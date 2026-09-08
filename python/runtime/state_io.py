@@ -104,7 +104,7 @@ def write_state(state: dict[str, Any], path: Path | None = None) -> Path:
     p.parent.mkdir(parents=True, exist_ok=True)
     state = dict(state)
     state["heartbeat_unix"] = int(time.time())  # match Lua os.time() seconds
-        state["heartbeat_mtime"] = time.time()  # high-res; Lua may use file mtime later
+    state["heartbeat_mtime"] = time.time()  # high-res for Lua dead-man
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
     tmp.replace(p)

@@ -39,7 +39,7 @@ def _help_lines() -> list[str]:
         "  3  lane polynomials",
         "  4  camera frustums",
         "  5  planner cost samples",
-        "  T  top-down / chase label",
+        "  T  toggle BEV debug / chase 3/4 bird",
         "  q  quit",
     ]
 

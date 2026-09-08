@@ -64,4 +64,4 @@ PYTHONPATH=. python python/run_vision.py --smoke   # writes docs/gvd_viz_smoke.p
 PYTHONPATH=. python python/run_vision.py --viz      # live window + state file for BeamNG
 ```
 
-Keys in `--viz`: `V` nerd, `?` help, `0` clean cabin, `1–5` debug layers, `T` BEV label, `q` quit. Caps: 32 agents / 16 forecast fans / 3 modes. If policy &lt; 8 Hz, drop fans + PIP first. In-game strip app: **GVD Strip** (mode · Hz · TTC · N).
+Keys in `--viz`: `V` nerd, `?` help, `0` clean cabin, `1–5` debug layers, `T` chase↔BEV, `q` quit. Caps: 32 agents / 16 forecast fans / 3 modes. If policy &lt; 8 Hz, drop fans + PIP first. In-game strip app: **GVD Strip** (mode · Hz · TTC · N).

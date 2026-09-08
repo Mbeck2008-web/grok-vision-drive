@@ -46,6 +46,7 @@ def default_state(**overrides: Any) -> dict[str, Any]:
         "viz_ms": 0.0,
         "heartbeat_ms": 0.0,
         "heartbeat_unix": int(time.time()),  # match Lua os.time() seconds
+            "heartbeat_mtime": time.time(),
         "gpu_vram_used_gb": 0.0,
         "gpu_vram_total_gb": 11.0,
         "gpu_name": "GTX 1080 Ti",
@@ -103,6 +104,7 @@ def write_state(state: dict[str, Any], path: Path | None = None) -> Path:
     p.parent.mkdir(parents=True, exist_ok=True)
     state = dict(state)
     state["heartbeat_unix"] = int(time.time())  # match Lua os.time() seconds
+        state["heartbeat_mtime"] = time.time()  # high-res; Lua may use file mtime later
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
     tmp.replace(p)

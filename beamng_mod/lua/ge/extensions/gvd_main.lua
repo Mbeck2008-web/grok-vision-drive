@@ -191,19 +191,33 @@ local function fadeAlpha(baseA, conf, hbAlive)
   return math.floor(clamp(a, 0, 255))
 end
 
+local lastBeatMono = nil
+local lastBeatMtime = nil
+
 local function heartbeatAlive(st, dt)
-  -- Prefer unix seconds from Python time.time(); fall back to file-age via heartbeat_unix only.
-  if not st or st.heartbeat_unix == nil then
-    return true
+  -- High-res path: Python heartbeat_mtime; we treat "fresh poll of newer/same recent beat" via os.clock.
+  -- Fallback: heartbeat_unix vs os.time() with 1 s slack (os.time resolution).
+  if not st then return true end
+  if st.heartbeat_mtime ~= nil then
+    local mt = tonumber(st.heartbeat_mtime)
+    if mt and (lastBeatMtime == nil or mt >= lastBeatMtime - 1e-6) then
+      if lastBeatMtime == nil or mt > lastBeatMtime + 1e-6 then
+        lastBeatMtime = mt
+        lastBeatMono = os.clock()
+      end
+    end
+    if lastBeatMono == nil then
+      lastBeatMono = os.clock()
+    end
+    local age = os.clock() - lastBeatMono
+    local alive = age <= HB_STALE_S
+    if not alive then fadeAcc = fadeAcc + (dt or 0.016) else fadeAcc = 0 end
+    return alive
   end
+  if st.heartbeat_unix == nil then return true end
   local age = nowUnix() - (tonumber(st.heartbeat_unix) or nowUnix())
-  -- os.time() is 1s resolution; allow 1s slack + HB_STALE_S
   local alive = age <= (1 + HB_STALE_S)
-  if not alive then
-    fadeAcc = fadeAcc + (dt or 0.016)
-  else
-    fadeAcc = 0
-  end
+  if not alive then fadeAcc = fadeAcc + (dt or 0.016) else fadeAcc = 0 end
   return alive
 end
 

@@ -1,0 +1,7 @@
+data/clips/
+*.pyc
+__pycache__/
+.venv/
+venv/
+*.onnx
+models/current.onnx

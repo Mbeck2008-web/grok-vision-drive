@@ -1,26 +1,28 @@
--- Grok Vision Drive — GE extension: engage + ice-blue ego path ribbon (no DLL inject)
+-- Grok Vision Drive — GE extension: engage + ice-blue ego path + compact HUD strip
+-- NOTE: Alt+A live ribbon remains UNPROVEN on Linux; confirm on Windows BeamNG smoke.
 local M = {}
 
 local engaged = false
 local showPath = true
-local showAgentGhosts = false -- off by default; GVD app toggle later
+local showAgentGhosts = false
 
 local STATE_REL = 'Documents/GVD/gvd_state.json'
 local pollAcc = 0
 local pollEvery = 0.10
 local fadeAcc = 0
 local fadeDur = 0.40
-local lastHb = 0
-local lastGood = nil -- {path_world=..., path_width=..., path_conf=..., agents=..., debug_preview=bool}
+local lastGood = nil
 local missingKeysLogged = false
+local stripAcc = 0
 
 local ICE_R, ICE_G, ICE_B = 90, 180, 220
 local AMBER_R, AMBER_G, AMBER_B = 200, 160, 60
 local MAX_EGO_SEGS = 40
 local MAX_AGENT = 8
-local MAX_AGENT_SEGS = 10
+local AGENT_PATH_MAX_M = 8.0
 local Z_BIAS = 0.08
 local DEFAULT_WIDTH = 2.0
+local HB_STALE_S = 0.35
 
 local function onInit()
 end
@@ -30,7 +32,6 @@ local function userStatePath()
   if home and home ~= '' then
     return home .. '/' .. STATE_REL
   end
-  -- BeamNG user folder fallback (may sit next to mods)
   if FS and FS.getUserPath then
     return FS:getUserPath() .. 'settings/gvd_state.json'
   end
@@ -72,6 +73,11 @@ local function clamp(x, a, b)
   return x
 end
 
+local function nowUnix()
+  -- Must match Python time.time() / heartbeat_unix (NOT os.clock)
+  return os.time()
+end
+
 local function getPlayerVeh()
   if be and be.getPlayerVehicle then
     return be:getPlayerVehicle(0)
@@ -79,8 +85,7 @@ local function getPlayerVeh()
   return nil
 end
 
--- BeamNG vehicle frame: +X right, +Y forward, +Z up → world via pos + dir/right
-local function egoToWorldPoints(pathEgo, veh)
+local function egoToWorldPoints(pathEgo, veh, maxLenM)
   if not pathEgo or not veh then return nil end
   local pos = veh:getPosition()
   local fwd = veh:getDirectionVector()
@@ -95,14 +100,22 @@ local function egoToWorldPoints(pathEgo, veh)
   up = up:normalized()
 
   local out = {}
-  local n = math.min(#pathEgo, MAX_EGO_SEGS + 1)
+  local n = #pathEgo
+  local traveled = 0
+  local prev = nil
   for i = 1, n do
     local p = pathEgo[i]
     local x = tonumber(p.x or p[1]) or 0
     local y = tonumber(p.y or p[2]) or 0
     local z = tonumber(p.z or p[3]) or 0
     local w = pos + right * x + fwd * y + up * (z + Z_BIAS)
+    if prev and maxLenM then
+      traveled = traveled + (w - prev):length()
+      if traveled > maxLenM then break end
+    end
     out[#out + 1] = w
+    prev = w
+    if #out > MAX_EGO_SEGS + 1 then break end
   end
   return out
 end
@@ -118,15 +131,14 @@ local function pathWorldFromState(st, veh)
     return out, false
   end
   if st.path_ego and #st.path_ego > 1 and veh then
-    return egoToWorldPoints(st.path_ego, veh), false
+    return egoToWorldPoints(st.path_ego, veh, nil), false
   end
-  -- debug preview: short straight from steer (or ahead)
   if not veh then return nil, true end
   local steer = 0
   if st.ego and st.ego.steer_deg then
     steer = tonumber(st.ego.steer_deg) or 0
   end
-  local curvature = (steer / 30.0) * 0.05 -- mild
+  local curvature = (steer / 30.0) * 0.05
   local pts = {}
   local pos = veh:getPosition()
   local fwd = veh:getDirectionVector():normalized()
@@ -138,15 +150,13 @@ local function pathWorldFromState(st, veh)
     y = y + 1.0
     heading = heading + curvature
     x = x + math.sin(heading)
-    local w = pos + right * x + fwd * y + up * Z_BIAS
-    pts[#pts + 1] = w
+    pts[#pts + 1] = pos + right * x + fwd * y + up * Z_BIAS
   end
   return pts, true
 end
 
 local function drawer()
-  if debugDrawer then return debugDrawer end
-  return nil
+  return debugDrawer
 end
 
 local function drawRibbon(points, width, col, segsCap)
@@ -154,7 +164,6 @@ local function drawRibbon(points, width, col, segsCap)
   if not d or not points or #points < 2 then return end
   local n = math.min(#points - 1, segsCap or MAX_EGO_SEGS)
   local half = float3 and float3(0.05, width, 0.05) or nil
-
   for i = 1, n do
     local a = points[i]
     local b = points[i + 1]
@@ -182,25 +191,29 @@ local function fadeAlpha(baseA, conf, hbAlive)
   return math.floor(clamp(a, 0, 255))
 end
 
-function M.drawPath(_dt)
+local function heartbeatAlive(st, dt)
+  -- Prefer unix seconds from Python time.time(); fall back to file-age via heartbeat_unix only.
+  if not st or st.heartbeat_unix == nil then
+    return true
+  end
+  local age = nowUnix() - (tonumber(st.heartbeat_unix) or nowUnix())
+  -- os.time() is 1s resolution; allow 1s slack + HB_STALE_S
+  local alive = age <= (1 + HB_STALE_S)
+  if not alive then
+    fadeAcc = fadeAcc + (dt or 0.016)
+  else
+    fadeAcc = 0
+  end
+  return alive
+end
+
+function M.drawPath(dt)
   if not showPath then return end
   if not engaged then return end
   if not lastGood then return end
 
-  local now = os.clock()
-  local hb = tonumber(lastGood.heartbeat_ms) or tonumber(lastGood.hb) or 0
-  -- treat missing heartbeat as alive for stub; if field present and stale >300ms, fade
-  local hbAlive = true
-  if lastGood.heartbeat_unix then
-    local age = now - (tonumber(lastGood.heartbeat_unix) or now)
-    hbAlive = age < 0.35
-    if not hbAlive then
-      fadeAcc = fadeAcc + (_dt or 0.016)
-      if fadeAcc >= fadeDur then return end
-    else
-      fadeAcc = 0
-    end
-  end
+  local hbAlive = heartbeatAlive(lastGood, dt)
+  if not hbAlive and fadeAcc >= fadeDur then return end
 
   local veh = getPlayerVeh()
   local pts, isPreview = pathWorldFromState(lastGood, veh)
@@ -208,23 +221,32 @@ function M.drawPath(_dt)
 
   local conf = tonumber(lastGood.path_conf) or (isPreview and 0.35 or 0.85)
   local width = tonumber(lastGood.path_width) or DEFAULT_WIDTH
-  width = clamp(width, 0.8, 2.4)
+  width = clamp(width, 1.8, 2.2)
   if conf < 0.45 then
-    width = width * 0.7
-    -- shorter ribbon when low conf
+    width = width * 0.75
     local keep = math.max(8, math.floor(#pts * 0.55))
     while #pts > keep do table.remove(pts) end
   end
 
-  local a = fadeAlpha(isPreview and 90 or 160, conf, hbAlive)
+  local a = fadeAlpha(isPreview and 90 or 170, conf, hbAlive)
   local col = color(ICE_R, ICE_G, ICE_B, a)
   if lastGood.policy == 'map-ai' then
     col = color(AMBER_R, AMBER_G, AMBER_B, math.floor(a * 0.7))
   end
 
+  -- soft underglow cue under ego (engage) — small prism at origin segment
+  if veh and drawer() and drawer().drawSphere then
+    local p = veh:getPosition()
+    local up = (veh:getDirectionVectorUp() or vec3(0, 0, 1)):normalized()
+    local glow = p + up * 0.05
+    local gf = glow.toFloat3 and glow:toFloat3() or glow
+    pcall(function()
+      drawer():drawSphere(0.55, gf, color(ICE_R, ICE_G, ICE_B, math.floor(a * 0.45)))
+    end)
+  end
+
   drawRibbon(pts, width, col, MAX_EGO_SEGS)
 
-  -- optional agent mode-0 ghosts (dim)
   if showAgentGhosts and lastGood.agents then
     local ghostA = math.floor(a * 0.20)
     local gcol = color(185, 192, 199, ghostA)
@@ -233,14 +255,44 @@ function M.drawPath(_dt)
       if count >= MAX_AGENT then break end
       local pe = ag.path_ego
       if pe and #pe > 1 and veh then
-        local wp = egoToWorldPoints(pe, veh)
-        if wp then
-          while #wp > MAX_AGENT_SEGS + 1 do table.remove(wp) end
-          drawRibbon(wp, 0.6, gcol, MAX_AGENT_SEGS)
+        local wp = egoToWorldPoints(pe, veh, AGENT_PATH_MAX_M)
+        if wp and #wp > 1 then
+          drawRibbon(wp, 0.55, gcol, 16)
           count = count + 1
         end
       end
     end
+  end
+end
+
+local function pushStrip()
+  if not lastGood then return end
+  local pl = lastGood.planner or {}
+  local mode = tostring(lastGood.policy or 'modular')
+  if engaged then mode = mode .. '|ON' else mode = mode .. '|OFF' end
+  local hz = tonumber(lastGood.loop_hz) or 0
+  local ttc = pl.ttc_lead
+  local ttcS = (ttc == nil) and '--' or string.format('%.1f', tonumber(ttc) or 0)
+  local n = tonumber(lastGood.objects_n or lastGood.tracks_n) or 0
+  local line = string.format('GVD  %s  %.0fHz  TTC %s  N=%d', mode, hz, ttcS, n)
+
+  if guihooks and guihooks.trigger then
+    pcall(function()
+      guihooks.trigger('gvdStrip', { text = line, mode = mode, hz = hz, ttc = ttc, n = n, engaged = engaged })
+    end)
+  end
+
+  -- Screen-adjacent draw if API exists (compact; not a nerd panel)
+  local d = drawer()
+  local veh = getPlayerVeh()
+  if d and d.drawTextAdvanced and veh then
+    local pos = veh:getPosition()
+    local up = (veh:getDirectionVectorUp() or vec3(0, 0, 1)):normalized()
+    local anchor = pos + up * 2.2
+    local af = anchor.toFloat3 and anchor:toFloat3() or anchor
+    pcall(function()
+      d:drawTextAdvanced(af, line, color(200, 204, 212, 200), true, false, color(12, 13, 16, 140))
+    end)
   end
 end
 
@@ -261,7 +313,7 @@ local function pollState(dt)
     if not st.path_width then miss[#miss + 1] = 'path_width' end
     if not st.path_conf then miss[#miss + 1] = 'path_conf' end
     if #miss > 0 then
-      log('I', 'GVD', '[GVD] state missing keys (using defaults/preview): ' .. table.concat(miss, ','))
+      log('I', 'GVD', '[GVD] state missing keys (defaults/preview): ' .. table.concat(miss, ','))
       missingKeysLogged = true
     end
   end
@@ -270,10 +322,16 @@ end
 function M.onPreRender(dt)
   pollState(dt)
   M.drawPath(dt)
+  stripAcc = stripAcc + (dt or 0)
+  if stripAcc >= 0.25 then
+    stripAcc = 0
+    pushStrip()
+  end
 end
 
 function M.onDebugDraw(_focuspos)
-  -- also draw here if onPreRender is not hooked in this build
+  -- Also draw here if onPreRender is not hooked in this build.
+  -- Alt+A live ribbon remains UNPROVEN on Linux.
   M.drawPath(0.016)
 end
 
@@ -282,8 +340,8 @@ function M.onUpdate(dt)
 end
 
 function M.onExtensionLoaded()
-  log('I', 'GVD', '[GVD] loaded. Alt+A engage. Path ribbon: GVD PATH (ice-blue).')
-  print('[GVD] loaded. Alt+A engage. Path ribbon reads Documents/GVD/gvd_state.json')
+  log('I', 'GVD', '[GVD] loaded. Alt+A engage. Path: GVD PATH. Strip: mode/Hz/TTC/N.')
+  print('[GVD] loaded. Alt+A engage. Reads Documents/GVD/gvd_state.json')
 end
 
 function M.onExtensionUnloaded()
@@ -298,6 +356,7 @@ function M.toggleEngage()
   local state = engaged and 'ENGAGED' or 'DISENGAGED'
   log('I', 'GVD', '[GVD] ' .. state)
   print('[GVD] ' .. state)
+  pushStrip()
 end
 
 function M.setShowAgentGhosts(v)

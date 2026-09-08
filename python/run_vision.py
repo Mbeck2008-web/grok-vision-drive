@@ -1,4 +1,4 @@
-"""GVD supervisor entry — writes gvd_state.json and optional OpenCV GVD window."""
+"""GVD supervisor entry — gvd_state.json + optional OpenCV GVD window."""
 
 from __future__ import annotations
 
@@ -7,12 +7,12 @@ import sys
 import time
 from pathlib import Path
 
-# repo root on path
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from python.runtime.state_io import default_state, state_path, write_state
+from python.runtime.state_io import default_state, state_path, steer_preview_path_ego, write_state
+from python.viz.stage import VizUI, render_stage, smoke
 
 
 def main() -> None:
@@ -23,58 +23,61 @@ def main() -> None:
     args = ap.parse_args()
 
     if args.smoke:
-        from python.viz.stage import smoke
-
-        out = smoke(window=False)
+        out = smoke()
         print(f"[GVD] smoke frame -> {out}")
         print(f"[GVD] state -> {state_path()}")
         return
 
     print("[GVD] supervisor stub — writing gvd_state.json for BeamNG path ribbon.")
     print(f"[GVD] state path: {state_path()}")
-    print("[GVD] Engage in BeamNG with Alt+A to show ice-blue GVD PATH.")
+    print("[GVD] Engage in BeamNG with Alt+A. Keys: V nerd, 0-5 layers, ? help, q quit.")
 
-    win = None
-    if args.viz:
-        import cv2
-        from python.viz.stage import render_stage
+    ui = VizUI()
+    win = "GVD" if args.viz else None
+    if win:
+        import cv2  # noqa: F401 — needs opencv-python (GUI), not headless-only
 
-        win = "GVD"
-
-    t0 = time.time()
     frame_i = 0
     try:
         while True:
             loop_t0 = time.perf_counter()
+            steer = 4.0 * ((frame_i // 30) % 5 - 2)
             st = default_state(
                 engaged=True,
                 loop_hz=args.hz,
                 camera_hz=10.0,
-                path_conf=0.75,
+                path_conf=0.85,
+                path_width=2.0,
                 path_debug_preview=True,
-                steer_deg=4.0 * ((frame_i // 30) % 5 - 2),
+                objects_n=0,
+                tracks_n=0,
+                planner={"corridor_width": 2.0, "curvature": 0.0, "target_v": 10.0, "ttc_lead": None, "aeb": "off"},
             )
-            # keep preview path in sync with steer
-            from python.runtime.state_io import steer_preview_path_ego
-
-            st["path_ego"] = steer_preview_path_ego(float(st["ego"]["steer_deg"]))
+            st["ego"]["steer_deg"] = steer
+            st["path_ego"] = steer_preview_path_ego(steer, length_m=36.0)
             st["heartbeat_ms"] = (time.perf_counter() - loop_t0) * 1000.0
             write_state(st)
 
             if win is not None:
                 import cv2
-                from python.viz.stage import render_stage
 
-                frame = render_stage(st)
+                frame = render_stage(st, ui=ui)
                 cv2.imshow(win, frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord("q"), 27):
                     break
+                if key == ord("v"):
+                    ui.toggle_nerd()
+                elif key == ord("?"):
+                    ui.toggle_help()
+                elif key == ord("t"):
+                    ui.top_down = not ui.top_down
+                elif key in (ord("0"), ord("1"), ord("2"), ord("3"), ord("4"), ord("5")):
+                    ui.set_layer(int(chr(key)))
 
             frame_i += 1
             dt = 1.0 / max(args.hz, 1.0)
             time.sleep(max(0.0, dt - (time.perf_counter() - loop_t0)))
-            if time.time() - t0 > 3600 * 8:
-                break
     except KeyboardInterrupt:
         print("[GVD] stopped.")
     finally:

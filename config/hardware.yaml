@@ -1,0 +1,6 @@
+# Default hardware profile — GTX 1080 Ti (11 GB, Pascal). Do not raise without an unlimited profile.
+profile: gtx_1080_ti
+max_inference_vram_gb: 4
+live_input_long_side: 640
+target_hz_min: 10
+target_hz_happy: 15

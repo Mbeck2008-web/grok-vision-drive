@@ -1,0 +1,11 @@
+{
+  "name": "GVD",
+  "version": 1,
+  "bindings": [
+    {
+      "control": "alt+a",
+      "action": "gvd_toggle_engage",
+      "desc": "GVD engage / disengage"
+    }
+  ]
+}

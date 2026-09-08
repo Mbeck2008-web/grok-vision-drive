@@ -1,0 +1,7 @@
+# HW3-class 8-cam draft mounts — calibrate on ETK800 (M1). FOV_v used by BeamNGpy (fovY).
+origin_offset: [0.0, 0.0, 0.0]
+cameras:
+  - id: cam_main
+    role: primary_forward
+    live_res: [640, 480]
+    fov_v: 34.0

@@ -1,0 +1,12 @@
+{
+  "gvd_toggle_engage": {
+    "cat": "vehicle",
+    "order": 900,
+    "ctx": "tlua",
+    "actionMap": "Normal",
+    "isBasic": true,
+    "onDown": "extensions.gvd_main.toggleEngage()",
+    "title": "GVD Engage",
+    "desc": "Engage / disengage Grok Vision Drive (stub until M2+)"
+  }
+}

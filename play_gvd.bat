@@ -16,19 +16,15 @@ if defined RUN (
     echo [GVD] Starting supervisor: %RUN%
     start "GVD supervisor" %PY% "%RUN%"
   ) else (
-    echo [GVD] Python not found — skipped supervisor.
+    echo [GVD] Python not found - skipped supervisor.
   )
 ) else (
-  echo [GVD] python\run_vision.py not found — skipped supervisor.
+  echo [GVD] python\run_vision.py not found - skipped supervisor.
 )
 
-echo [GVD] Launching BeamNG via Steam (app 284160)...
-start "" "steam://rungameid/284160"
-if errorlevel 1 (
-  echo [GVD] Steam URL failed — launch BeamNG yourself.
-)
-
-echo [GVD] If BeamNG did not open, launch it yourself. Enable GVD in Mod Manager.
+echo [GVD] Trying Steam app 284160. If BeamNG does not open, launch it yourself.
+start "" "steam://rungameid/284160" 2>nul
+echo [GVD] Enable GVD in Mod Manager if needed. Alt+A toggles engage (stub).
 pause
 endlocal
 exit /b 0

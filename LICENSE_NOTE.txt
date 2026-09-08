@@ -1,1 +1,0 @@
-This repository is MIT-licensed (see LICENSE). Entertainment / simulation toy only.

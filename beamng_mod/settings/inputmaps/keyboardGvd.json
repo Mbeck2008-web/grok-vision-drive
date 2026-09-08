@@ -1,0 +1,8 @@
+{
+  "bindings": [
+    {
+      "action": "gvd_toggle_engage",
+      "control": "alt+a"
+    }
+  ]
+}

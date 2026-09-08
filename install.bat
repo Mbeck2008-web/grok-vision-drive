@@ -18,31 +18,18 @@ if not defined USER_ROOT (
 )
 
 echo [GVD] User root: %USER_ROOT%
-echo [GVD] Scanning for versioned folders with mods...
-
-set "BEST_VER="
-set "BEST_PATH="
-
+echo [GVD] Candidate version folders with mods:
 for /d %%D in ("%USER_ROOT%\*") do (
-  if exist "%%D\mods\" (
-    set "NAME=%%~nxD"
-    rem Prefer lexical newest for 0.xx / current — track best by name
-    if /I "!NAME!"=="current" (
-      set "BEST_VER=!NAME!"
-      set "BEST_PATH=%%D"
-    ) else (
-      if not defined BEST_PATH (
-        set "BEST_VER=!NAME!"
-        set "BEST_PATH=%%D"
-      ) else (
-        if /I not "!BEST_VER!"=="current" (
-          if "!NAME!" GTR "!BEST_VER!" (
-            set "BEST_VER=!NAME!"
-            set "BEST_PATH=%%D"
-          )
-        )
-      )
-    )
+  if exist "%%D\mods\" echo   %%D
+)
+
+rem Numeric / current pick: current wins; else highest 0.xx by real version (0.32 > 0.9)
+set "BEST_PATH="
+set "BEST_VER="
+for /f "usebackq delims=" %%L in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$root=$env:USER_ROOT; Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'mods') } | ForEach-Object { $n=$_.Name; if ($n -ieq 'current') { [pscustomobject]@{ Name=$n; Path=$_.FullName; Key=[version]'9999.0' } } elseif ($n -match '^(\d+)\.(\d+)') { [pscustomobject]@{ Name=$n; Path=$_.FullName; Key=[version]($Matches[1]+'.'+$Matches[2]) } } else { [pscustomobject]@{ Name=$n; Path=$_.FullName; Key=[version]'0.0' } } } | Sort-Object Key -Descending | Select-Object -First 1 | ForEach-Object { $_.Path + '|' + $_.Name }"`) do (
+  for /f "tokens=1,2 delims=|" %%A in ("%%L") do (
+    set "BEST_PATH=%%A"
+    set "BEST_VER=%%B"
   )
 )
 
@@ -52,10 +39,6 @@ if not defined BEST_PATH (
   exit /b 1
 )
 
-echo [GVD] Candidate version folders with mods:
-for /d %%D in ("%USER_ROOT%\*") do (
-  if exist "%%D\mods\" echo   %%D
-)
 echo [GVD] Installing into newest: %BEST_PATH%  (version=%BEST_VER%)
 
 set "MODS=%BEST_PATH%\mods"
@@ -79,7 +62,6 @@ if errorlevel 1 (
   exit /b 1
 )
 
-rem Optional zip of unpacked tree (unpacked is enough)
 where tar >nul 2>&1
 if %ERRORLEVEL%==0 (
   if exist "%ZIP%" del /f /q "%ZIP%"
@@ -88,7 +70,7 @@ if %ERRORLEVEL%==0 (
   popd
   if exist "%ZIP%" echo [GVD] Also wrote %ZIP%
 ) else (
-  echo [GVD] tar not found — skipped gvd.zip (unpacked install is enough)
+  echo [GVD] tar not found - skipped gvd.zip (unpacked install is enough)
 )
 
 set "DOCS=%USERPROFILE%\Documents\GVD"

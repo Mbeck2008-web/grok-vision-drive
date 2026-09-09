@@ -60,3 +60,11 @@ Also: `Documents/GVD/gvd_cmd.json` = `{steer,throttle,brake,seq,heartbeat_mtime}
 | `path_world` | optional `[{x,y,z}]` | World path from BeamNGpy pose × path_ego (kinematics, not a map). Lua prefers this for 1:1 ribbon. |
 | `show_agent_ghosts` | bool | Default true when `tracks_n>0`; in-game track hulls + OpenCV ghosts |
 | `planner.cipv_id` | int? | Brighter ice / LEAD on that track |
+
+
+## UI prefs (`Documents/GVD/gvd_ui_prefs.json`)
+
+Written by the in-game **GVD** app. **Wins over** `gvd_state` for path/ghosts while the file exists. Setters also mirror into `gvd_state` when JSON encode is available so OpenCV follows.
+
+| `show_path` | bool | Ribbon on/off |
+| `show_agent_ghosts` | bool | Track hulls on/off |

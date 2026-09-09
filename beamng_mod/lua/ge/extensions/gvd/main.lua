@@ -9,6 +9,7 @@ local showAgentGhosts = false
 local STATE_REL = 'Documents/GVD/gvd_state.json'
 local ENGAGE_REL = 'Documents/GVD/gvd_engage.json'
 local CMD_REL = 'Documents/GVD/gvd_cmd.json'
+local UI_PREFS_REL = 'Documents/GVD/gvd_ui_prefs.json'
 local lastCmdSeq = -1
 local cmdAcc = 0
 local pollAcc = 0
@@ -96,6 +97,57 @@ local function getPlayerVeh()
     return be:getPlayerVehicle(0)
   end
   return nil
+end
+
+
+local function userUiPrefsPath()
+  local home = os.getenv('USERPROFILE') or os.getenv('HOME')
+  if home and home ~= '' then
+    return home .. '/' .. UI_PREFS_REL
+  end
+  return 'gvd_ui_prefs.json'
+end
+
+local function encodeUiStateMirror(st)
+  if jsonEncode then
+    local ok, s = pcall(jsonEncode, st)
+    if ok and s then return s end
+  end
+  if util_jsonEncode then
+    local ok, s = pcall(util_jsonEncode, st)
+    if ok and s then return s end
+  end
+  return nil
+end
+
+local function writeUiPrefs()
+  local payload = string.format(
+    '{"show_path":%s,"show_agent_ghosts":%s,"mtime":%d}',
+    showPath and 'true' or 'false',
+    showAgentGhosts and 'true' or 'false',
+    os.time()
+  )
+  writeText(userUiPrefsPath(), payload)
+  -- Mirror into gvd_state so OpenCV / Python follow the same toggles
+  local raw = readText(userStatePath())
+  local st = raw and decodeJson(raw) or nil
+  if type(st) == 'table' then
+    st.gvd_show_path = showPath
+    st.show_agent_ghosts = showAgentGhosts
+    local encoded = encodeUiStateMirror(st)
+    if encoded then
+      writeText(userStatePath(), encoded)
+    end
+  end
+end
+
+local function readUiPrefs()
+  local raw = readText(userUiPrefsPath())
+  if not raw then return end
+  local p = decodeJson(raw)
+  if not p then return end
+  if p.show_path ~= nil then showPath = not not p.show_path end
+  if p.show_agent_ghosts ~= nil then showAgentGhosts = not not p.show_agent_ghosts end
 end
 
 
@@ -469,6 +521,16 @@ local function pushStrip()
   if guihooks and guihooks.trigger then
     pcall(function()
       guihooks.trigger('gvdStrip', { text = line, mode = mode, hz = hz, ttc = ttc, n = n, engaged = engaged })
+      guihooks.trigger('gvdUi', {
+        engaged = engaged,
+        showPath = showPath,
+        showGhosts = showAgentGhosts,
+        hz = hz,
+        ttc = ttc,
+        n = n,
+        mode = mode,
+        text = line,
+      })
     end)
   end
 
@@ -495,8 +557,15 @@ local function pollState(dt)
   local st = decodeJson(raw)
   if not st then return end
   lastGood = st
-  if st.gvd_show_path ~= nil then showPath = not not st.gvd_show_path end
-  if st.show_agent_ghosts ~= nil then showAgentGhosts = not not st.show_agent_ghosts end
+  -- UI prefs win: if gvd_ui_prefs.json exists, do NOT apply path/ghosts from gvd_state
+  -- (run_vision show_agent_ghosts=true would clobber "Show ghosts" off every tick).
+  local prefsRaw = readText(userUiPrefsPath())
+  if prefsRaw and prefsRaw ~= '' then
+    readUiPrefs()
+  else
+    if st.gvd_show_path ~= nil then showPath = not not st.gvd_show_path end
+    if st.show_agent_ghosts ~= nil then showAgentGhosts = not not st.show_agent_ghosts end
+  end
   if not missingKeysLogged then
     local miss = {}
     if not st.path_ego and not st.path_world then miss[#miss + 1] = 'path_ego|path_world' end
@@ -531,7 +600,8 @@ function M.onUpdate(dt)
 end
 
 function M.onExtensionLoaded()
-  log('I', 'GVD', '[GVD] loaded. Alt+A engage. Path: GVD PATH. Strip: mode/Hz/TTC/N.')
+  readUiPrefs()
+  log('I', 'GVD', '[GVD] loaded. Alt+A engage. Path: GVD PATH. Strip: mode/Hz/TTC/N. UI app: GVD.')
   print('[GVD] loaded. Alt+A engage. Writes gvd_engage.json; optional gvd_cmd.json poll (BeamNGpy preferred).')
 end
 
@@ -554,10 +624,41 @@ end
 
 function M.setShowAgentGhosts(v)
   showAgentGhosts = not not v
+  writeUiPrefs()
+  pushStrip()
+end
+
+function M.setShowPath(v)
+  showPath = not not v
+  writeUiPrefs()
+  pushStrip()
+end
+
+function M.setEngaged(v)
+  local want = not not v
+  if engaged ~= want then
+    M.toggleEngage()
+  end
+end
+
+function M.engage()
+  if not engaged then M.toggleEngage() end
+end
+
+function M.disengage()
+  if engaged then M.toggleEngage() end
 end
 
 function M.isEngaged()
   return engaged
+end
+
+function M.getShowPath()
+  return showPath
+end
+
+function M.getShowAgentGhosts()
+  return showAgentGhosts
 end
 
 M.onInit = onInit

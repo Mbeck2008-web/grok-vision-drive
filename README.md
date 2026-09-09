@@ -39,9 +39,14 @@ After install, unpacked tree:
 mods\unpacked\gvd\
   scripts\gvd\modScript.lua
   lua\ge\extensions\gvd\main.lua
+  ui\modules\apps\GVD\              # Engage HUD app
   lua\ge\extensions\core\input\actions\gvd.json
   settings\inputmaps\keyboardGvd.json
 ```
+
+## In-game UI app
+
+After install, open BeamNG **Apps** and add **GVD** (`beamng_mod/ui/modules/apps/GVD/`) (Engage / Disengage, show path, show ghosts). Titles stay **GVD** / **VISION**. Alt+A still works. No FSD chrome.
 
 ## Two views
 

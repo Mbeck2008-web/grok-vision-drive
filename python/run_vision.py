@@ -237,6 +237,11 @@ def main() -> None:
     backend_name = resolve_backend_name(None if args.backend == "auto" else args.backend)
     hw = probe(backend=backend_name)
     print(hw.boot_line())
+    if hw.is_retail:
+        print(
+            "[GVD] RETAIL PATH: 1-cam window capture only (main/cam_main); other cam_health stay missing. "
+            "8-cam rig = BeamNG.tech + BeamNGpy."
+        )
     reason = refuse_live_start(hw, vision_only=args.vision_only)
     if reason:
         print(f"[GVD] REFUSE: {reason}")
@@ -269,6 +274,11 @@ def main() -> None:
     )
 
     print(f"[GVD] camera backend={backend.name} detector={perc.detector.name} actuator={actuator.name}")
+    if actuator.name == "cmd_json":
+        print(
+            "[GVD] actuator=cmd_json is a no-op sink: GVD does NOT drive the car on this path "
+            "(Engage = ribbon + HUD + clips only; driving needs a BeamNGpy vehicle)."
+        )
     print(f"[GVD] M5 policy={args.policy} e2e={e2e_policy.name} (modular vetoes E2E; shadow writes both)")
     print(f"[GVD] clip encoder={recorder.encoder} (qsv prefer; never default nvenc)")
     print(f"[GVD] state path: {state_path()}")

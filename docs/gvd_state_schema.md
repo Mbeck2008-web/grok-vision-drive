@@ -86,3 +86,17 @@ Written by the in-game **GVD** app. **Wins over** `gvd_state` for path/ghosts wh
 
 Perception always runs. Actuators only when engaged **and** modular OK. Shadow mode computes both intents; default apply path stays modular. Dead-man / heartbeat unchanged. No weight blobs in git (`models/e2e_current.onnx` gitignored).
 
+
+## M6 — `gvd_engage.json` contract (retail package)
+
+Path: `Documents/GVD/gvd_engage.json`, shared by GELua and Python.
+
+| Writer | Payload | When |
+| --- | --- | --- |
+| Lua (`gvd_main.toggleEngage`) | `{"engaged":true\|false,"mtime":<os.time() int>}` | Alt+A / GVD app button |
+| Python (`write_engage_flag`) | `{"engaged": false, "mtime": <time.time() float>}` | modular veto / stale heartbeat / `finally` on exit |
+
+Python reads the file every tick and mirrors it into `engaged` (never invents engage). Lua polls it every 0.1 s **only while engaged** and adopts `engaged=false` when the file says so and `mtime` ≥ Lua's own last toggle stamp; it logs `[GVD] DISENGAGED by supervisor (<disengage_reason>)` and refreshes the HUD/UI app. A file saying `true` never engages Lua — engage always starts in-game.
+
+Retail (`capture_backend=window`): `actuator=cmd_json`, `cmd_applied=false`, `cmd_reason=cmd_json_sink` — the car is not driven. Boot line: `backend=window cams=1/8 path=retail (1 window capture; not 8)`.
+

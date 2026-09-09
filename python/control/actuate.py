@@ -280,25 +280,36 @@ class BeamNGPyActuator:
 
 
 class CmdJsonActuator:
-    """Atomic Documents/GVD/gvd_cmd.json for GELua poll — fallback only."""
+    """Atomic Documents/GVD/gvd_cmd.json for GELua poll — fallback sink only.
+
+    Lua currently no-ops apply (no portable GE vehicle.control). File is still written,
+    but applied=False and reason=cmd_json_sink so state never claims the car moved.
+    """
 
     name = "cmd_json"
 
     def apply(self, cmd: DriveCommand) -> DriveCommand:
         p = cmd_path()
         p.parent.mkdir(parents=True, exist_ok=True)
+        # Preserve gate reasons; otherwise tag sink honesty.
+        if cmd.reason in ("ok", "plan", "stop", "shutdown", "unit_stop") or cmd.reason.startswith("beamngpy"):
+            sink_reason = "cmd_json_sink"
+        else:
+            sink_reason = cmd.reason
         payload = {
             "steer": float(cmd.steer),
             "throttle": float(cmd.throttle),
             "brake": float(cmd.brake),
             "seq": int(cmd.seq),
             "heartbeat_mtime": time.time(),
-            "reason": cmd.reason,
+            "reason": sink_reason,
+            "applied": False,
         }
         tmp = p.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         tmp.replace(p)
-        cmd.applied = True
+        cmd.applied = False
+        cmd.reason = sink_reason
         return cmd
 
     def stop(self, seq: int = 0, reason: str = "stop") -> DriveCommand:

@@ -85,4 +85,10 @@ PYTHONPATH=. python python/run_vision.py --backend beamngpy       # needs Tech; 
 
 Default `--backend auto`: beamngpy if importable → else window → else stub. Window backend fills **main / cam_main only**; other `cam_health` stay `missing`. Nerd panel shows `retail: 1 window` when that backend is active. Never synthesizes 8 frames from one grab.
 
+Window capture prefers a visible window whose title contains **BeamNG** (Win32 / wmctrl). If none is found, it falls back to the primary monitor — use **fullscreen BeamNG** in that case (`capture_note` says so).
+
+Tech path: `GVD_BEAMNG=1` attaches color-only BeamNGpy `Camera` sensors from `config/cameras.yaml` to the current vehicle (`GVD_BEAMNG_HOST`/`PORT`, optional `BNG_HOME`). Depth/semantic stay OFF. Live smoke still **UNPROVEN on Linux**.
+
+Live start **refuses** (exit 1) if probed dGPU VRAM &lt; 10 GB while BeamNG is running, unless `--vision-only`.
+
 BIOS (Windows): enable **iGPU Multi-Monitor** so UHD 630 QSV exists while 1080 Ti drives the display (M4 encode). Do not set DVMT to 2 GB.

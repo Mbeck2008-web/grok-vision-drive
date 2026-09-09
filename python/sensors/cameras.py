@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -56,8 +58,6 @@ def resize_long_side(img: np.ndarray, long_side: int) -> np.ndarray:
 
 
 def load_camera_config(path: Path | None = None) -> dict[str, Any]:
-    import json
-
     root = Path(__file__).resolve().parents[2]
     cfg_path = path or (root / "config" / "cameras.yaml")
     try:
@@ -65,7 +65,6 @@ def load_camera_config(path: Path | None = None) -> dict[str, Any]:
 
         return yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
     except Exception:
-        # Minimal fallback without PyYAML: only need ids for health keys
         return {"cameras": [{"id": c} for c in CAM_IDS]}
 
 
@@ -73,13 +72,27 @@ def load_live_long_side(default: int = 640) -> int:
     root = Path(__file__).resolve().parents[2]
     hw = root / "config" / "hardware.yaml"
     try:
-        text = hw.read_text(encoding="utf-8")
-        for line in text.splitlines():
+        for line in hw.read_text(encoding="utf-8").splitlines():
             if line.strip().startswith("live_input_long_side:"):
                 return int(line.split(":", 1)[1].strip())
     except Exception:
         pass
     return default
+
+
+def yaw_pitch_to_dir_up(yaw_deg: float, pitch_deg: float) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """GVD vehicle frame +X right +Y forward +Z up → BeamNGpy dir/up (toy; calibrate on ETK800)."""
+    yaw = math.radians(yaw_deg)
+    pitch = math.radians(pitch_deg)
+    # look direction
+    dx = math.sin(yaw) * math.cos(pitch)
+    dy = math.cos(yaw) * math.cos(pitch)
+    dz = math.sin(pitch)
+    # approximate up (roll=0)
+    ux = -math.sin(yaw) * math.sin(pitch)
+    uy = -math.cos(yaw) * math.sin(pitch)
+    uz = math.cos(pitch)
+    return (dx, dy, dz), (ux, uy, uz)
 
 
 @runtime_checkable
@@ -92,8 +105,6 @@ class CameraBackend(Protocol):
 
 
 class StubBackend:
-    """Offline / CI: no frames. Health stays missing. State/ribbon still work."""
-
     name = "stub"
 
     def __init__(self, long_side: int | None = None) -> None:
@@ -110,8 +121,51 @@ class StubBackend:
         return CameraFrameBundle(frames={}, timestamps={}, health=health, backend=self.name, note="stub: no cameras")
 
 
+def _find_beamng_window_rect() -> tuple[int, int, int, int] | None:
+    """Return (left, top, width, height) for a visible window titled with BeamNG, else None."""
+    # Windows: win32gui
+    try:
+        import win32gui  # type: ignore
+
+        found: list[tuple[int, int, int, int]] = []
+
+        def _enum(hwnd: int, _: Any) -> None:
+            if not win32gui.IsWindowVisible(hwnd):
+                return
+            title = win32gui.GetWindowText(hwnd) or ""
+            if "BeamNG" not in title:
+                return
+            rect = win32gui.GetClientRect(hwnd)
+            left, top = win32gui.ClientToScreen(hwnd, (0, 0))
+            w, h = rect[2] - rect[0], rect[3] - rect[1]
+            if w > 200 and h > 200:
+                found.append((left, top, w, h))
+
+        win32gui.EnumWindows(_enum, None)
+        if found:
+            return found[0]
+    except Exception:
+        pass
+    # Linux: wmctrl (best-effort)
+    try:
+        import subprocess
+
+        out = subprocess.check_output(["wmctrl", "-lG"], text=True, timeout=2)
+        for line in out.splitlines():
+            if "BeamNG" not in line:
+                continue
+            parts = line.split()
+            # id desk x y w h ...
+            x, y, w, h = map(int, parts[2:6])
+            if w > 200 and h > 200:
+                return (x, y, w, h)
+    except Exception:
+        pass
+    return None
+
+
 class WindowBackend:
-    """Retail: single main BeamNG window capture. Never clones into 8 cams."""
+    """Retail: capture BeamNG window (title match) or full monitor if fullscreen-only."""
 
     name = "window"
 
@@ -121,13 +175,28 @@ class WindowBackend:
         self._mss = None
         self._impl = "none"
         self._logged = False
+        self._region: dict[str, int] | None = None
+        self._note = "retail: 1 window"
 
     def open(self) -> None:
-        # Prefer bettercam with numpy path (no NVIDIA capture path stealing 1080 Ti)
+        rect = _find_beamng_window_rect()
+        if rect:
+            l, t, w, h = rect
+            self._region = {"left": l, "top": t, "width": w, "height": h}
+            self._note = "retail: 1 window (BeamNG title match)"
+        else:
+            self._region = None
+            self._note = "retail: 1 window (fullscreen/monitor — no BeamNG title match)"
+
         try:
             import bettercam  # type: ignore
 
-            self._cam = bettercam.create(output_color="BGR", nvidia_gpu=False)
+            # numpy path — do not steal 1080 Ti via nvidia_gpu capture
+            kwargs: dict[str, Any] = {"output_color": "BGR", "nvidia_gpu": False}
+            if self._region:
+                r = self._region
+                kwargs["region"] = (r["left"], r["top"], r["left"] + r["width"], r["top"] + r["height"])
+            self._cam = bettercam.create(**kwargs)
             self._impl = "bettercam"
             return
         except Exception:
@@ -153,30 +222,45 @@ class WindowBackend:
         health = {cid: CamHealth.MISSING for cid in CAM_IDS}
         frames: dict[str, np.ndarray] = {}
         timestamps: dict[str, float] = {}
-        note = "retail: 1 window"
         img = None
+        # refresh title match occasionally
+        if self._region is None:
+            rect = _find_beamng_window_rect()
+            if rect:
+                l, t, w, h = rect
+                self._region = {"left": l, "top": t, "width": w, "height": h}
+                self._note = "retail: 1 window (BeamNG title match)"
+
         try:
             if self._cam is not None:
                 img = self._cam.grab()
                 if img is not None and not isinstance(img, np.ndarray):
                     img = np.asarray(img)
             elif self._mss is not None:
-                mon = self._mss.monitors[1] if len(self._mss.monitors) > 1 else self._mss.monitors[0]
+                if self._region:
+                    mon = {
+                        "left": self._region["left"],
+                        "top": self._region["top"],
+                        "width": self._region["width"],
+                        "height": self._region["height"],
+                    }
+                else:
+                    mon = self._mss.monitors[1] if len(self._mss.monitors) > 1 else self._mss.monitors[0]
                 shot = self._mss.grab(mon)
-                img = np.asarray(shot)[:, :, :3]  # BGRA -> BGR
+                img = np.asarray(shot)[:, :, :3]
         except Exception as e:
             if not self._logged:
                 print(f"[GVD] window capture error: {e}")
                 self._logged = True
             health["main"] = CamHealth.ERROR
-            return CameraFrameBundle(frames={}, timestamps={}, health=health, backend=self.name, note=note)
+            return CameraFrameBundle(frames={}, timestamps={}, health=health, backend=self.name, note=self._note)
 
         if img is None:
             health["main"] = CamHealth.MISSING
             if not self._logged:
-                print(f"[GVD] window backend open via {self._impl}; no frame yet (retail: 1 window only).")
+                print(f"[GVD] window via {self._impl}; {self._note}. Sides stay missing.")
                 self._logged = True
-            return CameraFrameBundle(frames={}, timestamps={}, health=health, backend=self.name, note=note)
+            return CameraFrameBundle(frames={}, timestamps={}, health=health, backend=self.name, note=self._note)
 
         img = np.ascontiguousarray(img)
         if img.dtype != np.uint8:
@@ -187,12 +271,12 @@ class WindowBackend:
         frames["cam_main"] = img
         timestamps["main"] = ts
         health["main"] = CamHealth.OK
-        # all others stay missing — refuse fake 8-cam
-        return CameraFrameBundle(frames=frames, timestamps=timestamps, health=health, backend=self.name, note=note)
+        # refuse fake 8-cam
+        return CameraFrameBundle(frames=frames, timestamps=timestamps, health=health, backend=self.name, note=self._note)
 
 
 class BeamNGPyBackend:
-    """Tech path: BeamNGpy Camera sensors, color only. No depth/semantic in default."""
+    """Tech path: attach color-only BeamNGpy Camera sensors from cameras.yaml."""
 
     name = "beamngpy"
 
@@ -207,50 +291,148 @@ class BeamNGPyBackend:
 
     def open(self) -> None:
         try:
-            from beamngpy import BeamNGpy, Vehicle  # type: ignore
+            from beamngpy import BeamNGpy  # type: ignore
             from beamngpy.sensors import Camera  # type: ignore
         except Exception as e:
             if not self._logged:
-                print(f"[GVD] beamngpy not available ({e}); cam_health=missing. Install BeamNG.tech + beamngpy for 8-cam.")
+                print(f"[GVD] beamngpy not available ({e}); cam_health=missing.")
                 self._logged = True
             self._ok = False
             return
 
-        # Connection is environment-specific; without a live Tech server we stay missing.
-        # Do not invent frames.
-        try:
-            # Attempt attach only if BEAMNG_HOME / existing research connection conventions exist.
-            # Conservative: require GVD_BEAMNG=1 to even try connecting.
-            import os
-
-            if os.environ.get("GVD_BEAMNG", "").strip() not in ("1", "true", "yes"):
-                if not self._logged:
-                    print(
-                        "[GVD] beamngpy importable but GVD_BEAMNG not set; "
-                        "cam_health=missing (no fake 8-cam). Set GVD_BEAMNG=1 when Tech is running."
-                    )
-                    self._logged = True
-                self._ok = False
-                return
-            # Live attach is Windows/Tech-specific — leave sensors empty until a session is wired in M1.1+.
-            # Document UNPROVEN on Linux.
+        if os.environ.get("GVD_BEAMNG", "").strip().lower() not in ("1", "true", "yes"):
             if not self._logged:
                 print(
-                    "[GVD] beamngpy path selected; live Camera attach is UNPROVEN on Linux. "
-                    "Color-only mounts are defined in config/cameras.yaml."
+                    "[GVD] beamngpy importable; set GVD_BEAMNG=1 to attach color Cameras. "
+                    "cam_health=missing until then (no fake frames)."
                 )
                 self._logged = True
             self._ok = False
+            return
+
+        host = os.environ.get("GVD_BEAMNG_HOST", "localhost")
+        port = int(os.environ.get("GVD_BEAMNG_PORT", "25252"))
+        home = os.environ.get("BNG_HOME") or os.environ.get("BEAMNG_HOME")
+        try:
+            bng = BeamNGpy(host, port, home=home) if home else BeamNGpy(host, port)
+            # Connect to already-running Tech; do not launch a second instance by default
+            bng.open(launch=False)
+            self._bng = bng
         except Exception as e:
             if not self._logged:
-                print(f"[GVD] beamngpy Camera attach failed: {e}; cam_health=missing.")
+                print(f"[GVD] beamngpy connect failed ({e}); cam_health=missing. Is BeamNG.tech listening on {host}:{port}?")
                 self._logged = True
             self._ok = False
+            return
+
+        vehicle = self._resolve_vehicle(bng)
+        if vehicle is None:
+            if not self._logged:
+                print("[GVD] beamngpy: no vehicle to attach Cameras; cam_health=missing.")
+                self._logged = True
+            self._ok = False
+            return
+        self._vehicle = vehicle
+
+        cams = list(self.config.get("cameras") or [])
+        origin = self.config.get("origin_offset") or [0.0, 0.0, 0.0]
+        attached = 0
+        for spec in cams:
+            cid = str(spec.get("id") or "")
+            if not cid or cid not in CAM_IDS:
+                continue
+            try:
+                pos = list(spec.get("pos_m") or [0.0, 1.2, 1.2])
+                pos = [pos[0] + float(origin[0]), pos[1] + float(origin[1]), pos[2] + float(origin[2])]
+                yaw = float(spec.get("yaw_deg") or 0.0)
+                pitch = float(spec.get("pitch_deg") or 0.0)
+                direction, up = yaw_pitch_to_dir_up(yaw, pitch)
+                res = list(spec.get("live_res") or [640, 480])
+                # clamp long side
+                rw, rh = int(res[0]), int(res[1])
+                if max(rw, rh) > self.long_side:
+                    scale = self.long_side / float(max(rw, rh))
+                    rw, rh = max(1, int(rw * scale)), max(1, int(rh * scale))
+                fov_v = float(spec.get("fov_v") or 70.0)
+                cam = Camera(
+                    f"gvd_{cid}",
+                    bng,
+                    vehicle,
+                    pos=tuple(pos),
+                    dir=direction,
+                    up=up,
+                    field_of_view_y=fov_v,
+                    resolution=(rw, rh),
+                    is_using_shared_memory=True,
+                    is_streaming=True,
+                    is_render_colours=True,
+                    is_render_annotations=False,
+                    is_render_instance=False,
+                    is_render_depth=False,
+                    is_snapping_desired=False,
+                    is_visualised=False,
+                )
+                self._sensors[cid] = cam
+                attached += 1
+            except Exception as e:
+                print(f"[GVD] beamngpy Camera attach failed for {cid}: {e}")
+
+        self._ok = attached > 0
+        if not self._logged:
+            if self._ok:
+                print(f"[GVD] beamngpy attached {attached} color Camera(s) from cameras.yaml (depth/semantic OFF).")
+            else:
+                print("[GVD] beamngpy: zero Cameras attached; cam_health=missing.")
+            print("[GVD] note: live BeamNG frame grab still needs Windows Tech smoke if this host cannot render.")
+            self._logged = True
+
+    def _resolve_vehicle(self, bng: Any) -> Any:
+        # Prefer already-spawned vehicles in the running Tech session
+        try:
+            current = bng.vehicles.get_current()
+            if isinstance(current, dict) and current:
+                # values may be Vehicle instances or need re-connect
+                for _name, veh in current.items():
+                    try:
+                        # ensure connected
+                        if hasattr(veh, "is_connected") and not veh.is_connected():
+                            bng.connect_vehicle(veh)  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                    return veh
+        except Exception:
+            pass
+        try:
+            from beamngpy import Vehicle  # type: ignore
+
+            veh = Vehicle("gvd_ego", model="etk800")
+            # Some builds: enter existing by state
+            bng.poll_vehicles()  # type: ignore[attr-defined]
+        except Exception:
+            return None
+        return None
 
     def close(self) -> None:
+        for cam in list(self._sensors.values()):
+            try:
+                cam.remove()
+            except Exception:
+                try:
+                    cam.detach()
+                except Exception:
+                    pass
         self._sensors.clear()
-        self._vehicle = None
+        if self._bng is not None:
+            try:
+                self._bng.disconnect()
+            except Exception:
+                try:
+                    self._bng.close()
+                except Exception:
+                    pass
         self._bng = None
+        self._vehicle = None
+        self._ok = False
 
     def grab(self) -> CameraFrameBundle:
         health = {cid: CamHealth.MISSING for cid in CAM_IDS}
@@ -262,10 +444,48 @@ class BeamNGPyBackend:
                 backend=self.name,
                 note="beamngpy: no live Camera session",
             )
-        # Placeholder for when sensors are attached in a live Tech session
         frames: dict[str, np.ndarray] = {}
         timestamps: dict[str, float] = {}
-        return CameraFrameBundle(frames=frames, timestamps=timestamps, health=health, backend=self.name, note="beamngpy")
+        ts = time.time()
+        for cid, cam in self._sensors.items():
+            try:
+                images = None
+                if hasattr(cam, "stream") and getattr(cam, "is_streaming", False):
+                    try:
+                        images = cam.stream()
+                    except Exception:
+                        images = cam.poll() if hasattr(cam, "poll") else None
+                elif hasattr(cam, "poll"):
+                    images = cam.poll()
+                colour = None
+                if isinstance(images, dict):
+                    colour = images.get("colour") or images.get("color")
+                if colour is None:
+                    health[cid] = CamHealth.STALE
+                    continue
+                # PIL Image → BGR
+                arr = np.asarray(colour)
+                if arr.ndim == 3 and arr.shape[2] >= 3:
+                    # RGB(A) → BGR
+                    bgr = arr[:, :, :3][:, :, ::-1].copy()
+                else:
+                    health[cid] = CamHealth.ERROR
+                    continue
+                bgr = resize_long_side(bgr, self.long_side)
+                frames[cid] = bgr
+                timestamps[cid] = ts
+                health[cid] = CamHealth.OK
+                if cid == "main":
+                    frames["cam_main"] = bgr
+            except Exception:
+                health[cid] = CamHealth.ERROR
+        return CameraFrameBundle(
+            frames=frames,
+            timestamps=timestamps,
+            health=health,
+            backend=self.name,
+            note=f"beamngpy: {len(frames)} colour frame(s)",
+        )
 
 
 def resolve_backend_name(requested: str | None = None) -> str:

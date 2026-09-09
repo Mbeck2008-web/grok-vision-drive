@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from python.runtime.hw_probe import probe
+from python.runtime.hw_probe import probe, refuse_live_start
 from python.runtime.state_io import default_state, state_path, steer_preview_path_ego, write_state
 from python.sensors.cameras import make_backend, resolve_backend_name
 from python.viz.stage import VizUI, render_stage, smoke
@@ -62,6 +62,10 @@ def main() -> None:
     print(hw.boot_line())
     for n in hw.notes or []:
         print(f"[GVD] note: {n}")
+    reason = refuse_live_start(hw, vision_only=args.vision_only)
+    if reason:
+        print(f"[GVD] REFUSE: {reason}")
+        raise SystemExit(1)
 
     backend = make_backend(backend_name if args.backend != "auto" else backend_name)
     backend.open()

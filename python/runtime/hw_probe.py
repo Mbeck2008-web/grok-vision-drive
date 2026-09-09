@@ -123,6 +123,60 @@ def load_profile(path: Path | None = None) -> dict[str, Any]:
     return data
 
 
+def beamng_process_running() -> bool:
+    """True if a BeamNG process looks running (best-effort)."""
+    names = ("beamng", "beamng.drive", "beamngtech", "beamng.tech")
+    try:
+        import psutil  # type: ignore
+
+        for p in psutil.process_iter(["name"]):
+            n = (p.info.get("name") or "").lower()
+            if any(x in n for x in names):
+                return True
+    except Exception:
+        pass
+    if platform.system() == "Linux":
+        try:
+            for proc in Path("/proc").iterdir():
+                if not proc.name.isdigit():
+                    continue
+                try:
+                    cmd = (proc / "cmdline").read_bytes().decode("utf-8", "ignore").lower()
+                except Exception:
+                    continue
+                if "beamng" in cmd:
+                    return True
+        except Exception:
+            pass
+    if platform.system() == "Windows":
+        try:
+            out = subprocess.check_output(["tasklist"], text=True, timeout=5, stderr=subprocess.DEVNULL)
+            if "BeamNG" in out:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def refuse_live_start(report: HwReport, *, vision_only: bool = False) -> str | None:
+    """Return a refuse reason, or None if live start is allowed.
+
+    Spec: refuse if VRAM < 10 GB and BeamNG is up, unless --vision-only.
+    """
+    if vision_only:
+        return None
+    vram = report.dgpu_vram_gb
+    if vram is None:
+        return None
+    # Target profile placeholder "GTX 1080 Ti (target)" reports 11 — real probe uses nvidia-smi
+    if vram < 10.0 and beamng_process_running():
+        return (
+            f"dGPU VRAM {vram:.1f} GB < 10 GB while BeamNG is up — "
+            "refuse live start (pass --vision-only to override)"
+        )
+    return None
+
+
 def probe(backend: str = "stub") -> HwReport:
     cpu = _cpu_name()
     # Prefer configured profile labels when probing a foreign CI box

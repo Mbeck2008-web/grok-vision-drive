@@ -94,6 +94,11 @@ def default_state(**overrides: Any) -> dict[str, Any]:
         "agents": [],
         "tracks": [],
         "lanes_bev": [],
+        # Viz road model: lanes_ext entries carry kind detected|predicted|stub, road_edges are
+        # always predicted (no kerb detector), signs come straight from the detector.
+        "lanes_ext": [],
+        "road_edges": [],
+        "signs": [],
         "occupancy": None,
         "last_clip_trigger": "none",
         "shadow": {"steer": 0.0, "throttle": 0.0, "brake": 0.0},

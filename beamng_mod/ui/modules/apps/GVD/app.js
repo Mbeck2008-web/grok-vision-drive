@@ -44,7 +44,7 @@ angular.module('beamng.apps')
         detector: null, actuator: null, cmdApplied: null, cmdReason: null,
         cmdSeq: null, cmdAckSeq: null, egoSource: null,
         clipTrigger: null, encodeBackend: null,
-        path: null, tracks: null, lanes: null
+        path: null, tracks: null, lanes: null, edges: null, signs: null, fans: null
       };
       // Cleared when the supervisor is gone: stale numbers must not look live.
       var TELEMETRY = [
@@ -166,6 +166,26 @@ angular.module('beamng.apps')
         if (ui.n !== null && ui.n !== undefined) bits.push(ui.n + ' tracked');
         return bits.join(' · ');
       };
+      // Says out loud how much of the road model was seen vs offset from what was seen.
+      scope.sceneNote = function () {
+        if (ui.link === 'none' || !ui.showScene) return '';
+        var det = 0, pred = 0, stub = 0;
+        var lanes = angular.isArray(ui.lanes) ? ui.lanes : [];
+        for (var i = 0; i < lanes.length; i++) {
+          if (lanes[i].kind === 'detected') det++;
+          else if (lanes[i].kind === 'stub') stub++;
+          else pred++;
+        }
+        var bits = [];
+        if (det) bits.push(det + ' seen');
+        if (pred) bits.push(pred + ' pred');
+        if (stub) bits.push(stub + ' stub');
+        bits = bits.length ? ['lanes ' + bits.join('+')] : ['no lane paint'];
+        if (angular.isArray(ui.edges) && ui.edges.length) bits.push('edges pred');
+        var signs = angular.isArray(ui.signs) ? ui.signs.length : 0;
+        if (signs) bits.push(signs + ' sign' + (signs === 1 ? '' : 's'));
+        return bits.join(' · ');
+      };
       scope.segClass = function (p) {
         return { 'is-on': ui.policy === p, 'is-req': ui.policyReq === p && ui.policy !== p };
       };
@@ -236,6 +256,9 @@ angular.module('beamng.apps')
         ui.path = data.path || null;
         ui.tracks = data.tracks || null;
         ui.lanes = data.lanes || null;
+        ui.edges = data.edges || null;
+        ui.signs = data.signs || null;
+        ui.fans = data.fans || null;
         if (data.link === 'none') {
           for (var i = 0; i < TELEMETRY.length; i++) ui[TELEMETRY[i]] = null;
         }
@@ -291,35 +314,215 @@ angular.module('beamng.apps')
         ctx.closePath();
       }
 
+      function pxPerMeter(y) {
+        return Math.abs(P(1, y, 0)[0] - P(0, y, 0)[0]);
+      }
+      function strokePoly(ctx, pts, z) {
+        ctx.beginPath();
+        for (var j = 0; j < pts.length; j++) {
+          var p = P(pts[j].x, pts[j].y, z || 0);
+          if (j === 0) ctx.moveTo(p[0], p[1]); else ctx.lineTo(p[0], p[1]);
+        }
+      }
+
       function drawGround(ctx) {
+        var sky = ctx.createLinearGradient(0, 0, 0, horizonY);
+        sky.addColorStop(0, '#05070a');
+        sky.addColorStop(1, '#0b1117');
+        ctx.fillStyle = sky;
+        ctx.fillRect(0, 0, cw, Math.max(0, horizonY));
+        var glow = ctx.createLinearGradient(0, horizonY - 14, 0, horizonY + 10);
+        glow.addColorStop(0, 'rgba(90,167,199,0)');
+        glow.addColorStop(0.6, 'rgba(90,167,199,0.10)');
+        glow.addColorStop(1, 'rgba(90,167,199,0)');
+        ctx.fillStyle = glow;
+        ctx.fillRect(0, Math.max(0, horizonY - 14), cw, 24);
+
         var g = ctx.createLinearGradient(0, horizonY, 0, ch);
-        g.addColorStop(0, 'rgba(16,21,26,0)');
-        g.addColorStop(0.35, 'rgba(20,26,32,0.9)');
-        g.addColorStop(1, 'rgba(27,34,41,1)');
-        poly(ctx, [P(-16, 60, 0), P(16, 60, 0), P(16, -12, 0), P(-16, -12, 0)]);
+        g.addColorStop(0, 'rgba(11,14,18,0)');
+        g.addColorStop(0.55, 'rgba(14,18,22,0.7)');
+        g.addColorStop(1, 'rgba(17,21,26,1)');
+        poly(ctx, [P(-14, 60, 0), P(14, 60, 0), P(14, -12, 0), P(-14, -12, 0)]);
         ctx.fillStyle = g;
         ctx.fill();
         ctx.strokeStyle = 'rgba(158,196,212,0.05)';
         ctx.lineWidth = 1;
-        for (var d = 10; d <= 30; d += 10) {
-          var a = P(-4.5, d, 0), b = P(4.5, d, 0);
+        for (var d = 10; d <= 40; d += 10) {
+          var a = P(-6, d, 0), b = P(6, d, 0);
           ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
+        }
+      }
+
+      // Asphalt between the two road edges, so the drivable surface reads as a road
+      // rather than a generic plane. Only drawn when both edges exist.
+      function drawRoadSurface(ctx, edges) {
+        if (!edges || edges.length < 2) return;
+        var l = null, r = null;
+        for (var i = 0; i < edges.length; i++) {
+          if (edges[i].side === 'left') l = edges[i];
+          else if (edges[i].side === 'right') r = edges[i];
+        }
+        if (!l || !r || !l.pts || !r.pts) return;
+        var n = Math.min(l.pts.length, r.pts.length);
+        if (n < 2) return;
+        // Per-segment quads with a distance fade: a single polygon would end in a hard
+        // wall at the last sample instead of dissolving into the void.
+        for (var i = 0; i < n - 1; i++) {
+          var y0 = l.pts[i].y;
+          var a = y0 <= 12 ? 0.9 : Math.max(0, 0.9 * (1 - (y0 - 12) / 16));
+          if (a < 0.02) continue;
+          poly(ctx, [
+            P(l.pts[i].x, l.pts[i].y, 0.005), P(l.pts[i + 1].x, l.pts[i + 1].y, 0.005),
+            P(r.pts[i + 1].x, r.pts[i + 1].y, 0.005), P(r.pts[i].x, r.pts[i].y, 0.005)
+          ]);
+          ctx.fillStyle = 'rgba(48,58,68,' + a.toFixed(3) + ')';
+          ctx.fill();
+        }
+      }
+
+      // Kerb: ground line plus a short raised face, dim when the edge is only predicted.
+      function drawEdges(ctx, edges) {
+        if (!edges || !edges.length) return;
+        for (var i = 0; i < edges.length; i++) {
+          var e = edges[i];
+          if (!e.pts || e.pts.length < 2) continue;
+          var solid = e.kind === 'detected';
+          var top = [];
+          var base = [];
+          for (var j = 0; j < e.pts.length; j++) {
+            base.push(P(e.pts[j].x, e.pts[j].y, 0));
+            top.push(P(e.pts[j].x, e.pts[j].y, 0.14));
+          }
+          var face = base.concat(top.slice().reverse());
+          poly(ctx, face);
+          ctx.fillStyle = rgba(PAPER, solid ? 0.10 : 0.05);
+          ctx.fill();
+          ctx.beginPath();
+          for (var k = 0; k < top.length; k++) {
+            if (k === 0) ctx.moveTo(top[k][0], top[k][1]); else ctx.lineTo(top[k][0], top[k][1]);
+          }
+          ctx.setLineDash(solid ? [] : [5, 5]);
+          ctx.strokeStyle = rgba(PAPER, solid ? 0.34 : 0.20);
+          ctx.lineWidth = 1.2;
+          ctx.stroke();
+          ctx.setLineDash([]);
         }
       }
 
       function drawLanes(ctx, lanes) {
         if (!lanes || !lanes.length) return;
         for (var i = 0; i < lanes.length; i++) {
-          var pl = lanes[i];
-          if (!pl || pl.length < 2) continue;
-          ctx.beginPath();
-          for (var j = 0; j < pl.length; j++) {
-            var p = P(pl[j].x, pl[j].y, 0.02);
-            if (j === 0) ctx.moveTo(p[0], p[1]); else ctx.lineTo(p[0], p[1]);
+          var ln = lanes[i];
+          var pts = ln && (ln.pts || ln);          // tolerate the old plain-polyline shape
+          if (!pts || pts.length < 2) continue;
+          var detected = !ln.kind || ln.kind === 'detected';
+          var outer = Math.max(0, Math.abs(ln.idx || 1) - 1);
+          var fade = Math.max(0.45, 1 - 0.2 * outer);
+          if (detected) {
+            strokePoly(ctx, pts, 0.02);
+            ctx.setLineDash([]);
+            ctx.strokeStyle = rgba(PAPER, 0.10 * fade); ctx.lineWidth = 5; ctx.stroke();
+            ctx.strokeStyle = rgba(PAPER, 0.5 * fade); ctx.lineWidth = 1.5;
+            if (ln.style === 'dashed') ctx.setLineDash([11, 9]);
+            ctx.stroke();
+          } else {
+            // predicted / smoke stub: never as bright as paint we actually saw
+            strokePoly(ctx, pts, 0.02);
+            ctx.setLineDash([6, 7]);
+            ctx.strokeStyle = rgba(PAPER, 0.22 * fade);
+            ctx.lineWidth = 1.2;
+            ctx.stroke();
           }
-          ctx.strokeStyle = rgba(PAPER, 0.10); ctx.lineWidth = 5; ctx.stroke();
-          ctx.strokeStyle = rgba(PAPER, 0.42); ctx.lineWidth = 1.4; ctx.stroke();
+          ctx.setLineDash([]);
         }
+      }
+
+      function drawFans(ctx, fans) {
+        if (!fans || !fans.length) return;
+        for (var i = 0; i < fans.length; i++) {
+          var pts = fans[i].pts;
+          if (!pts || pts.length < 2) continue;
+          strokePoly(ctx, pts, 0.06);
+          ctx.strokeStyle = rgba(ICE, 0.30);
+          ctx.lineWidth = 1.1;
+          ctx.setLineDash([]);
+          ctx.stroke();
+          var last = P(pts[pts.length - 1].x, pts[pts.length - 1].y, 0.06);
+          ctx.fillStyle = rgba(ICE, 0.35);
+          ctx.beginPath();
+          ctx.arc(last[0], last[1], 1.6, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+
+      // Road furniture. Heights are a display convention (nothing measures them); the
+      // position is the detector's crude pinhole estimate, same as any other detection.
+      function drawSigns(ctx, signs) {
+        if (!signs || !signs.length) return;
+        var sorted = signs.slice().sort(function (a, b) { return (b.y || 0) - (a.y || 0); });
+        for (var i = 0; i < sorted.length; i++) {
+          var s = sorted[i];
+          var light = s.cls === 'traffic_light';
+          var h = light ? 3.2 : 2.1;
+          var far = Math.max(0.2, Math.min(1, 1 - ((s.y || 0) - 30) / 25));
+          var scale = pxPerMeter(s.y || 10);
+          var top = P(s.x || 0, s.y || 0, h);
+          var foot = P(s.x || 0, s.y || 0, 0);
+          ctx.strokeStyle = rgba([120, 128, 136], 0.5 * far);
+          ctx.lineWidth = Math.max(1, 0.06 * scale);
+          ctx.beginPath();
+          ctx.moveTo(foot[0], foot[1]);
+          ctx.lineTo(top[0], top[1]);
+          ctx.stroke();
+          if (light) {
+            var w = Math.max(6, 0.34 * scale), hh = Math.max(15, 0.95 * scale);
+            ctx.fillStyle = rgba([26, 31, 36], 0.92 * far);
+            ctx.strokeStyle = rgba(PAPER, 0.30 * far);
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.rect(top[0] - w / 2, top[1] - hh, w, hh);
+            ctx.fill();
+            ctx.stroke();
+            // aspect unknown until something classifies the lamp colour: show all three dim
+            var lampR = Math.max(1.2, w * 0.26);
+            var on = { red: 0, amber: 1, green: 2 }[String(s.state)];
+            var lampCol = [[192, 84, 74], [214, 168, 76], [110, 190, 130]];
+            for (var l = 0; l < 3; l++) {
+              var cy2 = top[1] - hh + hh * (0.22 + 0.28 * l);
+              ctx.fillStyle = (on === l) ? rgba(lampCol[l], 0.95 * far) : rgba([58, 64, 70], 0.85 * far);
+              ctx.beginPath();
+              ctx.arc(top[0], cy2, lampR, 0, Math.PI * 2);
+              ctx.fill();
+            }
+          } else {
+            var r = Math.max(5, 0.38 * scale);
+            ctx.beginPath();
+            for (var k = 0; k < 8; k++) {
+              var ang = Math.PI / 8 + k * Math.PI / 4;
+              var px = top[0] + r * Math.cos(ang), py = top[1] - r + r * Math.sin(ang);
+              if (k === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+            }
+            ctx.closePath();
+            ctx.fillStyle = rgba([176, 74, 66], 0.85 * far);
+            ctx.fill();
+            ctx.strokeStyle = rgba(PAPER, 0.55 * far);
+            ctx.lineWidth = 1;
+            ctx.stroke();
+            if (r > 6) {
+              ctx.fillStyle = rgba(PAPER, 0.85 * far);
+              ctx.fillRect(top[0] - r * 0.5, top[1] - r * 1.08, r, Math.max(1, r * 0.16));
+            }
+          }
+        }
+      }
+
+      // Sink the far field into the void so depth reads at a glance.
+      function drawFog(ctx) {
+        var f = ctx.createLinearGradient(0, Math.max(0, horizonY - 6), 0, horizonY + ch * 0.30);
+        f.addColorStop(0, 'rgba(7,8,10,0.92)');
+        f.addColorStop(1, 'rgba(7,8,10,0)');
+        ctx.fillStyle = f;
+        ctx.fillRect(0, Math.max(0, horizonY - 6), cw, ch * 0.34);
       }
 
       function drawCorridor(ctx, path, halfW, conf, preview) {
@@ -553,12 +756,17 @@ angular.module('beamng.apps')
         ctx.fillRect(0, 0, w, h);
         ctx.globalAlpha = ui.link === 'stale' ? 0.55 : 1;
         drawGround(ctx);
+        drawRoadSurface(ctx, ui.edges);
         drawLanes(ctx, ui.lanes);
+        drawEdges(ctx, ui.edges);
         if (smoothPath) {
           drawCorridor(ctx, smoothPath, Math.max(0.9, (ui.pathWidth || 2.0) * 0.5),
             ui.pathConf === null || ui.pathConf === undefined ? 0.5 : ui.pathConf, !!ui.pathPreview);
         }
+        drawFans(ctx, ui.fans);
         drawTracks(ctx, tracks);
+        drawSigns(ctx, ui.signs);
+        drawFog(ctx);
         drawEgo(ctx, ui.engaged && live);
         ctx.globalAlpha = 1;
       }

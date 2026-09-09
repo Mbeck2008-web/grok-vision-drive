@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Offline checks for the in-game GVD app (no BeamNG required).
+"""Offline checks for the in-game GVD app and its viz bridge (no BeamNG required).
 
-Guards the three things that break silently: app.json wiring, the app.js <-> gvd_main
-Lua contract, and the "no FSD / Tesla chrome" rule.
+Guards what breaks silently: app.json wiring, the app.js <-> gvd_main Lua contract, the
+"no FSD / Tesla chrome" rule, the M6 retail drive path surviving UI edits, and the road
+model never inventing lanes it did not see.
 """
 from __future__ import annotations
 
@@ -84,7 +85,55 @@ def main() -> None:
     # Session gate: a pref from a past run must not override --policy at launch.
     assert "_ui_request_is_live" in run_vision
 
+    # The UI layer shares main.lua with the M6 retail drive: a HUD refactor must not eat it.
+    for symbol in ("VE_APPLY_FMT", "VE_RELEASE", "VE_ARCADE", "VE_FEEDBACK", "CMD_STALE_S",
+                   "CMD_DEAD_S", "applyCmdJson", "releaseInputs", "syncEngageFromSupervisor",
+                   "function M.onEgoFeedback", "gvd_ego.json"):
+        assert symbol in lua, f"main.lua lost the retail drive path: {symbol}"
+    assert "input.event('steering'" in lua and "input.event('throttle'" in lua
+    assert "applying = applying" in lua, "gvdUi must carry the drive flag for the DRIVE state"
+    assert "'DRIVE'" in app_js and "steer to take over" in app_js
+
+    # Scene geometry the app reads has to be what the Lua bridge sends.
+    for key in ("lanes", "edges", "signs", "fans", "tracks", "path"):
+        assert re.search(rf"\b{key} = ", lua), f"gvdUi payload missing {key}"
+        assert f"ui.{key}" in app_js, f"app.js never reads {key}"
+
+    _check_road_model()
     print("test_gvd_ui_app: OK")
+
+
+def _check_road_model() -> None:
+    """Predicted lanes need a detected anchor; kerbs are never claimed as detected."""
+    sys.path.insert(0, str(ROOT))
+    from python.perception.detect import STATIC_CLASSES, coco_class_name
+    from python.perception.road_model import LANE_CONF_MIN, lanes_ext, road_edges
+
+    assert coco_class_name(9) == "traffic_light" and coco_class_name(11) == "stop_sign"
+    assert coco_class_name(2) == "vehicle" and coco_class_name(63) is None
+    assert set(STATIC_CLASSES) == {"traffic_light", "stop_sign"}
+
+    lanes = [[{"x": -1.8, "y": y} for y in range(2, 30, 4)],
+             [{"x": 1.8, "y": y} for y in range(2, 30, 4)]]
+    ext = lanes_ext(lanes, 0.8)
+    kinds = [l["kind"] for l in ext]
+    assert kinds.count("detected") == 2 and kinds.count("predicted") == 2, ext
+    assert {l["index"] for l in ext} == {-1, 1, -2, 2}
+    assert all(e["kind"] == "predicted" for e in road_edges(ext)), "kerbs are never detected"
+    # No paint seen → nothing predicted, no kerbs. Weak fit → detected only.
+    assert lanes_ext([], 0.9) == [] and road_edges([]) == []
+    weak = lanes_ext(lanes, LANE_CONF_MIN - 0.01)
+    assert all(l["kind"] == "detected" for l in weak) and len(weak) == 2
+
+    # Road furniture must never reach the tracker (CIPV / AEB / ghosts read tracks).
+    from python.perception.pipeline import ModularPerception
+    import numpy as np
+
+    out = ModularPerception(allow_synthetic=True).tick(np.zeros((240, 320, 3), dtype=np.uint8))
+    assert {s["cls"] for s in out.signs} == {"stop_sign", "traffic_light"}, out.signs
+    assert all(t["class"] not in STATIC_CLASSES for t in out.tracks), out.tracks
+    light = [s for s in out.signs if s["cls"] == "traffic_light"][0]
+    assert light["state"] == "unknown", "no lamp-colour classifier exists — never guess"
 
 
 if __name__ == "__main__":

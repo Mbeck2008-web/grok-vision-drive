@@ -87,7 +87,7 @@ mods\unpacked\gvd\
 
 After install, start a level, open the **Apps** editor (Esc → *UI Apps*, or the app-layout button on the HUD), drag **GVD** in from the app list, size it, then **Save layout**. Source: `beamng_mod/ui/modules/apps/GVD/`.
 
-The app draws an ego-centric **VISION scene** — corridor ribbon, tracked-object boxes with the CIPV tagged `LEAD`, detected lane polylines — from the same `Documents/GVD/gvd_state.json` that feeds the world ribbon, plus:
+The app draws an ego-centric **VISION scene** from the same `Documents/GVD/gvd_state.json` that feeds the world ribbon: road surface between the kerbs, ego-lane and neighbouring lane boundaries, the corridor ribbon, tracked-object boxes with the CIPV tagged `LEAD` and their forecast fans, plus stop signs and traffic lights when the detector sees them. Detected geometry is drawn solid, anything predicted is dim and dashed, and a line under the scene says which is which (`lanes 2 seen+2 pred · edges pred · 2 signs`). See [`docs/gvd_state_schema.md`](docs/gvd_state_schema.md#viz-road-model-in-game-scene) for what is measured vs inferred. Controls:
 
 - **Engage / Disengage** — the same toggle as Alt+A. The state strip reads `DRIVE` (the mod is feeding the player vehicle from `gvd_cmd.json`, or BeamNGpy is applying on Tech — steer to take over), `ENGAGED` (armed, nothing applied yet), `HOLD` (heartbeat stale → dead-man, inputs released) or `DISENGAGED` with the last reason.
 - **Path / Ghosts / Scene** — writes `gvd_ui_prefs.json`, so the world ribbon and the OpenCV window follow. `Scene` switches the canvas off (it shares the GPU with BeamNG).

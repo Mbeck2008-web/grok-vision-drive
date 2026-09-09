@@ -52,6 +52,11 @@
     .gvd-hud-l { left:8px; }
     .gvd-hud-r { right:8px; }
     .gvd-hud-r.is-warn b { color:var(--amber); }
+    .gvd-scene-note {
+      position:absolute; left:8px; bottom:5px; max-width:62%;
+      font-size:8px; letter-spacing:0.06em; color:#69737d; text-shadow:0 1px 2px #000;
+      white-space:nowrap; overflow:hidden; text-overflow:ellipsis; pointer-events:none;
+    }
     .gvd-veil {
       position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
       background:rgba(7,8,10,0.62);
@@ -133,7 +138,10 @@
       font-family:inherit; font-size:9px; letter-spacing:0.16em; text-transform:uppercase; color:var(--faint);
     }
     .gvd-nerdbtn:hover { color:var(--ice); }
-    .gvd-foot { font-size:9px; color:#454c53; letter-spacing:0.02em; }
+    .gvd-foot {
+      font-size:9px; color:#454c53; letter-spacing:0.02em;
+      white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+    }
   </style>
 
   <div class="gvd-row gvd-head">
@@ -151,6 +159,7 @@
     <div class="gvd-hud gvd-hud-r" ng-class="{'is-warn': ui.ttc != null && ui.ttc < 2}" ng-if="ui.link === 'live'">
       <b>{{ ui.ttc == null ? '--' : fmt1(ui.ttc) }}</b><i>S TTC</i>
     </div>
+    <div class="gvd-scene-note" ng-if="ui.link === 'live'">{{ sceneNote() }}</div>
     <div class="gvd-veil" ng-class="{'is-none': ui.link === 'none'}" ng-if="ui.link !== 'live'">
       <span>{{ veil() }}</span>
     </div>
@@ -203,5 +212,5 @@
     <div class="gvd-kv"><span>heartbeat</span><b>{{ beatLine() }}</b></div>
   </div>
 
-  <div class="gvd-foot">DRIVE = GVD holds the wheel; steer to take over. Sim toy · camera-only · never a real car.</div>
+  <div class="gvd-foot">DRIVE = GVD steers; take over any time. Sim toy, never a real car.</div>
 </div>

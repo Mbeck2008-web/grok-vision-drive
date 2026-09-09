@@ -58,8 +58,12 @@ local HB_STALE_S = 0.35
 -- Caps for the geometry we hand to the in-game app (keep the guihooks payload small)
 local UI_PATH_PTS = 28
 local UI_TRACKS = 12
-local UI_LANES = 3
+local UI_LANES = 6
 local UI_LANE_PTS = 12
+local UI_EDGES = 2
+local UI_SIGNS = 8
+local UI_FANS = 6
+local UI_FAN_PTS = 8
 local CAM_IDS = { 'narrow', 'main', 'wide', 'pillarL', 'pillarR', 'repeatL', 'repeatR', 'rear' }
 
 local function onInit()
@@ -673,22 +677,93 @@ local function uiTracks(st)
   return out
 end
 
+local function uiPoly(poly, cap)
+  if type(poly) ~= 'table' or #poly < 2 then return nil end
+  local step = math.max(1, math.floor(#poly / cap))
+  local pts = {}
+  for i = 1, #poly, step do
+    local p = poly[i]
+    pts[#pts + 1] = { x = r2(p.x or p[1] or 0), y = r2(p.y or p[2] or 0) }
+    if #pts >= cap then break end
+  end
+  if #pts < 2 then return nil end
+  return pts
+end
+
+-- lanes_ext carries kind detected|predicted|stub per boundary; lanes_bev (older supervisor)
+-- only ever holds what the Hough fit actually saw, so it maps to kind=detected.
 local function uiLanes(st)
-  local src = st and st.lanes_bev
+  if type(st) ~= 'table' then return nil end
+  local out = {}
+  local ext = st.lanes_ext
+  if type(ext) == 'table' and #ext > 0 then
+    for _, ln in ipairs(ext) do
+      if #out >= UI_LANES then break end
+      local pts = uiPoly(ln.points, UI_LANE_PTS)
+      if pts then
+        out[#out + 1] = {
+          pts = pts,
+          kind = tostring(ln.kind or 'detected'),
+          side = tostring(ln.side or ''),
+          style = tostring(ln.style or 'unknown'),
+          idx = tonumber(ln.index) or 0,
+        }
+      end
+    end
+  elseif type(st.lanes_bev) == 'table' then
+    for _, poly in ipairs(st.lanes_bev) do
+      if #out >= UI_LANES then break end
+      local pts = uiPoly(poly, UI_LANE_PTS)
+      if pts then
+        out[#out + 1] = { pts = pts, kind = 'detected', side = '', style = 'unknown', idx = 0 }
+      end
+    end
+  end
+  if #out == 0 then return nil end
+  return out
+end
+
+local function uiEdges(st)
+  local src = st and st.road_edges
   if type(src) ~= 'table' then return nil end
   local out = {}
-  for _, poly in ipairs(src) do
-    if #out >= UI_LANES then break end
-    if type(poly) == 'table' and #poly > 1 then
-      local step = math.max(1, math.floor(#poly / UI_LANE_PTS))
-      local pts = {}
-      for i = 1, #poly, step do
-        local p = poly[i]
-        pts[#pts + 1] = { x = r2(p.x or p[1] or 0), y = r2(p.y or p[2] or 0) }
-        if #pts >= UI_LANE_PTS then break end
-      end
-      if #pts > 1 then out[#out + 1] = pts end
+  for _, e in ipairs(src) do
+    if #out >= UI_EDGES then break end
+    local pts = uiPoly(e.points, UI_LANE_PTS)
+    if pts then
+      out[#out + 1] = { pts = pts, kind = tostring(e.kind or 'predicted'), side = tostring(e.side or '') }
     end
+  end
+  if #out == 0 then return nil end
+  return out
+end
+
+local function uiSigns(st)
+  local src = st and st.signs
+  if type(src) ~= 'table' or #src == 0 then return nil end
+  local out = {}
+  for _, s in ipairs(src) do
+    if #out >= UI_SIGNS then break end
+    out[#out + 1] = {
+      cls = tostring(s.cls or 'sign'),
+      x = r2(s.x or 0),
+      y = r2(s.y or 0),
+      conf = r2(s.conf),
+      state = s.state and tostring(s.state) or nil,
+    }
+  end
+  return out
+end
+
+-- Forecast fans: mode-0 constant-yaw-rate toy written by the supervisor (state.agents).
+local function uiFans(st)
+  local src = st and st.agents
+  if type(src) ~= 'table' or #src == 0 then return nil end
+  local out = {}
+  for _, ag in ipairs(src) do
+    if #out >= UI_FANS then break end
+    local pts = uiPoly(ag.path_ego, UI_FAN_PTS)
+    if pts then out[#out + 1] = { id = tonumber(ag.id), pts = pts } end
   end
   if #out == 0 then return nil end
   return out
@@ -804,7 +879,10 @@ local function uiPayload()
     -- scene geometry (ego frame: x right, y forward), capped + rounded
     path = (showScene and showPath) and uiPathPoints(st) or nil,
     tracks = (showScene and showAgentGhosts) and uiTracks(st) or nil,
+    fans = (showScene and showAgentGhosts) and uiFans(st) or nil,
     lanes = showScene and uiLanes(st) or nil,
+    edges = showScene and uiEdges(st) or nil,
+    signs = showScene and uiSigns(st) or nil,
     mode = mode .. modeTag,
     text = line,
   }

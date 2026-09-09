@@ -4,8 +4,8 @@ title GVD Play
 cd /d "%~dp0"
 
 rem Retail launcher (M6): 1-cam window capture + GVD VISION window + Steam BeamNG.
-rem Honesty: retail = ONE window capture (main cam). 8-cam rig + driving = BeamNG.tech + BeamNGpy.
-rem Tech users: set GVD_BACKEND=beamngpy before running. Extra args pass through to run_vision.py.
+rem Honesty: retail = ONE window capture (main cam); Engage drives the car via gvd_cmd.json -> mod Lua.
+rem 8-cam rig + BeamNGpy direct control = BeamNG.tech (set GVD_BACKEND=beamngpy). Extra args pass through.
 if not defined GVD_BACKEND set "GVD_BACKEND=window"
 
 set "PY="
@@ -53,7 +53,8 @@ if errorlevel 1 (
 
 :supervisor
 echo [GVD] Starting supervisor: %RUN%  (backend=%GVD_BACKEND%)
-echo [GVD] Retail = 1 window capture, main cam only. 8-cam rig + driving need BeamNG.tech + BeamNGpy.
+echo [GVD] Retail = 1 window capture, main cam only. Engage drives the car via gvd_cmd.json -^> mod Lua.
+echo [GVD] 8-cam rig + BeamNGpy direct control need BeamNG.tech (Tech path, preferred).
 rem cmd /k keeps the supervisor console open so errors stay readable.
 start "GVD supervisor" /D "%RUNROOT%" cmd /k %PY% "%RUN%" --backend %GVD_BACKEND% --viz %*
 
@@ -63,7 +64,8 @@ start "" "steam://rungameid/284160" 2>nul
 echo [GVD] Mods expect: %%LOCALAPPDATA%%\BeamNG\BeamNG.drive\current\mods\unpacked\gvd  (0.38+)
 echo [GVD] Legacy also: %%LOCALAPPDATA%%\BeamNG.drive\^<ver^>\mods\unpacked\gvd
 echo [GVD] Run install.bat if Mod Manager is empty. Alt+A or the GVD app = Engage (ribbon + HUD).
-echo [GVD] Retail does NOT steer the car (no BeamNGpy vehicle handle). Quit supervisor: q in GVD VISION.
+echo [GVD] Engaged + both lane lines seen = HUD DRIVE, GVD holds the wheel. Steer or Alt+A to take over.
+echo [GVD] Quit supervisor: q in GVD VISION (car is released, HUD goes OFF).
 pause
 endlocal
 exit /b 0

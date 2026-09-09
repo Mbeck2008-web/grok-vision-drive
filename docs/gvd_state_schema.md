@@ -38,14 +38,17 @@ Lua: `gvd_main.drawPath` on `onPreRender` / `onDebugDraw`. Engaged-only (Alt+A).
 
 | `engaged` | bool | Mirrored from Alt+A via `gvd_engage.json` (Lua writes; Python reads) |
 | `disengage_reason` | string | `none` / `not_engaged` / `preview_blocked` / `heartbeat_stale` / `driver_override` / … |
-| `actuator` | string | `beamngpy` / `cmd_json` / `null` |
+| `actuator` | string | `beamngpy` (Tech) / `cmd_json` (retail: GELua applies) / `null` |
 | `cmd_seq` | int | Monotonic command sequence |
-| `cmd_applied` | bool | True only when BeamNGpy `vehicle.control` ran; `cmd_json` sink stays false |
-| `cmd_reason` | string | Gate / plan reason; `cmd_json_sink` = file written, car not moved |
-| `ego.speed_mps` | float | From Electrics `wheelspeed`/`airspeed` when available; else last known (not invented 10) |
+| `cmd_applied` | bool | True when BeamNGpy `vehicle.control` ran, **or** the mod acked the seq via `gvd_ego.json` (fresh, `applying`) |
+| `cmd_reason` | string | Gate / plan reason; `cmd_json_applied` (acked) / `cmd_json_pending` (written, no ack) / `cmd_json_idle` (not engaged) |
+| `ego.speed_mps` | float | From Electrics `wheelspeed`/`airspeed` (BeamNGpy) or the mod's `gvd_ego.json` echo; else last known (not invented 10) |
 | `ego.throttle` / `ego.brake` | float | Last commanded values |
+| `ego_source` | string | `beamngpy` / `lua` (gvd_ego.json fresh) / `none` — M6 |
+| `cmd_ack_seq` | int | Last `applied_seq` echoed by the mod (-1 none) — M6 |
+| `lua_applying` | bool | Mod currently holds the player vehicle's inputs — M6 |
 
-Also: `Documents/GVD/gvd_cmd.json` = `{steer,throttle,brake,seq,heartbeat_mtime}` fallback sink.
+Also: `Documents/GVD/gvd_cmd.json` = `{steer,throttle,brake,seq,engaged,heartbeat_mtime,reason}` (see M6 below).
 
 
 ## M4 fields
@@ -96,7 +99,32 @@ Path: `Documents/GVD/gvd_engage.json`, shared by GELua and Python.
 | Lua (`gvd_main.toggleEngage`) | `{"engaged":true\|false,"mtime":<os.time() int>}` | Alt+A / GVD app button |
 | Python (`write_engage_flag`) | `{"engaged": false, "mtime": <time.time() float>}` | modular veto / stale heartbeat / `finally` on exit |
 
-Python reads the file every tick and mirrors it into `engaged` (never invents engage). Lua polls it every 0.1 s **only while engaged** and adopts `engaged=false` when the file says so and `mtime` ≥ Lua's own last toggle stamp; it logs `[GVD] DISENGAGED by supervisor (<disengage_reason>)` and refreshes the HUD/UI app. A file saying `true` never engages Lua — engage always starts in-game.
+Python reads the file every tick and mirrors it into `engaged` (never invents engage). Lua polls it every 0.1 s **only while engaged** and adopts `engaged=false` when the file says so and `mtime` ≥ Lua's own last toggle stamp; it logs `[GVD] DISENGAGED by supervisor (<disengage_reason>)`, releases the vehicle inputs and refreshes the HUD/UI app. A file saying `true` never engages Lua — engage always starts in-game. Python also writes `false` on `driver_override` (sticky) and Lua writes `false` when its dead-man fires.
 
-Retail (`capture_backend=window`): `actuator=cmd_json`, `cmd_applied=false`, `cmd_reason=cmd_json_sink` — the car is not driven. Boot line: `backend=window cams=1/8 path=retail (1 window capture; not 8)`.
+## M6 — retail drive bus (`gvd_cmd.json` → vehicle, `gvd_ego.json` ← vehicle)
+
+`Documents/GVD/gvd_cmd.json` — written by Python every tick (`CmdJsonActuator`, atomic tmp+replace with retry):
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `steer` | -1..1 | `+` = right (BeamNG `input.event('steering')` / `kbdSteer` convention) |
+| `throttle` / `brake` | 0..1 | Brake > 0 ⇒ Lua forces throttle 0 |
+| `seq` | int | Monotonic; Lua treats a non-advancing seq as a stalled supervisor |
+| `engaged` | bool | Supervisor-side engaged after gates. Lua applies **only** when this is true and it is engaged itself |
+| `heartbeat_mtime` | float | `time.time()`; Lua ignores files whose stamp is > 3 s behind `os.time()` (old session) |
+| `reason` | string | `ok` / `preview_blocked` / `not_engaged` / `veto:*` / … (diagnostic) |
+
+Lua (`gvd_main.applyCmdJson`, 20 Hz): `input.event('steering', s, 1)`; `input.event('throttle', t, 2)`; `input.event('brake', b, 2)` on `be:getPlayerVehicle(0)` via `queueLuaCommand`; `drivetrain.setShifterMode('arcade')` once. No new seq for 0.35 s → steer 0 / throttle 0 / brake 1 hold; 3 s → release (all 0), `engaged=false`, `gvd_engage.json` false. Any disengage (Alt+A, supervisor false, unload) sends one release and stops applying. `cmd.engaged=false` → release immediately (no brake tap on the player).
+
+`Documents/GVD/gvd_ego.json` — written by Lua at ~10 Hz while the supervisor's state heartbeat is alive (vehicle Lua `electrics.values` → `obj:queueGameEngineLua` → `gvd_main.onEgoFeedback`):
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `speed_mps` | float | `wheelspeed` (fallback `airspeed`) — feeds `ego.speed_mps`, TTC, speed plan |
+| `steering_input` / `throttle_input` / `brake_input` | float | Driver-override detection uses `steering_input` |
+| `applied_seq` | int | Last cmd seq Lua applied |
+| `applying` | bool | Lua currently holds the inputs |
+| `mtime` | int | `os.time()`; Python uses the file mtime, fresh ≤ 1 s |
+
+Retail (`capture_backend=window`): `actuator=cmd_json`; `cmd_applied` follows the ack. Boot line: `backend=window cams=1/8 path=retail (1 window capture; not 8; drive=gvd_cmd.json->mod Lua)`.
 

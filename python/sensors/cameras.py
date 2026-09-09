@@ -223,13 +223,14 @@ class WindowBackend:
         frames: dict[str, np.ndarray] = {}
         timestamps: dict[str, float] = {}
         img = None
-        # refresh title match occasionally
+        # If BeamNG title appears after open(), recreate capture on the window (not full monitor)
         if self._region is None:
             rect = _find_beamng_window_rect()
             if rect:
-                l, t, w, h = rect
-                self._region = {"left": l, "top": t, "width": w, "height": h}
+                l, top, w, h = rect
+                self._region = {"left": l, "top": top, "width": w, "height": h}
                 self._note = "retail: 1 window (BeamNG title match)"
+                self._recreate_capture()
 
         try:
             if self._cam is not None:
@@ -387,29 +388,21 @@ class BeamNGPyBackend:
             self._logged = True
 
     def _resolve_vehicle(self, bng: Any) -> Any:
-        # Prefer already-spawned vehicles in the running Tech session
+        """Return an already-spawned vehicle from the Tech session, or None (honest miss)."""
         try:
             current = bng.vehicles.get_current()
             if isinstance(current, dict) and current:
-                # values may be Vehicle instances or need re-connect
                 for _name, veh in current.items():
                     try:
-                        # ensure connected
                         if hasattr(veh, "is_connected") and not veh.is_connected():
-                            bng.connect_vehicle(veh)  # type: ignore[attr-defined]
+                            if hasattr(bng, "connect_vehicle"):
+                                bng.connect_vehicle(veh)
                     except Exception:
                         pass
                     return veh
         except Exception:
             pass
-        try:
-            from beamngpy import Vehicle  # type: ignore
-
-            veh = Vehicle("gvd_ego", model="etk800")
-            # Some builds: enter existing by state
-            bng.poll_vehicles()  # type: ignore[attr-defined]
-        except Exception:
-            return None
+        # Do not invent a disconnected Vehicle("gvd_ego") — that never attached Cameras.
         return None
 
     def close(self) -> None:

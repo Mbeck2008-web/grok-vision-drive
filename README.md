@@ -56,13 +56,15 @@ After install, open BeamNG **Apps** and add **GVD** (`beamng_mod/ui/modules/apps
 
 ## Status
 
-**M3 (actuation, this PR):** sim-only. Preferred BeamNGpy `vehicle.control` (arcade); fallback atomic `Documents/GVD/gvd_cmd.json` (no DLL). Engage = Alt+A → `gvd_engage.json`. No drive when `path_debug_preview=true` unless `--allow-preview-drive`. Ego speed from Electrics when present (never invent 10 m/s). Stale heartbeat / disengage / shutdown → throttle 0 + brake. **Arcade + hold brake can auto-shift reverse** — AEB keeps `throttle=0`. Live BeamNG.tech still **UNPROVEN on Linux**.
+**M5 (shadow + tiny E2E, this PR):** Perception always runs; actuators only when engaged. `--policy modular|e2e|shadow` (default **modular** = safety supervisor, vetoes E2E). `policy_e2e` = PilotNet-scale tiny CNN/MLP stub: 2×320×180 (main+wide) + speed/steer → `{steer, accel}`; loads `models/e2e_current.onnx` if present else numpy stub. Shadow fields `shadow.{steer,throttle,brake}` written every tick; modular veto on low `lane_conf` / heartbeat / disagreement → hold/disengage (+ clip if recorder). Toy VRAM ~0.15–0.4 GB. No transformers/ViT/BEV/AutoSteer-HD; no Tesla/FSD chrome; no real-car.
 
-**M2 (perception):** detect→track→CIPV→corridor; live default no synthetic cars; `path_debug_preview=false` only for lane-derived corridor.
+**M4 (clips):** ring-buffer + QSV/libx264 flush on disengage / AEB / near-miss / key C.
 
-**M1 (cameras + hw probe):** `beamngpy | window | stub`, 8-cam yaml, hw_probe. Live Camera attach / Alt+A still **UNPROVEN on Linux**.
+**M3 (actuation):** sim-only BeamNGpy `vehicle.control` / `gvd_cmd.json`. Engage Alt+A. Dead-man unchanged.
 
-M4 clips next.
+**M2 (perception):** detect→track→CIPV→corridor; live default no synthetic cars.
+
+**M1 (cameras + hw probe):** `beamngpy | window | stub`, 8-cam yaml, hw_probe. Live still **UNPROVEN on Linux**.
 
 Host profile (target): Intel **i9-9900K** + **UHD 630** (QSV encode) + **GTX 1080 Ti 11 GB** (infer ≤4 GB) + **32 GB DDR4**. See `config/hardware.yaml`.
 
@@ -145,3 +147,17 @@ PYTHONPATH=. python python/run_vision.py --viz            # key C = manual clip
 ```
 
 Clips land in `Documents/GVD/clips/` (repo `data/clips/` gitignored). Encode: `ffmpeg` `h264_qsv` if `hw_probe` qsv=yes, else `libx264` veryfast CRF~23. `--encode nvenc` only when you explicitly want Pascal encode (not default).
+
+
+## Shadow / E2E (M5)
+
+```bash
+PYTHONPATH=. python python/run_vision.py --smoke
+PYTHONPATH=. python python/run_vision.py --policy shadow --backend stub
+PYTHONPATH=. python python/run_vision.py --policy e2e --backend stub   # stub if no models/e2e_current.onnx
+PYTHONPATH=. python scripts/test_m5_shadow.py
+PYTHONPATH=. python -m python.train.train_e2e --smoke
+```
+
+Modular veto thresholds: `config/control.yaml`. E2E input 320×180: `config/perception.yaml` / `control.yaml`. Weights stay out of git.
+

@@ -93,6 +93,10 @@ def default_state(**overrides: Any) -> dict[str, Any]:
         "lanes_bev": [],
         "occupancy": None,
         "last_clip_trigger": "none",
+        "shadow": {"steer": 0.0, "throttle": 0.0, "brake": 0.0},
+        "e2e_ok": True,
+        "veto_reason": "none",
+        "e2e_backend": "stub",
         "missing_state_keys": [
             "tracks",
             "lanes_bev",

@@ -1,0 +1,11 @@
+# GVD perception knobs (M2+) + M5 E2E input size.
+live_input_long_side: 640
+lanes:
+  conf_min_ok: 0.25
+e2e:
+  input_w: 320
+  input_h: 180
+  cams: [main, wide]
+detector:
+  prefer: yolov8n-onnx
+  allow_synthetic_default: false

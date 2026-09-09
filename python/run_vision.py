@@ -1,4 +1,4 @@
-"""GVD supervisor — cameras + perception + actuation + M4 clips + gvd_state.json."""
+"""GVD supervisor — cameras + perception + actuation + M4 clips + M5 shadow/E2E + gvd_state.json."""
 
 from __future__ import annotations
 
@@ -20,13 +20,28 @@ from python.control.actuate import (
     safe_command,
     write_engage_flag,
 )
+from python.control.e2e import make_e2e
 from python.data.record import ClipRecorder, choose_encoder
 from python.perception.pipeline import ModularPerception
 from python.runtime.hw_probe import probe, refuse_live_start
+from python.runtime.shadow import load_shadow_config, shadow_tick
 from python.runtime.state_io import default_state, state_path, steer_preview_path_ego, write_state
 from python.sensors.cameras import make_backend, resolve_backend_name
 from python.viz.monitors import place_opencv_window
 from python.viz.stage import VizUI, render_stage, smoke
+
+
+
+def _load_control_yaml() -> dict:
+    try:
+        import yaml  # type: ignore
+
+        p = ROOT / "config" / "control.yaml"
+        if p.is_file():
+            return yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    except Exception:
+        pass
+    return {}
 
 
 def _rss_mb() -> float:
@@ -124,7 +139,7 @@ def _read_ui_prefs() -> dict:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="GVD supervisor + M2/M3/M4")
+    ap = argparse.ArgumentParser(description="GVD supervisor + M2/M3/M4/M5")
     ap.add_argument("--viz", action="store_true")
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--hz", type=float, default=15.0)
@@ -144,6 +159,12 @@ def main() -> None:
         "--force-engage",
         action="store_true",
         help="Dev only: treat as engaged without Alt+A gvd_engage.json (never default)",
+    )
+    ap.add_argument(
+        "--policy",
+        default="modular",
+        choices=["modular", "e2e", "shadow"],
+        help="M5: modular (default supervisor) | e2e | shadow (compute both; actuate modular unless e2e)",
     )
     ap.add_argument(
         "--encode",
@@ -172,9 +193,40 @@ def main() -> None:
         for i in range(8):
             rec.push(fake, {"engaged": True, "planner": {"aeb": "off"}, "ego": {}}, now=time.time() + i * 0.05)
         path = rec.flush("smoke")
+        # M5: stub E2E + shadow fields into state
+        e2e = make_e2e()
+        cfg = load_shadow_config()
+        tick = shadow_tick(
+            policy=args.policy,
+            engaged=False,
+            heartbeat_ok=True,
+            path_debug_preview=True,
+            allow_preview_drive=False,
+            path_ego=None,
+            planner={"aeb": "off", "target_v": 0.0},
+            ego_speed_mps=0.0,
+            lane_conf=0.0,
+            path_conf=0.0,
+            seq=0,
+            e2e_policy=e2e,
+            main_bgr=fake,
+            wide_bgr=fake,
+            cfg=cfg,
+        )
+        st = default_state(policy=args.policy, engaged=False)
+        st["shadow"] = {
+            "steer": tick.shadow.get("steer", 0.0),
+            "throttle": tick.shadow.get("throttle", 0.0),
+            "brake": tick.shadow.get("brake", 0.0),
+        }
+        st["e2e_ok"] = bool(tick.e2e_ok)
+        st["veto_reason"] = tick.veto_reason
+        st["e2e_backend"] = e2e.backend
+        write_state(st)
         print(f"[GVD] smoke frame -> {out}")
         print(f"[GVD] state -> {state_path()}")
         print(f"[GVD] clip dry-run -> {path} trigger={rec.last_clip_trigger} enc={rec.encoder}")
+        print(f"[GVD] M5 policy={args.policy} e2e={e2e.name} shadow={st['shadow']} veto={st['veto_reason']}")
         return
 
     backend_name = resolve_backend_name(None if args.backend == "auto" else args.backend)
@@ -194,6 +246,8 @@ def main() -> None:
     if vehicle is not None:
         attach_electrics(vehicle, bng)
     actuator = make_actuator(vehicle, prefer_beamngpy=True)
+    e2e_policy = make_e2e()
+    shadow_cfg = load_shadow_config(_load_control_yaml())
 
     allow_nvenc = args.encode == "nvenc"
     if args.encode == "nvenc":
@@ -210,6 +264,7 @@ def main() -> None:
     )
 
     print(f"[GVD] camera backend={backend.name} detector={perc.detector.name} actuator={actuator.name}")
+    print(f"[GVD] M5 policy={args.policy} e2e={e2e_policy.name} (modular vetoes E2E; shadow writes both)")
     print(f"[GVD] clip encoder={recorder.encoder} (qsv prefer; never default nvenc)")
     print(f"[GVD] state path: {state_path()}")
     print("[GVD] Vision-only: no LiDAR/radar/GPS-loc/HD-map in the live loop.")
@@ -260,7 +315,14 @@ def main() -> None:
             heartbeat_ok = True
 
             cmd_seq += 1
-            cmd = safe_command(
+            wide = None
+            try:
+                wide = bundle.frames.get("wide")
+            except Exception:
+                wide = None
+
+            tick = shadow_tick(
+                policy=args.policy,
                 engaged=engaged,
                 heartbeat_ok=heartbeat_ok,
                 path_debug_preview=bool(pout.path_debug_preview),
@@ -268,11 +330,23 @@ def main() -> None:
                 path_ego=pout.path_ego,
                 planner=pout.planner,
                 ego_speed_mps=ego_v,
+                lane_conf=float(pout.lane_conf),
+                path_conf=float(pout.path_conf),
                 seq=cmd_seq,
-                policy="modular",
+                e2e_policy=e2e_policy,
+                main_bgr=main,
+                wide_bgr=wide,
+                steer_deg=steer,
+                cfg=shadow_cfg,
             )
+            cmd = tick.applied
+
             if not engaged:
                 disengage_reason = "not_engaged"
+            elif tick.should_disengage:
+                engaged = False
+                disengage_reason = tick.veto_reason if tick.veto_reason != "none" else "veto"
+                write_engage_flag(False)
             elif cmd.reason == "preview_blocked":
                 disengage_reason = "preview_blocked"
             elif cmd.reason == "heartbeat_stale":
@@ -290,12 +364,16 @@ def main() -> None:
                     seq=cmd_seq,
                 )
 
-            applied = actuator.apply(cmd) if cmd.reason == "ok" else actuator.stop(seq=cmd_seq, reason=cmd.reason)
+            # Actuators only when engaged + command ok (shadow fields already on tick).
+            if engaged and cmd.reason == "ok":
+                applied = actuator.apply(cmd)
+            else:
+                applied = actuator.stop(seq=cmd_seq, reason=cmd.reason)
 
             st = default_state(
                 engaged=engaged,
                 disengage_reason=disengage_reason,
-                policy="modular",
+                policy=args.policy,
                 loop_hz=args.hz,
                 camera_hz=cam_hz_ema,
                 infer_ms=pout.infer_ms,
@@ -339,6 +417,14 @@ def main() -> None:
             st["cmd_seq"] = int(applied.seq)
             st["cmd_reason"] = applied.reason
             st["cmd_applied"] = bool(applied.applied)
+            st["shadow"] = {
+                "steer": float(tick.shadow.get("steer", 0.0)),
+                "throttle": float(tick.shadow.get("throttle", 0.0)),
+                "brake": float(tick.shadow.get("brake", 0.0)),
+            }
+            st["e2e_ok"] = bool(tick.e2e_ok)
+            st["veto_reason"] = str(tick.veto_reason or "none")
+            st["e2e_backend"] = e2e_policy.backend
             st["encode_backend"] = recorder.encoder
             miss = list(pout.missing)
             if pout.tracks_n > 0 and "tracks" in miss:
@@ -359,6 +445,8 @@ def main() -> None:
             trig = recorder.note_engage(engaged)
             if trig:
                 recorder.request(trig, now=wall)
+            if tick.clip_trigger:
+                recorder.request(tick.clip_trigger, now=wall)
             aeb_trig = recorder.check_aeb(pout.planner if isinstance(pout.planner, dict) else None)
             if aeb_trig:
                 recorder.request(aeb_trig, now=wall)

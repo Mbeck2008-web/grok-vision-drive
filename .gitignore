@@ -10,3 +10,11 @@ venv/
 models/*.pt
 models/*.onnx
 !models/.gitkeep
+
+# M5 E2E weights (never commit blobs)
+models/e2e_current.onnx
+*.onnx
+*.pt
+*.pth
+*.bin
+*.safetensors

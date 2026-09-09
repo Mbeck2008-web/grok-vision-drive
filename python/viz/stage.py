@@ -263,9 +263,17 @@ def render_stage(
     drop_heavy = loop_hz > 0 and loop_hz < 8.0
     engaged = bool(state.get("engaged"))
 
+    show_path = state.get("gvd_show_path")
+    if show_path is None:
+        show_path = True
+    show_ghosts = state.get("show_agent_ghosts")
+    if show_ghosts is None:
+        show_ghosts = True
+
     _draw_underglow(img, engaged, cam)
-    _draw_filled_corridor(img, state.get("path_ego") or [], float(state.get("path_conf") or 0.5), cam)
-    _draw_path_world_overlay(img, state.get("path_world") or [], cam)
+    if show_path:
+        _draw_filled_corridor(img, state.get("path_ego") or [], float(state.get("path_conf") or 0.5), cam)
+        _draw_path_world_overlay(img, state.get("path_world") or [], cam)
 
     # ego shell
     corners = [
@@ -284,7 +292,7 @@ def render_stage(
     except Exception:
         cipv_id = None
 
-    tracks = list(state.get("tracks") or [])[:MAX_AGENTS]
+    tracks = list(state.get("tracks") or [])[:MAX_AGENTS] if show_ghosts else []
     n_forecast = 0
     for tr in tracks:
         tid = tr.get("id")

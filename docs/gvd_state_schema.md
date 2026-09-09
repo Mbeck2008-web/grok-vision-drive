@@ -8,7 +8,7 @@ Path: `%USERPROFILE%\Documents\GVD\gvd_state.json` (written by `python/run_visio
 | `path_world` | optional same | If set, GELua draws this directly |
 | `path_width` | m | Default ~2.0 (1.8–2.2 aesthetic) |
 | `path_conf` | 0–1 | Low → thinner/shorter/darker ribbon |
-| `path_debug_preview` | bool | True when path is steer-preview stub |
+| `path_debug_preview` | bool | `false` only when corridor path came from lanes; geometric/steer fallback stays `true` |
 | `gvd_show_path` | bool | Default true |
 | `show_agent_ghosts` | bool | Default false; dim agent mode-0 only |
 | `agents[]` | optional | `id`, `path_ego` for forecast mode 0 |
@@ -23,3 +23,12 @@ Lua: `gvd_main.drawPath` on `onPreRender` / `onDebugDraw`. Engaged-only (Alt+A).
 | `capture_note` | string | e.g. `retail: 1 window` |
 | `rss_mb` | float | supervisor RSS; >12 GB is a bug |
 | `cam_health.narrow` | enum | added in M1 8-cam set |
+
+
+## M2 fields
+
+| `detector` | string | `empty` / `synthetic` / `yolov8n-onnx` / `yolov8n-ultra` |
+| `tracks[]` | list | id, class, x,y,yaw,speed_mps (weak Δy hint),… ego frame |
+| `planner.cipv_id` | int? | lead track id in path tube |
+| `planner.ttc_lead` | float? | seconds; null if ego_speed unknown |
+| `planner.aeb` | off/warn/brake | state flag only (M2); needs ego_speed > 0 |

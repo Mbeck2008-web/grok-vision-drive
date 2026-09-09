@@ -5,3 +5,8 @@ __pycache__/
 data/clips/
 models/current.onnx
 venv/
+
+*.pt
+models/*.pt
+models/*.onnx
+!models/.gitkeep

@@ -1,0 +1,7 @@
+# Optional M2 extras — keep requirements.txt / requirements-viz.txt light.
+-r requirements.txt
+onnxruntime>=1.16
+# GPU EP on Windows/Pascal (optional):
+# onnxruntime-gpu>=1.16
+ultralytics>=8.0
+# torch comes with ultralytics; prefer cu118/cu121 Pascal wheels on Michael's box

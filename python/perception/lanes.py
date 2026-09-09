@@ -18,6 +18,13 @@ class LaneResult:
 def estimate_lanes(bgr: np.ndarray | None) -> LaneResult:
     if bgr is None or bgr.size == 0:
         return LaneResult(conf=0.0, lanes_bev=[], curvature=0.0)
+    try:
+        return _estimate_lanes_impl(bgr)
+    except Exception:
+        return LaneResult(conf=0.0, lanes_bev=[], curvature=0.0)
+
+
+def _estimate_lanes_impl(bgr: np.ndarray) -> LaneResult:
     h, w = bgr.shape[:2]
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -30,7 +37,9 @@ def estimate_lanes(bgr: np.ndarray | None) -> LaneResult:
     lines = cv2.HoughLinesP(crop, 1, np.pi / 180, threshold=40, minLineLength=40, maxLineGap=80)
     left, right = [], []
     if lines is not None:
-        for x1, y1, x2, y2 in lines[:, 0]:
+        for row in lines[:, 0]:
+            # Cast endpoints to Python int — numpy.int32 unpack raises TypeError on some OpenCV builds
+            x1, y1, x2, y2 = (int(row[0]), int(row[1]), int(row[2]), int(row[3]))
             if x2 == x1:
                 continue
             slope = (y2 - y1) / float(x2 - x1)

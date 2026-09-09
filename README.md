@@ -46,3 +46,22 @@ mods\unpacked\gvd\
 ## Status
 
 Installer + mod auto-load scaffolding. Vision / data-engine milestones (M1+) come next.
+
+
+## GVD Viz
+
+Visualization **toy** (not a scientific claim that forecasts match Waymo). On-screen title: **GVD** / **VISION**. No Tesla logos, no “Full Self-Driving”, no “FSD” product label.
+
+### In-game (required)
+Ice-blue ego ribbon on the asphalt via GELua `debugDrawer` (`drawSquarePrism` → `drawLine` fallback), data from `Documents/GVD/gvd_state.json`. Engage with Alt+A. See `docs/gvd_state_schema.md`.
+
+### Python window (extra)
+OpenCV cabin stage + nerd panel + forecast fans:
+
+```bash
+pip install -r requirements-viz.txt
+PYTHONPATH=. python python/run_vision.py --smoke   # writes docs/gvd_viz_smoke.png
+PYTHONPATH=. python python/run_vision.py --viz      # live window + state file for BeamNG
+```
+
+Keys in `--viz`: `V` nerd, `?` help, `0` clean cabin, `1–5` debug layers, `T` chase↔BEV, `q` quit. Caps: 32 agents / 16 forecast fans / 3 modes. If policy &lt; 8 Hz, drop fans + PIP first. In-game strip app: **GVD Strip** (mode · Hz · TTC · N).

@@ -787,8 +787,12 @@ local function syncEngageFromSupervisor()
   engaged = false
   fadeAcc = 0
   releaseInputs('supervisor disengaged')
+  -- Reason: the engage file carries it since M6 (veto / driver_override / shutdown); fall back to state.
   local why = 'supervisor off'
-  if lastGood and lastGood.disengage_reason then
+  local fr = f.disengage_reason and tostring(f.disengage_reason) or nil
+  if fr and fr ~= 'none' and fr ~= 'not_engaged' then
+    why = fr
+  elseif lastGood and lastGood.disengage_reason then
     local r = tostring(lastGood.disengage_reason)
     if r ~= 'none' and r ~= 'not_engaged' then why = r end
   end

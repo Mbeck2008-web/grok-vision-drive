@@ -116,8 +116,14 @@ def read_engage_flag(default: bool = False) -> bool:
         return default
 
 
-def write_engage_flag(engaged: bool) -> None:
-    atomic_write_json(engage_path(), {"engaged": bool(engaged), "mtime": time.time()}, indent=None)
+def write_engage_flag(engaged: bool, disengage_reason: str | None = None) -> None:
+    """Write gvd_engage.json. On engage clear reason to none; on disengage pass reason when known."""
+    payload: dict = {"engaged": bool(engaged), "mtime": time.time()}
+    if engaged or disengage_reason is None:
+        payload["disengage_reason"] = "none"
+    else:
+        payload["disengage_reason"] = str(disengage_reason)
+    atomic_write_json(engage_path(), payload, indent=None)
 
 
 def heartbeat_fresh(heartbeat_mtime: float | None, now: float | None = None, stale_s: float = HEARTBEAT_STALE_S) -> bool:

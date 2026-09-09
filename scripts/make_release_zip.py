@@ -6,7 +6,7 @@ Windows-friendly: double-click ``scripts\\make_release_zip.bat`` or run
 
 Ships the **retail** slice a player double-clicks:
   install.bat / uninstall.bat / play_gvd.bat, beamng_mod/, python/ (runtime),
-  config/, requirements*.txt, LICENSE, README.md, docs/*.md, VERSION.txt.
+  config/, requirements.txt + requirements-retail.txt, LICENSE, README.md, docs/*.md, VERSION.txt.
 
 Never ships: data/clips/, weights (*.onnx *.pt *.pth *.bin *.safetensors …),
 .git, __pycache__, venvs, scripts/ (tests + this tool), dist/.
@@ -39,7 +39,9 @@ INCLUDE_FILES = (
     "README.md",
 )
 INCLUDE_GLOBS = (
-    "requirements*.txt",
+    # Retail zip: base + retail only (no beamng/perception/viz extras).
+    "requirements.txt",
+    "requirements-retail.txt",
     "docs/*.md",
     "models/.gitkeep",
 )

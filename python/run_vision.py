@@ -373,7 +373,7 @@ def main() -> None:
             elif tick.should_disengage:
                 engaged = False
                 disengage_reason = tick.veto_reason if tick.veto_reason != "none" else "veto"
-                write_engage_flag(False)
+                write_engage_flag(False, disengage_reason=disengage_reason)
             elif cmd.reason == "preview_blocked":
                 disengage_reason = "preview_blocked"
             elif cmd.reason == "heartbeat_stale":
@@ -385,7 +385,7 @@ def main() -> None:
                 # (sticky — otherwise Lua and the player would fight at loop rate).
                 engaged = False
                 disengage_reason = "driver_override"
-                write_engage_flag(False)
+                write_engage_flag(False, disengage_reason="driver_override")
                 cmd = safe_command(
                     engaged=False,
                     heartbeat_ok=True,
@@ -530,7 +530,7 @@ def main() -> None:
         except Exception:
             pass
         try:
-            write_engage_flag(False)
+            write_engage_flag(False, disengage_reason="shutdown")
         except Exception:
             pass
         backend.close()

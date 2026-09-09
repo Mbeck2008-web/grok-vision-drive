@@ -60,7 +60,7 @@ def check_release_zip() -> None:
         (tmp / "models" / "e2e_current.onnx").write_bytes(b"\x00" * 64)
         (tmp / "models" / "yolov8n.pt").write_bytes(b"\x00" * 64)
         (tmp / "python" / "weights.safetensors").write_bytes(b"\x00" * 16)
-        (tmp / "data" / "clips").mkdir(parents=True)
+        (tmp / "data" / "clips").mkdir(parents=True, exist_ok=True)
         (tmp / "data" / "clips" / "clip_x.mp4").write_bytes(b"\x00" * 16)
         (tmp / "python" / "__pycache__").mkdir()
         (tmp / "python" / "__pycache__" / "run_vision.cpython-312.pyc").write_bytes(b"\x00")
@@ -85,6 +85,9 @@ def check_release_zip() -> None:
                 assert not any(r.endswith(bad) for r in rels), bad
             assert not any(r.startswith((".git/", "data/", "dist/", "scripts/")) for r in rels)
             assert not any("clips" in r for r in rels)
+            assert "requirements-beamng.txt" not in rels
+            assert "requirements-perception.txt" not in rels
+            assert "requirements-viz.txt" not in rels
             # Mod entry point + UI icon survive; tests do not.
             assert "beamng_mod/scripts/gvd/modScript.lua" in rels
             assert "beamng_mod/ui/modules/apps/GVD/app.png" in rels
@@ -318,11 +321,14 @@ def check_engage_path_contract() -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text('{"engaged":true,"mtime":1700000000}', encoding="utf-8")
     assert read_engage_flag(default=False) is True
-    # Supervisor disengage payload: engaged=false with float mtime (what Lua adopts as OFF).
-    write_engage_flag(False)
+    # Supervisor disengage payload: engaged=false with float mtime + reason (what Lua adopts as OFF and logs).
+    write_engage_flag(False, disengage_reason="driver_override")
     data = json.loads(p.read_text(encoding="utf-8"))
     assert data["engaged"] is False and isinstance(data["mtime"], float)
+    assert data["disengage_reason"] == "driver_override"
     assert read_engage_flag(default=True) is False
+    write_engage_flag(False)
+    assert json.loads(p.read_text(encoding="utf-8"))["disengage_reason"] == "none"
 
 
 def _py_string_literals(path: Path) -> list[str]:
@@ -372,6 +378,9 @@ def check_player_docs() -> None:
         for bad in ("cannot drive", "does not steer", "does not drive", "no-op sink", "never steers"):
             assert bad not in text, f"{f.name}: stale wording {bad!r}"
     assert "1-cam window capture only" in rel.version_text("test") and "gvd_cmd.json" in rel.version_text("test")
+    # Soft: retail zip ships base+retail only
+    assert "requirements-beamng.txt" not in (ROOT / "scripts" / "make_release_zip.py").read_text()
+    assert '"requirements*.txt"' not in (ROOT / "scripts" / "make_release_zip.py").read_text()
     bat = (ROOT / "play_gvd.bat").read_text(encoding="utf-8", errors="ignore")
     assert 'set "GVD_BACKEND=window"' in bat and "--backend %GVD_BACKEND%" in bat
     assert "--backend auto" not in bat

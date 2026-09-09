@@ -177,6 +177,16 @@ M.onUpdate(0.11)
 check(near(lastEvent('throttle')[2], 0) and near(lastEvent('brake')[2], 0), 'supervisor not driving → inputs released (no brake hold on the player)')
 check(not M.isEngaged(), 'supervisor false adopted → OFF')
 
+-- 8b) engage file reason wins over state (M6 write_engage_flag disengage_reason)
+M.toggleEngage()
+writeCmd(true, 0.1, 0.2, 0.0)
+M.onUpdate(0.06)
+writeCmd(false, 0.0, 0.0, 1.0)
+beatState(false, 'none')
+writeFile(engagePath, string.format('{"engaged": false, "mtime": %.3f, "disengage_reason": "driver_override"}', os.time() + 0.5))
+M.onUpdate(0.11)
+check(not M.isEngaged() and logs[#logs]:find('%(driver_override%)') ~= nil, 'engage-file disengage_reason shown (driver_override)')
+
 -- 9) dead-man: supervisor dies while we hold the car → brake hold, then release + auto-disengage + file false
 M.toggleEngage()
 writeCmd(true, 0.2, 0.4, 0.0)

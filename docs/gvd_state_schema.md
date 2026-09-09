@@ -40,8 +40,8 @@ Lua: `gvd_main.drawPath` on `onPreRender` / `onDebugDraw`. Engaged-only (Alt+A).
 | `disengage_reason` | string | `none` / `not_engaged` / `preview_blocked` / `heartbeat_stale` / `driver_override` / … |
 | `actuator` | string | `beamngpy` / `cmd_json` / `null` |
 | `cmd_seq` | int | Monotonic command sequence |
-| `cmd_applied` | bool | Whether last command was sent to an actuator |
-| `cmd_reason` | string | Gate / plan reason |
+| `cmd_applied` | bool | True only when BeamNGpy `vehicle.control` ran; `cmd_json` sink stays false |
+| `cmd_reason` | string | Gate / plan reason; `cmd_json_sink` = file written, car not moved |
 | `ego.speed_mps` | float | From Electrics `wheelspeed`/`airspeed` when available; else last known (not invented 10) |
 | `ego.throttle` / `ego.brake` | float | Last commanded values |
 

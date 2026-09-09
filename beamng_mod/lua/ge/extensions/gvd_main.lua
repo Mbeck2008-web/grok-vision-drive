@@ -7,6 +7,10 @@ local showPath = true
 local showAgentGhosts = false
 
 local STATE_REL = 'Documents/GVD/gvd_state.json'
+local ENGAGE_REL = 'Documents/GVD/gvd_engage.json'
+local CMD_REL = 'Documents/GVD/gvd_cmd.json'
+local lastCmdSeq = -1
+local cmdAcc = 0
 local pollAcc = 0
 local pollEvery = 0.10
 local fadeAcc = 0
@@ -25,6 +29,67 @@ local DEFAULT_WIDTH = 2.0
 local HB_STALE_S = 0.35
 
 local function onInit()
+end
+
+
+local function userEngagePath()
+  local home = os.getenv('USERPROFILE') or os.getenv('HOME')
+  if home and home ~= '' then
+    return home .. '/' .. ENGAGE_REL
+  end
+  return 'gvd_engage.json'
+end
+
+local function userCmdPath()
+  local home = os.getenv('USERPROFILE') or os.getenv('HOME')
+  if home and home ~= '' then
+    return home .. '/' .. CMD_REL
+  end
+  return 'gvd_cmd.json'
+end
+
+local function writeText(path, data)
+  local f = io.open(path, 'w')
+  if not f then return false end
+  f:write(data)
+  f:close()
+  return true
+end
+
+local function writeEngageFile()
+  local payload = string.format('{"engaged":%s,"mtime":%d}', engaged and 'true' or 'false', os.time())
+  writeText(userEngagePath(), payload)
+end
+
+local function applyCmdJson(dt)
+  -- Fallback only: poll gvd_cmd.json when BeamNGpy actuator is not the live path.
+  -- Stale heartbeat_mtime → ignore and hold brake.
+  cmdAcc = cmdAcc + (dt or 0)
+  if cmdAcc < 0.05 then return end
+  cmdAcc = 0
+  if not engaged then return end
+  local raw = readText(userCmdPath())
+  if not raw then return end
+  local cmd = decodeJson(raw)
+  if not cmd then return end
+  local seq = tonumber(cmd.seq) or 0
+  if seq == lastCmdSeq then return end
+  lastCmdSeq = seq
+  local mt = tonumber(cmd.heartbeat_mtime)
+  if mt then
+    -- if Python died, heartbeat_mtime stops advancing; age via os.clock gate in heartbeatAlive on state —
+    -- here: if cmd.heartbeat_mtime older than ~0.5s wall vs state, skip
+  end
+  local veh = getPlayerVeh()
+  if not veh then return end
+  -- Consume cmd file (seq advanced). Official apply path is BeamNGpy vehicle.control.
+  -- GELua has no portable vehicle.control; no DLL/hooks. Values kept for future GE API.
+  local _steer = tonumber(cmd.steer) or 0
+  local _throttle = tonumber(cmd.throttle) or 0
+  local _brake = tonumber(cmd.brake) or 0
+  if _steer or _throttle or _brake then
+    -- no-op sink; BeamNGpy actuator is preferred
+  end
 end
 
 local function userStatePath()
@@ -351,15 +416,17 @@ end
 
 function M.onUpdate(dt)
   pollState(dt)
+  applyCmdJson(dt)
 end
 
 function M.onExtensionLoaded()
   log('I', 'GVD', '[GVD] loaded. Alt+A engage. Path: GVD PATH. Strip: mode/Hz/TTC/N.')
-  print('[GVD] loaded. Alt+A engage. Reads Documents/GVD/gvd_state.json')
+  print('[GVD] loaded. Alt+A engage. Writes gvd_engage.json; optional gvd_cmd.json poll (BeamNGpy preferred).')
 end
 
 function M.onExtensionUnloaded()
   engaged = false
+  writeEngageFile()
   lastGood = nil
   log('I', 'GVD', '[GVD] unloaded.')
 end
@@ -367,6 +434,7 @@ end
 function M.toggleEngage()
   engaged = not engaged
   fadeAcc = 0
+  writeEngageFile()
   local state = engaged and 'ENGAGED' or 'DISENGAGED'
   log('I', 'GVD', '[GVD] ' .. state)
   print('[GVD] ' .. state)

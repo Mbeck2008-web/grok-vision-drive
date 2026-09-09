@@ -32,3 +32,17 @@ Lua: `gvd_main.drawPath` on `onPreRender` / `onDebugDraw`. Engaged-only (Alt+A).
 | `planner.cipv_id` | int? | lead track id in path tube |
 | `planner.ttc_lead` | float? | seconds; null if ego_speed unknown |
 | `planner.aeb` | off/warn/brake | state flag only (M2); needs ego_speed > 0 |
+
+
+## M3 fields
+
+| `engaged` | bool | Mirrored from Alt+A via `gvd_engage.json` (Lua writes; Python reads) |
+| `disengage_reason` | string | `none` / `not_engaged` / `preview_blocked` / `heartbeat_stale` / `driver_override` / … |
+| `actuator` | string | `beamngpy` / `cmd_json` / `null` |
+| `cmd_seq` | int | Monotonic command sequence |
+| `cmd_applied` | bool | Whether last command was sent to an actuator |
+| `cmd_reason` | string | Gate / plan reason |
+| `ego.speed_mps` | float | From Electrics `wheelspeed`/`airspeed` when available; else last known (not invented 10) |
+| `ego.throttle` / `ego.brake` | float | Last commanded values |
+
+Also: `Documents/GVD/gvd_cmd.json` = `{steer,throttle,brake,seq,heartbeat_mtime}` fallback sink.

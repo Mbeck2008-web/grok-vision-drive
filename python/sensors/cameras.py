@@ -434,6 +434,15 @@ class BeamNGPyBackend:
         # Do not invent a disconnected Vehicle("gvd_ego") — that never attached Cameras.
         return None
 
+    @property
+    def vehicle(self):
+        """Player vehicle handle when attached (M3 actuation / Electrics)."""
+        return self._vehicle
+
+    @property
+    def bng(self):
+        return self._bng
+
     def close(self) -> None:
         for cam in list(self._sensors.values()):
             try:

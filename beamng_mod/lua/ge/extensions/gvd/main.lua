@@ -1,5 +1,6 @@
 -- Grok Vision Drive — GE extension: engage + ice-blue ego path + compact HUD strip
 -- NOTE: Alt+A live ribbon remains UNPROVEN on Linux; confirm on Windows BeamNG smoke.
+-- Retail (window capture) shows ribbon/HUD only; this extension never drives the car (no DLL/hooks).
 local M = {}
 
 local engaged = false
@@ -152,8 +153,11 @@ local function writeText(path, data)
   return true
 end
 
+local lastEngageWriteUnix = 0
+
 local function writeEngageFile()
-  local payload = string.format('{"engaged":%s,"mtime":%d}', engaged and 'true' or 'false', os.time())
+  lastEngageWriteUnix = os.time()
+  local payload = string.format('{"engaged":%s,"mtime":%d}', engaged and 'true' or 'false', lastEngageWriteUnix)
   writeText(userEngagePath(), payload)
 end
 
@@ -623,10 +627,31 @@ local function pushStrip()
   end
 end
 
-local function pollState(dt)
-  pollAcc = pollAcc + (dt or 0)
-  if pollAcc < pollEvery then return end
-  pollAcc = 0
+-- M6 retail: the Python supervisor writes gvd_engage.json {"engaged":false} when it vetoes,
+-- loses its heartbeat, or exits (finally block). Adopt that OFF so the HUD/ribbon never stay ON
+-- without a supervisor. Never adopt ON from the file — engage always starts in-game (Alt+A / GVD app).
+local function syncEngageFromSupervisor()
+  if not engaged then return end
+  local raw = readText(userEngagePath())
+  if not raw then return end
+  local f = decodeJson(raw)
+  if type(f) ~= 'table' or f.engaged ~= false then return end
+  -- Our own toggle write carries mtime = os.time(); only a supervisor write at/after it may switch us off.
+  local mt = tonumber(f.mtime) or 0
+  if mt < lastEngageWriteUnix then return end
+  engaged = false
+  fadeAcc = 0
+  local why = 'supervisor off'
+  if lastGood and lastGood.disengage_reason then
+    local r = tostring(lastGood.disengage_reason)
+    if r ~= 'none' and r ~= 'not_engaged' then why = r end
+  end
+  log('I', 'GVD', '[GVD] DISENGAGED by supervisor (' .. why .. ')')
+  print('[GVD] DISENGAGED by supervisor (' .. why .. ')')
+  pushStrip()
+end
+
+local function pollStateFile()
   local raw = readText(userStatePath())
   if not raw then return end
   local st = decodeJson(raw)
@@ -651,6 +676,15 @@ local function pollState(dt)
       missingKeysLogged = true
     end
   end
+end
+
+local function pollState(dt)
+  pollAcc = pollAcc + (dt or 0)
+  if pollAcc < pollEvery then return end
+  pollAcc = 0
+  pollStateFile()
+  -- After the state read so the logged reason is the supervisor's fresh disengage_reason.
+  syncEngageFromSupervisor()
 end
 
 function M.onPreRender(dt)

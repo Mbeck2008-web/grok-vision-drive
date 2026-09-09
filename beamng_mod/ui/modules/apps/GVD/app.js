@@ -11,13 +11,26 @@ angular.module('beamng.apps')
       var chkPath = root.querySelector('#gvdChkPath');
       var chkGhosts = root.querySelector('#gvdChkGhosts');
       var engaged = false;
+      var luaFailLogged = false;
 
       function lua(cmd) {
         try {
           if (typeof bngApi !== 'undefined' && bngApi.engineLua) {
             bngApi.engineLua(cmd);
+            return true;
           }
-        } catch (e) {}
+        } catch (e) {
+          if (!luaFailLogged) {
+            luaFailLogged = true;
+            try { console.warn('[GVD] engineLua failed', e); } catch (e2) {}
+          }
+          return false;
+        }
+        if (!luaFailLogged) {
+          luaFailLogged = true;
+          try { console.warn('[GVD] bngApi.engineLua unavailable'); } catch (e2) {}
+        }
+        return false;
       }
 
       function paintEngage() {
@@ -46,7 +59,6 @@ angular.module('beamng.apps')
       }
 
       scope.$on('gvdUi', function (event, data) { onUi(data); });
-      // also accept strip bus if UI bus not yet firing
       scope.$on('gvdStrip', function (event, data) {
         if (!data) return;
         if (typeof data.engaged === 'boolean') {
@@ -73,7 +85,7 @@ angular.module('beamng.apps')
       }
 
       paintEngage();
-      lua("if extensions.gvd_main then guihooks.trigger('gvdUi', {engaged=extensions.gvd_main.isEngaged(), showPath=extensions.gvd_main.getShowPath and extensions.gvd_main.getShowPath() or true, showGhosts=extensions.gvd_main.getShowAgentGhosts and extensions.gvd_main.getShowAgentGhosts() or false, hz=0, n=0}) end");
+      lua("if extensions.gvd_main then guihooks.trigger('gvdUi', {engaged=extensions.gvd_main.isEngaged(), showPath=(extensions.gvd_main.getShowPath and extensions.gvd_main.getShowPath()) or true, showGhosts=(extensions.gvd_main.getShowAgentGhosts and extensions.gvd_main.getShowAgentGhosts()) or false, hz=0, n=0}) end");
     }
   };
 }]);

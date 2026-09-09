@@ -64,7 +64,7 @@ Also: `Documents/GVD/gvd_cmd.json` = `{steer,throttle,brake,seq,heartbeat_mtime}
 
 ## UI prefs (`Documents/GVD/gvd_ui_prefs.json`)
 
-Written by the in-game **GVD** app. Overrides `gvd_show_path` / `show_agent_ghosts` from state while present.
+Written by the in-game **GVD** app. **Wins over** `gvd_state` for path/ghosts while the file exists. Setters also mirror into `gvd_state` when JSON encode is available so OpenCV follows.
 
 | `show_path` | bool | Ribbon on/off |
 | `show_agent_ghosts` | bool | Track hulls on/off |

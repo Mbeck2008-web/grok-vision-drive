@@ -109,6 +109,20 @@ def _path_world_from_vehicle(path_ego: list, vehicle) -> list[dict[str, float]] 
         return None
 
 
+
+def _read_ui_prefs() -> dict:
+    """Documents/GVD/gvd_ui_prefs.json — UI toggles; honor over forced defaults."""
+    try:
+        from python.runtime.state_io import gvd_docs_dir
+        import json
+        p = gvd_docs_dir() / "gvd_ui_prefs.json"
+        if not p.is_file():
+            return {}
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="GVD supervisor + M2/M3/M4")
     ap.add_argument("--viz", action="store_true")
@@ -305,8 +319,13 @@ def main() -> None:
                 st["path_debug_preview"] = True
             st["tracks"] = pout.tracks
             st["lanes_bev"] = pout.lanes_bev
-            if pout.tracks_n > 0:
+            prefs = _read_ui_prefs()
+            if "show_agent_ghosts" in prefs:
+                st["show_agent_ghosts"] = bool(prefs["show_agent_ghosts"])
+            elif pout.tracks_n > 0:
                 st["show_agent_ghosts"] = True
+            if "show_path" in prefs:
+                st["gvd_show_path"] = bool(prefs["show_path"])
             pw = _path_world_from_vehicle(st.get("path_ego") or [], vehicle)
             if pw:
                 st["path_world"] = pw

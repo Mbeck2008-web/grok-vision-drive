@@ -108,6 +108,18 @@ local function userUiPrefsPath()
   return 'gvd_ui_prefs.json'
 end
 
+local function encodeUiStateMirror(st)
+  if jsonEncode then
+    local ok, s = pcall(jsonEncode, st)
+    if ok and s then return s end
+  end
+  if util_jsonEncode then
+    local ok, s = pcall(util_jsonEncode, st)
+    if ok and s then return s end
+  end
+  return nil
+end
+
 local function writeUiPrefs()
   local payload = string.format(
     '{"show_path":%s,"show_agent_ghosts":%s,"mtime":%d}',
@@ -116,6 +128,17 @@ local function writeUiPrefs()
     os.time()
   )
   writeText(userUiPrefsPath(), payload)
+  -- Mirror into gvd_state so OpenCV / Python follow the same toggles
+  local raw = readText(userStatePath())
+  local st = raw and decodeJson(raw) or nil
+  if type(st) == 'table' then
+    st.gvd_show_path = showPath
+    st.show_agent_ghosts = showAgentGhosts
+    local encoded = encodeUiStateMirror(st)
+    if encoded then
+      writeText(userStatePath(), encoded)
+    end
+  end
 end
 
 local function readUiPrefs()
@@ -534,8 +557,15 @@ local function pollState(dt)
   local st = decodeJson(raw)
   if not st then return end
   lastGood = st
-  if st.gvd_show_path ~= nil then showPath = not not st.gvd_show_path end
-  if st.show_agent_ghosts ~= nil then showAgentGhosts = not not st.show_agent_ghosts end
+  -- UI prefs win: if gvd_ui_prefs.json exists, do NOT apply path/ghosts from gvd_state
+  -- (run_vision show_agent_ghosts=true would clobber "Show ghosts" off every tick).
+  local prefsRaw = readText(userUiPrefsPath())
+  if prefsRaw and prefsRaw ~= '' then
+    readUiPrefs()
+  else
+    if st.gvd_show_path ~= nil then showPath = not not st.gvd_show_path end
+    if st.show_agent_ghosts ~= nil then showAgentGhosts = not not st.show_agent_ghosts end
+  end
   if not missingKeysLogged then
     local miss = {}
     if not st.path_ego and not st.path_world then miss[#miss + 1] = 'path_ego|path_world' end

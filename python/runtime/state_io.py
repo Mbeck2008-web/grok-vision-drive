@@ -107,15 +107,33 @@ def default_state(**overrides: Any) -> dict[str, Any]:
     st.update(overrides)
     return st
 
+def atomic_write_json(p: Path, payload: Any, *, indent: int | None = 2, attempts: int = 6) -> bool:
+    """Write JSON via tmp + replace so GELua never reads a half-written file.
+
+    On Windows `replace` fails with PermissionError while Lua has the target open for
+    reading (it polls gvd_cmd.json at 20 Hz), so retry briefly instead of crashing the
+    supervisor. Returns False when the tick had to be skipped.
+    """
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    text = json.dumps(payload, indent=indent)
+    for i in range(max(1, attempts)):
+        try:
+            tmp.write_text(text, encoding="utf-8")
+            tmp.replace(p)
+            return True
+        except PermissionError:
+            time.sleep(0.002 * (i + 1))
+        except OSError:
+            time.sleep(0.002 * (i + 1))
+    return False
+
 def write_state(state: dict[str, Any], path: Path | None = None) -> Path:
     p = path or state_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
     state = dict(state)
     state["heartbeat_unix"] = int(time.time())  # match Lua os.time() seconds
     state["heartbeat_mtime"] = time.time()  # high-res for Lua dead-man
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    tmp.replace(p)
+    atomic_write_json(p, state)
     return p
 
 def read_state(path: Path | None = None) -> dict[str, Any] | None:

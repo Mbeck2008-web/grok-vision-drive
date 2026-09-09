@@ -1,9 +1,14 @@
-"""Sim-only actuation: BeamNGpy vehicle.control preferred; gvd_cmd.json fallback.
+"""Sim-only actuation: BeamNGpy vehicle.control (Tech) or gvd_cmd.json → GELua (retail).
 
 Safety gates (must all pass to drive):
   engaged + heartbeat fresh + (not path_debug_preview OR allow_preview_drive)
 
-No DLL / hooks / process inject. Live BeamNG still UNPROVEN on Linux.
+Retail bus (M6): Python writes Documents/GVD/gvd_cmd.json every tick; the mod's
+gvd_main.applyCmdJson feeds steer/throttle/brake to the player vehicle with the same
+vehicle-Lua `input.event` calls BeamNG's own AI and BeamNGpy use, and echoes
+wheelspeed / inputs / applied seq back through gvd_ego.json. `cmd_applied` is only
+claimed once that ack is fresh. No DLL / hooks / process inject. Live BeamNG still
+UNPROVEN on Linux.
 """
 
 from __future__ import annotations
@@ -14,10 +19,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from python.runtime.state_io import gvd_docs_dir
+from python.runtime.state_io import atomic_write_json, gvd_docs_dir
 
 HEARTBEAT_STALE_S = 0.35
 AEB_BRAKE_TTC = 1.2
+EGO_FRESH_S = 1.0          # gvd_ego.json older than this → treat Lua feedback as gone
+CMD_ACK_SLACK = 5          # Lua acks lag a few seqs (20 Hz apply, 10 Hz echo, 15 Hz loop)
 
 
 @dataclass
@@ -38,6 +45,65 @@ def engage_path() -> Path:
     return gvd_docs_dir() / "gvd_engage.json"
 
 
+def ego_path() -> Path:
+    return gvd_docs_dir() / "gvd_ego.json"
+
+
+@dataclass
+class EgoFeedback:
+    """Vehicle echo written by gvd_main (retail): electrics + which cmd seq Lua applied."""
+
+    speed_mps: float | None = None
+    steering_input: float | None = None
+    throttle_input: float | None = None
+    brake_input: float | None = None
+    applied_seq: int = -1
+    applying: bool = False
+    age_s: float = 0.0
+
+    @property
+    def fresh(self) -> bool:
+        return self.age_s <= EGO_FRESH_S
+
+
+def _num(v: Any) -> float | None:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f in (float("inf"), float("-inf")):
+        return None
+    return f
+
+
+def read_ego_feedback(now: float | None = None) -> EgoFeedback | None:
+    """Parse gvd_ego.json (Lua writes it non-atomically; a torn read just returns None)."""
+    p = ego_path()
+    try:
+        if not p.is_file():
+            return None
+        data = json.loads(p.read_text(encoding="utf-8"))
+        mtime = p.stat().st_mtime
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    t = now if now is not None else time.time()
+    try:
+        seq = int(data.get("applied_seq", -1))
+    except (TypeError, ValueError):
+        seq = -1
+    return EgoFeedback(
+        speed_mps=_num(data.get("speed_mps")),
+        steering_input=_num(data.get("steering_input")),
+        throttle_input=_num(data.get("throttle_input")),
+        brake_input=_num(data.get("brake_input")),
+        applied_seq=seq,
+        applying=bool(data.get("applying", False)),
+        age_s=max(0.0, t - mtime),
+    )
+
+
 def read_engage_flag(default: bool = False) -> bool:
     """Lua Alt+A writes gvd_engage.json; Python mirrors that (do not invent engage)."""
     p = engage_path()
@@ -51,11 +117,7 @@ def read_engage_flag(default: bool = False) -> bool:
 
 
 def write_engage_flag(engaged: bool) -> None:
-    p = engage_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"engaged": bool(engaged), "mtime": time.time()}), encoding="utf-8")
-    tmp.replace(p)
+    atomic_write_json(engage_path(), {"engaged": bool(engaged), "mtime": time.time()}, indent=None)
 
 
 def heartbeat_fresh(heartbeat_mtime: float | None, now: float | None = None, stale_s: float = HEARTBEAT_STALE_S) -> bool:
@@ -280,36 +342,55 @@ class BeamNGPyActuator:
 
 
 class CmdJsonActuator:
-    """Atomic Documents/GVD/gvd_cmd.json for GELua poll — fallback sink only.
+    """Retail drive bus: atomic Documents/GVD/gvd_cmd.json polled by gvd_main.applyCmdJson.
 
-    Lua currently no-ops apply (no portable GE vehicle.control). File is still written,
-    but applied=False and reason=cmd_json_sink so state never claims the car moved.
+    Payload carries `engaged` so Lua only touches the player vehicle while the supervisor
+    is engaged (gate holds like preview_blocked ride along as brake=1). Lua echoes the seq it
+    applied via gvd_ego.json; `applied` is claimed only when that ack is fresh — never on
+    the strength of having written a file.
     """
 
     name = "cmd_json"
+    _PASSTHROUGH_TAGS = ("ok", "plan", "stop", "shutdown", "unit_stop")
+
+    def __init__(self) -> None:
+        self.engaged = False
+        self.ack: EgoFeedback | None = None
+        self.last_seq = 0
+        self.write_ok = True
+
+    def note_engaged(self, engaged: bool) -> None:
+        self.engaged = bool(engaged)
+
+    def note_ack(self, fb: EgoFeedback | None) -> None:
+        self.ack = fb
+
+    def acked(self, seq: int) -> bool:
+        fb = self.ack
+        if fb is None or not fb.fresh or not fb.applying:
+            return False
+        return fb.applied_seq >= int(seq) - CMD_ACK_SLACK
 
     def apply(self, cmd: DriveCommand) -> DriveCommand:
-        p = cmd_path()
-        p.parent.mkdir(parents=True, exist_ok=True)
-        # Preserve gate reasons; otherwise tag sink honesty.
-        if cmd.reason in ("ok", "plan", "stop", "shutdown", "unit_stop") or cmd.reason.startswith("beamngpy"):
-            sink_reason = "cmd_json_sink"
-        else:
-            sink_reason = cmd.reason
         payload = {
-            "steer": float(cmd.steer),
-            "throttle": float(cmd.throttle),
-            "brake": float(cmd.brake),
+            "steer": float(max(-1.0, min(1.0, cmd.steer))),
+            "throttle": float(max(0.0, min(1.0, cmd.throttle))),
+            "brake": float(max(0.0, min(1.0, cmd.brake))),
             "seq": int(cmd.seq),
+            "engaged": bool(self.engaged),
             "heartbeat_mtime": time.time(),
-            "reason": sink_reason,
-            "applied": False,
+            "reason": cmd.reason,
         }
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        tmp.replace(p)
-        cmd.applied = False
-        cmd.reason = sink_reason
+        self.write_ok = atomic_write_json(cmd_path(), payload)
+        self.last_seq = int(cmd.seq)
+        cmd.applied = bool(self.engaged and self.write_ok and self.acked(cmd.seq))
+        if cmd.reason in self._PASSTHROUGH_TAGS or cmd.reason.startswith("beamngpy"):
+            if cmd.applied:
+                cmd.reason = "cmd_json_applied"
+            elif self.engaged:
+                cmd.reason = "cmd_json_pending"  # written; no fresh Lua ack (mod off / no vehicle)
+            else:
+                cmd.reason = "cmd_json_idle"  # not engaged: Lua keeps its hands off the car
         return cmd
 
     def stop(self, seq: int = 0, reason: str = "stop") -> DriveCommand:
@@ -320,7 +401,7 @@ class CmdJsonActuator:
 def make_actuator(vehicle: Any | None = None, prefer_beamngpy: bool = True) -> Actuator:
     if prefer_beamngpy and vehicle is not None and hasattr(vehicle, "control"):
         return BeamNGPyActuator(vehicle)
-    # Fallback: cmd json (Lua optional poll). Still no DLL.
+    # Retail: cmd json applied by the mod's GELua on the player vehicle. Still no DLL.
     return CmdJsonActuator()
 
 

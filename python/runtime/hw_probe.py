@@ -42,9 +42,9 @@ def cam_claim(backend: str) -> str:
     """Honest camera claim per backend — the retail window path never says 8 cams."""
     b = (backend or "stub").lower()
     if b == "window":
-        return "cams=1/8 path=retail (1 window capture; not 8)"
+        return "cams=1/8 path=retail (1 window capture; not 8; drive=gvd_cmd.json->mod Lua)"
     if b == "beamngpy":
-        return "cams<=8 path=tech (BeamNGpy cameras.yaml; live UNPROVEN)"
+        return "cams<=8 path=tech (BeamNGpy cameras.yaml + direct control; live UNPROVEN)"
     return "cams=0/8 path=stub"
 
 

@@ -199,7 +199,9 @@ class WindowBackend:
             self._cam = bettercam.create(**kwargs)
             self._impl = "bettercam"
             return
-        except Exception:
+        except BaseException as e:
+            if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                raise
             self._cam = None
         try:
             import mss  # type: ignore
@@ -278,12 +280,33 @@ class WindowBackend:
                     mon = self._mss.monitors[1] if len(self._mss.monitors) > 1 else self._mss.monitors[0]
                 shot = self._mss.grab(mon)
                 img = np.asarray(shot)[:, :, :3]
-        except Exception as e:
+        except BaseException as e:
+            # bettercam/comtypes can AV or raise COMError — never crash the supervisor
+            if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                raise
             if not self._logged:
-                print(f"[GVD] window capture error: {e}")
+                print(f"[GVD] window capture error ({type(e).__name__}): {e}")
                 self._logged = True
+            # Disable bettercam for this session; fall back to mss if possible
+            if self._cam is not None:
+                self._cam = None
+                try:
+                    import mss  # type: ignore
+
+                    if self._mss is None:
+                        self._mss = mss.mss()
+                    self._impl = "mss(after-bettercam-fail)"
+                    self._note = f"{self._note}; bettercam disabled after error"
+                except Exception:
+                    self._impl = "unavailable:bettercam-fail"
             health["main"] = CamHealth.ERROR
-            return CameraFrameBundle(frames={}, timestamps={}, health=health, backend=self.name, note=self._note)
+            return CameraFrameBundle(
+                frames={},
+                timestamps={},
+                health=health,
+                backend=self.name,
+                note=self._note,
+            )
 
         if img is None:
             health["main"] = CamHealth.MISSING

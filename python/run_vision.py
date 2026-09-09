@@ -1,4 +1,4 @@
-"""GVD supervisor — cameras + modular perception + M3 sim actuation + gvd_state.json."""
+"""GVD supervisor — cameras + perception + actuation + M4 clips + gvd_state.json."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from python.control.actuate import (
     safe_command,
     write_engage_flag,
 )
+from python.data.record import ClipRecorder, choose_encoder
 from python.perception.pipeline import ModularPerception
 from python.runtime.hw_probe import probe, refuse_live_start
 from python.runtime.state_io import default_state, state_path, steer_preview_path_ego, write_state
@@ -56,7 +57,7 @@ def _gpu_vram_used_gb() -> float:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="GVD supervisor + cameras + M2 perception + M3 actuation")
+    ap = argparse.ArgumentParser(description="GVD supervisor + M2/M3/M4")
     ap.add_argument("--viz", action="store_true")
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--hz", type=float, default=15.0)
@@ -77,6 +78,12 @@ def main() -> None:
         action="store_true",
         help="Dev only: treat as engaged without Alt+A gvd_engage.json (never default)",
     )
+    ap.add_argument(
+        "--encode",
+        default="auto",
+        choices=["auto", "qsv", "cpu", "nvenc"],
+        help="Clip encode: auto/qsv→libx264; nvenc only if explicitly requested",
+    )
     args = ap.parse_args()
 
     if args.vision_only:
@@ -84,8 +91,17 @@ def main() -> None:
 
     if args.smoke:
         out = smoke(use_perception=True)
+        # M4 dry-run: no BeamNG/QSV required
+        rec = ClipRecorder(dry_run=True, encode_prefer="cpu", hz=args.hz)
+        import numpy as np
+
+        fake = np.zeros((240, 320, 3), dtype=np.uint8)
+        for i in range(8):
+            rec.push(fake, {"engaged": True, "planner": {"aeb": "off"}, "ego": {}}, now=time.time() + i * 0.05)
+        path = rec.flush("smoke")
         print(f"[GVD] smoke frame -> {out}")
         print(f"[GVD] state -> {state_path()}")
+        print(f"[GVD] clip dry-run -> {path} trigger={rec.last_clip_trigger} enc={rec.encoder}")
         return
 
     backend_name = resolve_backend_name(None if args.backend == "auto" else args.backend)
@@ -105,10 +121,27 @@ def main() -> None:
     if vehicle is not None:
         attach_electrics(vehicle, bng)
     actuator = make_actuator(vehicle, prefer_beamngpy=True)
+
+    allow_nvenc = args.encode == "nvenc"
+    if args.encode == "nvenc":
+        prefer = "nvenc"
+    elif args.encode == "cpu":
+        prefer = "cpu"
+    else:
+        prefer = "qsv"
+    recorder = ClipRecorder(
+        encode_prefer=prefer,
+        allow_nvenc=allow_nvenc,
+        hz=args.hz,
+        dry_run=False,
+    )
+
     print(f"[GVD] camera backend={backend.name} detector={perc.detector.name} actuator={actuator.name}")
+    print(f"[GVD] clip encoder={recorder.encoder} (qsv prefer; never default nvenc)")
     print(f"[GVD] state path: {state_path()}")
     print("[GVD] Vision-only: no LiDAR/radar/GPS-loc/HD-map in the live loop.")
     print("[GVD] M3: no drive on preview unless --allow-preview-drive; engage via Alt+A (gvd_engage.json).")
+    print("[GVD] M4: clips on disengage / AEB / near-miss / key C. Live QSV UNPROVEN until Windows smoke.")
     if args.allow_preview_drive:
         print("[GVD] WARNING: --allow-preview-drive is ON")
 
@@ -134,7 +167,6 @@ def main() -> None:
                 cam_hz_ema = inst if cam_hz_ema <= 0 else (0.8 * cam_hz_ema + 0.2 * inst)
                 last_cam_t = now
 
-            # Electrics ego speed when available — never invent 10 m/s
             steer = 0.0
             ego_v = last_ego_v
             spd, steer_in = read_electrics_speed(vehicle)
@@ -142,14 +174,13 @@ def main() -> None:
                 ego_v = max(0.0, float(spd))
                 last_ego_v = ego_v
             if steer_in is not None:
-                steer = float(steer_in) * 30.0  # approx deg for preview ribbon
+                steer = float(steer_in) * 30.0
 
             pout = perc.tick(main, ego_speed_mps=ego_v, steer_deg=steer)
 
             engaged = bool(args.force_engage) or read_engage_flag(default=False)
             disengage_reason = "none"
-            hb_mtime = time.time()
-            heartbeat_ok = True  # this process is the heartbeat source while the loop runs
+            heartbeat_ok = True
 
             cmd_seq += 1
             cmd = safe_command(
@@ -171,7 +202,6 @@ def main() -> None:
                 disengage_reason = "heartbeat_stale"
                 engaged = False
 
-            # Driver override detect (optional): large steering_input while we command ≠ 0
             if engaged and steer_in is not None and abs(float(steer_in)) > 0.55 and abs(cmd.steer) < 0.2:
                 engaged = False
                 disengage_reason = "driver_override"
@@ -221,6 +251,7 @@ def main() -> None:
             st["cmd_seq"] = int(applied.seq)
             st["cmd_reason"] = applied.reason
             st["cmd_applied"] = bool(applied.applied)
+            st["encode_backend"] = recorder.encoder
             miss = list(pout.missing)
             if pout.tracks_n > 0 and "tracks" in miss:
                 miss = [m for m in miss if m != "tracks"]
@@ -233,6 +264,23 @@ def main() -> None:
             if pout.path_debug_preview is False:
                 st["missing_state_keys"] = [m for m in st["missing_state_keys"] if "path_ego" not in m]
             st["heartbeat_ms"] = (time.perf_counter() - loop_t0) * 1000.0
+
+            # M4 ring + triggers
+            wall = time.time()
+            recorder.push(main, st, now=wall)
+            trig = recorder.note_engage(engaged)
+            if trig:
+                recorder.request(trig, now=wall)
+            aeb_trig = recorder.check_aeb(pout.planner if isinstance(pout.planner, dict) else None)
+            if aeb_trig:
+                recorder.request(aeb_trig, now=wall)
+            flushed = recorder.maybe_flush(now=wall)
+            if flushed:
+                print(f"[GVD] clip flushed -> {flushed} ({recorder.last_clip_trigger})")
+            st["last_clip_trigger"] = recorder.last_clip_trigger
+            if recorder.last_clip_path:
+                st["last_clip_path"] = recorder.last_clip_path
+
             write_state(st)
 
             if win is not None:
@@ -249,6 +297,9 @@ def main() -> None:
                     ui.toggle_help()
                 elif key == ord("t"):
                     ui.top_down = not ui.top_down
+                elif key == ord("c"):
+                    recorder.request("manual", now=time.time())
+                    print("[GVD] manual clip requested (key C)")
                 elif key in (ord("0"), ord("1"), ord("2"), ord("3"), ord("4"), ord("5")):
                     ui.set_layer(int(chr(key)))
 

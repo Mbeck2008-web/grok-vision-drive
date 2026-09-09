@@ -10,8 +10,31 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from python.control.e2e import E2E_H, E2E_W, make_e2e
+from python.control.e2e import E2E_H, E2E_W, E2EIntent, make_e2e
 from python.runtime.shadow import ShadowConfig, shadow_tick
+
+
+class _FixedE2E:
+    """Deterministic E2E stand-in so disagreement asserts always fire."""
+
+    def __init__(self, steer: float = 0.0, accel: float = 0.0) -> None:
+        self.steer = float(steer)
+        self.accel = float(accel)
+        self.backend = "stub"
+
+    def forward(self, *args, **kwargs) -> E2EIntent:
+        a = self.accel
+        thr = a if a >= 0 else 0.0
+        brk = -a if a < 0 else 0.0
+        return E2EIntent(
+            steer=self.steer,
+            accel=a,
+            throttle=thr,
+            brake=brk,
+            ok=True,
+            backend="stub",
+            reason="fixed",
+        )
 
 
 def _path(n: int = 12, x: float = 0.1):
@@ -101,7 +124,7 @@ def main() -> None:
     assert tick3.veto_reason == "heartbeat_stale"
     assert tick3.applied.reason == "heartbeat_stale"
 
-    # disagreement veto: force modular steer far from e2e via skewed path
+    # disagreement veto: fixed E2E steer=0 vs modular steer~1 from skewed path — always assert
     tick4 = shadow_tick(
         policy="e2e",
         engaged=True,
@@ -114,15 +137,19 @@ def main() -> None:
         lane_conf=0.9,
         path_conf=0.8,
         seq=4,
-        e2e_policy=e2e,
+        e2e_policy=_FixedE2E(steer=0.0),
         main_bgr=main,
         wide_bgr=wide,
         cfg=ShadowConfig(lane_conf_min=0.25, steer_disagree_max=0.05, path_conf_min=0.15),
     )
-    # With tiny disagree max, almost certainly veto unless e2e luckily matches
-    if abs(tick4.modular.steer - tick4.e2e.steer) > 0.05:
-        assert tick4.veto_reason == "disagreement", tick4.veto_reason
-        assert tick4.e2e_ok is False
+    assert abs(tick4.modular.steer - tick4.e2e.steer) > 0.05, (
+        tick4.modular.steer,
+        tick4.e2e.steer,
+    )
+    assert tick4.veto_reason == "disagreement", tick4.veto_reason
+    assert tick4.e2e_ok is False
+    assert tick4.applied.throttle == 0.0 and tick4.applied.brake == 1.0
+    assert tick4.applied.reason.startswith("veto:")
 
     # engaged shadow + healthy → apply modular (not crash); shadow written
     tick5 = shadow_tick(
@@ -145,6 +172,53 @@ def main() -> None:
     assert tick5.veto_reason == "none"
     assert tick5.applied.reason == "ok"
     assert tick5.shadow["steer"] == tick5.e2e.steer
+
+    # AEB brake → veto E2E (do not apply E2E actuators)
+    tick_aeb = shadow_tick(
+        policy="e2e",
+        engaged=True,
+        heartbeat_ok=True,
+        path_debug_preview=False,
+        allow_preview_drive=False,
+        path_ego=_path(x=0.0),
+        planner={"target_v": 10, "aeb": "brake"},
+        ego_speed_mps=5.0,
+        lane_conf=0.9,
+        path_conf=0.8,
+        seq=6,
+        e2e_policy=_FixedE2E(steer=0.1, accel=0.5),
+        main_bgr=main,
+        wide_bgr=wide,
+        cfg=cfg,
+    )
+    assert tick_aeb.veto_reason == "aeb_brake", tick_aeb.veto_reason
+    assert tick_aeb.e2e_ok is False
+    assert tick_aeb.applied.throttle == 0.0 and tick_aeb.applied.brake == 1.0
+    assert tick_aeb.applied.reason.startswith("veto:")
+    assert tick_aeb.should_disengage is True
+
+    # AEB warn → also veto E2E
+    tick_warn = shadow_tick(
+        policy="e2e",
+        engaged=True,
+        heartbeat_ok=True,
+        path_debug_preview=False,
+        allow_preview_drive=False,
+        path_ego=_path(x=0.0),
+        planner={"target_v": 10, "aeb": "warn"},
+        ego_speed_mps=5.0,
+        lane_conf=0.9,
+        path_conf=0.8,
+        seq=7,
+        e2e_policy=_FixedE2E(steer=0.1, accel=0.5),
+        main_bgr=main,
+        wide_bgr=wide,
+        cfg=cfg,
+    )
+    assert tick_warn.veto_reason == "aeb_warn", tick_warn.veto_reason
+    assert tick_warn.e2e_ok is False
+    assert tick_warn.applied.throttle == 0.0 and tick_warn.applied.brake == 1.0
+    assert tick_warn.applied.reason.startswith("veto:")
 
     # train module imports without weights
     from python.train.train_e2e import smoke_import

@@ -1,6 +1,6 @@
 """PilotNet-scale tiny E2E stub for GVD M5.
 
-Inputs: main+wide RGB at 320x180 + speed/steer → {steer [-1,1], accel [-1,1]}.
+Inputs: named main/wide RGB 1×3×180×320 + kin 1×2 → {steer [-1,1], accel [-1,1]}.
 Loads models/e2e_current.onnx when present (onnxruntime); else numpy random stub.
 Toy VRAM footprint ~0.15–0.4 GB — no transformers / ViT / BEV / AutoSteer-HD.
 """
@@ -96,10 +96,12 @@ class E2EPolicy:
 
             opts = ort.SessionOptions()
             opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+            # Prefer CUDA when available; never default TensorRT.
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
             self._session = ort.InferenceSession(
                 str(self.model_path),
                 sess_options=opts,
-                providers=["CPUExecutionProvider"],
+                providers=providers,
             )
             self.backend = "onnx"
         except Exception:
@@ -118,14 +120,25 @@ class E2EPolicy:
         speed_mps: float = 0.0,
         steer_deg: float = 0.0,
     ) -> dict[str, np.ndarray]:
+        # Research pin: named feeds main/wide 1x3x180x320 + kin 1x2 (not concatenated).
         main = _resize_bgr(main_bgr)
         wide = _resize_bgr(wide_bgr if wide_bgr is not None else main_bgr)
-        cams = np.stack([main.transpose(2, 0, 1), wide.transpose(2, 0, 1)], axis=0)  # 2,3,H,W
-        ego = np.array(
-            [float(speed_mps) / 30.0, float(steer_deg) / 30.0],
+        main_nchw = main.transpose(2, 0, 1)[None, ...].astype(np.float32)  # 1,3,H,W
+        wide_nchw = wide.transpose(2, 0, 1)[None, ...].astype(np.float32)
+        kin = np.array(
+            [[float(speed_mps) / 30.0, float(steer_deg) / 30.0]],
             dtype=np.float32,
-        )
-        return {"cams": cams.astype(np.float32), "ego": ego}
+        )  # 1,2
+        # Stub MLP still wants stacked cams + flat ego.
+        cams = np.concatenate([main_nchw, wide_nchw], axis=0)  # 2,3,H,W
+        ego = kin.reshape(2)
+        return {
+            "main": main_nchw,
+            "wide": wide_nchw,
+            "kin": kin,
+            "cams": cams,
+            "ego": ego,
+        }
 
     def forward(
         self,
@@ -149,10 +162,28 @@ class E2EPolicy:
         feed: dict[str, np.ndarray] = {}
         for inp in inputs:
             name = inp.name.lower()
-            if "ego" in name or "state" in name or "speed" in name:
-                feed[inp.name] = feats["ego"].reshape(1, -1)
+            if name == "main" or name.endswith("/main") or name.startswith("main"):
+                feed[inp.name] = feats["main"]
+            elif name == "wide" or name.endswith("/wide") or name.startswith("wide"):
+                feed[inp.name] = feats["wide"]
+            elif (
+                name == "kin"
+                or name.endswith("/kin")
+                or name.startswith("kin")
+                or "ego" in name
+                or "state" in name
+                or "speed" in name
+            ):
+                feed[inp.name] = feats["kin"]
             else:
-                feed[inp.name] = feats["cams"][None, ...]
+                # Unknown input name: prefer shape match (1x3xHxW vs 1x2).
+                shape = tuple(int(d) if isinstance(d, int) else -1 for d in (inp.shape or ()))
+                if len(shape) == 2 or (len(shape) >= 1 and shape[-1] == 2):
+                    feed[inp.name] = feats["kin"]
+                elif "wide" in name:
+                    feed[inp.name] = feats["wide"]
+                else:
+                    feed[inp.name] = feats["main"]
         outs = self._session.run(None, feed)
         vec = np.asarray(outs[0]).reshape(-1)
         steer = float(np.clip(vec[0], -1.0, 1.0)) if vec.size > 0 else 0.0

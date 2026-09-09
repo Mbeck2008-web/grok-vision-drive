@@ -72,10 +72,17 @@ def evaluate_veto(
     allow_preview_drive: bool,
     cfg: ShadowConfig,
     policy: str,
+    planner: dict[str, Any] | None = None,
 ) -> str:
     """Return veto_reason or 'none'. Modular supervisor always may veto E2E."""
     if not heartbeat_ok:
         return "heartbeat_stale"
+    # AEB from modular planner: never apply E2E actuators under brake (and warn).
+    aeb = str((planner or {}).get("aeb") or "off").lower()
+    if aeb == "brake":
+        return "aeb_brake"
+    if aeb == "warn":
+        return "aeb_warn"
     if lane_conf < cfg.lane_conf_min:
         return "low_lane_conf"
     if path_conf < cfg.path_conf_min:
@@ -150,6 +157,7 @@ def shadow_tick(
         allow_preview_drive=allow_preview_drive,
         cfg=cfg,
         policy=policy,
+        planner=planner,
     )
 
     should_disengage = False
@@ -211,7 +219,13 @@ def shadow_tick(
 
     # E2E or shadow: modular is safety supervisor — veto holds / disengages.
     if veto != "none":
-        should_disengage = veto in ("low_lane_conf", "disagreement", "e2e_forward_fail", "low_path_conf")
+        should_disengage = veto in (
+            "low_lane_conf",
+            "disagreement",
+            "e2e_forward_fail",
+            "low_path_conf",
+            "aeb_brake",
+        )
         clip_trigger = "disengage" if should_disengage else None
         applied = stop_command(seq=seq, reason=f"veto:{veto}")
         return ShadowTick(

@@ -160,11 +160,16 @@ def main() -> None:
         action="store_true",
         help="Dev only: treat as engaged without Alt+A gvd_engage.json (never default)",
     )
+    _ctrl_yaml = _load_control_yaml()
+    _policy_default = str(_ctrl_yaml.get("policy_default") or "modular").lower()
+    if _policy_default not in ("modular", "e2e", "shadow"):
+        _policy_default = "modular"
     ap.add_argument(
         "--policy",
-        default="modular",
+        default=_policy_default,
         choices=["modular", "e2e", "shadow"],
-        help="M5: modular (default supervisor) | e2e | shadow (compute both; actuate modular unless e2e)",
+        help="M5: modular (default supervisor) | e2e | shadow (compute both; actuate modular unless e2e). "
+        "Default from config/control.yaml policy_default.",
     )
     ap.add_argument(
         "--encode",

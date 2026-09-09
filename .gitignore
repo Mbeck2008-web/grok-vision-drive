@@ -1,20 +1,15 @@
-*.onnx
 *.pyc
 .venv/
 __pycache__/
 data/clips/
-models/current.onnx
 venv/
 
-*.pt
-models/*.pt
-models/*.onnx
-!models/.gitkeep
-
-# M5 E2E weights (never commit blobs)
-models/e2e_current.onnx
+# M5 E2E / model weight blobs (never commit)
 *.onnx
 *.pt
 *.pth
 *.bin
 *.safetensors
+models/*.onnx
+models/*.pt
+!models/.gitkeep

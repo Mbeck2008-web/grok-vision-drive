@@ -67,12 +67,10 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=1)
     args = ap.parse_args()
 
-    if args.smoke or True:
-        # Always safe to smoke-import; full train is opt-in via clips present.
+    if args.smoke:
         info = smoke_import()
         print(json.dumps({"smoke": info}, indent=2))
-        if args.smoke:
-            return
+        return
 
     root = Path(args.clips) if args.clips else clips_root()
     dirs = list_clip_dirs(root)

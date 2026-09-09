@@ -46,3 +46,10 @@ Lua: `gvd_main.drawPath` on `onPreRender` / `onDebugDraw`. Engaged-only (Alt+A).
 | `ego.throttle` / `ego.brake` | float | Last commanded values |
 
 Also: `Documents/GVD/gvd_cmd.json` = `{steer,throttle,brake,seq,heartbeat_mtime}` fallback sink.
+
+
+## M4 fields
+
+| `last_clip_trigger` | string | `none` / `disengage` / `aeb_brake` / `near_miss_ttc` / `manual` / `smoke` |
+| `last_clip_path` | string? | Last flushed clip directory under Documents/GVD/clips |
+| `encode_backend` | string | `h264_qsv` / `libx264` / `h264_nvenc` / `none` |

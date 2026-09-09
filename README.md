@@ -123,3 +123,14 @@ PYTHONPATH=. python python/run_vision.py --backend beamngpy --viz   # Tech path
 Safety: Alt+A engage; heartbeat dead-man; AEB `brake=1`/`throttle=0`; kill Python → `finally` stop + Lua fade (loop itself sets `heartbeat_ok=True` while alive). `--force-engage` is **debug-only** (never default). Live drive on Windows = Michael smoke / still UNPROVEN here.
 
 `cmd_json` fallback writes `gvd_cmd.json` but reports `cmd_applied=false` / `cmd_json_sink` until a real GE apply exists (Lua poll is a no-op sink today).
+
+
+## Clips (M4)
+
+```bash
+PYTHONPATH=. python python/run_vision.py --smoke          # dry-run clip + viz smoke
+PYTHONPATH=. python scripts/test_m4_clips.py
+PYTHONPATH=. python python/run_vision.py --viz            # key C = manual clip
+```
+
+Clips land in `Documents/GVD/clips/` (repo `data/clips/` gitignored). Encode: `ffmpeg` `h264_qsv` if `hw_probe` qsv=yes, else `libx264` veryfast CRF~23. `--encode nvenc` only when you explicitly want Pascal encode (not default).

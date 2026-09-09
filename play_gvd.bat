@@ -24,7 +24,9 @@ if defined RUN (
 
 echo [GVD] Trying Steam app 284160. If BeamNG does not open, launch it yourself.
 start "" "steam://rungameid/284160" 2>nul
-echo [GVD] Enable GVD in Mod Manager if needed. Alt+A toggles engage (writes gvd_engage.json). Live Tech UNPROVEN.
+echo [GVD] Mods expect: %%LOCALAPPDATA%%\BeamNG\BeamNG.drive\current\mods\unpacked\gvd  (0.38+)
+echo [GVD] Legacy also: %%LOCALAPPDATA%%\BeamNG.drive\^<ver^>\mods\unpacked\gvd
+echo [GVD] Run install.bat if Mod Manager is empty. Alt+A engage. Live Tech UNPROVEN.
 pause
 endlocal
 exit /b 0

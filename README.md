@@ -120,4 +120,6 @@ PYTHONPATH=. python python/run_vision.py --backend beamngpy --viz   # Tech path
 # --allow-preview-drive   # opt-in only; default blocks preview paths
 ```
 
-Safety: Alt+A engage; heartbeat dead-man; AEB `brake=1`/`throttle=0`; kill Python → stop. Live drive on Windows = Michael smoke / still UNPROVEN here.
+Safety: Alt+A engage; heartbeat dead-man; AEB `brake=1`/`throttle=0`; kill Python → `finally` stop + Lua fade (loop itself sets `heartbeat_ok=True` while alive). `--force-engage` is **debug-only** (never default). Live drive on Windows = Michael smoke / still UNPROVEN here.
+
+`cmd_json` fallback writes `gvd_cmd.json` but reports `cmd_applied=false` / `cmd_json_sink` until a real GE apply exists (Lua poll is a no-op sink today).

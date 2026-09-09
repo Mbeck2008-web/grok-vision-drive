@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -19,15 +22,18 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import make_release_zip as rel  # noqa: E402
 from python.control.actuate import (  # noqa: E402
+    CmdJsonActuator,
     DriveCommand,
     cmd_path,
+    ego_path,
     engage_path,
     make_actuator,
+    read_ego_feedback,
     read_engage_flag,
     write_engage_flag,
 )
 from python.runtime.hw_probe import HwReport, cam_claim  # noqa: E402
-from python.runtime.state_io import state_path  # noqa: E402
+from python.runtime.state_io import read_state, state_path  # noqa: E402
 from python.sensors.cameras import CAM_IDS, WindowBackend  # noqa: E402
 
 CHROME_RE = re.compile(r"tesla|\bfsd\b|full self[- ]driving|autopilot", re.I)
@@ -91,7 +97,7 @@ def check_release_zip() -> None:
             ver = zf.read("gvd-retail-test/VERSION.txt").decode("utf-8")
             assert "retail package test" in ver
             assert "1-cam window capture only" in ver
-            assert "cannot drive the car" in ver
+            assert "drives the sim car through Documents/GVD/gvd_cmd.json" in ver
 
         # Flat variant has no top-level folder.
         flat = Path(td) / "flat.zip"
@@ -149,13 +155,159 @@ def check_window_backend_one_cam() -> None:
     assert all(v == "missing" for v in empty.health_str().values())
 
 
-def check_retail_actuator_is_sink() -> None:
+def _write_ego(seq: int, *, applying: bool = True, speed: float = 5.5, steer_in: float = 0.0, age_s: float = 0.0) -> None:
+    ego_path().write_text(
+        json.dumps(
+            {
+                "speed_mps": speed,
+                "steering_input": steer_in,
+                "throttle_input": 0.2,
+                "brake_input": 0.0,
+                "applied_seq": seq,
+                "applying": applying,
+                "mtime": int(time.time()),
+            }
+        ),
+        encoding="utf-8",
+    )
+    if age_s:
+        old = time.time() - age_s
+        os.utime(ego_path(), (old, old))
+
+
+def check_cmd_json_drive_bus() -> None:
+    """Retail actuator: engaged → real drive payload; disengaged → idle stop; applied only on Lua ack."""
+    if ego_path().exists():
+        ego_path().unlink()
     act = make_actuator(None, prefer_beamngpy=True)
-    assert act.name == "cmd_json"
-    out = act.apply(DriveCommand(steer=0.1, throttle=0.3, brake=0.0, seq=1, reason="ok"))
-    assert out.applied is False and out.reason == "cmd_json_sink", out
+    assert isinstance(act, CmdJsonActuator) and act.name == "cmd_json"
+
+    # Engaged, no Lua yet → payload carries the real command + engaged=true, but nothing is claimed.
+    act.note_engaged(True)
+    act.note_ack(read_ego_feedback())
+    out = act.apply(DriveCommand(steer=0.3, throttle=0.4, brake=0.0, seq=7, reason="ok"))
     payload = json.loads(cmd_path().read_text(encoding="utf-8"))
-    assert payload["applied"] is False and payload["reason"] == "cmd_json_sink"
+    assert payload == {
+        "steer": 0.3, "throttle": 0.4, "brake": 0.0, "seq": 7, "engaged": True,
+        "heartbeat_mtime": payload["heartbeat_mtime"], "reason": "ok",
+    }, payload
+    assert time.time() - payload["heartbeat_mtime"] < 5.0
+    assert out.applied is False and out.reason == "cmd_json_pending", out
+
+    # Lua echoes a fresh ack for that seq → applied.
+    _write_ego(7, steer_in=0.3)
+    fb = read_ego_feedback()
+    assert fb is not None and fb.fresh and fb.applying and fb.applied_seq == 7 and fb.speed_mps == 5.5
+    act.note_ack(fb)
+    out = act.apply(DriveCommand(steer=0.3, throttle=0.4, brake=0.0, seq=8, reason="ok"))
+    assert out.applied is True and out.reason == "cmd_json_applied", out
+
+    # Ack too far behind → not applied.
+    _write_ego(1)
+    act.note_ack(read_ego_feedback())
+    out = act.apply(DriveCommand(steer=0.0, throttle=0.1, brake=0.0, seq=9, reason="ok"))
+    assert out.applied is False and out.reason == "cmd_json_pending", out
+
+    # Stale ack (Lua stopped echoing) → not applied.
+    _write_ego(9, age_s=5.0)
+    fb = read_ego_feedback()
+    assert fb is not None and not fb.fresh
+    act.note_ack(fb)
+    out = act.apply(DriveCommand(steer=0.0, throttle=0.1, brake=0.0, seq=10, reason="ok"))
+    assert out.applied is False and out.reason == "cmd_json_pending", out
+
+    # Disengaged → stop with engaged=false so Lua hands the car back; gate reasons pass through.
+    act.note_engaged(False)
+    _write_ego(10)
+    act.note_ack(read_ego_feedback())
+    out = act.stop(seq=11, reason="not_engaged")
+    payload = json.loads(cmd_path().read_text(encoding="utf-8"))
+    assert payload["engaged"] is False and payload["brake"] == 1.0 and payload["throttle"] == 0.0
+    assert payload["reason"] == "not_engaged" and out.applied is False and out.reason == "not_engaged"
+    out = act.stop(seq=12, reason="shutdown")
+    assert out.applied is False and out.reason == "cmd_json_idle"
+    # Engaged gate hold (preview) still rides along as a brake hold Lua applies.
+    act.note_engaged(True)
+    out = act.stop(seq=13, reason="preview_blocked")
+    payload = json.loads(cmd_path().read_text(encoding="utf-8"))
+    assert payload["engaged"] is True and payload["brake"] == 1.0 and out.reason == "preview_blocked"
+
+    # Torn / garbage ego file never crashes the loop.
+    ego_path().write_text('{"speed_mps": 3.', encoding="utf-8")
+    assert read_ego_feedback() is None
+    ego_path().unlink()
+
+
+def _run_supervisor(extra: list[str], seconds: float, ack: bool = False) -> None:
+    """Run run_vision.py headless for `seconds`; optionally play the mod's ack role meanwhile."""
+    args = [sys.executable, "-u", str(ROOT / "python" / "run_vision.py"), "--backend", "stub", "--hz", "20", "--encode", "cpu", *extra]
+    env = dict(os.environ, PYTHONPATH=str(ROOT))
+    proc = subprocess.Popen(args, cwd=str(ROOT), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    t_end = time.time() + seconds
+    try:
+        while time.time() < t_end:
+            if proc.poll() is not None:
+                out = proc.stdout.read() if proc.stdout else ""
+                raise AssertionError(f"run_vision exited early ({proc.returncode}):\n{out}")
+            if ack:
+                try:
+                    seq = int(json.loads(cmd_path().read_text(encoding="utf-8")).get("seq", -1))
+                except Exception:
+                    seq = -1
+                if seq >= 0:
+                    _write_ego(seq, applying=True, speed=5.5)
+            time.sleep(0.05)
+    finally:
+        proc.kill()  # SIGKILL: the `finally` stop never runs, so the last tick's files survive for assertions
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+
+
+def check_run_vision_e2e() -> None:
+    """Supervisor loop end-to-end (stub cameras): engaged writes drive cmds, disengaged writes idle stops."""
+    write_engage_flag(False)
+    if ego_path().exists():
+        ego_path().unlink()
+
+    # Not engaged → every tick is a stop with engaged=false (Lua keeps its hands off).
+    _run_supervisor([], seconds=2.0)
+    cmd = json.loads(cmd_path().read_text(encoding="utf-8"))
+    assert cmd["engaged"] is False and cmd["brake"] == 1.0 and cmd["throttle"] == 0.0 and cmd["seq"] >= 5, cmd
+    assert cmd["reason"] == "not_engaged"
+    st = read_state()
+    assert st and st["engaged"] is False and st["cmd_applied"] is False and st["actuator"] == "cmd_json"
+    assert st["cmd_reason"] == "not_engaged" and st["ego_source"] == "none"
+
+    # Engaged with no lane path (stub) → preview gate holds the brake, still engaged for Lua.
+    _run_supervisor(["--force-engage"], seconds=2.0)
+    cmd = json.loads(cmd_path().read_text(encoding="utf-8"))
+    assert cmd["engaged"] is True and cmd["brake"] == 1.0 and cmd["throttle"] == 0.0 and cmd["reason"] == "preview_blocked", cmd
+
+    # Engaged + preview allowed → real drive command every tick; Lua ack flips cmd_applied and ego speed.
+    _run_supervisor(["--force-engage", "--allow-preview-drive"], seconds=2.5, ack=True)
+    cmd = json.loads(cmd_path().read_text(encoding="utf-8"))
+    assert cmd["engaged"] is True and cmd["reason"] == "ok" and cmd["seq"] >= 10, cmd
+    assert cmd["throttle"] > 0.0 and cmd["brake"] == 0.0 and -1.0 <= cmd["steer"] <= 1.0, cmd
+    st = read_state()
+    assert st and st["engaged"] is True and st["cmd_applied"] is True, {k: st.get(k) for k in ("engaged", "cmd_applied", "cmd_reason")}
+    assert st["cmd_reason"] == "cmd_json_applied" and st["ego_source"] == "lua" and st["lua_applying"] is True
+    assert abs(float(st["ego"]["speed_mps"]) - 5.5) < 1e-6, st["ego"]
+    assert st["cmd_ack_seq"] >= st["cmd_seq"] - 5
+
+    write_engage_flag(False)
+    ego_path().unlink()
+
+
+def check_lua_harness() -> None:
+    """Drive the mod's Lua through the stub-GE harness when a Lua 5.1 interpreter is available."""
+    for exe in ("lua5.1", "luajit", "lua"):
+        if shutil.which(exe):
+            res = subprocess.run([exe, "scripts/test_m6_lua_cmd.lua"], cwd=str(ROOT), capture_output=True, text=True, timeout=60)
+            assert res.returncode == 0 and "test_m6_lua_cmd: OK" in res.stdout, res.stdout + res.stderr
+            return
+    print("  (lua interpreter not found — scripts/test_m6_lua_cmd.lua skipped)")
 
 
 def check_engage_path_contract() -> None:
@@ -212,6 +364,14 @@ def check_player_docs() -> None:
     assert "## Player guide" in readme
     assert "make_release_zip" in readme
     assert "requirements-retail.txt" in readme
+    # Retail drives via the cmd JSON bus; the old "cannot drive" wording must be gone everywhere players look.
+    assert "gvd_cmd.json" in readme and "gvd_ego.json" in readme
+    for f in (ROOT / "README.md", ROOT / "play_gvd.bat", ROOT / "scripts" / "make_release_zip.py",
+              ROOT / "python" / "run_vision.py", ROOT / "docs" / "gvd_state_schema.md"):
+        text = f.read_text(encoding="utf-8", errors="ignore").lower()
+        for bad in ("cannot drive", "does not steer", "does not drive", "no-op sink", "never steers"):
+            assert bad not in text, f"{f.name}: stale wording {bad!r}"
+    assert "1-cam window capture only" in rel.version_text("test") and "gvd_cmd.json" in rel.version_text("test")
     bat = (ROOT / "play_gvd.bat").read_text(encoding="utf-8", errors="ignore")
     assert 'set "GVD_BACKEND=window"' in bat and "--backend %GVD_BACKEND%" in bat
     assert "--backend auto" not in bat
@@ -223,10 +383,12 @@ def main() -> None:
     check_release_zip()
     check_boot_line_honesty()
     check_window_backend_one_cam()
-    check_retail_actuator_is_sink()
+    check_cmd_json_drive_bus()
     check_engage_path_contract()
     check_no_chrome()
     check_player_docs()
+    check_lua_harness()
+    check_run_vision_e2e()
     print("test_m6_retail: OK")
 
 

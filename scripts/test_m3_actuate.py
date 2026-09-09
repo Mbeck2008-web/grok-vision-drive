@@ -87,13 +87,17 @@ def main() -> None:
     spd, steeri = read_electrics_speed(V())
     assert spd == 7.5 and steeri == 0.1, (spd, steeri)
 
-    # cmd json actuator writes file but does NOT claim applied
+    # cmd json actuator writes the file but never claims applied without a Lua ack (M6 bus)
     act = CmdJsonActuator()
     out = act.stop(seq=9, reason="unit_stop")
-    assert out.applied is False and out.reason == "cmd_json_sink" and out.brake == 1.0
+    assert out.applied is False and out.reason == "cmd_json_idle" and out.brake == 1.0
     from python.control.actuate import cmd_path
 
     assert cmd_path().is_file()
+    import json
+
+    payload = json.loads(cmd_path().read_text(encoding="utf-8"))
+    assert payload["engaged"] is False and payload["brake"] == 1.0 and payload["seq"] == 9
 
     print("test_m3_actuate: OK")
 

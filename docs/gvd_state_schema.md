@@ -62,6 +62,10 @@ Also: `Documents/GVD/gvd_cmd.json` = `{steer,throttle,brake,seq,heartbeat_mtime}
 | `planner.cipv_id` | int? | Brighter ice / LEAD on that track |
 
 
+## Path note
+
+Lua and Python share `%USERPROFILE%\\Documents\\GVD` (or HOME). GELua often has empty `USERPROFILE`; `gvd/main.lua` derives the profile from `LOCALAPPDATA` / `FS:getUserPath` / `FS:virtual2Native` instead of writing bare files under the BeamNG userfolder.
+
 ## UI prefs (`Documents/GVD/gvd_ui_prefs.json`)
 
 Written by the in-game **GVD** app. **Wins over** `gvd_state` for path/ghosts while the file exists. Setters also mirror into `gvd_state` when JSON encode is available so OpenCV follows.

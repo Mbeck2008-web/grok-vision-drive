@@ -34,23 +34,117 @@ local function onInit()
 end
 
 
-local function userEngagePath()
+
+-- Resolve Documents/GVD without relying on USERPROFILE (empty in GELua on some Windows builds).
+-- Live bug: bare gvd_engage.json landed under BeamNG userfolder current\, Python read Documents\GVD\.
+local gvdDocsResolved = nil
+local gvdDocsLogged = false
+
+local function _stripToUserHome(p)
+  if not p or p == '' then return nil end
+  p = tostring(p):gsub('\\', '/')
+  -- C:/Users/Name/AppData/Local/... → C:/Users/Name
+  local home = p:match('^(.+)/AppData/Local') or p:match('^(.+)/AppData/Roaming') or p:match('^(.+)/AppData')
+  if home and home ~= '' then return home end
+  return nil
+end
+
+local function _tryHomeEnv()
   local home = os.getenv('USERPROFILE') or os.getenv('HOME')
-  if home and home ~= '' then
-    return home .. '/' .. ENGAGE_REL
+  if home and home ~= '' then return home end
+  local localApp = os.getenv('LOCALAPPDATA')
+  if localApp and localApp ~= '' then
+    local h = _stripToUserHome(localApp)
+    if h then return h end
   end
-  return 'gvd_engage.json'
+  return nil
+end
+
+local function _tryFsHome()
+  if FS then
+    if FS.getUserPath then
+      local ok, up = pcall(function() return FS:getUserPath() end)
+      if ok and up and up ~= '' then
+        local h = _stripToUserHome(up)
+        if h then return h end
+      end
+    end
+    -- virtual2Native / getFileRealPath on a known user-folder VFS path
+    for _, vp in ipairs({'settings', '/settings', 'settings/'}) do
+      if FS.virtual2Native then
+        local ok, native = pcall(function() return FS:virtual2Native(vp) end)
+        if ok and native and native ~= '' then
+          local h = _stripToUserHome(native)
+          if h then return h end
+        end
+      end
+      if FS.getFileRealPath then
+        local ok, native = pcall(function() return FS:getFileRealPath(vp) end)
+        if ok and native and native ~= '' then
+          local h = _stripToUserHome(native)
+          if h then return h end
+        end
+      end
+    end
+  end
+  return nil
+end
+
+local function gvdDocsDir()
+  if gvdDocsResolved then return gvdDocsResolved end
+  local home = _tryHomeEnv() or _tryFsHome()
+  local dir
+  if home and home ~= '' then
+    dir = home:gsub('\\', '/') .. '/Documents/GVD'
+  else
+    -- Last resort: still under Documents/GVD relative to CWD (never bare filename in userfolder root)
+    dir = 'Documents/GVD'
+  end
+  -- Best-effort mkdir
+  if FS and FS.directoryCreate then
+    pcall(function() FS:directoryCreate(dir, true) end)
+  end
+  gvdDocsResolved = dir
+  if not gvdDocsLogged then
+    gvdDocsLogged = true
+    log('I', 'GVD', '[GVD] docs dir: ' .. tostring(dir) .. ' (USERPROFILE=' .. tostring(os.getenv('USERPROFILE') or '') .. ')')
+    print('[GVD] docs dir: ' .. tostring(dir))
+  end
+  return dir
+end
+
+local function gvdFile(name)
+  return gvdDocsDir() .. '/' .. name
+end
+
+local function userEngagePath()
+  return gvdFile('gvd_engage.json')
 end
 
 local function userCmdPath()
-  local home = os.getenv('USERPROFILE') or os.getenv('HOME')
-  if home and home ~= '' then
-    return home .. '/' .. CMD_REL
-  end
-  return 'gvd_cmd.json'
+  return gvdFile('gvd_cmd.json')
 end
 
+local function userUiPrefsPath()
+  return gvdFile('gvd_ui_prefs.json')
+end
+
+local function userStatePath()
+  return gvdFile('gvd_state.json')
+end
+
+
 local function writeText(path, data)
+  if not path then return false end
+  -- Ensure parent Documents/GVD exists when FS can
+  local parent = tostring(path):match('^(.+)/[^/]+$')
+  if parent and FS and FS.directoryCreate then
+    pcall(function() FS:directoryCreate(parent, true) end)
+  end
+  if FS and FS.writeFile then
+    local ok = pcall(function() FS:writeFile(path, data) end)
+    if ok then return true end
+  end
   local f = io.open(path, 'w')
   if not f then return false end
   f:write(data)
@@ -99,14 +193,6 @@ local function getPlayerVeh()
   return nil
 end
 
-
-local function userUiPrefsPath()
-  local home = os.getenv('USERPROFILE') or os.getenv('HOME')
-  if home and home ~= '' then
-    return home .. '/' .. UI_PREFS_REL
-  end
-  return 'gvd_ui_prefs.json'
-end
 
 local function encodeUiStateMirror(st)
   if jsonEncode then
@@ -180,17 +266,6 @@ local function applyCmdJson(dt)
   if _steer or _throttle or _brake then
     -- no-op sink; BeamNGpy actuator is preferred
   end
-end
-
-local function userStatePath()
-  local home = os.getenv('USERPROFILE') or os.getenv('HOME')
-  if home and home ~= '' then
-    return home .. '/' .. STATE_REL
-  end
-  if FS and FS.getUserPath then
-    return FS:getUserPath() .. 'settings/gvd_state.json'
-  end
-  return 'gvd_state.json'
 end
 
 local function clamp(x, a, b)
@@ -600,9 +675,18 @@ function M.onUpdate(dt)
 end
 
 function M.onExtensionLoaded()
+  gvdDocsDir()  -- resolve + log once
   readUiPrefs()
+  -- Soft: keyboard.diff / actions load race — reload bindings after gvd actions are present
+  pcall(function()
+    if core_input_bindings and core_input_bindings.reloadBindings then
+      core_input_bindings.reloadBindings()
+    elseif extensions and extensions.core_input_bindings and extensions.core_input_bindings.reloadBindings then
+      extensions.core_input_bindings.reloadBindings()
+    end
+  end)
   log('I', 'GVD', '[GVD] loaded. Alt+A engage. Path: GVD PATH. Strip: mode/Hz/TTC/N. UI app: GVD.')
-  print('[GVD] loaded. Alt+A engage. Writes gvd_engage.json; optional gvd_cmd.json poll (BeamNGpy preferred).')
+  print('[GVD] loaded. Alt+A engage. Writes ' .. userEngagePath() .. '; optional gvd_cmd.json poll (BeamNGpy preferred).')
 end
 
 function M.onExtensionUnloaded()

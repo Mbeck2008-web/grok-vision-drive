@@ -53,7 +53,8 @@ angular.module('beamng.apps')
         }
         if (statusEl) {
           var ttc = (data.ttc == null || data.ttc === undefined) ? '--' : Number(data.ttc).toFixed(1);
-          statusEl.textContent = (engaged ? 'ON' : 'OFF') + ' · ' +
+          var mode = engaged ? (data.applying ? 'DRIVE' : 'ON') : 'OFF';
+          statusEl.textContent = mode + ' · ' +
             Math.round(data.hz || 0) + 'Hz · TTC ' + ttc + ' · N=' + (data.n || 0);
         }
       }

@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
 from python.control.actuate import (
     attach_electrics,
     make_actuator,
+    read_ego_feedback,
     read_electrics_speed,
     read_engage_flag,
     safe_command,
@@ -237,6 +238,11 @@ def main() -> None:
     backend_name = resolve_backend_name(None if args.backend == "auto" else args.backend)
     hw = probe(backend=backend_name)
     print(hw.boot_line())
+    if hw.is_retail:
+        print(
+            "[GVD] RETAIL PATH: 1-cam window capture only (main/cam_main); other cam_health stay missing. "
+            "Drive = gvd_cmd.json -> mod Lua on the player vehicle. 8-cam rig + direct control = BeamNG.tech + BeamNGpy."
+        )
     reason = refuse_live_start(hw, vision_only=args.vision_only)
     if reason:
         print(f"[GVD] REFUSE: {reason}")
@@ -269,6 +275,12 @@ def main() -> None:
     )
 
     print(f"[GVD] camera backend={backend.name} detector={perc.detector.name} actuator={actuator.name}")
+    if actuator.name == "cmd_json":
+        print(
+            "[GVD] actuator=cmd_json: Documents/GVD/gvd_cmd.json -> gvd_main.applyCmdJson -> player vehicle "
+            "(input.event steering/throttle/brake). Ego speed/inputs echo back via gvd_ego.json; "
+            "cmd_applied is claimed only on a fresh Lua ack."
+        )
     print(f"[GVD] M5 policy={args.policy} e2e={e2e_policy.name} (modular vetoes E2E; shadow writes both)")
     print(f"[GVD] clip encoder={recorder.encoder} (qsv prefer; never default nvenc)")
     print(f"[GVD] state path: {state_path()}")
@@ -306,7 +318,17 @@ def main() -> None:
 
             steer = 0.0
             ego_v = last_ego_v
+            ego_source = "none"
+            ego_fb = None
             spd, steer_in = read_electrics_speed(vehicle)
+            if spd is not None or steer_in is not None:
+                ego_source = "beamngpy"
+            if vehicle is None:
+                # Retail: the mod echoes electrics (wheelspeed, inputs) through gvd_ego.json.
+                ego_fb = read_ego_feedback()
+                if ego_fb is not None and ego_fb.fresh:
+                    spd, steer_in = ego_fb.speed_mps, ego_fb.steering_input
+                    ego_source = "lua"
             if spd is not None:
                 ego_v = max(0.0, float(spd))
                 last_ego_v = ego_v
@@ -351,7 +373,7 @@ def main() -> None:
             elif tick.should_disengage:
                 engaged = False
                 disengage_reason = tick.veto_reason if tick.veto_reason != "none" else "veto"
-                write_engage_flag(False)
+                write_engage_flag(False, disengage_reason=disengage_reason)
             elif cmd.reason == "preview_blocked":
                 disengage_reason = "preview_blocked"
             elif cmd.reason == "heartbeat_stale":
@@ -359,8 +381,11 @@ def main() -> None:
                 engaged = False
 
             if engaged and steer_in is not None and abs(float(steer_in)) > 0.55 and abs(cmd.steer) < 0.2:
+                # Driver grabbed the wheel: hand the car back and stay off until the next Alt+A
+                # (sticky — otherwise Lua and the player would fight at loop rate).
                 engaged = False
                 disengage_reason = "driver_override"
+                write_engage_flag(False, disengage_reason="driver_override")
                 cmd = safe_command(
                     engaged=False,
                     heartbeat_ok=True,
@@ -370,6 +395,11 @@ def main() -> None:
                 )
 
             # Actuators only when engaged + command ok (shadow fields already on tick).
+            # cmd_json: Lua applies whatever we write only while `engaged` rides along in the payload.
+            if hasattr(actuator, "note_engaged"):
+                actuator.note_engaged(engaged)
+            if hasattr(actuator, "note_ack"):
+                actuator.note_ack(ego_fb)
             if engaged and cmd.reason == "ok":
                 applied = actuator.apply(cmd)
             else:
@@ -422,6 +452,9 @@ def main() -> None:
             st["cmd_seq"] = int(applied.seq)
             st["cmd_reason"] = applied.reason
             st["cmd_applied"] = bool(applied.applied)
+            st["ego_source"] = ego_source
+            st["cmd_ack_seq"] = int(ego_fb.applied_seq) if ego_fb is not None else -1
+            st["lua_applying"] = bool(ego_fb.applying and ego_fb.fresh) if ego_fb is not None else False
             st["shadow"] = {
                 "steer": float(tick.shadow.get("steer", 0.0)),
                 "throttle": float(tick.shadow.get("throttle", 0.0)),
@@ -491,11 +524,13 @@ def main() -> None:
         print("[GVD] stopped.")
     finally:
         try:
+            if hasattr(actuator, "note_engaged"):
+                actuator.note_engaged(False)  # cmd_json: Lua releases the car at once
             actuator.stop(seq=cmd_seq + 1, reason="shutdown")
         except Exception:
             pass
         try:
-            write_engage_flag(False)
+            write_engage_flag(False, disengage_reason="shutdown")
         except Exception:
             pass
         backend.close()

@@ -24,13 +24,28 @@ class HwReport:
     profile: str = "gtx_1080_ti"
     notes: list[str] | None = None
 
+    @property
+    def is_retail(self) -> bool:
+        return (self.backend or "").lower() == "window"
+
     def boot_line(self) -> str:
         vram = f"{self.dgpu_vram_gb:.0f}GB" if self.dgpu_vram_gb else "?"
         qsv = "yes" if self.qsv else "no"
         return (
             f"[GVD] cpu={self.cpu} ram={self.ram_gb:.0f}GB "
-            f"dgpu={self.dgpu} {vram} igpu={self.igpu} qsv={qsv} backend={self.backend}"
+            f"dgpu={self.dgpu} {vram} igpu={self.igpu} qsv={qsv} backend={self.backend} "
+            f"{cam_claim(self.backend)}"
         )
+
+
+def cam_claim(backend: str) -> str:
+    """Honest camera claim per backend — the retail window path never says 8 cams."""
+    b = (backend or "stub").lower()
+    if b == "window":
+        return "cams=1/8 path=retail (1 window capture; not 8; drive=gvd_cmd.json->mod Lua)"
+    if b == "beamngpy":
+        return "cams<=8 path=tech (BeamNGpy cameras.yaml + direct control; live UNPROVEN)"
+    return "cams=0/8 path=stub"
 
 
 def _cpu_name() -> str:

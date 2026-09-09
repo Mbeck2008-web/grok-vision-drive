@@ -1,5 +1,7 @@
--- Grok Vision Drive — GE extension: engage + ice-blue ego path + compact HUD strip
--- NOTE: Alt+A live ribbon remains UNPROVEN on Linux; confirm on Windows BeamNG smoke.
+-- Grok Vision Drive — GE extension: engage + ice-blue ego path + compact HUD strip + retail drive
+-- NOTE: Alt+A live ribbon/drive remain UNPROVEN on Linux; confirm on Windows BeamNG smoke.
+-- Retail (window capture): while engaged, Documents/GVD/gvd_cmd.json is applied to the player vehicle
+-- through vehicle-Lua input.event (the calls BeamNG's AI / BeamNGpy use). No DLL / hooks / injection.
 local M = {}
 
 local engaged = false
@@ -10,6 +12,7 @@ local STATE_REL = 'Documents/GVD/gvd_state.json'
 local ENGAGE_REL = 'Documents/GVD/gvd_engage.json'
 local CMD_REL = 'Documents/GVD/gvd_cmd.json'
 local UI_PREFS_REL = 'Documents/GVD/gvd_ui_prefs.json'
+local EGO_REL = 'Documents/GVD/gvd_ego.json'
 local lastCmdSeq = -1
 local cmdAcc = 0
 local pollAcc = 0
@@ -19,6 +22,25 @@ local fadeDur = 0.40
 local lastGood = nil
 local missingKeysLogged = false
 local stripAcc = 0
+
+-- M6 retail drive state (gvd_cmd.json → player vehicle; electrics echo → gvd_ego.json)
+local CMD_POLL_S = 0.05      -- 20 Hz apply
+-- Dead-man timers (wall / seq age): STALE = brake hold; DEAD = release + disengage.
+-- STALE matches Python HEARTBEAT_STALE_S (0.35). DEAD is short (1.0s) so a dead
+-- supervisor doesn't leave the car braked indefinitely — was 3.0s, soft-tightened.
+local CMD_STALE_S = 0.35     -- no new seq for this long → brake hold (dead-man)
+local CMD_DEAD_S = 1.0       -- stream dead this long while we hold the car → release + disengage
+local EGO_POLL_S = 0.10      -- 10 Hz electrics echo while the supervisor is alive
+local applying = false       -- true while our input.event stream holds the player vehicle
+local applyVeh = nil         -- vehicle object we last applied to (released on switch/disengage)
+local lastAppliedSeq = -1
+local cmdStaleAcc = 0
+local cmdStaleLogged = false
+local arcadeQueued = false
+local egoAcc = 0
+local egoFb = nil
+local stateBeatAcc = 0       -- seconds since gvd_state.json heartbeat_mtime last changed
+local lastStateBeat = nil
 
 local ICE_R, ICE_G, ICE_B = 90, 180, 220
 local AMBER_R, AMBER_G, AMBER_B = 200, 160, 60
@@ -133,6 +155,10 @@ local function userStatePath()
   return gvdFile('gvd_state.json')
 end
 
+local function userEgoPath()
+  return gvdFile('gvd_ego.json')
+end
+
 
 local function writeText(path, data)
   if not path then return false end
@@ -152,8 +178,11 @@ local function writeText(path, data)
   return true
 end
 
+local lastEngageWriteUnix = 0
+
 local function writeEngageFile()
-  local payload = string.format('{"engaged":%s,"mtime":%d}', engaged and 'true' or 'false', os.time())
+  lastEngageWriteUnix = os.time()
+  local payload = string.format('{"engaged":%s,"mtime":%d}', engaged and 'true' or 'false', lastEngageWriteUnix)
   writeText(userEngagePath(), payload)
 end
 
@@ -236,37 +265,6 @@ local function readUiPrefs()
   if p.show_agent_ghosts ~= nil then showAgentGhosts = not not p.show_agent_ghosts end
 end
 
-
-local function applyCmdJson(dt)
-  -- Fallback only: poll gvd_cmd.json when BeamNGpy actuator is not the live path.
-  -- Stale heartbeat_mtime → ignore and hold brake.
-  cmdAcc = cmdAcc + (dt or 0)
-  if cmdAcc < 0.05 then return end
-  cmdAcc = 0
-  if not engaged then return end
-  local raw = readText(userCmdPath())
-  if not raw then return end
-  local cmd = decodeJson(raw)
-  if not cmd then return end
-  local seq = tonumber(cmd.seq) or 0
-  if seq == lastCmdSeq then return end
-  lastCmdSeq = seq
-  local mt = tonumber(cmd.heartbeat_mtime)
-  if mt then
-    -- if Python died, heartbeat_mtime stops advancing; age via os.clock gate in heartbeatAlive on state —
-    -- here: if cmd.heartbeat_mtime older than ~0.5s wall vs state, skip
-  end
-  local veh = getPlayerVeh()
-  if not veh then return end
-  -- Consume cmd file (seq advanced). Official apply path is BeamNGpy vehicle.control.
-  -- GELua has no portable vehicle.control; no DLL/hooks. Values kept for future GE API.
-  local _steer = tonumber(cmd.steer) or 0
-  local _throttle = tonumber(cmd.throttle) or 0
-  local _brake = tonumber(cmd.brake) or 0
-  if _steer or _throttle or _brake then
-    -- no-op sink; BeamNGpy actuator is preferred
-  end
-end
 
 local function clamp(x, a, b)
   if x < a then return a end
@@ -586,7 +584,11 @@ local function pushStrip()
   if not lastGood then return end
   local pl = lastGood.planner or {}
   local mode = tostring(lastGood.policy or 'modular')
-  if engaged then mode = mode .. '|ON' else mode = mode .. '|OFF' end
+  if engaged then
+    mode = mode .. (applying and '|DRIVE' or '|ON')
+  else
+    mode = mode .. '|OFF'
+  end
   local hz = tonumber(lastGood.loop_hz) or 0
   local ttc = pl.ttc_lead
   local ttcS = (ttc == nil) and '--' or string.format('%.1f', tonumber(ttc) or 0)
@@ -598,6 +600,7 @@ local function pushStrip()
       guihooks.trigger('gvdStrip', { text = line, mode = mode, hz = hz, ttc = ttc, n = n, engaged = engaged })
       guihooks.trigger('gvdUi', {
         engaged = engaged,
+        applying = applying,
         showPath = showPath,
         showGhosts = showAgentGhosts,
         hz = hz,
@@ -623,15 +626,195 @@ local function pushStrip()
   end
 end
 
-local function pollState(dt)
-  pollAcc = pollAcc + (dt or 0)
-  if pollAcc < pollEvery then return end
-  pollAcc = 0
+-- ───────────── M6 retail drive: gvd_cmd.json → player vehicle, electrics → gvd_ego.json ─────────────
+-- Python writes {steer,throttle,brake,seq,engaged,heartbeat_mtime} every tick. While Lua-engaged AND the
+-- payload says engaged AND the seq keeps advancing, we feed the player vehicle with the vehicle-Lua calls
+-- BeamNG's own AI / BeamNGpy use: input.event('steering', v, 1) (pad-smoothed, +1 = right like kbdSteer)
+-- and input.event('throttle'|'brake', v, 2) (direct). Vehicle Lua echoes electrics back through
+-- obj:queueGameEngineLua → M.onEgoFeedback → gvd_ego.json (wheelspeed, inputs, applied seq).
+local VE_APPLY_FMT = "input.event('steering',%.4f,1);input.event('throttle',%.4f,2);input.event('brake',%.4f,2)"
+local VE_RELEASE = "input.event('steering',0,1);input.event('throttle',0,2);input.event('brake',0,2)"
+local VE_ARCADE = "if drivetrain and drivetrain.setShifterMode then pcall(drivetrain.setShifterMode,'arcade') end"
+local VE_FEEDBACK = "local ev=(electrics and electrics.values) or {};"
+  .. "local function n(x) x=tonumber(x) or 0;if x~=x or x==math.huge or x==-math.huge then x=0 end;return x end;"
+  .. "obj:queueGameEngineLua(string.format('extensions.gvd_main.onEgoFeedback(%.3f,%.4f,%.4f,%.4f)',"
+  .. "n(ev.wheelspeed or ev.airspeed),n(ev.steering_input),n(ev.throttle_input),n(ev.brake_input)))"
+
+local function queueVehicle(veh, code)
+  if not veh or not veh.queueLuaCommand then return false end
+  local ok = pcall(function() veh:queueLuaCommand(code) end)
+  return ok
+end
+
+local function applyInputs(veh, steer, throttle, brake)
+  steer = clamp(tonumber(steer) or 0, -1, 1)
+  throttle = clamp(tonumber(throttle) or 0, 0, 1)
+  brake = clamp(tonumber(brake) or 0, 0, 1)
+  if brake > 0.01 then throttle = 0 end  -- never both pedals (AEB semantics; arcade auto-reverse guard)
+  return queueVehicle(veh, string.format(VE_APPLY_FMT, steer, throttle, brake))
+end
+
+local function vehId(veh)
+  if not veh then return nil end
+  local ok, id = pcall(function() return veh:getID() end)
+  if ok and id ~= nil then return id end
+  return veh
+end
+
+local function releaseInputs(why)
+  if not applying then return end
+  applying = false
+  queueVehicle(applyVeh or getPlayerVeh(), VE_RELEASE)
+  applyVeh = nil
+  log('I', 'GVD', '[GVD] released vehicle inputs (' .. tostring(why) .. ')')
+end
+
+local function supervisorAlive()
+  return lastGood ~= nil and stateBeatAcc <= 2.0
+end
+
+local function writeEgoFile()
+  if not egoFb then return end
+  local payload = string.format(
+    '{"speed_mps":%.3f,"steering_input":%.4f,"throttle_input":%.4f,"brake_input":%.4f,"applied_seq":%d,"applying":%s,"mtime":%d}',
+    egoFb.speed, egoFb.steer, egoFb.throttle, egoFb.brake,
+    math.floor(tonumber(lastAppliedSeq) or -1), applying and 'true' or 'false', os.time())
+  writeText(userEgoPath(), payload)
+end
+
+-- Called from vehicle Lua (VE_FEEDBACK) via obj:queueGameEngineLua.
+function M.onEgoFeedback(speed, steerIn, thrIn, brkIn)
+  egoFb = {
+    speed = tonumber(speed) or 0,
+    steer = tonumber(steerIn) or 0,
+    throttle = tonumber(thrIn) or 0,
+    brake = tonumber(brkIn) or 0,
+  }
+  writeEgoFile()
+end
+
+local function pollEgo(dt)
+  egoAcc = egoAcc + (dt or 0)
+  if egoAcc < EGO_POLL_S then return end
+  egoAcc = 0
+  if not supervisorAlive() then return end
+  local veh = getPlayerVeh()
+  if not veh then return end
+  queueVehicle(veh, VE_FEEDBACK)
+end
+
+local function applyCmdJson(dt)
+  cmdAcc = cmdAcc + (dt or 0)
+  if cmdAcc < CMD_POLL_S then return end
+  local step = cmdAcc
+  cmdAcc = 0
+  if not engaged then
+    releaseInputs('disengaged')
+    cmdStaleAcc = 0
+    return
+  end
+  local veh = getPlayerVeh()
+  if not veh then
+    applying = false  -- vehicle gone; nothing to release
+    applyVeh = nil
+    return
+  end
+  if applying and applyVeh and vehId(applyVeh) ~= vehId(veh) then
+    -- Player switched vehicles while we held the wheel: free the old one, re-arm arcade for the new one.
+    queueVehicle(applyVeh, VE_RELEASE)
+    arcadeQueued = false
+    log('I', 'GVD', '[GVD] player vehicle changed: released previous vehicle inputs')
+  end
+  applyVeh = veh
+  local raw = readText(userCmdPath())
+  local cmd = raw and decodeJson(raw) or nil
+  if type(cmd) ~= 'table' then cmd = nil end
+  local seq = cmd and tonumber(cmd.seq) or nil
+  local hb = cmd and tonumber(cmd.heartbeat_mtime) or nil
+  if seq and seq ~= lastCmdSeq then
+    lastCmdSeq = seq
+    cmdStaleAcc = 0
+    cmdStaleLogged = false
+  else
+    cmdStaleAcc = cmdStaleAcc + step
+  end
+  -- A file left over from an old session has heartbeat_mtime far behind the wall clock.
+  local ancient = hb ~= nil and (os.time() - hb) > CMD_DEAD_S
+  if cmdStaleAcc > CMD_DEAD_S or ancient then
+    if applying then
+      -- Dead-man: the stream died while we held the car. Release it and disengage; Alt+A re-arms.
+      releaseInputs('command stream dead')
+      engaged = false
+      fadeAcc = 0
+      writeEngageFile()
+      log('W', 'GVD', '[GVD] DISENGAGED: supervisor command stream dead')
+      print('[GVD] DISENGAGED: supervisor command stream dead')
+      pushStrip()
+    end
+    return
+  end
+  if not cmd or cmd.engaged ~= true then
+    -- Supervisor is not driving (has not read Alt+A yet / vetoed / shutting down): hands off.
+    releaseInputs('supervisor not driving')
+    return
+  end
+  if not arcadeQueued then arcadeQueued = queueVehicle(veh, VE_ARCADE) end
+  if cmdStaleAcc > CMD_STALE_S then
+    -- Stream hiccup: straighten + brake, no throttle, until fresh commands resume.
+    applying = true
+    applyInputs(veh, 0, 0, 1)
+    if not cmdStaleLogged then
+      cmdStaleLogged = true
+      log('W', 'GVD', '[GVD] cmd stale > ' .. tostring(CMD_STALE_S) .. 's: brake hold')
+    end
+    return
+  end
+  applying = true
+  if applyInputs(veh, cmd.steer, cmd.throttle, cmd.brake) then
+    lastAppliedSeq = seq or lastAppliedSeq
+  end
+end
+
+-- M6 retail: the Python supervisor writes gvd_engage.json {"engaged":false} when it vetoes,
+-- loses its heartbeat, or exits (finally block). Adopt that OFF so the HUD/ribbon never stay ON
+-- without a supervisor. Never adopt ON from the file — engage always starts in-game (Alt+A / GVD app).
+local function syncEngageFromSupervisor()
+  if not engaged then return end
+  local raw = readText(userEngagePath())
+  if not raw then return end
+  local f = decodeJson(raw)
+  if type(f) ~= 'table' or f.engaged ~= false then return end
+  -- Our own toggle write carries mtime = os.time(); only a supervisor write at/after it may switch us off.
+  local mt = tonumber(f.mtime) or 0
+  if mt < lastEngageWriteUnix then return end
+  engaged = false
+  fadeAcc = 0
+  releaseInputs('supervisor disengaged')
+  -- Reason: the engage file carries it since M6 (veto / driver_override / shutdown); fall back to state.
+  local why = 'supervisor off'
+  local fr = f.disengage_reason and tostring(f.disengage_reason) or nil
+  if fr and fr ~= 'none' and fr ~= 'not_engaged' then
+    why = fr
+  elseif lastGood and lastGood.disengage_reason then
+    local r = tostring(lastGood.disengage_reason)
+    if r ~= 'none' and r ~= 'not_engaged' then why = r end
+  end
+  log('I', 'GVD', '[GVD] DISENGAGED by supervisor (' .. why .. ')')
+  print('[GVD] DISENGAGED by supervisor (' .. why .. ')')
+  pushStrip()
+end
+
+local function pollStateFile()
   local raw = readText(userStatePath())
   if not raw then return end
   local st = decodeJson(raw)
   if not st then return end
   lastGood = st
+  local beat = tonumber(st.heartbeat_mtime)
+  if beat ~= lastStateBeat then
+    lastStateBeat = beat
+    stateBeatAcc = 0
+  end
   -- UI prefs win: if gvd_ui_prefs.json exists, do NOT apply path/ghosts from gvd_state
   -- (run_vision show_agent_ghosts=true would clobber "Show ghosts" off every tick).
   local prefsRaw = readText(userUiPrefsPath())
@@ -653,6 +836,16 @@ local function pollState(dt)
   end
 end
 
+local function pollState(dt)
+  pollAcc = pollAcc + (dt or 0)
+  stateBeatAcc = stateBeatAcc + (dt or 0)
+  if pollAcc < pollEvery then return end
+  pollAcc = 0
+  pollStateFile()
+  -- After the state read so the logged reason is the supervisor's fresh disengage_reason.
+  syncEngageFromSupervisor()
+end
+
 function M.onPreRender(dt)
   pollState(dt)
   M.drawPath(dt)
@@ -672,6 +865,7 @@ end
 function M.onUpdate(dt)
   pollState(dt)
   applyCmdJson(dt)
+  pollEgo(dt)
 end
 
 function M.onExtensionLoaded()
@@ -686,10 +880,12 @@ function M.onExtensionLoaded()
     end
   end)
   log('I', 'GVD', '[GVD] loaded. Alt+A engage. Path: GVD PATH. Strip: mode/Hz/TTC/N. UI app: GVD.')
-  print('[GVD] loaded. Alt+A engage. Writes ' .. userEngagePath() .. '; optional gvd_cmd.json poll (BeamNGpy preferred).')
+  print('[GVD] loaded. Alt+A engage. Writes ' .. userEngagePath()
+    .. '; drives the player vehicle from gvd_cmd.json while engaged (retail). BeamNGpy direct control on Tech.')
 end
 
 function M.onExtensionUnloaded()
+  releaseInputs('extension unloaded')
   engaged = false
   writeEngageFile()
   lastGood = nil
@@ -699,6 +895,7 @@ end
 function M.toggleEngage()
   engaged = not engaged
   fadeAcc = 0
+  if not engaged then releaseInputs('Alt+A disengage') end
   writeEngageFile()
   local state = engaged and 'ENGAGED' or 'DISENGAGED'
   log('I', 'GVD', '[GVD] ' .. state)

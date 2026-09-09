@@ -62,6 +62,43 @@ local function writeEngageFile()
   writeText(userEngagePath(), payload)
 end
 
+local function readText(path)
+  if readFile then
+    local ok, data = pcall(readFile, path)
+    if ok and data and data ~= '' then return data end
+  end
+  if FS and FS.readFile then
+    local ok, data = pcall(function() return FS:readFile(path) end)
+    if ok and data and data ~= '' then return data end
+  end
+  local f = io.open(path, 'r')
+  if not f then return nil end
+  local data = f:read('*a')
+  f:close()
+  return data
+end
+
+local function decodeJson(s)
+  if not s then return nil end
+  if jsonDecode then
+    local ok, t = pcall(jsonDecode, s)
+    if ok then return t end
+  end
+  if util_jsonDecode then
+    local ok, t = pcall(util_jsonDecode, s)
+    if ok then return t end
+  end
+  return nil
+end
+
+local function getPlayerVeh()
+  if be and be.getPlayerVehicle then
+    return be:getPlayerVehicle(0)
+  end
+  return nil
+end
+
+
 local function applyCmdJson(dt)
   -- Fallback only: poll gvd_cmd.json when BeamNGpy actuator is not the live path.
   -- Stale heartbeat_mtime → ignore and hold brake.
@@ -104,35 +141,6 @@ local function userStatePath()
   return 'gvd_state.json'
 end
 
-local function readText(path)
-  if readFile then
-    local ok, data = pcall(readFile, path)
-    if ok and data and data ~= '' then return data end
-  end
-  if FS and FS.readFile then
-    local ok, data = pcall(function() return FS:readFile(path) end)
-    if ok and data and data ~= '' then return data end
-  end
-  local f = io.open(path, 'r')
-  if not f then return nil end
-  local data = f:read('*a')
-  f:close()
-  return data
-end
-
-local function decodeJson(s)
-  if not s then return nil end
-  if jsonDecode then
-    local ok, t = pcall(jsonDecode, s)
-    if ok then return t end
-  end
-  if util_jsonDecode then
-    local ok, t = pcall(util_jsonDecode, s)
-    if ok then return t end
-  end
-  return nil
-end
-
 local function clamp(x, a, b)
   if x < a then return a end
   if x > b then return b end
@@ -142,13 +150,6 @@ end
 local function nowUnix()
   -- Must match Python time.time() / heartbeat_unix (NOT os.clock)
   return os.time()
-end
-
-local function getPlayerVeh()
-  if be and be.getPlayerVehicle then
-    return be:getPlayerVehicle(0)
-  end
-  return nil
 end
 
 -- 1:1 mapping: path_ego x=right, y=forward, z=up in vehicle frame → world via veh basis.

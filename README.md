@@ -16,8 +16,8 @@ Credits: [VisionPilot](https://github.com/visionpilot-project/VisionPilot), Beam
 
 ## Install
 
-1. Double-click `install.bat`
-2. Restart BeamNG
+1. Double-click `install.bat` (prefers `%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\mods` on 0.38+; else newest versioned folder)
+2. Fully quit and restart BeamNG
 3. Enable Grok Vision Drive in Mod Manager if needed (Alt+A engage)
 
 Optional: double-click `play_gvd.bat` to start the Python stub + Steam BeamNG (`284160`). Uninstall: `uninstall.bat` (removes only `mods\unpacked\gvd` and `mods\gvd.zip`).
@@ -38,7 +38,7 @@ After install, unpacked tree:
 ```
 mods\unpacked\gvd\
   scripts\gvd\modScript.lua
-  lua\ge\extensions\gvd_main.lua
+  lua\ge\extensions\gvd\main.lua
   lua\ge\extensions\core\input\actions\gvd.json
   settings\inputmaps\keyboardGvd.json
 ```

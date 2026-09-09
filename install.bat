@@ -6,40 +6,51 @@ cd /d "%~dp0"
 set "LOG=%TEMP%\gvd_install.log"
 echo. > "%LOG%"
 
-set "USER_ROOT="
-if exist "%LOCALAPPDATA%\BeamNG.drive\" set "USER_ROOT=%LOCALAPPDATA%\BeamNG.drive"
-if not defined USER_ROOT if exist "%LOCALAPPDATA%\BeamNG\BeamNG.drive\" set "USER_ROOT=%LOCALAPPDATA%\BeamNG\BeamNG.drive"
+rem Roots: modern layout is LOCALAPPDATA\BeamNG\BeamNG.drive\current\mods (0.38+)
+rem Legacy: LOCALAPPDATA\BeamNG.drive\<ver>\mods
+set "ROOT_A=%LOCALAPPDATA%\BeamNG\BeamNG.drive"
+set "ROOT_B=%LOCALAPPDATA%\BeamNG.drive"
 
-if not defined USER_ROOT (
-  echo [GVD] Could not find BeamNG user folder under LOCALAPPDATA.
-  echo Tried: %%LOCALAPPDATA%%\BeamNG.drive and %%LOCALAPPDATA%%\BeamNG\BeamNG.drive\
-  pause
-  exit /b 1
-)
+echo [GVD] Scanning BeamNG mod roots...
+echo   A: %ROOT_A%
+echo   B: %ROOT_B%
 
-echo [GVD] User root: %USER_ROOT%
-echo [GVD] Candidate version folders with mods:
-for /d %%D in ("%USER_ROOT%\*") do (
-  if exist "%%D\mods\" echo   %%D
-)
-
-rem Numeric / current pick: current wins; else highest 0.xx by real version (0.32 > 0.9)
+rem Prefer current\mods when present (BeamNG 0.38.6 Mod Manager path)
 set "BEST_PATH="
 set "BEST_VER="
-for /f "usebackq delims=" %%L in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$root=$env:USER_ROOT; Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'mods') } | ForEach-Object { $n=$_.Name; if ($n -ieq 'current') { [pscustomobject]@{ Name=$n; Path=$_.FullName; Key=[version]'9999.0' } } elseif ($n -match '^(\d+)\.(\d+)') { [pscustomobject]@{ Name=$n; Path=$_.FullName; Key=[version]($Matches[1]+'.'+$Matches[2]) } } else { [pscustomobject]@{ Name=$n; Path=$_.FullName; Key=[version]'0.0' } } } | Sort-Object Key -Descending | Select-Object -First 1 | ForEach-Object { $_.Path + '|' + $_.Name }"`) do (
-  for /f "tokens=1,2 delims=|" %%A in ("%%L") do (
-    set "BEST_PATH=%%A"
-    set "BEST_VER=%%B"
+if exist "%ROOT_A%\current\mods\" (
+  set "BEST_PATH=%ROOT_A%\current"
+  set "BEST_VER=current"
+  echo [GVD] Prefer: %ROOT_A%\current\mods  (version=current)
+)
+
+echo [GVD] Candidate version folders with mods:
+if exist "%ROOT_A%\" for /d %%D in ("%ROOT_A%\*") do if exist "%%D\mods\" echo   %%D
+if exist "%ROOT_B%\" for /d %%D in ("%ROOT_B%\*") do if exist "%%D\mods\" echo   %%D
+
+if not defined BEST_PATH (
+  rem Else newest versioned under both roots (current Key=9999 already preferred above)
+  set "ROOT_A=%ROOT_A%"
+  set "ROOT_B=%ROOT_B%"
+  for /f "usebackq delims=" %%L in (`powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "$roots=@($env:ROOT_A,$env:ROOT_B); $cands=@(); foreach($root in $roots){ if(-not (Test-Path -LiteralPath $root)){continue}; Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'mods') } | ForEach-Object { $n=$_.Name; if($n -ieq 'current'){ $key=[version]'9999.0' } elseif($n -match '^(\d+)\.(\d+)'){ $key=[version]($Matches[1]+'.'+$Matches[2]) } else { $key=[version]'0.0' }; $cands += [pscustomobject]@{ Name=$n; Path=$_.FullName; Key=$key; Root=$root } } }; if(-not $cands){ '' } else { ($cands | Sort-Object Key -Descending | Select-Object -First 1 | ForEach-Object { $_.Path + '|' + $_.Name }) }"`) do (
+    for /f "tokens=1,2 delims=|" %%A in ("%%L") do (
+      set "BEST_PATH=%%A"
+      set "BEST_VER=%%B"
+    )
   )
 )
 
 if not defined BEST_PATH (
-  echo [GVD] No version folder with a mods directory under %USER_ROOT%
+  echo [GVD] No BeamNG mods folder found.
+  echo Tried: %%LOCALAPPDATA%%\BeamNG\BeamNG.drive\current\mods
+  echo        %%LOCALAPPDATA%%\BeamNG\BeamNG.drive\^<ver^>\mods
+  echo        %%LOCALAPPDATA%%\BeamNG.drive\^<ver^>\mods
   pause
   exit /b 1
 )
 
-echo [GVD] Installing into newest: %BEST_PATH%  (version=%BEST_VER%)
+echo [GVD] Chosen install: %BEST_PATH%\mods  (version=%BEST_VER%)
 
 set "MODS=%BEST_PATH%\mods"
 set "DEST=%MODS%\unpacked\gvd"
@@ -83,7 +94,7 @@ echo [GVD] Log: installed=%DEST% version=%BEST_VER%
 type "%LOG%"
 
 echo.
-echo Installed. Enable GVD in Mod Manager if it is off. Press any key.
+echo Installed. Fully quit BeamNG, relaunch, enable Grok Vision Drive in Mod Manager.
 pause >nul
 endlocal
 exit /b 0

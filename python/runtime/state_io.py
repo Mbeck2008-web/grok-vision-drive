@@ -53,6 +53,9 @@ def default_state(**overrides: Any) -> dict[str, Any]:
         "capture_backend": "stub",
         "capture_note": "",
         "rss_mb": 0.0,
+        "viz_window": False,
+        "viz_screen": "auto",
+        "viz_note": "",
         "cam_health": {
             "narrow": "missing",
             "main": "missing",

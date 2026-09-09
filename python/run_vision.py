@@ -138,6 +138,15 @@ def _read_ui_prefs() -> dict:
         return {}
 
 
+def _ui_request_is_live(prefs: dict, start_unix: float) -> bool:
+    """In-game policy / screen picks apply to the running session only, so a pref left
+    over from a past session never silently overrides --policy at launch."""
+    try:
+        return float(prefs.get("mtime") or 0) >= start_unix - 1.5
+    except Exception:
+        return False
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="GVD supervisor + M2/M3/M4/M5")
     ap.add_argument("--viz", action="store_true")
@@ -280,13 +289,17 @@ def main() -> None:
 
     ui = VizUI()
     win = "GVD VISION" if args.viz else None
+    viz_screen_active = str(args.viz_screen)
+    viz_note = ""
     if win:
         import cv2
 
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(win, 1280, 800)
-        place_opencv_window(win, screen=args.viz_screen, fullscreen=bool(args.viz_fullscreen))
+        viz_note = place_opencv_window(win, screen=args.viz_screen, fullscreen=bool(args.viz_fullscreen))
 
+    session_start = time.time()
+    policy_active = args.policy
     frame_i = 0
     cmd_seq = 0
     cam_hz_ema = 0.0
@@ -295,6 +308,21 @@ def main() -> None:
     try:
         while True:
             loop_t0 = time.perf_counter()
+
+            # In-game GVD app requests ride on the existing prefs file (no second bus).
+            prefs = _read_ui_prefs()
+            if _ui_request_is_live(prefs, session_start):
+                want_policy = str(prefs.get("policy") or "").lower()
+                if want_policy in ("modular", "e2e", "shadow") and want_policy != policy_active:
+                    policy_active = want_policy
+                    print(f"[GVD] policy -> {policy_active} (in-game GVD app; modular veto unchanged)")
+                want_screen = str(prefs.get("viz_screen") or "").strip().lower()
+                if win is not None and want_screen and want_screen != viz_screen_active:
+                    viz_screen_active = want_screen
+                    viz_note = place_opencv_window(
+                        win, screen=want_screen, fullscreen=bool(args.viz_fullscreen)
+                    )
+
             bundle = backend.grab()
             main = bundle.main_bgr()
             now = time.perf_counter()
@@ -327,7 +355,7 @@ def main() -> None:
                 wide = None
 
             tick = shadow_tick(
-                policy=args.policy,
+                policy=policy_active,
                 engaged=engaged,
                 heartbeat_ok=heartbeat_ok,
                 path_debug_preview=bool(pout.path_debug_preview),
@@ -378,7 +406,7 @@ def main() -> None:
             st = default_state(
                 engaged=engaged,
                 disengage_reason=disengage_reason,
-                policy=args.policy,
+                policy=policy_active,
                 loop_hz=args.hz,
                 camera_hz=cam_hz_ema,
                 infer_ms=pout.infer_ms,
@@ -402,7 +430,6 @@ def main() -> None:
                 st["path_debug_preview"] = True
             st["tracks"] = pout.tracks
             st["lanes_bev"] = pout.lanes_bev
-            prefs = _read_ui_prefs()
             if "show_agent_ghosts" in prefs:
                 st["show_agent_ghosts"] = bool(prefs["show_agent_ghosts"])
             elif pout.tracks_n > 0:
@@ -417,6 +444,9 @@ def main() -> None:
             st["capture_backend"] = bundle.backend
             st["capture_note"] = bundle.note
             st["rss_mb"] = _rss_mb()
+            st["viz_window"] = win is not None
+            st["viz_screen"] = viz_screen_active
+            st["viz_note"] = viz_note
             st["detector"] = pout.detector_name
             st["actuator"] = actuator.name
             st["cmd_seq"] = int(applied.seq)

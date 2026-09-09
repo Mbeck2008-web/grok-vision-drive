@@ -81,6 +81,7 @@ def _lines(s: dict[str, Any]) -> list[str]:
         f"planner w={pl.get('corridor_width', 0):.2f}  curv={pl.get('curvature', 0):.4f}  vt={pl.get('target_v', 0):.1f}",
         f"TTC {pl.get('ttc_lead')}   AEB {pl.get('aeb')}",
         f"path_conf {s.get('path_conf', 0):.2f}  width {s.get('path_width', 0):.2f}  preview={s.get('path_debug_preview')}",
+        f"cmd {s.get('actuator', '?')} {s.get('cmd_reason', '?')} applied={s.get('cmd_applied')} ego={s.get('ego_source', '?')}",
         f"clip {s.get('last_clip_trigger', 'none')}",
         *sel,
         "missing: " + (", ".join(miss) if miss else "none"),

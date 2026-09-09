@@ -16,6 +16,7 @@
     .gvd-app::-webkit-scrollbar-track { background:transparent; }
     .gvd-app::-webkit-scrollbar-thumb { background:rgba(158,196,212,0.22); border-radius:2px; }
     .gvd-app.is-engaged { border-color:#39616f; box-shadow:inset 0 0 0 1px rgba(158,196,212,0.10); }
+    .gvd-app.is-drive { border-color:var(--ice); box-shadow:inset 0 0 0 1px rgba(158,196,212,0.20); }
     .gvd-app.is-hold { border-color:#5c4a24; }
 
     /* players resize BeamNG apps freely: text cells must be allowed to shrink + ellipsize */
@@ -67,9 +68,11 @@
       background:var(--panel); border-left:2px solid var(--faint);
     }
     .gvd-state.is-on { border-left-color:var(--ice); background:linear-gradient(90deg,rgba(90,167,199,0.14),var(--panel) 70%); }
+    .gvd-state.is-drive { border-left-color:var(--ice-hi); background:linear-gradient(90deg,rgba(90,167,199,0.30),var(--panel) 75%); }
     .gvd-state.is-hold { border-left-color:var(--amber); background:linear-gradient(90deg,rgba(216,165,74,0.13),var(--panel) 70%); }
     .gvd-state-main { font-size:13px; font-weight:700; letter-spacing:0.14em; color:var(--dim); }
     .gvd-state.is-on .gvd-state-main { color:var(--ice-hi); }
+    .gvd-state.is-drive .gvd-state-main { color:#f2fbff; text-shadow:0 0 10px rgba(158,196,212,0.55); }
     .gvd-state.is-hold .gvd-state-main { color:var(--amber); }
     .gvd-state-sub {
       flex:1 1 auto; min-width:0; text-align:right; font-size:9.5px; color:var(--faint);
@@ -200,5 +203,5 @@
     <div class="gvd-kv"><span>heartbeat</span><b>{{ beatLine() }}</b></div>
   </div>
 
-  <div class="gvd-foot">Sim toy · camera-only · never a real car.</div>
+  <div class="gvd-foot">DRIVE = GVD holds the wheel; steer to take over. Sim toy · camera-only · never a real car.</div>
 </div>

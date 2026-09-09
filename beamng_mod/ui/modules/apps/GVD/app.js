@@ -33,7 +33,7 @@ angular.module('beamng.apps')
       var PATH_FADE_END = 42;
 
       var ui = {
-        engaged: false, link: 'none', hbAge: null, disengageReason: null,
+        engaged: false, applying: false, link: 'none', hbAge: null, disengageReason: null,
         showPath: true, showGhosts: false, showScene: true,
         policy: null, policyReq: null, e2eOk: null, vetoReason: null, e2eBackend: null,
         hz: null, camHz: null, ttc: null, aeb: null, n: null, speed: null,
@@ -42,6 +42,7 @@ angular.module('beamng.apps')
         vizWindow: null, vizScreen: null, vizNote: null, vizScreenReq: null,
         inferMs: null, rssMb: null, vramUsed: null, vramTotal: null, gpu: null,
         detector: null, actuator: null, cmdApplied: null, cmdReason: null,
+        cmdSeq: null, cmdAckSeq: null, egoSource: null,
         clipTrigger: null, encodeBackend: null,
         path: null, tracks: null, lanes: null
       };
@@ -51,7 +52,7 @@ angular.module('beamng.apps')
         'laneConf', 'policy', 'e2eOk', 'vetoReason', 'e2eBackend', 'camBackend', 'camNote',
         'camOk', 'camTotal', 'vizWindow', 'vizScreen', 'vizNote', 'inferMs', 'rssMb',
         'vramUsed', 'vramTotal', 'gpu', 'detector', 'actuator', 'cmdApplied', 'cmdReason',
-        'clipTrigger', 'encodeBackend', 'disengageReason'
+        'cmdSeq', 'cmdAckSeq', 'egoSource', 'clipTrigger', 'encodeBackend', 'disengageReason'
       ];
 
       scope.ui = ui;
@@ -108,15 +109,32 @@ angular.module('beamng.apps')
         if (ui.link === 'stale') return 'link stale';
         return 'no link';
       };
+      // Retail: the mod applies gvd_cmd.json itself (ui.applying). Tech: BeamNGpy drives the
+      // vehicle directly, so the mod never applies and cmd_applied is the honest signal.
+      function driving() {
+        if (ui.link !== 'live' || !ui.engaged) return false;
+        if (ui.applying) return true;
+        return ui.actuator === 'beamngpy' && ui.cmdApplied === true;
+      }
+      scope.driving = driving;
       scope.rootClass = function () {
-        return { 'is-engaged': ui.engaged && ui.link === 'live', 'is-hold': ui.engaged && ui.link !== 'live' };
+        return {
+          'is-engaged': ui.engaged && ui.link === 'live',
+          'is-drive': driving(),
+          'is-hold': ui.engaged && ui.link !== 'live'
+        };
       };
       scope.stateClass = function () {
-        return { 'is-on': ui.engaged && ui.link === 'live', 'is-hold': ui.engaged && ui.link !== 'live' };
+        return {
+          'is-on': ui.engaged && ui.link === 'live',
+          'is-drive': driving(),
+          'is-hold': ui.engaged && ui.link !== 'live'
+        };
       };
       scope.stateLabel = function () {
         if (!ui.engaged) return 'DISENGAGED';
-        return ui.link === 'live' ? 'ENGAGED' : 'HOLD';
+        if (ui.link !== 'live') return 'HOLD';
+        return driving() ? 'DRIVE' : 'ENGAGED';
       };
       scope.stateReason = function () {
         if (ui.engaged && ui.link === 'none') return 'dead-man: no telemetry, actuators off';
@@ -125,7 +143,9 @@ angular.module('beamng.apps')
           if (ui.aeb === 'brake') return 'AEB brake';
           if (ui.aeb === 'warn') return 'AEB warn';
           if (ui.vetoReason && ui.vetoReason !== 'none') return 'veto: ' + ui.vetoReason;
-          return 'supervisor ok';
+          if (driving()) return 'GVD holds the wheel · steer to take over';
+          if (ui.actuator === 'cmd_json') return 'armed · waiting for supervisor commands';
+          return 'armed · actuators idle';
         }
         var r = ui.disengageReason;
         if (r && r !== 'none' && r !== 'not_engaged') return 'last: ' + r;
@@ -190,7 +210,10 @@ angular.module('beamng.apps')
       scope.actuatorLine = function () {
         if (ui.link === 'none') return '—';
         var s = dash(ui.actuator);
-        if (ui.cmdApplied === false) s += ' · not applied';
+        if (ui.applying) s += ' · mod driving';
+        else if (ui.cmdApplied === false) s += ' · not applied';
+        if (ui.cmdAckSeq != null && ui.cmdAckSeq >= 0) s += ' · ack ' + ui.cmdAckSeq + '/' + dash(ui.cmdSeq);
+        if (ui.egoSource && ui.egoSource !== 'none') s += ' · ego ' + ui.egoSource;
         if (ui.cmdReason) s += ' · ' + ui.cmdReason;
         return s;
       };

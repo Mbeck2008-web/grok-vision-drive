@@ -4,6 +4,10 @@ __pycache__/
 data/clips/
 venv/
 
+# M6 release zips (build with scripts/make_release_zip.py)
+dist/
+gvd-retail-*.zip
+
 # M5 E2E / model weight blobs (never commit)
 *.onnx
 *.pt

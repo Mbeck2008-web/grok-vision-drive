@@ -17,3 +17,9 @@ Path: `%USERPROFILE%\Documents\GVD\gvd_state.json` (written by `python/run_visio
 | `ego.steer_deg` | float | Used for debug preview if path missing |
 
 Lua: `gvd_main.drawPath` on `onPreRender` / `onDebugDraw`. Engaged-only (Alt+A). Caps: 40 ego segs, 8 agents × 10 segs. Label in console: GVD PATH. No DecalRoad / map edit.
+
+
+| `capture_backend` | string | `beamngpy` / `window` / `stub` |
+| `capture_note` | string | e.g. `retail: 1 window` |
+| `rss_mb` | float | supervisor RSS; >12 GB is a bug |
+| `cam_health.narrow` | enum | added in M1 8-cam set |

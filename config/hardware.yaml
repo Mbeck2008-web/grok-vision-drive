@@ -1,6 +1,25 @@
-# Default hardware profile — GTX 1080 Ti (11 GB, Pascal). Do not raise without an unlimited profile.
+# Default hardware profile — do not raise inference VRAM without --profile unlimited (OFF by default).
 profile: gtx_1080_ti
+cpu: i9-9900k
+system_ram_gb: 32
 max_inference_vram_gb: 4
 live_input_long_side: 640
 target_hz_min: 10
 target_hz_happy: 15
+dgpu:
+  name: GTX 1080 Ti
+  vram_gb: 11
+  arch: pascal
+  tensor_cores: false
+igpu: uhd_630
+igpu_roles: [qsv_encode, optional_osd_display]
+ram_budget_gb:
+  windows: 6
+  beamng: 12
+  gvd_peak: 10
+  clip_ring: 2
+  unallocated_headroom: 4
+encode:
+  backend: qsv          # h264_qsv / hevc_qsv
+  fallback: cpu         # libx264 if QSV missing
+  never: nvenc          # do not spend 1080 Ti on encode unless QSV fails AND --encode nvenc

@@ -1,8 +1,79 @@
-# Installer stub only — single cam_main placeholder.
-# Full HW3-class 8-cam mounts land in M1 (do not treat this file as the rig yet).
+# GVD 8-cam rig (toy analogues of an HW3-class windshield/pillar/repeater/rear layout).
+# BeamNG vehicle frame: +X right, +Y forward, +Z up. Positions are drafts — calibrate on ETK800.
+# Comments say "toy analogue of …", never "Tesla camera".
+# BeamNGpy uses FOV_v (field_of_view_y). live_res long side ≤ hardware.live_input_long_side (640).
 origin_offset: [0.0, 0.0, 0.0]
 cameras:
-  - id: cam_main
-    role: primary_forward
+  - id: narrow
+    role: long_range_forward
+    note: "toy analogue of a narrow forward windshield cam"
+    mount: windshield_cluster
+    pos_m: [0.03, 1.20, 1.28]
+    yaw_deg: 0
+    pitch_deg: -4
+    fov_v: 21.4
     live_res: [640, 480]
+  - id: main
+    role: primary_forward
+    note: "toy analogue of the primary forward windshield cam; alias cam_main"
+    mount: windshield_cluster
+    pos_m: [0.00, 1.20, 1.26]
+    yaw_deg: 0
+    pitch_deg: -6
     fov_v: 34.0
+    live_res: [640, 480]
+    aliases: [cam_main]
+  - id: wide
+    role: urban_intersection
+    note: "toy analogue of a wide forward windshield cam"
+    mount: windshield_cluster
+    pos_m: [-0.03, 1.20, 1.24]
+    yaw_deg: 0
+    pitch_deg: -8
+    fov_v: 88.7
+    live_res: [640, 480]
+  - id: pillarL
+    role: forward_side_left
+    note: "toy analogue of a left B-pillar forward-side cam"
+    mount: left_b_pillar
+    pos_m: [-0.88, 0.40, 1.18]
+    yaw_deg: -38
+    pitch_deg: -6
+    fov_v: 65.3
+    live_res: [640, 480]
+  - id: pillarR
+    role: forward_side_right
+    note: "toy analogue of a right B-pillar forward-side cam"
+    mount: right_b_pillar
+    pos_m: [0.88, 0.40, 1.18]
+    yaw_deg: 38
+    pitch_deg: -6
+    fov_v: 65.3
+    live_res: [640, 480]
+  - id: repeatL
+    role: rear_side_left
+    note: "toy analogue of a left fender repeater"
+    mount: left_front_fender
+    pos_m: [-0.96, 1.45, 0.82]
+    yaw_deg: -128
+    pitch_deg: -8
+    fov_v: 55.4
+    live_res: [640, 480]
+  - id: repeatR
+    role: rear_side_right
+    note: "toy analogue of a right fender repeater"
+    mount: right_front_fender
+    pos_m: [0.96, 1.45, 0.82]
+    yaw_deg: 128
+    pitch_deg: -8
+    fov_v: 55.4
+    live_res: [640, 480]
+  - id: rear
+    role: rear_traffic
+    note: "toy analogue of a rear license-plate cam"
+    mount: above_license_plate
+    pos_m: [0.00, -2.25, 0.78]
+    yaw_deg: 180
+    pitch_deg: -10
+    fov_v: 80.0
+    live_res: [640, 360]

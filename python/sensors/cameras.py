@@ -218,6 +218,35 @@ class WindowBackend:
                 pass
             self._mss = None
 
+    def _recreate_capture(self) -> None:
+        """Rebuild bettercam/mss against current region after a late BeamNG title match."""
+        self._cam = None
+        if self._mss is not None:
+            try:
+                self._mss.close()
+            except Exception:
+                pass
+            self._mss = None
+        try:
+            import bettercam  # type: ignore
+
+            kwargs: dict[str, Any] = {"output_color": "BGR", "nvidia_gpu": False}
+            if self._region:
+                r = self._region
+                kwargs["region"] = (r["left"], r["top"], r["left"] + r["width"], r["top"] + r["height"])
+            self._cam = bettercam.create(**kwargs)
+            self._impl = "bettercam"
+            return
+        except Exception:
+            self._cam = None
+        try:
+            import mss  # type: ignore
+
+            self._mss = mss.mss()
+            self._impl = "mss"
+        except Exception as e:
+            self._impl = f"unavailable:{e}"
+
     def grab(self) -> CameraFrameBundle:
         health = {cid: CamHealth.MISSING for cid in CAM_IDS}
         frames: dict[str, np.ndarray] = {}

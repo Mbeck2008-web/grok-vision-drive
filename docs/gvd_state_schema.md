@@ -68,10 +68,24 @@ Lua and Python share `%USERPROFILE%\\Documents\\GVD` (or HOME). GELua often has 
 
 ## UI prefs (`Documents/GVD/gvd_ui_prefs.json`)
 
-Written by the in-game **GVD** app. **Wins over** `gvd_state` for path/ghosts while the file exists. Setters also mirror into `gvd_state` when JSON encode is available so OpenCV follows.
+Written by the in-game **GVD** app (GELua is the only writer). **Wins over** `gvd_state` for path/ghosts while the file exists. Setters also mirror path/ghosts into `gvd_state` when JSON encode is available so OpenCV follows.
 
 | `show_path` | bool | Ribbon on/off |
 | `show_agent_ghosts` | bool | Track hulls on/off |
+| `show_scene` | bool | In-app VISION canvas on/off (does not change the world ribbon) |
+| `policy` | string? | `modular` / `e2e` / `shadow` request; only present while the player picks one this session |
+| `viz_screen` | string? | `auto` / `1` / `2` / `3` — where the OpenCV `GVD VISION` window should sit |
+| `mtime` | int | `os.time()` at write |
+
+`policy` / `viz_screen` are **session requests**: `run_vision.py` applies them only when `mtime` is at or after supervisor start, so a pref from a past session never overrides `--policy` at launch. Modular veto and dead-man are unchanged by a policy request.
+
+## In-game app bus
+
+`gvd/main.lua` pushes `guihooks.trigger('gvdUi', …)` every 250 ms (100 ms while the app's scene is on) with the state above plus capped scene geometry: `path` ≤28 points, `tracks` ≤12 (`id,cls,x,y,yaw,v,lead`), `lanes` ≤3×12 points, all ego frame and rounded to 2 dp. `link` is `live` / `stale` / `none` from the heartbeat age, so the app can show the dead-man without a second file bus. `gvdStrip` keeps its old shape.
+
+| `viz_window` | bool | Python `--viz` OpenCV window exists |
+| `viz_screen` | string | Monitor the window was last placed on |
+| `viz_note` | string | e.g. `screen 2 (non-primary)` / `auto→primary (second screen not found …)` |
 
 
 ## M5 fields

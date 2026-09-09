@@ -46,7 +46,17 @@ mods\unpacked\gvd\
 
 ## In-game UI app
 
-After install, open BeamNG **Apps** and add **GVD** (`beamng_mod/ui/modules/apps/GVD/`) (Engage / Disengage, show path, show ghosts). Titles stay **GVD** / **VISION**. Alt+A still works. No FSD chrome.
+After install, start a level, open the **Apps** editor (Esc → *UI Apps*, or the app-layout button on the HUD), drag **GVD** in from the app list, size it, then **Save layout**. Source: `beamng_mod/ui/modules/apps/GVD/`.
+
+The app draws an ego-centric **VISION scene** — corridor ribbon, tracked-object boxes with the CIPV tagged `LEAD`, detected lane polylines — from the same `Documents/GVD/gvd_state.json` that feeds the world ribbon, plus:
+
+- **Engage / Disengage** — the same toggle as Alt+A. The state strip reads `ENGAGED`, `HOLD` (heartbeat stale → dead-man, actuators off) or `DISENGAGED` with the last reason.
+- **Path / Ghosts / Scene** — writes `gvd_ui_prefs.json`, so the world ribbon and the OpenCV window follow. `Scene` switches the canvas off (it shares the GPU with BeamNG).
+- **Policy** `modular | e2e | shadow` — shows what the supervisor is actually running and requests a change for the running session; the modular veto is unchanged and `--policy` still wins at launch.
+- **Sensing** — capture backend, `n/8` healthy feeds, the retail `cam_main only` note, and buttons that move the **GVD VISION** OpenCV window to screen 1 / 2.
+- **+ nerd** — loop/camera Hz, infer ms, VRAM, detector, actuator, clip encoder, heartbeat age.
+
+Titles stay **GVD** / **VISION**; Alt+A works with or without the app open. Offline check: `PYTHONPATH=. python scripts/test_gvd_ui_app.py`.
 
 ## Two views
 

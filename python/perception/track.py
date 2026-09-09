@@ -54,11 +54,9 @@ class IoUTracker:
                 continue
             d = dets[best_i]
             unmatched.discard(best_i)
-            # speed from y delta
+            # Weak relative Δy/dt hint only — NOT absolute road speed (CIPV uses ego_speed for closing).
             vy = (d.y - tr.y) / dt
-            tr.speed_mps = 0.7 * tr.speed_mps + 0.3 * max(0.0, -vy)  # closing positive later in CIPV
-            # store absolute along-road speed estimate from forward motion of box
-            tr.speed_mps = float(max(0.0, min(40.0, abs(vy))))
+            tr.speed_mps = float(max(0.0, min(40.0, 0.8 * tr.speed_mps + 0.2 * abs(vy))))
             tr.x, tr.y, tr.yaw = d.x, d.y, d.yaw
             tr.conf = d.conf
             tr.hits += 1

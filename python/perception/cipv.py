@@ -36,9 +36,11 @@ def select_cipv(
         return CipvResult(track=None, ttc_lead=None, aeb="off")
     lead = min(candidates, key=lambda t: float(t.get("y", 1e9)))
     y = float(lead.get("y", 0))
-    v_lead = float(lead.get("speed_mps", 0))
-    # closing speed: ego approaching lead
-    closing = max(ego_speed_mps - v_lead, 0.1)
+    # Relative closing only. Unknown ego_speed → no invented TTC/AEB.
+    if ego_speed_mps <= 0.05:
+        return CipvResult(track=lead, ttc_lead=None, aeb="off")
+    v_lead_along = float(lead.get("speed_mps", 0.0))  # weak Δy hint, not absolute road speed
+    closing = max(ego_speed_mps - min(v_lead_along, ego_speed_mps * 0.9), 0.1)
     ttc = y / closing
     aeb = "off"
     if ttc < 1.2:

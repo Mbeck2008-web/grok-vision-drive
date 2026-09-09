@@ -54,7 +54,11 @@ def main() -> None:
     ap.add_argument("--hz", type=float, default=15.0)
     ap.add_argument("--backend", default="auto", choices=["auto", "beamngpy", "window", "stub"])
     ap.add_argument("--vision-only", action="store_true")
-    ap.add_argument("--no-synthetic-detect", action="store_true", help="Do not use synthetic dets without weights")
+    ap.add_argument(
+        "--allow-synthetic-detect",
+        action="store_true",
+        help="Allow synthetic detections without YOLO weights (default: smoke only)",
+    )
     args = ap.parse_args()
 
     if args.vision_only:
@@ -76,7 +80,7 @@ def main() -> None:
 
     backend = make_backend(backend_name if args.backend != "auto" else backend_name)
     backend.open()
-    perc = ModularPerception(allow_synthetic=not args.no_synthetic_detect)
+    perc = ModularPerception(allow_synthetic=args.allow_synthetic_detect)
     print(f"[GVD] camera backend={backend.name} detector={perc.detector.name}")
     print(f"[GVD] state path: {state_path()}")
     print("[GVD] Vision-only: no LiDAR/radar/GPS-loc/HD-map in the live loop.")
@@ -101,8 +105,9 @@ def main() -> None:
                 cam_hz_ema = inst if cam_hz_ema <= 0 else (0.8 * cam_hz_ema + 0.2 * inst)
                 last_cam_t = now
 
+            # Ego speed: use last known / future BeamNG electrics. Do not invent 10 m/s for TTC.
             steer = 0.0
-            ego_v = 10.0
+            ego_v = 0.0
             pout = perc.tick(main, ego_speed_mps=ego_v, steer_deg=steer)
 
             st = default_state(

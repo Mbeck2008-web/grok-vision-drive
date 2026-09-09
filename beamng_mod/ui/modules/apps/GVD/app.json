@@ -1,10 +1,10 @@
 {
   "name": "GVD",
   "author": "GVD",
-  "version": "0.1.0",
-  "description": "GVD / VISION \u2014 Engage, path ribbon, agent ghosts",
+  "version": "0.2.0",
+  "description": "GVD / VISION \u2014 engage, path + agent ghosts, policy, camera honesty",
   "directive": "gvd-app",
   "domElement": "<gvd-app></gvd-app>",
-  "css": "{ \"left\": \"12px\", \"bottom\": \"80px\", \"width\": \"280px\", \"height\": \"220px\" }",
+  "css": "{ \"left\": \"12px\", \"bottom\": \"60px\", \"width\": \"330px\", \"height\": \"520px\" }",
   "preserveAspectRatio": false
 }

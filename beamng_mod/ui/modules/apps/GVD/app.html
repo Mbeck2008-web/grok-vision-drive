@@ -1,29 +1,193 @@
-<div class="gvd-app-root" style="
-  box-sizing:border-box;height:100%;padding:12px 14px;
-  background:rgba(12,13,16,0.90);border:1px solid #9ec4d4;border-radius:6px;
-  font-family:Consolas,'Segoe UI',sans-serif;color:#c8ccd4;
-  display:flex;flex-direction:column;gap:8px;">
+<div class="gvd-app" ng-class="rootClass()">
   <style>
-    .gvd-app-title { font-size:14px; letter-spacing:0.04em; }
-    .gvd-ice { color:#9ec4d4; font-weight:600; margin-right:6px; }
-    .gvd-muted { color:#7a8088; font-size:12px; }
-    .gvd-status { font-size:11px; color:#a8adb6; }
-    .gvd-btn {
-      border:1px solid #9ec4d4; background:#1a2228; color:#dce6ec;
-      border-radius:4px; padding:8px 10px; cursor:pointer; font-size:13px;
+    .gvd-app {
+      --ice:#9ec4d4; --ice-hi:#dbeef8; --corridor:#5aa7c7; --paper:#e8e6e1;
+      --amber:#d8a54a; --dim:#79828c; --faint:#59616a;
+      --void:#07080a; --panel:#0f1317; --panel-2:#151b21; --line:#1e272e;
+      box-sizing:border-box; height:100%; width:100%; overflow:auto;
+      padding:8px 9px 9px; display:flex; flex-direction:column; gap:6px;
+      background:linear-gradient(180deg,#0e1216 0%,#0a0d10 100%);
+      border:1px solid var(--line); border-radius:7px;
+      font-family:'Segoe UI','Roboto Condensed',Arial,sans-serif;
+      font-size:12px; color:#c3c9d1; user-select:none;
     }
-    .gvd-btn:hover { background:#243038; }
-    .gvd-btn.gvd-on { background:#1c3a44; border-color:#b8d8e8; color:#e8f4fa; }
-    .gvd-toggle { font-size:12px; display:flex; align-items:center; gap:8px; cursor:pointer; }
-    .gvd-hint { font-size:10px; color:#6a7078; margin-top:auto; }
+    .gvd-app * { box-sizing:border-box; }
+    .gvd-app::-webkit-scrollbar { width:4px; }
+    .gvd-app::-webkit-scrollbar-track { background:transparent; }
+    .gvd-app::-webkit-scrollbar-thumb { background:rgba(158,196,212,0.22); border-radius:2px; }
+    .gvd-app.is-engaged { border-color:#39616f; box-shadow:inset 0 0 0 1px rgba(158,196,212,0.10); }
+    .gvd-app.is-hold { border-color:#5c4a24; }
+
+    .gvd-row { display:flex; align-items:center; gap:6px; }
+    .gvd-grow { flex:1 1 auto; }
+    .gvd-mono { font-family:Consolas,'Roboto Mono',monospace; }
+
+    /* header */
+    .gvd-head { padding-bottom:5px; border-bottom:1px solid var(--line); }
+    .gvd-brand { color:var(--ice); font-weight:700; font-size:14px; letter-spacing:0.10em; }
+    .gvd-word { color:var(--faint); font-size:10px; letter-spacing:0.22em; margin-left:5px; }
+    .gvd-link {
+      display:flex; align-items:center; gap:5px; font-size:9px; letter-spacing:0.12em;
+      text-transform:uppercase; color:var(--faint);
+    }
+    .gvd-link .gvd-dot { width:6px; height:6px; border-radius:50%; background:currentColor; }
+    .gvd-link.is-live { color:var(--ice); }
+    .gvd-link.is-live .gvd-dot { box-shadow:0 0 6px rgba(158,196,212,0.9); }
+    .gvd-link.is-stale { color:var(--amber); }
+
+    /* scene */
+    .gvd-scene {
+      position:relative; flex:1 1 auto; min-height:96px;
+      border:1px solid var(--line); border-radius:5px; overflow:hidden; background:var(--void);
+    }
+    .gvd-canvas { display:block; width:100%; height:100%; }
+    .gvd-hud {
+      position:absolute; top:6px; display:flex; align-items:baseline; gap:3px;
+      font-family:Consolas,'Roboto Mono',monospace; color:var(--paper); text-shadow:0 1px 3px #000;
+    }
+    .gvd-hud b { font-size:15px; font-weight:600; }
+    .gvd-hud i { font-size:8px; font-style:normal; color:var(--dim); letter-spacing:0.08em; }
+    .gvd-hud-l { left:8px; }
+    .gvd-hud-r { right:8px; }
+    .gvd-hud-r.is-warn b { color:var(--amber); }
+    .gvd-veil {
+      position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+      background:rgba(7,8,10,0.62);
+    }
+    .gvd-veil span {
+      font-size:9px; letter-spacing:0.18em; text-transform:uppercase; color:var(--amber);
+      border:1px solid rgba(216,165,74,0.45); border-radius:3px; padding:4px 8px; background:rgba(7,8,10,0.75);
+    }
+    .gvd-veil.is-none span { color:var(--dim); border-color:var(--line); }
+
+    /* engage */
+    .gvd-state {
+      display:flex; align-items:center; gap:8px; padding:5px 8px; border-radius:5px;
+      background:var(--panel); border-left:2px solid var(--faint);
+    }
+    .gvd-state.is-on { border-left-color:var(--ice); background:linear-gradient(90deg,rgba(90,167,199,0.14),var(--panel) 70%); }
+    .gvd-state.is-hold { border-left-color:var(--amber); background:linear-gradient(90deg,rgba(216,165,74,0.13),var(--panel) 70%); }
+    .gvd-state-main { font-size:13px; font-weight:700; letter-spacing:0.14em; color:var(--dim); }
+    .gvd-state.is-on .gvd-state-main { color:var(--ice-hi); }
+    .gvd-state.is-hold .gvd-state-main { color:var(--amber); }
+    .gvd-state-sub { flex:1 1 auto; text-align:right; font-size:9.5px; color:var(--faint); letter-spacing:0.04em; }
+
+    .gvd-engage {
+      display:flex; align-items:center; justify-content:center; gap:8px; width:100%;
+      padding:8px 10px; border-radius:5px; cursor:pointer;
+      border:1px solid #35525e; background:#141c22; color:var(--ice-hi);
+      font-family:inherit; font-size:12px; font-weight:700; letter-spacing:0.16em;
+    }
+    .gvd-engage:hover { background:#1b262d; border-color:#4b7686; }
+    .gvd-engage:active { transform:translateY(1px); }
+    .gvd-engage i { font-style:normal; font-weight:400; font-size:9px; letter-spacing:0.08em; color:var(--faint); }
+    .gvd-engage.is-on { background:#16323c; border-color:var(--ice); color:#eaf6fc; }
+
+    /* chips + segments */
+    .gvd-chips { display:flex; gap:5px; }
+    .gvd-chip, .gvd-segbtn, .gvd-mini {
+      flex:1 1 0; padding:5px 4px; cursor:pointer; font-family:inherit;
+      border:1px solid var(--line); background:var(--panel); color:var(--dim);
+      border-radius:4px; font-size:10px; letter-spacing:0.06em; text-transform:uppercase;
+    }
+    .gvd-chip:hover, .gvd-segbtn:hover, .gvd-mini:hover { border-color:#33454f; color:#aab3bd; }
+    .gvd-chip.is-on { background:#16323c; border-color:#4b7686; color:var(--ice-hi); }
+    .gvd-segbtn.is-on { background:#16323c; border-color:#4b7686; color:var(--ice-hi); }
+    .gvd-segbtn.is-req { border-color:rgba(216,165,74,0.55); color:var(--amber); }
+    .gvd-seg { display:flex; gap:4px; }
+    .gvd-mini { flex:0 0 24px; padding:3px 0; text-align:center; }
+    .gvd-mini.is-on { background:#16323c; border-color:#4b7686; color:var(--ice-hi); }
+
+    /* sections */
+    .gvd-sec { display:flex; flex-direction:column; gap:4px; padding-top:5px; border-top:1px solid var(--line); }
+    .gvd-sec-h {
+      display:flex; align-items:baseline; gap:6px;
+      font-size:9px; letter-spacing:0.16em; text-transform:uppercase; color:var(--faint);
+    }
+    .gvd-note { flex:1 1 auto; font-style:normal; text-align:right; letter-spacing:0; text-transform:none; font-size:9px; color:#4e565e; }
+    .gvd-sub {
+      font-size:10px; color:var(--dim); font-family:Consolas,'Roboto Mono',monospace;
+      white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+    }
+    .gvd-sub.is-warn { color:var(--amber); }
+    .gvd-kv { display:flex; gap:8px; font-size:9.5px; line-height:1.4; }
+    .gvd-kv span { flex:0 0 62px; color:var(--faint); letter-spacing:0.04em; }
+    .gvd-kv b { flex:1 1 auto; font-weight:400; color:#b3bbc4; font-family:Consolas,'Roboto Mono',monospace; word-break:break-word; }
+
+    .gvd-nerdbtn {
+      align-self:flex-start; padding:2px 0; border:0; background:none; cursor:pointer;
+      font-family:inherit; font-size:9px; letter-spacing:0.16em; text-transform:uppercase; color:var(--faint);
+    }
+    .gvd-nerdbtn:hover { color:var(--ice); }
+    .gvd-foot { font-size:9px; color:#454c53; letter-spacing:0.02em; }
   </style>
-  <div class="gvd-app-title">
-    <span class="gvd-ice">GVD</span>
-    <span class="gvd-muted">VISION</span>
+
+  <div class="gvd-row gvd-head">
+    <span class="gvd-brand">GVD</span>
+    <span class="gvd-word">VISION</span>
+    <span class="gvd-grow"></span>
+    <span class="gvd-link" ng-class="'is-' + ui.link">
+      <b class="gvd-dot"></b>{{ linkLabel() }}
+    </span>
   </div>
-  <div class="gvd-status" id="gvdUiStatus">OFF · —Hz · TTC -- · N=0</div>
-  <button type="button" class="gvd-btn gvd-engage" id="gvdBtnEngage">Engage</button>
-  <label class="gvd-toggle"><input type="checkbox" id="gvdChkPath" checked /> Show path</label>
-  <label class="gvd-toggle"><input type="checkbox" id="gvdChkGhosts" /> Show ghosts</label>
-  <div class="gvd-hint">Alt+A also toggles engage</div>
+
+  <div class="gvd-scene" ng-if="ui.showScene">
+    <canvas class="gvd-canvas"></canvas>
+    <div class="gvd-hud gvd-hud-l"><b>{{ kph() }}</b><i>KM/H</i></div>
+    <div class="gvd-hud gvd-hud-r" ng-class="{'is-warn': ui.ttc != null && ui.ttc < 2}" ng-if="ui.link === 'live'">
+      <b>{{ ui.ttc == null ? '--' : fmt1(ui.ttc) }}</b><i>S TTC</i>
+    </div>
+    <div class="gvd-veil" ng-class="{'is-none': ui.link === 'none'}" ng-if="ui.link !== 'live'">
+      <span>{{ veil() }}</span>
+    </div>
+  </div>
+
+  <div class="gvd-state" ng-class="stateClass()">
+    <div class="gvd-state-main">{{ stateLabel() }}</div>
+    <div class="gvd-state-sub">{{ stateReason() }}</div>
+  </div>
+
+  <button type="button" class="gvd-engage" ng-class="{'is-on': ui.engaged}" ng-click="toggleEngage()">
+    <span>{{ ui.engaged ? 'DISENGAGE' : 'ENGAGE' }}</span><i>ALT+A</i>
+  </button>
+
+  <div class="gvd-sec">
+    <div class="gvd-sec-h">VIEW</div>
+    <div class="gvd-chips">
+      <button type="button" class="gvd-chip" ng-class="{'is-on': ui.showPath}" ng-click="setPath(!ui.showPath)">Path</button>
+      <button type="button" class="gvd-chip" ng-class="{'is-on': ui.showGhosts}" ng-click="setGhosts(!ui.showGhosts)">Ghosts</button>
+      <button type="button" class="gvd-chip" ng-class="{'is-on': ui.showScene}" ng-click="setScene(!ui.showScene)">Scene</button>
+    </div>
+    <div class="gvd-sub" ng-class="{'is-warn': ui.pathConf != null && ui.pathConf < 0.45}">{{ pathLine() }}</div>
+  </div>
+
+  <div class="gvd-sec">
+    <div class="gvd-sec-h">POLICY <i class="gvd-note">perception always runs · actuators only when engaged</i></div>
+    <div class="gvd-seg">
+      <button type="button" class="gvd-segbtn" ng-repeat="p in policies" ng-class="segClass(p)" ng-click="setPolicy(p)">{{ p }}</button>
+    </div>
+    <div class="gvd-sub" ng-class="{'is-warn': ui.vetoReason && ui.vetoReason !== 'none'}">{{ policyLine() }}</div>
+  </div>
+
+  <div class="gvd-sec">
+    <div class="gvd-sec-h">
+      SENSING <i class="gvd-note">GVD VISION screen</i>
+      <button type="button" class="gvd-mini" ng-class="{'is-on': vizSel('1')}" ng-click="setVizScreen('1')">1</button>
+      <button type="button" class="gvd-mini" ng-class="{'is-on': vizSel('2')}" ng-click="setVizScreen('2')">2</button>
+    </div>
+    <div class="gvd-kv"><span>cameras</span><b>{{ camLine() }}</b></div>
+    <div class="gvd-kv"><span>vision</span><b>{{ vizLine() }}</b></div>
+  </div>
+
+  <button type="button" class="gvd-nerdbtn" ng-click="nerd = !nerd">{{ nerd ? '- nerd' : '+ nerd' }}</button>
+  <div class="gvd-sec" ng-if="nerd" style="border-top:0;padding-top:0;">
+    <div class="gvd-kv"><span>rate</span><b>{{ rateLine() }}</b></div>
+    <div class="gvd-kv"><span>gpu</span><b>{{ gpuLine() }}</b></div>
+    <div class="gvd-kv"><span>detector</span><b>{{ dash(ui.detector) }}</b></div>
+    <div class="gvd-kv"><span>actuator</span><b>{{ actuatorLine() }}</b></div>
+    <div class="gvd-kv"><span>clips</span><b>{{ clipLine() }}</b></div>
+    <div class="gvd-kv"><span>heartbeat</span><b>{{ beatLine() }}</b></div>
+  </div>
+
+  <div class="gvd-foot">Sim toy · camera-only · never a real car.</div>
 </div>

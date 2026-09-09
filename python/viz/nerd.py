@@ -48,7 +48,9 @@ def _lines(s: dict[str, Any]) -> list[str]:
     ego = s.get("ego") or {}
     pl = s.get("planner") or {}
     cams = s.get("cam_health") or {}
-    cam_s = " ".join(f"{k[:1]}:{str(v)[:1]}" for k, v in cams.items())
+    cam_s = " ".join(f"{k}:{str(v)[:1]}" for k, v in cams.items())
+    cap = s.get("capture_backend") or "?"
+    cap_note = s.get("capture_note") or ""
     v = float(ego.get("speed_mps") or 0)
     mph = v * 2.23694
     miss = s.get("missing_state_keys") or []
@@ -71,6 +73,8 @@ def _lines(s: dict[str, Any]) -> list[str]:
         f"infer {s.get('infer_ms', 0):.1f}ms  viz {s.get('viz_ms', 0):.1f}ms  hb {s.get('heartbeat_ms', 0):.0f}ms",
         f"VRAM {s.get('gpu_vram_used_gb', 0):.1f}/{s.get('gpu_vram_total_gb', 11):.0f} GB  {s.get('gpu_name', '')}",
         f"cams {cam_s}",
+        f"capture {cap} {cap_note}".rstrip(),
+        f"rss {float(s.get('rss_mb') or 0):.0f} MB",
         f"lane {s.get('lane_conf', 0):.2f}  bev {s.get('bev_coverage', 0):.0%}  obj {s.get('objects_n', 0)}  trk {s.get('tracks_n', 0)}",
         f"ego {v:.1f} m/s ({mph:.0f} mph)  steer {ego.get('steer_deg', 0):.1f}",
         f"thr {ego.get('throttle', 0):.2f}  brk {ego.get('brake', 0):.2f}  yawr {ego.get('yaw_rate', 0):.2f}",

@@ -1,0 +1,5 @@
+# Windows Tech / retail capture extras (optional). Keep requirements-viz.txt light.
+-r requirements.txt
+beamngpy>=1.26
+bettercam>=1.0.0; platform_system=="Windows"
+mss>=9.0.0

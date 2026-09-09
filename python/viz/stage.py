@@ -215,7 +215,11 @@ def _draw_agent_forecasts(img: np.ndarray, tr: dict[str, Any], cam: Cam) -> None
             cv2.line(img, pts[i], pts[min(i + 1, len(pts) - 1)], (100, 100, 100), 1, cv2.LINE_AA)
 
 
-def render_stage(state: dict[str, Any], ui: VizUI | None = None) -> np.ndarray:
+def render_stage(
+    state: dict[str, Any],
+    ui: VizUI | None = None,
+    main_frame: np.ndarray | None = None,
+) -> np.ndarray:
     t0 = time.perf_counter()
     ui = ui or VizUI()
     clean = 0 in ui.layers
@@ -253,6 +257,11 @@ def render_stage(state: dict[str, Any], ui: VizUI | None = None) -> np.ndarray:
 
     if not drop_heavy and not clean:
         pip = np.full((180, 320, 3), (28, 28, 28), dtype=np.uint8)
+        if main_frame is not None and getattr(main_frame, "size", 0):
+            try:
+                pip = cv2.resize(main_frame, (320, 180), interpolation=cv2.INTER_AREA)
+            except Exception:
+                pass
         if 2 in ui.layers:
             cv2.putText(pip, "cam_main", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.5, PAPER, 1)
             cv2.drawMarker(pip, (160, 90), ICE, cv2.MARKER_CROSS, 12, 1)

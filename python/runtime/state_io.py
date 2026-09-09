@@ -46,11 +46,15 @@ def default_state(**overrides: Any) -> dict[str, Any]:
         "viz_ms": 0.0,
         "heartbeat_ms": 0.0,
         "heartbeat_unix": int(time.time()),  # match Lua os.time() seconds
-            "heartbeat_mtime": time.time(),
+        "heartbeat_mtime": time.time(),
         "gpu_vram_used_gb": 0.0,
         "gpu_vram_total_gb": 11.0,
         "gpu_name": "GTX 1080 Ti",
+        "capture_backend": "stub",
+        "capture_note": "",
+        "rss_mb": 0.0,
         "cam_health": {
+            "narrow": "missing",
             "main": "missing",
             "wide": "missing",
             "pillarL": "missing",

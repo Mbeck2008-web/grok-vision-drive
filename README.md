@@ -45,7 +45,12 @@ mods\unpacked\gvd\
 
 ## Status
 
-Installer + mod auto-load scaffolding. Vision / data-engine milestones (M1+) come next.
+**M1 (cameras + hw probe):** honest `CameraBackend` (`beamngpy | window | stub`), 8-cam mounts in `config/cameras.yaml`, `hw_probe` boot line, `--backend` flag. Viz PR #2 merged (ice-blue ribbon + OpenCV cabin). Live BeamNG Camera attach / Alt+A still **UNPROVEN on Linux** — confirm on Windows + Tech.
+
+M2 perception / M3 actuation / M4 clips next.
+
+Host profile (target): Intel **i9-9900K** + **UHD 630** (QSV encode) + **GTX 1080 Ti 11 GB** (infer ≤4 GB) + **32 GB DDR4**. See `config/hardware.yaml`.
+
 
 
 ## GVD Viz
@@ -65,3 +70,19 @@ PYTHONPATH=. python python/run_vision.py --viz      # live window + state file f
 ```
 
 Keys in `--viz`: `V` nerd, `?` help, `0` clean cabin, `1–5` debug layers, `T` chase↔BEV, `q` quit. Caps: 32 agents / 16 forecast fans / 3 modes. If policy &lt; 8 Hz, drop fans + PIP first. In-game strip app: **GVD Strip** (mode · Hz · TTC · N).
+
+
+## Cameras (M1)
+
+```bash
+pip install -r requirements.txt          # core
+pip install -r requirements-beamng.txt   # optional: beamngpy + bettercam/mss
+PYTHONPATH=. python python/run_vision.py --smoke
+PYTHONPATH=. python python/run_vision.py --backend stub
+PYTHONPATH=. python python/run_vision.py --backend window --viz   # retail: 1 window only
+PYTHONPATH=. python python/run_vision.py --backend beamngpy       # needs Tech; else honest missing
+```
+
+Default `--backend auto`: beamngpy if importable → else window → else stub. Window backend fills **main / cam_main only**; other `cam_health` stay `missing`. Nerd panel shows `retail: 1 window` when that backend is active. Never synthesizes 8 frames from one grab.
+
+BIOS (Windows): enable **iGPU Multi-Monitor** so UHD 630 QSV exists while 1080 Ti drives the display (M4 encode). Do not set DVMT to 2 GB.

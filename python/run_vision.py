@@ -123,25 +123,18 @@ def main() -> None:
     actuator = make_actuator(vehicle, prefer_beamngpy=True)
 
     allow_nvenc = args.encode == "nvenc"
-    prefer = "qsv" if args.encode in ("auto", "qsv") else ("cpu" if args.encode == "cpu" else "qsv")
     if args.encode == "nvenc":
-        prefer = "qsv"  # still try qsv first; nvenc only as allow flag in choose
+        prefer = "nvenc"
+    elif args.encode == "cpu":
+        prefer = "cpu"
+    else:
+        prefer = "qsv"
     recorder = ClipRecorder(
         encode_prefer=prefer,
         allow_nvenc=allow_nvenc,
         hz=args.hz,
         dry_run=False,
     )
-    # force encoder selection when --encode cpu
-    if args.encode == "cpu":
-        recorder.encoder = choose_encoder(prefer="cpu", allow_nvenc=False)
-    elif args.encode == "nvenc":
-        recorder.encoder = choose_encoder(prefer="qsv", allow_nvenc=True)
-        if recorder.encoder != "h264_nvenc":
-            # prefer qsv/cpu still wins if present — only use nvenc when others missing
-            enc2 = choose_encoder(prefer="cpu", allow_nvenc=True)
-            if enc2 == "libx264":
-                recorder.encoder = enc2
 
     print(f"[GVD] camera backend={backend.name} detector={perc.detector.name} actuator={actuator.name}")
     print(f"[GVD] clip encoder={recorder.encoder} (qsv prefer; never default nvenc)")

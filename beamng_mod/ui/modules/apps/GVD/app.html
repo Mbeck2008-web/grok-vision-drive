@@ -1,0 +1,29 @@
+<div class="gvd-app-root" style="
+  box-sizing:border-box;height:100%;padding:12px 14px;
+  background:rgba(12,13,16,0.90);border:1px solid #9ec4d4;border-radius:6px;
+  font-family:Consolas,'Segoe UI',sans-serif;color:#c8ccd4;
+  display:flex;flex-direction:column;gap:8px;">
+  <style>
+    .gvd-app-title { font-size:14px; letter-spacing:0.04em; }
+    .gvd-ice { color:#9ec4d4; font-weight:600; margin-right:6px; }
+    .gvd-muted { color:#7a8088; font-size:12px; }
+    .gvd-status { font-size:11px; color:#a8adb6; }
+    .gvd-btn {
+      border:1px solid #9ec4d4; background:#1a2228; color:#dce6ec;
+      border-radius:4px; padding:8px 10px; cursor:pointer; font-size:13px;
+    }
+    .gvd-btn:hover { background:#243038; }
+    .gvd-btn.gvd-on { background:#1c3a44; border-color:#b8d8e8; color:#e8f4fa; }
+    .gvd-toggle { font-size:12px; display:flex; align-items:center; gap:8px; cursor:pointer; }
+    .gvd-hint { font-size:10px; color:#6a7078; margin-top:auto; }
+  </style>
+  <div class="gvd-app-title">
+    <span class="gvd-ice">GVD</span>
+    <span class="gvd-muted">VISION</span>
+  </div>
+  <div class="gvd-status" id="gvdUiStatus">OFF · —Hz · TTC -- · N=0</div>
+  <button type="button" class="gvd-btn gvd-engage" id="gvdBtnEngage">Engage</button>
+  <label class="gvd-toggle"><input type="checkbox" id="gvdChkPath" checked /> Show path</label>
+  <label class="gvd-toggle"><input type="checkbox" id="gvdChkGhosts" /> Show ghosts</label>
+  <div class="gvd-hint">Alt+A also toggles engage</div>
+</div>

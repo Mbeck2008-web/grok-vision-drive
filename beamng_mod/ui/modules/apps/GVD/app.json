@@ -1,0 +1,10 @@
+{
+  "name": "GVD",
+  "author": "GVD",
+  "version": "0.1.0",
+  "description": "GVD / VISION \u2014 Engage, path ribbon, agent ghosts",
+  "directive": "gvd-app",
+  "domElement": "<gvd-app></gvd-app>",
+  "css": "{ \"left\": \"12px\", \"bottom\": \"80px\", \"width\": \"280px\", \"height\": \"220px\" }",
+  "preserveAspectRatio": false
+}

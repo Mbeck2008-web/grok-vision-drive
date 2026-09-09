@@ -43,6 +43,10 @@ mods\unpacked\gvd\
   settings\inputmaps\keyboardGvd.json
 ```
 
+## In-game UI app
+
+After install, open BeamNG **Apps** and add **GVD** (Engage / Disengage, show path, show ghosts). Titles stay **GVD** / **VISION**. Alt+A still works. No FSD chrome.
+
 ## Two views
 
 **In-game (BeamNG world):** ice-blue ribbon drawn on the pavement via GELua `debugDrawer` (`drawSquarePrism`, 3-line fallback) — **1:1** with `path_ego` / `path_world` (x right, y forward, z up). Track ghosts sit on the road at the same transform; CIPV is brighter. Engage with Alt+A. This is **not** a 2D camera overlay.

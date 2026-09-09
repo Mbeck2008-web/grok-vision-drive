@@ -50,11 +50,19 @@ def read_engage_flag(default: bool = False) -> bool:
         return default
 
 
-def write_engage_flag(engaged: bool) -> None:
+def write_engage_flag(engaged: bool, disengage_reason: str | None = None) -> None:
+    """Write gvd_engage.json. On engage clear reason to none; on disengage pass reason when known."""
     p = engage_path()
     p.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict = {"engaged": bool(engaged), "mtime": time.time()}
+    if engaged:
+        payload["disengage_reason"] = "none"
+    elif disengage_reason is not None:
+        payload["disengage_reason"] = str(disengage_reason)
+    else:
+        payload["disengage_reason"] = "none"
     tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"engaged": bool(engaged), "mtime": time.time()}), encoding="utf-8")
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
     tmp.replace(p)
 
 

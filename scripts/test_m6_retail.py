@@ -54,7 +54,7 @@ def check_release_zip() -> None:
         (tmp / "models" / "e2e_current.onnx").write_bytes(b"\x00" * 64)
         (tmp / "models" / "yolov8n.pt").write_bytes(b"\x00" * 64)
         (tmp / "python" / "weights.safetensors").write_bytes(b"\x00" * 16)
-        (tmp / "data" / "clips").mkdir(parents=True)
+        (tmp / "data" / "clips").mkdir(parents=True, exist_ok=True)
         (tmp / "data" / "clips" / "clip_x.mp4").write_bytes(b"\x00" * 16)
         (tmp / "python" / "__pycache__").mkdir()
         (tmp / "python" / "__pycache__" / "run_vision.cpython-312.pyc").write_bytes(b"\x00")
@@ -79,6 +79,9 @@ def check_release_zip() -> None:
                 assert not any(r.endswith(bad) for r in rels), bad
             assert not any(r.startswith((".git/", "data/", "dist/", "scripts/")) for r in rels)
             assert not any("clips" in r for r in rels)
+            assert "requirements-beamng.txt" not in rels
+            assert "requirements-perception.txt" not in rels
+            assert "requirements-viz.txt" not in rels
             # Mod entry point + UI icon survive; tests do not.
             assert "beamng_mod/scripts/gvd/modScript.lua" in rels
             assert "beamng_mod/ui/modules/apps/GVD/app.png" in rels
@@ -212,6 +215,9 @@ def check_player_docs() -> None:
     assert "## Player guide" in readme
     assert "make_release_zip" in readme
     assert "requirements-retail.txt" in readme
+    # Soft: retail zip ships base+retail only
+    assert "requirements-beamng.txt" not in (ROOT / "scripts" / "make_release_zip.py").read_text()
+    assert '"requirements*.txt"' not in (ROOT / "scripts" / "make_release_zip.py").read_text()
     bat = (ROOT / "play_gvd.bat").read_text(encoding="utf-8", errors="ignore")
     assert 'set "GVD_BACKEND=window"' in bat and "--backend %GVD_BACKEND%" in bat
     assert "--backend auto" not in bat

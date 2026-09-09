@@ -361,7 +361,7 @@ def main() -> None:
             elif tick.should_disengage:
                 engaged = False
                 disengage_reason = tick.veto_reason if tick.veto_reason != "none" else "veto"
-                write_engage_flag(False)
+                write_engage_flag(False, disengage_reason=disengage_reason)
             elif cmd.reason == "preview_blocked":
                 disengage_reason = "preview_blocked"
             elif cmd.reason == "heartbeat_stale":
@@ -505,7 +505,7 @@ def main() -> None:
         except Exception:
             pass
         try:
-            write_engage_flag(False)
+            write_engage_flag(False, disengage_reason="shutdown")
         except Exception:
             pass
         backend.close()

@@ -111,10 +111,10 @@ Python reads the file every tick and mirrors it into `engaged` (never invents en
 | `throttle` / `brake` | 0..1 | Brake > 0 ⇒ Lua forces throttle 0 |
 | `seq` | int | Monotonic; Lua treats a non-advancing seq as a stalled supervisor |
 | `engaged` | bool | Supervisor-side engaged after gates. Lua applies **only** when this is true and it is engaged itself |
-| `heartbeat_mtime` | float | `time.time()`; Lua ignores files whose stamp is > 3 s behind `os.time()` (old session) |
+| `heartbeat_mtime` | float | `time.time()`; Lua ignores files whose stamp is > `CMD_DEAD_S` (1.0 s) behind `os.time()` (old session) |
 | `reason` | string | `ok` / `preview_blocked` / `not_engaged` / `veto:*` / … (diagnostic) |
 
-Lua (`gvd_main.applyCmdJson`, 20 Hz): `input.event('steering', s, 1)`; `input.event('throttle', t, 2)`; `input.event('brake', b, 2)` on `be:getPlayerVehicle(0)` via `queueLuaCommand`; `drivetrain.setShifterMode('arcade')` once. No new seq for 0.35 s → steer 0 / throttle 0 / brake 1 hold; 3 s → release (all 0), `engaged=false`, `gvd_engage.json` false. Any disengage (Alt+A, supervisor false, unload) sends one release and stops applying. `cmd.engaged=false` → release immediately (no brake tap on the player).
+Lua (`gvd_main.applyCmdJson`, 20 Hz): `input.event('steering', s, 1)`; `input.event('throttle', t, 2)`; `input.event('brake', b, 2)` on `be:getPlayerVehicle(0)` via `queueLuaCommand`; `drivetrain.setShifterMode('arcade')` once. No new seq for `CMD_STALE_S` (0.35 s) → steer 0 / throttle 0 / brake 1 hold; after `CMD_DEAD_S` (1.0 s) → release (all 0), `engaged=false`, `gvd_engage.json` false. Any disengage (Alt+A, supervisor false, unload) sends one release and stops applying. `cmd.engaged=false` → release immediately (no brake tap on the player).
 
 `Documents/GVD/gvd_ego.json` — written by Lua at ~10 Hz while the supervisor's state heartbeat is alive (vehicle Lua `electrics.values` → `obj:queueGameEngineLua` → `gvd_main.onEgoFeedback`):
 

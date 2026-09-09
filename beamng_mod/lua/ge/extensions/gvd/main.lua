@@ -25,8 +25,11 @@ local stripAcc = 0
 
 -- M6 retail drive state (gvd_cmd.json → player vehicle; electrics echo → gvd_ego.json)
 local CMD_POLL_S = 0.05      -- 20 Hz apply
+-- Dead-man timers (wall / seq age): STALE = brake hold; DEAD = release + disengage.
+-- STALE matches Python HEARTBEAT_STALE_S (0.35). DEAD is short (1.0s) so a dead
+-- supervisor doesn't leave the car braked indefinitely — was 3.0s, soft-tightened.
 local CMD_STALE_S = 0.35     -- no new seq for this long → brake hold (dead-man)
-local CMD_DEAD_S = 3.0       -- stream dead this long while we hold the car → release + disengage
+local CMD_DEAD_S = 1.0       -- stream dead this long while we hold the car → release + disengage
 local EGO_POLL_S = 0.10      -- 10 Hz electrics echo while the supervisor is alive
 local applying = false       -- true while our input.event stream holds the player vehicle
 local applyVeh = nil         -- vehicle object we last applied to (released on switch/disengage)

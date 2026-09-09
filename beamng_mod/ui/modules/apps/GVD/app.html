@@ -4,7 +4,7 @@
       --ice:#9ec4d4; --ice-hi:#dbeef8; --corridor:#5aa7c7; --paper:#e8e6e1;
       --amber:#d8a54a; --dim:#79828c; --faint:#59616a;
       --void:#07080a; --panel:#0f1317; --panel-2:#151b21; --line:#1e272e;
-      box-sizing:border-box; height:100%; width:100%; overflow:auto;
+      box-sizing:border-box; height:100%; width:100%; overflow-y:auto; overflow-x:hidden;
       padding:8px 9px 9px; display:flex; flex-direction:column; gap:6px;
       background:linear-gradient(180deg,#0e1216 0%,#0a0d10 100%);
       border:1px solid var(--line); border-radius:7px;
@@ -18,19 +18,20 @@
     .gvd-app.is-engaged { border-color:#39616f; box-shadow:inset 0 0 0 1px rgba(158,196,212,0.10); }
     .gvd-app.is-hold { border-color:#5c4a24; }
 
+    /* players resize BeamNG apps freely: text cells must be allowed to shrink + ellipsize */
     .gvd-row { display:flex; align-items:center; gap:6px; }
-    .gvd-grow { flex:1 1 auto; }
+    .gvd-grow { flex:1 1 auto; min-width:0; }
     .gvd-mono { font-family:Consolas,'Roboto Mono',monospace; }
 
     /* header */
     .gvd-head { padding-bottom:5px; border-bottom:1px solid var(--line); }
-    .gvd-brand { color:var(--ice); font-weight:700; font-size:14px; letter-spacing:0.10em; }
+    .gvd-brand { flex:0 0 auto; color:var(--ice); font-weight:700; font-size:14px; letter-spacing:0.10em; }
     .gvd-word { color:var(--faint); font-size:10px; letter-spacing:0.22em; margin-left:5px; }
     .gvd-link {
-      display:flex; align-items:center; gap:5px; font-size:9px; letter-spacing:0.12em;
-      text-transform:uppercase; color:var(--faint);
+      display:flex; flex:0 0 auto; align-items:center; gap:5px; font-size:9px; letter-spacing:0.12em;
+      text-transform:uppercase; color:var(--faint); white-space:nowrap;
     }
-    .gvd-link .gvd-dot { width:6px; height:6px; border-radius:50%; background:currentColor; }
+    .gvd-link .gvd-dot { flex:0 0 auto; width:6px; height:6px; border-radius:50%; background:currentColor; }
     .gvd-link.is-live { color:var(--ice); }
     .gvd-link.is-live .gvd-dot { box-shadow:0 0 6px rgba(158,196,212,0.9); }
     .gvd-link.is-stale { color:var(--amber); }
@@ -70,7 +71,10 @@
     .gvd-state-main { font-size:13px; font-weight:700; letter-spacing:0.14em; color:var(--dim); }
     .gvd-state.is-on .gvd-state-main { color:var(--ice-hi); }
     .gvd-state.is-hold .gvd-state-main { color:var(--amber); }
-    .gvd-state-sub { flex:1 1 auto; text-align:right; font-size:9.5px; color:var(--faint); letter-spacing:0.04em; }
+    .gvd-state-sub {
+      flex:1 1 auto; min-width:0; text-align:right; font-size:9.5px; color:var(--faint);
+      letter-spacing:0.04em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+    }
 
     .gvd-engage {
       display:flex; align-items:center; justify-content:center; gap:8px; width:100%;
@@ -80,13 +84,13 @@
     }
     .gvd-engage:hover { background:#1b262d; border-color:#4b7686; }
     .gvd-engage:active { transform:translateY(1px); }
-    .gvd-engage i { font-style:normal; font-weight:400; font-size:9px; letter-spacing:0.08em; color:var(--faint); }
+    .gvd-engage i { flex:0 0 auto; font-style:normal; font-weight:400; font-size:9px; letter-spacing:0.08em; color:var(--faint); }
     .gvd-engage.is-on { background:#16323c; border-color:var(--ice); color:#eaf6fc; }
 
     /* chips + segments */
     .gvd-chips { display:flex; gap:5px; }
     .gvd-chip, .gvd-segbtn, .gvd-mini {
-      flex:1 1 0; padding:5px 4px; cursor:pointer; font-family:inherit;
+      flex:1 1 0; min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; padding:5px 4px; cursor:pointer; font-family:inherit;
       border:1px solid var(--line); background:var(--panel); color:var(--dim);
       border-radius:4px; font-size:10px; letter-spacing:0.06em; text-transform:uppercase;
     }
@@ -104,7 +108,11 @@
       display:flex; align-items:baseline; gap:6px;
       font-size:9px; letter-spacing:0.16em; text-transform:uppercase; color:var(--faint);
     }
-    .gvd-note { flex:1 1 auto; font-style:normal; text-align:right; letter-spacing:0; text-transform:none; font-size:9px; color:#4e565e; }
+    .gvd-note {
+      flex:1 1 auto; min-width:0; font-style:normal; text-align:right; letter-spacing:0;
+      text-transform:none; font-size:9px; color:#4e565e;
+      white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+    }
     .gvd-sub {
       font-size:10px; color:var(--dim); font-family:Consolas,'Roboto Mono',monospace;
       white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
@@ -112,7 +120,10 @@
     .gvd-sub.is-warn { color:var(--amber); }
     .gvd-kv { display:flex; gap:8px; font-size:9.5px; line-height:1.4; }
     .gvd-kv span { flex:0 0 62px; color:var(--faint); letter-spacing:0.04em; }
-    .gvd-kv b { flex:1 1 auto; font-weight:400; color:#b3bbc4; font-family:Consolas,'Roboto Mono',monospace; word-break:break-word; }
+    .gvd-kv b {
+      flex:1 1 auto; min-width:0; font-weight:400; color:#b3bbc4;
+      font-family:Consolas,'Roboto Mono',monospace; word-break:break-word;
+    }
 
     .gvd-nerdbtn {
       align-self:flex-start; padding:2px 0; border:0; background:none; cursor:pointer;

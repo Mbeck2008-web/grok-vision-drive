@@ -722,6 +722,13 @@ local function linkState()
   return 'stale'
 end
 
+-- `st and st.flag or nil` would turn a real false into nil, so booleans go through here.
+local function sBool(st, v, dflt)
+  if not st then return nil end
+  if v == nil then return dflt end
+  return not not v
+end
+
 local function uiPayload()
   local st = lastGood
   local pl = (st and st.planner) or {}
@@ -753,7 +760,7 @@ local function uiPayload()
     -- policy (honest toys)
     policy = st and mode or nil,
     policyReq = policyReq,
-    e2eOk = st and (st.e2e_ok ~= false) or nil,
+    e2eOk = sBool(st, st and st.e2e_ok, true),
     vetoReason = st and tostring(st.veto_reason or 'none') or nil,
     e2eBackend = st and st.e2e_backend or nil,
     -- driving numbers
@@ -766,7 +773,7 @@ local function uiPayload()
     steerDeg = r2(ego.steer_deg),
     pathConf = r2(st and st.path_conf),
     pathWidth = r2(st and st.path_width),
-    pathPreview = st and (st.path_debug_preview ~= false) or nil,
+    pathPreview = sBool(st, st and st.path_debug_preview, true),
     laneConf = r2(st and st.lane_conf),
     -- cameras (retail honesty: main only stays main only)
     camBackend = st and st.capture_backend or nil,
@@ -775,7 +782,7 @@ local function uiPayload()
     camTotal = st and camTotal or nil,
     cams = st and camList or nil,
     -- GVD VISION window (Python OpenCV second screen)
-    vizWindow = st and st.viz_window or nil,
+    vizWindow = sBool(st, st and st.viz_window, false),
     vizScreen = st and st.viz_screen or nil,
     vizNote = st and st.viz_note or nil,
     vizScreenReq = vizScreenReq,
@@ -787,7 +794,7 @@ local function uiPayload()
     gpu = st and st.gpu_name or nil,
     detector = st and st.detector or nil,
     actuator = st and st.actuator or nil,
-    cmdApplied = st and st.cmd_applied or nil,
+    cmdApplied = sBool(st, st and st.cmd_applied, false),
     cmdReason = st and st.cmd_reason or nil,
     clipTrigger = st and st.last_clip_trigger or nil,
     encodeBackend = st and st.encode_backend or nil,

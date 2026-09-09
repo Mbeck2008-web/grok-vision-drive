@@ -45,11 +45,13 @@ mods\unpacked\gvd\
 
 ## Status
 
-**M2 (perception, this PR):** modular detect→track→CIPV→corridor on `cam_main`. YOLOv8n ONNX if present; **live default = no synthetic cars** (`--allow-synthetic-detect` / `--smoke` only). `path_debug_preview=false` only for lane-derived corridor.
+**M3 (actuation, this PR):** sim-only. Preferred BeamNGpy `vehicle.control` (arcade); fallback atomic `Documents/GVD/gvd_cmd.json` (no DLL). Engage = Alt+A → `gvd_engage.json`. No drive when `path_debug_preview=true` unless `--allow-preview-drive`. Ego speed from Electrics when present (never invent 10 m/s). Stale heartbeat / disengage / shutdown → throttle 0 + brake. **Arcade + hold brake can auto-shift reverse** — AEB keeps `throttle=0`. Live BeamNG.tech still **UNPROVEN on Linux**.
 
-**M1 (cameras + hw probe):** honest `CameraBackend` (`beamngpy | window | stub`), 8-cam mounts in `config/cameras.yaml`, `hw_probe` boot line, `--backend` flag. Viz PR #2 merged (ice-blue ribbon + OpenCV cabin). Live BeamNG Camera attach / Alt+A still **UNPROVEN on Linux** — confirm on Windows + Tech.
+**M2 (perception):** detect→track→CIPV→corridor; live default no synthetic cars; `path_debug_preview=false` only for lane-derived corridor.
 
-M3 actuation / M4 clips next.
+**M1 (cameras + hw probe):** `beamngpy | window | stub`, 8-cam yaml, hw_probe. Live Camera attach / Alt+A still **UNPROVEN on Linux**.
+
+M4 clips next.
 
 Host profile (target): Intel **i9-9900K** + **UHD 630** (QSV encode) + **GTX 1080 Ti 11 GB** (infer ≤4 GB) + **32 GB DDR4**. See `config/hardware.yaml`.
 
@@ -107,3 +109,15 @@ python scripts/download_yolov8n.py --onnx
 # or: yolo export model=yolov8n.pt format=onnx imgsz=640 simplify=True && mv yolov8n.onnx models/
 PYTHONPATH=. python python/run_vision.py --smoke
 ```
+
+
+## Actuation (M3)
+
+Sim-only. Preferred: BeamNGpy `set_shift_mode("arcade")` + `control(steering, throttle, brake)` on the player vehicle (`get_current` / `get_player_vehicle_id`). Fallback: write `Documents/GVD/gvd_cmd.json` for GELua to poll — **no DLL**.
+
+```bash
+PYTHONPATH=. python python/run_vision.py --backend beamngpy --viz   # Tech path
+# --allow-preview-drive   # opt-in only; default blocks preview paths
+```
+
+Safety: Alt+A engage; heartbeat dead-man; AEB `brake=1`/`throttle=0`; kill Python → stop. Live drive on Windows = Michael smoke / still UNPROVEN here.

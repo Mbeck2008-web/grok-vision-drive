@@ -14,7 +14,7 @@ if not defined RUN if exist "%USERPROFILE%\Documents\GVD\python\run_vision.py" s
 if defined RUN (
   if defined PY (
     echo [GVD] Starting supervisor: %RUN%
-    start "GVD supervisor" %PY% "%RUN%"
+    start "GVD supervisor" %PY% "%RUN%" --viz
   ) else (
     echo [GVD] Python not found - skipped supervisor.
   )
@@ -24,7 +24,7 @@ if defined RUN (
 
 echo [GVD] Trying Steam app 284160. If BeamNG does not open, launch it yourself.
 start "" "steam://rungameid/284160" 2>nul
-echo [GVD] Enable GVD in Mod Manager if needed. Alt+A toggles engage (stub).
+echo [GVD] Enable GVD in Mod Manager if needed. Alt+A toggles engage (writes gvd_engage.json). Live Tech UNPROVEN.
 pause
 endlocal
 exit /b 0

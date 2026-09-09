@@ -38,7 +38,7 @@ After install, unpacked tree:
 ```
 mods\unpacked\gvd\
   scripts\gvd\modScript.lua
-  lua\ge\extensions\gvd_main.lua
+  lua\ge\extensions\gvd\main.lua
   lua\ge\extensions\core\input\actions\gvd.json
   settings\inputmaps\keyboardGvd.json
 ```

@@ -1,4 +1,4 @@
-"""Tesla-like cabin stage (OpenCV). Chase 3/4 bird default; BEV via T. No FSD marks."""
+"""GVD VISION cabin stage (OpenCV). Chase 3/4 bird default; BEV via T. No FSD/Tesla marks."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ BLOCKED = (92, 92, 196)
 
 MAX_AGENTS = 32
 MAX_FORECAST = 16
-STAGE_W, STAGE_H = 960, 720
+STAGE_W, STAGE_H = 1280, 800
 PATH_WIDTH_M = 2.0
 PATH_FADE_START_M = 25.0
 PATH_FADE_END_M = 40.0
@@ -175,13 +175,18 @@ def _draw_underglow(img: np.ndarray, engaged: bool, cam: Cam) -> None:
     img[:] = overlay
 
 
-def _draw_ghost(img: np.ndarray, tr: dict[str, Any], cam: Cam) -> None:
+def _draw_ghost(img: np.ndarray, tr: dict[str, Any], cam: Cam, *, lead: bool = False) -> None:
     cls = str(tr.get("class", "vehicle"))
     base = GHOST if cls == "vehicle" else PED if cls == "pedestrian" else BIKE
     x, y = float(tr.get("x", 0)), float(tr.get("y", 0))
     yaw = float(tr.get("yaw", tr.get("heading", 1.57)))
-    # oriented hull in ego frame, then project corners
-    L, W = 2.2, 0.95  # meters
+    # oriented hull — vehicles ~4.2×1.8 m visual scale (display), peds smaller
+    if cls in ("pedestrian", "ped"):
+        L, W = 0.6, 0.6
+    elif cls in ("bicycle", "bike"):
+        L, W = 1.6, 0.5
+    else:
+        L, W = 2.4, 1.05
     c, s = math.cos(yaw), math.sin(yaw)
     corners = []
     for dx, dy in ((-W, -L), (W, -L), (W, L), (-W, L)):
@@ -189,10 +194,17 @@ def _draw_ghost(img: np.ndarray, tr: dict[str, Any], cam: Cam) -> None:
         wx = x + dx * c - dy * s
         wy = y + dx * s + dy * c
         corners.append(list(cam.project(wx, wy, 0.4)))
+    pts = np.array(corners, dtype=np.int32)
     overlay = img.copy()
-    cv2.fillPoly(overlay, [np.array(corners, dtype=np.int32)], base)
-    cv2.addWeighted(overlay, 0.32, img, 0.68, 0, img)
-    cv2.polylines(img, [np.array(corners, dtype=np.int32)], True, PAPER, 1, cv2.LINE_AA)
+    fill_a = 0.45 if lead else 0.32
+    cv2.fillPoly(overlay, [pts], base if not lead else ICE)
+    cv2.addWeighted(overlay, fill_a, img, 1.0 - fill_a, 0, img)
+    stroke = ICE if lead else PAPER
+    thick = 3 if lead else 1
+    cv2.polylines(img, [pts], True, stroke, thick, cv2.LINE_AA)
+    if lead:
+        tag = cam.project(x, y + L * 0.55, 1.2)
+        cv2.putText(img, "LEAD", (tag[0] - 18, tag[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.45, ICE, 1, cv2.LINE_AA)
 
 
 def _draw_agent_forecasts(img: np.ndarray, tr: dict[str, Any], cam: Cam) -> None:
@@ -244,27 +256,43 @@ def render_stage(
     ]
     cv2.fillPoly(img, [np.array(corners, dtype=np.int32)], (55, 55, 55))
 
+    # Mode 0 (clean) still shows corridor + all tracks + CIPV — product viz, not empty cabin
+    planner = state.get("planner") or {}
+    cipv_id = planner.get("cipv_id")
+    try:
+        cipv_id = int(cipv_id) if cipv_id is not None else None
+    except Exception:
+        cipv_id = None
+
     tracks = list(state.get("tracks") or [])[:MAX_AGENTS]
     n_forecast = 0
     for tr in tracks:
-        _draw_ghost(img, tr, cam)
-        if clean or drop_heavy:
+        tid = tr.get("id")
+        try:
+            tid_i = int(tid) if tid is not None else None
+        except Exception:
+            tid_i = None
+        lead = cipv_id is not None and tid_i == cipv_id
+        _draw_ghost(img, tr, cam, lead=lead)
+        if drop_heavy:
+            continue
+        # forecasts: skip only when clean cabin AND we need FPS; mode 0 keeps cars, drops fans under 8 Hz already
+        if clean:
             continue
         if n_forecast >= MAX_FORECAST:
             continue
         _draw_agent_forecasts(img, tr, cam)
         n_forecast += 1
 
-    if not drop_heavy and not clean:
+    # Small cam_main PIP whenever a real frame exists (not only layer 2); drop under 8 Hz
+    if main_frame is not None and getattr(main_frame, "size", 0) and not drop_heavy:
         pip = np.full((180, 320, 3), (28, 28, 28), dtype=np.uint8)
-        # Spec: real main PIP when debug layer 2 is on (not a blank forever-blit)
-        if 2 in ui.layers and main_frame is not None and getattr(main_frame, "size", 0):
-            try:
-                pip = cv2.resize(main_frame, (320, 180), interpolation=cv2.INTER_AREA)
-            except Exception:
-                pass
-            cv2.putText(pip, "cam_main", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.5, PAPER, 1)
-            cv2.drawMarker(pip, (160, 90), ICE, cv2.MARKER_CROSS, 12, 1)
+        try:
+            pip = cv2.resize(main_frame, (320, 180), interpolation=cv2.INTER_AREA)
+        except Exception:
+            pass
+        cv2.putText(pip, "cam_main", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.5, PAPER, 1)
+        cv2.drawMarker(pip, (160, 90), ICE, cv2.MARKER_CROSS, 12, 1)
         img[12:192, 12:332] = pip
         cv2.rectangle(img, (12, 12), (332, 192), ICE, 1)
 
@@ -297,11 +325,12 @@ def smoke(ui: VizUI | None = None, use_perception: bool = False) -> "Path":
         tracks_n=3,
         objects_n=3,
         tracks=[
-            {"id": 1, "class": "vehicle", "x": -3.5, "y": 18, "speed_mps": 12, "yaw": 1.55, "yaw_rate": 0.0},
+            {"id": 1, "class": "vehicle", "x": -0.4, "y": 16, "speed_mps": 12, "yaw": 1.55, "yaw_rate": 0.0},
             {"id": 2, "class": "vehicle", "x": 3.0, "y": 25, "speed_mps": 8, "yaw": 1.6, "yaw_rate": 0.05},
             {"id": 3, "class": "pedestrian", "x": 6.0, "y": 12, "speed_mps": 1.2, "yaw": 3.1, "yaw_rate": 0.0},
         ],
-        planner={"corridor_width": 2.0, "curvature": 0.01, "target_v": 12.0, "ttc_lead": 2.4, "aeb": "off"},
+        planner={"corridor_width": 2.0, "curvature": 0.01, "target_v": 12.0, "ttc_lead": 2.4, "aeb": "off", "cipv_id": 1},
+        show_agent_ghosts=True,
         missing_state_keys=["live cameras", "real planner path", "occupancy grid"],
     )
     st["path_ego"] = [{"x": 0.12 * math.sin(i / 14), "y": float(i), "z": 0.0} for i in range(0, 45)]
@@ -327,6 +356,9 @@ def smoke(ui: VizUI | None = None, use_perception: bool = False) -> "Path":
         miss = [m for m in (st.get("missing_state_keys") or []) if m not in ("tracks", "lanes_bev", "real path_ego from planner")]
         st["missing_state_keys"] = sorted(set(miss + pout.missing))
     write_state(st)
+    # Product smoke: mode 0 cabin with corridor + 3 ghosts + LEAD (no Tesla/FSD chrome)
+    ui.layers = {0}
+    ui.show_nerd = False
     frame = render_stage(st, ui=ui)
     out = Path("docs/gvd_viz_smoke.png")
     out.parent.mkdir(parents=True, exist_ok=True)

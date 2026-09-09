@@ -81,7 +81,7 @@ Written by the in-game **GVD** app. **Wins over** `gvd_state` for path/ghosts wh
 | `shadow.throttle` | float | E2E proposed throttle [0,1] |
 | `shadow.brake` | float | E2E proposed brake [0,1] |
 | `e2e_ok` | bool | False when modular vetoes E2E (low lane_conf / heartbeat / disagreement / forward fail) |
-| `veto_reason` | string | `none` / `low_lane_conf` / `low_path_conf` / `heartbeat_stale` / `disagreement` / `e2e_forward_fail` / `preview_blocked` |
+| `veto_reason` | string | `none` / `aeb_brake` / `aeb_warn` / `low_lane_conf` / `low_path_conf` / `heartbeat_stale` / `disagreement` / `e2e_forward_fail` / `preview_blocked` |
 | `e2e_backend` | string | `stub` / `onnx` |
 
 Perception always runs. Actuators only when engaged **and** modular OK. Shadow mode computes both intents; default apply path stays modular. Dead-man / heartbeat unchanged. No weight blobs in git (`models/e2e_current.onnx` gitignored).

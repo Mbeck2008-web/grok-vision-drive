@@ -97,7 +97,9 @@ class E2EPolicy:
             opts = ort.SessionOptions()
             opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
             # Prefer CUDA when available; never default TensorRT.
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            want = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            avail = set(ort.get_available_providers())
+            providers = [p for p in want if p in avail] or ["CPUExecutionProvider"]
             self._session = ort.InferenceSession(
                 str(self.model_path),
                 sess_options=opts,

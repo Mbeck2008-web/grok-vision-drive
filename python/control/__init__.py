@@ -1,1 +1,1 @@
-"""M3 sim actuation (BeamNGpy preferred, gvd_cmd.json fallback)."""
+"""M3 sim actuation + M5 PilotNet-scale E2E stub."""

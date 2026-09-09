@@ -53,3 +53,10 @@ Also: `Documents/GVD/gvd_cmd.json` = `{steer,throttle,brake,seq,heartbeat_mtime}
 | `last_clip_trigger` | string | `none` / `disengage` / `aeb_brake` / `near_miss_ttc` / `manual` / `smoke` |
 | `last_clip_path` | string? | Last flushed clip directory under Documents/GVD/clips |
 | `encode_backend` | string | `h264_qsv` / `libx264` / `h264_nvenc` / `none` |
+
+
+## Dual-viz
+
+| `path_world` | optional `[{x,y,z}]` | World path from BeamNGpy pose × path_ego (kinematics, not a map). Lua prefers this for 1:1 ribbon. |
+| `show_agent_ghosts` | bool | Default true when `tracks_n>0`; in-game track hulls + OpenCV ghosts |
+| `planner.cipv_id` | int? | Brighter ice / LEAD on that track |

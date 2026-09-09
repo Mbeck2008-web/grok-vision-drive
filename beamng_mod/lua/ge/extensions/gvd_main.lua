@@ -22,10 +22,11 @@ local stripAcc = 0
 local ICE_R, ICE_G, ICE_B = 90, 180, 220
 local AMBER_R, AMBER_G, AMBER_B = 200, 160, 60
 local MAX_EGO_SEGS = 40
-local MAX_AGENT = 8
+local MAX_AGENT = 8  -- forecast ribbons; track hulls use MAX_TRACK_GHOSTS
 local AGENT_PATH_MAX_M = 8.0
-local Z_BIAS = 0.08
+local Z_BIAS = 0.10  -- dual-viz: reduce z-fight on pavement
 local DEFAULT_WIDTH = 2.0
+local MAX_TRACK_GHOSTS = 16
 local HB_STALE_S = 0.35
 
 local function onInit()
@@ -150,6 +151,7 @@ local function getPlayerVeh()
   return nil
 end
 
+-- 1:1 mapping: path_ego x=right, y=forward, z=up in vehicle frame → world via veh basis.
 local function egoToWorldPoints(pathEgo, veh, maxLenM)
   if not pathEgo or not veh then return nil end
   local pos = veh:getPosition()
@@ -225,6 +227,7 @@ local function drawer()
 end
 
 local function drawRibbon(points, width, col, segsCap)
+  -- World ribbon on pavement (not a 2D HUD). prism fail → 3 parallel lines L/C/R.
   local d = drawer()
   if not d or not points or #points < 2 then return end
   local n = math.min(#points - 1, segsCap or MAX_EGO_SEGS)
@@ -242,8 +245,114 @@ local function drawRibbon(points, width, col, segsCap)
       drew = ok
     end
     if not drew and d.drawLine then
+      -- 3 parallel lines so a thin center line is never the only fallback
+      pcall(function() d:drawLine(af, bf, col) end)
+      -- left/right offsets along a crude right vector
+      local dx = (b.x or 0) - (a.x or 0)
+      local dy = (b.y or 0) - (a.y or 0)
+      local len = math.sqrt(dx * dx + dy * dy) + 1e-6
+      local rx, ry = -dy / len * (width * 0.45), dx / len * (width * 0.45)
+      local aL = vec3((a.x or 0) + rx, (a.y or 0) + ry, (a.z or 0))
+      local bL = vec3((b.x or 0) + rx, (b.y or 0) + ry, (b.z or 0))
+      local aR = vec3((a.x or 0) - rx, (a.y or 0) - ry, (a.z or 0))
+      local bR = vec3((b.x or 0) - rx, (b.y or 0) - ry, (b.z or 0))
+      local aLf = aL.toFloat3 and aL:toFloat3() or aL
+      local bLf = bL.toFloat3 and bL:toFloat3() or bL
+      local aRf = aR.toFloat3 and aR:toFloat3() or aR
+      local bRf = bR.toFloat3 and bR:toFloat3() or bR
+      pcall(function() d:drawLine(aLf, bLf, col) end)
+      pcall(function() d:drawLine(aRf, bRf, col) end)
+    end
+  end
+end
+
+local function egoBasis(veh)
+  local pos = veh:getPosition()
+  local fwd = veh:getDirectionVector():normalized()
+  local up = (veh:getDirectionVectorUp() or vec3(0, 0, 1)):normalized()
+  local right = fwd:cross(up)
+  if right:length() < 1e-6 then right = vec3(1, 0, 0) else right = right:normalized() end
+  return pos, right, fwd, up
+end
+
+local function drawTrackHull(veh, tr, col)
+  -- Vehicle ~4.2x1.8 / ped 0.6x0.6 in ego frame → world via same basis as path_ego (x right, y forward, z up)
+  if not veh or not tr then return end
+  local d = drawer()
+  if not d then return end
+  local pos, right, fwd, up = egoBasis(veh)
+  local x = tonumber(tr.x) or 0
+  local y = tonumber(tr.y) or 0
+  local yaw = tonumber(tr.yaw or tr.heading) or 1.57
+  local cls = tostring(tr['class'] or tr.class or 'vehicle')
+  local L, W = 4.2, 1.8
+  if cls == 'pedestrian' or cls == 'ped' then L, W = 0.6, 0.6 end
+  if cls == 'bicycle' or cls == 'bike' then L, W = 1.8, 0.6 end
+  local cy, sy = math.cos(yaw), math.sin(yaw)
+  -- yaw 0 ≈ +Y forward in ego; build rear/front centers along heading
+  local rearX, rearY = x - (L * 0.5) * sy, y - (L * 0.5) * cy
+  local frontX, frontY = x + (L * 0.5) * sy, y + (L * 0.5) * cy
+  local pA = pos + right * rearX + fwd * rearY + up * Z_BIAS
+  local pB = pos + right * frontX + fwd * frontY + up * Z_BIAS
+  local aF = pA.toFloat3 and pA:toFloat3() or pA
+  local bF = pB.toFloat3 and pB:toFloat3() or pB
+  local half = float3 and float3(0.2, W, 0.2) or nil
+  local drew = false
+  if half and d.drawSquarePrism then
+    local ok = pcall(function() d:drawSquarePrism(aF, bF, half, half, col) end)
+    drew = ok
+  end
+  if not drew and d.drawLine then
+    -- 4 footprint lines + short vertical edge
+    local hx, hy = (W * 0.5) * cy, (W * 0.5) * sy
+    local corners = {
+      {rearX - hx, rearY - hy}, {rearX + hx, rearY + hy},
+      {frontX + hx, frontY + hy}, {frontX - hx, frontY - hy},
+    }
+    local wpts = {}
+    for i = 1, 4 do
+      local wx = corners[i][1]
+      local wy = corners[i][2]
+      wpts[i] = pos + right * wx + fwd * wy + up * Z_BIAS
+    end
+    for i = 1, 4 do
+      local a = wpts[i]
+      local b = wpts[(i % 4) + 1]
+      local af = a.toFloat3 and a:toFloat3() or a
+      local bf = b.toFloat3 and b:toFloat3() or b
       pcall(function() d:drawLine(af, bf, col) end)
     end
+    local top = wpts[1] + up * 0.4
+    local tF = top.toFloat3 and top:toFloat3() or top
+    local b0 = wpts[1].toFloat3 and wpts[1]:toFloat3() or wpts[1]
+    pcall(function() d:drawLine(b0, tF, col) end)
+  end
+end
+
+local function drawTrackGhosts(st, veh, baseA)
+  if not veh or not st then return end
+  local tracks = st.tracks
+  if not tracks then return end
+  -- Honor state flag directly when set; else fall back to extension local / tracks_n>0
+  local show
+  if st.show_agent_ghosts ~= nil then
+    show = not not st.show_agent_ghosts
+  else
+    local tn = tonumber(st.tracks_n) or #tracks
+    show = showAgentGhosts or (tn > 0)
+  end
+  if not show then return end
+  local cipv = nil
+  if st.planner and st.planner.cipv_id ~= nil then cipv = tonumber(st.planner.cipv_id) end
+  local count = 0
+  for _, tr in ipairs(tracks) do
+    if count >= MAX_TRACK_GHOSTS then break end
+    local id = tonumber(tr.id)
+    local isCipv = cipv and id and id == cipv
+    local a = isCipv and math.floor(clamp(baseA, 0, 255)) or math.floor(clamp(baseA * 0.40, 0, 255))
+    local col = color(ICE_R, ICE_G, ICE_B, a)
+    drawTrackHull(veh, tr, col)
+    count = count + 1
   end
 end
 
@@ -300,14 +409,14 @@ function M.drawPath(dt)
 
   local conf = tonumber(lastGood.path_conf) or (isPreview and 0.35 or 0.85)
   local width = tonumber(lastGood.path_width) or DEFAULT_WIDTH
-  width = clamp(width, 1.8, 2.2)
+  width = clamp(width, 1.8, 2.4)
   if conf < 0.45 then
     width = width * 0.75
     local keep = math.max(8, math.floor(#pts * 0.55))
     while #pts > keep do table.remove(pts) end
   end
 
-  local a = fadeAlpha(isPreview and 90 or 170, conf, hbAlive)
+  local a = fadeAlpha(isPreview and 90 or 200, conf, hbAlive)
   local col = color(ICE_R, ICE_G, ICE_B, a)
   if lastGood.policy == 'map-ai' then
     col = color(AMBER_R, AMBER_G, AMBER_B, math.floor(a * 0.7))
@@ -325,6 +434,7 @@ function M.drawPath(dt)
   end
 
   drawRibbon(pts, width, col, MAX_EGO_SEGS)
+  drawTrackGhosts(lastGood, veh, a)
 
   if showAgentGhosts and lastGood.agents then
     local ghostA = math.floor(a * 0.20)

@@ -43,6 +43,12 @@ mods\unpacked\gvd\
   settings\inputmaps\keyboardGvd.json
 ```
 
+## Two views
+
+**In-game (BeamNG world):** ice-blue ribbon drawn on the pavement via GELua `debugDrawer` (`drawSquarePrism`, 3-line fallback) — **1:1** with `path_ego` / `path_world` (x right, y forward, z up). Track ghosts sit on the road at the same transform; CIPV is brighter. Engage with Alt+A. This is **not** a 2D camera overlay.
+
+**Second screen (`GVD VISION`):** OpenCV cabin on monitor 2 when available (`--viz-screen auto|1|2`, `--viz-fullscreen`, or `GVD_VIZ_MONITOR=2`). Same corridor, tracks, CIPV **LEAD** mark, optional `cam_main` PIP. One monitor → window stays put; drag it, or use motherboard HDMI for UHD 630 as display 2. Live dual-monitor + Alt+A still **UNPROVEN** on Linux / until Windows gate.
+
 ## Status
 
 **M3 (actuation, this PR):** sim-only. Preferred BeamNGpy `vehicle.control` (arcade); fallback atomic `Documents/GVD/gvd_cmd.json` (no DLL). Engage = Alt+A → `gvd_engage.json`. No drive when `path_debug_preview=true` unless `--allow-preview-drive`. Ego speed from Electrics when present (never invent 10 m/s). Stale heartbeat / disengage / shutdown → throttle 0 + brake. **Arcade + hold brake can auto-shift reverse** — AEB keeps `throttle=0`. Live BeamNG.tech still **UNPROVEN on Linux**.

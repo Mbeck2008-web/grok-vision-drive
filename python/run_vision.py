@@ -25,6 +25,7 @@ from python.perception.pipeline import ModularPerception
 from python.runtime.hw_probe import probe, refuse_live_start
 from python.runtime.state_io import default_state, state_path, steer_preview_path_ego, write_state
 from python.sensors.cameras import make_backend, resolve_backend_name
+from python.viz.monitors import place_opencv_window
 from python.viz.stage import VizUI, render_stage, smoke
 
 
@@ -56,6 +57,58 @@ def _gpu_vram_used_gb() -> float:
         return 0.0
 
 
+
+def _path_world_from_vehicle(path_ego: list, vehicle) -> list[dict[str, float]] | None:
+    """Kinematics-only world path from BeamNGpy vehicle pose (honesty: not a map)."""
+    if not path_ego or vehicle is None:
+        return None
+    try:
+        # BeamNGpy Vehicle: state poll
+        pos = None
+        fwd = None
+        up = None
+        if hasattr(vehicle, "state") and isinstance(vehicle.state, dict):
+            pos = vehicle.state.get("pos")
+            # dir may be missing
+        if pos is None and hasattr(vehicle, "get_position"):
+            pos = vehicle.get_position()
+        if pos is None:
+            return None
+        # Prefer sensor/state vectors when present — never invent forward (honesty)
+        if hasattr(vehicle, "state") and isinstance(vehicle.state, dict):
+            fwd = vehicle.state.get("dir") or vehicle.state.get("forward")
+            up = vehicle.state.get("up")
+        if fwd is None:
+            return None
+        if up is None:
+            up = (0.0, 0.0, 1.0)
+        px, py, pz = float(pos[0]), float(pos[1]), float(pos[2])
+        fx, fy, fz = float(fwd[0]), float(fwd[1]), float(fwd[2])
+        ux, uy, uz = float(up[0]), float(up[1]), float(up[2])
+        # right = fwd × up
+        rx = fy * uz - fz * uy
+        ry = fz * ux - fx * uz
+        rz = fx * uy - fy * ux
+        import math
+        def _n(x, y, z):
+            L = math.sqrt(x * x + y * y + z * z) + 1e-9
+            return x / L, y / L, z / L
+        fx, fy, fz = _n(fx, fy, fz)
+        ux, uy, uz = _n(ux, uy, uz)
+        rx, ry, rz = _n(rx, ry, rz)
+        out = []
+        for p in path_ego:
+            ex, ey, ez = float(p.get("x", 0)), float(p.get("y", 0)), float(p.get("z", 0))
+            out.append({
+                "x": px + rx * ex + fx * ey + ux * ez,
+                "y": py + ry * ex + fy * ey + uy * ez,
+                "z": pz + rz * ex + fz * ey + uz * ez,
+            })
+        return out
+    except Exception:
+        return None
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="GVD supervisor + M2/M3/M4")
     ap.add_argument("--viz", action="store_true")
@@ -84,6 +137,12 @@ def main() -> None:
         choices=["auto", "qsv", "cpu", "nvenc"],
         help="Clip encode: auto/qsv→libx264; nvenc only if explicitly requested",
     )
+    ap.add_argument(
+        "--viz-screen",
+        default="auto",
+        help="GVD VISION monitor: auto|1|2 (or GVD_VIZ_MONITOR). auto→non-primary if present",
+    )
+    ap.add_argument("--viz-fullscreen", action="store_true", help="Fullscreen GVD VISION on chosen monitor")
     args = ap.parse_args()
 
     if args.vision_only:
@@ -146,9 +205,13 @@ def main() -> None:
         print("[GVD] WARNING: --allow-preview-drive is ON")
 
     ui = VizUI()
-    win = "GVD" if args.viz else None
+    win = "GVD VISION" if args.viz else None
     if win:
-        import cv2  # noqa: F401
+        import cv2
+
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(win, 1280, 800)
+        place_opencv_window(win, screen=args.viz_screen, fullscreen=bool(args.viz_fullscreen))
 
     frame_i = 0
     cmd_seq = 0
@@ -242,6 +305,12 @@ def main() -> None:
                 st["path_debug_preview"] = True
             st["tracks"] = pout.tracks
             st["lanes_bev"] = pout.lanes_bev
+            if pout.tracks_n > 0:
+                st["show_agent_ghosts"] = True
+            pw = _path_world_from_vehicle(st.get("path_ego") or [], vehicle)
+            if pw:
+                st["path_world"] = pw
+
             st["cam_health"] = bundle.health_str()
             st["capture_backend"] = bundle.backend
             st["capture_note"] = bundle.note

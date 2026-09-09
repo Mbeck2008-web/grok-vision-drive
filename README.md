@@ -45,6 +45,8 @@ mods\unpacked\gvd\
 
 ## Status
 
+**M2 (perception):** modular detect→track→CIPV→corridor on `cam_main` (YOLOv8n ONNX if present, else synthetic dets for offline). OpenCV lanes. `path_debug_preview=false` when corridor produces path.
+
 **M1 (cameras + hw probe):** honest `CameraBackend` (`beamngpy | window | stub`), 8-cam mounts in `config/cameras.yaml`, `hw_probe` boot line, `--backend` flag. Viz PR #2 merged (ice-blue ribbon + OpenCV cabin). Live BeamNG Camera attach / Alt+A still **UNPROVEN on Linux** — confirm on Windows + Tech.
 
 M2 perception / M3 actuation / M4 clips next.
@@ -92,3 +94,15 @@ Tech path: `GVD_BEAMNG=1` attaches color-only BeamNGpy `Camera` sensors from `co
 Live start **refuses** (exit 1) if probed dGPU VRAM &lt; 10 GB while BeamNG is running, unless `--vision-only`.
 
 BIOS (Windows): enable **iGPU Multi-Monitor** so UHD 630 QSV exists while 1080 Ti drives the display (M4 encode). Do not set DVMT to 2 GB.
+
+
+## Perception (M2)
+
+Vision-only: no LiDAR/radar/GPS-loc/HD-map in the live loop. Inspired by VisionPilot / Apollo camera-pipeline *names* — reimplemented tiny in-repo (not a vendor fork). Forecasts stay CV/CYR toys.
+
+```bash
+pip install -r requirements.txt
+pip install -r requirements-perception.txt   # optional
+python scripts/download_yolov8n.py --onnx      # models/ gitignored
+PYTHONPATH=. python python/run_vision.py --smoke
+```

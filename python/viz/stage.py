@@ -281,7 +281,7 @@ def render_stage(
     return img
 
 
-def smoke(ui: VizUI | None = None) -> "Path":
+def smoke(ui: VizUI | None = None, use_perception: bool = False) -> "Path":
     from pathlib import Path
 
     from python.runtime.state_io import default_state, write_state
@@ -305,6 +305,27 @@ def smoke(ui: VizUI | None = None) -> "Path":
         missing_state_keys=["live cameras", "real planner path", "occupancy grid"],
     )
     st["path_ego"] = [{"x": 0.12 * math.sin(i / 14), "y": float(i), "z": 0.0} for i in range(0, 45)]
+    if use_perception:
+        from python.perception.pipeline import ModularPerception
+        import numpy as np
+
+        perc = ModularPerception(allow_synthetic=True)
+        fake = np.zeros((480, 640, 3), dtype=np.uint8)
+        pout = perc.tick(fake, ego_speed_mps=12.0, steer_deg=0.0)
+        st["tracks"] = pout.tracks
+        st["tracks_n"] = pout.tracks_n
+        st["objects_n"] = pout.objects_n
+        st["lane_conf"] = pout.lane_conf
+        st["lanes_bev"] = pout.lanes_bev
+        st["path_ego"] = pout.path_ego
+        st["path_width"] = pout.path_width
+        st["path_conf"] = pout.path_conf
+        st["path_debug_preview"] = pout.path_debug_preview
+        st["planner"] = pout.planner
+        st["infer_ms"] = pout.infer_ms
+        st["detector"] = pout.detector_name
+        miss = [m for m in (st.get("missing_state_keys") or []) if m not in ("tracks", "lanes_bev", "real path_ego from planner")]
+        st["missing_state_keys"] = sorted(set(miss + pout.missing))
     write_state(st)
     frame = render_stage(st, ui=ui)
     out = Path("docs/gvd_viz_smoke.png")

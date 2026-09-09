@@ -74,12 +74,12 @@ def _path_world_from_vehicle(path_ego: list, vehicle) -> list[dict[str, float]] 
             pos = vehicle.get_position()
         if pos is None:
             return None
-        # Prefer sensor/state vectors when present
+        # Prefer sensor/state vectors when present — never invent forward (honesty)
         if hasattr(vehicle, "state") and isinstance(vehicle.state, dict):
             fwd = vehicle.state.get("dir") or vehicle.state.get("forward")
             up = vehicle.state.get("up")
         if fwd is None:
-            fwd = (0.0, 1.0, 0.0)
+            return None
         if up is None:
             up = (0.0, 0.0, 1.0)
         px, py, pz = float(pos[0]), float(pos[1]), float(pos[2])

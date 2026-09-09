@@ -246,10 +246,6 @@ local function drawRibbon(points, width, col, segsCap)
     end
     if not drew and d.drawLine then
       -- 3 parallel lines so a thin center line is never the only fallback
-      local lateral = 0.0
-      if a.x and b.x then
-        -- approximate side offset in world: use cross of segment with up
-      end
       pcall(function() d:drawLine(af, bf, col) end)
       -- left/right offsets along a crude right vector
       local dx = (b.x or 0) - (a.x or 0)
@@ -337,9 +333,14 @@ local function drawTrackGhosts(st, veh, baseA)
   if not veh or not st then return end
   local tracks = st.tracks
   if not tracks then return end
-  local show = showAgentGhosts
-  local tn = tonumber(st.tracks_n) or (tracks and #tracks) or 0
-  if st.show_agent_ghosts == nil and tn > 0 then show = true end
+  -- Honor state flag directly when set; else fall back to extension local / tracks_n>0
+  local show
+  if st.show_agent_ghosts ~= nil then
+    show = not not st.show_agent_ghosts
+  else
+    local tn = tonumber(st.tracks_n) or #tracks
+    show = showAgentGhosts or (tn > 0)
+  end
   if not show then return end
   local cipv = nil
   if st.planner and st.planner.cipv_id ~= nil then cipv = tonumber(st.planner.cipv_id) end

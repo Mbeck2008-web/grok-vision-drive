@@ -163,6 +163,25 @@ def _draw_filled_corridor(img: np.ndarray, path: list[dict], conf: float, cam: C
         cv2.line(img, center[i], center[i + 1], ICE, 1, cv2.LINE_AA)
 
 
+
+def _draw_path_world_overlay(img: np.ndarray, path_world: list, cam: Cam) -> None:
+    """BEV sanity: project path_world when T (top_down) so game==viz is visible."""
+    if not cam.top_down or not path_world or len(path_world) < 2:
+        return
+    # path_world is absolute; overlay relative to first point as origin for BEV sanity
+    x0 = float(path_world[0].get("x", 0))
+    y0 = float(path_world[0].get("y", 0))
+    pts = []
+    for p in path_world[:80]:
+        # treat delta as ego-ish for BEV debug (forward≈Δ along path dominant axis)
+        dx = float(p.get("x", 0)) - x0
+        dy = float(p.get("y", 0)) - y0
+        pts.append(cam.project(dx, dy, 0.0))
+    for i in range(len(pts) - 1):
+        cv2.line(img, pts[i], pts[i + 1], (120, 180, 90), 1, cv2.LINE_AA)  # dim green sanity
+    cv2.putText(img, "path_world", (pts[0][0] + 4, pts[0][1]), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (120, 180, 90), 1, cv2.LINE_AA)
+
+
 def _draw_underglow(img: np.ndarray, engaged: bool, cam: Cam) -> None:
     if not engaged:
         return
@@ -184,9 +203,9 @@ def _draw_ghost(img: np.ndarray, tr: dict[str, Any], cam: Cam, *, lead: bool = F
     if cls in ("pedestrian", "ped"):
         L, W = 0.6, 0.6
     elif cls in ("bicycle", "bike"):
-        L, W = 1.6, 0.5
+        L, W = 1.8, 0.6
     else:
-        L, W = 2.4, 1.05
+        L, W = 2.1, 0.9  # half-extents for Spec 4.2×1.8 m vehicle hull
     c, s = math.cos(yaw), math.sin(yaw)
     corners = []
     for dx, dy in ((-W, -L), (W, -L), (W, L), (-W, L)):
@@ -246,6 +265,7 @@ def render_stage(
 
     _draw_underglow(img, engaged, cam)
     _draw_filled_corridor(img, state.get("path_ego") or [], float(state.get("path_conf") or 0.5), cam)
+    _draw_path_world_overlay(img, state.get("path_world") or [], cam)
 
     # ego shell
     corners = [

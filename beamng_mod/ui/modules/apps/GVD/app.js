@@ -234,7 +234,8 @@ angular.module('beamng.apps')
         else if (ui.cmdApplied === false) s += ' · not applied';
         if (ui.cmdAckSeq != null && ui.cmdAckSeq >= 0) s += ' · ack ' + ui.cmdAckSeq + '/' + dash(ui.cmdSeq);
         if (ui.egoSource && ui.egoSource !== 'none') s += ' · ego ' + ui.egoSource;
-        if (ui.cmdReason) s += ' · ' + ui.cmdReason;
+        // the reason only earns space when it is not the happy path
+        if (ui.cmdReason && ['ok', 'cmd_json_applied'].indexOf(ui.cmdReason) < 0) s += ' · ' + ui.cmdReason;
         return s;
       };
       scope.clipLine = function () {
@@ -483,16 +484,23 @@ angular.module('beamng.apps')
             ctx.rect(top[0] - w / 2, top[1] - hh, w, hh);
             ctx.fill();
             ctx.stroke();
-            // aspect unknown until something classifies the lamp colour: show all three dim
+            // Nothing classifies the lamp colour yet, so an unknown aspect is drawn as three
+            // empty rings — never a lit lamp the player could act on.
             var lampR = Math.max(1.2, w * 0.26);
             var on = { red: 0, amber: 1, green: 2 }[String(s.state)];
             var lampCol = [[192, 84, 74], [214, 168, 76], [110, 190, 130]];
             for (var l = 0; l < 3; l++) {
               var cy2 = top[1] - hh + hh * (0.22 + 0.28 * l);
-              ctx.fillStyle = (on === l) ? rgba(lampCol[l], 0.95 * far) : rgba([58, 64, 70], 0.85 * far);
               ctx.beginPath();
               ctx.arc(top[0], cy2, lampR, 0, Math.PI * 2);
-              ctx.fill();
+              if (on === l) {
+                ctx.fillStyle = rgba(lampCol[l], 0.95 * far);
+                ctx.fill();
+              } else {
+                ctx.strokeStyle = rgba([86, 94, 102], 0.8 * far);
+                ctx.lineWidth = 1;
+                ctx.stroke();
+              }
             }
           } else {
             var r = Math.max(5, 0.38 * scale);

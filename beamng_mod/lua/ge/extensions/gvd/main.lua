@@ -5,6 +5,9 @@ local M = {}
 local engaged = false
 local showPath = true
 local showAgentGhosts = false
+local showScene = true       -- in-app VISION canvas (player can switch it off; shares the GPU with BeamNG)
+local policyReq = nil        -- session-scoped policy request for the Python supervisor
+local vizScreenReq = nil     -- session-scoped GVD VISION monitor request
 
 local STATE_REL = 'Documents/GVD/gvd_state.json'
 local ENGAGE_REL = 'Documents/GVD/gvd_engage.json'
@@ -29,6 +32,13 @@ local Z_BIAS = 0.10  -- dual-viz: reduce z-fight on pavement
 local DEFAULT_WIDTH = 2.0
 local MAX_TRACK_GHOSTS = 16
 local HB_STALE_S = 0.35
+
+-- Caps for the geometry we hand to the in-game app (keep the guihooks payload small)
+local UI_PATH_PTS = 28
+local UI_TRACKS = 12
+local UI_LANES = 3
+local UI_LANE_PTS = 12
+local CAM_IDS = { 'narrow', 'main', 'wide', 'pillarL', 'pillarR', 'repeatL', 'repeatR', 'rear' }
 
 local function onInit()
 end
@@ -206,14 +216,30 @@ local function encodeUiStateMirror(st)
   return nil
 end
 
+local function sanitizePolicy(p)
+  p = tostring(p or ''):lower()
+  if p == 'modular' or p == 'e2e' or p == 'shadow' then return p end
+  return nil
+end
+
+local function sanitizeScreen(s)
+  s = tostring(s or ''):lower()
+  if s == 'auto' or s == '1' or s == '2' or s == '3' then return s end
+  return nil
+end
+
 local function writeUiPrefs()
-  local payload = string.format(
-    '{"show_path":%s,"show_agent_ghosts":%s,"mtime":%d}',
-    showPath and 'true' or 'false',
-    showAgentGhosts and 'true' or 'false',
-    os.time()
-  )
-  writeText(userUiPrefsPath(), payload)
+  -- policy / viz_screen are session requests: written only while the player asks for one this run,
+  -- so a pref left over from a past session never overrides the supervisor's --policy at launch.
+  local parts = {
+    string.format('"show_path":%s', showPath and 'true' or 'false'),
+    string.format('"show_agent_ghosts":%s', showAgentGhosts and 'true' or 'false'),
+    string.format('"show_scene":%s', showScene and 'true' or 'false'),
+  }
+  if policyReq then parts[#parts + 1] = string.format('"policy":"%s"', policyReq) end
+  if vizScreenReq then parts[#parts + 1] = string.format('"viz_screen":"%s"', vizScreenReq) end
+  parts[#parts + 1] = string.format('"mtime":%d', os.time())
+  writeText(userUiPrefsPath(), '{' .. table.concat(parts, ',') .. '}')
   -- Mirror into gvd_state so OpenCV / Python follow the same toggles
   local raw = readText(userStatePath())
   local st = raw and decodeJson(raw) or nil
@@ -234,6 +260,7 @@ local function readUiPrefs()
   if not p then return end
   if p.show_path ~= nil then showPath = not not p.show_path end
   if p.show_agent_ghosts ~= nil then showAgentGhosts = not not p.show_agent_ghosts end
+  if p.show_scene ~= nil then showScene = not not p.show_scene end
 end
 
 
@@ -417,9 +444,10 @@ local function drawTrackHull(veh, tr, col)
   if cls == 'pedestrian' or cls == 'ped' then L, W = 0.6, 0.6 end
   if cls == 'bicycle' or cls == 'bike' then L, W = 1.8, 0.6 end
   local cy, sy = math.cos(yaw), math.sin(yaw)
-  -- yaw 0 ≈ +Y forward in ego; build rear/front centers along heading
-  local rearX, rearY = x - (L * 0.5) * sy, y - (L * 0.5) * cy
-  local frontX, frontY = x + (L * 0.5) * sy, y + (L * 0.5) * cy
+  -- Tracker writes yaw as the ego-frame angle from +X, so pi/2 is straight ahead
+  -- (python/perception/detect.py defaults to 1.57). Heading is (cos, sin), not (sin, cos).
+  local rearX, rearY = x - (L * 0.5) * cy, y - (L * 0.5) * sy
+  local frontX, frontY = x + (L * 0.5) * cy, y + (L * 0.5) * sy
   local pA = pos + right * rearX + fwd * rearY + up * Z_BIAS
   local pB = pos + right * frontX + fwd * frontY + up * Z_BIAS
   local aF = pA.toFloat3 and pA:toFloat3() or pA
@@ -431,8 +459,8 @@ local function drawTrackHull(veh, tr, col)
     drew = ok
   end
   if not drew and d.drawLine then
-    -- 4 footprint lines + short vertical edge
-    local hx, hy = (W * 0.5) * cy, (W * 0.5) * sy
+    -- 4 footprint lines + short vertical edge (half width along the heading normal)
+    local hx, hy = (W * 0.5) * sy, -(W * 0.5) * cy
     local corners = {
       {rearX - hx, rearY - hy}, {rearX + hx, rearY + hy},
       {frontX + hx, frontY + hy}, {frontX - hx, frontY - hy},
@@ -495,30 +523,53 @@ end
 
 local lastBeatMono = nil
 local lastBeatMtime = nil
+local hbCoarse = false   -- true when only heartbeat_unix (1 s resolution) is available
+local hbKnown = false
+
+local function noteHeartbeat(st)
+  -- High-res path: Python heartbeat_mtime; age via os.clock since the beat last advanced.
+  -- Fallback: heartbeat_unix (1 s resolution) → extra slack.
+  if not st then return end
+  local mt = tonumber(st.heartbeat_mtime)
+  local coarse = false
+  if mt == nil then
+    mt = tonumber(st.heartbeat_unix)
+    coarse = true
+  end
+  if mt == nil then return end
+  hbKnown = true
+  hbCoarse = coarse
+  if lastBeatMtime == nil or mt > lastBeatMtime + 1e-6 or mt < lastBeatMtime - 2.0 then
+    -- forward = new beat; far backwards = the file was replaced (restart / restored old state),
+    -- so trust the file over our own history and let the wall-clock check below judge it.
+    lastBeatMtime = mt
+    lastBeatMono = os.clock()
+  end
+end
+
+local function hbLimitS()
+  return hbCoarse and (1 + HB_STALE_S) or HB_STALE_S
+end
+
+local function hbAgeS()
+  -- nil = no heartbeat field at all (treat as alive, matches pre-M5 states)
+  if not hbKnown or lastBeatMono == nil then return nil end
+  local mono = os.clock() - lastBeatMono
+  -- A state file left over from a past session must read stale on the first poll, not fresh.
+  if lastBeatMtime and lastBeatMtime > 1e9 then
+    local wall = nowUnix() - lastBeatMtime
+    if wall > 2.0 then return wall end
+  end
+  if mono < 0 then return 0 end
+  return mono
+end
 
 local function heartbeatAlive(st, dt)
-  -- High-res path: Python heartbeat_mtime; we treat "fresh poll of newer/same recent beat" via os.clock.
-  -- Fallback: heartbeat_unix vs os.time() with 1 s slack (os.time resolution).
   if not st then return true end
-  if st.heartbeat_mtime ~= nil then
-    local mt = tonumber(st.heartbeat_mtime)
-    if mt and (lastBeatMtime == nil or mt >= lastBeatMtime - 1e-6) then
-      if lastBeatMtime == nil or mt > lastBeatMtime + 1e-6 then
-        lastBeatMtime = mt
-        lastBeatMono = os.clock()
-      end
-    end
-    if lastBeatMono == nil then
-      lastBeatMono = os.clock()
-    end
-    local age = os.clock() - lastBeatMono
-    local alive = age <= HB_STALE_S
-    if not alive then fadeAcc = fadeAcc + (dt or 0.016) else fadeAcc = 0 end
-    return alive
-  end
-  if st.heartbeat_unix == nil then return true end
-  local age = nowUnix() - (tonumber(st.heartbeat_unix) or nowUnix())
-  local alive = age <= (1 + HB_STALE_S)
+  noteHeartbeat(st)
+  local age = hbAgeS()
+  if age == nil then return true end
+  local alive = age <= hbLimitS()
   if not alive then fadeAcc = fadeAcc + (dt or 0.016) else fadeAcc = 0 end
   return alive
 end
@@ -582,33 +633,183 @@ function M.drawPath(dt)
   end
 end
 
-local function pushStrip()
-  if not lastGood then return end
-  local pl = lastGood.planner or {}
-  local mode = tostring(lastGood.policy or 'modular')
-  if engaged then mode = mode .. '|ON' else mode = mode .. '|OFF' end
-  local hz = tonumber(lastGood.loop_hz) or 0
+local function r2(v)
+  local n = tonumber(v)
+  if n == nil then return nil end
+  return math.floor(n * 100 + 0.5) / 100
+end
+
+local function uiPathPoints(st)
+  local src = st and st.path_ego
+  if type(src) ~= 'table' or #src < 2 then return nil end
+  local step = math.max(1, math.floor(#src / UI_PATH_PTS))
+  local out = {}
+  for i = 1, #src, step do
+    local p = src[i]
+    out[#out + 1] = { x = r2(p.x or p[1] or 0), y = r2(p.y or p[2] or 0) }
+    if #out >= UI_PATH_PTS then break end
+  end
+  if #out < 2 then return nil end
+  return out
+end
+
+local function uiTracks(st)
+  local src = st and st.tracks
+  if type(src) ~= 'table' or #src == 0 then return nil end
+  local cipv = nil
+  if st.planner and st.planner.cipv_id ~= nil then cipv = tonumber(st.planner.cipv_id) end
+  local out = {}
+  for _, tr in ipairs(src) do
+    if #out >= UI_TRACKS then break end
+    local id = tonumber(tr.id)
+    out[#out + 1] = {
+      id = id,
+      cls = tostring(tr['class'] or 'vehicle'),
+      x = r2(tr.x or 0),
+      y = r2(tr.y or 0),
+      yaw = r2(tr.yaw or tr.heading or 1.57),
+      v = r2(tr.speed_mps or 0),
+      lead = (cipv ~= nil and id ~= nil and id == cipv) or false,
+    }
+  end
+  return out
+end
+
+local function uiLanes(st)
+  local src = st and st.lanes_bev
+  if type(src) ~= 'table' then return nil end
+  local out = {}
+  for _, poly in ipairs(src) do
+    if #out >= UI_LANES then break end
+    if type(poly) == 'table' and #poly > 1 then
+      local step = math.max(1, math.floor(#poly / UI_LANE_PTS))
+      local pts = {}
+      for i = 1, #poly, step do
+        local p = poly[i]
+        pts[#pts + 1] = { x = r2(p.x or p[1] or 0), y = r2(p.y or p[2] or 0) }
+        if #pts >= UI_LANE_PTS then break end
+      end
+      if #pts > 1 then out[#out + 1] = pts end
+    end
+  end
+  if #out == 0 then return nil end
+  return out
+end
+
+local function uiCams(st)
+  local ch = st and st.cam_health
+  local ok, total = 0, 0
+  local list = {}
+  if type(ch) == 'table' then
+    for _, id in ipairs(CAM_IDS) do
+      local v = ch[id]
+      if v ~= nil then
+        total = total + 1
+        local s = tostring(v)
+        if s == 'ok' then ok = ok + 1 end
+        list[#list + 1] = { id = id, h = s }
+      end
+    end
+  end
+  return ok, total, list
+end
+
+local function linkState()
+  if not lastGood then return 'none' end
+  local age = hbAgeS()
+  if age == nil then return 'live' end
+  if age <= hbLimitS() then return 'live' end
+  return 'stale'
+end
+
+local function uiPayload()
+  local st = lastGood
+  local pl = (st and st.planner) or {}
+  local ego = (st and st.ego) or {}
+  local link = linkState()
+  local mode = tostring((st and st.policy) or 'modular')
+  local hz = tonumber(st and st.loop_hz) or 0
   local ttc = pl.ttc_lead
   local ttcS = (ttc == nil) and '--' or string.format('%.1f', tonumber(ttc) or 0)
-  local n = tonumber(lastGood.objects_n or lastGood.tracks_n) or 0
-  local line = string.format('GVD  %s  %.0fHz  TTC %s  N=%d', mode, hz, ttcS, n)
+  local n = tonumber((st and (st.tracks_n or st.objects_n))) or 0
+  local line
+  if st then
+    line = string.format('GVD  %s|%s  %.0fHz  TTC %s  N=%d', mode, engaged and 'ON' or 'OFF', hz, ttcS, n)
+  else
+    line = 'GVD  ' .. (engaged and 'ON' or 'OFF') .. '  no telemetry'
+  end
+  local camOk, camTotal, camList = uiCams(st)
 
+  return {
+    -- engage / safety
+    engaged = engaged,
+    link = link,                                   -- live | stale | none
+    hbAge = r2(hbAgeS()),
+    disengageReason = st and tostring(st.disengage_reason or 'none') or nil,
+    -- in-world viz toggles
+    showPath = showPath,
+    showGhosts = showAgentGhosts,
+    showScene = showScene,
+    -- policy (honest toys)
+    policy = st and mode or nil,
+    policyReq = policyReq,
+    e2eOk = st and (st.e2e_ok ~= false) or nil,
+    vetoReason = st and tostring(st.veto_reason or 'none') or nil,
+    e2eBackend = st and st.e2e_backend or nil,
+    -- driving numbers
+    hz = hz,
+    camHz = r2(st and st.camera_hz),
+    ttc = (ttc == nil) and nil or r2(ttc),
+    aeb = pl.aeb and tostring(pl.aeb) or nil,
+    n = n,
+    speed = r2(ego.speed_mps),
+    steerDeg = r2(ego.steer_deg),
+    pathConf = r2(st and st.path_conf),
+    pathWidth = r2(st and st.path_width),
+    pathPreview = st and (st.path_debug_preview ~= false) or nil,
+    laneConf = r2(st and st.lane_conf),
+    -- cameras (retail honesty: main only stays main only)
+    camBackend = st and st.capture_backend or nil,
+    camNote = st and st.capture_note or nil,
+    camOk = st and camOk or nil,
+    camTotal = st and camTotal or nil,
+    cams = st and camList or nil,
+    -- GVD VISION window (Python OpenCV second screen)
+    vizWindow = st and st.viz_window or nil,
+    vizScreen = st and st.viz_screen or nil,
+    vizNote = st and st.viz_note or nil,
+    vizScreenReq = vizScreenReq,
+    -- nerd-light
+    inferMs = r2(st and st.infer_ms),
+    rssMb = r2(st and st.rss_mb),
+    vramUsed = r2(st and st.gpu_vram_used_gb),
+    vramTotal = r2(st and st.gpu_vram_total_gb),
+    gpu = st and st.gpu_name or nil,
+    detector = st and st.detector or nil,
+    actuator = st and st.actuator or nil,
+    cmdApplied = st and st.cmd_applied or nil,
+    cmdReason = st and st.cmd_reason or nil,
+    clipTrigger = st and st.last_clip_trigger or nil,
+    encodeBackend = st and st.encode_backend or nil,
+    -- scene geometry (ego frame: x right, y forward), capped + rounded
+    path = (showScene and showPath) and uiPathPoints(st) or nil,
+    tracks = (showScene and showAgentGhosts) and uiTracks(st) or nil,
+    lanes = showScene and uiLanes(st) or nil,
+    mode = mode .. (engaged and '|ON' or '|OFF'),
+    text = line,
+  }
+end
+
+local function pushUi()
+  local p = uiPayload()
   if guihooks and guihooks.trigger then
     pcall(function()
-      guihooks.trigger('gvdStrip', { text = line, mode = mode, hz = hz, ttc = ttc, n = n, engaged = engaged })
-      guihooks.trigger('gvdUi', {
-        engaged = engaged,
-        showPath = showPath,
-        showGhosts = showAgentGhosts,
-        hz = hz,
-        ttc = ttc,
-        n = n,
-        mode = mode,
-        text = line,
-      })
+      guihooks.trigger('gvdStrip', { text = p.text, mode = p.mode, hz = p.hz, ttc = p.ttc, n = p.n, engaged = engaged })
+      guihooks.trigger('gvdUi', p)
     end)
   end
 
+  if not lastGood then return end
   -- Screen-adjacent draw if API exists (compact; not a nerd panel)
   local d = drawer()
   local veh = getPlayerVeh()
@@ -618,7 +819,7 @@ local function pushStrip()
     local anchor = pos + up * 2.2
     local af = anchor.toFloat3 and anchor:toFloat3() or anchor
     pcall(function()
-      d:drawTextAdvanced(af, line, color(200, 204, 212, 200), true, false, color(12, 13, 16, 140))
+      d:drawTextAdvanced(af, p.text, color(200, 204, 212, 200), true, false, color(12, 13, 16, 140))
     end)
   end
 end
@@ -632,6 +833,7 @@ local function pollState(dt)
   local st = decodeJson(raw)
   if not st then return end
   lastGood = st
+  noteHeartbeat(st)
   -- UI prefs win: if gvd_ui_prefs.json exists, do NOT apply path/ghosts from gvd_state
   -- (run_vision show_agent_ghosts=true would clobber "Show ghosts" off every tick).
   local prefsRaw = readText(userUiPrefsPath())
@@ -653,14 +855,23 @@ local function pollState(dt)
   end
 end
 
+local preRenderSeen = false
+
+local function tickPush(dt)
+  stripAcc = stripAcc + (dt or 0)
+  -- 10 Hz while the app draws the VISION scene, 4 Hz for the plain status strip
+  local every = (lastGood and showScene) and 0.10 or 0.25
+  if stripAcc >= every then
+    stripAcc = 0
+    pushUi()
+  end
+end
+
 function M.onPreRender(dt)
+  preRenderSeen = true
   pollState(dt)
   M.drawPath(dt)
-  stripAcc = stripAcc + (dt or 0)
-  if stripAcc >= 0.25 then
-    stripAcc = 0
-    pushStrip()
-  end
+  tickPush(dt)
 end
 
 function M.onDebugDraw(_focuspos)
@@ -672,6 +883,8 @@ end
 function M.onUpdate(dt)
   pollState(dt)
   applyCmdJson(dt)
+  -- Builds that never call onPreRender would otherwise leave the app with no data.
+  if not preRenderSeen then tickPush(dt) end
 end
 
 function M.onExtensionLoaded()
@@ -703,19 +916,50 @@ function M.toggleEngage()
   local state = engaged and 'ENGAGED' or 'DISENGAGED'
   log('I', 'GVD', '[GVD] ' .. state)
   print('[GVD] ' .. state)
-  pushStrip()
+  pushUi()
 end
 
 function M.setShowAgentGhosts(v)
   showAgentGhosts = not not v
   writeUiPrefs()
-  pushStrip()
+  pushUi()
 end
 
 function M.setShowPath(v)
   showPath = not not v
   writeUiPrefs()
-  pushStrip()
+  pushUi()
+end
+
+function M.setShowScene(v)
+  showScene = not not v
+  writeUiPrefs()
+  pushUi()
+end
+
+-- Session request for the Python supervisor: modular | e2e | shadow.
+-- The modular safety supervisor still vetoes E2E; this only picks which intent may be applied.
+function M.requestPolicy(p)
+  local want = sanitizePolicy(p)
+  if not want then return end
+  policyReq = want
+  writeUiPrefs()
+  log('I', 'GVD', '[GVD] policy request: ' .. want .. ' (applies while the Python supervisor is running)')
+  pushUi()
+end
+
+-- Session request: which monitor the Python GVD VISION window should sit on (auto|1|2|3).
+function M.requestVizScreen(s)
+  local want = sanitizeScreen(s)
+  if not want then return end
+  vizScreenReq = want
+  writeUiPrefs()
+  log('I', 'GVD', '[GVD] GVD VISION screen request: ' .. want)
+  pushUi()
+end
+
+function M.pushUiState()
+  pushUi()
 end
 
 function M.setEngaged(v)
@@ -743,6 +987,10 @@ end
 
 function M.getShowAgentGhosts()
   return showAgentGhosts
+end
+
+function M.getShowScene()
+  return showScene
 end
 
 M.onInit = onInit

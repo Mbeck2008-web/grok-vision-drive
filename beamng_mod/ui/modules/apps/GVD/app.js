@@ -503,7 +503,9 @@ angular.module('beamng.apps')
               }
             }
           } else {
-            var r = Math.max(5, 0.38 * scale);
+            // Flat-top octagon with a white rim and bar: a plain red disc on a post reads
+            // as a lit lamp, which is exactly the wrong thing for a sign to look like.
+            var r = Math.max(7, 0.45 * scale);
             ctx.beginPath();
             for (var k = 0; k < 8; k++) {
               var ang = Math.PI / 8 + k * Math.PI / 4;
@@ -511,15 +513,13 @@ angular.module('beamng.apps')
               if (k === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
             }
             ctx.closePath();
-            ctx.fillStyle = rgba([176, 74, 66], 0.85 * far);
+            ctx.fillStyle = rgba([176, 74, 66], 0.9 * far);
             ctx.fill();
-            ctx.strokeStyle = rgba(PAPER, 0.55 * far);
-            ctx.lineWidth = 1;
+            ctx.strokeStyle = rgba(PAPER, 0.8 * far);
+            ctx.lineWidth = Math.max(1.2, r * 0.16);
             ctx.stroke();
-            if (r > 6) {
-              ctx.fillStyle = rgba(PAPER, 0.85 * far);
-              ctx.fillRect(top[0] - r * 0.5, top[1] - r * 1.08, r, Math.max(1, r * 0.16));
-            }
+            ctx.fillStyle = rgba(PAPER, 0.92 * far);
+            ctx.fillRect(top[0] - r * 0.52, top[1] - r * 1.1, r * 1.04, Math.max(1.5, r * 0.2));
           }
         }
       }

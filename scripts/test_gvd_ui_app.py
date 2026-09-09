@@ -110,8 +110,9 @@ def _check_road_model() -> None:
     from python.perception.road_model import LANE_CONF_MIN, lanes_ext, road_edges
 
     assert coco_class_name(9) == "traffic_light" and coco_class_name(11) == "stop_sign"
+    assert coco_class_name(10) == "pole" and coco_class_name(12) == "pole"
     assert coco_class_name(2) == "vehicle" and coco_class_name(63) is None
-    assert set(STATIC_CLASSES) == {"traffic_light", "stop_sign"}
+    assert set(STATIC_CLASSES) == {"traffic_light", "stop_sign", "pole"}
 
     lanes = [[{"x": -1.8, "y": y} for y in range(2, 30, 4)],
              [{"x": 1.8, "y": y} for y in range(2, 30, 4)]]

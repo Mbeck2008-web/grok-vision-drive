@@ -845,6 +845,8 @@ local function uiPayload()
     aeb = pl.aeb and tostring(pl.aeb) or nil,
     n = n,
     speed = r2(ego.speed_mps),
+    targetV = r2(pl.target_v),          -- app draws slow-down chevrons off these two
+    brakeCmd = r2(ego.brake),
     steerDeg = r2(ego.steer_deg),
     pathConf = r2(st and st.path_conf),
     pathWidth = r2(st and st.path_width),

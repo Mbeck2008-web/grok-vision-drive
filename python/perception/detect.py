@@ -16,9 +16,10 @@ COCO_PERSON = {0}
 COCO_BIKE = {1}
 COCO_TRAFFIC_LIGHT = {9}
 COCO_STOP_SIGN = {11}
+COCO_POLE = {10, 12}  # fire hydrant, parking meter — the pole-like street furniture COCO knows
 # Road furniture: detected like anything else, but never tracked or offered to CIPV/AEB —
 # a stop sign is not a lead vehicle. The pipeline routes these to state["signs"].
-STATIC_CLASSES = ("traffic_light", "stop_sign")
+STATIC_CLASSES = ("traffic_light", "stop_sign", "pole")
 
 
 def coco_class_name(cls_id: int) -> str | None:
@@ -32,6 +33,8 @@ def coco_class_name(cls_id: int) -> str | None:
         return "traffic_light"
     if cls_id in COCO_STOP_SIGN:
         return "stop_sign"
+    if cls_id in COCO_POLE:
+        return "pole"
     return None
 
 

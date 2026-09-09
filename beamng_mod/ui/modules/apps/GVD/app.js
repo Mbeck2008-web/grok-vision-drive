@@ -16,16 +16,18 @@ angular.module('beamng.apps')
       // Same palette as the OpenCV GVD VISION window (python/viz/stage.py).
       var VOID = '#07080a';
       var ICE = [158, 196, 212];
+      var ICE_HI = [214, 238, 250];
+      var IN_PATH = [120, 190, 226];   // a road user standing in our corridor lights up
       var CORRIDOR = [90, 167, 199];
       var PAPER = [232, 230, 225];
       var GHOST = [170, 200, 210];
       var PED = [215, 176, 138];
       var BIKE = [224, 184, 90];
-      var EGO_BODY = [86, 98, 110];
+      var EGO_BODY = [64, 74, 84];
 
       // Chase camera: ego centred at ~80% height, horizon at ~25%.
-      var EYE = [0, -9.5, 4.70];
-      var TARGET = [0, 14.95, -0.50];
+      var EYE = [0, -11.0, 5.44];
+      var TARGET = [0, 13.45, 0.24];
       var VFOV = 46 * Math.PI / 180;
       var FPS_LIVE = 24;
       var FPS_IDLE = 6;
@@ -37,6 +39,7 @@ angular.module('beamng.apps')
         showPath: true, showGhosts: false, showScene: true,
         policy: null, policyReq: null, e2eOk: null, vetoReason: null, e2eBackend: null,
         hz: null, camHz: null, ttc: null, aeb: null, n: null, speed: null,
+        targetV: null, brakeCmd: null,
         pathConf: null, pathWidth: null, pathPreview: null, laneConf: null,
         camBackend: null, camNote: null, camOk: null, camTotal: null,
         vizWindow: null, vizScreen: null, vizNote: null, vizScreenReq: null,
@@ -50,7 +53,7 @@ angular.module('beamng.apps')
       var TELEMETRY = [
         'hz', 'camHz', 'ttc', 'aeb', 'n', 'speed', 'pathConf', 'pathWidth', 'pathPreview',
         'laneConf', 'policy', 'e2eOk', 'vetoReason', 'e2eBackend', 'camBackend', 'camNote',
-        'camOk', 'camTotal', 'vizWindow', 'vizScreen', 'vizNote', 'inferMs', 'rssMb',
+        'targetV', 'brakeCmd', 'camOk', 'camTotal', 'vizWindow', 'vizScreen', 'vizNote', 'inferMs', 'rssMb',
         'vramUsed', 'vramTotal', 'gpu', 'detector', 'actuator', 'cmdApplied', 'cmdReason',
         'cmdSeq', 'cmdAckSeq', 'egoSource', 'clipTrigger', 'encodeBackend', 'disengageReason'
       ];
@@ -117,6 +120,14 @@ angular.module('beamng.apps')
         return ui.actuator === 'beamngpy' && ui.cmdApplied === true;
       }
       scope.driving = driving;
+      // Chevrons only when the plan really is slowing: AEB, a brake command, or a target
+      // speed under what we are doing. No signal, no chevrons.
+      function slowing() {
+        if (ui.link !== 'live') return false;
+        if (ui.aeb === 'brake' || ui.aeb === 'warn') return true;
+        if (ui.brakeCmd != null && ui.brakeCmd > 0.05) return true;
+        return ui.targetV != null && ui.speed != null && ui.targetV < ui.speed - 0.6;
+      }
       scope.rootClass = function () {
         return {
           'is-engaged': ui.engaged && ui.link === 'live',
@@ -182,8 +193,11 @@ angular.module('beamng.apps')
         if (stub) bits.push(stub + ' stub');
         bits = bits.length ? ['lanes ' + bits.join('+')] : ['no lane paint'];
         if (angular.isArray(ui.edges) && ui.edges.length) bits.push('edges pred');
-        var signs = angular.isArray(ui.signs) ? ui.signs.length : 0;
+        var signs = 0, poles = 0;
+        var sl = angular.isArray(ui.signs) ? ui.signs : [];
+        for (var k = 0; k < sl.length; k++) { if (sl[k].cls === 'pole') poles++; else signs++; }
         if (signs) bits.push(signs + ' sign' + (signs === 1 ? '' : 's'));
+        if (poles) bits.push(poles + ' pole' + (poles === 1 ? '' : 's'));
         return bits.join(' · ');
       };
       scope.segClass = function (p) {
@@ -464,17 +478,22 @@ angular.module('beamng.apps')
         for (var i = 0; i < sorted.length; i++) {
           var s = sorted[i];
           var light = s.cls === 'traffic_light';
-          var h = light ? 3.2 : 2.1;
+          var pole = s.cls === 'pole';
+          var h = light ? 3.2 : (pole ? 1.1 : 2.1);
           var far = Math.max(0.2, Math.min(1, 1 - ((s.y || 0) - 30) / 25));
           var scale = pxPerMeter(s.y || 10);
           var top = P(s.x || 0, s.y || 0, h);
           var foot = P(s.x || 0, s.y || 0, 0);
-          ctx.strokeStyle = rgba([120, 128, 136], 0.5 * far);
-          ctx.lineWidth = Math.max(1, 0.06 * scale);
+          ctx.strokeStyle = rgba([120, 128, 136], (pole ? 0.75 : 0.5) * far);
+          ctx.lineWidth = Math.max(1, (pole ? 0.14 : 0.06) * scale);
           ctx.beginPath();
           ctx.moveTo(foot[0], foot[1]);
           ctx.lineTo(top[0], top[1]);
           ctx.stroke();
+          if (pole) {
+            // street furniture: a short grey stick, no plate to read
+            continue;
+          }
           if (light) {
             var w = Math.max(6, 0.34 * scale), hh = Math.max(15, 0.95 * scale);
             ctx.fillStyle = rgba([26, 31, 36], 0.92 * far);
@@ -533,6 +552,32 @@ angular.module('beamng.apps')
         ctx.fillRect(0, Math.max(0, horizonY - 6), cw, ch * 0.34);
       }
 
+      // Chevrons inside the corridor while the plan is slowing (target speed below the
+      // current speed, a brake command, or AEB). Everything here is a state value.
+      function drawChevrons(ctx, left, right, mid, fade, phase) {
+        var n = mid.length;
+        if (n < 5) return;
+        for (var c = 0; c < 4; c++) {
+          var t = ((c / 4) + phase) % 1;
+          var i = Math.floor(t * (n - 3)) + 1;
+          if (i < 1 || i + 1 >= n) continue;
+          var b = mid[i];
+          var dx = mid[i + 1][0] - mid[i - 1][0], dy = mid[i + 1][1] - mid[i - 1][1];
+          var w = Math.hypot(right[i][0] - left[i][0], right[i][1] - left[i][1]) * 0.34;
+          if (w < 2) continue;
+          var l = Math.hypot(dx, dy) || 1;
+          var nx = -dy / l, ny = dx / l;
+          ctx.beginPath();
+          ctx.moveTo(b[0] - nx * w, b[1] - ny * w);
+          ctx.lineTo(b[0] + dx * 0.5, b[1] + dy * 0.5);
+          ctx.lineTo(b[0] + nx * w, b[1] + ny * w);
+          ctx.strokeStyle = rgba(ICE_HI, 0.6 * (fade[i] || 0.5));
+          ctx.lineWidth = 1.8;
+          ctx.lineJoin = 'round';
+          ctx.stroke();
+        }
+      }
+
       function drawCorridor(ctx, path, halfW, conf, preview) {
         if (!path || path.length < 2) return;
         var left = [], right = [], mid = [], fade = [];
@@ -554,22 +599,28 @@ angular.module('beamng.apps')
           mid.push(P(p.x, p.y, 0.03));
           fade.push(dist <= PATH_FADE_START ? 1 : Math.max(0, 1 - (dist - PATH_FADE_START) / (PATH_FADE_END - PATH_FADE_START)));
         }
+        // Luminous body: brighter near the car, dissolving with distance and confidence.
         for (var s = 0; s < left.length - 1; s++) {
-          var a = 0.52 * Math.max(0.2, conf) * (0.55 * fade[s] + 0.45 * fade[s + 1]);
+          var near = 1 - s / Math.max(1, left.length - 1);
+          var a = (0.30 + 0.42 * near) * Math.max(0.2, conf) * (0.55 * fade[s] + 0.45 * fade[s + 1]);
           if (a < 0.02) continue;
           poly(ctx, [left[s], left[s + 1], right[s + 1], right[s]]);
           ctx.fillStyle = rgba(CORRIDOR, a);
           ctx.fill();
         }
+        ctx.save();
+        ctx.shadowColor = rgba(ICE, 0.85);
+        ctx.shadowBlur = 7;
         ctx.setLineDash(preview ? [5, 4] : []);
         for (var e = 0; e < left.length - 1; e++) {
-          ctx.strokeStyle = rgba(ICE, 0.7 * fade[e]);
-          ctx.lineWidth = 1.4;
+          ctx.strokeStyle = rgba(ICE_HI, 0.8 * fade[e]);
+          ctx.lineWidth = 1.5;
           ctx.beginPath();
           ctx.moveTo(left[e][0], left[e][1]); ctx.lineTo(left[e + 1][0], left[e + 1][1]);
           ctx.moveTo(right[e][0], right[e][1]); ctx.lineTo(right[e + 1][0], right[e + 1][1]);
           ctx.stroke();
         }
+        ctx.restore();
         ctx.setLineDash([4, 5]);
         ctx.strokeStyle = rgba(ICE, 0.30);
         ctx.lineWidth = 1;
@@ -579,6 +630,8 @@ angular.module('beamng.apps')
         }
         ctx.stroke();
         ctx.setLineDash([]);
+        if (slowing()) drawChevrons(ctx, left, right, mid, fade, chevronPhase);
+        return mid;
       }
 
       // yaw is the ego-frame heading angle from +X (π/2 = straight ahead), as written by the tracker.
@@ -595,10 +648,10 @@ angular.module('beamng.apps')
           var py = y + hy * hl * signs[i][0] + sy * hw * signs[i][1];
           base.push(P(px, py, 0));
           top.push(P(px, py, H));
-          shadow.push(P(x + (px - x) * 1.18, y + (py - y) * 1.18, 0));
+          shadow.push(P(x + (px - x) * 1.12, y + (py - y) * 1.12, 0));
         }
         poly(ctx, shadow);
-        ctx.fillStyle = 'rgba(0,0,0,' + (0.42 * alpha).toFixed(3) + ')';
+        ctx.fillStyle = 'rgba(0,0,0,' + (0.3 * alpha).toFixed(3) + ')';
         ctx.fill();
 
         // convex box: keep only faces whose outward normal points at the camera, far ones first
@@ -636,6 +689,64 @@ angular.module('beamng.apps')
         return [4.2, 1.8, 1.5, GHOST];
       }
 
+      // "In our path" = inside the corridor we are actually driving, measured against the
+      // planner's own polyline. Not a guess: no corridor means nobody is highlighted.
+      function inPath(t) {
+        if (!smoothPath || smoothPath.length < 2) return false;
+        var half = Math.max(0.9, (ui.pathWidth || 2.0) * 0.5) + 0.45;
+        var tx = t.x || 0, ty = t.y || 0;
+        for (var i = 0; i < smoothPath.length; i++) {
+          var p = smoothPath[i];
+          if (Math.abs(p.y - ty) > 2.5) continue;
+          if (Math.abs(p.x - tx) <= half) return true;
+        }
+        return false;
+      }
+
+      // Upright figure rather than a crate: a pedestrian box reads as a bollard.
+      function drawPedestrian(ctx, t, alpha, hot) {
+        var col = hot ? IN_PATH : PED;
+        var scale = pxPerMeter(t.y || 10);
+        var foot = P(t.x || 0, t.y || 0, 0);
+        var headC = P(t.x || 0, t.y || 0, 1.62);
+        var shoulder = P(t.x || 0, t.y || 0, 1.35);
+        var hip = P(t.x || 0, t.y || 0, 0.85);
+        var bodyW = Math.max(2.4, 0.42 * scale);
+        var headR = Math.max(1.6, 0.15 * scale);
+        poly(ctx, [
+          [shoulder[0] - bodyW / 2, shoulder[1]], [shoulder[0] + bodyW / 2, shoulder[1]],
+          [hip[0] + bodyW * 0.42, hip[1]], [foot[0] + bodyW * 0.30, foot[1]],
+          [foot[0] - bodyW * 0.30, foot[1]], [hip[0] - bodyW * 0.42, hip[1]]
+        ]);
+        ctx.fillStyle = rgba(col, 0.82 * alpha);
+        ctx.fill();
+        ctx.strokeStyle = rgba(hot ? ICE_HI : PAPER, 0.5 * alpha);
+        ctx.lineWidth = 0.9;
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(headC[0], headC[1], headR, 0, Math.PI * 2);
+        ctx.fillStyle = rgba(col, 0.95 * alpha);
+        ctx.fill();
+        ctx.stroke();
+      }
+
+      function drawVehicleBody(ctx, t, alpha, hot) {
+        var col = hot ? IN_PATH : GHOST;
+        var yaw = (t.yaw === undefined || t.yaw === null) ? Math.PI / 2 : t.yaw;
+        var stroke = hot ? ICE_HI : PAPER;
+        if (hot) {
+          ctx.save();
+          ctx.shadowColor = rgba(ICE, 0.9);
+          ctx.shadowBlur = 8;
+        }
+        drawBox(ctx, t.x || 0, t.y || 0, yaw, 4.2, 1.82, 0.85, col, alpha, stroke, hot ? 1.2 : 0.7);
+        // cabin, inset and shifted back: enough to read as a car instead of a crate
+        var hx = Math.cos(yaw), hy = Math.sin(yaw);
+        drawBox(ctx, (t.x || 0) - hx * 0.25, (t.y || 0) - hy * 0.25, yaw,
+          2.1, 1.55, 1.42, shade(col, 1.18), alpha, stroke, hot ? 1.2 : 0.7);
+        if (hot) ctx.restore();
+      }
+
       function drawTracks(ctx, tracks) {
         if (!tracks || !tracks.length) return;
         var sorted = tracks.slice().sort(function (a, b) { return (b.y || 0) - (a.y || 0); });
@@ -644,12 +755,20 @@ angular.module('beamng.apps')
           var d = trackDims(t.cls);
           var far = Math.max(0.18, Math.min(1, 1 - ((t.y || 0) - 30) / 25));
           var lead = !!t.lead;
-          drawBox(ctx, t.x || 0, t.y || 0, (t.yaw === undefined || t.yaw === null) ? Math.PI / 2 : t.yaw,
-            d[0], d[1], d[2], lead ? ICE : d[3], (lead ? 0.72 : 0.5) * far * (t.a === undefined ? 1 : t.a),
-            lead ? ICE : PAPER, lead ? 1.4 : 0.7);
+          var hot = lead || inPath(t);
+          var alpha = (hot ? 0.8 : 0.62) * far * (t.a === undefined ? 1 : t.a);
+          var ped = t.cls === 'pedestrian' || t.cls === 'ped';
+          if (ped) {
+            drawPedestrian(ctx, t, alpha, hot);
+          } else if (t.cls === 'bicycle' || t.cls === 'bike') {
+            drawBox(ctx, t.x || 0, t.y || 0, (t.yaw === undefined || t.yaw === null) ? Math.PI / 2 : t.yaw,
+              d[0], d[1], d[2], hot ? IN_PATH : BIKE, alpha, hot ? ICE_HI : PAPER, 0.8);
+          } else {
+            drawVehicleBody(ctx, t, alpha, hot);
+          }
           if (lead) {
-            var tag = P(t.x || 0, t.y || 0, d[2] + 0.55);
-            ctx.fillStyle = rgba(ICE, 0.9);
+            var tag = P(t.x || 0, t.y || 0, (ped ? 1.9 : 1.6) + 0.5);
+            ctx.fillStyle = rgba(ICE_HI, 0.95);
             ctx.font = '9px Consolas, monospace';
             ctx.textAlign = 'center';
             ctx.fillText('LEAD', tag[0], tag[1]);
@@ -668,13 +787,14 @@ angular.module('beamng.apps')
           ctx.fillStyle = g;
           ctx.beginPath(); ctx.arc(c[0], c[1], Math.max(6, r), 0, Math.PI * 2); ctx.fill();
         }
-        drawBox(ctx, 0, 0, Math.PI / 2, 4.4, 1.85, 0.78, EGO_BODY, 1, [128, 142, 156], 0.8);
-        drawBox(ctx, 0, -0.25, Math.PI / 2, 2.2, 1.58, 1.32, shade(EGO_BODY, 1.22), 1, [128, 142, 156], 0.8);
+        drawBox(ctx, 0, 0, Math.PI / 2, 4.4, 1.85, 0.66, EGO_BODY, 1, [122, 136, 150], 0.8);
+        drawBox(ctx, 0, -0.3, Math.PI / 2, 1.95, 1.44, 1.22, shade(EGO_BODY, 1.25), 1, [122, 136, 150], 0.8);
       }
 
       // -------------------------------------------------- smoothing + frame
       var smoothTracks = {};
       var smoothPath = null;
+      var chevronPhase = 0;
       var sceneDirty = true;
 
       function lerp(a, b, k) { return a + (b - a) * k; }
@@ -760,6 +880,7 @@ angular.module('beamng.apps')
         if (w !== cw || h !== ch) sizeChanged(w, h);
 
         var tracks = smooth(dt);
+        chevronPhase = (chevronPhase + dt * 0.5) % 1;
         ctx.fillStyle = VOID;
         ctx.fillRect(0, 0, w, h);
         ctx.globalAlpha = ui.link === 'stale' ? 0.55 : 1;

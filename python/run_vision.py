@@ -479,7 +479,7 @@ def main() -> None:
                 engaged = False
                 disengage_reason = ovr.reason
                 write_engage_flag(False, disengage_reason=ovr.reason)
-                print(f"[GVD] DISENGAGED: {ovr.reason}")
+                print(f"[GVD] DISENGAGED: {ovr.reason}", flush=True)
                 # Gate reason rides along on the bus so the mod / nerd panel name it, not just
                 # the generic not_engaged the following ticks write.
                 cmd = stop_command(seq=cmd_seq, reason=ovr.reason)

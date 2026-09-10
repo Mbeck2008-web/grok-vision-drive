@@ -191,3 +191,5 @@ Lua (`gvd_main.applyCmdJson`, 20 Hz): `input.event('steering', s, 1)`; `input.ev
 
 Retail (`capture_backend=window`): `actuator=cmd_json`; `cmd_applied` follows the ack. Boot line: `backend=window cams=1/8 path=retail (1 window capture; not 8; drive=gvd_cmd.json->mod Lua)`.
 
+Stub/`--smoke` have no live Lua. They may write the same `gvd_ego.json` echo after a successful `gvd_cmd.json` write (`CmdJsonActuator(simulate_ack=True)`) so `cmd_applied` still means "acked via the file bus", not "we wrote a cmd". A fresh harness or live echo is left alone. Window and BeamNGpy never invent an ack. `GVD_SIMULATE_LUA_ACK=0` disables the stub stand-in.
+

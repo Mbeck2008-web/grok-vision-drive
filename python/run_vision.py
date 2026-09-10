@@ -13,12 +13,15 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from python.control.actuate import (
+    CmdJsonActuator,
+    DriveCommand,
     attach_electrics,
     make_actuator,
     read_ego_feedback,
     read_electrics_inputs,
     read_engage_flag,
     stop_command,
+    want_simulated_lua_ack,
     write_engage_flag,
 )
 from python.control.e2e import make_e2e
@@ -272,7 +275,6 @@ def main() -> None:
         # M5 fields to it, instead of replacing it with a blank default_state.
         st = read_state() or default_state()
         st["policy"] = args.policy
-        st["engaged"] = False
         st["shadow"] = {
             "steer": tick.shadow.get("steer", 0.0),
             "throttle": tick.shadow.get("throttle", 0.0),
@@ -281,11 +283,30 @@ def main() -> None:
         st["e2e_ok"] = bool(tick.e2e_ok)
         st["veto_reason"] = tick.veto_reason
         st["e2e_backend"] = e2e.backend
+        # No live Lua on --smoke. Play the file-ack role so cmd_applied follows the
+        # same gvd_ego.json contract (written + simulated ack), never a silent write.
+        act = CmdJsonActuator(simulate_ack=True)
+        act.note_engaged(True)
+        applied = act.apply(DriveCommand(steer=0.0, throttle=0.12, brake=0.0, seq=1, reason="ok"))
+        st["engaged"] = True
+        st["actuator"] = act.name
+        st["cmd_seq"] = int(applied.seq)
+        st["cmd_reason"] = applied.reason
+        st["cmd_applied"] = bool(applied.applied)
+        st["cmd_ack_seq"] = int(applied.seq) if applied.applied else -1
+        st["lua_applying"] = bool(applied.applied)
+        st["ego_source"] = "lua" if applied.applied else "none"
         write_state(st)
+        # Do not leave a smoke session holding Alt+A for a later live game.
+        write_engage_flag(False, disengage_reason="smoke")
         print(f"[GVD] smoke frame -> {out}")
         print(f"[GVD] state -> {state_path()}")
         print(f"[GVD] clip dry-run -> {path} trigger={rec.last_clip_trigger} enc={rec.encoder}")
         print(f"[GVD] M5 policy={args.policy} e2e={e2e.name} shadow={st['shadow']} veto={st['veto_reason']}")
+        print(
+            f"[GVD] smoke cmd_json: simulated Lua ack (gvd_ego.json) "
+            f"cmd_applied={st['cmd_applied']} reason={st['cmd_reason']} — not a live apply"
+        )
         return
 
     backend_name = resolve_backend_name(None if args.backend == "auto" else args.backend)
@@ -309,7 +330,8 @@ def main() -> None:
     bng = getattr(backend, "bng", None)
     if vehicle is not None:
         attach_electrics(vehicle, bng)
-    actuator = make_actuator(vehicle, prefer_beamngpy=True)
+    simulate_ack = want_simulated_lua_ack(getattr(backend, "name", backend_name))
+    actuator = make_actuator(vehicle, prefer_beamngpy=True, simulate_ack=simulate_ack)
     e2e_policy = make_e2e()
     shadow_cfg = load_shadow_config(_ctrl_yaml)
     override_cfg = load_override_config(_ctrl_yaml)
@@ -336,6 +358,11 @@ def main() -> None:
             "(input.event steering/throttle/brake). Ego speed/inputs echo back via gvd_ego.json; "
             "cmd_applied is claimed only on a fresh Lua ack."
         )
+        if simulate_ack:
+            print(
+                "[GVD] stub/offline Lua ack: after each gvd_cmd.json write, gvd_ego.json is echoed "
+                "in-process when no fresh live/harness ack is present. Not a live Lua apply."
+            )
     print(f"[GVD] M5 policy={args.policy} e2e={e2e_policy.name} (modular vetoes E2E; shadow writes both)")
     print(f"[GVD] clip encoder={recorder.encoder} (qsv prefer; never default nvenc)")
     print(f"[GVD] state path: {state_path()}")

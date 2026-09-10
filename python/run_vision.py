@@ -24,9 +24,16 @@ from python.control.actuate import (
 from python.control.e2e import make_e2e
 from python.data.record import ClipRecorder, choose_encoder
 from python.perception.pipeline import ModularPerception
+from python.perception.road_model import lanes_ext, road_edges
 from python.runtime.hw_probe import probe, refuse_live_start
 from python.runtime.shadow import load_shadow_config, shadow_tick
-from python.runtime.state_io import default_state, state_path, steer_preview_path_ego, write_state
+from python.runtime.state_io import (
+    default_state,
+    read_state,
+    state_path,
+    steer_preview_path_ego,
+    write_state,
+)
 from python.sensors.cameras import make_backend, resolve_backend_name
 from python.viz.monitors import place_opencv_window
 from python.viz.stage import VizUI, render_stage, smoke
@@ -139,6 +146,43 @@ def _read_ui_prefs() -> dict:
         return {}
 
 
+def _forecast_agents(tracks: list, max_agents: int = 6, stride: int = 3) -> list[dict]:
+    """Mode-0 constant-yaw-rate fans for the in-game scene (same toy math as the OpenCV view)."""
+    if not tracks:
+        return []
+    try:
+        from python.viz.forecast import predict_modes
+    except Exception:
+        return []
+    out: list[dict] = []
+    for tr in tracks[:max_agents]:
+        try:
+            if float(tr.get("speed_mps", 0.0)) < 0.5:
+                continue  # a parked car's fan is just noise on screen
+            modes = predict_modes(tr, max_modes=1)
+            if not modes:
+                continue
+            pts = modes[0]["points"][::stride]
+            if len(pts) < 2:
+                continue
+            out.append({
+                "id": tr.get("id"),
+                "path_ego": [{"x": round(float(px), 2), "y": round(float(py), 2)} for px, py in pts],
+            })
+        except Exception:
+            continue
+    return out
+
+
+def _ui_request_is_live(prefs: dict, start_unix: float) -> bool:
+    """In-game policy / screen picks apply to the running session only, so a pref left
+    over from a past session never silently overrides --policy at launch."""
+    try:
+        return float(prefs.get("mtime") or 0) >= start_unix - 1.5
+    except Exception:
+        return False
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="GVD supervisor + M2/M3/M4/M5")
     ap.add_argument("--viz", action="store_true")
@@ -219,7 +263,11 @@ def main() -> None:
             wide_bgr=fake,
             cfg=cfg,
         )
-        st = default_state(policy=args.policy, engaged=False)
+        # Keep the perception smoke state (tracks, lanes, signs, stub road model) and add the
+        # M5 fields to it, instead of replacing it with a blank default_state.
+        st = read_state() or default_state()
+        st["policy"] = args.policy
+        st["engaged"] = False
         st["shadow"] = {
             "steer": tick.shadow.get("steer", 0.0),
             "throttle": tick.shadow.get("throttle", 0.0),
@@ -292,13 +340,17 @@ def main() -> None:
 
     ui = VizUI()
     win = "GVD VISION" if args.viz else None
+    viz_screen_active = str(args.viz_screen)
+    viz_note = ""
     if win:
         import cv2
 
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(win, 1280, 800)
-        place_opencv_window(win, screen=args.viz_screen, fullscreen=bool(args.viz_fullscreen))
+        viz_note = place_opencv_window(win, screen=args.viz_screen, fullscreen=bool(args.viz_fullscreen))
 
+    session_start = time.time()
+    policy_active = args.policy
     frame_i = 0
     cmd_seq = 0
     cam_hz_ema = 0.0
@@ -307,6 +359,21 @@ def main() -> None:
     try:
         while True:
             loop_t0 = time.perf_counter()
+
+            # In-game GVD app requests ride on the existing prefs file (no second bus).
+            prefs = _read_ui_prefs()
+            if _ui_request_is_live(prefs, session_start):
+                want_policy = str(prefs.get("policy") or "").lower()
+                if want_policy in ("modular", "e2e", "shadow") and want_policy != policy_active:
+                    policy_active = want_policy
+                    print(f"[GVD] policy -> {policy_active} (in-game GVD app; modular veto unchanged)")
+                want_screen = str(prefs.get("viz_screen") or "").strip().lower()
+                if win is not None and want_screen and want_screen != viz_screen_active:
+                    viz_screen_active = want_screen
+                    viz_note = place_opencv_window(
+                        win, screen=want_screen, fullscreen=bool(args.viz_fullscreen)
+                    )
+
             bundle = backend.grab()
             main = bundle.main_bgr()
             now = time.perf_counter()
@@ -349,7 +416,7 @@ def main() -> None:
                 wide = None
 
             tick = shadow_tick(
-                policy=args.policy,
+                policy=policy_active,
                 engaged=engaged,
                 heartbeat_ok=heartbeat_ok,
                 path_debug_preview=bool(pout.path_debug_preview),
@@ -408,7 +475,7 @@ def main() -> None:
             st = default_state(
                 engaged=engaged,
                 disengage_reason=disengage_reason,
-                policy=args.policy,
+                policy=policy_active,
                 loop_hz=args.hz,
                 camera_hz=cam_hz_ema,
                 infer_ms=pout.infer_ms,
@@ -432,7 +499,11 @@ def main() -> None:
                 st["path_debug_preview"] = True
             st["tracks"] = pout.tracks
             st["lanes_bev"] = pout.lanes_bev
-            prefs = _read_ui_prefs()
+            # Viz road model: detected boundaries + labelled predictions, never invented lanes.
+            st["lanes_ext"] = lanes_ext(pout.lanes_bev, pout.lane_conf)
+            st["road_edges"] = road_edges(st["lanes_ext"])
+            st["signs"] = pout.signs
+            st["agents"] = _forecast_agents(pout.tracks)
             if "show_agent_ghosts" in prefs:
                 st["show_agent_ghosts"] = bool(prefs["show_agent_ghosts"])
             elif pout.tracks_n > 0:
@@ -447,6 +518,9 @@ def main() -> None:
             st["capture_backend"] = bundle.backend
             st["capture_note"] = bundle.note
             st["rss_mb"] = _rss_mb()
+            st["viz_window"] = win is not None
+            st["viz_screen"] = viz_screen_active
+            st["viz_note"] = viz_note
             st["detector"] = pout.detector_name
             st["actuator"] = actuator.name
             st["cmd_seq"] = int(applied.seq)

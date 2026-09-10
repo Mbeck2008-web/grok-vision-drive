@@ -71,10 +71,50 @@ Lua and Python share `%USERPROFILE%\\Documents\\GVD` (or HOME). GELua often has 
 
 ## UI prefs (`Documents/GVD/gvd_ui_prefs.json`)
 
-Written by the in-game **GVD** app. **Wins over** `gvd_state` for path/ghosts while the file exists. Setters also mirror into `gvd_state` when JSON encode is available so OpenCV follows.
+Written by the in-game **GVD** app (GELua is the only writer). **Wins over** `gvd_state` for path/ghosts while the file exists. Setters also mirror path/ghosts into `gvd_state` when JSON encode is available so OpenCV follows.
 
 | `show_path` | bool | Ribbon on/off |
 | `show_agent_ghosts` | bool | Track hulls on/off |
+| `show_scene` | bool | In-app VISION canvas on/off (does not change the world ribbon) |
+| `policy` | string? | `modular` / `e2e` / `shadow` request; only present while the player picks one this session |
+| `viz_screen` | string? | `auto` / `1` / `2` / `3` — where the OpenCV `GVD VISION` window should sit |
+| `mtime` | int | `os.time()` at write |
+
+`policy` / `viz_screen` are **session requests**: `run_vision.py` applies them only when `mtime` is at or after supervisor start, so a pref from a past session never overrides `--policy` at launch. Modular veto and dead-man are unchanged by a policy request.
+
+## Viz road model (in-game scene)
+
+Drawn by the in-game **GVD** app. None of it feeds the planner — corridor, CIPV and AEB still read `lanes_bev` / `tracks` exactly as before.
+
+| `lanes_ext[]` | `{points:[{x,y}], kind, side, style, index}` | `kind`: `detected` (Hough saw the paint) / `predicted` (a detected boundary offset sideways by the measured lane width) / `stub` (`--smoke` only). `index` counts boundaries out from the ego lane (`±1` = its own edges, out to `±3` for the two-lane-per-side fan). `style` stays `unknown` — nothing classifies solid vs dashed yet |
+| `road_edges[]` | `{points:[{x,y}], kind, side}` | Kerb line just outside the outermost boundary. **Always `predicted`**: no kerb detector exists, this is the road edge implied by the lanes we can see |
+| `signs[]` | `{cls,x,y,conf,state}` | Road furniture straight from the detector: `stop_sign` (COCO 11), `traffic_light` (9), `pole` (10 / 12 — hydrants and parking meters, drawn as short grey sticks). Never tracked and never offered to CIPV or AEB. `state` is `unknown` for lights — no lamp-colour classifier, so the app draws all three lamps as empty rings |
+| `agents[]` | `{id, path_ego:[{x,y}]}` | Mode-0 constant-yaw-rate forecast fan per moving track, same toy math as the OpenCV view |
+
+### Scene cues derived in the app
+
+These come from state the app already has — no extra fields, and each one needs its own signal:
+
+| Cue | Condition |
+| --- | --- |
+| Road user lit ice-blue | inside the planner's corridor: `\|x\|` within `path_width/2 + 0.45` of a `path_ego` point at that range. No corridor → nothing highlighted |
+| Road user red + `BRAKE` tag | it is the CIPV **and** (`planner.aeb == brake` or `planner.ttc_lead < 1.5`) |
+| Slow-down chevrons on the ribbon | `planner.aeb` not `off`, `ego.brake` above 0.05, or `planner.target_v` below `ego.speed_mps` |
+| Ribbon shade | accelerating (`target_v` above speed) brightest, coasting normal, slowing dimmer, planned stop faintest |
+| Hard stop bar across the ribbon | planner halted (`target_v <= 0.2` or AEB brake) **and** a CIPV exists — the bar sits at the lead, because that is the constraint being stopped for. No CIPV means no stopping point we can honestly claim, so no bar |
+| Traffic light tinted ice-blue | `signs[].relevant == true`. **Nothing sets it today** — the stack has no route-relevance signal, so every light renders muted |
+
+The only filled surface in the scene is the ego corridor; lane paint, kerbs and the lane fan are thin vector polylines, and the sky is void — there is no backdrop.
+
+Predictions need an anchor: with no detected lane there are no predicted lanes and no road edges, and with `lane_conf` under 0.25 only the detected boundaries ship. Sign positions inherit `project_box_to_ego`'s crude pinhole estimate, and sign/light heights in the scene are a drawing convention, not a measurement. The app draws detected geometry solid and everything predicted dim + dashed, and prints e.g. `lanes 2 seen+2 pred · edges pred · 2 signs` under the scene.
+
+## In-game app bus
+
+`gvd/main.lua` pushes `guihooks.trigger('gvdUi', …)` every 250 ms (100 ms while the app's scene is on) with the state above plus capped scene geometry: `path` ≤28 points, `tracks` ≤12 (`id,cls,x,y,yaw,v,lead`), `lanes` ≤6×12 (`pts,kind,side,style,idx`), `edges` ≤2×12, `signs` ≤8, `fans` ≤6×8, all ego frame and rounded to 2 dp. `link` is `live` / `stale` / `none` from the heartbeat age, so the app can show the dead-man without a second file bus. `applying` rides along, so the app can show `DRIVE` while the mod holds the wheel (M6 retail); on Tech, `actuator=beamngpy` + `cmd_applied` means the same thing. `gvdStrip` keeps its old shape plus `applying`.
+
+| `viz_window` | bool | Python `--viz` OpenCV window exists |
+| `viz_screen` | string | Monitor the window was last placed on |
+| `viz_note` | string | e.g. `screen 2 (non-primary)` / `auto→primary (second screen not found …)` |
 
 
 ## M5 fields

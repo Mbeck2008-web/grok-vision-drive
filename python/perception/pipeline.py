@@ -9,11 +9,13 @@ from typing import Any
 import numpy as np
 
 from python.perception.cipv import select_cipv
-from python.perception.detect import make_detector
+from python.perception.detect import STATIC_CLASSES, make_detector
 from python.perception.lanes import estimate_lanes
 from python.perception.track import IoUTracker
 from python.planning.corridor import build_path_ego
 from python.planning.speed import plan_speed
+
+MAX_SIGNS = 8
 
 
 @dataclass
@@ -28,6 +30,7 @@ class PerceptionOut:
     path_conf: float = 0.0
     path_debug_preview: bool = True
     planner: dict[str, Any] = field(default_factory=dict)
+    signs: list[dict[str, Any]] = field(default_factory=list)
     infer_ms: float = 0.0
     missing: list[str] = field(default_factory=list)
     detector_name: str = ""
@@ -47,8 +50,23 @@ class ModularPerception:
     ) -> PerceptionOut:
         t0 = time.perf_counter()
         dets = self.detector.detect(main_bgr)
+        # Road furniture is detected but never tracked: tracks feed CIPV / AEB / ghosts,
+        # and a stop sign is not a lead vehicle. It rides to the UI as `signs` instead.
+        moving = [d for d in dets if d.cls not in STATIC_CLASSES]
+        signs = [
+            {
+                "cls": d.cls,
+                "x": round(float(d.x), 2),
+                "y": round(float(d.y), 2),
+                "conf": round(float(d.conf), 2),
+                # No colour classifier in the stack yet — never guess the aspect.
+                "state": "unknown" if d.cls == "traffic_light" else None,
+            }
+            for d in dets
+            if d.cls in STATIC_CLASSES
+        ][:MAX_SIGNS]
         # if detector didn't set ego x/y (onnx path does), leave as-is
-        tracks = self.tracker.update(dets, time.time())
+        tracks = self.tracker.update(moving, time.time())
         track_dicts = self.tracker.as_dicts()
         lanes = estimate_lanes(main_bgr)
         cipv = select_cipv(track_dicts, path_width=2.0, ego_speed_mps=ego_speed_mps)
@@ -84,6 +102,7 @@ class ModularPerception:
             path_width=corridor.path_width,
             path_conf=corridor.path_conf,
             path_debug_preview=not corridor.from_planner,
+            signs=signs,
             planner={
                 "corridor_width": corridor.path_width,
                 "curvature": corridor.curvature,

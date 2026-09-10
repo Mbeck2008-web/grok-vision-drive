@@ -381,10 +381,33 @@ def smoke(ui: VizUI | None = None, use_perception: bool = False) -> "Path":
         st["planner"] = pout.planner
         st["infer_ms"] = pout.infer_ms
         st["detector"] = pout.detector_name
+        st["signs"] = pout.signs
         miss = [m for m in (st.get("missing_state_keys") or []) if m not in ("tracks", "lanes_bev", "real path_ego from planner")]
         st["missing_state_keys"] = sorted(set(miss + pout.missing))
+    if not st.get("lanes_ext"):
+        # --smoke has no camera, so the Hough fit finds nothing. Give the in-game scene
+        # something to draw, tagged kind="stub" so it can never read as a live detection.
+        span = [float(i) for i in range(2, 40, 3)]
+        def _line(off: float) -> list[dict[str, float]]:
+            return [{"x": round(off + 0.9 * math.sin(y / 17.0), 2), "y": y} for y in span]
+        st["lanes_ext"] = [
+            {"points": _line(-1.85), "kind": "stub", "side": "left", "style": "unknown", "index": -1},
+            {"points": _line(1.85), "kind": "stub", "side": "right", "style": "unknown", "index": 1},
+            {"points": _line(-5.35), "kind": "stub", "side": "left", "style": "unknown", "index": -2},
+            {"points": _line(5.35), "kind": "stub", "side": "right", "style": "unknown", "index": 2},
+            {"points": _line(-8.85), "kind": "stub", "side": "left", "style": "unknown", "index": -3},
+            {"points": _line(8.85), "kind": "stub", "side": "right", "style": "unknown", "index": 3},
+        ]
+        st["road_edges"] = [
+            {"points": _line(-9.25), "kind": "stub", "side": "left"},
+            {"points": _line(9.25), "kind": "stub", "side": "right"},
+        ]
+        st["missing_state_keys"] = sorted(set(
+            (st.get("missing_state_keys") or []) + ["live lane paint (smoke uses stub lanes/edges)"]
+        ))
+
     write_state(st)
-    # Product smoke: mode 0 cabin with corridor + 3 ghosts + LEAD (no Tesla/FSD chrome)
+    # Product smoke: mode 0 cabin with corridor + 3 ghosts + LEAD
     ui.layers = {0}
     ui.show_nerd = False
     frame = render_stage(st, ui=ui)

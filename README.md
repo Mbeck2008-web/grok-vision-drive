@@ -85,7 +85,17 @@ mods\unpacked\gvd\
 
 ## In-game UI app
 
-After install, open BeamNG **Apps** and add **GVD** (`beamng_mod/ui/modules/apps/GVD/`) (Engage / Disengage, show path, show ghosts). Titles stay **GVD** / **VISION**. Alt+A still works. No FSD chrome.
+After install, start a level, open the **Apps** editor (Esc → *UI Apps*, or the app-layout button on the HUD), drag **GVD** in from the app list, size it, then **Save layout**. Source: `beamng_mod/ui/modules/apps/GVD/`.
+
+The app draws an ego-centric **VISION scene** from the same `Documents/GVD/gvd_state.json` that feeds the world ribbon: a near-black stage with the ego just below centre, thin vector lane paint fanning two lanes out per side, warm-grey kerbs, and one filled surface — the ice-blue ego corridor, shaded by intent, with chevrons while slowing and a hard stop bar when the planner halts behind a lead. Road users are low-poly grey boxes that turn ice-blue in our corridor and red when we are braking for them, plus forecast fans, stop signs, traffic lights and poles when the detector sees them. Detected geometry is drawn solid, anything predicted is dim and dashed, and a line under the scene says which is which (`lanes 2 seen+2 pred · edges pred · 2 signs`). See [`docs/gvd_state_schema.md`](docs/gvd_state_schema.md#viz-road-model-in-game-scene) for what is measured vs inferred. Controls:
+
+- **Engage / Disengage** — the same toggle as Alt+A. The state strip reads `DRIVE` (the mod is feeding the player vehicle from `gvd_cmd.json`, or BeamNGpy is applying on Tech — steer to take over), `ENGAGED` (armed, nothing applied yet), `HOLD` (heartbeat stale → dead-man, inputs released) or `DISENGAGED` with the last reason.
+- **Path / Ghosts / Scene** — writes `gvd_ui_prefs.json`, so the world ribbon and the OpenCV window follow. `Scene` switches the canvas off (it shares the GPU with BeamNG).
+- **Policy** `modular | e2e | shadow` — shows what the supervisor is actually running and requests a change for the running session; the modular veto is unchanged and `--policy` still wins at launch.
+- **Sensing** — capture backend, `n/8` healthy feeds, the retail `cam_main only` note, and buttons that move the **GVD VISION** OpenCV window to screen 1 / 2.
+- **+ nerd** — loop/camera Hz, infer ms, VRAM, detector, actuator, clip encoder, heartbeat age.
+
+Titles stay **GVD** / **VISION**; Alt+A works with or without the app open. Offline check: `PYTHONPATH=. python scripts/test_gvd_ui_app.py`.
 
 ## Two views
 

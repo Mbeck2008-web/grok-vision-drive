@@ -14,6 +14,28 @@ DEFAULT_ONNX = ROOT / "models" / "yolov8n.onnx"
 COCO_VEHICLE = {2, 3, 5, 7}  # car, motorcycle, bus, truck
 COCO_PERSON = {0}
 COCO_BIKE = {1}
+COCO_TRAFFIC_LIGHT = {9}
+COCO_STOP_SIGN = {11}
+COCO_POLE = {10, 12}  # fire hydrant, parking meter — the pole-like street furniture COCO knows
+# Road furniture: detected like anything else, but never tracked or offered to CIPV/AEB —
+# a stop sign is not a lead vehicle. The pipeline routes these to state["signs"].
+STATIC_CLASSES = ("traffic_light", "stop_sign", "pole")
+
+
+def coco_class_name(cls_id: int) -> str | None:
+    if cls_id in COCO_VEHICLE:
+        return "vehicle"
+    if cls_id in COCO_PERSON:
+        return "pedestrian"
+    if cls_id in COCO_BIKE:
+        return "bike"
+    if cls_id in COCO_TRAFFIC_LIGHT:
+        return "traffic_light"
+    if cls_id in COCO_STOP_SIGN:
+        return "stop_sign"
+    if cls_id in COCO_POLE:
+        return "pole"
+    return None
 
 
 @dataclass
@@ -71,6 +93,9 @@ class SyntheticDetector(Detector):
             Detection(cls="vehicle", conf=0.9, xyxy=(280, 200, 360, 320), x=float(lead_x), y=18.0, yaw=1.57),
             Detection(cls="vehicle", conf=0.7, xyxy=(420, 180, 500, 280), x=3.2, y=26.0, yaw=1.55),
             Detection(cls="pedestrian", conf=0.6, xyxy=(500, 240, 540, 340), x=5.5, y=12.0, yaw=3.1),
+            # Road furniture, same fake-but-stable contract as the cars above (detector=synthetic).
+            Detection(cls="stop_sign", conf=0.5, xyxy=(120, 150, 160, 190), x=-5.6, y=22.0, yaw=1.57),
+            Detection(cls="traffic_light", conf=0.5, xyxy=(300, 60, 330, 120), x=1.2, y=34.0, yaw=1.57),
         ]
 
 
@@ -117,13 +142,8 @@ class OnnxYoloDetector(Detector):
             score = float(scores[cls_id])
             if score < self.conf:
                 continue
-            if cls_id in COCO_VEHICLE:
-                cls = "vehicle"
-            elif cls_id in COCO_PERSON:
-                cls = "pedestrian"
-            elif cls_id in COCO_BIKE:
-                cls = "bike"
-            else:
+            cls = coco_class_name(cls_id)
+            if cls is None:
                 continue
             cx, cy, bw, bh = map(float, xywh)
             # scale to original
@@ -167,13 +187,8 @@ def make_detector(*, allow_synthetic: bool = True) -> tuple[Detector, list[str]]
                         cls_id = int(box.cls.item())
                         score = float(box.conf.item())
                         x1, y1, x2, y2 = map(float, box.xyxy[0].tolist())
-                        if cls_id in COCO_VEHICLE:
-                            cls = "vehicle"
-                        elif cls_id in COCO_PERSON:
-                            cls = "pedestrian"
-                        elif cls_id in COCO_BIKE:
-                            cls = "bike"
-                        else:
+                        cls = coco_class_name(cls_id)
+                        if cls is None:
                             continue
                         ex, ey, yaw = project_box_to_ego((x1, y1, x2, y2), w0, h0)
                         out.append(Detection(cls=cls, conf=score, xyxy=(x1, y1, x2, y2), x=ex, y=ey, yaw=yaw))

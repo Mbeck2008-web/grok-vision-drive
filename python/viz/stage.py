@@ -73,15 +73,15 @@ class Cam:
     def eye(self) -> tuple[float, float, float]:
         if self.top_down:
             return (0.0, -8.0, 40.0)
-        return (4.5, -11.0, 7.5)
+        # Chase 3/4, pulled back so ego does not eat the frame and the lane fan reads.
+        return (1.6, -16.5, 5.4)
 
     def project(self, x: float, y: float, z: float = 0.0) -> tuple[int, int]:
         if self.top_down:
             cx, cy = STAGE_W // 2, STAGE_H - 90
             return int(cx + x * self.ppm), int(cy - y * self.ppm)
-        # Chase-up 3/4 bird: slightly behind/right of ego, FOV ~50, look forward-down
-        cam = np.array([4.5, -11.0, 7.5], dtype=np.float64)
-        target = np.array([0.0, 12.0, 0.0], dtype=np.float64)
+        cam = np.array(self.eye, dtype=np.float64)
+        target = np.array([0.0, 16.0, -0.8], dtype=np.float64)
         eye = np.array([x, y, z], dtype=np.float64) - cam
         forward = target - cam
         forward = forward / (np.linalg.norm(forward) + 1e-9)
@@ -94,7 +94,7 @@ class Cam:
         cz = float(np.dot(eye, forward))
         if cz < 0.6:
             cz = 0.6
-        fov = math.radians(50.0)
+        fov = math.radians(42.0)
         f = (STAGE_H * 0.5) / math.tan(fov * 0.5)
         u = STAGE_W * 0.5 + f * cx / cz
         v = STAGE_H * 0.5 - f * cy / cz
@@ -324,24 +324,22 @@ def _draw_ground(img: np.ndarray, cam: Cam) -> None:
     horizon = max(0, min(STAGE_H - 1, far_l[1]))
     overlay = img.copy()
     cv2.fillPoly(overlay, [np.array([far_l, far_r, near_r, near_l], dtype=np.int32)], (22, 18, 15))
-    cv2.addWeighted(overlay, 0.55, img, 0.45, 0, img)
-    # sink the far field into the void
-    fog = img.copy()
-    cv2.rectangle(fog, (0, max(0, horizon - 8)), (STAGE_W, min(STAGE_H, horizon + int(STAGE_H * 0.22))), VOID, -1)
-    cv2.addWeighted(fog, 0.55, img, 0.45, 0, img)
-    tick = _mix(ICE, 0.06)
+    cv2.addWeighted(overlay, 0.40, img, 0.60, 0, img)
+    tick = _mix(ICE, 0.08)
     for d in (10, 20, 30, 40):
         a, b = cam.project(-7, d, 0), cam.project(7, d, 0)
         cv2.line(img, a, b, tick, 1, cv2.LINE_AA)
 
 
 def _draw_fog(img: np.ndarray, cam: Cam) -> None:
+    """Void the sky plus a thin horizon fade — do not wipe the lane fan."""
     horizon = max(0, min(STAGE_H - 1, cam.project(0, 70, 0)[1]))
-    band = img.copy()
-    y0 = max(0, horizon - 10)
-    y1 = min(STAGE_H, horizon + int(STAGE_H * 0.28))
-    cv2.rectangle(band, (0, y0), (STAGE_W, y1), VOID, -1)
-    cv2.addWeighted(band, 0.42, img, 0.58, 0, img)
+    sky = img.copy()
+    cv2.rectangle(sky, (0, 0), (STAGE_W, max(1, horizon)), VOID, -1)
+    cv2.addWeighted(sky, 0.55, img, 0.45, 0, img)
+    fade = img.copy()
+    cv2.rectangle(fade, (0, max(0, horizon)), (STAGE_W, min(STAGE_H, horizon + 28)), VOID, -1)
+    cv2.addWeighted(fade, 0.22, img, 0.78, 0, img)
 
 
 def _draw_lanes(img: np.ndarray, lanes: list, cam: Cam, *, smoke: bool) -> None:
@@ -364,12 +362,15 @@ def _draw_lanes(img: np.ndarray, lanes: list, cam: Cam, *, smoke: bool) -> None:
         style = str(ln.get("style") or "unknown") if isinstance(ln, dict) else "unknown"
         dashed = mode == "dashed" or style == "dashed"
         if mode == "solid":
-            color = _mix(PAPER, 0.55 * fade)
+            color = tuple(max(90, int(c * max(0.55, fade))) for c in PAPER)
             thick = 2
         else:
-            color = _mix(PAPER, 0.24 * fade)
-            thick = 1
-        _stroke_poly(img, _proj_poly(cam, pts, 0.02), color, thick, dashed=dashed, dash=11 if mode == "solid" else 6, gap=9 if mode == "solid" else 7)
+            color = tuple(max(70, int(c * max(0.40, 0.70 * fade))) for c in (170, 166, 160))
+            thick = 2
+        _stroke_poly(
+            img, _proj_poly(cam, pts, 0.02), color, thick,
+            dashed=dashed, dash=10 if mode == "solid" else 8, gap=5,
+        )
 
 
 def _draw_edges(img: np.ndarray, edges: list, cam: Cam) -> None:
@@ -384,8 +385,8 @@ def _draw_edges(img: np.ndarray, edges: list, cam: Cam) -> None:
         quad = np.array(base + list(reversed(top)), dtype=np.int32)
         overlay = img.copy()
         cv2.fillPoly(overlay, [quad], KERB)
-        cv2.addWeighted(overlay, 0.16 if solid else 0.09, img, 1.0 - (0.16 if solid else 0.09), 0, img)
-        _stroke_poly(img, top, _mix(KERB, 0.70 if solid else 0.42), 2, dashed=not solid, dash=6, gap=5)
+        cv2.addWeighted(overlay, 0.22 if solid else 0.14, img, 1.0 - (0.22 if solid else 0.14), 0, img)
+        _stroke_poly(img, top, _mix(KERB, 0.85 if solid else 0.62, (22, 20, 18)), 2, dashed=not solid, dash=6, gap=5)
 
 
 def _draw_signs(img: np.ndarray, signs: list, cam: Cam) -> None:
@@ -472,7 +473,7 @@ def _draw_chevrons(
             ],
             dtype=np.int32,
         )
-        cv2.polylines(img, [pts], False, _mix(ICE_HI, 0.6 * (fade[i] if i < len(fade) else 0.5)), 2, cv2.LINE_AA)
+        cv2.polylines(img, [pts], False, _mix(ICE_HI, 0.85 * (fade[i] if i < len(fade) else 0.5)), 3, cv2.LINE_AA)
 
 
 def _draw_stop_bar(
@@ -538,21 +539,28 @@ def _draw_filled_corridor(
         norm = math.hypot(tx, ty) + 1e-6
         px, py = (ty / norm) * half_w, (-tx / norm) * half_w
         fade = 1.0 if d <= PATH_FADE_START_M else max(0.0, 1.0 - (d - PATH_FADE_START_M) / (PATH_FADE_END_M - PATH_FADE_START_M))
-        left.append(cam.project(x - px, y - py, 0.03))
-        right.append(cam.project(x + px, y + py, 0.03))
-        center.append(cam.project(x, y, 0.03))
+        cx, cy = cam.project(x, y, 0.03)
+        lx, ly = cam.project(x - px, y - py, 0.03)
+        rx, ry = cam.project(x + px, y + py, 0.03)
+        if abs(rx - lx) < 3 and abs(ry - ly) < 3:
+            half_px = max(3.0, half_w * cam.scale_at(y))
+            lx, ly = int(cx - half_px), cy
+            rx, ry = int(cx + half_px), cy
+        left.append((lx, ly))
+        right.append((rx, ry))
+        center.append((cx, cy))
         alphas.append(fade)
 
     nseg = len(left) - 1
     for i in range(nseg):
         near = 1.0 - i / max(1, nseg)
-        a = intent * (0.30 + 0.42 * near) * max(0.2, conf) * (0.55 * alphas[i] + 0.45 * alphas[i + 1])
+        a = intent * (0.38 + 0.50 * near) * max(0.25, conf) * (0.55 * alphas[i] + 0.45 * alphas[i + 1])
         if a < 0.02:
             continue
         quad = np.array([left[i], left[i + 1], right[i + 1], right[i]], dtype=np.int32)
         overlay = img.copy()
         cv2.fillPoly(overlay, [quad], CORRIDOR)
-        cv2.addWeighted(overlay, min(0.55, a), img, 1 - min(0.55, a), 0, img)
+        cv2.addWeighted(overlay, min(0.62, a), img, 1 - min(0.62, a), 0, img)
 
     for i in range(nseg):
         edge = _mix(ICE_HI, 0.8 * alphas[i])
@@ -634,11 +642,13 @@ def _draw_box(
             continue
         fc["d"] = vx * vx + vy * vy + vz * vz
         vis.append(fc)
-    vis.sort(key=lambda f: -f["d"])
-    for fc in vis:
-        fill = _mix(_shade(color, fc["k"]), alpha)
-        cv2.fillPoly(img, [np.array(fc["p"], dtype=np.int32)], fill)
-        cv2.polylines(img, [np.array(fc["p"], dtype=np.int32)], True, _mix(stroke, min(1.0, alpha * 0.55)), stroke_w, cv2.LINE_AA)
+        vis.sort(key=lambda f: -f["d"])
+        for fc in vis:
+            # Lead / in-path boxes stay icy; do not crush them with the far-face shade.
+            k = fc["k"] if alpha < 0.8 else max(0.72, fc["k"])
+            fill = _mix(_shade(color, k), alpha)
+            cv2.fillPoly(img, [np.array(fc["p"], dtype=np.int32)], fill)
+            cv2.polylines(img, [np.array(fc["p"], dtype=np.int32)], True, _mix(stroke, min(1.0, alpha * 0.8)), stroke_w, cv2.LINE_AA)
 
 
 def _track_dims(cls: str) -> tuple[float, float, float]:
@@ -788,7 +798,7 @@ def render_stage(
     if show_ghosts:
         _draw_tracks(img, tracks, cam, path=path, path_width=path_width, state=state, cipv_id=cipv_id)
         n_forecast = 0
-        if not drop_heavy and not clean:
+        if not drop_heavy:
             for tr in tracks:
                 if n_forecast >= MAX_FORECAST:
                     break
@@ -854,7 +864,8 @@ def smoke(ui: VizUI | None = None, use_perception: bool = False) -> "Path":
         missing_state_keys=["live cameras", "real planner path", "occupancy grid"],
     )
     st["ego"] = {"speed_mps": 14.0, "steer_deg": 0.0, "throttle": 0.1, "brake": 0.0, "yaw_rate": 0.0}
-    st["path_ego"] = [{"x": 0.12 * math.sin(i / 14), "y": float(i), "z": 0.0} for i in range(0, 45)]
+    authored_path = [{"x": 0.12 * math.sin(i / 14), "y": float(i), "z": 0.0} for i in range(0, 45)]
+    st["path_ego"] = authored_path
     st["viz_smoke"] = True
     if use_perception:
         from python.perception.pipeline import ModularPerception
@@ -867,16 +878,39 @@ def smoke(ui: VizUI | None = None, use_perception: bool = False) -> "Path":
         st["objects_n"] = pout.objects_n
         st["lane_conf"] = pout.lane_conf
         st["lanes_bev"] = pout.lanes_bev
-        st["path_ego"] = pout.path_ego
-        st["path_width"] = pout.path_width
-        st["path_conf"] = pout.path_conf
-        st["path_debug_preview"] = pout.path_debug_preview
-        st["planner"] = pout.planner
         st["infer_ms"] = pout.infer_ms
         st["detector"] = pout.detector_name
         st["signs"] = pout.signs
         miss = [m for m in (st.get("missing_state_keys") or []) if m not in ("tracks", "lanes_bev", "real path_ego from planner")]
         st["missing_state_keys"] = sorted(set(miss + pout.missing))
+        # Blank-frame Hough cannot see paint. Keep the authored corridor + slowing/CIPV
+        # so --smoke actually demonstrates the lexicon, and say so in missing keys.
+        if pout.path_debug_preview or len(pout.path_ego or []) < 8:
+            st["path_ego"] = authored_path
+            st["path_width"] = 2.0
+            st["path_conf"] = 0.9
+            st["path_debug_preview"] = True
+            st["missing_state_keys"] = sorted(set(
+                (st.get("missing_state_keys") or []) + ["live corridor (smoke keeps authored path; Hough saw no paint)"]
+            ))
+        else:
+            st["path_ego"] = pout.path_ego
+            st["path_width"] = pout.path_width
+            st["path_conf"] = pout.path_conf
+            st["path_debug_preview"] = pout.path_debug_preview
+        pl = dict(pout.planner or {})
+        if pl.get("cipv_id") is None:
+            for tr in st.get("tracks") or []:
+                if track_cls(tr) == "vehicle" and float(tr.get("y") or 0) > 5:
+                    pl["cipv_id"] = tr.get("id")
+                    break
+            st["missing_state_keys"] = sorted(set(
+                (st.get("missing_state_keys") or []) + ["live CIPV (smoke tags nearest synthetic vehicle)"]
+            ))
+        # Authored slowing so chevrons show; blank-frame plan_speed has no lead TTC.
+        pl["target_v"] = 11.0
+        st["planner"] = pl
+        st["ego"]["speed_mps"] = 14.0
     if not st.get("lanes_ext"):
         # --smoke has no camera, so the Hough fit finds nothing. Give the stage
         # something to draw, tagged kind="stub" so it can never read as a live detection.

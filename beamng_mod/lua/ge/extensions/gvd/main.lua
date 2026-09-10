@@ -58,7 +58,7 @@ local HB_STALE_S = 0.35
 -- Caps for the geometry we hand to the in-game app (keep the guihooks payload small)
 local UI_PATH_PTS = 28
 local UI_TRACKS = 12
-local UI_LANES = 6
+local UI_LANES = 8
 local UI_LANE_PTS = 12
 local UI_EDGES = 2
 local UI_SIGNS = 8

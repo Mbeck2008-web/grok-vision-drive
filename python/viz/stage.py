@@ -395,10 +395,12 @@ def smoke(ui: VizUI | None = None, use_perception: bool = False) -> "Path":
             {"points": _line(1.85), "kind": "stub", "side": "right", "style": "unknown", "index": 1},
             {"points": _line(-5.35), "kind": "stub", "side": "left", "style": "unknown", "index": -2},
             {"points": _line(5.35), "kind": "stub", "side": "right", "style": "unknown", "index": 2},
+            {"points": _line(-8.85), "kind": "stub", "side": "left", "style": "unknown", "index": -3},
+            {"points": _line(8.85), "kind": "stub", "side": "right", "style": "unknown", "index": 3},
         ]
         st["road_edges"] = [
-            {"points": _line(-5.75), "kind": "stub", "side": "left"},
-            {"points": _line(5.75), "kind": "stub", "side": "right"},
+            {"points": _line(-9.25), "kind": "stub", "side": "left"},
+            {"points": _line(9.25), "kind": "stub", "side": "right"},
         ]
         st["missing_state_keys"] = sorted(set(
             (st.get("missing_state_keys") or []) + ["live lane paint (smoke uses stub lanes/edges)"]

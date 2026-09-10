@@ -20,6 +20,7 @@ LANE_W_DEFAULT = 3.5
 LANE_CONF_MIN = 0.25       # below this the Hough fit is too weak to hang predictions on
 EDGE_SHOULDER_M = 0.4      # curb sits just outside the outermost predicted boundary
 MAX_POLYS = 8
+NEIGHBOUR_LANES = 2   # boundaries offset per side: enough for a multi-lane fan, not clutter
 
 
 def _points(poly: Any) -> list[dict[str, float]]:
@@ -58,7 +59,7 @@ def measure_lane_width(left: list[dict[str, float]] | None,
     return LANE_W_DEFAULT, False
 
 
-def lanes_ext(lanes_bev: Any, lane_conf: float, *, neighbours: int = 1) -> list[dict[str, Any]]:
+def lanes_ext(lanes_bev: Any, lane_conf: float, *, neighbours: int = 2) -> list[dict[str, Any]]:
     """Ego-lane boundaries as detected, plus `neighbours` predicted boundaries per side.
 
     `index` counts boundaries out from the ego lane: -1 / +1 are its own edges, -2 / +2 the

@@ -107,7 +107,7 @@ def _check_road_model() -> None:
     """Predicted lanes need a detected anchor; kerbs are never claimed as detected."""
     sys.path.insert(0, str(ROOT))
     from python.perception.detect import STATIC_CLASSES, coco_class_name
-    from python.perception.road_model import LANE_CONF_MIN, lanes_ext, road_edges
+    from python.perception.road_model import LANE_CONF_MIN, NEIGHBOUR_LANES, lanes_ext, road_edges
 
     assert coco_class_name(9) == "traffic_light" and coco_class_name(11) == "stop_sign"
     assert coco_class_name(10) == "pole" and coco_class_name(12) == "pole"
@@ -118,8 +118,12 @@ def _check_road_model() -> None:
              [{"x": 1.8, "y": y} for y in range(2, 30, 4)]]
     ext = lanes_ext(lanes, 0.8)
     kinds = [l["kind"] for l in ext]
-    assert kinds.count("detected") == 2 and kinds.count("predicted") == 2, ext
-    assert {l["index"] for l in ext} == {-1, 1, -2, 2}
+    assert kinds.count("detected") == 2, ext
+    assert kinds.count("predicted") == 2 * NEIGHBOUR_LANES, ext
+    assert {l["index"] for l in ext} == {-1, 1, -2, 2, -3, 3}, ext
+    # the fan must stay ordered outwards, so the app can fade by |index|
+    for lane in ext:
+        assert abs(lane["index"]) <= NEIGHBOUR_LANES + 1
     assert all(e["kind"] == "predicted" for e in road_edges(ext)), "kerbs are never detected"
     # No paint seen → nothing predicted, no kerbs. Weak fit → detected only.
     assert lanes_ext([], 0.9) == [] and road_edges([]) == []

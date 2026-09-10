@@ -20,15 +20,15 @@ angular.module('beamng.apps')
       var IN_PATH = [120, 190, 226];   // a road user standing in our corridor lights up
       var CORRIDOR = [90, 167, 199];
       var PAPER = [232, 230, 225];
-      var GHOST = [170, 200, 210];
-      var PED = [215, 176, 138];
-      var BIKE = [224, 184, 90];
+      var GHOST = [168, 178, 188];   // every road user is grey until state says otherwise
+      var HAZARD = [196, 92, 92];     // CIPV under AEB brake / sub-1.5 s TTC
+      var KERB = [168, 131, 124];     // warm grey-red, deliberately not lane paint
       var EGO_BODY = [64, 74, 84];
 
-      // Chase camera: ego centred at ~80% height, horizon at ~25%.
-      var EYE = [0, -11.0, 5.44];
-      var TARGET = [0, 13.45, 0.24];
-      var VFOV = 46 * Math.PI / 180;
+      // Chase-up, slightly overhead: ego just below centre (~0.68h), horizon ~0.20h.
+      var EYE = [0, -11.0, 3.96];
+      var TARGET = [0, 13.42, -1.38];
+      var VFOV = 40 * Math.PI / 180;
       var FPS_LIVE = 24;
       var FPS_IDLE = 6;
       var PATH_FADE_START = 25;
@@ -127,6 +127,24 @@ angular.module('beamng.apps')
         if (ui.aeb === 'brake' || ui.aeb === 'warn') return true;
         if (ui.brakeCmd != null && ui.brakeCmd > 0.05) return true;
         return ui.targetV != null && ui.speed != null && ui.targetV < ui.speed - 0.6;
+      }
+      // The planner has called a full stop (not just a slow-down).
+      function halted() {
+        if (ui.link !== 'live') return false;
+        if (ui.aeb === 'brake') return true;
+        return ui.targetV != null && ui.targetV <= 0.2;
+      }
+      // Ribbon shade: accelerate bright, coast normal, planned stop faint.
+      function paceScale() {
+        if (halted()) return 0.55;
+        if (slowing()) return 0.78;
+        if (ui.targetV != null && ui.speed != null && ui.targetV > ui.speed + 0.6) return 1.15;
+        return 1.0;
+      }
+      function leadTrack() {
+        var list = angular.isArray(ui.tracks) ? ui.tracks : [];
+        for (var i = 0; i < list.length; i++) if (list[i].lead) return list[i];
+        return null;
       }
       scope.rootClass = function () {
         return {
@@ -340,62 +358,26 @@ angular.module('beamng.apps')
         }
       }
 
+      // Near-black void: no skybox, no photo backdrop. The ground is barely above the
+      // void so the vector lines carry the road, and range ticks give depth.
       function drawGround(ctx) {
-        var sky = ctx.createLinearGradient(0, 0, 0, horizonY);
-        sky.addColorStop(0, '#05070a');
-        sky.addColorStop(1, '#0b1117');
-        ctx.fillStyle = sky;
-        ctx.fillRect(0, 0, cw, Math.max(0, horizonY));
-        var glow = ctx.createLinearGradient(0, horizonY - 14, 0, horizonY + 10);
-        glow.addColorStop(0, 'rgba(90,167,199,0)');
-        glow.addColorStop(0.6, 'rgba(90,167,199,0.10)');
-        glow.addColorStop(1, 'rgba(90,167,199,0)');
-        ctx.fillStyle = glow;
-        ctx.fillRect(0, Math.max(0, horizonY - 14), cw, 24);
-
         var g = ctx.createLinearGradient(0, horizonY, 0, ch);
-        g.addColorStop(0, 'rgba(11,14,18,0)');
-        g.addColorStop(0.55, 'rgba(14,18,22,0.7)');
-        g.addColorStop(1, 'rgba(17,21,26,1)');
-        poly(ctx, [P(-14, 60, 0), P(14, 60, 0), P(14, -12, 0), P(-14, -12, 0)]);
+        g.addColorStop(0, 'rgba(10,12,15,0)');
+        g.addColorStop(0.6, 'rgba(12,15,18,0.75)');
+        g.addColorStop(1, 'rgba(15,18,22,1)');
+        poly(ctx, [P(-16, 60, 0), P(16, 60, 0), P(16, -16, 0), P(-16, -16, 0)]);
         ctx.fillStyle = g;
         ctx.fill();
-        ctx.strokeStyle = 'rgba(158,196,212,0.05)';
+        ctx.strokeStyle = 'rgba(158,196,212,0.045)';
         ctx.lineWidth = 1;
         for (var d = 10; d <= 40; d += 10) {
-          var a = P(-6, d, 0), b = P(6, d, 0);
+          var a = P(-7, d, 0), b = P(7, d, 0);
           ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
         }
       }
 
-      // Asphalt between the two road edges, so the drivable surface reads as a road
-      // rather than a generic plane. Only drawn when both edges exist.
-      function drawRoadSurface(ctx, edges) {
-        if (!edges || edges.length < 2) return;
-        var l = null, r = null;
-        for (var i = 0; i < edges.length; i++) {
-          if (edges[i].side === 'left') l = edges[i];
-          else if (edges[i].side === 'right') r = edges[i];
-        }
-        if (!l || !r || !l.pts || !r.pts) return;
-        var n = Math.min(l.pts.length, r.pts.length);
-        if (n < 2) return;
-        // Per-segment quads with a distance fade: a single polygon would end in a hard
-        // wall at the last sample instead of dissolving into the void.
-        for (var i = 0; i < n - 1; i++) {
-          var y0 = l.pts[i].y;
-          var a = y0 <= 12 ? 0.9 : Math.max(0, 0.9 * (1 - (y0 - 12) / 16));
-          if (a < 0.02) continue;
-          poly(ctx, [
-            P(l.pts[i].x, l.pts[i].y, 0.005), P(l.pts[i + 1].x, l.pts[i + 1].y, 0.005),
-            P(r.pts[i + 1].x, r.pts[i + 1].y, 0.005), P(r.pts[i].x, r.pts[i].y, 0.005)
-          ]);
-          ctx.fillStyle = 'rgba(48,58,68,' + a.toFixed(3) + ')';
-          ctx.fill();
-        }
-      }
-
-      // Kerb: ground line plus a short raised face, dim when the edge is only predicted.
+      // Kerb: its own warm grey-red polyline with a short raised face, deliberately
+      // unlike lane paint so an edge is never mistaken for a marking.
       function drawEdges(ctx, edges) {
         if (!edges || !edges.length) return;
         for (var i = 0; i < edges.length; i++) {
@@ -406,24 +388,25 @@ angular.module('beamng.apps')
           var base = [];
           for (var j = 0; j < e.pts.length; j++) {
             base.push(P(e.pts[j].x, e.pts[j].y, 0));
-            top.push(P(e.pts[j].x, e.pts[j].y, 0.14));
+            top.push(P(e.pts[j].x, e.pts[j].y, 0.13));
           }
-          var face = base.concat(top.slice().reverse());
-          poly(ctx, face);
-          ctx.fillStyle = rgba(PAPER, solid ? 0.10 : 0.05);
+          poly(ctx, base.concat(top.slice().reverse()));
+          ctx.fillStyle = rgba(KERB, solid ? 0.16 : 0.09);
           ctx.fill();
           ctx.beginPath();
           for (var k = 0; k < top.length; k++) {
             if (k === 0) ctx.moveTo(top[k][0], top[k][1]); else ctx.lineTo(top[k][0], top[k][1]);
           }
-          ctx.setLineDash(solid ? [] : [5, 5]);
-          ctx.strokeStyle = rgba(PAPER, solid ? 0.34 : 0.20);
-          ctx.lineWidth = 1.2;
+          ctx.setLineDash(solid ? [] : [6, 5]);
+          ctx.strokeStyle = rgba(KERB, solid ? 0.7 : 0.42);
+          ctx.lineWidth = 1.3;
           ctx.stroke();
           ctx.setLineDash([]);
         }
       }
 
+      // Thin vector paint for every boundary we see or can offset from one: no fills,
+      // no glow — the only filled surface in the scene is the ego corridor.
       function drawLanes(ctx, lanes) {
         if (!lanes || !lanes.length) return;
         for (var i = 0; i < lanes.length; i++) {
@@ -432,22 +415,19 @@ angular.module('beamng.apps')
           if (!pts || pts.length < 2) continue;
           var detected = !ln.kind || ln.kind === 'detected';
           var outer = Math.max(0, Math.abs(ln.idx || 1) - 1);
-          var fade = Math.max(0.45, 1 - 0.2 * outer);
+          var fade = Math.max(0.35, 1 - 0.22 * outer);
+          strokePoly(ctx, pts, 0.02);
           if (detected) {
-            strokePoly(ctx, pts, 0.02);
-            ctx.setLineDash([]);
-            ctx.strokeStyle = rgba(PAPER, 0.10 * fade); ctx.lineWidth = 5; ctx.stroke();
-            ctx.strokeStyle = rgba(PAPER, 0.5 * fade); ctx.lineWidth = 1.5;
-            if (ln.style === 'dashed') ctx.setLineDash([11, 9]);
-            ctx.stroke();
+            ctx.setLineDash(ln.style === 'dashed' ? [11, 9] : []);
+            ctx.strokeStyle = rgba(PAPER, 0.55 * fade);
+            ctx.lineWidth = 1.2;
           } else {
             // predicted / smoke stub: never as bright as paint we actually saw
-            strokePoly(ctx, pts, 0.02);
             ctx.setLineDash([6, 7]);
-            ctx.strokeStyle = rgba(PAPER, 0.22 * fade);
-            ctx.lineWidth = 1.2;
-            ctx.stroke();
+            ctx.strokeStyle = rgba(PAPER, 0.24 * fade);
+            ctx.lineWidth = 1;
           }
+          ctx.stroke();
           ctx.setLineDash([]);
         }
       }
@@ -496,8 +476,9 @@ angular.module('beamng.apps')
           }
           if (light) {
             var w = Math.max(6, 0.34 * scale), hh = Math.max(15, 0.95 * scale);
+            var routed = s.relevant === true;
             ctx.fillStyle = rgba([26, 31, 36], 0.92 * far);
-            ctx.strokeStyle = rgba(PAPER, 0.30 * far);
+            ctx.strokeStyle = rgba(routed ? ICE : PAPER, (routed ? 0.75 : 0.30) * far);
             ctx.lineWidth = 1;
             ctx.beginPath();
             ctx.rect(top[0] - w / 2, top[1] - hh, w, hh);
@@ -516,7 +497,7 @@ angular.module('beamng.apps')
                 ctx.fillStyle = rgba(lampCol[l], 0.95 * far);
                 ctx.fill();
               } else {
-                ctx.strokeStyle = rgba([86, 94, 102], 0.8 * far);
+                ctx.strokeStyle = rgba(routed ? ICE : [86, 94, 102], 0.8 * far);
                 ctx.lineWidth = 1;
                 ctx.stroke();
               }
@@ -600,9 +581,11 @@ angular.module('beamng.apps')
           fade.push(dist <= PATH_FADE_START ? 1 : Math.max(0, 1 - (dist - PATH_FADE_START) / (PATH_FADE_END - PATH_FADE_START)));
         }
         // Luminous body: brighter near the car, dissolving with distance and confidence.
+        // Intent shades it — accelerating is brightest, coasting dimmer, a planned stop faintest.
+        var intent = paceScale();
         for (var s = 0; s < left.length - 1; s++) {
           var near = 1 - s / Math.max(1, left.length - 1);
-          var a = (0.30 + 0.42 * near) * Math.max(0.2, conf) * (0.55 * fade[s] + 0.45 * fade[s + 1]);
+          var a = intent * (0.30 + 0.42 * near) * Math.max(0.2, conf) * (0.55 * fade[s] + 0.45 * fade[s + 1]);
           if (a < 0.02) continue;
           poly(ctx, [left[s], left[s + 1], right[s + 1], right[s]]);
           ctx.fillStyle = rgba(CORRIDOR, a);
@@ -631,7 +614,34 @@ angular.module('beamng.apps')
         ctx.stroke();
         ctx.setLineDash([]);
         if (slowing()) drawChevrons(ctx, left, right, mid, fade, chevronPhase);
+        drawStopBar(ctx, path, halfW);
         return mid;
+      }
+
+      // Hard stop bar across the corridor when the planner has actually called a halt.
+      // Placed at the lead vehicle, because that is the constraint the planner is stopping
+      // for — with no CIPV there is no stopping point to claim, so no bar.
+      function drawStopBar(ctx, path, halfW) {
+        if (!halted()) return;
+        var lead = leadTrack();
+        if (!lead) return;
+        var y = Math.max(1.5, (lead.y || 0) - 2.2);
+        var cx = 0;
+        for (var i = 0; i < path.length; i++) {
+          if (path[i].y >= y) { cx = path[i].x; break; }
+          cx = path[i].x;
+        }
+        var a = P(cx - halfW, y, 0.05), b = P(cx + halfW, y, 0.05);
+        ctx.save();
+        ctx.shadowColor = 'rgba(255,255,255,0.7)';
+        ctx.shadowBlur = 6;
+        ctx.strokeStyle = 'rgba(244,248,252,0.92)';
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(a[0], a[1]);
+        ctx.lineTo(b[0], b[1]);
+        ctx.stroke();
+        ctx.restore();
       }
 
       // yaw is the ego-frame heading angle from +X (π/2 = straight ahead), as written by the tracker.
@@ -684,9 +694,15 @@ angular.module('beamng.apps')
       }
 
       function trackDims(cls) {
-        if (cls === 'pedestrian' || cls === 'ped') return [0.6, 0.6, 1.75, PED];
-        if (cls === 'bicycle' || cls === 'bike') return [1.8, 0.6, 1.6, BIKE];
-        return [4.2, 1.8, 1.5, GHOST];
+        if (cls === 'pedestrian' || cls === 'ped') return [0.6, 0.6, 1.75];
+        if (cls === 'bicycle' || cls === 'bike') return [1.8, 0.6, 1.6];
+        return [4.2, 1.8, 1.5];
+      }
+      // Red is reserved for a lead the planner is braking for, or a sub-1.5 s gap.
+      function isHazard(t) {
+        if (!t.lead) return false;
+        if (ui.aeb === 'brake') return true;
+        return ui.ttc != null && ui.ttc < 1.5;
       }
 
       // "In our path" = inside the corridor we are actually driving, measured against the
@@ -703,50 +719,8 @@ angular.module('beamng.apps')
         return false;
       }
 
-      // Upright figure rather than a crate: a pedestrian box reads as a bollard.
-      function drawPedestrian(ctx, t, alpha, hot) {
-        var col = hot ? IN_PATH : PED;
-        var scale = pxPerMeter(t.y || 10);
-        var foot = P(t.x || 0, t.y || 0, 0);
-        var headC = P(t.x || 0, t.y || 0, 1.62);
-        var shoulder = P(t.x || 0, t.y || 0, 1.35);
-        var hip = P(t.x || 0, t.y || 0, 0.85);
-        var bodyW = Math.max(2.4, 0.42 * scale);
-        var headR = Math.max(1.6, 0.15 * scale);
-        poly(ctx, [
-          [shoulder[0] - bodyW / 2, shoulder[1]], [shoulder[0] + bodyW / 2, shoulder[1]],
-          [hip[0] + bodyW * 0.42, hip[1]], [foot[0] + bodyW * 0.30, foot[1]],
-          [foot[0] - bodyW * 0.30, foot[1]], [hip[0] - bodyW * 0.42, hip[1]]
-        ]);
-        ctx.fillStyle = rgba(col, 0.82 * alpha);
-        ctx.fill();
-        ctx.strokeStyle = rgba(hot ? ICE_HI : PAPER, 0.5 * alpha);
-        ctx.lineWidth = 0.9;
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.arc(headC[0], headC[1], headR, 0, Math.PI * 2);
-        ctx.fillStyle = rgba(col, 0.95 * alpha);
-        ctx.fill();
-        ctx.stroke();
-      }
-
-      function drawVehicleBody(ctx, t, alpha, hot) {
-        var col = hot ? IN_PATH : GHOST;
-        var yaw = (t.yaw === undefined || t.yaw === null) ? Math.PI / 2 : t.yaw;
-        var stroke = hot ? ICE_HI : PAPER;
-        if (hot) {
-          ctx.save();
-          ctx.shadowColor = rgba(ICE, 0.9);
-          ctx.shadowBlur = 8;
-        }
-        drawBox(ctx, t.x || 0, t.y || 0, yaw, 4.2, 1.82, 0.85, col, alpha, stroke, hot ? 1.2 : 0.9);
-        // cabin, inset and shifted back: enough to read as a car instead of a crate
-        var hx = Math.cos(yaw), hy = Math.sin(yaw);
-        drawBox(ctx, (t.x || 0) - hx * 0.25, (t.y || 0) - hy * 0.25, yaw,
-          2.1, 1.55, 1.42, shade(col, 1.18), alpha, stroke, hot ? 1.2 : 0.7);
-        if (hot) ctx.restore();
-      }
-
+      // Low-poly grey boxes for every road user; only state changes the colour —
+      // ice-blue in our corridor, red for a lead we are braking for.
       function drawTracks(ctx, tracks) {
         if (!tracks || !tracks.length) return;
         var sorted = tracks.slice().sort(function (a, b) { return (b.y || 0) - (a.y || 0); });
@@ -755,23 +729,33 @@ angular.module('beamng.apps')
           var d = trackDims(t.cls);
           var far = Math.max(0.18, Math.min(1, 1 - ((t.y || 0) - 30) / 25));
           var lead = !!t.lead;
+          var hazard = isHazard(t);
           var hot = lead || inPath(t);
+          var col = hazard ? HAZARD : (hot ? IN_PATH : GHOST);
+          var stroke = hazard ? [242, 168, 160] : (hot ? ICE_HI : PAPER);
           var alpha = (hot ? 0.85 : 0.74) * far * (t.a === undefined ? 1 : t.a);
-          var ped = t.cls === 'pedestrian' || t.cls === 'ped';
-          if (ped) {
-            drawPedestrian(ctx, t, alpha, hot);
-          } else if (t.cls === 'bicycle' || t.cls === 'bike') {
-            drawBox(ctx, t.x || 0, t.y || 0, (t.yaw === undefined || t.yaw === null) ? Math.PI / 2 : t.yaw,
-              d[0], d[1], d[2], hot ? IN_PATH : BIKE, alpha, hot ? ICE_HI : PAPER, 0.8);
-          } else {
-            drawVehicleBody(ctx, t, alpha, hot);
+          var yaw = (t.yaw === undefined || t.yaw === null) ? Math.PI / 2 : t.yaw;
+          var car = !(t.cls === 'pedestrian' || t.cls === 'ped' || t.cls === 'bicycle' || t.cls === 'bike');
+          if (hot || hazard) {
+            ctx.save();
+            ctx.shadowColor = rgba(hazard ? HAZARD : ICE, 0.9);
+            ctx.shadowBlur = 8;
           }
+          drawBox(ctx, t.x || 0, t.y || 0, yaw, d[0], d[1], car ? 0.85 : d[2], col, alpha,
+            stroke, (hot || hazard) ? 1.2 : 0.9);
+          if (car) {
+            // one extra facet for the cabin: still low-poly, but reads as a car
+            var hx = Math.cos(yaw), hy = Math.sin(yaw);
+            drawBox(ctx, (t.x || 0) - hx * 0.25, (t.y || 0) - hy * 0.25, yaw,
+              2.1, 1.55, 1.42, shade(col, 1.18), alpha, stroke, (hot || hazard) ? 1.2 : 0.7);
+          }
+          if (hot || hazard) ctx.restore();
           if (lead) {
-            var tag = P(t.x || 0, t.y || 0, (ped ? 1.9 : 1.6) + 0.5);
-            ctx.fillStyle = rgba(ICE_HI, 0.95);
+            var tag = P(t.x || 0, t.y || 0, (car ? 1.6 : d[2]) + 0.5);
+            ctx.fillStyle = rgba(hazard ? [246, 186, 178] : ICE_HI, 0.95);
             ctx.font = '9px Consolas, monospace';
             ctx.textAlign = 'center';
-            ctx.fillText('LEAD', tag[0], tag[1]);
+            ctx.fillText(hazard ? 'BRAKE' : 'LEAD', tag[0], tag[1]);
             ctx.textAlign = 'left';
           }
         }
@@ -780,9 +764,9 @@ angular.module('beamng.apps')
       function drawEgo(ctx, engaged) {
         if (engaged) {
           var c = P(0, 0.2, 0.02);
-          var r = Math.abs(P(2.6, 0.2, 0.02)[0] - c[0]);
+          var r = Math.abs(P(1.7, 0.2, 0.02)[0] - c[0]);
           var g = ctx.createRadialGradient(c[0], c[1], 1, c[0], c[1], Math.max(6, r));
-          g.addColorStop(0, rgba(ICE, 0.30));
+          g.addColorStop(0, rgba(ICE, 0.20));
           g.addColorStop(1, rgba(ICE, 0));
           ctx.fillStyle = g;
           ctx.beginPath(); ctx.arc(c[0], c[1], Math.max(6, r), 0, Math.PI * 2); ctx.fill();
@@ -885,7 +869,6 @@ angular.module('beamng.apps')
         ctx.fillRect(0, 0, w, h);
         ctx.globalAlpha = ui.link === 'stale' ? 0.55 : 1;
         drawGround(ctx);
-        drawRoadSurface(ctx, ui.edges);
         drawLanes(ctx, ui.lanes);
         drawEdges(ctx, ui.edges);
         if (smoothPath) {

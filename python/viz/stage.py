@@ -1009,10 +1009,13 @@ def render_stage(
         cv2.rectangle(img, (12, 12), (332, 192), ICE, 1)
 
     if (not clean) and dbg.viz_cams and not drop_heavy:
-        draw_cam_strip(
+        strip_top = draw_cam_strip(
             img, cam_frames, state.get("cam_health") if isinstance(state.get("cam_health"), dict) else None,
             stage_w=STAGE_W, stage_h=STAGE_H,
         )
+        hud_pad = STAGE_H - strip_top + 6
+    else:
+        hud_pad = 0
 
     cv2.rectangle(img, (0, 0), (STAGE_W, 22), (12, 13, 16), -1)
     cv2.putText(img, "GVD", (12, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, ICE, 1, cv2.LINE_AA)
@@ -1021,9 +1024,9 @@ def render_stage(
     cv2.putText(img, cam_lbl, (STAGE_W - 120, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
     note = scene_note(state)
     if note and not ((not clean) and dbg.viz_hud):
-        cv2.putText(img, note[:72], (12, STAGE_H - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (134, 124, 114), 1, cv2.LINE_AA)
+        cv2.putText(img, note[:72], (12, STAGE_H - 10 - hud_pad), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (134, 124, 114), 1, cv2.LINE_AA)
     if (not clean) and dbg.viz_hud:
-        draw_dense_hud(img, state, stage_w=STAGE_W, stage_h=STAGE_H)
+        draw_dense_hud(img, state, stage_w=STAGE_W, stage_h=STAGE_H, bottom_pad=hud_pad)
 
     state["viz_ms"] = (time.perf_counter() - t0) * 1000.0
     state["viz_scene_note"] = note

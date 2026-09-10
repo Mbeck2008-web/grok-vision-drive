@@ -219,14 +219,19 @@ def draw_cam_strip(
     *,
     stage_w: int,
     stage_h: int,
-) -> None:
-    """Row of tiny camera tiles along the bottom — missing feeds stay labelled missing."""
+    y0: int | None = None,
+) -> int:
+    """Row of tiny camera tiles along the bottom — missing feeds stay labelled missing.
+
+    Returns the top y of the strip so the HUD can sit above it.
+    """
     frames = frames or {}
     health = health or {}
     n = len(CAM_IDS)
     slot_w = min(150, max(72, (stage_w - 24) // n))
     slot_h = 64
-    y0 = stage_h - slot_h - 28
+    if y0 is None:
+        y0 = stage_h - slot_h - 8
     x = 12
     for cid in CAM_IDS:
         frame = frames.get(cid) if cid != "main" else (frames.get("main") or frames.get("cam_main"))
@@ -246,9 +251,17 @@ def draw_cam_strip(
         border = ICE_HI if status == "ok" else (50, 46, 44)
         cv2.rectangle(img, (x, y0), (x + slot_w - 1, y0 + slot_h - 1), border, 1)
         x += slot_w + 2
+    return y0
 
 
-def draw_dense_hud(img: np.ndarray, state: dict[str, Any], *, stage_w: int, stage_h: int) -> None:
+def draw_dense_hud(
+    img: np.ndarray,
+    state: dict[str, Any],
+    *,
+    stage_w: int,
+    stage_h: int,
+    bottom_pad: int = 0,
+) -> None:
     """Corner HUD: speed, engage/policy, TTC/AEB, last command."""
     ego = state.get("ego") or {}
     pl = state.get("planner") or {}
@@ -263,16 +276,17 @@ def draw_dense_hud(img: np.ndarray, state: dict[str, Any], *, stage_w: int, stag
     ttc = pl.get("ttc_lead")
     ttc_s = f"{float(ttc):.1f}s" if ttc is not None else "—"
     cmd = f"s{float(ego.get('steer_deg') or 0):+.0f} t{float(ego.get('throttle') or 0):.1f} b{float(ego.get('brake') or 0):.1f}"
+    base = stage_h - bottom_pad
     # Speed stack, lower-left.
-    cv2.putText(img, f"{mph:.0f}", (18, stage_h - 44), cv2.FONT_HERSHEY_SIMPLEX, 0.9, ICE_HI, 2, cv2.LINE_AA)
-    cv2.putText(img, "mph", (18, stage_h - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.38, HUD_DIM, 1, cv2.LINE_AA)
-    cv2.putText(img, f"{v:.1f} m/s", (18, stage_h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.36, HUD, 1, cv2.LINE_AA)
+    cv2.putText(img, f"{mph:.0f}", (18, base - 44), cv2.FONT_HERSHEY_SIMPLEX, 0.9, ICE_HI, 2, cv2.LINE_AA)
+    cv2.putText(img, "mph", (18, base - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.38, HUD_DIM, 1, cv2.LINE_AA)
+    cv2.putText(img, f"{v:.1f} m/s", (18, base - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.36, HUD, 1, cv2.LINE_AA)
     # Right cluster.
     drive = "DRIVE" if engaged else "idle"
     cv2.putText(
         img,
         f"{policy}  {drive}",
-        (stage_w - 220, stage_h - 44),
+        (stage_w - 220, base - 44),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.42,
         ICE_HI if engaged else HUD_DIM,
@@ -282,7 +296,7 @@ def draw_dense_hud(img: np.ndarray, state: dict[str, Any], *, stage_w: int, stag
     cv2.putText(
         img,
         f"TTC {ttc_s}  AEB {aeb}",
-        (stage_w - 220, stage_h - 26),
+        (stage_w - 220, base - 26),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.38,
         COST_HOT if aeb == "brake" else HUD,
@@ -292,7 +306,7 @@ def draw_dense_hud(img: np.ndarray, state: dict[str, Any], *, stage_w: int, stag
     cv2.putText(
         img,
         cmd,
-        (stage_w - 220, stage_h - 8),
+        (stage_w - 220, base - 8),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.36,
         HUD_DIM,

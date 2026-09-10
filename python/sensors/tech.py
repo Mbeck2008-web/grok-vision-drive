@@ -535,11 +535,13 @@ class TechSession:
             self.attached["advanced_imu"] = self._attach_advanced_imu(vehicle, bng)
         ok = [k for k, v in self.attached.items() if v]
         extra = [k for k in ("lidar", "radar", "advanced_imu") if self.attached.get(k)]
-        extra_note = (
-            f" extras={','.join(extra)} (Foxglove only; planner ignores them)"
-            if extra
-            else " (LiDAR/radar off; enable in config/sensors.yaml)"
-        )
+        wanted = [k for k in ("lidar", "radar", "advanced_imu") if flags.get(k)]
+        if extra:
+            extra_note = f" extras={','.join(extra)} (Foxglove only; planner ignores them)"
+        elif wanted:
+            extra_note = f" extras requested={','.join(wanted)} but missing (planner stays vision-only)"
+        else:
+            extra_note = " (LiDAR/radar off; enable in config/sensors.yaml)"
         self._log(
             f"[GVD] tech vehicle sensors: {', '.join(ok) if ok else 'none'} "
             f"(RGB cameras separate; GPS is a nav hint, not localization){extra_note}."

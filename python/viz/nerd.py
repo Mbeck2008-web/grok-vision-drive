@@ -116,7 +116,7 @@ def render_panel(
     y = 34
     _put(img, "GVD  ·  VISION", (PAD_X, y), FS_TITLE, ICE)
     y = _draw_tabs(img, tab, w, y + 14, hits)
-    foot_y = h - 18
+    live_limit = h - 28 - ROW_H
     if tab == "keys":
         lines = _help_lines()
         y += 10
@@ -124,7 +124,7 @@ def render_panel(
             col = DIM if line.startswith(" ") or line.startswith("keys") else FG
             _put(img, _fit(line, w - PAD_X * 2, FS_BODY), (PAD_X, y), FS_BODY, col)
             y += ROW_H
-            if y > foot_y - 8:
+            if y > live_limit:
                 break
     elif tab == "drive":
         y = _draw_knob_tab(
@@ -142,9 +142,9 @@ def render_panel(
             col = DIM if line.startswith(" ") else FG
             _put(img, _fit(line, w - PAD_X * 2, FS_BODY), (PAD_X, y), FS_BODY, col)
             y += ROW_H
-            if y > foot_y - 8:
+            if y > live_limit:
                 break
-    _put(img, _fit("D drive  G viz  [ ] tab  click  V hide", w - 24, FS_DIM), (12, foot_y), FS_DIM, DIM)
+    _put(img, _fit("D drive  G viz  [ ] tab  click  V hide", w - 24, FS_DIM), (12, h - 16), FS_DIM, DIM)
     if ui is not None:
         ui.nerd_hits = hits
         ui.nerd_tab = tab
@@ -186,7 +186,7 @@ def _draw_knob_tab(
     y += ROW_H
     n_ctrl = sum(1 for r in rows if r.get("kind") != "header")
     sel_i = (sel % n_ctrl) if n_ctrl else 0
-    foot_reserve = ROW_H + 10
+    foot_reserve = ROW_H * 2 + 8
     max_lines = max(1, (h - y - foot_reserve) // ROW_H)
     lines_before = 0
     ctrl = 0
@@ -218,7 +218,7 @@ def _draw_knob_tab(
             if not is_header:
                 ctrl_i += 1
             continue
-        if y > h - foot_reserve - 4:
+        if y > h - foot_reserve:
             break
         if is_header:
             _put(img, _fit(str(row.get("label") or ""), w - PAD_X * 2, FS_BODY), (PAD_X, y), FS_BODY, ICE)
@@ -247,10 +247,11 @@ def _draw_knob_tab(
         y += ROW_H
         vis_i += 1
         ctrl_i += 1
+    hint_y = h - 16 - ROW_H
     _put(
         img,
         _fit("j/k select  h/l nudge  Enter toggle", w - PAD_X * 2, FS_DIM),
-        (PAD_X, min(h - 16, y + 10)),
+        (PAD_X, hint_y),
         FS_DIM,
         DIM,
     )

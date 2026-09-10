@@ -739,7 +739,7 @@ angular.module('beamng.apps')
           ctx.shadowColor = rgba(ICE, 0.9);
           ctx.shadowBlur = 8;
         }
-        drawBox(ctx, t.x || 0, t.y || 0, yaw, 4.2, 1.82, 0.85, col, alpha, stroke, hot ? 1.2 : 0.7);
+        drawBox(ctx, t.x || 0, t.y || 0, yaw, 4.2, 1.82, 0.85, col, alpha, stroke, hot ? 1.2 : 0.9);
         // cabin, inset and shifted back: enough to read as a car instead of a crate
         var hx = Math.cos(yaw), hy = Math.sin(yaw);
         drawBox(ctx, (t.x || 0) - hx * 0.25, (t.y || 0) - hy * 0.25, yaw,
@@ -756,7 +756,7 @@ angular.module('beamng.apps')
           var far = Math.max(0.18, Math.min(1, 1 - ((t.y || 0) - 30) / 25));
           var lead = !!t.lead;
           var hot = lead || inPath(t);
-          var alpha = (hot ? 0.8 : 0.62) * far * (t.a === undefined ? 1 : t.a);
+          var alpha = (hot ? 0.85 : 0.74) * far * (t.a === undefined ? 1 : t.a);
           var ped = t.cls === 'pedestrian' || t.cls === 'ped';
           if (ped) {
             drawPedestrian(ctx, t, alpha, hot);

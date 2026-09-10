@@ -114,7 +114,6 @@ These come from state the stage already has — no extra fields, and each one ne
 | --- | --- |
 | Road user lit ice-blue | inside the planner's corridor: `\|x\|` within `path_width/2 + 0.45` of a `path_ego` point at that range. No corridor → nothing highlighted |
 | Road user red + `BRAKE` tag | it is the CIPV **and** (`planner.aeb == brake` or `planner.ttc_lead < 1.5`) |
-| Slow-down chevrons on the ribbon | `planner.aeb` not `off`, `ego.brake` above 0.05, or `planner.target_v` below `ego.speed_mps` |
 | Ribbon shade | accelerating (`target_v` above speed) brightest, coasting normal, slowing dimmer, planned stop faintest |
 | Hard stop bar across the ribbon | planner halted (`target_v <= 0.2` or AEB brake) **and** a CIPV exists — the bar sits at the lead, because that is the constraint being stopped for. No CIPV means no stopping point we can honestly claim, so no bar |
 | Traffic light tinted ice-blue | `signs[].relevant == true`. **Nothing sets it today** — the stack has no route-relevance signal, so every light renders muted |

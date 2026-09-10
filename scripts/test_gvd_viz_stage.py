@@ -30,6 +30,7 @@ def main() -> None:
     from python.viz.nerd import _extras_line, _nav_line, scene_note
     from python.viz.stage import (
         VizUI,
+        _track_dims,
         in_path,
         is_halted,
         is_hazard,
@@ -38,6 +39,9 @@ def main() -> None:
         pace_scale,
         render_stage,
     )
+
+    assert _track_dims({}, "vehicle") == (4.2, 1.8, 1.55)
+    assert _track_dims({"length": 6.0, "width": 2.2, "height": 2.4}, "vehicle") == (6.0, 2.2, 2.4)
 
     assert lane_draw_mode("detected", smoke=False) == "solid"
     assert lane_draw_mode("predicted", smoke=False) == "dashed"

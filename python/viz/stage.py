@@ -1,7 +1,7 @@
 """GVD VISION cabin stage (OpenCV). Chase 3/4 bird default; BEV via T.
 
 Lexicon (second-screen product viz): void stage, multi-lane fan, ice-blue ego
-corridor + chevrons/stop bar, agent boxes (CIPV / in-path / BRAKE), warm curbs,
+corridor + stop bar, agent boxes (CIPV / in-path / BRAKE), warm curbs,
 sign/light glyphs. Driven from gvd_state.json. Titles stay GVD / VISION.
 """
 
@@ -576,41 +576,6 @@ def _draw_signs(img: np.ndarray, signs: list, cam: Cam) -> None:
         )
 
 
-def _draw_chevrons(
-    img: np.ndarray,
-    left: list[tuple[int, int]],
-    right: list[tuple[int, int]],
-    mid: list[tuple[int, int]],
-    fade: list[float],
-    phase: float,
-) -> None:
-    n = len(mid)
-    if n < 5:
-        return
-    for c in range(4):
-        t = ((c / 4.0) + phase) % 1.0
-        i = int(t * (n - 3)) + 1
-        if i < 1 or i + 1 >= n:
-            continue
-        b = mid[i]
-        dx = mid[i + 1][0] - mid[i - 1][0]
-        dy = mid[i + 1][1] - mid[i - 1][1]
-        w = math.hypot(right[i][0] - left[i][0], right[i][1] - left[i][1]) * 0.34
-        if w < 2:
-            continue
-        L = math.hypot(dx, dy) or 1.0
-        nx, ny = -dy / L, dx / L
-        pts = np.array(
-            [
-                [int(b[0] - nx * w), int(b[1] - ny * w)],
-                [int(b[0] + dx * 0.5), int(b[1] + dy * 0.5)],
-                [int(b[0] + nx * w), int(b[1] + ny * w)],
-            ],
-            dtype=np.int32,
-        )
-        cv2.polylines(img, [pts], False, _mix(ICE_HI, 0.85 * (fade[i] if i < len(fade) else 0.5)), 3, cv2.LINE_AA)
-
-
 def _draw_stop_bar(
     img: np.ndarray,
     path: list[dict[str, Any]],
@@ -644,8 +609,6 @@ def _draw_filled_corridor(
     half_w: float,
     intent: float,
     preview: bool,
-    chevrons: bool,
-    phase: float,
 ) -> None:
     if len(path) < 2:
         return
@@ -702,8 +665,6 @@ def _draw_filled_corridor(
         _stroke_poly(img, [left[i], left[i + 1]], edge, 2, dashed=preview, dash=5, gap=4)
         _stroke_poly(img, [right[i], right[i + 1]], edge, 2, dashed=preview, dash=5, gap=4)
     _stroke_poly(img, center, _mix(ICE, 0.30), 1, dashed=True, dash=4, gap=5)
-    if chevrons:
-        _draw_chevrons(img, left, right, center, alphas, phase)
 
 
 def _draw_path_world_overlay(img: np.ndarray, path_world: list, cam: Cam) -> None:
@@ -786,12 +747,30 @@ def _draw_box(
             cv2.polylines(img, [np.array(fc["p"], dtype=np.int32)], True, _mix(stroke, min(1.0, alpha * 0.8)), stroke_w, cv2.LINE_AA)
 
 
-def _track_dims(cls: str) -> tuple[float, float, float]:
+def _track_dims(tr: dict[str, Any], cls: str) -> tuple[float, float, float]:
+    """One box per agent. Optional length/width/height on the track resize it."""
     if cls in ("pedestrian", "ped"):
-        return 0.6, 0.6, 1.75
-    if cls in ("bicycle", "bike"):
-        return 1.8, 0.6, 1.6
-    return 4.2, 1.8, 1.5
+        L, W, H = 0.6, 0.6, 1.75
+    elif cls in ("bicycle", "bike"):
+        L, W, H = 1.8, 0.6, 1.6
+    else:
+        L, W, H = 4.2, 1.8, 1.55
+    for key in ("length", "width", "height"):
+        raw = tr.get(key)
+        if raw is None:
+            continue
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if v > 0.2:
+            if key == "length":
+                L = v
+            elif key == "width":
+                W = v
+            else:
+                H = v
+    return L, W, H
 
 
 def _draw_tracks(
@@ -809,7 +788,7 @@ def _draw_tracks(
     ordered = sorted(tracks, key=lambda t: float(t.get("y") or 0), reverse=True)
     for t in ordered:
         cls = track_cls(t)
-        L, W, H = _track_dims(cls)
+        L, W, H = _track_dims(t, cls)
         far = max(0.18, min(1.0, 1.0 - (float(t.get("y") or 0) - 30.0) / 25.0))
         lead = is_lead(t, cipv_id)
         hazard = is_hazard(t, state, cipv_id)
@@ -821,22 +800,15 @@ def _draw_tracks(
             yaw = float(t["yaw"]) if t.get("yaw") is not None else math.pi / 2
         except (TypeError, ValueError):
             yaw = math.pi / 2
-        car = cls not in ("pedestrian", "ped", "bicycle", "bike")
         x, y = float(t.get("x") or 0), float(t.get("y") or 0)
-        _draw_box(img, cam, x, y, yaw, L, W, 0.85 if car else H, col, alpha, stroke, 2 if (hot or hazard) else 1)
-        if car:
-            hx, hy = math.cos(yaw), math.sin(yaw)
-            _draw_box(
-                img, cam, x - hx * 0.25, y - hy * 0.25, yaw,
-                2.1, 1.55, 1.42, _shade(col, 1.18), alpha, stroke, 2 if (hot or hazard) else 1,
-            )
+        _draw_box(img, cam, x, y, yaw, L, W, H, col, alpha, stroke, 2 if (hot or hazard) else 1)
         if lead:
-            tag_h = (1.6 if car else H) + 0.5
+            tag_h = H + 0.45
             tag = cam.project(x, y, tag_h)
             label = "BRAKE" if hazard else "LEAD"
             cv2.putText(img, label, (tag[0] - 18, tag[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.45, ICE_HI if not hazard else (178, 186, 246), 1, cv2.LINE_AA)
         elif show_ids:
-            tag = cam.project(x, y, (1.6 if car else H) + 0.35)
+            tag = cam.project(x, y, H + 0.35)
             tid = track_id(t)
             cv2.putText(
                 img,
@@ -861,7 +833,7 @@ def _draw_tracks(
         if show_ids and lead:
             tid = track_id(t)
             if tid is not None:
-                extra = cam.project(x, y, (1.6 if car else H) + 0.95)
+                extra = cam.project(x, y, H + 0.85)
                 cv2.putText(img, f"#{tid}", (extra[0] - 10, extra[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.32, ICE_HI, 1, cv2.LINE_AA)
 
 
@@ -869,8 +841,7 @@ def _draw_ego(img: np.ndarray, cam: Cam, engaged: bool) -> None:
     if engaged:
         _draw_underglow(img, True, cam)
     yaw = math.pi / 2
-    _draw_box(img, cam, 0.0, 0.0, yaw, 4.4, 1.85, 0.66, EGO_BODY, 1.0, EGO_EDGE, 1)
-    _draw_box(img, cam, 0.0, -0.3, yaw, 1.95, 1.44, 1.22, _shade(EGO_BODY, 1.25), 1.0, EGO_EDGE, 1)
+    _draw_box(img, cam, 0.0, 0.0, yaw, 4.4, 1.85, 1.5, EGO_BODY, 1.0, EGO_EDGE, 1)
 
 
 def _draw_agent_forecasts(img: np.ndarray, tr: dict[str, Any], cam: Cam) -> None:
@@ -956,8 +927,6 @@ def render_stage(
             half_w=half_w,
             intent=pace_scale(state),
             preview=preview,
-            chevrons=is_slowing(state),
-            phase=(time.time() * 0.5) % 1.0,
         )
         _draw_stop_bar(img, path, half_w, all_tracks, cipv_id, cam, is_halted(state))
         _draw_path_world_overlay(img, state.get("path_world") or [], cam)
@@ -1104,7 +1073,7 @@ def smoke(ui: VizUI | None = None, use_perception: bool = False) -> "Path":
             st["missing_state_keys"] = sorted(set(
                 (st.get("missing_state_keys") or []) + ["live CIPV (smoke tags nearest synthetic vehicle)"]
             ))
-        # Authored slowing so chevrons show; blank-frame plan_speed has no lead TTC.
+        # Authored slowing so the ribbon shade still reads; blank-frame plan_speed has no lead TTC.
         pl["target_v"] = 11.0
         st["planner"] = pl
         st["ego"]["speed_mps"] = 14.0

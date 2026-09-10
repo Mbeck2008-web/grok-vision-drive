@@ -7,13 +7,17 @@ Retail bus (M6): Python writes Documents/GVD/gvd_cmd.json every tick; the mod's
 gvd_main.applyCmdJson feeds steer/throttle/brake to the player vehicle with the same
 vehicle-Lua `input.event` calls BeamNG's own AI and BeamNGpy use, and echoes
 wheelspeed / inputs / applied seq back through gvd_ego.json. `cmd_applied` is only
-claimed once that ack is fresh. No DLL / hooks / process inject. Live BeamNG still
-UNPROVEN on Linux.
+claimed once that ack is fresh — never on the strength of having written the cmd
+file. Stub/smoke have no live Lua: they may play the same file-ack role
+(`write_simulated_lua_ack`) so the contract is exercised without claiming a live
+apply. Window/BeamNGpy never do that. No DLL / hooks / process inject. Live
+BeamNG still UNPROVEN on Linux.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +29,8 @@ HEARTBEAT_STALE_S = 0.35
 AEB_BRAKE_TTC = 1.2
 EGO_FRESH_S = 1.0          # gvd_ego.json older than this → treat Lua feedback as gone
 CMD_ACK_SLACK = 5          # Lua acks lag a few seqs (20 Hz apply, 10 Hz echo, 15 Hz loop)
+# Offline stub/smoke has no vehicle, so the simulated echo carries 0 speed — never a
+# made-up wheelspeed. The test harness may write a real-looking 5.5 on top.
 
 
 @dataclass
@@ -102,6 +108,44 @@ def read_ego_feedback(now: float | None = None) -> EgoFeedback | None:
         applying=bool(data.get("applying", False)),
         age_s=max(0.0, t - mtime),
     )
+
+
+def write_simulated_lua_ack(
+    cmd: DriveCommand,
+    *,
+    speed_mps: float = 0.0,
+    applying: bool = True,
+) -> EgoFeedback | None:
+    """Write `gvd_ego.json` the way `gvd_main.writeEgoFile` does.
+
+    Stub/smoke call this after a successful cmd write when no fresh echo exists.
+    Live retail (`window` / BeamNGpy) must not — that would claim a Lua apply
+    that did not happen. Speed defaults to 0 (no vehicle); inputs echo the
+    command, matching a car that followed `input.event`.
+    """
+    payload = {
+        "speed_mps": float(speed_mps),
+        "steering_input": float(max(-1.0, min(1.0, cmd.steer))),
+        "throttle_input": float(max(0.0, min(1.0, cmd.throttle))),
+        "brake_input": float(max(0.0, min(1.0, cmd.brake))),
+        "applied_seq": int(cmd.seq),
+        "applying": bool(applying),
+        "mtime": int(time.time()),
+    }
+    # Lua writes this non-atomically; atomic here just avoids a torn stub read.
+    if not atomic_write_json(ego_path(), payload, indent=None):
+        return None
+    return read_ego_feedback()
+
+
+def want_simulated_lua_ack(backend_name: str, env: dict[str, str] | None = None) -> bool:
+    """Stub/smoke may ack via the file bus; window and beamngpy never invent one."""
+    raw = (env if env is not None else os.environ).get("GVD_SIMULATE_LUA_ACK", "").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    return (backend_name or "").lower() == "stub"
 
 
 def read_engage_flag(default: bool = False) -> bool:
@@ -381,16 +425,22 @@ class CmdJsonActuator:
     is engaged (gate holds like preview_blocked ride along as brake=1). Lua echoes the seq it
     applied via gvd_ego.json; `applied` is claimed only when that ack is fresh — never on
     the strength of having written a file.
+
+    `simulate_ack` is the stub/smoke stand-in for `gvd_main.writeEgoFile`: after a
+    successful write, if no fresh echo is already on disk (live Lua or a test harness),
+    write one and claim applied against it. A fresh external echo is left alone so a
+    harness can still inject wheel/pedal residuals.
     """
 
     name = "cmd_json"
     _PASSTHROUGH_TAGS = ("ok", "plan", "stop", "shutdown", "unit_stop")
 
-    def __init__(self) -> None:
+    def __init__(self, simulate_ack: bool = False) -> None:
         self.engaged = False
         self.ack: EgoFeedback | None = None
         self.last_seq = 0
         self.write_ok = True
+        self.simulate_ack = bool(simulate_ack)
 
     def note_engaged(self, engaged: bool) -> None:
         self.engaged = bool(engaged)
@@ -404,6 +454,22 @@ class CmdJsonActuator:
             return False
         return fb.applied_seq >= int(seq) - CMD_ACK_SLACK
 
+    def _maybe_simulate_ack(self, cmd: DriveCommand) -> None:
+        if not self.simulate_ack or not self.engaged or not self.write_ok:
+            return
+        # Re-read: a harness may have echoed since note_ack, and we must not clobber
+        # a fresh echo that still covers this seq (wheel/pedal residuals live there).
+        fb = read_ego_feedback()
+        if fb is not None and fb.fresh and fb.applying and fb.applied_seq >= int(cmd.seq) - CMD_ACK_SLACK:
+            self.note_ack(fb)
+            return
+        if fb is None:
+            fb = self.ack
+        speed = float(fb.speed_mps) if fb is not None and fb.speed_mps is not None else 0.0
+        sim = write_simulated_lua_ack(cmd, speed_mps=speed, applying=True)
+        if sim is not None:
+            self.note_ack(sim)
+
     def apply(self, cmd: DriveCommand) -> DriveCommand:
         payload = {
             "steer": float(max(-1.0, min(1.0, cmd.steer))),
@@ -416,6 +482,7 @@ class CmdJsonActuator:
         }
         self.write_ok = atomic_write_json(cmd_path(), payload)
         self.last_seq = int(cmd.seq)
+        self._maybe_simulate_ack(cmd)
         cmd.applied = bool(self.engaged and self.write_ok and self.acked(cmd.seq))
         if cmd.reason in self._PASSTHROUGH_TAGS or cmd.reason.startswith("beamngpy"):
             if cmd.applied:
@@ -431,11 +498,15 @@ class CmdJsonActuator:
         return self.apply(cmd)
 
 
-def make_actuator(vehicle: Any | None = None, prefer_beamngpy: bool = True) -> Actuator:
+def make_actuator(
+    vehicle: Any | None = None,
+    prefer_beamngpy: bool = True,
+    simulate_ack: bool = False,
+) -> Actuator:
     if prefer_beamngpy and vehicle is not None and hasattr(vehicle, "control"):
         return BeamNGPyActuator(vehicle)
     # Retail: cmd json applied by the mod's GELua on the player vehicle. Still no DLL.
-    return CmdJsonActuator()
+    return CmdJsonActuator(simulate_ack=simulate_ack)
 
 
 def path_steer_from_ego(path_ego: list[dict[str, float]] | None) -> float:

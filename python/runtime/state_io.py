@@ -87,6 +87,16 @@ def default_state(**overrides: Any) -> dict[str, Any]:
             "rpm": None,
             "pose_ok": False,
         },
+        "nav": {
+            "mode": "missing",
+            "drive_to_pin": False,
+            "gps": None,
+            "pin": None,
+            "range_m": None,
+            "bearing_deg": None,
+            "bearing_rel_deg": None,
+            "note": "retail / no Tech GPS",
+        },
         "planner": {
             "corridor_width": 2.0,
             "curvature": 0.0,
@@ -119,6 +129,7 @@ def default_state(**overrides: Any) -> dict[str, Any]:
             "lanes_bev",
             "occupancy",
             "real path_ego from planner",
+            "nav",
         ],
     }
     st.update(overrides)

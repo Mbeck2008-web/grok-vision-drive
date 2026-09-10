@@ -1,12 +1,15 @@
-"""BeamNG.tech session: connect, player vehicle, electrics/damage/pose. Vision-only.
+"""BeamNG.tech session: connect, player vehicle, electrics/damage/pose + GPS nav hint.
 
-Never attaches LiDAR / radar / ultrasonic / GPS. Camera RGB is handled by cameras.py.
-Coordinates: GVD vehicle frame is +X right, +Y forward, +Z up. BeamNGpy Camera vehicle
-space is +X left, +Y backward, +Z up (default dir=(0,-1,0) is forward). Convert at attach.
+Never attaches LiDAR / radar / ultrasonic. Camera RGB is handled by cameras.py.
+GPS (Tech) is a coarse nav hint for a future map pin — not camera localization and not
+a drive-to-pin planner. Coordinates: GVD vehicle frame is +X right, +Y forward, +Z up.
+BeamNGpy Camera/GPS vehicle space is +X left, +Y backward, +Z up (default Camera
+dir=(0,-1,0) is forward). Convert at attach.
 """
 
 from __future__ import annotations
 
+import inspect
 import math
 import os
 import time
@@ -15,7 +18,11 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
-FORBIDDEN_SENSORS = ("lidar", "radar", "ultrasonic", "gps", "idealradar", "ideal_radar")
+FORBIDDEN_SENSORS = ("lidar", "radar", "ultrasonic", "idealradar", "ideal_radar")
+EARTH_R_M = 6371000.0
+# BeamNG maps have no real-world lat/lon. These put world (0, 0) on the Italy demo sphere.
+DEFAULT_REF_LON = 8.8017
+DEFAULT_REF_LAT = 53.0793
 
 
 def _num(v: Any) -> float | None:
@@ -54,6 +61,131 @@ def gvd_to_bng_vehicle(x: float, y: float, z: float) -> tuple[float, float, floa
 
 def bng_to_gvd_vehicle(x: float, y: float, z: float) -> tuple[float, float, float]:
     return gvd_to_bng_vehicle(x, y, z)
+
+
+def wrap180(deg: float) -> float:
+    x = (float(deg) + 180.0) % 360.0 - 180.0
+    if x <= -180.0:
+        return 180.0
+    return x
+
+
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2.0) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2.0) ** 2
+    a = min(1.0, max(0.0, a))
+    return 2.0 * EARTH_R_M * math.asin(math.sqrt(a))
+
+
+def bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Initial bearing, degrees clockwise from north."""
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dlmb = math.radians(lon2 - lon1)
+    x = math.sin(dlmb) * math.cos(p2)
+    y = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dlmb)
+    return (math.degrees(math.atan2(x, y)) + 360.0) % 360.0
+
+
+def heading_from_world_dir(direction: tuple[float, float, float] | None) -> float | None:
+    """Heading clockwise from north, assuming world +X east / +Y north (GPS map origin)."""
+    if direction is None:
+        return None
+    dx, dy = float(direction[0]), float(direction[1])
+    if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+        return None
+    return (math.degrees(math.atan2(dx, dy)) + 360.0) % 360.0
+
+
+def _flatten_gps_samples(raw: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    if raw is None:
+        return out
+    if isinstance(raw, dict):
+        if any(k in raw for k in ("lon", "lat", "x", "y")):
+            out.append(raw)
+            return out
+        data = raw.get("data")
+        if data is not None and data is not raw:
+            return _flatten_gps_samples(data)
+        for v in raw.values():
+            out.extend(_flatten_gps_samples(v))
+        return out
+    if isinstance(raw, (list, tuple)):
+        for item in raw:
+            out.extend(_flatten_gps_samples(item))
+        return out
+    data = getattr(raw, "data", None)
+    if data is not None:
+        return _flatten_gps_samples(data)
+    return out
+
+
+def latest_gps_reading(raw: Any) -> dict[str, Any] | None:
+    """Pick the newest lon/lat sample from a BeamNGpy GPS.poll() payload (list, dict, or bulk)."""
+    samples = _flatten_gps_samples(raw)
+    if not samples:
+        return None
+    timed: list[tuple[float, dict[str, Any]]] = []
+    for s in samples:
+        t = _num(s.get("time"))
+        if t is not None:
+            timed.append((t, s))
+    if timed:
+        timed.sort(key=lambda p: p[0])
+        return timed[-1][1]
+    return samples[-1]
+
+
+def empty_nav(*, note: str = "retail / no Tech GPS") -> dict[str, Any]:
+    return {
+        "mode": "missing",
+        "drive_to_pin": False,
+        "gps": None,
+        "pin": None,
+        "range_m": None,
+        "bearing_deg": None,
+        "bearing_rel_deg": None,
+        "note": note,
+    }
+
+
+def nav_snapshot(data: VehicleData | None) -> dict[str, Any]:
+    """gvd_state.json `nav` block. mode=hint never means the planner is routing to the pin."""
+    if data is None or not data.connected:
+        return empty_nav()
+    gps_ok = data.lat is not None and data.lon is not None
+    pin = None
+    if data.pin_lat is not None and data.pin_lon is not None:
+        pin = {"lat": data.pin_lat, "lon": data.pin_lon, "name": data.pin_name or ""}
+    return {
+        "mode": "hint" if gps_ok else "missing",
+        "drive_to_pin": False,
+        "gps": {
+            "lat": data.lat,
+            "lon": data.lon,
+            "x": data.gps_x,
+            "y": data.gps_y,
+            "ok": gps_ok,
+        },
+        "pin": pin,
+        "range_m": data.range_m,
+        "bearing_deg": data.bearing_deg,
+        "bearing_rel_deg": data.bearing_rel_deg,
+        "note": "nav hint only; not localization; pin is not a route",
+    }
+
+
+def apply_nav_missing(missing: list[str] | None, nav: dict[str, Any] | None) -> list[str]:
+    """Keep `nav` honest: Tech GPS is a hint; drive-to-pin stays missing until a planner exists."""
+    out = [m for m in (missing or []) if m not in ("nav", "nav drive-to-pin")]
+    mode = str((nav or {}).get("mode") or "missing")
+    if mode == "hint":
+        out.append("nav drive-to-pin")
+    else:
+        out.append("nav")
+    return sorted(set(out))
 
 
 def path_ego_to_world(
@@ -128,6 +260,30 @@ def apply_env_overrides(cfg: dict[str, Any]) -> dict[str, Any]:
     vid = os.environ.get("GVD_TECH_VEHICLE")
     if vid:
         out["vehicle"] = vid
+    gps_env = os.environ.get("GVD_GPS", "").strip().lower()
+    if gps_env:
+        sensors = dict(out["sensors"]) if isinstance(out.get("sensors"), dict) else {}
+        if gps_env in ("1", "true", "yes"):
+            sensors["gps"] = True
+        elif gps_env in ("0", "false", "no"):
+            sensors["gps"] = False
+        out["sensors"] = sensors
+    pin_lat = os.environ.get("GVD_NAV_PIN_LAT")
+    pin_lon = os.environ.get("GVD_NAV_PIN_LON")
+    pin_name = os.environ.get("GVD_NAV_PIN_NAME")
+    if pin_lat or pin_lon or pin_name:
+        nav = dict(out["nav"]) if isinstance(out.get("nav"), dict) else {}
+        if pin_lat:
+            n = _num(pin_lat)
+            if n is not None:
+                nav["pin_lat"] = n
+        if pin_lon:
+            n = _num(pin_lon)
+            if n is not None:
+                nav["pin_lon"] = n
+        if pin_name:
+            nav["pin_name"] = pin_name
+        out["nav"] = nav
     return out
 
 
@@ -159,6 +315,18 @@ class VehicleData:
     gz: float | None = None
     yaw_rate: float | None = None
     accel: float | None = None
+    lat: float | None = None
+    lon: float | None = None
+    gps_x: float | None = None
+    gps_y: float | None = None
+    gps_time: float | None = None
+    gps_heading_deg: float | None = None
+    pin_lat: float | None = None
+    pin_lon: float | None = None
+    pin_name: str | None = None
+    range_m: float | None = None
+    bearing_deg: float | None = None
+    bearing_rel_deg: float | None = None
     note: str = ""
     sensors: dict[str, str] = field(default_factory=dict)
 
@@ -178,6 +346,8 @@ class TechSession:
         self._logged = False
         self._last_dir: tuple[float, float, float] | None = None
         self._last_t: float | None = None
+        self._gps: Any = None
+        self._last_gps: tuple[float, float] | None = None
         self.note = ""
 
     def connect(self, *, explicit: bool = True) -> bool:
@@ -297,7 +467,7 @@ class TechSession:
         return veh
 
     def attach_vehicle_sensors(self) -> dict[str, bool]:
-        """Electrics + Damage + GForces only. Refuses perception extras."""
+        """Electrics + Damage + GForces + GPS nav hint. Refuses LiDAR/radar/ultrasonic."""
         flags = self.config.get("sensors") if isinstance(self.config.get("sensors"), dict) else {}
         for name in FORBIDDEN_SENSORS:
             if flags.get(name):
@@ -312,10 +482,12 @@ class TechSession:
             self.attached["damage"] = self._attach_classic(vehicle, bng, "damage", "Damage")
         if flags.get("gforces", True):
             self.attached["gforces"] = self._attach_classic(vehicle, bng, "gforces", "GForces")
+        if flags.get("gps", True):
+            self.attached["gps"] = self._attach_gps(vehicle, bng)
         ok = [k for k, v in self.attached.items() if v]
         self._log(
             f"[GVD] tech vehicle sensors: {', '.join(ok) if ok else 'none'} "
-            f"(RGB cameras separate; no LiDAR/radar/GPS)."
+            f"(RGB cameras separate; GPS is a nav hint, not localization; no LiDAR/radar)."
         )
         return dict(self.attached)
 
@@ -340,6 +512,85 @@ class TechSession:
         except Exception as e:
             self._log(f"[GVD] attach {key} failed: {e}")
         return False
+
+    def _attach_gps(self, vehicle: Any, bng: Any) -> bool:
+        """CommBase GPS like Camera: GPS(name, bng, vehicle, pos=..., ref_lon=...)."""
+        if self._gps is not None:
+            return True
+        try:
+            from beamngpy.sensors import GPS  # type: ignore
+        except Exception as e:
+            self._log(f"[GVD] GPS class missing ({e}); nav lat/lon missing.")
+            return False
+        gps_cfg = self.config.get("gps") if isinstance(self.config.get("gps"), dict) else {}
+        pos = list(gps_cfg.get("pos_m") or [0.0, 0.0, 1.7])
+        while len(pos) < 3:
+            pos.append(0.0)
+        cams = self.config.get("cameras") if isinstance(self.config.get("cameras"), dict) else {}
+        if cams.get("convert_gvd_frame", True):
+            pos_bng = gvd_to_bng_vehicle(float(pos[0]), float(pos[1]), float(pos[2]))
+        else:
+            pos_bng = (float(pos[0]), float(pos[1]), float(pos[2]))
+        ref_lon = _num(gps_cfg.get("ref_lon") if gps_cfg.get("ref_lon") is not None else gps_cfg.get("refLon"))
+        ref_lat = _num(gps_cfg.get("ref_lat") if gps_cfg.get("ref_lat") is not None else gps_cfg.get("refLat"))
+        if ref_lon is None:
+            ref_lon = DEFAULT_REF_LON
+        if ref_lat is None:
+            ref_lat = DEFAULT_REF_LAT
+        vis = bool(gps_cfg.get("visualised", False))
+        update_s = float(gps_cfg.get("update_s") or 0.05)
+        try:
+            params = set()
+            try:
+                params = set(inspect.signature(GPS.__init__).parameters)
+            except (TypeError, ValueError):
+                params = set()
+            kwargs: dict[str, Any] = {}
+            if not params or "pos" in params:
+                kwargs["pos"] = pos_bng
+            if not params or "is_visualised" in params:
+                kwargs["is_visualised"] = vis
+            if "is_snapping_desired" in params:
+                kwargs["is_snapping_desired"] = False
+            if not params or "ref_lon" in params:
+                kwargs["ref_lon"] = ref_lon
+                kwargs["ref_lat"] = ref_lat
+            elif "refLon" in params:
+                kwargs["refLon"] = ref_lon
+                kwargs["refLat"] = ref_lat
+            if "gfx_update_time" in params:
+                kwargs["gfx_update_time"] = update_s
+            elif "requested_update_time" in params:
+                kwargs["requested_update_time"] = update_s
+            self._gps = GPS("gvd_gps", bng, vehicle, **kwargs)
+            return True
+        except Exception as e:
+            self._log(f"[GVD] attach GPS failed: {e}")
+            self._gps = None
+            return False
+
+    def _nav_pin(self) -> tuple[float | None, float | None, str]:
+        nav = self.config.get("nav") if isinstance(self.config.get("nav"), dict) else {}
+        gps = self.config.get("gps") if isinstance(self.config.get("gps"), dict) else {}
+        lat = _num(nav.get("pin_lat"))
+        if lat is None:
+            lat = _num(gps.get("pin_lat"))
+        lon = _num(nav.get("pin_lon"))
+        if lon is None:
+            lon = _num(gps.get("pin_lon"))
+        name = str(nav.get("pin_name") or gps.get("pin_name") or "").strip()
+        return lat, lon, name
+
+    def _poll_gps(self) -> dict[str, Any] | None:
+        gps = self._gps
+        if gps is None:
+            return None
+        try:
+            raw = gps.poll() if hasattr(gps, "poll") else None
+        except Exception as e:
+            self._log(f"[GVD] GPS poll failed: {e}")
+            return None
+        return latest_gps_reading(raw)
 
     def poll(self) -> VehicleData:
         data = VehicleData(
@@ -398,7 +649,38 @@ class TechSession:
         if data.speed_mps is None and data.vel is not None:
             vx, vy, vz = data.vel
             data.speed_mps = math.sqrt(vx * vx + vy * vy + vz * vz)
+        self._fill_nav(data)
         return data
+
+    def _fill_nav(self, data: VehicleData) -> None:
+        reading = self._poll_gps()
+        if reading:
+            data.lat = _num(reading.get("lat"))
+            data.lon = _num(reading.get("lon"))
+            data.gps_x = _num(reading.get("x"))
+            data.gps_y = _num(reading.get("y"))
+            data.gps_time = _num(reading.get("time"))
+            data.sensors["gps"] = "ok" if data.lat is not None and data.lon is not None else "missing"
+        elif self.attached.get("gps"):
+            data.sensors["gps"] = "missing"
+        pin_lat, pin_lon, pin_name = self._nav_pin()
+        data.pin_lat, data.pin_lon = pin_lat, pin_lon
+        data.pin_name = pin_name or None
+        heading: float | None = None
+        if data.lat is not None and data.lon is not None:
+            if self._last_gps is not None:
+                plat, plon = self._last_gps
+                if haversine_m(plat, plon, data.lat, data.lon) > 0.5:
+                    heading = bearing_deg(plat, plon, data.lat, data.lon)
+            self._last_gps = (data.lat, data.lon)
+        if heading is None:
+            heading = heading_from_world_dir(data.dir)
+        data.gps_heading_deg = heading
+        if data.lat is not None and data.lon is not None and pin_lat is not None and pin_lon is not None:
+            data.range_m = haversine_m(data.lat, data.lon, pin_lat, pin_lon)
+            data.bearing_deg = bearing_deg(data.lat, data.lon, pin_lat, pin_lon)
+            if heading is not None:
+                data.bearing_rel_deg = wrap180(data.bearing_deg - heading)
 
     def _poll_sensors(self, vehicle: Any) -> dict[str, Any]:
         out: dict[str, Any] = {}
@@ -476,6 +758,15 @@ class TechSession:
         return (px, py, pz), dir_gvd, up_gvd
 
     def close(self) -> None:
+        if self._gps is not None:
+            try:
+                self._gps.remove()
+            except Exception:
+                try:
+                    self._gps.detach()
+                except Exception:
+                    pass
+            self._gps = None
         self.vehicle = None
         if self.bng is not None:
             try:
@@ -512,12 +803,12 @@ class TechSession:
 
 
 def run_probe(config: dict[str, Any] | None = None) -> int:
-    """Connect, list the player vehicle, poll electrics/pose/damage. No fake cameras."""
+    """Connect, list the player vehicle, poll electrics/pose/damage/GPS. No fake cameras."""
     cfg = apply_env_overrides(config if config is not None else load_tech_config())
     # Probe should not wait a full minute on a box with no Tech.
     cfg.setdefault("wait_vehicle_s", cfg.get("wait_vehicle_s", 15))
     session = TechSession(cfg)
-    print("[GVD] tech probe: vision-only (RGB + ego kinematics). No LiDAR/radar/GPS.")
+    print("[GVD] tech probe: RGB + ego kinematics + GPS nav hint. No LiDAR/radar. Pin is not a route.")
     if not session.connect(explicit=True):
         print(f"[GVD] tech probe FAIL: {session.note}")
         session.close()
@@ -531,5 +822,10 @@ def run_probe(config: dict[str, Any] | None = None) -> int:
     )
     if data.pos:
         print(f"[GVD] pose pos={data.pos} dir={data.dir}")
+    if data.lat is not None and data.lon is not None:
+        pin = f" pin={data.pin_name or '-'} range={data.range_m} bearing={data.bearing_deg}"
+        print(f"[GVD] gps lat={data.lat} lon={data.lon}{pin} (hint only; not routing)")
+    else:
+        print("[GVD] gps missing (Tech GPS did not return lat/lon)")
     session.close()
     return 0

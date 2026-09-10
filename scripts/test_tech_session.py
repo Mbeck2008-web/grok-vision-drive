@@ -20,9 +20,16 @@ from python.sensors.tech import (  # noqa: E402
     TechSession,
     VehicleData,
     apply_env_overrides,
+    apply_nav_missing,
+    bearing_deg,
     gvd_to_bng_vehicle,
+    haversine_m,
+    heading_from_world_dir,
+    latest_gps_reading,
     load_tech_config,
+    nav_snapshot,
     path_ego_to_world,
+    wrap180,
 )
 
 
@@ -58,13 +65,21 @@ def check_tech_yaml() -> None:
     sensors = cfg.get("sensors") or {}
     assert sensors.get("electrics") is True
     assert sensors.get("damage") is True
+    assert sensors.get("gps") is True
     for bad in FORBIDDEN_SENSORS:
         assert not sensors.get(bad), bad
+    assert "gps" not in FORBIDDEN_SENSORS
     cams = cfg.get("cameras") or {}
     assert cams.get("rgb_only") is True
     assert cams.get("convert_gvd_frame") is True
     text = (ROOT / "config" / "tech.yaml").read_text(encoding="utf-8").lower()
     assert "lidar" in text and "never" in text
+    assert "nav hint" in text or "map pin" in text
+    nav = cfg.get("nav") or {}
+    assert "pin_lat" in nav and "pin_lon" in nav
+    gps = cfg.get("gps") or {}
+    assert gps.get("ref_lon") is not None and gps.get("ref_lat") is not None
+    assert list(gps.get("pos_m") or [])[:3] == [0.0, 0.0, 1.7]
     rig = load_camera_config()
     ids = [c.get("id") for c in (rig.get("cameras") or [])]
     assert ids == list(CAM_IDS), ids
@@ -96,6 +111,115 @@ def check_forbidden_attach() -> None:
         raise AssertionError("lidar must be refused")
     except ValueError as e:
         assert "lidar" in str(e).lower()
+
+
+def check_gps_not_forbidden() -> None:
+    session = TechSession({"sensors": {"gps": True, "electrics": False, "damage": False, "gforces": False}, "wait_vehicle_s": 0})
+    session.vehicle = object()
+    session.bng = object()
+    try:
+        attached = session.attach_vehicle_sensors()
+    except ValueError as e:
+        raise AssertionError(f"GPS must be allowed, got {e}") from e
+    # Live GPS needs BeamNGpy; offline we only require no refuse.
+    assert attached.get("gps") in (True, False)
+
+
+def check_gps_geometry() -> None:
+    d = haversine_m(0.0, 0.0, 1.0, 0.0)
+    assert abs(d - 111194.9) < 250, d
+    assert abs(bearing_deg(0.0, 0.0, 1.0, 0.0) - 0.0) < 1e-6
+    assert abs(bearing_deg(0.0, 0.0, 0.0, 1.0) - 90.0) < 1e-6
+    assert abs(wrap180(190.0) - (-170.0)) < 1e-9
+    assert heading_from_world_dir((0.0, 1.0, 0.0)) == 0.0  # +Y north
+    assert abs(heading_from_world_dir((1.0, 0.0, 0.0)) - 90.0) < 1e-6  # +X east
+    bulk = [{"time": 1.0, "lat": 53.0, "lon": 8.8}, {"time": 2.0, "lat": 53.1, "lon": 8.81}]
+    got = latest_gps_reading(bulk)
+    assert got is not None and got["lat"] == 53.1
+    assert latest_gps_reading([{"lat": 1.0, "lon": 2.0}])["lon"] == 2.0
+    assert latest_gps_reading({"lat": 53.09, "lon": 8.81, "x": 1, "y": 2})["lat"] == 53.09
+
+
+def check_gps_poll_and_pin() -> None:
+    class Box(dict):
+        def __contains__(self, k):
+            return dict.__contains__(self, k)
+
+        def __iter__(self):
+            return dict.__iter__(self)
+
+    class FakeSensors(Box):
+        def poll(self):
+            return self
+
+    class FakeGPS:
+        def __init__(self):
+            self.removed = False
+
+        def poll(self):
+            return [{"time": 1.0, "lon": 8.81, "lat": 53.09, "x": 10.0, "y": 20.0}]
+
+        def remove(self):
+            self.removed = True
+
+    class FakeVeh:
+        vid = "etk_player"
+        options = {"model": "etk800"}
+        state = {"pos": (10.0, 20.0, 1.0), "dir": (0.0, 1.0, 0.0), "up": (0.0, 0.0, 1.0), "vel": (0, 8, 0)}
+        sensors = FakeSensors(
+            electrics={"wheelspeed": 8.0, "steering_input": 0.2, "throttle_input": 0.1, "brake_input": 0.0, "gear": 3, "rpm": 2200},
+            damage={"damage": 0.05},
+            gforces={"gx": 0.1, "gy": 0.2, "gz": 0.0},
+        )
+
+    session = TechSession(
+        {
+            "wait_vehicle_s": 0,
+            "sensors": {"electrics": True, "damage": True, "gforces": True, "gps": True},
+            "nav": {"pin_lat": 53.10, "pin_lon": 8.82, "pin_name": "west gate"},
+        }
+    )
+    session.vehicle = FakeVeh()
+    session.attached = {"electrics": True, "damage": True, "gforces": True, "gps": True}
+    gps = FakeGPS()
+    session._gps = gps
+    data = session.poll()
+    assert data.lat == 53.09 and data.lon == 8.81
+    assert data.gps_x == 10.0 and data.pin_name == "west gate"
+    assert data.range_m is not None and data.range_m > 0
+    assert data.bearing_deg is not None
+    # Facing +Y (north); pin is east-ish of current lon → relative bearing to the right.
+    assert data.bearing_rel_deg is not None and data.bearing_rel_deg > 0
+    snap = nav_snapshot(data)
+    assert snap["mode"] == "hint" and snap["drive_to_pin"] is False
+    assert snap["pin"]["name"] == "west gate"
+    miss = apply_nav_missing(["tracks", "nav"], snap)
+    assert "nav drive-to-pin" in miss and "nav" not in miss
+    assert nav_snapshot(None)["mode"] == "missing"
+    session.close()
+    assert gps.removed is True
+
+
+def check_pin_env_override() -> None:
+    import os
+
+    keys = ("GVD_NAV_PIN_LAT", "GVD_NAV_PIN_LON", "GVD_NAV_PIN_NAME", "GVD_GPS")
+    old = {k: os.environ.get(k) for k in keys}
+    try:
+        os.environ["GVD_NAV_PIN_LAT"] = "53.2"
+        os.environ["GVD_NAV_PIN_LON"] = "8.9"
+        os.environ["GVD_NAV_PIN_NAME"] = "dock"
+        os.environ["GVD_GPS"] = "1"
+        out = apply_env_overrides({"sensors": {"gps": False}, "nav": {}})
+        assert out["sensors"]["gps"] is True
+        assert out["nav"]["pin_lat"] == 53.2 and out["nav"]["pin_lon"] == 8.9
+        assert out["nav"]["pin_name"] == "dock"
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def check_poll_mock() -> None:
@@ -179,6 +303,10 @@ def main() -> None:
     check_tech_yaml()
     check_env_overrides({})
     check_forbidden_attach()
+    check_gps_not_forbidden()
+    check_gps_geometry()
+    check_gps_poll_and_pin()
+    check_pin_env_override()
     check_poll_mock()
     check_auto_backend_not_tech_without_env()
     check_connect_without_beamngpy()

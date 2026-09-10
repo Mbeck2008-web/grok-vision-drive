@@ -21,7 +21,7 @@ from python.control.actuate import (
     stop_command,
     write_engage_flag,
 )
-from python.sensors.tech import VehicleData, path_ego_to_world, run_probe
+from python.sensors.tech import VehicleData, apply_nav_missing, nav_snapshot, path_ego_to_world, run_probe
 from python.control.e2e import make_e2e
 from python.control.override import (
     OverrideDetector,
@@ -331,7 +331,7 @@ def main() -> None:
     print(f"[GVD] M5 policy={args.policy} e2e={e2e_policy.name} (modular vetoes E2E; shadow writes both)")
     print(f"[GVD] clip encoder={recorder.encoder} (qsv prefer; never default nvenc)")
     print(f"[GVD] state path: {state_path()}")
-    print("[GVD] Vision-only: no LiDAR/radar/GPS-loc/HD-map in the live loop.")
+    print("[GVD] Vision-only: no LiDAR/radar/ultrasonic/HD-map in the live loop. Tech GPS is a nav hint (not localization; pin is not a route).")
     print("[GVD] M3: no drive on preview unless --allow-preview-drive; engage via Alt+G (gvd_engage.json).")
     print("[GVD] M4: clips on disengage / AEB / near-miss / key C. Live QSV UNPROVEN until Windows smoke.")
     print(
@@ -550,6 +550,7 @@ def main() -> None:
                     "sensors": dict(vdata.sensors),
                     "note": vdata.note,
                 }
+            st["nav"] = nav_snapshot(vdata)
             st["path_ego"] = pout.path_ego if pout.path_ego else steer_preview_path_ego(steer, length_m=36.0)
             if not pout.path_ego:
                 st["path_debug_preview"] = True
@@ -620,6 +621,7 @@ def main() -> None:
             st["missing_state_keys"] = sorted(set(base_miss + miss))
             if pout.path_debug_preview is False:
                 st["missing_state_keys"] = [m for m in st["missing_state_keys"] if "path_ego" not in m]
+            st["missing_state_keys"] = apply_nav_missing(st["missing_state_keys"], st.get("nav"))
             st["heartbeat_ms"] = (time.perf_counter() - loop_t0) * 1000.0
 
             # M4 ring + triggers

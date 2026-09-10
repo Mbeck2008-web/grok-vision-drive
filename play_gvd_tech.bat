@@ -57,7 +57,7 @@ if errorlevel 1 (
 )
 
 :supervisor
-echo [GVD] Tech path: 8 RGB cameras from cameras.yaml + electrics/damage/pose. No LiDAR/radar/GPS.
+echo [GVD] Tech path: 8 RGB cameras + electrics/damage/pose + GPS nav hint (not localization, not drive-to-pin yet). No LiDAR/radar.
 echo [GVD] Starting supervisor: %RUN%  (backend=beamngpy)
 echo [GVD] Match BeamNGpy to your Tech build (0.38 -^> 1.35.x, 0.39 -^> 1.36). Edit config\tech.yaml.
 start "GVD supervisor" /D "%RUNROOT%" cmd /k %PY% "%RUN%" --backend beamngpy --viz %*
@@ -79,7 +79,8 @@ if defined BNG_HOME (
 )
 echo [GVD] Start BeamNG.tech yourself if it is not already running.
 echo [GVD] Place tech.key next to the Tech exe (install dir, not the user folder).
-echo [GVD] Spawn a vehicle, then the supervisor attaches cameras + electrics. Alt+G = Engage.
+echo [GVD] Spawn a vehicle, then the supervisor attaches cameras + electrics + GPS. Alt+G = Engage.
+echo [GVD] Optional pin: edit config\tech.yaml nav.pin_lat / pin_lon. Hint only — GVD is not routing to the pin yet.
 echo [GVD] Probe without driving:  %PY% "%RUN%" --tech-probe
 
 :done

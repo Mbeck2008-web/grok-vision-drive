@@ -6,8 +6,9 @@
 local logs = {}
 function log(level, tag, msg) logs[#logs + 1] = msg end
 
--- Minimal flat-JSON decoder (BeamNG provides jsonDecode in-game).
-function jsonDecode(s)
+-- Minimal JSON decoder: flat scalars plus one level of nested objects, which is all the mod
+-- reads (gvd_state.json nests override_cfg). BeamNG provides a real jsonDecode in-game.
+local function decodeScalars(s)
   local t = {}
   for k, v in s:gmatch('"([%w_]+)"%s*:%s*([^,}]+)') do
     v = v:gsub('^%s+', ''):gsub('%s+$', '')
@@ -17,6 +18,16 @@ function jsonDecode(s)
     elseif v:sub(1, 1) == '"' then t[k] = v:sub(2, -2)
     else t[k] = tonumber(v) end
   end
+  return t
+end
+
+function jsonDecode(s)
+  local t = {}
+  local rest = s:gsub('"([%w_]+)"%s*:%s*(%b{})', function(k, obj)
+    t[k] = decodeScalars(obj)
+    return ''
+  end)
+  for k, v in pairs(decodeScalars(rest)) do t[k] = v end
   return t
 end
 
@@ -95,9 +106,9 @@ local function writeCmd(engaged, steer, throttle, brake, hbOffset)
     steer, throttle, brake, seq, engaged and 'true' or 'false', os.time() + (hbOffset or 0)))
   return seq
 end
-local function beatState(engaged, reason)
-  writeFile(statePath, string.format('{"engaged":%s,"disengage_reason":"%s","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15}',
-    engaged and 'true' or 'false', reason or 'none', os.clock() + seq))
+local function beatState(engaged, reason, overrideCfg)
+  writeFile(statePath, string.format('{"engaged":%s,"disengage_reason":"%s","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15%s}',
+    engaged and 'true' or 'false', reason or 'none', os.clock() + seq, overrideCfg and (',"override_cfg":' .. overrideCfg) or ''))
 end
 
 M.onExtensionLoaded()
@@ -231,6 +242,83 @@ clearEvents()
 M.toggleEngage()
 check(lastEvent('throttle').veh == 202 and near(lastEvent('throttle')[2], 0), 'disengage releases the vehicle we actually drove')
 currentVeh = fakeVeh
+
+-- 13) driver override: force-feedback chatter must not disengage, a real driver must ────────────
+-- The mod only sees the electrics echo, so the harness plays the wheel/pedals by writing
+-- electrics.values; applyCmdJson reads the echo the *previous* tick round-tripped through GE.
+local function echo(steer, thr, brk)
+  electricsValues.steering_input = steer
+  electricsValues.throttle_input = thr
+  electricsValues.brake_input = brk
+end
+local function driveTick(steerCmd, thrCmd, brkCmd, overrideCfg)
+  writeCmd(true, steerCmd, thrCmd, brkCmd)
+  beatState(true, 'none', overrideCfg)
+  M.onUpdate(0.11)
+  drainGE()
+end
+
+echo(0, 0.3, 0)
+M.toggleEngage()
+driveTick(0, 0.3, 0)
+driveTick(0, 0.3, 0)
+check(M.isEngaged(), 'engaged and driving before the wheel is touched')
+
+for i = 1, 12 do
+  -- what a force-feedback wheel does over bumps: big, fast, alternating
+  echo((i % 2 == 0) and 0.7 or -0.7, 0.3, 0)
+  driveTick(0, 0.3, 0)
+end
+check(M.isEngaged(), 'alternating force-feedback chatter (+/-0.7) does not disengage')
+
+for _ = 1, 12 do
+  echo(0.08, 0.3, 0)
+  driveTick(0, 0.3, 0)
+end
+check(M.isEngaged(), 'steady steer noise inside the deadband does not disengage')
+
+-- a steady hold between the bare 0.55 threshold and the compensated 0.65 trip point: the
+-- deadband allowance is what stops this one from disengaging
+for _ = 1, 12 do
+  echo(0.60, 0.3, 0)
+  driveTick(0, 0.3, 0)
+end
+check(M.isEngaged(), 'steer hold inside the deadband allowance (0.60) does not disengage')
+
+echo(0.8, 0.3, 0)
+driveTick(0, 0.3, 0); driveTick(0, 0.3, 0); driveTick(0, 0.3, 0)
+check(not M.isEngaged(), 'steer held past the trip point in one direction -> disengage')
+check(logs[#logs]:find('driver override on steer') ~= nil, 'override logged the steer channel')
+local ef2 = readFileAll(engagePath)
+check(ef2 and ef2:find('"engaged":false') and ef2:find('driver_override'),
+  'override wrote gvd_engage.json engaged=false disengage_reason=driver_override')
+
+-- pedals stay hard: no deadband, no dwell
+echo(0, 0.3, 0)
+M.toggleEngage()
+driveTick(0, 0.3, 0); driveTick(0, 0.3, 0)
+check(M.isEngaged(), 'Alt+A re-arms after an override')
+echo(0, 0.3, 0.25)
+driveTick(0, 0.3, 0); driveTick(0, 0.3, 0)
+check(not M.isEngaged(), 'driver brake press (0.25) -> disengage on the tick it is seen')
+check(logs[#logs]:find('driver override on brake') ~= nil, 'override logged the brake channel')
+
+-- GVD's own AEB brake hold echoes back at 1.0 and must not read as the driver
+echo(0, 0, 1.0)
+M.toggleEngage()
+driveTick(0, 0, 1.0); driveTick(0, 0, 1.0); driveTick(0, 0, 1.0)
+check(M.isEngaged(), 'our own brake=1 echoed back is not an override')
+
+-- thresholds are tunable: the supervisor mirrors config/control.yaml into gvd_state.override_cfg
+local tuned = '{"steer_deadband":0.02,"steer_enter":0.20,"steer_clear":0.10,"steer_hold_s":0.0,"brake_enter":0.08,"throttle_enter":0.15,"pedal_hold_s":0.0,"steer_cmd_max":0.20,"cmd_window_s":0.30,"steer_sign_flip_resets":true,"ffb_assume_wheel":true}'
+echo(0, 0.3, 0)
+driveTick(0, 0.3, 0, tuned)
+check(M.isEngaged(), 'still engaged after adopting the mirrored thresholds')
+check(logs[#logs - 1]:find('deadband 0.02') ~= nil or logs[#logs]:find('deadband 0.02') ~= nil,
+  'mirrored override_cfg logged (deadband 0.02)')
+echo(0.30, 0.3, 0)
+driveTick(0, 0.3, 0, tuned); driveTick(0, 0.3, 0, tuned)
+check(not M.isEngaged(), 'tuned steer_enter 0.20 trips on a 0.30 hold the default 0.55 ignores')
 
 -- 12) chrome check on everything we push to the vehicle / HUD
 for _, e in ipairs(logs) do assert(not e:lower():find('tesla') and not e:find('FSD'), 'chrome in log: ' .. e) end

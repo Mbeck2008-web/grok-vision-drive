@@ -14,7 +14,10 @@ import time
 import zipfile
 from pathlib import Path
 
+from typing import Callable
+
 import numpy as np
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -158,14 +161,23 @@ def check_window_backend_one_cam() -> None:
     assert all(v == "missing" for v in empty.health_str().values())
 
 
-def _write_ego(seq: int, *, applying: bool = True, speed: float = 5.5, steer_in: float = 0.0, age_s: float = 0.0) -> None:
+def _write_ego(
+    seq: int,
+    *,
+    applying: bool = True,
+    speed: float = 5.5,
+    steer_in: float = 0.0,
+    throttle_in: float = 0.0,
+    brake_in: float = 0.0,
+    age_s: float = 0.0,
+) -> None:
     ego_path().write_text(
         json.dumps(
             {
                 "speed_mps": speed,
                 "steering_input": steer_in,
-                "throttle_input": 0.2,
-                "brake_input": 0.0,
+                "throttle_input": throttle_in,
+                "brake_input": brake_in,
                 "applied_seq": seq,
                 "applying": applying,
                 "mtime": int(time.time()),
@@ -241,8 +253,19 @@ def check_cmd_json_drive_bus() -> None:
     ego_path().unlink()
 
 
-def _run_supervisor(extra: list[str], seconds: float, ack: bool = False) -> None:
-    """Run run_vision.py headless for `seconds`; optionally play the mod's ack role meanwhile."""
+def _run_supervisor(
+    extra: list[str],
+    seconds: float,
+    ack: bool = False,
+    steer_echo: Callable[[int], float] | None = None,
+    brake_bias: float = 0.0,
+) -> str:
+    """Run run_vision.py headless for `seconds`; optionally play the mod's ack role meanwhile.
+
+    The fake mod echoes back what it was told to apply, exactly like `gvd_main` does, so the
+    override residual is zero unless a test deliberately plays a driver: `steer_echo(seq)`
+    reports a wheel position instead of the commanded one, `brake_bias` adds a pedal press.
+    """
     args = [sys.executable, "-u", str(ROOT / "python" / "run_vision.py"), "--backend", "stub", "--hz", "20", "--encode", "cpu", *extra]
     env = dict(os.environ, PYTHONPATH=str(ROOT))
     proc = subprocess.Popen(args, cwd=str(ROOT), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -253,19 +276,33 @@ def _run_supervisor(extra: list[str], seconds: float, ack: bool = False) -> None
                 out = proc.stdout.read() if proc.stdout else ""
                 raise AssertionError(f"run_vision exited early ({proc.returncode}):\n{out}")
             if ack:
+                cmd: dict = {}
                 try:
-                    seq = int(json.loads(cmd_path().read_text(encoding="utf-8")).get("seq", -1))
+                    cmd = json.loads(cmd_path().read_text(encoding="utf-8"))
+                    seq = int(cmd.get("seq", -1))
                 except Exception:
                     seq = -1
                 if seq >= 0:
-                    _write_ego(seq, applying=True, speed=5.5)
-            time.sleep(0.05)
+                    _write_ego(
+                        seq,
+                        applying=True,
+                        speed=5.5,
+                        steer_in=steer_echo(seq) if steer_echo else float(cmd.get("steer", 0.0)),
+                        throttle_in=float(cmd.get("throttle", 0.0)),
+                        brake_in=min(1.0, float(cmd.get("brake", 0.0)) + brake_bias),
+                    )
+            # Tighter than the 20 Hz supervisor loop so the echo always belongs to the newest seq.
+            time.sleep(0.01)
     finally:
         proc.kill()  # SIGKILL: the `finally` stop never runs, so the last tick's files survive for assertions
         try:
             proc.wait(timeout=5)
         except Exception:
             pass
+    try:
+        return proc.stdout.read() if proc.stdout else ""
+    except Exception:
+        return ""
 
 
 def check_run_vision_e2e() -> None:
@@ -298,6 +335,56 @@ def check_run_vision_e2e() -> None:
     assert st["cmd_reason"] == "cmd_json_applied" and st["ego_source"] == "lua" and st["lua_applying"] is True
     assert abs(float(st["ego"]["speed_mps"]) - 5.5) < 1e-6, st["ego"]
     assert st["cmd_ack_seq"] >= st["cmd_seq"] - 5
+
+    write_engage_flag(False)
+    ego_path().unlink()
+
+
+def check_ffb_override_live() -> None:
+    """Whole loop with a wheel on the echo: chatter keeps driving, a real driver gets the car."""
+    if ego_path().exists():
+        ego_path().unlink()
+
+    # Force-feedback chatter — alternating kicks well past M6's bare 0.55 threshold, keyed off
+    # the seq the supervisor just wrote so the sign really does flip every tick.
+    write_engage_flag(True)
+    out = _run_supervisor(["--allow-preview-drive"], seconds=3.0, ack=True, steer_echo=lambda seq: 0.9 if seq % 2 else -0.9)
+    assert "DISENGAGED: driver override" not in out, out[-2000:]
+    assert read_engage_flag(default=False) is True, "force-feedback chatter disengaged GVD"
+    cmd = json.loads(cmd_path().read_text(encoding="utf-8"))
+    assert cmd["engaged"] is True and cmd["reason"] == "ok", cmd
+    st = read_state()
+    assert st and st["engaged"] is True and st["disengage_reason"] == "none", {
+        k: st.get(k) for k in ("engaged", "disengage_reason")
+    }
+    assert st["override"]["channel"] == "none" and st["override"]["armed"] is True, st["override"]
+    assert st["override"]["steer_held_s"] < st["override_cfg"]["steer_hold_s"], st["override"]
+    # No sink regression: the mod's ack path still drives while the wheel chatters.
+    assert st["cmd_applied"] is True and st["cmd_reason"] == "cmd_json_applied", st["cmd_reason"]
+
+    # A driver actually holding the wheel over. The engage file is the durable record: later ticks
+    # only see engaged=false and write the generic not_engaged.
+    write_engage_flag(True)
+    out = _run_supervisor(["--allow-preview-drive"], seconds=3.0, ack=True, steer_echo=lambda _seq: 0.95)
+    assert "DISENGAGED: driver override on steer" in out, out[-2000:]
+    assert read_engage_flag(default=True) is False, "a real steer takeover must disengage"
+    assert json.loads(engage_path().read_text(encoding="utf-8"))["disengage_reason"] == "driver_override"
+    st = read_state()
+    assert st and st["engaged"] is False, {k: st.get(k) for k in ("engaged", "disengage_reason")}
+    assert json.loads(cmd_path().read_text(encoding="utf-8"))["engaged"] is False
+
+    # Pedals stay hard: a brake press on top of the command is an override with no dwell.
+    write_engage_flag(True)
+    out = _run_supervisor(["--allow-preview-drive"], seconds=2.0, ack=True, brake_bias=0.4)
+    assert "DISENGAGED: driver override on brake" in out, out[-2000:]
+    assert read_engage_flag(default=True) is False, "a real brake press must disengage"
+    assert json.loads(engage_path().read_text(encoding="utf-8"))["disengage_reason"] == "driver_override"
+
+    # Mirrored thresholds reach the mod through gvd_state.json.
+    from python.control.override import config_mirror, load_override_config
+
+    want = config_mirror(load_override_config(yaml.safe_load((ROOT / "config" / "control.yaml").read_text(encoding="utf-8"))))
+    assert read_state()["override_cfg"] == want, read_state()["override_cfg"]
 
     write_engage_flag(False)
     ego_path().unlink()
@@ -398,6 +485,7 @@ def main() -> None:
     check_player_docs()
     check_lua_harness()
     check_run_vision_e2e()
+    check_ffb_override_live()
     print("test_m6_retail: OK")
 
 

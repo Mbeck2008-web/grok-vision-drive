@@ -72,6 +72,7 @@ MUST_HAVE = (
 EXCLUDE_DIR_NAMES = {
     ".git",
     ".github",
+    ".cursor",
     "__pycache__",
     ".venv",
     "venv",

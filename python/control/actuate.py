@@ -225,14 +225,24 @@ def safe_command(
     return cmd
 
 
-def read_electrics_speed(vehicle: Any) -> tuple[float | None, float | None]:
-    """Return (speed_mps, steering_input) from BeamNGpy Electrics when available."""
+@dataclass
+class DriverInputs:
+    """Electrics echo of what the car is actually doing (Tech path; mirrors EgoFeedback)."""
+
+    speed_mps: float | None = None
+    steering_input: float | None = None
+    throttle_input: float | None = None
+    brake_input: float | None = None
+
+
+def read_electrics(vehicle: Any) -> dict[str, Any] | None:
+    """One best-effort poll of the BeamNGpy Electrics dict. None when the sensor is absent."""
     if vehicle is None:
-        return None, None
+        return None
     try:
         sensors = getattr(vehicle, "sensors", None)
         if sensors is None:
-            return None, None
+            return None
         data = None
         if hasattr(sensors, "poll"):
             data = sensors.poll()
@@ -248,20 +258,37 @@ def read_electrics_speed(vehicle: Any) -> tuple[float | None, float | None]:
             if isinstance(el, dict):
                 data = {"electrics": el}
             else:
-                return None, None
+                return None
         el = data.get("electrics") if "electrics" in data else data
-        if not isinstance(el, dict):
-            return None, None
+        return el if isinstance(el, dict) else None
+    except Exception:
+        return None
+
+
+def read_electrics_inputs(vehicle: Any) -> DriverInputs:
+    """Speed + steering/throttle/brake inputs in one poll (override detection needs pedals)."""
+    el = read_electrics(vehicle)
+    if not el:
+        return DriverInputs()
+    try:
         # wheelspeed / airspeed often m/s already in BeamNG electrics
         spd = el.get("wheelspeed")
         if spd is None:
             spd = el.get("airspeed")
-        steer_in = el.get("steering_input")
-        speed = float(spd) if spd is not None else None
-        steeri = float(steer_in) if steer_in is not None else None
-        return speed, steeri
+        return DriverInputs(
+            speed_mps=_num(spd),
+            steering_input=_num(el.get("steering_input")),
+            throttle_input=_num(el.get("throttle_input")),
+            brake_input=_num(el.get("brake_input")),
+        )
     except Exception:
-        return None, None
+        return DriverInputs()
+
+
+def read_electrics_speed(vehicle: Any) -> tuple[float | None, float | None]:
+    """Return (speed_mps, steering_input) from BeamNGpy Electrics when available."""
+    di = read_electrics_inputs(vehicle)
+    return di.speed_mps, di.steering_input
 
 
 def attach_electrics(vehicle: Any, bng: Any = None) -> bool:

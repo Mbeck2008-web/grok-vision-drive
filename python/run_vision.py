@@ -16,12 +16,18 @@ from python.control.actuate import (
     attach_electrics,
     make_actuator,
     read_ego_feedback,
-    read_electrics_speed,
+    read_electrics_inputs,
     read_engage_flag,
-    safe_command,
+    stop_command,
     write_engage_flag,
 )
 from python.control.e2e import make_e2e
+from python.control.override import (
+    OVERRIDE_REASON,
+    OverrideDetector,
+    config_mirror,
+    load_override_config,
+)
 from python.data.record import ClipRecorder, choose_encoder
 from python.perception.pipeline import ModularPerception
 from python.perception.road_model import lanes_ext, road_edges
@@ -306,7 +312,9 @@ def main() -> None:
         attach_electrics(vehicle, bng)
     actuator = make_actuator(vehicle, prefer_beamngpy=True)
     e2e_policy = make_e2e()
-    shadow_cfg = load_shadow_config(_load_control_yaml())
+    shadow_cfg = load_shadow_config(_ctrl_yaml)
+    override_cfg = load_override_config(_ctrl_yaml)
+    override = OverrideDetector(override_cfg)
 
     allow_nvenc = args.encode == "nvenc"
     if args.encode == "nvenc":
@@ -335,6 +343,12 @@ def main() -> None:
     print("[GVD] Vision-only: no LiDAR/radar/GPS-loc/HD-map in the live loop.")
     print("[GVD] M3: no drive on preview unless --allow-preview-drive; engage via Alt+A (gvd_engage.json).")
     print("[GVD] M4: clips on disengage / AEB / near-miss / key C. Live QSV UNPROVEN until Windows smoke.")
+    print(
+        f"[GVD] driver override: steer deadband {override_cfg.steer_deadband:.2f} / trip "
+        f"{override_cfg.steer_enter:.2f} held {override_cfg.steer_hold_s:.2f}s (force-feedback "
+        f"chatter must not disengage); pedals hard at brake {override_cfg.brake_enter:.2f} / "
+        f"throttle {override_cfg.throttle_enter:.2f}."
+    )
     if args.allow_preview_drive:
         print("[GVD] WARNING: --allow-preview-drive is ON")
 
@@ -387,7 +401,9 @@ def main() -> None:
             ego_v = last_ego_v
             ego_source = "none"
             ego_fb = None
-            spd, steer_in = read_electrics_speed(vehicle)
+            el = read_electrics_inputs(vehicle)
+            spd, steer_in = el.speed_mps, el.steering_input
+            throttle_in, brake_in = el.throttle_input, el.brake_input
             if spd is not None or steer_in is not None:
                 ego_source = "beamngpy"
             if vehicle is None:
@@ -395,6 +411,7 @@ def main() -> None:
                 ego_fb = read_ego_feedback()
                 if ego_fb is not None and ego_fb.fresh:
                     spd, steer_in = ego_fb.speed_mps, ego_fb.steering_input
+                    throttle_in, brake_in = ego_fb.throttle_input, ego_fb.brake_input
                     ego_source = "lua"
             if spd is not None:
                 ego_v = max(0.0, float(spd))
@@ -447,19 +464,24 @@ def main() -> None:
                 disengage_reason = "heartbeat_stale"
                 engaged = False
 
-            if engaged and steer_in is not None and abs(float(steer_in)) > 0.55 and abs(cmd.steer) < 0.2:
-                # Driver grabbed the wheel: hand the car back and stay off until the next Alt+A
-                # (sticky — otherwise Lua and the player would fight at loop rate).
+            # Driver override. Steer runs through the FFB deadband + hysteresis + dwell so wheel
+            # chatter cannot disengage; the pedals stay hard. Sticky either way — otherwise Lua
+            # and the player fight at loop rate — so the engage flag stays false until Alt+A.
+            # Judged against the commands we actually applied, which are noted below.
+            ovr = override.update(
+                engaged=engaged,
+                steering_input=steer_in,
+                throttle_input=throttle_in,
+                brake_input=brake_in,
+            )
+            if ovr.active:
                 engaged = False
-                disengage_reason = "driver_override"
-                write_engage_flag(False, disengage_reason="driver_override")
-                cmd = safe_command(
-                    engaged=False,
-                    heartbeat_ok=True,
-                    path_debug_preview=True,
-                    allow_preview_drive=False,
-                    seq=cmd_seq,
-                )
+                disengage_reason = OVERRIDE_REASON
+                write_engage_flag(False, disengage_reason=OVERRIDE_REASON)
+                print(f"[GVD] DISENGAGED: driver override on {ovr.channel}")
+                # Gate reason rides along on the bus so the mod / nerd panel name it, not just
+                # the generic not_engaged the following ticks write.
+                cmd = stop_command(seq=cmd_seq, reason=OVERRIDE_REASON)
 
             # Actuators only when engaged + command ok (shadow fields already on tick).
             # cmd_json: Lua applies whatever we write only while `engaged` rides along in the payload.
@@ -471,6 +493,9 @@ def main() -> None:
                 applied = actuator.apply(cmd)
             else:
                 applied = actuator.stop(seq=cmd_seq, reason=cmd.reason)
+            # Baseline for the next tick's override residual: the gate holds ride along as
+            # brake=1, and the car echoes those back just like a real command.
+            override.note_command(steer=applied.steer, throttle=applied.throttle, brake=applied.brake)
 
             st = default_state(
                 engaged=engaged,
@@ -529,6 +554,18 @@ def main() -> None:
             st["ego_source"] = ego_source
             st["cmd_ack_seq"] = int(ego_fb.applied_seq) if ego_fb is not None else -1
             st["lua_applying"] = bool(ego_fb.applying and ego_fb.fresh) if ego_fb is not None else False
+            # Mirrored so gvd_main runs the same override thresholds as config/control.yaml.
+            st["override_cfg"] = config_mirror(override_cfg)
+            st["override"] = {
+                "channel": ovr.channel,
+                "steer_residual": ovr.steer_residual,
+                "steer_raw": ovr.steer_raw,
+                "pedal_residual": ovr.pedal_residual,
+                "steer_held_s": ovr.steer_held_s,
+                "deadband_swallowed": bool(ovr.deadband_swallowed),
+                "steer_judged": bool(ovr.steer_judged),
+                "armed": bool(ovr.armed),
+            }
             st["shadow"] = {
                 "steer": float(tick.shadow.get("steer", 0.0)),
                 "throttle": float(tick.shadow.get("throttle", 0.0)),

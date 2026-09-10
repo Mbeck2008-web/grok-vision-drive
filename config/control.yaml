@@ -17,3 +17,27 @@ shadow:
   # Always compute both intents; actuators only when engaged + modular OK.
   write_fields: true
   apply_e2e_when: never   # shadow applies modular; e2e policy applies e2e if no veto
+override:
+  # Driver-override detection. Force-feedback wheels push steering_input around whatever GVD
+  # commands (self-aligning torque, spring centering, kicks over bumps), and M6's bare
+  # "|steering_input| > 0.55" read that chatter as a driver and disengaged. Steer now goes
+  # through residual -> deadband -> hysteresis -> dwell; pedals stay hard.
+  # No Code Lab research pin for FFB chatter magnitudes yet, so these are deliberately
+  # conservative: small deadband, wide clear band, short dwell, M6's trip point unchanged.
+  steer_deadband: 0.10         # |steer residual| at or below this is wheel noise: read as zero
+  steer_enter: 0.55            # residual above this for steer_hold_s -> driver_override
+  steer_clear: 0.30            # residual must fall back under this to discharge the dwell
+  steer_hold_s: 0.12           # ~2 supervisor ticks; a wheel kick over a bump is shorter
+  steer_sign_flip_resets: true # residual that keeps flipping sign is chatter, not a driver
+  # Residual already subtracts GVD's own steer, so unlike M6 this only has to skip near-full
+  # lock, where the residual saturates against the +/-1 input clamp and means nothing.
+  steer_cmd_max: 0.85
+  # Pedals stay sensitive: a real brake / throttle press is an override on the tick it is seen.
+  brake_enter: 0.08
+  throttle_enter: 0.15
+  pedal_hold_s: 0.0
+  cmd_window_s: 0.30           # lookback for "what GVD asked for" (covers the electrics echo lag)
+  # GE Lua exposes no dependable force-feedback device type, so the deadband is on whenever
+  # engaged. Set false to skip it when the platform *positively* reports no FFB device
+  # (unknown still means deadband on).
+  ffb_assume_wheel: true

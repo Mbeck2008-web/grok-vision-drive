@@ -40,8 +40,9 @@ from python.control.override import (
 from python.data.record import ClipRecorder, choose_encoder
 from python.perception.pipeline import ModularPerception
 from python.perception.road_model import lanes_ext, road_edges
+from python.runtime.debug_opts import apply_to_command, apply_to_perception
 from python.runtime.hw_probe import probe, refuse_live_start
-from python.runtime.shadow import load_shadow_config, shadow_tick
+from python.runtime.shadow import ShadowConfig, load_shadow_config, shadow_tick
 from python.runtime.state_io import (
     default_state,
     read_state,
@@ -51,7 +52,7 @@ from python.runtime.state_io import (
 )
 from python.sensors.cameras import make_backend, resolve_backend_name
 from python.viz.monitors import place_opencv_window
-from python.viz.stage import VizUI, render_stage, smoke
+from python.viz.stage import STAGE_W, STAGE_H, VizUI, render_stage, smoke
 
 
 
@@ -376,8 +377,25 @@ def main() -> None:
         import cv2
 
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(win, 1280, 800)
+        cv2.resizeWindow(win, STAGE_W + ui.nerd_width, STAGE_H)
         viz_note = place_opencv_window(win, screen=args.viz_screen, fullscreen=bool(args.viz_fullscreen))
+
+        def _on_mouse(event, x, y, flags, param):
+            if event != cv2.EVENT_LBUTTONDOWN:
+                return
+            img_w = STAGE_W + (ui.nerd_width if ui.show_nerd and 0 not in ui.layers else 0)
+            img_h = STAGE_H
+            try:
+                rect = cv2.getWindowImageRect(win)
+                ww, wh = int(rect[2]), int(rect[3])
+                if ww > 1 and wh > 1:
+                    x = int(x * img_w / ww)
+                    y = int(y * img_h / wh)
+            except Exception:
+                pass
+            ui.handle_click(int(x), int(y), stage_w=STAGE_W)
+
+        cv2.setMouseCallback(win, _on_mouse)
 
     session_start = time.time()
     policy_active = args.policy
@@ -386,6 +404,8 @@ def main() -> None:
     cam_hz_ema = 0.0
     last_cam_t = time.perf_counter()
     last_ego_v = 0.0
+    prev_force = bool(args.force_engage)
+    prev_preview = bool(args.allow_preview_drive)
     try:
         while True:
             loop_t0 = time.perf_counter()
@@ -466,10 +486,27 @@ def main() -> None:
                 steer = float(steer_in) * 30.0
 
             pout = perc.tick(main, ego_speed_mps=ego_v, steer_deg=steer)
+            pout = apply_to_perception(ui.debug, pout)
 
-            engaged = bool(args.force_engage) or read_engage_flag(default=False)
+            if ui.debug.force_engage and not prev_force:
+                print("[GVD] DEBUG force engage ON (sim toy; not Alt+G)", flush=True)
+            if (not ui.debug.force_engage) and prev_force and not args.force_engage:
+                print("[GVD] DEBUG force engage off", flush=True)
+            if ui.debug.allow_preview and not prev_preview:
+                print("[GVD] DEBUG drive-on-preview ON", flush=True)
+            prev_force = bool(ui.debug.force_engage)
+            prev_preview = bool(ui.debug.allow_preview)
+
+            engaged = bool(args.force_engage) or bool(ui.debug.force_engage) or read_engage_flag(default=False)
             disengage_reason = "none"
             heartbeat_ok = True
+            allow_preview = bool(args.allow_preview_drive) or bool(ui.debug.allow_preview)
+            policy_tick = ui.debug.effective_policy(policy_active)
+            tick_cfg = ShadowConfig(
+                lane_conf_min=float(ui.debug.lane_conf_min),
+                steer_disagree_max=shadow_cfg.steer_disagree_max,
+                path_conf_min=shadow_cfg.path_conf_min,
+            )
 
             cmd_seq += 1
             wide = None
@@ -479,11 +516,11 @@ def main() -> None:
                 wide = None
 
             tick = shadow_tick(
-                policy=policy_active,
+                policy=policy_tick,
                 engaged=engaged,
                 heartbeat_ok=heartbeat_ok,
                 path_debug_preview=bool(pout.path_debug_preview),
-                allow_preview_drive=bool(args.allow_preview_drive),
+                allow_preview_drive=allow_preview,
                 path_ego=pout.path_ego,
                 planner=pout.planner,
                 ego_speed_mps=ego_v,
@@ -494,16 +531,20 @@ def main() -> None:
                 main_bgr=main,
                 wide_bgr=wide,
                 steer_deg=steer,
-                cfg=shadow_cfg,
+                cfg=tick_cfg,
             )
             cmd = tick.applied
 
             if not engaged:
                 disengage_reason = "not_engaged"
             elif tick.should_disengage:
-                engaged = False
-                disengage_reason = tick.veto_reason if tick.veto_reason != "none" else "veto"
-                write_engage_flag(False, disengage_reason=disengage_reason)
+                veto_name = str(tick.veto_reason or "veto")
+                if ui.debug.ignore_veto_disengage and veto_name != "heartbeat_stale":
+                    disengage_reason = veto_name if veto_name != "none" else "veto"
+                else:
+                    engaged = False
+                    disengage_reason = veto_name if veto_name != "none" else "veto"
+                    write_engage_flag(False, disengage_reason=disengage_reason)
             elif cmd.reason == "preview_blocked":
                 disengage_reason = "preview_blocked"
             elif cmd.reason == "heartbeat_stale":
@@ -521,7 +562,7 @@ def main() -> None:
                 brake_input=brake_in,
                 applied_seq=ego_fb.applied_seq if ego_fb is not None and ego_fb.fresh else None,
             )
-            if ovr.active:
+            if ovr.active and not ui.debug.ignore_override:
                 engaged = False
                 disengage_reason = ovr.reason
                 write_engage_flag(False, disengage_reason=ovr.reason)
@@ -529,6 +570,8 @@ def main() -> None:
                 # Gate reason rides along on the bus so the mod / nerd panel name it, not just
                 # the generic not_engaged the following ticks write.
                 cmd = stop_command(seq=cmd_seq, reason=ovr.reason)
+
+            cmd = apply_to_command(ui.debug, cmd)
 
             # Actuators only when engaged + command ok (shadow fields already on tick).
             # cmd_json: Lua applies whatever we write only while `engaged` rides along in the payload.
@@ -550,7 +593,7 @@ def main() -> None:
             st = default_state(
                 engaged=engaged,
                 disengage_reason=disengage_reason,
-                policy=policy_active,
+                policy=policy_tick,
                 loop_hz=args.hz,
                 camera_hz=cam_hz_ema,
                 infer_ms=pout.infer_ms,
@@ -649,6 +692,7 @@ def main() -> None:
             st["e2e_ok"] = bool(tick.e2e_ok)
             st["veto_reason"] = str(tick.veto_reason or "none")
             st["e2e_backend"] = e2e_policy.backend
+            st["debug"] = ui.debug.as_dict()
             st["encode_backend"] = recorder.encoder
             miss = list(pout.missing)
             if pout.tracks_n > 0 and "tracks" in miss:
@@ -695,12 +739,22 @@ def main() -> None:
             if win is not None:
                 import cv2
 
-                frame = render_stage(st, ui=ui, main_frame=main)
+                frame = render_stage(
+                    st,
+                    ui=ui,
+                    main_frame=main,
+                    cam_frames=getattr(bundle, "frames", None),
+                    dets=getattr(pout, "dets", None),
+                )
                 cv2.imshow(win, frame)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):
                     break
-                if key == ord("v"):
+                if key == 255:
+                    pass
+                elif ui.handle_key(key):
+                    pass
+                elif key == ord("v"):
                     ui.toggle_nerd()
                 elif key == ord("?"):
                     ui.toggle_help()

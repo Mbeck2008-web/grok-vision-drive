@@ -15,8 +15,27 @@ from typing import Any
 import cv2
 import numpy as np
 
+from python.runtime.debug_opts import (
+    CONTROL_ROWS,
+    LAYER_ATTR,
+    VIZ_CONTROL_ROWS,
+    DebugOpts,
+    control_index,
+    row_at,
+    viz_control_index,
+    viz_row_at,
+)
+from python.viz.debug_draw import (
+    draw_cam_strip,
+    draw_dense_hud,
+    draw_frustums,
+    draw_lane_polys,
+    draw_occupancy,
+    draw_pip_boxes,
+    draw_planner_cost,
+)
 from python.viz.forecast import cone_widths, predict_modes
-from python.viz.nerd import render_panel, scene_note
+from python.viz.nerd import hit_test, render_panel, scene_note
 
 VOID = (10, 8, 7)  # #07080a
 PAPER = (225, 230, 232)
@@ -46,22 +65,138 @@ class VizUI:
     show_help: bool = False
     layers: set[int] = field(default_factory=set)
     top_down: bool = False  # default = chase 3/4 bird; T toggles BEV
+    nerd_tab: str = "live"  # live | drive | viz | keys
+    debug: DebugOpts = field(default_factory=DebugOpts)
+    debug_sel: int = 0
+    viz_sel: int = 0
+    nerd_hits: list = field(default_factory=list)
+    nerd_width: int = 420
 
     def toggle_nerd(self) -> None:
         self.show_nerd = not self.show_nerd
 
     def toggle_help(self) -> None:
-        self.show_help = not self.show_help
+        self.nerd_tab = "live" if self.nerd_tab == "keys" else "keys"
+        self.show_help = self.nerd_tab == "keys"
+        if self.nerd_tab == "keys":
+            self.show_nerd = True
+
+    def show_drive_tab(self) -> None:
+        self.nerd_tab = "drive"
+        self.show_help = False
+        self.show_nerd = True
+
+    def show_viz_tab(self) -> None:
+        self.nerd_tab = "viz"
+        self.show_help = False
+        self.show_nerd = True
+
+    def cycle_tab(self, delta: int = 1) -> None:
+        tabs = ("live", "drive", "viz", "keys")
+        cur = self.nerd_tab if self.nerd_tab in tabs else "live"
+        self.nerd_tab = tabs[(tabs.index(cur) + delta) % len(tabs)]
+        self.show_help = self.nerd_tab == "keys"
+        self.show_nerd = True
 
     def set_layer(self, k: int) -> None:
         if k == 0:
             self.layers = {0}
             return
         self.layers.discard(0)
+        attr = LAYER_ATTR.get(k)
         if k in self.layers:
             self.layers.discard(k)
+            if attr:
+                setattr(self.debug, attr, False)
         else:
             self.layers.add(k)
+            if attr:
+                setattr(self.debug, attr, True)
+
+    def sync_layers_from_debug(self) -> None:
+        self.layers.discard(0)
+        for k, attr in LAYER_ATTR.items():
+            if getattr(self.debug, attr, False):
+                self.layers.add(k)
+            else:
+                self.layers.discard(k)
+
+    def handle_key(self, key: int) -> bool:
+        """Consume a GVD VISION key that belongs to the nerd/DRIVE/VIZ tab. True = handled."""
+        if key in (ord("d"), ord("D")):
+            self.show_drive_tab()
+            return True
+        if key in (ord("g"), ord("G")):
+            self.show_viz_tab()
+            return True
+        if key == ord("["):
+            self.cycle_tab(-1)
+            return True
+        if key in (ord("]"), 9):  # Tab
+            self.cycle_tab(1)
+            return True
+        if self.nerd_tab not in ("drive", "viz") or not self.show_nerd:
+            return False
+        if self.nerd_tab == "viz":
+            n = max(1, len(VIZ_CONTROL_ROWS))
+            sel_attr = "viz_sel"
+            row_fn = viz_row_at
+        else:
+            n = max(1, len(CONTROL_ROWS))
+            sel_attr = "debug_sel"
+            row_fn = row_at
+        if key in (82, 0, ord("k")):  # up
+            setattr(self, sel_attr, (int(getattr(self, sel_attr)) - 1) % n)
+            return True
+        if key in (84, 1, ord("j")):  # down
+            setattr(self, sel_attr, (int(getattr(self, sel_attr)) + 1) % n)
+            return True
+        row = row_fn(int(getattr(self, sel_attr)))
+        if key in (81, 2, ord("h")):  # left
+            self.debug.nudge(row, -1)
+            self.sync_layers_from_debug()
+            return True
+        if key in (83, 3, ord("l")):  # right
+            self.debug.nudge(row, +1)
+            self.sync_layers_from_debug()
+            return True
+        if key in (13, 10, ord(" ")):
+            self.debug.toggle(row)
+            self.sync_layers_from_debug()
+            return True
+        return False
+
+    def handle_click(self, x: int, y: int, *, stage_w: int) -> bool:
+        if not self.show_nerd or 0 in self.layers:
+            return False
+        if x < stage_w:
+            return False
+        hit = hit_test(self.nerd_hits, x - stage_w, y)
+        if not hit:
+            return False
+        if hit.get("kind") == "tab":
+            tid = str(hit.get("id") or "live")
+            self.nerd_tab = tid
+            self.show_help = tid == "keys"
+            return True
+        if hit.get("kind") == "row":
+            i = int(hit.get("i") or 0)
+            if self.nerd_tab == "viz":
+                self.viz_sel = viz_control_index(i)
+                row = viz_row_at(self.viz_sel)
+            else:
+                self.debug_sel = control_index(i)
+                row = row_at(self.debug_sel)
+            part = str(hit.get("part") or "row")
+            if part == "minus":
+                self.debug.nudge(row, -1)
+            elif part == "plus":
+                self.debug.nudge(row, +1)
+            else:
+                self.debug.toggle(row)
+            self.sync_layers_from_debug()
+            return True
+        return False
 
 
 @dataclass
@@ -668,6 +803,8 @@ def _draw_tracks(
     path_width: float,
     state: dict[str, Any],
     cipv_id: int | None,
+    show_ids: bool = False,
+    show_vel: bool = False,
 ) -> None:
     ordered = sorted(tracks, key=lambda t: float(t.get("y") or 0), reverse=True)
     for t in ordered:
@@ -698,6 +835,34 @@ def _draw_tracks(
             tag = cam.project(x, y, tag_h)
             label = "BRAKE" if hazard else "LEAD"
             cv2.putText(img, label, (tag[0] - 18, tag[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.45, ICE_HI if not hazard else (178, 186, 246), 1, cv2.LINE_AA)
+        elif show_ids:
+            tag = cam.project(x, y, (1.6 if car else H) + 0.35)
+            tid = track_id(t)
+            cv2.putText(
+                img,
+                f"#{tid}" if tid is not None else cls[:4],
+                (tag[0] - 10, tag[1]),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.32,
+                PAPER,
+                1,
+                cv2.LINE_AA,
+            )
+        if show_vel:
+            try:
+                spd = float(t.get("speed_mps") or 0.0)
+            except (TypeError, ValueError):
+                spd = 0.0
+            reach = 0.6 + 0.18 * spd
+            hx, hy = math.cos(yaw), math.sin(yaw)
+            a = cam.project(x, y, 0.4)
+            b = cam.project(x + hx * reach, y + hy * reach, 0.4)
+            cv2.arrowedLine(img, a, b, ICE if hot else GHOST, 1, cv2.LINE_AA, tipLength=0.25)
+        if show_ids and lead:
+            tid = track_id(t)
+            if tid is not None:
+                extra = cam.project(x, y, (1.6 if car else H) + 0.95)
+                cv2.putText(img, f"#{tid}", (extra[0] - 10, extra[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.32, ICE_HI, 1, cv2.LINE_AA)
 
 
 def _draw_ego(img: np.ndarray, cam: Cam, engaged: bool) -> None:
@@ -743,9 +908,12 @@ def render_stage(
     state: dict[str, Any],
     ui: VizUI | None = None,
     main_frame: np.ndarray | None = None,
+    cam_frames: dict[str, Any] | None = None,
+    dets: list[dict[str, Any]] | None = None,
 ) -> np.ndarray:
     t0 = time.perf_counter()
     ui = ui or VizUI()
+    dbg = ui.debug
     clean = 0 in ui.layers
     cam = Cam(top_down=ui.top_down)
     img = np.full((STAGE_H, STAGE_W, 3), VOID, dtype=np.uint8)
@@ -765,16 +933,18 @@ def render_stage(
         path_conf = 0.5
     preview = bool(state.get("path_debug_preview"))
 
-    show_path = state.get("gvd_show_path")
-    if show_path is None:
-        show_path = True
-    show_ghosts = state.get("show_agent_ghosts")
-    if show_ghosts is None:
-        show_ghosts = True
+    show_path = bool(dbg.viz_path)
+    show_ghosts = bool(dbg.viz_ghosts)
 
     _draw_ground(img, cam)
-    _draw_lanes(img, state.get("lanes_ext") or state.get("lanes") or [], cam, smoke=smoke)
-    _draw_edges(img, state.get("road_edges") or state.get("edges") or [], cam)
+    if (not clean) and dbg.viz_occ:
+        draw_occupancy(img, cam, list(state.get("tracks") or []), path, path_width)
+    if dbg.viz_lanes:
+        _draw_lanes(img, state.get("lanes_ext") or state.get("lanes") or [], cam, smoke=smoke)
+    if dbg.viz_lanes:
+        _draw_edges(img, state.get("road_edges") or state.get("edges") or [], cam)
+    if (not clean) and dbg.viz_lane_poly:
+        draw_lane_polys(img, cam, state.get("lanes_bev") or [])
 
     cipv_id = cipv_id_of(state)
     all_tracks = list(state.get("tracks") or [])[:MAX_AGENTS]
@@ -792,35 +962,57 @@ def render_stage(
         _draw_stop_bar(img, path, half_w, all_tracks, cipv_id, cam, is_halted(state))
         _draw_path_world_overlay(img, state.get("path_world") or [], cam)
 
-    if not drop_heavy:
+    if (not clean) and dbg.viz_cost:
+        draw_planner_cost(img, cam, path, path_width, all_tracks)
+
+    if not drop_heavy and dbg.viz_forecast:
         _draw_state_fans(img, state.get("agents") or [], cam)
 
     if show_ghosts:
-        _draw_tracks(img, tracks, cam, path=path, path_width=path_width, state=state, cipv_id=cipv_id)
+        _draw_tracks(
+            img, tracks, cam, path=path, path_width=path_width, state=state, cipv_id=cipv_id,
+            show_ids=(not clean) and dbg.viz_ids,
+            show_vel=(not clean) and dbg.viz_vel,
+        )
         n_forecast = 0
-        if not drop_heavy:
+        if not drop_heavy and dbg.viz_forecast:
             for tr in tracks:
                 if n_forecast >= MAX_FORECAST:
                     break
                 _draw_agent_forecasts(img, tr, cam)
                 n_forecast += 1
 
-    if not drop_heavy:
+    if not drop_heavy and dbg.viz_signs:
         _draw_signs(img, state.get("signs") or [], cam)
+
+    if (not clean) and dbg.viz_frustums:
+        draw_frustums(img, cam, state.get("cam_health") if isinstance(state.get("cam_health"), dict) else None)
 
     _draw_fog(img, cam)
     _draw_ego(img, cam, engaged)
 
-    if main_frame is not None and getattr(main_frame, "size", 0) and not drop_heavy:
+    if main_frame is not None and getattr(main_frame, "size", 0) and not drop_heavy and dbg.viz_pip:
         pip = np.full((180, 320, 3), (28, 28, 28), dtype=np.uint8)
         try:
             pip = cv2.resize(main_frame, (320, 180), interpolation=cv2.INTER_AREA)
         except Exception:
             pass
+        if (not clean) and dbg.viz_boxes and dets:
+            try:
+                h0, w0 = main_frame.shape[:2]
+            except Exception:
+                h0, w0 = 180, 320
+            draw_pip_boxes(pip, dets, (w0, h0))
         cv2.putText(pip, "cam_main", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.5, PAPER, 1)
         cv2.drawMarker(pip, (160, 90), ICE, cv2.MARKER_CROSS, 12, 1)
         img[12:192, 12:332] = pip
         cv2.rectangle(img, (12, 12), (332, 192), ICE, 1)
+
+    if (not clean) and dbg.viz_cams and not drop_heavy:
+        draw_cam_strip(
+            img, cam_frames, state.get("cam_health") if isinstance(state.get("cam_health"), dict) else None,
+            stage_w=STAGE_W, stage_h=STAGE_H,
+        )
 
     cv2.rectangle(img, (0, 0), (STAGE_W, 22), (12, 13, 16), -1)
     cv2.putText(img, "GVD", (12, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, ICE, 1, cv2.LINE_AA)
@@ -828,13 +1020,15 @@ def render_stage(
     cam_lbl = "BEV debug" if ui.top_down else "chase 3/4"
     cv2.putText(img, cam_lbl, (STAGE_W - 120, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
     note = scene_note(state)
-    if note:
+    if note and not ((not clean) and dbg.viz_hud):
         cv2.putText(img, note[:72], (12, STAGE_H - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (134, 124, 114), 1, cv2.LINE_AA)
+    if (not clean) and dbg.viz_hud:
+        draw_dense_hud(img, state, stage_w=STAGE_W, stage_h=STAGE_H)
 
     state["viz_ms"] = (time.perf_counter() - t0) * 1000.0
     state["viz_scene_note"] = note
     if ui.show_nerd and not clean:
-        panel = render_panel(state, h=STAGE_H, w=420, show_help=ui.show_help)
+        panel = render_panel(state, h=STAGE_H, w=ui.nerd_width, show_help=ui.show_help, ui=ui)
         return np.concatenate([img, panel], axis=1)
     return img
 

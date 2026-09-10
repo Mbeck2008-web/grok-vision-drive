@@ -31,6 +31,7 @@ class PerceptionOut:
     path_debug_preview: bool = True
     planner: dict[str, Any] = field(default_factory=dict)
     signs: list[dict[str, Any]] = field(default_factory=list)
+    dets: list[dict[str, Any]] = field(default_factory=list)
     infer_ms: float = 0.0
     missing: list[str] = field(default_factory=list)
     detector_name: str = ""
@@ -103,6 +104,14 @@ class ModularPerception:
             path_conf=corridor.path_conf,
             path_debug_preview=not corridor.from_planner,
             signs=signs,
+            dets=[
+                {
+                    "cls": d.cls,
+                    "conf": round(float(d.conf), 2),
+                    "xyxy": [round(float(v), 1) for v in d.xyxy],
+                }
+                for d in dets
+            ],
             planner={
                 "corridor_width": corridor.path_width,
                 "curvature": corridor.curvature,

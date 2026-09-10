@@ -167,6 +167,31 @@ def main() -> None:
     heavy_frame = render_stage(heavy, ui=ui)
     assert heavy_frame.shape == frame.shape
 
+    # DRIVE / VIZ nerd tabs concatenate a 420px panel; occupancy overlay is opt-in.
+    nerd = VizUI()
+    nerd.show_nerd = True
+    nerd.show_drive_tab()
+    drive_frame = render_stage(st, ui=nerd)
+    assert drive_frame.shape == (800, 1280 + 420, 3)
+    tabs = {h.get("id") for h in nerd.nerd_hits if h.get("kind") == "tab"}
+    assert tabs == {"live", "drive", "viz", "keys"}
+    nerd.show_viz_tab()
+    nerd.debug.viz_dense = True
+    nerd.debug.apply_dense()
+    viz_frame = render_stage(st, ui=nerd)
+    assert viz_frame.shape == drive_frame.shape
+    nerd.show_nerd = False
+    nerd.layers = set()
+    dense = render_stage(st, ui=nerd)
+    nerd.debug.viz_occ = False
+    nerd.debug.viz_ids = False
+    nerd.debug.viz_vel = False
+    nerd.debug.viz_boxes = False
+    nerd.debug.viz_frustums = False
+    nerd.debug.viz_cost = False
+    sparse = render_stage(st, ui=nerd)
+    assert not np.array_equal(dense, sparse)
+
     print("test_gvd_viz_stage: OK")
 
 

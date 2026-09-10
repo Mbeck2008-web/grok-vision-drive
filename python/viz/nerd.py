@@ -1,4 +1,4 @@
-"""Monospace nerd overlay (toggle V). Help via ?."""
+"""Monospace nerd overlay (toggle V). Tabs: LIVE telemetry / DRIVE / VIZ / keys."""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ from typing import Any
 
 import cv2
 import numpy as np
+
+from python.runtime.debug_opts import DEBUG_ROWS, VIZ_ROWS, DebugOpts
 
 BG = (16, 13, 12)
 FG = (212, 204, 200)
@@ -59,34 +61,191 @@ def scene_note(s: dict[str, Any]) -> str:
     return " · ".join(bits)
 
 
-def render_panel(state: dict[str, Any], h: int = 720, w: int = 420, show_help: bool = False) -> np.ndarray:
+def render_panel(
+    state: dict[str, Any],
+    h: int = 720,
+    w: int = 420,
+    show_help: bool = False,
+    ui: Any = None,
+) -> np.ndarray:
     img = np.full((h, w, 3), BG, dtype=np.uint8)
-    lines = _help_lines() if show_help else _lines(state)
-    y = 28
-    cv2.putText(img, "GVD  ·  VISION", (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, ICE, 1, cv2.LINE_AA)
-    y += 26
-    for line in lines:
-        col = DIM if line.startswith(" ") or line.startswith("keys") else FG
-        cv2.putText(img, line[:58], (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.40, col, 1, cv2.LINE_AA)
-        y += 17
-        if y > h - 24:
-            break
-    cv2.putText(img, "V nerd  ? help  0 clean  q quit", (16, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.38, DIM, 1, cv2.LINE_AA)
+    tab = "keys" if show_help else "live"
+    opts = DebugOpts()
+    sel = 0
+    viz_sel = 0
+    hits: list[dict[str, Any]] = []
+    if ui is not None:
+        tab = str(getattr(ui, "nerd_tab", None) or tab)
+        if getattr(ui, "show_help", False) and tab == "live":
+            tab = "keys"
+        opts = getattr(ui, "debug", None) or opts
+        sel = int(getattr(ui, "debug_sel", 0) or 0)
+        viz_sel = int(getattr(ui, "viz_sel", 0) or 0)
+    y = 22
+    cv2.putText(img, "GVD  ·  VISION", (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, ICE, 1, cv2.LINE_AA)
+    y = _draw_tabs(img, tab, w, y + 10, hits)
+    if tab == "keys":
+        lines = _help_lines()
+        y += 8
+        for line in lines:
+            col = DIM if line.startswith(" ") or line.startswith("keys") else FG
+            cv2.putText(img, line[:58], (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.38, col, 1, cv2.LINE_AA)
+            y += 16
+            if y > h - 24:
+                break
+    elif tab == "drive":
+        y = _draw_knob_tab(
+            img, opts, sel, y + 6, h, w, hits, DEBUG_ROWS,
+            intro="wires into live gates / actuators / AEB",
+        )
+    elif tab == "viz":
+        y = _draw_knob_tab(
+            img, opts, viz_sel, y + 6, h, w, hits, VIZ_ROWS,
+            intro="stage layers — occupancy is from tracks, not a net",
+        )
+    else:
+        y += 8
+        for line in _lines(state):
+            col = DIM if line.startswith(" ") else FG
+            cv2.putText(img, line[:58], (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.38, col, 1, cv2.LINE_AA)
+            y += 16
+            if y > h - 24:
+                break
+    cv2.putText(
+        img,
+        "D drive  G viz  [ ] tab  click  V hide",
+        (12, h - 12),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.36,
+        DIM,
+        1,
+        cv2.LINE_AA,
+    )
+    if ui is not None:
+        ui.nerd_hits = hits
+        ui.nerd_tab = tab
     return img
+
+
+def _draw_tabs(
+    img: np.ndarray, tab: str, w: int, y: int, hits: list[dict[str, Any]]
+) -> int:
+    labels = (("live", "LIVE"), ("drive", "DRIVE"), ("viz", "VIZ"), ("keys", "KEYS"))
+    x = 12
+    for tid, label in labels:
+        tw = 8 + 9 * len(label)
+        rect = (x, y, x + tw, y + 20)
+        on = tid == tab
+        bg = ICE if on else (40, 36, 34)
+        fg = (16, 13, 12) if on else FG
+        cv2.rectangle(img, (rect[0], rect[1]), (rect[2], rect[3]), bg, -1)
+        cv2.putText(
+            img, label, (x + 4, y + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.38, fg, 1, cv2.LINE_AA
+        )
+        hits.append({"kind": "tab", "id": tid, "rect": rect})
+        x += tw + 8
+    # remainder of tab row
+    return y + 26
+
+
+def _draw_knob_tab(
+    img: np.ndarray,
+    opts: DebugOpts,
+    sel: int,
+    y0: int,
+    h: int,
+    w: int,
+    hits: list[dict[str, Any]],
+    rows: tuple,
+    *,
+    intro: str,
+) -> int:
+    y = y0
+    cv2.putText(img, intro[:58], (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.34, DIM, 1, cv2.LINE_AA)
+    y += 16
+    ctrl_i = 0
+    n_ctrl = sum(1 for r in rows if r.get("kind") != "header")
+    sel_i = (sel % n_ctrl) if n_ctrl else 0
+    for row in rows:
+        if y > h - 36:
+            break
+        kind = row.get("kind")
+        if kind == "header":
+            cv2.putText(
+                img,
+                str(row.get("label") or ""),
+                (16, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.36,
+                ICE,
+                1,
+                cv2.LINE_AA,
+            )
+            y += 16
+            continue
+        chosen = ctrl_i == sel_i
+        if chosen:
+            cv2.rectangle(img, (10, y - 12), (w - 10, y + 4), (42, 36, 32), -1)
+        label = str(row.get("label") or row.get("id"))
+        val = opts.format_value(row)
+        col = ICE if chosen else FG
+        cv2.putText(img, label[:28], (16, y), cv2.FONT_HERSHEY_SIMPLEX, 0.36, col, 1, cv2.LINE_AA)
+        val_x = w - 88
+        minus = (val_x - 16, y - 11, val_x - 2, y + 3)
+        plus = (w - 22, y - 11, w - 10, y + 3)
+        val_rect = (val_x, y - 11, w - 24, y + 3)
+        row_rect = (10, y - 12, w - 10, y + 4)
+        cv2.putText(img, "-", (minus[0] + 2, y), cv2.FONT_HERSHEY_SIMPLEX, 0.36, DIM, 1, cv2.LINE_AA)
+        cv2.putText(img, val[:8], (val_x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.36, col, 1, cv2.LINE_AA)
+        cv2.putText(img, "+", (plus[0] + 1, y), cv2.FONT_HERSHEY_SIMPLEX, 0.36, DIM, 1, cv2.LINE_AA)
+        hits.append({"kind": "row", "i": ctrl_i, "part": "row", "rect": row_rect})
+        hits.append({"kind": "row", "i": ctrl_i, "part": "minus", "rect": minus})
+        hits.append({"kind": "row", "i": ctrl_i, "part": "value", "rect": val_rect})
+        hits.append({"kind": "row", "i": ctrl_i, "part": "plus", "rect": plus})
+        y += 16
+        ctrl_i += 1
+    cv2.putText(
+        img,
+        "j/k select  h/l nudge  Enter toggle",
+        (16, min(h - 28, y + 8)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.34,
+        DIM,
+        1,
+        cv2.LINE_AA,
+    )
+    return y
+
+
+def hit_test(hits: list[dict[str, Any]] | None, x: int, y: int) -> dict[str, Any] | None:
+    for item in reversed(hits or []):
+        rect = item.get("rect") or (0, 0, 0, 0)
+        if rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
+            return item
+    return None
 
 
 def _help_lines() -> list[str]:
     return [
         "keys:",
         "  V  toggle this nerd panel",
+        "  D  DRIVE tab (gates / actuators / AEB)",
+        "  G  VIZ tab (overlay layers)",
+        "  [ ] cycle LIVE / DRIVE / VIZ / KEYS",
+        "  j/k  select row   h/l nudge",
+        "  Enter / click  toggle",
         "  0  clean cabin (stage only)",
-        "  1  occupancy grid",
-        "  2  YOLO boxes in PIP",
+        "  1  occupancy (from tracks)",
+        "  2  detector boxes in PIP",
         "  3  lane polynomials",
-        "  4  camera frustums",
+        "  4  camera FOV wedges",
         "  5  planner cost samples",
         "  T  toggle BEV debug / chase 3/4 bird",
+        "  C  manual clip",
         "  q  quit",
+        "",
+        "DRIVE writes the command this tick.",
+        "force engage is debug-only. Sim toy.",
     ]
 
 
@@ -205,5 +364,21 @@ def _lines(s: dict[str, Any]) -> list[str]:
         *([extras_line] if extras_line else []),
         f"clip {s.get('last_clip_trigger', 'none')}",
         *sel,
+        *([_debug_line(s)] if _debug_line(s) else []),
         "missing: " + (", ".join(miss) if miss else "none"),
     ]
+
+
+def _debug_line(s: dict[str, Any]) -> str:
+    dbg = s.get("debug") if isinstance(s.get("debug"), dict) else None
+    if not dbg:
+        return ""
+    cap = dbg.get("speed_cap")
+    try:
+        cap_s = f"{float(cap):.0f}"
+    except (TypeError, ValueError):
+        cap_s = "?"
+    return (
+        f"debug pol={dbg.get('policy')} preview={dbg.get('allow_preview')} "
+        f"aeb={dbg.get('aeb_on')} cap={cap_s}"
+    )

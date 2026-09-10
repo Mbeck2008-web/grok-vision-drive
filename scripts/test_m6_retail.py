@@ -556,7 +556,13 @@ def check_no_chrome() -> None:
     for f in ("install.bat", "uninstall.bat", "play_gvd.bat", "play_gvd_tech.bat", "requirements-retail.txt"):
         assert not CHROME_RE.search((ROOT / f).read_text(encoding="utf-8", errors="ignore")), f
     # Runtime strings players see (titles, prints); docstrings/comments may still state the honesty rule.
-    for f in [ROOT / "python" / "run_vision.py", ROOT / "python" / "runtime" / "hw_probe.py", ROOT / "python" / "sensors" / "tech.py", *(ROOT / "python" / "viz").glob("*.py")]:
+    for f in [
+        ROOT / "python" / "run_vision.py",
+        ROOT / "python" / "runtime" / "hw_probe.py",
+        ROOT / "python" / "runtime" / "debug_opts.py",
+        ROOT / "python" / "sensors" / "tech.py",
+        *(ROOT / "python" / "viz").glob("*.py"),
+    ]:
         for s in _py_string_literals(f):
             assert not CHROME_RE.search(s), f"chrome string in {f.relative_to(ROOT)}: {s!r}"
     # Release VERSION.txt banner only names the honesty rule, never a product label.

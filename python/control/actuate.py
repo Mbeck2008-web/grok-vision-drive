@@ -60,6 +60,12 @@ class EgoFeedback:
     applied_seq: int = -1
     applying: bool = False
     age_s: float = 0.0
+    gx: float | None = None
+    gy: float | None = None
+    gz: float | None = None
+    yaw_rate: float | None = None
+    pos: tuple[float, float, float] | None = None
+    dir: tuple[float, float, float] | None = None
 
     @property
     def fresh(self) -> bool:
@@ -93,6 +99,20 @@ def read_ego_feedback(now: float | None = None) -> EgoFeedback | None:
         seq = int(data.get("applied_seq", -1))
     except (TypeError, ValueError):
         seq = -1
+    pos = None
+    raw_pos = data.get("pos")
+    if isinstance(raw_pos, dict):
+        try:
+            pos = (float(raw_pos["x"]), float(raw_pos["y"]), float(raw_pos["z"]))
+        except (KeyError, TypeError, ValueError):
+            pos = None
+    direction = None
+    raw_dir = data.get("dir")
+    if isinstance(raw_dir, dict):
+        try:
+            direction = (float(raw_dir["x"]), float(raw_dir["y"]), float(raw_dir["z"]))
+        except (KeyError, TypeError, ValueError):
+            direction = None
     return EgoFeedback(
         speed_mps=_num(data.get("speed_mps")),
         steering_input=_num(data.get("steering_input")),
@@ -101,6 +121,12 @@ def read_ego_feedback(now: float | None = None) -> EgoFeedback | None:
         applied_seq=seq,
         applying=bool(data.get("applying", False)),
         age_s=max(0.0, t - mtime),
+        gx=_num(data.get("gx")),
+        gy=_num(data.get("gy")),
+        gz=_num(data.get("gz")),
+        yaw_rate=_num(data.get("yaw_rate")),
+        pos=pos,
+        dir=direction,
     )
 
 

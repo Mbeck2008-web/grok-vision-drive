@@ -97,6 +97,15 @@ def default_state(**overrides: Any) -> dict[str, Any]:
             "bearing_rel_deg": None,
             "note": "retail / no Tech GPS",
         },
+        "sensors": {
+            "imu": "missing",
+            "gps": "missing",
+            "lidar": "missing",
+            "radar": "missing",
+            "foxglove": "off",
+            "drive_uses": "vision",
+            "lidar_lua": False,
+        },
         "planner": {
             "corridor_width": 2.0,
             "curvature": 0.0,

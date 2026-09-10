@@ -1,0 +1,4 @@
+# Optional Foxglove live view (ws://127.0.0.1:8765). Not required to drive.
+# pip install -r requirements-foxglove.txt
+# Then set foxglove.enabled: true in config/sensors.yaml or GVD_FOXGLOVE=1 / --foxglove.
+foxglove-sdk>=0.8

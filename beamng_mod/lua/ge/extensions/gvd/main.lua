@@ -16,6 +16,7 @@ local ENGAGE_REL = 'Documents/GVD/gvd_engage.json'
 local CMD_REL = 'Documents/GVD/gvd_cmd.json'
 local UI_PREFS_REL = 'Documents/GVD/gvd_ui_prefs.json'
 local EGO_REL = 'Documents/GVD/gvd_ego.json'
+local SCAN_REL = 'Documents/GVD/gvd_scan.json'
 local lastCmdSeq = -1
 local cmdAcc = 0
 local pollAcc = 0
@@ -42,6 +43,10 @@ local cmdStaleLogged = false
 local arcadeQueued = false
 local egoAcc = 0
 local egoFb = nil
+local scanAcc = 0
+local SCAN_EVERY = 0.50      -- 2 Hz coarse retail ray sweep (opt-in via gvd_state.sensors.lidar_lua)
+local SCAN_RAYS = 24
+local SCAN_RANGE = 40
 local stateBeatAcc = 0       -- seconds since gvd_state.json heartbeat_mtime last changed
 local lastStateBeat = nil
 
@@ -171,6 +176,10 @@ end
 
 local function userEgoPath()
   return gvdFile('gvd_ego.json')
+end
+
+local function userScanPath()
+  return gvdFile('gvd_scan.json')
 end
 
 
@@ -930,9 +939,12 @@ local VE_APPLY_FMT = "input.event('steering',%.4f,1);input.event('throttle',%.4f
 local VE_RELEASE = "input.event('steering',0,1);input.event('throttle',0,2);input.event('brake',0,2)"
 local VE_ARCADE = "if drivetrain and drivetrain.setShifterMode then pcall(drivetrain.setShifterMode,'arcade') end"
 local VE_FEEDBACK = "local ev=(electrics and electrics.values) or {};"
+  .. "local s=sensors or {};"
   .. "local function n(x) x=tonumber(x) or 0;if x~=x or x==math.huge or x==-math.huge then x=0 end;return x end;"
-  .. "obj:queueGameEngineLua(string.format('extensions.gvd_main.onEgoFeedback(%.3f,%.4f,%.4f,%.4f)',"
-  .. "n(ev.wheelspeed or ev.airspeed),n(ev.steering_input),n(ev.throttle_input),n(ev.brake_input)))"
+  .. "local gx=n(s.gx2 or s.gx);local gy=n(s.gy2 or s.gy);local gz=n(s.gz2 or s.gz);"
+  .. "local yr=0;if obj and obj.getYawAngularVelocity then local ok,v=pcall(function() return obj:getYawAngularVelocity() end);if ok then yr=n(v) end end;"
+  .. "obj:queueGameEngineLua(string.format('extensions.gvd_main.onEgoFeedback(%.3f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f)',"
+  .. "n(ev.wheelspeed or ev.airspeed),n(ev.steering_input),n(ev.throttle_input),n(ev.brake_input),gx,gy,gz,yr))"
 
 -- ───────────── player override: steer residual, force-feedback tolerant ─────────────
 -- Force-feedback / racing wheels move electrics.steering_input around whatever GVD commands
@@ -1165,22 +1177,54 @@ local function supervisorAlive()
   return lastGood ~= nil and stateBeatAcc <= 2.0
 end
 
+local function jsonNum(x, fmt)
+  local n = tonumber(x)
+  if n == nil or n ~= n then return 'null' end
+  return string.format(fmt or '%.4f', n)
+end
+
+local function jsonVec3(v)
+  if v == nil then return 'null' end
+  local ok, x, y, z = pcall(function()
+    return tonumber(v.x), tonumber(v.y), tonumber(v.z)
+  end)
+  if not ok or x == nil or y == nil or z == nil then return 'null' end
+  return string.format('{"x":%.4f,"y":%.4f,"z":%.4f}', x, y, z)
+end
+
 local function writeEgoFile()
   if not egoFb then return end
+  local posJson, dirJson = 'null', 'null'
+  local veh = getPlayerVeh()
+  if veh then
+    local okp, pos = pcall(function() return veh:getPosition() end)
+    if okp then posJson = jsonVec3(pos) end
+    local okd, dir = pcall(function() return veh:getDirectionVector() end)
+    if okd then dirJson = jsonVec3(dir) end
+  end
   local payload = string.format(
-    '{"speed_mps":%.3f,"steering_input":%.4f,"throttle_input":%.4f,"brake_input":%.4f,"applied_seq":%d,"applying":%s,"mtime":%d}',
+    '{"speed_mps":%.3f,"steering_input":%.4f,"throttle_input":%.4f,"brake_input":%.4f,'
+      .. '"applied_seq":%d,"applying":%s,"mtime":%d,'
+      .. '"gx":%s,"gy":%s,"gz":%s,"yaw_rate":%s,"pos":%s,"dir":%s}',
     egoFb.speed, egoFb.steer, egoFb.throttle, egoFb.brake,
-    math.floor(tonumber(lastAppliedSeq) or -1), applying and 'true' or 'false', os.time())
+    math.floor(tonumber(lastAppliedSeq) or -1), applying and 'true' or 'false', os.time(),
+    jsonNum(egoFb.gx), jsonNum(egoFb.gy), jsonNum(egoFb.gz), jsonNum(egoFb.yawRate, '%.5f'),
+    posJson, dirJson)
   writeText(userEgoPath(), payload)
 end
 
 -- Called from vehicle Lua (VE_FEEDBACK) via obj:queueGameEngineLua.
-function M.onEgoFeedback(speed, steerIn, thrIn, brkIn)
+-- Extra IMU args are optional so a 4-arg call still works.
+function M.onEgoFeedback(speed, steerIn, thrIn, brkIn, gx, gy, gz, yawRate)
   egoFb = {
     speed = tonumber(speed) or 0,
     steer = tonumber(steerIn) or 0,
     throttle = tonumber(thrIn) or 0,
     brake = tonumber(brkIn) or 0,
+    gx = tonumber(gx),
+    gy = tonumber(gy),
+    gz = tonumber(gz),
+    yawRate = tonumber(yawRate),
   }
   -- Pin the reference the residual is measured against to this sample. Vehicle Lua runs the
   -- apply snippet and the electrics echo in that order in the same tick, so the command in
@@ -1198,6 +1242,79 @@ local function pollEgo(dt)
   local veh = getPlayerVeh()
   if not veh then return end
   queueVehicle(veh, VE_FEEDBACK)
+end
+
+local function lidarLuaWanted()
+  local s = lastGood and lastGood.sensors
+  return type(s) == 'table' and (s.lidar_lua == true or s.lidar_lua == 'on' or s.lidar_lua == 1)
+end
+
+local function tryCastRay(from, to)
+  local attempts = {
+    function() return Engine.castRay(from, to) end,
+    function() return Engine:castRay(from, to) end,
+    function() return be:castRay(from, to) end,
+    function() return castRay(from, to) end,
+  }
+  for _, fn in ipairs(attempts) do
+    local ok, hit = pcall(fn)
+    if ok and hit then return hit end
+  end
+  return nil
+end
+
+local function hitXYZ(hit, ox, oy, oz, dx, dy, dz)
+  if type(hit) == 'number' and hit == hit then
+    return ox + dx * hit, oy + dy * hit, oz + dz * hit
+  end
+  if type(hit) ~= 'table' then return nil end
+  if hit.x and hit.y then return tonumber(hit.x), tonumber(hit.y), tonumber(hit.z) or 0 end
+  local pt = hit.pt or hit.pos or hit.point
+  if type(pt) == 'table' and pt.x then return tonumber(pt.x), tonumber(pt.y), tonumber(pt.z) or 0 end
+  local dist = tonumber(hit.dist or hit.distance)
+  if dist then return ox + dx * dist, oy + dy * dist, oz + dz * dist end
+  return nil
+end
+
+-- Coarse retail stand-in for Tech Lidar. Off unless gvd_state.sensors.lidar_lua is true.
+-- ~24 rays / 2 Hz; honest empty file if Engine.castRay is missing on this build.
+local function pollLidarLua(dt)
+  if not lidarLuaWanted() then return end
+  scanAcc = scanAcc + (dt or 0)
+  if scanAcc < SCAN_EVERY then return end
+  scanAcc = 0
+  local veh = getPlayerVeh()
+  if not veh then return end
+  local okp, pos = pcall(function() return veh:getPosition() end)
+  local okd, dir = pcall(function() return veh:getDirectionVector() end)
+  if not okp or type(pos) ~= 'table' or not okd or type(dir) ~= 'table' then return end
+  local fx, fy, fz = tonumber(dir.x) or 0, tonumber(dir.y) or 1, tonumber(dir.z) or 0
+  local flen = math.sqrt(fx * fx + fy * fy + fz * fz) + 1e-9
+  fx, fy, fz = fx / flen, fy / flen, fz / flen
+  local lx, ly = -fy, fx
+  local ox = tonumber(pos.x) or 0
+  local oy = tonumber(pos.y) or 0
+  local oz = (tonumber(pos.z) or 0) + 0.6
+  local pts = {}
+  local fov = math.rad(120)
+  for i = 0, SCAN_RAYS - 1 do
+    local a = -fov / 2 + fov * (i / (SCAN_RAYS - 1))
+    local ca, sa = math.cos(a), math.sin(a)
+    local dx = fx * ca + lx * sa
+    local dy = fy * ca + ly * sa
+    local dz = fz
+    local from = { x = ox, y = oy, z = oz }
+    local to = { x = ox + dx * SCAN_RANGE, y = oy + dy * SCAN_RANGE, z = oz + dz * SCAN_RANGE }
+    if vec3 then
+      local okv, f, t = pcall(function() return vec3(ox, oy, oz), vec3(to.x, to.y, to.z) end)
+      if okv and f and t then from, to = f, t end
+    end
+    local hx, hy, hz = hitXYZ(tryCastRay(from, to), ox, oy, oz, dx, dy, dz)
+    if hx then
+      pts[#pts + 1] = string.format('{"x":%.2f,"y":%.2f,"z":%.2f}', hx, hy, hz)
+    end
+  end
+  writeText(userScanPath(), '{"n":' .. #pts .. ',"note":"coarse retail sweep","points":[' .. table.concat(pts, ',') .. ']}')
 end
 
 local function applyCmdJson(dt)
@@ -1395,6 +1512,7 @@ function M.onUpdate(dt)
   pollState(dt)
   applyCmdJson(dt)
   pollEgo(dt)
+  pollLidarLua(dt)
   -- Builds that never call onPreRender would otherwise leave the app with no data.
   if not preRenderSeen then tickPush(dt) end
 end

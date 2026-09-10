@@ -21,7 +21,16 @@ from python.control.actuate import (
     stop_command,
     write_engage_flag,
 )
-from python.sensors.tech import VehicleData, apply_nav_missing, nav_snapshot, path_ego_to_world, run_probe
+from python.sensors.tech import (
+    VehicleData,
+    apply_nav_missing,
+    heading_from_world_dir,
+    nav_snapshot,
+    path_ego_to_world,
+    run_probe,
+)
+from python.sensors.extras import ExtraSensors, load_sensors_config, nav_hint_from_bundle, write_sensors_snapshot
+from python.viz.foxglove_bridge import FoxgloveBridge
 from python.control.e2e import make_e2e
 from python.control.override import (
     OverrideDetector,
@@ -214,6 +223,11 @@ def main() -> None:
         action="store_true",
         help="Connect to BeamNG.tech, poll vehicle electrics/pose/damage, exit. No fake cameras.",
     )
+    ap.add_argument(
+        "--foxglove",
+        action="store_true",
+        help="Publish extras to a local Foxglove WebSocket (ws://127.0.0.1:8765). Planner stays vision-only.",
+    )
     args = ap.parse_args()
 
     if args.vision_only:
@@ -331,7 +345,9 @@ def main() -> None:
     print(f"[GVD] M5 policy={args.policy} e2e={e2e_policy.name} (modular vetoes E2E; shadow writes both)")
     print(f"[GVD] clip encoder={recorder.encoder} (qsv prefer; never default nvenc)")
     print(f"[GVD] state path: {state_path()}")
-    print("[GVD] Vision-only: no LiDAR/radar/ultrasonic/HD-map in the live loop. Tech GPS is a nav hint (not localization; pin is not a route).")
+    print("[GVD] Vision-only inference: RGB + ego kinematics + GPS nav hint. "
+          "LiDAR/radar/IMU extras are Foxglove / future fusion only; the corridor planner ignores them. "
+          "Pin is not a route.")
     print("[GVD] M3: no drive on preview unless --allow-preview-drive; engage via Alt+G (gvd_engage.json).")
     print("[GVD] M4: clips on disengage / AEB / near-miss / key C. Live QSV UNPROVEN until Windows smoke.")
     print(
@@ -343,6 +359,14 @@ def main() -> None:
     )
     if args.allow_preview_drive:
         print("[GVD] WARNING: --allow-preview-drive is ON")
+
+    sensors_cfg = load_sensors_config()
+    if args.foxglove:
+        fox_cfg = dict(sensors_cfg.get("foxglove") or {}) if isinstance(sensors_cfg.get("foxglove"), dict) else {}
+        fox_cfg["enabled"] = True
+        sensors_cfg["foxglove"] = fox_cfg
+    extras = ExtraSensors(sensors_cfg)
+    fox = FoxgloveBridge(sensors_cfg)
 
     ui = VizUI()
     win = "GVD VISION" if args.viz else None
@@ -426,6 +450,15 @@ def main() -> None:
                     spd, steer_in = ego_fb.speed_mps, ego_fb.steering_input
                     throttle_in, brake_in = ego_fb.throttle_input, ego_fb.brake_input
                     ego_source = "lua"
+                    if ego_fb.yaw_rate is not None:
+                        yaw_rate = float(ego_fb.yaw_rate)
+
+            session = getattr(backend, "session", None)
+            extras_bundle = extras.poll(vdata=vdata, ego_fb=ego_fb, session=session)
+            extras_bundle.foxglove = fox.note if fox.enabled else "off"
+            fox.publish(extras_bundle, frames=getattr(bundle, "frames", None))
+            write_sensors_snapshot(extras_bundle)
+
             if spd is not None:
                 ego_v = max(0.0, float(spd))
                 last_ego_v = ego_v
@@ -551,6 +584,13 @@ def main() -> None:
                     "note": vdata.note,
                 }
             st["nav"] = nav_snapshot(vdata)
+            if str((st.get("nav") or {}).get("mode") or "missing") == "missing" and extras_bundle.gps.ok:
+                heading = None
+                if vdata is not None:
+                    heading = vdata.gps_heading_deg
+                heading = heading_from_world_dir(ego_fb.dir)
+                st["nav"] = nav_hint_from_bundle(extras_bundle, heading_deg=heading)
+            st["sensors"] = extras_bundle.health()
             st["path_ego"] = pout.path_ego if pout.path_ego else steer_preview_path_ego(steer, length_m=36.0)
             if not pout.path_ego:
                 st["path_debug_preview"] = True
@@ -622,6 +662,14 @@ def main() -> None:
             if pout.path_debug_preview is False:
                 st["missing_state_keys"] = [m for m in st["missing_state_keys"] if "path_ego" not in m]
             st["missing_state_keys"] = apply_nav_missing(st["missing_state_keys"], st.get("nav"))
+            h = extras_bundle.health()
+            extra_miss: list[str] = []
+            if h.get("lidar") == "missing" and (sensors_cfg.get("lidar") or sensors_cfg.get("lidar_lua")):
+                extra_miss.append("lidar")
+            if h.get("radar") == "missing" and sensors_cfg.get("radar"):
+                extra_miss.append("radar")
+            if extra_miss:
+                st["missing_state_keys"] = sorted(set(st["missing_state_keys"] + extra_miss))
             st["heartbeat_ms"] = (time.perf_counter() - loop_t0) * 1000.0
 
             # M4 ring + triggers
@@ -681,6 +729,10 @@ def main() -> None:
         except Exception:
             pass
         backend.close()
+        try:
+            fox.close()
+        except Exception:
+            pass
         if win is not None:
             import cv2
 

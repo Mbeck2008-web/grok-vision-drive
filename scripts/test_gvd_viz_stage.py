@@ -27,7 +27,7 @@ def main() -> None:
             assert hit is None, f"{name}: {label} found ({hit.group(0)!r})"
     assert "GVD" in stage_src and "VISION" in stage_src
 
-    from python.viz.nerd import _nav_line, scene_note
+    from python.viz.nerd import _extras_line, _nav_line, scene_note
     from python.viz.stage import (
         VizUI,
         in_path,
@@ -87,6 +87,20 @@ def main() -> None:
     )
     assert "nav hint" in hint and "west gate" in hint and "not routing" in hint
     assert _nav_line({"capture_backend": "beamngpy", "nav": {"mode": "missing"}}) == "nav GPS missing"
+    extras = _extras_line(
+        {
+            "sensors": {
+                "imu": "lua",
+                "gps": "lua_pose",
+                "lidar": "missing",
+                "radar": "missing",
+                "foxglove": "off",
+                "drive_uses": "vision",
+            }
+        }
+    )
+    assert "imu=lua" in extras and "gps=lua_pose" in extras and "drive=vision" in extras
+    assert _extras_line({}) == ""
 
     import numpy as np
 

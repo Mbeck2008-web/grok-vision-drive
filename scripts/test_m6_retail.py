@@ -119,6 +119,10 @@ def check_release_zip() -> None:
     real = rel.collect_files(ROOT)
     assert "install.bat" in real and "python/run_vision.py" in real
     assert not any(f.endswith((".onnx", ".pt")) for f in real)
+    assert "requirements-foxglove.txt" not in real
+    assert "config/sensors.yaml" in real
+    assert "python/sensors/extras.py" in real
+    assert "python/viz/foxglove_bridge.py" in real
 
 
 def check_boot_line_honesty() -> None:

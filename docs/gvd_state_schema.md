@@ -53,16 +53,17 @@ Lua: `gvd_main.drawPath` on `onPreRender` / `onDebugDraw`. Engaged-only (Alt+G).
 | `vehicle.damage` | float? | Ground-truth Damage sensor; null when missing |
 | `vehicle.gear` / `rpm` | | Electrics extras |
 | `vehicle.pose_ok` | bool | `pos` + `dir` present for `path_world` |
-| `vehicle.sensors` | dict | `electrics`/`damage`/`gforces`/`gps` → `ok`/`missing` |
-| `nav.mode` | string | `missing` (retail / no GPS fix) / `hint` (Tech lat/lon). Never `route` until a planner exists |
+| `vehicle.sensors` | dict | `electrics`/`damage`/`gforces`/`gps` plus optional `lidar`/`radar`/`advanced_imu` → `ok`/`missing` |
+| `sensors` | dict | Extra bus health: `imu` / `gps` / `lidar` / `radar` sources, `foxglove`, `drive_uses=vision`, `lidar_lua` bool. Never fed to the planner |
+| `nav.mode` | string | `missing` (no GPS fix) / `hint` (Tech GPS or retail pose-derived lat/lon). Never `route` until a planner exists |
 | `nav.drive_to_pin` | bool | Always `false` today — pin is a hint, not a route |
-| `nav.gps` | `{lat,lon,x,y,ok}` or null | BeamNGpy GPS; BeamNG maps have no real-world lat/lon (`config/tech.yaml` `gps.ref_*` is world origin) |
+| `nav.gps` | `{lat,lon,x,y,ok}` or null | BeamNGpy GPS or retail `lua_pose` (world xy × `gps.ref_*`). Maps have no real-world lat/lon |
 | `nav.pin` | `{lat,lon,name}` or null | Destination from `nav.pin_*` / `GVD_NAV_PIN_*`; empty until you drop a pin |
 | `nav.range_m` / `bearing_deg` | float? | Haversine range; bearing clockwise from north |
 | `nav.bearing_rel_deg` | float? | Pin vs heading (−180..180, + = right). Heading from GPS motion or world `dir` |
 
 Also: `Documents/GVD/gvd_cmd.json` = `{steer,throttle,brake,seq,engaged,heartbeat_mtime,reason}` (see M6 below).
-`config/tech.yaml` owns host/port/home, wait-for-vehicle, vehicle-data sensors, GPS origin, and the optional nav pin (RGB cameras stay in `cameras.yaml`).
+`config/tech.yaml` owns host/port/home, wait-for-vehicle, vehicle-data sensors, GPS origin, and the optional nav pin (RGB cameras stay in `cameras.yaml`). Optional LiDAR / radar / Foxglove live in `config/sensors.yaml` — Foxglove / future fusion only; the corridor planner ignores them. Snapshot: `Documents/GVD/gvd_sensors.json`. Optional retail ray sweep: `Documents/GVD/gvd_scan.json` when `sensors.lidar_lua` is true.
 
 
 ## M4 fields
@@ -202,6 +203,8 @@ Lua (`gvd_main.applyCmdJson`, 20 Hz): `input.event('steering', s, 1)`; `input.ev
 | `applied_seq` | int | Last cmd seq Lua applied |
 | `applying` | bool | Lua currently holds the inputs |
 | `mtime` | int | `os.time()`; Python uses the file mtime, fresh ≤ 1 s |
+| `gx` / `gy` / `gz` / `yaw_rate` | float? | Vehicle `sensors.gx2` + `obj:getYawAngularVelocity` (IMU extras; planner still vision-only) |
+| `pos` / `dir` | `{x,y,z}`? | Player vehicle world pose from GE (`getPosition` / `getDirectionVector`); GPS lat/lon is derived from this × `gps.ref_*` |
 
 Retail (`capture_backend=window`): `actuator=cmd_json`; `cmd_applied` follows the ack. Boot line: `backend=window cams=1/8 path=retail (1 window capture; not 8; drive=gvd_cmd.json->mod Lua)`.
 

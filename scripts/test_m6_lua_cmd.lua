@@ -54,7 +54,11 @@ local veEnv = {
   input = { event = function(itype, ivalue, filter) events[#events + 1] = { itype, ivalue, filter } end },
   electrics = { values = electricsValues },
   drivetrain = { setShifterMode = function(mode) shifter[#shifter + 1] = mode end },
-  obj = { queueGameEngineLua = function(_, s) geQueue[#geQueue + 1] = s end },
+  sensors = { gx2 = 0, gy2 = 0, gz2 = 0 },
+  obj = {
+    queueGameEngineLua = function(_, s) geQueue[#geQueue + 1] = s end,
+    getYawAngularVelocity = function() return 0.0 end,
+  },
   pcall = pcall, tonumber = tonumber, tostring = tostring, string = string, math = math,
 }
 local Veh = {}
@@ -70,6 +74,7 @@ function Veh:queueLuaCommand(code)
   for i = n0 + 1, #events do events[i].veh = self.id end
 end
 function Veh:getPosition() return { x = 0, y = 0, z = 0 } end
+function Veh:getDirectionVector() return { x = 0, y = 1, z = 0 } end
 function Veh:getID() return self.id end
 local fakeVeh = setmetatable({ id = 101 }, Veh)
 local otherVeh = setmetatable({ id = 202 }, Veh)

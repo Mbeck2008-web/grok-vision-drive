@@ -1,10 +1,12 @@
 # GVD BeamNG.tech session. Used when --backend beamngpy / play_gvd_tech.bat.
-# Vision-only: RGB cameras + ego kinematics (electrics / pose / g-forces) + GPS nav hint.
-# Never LiDAR, radar, or ultrasonic. GPS is a map-pin hint, not camera localization.
+# Vision-only at inference: RGB cameras + ego kinematics + GPS nav hint.
+# Optional LiDAR / radar / AdvancedIMU live in config/sensors.yaml (Foxglove /
+# future fusion). The corridor planner ignores them. Ultrasonic stays refused.
+# GPS is a map-pin hint, not camera localization, and not a route.
 #
 # Env overrides (when set): GVD_BEAMNG_HOST, GVD_BEAMNG_PORT, BNG_HOME / BEAMNG_HOME,
 # GVD_BEAMNG_USER, GVD_TECH_LAUNCH=1, GVD_TECH_VEHICLE=<vid>, GVD_GPS=0/1,
-# GVD_NAV_PIN_LAT, GVD_NAV_PIN_LON, GVD_NAV_PIN_NAME.
+# GVD_NAV_PIN_LAT, GVD_NAV_PIN_LON, GVD_NAV_PIN_NAME, GVD_LIDAR=1, GVD_RADAR=1.
 #
 # Match BeamNGpy to your Tech build (0.38 → 1.35.x, 0.39 → 1.36). Live attach UNPROVEN here.
 
@@ -27,8 +29,7 @@ sensors:
   damage: true      # ground-truth damage (not a camera)
   gforces: true     # gx/gy/gz kinematics
   gps: true         # lat/lon nav hint for a future map pin. Not localization. Not a route.
-  # lidar: never
-  # radar: never
+  # lidar / radar: optional attach via config/sensors.yaml (planner ignores them)
 
 # BeamNG maps have no real-world lat/lon. ref_* put world (0, 0) on this sphere
 # (Italy demo defaults from BeamNGpy GPS_trajectory.py). pos_m is GVD frame.

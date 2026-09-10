@@ -1,0 +1,40 @@
+# Extra sensors for Foxglove / a future fusion stack.
+# Inference stays vision-only (RGB + ego kinematics + GPS nav hint).
+# LiDAR / radar never feed the corridor planner.
+#
+# Retail (no BeamNGpy): IMU + world pose come from the Lua ego echo.
+# GPS is derived from that pose using gps.ref_* (same sphere as Tech).
+# Optional lidar_lua = a coarse GELua ray sweep (not Tech Lidar).
+# Radar has no retail source.
+#
+# Env: GVD_FOXGLOVE=1, GVD_LIDAR=1, GVD_RADAR=1, GVD_LIDAR_LUA=1.
+
+drive_uses: vision
+
+imu: true
+gps: true
+lidar: false          # Tech BeamNGpy Lidar attach (play_gvd_tech.bat)
+radar: false          # Tech BeamNGpy Radar attach
+lidar_lua: false      # retail ray sweep → Documents/GVD/gvd_scan.json
+
+lidar_mount:
+  pos_m: [0.0, 0.0, 1.7]     # GVD frame; converted like cameras
+  is_360: true
+  update_s: 0.1
+  shared_memory: true
+  max_points: 4000
+
+radar_mount:
+  pos_m: [0.0, 2.0, 0.5]
+  update_s: 0.1
+
+imu_mount:
+  pos_m: [0.0, 0.0, 0.5]
+  visualised: false
+
+foxglove:
+  enabled: false
+  host: 127.0.0.1
+  port: 8765
+  cameras: true
+  max_lidar_points: 4000

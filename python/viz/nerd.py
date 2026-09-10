@@ -144,6 +144,20 @@ def _nav_line(s: dict[str, Any]) -> str:
     return " ".join(bits)
 
 
+def _extras_line(s: dict[str, Any]) -> str:
+    """IMU/GPS/LiDAR/radar/Foxglove bus; empty-ish if the block is absent."""
+    extra = s.get("sensors") if isinstance(s.get("sensors"), dict) else {}
+    if not extra:
+        return ""
+    imu = extra.get("imu") or "missing"
+    gps = extra.get("gps") or "missing"
+    lidar = extra.get("lidar") or "missing"
+    radar = extra.get("radar") or "missing"
+    fox = extra.get("foxglove") or "off"
+    drive = extra.get("drive_uses") or "vision"
+    return f"extras imu={imu} gps={gps} lidar={lidar} radar={radar} fox={fox} drive={drive}"
+
+
 def _lines(s: dict[str, Any]) -> list[str]:
     ego = s.get("ego") or {}
     pl = s.get("planner") or {}
@@ -168,6 +182,7 @@ def _lines(s: dict[str, Any]) -> list[str]:
             sel.append(f"miss@{t}s={miss_m:.1f}m (lead y~{pred_y:.0f})")
     veh_line = _vehicle_line(s)
     nav_line = _nav_line(s)
+    extras_line = _extras_line(s)
     return [
         f"policy: {s.get('policy', '?')}   engage: {s.get('engaged')}",
         f"disengage: {s.get('disengage_reason', 'none')}",
@@ -187,6 +202,7 @@ def _lines(s: dict[str, Any]) -> list[str]:
         f"cmd {s.get('actuator', '?')} {s.get('cmd_reason', '?')} applied={s.get('cmd_applied')} ego={s.get('ego_source', '?')}",
         *([veh_line] if veh_line else []),
         *([nav_line] if nav_line else []),
+        *([extras_line] if extras_line else []),
         f"clip {s.get('last_clip_trigger', 'none')}",
         *sel,
         "missing: " + (", ".join(miss) if miss else "none"),

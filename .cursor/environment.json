@@ -1,0 +1,5 @@
+{
+  "name": "Grok Vision Drive (GVD)",
+  "user": "ubuntu",
+  "install": "bash .cursor/install.sh"
+}

@@ -345,11 +345,10 @@ def check_ffb_override_live() -> None:
     if ego_path().exists():
         ego_path().unlink()
 
-    # Force-feedback chatter — alternating kicks well past M6's bare 0.55 threshold, keyed off
-    # the seq the supervisor just wrote so the sign really does flip every tick.
+    # Force-feedback chatter — alternating kicks keyed off the seq so the sign flips every tick.
     write_engage_flag(True)
     out = _run_supervisor(["--allow-preview-drive"], seconds=3.0, ack=True, steer_echo=lambda seq: 0.9 if seq % 2 else -0.9)
-    assert "DISENGAGED: driver override" not in out, out[-2000:]
+    assert "DISENGAGED: player_" not in out, out[-2000:]
     assert read_engage_flag(default=False) is True, "force-feedback chatter disengaged GVD"
     cmd = json.loads(cmd_path().read_text(encoding="utf-8"))
     assert cmd["engaged"] is True and cmd["reason"] == "ok", cmd
@@ -358,27 +357,27 @@ def check_ffb_override_live() -> None:
         k: st.get(k) for k in ("engaged", "disengage_reason")
     }
     assert st["override"]["channel"] == "none" and st["override"]["armed"] is True, st["override"]
-    assert st["override"]["steer_held_s"] < st["override_cfg"]["steer_hold_s"], st["override"]
+    assert st["override"]["steer_held_ms"] < st["override_cfg"]["steer_hold_ms"], st["override"]
     # No sink regression: the mod's ack path still drives while the wheel chatters.
     assert st["cmd_applied"] is True and st["cmd_reason"] == "cmd_json_applied", st["cmd_reason"]
 
     # A driver actually holding the wheel over. The engage file is the durable record: later ticks
     # only see engaged=false and write the generic not_engaged.
     write_engage_flag(True)
-    out = _run_supervisor(["--allow-preview-drive"], seconds=3.0, ack=True, steer_echo=lambda _seq: 0.95)
-    assert "DISENGAGED: driver override on steer" in out, out[-2000:]
+    out = _run_supervisor(["--allow-preview-drive"], seconds=3.0, ack=True, steer_echo=lambda _seq: 0.25)
+    assert "DISENGAGED: player_steer" in out, out[-2000:]
     assert read_engage_flag(default=True) is False, "a real steer takeover must disengage"
-    assert json.loads(engage_path().read_text(encoding="utf-8"))["disengage_reason"] == "driver_override"
+    assert json.loads(engage_path().read_text(encoding="utf-8"))["disengage_reason"] == "player_steer"
     st = read_state()
     assert st and st["engaged"] is False, {k: st.get(k) for k in ("engaged", "disengage_reason")}
     assert json.loads(cmd_path().read_text(encoding="utf-8"))["engaged"] is False
 
-    # Pedals stay hard: a brake press on top of the command is an override with no dwell.
+    # Pedals stay tight: a brake press on top of the command is an override with no dwell.
     write_engage_flag(True)
     out = _run_supervisor(["--allow-preview-drive"], seconds=2.0, ack=True, brake_bias=0.4)
-    assert "DISENGAGED: driver override on brake" in out, out[-2000:]
+    assert "DISENGAGED: player_brake" in out, out[-2000:]
     assert read_engage_flag(default=True) is False, "a real brake press must disengage"
-    assert json.loads(engage_path().read_text(encoding="utf-8"))["disengage_reason"] == "driver_override"
+    assert json.loads(engage_path().read_text(encoding="utf-8"))["disengage_reason"] == "player_brake"
 
     # Mirrored thresholds reach the mod through gvd_state.json.
     from python.control.override import config_mirror, load_override_config
@@ -409,10 +408,10 @@ def check_engage_path_contract() -> None:
     p.write_text('{"engaged":true,"mtime":1700000000}', encoding="utf-8")
     assert read_engage_flag(default=False) is True
     # Supervisor disengage payload: engaged=false with float mtime + reason (what Lua adopts as OFF and logs).
-    write_engage_flag(False, disengage_reason="driver_override")
+    write_engage_flag(False, disengage_reason="player_steer")
     data = json.loads(p.read_text(encoding="utf-8"))
     assert data["engaged"] is False and isinstance(data["mtime"], float)
-    assert data["disengage_reason"] == "driver_override"
+    assert data["disengage_reason"] == "player_steer"
     assert read_engage_flag(default=True) is False
     write_engage_flag(False)
     assert json.loads(p.read_text(encoding="utf-8"))["disengage_reason"] == "none"

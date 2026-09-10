@@ -75,7 +75,7 @@ angular.module('beamng.apps')
       };
 
       // ----------------------------------------------------------- readouts
-      function dash(v) { return (v === null || v === undefined || v === '') ? '—' : v; }
+      function dash(v) { return (v === null || v === undefined || v === '') ? '--' : v; }
       scope.dash = dash;
 
       scope.linkLabel = function () {
@@ -117,9 +117,9 @@ angular.module('beamng.apps')
           if (ui.aeb === 'brake') return 'AEB brake';
           if (ui.aeb === 'warn') return 'AEB warn';
           if (ui.vetoReason && ui.vetoReason !== 'none') return 'veto: ' + ui.vetoReason;
-          if (driving()) return 'GVD holds the wheel · steer to take over';
-          if (ui.actuator === 'cmd_json') return 'armed · waiting for supervisor commands';
-          return 'armed · actuators idle';
+          if (driving()) return 'GVD holds the wheel - steer to take over';
+          if (ui.actuator === 'cmd_json') return 'armed - waiting for supervisor commands';
+          return 'armed - actuators idle';
         }
         var r = ui.disengageReason;
         if (r && r !== 'none' && r !== 'not_engaged') return 'last: ' + r;
@@ -133,67 +133,67 @@ angular.module('beamng.apps')
         if (ui.pathWidth !== null && ui.pathWidth !== undefined) bits.push(Number(ui.pathWidth).toFixed(1) + ' m');
         if (ui.pathPreview) bits.push('preview path');
         if (ui.n !== null && ui.n !== undefined) bits.push(ui.n + ' tracked');
-        return bits.join(' · ');
+        return bits.join(' - ');
       };
       scope.segClass = function (p) {
         return { 'is-on': ui.policy === p, 'is-req': ui.policyReq === p && ui.policy !== p };
       };
       scope.policyLine = function () {
         if (ui.link === 'none') {
-          return ui.policyReq ? ('requested ' + ui.policyReq + ' · supervisor not running') : 'supervisor not running';
+          return ui.policyReq ? ('requested ' + ui.policyReq + ' - supervisor not running') : 'supervisor not running';
         }
         var bits = ['e2e ' + dash(ui.e2eBackend)];
         bits.push('veto ' + dash(ui.vetoReason));
         if (ui.e2eOk === false) bits.push('e2e held by modular');
-        if (ui.policyReq && ui.policyReq !== ui.policy) bits.push('requested ' + ui.policyReq + '…');
-        return bits.join(' · ');
+        if (ui.policyReq && ui.policyReq !== ui.policy) bits.push('requested ' + ui.policyReq + '...');
+        return bits.join(' - ');
       };
       scope.camLine = function () {
-        if (ui.link === 'none') return '—';
+        if (ui.link === 'none') return '--';
         var s = dash(ui.camBackend);
-        if (ui.camTotal) s += ' · ' + ui.camOk + '/' + ui.camTotal + ' feeds';
-        if (ui.camNote) s += ' · ' + ui.camNote;
-        else if (ui.camBackend === 'window') s += ' · retail: cam_main only';
+        if (ui.camTotal) s += ' - ' + ui.camOk + '/' + ui.camTotal + ' feeds';
+        if (ui.camNote) s += ' - ' + ui.camNote;
+        else if (ui.camBackend === 'window') s += ' - retail: cam_main only';
         return s;
       };
       scope.vizLine = function () {
-        if (ui.link === 'none') return '—';
-        if (!ui.vizWindow) return 'off · run python with --viz';
-        return 'on · ' + dash(ui.vizNote || ('screen ' + dash(ui.vizScreen)));
+        if (ui.link === 'none') return '--';
+        if (!ui.vizWindow) return 'off - run python with --viz';
+        return 'on - ' + dash(ui.vizNote || ('screen ' + dash(ui.vizScreen)));
       };
       scope.vizSel = function (s) {
         if (ui.vizScreenReq) return ui.vizScreenReq === s;
         return String(ui.vizScreen) === s;
       };
       scope.rateLine = function () {
-        if (ui.link === 'none') return '—';
-        return Math.round(ui.hz || 0) + ' Hz loop · ' + Math.round(ui.camHz || 0) + ' Hz cams · ' +
+        if (ui.link === 'none') return '--';
+        return Math.round(ui.hz || 0) + ' Hz loop - ' + Math.round(ui.camHz || 0) + ' Hz cams - ' +
           (ui.inferMs === null ? '--' : Number(ui.inferMs).toFixed(1)) + ' ms infer';
       };
       scope.gpuLine = function () {
-        if (ui.link === 'none') return '—';
+        if (ui.link === 'none') return '--';
         var vram = (ui.vramUsed === null ? '--' : Number(ui.vramUsed).toFixed(1)) + ' / ' +
           (ui.vramTotal === null ? '--' : Number(ui.vramTotal).toFixed(1)) + ' GB';
-        return vram + (ui.gpu ? ' · ' + ui.gpu : '') + (ui.rssMb ? ' · rss ' + Math.round(ui.rssMb) + ' MB' : '');
+        return vram + (ui.gpu ? ' - ' + ui.gpu : '') + (ui.rssMb ? ' - rss ' + Math.round(ui.rssMb) + ' MB' : '');
       };
       scope.actuatorLine = function () {
-        if (ui.link === 'none') return '—';
+        if (ui.link === 'none') return '--';
         var s = dash(ui.actuator);
-        if (ui.applying) s += ' · mod driving';
-        else if (ui.cmdApplied === false) s += ' · not applied';
-        if (ui.cmdAckSeq != null && ui.cmdAckSeq >= 0) s += ' · ack ' + ui.cmdAckSeq + '/' + dash(ui.cmdSeq);
-        if (ui.egoSource && ui.egoSource !== 'none') s += ' · ego ' + ui.egoSource;
-        if (ui.cmdReason && ['ok', 'cmd_json_applied'].indexOf(ui.cmdReason) < 0) s += ' · ' + ui.cmdReason;
+        if (ui.applying) s += ' - mod driving';
+        else if (ui.cmdApplied === false) s += ' - not applied';
+        if (ui.cmdAckSeq != null && ui.cmdAckSeq >= 0) s += ' - ack ' + ui.cmdAckSeq + '/' + dash(ui.cmdSeq);
+        if (ui.egoSource && ui.egoSource !== 'none') s += ' - ego ' + ui.egoSource;
+        if (ui.cmdReason && ['ok', 'cmd_json_applied'].indexOf(ui.cmdReason) < 0) s += ' - ' + ui.cmdReason;
         return s;
       };
       scope.clipLine = function () {
-        if (ui.link === 'none') return '—';
-        return dash(ui.encodeBackend) + ' · last ' + dash(ui.clipTrigger);
+        if (ui.link === 'none') return '--';
+        return dash(ui.encodeBackend) + ' - last ' + dash(ui.clipTrigger);
       };
       scope.beatLine = function () {
         if (ui.link === 'none') return 'no gvd_state.json yet';
         var age = (ui.hbAge === null || ui.hbAge === undefined) ? '--' : Number(ui.hbAge).toFixed(2);
-        return ui.link + ' · ' + age + ' s since last beat';
+        return ui.link + ' - ' + age + ' s since last beat';
       };
 
       // --------------------------------------------------------------- feed

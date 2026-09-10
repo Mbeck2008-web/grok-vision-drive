@@ -78,6 +78,15 @@ def default_state(**overrides: Any) -> dict[str, Any]:
             "yaw_rate": 0.0,
             "accel": 0.0,
         },
+        "vehicle": {
+            "vid": None,
+            "model": None,
+            "connected": False,
+            "damage": None,
+            "gear": None,
+            "rpm": None,
+            "pose_ok": False,
+        },
         "planner": {
             "corridor_width": 2.0,
             "curvature": 0.0,

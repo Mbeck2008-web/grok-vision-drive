@@ -292,27 +292,28 @@ def read_electrics_speed(vehicle: Any) -> tuple[float | None, float | None]:
 
 
 def attach_electrics(vehicle: Any, bng: Any = None) -> bool:
-    """Best-effort attach Electrics sensor (BeamNGpy). Returns True if attached/available."""
+    """Best-effort attach Electrics (classic BeamNGpy Sensor API). Prefer TechSession.attach_vehicle_sensors."""
     if vehicle is None:
         return False
     try:
+        sensors = getattr(vehicle, "sensors", None)
+        if sensors is not None and "electrics" in sensors:
+            return True
+    except Exception:
+        pass
+    try:
         from beamngpy.sensors import Electrics  # type: ignore
 
-        # Avoid double-attach
-        if getattr(vehicle, "_gvd_electrics", None) is not None:
-            return True
-        el = Electrics("gvd_electrics", bng, vehicle) if bng is not None else Electrics()
+        el = Electrics()
         if hasattr(vehicle, "attach_sensor"):
             vehicle.attach_sensor("electrics", el)
-        vehicle._gvd_electrics = el
-        return True
+            vehicle._gvd_electrics = el
+            return True
     except Exception:
-        # Older APIs: vehicle.sensors may already include electrics after poll setup
-        try:
-            if hasattr(vehicle, "sensors") and vehicle.sensors is not None:
-                return True
-        except Exception:
-            pass
+        pass
+    try:
+        return hasattr(vehicle, "sensors") and vehicle.sensors is not None
+    except Exception:
         return False
 
 

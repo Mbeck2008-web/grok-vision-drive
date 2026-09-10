@@ -90,6 +90,24 @@ def _help_lines() -> list[str]:
     ]
 
 
+def _vehicle_line(s: dict[str, Any]) -> str:
+    """Tech vehicle row; empty on retail so the panel stays one-cam honest."""
+    veh = s.get("vehicle") if isinstance(s.get("vehicle"), dict) else {}
+    cap = str(s.get("capture_backend") or "")
+    if cap != "beamngpy" and not veh.get("connected") and not veh.get("vid"):
+        return ""
+    if not veh.get("connected"):
+        note = veh.get("note") or "not connected"
+        return f"vehicle {note}"
+    dmg = veh.get("damage")
+    dmg_s = f"{float(dmg):.2f}" if dmg is not None else "?"
+    pose = "pose ok" if veh.get("pose_ok") else "pose missing"
+    return (
+        f"vehicle {veh.get('vid') or '?'} {veh.get('model') or ''} "
+        f"dmg={dmg_s} {pose}"
+    ).strip()
+
+
 def _lines(s: dict[str, Any]) -> list[str]:
     ego = s.get("ego") or {}
     pl = s.get("planner") or {}
@@ -112,6 +130,7 @@ def _lines(s: dict[str, Any]) -> list[str]:
             pred_y = float(lead.get("y", 0)) + float(lead.get("speed_mps", 0)) * t
             miss_m = abs(float(lead.get("x", 0)))
             sel.append(f"miss@{t}s={miss_m:.1f}m (lead y~{pred_y:.0f})")
+    veh_line = _vehicle_line(s)
     return [
         f"policy: {s.get('policy', '?')}   engage: {s.get('engaged')}",
         f"disengage: {s.get('disengage_reason', 'none')}",
@@ -129,6 +148,7 @@ def _lines(s: dict[str, Any]) -> list[str]:
         f"path_conf {s.get('path_conf', 0):.2f}  width {s.get('path_width', 0):.2f}  preview={s.get('path_debug_preview')}",
         f"scene {s.get('viz_scene_note') or scene_note(s)}",
         f"cmd {s.get('actuator', '?')} {s.get('cmd_reason', '?')} applied={s.get('cmd_applied')} ego={s.get('ego_source', '?')}",
+        *([veh_line] if veh_line else []),
         f"clip {s.get('last_clip_trigger', 'none')}",
         *sel,
         "missing: " + (", ".join(miss) if miss else "none"),

@@ -95,6 +95,20 @@ type "%LOG%"
 
 echo.
 echo Installed. Fully quit BeamNG, relaunch, enable Grok Vision Drive in Mod Manager.
+
+rem Also copy into BeamNG.tech user mods when that folder exists (separate from Drive).
+set "TECH_DEST="
+if exist "%LOCALAPPDATA%\BeamNG.tech\current\mods\" set "TECH_DEST=%LOCALAPPDATA%\BeamNG.tech\current\mods\unpacked\gvd"
+if not defined TECH_DEST if exist "%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\mods\" set "TECH_DEST=%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\mods\unpacked\gvd"
+if defined TECH_DEST (
+  if exist "%TECH_DEST%\" rd /s /q "%TECH_DEST%"
+  mkdir "%TECH_DEST%" 2>nul
+  xcopy /E /I /Y "%~dp0beamng_mod\*" "%TECH_DEST%\" >nul
+  echo [GVD] Also installed Tech mods: %TECH_DEST%
+) else (
+  echo [GVD] No BeamNG.tech current\mods folder yet - Drive install is enough until Tech is on this box.
+)
+
 pause >nul
 endlocal
 exit /b 0

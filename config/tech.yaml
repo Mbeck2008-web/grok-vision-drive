@@ -1,0 +1,38 @@
+# GVD BeamNG.tech session. Used when --backend beamngpy / play_gvd_tech.bat.
+# Vision-only: RGB cameras + ego kinematics (electrics / pose / g-forces).
+# Never LiDAR, radar, ultrasonic, or GPS-as-localization.
+#
+# Env overrides (when set): GVD_BEAMNG_HOST, GVD_BEAMNG_PORT, BNG_HOME / BEAMNG_HOME,
+# GVD_BEAMNG_USER, GVD_TECH_LAUNCH=1, GVD_TECH_VEHICLE=<vid>.
+#
+# Match BeamNGpy to your Tech build (0.38 → 1.35.x, 0.39 → 1.36). Live attach UNPROVEN here.
+
+host: localhost
+port: 25252
+home: ""          # BeamNG.tech install dir (tech.key lives next to the exe). Empty → BNG_HOME.
+user: ""          # Tech userfolder. Empty → Tech default. Set to the Drive userfolder to share mods.
+launch: false     # false = attach to already-running Tech. true = BeamNGpy launches from home.
+wait_vehicle_s: 60
+vehicle: current  # current = player vehicle when known, else first spawned. Or a vid string.
+prefer_model: etk800
+
+# Extra GVD-frame offset (+X right, +Y forward, +Z up) added before BeamNG vehicle-space convert.
+origin_offset: [0.0, 0.0, 0.0]
+vehicle_origins:
+  etk800: [0.0, 0.0, 0.0]
+
+sensors:
+  electrics: true   # wheelspeed, steering_input, throttle_input, brake_input, gear, rpm
+  damage: true      # ground-truth damage (not a camera)
+  gforces: true     # gx/gy/gz kinematics
+  # lidar: never
+  # radar: never
+  # gps: never
+
+cameras:
+  attach: true
+  rgb_only: true
+  convert_gvd_frame: true   # cameras.yaml is GVD frame; BeamNGpy Camera is +X left +Y back +Z up
+  update_s: 0.067           # ~15 Hz suggestion to the Tech sensor manager
+  shared_memory: true
+  streaming: true

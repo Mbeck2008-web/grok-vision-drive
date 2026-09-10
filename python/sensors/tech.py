@@ -1,10 +1,10 @@
 """BeamNG.tech session: connect, player vehicle, electrics/damage/pose + GPS nav hint.
 
-Never attaches LiDAR / radar / ultrasonic. Camera RGB is handled by cameras.py.
-GPS (Tech) is a coarse nav hint for a future map pin — not camera localization and not
-a drive-to-pin planner. Coordinates: GVD vehicle frame is +X right, +Y forward, +Z up.
-BeamNGpy Camera/GPS vehicle space is +X left, +Y backward, +Z up (default Camera
-dir=(0,-1,0) is forward). Convert at attach.
+Camera RGB is handled by cameras.py. GPS is a coarse nav hint, not localization.
+LiDAR / radar / AdvancedIMU attach when config/sensors.yaml enables them — Foxglove /
+future fusion only; the corridor planner stays vision-only. Ultrasonic stays refused.
+Coordinates: GVD vehicle frame is +X right, +Y forward, +Z up. BeamNGpy Camera/GPS
+vehicle space is +X left, +Y backward, +Z up. Convert at attach.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
-FORBIDDEN_SENSORS = ("lidar", "radar", "ultrasonic", "idealradar", "ideal_radar")
+FORBIDDEN_SENSORS = ("ultrasonic", "idealradar", "ideal_radar")
 EARTH_R_M = 6371000.0
 # BeamNG maps have no real-world lat/lon. These put world (0, 0) on the Italy demo sphere.
 DEFAULT_REF_LON = 8.8017
@@ -347,6 +347,10 @@ class TechSession:
         self._last_dir: tuple[float, float, float] | None = None
         self._last_t: float | None = None
         self._gps: Any = None
+        self._lidar: Any = None
+        self._radar: Any = None
+        self._imu: Any = None
+        self._extra_sensors_yaml: dict[str, Any] | None = None
         self._last_gps: tuple[float, float] | None = None
         self.note = ""
 
@@ -466,9 +470,48 @@ class TechSession:
             self._log(f"[GVD] beamngpy vehicle connect: {e}")
         return veh
 
+    def _extra_yaml(self) -> dict[str, Any]:
+        cached = getattr(self, "_extra_sensors_yaml", None)
+        if isinstance(cached, dict):
+            return cached
+        extra: dict[str, Any] = {}
+        try:
+            import yaml  # type: ignore
+
+            p = ROOT / "config" / "sensors.yaml"
+            if p.is_file():
+                extra = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        except Exception:
+            extra = {}
+        if not isinstance(extra, dict):
+            extra = {}
+        for key in ("lidar", "radar", "gps", "imu", "lidar_lua"):
+            env = os.environ.get(f"GVD_{key.upper()}", "").strip().lower()
+            if env in ("1", "true", "yes"):
+                extra[key] = True
+            elif env in ("0", "false", "no"):
+                extra[key] = False
+        adv = os.environ.get("GVD_ADVANCED_IMU", "").strip().lower()
+        if adv in ("1", "true", "yes"):
+            extra["advanced_imu"] = True
+        elif adv in ("0", "false", "no"):
+            extra["advanced_imu"] = False
+        self._extra_sensors_yaml = extra
+        return extra
+
+    def _merged_sensor_flags(self) -> dict[str, Any]:
+        flags = dict(self.config.get("sensors") or {}) if isinstance(self.config.get("sensors"), dict) else {}
+        extra = self._extra_yaml()
+        for key in ("lidar", "radar"):
+            if extra.get(key):
+                flags[key] = True
+        if extra.get("advanced_imu"):
+            flags["advanced_imu"] = True
+        return flags
+
     def attach_vehicle_sensors(self) -> dict[str, bool]:
-        """Electrics + Damage + GForces + GPS nav hint. Refuses LiDAR/radar/ultrasonic."""
-        flags = self.config.get("sensors") if isinstance(self.config.get("sensors"), dict) else {}
+        """Electrics + Damage + GForces + GPS. Optional LiDAR/radar/AdvancedIMU (not for driving)."""
+        flags = self._merged_sensor_flags()
         for name in FORBIDDEN_SENSORS:
             if flags.get(name):
                 raise ValueError(f"GVD refuses Tech sensor {name!r} (vision-only)")
@@ -484,10 +527,24 @@ class TechSession:
             self.attached["gforces"] = self._attach_classic(vehicle, bng, "gforces", "GForces")
         if flags.get("gps", True):
             self.attached["gps"] = self._attach_gps(vehicle, bng)
+        if flags.get("lidar"):
+            self.attached["lidar"] = self._attach_lidar(vehicle, bng)
+        if flags.get("radar"):
+            self.attached["radar"] = self._attach_radar(vehicle, bng)
+        if flags.get("advanced_imu"):
+            self.attached["advanced_imu"] = self._attach_advanced_imu(vehicle, bng)
         ok = [k for k, v in self.attached.items() if v]
+        extra = [k for k in ("lidar", "radar", "advanced_imu") if self.attached.get(k)]
+        wanted = [k for k in ("lidar", "radar", "advanced_imu") if flags.get(k)]
+        if extra:
+            extra_note = f" extras={','.join(extra)} (Foxglove only; planner ignores them)"
+        elif wanted:
+            extra_note = f" extras requested={','.join(wanted)} but missing (planner stays vision-only)"
+        else:
+            extra_note = " (LiDAR/radar off; enable in config/sensors.yaml)"
         self._log(
             f"[GVD] tech vehicle sensors: {', '.join(ok) if ok else 'none'} "
-            f"(RGB cameras separate; GPS is a nav hint, not localization; no LiDAR/radar)."
+            f"(RGB cameras separate; GPS is a nav hint, not localization){extra_note}."
         )
         return dict(self.attached)
 
@@ -568,6 +625,159 @@ class TechSession:
             self._log(f"[GVD] attach GPS failed: {e}")
             self._gps = None
             return False
+
+    def _mount_pos_dir(
+        self, pos_m: Any, dir_gvd: tuple[float, float, float] = (0.0, 1.0, 0.0)
+    ) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+        pos = list(pos_m or [0.0, 0.0, 0.0])
+        while len(pos) < 3:
+            pos.append(0.0)
+        cams = self.config.get("cameras") if isinstance(self.config.get("cameras"), dict) else {}
+        if cams.get("convert_gvd_frame", True):
+            return (
+                gvd_to_bng_vehicle(float(pos[0]), float(pos[1]), float(pos[2])),
+                gvd_to_bng_vehicle(*dir_gvd),
+            )
+        return (float(pos[0]), float(pos[1]), float(pos[2])), dir_gvd
+
+    def _comm_kwargs(
+        self,
+        cls: Any,
+        *,
+        pos: tuple[float, float, float],
+        direction: tuple[float, float, float] | None = None,
+        update_s: float = 0.1,
+        shared: bool | None = None,
+        is_360: bool | None = None,
+        vis: bool = False,
+    ) -> dict[str, Any]:
+        try:
+            params = set(inspect.signature(cls.__init__).parameters)
+        except (TypeError, ValueError):
+            params = set()
+        kwargs: dict[str, Any] = {}
+
+        def put(value: Any, *names: str) -> None:
+            for name in names:
+                if not params or name in params:
+                    kwargs[name] = value
+                    return
+
+        put(pos, "pos")
+        if direction is not None:
+            put(direction, "dir", "direction")
+        put(update_s, "requested_update_time", "gfx_update_time")
+        if shared is not None:
+            put(shared, "is_using_shared_memory")
+        if is_360 is not None:
+            put(is_360, "is_360_mode", "is_360")
+        put(vis, "is_visualised", "is_visualized")
+        if "is_snapping_desired" in params:
+            kwargs["is_snapping_desired"] = False
+        return kwargs
+
+    def _attach_lidar(self, vehicle: Any, bng: Any) -> bool:
+        """Optional BeamNGpy Lidar. Foxglove / future fusion only — planner ignores it."""
+        if self._lidar is not None:
+            return True
+        try:
+            from beamngpy.sensors import Lidar  # type: ignore
+        except Exception as e:
+            self._log(f"[GVD] Lidar class missing ({e}); lidar stays missing.")
+            return False
+        mount = self._extra_yaml().get("lidar_mount") if isinstance(self._extra_yaml().get("lidar_mount"), dict) else {}
+        pos, direction = self._mount_pos_dir(mount.get("pos_m") or [0.0, 0.0, 1.7])
+        update_s = float(mount.get("update_s") or 0.1)
+        shared = bool(mount.get("shared_memory", True))
+        is_360 = bool(mount.get("is_360", True))
+        try:
+            kwargs = self._comm_kwargs(
+                Lidar, pos=pos, direction=direction, update_s=update_s, shared=shared, is_360=is_360, vis=False
+            )
+            self._lidar = Lidar("gvd_lidar", bng, vehicle, **kwargs)
+            return True
+        except Exception as e:
+            self._log(f"[GVD] attach Lidar failed: {e}")
+            self._lidar = None
+            return False
+
+    def _attach_radar(self, vehicle: Any, bng: Any) -> bool:
+        """Optional BeamNGpy Radar. Foxglove / future fusion only — planner ignores it."""
+        if self._radar is not None:
+            return True
+        try:
+            from beamngpy.sensors import Radar  # type: ignore
+        except Exception as e:
+            self._log(f"[GVD] Radar class missing ({e}); radar stays missing.")
+            return False
+        mount = self._extra_yaml().get("radar_mount") if isinstance(self._extra_yaml().get("radar_mount"), dict) else {}
+        pos, direction = self._mount_pos_dir(mount.get("pos_m") or [0.0, 2.0, 0.5])
+        update_s = float(mount.get("update_s") or 0.1)
+        try:
+            kwargs = self._comm_kwargs(Radar, pos=pos, direction=direction, update_s=update_s, vis=False)
+            self._radar = Radar("gvd_radar", bng, vehicle, **kwargs)
+            return True
+        except Exception as e:
+            self._log(f"[GVD] attach Radar failed: {e}")
+            self._radar = None
+            return False
+
+    def _attach_advanced_imu(self, vehicle: Any, bng: Any) -> bool:
+        """Optional BeamNGpy AdvancedIMU. Default IMU is GForces / Lua; this is opt-in."""
+        if self._imu is not None:
+            return True
+        try:
+            from beamngpy.sensors import AdvancedIMU  # type: ignore
+        except Exception as e:
+            self._log(f"[GVD] AdvancedIMU class missing ({e}).")
+            return False
+        mount = self._extra_yaml().get("imu_mount") if isinstance(self._extra_yaml().get("imu_mount"), dict) else {}
+        pos, direction = self._mount_pos_dir(mount.get("pos_m") or [0.0, 0.0, 0.5])
+        vis = bool(mount.get("visualised", False))
+        try:
+            kwargs = self._comm_kwargs(AdvancedIMU, pos=pos, direction=direction, update_s=0.05, vis=vis)
+            self._imu = AdvancedIMU("gvd_imu", bng, vehicle, **kwargs)
+            return True
+        except Exception as e:
+            self._log(f"[GVD] attach AdvancedIMU failed: {e}")
+            self._imu = None
+            return False
+
+    def poll_lidar(self) -> Any:
+        inst = self._lidar
+        if inst is None:
+            return None
+        try:
+            if hasattr(inst, "poll"):
+                return inst.poll()
+            return getattr(inst, "data", None)
+        except Exception as e:
+            self._log(f"[GVD] LiDAR poll failed: {e}")
+            return None
+
+    def poll_radar(self) -> Any:
+        inst = self._radar
+        if inst is None:
+            return None
+        try:
+            if hasattr(inst, "poll"):
+                return inst.poll()
+            return getattr(inst, "data", None)
+        except Exception as e:
+            self._log(f"[GVD] Radar poll failed: {e}")
+            return None
+
+    def poll_advanced_imu(self) -> Any:
+        inst = self._imu
+        if inst is None:
+            return None
+        try:
+            if hasattr(inst, "poll"):
+                return inst.poll()
+            return getattr(inst, "data", None)
+        except Exception as e:
+            self._log(f"[GVD] AdvancedIMU poll failed: {e}")
+            return None
 
     def _nav_pin(self) -> tuple[float | None, float | None, str]:
         nav = self.config.get("nav") if isinstance(self.config.get("nav"), dict) else {}
@@ -757,16 +967,22 @@ class TechSession:
             return gvd_to_bng_vehicle(px, py, pz), gvd_to_bng_vehicle(*dir_gvd), gvd_to_bng_vehicle(*up_gvd)
         return (px, py, pz), dir_gvd, up_gvd
 
-    def close(self) -> None:
-        if self._gps is not None:
+    def _drop_handle(self, attr: str) -> None:
+        inst = getattr(self, attr, None)
+        if inst is None:
+            return
+        try:
+            inst.remove()
+        except Exception:
             try:
-                self._gps.remove()
+                inst.detach()
             except Exception:
-                try:
-                    self._gps.detach()
-                except Exception:
-                    pass
-            self._gps = None
+                pass
+        setattr(self, attr, None)
+
+    def close(self) -> None:
+        for attr in ("_gps", "_lidar", "_radar", "_imu"):
+            self._drop_handle(attr)
         self.vehicle = None
         if self.bng is not None:
             try:
@@ -808,7 +1024,11 @@ def run_probe(config: dict[str, Any] | None = None) -> int:
     # Probe should not wait a full minute on a box with no Tech.
     cfg.setdefault("wait_vehicle_s", cfg.get("wait_vehicle_s", 15))
     session = TechSession(cfg)
-    print("[GVD] tech probe: RGB + ego kinematics + GPS nav hint. No LiDAR/radar. Pin is not a route.")
+    print(
+        "[GVD] tech probe: RGB + ego kinematics + GPS nav hint. "
+        "LiDAR/radar/AdvancedIMU attach only if config/sensors.yaml enables them "
+        "(Foxglove / future fusion; planner stays vision-only). Pin is not a route."
+    )
     if not session.connect(explicit=True):
         print(f"[GVD] tech probe FAIL: {session.note}")
         session.close()

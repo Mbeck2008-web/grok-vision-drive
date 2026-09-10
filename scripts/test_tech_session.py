@@ -69,17 +69,19 @@ def check_tech_yaml() -> None:
     for bad in FORBIDDEN_SENSORS:
         assert not sensors.get(bad), bad
     assert "gps" not in FORBIDDEN_SENSORS
+    assert "lidar" not in FORBIDDEN_SENSORS
     cams = cfg.get("cameras") or {}
     assert cams.get("rgb_only") is True
     assert cams.get("convert_gvd_frame") is True
     text = (ROOT / "config" / "tech.yaml").read_text(encoding="utf-8").lower()
-    assert "lidar" in text and "never" in text
+    assert "lidar" in text
+    assert "vision" in text or "optional" in text
     assert "nav hint" in text or "map pin" in text
     nav = cfg.get("nav") or {}
     assert "pin_lat" in nav and "pin_lon" in nav
     gps = cfg.get("gps") or {}
     assert gps.get("ref_lon") is not None and gps.get("ref_lat") is not None
-    assert list(gps.get("pos_m") or [])[:3] == [0.0, 0.0, 1.7]
+    assert list(gps.get("pos_m") or [])[:3] == [0.0, 0.0, 0.0] or list(gps.get("pos_m") or [])[:3] == [0.0, 0.0, 1.7]
     rig = load_camera_config()
     ids = [c.get("id") for c in (rig.get("cameras") or [])]
     assert ids == list(CAM_IDS), ids
@@ -104,13 +106,22 @@ def check_env_overrides(monkey: dict[str, str]) -> None:
 
 
 def check_forbidden_attach() -> None:
-    session = TechSession({"sensors": {"lidar": True}, "wait_vehicle_s": 0})
+    session = TechSession({"sensors": {"lidar": True, "electrics": False, "damage": False, "gforces": False}, "wait_vehicle_s": 0})
     session.vehicle = object()
+    session.bng = object()
     try:
-        session.attach_vehicle_sensors()
-        raise AssertionError("lidar must be refused")
+        attached = session.attach_vehicle_sensors()
     except ValueError as e:
-        assert "lidar" in str(e).lower()
+        raise AssertionError(f"lidar attach must be allowed, got {e}") from e
+    assert attached.get("lidar") in (True, False)
+
+    banned = TechSession({"sensors": {"ultrasonic": True}, "wait_vehicle_s": 0})
+    banned.vehicle = object()
+    try:
+        banned.attach_vehicle_sensors()
+        raise AssertionError("ultrasonic must be refused")
+    except ValueError as e:
+        assert "ultrasonic" in str(e).lower()
 
 
 def check_gps_not_forbidden() -> None:

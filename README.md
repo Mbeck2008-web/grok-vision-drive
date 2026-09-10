@@ -6,8 +6,9 @@ Entertainment only. Never use this stack to control a physical car.
 
 ## Honesty (M0)
 
-- **Vision only** at inference (RGB cams + ego kinematics + coarse nav hint). No LiDAR / radar / ultrasonic. Tech GPS is a nav hint for a future map pin, not camera localization, and not a route — the corridor planner ignores the pin for now.
-- **Tech path** (preferred): BeamNGpy Camera sensors, 8-cam rig, BeamNGpy `vehicle.control`. **Retail path**: window-capture fallback for a **single** main view — do not pretend that is 8 cameras. Retail **drives** through the mod: Python writes `Documents/GVD/gvd_cmd.json`, GELua applies it to the player vehicle with the same vehicle-Lua `input.event` calls BeamNG's own AI uses (no DLL, no hooks), and echoes speed/inputs back via `gvd_ego.json`.
+- **Vision only** at inference: RGB cameras + ego kinematics + GPS as a **nav hint**. Optional pin (`nav.pin_lat` / `nav.pin_lon` in `config/tech.yaml`, or `GVD_NAV_PIN_LAT` / `GVD_NAV_PIN_LON`) is **not a route** — `nav.mode=hint`, `drive_to_pin=false`, and the corridor planner ignores the pin.
+- **Optional extras** (`config/sensors.yaml`): IMU + GPS on by default; LiDAR / radar / lidar_lua / Foxglove **off**. They are a **sensor bus** (Foxglove / future fusion only) — they never feed `ModularPerception` or the planner. Ultrasonic / IdealRadar stay refused. See [Extra sensors / Foxglove](#extra-sensors--foxglove).
+- **Tech path** (preferred): BeamNGpy Camera sensors, 8-cam rig, BeamNGpy `vehicle.control`. **Retail path**: window-capture fallback for a **single** main view (`cams=1/8`) — do not pretend that is 8 cameras. Retail **drives** through the mod: Python writes `Documents/GVD/gvd_cmd.json`, GELua applies it with the same vehicle-Lua `input.event` calls BeamNG's own AI uses (no DLL, no hooks), and echoes speed/inputs back via `gvd_ego.json`.
 - Default GPU profile: **NVIDIA GTX 1080 Ti (11 GB)**. Live stack must share the card with BeamNG.
 - Not Tesla FSD. No Tesla logos. Repository title stays free of “FSD”. “Vision Drive” / “camera autopilot toy” are fine.
 - Strategy analogies in docs mean: Tesla idea → **our toy version does X**.
@@ -65,17 +66,25 @@ There is still no retail mod that creates those eight cameras. Once `tech.key` i
 2. `pip install -r requirements-beamng.txt` (BeamNGpy version must match Tech: **0.38 → 1.35.x**, **0.39 → 1.36**).
 3. Set `BNG_HOME` to the Tech install folder. Edit `config\tech.yaml` for host/port/`wait_vehicle_s` if needed.
 4. Start BeamNG.tech, spawn a vehicle (ETK800 is the camera-draft car), enable GVD in Mod Manager.
-5. Double-click `play_gvd_tech.bat` (or `python python/run_vision.py --backend beamngpy --viz`). That sets `GVD_BEAMNG=1`, attaches the 8 RGB cameras from `cameras.yaml` (GVD frame converted to BeamNG vehicle space), **Electrics / Damage / GForces** plus pose, and a **GPS nav hint** (lat/lon). Optional destination: set `nav.pin_lat` / `nav.pin_lon` in `config/tech.yaml` (or `GVD_NAV_PIN_LAT` / `GVD_NAV_PIN_LON`) for range and bearing. **No LiDAR, radar, or ultrasonic.** GPS is not localization and **not a route** (the corridor planner ignores the pin for now).
+5. Double-click `play_gvd_tech.bat` (or `python python/run_vision.py --backend beamngpy --viz`). That sets `GVD_BEAMNG=1`, attaches the 8 RGB cameras from `cameras.yaml` (GVD frame converted to BeamNG vehicle space), **Electrics / Damage / GForces** plus pose, and a **GPS nav hint** (lat/lon). Optional destination: set `nav.pin_lat` / `nav.pin_lon` in `config/tech.yaml` (or `GVD_NAV_PIN_LAT` / `GVD_NAV_PIN_LON`) for range and bearing. Pin is **not a route** — the corridor planner ignores the pin. Optional LiDAR / radar / AdvancedIMU: opt-in in `config/sensors.yaml` (see [Extra sensors / Foxglove](#extra-sensors--foxglove)).
 6. Probe without driving: `python python/run_vision.py --tech-probe`.
 7. Engage is still Alt+G. Drive is BeamNGpy `vehicle.control` on the player vehicle (`actuator=beamngpy`). Ego speed/steer/pedals come from Electrics; the world ribbon uses pose × `path_ego`.
 
 Live Tech attach is **UNPROVEN** until a Windows smoke. `--backend auto` does **not** pick Tech just because beamngpy is installed — only `GVD_BEAMNG=1` or `--backend beamngpy`.
 
+## Extra sensors / Foxglove
+
+Optional bus in `config/sensors.yaml`. Defaults: IMU + GPS **on**; `lidar` / `radar` / `lidar_lua` / `foxglove.enabled` **off**. Env: `GVD_LIDAR=1`, `GVD_RADAR=1`, `GVD_LIDAR_LUA=1`, `GVD_FOXGLOVE=1`. Extras are Foxglove / future fusion only — they never feed `ModularPerception` or the planner. Ultrasonic / IdealRadar stay refused.
+
+- **Retail** (no BeamNGpy): IMU + world pose from Lua `gvd_ego.json`. GPS derived from world xy × `gps.ref_*` (same sphere as Tech). Optional coarse Lua ray sweep `Documents/GVD/gvd_scan.json` if `lidar_lua`. Radar has no retail source.
+- **Tech**: optional BeamNGpy Lidar / Radar attach. GPS already exists. AdvancedIMU only if `advanced_imu: true` (default IMU is GForces / Lua).
+- **Foxglove**: `pip install -r requirements-foxglove.txt`, then `foxglove.enabled: true` / `GVD_FOXGLOVE=1` / `--foxglove`. Connect the Foxglove app to `ws://127.0.0.1:8765`. Missing SDK → skip. Snapshot always at `Documents/GVD/gvd_sensors.json`. **Not in the retail zip.**
+
 ## Release zip (M6)
 
 Windows: double-click `scripts\make_release_zip.bat`. Anywhere: `python scripts/make_release_zip.py`. Output: `dist\gvd-retail-<version>.zip` (gitignored), `<version>` = exact git tag if any, else `m6-<sha>[-dirty]`; override with `--version v0.6.0`, `--out path`, `--flat` (no top-level folder), `--list` (manifest only).
 
-Packs: `install.bat`, `uninstall.bat`, `play_gvd.bat`, `beamng_mod/`, `python/` (retail runtime), `config/`, `requirements.txt` + `requirements-retail.txt`, `LICENSE`, `README.md`, `docs/*.md`, `models/.gitkeep`, plus a generated `VERSION.txt` (version, build time, git sha, the retail honesty lines). Excludes `data/clips/`, weights (`*.onnx *.pt *.pth *.bin *.safetensors`), `.git`, `scripts/` (tests + this tool), `__pycache__`, `dist/`. `*.bat` are written CRLF. After writing, the script re-opens the zip, refuses forbidden members and missing must-haves (mod entry point, `run_vision.py`, launchers), and exits non-zero on any problem. Attach the zip to a GitHub Release. Offline check: `PYTHONPATH=. python scripts/test_m6_retail.py`.
+Packs: `install.bat`, `uninstall.bat`, `play_gvd.bat`, `beamng_mod/`, `python/` (retail runtime), `config/` (including `sensors.yaml`), `requirements.txt` + `requirements-retail.txt`, `LICENSE`, `README.md`, `docs/*.md`, `models/.gitkeep`, plus a generated `VERSION.txt` (version, build time, git sha, the retail honesty lines). Excludes `data/clips/`, weights (`*.onnx *.pt *.pth *.bin *.safetensors`), `.git`, `scripts/` (tests + this tool), `__pycache__`, `dist/`, and `requirements-foxglove.txt`. `*.bat` are written CRLF. After writing, the script re-opens the zip, refuses forbidden members and missing must-haves (mod entry point, `run_vision.py`, launchers), and exits non-zero on any problem. Attach the zip to a GitHub Release. Offline check: `PYTHONPATH=. python scripts/test_m6_retail.py`.
 
 ## Layout
 
@@ -84,7 +93,9 @@ install.bat / uninstall.bat / play_gvd.bat / play_gvd_tech.bat
 beamng_mod/          → copied to %LOCALAPPDATA%\BeamNG.drive\<ver>\mods\unpacked\gvd
 python/              → also copied to %USERPROFILE%\Documents\GVD\python
 config/              → also copied to %USERPROFILE%\Documents\GVD\config
+config/sensors.yaml  → optional IMU / GPS / LiDAR / radar / Foxglove bus (planner ignores extras)
 requirements-retail.txt   → 1-cam window runtime (numpy, OpenCV, PyYAML, mss; no beamngpy)
+requirements-foxglove.txt  → optional Foxglove SDK (not in the retail zip)
 scripts/make_release_zip.py / .bat → dist/gvd-retail-<version>.zip (not shipped)
 ```
 
@@ -115,17 +126,28 @@ Titles stay **GVD** / **VISION**; Alt+G works with or without the app open. Offl
 
 ## Two views
 
-**In-game (BeamNG world):** ice-blue ribbon drawn on the pavement via GELua `debugDrawer` (`drawSquarePrism`, 3-line fallback) — **1:1** with `path_ego` / `path_world` (x right, y forward, z up). Track ghosts sit on the road at the same transform; CIPV is brighter. Engage with Alt+G. GELua resolves `Documents/GVD` via USERPROFILE/LOCALAPPDATA/`FS:getUserPath` (USERPROFILE is often empty in-process). This is **not** a 2D camera overlay.
+Visualization **toy** (not a scientific claim that forecasts match Waymo). On-screen title: **GVD** / **VISION**. No Tesla logos, no “Full Self-Driving”, no “FSD” product label.
 
-**Second screen (`GVD VISION`):** OpenCV cabin on monitor 2 when available (`--viz-screen auto|1|2`, `--viz-fullscreen`, or `GVD_VIZ_MONITOR=2`). This is the VISION lexicon: near-black void stage, thin vector lane paint (`lanes_ext`: solid detected / dim-dashed predicted; smoke stubs only), warm-grey kerbs (`road_edges`), ice-blue ego corridor (intent shade, chevrons while slowing, stop bar when halted behind a CIPV), agent boxes (ice-blue in-path, CIPV **LEAD**, red **BRAKE**), forecast fans, and stop-sign / traffic-light / pole glyphs when `signs[]` is present. Optional `cam_main` PIP. Loop under 8 Hz drops fans, signs and PIP first. One monitor → window stays put; drag it, or use motherboard HDMI for UHD 630 as display 2. Live dual-monitor + Alt+G still **UNPROVEN** on Linux / until Windows gate.
+**In-game (BeamNG world):** ice-blue ribbon drawn on the pavement via GELua `debugDrawer` (`drawSquarePrism`, 3-line fallback) — **1:1** with `path_ego` / `path_world` (x right, y forward, z up). Track ghosts sit on the road at the same transform; CIPV is brighter. Engage with Alt+G. GELua resolves `Documents/GVD` via USERPROFILE/LOCALAPPDATA/`FS:getUserPath` (USERPROFILE is often empty in-process). This is **not** a 2D camera overlay. In-game strip app: **GVD Strip** (mode · Hz · TTC · N).
+
+**Second screen (`GVD VISION`):** OpenCV cabin on monitor 2 when available (`--viz-screen auto|1|2`, `--viz-fullscreen`, or `GVD_VIZ_MONITOR=2`). This is the VISION lexicon: near-black void stage, thin vector lane paint (`lanes_ext`: solid detected / dim-dashed predicted; smoke stubs only), warm-grey kerbs (`road_edges`), ice-blue ego corridor (intent shade, chevrons while slowing, stop bar when halted behind a CIPV), agent boxes (ice-blue in-path, CIPV **LEAD**, red **BRAKE**), forecast fans, and stop-sign / traffic-light / pole glyphs when `signs[]` is present. Optional `cam_main` PIP. Loop under 8 Hz drops fans, signs and PIP first. Caps: 32 agents / 16 forecast fans / 3 modes. One monitor → window stays put; drag it, or use motherboard HDMI for UHD 630 as display 2. Live dual-monitor + Alt+G still **UNPROVEN** on Linux / until Windows gate.
+
+```bash
+pip install -r requirements-viz.txt
+PYTHONPATH=. python python/run_vision.py --smoke   # writes docs/gvd_viz_smoke.png
+PYTHONPATH=. python python/run_vision.py --viz      # live window + state file for BeamNG
+PYTHONPATH=. python scripts/test_gvd_viz_stage.py
+```
+
+Keys in `--viz`: `V` nerd, `?` help, `0` clean cabin, `1–5` debug layers, `T` chase↔BEV, `C` clip, `q` quit.
 
 ## Status
 
-**Force-feedback player override (this PR):** wheel chatter no longer disengages GVD. The signal is `|steering_input − aligned cmd.steer|` (never an absolute angle), then spike reject → EMA (`lpf_tau_ms` 80) → soft opposition bias → hysteresis (`steer_enter` 0.08 / `steer_exit` 0.04) → dwell (`steer_hold_ms` 200). Pedals are asymmetric and tight (`brake_enter` 0.06 / `throttle_enter` 0.10), no filter. Reasons: `player_steer` / `player_brake` / `player_throttle`. Thresholds live in `config/control.yaml` and are mirrored to the mod through `gvd_state.json`. `CMD_DEAD_S` is unchanged. Live FFB is **UNPROVEN**. Details under [Actuation](#actuation-m3).
+**Force-feedback player override:** wheel chatter no longer disengages GVD. Signal is `|steering_input − aligned cmd.steer|` (never an absolute angle), then spike reject → EMA → hysteresis → dwell. Pedals are asymmetric and tight. Live FFB is **UNPROVEN**. Details under [Actuation](#actuation-m3).
 
-**M6 (retail package):** player-ready **retail** slice. `scripts/make_release_zip.py` (+ `.bat`) builds `dist/gvd-retail-<version>.zip` — launchers, `beamng_mod/`, `python/`, `config/`, requirements, LICENSE, README, `VERSION.txt`; never clips, weights, `.git`, tests. `play_gvd.bat` runs the supervisor on the **`window` backend** (1 capture, `cams=1/8 path=retail` in the hw_probe boot line), checks the runtime and offers `pip install -r requirements-retail.txt`, keeps its console open on errors. Retail **drives** over the M3 file bus: `gvd_cmd.json` (`steer/throttle/brake/seq/engaged`) → `gvd_main.applyCmdJson` → vehicle-Lua `input.event` (the stock AI / BeamNGpy calls, arcade shifter once); vehicle electrics echo back through `gvd_ego.json` (wheelspeed, inputs, applied seq) so the planner has real ego speed, TTC works, player override works and `cmd_applied` is claimed only on a fresh Lua ack. Lua dead-man: `CMD_STALE_S` 0.35 s without a new seq → brake hold, `CMD_DEAD_S` 1.0 s → release + auto-disengage; every disengage releases the inputs. Driver override is now sticky (writes `engaged=false`). JSON writers retry on Windows sharing violations. 8 cams + BeamNGpy direct control stay Tech (preferred). Mod adopts `engaged=false` from `gvd_engage.json` when the supervisor vetoes/exits so the HUD never stays ON without a heartbeat. Player guide above. Live Alt+G / drive still **UNPROVEN** here. No Tesla / FSD chrome; no real-car.
+**M6 (retail package):** player-ready **retail** slice. `scripts/make_release_zip.py` (+ `.bat`) builds `dist/gvd-retail-<version>.zip`. `play_gvd.bat` runs the **`window` backend** (`cams=1/8 path=retail`), offers `pip install -r requirements-retail.txt`, keeps the console open on errors. Drive bus: `gvd_cmd.json` → Lua `input.event`; echo `gvd_ego.json`. 8 cams + BeamNGpy stay Tech. Live Alt+G / drive still **UNPROVEN**. Player guide above.
 
-**M5 (shadow + tiny E2E):** Perception always runs; actuators only when engaged. `--policy modular|e2e|shadow` (default **modular** = safety supervisor, vetoes E2E). `policy_e2e` = PilotNet-scale tiny CNN/MLP stub: 2×320×180 (main+wide) + speed/steer → `{steer, accel}`; loads `models/e2e_current.onnx` if present else numpy stub. Shadow fields `shadow.{steer,throttle,brake}` written every tick; modular veto on low `lane_conf` / heartbeat / disagreement → hold/disengage (+ clip if recorder). Toy VRAM ~0.15–0.4 GB. No transformers/ViT/BEV/AutoSteer-HD; no Tesla/FSD chrome; no real-car.
+**M5 (shadow + tiny E2E):** Perception always runs; actuators only when engaged. `--policy modular|e2e|shadow` (default **modular**). `policy_e2e` = PilotNet-scale stub. Shadow fields every tick; modular veto on low `lane_conf` / heartbeat / disagreement. Toy VRAM ~0.15–0.4 GB. No transformers/ViT/BEV.
 
 **M4 (clips):** ring-buffer + QSV/libx264 flush on disengage / AEB / near-miss / key C.
 
@@ -136,28 +158,6 @@ Titles stay **GVD** / **VISION**; Alt+G works with or without the app open. Offl
 **M1 (cameras + hw probe):** `beamngpy | window | stub`, 8-cam yaml, hw_probe. Live still **UNPROVEN on Linux**.
 
 Host profile (target): Intel **i9-9900K** + **UHD 630** (QSV encode) + **GTX 1080 Ti 11 GB** (infer ≤4 GB) + **32 GB DDR4**. See `config/hardware.yaml`.
-
-
-
-## GVD Viz
-
-Visualization **toy** (not a scientific claim that forecasts match Waymo). On-screen title: **GVD** / **VISION**. No Tesla logos, no “Full Self-Driving”, no “FSD” product label.
-
-### In-game (required)
-Ice-blue ego ribbon on the asphalt via GELua `debugDrawer` (`drawSquarePrism` → `drawLine` fallback), data from `Documents/GVD/gvd_state.json`. Engage with Alt+G. See `docs/gvd_state_schema.md`.
-
-### Python window (extra)
-OpenCV **GVD VISION** second screen owns the cabin lexicon (void stage, multi-lane fan, ice corridor, CIPV boxes, warm curbs, sign/light glyphs) plus nerd panel + forecast fans:
-
-```bash
-pip install -r requirements-viz.txt
-PYTHONPATH=. python python/run_vision.py --smoke   # writes docs/gvd_viz_smoke.png
-PYTHONPATH=. python python/run_vision.py --viz      # live window + state file for BeamNG
-PYTHONPATH=. python scripts/test_gvd_viz_stage.py
-```
-
-Keys in `--viz`: `V` nerd, `?` help, `0` clean cabin, `1–5` debug layers, `T` chase↔BEV, `q` quit. Caps: 32 agents / 16 forecast fans / 3 modes. If policy &lt; 8 Hz, drop fans, signs and PIP first. In-game strip app: **GVD Strip** (mode · Hz · TTC · N).
-
 
 ## Cameras (M1)
 
@@ -174,16 +174,15 @@ Default `--backend auto`: beamngpy if importable → else window → else stub. 
 
 Window capture prefers a visible window whose title contains **BeamNG** (Win32 / wmctrl). If none is found, it falls back to the primary monitor — use **fullscreen BeamNG** in that case (`capture_note` says so).
 
-Tech path: `GVD_BEAMNG=1` (or `--backend beamngpy` / `play_gvd_tech.bat`) attaches color-only BeamNGpy `Camera` sensors from `config/cameras.yaml` to the player vehicle, converting GVD frame (+X right, +Y forward) into BeamNG Camera vehicle space. Depth/semantic stay OFF. The same session attaches Electrics, Damage, GForces, and GPS (`config/tech.yaml`) — GPS is a nav hint (lat/lon + optional pin), not LiDAR/radar and not a route. Live smoke still **UNPROVEN on Linux**.
+Tech path: `GVD_BEAMNG=1` (or `--backend beamngpy` / `play_gvd_tech.bat`) attaches color-only BeamNGpy `Camera` sensors from `config/cameras.yaml` to the player vehicle, converting GVD frame (+X right, +Y forward) into BeamNG Camera vehicle space. Depth/semantic stay OFF. The same session attaches Electrics, Damage, GForces, and GPS (`config/tech.yaml`) — GPS is a nav hint (lat/lon + optional pin), **not a route**. Optional LiDAR / radar: `config/sensors.yaml` (off by default; Foxglove / future fusion only). Live smoke still **UNPROVEN on Linux**.
 
-Live start **refuses** (exit 1) if probed dGPU VRAM &lt; 10 GB while BeamNG is running, unless `--vision-only`.
+Live start **refuses** (exit 1) if probed dGPU VRAM is under 10 GB while BeamNG is running, unless `--vision-only`.
 
 BIOS (Windows): enable **iGPU Multi-Monitor** so UHD 630 QSV exists while 1080 Ti drives the display (M4 encode). Do not set DVMT to 2 GB.
 
-
 ## Perception (M2)
 
-Vision-only: no LiDAR/radar/ultrasonic/HD-map in the live loop. Tech GPS is a coarse nav hint (not localization; the corridor planner ignores the pin for now). Inspired by VisionPilot / Apollo camera-pipeline *names* — reimplemented tiny in-repo (not a vendor fork). Forecasts stay CV/CYR toys.
+Vision-only **inference**: RGB + ego kinematics + GPS as a nav hint. Optional extras are Foxglove / future fusion only — they never feed `ModularPerception` or the planner. The corridor planner ignores the pin. Inspired by VisionPilot / Apollo camera-pipeline *names* — reimplemented tiny in-repo (not a vendor fork). Forecasts stay CV/CYR toys.
 
 ```bash
 pip install -r requirements.txt
@@ -192,7 +191,6 @@ python scripts/download_yolov8n.py --onnx
 # or: yolo export model=yolov8n.pt format=onnx imgsz=640 simplify=True && mv yolov8n.onnx models/
 PYTHONPATH=. python python/run_vision.py --smoke
 ```
-
 
 ## Actuation (M3)
 
@@ -203,12 +201,11 @@ PYTHONPATH=. python python/run_vision.py --backend beamngpy --viz   # Tech path
 # --allow-preview-drive   # opt-in only; default blocks preview paths
 ```
 
-Safety: Alt+G engage; heartbeat dead-man; AEB `brake=1`/`throttle=0`; driver override (below) disengages and stays off until Alt+G; kill Python → `finally` stop + `engaged=false`, Lua releases the car and fades the ribbon; Lua-side dead-man holds the brake after `CMD_STALE_S` (0.35 s) without a new `seq` and releases + disengages after `CMD_DEAD_S` (1.0 s). `--force-engage` is **debug-only** (never default). Live drive on Windows = Michael smoke / still UNPROVEN here.
+Safety: Alt+G engage; heartbeat dead-man; AEB `brake=1`/`throttle=0`; driver override (below) disengages and stays off until Alt+G; kill Python → `finally` stop + `engaged=false`, Lua releases the car and fades the ribbon; Lua-side dead-man holds the brake after `CMD_STALE_S` (0.35 s) without a new `seq` and releases + disengages after `CMD_DEAD_S` (1.0 s). `--force-engage` is **debug-only** (never default). Live drive on Windows = Michael smoke / still UNPROVEN here. Live Tech / FFB / Alt+G still **UNPROVEN**.
 
 **Player override (force-feedback residual).** `python/control/override.py` and `gvd_main` run the same maths on both sides of the bus. The signal is `|steering_input − cmd.steer|` against the command that was in force when the echo was sampled (`applied_seq` / last applied), never an absolute angle — so GVD's own steer coming back is residual 0. Then: spike reject (`steer_spike` 0.20, a sample-to-sample jump is mechanical, the EMA holds) → EMA on the residual only (`lpf_tau_ms` 80) → soft opposition bias (a residual fighting GVD's steer counts a little more) → hysteresis (`steer_enter` 0.08 / `steer_exit` 0.04) → dwell (`steer_hold_ms` 200). Pedals are asymmetric and tight: no filter, no dwell, one-sided (only a press beyond what GVD asked for), `brake_enter` 0.06 / `throttle_enter` 0.10. Reasons: `player_steer` / `player_brake` / `player_throttle`. Thresholds: `config/control.yaml` `override:`, mirrored into `gvd_state.json` as `override_cfg`. This does **not** change `CMD_DEAD_S`. Live FFB is **UNPROVEN**. Offline check: `PYTHONPATH=. python scripts/test_ffb_override.py`.
 
 `cmd_json` (retail, `window` backend — no BeamNGpy vehicle) writes `gvd_cmd.json` = `{steer, throttle, brake, seq, engaged, heartbeat_mtime, reason}` every tick. `gvd_main.applyCmdJson` applies it only while the mod is engaged **and** the payload says `engaged` **and** `seq` keeps advancing; it echoes `applied_seq` plus electrics in `gvd_ego.json`. `cmd_applied=true` / `cmd_reason=cmd_json_applied` only on a fresh ack; `cmd_json_pending` = written but not acked (mod off, no vehicle); `cmd_json_idle` = not engaged, Lua hands off. Gate reasons (`not_engaged`, `preview_blocked`, `veto:*`, `player_steer`, `player_brake`, `player_throttle`) pass through unchanged. Engaged gate holds (e.g. `preview_blocked`) ride along as `brake=1` and are applied.
-
 
 ## Clips (M4)
 
@@ -219,7 +216,6 @@ PYTHONPATH=. python python/run_vision.py --viz            # key C = manual clip
 ```
 
 Clips land in `Documents/GVD/clips/` (repo `data/clips/` gitignored). Encode: `ffmpeg` `h264_qsv` if `hw_probe` qsv=yes, else `libx264` veryfast CRF~23. `--encode nvenc` only when you explicitly want Pascal encode (not default).
-
 
 ## Shadow / E2E (M5)
 
@@ -232,4 +228,3 @@ PYTHONPATH=. python -m python.train.train_e2e --smoke
 ```
 
 Modular veto thresholds: `config/control.yaml`. E2E input 320×180: `config/perception.yaml` / `control.yaml`. Weights stay out of git.
-

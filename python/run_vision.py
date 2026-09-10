@@ -23,7 +23,6 @@ from python.control.actuate import (
 )
 from python.control.e2e import make_e2e
 from python.control.override import (
-    OVERRIDE_REASON,
     OverrideDetector,
     config_mirror,
     load_override_config,
@@ -344,10 +343,11 @@ def main() -> None:
     print("[GVD] M3: no drive on preview unless --allow-preview-drive; engage via Alt+A (gvd_engage.json).")
     print("[GVD] M4: clips on disengage / AEB / near-miss / key C. Live QSV UNPROVEN until Windows smoke.")
     print(
-        f"[GVD] driver override: steer deadband {override_cfg.steer_deadband:.2f} / trip "
-        f"{override_cfg.steer_enter:.2f} held {override_cfg.steer_hold_s:.2f}s (force-feedback "
-        f"chatter must not disengage); pedals hard at brake {override_cfg.brake_enter:.2f} / "
-        f"throttle {override_cfg.throttle_enter:.2f}."
+        f"[GVD] player override on the steer residual: enter {override_cfg.steer_enter:.3f} / "
+        f"exit {override_cfg.steer_exit:.3f} held {override_cfg.steer_hold_ms:.0f}ms, spike "
+        f"{override_cfg.steer_spike:.2f}, lpf {override_cfg.lpf_tau_ms:.0f}ms (force-feedback "
+        f"noise must not disengage; live FFB UNPROVEN). Pedals tight: brake "
+        f"{override_cfg.brake_enter:.2f} / throttle {override_cfg.throttle_enter:.2f}."
     )
     if args.allow_preview_drive:
         print("[GVD] WARNING: --allow-preview-drive is ON")
@@ -464,24 +464,25 @@ def main() -> None:
                 disengage_reason = "heartbeat_stale"
                 engaged = False
 
-            # Driver override. Steer runs through the FFB deadband + hysteresis + dwell so wheel
-            # chatter cannot disengage; the pedals stay hard. Sticky either way — otherwise Lua
-            # and the player fight at loop rate — so the engage flag stays false until Alt+A.
-            # Judged against the commands we actually applied, which are noted below.
+            # Player override. Steer is the filtered residual against the command the mod says
+            # it applied, so force-feedback noise cannot disengage; the pedals stay tight.
+            # Sticky either way — otherwise Lua and the player fight at loop rate — so the
+            # engage flag stays false until Alt+A. Commands are noted below, after the actuator.
             ovr = override.update(
                 engaged=engaged,
                 steering_input=steer_in,
                 throttle_input=throttle_in,
                 brake_input=brake_in,
+                applied_seq=ego_fb.applied_seq if ego_fb is not None and ego_fb.fresh else None,
             )
             if ovr.active:
                 engaged = False
-                disengage_reason = OVERRIDE_REASON
-                write_engage_flag(False, disengage_reason=OVERRIDE_REASON)
-                print(f"[GVD] DISENGAGED: driver override on {ovr.channel}")
+                disengage_reason = ovr.reason
+                write_engage_flag(False, disengage_reason=ovr.reason)
+                print(f"[GVD] DISENGAGED: {ovr.reason}")
                 # Gate reason rides along on the bus so the mod / nerd panel name it, not just
                 # the generic not_engaged the following ticks write.
-                cmd = stop_command(seq=cmd_seq, reason=OVERRIDE_REASON)
+                cmd = stop_command(seq=cmd_seq, reason=ovr.reason)
 
             # Actuators only when engaged + command ok (shadow fields already on tick).
             # cmd_json: Lua applies whatever we write only while `engaged` rides along in the payload.
@@ -493,9 +494,12 @@ def main() -> None:
                 applied = actuator.apply(cmd)
             else:
                 applied = actuator.stop(seq=cmd_seq, reason=cmd.reason)
-            # Baseline for the next tick's override residual: the gate holds ride along as
-            # brake=1, and the car echoes those back just like a real command.
-            override.note_command(steer=applied.steer, throttle=applied.throttle, brake=applied.brake)
+            # Reference for the override residual, keyed by seq so the mod's ack can find the
+            # command its echo belongs to. Gate holds ride along as brake=1 and the car echoes
+            # those back just like a real command, so they have to be in here too.
+            override.note_command(
+                seq=applied.seq, steer=applied.steer, throttle=applied.throttle, brake=applied.brake
+            )
 
             st = default_state(
                 engaged=engaged,
@@ -558,12 +562,15 @@ def main() -> None:
             st["override_cfg"] = config_mirror(override_cfg)
             st["override"] = {
                 "channel": ovr.channel,
-                "steer_residual": ovr.steer_residual,
+                "reason": ovr.reason,
                 "steer_raw": ovr.steer_raw,
+                "steer_filt": ovr.steer_filt,
+                "steer_eff": ovr.steer_eff,
                 "pedal_residual": ovr.pedal_residual,
-                "steer_held_s": ovr.steer_held_s,
-                "deadband_swallowed": bool(ovr.deadband_swallowed),
-                "steer_judged": bool(ovr.steer_judged),
+                "steer_held_ms": ovr.steer_held_ms,
+                "spike": bool(ovr.spike),
+                "opposition": ovr.opposition,
+                "ref_seq": ovr.ref_seq,
                 "armed": bool(ovr.armed),
             }
             st["shadow"] = {

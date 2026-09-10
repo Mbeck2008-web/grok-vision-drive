@@ -934,80 +934,74 @@ local VE_FEEDBACK = "local ev=(electrics and electrics.values) or {};"
   .. "obj:queueGameEngineLua(string.format('extensions.gvd_main.onEgoFeedback(%.3f,%.4f,%.4f,%.4f)',"
   .. "n(ev.wheelspeed or ev.airspeed),n(ev.steering_input),n(ev.throttle_input),n(ev.brake_input)))"
 
--- ───────────── driver override: force-feedback deadband on steer, hard pedals ─────────────
+-- ───────────── player override: steer residual, force-feedback tolerant ─────────────
 -- Force-feedback / racing wheels move electrics.steering_input around whatever GVD commands
--- (self-aligning torque, spring centering, kicks over bumps), so a bare threshold on the echo
--- read that chatter as a driver and accidentally disengaged GVD. Steer now goes through
---   residual (echo - envelope of what we commanded) → deadband → hysteresis → dwell
--- so the trip point sits at steer_enter + steer_deadband of lock and the residual has to hold
--- one direction for steer_hold_s to count. Pedals stay hard: a press past its threshold is an
--- override on the tick it lands.
+-- (self-aligning torque, spring centering, kicks over bumps), so judging an override on the
+-- absolute angle read that chatter as a driver and accidentally disengaged GVD. The signal is
+-- the residual (echo - the cmd.steer that was in force when the echo was sampled), conditioned:
+--   residual → spike reject → EMA (lpf_tau_ms) → soft opposition bias → hysteresis → dwell
+-- A sample that jumps more than steer_spike is mechanical, not muscular, so the filter holds
+-- instead of following it. Pedals are asymmetric and tight: no filter, no dwell, one-sided, and
+-- brake trips lower than throttle. None of this touches the CMD_DEAD_S dead-man.
 -- Same maths as python/control/override.py; these defaults must match config/control.yaml,
--- which the supervisor mirrors into gvd_state.json.override_cfg.
+-- which the supervisor mirrors into gvd_state.json.override_cfg. Live FFB UNPROVEN.
 local OVR = {
-  steer_deadband = 0.10,
-  steer_enter = 0.55,
-  steer_clear = 0.30,
-  steer_hold_s = 0.12,
-  steer_cmd_max = 0.85,
-  steer_sign_flip_resets = true,
-  brake_enter = 0.08,
-  throttle_enter = 0.15,
-  pedal_hold_s = 0.0,
-  cmd_window_s = 0.30,
-  ffb_assume_wheel = true,
+  steer_enter = 0.08,
+  steer_exit = 0.04,
+  steer_hold_ms = 200,
+  steer_spike = 0.20,
+  brake_enter = 0.06,
+  throttle_enter = 0.10,
+  lpf_tau_ms = 80,
 }
-local OVR_RING = 64
+-- Soft opposition bias: a residual fighting GVD's steer counts up to 25 % more, ramped in by how
+-- hard GVD is actually steering. Not a threshold of its own, so not a mirrored config key.
+local OVR_OPPOSITION_GAIN = 0.25
+local OVR_OPPOSITION_FULL = 0.25
+local OVR_WARMUP_TAUS = 3    -- the EMA has to settle before anyone believes it
 local OVR_ECHO_MAX_S = 0.5   -- a frozen electrics echo is the dead-man's problem, not an override
-local ovrCmds = {}           -- {t, s, th, b} we actually pushed to the car
+
 local ovrClock = 0           -- monotonic seconds, accumulated from the applyCmdJson step
-local ovrEchoStamp = nil     -- ovrClock when the last electrics echo landed
+local ovrCmdLast = nil       -- {s, th, b} we pushed to the car most recently
+local ovrCmdPrev = nil       -- the one before it
+local ovrRef = nil           -- command in force when the last electrics echo was sampled
+local ovrEchoStamp = nil     -- ovrClock when that echo landed
 local ovrArmedAt = nil       -- ovrClock of the first command since we took the car
-local ovrSteerHeld = 0
-local ovrSteerSign = 0
-local ovrPedalHeld = 0
+local ovrFilt = 0            -- EMA of the steer residual
+local ovrLastRaw = 0        -- previous raw residual, for the spike test (0 = rest)
+local ovrHeldMs = 0
+local ovrSign = 0
 local ovrCfgLogged = false
 
 local function ovrReset()
-  ovrCmds = {}
+  ovrCmdLast = nil
+  ovrCmdPrev = nil
+  ovrRef = nil
+  ovrEchoStamp = nil
   ovrArmedAt = nil
-  ovrSteerHeld = 0
-  ovrSteerSign = 0
-  ovrPedalHeld = 0
+  ovrFilt = 0
+  ovrLastRaw = 0
+  ovrHeldMs = 0
+  ovrSign = 0
 end
 
 local function ovrNoteCommand(steer, throttle, brake)
   if ovrArmedAt == nil then ovrArmedAt = ovrClock end
-  ovrCmds[#ovrCmds + 1] = { t = ovrClock, s = steer, th = throttle, b = brake }
-  -- Keep one sample past the window: an empty envelope would read every echo as a driver.
-  while #ovrCmds > 1 and (ovrClock - ovrCmds[1].t) > OVR.cmd_window_s do table.remove(ovrCmds, 1) end
-  while #ovrCmds > OVR_RING do table.remove(ovrCmds, 1) end
+  ovrCmdPrev = ovrCmdLast
+  ovrCmdLast = { s = steer, th = throttle, b = brake }
 end
 
-local function ovrEnvelope(key)
-  local lo, hi
-  for _, c in ipairs(ovrCmds) do
-    local v = c[key]
-    if lo == nil or v < lo then lo = v end
-    if hi == nil or v > hi then hi = v end
-  end
-  return lo or 0, hi or 0
+-- Time-correct first-order weight, so the filter does not depend on the apply rate.
+local function ovrAlpha(dt, tauS)
+  if tauS <= 0 or dt <= 0 then return 1 end
+  return 1 - math.exp(-dt / tauS)
 end
 
--- Signed distance outside the command envelope: 0 while the echo is still explainable as ours.
-local function ovrResidual(v, lo, hi)
-  if v > hi then return v - hi end
-  if v < lo then return v - lo end
-  return 0
-end
-
--- Subtractive deadband, the way a wheel axis dead zone works: inside the band there is no
--- driver, outside it the band comes off the residual, so steer_enter is a threshold on the
--- compensated signal and the trip point sits that much further out.
-local function ovrDeadband(v, width)
-  local mag = math.abs(v) - width
-  if mag <= 0 then return 0 end
-  return (v > 0) and mag or -mag
+-- 0..1: how much the residual fights a steer command. Zero when they agree, and zero when GVD
+-- is steering straight — a residual cannot oppose a command that is not there.
+local function ovrOpposition(refSteer, residual)
+  if refSteer * residual >= 0 then return 0 end
+  return math.min(1, math.abs(refSteer) / OVR_OPPOSITION_FULL)
 end
 
 local function readOverrideCfg(st)
@@ -1018,32 +1012,28 @@ local function readOverrideCfg(st)
     if v == nil or v ~= v then return end
     OVR[k] = clamp(v, lo, hi)
   end
-  num('steer_deadband', 0, 0.5)
-  num('steer_enter', 0.02, 1)
-  num('steer_clear', 0, 1)
-  num('steer_hold_s', 0, 2)
-  num('steer_cmd_max', 0, 1)
-  num('brake_enter', 0.01, 1)
-  num('throttle_enter', 0.01, 1)
-  num('pedal_hold_s', 0, 2)
-  num('cmd_window_s', 0, 2)
-  if c.steer_sign_flip_resets ~= nil then OVR.steer_sign_flip_resets = not not c.steer_sign_flip_resets end
-  if c.ffb_assume_wheel ~= nil then OVR.ffb_assume_wheel = not not c.ffb_assume_wheel end
-  -- Whatever the yaml says, the dwell has to be able to discharge.
-  if OVR.steer_clear >= OVR.steer_enter then OVR.steer_clear = OVR.steer_enter * 0.95 end
+  num('steer_enter', 0.005, 1)
+  num('steer_exit', 0, 1)
+  num('steer_hold_ms', 0, 2000)
+  num('steer_spike', 0.01, 2)
+  num('brake_enter', 0.005, 1)
+  num('throttle_enter', 0.005, 1)
+  num('lpf_tau_ms', 0, 1000)
+  -- Exit at or above enter would leave the dwell unable to discharge.
+  if OVR.steer_exit >= OVR.steer_enter then OVR.steer_exit = OVR.steer_enter * 0.95 end
   if not ovrCfgLogged then
     ovrCfgLogged = true
     log('I', 'GVD', string.format(
-      '[GVD] override thresholds from gvd_state: steer deadband %.2f trip %.2f hold %.2fs, brake %.2f, throttle %.2f',
-      OVR.steer_deadband, OVR.steer_enter, OVR.steer_hold_s, OVR.brake_enter, OVR.throttle_enter))
+      '[GVD] override thresholds from gvd_state: steer enter %.3f exit %.3f hold %.0fms spike %.2f lpf %.0fms, brake %.2f, throttle %.2f',
+      OVR.steer_enter, OVR.steer_exit, OVR.steer_hold_ms, OVR.steer_spike, OVR.lpf_tau_ms,
+      OVR.brake_enter, OVR.throttle_enter))
   end
 end
 
--- GE Lua has no documented "is a force-feedback wheel attached" query, so this is best effort:
--- true only when an enumerable device names a wheel, false only when a device list came back
--- without one, nil (unknown) otherwise. Unknown keeps the deadband on. UNPROVEN on Windows.
+-- GE Lua has no documented "is a force-feedback wheel attached" query, so this is diagnostic
+-- only: the residual path runs whatever it says. Logged once so the Windows smoke can tell
+-- whether a wheel was even visible from here. UNPROVEN.
 local WHEEL_HINTS = { 'wheel', 'ffb', 'logitech', 'thrustmaster', 'fanatec', 'simucube', 'g27', 'g29', 'g920', 't300', 'csl' }
-local ffbWheel = nil
 local ffbProbed = false
 
 local function looksLikeWheel(name)
@@ -1056,7 +1046,7 @@ local function looksLikeWheel(name)
 end
 
 local function probeFfbWheel()
-  if ffbProbed then return ffbWheel end
+  if ffbProbed then return end
   ffbProbed = true
   local names = nil
   local function collect(t)
@@ -1081,74 +1071,62 @@ local function probeFfbWheel()
     end
   end
   if names == nil then
-    log('I', 'GVD', '[GVD] force-feedback wheel: undetectable on this build — steer deadband stays on while engaged')
-    return nil
+    log('I', 'GVD', '[GVD] force-feedback wheel: no device list on this build — steer residual path runs regardless')
+    return
   end
   for _, n in ipairs(names) do
     if looksLikeWheel(n) then
-      ffbWheel = true
-      log('I', 'GVD', '[GVD] force-feedback wheel detected (' .. n .. '): steer deadband on')
-      return true
+      log('I', 'GVD', '[GVD] force-feedback wheel seen (' .. n .. ')')
+      return
     end
   end
-  ffbWheel = false
   log('I', 'GVD', '[GVD] no wheel among ' .. #names .. ' input devices')
-  return false
 end
 
-local function ovrSteerBand()
-  local wheel = probeFfbWheel()  -- probed on the first drive tick so the log lands once
-  if OVR.ffb_assume_wheel or wheel ~= false then return OVR.steer_deadband end
-  return 0
-end
-
--- 'none' | 'steer' | 'brake' | 'throttle'. Only meaningful while we hold the vehicle.
+-- 'none' | 'player_steer' | 'player_brake' | 'player_throttle'. Only meaningful while we hold
+-- the vehicle. dt is the applyCmdJson step, so the filter and the dwell run on real time.
 local function ovrCheck(dt)
-  if not egoFb or ovrEchoStamp == nil then return 'none' end
+  if not egoFb or ovrEchoStamp == nil or ovrRef == nil then return 'none' end
   if (ovrClock - ovrEchoStamp) > OVR_ECHO_MAX_S then return 'none' end
-  -- Warm-up: until we have commanded across the whole lookback window there is nothing to
-  -- attribute the echo to, and a player holding the brake as they press Alt+A would override
-  -- themselves on the spot.
-  if ovrArmedAt == nil or (ovrClock - ovrArmedAt) < OVR.cmd_window_s then
-    ovrSteerHeld = 0
-    ovrSteerSign = 0
-    ovrPedalHeld = 0
+  -- Warm-up: the EMA needs a few time constants, and until GVD has been commanding for a while
+  -- the echo says nothing about our commands — a player resting on the brake as they press
+  -- Alt+A would otherwise override themselves on the spot.
+  if ovrArmedAt == nil or (ovrClock - ovrArmedAt) < (OVR_WARMUP_TAUS * OVR.lpf_tau_ms / 1000) then
+    ovrHeldMs = 0
+    ovrSign = 0
     return 'none'
   end
+  probeFfbWheel()
 
-  local thrLo, thrHi = ovrEnvelope('th')
-  local brkLo, brkHi = ovrEnvelope('b')
-  local thrR = math.max(0, ovrResidual(clamp(egoFb.throttle or 0, 0, 1), thrLo, thrHi))
-  local brkR = math.max(0, ovrResidual(clamp(egoFb.brake or 0, 0, 1), brkLo, brkHi))
-  local pedal = 'none'
-  if brkR >= OVR.brake_enter and brkR >= thrR then
-    pedal = 'brake'
-  elseif thrR >= OVR.throttle_enter then
-    pedal = 'throttle'
-  end
-  if pedal == 'none' then ovrPedalHeld = 0 else ovrPedalHeld = ovrPedalHeld + dt end
+  -- Pedals: one-sided, so our own AEB brake hold echoing back at 1.0 is not the player standing
+  -- on it. Brake is the tighter threshold and wins a tie.
+  local thrR = math.max(0, clamp(egoFb.throttle or 0, 0, 1) - ovrRef.th)
+  local brkR = math.max(0, clamp(egoFb.brake or 0, 0, 1) - ovrRef.b)
+  if brkR >= OVR.brake_enter then return 'player_brake' end
+  if thrR >= OVR.throttle_enter then return 'player_throttle' end
 
-  local sLo, sHi = ovrEnvelope('s')
-  local steerR = 0
-  if math.max(math.abs(sLo), math.abs(sHi)) <= OVR.steer_cmd_max then
-    steerR = ovrDeadband(ovrResidual(clamp(egoFb.steer or 0, -1, 1), sLo, sHi), ovrSteerBand())
+  local raw = clamp(egoFb.steer or 0, -1, 1) - ovrRef.s
+  local spike = math.abs(raw - ovrLastRaw) > OVR.steer_spike
+  ovrLastRaw = raw
+  if not spike then
+    ovrFilt = ovrFilt + ovrAlpha(dt, OVR.lpf_tau_ms / 1000) * (raw - ovrFilt)
   end
-  local mag = math.abs(steerR)
-  local sign = (steerR > 0 and 1) or (steerR < 0 and -1) or 0
+  local eff = ovrFilt * (1 + OVR_OPPOSITION_GAIN * ovrOpposition(ovrRef.s, ovrFilt))
+
+  local mag = math.abs(eff)
+  local sign = (eff > 0 and 1) or (eff < 0 and -1) or 0
+  if sign ~= 0 and ovrSign ~= 0 and sign ~= ovrSign then
+    ovrHeldMs = 0   -- "how long has the player been pushing one way": a side change restarts it
+  end
   if mag >= OVR.steer_enter then
-    if OVR.steer_sign_flip_resets and ovrSteerSign ~= 0 and sign ~= ovrSteerSign then
-      ovrSteerHeld = 0   -- chatter alternates side to side; a driver pulling the wheel does not
-    end
-    ovrSteerSign = sign
-    ovrSteerHeld = ovrSteerHeld + dt
-  elseif mag <= OVR.steer_clear then
-    ovrSteerHeld = 0
-    ovrSteerSign = 0
+    ovrSign = sign
+    ovrHeldMs = ovrHeldMs + dt * 1000
+  elseif mag <= OVR.steer_exit then
+    ovrHeldMs = 0
+    ovrSign = 0
   end
-  -- Between clear and enter the dwell is frozen: that band is the hysteresis.
-
-  if pedal ~= 'none' and ovrPedalHeld >= OVR.pedal_hold_s then return pedal end
-  if mag >= OVR.steer_enter and ovrSteerHeld >= OVR.steer_hold_s then return 'steer' end
+  -- Between exit and enter the dwell is frozen: that band is the hysteresis.
+  if mag >= OVR.steer_enter and ovrHeldMs >= OVR.steer_hold_ms then return 'player_steer' end
   return 'none'
 end
 
@@ -1163,7 +1141,7 @@ local function applyInputs(veh, steer, throttle, brake)
   throttle = clamp(tonumber(throttle) or 0, 0, 1)
   brake = clamp(tonumber(brake) or 0, 0, 1)
   if brake > 0.01 then throttle = 0 end  -- never both pedals (AEB semantics; arcade auto-reverse guard)
-  ovrNoteCommand(steer, throttle, brake)  -- baseline the override residual reads against
+  ovrNoteCommand(steer, throttle, brake)  -- reference the override residual is measured against
   return queueVehicle(veh, string.format(VE_APPLY_FMT, steer, throttle, brake))
 end
 
@@ -1179,7 +1157,7 @@ local function releaseInputs(why)
   applying = false
   queueVehicle(applyVeh or getPlayerVeh(), VE_RELEASE)
   applyVeh = nil
-  ovrReset()  -- hands off: the command envelope and the override dwell mean nothing now
+  ovrReset()  -- hands off: the residual filter and the dwell mean nothing now
   log('I', 'GVD', '[GVD] released vehicle inputs (' .. tostring(why) .. ')')
 end
 
@@ -1204,6 +1182,10 @@ function M.onEgoFeedback(speed, steerIn, thrIn, brkIn)
     throttle = tonumber(thrIn) or 0,
     brake = tonumber(brkIn) or 0,
   }
+  -- Pin the reference the residual is measured against to this sample. Vehicle Lua runs the
+  -- apply snippet and the electrics echo in that order in the same tick, so the command in
+  -- force when these values were read is the one we most recently pushed.
+  ovrRef = ovrCmdLast or ovrCmdPrev
   ovrEchoStamp = ovrClock
   writeEgoFile()
 end
@@ -1239,9 +1221,8 @@ local function applyCmdJson(dt)
     -- Player switched vehicles while we held the wheel: free the old one, re-arm arcade for the new one.
     queueVehicle(applyVeh, VE_RELEASE)
     arcadeQueued = false
-    -- New car, new baseline: its electrics echo says nothing about the old car's commands.
+    -- New car, new reference: its electrics echo says nothing about the old car's commands.
     ovrReset()
-    ovrEchoStamp = nil
     log('I', 'GVD', '[GVD] player vehicle changed: released previous vehicle inputs')
   end
   applyVeh = veh
@@ -1278,18 +1259,18 @@ local function applyCmdJson(dt)
     return
   end
   if not arcadeQueued then arcadeQueued = queueVehicle(veh, VE_ARCADE) end
-  -- Judged before we push the next command, and only while we actually hold the car: wheel
-  -- chatter must not disengage, a real pedal or a sustained wheel pull must. Sticky like the
-  -- supervisor's own check — Alt+A re-arms.
+  -- Judged before we push the next command, and only while we actually hold the car:
+  -- force-feedback noise must not disengage, a real pedal or a sustained wheel pull must.
+  -- Sticky like the supervisor's own check — Alt+A re-arms.
   if applying then
-    local ch = ovrCheck(step)
-    if ch ~= 'none' then
-      releaseInputs('driver override (' .. ch .. ')')
+    local why = ovrCheck(step)
+    if why ~= 'none' then
+      releaseInputs(why)
       engaged = false
       fadeAcc = 0
-      writeEngageFile('driver_override')
-      log('W', 'GVD', '[GVD] DISENGAGED: driver override on ' .. ch)
-      print('[GVD] DISENGAGED: driver override on ' .. ch)
+      writeEngageFile(why)
+      log('W', 'GVD', '[GVD] DISENGAGED: ' .. why)
+      print('[GVD] DISENGAGED: ' .. why)
       pushUi()
       return
     end
@@ -1325,7 +1306,7 @@ local function syncEngageFromSupervisor()
   engaged = false
   fadeAcc = 0
   releaseInputs('supervisor disengaged')
-  -- Reason: the engage file carries it since M6 (veto / driver_override / shutdown); fall back to state.
+  -- Reason: the engage file carries it since M6 (veto / player_steer / shutdown); fall back to state.
   local why = 'supervisor off'
   local fr = f.disengage_reason and tostring(f.disengage_reason) or nil
   if fr and fr ~= 'none' and fr ~= 'not_engaged' then
@@ -1431,8 +1412,9 @@ function M.onExtensionLoaded()
   end)
   log('I', 'GVD', '[GVD] loaded. Alt+A engage. Path: GVD PATH. Strip: mode/Hz/TTC/N. UI app: GVD.')
   log('I', 'GVD', string.format(
-    '[GVD] driver override: steer deadband %.2f (force-feedback chatter must not disengage), pedals hard at brake %.2f / throttle %.2f',
-    OVR.steer_deadband, OVR.brake_enter, OVR.throttle_enter))
+    '[GVD] player override on the steer residual: enter %.3f exit %.3f hold %.0fms spike %.2f lpf %.0fms (force-feedback noise must not disengage), pedals tight at brake %.2f / throttle %.2f',
+    OVR.steer_enter, OVR.steer_exit, OVR.steer_hold_ms, OVR.steer_spike, OVR.lpf_tau_ms,
+    OVR.brake_enter, OVR.throttle_enter))
   print('[GVD] loaded. Alt+A engage. Writes ' .. userEngagePath()
     .. '; drives the player vehicle from gvd_cmd.json while engaged (retail). BeamNGpy direct control on Tech.')
 end

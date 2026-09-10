@@ -105,7 +105,7 @@ def read_ego_feedback(now: float | None = None) -> EgoFeedback | None:
 
 
 def read_engage_flag(default: bool = False) -> bool:
-    """Lua Alt+A writes gvd_engage.json; Python mirrors that (do not invent engage)."""
+    """Lua Alt+G writes gvd_engage.json; Python mirrors that (do not invent engage)."""
     p = engage_path()
     if not p.is_file():
         return default

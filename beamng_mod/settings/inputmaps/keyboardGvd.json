@@ -2,7 +2,11 @@
   "bindings": [
     {
       "action": "gvd_toggle_engage",
-      "control": "alt+a"
+      "control": "alt+g"
+    },
+    {
+      "action": "gvd_toggle_engage",
+      "control": "ctrl+alt+g"
     }
   ]
 }

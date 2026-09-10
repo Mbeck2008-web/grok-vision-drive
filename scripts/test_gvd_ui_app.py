@@ -45,6 +45,7 @@ def main() -> None:
 
     # Titles stay GVD / VISION, and no Tesla / FSD chrome anywhere the player can see.
     assert "GVD" in app_html and "VISION" in app_html
+    assert "ALT+G" in app_html and "ALT+A" not in app_html
     for name, text in (("app.js", app_js), ("app.html", app_html), ("main.lua", lua),
                        ("app.json", json.dumps(app_json))):
         low = text.lower()
@@ -73,13 +74,16 @@ def main() -> None:
     unbound = sorted(bound - published)
     assert not unbound, f"app.html binds scope functions that app.js never defines: {unbound}"
 
-    # Engage still has to be reachable without the app (Alt+A action map).
+    # Engage still has to be reachable without the app. Alt+A is stock BeamNG
+    # toggleRangeStatus — GVD uses Alt+G (Ctrl+Alt+G fallback) and does not steal it.
     actions = json.loads((ROOT / "beamng_mod" / "lua" / "ge" / "extensions" / "core" / "input"
                           / "actions" / "gvd.json").read_text(encoding="utf-8"))
     assert "toggleEngage" in actions["gvd_toggle_engage"]["onDown"]
     keymap = json.loads((ROOT / "beamng_mod" / "settings" / "inputmaps"
                          / "keyboardGvd.json").read_text(encoding="utf-8"))
-    assert any(b["control"] == "alt+a" for b in keymap["bindings"]), keymap
+    controls = {b["control"] for b in keymap["bindings"]}
+    assert "alt+g" in controls and "ctrl+alt+g" in controls, keymap
+    assert "alt+a" not in controls, "do not steal stock toggleRangeStatus"
 
     # One prefs bus: what Lua writes is what the supervisor reads.
     written = set(re.findall(r'"(show_path|show_agent_ghosts|show_scene|policy|viz_screen)"\s*:', lua))

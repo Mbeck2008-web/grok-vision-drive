@@ -20,7 +20,7 @@ Get `gvd-retail-<version>.zip` from GitHub Releases (or build it — see [Releas
 
 1. Double-click `install.bat` (prefers `%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\mods` on 0.38+; else newest versioned folder)
 2. Fully quit and restart BeamNG
-3. Enable Grok Vision Drive in Mod Manager if needed (Alt+A engage)
+3. Enable Grok Vision Drive in Mod Manager if needed (Alt+G engage)
 
 Optional: double-click `play_gvd.bat` to start the Python supervisor (retail `window` backend) + Steam BeamNG (`284160`). Uninstall: `uninstall.bat` (removes only `mods\unpacked\gvd` and `mods\gvd.zip`).
 
@@ -28,7 +28,7 @@ Windows first. No admin. Never writes into `Steam\steamapps\common\BeamNG.drive`
 
 ## Player guide (retail, M6)
 
-What you get on **retail BeamNG.drive**: the in-game **GVD** app (Engage / Disengage, show path, show ghosts, policy, screen pick), Alt+A engage, the ice-blue path ribbon on the road, the **GVD VISION** second window (void-stage lexicon: multi-lane fan, ice corridor, CIPV boxes, curbs, signs), clips in `Documents\GVD\clips`, and **driving**: while engaged, GVD steers, throttles and brakes the sim car along the lane corridor (HUD reads `modular|DRIVE`).
+What you get on **retail BeamNG.drive**: the in-game **GVD** app (Engage / Disengage, show path, show ghosts, policy, screen pick), Alt+G engage, the ice-blue path ribbon on the road, the **GVD VISION** second window (void-stage lexicon: multi-lane fan, ice corridor, CIPV boxes, curbs, signs), clips in `Documents\GVD\clips`, and **driving**: while engaged, GVD steers, throttles and brakes the sim car along the lane corridor (HUD reads `modular|DRIVE`).
 
 What retail is **not**: eight cameras. It captures **one** window (the main view); the other seven stay `missing` in the nerd panel and the boot line says `cams=1/8 path=retail`. It drives through the **mod's Lua** (`gvd_cmd.json` → vehicle `input.event`), not through BeamNGpy. Eight cameras and BeamNGpy direct control need BeamNG.**tech** (`GVD_BACKEND=beamngpy`, `GVD_BEAMNG=1`) — the preferred path.
 
@@ -36,7 +36,7 @@ What retail is **not**: eight cameras. It captures **one** window (the main view
 2. In BeamNG open **Apps** → add **GVD** (and optionally **GVD Strip**).
 3. Install Python 3 (python.org, tick *Add to PATH*), then `pip install -r requirements-retail.txt` — or let `play_gvd.bat` offer to do it when packages are missing.
 4. Double-click `play_gvd.bat`. It opens the supervisor console (`cmd /k`, so errors stay readable), the **GVD VISION** window, and BeamNG via Steam. Window capture locks onto a visible window titled **BeamNG** as soon as it appears; if none is found it grabs the primary monitor, so run BeamNG fullscreen in that case (the nerd panel `capture` line tells you which).
-5. Drive onto a road with visible lane lines, then press **Alt+A** or the app's **Engage**. The ribbon appears and the HUD strip reads `modular|ON`; as soon as perception sees both lane lines (`path_debug_preview=false`) GVD takes the wheel and the strip switches to `modular|DRIVE`. Until then it holds the brake (`preview_blocked`). Take over any time by steering against it (`player_steer`), touching a pedal (`player_brake` / `player_throttle`), or pressing Alt+A — sticky until the next Alt+A.
+5. Drive onto a road with visible lane lines, then press **Alt+G** (fallback **Ctrl+Alt+G**) or the app's **Engage**. **Alt+A** stays BeamNG's stock range display (`toggleRangeStatus`); GVD does not steal it. The ribbon appears and the HUD strip reads `modular|ON`; as soon as perception sees both lane lines (`path_debug_preview=false`) GVD takes the wheel and the strip switches to `modular|DRIVE`. Until then it holds the brake (`preview_blocked`). Take over any time by steering against it (`player_steer`), touching a pedal (`player_brake` / `player_throttle`), or pressing Alt+G — sticky until the next Alt+G.
 
 **Force-feedback wheels.** A wheel is welcome. Override detection looks at `|steering_input − cmd.steer|`, not the absolute angle, then spike-rejects and EMA-filters that residual so self-aligning torque, spring centering and kicks over bumps no longer disengage GVD. A real pull held ~200 ms still wins, and so does any real brake or throttle press. Tune it in `config\control.yaml` under `override:`. Live FFB behaviour is **UNPROVEN**.
 
@@ -46,12 +46,12 @@ Keys in **GVD VISION**: `V` nerd panel, `?` help, `0` clean cabin, `1–5` debug
 
 **Heartbeat dead-man and disengage.** The supervisor stamps `heartbeat_mtime` into `gvd_state.json` every tick; if it stalls for more than 0.35 s the ribbon fades over 0.4 s and hides, returning when the beat returns. On the drive side the mod only applies commands while `seq` keeps advancing: `CMD_STALE_S` 0.35 s without a new command → steering straight, throttle 0, **brake hold**; `CMD_DEAD_S` 1.0 s → inputs released, auto-disengage, `gvd_engage.json` set to `false`. You are disengaged when:
 
-- you press Alt+A / **Disengage** — the mod sends steering/throttle/brake 0 once and stops touching the car;
-- you steer against it (`player_steer`) or use a pedal (`player_brake` / `player_throttle`) — sticky until the next Alt+A, judged by the mod **and** the supervisor, whichever sees it first;
+- you press Alt+G / **Disengage** — the mod sends steering/throttle/brake 0 once and stops touching the car;
+- you steer against it (`player_steer`) or use a pedal (`player_brake` / `player_throttle`) — sticky until the next Alt+G, judged by the mod **and** the supervisor, whichever sees it first;
 - the supervisor quits (`q`, window closed, Ctrl+C): its `finally` block writes a stop and `engaged=false`, the mod releases the car;
-- the modular supervisor vetoes an E2E/shadow policy (`--policy e2e|shadow`: low `lane_conf` / `path_conf`, disagreement, AEB). The default `modular` policy disengages only via Alt+A, override, supervisor exit or the dead-man.
+- the modular supervisor vetoes an E2E/shadow policy (`--policy e2e|shadow`: low `lane_conf` / `path_conf`, disagreement, AEB). The default `modular` policy disengages only via Alt+G, override, supervisor exit or the dead-man.
 
-The mod reads `engaged=false` back and flips the HUD to **OFF** within ~0.1 s (it never turns engage *on* from a file — engage always starts in-game). Re-engage with Alt+A. A clip is flushed on every disengage, AEB brake and near-miss (`Documents\GVD\clips\clip_<time>_<trigger>`).
+The mod reads `engaged=false` back and flips the HUD to **OFF** within ~0.1 s (it never turns engage *on* from a file — engage always starts in-game). Re-engage with Alt+G. A clip is flushed on every disengage, AEB brake and near-miss (`Documents\GVD\clips\clip_<time>_<trigger>`).
 
 Files: `Documents\GVD\{gvd_state.json, gvd_engage.json, gvd_cmd.json, gvd_ego.json, gvd_ui_prefs.json, clips\, python\, config\}`. `uninstall.bat` removes the mod only; delete `Documents\GVD` yourself if you want a clean slate. Nothing here talks to a real car and nothing carries Tesla / “FSD” branding.
 
@@ -91,31 +91,31 @@ After install, start a level, open the **Apps** editor (Esc → *UI Apps*, or th
 
 The in-game app is **Engage / Disengage + settings only**. The rich VISION lexicon (void stage, multi-lane fan, ice corridor, CIPV boxes, warm curbs, sign/light glyphs) is drawn on the **GVD VISION** OpenCV second screen from the same `Documents/GVD/gvd_state.json`. See [`docs/gvd_state_schema.md`](docs/gvd_state_schema.md#viz-road-model) for what is measured vs inferred. Controls:
 
-- **Engage / Disengage** — the same toggle as Alt+A. The state strip reads `DRIVE` (the mod is feeding the player vehicle from `gvd_cmd.json`, or BeamNGpy is applying on Tech — steer to take over), `ENGAGED` (armed, nothing applied yet), `HOLD` (heartbeat stale → dead-man, inputs released) or `DISENGAGED` with the last reason.
+- **Engage / Disengage** — the same toggle as Alt+G. The state strip reads `DRIVE` (the mod is feeding the player vehicle from `gvd_cmd.json`, or BeamNGpy is applying on Tech — steer to take over), `ENGAGED` (armed, nothing applied yet), `HOLD` (heartbeat stale → dead-man, inputs released) or `DISENGAGED` with the last reason.
 - **Path / Ghosts** — writes `gvd_ui_prefs.json`, so the world ribbon and the OpenCV window follow.
 - **Policy** `modular | e2e | shadow` — shows what the supervisor is actually running and requests a change for the running session; the modular veto is unchanged and `--policy` still wins at launch.
 - **Sensing** — capture backend, `n/8` healthy feeds, the retail `cam_main only` note, and buttons that move the **GVD VISION** OpenCV window to screen 1 / 2.
 - **+ nerd** — loop/camera Hz, infer ms, VRAM, detector, actuator, clip encoder, heartbeat age.
 
-Titles stay **GVD** / **VISION**; Alt+A works with or without the app open. Offline check: `PYTHONPATH=. python scripts/test_gvd_ui_app.py`.
+Titles stay **GVD** / **VISION**; Alt+G works with or without the app open. Offline check: `PYTHONPATH=. python scripts/test_gvd_ui_app.py`.
 
 ## Two views
 
-**In-game (BeamNG world):** ice-blue ribbon drawn on the pavement via GELua `debugDrawer` (`drawSquarePrism`, 3-line fallback) — **1:1** with `path_ego` / `path_world` (x right, y forward, z up). Track ghosts sit on the road at the same transform; CIPV is brighter. Engage with Alt+A. GELua resolves `Documents/GVD` via USERPROFILE/LOCALAPPDATA/`FS:getUserPath` (USERPROFILE is often empty in-process). This is **not** a 2D camera overlay.
+**In-game (BeamNG world):** ice-blue ribbon drawn on the pavement via GELua `debugDrawer` (`drawSquarePrism`, 3-line fallback) — **1:1** with `path_ego` / `path_world` (x right, y forward, z up). Track ghosts sit on the road at the same transform; CIPV is brighter. Engage with Alt+G. GELua resolves `Documents/GVD` via USERPROFILE/LOCALAPPDATA/`FS:getUserPath` (USERPROFILE is often empty in-process). This is **not** a 2D camera overlay.
 
-**Second screen (`GVD VISION`):** OpenCV cabin on monitor 2 when available (`--viz-screen auto|1|2`, `--viz-fullscreen`, or `GVD_VIZ_MONITOR=2`). This is the VISION lexicon: near-black void stage, thin vector lane paint (`lanes_ext`: solid detected / dim-dashed predicted; smoke stubs only), warm-grey kerbs (`road_edges`), ice-blue ego corridor (intent shade, chevrons while slowing, stop bar when halted behind a CIPV), agent boxes (ice-blue in-path, CIPV **LEAD**, red **BRAKE**), forecast fans, and stop-sign / traffic-light / pole glyphs when `signs[]` is present. Optional `cam_main` PIP. Loop under 8 Hz drops fans, signs and PIP first. One monitor → window stays put; drag it, or use motherboard HDMI for UHD 630 as display 2. Live dual-monitor + Alt+A still **UNPROVEN** on Linux / until Windows gate.
+**Second screen (`GVD VISION`):** OpenCV cabin on monitor 2 when available (`--viz-screen auto|1|2`, `--viz-fullscreen`, or `GVD_VIZ_MONITOR=2`). This is the VISION lexicon: near-black void stage, thin vector lane paint (`lanes_ext`: solid detected / dim-dashed predicted; smoke stubs only), warm-grey kerbs (`road_edges`), ice-blue ego corridor (intent shade, chevrons while slowing, stop bar when halted behind a CIPV), agent boxes (ice-blue in-path, CIPV **LEAD**, red **BRAKE**), forecast fans, and stop-sign / traffic-light / pole glyphs when `signs[]` is present. Optional `cam_main` PIP. Loop under 8 Hz drops fans, signs and PIP first. One monitor → window stays put; drag it, or use motherboard HDMI for UHD 630 as display 2. Live dual-monitor + Alt+G still **UNPROVEN** on Linux / until Windows gate.
 
 ## Status
 
 **Force-feedback player override (this PR):** wheel chatter no longer disengages GVD. The signal is `|steering_input − aligned cmd.steer|` (never an absolute angle), then spike reject → EMA (`lpf_tau_ms` 80) → soft opposition bias → hysteresis (`steer_enter` 0.08 / `steer_exit` 0.04) → dwell (`steer_hold_ms` 200). Pedals are asymmetric and tight (`brake_enter` 0.06 / `throttle_enter` 0.10), no filter. Reasons: `player_steer` / `player_brake` / `player_throttle`. Thresholds live in `config/control.yaml` and are mirrored to the mod through `gvd_state.json`. `CMD_DEAD_S` is unchanged. Live FFB is **UNPROVEN**. Details under [Actuation](#actuation-m3).
 
-**M6 (retail package):** player-ready **retail** slice. `scripts/make_release_zip.py` (+ `.bat`) builds `dist/gvd-retail-<version>.zip` — launchers, `beamng_mod/`, `python/`, `config/`, requirements, LICENSE, README, `VERSION.txt`; never clips, weights, `.git`, tests. `play_gvd.bat` runs the supervisor on the **`window` backend** (1 capture, `cams=1/8 path=retail` in the hw_probe boot line), checks the runtime and offers `pip install -r requirements-retail.txt`, keeps its console open on errors. Retail **drives** over the M3 file bus: `gvd_cmd.json` (`steer/throttle/brake/seq/engaged`) → `gvd_main.applyCmdJson` → vehicle-Lua `input.event` (the stock AI / BeamNGpy calls, arcade shifter once); vehicle electrics echo back through `gvd_ego.json` (wheelspeed, inputs, applied seq) so the planner has real ego speed, TTC works, player override works and `cmd_applied` is claimed only on a fresh Lua ack. Lua dead-man: `CMD_STALE_S` 0.35 s without a new seq → brake hold, `CMD_DEAD_S` 1.0 s → release + auto-disengage; every disengage releases the inputs. Driver override is now sticky (writes `engaged=false`). JSON writers retry on Windows sharing violations. 8 cams + BeamNGpy direct control stay Tech (preferred). Mod adopts `engaged=false` from `gvd_engage.json` when the supervisor vetoes/exits so the HUD never stays ON without a heartbeat. Player guide above. Live Alt+A / drive still **UNPROVEN** here. No Tesla / FSD chrome; no real-car.
+**M6 (retail package):** player-ready **retail** slice. `scripts/make_release_zip.py` (+ `.bat`) builds `dist/gvd-retail-<version>.zip` — launchers, `beamng_mod/`, `python/`, `config/`, requirements, LICENSE, README, `VERSION.txt`; never clips, weights, `.git`, tests. `play_gvd.bat` runs the supervisor on the **`window` backend** (1 capture, `cams=1/8 path=retail` in the hw_probe boot line), checks the runtime and offers `pip install -r requirements-retail.txt`, keeps its console open on errors. Retail **drives** over the M3 file bus: `gvd_cmd.json` (`steer/throttle/brake/seq/engaged`) → `gvd_main.applyCmdJson` → vehicle-Lua `input.event` (the stock AI / BeamNGpy calls, arcade shifter once); vehicle electrics echo back through `gvd_ego.json` (wheelspeed, inputs, applied seq) so the planner has real ego speed, TTC works, player override works and `cmd_applied` is claimed only on a fresh Lua ack. Lua dead-man: `CMD_STALE_S` 0.35 s without a new seq → brake hold, `CMD_DEAD_S` 1.0 s → release + auto-disengage; every disengage releases the inputs. Driver override is now sticky (writes `engaged=false`). JSON writers retry on Windows sharing violations. 8 cams + BeamNGpy direct control stay Tech (preferred). Mod adopts `engaged=false` from `gvd_engage.json` when the supervisor vetoes/exits so the HUD never stays ON without a heartbeat. Player guide above. Live Alt+G / drive still **UNPROVEN** here. No Tesla / FSD chrome; no real-car.
 
 **M5 (shadow + tiny E2E):** Perception always runs; actuators only when engaged. `--policy modular|e2e|shadow` (default **modular** = safety supervisor, vetoes E2E). `policy_e2e` = PilotNet-scale tiny CNN/MLP stub: 2×320×180 (main+wide) + speed/steer → `{steer, accel}`; loads `models/e2e_current.onnx` if present else numpy stub. Shadow fields `shadow.{steer,throttle,brake}` written every tick; modular veto on low `lane_conf` / heartbeat / disagreement → hold/disengage (+ clip if recorder). Toy VRAM ~0.15–0.4 GB. No transformers/ViT/BEV/AutoSteer-HD; no Tesla/FSD chrome; no real-car.
 
 **M4 (clips):** ring-buffer + QSV/libx264 flush on disengage / AEB / near-miss / key C.
 
-**M3 (actuation):** sim-only BeamNGpy `vehicle.control` / `gvd_cmd.json`. Engage Alt+A. Dead-man unchanged.
+**M3 (actuation):** sim-only BeamNGpy `vehicle.control` / `gvd_cmd.json`. Engage Alt+G. Dead-man unchanged.
 
 **M2 (perception):** detect→track→CIPV→corridor; live default no synthetic cars.
 
@@ -130,7 +130,7 @@ Host profile (target): Intel **i9-9900K** + **UHD 630** (QSV encode) + **GTX 108
 Visualization **toy** (not a scientific claim that forecasts match Waymo). On-screen title: **GVD** / **VISION**. No Tesla logos, no “Full Self-Driving”, no “FSD” product label.
 
 ### In-game (required)
-Ice-blue ego ribbon on the asphalt via GELua `debugDrawer` (`drawSquarePrism` → `drawLine` fallback), data from `Documents/GVD/gvd_state.json`. Engage with Alt+A. See `docs/gvd_state_schema.md`.
+Ice-blue ego ribbon on the asphalt via GELua `debugDrawer` (`drawSquarePrism` → `drawLine` fallback), data from `Documents/GVD/gvd_state.json`. Engage with Alt+G. See `docs/gvd_state_schema.md`.
 
 ### Python window (extra)
 OpenCV **GVD VISION** second screen owns the cabin lexicon (void stage, multi-lane fan, ice corridor, CIPV boxes, warm curbs, sign/light glyphs) plus nerd panel + forecast fans:
@@ -189,7 +189,7 @@ PYTHONPATH=. python python/run_vision.py --backend beamngpy --viz   # Tech path
 # --allow-preview-drive   # opt-in only; default blocks preview paths
 ```
 
-Safety: Alt+A engage; heartbeat dead-man; AEB `brake=1`/`throttle=0`; driver override (below) disengages and stays off until Alt+A; kill Python → `finally` stop + `engaged=false`, Lua releases the car and fades the ribbon; Lua-side dead-man holds the brake after `CMD_STALE_S` (0.35 s) without a new `seq` and releases + disengages after `CMD_DEAD_S` (1.0 s). `--force-engage` is **debug-only** (never default). Live drive on Windows = Michael smoke / still UNPROVEN here.
+Safety: Alt+G engage; heartbeat dead-man; AEB `brake=1`/`throttle=0`; driver override (below) disengages and stays off until Alt+G; kill Python → `finally` stop + `engaged=false`, Lua releases the car and fades the ribbon; Lua-side dead-man holds the brake after `CMD_STALE_S` (0.35 s) without a new `seq` and releases + disengages after `CMD_DEAD_S` (1.0 s). `--force-engage` is **debug-only** (never default). Live drive on Windows = Michael smoke / still UNPROVEN here.
 
 **Player override (force-feedback residual).** `python/control/override.py` and `gvd_main` run the same maths on both sides of the bus. The signal is `|steering_input − cmd.steer|` against the command that was in force when the echo was sampled (`applied_seq` / last applied), never an absolute angle — so GVD's own steer coming back is residual 0. Then: spike reject (`steer_spike` 0.20, a sample-to-sample jump is mechanical, the EMA holds) → EMA on the residual only (`lpf_tau_ms` 80) → soft opposition bias (a residual fighting GVD's steer counts a little more) → hysteresis (`steer_enter` 0.08 / `steer_exit` 0.04) → dwell (`steer_hold_ms` 200). Pedals are asymmetric and tight: no filter, no dwell, one-sided (only a press beyond what GVD asked for), `brake_enter` 0.06 / `throttle_enter` 0.10. Reasons: `player_steer` / `player_brake` / `player_throttle`. Thresholds: `config/control.yaml` `override:`, mirrored into `gvd_state.json` as `override_cfg`. This does **not** change `CMD_DEAD_S`. Live FFB is **UNPROVEN**. Offline check: `PYTHONPATH=. python scripts/test_ffb_override.py`.
 

@@ -16,7 +16,7 @@ Path: `%USERPROFILE%\Documents\GVD\gvd_state.json` (written by `python/run_visio
 | `policy` | string | `map-ai` draws amber (dimmer) instead of ice-blue |
 | `ego.steer_deg` | float | Used for debug preview if path missing |
 
-Lua: `gvd_main.drawPath` on `onPreRender` / `onDebugDraw`. Engaged-only (Alt+A). Caps: 40 ego segs, 8 agents × 10 segs. Label in console: GVD PATH. No DecalRoad / map edit.
+Lua: `gvd_main.drawPath` on `onPreRender` / `onDebugDraw`. Engaged-only (Alt+G). Caps: 40 ego segs, 8 agents × 10 segs. Label in console: GVD PATH. No DecalRoad / map edit.
 
 
 | `capture_backend` | string | `beamngpy` / `window` / `stub` |
@@ -36,7 +36,7 @@ Lua: `gvd_main.drawPath` on `onPreRender` / `onDebugDraw`. Engaged-only (Alt+A).
 
 ## M3 fields
 
-| `engaged` | bool | Mirrored from Alt+A via `gvd_engage.json` (Lua writes; Python reads) |
+| `engaged` | bool | Mirrored from Alt+G via `gvd_engage.json` (Lua writes; Python reads) |
 | `disengage_reason` | string | `none` / `not_engaged` / `preview_blocked` / `heartbeat_stale` / `player_steer` / `player_brake` / `player_throttle` / … (sticky reasons live in `gvd_engage.json`) |
 | `actuator` | string | `beamngpy` (Tech) / `cmd_json` (retail: GELua applies) / `null` |
 | `cmd_seq` | int | Monotonic command sequence |
@@ -136,7 +136,7 @@ Path: `Documents/GVD/gvd_engage.json`, shared by GELua and Python.
 
 | Writer | Payload | When |
 | --- | --- | --- |
-| Lua (`gvd_main.writeEngageFile`) | `{"engaged":true\|false,"mtime":<os.time() int>,"disengage_reason":"<why>"}` | Alt+A / GVD app button, `player_steer` / `player_brake` / `player_throttle`, `command_stream_dead`, `extension_unloaded` |
+| Lua (`gvd_main.writeEngageFile`) | `{"engaged":true\|false,"mtime":<os.time() int>,"disengage_reason":"<why>"}` | Alt+G / GVD app button, `player_steer` / `player_brake` / `player_throttle`, `command_stream_dead`, `extension_unloaded` |
 | Python (`write_engage_flag`) | `{"engaged": false, "mtime": <time.time() float>, "disengage_reason": "<why>"}` | `player_steer` / `player_brake` / `player_throttle` / modular veto / stale heartbeat / `finally` on exit |
 
 Python reads the file every tick and mirrors it into `engaged` (never invents engage). Lua polls it every 0.1 s **only while engaged** and adopts `engaged=false` when the file says so and `mtime` ≥ Lua's own last toggle stamp; it logs `[GVD] DISENGAGED by supervisor (<disengage_reason>)`, releases the vehicle inputs and refreshes the HUD/UI app. A file saying `true` never engages Lua — engage always starts in-game. Both sides write `false` on `player_steer` / `player_brake` / `player_throttle` (sticky, whichever sees it first) and Lua writes `false` when its dead-man fires. The file is the durable record of *why*: later supervisor ticks only see `engaged=false` and write the generic `not_engaged` into `disengage_reason`, so the mod keeps the reason it adopted for the HUD.
@@ -162,7 +162,7 @@ Python reads the file every tick and mirrors it into `engaged` (never invents en
 | `override.ref_seq` | int | Command seq the residual was measured against |
 | `override.armed` | bool | False during the ~3 τ warm-up after engage |
 
-On a trip both sides write `gvd_engage.json` `engaged=false` with the `player_*` reason and stay off until Alt+A; the override tick also puts that reason in `gvd_cmd.json`.
+On a trip both sides write `gvd_engage.json` `engaged=false` with the `player_*` reason and stay off until Alt+G; the override tick also puts that reason in `gvd_cmd.json`.
 
 ## M6 — retail drive bus (`gvd_cmd.json` → vehicle, `gvd_ego.json` ← vehicle)
 
@@ -177,7 +177,7 @@ On a trip both sides write `gvd_engage.json` `engaged=false` with the `player_*`
 | `heartbeat_mtime` | float | `time.time()`; Lua ignores files whose stamp is > `CMD_DEAD_S` (1.0 s) behind `os.time()` (old session) |
 | `reason` | string | `ok` / `preview_blocked` / `not_engaged` / `veto:*` / … (diagnostic) |
 
-Lua (`gvd_main.applyCmdJson`, 20 Hz): `input.event('steering', s, 1)`; `input.event('throttle', t, 2)`; `input.event('brake', b, 2)` on `be:getPlayerVehicle(0)` via `queueLuaCommand`; `drivetrain.setShifterMode('arcade')` once. No new seq for `CMD_STALE_S` (0.35 s) → steer 0 / throttle 0 / brake 1 hold; after `CMD_DEAD_S` (1.0 s) → release (all 0), `engaged=false`, `gvd_engage.json` false. Any disengage (Alt+A, supervisor false, unload) sends one release and stops applying. `cmd.engaged=false` → release immediately (no brake tap on the player).
+Lua (`gvd_main.applyCmdJson`, 20 Hz): `input.event('steering', s, 1)`; `input.event('throttle', t, 2)`; `input.event('brake', b, 2)` on `be:getPlayerVehicle(0)` via `queueLuaCommand`; `drivetrain.setShifterMode('arcade')` once. No new seq for `CMD_STALE_S` (0.35 s) → steer 0 / throttle 0 / brake 1 hold; after `CMD_DEAD_S` (1.0 s) → release (all 0), `engaged=false`, `gvd_engage.json` false. Any disengage (Alt+G, supervisor false, unload) sends one release and stops applying. `cmd.engaged=false` → release immediately (no brake tap on the player).
 
 `Documents/GVD/gvd_ego.json` — written by Lua at ~10 Hz while the supervisor's state heartbeat is alive (vehicle Lua `electrics.values` → `obj:queueGameEngineLua` → `gvd_main.onEgoFeedback`):
 

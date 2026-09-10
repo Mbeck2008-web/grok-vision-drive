@@ -114,7 +114,6 @@ These come from state the stage already has — no extra fields, and each one ne
 | --- | --- |
 | Road user lit ice-blue | inside the planner's corridor: `\|x\|` within `path_width/2 + 0.45` of a `path_ego` point at that range. No corridor → nothing highlighted |
 | Road user red + `BRAKE` tag | it is the CIPV **and** (`planner.aeb == brake` or `planner.ttc_lead < 1.5`) |
-| Slow-down chevrons on the ribbon | `planner.aeb` not `off`, `ego.brake` above 0.05, or `planner.target_v` below `ego.speed_mps` |
 | Ribbon shade | accelerating (`target_v` above speed) brightest, coasting normal, slowing dimmer, planned stop faintest |
 | Hard stop bar across the ribbon | planner halted (`target_v <= 0.2` or AEB brake) **and** a CIPV exists — the bar sits at the lead, because that is the constraint being stopped for. No CIPV means no stopping point we can honestly claim, so no bar |
 | Traffic light tinted ice-blue | `signs[].relevant == true`. **Nothing sets it today** — the stack has no route-relevance signal, so every light renders muted |
@@ -207,4 +206,25 @@ Lua (`gvd_main.applyCmdJson`, 20 Hz): `input.event('steering', s, 1)`; `input.ev
 | `pos` / `dir` | `{x,y,z}`? | Player vehicle world pose from GE (`getPosition` / `getDirectionVector`); GPS lat/lon is derived from this × `gps.ref_*` |
 
 Retail (`capture_backend=window`): `actuator=cmd_json`; `cmd_applied` follows the ack. Boot line: `backend=window cams=1/8 path=retail (1 window capture; not 8; drive=gvd_cmd.json->mod Lua)`.
+
+## Debug knobs (`debug`)
+
+Written every tick from the GVD VISION nerd **DRIVE** / **VIZ** tabs (`python/runtime/debug_opts.py`). Defaults match stock supervisor behaviour (preview blocked, Alt+G engage, product lexicon). These mutate the command **this tick**; they do not invent cameras or feed LiDAR into the planner.
+
+| Field | Notes |
+| --- | --- |
+| `allow_preview` | Same gate as `--allow-preview-drive` |
+| `force_engage` | Debug-only; Python treats the session as engaged without Alt+G. Does not write `gvd_engage.json` true (Lua still only engages in-game) |
+| `ignore_override` | Wheel/pedals still measured; they do not disengage |
+| `ignore_veto_disengage` | Modular veto still holds/brakes; engage stays. Heartbeat dead-man still disengages |
+| `policy` | `session` (use launch/in-game policy) or `modular` / `e2e` / `shadow` |
+| `steer_on` / `throttle_on` / `brake_on` | Mute an actuator channel |
+| `steer_gain` / `max_steer` / `invert_steer` | Post-plan steer rewrite |
+| `hold_brake` / `freeze_cmd` | Hold `brake=1` or repeat last command |
+| `aeb_on` / `aeb_ttc` / `cipv_on` | Rewrite planner AEB/CIPV before `shadow_tick` |
+| `speed_cap` / `cruise_mps` / `corridor_width` / `lane_conf_min` | Speed and veto knobs |
+| `lanes_on` / `detector_on` | Drop lane paint (preview path) or YOLO tracks |
+| `viz_*` | OpenCV overlay layers. `viz_occ` occupancy is **from tracks**, not a learned grid. Keys `1–5` map to occ / detector boxes / lane polynomials / camera FOV / planner samples |
+
+`occupancy` in state stays `null` (no occupancy net). The VIZ overlay is drawn in OpenCV only.
 

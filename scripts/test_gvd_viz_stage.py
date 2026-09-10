@@ -30,6 +30,7 @@ def main() -> None:
     from python.viz.nerd import _extras_line, _nav_line, scene_note
     from python.viz.stage import (
         VizUI,
+        _track_dims,
         in_path,
         is_halted,
         is_hazard,
@@ -38,6 +39,9 @@ def main() -> None:
         pace_scale,
         render_stage,
     )
+
+    assert _track_dims({}, "vehicle") == (4.2, 1.8, 1.55)
+    assert _track_dims({"length": 6.0, "width": 2.2, "height": 2.4}, "vehicle") == (6.0, 2.2, 2.4)
 
     assert lane_draw_mode("detected", smoke=False) == "solid"
     assert lane_draw_mode("predicted", smoke=False) == "dashed"
@@ -166,6 +170,31 @@ def main() -> None:
     heavy["loop_hz"] = 6.0
     heavy_frame = render_stage(heavy, ui=ui)
     assert heavy_frame.shape == frame.shape
+
+    # DRIVE / VIZ nerd tabs concatenate a wide panel; occupancy overlay is opt-in.
+    nerd = VizUI()
+    nerd.show_nerd = True
+    nerd.show_drive_tab()
+    drive_frame = render_stage(st, ui=nerd)
+    assert drive_frame.shape == (800, 1280 + nerd.nerd_width, 3)
+    tabs = {h.get("id") for h in nerd.nerd_hits if h.get("kind") == "tab"}
+    assert tabs == {"live", "drive", "viz", "keys"}
+    nerd.show_viz_tab()
+    nerd.debug.viz_dense = True
+    nerd.debug.apply_dense()
+    viz_frame = render_stage(st, ui=nerd)
+    assert viz_frame.shape == drive_frame.shape
+    nerd.show_nerd = False
+    nerd.layers = set()
+    dense = render_stage(st, ui=nerd)
+    nerd.debug.viz_occ = False
+    nerd.debug.viz_ids = False
+    nerd.debug.viz_vel = False
+    nerd.debug.viz_boxes = False
+    nerd.debug.viz_frustums = False
+    nerd.debug.viz_cost = False
+    sparse = render_stage(st, ui=nerd)
+    assert not np.array_equal(dense, sparse)
 
     print("test_gvd_viz_stage: OK")
 

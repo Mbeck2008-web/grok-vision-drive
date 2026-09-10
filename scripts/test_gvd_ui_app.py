@@ -159,7 +159,7 @@ def _check_opencv_lexicon() -> None:
             hit = re.search(pattern, low)
             assert hit is None, f"{name}: {label} found ({hit.group(0)!r})"
     for symbol in ("lane_draw_mode", "is_slowing", "is_halted", "is_hazard",
-                   "_draw_lanes", "_draw_edges", "_draw_signs", "_draw_chevrons",
+                   "_draw_lanes", "_draw_edges", "_draw_signs",
                    "_draw_stop_bar", "_draw_tracks"):
         assert symbol in stage, f"stage.py lost lexicon helper {symbol}"
     from python.viz.stage import is_halted, is_hazard, is_slowing, lane_draw_mode

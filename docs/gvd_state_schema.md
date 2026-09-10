@@ -37,7 +37,7 @@ Lua: `gvd_main.drawPath` on `onPreRender` / `onDebugDraw`. Engaged-only (Alt+A).
 ## M3 fields
 
 | `engaged` | bool | Mirrored from Alt+A via `gvd_engage.json` (Lua writes; Python reads) |
-| `disengage_reason` | string | `none` / `not_engaged` / `preview_blocked` / `heartbeat_stale` / `driver_override` / … |
+| `disengage_reason` | string | `none` / `not_engaged` / `preview_blocked` / `heartbeat_stale` / `driver_override` / … (sticky reasons live in `gvd_engage.json`) |
 | `actuator` | string | `beamngpy` (Tech) / `cmd_json` (retail: GELua applies) / `null` |
 | `cmd_seq` | int | Monotonic command sequence |
 | `cmd_applied` | bool | True when BeamNGpy `vehicle.control` ran, **or** the mod acked the seq via `gvd_ego.json` (fresh, `applying`) |
@@ -136,10 +136,35 @@ Path: `Documents/GVD/gvd_engage.json`, shared by GELua and Python.
 
 | Writer | Payload | When |
 | --- | --- | --- |
-| Lua (`gvd_main.toggleEngage`) | `{"engaged":true\|false,"mtime":<os.time() int>}` | Alt+A / GVD app button |
-| Python (`write_engage_flag`) | `{"engaged": false, "mtime": <time.time() float>}` | modular veto / stale heartbeat / `finally` on exit |
+| Lua (`gvd_main.writeEngageFile`) | `{"engaged":true\|false,"mtime":<os.time() int>,"disengage_reason":"<why>"}` | Alt+A / GVD app button, `driver_override`, `command_stream_dead`, `extension_unloaded` |
+| Python (`write_engage_flag`) | `{"engaged": false, "mtime": <time.time() float>, "disengage_reason": "<why>"}` | `driver_override` / modular veto / stale heartbeat / `finally` on exit |
 
-Python reads the file every tick and mirrors it into `engaged` (never invents engage). Lua polls it every 0.1 s **only while engaged** and adopts `engaged=false` when the file says so and `mtime` ≥ Lua's own last toggle stamp; it logs `[GVD] DISENGAGED by supervisor (<disengage_reason>)`, releases the vehicle inputs and refreshes the HUD/UI app. A file saying `true` never engages Lua — engage always starts in-game. Python also writes `false` on `driver_override` (sticky) and Lua writes `false` when its dead-man fires.
+Python reads the file every tick and mirrors it into `engaged` (never invents engage). Lua polls it every 0.1 s **only while engaged** and adopts `engaged=false` when the file says so and `mtime` ≥ Lua's own last toggle stamp; it logs `[GVD] DISENGAGED by supervisor (<disengage_reason>)`, releases the vehicle inputs and refreshes the HUD/UI app. A file saying `true` never engages Lua — engage always starts in-game. Both sides write `false` on `driver_override` (sticky, whichever sees it first) and Lua writes `false` when its dead-man fires. The file is the durable record of *why*: later supervisor ticks only see `engaged=false` and write the generic `not_engaged` into `disengage_reason`, so the mod keeps the reason it adopted for the HUD.
+
+## Driver override (force-feedback deadband)
+
+`config/control.yaml` `override:` owns the thresholds; the supervisor mirrors them into `override_cfg` every tick so `gvd_main` runs the same numbers without parsing YAML, and both sides share the maths (`python/control/override.py` / the `OVR` block in `main.lua`).
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `override_cfg.steer_deadband` | float | Subtractive deadband on the steer residual (0.10); the trip point is `steer_enter + steer_deadband` of lock |
+| `override_cfg.steer_enter` / `steer_clear` | float | Dwell charges above `enter` (0.55), discharges below `clear` (0.30), frozen between — the hysteresis band |
+| `override_cfg.steer_hold_s` | float | Residual must hold one direction this long (0.12 s); a sign flip discharges the dwell |
+| `override_cfg.steer_sign_flip_resets` | bool | Alternating residual is wheel chatter, not a driver |
+| `override_cfg.steer_cmd_max` | float | Steer channel bows out above this own-command magnitude (0.85), where the residual saturates against the ±1 clamp |
+| `override_cfg.brake_enter` / `throttle_enter` | float | Pedals: no deadband, no dwell (0.08 / 0.15 past the command) |
+| `override_cfg.pedal_hold_s` | float | 0.0 — a real pedal is an override on the tick it is seen |
+| `override_cfg.cmd_window_s` | float | Lookback for the applied-command envelope (0.30 s); also the warm-up after engage |
+| `override_cfg.ffb_assume_wheel` | bool | `true` = deadband on whenever engaged. GE Lua exposes no dependable FFB device type, so unknown still means on |
+| `override.channel` | string | `none` / `steer` / `brake` / `throttle` — what tripped it this tick |
+| `override.steer_raw` / `steer_residual` | float | Residual before / after the deadband |
+| `override.pedal_residual` | float | Pedal press beyond the command envelope |
+| `override.steer_held_s` | float | Current dwell |
+| `override.deadband_swallowed` | bool | There was a residual and the deadband read it as zero |
+| `override.steer_judged` | bool | False while GVD's own steer exceeds `steer_cmd_max` |
+| `override.armed` | bool | False during the `cmd_window_s` warm-up after engage |
+
+The driver signal is the electrics echo minus the envelope of commands GVD **actually applied** over `cmd_window_s`, so a gate hold riding along as `brake=1` and the echo lagging our own command by a tick are never read as a driver. On a trip both sides write `gvd_engage.json` `engaged=false` with `disengage_reason=driver_override` and stay off until Alt+A; the override tick also puts `driver_override` in `gvd_cmd.json` `reason`. Magnitudes are conservative first guesses (no research pin for FFB chatter yet) and live wheel behaviour is **UNPROVEN** until the Windows smoke.
 
 ## M6 — retail drive bus (`gvd_cmd.json` → vehicle, `gvd_ego.json` ← vehicle)
 
@@ -161,7 +186,7 @@ Lua (`gvd_main.applyCmdJson`, 20 Hz): `input.event('steering', s, 1)`; `input.ev
 | Field | Type | Notes |
 | --- | --- | --- |
 | `speed_mps` | float | `wheelspeed` (fallback `airspeed`) — feeds `ego.speed_mps`, TTC, speed plan |
-| `steering_input` / `throttle_input` / `brake_input` | float | Driver-override detection uses `steering_input` |
+| `steering_input` / `throttle_input` / `brake_input` | float | All three feed driver-override detection (steer through the deadband, pedals hard) |
 | `applied_seq` | int | Last cmd seq Lua applied |
 | `applying` | bool | Lua currently holds the inputs |
 | `mtime` | int | `os.time()`; Python uses the file mtime, fresh ≤ 1 s |

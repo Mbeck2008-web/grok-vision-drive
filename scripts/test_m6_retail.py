@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -259,18 +260,24 @@ def _run_supervisor(
     ack: bool = False,
     steer_echo: Callable[[int], float] | None = None,
     brake_bias: float = 0.0,
+    expect_disengage: str | None = None,
 ) -> str:
     """Run run_vision.py headless for `seconds`; optionally play the mod's ack role meanwhile.
 
     The fake mod echoes back what it was told to apply, exactly like `gvd_main` does, so the
     override residual is zero unless a test deliberately plays a driver: `steer_echo(seq)`
     reports a wheel position instead of the commanded one, `brake_bias` adds a pedal press.
+
+    `expect_disengage` is a `player_*` reason. When set, SIGKILL waits for
+    `[GVD] DISENGAGED: <reason>` — do not treat `cmd_applied` as done; that is already
+    true a few ticks after engage, before the dwell, and was the Verify FAIL on
+    `check_ffb_override_live`.
     """
     args = [sys.executable, "-u", str(ROOT / "python" / "run_vision.py"), "--backend", "stub", "--hz", "20", "--encode", "cpu", *extra]
     env = dict(os.environ, PYTHONPATH=str(ROOT))
     # PIPE only when a caller reads stdout. A full pipe freezes the supervisor on a
     # pending write_state — the Verify FAIL (engaged, cmd_json_pending).
-    want_out = steer_echo is not None or brake_bias > 0.0
+    want_out = steer_echo is not None or brake_bias > 0.0 or expect_disengage is not None
     proc = subprocess.Popen(
         args,
         cwd=str(ROOT),
@@ -278,7 +285,23 @@ def _run_supervisor(
         stdout=subprocess.PIPE if want_out else subprocess.DEVNULL,
         stderr=subprocess.STDOUT,
         text=True,
+        bufsize=1,
     )
+    chunks: list[str] = []
+    pump: threading.Thread | None = None
+    if proc.stdout is not None:
+        def _pump() -> None:
+            try:
+                for line in proc.stdout:
+                    chunks.append(line)
+            except Exception:
+                pass
+
+        pump = threading.Thread(target=_pump, daemon=True)
+        pump.start()
+
+    def _captured() -> str:
+        return "".join(chunks)
 
     def _ack_once() -> None:
         if not ack:
@@ -299,40 +322,54 @@ def _run_supervisor(
             brake_in=min(1.0, float(cmd.get("brake", 0.0)) + brake_bias),
         )
 
+    def _saw_disengage() -> bool:
+        if not expect_disengage:
+            return False
+        return f"DISENGAGED: {expect_disengage}" in _captured()
+
     t_end = time.time() + seconds
     try:
         while time.time() < t_end:
             if proc.poll() is not None:
-                out = proc.stdout.read() if proc.stdout else ""
-                raise AssertionError(f"run_vision exited early ({proc.returncode}):\n{out}")
+                if pump is not None:
+                    pump.join(timeout=1.0)
+                raise AssertionError(f"run_vision exited early ({proc.returncode}):\n{_captured()}")
             _ack_once()
             # Tighter than the 20 Hz supervisor loop so the echo always belongs to the newest seq.
             time.sleep(0.01)
         # Hold SIGKILL until write_state has seen the echo. Killing mid-tick left
         # cmd_applied=False / cmd_json_pending for check_run_vision_e2e.
-        if ack:
-            until = time.time() + 0.5
-            while time.time() < until:
-                if proc.poll() is not None:
-                    break
-                _ack_once()
+        # Override runs must not stop on cmd_applied: that flips true before the dwell.
+        grace = 1.5 if expect_disengage else (0.5 if ack else 0.0)
+        until = time.time() + grace
+        while time.time() < until:
+            if proc.poll() is not None:
+                break
+            _ack_once()
+            if _saw_disengage():
+                # print() is before write_state / the stop payload; wait for those files.
+                try:
+                    if json.loads(cmd_path().read_text(encoding="utf-8")).get("engaged") is False:
+                        break
+                except Exception:
+                    pass
+            if expect_disengage is None and ack:
                 try:
                     st = read_state() or {}
                     if st.get("cmd_applied") is True and st.get("cmd_reason") == "cmd_json_applied":
                         break
                 except Exception:
                     pass
-                time.sleep(0.01)
+            time.sleep(0.01)
     finally:
         proc.kill()  # SIGKILL: the `finally` stop never runs, so the last tick's files survive for assertions
         try:
             proc.wait(timeout=5)
         except Exception:
             pass
-    try:
-        return proc.stdout.read() if proc.stdout else ""
-    except Exception:
-        return ""
+        if pump is not None:
+            pump.join(timeout=1.0)
+    return _captured()
 
 
 def check_run_vision_e2e() -> None:
@@ -394,7 +431,13 @@ def check_ffb_override_live() -> None:
     # A driver actually holding the wheel over. The engage file is the durable record: later ticks
     # only see engaged=false and write the generic not_engaged.
     write_engage_flag(True)
-    out = _run_supervisor(["--allow-preview-drive"], seconds=3.0, ack=True, steer_echo=lambda _seq: 0.25)
+    out = _run_supervisor(
+        ["--allow-preview-drive"],
+        seconds=3.0,
+        ack=True,
+        steer_echo=lambda _seq: 0.25,
+        expect_disengage="player_steer",
+    )
     assert "DISENGAGED: player_steer" in out, out[-2000:]
     assert read_engage_flag(default=True) is False, "a real steer takeover must disengage"
     assert json.loads(engage_path().read_text(encoding="utf-8"))["disengage_reason"] == "player_steer"
@@ -404,7 +447,13 @@ def check_ffb_override_live() -> None:
 
     # Pedals stay tight: a brake press on top of the command is an override with no dwell.
     write_engage_flag(True)
-    out = _run_supervisor(["--allow-preview-drive"], seconds=2.0, ack=True, brake_bias=0.4)
+    out = _run_supervisor(
+        ["--allow-preview-drive"],
+        seconds=2.0,
+        ack=True,
+        brake_bias=0.4,
+        expect_disengage="player_brake",
+    )
     assert "DISENGAGED: player_brake" in out, out[-2000:]
     assert read_engage_flag(default=True) is False, "a real brake press must disengage"
     assert json.loads(engage_path().read_text(encoding="utf-8"))["disengage_reason"] == "player_brake"

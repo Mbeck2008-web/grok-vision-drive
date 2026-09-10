@@ -90,6 +90,60 @@ def _help_lines() -> list[str]:
     ]
 
 
+def _vehicle_line(s: dict[str, Any]) -> str:
+    """Tech vehicle row; empty on retail so the panel stays one-cam honest."""
+    veh = s.get("vehicle") if isinstance(s.get("vehicle"), dict) else {}
+    cap = str(s.get("capture_backend") or "")
+    if cap != "beamngpy" and not veh.get("connected") and not veh.get("vid"):
+        return ""
+    if not veh.get("connected"):
+        note = veh.get("note") or "not connected"
+        return f"vehicle {note}"
+    dmg = veh.get("damage")
+    dmg_s = f"{float(dmg):.2f}" if dmg is not None else "?"
+    pose = "pose ok" if veh.get("pose_ok") else "pose missing"
+    return (
+        f"vehicle {veh.get('vid') or '?'} {veh.get('model') or ''} "
+        f"dmg={dmg_s} {pose}"
+    ).strip()
+
+
+def _nav_line(s: dict[str, Any]) -> str:
+    """Tech GPS row; empty on retail so the panel stays one-cam honest."""
+    nav = s.get("nav") if isinstance(s.get("nav"), dict) else {}
+    cap = str(s.get("capture_backend") or "")
+    mode = str(nav.get("mode") or "missing")
+    gps = nav.get("gps") if isinstance(nav.get("gps"), dict) else {}
+    if mode != "hint" or not gps.get("ok"):
+        if cap == "beamngpy":
+            return "nav GPS missing"
+        return ""
+    try:
+        loc = f"{float(gps.get('lat')):.5f},{float(gps.get('lon')):.5f}"
+    except (TypeError, ValueError):
+        loc = "?"
+    bits = [f"nav hint {loc}"]
+    pin = nav.get("pin") if isinstance(nav.get("pin"), dict) else None
+    if pin:
+        name = str(pin.get("name") or "pin")
+        rng = nav.get("range_m")
+        if rng is not None:
+            try:
+                bits.append(f"{name} {float(rng):.0f}m")
+            except (TypeError, ValueError):
+                bits.append(name)
+        else:
+            bits.append(name)
+        rel = nav.get("bearing_rel_deg")
+        if rel is not None:
+            try:
+                bits.append(f"brg {float(rel):+.0f}deg")
+            except (TypeError, ValueError):
+                pass
+        bits.append("not routing")
+    return " ".join(bits)
+
+
 def _lines(s: dict[str, Any]) -> list[str]:
     ego = s.get("ego") or {}
     pl = s.get("planner") or {}
@@ -112,6 +166,8 @@ def _lines(s: dict[str, Any]) -> list[str]:
             pred_y = float(lead.get("y", 0)) + float(lead.get("speed_mps", 0)) * t
             miss_m = abs(float(lead.get("x", 0)))
             sel.append(f"miss@{t}s={miss_m:.1f}m (lead y~{pred_y:.0f})")
+    veh_line = _vehicle_line(s)
+    nav_line = _nav_line(s)
     return [
         f"policy: {s.get('policy', '?')}   engage: {s.get('engaged')}",
         f"disengage: {s.get('disengage_reason', 'none')}",
@@ -129,6 +185,8 @@ def _lines(s: dict[str, Any]) -> list[str]:
         f"path_conf {s.get('path_conf', 0):.2f}  width {s.get('path_width', 0):.2f}  preview={s.get('path_debug_preview')}",
         f"scene {s.get('viz_scene_note') or scene_note(s)}",
         f"cmd {s.get('actuator', '?')} {s.get('cmd_reason', '?')} applied={s.get('cmd_applied')} ego={s.get('ego_source', '?')}",
+        *([veh_line] if veh_line else []),
+        *([nav_line] if nav_line else []),
         f"clip {s.get('last_clip_trigger', 'none')}",
         *sel,
         "missing: " + (", ".join(miss) if miss else "none"),

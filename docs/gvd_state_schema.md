@@ -44,11 +44,25 @@ Lua: `gvd_main.drawPath` on `onPreRender` / `onDebugDraw`. Engaged-only (Alt+G).
 | `cmd_reason` | string | Gate / plan reason; `cmd_json_applied` (acked) / `cmd_json_pending` (written, no ack) / `cmd_json_idle` (not engaged) |
 | `ego.speed_mps` | float | From Electrics `wheelspeed`/`airspeed` (BeamNGpy) or the mod's `gvd_ego.json` echo; else last known (not invented 10) |
 | `ego.throttle` / `ego.brake` | float | Last commanded values |
+| `ego.yaw_rate` / `ego.accel` | float | Tech: yaw from consecutive pose dirs; accel from GForces gx/gy. Else 0 |
 | `ego_source` | string | `beamngpy` / `lua` (gvd_ego.json fresh) / `none` — M6 |
 | `cmd_ack_seq` | int | Last `applied_seq` echoed by the mod (-1 none) — M6 |
 | `lua_applying` | bool | Mod currently holds the player vehicle's inputs — M6 |
+| `vehicle.vid` / `model` | string? | Tech player vehicle when connected |
+| `vehicle.connected` | bool | BeamNGpy vehicle handle is live |
+| `vehicle.damage` | float? | Ground-truth Damage sensor; null when missing |
+| `vehicle.gear` / `rpm` | | Electrics extras |
+| `vehicle.pose_ok` | bool | `pos` + `dir` present for `path_world` |
+| `vehicle.sensors` | dict | `electrics`/`damage`/`gforces`/`gps` → `ok`/`missing` |
+| `nav.mode` | string | `missing` (retail / no GPS fix) / `hint` (Tech lat/lon). Never `route` until a planner exists |
+| `nav.drive_to_pin` | bool | Always `false` today — pin is a hint, not a route |
+| `nav.gps` | `{lat,lon,x,y,ok}` or null | BeamNGpy GPS; BeamNG maps have no real-world lat/lon (`config/tech.yaml` `gps.ref_*` is world origin) |
+| `nav.pin` | `{lat,lon,name}` or null | Destination from `nav.pin_*` / `GVD_NAV_PIN_*`; empty until you drop a pin |
+| `nav.range_m` / `bearing_deg` | float? | Haversine range; bearing clockwise from north |
+| `nav.bearing_rel_deg` | float? | Pin vs heading (−180..180, + = right). Heading from GPS motion or world `dir` |
 
 Also: `Documents/GVD/gvd_cmd.json` = `{steer,throttle,brake,seq,engaged,heartbeat_mtime,reason}` (see M6 below).
+`config/tech.yaml` owns host/port/home, wait-for-vehicle, vehicle-data sensors, GPS origin, and the optional nav pin (RGB cameras stay in `cameras.yaml`).
 
 
 ## M4 fields

@@ -333,18 +333,23 @@ class BeamNGPyBackend:
 
     name = "beamngpy"
 
-    def __init__(self, long_side: int | None = None, config: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        long_side: int | None = None,
+        config: dict[str, Any] | None = None,
+        tech_config: dict[str, Any] | None = None,
+    ) -> None:
         self.long_side = long_side or load_live_long_side()
         self.config = config or load_camera_config()
+        from python.sensors.tech import TechSession, load_tech_config
+
+        self.session = TechSession(tech_config if tech_config is not None else load_tech_config())
         self._sensors: dict[str, Any] = {}
-        self._vehicle = None
-        self._bng = None
         self._logged = False
         self._ok = False
 
     def open(self) -> None:
         try:
-            from beamngpy import BeamNGpy  # type: ignore
             from beamngpy.sensors import Camera  # type: ignore
         except Exception as e:
             if not self._logged:
@@ -353,43 +358,32 @@ class BeamNGPyBackend:
             self._ok = False
             return
 
-        if os.environ.get("GVD_BEAMNG", "").strip().lower() not in ("1", "true", "yes"):
-            if not self._logged:
-                print(
-                    "[GVD] beamngpy importable; set GVD_BEAMNG=1 to attach color Cameras. "
-                    "cam_health=missing until then (no fake frames)."
-                )
-                self._logged = True
+        if not self.session.connect(explicit=True):
             self._ok = False
+            self._logged = True
             return
 
-        host = os.environ.get("GVD_BEAMNG_HOST", "localhost")
-        port = int(os.environ.get("GVD_BEAMNG_PORT", "25252"))
-        home = os.environ.get("BNG_HOME") or os.environ.get("BEAMNG_HOME")
         try:
-            bng = BeamNGpy(host, port, home=home) if home else BeamNGpy(host, port)
-            # Connect to already-running Tech; do not launch a second instance by default
-            bng.open(launch=False)
-            self._bng = bng
+            self.session.attach_vehicle_sensors()
         except Exception as e:
-            if not self._logged:
-                print(f"[GVD] beamngpy connect failed ({e}); cam_health=missing. Is BeamNG.tech listening on {host}:{port}?")
-                self._logged = True
-            self._ok = False
-            return
+            print(f"[GVD] tech vehicle sensors: {e}")
 
-        vehicle = self._resolve_vehicle(bng)
-        if vehicle is None:
-            if not self._logged:
-                print("[GVD] beamngpy: no vehicle to attach Cameras; cam_health=missing.")
-                self._logged = True
+        vehicle = self.session.vehicle
+        bng = self.session.bng
+        cam_cfg = self.session.config.get("cameras") if isinstance(self.session.config.get("cameras"), dict) else {}
+        if cam_cfg.get("attach", True) is False:
             self._ok = False
+            print("[GVD] tech.yaml cameras.attach=false; cam_health=missing.")
+            self._logged = True
             return
-        self._vehicle = vehicle
 
         cams = list(self.config.get("cameras") or [])
         origin = self.config.get("origin_offset") or [0.0, 0.0, 0.0]
         attached = 0
+        update_s = float(cam_cfg.get("update_s") or 0.067)
+        shmem = bool(cam_cfg.get("shared_memory", True))
+        streaming = bool(cam_cfg.get("streaming", True))
+        rgb_only = bool(cam_cfg.get("rgb_only", True))
         for spec in cams:
             cid = str(spec.get("id") or "")
             if not cid or cid not in CAM_IDS:
@@ -400,8 +394,8 @@ class BeamNGPyBackend:
                 yaw = float(spec.get("yaw_deg") or 0.0)
                 pitch = float(spec.get("pitch_deg") or 0.0)
                 direction, up = yaw_pitch_to_dir_up(yaw, pitch)
+                pos_bng, dir_bng, up_bng = self.session.camera_mount(pos, direction, up)
                 res = list(spec.get("live_res") or [640, 480])
-                # clamp long side
                 rw, rh = int(res[0]), int(res[1])
                 if max(rw, rh) > self.long_side:
                     scale = self.long_side / float(max(rw, rh))
@@ -411,17 +405,18 @@ class BeamNGPyBackend:
                     f"gvd_{cid}",
                     bng,
                     vehicle,
-                    pos=tuple(pos),
-                    dir=direction,
-                    up=up,
+                    requested_update_time=update_s,
+                    pos=pos_bng,
+                    dir=dir_bng,
+                    up=up_bng,
                     field_of_view_y=fov_v,
                     resolution=(rw, rh),
-                    is_using_shared_memory=True,
-                    is_streaming=True,
+                    is_using_shared_memory=shmem,
+                    is_streaming=streaming,
                     is_render_colours=True,
-                    is_render_annotations=False,
+                    is_render_annotations=not rgb_only,
                     is_render_instance=False,
-                    is_render_depth=False,
+                    is_render_depth=not rgb_only,
                     is_snapping_desired=False,
                     is_visualised=False,
                 )
@@ -433,38 +428,26 @@ class BeamNGPyBackend:
         self._ok = attached > 0
         if not self._logged:
             if self._ok:
-                print(f"[GVD] beamngpy attached {attached} color Camera(s) from cameras.yaml (depth/semantic OFF).")
+                print(
+                    f"[GVD] beamngpy attached {attached} color Camera(s) from cameras.yaml "
+                    f"(GVD→BeamNG vehicle-space convert; depth/semantic OFF)."
+                )
             else:
                 print("[GVD] beamngpy: zero Cameras attached; cam_health=missing.")
             print("[GVD] note: live BeamNG frame grab still needs Windows Tech smoke if this host cannot render.")
             self._logged = True
 
-    def _resolve_vehicle(self, bng: Any) -> Any:
-        """Return an already-spawned vehicle from the Tech session, or None (honest miss)."""
-        try:
-            current = bng.vehicles.get_current()
-            if isinstance(current, dict) and current:
-                for _name, veh in current.items():
-                    try:
-                        if hasattr(veh, "is_connected") and not veh.is_connected():
-                            if hasattr(bng, "connect_vehicle"):
-                                bng.connect_vehicle(veh)
-                    except Exception:
-                        pass
-                    return veh
-        except Exception:
-            pass
-        # Do not invent a disconnected Vehicle("gvd_ego") — that never attached Cameras.
-        return None
-
     @property
     def vehicle(self):
         """Player vehicle handle when attached (M3 actuation / Electrics)."""
-        return self._vehicle
+        return self.session.vehicle
 
     @property
     def bng(self):
-        return self._bng
+        return self.session.bng
+
+    def poll_vehicle(self):
+        return self.session.poll()
 
     def close(self) -> None:
         for cam in list(self._sensors.values()):
@@ -476,16 +459,7 @@ class BeamNGPyBackend:
                 except Exception:
                     pass
         self._sensors.clear()
-        if self._bng is not None:
-            try:
-                self._bng.disconnect()
-            except Exception:
-                try:
-                    self._bng.close()
-                except Exception:
-                    pass
-        self._bng = None
-        self._vehicle = None
+        self.session.close()
         self._ok = False
 
     def grab(self) -> CameraFrameBundle:
@@ -545,12 +519,9 @@ class BeamNGPyBackend:
 def resolve_backend_name(requested: str | None = None) -> str:
     if requested and requested != "auto":
         return requested
-    try:
-        import beamngpy  # noqa: F401
-
+    # Do not pick Tech just because beamngpy is importable — that needs a live Tech session.
+    if os.environ.get("GVD_BEAMNG", "").strip().lower() in ("1", "true", "yes"):
         return "beamngpy"
-    except Exception:
-        pass
     try:
         import bettercam  # noqa: F401
 

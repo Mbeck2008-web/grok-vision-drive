@@ -54,7 +54,7 @@ if errorlevel 1 (
 :supervisor
 echo [GVD] Starting supervisor: %RUN%  (backend=%GVD_BACKEND%)
 echo [GVD] Retail = 1 window capture, main cam only. Engage drives the car via gvd_cmd.json -^> mod Lua.
-echo [GVD] 8-cam rig + BeamNGpy direct control need BeamNG.tech (Tech path, preferred).
+echo [GVD] 8-cam rig + BeamNGpy direct control need BeamNG.tech — use play_gvd_tech.bat when you have it.
 rem cmd /k keeps the supervisor console open so errors stay readable.
 start "GVD supervisor" /D "%RUNROOT%" cmd /k %PY% "%RUN%" --backend %GVD_BACKEND% --viz %*
 

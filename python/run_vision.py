@@ -21,6 +21,7 @@ from python.control.actuate import (
     stop_command,
     write_engage_flag,
 )
+from python.sensors.tech import VehicleData, apply_nav_missing, nav_snapshot, path_ego_to_world, run_probe
 from python.control.e2e import make_e2e
 from python.control.override import (
     OverrideDetector,
@@ -86,53 +87,28 @@ def _gpu_vram_used_gb() -> float:
 
 
 
-def _path_world_from_vehicle(path_ego: list, vehicle) -> list[dict[str, float]] | None:
-    """Kinematics-only world path from BeamNGpy vehicle pose (honesty: not a map)."""
+def _path_world_from_vehicle(path_ego: list, vehicle, vdata: VehicleData | None = None) -> list[dict[str, float]] | None:
+    """Kinematics-only world path from Tech pose (honesty: not a map)."""
+    if vdata is not None and vdata.pose_ok:
+        return path_ego_to_world(path_ego, vdata.pos, vdata.dir, vdata.up)
     if not path_ego or vehicle is None:
         return None
     try:
-        # BeamNGpy Vehicle: state poll
         pos = None
         fwd = None
         up = None
         if hasattr(vehicle, "state") and isinstance(vehicle.state, dict):
             pos = vehicle.state.get("pos")
-            # dir may be missing
-        if pos is None and hasattr(vehicle, "get_position"):
-            pos = vehicle.get_position()
-        if pos is None:
-            return None
-        # Prefer sensor/state vectors when present — never invent forward (honesty)
-        if hasattr(vehicle, "state") and isinstance(vehicle.state, dict):
             fwd = vehicle.state.get("dir") or vehicle.state.get("forward")
             up = vehicle.state.get("up")
-        if fwd is None:
+        if pos is None and hasattr(vehicle, "get_position"):
+            pos = vehicle.get_position()
+        if pos is None or fwd is None:
             return None
-        if up is None:
-            up = (0.0, 0.0, 1.0)
-        px, py, pz = float(pos[0]), float(pos[1]), float(pos[2])
-        fx, fy, fz = float(fwd[0]), float(fwd[1]), float(fwd[2])
-        ux, uy, uz = float(up[0]), float(up[1]), float(up[2])
-        # right = fwd × up
-        rx = fy * uz - fz * uy
-        ry = fz * ux - fx * uz
-        rz = fx * uy - fy * ux
-        import math
-        def _n(x, y, z):
-            L = math.sqrt(x * x + y * y + z * z) + 1e-9
-            return x / L, y / L, z / L
-        fx, fy, fz = _n(fx, fy, fz)
-        ux, uy, uz = _n(ux, uy, uz)
-        rx, ry, rz = _n(rx, ry, rz)
-        out = []
-        for p in path_ego:
-            ex, ey, ez = float(p.get("x", 0)), float(p.get("y", 0)), float(p.get("z", 0))
-            out.append({
-                "x": px + rx * ex + fx * ey + ux * ez,
-                "y": py + ry * ex + fy * ey + uy * ez,
-                "z": pz + rz * ex + fz * ey + uz * ez,
-            })
-        return out
+        p = (float(pos[0]), float(pos[1]), float(pos[2]))
+        d = (float(fwd[0]), float(fwd[1]), float(fwd[2]))
+        u = (float(up[0]), float(up[1]), float(up[2])) if up is not None else (0.0, 0.0, 1.0)
+        return path_ego_to_world(path_ego, p, d, u)
     except Exception:
         return None
 
@@ -233,10 +209,21 @@ def main() -> None:
         help="GVD VISION monitor: auto|1|2 (or GVD_VIZ_MONITOR). auto→non-primary if present",
     )
     ap.add_argument("--viz-fullscreen", action="store_true", help="Fullscreen GVD VISION on chosen monitor")
+    ap.add_argument(
+        "--tech-probe",
+        action="store_true",
+        help="Connect to BeamNG.tech, poll vehicle electrics/pose/damage, exit. No fake cameras.",
+    )
     args = ap.parse_args()
 
     if args.vision_only:
         os.environ["GVD_VISION_ONLY"] = "1"
+
+    if args.tech_probe:
+        raise SystemExit(run_probe())
+
+    if args.backend == "beamngpy":
+        os.environ["GVD_BEAMNG"] = "1"
 
     if args.smoke:
         out = smoke(use_perception=True)
@@ -307,9 +294,14 @@ def main() -> None:
 
     vehicle = getattr(backend, "vehicle", None)
     bng = getattr(backend, "bng", None)
-    if vehicle is not None:
+    if vehicle is not None and not getattr(backend, "session", None):
         attach_electrics(vehicle, bng)
     actuator = make_actuator(vehicle, prefer_beamngpy=True)
+    if backend_name == "beamngpy" and actuator.name != "beamngpy":
+        print(
+            "[GVD] Tech did not yield a vehicle.control handle; falling back to cmd_json "
+            "(mod Lua). Cameras may still be missing until a vehicle is spawned."
+        )
     e2e_policy = make_e2e()
     shadow_cfg = load_shadow_config(_ctrl_yaml)
     override_cfg = load_override_config(_ctrl_yaml)
@@ -339,7 +331,7 @@ def main() -> None:
     print(f"[GVD] M5 policy={args.policy} e2e={e2e_policy.name} (modular vetoes E2E; shadow writes both)")
     print(f"[GVD] clip encoder={recorder.encoder} (qsv prefer; never default nvenc)")
     print(f"[GVD] state path: {state_path()}")
-    print("[GVD] Vision-only: no LiDAR/radar/GPS-loc/HD-map in the live loop.")
+    print("[GVD] Vision-only: no LiDAR/radar/ultrasonic/HD-map in the live loop. Tech GPS is a nav hint (not localization; pin is not a route).")
     print("[GVD] M3: no drive on preview unless --allow-preview-drive; engage via Alt+G (gvd_engage.json).")
     print("[GVD] M4: clips on disengage / AEB / near-miss / key C. Live QSV UNPROVEN until Windows smoke.")
     print(
@@ -401,9 +393,30 @@ def main() -> None:
             ego_v = last_ego_v
             ego_source = "none"
             ego_fb = None
+            vdata = None
+            if hasattr(backend, "poll_vehicle"):
+                try:
+                    vdata = backend.poll_vehicle()
+                except Exception:
+                    vdata = None
             el = read_electrics_inputs(vehicle)
             spd, steer_in = el.speed_mps, el.steering_input
             throttle_in, brake_in = el.throttle_input, el.brake_input
+            yaw_rate = 0.0
+            accel = 0.0
+            if vdata is not None and vdata.connected:
+                if vdata.speed_mps is not None:
+                    spd = vdata.speed_mps
+                if vdata.steering_input is not None:
+                    steer_in = vdata.steering_input
+                if vdata.throttle_input is not None:
+                    throttle_in = vdata.throttle_input
+                if vdata.brake_input is not None:
+                    brake_in = vdata.brake_input
+                if vdata.yaw_rate is not None:
+                    yaw_rate = float(vdata.yaw_rate)
+                if vdata.accel is not None:
+                    accel = float(vdata.accel)
             if spd is not None or steer_in is not None:
                 ego_source = "beamngpy"
             if vehicle is None:
@@ -523,6 +536,21 @@ def main() -> None:
             st["ego"]["steer_deg"] = steer
             st["ego"]["throttle"] = float(applied.throttle)
             st["ego"]["brake"] = float(applied.brake)
+            st["ego"]["yaw_rate"] = float(yaw_rate)
+            st["ego"]["accel"] = float(accel)
+            if vdata is not None:
+                st["vehicle"] = {
+                    "vid": vdata.vid,
+                    "model": vdata.model,
+                    "connected": bool(vdata.connected),
+                    "damage": vdata.damage,
+                    "gear": vdata.gear,
+                    "rpm": vdata.rpm,
+                    "pose_ok": bool(vdata.pose_ok),
+                    "sensors": dict(vdata.sensors),
+                    "note": vdata.note,
+                }
+            st["nav"] = nav_snapshot(vdata)
             st["path_ego"] = pout.path_ego if pout.path_ego else steer_preview_path_ego(steer, length_m=36.0)
             if not pout.path_ego:
                 st["path_debug_preview"] = True
@@ -539,7 +567,7 @@ def main() -> None:
                 st["show_agent_ghosts"] = True
             if "show_path" in prefs:
                 st["gvd_show_path"] = bool(prefs["show_path"])
-            pw = _path_world_from_vehicle(st.get("path_ego") or [], vehicle)
+            pw = _path_world_from_vehicle(st.get("path_ego") or [], vehicle, vdata)
             if pw:
                 st["path_world"] = pw
 
@@ -593,6 +621,7 @@ def main() -> None:
             st["missing_state_keys"] = sorted(set(base_miss + miss))
             if pout.path_debug_preview is False:
                 st["missing_state_keys"] = [m for m in st["missing_state_keys"] if "path_ego" not in m]
+            st["missing_state_keys"] = apply_nav_missing(st["missing_state_keys"], st.get("nav"))
             st["heartbeat_ms"] = (time.perf_counter() - loop_t0) * 1000.0
 
             # M4 ring + triggers

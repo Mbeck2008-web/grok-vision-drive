@@ -87,8 +87,11 @@ def check_release_zip() -> None:
             for bad in (".onnx", ".pt", ".safetensors", ".pyc", ".mp4"):
                 assert not any(r.endswith(bad) for r in rels), bad
             assert not any(r.startswith((".git/", "data/", "dist/", "scripts/")) for r in rels)
-            assert not any("clips" in r for r in rels)
             assert "requirements-beamng.txt" not in rels
+            assert "play_gvd_tech.bat" not in rels  # Tech launcher stays out of the retail zip
+            assert "config/tech.yaml" in rels
+            assert "python/sensors/tech.py" in rels
+            assert not any("clips" in r for r in rels)
             assert "requirements-perception.txt" not in rels
             assert "requirements-viz.txt" not in rels
             # Mod entry point + UI icon survive; tests do not.
@@ -546,10 +549,10 @@ def check_no_chrome() -> None:
             text = f.read_text(encoding="utf-8", errors="ignore")
             assert not CHROME_RE.search(text), f"chrome in {f.relative_to(ROOT)}"
     # Launchers and the release tooling banner.
-    for f in ("install.bat", "uninstall.bat", "play_gvd.bat", "requirements-retail.txt"):
+    for f in ("install.bat", "uninstall.bat", "play_gvd.bat", "play_gvd_tech.bat", "requirements-retail.txt"):
         assert not CHROME_RE.search((ROOT / f).read_text(encoding="utf-8", errors="ignore")), f
     # Runtime strings players see (titles, prints); docstrings/comments may still state the honesty rule.
-    for f in [ROOT / "python" / "run_vision.py", ROOT / "python" / "runtime" / "hw_probe.py", *(ROOT / "python" / "viz").glob("*.py")]:
+    for f in [ROOT / "python" / "run_vision.py", ROOT / "python" / "runtime" / "hw_probe.py", ROOT / "python" / "sensors" / "tech.py", *(ROOT / "python" / "viz").glob("*.py")]:
         for s in _py_string_literals(f):
             assert not CHROME_RE.search(s), f"chrome string in {f.relative_to(ROOT)}: {s!r}"
     # Release VERSION.txt banner only names the honesty rule, never a product label.
@@ -565,7 +568,8 @@ def check_player_docs() -> None:
     assert "requirements-retail.txt" in readme
     # Retail drives via the cmd JSON bus; the old "cannot drive" wording must be gone everywhere players look.
     assert "gvd_cmd.json" in readme and "gvd_ego.json" in readme
-    for f in (ROOT / "README.md", ROOT / "play_gvd.bat", ROOT / "scripts" / "make_release_zip.py",
+    assert "play_gvd_tech.bat" in readme and "tech.yaml" in readme
+    for f in (ROOT / "README.md", ROOT / "play_gvd.bat", ROOT / "play_gvd_tech.bat", ROOT / "scripts" / "make_release_zip.py",
               ROOT / "python" / "run_vision.py", ROOT / "docs" / "gvd_state_schema.md"):
         text = f.read_text(encoding="utf-8", errors="ignore").lower()
         for bad in ("cannot drive", "does not steer", "does not drive", "no-op sink", "never steers"):

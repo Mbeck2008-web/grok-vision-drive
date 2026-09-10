@@ -1,7 +1,8 @@
 # GVD 8-cam rig (toy analogues of an HW3-class windshield/pillar/repeater/rear layout).
-# BeamNG vehicle frame: +X right, +Y forward, +Z up. Positions are drafts — calibrate on ETK800.
-# Comments say "toy analogue of …", never "Tesla camera".
-# BeamNGpy uses FOV_v (field_of_view_y). live_res long side ≤ hardware.live_input_long_side (640).
+# Positions are GVD vehicle frame: +X right, +Y forward, +Z up (drafts — calibrate on ETK800).
+# BeamNGpy Camera vehicle space is +X left, +Y backward, +Z up; python/sensors/tech.py converts
+# at attach (config/tech.yaml cameras.convert_gvd_frame). Comments say "toy analogue of …",
+# never a vendor camera name. BeamNGpy uses FOV_v (field_of_view_y). live_res long side ≤ 640.
 origin_offset: [0.0, 0.0, 0.0]
 cameras:
   - id: narrow

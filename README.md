@@ -6,7 +6,7 @@ Entertainment only. Never use this stack to control a physical car.
 
 ## Honesty (M0)
 
-- **Vision only** at inference (RGB cams + ego kinematics + coarse nav hint). No LiDAR / radar / ultrasonic / GPS-as-localization at runtime.
+- **Vision only** at inference (RGB cams + ego kinematics + coarse nav hint). No LiDAR / radar / ultrasonic. Tech GPS is a nav hint for a future map pin, not camera localization, and not a route — the corridor planner ignores the pin for now.
 - **Tech path** (preferred): BeamNGpy Camera sensors, 8-cam rig, BeamNGpy `vehicle.control`. **Retail path**: window-capture fallback for a **single** main view — do not pretend that is 8 cameras. Retail **drives** through the mod: Python writes `Documents/GVD/gvd_cmd.json`, GELua applies it to the player vehicle with the same vehicle-Lua `input.event` calls BeamNG's own AI uses (no DLL, no hooks), and echoes speed/inputs back via `gvd_ego.json`.
 - Default GPU profile: **NVIDIA GTX 1080 Ti (11 GB)**. Live stack must share the card with BeamNG.
 - Not Tesla FSD. No Tesla logos. Repository title stays free of “FSD”. “Vision Drive” / “camera autopilot toy” are fine.
@@ -57,6 +57,20 @@ Files: `Documents\GVD\{gvd_state.json, gvd_engage.json, gvd_cmd.json, gvd_ego.js
 
 Troubleshooting: mod missing in Mod Manager → run `install.bat` again and check the path it prints. “Python not found” → install Python 3 with *Add to PATH*. “Missing Python packages” → answer `Y` or run `pip install -r requirements-retail.txt`. No `cam_main` PIP / `capture_note` says *fullscreen/monitor* → make the BeamNG window visible with **BeamNG** in its title, or run fullscreen; `window via unavailable` → `pip install mss`. HUD stays `ON`, never `DRIVE` → GVD only drives once it sees both lane lines (nerd panel `lane` conf, `preview=`); `--allow-preview-drive` follows the steer-preview path instead (debug only). `DRIVE` but the car does nothing → nerd panel `cmd` line: `cmd_json_pending` means the mod is not acking (mod not enabled, no player vehicle, or the supervisor is engaged while the game is not). Boot refuses (`REFUSE: dGPU VRAM … < 10 GB while BeamNG is up`) → `play_gvd.bat --vision-only` (drops the GPU guard, nothing else).
 
+## Tech path (when you have BeamNG.tech)
+
+There is still no retail mod that creates those eight cameras. Once `tech.key` is in the **Tech install directory** (not the user folder), GVD already knows how to attach them and pull vehicle data.
+
+1. `install.bat` copies the Lua mod into Drive `current\mods` and, if present, `%LOCALAPPDATA%\BeamNG.tech\current\mods`.
+2. `pip install -r requirements-beamng.txt` (BeamNGpy version must match Tech: **0.38 → 1.35.x**, **0.39 → 1.36**).
+3. Set `BNG_HOME` to the Tech install folder. Edit `config\tech.yaml` for host/port/`wait_vehicle_s` if needed.
+4. Start BeamNG.tech, spawn a vehicle (ETK800 is the camera-draft car), enable GVD in Mod Manager.
+5. Double-click `play_gvd_tech.bat` (or `python python/run_vision.py --backend beamngpy --viz`). That sets `GVD_BEAMNG=1`, attaches the 8 RGB cameras from `cameras.yaml` (GVD frame converted to BeamNG vehicle space), **Electrics / Damage / GForces** plus pose, and a **GPS nav hint** (lat/lon). Optional destination: set `nav.pin_lat` / `nav.pin_lon` in `config/tech.yaml` (or `GVD_NAV_PIN_LAT` / `GVD_NAV_PIN_LON`) for range and bearing. **No LiDAR, radar, or ultrasonic.** GPS is not localization and **not a route** (the corridor planner ignores the pin for now).
+6. Probe without driving: `python python/run_vision.py --tech-probe`.
+7. Engage is still Alt+G. Drive is BeamNGpy `vehicle.control` on the player vehicle (`actuator=beamngpy`). Ego speed/steer/pedals come from Electrics; the world ribbon uses pose × `path_ego`.
+
+Live Tech attach is **UNPROVEN** until a Windows smoke. `--backend auto` does **not** pick Tech just because beamngpy is installed — only `GVD_BEAMNG=1` or `--backend beamngpy`.
+
 ## Release zip (M6)
 
 Windows: double-click `scripts\make_release_zip.bat`. Anywhere: `python scripts/make_release_zip.py`. Output: `dist\gvd-retail-<version>.zip` (gitignored), `<version>` = exact git tag if any, else `m6-<sha>[-dirty]`; override with `--version v0.6.0`, `--out path`, `--flat` (no top-level folder), `--list` (manifest only).
@@ -66,7 +80,7 @@ Packs: `install.bat`, `uninstall.bat`, `play_gvd.bat`, `beamng_mod/`, `python/` 
 ## Layout
 
 ```
-install.bat / uninstall.bat / play_gvd.bat
+install.bat / uninstall.bat / play_gvd.bat / play_gvd_tech.bat
 beamng_mod/          → copied to %LOCALAPPDATA%\BeamNG.drive\<ver>\mods\unpacked\gvd
 python/              → also copied to %USERPROFILE%\Documents\GVD\python
 config/              → also copied to %USERPROFILE%\Documents\GVD\config
@@ -160,7 +174,7 @@ Default `--backend auto`: beamngpy if importable → else window → else stub. 
 
 Window capture prefers a visible window whose title contains **BeamNG** (Win32 / wmctrl). If none is found, it falls back to the primary monitor — use **fullscreen BeamNG** in that case (`capture_note` says so).
 
-Tech path: `GVD_BEAMNG=1` attaches color-only BeamNGpy `Camera` sensors from `config/cameras.yaml` to the current vehicle (`GVD_BEAMNG_HOST`/`PORT`, optional `BNG_HOME`). Depth/semantic stay OFF. Live smoke still **UNPROVEN on Linux**.
+Tech path: `GVD_BEAMNG=1` (or `--backend beamngpy` / `play_gvd_tech.bat`) attaches color-only BeamNGpy `Camera` sensors from `config/cameras.yaml` to the player vehicle, converting GVD frame (+X right, +Y forward) into BeamNG Camera vehicle space. Depth/semantic stay OFF. The same session attaches Electrics, Damage, GForces, and GPS (`config/tech.yaml`) — GPS is a nav hint (lat/lon + optional pin), not LiDAR/radar and not a route. Live smoke still **UNPROVEN on Linux**.
 
 Live start **refuses** (exit 1) if probed dGPU VRAM &lt; 10 GB while BeamNG is running, unless `--vision-only`.
 
@@ -169,7 +183,7 @@ BIOS (Windows): enable **iGPU Multi-Monitor** so UHD 630 QSV exists while 1080 T
 
 ## Perception (M2)
 
-Vision-only: no LiDAR/radar/GPS-loc/HD-map in the live loop. Inspired by VisionPilot / Apollo camera-pipeline *names* — reimplemented tiny in-repo (not a vendor fork). Forecasts stay CV/CYR toys.
+Vision-only: no LiDAR/radar/ultrasonic/HD-map in the live loop. Tech GPS is a coarse nav hint (not localization; the corridor planner ignores the pin for now). Inspired by VisionPilot / Apollo camera-pipeline *names* — reimplemented tiny in-repo (not a vendor fork). Forecasts stay CV/CYR toys.
 
 ```bash
 pip install -r requirements.txt

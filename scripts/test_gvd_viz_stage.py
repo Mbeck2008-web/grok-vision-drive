@@ -27,7 +27,7 @@ def main() -> None:
             assert hit is None, f"{name}: {label} found ({hit.group(0)!r})"
     assert "GVD" in stage_src and "VISION" in stage_src
 
-    from python.viz.nerd import scene_note
+    from python.viz.nerd import _nav_line, scene_note
     from python.viz.stage import (
         VizUI,
         in_path,
@@ -72,6 +72,21 @@ def main() -> None:
     })
     assert "2 seen" in note and "1 pred" in note and "1 stub" in note
     assert "edges pred" in note and "2 signs" in note and "1 pole" in note
+    assert _nav_line({"capture_backend": "window", "nav": {"mode": "missing"}}) == ""
+    hint = _nav_line(
+        {
+            "capture_backend": "beamngpy",
+            "nav": {
+                "mode": "hint",
+                "gps": {"lat": 53.09, "lon": 8.81, "ok": True},
+                "pin": {"lat": 53.10, "lon": 8.82, "name": "west gate"},
+                "range_m": 1234.0,
+                "bearing_rel_deg": 45.0,
+            },
+        }
+    )
+    assert "nav hint" in hint and "west gate" in hint and "not routing" in hint
+    assert _nav_line({"capture_backend": "beamngpy", "nav": {"mode": "missing"}}) == "nav GPS missing"
 
     import numpy as np
 

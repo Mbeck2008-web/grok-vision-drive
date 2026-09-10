@@ -1520,12 +1520,18 @@ end
 function M.onExtensionLoaded()
   gvdDocsDir()  -- resolve + log once
   readUiPrefs()
-  -- Soft: keyboard.diff / actions load race — reload bindings after gvd actions are present
+  -- Soft: keyboard.diff / actions load race - reload actions, then bindings,
+  -- so Alt+G has a valid ActionMap description once gvd.json is visible.
   pcall(function()
-    if core_input_bindings and core_input_bindings.reloadBindings then
-      core_input_bindings.reloadBindings()
-    elseif extensions and extensions.core_input_bindings and extensions.core_input_bindings.reloadBindings then
-      extensions.core_input_bindings.reloadBindings()
+    local b = core_input_bindings or (extensions and extensions.core_input_bindings)
+    if type(b) ~= 'table' then return end
+    if type(b.loadActions) == 'function' then
+      b.loadActions()
+    elseif type(b.reloadActions) == 'function' then
+      b.reloadActions()
+    end
+    if type(b.reloadBindings) == 'function' then
+      b.reloadBindings()
     end
   end)
   log('I', 'GVD', '[GVD] loaded. Alt+G engage (Ctrl+Alt+G fallback). Path: GVD PATH. Strip: mode/Hz/TTC/N. UI app: GVD.')

@@ -39,7 +39,7 @@ class HwReport:
 
 
 def cam_claim(backend: str) -> str:
-    """Honest camera claim per backend — the retail window path never says 8 cams."""
+    """Honest camera claim per backend -- the retail window path never says 8 cams."""
     b = (backend or "stub").lower()
     if b == "window":
         return "cams=1/8 path=retail (1 window capture; not 8; drive=gvd_cmd.json->mod Lua)"
@@ -93,7 +93,7 @@ def _nvidia() -> tuple[str, float | None]:
         ).strip().splitlines()[0]
         parts = [p.strip() for p in out.split(",")]
         name = parts[0]
-        vram = float(parts[1]) / 1024.0 if len(parts) > 1 else None  # MiB → GiB approx if already MiB
+        vram = float(parts[1]) / 1024.0 if len(parts) > 1 else None  # MiB -> GiB approx if already MiB
         # nvidia-smi memory.total is MiB
         if vram and vram > 64:  # clearly MiB
             vram = float(parts[1]) / 1024.0
@@ -183,10 +183,10 @@ def refuse_live_start(report: HwReport, *, vision_only: bool = False) -> str | N
     vram = report.dgpu_vram_gb
     if vram is None:
         return None
-    # Target profile placeholder "GTX 1080 Ti (target)" reports 11 — real probe uses nvidia-smi
+    # Target profile placeholder "GTX 1080 Ti (target)" reports 11 -- real probe uses nvidia-smi
     if vram < 10.0 and beamng_process_running():
         return (
-            f"dGPU VRAM {vram:.1f} GB < 10 GB while BeamNG is up — "
+            f"dGPU VRAM {vram:.1f} GB < 10 GB while BeamNG is up - "
             "refuse live start (pass --vision-only to override)"
         )
     return None
@@ -209,7 +209,7 @@ def probe(backend: str = "stub") -> HwReport:
     qsv = _qsv_available()
     notes = []
     if vram is not None and vram < 10 and os.environ.get("GVD_VISION_ONLY", "") not in ("1", "true"):
-        notes.append("VRAM<10GB with BeamNG up may OOM — use --vision-only to force")
+        notes.append("VRAM<10GB with BeamNG up may OOM - use --vision-only to force")
     return HwReport(
         cpu=cpu_label,
         ram_gb=ram,

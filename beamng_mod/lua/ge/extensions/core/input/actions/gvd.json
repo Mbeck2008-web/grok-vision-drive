@@ -7,6 +7,6 @@
     "isBasic": true,
     "onDown": "extensions.gvd_main.toggleEngage()",
     "title": "GVD Engage",
-    "desc": "Engage / disengage Grok Vision Drive (Alt+G; Ctrl+Alt+G fallback). Alt+A stays stock range display."
+    "desc": "Toggle GVD engage"
   }
 }

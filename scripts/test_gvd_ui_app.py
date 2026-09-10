@@ -53,6 +53,25 @@ def main() -> None:
             hit = re.search(pattern, low)
             assert hit is None, f"{name}: {label} found ({hit.group(0)!r})"
 
+    # CEF / ActionMap / inputmap strings must stay ASCII (no BOM). BeamNG's
+    # in-game CEF drops app.js on em-dash / middot / fancy quotes, and Windows
+    # ActionMap addBinding fails when the action title/desc is missing or invalid.
+    cef_paths = [
+        APP / "app.js", APP / "app.html", APP / "app.json",
+        ROOT / "beamng_mod" / "ui" / "modules" / "apps" / "gvd_strip" / "app.js",
+        ROOT / "beamng_mod" / "ui" / "modules" / "apps" / "gvd_strip" / "app.html",
+        ROOT / "beamng_mod" / "ui" / "modules" / "apps" / "gvd_strip" / "app.json",
+        ROOT / "beamng_mod" / "lua" / "ge" / "extensions" / "core" / "input" / "actions" / "gvd.json",
+        ROOT / "beamng_mod" / "settings" / "inputmaps" / "keyboardGvd.json",
+        ROOT / "python" / "viz" / "monitors.py",
+    ]
+    for path in cef_paths:
+        raw = path.read_bytes()
+        assert not raw.startswith(b"\xef\xbb\xbf"), f"{path.name}: UTF-8 BOM"
+        bad = sorted({ch for ch in raw.decode("utf-8") if ord(ch) > 127})
+        assert not bad, f"{path.name}: non-ASCII {bad!r}"
+        raw.decode("utf-8").encode("cp1252")
+
     # Every gvd_main call the app makes must exist in the Lua extension.
     called = set(re.findall(r"extensions\.gvd_main\.(\w+)\s*\(", app_js))
     defined = set(re.findall(r"function M\.(\w+)\s*\(", lua))
@@ -78,6 +97,8 @@ def main() -> None:
     # toggleRangeStatus — GVD uses Alt+G (Ctrl+Alt+G fallback) and does not steal it.
     actions = json.loads((ROOT / "beamng_mod" / "lua" / "ge" / "extensions" / "core" / "input"
                           / "actions" / "gvd.json").read_text(encoding="utf-8"))
+    title, desc = actions["gvd_toggle_engage"]["title"], actions["gvd_toggle_engage"]["desc"]
+    assert title and desc and all(ord(ch) < 128 for ch in title + desc), (title, desc)
     assert "toggleEngage" in actions["gvd_toggle_engage"]["onDown"]
     keymap = json.loads((ROOT / "beamng_mod" / "settings" / "inputmaps"
                          / "keyboardGvd.json").read_text(encoding="utf-8"))
@@ -182,5 +203,5 @@ if __name__ == "__main__":
     try:
         main()
     except AssertionError as e:
-        print(f"test_gvd_ui_app: FAIL — {e}")
+        print(f"test_gvd_ui_app: FAIL - {e}")
         sys.exit(1)

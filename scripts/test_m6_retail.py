@@ -335,7 +335,7 @@ def _run_supervisor(
             return False
         eng = _read_json(engage_path())
         cmd = _read_json(cmd_path())
-        st = read_state() or {}
+        st = _read_json(state_path())
         if eng.get("engaged") is not False or eng.get("disengage_reason") != expect_disengage:
             return False
         if st.get("engaged") is not False:

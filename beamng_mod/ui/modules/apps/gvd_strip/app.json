@@ -2,7 +2,7 @@
   "name": "GVD Strip",
   "author": "GVD",
   "version": "0.1.0",
-  "description": "Compact GVD status: mode · Hz · TTC · N",
+  "description": "Compact GVD status: mode - Hz - TTC - N",
   "directive": "gvd-strip",
   "domElement": "<gvd-strip></gvd-strip>",
   "css": "{ \"left\": \"12px\", \"top\": \"12px\", \"width\": \"360px\", \"height\": \"40px\" }",

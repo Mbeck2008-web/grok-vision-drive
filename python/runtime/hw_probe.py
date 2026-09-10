@@ -186,7 +186,7 @@ def refuse_live_start(report: HwReport, *, vision_only: bool = False) -> str | N
     # Target profile placeholder "GTX 1080 Ti (target)" reports 11 — real probe uses nvidia-smi
     if vram < 10.0 and beamng_process_running():
         return (
-            f"dGPU VRAM {vram:.1f} GB < 10 GB while BeamNG is up — "
+            f"dGPU VRAM {vram:.1f} GB < 10 GB while BeamNG is up - "
             "refuse live start (pass --vision-only to override)"
         )
     return None
@@ -209,7 +209,7 @@ def probe(backend: str = "stub") -> HwReport:
     qsv = _qsv_available()
     notes = []
     if vram is not None and vram < 10 and os.environ.get("GVD_VISION_ONLY", "") not in ("1", "true"):
-        notes.append("VRAM<10GB with BeamNG up may OOM — use --vision-only to force")
+        notes.append("VRAM<10GB with BeamNG up may OOM - use --vision-only to force")
     return HwReport(
         cpu=cpu_label,
         ram_gb=ram,

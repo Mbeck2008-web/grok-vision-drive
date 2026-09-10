@@ -106,7 +106,7 @@ def list_monitors() -> list[Monitor]:
 
 
 def pick_monitor(screen: str = "auto", env_key: str = "GVD_VIZ_MONITOR") -> tuple[Monitor, str]:
-    """Return (monitor, note). screen: auto|1|2|…"""
+    """Return (monitor, note). screen: auto|1|2|..."""
     mons = list_monitors()
     env = os.environ.get(env_key, "").strip()
     if env.isdigit():
@@ -116,8 +116,8 @@ def pick_monitor(screen: str = "auto", env_key: str = "GVD_VIZ_MONITOR") -> tupl
     others = [m for m in mons if not m.primary]
     if screen == "auto":
         if others:
-            return others[0], f"auto→non-primary #{others[0].index}"
-        return primary, "auto→primary (second screen not found — drag GVD VISION)"
+            return others[0], f"auto->non-primary #{others[0].index}"
+        return primary, "auto->primary (second screen not found - drag GVD VISION)"
     try:
         idx = int(screen)
     except ValueError:
@@ -130,7 +130,7 @@ def pick_monitor(screen: str = "auto", env_key: str = "GVD_VIZ_MONITOR") -> tupl
     for m in mons:
         if m.index == idx:
             return m, f"screen {idx}"
-    return primary, f"screen {idx} missing — primary"
+    return primary, f"screen {idx} missing - primary"
 
 
 def place_opencv_window(
@@ -157,5 +157,5 @@ def place_opencv_window(
     if "not found" in note or "missing" in note:
         print(f"[GVD] {note}")
     else:
-        print(f"[GVD] GVD VISION → monitor {mon.index} @ ({x},{y}) [{note}]")
+        print(f"[GVD] GVD VISION -> monitor {mon.index} @ ({x},{y}) [{note}]")
     return note

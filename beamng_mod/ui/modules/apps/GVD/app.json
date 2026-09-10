@@ -2,7 +2,7 @@
   "name": "GVD",
   "author": "GVD",
   "version": "0.2.0",
-  "description": "GVD / VISION \u2014 engage, path + agent ghosts, policy, camera honesty",
+  "description": "GVD / VISION - engage, path + agent ghosts, policy, camera honesty",
   "directive": "gvd-app",
   "domElement": "<gvd-app></gvd-app>",
   "css": "{ \"left\": \"12px\", \"bottom\": \"60px\", \"width\": \"330px\", \"height\": \"400px\" }",

@@ -33,9 +33,7 @@ from python.control.actuate import (  # noqa: E402
     make_actuator,
     read_ego_feedback,
     read_engage_flag,
-    want_simulated_lua_ack,
     write_engage_flag,
-    write_simulated_lua_ack,
 )
 from python.runtime.hw_probe import HwReport, cam_claim  # noqa: E402
 from python.runtime.state_io import read_state, state_path  # noqa: E402
@@ -255,58 +253,6 @@ def check_cmd_json_drive_bus() -> None:
     ego_path().unlink()
 
 
-def check_simulated_ack_contract() -> None:
-    """Stub/smoke may ack via the file bus; that is still an ack, not a silent write."""
-    assert want_simulated_lua_ack("stub") is True
-    assert want_simulated_lua_ack("window") is False
-    assert want_simulated_lua_ack("beamngpy") is False
-    assert want_simulated_lua_ack("stub", env={"GVD_SIMULATE_LUA_ACK": "0"}) is False
-    assert want_simulated_lua_ack("window", env={"GVD_SIMULATE_LUA_ACK": "1"}) is True
-
-    if ego_path().exists():
-        ego_path().unlink()
-    act = CmdJsonActuator(simulate_ack=True)
-    act.note_engaged(True)
-    out = act.apply(DriveCommand(steer=0.2, throttle=0.3, brake=0.0, seq=3, reason="ok"))
-    assert out.applied is True and out.reason == "cmd_json_applied", out
-    fb = read_ego_feedback()
-    assert fb is not None and fb.fresh and fb.applying and fb.applied_seq == 3
-    assert fb.steering_input == 0.2 and fb.throttle_input == 0.3 and fb.speed_mps == 0.0
-
-    # A fresh harness echo with a driver residual is not overwritten.
-    _write_ego(3, steer_in=0.9, throttle_in=0.3, speed=5.5)
-    act.note_ack(read_ego_feedback())
-    out = act.apply(DriveCommand(steer=0.2, throttle=0.3, brake=0.0, seq=4, reason="ok"))
-    assert out.applied is True and out.reason == "cmd_json_applied", out
-    fb = read_ego_feedback()
-    assert fb is not None and abs(float(fb.steering_input) - 0.9) < 1e-6, fb
-    assert abs(float(fb.speed_mps) - 5.5) < 1e-6
-
-    # Slack must not expire across many stub ticks: refresh when the echo would go stale.
-    if ego_path().exists():
-        ego_path().unlink()
-    long = CmdJsonActuator(simulate_ack=True)
-    long.note_engaged(True)
-    for seq in range(1, 16):
-        out = long.apply(DriveCommand(steer=0.0, throttle=0.2, brake=0.0, seq=seq, reason="ok"))
-        assert out.applied is True and out.reason == "cmd_json_applied", (seq, out)
-
-    # Default actuator still refuses to claim applied without an echo (live honesty).
-    if ego_path().exists():
-        ego_path().unlink()
-    live = CmdJsonActuator(simulate_ack=False)
-    live.note_engaged(True)
-    out = live.apply(DriveCommand(steer=0.1, throttle=0.1, brake=0.0, seq=9, reason="ok"))
-    assert out.applied is False and out.reason == "cmd_json_pending", out
-    written = write_simulated_lua_ack(DriveCommand(steer=0.1, throttle=0.1, brake=0.0, seq=9))
-    assert written is not None and written.applied_seq == 9
-    live.note_ack(written)
-    out = live.apply(DriveCommand(steer=0.1, throttle=0.1, brake=0.0, seq=10, reason="ok"))
-    assert out.applied is True and out.reason == "cmd_json_applied", out
-    if ego_path().exists():
-        ego_path().unlink()
-
-
 def _run_supervisor(
     extra: list[str],
     seconds: float,
@@ -322,53 +268,61 @@ def _run_supervisor(
     """
     args = [sys.executable, "-u", str(ROOT / "python" / "run_vision.py"), "--backend", "stub", "--hz", "20", "--encode", "cpu", *extra]
     env = dict(os.environ, PYTHONPATH=str(ROOT))
-    # PIPE only when a caller needs stdout (override disengage line). Otherwise DEVNULL so a
-    # chatty boot cannot fill the pipe and freeze the supervisor before write_state.
-    capture = steer_echo is not None or brake_bias > 0.0
+    # PIPE only when a caller reads stdout. A full pipe freezes the supervisor on a
+    # pending write_state — the Verify FAIL (engaged, cmd_json_pending).
+    want_out = steer_echo is not None or brake_bias > 0.0
     proc = subprocess.Popen(
         args,
         cwd=str(ROOT),
         env=env,
-        stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+        stdout=subprocess.PIPE if want_out else subprocess.DEVNULL,
         stderr=subprocess.STDOUT,
         text=True,
     )
-    chunks: list[str] = []
+
+    def _ack_once() -> None:
+        if not ack:
+            return
+        try:
+            cmd = json.loads(cmd_path().read_text(encoding="utf-8"))
+            seq = int(cmd.get("seq", -1))
+        except Exception:
+            return
+        if seq < 0:
+            return
+        _write_ego(
+            seq,
+            applying=True,
+            speed=5.5,
+            steer_in=steer_echo(seq) if steer_echo else float(cmd.get("steer", 0.0)),
+            throttle_in=float(cmd.get("throttle", 0.0)),
+            brake_in=min(1.0, float(cmd.get("brake", 0.0)) + brake_bias),
+        )
+
     t_end = time.time() + seconds
     try:
         while time.time() < t_end:
             if proc.poll() is not None:
-                extra_out = proc.stdout.read() if proc.stdout else ""
-                raise AssertionError(f"run_vision exited early ({proc.returncode}):\n{''.join(chunks)}{extra_out}")
-            if proc.stdout:
-                try:
-                    import select
-
-                    while select.select([proc.stdout], [], [], 0)[0]:
-                        line = proc.stdout.readline()
-                        if not line:
-                            break
-                        chunks.append(line)
-                except Exception:
-                    pass
-            if ack:
-                cmd: dict = {}
-                try:
-                    cmd = json.loads(cmd_path().read_text(encoding="utf-8"))
-                    seq = int(cmd.get("seq", -1))
-                except Exception:
-                    seq = -1
-                if seq >= 0:
-                    _write_ego(
-                        seq,
-                        applying=True,
-                        speed=5.5,
-                        steer_in=steer_echo(seq) if steer_echo else float(cmd.get("steer", 0.0)),
-                        throttle_in=float(cmd.get("throttle", 0.0)),
-                        brake_in=min(1.0, float(cmd.get("brake", 0.0)) + brake_bias),
-                    )
+                out = proc.stdout.read() if proc.stdout else ""
+                raise AssertionError(f"run_vision exited early ({proc.returncode}):\n{out}")
+            _ack_once()
             # Tighter than the 20 Hz supervisor loop so the echo always belongs to the newest seq.
             time.sleep(0.01)
+        # Hold SIGKILL until write_state has seen the echo. Killing mid-tick left
+        # cmd_applied=False / cmd_json_pending for check_run_vision_e2e.
+        if ack:
+            until = time.time() + 0.5
+            while time.time() < until:
+                if proc.poll() is not None:
+                    break
+                _ack_once()
+                try:
+                    st = read_state() or {}
+                    if st.get("cmd_applied") is True and st.get("cmd_reason") == "cmd_json_applied":
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.01)
     finally:
         proc.kill()  # SIGKILL: the `finally` stop never runs, so the last tick's files survive for assertions
         try:
@@ -376,11 +330,9 @@ def _run_supervisor(
         except Exception:
             pass
     try:
-        if proc.stdout:
-            chunks.append(proc.stdout.read() or "")
+        return proc.stdout.read() if proc.stdout else ""
     except Exception:
-        pass
-    return "".join(chunks)
+        return ""
 
 
 def check_run_vision_e2e() -> None:
@@ -403,8 +355,7 @@ def check_run_vision_e2e() -> None:
     cmd = json.loads(cmd_path().read_text(encoding="utf-8"))
     assert cmd["engaged"] is True and cmd["brake"] == 1.0 and cmd["throttle"] == 0.0 and cmd["reason"] == "preview_blocked", cmd
 
-    # Engaged + preview allowed → real drive command every tick. Stub plays the Lua ack
-    # role in-process (gvd_ego.json); the harness here can still overlay a 5.5 wheelspeed.
+    # Engaged + preview allowed → real drive command every tick; Lua ack flips cmd_applied and ego speed.
     _run_supervisor(["--force-engage", "--allow-preview-drive"], seconds=2.5, ack=True)
     cmd = json.loads(cmd_path().read_text(encoding="utf-8"))
     assert cmd["engaged"] is True and cmd["reason"] == "ok" and cmd["seq"] >= 10, cmd
@@ -412,9 +363,7 @@ def check_run_vision_e2e() -> None:
     st = read_state()
     assert st and st["engaged"] is True and st["cmd_applied"] is True, {k: st.get(k) for k in ("engaged", "cmd_applied", "cmd_reason")}
     assert st["cmd_reason"] == "cmd_json_applied" and st["ego_source"] == "lua" and st["lua_applying"] is True
-    # Harness echoes 5.5; in-process stub ack has no vehicle so speed is 0. Never invent one.
-    spd = float(st["ego"]["speed_mps"])
-    assert spd == 0.0 or abs(spd - 5.5) < 1e-6, st["ego"]
+    assert abs(float(st["ego"]["speed_mps"]) - 5.5) < 1e-6, st["ego"]
     assert st["cmd_ack_seq"] >= st["cmd_seq"] - 5
 
     write_engage_flag(False)
@@ -560,7 +509,6 @@ def main() -> None:
     check_boot_line_honesty()
     check_window_backend_one_cam()
     check_cmd_json_drive_bus()
-    check_simulated_ack_contract()
     check_engage_path_contract()
     check_no_chrome()
     check_player_docs()

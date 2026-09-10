@@ -6,8 +6,9 @@
 local logs = {}
 function log(level, tag, msg) logs[#logs + 1] = msg end
 
--- Minimal flat-JSON decoder (BeamNG provides jsonDecode in-game).
-function jsonDecode(s)
+-- Minimal JSON decoder: flat scalars plus one level of nested objects, which is all the mod
+-- reads (gvd_state.json nests override_cfg). BeamNG provides a real jsonDecode in-game.
+local function decodeScalars(s)
   local t = {}
   for k, v in s:gmatch('"([%w_]+)"%s*:%s*([^,}]+)') do
     v = v:gsub('^%s+', ''):gsub('%s+$', '')
@@ -17,6 +18,16 @@ function jsonDecode(s)
     elseif v:sub(1, 1) == '"' then t[k] = v:sub(2, -2)
     else t[k] = tonumber(v) end
   end
+  return t
+end
+
+function jsonDecode(s)
+  local t = {}
+  local rest = s:gsub('"([%w_]+)"%s*:%s*(%b{})', function(k, obj)
+    t[k] = decodeScalars(obj)
+    return ''
+  end)
+  for k, v in pairs(decodeScalars(rest)) do t[k] = v end
   return t
 end
 
@@ -95,9 +106,9 @@ local function writeCmd(engaged, steer, throttle, brake, hbOffset)
     steer, throttle, brake, seq, engaged and 'true' or 'false', os.time() + (hbOffset or 0)))
   return seq
 end
-local function beatState(engaged, reason)
-  writeFile(statePath, string.format('{"engaged":%s,"disengage_reason":"%s","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15}',
-    engaged and 'true' or 'false', reason or 'none', os.clock() + seq))
+local function beatState(engaged, reason, overrideCfg)
+  writeFile(statePath, string.format('{"engaged":%s,"disengage_reason":"%s","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15%s}',
+    engaged and 'true' or 'false', reason or 'none', os.clock() + seq, overrideCfg and (',"override_cfg":' .. overrideCfg) or ''))
 end
 
 M.onExtensionLoaded()
@@ -230,6 +241,109 @@ check(#shifter == 1 and shifter[1] == 'arcade', 'arcade re-armed for the new veh
 clearEvents()
 M.toggleEngage()
 check(lastEvent('throttle').veh == 202 and near(lastEvent('throttle')[2], 0), 'disengage releases the vehicle we actually drove')
+currentVeh = fakeVeh
+
+-- 13) player override: force-feedback chatter must not disengage, a real driver must ──────
+-- The mod only sees the electrics echo, so the harness plays the wheel/pedals by writing
+-- electrics.values; applyCmdJson reads the echo the *previous* tick round-tripped through GE.
+local function echo(steer, thr, brk)
+  electricsValues.steering_input = steer
+  electricsValues.throttle_input = thr
+  electricsValues.brake_input = brk
+end
+local function driveTick(steerCmd, thrCmd, brkCmd, overrideCfg)
+  writeCmd(true, steerCmd, thrCmd, brkCmd)
+  beatState(true, 'none', overrideCfg)
+  M.onUpdate(0.11)
+  drainGE()
+end
+local function warmDrive(steerCmd, thrCmd, brkCmd, overrideCfg)
+  -- 3 * lpf_tau_ms = 240 ms of command before the residual is judged.
+  for _ = 1, 4 do driveTick(steerCmd, thrCmd, brkCmd, overrideCfg) end
+end
+
+echo(0, 0.3, 0)
+M.toggleEngage()
+warmDrive(0, 0.3, 0)
+check(M.isEngaged(), 'engaged and driving before the wheel is touched')
+
+for i = 1, 16 do
+  -- what a force-feedback wheel does over bumps: big, fast, alternating
+  echo((i % 2 == 0) and 0.7 or -0.7, 0.3, 0)
+  driveTick(0, 0.3, 0)
+end
+check(M.isEngaged(), 'alternating force-feedback chatter (+/-0.7) does not disengage')
+
+for _ = 1, 12 do
+  echo(0.02, 0.3, 0)
+  driveTick(0, 0.3, 0)
+end
+check(M.isEngaged(), 'steady residual inside steer_exit does not disengage')
+
+-- a one-tick kick then rest: spike reject, the filter never follows
+echo(0.7, 0.3, 0)
+driveTick(0, 0.3, 0)
+echo(0, 0.3, 0)
+for _ = 1, 6 do driveTick(0, 0.3, 0) end
+check(M.isEngaged(), 'one-tick FFB kick does not disengage')
+
+-- a held residual past enter, in one direction, for steer_hold_ms
+echo(0.25, 0.3, 0)
+for _ = 1, 8 do driveTick(0, 0.3, 0) end
+check(not M.isEngaged(), 'steer residual held past enter in one direction -> player_steer')
+check(logs[#logs]:find('player_steer') ~= nil, 'override logged player_steer')
+local ef2 = readFileAll(engagePath)
+check(ef2 and ef2:find('"engaged":false') and ef2:find('player_steer'),
+  'override wrote gvd_engage.json engaged=false disengage_reason=player_steer')
+
+-- pedals stay tight: no filter, no dwell
+echo(0, 0.3, 0)
+M.toggleEngage()
+warmDrive(0, 0.3, 0)
+check(M.isEngaged(), 'Alt+A re-arms after an override')
+echo(0, 0.3, 0.12)
+driveTick(0, 0.3, 0); driveTick(0, 0.3, 0)
+check(not M.isEngaged(), 'player brake press (0.12) -> player_brake')
+check(logs[#logs]:find('player_brake') ~= nil, 'override logged player_brake')
+
+-- GVD's own AEB brake hold echoes back at 1.0 and must not read as the player
+echo(0, 0, 1.0)
+M.toggleEngage()
+warmDrive(0, 0, 1.0)
+driveTick(0, 0, 1.0); driveTick(0, 0, 1.0)
+check(M.isEngaged(), 'our own brake=1 echoed back is not an override')
+
+-- GVD's own steer echo is residual 0, even at 0.4 of lock
+echo(0.4, 0.3, 0)
+for _ = 1, 8 do
+  echo(0.4, 0.3, 0)
+  driveTick(0.4, 0.3, 0)
+end
+check(M.isEngaged(), 'wheel matching cmd.steer is not an override (residual, not absolute)')
+
+-- thresholds are tunable: the supervisor mirrors config/control.yaml into gvd_state.override_cfg
+local tuned = '{"steer_enter":0.02,"steer_exit":0.01,"steer_hold_ms":0,"steer_spike":1.0,"brake_enter":0.06,"throttle_enter":0.10,"lpf_tau_ms":0}'
+echo(0, 0.3, 0)
+driveTick(0, 0.3, 0, tuned)
+check(M.isEngaged(), 'still engaged after adopting the mirrored thresholds')
+check(logs[#logs]:find('enter 0.020') ~= nil or logs[#logs - 1]:find('enter 0.020') ~= nil,
+  'mirrored override_cfg logged (enter 0.020)')
+echo(0.05, 0.3, 0)
+driveTick(0, 0.3, 0, tuned); driveTick(0, 0.3, 0, tuned)
+check(not M.isEngaged(), 'tuned steer_enter 0.02 trips on a 0.05 residual the default 0.08 ignores')
+
+-- swapping vehicles re-arms the warm-up: the new car's echo says nothing about the old car's commands
+local pin = '{"steer_enter":0.08,"steer_exit":0.04,"steer_hold_ms":200,"steer_spike":0.20,"brake_enter":0.06,"throttle_enter":0.10,"lpf_tau_ms":80}'
+echo(0, 0.3, 0)
+M.toggleEngage()
+warmDrive(0, 0.3, 0, pin)
+check(M.isEngaged(), 'driving before the vehicle switch')
+currentVeh = otherVeh
+echo(0.25, 0.3, 0)
+driveTick(0, 0.3, 0, pin); driveTick(0, 0.3, 0, pin)
+check(M.isEngaged(), 'vehicle switch re-arms the override warm-up')
+for _ = 1, 8 do driveTick(0, 0.3, 0, pin) end
+check(not M.isEngaged(), 'once warm again a held residual is player_steer')
 currentVeh = fakeVeh
 
 -- 12) chrome check on everything we push to the vehicle / HUD

@@ -14,7 +14,10 @@ import time
 import zipfile
 from pathlib import Path
 
+from typing import Callable
+
 import numpy as np
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -158,14 +161,23 @@ def check_window_backend_one_cam() -> None:
     assert all(v == "missing" for v in empty.health_str().values())
 
 
-def _write_ego(seq: int, *, applying: bool = True, speed: float = 5.5, steer_in: float = 0.0, age_s: float = 0.0) -> None:
+def _write_ego(
+    seq: int,
+    *,
+    applying: bool = True,
+    speed: float = 5.5,
+    steer_in: float = 0.0,
+    throttle_in: float = 0.0,
+    brake_in: float = 0.0,
+    age_s: float = 0.0,
+) -> None:
     ego_path().write_text(
         json.dumps(
             {
                 "speed_mps": speed,
                 "steering_input": steer_in,
-                "throttle_input": 0.2,
-                "brake_input": 0.0,
+                "throttle_input": throttle_in,
+                "brake_input": brake_in,
                 "applied_seq": seq,
                 "applying": applying,
                 "mtime": int(time.time()),
@@ -241,31 +253,137 @@ def check_cmd_json_drive_bus() -> None:
     ego_path().unlink()
 
 
-def _run_supervisor(extra: list[str], seconds: float, ack: bool = False) -> None:
-    """Run run_vision.py headless for `seconds`; optionally play the mod's ack role meanwhile."""
+def _read_json(path: Path) -> dict:
+    """Best-effort JSON object. Windows can raise PermissionError while Lua/Python replace the file."""
+    for _ in range(4):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            time.sleep(0.002)
+    return {}
+
+
+def _player_named(reason: str, *, engage: dict | None = None, state: dict | None = None) -> bool:
+    """True when gvd_engage.json or gvd_state.json names this player_* reason.
+
+    Later ticks rewrite state.disengage_reason to not_engaged and reset override;
+    the engage file is the sticky record. Either surface is enough.
+    """
+    if engage and engage.get("disengage_reason") == reason:
+        return True
+    if not state:
+        return False
+    ovr = state.get("override") if isinstance(state.get("override"), dict) else {}
+    return state.get("disengage_reason") == reason or ovr.get("reason") == reason
+
+
+def _run_supervisor(
+    extra: list[str],
+    seconds: float,
+    ack: bool = False,
+    steer_echo: Callable[[int], float] | None = None,
+    brake_bias: float = 0.0,
+    expect_disengage: str | None = None,
+) -> dict | None:
+    """Run run_vision.py headless for `seconds`; optionally play the mod's ack role meanwhile.
+
+    The fake mod echoes back what it was told to apply, exactly like `gvd_main` does, so the
+    override residual is zero unless a test deliberately plays a driver: `steer_echo(seq)`
+    reports a wheel position instead of the commanded one, `brake_bias` adds a pedal press.
+
+    `expect_disengage` is a `player_*` reason. When set, SIGKILL waits for that reason on
+    `gvd_engage.json` / `gvd_state.json` — not stdout. `cmd_applied` is already true a few
+    ticks after engage, before the dwell. Windows PIPE + TerminateProcess also drops
+    `[GVD] DISENGAGED:` (Verify FAIL: only boot lines through the preview WARNING).
+    """
     args = [sys.executable, "-u", str(ROOT / "python" / "run_vision.py"), "--backend", "stub", "--hz", "20", "--encode", "cpu", *extra]
     env = dict(os.environ, PYTHONPATH=str(ROOT))
-    proc = subprocess.Popen(args, cwd=str(ROOT), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    # Never PIPE. A full pipe freezes the supervisor (engaged, cmd_json_pending), and
+    # Windows TerminateProcess discards the child's unflushed stdout anyway.
+    proc = subprocess.Popen(
+        args,
+        cwd=str(ROOT),
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    latched: dict | None = None
+
+    def _ack_once() -> None:
+        if not ack:
+            return
+        try:
+            cmd = json.loads(cmd_path().read_text(encoding="utf-8"))
+            seq = int(cmd.get("seq", -1))
+        except Exception:
+            return
+        if seq < 0:
+            return
+        _write_ego(
+            seq,
+            applying=True,
+            speed=5.5,
+            steer_in=steer_echo(seq) if steer_echo else float(cmd.get("steer", 0.0)),
+            throttle_in=float(cmd.get("throttle", 0.0)),
+            brake_in=min(1.0, float(cmd.get("brake", 0.0)) + brake_bias),
+        )
+
+    def _try_latch() -> bool:
+        nonlocal latched
+        if not expect_disengage:
+            return False
+        eng = _read_json(engage_path())
+        cmd = _read_json(cmd_path())
+        st = _read_json(state_path())
+        if eng.get("engaged") is not False or eng.get("disengage_reason") != expect_disengage:
+            return False
+        if st.get("engaged") is not False:
+            return False
+        if cmd.get("engaged") is not False:
+            return False
+        # Latch even if a later tick already rewrote state.disengage_reason to
+        # not_engaged — the engage file is the sticky record. Prefer a snapshot
+        # that still names player_* when we catch the override tick.
+        latched = {"engage": eng, "cmd": cmd, "state": st}
+        return True
+
     t_end = time.time() + seconds
     try:
         while time.time() < t_end:
             if proc.poll() is not None:
-                out = proc.stdout.read() if proc.stdout else ""
-                raise AssertionError(f"run_vision exited early ({proc.returncode}):\n{out}")
-            if ack:
+                raise AssertionError(f"run_vision exited early ({proc.returncode})")
+            _ack_once()
+            if _try_latch():
+                break
+            # Tighter than the 20 Hz supervisor loop so the echo always belongs to the newest seq.
+            time.sleep(0.01)
+        # Hold SIGKILL until write_state has seen the echo. Killing mid-tick left
+        # cmd_applied=False / cmd_json_pending for check_run_vision_e2e.
+        # Override runs must not stop on cmd_applied: that flips true before the dwell.
+        grace = 1.5 if expect_disengage and latched is None else (0.5 if ack and expect_disengage is None else 0.0)
+        until = time.time() + grace
+        while time.time() < until:
+            if proc.poll() is not None:
+                break
+            _ack_once()
+            if _try_latch():
+                break
+            if expect_disengage is None and ack:
                 try:
-                    seq = int(json.loads(cmd_path().read_text(encoding="utf-8")).get("seq", -1))
+                    st = read_state() or {}
+                    if st.get("cmd_applied") is True and st.get("cmd_reason") == "cmd_json_applied":
+                        break
                 except Exception:
-                    seq = -1
-                if seq >= 0:
-                    _write_ego(seq, applying=True, speed=5.5)
-            time.sleep(0.05)
+                    pass
+            time.sleep(0.01)
     finally:
         proc.kill()  # SIGKILL: the `finally` stop never runs, so the last tick's files survive for assertions
         try:
             proc.wait(timeout=5)
         except Exception:
             pass
+    return latched
 
 
 def check_run_vision_e2e() -> None:
@@ -303,6 +421,81 @@ def check_run_vision_e2e() -> None:
     ego_path().unlink()
 
 
+def check_ffb_override_live() -> None:
+    """Whole loop with a wheel on the echo: chatter keeps driving, a real driver gets the car."""
+    if ego_path().exists():
+        ego_path().unlink()
+
+    # Force-feedback chatter — alternating kicks keyed off the seq so the sign flips every tick.
+    write_engage_flag(True)
+    _run_supervisor(["--allow-preview-drive"], seconds=3.0, ack=True, steer_echo=lambda seq: 0.9 if seq % 2 else -0.9)
+    assert read_engage_flag(default=False) is True, "force-feedback chatter disengaged GVD"
+    assert _read_json(engage_path()).get("disengage_reason") == "none"
+    cmd = json.loads(cmd_path().read_text(encoding="utf-8"))
+    assert cmd["engaged"] is True and cmd["reason"] == "ok", cmd
+    st = read_state()
+    assert st and st["engaged"] is True and st["disengage_reason"] == "none", {
+        k: st.get(k) for k in ("engaged", "disengage_reason")
+    }
+    assert st["override"]["channel"] == "none" and st["override"]["armed"] is True, st["override"]
+    assert st["override"]["steer_held_ms"] < st["override_cfg"]["steer_hold_ms"], st["override"]
+    # No sink regression: the mod's ack path still drives while the wheel chatters.
+    assert st["cmd_applied"] is True and st["cmd_reason"] == "cmd_json_applied", st["cmd_reason"]
+
+    # A driver actually holding the wheel over. Latch on gvd_engage.json / gvd_state.json,
+    # not stdout — Windows PIPE + SIGKILL only kept boot lines through the preview WARNING.
+    write_engage_flag(True)
+    snap = _run_supervisor(
+        ["--allow-preview-drive"],
+        seconds=3.0,
+        ack=True,
+        steer_echo=lambda _seq: 0.25,
+        expect_disengage="player_steer",
+    )
+    assert snap is not None, "player_steer never appeared on gvd_engage.json / gvd_state.json"
+    eng = snap["engage"]
+    st = snap["state"]
+    assert read_engage_flag(default=True) is False, "a real steer takeover must disengage"
+    assert eng.get("disengage_reason") == "player_steer", eng
+    assert st.get("engaged") is False, {k: st.get(k) for k in ("engaged", "disengage_reason", "override")}
+    assert _player_named("player_steer", engage=eng, state=st), {
+        "engage": eng.get("disengage_reason"),
+        "state": st.get("disengage_reason"),
+        "override": st.get("override"),
+    }
+    assert json.loads(cmd_path().read_text(encoding="utf-8"))["engaged"] is False
+
+    # Pedals stay tight: a brake press on top of the command is an override with no dwell.
+    write_engage_flag(True)
+    snap = _run_supervisor(
+        ["--allow-preview-drive"],
+        seconds=2.0,
+        ack=True,
+        brake_bias=0.4,
+        expect_disengage="player_brake",
+    )
+    assert snap is not None, "player_brake never appeared on gvd_engage.json / gvd_state.json"
+    eng = snap["engage"]
+    st = snap["state"]
+    assert read_engage_flag(default=True) is False, "a real brake press must disengage"
+    assert eng.get("disengage_reason") == "player_brake", eng
+    assert st.get("engaged") is False, {k: st.get(k) for k in ("engaged", "disengage_reason", "override")}
+    assert _player_named("player_brake", engage=eng, state=st), {
+        "engage": eng.get("disengage_reason"),
+        "state": st.get("disengage_reason"),
+        "override": st.get("override"),
+    }
+
+    # Mirrored thresholds reach the mod through gvd_state.json.
+    from python.control.override import config_mirror, load_override_config
+
+    want = config_mirror(load_override_config(yaml.safe_load((ROOT / "config" / "control.yaml").read_text(encoding="utf-8"))))
+    assert read_state()["override_cfg"] == want, read_state()["override_cfg"]
+
+    write_engage_flag(False)
+    ego_path().unlink()
+
+
 def check_lua_harness() -> None:
     """Drive the mod's Lua through the stub-GE harness when a Lua 5.1 interpreter is available."""
     for exe in ("lua5.1", "luajit", "lua"):
@@ -322,10 +515,10 @@ def check_engage_path_contract() -> None:
     p.write_text('{"engaged":true,"mtime":1700000000}', encoding="utf-8")
     assert read_engage_flag(default=False) is True
     # Supervisor disengage payload: engaged=false with float mtime + reason (what Lua adopts as OFF and logs).
-    write_engage_flag(False, disengage_reason="driver_override")
+    write_engage_flag(False, disengage_reason="player_steer")
     data = json.loads(p.read_text(encoding="utf-8"))
     assert data["engaged"] is False and isinstance(data["mtime"], float)
-    assert data["disengage_reason"] == "driver_override"
+    assert data["disengage_reason"] == "player_steer"
     assert read_engage_flag(default=True) is False
     write_engage_flag(False)
     assert json.loads(p.read_text(encoding="utf-8"))["disengage_reason"] == "none"
@@ -398,6 +591,7 @@ def main() -> None:
     check_player_docs()
     check_lua_harness()
     check_run_vision_e2e()
+    check_ffb_override_live()
     print("test_m6_retail: OK")
 
 

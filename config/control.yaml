@@ -17,3 +17,18 @@ shadow:
   # Always compute both intents; actuators only when engaged + modular OK.
   write_fields: true
   apply_e2e_when: never   # shadow applies modular; e2e policy applies e2e if no veto
+override:
+  # Driver override on the steer *residual* (steering_input - the cmd.steer that was in force),
+  # never an absolute angle: force-feedback wheels move steering_input around whatever GVD
+  # commands, and M6's bare "|steering_input| > 0.55" read that chatter as a driver and
+  # disengaged. Research pin magnitudes — live FFB behaviour is still UNPROVEN.
+  # Steer: residual -> spike reject -> EMA -> soft opposition bias -> hysteresis -> dwell.
+  steer_enter: 0.08      # filtered residual above this starts the dwell
+  steer_exit: 0.04       # and must fall back under this to discharge it (hysteresis)
+  steer_hold_ms: 200     # how long the player has to keep pushing one way to count
+  steer_spike: 0.20      # sample-to-sample jump past this is mechanical: the filter holds
+  lpf_tau_ms: 80         # EMA time constant, on the residual only
+  # Pedals asymmetric and tight: no filter, no dwell, one-sided (only a press beyond what GVD
+  # asked for), and brake lower than throttle.
+  brake_enter: 0.06
+  throttle_enter: 0.10

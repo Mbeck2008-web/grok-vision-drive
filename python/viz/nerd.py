@@ -13,6 +13,52 @@ ICE = (212, 196, 158)
 DIM = (120, 120, 120)
 
 
+def scene_note(s: dict[str, Any]) -> str:
+    """Honest lane/edge/sign tally for the OpenCV stage (and the nerd row)."""
+    det = pred = stub = 0
+    for ln in s.get("lanes_ext") or s.get("lanes") or []:
+        if not isinstance(ln, dict):
+            det += 1
+            continue
+        kind = str(ln.get("kind") or "detected")
+        if kind == "detected":
+            det += 1
+        elif kind == "stub":
+            stub += 1
+        else:
+            pred += 1
+    bits: list[str] = []
+    if det or pred or stub:
+        parts = []
+        if det:
+            parts.append(f"{det} seen")
+        if pred:
+            parts.append(f"{pred} pred")
+        if stub:
+            parts.append(f"{stub} stub")
+        bits.append("lanes " + "+".join(parts))
+    else:
+        bits.append("no lane paint")
+    edges = s.get("road_edges") or s.get("edges") or []
+    if edges:
+        only_pred = all(
+            (not isinstance(e, dict)) or str(e.get("kind") or "predicted") != "detected"
+            for e in edges
+        )
+        bits.append("edges pred" if only_pred else "edges")
+    signs = poles = 0
+    for item in s.get("signs") or []:
+        if str(item.get("cls") or item.get("class") or "") == "pole":
+            poles += 1
+        else:
+            signs += 1
+    if signs:
+        bits.append(f"{signs} sign" + ("" if signs == 1 else "s"))
+    if poles:
+        bits.append(f"{poles} pole" + ("" if poles == 1 else "s"))
+    return " · ".join(bits)
+
+
 def render_panel(state: dict[str, Any], h: int = 720, w: int = 420, show_help: bool = False) -> np.ndarray:
     img = np.full((h, w, 3), BG, dtype=np.uint8)
     lines = _help_lines() if show_help else _lines(state)
@@ -81,6 +127,7 @@ def _lines(s: dict[str, Any]) -> list[str]:
         f"planner w={pl.get('corridor_width', 0):.2f}  curv={pl.get('curvature', 0):.4f}  vt={pl.get('target_v', 0):.1f}",
         f"TTC {pl.get('ttc_lead')}   AEB {pl.get('aeb')}",
         f"path_conf {s.get('path_conf', 0):.2f}  width {s.get('path_width', 0):.2f}  preview={s.get('path_debug_preview')}",
+        f"scene {s.get('viz_scene_note') or scene_note(s)}",
         f"cmd {s.get('actuator', '?')} {s.get('cmd_reason', '?')} applied={s.get('cmd_applied')} ego={s.get('ego_source', '?')}",
         f"clip {s.get('last_clip_trigger', 'none')}",
         *sel,

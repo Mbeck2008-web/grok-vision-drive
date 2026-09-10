@@ -63,8 +63,8 @@ echo [GVD] Trying Steam app 284160. If BeamNG does not open, launch it yourself.
 start "" "steam://rungameid/284160" 2>nul
 echo [GVD] Mods expect: %%LOCALAPPDATA%%\BeamNG\BeamNG.drive\current\mods\unpacked\gvd  (0.38+)
 echo [GVD] Legacy also: %%LOCALAPPDATA%%\BeamNG.drive\^<ver^>\mods\unpacked\gvd
-echo [GVD] Run install.bat if Mod Manager is empty. Alt+A or the GVD app = Engage (ribbon + HUD).
-echo [GVD] Engaged + both lane lines seen = HUD DRIVE, GVD holds the wheel. Steer or Alt+A to take over.
+echo [GVD] Run install.bat if Mod Manager is empty. Alt+G (or Ctrl+Alt+G) or the GVD app = Engage (ribbon + HUD).
+echo [GVD] Engaged + both lane lines seen = HUD DRIVE, GVD holds the wheel. Steer or Alt+G to take over.
 echo [GVD] Quit supervisor: q in GVD VISION (car is released, HUD goes OFF).
 pause
 endlocal

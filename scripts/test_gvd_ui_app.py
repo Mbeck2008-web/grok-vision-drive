@@ -45,6 +45,7 @@ def main() -> None:
 
     # Titles stay GVD / VISION, and no Tesla / FSD chrome anywhere the player can see.
     assert "GVD" in app_html and "VISION" in app_html
+    assert "ALT+G" in app_html and "ALT+A" not in app_html
     for name, text in (("app.js", app_js), ("app.html", app_html), ("main.lua", lua),
                        ("app.json", json.dumps(app_json))):
         low = text.lower()
@@ -57,10 +58,14 @@ def main() -> None:
     defined = set(re.findall(r"function M\.(\w+)\s*\(", lua))
     missing = sorted(called - defined)
     assert not missing, f"app.js calls gvd_main functions that do not exist: {missing}"
-    for required in ("toggleEngage", "setShowPath", "setShowAgentGhosts", "setShowScene",
+    for required in ("toggleEngage", "setShowPath", "setShowAgentGhosts",
                      "requestPolicy", "requestVizScreen", "pushUiState"):
         assert required in defined, f"gvd_main.{required} missing"
         assert required in app_js, f"app.js never calls gvd_main.{required}"
+    # Scene canvas is gone; Lua keeps setShowScene so old prefs do not error.
+    assert "setShowScene" in defined
+    assert "gvd-canvas" not in app_html and "drawGround" not in app_js
+    assert "requestAnimationFrame" not in app_js
 
     # Angular template only binds handlers the directive actually publishes.
     bound = set(re.findall(r'ng-(?:click|change)="(\w+)\(', app_html))
@@ -69,13 +74,16 @@ def main() -> None:
     unbound = sorted(bound - published)
     assert not unbound, f"app.html binds scope functions that app.js never defines: {unbound}"
 
-    # Engage still has to be reachable without the app (Alt+A action map).
+    # Engage still has to be reachable without the app. Alt+A is stock BeamNG
+    # toggleRangeStatus — GVD uses Alt+G (Ctrl+Alt+G fallback) and does not steal it.
     actions = json.loads((ROOT / "beamng_mod" / "lua" / "ge" / "extensions" / "core" / "input"
                           / "actions" / "gvd.json").read_text(encoding="utf-8"))
     assert "toggleEngage" in actions["gvd_toggle_engage"]["onDown"]
     keymap = json.loads((ROOT / "beamng_mod" / "settings" / "inputmaps"
                          / "keyboardGvd.json").read_text(encoding="utf-8"))
-    assert any(b["control"] == "alt+a" for b in keymap["bindings"]), keymap
+    controls = {b["control"] for b in keymap["bindings"]}
+    assert "alt+g" in controls and "ctrl+alt+g" in controls, keymap
+    assert "alt+a" not in controls, "do not steal stock toggleRangeStatus"
 
     # One prefs bus: what Lua writes is what the supervisor reads.
     written = set(re.findall(r'"(show_path|show_agent_ghosts|show_scene|policy|viz_screen)"\s*:', lua))
@@ -94,12 +102,12 @@ def main() -> None:
     assert "applying = applying" in lua, "gvdUi must carry the drive flag for the DRIVE state"
     assert "'DRIVE'" in app_js and "steer to take over" in app_js
 
-    # Scene geometry the app reads has to be what the Lua bridge sends.
+    # Lua may still pack scene geometry for old layouts; the in-game app no longer draws it.
     for key in ("lanes", "edges", "signs", "fans", "tracks", "path"):
         assert re.search(rf"\b{key} = ", lua), f"gvdUi payload missing {key}"
-        assert f"ui.{key}" in app_js, f"app.js never reads {key}"
 
     _check_road_model()
+    _check_opencv_lexicon()
     print("test_gvd_ui_app: OK")
 
 
@@ -139,6 +147,35 @@ def _check_road_model() -> None:
     assert all(t["class"] not in STATIC_CLASSES for t in out.tracks), out.tracks
     light = [s for s in out.signs if s["cls"] == "traffic_light"][0]
     assert light["state"] == "unknown", "no lamp-colour classifier exists — never guess"
+
+
+def _check_opencv_lexicon() -> None:
+    """Second-screen stage owns the VISION lexicon; titles stay GVD / VISION."""
+    stage = (ROOT / "python" / "viz" / "stage.py").read_text(encoding="utf-8")
+    nerd = (ROOT / "python" / "viz" / "nerd.py").read_text(encoding="utf-8")
+    for name, text in (("stage.py", stage), ("nerd.py", nerd)):
+        low = text.lower()
+        for pattern, label in BANNED:
+            hit = re.search(pattern, low)
+            assert hit is None, f"{name}: {label} found ({hit.group(0)!r})"
+    for symbol in ("lane_draw_mode", "is_slowing", "is_halted", "is_hazard",
+                   "_draw_lanes", "_draw_edges", "_draw_signs", "_draw_chevrons",
+                   "_draw_stop_bar", "_draw_tracks"):
+        assert symbol in stage, f"stage.py lost lexicon helper {symbol}"
+    from python.viz.stage import is_halted, is_hazard, is_slowing, lane_draw_mode
+
+    assert lane_draw_mode("detected", smoke=False) == "solid"
+    assert lane_draw_mode("predicted", smoke=False) == "dashed"
+    assert lane_draw_mode("stub", smoke=False) is None
+    assert lane_draw_mode("stub", smoke=True) == "dashed"
+    st = {"planner": {"aeb": "off", "target_v": 8.0, "ttc_lead": 2.4, "cipv_id": 1},
+          "ego": {"speed_mps": 12.0, "brake": 0.0}}
+    assert is_slowing(st) and not is_halted(st)
+    st["planner"]["aeb"] = "brake"
+    assert is_halted(st)
+    lead = {"id": 1, "class": "vehicle", "x": 0.1, "y": 14}
+    assert is_hazard(lead, st, 1)
+    assert not is_hazard({"id": 2, "x": 3, "y": 20}, st, 1)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 -- Grok Vision Drive — GE extension: engage + ice-blue ego path + compact HUD strip + retail drive
--- NOTE: Alt+A live ribbon/drive remain UNPROVEN on Linux; confirm on Windows BeamNG smoke.
+-- NOTE: Alt+G live ribbon/drive remain UNPROVEN on Linux; confirm on Windows BeamNG smoke.
 -- Retail (window capture): while engaged, Documents/GVD/gvd_cmd.json is applied to the player vehicle
 -- through vehicle-Lua input.event (the calls BeamNG's AI / BeamNGpy use). No DLL / hooks / injection.
 local M = {}
@@ -7,7 +7,7 @@ local M = {}
 local engaged = false
 local showPath = true
 local showAgentGhosts = false
-local showScene = true       -- in-app VISION canvas (player can switch it off; shares the GPU with BeamNG)
+local showScene = false      -- in-app canvas retired; lexicon lives on OpenCV GVD VISION
 local policyReq = nil        -- session-scoped policy request for the Python supervisor
 local vizScreenReq = nil     -- session-scoped GVD VISION monitor request
 
@@ -1090,7 +1090,7 @@ local function ovrCheck(dt)
   if (ovrClock - ovrEchoStamp) > OVR_ECHO_MAX_S then return 'none' end
   -- Warm-up: the EMA needs a few time constants, and until GVD has been commanding for a while
   -- the echo says nothing about our commands — a player resting on the brake as they press
-  -- Alt+A would otherwise override themselves on the spot.
+  -- Alt+G would otherwise override themselves on the spot.
   if ovrArmedAt == nil or (ovrClock - ovrArmedAt) < (OVR_WARMUP_TAUS * OVR.lpf_tau_ms / 1000) then
     ovrHeldMs = 0
     ovrSign = 0
@@ -1242,7 +1242,7 @@ local function applyCmdJson(dt)
   local ancient = hb ~= nil and (os.time() - hb) > CMD_DEAD_S
   if cmdStaleAcc > CMD_DEAD_S or ancient then
     if applying then
-      -- Dead-man: the stream died while we held the car. Release it and disengage; Alt+A re-arms.
+      -- Dead-man: the stream died while we held the car. Release it and disengage; Alt+G re-arms.
       releaseInputs('command stream dead')
       engaged = false
       fadeAcc = 0
@@ -1254,14 +1254,14 @@ local function applyCmdJson(dt)
     return
   end
   if not cmd or cmd.engaged ~= true then
-    -- Supervisor is not driving (has not read Alt+A yet / vetoed / shutting down): hands off.
+    -- Supervisor is not driving (has not read Alt+G yet / vetoed / shutting down): hands off.
     releaseInputs('supervisor not driving')
     return
   end
   if not arcadeQueued then arcadeQueued = queueVehicle(veh, VE_ARCADE) end
   -- Judged before we push the next command, and only while we actually hold the car:
   -- force-feedback noise must not disengage, a real pedal or a sustained wheel pull must.
-  -- Sticky like the supervisor's own check — Alt+A re-arms.
+  -- Sticky like the supervisor's own check — Alt+G re-arms.
   if applying then
     local why = ovrCheck(step)
     if why ~= 'none' then
@@ -1293,7 +1293,7 @@ end
 
 -- M6 retail: the Python supervisor writes gvd_engage.json {"engaged":false} when it vetoes,
 -- loses its heartbeat, or exits (finally block). Adopt that OFF so the HUD/ribbon never stay ON
--- without a supervisor. Never adopt ON from the file — engage always starts in-game (Alt+A / GVD app).
+-- without a supervisor. Never adopt ON from the file — engage always starts in-game (Alt+G / GVD app).
 local function syncEngageFromSupervisor()
   if not engaged then return end
   local raw = readText(userEngagePath())
@@ -1387,7 +1387,7 @@ end
 
 function M.onDebugDraw(_focuspos)
   -- Also draw here if onPreRender is not hooked in this build.
-  -- Alt+A live ribbon remains UNPROVEN on Linux.
+  -- Alt+G live ribbon remains UNPROVEN on Linux.
   M.drawPath(0.016)
 end
 
@@ -1410,12 +1410,12 @@ function M.onExtensionLoaded()
       extensions.core_input_bindings.reloadBindings()
     end
   end)
-  log('I', 'GVD', '[GVD] loaded. Alt+A engage. Path: GVD PATH. Strip: mode/Hz/TTC/N. UI app: GVD.')
+  log('I', 'GVD', '[GVD] loaded. Alt+G engage (Ctrl+Alt+G fallback). Path: GVD PATH. Strip: mode/Hz/TTC/N. UI app: GVD.')
   log('I', 'GVD', string.format(
     '[GVD] player override on the steer residual: enter %.3f exit %.3f hold %.0fms spike %.2f lpf %.0fms (force-feedback noise must not disengage), pedals tight at brake %.2f / throttle %.2f',
     OVR.steer_enter, OVR.steer_exit, OVR.steer_hold_ms, OVR.steer_spike, OVR.lpf_tau_ms,
     OVR.brake_enter, OVR.throttle_enter))
-  print('[GVD] loaded. Alt+A engage. Writes ' .. userEngagePath()
+  print('[GVD] loaded. Alt+G engage (Ctrl+Alt+G fallback). Writes ' .. userEngagePath()
     .. '; drives the player vehicle from gvd_cmd.json while engaged (retail). BeamNGpy direct control on Tech.')
 end
 
@@ -1430,8 +1430,8 @@ end
 function M.toggleEngage()
   engaged = not engaged
   fadeAcc = 0
-  if not engaged then releaseInputs('Alt+A disengage') end
-  writeEngageFile()  -- a deliberate Alt+A is the normal path, not a reason the HUD should surface
+  if not engaged then releaseInputs('Alt+G disengage') end
+  writeEngageFile()  -- a deliberate Alt+G is the normal path, not a reason the HUD should surface
   local state = engaged and 'ENGAGED' or 'DISENGAGED'
   log('I', 'GVD', '[GVD] ' .. state)
   print('[GVD] ' .. state)

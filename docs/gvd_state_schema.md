@@ -16,7 +16,7 @@ Path: `%USERPROFILE%\Documents\GVD\gvd_state.json` (written by `python/run_visio
 | `policy` | string | `map-ai` draws amber (dimmer) instead of ice-blue |
 | `ego.steer_deg` | float | Used for debug preview if path missing |
 
-Lua: `gvd_main.drawPath` on `onPreRender` / `onDebugDraw`. Engaged-only (Alt+A). Caps: 40 ego segs, 8 agents × 10 segs. Label in console: GVD PATH. No DecalRoad / map edit.
+Lua: `gvd_main.drawPath` on `onPreRender` / `onDebugDraw`. Engaged-only (Alt+G). Caps: 40 ego segs, 8 agents × 10 segs. Label in console: GVD PATH. No DecalRoad / map edit.
 
 
 | `capture_backend` | string | `beamngpy` / `window` / `stub` |
@@ -36,7 +36,7 @@ Lua: `gvd_main.drawPath` on `onPreRender` / `onDebugDraw`. Engaged-only (Alt+A).
 
 ## M3 fields
 
-| `engaged` | bool | Mirrored from Alt+A via `gvd_engage.json` (Lua writes; Python reads) |
+| `engaged` | bool | Mirrored from Alt+G via `gvd_engage.json` (Lua writes; Python reads) |
 | `disengage_reason` | string | `none` / `not_engaged` / `preview_blocked` / `heartbeat_stale` / `player_steer` / `player_brake` / `player_throttle` / … (sticky reasons live in `gvd_engage.json`) |
 | `actuator` | string | `beamngpy` (Tech) / `cmd_json` (retail: GELua applies) / `null` |
 | `cmd_seq` | int | Monotonic command sequence |
@@ -82,18 +82,18 @@ Written by the in-game **GVD** app (GELua is the only writer). **Wins over** `gv
 
 `policy` / `viz_screen` are **session requests**: `run_vision.py` applies them only when `mtime` is at or after supervisor start, so a pref from a past session never overrides `--policy` at launch. Modular veto and dead-man are unchanged by a policy request.
 
-## Viz road model (in-game scene)
+## Viz road model
 
-Drawn by the in-game **GVD** app. None of it feeds the planner — corridor, CIPV and AEB still read `lanes_bev` / `tracks` exactly as before.
+Drawn by the OpenCV **GVD VISION** window (`python/viz/stage.py`). The in-game **GVD** app is Engage + settings only. None of this feeds the planner — corridor, CIPV and AEB still read `lanes_bev` / `tracks` exactly as before.
 
 | `lanes_ext[]` | `{points:[{x,y}], kind, side, style, index}` | `kind`: `detected` (Hough saw the paint) / `predicted` (a detected boundary offset sideways by the measured lane width) / `stub` (`--smoke` only). `index` counts boundaries out from the ego lane (`±1` = its own edges, out to `±3` for the two-lane-per-side fan). `style` stays `unknown` — nothing classifies solid vs dashed yet |
 | `road_edges[]` | `{points:[{x,y}], kind, side}` | Kerb line just outside the outermost boundary. **Always `predicted`**: no kerb detector exists, this is the road edge implied by the lanes we can see |
-| `signs[]` | `{cls,x,y,conf,state}` | Road furniture straight from the detector: `stop_sign` (COCO 11), `traffic_light` (9), `pole` (10 / 12 — hydrants and parking meters, drawn as short grey sticks). Never tracked and never offered to CIPV or AEB. `state` is `unknown` for lights — no lamp-colour classifier, so the app draws all three lamps as empty rings |
+| `signs[]` | `{cls,x,y,conf,state}` | Road furniture straight from the detector: `stop_sign` (COCO 11), `traffic_light` (9), `pole` (10 / 12 — hydrants and parking meters, drawn as short grey sticks). Never tracked and never offered to CIPV or AEB. `state` is `unknown` for lights — no lamp-colour classifier, so the OpenCV stage draws all three lamps as empty rings |
 | `agents[]` | `{id, path_ego:[{x,y}]}` | Mode-0 constant-yaw-rate forecast fan per moving track, same toy math as the OpenCV view |
 
-### Scene cues derived in the app
+### Scene cues derived in the OpenCV stage
 
-These come from state the app already has — no extra fields, and each one needs its own signal:
+These come from state the stage already has — no extra fields, and each one needs its own signal:
 
 | Cue | Condition |
 | --- | --- |
@@ -106,7 +106,7 @@ These come from state the app already has — no extra fields, and each one need
 
 The only filled surface in the scene is the ego corridor; lane paint, kerbs and the lane fan are thin vector polylines, and the sky is void — there is no backdrop.
 
-Predictions need an anchor: with no detected lane there are no predicted lanes and no road edges, and with `lane_conf` under 0.25 only the detected boundaries ship. Sign positions inherit `project_box_to_ego`'s crude pinhole estimate, and sign/light heights in the scene are a drawing convention, not a measurement. The app draws detected geometry solid and everything predicted dim + dashed, and prints e.g. `lanes 2 seen+2 pred · edges pred · 2 signs` under the scene.
+Predictions need an anchor: with no detected lane there are no predicted lanes and no road edges, and with `lane_conf` under 0.25 only the detected boundaries ship. Sign positions inherit `project_box_to_ego`'s crude pinhole estimate, and sign/light heights in the scene are a drawing convention, not a measurement. The stage draws detected geometry solid and everything predicted dim + dashed, skips `kind=stub` except `--smoke` (`viz_smoke`), and prints e.g. `lanes 2 seen+2 pred · edges pred · 2 signs` under the window. Loop under 8 Hz drops forecast fans, signs and the `cam_main` PIP.
 
 ## In-game app bus
 
@@ -136,7 +136,7 @@ Path: `Documents/GVD/gvd_engage.json`, shared by GELua and Python.
 
 | Writer | Payload | When |
 | --- | --- | --- |
-| Lua (`gvd_main.writeEngageFile`) | `{"engaged":true\|false,"mtime":<os.time() int>,"disengage_reason":"<why>"}` | Alt+A / GVD app button, `player_steer` / `player_brake` / `player_throttle`, `command_stream_dead`, `extension_unloaded` |
+| Lua (`gvd_main.writeEngageFile`) | `{"engaged":true\|false,"mtime":<os.time() int>,"disengage_reason":"<why>"}` | Alt+G / GVD app button, `player_steer` / `player_brake` / `player_throttle`, `command_stream_dead`, `extension_unloaded` |
 | Python (`write_engage_flag`) | `{"engaged": false, "mtime": <time.time() float>, "disengage_reason": "<why>"}` | `player_steer` / `player_brake` / `player_throttle` / modular veto / stale heartbeat / `finally` on exit |
 
 Python reads the file every tick and mirrors it into `engaged` (never invents engage). Lua polls it every 0.1 s **only while engaged** and adopts `engaged=false` when the file says so and `mtime` ≥ Lua's own last toggle stamp; it logs `[GVD] DISENGAGED by supervisor (<disengage_reason>)`, releases the vehicle inputs and refreshes the HUD/UI app. A file saying `true` never engages Lua — engage always starts in-game. Both sides write `false` on `player_steer` / `player_brake` / `player_throttle` (sticky, whichever sees it first) and Lua writes `false` when its dead-man fires. The file is the durable record of *why*: later supervisor ticks only see `engaged=false` and write the generic `not_engaged` into `disengage_reason`, so the mod keeps the reason it adopted for the HUD.
@@ -162,7 +162,7 @@ Python reads the file every tick and mirrors it into `engaged` (never invents en
 | `override.ref_seq` | int | Command seq the residual was measured against |
 | `override.armed` | bool | False during the ~3 τ warm-up after engage |
 
-On a trip both sides write `gvd_engage.json` `engaged=false` with the `player_*` reason and stay off until Alt+A; the override tick also puts that reason in `gvd_cmd.json`.
+On a trip both sides write `gvd_engage.json` `engaged=false` with the `player_*` reason and stay off until Alt+G; the override tick also puts that reason in `gvd_cmd.json`.
 
 ## M6 — retail drive bus (`gvd_cmd.json` → vehicle, `gvd_ego.json` ← vehicle)
 
@@ -177,7 +177,7 @@ On a trip both sides write `gvd_engage.json` `engaged=false` with the `player_*`
 | `heartbeat_mtime` | float | `time.time()`; Lua ignores files whose stamp is > `CMD_DEAD_S` (1.0 s) behind `os.time()` (old session) |
 | `reason` | string | `ok` / `preview_blocked` / `not_engaged` / `veto:*` / … (diagnostic) |
 
-Lua (`gvd_main.applyCmdJson`, 20 Hz): `input.event('steering', s, 1)`; `input.event('throttle', t, 2)`; `input.event('brake', b, 2)` on `be:getPlayerVehicle(0)` via `queueLuaCommand`; `drivetrain.setShifterMode('arcade')` once. No new seq for `CMD_STALE_S` (0.35 s) → steer 0 / throttle 0 / brake 1 hold; after `CMD_DEAD_S` (1.0 s) → release (all 0), `engaged=false`, `gvd_engage.json` false. Any disengage (Alt+A, supervisor false, unload) sends one release and stops applying. `cmd.engaged=false` → release immediately (no brake tap on the player).
+Lua (`gvd_main.applyCmdJson`, 20 Hz): `input.event('steering', s, 1)`; `input.event('throttle', t, 2)`; `input.event('brake', b, 2)` on `be:getPlayerVehicle(0)` via `queueLuaCommand`; `drivetrain.setShifterMode('arcade')` once. No new seq for `CMD_STALE_S` (0.35 s) → steer 0 / throttle 0 / brake 1 hold; after `CMD_DEAD_S` (1.0 s) → release (all 0), `engaged=false`, `gvd_engage.json` false. Any disengage (Alt+G, supervisor false, unload) sends one release and stops applying. `cmd.engaged=false` → release immediately (no brake tap on the player).
 
 `Documents/GVD/gvd_ego.json` — written by Lua at ~10 Hz while the supervisor's state heartbeat is alive (vehicle Lua `electrics.values` → `obj:queueGameEngineLua` → `gvd_main.onEgoFeedback`):
 

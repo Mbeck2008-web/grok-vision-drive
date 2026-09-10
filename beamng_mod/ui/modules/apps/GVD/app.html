@@ -37,36 +37,6 @@
     .gvd-link.is-live .gvd-dot { box-shadow:0 0 6px rgba(158,196,212,0.9); }
     .gvd-link.is-stale { color:var(--amber); }
 
-    /* scene */
-    .gvd-scene {
-      position:relative; flex:1 1 auto; min-height:70px;
-      border:1px solid var(--line); border-radius:5px; overflow:hidden; background:var(--void);
-    }
-    .gvd-canvas { display:block; width:100%; height:100%; }
-    .gvd-hud {
-      position:absolute; top:6px; display:flex; align-items:baseline; gap:3px;
-      font-family:Consolas,'Roboto Mono',monospace; color:var(--paper); text-shadow:0 1px 3px #000;
-    }
-    .gvd-hud b { font-size:15px; font-weight:600; }
-    .gvd-hud i { font-size:8px; font-style:normal; color:var(--dim); letter-spacing:0.08em; }
-    .gvd-hud-l { left:8px; }
-    .gvd-hud-r { right:8px; }
-    .gvd-hud-r.is-warn b { color:var(--amber); }
-    .gvd-scene-note {
-      position:absolute; left:8px; right:8px; bottom:5px;
-      font-size:8.5px; letter-spacing:0.05em; color:#727c86; text-shadow:0 1px 3px #000;
-      white-space:nowrap; overflow:hidden; text-overflow:ellipsis; pointer-events:none;
-    }
-    .gvd-veil {
-      position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
-      background:rgba(7,8,10,0.62);
-    }
-    .gvd-veil span {
-      font-size:9px; letter-spacing:0.18em; text-transform:uppercase; color:var(--amber);
-      border:1px solid rgba(216,165,74,0.45); border-radius:3px; padding:4px 8px; background:rgba(7,8,10,0.75);
-    }
-    .gvd-veil.is-none span { color:var(--dim); border-color:var(--line); }
-
     /* engage */
     .gvd-state {
       display:flex; align-items:center; gap:8px; padding:5px 8px; border-radius:5px;
@@ -153,25 +123,13 @@
     </span>
   </div>
 
-  <div class="gvd-scene" ng-if="ui.showScene">
-    <canvas class="gvd-canvas"></canvas>
-    <div class="gvd-hud gvd-hud-l"><b>{{ kph() }}</b><i>KM/H</i></div>
-    <div class="gvd-hud gvd-hud-r" ng-class="{'is-warn': ui.ttc != null && ui.ttc < 2}" ng-if="ui.link === 'live'">
-      <b>{{ ui.ttc == null ? '--' : fmt1(ui.ttc) }}</b><i>S TTC</i>
-    </div>
-    <div class="gvd-scene-note" ng-if="ui.link === 'live'">{{ sceneNote() }}</div>
-    <div class="gvd-veil" ng-class="{'is-none': ui.link === 'none'}" ng-if="ui.link !== 'live'">
-      <span>{{ veil() }}</span>
-    </div>
-  </div>
-
   <div class="gvd-state" ng-class="stateClass()">
     <div class="gvd-state-main">{{ stateLabel() }}</div>
     <div class="gvd-state-sub">{{ stateReason() }}</div>
   </div>
 
   <button type="button" class="gvd-engage" ng-class="{'is-on': ui.engaged}" ng-click="toggleEngage()">
-    <span>{{ ui.engaged ? 'DISENGAGE' : 'ENGAGE' }}</span><i>ALT+A</i>
+    <span>{{ ui.engaged ? 'DISENGAGE' : 'ENGAGE' }}</span><i>ALT+G</i>
   </button>
 
   <div class="gvd-sec">
@@ -179,7 +137,6 @@
     <div class="gvd-chips">
       <button type="button" class="gvd-chip" ng-class="{'is-on': ui.showPath}" ng-click="setPath(!ui.showPath)">Path</button>
       <button type="button" class="gvd-chip" ng-class="{'is-on': ui.showGhosts}" ng-click="setGhosts(!ui.showGhosts)">Ghosts</button>
-      <button type="button" class="gvd-chip" ng-class="{'is-on': ui.showScene}" ng-click="setScene(!ui.showScene)">Scene</button>
     </div>
     <div class="gvd-sub" ng-class="{'is-warn': ui.pathConf != null && ui.pathConf < 0.45}">{{ pathLine() }}</div>
   </div>

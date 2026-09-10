@@ -208,7 +208,7 @@ def main() -> None:
     ap.add_argument(
         "--force-engage",
         action="store_true",
-        help="Dev only: treat as engaged without Alt+A gvd_engage.json (never default)",
+        help="Dev only: treat as engaged without Alt+G gvd_engage.json (never default)",
     )
     _ctrl_yaml = _load_control_yaml()
     _policy_default = str(_ctrl_yaml.get("policy_default") or "modular").lower()
@@ -340,7 +340,7 @@ def main() -> None:
     print(f"[GVD] clip encoder={recorder.encoder} (qsv prefer; never default nvenc)")
     print(f"[GVD] state path: {state_path()}")
     print("[GVD] Vision-only: no LiDAR/radar/GPS-loc/HD-map in the live loop.")
-    print("[GVD] M3: no drive on preview unless --allow-preview-drive; engage via Alt+A (gvd_engage.json).")
+    print("[GVD] M3: no drive on preview unless --allow-preview-drive; engage via Alt+G (gvd_engage.json).")
     print("[GVD] M4: clips on disengage / AEB / near-miss / key C. Live QSV UNPROVEN until Windows smoke.")
     print(
         f"[GVD] player override on the steer residual: enter {override_cfg.steer_enter:.3f} / "
@@ -467,7 +467,7 @@ def main() -> None:
             # Player override. Steer is the filtered residual against the command the mod says
             # it applied, so force-feedback noise cannot disengage; the pedals stay tight.
             # Sticky either way — otherwise Lua and the player fight at loop rate — so the
-            # engage flag stays false until Alt+A. Commands are noted below, after the actuator.
+            # engage flag stays false until Alt+G. Commands are noted below, after the actuator.
             ovr = override.update(
                 engaged=engaged,
                 steering_input=steer_in,

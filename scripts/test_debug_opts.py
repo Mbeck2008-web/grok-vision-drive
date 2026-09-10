@@ -246,8 +246,12 @@ def main() -> None:
     test_ui_keys_clicks()
     test_overlay_pixels()
     test_no_chrome()
+    from python.viz.nerd import FS_BODY, NERD_WIDTH
+
     assert any(r["id"] == "force_engage" for r in DEBUG_ROWS)
     assert viz_row_at(0)["id"] == "viz_dense"
+    assert FS_BODY >= 0.65, "nerd body type must stay large enough to read on a second screen"
+    assert NERD_WIDTH >= 520
     print("test_debug_opts: OK")
 
 

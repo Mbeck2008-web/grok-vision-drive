@@ -35,7 +35,7 @@ from python.viz.debug_draw import (
     draw_planner_cost,
 )
 from python.viz.forecast import cone_widths, predict_modes
-from python.viz.nerd import hit_test, render_panel, scene_note
+from python.viz.nerd import NERD_WIDTH, hit_test, render_panel, scene_note
 
 VOID = (10, 8, 7)  # #07080a
 PAPER = (225, 230, 232)
@@ -70,7 +70,7 @@ class VizUI:
     debug_sel: int = 0
     viz_sel: int = 0
     nerd_hits: list = field(default_factory=list)
-    nerd_width: int = 420
+    nerd_width: int = NERD_WIDTH
 
     def toggle_nerd(self) -> None:
         self.show_nerd = not self.show_nerd

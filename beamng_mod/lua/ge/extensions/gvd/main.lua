@@ -7,7 +7,7 @@ local M = {}
 local engaged = false
 local showPath = true
 local showAgentGhosts = false
-local showScene = true       -- in-app VISION canvas (player can switch it off; shares the GPU with BeamNG)
+local showScene = false      -- in-app canvas retired; lexicon lives on OpenCV GVD VISION
 local policyReq = nil        -- session-scoped policy request for the Python supervisor
 local vizScreenReq = nil     -- session-scoped GVD VISION monitor request
 

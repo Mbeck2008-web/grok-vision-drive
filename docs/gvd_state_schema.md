@@ -82,18 +82,18 @@ Written by the in-game **GVD** app (GELua is the only writer). **Wins over** `gv
 
 `policy` / `viz_screen` are **session requests**: `run_vision.py` applies them only when `mtime` is at or after supervisor start, so a pref from a past session never overrides `--policy` at launch. Modular veto and dead-man are unchanged by a policy request.
 
-## Viz road model (in-game scene)
+## Viz road model
 
-Drawn by the in-game **GVD** app. None of it feeds the planner — corridor, CIPV and AEB still read `lanes_bev` / `tracks` exactly as before.
+Drawn by the OpenCV **GVD VISION** window (`python/viz/stage.py`). The in-game **GVD** app is Engage + settings only. None of this feeds the planner — corridor, CIPV and AEB still read `lanes_bev` / `tracks` exactly as before.
 
 | `lanes_ext[]` | `{points:[{x,y}], kind, side, style, index}` | `kind`: `detected` (Hough saw the paint) / `predicted` (a detected boundary offset sideways by the measured lane width) / `stub` (`--smoke` only). `index` counts boundaries out from the ego lane (`±1` = its own edges, out to `±3` for the two-lane-per-side fan). `style` stays `unknown` — nothing classifies solid vs dashed yet |
 | `road_edges[]` | `{points:[{x,y}], kind, side}` | Kerb line just outside the outermost boundary. **Always `predicted`**: no kerb detector exists, this is the road edge implied by the lanes we can see |
-| `signs[]` | `{cls,x,y,conf,state}` | Road furniture straight from the detector: `stop_sign` (COCO 11), `traffic_light` (9), `pole` (10 / 12 — hydrants and parking meters, drawn as short grey sticks). Never tracked and never offered to CIPV or AEB. `state` is `unknown` for lights — no lamp-colour classifier, so the app draws all three lamps as empty rings |
+| `signs[]` | `{cls,x,y,conf,state}` | Road furniture straight from the detector: `stop_sign` (COCO 11), `traffic_light` (9), `pole` (10 / 12 — hydrants and parking meters, drawn as short grey sticks). Never tracked and never offered to CIPV or AEB. `state` is `unknown` for lights — no lamp-colour classifier, so the OpenCV stage draws all three lamps as empty rings |
 | `agents[]` | `{id, path_ego:[{x,y}]}` | Mode-0 constant-yaw-rate forecast fan per moving track, same toy math as the OpenCV view |
 
-### Scene cues derived in the app
+### Scene cues derived in the OpenCV stage
 
-These come from state the app already has — no extra fields, and each one needs its own signal:
+These come from state the stage already has — no extra fields, and each one needs its own signal:
 
 | Cue | Condition |
 | --- | --- |
@@ -106,7 +106,7 @@ These come from state the app already has — no extra fields, and each one need
 
 The only filled surface in the scene is the ego corridor; lane paint, kerbs and the lane fan are thin vector polylines, and the sky is void — there is no backdrop.
 
-Predictions need an anchor: with no detected lane there are no predicted lanes and no road edges, and with `lane_conf` under 0.25 only the detected boundaries ship. Sign positions inherit `project_box_to_ego`'s crude pinhole estimate, and sign/light heights in the scene are a drawing convention, not a measurement. The app draws detected geometry solid and everything predicted dim + dashed, and prints e.g. `lanes 2 seen+2 pred · edges pred · 2 signs` under the scene.
+Predictions need an anchor: with no detected lane there are no predicted lanes and no road edges, and with `lane_conf` under 0.25 only the detected boundaries ship. Sign positions inherit `project_box_to_ego`'s crude pinhole estimate, and sign/light heights in the scene are a drawing convention, not a measurement. The stage draws detected geometry solid and everything predicted dim + dashed, skips `kind=stub` except `--smoke` (`viz_smoke`), and prints e.g. `lanes 2 seen+2 pred · edges pred · 2 signs` under the window. Loop under 8 Hz drops forecast fans, signs and the `cam_main` PIP.
 
 ## In-game app bus
 

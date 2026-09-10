@@ -28,7 +28,7 @@ Windows first. No admin. Never writes into `Steam\steamapps\common\BeamNG.drive`
 
 ## Player guide (retail, M6)
 
-What you get on **retail BeamNG.drive**: the in-game **GVD** app (Engage / Disengage, show path, show ghosts), Alt+A engage, the ice-blue path ribbon on the road, the **GVD VISION** second window (cabin stage, tracks, nerd panel), clips in `Documents\GVD\clips`, and **driving**: while engaged, GVD steers, throttles and brakes the sim car along the lane corridor (HUD reads `modular|DRIVE`).
+What you get on **retail BeamNG.drive**: the in-game **GVD** app (Engage / Disengage, show path, show ghosts, policy, screen pick), Alt+A engage, the ice-blue path ribbon on the road, the **GVD VISION** second window (void-stage lexicon: multi-lane fan, ice corridor, CIPV boxes, curbs, signs), clips in `Documents\GVD\clips`, and **driving**: while engaged, GVD steers, throttles and brakes the sim car along the lane corridor (HUD reads `modular|DRIVE`).
 
 What retail is **not**: eight cameras. It captures **one** window (the main view); the other seven stay `missing` in the nerd panel and the boot line says `cams=1/8 path=retail`. It drives through the **mod's Lua** (`gvd_cmd.json` → vehicle `input.event`), not through BeamNGpy. Eight cameras and BeamNGpy direct control need BeamNG.**tech** (`GVD_BACKEND=beamngpy`, `GVD_BEAMNG=1`) — the preferred path.
 
@@ -89,10 +89,10 @@ mods\unpacked\gvd\
 
 After install, start a level, open the **Apps** editor (Esc → *UI Apps*, or the app-layout button on the HUD), drag **GVD** in from the app list, size it, then **Save layout**. Source: `beamng_mod/ui/modules/apps/GVD/`.
 
-The app draws an ego-centric **VISION scene** from the same `Documents/GVD/gvd_state.json` that feeds the world ribbon: a near-black stage with the ego just below centre, thin vector lane paint fanning two lanes out per side, warm-grey kerbs, and one filled surface — the ice-blue ego corridor, shaded by intent, with chevrons while slowing and a hard stop bar when the planner halts behind a lead. Road users are low-poly grey boxes that turn ice-blue in our corridor and red when we are braking for them, plus forecast fans, stop signs, traffic lights and poles when the detector sees them. Detected geometry is drawn solid, anything predicted is dim and dashed, and a line under the scene says which is which (`lanes 2 seen+2 pred · edges pred · 2 signs`). See [`docs/gvd_state_schema.md`](docs/gvd_state_schema.md#viz-road-model-in-game-scene) for what is measured vs inferred. Controls:
+The in-game app is **Engage / Disengage + settings only**. The rich VISION lexicon (void stage, multi-lane fan, ice corridor, CIPV boxes, warm curbs, sign/light glyphs) is drawn on the **GVD VISION** OpenCV second screen from the same `Documents/GVD/gvd_state.json`. See [`docs/gvd_state_schema.md`](docs/gvd_state_schema.md#viz-road-model) for what is measured vs inferred. Controls:
 
 - **Engage / Disengage** — the same toggle as Alt+A. The state strip reads `DRIVE` (the mod is feeding the player vehicle from `gvd_cmd.json`, or BeamNGpy is applying on Tech — steer to take over), `ENGAGED` (armed, nothing applied yet), `HOLD` (heartbeat stale → dead-man, inputs released) or `DISENGAGED` with the last reason.
-- **Path / Ghosts / Scene** — writes `gvd_ui_prefs.json`, so the world ribbon and the OpenCV window follow. `Scene` switches the canvas off (it shares the GPU with BeamNG).
+- **Path / Ghosts** — writes `gvd_ui_prefs.json`, so the world ribbon and the OpenCV window follow.
 - **Policy** `modular | e2e | shadow` — shows what the supervisor is actually running and requests a change for the running session; the modular veto is unchanged and `--policy` still wins at launch.
 - **Sensing** — capture backend, `n/8` healthy feeds, the retail `cam_main only` note, and buttons that move the **GVD VISION** OpenCV window to screen 1 / 2.
 - **+ nerd** — loop/camera Hz, infer ms, VRAM, detector, actuator, clip encoder, heartbeat age.
@@ -103,7 +103,7 @@ Titles stay **GVD** / **VISION**; Alt+A works with or without the app open. Offl
 
 **In-game (BeamNG world):** ice-blue ribbon drawn on the pavement via GELua `debugDrawer` (`drawSquarePrism`, 3-line fallback) — **1:1** with `path_ego` / `path_world` (x right, y forward, z up). Track ghosts sit on the road at the same transform; CIPV is brighter. Engage with Alt+A. GELua resolves `Documents/GVD` via USERPROFILE/LOCALAPPDATA/`FS:getUserPath` (USERPROFILE is often empty in-process). This is **not** a 2D camera overlay.
 
-**Second screen (`GVD VISION`):** OpenCV cabin on monitor 2 when available (`--viz-screen auto|1|2`, `--viz-fullscreen`, or `GVD_VIZ_MONITOR=2`). Same corridor, tracks, CIPV **LEAD** mark, optional `cam_main` PIP. One monitor → window stays put; drag it, or use motherboard HDMI for UHD 630 as display 2. Live dual-monitor + Alt+A still **UNPROVEN** on Linux / until Windows gate.
+**Second screen (`GVD VISION`):** OpenCV cabin on monitor 2 when available (`--viz-screen auto|1|2`, `--viz-fullscreen`, or `GVD_VIZ_MONITOR=2`). This is the VISION lexicon: near-black void stage, thin vector lane paint (`lanes_ext`: solid detected / dim-dashed predicted; smoke stubs only), warm-grey kerbs (`road_edges`), ice-blue ego corridor (intent shade, chevrons while slowing, stop bar when halted behind a CIPV), agent boxes (ice-blue in-path, CIPV **LEAD**, red **BRAKE**), forecast fans, and stop-sign / traffic-light / pole glyphs when `signs[]` is present. Optional `cam_main` PIP. Loop under 8 Hz drops fans, signs and PIP first. One monitor → window stays put; drag it, or use motherboard HDMI for UHD 630 as display 2. Live dual-monitor + Alt+A still **UNPROVEN** on Linux / until Windows gate.
 
 ## Status
 
@@ -133,15 +133,16 @@ Visualization **toy** (not a scientific claim that forecasts match Waymo). On-sc
 Ice-blue ego ribbon on the asphalt via GELua `debugDrawer` (`drawSquarePrism` → `drawLine` fallback), data from `Documents/GVD/gvd_state.json`. Engage with Alt+A. See `docs/gvd_state_schema.md`.
 
 ### Python window (extra)
-OpenCV cabin stage + nerd panel + forecast fans:
+OpenCV **GVD VISION** second screen owns the cabin lexicon (void stage, multi-lane fan, ice corridor, CIPV boxes, warm curbs, sign/light glyphs) plus nerd panel + forecast fans:
 
 ```bash
 pip install -r requirements-viz.txt
 PYTHONPATH=. python python/run_vision.py --smoke   # writes docs/gvd_viz_smoke.png
 PYTHONPATH=. python python/run_vision.py --viz      # live window + state file for BeamNG
+PYTHONPATH=. python scripts/test_gvd_viz_stage.py
 ```
 
-Keys in `--viz`: `V` nerd, `?` help, `0` clean cabin, `1–5` debug layers, `T` chase↔BEV, `q` quit. Caps: 32 agents / 16 forecast fans / 3 modes. If policy &lt; 8 Hz, drop fans + PIP first. In-game strip app: **GVD Strip** (mode · Hz · TTC · N).
+Keys in `--viz`: `V` nerd, `?` help, `0` clean cabin, `1–5` debug layers, `T` chase↔BEV, `q` quit. Caps: 32 agents / 16 forecast fans / 3 modes. If policy &lt; 8 Hz, drop fans, signs and PIP first. In-game strip app: **GVD Strip** (mode · Hz · TTC · N).
 
 
 ## Cameras (M1)

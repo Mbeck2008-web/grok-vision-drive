@@ -1239,6 +1239,9 @@ local function applyCmdJson(dt)
     -- Player switched vehicles while we held the wheel: free the old one, re-arm arcade for the new one.
     queueVehicle(applyVeh, VE_RELEASE)
     arcadeQueued = false
+    -- New car, new baseline: its electrics echo says nothing about the old car's commands.
+    ovrReset()
+    ovrEchoStamp = nil
     log('I', 'GVD', '[GVD] player vehicle changed: released previous vehicle inputs')
   end
   applyVeh = veh

@@ -320,6 +320,20 @@ echo(0.30, 0.3, 0)
 driveTick(0, 0.3, 0, tuned); driveTick(0, 0.3, 0, tuned)
 check(not M.isEngaged(), 'tuned steer_enter 0.20 trips on a 0.30 hold the default 0.55 ignores')
 
+-- swapping vehicles re-arms the warm-up: the new car's echo says nothing about the old car's
+-- commands, and with these tuned thresholds a stale envelope would trip on the first tick
+echo(0, 0.3, 0)
+M.toggleEngage()
+for _ = 1, 6 do driveTick(0, 0.3, 0, tuned) end
+check(M.isEngaged(), 'driving before the vehicle switch')
+currentVeh = otherVeh
+echo(0.9, 0.3, 0)
+driveTick(0, 0.3, 0, tuned); driveTick(0, 0.3, 0, tuned)
+check(M.isEngaged(), 'vehicle switch re-arms the override warm-up')
+for _ = 1, 4 do driveTick(0, 0.3, 0, tuned) end
+check(not M.isEngaged(), 'once warm again the same steer is an override')
+currentVeh = fakeVeh
+
 -- 12) chrome check on everything we push to the vehicle / HUD
 for _, e in ipairs(logs) do assert(not e:lower():find('tesla') and not e:find('FSD'), 'chrome in log: ' .. e) end
 

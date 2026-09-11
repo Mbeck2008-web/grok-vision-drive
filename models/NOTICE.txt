@@ -1,0 +1,5 @@
+YOLOv8n detect weights in this folder are Ultralytics COCO checkpoints, not GVD-trained.
+
+- models/yolov8n.onnx  -- shipped. Ultralytics YOLOv8n detect @640, ONNX. License: AGPL-3.0 (Ultralytics). The rest of GVD stays MIT.
+- models/*.pt and other *.onnx stay gitignored. Optional local extras: python scripts/download_yolov8n.py --size s
+- No e2e_current.onnx: the E2E policy is still the in-repo numpy stub until you train and export one.

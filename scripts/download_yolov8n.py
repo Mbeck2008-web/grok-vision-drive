@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Download a YOLOv8 detect checkpoint and export ONNX @640 into models/ (gitignored).
+"""Download a YOLOv8 detect checkpoint and export ONNX @640 into models/.
 
-Default is yolov8n (the GVD target). s/m/l/x work with the same ONNX detector
-if you have the VRAM. Not a model zoo commit: weights stay local.
+``models/yolov8n.onnx`` is shipped in git. Use this for s/m/l/x extras (gitignored).
 
   PYTHONPATH=. python scripts/download_yolov8n.py --size n
   PYTHONPATH=. python scripts/download_yolov8n.py --size s
@@ -49,7 +48,7 @@ def main() -> None:
         print(f"[GVD] wrote {dest}")
     else:
         print("[GVD] export returned no file — use the yolo export one-liner in the docstring")
-    print("[GVD] weights are gitignored (*.pt / *.onnx).")
+    print("[GVD] n is the shipped detector; s/m/l/x ONNX stay gitignored.")
 
 
 if __name__ == "__main__":

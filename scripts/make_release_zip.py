@@ -8,8 +8,9 @@ Ships the **retail** slice a player double-clicks:
   install.bat / uninstall.bat / play_gvd.bat, beamng_mod/, python/ (runtime),
   config/, requirements.txt + requirements-retail.txt, LICENSE, README.md, docs/*.md, VERSION.txt.
 
-Never ships: data/clips/, weights (*.onnx *.pt *.pth *.bin *.safetensors …),
+Never ships: data/clips/, extra weights (*.pt, e2e ONNX, random blobs),
 .git, __pycache__, venvs, scripts/ (tests + this tool), dist/.
+Does ship: models/yolov8n.onnx (YOLOv8n detect, AGPL Ultralytics).
 
 Honesty: retail = 1-cam window capture only. 8-cam rig needs BeamNG.tech + BeamNGpy.
 No Tesla / FSD chrome. Not real-vehicle control.
@@ -44,6 +45,8 @@ INCLUDE_GLOBS = (
     "requirements-retail.txt",
     "docs/*.md",
     "models/.gitkeep",
+    "models/NOTICE.txt",
+    "models/yolov8n.onnx",
 )
 # Directories copied recursively (subject to EXCLUDE_* below).
 INCLUDE_DIRS = ("beamng_mod", "python", "config")
@@ -65,6 +68,7 @@ MUST_HAVE = (
     "config/cameras.yaml",
     "config/hardware.yaml",
     "VERSION.txt",
+    "models/yolov8n.onnx",
 )
 
 # Directory names skipped anywhere in the tree (tooling/cache junk only —
@@ -107,6 +111,9 @@ EXCLUDE_FILE_GLOBS = (
     ".gitattributes",
     "data/clips/*",
 )
+
+# Detect ONNX that must ship so retail auto-detector is YOLOv8n, not empty.
+SHIPPED_WEIGHTS = frozenset({"models/yolov8n.onnx"})
 # Never allowed in the built archive (belt-and-suspenders verification).
 FORBIDDEN_ARCHIVE_GLOBS = (
     "*.onnx",
@@ -154,7 +161,13 @@ def _excluded_dir(name: str) -> bool:
     return name in EXCLUDE_DIR_NAMES
 
 
+def _is_shipped_weight(rel: str) -> bool:
+    return rel.replace("\\", "/").lstrip("./") in SHIPPED_WEIGHTS
+
+
 def _excluded_file(rel: str) -> bool:
+    if _is_shipped_weight(rel):
+        return False
     if rel.startswith(EXCLUDE_REL_PREFIXES):
         return True
     name = rel.rsplit("/", 1)[-1]
@@ -268,6 +281,9 @@ def verify(zip_path: Path, *, flat: bool, version: str) -> list[str]:
             if prefix and not n.startswith(prefix):
                 problems.append(f"member outside top-level folder: {n}")
             for pat in FORBIDDEN_ARCHIVE_GLOBS:
+                rel_n = n[len(prefix):] if prefix and n.startswith(prefix) else n
+                if _is_shipped_weight(rel_n):
+                    continue
                 if fnmatch.fnmatch(n, pat) or fnmatch.fnmatch(n.rsplit("/", 1)[-1], pat):
                     problems.append(f"forbidden member: {n}")
                     break
@@ -278,7 +294,7 @@ def verify(zip_path: Path, *, flat: bool, version: str) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Build the GVD retail release zip (no weights, no clips, no .git).")
+    ap = argparse.ArgumentParser(description="Build the GVD retail release zip (YOLOv8n ONNX in, other weights/clips/.git out).")
     ap.add_argument("--version", default=None, help="Version label (default: exact git tag, else m6-<sha>)")
     ap.add_argument("--out", default=None, help="Output path (default: dist/gvd-retail-<version>.zip)")
     ap.add_argument("--flat", action="store_true", help="No top-level gvd-retail-<version>/ folder inside the zip")
@@ -309,7 +325,7 @@ def main(argv: list[str] | None = None) -> int:
 
     size_mb = zip_path.stat().st_size / (1024 * 1024)
     print(f"[GVD] release zip -> {zip_path}  ({len(names)} files, {size_mb:.2f} MB)")
-    print("[GVD] excluded: data/clips/, weights (*.onnx *.pt *.pth *.bin *.safetensors), .git, scripts/, __pycache__")
+    print("[GVD] excluded: data/clips/, extra weights (*.pt / e2e onnx), .git, scripts/, __pycache__")
     for line in HONESTY_LINES:
         print(f"[GVD] {line}")
     return 0

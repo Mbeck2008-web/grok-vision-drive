@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT))
 
 CHROME_RE = re.compile(r"tesla|\bfsd\b|full self[- ]driving|autopilot", re.I)
 
-from python.perception.detect import EmptyDetector, SyntheticDetector
+from python.perception.detect import EmptyDetector, OnnxYoloDetector, SyntheticDetector
 from python.perception.pipeline import ModularPerception
 from python.runtime.debug_opts import DebugOpts
 from python.runtime.models import (
@@ -28,12 +28,14 @@ from python.runtime.models import (
 import python.runtime.models as models_mod
 
 
-def test_catalog_without_weights() -> None:
+def test_catalog_shipped_n() -> None:
     det_ids = ids_for("detector")
     assert det_ids[0] == "auto"
     assert "synthetic" in det_ids and "empty" in det_ids
-    # No invented zoo: YOLO ids only when files exist.
-    for stem in ("yolov8n-onnx", "yolov8s-onnx", "yolov8m-onnx"):
+    assert "yolov8n-onnx" in det_ids
+    n = next(c for c in detector_choices() if c.id == "yolov8n-onnx")
+    assert n.path is not None and n.path.is_file()
+    for stem in ("yolov8s-onnx", "yolov8m-onnx"):
         if stem in det_ids:
             path = next(c.path for c in detector_choices() if c.id == stem)
             assert path is not None and path.is_file()
@@ -56,6 +58,12 @@ def test_load_fallbacks() -> None:
         pass
     pol = load_e2e("stub")
     assert pol.backend == "stub"
+    det, miss = load_detector("yolov8n-onnx")
+    assert isinstance(det, OnnxYoloDetector) and det.name == "yolov8n-onnx" and miss == []
+    import numpy as np
+
+    blank = det.detect(np.zeros((240, 320, 3), dtype=np.uint8))
+    assert isinstance(blank, list)
     try:
         load_e2e("missing-e2e-id")
         raise AssertionError("unknown e2e must raise")
@@ -112,7 +120,7 @@ def test_no_chrome() -> None:
 
 
 def main() -> None:
-    test_catalog_without_weights()
+    test_catalog_shipped_n()
     test_load_fallbacks()
     test_hot_swap()
     with tempfile.TemporaryDirectory() as td:

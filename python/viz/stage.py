@@ -1055,7 +1055,7 @@ def smoke(ui: VizUI | None = None, use_perception: bool = False) -> "Path":
     if use_perception:
         from python.perception.pipeline import ModularPerception
 
-        perc = ModularPerception(allow_synthetic=True)
+        perc = ModularPerception(allow_synthetic=True, detector_id="synthetic")
         fake = np.zeros((480, 640, 3), dtype=np.uint8)
         pout = perc.tick(fake, ego_speed_mps=12.0, steer_deg=0.0)
         st["tracks"] = pout.tracks

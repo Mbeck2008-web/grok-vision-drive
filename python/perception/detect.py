@@ -108,7 +108,9 @@ class OnnxYoloDetector(Detector):
         self.path = Path(onnx_path)
         self.name = f"{self.path.stem}-onnx"
         self.conf = conf
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        want = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        avail = set(ort.get_available_providers())
+        providers = [p for p in want if p in avail] or ["CPUExecutionProvider"]
         self.session = ort.InferenceSession(str(self.path), providers=providers)
         self.input_name = self.session.get_inputs()[0].name
         shape = self.session.get_inputs()[0].shape

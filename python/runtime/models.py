@@ -1,12 +1,13 @@
 """Discover and load the nets GVD can actually run.
 
-There is no in-repo model zoo (weights are gitignored). This catalog lists:
+Shipped: ``models/yolov8n.onnx`` (Ultralytics YOLOv8n detect @640). Other
+``*.onnx`` / ``*.pt`` stay gitignored. This catalog lists:
 
 * Detector: YOLOv8 *detect* ONNX or Ultralytics ``.pt`` found under ``models/``
   (stems ``yolov8n`` / ``s`` / ``m`` / ``l`` / ``x``, plus any other ``yolov8*.onnx|pt``).
   Always-available fallbacks: ``synthetic`` (smoke leads) and ``empty`` (no boxes).
 * E2E: PilotNet-scale ONNX (``e2e*.onnx`` / ``config/control.yaml`` ``e2e.model``) or the
-  numpy stub. Named feeds: main / wide 1x3x180x320 + kin 1x2.
+  numpy stub. Named feeds: main / wide 1x3x180x320 + kin 1x2. No trained E2E file is shipped.
 
 Not loadable here: lane nets (Hough only), transformers / ViT / BEV, YOLO-seg,
 Ultralytics YOLO-world, or anything that is not that detect/E2E contract.

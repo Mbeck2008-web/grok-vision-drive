@@ -8,7 +8,7 @@ venv/
 dist/
 gvd-retail-*.zip
 
-# M5 E2E / model weight blobs (never commit)
+# Weight blobs. Exception: the shipped YOLOv8n detect ONNX (COCO).
 *.onnx
 *.pt
 *.pth
@@ -17,3 +17,4 @@ gvd-retail-*.zip
 models/*.onnx
 models/*.pt
 !models/.gitkeep
+!models/yolov8n.onnx

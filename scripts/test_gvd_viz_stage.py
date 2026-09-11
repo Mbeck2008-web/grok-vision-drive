@@ -27,7 +27,7 @@ def main() -> None:
             assert hit is None, f"{name}: {label} found ({hit.group(0)!r})"
     assert "GVD" in stage_src and "VISION" in stage_src
 
-    from python.viz.nerd import _extras_line, _nav_line, scene_note
+    from python.viz.nerd import FS_BODY, TH, VAL_COL_W, _extras_line, _nav_line, _text_size, scene_note
     from python.viz.stage import (
         VizUI,
         _track_dims,
@@ -182,6 +182,7 @@ def main() -> None:
     nerd.show_model_tab()
     model_frame = render_stage(st, ui=nerd)
     assert model_frame.shape == drive_frame.shape
+    assert _text_size("yolov8n-onnx", FS_BODY, TH)[0] <= VAL_COL_W - 4, "MODEL value column must fit shipped id"
     nerd.show_viz_tab()
     nerd.debug.viz_dense = True
     nerd.debug.apply_dense()

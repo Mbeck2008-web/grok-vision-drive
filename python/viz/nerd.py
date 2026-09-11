@@ -25,6 +25,8 @@ TH = 2
 ROW_H = 32
 TAB_H = 36
 PAD_X = 16
+# yolov8n-onnx is 133px at FS_BODY; keep pad so shipped ids are not clipped.
+VAL_COL_W = 148
 
 
 def scene_note(s: dict[str, Any]) -> str:
@@ -209,7 +211,7 @@ def _draw_knob_tab(
 
     plus_box = 26
     minus_box = 26
-    val_col = 118
+    val_col = VAL_COL_W
     plus = (w - 14 - plus_box, 0, w - 12, 0)
     val_x = plus[0] - 8 - val_col
     minus_x0 = val_x - minus_box - 8

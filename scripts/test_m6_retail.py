@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline M6 retail-package checks (no BeamNG, no weights, no network)."""
+"""Offline M6 retail-package checks (no BeamNG, no network)."""
 from __future__ import annotations
 
 import ast
@@ -84,8 +84,13 @@ def check_release_zip() -> None:
             rels = [m.split("/", 1)[1] for m in members]
             for must in rel.MUST_HAVE:
                 assert must in rels, f"missing {must}"
-            for bad in (".onnx", ".pt", ".safetensors", ".pyc", ".mp4"):
+            for bad in (".pt", ".safetensors", ".pyc", ".mp4"):
                 assert not any(r.endswith(bad) for r in rels), bad
+            onnx_members = [r for r in rels if r.endswith(".onnx")]
+            assert onnx_members == ["models/yolov8n.onnx"], onnx_members
+            assert "models/NOTICE.txt" in rels
+            assert "models/e2e_current.onnx" not in rels
+            assert "models/yolov8n.pt" not in rels
             assert not any(r.startswith((".git/", "data/", "dist/", "scripts/")) for r in rels)
             assert "requirements-beamng.txt" not in rels
             assert "play_gvd_tech.bat" not in rels  # Tech launcher stays out of the retail zip
@@ -98,6 +103,7 @@ def check_release_zip() -> None:
             assert "beamng_mod/scripts/gvd/modScript.lua" in rels
             assert "beamng_mod/ui/modules/apps/GVD/app.png" in rels
             assert "models/.gitkeep" in rels
+            assert "models/yolov8n.onnx" in rels
             assert not any(r.startswith("scripts/test_") for r in rels)
             # Windows-friendly: .bat files are CRLF inside the zip.
             for r in ("install.bat", "uninstall.bat", "play_gvd.bat"):
@@ -118,7 +124,9 @@ def check_release_zip() -> None:
     # The real checkout must package cleanly too (manifest only; no dist/ write).
     real = rel.collect_files(ROOT)
     assert "install.bat" in real and "python/run_vision.py" in real
-    assert not any(f.endswith((".onnx", ".pt")) for f in real)
+    assert "models/yolov8n.onnx" in real
+    assert not any(f.endswith(".pt") for f in real)
+    assert not any(f.endswith(".onnx") and f != "models/yolov8n.onnx" for f in real)
     assert "requirements-foxglove.txt" not in real
     assert "config/sensors.yaml" in real
     assert "python/sensors/extras.py" in real
@@ -560,6 +568,7 @@ def check_no_chrome() -> None:
         ROOT / "python" / "run_vision.py",
         ROOT / "python" / "runtime" / "hw_probe.py",
         ROOT / "python" / "runtime" / "debug_opts.py",
+        ROOT / "python" / "runtime" / "models.py",
         ROOT / "python" / "sensors" / "tech.py",
         *(ROOT / "python" / "viz").glob("*.py"),
     ]:

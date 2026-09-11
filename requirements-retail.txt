@@ -1,6 +1,7 @@
 # Retail player runtime (M6): 1-cam window capture + GVD VISION window + state file.
 # No beamngpy here — the 8-cam rig is the Tech path (requirements-beamng.txt).
 -r requirements.txt
+onnxruntime>=1.16
 mss>=9.0.0
 bettercam>=1.0.0; platform_system=="Windows"
 pywin32>=306; platform_system=="Windows"  # BeamNG window title match

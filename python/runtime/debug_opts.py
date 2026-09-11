@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from python.control.actuate import DriveCommand
+from python.runtime.models import cycle_id
 
 POLICIES = ("session", "modular", "e2e", "shadow")
 
@@ -178,8 +179,31 @@ VIZ_ROWS: tuple[dict[str, Any], ...] = (
     {"id": "viz_cams", "kind": "bool", "label": "camera strip", "attr": "viz_cams"},
 )
 
+# Nerd MODEL tab: cycle nets that are actually loadable (scan models/). Always
+# has synthetic/empty + e2e stub; YOLO/E2E ONNX appear only when files exist.
+MODEL_ROWS: tuple[dict[str, Any], ...] = (
+    {"id": "nets", "kind": "header", "label": "WEIGHTS — models/"},
+    {
+        "id": "detector_id",
+        "kind": "model",
+        "label": "detector",
+        "attr": "detector_id",
+        "role": "detector",
+        "hint": "YOLOv8 detect ONNX/pt, or synthetic/empty",
+    },
+    {
+        "id": "e2e_id",
+        "kind": "model",
+        "label": "e2e",
+        "attr": "e2e_id",
+        "role": "e2e",
+        "hint": "PilotNet-scale ONNX or numpy stub",
+    },
+)
+
 CONTROL_ROWS = tuple(r for r in DEBUG_ROWS if r.get("kind") != "header")
 VIZ_CONTROL_ROWS = tuple(r for r in VIZ_ROWS if r.get("kind") != "header")
+MODEL_CONTROL_ROWS = tuple(r for r in MODEL_ROWS if r.get("kind") != "header")
 
 # Key 1–5 ↔ overlay attrs. Dense overlay turns the annotation stack on together.
 LAYER_ATTR = {1: "viz_occ", 2: "viz_boxes", 3: "viz_lane_poly", 4: "viz_frustums", 5: "viz_cost"}
@@ -216,6 +240,8 @@ class DebugOpts:
     lane_conf_min: float = 0.25
     lanes_on: bool = True
     detector_on: bool = True
+    detector_id: str = "auto"
+    e2e_id: str = "auto"
     viz_dense: bool = False
     viz_path: bool = True
     viz_lanes: bool = True
@@ -263,6 +289,8 @@ class DebugOpts:
             "lane_conf_min": float(self.lane_conf_min),
             "lanes_on": bool(self.lanes_on),
             "detector_on": bool(self.detector_on),
+            "detector_id": str(self.detector_id),
+            "e2e_id": str(self.e2e_id),
             "viz_dense": bool(self.viz_dense),
             "viz_path": bool(self.viz_path),
             "viz_lanes": bool(self.viz_lanes),
@@ -294,6 +322,8 @@ class DebugOpts:
             return "ON" if val else "off"
         if kind == "enum":
             return str(val)
+        if kind == "model":
+            return str(val or "auto")
         if kind == "float_opt":
             if val is None:
                 return "off"
@@ -321,6 +351,10 @@ class DebugOpts:
             i = values.index(cur) if cur in values else 0
             setattr(self, attr, values[(i + 1) % len(values)])
             return
+        if kind == "model":
+            role = str(row.get("role") or "detector")
+            setattr(self, attr, cycle_id(role, str(getattr(self, attr) or "auto"), +1))
+            return
         if kind == "float_opt":
             cur = getattr(self, attr)
             if cur is None:
@@ -340,6 +374,10 @@ class DebugOpts:
             cur = str(getattr(self, attr) or values[0])
             i = values.index(cur) if cur in values else 0
             setattr(self, attr, values[(i + (1 if direction >= 0 else -1)) % len(values)])
+            return
+        if kind == "model":
+            role = str(row.get("role") or "detector")
+            setattr(self, attr, cycle_id(role, str(getattr(self, attr) or "auto"), direction))
             return
         if kind == "bool":
             if direction != 0:
@@ -383,6 +421,17 @@ def viz_control_index(sel: int) -> int:
 
 def viz_row_at(sel: int) -> dict[str, Any]:
     return VIZ_CONTROL_ROWS[viz_control_index(sel)]
+
+
+def model_control_index(sel: int) -> int:
+    n = len(MODEL_CONTROL_ROWS)
+    if n <= 0:
+        return 0
+    return sel % n
+
+
+def model_row_at(sel: int) -> dict[str, Any]:
+    return MODEL_CONTROL_ROWS[model_control_index(sel)]
 
 
 def apply_to_perception(opts: DebugOpts, pout: Any) -> Any:

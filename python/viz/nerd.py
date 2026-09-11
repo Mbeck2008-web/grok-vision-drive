@@ -1,4 +1,4 @@
-"""Monospace nerd overlay (toggle V). Tabs: LIVE telemetry / DRIVE / VIZ / keys."""
+"""Monospace nerd overlay (toggle V). Tabs: LIVE telemetry / DRIVE / VIZ / MODEL / keys."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import Any
 import cv2
 import numpy as np
 
-from python.runtime.debug_opts import DEBUG_ROWS, VIZ_ROWS, DebugOpts
+from python.runtime.debug_opts import DEBUG_ROWS, MODEL_ROWS, VIZ_ROWS, DebugOpts
 
 BG = (16, 13, 12)
 FG = (212, 204, 200)
@@ -101,6 +101,7 @@ def render_panel(
     opts = DebugOpts()
     sel = 0
     viz_sel = 0
+    model_sel = 0
     hits: list[dict[str, Any]] = []
     if ui is not None:
         tab = str(getattr(ui, "nerd_tab", None) or tab)
@@ -109,6 +110,7 @@ def render_panel(
         opts = getattr(ui, "debug", None) or opts
         sel = int(getattr(ui, "debug_sel", 0) or 0)
         viz_sel = int(getattr(ui, "viz_sel", 0) or 0)
+        model_sel = int(getattr(ui, "model_sel", 0) or 0)
         if getattr(ui, "nerd_width", 0):
             w = int(ui.nerd_width)
             if img.shape[1] != w:
@@ -136,6 +138,11 @@ def render_panel(
             img, opts, viz_sel, y + 8, h, w, hits, VIZ_ROWS,
             intro="stage layers — occupancy is from tracks, not a net",
         )
+    elif tab == "model":
+        y = _draw_knob_tab(
+            img, opts, model_sel, y + 8, h, w, hits, MODEL_ROWS,
+            intro="YOLOv8 detect / E2E in models/; lanes stay Hough",
+        )
     else:
         y += 10
         for line in _lines(state):
@@ -144,7 +151,7 @@ def render_panel(
             y += ROW_H
             if y > live_limit:
                 break
-    _put(img, _fit("D drive  G viz  [ ] tab  click  V hide", w - 24, FS_DIM), (12, h - 16), FS_DIM, DIM)
+    _put(img, _fit("D drive  G viz  M model  [ ] tab  V hide", w - 24, FS_DIM), (12, h - 16), FS_DIM, DIM)
     if ui is not None:
         ui.nerd_hits = hits
         ui.nerd_tab = tab
@@ -154,7 +161,7 @@ def render_panel(
 def _draw_tabs(
     img: np.ndarray, tab: str, w: int, y: int, hits: list[dict[str, Any]]
 ) -> int:
-    labels = (("live", "LIVE"), ("drive", "DRIVE"), ("viz", "VIZ"), ("keys", "KEYS"))
+    labels = (("live", "LIVE"), ("drive", "DRIVE"), ("viz", "VIZ"), ("model", "MODEL"), ("keys", "KEYS"))
     x = 12
     for tid, label in labels:
         tw, _th = _text_size(label, FS_TAB)
@@ -272,7 +279,8 @@ def _help_lines() -> list[str]:
         "  V  toggle this nerd panel",
         "  D  DRIVE tab (gates / actuators / AEB)",
         "  G  VIZ tab (overlay layers)",
-        "  [ ] cycle LIVE / DRIVE / VIZ / KEYS",
+        "  M  MODEL tab (detector / e2e nets)",
+        "  [ ] cycle LIVE / DRIVE / VIZ / MODEL / KEYS",
         "  j/k  select row   h/l nudge",
         "  Enter / click  toggle",
         "  0  clean cabin (stage only)",
@@ -420,6 +428,6 @@ def _debug_line(s: dict[str, Any]) -> str:
     except (TypeError, ValueError):
         cap_s = "?"
     return (
-        f"debug pol={dbg.get('policy')} preview={dbg.get('allow_preview')} "
-        f"aeb={dbg.get('aeb_on')} cap={cap_s}"
+        f"debug pol={dbg.get('policy')} det={dbg.get('detector_id')} e2e={dbg.get('e2e_id')} "
+        f"preview={dbg.get('allow_preview')} aeb={dbg.get('aeb_on')} cap={cap_s}"
     )

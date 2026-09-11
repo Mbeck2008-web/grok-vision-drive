@@ -141,7 +141,7 @@ Predictions need an anchor: with no detected lane there are no predicted lanes a
 | `veto_reason` | string | `none` / `aeb_brake` / `aeb_warn` / `low_lane_conf` / `low_path_conf` / `heartbeat_stale` / `disagreement` / `e2e_forward_fail` / `preview_blocked` |
 | `e2e_backend` | string | `stub` / `onnx` |
 
-Perception always runs. Actuators only when engaged **and** modular OK. Shadow mode computes both intents; default apply path stays modular. Dead-man / heartbeat unchanged. No weight blobs in git (`models/e2e_current.onnx` gitignored).
+Perception always runs. Actuators only when engaged **and** modular OK. Shadow mode computes both intents; default apply path stays modular. Dead-man / heartbeat unchanged. Detector default is shipped `models/yolov8n.onnx`. No E2E checkpoint in git (`models/e2e_current.onnx` still gitignored).
 
 
 ## M6 — `gvd_engage.json` contract (retail package)
@@ -224,6 +224,7 @@ Written every tick from the GVD VISION nerd **DRIVE** / **VIZ** tabs (`python/ru
 | `aeb_on` / `aeb_ttc` / `cipv_on` | Rewrite planner AEB/CIPV before `shadow_tick` |
 | `speed_cap` / `cruise_mps` / `corridor_width` / `lane_conf_min` | Speed and veto knobs |
 | `lanes_on` / `detector_on` | Drop lane paint (preview path) or YOLO tracks |
+| `detector_id` / `e2e_id` | Nerd **MODEL** tab. `auto` uses shipped `yolov8n.onnx` when present. `synthetic` / `empty` plus any extra `models/yolov8*.onnx\|pt` or `e2e*.onnx`. Unknown ids are not listed. Lanes are Hough (no net). |
 | `viz_*` | OpenCV overlay layers. `viz_occ` occupancy is **from tracks**, not a learned grid. Keys `1–5` map to occ / detector boxes / lane polynomials / camera FOV / planner samples |
 
 `occupancy` in state stays `null` (no occupancy net). The VIZ overlay is drawn in OpenCV only.

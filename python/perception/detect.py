@@ -106,8 +106,11 @@ class OnnxYoloDetector(Detector):
         import onnxruntime as ort  # type: ignore
 
         self.path = Path(onnx_path)
+        self.name = f"{self.path.stem}-onnx"
         self.conf = conf
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        want = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        avail = set(ort.get_available_providers())
+        providers = [p for p in want if p in avail] or ["CPUExecutionProvider"]
         self.session = ort.InferenceSession(str(self.path), providers=providers)
         self.input_name = self.session.get_inputs()[0].name
         shape = self.session.get_inputs()[0].shape
@@ -157,6 +160,37 @@ class OnnxYoloDetector(Detector):
         return dets
 
 
+class UltraYoloDetector(Detector):
+    """Ultralytics .pt path (optional). Same COCO class map as the ONNX detector."""
+
+    name = "yolov8n-ultra"
+
+    def __init__(self, pt_path: Path, conf: float = 0.35) -> None:
+        from ultralytics import YOLO  # type: ignore
+
+        self.path = Path(pt_path)
+        self.name = f"{self.path.stem}-ultra"
+        self.conf = conf
+        self.model = YOLO(str(self.path))
+
+    def detect(self, bgr: np.ndarray | None) -> list[Detection]:
+        if bgr is None or (hasattr(bgr, "size") and bgr.size == 0):
+            return []
+        res = self.model.predict(bgr, imgsz=640, conf=self.conf, verbose=False)[0]
+        out: list[Detection] = []
+        h0, w0 = bgr.shape[:2]
+        for box in res.boxes:
+            cls_id = int(box.cls.item())
+            score = float(box.conf.item())
+            x1, y1, x2, y2 = map(float, box.xyxy[0].tolist())
+            cls = coco_class_name(cls_id)
+            if cls is None:
+                continue
+            ex, ey, yaw = project_box_to_ego((x1, y1, x2, y2), w0, h0)
+            out.append(Detection(cls=cls, conf=score, xyxy=(x1, y1, x2, y2), x=ex, y=ey, yaw=yaw))
+        return out
+
+
 def make_detector(*, allow_synthetic: bool = True) -> tuple[Detector, list[str]]:
     """Return detector + missing keys. Prefer ONNX; Ultralytics pt optional; else synthetic/empty."""
     missing: list[str] = []
@@ -165,36 +199,10 @@ def make_detector(*, allow_synthetic: bool = True) -> tuple[Detector, list[str]]
             return OnnxYoloDetector(DEFAULT_ONNX), missing
         except Exception as e:
             missing.append(f"onnx_load:{e}")
-    # optional ultralytics
     pt = ROOT / "models" / "yolov8n.pt"
     if pt.is_file():
         try:
-            from ultralytics import YOLO  # type: ignore
-
-            class _Ultra(Detector):
-                name = "yolov8n-ultra"
-
-                def __init__(self) -> None:
-                    self.model = YOLO(str(pt))
-
-                def detect(self, bgr: np.ndarray | None) -> list[Detection]:
-                    if bgr is None:
-                        return []
-                    res = self.model.predict(bgr, imgsz=640, verbose=False)[0]
-                    out: list[Detection] = []
-                    h0, w0 = bgr.shape[:2]
-                    for box in res.boxes:
-                        cls_id = int(box.cls.item())
-                        score = float(box.conf.item())
-                        x1, y1, x2, y2 = map(float, box.xyxy[0].tolist())
-                        cls = coco_class_name(cls_id)
-                        if cls is None:
-                            continue
-                        ex, ey, yaw = project_box_to_ego((x1, y1, x2, y2), w0, h0)
-                        out.append(Detection(cls=cls, conf=score, xyxy=(x1, y1, x2, y2), x=ex, y=ey, yaw=yaw))
-                    return out
-
-            return _Ultra(), missing
+            return UltraYoloDetector(pt), missing
         except Exception as e:
             missing.append(f"ultra_load:{e}")
     missing.append("yolo_weights")

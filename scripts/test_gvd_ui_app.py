@@ -163,7 +163,9 @@ def _check_road_model() -> None:
     from python.perception.pipeline import ModularPerception
     import numpy as np
 
-    out = ModularPerception(allow_synthetic=True).tick(np.zeros((240, 320, 3), dtype=np.uint8))
+    out = ModularPerception(allow_synthetic=True, detector_id="synthetic").tick(
+        np.zeros((240, 320, 3), dtype=np.uint8)
+    )
     assert {s["cls"] for s in out.signs} == {"stop_sign", "traffic_light"}, out.signs
     assert all(t["class"] not in STATIC_CLASSES for t in out.tracks), out.tracks
     light = [s for s in out.signs if s["cls"] == "traffic_light"][0]

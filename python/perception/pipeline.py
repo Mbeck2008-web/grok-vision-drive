@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 
 from python.perception.cipv import select_cipv
-from python.perception.detect import STATIC_CLASSES, make_detector
+from python.perception.detect import STATIC_CLASSES
 from python.perception.lanes import estimate_lanes
 from python.perception.track import IoUTracker
 from python.planning.corridor import build_path_ego
@@ -38,8 +38,16 @@ class PerceptionOut:
 
 
 class ModularPerception:
-    def __init__(self, *, allow_synthetic: bool = True) -> None:
-        self.detector, self.missing = make_detector(allow_synthetic=allow_synthetic)
+    def __init__(self, *, allow_synthetic: bool = True, detector_id: str = "auto") -> None:
+        from python.runtime.models import load_detector
+
+        self.detector, self.missing = load_detector(detector_id, allow_synthetic=allow_synthetic)
+        self.tracker = IoUTracker()
+
+    def set_detector(self, detector: Any, missing: list[str] | None = None) -> None:
+        """Swap the live detector; reset tracks so CIPV ids do not stick to a dead net."""
+        self.detector = detector
+        self.missing = list(missing or [])
         self.tracker = IoUTracker()
 
     def tick(

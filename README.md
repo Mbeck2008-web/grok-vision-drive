@@ -41,7 +41,7 @@ What retail is **not**: eight cameras. It captures **one** window (the main view
 
 **Force-feedback wheels.** A wheel is welcome. Override detection looks at `|steering_input − cmd.steer|`, not the absolute angle, then spike-rejects and EMA-filters that residual so self-aligning torque, spring centering and kicks over bumps no longer disengage GVD. A real pull held ~200 ms still wins, and so does any real brake or throttle press. Tune it in `config\control.yaml` under `override:`. Live FFB behaviour is **UNPROVEN**.
 
-Keys in **GVD VISION**: `V` nerd panel, `D` DRIVE tab (gates / actuators / AEB), `G` VIZ tab (overlay layers), `[` `]` / `?` cycle tabs, `0` clean cabin, `1–5` debug layers (occupancy / detector boxes / lane polynomials / camera FOV / planner samples), `T` chase↔BEV, `C` manual clip, `q` quit. Click the nerd tabs and `+`/`−` to change knobs; they write the command this tick.
+Keys in **GVD VISION**: `V` nerd panel, `D` DRIVE tab (gates / actuators / AEB), `G` VIZ tab (overlay layers), `M` MODEL tab (detector / e2e), `[` `]` / `?` cycle tabs, `0` clean cabin, `1–5` debug layers (occupancy / detector boxes / lane polynomials / camera FOV / planner samples), `T` chase↔BEV, `C` manual clip, `q` quit. Click the nerd tabs and `+`/`−` to change knobs; they write the command this tick.
 
 **How retail drives.** Every tick the supervisor writes `Documents\GVD\gvd_cmd.json` (`steer, throttle, brake, seq, engaged, heartbeat_mtime`). The mod polls it at 20 Hz and, while **both** sides are engaged, feeds the player vehicle with `input.event('steering', s, 1)` / `input.event('throttle'|'brake', v, 2)` — the calls BeamNG's own AI and BeamNGpy use (`+steer` = right, pad-smoothed steering, direct pedals) — and switches the gearbox to arcade once. Vehicle Lua echoes `wheelspeed`, `steering_input`, `throttle_input`, `brake_input` and the applied `seq` back through `gvd_ego.json`, which gives the planner real ego speed (closed-loop throttle, TTC/AEB) and lets `cmd_applied` be `true` only on a fresh Lua ack (`cmd_reason`: `cmd_json_applied` / `cmd_json_pending` / `cmd_json_idle`).
 
@@ -84,7 +84,7 @@ Optional bus in `config/sensors.yaml`. Defaults: IMU + GPS **on**; `lidar` / `ra
 
 Windows: double-click `scripts\make_release_zip.bat`. Anywhere: `python scripts/make_release_zip.py`. Output: `dist\gvd-retail-<version>.zip` (gitignored), `<version>` = exact git tag if any, else `m6-<sha>[-dirty]`; override with `--version v0.6.0`, `--out path`, `--flat` (no top-level folder), `--list` (manifest only).
 
-Packs: `install.bat`, `uninstall.bat`, `play_gvd.bat`, `beamng_mod/`, `python/` (retail runtime), `config/` (including `sensors.yaml`), `requirements.txt` + `requirements-retail.txt`, `LICENSE`, `README.md`, `docs/*.md`, `models/.gitkeep`, plus a generated `VERSION.txt` (version, build time, git sha, the retail honesty lines). Excludes `data/clips/`, weights (`*.onnx *.pt *.pth *.bin *.safetensors`), `.git`, `scripts/` (tests + this tool), `__pycache__`, `dist/`, and `requirements-foxglove.txt`. `*.bat` are written CRLF. After writing, the script re-opens the zip, refuses forbidden members and missing must-haves (mod entry point, `run_vision.py`, launchers), and exits non-zero on any problem. Attach the zip to a GitHub Release. Offline check: `PYTHONPATH=. python scripts/test_m6_retail.py`.
+Packs: `install.bat`, `uninstall.bat`, `play_gvd.bat`, `beamng_mod/`, `python/` (retail runtime), `config/` (including `sensors.yaml`), `requirements.txt` + `requirements-retail.txt`, `LICENSE`, `README.md`, `docs/*.md`, `models/yolov8n.onnx` + `models/NOTICE.txt`, plus a generated `VERSION.txt` (version, build time, git sha, the retail honesty lines). Excludes `data/clips/`, extra weights (`*.pt`, other `*.onnx`, `*.pth` `*.bin` `*.safetensors`), `.git`, `scripts/` (tests + this tool), `__pycache__`, `dist/`, and `requirements-foxglove.txt`. `*.bat` are written CRLF. After writing, the script re-opens the zip, refuses forbidden members and missing must-haves (mod entry point, `run_vision.py`, launchers, `models/yolov8n.onnx`), and exits non-zero on any problem. Attach the zip to a GitHub Release. Offline check: `PYTHONPATH=. python scripts/test_m6_retail.py`.
 
 ## Layout
 
@@ -139,7 +139,7 @@ PYTHONPATH=. python python/run_vision.py --viz      # live window + state file f
 PYTHONPATH=. python scripts/test_gvd_viz_stage.py
 ```
 
-Keys in `--viz`: `V` nerd, `D` DRIVE (live actuators), `G` VIZ (occupancy / boxes / FOV / cost), `[` `]` tabs, `j/k` `h/l` / click to edit, `0` clean cabin, `1–5` overlay layers, `T` chase↔BEV, `C` clip, `q` quit. Occupancy is derived from tracks, not a learned grid.
+Keys in `--viz`: `V` nerd, `D` DRIVE (live actuators), `G` VIZ (occupancy / boxes / FOV / cost), `M` MODEL (detector / e2e), `[` `]` tabs, `j/k` `h/l` / click to edit, `0` clean cabin, `1–5` overlay layers, `T` chase↔BEV, `C` clip, `q` quit. Occupancy is derived from tracks, not a learned grid.
 
 ## Status
 
@@ -148,6 +148,8 @@ Keys in `--viz`: `V` nerd, `D` DRIVE (live actuators), `G` VIZ (occupancy / boxe
 **M6 (retail package):** player-ready **retail** slice. `scripts/make_release_zip.py` (+ `.bat`) builds `dist/gvd-retail-<version>.zip`. `play_gvd.bat` runs the **`window` backend** (`cams=1/8 path=retail`), offers `pip install -r requirements-retail.txt`, keeps the console open on errors. Drive bus: `gvd_cmd.json` → Lua `input.event`; echo `gvd_ego.json`. 8 cams + BeamNGpy stay Tech. Live Alt+G / drive still **UNPROVEN**. Player guide above.
 
 **M5 (shadow + tiny E2E):** Perception always runs; actuators only when engaged. `--policy modular|e2e|shadow` (default **modular**). `policy_e2e` = PilotNet-scale stub. Shadow fields every tick; modular veto on low `lane_conf` / heartbeat / disagreement. Toy VRAM ~0.15–0.4 GB. No transformers/ViT/BEV.
+
+**Nets (nerd MODEL tab):** `models/yolov8n.onnx` is in git (Ultralytics YOLOv8n detect @640, AGPL — see `models/NOTICE.txt`). `M` on GVD VISION lists what can actually load: detector `auto` (that n ONNX) / `synthetic` / `empty` plus any extra `models/yolov8{s,m,l,x}.onnx` you add, and E2E `auto` / `stub` plus `models/e2e*.onnx` if you train one. Lanes stay OpenCV Hough. Optional extras: `python scripts/download_yolov8n.py --size s`. `--detector` / `--e2e-model` set the launch id. There is no shipped E2E checkpoint.
 
 **M4 (clips):** ring-buffer + QSV/libx264 flush on disengage / AEB / near-miss / key C.
 
@@ -186,9 +188,8 @@ Vision-only **inference**: RGB + ego kinematics + GPS as a nav hint. Optional ex
 
 ```bash
 pip install -r requirements.txt
-pip install -r requirements-perception.txt   # optional
-python scripts/download_yolov8n.py --onnx
-# or: yolo export model=yolov8n.pt format=onnx imgsz=640 simplify=True && mv yolov8n.onnx models/
+pip install -r requirements-perception.txt   # optional (ultralytics / re-export)
+# models/yolov8n.onnx is already in the repo
 PYTHONPATH=. python python/run_vision.py --smoke
 ```
 
@@ -222,7 +223,7 @@ Clips land in `Documents/GVD/clips/` (repo `data/clips/` gitignored). Encode: `f
 ```bash
 PYTHONPATH=. python python/run_vision.py --smoke
 PYTHONPATH=. python python/run_vision.py --policy shadow --backend stub
-PYTHONPATH=. python python/run_vision.py --policy e2e --backend stub   # stub if no models/e2e_current.onnx
+PYTHONPATH=. python python/run_vision.py --policy e2e --backend stub   # numpy stub; no e2e_current.onnx shipped
 PYTHONPATH=. python scripts/test_m5_shadow.py
 PYTHONPATH=. python -m python.train.train_e2e --smoke
 ```

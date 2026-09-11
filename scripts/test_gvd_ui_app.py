@@ -122,6 +122,16 @@ def main() -> None:
     assert "input.event('steering'" in lua and "input.event('throttle'" in lua
     assert "applying = applying" in lua, "gvdUi must carry the drive flag for the DRIVE state"
     assert "'DRIVE'" in app_js and "steer to take over" in app_js
+    assert "engage takes the wheel" in app_html
+
+    # Path / ghosts keep drawing while OFF; engage is underglow + applyCmdJson only.
+    start = lua.index("function M.drawPath(dt)")
+    nxt = lua.index("\nlocal function r2", start)
+    draw_path = lua[start:nxt]
+    assert "if not showPath then return end" in draw_path
+    assert "if not engaged then return end" not in draw_path, "drawPath must not hide ribbon when disengaged"
+    assert "if engaged and veh" in draw_path, "underglow stays engage-only"
+    assert "releaseInputs('disengaged')" in lua
 
     # Lua may still pack scene geometry for old layouts; the in-game app no longer draws it.
     for key in ("lanes", "edges", "signs", "fans", "tracks", "path"):

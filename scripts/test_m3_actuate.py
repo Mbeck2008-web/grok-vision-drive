@@ -9,7 +9,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from python.control.actuate import (
+    BeamNGPyActuator,
     CmdJsonActuator,
+    DriveCommand,
     heartbeat_fresh,
     may_drive,
     read_electrics_speed,
@@ -98,6 +100,33 @@ def main() -> None:
 
     payload = json.loads(cmd_path().read_text(encoding="utf-8"))
     assert payload["engaged"] is False and payload["brake"] == 1.0 and payload["seq"] == 9
+
+    # Tech: disengaged must not call vehicle.control (no brake takeover). One zero
+    # release on the falling edge, then silence. Engaged stops still apply brake=1.
+    class FakeVeh:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def control(self, **kw):
+            self.calls.append(kw)
+
+    veh = FakeVeh()
+    tech = BeamNGPyActuator(veh)
+    tech.note_engaged(False)
+    idle = tech.stop(seq=1, reason="not_engaged")
+    assert idle.applied is False and veh.calls == [], veh.calls
+    tech.note_engaged(True)
+    drive = tech.apply(DriveCommand(steer=0.2, throttle=0.4, brake=0.0, seq=2, reason="ok"))
+    assert drive.applied is True and veh.calls[-1]["throttle"] == 0.4
+    hold = tech.stop(seq=3, reason="preview_blocked")
+    assert hold.applied is True and veh.calls[-1]["brake"] == 1.0
+    tech.note_engaged(False)
+    n = len(veh.calls)
+    edge = tech.stop(seq=4, reason="not_engaged")
+    assert edge.applied is False
+    assert veh.calls[-1] == {"steering": 0.0, "throttle": 0.0, "brake": 0.0}
+    tech.stop(seq=5, reason="not_engaged")
+    assert len(veh.calls) == n + 1, veh.calls  # no further takeover while OFF
 
     print("test_m3_actuate: OK")
 

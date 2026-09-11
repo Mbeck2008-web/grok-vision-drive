@@ -17,10 +17,12 @@ from python.control.actuate import DriveCommand
 from python.runtime.debug_opts import (
     CONTROL_ROWS,
     DEBUG_ROWS,
+    MODEL_CONTROL_ROWS,
     VIZ_CONTROL_ROWS,
     apply_to_command,
     apply_to_perception,
     DebugOpts,
+    model_row_at,
     row_at,
     viz_row_at,
 )
@@ -118,6 +120,13 @@ def test_toggle_nudge() -> None:
     opts.policy = "session"
     assert opts.effective_policy("e2e") == "e2e"
 
+    det = next(r for r in MODEL_CONTROL_ROWS if r["id"] == "detector_id")
+    assert opts.detector_id == "auto"
+    opts.toggle(det)
+    assert opts.detector_id in ("synthetic", "empty", "auto") or opts.detector_id.startswith("yolov8")
+    opts.nudge(det, -1)
+    assert opts.detector_id == "auto"
+
     dense = next(r for r in VIZ_CONTROL_ROWS if r["id"] == "viz_dense")
     opts.toggle(dense)
     assert opts.viz_dense and opts.viz_occ and opts.viz_ids and opts.viz_frustums
@@ -131,6 +140,10 @@ def test_ui_keys_clicks() -> None:
     assert ui.nerd_tab == "drive" and ui.show_nerd
     assert ui.handle_key(ord("g"))
     assert ui.nerd_tab == "viz"
+    assert ui.handle_key(ord("]"))
+    assert ui.nerd_tab == "model"
+    assert ui.handle_key(ord("m"))
+    assert ui.nerd_tab == "model" and ui.show_nerd
     assert ui.handle_key(ord("]"))
     assert ui.nerd_tab == "keys"
     ui.show_drive_tab()
@@ -180,6 +193,17 @@ def test_ui_keys_clicks() -> None:
     ui.handle_click(STAGE_W + (x0 + x1) // 2, (y0 + y1) // 2, stage_w=STAGE_W)
     assert ui.debug.viz_dense is (not before)
 
+    model = next(h for h in ui.nerd_hits if h.get("kind") == "tab" and h.get("id") == "model")
+    x0, y0, x1, y1 = model["rect"]
+    assert ui.handle_click(STAGE_W + (x0 + x1) // 2, (y0 + y1) // 2, stage_w=STAGE_W)
+    assert ui.nerd_tab == "model"
+    render_stage(st, ui=ui)
+    row0 = next(h for h in ui.nerd_hits if h.get("kind") == "row" and h.get("i") == 0 and h.get("part") == "value")
+    x0, y0, x1, y1 = row0["rect"]
+    before_det = ui.debug.detector_id
+    ui.handle_click(STAGE_W + (x0 + x1) // 2, (y0 + y1) // 2, stage_w=STAGE_W)
+    assert ui.debug.detector_id != before_det
+
 
 def test_overlay_pixels() -> None:
     import numpy as np
@@ -222,6 +246,7 @@ def test_overlay_pixels() -> None:
 def test_no_chrome() -> None:
     files = [
         ROOT / "python" / "runtime" / "debug_opts.py",
+        ROOT / "python" / "runtime" / "models.py",
         ROOT / "python" / "viz" / "debug_draw.py",
         ROOT / "python" / "viz" / "nerd.py",
         ROOT / "python" / "viz" / "stage.py",
@@ -250,6 +275,13 @@ def main() -> None:
 
     assert any(r["id"] == "force_engage" for r in DEBUG_ROWS)
     assert viz_row_at(0)["id"] == "viz_dense"
+    assert model_row_at(0)["id"] == "detector_id"
+    from python.viz.nerd import FS_TAB, _text_size
+
+    tab_x = 12
+    for label in ("LIVE", "DRIVE", "VIZ", "MODEL", "KEYS"):
+        tab_x += _text_size(label, FS_TAB)[0] + 26
+    assert tab_x <= NERD_WIDTH + 8, tab_x
     assert FS_BODY >= 0.65, "nerd body type must stay large enough to read on a second screen"
     assert NERD_WIDTH >= 520
     print("test_debug_opts: OK")

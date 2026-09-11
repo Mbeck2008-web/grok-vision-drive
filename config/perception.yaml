@@ -9,3 +9,5 @@ e2e:
 detector:
   prefer: yolov8n-onnx
   allow_synthetic_default: false
+  # Nerd MODEL tab / --detector: auto | synthetic | empty | yolov8{n,s,m,l,x}-onnx
+  # (file must exist under models/; weights are gitignored). Lanes stay Hough.

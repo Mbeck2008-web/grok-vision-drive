@@ -18,9 +18,12 @@ import numpy as np
 from python.runtime.debug_opts import (
     CONTROL_ROWS,
     LAYER_ATTR,
+    MODEL_CONTROL_ROWS,
     VIZ_CONTROL_ROWS,
     DebugOpts,
     control_index,
+    model_control_index,
+    model_row_at,
     row_at,
     viz_control_index,
     viz_row_at,
@@ -65,10 +68,11 @@ class VizUI:
     show_help: bool = False
     layers: set[int] = field(default_factory=set)
     top_down: bool = False  # default = chase 3/4 bird; T toggles BEV
-    nerd_tab: str = "live"  # live | drive | viz | keys
+    nerd_tab: str = "live"  # live | drive | viz | model | keys
     debug: DebugOpts = field(default_factory=DebugOpts)
     debug_sel: int = 0
     viz_sel: int = 0
+    model_sel: int = 0
     nerd_hits: list = field(default_factory=list)
     nerd_width: int = NERD_WIDTH
 
@@ -91,8 +95,13 @@ class VizUI:
         self.show_help = False
         self.show_nerd = True
 
+    def show_model_tab(self) -> None:
+        self.nerd_tab = "model"
+        self.show_help = False
+        self.show_nerd = True
+
     def cycle_tab(self, delta: int = 1) -> None:
-        tabs = ("live", "drive", "viz", "keys")
+        tabs = ("live", "drive", "viz", "model", "keys")
         cur = self.nerd_tab if self.nerd_tab in tabs else "live"
         self.nerd_tab = tabs[(tabs.index(cur) + delta) % len(tabs)]
         self.show_help = self.nerd_tab == "keys"
@@ -129,18 +138,25 @@ class VizUI:
         if key in (ord("g"), ord("G")):
             self.show_viz_tab()
             return True
+        if key in (ord("m"), ord("M")):
+            self.show_model_tab()
+            return True
         if key == ord("["):
             self.cycle_tab(-1)
             return True
         if key in (ord("]"), 9):  # Tab
             self.cycle_tab(1)
             return True
-        if self.nerd_tab not in ("drive", "viz") or not self.show_nerd:
+        if self.nerd_tab not in ("drive", "viz", "model") or not self.show_nerd:
             return False
         if self.nerd_tab == "viz":
             n = max(1, len(VIZ_CONTROL_ROWS))
             sel_attr = "viz_sel"
             row_fn = viz_row_at
+        elif self.nerd_tab == "model":
+            n = max(1, len(MODEL_CONTROL_ROWS))
+            sel_attr = "model_sel"
+            row_fn = model_row_at
         else:
             n = max(1, len(CONTROL_ROWS))
             sel_attr = "debug_sel"
@@ -184,6 +200,9 @@ class VizUI:
             if self.nerd_tab == "viz":
                 self.viz_sel = viz_control_index(i)
                 row = viz_row_at(self.viz_sel)
+            elif self.nerd_tab == "model":
+                self.model_sel = model_control_index(i)
+                row = model_row_at(self.model_sel)
             else:
                 self.debug_sel = control_index(i)
                 row = row_at(self.debug_sel)

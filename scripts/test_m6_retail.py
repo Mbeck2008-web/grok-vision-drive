@@ -560,6 +560,7 @@ def check_no_chrome() -> None:
         ROOT / "python" / "run_vision.py",
         ROOT / "python" / "runtime" / "hw_probe.py",
         ROOT / "python" / "runtime" / "debug_opts.py",
+        ROOT / "python" / "runtime" / "models.py",
         ROOT / "python" / "sensors" / "tech.py",
         *(ROOT / "python" / "viz").glob("*.py"),
     ]:

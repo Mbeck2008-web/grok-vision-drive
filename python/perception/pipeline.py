@@ -42,6 +42,12 @@ class ModularPerception:
         self.detector, self.missing = make_detector(allow_synthetic=allow_synthetic)
         self.tracker = IoUTracker()
 
+    def set_detector(self, detector: Any, missing: list[str] | None = None) -> None:
+        """Swap the live detector; reset tracks so CIPV ids do not stick to a dead net."""
+        self.detector = detector
+        self.missing = list(missing or [])
+        self.tracker = IoUTracker()
+
     def tick(
         self,
         main_bgr: np.ndarray | None,

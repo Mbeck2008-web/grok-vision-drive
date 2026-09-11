@@ -41,7 +41,7 @@ What retail is **not**: eight cameras. It captures **one** window (the main view
 
 **Force-feedback wheels.** A wheel is welcome. Override detection looks at `|steering_input − cmd.steer|`, not the absolute angle, then spike-rejects and EMA-filters that residual so self-aligning torque, spring centering and kicks over bumps no longer disengage GVD. A real pull held ~200 ms still wins, and so does any real brake or throttle press. Tune it in `config\control.yaml` under `override:`. Live FFB behaviour is **UNPROVEN**.
 
-Keys in **GVD VISION**: `V` nerd panel, `D` DRIVE tab (gates / actuators / AEB), `G` VIZ tab (overlay layers), `[` `]` / `?` cycle tabs, `0` clean cabin, `1–5` debug layers (occupancy / detector boxes / lane polynomials / camera FOV / planner samples), `T` chase↔BEV, `C` manual clip, `q` quit. Click the nerd tabs and `+`/`−` to change knobs; they write the command this tick.
+Keys in **GVD VISION**: `V` nerd panel, `D` DRIVE tab (gates / actuators / AEB), `G` VIZ tab (overlay layers), `M` MODEL tab (detector / e2e), `[` `]` / `?` cycle tabs, `0` clean cabin, `1–5` debug layers (occupancy / detector boxes / lane polynomials / camera FOV / planner samples), `T` chase↔BEV, `C` manual clip, `q` quit. Click the nerd tabs and `+`/`−` to change knobs; they write the command this tick.
 
 **How retail drives.** Every tick the supervisor writes `Documents\GVD\gvd_cmd.json` (`steer, throttle, brake, seq, engaged, heartbeat_mtime`). The mod polls it at 20 Hz and, while **both** sides are engaged, feeds the player vehicle with `input.event('steering', s, 1)` / `input.event('throttle'|'brake', v, 2)` — the calls BeamNG's own AI and BeamNGpy use (`+steer` = right, pad-smoothed steering, direct pedals) — and switches the gearbox to arcade once. Vehicle Lua echoes `wheelspeed`, `steering_input`, `throttle_input`, `brake_input` and the applied `seq` back through `gvd_ego.json`, which gives the planner real ego speed (closed-loop throttle, TTC/AEB) and lets `cmd_applied` be `true` only on a fresh Lua ack (`cmd_reason`: `cmd_json_applied` / `cmd_json_pending` / `cmd_json_idle`).
 
@@ -139,7 +139,7 @@ PYTHONPATH=. python python/run_vision.py --viz      # live window + state file f
 PYTHONPATH=. python scripts/test_gvd_viz_stage.py
 ```
 
-Keys in `--viz`: `V` nerd, `D` DRIVE (live actuators), `G` VIZ (occupancy / boxes / FOV / cost), `[` `]` tabs, `j/k` `h/l` / click to edit, `0` clean cabin, `1–5` overlay layers, `T` chase↔BEV, `C` clip, `q` quit. Occupancy is derived from tracks, not a learned grid.
+Keys in `--viz`: `V` nerd, `D` DRIVE (live actuators), `G` VIZ (occupancy / boxes / FOV / cost), `M` MODEL (detector / e2e), `[` `]` tabs, `j/k` `h/l` / click to edit, `0` clean cabin, `1–5` overlay layers, `T` chase↔BEV, `C` clip, `q` quit. Occupancy is derived from tracks, not a learned grid.
 
 ## Status
 
@@ -148,6 +148,8 @@ Keys in `--viz`: `V` nerd, `D` DRIVE (live actuators), `G` VIZ (occupancy / boxe
 **M6 (retail package):** player-ready **retail** slice. `scripts/make_release_zip.py` (+ `.bat`) builds `dist/gvd-retail-<version>.zip`. `play_gvd.bat` runs the **`window` backend** (`cams=1/8 path=retail`), offers `pip install -r requirements-retail.txt`, keeps the console open on errors. Drive bus: `gvd_cmd.json` → Lua `input.event`; echo `gvd_ego.json`. 8 cams + BeamNGpy stay Tech. Live Alt+G / drive still **UNPROVEN**. Player guide above.
 
 **M5 (shadow + tiny E2E):** Perception always runs; actuators only when engaged. `--policy modular|e2e|shadow` (default **modular**). `policy_e2e` = PilotNet-scale stub. Shadow fields every tick; modular veto on low `lane_conf` / heartbeat / disagreement. Toy VRAM ~0.15–0.4 GB. No transformers/ViT/BEV.
+
+**Nets (nerd MODEL tab):** Weights are gitignored; the repo does not ship a zoo. `M` on GVD VISION lists what can actually load: detector `auto` / `synthetic` / `empty` plus any `models/yolov8{n,s,m,l,x}.onnx` (or `.pt`), and E2E `auto` / `stub` plus `models/e2e*.onnx`. Lanes stay OpenCV Hough. Fetch nano with `python scripts/download_yolov8n.py --size n` (or `--size s`). `--detector` / `--e2e-model` set the launch id.
 
 **M4 (clips):** ring-buffer + QSV/libx264 flush on disengage / AEB / near-miss / key C.
 

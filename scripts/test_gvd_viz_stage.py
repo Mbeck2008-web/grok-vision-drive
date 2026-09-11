@@ -178,7 +178,10 @@ def main() -> None:
     drive_frame = render_stage(st, ui=nerd)
     assert drive_frame.shape == (800, 1280 + nerd.nerd_width, 3)
     tabs = {h.get("id") for h in nerd.nerd_hits if h.get("kind") == "tab"}
-    assert tabs == {"live", "drive", "viz", "keys"}
+    assert tabs == {"live", "drive", "viz", "model", "keys"}
+    nerd.show_model_tab()
+    model_frame = render_stage(st, ui=nerd)
+    assert model_frame.shape == drive_frame.shape
     nerd.show_viz_tab()
     nerd.debug.viz_dense = True
     nerd.debug.apply_dense()

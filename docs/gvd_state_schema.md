@@ -224,6 +224,7 @@ Written every tick from the GVD VISION nerd **DRIVE** / **VIZ** tabs (`python/ru
 | `aeb_on` / `aeb_ttc` / `cipv_on` | Rewrite planner AEB/CIPV before `shadow_tick` |
 | `speed_cap` / `cruise_mps` / `corridor_width` / `lane_conf_min` | Speed and veto knobs |
 | `lanes_on` / `detector_on` | Drop lane paint (preview path) or YOLO tracks |
+| `detector_id` / `e2e_id` | Nerd **MODEL** tab. `auto` / `synthetic` / `empty` plus any `models/yolov8*.onnx\|pt` or `e2e*.onnx` that exists. Unknown ids are not listed. Lanes are Hough (no net). |
 | `viz_*` | OpenCV overlay layers. `viz_occ` occupancy is **from tracks**, not a learned grid. Keys `1–5` map to occ / detector boxes / lane polynomials / camera FOV / planner samples |
 
 `occupancy` in state stays `null` (no occupancy net). The VIZ overlay is drawn in OpenCV only.

@@ -42,6 +42,7 @@ from python.perception.pipeline import ModularPerception
 from python.perception.road_model import lanes_ext, road_edges
 from python.runtime.debug_opts import apply_to_command, apply_to_perception
 from python.runtime.hw_probe import probe, refuse_live_start
+from python.runtime.models import ModelRuntime
 from python.runtime.shadow import ShadowConfig, load_shadow_config, shadow_tick
 from python.runtime.state_io import (
     default_state,
@@ -187,6 +188,17 @@ def main() -> None:
         help="Allow synthetic detections without YOLO weights (default: smoke only)",
     )
     ap.add_argument(
+        "--detector",
+        default="auto",
+        help="Detector catalog id: auto (default), synthetic, empty, or a yolov8*-onnx/ultra file in models/",
+    )
+    ap.add_argument(
+        "--e2e-model",
+        default="auto",
+        dest="e2e_model",
+        help="E2E catalog id: auto (default), stub, or an e2e*.onnx stem in models/",
+    )
+    ap.add_argument(
         "--allow-preview-drive",
         action="store_true",
         help="Allow actuation when path_debug_preview=true (default: blocked)",
@@ -306,6 +318,16 @@ def main() -> None:
     backend = make_backend(backend_name if args.backend != "auto" else backend_name)
     backend.open()
     perc = ModularPerception(allow_synthetic=args.allow_synthetic_detect)
+    e2e_policy = make_e2e()
+    ui = VizUI()
+    ui.debug.detector_id = str(args.detector or "auto")
+    ui.debug.e2e_id = str(args.e2e_model or "auto")
+    models_rt = ModelRuntime(detector_id="", e2e_id="")
+    perc, e2e_policy, model_notes = models_rt.sync(
+        ui.debug, perc, e2e_policy, allow_synthetic=bool(args.allow_synthetic_detect)
+    )
+    for note in model_notes:
+        print(f"[GVD] {note}")
 
     vehicle = getattr(backend, "vehicle", None)
     bng = getattr(backend, "bng", None)
@@ -317,7 +339,6 @@ def main() -> None:
             "[GVD] Tech did not yield a vehicle.control handle; falling back to cmd_json "
             "(mod Lua). Cameras may still be missing until a vehicle is spawned."
         )
-    e2e_policy = make_e2e()
     shadow_cfg = load_shadow_config(_ctrl_yaml)
     override_cfg = load_override_config(_ctrl_yaml)
     override = OverrideDetector(override_cfg)
@@ -369,7 +390,6 @@ def main() -> None:
     extras = ExtraSensors(sensors_cfg)
     fox = FoxgloveBridge(sensors_cfg)
 
-    ui = VizUI()
     win = "GVD VISION" if args.viz else None
     viz_screen_active = str(args.viz_screen)
     viz_note = ""
@@ -484,6 +504,12 @@ def main() -> None:
                 last_ego_v = ego_v
             if steer_in is not None:
                 steer = float(steer_in) * 30.0
+
+            perc, e2e_policy, model_notes = models_rt.sync(
+                ui.debug, perc, e2e_policy, allow_synthetic=bool(args.allow_synthetic_detect)
+            )
+            for note in model_notes:
+                print(f"[GVD] {note}", flush=True)
 
             pout = perc.tick(main, ego_speed_mps=ego_v, steer_deg=steer)
             pout = apply_to_perception(ui.debug, pout)

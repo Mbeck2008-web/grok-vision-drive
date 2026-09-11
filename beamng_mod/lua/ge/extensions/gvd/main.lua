@@ -1,7 +1,9 @@
 -- Grok Vision Drive — GE extension: engage + ice-blue ego path + compact HUD strip + retail drive
 -- NOTE: Alt+G live ribbon/drive remain UNPROVEN on Linux; confirm on Windows BeamNG smoke.
--- Retail (window capture): while engaged, Documents/GVD/gvd_cmd.json is applied to the player vehicle
--- through vehicle-Lua input.event (the calls BeamNG's AI / BeamNGpy use). No DLL / hooks / injection.
+-- Retail (window capture): Documents/GVD/gvd_cmd.json is applied to the player vehicle only while
+-- engaged, through vehicle-Lua input.event (the calls BeamNG's AI / BeamNGpy use). No DLL / hooks.
+-- Detector, path, planner and track ghosts keep running/drawing while the supervisor is live;
+-- Alt+G is the takeover latch (ice underglow + actuators), not the start of perception.
 local M = {}
 
 local engaged = false
@@ -590,7 +592,6 @@ end
 
 function M.drawPath(dt)
   if not showPath then return end
-  if not engaged then return end
   if not lastGood then return end
 
   local hbAlive = heartbeatAlive(lastGood, dt)
@@ -610,13 +611,16 @@ function M.drawPath(dt)
   end
 
   local a = fadeAlpha(isPreview and 90 or 200, conf, hbAlive)
+  if not engaged then
+    a = math.floor(a * 0.45)
+  end
   local col = color(ICE_R, ICE_G, ICE_B, a)
   if lastGood.policy == 'map-ai' then
     col = color(AMBER_R, AMBER_G, AMBER_B, math.floor(a * 0.7))
   end
 
-  -- soft underglow cue under ego (engage) — small prism at origin segment
-  if veh and drawer() and drawer().drawSphere then
+  -- Ice underglow is the engage cue. Ribbon + ghosts stay up while the nets run.
+  if engaged and veh and drawer() and drawer().drawSphere then
     local p = veh:getPosition()
     local up = (veh:getDirectionVectorUp() or vec3(0, 0, 1)):normalized()
     local glow = p + up * 0.05

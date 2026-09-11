@@ -511,6 +511,7 @@ def main() -> None:
             for note in model_notes:
                 print(f"[GVD] {note}", flush=True)
 
+            # Loaded detector / lanes / planner / E2E shadow run every tick, engaged or not.
             pout = perc.tick(main, ego_speed_mps=ego_v, steer_deg=steer)
             pout = apply_to_perception(ui.debug, pout)
 
@@ -599,8 +600,9 @@ def main() -> None:
 
             cmd = apply_to_command(ui.debug, cmd)
 
-            # Actuators only when engaged + command ok (shadow fields already on tick).
+            # Actuators only when engaged + command ok (path / tracks / shadow already on this tick).
             # cmd_json: Lua applies whatever we write only while `engaged` rides along in the payload.
+            # beamngpy: note_engaged(False) makes stop() release once, then not call vehicle.control.
             if hasattr(actuator, "note_engaged"):
                 actuator.note_engaged(engaged)
             if hasattr(actuator, "note_ack"):

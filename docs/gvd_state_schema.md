@@ -16,7 +16,7 @@ Path: `%USERPROFILE%\Documents\GVD\gvd_state.json` (written by `python/run_visio
 | `policy` | string | `map-ai` draws amber (dimmer) instead of ice-blue |
 | `ego.steer_deg` | float | Used for debug preview if path missing |
 
-Lua: `gvd_main.drawPath` on `onPreRender` / `onDebugDraw`. Engaged-only (Alt+G). Caps: 40 ego segs, 8 agents × 10 segs. Label in console: GVD PATH. No DecalRoad / map edit.
+Lua: `gvd_main.drawPath` on `onPreRender` / `onDebugDraw`. Runs whenever the supervisor heartbeat is live (dimmer while disengaged). Ice underglow is engage-only. Caps: 40 ego segs, 8 agents × 10 segs. Label in console: GVD PATH. No DecalRoad / map edit.
 
 
 | `capture_backend` | string | `beamngpy` / `window` / `stub` |
@@ -141,7 +141,7 @@ Predictions need an anchor: with no detected lane there are no predicted lanes a
 | `veto_reason` | string | `none` / `aeb_brake` / `aeb_warn` / `low_lane_conf` / `low_path_conf` / `heartbeat_stale` / `disagreement` / `e2e_forward_fail` / `preview_blocked` |
 | `e2e_backend` | string | `stub` / `onnx` |
 
-Perception always runs. Actuators only when engaged **and** modular OK. Shadow mode computes both intents; default apply path stays modular. Dead-man / heartbeat unchanged. Detector default is shipped `models/yolov8n.onnx`. No E2E checkpoint in git (`models/e2e_current.onnx` still gitignored).
+Perception always runs (loaded detector, lanes, corridor planner, other-vehicle tracks, E2E shadow). Path ribbon / GVD VISION overlays stay up. Actuators only when engaged **and** modular OK. Shadow mode computes both intents; default apply path stays modular. Dead-man / heartbeat unchanged. Detector default is shipped `models/yolov8n.onnx`. No E2E checkpoint in git (`models/e2e_current.onnx` still gitignored).
 
 
 ## M6 — `gvd_engage.json` contract (retail package)

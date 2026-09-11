@@ -415,6 +415,11 @@ def check_run_vision_e2e() -> None:
     st = read_state()
     assert st and st["engaged"] is False and st["cmd_applied"] is False and st["actuator"] == "cmd_json"
     assert st["cmd_reason"] == "not_engaged" and st["ego_source"] == "none"
+    # Loaded nets keep writing path / tracks / shadow while the car is still yours.
+    assert isinstance(st.get("path_ego"), list) and len(st["path_ego"]) >= 2, st.get("path_ego")
+    assert isinstance(st.get("tracks"), list)
+    assert isinstance(st.get("shadow"), dict) and "steer" in st["shadow"]
+    assert st.get("detector")
 
     # Engaged with no lane path (stub) → preview gate holds the brake, still engaged for Lua.
     _run_supervisor(["--force-engage"], seconds=2.0)

@@ -365,17 +365,27 @@ class NullActuator:
 
 
 class BeamNGPyActuator:
+    """Tech drive: vehicle.control only while engaged.
+
+    Disengaged ticks must not slam brake=1 (that is takeover). On the falling
+    edge we send zeros once so the last throttle does not stick, then hands off.
+    Engaged gate holds (preview_blocked, AEB, veto) still apply the stop command.
+    """
+
     name = "beamngpy"
 
     def __init__(self, vehicle: Any) -> None:
         self.vehicle = vehicle
         self._shift_set = False
+        self.engaged = False
+        self._latched = False
 
-    def apply(self, cmd: DriveCommand) -> DriveCommand:
+    def note_engaged(self, engaged: bool) -> None:
+        self.engaged = bool(engaged)
+
+    def _control(self, steer: float, throttle: float, brake: float) -> str | None:
         if self.vehicle is None:
-            cmd.applied = False
-            cmd.reason = "no_vehicle"
-            return cmd
+            return "no_vehicle"
         try:
             if not self._shift_set and hasattr(self.vehicle, "set_shift_mode"):
                 try:
@@ -383,21 +393,38 @@ class BeamNGPyActuator:
                     self._shift_set = True
                 except Exception:
                     pass
-            # steering [-1,1], throttle/brake [0,1]
             self.vehicle.control(
-                steering=float(max(-1.0, min(1.0, cmd.steer))),
-                throttle=float(max(0.0, min(1.0, cmd.throttle))),
-                brake=float(max(0.0, min(1.0, cmd.brake))),
+                steering=float(max(-1.0, min(1.0, steer))),
+                throttle=float(max(0.0, min(1.0, throttle))),
+                brake=float(max(0.0, min(1.0, brake))),
             )
-            cmd.applied = True
-            return cmd
+            return None
         except Exception as e:
+            return f"beamngpy_err:{type(e).__name__}"
+
+    def apply(self, cmd: DriveCommand) -> DriveCommand:
+        if not self.engaged:
             cmd.applied = False
-            cmd.reason = f"beamngpy_err:{type(e).__name__}"
+            if cmd.reason in ("ok", "plan"):
+                cmd.reason = "not_engaged"
             return cmd
+        err = self._control(cmd.steer, cmd.throttle, cmd.brake)
+        if err:
+            cmd.applied = False
+            cmd.reason = err
+            return cmd
+        cmd.applied = True
+        self._latched = True
+        return cmd
 
     def stop(self, seq: int = 0, reason: str = "stop") -> DriveCommand:
         cmd = stop_command(seq=seq, reason=reason)
+        if not self.engaged:
+            if self._latched:
+                self._control(0.0, 0.0, 0.0)
+                self._latched = False
+            cmd.applied = False
+            return cmd
         return self.apply(cmd)
 
 

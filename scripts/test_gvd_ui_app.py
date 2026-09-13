@@ -115,11 +115,19 @@ def main() -> None:
     assert "_ui_request_is_live" in run_vision
 
     # The UI layer shares main.lua with the M6 retail drive: a HUD refactor must not eat it.
-    for symbol in ("VE_APPLY_FMT", "VE_RELEASE", "VE_ARCADE", "VE_FEEDBACK", "CMD_STALE_S",
+    for symbol in ("VE_APPLY_FMT", "VE_RELEASE", "VE_HOLD", "VE_ARCADE", "VE_FEEDBACK", "CMD_STALE_S",
                    "CMD_DEAD_S", "applyCmdJson", "releaseInputs", "syncEngageFromSupervisor",
-                   "function M.onEgoFeedback", "gvd_ego.json"):
+                   "function M.onEgoFeedback", "gvd_ego.json", "setAllowedInputSource"):
         assert symbol in lua, f"main.lua lost the retail drive path: {symbol}"
     assert "input.event('steering'" in lua and "input.event('throttle'" in lua
+    assert "input.event('brake'" in lua and "input.event('parkingbrake'" in lua and "input.event('clutch'" in lua
+    assert "2,900,0,nil,'gvd'" in lua, "retail must apply as a secondary Direct Drive wheel"
+    assert "2,0,0,nil,'gvd'" in lua, "retail must apply throttle/brake as Direct Drive pedals"
+    assert "setAllowedInputSource('steering','local',false)" in lua, "retail must lock out the player wheel"
+    assert "setAllowedInputSource('throttle','local',false)" in lua, "retail must lock out the player gas pedal"
+    assert "setAllowedInputSource('brake','local',false)" in lua, "retail must lock out the player brake pedal"
+    assert "setAllowedInputSource('parkingbrake','local',false)" in lua, "retail must lock out a resting handbrake"
+    assert "setAllowedInputSource('clutch','local',false)" in lua, "retail must lock out a resting clutch"
     assert "applying = applying" in lua, "gvdUi must carry the drive flag for the DRIVE state"
     assert "'DRIVE'" in app_js and "steer to take over" in app_js
     assert "engage takes the wheel" in app_html

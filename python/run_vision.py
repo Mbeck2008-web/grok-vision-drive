@@ -361,7 +361,7 @@ def main() -> None:
     if actuator.name == "cmd_json":
         print(
             "[GVD] actuator=cmd_json: Documents/GVD/gvd_cmd.json -> gvd_main.applyCmdJson -> player vehicle "
-            "(input.event steering/throttle/brake). Ego speed/inputs echo back via gvd_ego.json; "
+            "(input.event secondary Direct Drive wheel+pedals, source=gvd). Ego speed/inputs echo back via gvd_ego.json; "
             "cmd_applied is claimed only on a fresh Lua ack."
         )
     print(f"[GVD] M5 policy={args.policy} e2e={e2e_policy.name} (modular vetoes E2E; shadow writes both)")
@@ -578,15 +578,21 @@ def main() -> None:
                 disengage_reason = "heartbeat_stale"
                 engaged = False
 
-            # Player override. Steer is the filtered residual against the command the mod says
-            # it applied, so force-feedback noise cannot disengage; the pedals stay tight.
-            # Sticky either way — otherwise Lua and the player fight at loop rate — so the
-            # engage flag stays false until Alt+G. Commands are noted below, after the actuator.
+            # Player override. Retail Direct Drive lock: when Lua saw a player device, electrics
+            # are GVD's own command — use the physical lastInputs axes (absolute). Otherwise the
+            # residual is still steering_input - aligned cmd.steer so FFB noise cannot disengage.
+            if ego_fb is not None and ego_fb.fresh and ego_fb.player_device:
+                ovr_steer, ovr_thr, ovr_brk, ovr_dev = (
+                    ego_fb.player_steering, ego_fb.player_throttle, ego_fb.player_brake, True,
+                )
+            else:
+                ovr_steer, ovr_thr, ovr_brk, ovr_dev = steer_in, throttle_in, brake_in, False
             ovr = override.update(
                 engaged=engaged,
-                steering_input=steer_in,
-                throttle_input=throttle_in,
-                brake_input=brake_in,
+                steering_input=ovr_steer,
+                throttle_input=ovr_thr,
+                brake_input=ovr_brk,
+                player_device=ovr_dev,
                 applied_seq=ego_fb.applied_seq if ego_fb is not None and ego_fb.fresh else None,
             )
             if ovr.active and not ui.debug.ignore_override:

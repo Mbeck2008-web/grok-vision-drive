@@ -121,29 +121,78 @@ class StubBackend:
         return CameraFrameBundle(frames={}, timestamps={}, health=health, backend=self.name, note="stub: no cameras")
 
 
+_SKIP_BEAMNG_TITLE = ("crash", "dump", "werfault", "error report", "crashreporter")
+
+
+def _skip_beamng_title(title: str) -> bool:
+    """Drop crash/dump dialogs; they also contain 'BeamNG' and are the wrong capture."""
+    t = (title or "").lower()
+    if "beamng" not in t:
+        return True
+    return any(bad in t for bad in _SKIP_BEAMNG_TITLE)
+
+
+def _beamng_window_rank(title: str, w: int, h: int) -> tuple[int, int]:
+    """Retail prefers BeamNG.drive, then a generic BeamNG title, then Tech. Largest area wins ties."""
+    t = (title or "").lower()
+    if "beamng.drive" in t:
+        kind = 3
+    elif "beamng.tech" in t:
+        kind = 1
+    else:
+        kind = 2
+    return (kind, int(w) * int(h))
+
+
+def _pick_best_beamng_rect(
+    candidates: list[tuple[str, int, int, int, int]],
+) -> tuple[int, int, int, int] | None:
+    """candidates: (title, left, top, width, height)."""
+    best: tuple[tuple[int, int], tuple[int, int, int, int]] | None = None
+    for title, left, top, w, h in candidates:
+        if _skip_beamng_title(title) or w <= 200 or h <= 200:
+            continue
+        rank = _beamng_window_rank(title, w, h)
+        rect = (left, top, w, h)
+        if best is None or rank > best[0]:
+            best = (rank, rect)
+    return None if best is None else best[1]
+
+
+def _region_moved(a: dict[str, int] | None, b: dict[str, int] | None, slop: int = 8) -> bool:
+    if a is None or b is None:
+        return a is not b
+    return any(abs(int(a[k]) - int(b[k])) > slop for k in ("left", "top", "width", "height"))
+
+
 def _find_beamng_window_rect() -> tuple[int, int, int, int] | None:
-    """Return (left, top, width, height) for a visible window titled with BeamNG, else None."""
+    """Return (left, top, width, height) for the retail BeamNG.drive window, else None."""
     # Windows: win32gui
     try:
         import win32gui  # type: ignore
 
-        found: list[tuple[int, int, int, int]] = []
+        found: list[tuple[str, int, int, int, int]] = []
 
         def _enum(hwnd: int, _: Any) -> None:
             if not win32gui.IsWindowVisible(hwnd):
                 return
+            try:
+                if win32gui.IsIconic(hwnd):
+                    return
+            except Exception:
+                pass
             title = win32gui.GetWindowText(hwnd) or ""
-            if "BeamNG" not in title:
+            if _skip_beamng_title(title):
                 return
             rect = win32gui.GetClientRect(hwnd)
             left, top = win32gui.ClientToScreen(hwnd, (0, 0))
             w, h = rect[2] - rect[0], rect[3] - rect[1]
-            if w > 200 and h > 200:
-                found.append((left, top, w, h))
+            found.append((title, left, top, w, h))
 
         win32gui.EnumWindows(_enum, None)
-        if found:
-            return found[0]
+        picked = _pick_best_beamng_rect(found)
+        if picked:
+            return picked
     except Exception:
         pass
     # Linux: wmctrl (best-effort)
@@ -151,14 +200,19 @@ def _find_beamng_window_rect() -> tuple[int, int, int, int] | None:
         import subprocess
 
         out = subprocess.check_output(["wmctrl", "-lG"], text=True, timeout=2)
+        found_l: list[tuple[str, int, int, int, int]] = []
         for line in out.splitlines():
             if "BeamNG" not in line:
                 continue
-            parts = line.split()
-            # id desk x y w h ...
+            parts = line.split(None, 7)
+            if len(parts) < 7:
+                continue
             x, y, w, h = map(int, parts[2:6])
-            if w > 200 and h > 200:
-                return (x, y, w, h)
+            title = parts[7] if len(parts) > 7 else line
+            found_l.append((title, x, y, w, h))
+        picked = _pick_best_beamng_rect(found_l)
+        if picked:
+            return picked
     except Exception:
         pass
     return None
@@ -177,16 +231,25 @@ class WindowBackend:
         self._logged = False
         self._region: dict[str, int] | None = None
         self._note = "retail: 1 window"
+        self._title_match = False
+
+    def _apply_window_rect(self, rect: tuple[int, int, int, int] | None) -> None:
+        """Lock onto the Drive window when it exists; keep last region if the title flickers."""
+        if not rect:
+            if not self._title_match:
+                self._note = "retail: 1 window (fullscreen/monitor — no BeamNG title match)"
+            return
+        l, t, w, h = rect
+        new_region = {"left": l, "top": t, "width": w, "height": h}
+        moved = _region_moved(self._region, new_region)
+        self._region = new_region
+        self._title_match = True
+        self._note = "retail: 1 window (BeamNG title match)"
+        if moved and str(self._impl).startswith("bettercam"):
+            self._recreate_capture()
 
     def open(self) -> None:
-        rect = _find_beamng_window_rect()
-        if rect:
-            l, t, w, h = rect
-            self._region = {"left": l, "top": t, "width": w, "height": h}
-            self._note = "retail: 1 window (BeamNG title match)"
-        else:
-            self._region = None
-            self._note = "retail: 1 window (fullscreen/monitor — no BeamNG title match)"
+        self._apply_window_rect(_find_beamng_window_rect())
 
         try:
             import bettercam  # type: ignore
@@ -254,14 +317,9 @@ class WindowBackend:
         frames: dict[str, np.ndarray] = {}
         timestamps: dict[str, float] = {}
         img = None
-        # If BeamNG title appears after open(), recreate capture on the window (not full monitor)
-        if self._region is None:
-            rect = _find_beamng_window_rect()
-            if rect:
-                l, top, w, h = rect
-                self._region = {"left": l, "top": top, "width": w, "height": h}
-                self._note = "retail: 1 window (BeamNG title match)"
-                self._recreate_capture()
+        # Re-resolve every grab: Steam starts after the supervisor, and a windowed
+        # player can move/resize BeamNG.drive. Prefer Drive over Tech/crash dialogs.
+        self._apply_window_rect(_find_beamng_window_rect())
 
         try:
             if self._cam is not None:

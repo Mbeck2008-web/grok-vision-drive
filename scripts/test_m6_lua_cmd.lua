@@ -45,13 +45,22 @@ local function readFileAll(p) local f = io.open(p, 'r'); if not f then return ni
 os.remove(egoPath)
 
 -- ── fake vehicle: executes queued vehicle-Lua in a sandbox ─────────────────────────────────────
+local allowed = {}          -- recorded input.setAllowedInputSource calls
 local events = {}          -- recorded input.event calls, in order
 local shifter = {}         -- drivetrain.setShifterMode calls
 local geQueue = {}         -- strings vehicle Lua queued back to GE
 local electricsValues = { wheelspeed = 0, steering_input = 0, throttle_input = 0, brake_input = 0 }
 
 local veEnv = {
-  input = { event = function(itype, ivalue, filter) events[#events + 1] = { itype, ivalue, filter } end },
+  input = {
+    event = function(itype, ivalue, filter, angle, lockType, osClockHP, source)
+      events[#events + 1] = { itype, ivalue, filter, angle, lockType, source }
+    end,
+    setAllowedInputSource = function(itype, source, enabled)
+      allowed[#allowed + 1] = { itype, source, enabled }
+    end,
+    lastInputs = {},
+  },
   electrics = { values = electricsValues },
   drivetrain = { setShifterMode = function(mode) shifter[#shifter + 1] = mode end },
   sensors = { gx2 = 0, gy2 = 0, gz2 = 0 },
@@ -60,6 +69,7 @@ local veEnv = {
     getYawAngularVelocity = function() return 0.0 end,
   },
   pcall = pcall, tonumber = tonumber, tostring = tostring, string = string, math = math,
+  pairs = pairs, type = type,
 }
 local Veh = {}
 Veh.__index = Veh
@@ -99,7 +109,17 @@ local function lastEvent(itype)
   for i = #events, 1, -1 do if events[i][1] == itype then return events[i] end end
   return nil
 end
-local function clearEvents() events = {} end
+local function lastAllowed(itype)
+  for i = #allowed, 1, -1 do if allowed[i][1] == itype then return allowed[i] end end
+  return nil
+end
+local function lastAllowedFor(itype, source)
+  for i = #allowed, 1, -1 do
+    if allowed[i][1] == itype and allowed[i][2] == source then return allowed[i] end
+  end
+  return nil
+end
+local function clearEvents() events = {}; allowed = {} end
 local function check(cond, msg) if not cond then error('FAIL: ' .. msg, 2) end; print('ok   ' .. msg) end
 local function near(a, b) return math.abs((a or 0) - (b or 0)) < 1e-6 end
 
@@ -128,14 +148,39 @@ check(M.isEngaged(), 'Alt+A → engaged')
 M.onUpdate(0.06)
 check(#events == 0, 'supervisor cmd engaged=false → no input.event')
 
--- 2) supervisor engaged: real steer/throttle applied with stock filters, +steer passes through (right)
+-- 2) supervisor engaged: real steer/throttle applied as a secondary Direct Drive wheel+pedals
 writeCmd(true, 0.3, 0.4, 0.0)
 beatState(true)
 M.onUpdate(0.06)
 local st = lastEvent('steering'); local th = lastEvent('throttle'); local br = lastEvent('brake')
-check(st and near(st[2], 0.3) and st[3] == 1, "input.event('steering', 0.3, 1) pad-smoothed, sign unchanged")
-check(th and near(th[2], 0.4) and th[3] == 2, "input.event('throttle', 0.4, 2) direct")
-check(br and near(br[2], 0.0) and br[3] == 2, "input.event('brake', 0, 2) direct")
+local pbk = lastEvent('parkingbrake'); local clu = lastEvent('clutch')
+check(st and near(st[2], 0.3) and st[3] == 2, "input.event('steering', 0.3, 2) Direct Drive filter, sign unchanged")
+check(st and near(st[4] or 0, 900) and near(st[5] or -1, 0) and st[6] == 'gvd',
+  "steering angle=900 lockType=0 source=gvd (secondary Direct Drive wheel)")
+check(th and near(th[2], 0.4) and th[3] == 2 and near(th[4] or -1, 0) and near(th[5] or -1, 0) and th[6] == 'gvd',
+  "input.event('throttle', 0.4, 2, 0, 0, source=gvd) Direct Drive pedals")
+check(br and near(br[2], 0.0) and br[3] == 2 and near(br[4] or -1, 0) and near(br[5] or -1, 0) and br[6] == 'gvd',
+  "input.event('brake', 0, 2, 0, 0, source=gvd) Direct Drive pedals")
+check(pbk and near(pbk[2], 0) and pbk[3] == 2 and pbk[6] == 'gvd',
+  'parkingbrake held at 0 on gvd Direct Drive source so a resting handbrake cannot pin the car')
+check(clu and near(clu[2], 0) and clu[3] == 2 and clu[6] == 'gvd',
+  'clutch held at 0 on gvd Direct Drive source so a resting clutch cannot pin the car')
+check(lastAllowedFor('steering', 'gvd') and lastAllowedFor('steering', 'gvd')[3] == true,
+  'setAllowedInputSource(steering, gvd, true) so the software holds the car')
+check(lastAllowedFor('steering', 'local') and lastAllowedFor('steering', 'local')[3] == false,
+  'setAllowedInputSource(steering, local, false) so a connected wheel cannot overwrite')
+check(lastAllowedFor('throttle', 'gvd') and lastAllowedFor('throttle', 'gvd')[3] == true,
+  'setAllowedInputSource(throttle, gvd, true) so the software holds the gas')
+check(lastAllowedFor('throttle', 'local') and lastAllowedFor('throttle', 'local')[3] == false,
+  'setAllowedInputSource(throttle, local, false) so a connected pedal cannot overwrite')
+check(lastAllowedFor('brake', 'gvd') and lastAllowedFor('brake', 'gvd')[3] == true,
+  'setAllowedInputSource(brake, gvd, true) so the software holds the brake')
+check(lastAllowedFor('brake', 'local') and lastAllowedFor('brake', 'local')[3] == false,
+  'setAllowedInputSource(brake, local, false) so a connected pedal cannot overwrite')
+check(lastAllowedFor('parkingbrake', 'local') and lastAllowedFor('parkingbrake', 'local')[3] == false,
+  'setAllowedInputSource(parkingbrake, local, false) so a resting handbrake cannot pin the car')
+check(lastAllowedFor('clutch', 'local') and lastAllowedFor('clutch', 'local')[3] == false,
+  'setAllowedInputSource(clutch, local, false) so a resting clutch cannot pin the car')
 check(#shifter == 1 and shifter[1] == 'arcade', 'arcade shifter mode queued once on first drive')
 
 -- 3) electrics echo → GE → gvd_ego.json with applied seq
@@ -175,6 +220,14 @@ clearEvents()
 M.toggleEngage()
 check(not M.isEngaged(), 'Alt+A → disengaged')
 check(near(lastEvent('steering')[2], 0) and near(lastEvent('throttle')[2], 0) and near(lastEvent('brake')[2], 0), 'release: steering/throttle/brake → 0')
+check(near(lastEvent('parkingbrake')[2], 0) and near(lastEvent('clutch')[2], 0), 'release: parkingbrake/clutch → 0')
+check(lastEvent('steering')[6] == 'gvd' and lastEvent('throttle')[6] == 'gvd' and lastEvent('brake')[6] == 'gvd',
+  'release zeros go out on the gvd Direct Drive source')
+check(lastAllowed('steering') and lastAllowed('steering')[2] == nil, 'release clears allowedInputSources so the player device gets the car back')
+check(lastAllowed('throttle') and lastAllowed('throttle')[2] == nil, 'release clears throttle whitelist')
+check(lastAllowed('brake') and lastAllowed('brake')[2] == nil, 'release clears brake whitelist')
+check(lastAllowed('parkingbrake') and lastAllowed('parkingbrake')[2] == nil, 'release clears parkingbrake whitelist')
+check(lastAllowed('clutch') and lastAllowed('clutch')[2] == nil, 'release clears clutch whitelist')
 clearEvents()
 writeCmd(true, 0.5, 0.5, 0.0)
 M.onUpdate(0.06)
@@ -349,6 +402,44 @@ driveTick(0, 0.3, 0, pin); driveTick(0, 0.3, 0, pin)
 check(M.isEngaged(), 'vehicle switch re-arms the override warm-up')
 for _ = 1, 8 do driveTick(0, 0.3, 0, pin) end
 check(not M.isEngaged(), 'once warm again a held residual is player_steer')
+currentVeh = fakeVeh
+
+-- 13b) secondary Direct Drive lock: electrics match GVD, override is the physical wheel
+veEnv.input.lastInputs = {
+  gvd = { steering = 0.4, throttle = 0.3, brake = 0 },
+  wheel = { steering = 0.0, throttle = 0.0, brake = 0.0 },
+}
+echo(0.4, 0.3, 0)
+M.toggleEngage()
+warmDrive(0.4, 0.3, 0, pin)
+check(M.isEngaged(), 'centered physical wheel while GVD steers 0.4 is not an override')
+local egoPd = readFileAll(egoPath)
+check(egoPd and egoPd:find('"player_device":true') and egoPd:find('"player_steering":0.000'),
+  'gvd_ego.json carries player_device + centered wheel (' .. tostring(egoPd) .. ')')
+veEnv.input.lastInputs.wheel.steering = 0.25
+for _ = 1, 8 do driveTick(0.4, 0.3, 0, pin) end
+check(not M.isEngaged(), 'physical wheel pull 0.25 with the Direct Drive source locked -> player_steer')
+
+-- 13c) secondary Direct Drive pedals: resting lastInputs is not an override; a real brake press is.
+-- Clutch / handbrake lastInputs must not trip override (GVD zeros those axes; they are not a takeover).
+veEnv.input.lastInputs = {
+  gvd = { steering = 0, throttle = 0.4, brake = 0 },
+  wheel = { steering = 0.0, throttle = 0.0, brake = 0.0, clutch = 1.0, parkingbrake = 1.0 },
+}
+echo(0, 0.4, 0)
+M.toggleEngage()
+warmDrive(0, 0.4, 0, pin)
+check(M.isEngaged(), 'resting physical pedals while GVD throttles 0.4 is not an override')
+check(M.isEngaged(), 'physical clutch/handbrake lastInputs do not trip override')
+local egoPed = readFileAll(egoPath)
+check(egoPed and egoPed:find('"player_device":true') and egoPed:find('"player_throttle":0.000')
+    and egoPed:find('"player_brake":0.000'),
+  'gvd_ego.json carries player_device + resting pedals (' .. tostring(egoPed) .. ')')
+veEnv.input.lastInputs.wheel.brake = 0.12
+driveTick(0, 0.4, 0, pin); driveTick(0, 0.4, 0, pin)
+check(not M.isEngaged(), 'physical brake press 0.12 with the Direct Drive source locked -> player_brake')
+check(logs[#logs]:find('player_brake') ~= nil, 'override logged player_brake from lastInputs')
+veEnv.input.lastInputs = {}
 currentVeh = fakeVeh
 
 -- 12) chrome check on everything we push to the vehicle / HUD

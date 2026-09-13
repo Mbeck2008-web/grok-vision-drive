@@ -172,9 +172,9 @@ PYTHONPATH=. python python/run_vision.py --backend window --viz   # retail: 1 wi
 PYTHONPATH=. python python/run_vision.py --backend beamngpy       # needs Tech; else honest missing
 ```
 
-Default `--backend auto`: beamngpy if importable → else window → else stub. `play_gvd.bat` (retail launcher) forces `--backend window` (`set GVD_BACKEND=beamngpy` for Tech). Window backend fills **main / cam_main only**; other `cam_health` stay `missing`. Boot line ends with `cams=1/8 path=retail (1 window capture; not 8)`; nerd panel shows `retail: 1 window`. Never synthesizes 8 frames from one grab.
+Default `--backend auto`: **window** if mss/bettercam is importable, else stub. It does **not** pick Tech just because beamngpy is installed — only `GVD_BEAMNG=1` or `--backend beamngpy` / `play_gvd_tech.bat`. `play_gvd.bat` (retail launcher) forces `--backend window`. Window backend fills **main / cam_main only**; other `cam_health` stay `missing`. Boot line ends with `cams=1/8 path=retail (1 window capture; not 8; drive=gvd_cmd.json->mod Lua secondary Direct Drive wheel+pedals)`; nerd panel shows `retail: 1 window`. Never synthesizes 8 frames from one grab.
 
-Window capture prefers a visible window whose title contains **BeamNG** (Win32 / wmctrl). If none is found, it falls back to the primary monitor — use **fullscreen BeamNG** in that case (`capture_note` says so).
+Window capture prefers a visible **BeamNG.drive** window (Win32 / wmctrl; skips crash/dump dialogs; largest client area wins). If none is found, it falls back to the primary monitor — use **fullscreen BeamNG** in that case (`capture_note` says so). It re-locks if you move or resize the window.
 
 Tech path: `GVD_BEAMNG=1` (or `--backend beamngpy` / `play_gvd_tech.bat`) attaches color-only BeamNGpy `Camera` sensors from `config/cameras.yaml` to the player vehicle, converting GVD frame (+X right, +Y forward) into BeamNG Camera vehicle space. Depth/semantic stay OFF. The same session attaches Electrics, Damage, GForces, and GPS (`config/tech.yaml`) — GPS is a nav hint (lat/lon + optional pin), **not a route**. Optional LiDAR / radar: `config/sensors.yaml` (off by default; Foxglove / future fusion only). Live smoke still **UNPROVEN on Linux**.
 

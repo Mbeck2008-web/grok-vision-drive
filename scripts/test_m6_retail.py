@@ -37,7 +37,12 @@ from python.control.actuate import (  # noqa: E402
 )
 from python.runtime.hw_probe import HwReport, cam_claim  # noqa: E402
 from python.runtime.state_io import read_state, state_path  # noqa: E402
-from python.sensors.cameras import CAM_IDS, WindowBackend  # noqa: E402
+from python.sensors.cameras import (  # noqa: E402
+    CAM_IDS,
+    WindowBackend,
+    _pick_best_beamng_rect,
+    _skip_beamng_title,
+)
 
 CHROME_RE = re.compile(r"tesla|\bfsd\b|full self[- ]driving|autopilot", re.I)
 
@@ -174,6 +179,22 @@ def check_window_backend_one_cam() -> None:
     empty = wb2.grab()
     assert empty.main_bgr() is None
     assert all(v == "missing" for v in empty.health_str().values())
+
+
+def check_window_picker_prefers_drive() -> None:
+    """Retail must grab BeamNG.drive, not a crash dialog or a Tech window."""
+    assert _skip_beamng_title("Notepad")
+    assert _skip_beamng_title("BeamNG.drive Crash Reporter")
+    assert not _skip_beamng_title("BeamNG.drive")
+    crash = ("BeamNG.drive Crash Reporter", 0, 0, 800, 600)
+    tiny = ("BeamNG.drive", 0, 0, 100, 100)
+    tech = ("BeamNG.tech", 0, 0, 1920, 1080)
+    drive = ("BeamNG.drive", 10, 10, 1280, 720)
+    generic = ("BeamNG", 0, 0, 1920, 1080)
+    assert _pick_best_beamng_rect([crash, tiny]) is None
+    assert _pick_best_beamng_rect([tech, drive]) == (10, 10, 1280, 720)
+    assert _pick_best_beamng_rect([generic, tech]) == (0, 0, 1920, 1080)
+    assert _pick_best_beamng_rect([tiny, drive]) == (10, 10, 1280, 720)
 
 
 def _write_ego(
@@ -593,6 +614,8 @@ def check_player_docs() -> None:
     # Retail drives via the cmd JSON bus; the old "cannot drive" wording must be gone everywhere players look.
     assert "gvd_cmd.json" in readme and "gvd_ego.json" in readme
     assert "play_gvd_tech.bat" in readme and "tech.yaml" in readme
+    assert "beamngpy if importable" not in readme.lower(), "auto backend must not pick Tech just because beamngpy is installed"
+    assert "does **not** pick Tech just because beamngpy is installed" in readme
     for f in (ROOT / "README.md", ROOT / "play_gvd.bat", ROOT / "play_gvd_tech.bat", ROOT / "scripts" / "make_release_zip.py",
               ROOT / "python" / "run_vision.py", ROOT / "docs" / "gvd_state_schema.md"):
         text = f.read_text(encoding="utf-8", errors="ignore").lower()
@@ -613,6 +636,7 @@ def main() -> None:
     check_release_zip()
     check_boot_line_honesty()
     check_window_backend_one_cam()
+    check_window_picker_prefers_drive()
     check_cmd_json_drive_bus()
     check_engage_path_contract()
     check_no_chrome()

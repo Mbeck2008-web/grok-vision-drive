@@ -8,6 +8,26 @@ Repo: [Mbeck2008-web/grok-vision-drive](https://github.com/Mbeck2008-web/grok-vi
 Schema / UI contract: [`docs/gvd_state_schema.md`](gvd_state_schema.md)
 
 
+## Snapshot (2026-09-13, CEF + Alt+G hotfix after live FAIL @ main 1543777)
+
+Live Desktop-IQU45 on main@1543777 (includes #22 ASCII): Apps tile still blank, Alt+G still `Could not create a description`, early `Couldn't find action gvd_toggle_engage` on `keyboard.diff` ~1s before mod mount. ASCII was not the remaining CEF bug.
+
+Root causes (repo + BeamNG 0.39 UiApps / input docs):
+
+1. **CEF directive.** `app.json` had `"directive": "gvd-app"` (kebab). UiAppsService does `$injector.has(directive + 'Directive')` after loading `app.js`. Angular registers `gvdAppDirective`. Lookup of `gvd-appDirective` fails -- tile blank, Hide only. Official app contract is camelCase `"directive": "gvdApp"` matching `.directive('gvdApp', ...)`, plus `css` as an object (not a JSON string).
+2. **ActionMap race.** `core_input_actions` caches the action table on first read. `keyboard.diff` binds `gvd_toggle_engage` before unpacked `gvd.json` is mounted. #22 called `core_input_bindings.loadActions()` -- that function is not on that module (`load`/`getActiveActions` live on `core_input_actions`). Reload never saw `gvd.json`, so `am:bind` still had no title/desc.
+
+This hotfix rewrites the slim in-game app to the official contract, ships live wheel/pedal readouts from the existing `egoFb` / `gvd_ego.json` Direct Drive echo (no second input stack), busts the action cache, and defer/retries `reloadBindings`.
+
+| Item | Value |
+| --- | --- |
+| `main` tip this branch is off | `1543777` -- includes #22 ASCII CEF / Alt+G / cp1252 and #31 Direct Drive wheel+pedals |
+| Live prove | **UNPROVEN** -- Desktop-IQU45, BeamNG.drive **0.39.4**, DX (not Vulkan) |
+| Hardware profile | i9-9900K + UHD 630 QSV + GTX 1080 Ti, infer <= 4 GB |
+
+Live dual-monitor + Alt+G remains **UNPROVEN**. Live FFB remains **UNPROVEN**. Live QSV remains **UNPROVEN**. Live Tech remains **UNPROVEN**.
+
+
 ## Snapshot (2026-09-10, after #22)
 
 Michael asked to land remaining open PRs onto `main` (same session as nerd debug #26). [#22](https://github.com/Mbeck2008-web/grok-vision-drive/pull/22) was merged **at that request** even though the Windows 0.39.4 live prove is still **UNPROVEN**. Offline tests here are not that prove.
@@ -27,7 +47,7 @@ Live dual-monitor + Alt+G remains **UNPROVEN**. Live FFB remains **UNPROVEN**. L
 - Vision-only BeamNG **toy**. No Tesla logos. No "FSD" / "Full Self-Driving" chrome or names. Repo title stays free of "FSD".
 - **Retail** = 1-cam OpenCV / window capture + Lua cmd bus (`Documents/GVD/gvd_cmd.json` -> GELua secondary Direct Drive wheel+pedals). Do not pretend that is 8 cameras.
 - **Tech** = BeamNGpy 8-cam + `vehicle.control` (preferred path; needs BeamNG.tech). Optional extras are a sensor bus the planner ignores. GPS is a nav hint, not a route.
-- In-game Apps **GVD** = slim Engage / Disengage + settings only.
+- In-game Apps **GVD** = slim Engage / Disengage + settings + live wheel/pedal echo only.
 - Rich VISION lexicon lives on the Python `python/viz/` second screen (`stage.py`). Nerd DRIVE/VIZ tabs are OpenCV, not CEF.
 - Engage key: **Alt+G** (and **Ctrl+Alt+G**). **Alt+A** is stock BeamNG `toggleRangeStatus`. Do not steal it.
 - Hardware: 9900K + UHD 630 QSV + GTX 1080 Ti, infer <= 4 GB. Live start refuses if probed dGPU VRAM < 10 GB while BeamNG is up, unless `--vision-only`.
@@ -47,32 +67,33 @@ Writing only `Documents/GVD/gvd_engage.json` is **not** Engage. Python never inv
 `.cursor/environment.json` + `install.sh` came along on the hotfix tip (Cloud Agent Linux slice). They are repo tooling; they must not ship in the retail zip.
 
 
-## Verify reinstall checklist (Windows 0.39.4, when Desktop-IQU45 is online)
+## Verify reinstall checklist (Windows 0.39.4, Desktop-IQU45, Michael in-car)
 
-A dirty leftover `app.js` from a partial wipe will look like a CEF regression. Run this on **current `main`**, not the old `47f2ceb` tip (main also has #24/#25/#26).
+A dirty leftover `app.js` / stale HUD layout will look like a CEF regression. Install **this hotfix tip**, not main@1543777.
 
 1. Fully quit BeamNG.
 2. Wipe unpacked `gvd`:
    - `%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\mods\unpacked\gvd`
    - and legacy `%LOCALAPPDATA%\BeamNG.drive\<ver>\mods\unpacked\gvd` if present
-3. Copy this tip's `beamng_mod\*` into that path -- or run `install.bat`. **No hand-sanitized leftover `app.js`.**
+3. Copy this tip's `beamng_mod\*` into that path -- or run `install.bat`. **No leftover `app.js` / `app.json`.** Confirm installed `app.json` has `"directive": "gvdApp"` (camelCase) and `css` is an object.
 4. Relaunch BeamNG **DX** (not Vulkan), enable **Grok Vision Drive** in Mod Manager, sit in a vehicle.
-5. Remove the GVD app from the cockpit if it is already placed, then re-add it from Apps (stale layout can keep a dead tile).
+5. Remove the GVD app from the cockpit if it is already placed, then re-add it from HUD Apps (stale layout can keep a dead tile).
 6. Prove all of:
-   - Tile shows Engage / settings (not blank). Console registers `gvd-app` with no CEF parse error.
-   - Alt+G and Ctrl+Alt+G log `[GVD] ENGAGED` / `DISENGAGED` with **no** ActionMap `Could not create a description for binding keyboard0::alt+g` (or `ctrl+alt+g`).
-   - Writing only `gvd_engage.json` is **not** enough -- need the Lua toggle (key or app).
-   - `play_gvd.bat` / supervisor survives **without** `PYTHONUTF8=1` (no `UnicodeEncodeError` from `place_opencv_window`).
-   - OpenCV second-screen lexicon is present when `run_vision --viz` / `play_gvd.bat` runs (void stage, lane fan, ice corridor -- not a blank window).
+   - Tile shows Engage / settings / **WHEEL / PEDALS** (not blank, not only Hide). Console has **no** `[UiAppsService] failed to load directive: gvd-app`.
+   - Steering the wheel and pressing gas/brake moves the in-game bars from the existing `gvd_ego.json` / `egoFb` echo (applied electrics + player lastInputs). No second input stack.
+   - Alt+G and Ctrl+Alt+G log `[GVD] ENGAGED` / `DISENGAGED` with **no** leftover ActionMap `Could not create a description for binding keyboard0::alt+g` (or `ctrl+alt+g`) after the extension is loaded. An early boot `Couldn't find action gvd_toggle_engage` on `keyboard.diff` is OK only if the later retry logs `[GVD] Alt+G action ready` and the key then works.
+   - Writing only `gvd_engage.json` is **not** Engage -- need the Lua toggle (key or app). Ignore a stale Sep-9 `engaged:true` file.
+   - `play_gvd.bat` / supervisor survives **without** `PYTHONUTF8=1`.
+   - OpenCV second-screen lexicon is present when `run_vision --viz` / `play_gvd.bat` runs. In-game app stays slim (no VISION canvas).
 
-If verify fails, stay on a hotfix branch. Do not call live dual proven from offline tests.
+If verify fails, stay on this hotfix branch. Do not call live dual proven from offline tests.
 
 
 ## Soft backlog (out of scope unless Michael asks)
 
 - Cones / crosswalks on the OpenCV lexicon
-- Boot nit: `Couldn't find action gvd_toggle_engage` race (reload-on-load is the mitigation; the first bind can still log)
-- Critic soft: in-game app height 400
+- Boot nit: first `Couldn't find action gvd_toggle_engage` on `keyboard.diff` can still log before mount (retry is the mitigation)
+- Critic soft: in-game app height 440 (wheel/pedal row)
 - Live dual-monitor proof with Michael in-car (still **UNPROVEN**)
 
 
@@ -92,10 +113,10 @@ PYTHONPATH=. python scripts/test_debug_opts.py
 
 4. When Desktop-IQU45 is online, run the reinstall checklist above with Michael in-car.
 5. Product files that matter for the blank-tile / bind / cp1252 class of bugs:
-   - CEF app: `beamng_mod/ui/modules/apps/GVD/`
+   - CEF app: `beamng_mod/ui/modules/apps/GVD/` -- `app.json` directive must be camelCase `gvdApp`
    - ActionMap: `beamng_mod/lua/ge/extensions/core/input/actions/gvd.json`
    - Binds: `beamng_mod/settings/inputmaps/keyboardGvd.json`
-   - Reload: `M.onExtensionLoaded` in `beamng_mod/lua/ge/extensions/gvd/main.lua`
+   - Reload: `refreshEngageBindings` / `retryEngageBindings` in `gvd/main.lua` (`core_input_actions` cache bust, then bindings)
    - Console prints: `python/viz/monitors.py`, `python/runtime/hw_probe.py`
    - Lexicon: `python/viz/stage.py` (second screen), not the in-game canvas
 6. Retail drive bus: `gvd_cmd.json` -> Lua, `gvd_ego.json` <- vehicle, `gvd_engage.json` = sticky engage/disengage record. See [`gvd_state_schema.md`](gvd_state_schema.md).

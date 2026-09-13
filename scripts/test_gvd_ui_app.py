@@ -32,16 +32,23 @@ def main() -> None:
     lua = LUA.read_text(encoding="utf-8")
     run_vision = RUN_VISION.read_text(encoding="utf-8")
 
-    # app.json wiring: directive name, template path, default geometry
+    # app.json wiring: directive name MUST match app.js (camelCase). BeamNG
+    # UiAppsService checks $injector.has(directive + 'Directive'); kebab-case
+    # "gvd-app" looks up gvd-appDirective and the tile stays blank after app.js loads.
     assert app_json["name"] == "GVD", app_json["name"]
-    assert app_json["directive"] == "gvd-app", app_json["directive"]
+    assert app_json["directive"] == "gvdApp", app_json["directive"]
     assert app_json["domElement"] == "<gvd-app></gvd-app>", app_json["domElement"]
-    css = json.loads(app_json["css"])
+    css = app_json["css"]
+    assert isinstance(css, dict), "app.json css must be an object (not a JSON string)"
     for key in ("width", "height"):
         assert css[key].endswith("px"), css
-    assert "gvdApp" in app_js, "directive gvdApp missing (app.json says gvd-app)"
+    assert ".directive('gvdApp'" in app_js, "directive gvdApp missing (must match app.json)"
     assert "/ui/modules/apps/GVD/app.html" in app_js, "templateUrl must be the absolute mod path"
     assert (APP / "app.png").is_file(), "app.png icon missing"
+    strip_json = json.loads((ROOT / "beamng_mod" / "ui" / "modules" / "apps" / "gvd_strip"
+                             / "app.json").read_text(encoding="utf-8"))
+    assert strip_json["directive"] == "gvdStrip", strip_json["directive"]
+    assert isinstance(strip_json["css"], dict), "gvd_strip css must be an object"
 
     # Titles stay GVD / VISION, and no Tesla / FSD chrome anywhere the player can see.
     assert "GVD" in app_html and "VISION" in app_html
@@ -105,6 +112,21 @@ def main() -> None:
     controls = {b["control"] for b in keymap["bindings"]}
     assert "alt+g" in controls and "ctrl+alt+g" in controls, keymap
     assert "alt+a" not in controls, "do not steal stock toggleRangeStatus"
+    # ActionMap race: bust core_input_actions cache, then reload bindings. The old
+    # core_input_bindings.loadActions path does not exist on that module.
+    assert "core_input_actions" in lua and "getActiveActions" in lua
+    assert "gvd_toggle_engage" in lua and "refreshEngageBindings" in lua
+    assert "retryEngageBindings" in lua
+    assert "b.loadActions" not in lua
+    assert "onFileChanged" in lua
+
+    # Retail Direct Drive echo on the slim HUD -- reuse egoFb, do not invent a bus.
+    assert "WHEEL / PEDALS" in app_html
+    for key in ("steerInput", "throttleInput", "brakeInput",
+                "playerSteer", "playerThrottle", "playerBrake", "playerDevice"):
+        assert f"{key} =" in lua or f"{key}=" in lua, f"gvdUi missing {key}"
+        assert key in app_js, f"app.js never reads {key}"
+    assert "axisTxt" in app_js and "inputNote" in app_js
 
     # One prefs bus: what Lua writes is what the supervisor reads.
     written = set(re.findall(r'"(show_path|show_agent_ghosts|show_scene|policy|viz_screen)"\s*:', lua))

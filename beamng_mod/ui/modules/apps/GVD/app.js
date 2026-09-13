@@ -1,15 +1,15 @@
-// GVD in-game app: engage + settings (path/ghosts, policy, GVD VISION screen).
-// The rich VISION lexicon lives on the OpenCV second screen (python/viz/stage.py).
-// Data comes from the existing gvdUi guihooks push (gvd/main.lua reads Documents/GVD/gvd_state.json).
-// Titles stay GVD / VISION; scripts/test_gvd_ui_app.py fails the build on any other product chrome.
+// Slim in-game GVD HUD: Engage + settings + live wheel/pedal echo.
+// Rich VISION lexicon stays on the OpenCV second screen (python/viz/stage.py).
+// Data: gvdUi from gvd/main.lua (gvd_state.json + retail Direct Drive egoFb).
+// app.json.directive must be camelCase "gvdApp" -- BeamNG UiAppsService looks up
+// $injector.has(directive + 'Directive'), so kebab-case "gvd-app" never registers.
 angular.module('beamng.apps')
 .directive('gvdApp', [function () {
   return {
     templateUrl: '/ui/modules/apps/GVD/app.html',
     replace: true,
     restrict: 'EA',
-    scope: true,
-    link: function (scope, element) {
+    link: function (scope, element, attrs) {
       var POLICIES = ['modular', 'e2e', 'shadow'];
 
       var ui = {
@@ -17,29 +17,31 @@ angular.module('beamng.apps')
         showPath: true, showGhosts: false, showScene: false,
         policy: null, policyReq: null, e2eOk: null, vetoReason: null, e2eBackend: null,
         hz: null, camHz: null, ttc: null, aeb: null, n: null, speed: null,
-        targetV: null, brakeCmd: null,
+        targetV: null, brakeCmd: null, steerDeg: null,
         pathConf: null, pathWidth: null, pathPreview: null, laneConf: null,
         camBackend: null, camNote: null, camOk: null, camTotal: null,
         vizWindow: null, vizScreen: null, vizNote: null, vizScreenReq: null,
         inferMs: null, rssMb: null, vramUsed: null, vramTotal: null, gpu: null,
         detector: null, actuator: null, cmdApplied: null, cmdReason: null,
         cmdSeq: null, cmdAckSeq: null, egoSource: null,
-        clipTrigger: null, encodeBackend: null
+        clipTrigger: null, encodeBackend: null,
+        steerInput: null, throttleInput: null, brakeInput: null,
+        playerDevice: null, playerSteer: null, playerThrottle: null, playerBrake: null
       };
-      // Cleared when the supervisor is gone: stale numbers must not look live.
       var TELEMETRY = [
         'hz', 'camHz', 'ttc', 'aeb', 'n', 'speed', 'pathConf', 'pathWidth', 'pathPreview',
         'laneConf', 'policy', 'e2eOk', 'vetoReason', 'e2eBackend', 'camBackend', 'camNote',
-        'targetV', 'brakeCmd', 'camOk', 'camTotal', 'vizWindow', 'vizScreen', 'vizNote', 'inferMs', 'rssMb',
-        'vramUsed', 'vramTotal', 'gpu', 'detector', 'actuator', 'cmdApplied', 'cmdReason',
-        'cmdSeq', 'cmdAckSeq', 'egoSource', 'clipTrigger', 'encodeBackend', 'disengageReason'
+        'targetV', 'brakeCmd', 'steerDeg', 'camOk', 'camTotal', 'vizWindow', 'vizScreen', 'vizNote',
+        'inferMs', 'rssMb', 'vramUsed', 'vramTotal', 'gpu', 'detector', 'actuator',
+        'cmdApplied', 'cmdReason', 'cmdSeq', 'cmdAckSeq', 'egoSource', 'clipTrigger',
+        'encodeBackend', 'disengageReason', 'steerInput', 'throttleInput', 'brakeInput',
+        'playerDevice', 'playerSteer', 'playerThrottle', 'playerBrake'
       ];
 
       scope.ui = ui;
       scope.policies = POLICIES;
       scope.nerd = false;
 
-      // ---------------------------------------------------------------- lua
       var luaWarned = false;
       function lua(cmd) {
         try {
@@ -58,7 +60,6 @@ angular.module('beamng.apps')
         return lua('if extensions and extensions.gvd_main then extensions.gvd_main.' + call + ' end');
       }
 
-      // ------------------------------------------------------------ actions
       scope.toggleEngage = function () { gvdLua('toggleEngage()'); };
       scope.setPath = function (v) { ui.showPath = !!v; gvdLua('setShowPath(' + (v ? 'true' : 'false') + ')'); };
       scope.setGhosts = function (v) { ui.showGhosts = !!v; gvdLua('setShowAgentGhosts(' + (v ? 'true' : 'false') + ')'); };
@@ -74,8 +75,13 @@ angular.module('beamng.apps')
         gvdLua("requestVizScreen('" + s + "')");
       };
 
-      // ----------------------------------------------------------- readouts
       function dash(v) { return (v === null || v === undefined || v === '') ? '--' : v; }
+      function num1(v) {
+        if (v === null || v === undefined || v === '') return '--';
+        var n = Number(v);
+        if (isNaN(n)) return '--';
+        return n.toFixed(2);
+      }
       scope.dash = dash;
 
       scope.linkLabel = function () {
@@ -83,8 +89,6 @@ angular.module('beamng.apps')
         if (ui.link === 'stale') return 'link stale';
         return 'no link';
       };
-      // Retail: the mod applies gvd_cmd.json itself (ui.applying). Tech: BeamNGpy drives the
-      // vehicle directly, so the mod never applies and cmd_applied is the honest signal.
       function driving() {
         if (ui.link !== 'live' || !ui.engaged) return false;
         if (ui.applying) return true;
@@ -196,13 +200,39 @@ angular.module('beamng.apps')
         return ui.link + ' - ' + age + ' s since last beat';
       };
 
-      // --------------------------------------------------------------- feed
+      // Retail Direct Drive echo already on gvdUi: applied electrics + player lastInputs.
+      scope.inputNote = function () {
+        if (ui.steerInput === null && ui.playerSteer === null) return 'waiting for vehicle echo';
+        return ui.playerDevice ? 'player device + applied electrics' : 'applied electrics (no player device)';
+      };
+      scope.axisPct = function (v, centered) {
+        var n = Number(v);
+        if (v === null || v === undefined || isNaN(n)) return 0;
+        if (centered) return Math.max(0, Math.min(100, (n + 1) * 50));
+        return Math.max(0, Math.min(100, n * 100));
+      };
+      scope.wheelMark = function (v) {
+        return { left: scope.axisPct(v, true) + '%' };
+      };
+      scope.pedalFill = function (v) {
+        return { width: scope.axisPct(v, false) + '%' };
+      };
+      scope.axisTxt = function (v) { return num1(v); };
+
       function ingest(data) {
         for (var k in data) {
           if (Object.prototype.hasOwnProperty.call(data, k)) ui[k] = data[k];
         }
         if (data.link === 'none') {
-          for (var i = 0; i < TELEMETRY.length; i++) ui[TELEMETRY[i]] = null;
+          for (var i = 0; i < TELEMETRY.length; i++) {
+            var key = TELEMETRY[i];
+            if (key === 'steerInput' || key === 'throttleInput' || key === 'brakeInput' ||
+                key === 'playerDevice' || key === 'playerSteer' || key === 'playerThrottle' ||
+                key === 'playerBrake') {
+              continue;
+            }
+            ui[key] = null;
+          }
         }
       }
 
@@ -210,17 +240,15 @@ angular.module('beamng.apps')
         if (!data) return;
         scope.$evalAsync(function () { ingest(data); });
       });
-      // Older strip-only pushes still keep the engage state honest.
       scope.$on('gvdStrip', function (event, data) {
         if (!data || typeof data.engaged !== 'boolean') return;
         scope.$evalAsync(function () { ui.engaged = data.engaged; });
       });
 
-      // Ask the extension for a first payload; it pushes on its own afterwards.
       var tries = 0;
       var poke = window.setInterval(function () {
         tries++;
-        if (ui.link !== 'none' || tries > 10) { window.clearInterval(poke); poke = null; return; }
+        if (tries > 10) { window.clearInterval(poke); poke = null; return; }
         lua('if extensions and extensions.gvd_main and extensions.gvd_main.pushUiState then extensions.gvd_main.pushUiState() end');
       }, 1000);
 

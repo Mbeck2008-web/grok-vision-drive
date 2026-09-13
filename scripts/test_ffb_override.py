@@ -128,7 +128,9 @@ def check_lua_defaults_match_yaml() -> None:
     assert re.search(r"local CMD_DEAD_S = 1\.0", body), "CMD_DEAD_S must stay 1.0 — this is not a dead-man change"
     assert "player_steer" in body and "player_brake" in body and "player_throttle" in body
     assert "2,900,0,nil,'gvd'" in body, "retail apply must be FILTER_DIRECT + Direct Drive angle + source gvd"
+    assert "2,0,0,nil,'gvd'" in body, "retail pedals must use Direct Drive arity (angle 0, lockType 0, source gvd)"
     assert "setAllowedInputSource" in body and "player_device" in body
+    assert "input.event('parkingbrake'" in body and "input.event('clutch'" in body, "resting clutch/handbrake must be held at 0"
 
 
 def check_residual_not_absolute() -> None:
@@ -407,6 +409,15 @@ def check_player_device_absolute() -> None:
             assert v.channel == "steer", v
             break
     assert tripped, "physical wheel pull 0.25 must be player_steer when player_device"
+
+    # Same lock for pedals: GVD throttle 0.4 with resting lastInputs is not an override.
+    sim = Sim(cfg)
+    sim.warm(cmd=(0.0, 0.4, 0.0), echo=(0.0, 0.0, 0.0), player_device=True)
+    for _ in range(8):
+        v = sim.step(cmd=(0.0, 0.4, 0.0), echo=(0.0, 0.0, 0.0), player_device=True)
+        assert not v.active, f"resting pedals vs GVD throttle 0.4 read as driver: {v}"
+    v = sim.step(cmd=(0.0, 0.4, 0.0), echo=(0.0, 0.0, 0.12), player_device=True)
+    assert v.active and v.channel == "brake", f"physical brake 0.12 must be player_brake: {v}"
 
 
 def main() -> None:

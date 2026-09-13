@@ -25,7 +25,7 @@ Live dual-monitor + Alt+G remains **UNPROVEN**. Live FFB remains **UNPROVEN**. L
 ## Product rules (non-negotiable)
 
 - Vision-only BeamNG **toy**. No Tesla logos. No "FSD" / "Full Self-Driving" chrome or names. Repo title stays free of "FSD".
-- **Retail** = 1-cam OpenCV / window capture + Lua cmd bus (`Documents/GVD/gvd_cmd.json` -> GELua secondary Direct Drive wheel). Do not pretend that is 8 cameras.
+- **Retail** = 1-cam OpenCV / window capture + Lua cmd bus (`Documents/GVD/gvd_cmd.json` -> GELua secondary Direct Drive wheel+pedals). Do not pretend that is 8 cameras.
 - **Tech** = BeamNGpy 8-cam + `vehicle.control` (preferred path; needs BeamNG.tech). Optional extras are a sensor bus the planner ignores. GPS is a nav hint, not a route.
 - In-game Apps **GVD** = slim Engage / Disengage + settings only.
 - Rich VISION lexicon lives on the Python `python/viz/` second screen (`stage.py`). Nerd DRIVE/VIZ tabs are OpenCV, not CEF.

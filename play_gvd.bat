@@ -4,7 +4,7 @@ title GVD Play
 cd /d "%~dp0"
 
 rem Retail launcher (M6): 1-cam window capture + GVD VISION window + Steam BeamNG.
-rem Honesty: retail = ONE window capture (main cam); Engage drives via gvd_cmd.json -> mod Lua secondary Direct Drive wheel.
+rem Honesty: retail = ONE window capture (main cam); Engage drives via gvd_cmd.json -> mod Lua secondary Direct Drive wheel+pedals.
 rem 8-cam rig + BeamNGpy direct control = BeamNG.tech (set GVD_BACKEND=beamngpy). Extra args pass through.
 if not defined GVD_BACKEND set "GVD_BACKEND=window"
 

@@ -1,9 +1,9 @@
 -- Grok Vision Drive — GE extension: engage + ice-blue ego path + compact HUD strip + retail drive
 -- NOTE: Alt+G live ribbon/drive remain UNPROVEN on Linux; confirm on Windows BeamNG smoke.
 -- Retail (window capture): Documents/GVD/gvd_cmd.json is applied to the player vehicle only while
--- engaged, as a secondary Direct Drive wheel (FILTER_DIRECT + source gvd + allowedInputSources).
--- A connected keyboard/pad/wheel otherwise overwrites pad-smoothed input.event every frame, so
--- the software never actually holds the sim car. No DLL / hooks. Tech still uses BeamNGpy.
+-- engaged, as a secondary Direct Drive wheel + pedals (FILTER_DIRECT + source gvd + allowedInputSources).
+-- A connected keyboard/pad/wheel/pedal cluster otherwise overwrites pad-smoothed input.event every
+-- frame, so the software never actually holds the sim car. No DLL / hooks. Tech still uses BeamNGpy.
 -- Detector, path, planner and track ghosts keep running/drawing while the supervisor is live;
 -- Alt+G is the takeover latch (ice underglow + actuators), not the start of perception.
 local M = {}
@@ -39,7 +39,7 @@ local CMD_POLL_S = 0.05      -- 20 Hz apply
 local CMD_STALE_S = 0.35     -- no new seq for this long → brake hold (dead-man)
 local CMD_DEAD_S = 1.0       -- stream dead this long while we hold the car → release + disengage
 local EGO_POLL_S = 0.10      -- 10 Hz electrics echo while the supervisor is alive
-local applying = false       -- true while our secondary Direct Drive wheel holds the player vehicle
+local applying = false       -- true while our secondary Direct Drive wheel+pedals hold the player vehicle
 local holdLogged = false     -- one-shot log when we first claim the Direct Drive source
 local applyVeh = nil         -- vehicle object we last applied to (released on switch/disengage)
 local lastAppliedSeq = -1
@@ -939,13 +939,15 @@ end
 -- ───────────── M6 retail drive: gvd_cmd.json → player vehicle, electrics → gvd_ego.json ─────────────
 -- Python writes {steer,throttle,brake,seq,engaged,heartbeat_mtime} every tick. While Lua-engaged AND the
 -- payload says engaged AND the seq keeps advancing, we feed the player vehicle as a *secondary Direct
--- Drive wheel*: input.event(..., FILTER_DIRECT=2, angle=900, lockType=0, source='gvd').
--- Pad-smoothed filter 1 (the old retail path, and what BeamNGpy still sends on Tech) is last-writer-wins
--- against a connected wheel/pad, so GVD's 20 Hz stream never holds the car. Direct + source gvd, with
--- input.setAllowedInputSource locking out 'local' (and any other device) while we apply, is the retail
--- take-the-wheel path. angle=900 marks it as a Direct Drive wheel; lockType=0 means our -1..1 command
--- is already fraction of vehicle lock (same sign as kbdSteer: + = right). On release we zero the gvd
--- source then clear the whitelist so the player's device gets the car back.
+-- Drive wheel + pedals*: input.event(..., FILTER_DIRECT=2, source='gvd'). Steering uses angle=900
+-- (marks Direct Drive) and lockType=0 so -1..1 is already fraction of vehicle lock (+ = right). Pedals
+-- use the same Direct arity with angle=0 (unused on throttle/brake). Pad-smoothed filter 1 (the old
+-- retail path, and what BeamNGpy still sends on Tech) is last-writer-wins against a connected
+-- wheel/pad/pedal cluster, so GVD's 20 Hz stream never holds the car. Direct + source gvd, with
+-- input.setAllowedInputSource locking out 'local' (and any other device) on steering/throttle/brake/
+-- parkingbrake/clutch while we apply, is the retail take-the-wheel path. parkingbrake and clutch are
+-- held at 0 on source gvd so a resting handbrake or clutch pedal cannot pin the car. On release we
+-- zero the gvd source then clear the whitelist so the player's device gets the car back.
 -- Vehicle Lua echoes electrics plus non-gvd lastInputs (the physical wheel/pedals, still recorded even
 -- when not applied) through obj:queueGameEngineLua → M.onEgoFeedback → gvd_ego.json.
 local VE_HOLD = "if input and input.setAllowedInputSource then "
@@ -955,18 +957,28 @@ local VE_HOLD = "if input and input.setAllowedInputSource then "
   .. "input.setAllowedInputSource('throttle','local',false);"
   .. "input.setAllowedInputSource('brake','gvd',true);"
   .. "input.setAllowedInputSource('brake','local',false);"
+  .. "input.setAllowedInputSource('parkingbrake','gvd',true);"
+  .. "input.setAllowedInputSource('parkingbrake','local',false);"
+  .. "input.setAllowedInputSource('clutch','gvd',true);"
+  .. "input.setAllowedInputSource('clutch','local',false);"
   .. "end;"
 local VE_APPLY_FMT = VE_HOLD
   .. "input.event('steering',%.4f,2,900,0,nil,'gvd');"
-  .. "input.event('throttle',%.4f,2,nil,nil,nil,'gvd');"
-  .. "input.event('brake',%.4f,2,nil,nil,nil,'gvd')"
+  .. "input.event('throttle',%.4f,2,0,0,nil,'gvd');"
+  .. "input.event('brake',%.4f,2,0,0,nil,'gvd');"
+  .. "input.event('parkingbrake',0,2,0,0,nil,'gvd');"
+  .. "input.event('clutch',0,2,0,0,nil,'gvd')"
 local VE_RELEASE = "input.event('steering',0,2,900,0,nil,'gvd');"
-  .. "input.event('throttle',0,2,nil,nil,nil,'gvd');"
-  .. "input.event('brake',0,2,nil,nil,nil,'gvd');"
+  .. "input.event('throttle',0,2,0,0,nil,'gvd');"
+  .. "input.event('brake',0,2,0,0,nil,'gvd');"
+  .. "input.event('parkingbrake',0,2,0,0,nil,'gvd');"
+  .. "input.event('clutch',0,2,0,0,nil,'gvd');"
   .. "if input and input.setAllowedInputSource then "
   .. "input.setAllowedInputSource('steering',nil);"
   .. "input.setAllowedInputSource('throttle',nil);"
   .. "input.setAllowedInputSource('brake',nil);"
+  .. "input.setAllowedInputSource('parkingbrake',nil);"
+  .. "input.setAllowedInputSource('clutch',nil);"
   .. "end"
 local VE_ARCADE = "if drivetrain and drivetrain.setShifterMode then pcall(drivetrain.setShifterMode,'arcade') end"
 local VE_FEEDBACK = "local ev=(electrics and electrics.values) or {};"
@@ -1214,7 +1226,7 @@ local function applyInputs(veh, steer, throttle, brake)
   ovrNoteCommand(steer, throttle, brake)  -- reference the override residual is measured against
   if not holdLogged then
     holdLogged = true
-    log('I', 'GVD', '[GVD] retail drive: secondary Direct Drive wheel (source=gvd, filter=direct) so the software can hold the sim car')
+    log('I', 'GVD', '[GVD] retail drive: secondary Direct Drive wheel+pedals (source=gvd, filter=direct) so the software can hold the sim car')
   end
   return queueVehicle(veh, string.format(VE_APPLY_FMT, steer, throttle, brake))
 end
@@ -1611,7 +1623,7 @@ function M.onExtensionLoaded()
     OVR.steer_enter, OVR.steer_exit, OVR.steer_hold_ms, OVR.steer_spike, OVR.lpf_tau_ms,
     OVR.brake_enter, OVR.throttle_enter))
   print('[GVD] loaded. Alt+G engage (Ctrl+Alt+G fallback). Writes ' .. userEngagePath()
-    .. '; drives the player vehicle from gvd_cmd.json as a secondary Direct Drive wheel (retail). BeamNGpy direct control on Tech.')
+    .. '; drives the player vehicle from gvd_cmd.json as a secondary Direct Drive wheel+pedals (retail). BeamNGpy direct control on Tech.')
 end
 
 function M.onExtensionUnloaded()

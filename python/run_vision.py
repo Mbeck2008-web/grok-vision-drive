@@ -361,7 +361,7 @@ def main() -> None:
     if actuator.name == "cmd_json":
         print(
             "[GVD] actuator=cmd_json: Documents/GVD/gvd_cmd.json -> gvd_main.applyCmdJson -> player vehicle "
-            "(input.event secondary Direct Drive wheel, source=gvd). Ego speed/inputs echo back via gvd_ego.json; "
+            "(input.event secondary Direct Drive wheel+pedals, source=gvd). Ego speed/inputs echo back via gvd_ego.json; "
             "cmd_applied is claimed only on a fresh Lua ack."
         )
     print(f"[GVD] M5 policy={args.policy} e2e={e2e_policy.name} (modular vetoes E2E; shadow writes both)")

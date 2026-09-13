@@ -5,8 +5,9 @@ Safety gates (must all pass to drive):
 
 Retail bus (M6): Python writes Documents/GVD/gvd_cmd.json every tick; the mod's
 gvd_main.applyCmdJson feeds steer/throttle/brake to the player vehicle as a secondary
-Direct Drive wheel (`input.event(..., 2, 900, 0, nil, 'gvd')` + `setAllowedInputSource`)
-so a connected keyboard/pad/wheel cannot overwrite the software. Echoes wheelspeed /
+Direct Drive wheel + pedals (`input.event` FILTER_DIRECT + source `gvd` + `setAllowedInputSource`
+on steering/throttle/brake/parkingbrake/clutch) so a connected keyboard/pad/wheel/pedal cluster
+cannot overwrite the software. Echoes wheelspeed /
 inputs / applied seq back through gvd_ego.json. `cmd_applied` is only claimed once that
 ack is fresh. No DLL / hooks / process inject. Live BeamNG still UNPROVEN on Linux.
 """

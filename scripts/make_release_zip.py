@@ -132,7 +132,7 @@ FORBIDDEN_ARCHIVE_GLOBS = (
 
 HONESTY_LINES = (
     "Retail = 1-cam window capture only (main/cam_main). 8-cam rig needs BeamNG.tech + BeamNGpy.",
-    "Retail drives the sim car through Documents/GVD/gvd_cmd.json -> mod Lua secondary Direct Drive wheel on the player vehicle; "
+    "Retail drives the sim car through Documents/GVD/gvd_cmd.json -> mod Lua secondary Direct Drive wheel+pedals on the player vehicle; "
     "Tech keeps BeamNGpy direct control (preferred).",
     "Vision only at inference. Optional LiDAR/radar/IMU/Foxglove are a bus the planner ignores. GPS is a nav hint, not localization. Not Tesla FSD, no Tesla logos. Sim toy, never a real car.",
 )

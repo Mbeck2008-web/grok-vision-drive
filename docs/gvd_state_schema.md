@@ -191,7 +191,7 @@ On a trip both sides write `gvd_engage.json` `engaged=false` with the `player_*`
 | `heartbeat_mtime` | float | `time.time()`; Lua ignores files whose stamp is > `CMD_DEAD_S` (1.0 s) behind `os.time()` (old session) |
 | `reason` | string | `ok` / `preview_blocked` / `not_engaged` / `veto:*` / … (diagnostic) |
 
-Lua (`gvd_main.applyCmdJson`, 20 Hz): `input.event('steering', s, 2, 900, 0, nil, 'gvd')`; `input.event('throttle', t, 2, nil, nil, nil, 'gvd')`; `input.event('brake', b, 2, nil, nil, nil, 'gvd')` on `be:getPlayerVehicle(0)` via `queueLuaCommand` (FILTER_DIRECT, Direct Drive angle 900, lockType 0 so -1..1 is already fraction of vehicle lock); `input.setAllowedInputSource(..., 'gvd', true)` and `('local', false)` while applying so a connected device cannot overwrite; `drivetrain.setShifterMode('arcade')` once. On release: zeros on source `gvd`, then `setAllowedInputSource(..., nil)` to give the player device back. No new seq for `CMD_STALE_S` (0.35 s) → steer 0 / throttle 0 / brake 1 hold; after `CMD_DEAD_S` (1.0 s) → release (all 0), `engaged=false`, `gvd_engage.json` false. Any disengage (Alt+G, supervisor false, unload) sends one release and stops applying. `cmd.engaged=false` → release immediately (no brake tap on the player).
+Lua (`gvd_main.applyCmdJson`, 20 Hz): `input.event('steering', s, 2, 900, 0, nil, 'gvd')`; `input.event('throttle', t, 2, 0, 0, nil, 'gvd')`; `input.event('brake', b, 2, 0, 0, nil, 'gvd')`; `input.event('parkingbrake', 0, 2, 0, 0, nil, 'gvd')`; `input.event('clutch', 0, 2, 0, 0, nil, 'gvd')` on `be:getPlayerVehicle(0)` via `queueLuaCommand` (FILTER_DIRECT; steering angle 900 marks Direct Drive, lockType 0 so -1..1 is already fraction of vehicle lock; pedal angle 0 is unused); `input.setAllowedInputSource(..., 'gvd', true)` and `('local', false)` on steering/throttle/brake/parkingbrake/clutch while applying so a connected device cannot overwrite; `drivetrain.setShifterMode('arcade')` once. On release: zeros on source `gvd`, then `setAllowedInputSource(..., nil)` to give the player device back. No new seq for `CMD_STALE_S` (0.35 s) → steer 0 / throttle 0 / brake 1 hold; after `CMD_DEAD_S` (1.0 s) → release (all 0), `engaged=false`, `gvd_engage.json` false. Any disengage (Alt+G, supervisor false, unload) sends one release and stops applying. `cmd.engaged=false` → release immediately (no brake tap on the player).
 
 `Documents/GVD/gvd_ego.json` — written by Lua at ~10 Hz while the supervisor's state heartbeat is alive (vehicle Lua `electrics.values` → `obj:queueGameEngineLua` → `gvd_main.onEgoFeedback`):
 
@@ -207,7 +207,7 @@ Lua (`gvd_main.applyCmdJson`, 20 Hz): `input.event('steering', s, 2, 900, 0, nil
 | `gx` / `gy` / `gz` / `yaw_rate` | float? | Vehicle `sensors.gx2` + `obj:getYawAngularVelocity` (IMU extras; planner still vision-only) |
 | `pos` / `dir` | `{x,y,z}`? | Player vehicle world pose from GE (`getPosition` / `getDirectionVector`); GPS lat/lon is derived from this × `gps.ref_*` |
 
-Retail (`capture_backend=window`): `actuator=cmd_json`; `cmd_applied` follows the ack. Boot line: `backend=window cams=1/8 path=retail (1 window capture; not 8; drive=gvd_cmd.json->mod Lua secondary Direct Drive wheel)`.
+Retail (`capture_backend=window`): `actuator=cmd_json`; `cmd_applied` follows the ack. Boot line: `backend=window cams=1/8 path=retail (1 window capture; not 8; drive=gvd_cmd.json->mod Lua secondary Direct Drive wheel+pedals)`.
 
 ## Debug knobs (`debug`)
 

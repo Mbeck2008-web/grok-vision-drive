@@ -157,7 +157,7 @@ Python reads the file every tick and mirrors it into `engaged` (never invents en
 
 ## Player override (force-feedback residual)
 
-`config/control.yaml` `override:` owns the research-pin thresholds; the supervisor mirrors them into `override_cfg` every tick so `gvd_main` runs the same numbers without parsing YAML. The signal is `|steering_input − cmd.steer|` against the command in force when the echo was sampled, never an absolute angle. Live FFB is **UNPROVEN**. `CMD_DEAD_S` is not part of this.
+`config/control.yaml` `override:` owns the research-pin thresholds; the supervisor mirrors them into `override_cfg` every tick so `gvd_main` runs the same numbers without parsing YAML. Without a player device the signal is `|steering_input − cmd.steer|` against the command in force when the echo was sampled. On retail while the secondary Direct Drive source is locked, electrics are GVD's command and override reads `player_*` lastInputs as an absolute axis. Live FFB is **UNPROVEN**. `CMD_DEAD_S` is not part of this.
 
 | Field | Type | Notes |
 | --- | --- | --- |
@@ -191,21 +191,23 @@ On a trip both sides write `gvd_engage.json` `engaged=false` with the `player_*`
 | `heartbeat_mtime` | float | `time.time()`; Lua ignores files whose stamp is > `CMD_DEAD_S` (1.0 s) behind `os.time()` (old session) |
 | `reason` | string | `ok` / `preview_blocked` / `not_engaged` / `veto:*` / … (diagnostic) |
 
-Lua (`gvd_main.applyCmdJson`, 20 Hz): `input.event('steering', s, 1)`; `input.event('throttle', t, 2)`; `input.event('brake', b, 2)` on `be:getPlayerVehicle(0)` via `queueLuaCommand`; `drivetrain.setShifterMode('arcade')` once. No new seq for `CMD_STALE_S` (0.35 s) → steer 0 / throttle 0 / brake 1 hold; after `CMD_DEAD_S` (1.0 s) → release (all 0), `engaged=false`, `gvd_engage.json` false. Any disengage (Alt+G, supervisor false, unload) sends one release and stops applying. `cmd.engaged=false` → release immediately (no brake tap on the player).
+Lua (`gvd_main.applyCmdJson`, 20 Hz): `input.event('steering', s, 2, 900, 0, nil, 'gvd')`; `input.event('throttle', t, 2, nil, nil, nil, 'gvd')`; `input.event('brake', b, 2, nil, nil, nil, 'gvd')` on `be:getPlayerVehicle(0)` via `queueLuaCommand` (FILTER_DIRECT, Direct Drive angle 900, lockType 0 so -1..1 is already fraction of vehicle lock); `input.setAllowedInputSource(..., 'gvd', true)` and `('local', false)` while applying so a connected device cannot overwrite; `drivetrain.setShifterMode('arcade')` once. On release: zeros on source `gvd`, then `setAllowedInputSource(..., nil)` to give the player device back. No new seq for `CMD_STALE_S` (0.35 s) → steer 0 / throttle 0 / brake 1 hold; after `CMD_DEAD_S` (1.0 s) → release (all 0), `engaged=false`, `gvd_engage.json` false. Any disengage (Alt+G, supervisor false, unload) sends one release and stops applying. `cmd.engaged=false` → release immediately (no brake tap on the player).
 
 `Documents/GVD/gvd_ego.json` — written by Lua at ~10 Hz while the supervisor's state heartbeat is alive (vehicle Lua `electrics.values` → `obj:queueGameEngineLua` → `gvd_main.onEgoFeedback`):
 
 | Field | Type | Notes |
 | --- | --- | --- |
 | `speed_mps` | float | `wheelspeed` (fallback `airspeed`) — feeds `ego.speed_mps`, TTC, speed plan |
-| `steering_input` / `throttle_input` / `brake_input` | float | All three feed player-override detection (steer residual vs aligned `cmd.steer`, pedals one-sided) |
+| `steering_input` / `throttle_input` / `brake_input` | float | Applied electrics (GVD's command while the Direct Drive source is locked). Fallback override signal when `player_device` is false |
+| `player_device` | bool | True when vehicle Lua saw a non-`gvd` `input.lastInputs` source (physical wheel/pad/keys) |
+| `player_steering` / `player_throttle` / `player_brake` | float | Strongest non-`gvd` lastInputs axis. Override uses these as an absolute axis when `player_device` is true (centered wheel is 0, not residual vs `cmd.steer`) |
 | `applied_seq` | int | Last cmd seq Lua applied |
 | `applying` | bool | Lua currently holds the inputs |
 | `mtime` | int | `os.time()`; Python uses the file mtime, fresh ≤ 1 s |
 | `gx` / `gy` / `gz` / `yaw_rate` | float? | Vehicle `sensors.gx2` + `obj:getYawAngularVelocity` (IMU extras; planner still vision-only) |
 | `pos` / `dir` | `{x,y,z}`? | Player vehicle world pose from GE (`getPosition` / `getDirectionVector`); GPS lat/lon is derived from this × `gps.ref_*` |
 
-Retail (`capture_backend=window`): `actuator=cmd_json`; `cmd_applied` follows the ack. Boot line: `backend=window cams=1/8 path=retail (1 window capture; not 8; drive=gvd_cmd.json->mod Lua)`.
+Retail (`capture_backend=window`): `actuator=cmd_json`; `cmd_applied` follows the ack. Boot line: `backend=window cams=1/8 path=retail (1 window capture; not 8; drive=gvd_cmd.json->mod Lua secondary Direct Drive wheel)`.
 
 ## Debug knobs (`debug`)
 

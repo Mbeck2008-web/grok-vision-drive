@@ -4,11 +4,11 @@ Safety gates (must all pass to drive):
   engaged + heartbeat fresh + (not path_debug_preview OR allow_preview_drive)
 
 Retail bus (M6): Python writes Documents/GVD/gvd_cmd.json every tick; the mod's
-gvd_main.applyCmdJson feeds steer/throttle/brake to the player vehicle with the same
-vehicle-Lua `input.event` calls BeamNG's own AI and BeamNGpy use, and echoes
-wheelspeed / inputs / applied seq back through gvd_ego.json. `cmd_applied` is only
-claimed once that ack is fresh. No DLL / hooks / process inject. Live BeamNG still
-UNPROVEN on Linux.
+gvd_main.applyCmdJson feeds steer/throttle/brake to the player vehicle as a secondary
+Direct Drive wheel (`input.event(..., 2, 900, 0, nil, 'gvd')` + `setAllowedInputSource`)
+so a connected keyboard/pad/wheel cannot overwrite the software. Echoes wheelspeed /
+inputs / applied seq back through gvd_ego.json. `cmd_applied` is only claimed once that
+ack is fresh. No DLL / hooks / process inject. Live BeamNG still UNPROVEN on Linux.
 """
 
 from __future__ import annotations
@@ -66,6 +66,10 @@ class EgoFeedback:
     yaw_rate: float | None = None
     pos: tuple[float, float, float] | None = None
     dir: tuple[float, float, float] | None = None
+    player_device: bool = False
+    player_steering: float | None = None
+    player_throttle: float | None = None
+    player_brake: float | None = None
 
     @property
     def fresh(self) -> bool:
@@ -127,6 +131,10 @@ def read_ego_feedback(now: float | None = None) -> EgoFeedback | None:
         yaw_rate=_num(data.get("yaw_rate")),
         pos=pos,
         dir=direction,
+        player_device=bool(data.get("player_device", False)),
+        player_steering=_num(data.get("player_steering")),
+        player_throttle=_num(data.get("player_throttle")),
+        player_brake=_num(data.get("player_brake")),
     )
 
 

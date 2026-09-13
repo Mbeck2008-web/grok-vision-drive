@@ -45,13 +45,22 @@ local function readFileAll(p) local f = io.open(p, 'r'); if not f then return ni
 os.remove(egoPath)
 
 -- ── fake vehicle: executes queued vehicle-Lua in a sandbox ─────────────────────────────────────
+local allowed = {}          -- recorded input.setAllowedInputSource calls
 local events = {}          -- recorded input.event calls, in order
 local shifter = {}         -- drivetrain.setShifterMode calls
 local geQueue = {}         -- strings vehicle Lua queued back to GE
 local electricsValues = { wheelspeed = 0, steering_input = 0, throttle_input = 0, brake_input = 0 }
 
 local veEnv = {
-  input = { event = function(itype, ivalue, filter) events[#events + 1] = { itype, ivalue, filter } end },
+  input = {
+    event = function(itype, ivalue, filter, angle, lockType, osClockHP, source)
+      events[#events + 1] = { itype, ivalue, filter, angle, lockType, source }
+    end,
+    setAllowedInputSource = function(itype, source, enabled)
+      allowed[#allowed + 1] = { itype, source, enabled }
+    end,
+    lastInputs = {},
+  },
   electrics = { values = electricsValues },
   drivetrain = { setShifterMode = function(mode) shifter[#shifter + 1] = mode end },
   sensors = { gx2 = 0, gy2 = 0, gz2 = 0 },
@@ -60,6 +69,7 @@ local veEnv = {
     getYawAngularVelocity = function() return 0.0 end,
   },
   pcall = pcall, tonumber = tonumber, tostring = tostring, string = string, math = math,
+  pairs = pairs, type = type,
 }
 local Veh = {}
 Veh.__index = Veh
@@ -99,7 +109,17 @@ local function lastEvent(itype)
   for i = #events, 1, -1 do if events[i][1] == itype then return events[i] end end
   return nil
 end
-local function clearEvents() events = {} end
+local function lastAllowed(itype)
+  for i = #allowed, 1, -1 do if allowed[i][1] == itype then return allowed[i] end end
+  return nil
+end
+local function lastAllowedFor(itype, source)
+  for i = #allowed, 1, -1 do
+    if allowed[i][1] == itype and allowed[i][2] == source then return allowed[i] end
+  end
+  return nil
+end
+local function clearEvents() events = {}; allowed = {} end
 local function check(cond, msg) if not cond then error('FAIL: ' .. msg, 2) end; print('ok   ' .. msg) end
 local function near(a, b) return math.abs((a or 0) - (b or 0)) < 1e-6 end
 
@@ -128,14 +148,20 @@ check(M.isEngaged(), 'Alt+A → engaged')
 M.onUpdate(0.06)
 check(#events == 0, 'supervisor cmd engaged=false → no input.event')
 
--- 2) supervisor engaged: real steer/throttle applied with stock filters, +steer passes through (right)
+-- 2) supervisor engaged: real steer/throttle applied as a secondary Direct Drive wheel
 writeCmd(true, 0.3, 0.4, 0.0)
 beatState(true)
 M.onUpdate(0.06)
 local st = lastEvent('steering'); local th = lastEvent('throttle'); local br = lastEvent('brake')
-check(st and near(st[2], 0.3) and st[3] == 1, "input.event('steering', 0.3, 1) pad-smoothed, sign unchanged")
-check(th and near(th[2], 0.4) and th[3] == 2, "input.event('throttle', 0.4, 2) direct")
-check(br and near(br[2], 0.0) and br[3] == 2, "input.event('brake', 0, 2) direct")
+check(st and near(st[2], 0.3) and st[3] == 2, "input.event('steering', 0.3, 2) Direct Drive filter, sign unchanged")
+check(st and near(st[4] or 0, 900) and near(st[5] or -1, 0) and st[6] == 'gvd',
+  "steering angle=900 lockType=0 source=gvd (secondary Direct Drive wheel)")
+check(th and near(th[2], 0.4) and th[3] == 2 and th[6] == 'gvd', "input.event('throttle', 0.4, 2, source=gvd) direct")
+check(br and near(br[2], 0.0) and br[3] == 2 and br[6] == 'gvd', "input.event('brake', 0, 2, source=gvd) direct")
+check(lastAllowedFor('steering', 'gvd') and lastAllowedFor('steering', 'gvd')[3] == true,
+  'setAllowedInputSource(steering, gvd, true) so the software holds the car')
+check(lastAllowedFor('steering', 'local') and lastAllowedFor('steering', 'local')[3] == false,
+  'setAllowedInputSource(steering, local, false) so a connected wheel cannot overwrite')
 check(#shifter == 1 and shifter[1] == 'arcade', 'arcade shifter mode queued once on first drive')
 
 -- 3) electrics echo → GE → gvd_ego.json with applied seq
@@ -175,6 +201,8 @@ clearEvents()
 M.toggleEngage()
 check(not M.isEngaged(), 'Alt+A → disengaged')
 check(near(lastEvent('steering')[2], 0) and near(lastEvent('throttle')[2], 0) and near(lastEvent('brake')[2], 0), 'release: steering/throttle/brake → 0')
+check(lastEvent('steering')[6] == 'gvd', 'release zeros go out on the gvd Direct Drive source')
+check(lastAllowed('steering') and lastAllowed('steering')[2] == nil, 'release clears allowedInputSources so the player device gets the car back')
 clearEvents()
 writeCmd(true, 0.5, 0.5, 0.0)
 M.onUpdate(0.06)
@@ -349,6 +377,24 @@ driveTick(0, 0.3, 0, pin); driveTick(0, 0.3, 0, pin)
 check(M.isEngaged(), 'vehicle switch re-arms the override warm-up')
 for _ = 1, 8 do driveTick(0, 0.3, 0, pin) end
 check(not M.isEngaged(), 'once warm again a held residual is player_steer')
+currentVeh = fakeVeh
+
+-- 13b) secondary Direct Drive lock: electrics match GVD, override is the physical wheel
+veEnv.input.lastInputs = {
+  gvd = { steering = 0.4, throttle = 0.3, brake = 0 },
+  wheel = { steering = 0.0, throttle = 0.0, brake = 0.0 },
+}
+echo(0.4, 0.3, 0)
+M.toggleEngage()
+warmDrive(0.4, 0.3, 0, pin)
+check(M.isEngaged(), 'centered physical wheel while GVD steers 0.4 is not an override')
+local egoPd = readFileAll(egoPath)
+check(egoPd and egoPd:find('"player_device":true') and egoPd:find('"player_steering":0.000'),
+  'gvd_ego.json carries player_device + centered wheel (' .. tostring(egoPd) .. ')')
+veEnv.input.lastInputs.wheel.steering = 0.25
+for _ = 1, 8 do driveTick(0.4, 0.3, 0, pin) end
+check(not M.isEngaged(), 'physical wheel pull 0.25 with the Direct Drive source locked -> player_steer')
+veEnv.input.lastInputs = {}
 currentVeh = fakeVeh
 
 -- 12) chrome check on everything we push to the vehicle / HUD

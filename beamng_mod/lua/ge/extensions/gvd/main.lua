@@ -1,7 +1,9 @@
 -- Grok Vision Drive — GE extension: engage + ice-blue ego path + compact HUD strip + retail drive
 -- NOTE: Alt+G live ribbon/drive remain UNPROVEN on Linux; confirm on Windows BeamNG smoke.
 -- Retail (window capture): Documents/GVD/gvd_cmd.json is applied to the player vehicle only while
--- engaged, through vehicle-Lua input.event (the calls BeamNG's AI / BeamNGpy use). No DLL / hooks.
+-- engaged, as a secondary Direct Drive wheel (FILTER_DIRECT + source gvd + allowedInputSources).
+-- A connected keyboard/pad/wheel otherwise overwrites pad-smoothed input.event every frame, so
+-- the software never actually holds the sim car. No DLL / hooks. Tech still uses BeamNGpy.
 -- Detector, path, planner and track ghosts keep running/drawing while the supervisor is live;
 -- Alt+G is the takeover latch (ice underglow + actuators), not the start of perception.
 local M = {}
@@ -37,7 +39,8 @@ local CMD_POLL_S = 0.05      -- 20 Hz apply
 local CMD_STALE_S = 0.35     -- no new seq for this long → brake hold (dead-man)
 local CMD_DEAD_S = 1.0       -- stream dead this long while we hold the car → release + disengage
 local EGO_POLL_S = 0.10      -- 10 Hz electrics echo while the supervisor is alive
-local applying = false       -- true while our input.event stream holds the player vehicle
+local applying = false       -- true while our secondary Direct Drive wheel holds the player vehicle
+local holdLogged = false     -- one-shot log when we first claim the Direct Drive source
 local applyVeh = nil         -- vehicle object we last applied to (released on switch/disengage)
 local lastAppliedSeq = -1
 local cmdStaleAcc = 0
@@ -935,20 +938,50 @@ end
 
 -- ───────────── M6 retail drive: gvd_cmd.json → player vehicle, electrics → gvd_ego.json ─────────────
 -- Python writes {steer,throttle,brake,seq,engaged,heartbeat_mtime} every tick. While Lua-engaged AND the
--- payload says engaged AND the seq keeps advancing, we feed the player vehicle with the vehicle-Lua calls
--- BeamNG's own AI / BeamNGpy use: input.event('steering', v, 1) (pad-smoothed, +1 = right like kbdSteer)
--- and input.event('throttle'|'brake', v, 2) (direct). Vehicle Lua echoes electrics back through
--- obj:queueGameEngineLua → M.onEgoFeedback → gvd_ego.json (wheelspeed, inputs, applied seq).
-local VE_APPLY_FMT = "input.event('steering',%.4f,1);input.event('throttle',%.4f,2);input.event('brake',%.4f,2)"
-local VE_RELEASE = "input.event('steering',0,1);input.event('throttle',0,2);input.event('brake',0,2)"
+-- payload says engaged AND the seq keeps advancing, we feed the player vehicle as a *secondary Direct
+-- Drive wheel*: input.event(..., FILTER_DIRECT=2, angle=900, lockType=0, source='gvd').
+-- Pad-smoothed filter 1 (the old retail path, and what BeamNGpy still sends on Tech) is last-writer-wins
+-- against a connected wheel/pad, so GVD's 20 Hz stream never holds the car. Direct + source gvd, with
+-- input.setAllowedInputSource locking out 'local' (and any other device) while we apply, is the retail
+-- take-the-wheel path. angle=900 marks it as a Direct Drive wheel; lockType=0 means our -1..1 command
+-- is already fraction of vehicle lock (same sign as kbdSteer: + = right). On release we zero the gvd
+-- source then clear the whitelist so the player's device gets the car back.
+-- Vehicle Lua echoes electrics plus non-gvd lastInputs (the physical wheel/pedals, still recorded even
+-- when not applied) through obj:queueGameEngineLua → M.onEgoFeedback → gvd_ego.json.
+local VE_HOLD = "if input and input.setAllowedInputSource then "
+  .. "input.setAllowedInputSource('steering','gvd',true);"
+  .. "input.setAllowedInputSource('steering','local',false);"
+  .. "input.setAllowedInputSource('throttle','gvd',true);"
+  .. "input.setAllowedInputSource('throttle','local',false);"
+  .. "input.setAllowedInputSource('brake','gvd',true);"
+  .. "input.setAllowedInputSource('brake','local',false);"
+  .. "end;"
+local VE_APPLY_FMT = VE_HOLD
+  .. "input.event('steering',%.4f,2,900,0,nil,'gvd');"
+  .. "input.event('throttle',%.4f,2,nil,nil,nil,'gvd');"
+  .. "input.event('brake',%.4f,2,nil,nil,nil,'gvd')"
+local VE_RELEASE = "input.event('steering',0,2,900,0,nil,'gvd');"
+  .. "input.event('throttle',0,2,nil,nil,nil,'gvd');"
+  .. "input.event('brake',0,2,nil,nil,nil,'gvd');"
+  .. "if input and input.setAllowedInputSource then "
+  .. "input.setAllowedInputSource('steering',nil);"
+  .. "input.setAllowedInputSource('throttle',nil);"
+  .. "input.setAllowedInputSource('brake',nil);"
+  .. "end"
 local VE_ARCADE = "if drivetrain and drivetrain.setShifterMode then pcall(drivetrain.setShifterMode,'arcade') end"
 local VE_FEEDBACK = "local ev=(electrics and electrics.values) or {};"
   .. "local s=sensors or {};"
   .. "local function n(x) x=tonumber(x) or 0;if x~=x or x==math.huge or x==-math.huge then x=0 end;return x end;"
   .. "local gx=n(s.gx2 or s.gx);local gy=n(s.gy2 or s.gy);local gz=n(s.gz2 or s.gz);"
   .. "local yr=0;if obj and obj.getYawAngularVelocity then local ok,v=pcall(function() return obj:getYawAngularVelocity() end);if ok then yr=n(v) end end;"
-  .. "obj:queueGameEngineLua(string.format('extensions.gvd_main.onEgoFeedback(%.3f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f)',"
-  .. "n(ev.wheelspeed or ev.airspeed),n(ev.steering_input),n(ev.throttle_input),n(ev.brake_input),gx,gy,gz,yr))"
+  .. "local ps,pt,pb,np=0,0,0,0;"
+  .. "if input and input.lastInputs then for src,ins in pairs(input.lastInputs) do "
+  .. "if src~='gvd' and type(ins)=='table' then np=np+1;"
+  .. "local a=n(ins.steering);if a*a>(ps*ps) then ps=a end;"
+  .. "local t=n(ins.throttle);if t>pt then pt=t end;"
+  .. "local b=n(ins.brake);if b>pb then pb=b end;end end end;"
+  .. "obj:queueGameEngineLua(string.format('extensions.gvd_main.onEgoFeedback(%.3f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d)',"
+  .. "n(ev.wheelspeed or ev.airspeed),n(ev.steering_input),n(ev.throttle_input),n(ev.brake_input),gx,gy,gz,yr,ps,pt,pb,np))"
 
 -- ───────────── player override: steer residual, force-feedback tolerant ─────────────
 -- Force-feedback / racing wheels move electrics.steering_input around whatever GVD commands
@@ -1101,6 +1134,11 @@ end
 
 -- 'none' | 'player_steer' | 'player_brake' | 'player_throttle'. Only meaningful while we hold
 -- the vehicle. dt is the applyCmdJson step, so the filter and the dwell run on real time.
+-- When a player device is visible in input.lastInputs (nPlayer > 0), we locked that device out
+-- of hydros, so electrics.steering_input is GVD's own command (residual 0). Override then uses
+-- the physical wheel/pedals as an absolute axis (centered wheel is 0, a real pull is not).
+-- Without a player device (keyboard until a key, or the offline harness) we keep the electrics
+-- residual vs aligned cmd.steer so force-feedback chatter on an unlocked wheel still works.
 local function ovrCheck(dt)
   if not egoFb or ovrEchoStamp == nil or ovrRef == nil then return 'none' end
   if (ovrClock - ovrEchoStamp) > OVR_ECHO_MAX_S then return 'none' end
@@ -1114,14 +1152,30 @@ local function ovrCheck(dt)
   end
   probeFfbWheel()
 
+  local usePlayer = (tonumber(egoFb.nPlayer) or 0) > 0
+  local echoSteer, echoThr, echoBrk, refSteer, refThr, refBrk
+  if usePlayer then
+    -- Absolute player axes. Do not use `and/or` here: a centered wheel is 0 (falsy in Lua).
+    echoSteer = egoFb.pSteer or 0
+    echoThr = egoFb.pThr or 0
+    echoBrk = egoFb.pBrk or 0
+    refSteer, refThr, refBrk = 0, 0, 0
+  else
+    echoSteer = egoFb.steer or 0
+    echoThr = egoFb.throttle or 0
+    echoBrk = egoFb.brake or 0
+    refSteer, refThr, refBrk = ovrRef.s, ovrRef.th, ovrRef.b
+  end
+
   -- Pedals: one-sided, so our own AEB brake hold echoing back at 1.0 is not the player standing
-  -- on it. Brake is the tighter threshold and wins a tie.
-  local thrR = math.max(0, clamp(egoFb.throttle or 0, 0, 1) - ovrRef.th)
-  local brkR = math.max(0, clamp(egoFb.brake or 0, 0, 1) - ovrRef.b)
+  -- on it. With a player device the pedal lastInputs are already theirs (GVD is not in that
+  -- signal). Brake is the tighter threshold and wins a tie.
+  local thrR = math.max(0, clamp(echoThr, 0, 1) - refThr)
+  local brkR = math.max(0, clamp(echoBrk, 0, 1) - refBrk)
   if brkR >= OVR.brake_enter then return 'player_brake' end
   if thrR >= OVR.throttle_enter then return 'player_throttle' end
 
-  local raw = clamp(egoFb.steer or 0, -1, 1) - ovrRef.s
+  local raw = clamp(echoSteer, -1, 1) - refSteer
   local spike = math.abs(raw - ovrLastRaw) > OVR.steer_spike
   ovrLastRaw = raw
   if not spike then
@@ -1158,6 +1212,10 @@ local function applyInputs(veh, steer, throttle, brake)
   brake = clamp(tonumber(brake) or 0, 0, 1)
   if brake > 0.01 then throttle = 0 end  -- never both pedals (AEB semantics; arcade auto-reverse guard)
   ovrNoteCommand(steer, throttle, brake)  -- reference the override residual is measured against
+  if not holdLogged then
+    holdLogged = true
+    log('I', 'GVD', '[GVD] retail drive: secondary Direct Drive wheel (source=gvd, filter=direct) so the software can hold the sim car')
+  end
   return queueVehicle(veh, string.format(VE_APPLY_FMT, steer, throttle, brake))
 end
 
@@ -1171,6 +1229,7 @@ end
 local function releaseInputs(why)
   if not applying then return end
   applying = false
+  holdLogged = false
   queueVehicle(applyVeh or getPlayerVeh(), VE_RELEASE)
   applyVeh = nil
   ovrReset()  -- hands off: the residual filter and the dwell mean nothing now
@@ -1206,20 +1265,24 @@ local function writeEgoFile()
     local okd, dir = pcall(function() return veh:getDirectionVector() end)
     if okd then dirJson = jsonVec3(dir) end
   end
+  local np = math.floor(tonumber(egoFb.nPlayer) or 0)
   local payload = string.format(
     '{"speed_mps":%.3f,"steering_input":%.4f,"throttle_input":%.4f,"brake_input":%.4f,'
       .. '"applied_seq":%d,"applying":%s,"mtime":%d,'
-      .. '"gx":%s,"gy":%s,"gz":%s,"yaw_rate":%s,"pos":%s,"dir":%s}',
+      .. '"gx":%s,"gy":%s,"gz":%s,"yaw_rate":%s,"pos":%s,"dir":%s,'
+      .. '"player_device":%s,"player_steering":%.4f,"player_throttle":%.4f,"player_brake":%.4f}',
     egoFb.speed, egoFb.steer, egoFb.throttle, egoFb.brake,
     math.floor(tonumber(lastAppliedSeq) or -1), applying and 'true' or 'false', os.time(),
     jsonNum(egoFb.gx), jsonNum(egoFb.gy), jsonNum(egoFb.gz), jsonNum(egoFb.yawRate, '%.5f'),
-    posJson, dirJson)
+    posJson, dirJson,
+    np > 0 and 'true' or 'false',
+    tonumber(egoFb.pSteer) or 0, tonumber(egoFb.pThr) or 0, tonumber(egoFb.pBrk) or 0)
   writeText(userEgoPath(), payload)
 end
 
 -- Called from vehicle Lua (VE_FEEDBACK) via obj:queueGameEngineLua.
 -- Extra IMU args are optional so a 4-arg call still works.
-function M.onEgoFeedback(speed, steerIn, thrIn, brkIn, gx, gy, gz, yawRate)
+function M.onEgoFeedback(speed, steerIn, thrIn, brkIn, gx, gy, gz, yawRate, pSteer, pThr, pBrk, nPlayer)
   egoFb = {
     speed = tonumber(speed) or 0,
     steer = tonumber(steerIn) or 0,
@@ -1229,6 +1292,10 @@ function M.onEgoFeedback(speed, steerIn, thrIn, brkIn, gx, gy, gz, yawRate)
     gy = tonumber(gy),
     gz = tonumber(gz),
     yawRate = tonumber(yawRate),
+    pSteer = tonumber(pSteer) or 0,
+    pThr = tonumber(pThr) or 0,
+    pBrk = tonumber(pBrk) or 0,
+    nPlayer = math.floor(tonumber(nPlayer) or 0),
   }
   -- Pin the reference the residual is measured against to this sample. Vehicle Lua runs the
   -- apply snippet and the electrics echo in that order in the same tick, so the command in
@@ -1544,7 +1611,7 @@ function M.onExtensionLoaded()
     OVR.steer_enter, OVR.steer_exit, OVR.steer_hold_ms, OVR.steer_spike, OVR.lpf_tau_ms,
     OVR.brake_enter, OVR.throttle_enter))
   print('[GVD] loaded. Alt+G engage (Ctrl+Alt+G fallback). Writes ' .. userEngagePath()
-    .. '; drives the player vehicle from gvd_cmd.json while engaged (retail). BeamNGpy direct control on Tech.')
+    .. '; drives the player vehicle from gvd_cmd.json as a secondary Direct Drive wheel (retail). BeamNGpy direct control on Tech.')
 end
 
 function M.onExtensionUnloaded()

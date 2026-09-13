@@ -897,6 +897,15 @@ local function uiPayload()
     egoSource = st and st.ego_source or nil,
     clipTrigger = st and st.last_clip_trigger or nil,
     encodeBackend = st and st.encode_backend or nil,
+    -- Retail Direct Drive echo already collected for gvd_ego.json (no second input stack).
+    -- applied electrics = what holds the car while source=gvd is locked; player_* = lastInputs.
+    steerInput = egoFb and r2(egoFb.steer) or nil,
+    throttleInput = egoFb and r2(egoFb.throttle) or nil,
+    brakeInput = egoFb and r2(egoFb.brake) or nil,
+    playerDevice = egoFb and ((tonumber(egoFb.nPlayer) or 0) > 0) or nil,
+    playerSteer = egoFb and r2(egoFb.pSteer) or nil,
+    playerThrottle = egoFb and r2(egoFb.pThr) or nil,
+    playerBrake = egoFb and r2(egoFb.pBrk) or nil,
     -- scene geometry (ego frame: x right, y forward), capped + rounded
     path = (showScene and showPath) and uiPathPoints(st) or nil,
     tracks = (showScene and showAgentGhosts) and uiTracks(st) or nil,
@@ -1314,14 +1323,14 @@ function M.onEgoFeedback(speed, steerIn, thrIn, brkIn, gx, gy, gz, yawRate, pSte
   -- force when these values were read is the one we most recently pushed.
   ovrRef = ovrCmdLast or ovrCmdPrev
   ovrEchoStamp = ovrClock
-  writeEgoFile()
+  -- File bus is for the Python supervisor; the in-game HUD reads egoFb from gvdUi either way.
+  if supervisorAlive() then writeEgoFile() end
 end
 
 local function pollEgo(dt)
   egoAcc = egoAcc + (dt or 0)
   if egoAcc < EGO_POLL_S then return end
   egoAcc = 0
-  if not supervisorAlive() then return end
   local veh = getPlayerVeh()
   if not veh then return end
   queueVehicle(veh, VE_FEEDBACK)
@@ -1568,6 +1577,67 @@ end
 
 local preRenderSeen = false
 
+-- ActionMap: gvd.json is not in the FS when keyboard.diff first binds (~8.4s vs mount ~9.4s).
+local bindRetryLeft = 0
+local bindReady = false
+local BIND_RETRY_N = 40
+
+local function inputExt(name)
+  if _G[name] then return _G[name] end
+  if extensions and extensions[name] then return extensions[name] end
+  return nil
+end
+
+local function engageActionReady()
+  local a = inputExt('core_input_actions')
+  if type(a) ~= 'table' or type(a.getActiveActions) ~= 'function' then return false end
+  local ok, acts = pcall(a.getActiveActions)
+  if not ok or type(acts) ~= 'table' then return false end
+  local act = acts.gvd_toggle_engage
+  return type(act) == 'table' and act.title and act.desc and act.onDown
+end
+
+local function refreshEngageBindings(reason)
+  local actions = inputExt('core_input_actions')
+  local bindings = inputExt('core_input_bindings')
+  -- Drop the pre-mount action cache so the next getActiveActions rereads gvd.json.
+  if actions and type(actions.onFileChanged) == 'function' then
+    pcall(actions.onFileChanged, '/lua/ge/extensions/core/input/actions/gvd.json')
+  end
+  if bindings then
+    if type(bindings.onFileChanged) == 'function' then
+      -- bindings.onFileChanged also forceRefresh(0.1) when an actions/*.json path changes.
+      pcall(bindings.onFileChanged, '/lua/ge/extensions/core/input/actions/gvd.json')
+      pcall(bindings.onFileChanged, '/settings/inputmaps/keyboardGvd.json')
+    elseif type(bindings.reloadBindings) == 'function' then
+      pcall(bindings.reloadBindings)
+    end
+  end
+  local ok = engageActionReady()
+  if ok then
+    if not bindReady then
+      bindReady = true
+      bindRetryLeft = 0
+      log('I', 'GVD', '[GVD] Alt+G action ready (' .. tostring(reason) .. ')')
+    end
+  elseif reason == 'onExtensionLoaded' then
+    bindRetryLeft = BIND_RETRY_N
+    log('W', 'GVD', '[GVD] gvd_toggle_engage not in action table yet; defer/retry reloadBindings')
+  end
+  return ok
+end
+
+local function retryEngageBindings()
+  if bindReady or bindRetryLeft <= 0 then return end
+  bindRetryLeft = bindRetryLeft - 1
+  if bindRetryLeft % 5 ~= 0 then return end
+  refreshEngageBindings('retry')
+  if not bindReady and bindRetryLeft <= 0 then
+    log('E', 'GVD', '[GVD] gvd_toggle_engage still missing after retries; Alt+G bind may be dead. Use extensions.gvd_main.toggleEngage()')
+  end
+end
+
+
 local function tickPush(dt)
   stripAcc = stripAcc + (dt or 0)
   -- 10 Hz while the app draws the VISION scene, 4 Hz for the plain status strip
@@ -1598,25 +1668,18 @@ function M.onUpdate(dt)
   pollLidarLua(dt)
   -- Builds that never call onPreRender would otherwise leave the app with no data.
   if not preRenderSeen then tickPush(dt) end
+  retryEngageBindings()
 end
 
 function M.onExtensionLoaded()
   gvdDocsDir()  -- resolve + log once
   readUiPrefs()
-  -- Soft: keyboard.diff / actions load race - reload actions, then bindings,
-  -- so Alt+G has a valid ActionMap description once gvd.json is visible.
-  pcall(function()
-    local b = core_input_bindings or (extensions and extensions.core_input_bindings)
-    if type(b) ~= 'table' then return end
-    if type(b.loadActions) == 'function' then
-      b.loadActions()
-    elseif type(b.reloadActions) == 'function' then
-      b.reloadActions()
-    end
-    if type(b.reloadBindings) == 'function' then
-      b.reloadBindings()
-    end
-  end)
+  -- keyboard.diff applies ~1s before unpacked mods mount. core_input_actions caches the
+  -- action table on first read, so a bind of gvd_toggle_engage before gvd.json is visible
+  -- leaves ActionMap with no title/desc (Could not create a description for alt+g).
+  -- loadActions lives on core_input_actions, not core_input_bindings -- bust that cache,
+  -- then reload bindings. Early "Couldn't find action" is OK if this retry lands the bind.
+  refreshEngageBindings('onExtensionLoaded')
   log('I', 'GVD', '[GVD] loaded. Alt+G engage (Ctrl+Alt+G fallback). Path: GVD PATH. Strip: mode/Hz/TTC/N. UI app: GVD.')
   log('I', 'GVD', string.format(
     '[GVD] player override on the steer residual: enter %.3f exit %.3f hold %.0fms spike %.2f lpf %.0fms (force-feedback noise must not disengage), pedals tight at brake %.2f / throttle %.2f',

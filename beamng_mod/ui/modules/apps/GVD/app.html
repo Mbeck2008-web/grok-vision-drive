@@ -1,4 +1,4 @@
-<div class="gvd-app" ng-class="rootClass()">
+<div class="gvd-app bngApp" ng-class="rootClass()">
   <style>
     .gvd-app {
       --ice:#9ec4d4; --ice-hi:#dbeef8; --corridor:#5aa7c7; --paper:#e8e6e1;
@@ -19,12 +19,10 @@
     .gvd-app.is-drive { border-color:var(--ice); box-shadow:inset 0 0 0 1px rgba(158,196,212,0.20); }
     .gvd-app.is-hold { border-color:#5c4a24; }
 
-    /* players resize BeamNG apps freely: text cells must be allowed to shrink + ellipsize */
     .gvd-row { display:flex; align-items:center; gap:6px; }
     .gvd-grow { flex:1 1 auto; min-width:0; }
     .gvd-mono { font-family:Consolas,'Roboto Mono',monospace; }
 
-    /* header */
     .gvd-head { padding-bottom:5px; border-bottom:1px solid var(--line); }
     .gvd-brand { flex:0 0 auto; color:var(--ice); font-weight:700; font-size:14px; letter-spacing:0.10em; }
     .gvd-word { color:var(--faint); font-size:10px; letter-spacing:0.22em; margin-left:5px; }
@@ -37,7 +35,6 @@
     .gvd-link.is-live .gvd-dot { box-shadow:0 0 6px rgba(158,196,212,0.9); }
     .gvd-link.is-stale { color:var(--amber); }
 
-    /* engage */
     .gvd-state {
       display:flex; align-items:center; gap:8px; padding:5px 8px; border-radius:5px;
       background:var(--panel); border-left:2px solid var(--faint);
@@ -65,7 +62,6 @@
     .gvd-engage i { flex:0 0 auto; font-style:normal; font-weight:400; font-size:9px; letter-spacing:0.08em; color:var(--faint); }
     .gvd-engage.is-on { background:#16323c; border-color:var(--ice); color:#eaf6fc; }
 
-    /* chips + segments */
     .gvd-chips { display:flex; gap:5px; }
     .gvd-chip, .gvd-segbtn, .gvd-mini {
       flex:1 1 0; min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; padding:5px 4px; cursor:pointer; font-family:inherit;
@@ -80,7 +76,6 @@
     .gvd-mini { flex:0 0 24px; padding:3px 0; text-align:center; }
     .gvd-mini.is-on { background:#16323c; border-color:#4b7686; color:var(--ice-hi); }
 
-    /* sections */
     .gvd-sec { display:flex; flex-direction:column; gap:4px; padding-top:5px; border-top:1px solid var(--line); }
     .gvd-sec-h {
       display:flex; align-items:baseline; gap:6px;
@@ -102,6 +97,20 @@
       flex:1 1 auto; min-width:0; font-weight:400; color:#b3bbc4;
       font-family:Consolas,'Roboto Mono',monospace; word-break:break-word;
     }
+
+    .gvd-axis { display:flex; align-items:center; gap:6px; font-size:9.5px; }
+    .gvd-axis > span { flex:0 0 42px; color:var(--faint); letter-spacing:0.04em; text-transform:uppercase; }
+    .gvd-axis > b { flex:0 0 42px; font-weight:400; color:#b3bbc4; font-family:Consolas,'Roboto Mono',monospace; text-align:right; }
+    .gvd-track {
+      position:relative; flex:1 1 auto; min-width:0; height:8px; border-radius:3px;
+      background:#12181d; border:1px solid #1e272e; overflow:hidden;
+    }
+    .gvd-fill { position:absolute; top:0; left:0; height:100%; background:#2a5360; }
+    .gvd-mark {
+      position:absolute; top:-1px; width:2px; height:10px; margin-left:-1px;
+      background:var(--ice-hi); box-shadow:0 0 4px rgba(158,196,212,0.7);
+    }
+    .gvd-mid { position:absolute; left:50%; top:0; width:1px; height:100%; background:#2a333b; }
 
     .gvd-nerdbtn {
       align-self:flex-start; padding:2px 0; border:0; background:none; cursor:pointer;
@@ -131,6 +140,33 @@
   <button type="button" class="gvd-engage" ng-class="{'is-on': ui.engaged}" ng-click="toggleEngage()">
     <span>{{ ui.engaged ? 'DISENGAGE' : 'ENGAGE' }}</span><i>ALT+G</i>
   </button>
+
+  <div class="gvd-sec">
+    <div class="gvd-sec-h">WHEEL / PEDALS <i class="gvd-note">{{ inputNote() }}</i></div>
+    <div class="gvd-axis">
+      <span>wheel</span>
+      <div class="gvd-track">
+        <i class="gvd-mid"></i>
+        <i class="gvd-mark" ng-style="wheelMark(ui.playerDevice ? ui.playerSteer : ui.steerInput)"></i>
+      </div>
+      <b>{{ axisTxt(ui.playerDevice ? ui.playerSteer : ui.steerInput) }}</b>
+    </div>
+    <div class="gvd-axis">
+      <span>gas</span>
+      <div class="gvd-track">
+        <i class="gvd-fill" ng-style="pedalFill(ui.playerDevice ? ui.playerThrottle : ui.throttleInput)"></i>
+      </div>
+      <b>{{ axisTxt(ui.playerDevice ? ui.playerThrottle : ui.throttleInput) }}</b>
+    </div>
+    <div class="gvd-axis">
+      <span>brake</span>
+      <div class="gvd-track">
+        <i class="gvd-fill" ng-style="pedalFill(ui.playerDevice ? ui.playerBrake : ui.brakeInput)"></i>
+      </div>
+      <b>{{ axisTxt(ui.playerDevice ? ui.playerBrake : ui.brakeInput) }}</b>
+    </div>
+    <div class="gvd-sub">applied wheel {{ axisTxt(ui.steerInput) }}  gas {{ axisTxt(ui.throttleInput) }}  brake {{ axisTxt(ui.brakeInput) }}</div>
+  </div>
 
   <div class="gvd-sec">
     <div class="gvd-sec-h">VIEW</div>

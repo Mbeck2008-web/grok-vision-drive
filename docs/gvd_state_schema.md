@@ -126,6 +126,12 @@ Predictions need an anchor: with no detected lane there are no predicted lanes a
 
 `gvd/main.lua` pushes `guihooks.trigger('gvdUi', …)` every 250 ms (100 ms while the app's scene is on) with the state above plus capped scene geometry: `path` ≤28 points, `tracks` ≤12 (`id,cls,x,y,yaw,v,lead`), `lanes` ≤6×12 (`pts,kind,side,style,idx`), `edges` ≤2×12, `signs` ≤8, `fans` ≤6×8, all ego frame and rounded to 2 dp. `link` is `live` / `stale` / `none` from the heartbeat age, so the app can show the dead-man without a second file bus. `applying` rides along, so the app can show `DRIVE` while the mod holds the wheel (M6 retail); on Tech, `actuator=beamngpy` + `cmd_applied` means the same thing. `gvdStrip` keeps its old shape plus `applying`.
 
+Live wheel / pedal HUD fields are the same retail Direct Drive echo already written to `gvd_ego.json` (`M.onEgoFeedback` / `egoFb`). No parallel input stack.
+
+| `steerInput` / `throttleInput` / `brakeInput` | float? | Applied electrics (`steering_input` / `throttle_input` / `brake_input`) |
+| `playerDevice` | bool? | True when vehicle Lua saw a non-`gvd` `input.lastInputs` source |
+| `playerSteer` / `playerThrottle` / `playerBrake` | float? | Strongest non-`gvd` lastInputs axis |
+
 | `viz_window` | bool | Python `--viz` OpenCV window exists |
 | `viz_screen` | string | Monitor the window was last placed on |
 | `viz_note` | string | e.g. `screen 2 (non-primary)` / `auto→primary (second screen not found …)` |

@@ -543,6 +543,8 @@ def check_lua_harness() -> None:
         if shutil.which(exe):
             res = subprocess.run([exe, "scripts/test_m6_lua_cmd.lua"], cwd=str(ROOT), capture_output=True, text=True, timeout=60)
             assert res.returncode == 0 and "test_m6_lua_cmd: OK" in res.stdout, res.stdout + res.stderr
+            bind = subprocess.run([exe, "scripts/test_gvd_bind_reload.lua"], cwd=str(ROOT), capture_output=True, text=True, timeout=60)
+            assert bind.returncode == 0 and "test_gvd_bind_reload: OK" in bind.stdout, bind.stdout + bind.stderr
             return
     print("  (lua interpreter not found — scripts/test_m6_lua_cmd.lua skipped)")
 

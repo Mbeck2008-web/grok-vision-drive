@@ -95,10 +95,12 @@ local M = dofile('beamng_mod/lua/ge/extensions/gvd/main.lua')
 extensions = { gvd_main = M }
 
 -- Poison bindings.loadActions (#22). Prefer core_input_actions.load, then reloadBindings.
--- Populate title/desc/onDown on load so a premature bindReady would look tempting.
+-- Always clear actionsCache (onFileChanged) before load. Title/desc on load is not bindReady.
 local bindTrace = {}
 local actionTable = {}
 core_input_actions = {
+  actionsCache = { [true] = { stale = true } },
+  normalActionsCache = { [true] = { stale = true } },
   load = function()
     bindTrace[#bindTrace + 1] = { 'load' }
     actionTable.gvd_toggle_engage = {
@@ -171,28 +173,33 @@ local function beatState(engaged, reason, overrideCfg)
 end
 
 M.onExtensionLoaded()
-local sawLoad, sawReload, readyAfterReload = false, false, false
+local sawCache, sawLoad, sawReload, readyAfterReload = false, false, false, false
 for _, ev in ipairs(bindTrace) do
+  if ev[1] == 'actions.onFileChanged' then sawCache = true end
   if ev[1] == 'load' then sawLoad = true end
   if ev[1] == 'reloadBindings' then sawReload = true end
-  check(ev[1] ~= 'actions.onFileChanged', 'load exists so actions.onFileChanged is not the primary path')
 end
 for _, msg in ipairs(logs) do
   if tostring(msg):find('Alt%+G action ready', 1) then
     readyAfterReload = sawReload
   end
 end
+check(sawCache, 'onExtensionLoaded always clears actionsCache via onFileChanged')
 check(sawLoad, 'onExtensionLoaded calls core_input_actions.load')
 check(sawReload, 'onExtensionLoaded calls core_input_bindings.reloadBindings after load')
 check(readyAfterReload, 'Alt+G ready is reported only after reloadBindings')
 do
-  local loadAt, reloadAt
+  local cacheAt, loadAt, reloadAt
   for i, ev in ipairs(bindTrace) do
+    if ev[1] == 'actions.onFileChanged' and not cacheAt then cacheAt = i end
     if ev[1] == 'load' and not loadAt then loadAt = i end
     if ev[1] == 'reloadBindings' and not reloadAt then reloadAt = i end
   end
+  check(cacheAt and loadAt and cacheAt < loadAt, 'cache clear happens before load')
   check(loadAt and reloadAt and loadAt < reloadAt, 'load happens before reloadBindings')
 end
+check(core_input_actions.actionsCache[true] == nil, 'actionsCache[true] was wiped')
+check(core_input_actions.normalActionsCache[true] == nil, 'normalActionsCache[true] was wiped')
 beatState(false, 'not_engaged')
 writeCmd(false, 0, 0, 1)
 M.onUpdate(0.2)

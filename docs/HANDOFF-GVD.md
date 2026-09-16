@@ -13,11 +13,11 @@ Schema / UI contract: [`docs/gvd_state_schema.md`](gvd_state_schema.md)
 #32 landed camelCase `gvdApp` + wheel HUD + action-cache bust, but Critic still failed Alt+G ready and HUD cadence:
 
 1. **EGO_POLL_S comment.** pollEgo is ungated; the comment no longer says supervisor-only.
-2. **4 Hz wheel HUD.** `tickPush` used 0.25 s unless `showScene`. HUD push is 10 Hz (`UI_PUSH_S = EGO_POLL_S`) and `onEgoFeedback` pushes the same `egoFb` axes.
+2. **4 Hz wheel HUD.** `tickPush` used 0.25 s unless `showScene`. HUD push is a single 10 Hz `tickPush` (`UI_PUSH_S = EGO_POLL_S`); `onEgoFeedback` only stores `egoFb`.
 3. **Swallowed pcalls.** `tryCall` logs `label failed: err` instead of silent `pcall`.
 4. **Tests.** `test_gvd_ui_app.py` requires `core_input_actions.load` / `loadActions` then `core_input_bindings.reloadBindings()`, and forbids `bindings.loadActions`.
 5. **onFileChanged arity.** Calls are `(path, 'added')`.
-6. **bindReady too early.** `getActiveActions().gvd_toggle_engage` title/desc is not a live Alt+G bind. Ready means `reloadBindings()` actually ran (or the delayed `forceRefresh(0.1)` wait elapsed).
+6. **bindReady too early.** `getActiveActions().gvd_toggle_engage` title/desc is not a live Alt+G bind. Ready means `reloadBindings()` actually ran (or the delayed `forceRefresh(0.1)` wait elapsed). Fail log only if `onFileChanged` ran and reload still failed.
 7. **onFileChanged skipped reload.** Always `load`/`loadActions` then `reloadBindings()`. `onFileChanged` is not an `elseif` substitute.
 
 | Item | Value |
@@ -28,13 +28,7 @@ Schema / UI contract: [`docs/gvd_state_schema.md`](gvd_state_schema.md)
 
 Keep the camelCase `gvdApp` / `gvdStrip` contract and object `css`. Do not regress to `gvd-app`. Live dual-monitor + Alt+G remains **UNPROVEN**.
 
-| Item | Value |
-| --- | --- |
-| `main` tip this branch is off | `160812e` / `2f5cb71` -- merged #32 |
-| Live prove | **UNPROVEN** -- Desktop-IQU45, BeamNG.drive **0.39.4**, DX (not Vulkan) |
-| Hardware profile | i9-9900K + UHD 630 QSV + GTX 1080 Ti, infer <= 4 GB |
-
-Keep the camelCase `gvdApp` contract. Do not regress to `gvd-app`. Live dual-monitor + Alt+G remains **UNPROVEN**.
+8.8 optional softs on this tip: one snapshot table (no duplicate); single 10 Hz `tickPush` (no competing `onEgoFeedback` pusher); `bindReady` after `reloadBindings` only (fail log only if `onFileChanged` ran and reload still failed); 0.36/0.39 `actionsCache` vs `normalActionsCache` dump shapes; always clear cache before load + `reloadBindings`.
 
 
 ## Snapshot (2026-09-13, CEF + Alt+G hotfix after live FAIL @ main 1543777)
@@ -145,7 +139,7 @@ lua5.1 scripts/test_gvd_bind_reload.lua   # bundled via test_m6_retail when lua5
    - CEF app: `beamng_mod/ui/modules/apps/GVD/` -- `app.json` directive must be camelCase `gvdApp`
    - ActionMap: `beamng_mod/lua/ge/extensions/core/input/actions/gvd.json`
    - Binds: `beamng_mod/settings/inputmaps/keyboardGvd.json`
-   - Reload: `refreshEngageBindings` in `gvd/main.lua` (`core_input_actions.load` / `loadActions`, then `core_input_bindings.reloadBindings`; `onFileChanged(path, 'added')` must not skip that reload)
+   - Reload: `refreshEngageBindings` in `gvd/main.lua` (always clear `actionsCache` / `normalActionsCache`, then `core_input_actions.load` / `loadActions`, then `core_input_bindings.reloadBindings`; `onFileChanged(path, 'added')` must not skip that reload)
    - Console prints: `python/viz/monitors.py`, `python/runtime/hw_probe.py`
    - Lexicon: `python/viz/stage.py` (second screen), not the in-game canvas
 6. Retail drive bus: `gvd_cmd.json` -> Lua, `gvd_ego.json` <- vehicle, `gvd_engage.json` = sticky engage/disengage record. See [`gvd_state_schema.md`](gvd_state_schema.md).

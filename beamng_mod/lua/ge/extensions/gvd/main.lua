@@ -39,7 +39,7 @@ local CMD_POLL_S = 0.05      -- 20 Hz apply
 local CMD_STALE_S = 0.35     -- no new seq for this long → brake hold (dead-man)
 local CMD_DEAD_S = 1.0       -- stream dead this long while we hold the car → release + disengage
 local EGO_POLL_S = 0.10      -- 10 Hz electrics echo whenever a player vehicle exists (HUD + gvd_ego.json)
-local UI_PUSH_S = EGO_POLL_S -- 10 Hz gvdUi; 4 Hz when showScene=false made wheel/pedal bars step
+local UI_PUSH_S = EGO_POLL_S -- single 10 Hz gvdUi path (tickPush only; not 4 Hz strip + 10 Hz ego)
 local applying = false       -- true while our secondary Direct Drive wheel+pedals hold the player vehicle
 local holdLogged = false     -- one-shot log when we first claim the Direct Drive source
 local applyVeh = nil         -- vehicle object we last applied to (released on switch/disengage)
@@ -1325,10 +1325,8 @@ function M.onEgoFeedback(speed, steerIn, thrIn, brkIn, gx, gy, gz, yawRate, pSte
   ovrRef = ovrCmdLast or ovrCmdPrev
   ovrEchoStamp = ovrClock
   -- File bus is for the Python supervisor; the in-game HUD reads egoFb from gvdUi either way.
+  -- Wheel/pedal bars ride this same echo via the single 10 Hz tickPush path (not a second pusher).
   if supervisorAlive() then writeEgoFile() end
-  -- Wheel/pedal bars ride this same echo. Push here so the HUD matches the 10 Hz poll,
-  -- not the old 4 Hz showScene=false strip cadence.
-  pushUi()
 end
 
 local function pollEgo(dt)
@@ -1582,18 +1580,20 @@ end
 local preRenderSeen = false
 
 -- ActionMap: gvd.json is not in the FS when keyboard.diff first binds (~8.4s vs mount ~9.4s).
--- Sequence: core_input_actions.load / loadActions, then core_input_bindings.reloadBindings().
--- loadActions is not on core_input_bindings (#22 / 1543777). onFileChanged is BeamNG
--- (filename, type) and must not skip reloadBindings (it only queues forceRefresh(0.1)).
+-- Sequence: always clear actionsCache, then core_input_actions.load / loadActions, then
+-- core_input_bindings.reloadBindings(). loadActions is not on core_input_bindings (#22 / 1543777).
+-- onFileChanged is BeamNG (filename, type) and must not skip reloadBindings (it only queues
+-- forceRefresh(0.1)). bindReady is after a real reload, never from getActiveActions title/desc.
 local bindRetryLeft = 0
 local bindReady = false
 local bindDeferAcc = 0
 local bindNotified = false
-local bindPostedAfterAction = false
+local bindFileChangedRan = false
 local BIND_RETRY_N = 40
 local BIND_DEFER_S = 0.15
 local ACTION_JSON = '/lua/ge/extensions/core/input/actions/gvd.json'
 local BIND_JSON = '/settings/inputmaps/keyboardGvd.json'
+local ENGAGE_ACTION = 'gvd_toggle_engage'
 
 local function inputExt(name)
   if _G[name] then return _G[name] end
@@ -1611,14 +1611,70 @@ local function tryCall(label, fn, ...)
   return true
 end
 
+-- 0.36/0.39 dump: actionsCache and normalActionsCache are keyed [true]/[false].
+-- Wipe in place so a shared M.actionsCache local still drops.
+local function wipeActionsCacheTable(cache)
+  if type(cache) ~= 'table' then return end
+  cache[true] = nil
+  cache[false] = nil
+  if table and type(table.clear) == 'function' then
+    pcall(table.clear, cache)
+  else
+    for k in pairs(cache) do cache[k] = nil end
+  end
+end
+
+-- Always drop the pre-mount cache before load/loadActions. Locals are not on M;
+-- onFileChanged is the public drop. Extra 'added' arg is ignored on 0.36 (filename only).
+local function clearActionsCache()
+  local actions = inputExt('core_input_actions')
+  if type(actions) ~= 'table' then return false end
+  wipeActionsCacheTable(actions.actionsCache)
+  wipeActionsCacheTable(actions.normalActionsCache)
+  if type(actions.onFileChanged) == 'function' then
+    if tryCall('core_input_actions.onFileChanged', actions.onFileChanged, ACTION_JSON, 'added') then
+      bindFileChangedRan = true
+    end
+  end
+  return true
+end
+
+-- Action dump may be a flat map, or the 0.36/0.39 cache wrapper ([true]/[false],
+-- .actions / .normal). Input dump is not title/desc -- this is visibility only.
+local function isEngageActionDef(act)
+  return type(act) == 'table' and act.title and act.desc and act.onDown
+end
+
+local function lookupEngageAction(root)
+  if type(root) ~= 'table' then return nil end
+  if isEngageActionDef(root[ENGAGE_ACTION]) then return root[ENGAGE_ACTION] end
+  local nests = {
+    root[true], root[false],
+    root.actions, root.normal, root.Normal,
+    root.normalActions, root.normalActionsCache, root.actionsCache,
+  }
+  for i = 1, #nests do
+    local nest = nests[i]
+    if type(nest) == 'table' then
+      if isEngageActionDef(nest[ENGAGE_ACTION]) then return nest[ENGAGE_ACTION] end
+      if type(nest[true]) == 'table' and isEngageActionDef(nest[true][ENGAGE_ACTION]) then
+        return nest[true][ENGAGE_ACTION]
+      end
+      if type(nest[false]) == 'table' and isEngageActionDef(nest[false][ENGAGE_ACTION]) then
+        return nest[false][ENGAGE_ACTION]
+      end
+    end
+  end
+  return nil
+end
+
 -- title/desc on getActiveActions is not a live Alt+G bind; used only to know gvd.json is visible.
 local function engageActionListed()
   local a = inputExt('core_input_actions')
   if type(a) ~= 'table' or type(a.getActiveActions) ~= 'function' then return false end
   local ok, acts = pcall(a.getActiveActions)
-  if not ok or type(acts) ~= 'table' then return false end
-  local act = acts.gvd_toggle_engage
-  return type(act) == 'table' and act.title and act.desc and act.onDown
+  if not ok then return false end
+  return lookupEngageAction(acts) ~= nil
 end
 
 local function loadEngageActions()
@@ -1630,27 +1686,27 @@ local function loadEngageActions()
   if type(actions.loadActions) == 'function' then
     return tryCall('core_input_actions.loadActions', actions.loadActions)
   end
-  if type(actions.onFileChanged) == 'function' then
-    return tryCall('core_input_actions.onFileChanged', actions.onFileChanged, ACTION_JSON, 'added')
-  end
   return false
 end
 
 -- Always call reloadBindings after load/loadActions. onFileChanged is not a substitute.
+-- Returns 'ok' | 'failed' | 'missing' so a pcall error is not treated as "no export".
 local function reloadEngageBindings()
   local bindings = inputExt('core_input_bindings')
-  if type(bindings) ~= 'table' then return false end
-  if type(bindings.reloadBindings) == 'function' then
-    return tryCall('core_input_bindings.reloadBindings', bindings.reloadBindings)
+  if type(bindings) ~= 'table' then return 'missing' end
+  if type(bindings.reloadBindings) ~= 'function' then return 'missing' end
+  if tryCall('core_input_bindings.reloadBindings', bindings.reloadBindings) then
+    return 'ok'
   end
-  return false
+  return 'failed'
 end
 
 local function notifyBindingsFileChanged()
   local bindings = inputExt('core_input_bindings')
   if type(bindings) ~= 'table' or type(bindings.onFileChanged) ~= 'function' then return false end
-  tryCall('core_input_bindings.onFileChanged', bindings.onFileChanged, ACTION_JSON, 'added')
-  tryCall('core_input_bindings.onFileChanged', bindings.onFileChanged, BIND_JSON, 'added')
+  local a = tryCall('core_input_bindings.onFileChanged', bindings.onFileChanged, ACTION_JSON, 'added')
+  local b = tryCall('core_input_bindings.onFileChanged', bindings.onFileChanged, BIND_JSON, 'added')
+  if a or b then bindFileChangedRan = true end
   return true
 end
 
@@ -1663,36 +1719,28 @@ local function markBindReady(reason)
 end
 
 local function refreshEngageBindings(reason)
+  clearActionsCache()
   loadEngageActions()
+  -- Visibility only -- never bindReady from title/desc.
+  engageActionListed()
   -- Never elseif-skip this when onFileChanged exists.
-  local reloaded = reloadEngageBindings()
-  local listed = engageActionListed()
-  if reloaded then
-    -- Live ActionMap rebuild. listed means gvd.json was in the table for that reload.
-    if listed then
-      markBindReady(reason)
-      return true
-    end
-  else
-    -- Builds that do not export reloadBindings: onFileChanged(filename, 'added')
-    -- queues forceRefresh(0.1). Do not re-notify every retry (that resets the timer).
-    -- listed title/desc is not ready; wait until the delayed reload should have run.
-    if listed and not bindPostedAfterAction then
-      notifyBindingsFileChanged()
-      bindPostedAfterAction = true
+  local reloadStatus = reloadEngageBindings()
+  if reloadStatus == 'ok' then
+    markBindReady(reason)
+    return true
+  end
+  -- Builds that do not export reloadBindings: onFileChanged(filename, 'added')
+  -- queues forceRefresh(0.1). Do not re-notify every retry (that resets the timer).
+  -- listed title/desc is not ready; wait until the delayed reload should have run.
+  if not bindNotified then
+    if notifyBindingsFileChanged() then
       bindNotified = true
       bindDeferAcc = 0
-    elseif not listed and not bindNotified then
-      notifyBindingsFileChanged()
-      bindNotified = true
-    elseif not listed and bindDeferAcc >= BIND_DEFER_S then
-      notifyBindingsFileChanged()
-      bindDeferAcc = 0
     end
-    if listed and bindPostedAfterAction and bindDeferAcc >= BIND_DEFER_S then
-      markBindReady(reason)
-      return true
-    end
+  end
+  if reloadStatus == 'missing' and bindNotified and bindDeferAcc >= BIND_DEFER_S then
+    markBindReady(reason)
+    return true
   end
   if reason == 'onExtensionLoaded' then
     bindRetryLeft = BIND_RETRY_N
@@ -1708,14 +1756,15 @@ local function retryEngageBindings(dt)
   bindRetryLeft = bindRetryLeft - 1
   if bindRetryLeft % 5 ~= 0 then return end
   refreshEngageBindings('retry')
-  if not bindReady and bindRetryLeft <= 0 then
+  -- Fail log only if onFileChanged actually ran and reload still failed.
+  if not bindReady and bindRetryLeft <= 0 and bindFileChangedRan then
     log('E', 'GVD', '[GVD] gvd_toggle_engage still missing after retries; Alt+G bind may be dead. Use extensions.gvd_main.toggleEngage()')
   end
 end
 
 local function tickPush(dt)
   stripAcc = stripAcc + (dt or 0)
-  -- Slim HUD including wheel/pedal axes from egoFb. Same 10 Hz as EGO_POLL_S.
+  -- Single 10 Hz HUD path (wheel/pedal axes from egoFb). Not 4 Hz + 10 Hz.
   if stripAcc < UI_PUSH_S then return end
   stripAcc = 0
   pushUi()
@@ -1750,10 +1799,9 @@ function M.onExtensionLoaded()
   -- keyboard.diff applies ~1s before unpacked mods mount. core_input_actions caches the
   -- action table on first read, so a bind of gvd_toggle_engage before gvd.json is visible
   -- leaves ActionMap with no title/desc (Could not create a description for alt+g).
-  -- There is no loadActions on core_input_bindings. Call core_input_actions.load /
-  -- loadActions, then core_input_bindings.reloadBindings so ActionMap gets title/desc.
-  -- Early "Couldn't find action" is OK if a later retry logs Alt+G action ready after
-  -- that reload (not merely after getActiveActions lists the action).
+  -- Always clear actionsCache / normalActionsCache, then core_input_actions.load /
+  -- loadActions, then core_input_bindings.reloadBindings. bindReady is after that reload
+  -- (or delayed forceRefresh), never from getActiveActions title/desc alone.
   refreshEngageBindings('onExtensionLoaded')
   log('I', 'GVD', '[GVD] loaded. Alt+G engage (Ctrl+Alt+G fallback). Path: GVD PATH. Strip: mode/Hz/TTC/N. UI app: GVD.')
   log('I', 'GVD', string.format(

@@ -112,13 +112,58 @@ def main() -> None:
     controls = {b["control"] for b in keymap["bindings"]}
     assert "alt+g" in controls and "ctrl+alt+g" in controls, keymap
     assert "alt+a" not in controls, "do not steal stock toggleRangeStatus"
-    # ActionMap race: bust core_input_actions cache, then reload bindings. The old
-    # core_input_bindings.loadActions path does not exist on that module.
+    # ActionMap: core_input_actions.load / loadActions, then
+    # core_input_bindings.reloadBindings(). loadActions is not on bindings (#22).
+    lua_exec = re.sub(r"--[^\n]*", "", lua)
+
+    def lua_fn(name: str) -> str:
+        m = re.search(rf"local function {re.escape(name)}\s*\([^)]*\).*?\nend\n", lua, re.S)
+        assert m, f"missing lua function {name}"
+        return m.group(0)
+
+    refresh_fn = lua_fn("refreshEngageBindings")
+    load_fn = lua_fn("loadEngageActions")
+    reload_fn = lua_fn("reloadEngageBindings")
+    retry_fn = lua_fn("retryEngageBindings")
+    tick_fn = lua_fn("tickPush")
+    try_fn = lua_fn("tryCall")
+    refresh_exec = re.sub(r"--[^\n]*", "", refresh_fn)
+    load_exec = re.sub(r"--[^\n]*", "", load_fn)
+    reload_exec = re.sub(r"--[^\n]*", "", reload_fn)
+    try_exec = re.sub(r"--[^\n]*", "", try_fn)
+
     assert "core_input_actions" in lua and "getActiveActions" in lua
     assert "gvd_toggle_engage" in lua and "refreshEngageBindings" in lua
     assert "retryEngageBindings" in lua
+    # Never the #22 / 1543777 call site.
     assert "b.loadActions" not in lua
-    assert "onFileChanged" in lua
+    assert "bindings.loadActions" not in lua_exec
+    assert "core_input_bindings.loadActions" not in lua_exec
+    # Required sequence lives in executable code, not comments.
+    assert "actions.load" in load_exec, "must call core_input_actions.load"
+    assert "actions.loadActions" in load_exec, "must call core_input_actions.loadActions"
+    assert "reloadBindings" in reload_exec, "must call core_input_bindings.reloadBindings"
+    assert "loadEngageActions" in refresh_exec
+    assert "reloadEngageBindings" in refresh_exec
+    assert refresh_exec.find("loadEngageActions") < refresh_exec.find("reloadEngageBindings")
+    assert "elseif type(bindings.reloadBindings)" not in lua
+    assert not re.search(
+        r"onFileChanged[\s\S]{0,400}elseif[^\n]*reloadBindings", refresh_fn
+    ), "onFileChanged must not skip reloadBindings"
+    else_at = refresh_exec.find("else")
+    reload_at = refresh_exec.find("reloadEngageBindings")
+    assert else_at == -1 or reload_at < else_at, "reloadBindings must run before any onFileChanged fallback"
+    # pcall failures are logged, not swallowed.
+    assert "failed:" in try_exec
+    assert "tryCall" in load_exec and "tryCall" in reload_exec
+    # BeamNG onFileChanged arity is (filename, type).
+    assert ", 'added')" in lua
+    assert "'added'" in lua
+    # title/desc from getActiveActions is not bindReady by itself.
+    assert "engageActionListed" in refresh_exec
+    assert refresh_fn.find("reloaded") < refresh_fn.find("markBindReady")
+    assert "retryEngageBindings(dt)" in lua_exec or "retryEngageBindings(dt)" in retry_fn
+    assert "BIND_DEFER_S" in lua
 
     # Retail Direct Drive echo on the slim HUD -- reuse egoFb, do not invent a bus.
     assert "WHEEL / PEDALS" in app_html
@@ -127,6 +172,18 @@ def main() -> None:
         assert f"{key} =" in lua or f"{key}=" in lua, f"gvdUi missing {key}"
         assert key in app_js, f"app.js never reads {key}"
     assert "axisTxt" in app_js and "inputNote" in app_js
+    # Wheel HUD cadence: 4 Hz (0.25s) when showScene=false made bars step.
+    # Push at 10 Hz egoFb poll; axes already ride uiPayload / tickPush.
+    assert "UI_PUSH_S" in lua
+    assert re.search(r"UI_PUSH_S\s*=\s*EGO_POLL_S\b", lua), "HUD push must match 10 Hz egoFb poll"
+    assert re.search(r"EGO_POLL_S\s*=\s*0\.10\b", lua)
+    ego_decl = next(ln for ln in lua.splitlines() if ln.startswith("local EGO_POLL_S"))
+    assert "supervisor" not in ego_decl.lower(), "EGO_POLL_S comment must not say supervisor-only"
+    assert "supervisorAlive" not in lua_fn("pollEgo")
+    assert "0.25" not in tick_fn
+    assert "UI_PUSH_S" in tick_fn
+    assert "pushUi()" in lua[lua.index("function M.onEgoFeedback"):lua.index("local function pollEgo")]
+    assert "egoFb" in lua and "gvd_ego.json" in lua
 
     # One prefs bus: what Lua writes is what the supervisor reads.
     written = set(re.findall(r'"(show_path|show_agent_ghosts|show_scene|policy|viz_screen)"\s*:', lua))

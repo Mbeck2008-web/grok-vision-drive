@@ -8,6 +8,35 @@ Repo: [Mbeck2008-web/grok-vision-drive](https://github.com/Mbeck2008-web/grok-vi
 Schema / UI contract: [`docs/gvd_state_schema.md`](gvd_state_schema.md)
 
 
+## Snapshot (2026-09-16, Critic hotfix after FAIL 8.2/10 on merged #32 @ 160812e)
+
+#32 landed camelCase `gvdApp` + wheel HUD + action-cache bust, but Critic still failed Alt+G ready and HUD cadence:
+
+1. **EGO_POLL_S comment.** pollEgo is ungated; the comment no longer says supervisor-only.
+2. **4 Hz wheel HUD.** `tickPush` used 0.25 s unless `showScene`. HUD push is 10 Hz (`UI_PUSH_S = EGO_POLL_S`) and `onEgoFeedback` pushes the same `egoFb` axes.
+3. **Swallowed pcalls.** `tryCall` logs `label failed: err` instead of silent `pcall`.
+4. **Tests.** `test_gvd_ui_app.py` requires `core_input_actions.load` / `loadActions` then `core_input_bindings.reloadBindings()`, and forbids `bindings.loadActions`.
+5. **onFileChanged arity.** Calls are `(path, 'added')`.
+6. **bindReady too early.** `getActiveActions().gvd_toggle_engage` title/desc is not a live Alt+G bind. Ready means `reloadBindings()` actually ran (or the delayed `forceRefresh(0.1)` wait elapsed).
+7. **onFileChanged skipped reload.** Always `load`/`loadActions` then `reloadBindings()`. `onFileChanged` is not an `elseif` substitute.
+
+| Item | Value |
+| --- | --- |
+| `main` tip this branch is off | `160812e` / `2f5cb71` -- merged #32 |
+| Live prove | **UNPROVEN** -- Desktop-IQU45, BeamNG.drive **0.39.4**, DX (not Vulkan) |
+| Hardware profile | i9-9900K + UHD 630 QSV + GTX 1080 Ti, infer <= 4 GB |
+
+Keep the camelCase `gvdApp` / `gvdStrip` contract and object `css`. Do not regress to `gvd-app`. Live dual-monitor + Alt+G remains **UNPROVEN**.
+
+| Item | Value |
+| --- | --- |
+| `main` tip this branch is off | `160812e` / `2f5cb71` -- merged #32 |
+| Live prove | **UNPROVEN** -- Desktop-IQU45, BeamNG.drive **0.39.4**, DX (not Vulkan) |
+| Hardware profile | i9-9900K + UHD 630 QSV + GTX 1080 Ti, infer <= 4 GB |
+
+Keep the camelCase `gvdApp` contract. Do not regress to `gvd-app`. Live dual-monitor + Alt+G remains **UNPROVEN**.
+
+
 ## Snapshot (2026-09-13, CEF + Alt+G hotfix after live FAIL @ main 1543777)
 
 Live Desktop-IQU45 on main@1543777 (includes #22 ASCII): Apps tile still blank, Alt+G still `Could not create a description`, early `Couldn't find action gvd_toggle_engage` on `keyboard.diff` ~1s before mod mount. ASCII was not the remaining CEF bug.
@@ -69,7 +98,7 @@ Writing only `Documents/GVD/gvd_engage.json` is **not** Engage. Python never inv
 
 ## Verify reinstall checklist (Windows 0.39.4, Desktop-IQU45, Michael in-car)
 
-A dirty leftover `app.js` / stale HUD layout will look like a CEF regression. Install **this hotfix tip**, not main@1543777.
+A dirty leftover `app.js` / stale HUD layout will look like a CEF regression. Install **this hotfix tip**, not main@160812e (#32).
 
 1. Fully quit BeamNG.
 2. Wipe unpacked `gvd`:
@@ -80,8 +109,8 @@ A dirty leftover `app.js` / stale HUD layout will look like a CEF regression. In
 5. Remove the GVD app from the cockpit if it is already placed, then re-add it from HUD Apps (stale layout can keep a dead tile).
 6. Prove all of:
    - Tile shows Engage / settings / **WHEEL / PEDALS** (not blank, not only Hide). Console has **no** `[UiAppsService] failed to load directive: gvd-app`.
-   - Steering the wheel and pressing gas/brake moves the in-game bars from the existing `gvd_ego.json` / `egoFb` echo (applied electrics + player lastInputs). No second input stack.
-   - Alt+G and Ctrl+Alt+G log `[GVD] ENGAGED` / `DISENGAGED` with **no** leftover ActionMap `Could not create a description for binding keyboard0::alt+g` (or `ctrl+alt+g`) after the extension is loaded. An early boot `Couldn't find action gvd_toggle_engage` on `keyboard.diff` is OK only if the later retry logs `[GVD] Alt+G action ready` and the key then works.
+   - Steering the wheel and pressing gas/brake moves the in-game bars from the existing `gvd_ego.json` / `egoFb` echo (applied electrics + player lastInputs). Bars should feel live (~10 Hz, same as the ego poll), not stepped at 4 Hz. No second input stack.
+   - Alt+G and Ctrl+Alt+G log `[GVD] ENGAGED` / `DISENGAGED` with **no** leftover ActionMap `Could not create a description for binding keyboard0::alt+g` (or `ctrl+alt+g`) after the extension is loaded. An early boot `Couldn't find action gvd_toggle_engage` on `keyboard.diff` is OK only if the later retry logs `[GVD] Alt+G action ready` *after* bindings reload (not merely after the action cache drop) and the key then works.
    - Writing only `gvd_engage.json` is **not** Engage -- need the Lua toggle (key or app). Ignore a stale Sep-9 `engaged:true` file.
    - `play_gvd.bat` / supervisor survives **without** `PYTHONUTF8=1`.
    - OpenCV second-screen lexicon is present when `run_vision --viz` / `play_gvd.bat` runs. In-game app stays slim (no VISION canvas).
@@ -93,7 +122,6 @@ If verify fails, stay on this hotfix branch. Do not call live dual proven from o
 
 - Cones / crosswalks on the OpenCV lexicon
 - Boot nit: first `Couldn't find action gvd_toggle_engage` on `keyboard.diff` can still log before mount (retry is the mitigation)
-- Critic soft: in-game app height 440 (wheel/pedal row)
 - Live dual-monitor proof with Michael in-car (still **UNPROVEN**)
 
 
@@ -109,6 +137,7 @@ PYTHONPATH=. python scripts/test_gvd_viz_stage.py
 PYTHONPATH=. python scripts/test_ffb_override.py
 PYTHONPATH=. python scripts/test_m6_retail.py
 PYTHONPATH=. python scripts/test_debug_opts.py
+lua5.1 scripts/test_gvd_bind_reload.lua   # bundled via test_m6_retail when lua5.1/luajit exists
 ```
 
 4. When Desktop-IQU45 is online, run the reinstall checklist above with Michael in-car.
@@ -116,7 +145,7 @@ PYTHONPATH=. python scripts/test_debug_opts.py
    - CEF app: `beamng_mod/ui/modules/apps/GVD/` -- `app.json` directive must be camelCase `gvdApp`
    - ActionMap: `beamng_mod/lua/ge/extensions/core/input/actions/gvd.json`
    - Binds: `beamng_mod/settings/inputmaps/keyboardGvd.json`
-   - Reload: `refreshEngageBindings` / `retryEngageBindings` in `gvd/main.lua` (`core_input_actions` cache bust, then bindings)
+   - Reload: `refreshEngageBindings` in `gvd/main.lua` (`core_input_actions.load` / `loadActions`, then `core_input_bindings.reloadBindings`; `onFileChanged(path, 'added')` must not skip that reload)
    - Console prints: `python/viz/monitors.py`, `python/runtime/hw_probe.py`
    - Lexicon: `python/viz/stage.py` (second screen), not the in-game canvas
 6. Retail drive bus: `gvd_cmd.json` -> Lua, `gvd_ego.json` <- vehicle, `gvd_engage.json` = sticky engage/disengage record. See [`gvd_state_schema.md`](gvd_state_schema.md).

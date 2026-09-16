@@ -94,6 +94,40 @@ be = { getPlayerVehicle = function(_, _idx) return currentVeh end }
 local M = dofile('beamng_mod/lua/ge/extensions/gvd/main.lua')
 extensions = { gvd_main = M }
 
+-- Poison bindings.loadActions (#22). Prefer core_input_actions.load, then reloadBindings.
+-- Populate title/desc/onDown on load so a premature bindReady would look tempting.
+local bindTrace = {}
+local actionTable = {}
+core_input_actions = {
+  load = function()
+    bindTrace[#bindTrace + 1] = { 'load' }
+    actionTable.gvd_toggle_engage = {
+      title = 'GVD Engage', desc = 'Toggle GVD engage',
+      onDown = 'extensions.gvd_main.toggleEngage()',
+    }
+  end,
+  loadActions = function()
+    error('core_input_actions.loadActions must not run when load exists')
+  end,
+  onFileChanged = function(path, typ)
+    bindTrace[#bindTrace + 1] = { 'actions.onFileChanged', path, typ }
+  end,
+  getActiveActions = function() return actionTable end,
+}
+core_input_bindings = {
+  loadActions = function()
+    error('core_input_bindings.loadActions does not exist; GVD must not call it')
+  end,
+  onFileChanged = function(path, typ)
+    bindTrace[#bindTrace + 1] = { 'onFileChanged', path, typ }
+  end,
+  reloadBindings = function()
+    bindTrace[#bindTrace + 1] = { 'reloadBindings' }
+  end,
+}
+extensions.core_input_actions = core_input_actions
+extensions.core_input_bindings = core_input_bindings
+
 local function drainGE()
   -- run whatever vehicle Lua queued back into GE (extensions.gvd_main.onEgoFeedback(...))
   local q = geQueue
@@ -137,6 +171,28 @@ local function beatState(engaged, reason, overrideCfg)
 end
 
 M.onExtensionLoaded()
+local sawLoad, sawReload, readyAfterReload = false, false, false
+for _, ev in ipairs(bindTrace) do
+  if ev[1] == 'load' then sawLoad = true end
+  if ev[1] == 'reloadBindings' then sawReload = true end
+  check(ev[1] ~= 'actions.onFileChanged', 'load exists so actions.onFileChanged is not the primary path')
+end
+for _, msg in ipairs(logs) do
+  if tostring(msg):find('Alt%+G action ready', 1) then
+    readyAfterReload = sawReload
+  end
+end
+check(sawLoad, 'onExtensionLoaded calls core_input_actions.load')
+check(sawReload, 'onExtensionLoaded calls core_input_bindings.reloadBindings after load')
+check(readyAfterReload, 'Alt+G ready is reported only after reloadBindings')
+do
+  local loadAt, reloadAt
+  for i, ev in ipairs(bindTrace) do
+    if ev[1] == 'load' and not loadAt then loadAt = i end
+    if ev[1] == 'reloadBindings' and not reloadAt then reloadAt = i end
+  end
+  check(loadAt and reloadAt and loadAt < reloadAt, 'load happens before reloadBindings')
+end
 beatState(false, 'not_engaged')
 writeCmd(false, 0, 0, 1)
 M.onUpdate(0.2)

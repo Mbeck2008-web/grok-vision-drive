@@ -123,7 +123,7 @@ def test_toggle_nudge() -> None:
     det = next(r for r in MODEL_CONTROL_ROWS if r["id"] == "detector_id")
     assert opts.detector_id == "auto"
     opts.toggle(det)
-    assert opts.detector_id in ("synthetic", "empty", "auto") or opts.detector_id.startswith("yolov8")
+    assert opts.detector_id in ("synthetic", "empty", "auto") or opts.detector_id.startswith("yolov8") or opts.detector_id.startswith("yolox")
     opts.nudge(det, -1)
     assert opts.detector_id == "auto"
 

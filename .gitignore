@@ -9,6 +9,7 @@ dist/
 gvd-retail-*.zip
 
 # Weight blobs. Exception: the shipped YOLOv8n detect ONNX (COCO).
+# Optional extras (yolov8s/m, yolox_s.onnx, e2e) stay ignored. Retail zip ships n only.
 *.onnx
 *.pt
 *.pth

@@ -5,6 +5,8 @@ Shipped: ``models/yolov8n.onnx`` (Ultralytics YOLOv8n detect @640). Other
 
 * Detector: YOLOv8 *detect* ONNX or Ultralytics ``.pt`` found under ``models/``
   (stems ``yolov8n`` / ``s`` / ``m`` / ``l`` / ``x``, plus any other ``yolov8*.onnx|pt``).
+  Optional Apache second row: any ``models/yolox*.onnx`` (``yolox_s.onnx`` →
+  ``yolox-s-onnx``). Missing files are omitted from the MODEL cycle.
   Always-available fallbacks: ``synthetic`` (smoke leads) and ``empty`` (no boxes).
 * E2E: PilotNet-scale ONNX (``e2e*.onnx`` / ``config/control.yaml`` ``e2e.model``) or the
   numpy stub. Named feeds: main / wide 1x3x180x320 + kin 1x2. No trained E2E file is shipped.
@@ -73,6 +75,30 @@ def _yolo_files() -> list[tuple[str, Path, str]]:
     return [found[k] for k in sorted(found)]
 
 
+def yolox_catalog_id(path: Path) -> str:
+    """``yolox_s.onnx`` / ``yolox-s.onnx`` → ``yolox-s-onnx``."""
+    stem = path.stem.replace("_", "-")
+    return stem if stem.endswith("-onnx") else f"{stem}-onnx"
+
+
+def _yolox_files() -> list[tuple[str, Path, str]]:
+    """Return (id, path, kind) for ``models/yolox*.onnx`` that exist."""
+    if not MODELS_DIR.is_dir():
+        return []
+    found: dict[str, tuple[str, Path, str]] = {}
+    for path in sorted(MODELS_DIR.glob("yolox*.onnx")):
+        if not path.is_file():
+            continue
+        did = yolox_catalog_id(path)
+        if did in found:
+            prev = found[did][1]
+            # Official Megvii stem uses underscore (yolox_s.onnx).
+            if "_" in prev.name or "_" not in path.name:
+                continue
+        found[did] = (did, path, "yolox-onnx")
+    return [found[k] for k in sorted(found)]
+
+
 def _e2e_files() -> list[tuple[str, Path]]:
     if not MODELS_DIR.is_dir():
         files: list[Path] = []
@@ -107,6 +133,17 @@ def detector_choices() -> list[ModelChoice]:
                 kind,
                 path=path,
                 hint="YOLOv8 detect COCO",
+            )
+        )
+    for did, path, kind in _yolox_files():
+        rows.append(
+            ModelChoice(
+                did,
+                "detector",
+                did,
+                kind,
+                path=path,
+                hint="YOLOX detect COCO Apache",
             )
         )
     rows.append(
@@ -160,6 +197,7 @@ def load_detector(spec: str, *, allow_synthetic: bool = True) -> tuple[Any, list
     from python.perception.detect import (
         EmptyDetector,
         OnnxYoloDetector,
+        OnnxYoloxDetector,
         SyntheticDetector,
         UltraYoloDetector,
         make_detector,
@@ -179,6 +217,9 @@ def load_detector(spec: str, *, allow_synthetic: bool = True) -> tuple[Any, list
     if choice.kind == "yolo-onnx":
         assert choice.path is not None
         return OnnxYoloDetector(choice.path), []
+    if choice.kind == "yolox-onnx":
+        assert choice.path is not None
+        return OnnxYoloxDetector(choice.path), []
     if choice.kind == "yolo-pt":
         assert choice.path is not None
         return UltraYoloDetector(choice.path), []

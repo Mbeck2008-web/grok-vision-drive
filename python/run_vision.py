@@ -190,7 +190,7 @@ def main() -> None:
     ap.add_argument(
         "--detector",
         default="auto",
-        help="Detector catalog id: auto (default), synthetic, empty, or a yolov8*-onnx/ultra file in models/",
+        help="Detector catalog id: auto (default), synthetic, empty, a yolox*.onnx id if present, or a yolov8*-onnx/ultra file in models/",
     )
     ap.add_argument(
         "--e2e-model",

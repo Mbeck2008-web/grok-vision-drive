@@ -173,8 +173,10 @@ def main() -> None:
     # BeamNG onFileChanged arity is (filename, type).
     assert ", 'added')" in lua
     assert "'added'" in lua
-    # title/desc from getActiveActions is not bindReady by itself.
+    # title/desc from getActiveActions is not bindReady by itself; dump-shape walk gates ready.
     assert "engageActionListed" in refresh_exec
+    assert "reloadStatus == 'ok' and engageActionListed()" in refresh_exec
+    assert refresh_exec.count("engageActionListed()") >= 2
     assert "reloadStatus" in refresh_fn
     assert refresh_fn.find("reloadEngageBindings") < refresh_fn.find("markBindReady")
     assert "reloadStatus == 'ok'" in refresh_exec
@@ -182,6 +184,13 @@ def main() -> None:
     assert "retryEngageBindings(dt)" in lua_exec or "retryEngageBindings(dt)" in retry_fn
     assert "BIND_DEFER_S" in lua
     assert "bindFileChangedRan" in retry_exec, "fail log only if onFileChanged actually ran"
+    notify_fn = lua_fn("notifyBindingsFileChanged")
+    notify_exec = re.sub(r"--[^\n]*", "", notify_fn)
+    assert "return a or b" in notify_exec, "notifyBindingsFileChanged must succeed only when pcall succeeds"
+    assert re.search(r"return true\b", notify_exec) is None, "do not mark notify success just because the export exists"
+    bind_test = (ROOT / "scripts" / "test_gvd_bind_reload.lua").read_text(encoding="utf-8")
+    assert "neither load nor loadActions" in bind_test
+    assert "Test B still has loadActions" in bind_test
 
     # Retail Direct Drive echo on the slim HUD -- reuse egoFb, do not invent a bus.
     assert "WHEEL / PEDALS" in app_html

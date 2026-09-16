@@ -1,9 +1,11 @@
 -- Offline ActionMap reload contract for gvd/main.lua (no BeamNG).
 -- Run: lua5.1 scripts/test_gvd_bind_reload.lua
 -- Proves: always clear actionsCache then load/loadActions then reloadBindings;
--- never call bindings.loadActions; bindReady only after a real reload (not title/desc);
+-- never call bindings.loadActions; bindReady after reload AND dump-shape listing
+-- of gvd_toggle_engage (title/desc alone is not enough); keep retrying if unlisted;
 -- fail log only if onFileChanged ran and reload still failed; pcall failures log;
--- onFileChanged uses (filename, type); 0.36/0.39 dump shapes.
+-- onFileChanged uses (filename, type); throwing onFileChanged is not success;
+-- 0.36/0.39 dump shapes; a path with neither load nor loadActions (onFileChanged + defer).
 
 local logs = {}
 function log(level, tag, msg) logs[#logs + 1] = tostring(msg) end
@@ -169,12 +171,20 @@ do
   check(not readyIn(logs), 'C: ticks after failed reload still do not set bindReady')
 end
 
--- D: reloadBindings success is ready even with empty getActiveActions (title/desc is not the signal).
+-- D: first non-throwing reloadBindings is not ready until dump-shape walk lists the action.
 do
   logs = {}
+  local listed = false
+  local def = {
+    title = 'GVD Engage', desc = 'Toggle GVD engage',
+    onDown = 'extensions.gvd_main.toggleEngage()',
+  }
   core_input_actions = {
     load = function() end,
-    getActiveActions = function() return {} end,
+    getActiveActions = function()
+      if listed then return { [true] = { gvd_toggle_engage = def } } end
+      return {}
+    end,
   }
   core_input_bindings = {
     loadActions = function()
@@ -186,7 +196,10 @@ do
   local M = dofile('beamng_mod/lua/ge/extensions/gvd/main.lua')
   extensions.gvd_main = M
   M.onExtensionLoaded()
-  check(readyIn(logs), 'D: bindReady after reloadBindings even without title/desc')
+  check(not readyIn(logs), 'D: reload without listed action does not set bindReady')
+  listed = true
+  for _ = 1, 48 do M.onUpdate(0.05) end
+  check(readyIn(logs), 'D: bindReady after dump-shape walk lists gvd_toggle_engage')
 end
 
 -- E: 0.39-style boolean-keyed action dump. listed sees it; ready is still the reload.
@@ -239,6 +252,70 @@ do
     if tostring(m):find('still missing after retries', 1, true) then dead = true end
   end
   check(not dead, 'F: fail log only if onFileChanged actually ran')
+end
+
+-- G: neither load nor loadActions. Only onFileChanged + defer. Test B still has loadActions.
+do
+  logs = {}
+  local notified = 0
+  local def = {
+    title = 'GVD Engage', desc = 'Toggle GVD engage',
+    onDown = 'extensions.gvd_main.toggleEngage()',
+  }
+  core_input_actions = {
+    getActiveActions = function()
+      return { [true] = { gvd_toggle_engage = def } }
+    end,
+  }
+  core_input_bindings = {
+    loadActions = function()
+      error('must never call core_input_bindings.loadActions')
+    end,
+    onFileChanged = function(path, typ)
+      notified = notified + 1
+      check(typ == 'added', 'G: onFileChanged arity is (filename, added)')
+    end,
+  }
+  extensions = { core_input_actions = core_input_actions, core_input_bindings = core_input_bindings }
+  local M = dofile('beamng_mod/lua/ge/extensions/gvd/main.lua')
+  extensions.gvd_main = M
+  M.onExtensionLoaded()
+  check(not readyIn(logs), 'G: bindReady not set before delayed reload completes')
+  check(core_input_actions.load == nil and core_input_actions.loadActions == nil,
+    'G: fixture has neither load nor loadActions')
+  check(notified >= 1, 'G: onFileChanged scheduled a bindings refresh')
+  local notifyAtReady = notified
+  for _ = 1, 24 do M.onUpdate(0.05) end
+  check(readyIn(logs), 'G: Alt+G ready after onFileChanged + defer (no load/loadActions)')
+  check(notified == notifyAtReady, 'G: retries do not reset the forceRefresh(0.1) timer')
+end
+
+-- H: onFileChanged export exists but both pcalls throw; do not markBindReady.
+do
+  logs = {}
+  local def = {
+    title = 'GVD Engage', desc = 'Toggle GVD engage',
+    onDown = 'extensions.gvd_main.toggleEngage()',
+  }
+  core_input_actions = {
+    getActiveActions = function()
+      return { gvd_toggle_engage = def }
+    end,
+  }
+  core_input_bindings = {
+    loadActions = function()
+      error('must never call core_input_bindings.loadActions')
+    end,
+    onFileChanged = function() error('boom') end,
+  }
+  extensions = { core_input_actions = core_input_actions, core_input_bindings = core_input_bindings }
+  local M = dofile('beamng_mod/lua/ge/extensions/gvd/main.lua')
+  extensions.gvd_main = M
+  M.onExtensionLoaded()
+  check(failedIn(logs, 'core_input_bindings.onFileChanged'), 'H: onFileChanged pcall failure is logged')
+  check(not readyIn(logs), 'H: thrown onFileChanged does not set bindReady')
+  for _ = 1, 48 do M.onUpdate(0.05) end
+  check(not readyIn(logs), 'H: ticks after thrown onFileChanged still do not set bindReady')
 end
 
 print('test_gvd_bind_reload: OK')

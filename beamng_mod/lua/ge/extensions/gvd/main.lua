@@ -1583,7 +1583,8 @@ local preRenderSeen = false
 -- Sequence: always clear actionsCache, then core_input_actions.load / loadActions, then
 -- core_input_bindings.reloadBindings(). loadActions is not on core_input_bindings (#22 / 1543777).
 -- onFileChanged is BeamNG (filename, type) and must not skip reloadBindings (it only queues
--- forceRefresh(0.1)). bindReady is after a real reload, never from getActiveActions title/desc.
+-- forceRefresh(0.1)). bindReady is after a real reload (or delayed forceRefresh) AND a
+-- dump-shape walk lists gvd_toggle_engage. Title/desc alone is not a live Alt+G bind.
 local bindRetryLeft = 0
 local bindReady = false
 local bindDeferAcc = 0
@@ -1668,7 +1669,7 @@ local function lookupEngageAction(root)
   return nil
 end
 
--- title/desc on getActiveActions is not a live Alt+G bind; used only to know gvd.json is visible.
+-- Dump-shape walk of getActiveActions. Gates bindReady together with a real reload.
 local function engageActionListed()
   local a = inputExt('core_input_actions')
   if type(a) ~= 'table' or type(a.getActiveActions) ~= 'function' then return false end
@@ -1707,7 +1708,8 @@ local function notifyBindingsFileChanged()
   local a = tryCall('core_input_bindings.onFileChanged', bindings.onFileChanged, ACTION_JSON, 'added')
   local b = tryCall('core_input_bindings.onFileChanged', bindings.onFileChanged, BIND_JSON, 'added')
   if a or b then bindFileChangedRan = true end
-  return true
+  -- Export existing is not success: both pcalls throwing must not markBindReady.
+  return a or b
 end
 
 local function markBindReady(reason)
@@ -1721,26 +1723,28 @@ end
 local function refreshEngageBindings(reason)
   clearActionsCache()
   loadEngageActions()
-  -- Visibility only -- never bindReady from title/desc.
-  engageActionListed()
   -- Never elseif-skip this when onFileChanged exists.
   local reloadStatus = reloadEngageBindings()
-  if reloadStatus == 'ok' then
+  -- Ready only after reload (or delayed forceRefresh) AND dump-shape walk lists
+  -- gvd_toggle_engage. A non-throwing reload with an empty action table keeps retrying.
+  if reloadStatus == 'ok' and engageActionListed() then
     markBindReady(reason)
     return true
   end
   -- Builds that do not export reloadBindings: onFileChanged(filename, 'added')
   -- queues forceRefresh(0.1). Do not re-notify every retry (that resets the timer).
-  -- listed title/desc is not ready; wait until the delayed reload should have run.
-  if not bindNotified then
-    if notifyBindingsFileChanged() then
-      bindNotified = true
-      bindDeferAcc = 0
+  -- A throwing onFileChanged is not notified; do not markBindReady on throw.
+  if reloadStatus == 'missing' then
+    if not bindNotified then
+      if notifyBindingsFileChanged() then
+        bindNotified = true
+        bindDeferAcc = 0
+      end
     end
-  end
-  if reloadStatus == 'missing' and bindNotified and bindDeferAcc >= BIND_DEFER_S then
-    markBindReady(reason)
-    return true
+    if bindNotified and bindDeferAcc >= BIND_DEFER_S and engageActionListed() then
+      markBindReady(reason)
+      return true
+    end
   end
   if reason == 'onExtensionLoaded' then
     bindRetryLeft = BIND_RETRY_N
@@ -1801,7 +1805,7 @@ function M.onExtensionLoaded()
   -- leaves ActionMap with no title/desc (Could not create a description for alt+g).
   -- Always clear actionsCache / normalActionsCache, then core_input_actions.load /
   -- loadActions, then core_input_bindings.reloadBindings. bindReady is after that reload
-  -- (or delayed forceRefresh), never from getActiveActions title/desc alone.
+  -- (or delayed forceRefresh) plus dump-shape listing of gvd_toggle_engage.
   refreshEngageBindings('onExtensionLoaded')
   log('I', 'GVD', '[GVD] loaded. Alt+G engage (Ctrl+Alt+G fallback). Path: GVD PATH. Strip: mode/Hz/TTC/N. UI app: GVD.')
   log('I', 'GVD', string.format(

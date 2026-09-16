@@ -245,7 +245,8 @@ class OnnxYoloxDetector(Detector):
         import onnxruntime as ort  # type: ignore
 
         self.path = Path(onnx_path)
-        self.name = "yolox-s-onnx"
+        stem = self.path.stem.replace("_", "-")
+        self.name = stem if stem.endswith("-onnx") else f"{stem}-onnx"
         self.conf = conf
         self.nms_thr = nms_thr
         want = ["CUDAExecutionProvider", "CPUExecutionProvider"]

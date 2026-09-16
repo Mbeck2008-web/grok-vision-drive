@@ -150,7 +150,7 @@ Keys in `--viz`: `V` nerd, `D` DRIVE (live actuators), `G` VIZ (occupancy / boxe
 
 **M5 (shadow + tiny E2E):** Loaded detector / path / planner / tracks always run; actuators only when engaged. `--policy modular|e2e|shadow` (default **modular**). `policy_e2e` = PilotNet-scale stub. Shadow fields every tick; modular veto on low `lane_conf` / heartbeat / disagreement. Toy VRAM ~0.15–0.4 GB. No transformers/ViT/BEV.
 
-**Nets (nerd MODEL tab):** `models/yolov8n.onnx` is in git (Ultralytics YOLOv8n detect @640, AGPL — see `models/NOTICE.txt`). Optional Apache second row: `models/yolox_s.onnx` (Megvii YOLOX-s, Apache-2.0) appears on the MODEL cycle only when present (`PYTHONPATH=. python scripts/download_yolox_s.py`). Retail zip still ships YOLOv8n only. `M` on GVD VISION lists what can actually load: detector `auto` (that n ONNX) / `synthetic` / `empty` plus any extra `models/yolov8{s,m,l,x}.onnx` you add and `yolox-s-onnx` if downloaded, and E2E `auto` / `stub` plus `models/e2e*.onnx` if you train one. Lanes stay OpenCV Hough. Optional extras: `python scripts/download_yolov8n.py --size s`. `--detector` / `--e2e-model` set the launch id. There is no shipped E2E checkpoint.
+**Nets (nerd MODEL tab):** `models/yolov8n.onnx` is in git (Ultralytics YOLOv8n detect @640, AGPL — see `models/NOTICE.txt`). Optional Apache second row: any `models/yolox*.onnx` (Megvii YOLOX-s via `PYTHONPATH=. python scripts/download_yolox.py`, Apache-2.0) appears on the MODEL cycle only when present. Retail zip still ships YOLOv8n only. `M` on GVD VISION lists what can actually load: detector `auto` (that n ONNX) / `synthetic` / `empty` plus any extra `models/yolov8{s,m,l,x}.onnx` or `models/yolox*.onnx` you add, and E2E `auto` / `stub` plus `models/e2e*.onnx` if you train one. Lanes stay OpenCV Hough. Optional extras: `python scripts/download_yolov8n.py --size s`. `--detector` / `--e2e-model` set the launch id. There is no shipped E2E checkpoint.
 
 **M4 (clips):** ring-buffer + QSV/libx264 flush on disengage / AEB / near-miss / key C.
 
@@ -192,7 +192,7 @@ pip install -r requirements.txt
 pip install -r requirements-perception.txt   # optional (ultralytics / re-export)
 # models/yolov8n.onnx is already in the repo (retail / auto default)
 # optional Apache YOLOX-s (nerd MODEL / --detector yolox-s-onnx only; not in retail zip):
-# PYTHONPATH=. python scripts/download_yolox_s.py
+# PYTHONPATH=. python scripts/download_yolox.py
 PYTHONPATH=. python python/run_vision.py --smoke
 ```
 

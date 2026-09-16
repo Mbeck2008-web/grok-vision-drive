@@ -3,7 +3,7 @@
 
 Optional second detector row. Retail zip still ships YOLOv8n only.
 
-  PYTHONPATH=. python scripts/download_yolox_s.py
+  PYTHONPATH=. python scripts/download_yolox.py
 
 Source: Megvii-BaseDetection/YOLOX 0.1.1rc0 ``yolox_s.onnx`` (not AGPL).
 """
@@ -30,7 +30,7 @@ NOTICE_LINES = (
     "- models/yolox_s.onnx  -- optional, gitignored, not in the retail zip. "
     "Megvii YOLOX-s detect @640, official ONNX (0.1.1rc0). License: Apache-2.0 "
     "(Megvii-BaseDetection/YOLOX, Copyright (c) 2021-2022 Megvii Inc.). "
-    "Download: PYTHONPATH=. python scripts/download_yolox_s.py",
+    "Download: PYTHONPATH=. python scripts/download_yolox.py",
 )
 
 

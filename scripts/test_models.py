@@ -46,7 +46,9 @@ def test_catalog_shipped_n() -> None:
         if stem in det_ids:
             path = next(c.path for c in detector_choices() if c.id == stem)
             assert path is not None and path.is_file()
-    yolox_present = any((models_mod.MODELS_DIR / n).is_file() for n in models_mod.YOLOX_S_NAMES)
+    yolox_present = models_mod.MODELS_DIR.is_dir() and any(
+        p.is_file() for p in models_mod.MODELS_DIR.glob("yolox*.onnx")
+    )
     assert ("yolox-s-onnx" in det_ids) == yolox_present
     e2e_ids = ids_for("e2e")
     assert e2e_ids[:2] == ["auto", "stub"]
@@ -88,10 +90,13 @@ def test_yolox_optional(tmp_path: Path) -> None:
         models_mod.MODELS_DIR = tmp_path
         assert "yolox-s-onnx" not in ids_for("detector")
         (tmp_path / "yolox_s.onnx").write_bytes(b"not-an-onnx")
-        assert "yolox-s-onnx" in ids_for("detector")
+        (tmp_path / "yolox-s.onnx").write_bytes(b"also-not-onnx")
+        (tmp_path / "yolox_m.onnx").write_bytes(b"not-an-onnx")
+        ids = ids_for("detector")
+        assert "yolox-s-onnx" in ids and "yolox-m-onnx" in ids
         choice = next(c for c in detector_choices() if c.id == "yolox-s-onnx")
         assert choice.kind == "yolox-onnx" and choice.path == tmp_path / "yolox_s.onnx"
-        assert "yolov8n-onnx" not in ids_for("detector")
+        assert "yolov8n-onnx" not in ids
     finally:
         models_mod.MODELS_DIR = old
 
@@ -105,9 +110,12 @@ def test_yolox_optional(tmp_path: Path) -> None:
     det, _miss = make_detector(allow_synthetic=True)
     assert isinstance(det, OnnxYoloDetector) and det.name == "yolov8n-onnx"
 
-    yolox_path = next((models_mod.MODELS_DIR / n for n in models_mod.YOLOX_S_NAMES if (models_mod.MODELS_DIR / n).is_file()), None)
+    yolox_path = next(
+        (p for p in sorted(models_mod.MODELS_DIR.glob("yolox*.onnx")) if p.is_file()),
+        None,
+    )
     if yolox_path is None:
-        print("test_models: skip yolox load (models/yolox_s.onnx missing)")
+        print("test_models: skip yolox load (models/yolox*.onnx missing)")
         return
     loaded, miss = load_detector("yolox-s-onnx")
     assert isinstance(loaded, OnnxYoloxDetector) and loaded.name == "yolox-s-onnx" and miss == []
@@ -126,7 +134,10 @@ def test_retail_zip_no_yolox() -> None:
     assert not any(Path(f).name.startswith("yolox") and f.endswith(".onnx") for f in files)
     assert rel._excluded_file("models/yolox_s.onnx")
     assert rel._excluded_file("models/yolox-s.onnx")
+    assert rel._excluded_file("models/yolox_m.onnx")
     assert not rel._excluded_file("models/yolov8n.onnx")
+    assert (ROOT / "scripts" / "download_yolox.py").is_file()
+    assert not (ROOT / "scripts" / "download_yolox_s.py").is_file()
 
 
 def test_hot_swap() -> None:

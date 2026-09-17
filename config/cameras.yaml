@@ -10,11 +10,15 @@
 #   narrow: 800 @ 0.067 (~15 Hz)
 #   main:   300 @ 0.067
 #   wide:   300 @ 0.067 (same rate as forward)
-#   pillarL / pillarR / repeatL / repeatR / rear: 150 @ 0.13 (half-rate vs forward)
+#   pillarL / pillarR / repeatL / repeatR: 100 @ 0.13 (half-rate vs forward)
+#   rear: 100 @ 0.267 (÷4 vs forward)
 # Optional per-cam near_far_planes: [near_m, far_m] still clamped to the role band.
-# Hitch: half-rate sides/rear — not resolution. Depth OFF.
+# Hitch: half-rate sides + rear÷4 grab — not resolution. Depth OFF.
 origin_offset: [0.0, 0.0, 0.0]
 near_m: 0.05
+hitch:
+  side_grab_div: 2   # pillar/repeat every 2nd forward grab
+  rear_grab_div: 4   # rear every 4th forward grab
 cameras:
   - id: narrow
     role: long_range_forward
@@ -59,7 +63,7 @@ cameras:
     pitch_deg: -6
     fov_v: 65.3
     live_res: [640, 480]
-    far_m: 150
+    far_m: 100
     requested_update_time: 0.13
   - id: pillarR
     role: forward_side_right
@@ -70,7 +74,7 @@ cameras:
     pitch_deg: -6
     fov_v: 65.3
     live_res: [640, 480]
-    far_m: 150
+    far_m: 100
     requested_update_time: 0.13
   - id: repeatL
     role: rear_side_left
@@ -81,7 +85,7 @@ cameras:
     pitch_deg: -8
     fov_v: 55.4
     live_res: [640, 480]
-    far_m: 150
+    far_m: 100
     requested_update_time: 0.13
   - id: repeatR
     role: rear_side_right
@@ -92,7 +96,7 @@ cameras:
     pitch_deg: -8
     fov_v: 55.4
     live_res: [640, 480]
-    far_m: 150
+    far_m: 100
     requested_update_time: 0.13
   - id: rear
     role: rear_traffic
@@ -103,5 +107,5 @@ cameras:
     pitch_deg: -10
     fov_v: 80.0
     live_res: [640, 360]
-    far_m: 150
-    requested_update_time: 0.13
+    far_m: 100
+    requested_update_time: 0.267

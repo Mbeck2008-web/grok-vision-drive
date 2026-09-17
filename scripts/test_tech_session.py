@@ -14,9 +14,13 @@ from python.sensors.cameras import (  # noqa: E402
     DEFAULT_FAR_M,
     DEFAULT_NEAR_M,
     DEFAULT_UPDATE_S,
+    REAR_CAM_IDS,
+    REAR_GRAB_DIV,
     SIDE_CAM_IDS,
+    SIDE_GRAB_DIV,
     beamng_camera_sensor_kwargs,
     camera_clip_planes,
+    camera_grab_div,
     camera_update_s,
     far_hitch_ladder,
     iter_clip_attach_attempts,
@@ -102,11 +106,19 @@ def check_tech_yaml() -> None:
     assert float(by_id["narrow"]["far_m"]) > float(by_id["main"]["far_m"])
     assert float(by_id["main"]["far_m"]) != 800
     assert float(by_id["wide"]["far_m"]) == 300
-    for cid in ("pillarL", "pillarR", "repeatL", "repeatR", "rear"):
-        assert float(by_id[cid]["far_m"]) == 150, cid
+    hitch = rig.get("hitch") or {}
+    assert int(hitch.get("side_grab_div")) == SIDE_GRAB_DIV
+    assert int(hitch.get("rear_grab_div")) == REAR_GRAB_DIV
+    for cid in ("pillarL", "pillarR", "repeatL", "repeatR"):
+        assert float(by_id[cid]["far_m"]) == 100, cid
         assert abs(float(by_id[cid]["requested_update_time"]) - 0.13) < 1e-9, cid
+        assert camera_grab_div(cid, hitch) == 2, cid
+    assert float(by_id["rear"]["far_m"]) == 100
+    assert abs(float(by_id["rear"]["requested_update_time"]) - 0.267) < 1e-9
+    assert camera_grab_div("rear", hitch) == 4
     for cid in ("narrow", "main", "wide"):
         assert abs(float(by_id[cid]["requested_update_time"]) - 0.067) < 1e-9, cid
+        assert camera_grab_div(cid, hitch) == 1, cid
     for spec in rig.get("cameras") or []:
         res = list(spec.get("live_res") or [])
         assert res and max(int(res[0]), int(res[1])) == 640, spec.get("id")
@@ -322,11 +334,11 @@ def check_camera_clip_planes() -> None:
         "narrow": 800.0,
         "main": 300.0,
         "wide": 300.0,
-        "pillarL": 150.0,
-        "pillarR": 150.0,
-        "repeatL": 150.0,
-        "repeatR": 150.0,
-        "rear": 150.0,
+        "pillarL": 100.0,
+        "pillarR": 100.0,
+        "repeatL": 100.0,
+        "repeatR": 100.0,
+        "rear": 100.0,
     }
     want_rate = {
         "narrow": 0.067,
@@ -336,7 +348,7 @@ def check_camera_clip_planes() -> None:
         "pillarR": 0.13,
         "repeatL": 0.13,
         "repeatR": 0.13,
-        "rear": 0.13,
+        "rear": 0.267,
     }
     assert DEFAULT_FAR_M == want_far
     assert DEFAULT_UPDATE_S == want_rate
@@ -352,20 +364,26 @@ def check_camera_clip_planes() -> None:
         other = "rear" if cid == "narrow" else "narrow"
         assert camera_clip_planes({"id": other}, defaults=defaults)[1] == want_far[other]
 
-    # missing yaml keys still use locked per-id defaults (never silent 100 m, never both-800)
+    # missing yaml keys still use locked per-id defaults (forward never silent 100 m, never both-800)
     assert camera_clip_planes({"id": "narrow"}) == (0.05, 800.0)
     assert camera_clip_planes({"id": "main"}) == (0.05, 300.0)
     assert camera_clip_planes({"id": "wide"}) == (0.05, 300.0)
-    assert camera_clip_planes({"id": "rear"}) == (0.05, 150.0)
+    assert camera_clip_planes({"id": "pillarL"}) == (0.05, 100.0)
+    assert camera_clip_planes({"id": "rear"}) == (0.05, 100.0)
     assert abs(camera_update_s({"id": "narrow"}) - 0.067) < 1e-9
     assert abs(camera_update_s({"id": "main"}) - 0.067) < 1e-9
     assert abs(camera_update_s({"id": "wide"}) - 0.067) < 1e-9
     assert abs(camera_update_s({"id": "pillarL"}) - 0.13) < 1e-9
-    # 100 m (BeamNGpy default) is clamped to the role far — not kept
+    assert abs(camera_update_s({"id": "rear"}) - 0.267) < 1e-9
+    # forward 100 m (BeamNGpy default) is clamped to the role far — not kept
     assert camera_clip_planes({"id": "narrow", "far_m": 100})[1] == 800.0
     assert camera_clip_planes({"id": "main", "far_m": 100})[1] == 300.0
     assert camera_clip_planes({"id": "wide", "far_m": 100})[1] == 300.0
-    assert camera_clip_planes({"id": "rear", "far_m": 100})[1] == 150.0
+    # sides/rear lock at 100; 150 clamps down (rung-2 hitch)
+    assert camera_clip_planes({"id": "pillarL", "far_m": 100})[1] == 100.0
+    assert camera_clip_planes({"id": "rear", "far_m": 100})[1] == 100.0
+    assert camera_clip_planes({"id": "pillarL", "far_m": 150})[1] == 100.0
+    assert camera_clip_planes({"id": "rear", "far_m": 150})[1] == 100.0
     # both-800 rejected: main 800 clamps to 300; narrow stays 800
     assert camera_clip_planes({"id": "main", "far_m": 800})[1] == 300.0
     assert camera_clip_planes({"id": "narrow", "far_m": 800})[1] == 800.0
@@ -376,9 +394,16 @@ def check_camera_clip_planes() -> None:
     assert far_hitch_ladder("narrow", 800.0) == (800.0,)
     assert far_hitch_ladder("main", 300.0) == (300.0,)
     assert far_hitch_ladder("wide", 300.0) == (300.0,)
-    assert far_hitch_ladder("rear", 150.0) == (150.0,)
+    assert far_hitch_ladder("pillarL", 100.0) == (100.0,)
+    assert far_hitch_ladder("rear", 100.0) == (100.0,)
+    assert far_hitch_ladder("rear", 150.0) == (100.0,)
     assert far_hitch_ladder("main", 800.0) == (300.0,)
     assert far_hitch_ladder("narrow", 100.0) == (800.0,)
+
+    assert camera_grab_div("narrow") == 1
+    assert camera_grab_div("pillarL") == 2
+    assert camera_grab_div("rear") == 4
+    assert camera_grab_div("rear", {"rear_grab_div": 4, "side_grab_div": 2}) == 4
 
     narrow_tries = iter_clip_attach_attempts({"id": "narrow", "far_m": 800, "requested_update_time": 0.067})
     assert narrow_tries == [(0.05, 800.0, 0.067)]
@@ -386,11 +411,13 @@ def check_camera_clip_planes() -> None:
     assert main_tries == [(0.05, 300.0, 0.067)]
     wide_tries = iter_clip_attach_attempts({"id": "wide", "far_m": 300})
     assert wide_tries == [(0.05, 300.0, 0.067)]
-    side = iter_clip_attach_attempts({"id": "pillarL", "far_m": 150, "requested_update_time": 0.13}, update_s=0.067)
-    assert side == [(0.05, 150.0, 0.13)]
-    # global 0.067 cannot clobber side half-rate
-    side_default = iter_clip_attach_attempts({"id": "rear"}, update_s=0.067)
-    assert side_default == [(0.05, 150.0, 0.13)]
+    side = iter_clip_attach_attempts({"id": "pillarL", "far_m": 100, "requested_update_time": 0.13}, update_s=0.067)
+    assert side == [(0.05, 100.0, 0.13)]
+    # global 0.067 cannot clobber side half-rate or rear ÷4
+    side_default = iter_clip_attach_attempts({"id": "pillarL"}, update_s=0.067)
+    assert side_default == [(0.05, 100.0, 0.13)]
+    rear_default = iter_clip_attach_attempts({"id": "rear"}, update_s=0.067)
+    assert rear_default == [(0.05, 100.0, 0.267)]
 
     kw = beamng_camera_sensor_kwargs(
         pos=(0.0, -1.2, 1.26),
@@ -420,6 +447,7 @@ def check_camera_clip_planes() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "BeamNGpy #199" in readme or "BeamNGpy/issues/199" in readme
     assert "narrow > main" in readme
+    assert "0.267" in readme
 
 
 def check_beamngpy_open_passes_near_far() -> None:
@@ -461,7 +489,22 @@ def check_beamngpy_open_passes_near_far() -> None:
 
         be.session.connect = _connect  # type: ignore[method-assign]
         be.session.attach_vehicle_sensors = lambda: {}  # type: ignore[method-assign]
-        be.open()
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            be.open()
+        log = buf.getvalue()
+        assert "hitch steps narrow:" in log
+        assert "far_m=800@update_s=0.067" in log
+        assert "hitch steps rear:" in log
+        assert "far_m=100@update_s=0.267" in log
+        assert "hitch steps pillarL:" in log
+        assert "not resolution" in log
+        assert "side_grab_div=2" in log
+        assert "rear_grab_div=4" in log
+        assert "depth/semantic OFF" in log
         names = [n for n, _ in captured]
         assert names == [f"gvd_{c}" for c in CAM_IDS], names
         by = {n: kw for n, kw in captured}
@@ -472,22 +515,35 @@ def check_beamngpy_open_passes_near_far() -> None:
         assert by["gvd_main"]["requested_update_time"] == 0.067
         assert by["gvd_wide"]["requested_update_time"] == 0.067
         for cid in SIDE_CAM_IDS:
-            assert by[f"gvd_{cid}"]["near_far_planes"] == (0.05, 150.0), cid
+            assert by[f"gvd_{cid}"]["near_far_planes"] == (0.05, 100.0), cid
             assert abs(by[f"gvd_{cid}"]["requested_update_time"] - 0.13) < 1e-9, cid
             assert by[f"gvd_{cid}"]["is_render_depth"] is False
             assert by[f"gvd_{cid}"]["resolution"][0] >= 1
+        for cid in REAR_CAM_IDS:
+            assert by[f"gvd_{cid}"]["near_far_planes"] == (0.05, 100.0), cid
+            assert abs(by[f"gvd_{cid}"]["requested_update_time"] - 0.267) < 1e-9, cid
+            assert by[f"gvd_{cid}"]["is_render_depth"] is False
         assert by["gvd_narrow"]["is_render_depth"] is False
         assert by["gvd_narrow"]["resolution"] == (640, 480)
         assert be._clip_planes["narrow"] == (0.05, 800.0)
         assert be._clip_planes["main"] == (0.05, 300.0)
-        assert abs(be._update_s["rear"] - 0.13) < 1e-9
-        # never silent 100 m, never both-800
+        assert abs(be._update_s["rear"] - 0.267) < 1e-9
+        assert be._side_grab_div == 2
+        assert be._rear_grab_div == 4
+        hitch_by = {cid: (near, far, rate) for cid, near, far, rate in be._hitch_steps}
+        assert hitch_by["narrow"] == (0.05, 800.0, 0.067)
+        assert hitch_by["main"] == (0.05, 300.0, 0.067)
+        assert hitch_by["wide"] == (0.05, 300.0, 0.067)
+        assert hitch_by["pillarL"][1] == 100.0 and abs(hitch_by["pillarL"][2] - 0.13) < 1e-9
+        assert hitch_by["rear"][1] == 100.0 and abs(hitch_by["rear"][2] - 0.267) < 1e-9
+        # always explicit near_far_planes; forward never 100; never both-800
         for name, kw in captured:
             assert "near_far_planes" in kw, name
             far = kw["near_far_planes"][1]
-            assert far != 100.0, name
-            if name in ("gvd_narrow", "gvd_main"):
+            if name in ("gvd_narrow", "gvd_main", "gvd_wide"):
                 assert far != 100.0, name
+            else:
+                assert far == 100.0, name
         assert by["gvd_narrow"]["near_far_planes"][1] != by["gvd_main"]["near_far_planes"][1]
         assert by["gvd_main"]["near_far_planes"][1] != 800.0
         assert be._ok
@@ -500,13 +556,13 @@ def check_beamngpy_open_passes_near_far() -> None:
 
 
 def check_beamngpy_side_grab_half_rate() -> None:
-    """Sides/rear poll every 2nd grab; forward every grab. No resolution change."""
+    """Sides poll every 2nd grab; rear every 4th; forward every grab. No resolution change."""
     import sys
     import types
 
     import numpy as np
 
-    from python.sensors.cameras import BeamNGPyBackend, CamHealth, SIDE_CAM_IDS
+    from python.sensors.cameras import BeamNGPyBackend, CamHealth, REAR_CAM_IDS, SIDE_CAM_IDS
 
     polls: dict[str, int] = {}
 
@@ -548,14 +604,14 @@ def check_beamngpy_side_grab_half_rate() -> None:
         be.session.connect = _connect  # type: ignore[method-assign]
         be.session.attach_vehicle_sensors = lambda: {}  # type: ignore[method-assign]
         be.open()
-        n = 4
+        n = 8
         last = None
         for _ in range(n):
             last = be.grab()
         assert last is not None
         assert last.health["main"] == CamHealth.OK
         assert last.health["narrow"] == CamHealth.OK
-        for cid in SIDE_CAM_IDS:
+        for cid in SIDE_CAM_IDS | REAR_CAM_IDS:
             assert last.health[cid] == CamHealth.OK, cid
             assert f"gvd_{cid}" in last.frames or cid in last.frames
         assert polls["gvd_narrow"] == n
@@ -563,7 +619,11 @@ def check_beamngpy_side_grab_half_rate() -> None:
         assert polls["gvd_wide"] == n
         for cid in SIDE_CAM_IDS:
             assert polls[f"gvd_{cid}"] == n // 2, (cid, polls[f"gvd_{cid}"])
+        for cid in REAR_CAM_IDS:
+            assert polls[f"gvd_{cid}"] == n // 4, (cid, polls[f"gvd_{cid}"])
         assert be._clip_planes["narrow"][1] > be._clip_planes["main"][1]
+        assert "rear_div=4" in last.note
+        assert "side_div=2" in last.note
     finally:
         for k, v in old.items():
             if v is None:

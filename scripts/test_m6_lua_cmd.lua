@@ -31,54 +31,33 @@ function jsonDecode(s)
   return t
 end
 
-local function busDocs()
-  local ov = os.getenv('GVD_DOCS_DIR')
-  if ov then
-    ov = tostring(ov):match('^%s*(.-)%s*$') or ''
-    if ov ~= '' then return ov:gsub('\\', '/') end
-  end
-  local product = 'drive'
-  local gp = os.getenv('GVD_PRODUCT')
-  if gp and tostring(gp) ~= '' then
-    gp = tostring(gp):lower():match('^%s*(.-)%s*$') or ''
-    if gp == 'tech' or gp == 'beamng.tech' or gp == 'beamngtech' then product = 'tech' end
-  end
-  local b = os.getenv('GVD_BEAMNG')
-  if b then
-    b = tostring(b):lower():match('^%s*(.-)%s*$') or ''
-    if b == '1' or b == 'true' or b == 'yes' then product = 'tech' end
-  end
-  local be = os.getenv('GVD_BACKEND')
-  if be then
-    be = tostring(be):lower():match('^%s*(.-)%s*$') or ''
-    if be == 'beamngpy' or be == 'tech' then product = 'tech' end
-  end
-  local function fromLa(localApp)
-    if not localApp or localApp == '' then return nil end
-    local la = tostring(localApp):gsub('\\', '/')
-    if la == '' or la:lower():find('onedrive', 1, true) then return nil end
-    if product == 'tech' then
-      return la .. '/BeamNG/BeamNG.tech/current/Documents/GVD'
-    end
-    return la .. '/BeamNG/BeamNG.drive/current/Documents/GVD'
-  end
-  local d = fromLa(os.getenv('LOCALAPPDATA'))
-  if d then return d end
-  local home = os.getenv('HOME') or os.getenv('USERPROFILE')
-  assert(home and home ~= '', 'HOME/USERPROFILE required')
-  return fromLa(home:gsub('\\', '/') .. '/AppData/Local')
-end
-local docs = busDocs()
-os.execute('mkdir -p "' .. docs .. '"')
-local engagePath = docs .. '/gvd_engage.json'
-local statePath = docs .. '/gvd_state.json'
-local cmdPath = docs .. '/gvd_cmd.json'
-local egoPath = docs .. '/gvd_ego.json'
+local engagePath = 'Documents/GVD/gvd_engage.json'
+local statePath = 'Documents/GVD/gvd_state.json'
+local cmdPath = 'Documents/GVD/gvd_cmd.json'
+local egoPath = 'Documents/GVD/gvd_ego.json'
 
-local function writeFile(p, s) local f = assert(io.open(p, 'w')); f:write(s); f:close() end
-local function readFileAll(p) local f = io.open(p, 'r'); if not f then return nil end; local d = f:read('*a'); f:close(); return d end
-os.remove(egoPath)
-os.remove(statePath)
+local vfsBus = {}
+local function busRel(path)
+  local p = tostring(path or ''):gsub('\\', '/')
+  local name = p:match('([^/]+)$')
+  if name and name:match('^gvd_') then return 'Documents/GVD/' .. name end
+  return p
+end
+function readFile(path)
+  return vfsBus[busRel(path)]
+end
+FS = {
+  readFile = function(_, path) return vfsBus[busRel(path)] end,
+  writeFile = function(_, path, data)
+    vfsBus[busRel(path)] = data
+    return true
+  end,
+  directoryCreate = function() end,
+}
+local function writeFile(p, s) vfsBus[busRel(p)] = s end
+local function readFileAll(p) return vfsBus[busRel(p)] end
+vfsBus[egoPath] = nil
+vfsBus[statePath] = nil
 
 -- ── fake vehicle: executes queued vehicle-Lua in a sandbox ─────────────────────────────────────
 local allowed = {}          -- recorded input.setAllowedInputSource calls

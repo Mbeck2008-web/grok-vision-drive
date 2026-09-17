@@ -4,7 +4,7 @@ Path: product sandbox `gvd_state.json` (written by `python/run_vision.py`). **No
 
 - Tech: `%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\Documents\GVD\gvd_state.json`
 - Drive / retail: `%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\Documents\GVD\gvd_state.json`
-- `GVD_DOCS_DIR` override wins (full GVD root). Steam GELua does not inherit it — live retail Lua follows the Drive sandbox from `FS:getUserPath`.
+- `GVD_DOCS_DIR` override wins (full GVD root) for **Python writers**. Steam GELua does not inherit it — live Lua reads relative `Documents/GVD` via VFS / `FS:readFile` (the userfolder mapping of that sandbox). No absolute `io.open`.
 
 | Field | Type | Notes |
 | --- | --- | --- |
@@ -86,7 +86,7 @@ Also: `Documents/GVD/gvd_cmd.json` = `{steer,throttle,brake,seq,engaged,heartbea
 
 ## Path note
 
-Lua and Python share the **running product** sandbox (Tech `BeamNG.tech\current\Documents\GVD` vs Drive `BeamNG.drive\current\Documents\GVD` under `%LOCALAPPDATA%\BeamNG\`, or `GVD_DOCS_DIR`). GELua reconstructs the product from `FS:getUserPath` / `FS:virtual2Native` so Steam retail works without env. Never `%USERPROFILE%\Documents\GVD`. Never OneDrive. Never a bare `gvd_*.json` under userfolder `current\`.
+Python **writes** the **running product** sandbox (Tech `BeamNG.tech\current\Documents\GVD` vs Drive `BeamNG.drive\current\Documents\GVD` under `%LOCALAPPDATA%\BeamNG\`, or `GVD_DOCS_DIR`). GELua **reads** relative `Documents/GVD` via VFS / `FS:readFile` (same physical folder when the userfolder maps `Documents/GVD`). Never `%USERPROFILE%\Documents\GVD`. Never OneDrive. Never a bare `gvd_*.json` under userfolder `current\`. Never absolute `io.open` on the bus.
 
 ## UI prefs (`Documents/GVD/gvd_ui_prefs.json`)
 

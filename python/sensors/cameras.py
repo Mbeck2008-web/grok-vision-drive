@@ -15,6 +15,29 @@ import numpy as np
 CAM_IDS = ("narrow", "main", "wide", "pillarL", "pillarR", "repeatL", "repeatR", "rear")
 MAIN_ALIASES = ("main", "cam_main")
 
+# BeamNGpy Camera() defaults near_far_planes=(0.05, 100) — BeamNGpy#199.
+# GVD must pass an explicit pair from cameras.yaml so Tech attach is not clipped at 100 m.
+DEFAULT_NEAR_M = 0.05
+BNGPY_DEFAULT_FAR_M = 100.0
+LONG_RANGE_CAM_IDS = frozenset(("narrow", "main"))
+DEFAULT_FAR_M = {
+    "narrow": 1500.0,
+    "main": 800.0,
+    "wide": 200.0,
+    "pillarL": 200.0,
+    "pillarR": 200.0,
+    "repeatL": 200.0,
+    "repeatR": 200.0,
+    "rear": 200.0,
+}
+NARROW_FAR_BAND = (400.0, 1500.0)
+MAIN_FAR_BAND = (400.0, 1000.0)
+SIDE_FAR_BAND = (150.0, 300.0)
+NARROW_FAR_HITCH = (1500.0, 800.0, 600.0, 400.0)
+MAIN_FAR_HITCH = (800.0, 600.0, 400.0)
+SIDE_FAR_HITCH = (200.0, 150.0)
+SIDE_CAM_HITCH_UPDATE_S = 0.10  # 10 Hz floor; never drop resolution on hitch
+
 
 class CamHealth(str, Enum):
     OK = "ok"
@@ -93,6 +116,168 @@ def yaw_pitch_to_dir_up(yaw_deg: float, pitch_deg: float) -> tuple[tuple[float, 
     uy = -math.cos(yaw) * math.sin(pitch)
     uz = math.cos(pitch)
     return (dx, dy, dz), (ux, uy, uz)
+
+
+def _as_float(v: Any) -> float | None:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f in (float("inf"), float("-inf")):
+        return None
+    return f
+
+
+def _pair2(v: Any) -> tuple[float, float] | None:
+    """Parse near_far_planes as [near, far] or {near/near_m, far/far_m}."""
+    if v is None:
+        return None
+    if isinstance(v, dict):
+        near = _as_float(v.get("near") if v.get("near") is not None else v.get("near_m"))
+        far = _as_float(v.get("far") if v.get("far") is not None else v.get("far_m"))
+        if near is None or far is None:
+            return None
+        return (near, far)
+    try:
+        seq = list(v)
+    except TypeError:
+        return None
+    if len(seq) < 2:
+        return None
+    near, far = _as_float(seq[0]), _as_float(seq[1])
+    if near is None or far is None:
+        return None
+    return (near, far)
+
+
+def default_far_m(cid: str) -> float:
+    return float(DEFAULT_FAR_M.get(cid, DEFAULT_FAR_M["rear"]))
+
+
+def far_band(cid: str) -> tuple[float, float]:
+    if cid == "narrow":
+        return NARROW_FAR_BAND
+    if cid == "main":
+        return MAIN_FAR_BAND
+    return SIDE_FAR_BAND
+
+
+def clamp_far_m(cid: str, far_m: float) -> float:
+    lo, hi = far_band(cid)
+    return min(hi, max(lo, float(far_m)))
+
+
+def camera_clip_planes(
+    spec: dict[str, Any] | None,
+    *,
+    cid: str | None = None,
+    defaults: dict[str, Any] | None = None,
+) -> tuple[float, float]:
+    """Per-cam (near_m, far_m) for BeamNGpy Camera.near_far_planes.
+
+    Precedence: spec.near_far_planes > spec.near_m/far_m > defaults.near_m + role far.
+    Role far: narrow 1500, main 800, wide/pillar/repeat/rear 200. Clamped to the
+    role band so a missing or 100 m value cannot silently keep BeamNGpy's default.
+    """
+    spec = spec or {}
+    defaults = defaults or {}
+    cam_id = str(cid or spec.get("id") or "")
+    near = DEFAULT_NEAR_M
+    far = default_far_m(cam_id)
+    dn = _as_float(defaults.get("near_m"))
+    if dn is not None:
+        near = dn
+    # File-level far_m is not applied: Spec locks per-id far_m (narrow 1500 ≠ main 800).
+    sn = _as_float(spec.get("near_m"))
+    if sn is not None:
+        near = sn
+    sf = _as_float(spec.get("far_m"))
+    if sf is not None:
+        far = sf
+    nfp = _pair2(spec.get("near_far_planes"))
+    if nfp is None:
+        nfp = _pair2(defaults.get("near_far_planes"))
+    if nfp is not None:
+        near, far = nfp
+    if near <= 0 or near >= far:
+        near = DEFAULT_NEAR_M
+    return (float(near), clamp_far_m(cam_id, far))
+
+
+def far_hitch_ladder(cid: str, far_m: float) -> tuple[float, ...]:
+    """Requested far, then lower rungs. Narrow: 1500→800→600→400. Main: 800→600→400. Side: 200→150."""
+    if cid == "narrow":
+        rungs = NARROW_FAR_HITCH
+    elif cid == "main":
+        rungs = MAIN_FAR_HITCH
+    else:
+        rungs = SIDE_FAR_HITCH
+    lo, _hi = far_band(cid)
+    out: list[float] = []
+    seen: set[float] = set()
+    for f in (float(far_m),) + tuple(float(x) for x in rungs):
+        if f > far_m + 1e-9 or f < lo - 1e-9:
+            continue
+        key = round(f, 3)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(float(f))
+    return tuple(out) or (float(far_m),)
+
+
+def iter_clip_attach_attempts(
+    spec: dict[str, Any] | None,
+    *,
+    cid: str | None = None,
+    update_s: float = 0.067,
+    defaults: dict[str, Any] | None = None,
+) -> list[tuple[float, float, float]]:
+    """(near_m, far_m, update_s) tries. Drop far, then side-cam rate. Never resolution."""
+    spec = spec or {}
+    cam_id = str(cid or spec.get("id") or "")
+    near_m, far_m = camera_clip_planes(spec, cid=cam_id, defaults=defaults)
+    rate = float(update_s)
+    tries: list[tuple[float, float, float]] = [(near_m, f, rate) for f in far_hitch_ladder(cam_id, far_m)]
+    if cam_id not in LONG_RANGE_CAM_IDS:
+        hitch_rate = max(rate, SIDE_CAM_HITCH_UPDATE_S)
+        if hitch_rate > rate + 1e-9:
+            tries.append((near_m, far_m, hitch_rate))
+    return tries
+
+
+def beamng_camera_sensor_kwargs(
+    *,
+    pos: tuple[float, float, float],
+    direction: tuple[float, float, float],
+    up: tuple[float, float, float],
+    fov_v: float,
+    resolution: tuple[int, int],
+    update_s: float,
+    near_m: float,
+    far_m: float,
+    shmem: bool,
+    streaming: bool,
+    rgb_only: bool,
+) -> dict[str, Any]:
+    """Kwargs for beamngpy.sensors.Camera (name, bng, vehicle stay positional)."""
+    return {
+        "requested_update_time": float(update_s),
+        "pos": pos,
+        "dir": direction,
+        "up": up,
+        "field_of_view_y": float(fov_v),
+        "resolution": (int(resolution[0]), int(resolution[1])),
+        "near_far_planes": (float(near_m), float(far_m)),
+        "is_using_shared_memory": bool(shmem),
+        "is_streaming": bool(streaming),
+        "is_render_colours": True,
+        "is_render_annotations": not bool(rgb_only),
+        "is_render_instance": False,
+        "is_render_depth": not bool(rgb_only),
+        "is_snapping_desired": False,
+        "is_visualised": False,
+    }
 
 
 @runtime_checkable
@@ -403,6 +588,7 @@ class BeamNGPyBackend:
 
         self.session = TechSession(tech_config if tech_config is not None else load_tech_config())
         self._sensors: dict[str, Any] = {}
+        self._clip_planes: dict[str, tuple[float, float]] = {}
         self._logged = False
         self._ok = False
 
@@ -444,6 +630,8 @@ class BeamNGPyBackend:
         shmem = bool(cam_cfg.get("shared_memory", True))
         streaming = bool(cam_cfg.get("streaming", True))
         rgb_only = bool(cam_cfg.get("rgb_only", True))
+        clip_defaults = {"near_m": self.config.get("near_m", DEFAULT_NEAR_M)}
+        self._clip_planes = {}
         for spec in cams:
             cid = str(spec.get("id") or "")
             if not cid or cid not in CAM_IDS:
@@ -461,26 +649,52 @@ class BeamNGPyBackend:
                     scale = self.long_side / float(max(rw, rh))
                     rw, rh = max(1, int(rw * scale)), max(1, int(rh * scale))
                 fov_v = float(spec.get("fov_v") or 70.0)
-                cam = Camera(
-                    f"gvd_{cid}",
-                    bng,
-                    vehicle,
-                    requested_update_time=update_s,
-                    pos=pos_bng,
-                    dir=dir_bng,
-                    up=up_bng,
-                    field_of_view_y=fov_v,
-                    resolution=(rw, rh),
-                    is_using_shared_memory=shmem,
-                    is_streaming=streaming,
-                    is_render_colours=True,
-                    is_render_annotations=not rgb_only,
-                    is_render_instance=False,
-                    is_render_depth=not rgb_only,
-                    is_snapping_desired=False,
-                    is_visualised=False,
-                )
+                want_near, want_far = camera_clip_planes(spec, cid=cid, defaults=clip_defaults)
+                last_err: Exception | None = None
+                cam = None
+                used_near, used_far, used_rate = want_near, want_far, update_s
+                for try_near, try_far, try_rate in iter_clip_attach_attempts(
+                    spec, cid=cid, update_s=update_s, defaults=clip_defaults
+                ):
+                    kwargs = beamng_camera_sensor_kwargs(
+                        pos=pos_bng,
+                        direction=dir_bng,
+                        up=up_bng,
+                        fov_v=fov_v,
+                        resolution=(rw, rh),
+                        update_s=try_rate,
+                        near_m=try_near,
+                        far_m=try_far,
+                        shmem=shmem,
+                        streaming=streaming,
+                        rgb_only=rgb_only,
+                    )
+                    try:
+                        cam = Camera(f"gvd_{cid}", bng, vehicle, **kwargs)
+                        used_near, used_far, used_rate = try_near, try_far, try_rate
+                        break
+                    except TypeError as e:
+                        last_err = e
+                        if "near_far_planes" in str(e):
+                            print(
+                                f"[GVD] beamngpy Camera rejected near_far_planes for {cid} "
+                                f"({e}); not attaching with silent {BNGPY_DEFAULT_FAR_M:g} m far."
+                            )
+                            cam = None
+                            break
+                    except Exception as e:
+                        last_err = e
+                        cam = None
+                if cam is None:
+                    print(f"[GVD] beamngpy Camera attach failed for {cid}: {last_err}")
+                    continue
+                if used_far + 1e-9 < want_far or used_rate > update_s + 1e-9:
+                    print(
+                        f"[GVD] beamngpy Camera hitch {cid}: far_m {want_far:g}->{used_far:g} "
+                        f"update_s {update_s:g}->{used_rate:g} (not resolution)"
+                    )
                 self._sensors[cid] = cam
+                self._clip_planes[cid] = (used_near, used_far)
                 attached += 1
             except Exception as e:
                 print(f"[GVD] beamngpy Camera attach failed for {cid}: {e}")
@@ -488,9 +702,10 @@ class BeamNGPyBackend:
         self._ok = attached > 0
         if not self._logged:
             if self._ok:
+                clips = " ".join(f"{k}={v[1]:g}" for k, v in self._clip_planes.items())
                 print(
                     f"[GVD] beamngpy attached {attached} color Camera(s) from cameras.yaml "
-                    f"(GVD→BeamNG vehicle-space convert; depth/semantic OFF)."
+                    f"(near_far_planes far_m {clips}; GVD→BeamNG vehicle-space convert; depth/semantic OFF)."
                 )
             else:
                 print("[GVD] beamngpy: zero Cameras attached; cam_health=missing.")
@@ -519,6 +734,7 @@ class BeamNGPyBackend:
                 except Exception:
                     pass
         self._sensors.clear()
+        self._clip_planes.clear()
         self.session.close()
         self._ok = False
 

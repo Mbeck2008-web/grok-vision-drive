@@ -11,6 +11,12 @@ sys.path.insert(0, str(ROOT))
 
 from python.sensors.cameras import (  # noqa: E402
     CAM_IDS,
+    DEFAULT_FAR_M,
+    DEFAULT_NEAR_M,
+    beamng_camera_sensor_kwargs,
+    camera_clip_planes,
+    far_hitch_ladder,
+    iter_clip_attach_attempts,
     load_camera_config,
     resolve_backend_name,
     yaw_pitch_to_dir_up,
@@ -86,6 +92,12 @@ def check_tech_yaml() -> None:
     rig = load_camera_config()
     ids = [c.get("id") for c in (rig.get("cameras") or [])]
     assert ids == list(CAM_IDS), ids
+    assert abs(float(rig.get("near_m") or 0) - DEFAULT_NEAR_M) < 1e-9
+    by_id = {c["id"]: c for c in (rig.get("cameras") or [])}
+    assert float(by_id["narrow"]["far_m"]) == 1500
+    assert float(by_id["main"]["far_m"]) == 800
+    for cid in ("wide", "pillarL", "pillarR", "repeatL", "repeatR", "rear"):
+        assert float(by_id[cid]["far_m"]) == 200, cid
 
 
 def check_env_overrides(monkey: dict[str, str]) -> None:
@@ -290,6 +302,144 @@ def check_poll_mock() -> None:
     assert pos == (0.0, -1.2, 1.26) and direction == (0.0, -1.0, 0.0)
 
 
+def check_camera_clip_planes() -> None:
+    """Per-id far_m from cameras.yaml is wired as near_far_planes=(0.05, far_m)."""
+    cfg = load_camera_config()
+    defaults = {"near_m": cfg.get("near_m", DEFAULT_NEAR_M)}
+    want = {
+        "narrow": 1500.0,
+        "main": 800.0,
+        "wide": 200.0,
+        "pillarL": 200.0,
+        "pillarR": 200.0,
+        "repeatL": 200.0,
+        "repeatR": 200.0,
+        "rear": 200.0,
+    }
+    assert DEFAULT_FAR_M == want
+    for spec in cfg.get("cameras") or []:
+        cid = spec["id"]
+        near, far = camera_clip_planes(spec, defaults=defaults)
+        assert abs(near - 0.05) < 1e-9, cid
+        assert far == want[cid], (cid, far)
+        # independent: changing one cam does not move another
+        other = "rear" if cid == "narrow" else "narrow"
+        assert camera_clip_planes({"id": other}, defaults=defaults)[1] == want[other]
+
+    # missing yaml keys still use locked per-id defaults (never silent 100 m)
+    assert camera_clip_planes({"id": "narrow"}) == (0.05, 1500.0)
+    assert camera_clip_planes({"id": "main"}) == (0.05, 800.0)
+    assert camera_clip_planes({"id": "wide"}) == (0.05, 200.0)
+    # 100 m (BeamNGpy default) is clamped up out of the silent-clip zone
+    assert camera_clip_planes({"id": "main", "far_m": 100})[1] == 400.0
+    assert camera_clip_planes({"id": "narrow", "far_m": 100})[1] == 400.0
+    assert camera_clip_planes({"id": "rear", "far_m": 100})[1] == 150.0
+    # near_far_planes pair overrides far_m
+    assert camera_clip_planes({"id": "main", "far_m": 800, "near_far_planes": [0.05, 600]}) == (0.05, 600.0)
+    # narrow stays farther than main and is not clamped to 1000
+    assert camera_clip_planes({"id": "narrow", "far_m": 1500})[1] == 1500.0
+    assert camera_clip_planes({"id": "narrow", "far_m": 2000})[1] == 1500.0
+
+    assert far_hitch_ladder("narrow", 1500.0) == (1500.0, 800.0, 600.0, 400.0)
+    assert far_hitch_ladder("main", 800.0) == (800.0, 600.0, 400.0)
+    assert far_hitch_ladder("main", 600.0) == (600.0, 400.0)
+    assert far_hitch_ladder("rear", 200.0) == (200.0, 150.0)
+
+    narrow_tries = iter_clip_attach_attempts({"id": "narrow", "far_m": 1500}, update_s=0.067)
+    assert [t[1] for t in narrow_tries] == [1500.0, 800.0, 600.0, 400.0]
+    assert all(abs(t[0] - 0.05) < 1e-9 and t[2] == 0.067 for t in narrow_tries)
+
+    side = iter_clip_attach_attempts({"id": "pillarL", "far_m": 200}, update_s=0.067)
+    assert side[0] == (0.05, 200.0, 0.067)
+    assert (0.05, 150.0, 0.067) in side
+    assert any(abs(t[2] - 0.10) < 1e-9 and t[1] == 200.0 for t in side)
+
+    kw = beamng_camera_sensor_kwargs(
+        pos=(0.0, -1.2, 1.26),
+        direction=(0.0, -1.0, 0.0),
+        up=(0.0, 0.0, 1.0),
+        fov_v=21.4,
+        resolution=(640, 480),
+        update_s=0.067,
+        near_m=0.05,
+        far_m=1500.0,
+        shmem=True,
+        streaming=True,
+        rgb_only=True,
+    )
+    assert kw["near_far_planes"] == (0.05, 1500.0)
+    assert kw["is_render_depth"] is False
+    assert kw["is_render_annotations"] is False
+    assert kw["resolution"] == (640, 480)
+
+    src = (ROOT / "python" / "sensors" / "cameras.py").read_text(encoding="utf-8")
+    assert "near_far_planes" in src
+    assert "beamng_camera_sensor_kwargs" in src
+    assert "Camera(f\"gvd_{cid}\", bng, vehicle, **kwargs)" in src
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "BeamNGpy #199" in readme or "BeamNGpy/issues/199" in readme
+    assert "narrow` 1500" in readme or "narrow 1500" in readme
+
+
+def check_beamngpy_open_passes_near_far() -> None:
+    """BeamNGPyBackend.open() constructs Camera(..., near_far_planes=(0.05, far_m)) per id."""
+    import sys
+    import types
+
+    from python.sensors.cameras import BeamNGPyBackend
+
+    captured: list[tuple[str, dict]] = []
+
+    class FakeCamera:
+        def __init__(self, name, _bng, _vehicle, **kwargs):
+            captured.append((name, kwargs))
+
+        def remove(self):
+            return None
+
+    sensors = types.ModuleType("beamngpy.sensors")
+    sensors.Camera = FakeCamera
+    beamngpy = types.ModuleType("beamngpy")
+    beamngpy.sensors = sensors
+    old = {k: sys.modules.get(k) for k in ("beamngpy", "beamngpy.sensors")}
+    sys.modules["beamngpy"] = beamngpy
+    sys.modules["beamngpy.sensors"] = sensors
+    try:
+        be = BeamNGPyBackend(
+            config=load_camera_config(),
+            tech_config={
+                "wait_vehicle_s": 0,
+                "cameras": {"attach": True, "rgb_only": True, "update_s": 0.067, "shared_memory": True, "streaming": True},
+            },
+        )
+
+        def _connect(explicit=True):
+            be.session.vehicle = object()
+            be.session.bng = object()
+            return True
+
+        be.session.connect = _connect  # type: ignore[method-assign]
+        be.session.attach_vehicle_sensors = lambda: {}  # type: ignore[method-assign]
+        be.open()
+        names = [n for n, _ in captured]
+        assert names == [f"gvd_{c}" for c in CAM_IDS], names
+        by = {n: kw for n, kw in captured}
+        assert by["gvd_narrow"]["near_far_planes"] == (0.05, 1500.0)
+        assert by["gvd_main"]["near_far_planes"] == (0.05, 800.0)
+        for cid in ("wide", "pillarL", "pillarR", "repeatL", "repeatR", "rear"):
+            assert by[f"gvd_{cid}"]["near_far_planes"] == (0.05, 200.0), cid
+            assert by[f"gvd_{cid}"]["is_render_depth"] is False
+        assert by["gvd_narrow"]["is_render_depth"] is False
+        assert be._clip_planes["narrow"] == (0.05, 1500.0)
+        assert be._ok
+    finally:
+        for k, v in old.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+
 def check_auto_backend_not_tech_without_env() -> None:
     import os
 
@@ -340,6 +490,8 @@ def main() -> None:
     check_gps_poll_and_pin()
     check_pin_env_override()
     check_poll_mock()
+    check_camera_clip_planes()
+    check_beamngpy_open_passes_near_far()
     check_auto_backend_not_tech_without_env()
     check_connect_without_beamngpy()
     check_no_chrome()

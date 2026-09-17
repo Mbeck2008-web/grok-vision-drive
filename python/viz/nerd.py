@@ -236,7 +236,10 @@ def _draw_cams_tab(
     hits.append({"kind": "cams_grid", "n": n, "rect": (PAD_X, y, w - PAD_X, y + grid_h)})
     ok_n = sum(1 for cid in CAM_IDS if str(health.get(cid) or "missing") == "ok")
     miss_n = len(CAM_IDS) - ok_n
-    foot_txt = f"{ok_n}/8 ok  {miss_n} missing" + (f"  drop<{CAMS_DROP_HZ:.0f}Hz" if dropped else "")
+    if dropped:
+        foot_txt = f"{ok_n}/8 health  blit dropped (<{CAMS_DROP_HZ:.0f} Hz)"
+    else:
+        foot_txt = f"{ok_n}/8 ok  {miss_n} missing"
     _put(img, _fit(foot_txt, w - PAD_X * 2, FS_DIM), (PAD_X, h - 16 - ROW_H), FS_DIM, DIM)
     return y + grid_h
 

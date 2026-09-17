@@ -943,7 +943,7 @@ def render_stage(
         cv2.rectangle(img, (0, 0), (STAGE_W, 22), (12, 13, 16), -1)
         cv2.putText(img, "GVD", (12, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, ICE, 1, cv2.LINE_AA)
         cv2.putText(img, "VISION", (52, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1, cv2.LINE_AA)
-        cam_lbl = f"CAMS drop<{CAMS_DROP_HZ:.0f}Hz" if drop_heavy else "CAMS 8-view"
+        cam_lbl = "CAMS dropped" if drop_heavy else "CAMS 8-view"
         cv2.putText(img, cam_lbl, (STAGE_W - 150, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
         note = scene_note(state)
         state["viz_ms"] = (time.perf_counter() - t0) * 1000.0

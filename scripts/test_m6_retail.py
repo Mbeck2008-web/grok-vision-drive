@@ -201,6 +201,21 @@ def check_window_picker_prefers_drive() -> None:
     assert _pick_best_beamng_rect([tiny, drive]) == (10, 10, 1280, 720)
 
 
+def _touch_lua_bus() -> Path:
+    """Keep a fresh lua_bus handshake at the predicted pin so cmd tests can actuate."""
+    from python.runtime import paths as gvd_paths
+
+    pin = gvd_paths.predicted_gvd_docs_path()
+    pin.mkdir(parents=True, exist_ok=True)
+    abs_pin = pin if pin.is_absolute() else pin.resolve()
+    abs_pin.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({"lua_bus": str(abs_pin)})
+    (pin / "gvd_link.json").write_text(payload, encoding="utf-8")
+    if abs_pin != pin:
+        (abs_pin / "gvd_link.json").write_text(payload, encoding="utf-8")
+    return abs_pin
+
+
 def _write_ego(
     seq: int,
     *,
@@ -211,6 +226,7 @@ def _write_ego(
     brake_in: float = 0.0,
     age_s: float = 0.0,
 ) -> None:
+    root = _touch_lua_bus()
     ego_path().write_text(
         json.dumps(
             {
@@ -221,6 +237,7 @@ def _write_ego(
                 "applied_seq": seq,
                 "applying": applying,
                 "mtime": int(time.time()),
+                "lua_bus": str(root),
             }
         ),
         encoding="utf-8",
@@ -232,6 +249,7 @@ def _write_ego(
 
 def check_cmd_json_drive_bus() -> None:
     """Retail actuator: engaged → real drive payload; disengaged → idle stop; applied only on Lua ack."""
+    _touch_lua_bus()
     if ego_path().exists():
         ego_path().unlink()
     act = make_actuator(None, prefer_beamngpy=True)
@@ -339,6 +357,7 @@ def _run_supervisor(
     """
     args = [sys.executable, "-u", str(ROOT / "python" / "run_vision.py"), "--backend", "stub", "--hz", "20", "--encode", "cpu", *extra]
     env = dict(os.environ, PYTHONPATH=str(ROOT))
+    _touch_lua_bus()
     # Never PIPE. A full pipe freezes the supervisor (engaged, cmd_json_pending), and
     # Windows TerminateProcess discards the child's unflushed stdout anyway.
     proc = subprocess.Popen(
@@ -390,9 +409,11 @@ def _run_supervisor(
 
     t_end = time.time() + seconds
     try:
+        _touch_lua_bus()
         while time.time() < t_end:
             if proc.poll() is not None:
                 raise AssertionError(f"run_vision exited early ({proc.returncode})")
+            _touch_lua_bus()
             _ack_once()
             if _try_latch():
                 break
@@ -406,6 +427,7 @@ def _run_supervisor(
         while time.time() < until:
             if proc.poll() is not None:
                 break
+            _touch_lua_bus()
             _ack_once()
             if _try_latch():
                 break
@@ -428,6 +450,7 @@ def _run_supervisor(
 
 def check_run_vision_e2e() -> None:
     """Supervisor loop end-to-end (stub cameras): engaged writes drive cmds, disengaged writes idle stops."""
+    _touch_lua_bus()
     write_engage_flag(False)
     if ego_path().exists():
         ego_path().unlink()
@@ -468,6 +491,7 @@ def check_run_vision_e2e() -> None:
 
 def check_ffb_override_live() -> None:
     """Whole loop with a wheel on the echo: chatter keeps driving, a real driver gets the car."""
+    _touch_lua_bus()
     if ego_path().exists():
         ego_path().unlink()
 

@@ -1323,17 +1323,20 @@ local function writeEgoFile()
     if okd then dirJson = jsonVec3(dir) end
   end
   local np = math.floor(tonumber(egoFb.nPlayer) or 0)
+  local bus = tostring(luaBusPath()):gsub('"', '')
   local payload = string.format(
     '{"speed_mps":%.3f,"steering_input":%.4f,"throttle_input":%.4f,"brake_input":%.4f,'
       .. '"applied_seq":%d,"applying":%s,"mtime":%d,'
       .. '"gx":%s,"gy":%s,"gz":%s,"yaw_rate":%s,"pos":%s,"dir":%s,'
-      .. '"player_device":%s,"player_steering":%.4f,"player_throttle":%.4f,"player_brake":%.4f}',
+      .. '"player_device":%s,"player_steering":%.4f,"player_throttle":%.4f,"player_brake":%.4f,'
+      .. '"lua_bus":"%s"}',
     egoFb.speed, egoFb.steer, egoFb.throttle, egoFb.brake,
     math.floor(tonumber(lastAppliedSeq) or -1), applying and 'true' or 'false', os.time(),
     jsonNum(egoFb.gx), jsonNum(egoFb.gy), jsonNum(egoFb.gz), jsonNum(egoFb.yawRate, '%.5f'),
     posJson, dirJson,
     np > 0 and 'true' or 'false',
-    tonumber(egoFb.pSteer) or 0, tonumber(egoFb.pThr) or 0, tonumber(egoFb.pBrk) or 0)
+    tonumber(egoFb.pSteer) or 0, tonumber(egoFb.pThr) or 0, tonumber(egoFb.pBrk) or 0,
+    bus)
   writeText(gvdFile('gvd_ego.json'), payload)
 end
 
@@ -1840,11 +1843,14 @@ local function tickPush(dt)
 end
 
 local function tickBusIdentity(dt)
+  -- Publish getUserPath()/Documents/GVD every tick so Python follows Lua, not LOCALAPPDATA.
+  -- VFS write only. Never a bus read/write path via absolute io.
+  local bus = luaBusPath()
+  writeText(gvdFile('gvd_link.json'), '{"lua_bus":"' .. tostring(bus):gsub('"', '') .. '"}')
   identAcc = identAcc + (dt or 0)
   if identAcc < 1.0 then return end
   identAcc = 0
   -- bus= is the physical folder VFS Documents/GVD maps to (getUserPath). Reads stay VFS-only.
-  local bus = luaBusPath()
   local raw = readText(STATE_REL)
   local exists = raw and raw ~= ''
   local mt = '--'

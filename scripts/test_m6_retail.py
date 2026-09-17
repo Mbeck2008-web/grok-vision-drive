@@ -545,6 +545,8 @@ def check_lua_harness() -> None:
             assert res.returncode == 0 and "test_m6_lua_cmd: OK" in res.stdout, res.stdout + res.stderr
             bind = subprocess.run([exe, "scripts/test_gvd_bind_reload.lua"], cwd=str(ROOT), capture_output=True, text=True, timeout=60)
             assert bind.returncode == 0 and "test_gvd_bind_reload: OK" in bind.stdout, bind.stdout + bind.stderr
+            docs = subprocess.run([exe, "scripts/test_gvd_docs_dir.lua"], cwd=str(ROOT), capture_output=True, text=True, timeout=30)
+            assert docs.returncode == 0 and "test_gvd_docs_dir: OK" in docs.stdout, docs.stdout + docs.stderr
             return
     print("  (lua interpreter not found — scripts/test_m6_lua_cmd.lua skipped)")
 
@@ -565,6 +567,15 @@ def check_engage_path_contract() -> None:
     assert read_engage_flag(default=True) is False
     write_engage_flag(False)
     assert json.loads(p.read_text(encoding="utf-8"))["disengage_reason"] == "none"
+
+
+def check_gvd_docs_dir() -> None:
+    """Lua + Python share USERPROFILE/Documents/GVD; LINKED is gvd_state HB only."""
+    import test_gvd_docs_dir as docs_dir
+
+    lua = (ROOT / "beamng_mod" / "lua" / "ge" / "extensions" / "gvd" / "main.lua").read_text(encoding="utf-8")
+    docs_dir.check_source_contracts(lua)
+    docs_dir.check_python_mirror()
 
 
 def _py_string_literals(path: Path) -> list[str]:
@@ -641,6 +652,7 @@ def main() -> None:
     check_window_picker_prefers_drive()
     check_cmd_json_drive_bus()
     check_engage_path_contract()
+    check_gvd_docs_dir()
     check_no_chrome()
     check_player_docs()
     check_lua_harness()

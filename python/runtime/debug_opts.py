@@ -1,4 +1,4 @@
-"""Session debug knobs for the GVD VISION nerd DRIVE tab.
+"""Session debug knobs for the GVD VISION nerd DRIVE / VIZ / MODEL / CAMS tabs.
 
 These mutate the live supervisor: gates, actuator channels, AEB/CIPV, perception.
 They do not invent cameras or feed LiDAR into the planner. Sim toy only.
@@ -13,6 +13,19 @@ from python.control.actuate import DriveCommand
 from python.runtime.models import cycle_id
 
 POLICIES = ("session", "modular", "e2e", "shadow")
+
+# Nerd panel tabs, cycle order for [ ] / Tab. Cabin / LIVE stays the default view.
+NERD_TABS: tuple[tuple[str, str], ...] = (
+    ("live", "LIVE"),
+    ("drive", "DRIVE"),
+    ("viz", "VIZ"),
+    ("model", "MODEL"),
+    ("cams", "CAMS"),
+    ("keys", "KEYS"),
+)
+NERD_TAB_IDS: tuple[str, ...] = tuple(tid for tid, _lbl in NERD_TABS)
+# CAMS grid / camera strip / PIP skip the blit under this loop rate (tiles stay labelled).
+CAMS_DROP_HZ = 8.0
 
 # Rows drawn on the DRIVE tab, in order. kind=header is a label, not a control.
 DEBUG_ROWS: tuple[dict[str, Any], ...] = (
@@ -176,7 +189,13 @@ VIZ_ROWS: tuple[dict[str, Any], ...] = (
     {"id": "viz_more", "kind": "header", "label": "ANNOTATION"},
     {"id": "viz_ids", "kind": "bool", "label": "track ids", "attr": "viz_ids"},
     {"id": "viz_vel", "kind": "bool", "label": "velocity ticks", "attr": "viz_vel"},
-    {"id": "viz_cams", "kind": "bool", "label": "camera strip", "attr": "viz_cams"},
+    {
+        "id": "viz_cams",
+        "kind": "bool",
+        "label": "camera strip",
+        "attr": "viz_cams",
+        "hint": "tiny bottom row; A / CAMS tab is the 8-view wall",
+    },
 )
 
 # Nerd MODEL tab: cycle nets that are actually loadable (scan models/). Always

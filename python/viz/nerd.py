@@ -1,4 +1,4 @@
-"""Monospace nerd overlay (toggle V). Tabs: LIVE telemetry / DRIVE / VIZ / MODEL / keys."""
+"""Monospace nerd overlay (toggle V). Tabs: LIVE / DRIVE / VIZ / MODEL / CAMS / keys."""
 
 from __future__ import annotations
 
@@ -7,7 +7,9 @@ from typing import Any
 import cv2
 import numpy as np
 
-from python.runtime.debug_opts import DEBUG_ROWS, MODEL_ROWS, VIZ_ROWS, DebugOpts
+from python.runtime.debug_opts import CAMS_DROP_HZ, DEBUG_ROWS, MODEL_ROWS, NERD_TABS, VIZ_ROWS, DebugOpts
+from python.sensors.cameras import CAM_IDS
+from python.viz.debug_draw import draw_cam_tiles
 
 BG = (16, 13, 12)
 FG = (212, 204, 200)
@@ -97,6 +99,7 @@ def render_panel(
     w: int = NERD_WIDTH,
     show_help: bool = False,
     ui: Any = None,
+    cam_frames: dict[str, Any] | None = None,
 ) -> np.ndarray:
     img = np.full((h, w, 3), BG, dtype=np.uint8)
     tab = "keys" if show_help else "live"
@@ -145,6 +148,8 @@ def render_panel(
             img, opts, model_sel, y + 8, h, w, hits, MODEL_ROWS,
             intro="YOLOv8 detect / E2E in models/; lanes stay Hough",
         )
+    elif tab == "cams":
+        y = _draw_cams_tab(img, state, y + 8, h, w, hits, cam_frames=cam_frames)
     else:
         y += 10
         for line in _lines(state):
@@ -153,7 +158,7 @@ def render_panel(
             y += ROW_H
             if y > live_limit:
                 break
-    _put(img, _fit("D drive  G viz  M model  [ ] tab  V hide", w - 24, FS_DIM), (12, h - 16), FS_DIM, DIM)
+    _put(img, _fit("D drive  G viz  M model  A cams  [ ] tab  V hide", w - 24, FS_DIM), (12, h - 16), FS_DIM, DIM)
     if ui is not None:
         ui.nerd_hits = hits
         ui.nerd_tab = tab
@@ -163,19 +168,77 @@ def render_panel(
 def _draw_tabs(
     img: np.ndarray, tab: str, w: int, y: int, hits: list[dict[str, Any]]
 ) -> int:
-    labels = (("live", "LIVE"), ("drive", "DRIVE"), ("viz", "VIZ"), ("model", "MODEL"), ("keys", "KEYS"))
+    labels = NERD_TABS
     x = 12
+    row_y = y
+    last_bottom = y + TAB_H
     for tid, label in labels:
         tw, _th = _text_size(label, FS_TAB)
-        rect = (x, y, x + tw + 18, y + TAB_H)
+        box_w = tw + 18
+        if x + box_w > w - 8 and x > 12:
+            x = 12
+            row_y = last_bottom + 6
+        rect = (x, row_y, x + box_w, row_y + TAB_H)
         on = tid == tab
         bg = ICE if on else (40, 36, 34)
         fg = (16, 13, 12) if on else FG
         cv2.rectangle(img, (rect[0], rect[1]), (rect[2], rect[3]), bg, -1)
-        _put(img, label, (x + 8, y + TAB_H - 10), FS_TAB, fg)
+        _put(img, label, (x + 8, row_y + TAB_H - 10), FS_TAB, fg)
         hits.append({"kind": "tab", "id": tid, "rect": rect})
         x += tw + 26
-    return y + TAB_H + 8
+        last_bottom = row_y + TAB_H
+    return last_bottom + 8
+
+
+def _cams_dropped(state: dict[str, Any]) -> bool:
+    try:
+        hz = float(state.get("loop_hz") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return hz > 0 and hz < CAMS_DROP_HZ
+
+
+def _draw_cams_tab(
+    img: np.ndarray,
+    state: dict[str, Any],
+    y0: int,
+    h: int,
+    w: int,
+    hits: list[dict[str, Any]],
+    cam_frames: dict[str, Any] | None = None,
+) -> int:
+    """Nerd CAMS body: ≤8 honest tiles + health. Empty slots stay labelled."""
+    y = y0
+    dropped = _cams_dropped(state)
+    intro = (
+        f"grid dropped (loop < {CAMS_DROP_HZ:.0f} Hz) -- slots stay labelled"
+        if dropped
+        else "8 slots -- missing stays labelled; attach-only (no engage)"
+    )
+    _put(img, _fit(intro, w - PAD_X * 2, FS_DIM), (PAD_X, y), FS_DIM, DIM)
+    y += ROW_H
+    health = state.get("cam_health") if isinstance(state.get("cam_health"), dict) else {}
+    foot = ROW_H * 2 + 8
+    grid_h = max(72, h - y - foot)
+    n = draw_cam_tiles(
+        img,
+        cam_frames,
+        health,
+        x0=PAD_X,
+        y0=y,
+        width=max(8, w - PAD_X * 2),
+        height=grid_h,
+        cols=2,
+        rows=4,
+        ids=CAM_IDS,
+        dropped=dropped,
+    )
+    hits.append({"kind": "cams_grid", "n": n, "rect": (PAD_X, y, w - PAD_X, y + grid_h)})
+    ok_n = sum(1 for cid in CAM_IDS if str(health.get(cid) or "missing") == "ok")
+    miss_n = len(CAM_IDS) - ok_n
+    foot_txt = f"{ok_n}/8 ok  {miss_n} missing" + (f"  drop<{CAMS_DROP_HZ:.0f}Hz" if dropped else "")
+    _put(img, _fit(foot_txt, w - PAD_X * 2, FS_DIM), (PAD_X, h - 16 - ROW_H), FS_DIM, DIM)
+    return y + grid_h
 
 
 def _draw_knob_tab(
@@ -282,7 +345,8 @@ def _help_lines() -> list[str]:
         "  D  DRIVE tab (gates / actuators / AEB)",
         "  G  VIZ tab (overlay layers)",
         "  M  MODEL tab (detector / e2e nets)",
-        "  [ ] cycle LIVE / DRIVE / VIZ / MODEL / KEYS",
+        "  A  CAMS tab (8 camera views; missing stays labelled)",
+        "  [ ] cycle LIVE / DRIVE / VIZ / MODEL / CAMS / KEYS",
         "  j/k  select row   h/l nudge",
         "  Enter / click  toggle",
         "  0  clean cabin (stage only)",
@@ -295,6 +359,7 @@ def _help_lines() -> list[str]:
         "  C  manual clip",
         "  q  quit",
         "",
+        "CAMS / camera strip drop the blit under 8 Hz (tiles stay labelled).",
         "DRIVE writes the command this tick.",
         "force engage is debug-only. Sim toy.",
     ]

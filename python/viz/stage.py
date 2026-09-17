@@ -16,9 +16,11 @@ import cv2
 import numpy as np
 
 from python.runtime.debug_opts import (
+    CAMS_DROP_HZ,
     CONTROL_ROWS,
     LAYER_ATTR,
     MODEL_CONTROL_ROWS,
+    NERD_TAB_IDS,
     VIZ_CONTROL_ROWS,
     DebugOpts,
     control_index,
@@ -29,7 +31,9 @@ from python.runtime.debug_opts import (
     viz_row_at,
 )
 from python.viz.debug_draw import (
+    clamp_front_overexpose,
     draw_cam_strip,
+    draw_cam_tiles,
     draw_dense_hud,
     draw_frustums,
     draw_lane_polys,
@@ -60,6 +64,9 @@ MAX_FORECAST = 16
 STAGE_W, STAGE_H = 1280, 800
 PATH_FADE_START_M = 25.0
 PATH_FADE_END_M = 42.0
+# CAMS tab 4×2 wall on the stage (nerd panel has its own 2×4).
+CAMS_STAGE_BOX = (12, 28, STAGE_W - 24, STAGE_H - 40)
+CAMS_STAGE_GRID = (4, 2)
 
 
 @dataclass
@@ -68,7 +75,7 @@ class VizUI:
     show_help: bool = False
     layers: set[int] = field(default_factory=set)
     top_down: bool = False  # default = chase 3/4 bird; T toggles BEV
-    nerd_tab: str = "live"  # live | drive | viz | model | keys
+    nerd_tab: str = "live"  # live | drive | viz | model | cams | keys
     debug: DebugOpts = field(default_factory=DebugOpts)
     debug_sel: int = 0
     viz_sel: int = 0
@@ -100,8 +107,13 @@ class VizUI:
         self.show_help = False
         self.show_nerd = True
 
+    def show_cams_tab(self) -> None:
+        self.nerd_tab = "cams"
+        self.show_help = False
+        self.show_nerd = True
+
     def cycle_tab(self, delta: int = 1) -> None:
-        tabs = ("live", "drive", "viz", "model", "keys")
+        tabs = NERD_TAB_IDS
         cur = self.nerd_tab if self.nerd_tab in tabs else "live"
         self.nerd_tab = tabs[(tabs.index(cur) + delta) % len(tabs)]
         self.show_help = self.nerd_tab == "keys"
@@ -140,6 +152,9 @@ class VizUI:
             return True
         if key in (ord("m"), ord("M")):
             self.show_model_tab()
+            return True
+        if key in (ord("a"), ord("A")):
+            self.show_cams_tab()
             return True
         if key == ord("["):
             self.cycle_tab(-1)
@@ -461,11 +476,12 @@ def lead_track(tracks: list[dict[str, Any]], cipv_id: int | None) -> dict[str, A
 
 
 def _drop_heavy(state: dict[str, Any]) -> bool:
+    """Under 8 Hz: drop fans, signs, PIP blit, camera strip, CAMS grid blit (tiles stay labelled)."""
     try:
         hz = float(state.get("loop_hz") or 0.0)
     except (TypeError, ValueError):
         return False
-    return hz > 0 and hz < 8.0
+    return hz > 0 and hz < CAMS_DROP_HZ
 
 
 def _allow_stub(state: dict[str, Any]) -> bool:
@@ -909,6 +925,36 @@ def render_stage(
     img = np.full((STAGE_H, STAGE_W, 3), VOID, dtype=np.uint8)
 
     drop_heavy = _drop_heavy(state)
+    health = state.get("cam_health") if isinstance(state.get("cam_health"), dict) else None
+    cams_tab = (not clean) and ui.nerd_tab == "cams"
+    if cams_tab:
+        draw_cam_tiles(
+            img,
+            cam_frames,
+            health,
+            x0=CAMS_STAGE_BOX[0],
+            y0=CAMS_STAGE_BOX[1],
+            width=CAMS_STAGE_BOX[2],
+            height=CAMS_STAGE_BOX[3],
+            cols=CAMS_STAGE_GRID[0],
+            rows=CAMS_STAGE_GRID[1],
+            dropped=drop_heavy,
+        )
+        cv2.rectangle(img, (0, 0), (STAGE_W, 22), (12, 13, 16), -1)
+        cv2.putText(img, "GVD", (12, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, ICE, 1, cv2.LINE_AA)
+        cv2.putText(img, "VISION", (52, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1, cv2.LINE_AA)
+        cam_lbl = f"CAMS drop<{CAMS_DROP_HZ:.0f}Hz" if drop_heavy else "CAMS 8-view"
+        cv2.putText(img, cam_lbl, (STAGE_W - 150, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
+        note = scene_note(state)
+        state["viz_ms"] = (time.perf_counter() - t0) * 1000.0
+        state["viz_scene_note"] = note
+        if ui.show_nerd:
+            panel = render_panel(
+                state, h=STAGE_H, w=ui.nerd_width, show_help=ui.show_help, ui=ui, cam_frames=cam_frames,
+            )
+            return np.concatenate([img, panel], axis=1)
+        return img
+
     engaged = bool(state.get("engaged"))
     smoke = _allow_stub(state)
     path = list(state.get("path_ego") or [])
@@ -981,8 +1027,9 @@ def render_stage(
 
     if main_frame is not None and getattr(main_frame, "size", 0) and not drop_heavy and dbg.viz_pip:
         pip = np.full((180, 320, 3), (28, 28, 28), dtype=np.uint8)
+        pip_src = clamp_front_overexpose(main_frame, "main")
         try:
-            pip = cv2.resize(main_frame, (320, 180), interpolation=cv2.INTER_AREA)
+            pip = cv2.resize(pip_src if pip_src is not None else main_frame, (320, 180), interpolation=cv2.INTER_AREA)
         except Exception:
             pass
         if (not clean) and dbg.viz_boxes and dets:
@@ -996,10 +1043,11 @@ def render_stage(
         img[12:192, 12:332] = pip
         cv2.rectangle(img, (12, 12), (332, 192), ICE, 1)
 
-    if (not clean) and dbg.viz_cams and not drop_heavy:
+    if (not clean) and dbg.viz_cams:
+        # Under 8 Hz keep labelled slots; skip the blit inside draw_cam_tiles.
         strip_top = draw_cam_strip(
-            img, cam_frames, state.get("cam_health") if isinstance(state.get("cam_health"), dict) else None,
-            stage_w=STAGE_W, stage_h=STAGE_H,
+            img, cam_frames, health,
+            stage_w=STAGE_W, stage_h=STAGE_H, dropped=drop_heavy,
         )
         hud_pad = STAGE_H - strip_top + 6
     else:
@@ -1019,7 +1067,9 @@ def render_stage(
     state["viz_ms"] = (time.perf_counter() - t0) * 1000.0
     state["viz_scene_note"] = note
     if ui.show_nerd and not clean:
-        panel = render_panel(state, h=STAGE_H, w=ui.nerd_width, show_help=ui.show_help, ui=ui)
+        panel = render_panel(
+            state, h=STAGE_H, w=ui.nerd_width, show_help=ui.show_help, ui=ui, cam_frames=cam_frames,
+        )
         return np.concatenate([img, panel], axis=1)
     return img
 

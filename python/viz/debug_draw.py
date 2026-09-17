@@ -15,6 +15,12 @@ import numpy as np
 
 from python.sensors.cameras import CAM_IDS
 
+# Windshield cluster — Tech attach can blow these white; side/rear stay as-is.
+FRONT_CAM_IDS = frozenset({"narrow", "main", "wide", "cam_main"})
+CAM_TILE_GAP = 4
+_OVEREXPOSE_MEAN = 165.0
+_OVEREXPOSE_TARGET = 140.0
+
 OCC = (88, 86, 196)
 FREE = (120, 150, 92)
 FOV = (168, 156, 120)
@@ -212,6 +218,167 @@ def draw_pip_boxes(pip: np.ndarray, dets: list[dict[str, Any]], src_wh: tuple[in
             cv2.putText(pip, cls, (p1[0], max(12, p1[1] - 3)), cv2.FONT_HERSHEY_SIMPLEX, 0.32, PAPER, 1, cv2.LINE_AA)
 
 
+def clamp_front_overexpose(frame: np.ndarray | None, cid: str = "main") -> np.ndarray | None:
+    """Scale down blown-white Tech front previews. Side/rear and missing feeds are untouched."""
+    if frame is None or not getattr(frame, "size", 0):
+        return frame
+    key = "main" if cid == "cam_main" else str(cid or "main")
+    if key not in FRONT_CAM_IDS:
+        return frame
+    if not isinstance(frame, np.ndarray) or frame.ndim != 3 or frame.shape[2] < 3:
+        return frame
+    mean = float(frame.mean())
+    if mean <= _OVEREXPOSE_MEAN:
+        return frame
+    scale = _OVEREXPOSE_TARGET / mean
+    return np.clip(frame.astype(np.float32) * scale, 0, 255).astype(np.uint8)
+
+
+def cam_frame_for(frames: dict[str, Any] | None, cid: str) -> Any:
+    """Look up one slot. `main` also accepts `cam_main`. Never synthesizes a missing feed."""
+    if not frames:
+        return None
+    frame = frames.get(cid)
+    if cid == "main" and (frame is None or not getattr(frame, "size", 0)):
+        frame = frames.get("cam_main")
+    return frame
+
+
+def cam_tile_rects(
+    x0: int,
+    y0: int,
+    width: int,
+    height: int,
+    cols: int,
+    rows: int,
+    *,
+    gap: int = CAM_TILE_GAP,
+) -> list[tuple[int, int, int, int]]:
+    """(x, y, w, h) for a cols×rows grid. Caller paints at most 8 slots."""
+    cols = max(1, int(cols))
+    rows = max(1, int(rows))
+    gap = max(0, int(gap))
+    slot_w = max(1, (int(width) - gap * (cols - 1)) // cols)
+    slot_h = max(1, (int(height) - gap * (rows - 1)) // rows)
+    out: list[tuple[int, int, int, int]] = []
+    for r in range(rows):
+        for c in range(cols):
+            x = int(x0) + c * (slot_w + gap)
+            y = int(y0) + r * (slot_h + gap)
+            out.append((x, y, slot_w, slot_h))
+    return out
+
+
+def _paint_cam_tile(
+    slot_w: int,
+    slot_h: int,
+    cid: str,
+    frame: Any,
+    status: str,
+    *,
+    dropped: bool,
+) -> tuple[np.ndarray, str, bool]:
+    """Build one tile. Missing/dropped stay labelled; never invents pixels from another cam."""
+    tile = np.full((slot_h, slot_w, 3), (22, 20, 18), dtype=np.uint8)
+    has = frame is not None and getattr(frame, "size", 0)
+    ok = False
+    if dropped:
+        label = "dropped" if has else "missing"
+    elif has:
+        try:
+            src = clamp_front_overexpose(frame, cid)
+            if src is None or not getattr(src, "size", 0):
+                label = str(status or "missing")
+            else:
+                tile = cv2.resize(src, (slot_w, slot_h), interpolation=cv2.INTER_AREA)
+                ok = True
+                label = str(status or "ok")
+        except Exception:
+            label = str(status or "error")
+    else:
+        label = str(status or "missing")
+        if label == "ok":
+            label = "missing"
+    return tile, label, ok
+
+
+def draw_cam_tiles(
+    img: np.ndarray,
+    frames: dict[str, Any] | None,
+    health: dict[str, Any] | None,
+    *,
+    x0: int,
+    y0: int,
+    width: int,
+    height: int,
+    cols: int = 4,
+    rows: int = 2,
+    ids: tuple[str, ...] | None = None,
+    dropped: bool = False,
+) -> int:
+    """Paint ≤8 honest camera tiles. Empty slots stay labelled; a slow loop may skip the blit.
+
+    Returns how many slots were drawn. Never raises on a bad/missing frame.
+    """
+    health = health or {}
+    ids = tuple(ids or CAM_IDS)[:8]
+    rects = cam_tile_rects(x0, y0, width, height, cols, rows)
+    ih, iw = img.shape[:2]
+    n = 0
+    for cid, rect in zip(ids, rects):
+        x, y, slot_w, slot_h = rect
+        x2 = min(iw, x + slot_w)
+        y2 = min(ih, y + slot_h)
+        if x >= iw or y >= ih or x2 <= max(0, x) or y2 <= max(0, y):
+            continue
+        x = max(0, x)
+        y = max(0, y)
+        tw, th = x2 - x, y2 - y
+        status = str(health.get(cid) or "")
+        raw = cam_frame_for(frames, cid)
+        tile, label, ok = _paint_cam_tile(tw, th, cid, raw, status, dropped=dropped)
+        fs_id = 0.28 if th < 80 else 0.45
+        fs_st = 0.32 if th < 80 else 0.50
+        live = ok and label == "ok"
+        if not ok:
+            cv2.putText(
+                tile,
+                label[:10],
+                (6, th // 2 + 4),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                fs_st,
+                HUD_DIM,
+                1,
+                cv2.LINE_AA,
+            )
+        cv2.putText(
+            tile,
+            cid[:8],
+            (4, 12 if th < 80 else 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            fs_id,
+            PAPER if live else HUD_DIM,
+            1,
+            cv2.LINE_AA,
+        )
+        if ok and label not in ("ok",) and th >= 80:
+            cv2.putText(
+                tile,
+                label[:10],
+                (4, th - 8),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.36,
+                HUD_DIM,
+                1,
+                cv2.LINE_AA,
+            )
+        img[y:y2, x:x2] = tile
+        border = ICE_HI if live else (50, 46, 44)
+        cv2.rectangle(img, (x, y), (x2 - 1, y2 - 1), border, 1)
+        n += 1
+    return n
+
+
 def draw_cam_strip(
     img: np.ndarray,
     frames: dict[str, Any] | None,
@@ -220,37 +387,31 @@ def draw_cam_strip(
     stage_w: int,
     stage_h: int,
     y0: int | None = None,
+    dropped: bool = False,
 ) -> int:
     """Row of tiny camera tiles along the bottom — missing feeds stay labelled missing.
 
-    Returns the top y of the strip so the HUD can sit above it.
+    Returns the top y of the strip so the HUD can sit above it. Under 8 Hz the caller
+    should pass dropped=True (or skip the strip); labelled slots still render.
     """
-    frames = frames or {}
-    health = health or {}
     n = len(CAM_IDS)
     slot_w = min(150, max(72, (stage_w - 24) // n))
     slot_h = 64
     if y0 is None:
         y0 = stage_h - slot_h - 8
-    x = 12
-    for cid in CAM_IDS:
-        frame = frames.get(cid) if cid != "main" else (frames.get("main") or frames.get("cam_main"))
-        tile = np.full((slot_h, slot_w, 3), (22, 20, 18), dtype=np.uint8)
-        ok = False
-        if frame is not None and getattr(frame, "size", 0):
-            try:
-                tile = cv2.resize(frame, (slot_w, slot_h), interpolation=cv2.INTER_AREA)
-                ok = True
-            except Exception:
-                ok = False
-        status = str(health.get(cid) or ("ok" if ok else "missing"))
-        if not ok:
-            cv2.putText(tile, "missing", (6, slot_h // 2 + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.32, HUD_DIM, 1, cv2.LINE_AA)
-        cv2.putText(tile, cid[:8], (4, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.28, PAPER if ok else HUD_DIM, 1, cv2.LINE_AA)
-        img[y0 : y0 + slot_h, x : x + slot_w] = tile
-        border = ICE_HI if status == "ok" else (50, 46, 44)
-        cv2.rectangle(img, (x, y0), (x + slot_w - 1, y0 + slot_h - 1), border, 1)
-        x += slot_w + 2
+    draw_cam_tiles(
+        img,
+        frames,
+        health,
+        x0=12,
+        y0=y0,
+        width=n * (slot_w + 2) - 2,
+        height=slot_h,
+        cols=n,
+        rows=1,
+        ids=CAM_IDS,
+        dropped=dropped,
+    )
     return y0
 
 

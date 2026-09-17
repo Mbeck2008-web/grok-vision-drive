@@ -82,8 +82,11 @@ end
 
 
 
--- Resolve Documents/GVD without relying on USERPROFILE (empty in GELua on some Windows builds).
--- Live bug: bare gvd_engage.json landed under BeamNG userfolder current\, Python read Documents\GVD\.
+-- Resolve Documents/GVD so Lua + Python share %USERPROFILE%/Documents/GVD (state/engage/cmd).
+-- Prefer USERPROFILE, then HOME, then LOCALAPPDATA / FS paths stripped to the user profile.
+-- GELua often has empty USERPROFILE; BeamNG's userfolder commonly lives under Documents
+-- (or AppData). Strip those parents — never write bare gvd_*.json under userfolder current\.
+-- CEF Apps LINKED is gvd_state heartbeat only (see linkState); gvd_ego.json is not required.
 local gvdDocsResolved = nil
 local gvdDocsLogged = false
 
@@ -93,10 +96,15 @@ local function _stripToUserHome(p)
   -- C:/Users/Name/AppData/Local/... → C:/Users/Name
   local home = p:match('^(.+)/AppData/Local') or p:match('^(.+)/AppData/Roaming') or p:match('^(.+)/AppData')
   if home and home ~= '' then return home end
+  -- C:/Users/Name/Documents/... or .../Documents/BeamNG.drive/... → C:/Users/Name
+  -- Non-greedy so the first /Documents/ parent wins (Users/Name), not a nested copy under current\.
+  home = p:match('^(.-)/Documents/') or p:match('^(.-)/Documents$')
+  if home and home ~= '' then return home end
   return nil
 end
 
 local function _tryHomeEnv()
+  -- USERPROFILE first (matches Python os.path.expanduser("~") on Windows), then HOME.
   local home = os.getenv('USERPROFILE') or os.getenv('HOME')
   if home and home ~= '' then return home end
   local localApp = os.getenv('LOCALAPPDATA')
@@ -161,6 +169,7 @@ local function gvdDocsDir()
 end
 
 local function gvdFile(name)
+  -- Always join under the resolved Documents/GVD dir — never a bare gvd_*.json.
   return gvdDocsDir() .. '/' .. name
 end
 

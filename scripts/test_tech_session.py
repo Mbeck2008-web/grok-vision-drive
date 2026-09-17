@@ -11,31 +11,40 @@ sys.path.insert(0, str(ROOT))
 
 from python.sensors.cameras import (  # noqa: E402
     CAM_IDS,
+    CAMERA_HZ_TARGET,
     DEFAULT_FAR_M,
     DEFAULT_NEAR_M,
     DEFAULT_UPDATE_PRIORITY,
     DEFAULT_UPDATE_S,
     FORWARD_CAM_IDS,
+    LIVE_NARROW_HITCH_AFTER_S,
     NARROW_FAR_LIVE_HITCH_M,
     NARROW_GRAB_DIV,
     ON_DEMAND_UPDATE_S,
     REAR_CAM_IDS,
     REAR_GRAB_DIV,
+    REAR_GRAB_PHASE,
     SIDE_CAM_IDS,
     SIDE_GRAB_DIV,
+    SIDE_GRAB_PHASE,
     WIDE_GRAB_DIV,
     beamng_camera_sensor_kwargs,
     camera_clip_planes,
     camera_grab_div,
+    camera_grab_due,
     camera_grab_phase,
     camera_update_priority,
     camera_update_s,
     colour_to_bgr,
     far_hitch_ladder,
     grab_due,
+    invert_update_priority,
     iter_clip_attach_attempts,
+    live_narrow_far_m,
     load_camera_config,
+    priority_highest_is_zero,
     read_camera_colour,
+    read_camera_update_priority,
     resolve_backend_name,
     yaw_pitch_to_dir_up,
 )
@@ -126,6 +135,8 @@ def check_tech_yaml() -> None:
     assert int(hitch.get("narrow_grab_div")) != 4
     assert int(hitch.get("narrow_grab_phase")) == 1
     assert int(hitch.get("wide_grab_phase")) == 0
+    assert int(hitch.get("side_grab_phase")) == SIDE_GRAB_PHASE
+    assert int(hitch.get("rear_grab_phase")) == REAR_GRAB_PHASE
     for cid in ("pillarL", "pillarR", "repeatL", "repeatR"):
         assert float(by_id[cid]["far_m"]) == 100, cid
         assert float(by_id[cid]["requested_update_time"]) < 0, cid
@@ -141,6 +152,8 @@ def check_tech_yaml() -> None:
     assert camera_grab_div("narrow", hitch) == 2
     assert camera_grab_phase("wide", hitch) == 0
     assert camera_grab_phase("narrow", hitch) == 1
+    assert camera_grab_phase("pillarL", hitch) == SIDE_GRAB_PHASE
+    assert camera_grab_phase("rear", hitch) == REAR_GRAB_PHASE
     assert abs(float(by_id["main"].get("update_priority", 0)) - 0.0) < 1e-9
     assert float(by_id["narrow"].get("update_priority", 0)) > float(by_id["main"].get("update_priority", 0))
     assert float(by_id["pillarL"].get("update_priority", 0)) >= float(by_id["narrow"].get("update_priority", 0))
@@ -433,6 +446,8 @@ def check_camera_clip_planes() -> None:
     assert far_hitch_ladder("narrow", 100.0) == (800.0,)
 
     assert camera_grab_div("main") == 1
+    assert camera_grab_div("main", {"main_grab_div": 4}) == 1  # clamped every-tick
+    assert camera_grab_div("main", {"main_grab_div": 2}) == 1
     assert camera_grab_div("wide") == 2
     assert camera_grab_div("narrow") == 2
     assert camera_grab_div("narrow", {"narrow_grab_div": 4}) == 3  # never ÷4
@@ -442,6 +457,41 @@ def check_camera_clip_planes() -> None:
     assert camera_grab_div("rear", {"rear_grab_div": 4, "side_grab_div": 2}) == 4
     assert grab_due(0, 2, 0) and not grab_due(1, 2, 0)
     assert grab_due(1, 2, 1) and not grab_due(0, 2, 1)
+    hitch = load_camera_config().get("hitch") or {}
+    for i in range(32):
+        assert not (
+            camera_grab_due("wide", i, hitch) and camera_grab_due("narrow", i, hitch)
+        ), i
+        if i % 2 == 0:
+            assert camera_grab_due("main", i, hitch)
+            assert camera_grab_due("wide", i, hitch)
+            assert not camera_grab_due("narrow", i, hitch)
+            for sid in SIDE_CAM_IDS | REAR_CAM_IDS:
+                assert not camera_grab_due(sid, i, hitch), (sid, i)
+        else:
+            assert camera_grab_due("narrow", i, hitch)
+            assert not camera_grab_due("wide", i, hitch)
+    assert camera_grab_due("main", 0, hitch) and camera_grab_due("wide", 0, hitch)
+    hitch3 = dict(hitch)
+    hitch3["narrow_grab_div"] = 3
+    n3 = 0
+    for i in range(24):
+        w = camera_grab_due("wide", i, hitch3)
+        n = camera_grab_due("narrow", i, hitch3)
+        assert not (w and n), i
+        if n:
+            n3 += 1
+            assert not w
+    assert n3 == 8  # 2 per 6 ticks = ÷3, misses wide even
+    assert CAMERA_HZ_TARGET == 10.0
+    assert invert_update_priority(0.0) == 1.0
+    assert live_narrow_far_m(4.0, 800.0, elapsed_s=0.0, unique_n=10) == 800.0  # warmup
+    assert live_narrow_far_m(4.0, 800.0, elapsed_s=LIVE_NARROW_HITCH_AFTER_S, unique_n=10) == NARROW_FAR_LIVE_HITCH_M
+    assert live_narrow_far_m(12.0, 800.0, elapsed_s=LIVE_NARROW_HITCH_AFTER_S, unique_n=10) == 800.0
+    assert NARROW_FAR_LIVE_HITCH_M == 400.0
+    assert NARROW_FAR_LIVE_HITCH_M >= 300.0
+    assert far_hitch_ladder("narrow", 800.0, unique_hz=4.0) == (800.0, NARROW_FAR_LIVE_HITCH_M)
+    assert far_hitch_ladder("narrow", 800.0, unique_hz=12.0) == (800.0,)
 
     assert abs(camera_update_priority({"id": "main"}, cid="main") - 0.0) < 1e-9
     assert camera_update_priority({"id": "narrow"}, cid="narrow") > camera_update_priority({"id": "main"}, cid="main")
@@ -500,16 +550,30 @@ def check_camera_clip_planes() -> None:
     assert "stream_raw" in src
     assert "read_camera_colour" in src
     assert "poll_camera_colour" not in src
+    assert "NARROW_FAR_LIVE_HITCH_M" in src
+    assert "live_narrow_far_m" in src
+    assert "unique_gpu_n" in src
     rv = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
     assert "loop_hz=args.hz" not in rv
     assert "loop_hz=loop_hz_ema" in rv
     assert "gpu_vram_used_gb" in rv
+    assert "unique_gpu_n" in rv
+    assert "unique_frame_hz_inst" in rv
+    assert "if main is not None:" not in rv
     hw = (ROOT / "python" / "runtime" / "hw_probe.py").read_text(encoding="utf-8")
     assert "GPU_VRAM_CACHE_S" in hw
     assert "def ema_hz" in hw
+    assert "NVIDIA_SMI_TIMEOUT_S" in hw
+    assert "timeout=3" not in hw
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "BeamNGpy #199" in readme or "BeamNGpy/issues/199" in readme
     assert "narrow > main" in readme
+    assert "@ -1" in readme or "@ **-1**" in readme
+    assert "0.13 half-rate" not in readme
+    assert "0.267" not in readme
+    schema = (ROOT / "docs" / "gvd_state_schema.md").read_text(encoding="utf-8")
+    assert "`grab_ms`" in schema
+    assert "unique GPU-frame" in schema
 
 
 def check_beamngpy_open_passes_near_far() -> None:
@@ -524,6 +588,10 @@ def check_beamngpy_open_passes_near_far() -> None:
     class FakeCamera:
         def __init__(self, name, _bng, _vehicle, **kwargs):
             captured.append((name, kwargs))
+            self.update_priority = float(kwargs.get("update_priority", 0.0))
+
+        def get_update_priority(self):
+            return self.update_priority
 
         def remove(self):
             return None
@@ -581,6 +649,10 @@ def check_beamngpy_open_passes_near_far() -> None:
         assert by["gvd_wide"]["requested_update_time"] == 0.067
         assert by["gvd_main"]["update_priority"] == 0.0
         assert by["gvd_narrow"]["update_priority"] > by["gvd_main"]["update_priority"]
+        assert read_camera_update_priority(be._sensors["main"]) == 0.0
+        assert priority_highest_is_zero(be._sensors["main"], 0.0)
+        assert invert_update_priority(0.0) == 1.0
+        assert CAMERA_HZ_TARGET == 10.0
         for cid in SIDE_CAM_IDS | REAR_CAM_IDS:
             assert by[f"gvd_{cid}"]["near_far_planes"] == (0.05, 100.0), cid
             assert by[f"gvd_{cid}"]["requested_update_time"] == ON_DEMAND_UPDATE_S, cid
@@ -641,17 +713,28 @@ def check_beamngpy_side_grab_half_rate() -> None:
             self.name = name
             self.kwargs = kwargs
             self.is_streaming = True
+            self.update_priority = float(kwargs.get("update_priority", 0.0))
             self.resolution = kwargs.get("resolution", (8, 8))
             streams[name] = 0
             polls[name] = 0
 
+        def get_update_priority(self):
+            return self.update_priority
+
+        def set_update_priority(self, p):
+            self.update_priority = float(p)
+
         def stream_raw(self):
             streams[self.name] += 1
-            return {"colour": np.zeros((8, 8, 3), dtype=np.uint8)}
+            img = np.zeros((8, 8, 3), dtype=np.uint8)
+            img[0, 0, 0] = streams[self.name] % 256
+            return {"colour": img}
 
         def poll(self):
             polls[self.name] += 1
-            return {"colour": np.zeros((8, 8, 3), dtype=np.uint8)}
+            img = np.zeros((8, 8, 3), dtype=np.uint8)
+            img[0, 0, 1] = polls[self.name] % 256
+            return {"colour": img}
 
         def stream(self):
             raise AssertionError("forwards must use stream_raw, not stream()")
@@ -683,17 +766,36 @@ def check_beamngpy_side_grab_half_rate() -> None:
         be.session.connect = _connect  # type: ignore[method-assign]
         be.session.attach_vehicle_sensors = lambda: {}  # type: ignore[method-assign]
         be.open()
+        assert read_camera_update_priority(be._sensors["main"]) == 0.0
+        assert priority_highest_is_zero(be._sensors["main"], 0.0)
         n = 8
         last = None
-        for _ in range(n):
-            last = be.grab()
+        for i in range(n):
+            s0 = dict(streams)
+            bundle = be.grab()
+            last = bundle
+            streamed = [cid for cid in ("main", "wide", "narrow") if streams[f"gvd_{cid}"] > s0.get(f"gvd_{cid}", 0)]
+            assert not ("wide" in streamed and "narrow" in streamed), (i, streamed)
+            if i == 0:
+                assert streamed == ["main", "wide"] or set(streamed) == {"main", "wide"}
+                for cid in SIDE_CAM_IDS | REAR_CAM_IDS:
+                    assert polls[f"gvd_{cid}"] == 0, cid
+            if i % 2 == 0:
+                assert "wide" in streamed and "narrow" not in streamed
+            else:
+                assert "narrow" in streamed and "wide" not in streamed
         assert last is not None
         assert last.health["main"] == CamHealth.OK
         assert last.health["narrow"] == CamHealth.OK
+        assert last.health["wide"] == CamHealth.STALE  # grab_i=7 skip
         assert last.grab_ms >= 0.0
-        for cid in SIDE_CAM_IDS | REAR_CAM_IDS:
-            assert last.health[cid] == CamHealth.OK, cid
-            assert f"gvd_{cid}" in last.frames or cid in last.frames
+        assert last.unique_gpu_n >= 1  # incrementing FakeCamera
+        for cid in SIDE_CAM_IDS:
+            assert last.health[cid] == CamHealth.OK, cid  # odd tick, phase 1
+            assert cid in last.frames
+        for cid in REAR_CAM_IDS:
+            assert last.health[cid] == CamHealth.STALE, cid  # 7 % 4 != 1
+            assert cid in last.frames
         assert streams["gvd_main"] == n
         assert polls["gvd_main"] == 0
         assert polls["gvd_wide"] == 0
@@ -723,6 +825,49 @@ def check_beamngpy_side_grab_half_rate() -> None:
 
         assert read_camera_colour(NoStream(), cid="main", resolution=(8, 8)) is None
         assert "main" in FORWARD_CAM_IDS
+
+        # skip/failed stream_raw → STALE (not a camera tick)
+        class FailRaw:
+            is_streaming = True
+            resolution = (8, 8)
+
+            def stream_raw(self):
+                return None
+
+            def poll(self):
+                raise AssertionError("forward cam must not poll()")
+
+        be._sensors["main"] = FailRaw()
+        failed = be.grab()
+        assert failed.health["main"] == CamHealth.STALE
+        assert "main" not in failed.unique_gpu_ids
+
+        # cache re-show is not a unique GPU frame
+        class SameRaw:
+            is_streaming = True
+            resolution = (8, 8)
+
+            def stream_raw(self):
+                return {"colour": np.zeros((8, 8, 3), dtype=np.uint8)}
+
+        be._sensors["main"] = SameRaw()
+        be._frame_sig.pop("main", None)
+        first = be.grab()
+        second = be.grab()
+        assert "main" in first.unique_gpu_ids
+        assert "main" not in second.unique_gpu_ids
+
+        # live unique-Hz hitch 800→400 (warmup already elapsed)
+        import time as _time
+
+        be._open_mono = _time.monotonic() - LIVE_NARROW_HITCH_AFTER_S - 0.1
+        be._unique_n = 10
+        be._unique_hz_ema = 4.0
+        be._narrow_live_hitched = False
+        be._maybe_live_narrow_hitch()
+        assert be._narrow_live_hitched
+        assert abs(be._clip_planes["narrow"][1] - NARROW_FAR_LIVE_HITCH_M) < 1e-9
+        assert be._clip_planes["narrow"][1] >= be._clip_planes["main"][1]
     finally:
         for k, v in old.items():
             if v is None:
@@ -740,6 +885,7 @@ def check_nvidia_smi_cache_and_honest_hz() -> None:
 
     def _fake_check_output(*_a, **_k):
         calls["n"] += 1
+        assert float(_k.get("timeout", 99)) <= 2.0 + 1e-9
         return "2048\n"
 
     old = __import__("subprocess").check_output
@@ -761,6 +907,10 @@ def check_nvidia_smi_cache_and_honest_hz() -> None:
     mixed = hw.ema_hz(4.0, 12.0)
     assert 4.0 < mixed < 12.0
     assert mixed < 10.0  # honest; not clamped to ≥10
+    assert abs(hw.unique_frame_hz_inst(0, 0.1)) < 1e-12
+    assert abs(hw.unique_frame_hz_inst(1, 0.1) - 10.0) < 1e-9
+    assert abs(hw.unique_frame_hz_inst(8, 0.1) - 10.0) < 1e-9  # one tick, not 80 Hz
+    assert hw.NVIDIA_SMI_TIMEOUT_S <= 2.0
 
 
 def check_auto_backend_not_tech_without_env() -> None:

@@ -27,6 +27,11 @@ Lua: `gvd_main.drawPath` on `onPreRender` / `onDebugDraw`. Runs whenever the sup
 | `capture_note` | string | e.g. `retail: 1 window` |
 | `rss_mb` | float | supervisor RSS; >12 GB is a bug |
 | `cam_health.narrow` | enum | added in M1 8-cam set |
+| `loop_hz` | float | honest supervisor loop EMA (never clamped to a fake ≥10) |
+| `camera_hz` | float | unique GPU-frame EMA — new frames only, not cache re-shows / `main is not None` |
+| `grab_ms` | float | camera grab wall-ms this tick |
+| `infer_ms` | float | perception tick ms |
+| `viz_ms` | float | OpenCV stage ms |
 
 
 ## M2 fields

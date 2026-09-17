@@ -41,7 +41,7 @@ from python.data.record import ClipRecorder, choose_encoder
 from python.perception.pipeline import ModularPerception
 from python.perception.road_model import lanes_ext, road_edges
 from python.runtime.debug_opts import apply_to_command, apply_to_perception
-from python.runtime.hw_probe import ema_hz, gpu_vram_used_gb, probe, refuse_live_start
+from python.runtime.hw_probe import ema_hz, gpu_vram_used_gb, probe, refuse_live_start, unique_frame_hz_inst
 from python.runtime.models import ModelRuntime
 from python.runtime.shadow import ShadowConfig, load_shadow_config, shadow_tick
 from python.runtime.state_io import (
@@ -446,11 +446,12 @@ def main() -> None:
             if grab_ms <= 0:
                 grab_ms = (time.perf_counter() - t_grab) * 1000.0
             main = bundle.main_bgr()
+            unique_gpu_n = int(getattr(bundle, "unique_gpu_n", 0) or 0)
             now = time.perf_counter()
-            if main is not None:
-                dt = max(1e-6, now - last_cam_t)
-                cam_hz_ema = ema_hz(cam_hz_ema, 1.0 / dt)
-                last_cam_t = now
+            if frame_i > 0:
+                dt_cam = max(1e-6, now - last_cam_t)
+                cam_hz_ema = ema_hz(cam_hz_ema, unique_frame_hz_inst(unique_gpu_n, dt_cam))
+            last_cam_t = now
 
             steer = 0.0
             ego_v = last_ego_v

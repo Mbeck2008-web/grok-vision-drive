@@ -41,7 +41,7 @@ from python.data.record import ClipRecorder, choose_encoder
 from python.perception.pipeline import ModularPerception
 from python.perception.road_model import lanes_ext, road_edges
 from python.runtime.debug_opts import apply_to_command, apply_to_perception
-from python.runtime.hw_probe import probe, refuse_live_start
+from python.runtime.hw_probe import ema_hz, gpu_vram_used_gb, probe, refuse_live_start, unique_frame_hz_inst
 from python.runtime.models import ModelRuntime
 from python.runtime.shadow import ShadowConfig, load_shadow_config, shadow_tick
 from python.runtime.state_io import (
@@ -81,20 +81,6 @@ def _rss_mb() -> float:
             return psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
         except Exception:
             return 0.0
-
-
-def _gpu_vram_used_gb() -> float:
-    try:
-        import subprocess
-
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-            text=True,
-            timeout=2,
-        ).strip().splitlines()[0]
-        return float(out) / 1024.0
-    except Exception:
-        return 0.0
 
 
 
@@ -426,13 +412,19 @@ def main() -> None:
     frame_i = 0
     cmd_seq = 0
     cam_hz_ema = 0.0
+    loop_hz_ema = 0.0
     last_cam_t = time.perf_counter()
+    last_loop_t = time.perf_counter()
     last_ego_v = 0.0
     prev_force = bool(args.force_engage)
     prev_preview = bool(args.allow_preview_drive)
     try:
         while True:
             loop_t0 = time.perf_counter()
+            if frame_i > 0:
+                dt_loop = max(1e-6, loop_t0 - last_loop_t)
+                loop_hz_ema = ema_hz(loop_hz_ema, 1.0 / dt_loop)
+            last_loop_t = loop_t0
 
             # In-game GVD app requests ride on the existing prefs file (no second bus).
             prefs = _read_ui_prefs()
@@ -448,14 +440,18 @@ def main() -> None:
                         win, screen=want_screen, fullscreen=bool(args.viz_fullscreen)
                     )
 
+            t_grab = time.perf_counter()
             bundle = backend.grab()
+            grab_ms = float(getattr(bundle, "grab_ms", 0.0) or 0.0)
+            if grab_ms <= 0:
+                grab_ms = (time.perf_counter() - t_grab) * 1000.0
             main = bundle.main_bgr()
+            unique_gpu_n = int(getattr(bundle, "unique_gpu_n", 0) or 0)
             now = time.perf_counter()
-            if main is not None:
-                dt = max(1e-6, now - last_cam_t)
-                inst = 1.0 / dt
-                cam_hz_ema = inst if cam_hz_ema <= 0 else (0.8 * cam_hz_ema + 0.2 * inst)
-                last_cam_t = now
+            if frame_i > 0:
+                dt_cam = max(1e-6, now - last_cam_t)
+                cam_hz_ema = ema_hz(cam_hz_ema, unique_frame_hz_inst(unique_gpu_n, dt_cam))
+            last_cam_t = now
 
             steer = 0.0
             ego_v = last_ego_v
@@ -632,9 +628,10 @@ def main() -> None:
                 engaged=engaged,
                 disengage_reason=disengage_reason,
                 policy=policy_tick,
-                loop_hz=args.hz,
+                loop_hz=loop_hz_ema,
                 camera_hz=cam_hz_ema,
                 infer_ms=pout.infer_ms,
+                grab_ms=grab_ms,
                 path_conf=pout.path_conf,
                 path_width=pout.path_width,
                 path_debug_preview=pout.path_debug_preview,
@@ -644,7 +641,7 @@ def main() -> None:
                 planner=pout.planner,
                 gpu_name=hw.dgpu,
                 gpu_vram_total_gb=float(hw.dgpu_vram_gb or 11.0),
-                gpu_vram_used_gb=_gpu_vram_used_gb(),
+                gpu_vram_used_gb=gpu_vram_used_gb(),
             )
             st["ego"]["speed_mps"] = ego_v
             st["ego"]["steer_deg"] = steer

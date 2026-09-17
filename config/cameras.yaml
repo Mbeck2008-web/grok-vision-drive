@@ -6,19 +6,31 @@
 #
 # BeamNGpy Camera defaults near_far_planes=(0.05, 100) m (BeamNGpy#199). GVD always passes
 # an explicit (near_m, far_m) + requested_update_time from this file. near is 0.05 on every cam.
-# Locked far_m / requested_update_time (narrow > main; never both-800):
-#   narrow: 800 @ 0.067 (~15 Hz)
-#   main:   300 @ 0.067
-#   wide:   300 @ 0.067 (same rate as forward)
-#   pillarL / pillarR / repeatL / repeatR: 100 @ 0.13 (half-rate vs forward)
-#   rear: 100 @ 0.267 (÷4 vs forward)
+# Locked far_m (narrow > main; never both-800). Grab stagger is Python-side (not resolution):
+#   main:   every tick (÷1)
+#   wide:   every 2nd tick (÷2, phase 0)
+#   narrow: every 2nd tick (÷2 start, phase 1; ÷2–3 allowed, never ÷4)
+#   pillar/repeat: every 2nd, phase 1 (miss wide even ticks)
+#   rear: every 4th, phase 1
+# Far / GPU (stream_raw on forwards; never is_streaming=False):
+#   narrow: 800 @ 0.067  priority 0.5   (next far hitch 400 only if live unique-frame Hz <10)
+#   main:   300 @ 0.067  priority 0.0
+#   wide:   300 @ 0.067  priority 0.5
+#   pillarL / pillarR / repeatL / repeatR / rear: 100 @ -1 (on-demand; no auto GPU)
 # Optional per-cam near_far_planes: [near_m, far_m] still clamped to the role band.
-# Hitch: half-rate sides + rear÷4 grab — not resolution. Depth OFF.
+# Hitch: forward grab stagger + on-demand sides/rear — not resolution. Depth OFF.
 origin_offset: [0.0, 0.0, 0.0]
 near_m: 0.05
 hitch:
-  side_grab_div: 2   # pillar/repeat every 2nd forward grab
-  rear_grab_div: 4   # rear every 4th forward grab
+  main_grab_div: 1
+  wide_grab_div: 2
+  wide_grab_phase: 0
+  narrow_grab_div: 2     # start ÷2 (÷2–3); not ÷4
+  narrow_grab_phase: 1   # offset vs wide so they do not share a tick
+  side_grab_div: 2
+  side_grab_phase: 1     # miss wide even ticks (tick0 clump)
+  rear_grab_div: 4
+  rear_grab_phase: 1     # miss wide even ticks
 cameras:
   - id: narrow
     role: long_range_forward
@@ -31,6 +43,7 @@ cameras:
     live_res: [640, 480]
     far_m: 800
     requested_update_time: 0.067
+    update_priority: 0.5
   - id: main
     role: primary_forward
     note: "toy analogue of the primary forward windshield cam; alias cam_main"
@@ -42,6 +55,7 @@ cameras:
     live_res: [640, 480]
     far_m: 300
     requested_update_time: 0.067
+    update_priority: 0.0
     aliases: [cam_main]
   - id: wide
     role: urban_intersection
@@ -54,6 +68,7 @@ cameras:
     live_res: [640, 480]
     far_m: 300
     requested_update_time: 0.067
+    update_priority: 0.5
   - id: pillarL
     role: forward_side_left
     note: "toy analogue of a left B-pillar forward-side cam"
@@ -64,7 +79,8 @@ cameras:
     fov_v: 65.3
     live_res: [640, 480]
     far_m: 100
-    requested_update_time: 0.13
+    requested_update_time: -1
+    update_priority: 1.0
   - id: pillarR
     role: forward_side_right
     note: "toy analogue of a right B-pillar forward-side cam"
@@ -75,7 +91,8 @@ cameras:
     fov_v: 65.3
     live_res: [640, 480]
     far_m: 100
-    requested_update_time: 0.13
+    requested_update_time: -1
+    update_priority: 1.0
   - id: repeatL
     role: rear_side_left
     note: "toy analogue of a left fender repeater"
@@ -86,7 +103,8 @@ cameras:
     fov_v: 55.4
     live_res: [640, 480]
     far_m: 100
-    requested_update_time: 0.13
+    requested_update_time: -1
+    update_priority: 1.0
   - id: repeatR
     role: rear_side_right
     note: "toy analogue of a right fender repeater"
@@ -97,7 +115,8 @@ cameras:
     fov_v: 55.4
     live_res: [640, 480]
     far_m: 100
-    requested_update_time: 0.13
+    requested_update_time: -1
+    update_priority: 1.0
   - id: rear
     role: rear_traffic
     note: "toy analogue of a rear license-plate cam"
@@ -108,4 +127,5 @@ cameras:
     fov_v: 80.0
     live_res: [640, 360]
     far_m: 100
-    requested_update_time: 0.267
+    requested_update_time: -1
+    update_priority: 1.0

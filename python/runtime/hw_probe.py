@@ -7,6 +7,7 @@ import platform
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -89,7 +90,7 @@ def _nvidia() -> tuple[str, float | None]:
                 "--format=csv,noheader,nounits",
             ],
             text=True,
-            timeout=3,
+            timeout=NVIDIA_SMI_TIMEOUT_S,
         ).strip().splitlines()[0]
         parts = [p.strip() for p in out.split(",")]
         name = parts[0]
@@ -171,6 +172,48 @@ def beamng_process_running() -> bool:
         except Exception:
             pass
     return False
+
+
+NVIDIA_SMI_TIMEOUT_S = 2.0  # hung nvidia-smi must not stall the vision loop
+GPU_VRAM_CACHE_S = 0.5  # nvidia-smi at 1–2 Hz, not every vision tick
+_gpu_vram_cached_at = 0.0
+_gpu_vram_cached_gb = 0.0
+
+
+def ema_hz(prev: float, inst: float, alpha: float = 0.2) -> float:
+    """Honest rate EMA. Never clamp to a fake ≥10."""
+    inst = float(inst)
+    if prev <= 0:
+        return inst
+    return (1.0 - alpha) * float(prev) + alpha * inst
+
+
+def unique_frame_hz_inst(unique_gpu_n: int, dt: float) -> float:
+    """Instant unique-GPU-frame Hz. Re-shows / cache reuse contribute 0, not 1/dt."""
+    if int(unique_gpu_n) <= 0:
+        return 0.0
+    return 1.0 / max(1e-6, float(dt))
+
+
+def gpu_vram_used_gb(*, now: float | None = None, force: bool = False) -> float:
+    """Cached nvidia-smi memory.used. TTL 0.5 s (~2 Hz)."""
+    global _gpu_vram_cached_at, _gpu_vram_cached_gb
+    t = time.monotonic() if now is None else float(now)
+    if not force and _gpu_vram_cached_at > 0 and (t - _gpu_vram_cached_at) < GPU_VRAM_CACHE_S:
+        return _gpu_vram_cached_gb
+    val = 0.0
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            text=True,
+            timeout=NVIDIA_SMI_TIMEOUT_S,
+        ).strip().splitlines()[0]
+        val = float(out) / 1024.0
+    except Exception:
+        val = _gpu_vram_cached_gb if _gpu_vram_cached_at > 0 else 0.0
+    _gpu_vram_cached_at = t
+    _gpu_vram_cached_gb = val
+    return val
 
 
 def refuse_live_start(report: HwReport, *, vision_only: bool = False) -> str | None:

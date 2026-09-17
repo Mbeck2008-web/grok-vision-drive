@@ -23,11 +23,23 @@ FORWARD_CAM_IDS = frozenset(("narrow", "main", "wide"))
 # of near_far_planes (sides/rear lock at 100 m still go through Camera(..., near_far_planes=)).
 DEFAULT_NEAR_M = 0.05
 BNGPY_DEFAULT_FAR_M = 100.0
-FORWARD_UPDATE_S = 0.067  # ~15 Hz
-SIDE_UPDATE_S = 0.13  # half-rate vs forward (~7.7 Hz)
-REAR_UPDATE_S = 0.267  # ÷4 vs forward (~3.7 Hz)
+FORWARD_UPDATE_S = 0.067  # ~15 Hz suggestion to the Tech sensor manager
+ON_DEMAND_UPDATE_S = -1.0  # no auto GPU update; ad-hoc poll only (sides/rear)
+SIDE_UPDATE_S = ON_DEMAND_UPDATE_S
+REAR_UPDATE_S = ON_DEMAND_UPDATE_S
+MAIN_GRAB_DIV = 1
+WIDE_GRAB_DIV = 2
+NARROW_GRAB_DIV = 2  # start ÷2 (allowed 2–3; never ÷4)
+NARROW_GRAB_PHASE = 1  # offset vs wide so they do not share a tick
+WIDE_GRAB_PHASE = 0
 SIDE_GRAB_DIV = 2  # poll pillar/repeat every Nth grab; never drop resolution
+SIDE_GRAB_PHASE = 1  # odd ticks — miss wide even (tick0 was main+wide+4sides+rear)
 REAR_GRAB_DIV = 4  # poll rear every Nth grab; never drop resolution
+REAR_GRAB_PHASE = 1  # miss wide even ticks
+NARROW_FAR_LIVE_HITCH_M = 400.0  # live unique-frame Hz hitch (800→400 if still <10)
+CAMERA_HZ_TARGET = 10.0
+LIVE_NARROW_HITCH_AFTER_S = 2.0
+LIVE_NARROW_HITCH_MIN_UNIQUE = 4
 DEFAULT_FAR_M = {
     "narrow": 800.0,
     "main": 300.0,
@@ -42,26 +54,38 @@ DEFAULT_UPDATE_S = {
     "narrow": FORWARD_UPDATE_S,
     "main": FORWARD_UPDATE_S,
     "wide": FORWARD_UPDATE_S,
-    "pillarL": SIDE_UPDATE_S,
-    "pillarR": SIDE_UPDATE_S,
-    "repeatL": SIDE_UPDATE_S,
-    "repeatR": SIDE_UPDATE_S,
-    "rear": REAR_UPDATE_S,
+    "pillarL": ON_DEMAND_UPDATE_S,
+    "pillarR": ON_DEMAND_UPDATE_S,
+    "repeatL": ON_DEMAND_UPDATE_S,
+    "repeatR": ON_DEMAND_UPDATE_S,
+    "rear": ON_DEMAND_UPDATE_S,
+}
+# BeamNGpy update_priority: 0 highest → 1 lowest (getter contract). Starve non-main.
+DEFAULT_UPDATE_PRIORITY = {
+    "main": 0.0,
+    "narrow": 0.5,
+    "wide": 0.5,
+    "pillarL": 1.0,
+    "pillarR": 1.0,
+    "repeatL": 1.0,
+    "repeatR": 1.0,
+    "rear": 1.0,
 }
 # Role bands pin the lock (narrow 800 > main 300; never both-800).
+# Narrow lo 400 is the live hitch floor (still ≥ main 300); attach stays 800.
 # Forward 100 m clamps up to the role far. Sides/rear lock at 100 m (explicit planes).
-NARROW_FAR_BAND = (800.0, 800.0)
+NARROW_FAR_BAND = (400.0, 800.0)
 MAIN_FAR_BAND = (300.0, 300.0)
 WIDE_FAR_BAND = (300.0, 300.0)
 SIDE_FAR_BAND = (100.0, 100.0)
 REAR_FAR_BAND = (100.0, 100.0)
-NARROW_FAR_HITCH = (800.0,)
+NARROW_FAR_HITCH = (800.0,)  # attach starts 800; 400 is live unique-Hz only
 MAIN_FAR_HITCH = (300.0,)
 WIDE_FAR_HITCH = (300.0,)
 SIDE_FAR_HITCH = (100.0,)
 REAR_FAR_HITCH = (100.0,)
-SIDE_CAM_HITCH_UPDATE_S = SIDE_UPDATE_S
-REAR_CAM_HITCH_UPDATE_S = REAR_UPDATE_S
+SIDE_CAM_HITCH_UPDATE_S = ON_DEMAND_UPDATE_S
+REAR_CAM_HITCH_UPDATE_S = ON_DEMAND_UPDATE_S
 
 
 class CamHealth(str, Enum):
@@ -78,6 +102,9 @@ class CameraFrameBundle:
     health: dict[str, CamHealth] = field(default_factory=dict)
     backend: str = "stub"
     note: str = ""
+    grab_ms: float = 0.0
+    unique_gpu_n: int = 0  # new GPU frames this tick (not cache / stream_raw re-shows)
+    unique_gpu_ids: tuple[str, ...] = ()
 
     def health_str(self) -> dict[str, str]:
         out = {cid: CamHealth.MISSING.value for cid in CAM_IDS}
@@ -203,8 +230,8 @@ def camera_update_s(
 ) -> float:
     """Per-cam BeamNGpy requested_update_time. Spec yaml wins; else role default.
 
-    File-level tech.yaml cameras.update_s is not applied: it would clobber
-    sides 0.13 / rear 0.267 with the forward 0.067 suggestion.
+    Negative means on-demand (no auto GPU update). File-level tech.yaml
+    cameras.update_s is not applied: it would clobber sides/rear -1 with 0.067.
     """
     spec = spec or {}
     defaults = defaults or {}
@@ -213,9 +240,59 @@ def camera_update_s(
         v = _as_float(src.get("requested_update_time"))
         if v is None:
             v = _as_float(src.get("update_s"))
-        if v is not None and v > 0:
+        if v is None:
+            continue
+        if v < 0:
+            return ON_DEMAND_UPDATE_S
+        if v > 0:
             return float(v)
     return default_update_s(cam_id)
+
+
+def camera_update_priority(
+    spec: dict[str, Any] | None,
+    *,
+    cid: str | None = None,
+) -> float:
+    """BeamNGpy update_priority in [0, 1], 0 = highest. Starve non-main."""
+    spec = spec or {}
+    cam_id = str(cid or spec.get("id") or "")
+    v = _as_float(spec.get("update_priority"))
+    if v is None:
+        v = DEFAULT_UPDATE_PRIORITY.get(cam_id, 0.5)
+    return min(1.0, max(0.0, float(v)))
+
+
+def read_camera_update_priority(cam: Any) -> float | None:
+    """Read BeamNGpy Camera GPU priority. Getter contract: 0 = highest, 1 = lowest."""
+    for name in ("get_update_priority", "getUpdatePriority"):
+        fn = getattr(cam, name, None)
+        if not callable(fn):
+            continue
+        try:
+            v = _as_float(fn())
+        except Exception:
+            v = None
+        if v is not None:
+            return min(1.0, max(0.0, float(v)))
+    return _as_float(getattr(cam, "update_priority", None))
+
+
+def priority_highest_is_zero(cam: Any, requested: float) -> bool:
+    """True when getter agrees 0 is highest (main requested ~0 must not read ~1)."""
+    got = read_camera_update_priority(cam)
+    if got is None:
+        return True
+    req = min(1.0, max(0.0, float(requested)))
+    if req <= 0.05 and got >= 0.95:
+        return False
+    if req >= 0.95 and got <= 0.05:
+        return False
+    return True
+
+
+def invert_update_priority(p: float) -> float:
+    return min(1.0, max(0.0, 1.0 - float(p)))
 
 
 def _positive_div(v: Any, default: int) -> int:
@@ -226,9 +303,24 @@ def _positive_div(v: Any, default: int) -> int:
     return n if n >= 1 else int(default)
 
 
+def _nonneg_int(v: Any, default: int) -> int:
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return int(default)
+    return n if n >= 0 else int(default)
+
+
 def camera_grab_div(cid: str, hitch: dict[str, Any] | None = None) -> int:
-    """Python poll divisor. Forward=1, sides=2, rear=4. Never resolution."""
+    """Python grab divisor. main÷1 (clamped), wide÷2, narrow÷2 (2–3), sides÷2, rear÷4."""
     hitch = hitch if isinstance(hitch, dict) else {}
+    if cid == "main":
+        return MAIN_GRAB_DIV  # every-tick; hitch yaml cannot raise this
+    if cid == "wide":
+        return _positive_div(hitch.get("wide_grab_div"), WIDE_GRAB_DIV)
+    if cid == "narrow":
+        n = _positive_div(hitch.get("narrow_grab_div"), NARROW_GRAB_DIV)
+        return min(3, max(2, n))  # ÷2–3 start; never ÷4
     if cid in REAR_CAM_IDS:
         return _positive_div(hitch.get("rear_grab_div"), REAR_GRAB_DIV)
     if cid in SIDE_CAM_IDS:
@@ -236,9 +328,60 @@ def camera_grab_div(cid: str, hitch: dict[str, Any] | None = None) -> int:
     return 1
 
 
+def camera_grab_phase(cid: str, hitch: dict[str, Any] | None = None) -> int:
+    """Phase offset so wide (0) and narrow (1) do not grab the same tick.
+
+    Sides/rear default to phase 1 so they miss wide's even ticks (tick0 clump).
+    """
+    hitch = hitch if isinstance(hitch, dict) else {}
+    if cid == "narrow":
+        return _nonneg_int(hitch.get("narrow_grab_phase"), NARROW_GRAB_PHASE)
+    if cid == "wide":
+        return _nonneg_int(hitch.get("wide_grab_phase"), WIDE_GRAB_PHASE)
+    if cid == "main":
+        return _nonneg_int(hitch.get("main_grab_phase"), 0)
+    if cid in REAR_CAM_IDS:
+        return _nonneg_int(hitch.get("rear_grab_phase"), REAR_GRAB_PHASE)
+    if cid in SIDE_CAM_IDS:
+        return _nonneg_int(hitch.get("side_grab_phase"), SIDE_GRAB_PHASE)
+    return 0
+
+
+def grab_due(grab_i: int, div: int, phase: int = 0) -> bool:
+    d = max(1, int(div))
+    p = int(phase) % d
+    return (int(grab_i) % d) == p
+
+
+def camera_grab_due(cid: str, grab_i: int, hitch: dict[str, Any] | None = None) -> bool:
+    """Whether this cam should GPU-read on grab_i. Narrow never shares a tick with wide."""
+    hitch = hitch if isinstance(hitch, dict) else {}
+    div = camera_grab_div(cid, hitch)
+    phase = camera_grab_phase(cid, hitch)
+    gi = int(grab_i)
+    if cid == "narrow" and div >= 3:
+        # ÷3 rate that misses every wide÷2 tick: two residues per 6, opposite wide parity.
+        wide_parity = int(camera_grab_phase("wide", hitch)) % 2
+        if (gi % 2) == wide_parity:
+            return False
+        return (gi % 3) != 0
+    if not grab_due(gi, div, phase):
+        return False
+    if cid == "narrow":
+        wdiv = camera_grab_div("wide", hitch)
+        wph = camera_grab_phase("wide", hitch)
+        if grab_due(gi, wdiv, wph):
+            return False
+    return True
+
+
 def clamp_far_m(cid: str, far_m: float) -> float:
     lo, hi = far_band(cid)
-    return min(hi, max(lo, float(far_m)))
+    f = float(far_m)
+    # Silent BeamNGpy 100 m is not a hitch cut. Narrow live floor is 400, attach stays 800.
+    if cid == "narrow" and f <= BNGPY_DEFAULT_FAR_M + 1e-9:
+        return default_far_m("narrow")
+    return min(hi, max(lo, f))
 
 
 def camera_clip_planes(
@@ -252,7 +395,8 @@ def camera_clip_planes(
     Precedence: spec.near_far_planes > spec.near_m/far_m > defaults.near_m + role far.
     Role far: narrow 800, main 300, wide 300, pillar/repeat 100, rear 100. Clamped to
     the role band so a missing yaml far cannot silently omit near_far_planes, main
-    cannot sit at 800 next to narrow, and sides/rear cannot sit at 150.
+    cannot sit at 800 next to narrow, and sides/rear cannot sit at 150. Narrow 400
+    is allowed (live hitch if camera_hz still <10); attach yaml stays 800.
     """
     spec = spec or {}
     defaults = defaults or {}
@@ -279,15 +423,37 @@ def camera_clip_planes(
     return (float(near), clamp_far_m(cam_id, far))
 
 
-def far_hitch_ladder(cid: str, far_m: float) -> tuple[float, ...]:
+def live_narrow_far_m(
+    unique_hz: float,
+    current_far: float,
+    *,
+    elapsed_s: float = 0.0,
+    unique_n: int = 0,
+) -> float:
+    """800→400 when unique-frame Hz stays <10 after stagger. Still ≥ main 300."""
+    cur = float(current_far)
+    floor = float(NARROW_FAR_LIVE_HITCH_M)
+    if cur <= floor + 1e-9:
+        return floor if cur <= 0 else cur
+    if elapsed_s < LIVE_NARROW_HITCH_AFTER_S or int(unique_n) < LIVE_NARROW_HITCH_MIN_UNIQUE:
+        return cur
+    if float(unique_hz) < CAMERA_HZ_TARGET:
+        return floor
+    return cur
+
+
+def far_hitch_ladder(cid: str, far_m: float, *, unique_hz: float | None = None) -> tuple[float, ...]:
     """Requested far, then lower rungs still inside the role band.
 
-    Locked tip is a single rung: narrow 800, main/wide 300, sides/rear 100.
+    Locked attach is a single rung: narrow 800, main/wide 300, sides/rear 100.
+    When unique_hz is set and still <10, the ladder includes live narrow 400.
     Values are clamped first so a both-800 input cannot stay on the ladder.
     """
     far_m = clamp_far_m(cid, float(far_m))
     if cid == "narrow":
         rungs = NARROW_FAR_HITCH
+        if unique_hz is not None and float(unique_hz) < CAMERA_HZ_TARGET:
+            rungs = (float(far_m), NARROW_FAR_LIVE_HITCH_M)
     elif cid == "main":
         rungs = MAIN_FAR_HITCH
     elif cid == "wide":
@@ -320,7 +486,7 @@ def iter_clip_attach_attempts(
     """(near_m, far_m, update_s) tries. Per-id rate from yaml; never drop resolution.
 
     `update_s` is ignored when the spec already has requested_update_time / update_s,
-    and is ignored for sides/rear so a global 0.067 cannot clobber 0.13 / 0.267.
+    and is ignored for sides/rear so a global 0.067 cannot clobber on-demand -1.
     """
     spec = spec or {}
     cam_id = str(cid or spec.get("id") or "")
@@ -346,10 +512,17 @@ def beamng_camera_sensor_kwargs(
     shmem: bool,
     streaming: bool,
     rgb_only: bool,
+    update_priority: float = 0.0,
 ) -> dict[str, Any]:
-    """Kwargs for beamngpy.sensors.Camera (name, bng, vehicle stay positional)."""
+    """Kwargs for beamngpy.sensors.Camera (name, bng, vehicle stay positional).
+
+    `is_streaming` is always True (stream_raw). The streaming arg is accepted
+    for callers but never written False.
+    """
+    _ = streaming  # kept so call sites stay stable; never set is_streaming False
     return {
         "requested_update_time": float(update_s),
+        "update_priority": float(min(1.0, max(0.0, update_priority))),
         "pos": pos,
         "dir": direction,
         "up": up,
@@ -357,7 +530,7 @@ def beamng_camera_sensor_kwargs(
         "resolution": (int(resolution[0]), int(resolution[1])),
         "near_far_planes": (float(near_m), float(far_m)),
         "is_using_shared_memory": bool(shmem),
-        "is_streaming": bool(streaming),
+        "is_streaming": True,
         "is_render_colours": True,
         "is_render_annotations": not bool(rgb_only),
         "is_render_instance": False,
@@ -367,23 +540,93 @@ def beamng_camera_sensor_kwargs(
     }
 
 
-def poll_camera_colour(cam: Any) -> Any:
-    """One colour frame from a BeamNGpy Camera, or None."""
-    images = None
-    if hasattr(cam, "stream") and getattr(cam, "is_streaming", False):
+def _cam_resolution(cam: Any) -> tuple[int, int] | None:
+    res = getattr(cam, "resolution", None)
+    if res is None:
+        return None
+    try:
+        w, h = int(res[0]), int(res[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if w < 1 or h < 1:
+        return None
+    return (w, h)
+
+
+def colour_to_bgr(colour: Any, resolution: tuple[int, int] | None = None) -> np.ndarray | None:
+    """RGB(A) / BGRA bytes / array / PIL → BGR uint8. Empty → None."""
+    if colour is None:
+        return None
+    arr: np.ndarray | None = None
+    if isinstance(colour, np.ndarray):
+        arr = colour
+    elif hasattr(colour, "mode"):
+        arr = np.asarray(colour)
+    elif isinstance(colour, (bytes, bytearray, memoryview)):
+        buf = np.frombuffer(memoryview(colour), dtype=np.uint8)
+        n = int(buf.size)
+        if resolution is not None:
+            w, h = int(resolution[0]), int(resolution[1])
+            need4, need3 = w * h * 4, w * h * 3
+            if n >= need4:
+                arr = buf[:need4].reshape(h, w, 4)
+            elif n >= need3:
+                arr = buf[:need3].reshape(h, w, 3)
+        if arr is None and n >= 12:
+            if n % 4 == 0:
+                px = n // 4
+                side = int(px**0.5)
+                if side * side == px:
+                    arr = buf.reshape(side, side, 4)
+            if arr is None and n % 3 == 0:
+                px = n // 3
+                side = int(px**0.5)
+                if side * side == px:
+                    arr = buf.reshape(side, side, 3)
+    if arr is None or arr.ndim != 3 or arr.shape[2] < 3:
+        return None
+    rgb = arr[:, :, :3]
+    if rgb.dtype != np.uint8:
+        rgb = rgb.astype(np.uint8)
+    return np.ascontiguousarray(rgb[:, :, ::-1])
+
+
+def read_camera_colour(
+    cam: Any,
+    *,
+    cid: str,
+    resolution: tuple[int, int] | None = None,
+) -> np.ndarray | None:
+    """Forwards: stream_raw only (no poll). Sides/rear: poll (on-demand -1)."""
+    res = resolution or _cam_resolution(cam)
+    if cid in FORWARD_CAM_IDS:
+        if not hasattr(cam, "stream_raw"):
+            return None
         try:
-            images = cam.stream()
+            raw = cam.stream_raw()
         except Exception:
-            images = cam.poll() if hasattr(cam, "poll") else None
-    elif hasattr(cam, "poll"):
+            return None
+        colour = None
+        if isinstance(raw, dict):
+            colour = raw.get("colour") if raw.get("colour") is not None else raw.get("color")
+        return colour_to_bgr(colour, res)
+    # sides/rear requested_update_time=-1: need an ad-hoc poll. Never set streaming false.
+    if not hasattr(cam, "poll"):
+        return None
+    try:
         images = cam.poll()
+    except Exception:
+        return None
     if not isinstance(images, dict):
         return None
-    if "colour" in images and images["colour"] is not None:
-        return images["colour"]
-    if "color" in images and images["color"] is not None:
-        return images["color"]
-    return None
+    colour = images.get("colour") if images.get("colour") is not None else images.get("color")
+    return colour_to_bgr(colour, res)
+
+
+def frame_signature(bgr: np.ndarray) -> tuple[Any, ...]:
+    """Cheap identity for unique-GPU-frame detection (stream_raw re-shows share bytes)."""
+    arr = np.ascontiguousarray(bgr)
+    return (arr.shape, arr.dtype.str, hash(arr.tobytes()))
 
 
 @runtime_checkable
@@ -409,7 +652,14 @@ class StubBackend:
 
     def grab(self) -> CameraFrameBundle:
         health = {cid: CamHealth.MISSING for cid in CAM_IDS}
-        return CameraFrameBundle(frames={}, timestamps={}, health=health, backend=self.name, note="stub: no cameras")
+        return CameraFrameBundle(
+            frames={},
+            timestamps={},
+            health=health,
+            backend=self.name,
+            note="stub: no cameras",
+            unique_gpu_n=0,
+        )
 
 
 _SKIP_BEAMNG_TITLE = ("crash", "dump", "werfault", "error report", "crashreporter")
@@ -655,6 +905,7 @@ class WindowBackend:
                 health=health,
                 backend=self.name,
                 note=self._note,
+                unique_gpu_n=0,
             )
 
         if img is None:
@@ -662,7 +913,14 @@ class WindowBackend:
             if not self._logged:
                 print(f"[GVD] window via {self._impl}; {self._note}. Sides stay missing.")
                 self._logged = True
-            return CameraFrameBundle(frames={}, timestamps={}, health=health, backend=self.name, note=self._note)
+            return CameraFrameBundle(
+                frames={},
+                timestamps={},
+                health=health,
+                backend=self.name,
+                note=self._note,
+                unique_gpu_n=0,
+            )
 
         img = np.ascontiguousarray(img)
         if img.dtype != np.uint8:
@@ -674,7 +932,15 @@ class WindowBackend:
         timestamps["main"] = ts
         health["main"] = CamHealth.OK
         # refuse fake 8-cam
-        return CameraFrameBundle(frames=frames, timestamps=timestamps, health=health, backend=self.name, note=self._note)
+        return CameraFrameBundle(
+            frames=frames,
+            timestamps=timestamps,
+            health=health,
+            backend=self.name,
+            note=self._note,
+            unique_gpu_n=1,
+            unique_gpu_ids=("main",),
+        )
 
 
 class BeamNGPyBackend:
@@ -696,6 +962,8 @@ class BeamNGPyBackend:
         self._sensors: dict[str, Any] = {}
         self._clip_planes: dict[str, tuple[float, float]] = {}
         self._update_s: dict[str, float] = {}
+        self._update_priority: dict[str, float] = {}
+        self._resolution: dict[str, tuple[int, int]] = {}
         self._logged = False
         self._ok = False
         self._grab_i = 0
@@ -703,8 +971,19 @@ class BeamNGPyBackend:
         self._cache_ts: dict[str, float] = {}
         self._hitch_steps: list[tuple[str, float, float, float]] = []  # cid, near, far, update_s
         hitch = self.config.get("hitch") if isinstance(self.config.get("hitch"), dict) else {}
-        self._side_grab_div = camera_grab_div("pillarL", hitch)
-        self._rear_grab_div = camera_grab_div("rear", hitch)
+        self._hitch = hitch
+        self._grab_div = {cid: camera_grab_div(cid, hitch) for cid in CAM_IDS}
+        self._grab_phase = {cid: camera_grab_phase(cid, hitch) for cid in CAM_IDS}
+        self._side_grab_div = self._grab_div["pillarL"]
+        self._rear_grab_div = self._grab_div["rear"]
+        self._Camera: Any = None
+        self._sensor_kwargs: dict[str, dict[str, Any]] = {}
+        self._frame_sig: dict[str, tuple[Any, ...]] = {}
+        self._unique_hz_ema = 0.0
+        self._unique_n = 0
+        self._open_mono = 0.0
+        self._narrow_live_hitched = False
+        self._last_unique_tick_t = 0.0
 
     def open(self) -> None:
         try:
@@ -715,6 +994,7 @@ class BeamNGPyBackend:
                 self._logged = True
             self._ok = False
             return
+        self._Camera = Camera
 
         if not self.session.connect(explicit=True):
             self._ok = False
@@ -741,12 +1021,21 @@ class BeamNGPyBackend:
         origin = self.config.get("origin_offset") or [0.0, 0.0, 0.0]
         attached = 0
         shmem = bool(cam_cfg.get("shared_memory", True))
-        streaming = bool(cam_cfg.get("streaming", True))
+        if cam_cfg.get("streaming") is False:
+            print("[GVD] cameras.streaming=false ignored; stream_raw needs is_streaming=True")
         rgb_only = bool(cam_cfg.get("rgb_only", True))
         clip_defaults = {"near_m": self.config.get("near_m", DEFAULT_NEAR_M)}
         self._clip_planes = {}
         self._update_s = {}
+        self._update_priority = {}
+        self._resolution = {}
         self._hitch_steps = []
+        self._sensor_kwargs = {}
+        self._frame_sig = {}
+        self._unique_hz_ema = 0.0
+        self._unique_n = 0
+        self._open_mono = time.monotonic()
+        self._narrow_live_hitched = False
         for spec in cams:
             cid = str(spec.get("id") or "")
             if not cid or cid not in CAM_IDS:
@@ -766,9 +1055,11 @@ class BeamNGPyBackend:
                 fov_v = float(spec.get("fov_v") or 70.0)
                 want_near, want_far = camera_clip_planes(spec, cid=cid, defaults=clip_defaults)
                 want_rate = camera_update_s(spec, cid=cid)
+                want_prio = camera_update_priority(spec, cid=cid)
                 last_err: Exception | None = None
                 cam = None
                 used_near, used_far, used_rate = want_near, want_far, want_rate
+                used_prio = want_prio
                 attempts = iter_clip_attach_attempts(spec, cid=cid, defaults=clip_defaults)
                 step_s = " ".join(f"far_m={try_far:g}@update_s={try_rate:g}" for _n, try_far, try_rate in attempts)
                 print(f"[GVD] beamngpy Camera hitch steps {cid}: {step_s} (not resolution)")
@@ -783,16 +1074,37 @@ class BeamNGPyBackend:
                         near_m=try_near,
                         far_m=try_far,
                         shmem=shmem,
-                        streaming=streaming,
+                        streaming=True,
                         rgb_only=rgb_only,
+                        update_priority=want_prio,
                     )
                     try:
                         cam = Camera(f"gvd_{cid}", bng, vehicle, **kwargs)
                         used_near, used_far, used_rate = try_near, try_far, try_rate
+                        used_prio = float(kwargs.get("update_priority", want_prio))
                         break
                     except TypeError as e:
                         last_err = e
-                        if "near_far_planes" in str(e):
+                        msg = str(e)
+                        if "update_priority" in msg and "update_priority" in kwargs:
+                            kwargs = dict(kwargs)
+                            kwargs.pop("update_priority", None)
+                            try:
+                                cam = Camera(f"gvd_{cid}", bng, vehicle, **kwargs)
+                                used_near, used_far, used_rate = try_near, try_far, try_rate
+                                used_prio = want_prio
+                                break
+                            except TypeError as e2:
+                                last_err = e2
+                                msg = str(e2)
+                                cam = None
+                            except Exception as e2:
+                                last_err = e2
+                                cam = None
+                                continue
+                        if cam is not None:
+                            break
+                        if "near_far_planes" in msg:
                             print(
                                 f"[GVD] beamngpy Camera rejected near_far_planes for {cid} "
                                 f"({e}); not attaching with silent {BNGPY_DEFAULT_FAR_M:g} m far."
@@ -813,20 +1125,28 @@ class BeamNGPyBackend:
                 self._sensors[cid] = cam
                 self._clip_planes[cid] = (used_near, used_far)
                 self._update_s[cid] = float(used_rate)
+                self._update_priority[cid] = float(used_prio)
+                self._resolution[cid] = (rw, rh)
+                self._sensor_kwargs[cid] = dict(kwargs)
                 self._hitch_steps.append((cid, float(used_near), float(used_far), float(used_rate)))
                 attached += 1
             except Exception as e:
                 print(f"[GVD] beamngpy Camera attach failed for {cid}: {e}")
 
+        self._confirm_priority_scale()
         self._ok = attached > 0
         if not self._logged:
             if self._ok:
                 clips = " ".join(f"{k}={v[1]:g}" for k, v in self._clip_planes.items())
                 rates = " ".join(f"{k}={v:g}" for k, v in self._update_s.items())
+                prios = " ".join(f"{k}={v:g}" for k, v in self._update_priority.items())
                 print(
                     f"[GVD] beamngpy attached {attached} color Camera(s) from cameras.yaml "
                     f"(near_far_planes far_m {clips}; requested_update_time {rates}; "
-                    f"side_grab_div={self._side_grab_div} rear_grab_div={self._rear_grab_div}; "
+                    f"update_priority {prios}; "
+                    f"grab_div main={self._grab_div['main']} wide={self._grab_div['wide']} "
+                    f"narrow={self._grab_div['narrow']} side={self._side_grab_div} "
+                    f"rear={self._rear_grab_div}; stream_raw forwards; "
                     f"GVD→BeamNG vehicle-space convert; depth/semantic OFF)."
                 )
             else:
@@ -858,21 +1178,22 @@ class BeamNGPyBackend:
         self._sensors.clear()
         self._clip_planes.clear()
         self._update_s.clear()
+        self._update_priority.clear()
+        self._resolution.clear()
         self._hitch_steps.clear()
+        self._sensor_kwargs.clear()
+        self._frame_sig.clear()
         self._cache_frames.clear()
         self._cache_ts.clear()
         self._grab_i = 0
+        self._unique_hz_ema = 0.0
+        self._unique_n = 0
+        self._narrow_live_hitched = False
         self.session.close()
         self._ok = False
 
-    def _poll_this_grab(self, cid: str, grab_i: int) -> bool:
-        if cid in REAR_CAM_IDS:
-            div = max(1, int(self._rear_grab_div))
-        elif cid in SIDE_CAM_IDS:
-            div = max(1, int(self._side_grab_div))
-        else:
-            return True
-        return (int(grab_i) % div) == 0
+    def _grab_this_tick(self, cid: str, grab_i: int) -> bool:
+        return camera_grab_due(cid, grab_i, self._hitch)
 
     def _store_frame(self, cid: str, bgr: np.ndarray, ts: float, frames: dict, timestamps: dict, health: dict) -> None:
         frames[cid] = bgr
@@ -884,17 +1205,110 @@ class BeamNGPyBackend:
             frames["cam_main"] = bgr
 
     def _reuse_cached(self, cid: str, frames: dict, timestamps: dict, health: dict) -> None:
+        """Skip / failed stream_raw: keep last pixels for perception, mark STALE (not a camera tick)."""
         bgr = self._cache_frames.get(cid)
         if bgr is None:
             health[cid] = CamHealth.STALE
             return
         frames[cid] = bgr
         timestamps[cid] = self._cache_ts.get(cid, time.time())
-        health[cid] = CamHealth.OK
+        health[cid] = CamHealth.STALE
         if cid == "main":
             frames["cam_main"] = bgr
 
+    def _confirm_priority_scale(self) -> None:
+        """BeamNGpy getter: 0=highest. If main reads ~1, invert so main is not starved."""
+        main = self._sensors.get("main")
+        if main is None:
+            return
+        req = float(self._update_priority.get("main", 0.0))
+        if priority_highest_is_zero(main, req):
+            return
+        print(
+            "[GVD] BeamNGpy update_priority getter scale inverted "
+            "(0 was not highest); flipping so main is not starved"
+        )
+        for cid, cam in list(self._sensors.items()):
+            p = invert_update_priority(self._update_priority.get(cid, 0.5))
+            self._update_priority[cid] = p
+            if cid in self._sensor_kwargs:
+                self._sensor_kwargs[cid]["update_priority"] = p
+            setter = getattr(cam, "set_update_priority", None) or getattr(cam, "setUpdatePriority", None)
+            if callable(setter):
+                try:
+                    setter(p)
+                except Exception:
+                    pass
+
+    def _maybe_live_narrow_hitch(self) -> None:
+        """Runtime 800→400 when unique-frame Hz stays <10. Attach yaml stays 800."""
+        if self._narrow_live_hitched:
+            return
+        planes = self._clip_planes.get("narrow")
+        if not planes:
+            return
+        elapsed = time.monotonic() - self._open_mono if self._open_mono else 0.0
+        want = live_narrow_far_m(
+            self._unique_hz_ema,
+            float(planes[1]),
+            elapsed_s=elapsed,
+            unique_n=self._unique_n,
+        )
+        if want >= float(planes[1]) - 1e-9:
+            return
+        ladder = far_hitch_ladder("narrow", float(planes[1]), unique_hz=self._unique_hz_ema)
+        nxt = next((f for f in ladder if f < float(planes[1]) - 1e-9), want)
+        if abs(nxt - NARROW_FAR_LIVE_HITCH_M) > 1e-6 and abs(want - NARROW_FAR_LIVE_HITCH_M) > 1e-6:
+            return
+        if not self._reattach_cam("narrow", far_m=NARROW_FAR_LIVE_HITCH_M):
+            return
+        self._narrow_live_hitched = True
+        print(
+            f"[GVD] live unique-frame Hz={self._unique_hz_ema:.2f} < {CAMERA_HZ_TARGET:g}; "
+            f"hitch narrow far_m {planes[1]:g}->{NARROW_FAR_LIVE_HITCH_M:g}"
+        )
+
+    def _reattach_cam(self, cid: str, *, far_m: float) -> bool:
+        Camera = self._Camera
+        kwargs = self._sensor_kwargs.get(cid)
+        cam = self._sensors.get(cid)
+        if Camera is None or kwargs is None or self.session.vehicle is None or self.session.bng is None:
+            return False
+        near = float(kwargs.get("near_far_planes", (DEFAULT_NEAR_M, far_m))[0])
+        new_kwargs = dict(kwargs)
+        new_kwargs["near_far_planes"] = (near, float(far_m))
+        if cam is not None:
+            try:
+                cam.remove()
+            except Exception:
+                try:
+                    cam.detach()
+                except Exception:
+                    pass
+        try:
+            fresh = Camera(f"gvd_{cid}", self.session.bng, self.session.vehicle, **new_kwargs)
+        except TypeError:
+            dropped = dict(new_kwargs)
+            dropped.pop("update_priority", None)
+            try:
+                fresh = Camera(f"gvd_{cid}", self.session.bng, self.session.vehicle, **dropped)
+                new_kwargs = dropped
+            except Exception:
+                return False
+        except Exception:
+            return False
+        self._sensors[cid] = fresh
+        self._sensor_kwargs[cid] = new_kwargs
+        rate = float(self._update_s.get(cid, FORWARD_UPDATE_S))
+        self._clip_planes[cid] = (near, float(far_m))
+        self._hitch_steps.append((cid, near, float(far_m), rate))
+        self._frame_sig.pop(cid, None)
+        return True
+
     def grab(self) -> CameraFrameBundle:
+        from python.runtime.hw_probe import ema_hz, unique_frame_hz_inst
+
+        t0 = time.perf_counter()
         health = {cid: CamHealth.MISSING for cid in CAM_IDS}
         if not self._ok or not self._sensors:
             return CameraFrameBundle(
@@ -903,41 +1317,59 @@ class BeamNGPyBackend:
                 health=health,
                 backend=self.name,
                 note="beamngpy: no live Camera session",
+                grab_ms=(time.perf_counter() - t0) * 1000.0,
+                unique_gpu_n=0,
             )
         frames: dict[str, np.ndarray] = {}
         timestamps: dict[str, float] = {}
         ts = time.time()
         grab_i = self._grab_i
         self._grab_i = grab_i + 1
+        unique_ids: list[str] = []
         for cid, cam in self._sensors.items():
-            if not self._poll_this_grab(cid, grab_i):
+            if not self._grab_this_tick(cid, grab_i):
                 self._reuse_cached(cid, frames, timestamps, health)
                 continue
             try:
-                colour = poll_camera_colour(cam)
-                if colour is None:
-                    if cid in self._cache_frames:
-                        self._reuse_cached(cid, frames, timestamps, health)
-                    else:
-                        health[cid] = CamHealth.STALE
-                    continue
-                arr = np.asarray(colour)
-                if arr.ndim == 3 and arr.shape[2] >= 3:
-                    bgr = arr[:, :, :3][:, :, ::-1].copy()
-                else:
-                    health[cid] = CamHealth.ERROR
+                bgr = read_camera_colour(cam, cid=cid, resolution=self._resolution.get(cid))
+                if bgr is None:
+                    self._reuse_cached(cid, frames, timestamps, health)
                     continue
                 bgr = resize_long_side(bgr, self.long_side)
+                sig = frame_signature(bgr)
+                unique = sig != self._frame_sig.get(cid)
                 self._store_frame(cid, bgr, ts, frames, timestamps, health)
+                if unique:
+                    self._frame_sig[cid] = sig
+                    unique_ids.append(cid)
             except Exception:
                 health[cid] = CamHealth.ERROR
+        unique_n = len(unique_ids)
+        now = time.perf_counter()
+        if grab_i > 0 and self._last_unique_tick_t > 0:
+            gap = max(1e-6, now - self._last_unique_tick_t)
+            self._unique_hz_ema = ema_hz(self._unique_hz_ema, unique_frame_hz_inst(unique_n, gap))
+        self._last_unique_tick_t = now
+        if unique_n > 0:
+            self._unique_n += 1
+        self._maybe_live_narrow_hitch()
         n_ok = sum(1 for c in CAM_IDS if health.get(c) == CamHealth.OK)
+        grab_ms = (time.perf_counter() - t0) * 1000.0
         return CameraFrameBundle(
             frames=frames,
             timestamps=timestamps,
             health=health,
             backend=self.name,
-            note=f"beamngpy: {n_ok} colour frame(s) grab={grab_i} side_div={self._side_grab_div} rear_div={self._rear_grab_div}",
+            note=(
+                f"beamngpy: {n_ok} colour frame(s) grab={grab_i} unique={unique_n} "
+                f"main_div={self._grab_div.get('main', 1)} "
+                f"wide_div={self._grab_div.get('wide', 2)} "
+                f"narrow_div={self._grab_div.get('narrow', 2)} "
+                f"side_div={self._side_grab_div} rear_div={self._rear_grab_div}"
+            ),
+            grab_ms=grab_ms,
+            unique_gpu_n=unique_n,
+            unique_gpu_ids=tuple(unique_ids),
         )
 
 

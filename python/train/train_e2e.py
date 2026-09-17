@@ -17,12 +17,9 @@ if str(ROOT) not in sys.path:
 
 
 def clips_root() -> Path:
-    try:
-        from python.runtime.state_io import gvd_docs_dir
+    from python.runtime.paths import gvd_docs_dir
 
-        return gvd_docs_dir() / "clips"
-    except Exception:
-        return Path.home() / "Documents" / "GVD" / "clips"
+    return gvd_docs_dir() / "clips"
 
 
 def list_clip_dirs(root: Path | None = None) -> list[Path]:

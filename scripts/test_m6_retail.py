@@ -570,12 +570,13 @@ def check_engage_path_contract() -> None:
 
 
 def check_gvd_docs_dir() -> None:
-    """Lua + Python share USERPROFILE/Documents/GVD; LINKED is gvd_state HB only."""
+    """Lua gvdDocsDir + Python FOLDERID_Documents; LINKED is gvd_state HB only."""
     import test_gvd_docs_dir as docs_dir
 
     lua = (ROOT / "beamng_mod" / "lua" / "ge" / "extensions" / "gvd" / "main.lua").read_text(encoding="utf-8")
     docs_dir.check_source_contracts(lua)
     docs_dir.check_python_mirror()
+    docs_dir.check_python_known_folder()
 
 
 def _py_string_literals(path: Path) -> list[str]:

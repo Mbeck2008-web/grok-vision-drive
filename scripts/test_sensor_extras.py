@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from python.control.actuate import EgoFeedback, read_ego_feedback  # noqa: E402
+from python.runtime.state_io import gvd_docs_dir  # noqa: E402
 from python.sensors.extras import (  # noqa: E402
     ExtraSensors,
     apply_sensor_env,
@@ -74,8 +75,7 @@ def check_parse_lidar_radar() -> None:
 
 
 def check_ego_feedback_extras() -> None:
-    docs = Path.home() / "Documents" / "GVD"
-    docs.mkdir(parents=True, exist_ok=True)
+    docs = gvd_docs_dir()
     p = docs / "gvd_ego.json"
     p.write_text(
         '{"speed_mps":4.0,"steering_input":0.1,"throttle_input":0.2,"brake_input":0.0,'

@@ -4,16 +4,12 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import time
 from pathlib import Path
 from typing import Any
 
-def gvd_docs_dir() -> Path:
-    home = Path(os.path.expanduser("~"))
-    d = home / "Documents" / "GVD"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+# All Documents/GVD writers/readers go through Known Folder + fallbacks in paths.py.
+from python.runtime.paths import gvd_docs_dir as gvd_docs_dir
 
 def state_path() -> Path:
     return gvd_docs_dir() / "gvd_state.json"

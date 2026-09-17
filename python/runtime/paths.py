@@ -1,17 +1,18 @@
-"""Resolve Documents/GVD the same way Windows Explorer / Lua gvdDocsDir intend.
+"""Resolve Documents/GVD to local ``%USERPROFILE%\\Documents\\GVD``.
 
-On OneDrive Personal, ``%USERPROFILE%\\Documents`` is often *not* the Known Folder
-(FOLDERID_Documents). Python ``expanduser(\"~\") / Documents / GVD`` then drifts
-from Lua, which after #37 strips ``…/OneDrive/Documents/…`` to
-``…/OneDrive/Documents/GVD``. Apps stay NO LINK unless both sides write the
-real Documents folder (no junction required).
+#38 followed ``SHGetKnownFolderPath(FOLDERID_Documents)`` onto OneDrive Personal.
+Lua ``gvdDocsDir`` is USERPROFILE-first (``{USERPROFILE}/Documents/GVD``) and is
+left as-is. Python must match that local folder — not the Known Folder redirect.
 
-Resolution (Windows first):
-  1. ``SHGetKnownFolderPath(FOLDERID_Documents)`` via ctypes/shell32 (no pywin32)
-  2. ``%USERPROFILE%/Documents`` or ``expanduser(~)/Documents``
-  3. relative ``Documents``
+Resolution:
+  1. env override ``GVD_DOCS_DIR`` if set (full GVD root)
+  2. ``%USERPROFILE%/Documents`` (local, non-redirected; never OneDrive)
+  3. ``SHGetKnownFolderPath(FOLDERID_Documents)`` probe only if USERPROFILE is missing
+     (ctypes/shell32, no pywin32) — **reject** when the path contains ``OneDrive``
+  4. ``expanduser(~)/Documents`` / ``HOME``; else relative ``Documents``
 
-Callers append ``GVD`` through ``gvd_docs_dir()``.
+Callers append ``GVD`` through ``gvd_docs_dir()`` unless the override already is
+the GVD root.
 """
 
 from __future__ import annotations
@@ -36,6 +37,27 @@ def folderid_documents_fields() -> tuple[int, int, int, tuple[int, ...]]:
         _FOLDERID_DOCUMENTS_DATA3,
         _FOLDERID_DOCUMENTS_DATA4,
     )
+
+
+def is_onedrive_path(path: Path | str | None) -> bool:
+    """True when *path* is a OneDrive redirect (Personal, Business, ``OneDrive - …``)."""
+    if path is None:
+        return False
+    text = str(path).replace("\\", "/")
+    if not text.strip():
+        return False
+    return "onedrive" in text.lower()
+
+
+def env_override_gvd_docs_dir() -> Path | None:
+    """``GVD_DOCS_DIR`` env override (full GVD root), or None if unset/blank."""
+    raw = os.environ.get("GVD_DOCS_DIR")
+    if raw is None:
+        return None
+    stripped = str(raw).strip()
+    if not stripped:
+        return None
+    return Path(stripped)
 
 
 def _call_sh_get_known_folder_path() -> str | None:
@@ -78,7 +100,7 @@ def _call_sh_get_known_folder_path() -> str | None:
     try:
         hr = sh_get_known_folder_path(
             ctypes.byref(folder_id),
-            0,  # KF_FLAG_DEFAULT — redirected OneDrive Documents when set
+            0,  # KF_FLAG_DEFAULT — probe only; OneDrive redirects are rejected
             None,
             ctypes.byref(path_ptr),
         )
@@ -96,7 +118,7 @@ def _call_sh_get_known_folder_path() -> str | None:
 
 
 def windows_known_folder_documents() -> Path | None:
-    """Real Documents folder from ``SHGetKnownFolderPath(FOLDERID_Documents)``."""
+    """Raw Documents folder from ``SHGetKnownFolderPath(FOLDERID_Documents)`` (probe)."""
     raw = _call_sh_get_known_folder_path()
     if not raw or not str(raw).strip():
         return None
@@ -118,18 +140,23 @@ def env_documents_dir() -> Path | None:
 
 
 def documents_dir() -> Path:
-    """Documents root for every GVD bus file (state/cmd/engage/prefs/clips)."""
-    known = windows_known_folder_documents()
-    if known is not None:
-        return known
+    """Local Documents: USERPROFILE first; never an OneDrive Known Folder redirect."""
     env_docs = env_documents_dir()
+    if env_docs is not None and not is_onedrive_path(env_docs):
+        return env_docs
+    known = windows_known_folder_documents()
+    if known is not None and not is_onedrive_path(known):
+        return known
     if env_docs is not None:
         return env_docs
     return Path("Documents")
 
 
 def gvd_docs_path() -> Path:
-    """``{Documents}/GVD`` without mkdir (tests / path math)."""
+    """``{Documents}/GVD`` without mkdir (tests / path math). ``GVD_DOCS_DIR`` wins."""
+    override = env_override_gvd_docs_dir()
+    if override is not None:
+        return override
     return documents_dir() / "GVD"
 
 

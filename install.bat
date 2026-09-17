@@ -84,7 +84,8 @@ if %ERRORLEVEL%==0 (
   echo [GVD] tar not found - skipped gvd.zip (unpacked install is enough)
 )
 
-set "DOCS=%USERPROFILE%\Documents\GVD"
+set "DOCS=%GVD_DOCS_DIR%"
+if not defined DOCS set "DOCS=%USERPROFILE%\Documents\GVD"
 if not exist "%DOCS%\" mkdir "%DOCS%"
 if exist "%~dp0python\" xcopy /E /I /Y "%~dp0python\*" "%DOCS%\python\" >nul
 if exist "%~dp0config\" xcopy /E /I /Y "%~dp0config\*" "%DOCS%\config\" >nul

@@ -1,7 +1,7 @@
 {
   "name": "GVD",
   "author": "GVD",
-  "version": "0.2.1",
+  "version": "1.0.0",
   "description": "GVD / VISION - engage, settings, wheel and pedals",
   "directive": "gvdApp",
   "domElement": "<gvd-app></gvd-app>",

@@ -4,6 +4,17 @@ Public **MIT** BeamNG.drive / BeamNG.tech **camera-only** self-driving **toy** i
 
 Entertainment only. Never use this stack to control a physical car.
 
+## Alpha 1.0.0
+
+This is **alpha** — it may break / not work. It improves with fixes.
+
+Canonical pin **1.0.0** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Untagged retail zips use `1.0.0-alpha-<sha>`.
+
+**Versioning** (this line stays **alpha** until a later non-alpha release):
+
+- **point** bumps (`1.0.x`) = fixes / small UI
+- **main alpha** bump (`1.x.0`) = features / core / UI overhaul
+
 ## Honesty (M0)
 
 - **Vision only** at inference: RGB cameras + ego kinematics + GPS as a **nav hint**. Optional pin (`nav.pin_lat` / `nav.pin_lon` in `config/tech.yaml`, or `GVD_NAV_PIN_LAT` / `GVD_NAV_PIN_LON`) is **not a route** — `nav.mode=hint`, `drive_to_pin=false`, and the corridor planner ignores the pin.
@@ -149,7 +160,7 @@ Optional bus in `config/sensors.yaml`. Defaults: IMU + GPS **on**; `lidar` / `ra
 
 ## Release zip (M6)
 
-Windows: double-click `scripts\make_release_zip.bat`. Anywhere: `python scripts/make_release_zip.py`. Output: `dist\gvd-retail-<version>.zip` (gitignored), `<version>` = exact git tag if any, else `m6-<sha>[-dirty]`; override with `--version v0.6.0`, `--out path`, `--flat` (no top-level folder), `--list` (manifest only).
+Windows: double-click `scripts\make_release_zip.bat`. Anywhere: `python scripts/make_release_zip.py`. Output: `dist\gvd-retail-<version>.zip` (gitignored), `<version>` = exact git tag if any, else `1.0.0-alpha-<sha>[-dirty]`; override with `--version 1.0.0`, `--out path`, `--flat` (no top-level folder), `--list` (manifest only).
 
 Packs: `install.bat`, `uninstall.bat`, `play_gvd.bat`, `beamng_mod/`, `python/` (retail runtime), `config/` (including `sensors.yaml`), `requirements.txt` + `requirements-retail.txt`, `LICENSE`, `README.md`, `docs/*.md`, `models/yolov8n.onnx` + `models/NOTICE.txt`, plus a generated `VERSION.txt` (version, build time, git sha, the retail honesty lines). Excludes `data/clips/`, extra weights (`*.pt`, other `*.onnx`, `*.pth` `*.bin` `*.safetensors`), `.git`, `scripts/` (tests + this tool), `__pycache__`, `dist/`, and `requirements-foxglove.txt`. `*.bat` are written CRLF. After writing, the script re-opens the zip, refuses forbidden members and missing must-haves (mod entry point, `run_vision.py`, launchers, `models/yolov8n.onnx`), and exits non-zero on any problem. Attach the zip to a GitHub Release. Offline check: `PYTHONPATH=. python scripts/test_m6_retail.py`.
 
@@ -223,6 +234,8 @@ PYTHONPATH=. python scripts/test_gvd_viz_stage.py
 Keys in `--viz`: `V` nerd, `D` DRIVE (live actuators), `G` VIZ (occupancy / boxes / FOV / cost), `M` MODEL (detector / e2e), `A` CAMS (8 views), `[` `]` tabs, `j/k` `h/l` / click to edit, `0` clean cabin, `1–5` overlay layers, `T` chase↔BEV, `C` clip, `q` quit. Occupancy is derived from tracks, not a learned grid. CAMS / camera-strip blits drop under 8 Hz.
 
 ## Status
+
+**Alpha 1.0.0:** this is **alpha** — it may break / not work. It improves with fixes. **point** bumps = fixes / small UI. **main alpha** bump = features / core / UI overhaul. See [Alpha 1.0.0](#alpha-100).
 
 **Force-feedback player override:** wheel chatter no longer disengages GVD. Signal is `|steering_input − aligned cmd.steer|` (never an absolute angle), then spike reject → EMA → hysteresis → dwell. Pedals are asymmetric and tight. Live FFB is **UNPROVEN**. Details under [Actuation](#actuation-m3).
 

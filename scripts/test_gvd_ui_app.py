@@ -49,6 +49,8 @@ def main() -> None:
                              / "app.json").read_text(encoding="utf-8"))
     assert strip_json["directive"] == "gvdStrip", strip_json["directive"]
     assert isinstance(strip_json["css"], dict), "gvd_strip css must be an object"
+    assert app_json["version"] == "1.0.0", app_json["version"]
+    assert strip_json["version"] == "1.0.0", strip_json["version"]
 
     # Titles stay GVD / VISION, and no Tesla / FSD chrome anywhere the player can see.
     assert "GVD" in app_html and "VISION" in app_html

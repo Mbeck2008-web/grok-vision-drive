@@ -90,104 +90,92 @@ end
 -- USERPROFILE\Documents is NOT readable by Tech Lua (live Apps NO LINK). Not OneDrive.
 -- GVD_DOCS_DIR override wins. Never a bare gvd_*.json under userfolder current\.
 -- CEF Apps LINKED is gvd_state heartbeat only (see linkState); gvd_ego.json is not required.
+-- Extra helpers stay nested: Lua 5.1 main chunks are capped at 200 locals.
 local gvdDocsResolved = nil
 local gvdDocsLogged = false
-local TECH_GVD_TAIL = 'BeamNG/BeamNG.tech/current/Documents/GVD'
-
-local function _slash(p)
-  return tostring(p):gsub('\\', '/')
-end
-
-local function _trim(s)
-  if not s then return '' end
-  return tostring(s):match('^%s*(.-)%s*$') or ''
-end
-
-local function _isOnedrive(p)
-  if not p or p == '' then return false end
-  return _slash(p):lower():find('onedrive', 1, true) ~= nil
-end
-
-local function _techGvdFromLocalApp(localApp)
-  if not localApp or localApp == '' then return nil end
-  local la = _slash(_trim(localApp))
-  if la == '' or _isOnedrive(la) then return nil end
-  return la .. '/' .. TECH_GVD_TAIL
-end
 
 local function _localAppFromPath(p)
   if not p or p == '' then return nil end
-  p = _slash(p)
+  p = tostring(p):gsub('\\', '/')
+  if p:lower():find('onedrive', 1, true) then return nil end
   local la = p:match('^(.+/AppData/Local)')
-  if la and la ~= '' and not _isOnedrive(la) then return la end
+  if la and la ~= '' then return la end
   return nil
 end
 
 local function _techCurrentFromPath(p)
   if not p or p == '' then return nil end
-  p = _slash(p)
+  p = tostring(p):gsub('\\', '/')
+  if p:lower():find('onedrive', 1, true) then return nil end
   local cur = p:match('^(.+/BeamNG/BeamNG.tech/current)')
-  if cur and cur ~= '' and not _isOnedrive(cur) then return cur end
+  if cur and cur ~= '' then return cur end
   return nil
 end
 
 local function _tryEnvDocs()
-  local ov = _trim(os.getenv('GVD_DOCS_DIR'))
-  if ov ~= '' then return _slash(ov) end
-  local fromLa = _techGvdFromLocalApp(os.getenv('LOCALAPPDATA'))
+  local ov = os.getenv('GVD_DOCS_DIR')
+  if ov then
+    ov = tostring(ov):match('^%s*(.-)%s*$') or ''
+    if ov ~= '' then return ov:gsub('\\', '/') end
+  end
+  local function techFromLa(localApp)
+    if not localApp or localApp == '' then return nil end
+    local la = tostring(localApp):gsub('\\', '/')
+    la = la:match('^%s*(.-)%s*$') or la
+    if la == '' or la:lower():find('onedrive', 1, true) then return nil end
+    return la .. '/BeamNG/BeamNG.tech/current/Documents/GVD'
+  end
+  local fromLa = techFromLa(os.getenv('LOCALAPPDATA'))
   if fromLa then return fromLa end
   -- LOCALAPPDATA is usually USERPROFILE/AppData/Local — never USERPROFILE/Documents.
   local home = os.getenv('USERPROFILE') or os.getenv('HOME')
   if home and home ~= '' then
-    return _techGvdFromLocalApp(_slash(home) .. '/AppData/Local')
-  end
-  return nil
-end
-
-local function _considerNative(native)
-  if not native or native == '' then return nil end
-  local cur = _techCurrentFromPath(native)
-  if cur then return cur .. '/Documents/GVD' end
-  local la = _localAppFromPath(native)
-  if la then return _techGvdFromLocalApp(la) end
-  return nil
-end
-
-local function _tryFsDocs()
-  if not FS then return nil end
-  if FS.getUserPath then
-    local ok, up = pcall(function() return FS:getUserPath() end)
-    if ok then
-      local d = _considerNative(up)
-      if d then return d end
-    end
-  end
-  for _, vp in ipairs({'settings', '/settings', 'settings/'}) do
-    if FS.virtual2Native then
-      local ok, native = pcall(function() return FS:virtual2Native(vp) end)
-      if ok then
-        local d = _considerNative(native)
-        if d then return d end
-      end
-    end
-    if FS.getFileRealPath then
-      local ok, native = pcall(function() return FS:getFileRealPath(vp) end)
-      if ok then
-        local d = _considerNative(native)
-        if d then return d end
-      end
-    end
+    return techFromLa(tostring(home):gsub('\\', '/') .. '/AppData/Local')
   end
   return nil
 end
 
 local function gvdDocsDir()
   if gvdDocsResolved then return gvdDocsResolved end
+  local function consider(native)
+    if not native or native == '' then return nil end
+    local cur = _techCurrentFromPath(native)
+    if cur then return cur .. '/Documents/GVD' end
+    local la = _localAppFromPath(native)
+    if la then return la .. '/BeamNG/BeamNG.tech/current/Documents/GVD' end
+    return nil
+  end
+  local function _tryFsDocs()
+    if not FS then return nil end
+    if FS.getUserPath then
+      local ok, up = pcall(function() return FS:getUserPath() end)
+      if ok then
+        local d = consider(up)
+        if d then return d end
+      end
+    end
+    for _, vp in ipairs({'settings', '/settings', 'settings/'}) do
+      if FS.virtual2Native then
+        local ok, native = pcall(function() return FS:virtual2Native(vp) end)
+        if ok then
+          local d = consider(native)
+          if d then return d end
+        end
+      end
+      if FS.getFileRealPath then
+        local ok, native = pcall(function() return FS:getFileRealPath(vp) end)
+        if ok then
+          local d = consider(native)
+          if d then return d end
+        end
+      end
+    end
+    return nil
+  end
   local dir = _tryEnvDocs() or _tryFsDocs()
   if not dir or dir == '' then
     dir = 'Documents/GVD'
   end
-  -- Best-effort mkdir
   if FS and FS.directoryCreate then
     pcall(function() FS:directoryCreate(dir, true) end)
   end

@@ -4,6 +4,8 @@ Public **MIT** BeamNG.drive / BeamNG.tech **camera-only** self-driving **toy** i
 
 Entertainment only. Never use this stack to control a physical car.
 
+First-time clone: point [Grok Build](https://x.ai/cli), Grok Bot, or any computer-use agent at this repo on extra-high reasoning — paste [`AGENTS.md`](AGENTS.md) if the tool does not auto-read the tree. Have it install GVD on this PC, probe or accept the specs, pick **retail** window-capture vs BeamNG.**tech** 8-cam from what is actually installed, and patch [`config/hardware.yaml`](config/hardware.yaml) to that GPU / VRAM / RAM. No step-by-step here — the model can open the project.
+
 ## Alpha 1.0.0
 
 This is **alpha** — may break / not work; improves with fixes.
@@ -174,7 +176,7 @@ Optional bus in `config/sensors.yaml`. Defaults: IMU + GPS **on**; `lidar` / `ra
 
 Windows: double-click `scripts\make_release_zip.bat`. Anywhere: `python scripts/make_release_zip.py`. Output: `dist\gvd-retail-<version>.zip` (gitignored), `<version>` = exact git tag if any, else `1.0.0-alpha-<sha>[-dirty]`; override with `--version 1.0.0`, `--out path`, `--flat` (no top-level folder), `--list` (manifest only).
 
-Packs: `install.bat`, `uninstall.bat`, `play_gvd.bat`, `beamng_mod/`, `python/` (retail runtime), `config/` (including `sensors.yaml`), `requirements.txt` + `requirements-retail.txt`, `LICENSE`, `README.md`, `docs/*.md`, `models/yolov8n.onnx` + `models/NOTICE.txt`, plus a generated `VERSION.txt` (version, build time, git sha, the retail honesty lines). Excludes `data/clips/`, extra weights (`*.pt`, other `*.onnx`, `*.pth` `*.bin` `*.safetensors`), `.git`, `scripts/` (tests + this tool), `__pycache__`, `dist/`, and `requirements-foxglove.txt`. `*.bat` are written CRLF. After writing, the script re-opens the zip, refuses forbidden members and missing must-haves (mod entry point, `run_vision.py`, launchers, `models/yolov8n.onnx`), and exits non-zero on any problem. Attach the zip to a GitHub Release. Offline check: `PYTHONPATH=. python scripts/test_m6_retail.py`.
+Packs: `install.bat`, `uninstall.bat`, `play_gvd.bat`, `beamng_mod/`, `python/` (retail runtime), `config/` (including `sensors.yaml`), `requirements.txt` + `requirements-retail.txt`, `LICENSE`, `README.md`, `AGENTS.md`, `docs/*.md`, `models/yolov8n.onnx` + `models/NOTICE.txt`, plus a generated `VERSION.txt` (version, build time, git sha, the retail honesty lines). Excludes `data/clips/`, extra weights (`*.pt`, other `*.onnx`, `*.pth` `*.bin` `*.safetensors`), `.git`, `scripts/` (tests + this tool), `__pycache__`, `dist/`, and `requirements-foxglove.txt`. `*.bat` are written CRLF. After writing, the script re-opens the zip, refuses forbidden members and missing must-haves (mod entry point, `run_vision.py`, launchers, `models/yolov8n.onnx`), and exits non-zero on any problem. Attach the zip to a GitHub Release. Offline check: `PYTHONPATH=. python scripts/test_m6_retail.py`.
 
 ## Layout
 

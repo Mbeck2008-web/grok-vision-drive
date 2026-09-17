@@ -110,6 +110,7 @@ def check_release_zip() -> None:
             assert "docs/media/gvd_cabin_synthetic.png" in rels
             assert "docs/media/gvd_ingame_ui_synthetic.png" in rels
             assert "docs/media/SOURCE.md" in rels
+            assert "AGENTS.md" in rels
             assert "models/.gitkeep" in rels
             assert "models/yolov8n.onnx" in rels
             assert not any(r.startswith("scripts/test_") for r in rels)

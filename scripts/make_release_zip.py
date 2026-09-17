@@ -7,7 +7,7 @@ Windows-friendly: double-click ``scripts\\make_release_zip.bat`` or run
 Ships the **retail** slice a player double-clicks:
   install.bat / uninstall.bat / play_gvd.bat, beamng_mod/, python/ (runtime),
   config/, requirements.txt + requirements-retail.txt, LICENSE, README.md,
-  docs/*.md, docs/media/ (synthetic README shots), VERSION.txt.
+  AGENTS.md, docs/*.md, docs/media/ (synthetic README shots), VERSION.txt.
 
 Never ships: data/clips/, extra weights (*.pt, e2e ONNX, random blobs),
 .git, __pycache__, venvs, scripts/ (tests + this tool), dist/.
@@ -42,6 +42,7 @@ INCLUDE_FILES = (
     "play_gvd.bat",
     "LICENSE",
     "README.md",
+    "AGENTS.md",
 )
 INCLUDE_GLOBS = (
     # Retail zip: base + retail only (no beamng/perception/viz extras).

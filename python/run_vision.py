@@ -47,12 +47,13 @@ from python.runtime.shadow import ShadowConfig, load_shadow_config, shadow_tick
 from python.runtime.state_io import (
     default_state,
     load_paint_state,
+    print_py_bus,
     read_state,
     state_path,
     steer_preview_path_ego,
     write_state,
 )
-from python.runtime.paths import bus_identity, format_bus_identity_line
+from python.runtime.paths import bus_identity
 from python.sensors.cameras import make_backend, resolve_backend_name
 from python.viz.monitors import place_opencv_window
 from python.viz.stage import STAGE_W, STAGE_H, VizUI, render_stage, smoke
@@ -351,15 +352,7 @@ def main() -> None:
 
     print(f"[GVD] camera backend={backend.name} detector={perc.detector.name} actuator={actuator.name}")
     ident0 = bus_identity()
-    print(format_bus_identity_line(
-        python_bus=ident0.python_bus_s,
-        lua_bus=ident0.lua_bus_s,
-        product=ident0.product,
-        state_mtime="--",
-        engage=False,
-        seq=-1,
-        link=ident0.link if ident0.link == "MISMATCH" else None,
-    ))
+    print_py_bus(state_path(), force=True)
     if not ident0.matched:
         print(f"[GVD] link=MISMATCH {ident0.note} — refuse actuation. Steam GELua does not inherit GVD_DOCS_DIR.")
     if actuator.name == "cmd_json":
@@ -422,7 +415,6 @@ def main() -> None:
         cv2.setMouseCallback(win, _on_mouse)
 
     session_start = time.time()
-    last_ident_print = 0.0
     policy_active = args.policy
     frame_i = 0
     cmd_seq = 0
@@ -790,28 +782,6 @@ def main() -> None:
                 st["last_clip_path"] = recorder.last_clip_path
 
             write_state(st)
-
-            now_wall = time.time()
-            if now_wall - last_ident_print >= 1.0:
-                last_ident_print = now_wall
-                mt: object = "--"
-                try:
-                    if state_path().is_file():
-                        mt = f"{state_path().stat().st_mtime:.3f}"
-                except OSError:
-                    mt = st.get("heartbeat_mtime") or "--"
-                print(
-                    format_bus_identity_line(
-                        python_bus=ident.python_bus_s,
-                        lua_bus=ident.lua_bus_s,
-                        product=ident.product,
-                        state_mtime=mt,
-                        engage=engaged,
-                        seq=st.get("cmd_seq", cmd_seq),
-                        link=ident.link if ident.link == "MISMATCH" else None,
-                    ),
-                    flush=True,
-                )
 
             if win is not None:
                 import cv2

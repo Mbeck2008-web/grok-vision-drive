@@ -16,6 +16,31 @@ from typing import Any
 from python.runtime.paths import bus_identity as bus_identity
 from python.runtime.paths import gvd_docs_dir as gvd_docs_dir
 
+_last_py_bus_print = 0.0
+
+
+def print_py_bus(state_file: Path, state: dict[str, Any] | None = None, *, force: bool = False) -> None:
+    """Once per second: the folder Python actually wrote. Steam Lua does not inherit env."""
+    global _last_py_bus_print
+    now = time.time()
+    if not force and now - _last_py_bus_print < 1.0:
+        return
+    _last_py_bus_print = now
+    exists = False
+    mtime: object = "--"
+    try:
+        exists = state_file.is_file()
+        if exists:
+            mtime = f"{state_file.stat().st_mtime:.3f}"
+    except OSError:
+        exists = False
+    engaged = bool((state or {}).get("engaged"))
+    print(
+        f"[GVD][PY]  bus= {state_file.parent}  state= {str(exists).lower()}  "
+        f"mtime= {mtime}  engaged= {str(engaged).lower()}",
+        flush=True,
+    )
+
 def state_path() -> Path:
     return gvd_docs_dir() / "gvd_state.json"
 
@@ -242,9 +267,12 @@ def write_state(state: dict[str, Any], path: Path | None = None) -> Path:
     p = path or state_path()
     state = dict(state)
     attach_bus_identity(state)
+    # Stamp the folder this write actually used so Lua can refuse a mismatch.
+    state["python_bus"] = str(p.parent)
     state["heartbeat_unix"] = int(time.time())  # match Lua os.time() seconds
     state["heartbeat_mtime"] = time.time()  # high-res for Lua dead-man
     atomic_write_json(p, state)
+    print_py_bus(p, state)
     return p
 
 

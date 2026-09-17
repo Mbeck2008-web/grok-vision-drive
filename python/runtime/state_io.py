@@ -10,7 +10,8 @@ from typing import Any
 
 # All GVD bus writers/readers go through paths.py (GVD_DOCS_DIR, then the
 # running product sandbox: Tech → BeamNG.tech\current\Documents\GVD;
-# Drive → BeamNG.drive\current\Documents\GVD). Not USERPROFILE Documents.
+# Drive → BeamNG.drive\current\Documents\GVD). Lua reads that same folder as
+# relative Documents/GVD via VFS / FS:readFile. Not USERPROFILE Documents.
 # Not OneDrive. Steam GELua does not inherit GVD_DOCS_DIR.
 from python.runtime.paths import gvd_docs_dir as gvd_docs_dir
 

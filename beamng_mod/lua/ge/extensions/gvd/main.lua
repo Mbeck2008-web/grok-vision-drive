@@ -85,145 +85,42 @@ end
 
 
 
--- Resolve GVD bus dir so Lua + Python share the *running* product sandbox:
+-- Lua bus reads/writes are userfolder-relative Documents/GVD via VFS / FS:readFile
+-- (and FS:writeFile). Tech GELua cannot io.open absolute LOCALAPPDATA paths.
+-- Python still writes the product sandbox (dual-path #40):
 --   Tech:  %LOCALAPPDATA%/BeamNG/BeamNG.tech/current/Documents/GVD
 --   Drive: %LOCALAPPDATA%/BeamNG/BeamNG.drive/current/Documents/GVD
--- Steam GELua does not inherit GVD_DOCS_DIR — live retail follows FS userfolder.
--- Tech cannot io.open the Drive sandbox; Drive cannot io.open the Tech sandbox.
--- USERPROFILE\Documents is NOT readable by Tech Lua. Not OneDrive.
--- GVD_DOCS_DIR override wins when inherited. Never a bare gvd_*.json under userfolder current\.
+-- Those folders are the same physical tree the running userfolder maps as Documents/GVD.
+-- GVD_DOCS_DIR is the Python writer override; an absolute value is not a Lua read path.
+-- A relative GVD_DOCS_DIR still wins. Never a bare gvd_*.json under userfolder current\.
 -- CEF link is gvd_state heartbeat only (see linkState); live Apps LINK is UNPROVEN.
--- Extra helpers stay nested: Lua 5.1 main chunks are capped at 200 locals.
 local gvdDocsResolved = nil
 local gvdDocsLogged = false
 
-local function _localAppFromPath(p)
-  if not p or p == '' then return nil end
-  p = tostring(p):gsub('\\', '/')
-  if p:lower():find('onedrive', 1, true) then return nil end
-  local la = p:match('^(.+/AppData/Local)')
-  if la and la ~= '' then return la end
-  return nil
-end
-
-local function _techCurrentFromPath(p)
-  if not p or p == '' then return nil end
-  p = tostring(p):gsub('\\', '/')
-  if p:lower():find('onedrive', 1, true) then return nil end
-  local cur = p:match('^(.+/BeamNG/BeamNG.tech/current)')
-  if cur and cur ~= '' then return cur end
-  return nil
+local function _isAbsDiskPath(path)
+  local p = tostring(path or '')
+  if p:match('^%a:[/\\]') then return true end
+  if p:match('^\\\\') then return true end
+  if p:sub(1, 1) == '/' then return true end
+  return false
 end
 
 local function _tryEnvDocs()
-  -- GVD_DOCS_DIR override only. LOCALAPPDATA is product-specific and comes
-  -- *after* FS:getUserPath so Steam retail is not forced onto the Tech tail.
+  -- Relative GVD_DOCS_DIR only. Absolute override is Python's Tech/Drive write root.
   local ov = os.getenv('GVD_DOCS_DIR')
   if ov then
     ov = tostring(ov):match('^%s*(.-)%s*$') or ''
-    if ov ~= '' then return ov:gsub('\\', '/') end
+    if ov ~= '' then
+      ov = ov:gsub('\\', '/')
+      if not _isAbsDiskPath(ov) then return ov end
+    end
   end
   return nil
 end
 
 local function gvdDocsDir()
   if gvdDocsResolved then return gvdDocsResolved end
-  local function _driveCurrentFromPath(p)
-    if not p or p == '' then return nil end
-    p = tostring(p):gsub('\\', '/')
-    if p:lower():find('onedrive', 1, true) then return nil end
-    local cur = p:match('^(.+/BeamNG/BeamNG.drive/current)')
-    if cur and cur ~= '' then return cur end
-    return nil
-  end
-  local function _productFromPath(p)
-    if not p or p == '' then return nil end
-    local s = tostring(p):gsub('\\', '/'):lower()
-    if s:find('onedrive', 1, true) then return nil end
-    if s:find('beamng.tech', 1, true) then return 'tech' end
-    if s:find('beamng.drive', 1, true) then return 'drive' end
-    return nil
-  end
-  local function fromLa(localApp, product)
-    if not localApp or localApp == '' then return nil end
-    local la = tostring(localApp):gsub('\\', '/')
-    la = la:match('^%s*(.-)%s*$') or la
-    if la == '' or la:lower():find('onedrive', 1, true) then return nil end
-    if product == 'drive' then
-      return la .. '/BeamNG/BeamNG.drive/current/Documents/GVD'
-    end
-    return la .. '/BeamNG/BeamNG.tech/current/Documents/GVD'
-  end
-  local function _envProduct()
-    local p = os.getenv('GVD_PRODUCT')
-    if p and tostring(p) ~= '' then
-      p = tostring(p):lower():match('^%s*(.-)%s*$') or ''
-      if p == 'tech' or p == 'beamng.tech' or p == 'beamngtech' then return 'tech' end
-      if p == 'drive' or p == 'retail' or p == 'beamng.drive' or p == 'beamngdrive' then return 'drive' end
-    end
-    local b = os.getenv('GVD_BEAMNG')
-    if b and tostring(b) ~= '' then
-      b = tostring(b):lower():match('^%s*(.-)%s*$') or ''
-      if b == '1' or b == 'true' or b == 'yes' then return 'tech' end
-    end
-    local be = os.getenv('GVD_BACKEND')
-    if be and tostring(be) ~= '' then
-      be = tostring(be):lower():match('^%s*(.-)%s*$') or ''
-      if be == 'beamngpy' or be == 'tech' then return 'tech' end
-    end
-    return 'drive'
-  end
-  local function homeAppData()
-    -- LOCALAPPDATA is usually USERPROFILE/AppData/Local — never USERPROFILE/Documents.
-    local home = os.getenv('USERPROFILE') or os.getenv('HOME')
-    if not home or home == '' then return nil end
-    return tostring(home):gsub('\\', '/') .. '/AppData/Local'
-  end
-  local function consider(native)
-    if not native or native == '' then return nil end
-    local techCur = _techCurrentFromPath(native)
-    if techCur then return techCur .. '/Documents/GVD' end
-    local driveCur = _driveCurrentFromPath(native)
-    if driveCur then return driveCur .. '/Documents/GVD' end
-    local product = _productFromPath(native)
-    if not product then return nil end
-    local la = _localAppFromPath(native)
-    if la then return fromLa(la, product) end
-    return fromLa(os.getenv('LOCALAPPDATA'), product) or fromLa(homeAppData(), product)
-  end
-  local function _tryFsDocs()
-    if not FS then return nil end
-    if FS.getUserPath then
-      local ok, up = pcall(function() return FS:getUserPath() end)
-      if ok then
-        local d = consider(up)
-        if d then return d end
-      end
-    end
-    for _, vp in ipairs({'settings', '/settings', 'settings/'}) do
-      if FS.virtual2Native then
-        local ok, native = pcall(function() return FS:virtual2Native(vp) end)
-        if ok then
-          local d = consider(native)
-          if d then return d end
-        end
-      end
-      if FS.getFileRealPath then
-        local ok, native = pcall(function() return FS:getFileRealPath(vp) end)
-        if ok then
-          local d = consider(native)
-          if d then return d end
-        end
-      end
-    end
-    return nil
-  end
-  local function _tryEnvProductDocs()
-    local product = _envProduct()
-    return fromLa(os.getenv('LOCALAPPDATA'), product) or fromLa(homeAppData(), product)
-  end
-  -- Override, then running userfolder (Steam has no GVD_DOCS_DIR), then env product.
-  local dir = _tryEnvDocs() or _tryFsDocs() or _tryEnvProductDocs()
+  local dir = _tryEnvDocs()
   if not dir or dir == '' then
     dir = 'Documents/GVD'
   end
@@ -298,45 +195,24 @@ local function writeEngageFile(reason)
   writeText(userEngagePath(), payload)
 end
 
--- Absolute disk paths: io.open FIRST. VFS readFile / FS:readFile often fail
--- (or return empty/junk) on C:/ and \\ paths, which left lastGood nil when the
--- bus was USERPROFILE\Documents\GVD (Tech cannot read that folder). Bus is the
--- running product current\Documents\GVD (Tech vs Drive). Live Apps LINK UNPROVEN.
-local function _isAbsDiskPath(path)
-  local p = tostring(path or '')
-  -- spec: ^[A-Za-z]:/  or  \\UNC
-  if p:match('^%a:[/\\]') then return true end
-  if p:match('^\\\\') then return true end
-  if p:sub(1, 1) == '/' then return true end
-  return false
-end
-
-local function _ioOpenRead(path)
+-- Bus reads: relative Documents/GVD via VFS readFile / FS:readFile only.
+-- Never io.open (absolute or otherwise) — Tech GELua cannot io.open the
+-- LOCALAPPDATA sandbox even when Python writes there. Live Apps LINK UNPROVEN.
+local function _gvdBusRel(path)
   if not path or path == '' then return nil end
-  local p = tostring(path)
-  local f = io.open(p, 'r')
-  if f then return f end
-  local win = p:gsub('/', '\\')
-  if win ~= p then f = io.open(win, 'r') end
-  return f
-end
-
-local function _ioReadAll(path)
-  local f = _ioOpenRead(path)
-  if not f then return nil end
-  local data = f:read('*a')
-  f:close()
-  if data and data ~= '' then return data end
+  local p = tostring(path):gsub('\\', '/')
+  local name = p:match('([^/]+)$')
+  if name and name:match('^gvd_') then
+    return 'Documents/GVD/' .. name
+  end
+  if p == 'Documents/GVD' or p:match('^Documents/GVD/') then
+    return p
+  end
   return nil
 end
 
-local function readText(path)
-  if not path then return nil end
-  -- Absolute C:/ or \\ (and POSIX /): io.open BEFORE FS:readFile.
-  if _isAbsDiskPath(path) then
-    local data = _ioReadAll(path)
-    if data then return data end
-  end
+local function _vfsRead(path)
+  if not path or path == '' then return nil end
   if readFile then
     local ok, data = pcall(readFile, path)
     if ok and data and data ~= '' then return data end
@@ -345,8 +221,20 @@ local function readText(path)
     local ok, data = pcall(function() return FS:readFile(path) end)
     if ok and data and data ~= '' then return data end
   end
-  if not _isAbsDiskPath(path) then
-    return _ioReadAll(path)
+  return nil
+end
+
+local function readText(path)
+  if not path then return nil end
+  -- Relative Documents/GVD first. Never io.open. Never absolute LOCALAPPDATA.
+  local rel = _gvdBusRel(path)
+  if rel then
+    local data = _vfsRead(rel)
+    if data then return data end
+  end
+  local p = tostring(path):gsub('\\', '/')
+  if rel ~= p and not _isAbsDiskPath(p) then
+    return _vfsRead(p)
   end
   return nil
 end
@@ -409,7 +297,7 @@ local function writeUiPrefs()
   parts[#parts + 1] = string.format('"mtime":%d', os.time())
   writeText(userUiPrefsPath(), '{' .. table.concat(parts, ',') .. '}')
   -- Mirror into gvd_state so OpenCV / Python follow the same toggles
-  local raw = readText(userStatePath())
+  local raw = readText(STATE_REL)
   local st = raw and decodeJson(raw) or nil
   if type(st) == 'table' then
     st.gvd_show_path = showPath
@@ -422,7 +310,7 @@ local function writeUiPrefs()
 end
 
 local function readUiPrefs()
-  local raw = readText(userUiPrefsPath())
+  local raw = readText(UI_PREFS_REL)
   if not raw then return end
   local p = decodeJson(raw)
   if not p then return end
@@ -1554,7 +1442,7 @@ local function applyCmdJson(dt)
     log('I', 'GVD', '[GVD] player vehicle changed: released previous vehicle inputs')
   end
   applyVeh = veh
-  local raw = readText(userCmdPath())
+  local raw = readText(CMD_REL)
   local cmd = raw and decodeJson(raw) or nil
   if type(cmd) ~= 'table' then cmd = nil end
   local seq = cmd and tonumber(cmd.seq) or nil
@@ -1624,7 +1512,7 @@ end
 -- without a supervisor. Never adopt ON from the file — engage always starts in-game (Alt+G / GVD app).
 local function syncEngageFromSupervisor()
   if not engaged then return end
-  local raw = readText(userEngagePath())
+  local raw = readText(ENGAGE_REL)
   if not raw then return end
   local f = decodeJson(raw)
   if type(f) ~= 'table' or f.engaged ~= false then return end
@@ -1651,7 +1539,7 @@ local function syncEngageFromSupervisor()
 end
 
 local function pollStateFile()
-  local path = userStatePath()
+  local path = STATE_REL
   local raw = readText(path)
   if not raw then
     if not stateReadFailLogged then
@@ -1686,7 +1574,7 @@ local function pollStateFile()
   end
   -- UI prefs win: if gvd_ui_prefs.json exists, do NOT apply path/ghosts from gvd_state
   -- (run_vision show_agent_ghosts=true would clobber "Show ghosts" off every tick).
-  local prefsRaw = readText(userUiPrefsPath())
+  local prefsRaw = readText(UI_PREFS_REL)
   if prefsRaw and prefsRaw ~= '' then
     readUiPrefs()
   else

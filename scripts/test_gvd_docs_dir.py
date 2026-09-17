@@ -1,26 +1,31 @@
 #!/usr/bin/env python3
-"""Offline checks for Lua gvdDocsDir / Python dual-path GVD (no BeamNG).
+"""Offline checks for Lua relative Documents/GVD reads / Python dual-path writes.
 
-Lua gvdDocsDir + Python gvd_docs_dir (same product sandbox; #39 USERPROFILE Documents is the FAIL)
-------------------------------------------------------------------------------------------------
+Python gvd_docs_dir (writers; dual-path #40)
+------------------------------------------
 1. env ``GVD_DOCS_DIR`` if set (full GVD root)
-2. Lua: FS:getUserPath / virtual2Native / getFileRealPath → running product
-   ``current\\Documents\\GVD`` (Tech vs Drive). Steam does not inherit env.
-3. else product sandbox under ``%LOCALAPPDATA%`` (or synthesized
+2. product sandbox under ``%LOCALAPPDATA%`` (or synthesized
    ``{USERPROFILE|HOME}/AppData/Local`` — never USERPROFILE/Documents):
      - ``GVD_PRODUCT=tech`` / ``GVD_BEAMNG=1`` / ``GVD_BACKEND=beamngpy`` → Tech
+       ``%LOCALAPPDATA%\\BeamNG\\BeamNG.tech\\current\\Documents\\GVD``
      - else Drive / retail
-4. else last resort ``Documents/GVD`` (never a bare ``gvd_*.json`` under
+       ``%LOCALAPPDATA%\\BeamNG\\BeamNG.drive\\current\\Documents\\GVD``
+3. else last resort ``Documents/GVD`` (never a bare ``gvd_*.json`` under
    BeamNG userfolder ``current\\``).
 
-Not USERPROFILE\\Documents. Not OneDrive. No junctions.
-Drive FS must not reconstruct the Tech tail.
+Lua gvdDocsDir / readText (readers)
+-----------------------------------
+Relative ``Documents/GVD`` via VFS ``readFile`` / ``FS:readFile`` only.
+No absolute ``io.open``. Absolute ``GVD_DOCS_DIR`` / LOCALAPPDATA Tech tails are
+Python write roots — Tech GELua cannot ``io.open`` them. Relative ``GVD_DOCS_DIR``
+still wins. Never USERPROFILE\\Documents. Never OneDrive. No junctions.
 
 Lua ``gvd_state`` lastGood / gvdUi (offline ≠ live Apps LINK)
 -----------------------------------------------------------
-``readText`` uses absolute ``io.open`` **before** VFS ``FS:readFile``. ``pollStateFile``
-sets ``lastGood`` and logs read ok / read fail / json fail distinctly. ``pushUiState``
-and ``onExtensionLoaded`` poll + push ``gvdUi``. Live CEF LINK stays UNPROVEN.
+``readText`` uses relative ``Documents/GVD`` via VFS / ``FS:readFile`` only.
+``pollStateFile`` sets ``lastGood`` and logs read ok / read fail / json fail
+distinctly. ``pushUiState`` and ``onExtensionLoaded`` poll + push ``gvdUi``.
+Live CEF LINK stays UNPROVEN.
 
 Run: ``PYTHONPATH=. python scripts/test_gvd_docs_dir.py``
 Lua extract harness (when lua5.1/luajit is on PATH): ``lua5.1 scripts/test_gvd_docs_dir.lua``
@@ -167,36 +172,37 @@ def resolve_docs_dir(
 
 
 def check_source_contracts(lua: str) -> None:
-    local_fn = _fn(lua, "_localAppFromPath")
-    tech_fn = _fn(lua, "_techCurrentFromPath")
     try_env = _fn(lua, "_tryEnvDocs")
     docs_fn = _fn(lua, "gvdDocsDir")
     file_fn = _fn(lua, "gvdFile")
     link_fn = _fn(lua, "linkState")
+    bus_fn = _fn(lua, "_gvdBusRel")
+    vfs_fn = _fn(lua, "_vfsRead")
 
-    assert "AppData/Local" in local_fn
-    assert "BeamNG/BeamNG.tech/current" in tech_fn
-    assert TECH_TAIL in lua
-    assert DRIVE_TAIL in lua
-    assert "_driveCurrentFromPath" in docs_fn
-    assert "beamng.drive" in docs_fn.lower()
+    assert TECH_TAIL in lua, "Lua comments still name the Python Tech write tail"
+    assert DRIVE_TAIL in lua, "Lua comments still name the Python Drive write tail"
+    assert "_tryFsDocs" not in lua
+    assert "_tryEnvProductDocs" not in lua
+    assert "_localAppFromPath" not in lua
+    assert "_techCurrentFromPath" not in lua
+    assert "_driveCurrentFromPath" not in lua
 
     try_exec = re.sub(r"--[^\n]*", "", try_env)
     ov = try_exec.find("GVD_DOCS_DIR")
     assert ov >= 0, "GVD_DOCS_DIR override"
+    assert "_isAbsDiskPath" in try_exec, "absolute override is not a Lua read path"
     assert "LOCALAPPDATA" not in try_exec, "override must not append Tech tail from LOCALAPPDATA"
     assert not re.search(r"USERPROFILE.+/Documents/GVD", try_exec)
 
     docs_exec = re.sub(r"--[^\n]*", "", docs_fn)
-    assert "/Documents/GVD" in docs_exec
+    assert "/Documents/GVD" in docs_exec or "Documents/GVD" in docs_exec
     assert "directoryCreate" in docs_exec, "mkdir of resolved docs dir"
     assert "gvdDocsLogged" in docs_fn and "docs dir=" in docs_fn, "one-shot log"
-    assert "dir = 'Documents/GVD'" in docs_exec, "last resort is Documents/GVD, never CWD or current\\"
-    assert "_tryEnvDocs" in docs_exec and "_tryFsDocs" in docs_exec
-    assert "_tryEnvProductDocs" in docs_exec
-    assert "dir = _tryEnvDocs() or _tryFsDocs() or _tryEnvProductDocs()" in docs_exec, (
-        "override → FS product → env LOCALAPPDATA"
-    )
+    assert "dir = 'Documents/GVD'" in docs_exec, "Lua bus is Documents/GVD, never CWD or current\\"
+    assert "_tryEnvDocs" in docs_exec
+    assert "_tryFsDocs" not in docs_exec
+    assert "_tryEnvProductDocs" not in docs_exec
+    assert "dir = _tryEnvDocs()" in docs_exec
 
     file_exec = re.sub(r"--[^\n]*", "", file_fn)
     assert "gvdDocsDir() .. '/' .. name" in file_exec
@@ -208,28 +214,39 @@ def check_source_contracts(lua: str) -> None:
     assert "gvd_ego" not in link_exec and "egoFb" not in link_exec, link_fn
     assert "userEgoPath" not in link_exec
 
-    helpers = local_fn + tech_fn + try_env + docs_fn
+    helpers = try_env + docs_fn
     assert "Accounts" not in helpers and "UserFolder" not in helpers
     assert "SHGetKnownFolderPath" not in helpers
     assert "FOLDERID" not in helpers
     assert "mklink" not in lua.lower()
 
     read_fn = _fn(lua, "readText")
-    io_fn = _fn(lua, "_ioOpenRead")
     read_exec = re.sub(r"--[^\n]*", "", read_fn)
-    io_exec = re.sub(r"--[^\n]*", "", io_fn)
-    assert "io.open" in io_exec, "absolute io.open helper"
-    assert "_isAbsDiskPath" in read_exec and "_ioReadAll" in read_exec
-    assert 0 <= read_exec.find("_isAbsDiskPath") < read_exec.find("FS:readFile"), "io.open before FS:readFile"
-    assert read_exec.find("_ioReadAll") < read_exec.find("FS:readFile")
-    assert read_exec.find("_isAbsDiskPath") < read_exec.find("if readFile")
-    assert "_isAbsDiskPath" in lua and r"%a:[/\\" in lua
+    bus_exec = re.sub(r"--[^\n]*", "", bus_fn)
+    vfs_exec = re.sub(r"--[^\n]*", "", vfs_fn)
+    assert "_ioOpenRead" not in lua
+    assert "_ioReadAll" not in lua
+    assert "io.open" not in read_exec, "bus reads must not io.open"
+    assert "io.open" not in bus_exec
+    assert "io.open" not in vfs_exec
+    assert "Documents/GVD" in bus_exec
+    assert "readFile" in vfs_exec and "FS:readFile" in vfs_exec
+    assert "_gvdBusRel" in read_exec and "_vfsRead" in read_exec
+    assert 0 <= read_exec.find("_gvdBusRel") < read_exec.find("_vfsRead"), "relative Documents/GVD before VFS read"
+    assert "FS:readFile" in vfs_exec
     poll_fn = _fn(lua, "pollStateFile")
+    poll_exec = re.sub(r"--[^\n]*", "", poll_fn)
     assert "lastGood = st" in poll_fn
     assert "gvd_state read ok path=" in poll_fn
     assert "read fail path=" in poll_fn
     assert "json fail len=" in poll_fn
     assert "pushUi()" in poll_fn, "first lastGood must push gvdUi"
+    assert "STATE_REL" in poll_exec, "poll reads relative Documents/GVD/gvd_state.json"
+    assert "io.open" not in poll_exec
+    assert "readText(STATE_REL)" in lua
+    assert "readText(CMD_REL)" in lua
+    assert "readText(ENGAGE_REL)" in lua
+    assert "readText(UI_PREFS_REL)" in lua
     loaded = re.search(r"function M\.onExtensionLoaded\(\).*?\nend\n", lua, re.S)
     assert loaded, "onExtensionLoaded missing"
     load_exec = re.sub(r"--[^\n]*", "", loaded.group(0))
@@ -266,6 +283,9 @@ def check_source_contracts(lua: str) -> None:
     assert r"%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\Documents\GVD" in schema
     assert "Path: `%USERPROFILE%\\Documents\\GVD" not in schema
     assert "Lua and Python share `%USERPROFILE%" not in schema
+    assert "FS:readFile" in readme
+    assert "FS:readFile" in schema
+    assert "io.open" in readme and "io.open" in schema
 
 
 def check_python_mirror() -> None:

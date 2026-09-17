@@ -1,8 +1,8 @@
-"""Resolve the GVD bus dir to the running product sandbox.
+"""Resolve the GVD bus dir to the running product sandbox (Python writers).
 
-Tech GELua cannot ``io.open`` the Drive sandbox; Drive GELua cannot ``io.open``
-the Tech sandbox. Steam does not inherit ``GVD_DOCS_DIR`` into GELua, so live
-retail must use the Drive userfolder bus without an env override.
+Python writes the product sandbox (dual-path #40). Lua reads the same folder
+as userfolder-relative ``Documents/GVD`` via VFS / ``FS:readFile`` — never
+absolute ``io.open``.
 
   Tech:  ``%LOCALAPPDATA%\\BeamNG\\BeamNG.tech\\current\\Documents\\GVD``
   Drive: ``%LOCALAPPDATA%\\BeamNG\\BeamNG.drive\\current\\Documents\\GVD``
@@ -16,9 +16,6 @@ Resolution:
        - ``GVD_PRODUCT=tech`` / ``GVD_BEAMNG=1`` / ``GVD_BACKEND=beamngpy`` → Tech
        - else Drive / retail (``play_gvd.bat`` / window backend)
   3. else relative ``Documents/GVD``
-
-Lua additionally reconstructs the product from the running ``FS:getUserPath``
-(before any LOCALAPPDATA default) so GELua matches the process that loaded it.
 
 Callers append nothing: ``gvd_docs_dir()`` is the GVD root (state/cmd/engage).
 """

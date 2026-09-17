@@ -1,5 +1,5 @@
--- Offline lastGood + gvdUi from absolute io.open of gvd_state.json (no BeamNG).
--- VFS readFile / FS:readFile are poisoned: if they run first, lastGood must NOT come from junk.
+-- Offline lastGood + gvdUi from VFS / FS:readFile of relative Documents/GVD/gvd_state.json.
+-- Absolute io.open of the Tech/Drive sandbox is the FAIL (Tech GELua cannot io.open it).
 -- This is NOT a live BeamNG Apps LINK proof. Live CEF LINK stays UNPROVEN.
 -- Run from repo root: lua5.1 scripts/test_gvd_state_link.lua
 local logs = {}
@@ -25,66 +25,63 @@ function jsonDecode(s)
   return t
 end
 
-local function busDocs()
-  local ov = os.getenv('GVD_DOCS_DIR')
-  if ov then
-    ov = tostring(ov):match('^%s*(.-)%s*$') or ''
-    if ov ~= '' then return ov:gsub('\\', '/') end
-  end
-  local product = 'drive'
-  local gp = os.getenv('GVD_PRODUCT')
-  if gp and tostring(gp) ~= '' then
-    gp = tostring(gp):lower():match('^%s*(.-)%s*$') or ''
-    if gp == 'tech' or gp == 'beamng.tech' or gp == 'beamngtech' then product = 'tech' end
-  end
-  local b = os.getenv('GVD_BEAMNG')
-  if b then
-    b = tostring(b):lower():match('^%s*(.-)%s*$') or ''
-    if b == '1' or b == 'true' or b == 'yes' then product = 'tech' end
-  end
-  local be = os.getenv('GVD_BACKEND')
-  if be then
-    be = tostring(be):lower():match('^%s*(.-)%s*$') or ''
-    if be == 'beamngpy' or be == 'tech' then product = 'tech' end
-  end
-  local function fromLa(localApp)
-    if not localApp or localApp == '' then return nil end
-    local la = tostring(localApp):gsub('\\', '/')
-    if la == '' or la:lower():find('onedrive', 1, true) then return nil end
-    if product == 'tech' then
-      return la .. '/BeamNG/BeamNG.tech/current/Documents/GVD'
-    end
-    return la .. '/BeamNG/BeamNG.drive/current/Documents/GVD'
-  end
-  local d = fromLa(os.getenv('LOCALAPPDATA'))
-  if d then return d end
-  local home = os.getenv('USERPROFILE') or os.getenv('HOME')
-  assert(home and home ~= '', 'LOCALAPPDATA or USERPROFILE/HOME required')
-  return fromLa(home:gsub('\\', '/') .. '/AppData/Local')
-end
-local docs = busDocs()
-os.execute('mkdir -p "' .. docs .. '"')
-local statePath = docs .. '/gvd_state.json'
-
-local function writeFile(p, s)
-  local f = assert(io.open(p, 'w'))
-  f:write(s)
-  f:close()
-end
-
+local vfsBus = {}
 local vfsHits = 0
-function readFile(_)
+local function busRel(path)
+  local p = tostring(path or ''):gsub('\\', '/')
+  local name = p:match('([^/]+)$')
+  if name and name:match('^gvd_') then return 'Documents/GVD/' .. name end
+  return p
+end
+local function vfsGet(path)
   vfsHits = vfsHits + 1
-  return '{"poison":true,"loop_hz":99}'
+  return vfsBus[busRel(path)]
+end
+function readFile(path)
+  return vfsGet(path)
 end
 FS = {
-  readFile = function(_)
-    vfsHits = vfsHits + 1
-    return '{"poison":true,"loop_hz":99}'
+  readFile = function(_, path)
+    return vfsGet(path)
   end,
   directoryCreate = function() end,
-  writeFile = function() return true end,
+  writeFile = function(_, path, data)
+    vfsBus[busRel(path)] = data
+    return true
+  end,
 }
+
+-- Absolute disk poison: if readText still io.opens the sandbox, lastGood would take this.
+local poisonDocs
+do
+  local la = os.getenv('LOCALAPPDATA')
+  local home = os.getenv('USERPROFILE') or os.getenv('HOME')
+  local root = la or ((home and home ~= '') and (tostring(home):gsub('\\', '/') .. '/AppData/Local') or nil)
+  if root then
+    poisonDocs = tostring(root):gsub('\\', '/') .. '/BeamNG/BeamNG.tech/current/Documents/GVD'
+    os.execute('mkdir -p "' .. poisonDocs .. '"')
+    local pf = assert(io.open(poisonDocs .. '/gvd_state.json', 'w'))
+    pf:write('{"schema":1,"policy":"poison-abs","loop_hz":99,"detector":"abs-io-open","heartbeat_mtime":1,"heartbeat_unix":1}')
+    pf:close()
+  end
+end
+
+local busReadOpens = 0
+local realOpen = io.open
+io.open = function(path, mode)
+  local p = tostring(path or '')
+  local m = tostring(mode or 'r')
+  if m:sub(1, 1) == 'r' and (p:find('gvd_state', 1, true) or p:find('Documents/GVD', 1, true)
+      or p:find('Documents\\GVD', 1, true)) then
+    busReadOpens = busReadOpens + 1
+    return nil
+  end
+  return realOpen(path, mode)
+end
+
+local function writeBus(name, s)
+  vfsBus['Documents/GVD/' .. name] = s
+end
 
 local uiPushes = {}
 guihooks = {
@@ -94,7 +91,7 @@ guihooks = {
 }
 be = { getPlayerVehicle = function() return nil end }
 
-writeFile(statePath, string.format(
+writeBus('gvd_state.json', string.format(
   '{"schema":1,"policy":"modular","loop_hz":17,"detector":"link-probe","heartbeat_mtime":%d,"heartbeat_unix":%d}',
   os.time(), os.time()))
 
@@ -110,34 +107,42 @@ local function saw(needle)
 end
 
 check(saw('docs dir='), 'gvdDocsDir logged once on load')
+check(saw('docs dir=Documents/GVD'), 'docs dir is relative Documents/GVD')
 check(saw('gvd_state read ok path='), 'distinct gvd_state read ok log')
+check(saw('gvd_state read ok path=Documents/GVD/gvd_state.json'),
+  'read ok path is relative Documents/GVD/gvd_state.json')
 check(not saw('json fail len='), 'fresh JSON is not a json fail')
 check(#uiPushes > 0, 'gvdUi pushed on load with lastGood')
 local p = uiPushes[#uiPushes]
 check(p.link ~= 'none', 'CEF link is not none (was NO LINK / supervisor not running)')
 check(p.link == 'live' or p.link == 'stale', 'CEF link is lastGood HB live/stale')
-check(tonumber(p.hz) == 17, 'gvdUi hz comes from disk gvd_state, not VFS poison 99')
-check(p.detector == 'link-probe', 'gvdUi detector comes from disk, not VFS poison')
+check(tonumber(p.hz) == 17, 'gvdUi hz comes from VFS Documents/GVD, not absolute io.open poison 99')
+check(p.detector == 'link-probe', 'gvdUi detector comes from VFS, not abs io.open')
 check(p.policy == 'modular', 'gvdUi policy from lastGood')
+check(busReadOpens == 0, 'no io.open for bus reads (opens=' .. tostring(busReadOpens) .. ')')
 
--- CEF poke path: pollStateFile + pushUi even if onUpdate never ticks.
 uiPushes = {}
 M.pushUiState()
 check(#uiPushes > 0, 'pushUiState polls + pushes without onUpdate')
 check(uiPushes[#uiPushes].link ~= 'none', 'pushUiState keeps LINKED from lastGood')
-check(tonumber(uiPushes[#uiPushes].hz) == 17, 'pushUiState still disk lastGood, not VFS')
+check(tonumber(uiPushes[#uiPushes].hz) == 17, 'pushUiState still VFS lastGood, not abs io.open')
 
--- json fail is distinct from read fail.
-writeFile(statePath, '{not-json')
-stateJsonFailLogged = nil -- cannot reset module locals; json-fail log is one-shot from first fail
--- First decode already succeeded so lastGood stays the previous table; rewrite + push
--- still must not take VFS poison. Prove readText still prefers io.open by unique hz.
-writeFile(statePath, string.format(
+-- reread via VFS picks up fresh bytes. Absolute disk poison must not win.
+writeBus('gvd_state.json', string.format(
   '{"schema":1,"policy":"modular","loop_hz":18,"detector":"link-probe-2","heartbeat_mtime":%d,"heartbeat_unix":%d}',
   os.time(), os.time()))
 M.pushUiState()
-check(tonumber(uiPushes[#uiPushes].hz) == 18, 'reread via io.open picks up fresh disk bytes')
-check(uiPushes[#uiPushes].detector == 'link-probe-2', 'reread lastGood from absolute io.open')
-check(vfsHits >= 0, 'VFS stubs callable (hits=' .. tostring(vfsHits) .. ')')
+check(tonumber(uiPushes[#uiPushes].hz) == 18, 'reread via VFS picks up fresh Documents/GVD bytes')
+check(uiPushes[#uiPushes].detector == 'link-probe-2', 'reread lastGood from VFS, not absolute io.open')
+check(busReadOpens == 0, 'reread still does not io.open the bus')
+check(vfsHits > 0, 'VFS stubs served the bus (hits=' .. tostring(vfsHits) .. ')')
+
+-- Flip of the old absolute-io.open success: VFS empty, only abs disk exists → read fail, keep lastGood.
+vfsBus['Documents/GVD/gvd_state.json'] = nil
+local hzBefore = tonumber(uiPushes[#uiPushes].hz)
+M.pushUiState()
+check(tonumber(uiPushes[#uiPushes].hz) == hzBefore,
+  'empty VFS does not fall back to absolute io.open (lastGood stays 18)')
+check(busReadOpens == 0, 'empty VFS still does not io.open abs Tech sandbox')
 
 print('test_gvd_state_link: OK')

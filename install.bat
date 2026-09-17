@@ -66,11 +66,28 @@ if exist "%DEST%\" rd /s /q "%DEST%"
 mkdir "%DEST%" 2>nul
 
 echo [GVD] Copying beamng_mod\ -^> %DEST%
+echo [GVD] Fully quit BeamNG first. Stale unpacked\gvd with kebab directive gvd-app leaves a blank Apps tile.
+echo [GVD] This wipe+copy installs camelCase app.json directive gvdApp. Do not paper over a stale tile with more JS.
 xcopy /E /I /Y "%~dp0beamng_mod\*" "%DEST%\" >nul
 if errorlevel 1 (
   echo [GVD] Copy failed.
   pause
   exit /b 1
+)
+
+findstr /C:"\"directive\": \"gvdApp\"" "%DEST%\ui\modules\apps\GVD\app.json" >nul
+if errorlevel 1 (
+  echo [GVD] ERROR: installed app.json is not directive gvdApp. Wipe unpacked\gvd and re-run.
+  pause
+  exit /b 1
+)
+echo [GVD] installed app.json directive=gvdApp
+
+if exist "%ROOT_A%\current\gvd_state.json" (
+  echo [GVD] leftover %ROOT_A%\current\gvd_state.json -- not the bus. Documents\GVD is the bus. LINK will MISMATCH until that file is gone.
+)
+if exist "%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\gvd_state.json" (
+  echo [GVD] leftover Tech current\gvd_state.json -- not the bus. Use current\Documents\GVD.
 )
 
 where tar >nul 2>&1
@@ -84,12 +101,12 @@ if %ERRORLEVEL%==0 (
   echo [GVD] tar not found - skipped gvd.zip (unpacked install is enough)
 )
 
-set "DOCS=%GVD_DOCS_DIR%"
-if not defined DOCS set "DOCS=%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\Documents\GVD"
+set "DOCS=%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\Documents\GVD"
 if not exist "%DOCS%\" mkdir "%DOCS%"
 if exist "%~dp0python\" xcopy /E /I /Y "%~dp0python\*" "%DOCS%\python\" >nul
 if exist "%~dp0config\" xcopy /E /I /Y "%~dp0config\*" "%DOCS%\config\" >nul
 echo [GVD] bus dir (Drive/retail): %DOCS%
+echo [GVD] GVD_DOCS_DIR is Python-only and is not used here. Steam GELua reads Documents\GVD.
 
 rem Seed Tech bus too when that userfolder exists (separate sandbox; Drive cannot io.open it).
 set "TECH_DOCS=%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\Documents\GVD"
@@ -108,6 +125,9 @@ type "%LOG%"
 
 echo.
 echo Installed. Fully quit BeamNG, relaunch, enable Grok Vision Drive in Mod Manager.
+echo [GVD] Windows smoke (live still UNPROVEN): quit BeamNG, wipe unpacked\gvd, install.bat, Add App GVD, play_gvd.bat, Alt+G.
+echo [GVD] Confirm both logs show the same python_bus/lua_bus folder and VISION follows engage.
+echo [GVD] Do not claim live dual-monitor / Alt+G / Tech 8-cam proven from this install.
 
 rem Also copy into BeamNG.tech user mods when that folder exists (separate from Drive).
 set "TECH_DEST="

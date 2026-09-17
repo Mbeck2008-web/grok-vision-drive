@@ -9,6 +9,8 @@ rem Does NOT launch Steam BeamNG.drive. Extra args pass through to run_vision.py
 
 set "GVD_BACKEND=beamngpy"
 set "GVD_BEAMNG=1"
+set "GVD_PRODUCT=tech"
+set "GVD_DOCS_DIR=%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\Documents\GVD"
 
 set "PY="
 where py >nul 2>&1 && set "PY=py -3"
@@ -17,7 +19,6 @@ if not defined PY where python >nul 2>&1 && set "PY=python"
 set "RUN="
 set "RUNROOT=%~dp0"
 if exist "%~dp0python\run_vision.py" set "RUN=%~dp0python\run_vision.py"
-if not defined GVD_DOCS_DIR set "GVD_DOCS_DIR=%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\Documents\GVD"
 if not defined RUN if exist "%GVD_DOCS_DIR%\python\run_vision.py" (
   set "RUN=%GVD_DOCS_DIR%\python\run_vision.py"
   set "RUNROOT=%GVD_DOCS_DIR%"
@@ -61,6 +62,8 @@ if errorlevel 1 (
 echo [GVD] Tech path: 8 RGB cameras + electrics/damage/pose + GPS nav hint (not localization, pin is not a route). LiDAR/radar optional in config\sensors.yaml — Foxglove / future fusion; planner stays vision-only.
 echo [GVD] Starting supervisor: %RUN%  (backend=beamngpy)
 echo [GVD] bus: %GVD_DOCS_DIR%
+echo [GVD] product=tech. Supervisor and GELua must print the same python_bus/lua_bus folder.
+echo [GVD] link=MISMATCH means Drive vs Tech or leftover GVD_DOCS_DIR. Live Tech 8-cam UNPROVEN.
 echo [GVD] Match BeamNGpy to your Tech build (0.38 -^> 1.35.x, 0.39 -^> 1.36). Edit config\tech.yaml.
 start "GVD supervisor" /D "%RUNROOT%" cmd /k %PY% "%RUN%" --backend beamngpy --viz %*
 
@@ -87,6 +90,8 @@ echo [GVD] Probe without driving:  %PY% "%RUN%" --tech-probe
 
 :done
 echo [GVD] Mods: run install.bat so unpacked\gvd lands in Drive and (if present) Tech current\mods.
+echo [GVD] Windows smoke (live Tech 8-cam still UNPROVEN): quit BeamNG, wipe unpacked\gvd, install.bat, Add App GVD, play_gvd_tech.bat, Alt+G.
+echo [GVD] Confirm both logs show the same python_bus/lua_bus folder and VISION follows engage. Do not claim dual-monitor / Tech 8-cam proven.
 echo [GVD] Quit supervisor: q in GVD VISION.
 pause
 endlocal

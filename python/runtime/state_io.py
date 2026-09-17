@@ -13,6 +13,7 @@ from typing import Any
 # Drive → BeamNG.drive\current\Documents\GVD). Lua reads that same folder as
 # relative Documents/GVD via VFS / FS:readFile. Not USERPROFILE Documents.
 # Not OneDrive. Steam GELua does not inherit GVD_DOCS_DIR.
+from python.runtime.paths import bus_identity as bus_identity
 from python.runtime.paths import gvd_docs_dir as gvd_docs_dir
 
 def state_path() -> Path:
@@ -166,13 +167,86 @@ def atomic_write_json(p: Path, payload: Any, *, indent: int | None = 2, attempts
             time.sleep(0.002 * (i + 1))
     return False
 
+
+def attach_bus_identity(state: dict[str, Any]) -> dict[str, Any]:
+    """Stamp python_bus / lua_bus / product / bus_link so Lua can refuse a mismatch."""
+    ident = bus_identity()
+    state["python_bus"] = ident.python_bus_s
+    state["lua_bus"] = ident.lua_bus_s
+    state["product"] = ident.product
+    state["bus_link"] = ident.link
+    state["bus_note"] = ident.note
+    if ident.leftover:
+        state["bus_leftover"] = [str(p) for p in ident.leftover]
+    return state
+
+
+def mismatch_paint_state(reason: str, ident: Any | None = None) -> dict[str, Any]:
+    """Empty stage payload — VISION must not invent a corridor from the wrong tree."""
+    ident = ident or bus_identity()
+    return {
+        "schema": 1,
+        "policy": "modular",
+        "engaged": False,
+        "python_bus": ident.python_bus_s,
+        "lua_bus": ident.lua_bus_s,
+        "product": ident.product,
+        "bus_link": "MISMATCH",
+        "link": "mismatch",
+        "bus_note": reason,
+        "path_ego": [],
+        "path_world": [],
+        "tracks": [],
+        "lanes_ext": [],
+        "lanes_bev": [],
+        "road_edges": [],
+        "agents": [],
+        "signs": [],
+        "path_debug_preview": False,
+        "viz_smoke": False,
+        "gvd_show_path": False,
+        "show_agent_ghosts": False,
+    }
+
+
+def load_paint_state(path: Path | None = None) -> dict[str, Any]:
+    """Paint source: the shared gvd_state.json only. Missing / other tree → MISMATCH."""
+    ident = bus_identity()
+    p = path or (ident.python_bus / "gvd_state.json")
+    other = ident.other_state
+    try:
+        exists = p.is_file()
+    except OSError:
+        exists = False
+    if not exists:
+        reason = "gvd_state.json missing"
+        if other is not None:
+            reason = f"gvd_state.json is in the other product tree ({other})"
+        return mismatch_paint_state(reason, ident)
+    try:
+        st = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return mismatch_paint_state("gvd_state.json unreadable", ident)
+    if not isinstance(st, dict):
+        return mismatch_paint_state("gvd_state.json unreadable", ident)
+    if not ident.matched:
+        return mismatch_paint_state(ident.note, ident)
+    st["python_bus"] = ident.python_bus_s
+    st["lua_bus"] = ident.lua_bus_s
+    st["product"] = ident.product
+    st["bus_link"] = ident.link
+    return st
+
+
 def write_state(state: dict[str, Any], path: Path | None = None) -> Path:
     p = path or state_path()
     state = dict(state)
+    attach_bus_identity(state)
     state["heartbeat_unix"] = int(time.time())  # match Lua os.time() seconds
     state["heartbeat_mtime"] = time.time()  # high-res for Lua dead-man
     atomic_write_json(p, state)
     return p
+
 
 def read_state(path: Path | None = None) -> dict[str, Any] | None:
     p = path or state_path()

@@ -18,6 +18,7 @@
     .gvd-app.is-engaged { border-color:#39616f; box-shadow:inset 0 0 0 1px rgba(158,196,212,0.10); }
     .gvd-app.is-drive { border-color:var(--ice); box-shadow:inset 0 0 0 1px rgba(158,196,212,0.20); }
     .gvd-app.is-hold { border-color:#5c4a24; }
+    .gvd-app.is-mismatch { border-color:#8a3b3b; }
 
     .gvd-row { display:flex; align-items:center; gap:6px; }
     .gvd-grow { flex:1 1 auto; min-width:0; }
@@ -34,6 +35,7 @@
     .gvd-link.is-live { color:var(--ice); }
     .gvd-link.is-live .gvd-dot { box-shadow:0 0 6px rgba(158,196,212,0.9); }
     .gvd-link.is-stale { color:var(--amber); }
+    .gvd-link.is-mismatch { color:#d07070; }
 
     .gvd-state {
       display:flex; align-items:center; gap:8px; padding:5px 8px; border-radius:5px;
@@ -42,10 +44,12 @@
     .gvd-state.is-on { border-left-color:var(--ice); background:linear-gradient(90deg,rgba(90,167,199,0.14),var(--panel) 70%); }
     .gvd-state.is-drive { border-left-color:var(--ice-hi); background:linear-gradient(90deg,rgba(90,167,199,0.30),var(--panel) 75%); }
     .gvd-state.is-hold { border-left-color:var(--amber); background:linear-gradient(90deg,rgba(216,165,74,0.13),var(--panel) 70%); }
+    .gvd-state.is-mismatch { border-left-color:#8a3b3b; background:linear-gradient(90deg,rgba(200,80,80,0.16),var(--panel) 70%); }
     .gvd-state-main { font-size:13px; font-weight:700; letter-spacing:0.14em; color:var(--dim); }
     .gvd-state.is-on .gvd-state-main { color:var(--ice-hi); }
     .gvd-state.is-drive .gvd-state-main { color:#f2fbff; text-shadow:0 0 10px rgba(158,196,212,0.55); }
     .gvd-state.is-hold .gvd-state-main { color:var(--amber); }
+    .gvd-state.is-mismatch .gvd-state-main { color:#e8a0a0; }
     .gvd-state-sub {
       flex:1 1 auto; min-width:0; text-align:right; font-size:9.5px; color:var(--faint);
       letter-spacing:0.04em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
@@ -205,5 +209,6 @@
     <div class="gvd-kv"><span>heartbeat</span><b>{{ beatLine() }}</b></div>
   </div>
 
+  <div class="gvd-foot gvd-mono">{{ busLine() }}</div>
   <div class="gvd-foot">Sim toy - camera-only - never a real car.</div>
 </div>

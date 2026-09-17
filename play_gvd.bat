@@ -7,6 +7,8 @@ rem Retail launcher (M6): 1-cam window capture + GVD VISION window + Steam BeamN
 rem Honesty: retail = ONE window capture (main cam); Engage drives via gvd_cmd.json -> mod Lua secondary Direct Drive wheel+pedals.
 rem 8-cam rig + BeamNGpy direct control = BeamNG.tech (set GVD_BACKEND=beamngpy). Extra args pass through.
 if not defined GVD_BACKEND set "GVD_BACKEND=window"
+set "GVD_PRODUCT=drive"
+set "GVD_DOCS_DIR=%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\Documents\GVD"
 
 set "PY="
 where py >nul 2>&1 && set "PY=py -3"
@@ -15,12 +17,13 @@ if not defined PY where python >nul 2>&1 && set "PY=python"
 set "RUN="
 set "RUNROOT=%~dp0"
 if exist "%~dp0python\run_vision.py" set "RUN=%~dp0python\run_vision.py"
-if not defined GVD_DOCS_DIR set "GVD_DOCS_DIR=%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\Documents\GVD"
 if not defined RUN if exist "%GVD_DOCS_DIR%\python\run_vision.py" (
   set "RUN=%GVD_DOCS_DIR%\python\run_vision.py"
   set "RUNROOT=%GVD_DOCS_DIR%"
 )
 echo [GVD] bus: %GVD_DOCS_DIR%
+echo [GVD] product=drive. Supervisor and GELua must print the same python_bus/lua_bus folder.
+echo [GVD] link=MISMATCH means Drive vs Tech, leftover GVD_DOCS_DIR, or gvd_*.json under current\ (not Documents\GVD).
 set "REQS=%~dp0requirements-retail.txt"
 
 if not defined RUN (
@@ -66,6 +69,8 @@ start "" "steam://rungameid/284160" 2>nul
 echo [GVD] Mods expect: %%LOCALAPPDATA%%\BeamNG\BeamNG.drive\current\mods\unpacked\gvd  (0.38+)
 echo [GVD] Legacy also: %%LOCALAPPDATA%%\BeamNG.drive\^<ver^>\mods\unpacked\gvd
 echo [GVD] Run install.bat if Mod Manager is empty. Alt+G (or Ctrl+Alt+G) or the GVD app = Engage (ribbon + HUD).
+echo [GVD] Windows smoke (live still UNPROVEN): quit BeamNG, wipe unpacked\gvd, install.bat, Add App GVD, play_gvd.bat, Alt+G.
+echo [GVD] Confirm both logs show the same python_bus/lua_bus folder and VISION follows engage. Do not claim dual-monitor / Tech 8-cam proven.
 echo [GVD] Engaged + both lane lines seen = HUD DRIVE, GVD holds the wheel. Steer or Alt+G to take over.
 echo [GVD] Quit supervisor: q in GVD VISION (car is released, HUD goes OFF).
 pause

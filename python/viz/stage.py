@@ -348,6 +348,38 @@ def _stroke_poly(
                 on = not on
 
 
+def is_bus_mismatch(state: dict[str, Any]) -> bool:
+    link = str(state.get("bus_link") or state.get("link") or "").strip().lower()
+    return link == "mismatch"
+
+
+def _draw_mismatch(img: np.ndarray, state: dict[str, Any]) -> None:
+    """Loud overlay: do not invent a corridor when the bus folder is wrong."""
+    note = str(state.get("bus_note") or "python_bus and lua_bus are not the same folder")
+    py = str(state.get("python_bus") or "--")
+    lua_b = str(state.get("lua_bus") or "--")
+    prod = str(state.get("product") or "--")
+    cv2.rectangle(img, (0, 0), (STAGE_W, STAGE_H), VOID, -1)
+    cv2.putText(img, "GVD", (12, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, ICE, 1, cv2.LINE_AA)
+    cv2.putText(img, "VISION", (52, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1, cv2.LINE_AA)
+    cv2.putText(img, "MISMATCH", (80, 220), cv2.FONT_HERSHEY_SIMPLEX, 2.1, (80, 80, 210), 3, cv2.LINE_AA)
+    cv2.putText(img, "refuse actuation  -  not a fake corridor", (80, 270), cv2.FONT_HERSHEY_SIMPLEX, 0.7, PAPER, 1, cv2.LINE_AA)
+    cv2.putText(img, "product=" + prod, (80, 330), cv2.FONT_HERSHEY_SIMPLEX, 0.55, ICE, 1, cv2.LINE_AA)
+    cv2.putText(img, "python_bus=" + py[:72], (80, 370), cv2.FONT_HERSHEY_SIMPLEX, 0.48, PAPER, 1, cv2.LINE_AA)
+    cv2.putText(img, "lua_bus=" + lua_b[:72], (80, 410), cv2.FONT_HERSHEY_SIMPLEX, 0.48, PAPER, 1, cv2.LINE_AA)
+    cv2.putText(img, note[:88], (80, 470), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (120, 140, 210), 1, cv2.LINE_AA)
+    cv2.putText(
+        img,
+        "Drive vs Tech, leftover GVD_DOCS_DIR, or gvd_*.json under current\\",
+        (80, 520),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42,
+        (134, 124, 114),
+        1,
+        cv2.LINE_AA,
+    )
+
+
 def lane_draw_mode(kind: str | None, *, smoke: bool) -> str | None:
     """How to stroke a lanes_ext boundary: solid / dashed / skip.
 
@@ -923,6 +955,18 @@ def render_stage(
     clean = 0 in ui.layers
     cam = Cam(top_down=ui.top_down)
     img = np.full((STAGE_H, STAGE_W, 3), VOID, dtype=np.uint8)
+
+    if is_bus_mismatch(state):
+        _draw_mismatch(img, state)
+        note = str(state.get("bus_note") or "MISMATCH")
+        state["viz_ms"] = (time.perf_counter() - t0) * 1000.0
+        state["viz_scene_note"] = note
+        if ui.show_nerd and not clean:
+            panel = render_panel(
+                state, h=STAGE_H, w=ui.nerd_width, show_help=ui.show_help, ui=ui, cam_frames=cam_frames,
+            )
+            return np.concatenate([img, panel], axis=1)
+        return img
 
     drop_heavy = _drop_heavy(state)
     health = state.get("cam_health") if isinstance(state.get("cam_health"), dict) else None

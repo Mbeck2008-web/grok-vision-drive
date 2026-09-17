@@ -91,7 +91,14 @@ Also: `Documents/GVD/gvd_cmd.json` = `{steer,throttle,brake,seq,engaged,heartbea
 
 ## Path note
 
-Python **writes** the **running product** sandbox (Tech `BeamNG.tech\current\Documents\GVD` vs Drive `BeamNG.drive\current\Documents\GVD` under `%LOCALAPPDATA%\BeamNG\`, or `GVD_DOCS_DIR`). GELua **reads** relative `Documents/GVD` via VFS / `FS:readFile` (same physical folder when the userfolder maps `Documents/GVD`). Never `%USERPROFILE%\Documents\GVD`. Never OneDrive. Never a bare `gvd_*.json` under userfolder `current\`. Never absolute `io.open` on the bus.
+Python **writes** the **running product** sandbox (Tech `BeamNG.tech\current\Documents\GVD` vs Drive `BeamNG.drive\current\Documents\GVD` under `%LOCALAPPDATA%\BeamNG\`). `GVD_DOCS_DIR` is Python-only — Steam GELua does not inherit it. GELua **reads** relative `Documents/GVD` via VFS / `FS:readFile`. Never `%USERPROFILE%\Documents\GVD`. Never OneDrive. Never a bare `gvd_*.json` under userfolder `current\`. Never absolute `io.open` on the bus.
+
+Both sides print every second: `python_bus=` (absolute) `lua_bus=` (resolved `Documents/GVD`) `product=drive|tech` `state_mtime` `engage` `seq`. If those folders are not the same, `link=MISMATCH` and actuation is refused. VISION paints only from that shared `gvd_state.json`; missing or the other product tree is a loud mismatch, not a fake corridor.
+
+| `python_bus` | string | Absolute folder Python wrote |
+| `lua_bus` | string | Resolved `Documents/GVD` (product sandbox) |
+| `product` | string | `drive` / `tech` |
+| `bus_link` | string | `ok` / `MISMATCH` |
 
 ## UI prefs (`Documents/GVD/gvd_ui_prefs.json`)
 
@@ -133,7 +140,7 @@ Predictions need an anchor: with no detected lane there are no predicted lanes a
 
 ## In-game app bus
 
-`gvd/main.lua` pushes `guihooks.trigger('gvdUi', ...)` on a single 10 Hz `tickPush` path (same period as the `egoFb` poll). Wheel/pedal bars ride that path from `egoFb`; `onEgoFeedback` does not push a second HUD stream. Payload still includes capped scene geometry: `path` ≤28 points, `tracks` ≤12 (`id,cls,x,y,yaw,v,lead`), `lanes` ≤6×12 (`pts,kind,side,style,idx`), `edges` ≤2×12, `signs` ≤8, `fans` ≤6×8, all ego frame and rounded to 2 dp. `link` is `live` / `stale` / `none` from the heartbeat age, so the app can show the dead-man without a second file bus. `applying` rides along, so the app can show `DRIVE` while the mod holds the wheel (M6 retail); on Tech, `actuator=beamngpy` + `cmd_applied` means the same thing. `gvdStrip` keeps its old shape plus `applying`.
+`gvd/main.lua` pushes `guihooks.trigger('gvdUi', ...)` on a single 10 Hz `tickPush` path (same period as the `egoFb` poll). Wheel/pedal bars ride that path from `egoFb`; `onEgoFeedback` does not push a second HUD stream. Payload still includes capped scene geometry: `path` ≤28 points, `tracks` ≤12 (`id,cls,x,y,yaw,v,lead`), `lanes` ≤6×12 (`pts,kind,side,style,idx`), `edges` ≤2×12, `signs` ≤8, `fans` ≤6×8, all ego frame and rounded to 2 dp. `link` is `live` / `stale` / `none` from the heartbeat age, or `mismatch` when `python_bus` and `lua_bus` are not the same folder (refuse actuation; do not guess). The app can show the dead-man without a second file bus. `applying` rides along, so the app can show `DRIVE` while the mod holds the wheel (M6 retail); on Tech, `actuator=beamngpy` + `cmd_applied` means the same thing. `gvdStrip` keeps its old shape plus `applying`.
 
 Live wheel / pedal HUD fields are the same retail Direct Drive echo already written to `gvd_ego.json` (`M.onEgoFeedback` / `egoFb`). No parallel input stack.
 

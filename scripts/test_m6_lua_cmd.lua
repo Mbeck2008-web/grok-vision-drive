@@ -46,6 +46,9 @@ end
 function readFile(path)
   return vfsBus[busRel(path)]
 end
+local DRIVE_USER = 'C:/Users/Name/AppData/Local/BeamNG/BeamNG.drive/current'
+local DRIVE_BUS = DRIVE_USER .. '/Documents/GVD'
+local TECH_BUS = 'C:/Users/Name/AppData/Local/BeamNG/BeamNG.tech/current/Documents/GVD'
 FS = {
   readFile = function(_, path) return vfsBus[busRel(path)] end,
   writeFile = function(_, path, data)
@@ -53,6 +56,7 @@ FS = {
     return true
   end,
   directoryCreate = function() end,
+  getUserPath = function() return DRIVE_USER end,
 }
 local function writeFile(p, s) vfsBus[busRel(p)] = s end
 local function readFileAll(p) return vfsBus[busRel(p)] end
@@ -183,8 +187,10 @@ local function writeCmd(engaged, steer, throttle, brake, hbOffset)
   return seq
 end
 local function beatState(engaged, reason, overrideCfg)
-  writeFile(statePath, string.format('{"engaged":%s,"disengage_reason":"%s","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15%s}',
-    engaged and 'true' or 'false', reason or 'none', os.clock() + seq, overrideCfg and (',"override_cfg":' .. overrideCfg) or ''))
+  writeFile(statePath, string.format(
+    '{"engaged":%s,"disengage_reason":"%s","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"drive","cmd_seq":%d%s}',
+    engaged and 'true' or 'false', reason or 'none', os.clock() + seq, DRIVE_BUS, DRIVE_BUS, seq,
+    overrideCfg and (',"override_cfg":' .. overrideCfg) or ''))
 end
 
 M.onExtensionLoaded()
@@ -215,10 +221,15 @@ do
 end
 check(core_input_actions.actionsCache[true] == nil, 'actionsCache[true] was wiped')
 check(core_input_actions.normalActionsCache[true] == nil, 'normalActionsCache[true] was wiped')
+-- Engage is Lua-owned (Alt+G / in-game button). Writing gvd_engage.json true from Python must not latch ON.
+writeFile(engagePath, string.format('{"engaged": true, "mtime": %.3f}', os.time() + 10))
+M.onUpdate(0.2)
+check(not M.isEngaged(), 'Engage-from-file-true does not engage Lua')
 beatState(false, 'not_engaged')
 writeCmd(false, 0, 0, 1)
 M.onUpdate(0.2)
 check(#events == 0, 'not engaged in-game → vehicle untouched')
+check(not M.isEngaged(), 'still OFF after Engage-from-file-true + state beat')
 
 -- 1) Alt+A, but the supervisor has not read the flag yet → hands off (no brake tap on engage)
 M.toggleEngage()
@@ -519,6 +530,27 @@ check(not M.isEngaged(), 'physical brake press 0.12 with the Direct Drive source
 check(logs[#logs]:find('player_brake') ~= nil, 'override logged player_brake from lastInputs')
 veEnv.input.lastInputs = {}
 currentVeh = fakeVeh
+
+-- 14) Drive Lua + Tech python_bus: refuse actuation. Do not guess folders.
+echo(0, 0.3, 0)
+M.toggleEngage()
+warmDrive(0, 0.3, 0)
+check(M.isEngaged(), 'engaged on matching Drive bus before mismatch')
+clearEvents()
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","product":"tech","cmd_seq":%d}',
+  os.clock() + seq, TECH_BUS, seq))
+writeCmd(true, 0.4, 0.5, 0.0)
+M.onUpdate(0.2)
+local droveMismatch = false
+for _, e in ipairs(events) do
+  if (e[1] == 'throttle' or e[1] == 'steering') and math.abs((e[2] or 0)) > 0.05 then
+    droveMismatch = true
+  end
+end
+check(not droveMismatch, 'bus mismatch refuses actuation')
+check(M.isEngaged(), 'mismatch does not steal Lua-owned engage')
+M.toggleEngage()
 
 -- 12) chrome check on everything we push to the vehicle / HUD
 for _, e in ipairs(logs) do assert(not e:lower():find('tesla') and not e:find('FSD'), 'chrome in log: ' .. e) end

@@ -203,14 +203,33 @@ def check_source_contracts(lua: str) -> None:
     assert "_tryFsDocs" not in docs_exec
     assert "_tryEnvProductDocs" not in docs_exec
     assert "dir = _tryEnvDocs()" in docs_exec
+    assert "getUserPath" not in docs_exec, "gvdDocsDir must not io/read via getUserPath"
+
+    lua_bus_fn = _fn(lua, "luaBusPath")
+    same_fn = _fn(lua, "busesSame")
+    lua_bus_exec = re.sub(r"--[^\n]*", "", lua_bus_fn)
+    same_exec = re.sub(r"--[^\n]*", "", same_fn)
+    assert "getUserPath" in lua_bus_exec
+    assert "Documents/GVD" in lua_bus_exec
+    assert "io.open" not in lua_bus_exec
+    assert "onedrive" in same_exec
+    write_fn = _fn(lua, "writeText")
+    write_exec = re.sub(r"--[^\n]*", "", write_fn)
+    assert "io.open" not in write_exec, "bus writes must not io.open (leftover current\\ gvd_*.json)"
+    assert "FS:writeFile" in write_exec
+    assert "tickBusIdentity" in lua
+    assert "python_bus=" in lua and "lua_bus=" in lua and "product=" in lua
+    assert "state_mtime=" in lua and "engage=" in lua and "seq=" in lua
+    assert "link=MISMATCH" in lua
 
     file_exec = re.sub(r"--[^\n]*", "", file_fn)
     assert "gvdDocsDir() .. '/' .. name" in file_exec
     assert not re.search(r"return\s+name\b", file_exec)
 
-    # lastGood / gvdUi = gvd_state heartbeat (hbAge). Not gvd_ego.json. Live LINK UNPROVEN.
+    # lastGood / gvdUi = gvd_state heartbeat (hbAge). bus folder mismatch is louder than stale.
     link_exec = re.sub(r"--[^\n]*", "", link_fn)
     assert "lastGood" in link_exec and "hbAgeS" in link_exec
+    assert "mismatch" in link_exec and "busMismatch" in lua
     assert "gvd_ego" not in link_exec and "egoFb" not in link_exec, link_fn
     assert "userEgoPath" not in link_exec
 
@@ -264,15 +283,23 @@ def check_source_contracts(lua: str) -> None:
     install = (ROOT / "install.bat").read_text(encoding="utf-8", errors="ignore")
     assert DRIVE_BAT in play and 'set "GVD_DOCS_DIR=%LOCALAPPDATA%\\BeamNG\\BeamNG.drive\\current\\Documents\\GVD"' in play
     assert "echo [GVD] bus:" in play
+    assert "if not defined GVD_DOCS_DIR" not in play, "play_gvd.bat must pin Drive bus (no leftover Tech override)"
+    assert 'set "GVD_PRODUCT=drive"' in play
     assert 'set "GVD_DOCS_DIR=%LOCALAPPDATA%\\BeamNG\\BeamNG.tech\\current\\Documents\\GVD"' not in play
     assert TECH_BAT in tech and 'set "GVD_DOCS_DIR=%LOCALAPPDATA%\\BeamNG\\BeamNG.tech\\current\\Documents\\GVD"' in tech
+    assert "if not defined GVD_DOCS_DIR" not in tech, "play_gvd_tech.bat must pin Tech bus"
+    assert 'set "GVD_PRODUCT=tech"' in tech
     assert 'set "DOCS=%LOCALAPPDATA%\\BeamNG\\BeamNG.drive\\current\\Documents\\GVD"' in install
+    assert 'set "DOCS=%GVD_DOCS_DIR%"' not in install
     assert 'set "DOCS=%LOCALAPPDATA%\\BeamNG\\BeamNG.tech\\current\\Documents\\GVD"' not in install
+    assert "gvdApp" in install
+    assert "gvd-app" in install, "install must call out stale kebab tiles"
+    assert "unpacked\\gvd" in install
     for bat_name, bat in (("install.bat", install), ("play_gvd.bat", play), ("play_gvd_tech.bat", tech)):
-        assert "GVD_DOCS_DIR" in bat, bat_name
         assert 'set "GVD_DOCS_DIR=%USERPROFILE%\\Documents\\GVD"' not in bat, bat_name
         assert 'set "DOCS=%USERPROFILE%\\Documents\\GVD"' not in bat, bat_name
         assert "OneDrive" not in bat and "FOLDERID" not in bat and "mklink" not in bat.lower()
+    assert "GVD_DOCS_DIR" in play and "GVD_DOCS_DIR" in tech
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     schema = (ROOT / "docs" / "gvd_state_schema.md").read_text(encoding="utf-8")
@@ -493,6 +520,10 @@ def check_python_product_sandbox() -> None:
             assert root == override and root.is_dir()
             assert state_path().parent == root
             assert cmd_path().parent == engage_path().parent == ego_path().parent == root
+            ident = paths.bus_identity()
+            assert ident.matched is False, "Python-only override must not pretend Lua shares that folder"
+            assert ident.link == "MISMATCH"
+            assert not paths.buses_same_folder(ident.python_bus, ident.lua_bus)
 
     # Blank GVD_DOCS_DIR is ignored (fall through to Drive sandbox).
     with _clear_product(
@@ -532,6 +563,11 @@ def check_python_product_sandbox() -> None:
             assert root.parts[-2:] == ("Documents", "GVD")
             assert "BeamNG.drive" in root.parts
             assert "BeamNG.tech" not in root.parts
+            ident = paths.bus_identity()
+            assert ident.matched is True
+            assert ident.product == "drive"
+            assert paths.buses_same_folder(ident.python_bus, ident.lua_bus)
+            assert ident.python_bus == expected
 
     # Tech mkdir when GVD_BEAMNG=1.
     with tempfile.TemporaryDirectory() as td:
@@ -542,6 +578,8 @@ def check_python_product_sandbox() -> None:
             assert root == expected and root.is_dir()
             assert "BeamNG.tech" in root.parts
             assert not (Path(td) / "Documents" / "GVD").exists()
+            ident = paths.bus_identity()
+            assert ident.matched is True and ident.product == "tech"
 
     # USERPROFILE-only mkdir still lands on AppData\\Local Drive sandbox.
     with tempfile.TemporaryDirectory() as td:
@@ -569,6 +607,140 @@ def check_python_tech_sandbox() -> None:
 def check_python_known_folder() -> None:
     """Alias kept for test_m6_retail.check_gvd_docs_dir."""
     check_python_product_sandbox()
+
+
+def lua_read_helper(path: str) -> str | None:
+    """Mirror of Lua ``_gvdBusRel``: the folder GELua actually reads."""
+    p = str(path).replace("\\", "/")
+    name = p.rsplit("/", 1)[-1]
+    if name.startswith("gvd_"):
+        return "Documents/GVD/" + name
+    if p == "Documents/GVD" or p.startswith("Documents/GVD/"):
+        return p
+    return None
+
+
+def check_writer_lua_folder_agreement() -> None:
+    """Fails if Python writers and the Lua read helper disagree on the bus folder."""
+    from python.runtime import paths
+
+    lua = LUA.read_text(encoding="utf-8")
+    bus_fn = _fn(lua, "_gvdBusRel")
+    bus_exec = re.sub(r"--[^\n]*", "", bus_fn)
+    assert "Documents/GVD/" in bus_exec
+    assert "return 'Documents/GVD/' .. name" in bus_exec or 'return "Documents/GVD/" .. name' in bus_exec
+    assert not re.search(r"return\s+name\b", bus_exec), "Lua must not read a bare gvd_*.json under current\\"
+    assert "/current/" not in bus_exec.replace("Documents/GVD", "")
+
+    rel = lua_read_helper("gvd_state.json")
+    assert rel == "Documents/GVD/gvd_state.json", rel
+    leftover = lua_read_helper("current/gvd_state.json")
+    assert leftover == "Documents/GVD/gvd_state.json", leftover
+    assert lua_read_helper("Documents/GVD/gvd_cmd.json") == "Documents/GVD/gvd_cmd.json"
+
+    drive = "C:/Users/Name/AppData/Local/" + DRIVE_TAIL
+    tech = "C:/Users/Name/AppData/Local/" + TECH_TAIL
+    assert paths.buses_same_folder(drive, drive.replace("/", "\\"))
+    assert not paths.buses_same_folder(drive, tech), "Drive vs Tech must fail the agreement check"
+    assert not paths.buses_same_folder(drive, "Documents/GVD"), "do not guess relative == absolute"
+    assert not paths.buses_same_folder(drive, "C:/Users/Name/Documents/GVD")
+    assert not paths.buses_same_folder(drive, "C:/Users/Name/AppData/Local/BeamNG/BeamNG.drive/current")
+
+    with _clear_product(
+        LOCALAPPDATA="C:/Users/Name/AppData/Local",
+        USERPROFILE="C:/Users/Name",
+        HOME=None,
+    ):
+        py = paths.gvd_docs_path()
+        lua_bus = paths.resolved_lua_bus("drive")
+        ident = paths.bus_identity()
+        writer_state = (py / "gvd_state.json").as_posix()
+        reader_state = lua_read_helper("gvd_state.json")
+        assert writer_state.endswith("/" + reader_state) or writer_state.endswith(reader_state), (
+            writer_state,
+            reader_state,
+        )
+        assert "BeamNG.drive/current/Documents/GVD" in writer_state.replace("\\", "/")
+        assert ident.matched and paths.buses_same_folder(py, lua_bus), (py, lua_bus)
+        assert ident.product == "drive"
+        assert ident.lua_bus_s.replace("\\", "/").endswith("/Documents/GVD") or ident.lua_bus_s.replace("\\", "/") == "Documents/GVD"
+
+    with _clear_product(
+        LOCALAPPDATA="C:/Users/Name/AppData/Local",
+        GVD_BEAMNG="1",
+    ):
+        py = paths.gvd_docs_path()
+        assert "BeamNG.tech/current/Documents/GVD" in str(py).replace("\\", "/")
+        assert paths.bus_identity().product == "tech"
+        assert paths.bus_identity().matched
+
+    with _clear_product(
+        LOCALAPPDATA="C:/Users/Name/AppData/Local",
+        GVD_DOCS_DIR="C:/Users/Name/AppData/Local/BeamNG/BeamNG.tech/current/Documents/GVD",
+        GVD_PRODUCT="drive",
+    ):
+        ident = paths.bus_identity()
+        assert ident.product == "drive"
+        assert ident.matched is False, "Tech write root while Drive product is a bus mismatch"
+        assert ident.link == "MISMATCH"
+
+    # Leftover gvd_state.json under current\\ while Documents/GVD is empty → MISMATCH.
+    with tempfile.TemporaryDirectory() as td:
+        la = Path(td) / "AppData" / "Local"
+        current = la.joinpath("BeamNG", "BeamNG.drive", "current")
+        current.mkdir(parents=True)
+        (current / "gvd_state.json").write_text("{}", encoding="utf-8")
+        with _clear_product(LOCALAPPDATA=str(la), USERPROFILE=str(Path(td)), HOME=None):
+            ident = paths.bus_identity()
+            assert ident.leftover
+            assert ident.matched is False
+            assert "leftover" in ident.note
+
+    # Other product tree has the file, ours does not → MISMATCH.
+    with tempfile.TemporaryDirectory() as td:
+        la = Path(td) / "AppData" / "Local"
+        tech_docs = la.joinpath(*paths.TECH_GVD_REL)
+        tech_docs.mkdir(parents=True)
+        (tech_docs / "gvd_state.json").write_text("{}", encoding="utf-8")
+        with _clear_product(LOCALAPPDATA=str(la), USERPROFILE=str(Path(td)), HOME=None):
+            ident = paths.bus_identity()
+            assert ident.product == "drive"
+            assert ident.other_state is not None
+            assert ident.matched is False
+            assert "other product" in ident.note
+
+    line = paths.format_bus_identity_line(
+        python_bus=drive,
+        lua_bus=drive,
+        product="drive",
+        state_mtime=1,
+        engage=False,
+        seq=3,
+        link="ok",
+    )
+    assert "python_bus=" in line and "lua_bus=" in line and "product=drive" in line
+    assert "state_mtime=1" in line and "engage=false" in line and "seq=3" in line
+    bad = paths.format_bus_identity_line(
+        python_bus=tech,
+        lua_bus=drive,
+        product="drive",
+        state_mtime=2,
+        engage=True,
+        seq=9,
+        link="MISMATCH",
+    )
+    assert "link=MISMATCH" in bad and "engage=true" in bad
+
+    from python.runtime.state_io import load_paint_state
+
+    with tempfile.TemporaryDirectory() as td:
+        la = Path(td) / "AppData" / "Local"
+        with _clear_product(LOCALAPPDATA=str(la), USERPROFILE=str(Path(td)), HOME=None):
+            paint = load_paint_state()
+            assert paint.get("bus_link") == "MISMATCH"
+            assert paint.get("path_ego") == []
+            assert paint.get("lanes_ext") == []
+            assert paint.get("engaged") is False
 
 
 def check_lua_harness() -> None:
@@ -604,6 +776,7 @@ def main() -> None:
     check_source_contracts(lua)
     check_python_mirror()
     check_python_product_sandbox()
+    check_writer_lua_folder_agreement()
     check_lua_harness()
     print("test_gvd_docs_dir: OK")
 

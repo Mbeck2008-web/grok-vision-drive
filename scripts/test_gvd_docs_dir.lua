@@ -17,8 +17,8 @@ local src = f:read('*a')
 f:close()
 
 local i = src:find('local gvdDocsResolved', 1, true)
-local j = src:find('\nlocal function userEngagePath', i, true)
-check(i and j, 'main.lua exports gvdDocsDir helpers before userEngagePath')
+local j = src:find('\nlocal function writeText', i, true)
+check(i and j, 'main.lua exports gvdDocsDir helpers before writeText')
 local body = src:sub(i, j - 1)
 check(body:find('GVD_DOCS_DIR', 1, true), 'GVD_DOCS_DIR override is in helpers')
 check(body:find("dir = 'Documents/GVD'", 1, true), 'default docs dir is relative Documents/GVD')
@@ -67,7 +67,7 @@ local function loadHelpers(envVars, fs)
     math = math,
     assert = assert,
   }
-  local chunk = body .. '\nreturn { abs = _isAbsDiskPath, docsDir = gvdDocsDir, file = gvdFile }\n'
+  local chunk = body .. '\nreturn { abs = _isAbsDiskPath, docsDir = gvdDocsDir, file = gvdFile, bus = luaBusPath, product = gvdProduct, same = busesSame }\n'
   local fn, err = loadfn(chunk)
   check(fn, 'helpers compile: ' .. tostring(err))
   if setfenv then setfenv(fn, sandbox) else
@@ -83,6 +83,22 @@ check(H.abs('\\\\server\\share\\GVD') == true, 'UNC path is absolute')
 check(H.abs('/tmp/custom/GVD') == true, 'POSIX path is absolute')
 check(H.abs('Documents/GVD') == false, 'Documents/GVD is relative')
 check(H.abs('custom/GVD') == false, 'custom relative dir is not absolute')
+check(H.same(
+      'C:/Users/Name/AppData/Local/BeamNG/BeamNG.drive/current/Documents/GVD',
+      'C:\\Users\\Name\\AppData\\Local\\BeamNG\\BeamNG.drive\\current\\Documents\\GVD') == true,
+  'slash/case normalized same folder')
+check(H.same(
+      'C:/Users/Name/AppData/Local/BeamNG/BeamNG.drive/current/Documents/GVD',
+      'C:/Users/Name/AppData/Local/BeamNG/BeamNG.tech/current/Documents/GVD') == false,
+  'Drive vs Tech is not the same folder')
+check(H.same(
+      'C:/Users/Name/AppData/Local/BeamNG/BeamNG.drive/current/Documents/GVD',
+      'Documents/GVD') == false,
+  'do not guess that relative Documents/GVD equals an absolute sandbox')
+check(H.same(
+      'C:/Users/Name/AppData/Local/BeamNG/BeamNG.drive/current/Documents/GVD',
+      'C:/Users/Name/OneDrive/Documents/GVD') == false,
+  'OneDrive is not the GVD bus')
 
 local function resolve(envVars, fs)
   return loadHelpers(envVars, fs).docsDir()
@@ -121,6 +137,27 @@ check(resolve({
 check(resolve({ USERPROFILE = 'C:\\Users\\Name' }, nil) == 'Documents/GVD',
   'USERPROFILE does not become USERPROFILE/Documents/GVD')
 
+check(loadHelpers({}, {
+      getUserPath = function() return 'C:/Users/Name/AppData/Local/BeamNG/BeamNG.drive/current/' end,
+      directoryCreate = function() end,
+    }).bus() == 'C:/Users/Name/AppData/Local/BeamNG/BeamNG.drive/current/Documents/GVD',
+  'lua_bus resolves Documents/GVD via the running userfolder')
+
+check(loadHelpers({}, {
+      getUserPath = function() return 'C:/Users/Name/AppData/Local/BeamNG/BeamNG.tech/current' end,
+      directoryCreate = function() end,
+    }).product() == 'tech',
+  'product=tech from userfolder')
+
+check(loadHelpers({}, {
+      getUserPath = function() return 'C:/Users/Name/AppData/Local/BeamNG/BeamNG.drive/current' end,
+      directoryCreate = function() end,
+    }).product() == 'drive',
+  'product=drive from userfolder')
+
+check(loadHelpers({}, { directoryCreate = function() end }).bus() == 'Documents/GVD',
+  'lua_bus stays relative Documents/GVD when userfolder is unknown (do not guess)')
+
 check(resolve({ LOCALAPPDATA = 'C:/Users/Name/AppData/Local', GVD_BEAMNG = '1' }, nil)
     == 'Documents/GVD',
   'LOCALAPPDATA + GVD_BEAMNG does not join the Tech tail for Lua')
@@ -148,5 +185,8 @@ check(mkdirDir == 'Documents/GVD', 'mkdir of relative Documents/GVD')
 
 check(body:find("docs dir=", 1, true) and body:find('gvdDocsLogged', 1, true),
   'one-shot log of resolved docs dir')
+check(body:find('luaBusPath', 1, true) and body:find('busesSame', 1, true),
+  'identity helpers live next to gvdDocsDir')
+check(not body:find('io.open', 1, true), 'identity/docs helpers have no io.open')
 
 print('test_gvd_docs_dir: OK')

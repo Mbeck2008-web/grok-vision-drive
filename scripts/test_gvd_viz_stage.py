@@ -32,6 +32,7 @@ def main() -> None:
         VizUI,
         _track_dims,
         in_path,
+        is_bus_mismatch,
         is_halted,
         is_hazard,
         is_slowing,
@@ -151,6 +152,23 @@ def main() -> None:
     # void stage is near-black; a fully white or empty frame means the draw failed
     assert int(frame.mean()) < 80
     assert int(frame.max()) > 80, "lexicon should light ice/paper pixels"
+
+    # Loud mismatch: path_ego present must not become a fake corridor.
+    mismatch_st = dict(st)
+    mismatch_st["bus_link"] = "MISMATCH"
+    mismatch_st["link"] = "mismatch"
+    mismatch_st["python_bus"] = "C:/Users/Name/AppData/Local/BeamNG/BeamNG.tech/current/Documents/GVD"
+    mismatch_st["lua_bus"] = "C:/Users/Name/AppData/Local/BeamNG/BeamNG.drive/current/Documents/GVD"
+    mismatch_st["product"] = "drive"
+    mismatch_st["bus_note"] = "python_bus and lua_bus are not the same folder"
+    assert is_bus_mismatch(mismatch_st)
+    mm = render_stage(mismatch_st, ui=ui)
+    assert mm.shape == (800, 1280, 3)
+    path_band = frame[520:720, 500:780]
+    mm_band = mm[520:720, 500:780]
+    assert int(mm_band.mean()) < 25, "mismatch must not paint a corridor"
+    assert int(path_band.mean()) > int(mm_band.mean()), "live corridor lights more than mismatch void"
+    assert int(mm.max()) > 80, "MISMATCH overlay must be visible"
 
     # stub lanes must not be drawn unless viz_smoke
     stub_only = dict(st)

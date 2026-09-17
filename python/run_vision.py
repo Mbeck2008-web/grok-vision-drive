@@ -46,11 +46,13 @@ from python.runtime.models import ModelRuntime
 from python.runtime.shadow import ShadowConfig, load_shadow_config, shadow_tick
 from python.runtime.state_io import (
     default_state,
+    load_paint_state,
     read_state,
     state_path,
     steer_preview_path_ego,
     write_state,
 )
+from python.runtime.paths import bus_identity, format_bus_identity_line
 from python.sensors.cameras import make_backend, resolve_backend_name
 from python.viz.monitors import place_opencv_window
 from python.viz.stage import STAGE_W, STAGE_H, VizUI, render_stage, smoke
@@ -348,6 +350,18 @@ def main() -> None:
     )
 
     print(f"[GVD] camera backend={backend.name} detector={perc.detector.name} actuator={actuator.name}")
+    ident0 = bus_identity()
+    print(format_bus_identity_line(
+        python_bus=ident0.python_bus_s,
+        lua_bus=ident0.lua_bus_s,
+        product=ident0.product,
+        state_mtime="--",
+        engage=False,
+        seq=-1,
+        link=ident0.link if ident0.link == "MISMATCH" else None,
+    ))
+    if not ident0.matched:
+        print(f"[GVD] link=MISMATCH {ident0.note} — refuse actuation. Steam GELua does not inherit GVD_DOCS_DIR.")
     if actuator.name == "cmd_json":
         print(
             "[GVD] actuator=cmd_json: Documents/GVD/gvd_cmd.json -> gvd_main.applyCmdJson -> player vehicle "
@@ -408,6 +422,7 @@ def main() -> None:
         cv2.setMouseCallback(win, _on_mouse)
 
     session_start = time.time()
+    last_ident_print = 0.0
     policy_active = args.policy
     frame_i = 0
     cmd_seq = 0
@@ -525,7 +540,11 @@ def main() -> None:
             prev_preview = bool(ui.debug.allow_preview)
 
             engaged = bool(args.force_engage) or bool(ui.debug.force_engage) or read_engage_flag(default=False)
-            disengage_reason = "none"
+            ident = bus_identity()
+            if not ident.matched:
+                engaged = False
+                # Refuse actuation. Do not guess Drive vs Tech or honor a Python-only override.
+            disengage_reason = "none" if ident.matched else "bus_mismatch"
             heartbeat_ok = True
             allow_preview = bool(args.allow_preview_drive) or bool(ui.debug.allow_preview)
             policy_tick = ui.debug.effective_policy(policy_active)
@@ -562,7 +581,10 @@ def main() -> None:
             )
             cmd = tick.applied
 
-            if not engaged:
+            if not ident.matched:
+                disengage_reason = "bus_mismatch"
+                cmd = stop_command(seq=cmd_seq, reason="bus_mismatch")
+            elif not engaged:
                 disengage_reason = "not_engaged"
             elif tick.should_disengage:
                 veto_name = str(tick.veto_reason or "veto")
@@ -769,11 +791,34 @@ def main() -> None:
 
             write_state(st)
 
+            now_wall = time.time()
+            if now_wall - last_ident_print >= 1.0:
+                last_ident_print = now_wall
+                mt: object = "--"
+                try:
+                    if state_path().is_file():
+                        mt = f"{state_path().stat().st_mtime:.3f}"
+                except OSError:
+                    mt = st.get("heartbeat_mtime") or "--"
+                print(
+                    format_bus_identity_line(
+                        python_bus=ident.python_bus_s,
+                        lua_bus=ident.lua_bus_s,
+                        product=ident.product,
+                        state_mtime=mt,
+                        engage=engaged,
+                        seq=st.get("cmd_seq", cmd_seq),
+                        link=ident.link if ident.link == "MISMATCH" else None,
+                    ),
+                    flush=True,
+                )
+
             if win is not None:
                 import cv2
 
+                paint = load_paint_state()
                 frame = render_stage(
-                    st,
+                    paint,
                     ui=ui,
                     main_frame=main,
                     cam_frames=getattr(bundle, "frames", None),

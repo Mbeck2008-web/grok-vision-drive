@@ -29,6 +29,9 @@ local fadeAcc = 0
 local fadeDur = 0.40
 local lastGood = nil
 local missingKeysLogged = false
+local stateReadOkLogged = false
+local stateReadFailLogged = false
+local stateJsonFailLogged = false
 local stripAcc = 0
 
 -- M6 retail drive state (gvd_cmd.json → player vehicle; electrics echo → gvd_ego.json)
@@ -162,8 +165,8 @@ local function gvdDocsDir()
   gvdDocsResolved = dir
   if not gvdDocsLogged then
     gvdDocsLogged = true
-    log('I', 'GVD', '[GVD] docs dir: ' .. tostring(dir) .. ' (USERPROFILE=' .. tostring(os.getenv('USERPROFILE') or '') .. ')')
-    print('[GVD] docs dir: ' .. tostring(dir))
+    log('I', 'GVD', '[GVD] docs dir=' .. tostring(dir))
+    print('[GVD] docs dir=' .. tostring(dir))
   end
   return dir
 end
@@ -227,7 +230,44 @@ local function writeEngageFile(reason)
   writeText(userEngagePath(), payload)
 end
 
+-- Absolute disk paths: io.open FIRST. VFS readFile / FS:readFile often fail
+-- (or return empty/junk) on C:/ and \\ paths, which left lastGood nil and Apps
+-- NO LINK even when USERPROFILE\Documents\GVD\gvd_state.json was fresh on disk.
+local function _isAbsDiskPath(path)
+  local p = tostring(path or '')
+  -- spec: ^[A-Za-z]:/  or  \\UNC
+  if p:match('^%a:[/\\]') then return true end
+  if p:match('^\\\\') then return true end
+  if p:sub(1, 1) == '/' then return true end
+  return false
+end
+
+local function _ioOpenRead(path)
+  if not path or path == '' then return nil end
+  local p = tostring(path)
+  local f = io.open(p, 'r')
+  if f then return f end
+  local win = p:gsub('/', '\\')
+  if win ~= p then f = io.open(win, 'r') end
+  return f
+end
+
+local function _ioReadAll(path)
+  local f = _ioOpenRead(path)
+  if not f then return nil end
+  local data = f:read('*a')
+  f:close()
+  if data and data ~= '' then return data end
+  return nil
+end
+
 local function readText(path)
+  if not path then return nil end
+  -- Absolute C:/ or \\ (and POSIX /): io.open BEFORE FS:readFile.
+  if _isAbsDiskPath(path) then
+    local data = _ioReadAll(path)
+    if data then return data end
+  end
   if readFile then
     local ok, data = pcall(readFile, path)
     if ok and data and data ~= '' then return data end
@@ -236,11 +276,10 @@ local function readText(path)
     local ok, data = pcall(function() return FS:readFile(path) end)
     if ok and data and data ~= '' then return data end
   end
-  local f = io.open(path, 'r')
-  if not f then return nil end
-  local data = f:read('*a')
-  f:close()
-  return data
+  if not _isAbsDiskPath(path) then
+    return _ioReadAll(path)
+  end
+  return nil
 end
 
 local function decodeJson(s)
@@ -1543,11 +1582,32 @@ local function syncEngageFromSupervisor()
 end
 
 local function pollStateFile()
-  local raw = readText(userStatePath())
-  if not raw then return end
+  local path = userStatePath()
+  local raw = readText(path)
+  if not raw then
+    if not stateReadFailLogged then
+      stateReadFailLogged = true
+      log('W', 'GVD', '[GVD] read fail path=' .. tostring(path))
+      print('[GVD] read fail path=' .. tostring(path))
+    end
+    return
+  end
   local st = decodeJson(raw)
-  if not st then return end
+  if type(st) ~= 'table' then
+    if not stateJsonFailLogged then
+      stateJsonFailLogged = true
+      log('W', 'GVD', '[GVD] json fail len=' .. tostring(#raw) .. ' path=' .. tostring(path))
+      print('[GVD] json fail len=' .. tostring(#raw) .. ' path=' .. tostring(path))
+    end
+    return
+  end
+  local firstGood = lastGood == nil
   lastGood = st
+  if not stateReadOkLogged then
+    stateReadOkLogged = true
+    log('I', 'GVD', '[GVD] gvd_state read ok path=' .. tostring(path))
+    print('[GVD] gvd_state read ok path=' .. tostring(path))
+  end
   readOverrideCfg(st)  -- config/control.yaml override: block, mirrored by the supervisor
   noteHeartbeat(st)
   local beat = tonumber(st.heartbeat_mtime)
@@ -1573,6 +1633,11 @@ local function pollStateFile()
       log('I', 'GVD', '[GVD] state missing keys (defaults/preview): ' .. table.concat(miss, ','))
       missingKeysLogged = true
     end
+  end
+  -- Fresh lastGood must hit CEF immediately. Apps stay NO LINK if we wait for
+  -- onPreRender/onUpdate (some builds never tick those before the CEF poke).
+  if firstGood then
+    pushUi()
   end
 end
 
@@ -1809,6 +1874,10 @@ end
 function M.onExtensionLoaded()
   gvdDocsDir()  -- resolve + log once
   readUiPrefs()
+  -- Do not wait for onUpdate/onPreRender: CEF Apps poke pushUiState while lastGood
+  -- is still nil and show "supervisor not running" / NO LINK on a fresh disk file.
+  pollStateFile()
+  pushUi()
   -- keyboard.diff applies ~1s before unpacked mods mount. core_input_actions caches the
   -- action table on first read, so a bind of gvd_toggle_engage before gvd.json is visible
   -- leaves ActionMap with no title/desc (Could not create a description for alt+g).
@@ -1884,6 +1953,8 @@ function M.requestVizScreen(s)
 end
 
 function M.pushUiState()
+  -- CEF poke: read disk now so LINKED does not depend on pollState ticks.
+  pollStateFile()
   pushUi()
 end
 

@@ -6,10 +6,10 @@ left as-is. Python must match that local folder — not the Known Folder redirec
 
 Resolution:
   1. env override ``GVD_DOCS_DIR`` if set (full GVD root)
-  2. ``SHGetKnownFolderPath(FOLDERID_Documents)`` as a probe (ctypes/shell32, no pywin32)
-     — **reject** when the path contains ``OneDrive`` (no junction, no Personal-reg tip)
-  3. ``%USERPROFILE%/Documents`` or ``expanduser(~)/Documents``
-  4. relative ``Documents``
+  2. ``%USERPROFILE%/Documents`` (local, non-redirected; never OneDrive)
+  3. ``SHGetKnownFolderPath(FOLDERID_Documents)`` probe only if USERPROFILE is missing
+     (ctypes/shell32, no pywin32) — **reject** when the path contains ``OneDrive``
+  4. ``expanduser(~)/Documents`` / ``HOME``; else relative ``Documents``
 
 Callers append ``GVD`` through ``gvd_docs_dir()`` unless the override already is
 the GVD root.
@@ -140,11 +140,13 @@ def env_documents_dir() -> Path | None:
 
 
 def documents_dir() -> Path:
-    """Local Documents root — never an OneDrive Known Folder redirect."""
+    """Local Documents: USERPROFILE first; never an OneDrive Known Folder redirect."""
+    env_docs = env_documents_dir()
+    if env_docs is not None and not is_onedrive_path(env_docs):
+        return env_docs
     known = windows_known_folder_documents()
     if known is not None and not is_onedrive_path(known):
         return known
-    env_docs = env_documents_dir()
     if env_docs is not None:
         return env_docs
     return Path("Documents")

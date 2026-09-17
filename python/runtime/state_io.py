@@ -8,8 +8,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-# All Documents/GVD writers/readers go through paths.py (GVD_DOCS_DIR, then a
-# non-OneDrive Known Folder probe, then %USERPROFILE%\Documents\GVD).
+# All Documents/GVD writers/readers go through paths.py (GVD_DOCS_DIR, then
+# %USERPROFILE%\Documents\GVD; OneDrive FOLDERID is never followed).
 from python.runtime.paths import gvd_docs_dir as gvd_docs_dir
 
 def state_path() -> Path:

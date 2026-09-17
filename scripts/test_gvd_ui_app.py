@@ -235,7 +235,14 @@ def main() -> None:
     assert "setAllowedInputSource('brake','local',false)" in lua, "retail must lock out the player brake pedal"
     assert "setAllowedInputSource('parkingbrake','local',false)" in lua, "retail must lock out a resting handbrake"
     assert "setAllowedInputSource('clutch','local',false)" in lua, "retail must lock out a resting clutch"
-    assert "applying = applying" in lua, "gvdUi must carry the drive flag for the DRIVE state"
+    assert "gvdUi" in app_js and "scope.$on('gvdUi'" in app_js
+    assert "pushUiState" in app_js
+    assert "supervisor not running" in app_js
+    assert "ui.link === 'none'" in app_js, "CEF supervisor-not-running is link none (lastGood missing)"
+    assert "lastGood = st" in lua
+    assert "gvd_state read ok path=" in lua and "read fail path=" in lua and "json fail len=" in lua
+    poke = re.search(r"function M\.pushUiState\(\).*?\nend\n", lua, re.S)
+    assert poke and "pollStateFile()" in poke.group(0)
     assert "'DRIVE'" in app_js and "steer to take over" in app_js
     assert "engage takes the wheel" in app_html
 

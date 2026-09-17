@@ -547,6 +547,8 @@ def check_lua_harness() -> None:
             assert bind.returncode == 0 and "test_gvd_bind_reload: OK" in bind.stdout, bind.stdout + bind.stderr
             docs = subprocess.run([exe, "scripts/test_gvd_docs_dir.lua"], cwd=str(ROOT), capture_output=True, text=True, timeout=30)
             assert docs.returncode == 0 and "test_gvd_docs_dir: OK" in docs.stdout, docs.stdout + docs.stderr
+            link = subprocess.run([exe, "scripts/test_gvd_state_link.lua"], cwd=str(ROOT), capture_output=True, text=True, timeout=30)
+            assert link.returncode == 0 and "test_gvd_state_link: OK" in link.stdout, link.stdout + link.stderr
             return
     print("  (lua interpreter not found — scripts/test_m6_lua_cmd.lua skipped)")
 

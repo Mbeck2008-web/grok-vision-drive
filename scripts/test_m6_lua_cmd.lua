@@ -43,6 +43,7 @@ local egoPath = docs .. '/gvd_ego.json'
 local function writeFile(p, s) local f = assert(io.open(p, 'w')); f:write(s); f:close() end
 local function readFileAll(p) local f = io.open(p, 'r'); if not f then return nil end; local d = f:read('*a'); f:close(); return d end
 os.remove(egoPath)
+os.remove(statePath)
 
 -- ── fake vehicle: executes queued vehicle-Lua in a sandbox ─────────────────────────────────────
 local allowed = {}          -- recorded input.setAllowedInputSource calls

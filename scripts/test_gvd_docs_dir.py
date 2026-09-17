@@ -16,10 +16,17 @@ Lua gvdDocsDir (unchanged USERPROFILE-first; no Personal-reg OneDrive tip)
 Python ``gvd_docs_dir`` (local Documents; #38 OneDrive FOLDERID is the FAIL)
 ---------------------------------------------------------------------------
 1. env ``GVD_DOCS_DIR`` if set (full GVD root)
-2. ``SHGetKnownFolderPath(FOLDERID_Documents)`` as a probe — reject when the
-   path contains ``OneDrive`` (Personal / ``OneDrive - …``)
-3. else ``%USERPROFILE%/Documents/GVD`` or ``expanduser`` Documents
-4. else relative ``Documents/GVD``
+2. ``%USERPROFILE%/Documents/GVD`` (local, non-redirected)
+3. ``SHGetKnownFolderPath(FOLDERID_Documents)`` as a probe only if USERPROFILE is
+   missing — reject when the path contains ``OneDrive``
+4. else ``expanduser`` / HOME Documents, else relative ``Documents/GVD``
+
+Lua ``gvd_state`` LINKED (not path-only)
+---------------------------------------
+``readText`` uses absolute ``io.open`` **before** VFS ``FS:readFile``. ``pollStateFile``
+sets ``lastGood`` and logs read ok / read fail / json fail distinctly. ``pushUiState``
+and ``onExtensionLoaded`` poll + push ``gvdUi`` so CEF is not stuck on
+"supervisor not running" when the disk file is fresh.
 
 When FOLDERID points at OneDrive, Python must land on
 ``%USERPROFILE%\\Documents\\GVD`` — the same USERPROFILE-first folder Lua uses
@@ -106,7 +113,7 @@ def check_source_contracts(lua: str) -> None:
     docs_exec = re.sub(r"--[^\n]*", "", docs_fn)
     assert "/Documents/GVD" in docs_exec
     assert "directoryCreate" in docs_exec, "mkdir of resolved docs dir"
-    assert "gvdDocsLogged" in docs_fn and "docs dir:" in docs_fn, "one-shot log"
+    assert "gvdDocsLogged" in docs_fn and "docs dir=" in docs_fn, "one-shot log"
     assert "dir = 'Documents/GVD'" in docs_exec, "last resort is Documents/GVD, never CWD or current\\"
 
     file_exec = re.sub(r"--[^\n]*", "", file_fn)
@@ -124,6 +131,40 @@ def check_source_contracts(lua: str) -> None:
     assert "Accounts" not in helpers and "UserFolder" not in helpers
     assert "SHGetKnownFolderPath" not in helpers
     assert "FOLDERID" not in helpers
+
+    read_fn = _fn(lua, "readText")
+    io_fn = _fn(lua, "_ioOpenRead")
+    read_exec = re.sub(r"--[^\n]*", "", read_fn)
+    io_exec = re.sub(r"--[^\n]*", "", io_fn)
+    assert "io.open" in io_exec, "absolute io.open helper"
+    assert "_isAbsDiskPath" in read_exec and "_ioReadAll" in read_exec
+    assert 0 <= read_exec.find("_isAbsDiskPath") < read_exec.find("FS:readFile"), "io.open before FS:readFile"
+    assert read_exec.find("_ioReadAll") < read_exec.find("FS:readFile")
+    assert read_exec.find("_isAbsDiskPath") < read_exec.find("if readFile")
+    assert "_isAbsDiskPath" in lua and "%a:[/\\" in lua
+    poll_fn = _fn(lua, "pollStateFile")
+    assert "lastGood = st" in poll_fn
+    assert "gvd_state read ok path=" in poll_fn
+    assert "read fail path=" in poll_fn
+    assert "json fail len=" in poll_fn
+    assert "pushUi()" in poll_fn, "first lastGood must push gvdUi"
+    loaded = re.search(r"function M\.onExtensionLoaded\(\).*?\nend\n", lua, re.S)
+    assert loaded, "onExtensionLoaded missing"
+    load_exec = re.sub(r"--[^\n]*", "", loaded.group(0))
+    assert "pollStateFile()" in load_exec and "pushUi()" in load_exec
+    poke = re.search(r"function M\.pushUiState\(\).*?\nend\n", lua, re.S)
+    assert poke, "pushUiState missing"
+    poke_exec = re.sub(r"--[^\n]*", "", poke.group(0))
+    assert "pollStateFile()" in poke_exec and "pushUi()" in poke_exec
+    assert "pollState(dt)" in lua
+    assert re.search(r"function M\.onPreRender\(dt\).*?pollState\(dt\)", lua, re.S)
+    assert re.search(r"function M\.onUpdate\(dt\).*?pollState\(dt\)", lua, re.S)
+
+    for bat_name in ("install.bat", "play_gvd.bat", "play_gvd_tech.bat"):
+        bat = (ROOT / bat_name).read_text(encoding="utf-8", errors="ignore")
+        assert r"%USERPROFILE%\Documents\GVD" in bat, bat_name
+        assert "GVD_DOCS_DIR" in bat, bat_name
+        assert "OneDrive" not in bat and "FOLDERID" not in bat and "mklink" not in bat.lower()
 
 
 def check_python_mirror() -> None:
@@ -211,6 +252,10 @@ def check_python_known_folder() -> None:
     from python.runtime.state_io import gvd_docs_dir, state_path
 
     src = (ROOT / "python" / "runtime" / "paths.py").read_text(encoding="utf-8")
+    docs_body = src[src.find("def documents_dir"): src.find("def gvd_docs_path")]
+    assert docs_body.find("env_documents_dir") < docs_body.find("windows_known_folder_documents"), (
+        "USERPROFILE Documents before Known Folder probe"
+    )
     state_src = (ROOT / "python" / "runtime" / "state_io.py").read_text(encoding="utf-8")
     assert "SHGetKnownFolderPath" in src, "Known Folder stays a probe"
     assert "FOLDERID_Documents" in src
@@ -316,11 +361,19 @@ def check_python_known_folder() -> None:
     # Classic Known Folder == USERPROFILE Documents (non-OneDrive retail).
     classic_docs = Path("C:/Users/Name/Documents")
     with _patch_attr(paths, "windows_known_folder_documents", lambda: classic_docs):
-        with _env(GVD_DOCS_DIR=None):
+        with _env(GVD_DOCS_DIR=None, USERPROFILE="C:/Users/Name"):
             got = paths.gvd_docs_path()
             assert _slash(got) == local_gvd
             assert lua_onedrive != _slash(got)
             assert resolve_docs_dir({"USERPROFILE": "C:/Users/Name"}) == _slash(got)
+
+    # USERPROFILE wins over a non-OneDrive FOLDERID redirect (system-disk local docs).
+    other = Path("D:/Redirected/Documents")
+    with _patch_attr(paths, "windows_known_folder_documents", lambda: other):
+        with _env(USERPROFILE="C:/Users/Name", GVD_DOCS_DIR=None):
+            got = paths.gvd_docs_path()
+            assert _slash(got) == local_gvd, got
+            assert "Redirected" not in _slash(got)
 
     # GVD_DOCS_DIR override wins over OneDrive FOLDERID and USERPROFILE.
     with tempfile.TemporaryDirectory() as td:
@@ -363,16 +416,17 @@ def check_python_known_folder() -> None:
                 assert cmd_path().parent == engage_path().parent == ego_path().parent == root
                 assert root.parts[-2:] == ("Documents", "GVD")
 
-    # Classic non-OneDrive FOLDERID still mkdir's {Documents}/GVD.
+    # Classic non-OneDrive FOLDERID mkdir only when USERPROFILE/HOME are missing.
     with tempfile.TemporaryDirectory() as td:
         known = Path(td) / "Documents"
         known.mkdir(parents=True)
         with _patch_attr(paths, "windows_known_folder_documents", lambda: known):
-            with _env(GVD_DOCS_DIR=None):
-                root = gvd_docs_dir()
-                assert root == known / "GVD" and root.is_dir()
-                assert state_path().parent == root
-                assert cmd_path().parent == engage_path().parent == ego_path().parent == root
+            with _patch_attr(paths, "env_documents_dir", lambda: None):
+                with _env(GVD_DOCS_DIR=None):
+                    root = gvd_docs_dir()
+                    assert root == known / "GVD" and root.is_dir()
+                    assert state_path().parent == root
+                    assert cmd_path().parent == engage_path().parent == ego_path().parent == root
 
     # Host fallback (Linux CI / non-OneDrive): still …/Documents/GVD unless override.
     with _env(GVD_DOCS_DIR=None):
@@ -392,6 +446,16 @@ def check_lua_harness() -> None:
             )
             assert res.returncode == 0 and "test_gvd_docs_dir: OK" in res.stdout, (
                 res.stdout + res.stderr
+            )
+            link = subprocess.run(
+                [exe, "scripts/test_gvd_state_link.lua"],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            assert link.returncode == 0 and "test_gvd_state_link: OK" in link.stdout, (
+                link.stdout + link.stderr
             )
             print(f"  lua harness via {exe}: OK")
             return

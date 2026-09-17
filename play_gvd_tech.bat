@@ -17,9 +17,10 @@ if not defined PY where python >nul 2>&1 && set "PY=python"
 set "RUN="
 set "RUNROOT=%~dp0"
 if exist "%~dp0python\run_vision.py" set "RUN=%~dp0python\run_vision.py"
-if not defined RUN if exist "%USERPROFILE%\Documents\GVD\python\run_vision.py" (
-  set "RUN=%USERPROFILE%\Documents\GVD\python\run_vision.py"
-  set "RUNROOT=%USERPROFILE%\Documents\GVD"
+if not defined GVD_DOCS_DIR set "GVD_DOCS_DIR=%USERPROFILE%\Documents\GVD"
+if not defined RUN if exist "%GVD_DOCS_DIR%\python\run_vision.py" (
+  set "RUN=%GVD_DOCS_DIR%\python\run_vision.py"
+  set "RUNROOT=%GVD_DOCS_DIR%"
 )
 set "REQS=%~dp0requirements-beamng.txt"
 

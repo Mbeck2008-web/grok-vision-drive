@@ -151,7 +151,7 @@ made.docsDir()
 check(mkdirDir == 'C:/Users/Name/Documents/GVD', 'mkdir of resolved Documents/GVD')
 
 -- one-shot log of resolved docs dir (source contract; log is called from gvdDocsDir)
-check(body:find("docs dir:", 1, true) and body:find('gvdDocsLogged', 1, true),
+check(body:find("docs dir=", 1, true) and body:find('gvdDocsLogged', 1, true),
   'one-shot log of resolved docs dir')
 
 print('test_gvd_docs_dir: OK')

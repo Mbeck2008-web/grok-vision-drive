@@ -27,15 +27,13 @@ AEB_BRAKE_TTC = 1.2
 EGO_FRESH_S = 1.0          # gvd_ego.json older than this → treat Lua feedback as gone
 CMD_ACK_SLACK = 5          # Lua acks lag a few seqs (20 Hz apply, 10 Hz echo, 15 Hz loop)
 
-# Tech no-R: leave arcade (held service brake = reverse throttle). realistic_automatic
-# shifts up on its own; reverse/park are manual. stop_command / AEB use brake=1;
-# speed-plan braking maxes at 0.6.
+# Tech no-R (research pin): arcade + brake-hold + no throttle auto-selects R.
+# Use realistic_automatic so brake-hold is not reverse throttle. Gear is int only
+# (-1 R, 0 N, 1+ forward) — never gear=-1, never letter "D".
 TECH_SHIFT_MODE = "realistic_automatic"
 TECH_HOLD_BRAKE = 0.99
 # Below this, a full brake is a rest hold (parkingbrake on). Rolling AEB keeps PB off.
 TECH_HOLD_SPEED_MPS = 0.5
-# BeamNGpy control(gear=): -1 reverse, 0 neutral, 1+ forward. NEVER send -1.
-# TODO(research): named D / gearIndex kwargs if BeamNGpy grows them.
 TECH_HOLD_GEAR = 0
 TECH_DRIVE_GEAR = 1
 
@@ -213,6 +211,17 @@ def _clip_steer(v: float) -> float:
     return float(max(-1.0, min(1.0, v)))
 
 
+def _tech_gear(value: int) -> int:
+    """Clamp to a non-reverse BeamNGpy gear int (0 N, 1+ forward). Never -1 or 'D'."""
+    try:
+        g = int(value)
+    except (TypeError, ValueError):
+        return TECH_HOLD_GEAR
+    if g < 0:
+        return TECH_HOLD_GEAR
+    return g
+
+
 def tech_control_kwargs(
     steer: float,
     throttle: float,
@@ -223,9 +232,9 @@ def tech_control_kwargs(
 ) -> dict[str, Any]:
     """BeamNGpy vehicle.control kwargs that never select reverse.
 
-    Shift mode is realistic_automatic (not arcade). Holds use gear=0 (N) plus
-    service brake and, at rest, parkingbrake. Drive pins gear>=1. gear=-1 is
-    never sent. TODO(research): named D / gearIndex if BeamNGpy grows them.
+    Shift mode is realistic_automatic (not arcade). Holds: throttle=0, brake=1,
+    gear=0, ±parkingbrake. Forward motion only with gear>=1 and throttle>0.
+    gear is int only; never -1, never letter D. clutch optional (omitted).
     """
     if release:
         return {
@@ -237,21 +246,24 @@ def tech_control_kwargs(
     steer_v = _clip_steer(steer)
     throttle_v = _clip01(throttle)
     brake_v = _clip01(brake)
-    if throttle_v <= 1e-6 and brake_v >= TECH_HOLD_BRAKE:
-        moving = speed_mps is not None and float(speed_mps) > TECH_HOLD_SPEED_MPS
+    if throttle_v > 1e-6:
         return {
             "steering": steer_v,
-            "throttle": 0.0,
+            "throttle": throttle_v,
             "brake": brake_v,
-            "parkingbrake": 0.0 if moving else 1.0,
-            "gear": TECH_HOLD_GEAR,
+            "parkingbrake": 0.0,
+            "gear": _tech_gear(TECH_DRIVE_GEAR),
         }
+    parking = 0.0
+    if brake_v >= TECH_HOLD_BRAKE:
+        moving = speed_mps is not None and float(speed_mps) > TECH_HOLD_SPEED_MPS
+        parking = 0.0 if moving else 1.0
     return {
         "steering": steer_v,
-        "throttle": throttle_v,
+        "throttle": 0.0,
         "brake": brake_v,
-        "parkingbrake": 0.0,
-        "gear": TECH_DRIVE_GEAR,
+        "parkingbrake": parking,
+        "gear": _tech_gear(TECH_HOLD_GEAR),
     }
 
 
@@ -490,17 +502,14 @@ class BeamNGPyActuator:
         self.engaged = bool(engaged)
 
     def _invoke_control(self, kwargs: dict[str, Any]) -> None:
-        """Send control kwargs; drop gear / parkingbrake if this BeamNGpy rejects them."""
+        """Send control kwargs. Never fall back to arcade brake-hold (no gear, brake=1)."""
         attempts: list[dict[str, Any]] = [dict(kwargs)]
         if "gear" in kwargs:
-            no_gear = dict(kwargs)
-            del no_gear["gear"]
-            attempts.append(no_gear)
-        core = {k: kwargs[k] for k in ("steering", "throttle", "brake") if k in kwargs}
-        if core not in attempts:
-            attempts.append(core)
+            attempts.append({k: v for k, v in kwargs.items() if k != "gear"})
         last_err: Exception | None = None
         for kw in attempts:
+            if is_reverse_control(kw) or is_arcade_reverse_hold(kw):
+                continue
             try:
                 self.vehicle.control(**kw)
                 return
@@ -509,7 +518,7 @@ class BeamNGPyActuator:
                 continue
         if last_err is not None:
             raise last_err
-        self.vehicle.control(**kwargs)
+        raise TypeError("vehicle.control rejected non-reverse Tech kwargs")
 
     def _control(
         self, steer: float, throttle: float, brake: float, *, release: bool = False

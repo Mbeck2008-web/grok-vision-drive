@@ -126,7 +126,9 @@ def main() -> None:
     assert drive_kw["gear"] >= TECH_DRIVE_GEAR and drive_kw["gear"] != -1
     slow = tech_control_kwargs(0.0, 0.0, 0.6)
     assert slow["brake"] == 0.6 and slow.get("parkingbrake", 0.0) == 0.0
-    assert slow["gear"] >= TECH_DRIVE_GEAR
+    assert slow["gear"] == TECH_HOLD_GEAR == 0  # forward gear only with throttle>0
+    coast = tech_control_kwargs(0.0, 0.0, 0.0)
+    assert coast["gear"] == 0 and coast["throttle"] == 0.0
     rel = tech_control_kwargs(0.9, 0.9, 0.9, release=True)
     assert rel == {"steering": 0.0, "throttle": 0.0, "brake": 0.0, "parkingbrake": 0.0}
     assert rel.get("gear", 0) != -1
@@ -147,7 +149,18 @@ def main() -> None:
 
     def _assert_no_reverse(kw: dict) -> None:
         assert not is_reverse_control(kw), kw
-        assert kw.get("gear", 0) != -1, kw
+        gear = kw.get("gear")
+        assert gear != -1, kw
+        assert not isinstance(gear, str), kw  # never letter "D"
+        if gear is not None:
+            assert isinstance(gear, int) and gear >= 0, kw
+        if float(kw.get("throttle") or 0.0) > 1e-6:
+            assert int(kw["gear"]) >= TECH_DRIVE_GEAR, kw
+        if float(kw.get("throttle") or 0.0) <= 1e-6 and float(kw.get("brake") or 0.0) >= 0.99:
+            assert float(kw.get("brake") or 0.0) > 0.0 or float(kw.get("parkingbrake") or 0.0) > 0.0, kw
+            if gear is not None:
+                assert gear == 0 or gear >= 1, kw
+        assert not is_arcade_reverse_hold(kw), kw
 
     veh = FakeVeh()
     tech = BeamNGPyActuator(veh)
@@ -226,6 +239,9 @@ def main() -> None:
     assert veh.calls[-1].get("gear", 0) != -1
     tech.stop(seq=5, reason="not_engaged")
     assert len(veh.calls) == n + 1, veh.calls  # no further takeover while OFF
+
+    for kw in veh.calls + moving.calls + ng.calls:
+        _assert_no_reverse(kw)
 
     print("test_m3_actuate: OK")
 

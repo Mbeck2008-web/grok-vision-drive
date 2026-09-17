@@ -27,6 +27,7 @@ from python.sensors.tech import (  # noqa: E402
     heading_from_world_dir,
     latest_gps_reading,
     load_tech_config,
+    nav_heading_from_sources,
     nav_snapshot,
     path_ego_to_world,
     wrap180,
@@ -149,6 +150,25 @@ def check_gps_geometry() -> None:
     assert got is not None and got["lat"] == 53.1
     assert latest_gps_reading([{"lat": 1.0, "lon": 2.0}])["lon"] == 2.0
     assert latest_gps_reading({"lat": 53.09, "lon": 8.81, "x": 1, "y": 2})["lat"] == 53.09
+
+
+def check_ego_fb_null_safe() -> None:
+    """Tech attach leaves ego_fb=None; heading fill must not crash or require engage."""
+    assert nav_heading_from_sources(vdata=None, ego_fb=None) is None
+    vd = VehicleData(dir=(0.0, 1.0, 0.0), gps_heading_deg=12.5)
+    assert nav_heading_from_sources(vdata=vd, ego_fb=None) == 12.5
+    vd2 = VehicleData(dir=(0.0, 1.0, 0.0))
+    assert nav_heading_from_sources(vdata=vd2, ego_fb=None) == 0.0
+
+    class _Fb:
+        dir = (1.0, 0.0, 0.0)
+
+    assert abs(nav_heading_from_sources(vdata=None, ego_fb=_Fb()) - 90.0) < 1e-6
+    rv = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
+    assert "ego_fb.dir" not in rv
+    assert "nav_heading_from_sources" in rv
+    cams = (ROOT / "python" / "sensors" / "cameras.py").read_text(encoding="utf-8")
+    assert "independent of Alt+G" in cams
 
 
 def check_gps_poll_and_pin() -> None:
@@ -316,6 +336,7 @@ def main() -> None:
     check_forbidden_attach()
     check_gps_not_forbidden()
     check_gps_geometry()
+    check_ego_fb_null_safe()
     check_gps_poll_and_pin()
     check_pin_env_override()
     check_poll_mock()

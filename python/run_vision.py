@@ -24,7 +24,7 @@ from python.control.actuate import (
 from python.sensors.tech import (
     VehicleData,
     apply_nav_missing,
-    heading_from_world_dir,
+    nav_heading_from_sources,
     nav_snapshot,
     path_ego_to_world,
     run_probe,
@@ -662,10 +662,8 @@ def main() -> None:
                 }
             st["nav"] = nav_snapshot(vdata)
             if str((st.get("nav") or {}).get("mode") or "missing") == "missing" and extras_bundle.gps.ok:
-                heading = None
-                if vdata is not None:
-                    heading = vdata.gps_heading_deg
-                heading = heading_from_world_dir(ego_fb.dir)
+                # Tech attach has no gvd_ego.json; ego_fb stays None until Lua retail echo.
+                heading = nav_heading_from_sources(vdata, ego_fb)
                 st["nav"] = nav_hint_from_bundle(extras_bundle, heading_deg=heading)
             st["sensors"] = extras_bundle.health()
             st["path_ego"] = pout.path_ego if pout.path_ego else steer_preview_path_ego(steer, length_m=36.0)

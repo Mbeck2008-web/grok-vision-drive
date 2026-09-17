@@ -8,24 +8,93 @@ Entertainment only. Never use this stack to control a physical car.
 
 - **Vision only** at inference: RGB cameras + ego kinematics + GPS as a **nav hint**. Optional pin (`nav.pin_lat` / `nav.pin_lon` in `config/tech.yaml`, or `GVD_NAV_PIN_LAT` / `GVD_NAV_PIN_LON`) is **not a route** — `nav.mode=hint`, `drive_to_pin=false`, and the corridor planner ignores the pin.
 - **Optional extras** (`config/sensors.yaml`): IMU + GPS on by default; LiDAR / radar / lidar_lua / Foxglove **off**. They are a **sensor bus** (Foxglove / future fusion only) — they never feed `ModularPerception` or the planner. Ultrasonic / IdealRadar stay refused. See [Extra sensors / Foxglove](#extra-sensors--foxglove).
-- **Tech path** (preferred): BeamNGpy Camera sensors, 8-cam rig, BeamNGpy `vehicle.control`. Engaged hold/stop/AEB: `set_shift_mode("realistic_automatic")` + `gear=0` (int, never `-1` / never `"D"`) + `brake=1` ± `parkingbrake`. Forward only with `gear>=1` and throttle>0. **Retail path**: window-capture fallback for a **single** main view (`cams=1/8`) — do not pretend that is 8 cameras. Retail **drives** through the mod: Python writes `Documents/GVD/gvd_cmd.json`, GELua applies it as a **secondary Direct Drive wheel + pedals** (`input.event(..., FILTER_DIRECT, source=gvd)` plus `setAllowedInputSource` so a connected keyboard/pad/wheel/pedal cluster cannot overwrite the software), and echoes speed/inputs back via `gvd_ego.json`. Retail still zeros `parkingbrake` so a resting handbrake cannot pin the car (unchanged this hotfix).
-- Default GPU profile: **NVIDIA GTX 1080 Ti (11 GB)**. Live stack must share the card with BeamNG.
+- **Dev / Tech path** (preferred): BeamNGpy Camera sensors, 8-cam rig, BeamNGpy `vehicle.control`. Engaged hold/stop/AEB: `set_shift_mode("realistic_automatic")` + `gear=0` (int, never `-1` / never `"D"`) + `brake=1` ± `parkingbrake`. Forward only with `gear>=1` and throttle>0. **Player / Drive (retail)**: window-capture fallback for a **single** main view (`cams=1/8`) — do not pretend that is 8 cameras. Retail **drives** through the mod: Python writes `Documents/GVD/gvd_cmd.json`, GELua applies it as a **secondary Direct Drive wheel + pedals** (`input.event(..., FILTER_DIRECT, source=gvd)` plus `setAllowedInputSource` so a connected keyboard/pad/wheel/pedal cluster cannot overwrite the software), and echoes speed/inputs back via `gvd_ego.json`. Retail still zeros `parkingbrake` so a resting handbrake cannot pin the car (unchanged this hotfix).
+- Default GPU profile: **NVIDIA GTX 1080 Ti (11 GB)** — **mid** in [`config/hardware.yaml`](config/hardware.yaml). Live stack must share the card with BeamNG. See [GPU tiers](#gpu-tiers).
+- **Soft Esc parked.** Esc is BeamNG's pause / **UI Apps** menu. It is **not** a GVD live disengage and **not** Engage. This repo does not handle Esc as takeover. Live Engage is **UNPROVEN** (install still documents Alt+G / Ctrl+Alt+G as the intended bind; that is not a live prove). Live Tech 8-cam attach is **UNPROVEN**.
 - Not Tesla FSD. No Tesla logos. Repository title stays free of “FSD”. “Vision Drive” / “camera autopilot toy” are fine.
 - Strategy analogies in docs mean: Tesla idea → **our toy version does X**.
 
 Credits: [VisionPilot](https://github.com/visionpilot-project/VisionPilot), BeamNG / BeamNGpy, Udacity/Aly lane pipelines, Ultralytics if YOLO is used later.
 
+## Audiences
+
+Pick one product. They do **not** share a userfolder, mod tree, or `Documents/GVD` bus.
+
+| | **Player** — retail BeamNG.**drive** | **Dev** — BeamNG.**tech** |
+| --- | --- | --- |
+| Who | Steam / retail players | People with a Tech license + `tech.key` |
+| Cameras | **1** window capture (`cams=1/8 path=retail`). Not 8 cams. | **8** RGB BeamNGpy cameras from `config/cameras.yaml` |
+| Drive | `gvd_cmd.json` → Lua secondary Direct Drive wheel + pedals | BeamNGpy `vehicle.control` after Alt+G |
+| Launcher | `play_gvd.bat` | `play_gvd_tech.bat` |
+| Python extras | `requirements-retail.txt` (no beamngpy) | `requirements-beamng.txt` (BeamNGpy pin must match Tech) |
+
+`--backend auto` does **not** pick Tech just because beamngpy is installed — only `GVD_BEAMNG=1` or `--backend beamngpy` / `play_gvd_tech.bat`.
+
+## Drive vs Tech paths
+
+Three trees per product. Do not mix Drive with Tech. Confirm the live userfolder: Launcher → Manage User Folder → **Open in Explorer**. GVD **never** writes into the Steam/Tech **game** folder.
+
+| | **Player / Drive** (retail BeamNG.drive) | **Dev / Tech** (BeamNG.tech) |
+| --- | --- | --- |
+| Userfolder (0.37+ / 0.38+) | `%LOCALAPPDATA%\BeamNG\BeamNG.drive\current` | `%LOCALAPPDATA%\BeamNG\BeamNG.tech\current` |
+| `mods\unpacked\gvd` | Nested `%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\mods\unpacked\gvd` (legacy `%LOCALAPPDATA%\BeamNG.drive\<ver>\mods\unpacked\gvd` if that is the install pick) | Dual Tech trees: **mods → legacy**. `install.bat` copies Tech mods to `%LOCALAPPDATA%\BeamNG.tech\current\mods\unpacked\gvd` first (legacy), else nested `%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\mods\unpacked\gvd`. If both exist, **legacy wins**. |
+| `Documents\GVD` bus | Nested `%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\Documents\GVD` | Dual Tech trees: **bus → nested** `%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\Documents\GVD` (not the legacy `BeamNG.tech` tree). |
+| `play_gvd*.bat` | `play_gvd.bat` — `GVD_BACKEND=window`, Steam `284160`, Drive bus | `play_gvd_tech.bat` — `GVD_BACKEND=beamngpy` + `GVD_BEAMNG=1`, Tech nested bus, launches `%BNG_HOME%\BeamNG.tech.exe` **or**, if that file is missing, `%BNG_HOME%\Bin64\BeamNG.tech.x64.exe`. Does **not** launch Steam Drive. |
+
+Lua on **both** products reads relative `Documents/GVD` via VFS / `FS:readFile` — that mapping follows the **running** userfolder (Launcher → Manage User Folder → **Open in Explorer**), not whichever tree `install.bat` last copied. No absolute `io.open`. `GVD_DOCS_DIR` wins for **Python writers**; Steam GELua does **not** inherit it. Not `%USERPROFILE%\Documents\GVD`. Not OneDrive. Not the Steam game folder (`C:\Program Files (x86)\Steam\steamapps\common\BeamNG.drive` typical; confirm via Steam → Properties → Installed files).
+
+`tech.key` lives in the **Tech install directory** next to the exe, not the userfolder. `uninstall.bat` removes Drive `mods\unpacked\gvd` and `mods\gvd.zip` only — it does **not** remove Tech mods or either bus.
+
 ## Install
+
+Windows first. No admin. Never writes into `Steam\steamapps\common\BeamNG.drive`. "Inject" here means copy into the correct user mods folder so BeamNG loads the mod itself — no DLLs, hooks, or process injection.
+
+### Player (retail BeamNG.drive)
 
 Get `gvd-retail-<version>.zip` from GitHub Releases (or build it — see [Release zip](#release-zip-m6)), extract it anywhere, then:
 
-1. Double-click `install.bat` (prefers `%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\mods` on 0.38+; else newest versioned folder)
-2. Fully quit and restart BeamNG
-3. Enable Grok Vision Drive in Mod Manager if needed (Alt+G engage)
+1. Double-click `install.bat` (prefers `%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\mods` on 0.38+; else newest versioned folder).
+2. Fully quit and restart BeamNG.drive.
+3. Enable **Grok Vision Drive** in Mod Manager.
+4. Install Python 3 from python.org (tick *Add to PATH*).
+5. `pip install -r requirements-retail.txt` — or let `play_gvd.bat` offer when packages are missing.
+6. Double-click `play_gvd.bat` (supervisor `window` backend + Steam app `284160` + **GVD VISION**).
+7. Esc → **UI Apps** → Add App → **GVD** / **GVD Strip**. Alt+G engage.
 
-Optional: double-click `play_gvd.bat` to start the Python supervisor (retail `window` backend) + Steam BeamNG (`284160`). Uninstall: `uninstall.bat` (removes only `mods\unpacked\gvd` and `mods\gvd.zip`).
+Uninstall Drive mods: `uninstall.bat`. Play details: [Player guide](#player-guide-retail-m6).
 
-Windows first. No admin. Never writes into `Steam\steamapps\common\BeamNG.drive`. “Inject” here means copy into the correct user mods folder so BeamNG loads the mod itself — no DLLs, hooks, or process injection.
+### Dev install (BeamNG.tech)
+
+1. Install BeamNG.tech (not Steam Drive). Place `tech.key` **next to the Tech exe** (install dir, not the userfolder).
+2. Double-click `install.bat` — copies the Lua mod into Drive `current\mods` and, if a Tech mods folder exists, Tech `current\mods` (legacy `%LOCALAPPDATA%\BeamNG.tech\current\mods` first).
+3. `pip install -r requirements-beamng.txt` (BeamNGpy must match Tech: **0.38 → 1.35.x**, **0.39 → 1.36**).
+4. Set `BNG_HOME` to the Tech install folder. Edit `config\tech.yaml` for host/port/`wait_vehicle_s` / `user:` if needed.
+5. Start BeamNG.tech, spawn a vehicle (ETK800 is the camera-draft car), enable **Grok Vision Drive** in Mod Manager.
+6. Double-click `play_gvd_tech.bat` (or `PYTHONPATH=. python python/run_vision.py --backend beamngpy --viz`). That sets `GVD_BEAMNG=1` and uses the Tech bus.
+7. Probe without driving: `PYTHONPATH=. python python/run_vision.py --tech-probe`.
+8. Alt+G engage. Optional pin: `nav.pin_lat` / `nav.pin_lon` in `config/tech.yaml` (or `GVD_NAV_PIN_LAT` / `GVD_NAV_PIN_LON`) — **hint only**, not a route.
+
+Live Tech attach is **UNPROVEN**. Details: [Dev (BeamNG.tech)](#dev-beamngtech).
+
+## GPU tiers
+
+Caps come from [`config/hardware.yaml`](config/hardware.yaml). There is **one** shipped profile: `gtx_1080_ti`. GVD does **not** ship an in-game graphics preset. BeamNG overall Graphics quality (official lighting docs) is **Lowest / Low / Normal / High / Ultra** — there is no overall **Medium**. Do not invent extra Options names.
+
+Shared-card rules (all tiers): infer ≤ `max_inference_vram_gb: 4`; `live_input_long_side: 640`; `target_hz_min: 10` / `target_hz_happy: 15`; depth/semantic **OFF**; encode **QSV** (`igpu: uhd_630`); `encode.never: nvenc` unless QSV fails **and** `--encode nvenc`; hitch drops **far / side-cam rate** (sides half, rear ÷4), not resolution. Live start **refuses** if probed dGPU VRAM is **< 10 GB** while BeamNG is up, unless `--vision-only` (that flag does **not** free BeamNG VRAM). The `hardware.yaml` header mentions `--profile unlimited` as **OFF** — that is a **yaml comment only**, not a `run_vision.py` CLI flag. Do not raise inference VRAM.
+
+**A = retail** (`play_gvd.bat`): one window grab (`cam_main` only). Capture does **not** attach 8 Camera sensors and does **not** need 8 extra renders.
+
+**B = Tech 8-cam** (`play_gvd_tech.bat`): BeamNG **plus** 8 colour Camera sensors @640 **plus** ONNX on the same dGPU. That is 8 extra GPU views, not "just 640".
+
+| Tier | `hardware.yaml` | **A** = retail (1 window) | **B** = Tech 8-cam |
+| --- | --- | --- | --- |
+| **entry** | probed dGPU VRAM **< 10 GB** (below the live-start floor) | Only with `--vision-only`. Infer still ≤4 GB / 640. May miss `target_hz_min: 10`. | Not realistic. 8 RGB @640 + BeamNG will OOM. Live start refuses while BeamNG is up unless `--vision-only`. |
+| **mid** (default, **= 1080 Ti**) | `profile: gtx_1080_ti` — GTX 1080 Ti **11 GB**, Pascal, `tensor_cores: false`. Host `cpu: i9-9900k`, `system_ram_gb: 32`. RAM budget: windows 6 / beamng 12 / gvd_peak 10 / clip_ring 2 / unallocated_headroom 4. | Intended retail path. Overall Graphics **Normal** or **High**. Avoid **Ultra**. Toy ONNX ~0.15–0.4 GB; BeamNG still owns most of the 11 GB. If VRAM/Hz fail, same OOM ladder. | Intended Tech path, tight. Overall Graphics **Low** or **Normal**. Turn **Shadow Quality** down, **Antialiasing** off, then **draw** down. Keep LiDAR/radar off (already default). Do not raise `live_res` past 640. |
+| **high** | more VRAM than `dgpu.vram_gb: 11`. Same infer cap (`max_inference_vram_gb: 4`). No CLI `--profile unlimited`. | Comfortable at Normal/High. Same 640 / ≤4 GB caps. If VRAM/Hz fail, same OOM ladder. | 8-cam fits better. Still QSV-first encode. Still 640 / ≤4 GB. If VRAM/Hz fail, same OOM ladder. |
+
+**OOM ladder** (same dGPU; if VRAM/Hz fail). One order, **A** and **B**: **Shadow Quality**, then **Antialiasing**, then **draw**. "Draw" is generic — official lighting docs do not name a player menu **Draw distance**. Then Tech hitch: drop camera `far_m`, then side-cam **rate** (half) and rear ÷4 — **not** 640. Do not add LiDAR/radar, depth, or NVENC.
+
+BIOS (Windows, mid host): enable **iGPU Multi-Monitor** so UHD 630 QSV exists while the 1080 Ti drives the display (M4 encode). Do not set DVMT to 2 GB.
 
 ## Player guide (retail, M6)
 
@@ -34,7 +103,7 @@ What you get on **retail BeamNG.drive**: the in-game **GVD** app (Engage / Disen
 What retail is **not**: eight cameras. It captures **one** window (the main view); the other seven stay `missing` in the nerd panel and the boot line says `cams=1/8 path=retail`. It drives through the **mod's Lua** as a secondary Direct Drive wheel + pedals (`gvd_cmd.json` → vehicle `input.event` source `gvd`), not through BeamNGpy. Eight cameras and BeamNGpy direct control need BeamNG.**tech** (`GVD_BACKEND=beamngpy`, `GVD_BEAMNG=1`) — the preferred path.
 
 1. Extract the zip, double-click `install.bat`, restart BeamNG, enable **Grok Vision Drive** in Mod Manager.
-2. In BeamNG open **Apps** → add **GVD** (and optionally **GVD Strip**).
+2. Esc → **UI Apps** → Add App → **GVD** / **GVD Strip**.
 3. Install Python 3 (python.org, tick *Add to PATH*), then `pip install -r requirements-retail.txt` — or let `play_gvd.bat` offer to do it when packages are missing.
 4. Double-click `play_gvd.bat`. It opens the supervisor console (`cmd /k`, so errors stay readable), the **GVD VISION** window, and BeamNG via Steam. Window capture locks onto a visible window titled **BeamNG** as soon as it appears; if none is found it grabs the primary monitor, so run BeamNG fullscreen in that case (the nerd panel `capture` line tells you which).
 5. Drive onto a road with visible lane lines. As soon as `play_gvd.bat` is up, GVD VISION and the in-game ribbon/ghosts already follow the loaded nets (path, planner, other vehicles) — you are still driving. Press **Alt+G** (fallback **Ctrl+Alt+G**) or the app's **Engage** when you want GVD to take the wheel. **Alt+A** stays BeamNG's stock range display (`toggleRangeStatus`); GVD does not steal it. The HUD strip reads `modular|ON`; as soon as perception sees both lane lines (`path_debug_preview=false`) GVD drives and the strip switches to `modular|DRIVE`. Until then it holds the brake (`preview_blocked`). Take over any time by steering against it (`player_steer`), touching a pedal (`player_brake` / `player_throttle`), or pressing Alt+G — sticky until the next Alt+G.
@@ -54,23 +123,21 @@ Keys in **GVD VISION**: `V` nerd panel, `D` DRIVE tab (gates / actuators / AEB),
 
 The mod reads `engaged=false` back and flips the HUD to **OFF** within ~0.1 s (it never turns engage *on* from a file — engage always starts in-game). Re-engage with Alt+G. A clip is flushed on every disengage, AEB brake and near-miss (`clips\clip_<time>_<trigger>` under the bus dir).
 
-**Bus dir (not `%USERPROFILE%\Documents\GVD`, not OneDrive):** Drive/retail = `%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\Documents\GVD`. Tech = `%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\Documents\GVD`. `GVD_DOCS_DIR` override wins when set (**Python writers**). Steam GELua does **not** inherit that env — live Lua reads relative `Documents/GVD` via VFS / `FS:readFile` (the userfolder mapping of that sandbox). No absolute `io.open`. Files: `{gvd_state.json, gvd_engage.json, gvd_cmd.json, gvd_ego.json, gvd_ui_prefs.json, clips\, python\, config\}`. `uninstall.bat` removes the mod only; delete the sandbox yourself if you want a clean slate. Nothing here talks to a real car and nothing carries Tesla / “FSD” branding.
+**Bus dir (not `%USERPROFILE%\Documents\GVD`, not OneDrive):** Drive/retail = nested `%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\Documents\GVD`. Tech **bus → nested** `%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\Documents\GVD` (Tech **mods → legacy** is a different tree). `GVD_DOCS_DIR` override wins when set (**Python writers**). Steam GELua does **not** inherit that env — live Lua reads relative `Documents/GVD` via VFS / `FS:readFile` (follows the **running** userfolder). No absolute `io.open`. Files: `{gvd_state.json, gvd_engage.json, gvd_cmd.json, gvd_ego.json, gvd_ui_prefs.json, clips\, python\, config\}`. `uninstall.bat` removes the mod only; delete the sandbox yourself if you want a clean slate. Nothing here talks to a real car and nothing carries Tesla / “FSD” branding.
 
 Troubleshooting: blank GVD Apps tile, or console `Could not create a description for binding keyboard0::alt+g` → fully quit BeamNG, wipe `mods\unpacked\gvd`, re-run `install.bat` (in-game CEF / ActionMap need the ASCII app from this tip). Mod missing in Mod Manager → run `install.bat` again and check the path it prints. “Python not found” → install Python 3 with *Add to PATH*. “Missing Python packages” → answer `Y` or run `pip install -r requirements-retail.txt`. No `cam_main` PIP / `capture_note` says *fullscreen/monitor* → make the BeamNG window visible with **BeamNG** in its title, or run fullscreen; `window via unavailable` → `pip install mss`. HUD stays `ON`, never `DRIVE` → GVD only drives once it sees both lane lines (nerd panel `lane` conf, `preview=`); `--allow-preview-drive` follows the steer-preview path instead (debug only). `DRIVE` but the car does nothing → nerd panel `cmd` line: `cmd_json_pending` means the mod is not acking (mod not enabled, no player vehicle, or the supervisor is engaged while the game is not). Boot refuses (`REFUSE: dGPU VRAM … < 10 GB while BeamNG is up`) → `play_gvd.bat --vision-only` (drops the GPU guard, nothing else).
 
-## Tech path (when you have BeamNG.tech)
+## Dev (BeamNG.tech)
 
-There is still no retail mod that creates those eight cameras. Once `tech.key` is in the **Tech install directory** (not the user folder), GVD already knows how to attach them and pull vehicle data.
+Numbered install is under [Install → Dev](#dev-install-beamngtech). There is still no retail mod that creates those eight cameras. Once `tech.key` is in the **Tech install directory** (not the user folder), GVD already knows how to attach them and pull vehicle data.
 
-1. `install.bat` copies the Lua mod into Drive `current\mods` and, if present, `%LOCALAPPDATA%\BeamNG.tech\current\mods`.
-2. `pip install -r requirements-beamng.txt` (BeamNGpy version must match Tech: **0.38 → 1.35.x**, **0.39 → 1.36**).
-3. Set `BNG_HOME` to the Tech install folder. Edit `config\tech.yaml` for host/port/`wait_vehicle_s` if needed.
-4. Start BeamNG.tech, spawn a vehicle (ETK800 is the camera-draft car), enable GVD in Mod Manager.
-5. Double-click `play_gvd_tech.bat` (or `python python/run_vision.py --backend beamngpy --viz`). That sets `GVD_BEAMNG=1`, attaches the 8 RGB cameras from `cameras.yaml` (GVD frame converted to BeamNG vehicle space), **Electrics / Damage / GForces** plus pose, and a **GPS nav hint** (lat/lon). Optional destination: set `nav.pin_lat` / `nav.pin_lon` in `config/tech.yaml` (or `GVD_NAV_PIN_LAT` / `GVD_NAV_PIN_LON`) for range and bearing. Pin is **not a route** — the corridor planner ignores the pin. Optional LiDAR / radar / AdvancedIMU: opt-in in `config/sensors.yaml` (see [Extra sensors / Foxglove](#extra-sensors--foxglove)).
-6. Probe without driving: `python python/run_vision.py --tech-probe`.
-7. Engage is still Alt+G — the 8-cam nets, corridor and tracks already ran while you were driving. Drive is BeamNGpy `vehicle.control` on the player vehicle (`actuator=beamngpy`) only after engage. Ego speed/steer/pedals come from Electrics; the world ribbon uses pose × `path_ego`. Disengaged Tech ticks do not call `vehicle.control` (one zero release on the falling edge, parkingbrake included). Engaged gate holds use neutral + brake, not reverse. Cameras attach on `open()` with `engaged=false` — vision LINK does not wait for Alt+G.
+`play_gvd_tech.bat` (or `PYTHONPATH=. python python/run_vision.py --backend beamngpy --viz`) sets `GVD_BEAMNG=1`, attaches the 8 RGB cameras from `cameras.yaml` (GVD frame converted to BeamNG vehicle space), **Electrics / Damage / GForces** plus pose, and a **GPS nav hint** (lat/lon). Optional destination: set `nav.pin_lat` / `nav.pin_lon` in `config/tech.yaml` (or `GVD_NAV_PIN_LAT` / `GVD_NAV_PIN_LON`) for range and bearing. Pin is **not a route** — the corridor planner ignores the pin. Optional LiDAR / radar / AdvancedIMU: opt-in in `config/sensors.yaml` (see [Extra sensors / Foxglove](#extra-sensors--foxglove)).
+
+Engage is still Alt+G — the 8-cam nets, corridor and tracks already ran while you were driving. Drive is BeamNGpy `vehicle.control` on the player vehicle (`actuator=beamngpy`) only after engage. Ego speed/steer/pedals come from Electrics; the world ribbon uses pose × `path_ego`. Disengaged Tech ticks do not call `vehicle.control` (one zero release on the falling edge, parkingbrake included). Engaged gate holds use neutral + brake, not reverse. Cameras attach on `open()` with `engaged=false` — vision LINK does not wait for Alt+G.
 
 Live Tech attach is **UNPROVEN** until a Windows smoke. `--backend auto` does **not** pick Tech just because beamngpy is installed — only `GVD_BEAMNG=1` or `--backend beamngpy`.
+
+GPU: **B = Tech 8-cam**. Mid host is a **1080 Ti** sharing 11 GB with BeamNG + 8×640 colour + ONNX. See [GPU tiers](#gpu-tiers).
 
 ## Extra sensors / Foxglove
 
@@ -88,31 +155,44 @@ Packs: `install.bat`, `uninstall.bat`, `play_gvd.bat`, `beamng_mod/`, `python/` 
 
 ## Layout
 
+Repo vs the three trees per product (same as [Drive vs Tech paths](#drive-vs-tech-paths)). `install.bat` copies; GVD never writes into the Steam/Tech **game** folder.
+
+| Tree | **Player / Drive** | **Dev / Tech** |
+| --- | --- | --- |
+| Userfolder | Nested `%LOCALAPPDATA%\BeamNG\BeamNG.drive\current` | Nested `%LOCALAPPDATA%\BeamNG\BeamNG.tech\current` |
+| `mods\unpacked\gvd` | Nested `...\current\mods\unpacked\gvd` (legacy `%LOCALAPPDATA%\BeamNG.drive\<ver>\mods\unpacked\gvd` if that is the install pick) | **mods → legacy:** `%LOCALAPPDATA%\BeamNG.tech\current\mods\unpacked\gvd` first, else nested `%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\mods\unpacked\gvd` |
+| `Documents\GVD` bus | Nested `...\current\Documents\GVD` | **bus → nested:** `%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\Documents\GVD` |
+
+Lua relative `Documents/GVD` follows the **running** userfolder (Launcher → Manage User Folder → **Open in Explorer**), not whichever tree `install.bat` last copied.
+
 ```
 install.bat / uninstall.bat / play_gvd.bat / play_gvd_tech.bat
-beamng_mod/          → copied to %LOCALAPPDATA%\BeamNG.drive\<ver>\mods\unpacked\gvd
-python/              → also copied to %LOCALAPPDATA%\BeamNG\BeamNG.drive\current\Documents\GVD\python (Tech sandbox if present)
-config/              → also copied to %LOCALAPPDATA%\BeamNG\BeamNG.drive\current\Documents\GVD\config (Tech sandbox if present)
+beamng_mod/          → Player Drive mods\unpacked\gvd (nested current, or legacy Drive <ver>)
+                     → Dev Tech mods (legacy BeamNG.tech\current first, else nested BeamNG\BeamNG.tech\current)
+python/ config/      → Player nested Drive Documents\GVD\{python,config}
+                     → Dev nested Tech Documents\GVD\{python,config} when that Tech userfolder exists
 config/sensors.yaml  → optional IMU / GPS / LiDAR / radar / Foxglove bus (planner ignores extras)
-requirements-retail.txt   → 1-cam window runtime (numpy, OpenCV, PyYAML, mss; no beamngpy)
+requirements-retail.txt   → Player 1-cam window runtime (numpy, OpenCV, PyYAML, mss; no beamngpy)
+requirements-beamng.txt   → Dev Tech runtime (BeamNGpy pin must match Tech)
 requirements-foxglove.txt  → optional Foxglove SDK (not in the retail zip)
 scripts/make_release_zip.py / .bat → dist/gvd-retail-<version>.zip (not shipped)
 ```
 
-After install, unpacked tree:
+After install, unpacked tree (same internals on both products):
 
 ```
 mods\unpacked\gvd\
   scripts\gvd\modScript.lua
   lua\ge\extensions\gvd\main.lua
   ui\modules\apps\GVD\              # Engage HUD app
+  ui\modules\apps\gvd_strip\        # GVD Strip
   lua\ge\extensions\core\input\actions\gvd.json
   settings\inputmaps\keyboardGvd.json
 ```
 
 ## In-game UI app
 
-After install, start a level, open the **Apps** editor (Esc → *UI Apps*, or the app-layout button on the HUD), drag **GVD** in from the app list, size it, then **Save layout**. Source: `beamng_mod/ui/modules/apps/GVD/`.
+After install, start a level, Esc → **UI Apps** → Add App → **GVD** / **GVD Strip**, size it, then **Save layout**. (The HUD app-layout button also opens this editor.) Source: `beamng_mod/ui/modules/apps/GVD/` and `beamng_mod/ui/modules/apps/gvd_strip/`.
 
 The in-game app is **Engage / Disengage + settings + live wheel/pedal echo** only. The rich VISION lexicon (void stage, multi-lane fan, ice corridor, CIPV boxes, warm curbs, sign/light glyphs) is drawn on the **GVD VISION** OpenCV second screen from the same `Documents/GVD/gvd_state.json`. See [`docs/gvd_state_schema.md`](docs/gvd_state_schema.md#viz-road-model) for what is measured vs inferred. Controls:
 
@@ -160,7 +240,7 @@ Keys in `--viz`: `V` nerd, `D` DRIVE (live actuators), `G` VIZ (occupancy / boxe
 
 **M1 (cameras + hw probe):** `beamngpy | window | stub`, 8-cam yaml, hw_probe. Live still **UNPROVEN on Linux**.
 
-Host profile (target): Intel **i9-9900K** + **UHD 630** (QSV encode) + **GTX 1080 Ti 11 GB** (infer ≤4 GB) + **32 GB DDR4**. See `config/hardware.yaml`.
+Host profile (target / **mid**): Intel **i9-9900K** + **UHD 630** (QSV encode) + **GTX 1080 Ti 11 GB** (infer ≤4 GB) + **32 GB DDR4**. See [GPU tiers](#gpu-tiers) and `config/hardware.yaml`.
 
 ## Cameras (M1)
 
@@ -219,7 +299,7 @@ PYTHONPATH=. python scripts/test_m4_clips.py
 PYTHONPATH=. python python/run_vision.py --viz            # key C = manual clip
 ```
 
-Clips land in `Documents/GVD/clips/` (repo `data/clips/` gitignored). Encode: `ffmpeg` `h264_qsv` if `hw_probe` qsv=yes, else `libx264` veryfast CRF~23. `--encode nvenc` only when you explicitly want Pascal encode (not default).
+Clips land in `Documents/GVD/clips/` (repo `data/clips/` gitignored). Encode: `ffmpeg` `h264_qsv` if `hw_probe` qsv=yes, else `libx264` veryfast CRF~23. `encode.never: nvenc` unless QSV fails **and** `--encode nvenc`.
 
 ## Shadow / E2E (M5)
 

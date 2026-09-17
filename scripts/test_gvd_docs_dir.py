@@ -246,8 +246,10 @@ def check_source_contracts(lua: str) -> None:
     assert probe_fn is not None
     assert "product_gvd_docs_path" in probe_fn
     assert "env_override_gvd_docs_dir" in probe_fn
-    assert "OneDrive" not in probe_fn
-    assert "USERPROFILE" not in probe_fn
+    assert "for root in (env_override_gvd_docs_dir(), product_gvd_docs_path())" in probe_fn
+    assert "is_userprofile_documents_gvd" not in probe_fn
+    assert "OneDrive" in probe_fn  # docstring: do not search it
+    assert "USERPROFILE" in probe_fn  # docstring: do not search it
     state_io_src = (ROOT / "python" / "runtime" / "state_io.py").read_text(encoding="utf-8")
     assert "[GVD][PY]  bus=" in state_io_src
     assert "print_py_bus" in state_io_src

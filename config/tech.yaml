@@ -51,6 +51,6 @@ cameras:
   attach: true
   rgb_only: true
   convert_gvd_frame: true   # cameras.yaml is GVD frame; BeamNGpy Camera is +X left +Y back +Z up
-  update_s: 0.067           # ~15 Hz suggestion to the Tech sensor manager
+  update_s: 0.067           # forward/wide default; cameras.yaml requested_update_time wins (sides/rear 0.13)
   shared_memory: true
   streaming: true

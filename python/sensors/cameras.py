@@ -14,29 +14,46 @@ import numpy as np
 
 CAM_IDS = ("narrow", "main", "wide", "pillarL", "pillarR", "repeatL", "repeatR", "rear")
 MAIN_ALIASES = ("main", "cam_main")
+SIDE_CAM_IDS = frozenset(("pillarL", "pillarR", "repeatL", "repeatR", "rear"))
+FORWARD_CAM_IDS = frozenset(("narrow", "main", "wide"))
 
 # BeamNGpy Camera() defaults near_far_planes=(0.05, 100) — BeamNGpy#199.
-# GVD must pass an explicit pair from cameras.yaml so Tech attach is not clipped at 100 m.
+# GVD always passes an explicit pair from cameras.yaml so Tech attach is not that silent 100 m.
 DEFAULT_NEAR_M = 0.05
 BNGPY_DEFAULT_FAR_M = 100.0
-LONG_RANGE_CAM_IDS = frozenset(("narrow", "main"))
+FORWARD_UPDATE_S = 0.067  # ~15 Hz
+SIDE_UPDATE_S = 0.13  # half-rate vs forward (~7.7 Hz)
+SIDE_GRAB_DIV = 2  # poll sides/rear every Nth grab; never drop resolution
 DEFAULT_FAR_M = {
-    "narrow": 1500.0,
-    "main": 800.0,
-    "wide": 200.0,
-    "pillarL": 200.0,
-    "pillarR": 200.0,
-    "repeatL": 200.0,
-    "repeatR": 200.0,
-    "rear": 200.0,
+    "narrow": 800.0,
+    "main": 300.0,
+    "wide": 300.0,
+    "pillarL": 150.0,
+    "pillarR": 150.0,
+    "repeatL": 150.0,
+    "repeatR": 150.0,
+    "rear": 150.0,
 }
-NARROW_FAR_BAND = (400.0, 1500.0)
-MAIN_FAR_BAND = (400.0, 1000.0)
-SIDE_FAR_BAND = (150.0, 300.0)
-NARROW_FAR_HITCH = (1500.0, 800.0, 600.0, 400.0)
-MAIN_FAR_HITCH = (800.0, 600.0, 400.0)
-SIDE_FAR_HITCH = (200.0, 150.0)
-SIDE_CAM_HITCH_UPDATE_S = 0.10  # 10 Hz floor; never drop resolution on hitch
+DEFAULT_UPDATE_S = {
+    "narrow": FORWARD_UPDATE_S,
+    "main": FORWARD_UPDATE_S,
+    "wide": FORWARD_UPDATE_S,
+    "pillarL": SIDE_UPDATE_S,
+    "pillarR": SIDE_UPDATE_S,
+    "repeatL": SIDE_UPDATE_S,
+    "repeatR": SIDE_UPDATE_S,
+    "rear": SIDE_UPDATE_S,
+}
+# Role bands pin the lock (narrow 800 > main 300; never both-800). 100 m clamps to the role far.
+NARROW_FAR_BAND = (800.0, 800.0)
+MAIN_FAR_BAND = (300.0, 300.0)
+WIDE_FAR_BAND = (300.0, 300.0)
+SIDE_FAR_BAND = (150.0, 150.0)
+NARROW_FAR_HITCH = (800.0,)
+MAIN_FAR_HITCH = (300.0,)
+WIDE_FAR_HITCH = (300.0,)
+SIDE_FAR_HITCH = (150.0,)
+SIDE_CAM_HITCH_UPDATE_S = SIDE_UPDATE_S
 
 
 class CamHealth(str, Enum):
@@ -159,7 +176,36 @@ def far_band(cid: str) -> tuple[float, float]:
         return NARROW_FAR_BAND
     if cid == "main":
         return MAIN_FAR_BAND
+    if cid == "wide":
+        return WIDE_FAR_BAND
     return SIDE_FAR_BAND
+
+
+def default_update_s(cid: str) -> float:
+    return float(DEFAULT_UPDATE_S.get(cid, FORWARD_UPDATE_S))
+
+
+def camera_update_s(
+    spec: dict[str, Any] | None,
+    *,
+    cid: str | None = None,
+    defaults: dict[str, Any] | None = None,
+) -> float:
+    """Per-cam BeamNGpy requested_update_time. Spec yaml wins; else role default.
+
+    File-level tech.yaml cameras.update_s is not applied: it would clobber
+    sides/rear 0.13 with the forward 0.067 suggestion.
+    """
+    spec = spec or {}
+    defaults = defaults or {}
+    cam_id = str(cid or spec.get("id") or "")
+    for src in (spec, defaults):
+        v = _as_float(src.get("requested_update_time"))
+        if v is None:
+            v = _as_float(src.get("update_s"))
+        if v is not None and v > 0:
+            return float(v)
+    return default_update_s(cam_id)
 
 
 def clamp_far_m(cid: str, far_m: float) -> float:
@@ -176,8 +222,9 @@ def camera_clip_planes(
     """Per-cam (near_m, far_m) for BeamNGpy Camera.near_far_planes.
 
     Precedence: spec.near_far_planes > spec.near_m/far_m > defaults.near_m + role far.
-    Role far: narrow 1500, main 800, wide/pillar/repeat/rear 200. Clamped to the
-    role band so a missing or 100 m value cannot silently keep BeamNGpy's default.
+    Role far: narrow 800, main 300, wide 300, pillar/repeat/rear 150. Clamped to the
+    role band so a missing or 100 m value cannot silently keep BeamNGpy's default,
+    and main cannot sit at 800 next to narrow.
     """
     spec = spec or {}
     defaults = defaults or {}
@@ -187,7 +234,7 @@ def camera_clip_planes(
     dn = _as_float(defaults.get("near_m"))
     if dn is not None:
         near = dn
-    # File-level far_m is not applied: Spec locks per-id far_m (narrow 1500 ≠ main 800).
+    # File-level far_m is not applied: Spec locks per-id far_m (narrow 800 > main 300).
     sn = _as_float(spec.get("near_m"))
     if sn is not None:
         near = sn
@@ -205,17 +252,24 @@ def camera_clip_planes(
 
 
 def far_hitch_ladder(cid: str, far_m: float) -> tuple[float, ...]:
-    """Requested far, then lower rungs. Narrow: 1500→800→600→400. Main: 800→600→400. Side: 200→150."""
+    """Requested far, then lower rungs still inside the role band.
+
+    Locked tip is a single rung: narrow 800, main/wide 300, sides/rear 150.
+    Values are clamped first so a 100 m or both-800 input cannot stay on the ladder.
+    """
+    far_m = clamp_far_m(cid, float(far_m))
     if cid == "narrow":
         rungs = NARROW_FAR_HITCH
     elif cid == "main":
         rungs = MAIN_FAR_HITCH
+    elif cid == "wide":
+        rungs = WIDE_FAR_HITCH
     else:
         rungs = SIDE_FAR_HITCH
     lo, _hi = far_band(cid)
     out: list[float] = []
     seen: set[float] = set()
-    for f in (float(far_m),) + tuple(float(x) for x in rungs):
+    for f in (far_m,) + tuple(float(x) for x in rungs):
         if f > far_m + 1e-9 or f < lo - 1e-9:
             continue
         key = round(f, 3)
@@ -223,27 +277,30 @@ def far_hitch_ladder(cid: str, far_m: float) -> tuple[float, ...]:
             continue
         seen.add(key)
         out.append(float(f))
-    return tuple(out) or (float(far_m),)
+    return tuple(out) or (far_m,)
 
 
 def iter_clip_attach_attempts(
     spec: dict[str, Any] | None,
     *,
     cid: str | None = None,
-    update_s: float = 0.067,
+    update_s: float | None = None,
     defaults: dict[str, Any] | None = None,
 ) -> list[tuple[float, float, float]]:
-    """(near_m, far_m, update_s) tries. Drop far, then side-cam rate. Never resolution."""
+    """(near_m, far_m, update_s) tries. Per-id rate from yaml; never drop resolution.
+
+    `update_s` is ignored when the spec already has requested_update_time / update_s,
+    and is ignored for sides/rear so a global 0.067 cannot clobber half-rate 0.13.
+    """
     spec = spec or {}
     cam_id = str(cid or spec.get("id") or "")
     near_m, far_m = camera_clip_planes(spec, cid=cam_id, defaults=defaults)
-    rate = float(update_s)
-    tries: list[tuple[float, float, float]] = [(near_m, f, rate) for f in far_hitch_ladder(cam_id, far_m)]
-    if cam_id not in LONG_RANGE_CAM_IDS:
-        hitch_rate = max(rate, SIDE_CAM_HITCH_UPDATE_S)
-        if hitch_rate > rate + 1e-9:
-            tries.append((near_m, far_m, hitch_rate))
-    return tries
+    rate = camera_update_s(spec, cid=cam_id)
+    if update_s is not None and cam_id in FORWARD_CAM_IDS:
+        has_own = _as_float(spec.get("requested_update_time")) is not None or _as_float(spec.get("update_s")) is not None
+        if not has_own:
+            rate = float(update_s)
+    return [(near_m, f, rate) for f in far_hitch_ladder(cam_id, far_m)]
 
 
 def beamng_camera_sensor_kwargs(
@@ -278,6 +335,25 @@ def beamng_camera_sensor_kwargs(
         "is_snapping_desired": False,
         "is_visualised": False,
     }
+
+
+def poll_camera_colour(cam: Any) -> Any:
+    """One colour frame from a BeamNGpy Camera, or None."""
+    images = None
+    if hasattr(cam, "stream") and getattr(cam, "is_streaming", False):
+        try:
+            images = cam.stream()
+        except Exception:
+            images = cam.poll() if hasattr(cam, "poll") else None
+    elif hasattr(cam, "poll"):
+        images = cam.poll()
+    if not isinstance(images, dict):
+        return None
+    if "colour" in images and images["colour"] is not None:
+        return images["colour"]
+    if "color" in images and images["color"] is not None:
+        return images["color"]
+    return None
 
 
 @runtime_checkable
@@ -589,8 +665,17 @@ class BeamNGPyBackend:
         self.session = TechSession(tech_config if tech_config is not None else load_tech_config())
         self._sensors: dict[str, Any] = {}
         self._clip_planes: dict[str, tuple[float, float]] = {}
+        self._update_s: dict[str, float] = {}
         self._logged = False
         self._ok = False
+        self._grab_i = 0
+        self._cache_frames: dict[str, np.ndarray] = {}
+        self._cache_ts: dict[str, float] = {}
+        hitch = self.config.get("hitch") if isinstance(self.config.get("hitch"), dict) else {}
+        div = hitch.get("side_grab_div")
+        self._side_grab_div = int(div) if div is not None else SIDE_GRAB_DIV
+        if self._side_grab_div < 1:
+            self._side_grab_div = SIDE_GRAB_DIV
 
     def open(self) -> None:
         try:
@@ -626,12 +711,12 @@ class BeamNGPyBackend:
         cams = list(self.config.get("cameras") or [])
         origin = self.config.get("origin_offset") or [0.0, 0.0, 0.0]
         attached = 0
-        update_s = float(cam_cfg.get("update_s") or 0.067)
         shmem = bool(cam_cfg.get("shared_memory", True))
         streaming = bool(cam_cfg.get("streaming", True))
         rgb_only = bool(cam_cfg.get("rgb_only", True))
         clip_defaults = {"near_m": self.config.get("near_m", DEFAULT_NEAR_M)}
         self._clip_planes = {}
+        self._update_s = {}
         for spec in cams:
             cid = str(spec.get("id") or "")
             if not cid or cid not in CAM_IDS:
@@ -650,11 +735,12 @@ class BeamNGPyBackend:
                     rw, rh = max(1, int(rw * scale)), max(1, int(rh * scale))
                 fov_v = float(spec.get("fov_v") or 70.0)
                 want_near, want_far = camera_clip_planes(spec, cid=cid, defaults=clip_defaults)
+                want_rate = camera_update_s(spec, cid=cid)
                 last_err: Exception | None = None
                 cam = None
-                used_near, used_far, used_rate = want_near, want_far, update_s
+                used_near, used_far, used_rate = want_near, want_far, want_rate
                 for try_near, try_far, try_rate in iter_clip_attach_attempts(
-                    spec, cid=cid, update_s=update_s, defaults=clip_defaults
+                    spec, cid=cid, defaults=clip_defaults
                 ):
                     kwargs = beamng_camera_sensor_kwargs(
                         pos=pos_bng,
@@ -688,13 +774,14 @@ class BeamNGPyBackend:
                 if cam is None:
                     print(f"[GVD] beamngpy Camera attach failed for {cid}: {last_err}")
                     continue
-                if used_far + 1e-9 < want_far or used_rate > update_s + 1e-9:
+                if abs(used_far - want_far) > 1e-9 or abs(used_rate - want_rate) > 1e-9:
                     print(
                         f"[GVD] beamngpy Camera hitch {cid}: far_m {want_far:g}->{used_far:g} "
-                        f"update_s {update_s:g}->{used_rate:g} (not resolution)"
+                        f"update_s {want_rate:g}->{used_rate:g} (not resolution)"
                     )
                 self._sensors[cid] = cam
                 self._clip_planes[cid] = (used_near, used_far)
+                self._update_s[cid] = float(used_rate)
                 attached += 1
             except Exception as e:
                 print(f"[GVD] beamngpy Camera attach failed for {cid}: {e}")
@@ -703,9 +790,11 @@ class BeamNGPyBackend:
         if not self._logged:
             if self._ok:
                 clips = " ".join(f"{k}={v[1]:g}" for k, v in self._clip_planes.items())
+                rates = " ".join(f"{k}={v:g}" for k, v in self._update_s.items())
                 print(
                     f"[GVD] beamngpy attached {attached} color Camera(s) from cameras.yaml "
-                    f"(near_far_planes far_m {clips}; GVD→BeamNG vehicle-space convert; depth/semantic OFF)."
+                    f"(near_far_planes far_m {clips}; requested_update_time {rates}; "
+                    f"GVD→BeamNG vehicle-space convert; depth/semantic OFF)."
                 )
             else:
                 print("[GVD] beamngpy: zero Cameras attached; cam_health=missing.")
@@ -735,8 +824,38 @@ class BeamNGPyBackend:
                     pass
         self._sensors.clear()
         self._clip_planes.clear()
+        self._update_s.clear()
+        self._cache_frames.clear()
+        self._cache_ts.clear()
+        self._grab_i = 0
         self.session.close()
         self._ok = False
+
+    def _poll_side_this_grab(self, cid: str, grab_i: int) -> bool:
+        if cid not in SIDE_CAM_IDS:
+            return True
+        div = max(1, int(self._side_grab_div))
+        return (int(grab_i) % div) == 0
+
+    def _store_frame(self, cid: str, bgr: np.ndarray, ts: float, frames: dict, timestamps: dict, health: dict) -> None:
+        frames[cid] = bgr
+        timestamps[cid] = ts
+        health[cid] = CamHealth.OK
+        self._cache_frames[cid] = bgr
+        self._cache_ts[cid] = ts
+        if cid == "main":
+            frames["cam_main"] = bgr
+
+    def _reuse_cached(self, cid: str, frames: dict, timestamps: dict, health: dict) -> None:
+        bgr = self._cache_frames.get(cid)
+        if bgr is None:
+            health[cid] = CamHealth.STALE
+            return
+        frames[cid] = bgr
+        timestamps[cid] = self._cache_ts.get(cid, time.time())
+        health[cid] = CamHealth.OK
+        if cid == "main":
+            frames["cam_main"] = bgr
 
     def grab(self) -> CameraFrameBundle:
         health = {cid: CamHealth.MISSING for cid in CAM_IDS}
@@ -751,44 +870,37 @@ class BeamNGPyBackend:
         frames: dict[str, np.ndarray] = {}
         timestamps: dict[str, float] = {}
         ts = time.time()
+        grab_i = self._grab_i
+        self._grab_i = grab_i + 1
         for cid, cam in self._sensors.items():
+            if not self._poll_side_this_grab(cid, grab_i):
+                self._reuse_cached(cid, frames, timestamps, health)
+                continue
             try:
-                images = None
-                if hasattr(cam, "stream") and getattr(cam, "is_streaming", False):
-                    try:
-                        images = cam.stream()
-                    except Exception:
-                        images = cam.poll() if hasattr(cam, "poll") else None
-                elif hasattr(cam, "poll"):
-                    images = cam.poll()
-                colour = None
-                if isinstance(images, dict):
-                    colour = images.get("colour") or images.get("color")
+                colour = poll_camera_colour(cam)
                 if colour is None:
-                    health[cid] = CamHealth.STALE
+                    if cid in self._cache_frames:
+                        self._reuse_cached(cid, frames, timestamps, health)
+                    else:
+                        health[cid] = CamHealth.STALE
                     continue
-                # PIL Image → BGR
                 arr = np.asarray(colour)
                 if arr.ndim == 3 and arr.shape[2] >= 3:
-                    # RGB(A) → BGR
                     bgr = arr[:, :, :3][:, :, ::-1].copy()
                 else:
                     health[cid] = CamHealth.ERROR
                     continue
                 bgr = resize_long_side(bgr, self.long_side)
-                frames[cid] = bgr
-                timestamps[cid] = ts
-                health[cid] = CamHealth.OK
-                if cid == "main":
-                    frames["cam_main"] = bgr
+                self._store_frame(cid, bgr, ts, frames, timestamps, health)
             except Exception:
                 health[cid] = CamHealth.ERROR
+        n_ok = sum(1 for c in CAM_IDS if health.get(c) == CamHealth.OK)
         return CameraFrameBundle(
             frames=frames,
             timestamps=timestamps,
             health=health,
             backend=self.name,
-            note=f"beamngpy: {len(frames)} colour frame(s)",
+            note=f"beamngpy: {n_ok} colour frame(s) grab={grab_i} side_div={self._side_grab_div}",
         )
 
 

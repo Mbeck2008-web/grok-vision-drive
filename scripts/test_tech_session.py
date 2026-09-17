@@ -13,8 +13,11 @@ from python.sensors.cameras import (  # noqa: E402
     CAM_IDS,
     DEFAULT_FAR_M,
     DEFAULT_NEAR_M,
+    DEFAULT_UPDATE_S,
+    SIDE_CAM_IDS,
     beamng_camera_sensor_kwargs,
     camera_clip_planes,
+    camera_update_s,
     far_hitch_ladder,
     iter_clip_attach_attempts,
     load_camera_config,
@@ -94,10 +97,19 @@ def check_tech_yaml() -> None:
     assert ids == list(CAM_IDS), ids
     assert abs(float(rig.get("near_m") or 0) - DEFAULT_NEAR_M) < 1e-9
     by_id = {c["id"]: c for c in (rig.get("cameras") or [])}
-    assert float(by_id["narrow"]["far_m"]) == 1500
-    assert float(by_id["main"]["far_m"]) == 800
-    for cid in ("wide", "pillarL", "pillarR", "repeatL", "repeatR", "rear"):
-        assert float(by_id[cid]["far_m"]) == 200, cid
+    assert float(by_id["narrow"]["far_m"]) == 800
+    assert float(by_id["main"]["far_m"]) == 300
+    assert float(by_id["narrow"]["far_m"]) > float(by_id["main"]["far_m"])
+    assert float(by_id["main"]["far_m"]) != 800
+    assert float(by_id["wide"]["far_m"]) == 300
+    for cid in ("pillarL", "pillarR", "repeatL", "repeatR", "rear"):
+        assert float(by_id[cid]["far_m"]) == 150, cid
+        assert abs(float(by_id[cid]["requested_update_time"]) - 0.13) < 1e-9, cid
+    for cid in ("narrow", "main", "wide"):
+        assert abs(float(by_id[cid]["requested_update_time"]) - 0.067) < 1e-9, cid
+    for spec in rig.get("cameras") or []:
+        res = list(spec.get("live_res") or [])
+        assert res and max(int(res[0]), int(res[1])) == 640, spec.get("id")
 
 
 def check_env_overrides(monkey: dict[str, str]) -> None:
@@ -303,56 +315,82 @@ def check_poll_mock() -> None:
 
 
 def check_camera_clip_planes() -> None:
-    """Per-id far_m from cameras.yaml is wired as near_far_planes=(0.05, far_m)."""
+    """Per-id far_m + requested_update_time wired as near_far_planes and update time."""
     cfg = load_camera_config()
     defaults = {"near_m": cfg.get("near_m", DEFAULT_NEAR_M)}
-    want = {
-        "narrow": 1500.0,
-        "main": 800.0,
-        "wide": 200.0,
-        "pillarL": 200.0,
-        "pillarR": 200.0,
-        "repeatL": 200.0,
-        "repeatR": 200.0,
-        "rear": 200.0,
+    want_far = {
+        "narrow": 800.0,
+        "main": 300.0,
+        "wide": 300.0,
+        "pillarL": 150.0,
+        "pillarR": 150.0,
+        "repeatL": 150.0,
+        "repeatR": 150.0,
+        "rear": 150.0,
     }
-    assert DEFAULT_FAR_M == want
+    want_rate = {
+        "narrow": 0.067,
+        "main": 0.067,
+        "wide": 0.067,
+        "pillarL": 0.13,
+        "pillarR": 0.13,
+        "repeatL": 0.13,
+        "repeatR": 0.13,
+        "rear": 0.13,
+    }
+    assert DEFAULT_FAR_M == want_far
+    assert DEFAULT_UPDATE_S == want_rate
+    assert want_far["narrow"] > want_far["main"]
+    assert want_far["main"] != 800.0
+    assert want_far["narrow"] != want_far["main"]
     for spec in cfg.get("cameras") or []:
         cid = spec["id"]
         near, far = camera_clip_planes(spec, defaults=defaults)
         assert abs(near - 0.05) < 1e-9, cid
-        assert far == want[cid], (cid, far)
-        # independent: changing one cam does not move another
+        assert far == want_far[cid], (cid, far)
+        assert abs(camera_update_s(spec, cid=cid) - want_rate[cid]) < 1e-9, cid
         other = "rear" if cid == "narrow" else "narrow"
-        assert camera_clip_planes({"id": other}, defaults=defaults)[1] == want[other]
+        assert camera_clip_planes({"id": other}, defaults=defaults)[1] == want_far[other]
 
-    # missing yaml keys still use locked per-id defaults (never silent 100 m)
-    assert camera_clip_planes({"id": "narrow"}) == (0.05, 1500.0)
-    assert camera_clip_planes({"id": "main"}) == (0.05, 800.0)
-    assert camera_clip_planes({"id": "wide"}) == (0.05, 200.0)
-    # 100 m (BeamNGpy default) is clamped up out of the silent-clip zone
-    assert camera_clip_planes({"id": "main", "far_m": 100})[1] == 400.0
-    assert camera_clip_planes({"id": "narrow", "far_m": 100})[1] == 400.0
+    # missing yaml keys still use locked per-id defaults (never silent 100 m, never both-800)
+    assert camera_clip_planes({"id": "narrow"}) == (0.05, 800.0)
+    assert camera_clip_planes({"id": "main"}) == (0.05, 300.0)
+    assert camera_clip_planes({"id": "wide"}) == (0.05, 300.0)
+    assert camera_clip_planes({"id": "rear"}) == (0.05, 150.0)
+    assert abs(camera_update_s({"id": "narrow"}) - 0.067) < 1e-9
+    assert abs(camera_update_s({"id": "main"}) - 0.067) < 1e-9
+    assert abs(camera_update_s({"id": "wide"}) - 0.067) < 1e-9
+    assert abs(camera_update_s({"id": "pillarL"}) - 0.13) < 1e-9
+    # 100 m (BeamNGpy default) is clamped to the role far — not kept
+    assert camera_clip_planes({"id": "narrow", "far_m": 100})[1] == 800.0
+    assert camera_clip_planes({"id": "main", "far_m": 100})[1] == 300.0
+    assert camera_clip_planes({"id": "wide", "far_m": 100})[1] == 300.0
     assert camera_clip_planes({"id": "rear", "far_m": 100})[1] == 150.0
-    # near_far_planes pair overrides far_m
-    assert camera_clip_planes({"id": "main", "far_m": 800, "near_far_planes": [0.05, 600]}) == (0.05, 600.0)
-    # narrow stays farther than main and is not clamped to 1000
-    assert camera_clip_planes({"id": "narrow", "far_m": 1500})[1] == 1500.0
-    assert camera_clip_planes({"id": "narrow", "far_m": 2000})[1] == 1500.0
+    # both-800 rejected: main 800 clamps to 300; narrow stays 800
+    assert camera_clip_planes({"id": "main", "far_m": 800})[1] == 300.0
+    assert camera_clip_planes({"id": "narrow", "far_m": 800})[1] == 800.0
+    # near_far_planes pair still clamped to the role band
+    assert camera_clip_planes({"id": "main", "far_m": 300, "near_far_planes": [0.05, 600]}) == (0.05, 300.0)
+    assert camera_clip_planes({"id": "narrow", "far_m": 2000})[1] == 800.0
 
-    assert far_hitch_ladder("narrow", 1500.0) == (1500.0, 800.0, 600.0, 400.0)
-    assert far_hitch_ladder("main", 800.0) == (800.0, 600.0, 400.0)
-    assert far_hitch_ladder("main", 600.0) == (600.0, 400.0)
-    assert far_hitch_ladder("rear", 200.0) == (200.0, 150.0)
+    assert far_hitch_ladder("narrow", 800.0) == (800.0,)
+    assert far_hitch_ladder("main", 300.0) == (300.0,)
+    assert far_hitch_ladder("wide", 300.0) == (300.0,)
+    assert far_hitch_ladder("rear", 150.0) == (150.0,)
+    assert far_hitch_ladder("main", 800.0) == (300.0,)
+    assert far_hitch_ladder("narrow", 100.0) == (800.0,)
 
-    narrow_tries = iter_clip_attach_attempts({"id": "narrow", "far_m": 1500}, update_s=0.067)
-    assert [t[1] for t in narrow_tries] == [1500.0, 800.0, 600.0, 400.0]
-    assert all(abs(t[0] - 0.05) < 1e-9 and t[2] == 0.067 for t in narrow_tries)
-
-    side = iter_clip_attach_attempts({"id": "pillarL", "far_m": 200}, update_s=0.067)
-    assert side[0] == (0.05, 200.0, 0.067)
-    assert (0.05, 150.0, 0.067) in side
-    assert any(abs(t[2] - 0.10) < 1e-9 and t[1] == 200.0 for t in side)
+    narrow_tries = iter_clip_attach_attempts({"id": "narrow", "far_m": 800, "requested_update_time": 0.067})
+    assert narrow_tries == [(0.05, 800.0, 0.067)]
+    main_tries = iter_clip_attach_attempts({"id": "main", "far_m": 300, "requested_update_time": 0.067})
+    assert main_tries == [(0.05, 300.0, 0.067)]
+    wide_tries = iter_clip_attach_attempts({"id": "wide", "far_m": 300})
+    assert wide_tries == [(0.05, 300.0, 0.067)]
+    side = iter_clip_attach_attempts({"id": "pillarL", "far_m": 150, "requested_update_time": 0.13}, update_s=0.067)
+    assert side == [(0.05, 150.0, 0.13)]
+    # global 0.067 cannot clobber side half-rate
+    side_default = iter_clip_attach_attempts({"id": "rear"}, update_s=0.067)
+    assert side_default == [(0.05, 150.0, 0.13)]
 
     kw = beamng_camera_sensor_kwargs(
         pos=(0.0, -1.2, 1.26),
@@ -362,23 +400,26 @@ def check_camera_clip_planes() -> None:
         resolution=(640, 480),
         update_s=0.067,
         near_m=0.05,
-        far_m=1500.0,
+        far_m=800.0,
         shmem=True,
         streaming=True,
         rgb_only=True,
     )
-    assert kw["near_far_planes"] == (0.05, 1500.0)
+    assert kw["near_far_planes"] == (0.05, 800.0)
+    assert kw["requested_update_time"] == 0.067
     assert kw["is_render_depth"] is False
     assert kw["is_render_annotations"] is False
     assert kw["resolution"] == (640, 480)
+    assert "near_far_planes" in kw
 
     src = (ROOT / "python" / "sensors" / "cameras.py").read_text(encoding="utf-8")
     assert "near_far_planes" in src
     assert "beamng_camera_sensor_kwargs" in src
     assert "Camera(f\"gvd_{cid}\", bng, vehicle, **kwargs)" in src
+    assert "requested_update_time" in src
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "BeamNGpy #199" in readme or "BeamNGpy/issues/199" in readme
-    assert "narrow` 1500" in readme or "narrow 1500" in readme
+    assert "narrow > main" in readme
 
 
 def check_beamngpy_open_passes_near_far() -> None:
@@ -424,14 +465,105 @@ def check_beamngpy_open_passes_near_far() -> None:
         names = [n for n, _ in captured]
         assert names == [f"gvd_{c}" for c in CAM_IDS], names
         by = {n: kw for n, kw in captured}
-        assert by["gvd_narrow"]["near_far_planes"] == (0.05, 1500.0)
-        assert by["gvd_main"]["near_far_planes"] == (0.05, 800.0)
-        for cid in ("wide", "pillarL", "pillarR", "repeatL", "repeatR", "rear"):
-            assert by[f"gvd_{cid}"]["near_far_planes"] == (0.05, 200.0), cid
+        assert by["gvd_narrow"]["near_far_planes"] == (0.05, 800.0)
+        assert by["gvd_main"]["near_far_planes"] == (0.05, 300.0)
+        assert by["gvd_wide"]["near_far_planes"] == (0.05, 300.0)
+        assert by["gvd_narrow"]["requested_update_time"] == 0.067
+        assert by["gvd_main"]["requested_update_time"] == 0.067
+        assert by["gvd_wide"]["requested_update_time"] == 0.067
+        for cid in SIDE_CAM_IDS:
+            assert by[f"gvd_{cid}"]["near_far_planes"] == (0.05, 150.0), cid
+            assert abs(by[f"gvd_{cid}"]["requested_update_time"] - 0.13) < 1e-9, cid
             assert by[f"gvd_{cid}"]["is_render_depth"] is False
+            assert by[f"gvd_{cid}"]["resolution"][0] >= 1
         assert by["gvd_narrow"]["is_render_depth"] is False
-        assert be._clip_planes["narrow"] == (0.05, 1500.0)
+        assert by["gvd_narrow"]["resolution"] == (640, 480)
+        assert be._clip_planes["narrow"] == (0.05, 800.0)
+        assert be._clip_planes["main"] == (0.05, 300.0)
+        assert abs(be._update_s["rear"] - 0.13) < 1e-9
+        # never silent 100 m, never both-800
+        for name, kw in captured:
+            assert "near_far_planes" in kw, name
+            far = kw["near_far_planes"][1]
+            assert far != 100.0, name
+            if name in ("gvd_narrow", "gvd_main"):
+                assert far != 100.0, name
+        assert by["gvd_narrow"]["near_far_planes"][1] != by["gvd_main"]["near_far_planes"][1]
+        assert by["gvd_main"]["near_far_planes"][1] != 800.0
         assert be._ok
+    finally:
+        for k, v in old.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+
+def check_beamngpy_side_grab_half_rate() -> None:
+    """Sides/rear poll every 2nd grab; forward every grab. No resolution change."""
+    import sys
+    import types
+
+    import numpy as np
+
+    from python.sensors.cameras import BeamNGPyBackend, CamHealth, SIDE_CAM_IDS
+
+    polls: dict[str, int] = {}
+
+    class FakeCamera:
+        def __init__(self, name, _bng, _vehicle, **kwargs):
+            self.name = name
+            self.kwargs = kwargs
+            self.is_streaming = False
+            polls[name] = 0
+
+        def poll(self):
+            polls[self.name] += 1
+            return {"colour": np.zeros((8, 8, 3), dtype=np.uint8)}
+
+        def remove(self):
+            return None
+
+    sensors = types.ModuleType("beamngpy.sensors")
+    sensors.Camera = FakeCamera
+    beamngpy = types.ModuleType("beamngpy")
+    beamngpy.sensors = sensors
+    old = {k: sys.modules.get(k) for k in ("beamngpy", "beamngpy.sensors")}
+    sys.modules["beamngpy"] = beamngpy
+    sys.modules["beamngpy.sensors"] = sensors
+    try:
+        be = BeamNGPyBackend(
+            config=load_camera_config(),
+            tech_config={
+                "wait_vehicle_s": 0,
+                "cameras": {"attach": True, "rgb_only": True, "update_s": 0.067, "shared_memory": True, "streaming": True},
+            },
+        )
+
+        def _connect(explicit=True):
+            be.session.vehicle = object()
+            be.session.bng = object()
+            return True
+
+        be.session.connect = _connect  # type: ignore[method-assign]
+        be.session.attach_vehicle_sensors = lambda: {}  # type: ignore[method-assign]
+        be.open()
+        n = 4
+        last = None
+        for _ in range(n):
+            last = be.grab()
+        assert last is not None
+        assert last.health["main"] == CamHealth.OK
+        assert last.health["narrow"] == CamHealth.OK
+        for cid in SIDE_CAM_IDS:
+            assert last.health[cid] == CamHealth.OK, cid
+            assert f"gvd_{cid}" in last.frames or cid in last.frames
+        assert polls["gvd_narrow"] == n
+        assert polls["gvd_main"] == n
+        assert polls["gvd_wide"] == n
+        for cid in SIDE_CAM_IDS:
+            assert polls[f"gvd_{cid}"] == n // 2, (cid, polls[f"gvd_{cid}"])
+        assert be._clip_planes["narrow"][1] > be._clip_planes["main"][1]
     finally:
         for k, v in old.items():
             if v is None:
@@ -492,6 +624,7 @@ def main() -> None:
     check_poll_mock()
     check_camera_clip_planes()
     check_beamngpy_open_passes_near_far()
+    check_beamngpy_side_grab_half_rate()
     check_auto_backend_not_tech_without_env()
     check_connect_without_beamngpy()
     check_no_chrome()

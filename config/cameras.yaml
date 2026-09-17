@@ -4,14 +4,15 @@
 # at attach (config/tech.yaml cameras.convert_gvd_frame). Comments say "toy analogue of …",
 # never a vendor camera name. BeamNGpy uses FOV_v (field_of_view_y). live_res long side ≤ 640.
 #
-# BeamNGpy Camera defaults near_far_planes=(0.05, 100) m (BeamNGpy#199). GVD sets per-cam far_m
-# so Tech attach does not inherit that 100 m far clip. near is 0.05 on every cam.
-#   narrow: 1500 (farther than main; band 400–1500)
-#   main: 800 (band 400–1000)
-#   wide / pillarL / pillarR / repeatL / repeatR / rear: 200 (band 150–300)
-# Optional per-cam near_far_planes: [near_m, far_m] overrides near_m/far_m.
-# Hitch: drop far (narrow 1500→800→600→400; main 800→600→400) or side-cam rate first — not resolution.
-# Depth OFF.
+# BeamNGpy Camera defaults near_far_planes=(0.05, 100) m (BeamNGpy#199). GVD always passes
+# an explicit (near_m, far_m) + requested_update_time from this file. near is 0.05 on every cam.
+# Locked far_m / requested_update_time (narrow > main; never both-800):
+#   narrow: 800 @ 0.067 (~15 Hz)
+#   main:   300 @ 0.067
+#   wide:   300 @ 0.067 (same rate as forward)
+#   pillarL / pillarR / repeatL / repeatR / rear: 150 @ 0.13 (half-rate vs forward)
+# Optional per-cam near_far_planes: [near_m, far_m] still clamped to the role band.
+# Hitch: half-rate sides/rear — not resolution. Depth OFF.
 origin_offset: [0.0, 0.0, 0.0]
 near_m: 0.05
 cameras:
@@ -24,7 +25,8 @@ cameras:
     pitch_deg: -4
     fov_v: 21.4
     live_res: [640, 480]
-    far_m: 1500
+    far_m: 800
+    requested_update_time: 0.067
   - id: main
     role: primary_forward
     note: "toy analogue of the primary forward windshield cam; alias cam_main"
@@ -34,7 +36,8 @@ cameras:
     pitch_deg: -6
     fov_v: 34.0
     live_res: [640, 480]
-    far_m: 800
+    far_m: 300
+    requested_update_time: 0.067
     aliases: [cam_main]
   - id: wide
     role: urban_intersection
@@ -45,7 +48,8 @@ cameras:
     pitch_deg: -8
     fov_v: 88.7
     live_res: [640, 480]
-    far_m: 200
+    far_m: 300
+    requested_update_time: 0.067
   - id: pillarL
     role: forward_side_left
     note: "toy analogue of a left B-pillar forward-side cam"
@@ -55,7 +59,8 @@ cameras:
     pitch_deg: -6
     fov_v: 65.3
     live_res: [640, 480]
-    far_m: 200
+    far_m: 150
+    requested_update_time: 0.13
   - id: pillarR
     role: forward_side_right
     note: "toy analogue of a right B-pillar forward-side cam"
@@ -65,7 +70,8 @@ cameras:
     pitch_deg: -6
     fov_v: 65.3
     live_res: [640, 480]
-    far_m: 200
+    far_m: 150
+    requested_update_time: 0.13
   - id: repeatL
     role: rear_side_left
     note: "toy analogue of a left fender repeater"
@@ -75,7 +81,8 @@ cameras:
     pitch_deg: -8
     fov_v: 55.4
     live_res: [640, 480]
-    far_m: 200
+    far_m: 150
+    requested_update_time: 0.13
   - id: repeatR
     role: rear_side_right
     note: "toy analogue of a right fender repeater"
@@ -85,7 +92,8 @@ cameras:
     pitch_deg: -8
     fov_v: 55.4
     live_res: [640, 480]
-    far_m: 200
+    far_m: 150
+    requested_update_time: 0.13
   - id: rear
     role: rear_traffic
     note: "toy analogue of a rear license-plate cam"
@@ -95,4 +103,5 @@ cameras:
     pitch_deg: -10
     fov_v: 80.0
     live_res: [640, 360]
-    far_m: 200
+    far_m: 150
+    requested_update_time: 0.13

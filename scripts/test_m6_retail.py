@@ -570,7 +570,7 @@ def check_engage_path_contract() -> None:
 
 
 def check_gvd_docs_dir() -> None:
-    """Lua gvdDocsDir + Python FOLDERID_Documents; LINKED is gvd_state HB only."""
+    """Lua gvdDocsDir + Python local Documents/GVD (reject OneDrive FOLDERID)."""
     import test_gvd_docs_dir as docs_dir
 
     lua = (ROOT / "beamng_mod" / "lua" / "ge" / "extensions" / "gvd" / "main.lua").read_text(encoding="utf-8")

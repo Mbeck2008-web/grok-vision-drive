@@ -41,8 +41,7 @@ def main() -> None:
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "## Alpha 1.0.0" in readme
-    assert "This is **alpha** — it may break / not work." in readme
-    assert "It improves with fixes." in readme
+    assert "This is **alpha** — may break / not work; improves with fixes." in readme
     assert "**point** bumps" in readme
     assert "fixes / small UI" in readme
     assert "**main alpha** bump" in readme

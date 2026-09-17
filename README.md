@@ -6,7 +6,7 @@ Entertainment only. Never use this stack to control a physical car.
 
 ## Alpha 1.0.0
 
-This is **alpha** — it may break / not work. It improves with fixes.
+This is **alpha** — may break / not work; improves with fixes.
 
 Canonical pin **1.0.0** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Untagged retail zips use `1.0.0-alpha-<sha>`.
 
@@ -235,7 +235,7 @@ Keys in `--viz`: `V` nerd, `D` DRIVE (live actuators), `G` VIZ (occupancy / boxe
 
 ## Status
 
-**Alpha 1.0.0:** this is **alpha** — it may break / not work. It improves with fixes. **point** bumps = fixes / small UI. **main alpha** bump = features / core / UI overhaul. See [Alpha 1.0.0](#alpha-100).
+**Alpha 1.0.0:** this is **alpha** — may break / not work; improves with fixes. **point** bumps = fixes / small UI. **main alpha** bump = features / core / UI overhaul. See [Alpha 1.0.0](#alpha-100).
 
 **Force-feedback player override:** wheel chatter no longer disengages GVD. Signal is `|steering_input − aligned cmd.steer|` (never an absolute angle), then spike reject → EMA → hysteresis → dwell. Pedals are asymmetric and tight. Live FFB is **UNPROVEN**. Details under [Actuation](#actuation-m3).
 

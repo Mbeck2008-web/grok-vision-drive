@@ -1,8 +1,9 @@
--- Offline harness for gvdDocsDir / _stripToUserHome (no BeamNG).
+-- Offline harness for gvdDocsDir Tech sandbox (no BeamNG).
 -- Extracts the live helpers from main.lua and asserts:
---   USERPROFILE prefer → …/Documents/GVD
---   FS paths under /Documents/ strip to Users/Name, then Documents/GVD
---   never a bare gvd_*.json under BeamNG userfolder current\
+--   GVD_DOCS_DIR → override
+--   LOCALAPPDATA → …/BeamNG/BeamNG.tech/current/Documents/GVD
+--   FS AppData/Local or BeamNG.tech/current → same Tech sandbox
+--   never USERPROFILE/Documents/GVD, never a bare gvd_*.json under current\
 -- Run from repo root: lua5.1 scripts/test_gvd_docs_dir.lua
 
 local function check(cond, msg)
@@ -18,9 +19,13 @@ local i = src:find('local gvdDocsResolved', 1, true)
 local j = src:find('\nlocal function userEngagePath', i, true)
 check(i and j, 'main.lua exports gvdDocsDir helpers before userEngagePath')
 local body = src:sub(i, j - 1)
-check(body:find('_stripToUserHome', 1, true), 'extracted _stripToUserHome')
-check(body:find('/Documents/', 1, true), 'Documents-parent strip is in helpers')
-check(body:find('USERPROFILE', 1, true), 'USERPROFILE prefer is in helpers')
+check(body:find('_localAppFromPath', 1, true), 'extracted _localAppFromPath')
+check(body:find('_techCurrentFromPath', 1, true), 'extracted _techCurrentFromPath')
+check(body:find('GVD_DOCS_DIR', 1, true), 'GVD_DOCS_DIR override is in helpers')
+check(body:find('LOCALAPPDATA', 1, true), 'LOCALAPPDATA Tech sandbox is in helpers')
+check(body:find('BeamNG/BeamNG.tech/current/Documents/GVD', 1, true), 'Tech tail is in helpers')
+check(not body:find('USERPROFILE') or body:find('AppData/Local', 1, true),
+  'USERPROFILE only synthesizes AppData/Local, not Documents/GVD')
 
 local loadfn = loadstring or load
 local function loadHelpers(envVars, fs)
@@ -44,7 +49,7 @@ local function loadHelpers(envVars, fs)
     math = math,
     assert = assert,
   }
-  local chunk = body .. '\nreturn { strip = _stripToUserHome, docsDir = gvdDocsDir, file = gvdFile }\n'
+  local chunk = body .. '\nreturn { localApp = _localAppFromPath, techCurrent = _techCurrentFromPath, docsDir = gvdDocsDir, file = gvdFile }\n'
   local fn, err = loadfn(chunk)
   check(fn, 'helpers compile: ' .. tostring(err))
   if setfenv then setfenv(fn, sandbox) else
@@ -54,78 +59,78 @@ local function loadHelpers(envVars, fs)
   return fn()
 end
 
--- Python mirror of Lua patterns (kept in lockstep by executing the extracted function).
 local H = loadHelpers({}, nil)
+local SPEC = 'C:/Users/Name/AppData/Local/BeamNG/BeamNG.tech/current/Documents/GVD'
 
--- ── strip: AppData (existing) ────────────────────────────────────────────────
-check(H.strip('C:/Users/Name/AppData/Local/BeamNG.drive/0.36') == 'C:/Users/Name',
-  'AppData/Local strips to Users/Name')
-check(H.strip('C:\\Users\\Name\\AppData\\Roaming\\BeamNG.drive') == 'C:/Users/Name',
-  'AppData/Roaming backslashes strip to Users/Name')
-check(H.strip('C:/Users/Name/AppData/LocalLow/x') == 'C:/Users/Name',
-  'AppData (generic) strips to Users/Name')
+-- ── localApp / techCurrent ───────────────────────────────────────────────────
+check(H.localApp('C:/Users/Name/AppData/Local/BeamNG.drive/0.36') == 'C:/Users/Name/AppData/Local',
+  'AppData/Local prefix from Drive userfolder')
+check(H.localApp('C:\\Users\\Name\\AppData\\Local\\BeamNG\\BeamNG.tech\\current') == 'C:/Users/Name/AppData/Local',
+  'AppData/Local prefix with backslashes')
+check(H.localApp('C:/Users/Name/Documents/BeamNG.drive/current') == nil,
+  'Documents userfolder does not invent LOCALAPPDATA')
+check(H.localApp(nil) == nil, 'nil path → nil')
+check(H.localApp('') == nil, 'empty path → nil')
+check(H.techCurrent('C:/Users/Name/AppData/Local/BeamNG/BeamNG.tech/current')
+    == 'C:/Users/Name/AppData/Local/BeamNG/BeamNG.tech/current',
+  'nested BeamNG.tech/current is the Tech userfolder')
+check(H.techCurrent('C:/Users/Name/AppData/Local/BeamNG.tech/current') == nil,
+  'legacy BeamNG.tech (no BeamNG parent) is not the spec current')
+check(H.techCurrent('C:/Users/Name/OneDrive/AppData/Local/BeamNG/BeamNG.tech/current') == nil,
+  'OneDrive tech current is rejected')
+check(H.localApp('C:/Users/Name/OneDrive/AppData/Local/foo') == nil,
+  'OneDrive AppData/Local is rejected')
 
--- ── strip: Documents parent (the hotfix) ─────────────────────────────────────
-check(H.strip('C:/Users/Name/Documents/BeamNG.drive/0.36/current') == 'C:/Users/Name',
-  'Documents/BeamNG userfolder strips to Users/Name')
-check(H.strip('C:\\Users\\Name\\Documents\\BeamNG.drive\\0.36\\current\\') == 'C:/Users/Name',
-  'Documents userfolder with backslashes strips to Users/Name')
-check(H.strip('C:/Users/Name/Documents/GVD/gvd_state.json') == 'C:/Users/Name',
-  'path already under Documents/GVD strips to Users/Name')
-check(H.strip('C:/Users/Name/Documents') == 'C:/Users/Name',
-  'path ending at Documents strips to Users/Name')
-check(H.strip('C:/Users/Name/Documents/') == 'C:/Users/Name',
-  'Documents/ with trailing slash strips to Users/Name')
-check(H.strip('C:/Users/Name/OneDrive/Documents/BeamNG.drive/current') == 'C:/Users/Name/OneDrive',
-  'OneDrive Documents parent is OneDrive (not Users/Name/Documents/BeamNG...)')
-check(H.strip('/home/me/Documents/BeamNG.drive/current') == '/home/me',
-  'POSIX Documents parent strips to $HOME')
-check(H.strip('C:/Users/Name/Documents/BeamNG.drive/current/Documents/GVD') == 'C:/Users/Name',
-  'nested Documents under current still strips to the first parent (Users/Name)')
-check(H.strip(nil) == nil, 'nil path → nil')
-check(H.strip('') == nil, 'empty path → nil')
-check(H.strip('D:/BeamNG.drive/current') == nil,
-  'userfolder with no Documents/AppData does not invent a home')
-
--- ── resolve: USERPROFILE prefer → …/Documents/GVD ────────────────────────────
+-- ── resolve ──────────────────────────────────────────────────────────────────
 local function resolve(envVars, fs)
   return loadHelpers(envVars, fs).docsDir()
 end
 
-check(resolve({ USERPROFILE = 'C:\\Users\\Name', HOME = '/home/other' }, {
+check(resolve({ GVD_DOCS_DIR = 'D:\\custom\\GVD', LOCALAPPDATA = 'C:\\Users\\Name\\AppData\\Local' }, nil)
+    == 'D:/custom/GVD',
+  'GVD_DOCS_DIR wins over LOCALAPPDATA')
+
+check(resolve({ LOCALAPPDATA = 'C:\\Users\\Name\\AppData\\Local', USERPROFILE = 'C:\\Users\\Name' }, {
       getUserPath = function() return 'C:/Users/Name/Documents/BeamNG.drive/0.36/current' end,
       directoryCreate = function() end,
-    }) == 'C:/Users/Name/Documents/GVD',
-  'USERPROFILE wins over HOME and Documents FS path → …/Documents/GVD')
+    }) == SPEC,
+  'LOCALAPPDATA Tech sandbox wins over USERPROFILE and Documents FS path')
 
-check(resolve({ HOME = '/home/me' }, {
-      getUserPath = function() return '/home/me/Documents/BeamNG.drive/current' end,
-      directoryCreate = function() end,
-    }) == '/home/me/Documents/GVD',
-  'HOME when USERPROFILE empty → …/Documents/GVD')
+check(resolve({ USERPROFILE = 'C:\\Users\\Name' }, nil) == SPEC,
+  'USERPROFILE synthesizes AppData/Local Tech sandbox (not Documents/GVD)')
 
-check(resolve({ LOCALAPPDATA = 'C:\\Users\\Name\\AppData\\Local' }, nil) == 'C:/Users/Name/Documents/GVD',
-  'LOCALAPPDATA strip when USERPROFILE/HOME empty → …/Documents/GVD')
+check(resolve({ HOME = '/home/me' }, nil)
+    == '/home/me/AppData/Local/BeamNG/BeamNG.tech/current/Documents/GVD',
+  'HOME synthesizes AppData/Local Tech sandbox when LOCALAPPDATA empty')
+
+check(resolve({ LOCALAPPDATA = 'C:/Users/Name/OneDrive', USERPROFILE = 'C:/Users/Name' }, nil) == SPEC,
+  'OneDrive LOCALAPPDATA is rejected; USERPROFILE AppData/Local is used')
 
 check(resolve({}, {
-      getUserPath = function() return 'C:/Users/Name/Documents/BeamNG.drive/0.36/current' end,
+      getUserPath = function() return 'C:/Users/Name/AppData/Local/BeamNG/BeamNG.tech/current' end,
       directoryCreate = function() end,
-    }) == 'C:/Users/Name/Documents/GVD',
-  'FS Documents userfolder (empty env, live Tech NO LINK bug) → Users/Name/Documents/GVD')
+    }) == SPEC,
+  'FS Tech current userfolder → Tech Documents/GVD')
 
 check(resolve({}, {
       getUserPath = function() return 'C:/Users/Name/AppData/Local/BeamNG.drive/0.36' end,
       directoryCreate = function() end,
-    }) == 'C:/Users/Name/Documents/GVD',
-  'FS AppData userfolder → Users/Name/Documents/GVD')
+    }) == SPEC,
+  'FS Drive AppData userfolder reconstructs LOCALAPPDATA Tech sandbox')
 
 check(resolve({}, {
       virtual2Native = function(_, vp)
-        if vp == 'settings' then return 'C:/Users/Name/Documents/BeamNG.drive/0.36/settings' end
+        if vp == 'settings' then return 'C:/Users/Name/AppData/Local/BeamNG/BeamNG.tech/current/settings' end
       end,
       directoryCreate = function() end,
-    }) == 'C:/Users/Name/Documents/GVD',
-  'FS:virtual2Native Documents path → Users/Name/Documents/GVD')
+    }) == SPEC,
+  'FS:virtual2Native Tech settings path → Tech Documents/GVD')
+
+check(resolve({}, {
+      getUserPath = function() return 'C:/Users/Name/Documents/BeamNG.drive/0.36/current' end,
+      directoryCreate = function() end,
+    }) == 'Documents/GVD',
+  'FS Documents userfolder does NOT become USERPROFILE/Documents/GVD')
 
 -- last resort is Documents/GVD, never a bare filename, never userfolder current\
 local last = resolve({}, { directoryCreate = function() end })
@@ -134,23 +139,22 @@ check(last ~= 'current' and not last:match('gvd_.*%.json$'),
   'last resort is not a bare gvd_*.json')
 
 -- gvdFile never returns a bare filename
-local files = loadHelpers({ USERPROFILE = 'C:/Users/Name' }, { directoryCreate = function() end })
+local files = loadHelpers({ LOCALAPPDATA = 'C:/Users/Name/AppData/Local' }, { directoryCreate = function() end })
 for _, name in ipairs({'gvd_state.json', 'gvd_ego.json', 'gvd_engage.json', 'gvd_cmd.json'}) do
   local p = files.file(name)
-  check(p == 'C:/Users/Name/Documents/GVD/' .. name, 'gvdFile(' .. name .. ') under Documents/GVD')
+  check(p == SPEC .. '/' .. name, 'gvdFile(' .. name .. ') under Tech current/Documents/GVD')
   check(not p:match('^gvd_'), name .. ' is not a bare filename')
   check(not p:match('/current/' .. name .. '$'), name .. ' is not under userfolder current\\')
 end
 
 -- mkdir is attempted on the resolved docs dir
 local mkdirDir
-local made = loadHelpers({ USERPROFILE = 'C:/Users/Name' }, {
+local made = loadHelpers({ LOCALAPPDATA = 'C:/Users/Name/AppData/Local' }, {
   directoryCreate = function(_, dir) mkdirDir = dir end,
 })
 made.docsDir()
-check(mkdirDir == 'C:/Users/Name/Documents/GVD', 'mkdir of resolved Documents/GVD')
+check(mkdirDir == SPEC, 'mkdir of resolved Tech Documents/GVD')
 
--- one-shot log of resolved docs dir (source contract; log is called from gvdDocsDir)
 check(body:find("docs dir=", 1, true) and body:find('gvdDocsLogged', 1, true),
   'one-shot log of resolved docs dir')
 

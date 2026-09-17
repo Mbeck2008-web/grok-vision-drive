@@ -24,10 +24,22 @@ function jsonDecode(s)
   return t
 end
 
-local home = os.getenv('USERPROFILE') or os.getenv('HOME')
-assert(home and home ~= '', 'USERPROFILE/HOME required')
-os.execute('mkdir -p "' .. home .. '/Documents/GVD"')
-local docs = home:gsub('\\', '/') .. '/Documents/GVD'
+local function busDocs()
+  local ov = os.getenv('GVD_DOCS_DIR')
+  if ov then
+    ov = tostring(ov):match('^%s*(.-)%s*$') or ''
+    if ov ~= '' then return ov:gsub('\\', '/') end
+  end
+  local la = os.getenv('LOCALAPPDATA')
+  if la and la ~= '' and not tostring(la):lower():find('onedrive', 1, true) then
+    return la:gsub('\\', '/') .. '/BeamNG/BeamNG.tech/current/Documents/GVD'
+  end
+  local home = os.getenv('USERPROFILE') or os.getenv('HOME')
+  assert(home and home ~= '', 'LOCALAPPDATA or USERPROFILE/HOME required')
+  return home:gsub('\\', '/') .. '/AppData/Local/BeamNG/BeamNG.tech/current/Documents/GVD'
+end
+local docs = busDocs()
+os.execute('mkdir -p "' .. docs .. '"')
 local statePath = docs .. '/gvd_state.json'
 
 local function writeFile(p, s)

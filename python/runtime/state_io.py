@@ -1,4 +1,4 @@
-"""Read/write Documents/GVD/gvd_state.json for BeamNG path ribbon + HUD."""
+"""Read/write gvd_state.json for BeamNG path ribbon + HUD."""
 
 from __future__ import annotations
 
@@ -8,8 +8,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-# All Documents/GVD writers/readers go through paths.py (GVD_DOCS_DIR, then
-# %USERPROFILE%\Documents\GVD; OneDrive FOLDERID is never followed).
+# All GVD bus writers/readers go through paths.py (GVD_DOCS_DIR, then
+# %LOCALAPPDATA%\BeamNG\BeamNG.tech\current\Documents\GVD). Not USERPROFILE
+# Documents (Tech Lua cannot read it). Not OneDrive.
 from python.runtime.paths import gvd_docs_dir as gvd_docs_dir
 
 def state_path() -> Path:

@@ -85,63 +85,96 @@ end
 
 
 
--- Resolve Documents/GVD so Lua + Python share %USERPROFILE%/Documents/GVD (state/engage/cmd).
--- Prefer USERPROFILE, then HOME, then LOCALAPPDATA / FS paths stripped to the user profile.
--- GELua often has empty USERPROFILE; BeamNG's userfolder commonly lives under Documents
--- (or AppData). Strip those parents — never write bare gvd_*.json under userfolder current\.
+-- Resolve GVD bus dir so Lua + Python share the Tech GELua sandbox:
+--   %LOCALAPPDATA%/BeamNG/BeamNG.tech/current/Documents/GVD
+-- USERPROFILE\Documents is NOT readable by Tech Lua (live Apps NO LINK). Not OneDrive.
+-- GVD_DOCS_DIR override wins. Never a bare gvd_*.json under userfolder current\.
 -- CEF Apps LINKED is gvd_state heartbeat only (see linkState); gvd_ego.json is not required.
 local gvdDocsResolved = nil
 local gvdDocsLogged = false
+local TECH_GVD_TAIL = 'BeamNG/BeamNG.tech/current/Documents/GVD'
 
-local function _stripToUserHome(p)
+local function _slash(p)
+  return tostring(p):gsub('\\', '/')
+end
+
+local function _trim(s)
+  if not s then return '' end
+  return tostring(s):match('^%s*(.-)%s*$') or ''
+end
+
+local function _isOnedrive(p)
+  if not p or p == '' then return false end
+  return _slash(p):lower():find('onedrive', 1, true) ~= nil
+end
+
+local function _techGvdFromLocalApp(localApp)
+  if not localApp or localApp == '' then return nil end
+  local la = _slash(_trim(localApp))
+  if la == '' or _isOnedrive(la) then return nil end
+  return la .. '/' .. TECH_GVD_TAIL
+end
+
+local function _localAppFromPath(p)
   if not p or p == '' then return nil end
-  p = tostring(p):gsub('\\', '/')
-  -- C:/Users/Name/AppData/Local/... → C:/Users/Name
-  local home = p:match('^(.+)/AppData/Local') or p:match('^(.+)/AppData/Roaming') or p:match('^(.+)/AppData')
-  if home and home ~= '' then return home end
-  -- C:/Users/Name/Documents/... or .../Documents/BeamNG.drive/... → C:/Users/Name
-  -- Non-greedy so the first /Documents/ parent wins (Users/Name), not a nested copy under current\.
-  home = p:match('^(.-)/Documents/') or p:match('^(.-)/Documents$')
-  if home and home ~= '' then return home end
+  p = _slash(p)
+  local la = p:match('^(.+/AppData/Local)')
+  if la and la ~= '' and not _isOnedrive(la) then return la end
   return nil
 end
 
-local function _tryHomeEnv()
-  -- USERPROFILE first (matches Python os.path.expanduser("~") on Windows), then HOME.
+local function _techCurrentFromPath(p)
+  if not p or p == '' then return nil end
+  p = _slash(p)
+  local cur = p:match('^(.+/BeamNG/BeamNG.tech/current)')
+  if cur and cur ~= '' and not _isOnedrive(cur) then return cur end
+  return nil
+end
+
+local function _tryEnvDocs()
+  local ov = _trim(os.getenv('GVD_DOCS_DIR'))
+  if ov ~= '' then return _slash(ov) end
+  local fromLa = _techGvdFromLocalApp(os.getenv('LOCALAPPDATA'))
+  if fromLa then return fromLa end
+  -- LOCALAPPDATA is usually USERPROFILE/AppData/Local — never USERPROFILE/Documents.
   local home = os.getenv('USERPROFILE') or os.getenv('HOME')
-  if home and home ~= '' then return home end
-  local localApp = os.getenv('LOCALAPPDATA')
-  if localApp and localApp ~= '' then
-    local h = _stripToUserHome(localApp)
-    if h then return h end
+  if home and home ~= '' then
+    return _techGvdFromLocalApp(_slash(home) .. '/AppData/Local')
   end
   return nil
 end
 
-local function _tryFsHome()
-  if FS then
-    if FS.getUserPath then
-      local ok, up = pcall(function() return FS:getUserPath() end)
-      if ok and up and up ~= '' then
-        local h = _stripToUserHome(up)
-        if h then return h end
+local function _considerNative(native)
+  if not native or native == '' then return nil end
+  local cur = _techCurrentFromPath(native)
+  if cur then return cur .. '/Documents/GVD' end
+  local la = _localAppFromPath(native)
+  if la then return _techGvdFromLocalApp(la) end
+  return nil
+end
+
+local function _tryFsDocs()
+  if not FS then return nil end
+  if FS.getUserPath then
+    local ok, up = pcall(function() return FS:getUserPath() end)
+    if ok then
+      local d = _considerNative(up)
+      if d then return d end
+    end
+  end
+  for _, vp in ipairs({'settings', '/settings', 'settings/'}) do
+    if FS.virtual2Native then
+      local ok, native = pcall(function() return FS:virtual2Native(vp) end)
+      if ok then
+        local d = _considerNative(native)
+        if d then return d end
       end
     end
-    -- virtual2Native / getFileRealPath on a known user-folder VFS path
-    for _, vp in ipairs({'settings', '/settings', 'settings/'}) do
-      if FS.virtual2Native then
-        local ok, native = pcall(function() return FS:virtual2Native(vp) end)
-        if ok and native and native ~= '' then
-          local h = _stripToUserHome(native)
-          if h then return h end
-        end
-      end
-      if FS.getFileRealPath then
-        local ok, native = pcall(function() return FS:getFileRealPath(vp) end)
-        if ok and native and native ~= '' then
-          local h = _stripToUserHome(native)
-          if h then return h end
-        end
+    if FS.getFileRealPath then
+      local ok, native = pcall(function() return FS:getFileRealPath(vp) end)
+      if ok then
+        local d = _considerNative(native)
+        if d then return d end
       end
     end
   end
@@ -150,12 +183,8 @@ end
 
 local function gvdDocsDir()
   if gvdDocsResolved then return gvdDocsResolved end
-  local home = _tryHomeEnv() or _tryFsHome()
-  local dir
-  if home and home ~= '' then
-    dir = home:gsub('\\', '/') .. '/Documents/GVD'
-  else
-    -- Last resort: still under Documents/GVD relative to CWD (never bare filename in userfolder root)
+  local dir = _tryEnvDocs() or _tryFsDocs()
+  if not dir or dir == '' then
     dir = 'Documents/GVD'
   end
   -- Best-effort mkdir
@@ -232,7 +261,8 @@ end
 
 -- Absolute disk paths: io.open FIRST. VFS readFile / FS:readFile often fail
 -- (or return empty/junk) on C:/ and \\ paths, which left lastGood nil and Apps
--- NO LINK even when USERPROFILE\Documents\GVD\gvd_state.json was fresh on disk.
+-- NO LINK even when USERPROFILE\Documents\GVD\gvd_state.json was fresh on disk
+-- (Tech GELua sandbox cannot read that folder; bus is Tech current\Documents\GVD).
 local function _isAbsDiskPath(path)
   local p = tostring(path or '')
   -- spec: ^[A-Za-z]:/  or  \\UNC

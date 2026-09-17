@@ -17,7 +17,7 @@ if not defined PY where python >nul 2>&1 && set "PY=python"
 set "RUN="
 set "RUNROOT=%~dp0"
 if exist "%~dp0python\run_vision.py" set "RUN=%~dp0python\run_vision.py"
-if not defined GVD_DOCS_DIR set "GVD_DOCS_DIR=%USERPROFILE%\Documents\GVD"
+if not defined GVD_DOCS_DIR set "GVD_DOCS_DIR=%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\Documents\GVD"
 if not defined RUN if exist "%GVD_DOCS_DIR%\python\run_vision.py" (
   set "RUN=%GVD_DOCS_DIR%\python\run_vision.py"
   set "RUNROOT=%GVD_DOCS_DIR%"
@@ -60,6 +60,7 @@ if errorlevel 1 (
 :supervisor
 echo [GVD] Tech path: 8 RGB cameras + electrics/damage/pose + GPS nav hint (not localization, pin is not a route). LiDAR/radar optional in config\sensors.yaml — Foxglove / future fusion; planner stays vision-only.
 echo [GVD] Starting supervisor: %RUN%  (backend=beamngpy)
+echo [GVD] bus: %GVD_DOCS_DIR%
 echo [GVD] Match BeamNGpy to your Tech build (0.38 -^> 1.35.x, 0.39 -^> 1.36). Edit config\tech.yaml.
 start "GVD supervisor" /D "%RUNROOT%" cmd /k %PY% "%RUN%" --backend beamngpy --viz %*
 

@@ -85,10 +85,11 @@ if %ERRORLEVEL%==0 (
 )
 
 set "DOCS=%GVD_DOCS_DIR%"
-if not defined DOCS set "DOCS=%USERPROFILE%\Documents\GVD"
+if not defined DOCS set "DOCS=%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\Documents\GVD"
 if not exist "%DOCS%\" mkdir "%DOCS%"
 if exist "%~dp0python\" xcopy /E /I /Y "%~dp0python\*" "%DOCS%\python\" >nul
 if exist "%~dp0config\" xcopy /E /I /Y "%~dp0config\*" "%DOCS%\config\" >nul
+echo [GVD] bus dir: %DOCS%
 
 echo installed=%DEST% version=%BEST_VER% > "%LOG%"
 echo [GVD] Log: installed=%DEST% version=%BEST_VER%

@@ -11,9 +11,21 @@ local logs = {}
 function log(level, tag, msg) logs[#logs + 1] = tostring(msg) end
 function jsonDecode(_) return nil end
 
-local home = os.getenv('HOME') or os.getenv('USERPROFILE')
-assert(home and home ~= '', 'HOME/USERPROFILE required')
-os.execute('mkdir -p "' .. home .. '/Documents/GVD"')
+local function busDocs()
+  local ov = os.getenv('GVD_DOCS_DIR')
+  if ov then
+    ov = tostring(ov):match('^%s*(.-)%s*$') or ''
+    if ov ~= '' then return ov:gsub('\\', '/') end
+  end
+  local la = os.getenv('LOCALAPPDATA')
+  if la and la ~= '' and not tostring(la):lower():find('onedrive', 1, true) then
+    return la:gsub('\\', '/') .. '/BeamNG/BeamNG.tech/current/Documents/GVD'
+  end
+  local home = os.getenv('HOME') or os.getenv('USERPROFILE')
+  assert(home and home ~= '', 'HOME/USERPROFILE required')
+  return home:gsub('\\', '/') .. '/AppData/Local/BeamNG/BeamNG.tech/current/Documents/GVD'
+end
+os.execute('mkdir -p "' .. busDocs() .. '"')
 
 be = { getPlayerVehicle = function() return nil end }
 guihooks = nil

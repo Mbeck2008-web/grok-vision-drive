@@ -1,1 +1,4 @@
-# GVD python package root (stubs until M1+)
+# GVD python package root.
+__version__ = "1.0.0"
+__release__ = "alpha"
+

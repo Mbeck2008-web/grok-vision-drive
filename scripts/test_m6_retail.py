@@ -624,6 +624,11 @@ def check_no_chrome() -> None:
 def check_player_docs() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "**M6" in readme, "README Status must be M6"
+    assert "## Alpha 1.0.0" in readme
+    assert "This is **alpha** — may break / not work; improves with fixes." in readme
+    assert "**point** bumps" in readme and "fixes / small UI" in readme
+    assert "**main alpha** bump" in readme and "features / core / UI overhaul" in readme
+    assert "1.0.0-alpha-<sha>" in readme
     assert "## Player guide" in readme
     assert "make_release_zip" in readme
     assert "requirements-retail.txt" in readme

@@ -161,9 +161,8 @@ writeBus('gvd_state.json', string.format(
 M.pushUiState()
 check(uiPushes[#uiPushes].link == 'mismatch', 'Tech python_bus vs Drive lua_bus is link=MISMATCH')
 M.onUpdate(1.1)
+check(saw('[GVD][LUA]'), '1 Hz LUA bus line is printed')
+check(saw('bus='), 'LUA line prints bus=')
 check(saw('link=MISMATCH'), '1 Hz identity prints link=MISMATCH')
-check(saw('python_bus='), 'identity prints python_bus')
-check(saw('lua_bus='), 'identity prints lua_bus')
-check(saw('product='), 'identity prints product')
 
 print('test_gvd_state_link: OK')

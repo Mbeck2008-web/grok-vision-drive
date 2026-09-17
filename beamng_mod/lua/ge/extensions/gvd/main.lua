@@ -1843,21 +1843,21 @@ local function tickBusIdentity(dt)
   identAcc = identAcc + (dt or 0)
   if identAcc < 1.0 then return end
   identAcc = 0
-  local py = (lastGood and lastGood.python_bus) or '--'
-  local luaB = luaBusPath()
-  local product = gvdProduct() or (lastGood and lastGood.product) or 'unknown'
+  -- bus= is the physical folder VFS Documents/GVD maps to (getUserPath). Reads stay VFS-only.
+  local bus = luaBusPath()
+  local raw = readText(STATE_REL)
+  local exists = raw and raw ~= ''
   local mt = '--'
   if lastGood then
     mt = lastGood.heartbeat_mtime or lastGood.state_mtime or '--'
   end
-  local seq = lastGood and tonumber(lastGood.cmd_seq) or lastCmdSeq
-  local link = linkState()
   local line = string.format(
-    '[GVD] python_bus=%s lua_bus=%s product=%s state_mtime=%s engage=%s seq=%s',
-    tostring(py), luaB, tostring(product), tostring(mt),
-    engaged and 'true' or 'false', tostring(seq or -1))
-  if link == 'mismatch' then
-    line = line .. ' link=MISMATCH'
+    '[GVD][LUA] bus= %s  state= %s  mtime= %s  engaged= %s',
+    tostring(bus), exists and 'true' or 'false', tostring(mt),
+    engaged and 'true' or 'false')
+  local py = lastGood and lastGood.python_bus
+  if py and tostring(py) ~= '' and not busesSame(py, bus) then
+    line = line .. '  link=MISMATCH'
   end
   log('I', 'GVD', line)
   print(line)

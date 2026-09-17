@@ -362,7 +362,7 @@ def _draw_mismatch(img: np.ndarray, state: dict[str, Any]) -> None:
     cv2.rectangle(img, (0, 0), (STAGE_W, STAGE_H), VOID, -1)
     cv2.putText(img, "GVD", (12, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, ICE, 1, cv2.LINE_AA)
     cv2.putText(img, "VISION", (52, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1, cv2.LINE_AA)
-    cv2.putText(img, "MISMATCH", (80, 220), cv2.FONT_HERSHEY_SIMPLEX, 2.1, (80, 80, 210), 3, cv2.LINE_AA)
+    cv2.putText(img, "BUS MISMATCH", (80, 220), cv2.FONT_HERSHEY_SIMPLEX, 1.7, (80, 80, 210), 3, cv2.LINE_AA)
     cv2.putText(img, "refuse actuation  -  not a fake corridor", (80, 270), cv2.FONT_HERSHEY_SIMPLEX, 0.7, PAPER, 1, cv2.LINE_AA)
     cv2.putText(img, "product=" + prod, (80, 330), cv2.FONT_HERSHEY_SIMPLEX, 0.55, ICE, 1, cv2.LINE_AA)
     cv2.putText(img, "python_bus=" + py[:72], (80, 370), cv2.FONT_HERSHEY_SIMPLEX, 0.48, PAPER, 1, cv2.LINE_AA)

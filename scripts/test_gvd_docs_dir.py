@@ -218,9 +218,11 @@ def check_source_contracts(lua: str) -> None:
     assert "io.open" not in write_exec, "bus writes must not io.open (leftover current\\ gvd_*.json)"
     assert "FS:writeFile" in write_exec
     assert "tickBusIdentity" in lua
-    assert "python_bus=" in lua and "lua_bus=" in lua and "product=" in lua
-    assert "state_mtime=" in lua and "engage=" in lua and "seq=" in lua
+    assert "[GVD][LUA] bus=" in lua
     assert "link=MISMATCH" in lua
+    state_io_src = (ROOT / "python" / "runtime" / "state_io.py").read_text(encoding="utf-8")
+    assert "[GVD][PY]  bus=" in state_io_src
+    assert "print_py_bus" in state_io_src
 
     file_exec = re.sub(r"--[^\n]*", "", file_fn)
     assert "gvdDocsDir() .. '/' .. name" in file_exec
@@ -661,9 +663,28 @@ def check_writer_lua_folder_agreement() -> None:
             reader_state,
         )
         assert "BeamNG.drive/current/Documents/GVD" in writer_state.replace("\\", "/")
-        assert ident.matched and paths.buses_same_folder(py, lua_bus), (py, lua_bus)
+        assert ident.matched is True
         assert ident.product == "drive"
+        assert paths.buses_same_folder(ident.python_bus, ident.lua_bus), (py, lua_bus)
         assert ident.lua_bus_s.replace("\\", "/").endswith("/Documents/GVD") or ident.lua_bus_s.replace("\\", "/") == "Documents/GVD"
+
+    from python.runtime import state_io as state_io_mod
+    from python.runtime.state_io import default_state, write_state
+    import io
+    from contextlib import redirect_stdout
+    state_io_mod._last_py_bus_print = 0.0
+    with tempfile.TemporaryDirectory() as td:
+        la = Path(td) / "AppData" / "Local"
+        with _clear_product(LOCALAPPDATA=str(la), USERPROFILE=str(Path(td)), HOME=None):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                written = write_state(default_state(engaged=False))
+            out = buf.getvalue()
+            assert "[GVD][PY]  bus=" in out, out
+            assert str(written.parent) in out, out
+            assert written.parent.parts[-2:] == ("Documents", "GVD"), written.parent
+            assert "state= true" in out
+            assert "engaged= false" in out
 
     with _clear_product(
         LOCALAPPDATA="C:/Users/Name/AppData/Local",

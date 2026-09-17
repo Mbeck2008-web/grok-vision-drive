@@ -85,11 +85,22 @@ if %ERRORLEVEL%==0 (
 )
 
 set "DOCS=%GVD_DOCS_DIR%"
-if not defined DOCS set "DOCS=%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\Documents\GVD"
+if not defined DOCS set "DOCS=%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\Documents\GVD"
 if not exist "%DOCS%\" mkdir "%DOCS%"
 if exist "%~dp0python\" xcopy /E /I /Y "%~dp0python\*" "%DOCS%\python\" >nul
 if exist "%~dp0config\" xcopy /E /I /Y "%~dp0config\*" "%DOCS%\config\" >nul
-echo [GVD] bus dir: %DOCS%
+echo [GVD] bus dir (Drive/retail): %DOCS%
+
+rem Seed Tech bus too when that userfolder exists (separate sandbox; Drive cannot io.open it).
+set "TECH_DOCS=%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\Documents\GVD"
+if exist "%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\" (
+  if /I not "%DOCS%"=="%TECH_DOCS%" (
+    if not exist "%TECH_DOCS%\" mkdir "%TECH_DOCS%"
+    if exist "%~dp0python\" xcopy /E /I /Y "%~dp0python\*" "%TECH_DOCS%\python\" >nul
+    if exist "%~dp0config\" xcopy /E /I /Y "%~dp0config\*" "%TECH_DOCS%\config\" >nul
+    echo [GVD] also Tech bus: %TECH_DOCS%
+  )
+)
 
 echo installed=%DEST% version=%BEST_VER% > "%LOG%"
 echo [GVD] Log: installed=%DEST% version=%BEST_VER%

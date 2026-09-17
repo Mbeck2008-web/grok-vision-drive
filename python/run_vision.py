@@ -246,11 +246,15 @@ def main() -> None:
     if args.vision_only:
         os.environ["GVD_VISION_ONLY"] = "1"
 
+    # Product bus matches the running backend (Python default is Drive/retail).
+    if args.tech_probe or args.backend == "beamngpy":
+        os.environ["GVD_BEAMNG"] = "1"
+        os.environ["GVD_BACKEND"] = "beamngpy"
+    elif args.backend == "window":
+        os.environ["GVD_BACKEND"] = "window"
+
     if args.tech_probe:
         raise SystemExit(run_probe())
-
-    if args.backend == "beamngpy":
-        os.environ["GVD_BEAMNG"] = "1"
 
     if args.smoke:
         out = smoke(use_perception=True)

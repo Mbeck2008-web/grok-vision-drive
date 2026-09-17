@@ -572,7 +572,7 @@ def check_engage_path_contract() -> None:
 
 
 def check_gvd_docs_dir() -> None:
-    """Lua gvdDocsDir + Python Tech current\\Documents\\GVD sandbox."""
+    """Lua gvdDocsDir + Python Drive vs Tech current\\Documents\\GVD sandbox."""
     import test_gvd_docs_dir as docs_dir
 
     lua = (ROOT / "beamng_mod" / "lua" / "ge" / "extensions" / "gvd" / "main.lua").read_text(encoding="utf-8")

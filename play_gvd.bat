@@ -15,11 +15,12 @@ if not defined PY where python >nul 2>&1 && set "PY=python"
 set "RUN="
 set "RUNROOT=%~dp0"
 if exist "%~dp0python\run_vision.py" set "RUN=%~dp0python\run_vision.py"
-if not defined GVD_DOCS_DIR set "GVD_DOCS_DIR=%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\Documents\GVD"
+if not defined GVD_DOCS_DIR set "GVD_DOCS_DIR=%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\Documents\GVD"
 if not defined RUN if exist "%GVD_DOCS_DIR%\python\run_vision.py" (
   set "RUN=%GVD_DOCS_DIR%\python\run_vision.py"
   set "RUNROOT=%GVD_DOCS_DIR%"
 )
+echo [GVD] bus: %GVD_DOCS_DIR%
 set "REQS=%~dp0requirements-retail.txt"
 
 if not defined RUN (

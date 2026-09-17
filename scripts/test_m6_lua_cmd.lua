@@ -37,13 +37,36 @@ local function busDocs()
     ov = tostring(ov):match('^%s*(.-)%s*$') or ''
     if ov ~= '' then return ov:gsub('\\', '/') end
   end
-  local la = os.getenv('LOCALAPPDATA')
-  if la and la ~= '' and not tostring(la):lower():find('onedrive', 1, true) then
-    return la:gsub('\\', '/') .. '/BeamNG/BeamNG.tech/current/Documents/GVD'
+  local product = 'drive'
+  local gp = os.getenv('GVD_PRODUCT')
+  if gp and tostring(gp) ~= '' then
+    gp = tostring(gp):lower():match('^%s*(.-)%s*$') or ''
+    if gp == 'tech' or gp == 'beamng.tech' or gp == 'beamngtech' then product = 'tech' end
   end
+  local b = os.getenv('GVD_BEAMNG')
+  if b then
+    b = tostring(b):lower():match('^%s*(.-)%s*$') or ''
+    if b == '1' or b == 'true' or b == 'yes' then product = 'tech' end
+  end
+  local be = os.getenv('GVD_BACKEND')
+  if be then
+    be = tostring(be):lower():match('^%s*(.-)%s*$') or ''
+    if be == 'beamngpy' or be == 'tech' then product = 'tech' end
+  end
+  local function fromLa(localApp)
+    if not localApp or localApp == '' then return nil end
+    local la = tostring(localApp):gsub('\\', '/')
+    if la == '' or la:lower():find('onedrive', 1, true) then return nil end
+    if product == 'tech' then
+      return la .. '/BeamNG/BeamNG.tech/current/Documents/GVD'
+    end
+    return la .. '/BeamNG/BeamNG.drive/current/Documents/GVD'
+  end
+  local d = fromLa(os.getenv('LOCALAPPDATA'))
+  if d then return d end
   local home = os.getenv('HOME') or os.getenv('USERPROFILE')
   assert(home and home ~= '', 'HOME/USERPROFILE required')
-  return home:gsub('\\', '/') .. '/AppData/Local/BeamNG/BeamNG.tech/current/Documents/GVD'
+  return fromLa(home:gsub('\\', '/') .. '/AppData/Local')
 end
 local docs = busDocs()
 os.execute('mkdir -p "' .. docs .. '"')

@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
-"""Offline checks for Lua gvdDocsDir / Python Tech sandbox GVD (no BeamNG).
+"""Offline checks for Lua gvdDocsDir / Python dual-path GVD (no BeamNG).
 
-Lua gvdDocsDir + Python gvd_docs_dir (same resolve; #39 USERPROFILE Documents is the FAIL)
------------------------------------------------------------------------------------------
+Lua gvdDocsDir + Python gvd_docs_dir (same product sandbox; #39 USERPROFILE Documents is the FAIL)
+------------------------------------------------------------------------------------------------
 1. env ``GVD_DOCS_DIR`` if set (full GVD root)
-2. ``%LOCALAPPDATA%/BeamNG/BeamNG.tech/current/Documents/GVD``
-3. else ``{USERPROFILE|HOME}/AppData/Local/BeamNG/BeamNG.tech/current/Documents/GVD``
-   (synthesize LOCALAPPDATA — never USERPROFILE/Documents)
-4. else FS:getUserPath / virtual2Native / getFileRealPath:
-   - ``…/BeamNG/BeamNG.tech/current`` → that + ``/Documents/GVD``
-   - ``…/AppData/Local`` → LOCALAPPDATA + Tech tail
-5. else last resort ``Documents/GVD`` (never a bare ``gvd_*.json`` under
+2. Lua: FS:getUserPath / virtual2Native / getFileRealPath → running product
+   ``current\\Documents\\GVD`` (Tech vs Drive). Steam does not inherit env.
+3. else product sandbox under ``%LOCALAPPDATA%`` (or synthesized
+   ``{USERPROFILE|HOME}/AppData/Local`` — never USERPROFILE/Documents):
+     - ``GVD_PRODUCT=tech`` / ``GVD_BEAMNG=1`` / ``GVD_BACKEND=beamngpy`` → Tech
+     - else Drive / retail
+4. else last resort ``Documents/GVD`` (never a bare ``gvd_*.json`` under
    BeamNG userfolder ``current\\``).
 
-Not USERPROFILE\\Documents (Tech GELua cannot read it). Not OneDrive. No junctions.
+Not USERPROFILE\\Documents. Not OneDrive. No junctions.
+Drive FS must not reconstruct the Tech tail.
 
-Lua ``gvd_state`` LINKED (not path-only)
----------------------------------------
+Lua ``gvd_state`` lastGood / gvdUi (offline ≠ live Apps LINK)
+-----------------------------------------------------------
 ``readText`` uses absolute ``io.open`` **before** VFS ``FS:readFile``. ``pollStateFile``
 sets ``lastGood`` and logs read ok / read fail / json fail distinctly. ``pushUiState``
-and ``onExtensionLoaded`` poll + push ``gvdUi`` so CEF is not stuck on
-"supervisor not running" when the disk file is fresh.
+and ``onExtensionLoaded`` poll + push ``gvdUi``. Live CEF LINK stays UNPROVEN.
 
 Run: ``PYTHONPATH=. python scripts/test_gvd_docs_dir.py``
 Lua extract harness (when lua5.1/luajit is on PATH): ``lua5.1 scripts/test_gvd_docs_dir.lua``
@@ -42,7 +42,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 TECH_TAIL = "BeamNG/BeamNG.tech/current/Documents/GVD"
+DRIVE_TAIL = "BeamNG/BeamNG.drive/current/Documents/GVD"
 TECH_BAT = r"%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\Documents\GVD"
+DRIVE_BAT = r"%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\Documents\GVD"
+PRODUCT_ENV = ("GVD_DOCS_DIR", "GVD_PRODUCT", "GVD_BEAMNG", "GVD_BACKEND")
 
 
 def _fn(src: str, name: str) -> str:
@@ -56,8 +59,10 @@ def local_app_from_path(p: str | None) -> str | None:
     if not p:
         return None
     p = str(p).replace("\\", "/")
+    if "onedrive" in p.lower():
+        return None
     m = re.match(r"^(.+/AppData/Local)", p)
-    if m and m.group(1) and "onedrive" not in m.group(1).lower():
+    if m and m.group(1):
         return m.group(1)
     return None
 
@@ -67,35 +72,97 @@ def tech_current_from_path(p: str | None) -> str | None:
     if not p:
         return None
     p = str(p).replace("\\", "/")
+    if "onedrive" in p.lower():
+        return None
     m = re.match(r"^(.+/BeamNG/BeamNG.tech/current)", p)
-    if m and m.group(1) and "onedrive" not in m.group(1).lower():
+    if m and m.group(1):
         return m.group(1)
     return None
+
+
+def drive_current_from_path(p: str | None) -> str | None:
+    """Python mirror of Lua ``_driveCurrentFromPath``."""
+    if not p:
+        return None
+    p = str(p).replace("\\", "/")
+    if "onedrive" in p.lower():
+        return None
+    m = re.match(r"^(.+/BeamNG/BeamNG.drive/current)", p)
+    if m and m.group(1):
+        return m.group(1)
+    return None
+
+
+def product_from_path(p: str | None) -> str | None:
+    if not p:
+        return None
+    s = str(p).replace("\\", "/").lower()
+    if "onedrive" in s:
+        return None
+    if "beamng.tech" in s:
+        return "tech"
+    if "beamng.drive" in s:
+        return "drive"
+    return None
+
+
+def from_la(local_app: str | None, product: str) -> str | None:
+    if not local_app or not str(local_app).strip():
+        return None
+    la = str(local_app).replace("\\", "/").strip()
+    if not la or "onedrive" in la.lower():
+        return None
+    tail = TECH_TAIL if product == "tech" else DRIVE_TAIL
+    return la + "/" + tail
+
+
+def env_product(env: dict[str, str | None]) -> str:
+    raw = env.get("GVD_PRODUCT")
+    if raw and str(raw).strip():
+        p = str(raw).strip().lower().replace(" ", "")
+        if p in ("tech", "beamng.tech", "beamngtech"):
+            return "tech"
+        if p in ("drive", "retail", "beamng.drive", "beamngdrive"):
+            return "drive"
+    beamng = (env.get("GVD_BEAMNG") or "").strip().lower()
+    if beamng in ("1", "true", "yes"):
+        return "tech"
+    backend = (env.get("GVD_BACKEND") or "").strip().lower()
+    if backend in ("beamngpy", "tech"):
+        return "tech"
+    return "drive"
 
 
 def resolve_docs_dir(
     env: dict[str, str | None],
     fs_paths: list[str] | None = None,
 ) -> str:
-    """Python mirror of gvdDocsDir env + FS reconstruction."""
+    """Python mirror of gvdDocsDir: override → FS product → env product sandbox."""
     ov = env.get("GVD_DOCS_DIR")
     if ov and str(ov).strip():
         return str(ov).strip().replace("\\", "/")
-    la = env.get("LOCALAPPDATA")
-    if la and str(la).strip() and "onedrive" not in str(la).lower():
-        return str(la).replace("\\", "/") + "/" + TECH_TAIL
     home = env.get("USERPROFILE") or env.get("HOME")
-    if home and str(home).strip():
-        synth = str(home).replace("\\", "/") + "/AppData/Local"
-        if "onedrive" not in synth.lower():
-            return synth + "/" + TECH_TAIL
+    home_la = (str(home).replace("\\", "/") + "/AppData/Local") if home and str(home).strip() else None
     for p in fs_paths or []:
         cur = tech_current_from_path(p)
         if cur:
             return cur + "/Documents/GVD"
-        la2 = local_app_from_path(p)
-        if la2:
-            return la2 + "/" + TECH_TAIL
+        cur = drive_current_from_path(p)
+        if cur:
+            return cur + "/Documents/GVD"
+        product = product_from_path(p)
+        if not product:
+            continue
+        got = from_la(local_app_from_path(p), product)
+        if got:
+            return got
+        got = from_la(env.get("LOCALAPPDATA"), product) or from_la(home_la, product)
+        if got:
+            return got
+    product = env_product(env)
+    got = from_la(env.get("LOCALAPPDATA"), product) or from_la(home_la, product)
+    if got:
+        return got
     return "Documents/GVD"
 
 
@@ -110,27 +177,32 @@ def check_source_contracts(lua: str) -> None:
     assert "AppData/Local" in local_fn
     assert "BeamNG/BeamNG.tech/current" in tech_fn
     assert TECH_TAIL in lua
+    assert DRIVE_TAIL in lua
+    assert "_driveCurrentFromPath" in docs_fn
+    assert "beamng.drive" in docs_fn.lower()
 
     try_exec = re.sub(r"--[^\n]*", "", try_env)
     ov = try_exec.find("GVD_DOCS_DIR")
-    la = try_exec.find("LOCALAPPDATA")
-    assert 0 <= ov < la, "GVD_DOCS_DIR then LOCALAPPDATA"
-    assert "AppData/Local" in try_exec
+    assert ov >= 0, "GVD_DOCS_DIR override"
+    assert "LOCALAPPDATA" not in try_exec, "override must not append Tech tail from LOCALAPPDATA"
     assert not re.search(r"USERPROFILE.+/Documents/GVD", try_exec)
-    assert "/Documents/GVD" not in try_exec or "TECH_GVD_TAIL" in try_env or TECH_TAIL in lua
 
     docs_exec = re.sub(r"--[^\n]*", "", docs_fn)
-    assert "/Documents/GVD" in docs_exec or "TECH_GVD_TAIL" in lua
+    assert "/Documents/GVD" in docs_exec
     assert "directoryCreate" in docs_exec, "mkdir of resolved docs dir"
     assert "gvdDocsLogged" in docs_fn and "docs dir=" in docs_fn, "one-shot log"
     assert "dir = 'Documents/GVD'" in docs_exec, "last resort is Documents/GVD, never CWD or current\\"
     assert "_tryEnvDocs" in docs_exec and "_tryFsDocs" in docs_exec
+    assert "_tryEnvProductDocs" in docs_exec
+    assert "dir = _tryEnvDocs() or _tryFsDocs() or _tryEnvProductDocs()" in docs_exec, (
+        "override → FS product → env LOCALAPPDATA"
+    )
 
     file_exec = re.sub(r"--[^\n]*", "", file_fn)
     assert "gvdDocsDir() .. '/' .. name" in file_exec
     assert not re.search(r"return\s+name\b", file_exec)
 
-    # LINKED = gvd_state heartbeat (lastGood / hbAge). Not gvd_ego.json.
+    # lastGood / gvdUi = gvd_state heartbeat (hbAge). Not gvd_ego.json. Live LINK UNPROVEN.
     link_exec = re.sub(r"--[^\n]*", "", link_fn)
     assert "lastGood" in link_exec and "hbAgeS" in link_exec
     assert "gvd_ego" not in link_exec and "egoFb" not in link_exec, link_fn
@@ -170,17 +242,35 @@ def check_source_contracts(lua: str) -> None:
     assert re.search(r"function M\.onPreRender\(dt\).*?pollState\(dt\)", lua, re.S)
     assert re.search(r"function M\.onUpdate\(dt\).*?pollState\(dt\)", lua, re.S)
 
-    for bat_name in ("install.bat", "play_gvd.bat", "play_gvd_tech.bat"):
-        bat = (ROOT / bat_name).read_text(encoding="utf-8", errors="ignore")
-        assert TECH_BAT in bat, bat_name
+    play = (ROOT / "play_gvd.bat").read_text(encoding="utf-8", errors="ignore")
+    tech = (ROOT / "play_gvd_tech.bat").read_text(encoding="utf-8", errors="ignore")
+    install = (ROOT / "install.bat").read_text(encoding="utf-8", errors="ignore")
+    assert DRIVE_BAT in play and 'set "GVD_DOCS_DIR=%LOCALAPPDATA%\\BeamNG\\BeamNG.drive\\current\\Documents\\GVD"' in play
+    assert "echo [GVD] bus:" in play
+    assert 'set "GVD_DOCS_DIR=%LOCALAPPDATA%\\BeamNG\\BeamNG.tech\\current\\Documents\\GVD"' not in play
+    assert TECH_BAT in tech and 'set "GVD_DOCS_DIR=%LOCALAPPDATA%\\BeamNG\\BeamNG.tech\\current\\Documents\\GVD"' in tech
+    assert 'set "DOCS=%LOCALAPPDATA%\\BeamNG\\BeamNG.drive\\current\\Documents\\GVD"' in install
+    assert 'set "DOCS=%LOCALAPPDATA%\\BeamNG\\BeamNG.tech\\current\\Documents\\GVD"' not in install
+    for bat_name, bat in (("install.bat", install), ("play_gvd.bat", play), ("play_gvd_tech.bat", tech)):
         assert "GVD_DOCS_DIR" in bat, bat_name
         assert 'set "GVD_DOCS_DIR=%USERPROFILE%\\Documents\\GVD"' not in bat, bat_name
         assert 'set "DOCS=%USERPROFILE%\\Documents\\GVD"' not in bat, bat_name
         assert "OneDrive" not in bat and "FOLDERID" not in bat and "mklink" not in bat.lower()
 
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    schema = (ROOT / "docs" / "gvd_state_schema.md").read_text(encoding="utf-8")
+    assert r"%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\Documents\GVD" in readme
+    assert r"%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\Documents\GVD" in readme
+    assert "also copied to %USERPROFILE%\\Documents\\GVD" not in readme
+    assert r"%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\Documents\GVD" in schema
+    assert r"%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\Documents\GVD" in schema
+    assert "Path: `%USERPROFILE%\\Documents\\GVD" not in schema
+    assert "Lua and Python share `%USERPROFILE%" not in schema
+
 
 def check_python_mirror() -> None:
-    spec = "C:/Users/Name/AppData/Local/" + TECH_TAIL
+    tech = "C:/Users/Name/AppData/Local/" + TECH_TAIL
+    drive = "C:/Users/Name/AppData/Local/" + DRIVE_TAIL
     assert local_app_from_path(r"C:\Users\Name\AppData\Local\BeamNG\BeamNG.tech\current") == (
         "C:/Users/Name/AppData/Local"
     )
@@ -188,26 +278,38 @@ def check_python_mirror() -> None:
         tech_current_from_path("C:/Users/Name/AppData/Local/BeamNG/BeamNG.tech/current")
         == "C:/Users/Name/AppData/Local/BeamNG/BeamNG.tech/current"
     )
+    assert (
+        drive_current_from_path("C:/Users/Name/AppData/Local/BeamNG/BeamNG.drive/current")
+        == "C:/Users/Name/AppData/Local/BeamNG/BeamNG.drive/current"
+    )
     assert tech_current_from_path("C:/Users/Name/AppData/Local/BeamNG.tech/current") is None
     assert local_app_from_path("C:/Users/Name/Documents/BeamNG.drive/current") is None
     assert local_app_from_path("D:/BeamNG.drive/current") is None
+    assert product_from_path("C:/Users/Name/AppData/Local/BeamNG.drive/0.36") == "drive"
+    assert product_from_path("C:/Users/Name/AppData/Local/BeamNG/BeamNG.tech/current") == "tech"
 
+    la = {"LOCALAPPDATA": r"C:\Users\Name\AppData\Local", "USERPROFILE": r"C:\Users\Name"}
     assert (
-        resolve_docs_dir(
-            {"LOCALAPPDATA": r"C:\Users\Name\AppData\Local", "USERPROFILE": r"C:\Users\Name"},
-            ["C:/Users/Name/Documents/BeamNG.drive/0.36/current"],
-        )
-        == spec
+        resolve_docs_dir(la, ["C:/Users/Name/AppData/Local/BeamNG/BeamNG.drive/current"])
+        == drive
     )
-    assert resolve_docs_dir({"USERPROFILE": r"C:\Users\Name"}, []) == spec
-    assert resolve_docs_dir({"HOME": "/home/me"}, []) == "/home/me/AppData/Local/" + TECH_TAIL
+    assert (
+        resolve_docs_dir(la, ["C:/Users/Name/Documents/BeamNG.drive/0.36/current"])
+        == drive
+    )
+    assert resolve_docs_dir({"USERPROFILE": r"C:\Users\Name"}, []) == drive
+    assert resolve_docs_dir({"HOME": "/home/me"}, []) == "/home/me/AppData/Local/" + DRIVE_TAIL
     assert (
         resolve_docs_dir({}, ["C:/Users/Name/AppData/Local/BeamNG/BeamNG.tech/current"])
-        == spec
+        == tech
     )
     assert (
-        resolve_docs_dir({}, ["C:/Users/Name/AppData/Local/BeamNG.drive/0.36"])
-        == spec
+        resolve_docs_dir(la, ["C:/Users/Name/AppData/Local/BeamNG.drive/0.36"])
+        == drive
+    ), "Drive FS must not reconstruct Tech tail"
+    assert (
+        resolve_docs_dir({"LOCALAPPDATA": r"C:\Users\Name\AppData\Local", "GVD_BEAMNG": "1"}, [])
+        == tech
     )
     # Documents userfolder cannot reconstruct LOCALAPPDATA → last resort (not USERPROFILE Documents).
     assert (
@@ -222,7 +324,8 @@ def check_python_mirror() -> None:
     for name in ("gvd_state.json", "gvd_ego.json", "gvd_engage.json", "gvd_cmd.json"):
         p = resolve_docs_dir({"LOCALAPPDATA": "C:/Users/Name/AppData/Local"}) + "/" + name
         assert p.endswith("/Documents/GVD/" + name)
-        assert TECH_TAIL in p
+        assert DRIVE_TAIL in p
+        assert TECH_TAIL not in p
         assert not p.startswith("gvd_")
         assert not p.endswith("/current/" + name)
 
@@ -250,8 +353,14 @@ def _env(**kwargs: str | None):
                 os.environ[k] = v
 
 
-def check_python_tech_sandbox() -> None:
-    """Python GVD bus: Tech current\\Documents\\GVD; override wins; never USERPROFILE Documents."""
+def _clear_product(**extra: str | None):
+    kwargs: dict[str, str | None] = {k: None for k in PRODUCT_ENV}
+    kwargs.update(extra)
+    return _env(**kwargs)
+
+
+def check_python_product_sandbox() -> None:
+    """Python GVD bus: Drive vs Tech current\\Documents\\GVD; override wins; never USERPROFILE Documents."""
     from python.control.actuate import cmd_path, ego_path, engage_path
     from python.runtime import paths
     from python.runtime.state_io import gvd_docs_dir, state_path
@@ -259,8 +368,8 @@ def check_python_tech_sandbox() -> None:
     src = (ROOT / "python" / "runtime" / "paths.py").read_text(encoding="utf-8")
     state_src = (ROOT / "python" / "runtime" / "state_io.py").read_text(encoding="utf-8")
     assert "GVD_DOCS_DIR" in src
-    assert "BeamNG.tech" in src and "current" in src
-    assert "TECH_GVD_REL" in src
+    assert "BeamNG.tech" in src and "BeamNG.drive" in src and "current" in src
+    assert "TECH_GVD_REL" in src and "DRIVE_GVD_REL" in src
     assert "SHGetKnownFolderPath" not in src
     assert "FOLDERID" not in src
     assert "Accounts" not in src and "UserFolder" not in src, "no Personal-reg OneDrive tip"
@@ -283,9 +392,12 @@ def check_python_tech_sandbox() -> None:
         assert 'Path.home() / "Documents"' not in text, rel
         assert 'expanduser("~")' not in text, rel
 
-    spec = "C:/Users/Name/AppData/Local/" + TECH_TAIL
-    lua_spec = resolve_docs_dir({"LOCALAPPDATA": r"C:\Users\Name\AppData\Local"})
-    assert lua_spec == spec, lua_spec
+    tech = "C:/Users/Name/AppData/Local/" + TECH_TAIL
+    drive = "C:/Users/Name/AppData/Local/" + DRIVE_TAIL
+    lua_drive = resolve_docs_dir({"LOCALAPPDATA": r"C:\Users\Name\AppData\Local"})
+    lua_tech = resolve_docs_dir({"LOCALAPPDATA": r"C:\Users\Name\AppData\Local", "GVD_BEAMNG": "1"})
+    assert lua_drive == drive, lua_drive
+    assert lua_tech == tech, lua_tech
 
     assert paths.is_onedrive_path(Path("C:/Users/Name/OneDrive/Documents"))
     assert paths.is_onedrive_path(r"C:\Users\Name\OneDrive - Personal\Documents")
@@ -294,44 +406,66 @@ def check_python_tech_sandbox() -> None:
     assert not paths.is_onedrive_path(None)
     assert not paths.is_onedrive_path("  ")
 
-    # LOCALAPPDATA wins over USERPROFILE Documents (the live NO LINK path).
-    with _env(
+    # Retail default: LOCALAPPDATA Drive sandbox, never USERPROFILE Documents, never Tech.
+    with _clear_product(
         LOCALAPPDATA="C:/Users/Name/AppData/Local",
         USERPROFILE="C:/Users/Name",
         HOME="/home/other",
-        GVD_DOCS_DIR=None,
     ):
         got = paths.gvd_docs_path()
-        assert _slash(got) == spec, got
+        assert _slash(got) == drive, got
         assert got.parts[-2:] == ("Documents", "GVD")
-        assert "BeamNG.tech" in got.parts
+        assert "BeamNG.drive" in got.parts
+        assert "BeamNG.tech" not in got.parts
         assert "OneDrive" not in _slash(got)
-        assert _slash(got) == lua_spec
+        assert _slash(got) == lua_drive
         assert "Users/Name/Documents/GVD" not in _slash(got)
+        assert paths.gvd_product() == "drive"
 
-    # USERPROFILE alone synthesizes AppData\\Local\\…Tech…\\Documents\\GVD.
-    with _env(LOCALAPPDATA=None, USERPROFILE="C:/Users/Name", HOME=None, GVD_DOCS_DIR=None):
+    # Tech env: GVD_BEAMNG=1 / GVD_BACKEND=beamngpy / GVD_PRODUCT=tech.
+    with _clear_product(
+        LOCALAPPDATA="C:/Users/Name/AppData/Local",
+        USERPROFILE="C:/Users/Name",
+        GVD_BEAMNG="1",
+    ):
         got = paths.gvd_docs_path()
-        assert _slash(got) == spec, got
+        assert _slash(got) == tech, got
+        assert "BeamNG.tech" in got.parts
+        assert paths.gvd_product() == "tech"
+    with _clear_product(
+        LOCALAPPDATA="C:/Users/Name/AppData/Local",
+        GVD_BACKEND="beamngpy",
+    ):
+        assert _slash(paths.gvd_docs_path()) == tech
+    with _clear_product(
+        LOCALAPPDATA="C:/Users/Name/AppData/Local",
+        GVD_PRODUCT="tech",
+    ):
+        assert _slash(paths.gvd_docs_path()) == tech
+
+    # USERPROFILE alone synthesizes AppData\\Local Drive sandbox (retail default).
+    with _clear_product(LOCALAPPDATA=None, USERPROFILE="C:/Users/Name", HOME=None):
+        got = paths.gvd_docs_path()
+        assert _slash(got) == drive, got
         assert _slash(got) == resolve_docs_dir({"USERPROFILE": r"C:\Users\Name"})
 
-    # OneDrive LOCALAPPDATA is rejected; fall through to USERPROFILE\\AppData\\Local.
-    with _env(
+    # OneDrive LOCALAPPDATA is rejected; fall through to USERPROFILE\\AppData\\Local Drive.
+    with _clear_product(
         LOCALAPPDATA="C:/Users/Name/OneDrive",
         USERPROFILE="C:/Users/Name",
-        GVD_DOCS_DIR=None,
     ):
         got = paths.gvd_docs_path()
         assert "OneDrive" not in _slash(got), got
-        assert _slash(got) == spec
+        assert _slash(got) == drive
 
-    # GVD_DOCS_DIR override wins over Tech sandbox and USERPROFILE.
+    # GVD_DOCS_DIR override wins over both sandboxes and USERPROFILE.
     with tempfile.TemporaryDirectory() as td:
         override = Path(td) / "custom_gvd"
-        with _env(
+        with _clear_product(
             GVD_DOCS_DIR=str(override),
             USERPROFILE="C:/Users/Name",
             LOCALAPPDATA="C:/Users/Name/AppData/Local",
+            GVD_BEAMNG="1",
         ):
             got = paths.gvd_docs_path()
             assert Path(got) == override, got
@@ -340,21 +474,21 @@ def check_python_tech_sandbox() -> None:
             assert state_path().parent == root
             assert cmd_path().parent == engage_path().parent == ego_path().parent == root
 
-    # Blank GVD_DOCS_DIR is ignored (fall through to Tech sandbox).
-    with _env(
+    # Blank GVD_DOCS_DIR is ignored (fall through to Drive sandbox).
+    with _clear_product(
         GVD_DOCS_DIR="   ",
         LOCALAPPDATA="C:/Users/Name/AppData/Local",
         USERPROFILE="C:/Users/Name",
     ):
-        assert _slash(paths.gvd_docs_path()) == spec
+        assert _slash(paths.gvd_docs_path()) == drive
 
     # Last resort relative Documents/GVD (Lua last-resort contract).
-    with _env(GVD_DOCS_DIR=None, LOCALAPPDATA=None, USERPROFILE=None, HOME=None):
+    with _clear_product(LOCALAPPDATA=None, USERPROFILE=None, HOME=None):
         last = paths.gvd_docs_path()
         assert _slash(last) == "Documents/GVD"
         assert not str(last).endswith(".json")
 
-    # Live mkdir: Tech sandbox under LOCALAPPDATA, never USERPROFILE\\Documents or OneDrive.
+    # Live mkdir: Drive sandbox under LOCALAPPDATA, never USERPROFILE\\Documents or OneDrive.
     with tempfile.TemporaryDirectory() as td:
         profile = Path(td) / "Users" / "Name"
         la = profile / "AppData" / "Local"
@@ -362,14 +496,13 @@ def check_python_tech_sandbox() -> None:
         onedrive.mkdir(parents=True)
         local_docs = profile / "Documents"
         local_docs.mkdir(parents=True)
-        with _env(
+        with _clear_product(
             LOCALAPPDATA=str(la),
             USERPROFILE=str(profile),
             HOME=None,
-            GVD_DOCS_DIR=None,
         ):
             root = gvd_docs_dir()
-            expected = la.joinpath(*paths.TECH_GVD_REL)
+            expected = la.joinpath(*paths.DRIVE_GVD_REL)
             assert root == expected and root.is_dir()
             assert "OneDrive" not in _slash(root)
             assert not (onedrive / "GVD").exists()
@@ -377,28 +510,45 @@ def check_python_tech_sandbox() -> None:
             assert state_path().parent == root
             assert cmd_path().parent == engage_path().parent == ego_path().parent == root
             assert root.parts[-2:] == ("Documents", "GVD")
-            assert "BeamNG.tech" in root.parts
+            assert "BeamNG.drive" in root.parts
+            assert "BeamNG.tech" not in root.parts
 
-    # USERPROFILE-only mkdir still lands on AppData\\Local Tech sandbox.
+    # Tech mkdir when GVD_BEAMNG=1.
+    with tempfile.TemporaryDirectory() as td:
+        la = Path(td) / "AppData" / "Local"
+        with _clear_product(LOCALAPPDATA=str(la), USERPROFILE=str(Path(td)), HOME=None, GVD_BEAMNG="1"):
+            root = gvd_docs_dir()
+            expected = la.joinpath(*paths.TECH_GVD_REL)
+            assert root == expected and root.is_dir()
+            assert "BeamNG.tech" in root.parts
+            assert not (Path(td) / "Documents" / "GVD").exists()
+
+    # USERPROFILE-only mkdir still lands on AppData\\Local Drive sandbox.
     with tempfile.TemporaryDirectory() as td:
         profile = Path(td) / "Users" / "Name"
-        with _env(LOCALAPPDATA=None, USERPROFILE=str(profile), HOME=None, GVD_DOCS_DIR=None):
+        with _clear_product(LOCALAPPDATA=None, USERPROFILE=str(profile), HOME=None):
             root = gvd_docs_dir()
-            expected = profile.joinpath("AppData", "Local", *paths.TECH_GVD_REL)
+            expected = profile.joinpath("AppData", "Local", *paths.DRIVE_GVD_REL)
             assert root == expected and root.is_dir()
             assert not (profile / "Documents" / "GVD").exists()
 
-    # Host fallback: Tech tail when LOCALAPPDATA/HOME can be synthesized.
-    with _env(GVD_DOCS_DIR=None):
+    # Host fallback: product tail when LOCALAPPDATA/HOME can be synthesized.
+    with _clear_product():
         live = paths.gvd_docs_path()
         assert live.parts[-2:] == ("Documents", "GVD"), live
         if os.environ.get("LOCALAPPDATA") or os.environ.get("USERPROFILE") or os.environ.get("HOME"):
-            assert "BeamNG.tech" in live.parts, live
+            assert "BeamNG.drive" in live.parts or "BeamNG.tech" in live.parts, live
+            assert "OneDrive" not in _slash(live)
+
+
+def check_python_tech_sandbox() -> None:
+    """Alias kept for older imports."""
+    check_python_product_sandbox()
 
 
 def check_python_known_folder() -> None:
     """Alias kept for test_m6_retail.check_gvd_docs_dir."""
-    check_python_tech_sandbox()
+    check_python_product_sandbox()
 
 
 def check_lua_harness() -> None:
@@ -433,7 +583,7 @@ def main() -> None:
     lua = LUA.read_text(encoding="utf-8")
     check_source_contracts(lua)
     check_python_mirror()
-    check_python_tech_sandbox()
+    check_python_product_sandbox()
     check_lua_harness()
     print("test_gvd_docs_dir: OK")
 

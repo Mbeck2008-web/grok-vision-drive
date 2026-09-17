@@ -85,11 +85,14 @@ end
 
 
 
--- Resolve GVD bus dir so Lua + Python share the Tech GELua sandbox:
---   %LOCALAPPDATA%/BeamNG/BeamNG.tech/current/Documents/GVD
--- USERPROFILE\Documents is NOT readable by Tech Lua (live Apps NO LINK). Not OneDrive.
--- GVD_DOCS_DIR override wins. Never a bare gvd_*.json under userfolder current\.
--- CEF Apps LINKED is gvd_state heartbeat only (see linkState); gvd_ego.json is not required.
+-- Resolve GVD bus dir so Lua + Python share the *running* product sandbox:
+--   Tech:  %LOCALAPPDATA%/BeamNG/BeamNG.tech/current/Documents/GVD
+--   Drive: %LOCALAPPDATA%/BeamNG/BeamNG.drive/current/Documents/GVD
+-- Steam GELua does not inherit GVD_DOCS_DIR — live retail follows FS userfolder.
+-- Tech cannot io.open the Drive sandbox; Drive cannot io.open the Tech sandbox.
+-- USERPROFILE\Documents is NOT readable by Tech Lua. Not OneDrive.
+-- GVD_DOCS_DIR override wins when inherited. Never a bare gvd_*.json under userfolder current\.
+-- CEF link is gvd_state heartbeat only (see linkState); live Apps LINK is UNPROVEN.
 -- Extra helpers stay nested: Lua 5.1 main chunks are capped at 200 locals.
 local gvdDocsResolved = nil
 local gvdDocsLogged = false
@@ -113,37 +116,80 @@ local function _techCurrentFromPath(p)
 end
 
 local function _tryEnvDocs()
+  -- GVD_DOCS_DIR override only. LOCALAPPDATA is product-specific and comes
+  -- *after* FS:getUserPath so Steam retail is not forced onto the Tech tail.
   local ov = os.getenv('GVD_DOCS_DIR')
   if ov then
     ov = tostring(ov):match('^%s*(.-)%s*$') or ''
     if ov ~= '' then return ov:gsub('\\', '/') end
-  end
-  local function techFromLa(localApp)
-    if not localApp or localApp == '' then return nil end
-    local la = tostring(localApp):gsub('\\', '/')
-    la = la:match('^%s*(.-)%s*$') or la
-    if la == '' or la:lower():find('onedrive', 1, true) then return nil end
-    return la .. '/BeamNG/BeamNG.tech/current/Documents/GVD'
-  end
-  local fromLa = techFromLa(os.getenv('LOCALAPPDATA'))
-  if fromLa then return fromLa end
-  -- LOCALAPPDATA is usually USERPROFILE/AppData/Local — never USERPROFILE/Documents.
-  local home = os.getenv('USERPROFILE') or os.getenv('HOME')
-  if home and home ~= '' then
-    return techFromLa(tostring(home):gsub('\\', '/') .. '/AppData/Local')
   end
   return nil
 end
 
 local function gvdDocsDir()
   if gvdDocsResolved then return gvdDocsResolved end
+  local function _driveCurrentFromPath(p)
+    if not p or p == '' then return nil end
+    p = tostring(p):gsub('\\', '/')
+    if p:lower():find('onedrive', 1, true) then return nil end
+    local cur = p:match('^(.+/BeamNG/BeamNG.drive/current)')
+    if cur and cur ~= '' then return cur end
+    return nil
+  end
+  local function _productFromPath(p)
+    if not p or p == '' then return nil end
+    local s = tostring(p):gsub('\\', '/'):lower()
+    if s:find('onedrive', 1, true) then return nil end
+    if s:find('beamng.tech', 1, true) then return 'tech' end
+    if s:find('beamng.drive', 1, true) then return 'drive' end
+    return nil
+  end
+  local function fromLa(localApp, product)
+    if not localApp or localApp == '' then return nil end
+    local la = tostring(localApp):gsub('\\', '/')
+    la = la:match('^%s*(.-)%s*$') or la
+    if la == '' or la:lower():find('onedrive', 1, true) then return nil end
+    if product == 'drive' then
+      return la .. '/BeamNG/BeamNG.drive/current/Documents/GVD'
+    end
+    return la .. '/BeamNG/BeamNG.tech/current/Documents/GVD'
+  end
+  local function _envProduct()
+    local p = os.getenv('GVD_PRODUCT')
+    if p and tostring(p) ~= '' then
+      p = tostring(p):lower():match('^%s*(.-)%s*$') or ''
+      if p == 'tech' or p == 'beamng.tech' or p == 'beamngtech' then return 'tech' end
+      if p == 'drive' or p == 'retail' or p == 'beamng.drive' or p == 'beamngdrive' then return 'drive' end
+    end
+    local b = os.getenv('GVD_BEAMNG')
+    if b and tostring(b) ~= '' then
+      b = tostring(b):lower():match('^%s*(.-)%s*$') or ''
+      if b == '1' or b == 'true' or b == 'yes' then return 'tech' end
+    end
+    local be = os.getenv('GVD_BACKEND')
+    if be and tostring(be) ~= '' then
+      be = tostring(be):lower():match('^%s*(.-)%s*$') or ''
+      if be == 'beamngpy' or be == 'tech' then return 'tech' end
+    end
+    return 'drive'
+  end
+  local function homeAppData()
+    -- LOCALAPPDATA is usually USERPROFILE/AppData/Local — never USERPROFILE/Documents.
+    local home = os.getenv('USERPROFILE') or os.getenv('HOME')
+    if not home or home == '' then return nil end
+    return tostring(home):gsub('\\', '/') .. '/AppData/Local'
+  end
   local function consider(native)
     if not native or native == '' then return nil end
-    local cur = _techCurrentFromPath(native)
-    if cur then return cur .. '/Documents/GVD' end
+    local techCur = _techCurrentFromPath(native)
+    if techCur then return techCur .. '/Documents/GVD' end
+    local driveCur = _driveCurrentFromPath(native)
+    if driveCur then return driveCur .. '/Documents/GVD' end
+    local product = _productFromPath(native)
+    if not product then return nil end
     local la = _localAppFromPath(native)
-    if la then return la .. '/BeamNG/BeamNG.tech/current/Documents/GVD' end
-    return nil
+    if la then return fromLa(la, product) end
+    return fromLa(os.getenv('LOCALAPPDATA'), product) or fromLa(homeAppData(), product)
   end
   local function _tryFsDocs()
     if not FS then return nil end
@@ -172,7 +218,12 @@ local function gvdDocsDir()
     end
     return nil
   end
-  local dir = _tryEnvDocs() or _tryFsDocs()
+  local function _tryEnvProductDocs()
+    local product = _envProduct()
+    return fromLa(os.getenv('LOCALAPPDATA'), product) or fromLa(homeAppData(), product)
+  end
+  -- Override, then running userfolder (Steam has no GVD_DOCS_DIR), then env product.
+  local dir = _tryEnvDocs() or _tryFsDocs() or _tryEnvProductDocs()
   if not dir or dir == '' then
     dir = 'Documents/GVD'
   end
@@ -248,9 +299,9 @@ local function writeEngageFile(reason)
 end
 
 -- Absolute disk paths: io.open FIRST. VFS readFile / FS:readFile often fail
--- (or return empty/junk) on C:/ and \\ paths, which left lastGood nil and Apps
--- NO LINK even when USERPROFILE\Documents\GVD\gvd_state.json was fresh on disk
--- (Tech GELua sandbox cannot read that folder; bus is Tech current\Documents\GVD).
+-- (or return empty/junk) on C:/ and \\ paths, which left lastGood nil when the
+-- bus was USERPROFILE\Documents\GVD (Tech cannot read that folder). Bus is the
+-- running product current\Documents\GVD (Tech vs Drive). Live Apps LINK UNPROVEN.
 local function _isAbsDiskPath(path)
   local p = tostring(path or '')
   -- spec: ^[A-Za-z]:/  or  \\UNC

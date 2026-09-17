@@ -43,6 +43,7 @@ def default_state(**overrides: Any) -> dict[str, Any]:
         "loop_hz": 0.0,
         "camera_hz": 0.0,
         "infer_ms": 0.0,
+        "grab_ms": 0.0,
         "viz_ms": 0.0,
         "heartbeat_ms": 0.0,
         "heartbeat_unix": int(time.time()),  # match Lua os.time() seconds

@@ -465,7 +465,7 @@ def _lines(s: dict[str, Any]) -> list[str]:
         f"policy: {s.get('policy', '?')}   engage: {s.get('engaged')}",
         f"disengage: {s.get('disengage_reason', 'none')}",
         f"loop {s.get('loop_hz', 0):.1f}Hz  cam {s.get('camera_hz', 0):.1f}Hz",
-        f"infer {s.get('infer_ms', 0):.1f}ms  viz {s.get('viz_ms', 0):.1f}ms  hb {s.get('heartbeat_ms', 0):.0f}ms",
+        f"infer {s.get('infer_ms', 0):.1f}ms  grab {s.get('grab_ms', 0):.1f}ms  viz {s.get('viz_ms', 0):.1f}ms  hb {s.get('heartbeat_ms', 0):.0f}ms",
         f"VRAM {s.get('gpu_vram_used_gb', 0):.1f}/{s.get('gpu_vram_total_gb', 11):.0f} GB  {s.get('gpu_name', '')}",
         f"cams {cam_s}",
         f"capture {cap} {cap_note}".rstrip(),

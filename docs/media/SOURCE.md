@@ -1,8 +1,8 @@
 # README media provenance
 
-These files are **synthetic**. They are not live Desktop-IQU45 / BeamNG photos.
+These files are **synthetic**. They are not live photos from the Windows live machine / BeamNG.
 
-IQU45 had no recent GVD viz or in-game UI shots (only unrelated old BeamNG clips). Repo search found `docs/gvd_viz_smoke.png` (OpenCV smoke) and the 64px `beamng_mod/ui/modules/apps/GVD/app.png` icon — neither is a live cabin or HUD photo.
+The Windows live host had no recent GVD viz or in-game UI shots (only unrelated old BeamNG clips). Repo search found `docs/gvd_viz_smoke.png` (OpenCV smoke) and the 64px `beamng_mod/ui/modules/apps/GVD/app.png` icon — neither is a live cabin or HUD photo.
 
 | File | What | How |
 | --- | --- | --- |
@@ -11,4 +11,4 @@ IQU45 had no recent GVD viz or in-game UI shots (only unrelated old BeamNG clips
 
 Soft Esc parked. Esc is BeamNG **UI Apps**, not GVD Engage. Do not retitle these as live.
 
-To replace with real crops later: drop Michael's live GVD cabin / HUD photos here, keep the filenames (or update README paths), and change the README caption from **synthetic** to **real**.
+To replace with real crops later: drop live GVD cabin / HUD photos here, keep the filenames (or update README paths), and change the README caption from **synthetic** to **real**.

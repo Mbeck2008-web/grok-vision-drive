@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Render README media under docs/media/ (synthetic cabin + in-game HUD).
 
-No recent live IQU45 GVD viz/UI photos exist in-repo. Cabin comes from
+No recent live GVD viz/UI photos from the Windows live machine exist in-repo. Cabin comes from
 ``python.viz.stage.smoke`` (parked, engaged=False). In-game UI is a raster of
 ``beamng_mod/ui/modules/apps/GVD/app.html`` in DISENGAGED / Soft Esc parked
 (Chrome headless, OpenCV fallback). Captions must stay **synthetic**.
@@ -361,7 +361,7 @@ def main() -> int:
     hud = render_hud()
     print(f"[GVD] README media cabin -> {cabin}")
     print(f"[GVD] README media HUD   -> {hud}")
-    print("[GVD] captions: synthetic. Soft Esc parked. Not Engage. Not live IQU45 photos.")
+    print("[GVD] captions: synthetic. Soft Esc parked. Not Engage. Not live photos from the Windows live machine.")
     return 0
 
 

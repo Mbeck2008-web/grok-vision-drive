@@ -35,7 +35,7 @@ thresholds; `run_vision.py` mirrors them into `gvd_state.json` as `override_cfg`
 tracks the yaml without parsing it.
 
 Force-feedback behaviour on a real wheel is **UNPROVEN** — no live BeamNG here. The magnitudes
-are Michael's research pin, every one is tunable from the yaml, and none of this touches the
+are a research pin, every one is tunable from the yaml, and none of this touches the
 `CMD_DEAD_S` dead-man.
 """
 

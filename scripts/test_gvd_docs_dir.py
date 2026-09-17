@@ -32,12 +32,14 @@ Lua extract harness (when lua5.1/luajit is on PATH): ``lua5.1 scripts/test_gvd_d
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -220,6 +222,34 @@ def check_source_contracts(lua: str) -> None:
     assert "tickBusIdentity" in lua
     assert "[GVD][LUA] bus=" in lua
     assert "link=MISMATCH" in lua
+    assert "gvd_link.json" in lua
+    ident_fn = _fn(lua, "tickBusIdentity")
+    ident_exec = re.sub(r"--[^\n]*", "", ident_fn)
+    assert "gvd_link.json" in ident_exec
+    assert "lua_bus" in ident_exec
+    assert "writeText" in ident_exec
+    assert "io.open" not in ident_exec
+    ego_write_fn = _fn(lua, "writeEgoFile")
+    ego_write_exec = re.sub(r"--[^\n]*", "", ego_write_fn)
+    assert '"lua_bus"' in ego_write_exec or "lua_bus" in ego_write_exec
+    assert "luaBusPath" in ego_write_exec
+    paths_src = (ROOT / "python" / "runtime" / "paths.py").read_text(encoding="utf-8")
+    assert "read_live_lua_bus" in paths_src
+    assert "predicted_gvd_docs_path" in paths_src
+    assert "gvd_link.json" in paths_src
+    assert "LUA_BUS_FRESH_S" in paths_src
+    probe_fn = None
+    for block in paths_src.split("def "):
+        if block.startswith("_probe_lua_bus_files"):
+            probe_fn = block
+            break
+    assert probe_fn is not None
+    assert "product_gvd_docs_path" in probe_fn
+    assert "env_override_gvd_docs_dir" in probe_fn
+    assert "for root in (env_override_gvd_docs_dir(), product_gvd_docs_path())" in probe_fn
+    assert "is_userprofile_documents_gvd" not in probe_fn
+    assert "OneDrive" in probe_fn  # docstring: do not search it
+    assert "USERPROFILE" in probe_fn  # docstring: do not search it
     state_io_src = (ROOT / "python" / "runtime" / "state_io.py").read_text(encoding="utf-8")
     assert "[GVD][PY]  bus=" in state_io_src
     assert "print_py_bus" in state_io_src
@@ -408,6 +438,19 @@ def _clear_product(**extra: str | None):
     return _env(**kwargs)
 
 
+def _plant_lua_bus(folder: Path, *, at: Path | None = None, age_s: float = 0.0) -> Path:
+    """Write a handshake file so Python follows *folder* (Lua getUserPath Documents/GVD)."""
+    probe = at if at is not None else folder
+    folder.mkdir(parents=True, exist_ok=True)
+    probe.mkdir(parents=True, exist_ok=True)
+    p = probe / "gvd_link.json"
+    p.write_text(json.dumps({"lua_bus": str(folder)}), encoding="utf-8")
+    if age_s:
+        old = time.time() - age_s
+        os.utime(p, (old, old))
+    return p
+
+
 def check_python_product_sandbox() -> None:
     """Python GVD bus: Drive vs Tech current\\Documents\\GVD; override wins; never USERPROFILE Documents."""
     from python.control.actuate import cmd_path, ego_path, engage_path
@@ -565,6 +608,8 @@ def check_python_product_sandbox() -> None:
             assert root.parts[-2:] == ("Documents", "GVD")
             assert "BeamNG.drive" in root.parts
             assert "BeamNG.tech" not in root.parts
+            assert paths.bus_identity().matched is False, "no lua_bus yet is MISMATCH"
+            _plant_lua_bus(expected)
             ident = paths.bus_identity()
             assert ident.matched is True
             assert ident.product == "drive"
@@ -580,6 +625,7 @@ def check_python_product_sandbox() -> None:
             assert root == expected and root.is_dir()
             assert "BeamNG.tech" in root.parts
             assert not (Path(td) / "Documents" / "GVD").exists()
+            _plant_lua_bus(expected)
             ident = paths.bus_identity()
             assert ident.matched is True and ident.product == "tech"
 
@@ -653,8 +699,7 @@ def check_writer_lua_folder_agreement() -> None:
         USERPROFILE="C:/Users/Name",
         HOME=None,
     ):
-        py = paths.gvd_docs_path()
-        lua_bus = paths.resolved_lua_bus("drive")
+        py = paths.predicted_gvd_docs_path()
         ident = paths.bus_identity()
         writer_state = (py / "gvd_state.json").as_posix()
         reader_state = lua_read_helper("gvd_state.json")
@@ -663,10 +708,8 @@ def check_writer_lua_folder_agreement() -> None:
             reader_state,
         )
         assert "BeamNG.drive/current/Documents/GVD" in writer_state.replace("\\", "/")
-        assert ident.matched is True
+        assert ident.matched is False, "predicted LOCALAPPDATA is not a match without live lua_bus"
         assert ident.product == "drive"
-        assert paths.buses_same_folder(ident.python_bus, ident.lua_bus), (py, lua_bus)
-        assert ident.lua_bus_s.replace("\\", "/").endswith("/Documents/GVD") or ident.lua_bus_s.replace("\\", "/") == "Documents/GVD"
 
     from python.runtime import state_io as state_io_mod
     from python.runtime.state_io import default_state, write_state
@@ -690,10 +733,10 @@ def check_writer_lua_folder_agreement() -> None:
         LOCALAPPDATA="C:/Users/Name/AppData/Local",
         GVD_BEAMNG="1",
     ):
-        py = paths.gvd_docs_path()
+        py = paths.predicted_gvd_docs_path()
         assert "BeamNG.tech/current/Documents/GVD" in str(py).replace("\\", "/")
         assert paths.bus_identity().product == "tech"
-        assert paths.bus_identity().matched
+        assert paths.bus_identity().matched is False
 
     with _clear_product(
         LOCALAPPDATA="C:/Users/Name/AppData/Local",
@@ -764,6 +807,144 @@ def check_writer_lua_folder_agreement() -> None:
             assert paint.get("engaged") is False
 
 
+def check_follow_lua_bus() -> None:
+    """(a) predicted LOCALAPPDATA ≠ lua_bus → relocate. (b) stale/missing → MISMATCH, no actuate."""
+    from python.control.actuate import CmdJsonActuator, DriveCommand
+    from python.runtime import paths
+    from python.runtime import state_io as state_io_mod
+    from python.runtime.state_io import default_state, write_state
+
+    # (a) bat pin / predicted sandbox ≠ live getUserPath folder → write at lua_bus.
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        la = td_path / "AppData" / "Local"
+        predicted = la.joinpath(*paths.DRIVE_GVD_REL)
+        moved = td_path / "moved_userfolder" / "Documents" / "GVD"
+        predicted.mkdir(parents=True)
+        moved.mkdir(parents=True)
+        pin = str(predicted)
+        with _clear_product(
+            LOCALAPPDATA=str(la),
+            USERPROFILE=str(td_path / "Users" / "Name"),
+            HOME=None,
+            GVD_DOCS_DIR=pin,
+            GVD_PRODUCT="drive",
+        ):
+            assert paths.predicted_gvd_docs_path() == predicted
+            assert paths.gvd_docs_path() == predicted
+            assert paths.bus_identity().matched is False
+            _plant_lua_bus(moved, at=predicted)
+            ident = paths.bus_identity()
+            assert ident.matched is True, ident.note
+            assert ident.python_bus == moved, ident.python_bus
+            assert ident.lua_bus == moved
+            assert paths.gvd_docs_path() == moved
+            assert paths.gvd_docs_dir() == moved
+            state_io_mod._last_py_bus_print = 0.0
+            written = write_state(default_state(engaged=False))
+            assert written.parent == moved, written
+            assert (moved / "gvd_state.json").is_file()
+            assert not (predicted / "gvd_state.json").exists() or predicted == moved
+            act = CmdJsonActuator()
+            act.note_engaged(True)
+            out = act.apply(DriveCommand(steer=0.2, throttle=0.3, brake=0.0, seq=1, reason="ok"))
+            assert out.reason != "bus_mismatch", out
+            cmd = moved / "gvd_cmd.json"
+            assert cmd.is_file()
+            payload = json.loads(cmd.read_text(encoding="utf-8"))
+            assert payload["engaged"] is True
+            assert payload["steer"] == 0.2
+
+    # lua_bus via gvd_ego.json (not only gvd_link.json)
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        la = td_path / "AppData" / "Local"
+        predicted = la.joinpath(*paths.DRIVE_GVD_REL)
+        moved = td_path / "userfolder" / "Documents" / "GVD"
+        predicted.mkdir(parents=True)
+        moved.mkdir(parents=True)
+        (predicted / "gvd_ego.json").write_text(
+            json.dumps({"speed_mps": 1.0, "lua_bus": str(moved)}),
+            encoding="utf-8",
+        )
+        with _clear_product(
+            LOCALAPPDATA=str(la),
+            USERPROFILE=str(td_path / "Users" / "Name"),
+            HOME=None,
+        ):
+            ident = paths.bus_identity()
+            assert ident.matched is True
+            assert ident.python_bus == moved
+
+    # (b) missing lua_bus → MISMATCH, no actuate
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        la = td_path / "AppData" / "Local"
+        with _clear_product(
+            LOCALAPPDATA=str(la),
+            USERPROFILE=str(td_path / "Users" / "Name"),
+            HOME=None,
+        ):
+            ident = paths.bus_identity()
+            assert ident.matched is False
+            assert ident.link == "MISMATCH"
+            assert "lua_bus" in ident.note
+            act = CmdJsonActuator()
+            act.note_engaged(True)
+            out = act.apply(DriveCommand(steer=0.4, throttle=0.5, brake=0.0, seq=3, reason="ok"))
+            assert out.reason == "bus_mismatch", out
+            assert out.applied is False
+            payload = json.loads((paths.gvd_docs_path() / "gvd_cmd.json").read_text(encoding="utf-8"))
+            assert payload["engaged"] is False
+            assert payload["throttle"] == 0.0
+            assert payload["brake"] == 1.0
+
+    # (b) stale lua_bus → MISMATCH, no actuate
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        la = td_path / "AppData" / "Local"
+        predicted = la.joinpath(*paths.DRIVE_GVD_REL)
+        with _clear_product(
+            LOCALAPPDATA=str(la),
+            USERPROFILE=str(td_path / "Users" / "Name"),
+            HOME=None,
+        ):
+            _plant_lua_bus(predicted, age_s=2.5)
+            ident = paths.bus_identity()
+            assert ident.matched is False, ident
+            assert ident.link == "MISMATCH"
+            act = CmdJsonActuator()
+            act.note_engaged(True)
+            out = act.apply(DriveCommand(steer=0.1, throttle=0.2, brake=0.0, seq=4, reason="ok"))
+            assert out.reason == "bus_mismatch", out
+            payload = json.loads((paths.gvd_docs_path() / "gvd_cmd.json").read_text(encoding="utf-8"))
+            assert payload["engaged"] is False
+
+    # USERPROFILE Documents/GVD and OneDrive are not a live bus
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        profile = td_path / "Users" / "Name"
+        la = profile / "AppData" / "Local"
+        docs = profile / "Documents" / "GVD"
+        docs.mkdir(parents=True)
+        predicted = la.joinpath(*paths.DRIVE_GVD_REL)
+        predicted.mkdir(parents=True)
+        with _clear_product(
+            LOCALAPPDATA=str(la),
+            USERPROFILE=str(profile),
+            HOME=None,
+        ):
+            _plant_lua_bus(docs, at=predicted)
+            ident = paths.bus_identity()
+            assert ident.matched is False
+            assert ident.link == "MISMATCH"
+            onedrive = profile / "OneDrive" / "Documents" / "GVD"
+            onedrive.mkdir(parents=True)
+            _plant_lua_bus(onedrive, at=predicted)
+            ident = paths.bus_identity()
+            assert ident.matched is False
+
+
 def check_lua_harness() -> None:
     for exe in ("lua5.1", "luajit", "lua"):
         if shutil.which(exe):
@@ -798,6 +979,7 @@ def main() -> None:
     check_python_mirror()
     check_python_product_sandbox()
     check_writer_lua_folder_agreement()
+    check_follow_lua_bus()
     check_lua_harness()
     print("test_gvd_docs_dir: OK")
 

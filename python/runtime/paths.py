@@ -10,24 +10,30 @@ absolute ``io.open``.
 Not USERPROFILE Documents. Not OneDrive. No junctions.
 
 Resolution:
-  1. env override ``GVD_DOCS_DIR`` if set (full GVD root)
-  2. product sandbox under ``%LOCALAPPDATA%`` (or synthesized
+  1. live ``lua_bus`` from a fresh (< 1 s) ``gvd_link.json`` / ``gvd_ego.json``
+     at the predicted pin — source of truth (``FS:getUserPath()`` + Documents/GVD)
+  2. else env override ``GVD_DOCS_DIR`` if set (full GVD root; bat pin only
+     until Lua's first ``lua_bus`` lands)
+  3. else product sandbox under ``%LOCALAPPDATA%`` (or synthesized
      ``{USERPROFILE|HOME}/AppData/Local`` — never Documents):
        - ``GVD_PRODUCT=tech`` / ``GVD_BEAMNG=1`` / ``GVD_BACKEND=beamngpy`` → Tech
        - else Drive / retail (``play_gvd.bat`` / window backend)
-  3. else relative ``Documents/GVD``
+  4. else relative ``Documents/GVD``
 
 Callers append nothing: ``gvd_docs_dir()`` is the GVD root (state/cmd/engage).
 
-Steam GELua does not inherit ``GVD_DOCS_DIR``. Identity (printed every second on
-both sides) is the only link check: ``python_bus`` must be the same folder as
-Lua's resolved ``Documents/GVD``. Drive vs Tech, a leftover override, or
-``gvd_*.json`` under userfolder ``current\\`` is ``link=MISMATCH`` — no guess.
+Steam GELua does not inherit ``GVD_DOCS_DIR``. Do not predict Lua's folder from
+LOCALAPPDATA: a moved userfolder (Launcher → Manage User Folder) makes
+``current\\Documents\\GVD`` the wrong string. Identity is the live ``lua_bus``
+string vs the folder Python actually writes. Missing/stale/bad-tail ``lua_bus``
+is ``link=MISMATCH`` — no OneDrive / USERPROFILE Documents fallback.
 """
 
 from __future__ import annotations
 
+import json
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,6 +42,8 @@ DRIVE_GVD_REL = ("BeamNG", "BeamNG.drive", "current", "Documents", "GVD")
 TECH_GVD_TAIL = "BeamNG/BeamNG.tech/current/Documents/GVD"
 DRIVE_GVD_TAIL = "BeamNG/BeamNG.drive/current/Documents/GVD"
 LUA_BUS_REL = "Documents/GVD"
+LUA_BUS_FRESH_S = 1.0
+LUA_BUS_FILES = ("gvd_link.json", "gvd_ego.json")
 
 
 def is_onedrive_path(path: Path | str | None) -> bool:
@@ -132,8 +140,8 @@ def product_gvd_docs_path(product: str | None = None) -> Path | None:
     return la.joinpath(*gvd_rel_for_product(product))
 
 
-def gvd_docs_path() -> Path:
-    """GVD bus root without mkdir (tests / path math). ``GVD_DOCS_DIR`` wins."""
+def predicted_gvd_docs_path() -> Path:
+    """Bat / LOCALAPPDATA guess. Not Lua's live ``getUserPath`` folder."""
     override = env_override_gvd_docs_dir()
     if override is not None:
         return override
@@ -141,6 +149,14 @@ def gvd_docs_path() -> Path:
     if product is not None:
         return product
     return Path("Documents") / "GVD"
+
+
+def gvd_docs_path() -> Path:
+    """GVD bus root without mkdir (tests / path math). Live ``lua_bus`` wins."""
+    live, _note = read_live_lua_bus()
+    if live is not None:
+        return live
+    return predicted_gvd_docs_path()
 
 
 def gvd_docs_dir() -> Path:
@@ -176,6 +192,122 @@ def buses_same_folder(python_bus: Path | str | None, lua_bus: Path | str | None)
 def ends_with_docs_gvd(path: Path | str | None) -> bool:
     s = norm_bus_folder(path)
     return s == "documents/gvd" or s.endswith("/documents/gvd")
+
+
+def is_abs_disk_path(path: Path | str | None) -> bool:
+    """True for a Windows drive / UNC / POSIX absolute path. Relative ``Documents/GVD`` is not."""
+    if path is None:
+        return False
+    text = str(path).strip().replace("\\", "/")
+    if not text:
+        return False
+    if len(text) >= 2 and text[1] == ":":
+        return True
+    if text.startswith("//") or text.startswith("/"):
+        return True
+    try:
+        return Path(text).is_absolute()
+    except (OSError, ValueError):
+        return False
+
+
+def is_userprofile_documents_gvd(path: Path | str | None) -> bool:
+    """True when *path* is USERPROFILE/HOME Documents/GVD — not a BeamNG userfolder."""
+    if path is None:
+        return False
+    profile = _env_nonempty("USERPROFILE") or _env_nonempty("HOME")
+    if not profile:
+        return False
+    banned = Path(profile) / "Documents" / "GVD"
+    return buses_same_folder(path, banned)
+
+
+def accepted_lua_bus_folder(raw: Path | str | None) -> Path | None:
+    """Live ``lua_bus`` only when it is a real absolute folder ending in Documents/GVD."""
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    p = Path(text)
+    if not is_abs_disk_path(p):
+        return None
+    if is_onedrive_path(p) or is_userprofile_documents_gvd(p):
+        return None
+    if not ends_with_docs_gvd(p):
+        return None
+    try:
+        if p.is_dir():
+            return p
+    except OSError:
+        return None
+    return None
+
+
+def _probe_lua_bus_files() -> list[Path]:
+    """Look for Lua's handshake at the bat pin / predicted sandbox only.
+
+    Do not search USERPROFILE Documents or OneDrive.
+    """
+    files: list[Path] = []
+    seen: set[str] = set()
+    for root in (env_override_gvd_docs_dir(), product_gvd_docs_path()):
+        if root is None:
+            continue
+        key = norm_bus_folder(root)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        for name in LUA_BUS_FILES:
+            files.append(root / name)
+    return files
+
+
+def _read_lua_bus_field(path: Path, now: float) -> tuple[str | None, float | None]:
+    """Return ``(lua_bus or None, age_s)``. Missing file → ``(None, None)``."""
+    try:
+        if not path.is_file():
+            return None, None
+        age = now - path.stat().st_mtime
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError, TypeError, ValueError):
+        return None, None
+    if not isinstance(data, dict):
+        return None, age
+    raw = data.get("lua_bus")
+    if raw is None:
+        return None, age
+    text = str(raw).strip()
+    if not text:
+        return None, age
+    return text, age
+
+
+def read_live_lua_bus(*, now: float | None = None) -> tuple[Path | None, str]:
+    """Fresh ``lua_bus`` from ``gvd_link.json`` / ``gvd_ego.json``, or ``(None, why)``."""
+    t = time.time() if now is None else now
+    saw_file = False
+    saw_stale = False
+    saw_bad = False
+    for path in _probe_lua_bus_files():
+        raw, age = _read_lua_bus_field(path, t)
+        if age is None:
+            continue
+        saw_file = True
+        if age >= LUA_BUS_FRESH_S:
+            saw_stale = True
+            continue
+        accepted = accepted_lua_bus_folder(raw)
+        if accepted is not None:
+            return accepted, "ok"
+        saw_bad = True
+    if not saw_file:
+        return None, "lua_bus missing or stale"
+    if saw_bad:
+        return None, "lua_bus is not a Documents/GVD folder"
+    if saw_stale:
+        return None, "lua_bus missing or stale"
+    return None, "lua_bus missing or stale"
 
 
 def resolved_lua_bus(product: str | None = None) -> Path:
@@ -245,39 +377,45 @@ class BusIdentity:
 
 
 def bus_identity() -> BusIdentity:
-    """Python write root vs the folder Lua's ``Documents/GVD`` resolves to.
+    """Python write root vs Lua's live ``getUserPath()`` folder.
 
-    ``GVD_DOCS_DIR`` is Python-only. If it is not the product sandbox, this is
-    ``MISMATCH`` — Steam GELua will not follow the override.
+    ``lua_bus`` from a fresh ego/link file is source of truth. The LOCALAPPDATA
+    ``current\\Documents\\GVD`` guess is only a pin until that file lands.
+    Missing, stale, OneDrive, USERPROFILE Documents, or a path that is not a
+    real ``Documents/GVD`` folder is ``MISMATCH`` — do not predict a match.
     """
     product = gvd_product()
-    python_bus = gvd_docs_path()
-    lua_bus = resolved_lua_bus(product)
     leftover = tuple(leftover_gvd_json(product))
     other = other_product_state_path(product)
-    note = "ok"
-    matched = buses_same_folder(python_bus, lua_bus) and ends_with_docs_gvd(python_bus)
-    if is_onedrive_path(python_bus) or is_onedrive_path(lua_bus):
-        matched = False
+    live, live_note = read_live_lua_bus()
+    if live is not None:
+        return BusIdentity(
+            python_bus=live,
+            lua_bus=live,
+            product=product,
+            matched=True,
+            note="ok",
+            leftover=leftover,
+            other_state=other,
+        )
+    predicted = predicted_gvd_docs_path()
+    note = live_note
+    if is_onedrive_path(predicted):
         note = "OneDrive is not the GVD bus"
-    elif not matched:
-        note = "python_bus and lua_bus are not the same folder"
-    our_state = python_bus / "gvd_state.json"
+    our_state = predicted / "gvd_state.json"
     try:
         our_exists = our_state.is_file()
     except OSError:
         our_exists = False
     if leftover and not our_exists:
-        matched = False
         note = "leftover gvd_*.json under userfolder current\\ (not Documents/GVD)"
-    if other is not None and not our_exists:
-        matched = False
+    elif other is not None and not our_exists:
         note = "gvd_state.json is in the other product tree"
     return BusIdentity(
-        python_bus=python_bus,
-        lua_bus=lua_bus,
+        python_bus=predicted,
+        lua_bus=Path(""),
         product=product,
-        matched=matched,
+        matched=False,
         note=note,
         leftover=leftover,
         other_state=other,

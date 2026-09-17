@@ -168,7 +168,7 @@ check(last ~= 'current' and not last:match('gvd_.*%.json$'),
   'default is not a bare gvd_*.json')
 
 local files = loadHelpers({ LOCALAPPDATA = 'C:/Users/Name/AppData/Local' }, { directoryCreate = function() end })
-for _, name in ipairs({'gvd_state.json', 'gvd_ego.json', 'gvd_engage.json', 'gvd_cmd.json'}) do
+for _, name in ipairs({'gvd_state.json', 'gvd_ego.json', 'gvd_engage.json', 'gvd_cmd.json', 'gvd_link.json'}) do
   local p = files.file(name)
   check(p == 'Documents/GVD/' .. name, 'gvdFile(' .. name .. ') is relative Documents/GVD')
   check(not p:match('^gvd_'), name .. ' is not a bare filename')

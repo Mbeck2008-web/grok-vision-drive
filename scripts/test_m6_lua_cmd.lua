@@ -194,6 +194,9 @@ local function beatState(engaged, reason, overrideCfg)
 end
 
 M.onExtensionLoaded()
+local link = readFileAll('Documents/GVD/gvd_link.json')
+check(link and link:find('"lua_bus"', 1, true) and link:find(DRIVE_BUS, 1, true),
+  'gvd_link.json carries luaBusPath() every tick (' .. tostring(link) .. ')')
 local sawCache, sawLoad, sawReload, readyAfterReload = false, false, false, false
 for _, ev in ipairs(bindTrace) do
   if ev[1] == 'actions.onFileChanged' then sawCache = true end
@@ -280,6 +283,8 @@ drainGE()
 local ego = readFileAll(egoPath)
 check(ego and ego:find('"speed_mps":5.500') and ego:find('"applied_seq":' .. seq) and ego:find('"applying":true'),
   'gvd_ego.json carries wheelspeed + applied_seq + applying (' .. tostring(ego) .. ')')
+check(ego and ego:find('"lua_bus":"' .. DRIVE_BUS, 1, true),
+  'gvd_ego.json carries lua_bus from luaBusPath (' .. tostring(ego) .. ')')
 
 -- 4) AEB: brake wins, throttle forced to 0 even if both were set
 clearEvents()

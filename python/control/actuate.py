@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from python.runtime.paths import bus_identity
 from python.runtime.state_io import atomic_write_json, gvd_docs_dir
 
 HEARTBEAT_STALE_S = 0.35
@@ -604,22 +605,31 @@ class CmdJsonActuator:
         return fb.applied_seq >= int(seq) - CMD_ACK_SLACK
 
     def apply(self, cmd: DriveCommand) -> DriveCommand:
+        driving = bool(self.engaged)
+        if not bus_identity().matched:
+            # Fresh lua_bus is required. Do not drive the predicted LOCALAPPDATA guess.
+            if driving:
+                cmd.reason = "bus_mismatch"
+                cmd.steer = 0.0
+                cmd.throttle = 0.0
+                cmd.brake = 1.0
+            driving = False
         payload = {
             "steer": float(max(-1.0, min(1.0, cmd.steer))),
             "throttle": float(max(0.0, min(1.0, cmd.throttle))),
             "brake": float(max(0.0, min(1.0, cmd.brake))),
             "seq": int(cmd.seq),
-            "engaged": bool(self.engaged),
+            "engaged": driving,
             "heartbeat_mtime": time.time(),
             "reason": cmd.reason,
         }
         self.write_ok = atomic_write_json(cmd_path(), payload)
         self.last_seq = int(cmd.seq)
-        cmd.applied = bool(self.engaged and self.write_ok and self.acked(cmd.seq))
+        cmd.applied = bool(driving and self.write_ok and self.acked(cmd.seq))
         if cmd.reason in self._PASSTHROUGH_TAGS or cmd.reason.startswith("beamngpy"):
             if cmd.applied:
                 cmd.reason = "cmd_json_applied"
-            elif self.engaged:
+            elif driving:
                 cmd.reason = "cmd_json_pending"  # written; no fresh Lua ack (mod off / no vehicle)
             else:
                 cmd.reason = "cmd_json_idle"  # not engaged: Lua keeps its hands off the car

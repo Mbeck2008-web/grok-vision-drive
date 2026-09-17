@@ -27,6 +27,16 @@ AEB_BRAKE_TTC = 1.2
 EGO_FRESH_S = 1.0          # gvd_ego.json older than this → treat Lua feedback as gone
 CMD_ACK_SLACK = 5          # Lua acks lag a few seqs (20 Hz apply, 10 Hz echo, 15 Hz loop)
 
+# Tech no-R (research pin): arcade + brake-hold + no throttle auto-selects R.
+# Use realistic_automatic so brake-hold is not reverse throttle. Gear is int only
+# (-1 R, 0 N, 1+ forward) — never gear=-1, never letter "D".
+TECH_SHIFT_MODE = "realistic_automatic"
+TECH_HOLD_BRAKE = 0.99
+# Below this, a full brake is a rest hold (parkingbrake on). Rolling AEB keeps PB off.
+TECH_HOLD_SPEED_MPS = 0.5
+TECH_HOLD_GEAR = 0
+TECH_DRIVE_GEAR = 1
+
 
 @dataclass
 class DriveCommand:
@@ -193,6 +203,97 @@ def stop_command(seq: int = 0, reason: str = "stop") -> DriveCommand:
     return DriveCommand(steer=0.0, throttle=0.0, brake=1.0, seq=seq, applied=False, reason=reason)
 
 
+def _clip01(v: float) -> float:
+    return float(max(0.0, min(1.0, v)))
+
+
+def _clip_steer(v: float) -> float:
+    return float(max(-1.0, min(1.0, v)))
+
+
+def _tech_gear(value: int) -> int:
+    """Clamp to a non-reverse BeamNGpy gear int (0 N, 1+ forward). Never -1 or 'D'."""
+    try:
+        g = int(value)
+    except (TypeError, ValueError):
+        return TECH_HOLD_GEAR
+    if g < 0:
+        return TECH_HOLD_GEAR
+    return g
+
+
+def tech_control_kwargs(
+    steer: float,
+    throttle: float,
+    brake: float,
+    *,
+    release: bool = False,
+    speed_mps: float | None = None,
+) -> dict[str, Any]:
+    """BeamNGpy vehicle.control kwargs that never select reverse.
+
+    Shift mode is realistic_automatic (not arcade). Holds: throttle=0, brake=1,
+    gear=0, ±parkingbrake. Forward motion only with gear>=1 and throttle>0.
+    gear is int only; never -1, never letter D. clutch optional (omitted).
+    """
+    if release:
+        return {
+            "steering": 0.0,
+            "throttle": 0.0,
+            "brake": 0.0,
+            "parkingbrake": 0.0,
+        }
+    steer_v = _clip_steer(steer)
+    throttle_v = _clip01(throttle)
+    brake_v = _clip01(brake)
+    if throttle_v > 1e-6:
+        return {
+            "steering": steer_v,
+            "throttle": throttle_v,
+            "brake": brake_v,
+            "parkingbrake": 0.0,
+            "gear": _tech_gear(TECH_DRIVE_GEAR),
+        }
+    parking = 0.0
+    if brake_v >= TECH_HOLD_BRAKE:
+        moving = speed_mps is not None and float(speed_mps) > TECH_HOLD_SPEED_MPS
+        parking = 0.0 if moving else 1.0
+    return {
+        "steering": steer_v,
+        "throttle": 0.0,
+        "brake": brake_v,
+        "parkingbrake": parking,
+        "gear": _tech_gear(TECH_HOLD_GEAR),
+    }
+
+
+def is_reverse_control(kwargs: dict[str, Any]) -> bool:
+    """True when control kwargs select reverse (gear=-1)."""
+    gear = kwargs.get("gear")
+    try:
+        return gear is not None and int(gear) < 0
+    except (TypeError, ValueError):
+        return False
+
+
+def is_arcade_reverse_hold(kwargs: dict[str, Any]) -> bool:
+    """Backward-compat alias: arcade brake-hold → R, or an explicit reverse gear."""
+    if is_reverse_control(kwargs):
+        return True
+    throttle = float(kwargs.get("throttle") or 0.0)
+    brake = float(kwargs.get("brake") or 0.0)
+    parkingbrake = float(kwargs.get("parkingbrake") or 0.0)
+    gear = kwargs.get("gear")
+    try:
+        if gear is not None and int(gear) == TECH_HOLD_GEAR:
+            return False
+        if gear is not None and int(gear) >= TECH_DRIVE_GEAR:
+            return False
+    except (TypeError, ValueError):
+        pass
+    return throttle <= 1e-6 and brake >= TECH_HOLD_BRAKE and parkingbrake < 0.5
+
+
 def plan_command(
     *,
     path_ego: list[dict[str, float]] | None,
@@ -200,7 +301,12 @@ def plan_command(
     ego_speed_mps: float,
     seq: int,
 ) -> DriveCommand:
-    """Map corridor + speed plan → arcade controls. AEB brake forces throttle=0."""
+    """Map corridor + speed plan → DriveCommand pedals.
+
+    AEB / full stop still return brake=1, throttle=0 (retail JSON + override
+    semantics). Tech remaps that pair in BeamNGPyActuator via tech_control_kwargs
+    (realistic_automatic, hold gear=0 + brake ±parkingbrake; never gear=-1).
+    """
     planner = planner or {}
     aeb = str(planner.get("aeb") or "off")
     target_v = float(planner.get("target_v") or 0.0)
@@ -216,7 +322,8 @@ def plan_command(
     throttle = 0.0
     brake = 0.0
     if aeb == "brake" or (ttc is not None and float(ttc) < AEB_BRAKE_TTC):
-        # Arcade + hold brake can auto-shift reverse — keep throttle=0 (README caveat).
+        # Keep the command semantic (brake=1). Arcade would treat this as reverse
+        # throttle; Tech remaps at control() (realistic_automatic, gear=0 hold).
         throttle = 0.0
         brake = 1.0
     elif aeb == "warn":
@@ -377,8 +484,10 @@ class BeamNGPyActuator:
     """Tech drive: vehicle.control only while engaged.
 
     Disengaged ticks must not slam brake=1 (that is takeover). On the falling
-    edge we send zeros once so the last throttle does not stick, then hands off.
-    Engaged gate holds (preview_blocked, AEB, veto) still apply the stop command.
+    edge we send zeros once (including parkingbrake) so the last throttle does
+    not stick, then hands off. Engaged gate holds (preview_blocked, AEB, veto)
+    still apply the stop command, remapped off reverse: realistic_automatic,
+    hold gear=0 + brake ±parkingbrake, drive gear>=1, never gear=-1.
     """
 
     name = "beamngpy"
@@ -392,21 +501,48 @@ class BeamNGPyActuator:
     def note_engaged(self, engaged: bool) -> None:
         self.engaged = bool(engaged)
 
-    def _control(self, steer: float, throttle: float, brake: float) -> str | None:
+    def _invoke_control(self, kwargs: dict[str, Any]) -> None:
+        """Send control kwargs. Never fall back to arcade brake-hold (no gear, brake=1)."""
+        attempts: list[dict[str, Any]] = [dict(kwargs)]
+        if "gear" in kwargs:
+            attempts.append({k: v for k, v in kwargs.items() if k != "gear"})
+        last_err: Exception | None = None
+        for kw in attempts:
+            if is_reverse_control(kw) or is_arcade_reverse_hold(kw):
+                continue
+            try:
+                self.vehicle.control(**kw)
+                return
+            except TypeError as e:
+                last_err = e
+                continue
+        if last_err is not None:
+            raise last_err
+        raise TypeError("vehicle.control rejected non-reverse Tech kwargs")
+
+    def _control(
+        self, steer: float, throttle: float, brake: float, *, release: bool = False
+    ) -> str | None:
         if self.vehicle is None:
             return "no_vehicle"
         try:
             if not self._shift_set and hasattr(self.vehicle, "set_shift_mode"):
                 try:
-                    self.vehicle.set_shift_mode("arcade")
+                    self.vehicle.set_shift_mode(TECH_SHIFT_MODE)
                     self._shift_set = True
                 except Exception:
                     pass
-            self.vehicle.control(
-                steering=float(max(-1.0, min(1.0, steer))),
-                throttle=float(max(0.0, min(1.0, throttle))),
-                brake=float(max(0.0, min(1.0, brake))),
+            speed_mps = None
+            if (
+                not release
+                and float(throttle) <= 1e-6
+                and float(brake) >= TECH_HOLD_BRAKE
+            ):
+                speed_mps = read_electrics_inputs(self.vehicle).speed_mps
+            kwargs = tech_control_kwargs(
+                steer, throttle, brake, release=release, speed_mps=speed_mps
             )
+            self._invoke_control(kwargs)
             return None
         except Exception as e:
             return f"beamngpy_err:{type(e).__name__}"
@@ -430,7 +566,7 @@ class BeamNGPyActuator:
         cmd = stop_command(seq=seq, reason=reason)
         if not self.engaged:
             if self._latched:
-                self._control(0.0, 0.0, 0.0)
+                self._control(0.0, 0.0, 0.0, release=True)
                 self._latched = False
             cmd.applied = False
             return cmd

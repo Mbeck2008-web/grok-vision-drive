@@ -421,6 +421,8 @@ class BeamNGPyBackend:
             self._logged = True
             return
 
+        # Cameras + vehicle sensors attach here, independent of Alt+G / engaged.
+        # Vision LINK and cam_health ok×8 must work with engaged=false.
         try:
             self.session.attach_vehicle_sensors()
         except Exception as e:

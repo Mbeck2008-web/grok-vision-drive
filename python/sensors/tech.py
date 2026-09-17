@@ -98,6 +98,30 @@ def heading_from_world_dir(direction: tuple[float, float, float] | None) -> floa
     return (math.degrees(math.atan2(dx, dy)) + 360.0) % 360.0
 
 
+def nav_heading_from_sources(
+    vdata: Any = None,
+    ego_fb: Any = None,
+) -> float | None:
+    """Heading for extras-GPS nav fill. Safe when ego_fb is missing (Tech attach).
+
+    Wait for vehicle pose / GPS heading first; Lua ego_fb.dir is retail-only and
+    stays None after beamngpy Camera attach. Never require engage.
+    """
+    if vdata is not None:
+        heading = getattr(vdata, "gps_heading_deg", None)
+        if heading is not None:
+            try:
+                return float(heading)
+            except (TypeError, ValueError):
+                pass
+        heading = heading_from_world_dir(getattr(vdata, "dir", None))
+        if heading is not None:
+            return heading
+    if ego_fb is not None:
+        return heading_from_world_dir(getattr(ego_fb, "dir", None))
+    return None
+
+
 def _flatten_gps_samples(raw: Any) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     if raw is None:

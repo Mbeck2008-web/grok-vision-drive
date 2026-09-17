@@ -145,6 +145,10 @@ def test_ui_keys_clicks() -> None:
     assert ui.handle_key(ord("m"))
     assert ui.nerd_tab == "model" and ui.show_nerd
     assert ui.handle_key(ord("]"))
+    assert ui.nerd_tab == "cams"
+    assert ui.handle_key(ord("a"))
+    assert ui.nerd_tab == "cams" and ui.show_nerd
+    assert ui.handle_key(ord("]"))
     assert ui.nerd_tab == "keys"
     ui.show_drive_tab()
     n = len(CONTROL_ROWS)
@@ -203,6 +207,14 @@ def test_ui_keys_clicks() -> None:
     before_det = ui.debug.detector_id
     ui.handle_click(STAGE_W + (x0 + x1) // 2, (y0 + y1) // 2, stage_w=STAGE_W)
     assert ui.debug.detector_id != before_det
+
+    render_stage(st, ui=ui)
+    cams = next(h for h in ui.nerd_hits if h.get("kind") == "tab" and h.get("id") == "cams")
+    x0, y0, x1, y1 = cams["rect"]
+    assert ui.handle_click(STAGE_W + (x0 + x1) // 2, (y0 + y1) // 2, stage_w=STAGE_W)
+    assert ui.nerd_tab == "cams"
+    render_stage(st, ui=ui)
+    assert any(h.get("kind") == "cams_grid" for h in ui.nerd_hits)
 
 
 def test_overlay_pixels() -> None:
@@ -276,11 +288,15 @@ def main() -> None:
     assert any(r["id"] == "force_engage" for r in DEBUG_ROWS)
     assert viz_row_at(0)["id"] == "viz_dense"
     assert model_row_at(0)["id"] == "detector_id"
+    from python.runtime.debug_opts import NERD_TAB_IDS
     from python.viz.nerd import FS_TAB, _text_size
 
+    assert NERD_TAB_IDS == ("live", "drive", "viz", "model", "cams", "keys")
     tab_x = 12
-    for label in ("LIVE", "DRIVE", "VIZ", "MODEL", "KEYS"):
-        tab_x += _text_size(label, FS_TAB)[0] + 26
+    for label in ("LIVE", "DRIVE", "VIZ", "MODEL", "CAMS", "KEYS"):
+        tw = _text_size(label, FS_TAB)[0]
+        tab_x += tw + 26
+        assert tw + 18 < NERD_WIDTH - 16, label
     assert tab_x <= NERD_WIDTH + 8, tab_x
     assert FS_BODY >= 0.65, "nerd body type must stay large enough to read on a second screen"
     assert NERD_WIDTH >= 520

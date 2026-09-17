@@ -178,7 +178,7 @@ def main() -> None:
     drive_frame = render_stage(st, ui=nerd)
     assert drive_frame.shape == (800, 1280 + nerd.nerd_width, 3)
     tabs = {h.get("id") for h in nerd.nerd_hits if h.get("kind") == "tab"}
-    assert tabs == {"live", "drive", "viz", "model", "keys"}
+    assert tabs == {"live", "drive", "viz", "model", "cams", "keys"}
     nerd.show_model_tab()
     model_frame = render_stage(st, ui=nerd)
     assert model_frame.shape == drive_frame.shape
@@ -199,6 +199,101 @@ def main() -> None:
     nerd.debug.viz_cost = False
     sparse = render_stage(st, ui=nerd)
     assert not np.array_equal(dense, sparse)
+
+    from python.sensors.cameras import CAM_IDS
+    from python.viz.debug_draw import cam_tile_rects, clamp_front_overexpose, draw_cam_tiles
+    from python.viz.stage import CAMS_STAGE_BOX, CAMS_STAGE_GRID
+
+    white = np.full((32, 48, 3), 255, dtype=np.uint8)
+    clamped = clamp_front_overexpose(white, "main")
+    assert clamped is not None and float(clamped.mean()) < 180, "front overexpose clamp should darken blown-white"
+    assert float(clamp_front_overexpose(white, "rear").mean()) == 255, "rear must not be clamped"
+    dim = np.full((32, 48, 3), 80, dtype=np.uint8)
+    assert np.array_equal(clamp_front_overexpose(dim, "main"), dim)
+
+    colors = {}
+    frames = {}
+    for i, cid in enumerate(CAM_IDS):
+        col = (20 + i * 12, 40 + i * 16, 70 + i * 8)
+        colors[cid] = col
+        frames[cid] = np.full((36, 48, 3), col, dtype=np.uint8)
+    health = {cid: "ok" for cid in CAM_IDS}
+    health["rear"] = "missing"
+    del frames["rear"]
+
+    cams_ui = VizUI()
+    cams_ui.show_cams_tab()
+    cams_ui.show_nerd = False
+    cams_st = dict(st)
+    cams_st["loop_hz"] = 12.0
+    cams_st["cam_health"] = health
+    cams_st["engaged"] = False
+    wall = render_stage(cams_st, ui=cams_ui, cam_frames=frames)
+    assert wall.shape == (800, 1280, 3)
+    rects = cam_tile_rects(*CAMS_STAGE_BOX, *CAMS_STAGE_GRID)
+    assert len(rects) >= 8
+    for cid, (x, y, tw, th) in zip(CAM_IDS, rects):
+        sx, sy = x + int(tw * 0.78), y + th // 2
+        pix = wall[sy, sx]
+        if cid == "rear":
+            assert int(pix.mean()) < 70, f"{cid} missing tile should stay dark, got {pix}"
+        else:
+            assert np.allclose(pix, colors[cid], atol=8), f"{cid} tile {pix} != {colors[cid]}"
+
+    # retail / stub: only main (or cam_main) filled; others labelled missing
+    retail_frames = {"cam_main": np.full((36, 48, 3), (30, 200, 30), dtype=np.uint8)}
+    retail_health = {cid: "missing" for cid in CAM_IDS}
+    retail_health["main"] = "ok"
+    retail = render_stage(cams_st, ui=cams_ui, cam_frames=retail_frames)
+    mx, my, mw, mh = rects[list(CAM_IDS).index("main")]
+    nx, ny, nw, nh = rects[list(CAM_IDS).index("narrow")]
+    assert int(retail[my + mh // 2, mx + int(mw * 0.78)][1]) > 120
+    assert int(retail[ny + nh // 2, nx + int(nw * 0.78)].mean()) < 70
+
+    # under 8 Hz: labelled drop, no crash, no fake fill from the colored frames
+    slow = dict(cams_st)
+    slow["loop_hz"] = 6.0
+    dropped = render_stage(slow, ui=cams_ui, cam_frames=frames)
+    assert dropped.shape == wall.shape
+    dx, dy, dw, dh = rects[0]
+    assert int(dropped[dy + dh // 2, dx + int(dw * 0.78)].mean()) < 70, "dropped blit must not copy live pixels"
+
+    # nerd CAMS tab still concatenates and reports 8 slots
+    nerd_cams = VizUI()
+    nerd_cams.show_nerd = True
+    nerd_cams.show_cams_tab()
+    nerd_wall = render_stage(cams_st, ui=nerd_cams, cam_frames=frames)
+    assert nerd_wall.shape == (800, 1280 + nerd_cams.nerd_width, 3)
+    tabs = {h.get("id") for h in nerd_cams.nerd_hits if h.get("kind") == "tab"}
+    assert "cams" in tabs
+    grid = next(h for h in nerd_cams.nerd_hits if h.get("kind") == "cams_grid")
+    assert int(grid.get("n") or 0) == 8
+
+    # cabin/default stage is unchanged when CAMS is not selected
+    cabin_ui = VizUI()
+    cabin_ui.layers = {0}
+    cabin_ui.show_nerd = False
+    cabin = render_stage(st, ui=cabin_ui)
+    assert cabin.shape == (800, 1280, 3)
+    assert int(cabin.mean()) < 80
+
+    # PIP front clamp: blown-white main preview is not left at 255
+    pip_ui = VizUI()
+    pip_ui.show_nerd = False
+    pip_ui.layers = set()
+    pip_ui.debug.viz_pip = True
+    pip_st = dict(st)
+    pip_st["loop_hz"] = 12.0
+    pip_frame = render_stage(pip_st, ui=pip_ui, main_frame=np.full((180, 320, 3), 255, dtype=np.uint8))
+    pip = pip_frame[12:192, 12:332]
+    assert float(pip.mean()) < 200, "PIP should not stay blown-white"
+
+    scratch = np.full((200, 800, 3), 10, dtype=np.uint8)
+    n = draw_cam_tiles(
+        scratch, None, {cid: "missing" for cid in CAM_IDS},
+        x0=4, y0=4, width=790, height=190, cols=4, rows=2, dropped=False,
+    )
+    assert n == 8
 
     print("test_gvd_viz_stage: OK")
 

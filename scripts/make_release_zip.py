@@ -6,7 +6,8 @@ Windows-friendly: double-click ``scripts\\make_release_zip.bat`` or run
 
 Ships the **retail** slice a player double-clicks:
   install.bat / uninstall.bat / play_gvd.bat, beamng_mod/, python/ (runtime),
-  config/, requirements.txt + requirements-retail.txt, LICENSE, README.md, docs/*.md, VERSION.txt.
+  config/, requirements.txt + requirements-retail.txt, LICENSE, README.md,
+  docs/*.md, docs/media/ (synthetic README shots), VERSION.txt.
 
 Never ships: data/clips/, extra weights (*.pt, e2e ONNX, random blobs),
 .git, __pycache__, venvs, scripts/ (tests + this tool), dist/.
@@ -44,6 +45,8 @@ INCLUDE_GLOBS = (
     "requirements.txt",
     "requirements-retail.txt",
     "docs/*.md",
+    "docs/media/*.md",
+    "docs/media/*.png",
     "models/.gitkeep",
     "models/NOTICE.txt",
     "models/yolov8n.onnx",
@@ -69,6 +72,8 @@ MUST_HAVE = (
     "config/hardware.yaml",
     "VERSION.txt",
     "models/yolov8n.onnx",
+    "docs/media/gvd_cabin_synthetic.png",
+    "docs/media/gvd_ingame_ui_synthetic.png",
 )
 
 # Directory names skipped anywhere in the tree (tooling/cache junk only —

@@ -107,6 +107,9 @@ def check_release_zip() -> None:
             # Mod entry point + UI icon survive; tests do not.
             assert "beamng_mod/scripts/gvd/modScript.lua" in rels
             assert "beamng_mod/ui/modules/apps/GVD/app.png" in rels
+            assert "docs/media/gvd_cabin_synthetic.png" in rels
+            assert "docs/media/gvd_ingame_ui_synthetic.png" in rels
+            assert "docs/media/SOURCE.md" in rels
             assert "models/.gitkeep" in rels
             assert "models/yolov8n.onnx" in rels
             assert not any(r.startswith("scripts/test_") for r in rels)
@@ -630,6 +633,10 @@ def check_player_docs() -> None:
     # Retail drives via the cmd JSON bus; the old "cannot drive" wording must be gone everywhere players look.
     assert "gvd_cmd.json" in readme and "gvd_ego.json" in readme
     assert "play_gvd_tech.bat" in readme and "tech.yaml" in readme
+    assert "docs/media/gvd_cabin_synthetic.png" in readme
+    assert "docs/media/gvd_ingame_ui_synthetic.png" in readme
+    assert "## Screenshots" in readme
+    assert readme.lower().count("synthetic") >= 4
     assert "beamngpy if importable" not in readme.lower(), "auto backend must not pick Tech just because beamngpy is installed"
     assert "does **not** pick Tech just because beamngpy is installed" in readme
     for f in (ROOT / "README.md", ROOT / "play_gvd.bat", ROOT / "play_gvd_tech.bat", ROOT / "scripts" / "make_release_zip.py",

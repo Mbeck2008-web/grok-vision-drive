@@ -15,6 +15,7 @@ angular.module('beamng.apps')
       var ui = {
         engaged: false, applying: false, link: 'none', hbAge: null, disengageReason: null,
         showPath: true, showGhosts: false, showScene: false,
+        pythonBus: null, luaBus: null, product: null,
         policy: null, policyReq: null, e2eOk: null, vetoReason: null, e2eBackend: null,
         hz: null, camHz: null, ttc: null, aeb: null, n: null, speed: null,
         targetV: null, brakeCmd: null, steerDeg: null,
@@ -87,6 +88,7 @@ angular.module('beamng.apps')
       scope.linkLabel = function () {
         if (ui.link === 'live') return 'link live';
         if (ui.link === 'stale') return 'link stale';
+        if (ui.link === 'mismatch') return 'link mismatch';
         return 'no link';
       };
       function driving() {
@@ -99,22 +101,26 @@ angular.module('beamng.apps')
         return {
           'is-engaged': ui.engaged && ui.link === 'live',
           'is-drive': driving(),
-          'is-hold': ui.engaged && ui.link !== 'live'
+          'is-hold': ui.engaged && ui.link !== 'live',
+          'is-mismatch': ui.link === 'mismatch'
         };
       };
       scope.stateClass = function () {
         return {
           'is-on': ui.engaged && ui.link === 'live',
           'is-drive': driving(),
-          'is-hold': ui.engaged && ui.link !== 'live'
+          'is-hold': ui.engaged && ui.link !== 'live',
+          'is-mismatch': ui.link === 'mismatch'
         };
       };
       scope.stateLabel = function () {
+        if (ui.link === 'mismatch') return 'MISMATCH';
         if (!ui.engaged) return 'DISENGAGED';
         if (ui.link !== 'live') return 'HOLD';
         return driving() ? 'DRIVE' : 'ENGAGED';
       };
       scope.stateReason = function () {
+        if (ui.link === 'mismatch') return 'bus MISMATCH: python_bus and lua_bus differ - refuse';
         if (ui.engaged && ui.link === 'none') return 'dead-man: no telemetry, actuators off';
         if (ui.engaged && ui.link === 'stale') return 'dead-man: heartbeat stale, actuators off';
         if (ui.engaged) {
@@ -131,6 +137,7 @@ angular.module('beamng.apps')
       };
 
       scope.pathLine = function () {
+        if (ui.link === 'mismatch') return 'refuse: not the same GVD folder';
         if (ui.link === 'none') return 'waiting for gvd_state.json';
         var low = ui.pathConf !== null && ui.pathConf < 0.45;
         var bits = ['conf ' + (ui.pathConf === null ? '--' : Number(ui.pathConf).toFixed(2)) + (low ? ' low' : '')];
@@ -195,9 +202,17 @@ angular.module('beamng.apps')
         return dash(ui.encodeBackend) + ' - last ' + dash(ui.clipTrigger);
       };
       scope.beatLine = function () {
+        if (ui.link === 'mismatch') return 'MISMATCH - python_bus vs lua_bus';
         if (ui.link === 'none') return 'no gvd_state.json yet';
         var age = (ui.hbAge === null || ui.hbAge === undefined) ? '--' : Number(ui.hbAge).toFixed(2);
         return ui.link + ' - ' + age + ' s since last beat';
+      };
+
+      scope.busLine = function () {
+        var prod = ui.product || '--';
+        var luaB = (ui.luaBus === null || ui.luaBus === undefined || ui.luaBus === '') ? '--' : ui.luaBus;
+        var py = (ui.pythonBus === null || ui.pythonBus === undefined || ui.pythonBus === '') ? '--' : ui.pythonBus;
+        return prod + '  lua_bus=' + luaB + '  python_bus=' + py;
       };
 
       // Retail Direct Drive echo already on gvdUi: applied electrics + player lastInputs.

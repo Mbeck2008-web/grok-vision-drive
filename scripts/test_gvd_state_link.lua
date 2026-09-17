@@ -49,6 +49,9 @@ FS = {
     vfsBus[busRel(path)] = data
     return true
   end,
+  getUserPath = function()
+    return 'C:/Users/Name/AppData/Local/BeamNG/BeamNG.drive/current'
+  end,
 }
 
 -- Absolute disk poison: if readText still io.opens the sandbox, lastGood would take this.
@@ -92,7 +95,7 @@ guihooks = {
 be = { getPlayerVehicle = function() return nil end }
 
 writeBus('gvd_state.json', string.format(
-  '{"schema":1,"policy":"modular","loop_hz":17,"detector":"link-probe","heartbeat_mtime":%d,"heartbeat_unix":%d}',
+  '{"schema":1,"policy":"modular","loop_hz":17,"detector":"link-probe","heartbeat_mtime":%d,"heartbeat_unix":%d,"python_bus":"C:/Users/Name/AppData/Local/BeamNG/BeamNG.drive/current/Documents/GVD","lua_bus":"C:/Users/Name/AppData/Local/BeamNG/BeamNG.drive/current/Documents/GVD","product":"drive","bus_link":"ok","cmd_seq":4}',
   os.time(), os.time()))
 
 local M = dofile('beamng_mod/lua/ge/extensions/gvd/main.lua')
@@ -116,6 +119,12 @@ check(#uiPushes > 0, 'gvdUi pushed on load with lastGood')
 local p = uiPushes[#uiPushes]
 check(p.link ~= 'none', 'CEF link is not none (was NO LINK / supervisor not running)')
 check(p.link == 'live' or p.link == 'stale', 'CEF link is lastGood HB live/stale')
+check(p.link ~= 'mismatch', 'matching python_bus/lua_bus is not MISMATCH')
+check(p.luaBus == 'C:/Users/Name/AppData/Local/BeamNG/BeamNG.drive/current/Documents/GVD',
+  'gvdUi luaBus is resolved Documents/GVD')
+check(p.pythonBus == 'C:/Users/Name/AppData/Local/BeamNG/BeamNG.drive/current/Documents/GVD',
+  'gvdUi pythonBus comes from gvd_state.json')
+check(p.product == 'drive', 'gvdUi product=drive from userfolder')
 check(tonumber(p.hz) == 17, 'gvdUi hz comes from VFS Documents/GVD, not absolute io.open poison 99')
 check(p.detector == 'link-probe', 'gvdUi detector comes from VFS, not abs io.open')
 check(p.policy == 'modular', 'gvdUi policy from lastGood')
@@ -129,7 +138,7 @@ check(tonumber(uiPushes[#uiPushes].hz) == 17, 'pushUiState still VFS lastGood, n
 
 -- reread via VFS picks up fresh bytes. Absolute disk poison must not win.
 writeBus('gvd_state.json', string.format(
-  '{"schema":1,"policy":"modular","loop_hz":18,"detector":"link-probe-2","heartbeat_mtime":%d,"heartbeat_unix":%d}',
+  '{"schema":1,"policy":"modular","loop_hz":18,"detector":"link-probe-2","heartbeat_mtime":%d,"heartbeat_unix":%d,"python_bus":"C:/Users/Name/AppData/Local/BeamNG/BeamNG.drive/current/Documents/GVD","product":"drive","cmd_seq":5}',
   os.time(), os.time()))
 M.pushUiState()
 check(tonumber(uiPushes[#uiPushes].hz) == 18, 'reread via VFS picks up fresh Documents/GVD bytes')
@@ -144,5 +153,17 @@ M.pushUiState()
 check(tonumber(uiPushes[#uiPushes].hz) == hzBefore,
   'empty VFS does not fall back to absolute io.open (lastGood stays 18)')
 check(busReadOpens == 0, 'empty VFS still does not io.open abs Tech sandbox')
+
+-- Drive Lua + Tech python_bus is MISMATCH (do not guess).
+writeBus('gvd_state.json', string.format(
+  '{"schema":1,"policy":"modular","loop_hz":19,"detector":"link-probe-3","heartbeat_mtime":%d,"heartbeat_unix":%d,"python_bus":"C:/Users/Name/AppData/Local/BeamNG/BeamNG.tech/current/Documents/GVD","product":"tech","cmd_seq":6}',
+  os.time(), os.time()))
+M.pushUiState()
+check(uiPushes[#uiPushes].link == 'mismatch', 'Tech python_bus vs Drive lua_bus is link=MISMATCH')
+M.onUpdate(1.1)
+check(saw('link=MISMATCH'), '1 Hz identity prints link=MISMATCH')
+check(saw('python_bus='), 'identity prints python_bus')
+check(saw('lua_bus='), 'identity prints lua_bus')
+check(saw('product='), 'identity prints product')
 
 print('test_gvd_state_link: OK')

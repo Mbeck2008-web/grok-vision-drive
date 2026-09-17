@@ -37,6 +37,7 @@ def main() -> None:
     # "gvd-app" looks up gvd-appDirective and the tile stays blank after app.js loads.
     assert app_json["name"] == "GVD", app_json["name"]
     assert app_json["directive"] == "gvdApp", app_json["directive"]
+    assert app_json["directive"] != "gvd-app", "kebab gvd-app leaves a blank Apps tile"
     assert app_json["domElement"] == "<gvd-app></gvd-app>", app_json["domElement"]
     css = app_json["css"]
     assert isinstance(css, dict), "app.json css must be an object (not a JSON string)"
@@ -241,6 +242,22 @@ def main() -> None:
     assert "pushUiState" in app_js
     assert "supervisor not running" in app_js
     assert "ui.link === 'none'" in app_js, "CEF supervisor-not-running is link none (lastGood missing)"
+    assert "ui.link === 'mismatch'" in app_js
+    assert "busLine" in app_js and "busLine()" in app_html
+    assert "pythonBus" in app_js and "luaBus" in app_js and "product" in app_js
+    assert "pythonBus =" in lua or "pythonBus=" in lua
+    assert "luaBus =" in lua or "luaBus=" in lua
+    install = (ROOT / "install.bat").read_text(encoding="utf-8", errors="ignore")
+    assert "gvd-app" in install and "gvdApp" in install
+    assert "unpacked\\gvd" in install or "unpacked\\gvd" in install.replace("/", "\\")
+    assert "blank" in install.lower()
+    sync_fn = lua_fn("syncEngageFromSupervisor")
+    sync_exec = re.sub(r"--[^\n]*", "", sync_fn)
+    assert "f.engaged ~= false" in sync_exec, "Lua must only adopt supervisor OFF"
+    assert "engaged = true" not in sync_exec, "writing gvd_engage.json true must not latch engage"
+    apply_fn = lua_fn("applyCmdJson")
+    apply_exec = re.sub(r"--[^\n]*", "", apply_fn)
+    assert "busMismatch" in apply_exec, "applyCmdJson must refuse on folder mismatch"
     assert "lastGood = st" in lua
     assert "gvd_state read ok path=" in lua and "read fail path=" in lua and "json fail len=" in lua
     poke = re.search(r"function M\.pushUiState\(\).*?\nend\n", lua, re.S)

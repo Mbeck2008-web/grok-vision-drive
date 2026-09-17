@@ -583,6 +583,7 @@ def check_gvd_docs_dir() -> None:
     docs_dir.check_source_contracts(lua)
     docs_dir.check_python_mirror()
     docs_dir.check_python_known_folder()
+    docs_dir.check_writer_lua_folder_agreement()
 
 
 def _py_string_literals(path: Path) -> list[str]:

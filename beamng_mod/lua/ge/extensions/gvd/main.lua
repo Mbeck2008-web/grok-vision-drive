@@ -93,9 +93,11 @@ end
 -- Those folders are the same physical tree the running userfolder maps as Documents/GVD.
 -- GVD_DOCS_DIR is the Python writer override; an absolute value is not a Lua read path.
 -- A relative GVD_DOCS_DIR still wins. Never a bare gvd_*.json under userfolder current\.
--- CEF link is gvd_state heartbeat only (see linkState); live Apps LINK is UNPROVEN.
+-- Identity (1 Hz): python_bus vs lua_bus (resolved Documents/GVD). Different folder → link=MISMATCH, refuse actuation.
+-- Live Apps LINK / Alt+G / dual-monitor remain UNPROVEN.
 local gvdDocsResolved = nil
 local gvdDocsLogged = false
+local identAcc = 0
 
 local function _isAbsDiskPath(path)
   local p = tostring(path or '')
@@ -141,30 +143,50 @@ local function gvdFile(name)
   return gvdDocsDir() .. '/' .. name
 end
 
-local function userEngagePath()
-  return gvdFile('gvd_engage.json')
+local function luaBusPath()
+  -- Identity only. Never a bus read/write path. Resolves Documents/GVD via userfolder.
+  local up
+  if FS and FS.getUserPath then
+    local ok, p = pcall(function() return FS:getUserPath() end)
+    if ok and p and tostring(p) ~= '' then
+      up = tostring(p):gsub('\\', '/'):gsub('/$', '')
+    end
+  end
+  if up and up ~= '' then
+    return up .. '/Documents/GVD'
+  end
+  return 'Documents/GVD'
 end
 
-local function userCmdPath()
-  return gvdFile('gvd_cmd.json')
+local function gvdProduct()
+  local up
+  if FS and FS.getUserPath then
+    local ok, p = pcall(function() return FS:getUserPath() end)
+    if ok and p and tostring(p) ~= '' then
+      up = tostring(p):gsub('\\', '/'):gsub('/$', '')
+    end
+  end
+  if not up then return nil end
+  local s = up:lower()
+  if s:find('beamng.tech', 1, true) then return 'tech' end
+  if s:find('beamng.drive', 1, true) then return 'drive' end
+  return nil
 end
 
-local function userUiPrefsPath()
-  return gvdFile('gvd_ui_prefs.json')
+local function busesSame(pythonBus, luaBus)
+  local function norm(path)
+    local p = tostring(path or ''):gsub('\\', '/'):gsub('/*$', '')
+    while p:find('//', 1, true) do
+      p = p:gsub('//', '/')
+    end
+    return p:lower()
+  end
+  local a, b = norm(pythonBus), norm(luaBus)
+  if a == '' or b == '' then return false end
+  if a:find('onedrive', 1, true) then return false end
+  if b:find('onedrive', 1, true) then return false end
+  return a == b
 end
-
-local function userStatePath()
-  return gvdFile('gvd_state.json')
-end
-
-local function userEgoPath()
-  return gvdFile('gvd_ego.json')
-end
-
-local function userScanPath()
-  return gvdFile('gvd_scan.json')
-end
-
 
 local function writeText(path, data)
   if not path then return false end
@@ -177,11 +199,7 @@ local function writeText(path, data)
     local ok = pcall(function() FS:writeFile(path, data) end)
     if ok then return true end
   end
-  local f = io.open(path, 'w')
-  if not f then return false end
-  f:write(data)
-  f:close()
-  return true
+  return false
 end
 
 local lastEngageWriteUnix = 0
@@ -192,7 +210,7 @@ local function writeEngageFile(reason)
   luaDisengageReason = (not engaged) and reason or nil
   local payload = string.format('{"engaged":%s,"mtime":%d,"disengage_reason":"%s"}',
     engaged and 'true' or 'false', lastEngageWriteUnix, tostring(reason or 'none'))
-  writeText(userEngagePath(), payload)
+  writeText(gvdFile('gvd_engage.json'), payload)
 end
 
 -- Bus reads: relative Documents/GVD via VFS readFile / FS:readFile only.
@@ -295,7 +313,7 @@ local function writeUiPrefs()
   if policyReq then parts[#parts + 1] = string.format('"policy":"%s"', policyReq) end
   if vizScreenReq then parts[#parts + 1] = string.format('"viz_screen":"%s"', vizScreenReq) end
   parts[#parts + 1] = string.format('"mtime":%d', os.time())
-  writeText(userUiPrefsPath(), '{' .. table.concat(parts, ',') .. '}')
+  writeText(gvdFile('gvd_ui_prefs.json'), '{' .. table.concat(parts, ',') .. '}')
   -- Mirror into gvd_state so OpenCV / Python follow the same toggles
   local raw = readText(STATE_REL)
   local st = raw and decodeJson(raw) or nil
@@ -304,7 +322,7 @@ local function writeUiPrefs()
     st.show_agent_ghosts = showAgentGhosts
     local encoded = encodeUiStateMirror(st)
     if encoded then
-      writeText(userStatePath(), encoded)
+      writeText(gvdFile('gvd_state.json'), encoded)
     end
   end
 end
@@ -812,8 +830,17 @@ local function uiCams(st)
   return ok, total, list
 end
 
+local function busMismatch()
+  -- No lastGood / no python_bus → cannot prove the same folder. Do not guess.
+  if not lastGood then return true end
+  local py = lastGood.python_bus
+  if py == nil or tostring(py) == '' then return true end
+  return not busesSame(py, luaBusPath())
+end
+
 local function linkState()
   if not lastGood then return 'none' end
+  if busMismatch() then return 'mismatch' end
   local age = hbAgeS()
   if age == nil then return 'live' end
   if age <= hbLimitS() then return 'live' end
@@ -850,7 +877,10 @@ local function uiPayload()
     -- engage / safety
     engaged = engaged,
     applying = applying,                           -- M6: our input.event stream holds the player vehicle
-    link = link,                                   -- live | stale | none
+    link = link,                                   -- live | stale | none | mismatch
+    pythonBus = lastGood and lastGood.python_bus or nil,
+    luaBus = luaBusPath(),
+    product = gvdProduct() or (lastGood and lastGood.product) or nil,
     hbAge = r2(hbAgeS()),
     disengageReason = luaDisengageReason or (st and tostring(st.disengage_reason or 'none')) or nil,
     -- in-world viz toggles
@@ -1304,7 +1334,7 @@ local function writeEgoFile()
     posJson, dirJson,
     np > 0 and 'true' or 'false',
     tonumber(egoFb.pSteer) or 0, tonumber(egoFb.pThr) or 0, tonumber(egoFb.pBrk) or 0)
-  writeText(userEgoPath(), payload)
+  writeText(gvdFile('gvd_ego.json'), payload)
 end
 
 -- Called from vehicle Lua (VE_FEEDBACK) via obj:queueGameEngineLua.
@@ -1413,7 +1443,7 @@ local function pollLidarLua(dt)
       pts[#pts + 1] = string.format('{"x":%.2f,"y":%.2f,"z":%.2f}', hx, hy, hz)
     end
   end
-  writeText(userScanPath(), '{"n":' .. #pts .. ',"note":"coarse retail sweep","points":[' .. table.concat(pts, ',') .. ']}')
+  writeText(gvdFile('gvd_scan.json'), '{"n":' .. #pts .. ',"note":"coarse retail sweep","points":[' .. table.concat(pts, ',') .. ']}')
 end
 
 local function applyCmdJson(dt)
@@ -1422,6 +1452,10 @@ local function applyCmdJson(dt)
   local step = cmdAcc
   cmdAcc = 0
   ovrClock = ovrClock + step
+  if busMismatch() then
+    releaseInputs('bus mismatch')
+    return
+  end
   if not engaged then
     releaseInputs('disengaged')
     cmdStaleAcc = 0
@@ -1805,11 +1839,36 @@ local function tickPush(dt)
   pushUi()
 end
 
+local function tickBusIdentity(dt)
+  identAcc = identAcc + (dt or 0)
+  if identAcc < 1.0 then return end
+  identAcc = 0
+  local py = (lastGood and lastGood.python_bus) or '--'
+  local luaB = luaBusPath()
+  local product = gvdProduct() or (lastGood and lastGood.product) or 'unknown'
+  local mt = '--'
+  if lastGood then
+    mt = lastGood.heartbeat_mtime or lastGood.state_mtime or '--'
+  end
+  local seq = lastGood and tonumber(lastGood.cmd_seq) or lastCmdSeq
+  local link = linkState()
+  local line = string.format(
+    '[GVD] python_bus=%s lua_bus=%s product=%s state_mtime=%s engage=%s seq=%s',
+    tostring(py), luaB, tostring(product), tostring(mt),
+    engaged and 'true' or 'false', tostring(seq or -1))
+  if link == 'mismatch' then
+    line = line .. ' link=MISMATCH'
+  end
+  log('I', 'GVD', line)
+  print(line)
+end
+
 function M.onPreRender(dt)
   preRenderSeen = true
   pollState(dt)
   M.drawPath(dt)
   tickPush(dt)
+  tickBusIdentity(dt)
 end
 
 function M.onDebugDraw(_focuspos)
@@ -1824,7 +1883,10 @@ function M.onUpdate(dt)
   pollEgo(dt)
   pollLidarLua(dt)
   -- Builds that never call onPreRender would otherwise leave the app with no data.
-  if not preRenderSeen then tickPush(dt) end
+  if not preRenderSeen then
+    tickPush(dt)
+    tickBusIdentity(dt)
+  end
   retryEngageBindings(dt)
 end
 
@@ -1842,12 +1904,14 @@ function M.onExtensionLoaded()
   -- loadActions, then core_input_bindings.reloadBindings. bindReady is after that reload
   -- (or delayed forceRefresh) plus dump-shape listing of gvd_toggle_engage.
   refreshEngageBindings('onExtensionLoaded')
+  identAcc = 1.0
+  tickBusIdentity(0)
   log('I', 'GVD', '[GVD] loaded. Alt+G engage (Ctrl+Alt+G fallback). Path: GVD PATH. Strip: mode/Hz/TTC/N. UI app: GVD.')
   log('I', 'GVD', string.format(
     '[GVD] player override on the steer residual: enter %.3f exit %.3f hold %.0fms spike %.2f lpf %.0fms (force-feedback noise must not disengage), pedals tight at brake %.2f / throttle %.2f',
     OVR.steer_enter, OVR.steer_exit, OVR.steer_hold_ms, OVR.steer_spike, OVR.lpf_tau_ms,
     OVR.brake_enter, OVR.throttle_enter))
-  print('[GVD] loaded. Alt+G engage (Ctrl+Alt+G fallback). Writes ' .. userEngagePath()
+  print('[GVD] loaded. Alt+G engage (Ctrl+Alt+G fallback). Writes ' .. gvdFile('gvd_engage.json')
     .. '; drives the player vehicle from gvd_cmd.json as a secondary Direct Drive wheel+pedals (retail). BeamNGpy direct control on Tech.')
 end
 

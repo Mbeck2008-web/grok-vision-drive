@@ -1074,14 +1074,27 @@ def render_stage(
     return img
 
 
-def smoke(ui: VizUI | None = None, use_perception: bool = False) -> "Path":
+def smoke(
+    ui: VizUI | None = None,
+    use_perception: bool = False,
+    *,
+    engaged: bool = True,
+    out: "Path | None" = None,
+    write_bus: bool = True,
+) -> "Path":
+    """Render the product smoke cabin.
+
+    Default path is ``docs/gvd_viz_smoke.png`` (``--smoke``). README media
+    calls this with ``engaged=False`` and a ``docs/media/`` dest so the
+    parked cabin is synthetic and un-engaged (no ice underglow).
+    """
     from pathlib import Path
 
     from python.runtime.state_io import default_state, write_state
 
     ui = ui or VizUI()
     st = default_state(
-        engaged=True,
+        engaged=bool(engaged),
         loop_hz=12.0,
         camera_hz=10.0,
         path_conf=0.9,
@@ -1178,12 +1191,13 @@ def smoke(ui: VizUI | None = None, use_perception: bool = False) -> "Path":
             (st.get("missing_state_keys") or []) + ["live signs (smoke uses synthetic furniture)"]
         ))
 
-    write_state(st)
+    if write_bus:
+        write_state(st)
     # Product smoke: clean cabin with the full lexicon (no nerd chrome)
     ui.layers = {0}
     ui.show_nerd = False
     frame = render_stage(st, ui=ui)
-    out = Path("docs/gvd_viz_smoke.png")
-    out.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(out), frame)
-    return out
+    dest = Path(out) if out is not None else Path("docs/gvd_viz_smoke.png")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(dest), frame)
+    return dest

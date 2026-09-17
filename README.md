@@ -27,6 +27,18 @@ Canonical pin **1.0.0** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Un
 
 Credits: [VisionPilot](https://github.com/visionpilot-project/VisionPilot), BeamNG / BeamNGpy, Udacity/Aly lane pipelines, Ultralytics if YOLO is used later.
 
+## Screenshots
+
+No recent live IQU45 GVD cabin or in-game UI photos were in the repo (only `docs/gvd_viz_smoke.png` and the 64px `app.png` icon). These two shots are **synthetic**. They are not live BeamNG photos. Soft Esc parked. Not Engage. Swap in cropped live shots later and change the caption to **real**. Provenance: [`docs/media/SOURCE.md`](docs/media/SOURCE.md).
+
+**Cabin — GVD VISION (synthetic).** OpenCV `python/viz/stage.py` parked clean cabin (chase 3/4, no nerd chrome, ice underglow off). Stub lanes and synthetic tracks. Same lexicon as `PYTHONPATH=. python python/run_vision.py --smoke`. Not a live second-screen photo.
+
+![GVD VISION cabin (synthetic)](docs/media/gvd_cabin_synthetic.png)
+
+**In-game UI — GVD Apps HUD (synthetic).** Raster of `beamng_mod/ui/modules/apps/GVD/` in **DISENGAGED** / standby (`ENGAGE` + Alt+G, Path on, Ghosts off). Not a live BeamNG CEF screenshot. Esc is BeamNG **UI Apps**, not GVD Engage.
+
+![GVD in-game Apps HUD (synthetic)](docs/media/gvd_ingame_ui_synthetic.png)
+
 ## Audiences
 
 Pick one product. They do **not** share a userfolder, mod tree, or `Documents/GVD` bus.
@@ -214,7 +226,7 @@ The in-game app is **Engage / Disengage + settings + live wheel/pedal echo** onl
 - **Sensing** — capture backend, `n/8` healthy feeds, the retail `cam_main only` note, and buttons that move the **GVD VISION** OpenCV window to screen 1 / 2.
 - **+ nerd** — loop/camera Hz, infer ms, VRAM, detector, actuator, clip encoder, heartbeat age.
 
-Titles stay **GVD** / **VISION**; Alt+G works with or without the app open. Offline check: `PYTHONPATH=. python scripts/test_gvd_ui_app.py`.
+Titles stay **GVD** / **VISION**; Alt+G works with or without the app open. Offline check: `PYTHONPATH=. python scripts/test_gvd_ui_app.py`. A **synthetic** parked HUD is under [Screenshots](#screenshots) — not a live CEF photo.
 
 ## Two views
 
@@ -227,6 +239,7 @@ Visualization **toy** (not a scientific claim that forecasts match Waymo). On-sc
 ```bash
 pip install -r requirements-viz.txt
 PYTHONPATH=. python python/run_vision.py --smoke   # writes docs/gvd_viz_smoke.png
+PYTHONPATH=. python scripts/render_readme_media.py  # docs/media synthetic cabin + HUD
 PYTHONPATH=. python python/run_vision.py --viz      # live window + state file for BeamNG
 PYTHONPATH=. python scripts/test_gvd_viz_stage.py
 ```

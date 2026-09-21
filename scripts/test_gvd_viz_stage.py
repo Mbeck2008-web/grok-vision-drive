@@ -2,6 +2,7 @@
 """Offline checks for the OpenCV GVD VISION lexicon (no display required)."""
 from __future__ import annotations
 
+import math
 import re
 import sys
 from pathlib import Path
@@ -40,6 +41,7 @@ def main() -> None:
 
     from python.viz.nerd import FS_BODY, TH, VAL_COL_W, _extras_line, _nav_line, _text_size, scene_note
     from python.viz.stage import (
+        Cam,
         VizUI,
         _track_dims,
         in_path,
@@ -50,6 +52,7 @@ def main() -> None:
         lane_draw_mode,
         pace_scale,
         render_stage,
+        track_cls,
     )
 
     assert _track_dims({}, "vehicle") == (4.2, 1.8, 1.55)
@@ -305,6 +308,47 @@ def main() -> None:
     cabin = render_stage(st, ui=cabin_ui)
     assert cabin.shape == (800, 1280, 3)
     assert int(cabin.mean()) < 80
+
+    # Forecast fans stay off the box face. A ground line ahead of a car still
+    # lands inside the chase silhouette, so the solid fill has to cover it.
+    import cv2
+
+    bare = VizUI()
+    bare.layers = {0}
+    bare.show_nerd = False
+    bare.debug.viz_forecast = False
+    cabin_bare = render_stage(st, ui=bare)
+    face_delta = cv2.absdiff(cabin, cabin_bare)
+    cam = Cam()
+    covered = np.zeros(cabin.shape[:2], np.uint8)
+    for tr in st["tracks"]:
+        length, width, height = _track_dims(tr, track_cls(tr))
+        yaw = float(tr.get("yaw") or 1.57)
+        x, y = float(tr["x"]), float(tr["y"])
+        hx, hy = math.cos(yaw), math.sin(yaw)
+        sx, sy = hy, -hx
+        hl, hw = length * 0.5, width * 0.5
+        corners = []
+        for z in (0.0, height):
+            for s0, s1 in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
+                corners.append(cam.project(
+                    x + hx * hl * s0 + sx * hw * s1,
+                    y + hy * hl * s0 + sy * hw * s1,
+                    z,
+                ))
+        mask = np.zeros(cabin.shape[:2], np.uint8)
+        cv2.fillConvexPoly(mask, cv2.convexHull(np.array(corners, np.int32)), 255)
+        mask = cv2.erode(mask, np.ones((3, 3), np.uint8))
+        covered = cv2.bitwise_or(covered, mask)
+        assert int(np.count_nonzero((face_delta.sum(axis=2) > 8) & (mask > 0))) == 0, (
+            f"forecast stamped track {tr.get('id')}"
+        )
+        cx, cy = cam.project(x, y, height * 0.45)
+        face = cabin[cy - 4:cy + 5, cx - 4:cx + 5]
+        assert face.std() < 1.0 or face.max(axis=2).std() < 1.0, f"track {tr.get('id')} face is not a flat fill"
+    assert int(np.count_nonzero((face_delta.sum(axis=2) > 8) & (covered == 0))) > 0, (
+        "moving agents should still draw a thin fan past the box"
+    )
 
     # PIP front clamp: blown-white main preview is not left at 255
     pip_ui = VizUI()

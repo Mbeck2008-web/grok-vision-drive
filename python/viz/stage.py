@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import cv2
@@ -42,6 +43,7 @@ from python.viz.debug_draw import (
     draw_pip_boxes,
     draw_planner_cost,
 )
+from python.runtime.state_io import steer_preview_path_ego
 from python.viz.forecast import predict_modes
 from python.viz.nerd import NERD_WIDTH, hit_test, render_panel, scene_note
 
@@ -63,8 +65,9 @@ POLE = (136, 128, 120)
 MAX_AGENTS = 32
 MAX_FORECAST = 16
 STAGE_W, STAGE_H = 1280, 800
-PATH_FADE_START_M = 25.0
-PATH_FADE_END_M = 42.0
+# Fade the tail of whatever polyline exists. Do not invent meters past the last point.
+# Furniture fade (cameras.yaml viz.fade_frac) is separate and must not pad this ribbon.
+CORRIDOR_FADE_FRAC = 0.40
 # CAMS tab 4×2 wall on the stage (nerd panel has its own 2×4).
 CAMS_STAGE_BOX = (12, 28, STAGE_W - 24, STAGE_H - 40)
 CAMS_STAGE_GRID = (4, 2)
@@ -234,16 +237,150 @@ class VizUI:
         return False
 
 
+@dataclass(frozen=True)
+class DrawRange:
+    """Cabin world span. The ice ribbon does not use this."""
+
+    ahead_m: float
+    behind_m: float
+    fade_frac: float
+    ahead_min_m: float
+    behind_min_m: float
+
+
+_VIZ_FILE_CACHE: tuple[dict[str, Any], float] | None = None
+
+
+def _num(v: Any) -> float | None:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_viz_files() -> tuple[dict[str, Any], float]:
+    root = Path(__file__).resolve().parents[2]
+    cams: dict[str, Any] = {}
+    vram = 11.0
+    try:
+        import yaml  # type: ignore
+
+        cams = yaml.safe_load((root / "config" / "cameras.yaml").read_text(encoding="utf-8")) or {}
+    except Exception:
+        cams = {}
+    try:
+        import yaml  # type: ignore
+
+        hw = yaml.safe_load((root / "config" / "hardware.yaml").read_text(encoding="utf-8")) or {}
+        dgpu = hw.get("dgpu") if isinstance(hw.get("dgpu"), dict) else {}
+        got = _num((dgpu or {}).get("vram_gb"))
+        if got is not None:
+            vram = got
+    except Exception:
+        vram = 11.0
+    return cams, vram
+
+
+def _far_of(cameras: dict[str, Any], cid: str, fallback: float) -> float:
+    for cam in cameras.get("cameras") or []:
+        if isinstance(cam, dict) and str(cam.get("id") or "") == cid:
+            got = _num(cam.get("far_m"))
+            if got is not None and got > 0:
+                return got
+    return fallback
+
+
+def _state_far(state: dict[str, Any], key: str) -> float | None:
+    got = _num(state.get(key))
+    if got is not None and got > 0:
+        return got
+    return None
+
+
+def resolve_draw_range(
+    state: dict[str, Any] | None = None,
+    *,
+    cameras: dict[str, Any] | None = None,
+    vram_gb: float | None = None,
+) -> DrawRange:
+    """Clamp cabin ahead/behind once per call.
+
+    auto uses that camera's far_m. A published state far (main_far_m / rear_far_m)
+    is the hitch result and replaces the yaml number. vram_gb >= 16 raises the
+    ahead cap to 600 so a stronger card can show main far_m 400–600.
+    """
+    global _VIZ_FILE_CACHE
+    state = state or {}
+    if cameras is None or vram_gb is None:
+        if _VIZ_FILE_CACHE is None:
+            _VIZ_FILE_CACHE = _load_viz_files()
+        loaded, file_vram = _VIZ_FILE_CACHE
+        if cameras is None:
+            cameras = loaded
+        if vram_gb is None:
+            vram_gb = file_vram
+    viz = cameras.get("viz") if isinstance(cameras.get("viz"), dict) else {}
+    ahead_min = _num(viz.get("ahead_min_m")) or 80.0
+    ahead_max = _num(viz.get("ahead_max_m")) or 400.0
+    behind_min = _num(viz.get("behind_min_m")) or 20.0
+    behind_max = _num(viz.get("behind_max_m")) or 80.0
+    fade = _num(viz.get("fade_frac"))
+    if fade is None:
+        fade = 0.28
+    if float(vram_gb) >= 16.0:
+        ahead_max = max(ahead_max, 600.0)
+    ahead_raw = viz.get("draw_ahead_m", "auto")
+    behind_raw = viz.get("draw_behind_m", "auto")
+    ahead_auto = isinstance(ahead_raw, str) and ahead_raw.strip().lower() == "auto"
+    behind_auto = isinstance(behind_raw, str) and behind_raw.strip().lower() == "auto"
+    if ahead_auto:
+        ahead_src = _state_far(state, "main_far_m")
+        if ahead_src is None:
+            ahead_src = _far_of(cameras, "main", 300.0)
+    else:
+        ahead_src = _num(ahead_raw) or _far_of(cameras, "main", 300.0)
+    if behind_auto:
+        behind_src = _state_far(state, "rear_far_m")
+        if behind_src is None:
+            behind_src = _far_of(cameras, "rear", 100.0)
+    else:
+        behind_src = _num(behind_raw) or _far_of(cameras, "rear", 100.0)
+    if ahead_max < ahead_min:
+        ahead_max = ahead_min
+    if behind_max < behind_min:
+        behind_max = behind_min
+    return DrawRange(
+        ahead_m=min(ahead_max, max(ahead_min, float(ahead_src))),
+        behind_m=min(behind_max, max(behind_min, float(behind_src))),
+        fade_frac=max(0.0, min(0.95, float(fade))),
+        ahead_min_m=float(ahead_min),
+        behind_min_m=float(behind_min),
+    )
+
+
 @dataclass
 class Cam:
     top_down: bool = False
     ppm: float = 10.0
+    ahead_m: float = -1.0
+    behind_m: float = -1.0
+    fade_frac: float = -1.0
+
+    def __post_init__(self) -> None:
+        if self.ahead_m < 0 or self.behind_m < 0 or self.fade_frac < 0:
+            draw = resolve_draw_range({})
+            if self.ahead_m < 0:
+                self.ahead_m = draw.ahead_m
+            if self.behind_m < 0:
+                self.behind_m = draw.behind_m
+            if self.fade_frac < 0:
+                self.fade_frac = draw.fade_frac
 
     @property
     def eye(self) -> tuple[float, float, float]:
         if self.top_down:
             return (0.0, -8.0, 40.0)
-        # Chase 3/4, pulled back so ego does not eat the frame and the lane fan reads.
+        # Chase 3/4, just behind the ego. Draw range is longer; the lens stays here.
         return (1.6, -16.5, 5.4)
 
     def project(self, x: float, y: float, z: float = 0.0) -> tuple[int, int]:
@@ -521,22 +658,158 @@ def _allow_stub(state: dict[str, Any]) -> bool:
     return bool(state.get("viz_smoke"))
 
 
+def _furniture_alpha(cam: Cam, y: float) -> float:
+    """Full strength until the last fade_frac of AHEAD. Behind the ego stays full."""
+    if y > cam.ahead_m + 1e-3 or y < -cam.behind_m - 1e-3:
+        return 0.0
+    frac = cam.fade_frac
+    if frac <= 0.0:
+        return 1.0
+    start = cam.ahead_m * (1.0 - frac)
+    if y <= start:
+        return 1.0
+    span = max(1e-3, cam.ahead_m - start)
+    return max(0.15, 1.0 - (y - start) / span)
+
+
+def _clip_poly_y(pts: list[dict[str, float]], y_lo: float, y_hi: float) -> list[dict[str, float]]:
+    """Keep the polyline inside [y_lo, y_hi], interpolating the cut."""
+    if not pts:
+        return []
+    ordered = sorted(pts, key=lambda p: (p["y"], p["x"]))
+    if len(ordered) == 1:
+        p = ordered[0]
+        return [p] if y_lo <= p["y"] <= y_hi else []
+
+    def _at(a: dict[str, float], b: dict[str, float], y: float) -> dict[str, float]:
+        dy = b["y"] - a["y"]
+        t = 0.0 if abs(dy) < 1e-9 else (y - a["y"]) / dy
+        t = max(0.0, min(1.0, t))
+        return {"x": a["x"] + (b["x"] - a["x"]) * t, "y": y}
+
+    out: list[dict[str, float]] = []
+    for i in range(len(ordered) - 1):
+        a, b = ordered[i], ordered[i + 1]
+        lo, hi = (a, b) if a["y"] <= b["y"] else (b, a)
+        if hi["y"] < y_lo or lo["y"] > y_hi:
+            continue
+        y0 = max(y_lo, lo["y"])
+        y1 = min(y_hi, hi["y"])
+        p0 = lo if abs(lo["y"] - y0) < 1e-6 else _at(lo, hi, y0)
+        p1 = hi if abs(hi["y"] - y1) < 1e-6 else _at(lo, hi, y1)
+        if not out or abs(out[-1]["y"] - p0["y"]) > 1e-3 or abs(out[-1]["x"] - p0["x"]) > 1e-3:
+            out.append(p0)
+        if abs(p1["y"] - p0["y"]) > 1e-3 or abs(p1["x"] - p0["x"]) > 1e-3:
+            out.append(p1)
+    return out
+
+
+def _extend_predicted(
+    pts: list[dict[str, float]], y_lo: float, y_hi: float,
+) -> list[list[dict[str, float]]]:
+    """Dashed continuation of a short detected poly. Does not repeat one point as a wall."""
+    if len(pts) < 2:
+        return []
+    pieces: list[list[dict[str, float]]] = []
+    y0, y1 = pts[0]["y"], pts[-1]["y"]
+    if y1 < y_hi - 0.5:
+        a, b = pts[-2], pts[-1]
+        dy = b["y"] - a["y"]
+        slope = 0.0 if abs(dy) < 1e-6 else (b["x"] - a["x"]) / dy
+        ext = [dict(b)]
+        y, x = b["y"], b["x"]
+        while y < y_hi - 1e-3:
+            step = min(8.0, y_hi - y)
+            y += step
+            x += slope * step
+            ext.append({"x": x, "y": y})
+        if len(ext) >= 2:
+            pieces.append(ext)
+    if y0 > y_lo + 0.5:
+        a, b = pts[0], pts[1]
+        dy = b["y"] - a["y"]
+        slope = 0.0 if abs(dy) < 1e-6 else (b["x"] - a["x"]) / dy
+        ext = [dict(a)]
+        y, x = a["y"], a["x"]
+        while y > y_lo + 1e-3:
+            step = min(8.0, y - y_lo)
+            y -= step
+            x -= slope * step
+            ext.append({"x": x, "y": y})
+        ext.reverse()
+        if len(ext) >= 2:
+            pieces.append(ext)
+    return pieces
+
+
+def _stroke_world(
+    img: np.ndarray,
+    cam: Cam,
+    pts: list[dict[str, float]],
+    color: tuple[int, int, int],
+    thickness: int,
+    *,
+    dashed: bool = False,
+    dash: int = 8,
+    gap: int = 7,
+    z: float = 0.02,
+) -> None:
+    """Stroke a world polyline, fading only in the last fade_frac of AHEAD."""
+    if len(pts) < 2:
+        return
+    fade_y = cam.ahead_m * (1.0 - cam.fade_frac) if cam.fade_frac > 0 else cam.ahead_m
+    runs: list[tuple[float, list[dict[str, float]]]] = []
+    run_a: float | None = None
+    run: list[dict[str, float]] = []
+    for p in pts:
+        a = 1.0 if p["y"] <= fade_y else round(_furniture_alpha(cam, p["y"]) * 5.0) / 5.0
+        if run_a is None:
+            run_a, run = a, [p]
+            continue
+        if abs(a - run_a) < 0.04:
+            run.append(p)
+            continue
+        runs.append((run_a, run))
+        run_a, run = a, [run[-1], p]
+    if run_a is not None and len(run) >= 2:
+        runs.append((run_a, run))
+    for alpha, piece in runs:
+        _stroke_poly(
+            img, _proj_poly(cam, piece, z), _mix(color, alpha), thickness,
+            dashed=dashed, dash=dash, gap=gap,
+        )
+
+
+def _draw_y_lo(cam: Cam) -> float:
+    """Near end of the draw span that this camera can actually see.
+
+    Chase sits just behind the ego, so points behind the lens are not stroked.
+    Top-down still paints the full behind span.
+    """
+    span = -float(cam.behind_m)
+    if cam.top_down:
+        return span
+    return max(span, float(cam.eye[1]) + 1.5)
+
+
 def _draw_ground(img: np.ndarray, cam: Cam) -> None:
-    far_l, far_r = cam.project(-16, 60, 0), cam.project(16, 60, 0)
-    near_l, near_r = cam.project(-16, -16, 0), cam.project(16, -16, 0)
-    horizon = max(0, min(STAGE_H - 1, far_l[1]))
+    y0, y1 = _draw_y_lo(cam), cam.ahead_m
+    far_l, far_r = cam.project(-16, y1, 0), cam.project(16, y1, 0)
+    near_l, near_r = cam.project(-16, y0, 0), cam.project(16, y0, 0)
     overlay = img.copy()
     cv2.fillPoly(overlay, [np.array([far_l, far_r, near_r, near_l], dtype=np.int32)], (22, 18, 15))
     cv2.addWeighted(overlay, 0.40, img, 0.60, 0, img)
     tick = _mix(ICE, 0.08)
-    for d in (10, 20, 30, 40):
-        a, b = cam.project(-7, d, 0), cam.project(7, d, 0)
+    y = math.ceil((y0 - 1e-6) / 20.0) * 20.0
+    while y <= y1 + 1e-6:
+        a, b = cam.project(-7, y, 0), cam.project(7, y, 0)
         cv2.line(img, a, b, tick, 1, cv2.LINE_AA)
+        y += 20.0
 
 
 def _draw_fog(img: np.ndarray, cam: Cam) -> None:
-    """Void the sky plus a thin horizon fade — do not wipe the lane fan."""
-    horizon = max(0, min(STAGE_H - 1, cam.project(0, 70, 0)[1]))
+    """Void the sky plus a thin horizon fade — horizon is the draw-ahead range."""
+    horizon = max(0, min(STAGE_H - 1, cam.project(0, cam.ahead_m, 0)[1]))
     sky = img.copy()
     cv2.rectangle(sky, (0, 0), (STAGE_W, max(1, horizon)), VOID, -1)
     cv2.addWeighted(sky, 0.55, img, 0.45, 0, img)
@@ -545,13 +818,22 @@ def _draw_fog(img: np.ndarray, cam: Cam) -> None:
     cv2.addWeighted(fade, 0.22, img, 0.78, 0, img)
 
 
+def _lane_color(mode: str, fade: float) -> tuple[tuple[int, int, int], int, bool]:
+    if mode == "solid":
+        color = tuple(max(90, int(c * max(0.55, fade))) for c in PAPER)
+        return color, 2, False
+    color = tuple(max(70, int(c * max(0.40, 0.70 * fade))) for c in (170, 166, 160))
+    return color, 2, True
+
+
 def _draw_lanes(img: np.ndarray, lanes: list, cam: Cam, *, smoke: bool) -> None:
+    y_lo, y_hi = _draw_y_lo(cam), cam.ahead_m
     for ln in lanes or []:
         kind = ln.get("kind") if isinstance(ln, dict) else None
         mode = lane_draw_mode(kind, smoke=smoke)
         if mode is None:
             continue
-        pts = _poly_points(ln)
+        pts = _clip_poly_y(_poly_points(ln), y_lo, y_hi)
         if len(pts) < 2:
             continue
         idx = 1
@@ -564,32 +846,62 @@ def _draw_lanes(img: np.ndarray, lanes: list, cam: Cam, *, smoke: bool) -> None:
         fade = max(0.35, 1.0 - 0.22 * outer)
         style = str(ln.get("style") or "unknown") if isinstance(ln, dict) else "unknown"
         dashed = mode == "dashed" or style == "dashed"
-        if mode == "solid":
-            color = tuple(max(90, int(c * max(0.55, fade))) for c in PAPER)
-            thick = 2
-        else:
-            color = tuple(max(70, int(c * max(0.40, 0.70 * fade))) for c in (170, 166, 160))
-            thick = 2
-        _stroke_poly(
-            img, _proj_poly(cam, pts, 0.02), color, thick,
-            dashed=dashed, dash=10 if mode == "solid" else 8, gap=5,
+        color, thick, dash_default = _lane_color(mode, fade)
+        _stroke_world(
+            img, cam, pts, color, thick,
+            dashed=dashed or dash_default, dash=10 if mode == "solid" and not dashed else 8, gap=5,
         )
+        # Short live paint is extended as predicted dashes. The source poly is not relabeled.
+        ext_color, ext_thick, _ = _lane_color("dashed", fade * 0.85)
+        for ext in _extend_predicted(pts, y_lo, y_hi):
+            _stroke_world(img, cam, ext, ext_color, ext_thick, dashed=True, dash=8, gap=6)
+
+
+def _draw_edge_piece(
+    img: np.ndarray, cam: Cam, pts: list[dict[str, float]], *, solid: bool, alpha: float,
+) -> None:
+    if len(pts) < 2 or alpha <= 0.02:
+        return
+    base = _proj_poly(cam, pts, 0.0)
+    top = _proj_poly(cam, pts, 0.13)
+    quad = np.array(base + list(reversed(top)), dtype=np.int32)
+    overlay = img.copy()
+    cv2.fillPoly(overlay, [quad], KERB)
+    w = (0.22 if solid else 0.14) * alpha
+    cv2.addWeighted(overlay, w, img, 1.0 - w, 0, img)
+    _stroke_poly(
+        img, top, _mix(KERB, (0.85 if solid else 0.62) * alpha, (22, 20, 18)), 2,
+        dashed=not solid, dash=6, gap=5,
+    )
 
 
 def _draw_edges(img: np.ndarray, edges: list, cam: Cam) -> None:
+    y_lo, y_hi = _draw_y_lo(cam), cam.ahead_m
+    fade_y = cam.ahead_m * (1.0 - cam.fade_frac) if cam.fade_frac > 0 else cam.ahead_m
     for e in edges or []:
-        pts = _poly_points(e)
-        if len(pts) < 2:
+        raw = _clip_poly_y(_poly_points(e), y_lo, y_hi)
+        if len(raw) < 2:
             continue
         kind = e.get("kind") if isinstance(e, dict) else "predicted"
         solid = str(kind or "predicted") == "detected"
-        base = _proj_poly(cam, pts, 0.0)
-        top = _proj_poly(cam, pts, 0.13)
-        quad = np.array(base + list(reversed(top)), dtype=np.int32)
-        overlay = img.copy()
-        cv2.fillPoly(overlay, [quad], KERB)
-        cv2.addWeighted(overlay, 0.22 if solid else 0.14, img, 1.0 - (0.22 if solid else 0.14), 0, img)
-        _stroke_poly(img, top, _mix(KERB, 0.85 if solid else 0.62, (22, 20, 18)), 2, dashed=not solid, dash=6, gap=5)
+        near = [p for p in raw if p["y"] <= fade_y + 1e-6]
+        far = [p for p in raw if p["y"] >= fade_y - 1e-6]
+        if len(near) >= 2:
+            _draw_edge_piece(img, cam, near, solid=solid, alpha=1.0)
+        if len(far) >= 2 and far[-1]["y"] > fade_y + 0.5:
+            mid = 0.5 * (far[0]["y"] + far[-1]["y"])
+            _draw_edge_piece(img, cam, far, solid=solid, alpha=_furniture_alpha(cam, mid))
+        for ext in _extend_predicted(raw, y_lo, y_hi):
+            ext_near = [p for p in ext if p["y"] <= fade_y + 1e-6]
+            ext_far = [p for p in ext if p["y"] >= fade_y - 1e-6]
+            if len(ext_near) >= 2:
+                _draw_edge_piece(img, cam, ext_near, solid=False, alpha=0.85)
+            if len(ext_far) >= 2 and ext_far[-1]["y"] > fade_y + 0.5:
+                mid = 0.5 * (ext_far[0]["y"] + ext_far[-1]["y"])
+                _draw_edge_piece(
+                    img, cam, ext_far, solid=False,
+                    alpha=0.85 * _furniture_alpha(cam, mid),
+                )
 
 
 def _draw_signs(img: np.ndarray, signs: list, cam: Cam) -> None:
@@ -599,10 +911,12 @@ def _draw_signs(img: np.ndarray, signs: list, cam: Cam) -> None:
     for s in ordered:
         cls = str(s.get("cls") or s.get("class") or "sign")
         x, y = float(s.get("x") or 0), float(s.get("y") or 0)
+        if y > cam.ahead_m or y < -cam.behind_m:
+            continue
         light = cls == "traffic_light"
         pole = cls == "pole"
         h = 3.2 if light else (1.1 if pole else 2.1)
-        far = max(0.2, min(1.0, 1.0 - (y - 30.0) / 25.0))
+        far = _furniture_alpha(cam, y)
         scale = cam.scale_at(y)
         top = cam.project(x, y, h)
         foot = cam.project(x, y, 0.0)
@@ -668,6 +982,96 @@ def _draw_stop_bar(
     cv2.line(img, a, b, (252, 248, 244), 3, cv2.LINE_AA)
 
 
+def _as_path(raw: Any) -> list[dict[str, float]]:
+    out: list[dict[str, float]] = []
+    for p in raw or []:
+        if isinstance(p, dict):
+            out.append({
+                "x": float(p.get("x") or 0.0),
+                "y": float(p.get("y") or 0.0),
+                "z": float(p.get("z") or 0.0),
+            })
+        elif isinstance(p, (list, tuple)) and len(p) >= 2:
+            z = float(p[2]) if len(p) > 2 else 0.0
+            out.append({"x": float(p[0]), "y": float(p[1]), "z": z})
+    return out
+
+
+def _arc_length(path: list) -> float:
+    pts = _as_path(path)
+    dist = 0.0
+    prev: tuple[float, float] | None = None
+    for p in pts:
+        if prev is not None:
+            dist += math.hypot(p["x"] - prev[0], p["y"] - prev[1])
+        prev = (p["x"], p["y"])
+    return dist
+
+
+def corridor_half_width(state: dict[str, Any]) -> float:
+    """Half of the planner corridor, in meters. No pixel floor and no lane-fan inflate."""
+    raw = state.get("path_width")
+    if raw is None:
+        planner = state.get("planner") if isinstance(state.get("planner"), dict) else {}
+        raw = planner.get("corridor_width")
+    try:
+        width = float(raw)
+    except (TypeError, ValueError):
+        width = 2.0
+    if width <= 0.0:
+        width = 2.0
+    return width * 0.5
+
+
+def _e2e_live(state: dict[str, Any]) -> bool:
+    """E2E is the driver only when the net is a real onnx and the modular veto is clear."""
+    policy = str(state.get("policy") or "modular").lower()
+    backend = str(state.get("e2e_backend") or "stub").lower()
+    veto = str(state.get("veto_reason") or "none").lower()
+    return policy == "e2e" and backend not in ("", "stub") and veto in ("none", "")
+
+
+def _e2e_corridor(state: dict[str, Any], modular: list[dict[str, float]]) -> list[dict[str, float]]:
+    """Exported E2E polyline, or the same steer integrator as steer_preview_path_ego.
+
+    Length follows the modular path that exists. A missing export does not become a 36 m preview.
+    """
+    exported = _as_path(state.get("path_e2e"))
+    if len(exported) >= 2:
+        return exported
+    shadow = state.get("shadow") if isinstance(state.get("shadow"), dict) else {}
+    if shadow.get("steer") is None:
+        return []
+    length = _arc_length(modular)
+    if length < 1.0:
+        return []
+    try:
+        steer = float(shadow["steer"])
+    except (TypeError, ValueError):
+        return []
+    return steer_preview_path_ego(steer * 30.0, length_m=length, step=1.0)
+
+
+def resolve_corridors(state: dict[str, Any]) -> tuple[list[dict[str, float]], list[dict[str, float]] | None]:
+    """Primary ribbon plus an optional shadow ghost.
+
+    Modular, or e2e/shadow held by a modular veto (including e2e_stub): the planner path.
+    policy=e2e with a live onnx and veto none: that net's path, not the modular polyline.
+    policy=shadow: primary is the modular command that actuates; ghost is the other path.
+    """
+    modular = _as_path(state.get("path_ego"))
+    policy = str(state.get("policy") or "modular").lower()
+    backend = str(state.get("e2e_backend") or "stub").lower()
+    if _e2e_live(state):
+        return _e2e_corridor(state, modular), None
+    ghost: list[dict[str, float]] | None = None
+    if policy == "shadow" and backend not in ("", "stub"):
+        other = _e2e_corridor(state, modular)
+        if len(other) >= 2:
+            ghost = other
+    return modular, ghost
+
+
 def _draw_filled_corridor(
     img: np.ndarray,
     path: list[dict],
@@ -677,8 +1081,9 @@ def _draw_filled_corridor(
     half_w: float,
     intent: float,
     preview: bool,
+    gain: float = 1.0,
 ) -> None:
-    if len(path) < 2:
+    if len(path) < 2 or half_w <= 0.0:
         return
     trimmed: list[tuple[float, float, float]] = []
     dist = 0.0
@@ -687,12 +1092,12 @@ def _draw_filled_corridor(
         x, y = float(p.get("x", 0)), float(p.get("y", 0))
         if prev is not None:
             dist += math.hypot(x - prev[0], y - prev[1])
-        if dist > PATH_FADE_END_M:
-            break
         trimmed.append((x, y, dist if prev is not None else 0.0))
         prev = (x, y)
     if len(trimmed) < 2:
         return
+    total = trimmed[-1][2]
+    fade_from = total * (1.0 - CORRIDOR_FADE_FRAC)
 
     left, right, center, alphas = [], [], [], []
     for i, (x, y, d) in enumerate(trimmed):
@@ -704,14 +1109,17 @@ def _draw_filled_corridor(
         tx, ty = nx - x, ny - y
         norm = math.hypot(tx, ty) + 1e-6
         px, py = (ty / norm) * half_w, (-tx / norm) * half_w
-        fade = 1.0 if d <= PATH_FADE_START_M else max(0.0, 1.0 - (d - PATH_FADE_START_M) / (PATH_FADE_END_M - PATH_FADE_START_M))
+        if total <= 1e-3 or d <= fade_from:
+            fade = 1.0
+        else:
+            fade = max(0.0, 1.0 - (d - fade_from) / max(1e-3, total - fade_from))
         cx, cy = cam.project(x, y, 0.03)
         lx, ly = cam.project(x - px, y - py, 0.03)
         rx, ry = cam.project(x + px, y + py, 0.03)
-        if abs(rx - lx) < 3 and abs(ry - ly) < 3:
-            half_px = max(3.0, half_w * cam.scale_at(y))
-            lx, ly = int(cx - half_px), cy
-            rx, ry = int(cx + half_px), cy
+        if abs(rx - lx) < 1 and abs(ry - ly) < 1:
+            half_px = half_w * cam.scale_at(y)
+            lx, ly = int(round(cx - half_px)), cy
+            rx, ry = int(round(cx + half_px)), cy
         left.append((lx, ly))
         right.append((rx, ry))
         center.append((cx, cy))
@@ -720,7 +1128,7 @@ def _draw_filled_corridor(
     nseg = len(left) - 1
     for i in range(nseg):
         near = 1.0 - i / max(1, nseg)
-        a = intent * (0.38 + 0.50 * near) * max(0.25, conf) * (0.55 * alphas[i] + 0.45 * alphas[i + 1])
+        a = gain * intent * (0.38 + 0.50 * near) * max(0.25, conf) * (0.55 * alphas[i] + 0.45 * alphas[i + 1])
         if a < 0.02:
             continue
         quad = np.array([left[i], left[i + 1], right[i + 1], right[i]], dtype=np.int32)
@@ -857,7 +1265,10 @@ def _draw_tracks(
     for t in ordered:
         cls = track_cls(t)
         L, W, H = _track_dims(t, cls)
-        far = max(0.18, min(1.0, 1.0 - (float(t.get("y") or 0) - 30.0) / 25.0))
+        y_track = float(t.get("y") or 0)
+        if y_track > cam.ahead_m or y_track < -cam.behind_m:
+            continue
+        far = _furniture_alpha(cam, y_track)
         lead = is_lead(t, cipv_id)
         hazard = is_hazard(t, state, cipv_id)
         hot = lead or in_path(t, path, path_width)
@@ -993,7 +1404,13 @@ def render_stage(
     ui = ui or VizUI()
     dbg = ui.debug
     clean = 0 in ui.layers
-    cam = Cam(top_down=ui.top_down)
+    draw = resolve_draw_range(state)
+    cam = Cam(
+        top_down=ui.top_down,
+        ahead_m=draw.ahead_m,
+        behind_m=draw.behind_m,
+        fade_frac=draw.fade_frac,
+    )
     img = np.full((STAGE_H, STAGE_W, 3), VOID, dtype=np.uint8)
 
     if is_bus_mismatch(state):
@@ -1043,12 +1460,13 @@ def render_stage(
 
     engaged = bool(state.get("engaged"))
     smoke = _allow_stub(state)
-    path = list(state.get("path_ego") or [])
+    primary, ghost = resolve_corridors(state)
+    path = primary
+    half_w = corridor_half_width(state)
     try:
-        path_width = float(state.get("path_width") or 2.0)
+        path_width = float(state.get("path_width") or (half_w * 2.0))
     except (TypeError, ValueError):
-        path_width = 2.0
-    half_w = max(0.9, path_width * 0.5)
+        path_width = half_w * 2.0
     try:
         path_conf = float(state.get("path_conf") or 0.5)
     except (TypeError, ValueError):
@@ -1073,11 +1491,22 @@ def render_stage(
     tracks = all_tracks if show_ghosts else []
 
     if show_path:
+        intent = pace_scale(state)
+        # Preview stays dimmer. A shadow ghost is thinner and only off the clean cabin.
+        if ghost and not clean:
+            _draw_filled_corridor(
+                img, ghost, path_conf, cam,
+                half_w=half_w * 0.62,
+                intent=intent * 0.40,
+                preview=False,
+                gain=0.55 if preview else 1.0,
+            )
         _draw_filled_corridor(
             img, path, path_conf, cam,
             half_w=half_w,
-            intent=pace_scale(state),
+            intent=intent,
             preview=preview,
+            gain=0.62 if preview else 1.0,
         )
         _draw_stop_bar(img, path, half_w, all_tracks, cipv_id, cam, is_halted(state))
         _draw_path_world_overlay(img, state.get("path_world") or [], cam)
@@ -1164,6 +1593,67 @@ def render_stage(
     return img
 
 
+def _smoke_traffic() -> list[dict[str, Any]]:
+    """Cars for the smoke/README cabin. Furniture, not a live detector.
+
+    Centers sit in the stub lane fan so boxes miss the left lane-line probes
+    the viz test samples, and miss the ground samples at (0.45, 70) and (0.45, -6).
+    """
+    # id, x, y, speed, class. Lane centers are about 0, ±3.6, ±7.1.
+    spec = [
+        (1, 0.15, 14.0, 11.0, "vehicle"),
+        (2, 3.55, 8.5, 13.0, "vehicle"),
+        (3, -3.55, 10.5, 12.0, "vehicle"),
+        (4, 7.05, 16.0, 15.0, "vehicle"),
+        (5, -7.05, 18.0, 13.0, "vehicle"),
+        (6, -3.5, 24.0, 14.0, "vehicle"),
+        (7, 3.5, 26.0, 10.5, "vehicle"),
+        (8, 0.1, 32.0, 12.0, "vehicle"),
+        (9, 7.0, 34.0, 16.0, "vehicle"),
+        (10, -7.0, 36.0, 11.5, "vehicle"),
+        (11, 3.55, 42.0, 13.0, "vehicle"),
+        (12, -3.55, 44.0, 12.5, "vehicle"),
+        (13, 0.05, 50.0, 14.0, "vehicle"),
+        (14, -3.6, 56.0, 11.0, "vehicle"),
+        (15, 3.5, 60.0, 13.5, "vehicle"),
+        (16, 7.1, 52.0, 15.0, "vehicle"),
+        (17, -7.05, 58.0, 12.0, "vehicle"),
+        (18, 3.6, 78.0, 13.0, "vehicle"),
+        (19, -3.55, 96.0, 12.0, "vehicle"),
+        (20, 0.1, 110.0, 14.0, "vehicle"),
+        (21, -3.6, -5.2, 12.0, "vehicle"),
+        (22, 3.55, -5.0, 11.0, "vehicle"),
+        (23, 8.6, 13.0, 1.4, "pedestrian"),
+    ]
+    out: list[dict[str, Any]] = []
+    for tid, x, y, spd, cls in spec:
+        out.append({
+            "id": tid,
+            "class": cls,
+            "x": x,
+            "y": y,
+            "speed_mps": spd,
+            "yaw": 1.57 if cls == "vehicle" else 3.05,
+            "yaw_rate": 0.0,
+        })
+    return out
+
+
+def _span_ys(y0: float, y1: float, step: float = 3.0) -> list[float]:
+    """Inclusive samples from y0 to y1. Smoke authors lanes across the cabin span."""
+    ys: list[float] = []
+    y = float(y0)
+    end = float(y1)
+    step = float(step) if step > 0 else 3.0
+    if end < y:
+        return [round(y, 2), round(end, 2)]
+    while y < end - 1e-6 and len(ys) < 4000:
+        ys.append(round(y, 2))
+        y += step
+    ys.append(round(end, 2))
+    return ys
+
+
 def smoke(
     ui: VizUI | None = None,
     use_perception: bool = False,
@@ -1202,7 +1692,8 @@ def smoke(
         missing_state_keys=["live cameras", "real planner path", "occupancy grid"],
     )
     st["ego"] = {"speed_mps": 14.0, "steer_deg": 0.0, "throttle": 0.1, "brake": 0.0, "yaw_rate": 0.0}
-    authored_path = [{"x": 0.12 * math.sin(i / 14), "y": float(i), "z": 0.0} for i in range(0, 45)]
+    # Smoke furniture only. Live ticks keep the model path and do not pad it to this span.
+    authored_path = [{"x": 0.12 * math.sin(i / 14), "y": float(i), "z": 0.0} for i in range(0, 61)]
     st["path_ego"] = authored_path
     st["viz_smoke"] = True
     if use_perception:
@@ -1249,10 +1740,26 @@ def smoke(
         pl["target_v"] = 11.0
         st["planner"] = pl
         st["ego"]["speed_mps"] = 14.0
+    # README / --smoke shots. A blank frame only yields two synthetic cars.
+    # This pack is furniture so the cabin reads as traffic. Live ticks do not use it.
+    st["tracks"] = _smoke_traffic()
+    st["tracks_n"] = len(st["tracks"])
+    st["objects_n"] = st["tracks_n"]
+    pl_show = dict(st.get("planner") or {})
+    pl_show["cipv_id"] = 1
+    pl_show["aeb"] = "off"
+    pl_show["target_v"] = 11.0
+    pl_show["ttc_lead"] = 2.4
+    st["planner"] = pl_show
+    st["missing_state_keys"] = sorted(set(
+        (st.get("missing_state_keys") or []) + ["live tracks (smoke authors a traffic pack)"]
+    ))
     if not st.get("lanes_ext"):
         # --smoke has no camera, so the Hough fit finds nothing. Give the stage
         # something to draw, tagged kind="stub" so it can never read as a live detection.
-        span = [float(i) for i in range(2, 40, 3)]
+        # Author the full cabin span. Live Hough stays short; the drawer may dash-extend it.
+        span_draw = resolve_draw_range(st)
+        span = _span_ys(-span_draw.behind_m, span_draw.ahead_m, 3.0)
 
         def _line(off: float) -> list[dict[str, float]]:
             return [{"x": round(off + 0.9 * math.sin(y / 17.0), 2), "y": y} for y in span]

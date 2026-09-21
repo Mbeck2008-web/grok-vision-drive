@@ -8,9 +8,10 @@ Path: product sandbox `gvd_state.json` (written by `python/run_vision.py`). **No
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `path_ego` | `[{x,y,z}, ...]` | Vehicle frame (+X right, +Y forward, +Z up), ~1 m spacing, 30–40 m |
+| `path_ego` | `[{x,y,z}, ...]` | Modular planner path, vehicle frame (+X right, +Y forward). The VISION ribbon ends at the last point. It is not repeated out to a draw distance. |
 | `path_world` | optional same | If set, GELua draws this directly |
-| `path_width` | m | Default ~2.0 (1.8–2.2 aesthetic) |
+| `path_width` | m | Planner corridor width. VISION half-width is `path_width / 2` in meters at every station. |
+| `path_e2e` | optional `[{x,y,z}]` | E2E polyline when the onnx exports one. Empty when the net only outputs steer/throttle/brake. |
 | `path_conf` | 0–1 | Low → thinner/shorter/darker ribbon |
 | `path_debug_preview` | bool | `false` only when corridor path came from lanes; geometric/steer fallback stays `true` |
 | `gvd_show_path` | bool | Default true |
@@ -163,7 +164,7 @@ Live wheel / pedal HUD fields are the same retail Direct Drive echo already writ
 | `veto_reason` | string | `none` / `aeb_brake` / `aeb_warn` / `low_lane_conf` / `low_path_conf` / `heartbeat_stale` / `disagreement` / `e2e_forward_fail` / `e2e_stub` / `preview_blocked` |
 | `e2e_backend` | string | `stub` / `onnx` |
 
-Perception always runs (loaded detector, lanes, corridor planner, other-vehicle tracks, E2E shadow). Path ribbon / GVD VISION overlays stay up. Actuators only when engaged **and** modular OK. Shadow mode computes both intents; default apply path stays modular. `e2e_stub` (no trained onnx, `e2e_backend=stub`) holds the brake and stays engaged on `--policy e2e`. Shadow does not treat that stub as a disagreement. Dead-man / heartbeat unchanged. Detector default is shipped `models/yolov8n.onnx`. No E2E checkpoint in git (`models/e2e_current.onnx` still gitignored).
+Perception always runs (loaded detector, lanes, corridor planner, other-vehicle tracks, E2E shadow). Path ribbon / GVD VISION overlays stay up. The VISION ice ribbon is `path_width / 2` meters each side and only as long as the path being painted. Modular, or e2e/shadow held by a veto (including `e2e_stub`), paints `path_ego`. `policy=e2e` with `e2e_backend=onnx` and `veto_reason=none` paints `path_e2e` or a steer integral of that same length. Shadow keeps the modular ribbon and may add a thinner ghost of the other path when the clean cabin (key 0) is off. Actuators only when engaged **and** modular OK. Shadow mode computes both intents; default apply path stays modular. `e2e_stub` (no trained onnx, `e2e_backend=stub`) holds the brake and stays engaged on `--policy e2e`. Shadow does not treat that stub as a disagreement. Dead-man / heartbeat unchanged. Detector default is shipped `models/yolov8n.onnx`. No E2E checkpoint in git (`models/e2e_current.onnx` still gitignored).
 
 
 ## M6 — `gvd_engage.json` contract (retail package)

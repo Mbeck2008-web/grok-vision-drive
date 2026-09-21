@@ -142,7 +142,7 @@ html, body {{
       <button type="button" class="gvd-segbtn">e2e</button>
       <button type="button" class="gvd-segbtn">shadow</button>
     </div>
-    <div class="gvd-sub">e2e stub - veto none</div>
+    <div class="gvd-sub">e2e untrained stub - veto none</div>
   </div>
 
   <div class="gvd-sec">
@@ -321,7 +321,7 @@ def render_hud_opencv(dest: Path) -> Path:
         rect(x, y + 24, 98, 22, (60, 50, 22) if on else panel)
         cv2.rectangle(img, (x, y + 24), (x + 98, y + 46), (134, 118, 75) if on else line, 1, cv2.LINE_AA)
         text(name.upper(), x + (18 if name != "modular" else 10), y + 40, 0.32, ICE_HI if on else dim)
-    text("e2e stub - veto none", 10, y + 66, 0.32, dim)
+    text("e2e untrained stub - veto none", 10, y + 66, 0.28, dim)
     y = 430
     cv2.line(img, (10, y), (w - 10, y), line, 1, cv2.LINE_AA)
     text("SENSING", 10, y + 16, 0.32, faint)

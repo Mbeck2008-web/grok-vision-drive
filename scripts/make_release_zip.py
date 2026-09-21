@@ -31,7 +31,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 # Canonical product pin (also VERSION, python/__init__.py, BeamNG app.json).
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 RELEASE_CHANNEL = "alpha"
 RELEASE_LABEL = f"{VERSION}-{RELEASE_CHANNEL}"
 
@@ -140,7 +140,6 @@ FORBIDDEN_ARCHIVE_GLOBS = (
 )
 
 HONESTY_LINES = (
-    "Alpha 1.0.0: may break / not work. Improves with fixes.",
     "Retail = 1-cam window capture only (main/cam_main). 8-cam rig needs BeamNG.tech + BeamNGpy.",
     "Retail drives the sim car through Documents/GVD/gvd_cmd.json -> mod Lua secondary Direct Drive wheel+pedals on the player vehicle; "
     "Tech keeps BeamNGpy direct control (preferred).",
@@ -229,6 +228,7 @@ def version_text(version: str) -> str:
         f"built {now}",
         f"git {sha}",
         "",
+        f"Alpha {version}: may break / not work. Improves with fixes.",
         *HONESTY_LINES,
         "",
         "Install: double-click install.bat -> restart BeamNG -> enable GVD in Mod Manager.",
@@ -305,7 +305,7 @@ def verify(zip_path: Path, *, flat: bool, version: str) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Build the GVD retail release zip (YOLOv8n ONNX in, other weights/clips/.git out).")
-    ap.add_argument("--version", default=None, help="Version label (default: exact git tag, else 1.0.0-alpha-<sha>)")
+    ap.add_argument("--version", default=None, help=f"Version label (default: exact git tag, else {RELEASE_LABEL}-<sha>)")
     ap.add_argument("--out", default=None, help="Output path (default: dist/gvd-retail-<version>.zip)")
     ap.add_argument("--flat", action="store_true", help="No top-level gvd-retail-<version>/ folder inside the zip")
     ap.add_argument("--list", action="store_true", help="Print the manifest and exit without writing")

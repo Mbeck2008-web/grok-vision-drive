@@ -32,6 +32,7 @@ from python.runtime.debug_opts import (
 )
 from python.viz.debug_draw import (
     clamp_front_overexpose,
+    cabin_drive_word,
     draw_cam_strip,
     draw_cam_tiles,
     draw_dense_hud,
@@ -987,6 +988,8 @@ def render_stage(
         cv2.rectangle(img, (0, 0), (STAGE_W, 22), (12, 13, 16), -1)
         cv2.putText(img, "GVD", (12, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, ICE, 1, cv2.LINE_AA)
         cv2.putText(img, "VISION", (52, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1, cv2.LINE_AA)
+        word, word_col = cabin_drive_word(state)
+        cv2.putText(img, word, (118, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, word_col, 1, cv2.LINE_AA)
         cam_lbl = "CAMS dropped" if drop_heavy else "CAMS 8-view"
         cv2.putText(img, cam_lbl, (STAGE_W - 150, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
         note = scene_note(state)
@@ -1100,6 +1103,8 @@ def render_stage(
     cv2.rectangle(img, (0, 0), (STAGE_W, 22), (12, 13, 16), -1)
     cv2.putText(img, "GVD", (12, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, ICE, 1, cv2.LINE_AA)
     cv2.putText(img, "VISION", (52, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1, cv2.LINE_AA)
+    word, word_col = cabin_drive_word(state)
+    cv2.putText(img, word, (118, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, word_col, 1, cv2.LINE_AA)
     cam_lbl = "BEV debug" if ui.top_down else "chase 3/4"
     cv2.putText(img, cam_lbl, (STAGE_W - 120, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
     note = scene_note(state)

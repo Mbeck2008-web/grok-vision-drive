@@ -49,7 +49,7 @@ Lua: `gvd_main.drawPath` on `onPreRender` / `onDebugDraw`. Runs whenever the sup
 | `disengage_reason` | string | `none` / `not_engaged` / `preview_blocked` / `heartbeat_stale` / `player_steer` / `player_brake` / `player_throttle` / … (sticky reasons live in `gvd_engage.json`) |
 | `actuator` | string | `beamngpy` (Tech) / `cmd_json` (retail: GELua applies) / `null` |
 | `cmd_seq` | int | Monotonic command sequence |
-| `cmd_applied` | bool | True when BeamNGpy `vehicle.control` ran, **or** the mod acked the seq via `gvd_ego.json` (fresh, `applying`) |
+| `cmd_applied` | bool | True when BeamNGpy `vehicle.control` ran, **or** the mod acked this seq via `gvd_ego.json` (fresh, `applying`, `applied_seq` equal to `cmd_seq` or up to 5 behind — a higher seq from a previous supervisor is not an ack) |
 | `cmd_reason` | string | Gate / plan reason; `cmd_json_applied` (acked) / `cmd_json_pending` (written, no ack) / `cmd_json_idle` (not engaged) |
 | `ego.speed_mps` | float | From Electrics `wheelspeed`/`airspeed` (BeamNGpy) or the mod's `gvd_ego.json` echo; else last known (not invented 10) |
 | `ego.throttle` / `ego.brake` | float | Last commanded values |
@@ -140,7 +140,7 @@ Predictions need an anchor: with no detected lane there are no predicted lanes a
 
 ## In-game app bus
 
-`gvd/main.lua` pushes `guihooks.trigger('gvdUi', ...)` on a single 10 Hz `tickPush` path (same period as the `egoFb` poll). Wheel/pedal bars ride that path from `egoFb`; `onEgoFeedback` does not push a second HUD stream. Payload still includes capped scene geometry: `path` ≤28 points, `tracks` ≤12 (`id,cls,x,y,yaw,v,lead`), `lanes` ≤6×12 (`pts,kind,side,style,idx`), `edges` ≤2×12, `signs` ≤8, `fans` ≤6×8, all ego frame and rounded to 2 dp. `link` is `live` / `stale` / `none` from the heartbeat age, or `mismatch` when `python_bus` and `lua_bus` are not the same folder (refuse actuation; do not guess). The app can show the dead-man without a second file bus. `applying` rides along, so the app can show `DRIVE` while the mod holds the wheel (M6 retail); on Tech, `actuator=beamngpy` + `cmd_applied` means the same thing. `gvdStrip` keeps its old shape plus `applying`.
+`gvd/main.lua` pushes `guihooks.trigger('gvdUi', ...)` on a single 10 Hz `tickPush` path (same period as the `egoFb` poll). Wheel/pedal bars ride that path from `egoFb`; `onEgoFeedback` does not push a second HUD stream. Payload still includes capped scene geometry: `path` ≤28 points, `tracks` ≤12 (`id,cls,x,y,yaw,v,lead`), `lanes` ≤6×12 (`pts,kind,side,style,idx`), `edges` ≤2×12, `signs` ≤8, `fans` ≤6×8, all ego frame and rounded to 2 dp. `link` is `live` / `stale` / `none` from the heartbeat age, or `mismatch` when `python_bus` and `lua_bus` are not the same folder (refuse actuation; do not guess). The app can show the dead-man without a second file bus. `tag` is the shared glance word: `MISMATCH` when the buses differ; `HOLD` while engaged and the link is not live, or `cmd_reason` is `preview_blocked` / `heartbeat_stale` / `veto:*`, or AEB is `brake`/`warn`; `DRIVE` only while engaged and not holding and (Lua `applying` or Tech `actuator=beamngpy` with `cmd_applied`); `ON` while engaged and waiting; `OFF` when disengaged. The full app maps that to DISENGAGED / ENGAGED / HOLD / DRIVE / MISMATCH. `gvdStrip` gets the same `tag` plus `link` so it cannot say DRIVE during a brake hold. The OpenCV title bar uses the same word.
 
 Live wheel / pedal HUD fields are the same retail Direct Drive echo already written to `gvd_ego.json` (`M.onEgoFeedback` / `egoFb`). No parallel input stack.
 
@@ -160,10 +160,10 @@ Live wheel / pedal HUD fields are the same retail Direct Drive echo already writ
 | `shadow.throttle` | float | E2E proposed throttle [0,1] |
 | `shadow.brake` | float | E2E proposed brake [0,1] |
 | `e2e_ok` | bool | False when modular vetoes E2E (low lane_conf / heartbeat / disagreement / forward fail) |
-| `veto_reason` | string | `none` / `aeb_brake` / `aeb_warn` / `low_lane_conf` / `low_path_conf` / `heartbeat_stale` / `disagreement` / `e2e_forward_fail` / `preview_blocked` |
+| `veto_reason` | string | `none` / `aeb_brake` / `aeb_warn` / `low_lane_conf` / `low_path_conf` / `heartbeat_stale` / `disagreement` / `e2e_forward_fail` / `e2e_stub` / `preview_blocked` |
 | `e2e_backend` | string | `stub` / `onnx` |
 
-Perception always runs (loaded detector, lanes, corridor planner, other-vehicle tracks, E2E shadow). Path ribbon / GVD VISION overlays stay up. Actuators only when engaged **and** modular OK. Shadow mode computes both intents; default apply path stays modular. Dead-man / heartbeat unchanged. Detector default is shipped `models/yolov8n.onnx`. No E2E checkpoint in git (`models/e2e_current.onnx` still gitignored).
+Perception always runs (loaded detector, lanes, corridor planner, other-vehicle tracks, E2E shadow). Path ribbon / GVD VISION overlays stay up. Actuators only when engaged **and** modular OK. Shadow mode computes both intents; default apply path stays modular. `e2e_stub` (no trained onnx, `e2e_backend=stub`) holds the brake and stays engaged on `--policy e2e`. Shadow does not treat that stub as a disagreement. Dead-man / heartbeat unchanged. Detector default is shipped `models/yolov8n.onnx`. No E2E checkpoint in git (`models/e2e_current.onnx` still gitignored).
 
 
 ## M6 — `gvd_engage.json` contract (retail package)
@@ -172,10 +172,11 @@ Path: `Documents/GVD/gvd_engage.json`, shared by GELua and Python.
 
 | Writer | Payload | When |
 | --- | --- | --- |
-| Lua (`gvd_main.writeEngageFile`) | `{"engaged":true\|false,"mtime":<os.time() int>,"disengage_reason":"<why>"}` | Alt+G / GVD app button, `player_steer` / `player_brake` / `player_throttle`, `command_stream_dead`, `extension_unloaded` |
-| Python (`write_engage_flag`) | `{"engaged": false, "mtime": <time.time() float>, "disengage_reason": "<why>"}` | `player_steer` / `player_brake` / `player_throttle` / modular veto / stale heartbeat / `finally` on exit |
+| Lua (`gvd_main.writeEngageFile`) | `{"engaged":true\|false,"mtime":<os.time() int>,"disengage_reason":"<why>"}` | Alt+G / GVD app button, `player_steer` / `player_brake` / `player_throttle`, `command_stream_dead`, `extension_unloaded`. This is the only writer of `engaged:true`. |
+| Lua (`M.onUpdate`, every 0.5 s) | same shape, `engaged:true`, fresh `mtime` | While the in-memory latch is on. Does **not** bump `lastEngageWriteUnix`. Refuses to write `true` over a supervisor `false` whose `mtime` ≥ that stamp. |
+| Python (`write_engage_flag`) | `{"engaged": false, "mtime": <time.time() float>, "disengage_reason": "<why>"}` | `player_steer` / `player_brake` / `player_throttle` / modular veto / stale heartbeat / `finally` on exit. Python does not write `engaged:true`. |
 
-Python reads the file every tick and mirrors it into `engaged` (never invents engage). Lua polls it every 0.1 s **only while engaged** and adopts `engaged=false` when the file says so and `mtime` ≥ Lua's own last toggle stamp; it logs `[GVD] DISENGAGED by supervisor (<disengage_reason>)`, releases the vehicle inputs and refreshes the HUD/UI app. A file saying `true` never engages Lua — engage always starts in-game. Both sides write `false` on `player_steer` / `player_brake` / `player_throttle` (sticky, whichever sees it first) and Lua writes `false` when its dead-man fires. The file is the durable record of *why*: later supervisor ticks only see `engaged=false` and write the generic `not_engaged` into `disengage_reason`, so the mod keeps the reason it adopted for the HUD.
+Python reads the file every tick. `engaged:false` is always off. `engaged:true` counts only when JSON `mtime` age is in `[-1.0, 2.5]` seconds (`ENGAGE_FRESH_S`). Missing `mtime`, or a stamp left from a crashed session, is not engage — Tech must not call `vehicle.control` from it. A missing file returns the caller's default (the supervisor default is false). Lua polls the file every 0.1 s **only while engaged** and adopts `engaged=false` when the file says so and `mtime` ≥ Lua's own last toggle stamp; it logs `[GVD] DISENGAGED by supervisor (<disengage_reason>)`, releases the vehicle inputs and refreshes the HUD/UI app. A file saying `true` never engages Lua — engage always starts in-game (Alt+G or the app button). Both sides write `false` on `player_steer` / `player_brake` / `player_throttle` (sticky, whichever sees it first) and Lua writes `false` when its dead-man fires. The file is the durable record of *why*: later supervisor ticks only see `engaged=false` and write the generic `not_engaged` into `disengage_reason`, so the mod keeps the reason it adopted for the HUD.
 
 ## Player override (force-feedback residual)
 
@@ -223,7 +224,7 @@ Lua (`gvd_main.applyCmdJson`, 20 Hz): `input.event('steering', s, 2, 900, 0, nil
 | `steering_input` / `throttle_input` / `brake_input` | float | Applied electrics (GVD's command while the Direct Drive source is locked). Fallback override signal when `player_device` is false |
 | `player_device` | bool | True when vehicle Lua saw a non-`gvd` `input.lastInputs` source (physical wheel/pad/keys) |
 | `player_steering` / `player_throttle` / `player_brake` | float | Strongest non-`gvd` lastInputs axis. Override uses these as an absolute axis when `player_device` is true (centered wheel is 0, not residual vs `cmd.steer`) |
-| `applied_seq` | int | Last cmd seq Lua applied |
+| `applied_seq` | int | Last cmd seq Lua applied. Python claims `cmd_applied` only when `0 <= cmd_seq - applied_seq <= 5` |
 | `applying` | bool | Lua currently holds the inputs |
 | `mtime` | int | `os.time()`; Python uses the file mtime, fresh ≤ 1 s |
 | `gx` / `gy` / `gz` / `yaw_rate` | float? | Vehicle `sensors.gx2` + `obj:getYawAngularVelocity` (IMU extras; planner still vision-only) |

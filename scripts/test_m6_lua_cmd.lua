@@ -557,6 +557,19 @@ check(not droveMismatch, 'bus mismatch refuses actuation')
 check(M.isEngaged(), 'mismatch does not steal Lua-owned engage')
 M.toggleEngage()
 
+-- 15) Engage heartbeat: live latch stays fresh; a supervisor OFF is not overwritten.
+M.toggleEngage()
+check(M.isEngaged(), 'heartbeat setup engage')
+M.onUpdate(0.6)
+local hb = readFileAll(engagePath)
+check(M.isEngaged() and hb and hb:find('"engaged":true'), 'heartbeat keeps engaged true (' .. tostring(hb) .. ')')
+check(hb and hb:find('"mtime":' .. tostring(os.time()), 1, true), 'heartbeat refreshes mtime (' .. tostring(hb) .. ')')
+writeFile(engagePath, string.format('{"engaged": false, "mtime": %.3f, "disengage_reason": "shutdown"}', os.time() + 0.5))
+M.onUpdate(0.11)
+check(not M.isEngaged(), 'supervisor OFF still wins after a heartbeat')
+local stayed = readFileAll(engagePath)
+check(stayed and stayed:find('"engaged": false', 1, true), 'heartbeat did not rewrite supervisor OFF (' .. tostring(stayed) .. ')')
+
 -- 12) chrome check on everything we push to the vehicle / HUD
 for _, e in ipairs(logs) do assert(not e:lower():find('tesla') and not e:find('FSD'), 'chrome in log: ' .. e) end
 

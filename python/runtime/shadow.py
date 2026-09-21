@@ -94,9 +94,17 @@ def evaluate_veto(
             return "preview_blocked"
     if not e2e.ok:
         return "e2e_forward_fail"
-    disagree = abs(float(modular.steer) - float(e2e.steer))
-    if disagree > cfg.steer_disagree_max:
-        return "disagreement"
+    # Numpy stub (no models/e2e_current.onnx) is not a trained policy. Shadow still
+    # records the proposal; only the e2e apply path is refused.
+    backend = str(getattr(e2e, "backend", "") or "")
+    if policy == "e2e" and backend == "stub":
+        return "e2e_stub"
+    # Untrained weights are not a second driver. Shadow keeps the modular command
+    # instead of disengaging on a stub steer that happens to disagree.
+    if backend != "stub":
+        disagree = abs(float(modular.steer) - float(e2e.steer))
+        if disagree > cfg.steer_disagree_max:
+            return "disagreement"
     return "none"
 
 

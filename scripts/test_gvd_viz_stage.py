@@ -27,6 +27,17 @@ def main() -> None:
             assert hit is None, f"{name}: {label} found ({hit.group(0)!r})"
     assert "GVD" in stage_src and "VISION" in stage_src
 
+    from python.viz.debug_draw import cabin_drive_word
+
+    assert cabin_drive_word({"engaged": False})[0] == "OFF"
+    assert cabin_drive_word({"engaged": True, "cmd_reason": "preview_blocked"})[0] == "HOLD"
+    assert cabin_drive_word({"engaged": True, "cmd_reason": "veto:e2e_stub", "veto_reason": "e2e_stub"})[0] == "HOLD"
+    assert cabin_drive_word({"engaged": True, "cmd_reason": "cmd_json_pending", "cmd_applied": False})[0] == "ON"
+    assert cabin_drive_word({
+        "engaged": True, "cmd_reason": "cmd_json_applied", "cmd_applied": True, "lua_applying": True,
+    })[0] == "DRIVE"
+    assert cabin_drive_word({"bus_link": "MISMATCH", "engaged": True})[0] == "MISMATCH"
+
     from python.viz.nerd import FS_BODY, TH, VAL_COL_W, _extras_line, _nav_line, _text_size, scene_note
     from python.viz.stage import (
         VizUI,

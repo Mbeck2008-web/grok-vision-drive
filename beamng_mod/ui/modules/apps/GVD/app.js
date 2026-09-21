@@ -91,32 +91,42 @@ angular.module('beamng.apps')
         if (ui.link === 'mismatch') return 'link mismatch';
         return 'no link';
       };
+      function holding() {
+        if (!ui.engaged || ui.link === 'mismatch') return false;
+        if (ui.link !== 'live') return true;
+        var reason = String(ui.cmdReason || '');
+        if (reason === 'preview_blocked' || reason === 'heartbeat_stale' || reason.indexOf('veto:') === 0) return true;
+        if (ui.aeb === 'brake' || ui.aeb === 'warn') return true;
+        if (ui.vetoReason === 'e2e_stub') return true;
+        return false;
+      }
       function driving() {
-        if (ui.link !== 'live' || !ui.engaged) return false;
+        if (ui.link !== 'live' || !ui.engaged || holding()) return false;
         if (ui.applying) return true;
         return ui.actuator === 'beamngpy' && ui.cmdApplied === true;
       }
       scope.driving = driving;
+      scope.holding = holding;
       scope.rootClass = function () {
         return {
-          'is-engaged': ui.engaged && ui.link === 'live',
+          'is-engaged': ui.engaged && ui.link === 'live' && !holding(),
           'is-drive': driving(),
-          'is-hold': ui.engaged && ui.link !== 'live',
+          'is-hold': holding() || (ui.engaged && ui.link !== 'live' && ui.link !== 'mismatch'),
           'is-mismatch': ui.link === 'mismatch'
         };
       };
       scope.stateClass = function () {
         return {
-          'is-on': ui.engaged && ui.link === 'live',
+          'is-on': ui.engaged && ui.link === 'live' && !driving() && !holding(),
           'is-drive': driving(),
-          'is-hold': ui.engaged && ui.link !== 'live',
+          'is-hold': holding(),
           'is-mismatch': ui.link === 'mismatch'
         };
       };
       scope.stateLabel = function () {
         if (ui.link === 'mismatch') return 'MISMATCH';
         if (!ui.engaged) return 'DISENGAGED';
-        if (ui.link !== 'live') return 'HOLD';
+        if (holding()) return 'HOLD';
         return driving() ? 'DRIVE' : 'ENGAGED';
       };
       scope.stateReason = function () {
@@ -124,8 +134,10 @@ angular.module('beamng.apps')
         if (ui.engaged && ui.link === 'none') return 'dead-man: no telemetry, actuators off';
         if (ui.engaged && ui.link === 'stale') return 'dead-man: heartbeat stale, actuators off';
         if (ui.engaged) {
+          if (ui.vetoReason === 'e2e_stub') return 'untrained e2e stub - hold';
           if (ui.aeb === 'brake') return 'AEB brake';
           if (ui.aeb === 'warn') return 'AEB warn';
+          if (ui.cmdReason === 'preview_blocked') return 'preview hold - lane lines not seen';
           if (ui.vetoReason && ui.vetoReason !== 'none') return 'veto: ' + ui.vetoReason;
           if (driving()) return 'GVD holds the wheel - steer to take over';
           if (ui.actuator === 'cmd_json') return 'armed - waiting for supervisor commands';
@@ -153,7 +165,7 @@ angular.module('beamng.apps')
         if (ui.link === 'none') {
           return ui.policyReq ? ('requested ' + ui.policyReq + ' - supervisor not running') : 'supervisor not running';
         }
-        var bits = ['e2e ' + dash(ui.e2eBackend)];
+        var bits = [ui.e2eBackend === 'stub' ? 'e2e untrained stub' : ('e2e ' + dash(ui.e2eBackend))];
         bits.push('veto ' + dash(ui.vetoReason));
         if (ui.e2eOk === false) bits.push('e2e held by modular');
         if (ui.policyReq && ui.policyReq !== ui.policy) bits.push('requested ' + ui.policyReq + '...');

@@ -42,6 +42,7 @@ from python.viz.debug_draw import (
     draw_pip_boxes,
     draw_planner_cost,
 )
+from python.runtime.state_io import steer_preview_path_ego
 from python.viz.forecast import predict_modes
 from python.viz.nerd import NERD_WIDTH, hit_test, render_panel, scene_note
 
@@ -63,8 +64,8 @@ POLE = (136, 128, 120)
 MAX_AGENTS = 32
 MAX_FORECAST = 16
 STAGE_W, STAGE_H = 1280, 800
-PATH_FADE_START_M = 25.0
-PATH_FADE_END_M = 42.0
+# Fade the tail of whatever polyline exists. Do not invent meters past the last point.
+CORRIDOR_FADE_FRAC = 0.40
 # CAMS tab 4×2 wall on the stage (nerd panel has its own 2×4).
 CAMS_STAGE_BOX = (12, 28, STAGE_W - 24, STAGE_H - 40)
 CAMS_STAGE_GRID = (4, 2)
@@ -668,6 +669,96 @@ def _draw_stop_bar(
     cv2.line(img, a, b, (252, 248, 244), 3, cv2.LINE_AA)
 
 
+def _as_path(raw: Any) -> list[dict[str, float]]:
+    out: list[dict[str, float]] = []
+    for p in raw or []:
+        if isinstance(p, dict):
+            out.append({
+                "x": float(p.get("x") or 0.0),
+                "y": float(p.get("y") or 0.0),
+                "z": float(p.get("z") or 0.0),
+            })
+        elif isinstance(p, (list, tuple)) and len(p) >= 2:
+            z = float(p[2]) if len(p) > 2 else 0.0
+            out.append({"x": float(p[0]), "y": float(p[1]), "z": z})
+    return out
+
+
+def _arc_length(path: list) -> float:
+    pts = _as_path(path)
+    dist = 0.0
+    prev: tuple[float, float] | None = None
+    for p in pts:
+        if prev is not None:
+            dist += math.hypot(p["x"] - prev[0], p["y"] - prev[1])
+        prev = (p["x"], p["y"])
+    return dist
+
+
+def corridor_half_width(state: dict[str, Any]) -> float:
+    """Half of the planner corridor, in meters. No pixel floor and no lane-fan inflate."""
+    raw = state.get("path_width")
+    if raw is None:
+        planner = state.get("planner") if isinstance(state.get("planner"), dict) else {}
+        raw = planner.get("corridor_width")
+    try:
+        width = float(raw)
+    except (TypeError, ValueError):
+        width = 2.0
+    if width <= 0.0:
+        width = 2.0
+    return width * 0.5
+
+
+def _e2e_live(state: dict[str, Any]) -> bool:
+    """E2E is the driver only when the net is a real onnx and the modular veto is clear."""
+    policy = str(state.get("policy") or "modular").lower()
+    backend = str(state.get("e2e_backend") or "stub").lower()
+    veto = str(state.get("veto_reason") or "none").lower()
+    return policy == "e2e" and backend not in ("", "stub") and veto in ("none", "")
+
+
+def _e2e_corridor(state: dict[str, Any], modular: list[dict[str, float]]) -> list[dict[str, float]]:
+    """Exported E2E polyline, or the same steer integrator as steer_preview_path_ego.
+
+    Length follows the modular path that exists. A missing export does not become a 36 m preview.
+    """
+    exported = _as_path(state.get("path_e2e"))
+    if len(exported) >= 2:
+        return exported
+    shadow = state.get("shadow") if isinstance(state.get("shadow"), dict) else {}
+    if shadow.get("steer") is None:
+        return []
+    length = _arc_length(modular)
+    if length < 1.0:
+        return []
+    try:
+        steer = float(shadow["steer"])
+    except (TypeError, ValueError):
+        return []
+    return steer_preview_path_ego(steer * 30.0, length_m=length, step=1.0)
+
+
+def resolve_corridors(state: dict[str, Any]) -> tuple[list[dict[str, float]], list[dict[str, float]] | None]:
+    """Primary ribbon plus an optional shadow ghost.
+
+    Modular, or e2e/shadow held by a modular veto (including e2e_stub): the planner path.
+    policy=e2e with a live onnx and veto none: that net's path, not the modular polyline.
+    policy=shadow: primary is the modular command that actuates; ghost is the other path.
+    """
+    modular = _as_path(state.get("path_ego"))
+    policy = str(state.get("policy") or "modular").lower()
+    backend = str(state.get("e2e_backend") or "stub").lower()
+    if _e2e_live(state):
+        return _e2e_corridor(state, modular), None
+    ghost: list[dict[str, float]] | None = None
+    if policy == "shadow" and backend not in ("", "stub"):
+        other = _e2e_corridor(state, modular)
+        if len(other) >= 2:
+            ghost = other
+    return modular, ghost
+
+
 def _draw_filled_corridor(
     img: np.ndarray,
     path: list[dict],
@@ -677,8 +768,9 @@ def _draw_filled_corridor(
     half_w: float,
     intent: float,
     preview: bool,
+    gain: float = 1.0,
 ) -> None:
-    if len(path) < 2:
+    if len(path) < 2 or half_w <= 0.0:
         return
     trimmed: list[tuple[float, float, float]] = []
     dist = 0.0
@@ -687,12 +779,12 @@ def _draw_filled_corridor(
         x, y = float(p.get("x", 0)), float(p.get("y", 0))
         if prev is not None:
             dist += math.hypot(x - prev[0], y - prev[1])
-        if dist > PATH_FADE_END_M:
-            break
         trimmed.append((x, y, dist if prev is not None else 0.0))
         prev = (x, y)
     if len(trimmed) < 2:
         return
+    total = trimmed[-1][2]
+    fade_from = total * (1.0 - CORRIDOR_FADE_FRAC)
 
     left, right, center, alphas = [], [], [], []
     for i, (x, y, d) in enumerate(trimmed):
@@ -704,14 +796,17 @@ def _draw_filled_corridor(
         tx, ty = nx - x, ny - y
         norm = math.hypot(tx, ty) + 1e-6
         px, py = (ty / norm) * half_w, (-tx / norm) * half_w
-        fade = 1.0 if d <= PATH_FADE_START_M else max(0.0, 1.0 - (d - PATH_FADE_START_M) / (PATH_FADE_END_M - PATH_FADE_START_M))
+        if total <= 1e-3 or d <= fade_from:
+            fade = 1.0
+        else:
+            fade = max(0.0, 1.0 - (d - fade_from) / max(1e-3, total - fade_from))
         cx, cy = cam.project(x, y, 0.03)
         lx, ly = cam.project(x - px, y - py, 0.03)
         rx, ry = cam.project(x + px, y + py, 0.03)
-        if abs(rx - lx) < 3 and abs(ry - ly) < 3:
-            half_px = max(3.0, half_w * cam.scale_at(y))
-            lx, ly = int(cx - half_px), cy
-            rx, ry = int(cx + half_px), cy
+        if abs(rx - lx) < 1 and abs(ry - ly) < 1:
+            half_px = half_w * cam.scale_at(y)
+            lx, ly = int(round(cx - half_px)), cy
+            rx, ry = int(round(cx + half_px)), cy
         left.append((lx, ly))
         right.append((rx, ry))
         center.append((cx, cy))
@@ -720,7 +815,7 @@ def _draw_filled_corridor(
     nseg = len(left) - 1
     for i in range(nseg):
         near = 1.0 - i / max(1, nseg)
-        a = intent * (0.38 + 0.50 * near) * max(0.25, conf) * (0.55 * alphas[i] + 0.45 * alphas[i + 1])
+        a = gain * intent * (0.38 + 0.50 * near) * max(0.25, conf) * (0.55 * alphas[i] + 0.45 * alphas[i + 1])
         if a < 0.02:
             continue
         quad = np.array([left[i], left[i + 1], right[i + 1], right[i]], dtype=np.int32)
@@ -1043,12 +1138,13 @@ def render_stage(
 
     engaged = bool(state.get("engaged"))
     smoke = _allow_stub(state)
-    path = list(state.get("path_ego") or [])
+    primary, ghost = resolve_corridors(state)
+    path = primary
+    half_w = corridor_half_width(state)
     try:
-        path_width = float(state.get("path_width") or 2.0)
+        path_width = float(state.get("path_width") or (half_w * 2.0))
     except (TypeError, ValueError):
-        path_width = 2.0
-    half_w = max(0.9, path_width * 0.5)
+        path_width = half_w * 2.0
     try:
         path_conf = float(state.get("path_conf") or 0.5)
     except (TypeError, ValueError):
@@ -1073,11 +1169,22 @@ def render_stage(
     tracks = all_tracks if show_ghosts else []
 
     if show_path:
+        intent = pace_scale(state)
+        # Preview stays dimmer. A shadow ghost is thinner and only off the clean cabin.
+        if ghost and not clean:
+            _draw_filled_corridor(
+                img, ghost, path_conf, cam,
+                half_w=half_w * 0.62,
+                intent=intent * 0.40,
+                preview=False,
+                gain=0.55 if preview else 1.0,
+            )
         _draw_filled_corridor(
             img, path, path_conf, cam,
             half_w=half_w,
-            intent=pace_scale(state),
+            intent=intent,
             preview=preview,
+            gain=0.62 if preview else 1.0,
         )
         _draw_stop_bar(img, path, half_w, all_tracks, cipv_id, cam, is_halted(state))
         _draw_path_world_overlay(img, state.get("path_world") or [], cam)
@@ -1202,7 +1309,8 @@ def smoke(
         missing_state_keys=["live cameras", "real planner path", "occupancy grid"],
     )
     st["ego"] = {"speed_mps": 14.0, "steer_deg": 0.0, "throttle": 0.1, "brake": 0.0, "yaw_rate": 0.0}
-    authored_path = [{"x": 0.12 * math.sin(i / 14), "y": float(i), "z": 0.0} for i in range(0, 45)]
+    # Smoke furniture only. Live ticks keep the model path and do not pad it to this span.
+    authored_path = [{"x": 0.12 * math.sin(i / 14), "y": float(i), "z": 0.0} for i in range(0, 61)]
     st["path_ego"] = authored_path
     st["viz_smoke"] = True
     if use_perception:

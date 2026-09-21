@@ -681,9 +681,12 @@ def main() -> None:
                 heading = nav_heading_from_sources(vdata, ego_fb)
                 st["nav"] = nav_hint_from_bundle(extras_bundle, heading_deg=heading)
             st["sensors"] = extras_bundle.health()
-            st["path_ego"] = pout.path_ego if pout.path_ego else steer_preview_path_ego(steer, length_m=36.0)
+            # Real planner path wins. The 36 m steer preview is only the empty-path stand-in.
+            st["path_ego"] = list(pout.path_ego) if pout.path_ego else steer_preview_path_ego(steer, length_m=36.0)
             if not pout.path_ego:
                 st["path_debug_preview"] = True
+            e2e_path = getattr(tick.e2e, "path", None)
+            st["path_e2e"] = list(e2e_path) if e2e_path else []
             st["tracks"] = pout.tracks
             st["lanes_bev"] = pout.lanes_bev
             # Viz road model: detected boundaries + labelled predictions, never invented lanes.

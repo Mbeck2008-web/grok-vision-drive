@@ -30,6 +30,7 @@ class E2EIntent:
     ok: bool = True
     backend: str = "stub"
     reason: str = "ok"
+    path: list[dict[str, float]] | None = None
 
 
 def _resize_bgr(img: np.ndarray | None, w: int = E2E_W, h: int = E2E_H) -> np.ndarray:
@@ -50,6 +51,37 @@ def _resize_bgr(img: np.ndarray | None, w: int = E2E_W, h: int = E2E_H) -> np.nd
         xs = (np.linspace(0, max(sw - 1, 0), w)).astype(np.int32)
         out[:] = src[ys][:, xs, :3]
     return out
+
+
+def _polyline_from_array(arr: Any) -> list[dict[str, float]] | None:
+    """Nx2 / Nx3 waypoints, or a flat even xy vector of at least two points."""
+    a = np.asarray(arr, dtype=np.float64)
+    a = np.squeeze(a)
+    pts: list[dict[str, float]] = []
+    if a.ndim == 2 and a.shape[0] >= 2 and a.shape[1] >= 2:
+        for row in a:
+            z = float(row[2]) if row.shape[0] > 2 else 0.0
+            pts.append({"x": float(row[0]), "y": float(row[1]), "z": z})
+    elif a.ndim == 1 and a.size >= 4 and a.size % 2 == 0:
+        for i in range(0, int(a.size), 2):
+            pts.append({"x": float(a[i]), "y": float(a[i + 1]), "z": 0.0})
+    return pts or None
+
+
+def _path_from_onnx(outputs: Any, values: Any) -> list[dict[str, float]] | None:
+    """Use a named path/trajectory output. Steer and accel stay the control head."""
+    try:
+        pairs = list(zip(outputs, values))
+    except TypeError:
+        return None
+    for meta, arr in pairs:
+        name = str(getattr(meta, "name", "") or "").lower()
+        if not any(key in name for key in ("path", "traj", "waypoint", "corridor")):
+            continue
+        pts = _polyline_from_array(arr)
+        if pts and len(pts) >= 2:
+            return pts
+    return None
 
 
 def _accel_to_pedals(accel: float) -> tuple[float, float]:
@@ -199,6 +231,7 @@ class E2EPolicy:
             ok=True,
             backend="onnx",
             reason="ok",
+            path=_path_from_onnx(self._session.get_outputs(), outs),
         )
 
     def _forward_numpy(self, feats: dict[str, np.ndarray]) -> E2EIntent:

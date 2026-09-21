@@ -52,6 +52,7 @@ def main() -> None:
         lane_draw_mode,
         pace_scale,
         render_stage,
+        resolve_corridors,
         track_cls,
     )
 
@@ -367,6 +368,108 @@ def main() -> None:
         x0=4, y0=4, width=790, height=190, cols=4, rows=2, dropped=False,
     )
     assert n == 8
+
+    # Corridor width stays path_width/2 meters. A 40 m path does not grow ice past itself.
+    ribbon = {
+        "engaged": False,
+        "loop_hz": 12.0,
+        "policy": "modular",
+        "e2e_backend": "stub",
+        "veto_reason": "none",
+        "path_conf": 0.95,
+        "path_width": 2.0,
+        "path_debug_preview": False,
+        "viz_smoke": False,
+        "ego": {"speed_mps": 8.0, "brake": 0.0},
+        "planner": {"aeb": "off", "target_v": 8.0, "ttc_lead": 4.0, "corridor_width": 2.0},
+        "path_ego": [{"x": 0.0, "y": float(i), "z": 0.0} for i in range(0, 41)],
+        "tracks": [],
+        "lanes_ext": [],
+        "road_edges": [],
+        "signs": [],
+    }
+    primary, ghost = resolve_corridors(ribbon)
+    assert ghost is None
+    assert primary[-1]["y"] == 40.0
+    assert len(primary) == 41
+    rib_ui = VizUI()
+    rib_ui.layers = {0}
+    rib_ui.show_nerd = False
+    rib_ui.debug.viz_forecast = False
+    rib_ui.debug.viz_lanes = False
+    rib_ui.debug.viz_signs = False
+    painted = render_stage(ribbon, ui=rib_ui)
+    bare_path = dict(ribbon)
+    bare_path["path_ego"] = []
+    empty = render_stage(bare_path, ui=rib_ui)
+    delta = cv2.absdiff(painted, empty)
+    y_near = 12.0
+    painted_x = []
+    for x in np.linspace(-3.0, 3.0, 121):
+        px, py = cam.project(float(x), y_near, 0.03)
+        if int(delta[py, px].sum()) > 8:
+            painted_x.append(float(x))
+    assert painted_x, "corridor should paint near the ego"
+    world_half = max(abs(min(painted_x)), abs(max(painted_x)))
+    assert abs(world_half - float(ribbon["path_width"]) * 0.5) <= 0.25, world_half
+    right = max(painted_x)
+    half_px = abs(cam.project(right, y_near, 0.03)[0] - cam.project(0.0, y_near, 0.03)[0])
+    expected_half = (float(ribbon["path_width"]) * 0.5) * cam.scale_at(y_near)
+    assert abs(half_px - expected_half) <= max(8.0, 0.20 * expected_half), (
+        f"half-width {half_px:.1f}px != path_width/2 * scale_at ({expected_half:.1f}px)"
+    )
+    far_px, far_py = cam.project(2.2, y_near, 0.03)
+    assert int(delta[far_py, far_px].sum()) <= 8, "ribbon must not inflate out to the lane fan"
+
+    def _ice_at(y: float) -> int:
+        px, py = cam.project(0.0, y, 0.03)
+        patch = delta[py - 3:py + 4, px - 3:px + 4]
+        return int(np.count_nonzero(patch.sum(axis=2) > 8))
+
+    assert _ice_at(20.0) > 0, "ribbon should cover the path that exists"
+    assert _ice_at(46.0) == 0, "path ending at 40 m must not paint ice past ~40 m"
+    assert _ice_at(55.0) == 0
+
+    e2e_live = dict(ribbon)
+    e2e_live["policy"] = "e2e"
+    e2e_live["e2e_backend"] = "onnx"
+    e2e_live["veto_reason"] = "none"
+    e2e_live["path_e2e"] = [{"x": 1.5, "y": float(i), "z": 0.0} for i in range(0, 21)]
+    e2e_primary, e2e_ghost = resolve_corridors(e2e_live)
+    assert e2e_ghost is None
+    assert e2e_primary[-1]["y"] == 20.0
+    assert e2e_primary[5]["x"] == 1.5
+    held = dict(e2e_live)
+    held["veto_reason"] = "e2e_stub"
+    held["e2e_backend"] = "stub"
+    held_primary, _held_ghost = resolve_corridors(held)
+    assert held_primary[-1]["y"] == 40.0 and held_primary[0]["x"] == 0.0
+    steer_only = dict(ribbon)
+    steer_only["policy"] = "e2e"
+    steer_only["e2e_backend"] = "onnx"
+    steer_only["veto_reason"] = "none"
+    steer_only["shadow"] = {"steer": 0.35}
+    steer_only["path_e2e"] = []
+    integrated, _no_ghost = resolve_corridors(steer_only)
+    assert len(integrated) == 41 and abs(integrated[-1]["y"] - 40.0) < 0.2
+    assert any(abs(p["x"]) > 0.05 for p in integrated), "e2e steer must bend the ribbon"
+    shadow = dict(ribbon)
+    shadow["policy"] = "shadow"
+    shadow["e2e_backend"] = "onnx"
+    shadow["shadow"] = {"steer": 0.4}
+    shadow["path_e2e"] = [{"x": 4.0, "y": float(i), "z": 0.0} for i in range(0, 41)]
+    sh_primary, sh_ghost = resolve_corridors(shadow)
+    assert sh_primary[8]["x"] == 0.0 and sh_ghost is not None and sh_ghost[8]["x"] == 4.0
+    sh_clean = render_stage(shadow, ui=rib_ui)
+    sh_ui = VizUI()
+    sh_ui.layers = {1}
+    sh_ui.show_nerd = False
+    sh_ui.debug.viz_forecast = False
+    sh_ui.debug.viz_lanes = False
+    sh_ui.debug.viz_signs = False
+    sh_nerd = render_stage(shadow, ui=sh_ui)
+    assert int(cv2.absdiff(sh_clean, painted).sum()) == 0, "key 0 hides the shadow ghost"
+    assert int(cv2.absdiff(sh_nerd, sh_clean).sum()) > 0, "nerd shows the other policy ribbon"
 
     print("test_gvd_viz_stage: OK")
 

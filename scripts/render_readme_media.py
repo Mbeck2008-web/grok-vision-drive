@@ -2,9 +2,9 @@
 """Render README media under docs/media/ (synthetic cabin + in-game HUD).
 
 No recent live GVD viz/UI photos from the Windows live machine exist in-repo. Cabin comes from
-``python.viz.stage.smoke`` (parked, engaged=False). In-game UI is a raster of
-``beamng_mod/ui/modules/apps/GVD/app.html`` in DISENGAGED / Soft Esc parked
-(Chrome headless, OpenCV fallback). Captions must stay **synthetic**.
+``python.viz.stage.smoke`` (parked, engaged=False, title OFF). In-game UI is a CSS raster of
+``beamng_mod/ui/modules/apps/GVD/app.html``: DISENGAGED, plus one DRIVE glance-word card.
+(Chrome headless, OpenCV fallback). Captions must stay **synthetic**. Not a live Engage.
 """
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ sys.path.insert(0, str(ROOT))
 MEDIA = ROOT / "docs" / "media"
 CABIN = MEDIA / "gvd_cabin_synthetic.png"
 HUD = MEDIA / "gvd_ingame_ui_synthetic.png"
+HUD_DRIVE = MEDIA / "gvd_ingame_ui_drive_synthetic.png"
 APP_HTML = ROOT / "beamng_mod" / "ui" / "modules" / "apps" / "GVD" / "app.html"
 
 # Tiny on-frame stamp so GitHub unfurls stay honest without the README caption.
@@ -37,6 +38,8 @@ def _stamp(img, text: str = STAMP, *, corner: str = "tr") -> None:
     pad = 8
     if corner == "tr":
         x, y = w - tw - pad, 16
+    elif corner == "br":
+        x, y = w - tw - pad, h - pad
     else:
         x, y = pad, h - pad
     cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, (114, 124, 134), thick, cv2.LINE_AA)
@@ -63,9 +66,37 @@ def _app_css() -> str:
     return m.group(1).strip()
 
 
-def _hud_html() -> str:
-    """Parked DISENGAGED snapshot. Values match app.js with supervisor live, engage off."""
+def _hud_html(*, drive: bool = False) -> str:
+    """Static raster of app.html. CSS is extracted from the live file.
+
+    ``drive=False`` is DISENGAGED / standby. ``drive=True`` is the DRIVE glance
+    word (ice border, DISENGAGE). Wheel numbers are placeholders, not a log.
+    """
     css = _app_css()
+    if drive:
+        app_cls = "gvd-app bngApp is-engaged is-drive"
+        state_cls = "gvd-state is-drive"
+        state_main = "DRIVE"
+        state_sub = "GVD holds the wheel - steer to take over"
+        engage_cls = "gvd-engage is-on"
+        engage_label = "DISENGAGE"
+        wheel_left = "62%"
+        gas_w = "22%"
+        wheel_txt = "0.12"
+        gas_txt = "0.22"
+        applied = "applied wheel 0.12  gas 0.22  brake 0.00"
+    else:
+        app_cls = "gvd-app bngApp"
+        state_cls = "gvd-state"
+        state_main = "DISENGAGED"
+        state_sub = "standby"
+        engage_cls = "gvd-engage"
+        engage_label = "ENGAGE"
+        wheel_left = "50%"
+        gas_w = "0%"
+        wheel_txt = "0.00"
+        gas_txt = "0.00"
+        applied = "applied wheel 0.00  gas 0.00  brake 0.00"
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -80,7 +111,7 @@ html, body {{
 </style>
 </head>
 <body>
-<div class="gvd-app bngApp">
+<div class="{app_cls}">
   <div class="gvd-row gvd-head">
     <span class="gvd-brand">GVD</span>
     <span class="gvd-word">VISION</span>
@@ -90,13 +121,13 @@ html, body {{
     </span>
   </div>
 
-  <div class="gvd-state">
-    <div class="gvd-state-main">DISENGAGED</div>
-    <div class="gvd-state-sub">standby</div>
+  <div class="{state_cls}">
+    <div class="gvd-state-main">{state_main}</div>
+    <div class="gvd-state-sub">{state_sub}</div>
   </div>
 
-  <button type="button" class="gvd-engage">
-    <span>ENGAGE</span><i>ALT+G</i>
+  <button type="button" class="{engage_cls}">
+    <span>{engage_label}</span><i>ALT+G</i>
   </button>
 
   <div class="gvd-sec">
@@ -105,16 +136,16 @@ html, body {{
       <span>wheel</span>
       <div class="gvd-track">
         <i class="gvd-mid"></i>
-        <i class="gvd-mark" style="left:50%"></i>
+        <i class="gvd-mark" style="left:{wheel_left}"></i>
       </div>
-      <b>0.00</b>
+      <b>{wheel_txt}</b>
     </div>
     <div class="gvd-axis">
       <span>gas</span>
       <div class="gvd-track">
-        <i class="gvd-fill" style="width:0%"></i>
+        <i class="gvd-fill" style="width:{gas_w}"></i>
       </div>
-      <b>0.00</b>
+      <b>{gas_txt}</b>
     </div>
     <div class="gvd-axis">
       <span>brake</span>
@@ -123,7 +154,7 @@ html, body {{
       </div>
       <b>0.00</b>
     </div>
-    <div class="gvd-sub">applied wheel 0.00  gas 0.00  brake 0.00</div>
+    <div class="gvd-sub">{applied}</div>
   </div>
 
   <div class="gvd-sec">
@@ -142,7 +173,7 @@ html, body {{
       <button type="button" class="gvd-segbtn">e2e</button>
       <button type="button" class="gvd-segbtn">shadow</button>
     </div>
-    <div class="gvd-sub">e2e stub - veto none</div>
+    <div class="gvd-sub">e2e untrained stub - veto none</div>
   </div>
 
   <div class="gvd-sec">
@@ -157,7 +188,7 @@ html, body {{
 
   <button type="button" class="gvd-nerdbtn">+ nerd</button>
 
-  <div class="gvd-foot">Sim toy - camera-only - never a real car. synthetic raster.</div>
+  <div class="gvd-foot gvd-foot-pin">Sim toy - camera-only - never a real car.</div>
 </div>
 </body>
 </html>
@@ -223,7 +254,7 @@ def render_hud_chrome(dest: Path, html_path: Path, shot: Path) -> bool:
         "--hide-scrollbars",
         "--force-color-profile=srgb",
         "--force-device-scale-factor=2",
-        "--window-size=380,780",
+        "--window-size=420,980",
         "--virtual-time-budget=1500",
         f"--screenshot={shot}",
         html_path.resolve().as_uri(),
@@ -242,16 +273,17 @@ def render_hud_chrome(dest: Path, html_path: Path, shot: Path) -> bool:
     img = _crop_tile(img)
     if img.shape[0] < 300 or img.shape[1] < 260:
         return False
+    _stamp(img, corner="br")
     cv2.imwrite(str(dest), img, [cv2.IMWRITE_PNG_COMPRESSION, 9])
     return dest.is_file()
 
 
-def render_hud_opencv(dest: Path) -> Path:
+def render_hud_opencv(dest: Path, *, drive: bool = False) -> Path:
     """Fallback HUD card using GVD void/ice tokens (not live CEF)."""
     import cv2
     import numpy as np
 
-    from python.viz.stage import CORRIDOR, ICE, ICE_HI, VOID
+    from python.viz.stage import ICE, ICE_HI, VOID
 
     w, h = 330, 560
     img = np.full((h, w, 3), VOID, dtype=np.uint8)
@@ -279,12 +311,16 @@ def render_hud_opencv(dest: Path) -> Path:
     y = 52
     rect(8, y, w - 16, 28, panel)
     cv2.rectangle(img, (8, y), (10, y + 28), faint, -1)
-    text("DISENGAGED", 16, y + 19, 0.45, dim)
-    text("standby", w - 78, y + 18, 0.32, faint)
+    if drive:
+        text("DRIVE", 16, y + 19, 0.45, ICE_HI)
+        text("steer to take over", w - 148, y + 18, 0.28, faint)
+    else:
+        text("DISENGAGED", 16, y + 19, 0.45, dim)
+        text("standby", w - 78, y + 18, 0.32, faint)
     y = 90
     rect(8, y, w - 16, 32, (34, 28, 20))
     cv2.rectangle(img, (8, y), (w - 8, y + 32), (94, 82, 53), 1, cv2.LINE_AA)
-    text("ENGAGE", 118, y + 21, 0.45, ICE_HI)
+    text("DISENGAGE" if drive else "ENGAGE", 100 if drive else 118, y + 21, 0.45, ICE_HI)
     text("ALT+G", w - 62, y + 20, 0.32, faint)
     y = 136
     text("WHEEL / PEDALS", 10, y, 0.32, faint)
@@ -321,7 +357,7 @@ def render_hud_opencv(dest: Path) -> Path:
         rect(x, y + 24, 98, 22, (60, 50, 22) if on else panel)
         cv2.rectangle(img, (x, y + 24), (x + 98, y + 46), (134, 118, 75) if on else line, 1, cv2.LINE_AA)
         text(name.upper(), x + (18 if name != "modular" else 10), y + 40, 0.32, ICE_HI if on else dim)
-    text("e2e stub - veto none", 10, y + 66, 0.32, dim)
+    text("e2e untrained stub - veto none", 10, y + 66, 0.28, dim)
     y = 430
     cv2.line(img, (10, y), (w - 10, y), line, 1, cv2.LINE_AA)
     text("SENSING", 10, y + 16, 0.32, faint)
@@ -337,30 +373,32 @@ def render_hud_opencv(dest: Path) -> Path:
     y = 510
     text("+ nerd", 10, y, 0.32, faint)
     text("Sim toy - camera-only - never a real car.", 10, y + 28, 0.28, faint)
-    text("synthetic raster", 10, h - 14, 0.32, CORRIDOR)
+    _stamp(img, corner="br")
     dest.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(dest), img, [cv2.IMWRITE_PNG_COMPRESSION, 9])
     return dest
 
 
-def render_hud(dest: Path = HUD) -> Path:
+def render_hud(dest: Path = HUD, *, drive: bool = False) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
-        html_path = tmp / "gvd_hud_parked.html"
-        html_path.write_text(_hud_html(), encoding="utf-8")
+        html_path = tmp / ("gvd_hud_drive.html" if drive else "gvd_hud_parked.html")
+        html_path.write_text(_hud_html(drive=drive), encoding="utf-8")
         shot = tmp / "hud.png"
         if render_hud_chrome(dest, html_path, shot):
             return dest
-    return render_hud_opencv(dest)
+    return render_hud_opencv(dest, drive=drive)
 
 
 def main() -> int:
     MEDIA.mkdir(parents=True, exist_ok=True)
     cabin = render_cabin()
-    hud = render_hud()
+    hud = render_hud(HUD, drive=False)
+    hud_drive = render_hud(HUD_DRIVE, drive=True)
     print(f"[GVD] README media cabin -> {cabin}")
     print(f"[GVD] README media HUD   -> {hud}")
+    print(f"[GVD] README media DRIVE -> {hud_drive}")
     print("[GVD] captions: synthetic. Soft Esc parked. Not Engage. Not live photos from the Windows live machine.")
     return 0
 

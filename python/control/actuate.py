@@ -27,6 +27,9 @@ HEARTBEAT_STALE_S = 0.35
 AEB_BRAKE_TTC = 1.2
 EGO_FRESH_S = 1.0          # gvd_ego.json older than this → treat Lua feedback as gone
 CMD_ACK_SLACK = 5          # Lua acks lag a few seqs (20 Hz apply, 10 Hz echo, 15 Hz loop)
+# Lua heartbeats gvd_engage.json while its in-memory latch is on (os.time is 1 s).
+# A leftover engaged:true from a crashed session must not start Tech vehicle.control.
+ENGAGE_FRESH_S = 2.5
 
 # Tech no-R (research pin): arcade + brake-hold + no throttle auto-selects R.
 # Use realistic_automatic so brake-hold is not reverse throttle. Gear is int only
@@ -151,15 +154,30 @@ def read_ego_feedback(now: float | None = None) -> EgoFeedback | None:
 
 
 def read_engage_flag(default: bool = False) -> bool:
-    """Lua Alt+G writes gvd_engage.json; Python mirrors that (do not invent engage)."""
+    """Mirror Lua Alt+G. ``engaged:true`` counts only while ``mtime`` is fresh.
+
+    Lua rewrites the stamp while the in-game latch is on. A file left true after a
+    crash is not a new human engage — Tech must not call ``vehicle.control`` from it.
+    ``engaged:false`` is always off. A missing file returns *default*.
+    """
     p = engage_path()
     if not p.is_file():
         return default
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
-        return bool(data.get("engaged", default))
     except Exception:
         return default
+    if not isinstance(data, dict) or not bool(data.get("engaged", False)):
+        return False
+    try:
+        age = time.time() - float(data["mtime"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    # os.time() is whole seconds, so a heartbeat can look ~1 s old. A stamp far
+    # in the future is not a live latch.
+    if age < -1.0:
+        return False
+    return age <= ENGAGE_FRESH_S
 
 
 def write_engage_flag(engaged: bool, disengage_reason: str | None = None) -> None:
@@ -602,7 +620,13 @@ class CmdJsonActuator:
         fb = self.ack
         if fb is None or not fb.fresh or not fb.applying:
             return False
-        return fb.applied_seq >= int(seq) - CMD_ACK_SLACK
+        # Ack must be this seq or a few behind. A high applied_seq from a previous
+        # supervisor (seq restarts at 1) is not an ack of the command we just wrote.
+        try:
+            lag = int(seq) - int(fb.applied_seq)
+        except (TypeError, ValueError):
+            return False
+        return 0 <= lag <= CMD_ACK_SLACK
 
     def apply(self, cmd: DriveCommand) -> DriveCommand:
         driving = bool(self.engaged)

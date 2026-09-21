@@ -212,7 +212,7 @@ def main() -> None:
         "--encode",
         default="auto",
         choices=["auto", "qsv", "cpu", "nvenc"],
-        help="Clip encode: auto/qsv→libx264; nvenc only if explicitly requested",
+        help="Clip encode: auto prefers h264_qsv then libx264; nvenc only with --encode nvenc",
     )
     ap.add_argument(
         "--viz-screen",

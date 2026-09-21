@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT))
 MEDIA = ROOT / "docs" / "media"
 CABIN = MEDIA / "gvd_cabin_synthetic.png"
 HUD = MEDIA / "gvd_ingame_ui_synthetic.png"
+HUD_DRIVE = MEDIA / "gvd_ingame_ui_drive_synthetic.png"
 SOURCE = MEDIA / "SOURCE.md"
 README = ROOT / "README.md"
 APP_ICON = ROOT / "beamng_mod" / "ui" / "modules" / "apps" / "GVD" / "app.png"
@@ -28,28 +29,34 @@ def _png_size(path: Path) -> tuple[int, int]:
 
 
 def main() -> None:
-    assert CABIN.is_file() and HUD.is_file() and SOURCE.is_file()
+    assert CABIN.is_file() and HUD.is_file() and HUD_DRIVE.is_file() and SOURCE.is_file()
     cw, ch = _png_size(CABIN)
     hw, hh = _png_size(HUD)
+    dw, dh = _png_size(HUD_DRIVE)
     iw, ih = _png_size(APP_ICON)
     assert (cw, ch) == (1280, 800), (cw, ch)
     assert iw == 64 and ih == 64, "app.png is the 64px icon, not the HUD shot"
     assert hw >= 280 and hh >= 400, (hw, hh)
+    assert dw >= 280 and dh >= 400, (dw, dh)
     assert (hw, hh) != (iw, ih)
 
     import cv2
 
     cabin = cv2.imread(str(CABIN))
     hud = cv2.imread(str(HUD))
-    assert cabin is not None and hud is not None
+    drive = cv2.imread(str(HUD_DRIVE))
+    assert cabin is not None and hud is not None and drive is not None
     assert int(cabin.mean()) < 80, "cabin must stay a void-stage render"
     assert 8 < float(hud.mean()) < 60, hud.mean()
+    assert 8 < float(drive.mean()) < 60, drive.mean()
 
-    # Ice token present on both (BGR ~ 212,196,158).
+    # Ice token present (BGR ~ 212,196,158).
     ice_c = ((cabin[:, :, 0] > 170) & (cabin[:, :, 1] > 150) & (cabin[:, :, 2] > 120)).sum()
     ice_h = ((hud[:, :, 0] > 140) & (hud[:, :, 1] > 130) & (hud[:, :, 2] > 100)).sum()
+    ice_d = ((drive[:, :, 0] > 140) & (drive[:, :, 1] > 130) & (drive[:, :, 2] > 100)).sum()
     assert ice_c > 200, ice_c
     assert ice_h > 200, ice_h
+    assert ice_d > 200, ice_d
 
     readme = README.read_text(encoding="utf-8")
     src = SOURCE.read_text(encoding="utf-8")
@@ -57,6 +64,7 @@ def main() -> None:
     for text in (shot_block, src):
         assert "gvd_cabin_synthetic.png" in text
         assert "gvd_ingame_ui_synthetic.png" in text
+        assert "gvd_ingame_ui_drive_synthetic.png" in text
         assert "synthetic" in text.lower()
         assert CHROME_RE.search(text) is None, "screenshots/SOURCE must not add Tesla/FSD chrome"
 
@@ -66,9 +74,12 @@ def main() -> None:
     assert "Soft Esc parked" in shot_block
     assert "Not Engage" in shot_block
     assert "DISENGAGED" in shot_block
+    assert "DRIVE" in shot_block
+    assert "Not a live Engage" in shot_block
 
     assert "docs/media/gvd_cabin_synthetic.png" in readme
     assert "docs/media/gvd_ingame_ui_synthetic.png" in readme
+    assert "docs/media/gvd_ingame_ui_drive_synthetic.png" in readme
     assert "render_readme_media.py" in readme
 
     # Parked cabin: regenerating with engaged=False stays the README dest.

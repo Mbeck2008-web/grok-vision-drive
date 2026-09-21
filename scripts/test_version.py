@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline pin for GVD alpha 1.0.0 (no BeamNG). Canonical spots must stay in lockstep."""
+"""Offline pin for GVD alpha 1.0.1 (no BeamNG). Canonical spots must stay in lockstep."""
 from __future__ import annotations
 
 import json
@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import make_release_zip as rel  # noqa: E402
 import python as gvd  # noqa: E402
 
-PIN = "1.0.0"
+PIN = "1.0.1"
 CHANNEL = "alpha"
 
 
@@ -40,18 +40,18 @@ def main() -> None:
     assert strip["version"] == PIN, strip["version"]
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "## Alpha 1.0.0" in readme
+    assert f"## Alpha {PIN}" in readme
     assert "This is **alpha** — may break / not work; improves with fixes." in readme
     assert "**point** bumps" in readme
     assert "fixes / small UI" in readme
     assert "**main alpha** bump" in readme
     assert "features / core / UI overhaul" in readme
-    assert "1.0.0-alpha-<sha>" in readme
+    assert f"{PIN}-alpha-<sha>" in readme
     assert "Soft Esc parked" in readme
     assert "m6-<sha>" not in readme
 
-    banner = rel.version_text("1.0.0")
-    assert "Alpha 1.0.0: may break / not work. Improves with fixes." in banner
+    banner = rel.version_text(PIN)
+    assert f"Alpha {PIN}: may break / not work. Improves with fixes." in banner
     print("test_version: OK")
 
 

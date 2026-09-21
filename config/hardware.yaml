@@ -1,4 +1,5 @@
-# Default hardware profile — do not raise inference VRAM without --profile unlimited (OFF by default).
+# Default hardware profile. max_inference_vram_gb is the inference cap.
+# There is no CLI --profile unlimited.
 profile: gtx_1080_ti
 cpu: i9-9900k
 system_ram_gb: 32

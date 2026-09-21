@@ -20,7 +20,7 @@ class _FixedE2E:
     def __init__(self, steer: float = 0.0, accel: float = 0.0) -> None:
         self.steer = float(steer)
         self.accel = float(accel)
-        self.backend = "stub"
+        self.backend = "onnx"
 
     def forward(self, *args, **kwargs) -> E2EIntent:
         a = self.accel
@@ -32,7 +32,7 @@ class _FixedE2E:
             throttle=thr,
             brake=brk,
             ok=True,
-            backend="stub",
+            backend="onnx",
             reason="fixed",
         )
 
@@ -219,6 +219,57 @@ def main() -> None:
     assert tick_warn.e2e_ok is False
     assert tick_warn.applied.throttle == 0.0 and tick_warn.applied.brake == 1.0
     assert tick_warn.applied.reason.startswith("veto:")
+
+    # No trained ONNX: the numpy stub must not be applied as an e2e policy.
+    class _StubE2E(_FixedE2E):
+        def forward(self, *args, **kwargs):
+            intent = super().forward(*args, **kwargs)
+            intent.backend = "stub"
+            intent.reason = "stub"
+            return intent
+
+    tick_stub = shadow_tick(
+        policy="e2e",
+        engaged=True,
+        heartbeat_ok=True,
+        path_debug_preview=False,
+        allow_preview_drive=False,
+        path_ego=_path(x=0.0),
+        planner={"target_v": 10, "aeb": "off"},
+        ego_speed_mps=5.0,
+        lane_conf=0.9,
+        path_conf=0.8,
+        seq=8,
+        e2e_policy=_StubE2E(steer=0.4, accel=0.3),
+        main_bgr=main,
+        wide_bgr=wide,
+        cfg=cfg,
+    )
+    assert tick_stub.veto_reason == "e2e_stub", tick_stub.veto_reason
+    assert tick_stub.should_disengage is False
+    assert tick_stub.applied.steer == 0.0 and tick_stub.applied.throttle == 0.0
+    assert tick_stub.applied.brake == 1.0 and tick_stub.applied.reason == "veto:e2e_stub"
+    # Shadow still drives modular when the proposal is only a stub.
+    tick_shadow_stub = shadow_tick(
+        policy="shadow",
+        engaged=True,
+        heartbeat_ok=True,
+        path_debug_preview=False,
+        allow_preview_drive=False,
+        path_ego=_path(x=0.0),
+        planner={"target_v": 10, "aeb": "off"},
+        ego_speed_mps=5.0,
+        lane_conf=0.9,
+        path_conf=0.8,
+        seq=9,
+        e2e_policy=_StubE2E(steer=0.95, accel=0.3),
+        main_bgr=main,
+        wide_bgr=wide,
+        cfg=cfg,
+    )
+    assert tick_shadow_stub.veto_reason == "none", tick_shadow_stub.veto_reason
+    assert tick_shadow_stub.should_disengage is False
+    assert tick_shadow_stub.applied.reason == "ok"
 
     # train module imports without weights
     from python.train.train_e2e import smoke_import

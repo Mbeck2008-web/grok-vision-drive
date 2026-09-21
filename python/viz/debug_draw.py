@@ -29,7 +29,42 @@ COST_HOT = (92, 92, 196)
 HUD = (212, 204, 200)
 HUD_DIM = (120, 120, 120)
 ICE_HI = (248, 238, 214)
+AMBER = (74, 165, 216)  # #d8a54a
+MISMATCH_RED = (112, 112, 208)
 PAPER = (225, 230, 232)
+
+
+def cabin_drive_word(state: dict[str, Any]) -> tuple[str, tuple[int, int, int]]:
+    """Same glance word as the in-game app: OFF / ENGAGED is ON here, HOLD, DRIVE, MISMATCH.
+
+    Preview, veto, and AEB are HOLD. DRIVE only when engaged and the command is a live apply.
+    """
+    link = str(state.get("link") or "")
+    bus = str(state.get("bus_link") or "")
+    if link == "mismatch" or bus == "MISMATCH":
+        return "MISMATCH", MISMATCH_RED
+    if not state.get("engaged"):
+        return "OFF", HUD_DIM
+    reason = str(state.get("cmd_reason") or "")
+    planner = state.get("planner") if isinstance(state.get("planner"), dict) else {}
+    aeb = str((planner or {}).get("aeb") or "off")
+    veto = str(state.get("veto_reason") or "none")
+    if (
+        reason in ("preview_blocked", "heartbeat_stale", "bus_mismatch")
+        or reason.startswith("veto:")
+        or aeb in ("brake", "warn")
+        or veto == "e2e_stub"
+    ):
+        return "HOLD", AMBER
+    applied = bool(state.get("cmd_applied"))
+    lua_applying = bool(state.get("lua_applying"))
+    actuator = str(state.get("actuator") or "")
+    # Pending retail writes are armed, not driving. DRIVE needs a live apply.
+    if lua_applying or (actuator == "beamngpy" and applied) or (reason == "cmd_json_applied" and applied):
+        return "DRIVE", ICE_HI
+    if reason in ("ok", "plan") and applied:
+        return "DRIVE", ICE_HI
+    return "ON", (212, 196, 158)
 
 _FRUSTUMS: list[dict[str, Any]] | None = None
 
@@ -431,7 +466,6 @@ def draw_dense_hud(
     except (TypeError, ValueError):
         v = 0.0
     mph = v * 2.23694
-    engaged = bool(state.get("engaged"))
     policy = str(state.get("policy") or "?")
     aeb = str(pl.get("aeb") or "off")
     ttc = pl.get("ttc_lead")
@@ -443,14 +477,14 @@ def draw_dense_hud(
     cv2.putText(img, "mph", (18, base - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.38, HUD_DIM, 1, cv2.LINE_AA)
     cv2.putText(img, f"{v:.1f} m/s", (18, base - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.36, HUD, 1, cv2.LINE_AA)
     # Right cluster.
-    drive = "DRIVE" if engaged else "idle"
+    drive, drive_col = cabin_drive_word(state)
     cv2.putText(
         img,
         f"{policy}  {drive}",
         (stage_w - 220, base - 44),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.42,
-        ICE_HI if engaged else HUD_DIM,
+        drive_col,
         1,
         cv2.LINE_AA,
     )

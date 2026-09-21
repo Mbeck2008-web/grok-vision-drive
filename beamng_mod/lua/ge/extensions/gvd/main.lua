@@ -864,14 +864,32 @@ local function uiPayload()
   local ttc = pl.ttc_lead
   local ttcS = (ttc == nil) and '--' or string.format('%.1f', tonumber(ttc) or 0)
   local n = tonumber((st and (st.tracks_n or st.objects_n))) or 0
-  local modeTag = engaged and (applying and '|DRIVE' or '|ON') or '|OFF'
+  local camOk, camTotal, camList = uiCams(st)
+  local reason = st and tostring(st.cmd_reason or '') or ''
+  local aeb = pl.aeb and tostring(pl.aeb) or ''
+  -- preview / veto / AEB / stale link are holds. DRIVE only while a live command is applied.
+  local hold = link ~= 'live' or reason == 'preview_blocked' or reason == 'heartbeat_stale'
+    or reason:sub(1, 5) == 'veto:' or aeb == 'brake' or aeb == 'warn'
+  local actuator = st and tostring(st.actuator or '') or ''
+  local applied = st and st.cmd_applied == true
+  local modeTag = '|OFF'
+  if link == 'mismatch' then
+    modeTag = '|MISMATCH'
+  elseif engaged and hold then
+    modeTag = '|HOLD'
+  elseif engaged and (applying or (actuator == 'beamngpy' and applied)) then
+    modeTag = '|DRIVE'
+  elseif engaged then
+    modeTag = '|ON'
+  end
   local line
-  if st then
+  if link == 'mismatch' then
+    line = 'GVD  MISMATCH  buses differ'
+  elseif st then
     line = string.format('GVD  %s%s  %.0fHz  TTC %s  N=%d', mode, modeTag, hz, ttcS, n)
   else
     line = 'GVD  ' .. (engaged and 'ON' or 'OFF') .. '  no telemetry'
   end
-  local camOk, camTotal, camList = uiCams(st)
 
   return {
     -- engage / safety
@@ -950,6 +968,7 @@ local function uiPayload()
     edges = showScene and uiEdges(st) or nil,
     signs = showScene and uiSigns(st) or nil,
     mode = mode .. modeTag,
+    tag = modeTag:sub(2),
     text = line,
   }
 end
@@ -960,7 +979,7 @@ local function pushUi()
     pcall(function()
       guihooks.trigger('gvdStrip', {
         text = p.text, mode = p.mode, hz = p.hz, ttc = p.ttc, n = p.n,
-        engaged = engaged, applying = applying,
+        engaged = engaged, applying = applying, link = p.link, tag = p.tag,
       })
       guihooks.trigger('gvdUi', p)
     end)
@@ -1885,6 +1904,25 @@ end
 
 function M.onUpdate(dt)
   pollState(dt)
+  -- Python honors engaged:true only while mtime is fresh (~2.5 s). Refresh the stamp
+  -- while the in-game latch is on. Do not move lastEngageWriteUnix, and do not write
+  -- true over a supervisor false that pollState has not adopted yet. Kept inline so
+  -- the GELua chunk stays under Lua 5.1's 200-local limit.
+  if engaged then
+    M.engageHbAcc = (M.engageHbAcc or 0) + (dt or 0)
+    if M.engageHbAcc >= 0.50 then
+      M.engageHbAcc = 0
+      local raw = readText(ENGAGE_REL)
+      local f = raw and decodeJson(raw) or nil
+      local blocked = type(f) == 'table' and f.engaged == false and (tonumber(f.mtime) or 0) >= lastEngageWriteUnix
+      if not blocked then
+        writeText(gvdFile('gvd_engage.json'), string.format(
+          '{"engaged":true,"mtime":%d,"disengage_reason":"none"}', os.time()))
+      end
+    end
+  else
+    M.engageHbAcc = 0
+  end
   applyCmdJson(dt)
   pollEgo(dt)
   pollLidarLua(dt)

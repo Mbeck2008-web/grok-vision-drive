@@ -32,6 +32,7 @@ from python.runtime.debug_opts import (
 )
 from python.viz.debug_draw import (
     clamp_front_overexpose,
+    cabin_drive_word,
     draw_cam_strip,
     draw_cam_tiles,
     draw_dense_hud,
@@ -41,7 +42,7 @@ from python.viz.debug_draw import (
     draw_pip_boxes,
     draw_planner_cost,
 )
-from python.viz.forecast import cone_widths, predict_modes
+from python.viz.forecast import predict_modes
 from python.viz.nerd import NERD_WIDTH, hit_test, render_panel, scene_note
 
 VOID = (10, 8, 7)  # #07080a
@@ -911,22 +912,61 @@ def _draw_ego(img: np.ndarray, cam: Cam, engaged: bool) -> None:
     _draw_box(img, cam, 0.0, 0.0, yaw, 4.4, 1.85, 1.5, EGO_BODY, 1.0, EGO_EDGE, 1)
 
 
+def _pt_xy(p: Any) -> tuple[float, float]:
+    if isinstance(p, dict):
+        return float(p.get("x") or 0.0), float(p.get("y") or 0.0)
+    return float(p[0]), float(p[1])
+
+
+def _fan_ahead(tr: dict[str, Any] | None, points: list) -> list:
+    """Drop samples still on the box so a fan never stamps the face.
+
+    The first kept point is at least half a length in front of the track origin.
+    """
+    if not points:
+        return []
+    src = tr if isinstance(tr, dict) else {}
+    length, _, _ = _track_dims(src, track_cls(src))
+    half = max(0.5, float(length) * 0.5)
+    if src.get("x") is not None or src.get("y") is not None:
+        x0 = float(src.get("x") or 0.0)
+        y0 = float(src.get("y") or 0.0)
+    else:
+        x0, y0 = _pt_xy(points[0])
+    yaw = None
+    if src.get("yaw") is not None:
+        try:
+            yaw = float(src["yaw"])
+        except (TypeError, ValueError):
+            yaw = None
+    if yaw is None and len(points) >= 2:
+        ax, ay = _pt_xy(points[0])
+        bx, by = _pt_xy(points[1])
+        if abs(bx - ax) + abs(by - ay) > 1e-4:
+            yaw = math.atan2(by - ay, bx - ax)
+    if yaw is None:
+        yaw = math.pi / 2
+    fx, fy = math.cos(yaw), math.sin(yaw)
+    ahead = []
+    for p in points:
+        px, py = _pt_xy(p)
+        if (px - x0) * fx + (py - y0) * fy >= half - 1e-6:
+            ahead.append(p)
+    return ahead
+
+
 def _draw_agent_forecasts(img: np.ndarray, tr: dict[str, Any], cam: Cam) -> None:
     modes = predict_modes(tr)
     if not modes:
         return
-    m0 = modes[0]["points"]
-    widths = cone_widths(len(m0))
+    # Thin ground line only. No disc, halo, or centroid mark on the box face.
+    m0 = _fan_ahead(tr, modes[0]["points"])
     for i in range(len(m0) - 1):
-        a = cam.project(m0[i][0], m0[i][1], 0.3)
-        b = cam.project(m0[i + 1][0], m0[i + 1][1], 0.3)
-        cv2.line(img, a, b, ICE, 2, cv2.LINE_AA)
-        rad = max(2, int(widths[i] * cam.scale_at(m0[i][1]) * 0.30))
-        overlay = img.copy()
-        cv2.circle(overlay, b, rad, (55, 50, 45), -1, cv2.LINE_AA)
-        cv2.addWeighted(overlay, 0.14, img, 0.86, 0, img)
+        a = cam.project(m0[i][0], m0[i][1], 0.04)
+        b = cam.project(m0[i + 1][0], m0[i + 1][1], 0.04)
+        cv2.line(img, a, b, ICE, 1, cv2.LINE_AA)
     for m in modes[1:]:
-        pts = [cam.project(p[0], p[1], 0.3) for p in m["points"]]
+        pts = [cam.project(p[0], p[1], 0.04) for p in _fan_ahead(tr, m["points"])]
         for i in range(0, len(pts) - 1, 2):
             cv2.line(img, pts[i], pts[min(i + 1, len(pts) - 1)], (100, 100, 100), 1, cv2.LINE_AA)
 
@@ -934,12 +974,12 @@ def _draw_agent_forecasts(img: np.ndarray, tr: dict[str, Any], cam: Cam) -> None
 def _draw_state_fans(img: np.ndarray, agents: list, cam: Cam) -> None:
     """Mode-0 fans already written into state.agents (same toy math as predict_modes)."""
     for ag in agents or []:
-        pts = _poly_points(ag.get("path_ego") if isinstance(ag, dict) else ag)
+        raw = ag.get("path_ego") if isinstance(ag, dict) else ag
+        pts = _fan_ahead(ag if isinstance(ag, dict) else {}, _poly_points(raw))
         if len(pts) < 2:
             continue
-        screen = _proj_poly(cam, pts, 0.06)
+        screen = _proj_poly(cam, pts, 0.04)
         _stroke_poly(img, screen, _mix(ICE, 0.30), 1)
-        cv2.circle(img, screen[-1], 2, _mix(ICE, 0.35), -1, cv2.LINE_AA)
 
 
 def render_stage(
@@ -987,6 +1027,8 @@ def render_stage(
         cv2.rectangle(img, (0, 0), (STAGE_W, 22), (12, 13, 16), -1)
         cv2.putText(img, "GVD", (12, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, ICE, 1, cv2.LINE_AA)
         cv2.putText(img, "VISION", (52, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1, cv2.LINE_AA)
+        word, word_col = cabin_drive_word(state)
+        cv2.putText(img, word, (118, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, word_col, 1, cv2.LINE_AA)
         cam_lbl = "CAMS dropped" if drop_heavy else "CAMS 8-view"
         cv2.putText(img, cam_lbl, (STAGE_W - 150, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
         note = scene_note(state)
@@ -1044,6 +1086,15 @@ def render_stage(
         draw_planner_cost(img, cam, path, path_width, all_tracks)
 
     if not drop_heavy and dbg.viz_forecast:
+        # Fans go down before the boxes. A ground line ahead of a car still
+        # projects inside the chase silhouette, and a disc there reads as a pupil.
+        if show_ghosts:
+            n_forecast = 0
+            for tr in tracks:
+                if n_forecast >= MAX_FORECAST:
+                    break
+                _draw_agent_forecasts(img, tr, cam)
+                n_forecast += 1
         _draw_state_fans(img, state.get("agents") or [], cam)
 
     if show_ghosts:
@@ -1052,13 +1103,6 @@ def render_stage(
             show_ids=(not clean) and dbg.viz_ids,
             show_vel=(not clean) and dbg.viz_vel,
         )
-        n_forecast = 0
-        if not drop_heavy and dbg.viz_forecast:
-            for tr in tracks:
-                if n_forecast >= MAX_FORECAST:
-                    break
-                _draw_agent_forecasts(img, tr, cam)
-                n_forecast += 1
 
     if not drop_heavy and dbg.viz_signs:
         _draw_signs(img, state.get("signs") or [], cam)
@@ -1100,6 +1144,8 @@ def render_stage(
     cv2.rectangle(img, (0, 0), (STAGE_W, 22), (12, 13, 16), -1)
     cv2.putText(img, "GVD", (12, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, ICE, 1, cv2.LINE_AA)
     cv2.putText(img, "VISION", (52, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1, cv2.LINE_AA)
+    word, word_col = cabin_drive_word(state)
+    cv2.putText(img, word, (118, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, word_col, 1, cv2.LINE_AA)
     cam_lbl = "BEV debug" if ui.top_down else "chase 3/4"
     cv2.putText(img, cam_lbl, (STAGE_W - 120, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
     note = scene_note(state)

@@ -109,6 +109,7 @@ def check_release_zip() -> None:
             assert "beamng_mod/ui/modules/apps/GVD/app.png" in rels
             assert "docs/media/gvd_cabin_synthetic.png" in rels
             assert "docs/media/gvd_ingame_ui_synthetic.png" in rels
+            assert "docs/media/gvd_ingame_ui_drive_synthetic.png" in rels
             assert "docs/media/SOURCE.md" in rels
             assert "AGENTS.md" in rels
             assert "models/.gitkeep" in rels
@@ -281,6 +282,12 @@ def check_cmd_json_drive_bus() -> None:
     out = act.apply(DriveCommand(steer=0.0, throttle=0.1, brake=0.0, seq=9, reason="ok"))
     assert out.applied is False and out.reason == "cmd_json_pending", out
 
+    # Previous session's high applied_seq is not an ack of a restarted supervisor.
+    _write_ego(500)
+    act.note_ack(read_ego_feedback())
+    out = act.apply(DriveCommand(steer=0.0, throttle=0.1, brake=0.0, seq=4, reason="ok"))
+    assert out.applied is False and out.reason == "cmd_json_pending", out
+
     # Stale ack (Lua stopped echoing) → not applied.
     _write_ego(9, age_s=5.0)
     fb = read_ego_feedback()
@@ -407,6 +414,30 @@ def _run_supervisor(
         latched = {"engage": eng, "cmd": cmd, "state": st}
         return True
 
+    last_engage_hb = 0.0
+
+    def _touch_engage_heartbeat() -> None:
+        """Stand in for Lua's engage-file heartbeat so a multi-second run stays latched."""
+        nonlocal last_engage_hb
+        now = time.time()
+        if now - last_engage_hb < 1.0:
+            return
+        try:
+            data = json.loads(engage_path().read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(data, dict) or data.get("engaged") is not True:
+            return
+        try:
+            again = json.loads(engage_path().read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if again.get("engaged") is not True:
+            return
+        again["mtime"] = now
+        engage_path().write_text(json.dumps(again), encoding="utf-8")
+        last_engage_hb = now
+
     t_end = time.time() + seconds
     try:
         _touch_lua_bus()
@@ -414,6 +445,7 @@ def _run_supervisor(
             if proc.poll() is not None:
                 raise AssertionError(f"run_vision exited early ({proc.returncode})")
             _touch_lua_bus()
+            _touch_engage_heartbeat()
             _ack_once()
             if _try_latch():
                 break
@@ -428,6 +460,7 @@ def _run_supervisor(
             if proc.poll() is not None:
                 break
             _touch_lua_bus()
+            _touch_engage_heartbeat()
             _ack_once()
             if _try_latch():
                 break
@@ -585,9 +618,13 @@ def check_engage_path_contract() -> None:
     p = engage_path()
     assert p.parts[-3:] == ("Documents", "GVD", "gvd_engage.json"), p
     assert p.parent == state_path().parent == cmd_path().parent
-    # Lua-shaped payload (Alt+A) must read back as engaged.
+    # A leftover true from a crashed session is not a live Alt+G.
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text('{"engaged":true,"mtime":1700000000}', encoding="utf-8")
+    assert read_engage_flag(default=False) is False
+    p.write_text('{"engaged":true}', encoding="utf-8")
+    assert read_engage_flag(default=False) is False, "engaged:true without mtime must not latch"
+    p.write_text(json.dumps({"engaged": True, "mtime": time.time()}), encoding="utf-8")
     assert read_engage_flag(default=False) is True
     # Supervisor disengage payload: engaged=false with float mtime + reason (what Lua adopts as OFF and logs).
     write_engage_flag(False, disengage_reason="player_steer")
@@ -653,11 +690,11 @@ def check_no_chrome() -> None:
 def check_player_docs() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "**M6" in readme, "README Status must be M6"
-    assert "## Alpha 1.0.0" in readme
+    assert "## Alpha 1.0.1" in readme
     assert "This is **alpha** — may break / not work; improves with fixes." in readme
     assert "**point** bumps" in readme and "fixes / small UI" in readme
     assert "**main alpha** bump" in readme and "features / core / UI overhaul" in readme
-    assert "1.0.0-alpha-<sha>" in readme
+    assert "1.0.1-alpha-<sha>" in readme
     assert "## Player guide" in readme
     assert "make_release_zip" in readme
     assert "requirements-retail.txt" in readme
@@ -666,6 +703,7 @@ def check_player_docs() -> None:
     assert "play_gvd_tech.bat" in readme and "tech.yaml" in readme
     assert "docs/media/gvd_cabin_synthetic.png" in readme
     assert "docs/media/gvd_ingame_ui_synthetic.png" in readme
+    assert "docs/media/gvd_ingame_ui_drive_synthetic.png" in readme
     assert "## Screenshots" in readme
     assert readme.lower().count("synthetic") >= 4
     assert "beamngpy if importable" not in readme.lower(), "auto backend must not pick Tech just because beamngpy is installed"

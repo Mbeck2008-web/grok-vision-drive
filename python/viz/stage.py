@@ -1593,6 +1593,52 @@ def render_stage(
     return img
 
 
+def _smoke_traffic() -> list[dict[str, Any]]:
+    """Cars for the smoke/README cabin. Furniture, not a live detector.
+
+    Centers sit in the stub lane fan so boxes miss the left lane-line probes
+    the viz test samples, and miss the ground samples at (0.45, 70) and (0.45, -6).
+    """
+    # id, x, y, speed, class. Lane centers are about 0, ±3.6, ±7.1.
+    spec = [
+        (1, 0.15, 14.0, 11.0, "vehicle"),
+        (2, 3.55, 8.5, 13.0, "vehicle"),
+        (3, -3.55, 10.5, 12.0, "vehicle"),
+        (4, 7.05, 16.0, 15.0, "vehicle"),
+        (5, -7.05, 18.0, 13.0, "vehicle"),
+        (6, -3.5, 24.0, 14.0, "vehicle"),
+        (7, 3.5, 26.0, 10.5, "vehicle"),
+        (8, 0.1, 32.0, 12.0, "vehicle"),
+        (9, 7.0, 34.0, 16.0, "vehicle"),
+        (10, -7.0, 36.0, 11.5, "vehicle"),
+        (11, 3.55, 42.0, 13.0, "vehicle"),
+        (12, -3.55, 44.0, 12.5, "vehicle"),
+        (13, 0.05, 50.0, 14.0, "vehicle"),
+        (14, -3.6, 56.0, 11.0, "vehicle"),
+        (15, 3.5, 60.0, 13.5, "vehicle"),
+        (16, 7.1, 52.0, 15.0, "vehicle"),
+        (17, -7.05, 58.0, 12.0, "vehicle"),
+        (18, 3.6, 78.0, 13.0, "vehicle"),
+        (19, -3.55, 96.0, 12.0, "vehicle"),
+        (20, 0.1, 110.0, 14.0, "vehicle"),
+        (21, -3.6, -5.2, 12.0, "vehicle"),
+        (22, 3.55, -5.0, 11.0, "vehicle"),
+        (23, 8.6, 13.0, 1.4, "pedestrian"),
+    ]
+    out: list[dict[str, Any]] = []
+    for tid, x, y, spd, cls in spec:
+        out.append({
+            "id": tid,
+            "class": cls,
+            "x": x,
+            "y": y,
+            "speed_mps": spd,
+            "yaw": 1.57 if cls == "vehicle" else 3.05,
+            "yaw_rate": 0.0,
+        })
+    return out
+
+
 def _span_ys(y0: float, y1: float, step: float = 3.0) -> list[float]:
     """Inclusive samples from y0 to y1. Smoke authors lanes across the cabin span."""
     ys: list[float] = []
@@ -1694,6 +1740,20 @@ def smoke(
         pl["target_v"] = 11.0
         st["planner"] = pl
         st["ego"]["speed_mps"] = 14.0
+    # README / --smoke shots. A blank frame only yields two synthetic cars.
+    # This pack is furniture so the cabin reads as traffic. Live ticks do not use it.
+    st["tracks"] = _smoke_traffic()
+    st["tracks_n"] = len(st["tracks"])
+    st["objects_n"] = st["tracks_n"]
+    pl_show = dict(st.get("planner") or {})
+    pl_show["cipv_id"] = 1
+    pl_show["aeb"] = "off"
+    pl_show["target_v"] = 11.0
+    pl_show["ttc_lead"] = 2.4
+    st["planner"] = pl_show
+    st["missing_state_keys"] = sorted(set(
+        (st.get("missing_state_keys") or []) + ["live tracks (smoke authors a traffic pack)"]
+    ))
     if not st.get("lanes_ext"):
         # --smoke has no camera, so the Hough fit finds nothing. Give the stage
         # something to draw, tagged kind="stub" so it can never read as a live detection.

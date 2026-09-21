@@ -37,7 +37,8 @@ UI
 - Key `0` still hides nerd chrome. The title word stays, because that bar is already on the clean cabin.
 - Cabin agent boxes are empty solids. LEAD and BRAKE stay. The forecast is a thin ice line that starts half a length ahead of the track and is drawn under the box, so the face has no disc and no bright center mark. Occupancy and planner samples stay on nerd layers `1–5`.
 - The ice corridor stays `path_width / 2` meters each side and ends where that path ends. A live tick does not stretch it to a fixed preview length. Smoke may still draw a long authored ribbon. Key `0` hides the shadow ghost ribbon.
-- Cabin ground, lanes, curbs, signs, and agent boxes follow `cameras.yaml` `viz` and camera `far_m`, ahead and behind the ego. The mid 1080 Ti clamps that span. The ice ribbon still ends on the running path.
+- Cabin ground, lanes, curbs, signs, and agent boxes follow `cameras.yaml` `viz` and camera `far_m`, ahead and behind the ego. The chase camera stays just behind the ego. The mid 1080 Ti clamps that span. The ice ribbon still ends on the running path.
+- The smoke and README cabin author a pack of cars in the lanes so the shot reads as traffic. Those boxes are furniture, not a live detector.
 
 ## Honesty (M0)
 
@@ -55,7 +56,7 @@ Credits: [VisionPilot](https://github.com/visionpilot-project/VisionPilot), Beam
 
 No recent live GVD cabin or in-game UI photos from the Windows live machine are in the repo (only `docs/gvd_viz_smoke.png` and the 64px `app.png` icon). These shots are **synthetic**. They are not live BeamNG photos. Soft Esc parked. Not Engage. 1.0.1 keeps the same void cabin and the same 330px face: one glance word, a pinned toy footer, and the bus folder inside `+ nerd`. Swap in cropped live shots later and change the caption to **real**. Provenance: [`docs/media/SOURCE.md`](docs/media/SOURCE.md).
 
-**Cabin — GVD VISION (synthetic).** OpenCV `python/viz/stage.py` parked clean cabin (chase 3/4, no nerd chrome, ice underglow off). The title reads **OFF**. Agent boxes are empty solids (LEAD / BRAKE tags, no center disc). Stub lanes and synthetic tracks. Same lexicon as `PYTHONPATH=. python python/run_vision.py --smoke`. Not a live second-screen photo.
+**Cabin — GVD VISION (synthetic).** OpenCV `python/viz/stage.py` parked clean cabin (chase 3/4 just behind the ego, no nerd chrome, ice underglow off). The title reads **OFF**. Agent boxes are empty solids (LEAD / BRAKE tags, no center disc). Stub lanes run with the `cameras.yaml` viz span. The cars are an authored traffic pack in those lanes, not a live detector. The ice ribbon is the authored smoke path and ends with that path. Same lexicon as `PYTHONPATH=. python python/run_vision.py --smoke`. Not a live second-screen photo.
 
 ![GVD VISION cabin (synthetic)](docs/media/gvd_cabin_synthetic.png)
 

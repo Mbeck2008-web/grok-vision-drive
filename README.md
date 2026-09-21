@@ -17,6 +17,25 @@ Canonical pin **1.0.1** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Un
 - **point** bumps (`1.0.x`) = fixes / small UI
 - **main alpha** bump (`1.x.0`) = features / core / UI overhaul
 
+## Recent changes (alpha 1.0.1)
+
+Point bump: bus safety fixes and a small HUD polish. Live Alt+G, Tech 8-cam, FFB, and QSV stay **UNPROVEN**.
+
+Architecture
+
+- A leftover `gvd_engage.json` `engaged:true` does not start the car. Python honors that flag only while its `mtime` is about 2.5 s fresh. Lua refreshes the stamp every 0.5 s while the in-game latch is on, and will not write `true` over a newer supervisor `false`.
+- Engage still starts only in the game (Alt+G or the app button). A file cannot turn it on.
+- `--policy e2e` with no `models/e2e_current.onnx` holds the brake (`veto:e2e_stub`) and stays engaged. Shadow keeps the modular command.
+- `cmd_applied` is true only when the Lua ack is this `seq` or up to 5 behind. An old high `applied_seq` is not an ack.
+- Retail stays one window (`cams=1/8`). Tech 8-cam is still the other product. `--backend auto` still does not pick Tech because `beamngpy` imports.
+
+UI
+
+- The app, the strip, and the GVD VISION title share one glance word: OFF / ON / HOLD / DRIVE / MISMATCH. HOLD is a brake hold (preview, veto, AEB, untrained e2e, or a link that is not live). DRIVE means a command is actually applied.
+- The default app stays 330×440. The bus folder moved into `+ nerd`. The toy footer stays pinned on that tile.
+- The strip uses ice when on or driving, amber on HOLD, and red on MISMATCH.
+- Key `0` still hides nerd chrome. The title word stays, because that bar is already on the clean cabin.
+
 ## Honesty (M0)
 
 - **Vision only** at inference: RGB cameras + ego kinematics + GPS as a **nav hint**. Optional pin (`nav.pin_lat` / `nav.pin_lon` in `config/tech.yaml`, or `GVD_NAV_PIN_LAT` / `GVD_NAV_PIN_LON`) is **not a route** — `nav.mode=hint`, `drive_to_pin=false`, and the corridor planner ignores the pin.
@@ -31,15 +50,19 @@ Credits: [VisionPilot](https://github.com/visionpilot-project/VisionPilot), Beam
 
 ## Screenshots
 
-No recent live GVD cabin or in-game UI photos from the Windows live machine were in the repo (only `docs/gvd_viz_smoke.png` and the 64px `app.png` icon). These two shots are **synthetic**. They are not live BeamNG photos. Soft Esc parked. Not Engage. Swap in cropped live shots later and change the caption to **real**. Provenance: [`docs/media/SOURCE.md`](docs/media/SOURCE.md).
+No recent live GVD cabin or in-game UI photos from the Windows live machine are in the repo (only `docs/gvd_viz_smoke.png` and the 64px `app.png` icon). These shots are **synthetic**. They are not live BeamNG photos. Soft Esc parked. Not Engage. 1.0.1 keeps the same void cabin and the same 330px face: one glance word, a pinned toy footer, and the bus folder inside `+ nerd`. Swap in cropped live shots later and change the caption to **real**. Provenance: [`docs/media/SOURCE.md`](docs/media/SOURCE.md).
 
-**Cabin — GVD VISION (synthetic).** OpenCV `python/viz/stage.py` parked clean cabin (chase 3/4, no nerd chrome, ice underglow off). Stub lanes and synthetic tracks. Same lexicon as `PYTHONPATH=. python python/run_vision.py --smoke`. Not a live second-screen photo.
+**Cabin — GVD VISION (synthetic).** OpenCV `python/viz/stage.py` parked clean cabin (chase 3/4, no nerd chrome, ice underglow off). The title reads **OFF**. Stub lanes and synthetic tracks. Same lexicon as `PYTHONPATH=. python python/run_vision.py --smoke`. Not a live second-screen photo.
 
 ![GVD VISION cabin (synthetic)](docs/media/gvd_cabin_synthetic.png)
 
-**In-game UI — GVD Apps HUD (synthetic).** Raster of `beamng_mod/ui/modules/apps/GVD/` in **DISENGAGED** / standby (`ENGAGE` + Alt+G, Path on, Ghosts off). Not a live BeamNG CEF screenshot. Esc is BeamNG **UI Apps**, not GVD Engage.
+**In-game UI — parked (synthetic).** CSS raster of `beamng_mod/ui/modules/apps/GVD/app.html` in **DISENGAGED** / standby (`ENGAGE` + Alt+G, Path on, Ghosts off, nerd closed). Unclipped so Policy and Sensing stay visible; the in-game tile is still 330×440. Not a live BeamNG CEF screenshot. Esc is BeamNG **UI Apps**, not GVD Engage.
 
-![GVD in-game Apps HUD (synthetic)](docs/media/gvd_ingame_ui_synthetic.png)
+![GVD in-game Apps HUD parked (synthetic)](docs/media/gvd_ingame_ui_synthetic.png)
+
+**In-game UI — DRIVE word (synthetic).** The same CSS with the `is-drive` classes and the copy the app uses while a command is applied (`DISENGAGE`, "steer to take over"). Wheel and gas figures are placeholders. Not a live Engage and not a live CEF screenshot.
+
+![GVD in-game Apps HUD DRIVE word (synthetic)](docs/media/gvd_ingame_ui_drive_synthetic.png)
 
 ## Audiences
 
@@ -135,7 +158,7 @@ What retail is **not**: eight cameras. It captures **one** window (the main view
 
 **Force-feedback wheels.** A wheel is welcome. Override detection looks at `|steering_input − cmd.steer|`, not the absolute angle, then spike-rejects and EMA-filters that residual so self-aligning torque, spring centering and kicks over bumps no longer disengage GVD. A real pull held ~200 ms still wins, and so does any real brake or throttle press. Tune it in `config\control.yaml` under `override:`. Live FFB behaviour is **UNPROVEN**.
 
-Keys in **GVD VISION**: `V` nerd panel, `D` DRIVE tab (gates / actuators / AEB), `G` VIZ tab (overlay layers), `M` MODEL tab (detector / e2e), `A` CAMS tab (8 camera views; missing slots stay labelled), `[` `]` / `?` cycle tabs, `0` clean cabin, `1–5` debug layers (occupancy / detector boxes / lane polynomials / camera FOV / planner samples), `T` chase↔BEV, `C` manual clip, `q` quit. Click the nerd tabs and `+`/`−` to change knobs; they write the command this tick. Loop under 8 Hz drops the CAMS blit and the VIZ camera strip (tiles stay labelled `dropped` / `missing`; the supervisor does not crash).
+Keys in **GVD VISION**: `V` nerd panel, `D` DRIVE tab (gates / actuators / AEB), `G` VIZ tab (overlay layers), `M` MODEL tab (detector / e2e), `A` CAMS tab (8 camera views; missing slots stay labelled), `[` `]` / `?` cycle tabs, `0` clean cabin, `1–5` debug layers (occupancy / detector boxes / lane polynomials / camera FOV / planner samples), `T` chase↔BEV, `C` manual clip, `q` quit. The title bar shows the same glance word as the in-game app (OFF / ON / HOLD / DRIVE / MISMATCH). Key `0` hides the nerd chrome and keeps that word. Click the nerd tabs and `+`/`−` to change knobs; they write the command this tick. Loop under 8 Hz drops the CAMS blit and the VIZ camera strip (tiles stay labelled `dropped` / `missing`; the supervisor does not crash).
 
 **How retail drives.** Every tick the supervisor writes `Documents\GVD\gvd_cmd.json` (`steer, throttle, brake, seq, engaged, heartbeat_mtime`). The mod polls it at 20 Hz and, while **both** sides are engaged, feeds the player vehicle as a **secondary Direct Drive wheel + pedals**: `input.event('steering', s, 2, 900, 0, nil, 'gvd')` / `input.event('throttle'|'brake', v, 2, 0, 0, nil, 'gvd')` (`+steer` = right, Direct filter so the command is 1:1, not pad-smoothed), zeros `parkingbrake`/`clutch` on the same source, and `input.setAllowedInputSource(..., 'gvd', true)` / `('local', false)` so a connected keyboard, pad, wheel or pedal cluster cannot overwrite the software every frame. Arcade gearbox once. Vehicle Lua echoes `wheelspeed`, applied electrics, and non-gvd `lastInputs` (the physical wheel/pedals) back through `gvd_ego.json`, which gives the planner real ego speed (closed-loop throttle, TTC/AEB) and lets `cmd_applied` be `true` only on a fresh Lua ack (`cmd_reason`: `cmd_json_applied` / `cmd_json_pending` / `cmd_json_idle`). On disengage the mod zeros the `gvd` source and clears the whitelist so the player's device gets the car back.
 
@@ -221,12 +244,12 @@ After install, start a level, Esc → **UI Apps** → Add App → **GVD** / **GV
 
 The in-game app is **Engage / Disengage + settings + live wheel/pedal echo** only. The rich VISION lexicon (void stage, multi-lane fan, ice corridor, CIPV boxes, warm curbs, sign/light glyphs) is drawn on the **GVD VISION** OpenCV second screen from the same `Documents/GVD/gvd_state.json`. See [`docs/gvd_state_schema.md`](docs/gvd_state_schema.md#viz-road-model) for what is measured vs inferred. Controls:
 
-- **Engage / Disengage** — the same toggle as Alt+G. The state strip reads `DRIVE` (the mod is feeding the player vehicle from `gvd_cmd.json`, or BeamNGpy is applying on Tech — steer to take over), `ENGAGED` (armed, nothing applied yet), `HOLD` (heartbeat stale → dead-man, inputs released) or `DISENGAGED` with the last reason.
+- **Engage / Disengage** — the same toggle as Alt+G. The state word is `DRIVE` (Lua is applying `gvd_cmd.json`, or Tech `beamngpy` has `cmd_applied` — steer to take over), `ENGAGED` (armed, command not applied yet), `HOLD` (preview, a veto including the untrained e2e stub, AEB, or a link that is not live), `MISMATCH` (the two bus folders differ), or `DISENGAGED` with the last reason.
 - **Wheel / pedals** — live `steering_input` / `throttle_input` / `brake_input` plus physical `player_*` lastInputs from the retail Direct Drive echo (`gvd_ego.json`). Not a second input stack.
 - **Path / Ghosts** — writes `gvd_ui_prefs.json`, so the world ribbon and the OpenCV window follow.
 - **Policy** `modular | e2e | shadow` — shows what the supervisor is actually running and requests a change for the running session; the modular veto is unchanged and `--policy` still wins at launch.
 - **Sensing** — capture backend, `n/8` healthy feeds, the retail `cam_main only` note, and buttons that move the **GVD VISION** OpenCV window to screen 1 / 2.
-- **+ nerd** — loop/camera Hz, infer ms, VRAM, detector, actuator, clip encoder, heartbeat age.
+- **+ nerd** — loop/camera Hz, infer ms, VRAM, detector, actuator, clip encoder, heartbeat age, and the bus folder. The face stays clear of that path.
 
 Titles stay **GVD** / **VISION**; Alt+G works with or without the app open. Offline check: `PYTHONPATH=. python scripts/test_gvd_ui_app.py`. A **synthetic** parked HUD is under [Screenshots](#screenshots) — not a live CEF photo.
 
@@ -234,14 +257,14 @@ Titles stay **GVD** / **VISION**; Alt+G works with or without the app open. Offl
 
 Visualization **toy** (not a scientific claim that forecasts match Waymo). On-screen title: **GVD** / **VISION**. No Tesla logos, no “Full Self-Driving”, no “FSD” product label.
 
-**In-game (BeamNG world):** ice-blue ribbon drawn on the pavement via GELua `debugDrawer` (`drawSquarePrism`, 3-line fallback) — **1:1** with `path_ego` / `path_world` (x right, y forward, z up). Track ghosts sit on the road at the same transform; CIPV is brighter. Ribbon/ghosts draw while the supervisor is live (dimmer when OFF); Alt+G takes the wheel and lights the ice underglow. GELua reads relative `Documents/GVD` via VFS / `FS:readFile` (Tech/Drive `current\Documents\GVD` under the running userfolder). Python writes the absolute product sandbox; `GVD_DOCS_DIR` wins for writers. Not USERPROFILE Documents. Not OneDrive. This is **not** a 2D camera overlay. In-game strip app: **GVD Strip** (mode · Hz · TTC · N).
+**In-game (BeamNG world):** ice-blue ribbon drawn on the pavement via GELua `debugDrawer` (`drawSquarePrism`, 3-line fallback) — **1:1** with `path_ego` / `path_world` (x right, y forward, z up). Track ghosts sit on the road at the same transform; CIPV is brighter. Ribbon/ghosts draw while the supervisor is live (dimmer when OFF); Alt+G takes the wheel and lights the ice underglow. GELua reads relative `Documents/GVD` via VFS / `FS:readFile` (Tech/Drive `current\Documents\GVD` under the running userfolder). Python writes the absolute product sandbox; `GVD_DOCS_DIR` wins for writers. Not USERPROFILE Documents. Not OneDrive. This is **not** a 2D camera overlay. In-game strip app: **GVD Strip** (policy plus OFF / ON / HOLD / DRIVE / MISMATCH, then Hz · TTC · N). Ice when on or driving, amber on HOLD, red on MISMATCH.
 
 **Second screen (`GVD VISION`):** OpenCV cabin on monitor 2 when available (`--viz-screen auto|1|2`, `--viz-fullscreen`, or `GVD_VIZ_MONITOR=2`). This is the VISION lexicon: near-black void stage, thin vector lane paint (`lanes_ext`: solid detected / dim-dashed predicted; smoke stubs only), warm-grey kerbs (`road_edges`), ice-blue ego corridor (intent shade, stop bar when halted behind a CIPV), agent boxes (ice-blue in-path, CIPV **LEAD**, red **BRAKE**), forecast fans, and stop-sign / traffic-light / pole glyphs when `signs[]` is present. Optional `cam_main` PIP (front overexposure is clamped so a Tech attach does not blow the preview white). The nerd **CAMS** tab (`A`) is an extra 8-slot camera wall on the stage plus a 2×4 in the panel; retail / stub missing feeds stay labelled `missing` (never filled from `cam_main`). Cabin / LIVE stays the default view. The nerd **VIZ** tab / keys `1–5` add a denser debug stack (occupancy from tracks, detector boxes, camera FOV, planner samples) on top of that lexicon — overlay only, still vision-only at inference. Loop under 8 Hz drops fans, signs, PIP blit, the VIZ camera strip blit, and the CAMS grid blit first (labelled empty tiles; no crash). Caps: 32 agents / 16 forecast fans / 3 modes. One monitor → window stays put; drag it, or use motherboard HDMI for UHD 630 as display 2. Live dual-monitor + Alt+G still **UNPROVEN** on Linux / until Windows gate.
 
 ```bash
 pip install -r requirements-viz.txt
 PYTHONPATH=. python python/run_vision.py --smoke   # writes docs/gvd_viz_smoke.png
-PYTHONPATH=. python scripts/render_readme_media.py  # docs/media synthetic cabin + HUD
+PYTHONPATH=. python scripts/render_readme_media.py  # docs/media synthetic cabin + parked HUD + DRIVE word
 PYTHONPATH=. python python/run_vision.py --viz      # live window + state file for BeamNG
 PYTHONPATH=. python scripts/test_gvd_viz_stage.py
 ```

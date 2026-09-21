@@ -109,6 +109,7 @@ def check_release_zip() -> None:
             assert "beamng_mod/ui/modules/apps/GVD/app.png" in rels
             assert "docs/media/gvd_cabin_synthetic.png" in rels
             assert "docs/media/gvd_ingame_ui_synthetic.png" in rels
+            assert "docs/media/gvd_ingame_ui_drive_synthetic.png" in rels
             assert "docs/media/SOURCE.md" in rels
             assert "AGENTS.md" in rels
             assert "models/.gitkeep" in rels
@@ -702,6 +703,7 @@ def check_player_docs() -> None:
     assert "play_gvd_tech.bat" in readme and "tech.yaml" in readme
     assert "docs/media/gvd_cabin_synthetic.png" in readme
     assert "docs/media/gvd_ingame_ui_synthetic.png" in readme
+    assert "docs/media/gvd_ingame_ui_drive_synthetic.png" in readme
     assert "## Screenshots" in readme
     assert readme.lower().count("synthetic") >= 4
     assert "beamngpy if importable" not in readme.lower(), "auto backend must not pick Tech just because beamngpy is installed"

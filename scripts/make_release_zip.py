@@ -78,6 +78,7 @@ MUST_HAVE = (
     "models/yolov8n.onnx",
     "docs/media/gvd_cabin_synthetic.png",
     "docs/media/gvd_ingame_ui_synthetic.png",
+    "docs/media/gvd_ingame_ui_drive_synthetic.png",
 )
 
 # Directory names skipped anywhere in the tree (tooling/cache junk only —

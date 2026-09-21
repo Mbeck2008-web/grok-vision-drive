@@ -380,16 +380,15 @@ class Cam:
     def eye(self) -> tuple[float, float, float]:
         if self.top_down:
             return (0.0, -8.0, 40.0)
-        # Chase 3/4. Sit just behind the behind-span so the road past the rear bumper stays in frame.
-        z = 5.4 + min(3.2, max(0.0, self.behind_m) * 0.04)
-        return (1.6, -(self.behind_m + 8.0), z)
+        # Chase 3/4, just behind the ego. Draw range is longer; the lens stays here.
+        return (1.6, -16.5, 5.4)
 
     def project(self, x: float, y: float, z: float = 0.0) -> tuple[int, int]:
         if self.top_down:
             cx, cy = STAGE_W // 2, STAGE_H - 90
             return int(cx + x * self.ppm), int(cy - y * self.ppm)
         cam = np.array(self.eye, dtype=np.float64)
-        target = np.array([0.0, 0.25 * self.ahead_m, -0.8], dtype=np.float64)
+        target = np.array([0.0, 16.0, -0.8], dtype=np.float64)
         eye = np.array([x, y, z], dtype=np.float64) - cam
         forward = target - cam
         forward = forward / (np.linalg.norm(forward) + 1e-9)
@@ -781,8 +780,20 @@ def _stroke_world(
         )
 
 
+def _draw_y_lo(cam: Cam) -> float:
+    """Near end of the draw span that this camera can actually see.
+
+    Chase sits just behind the ego, so points behind the lens are not stroked.
+    Top-down still paints the full behind span.
+    """
+    span = -float(cam.behind_m)
+    if cam.top_down:
+        return span
+    return max(span, float(cam.eye[1]) + 1.5)
+
+
 def _draw_ground(img: np.ndarray, cam: Cam) -> None:
-    y0, y1 = -cam.behind_m, cam.ahead_m
+    y0, y1 = _draw_y_lo(cam), cam.ahead_m
     far_l, far_r = cam.project(-16, y1, 0), cam.project(16, y1, 0)
     near_l, near_r = cam.project(-16, y0, 0), cam.project(16, y0, 0)
     overlay = img.copy()
@@ -816,7 +827,7 @@ def _lane_color(mode: str, fade: float) -> tuple[tuple[int, int, int], int, bool
 
 
 def _draw_lanes(img: np.ndarray, lanes: list, cam: Cam, *, smoke: bool) -> None:
-    y_lo, y_hi = -cam.behind_m, cam.ahead_m
+    y_lo, y_hi = _draw_y_lo(cam), cam.ahead_m
     for ln in lanes or []:
         kind = ln.get("kind") if isinstance(ln, dict) else None
         mode = lane_draw_mode(kind, smoke=smoke)
@@ -865,7 +876,7 @@ def _draw_edge_piece(
 
 
 def _draw_edges(img: np.ndarray, edges: list, cam: Cam) -> None:
-    y_lo, y_hi = -cam.behind_m, cam.ahead_m
+    y_lo, y_hi = _draw_y_lo(cam), cam.ahead_m
     fade_y = cam.ahead_m * (1.0 - cam.fade_frac) if cam.fade_frac > 0 else cam.ahead_m
     for e in edges or []:
         raw = _clip_poly_y(_poly_points(e), y_lo, y_hi)

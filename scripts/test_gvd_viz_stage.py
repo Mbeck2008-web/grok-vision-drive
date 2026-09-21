@@ -510,11 +510,24 @@ def main() -> None:
     span_cam = Cam()
     assert abs(span_cam.ahead_m - draw.ahead_m) < 1e-6
     assert abs(span_cam.behind_m - draw.behind_m) < 1e-6
-    assert abs(span_cam.eye[1] - (-(draw.behind_m + 8.0))) < 1e-6
+    # Chase stays just behind the ego. Draw range does not drag the lens back.
+    assert abs(span_cam.eye[0] - 1.6) < 1e-6
+    assert abs(span_cam.eye[1] - (-16.5)) < 1e-6
+    assert abs(span_cam.eye[2] - 5.4) < 1e-6
 
     import tempfile
 
-    from python.viz.stage import smoke
+    from python.viz.stage import _extend_predicted, _span_ys, smoke
+
+    span_ys = _span_ys(-draw.behind_m, draw.ahead_m, 3.0)
+    assert span_ys[0] <= -draw.behind_min_m and span_ys[-1] >= draw.ahead_min_m
+    ext_pieces = _extend_predicted(
+        [{"x": -1.8, "y": float(y)} for y in range(2, 36, 3)],
+        -draw.behind_m,
+        draw.ahead_m,
+    )
+    ext_ys = [p["y"] for piece in ext_pieces for p in piece]
+    assert ext_ys and min(ext_ys) <= -draw.behind_min_m and max(ext_ys) >= draw.ahead_min_m
 
     smoke_path = Path(tempfile.mkdtemp()) / "cabin_span.png"
     smoke(use_perception=False, engaged=False, write_bus=False, out=smoke_path)
@@ -531,9 +544,8 @@ def main() -> None:
         pix = cabin_span[py, px]
         return int(pix[0]), int(pix[1]), int(pix[2])
 
-    for gy in (draw.ahead_min_m, -draw.behind_min_m):
-        # 70 and -18 sit off the 20 m ticks. 80 and -20 are on a tick, still ground.
-        sample_y = 70.0 if gy > 0 else -18.0
+    # 70 is ahead of the car. -6 is behind the rear bumper and still in the chase frame.
+    for sample_y in (70.0, -6.0):
         gb, gg, gr = _ground_at(sample_y)
         assert max(gb, gg, gr) >= 13, (sample_y, gb, gg, gr)
 
@@ -546,7 +558,7 @@ def main() -> None:
         return int(patch.max()) > 40
 
     assert any(_lane_lit(y) for y in (72.0, 76.0, 80.0, 84.0, 88.0)), "stub lanes must reach ahead_min"
-    assert any(_lane_lit(y) for y in (-28.0, -24.0, -20.0, -16.0, -12.0)), "stub lanes must reach behind_min"
+    assert any(_lane_lit(y) for y in (-6.0, -4.0, -2.0)), "stub lanes must show behind the ego"
 
     # A short live poly is dashed out to the cabin span and is not relabeled in state.
     short = {
@@ -590,7 +602,7 @@ def main() -> None:
 
     assert _ext_hit(20.0) > 0, "detected paint still strokes"
     assert any(_ext_hit(y) > 0 for y in (72.0, 80.0, 88.0)), "predicted dash reaches ahead"
-    assert any(_ext_hit(y) > 0 for y in (-28.0, -20.0, -12.0)), "predicted dash reaches behind"
+    assert any(_ext_hit(y) > 0 for y in (-6.0, -4.0, -2.0)), "predicted dash shows behind the ego"
 
     # Under 8 Hz the lane stroke and the ribbon stay. Signs drop.
     slow = dict(short)

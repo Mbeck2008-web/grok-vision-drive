@@ -10,6 +10,8 @@ target_hz_happy: 15
 dgpu:
   name: GTX 1080 Ti
   vram_gb: 11
+  # Cabin ahead cap (cameras.yaml viz.ahead_max_m) rises to 600 when vram_gb >= 16.
+  # This 11 GB profile stays clamped at 400. Do not raise live_input_long_side or max_inference_vram_gb.
   arch: pascal
   tensor_cores: false
 igpu: uhd_630

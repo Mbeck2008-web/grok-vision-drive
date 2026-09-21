@@ -37,6 +37,7 @@ UI
 - Key `0` still hides nerd chrome. The title word stays, because that bar is already on the clean cabin.
 - Cabin agent boxes are empty solids. LEAD and BRAKE stay. The forecast is a thin ice line that starts half a length ahead of the track and is drawn under the box, so the face has no disc and no bright center mark. Occupancy and planner samples stay on nerd layers `1–5`.
 - The ice corridor stays `path_width / 2` meters each side and ends where that path ends. A live tick does not stretch it to a fixed preview length. Smoke may still draw a long authored ribbon. Key `0` hides the shadow ghost ribbon.
+- Cabin ground, lanes, curbs, signs, and agent boxes follow `cameras.yaml` `viz` and camera `far_m`, ahead and behind the ego. The mid 1080 Ti clamps that span. The ice ribbon still ends on the running path.
 
 ## Honesty (M0)
 
@@ -143,6 +144,8 @@ Shared-card rules (all tiers): infer ≤ `max_inference_vram_gb: 4`; `live_input
 | **high** | more VRAM than `dgpu.vram_gb: 11`. Same infer cap (`max_inference_vram_gb: 4`). No CLI `--profile unlimited`. | Comfortable at Normal/High. Same 640 / ≤4 GB caps. If VRAM/Hz fail, same OOM ladder. | 8-cam fits better. Still QSV-first encode. Still 640 / ≤4 GB. If VRAM/Hz fail, same OOM ladder. |
 
 **OOM ladder** (same dGPU; if VRAM/Hz fail). One order, **A** and **B**: **Shadow Quality**, then **Antialiasing**, then **draw**. "Draw" is generic — official lighting docs do not name a player menu **Draw distance**. Then Tech hitch: drop camera `far_m`, then side-cam **rate** (half) and rear ÷4 — **not** 640. Do not add LiDAR/radar, depth, or NVENC.
+
+The GVD VISION cabin world follows `config/cameras.yaml` `viz` plus each camera `far_m`. `draw_ahead_m: auto` uses main `far_m` after hitch, and `draw_behind_m: auto` uses rear `far_m`, each clamped by the viz min/max. On a stronger card (`dgpu.vram_gb` ≥ 16) the ahead cap rises to 600 m, so bump main and rear `far_m` to see more road. The mid 1080 Ti stays clamped (`ahead_max_m: 400`). A longer cabin is not a 400 m detector: boxes and signs appear only where tracks and signs exist, and the ice ribbon still ends where the running model path ends.
 
 BIOS (Windows, mid host): enable **iGPU Multi-Monitor** so UHD 630 QSV exists while the 1080 Ti drives the display (M4 encode). Do not set DVMT to 2 GB.
 

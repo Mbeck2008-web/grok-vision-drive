@@ -27,6 +27,8 @@ def main() -> None:
             hit = re.search(pattern, low)
             assert hit is None, f"{name}: {label} found ({hit.group(0)!r})"
     assert "GVD" in stage_src and "VISION" in stage_src
+    assert "PATH_FADE" not in stage_src
+    assert "CORRIDOR_FADE_FRAC" in stage_src
 
     from python.viz.debug_draw import cabin_drive_word
 
@@ -53,6 +55,7 @@ def main() -> None:
         pace_scale,
         render_stage,
         resolve_corridors,
+        resolve_draw_range,
         track_cls,
     )
 
@@ -345,8 +348,13 @@ def main() -> None:
             f"forecast stamped track {tr.get('id')}"
         )
         cx, cy = cam.project(x, y, height * 0.45)
-        face = cabin[cy - 4:cy + 5, cx - 4:cx + 5]
-        assert face.std() < 1.0 or face.max(axis=2).std() < 1.0, f"track {tr.get('id')} face is not a flat fill"
+        # Chase sits farther back, so several shaded faces fit in a few dozen
+        # pixels. The center still has to match its own face: a disc would not.
+        center = cabin[cy, cx].astype(np.int16)
+        neigh = cabin[cy - 1:cy + 2, cx - 1:cx + 2].reshape(-1, 3).astype(np.int16)
+        same = int(np.all(np.abs(neigh - center) <= 2, axis=1).sum())
+        assert same >= 4, f"track {tr.get('id')} face center is not a flat fill ({same})"
+        assert int(center.max()) < 230, f"track {tr.get('id')} face center is a bright mark"
     assert int(np.count_nonzero((face_delta.sum(axis=2) > 8) & (covered == 0))) > 0, (
         "moving agents should still draw a thin fan past the box"
     )
@@ -470,6 +478,139 @@ def main() -> None:
     sh_nerd = render_stage(shadow, ui=sh_ui)
     assert int(cv2.absdiff(sh_clean, painted).sum()) == 0, "key 0 hides the shadow ghost"
     assert int(cv2.absdiff(sh_nerd, sh_clean).sum()) > 0, "nerd shows the other policy ribbon"
+
+    # Cabin span follows cameras.yaml viz + far_m. The ribbon does not.
+    draw = resolve_draw_range({})
+    assert draw.ahead_min_m >= 80 and draw.behind_min_m >= 20
+    assert draw.ahead_m >= draw.ahead_min_m and draw.behind_m >= draw.behind_min_m
+    assert abs(draw.ahead_m - 300.0) < 1e-6, draw
+    assert abs(draw.behind_m - 80.0) < 1e-6, draw
+    assert abs(resolve_draw_range({"main_far_m": 150}).ahead_m - 150.0) < 1e-6
+    assert abs(resolve_draw_range({"main_far_m": 20}).ahead_m - draw.ahead_min_m) < 1e-6
+    assert abs(resolve_draw_range({"main_far_m": 900}).ahead_m - 400.0) < 1e-6
+    assert abs(resolve_draw_range({"main_far_m": 550}, vram_gb=16.0).ahead_m - 550.0) < 1e-6
+    assert abs(resolve_draw_range({"rear_far_m": 40}).behind_m - 40.0) < 1e-6
+    assert abs(resolve_draw_range({"rear_far_m": 500}).behind_m - 80.0) < 1e-6
+    wish = {
+        "viz": {
+            "draw_ahead_m": 120,
+            "draw_behind_m": 40,
+            "ahead_min_m": 80,
+            "ahead_max_m": 400,
+            "behind_min_m": 20,
+            "behind_max_m": 80,
+            "fade_frac": 0.28,
+        },
+        "cameras": [
+            {"id": "main", "far_m": 300},
+            {"id": "rear", "far_m": 100},
+        ],
+    }
+    assert abs(resolve_draw_range({"main_far_m": 200}, cameras=wish).ahead_m - 120.0) < 1e-6
+    span_cam = Cam()
+    assert abs(span_cam.ahead_m - draw.ahead_m) < 1e-6
+    assert abs(span_cam.behind_m - draw.behind_m) < 1e-6
+    assert abs(span_cam.eye[1] - (-(draw.behind_m + 8.0))) < 1e-6
+
+    import tempfile
+
+    from python.viz.stage import smoke
+
+    smoke_path = Path(tempfile.mkdtemp()) / "cabin_span.png"
+    smoke(use_perception=False, engaged=False, write_bus=False, out=smoke_path)
+    cabin_span = cv2.imread(str(smoke_path))
+    assert cabin_span is not None and cabin_span.shape[:2] == (800, 1280)
+
+    def _inside(x: float, y: float, z: float = 0.02) -> tuple[int, int]:
+        px, py = span_cam.project(x, y, z)
+        assert 0 <= px < 1280 and 22 < py < 798, (x, y, px, py)
+        return px, py
+
+    def _ground_at(y: float) -> tuple[int, int, int]:
+        px, py = _inside(0.45, y, 0.0)
+        pix = cabin_span[py, px]
+        return int(pix[0]), int(pix[1]), int(pix[2])
+
+    for gy in (draw.ahead_min_m, -draw.behind_min_m):
+        # 70 and -18 sit off the 20 m ticks. 80 and -20 are on a tick, still ground.
+        sample_y = 70.0 if gy > 0 else -18.0
+        gb, gg, gr = _ground_at(sample_y)
+        assert max(gb, gg, gr) >= 13, (sample_y, gb, gg, gr)
+
+    def _lane_lit(y: float) -> bool:
+        x = -1.85 + 0.9 * math.sin(y / 17.0)
+        px, py = span_cam.project(x, y, 0.02)
+        if not (0 <= px < 1280 and 22 < py < 798):
+            return False
+        patch = cabin_span[py - 6:py + 7, px - 6:px + 7]
+        return int(patch.max()) > 40
+
+    assert any(_lane_lit(y) for y in (72.0, 76.0, 80.0, 84.0, 88.0)), "stub lanes must reach ahead_min"
+    assert any(_lane_lit(y) for y in (-28.0, -24.0, -20.0, -16.0, -12.0)), "stub lanes must reach behind_min"
+
+    # A short live poly is dashed out to the cabin span and is not relabeled in state.
+    short = {
+        "engaged": False,
+        "loop_hz": 12.0,
+        "policy": "modular",
+        "path_ego": [],
+        "path_width": 2.0,
+        "path_debug_preview": False,
+        "viz_smoke": False,
+        "lanes_ext": [{
+            "points": [{"x": -1.8, "y": float(y)} for y in range(2, 36, 3)],
+            "kind": "detected",
+            "index": -1,
+        }],
+        "road_edges": [],
+        "tracks": [],
+        "signs": [],
+        "missing_state_keys": ["live cameras"],
+    }
+    lane_ui = VizUI()
+    lane_ui.layers = {0}
+    lane_ui.show_nerd = False
+    lane_ui.debug.viz_forecast = False
+    lane_ui.debug.viz_signs = False
+    ys_before = [p["y"] for p in short["lanes_ext"][0]["points"]]
+    keys_before = list(short["missing_state_keys"])
+    lane_on = render_stage(short, ui=lane_ui)
+    assert [p["y"] for p in short["lanes_ext"][0]["points"]] == ys_before
+    assert short["lanes_ext"][0]["kind"] == "detected"
+    assert short["missing_state_keys"] == keys_before
+    lane_off = render_stage({**short, "lanes_ext": []}, ui=lane_ui)
+    lane_delta = cv2.absdiff(lane_on, lane_off)
+
+    def _ext_hit(y: float) -> int:
+        px, py = span_cam.project(-1.8, y, 0.02)
+        if not (4 <= px < 1276 and 24 < py < 796):
+            return -1
+        patch = lane_delta[py - 5:py + 6, px - 5:px + 6]
+        return int(np.count_nonzero(patch.sum(axis=2) > 8))
+
+    assert _ext_hit(20.0) > 0, "detected paint still strokes"
+    assert any(_ext_hit(y) > 0 for y in (72.0, 80.0, 88.0)), "predicted dash reaches ahead"
+    assert any(_ext_hit(y) > 0 for y in (-28.0, -20.0, -12.0)), "predicted dash reaches behind"
+
+    # Under 8 Hz the lane stroke and the ribbon stay. Signs drop.
+    slow = dict(short)
+    slow["loop_hz"] = 6.0
+    slow["path_ego"] = [{"x": 0.0, "y": float(i), "z": 0.0} for i in range(0, 41)]
+    slow["path_conf"] = 0.95
+    slow["signs"] = [{"cls": "stop_sign", "x": -4.0, "y": 22.0}]
+    sign_ui = VizUI()
+    sign_ui.layers = {0}
+    sign_ui.show_nerd = False
+    sign_ui.debug.viz_forecast = False
+    sign_ui.debug.viz_lanes = True
+    sign_ui.debug.viz_signs = True
+    slow_full = render_stage(slow, ui=sign_ui)
+    slow_nolane = render_stage({**slow, "lanes_ext": []}, ui=sign_ui)
+    slow_nopath = render_stage({**slow, "path_ego": []}, ui=sign_ui)
+    assert int(cv2.absdiff(slow_full, slow_nolane).sum()) > 0, "under 8 Hz lanes stay"
+    assert int(cv2.absdiff(slow_full, slow_nopath).sum()) > 0, "under 8 Hz ribbon stays"
+    fast_signs = render_stage({**slow, "loop_hz": 12.0}, ui=sign_ui)
+    assert int(cv2.absdiff(slow_full, fast_signs).sum()) > 0, "under 8 Hz signs drop"
 
     print("test_gvd_viz_stage: OK")
 

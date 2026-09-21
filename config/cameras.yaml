@@ -31,6 +31,16 @@ hitch:
   side_grab_phase: 1     # miss wide even ticks (tick0 clump)
   rear_grab_div: 4
   rear_grab_phase: 1     # miss wide even ticks
+# OpenCV cabin only. Does not set BeamNGpy clip planes or the hitch ladder.
+# auto = that camera's far_m after hitch (state main_far_m / rear_far_m when set).
+viz:
+  draw_ahead_m: auto      # auto = main.far_m after hitch
+  draw_behind_m: auto     # auto = rear.far_m
+  ahead_min_m: 80
+  ahead_max_m: 400        # 1080 Ti mid cap
+  behind_min_m: 20
+  behind_max_m: 80
+  fade_frac: 0.28         # furniture/lanes fade in the last 28% of AHEAD range
 cameras:
   - id: narrow
     role: long_range_forward

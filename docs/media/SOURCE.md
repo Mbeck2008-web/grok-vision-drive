@@ -6,7 +6,7 @@ The Windows live host had no recent GVD viz or in-game UI shots (only unrelated 
 
 | File | What | How |
 | --- | --- | --- |
-| `gvd_cabin_synthetic.png` | GVD VISION clean cabin, chase 3/4, parked (`engaged=false`, title **OFF**, no ice underglow). Agent boxes are empty solids (LEAD / BRAKE, no center disc). The ice ribbon is the authored smoke path, not a live planner | `python.viz.stage.smoke` (`scripts/render_readme_media.py`) |
+| `gvd_cabin_synthetic.png` | GVD VISION clean cabin, chase 3/4, parked (`engaged=false`, title **OFF**, no ice underglow). Agent boxes are empty solids (LEAD / BRAKE, no center disc). Ground, stub lanes, and curbs span the `cameras.yaml` viz range. The ice ribbon is the authored smoke path (~60 m), not a live planner and not stretched to the horizon | `python.viz.stage.smoke` (`scripts/render_readme_media.py`) |
 | `gvd_ingame_ui_synthetic.png` | GVD Apps HUD in **DISENGAGED** / standby (`ENGAGE` + Alt+G, nerd closed). CSS from `app.html`, footer text matches the app. Corner stamp `synthetic`. | Chrome raster of that CSS (OpenCV fallback). Unclipped width 330px; the in-game tile stays 330×440 |
 | `gvd_ingame_ui_drive_synthetic.png` | Same HUD with the **DRIVE** glance word (`is-drive`, `DISENGAGE`, "steer to take over"). Wheel and gas numbers are placeholders | Same renderer, `drive=True`. Not a live Engage |
 

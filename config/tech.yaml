@@ -19,6 +19,7 @@ home: ""          # BeamNG.tech install dir. Empty → BNG_HOME.
                   # Do not also launch from the bat. A missing tech.key does not fail the hold.
 user: ""          # Optional Tech userfolder. Empty is not a hold failure.
 launch: false     # false = attach to already-running Tech. true = BeamNGpy is the only starter (port was down).
+socket_timeout: 10  # Hello seconds on attach. Timeout is REFUSE, not a missing vehicle. A listening port forces launch false.
 beamngpy_pin: "1.36"  # Tech 0.39. Tech 0.38 → "1.35". Prove refuses a different installed BeamNGpy.
 wait_vehicle_s: 60
 vehicle: current  # current = player vehicle when known, else first spawned. Or a vid string.

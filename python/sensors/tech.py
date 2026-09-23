@@ -318,6 +318,12 @@ def apply_env_overrides(cfg: dict[str, Any]) -> dict[str, Any]:
 TECH_RESEARCH_PORT = 25252
 TECH_ROOT_EXE = "BeamNG.tech.exe"
 TECH_GFX = "dx11"
+# BeamNGpy Hello recv. None blocks past the prove window; this cap REFUSEs.
+TECH_SOCKET_TIMEOUT_S = 10.0
+
+
+class TechHelloTimeout(TimeoutError):
+    """Hello did not return before socket_timeout. Not a missing vehicle."""
 # Human one-starter and the BeamNGpy gfx switch. BeamNGpy also adds -nosteam/-tport.
 TECH_HUMAN_TAIL = ("-tcom", "-console", "-gfx", TECH_GFX)
 # BeamNGpy minor line for the Tech build in use. 0.38 → 1.35, 0.39 → 1.36.
@@ -435,14 +441,34 @@ def real_launch_argv(bng: Any, home: str | None, port: int, user: str | None) ->
     return " ".join(beamngpy_launch_argv(home, port, user))
 
 
-def _force_root_dx11(bng: Any) -> None:
-    """Leave the BeamNGpy binary as the install-root exe and gfx as dx11."""
+def resolve_socket_timeout(cfg: dict[str, Any] | None = None) -> float:
+    """Attach/Hello cap in seconds. Env, then yaml, then ``TECH_SOCKET_TIMEOUT_S``."""
+    raw: Any = os.environ.get("GVD_TECH_SOCKET_TIMEOUT", "").strip()
+    if not raw and cfg is not None:
+        raw = cfg.get("socket_timeout")
+    if raw is None or raw == "":
+        raw = TECH_SOCKET_TIMEOUT_S
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        val = TECH_SOCKET_TIMEOUT_S
+    if val <= 0:
+        return TECH_SOCKET_TIMEOUT_S
+    return val
+
+
+def _force_root_dx11(bng: Any, socket_timeout: float) -> None:
+    """Root exe, dx11, and a finite Hello socket timeout. No Bin64 default."""
     try:
         bng.binary = TECH_ROOT_EXE
     except Exception:
         pass
     try:
         bng.gfx = TECH_GFX
+    except Exception:
+        pass
+    try:
+        bng.socket_timeout = socket_timeout
     except Exception:
         pass
 
@@ -454,18 +480,33 @@ def open_tech_beamngpy(
     home: str | None,
     user: str | None,
     launch: bool,
+    socket_timeout: float | None = None,
 ) -> Any:
     """Connect with quit_on_close=False. Launch uses the root exe and ``-gfx dx11``.
 
-    A launch failure prints the real argv (``last_command_line`` when BeamNGpy
-    set it). Attach failures do not print a launch line.
+    A listening research port forces ``launch=False``. Hello uses ``socket_timeout``;
+    a timeout is ``TechHelloTimeout`` (REFUSE), not a missing vehicle.
+    A launch failure prints the real argv. Attach failures do not print a launch line.
     """
     from beamngpy import BeamNGpy  # type: ignore
 
+    timeout = resolve_socket_timeout() if socket_timeout is None else float(socket_timeout)
+    if timeout <= 0:
+        timeout = TECH_SOCKET_TIMEOUT_S
+    listening = research_port_listening(host, int(port))
+    if listening:
+        launch = False
+    print(
+        f"[GVD] phase=attach {host}:{int(port)} "
+        f"{'LISTENING' if listening else 'down'} "
+        f"launch={launch} socket_timeout={timeout:g}s",
+        flush=True,
+    )
     kwargs: dict[str, Any] = {
         "quit_on_close": False,
         "binary": TECH_ROOT_EXE,
         "gfx": TECH_GFX,
+        "socket_timeout": timeout,
     }
     if home:
         kwargs["home"] = home
@@ -485,12 +526,24 @@ def open_tech_beamngpy(
                 bng = BeamNGpy(host, int(port), quit_on_close=False, **slim)
             except TypeError:
                 bng = BeamNGpy(host, int(port), **slim) if slim else BeamNGpy(host, int(port))
-        _force_root_dx11(bng)
+        _force_root_dx11(bng, timeout)
         hold_tech_process(bng)
-        bng.open(launch=bool(launch))
+        print("[GVD] phase=Hello", flush=True)
+        try:
+            bng.open(launch=bool(launch))
+        except TimeoutError as exc:
+            print(
+                f"[GVD] phase=Hello REFUSE: socket_timeout {timeout:g}s. Not a missing vehicle.",
+                flush=True,
+            )
+            release_tech_beamngpy(bng)
+            raise TechHelloTimeout(f"Hello timeout after {timeout:g}s on {host}:{int(port)}") from exc
+        print("[GVD] phase=Hello ok", flush=True)
         hold_tech_process(bng)
-        _force_root_dx11(bng)
+        _force_root_dx11(bng, timeout)
         return bng
+    except TechHelloTimeout:
+        raise
     except Exception:
         if launch:
             argv = real_launch_argv(bng, home, port, user)
@@ -577,15 +630,25 @@ def tech_mod_present() -> bool:
     return False
 
 
-def probe_spawned_vehicle(host: str, port: int) -> bool | None:
-    """Attach-only vehicle poll. None when beamngpy is missing. Never launches or kills."""
+def probe_spawned_vehicle(
+    host: str,
+    port: int,
+    *,
+    socket_timeout: float | None = None,
+) -> bool | None:
+    """Attach-only vehicle poll. None when beamngpy is missing. Never launches or kills.
+
+    ``TechHelloTimeout`` propagates. It is not an empty vehicle list.
+    """
     try:
         from beamngpy import BeamNGpy  # type: ignore  # noqa: F401
     except Exception:
         return None
     bng = None
     try:
-        bng = open_tech_beamngpy(host, port, home=None, user=None, launch=False)
+        bng = open_tech_beamngpy(
+            host, port, home=None, user=None, launch=False, socket_timeout=socket_timeout
+        )
         vehicles = None
         getter = getattr(bng, "get_current_vehicles", None)
         if callable(getter):
@@ -598,6 +661,8 @@ def probe_spawned_vehicle(host: str, port: int) -> bool | None:
         if isinstance(vehicles, dict):
             return len(vehicles) > 0
         return bool(vehicles)
+    except TechHelloTimeout:
+        raise
     except Exception:
         return False
     finally:
@@ -625,6 +690,7 @@ class TechHoldGate:
     will_launch: bool
     host: str
     port: int
+    hello: str = "skipped"
 
     @property
     def ok(self) -> bool:
@@ -646,10 +712,14 @@ class TechHoldGate:
     @property
     def line(self) -> str:
         age = "--" if self.lua_age_s is None else f"{self.lua_age_s:.3f}s"
+        if self.hello == "timeout":
+            vehicle = "Hello-timeout"
+        else:
+            vehicle = "yes" if self.vehicle_spawned else "no"
         return (
-            f"[GVD] tech-hold port={'LISTENING' if self.port_listening else 'down'} "
+            f"[GVD] phase=wait-gate port={'LISTENING' if self.port_listening else 'down'} "
             f"mod={'yes' if self.mod_present else 'no'} "
-            f"vehicle={'yes' if self.vehicle_spawned else 'no'} "
+            f"vehicle={vehicle} "
             f"lua_bus={'fresh' if self.lua_fresh else 'stale'} age={age} "
             f"buses_same={'yes' if self.buses_same else 'no'} link={self.link} "
             f"pin={self.beamngpy_pin or '--'} beamngpy={self.beamngpy_version or 'missing'} "
@@ -685,16 +755,32 @@ def tech_hold_gate(
         mod_ok = bool(mod_present)
 
     vehicle_note = ""
+    hello = "skipped"
+    hello_note = ""
     if vehicle_spawned is None:
         if not listening:
             veh_ok = False
+            print(
+                f"[GVD] phase=attach {host}:{port} down launch={will_launch}",
+                flush=True,
+            )
+            print("[GVD] phase=Hello skipped", flush=True)
         else:
-            probed = probe_spawned_vehicle(host, port)
-            if probed is None:
+            try:
+                probed = probe_spawned_vehicle(
+                    host, port, socket_timeout=resolve_socket_timeout(cfg)
+                )
+            except TechHelloTimeout as exc:
                 veh_ok = False
-                vehicle_note = "beamngpy not available"
+                hello = "timeout"
+                hello_note = str(exc)
             else:
-                veh_ok = bool(probed)
+                hello = "ok"
+                if probed is None:
+                    veh_ok = False
+                    vehicle_note = "beamngpy not available"
+                else:
+                    veh_ok = bool(probed)
     else:
         veh_ok = bool(vehicle_spawned)
 
@@ -719,7 +805,9 @@ def tech_hold_gate(
         reasons.append(f"research port {host}:{port} not LISTENING")
     if not mod_ok:
         reasons.append(r"GVD mod missing under Tech current\mods\unpacked\gvd")
-    if not veh_ok:
+    if hello == "timeout":
+        reasons.append(hello_note or "Hello timeout")
+    elif not veh_ok:
         reasons.append(vehicle_note or "no vehicle spawned")
     if not fresh:
         reasons.append(live_note or "lua_bus missing or stale")
@@ -731,7 +819,7 @@ def tech_hold_gate(
         extra = f" (Tech {tech})" if tech else ""
         reasons.append(f"beamngpy {got} != pin {pin or '--'}{extra}")
     note = "ok" if not reasons else "; ".join(reasons)
-    return TechHoldGate(
+    gate = TechHoldGate(
         port_listening=listening,
         mod_present=mod_ok,
         vehicle_spawned=veh_ok,
@@ -749,13 +837,15 @@ def tech_hold_gate(
         will_launch=will_launch,
         host=host,
         port=port,
+        hello=hello,
     )
+    print(gate.line, flush=True)
+    return gate
 
 
 def run_tech_hold(config: dict[str, Any] | None = None) -> int:
     """Print the wait gate and return 0 only when vision/Hz is allowed to start."""
     gate = tech_hold_gate(config)
-    print(gate.line, flush=True)
     cfg = apply_env_overrides(config if config is not None else load_tech_config())
     home = str(cfg.get("home") or "").strip() or None
     print(f"[GVD] one starter: {human_one_starter(home)}", flush=True)
@@ -867,8 +957,19 @@ class TechSession:
             )
             return False
         try:
-            bng = open_tech_beamngpy(host, port, home=home, user=user, launch=launch)
+            bng = open_tech_beamngpy(
+                host,
+                port,
+                home=home,
+                user=user,
+                launch=launch,
+                socket_timeout=resolve_socket_timeout(self.config),
+            )
             self.bng = bng
+        except TechHelloTimeout as e:
+            self.note = str(e)
+            self._log(f"[GVD] phase=Hello REFUSE: {self.note}. Not a missing vehicle.")
+            return False
         except Exception as e:
             self.note = f"beamngpy connect failed ({e})"
             self._log(f"[GVD] {self.note}. Research port {host}:{port}.")

@@ -96,6 +96,7 @@ def check_tech_yaml() -> None:
     assert cfg.get("host") == "localhost"
     assert int(cfg.get("port") or 0) == 25252
     assert cfg.get("launch") is False
+    assert float(cfg.get("socket_timeout")) == 10.0
     assert str(cfg.get("beamngpy_pin")) == "1.36"
     sensors = cfg.get("sensors") or {}
     assert sensors.get("electrics") is True
@@ -1109,6 +1110,155 @@ def _check_launch_fail_prints_argv(open_tech_beamngpy) -> None:
             sys.modules["beamngpy"] = old
 
 
+def _check_hello_timeout() -> None:
+    """Hello socket timeout REFUSEs and does not report a missing vehicle."""
+    import io
+    import os
+    import socket
+    import sys
+    import types
+    from contextlib import redirect_stdout
+
+    from python.sensors.tech import (
+        TECH_SOCKET_TIMEOUT_S,
+        TechHelloTimeout,
+        open_tech_beamngpy,
+        tech_hold_gate,
+    )
+
+    os.environ.pop("GVD_TECH_SOCKET_TIMEOUT", None)
+    seen: dict = {}
+    instances: list = []
+
+    class FakeBNG:
+        def __init__(self, host, port, **kwargs):
+            self.kwargs = dict(kwargs)
+            self.binary = "Bin64/BeamNG.tech.x64.exe"
+            self.gfx = None
+            self.socket_timeout = None
+            self.quit_on_close = True
+            self.last_command_line = None
+            self.events: list[str] = []
+            instances.append(self)
+
+        def open(self, launch=True, **kwargs):
+            seen["launch"] = launch
+            seen["socket_timeout"] = self.socket_timeout
+            seen["quit_on_close"] = self.quit_on_close
+            seen["binary"] = self.binary
+            raise TimeoutError("timed out")
+
+        def disconnect(self) -> None:
+            self.events.append("disconnect")
+
+        def close(self) -> None:
+            self.events.append("close")
+
+        def quit_beamng(self) -> None:
+            self.events.append("quit")
+
+    mod = types.ModuleType("beamngpy")
+    mod.BeamNGpy = FakeBNG
+    old = sys.modules.get("beamngpy")
+    sys.modules["beamngpy"] = mod
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    port = srv.getsockname()[1]
+    try:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            try:
+                open_tech_beamngpy(
+                    "127.0.0.1",
+                    port,
+                    home="/opt/techhome",
+                    user=None,
+                    launch=True,
+                )
+            except TechHelloTimeout as exc:
+                assert "Hello timeout" in str(exc)
+            else:
+                raise AssertionError("Hello timeout should refuse")
+        out = buf.getvalue()
+        assert seen["launch"] is False
+        assert seen["socket_timeout"] == TECH_SOCKET_TIMEOUT_S
+        assert seen["quit_on_close"] is False
+        assert seen["binary"] == "BeamNG.tech.exe"
+        assert instances[-1].kwargs["socket_timeout"] == TECH_SOCKET_TIMEOUT_S
+        assert instances[-1].events == ["disconnect"]
+        assert "close" not in instances[-1].events and "quit" not in instances[-1].events
+        assert f"phase=attach 127.0.0.1:{port} LISTENING launch=False" in out
+        assert "phase=Hello" in out
+        assert "phase=Hello REFUSE" in out
+        assert "Not a missing vehicle" in out
+        assert "no vehicle spawned" not in out
+        assert "launch failed" not in out
+
+        buf = io.StringIO()
+        with _hold_env():
+            with redirect_stdout(buf):
+                gate = tech_hold_gate(
+                    {
+                        "host": "127.0.0.1",
+                        "port": port,
+                        "launch": True,
+                        "beamngpy_pin": "1.36",
+                        "home": "/opt/techhome",
+                    },
+                    mod_present=True,
+                    beamngpy_version="1.36.1",
+                )
+        out = buf.getvalue()
+        assert gate.hello == "timeout"
+        assert gate.vehicle_spawned is False
+        assert gate.will_launch is False
+        assert not gate.ok and not gate.proceed
+        assert "Hello timeout" in gate.note
+        assert "no vehicle spawned" not in gate.note
+        assert "vehicle=Hello-timeout" in gate.line
+        assert "phase=wait-gate" in gate.line
+        assert "phase=Hello REFUSE" in out
+        assert "phase=wait-gate" in out
+        assert "no vehicle spawned" not in out
+        assert instances[-1].events[0] == "disconnect"
+        assert "close" not in instances[-1].events and "quit" not in instances[-1].events
+
+        class FakeEmpty(FakeBNG):
+            def open(self, launch=True, **kwargs):
+                return None
+
+            def get_current_vehicles(self):
+                return {}
+
+        mod.BeamNGpy = FakeEmpty
+        with _hold_env():
+            with redirect_stdout(io.StringIO()):
+                empty = tech_hold_gate(
+                    {
+                        "host": "127.0.0.1",
+                        "port": port,
+                        "launch": False,
+                        "beamngpy_pin": "1.36",
+                        "home": "/opt/techhome",
+                    },
+                    mod_present=True,
+                    beamngpy_version="1.36.1",
+                )
+        assert empty.hello == "ok"
+        assert empty.vehicle_spawned is False
+        assert "no vehicle spawned" in empty.note
+        assert "Hello timeout" not in empty.note
+        assert "vehicle=no" in empty.line
+        assert "close" not in instances[-1].events and "quit" not in instances[-1].events
+    finally:
+        srv.close()
+        if old is None:
+            sys.modules.pop("beamngpy", None)
+        else:
+            sys.modules["beamngpy"] = old
+
+
 def check_tech_hold_gate() -> None:
     """Offline: bus match / freshness, one starter, pin, and Esc/q disconnect."""
     import inspect
@@ -1302,6 +1452,9 @@ def check_tech_hold_gate() -> None:
             assert ok.lua_age_s is not None and ok.lua_age_s < 1.0
             assert ok.will_launch is False
             assert ok.tech_key is True
+            assert ok.hello == "skipped"
+            assert "phase=wait-gate" in ok.line
+            assert "Hello-timeout" not in ok.line
             (home / "tech.key").write_text("", encoding="utf-8")
             unlocked = tech_hold_gate(cfg, **base)
             assert unlocked.tech_key is False
@@ -1331,6 +1484,7 @@ def check_tech_hold_gate() -> None:
             assert not no_veh.vehicle_spawned and not no_veh.ok
 
     _check_launch_fail_prints_argv(open_tech_beamngpy)
+    _check_hello_timeout()
 
     # connect refuses a dead port instead of launching (launch stays false).
     with _hold_env():

@@ -322,14 +322,15 @@ def main() -> None:
         from python.sensors.tech import tech_hold_gate
 
         # Wait gate before any camera open or unique-frame Hz.
+        # tech_hold_gate logs phase=attach / phase=Hello / phase=wait-gate.
         hold = tech_hold_gate()
-        print(hold.line)
         if not hold.proceed:
             print(f"[GVD] REFUSE: {hold.note}")
             print(
                 "[GVD] Tech hold failed before vision. Unique-frame Hz is not measured. "
                 "One starter: install-root BeamNG.tech.exe -tcom -console -gfx dx11 already up, "
                 "mod loaded, vehicle spawned. Attach only (GVD_TECH_LAUNCH=0). "
+                "Hello timeout is REFUSE and is not a missing vehicle. "
                 "Do not kill BeamNG.tech or CrashSender."
             )
             raise SystemExit(1)

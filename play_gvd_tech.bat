@@ -77,6 +77,7 @@ echo [GVD] tech.key status: non-empty "%BNG_HOME%\tech.key". Missing or empty do
 echo [GVD] User path is optional. An empty user path does not block the wait gate.
 echo [GVD] Mod: Tech current\mods\unpacked\gvd. Spawn a vehicle before this bat.
 echo [GVD] Wait gate before vision/Hz: port 25252 LISTENING, mod, vehicle, fresh lua_bus, buses_same.
+echo [GVD] Attach socket_timeout. Hello timeout is REFUSE, not a missing vehicle. launch=False while :25252 is LISTENING.
 echo [GVD] Esc or q in GVD VISION disconnects only (quit_on_close=false). Do not kill BeamNG.tech or CrashSender.
 echo [GVD] Preflight:
 %PY% "%RUN%" --tech-hold

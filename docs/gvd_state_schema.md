@@ -96,7 +96,7 @@ Python **writes** the **running product** sandbox (Tech `BeamNG.tech\current\Doc
 
 Both sides print every second: `python_bus=` (absolute) `lua_bus=` (resolved `Documents/GVD`) `product=drive|tech` `state_mtime` `engage` `seq`. If those folders are not the same, `link=MISMATCH` and actuation is refused. VISION paints only from that shared `gvd_state.json`; missing or the other product tree is a loud mismatch, not a fake corridor.
 
-Tech vision does not start camera Hz until the wait gate passes: research port `:25252` LISTENING, the GVD mod under Tech `current\mods\unpacked\gvd`, a spawned vehicle, and a fresh `lua_bus` (handshake age < 1 s) with `buses_same(python_bus, lua_bus)` so `link=ok`. A missing or stale `gvd_link.json` / `gvd_ego.json` stays `link=MISMATCH`. Live `lua_bus` wins over a `GVD_DOCS_DIR` guess. Esc or `q` in GVD VISION disconnects that socket only (`quit_on_close=false`); it does not quit BeamNG.tech.
+Tech vision does not start camera Hz until the wait gate passes: research port `:25252` LISTENING, the GVD mod under Tech `current\mods\unpacked\gvd`, a spawned vehicle, and a fresh `lua_bus` (handshake age < 1 s) with `buses_same(python_bus, lua_bus)` so `link=ok`. A missing or stale `gvd_link.json` / `gvd_ego.json` stays `link=MISMATCH`. Live `lua_bus` wins over a `GVD_DOCS_DIR` guess. The human one-starter is install-root `BeamNG.tech.exe -tcom -console -gfx dx11`. BeamNGpy launch uses that same root exe and `-gfx dx11`. A missing `tech.key` or user path does not open or close this gate. Esc or `q` in GVD VISION disconnects that socket only (`quit_on_close=false`); it does not quit BeamNG.tech.
 
 | `python_bus` | string | Absolute folder Python wrote |
 | `lua_bus` | string | Resolved `Documents/GVD` (product sandbox) |

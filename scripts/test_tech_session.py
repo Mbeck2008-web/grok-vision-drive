@@ -1007,6 +1007,108 @@ def _plant_link(folder, *, lua_bus: str, age_s: float = 0.0) -> None:
         os.utime(path, (old, old))
 
 
+def _check_launch_fail_prints_argv(open_tech_beamngpy) -> None:
+    """Launch failure prints BeamNGpy's real argv. Attach failure does not."""
+    import io
+    import sys
+    import types
+    from contextlib import redirect_stdout
+
+    seen: dict = {}
+
+    class FakeBNG:
+        def __init__(self, host, port, **kwargs):
+            seen["kwargs"] = dict(kwargs)
+            self.binary = "Bin64/BeamNG.tech.x64.exe"
+            self.gfx = None
+            self.quit_on_close = True
+            self.last_command_line = None
+
+        def open(self, launch=True, **kwargs):
+            seen["binary"] = self.binary
+            seen["gfx"] = self.gfx
+            seen["quit_on_close"] = self.quit_on_close
+            if launch:
+                self.last_command_line = (
+                    "/opt/techhome/BeamNG.tech.exe -nosteam -tcom -tport 25252 "
+                    "-console -tcom-listen-ip 127.0.0.1 -gfx dx11"
+                )
+                raise RuntimeError("crash")
+
+        def disconnect(self) -> None:
+            return None
+
+    class FakeEarly(FakeBNG):
+        def open(self, launch=True, **kwargs):
+            seen["early_binary"] = self.binary
+            seen["early_gfx"] = self.gfx
+            raise RuntimeError("missing exe")
+
+    class FakeAttach(FakeBNG):
+        def open(self, launch=True, **kwargs):
+            raise RuntimeError("attach down")
+
+    mod = types.ModuleType("beamngpy")
+    mod.BeamNGpy = FakeBNG
+    old = sys.modules.get("beamngpy")
+    sys.modules["beamngpy"] = mod
+    try:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            try:
+                open_tech_beamngpy("127.0.0.1", 25252, home="/opt/techhome", user=None, launch=True)
+            except RuntimeError as exc:
+                assert "crash" in str(exc)
+            else:
+                raise AssertionError("launch should fail")
+        out = buf.getvalue()
+        assert seen["kwargs"]["binary"] == "BeamNG.tech.exe"
+        assert seen["kwargs"]["gfx"] == "dx11"
+        assert seen["kwargs"]["quit_on_close"] is False
+        assert seen["binary"] == "BeamNG.tech.exe"
+        assert seen["gfx"] == "dx11"
+        assert seen["quit_on_close"] is False
+        assert (
+            "argv: /opt/techhome/BeamNG.tech.exe -nosteam -tcom -tport 25252 "
+            "-console -tcom-listen-ip 127.0.0.1 -gfx dx11"
+        ) in out
+        assert "BeamNG.tech.x64.exe" not in out
+        assert "Bin64" not in out
+
+        mod.BeamNGpy = FakeEarly
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            try:
+                open_tech_beamngpy("127.0.0.1", 25252, home="/opt/techhome", user=None, launch=True)
+            except RuntimeError as exc:
+                assert "missing exe" in str(exc)
+            else:
+                raise AssertionError("early launch should fail")
+        out = buf.getvalue()
+        assert seen["early_binary"] == "BeamNG.tech.exe"
+        assert seen["early_gfx"] == "dx11"
+        assert "/opt/techhome/BeamNG.tech.exe" in out
+        assert "-tcom" in out and "-console" in out and "-gfx dx11" in out
+        assert "BeamNG.tech.x64.exe" not in out
+        assert "Bin64" not in out
+
+        mod.BeamNGpy = FakeAttach
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            try:
+                open_tech_beamngpy("127.0.0.1", 25252, home="/opt/techhome", user=None, launch=False)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("attach should fail")
+        assert "launch failed" not in buf.getvalue()
+    finally:
+        if old is None:
+            sys.modules.pop("beamngpy", None)
+        else:
+            sys.modules["beamngpy"] = old
+
+
 def check_tech_hold_gate() -> None:
     """Offline: bus match / freshness, one starter, pin, and Esc/q disconnect."""
     import inspect
@@ -1017,10 +1119,15 @@ def check_tech_hold_gate() -> None:
 
     from python.runtime import paths
     from python.sensors.tech import (
-        TECH_BIN64_EXE,
+        TECH_GFX,
+        TECH_ROOT_EXE,
+        TechHoldGate,
         TechSession,
+        beamngpy_launch_argv,
         beamngpy_pin_ok,
+        human_one_starter,
         open_tech_beamngpy,
+        real_launch_argv,
         release_tech_beamngpy,
         research_port_listening,
         resolve_tech_launch,
@@ -1029,7 +1136,23 @@ def check_tech_hold_gate() -> None:
         tech_mod_present,
     )
 
-    assert TECH_BIN64_EXE == "BeamNG.tech.x64.exe"
+    assert TECH_ROOT_EXE == "BeamNG.tech.exe"
+    assert TECH_GFX == "dx11"
+    assert human_one_starter(None) == "BeamNG.tech.exe -tcom -console -gfx dx11"
+    starter = human_one_starter("/opt/techhome")
+    assert starter == "/opt/techhome/BeamNG.tech.exe -tcom -console -gfx dx11"
+    argv = beamngpy_launch_argv("/opt/techhome", 25252, None)
+    assert argv[0] == "/opt/techhome/BeamNG.tech.exe"
+    assert argv[1:6] == ["-nosteam", "-tcom", "-tport", "25252", "-console"]
+    assert argv[argv.index("-gfx") + 1] == "dx11"
+    assert "-userpath" not in argv
+    assert "Bin64" not in " ".join(argv)
+    assert "BeamNG.tech.x64.exe" not in " ".join(argv)
+    with_user = beamngpy_launch_argv("/opt/techhome", 25252, "/opt/user")
+    assert with_user[-2:] == ["-userpath", "/opt/user"]
+    assert "tech_key" not in inspect.getsource(TechHoldGate.ok.fget)
+    assert "tech_key" not in inspect.getsource(TechHoldGate.proceed.fget)
+    assert inspect.getsource(TechHoldGate.proceed.fget).strip().endswith("return self.ok and self.pin_ok")
     assert resolve_tech_launch({"launch": True}, port_listening=True)[0] is False
     assert "double-start" in resolve_tech_launch({"launch": True}, port_listening=True)[1]
     assert resolve_tech_launch({"launch": False}, port_listening=True)[0] is False
@@ -1090,12 +1213,18 @@ def check_tech_hold_gate() -> None:
     connect_src = inspect.getsource(TechSession.connect)
     assert "resolve_tech_launch" in connect_src
     assert "quit_on_close=False" in inspect.getsource(open_tech_beamngpy)
+    open_src = inspect.getsource(open_tech_beamngpy)
+    assert 'binary": TECH_ROOT_EXE' in open_src or "binary=TECH_ROOT_EXE" in open_src or '"binary": TECH_ROOT_EXE' in open_src
+    assert "TECH_GFX" in open_src
+    assert "beamngpy launch failed. argv:" in open_src
 
     bat = (ROOT / "play_gvd_tech.bat").read_text(encoding="utf-8")
     assert 'set "GVD_TECH_LAUNCH=0"' in bat
     assert 'set "GVD_TECH_LAUNCH=1"' not in bat
     assert 'start ""' not in bat
-    assert r"Bin64\BeamNG.tech.x64.exe" in bat
+    assert r'BeamNG.tech.exe" -tcom -console -gfx dx11' in bat
+    assert "BeamNG.tech.x64.exe" not in bat
+    assert r"Bin64\BeamNG" not in bat
     assert "--tech-hold" in bat
     assert "quit BeamNG" not in bat
     req = (ROOT / "requirements-beamng.txt").read_text(encoding="utf-8")
@@ -1122,11 +1251,17 @@ def check_tech_hold_gate() -> None:
         (mod / "main.lua").write_text("-- gvd\n", encoding="utf-8")
         home = root / "tech-install"
         (home / "Bin64").mkdir(parents=True)
-        (home / "Bin64" / TECH_BIN64_EXE).write_bytes(b"")
-        assert tech_key_status(str(home)) is False
+        (home / "Bin64" / "BeamNG.tech.x64.exe").write_bytes(b"")
         (home / "Bin64" / "tech.key").write_text("key", encoding="utf-8")
+        assert tech_key_status(str(home)) is False
+        (home / "tech.key").write_text("", encoding="utf-8")
+        assert tech_key_status(str(home)) is False
+        (home / "tech.key").write_text(" \n\t", encoding="utf-8")
+        assert tech_key_status(str(home)) is False
+        (home / "tech.key").write_text("key\n", encoding="utf-8")
         assert tech_key_status(str(home)) is True
         assert tech_key_status("") is None
+        assert tech_key_status(None) is None
         cfg = {
             "host": "127.0.0.1",
             "port": 9,
@@ -1167,6 +1302,11 @@ def check_tech_hold_gate() -> None:
             assert ok.lua_age_s is not None and ok.lua_age_s < 1.0
             assert ok.will_launch is False
             assert ok.tech_key is True
+            (home / "tech.key").write_text("", encoding="utf-8")
+            unlocked = tech_hold_gate(cfg, **base)
+            assert unlocked.tech_key is False
+            assert unlocked.ok and unlocked.proceed, unlocked.note
+            (home / "tech.key").write_text("key\n", encoding="utf-8")
 
             down = tech_hold_gate(cfg, port_up=False, vehicle_spawned=True, mod_present=True, beamngpy_version="1.36.1")
             assert not down.port_listening and not down.ok and down.will_launch is False
@@ -1189,6 +1329,8 @@ def check_tech_hold_gate() -> None:
             assert not no_mod.mod_present and not no_mod.ok
             no_veh = tech_hold_gate(cfg, port_up=True, vehicle_spawned=False, mod_present=True, beamngpy_version="1.36")
             assert not no_veh.vehicle_spawned and not no_veh.ok
+
+    _check_launch_fail_prints_argv(open_tech_beamngpy)
 
     # connect refuses a dead port instead of launching (launch stays false).
     with _hold_env():

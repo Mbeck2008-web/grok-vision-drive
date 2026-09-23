@@ -14,9 +14,10 @@
 
 host: localhost
 port: 25252
-home: ""          # BeamNG.tech install dir (tech.key next to the exe). Empty → BNG_HOME.
-                  # Bin64 binary is Bin64/BeamNG.tech.x64.exe. One starter; do not also launch from the bat.
-user: ""          # Tech userfolder. Empty → Tech default. Set to the Drive userfolder to share mods.
+home: ""          # BeamNG.tech install dir. Empty → BNG_HOME.
+                  # One starter: install-root BeamNG.tech.exe -tcom -console -gfx dx11.
+                  # Do not also launch from the bat. A missing tech.key does not fail the hold.
+user: ""          # Optional Tech userfolder. Empty is not a hold failure.
 launch: false     # false = attach to already-running Tech. true = BeamNGpy is the only starter (port was down).
 beamngpy_pin: "1.36"  # Tech 0.39. Tech 0.38 → "1.35". Prove refuses a different installed BeamNGpy.
 wait_vehicle_s: 60

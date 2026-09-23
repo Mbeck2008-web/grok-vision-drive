@@ -4,9 +4,9 @@ title GVD Tech
 cd /d "%~dp0"
 
 rem Tech launcher: 8-cam BeamNGpy + vehicle electrics/pose/damage + vehicle.control.
-rem Requires BeamNG.tech with tech.key beside the exe (install dir or Bin64). Not a community camera mod.
+rem One starter, already up: install-root BeamNG.tech.exe -tcom -console -gfx dx11.
 rem Does NOT launch Steam BeamNG.drive. Does NOT start BeamNG.tech. Extra args pass through to run_vision.py.
-rem One starter: Tech is already running. GVD_TECH_LAUNCH=0 attaches. Never also launch=1.
+rem GVD_TECH_LAUNCH=0 attaches. Never also launch=1. tech.key and user path do not block the wait gate.
 
 set "GVD_BACKEND=beamngpy"
 set "GVD_BEAMNG=1"
@@ -70,9 +70,11 @@ echo [GVD] product=tech. Supervisor and GELua must print the same python_bus/lua
 echo [GVD] link=MISMATCH means Drive vs Tech, a stale lua_bus, or leftover GVD_DOCS_DIR. Live lua_bus wins. Live Tech 8-cam UNPROVEN.
 echo [GVD] Match BeamNGpy to the Tech build in use (0.38 -^> 1.35.x, 0.39 -^> 1.36). config\tech.yaml beamngpy_pin.
 echo [GVD] GVD_TECH_LAUNCH=0 attach. This bat does not start BeamNG.tech.
-echo [GVD] One starter only. Already running: "%BNG_HOME%\Bin64\BeamNG.tech.x64.exe"
+echo [GVD] One starter only. Already running: "%BNG_HOME%\BeamNG.tech.exe" -tcom -console -gfx dx11
+echo [GVD] -gfx dx11 avoids the D3D12 Basic Render crash. A bare Bin64 start is not this starter.
 echo [GVD] Do not combine a bat start with GVD_TECH_LAUNCH=1. That double-starts Tech.
-echo [GVD] tech.key beside Bin64\BeamNG.tech.x64.exe or next to BeamNG.tech.exe in the install dir.
+echo [GVD] tech.key status: non-empty "%BNG_HOME%\tech.key". Missing or empty does not block the wait gate.
+echo [GVD] User path is optional. An empty user path does not block the wait gate.
 echo [GVD] Mod: Tech current\mods\unpacked\gvd. Spawn a vehicle before this bat.
 echo [GVD] Wait gate before vision/Hz: port 25252 LISTENING, mod, vehicle, fresh lua_bus, buses_same.
 echo [GVD] Esc or q in GVD VISION disconnects only (quit_on_close=false). Do not kill BeamNG.tech or CrashSender.
@@ -88,7 +90,7 @@ echo [GVD] Starting supervisor: %RUN%  (backend=beamngpy, attach)
 start "GVD supervisor" /D "%RUNROOT%" cmd /k %PY% "%RUN%" --backend beamngpy --viz %*
 
 echo [GVD] Mods: run install.bat so unpacked\gvd lands in Drive and (if present) Tech current\mods.
-echo [GVD] Prove: Tech already up on Bin64\BeamNG.tech.x64.exe, mod enabled, vehicle spawned, then this bat attaches.
+echo [GVD] Prove: Tech already up via BeamNG.tech.exe -tcom -console -gfx dx11, mod enabled, vehicle spawned, then this bat attaches.
 echo [GVD] Soft Esc of the supervisor disconnects only. Killing BeamNG.tech is a failed prove: the port dies, lua_bus goes stale, unique-frame Hz stays 0.
 echo [GVD] Optional pin: edit config\tech.yaml nav.pin_lat / pin_lon. Hint only — GVD is not routing to the pin yet.
 echo [GVD] Probe without driving:  %PY% "%RUN%" --tech-probe

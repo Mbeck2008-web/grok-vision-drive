@@ -314,10 +314,12 @@ def apply_env_overrides(cfg: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-# Research socket. Bin64 game binary (not BeamNG.tech.exe inside Bin64).
+# Research socket. Official binary is the install-root exe, not Bin64.
 TECH_RESEARCH_PORT = 25252
-TECH_BIN64_EXE = "BeamNG.tech.x64.exe"
-TECH_BIN64_REL = ("Bin64", TECH_BIN64_EXE)
+TECH_ROOT_EXE = "BeamNG.tech.exe"
+TECH_GFX = "dx11"
+# Human one-starter and the BeamNGpy gfx switch. BeamNGpy also adds -nosteam/-tport.
+TECH_HUMAN_TAIL = ("-tcom", "-console", "-gfx", TECH_GFX)
 # BeamNGpy minor line for the Tech build in use. 0.38 → 1.35, 0.39 → 1.36.
 BEAMNGPY_FOR_TECH = {"1.35": "0.38", "1.36": "0.39"}
 
@@ -385,6 +387,66 @@ def release_tech_beamngpy(bng: Any) -> None:
         pass
 
 
+def human_one_starter(home: str | None) -> str:
+    """Install-root ``BeamNG.tech.exe -tcom -console -gfx dx11``."""
+    exe = TECH_ROOT_EXE
+    if home and str(home).strip():
+        exe = str(Path(home) / TECH_ROOT_EXE)
+    return " ".join((exe, *TECH_HUMAN_TAIL))
+
+
+def beamngpy_launch_argv(home: str | None, port: int, user: str | None = None) -> list[str]:
+    """Argv BeamNGpy 1.36 builds for the root exe with ``gfx=dx11``.
+
+    Matches ``_prepare_call`` plus ``open()``'s default ``-tcom-listen-ip``.
+    Used when a launch fails before ``last_command_line`` is set. Not a Bin64 path.
+    """
+    exe = TECH_ROOT_EXE
+    if home and str(home).strip():
+        exe = str(Path(home) / TECH_ROOT_EXE)
+    call = [
+        exe,
+        "-nosteam",
+        "-tcom",
+        "-tport",
+        str(int(port)),
+        "-console",
+        "-tcom-listen-ip",
+        "127.0.0.1",
+        "-gfx",
+        TECH_GFX,
+    ]
+    if user and str(user).strip():
+        call.extend(("-userpath", str(user)))
+    return call
+
+
+def real_launch_argv(bng: Any, home: str | None, port: int, user: str | None) -> str:
+    """Command line BeamNGpy actually used, else the root-exe reconstruction.
+
+    ``get_launch_arguments()`` ignores ``self.binary`` when ``last_command_line``
+    is empty, so it is not the failure argv.
+    """
+    line = getattr(bng, "last_command_line", None) if bng is not None else None
+    if isinstance(line, (list, tuple)) and line:
+        return " ".join(str(part) for part in line)
+    if isinstance(line, str) and line.strip():
+        return line.strip()
+    return " ".join(beamngpy_launch_argv(home, port, user))
+
+
+def _force_root_dx11(bng: Any) -> None:
+    """Leave the BeamNGpy binary as the install-root exe and gfx as dx11."""
+    try:
+        bng.binary = TECH_ROOT_EXE
+    except Exception:
+        pass
+    try:
+        bng.gfx = TECH_GFX
+    except Exception:
+        pass
+
+
 def open_tech_beamngpy(
     host: str,
     port: int,
@@ -393,22 +455,47 @@ def open_tech_beamngpy(
     user: str | None,
     launch: bool,
 ) -> Any:
-    """Connect with quit_on_close=False so a later close cannot kill Tech."""
+    """Connect with quit_on_close=False. Launch uses the root exe and ``-gfx dx11``.
+
+    A launch failure prints the real argv (``last_command_line`` when BeamNGpy
+    set it). Attach failures do not print a launch line.
+    """
     from beamngpy import BeamNGpy  # type: ignore
 
-    kwargs: dict[str, Any] = {}
+    kwargs: dict[str, Any] = {
+        "quit_on_close": False,
+        "binary": TECH_ROOT_EXE,
+        "gfx": TECH_GFX,
+    }
     if home:
         kwargs["home"] = home
     if user:
         kwargs["user"] = user
+    bng = None
     try:
-        bng = BeamNGpy(host, int(port), quit_on_close=False, **kwargs)
-    except TypeError:
-        bng = BeamNGpy(host, int(port), **kwargs) if kwargs else BeamNGpy(host, int(port))
-    hold_tech_process(bng)
-    bng.open(launch=bool(launch))
-    hold_tech_process(bng)
-    return bng
+        try:
+            bng = BeamNGpy(host, int(port), **kwargs)
+        except TypeError:
+            slim: dict[str, Any] = {}
+            if home:
+                slim["home"] = home
+            if user:
+                slim["user"] = user
+            try:
+                bng = BeamNGpy(host, int(port), quit_on_close=False, **slim)
+            except TypeError:
+                bng = BeamNGpy(host, int(port), **slim) if slim else BeamNGpy(host, int(port))
+        _force_root_dx11(bng)
+        hold_tech_process(bng)
+        bng.open(launch=bool(launch))
+        hold_tech_process(bng)
+        _force_root_dx11(bng)
+        return bng
+    except Exception:
+        if launch:
+            argv = real_launch_argv(bng, home, port, user)
+            print(f"[GVD] beamngpy launch failed. argv: {argv}", flush=True)
+        raise
 
 
 def beamngpy_minor(version: str | None) -> str | None:
@@ -448,30 +535,22 @@ def installed_beamngpy_version() -> str | None:
         return None
 
 
-def tech_bin64_exe(home: Path | str | None) -> Path | None:
-    if home is None or not str(home).strip():
-        return None
-    return Path(home).joinpath(*TECH_BIN64_REL)
-
-
 def tech_key_status(home: str | None) -> bool | None:
-    """True/False when an exe is visible, else None if home or the exe is unknown.
+    """Diagnose only. True when install-root ``tech.key`` is non-empty.
 
-    ``tech.key`` counts beside ``Bin64\\BeamNG.tech.x64.exe`` or in the install dir
-    next to ``BeamNG.tech.exe``.
+    A Bin64 ``tech.key`` does not count. Empty or whitespace is False.
+    None when home is unset. This does not gate the wait hold.
     """
     if home is None or not str(home).strip():
         return None
-    root = Path(home)
-    bin_exe = root.joinpath(*TECH_BIN64_REL)
-    root_exe = root / "BeamNG.tech.exe"
-    key_bin = bin_exe.parent / "tech.key"
-    key_root = root / "tech.key"
-    if bin_exe.is_file() or root_exe.is_file():
-        return key_bin.is_file() or key_root.is_file()
-    if key_bin.is_file() or key_root.is_file():
-        return True
-    return None
+    key = Path(home) / "tech.key"
+    try:
+        if not key.is_file():
+            return False
+        text = key.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return bool(text.strip())
 
 
 def tech_mod_roots() -> list[Path]:
@@ -590,6 +669,7 @@ def tech_hold_gate(
 
     Wait gate (unchanged): research port LISTENING, unpacked GVD mod, a spawned
     vehicle, fresh lua_bus (age < 1s), and buses_same(python_bus, lua_bus).
+    ``tech.key`` and the Tech user path are status only and are not part of this gate.
     """
     from python.runtime.paths import bus_identity, buses_same_folder, read_live_lua_bus, youngest_lua_handshake
 
@@ -676,24 +756,22 @@ def run_tech_hold(config: dict[str, Any] | None = None) -> int:
     """Print the wait gate and return 0 only when vision/Hz is allowed to start."""
     gate = tech_hold_gate(config)
     print(gate.line, flush=True)
-    exe = tech_bin64_exe(str(apply_env_overrides(config if config is not None else load_tech_config()).get("home") or ""))
-    if exe is not None:
-        print(f"[GVD] Bin64 exe: {exe}", flush=True)
-    else:
-        print(f"[GVD] Bin64 exe name: {TECH_BIN64_EXE}", flush=True)
+    cfg = apply_env_overrides(config if config is not None else load_tech_config())
+    home = str(cfg.get("home") or "").strip() or None
+    print(f"[GVD] one starter: {human_one_starter(home)}", flush=True)
     if gate.tech_key is True:
-        print("[GVD] tech.key beside exe.", flush=True)
+        print("[GVD] tech.key: non-empty install-root tech.key (status only, not a hold gate).", flush=True)
     elif gate.tech_key is False:
-        print("[GVD] tech.key is not beside the Tech exe.", flush=True)
+        print("[GVD] tech.key: missing or empty at the install root (status only, not a hold gate).", flush=True)
     else:
-        print("[GVD] tech.key not confirmed (set BNG_HOME to the Tech install dir).", flush=True)
+        print("[GVD] tech.key: not confirmed (set BNG_HOME). Status only, not a hold gate.", flush=True)
     if gate.proceed:
         print("[GVD] tech-hold OK. Unique-frame Hz is not measured here.", flush=True)
         return 0
     print(f"[GVD] REFUSE: {gate.note}", flush=True)
     print(
         "[GVD] Supervisor stays down. Do not kill BeamNG.tech or CrashSender. "
-        "One starter: Bin64\\BeamNG.tech.x64.exe already running, mod loaded, vehicle spawned, then attach.",
+        f"One starter: {human_one_starter(home)} already running, mod loaded, vehicle spawned, then attach.",
         flush=True,
     )
     return 1
@@ -784,9 +862,8 @@ class TechSession:
         if not listening and not launch:
             self.note = f"research port {host}:{port} not LISTENING"
             self._log(
-                f"[GVD] {self.note}. Start BeamNG.tech once "
-                f"(Bin64\\{TECH_BIN64_EXE}) with tech.key beside the exe, then attach. "
-                "This path does not start a second Tech."
+                f"[GVD] {self.note}. Start BeamNG.tech once: {human_one_starter(home)} "
+                "then attach. This path does not start a second Tech."
             )
             return False
         try:
@@ -794,10 +871,7 @@ class TechSession:
             self.bng = bng
         except Exception as e:
             self.note = f"beamngpy connect failed ({e})"
-            self._log(
-                f"[GVD] {self.note}. Is BeamNG.tech listening on {host}:{port} "
-                f"with tech.key in the install dir?"
-            )
+            self._log(f"[GVD] {self.note}. Research port {host}:{port}.")
             return False
 
         wait_s = float(self.config.get("wait_vehicle_s") or 0.0)

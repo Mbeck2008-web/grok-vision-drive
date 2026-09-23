@@ -91,7 +91,7 @@ Three trees per product. Do not mix Drive with Tech. Confirm the live userfolder
 | Userfolder (0.37+ / 0.38+) | `%LOCALAPPDATA%\BeamNG\BeamNG.drive\current` | `%LOCALAPPDATA%\BeamNG\BeamNG.tech\current` |
 | `mods\unpacked\gvd` | Nested `%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\mods\unpacked\gvd` (legacy `%LOCALAPPDATA%\BeamNG.drive\<ver>\mods\unpacked\gvd` if that is the install pick) | Dual Tech trees: **mods → legacy**. `install.bat` copies Tech mods to `%LOCALAPPDATA%\BeamNG.tech\current\mods\unpacked\gvd` first (legacy), else nested `%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\mods\unpacked\gvd`. If both exist, **legacy wins**. |
 | `Documents\GVD` bus | Nested `%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\Documents\GVD` | Dual Tech trees: **bus → nested** `%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\Documents\GVD` (not the legacy `BeamNG.tech` tree). |
-| `play_gvd*.bat` | `play_gvd.bat` — `GVD_BACKEND=window`, Steam `284160`, Drive bus | `play_gvd_tech.bat` — `GVD_BACKEND=beamngpy` + `GVD_BEAMNG=1` + `GVD_TECH_LAUNCH=0` (attach). Does **not** start BeamNG.tech and does **not** launch Steam Drive. One starter, already up: `%BNG_HOME%\Bin64\BeamNG.tech.x64.exe`. |
+| `play_gvd*.bat` | `play_gvd.bat` — `GVD_BACKEND=window`, Steam `284160`, Drive bus | `play_gvd_tech.bat` — `GVD_BACKEND=beamngpy` + `GVD_BEAMNG=1` + `GVD_TECH_LAUNCH=0` (attach). Does **not** start BeamNG.tech and does **not** launch Steam Drive. One starter, already up: `%BNG_HOME%\BeamNG.tech.exe -tcom -console -gfx dx11`. |
 
 Lua on **both** products reads relative `Documents/GVD` via VFS / `FS:readFile` — that mapping follows the **running** userfolder (Launcher → Manage User Folder → **Open in Explorer**), not whichever tree `install.bat` last copied. No absolute `io.open`. `GVD_DOCS_DIR` wins for **Python writers**; Steam GELua does **not** inherit it. Not `%USERPROFILE%\Documents\GVD`. Not OneDrive. Not the Steam game folder (`C:\Program Files (x86)\Steam\steamapps\common\BeamNG.drive` typical; confirm via Steam → Properties → Installed files).
 
@@ -117,11 +117,11 @@ Uninstall Drive mods: `uninstall.bat`. Play details: [Player guide](#player-guid
 
 ### Dev install (BeamNG.tech)
 
-1. Install BeamNG.tech (not Steam Drive). Place `tech.key` **next to the Tech exe** (install dir, not the userfolder).
+1. Install BeamNG.tech (not Steam Drive). A non-empty `tech.key` in the install dir (next to `BeamNG.tech.exe`, not the userfolder) is status only. A missing key does not fail the wait gate.
 2. Double-click `install.bat` — copies the Lua mod into Drive `current\mods` and, if a Tech mods folder exists, Tech `current\mods` (legacy `%LOCALAPPDATA%\BeamNG.tech\current\mods` first).
 3. `pip install -r requirements-beamng.txt`. Pin BeamNGpy to the Tech build in use: **0.38 → 1.35.x**, **0.39 → 1.36** (`config/tech.yaml` `beamngpy_pin`, default `1.36`).
 4. Set `BNG_HOME` to the Tech install folder. Edit `config\tech.yaml` for host/port/`wait_vehicle_s` / `user:` / `beamngpy_pin` if needed.
-5. Start **one** BeamNG.tech: `%BNG_HOME%\Bin64\BeamNG.tech.x64.exe` (`tech.key` beside that exe or in the install dir). Spawn a vehicle (ETK800 is the camera-draft car). Enable **Grok Vision Drive** in Mod Manager. Leave Tech running.
+5. Start **one** BeamNG.tech: `%BNG_HOME%\BeamNG.tech.exe -tcom -console -gfx dx11` (install root, not a bare Bin64 exe). `-gfx dx11` avoids the D3D12 Basic Render crash. A non-empty install-root `tech.key` is status only and does not block the hold. Spawn a vehicle (ETK800 is the camera-draft car). Enable **Grok Vision Drive** in Mod Manager. Leave Tech running.
 6. Double-click `play_gvd_tech.bat` (or `PYTHONPATH=. python python/run_vision.py --backend beamngpy --viz`). The bat sets `GVD_BEAMNG=1`, `GVD_TECH_LAUNCH=0`, and the Tech bus. It does **not** start Tech. Do not also set `GVD_TECH_LAUNCH=1` (that double-starts).
 7. Preflight before the supervisor: `PYTHONPATH=. python python/run_vision.py --tech-hold`. Vision/Hz stays down until the research port is LISTENING, the unpacked mod is present, a vehicle is spawned, and `lua_bus` is fresh (< 1 s) with `buses_same` (`link=ok`).
 8. Probe without driving: `PYTHONPATH=. python python/run_vision.py --tech-probe`.
@@ -129,8 +129,8 @@ Uninstall Drive mods: `uninstall.bat`. Play details: [Player guide](#player-guid
 
 **Tech hold prove** (this tree gates the setup; it does not claim a live unique-frame Hz):
 
-1. One starter. Tech is already up via `Bin64\BeamNG.tech.x64.exe`. `play_gvd_tech.bat` attaches (`GVD_TECH_LAUNCH=0`) and does not start a second process. `GVD_TECH_LAUNCH=1` is the other starter, only when the bat did not start Tech and the port was down — never both.
-2. `BNG_HOME` is the install dir. `tech.key` sits beside the exe. The mod is under Tech `current\mods\unpacked\gvd` (legacy `%LOCALAPPDATA%\BeamNG.tech\current\mods\unpacked\gvd` first, else nested).
+1. One starter. Tech is already up via install-root `BeamNG.tech.exe -tcom -console -gfx dx11`. `play_gvd_tech.bat` attaches (`GVD_TECH_LAUNCH=0`) and does not start a second process. `GVD_TECH_LAUNCH=1` is the other starter, only when the bat did not start Tech and the port was down — never both. BeamNGpy launch uses that same root exe and `-gfx dx11`.
+2. `BNG_HOME` is the install dir. The mod is under Tech `current\mods\unpacked\gvd` (legacy `%LOCALAPPDATA%\BeamNG.tech\current\mods\unpacked\gvd` first, else nested). A missing install-root `tech.key` or an empty user path is printed as status and does not fail the wait gate.
 3. Wait gate before any camera Hz: `:25252` LISTENING, mod present, vehicle spawned, fresh `gvd_link.json` (`lua_bus` age < 1 s), `buses_same(python_bus, lua_bus)` → `link=ok`. Live `lua_bus` wins over the `GVD_DOCS_DIR` guess. Cache reuse is not a pass.
 4. Esc or `q` in GVD VISION quits the supervisor and **disconnects only** (`quit_on_close=false`). It must not quit BeamNG.tech or CrashSender. Killing Tech is a failed prove: the port dies, `lua_bus` goes stale, unique-frame Hz stays 0.
 5. BeamNGpy is pinned to the Tech build in `config/tech.yaml` `beamngpy_pin` (0.38 → `1.35`, 0.39 → `1.36`) and `requirements-beamng.txt`.
@@ -192,9 +192,9 @@ Troubleshooting: blank GVD Apps tile, or console `Could not create a description
 
 ## Dev (BeamNG.tech)
 
-Numbered install is under [Install → Dev](#dev-install-beamngtech). There is still no retail mod that creates those eight cameras. Once `tech.key` is in the **Tech install directory** (not the user folder), GVD already knows how to attach them and pull vehicle data.
+Numbered install is under [Install → Dev](#dev-install-beamngtech). There is still no retail mod that creates those eight cameras. GVD attaches them and pulls vehicle data after the wait gate. Install-root `tech.key` is status only (not the user folder, and not a hold failure).
 
-`play_gvd_tech.bat` (or `PYTHONPATH=. python python/run_vision.py --backend beamngpy --viz`) sets `GVD_BEAMNG=1` and `GVD_TECH_LAUNCH=0`, then attaches to Tech that is already up. It does not start `Bin64\BeamNG.tech.x64.exe`. After the wait gate (`--tech-hold`) it attaches the 8 RGB cameras from `cameras.yaml` (GVD frame converted to BeamNG vehicle space), **Electrics / Damage / GForces** plus pose, and a **GPS nav hint** (lat/lon). Optional destination: set `nav.pin_lat` / `nav.pin_lon` in `config/tech.yaml` (or `GVD_NAV_PIN_LAT` / `GVD_NAV_PIN_LON`) for range and bearing. Pin is **not a route** — the corridor planner ignores the pin. Optional LiDAR / radar / AdvancedIMU: opt-in in `config/sensors.yaml` (see [Extra sensors / Foxglove](#extra-sensors--foxglove)).
+`play_gvd_tech.bat` (or `PYTHONPATH=. python python/run_vision.py --backend beamngpy --viz`) sets `GVD_BEAMNG=1` and `GVD_TECH_LAUNCH=0`, then attaches to Tech that is already up via `BeamNG.tech.exe -tcom -console -gfx dx11`. It does not start a second Tech. After the wait gate (`--tech-hold`) it attaches the 8 RGB cameras from `cameras.yaml` (GVD frame converted to BeamNG vehicle space), **Electrics / Damage / GForces** plus pose, and a **GPS nav hint** (lat/lon). Optional destination: set `nav.pin_lat` / `nav.pin_lon` in `config/tech.yaml` (or `GVD_NAV_PIN_LAT` / `GVD_NAV_PIN_LON`) for range and bearing. Pin is **not a route** — the corridor planner ignores the pin. Optional LiDAR / radar / AdvancedIMU: opt-in in `config/sensors.yaml` (see [Extra sensors / Foxglove](#extra-sensors--foxglove)).
 
 Engage is still Alt+G — the 8-cam nets, corridor and tracks already ran while you were driving. Drive is BeamNGpy `vehicle.control` on the player vehicle (`actuator=beamngpy`) only after engage. Ego speed/steer/pedals come from Electrics; the world ribbon uses pose × `path_ego`. Disengaged Tech ticks do not call `vehicle.control` (one zero release on the falling edge, parkingbrake included). Engaged gate holds use neutral + brake, not reverse. Cameras attach on `open()` with `engaged=false` — vision LINK does not wait for Alt+G.
 

@@ -328,8 +328,9 @@ def main() -> None:
             print(f"[GVD] REFUSE: {hold.note}")
             print(
                 "[GVD] Tech hold failed before vision. Unique-frame Hz is not measured. "
-                "One starter: Bin64\\BeamNG.tech.x64.exe already up, mod loaded, vehicle spawned. "
-                "Attach only (GVD_TECH_LAUNCH=0). Do not kill BeamNG.tech or CrashSender."
+                "One starter: install-root BeamNG.tech.exe -tcom -console -gfx dx11 already up, "
+                "mod loaded, vehicle spawned. Attach only (GVD_TECH_LAUNCH=0). "
+                "Do not kill BeamNG.tech or CrashSender."
             )
             raise SystemExit(1)
 

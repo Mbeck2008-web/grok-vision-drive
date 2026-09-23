@@ -226,6 +226,11 @@ def main() -> None:
         help="Connect to BeamNG.tech, poll vehicle electrics/pose/damage, exit. No fake cameras.",
     )
     ap.add_argument(
+        "--tech-hold",
+        action="store_true",
+        help="Tech hold preflight only: port LISTENING, mod, vehicle, fresh lua_bus, buses_same. No cameras, no Hz.",
+    )
+    ap.add_argument(
         "--foxglove",
         action="store_true",
         help="Publish extras to a local Foxglove WebSocket (ws://127.0.0.1:8765). Planner stays vision-only.",
@@ -236,11 +241,16 @@ def main() -> None:
         os.environ["GVD_VISION_ONLY"] = "1"
 
     # Product bus matches the running backend (Python default is Drive/retail).
-    if args.tech_probe or args.backend == "beamngpy":
+    if args.tech_hold or args.tech_probe or args.backend == "beamngpy":
         os.environ["GVD_BEAMNG"] = "1"
         os.environ["GVD_BACKEND"] = "beamngpy"
     elif args.backend == "window":
         os.environ["GVD_BACKEND"] = "window"
+
+    if args.tech_hold:
+        from python.sensors.tech import run_tech_hold
+
+        raise SystemExit(run_tech_hold())
 
     if args.tech_probe:
         raise SystemExit(run_probe())
@@ -307,6 +317,21 @@ def main() -> None:
     if reason:
         print(f"[GVD] REFUSE: {reason}")
         raise SystemExit(1)
+
+    if backend_name == "beamngpy":
+        from python.sensors.tech import tech_hold_gate
+
+        # Wait gate before any camera open or unique-frame Hz.
+        hold = tech_hold_gate()
+        print(hold.line)
+        if not hold.proceed:
+            print(f"[GVD] REFUSE: {hold.note}")
+            print(
+                "[GVD] Tech hold failed before vision. Unique-frame Hz is not measured. "
+                "One starter: Bin64\\BeamNG.tech.x64.exe already up, mod loaded, vehicle spawned. "
+                "Attach only (GVD_TECH_LAUNCH=0). Do not kill BeamNG.tech or CrashSender."
+            )
+            raise SystemExit(1)
 
     backend = make_backend(backend_name if args.backend != "auto" else backend_name)
     backend.open()
@@ -799,6 +824,8 @@ def main() -> None:
                 )
                 cv2.imshow(win, frame)
                 key = cv2.waitKey(1) & 0xFF
+                # q and Esc leave the supervisor. close() disconnects only
+                # (quit_on_close=false) and does not kill BeamNG.tech.
                 if key in (ord("q"), 27):
                     break
                 if key == 255:

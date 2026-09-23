@@ -96,6 +96,7 @@ def check_tech_yaml() -> None:
     assert cfg.get("host") == "localhost"
     assert int(cfg.get("port") or 0) == 25252
     assert cfg.get("launch") is False
+    assert str(cfg.get("beamngpy_pin")) == "1.36"
     sensors = cfg.get("sensors") or {}
     assert sensors.get("electrics") is True
     assert sensors.get("damage") is True
@@ -951,6 +952,252 @@ def check_no_chrome() -> None:
             assert not chrome.search(text), rel
 
 
+def _hold_env(**extra: str | None):
+    import os
+    from contextlib import contextmanager
+
+    keys = (
+        "GVD_DOCS_DIR",
+        "GVD_PRODUCT",
+        "GVD_BEAMNG",
+        "GVD_BACKEND",
+        "GVD_TECH_LAUNCH",
+        "GVD_BEAMNGPY_PIN",
+        "LOCALAPPDATA",
+        "BNG_HOME",
+        "BEAMNG_HOME",
+        "USERPROFILE",
+        "HOME",
+    )
+
+    @contextmanager
+    def _ctx():
+        old = {k: os.environ.get(k) for k in keys}
+        try:
+            for k in keys:
+                if k in extra:
+                    val = extra[k]
+                    if val is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = val
+                elif k in ("GVD_TECH_LAUNCH", "GVD_BEAMNGPY_PIN", "GVD_DOCS_DIR", "BNG_HOME", "BEAMNG_HOME"):
+                    os.environ.pop(k, None)
+            yield
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    return _ctx()
+
+
+def _plant_link(folder, *, lua_bus: str, age_s: float = 0.0) -> None:
+    import json
+    import os
+    import time
+
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / "gvd_link.json"
+    path.write_text(json.dumps({"lua_bus": lua_bus}), encoding="utf-8")
+    if age_s:
+        old = time.time() - age_s
+        os.utime(path, (old, old))
+
+
+def check_tech_hold_gate() -> None:
+    """Offline: bus match / freshness, one starter, pin, and Esc/q disconnect."""
+    import inspect
+    import os
+    import socket
+    import tempfile
+    from pathlib import Path
+
+    from python.runtime import paths
+    from python.sensors.tech import (
+        TECH_BIN64_EXE,
+        TechSession,
+        beamngpy_pin_ok,
+        open_tech_beamngpy,
+        release_tech_beamngpy,
+        research_port_listening,
+        resolve_tech_launch,
+        tech_hold_gate,
+        tech_key_status,
+        tech_mod_present,
+    )
+
+    assert TECH_BIN64_EXE == "BeamNG.tech.x64.exe"
+    assert resolve_tech_launch({"launch": True}, port_listening=True)[0] is False
+    assert "double-start" in resolve_tech_launch({"launch": True}, port_listening=True)[1]
+    assert resolve_tech_launch({"launch": False}, port_listening=True)[0] is False
+    assert resolve_tech_launch({"launch": True}, port_listening=False)[0] is True
+    assert resolve_tech_launch({"launch": False}, port_listening=False)[0] is False
+    assert beamngpy_pin_ok("1.36.2", "1.36")
+    assert beamngpy_pin_ok("1.35.4", "1.35")
+    assert not beamngpy_pin_ok("1.35.0", "1.36")
+    assert not beamngpy_pin_ok("1.26.0", "1.36")
+    assert not beamngpy_pin_ok(None, "1.36")
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    live_port = srv.getsockname()[1]
+    try:
+        assert research_port_listening("127.0.0.1", live_port)
+    finally:
+        srv.close()
+    assert not research_port_listening("127.0.0.1", live_port)
+
+    class _Bng:
+        def __init__(self, *, boom: bool = False) -> None:
+            self.quit_on_close = True
+            self.events: list[str] = []
+            self.boom = boom
+
+        def disconnect(self) -> None:
+            self.events.append("disconnect")
+            if self.boom:
+                raise RuntimeError("socket dead")
+
+        def close(self) -> None:
+            self.events.append("close")
+
+        def quit_beamng(self) -> None:
+            self.events.append("quit")
+
+    alive = _Bng()
+    session = TechSession({"wait_vehicle_s": 0, "launch": True})
+    session.bng = alive
+    session.close()
+    assert alive.events == ["disconnect"]
+    assert alive.quit_on_close is False
+    dead = _Bng(boom=True)
+    session.bng = dead
+    session.close()
+    assert dead.events == ["disconnect"]
+    assert "close" not in dead.events and "quit" not in dead.events
+    orphan = _Bng()
+    release_tech_beamngpy(orphan)
+    assert orphan.events == ["disconnect"]
+    close_src = inspect.getsource(TechSession.close)
+    close_body = close_src.split('"""', 2)[-1]
+    assert ".close(" not in close_body
+    assert "quit_beamng" not in close_body
+    assert "taskkill" not in close_body
+    connect_src = inspect.getsource(TechSession.connect)
+    assert "resolve_tech_launch" in connect_src
+    assert "quit_on_close=False" in inspect.getsource(open_tech_beamngpy)
+
+    bat = (ROOT / "play_gvd_tech.bat").read_text(encoding="utf-8")
+    assert 'set "GVD_TECH_LAUNCH=0"' in bat
+    assert 'set "GVD_TECH_LAUNCH=1"' not in bat
+    assert 'start ""' not in bat
+    assert r"Bin64\BeamNG.tech.x64.exe" in bat
+    assert "--tech-hold" in bat
+    assert "quit BeamNG" not in bat
+    req = (ROOT / "requirements-beamng.txt").read_text(encoding="utf-8")
+    assert "beamngpy>=1.35,<1.37" in req
+    assert "beamngpy>=1.26" not in req
+    rv = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
+    assert rv.find("tech_hold_gate(") < rv.find("make_backend(")
+    assert "--tech-hold" in rv
+    assert 'ord("q"), 27' in rv
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "Soft Esc parked" in readme
+    assert "Tech hold prove" in readme
+    assert "quit_on_close" in readme
+    assert "Unique-frame Hz" in readme and "not" in readme
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        la = root / "AppData" / "Local"
+        bus = la.joinpath("BeamNG", "BeamNG.tech", "current", "Documents", "GVD")
+        moved = root / "moved" / "Documents" / "GVD"
+        moved.mkdir(parents=True)
+        mod = la.joinpath("BeamNG", "BeamNG.tech", "current", "mods", "unpacked", "gvd", "lua", "ge", "extensions", "gvd")
+        mod.mkdir(parents=True)
+        (mod / "main.lua").write_text("-- gvd\n", encoding="utf-8")
+        home = root / "tech-install"
+        (home / "Bin64").mkdir(parents=True)
+        (home / "Bin64" / TECH_BIN64_EXE).write_bytes(b"")
+        assert tech_key_status(str(home)) is False
+        (home / "Bin64" / "tech.key").write_text("key", encoding="utf-8")
+        assert tech_key_status(str(home)) is True
+        assert tech_key_status("") is None
+        cfg = {
+            "host": "127.0.0.1",
+            "port": 9,
+            "launch": False,
+            "beamngpy_pin": "1.36",
+            "home": str(home),
+        }
+        with _hold_env(
+            LOCALAPPDATA=str(la),
+            USERPROFILE=str(root / "Users" / "Name"),
+            HOME=str(root),
+            GVD_PRODUCT="tech",
+            GVD_BEAMNG="1",
+            GVD_DOCS_DIR=str(bus),
+            BNG_HOME=str(home),
+        ):
+            assert tech_mod_present()
+            base = dict(port_up=True, vehicle_spawned=True, mod_present=True, beamngpy_version="1.36.1")
+            gate = tech_hold_gate(cfg, **base)
+            assert gate.link == "MISMATCH" and not gate.ok, gate.note
+            assert not gate.lua_fresh and not gate.buses_same
+
+            _plant_link(bus, lua_bus=str(moved), age_s=2.5)
+            stale = tech_hold_gate(cfg, **base)
+            assert not stale.lua_fresh and not stale.buses_same and stale.link == "MISMATCH"
+            assert stale.lua_age_s is not None and stale.lua_age_s >= 1.0
+            assert not stale.ok and not stale.proceed
+
+            _plant_link(bus, lua_bus="Documents/GVD", age_s=0.0)
+            bad = tech_hold_gate(cfg, **base)
+            assert not bad.lua_fresh and bad.link == "MISMATCH"
+
+            _plant_link(bus, lua_bus=str(moved), age_s=0.0)
+            ok = tech_hold_gate(cfg, **base)
+            assert ok.lua_fresh and ok.buses_same and ok.link == "ok", ok.note
+            assert ok.ok and ok.proceed, ok.note
+            assert paths.buses_same_folder(ok.python_bus, ok.lua_bus)
+            assert ok.lua_age_s is not None and ok.lua_age_s < 1.0
+            assert ok.will_launch is False
+            assert ok.tech_key is True
+
+            down = tech_hold_gate(cfg, port_up=False, vehicle_spawned=True, mod_present=True, beamngpy_version="1.36.1")
+            assert not down.port_listening and not down.ok and down.will_launch is False
+            # port down must not probe a vehicle, and must still build the gate.
+            skipped = tech_hold_gate(cfg, port_up=False, beamngpy_version="1.36.1")
+            assert skipped.vehicle_spawned is False and not skipped.ok
+
+            launch_cfg = dict(cfg, launch=True)
+            attached = tech_hold_gate(launch_cfg, **base)
+            assert attached.will_launch is False and attached.proceed
+            solo = tech_hold_gate(
+                launch_cfg, port_up=False, vehicle_spawned=False, mod_present=True, beamngpy_version="1.36.1"
+            )
+            assert solo.will_launch is True and not solo.ok
+
+            mismatch_pin = tech_hold_gate(cfg, port_up=True, vehicle_spawned=True, mod_present=True, beamngpy_version="1.35.2")
+            assert mismatch_pin.ok and not mismatch_pin.pin_ok and not mismatch_pin.proceed
+
+            no_mod = tech_hold_gate(cfg, port_up=True, vehicle_spawned=True, mod_present=False, beamngpy_version="1.36")
+            assert not no_mod.mod_present and not no_mod.ok
+            no_veh = tech_hold_gate(cfg, port_up=True, vehicle_spawned=False, mod_present=True, beamngpy_version="1.36")
+            assert not no_veh.vehicle_spawned and not no_veh.ok
+
+    # connect refuses a dead port instead of launching (launch stays false).
+    with _hold_env():
+        quiet = TechSession({"wait_vehicle_s": 0, "host": "127.0.0.1", "port": 1, "launch": False})
+        assert quiet.connect(explicit=True) is False
+        assert quiet.vehicle is None
+        assert "not LISTENING" in quiet.note
+
+
 def main() -> None:
     check_frame_convert()
     check_path_world()
@@ -969,6 +1216,7 @@ def main() -> None:
     check_nvidia_smi_cache_and_honest_hz()
     check_auto_backend_not_tech_without_env()
     check_connect_without_beamngpy()
+    check_tech_hold_gate()
     check_no_chrome()
     print("test_tech_session: OK")
 

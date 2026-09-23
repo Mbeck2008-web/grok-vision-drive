@@ -1,7 +1,8 @@
 # Windows Tech extras (optional). Keep requirements-retail.txt free of beamngpy.
-# Pin BeamNGpy to your Tech build: 0.38 → beamngpy 1.35.x, 0.39 → 1.36.
+# Pin BeamNGpy to the Tech build in use. config/tech.yaml beamngpy_pin must match.
+# Tech 0.38 → beamngpy 1.35.x, Tech 0.39 → beamngpy 1.36.x.
 -r requirements.txt
-beamngpy>=1.26
+beamngpy>=1.35,<1.37
 bettercam>=1.0.0; platform_system=="Windows"
 mss>=9.0.0
 pywin32>=306; platform_system=="Windows"  # BeamNG window title match

@@ -281,6 +281,9 @@ def apply_env_overrides(cfg: dict[str, Any]) -> dict[str, Any]:
         out["launch"] = True
     elif launch in ("0", "false", "no"):
         out["launch"] = False
+    py_pin = os.environ.get("GVD_BEAMNGPY_PIN", "").strip()
+    if py_pin:
+        out["beamngpy_pin"] = py_pin
     vid = os.environ.get("GVD_TECH_VEHICLE")
     if vid:
         out["vehicle"] = vid
@@ -311,8 +314,389 @@ def apply_env_overrides(cfg: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+# Research socket. Bin64 game binary (not BeamNG.tech.exe inside Bin64).
+TECH_RESEARCH_PORT = 25252
+TECH_BIN64_EXE = "BeamNG.tech.x64.exe"
+TECH_BIN64_REL = ("Bin64", TECH_BIN64_EXE)
+# BeamNGpy minor line for the Tech build in use. 0.38 → 1.35, 0.39 → 1.36.
+BEAMNGPY_FOR_TECH = {"1.35": "0.38", "1.36": "0.39"}
+
+
 def wants_tech_attach() -> bool:
     return os.environ.get("GVD_BEAMNG", "").strip().lower() in ("1", "true", "yes")
+
+
+def research_port_listening(host: str, port: int, *, timeout_s: float = 0.4) -> bool:
+    """True when a TCP listener accepts on the Tech research port."""
+    import socket
+
+    try:
+        with socket.create_connection((str(host), int(port)), timeout=timeout_s):
+            return True
+    except OSError:
+        return False
+
+
+def resolve_tech_launch(cfg: dict[str, Any], *, port_listening: bool) -> tuple[bool, str]:
+    """One starter. Port already up → attach, even if launch was requested.
+
+    ``True`` only when launch was asked and nothing is listening yet (BeamNGpy
+    is the only starter). Never launch a second Tech onto a live port.
+    """
+    requested = bool(cfg.get("launch"))
+    if port_listening:
+        if requested:
+            return (
+                False,
+                "research port already LISTENING; attach only "
+                "(GVD_TECH_LAUNCH=1 would double-start BeamNG.tech)",
+            )
+        return False, "attach"
+    if requested:
+        return (
+            True,
+            "single launch path: port is down and GVD_TECH_LAUNCH=1. "
+            "The bat must not also start BeamNG.tech.",
+        )
+    return False, "attach; research port is not LISTENING"
+
+
+def hold_tech_process(bng: Any) -> None:
+    """Esc/q must not quit Tech. BeamNGpy.close() sends quit_beamng when this is true."""
+    if bng is None:
+        return
+    try:
+        bng.quit_on_close = False
+    except Exception:
+        pass
+
+
+def release_tech_beamngpy(bng: Any) -> None:
+    """Disconnect the research socket. Do not close, quit, or kill BeamNG.tech / CrashSender."""
+    if bng is None:
+        return
+    hold_tech_process(bng)
+    disc = getattr(bng, "disconnect", None)
+    if not callable(disc):
+        return
+    try:
+        disc()
+    except Exception:
+        pass
+
+
+def open_tech_beamngpy(
+    host: str,
+    port: int,
+    *,
+    home: str | None,
+    user: str | None,
+    launch: bool,
+) -> Any:
+    """Connect with quit_on_close=False so a later close cannot kill Tech."""
+    from beamngpy import BeamNGpy  # type: ignore
+
+    kwargs: dict[str, Any] = {}
+    if home:
+        kwargs["home"] = home
+    if user:
+        kwargs["user"] = user
+    try:
+        bng = BeamNGpy(host, int(port), quit_on_close=False, **kwargs)
+    except TypeError:
+        bng = BeamNGpy(host, int(port), **kwargs) if kwargs else BeamNGpy(host, int(port))
+    hold_tech_process(bng)
+    bng.open(launch=bool(launch))
+    hold_tech_process(bng)
+    return bng
+
+
+def beamngpy_minor(version: str | None) -> str | None:
+    if version is None:
+        return None
+    parts = str(version).strip().split(".")
+    if len(parts) < 2:
+        return None
+    try:
+        return f"{int(parts[0])}.{int(parts[1])}"
+    except ValueError:
+        return None
+
+
+def beamngpy_pin_ok(installed: str | None, pin: str | None) -> bool:
+    """True when the installed BeamNGpy minor matches the Tech-build pin."""
+    want = beamngpy_minor(pin)
+    got = beamngpy_minor(installed)
+    if not want or not got:
+        return False
+    return want == got
+
+
+def installed_beamngpy_version() -> str | None:
+    try:
+        from importlib.metadata import version
+
+        return version("beamngpy")
+    except Exception:
+        pass
+    try:
+        import beamngpy  # type: ignore
+
+        raw = getattr(beamngpy, "__version__", None)
+        return str(raw) if raw else None
+    except Exception:
+        return None
+
+
+def tech_bin64_exe(home: Path | str | None) -> Path | None:
+    if home is None or not str(home).strip():
+        return None
+    return Path(home).joinpath(*TECH_BIN64_REL)
+
+
+def tech_key_status(home: str | None) -> bool | None:
+    """True/False when an exe is visible, else None if home or the exe is unknown.
+
+    ``tech.key`` counts beside ``Bin64\\BeamNG.tech.x64.exe`` or in the install dir
+    next to ``BeamNG.tech.exe``.
+    """
+    if home is None or not str(home).strip():
+        return None
+    root = Path(home)
+    bin_exe = root.joinpath(*TECH_BIN64_REL)
+    root_exe = root / "BeamNG.tech.exe"
+    key_bin = bin_exe.parent / "tech.key"
+    key_root = root / "tech.key"
+    if bin_exe.is_file() or root_exe.is_file():
+        return key_bin.is_file() or key_root.is_file()
+    if key_bin.is_file() or key_root.is_file():
+        return True
+    return None
+
+
+def tech_mod_roots() -> list[Path]:
+    """Unpacked GVD mod: legacy ``BeamNG.tech\\current`` first, then nested."""
+    from python.runtime.paths import local_appdata_dir
+
+    la = local_appdata_dir()
+    if la is None:
+        return []
+    return [
+        la / "BeamNG.tech" / "current" / "mods" / "unpacked" / "gvd",
+        la / "BeamNG" / "BeamNG.tech" / "current" / "mods" / "unpacked" / "gvd",
+    ]
+
+
+def tech_mod_present() -> bool:
+    marker = Path("lua") / "ge" / "extensions" / "gvd" / "main.lua"
+    for root in tech_mod_roots():
+        try:
+            if (root / marker).is_file():
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def probe_spawned_vehicle(host: str, port: int) -> bool | None:
+    """Attach-only vehicle poll. None when beamngpy is missing. Never launches or kills."""
+    try:
+        from beamngpy import BeamNGpy  # type: ignore  # noqa: F401
+    except Exception:
+        return None
+    bng = None
+    try:
+        bng = open_tech_beamngpy(host, port, home=None, user=None, launch=False)
+        vehicles = None
+        getter = getattr(bng, "get_current_vehicles", None)
+        if callable(getter):
+            vehicles = getter()
+        else:
+            api = getattr(bng, "vehicles", None)
+            info = getattr(api, "get_current", None) if api is not None else None
+            if callable(info):
+                vehicles = info()
+        if isinstance(vehicles, dict):
+            return len(vehicles) > 0
+        return bool(vehicles)
+    except Exception:
+        return False
+    finally:
+        release_tech_beamngpy(bng)
+
+
+@dataclass(frozen=True)
+class TechHoldGate:
+    """Wait gate before vision / unique-frame Hz. Launch policy is separate."""
+
+    port_listening: bool
+    mod_present: bool
+    vehicle_spawned: bool
+    lua_fresh: bool
+    buses_same: bool
+    link: str
+    pin_ok: bool
+    note: str
+    python_bus: str
+    lua_bus: str
+    lua_age_s: float | None
+    beamngpy_pin: str
+    beamngpy_version: str
+    tech_key: bool | None
+    will_launch: bool
+    host: str
+    port: int
+
+    @property
+    def ok(self) -> bool:
+        """Port LISTENING + mod + vehicle + fresh lua_bus + buses_same. Not the pin."""
+        return bool(
+            self.port_listening
+            and self.mod_present
+            and self.vehicle_spawned
+            and self.lua_fresh
+            and self.buses_same
+            and self.link == "ok"
+        )
+
+    @property
+    def proceed(self) -> bool:
+        """Wait gate plus the BeamNGpy pin for the Tech build in use."""
+        return self.ok and self.pin_ok
+
+    @property
+    def line(self) -> str:
+        age = "--" if self.lua_age_s is None else f"{self.lua_age_s:.3f}s"
+        return (
+            f"[GVD] tech-hold port={'LISTENING' if self.port_listening else 'down'} "
+            f"mod={'yes' if self.mod_present else 'no'} "
+            f"vehicle={'yes' if self.vehicle_spawned else 'no'} "
+            f"lua_bus={'fresh' if self.lua_fresh else 'stale'} age={age} "
+            f"buses_same={'yes' if self.buses_same else 'no'} link={self.link} "
+            f"pin={self.beamngpy_pin or '--'} beamngpy={self.beamngpy_version or 'missing'} "
+            f"launch={'yes' if self.will_launch else 'attach'}"
+        )
+
+
+def tech_hold_gate(
+    config: dict[str, Any] | None = None,
+    *,
+    port_up: bool | None = None,
+    vehicle_spawned: bool | None = None,
+    mod_present: bool | None = None,
+    beamngpy_version: str | None = None,
+) -> TechHoldGate:
+    """Preflight before cameras / unique-frame Hz.
+
+    Wait gate (unchanged): research port LISTENING, unpacked GVD mod, a spawned
+    vehicle, fresh lua_bus (age < 1s), and buses_same(python_bus, lua_bus).
+    """
+    from python.runtime.paths import bus_identity, buses_same_folder, read_live_lua_bus, youngest_lua_handshake
+
+    cfg = apply_env_overrides(config if config is not None else load_tech_config())
+    host = str(cfg.get("host") or "localhost")
+    port = int(cfg.get("port") or TECH_RESEARCH_PORT)
+    listening = research_port_listening(host, port) if port_up is None else bool(port_up)
+    will_launch, _launch_note = resolve_tech_launch(cfg, port_listening=listening)
+
+    if mod_present is None:
+        mod_ok = tech_mod_present()
+    else:
+        mod_ok = bool(mod_present)
+
+    vehicle_note = ""
+    if vehicle_spawned is None:
+        if not listening:
+            veh_ok = False
+        else:
+            probed = probe_spawned_vehicle(host, port)
+            if probed is None:
+                veh_ok = False
+                vehicle_note = "beamngpy not available"
+            else:
+                veh_ok = bool(probed)
+    else:
+        veh_ok = bool(vehicle_spawned)
+
+    ident = bus_identity()
+    live, live_note = read_live_lua_bus()
+    _raw, age = youngest_lua_handshake()
+    fresh = live is not None and live_note == "ok"
+    same = bool(
+        buses_same_folder(ident.python_bus, ident.lua_bus)
+        and live is not None
+        and buses_same_folder(ident.python_bus, live)
+    )
+    link = "ok" if fresh and same else "MISMATCH"
+    pin = str(cfg.get("beamngpy_pin") or "").strip()
+    installed = beamngpy_version if beamngpy_version is not None else installed_beamngpy_version()
+    pin_ok = beamngpy_pin_ok(installed, pin)
+    home = str(cfg.get("home") or "").strip() or None
+    key = tech_key_status(home)
+
+    reasons: list[str] = []
+    if not listening:
+        reasons.append(f"research port {host}:{port} not LISTENING")
+    if not mod_ok:
+        reasons.append(r"GVD mod missing under Tech current\mods\unpacked\gvd")
+    if not veh_ok:
+        reasons.append(vehicle_note or "no vehicle spawned")
+    if not fresh:
+        reasons.append(live_note or "lua_bus missing or stale")
+    elif not same:
+        reasons.append("python_bus and lua_bus differ")
+    if not pin_ok:
+        got = installed or "missing"
+        tech = BEAMNGPY_FOR_TECH.get(beamngpy_minor(pin) or "", "")
+        extra = f" (Tech {tech})" if tech else ""
+        reasons.append(f"beamngpy {got} != pin {pin or '--'}{extra}")
+    note = "ok" if not reasons else "; ".join(reasons)
+    return TechHoldGate(
+        port_listening=listening,
+        mod_present=mod_ok,
+        vehicle_spawned=veh_ok,
+        lua_fresh=fresh,
+        buses_same=same,
+        link=link,
+        pin_ok=pin_ok,
+        note=note,
+        python_bus=ident.python_bus_s,
+        lua_bus=ident.lua_bus_s if fresh else "",
+        lua_age_s=age,
+        beamngpy_pin=pin,
+        beamngpy_version=str(installed or ""),
+        tech_key=key,
+        will_launch=will_launch,
+        host=host,
+        port=port,
+    )
+
+
+def run_tech_hold(config: dict[str, Any] | None = None) -> int:
+    """Print the wait gate and return 0 only when vision/Hz is allowed to start."""
+    gate = tech_hold_gate(config)
+    print(gate.line, flush=True)
+    exe = tech_bin64_exe(str(apply_env_overrides(config if config is not None else load_tech_config()).get("home") or ""))
+    if exe is not None:
+        print(f"[GVD] Bin64 exe: {exe}", flush=True)
+    else:
+        print(f"[GVD] Bin64 exe name: {TECH_BIN64_EXE}", flush=True)
+    if gate.tech_key is True:
+        print("[GVD] tech.key beside exe.", flush=True)
+    elif gate.tech_key is False:
+        print("[GVD] tech.key is not beside the Tech exe.", flush=True)
+    else:
+        print("[GVD] tech.key not confirmed (set BNG_HOME to the Tech install dir).", flush=True)
+    if gate.proceed:
+        print("[GVD] tech-hold OK. Unique-frame Hz is not measured here.", flush=True)
+        return 0
+    print(f"[GVD] REFUSE: {gate.note}", flush=True)
+    print(
+        "[GVD] Supervisor stays down. Do not kill BeamNG.tech or CrashSender. "
+        "One starter: Bin64\\BeamNG.tech.x64.exe already running, mod loaded, vehicle spawned, then attach.",
+        flush=True,
+    )
+    return 1
 
 
 @dataclass
@@ -379,30 +763,34 @@ class TechSession:
         self.note = ""
 
     def connect(self, *, explicit: bool = True) -> bool:
-        """Open BeamNGpy. explicit=True when the user asked for --backend beamngpy."""
+        """Open BeamNGpy. explicit=True when the user asked for --backend beamngpy.
+
+        Prefer attach. If the research port is already LISTENING, launch is forced
+        off so a second Tech is not started. The socket is opened with
+        quit_on_close=False; Esc/q disconnects and does not kill the process.
+        """
         if not explicit and not wants_tech_attach():
             self.note = "set GVD_BEAMNG=1 or --backend beamngpy to attach"
             return False
-        try:
-            from beamngpy import BeamNGpy  # type: ignore
-        except Exception as e:
-            self.note = f"beamngpy not available ({e})"
-            self._log(f"[GVD] {self.note}; vehicle data missing.")
-            return False
 
         host = str(self.config.get("host") or "localhost")
-        port = int(self.config.get("port") or 25252)
+        port = int(self.config.get("port") or TECH_RESEARCH_PORT)
         home = str(self.config.get("home") or "").strip() or None
         user = str(self.config.get("user") or "").strip() or None
-        launch = bool(self.config.get("launch"))
-        kwargs: dict[str, Any] = {}
-        if home:
-            kwargs["home"] = home
-        if user:
-            kwargs["user"] = user
+        listening = research_port_listening(host, port)
+        launch, launch_note = resolve_tech_launch(self.config, port_listening=listening)
+        if launch_note not in ("attach",):
+            self._log(f"[GVD] {launch_note}")
+        if not listening and not launch:
+            self.note = f"research port {host}:{port} not LISTENING"
+            self._log(
+                f"[GVD] {self.note}. Start BeamNG.tech once "
+                f"(Bin64\\{TECH_BIN64_EXE}) with tech.key beside the exe, then attach. "
+                "This path does not start a second Tech."
+            )
+            return False
         try:
-            bng = BeamNGpy(host, port, **kwargs) if kwargs else BeamNGpy(host, port)
-            bng.open(launch=launch)
+            bng = open_tech_beamngpy(host, port, home=home, user=user, launch=launch)
             self.bng = bng
         except Exception as e:
             self.note = f"beamngpy connect failed ({e})"
@@ -417,6 +805,8 @@ class TechSession:
         if vehicle is None:
             self.note = "no vehicle to attach (spawn one in Tech, then retry)"
             self._log(f"[GVD] beamngpy: {self.note}.")
+            release_tech_beamngpy(self.bng)
+            self.bng = None
             return False
         self.vehicle = vehicle
         self.note = f"connected vid={self._vid(vehicle)}"
@@ -1005,18 +1395,18 @@ class TechSession:
         setattr(self, attr, None)
 
     def close(self) -> None:
+        """Esc/q / supervisor exit. Disconnect only — never BeamNGpy.close().
+
+        BeamNGpy.close() sends quit_beamng even when this instance did not launch
+        Tech (quit_on_close defaults true, process is None) and may kill the
+        process tree, which is how CrashSender shows up after a Soft Esc.
+        """
         for attr in ("_gps", "_lidar", "_radar", "_imu"):
             self._drop_handle(attr)
         self.vehicle = None
-        if self.bng is not None:
-            try:
-                self.bng.disconnect()
-            except Exception:
-                try:
-                    self.bng.close()
-                except Exception:
-                    pass
+        bng = self.bng
         self.bng = None
+        release_tech_beamngpy(bng)
 
     def _vid(self, vehicle: Any) -> str | None:
         if vehicle is None:

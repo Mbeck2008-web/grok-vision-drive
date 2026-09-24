@@ -63,7 +63,7 @@ Lua: `gvd_main.drawPath` on `onPreRender` / `onDebugDraw`. Runs whenever the sup
 | `vehicle.damage` | float? | Ground-truth Damage sensor; null when missing |
 | `vehicle.gear` / `rpm` | | Electrics extras |
 | `vehicle.pose_ok` | bool | `pos` + `dir` present for `path_world` |
-| `vehicle.sensors` | dict | `electrics`/`damage`/`gforces`/`gps` plus optional `lidar`/`radar`/`advanced_imu` → `ok`/`missing`. `gps` may be `stale`: the last PollGPSGE sample reused off the camera grab cadence (lat/lon stay; `nav.gps.ok` still means a fix is present; the nav note says it is not a new fix) |
+| `vehicle.sensors` | dict | `electrics`/`damage`/`gforces`/`gps` plus optional `lidar`/`radar`/`advanced_imu` → `ok`/`missing` |
 | `sensors` | dict | Extra bus health: `imu` / `gps` / `lidar` / `radar` sources, `foxglove`, `drive_uses=vision`, `lidar_lua` bool. Never fed to the planner |
 | `nav.mode` | string | `missing` (no GPS fix) / `hint` (Tech GPS or retail pose-derived lat/lon). Never `route` until a planner exists |
 | `nav.drive_to_pin` | bool | Always `false` today — pin is a hint, not a route |

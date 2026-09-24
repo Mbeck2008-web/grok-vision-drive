@@ -277,7 +277,66 @@ def main() -> None:
     again = json.loads(cmd_path().read_text(encoding="utf-8"))
     assert again["brake"] == 0.0 and again["throttle"] == 0.0 and again["engaged"] is False
 
-    for kw in veh.calls + moving.calls + ng.calls:
+    # Falling-edge release with the shifter never armed must not call realistic_automatic.
+    bare = FakeVeh()
+    tech_bare = BeamNGPyActuator(bare)
+    tech_bare._latched = True
+    tech_bare._shift_set = False
+    tech_bare.note_engaged(False)
+    bare_edge = tech_bare.stop(seq=40, reason="not_engaged")
+    assert bare_edge.throttle == 0.0 and bare_edge.brake == 0.0
+    assert bare.calls[-1] == {"steering": 0.0, "throttle": 0.0, "brake": 0.0, "parkingbrake": 0.0}
+    assert TECH_SHIFT_MODE not in bare.shifts, bare.shifts
+    assert bare.shifts == [TECH_PLAYER_SHIFT_MODE]
+    assert bare.ai_modes == ["disabled"]
+    assert tech_bare._latched is False and tech_bare._shift_set is False
+    n_bare = len(bare.calls)
+    tech_bare.stop(seq=41, reason="not_engaged")
+    assert len(bare.calls) == n_bare
+
+    # Arcade restore throw keeps the latch so the next disengaged tick retries.
+    class ArcadeFailVeh(FakeVeh):
+        def __init__(self) -> None:
+            super().__init__()
+            self.arcade_ok = False
+
+        def set_shift_mode(self, mode: str) -> None:
+            self.shifts.append(mode)
+            if mode == TECH_PLAYER_SHIFT_MODE and not self.arcade_ok:
+                raise RuntimeError("arcade handoff failed")
+
+    fail = ArcadeFailVeh()
+    tech_fail = BeamNGPyActuator(fail)
+    tech_fail.note_engaged(True)
+    tech_fail.apply(DriveCommand(steer=0.0, throttle=0.3, brake=0.0, seq=42, reason="ok"))
+    assert fail.shifts == [TECH_SHIFT_MODE] and tech_fail._latched is True
+    tech_fail.note_engaged(False)
+    missed = tech_fail.stop(seq=43, reason="not_engaged")
+    assert missed.throttle == 0.0 and missed.brake == 0.0
+    assert fail.calls[-1]["brake"] == 0.0 and fail.calls[-1]["throttle"] == 0.0
+    assert fail.shifts == [TECH_SHIFT_MODE, TECH_PLAYER_SHIFT_MODE]
+    assert tech_fail._latched is True and tech_fail._shift_set is True
+    n_fail = len(fail.calls)
+    n_realistic = fail.shifts.count(TECH_SHIFT_MODE)
+    tech_fail.stop(seq=44, reason="not_engaged")
+    assert tech_fail._latched is True
+    assert len(fail.calls) == n_fail + 1
+    assert fail.calls[-1]["brake"] == 0.0 and fail.calls[-1]["parkingbrake"] == 0.0
+    assert fail.shifts.count(TECH_SHIFT_MODE) == n_realistic
+    assert fail.shifts[-1] == TECH_PLAYER_SHIFT_MODE
+    fail.arcade_ok = True
+    n_retry = len(fail.calls)
+    landed = tech_fail.stop(seq=45, reason="not_engaged")
+    assert landed.brake == 0.0 and landed.throttle == 0.0
+    assert tech_fail._latched is False and tech_fail._shift_set is False
+    assert fail.shifts[-1] == TECH_PLAYER_SHIFT_MODE
+    assert len(fail.calls) == n_retry + 1
+    tech_fail.stop(seq=46, reason="not_engaged")
+    assert len(fail.calls) == n_retry + 1
+    fail_payload = json.loads(cmd_path().read_text(encoding="utf-8"))
+    assert fail_payload["engaged"] is False and fail_payload["brake"] == 0.0 and fail_payload["throttle"] == 0.0
+
+    for kw in veh.calls + moving.calls + ng.calls + bare.calls + fail.calls:
         _assert_no_reverse(kw)
 
     print("test_m3_actuate: OK")

@@ -510,10 +510,12 @@ class BeamNGPyActuator:
     """Tech drive: vehicle.control only while engaged.
 
     Disengaged ticks must not slam brake=1 (that is takeover). On the falling
-    edge, once, we zero throttle/brake/parkingbrake, set AI mode to disabled,
-    restore arcade shift, and rewrite gvd_cmd.json to brake=0 / engaged=false
-    so a stale brake:1 file cannot keep the pedals. Later disengaged ticks
-    refresh that file and do not call vehicle.control. Engaged gate holds
+    edge we zero throttle/brake/parkingbrake, set AI mode to disabled, restore
+    arcade shift, and rewrite gvd_cmd.json to brake=0 / engaged=false so a
+    stale brake:1 file cannot keep the pedals. Release does not arm
+    realistic_automatic when the shifter was never set. A failed arcade
+    restore leaves the latch set so the next disengaged tick retries. After
+    arcade succeeds, later ticks only refresh the cmd file. Engaged gate holds
     (preview_blocked, AEB, veto) still apply the stop command, remapped off
     reverse: realistic_automatic, hold gear=0 + brake ±parkingbrake, drive
     gear>=1, never gear=-1.
@@ -565,16 +567,22 @@ class BeamNGPyActuator:
             except Exception:
                 pass
 
-    def _restore_player_shift(self) -> None:
-        """Arcade is what player arrows drive. Next Engage re-arms realistic_automatic."""
+    def _restore_player_shift(self) -> bool:
+        """Arcade is what player arrows drive. True only after that restore lands.
+
+        A throw leaves ``_shift_set`` unchanged and returns False so ``stop``
+        keeps ``_latched`` and the next disengaged tick retries.
+        """
         veh = self.vehicle
-        self._shift_set = False
         if veh is None or not hasattr(veh, "set_shift_mode"):
-            return
+            self._shift_set = False
+            return True
         try:
             veh.set_shift_mode(TECH_PLAYER_SHIFT_MODE)
         except Exception:
-            pass
+            return False
+        self._shift_set = False
+        return True
 
     def _invoke_control(self, kwargs: dict[str, Any]) -> None:
         """Send control kwargs. Never fall back to arcade brake-hold (no gear, brake=1)."""
@@ -601,7 +609,13 @@ class BeamNGPyActuator:
         if self.vehicle is None:
             return "no_vehicle"
         try:
-            if not self._shift_set and hasattr(self.vehicle, "set_shift_mode"):
+            # Engage arms realistic_automatic once. A release with the shifter
+            # still unset must only clear pedals, not arm that mode on the way out.
+            if (
+                not release
+                and not self._shift_set
+                and hasattr(self.vehicle, "set_shift_mode")
+            ):
                 try:
                     self.vehicle.set_shift_mode(TECH_SHIFT_MODE)
                     self._shift_set = True
@@ -647,8 +661,8 @@ class BeamNGPyActuator:
                 err = self._control(0.0, 0.0, 0.0, release=True)
                 if err is None or err == "no_vehicle":
                     self._release_ai()
-                    self._restore_player_shift()
-                    self._latched = False
+                    if self._restore_player_shift():
+                        self._latched = False
             cmd.applied = False
             return cmd
         return self.apply(stop_command(seq=seq, reason=reason))

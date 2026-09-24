@@ -8,7 +8,7 @@
 # GVD_BEAMNG_USER, GVD_TECH_LAUNCH=0 (attach) or 1 (single BeamNGpy launch only when
 # the bat did not start Tech), GVD_TECH_VEHICLE=<vid>, GVD_GPS=0/1,
 # GVD_NAV_PIN_LAT, GVD_NAV_PIN_LON, GVD_NAV_PIN_NAME, GVD_LIDAR=1, GVD_RADAR=1,
-# GVD_BEAMNGPY_PIN=1.35|1.36.
+# GVD_BEAMNGPY_PIN=1.35|1.36, GVD_TECH_SOCKET_TIMEOUT (Hello seconds; env wins over socket_timeout).
 #
 # Match BeamNGpy to the Tech build in use (0.38 → 1.35.x, 0.39 → 1.36). Live attach UNPROVEN here.
 

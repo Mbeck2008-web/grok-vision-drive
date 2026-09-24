@@ -323,7 +323,7 @@ def main() -> None:
 
         # Wait gate before any camera open or unique-frame Hz.
         # tech_hold_gate logs phase=attach / phase=Hello / phase=wait-gate.
-        hold = tech_hold_gate()
+        hold = tech_hold_gate(retain=True)
         if not hold.proceed:
             print(f"[GVD] REFUSE: {hold.note}")
             print(
@@ -337,6 +337,9 @@ def main() -> None:
 
     backend = make_backend(backend_name if args.backend != "auto" else backend_name)
     backend.open()
+    from python.sensors.tech import exit_if_tech_connect_failed
+
+    exit_if_tech_connect_failed(backend, backend_name)
     perc = ModularPerception(allow_synthetic=args.allow_synthetic_detect)
     e2e_policy = make_e2e()
     ui = VizUI()

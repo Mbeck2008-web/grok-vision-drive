@@ -9,9 +9,11 @@ vehicle space is +X left, +Y backward, +Z up. Convert at attach.
 
 from __future__ import annotations
 
+import ctypes
 import inspect
 import math
 import os
+import socket
 import threading
 import time
 from dataclasses import dataclass, field
@@ -394,6 +396,168 @@ def release_tech_beamngpy(bng: Any) -> None:
         pass
 
 
+class HelloAbandoned(Exception):
+    """Stops a BeamNGpy ``open()`` reconnect loop after the Hello deadline.
+
+    This is not an ``OSError``. ``_recv_exactly`` handles ``socket.error`` by
+    calling ``reconnect()``; a raise from that call leaves ``open()``.
+    """
+
+
+_held_bng: Any = None
+_held_lock = threading.Lock()
+_HELLO_JOIN_GRACE_S = 0.05
+
+
+def park_tech_beamngpy(bng: Any) -> None:
+    """Keep one live BeamNGpy for the supervisor to reuse after the hold."""
+    global _held_bng
+    if bng is None:
+        return
+    with _held_lock:
+        prev = _held_bng
+        _held_bng = bng
+    if prev is not None and prev is not bng:
+        release_tech_beamngpy(prev)
+
+
+def take_tech_beamngpy(port: int | None = None) -> Any:
+    """Remove and return the parked session when its research port matches."""
+    global _held_bng
+    with _held_lock:
+        bng = _held_bng
+        _held_bng = None
+    if bng is None:
+        return None
+    if port is not None:
+        bport = getattr(bng, "port", None)
+        try:
+            mismatch = bport is not None and int(bport) != int(port)
+        except (TypeError, ValueError):
+            mismatch = True
+        if mismatch:
+            release_tech_beamngpy(bng)
+            return None
+    return bng
+
+
+def drop_tech_beamngpy() -> None:
+    """Disconnect a parked session. Idempotent."""
+    release_tech_beamngpy(take_tech_beamngpy())
+
+
+def _close_raw_socket(sock: Any) -> None:
+    if not isinstance(sock, socket.socket):
+        return
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except Exception:
+        pass
+    try:
+        sock.close()
+    except Exception:
+        pass
+
+
+def _patch_reconnect(obj: Any) -> None:
+    if obj is None or isinstance(obj, socket.socket):
+        return
+    if not callable(getattr(obj, "reconnect", None)):
+        return
+
+    def _stop(*_a: Any, **_k: Any) -> None:
+        raise HelloAbandoned("Hello abandoned after socket_timeout")
+
+    try:
+        obj.reconnect = _stop
+    except Exception:
+        pass
+
+
+def _hello_objects(bng: Any) -> list[Any]:
+    objs: list[Any] = []
+    seen: set[int] = set()
+
+    def add(obj: Any) -> None:
+        if obj is None or id(obj) in seen:
+            return
+        seen.add(id(obj))
+        objs.append(obj)
+
+    add(bng)
+    conn = getattr(bng, "connection", None)
+    add(conn)
+    add(getattr(bng, "skt", None))
+    add(getattr(bng, "_hello_sock", None))
+    if conn is not None:
+        add(getattr(conn, "skt", None))
+    return objs
+
+
+def _hello_sockets(bng: Any) -> list[socket.socket]:
+    found: list[socket.socket] = []
+    seen: set[int] = set()
+
+    def add(obj: Any) -> None:
+        if isinstance(obj, socket.socket) and id(obj) not in seen:
+            seen.add(id(obj))
+            found.append(obj)
+
+    for obj in _hello_objects(bng):
+        add(obj)
+        for attr in ("skt", "socket", "sock", "_socket", "_sock"):
+            try:
+                add(getattr(obj, attr, None))
+            except Exception:
+                pass
+        try:
+            for val in vars(obj).values():
+                add(val)
+        except Exception:
+            pass
+    return found
+
+
+def _async_raise(worker: threading.Thread, exc_type: type[BaseException]) -> None:
+    ident = worker.ident
+    if not ident:
+        return
+    for tid_type in (ctypes.c_ulong, ctypes.c_long):
+        try:
+            res = ctypes.pythonapi.PyThreadState_SetAsyncExc(tid_type(ident), ctypes.py_object(exc_type))
+        except Exception:
+            return
+        if res == 0:
+            continue
+        if res > 1:
+            try:
+                ctypes.pythonapi.PyThreadState_SetAsyncExc(tid_type(ident), None)
+            except Exception:
+                pass
+        return
+
+
+def _abandon_hello(bng: Any, worker: threading.Thread) -> None:
+    """Stop a daemon still inside ``bng.open()`` so it cannot reconnect forever.
+
+    BeamNGpy 1.35.1/1.36 treat a closed socket as ``socket.error`` and call
+    ``reconnect()``. 1.35.1 then sets the new socket to blocking. Patch
+    ``reconnect`` before closing so that follow-up raises out of ``open()``.
+    """
+    try:
+        setattr(bng, "_gvd_abandon", True)
+    except Exception:
+        pass
+    for obj in _hello_objects(bng):
+        _patch_reconnect(obj)
+    for sock in _hello_sockets(bng):
+        _close_raw_socket(sock)
+    worker.join(_HELLO_JOIN_GRACE_S)
+    if worker.is_alive():
+        _async_raise(worker, HelloAbandoned)
+        worker.join(_HELLO_JOIN_GRACE_S)
+
+
 def human_one_starter(home: str | None) -> str:
     """Install-root ``BeamNG.tech.exe -tcom -console -gfx dx11``."""
     exe = TECH_ROOT_EXE
@@ -474,12 +638,21 @@ def _force_root_dx11(bng: Any, socket_timeout: float) -> None:
         pass
 
 
+def _hello_refuse_line(timeout: float) -> None:
+    print(
+        f"[GVD] phase=Hello REFUSE: socket_timeout {timeout:g}s. Not a missing vehicle.",
+        flush=True,
+    )
+
+
 def _open_with_deadline(bng: Any, launch: bool, timeout: float, host: str, port: int) -> None:
     """Return when ``bng.open`` finishes, or REFUSE at ``timeout``.
 
     BeamNGpy 1.35.1 has no ``socket_timeout`` argument, so a silent port blocks
     inside ``open()``. 1.36 accepts the argument and may retry once. The join
-    is the cap for both pins. On expiry the socket is disconnected only.
+    is the cap for both pins. On expiry the helper logs one REFUSE, stops the
+    ``open()`` thread, and disconnects. Any other ``open()`` error disconnects
+    too, so a Hello version mismatch cannot leave the socket up.
     """
     box: dict[str, BaseException] = {}
 
@@ -493,28 +666,19 @@ def _open_with_deadline(bng: Any, launch: bool, timeout: float, host: str, port:
     worker.start()
     worker.join(timeout)
     if worker.is_alive():
-        print(
-            f"[GVD] phase=Hello REFUSE: socket_timeout {timeout:g}s. Not a missing vehicle.",
-            flush=True,
-        )
+        _hello_refuse_line(timeout)
+        _abandon_hello(bng, worker)
         release_tech_beamngpy(bng)
         raise TechHelloTimeout(f"Hello timeout after {timeout:g}s on {host}:{int(port)}")
     exc = box.get("exc")
     if exc is None:
         return
+    release_tech_beamngpy(bng)
     if isinstance(exc, TechHelloTimeout):
-        print(
-            f"[GVD] phase=Hello REFUSE: socket_timeout {timeout:g}s. Not a missing vehicle.",
-            flush=True,
-        )
-        release_tech_beamngpy(bng)
+        _hello_refuse_line(timeout)
         raise exc
     if isinstance(exc, TimeoutError):
-        print(
-            f"[GVD] phase=Hello REFUSE: socket_timeout {timeout:g}s. Not a missing vehicle.",
-            flush=True,
-        )
-        release_tech_beamngpy(bng)
+        _hello_refuse_line(timeout)
         raise TechHelloTimeout(f"Hello timeout after {timeout:g}s on {host}:{int(port)}") from exc
     raise exc
 
@@ -677,16 +841,20 @@ def probe_spawned_vehicle(
     port: int,
     *,
     socket_timeout: float | None = None,
+    retain: bool = False,
 ) -> bool | None:
     """Attach-only vehicle poll. None when beamngpy is missing. Never launches or kills.
 
     ``TechHelloTimeout`` propagates. It is not an empty vehicle list.
+    ``retain=True`` parks the live socket when a vehicle is present so the
+    supervisor can reuse that one Hello.
     """
     try:
         from beamngpy import BeamNGpy  # type: ignore  # noqa: F401
     except Exception:
         return None
     bng = None
+    parked = False
     try:
         bng = open_tech_beamngpy(
             host, port, home=None, user=None, launch=False, socket_timeout=socket_timeout
@@ -701,14 +869,20 @@ def probe_spawned_vehicle(
             if callable(info):
                 vehicles = info()
         if isinstance(vehicles, dict):
-            return len(vehicles) > 0
-        return bool(vehicles)
+            found = len(vehicles) > 0
+        else:
+            found = bool(vehicles)
+        if retain and found:
+            park_tech_beamngpy(bng)
+            parked = True
+        return found
     except TechHelloTimeout:
         raise
     except Exception:
         return False
     finally:
-        release_tech_beamngpy(bng)
+        if not parked:
+            release_tech_beamngpy(bng)
 
 
 @dataclass(frozen=True)
@@ -733,6 +907,7 @@ class TechHoldGate:
     host: str
     port: int
     hello: str = "skipped"
+    lua_folder: str = ""
 
     @property
     def ok(self) -> bool:
@@ -758,11 +933,12 @@ class TechHoldGate:
             vehicle = "Hello-timeout"
         else:
             vehicle = "yes" if self.vehicle_spawned else "no"
+        folder = (self.lua_folder or "").strip() or "--"
         return (
             f"[GVD] phase=wait-gate port={'LISTENING' if self.port_listening else 'down'} "
             f"mod={'yes' if self.mod_present else 'no'} "
             f"vehicle={vehicle} "
-            f"lua_bus={'fresh' if self.lua_fresh else 'stale'} age={age} "
+            f"lua_bus={'fresh' if self.lua_fresh else 'stale'} folder={folder} age={age} "
             f"buses_same={'yes' if self.buses_same else 'no'} link={self.link} "
             f"pin={self.beamngpy_pin or '--'} beamngpy={self.beamngpy_version or 'missing'} "
             f"launch={'yes' if self.will_launch else 'attach'}"
@@ -776,15 +952,19 @@ def tech_hold_gate(
     vehicle_spawned: bool | None = None,
     mod_present: bool | None = None,
     beamngpy_version: str | None = None,
+    retain: bool = False,
 ) -> TechHoldGate:
     """Preflight before cameras / unique-frame Hz.
 
     Wait gate (unchanged): research port LISTENING, unpacked GVD mod, a spawned
     vehicle, fresh lua_bus (age < 1s), and buses_same(python_bus, lua_bus).
     ``tech.key`` and the Tech user path are status only and are not part of this gate.
+    ``retain=True`` parks the Hello socket when the gate proceeds so
+    ``TechSession.connect`` reuses that one session.
     """
     from python.runtime.paths import bus_identity, buses_same_folder, read_live_lua_bus, youngest_lua_handshake
 
+    drop_tech_beamngpy()
     cfg = apply_env_overrides(config if config is not None else load_tech_config())
     host = str(cfg.get("host") or "localhost")
     port = int(cfg.get("port") or TECH_RESEARCH_PORT)
@@ -811,7 +991,10 @@ def tech_hold_gate(
         else:
             try:
                 probed = probe_spawned_vehicle(
-                    host, port, socket_timeout=resolve_socket_timeout(cfg)
+                    host,
+                    port,
+                    socket_timeout=resolve_socket_timeout(cfg),
+                    retain=retain,
                 )
             except TechHelloTimeout as exc:
                 veh_ok = False
@@ -831,6 +1014,7 @@ def tech_hold_gate(
     live, live_note = read_live_lua_bus()
     _raw, age = youngest_lua_handshake()
     fresh = live is not None and live_note == "ok"
+    lua_folder = ident.lua_bus_s if fresh else (str(_raw).strip() if _raw else "")
     same = bool(
         buses_same_folder(ident.python_bus, ident.lua_bus)
         and live is not None
@@ -881,7 +1065,10 @@ def tech_hold_gate(
         host=host,
         port=port,
         hello=hello,
+        lua_folder=lua_folder,
     )
+    if not (retain and gate.proceed):
+        drop_tech_beamngpy()
     print(gate.line, flush=True)
     return gate
 
@@ -977,8 +1164,9 @@ class TechSession:
         """Open BeamNGpy. explicit=True when the user asked for --backend beamngpy.
 
         Prefer attach. If the research port is already LISTENING, launch is forced
-        off so a second Tech is not started. The socket is opened with
-        quit_on_close=False; Esc/q disconnects and does not kill the process.
+        off so a second Tech is not started. A session parked by the wait gate is
+        reused (one Hello). The socket is opened with quit_on_close=False; Esc/q
+        disconnects and leaves the Tech process running.
         """
         if not explicit and not wants_tech_attach():
             self.note = "set GVD_BEAMNG=1 or --backend beamngpy to attach"
@@ -992,6 +1180,8 @@ class TechSession:
         launch, launch_note = resolve_tech_launch(self.config, port_listening=listening)
         if launch_note not in ("attach",):
             self._log(f"[GVD] {launch_note}")
+        if not listening:
+            drop_tech_beamngpy()
         if not listening and not launch:
             self.note = f"research port {host}:{port} not LISTENING"
             self._log(
@@ -999,24 +1189,30 @@ class TechSession:
                 "then attach. This path does not start a second Tech."
             )
             return False
-        try:
-            bng = open_tech_beamngpy(
-                host,
-                port,
-                home=home,
-                user=user,
-                launch=launch,
-                socket_timeout=resolve_socket_timeout(self.config),
-            )
-            self.bng = bng
-        except TechHelloTimeout as e:
-            # The open helper already logged this Hello failure once.
-            self.note = str(e)
-            return False
-        except Exception as e:
-            self.note = f"beamngpy connect failed ({e})"
-            self._log(f"[GVD] {self.note}. Research port {host}:{port}.")
-            return False
+        parked = take_tech_beamngpy(port) if listening else None
+        if parked is not None:
+            hold_tech_process(parked)
+            self.bng = parked
+            self._log(f"[GVD] phase=Hello reuse {host}:{int(port)}")
+        else:
+            try:
+                bng = open_tech_beamngpy(
+                    host,
+                    port,
+                    home=home,
+                    user=user,
+                    launch=launch,
+                    socket_timeout=resolve_socket_timeout(self.config),
+                )
+                self.bng = bng
+            except TechHelloTimeout as e:
+                # The open helper already logged this Hello failure once.
+                self.note = str(e)
+                return False
+            except Exception as e:
+                self.note = f"beamngpy connect failed ({e})"
+                self._log(f"[GVD] {self.note}. Research port {host}:{port}.")
+                return False
 
         wait_s = float(self.config.get("wait_vehicle_s") or 0.0)
         vehicle = self._wait_vehicle(wait_s)
@@ -1648,6 +1844,27 @@ class TechSession:
 
     def _log(self, msg: str) -> None:
         print(msg, flush=True)
+
+
+def exit_if_tech_connect_failed(backend: Any, backend_name: str) -> None:
+    """Exit 1 when a beamngpy backend fails connect after the wait gate.
+
+    ``connect_failed`` is the connect/import miss. ``_ok`` later means cameras
+    attached, so a zero-camera open stays in the vision loop.
+    """
+    if backend_name != "beamngpy" or not getattr(backend, "connect_failed", False):
+        return
+    drop_tech_beamngpy()
+    session = getattr(backend, "session", None)
+    note = getattr(session, "note", "") if session is not None else ""
+    note = str(note or "beamngpy connect failed")
+    print(f"[GVD] REFUSE: {note}", flush=True)
+    print(
+        "[GVD] Post-hold connect failed. Supervisor exits. Unique-frame Hz is not measured. "
+        "Do not kill BeamNG.tech or CrashSender.",
+        flush=True,
+    )
+    raise SystemExit(1)
 
 
 def run_probe(config: dict[str, Any] | None = None) -> int:

@@ -109,7 +109,9 @@ def check_tech_yaml() -> None:
     cams = cfg.get("cameras") or {}
     assert cams.get("rgb_only") is True
     assert cams.get("convert_gvd_frame") is True
-    text = (ROOT / "config" / "tech.yaml").read_text(encoding="utf-8").lower()
+    raw_yaml = (ROOT / "config" / "tech.yaml").read_text(encoding="utf-8")
+    assert "GVD_TECH_SOCKET_TIMEOUT" in raw_yaml
+    text = raw_yaml.lower()
     assert "lidar" in text
     assert "vision" in text or "optional" in text
     assert "nav hint" in text or "map pin" in text
@@ -1118,6 +1120,7 @@ def _check_hello_timeout() -> None:
     import socket
     import sys
     import tempfile
+    import threading
     import time
     import types
     from contextlib import redirect_stdout
@@ -1127,6 +1130,7 @@ def _check_hello_timeout() -> None:
         TECH_SOCKET_TIMEOUT_S,
         TechHelloTimeout,
         TechSession,
+        drop_tech_beamngpy,
         load_tech_config,
         open_tech_beamngpy,
         resolve_socket_timeout,
@@ -1154,15 +1158,43 @@ def _check_hello_timeout() -> None:
             self.port = port
             instances.append(self)
 
+        def reconnect(self) -> None:
+            """1.35.1-shaped: a closed Hello socket opens another blocking recv."""
+            self.events.append("reconnect")
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = socket.create_connection((self.host, int(self.port)))
+            self._sock.settimeout(None)
+
         def open(self, launch=True, **kwargs):
             seen["launch"] = launch
             seen["socket_timeout"] = self.socket_timeout
             seen["quit_on_close"] = self.quit_on_close
             seen["binary"] = self.binary
-            time.sleep(block_s)
+            seen["open_returned"] = False
+            self._sock = socket.create_connection((self.host, int(self.port)))
+            try:
+                while True:
+                    try:
+                        self._sock.settimeout(None)
+                        data = self._sock.recv(1)
+                        if not data:
+                            raise OSError("eof")
+                    except OSError:
+                        self.reconnect()
+            finally:
+                seen["open_returned"] = True
 
         def disconnect(self) -> None:
             self.events.append("disconnect")
+            sock = getattr(self, "_sock", None)
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
 
         def close(self) -> None:
             self.events.append("close")
@@ -1180,8 +1212,13 @@ def _check_hello_timeout() -> None:
 
     def _bounded(elapsed: float, limit: float) -> None:
         assert elapsed >= limit * 0.8, elapsed
-        assert elapsed < limit + 1.0, elapsed
+        assert elapsed < limit + 0.2, elapsed
         assert elapsed < block_s * 0.9, elapsed
+
+    def _hello_stopped() -> None:
+        assert seen.get("open_returned") is True
+        alive = [t.name for t in threading.enumerate() if t.name == "gvd-hello" and t.is_alive()]
+        assert not alive, alive
 
     mod = types.ModuleType("beamngpy")
     mod.BeamNGpy = FakeBNG
@@ -1191,6 +1228,23 @@ def _check_hello_timeout() -> None:
     srv.bind(("127.0.0.1", 0))
     srv.listen(8)
     port = srv.getsockname()[1]
+    held_socks: list[socket.socket] = []
+    stop_accept = threading.Event()
+
+    def _accept_hold() -> None:
+        """Accept so the backlog cannot stall connect(); hold so client recv blocks."""
+        srv.settimeout(0.2)
+        while not stop_accept.is_set():
+            try:
+                conn, _addr = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            held_socks.append(conn)
+
+    acceptor = threading.Thread(target=_accept_hold, name="gvd-accept", daemon=True)
+    acceptor.start()
     try:
         assert "phase=Hello REFUSE" not in inspect.getsource(TechSession.connect)
         assert float(load_tech_config().get("socket_timeout")) == TECH_SOCKET_TIMEOUT_S
@@ -1223,6 +1277,7 @@ def _check_hello_timeout() -> None:
         assert instances[-1].kwargs["socket_timeout"] == cap
         assert instances[-1].events == ["disconnect"]
         assert "close" not in instances[-1].events and "quit" not in instances[-1].events
+        _hello_stopped()
         assert f"phase=attach 127.0.0.1:{port} LISTENING launch=False" in out
         assert f"socket_timeout={cap:g}s" in out
         assert out.count("phase=Hello REFUSE") == 1
@@ -1253,6 +1308,7 @@ def _check_hello_timeout() -> None:
         assert "socket_timeout" not in instances[-1].kwargs
         assert instances[-1].events == ["disconnect"]
         assert "close" not in instances[-1].events and "quit" not in instances[-1].events
+        _hello_stopped()
         assert out.count("phase=Hello REFUSE") == 1
         assert f"socket_timeout={cap:g}s" in out
 
@@ -1300,6 +1356,7 @@ def _check_hello_timeout() -> None:
         assert "no vehicle spawned" not in out
         assert "disconnect" in instances[-1].events
         assert "close" not in instances[-1].events and "quit" not in instances[-1].events
+        _hello_stopped()
 
         buf = io.StringIO()
         started = time.monotonic()
@@ -1323,6 +1380,7 @@ def _check_hello_timeout() -> None:
         assert session.bng is None
         assert "disconnect" in instances[-1].events
         assert "close" not in instances[-1].events and "quit" not in instances[-1].events
+        _hello_stopped()
 
         buf = io.StringIO()
         with _hold_env():
@@ -1373,7 +1431,102 @@ def _check_hello_timeout() -> None:
         assert "Hello timeout" not in empty.note
         assert "vehicle=no" in empty.line
         assert "close" not in instances[-1].events and "quit" not in instances[-1].events
+
+        class FakeBoom(FakeBNG):
+            def open(self, launch=True, **kwargs):
+                raise RuntimeError("Hello version mismatch")
+
+        mod.BeamNGpy = FakeBoom
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            try:
+                open_tech_beamngpy(
+                    "127.0.0.1",
+                    port,
+                    home=None,
+                    user=None,
+                    launch=False,
+                    socket_timeout=cap,
+                )
+            except RuntimeError as exc:
+                assert "version mismatch" in str(exc)
+            else:
+                raise AssertionError("Hello mismatch should disconnect and raise")
+        boom_out = buf.getvalue()
+        assert instances[-1].events == ["disconnect"]
+        assert "close" not in instances[-1].events and "quit" not in instances[-1].events
+        assert "phase=Hello REFUSE" not in boom_out
+
+        class FakeLive(FakeBNG):
+            def __init__(self, host, port, **kwargs):
+                super().__init__(host, port, **kwargs)
+                veh = types.SimpleNamespace(vid="veh", is_connected=lambda: True)
+                self._veh = veh
+                self.vehicles = types.SimpleNamespace(get_current=lambda: {"veh": veh})
+
+            def open(self, launch=True, **kwargs):
+                seen["opens"] = seen.get("opens", 0) + 1
+
+            def get_current_vehicles(self):
+                return {"veh": self._veh}
+
+        mod.BeamNGpy = FakeLive
+        seen["opens"] = 0
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bus = root / "AppData" / "Local" / "BeamNG" / "BeamNG.tech" / "current" / "Documents" / "GVD"
+            moved = root / "moved" / "Documents" / "GVD"
+            moved.mkdir(parents=True)
+            _plant_link(bus, lua_bus=str(moved), age_s=0.0)
+            live_cfg = {
+                "host": "127.0.0.1",
+                "port": port,
+                "launch": False,
+                "beamngpy_pin": "1.36",
+                "socket_timeout": cap,
+                "home": "/opt/techhome",
+                "wait_vehicle_s": 0,
+            }
+            with _hold_env(
+                LOCALAPPDATA=str(root / "AppData" / "Local"),
+                USERPROFILE=str(root / "Users" / "Name"),
+                HOME=str(root),
+                GVD_PRODUCT="tech",
+                GVD_BEAMNG="1",
+                GVD_DOCS_DIR=str(bus),
+            ):
+                with redirect_stdout(io.StringIO()) as hold_buf:
+                    held = tech_hold_gate(
+                        live_cfg,
+                        mod_present=True,
+                        beamngpy_version="1.36.1",
+                        retain=True,
+                    )
+                assert held.proceed, held.note
+                assert seen["opens"] == 1
+                assert f"folder={moved}" in held.line
+                assert "disconnect" not in instances[-1].events
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    session = TechSession(live_cfg)
+                    assert session.connect(explicit=True) is True
+                reuse_out = buf.getvalue()
+                assert seen["opens"] == 1, seen["opens"]
+                assert f"phase=Hello reuse 127.0.0.1:{port}" in reuse_out
+                assert "phase=Hello REFUSE" not in reuse_out
+                assert session.bng is instances[-1]
+                session.close()
+                assert instances[-1].events == ["disconnect"]
+                assert "close" not in instances[-1].events and "quit" not in instances[-1].events
+                assert "phase=Hello" in hold_buf.getvalue()
     finally:
+        drop_tech_beamngpy()
+        stop_accept.set()
+        for held in held_socks:
+            try:
+                held.close()
+            except OSError:
+                pass
         os.environ.pop("GVD_TECH_SOCKET_TIMEOUT", None)
         srv.close()
         if old is None:
@@ -1396,6 +1549,8 @@ def check_tech_hold_gate() -> None:
         TECH_ROOT_EXE,
         TechHoldGate,
         TechSession,
+        exit_if_tech_connect_failed,
+        park_tech_beamngpy,
         beamngpy_launch_argv,
         beamngpy_pin_ok,
         human_one_starter,
@@ -1505,9 +1660,14 @@ def check_tech_hold_gate() -> None:
     assert "beamngpy>=1.26" not in req
     rv = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
     assert rv.find("tech_hold_gate(") < rv.find("make_backend(")
+    assert "tech_hold_gate(retain=True)" in rv
+    assert rv.find("backend.open()") < rv.find("exit_if_tech_connect_failed(")
     assert "--tech-hold" in rv
     assert 'ord("q"), 27' in rv
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    readme_dev = readme.split("### Dev install (BeamNG.tech)", 1)[1].split("**Tech hold prove**", 1)[0]
+    assert "--tech-hold" in readme_dev
+    assert "python python/run_vision.py --tech-hold" not in readme_dev
     assert "Soft Esc parked" in readme
     assert "Tech hold prove" in readme
     assert "quit_on_close" in readme
@@ -1556,22 +1716,28 @@ def check_tech_hold_gate() -> None:
             gate = tech_hold_gate(cfg, **base)
             assert gate.link == "MISMATCH" and not gate.ok, gate.note
             assert not gate.lua_fresh and not gate.buses_same
+            assert gate.lua_bus == ""
+            assert "lua_bus=stale" in gate.line and "folder=--" in gate.line
 
             _plant_link(bus, lua_bus=str(moved), age_s=2.5)
             stale = tech_hold_gate(cfg, **base)
             assert not stale.lua_fresh and not stale.buses_same and stale.link == "MISMATCH"
             assert stale.lua_age_s is not None and stale.lua_age_s >= 1.0
             assert not stale.ok and not stale.proceed
+            assert stale.lua_bus == ""
+            assert "lua_bus=stale" in stale.line and f"folder={moved}" in stale.line
 
             _plant_link(bus, lua_bus="Documents/GVD", age_s=0.0)
             bad = tech_hold_gate(cfg, **base)
             assert not bad.lua_fresh and bad.link == "MISMATCH"
+            assert "folder=Documents/GVD" in bad.line
 
             _plant_link(bus, lua_bus=str(moved), age_s=0.0)
             ok = tech_hold_gate(cfg, **base)
             assert ok.lua_fresh and ok.buses_same and ok.link == "ok", ok.note
             assert ok.ok and ok.proceed, ok.note
             assert paths.buses_same_folder(ok.python_bus, ok.lua_bus)
+            assert "lua_bus=fresh" in ok.line and f"folder={moved}" in ok.line
             assert ok.lua_age_s is not None and ok.lua_age_s < 1.0
             assert ok.will_launch is False
             assert ok.tech_key is True
@@ -1615,6 +1781,49 @@ def check_tech_hold_gate() -> None:
         assert quiet.connect(explicit=True) is False
         assert quiet.vehicle is None
         assert "not LISTENING" in quiet.note
+
+    import io
+    from contextlib import redirect_stdout
+
+    class _Parked:
+        def __init__(self) -> None:
+            self.events: list[str] = []
+            self.port = 25252
+
+        def disconnect(self) -> None:
+            self.events.append("disconnect")
+
+    parked = _Parked()
+    park_tech_beamngpy(parked)
+
+    class _Ok:
+        connect_failed = False
+
+    exit_if_tech_connect_failed(_Ok(), "beamngpy")
+
+    class _Window:
+        connect_failed = True
+        session = type("S", (), {"note": "boom"})()
+
+    exit_if_tech_connect_failed(_Window(), "window")
+    assert parked.events == []
+
+    class _Bad:
+        connect_failed = True
+        session = type("S", (), {"note": "beamngpy connect failed (boom)"})()
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        try:
+            exit_if_tech_connect_failed(_Bad(), "beamngpy")
+        except SystemExit as exc:
+            assert exc.code == 1
+        else:
+            raise AssertionError("post-hold connect fail should exit 1")
+    assert "REFUSE:" in buf.getvalue()
+    assert "Post-hold connect failed" in buf.getvalue()
+    assert parked.events == ["disconnect"]
+    assert "close" not in parked.events
 
 
 def main() -> None:

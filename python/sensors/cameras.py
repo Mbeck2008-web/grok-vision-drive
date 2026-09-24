@@ -966,6 +966,7 @@ class BeamNGPyBackend:
         self._resolution: dict[str, tuple[int, int]] = {}
         self._logged = False
         self._ok = False
+        self.connect_failed = False
         self._grab_i = 0
         self._cache_frames: dict[str, np.ndarray] = {}
         self._cache_ts: dict[str, float] = {}
@@ -986,6 +987,7 @@ class BeamNGPyBackend:
         self._last_unique_tick_t = 0.0
 
     def open(self) -> None:
+        self.connect_failed = False
         try:
             from beamngpy.sensors import Camera  # type: ignore
         except Exception as e:
@@ -993,12 +995,14 @@ class BeamNGPyBackend:
                 print(f"[GVD] beamngpy not available ({e}); cam_health=missing.")
                 self._logged = True
             self._ok = False
+            self.connect_failed = True
             return
         self._Camera = Camera
 
         if not self.session.connect(explicit=True):
             self._ok = False
             self._logged = True
+            self.connect_failed = True
             return
 
         # Cameras + vehicle sensors attach here, independent of Alt+G / engaged.

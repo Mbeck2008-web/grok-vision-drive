@@ -403,11 +403,75 @@ class DriverInputs:
     brake_input: float | None = None
 
 
+# Soft Esc grab calls TechSession.poll, then read_electrics, on one tick.
+# vehicle.sensors.poll is one GE roundtrip. Reuse that map once. The clock
+# restarts when poll() returns so PollGPSGE inside the same poll cannot
+# expire the snapshot before electrics are read. A miss still polls; Engage
+# hold reads speed on that path.
+SENSOR_POLL_REUSE_S = 0.05
+
+
+class _SensorSnap:
+    """One vehicle.sensors.poll payload, consumed by the next same-tick reader."""
+
+    __slots__ = ("mono", "data", "used")
+
+    def __init__(self, mono: float, data: dict[str, Any]) -> None:
+        self.mono = mono
+        self.data = data
+        self.used = False
+
+
+_sensor_snaps: dict[int, _SensorSnap] = {}
+
+
+def publish_vehicle_sensor_snap(vehicle: Any, data: dict[str, Any]) -> None:
+    """Remember this tick's vehicle.sensors.poll map for one follow-up read."""
+    if vehicle is None:
+        return
+    payload = data if isinstance(data, dict) else {}
+    _sensor_snaps[id(vehicle)] = _SensorSnap(time.monotonic(), payload)
+
+
+def touch_vehicle_sensor_snap(vehicle: Any) -> None:
+    """Restart the reuse window when TechSession.poll returns."""
+    if vehicle is None:
+        return
+    snap = _sensor_snaps.get(id(vehicle))
+    if snap is None or snap.used:
+        return
+    snap.mono = time.monotonic()
+
+
+def take_vehicle_sensor_snap(vehicle: Any) -> dict[str, Any] | None:
+    """Return the unconsumed snapshot, or None when it is missing or old."""
+    if vehicle is None:
+        return None
+    snap = _sensor_snaps.get(id(vehicle))
+    if snap is None or snap.used:
+        return None
+    if time.monotonic() - snap.mono > SENSOR_POLL_REUSE_S:
+        return None
+    snap.used = True
+    return snap.data
+
+
 def read_electrics(vehicle: Any) -> dict[str, Any] | None:
-    """One best-effort poll of the BeamNGpy Electrics dict. None when the sensor is absent."""
+    """Electrics dict. None when the sensor is absent.
+
+    Soft Esc calls this immediately after ``TechSession.poll``. That poll
+    already issued this tick's ``vehicle.sensors.poll``. Reuse that snapshot
+    once so the grab does not open a second GE roundtrip. A miss (no
+    snapshot, already consumed, or older than the reuse window) still polls.
+    Engage hold reads speed on that miss path.
+    """
     if vehicle is None:
         return None
     try:
+        snap = take_vehicle_sensor_snap(vehicle)
+        if isinstance(snap, dict):
+            el = snap.get("electrics") if "electrics" in snap else snap
+            return el if isinstance(el, dict) else None
         sensors = getattr(vehicle, "sensors", None)
         if sensors is None:
             return None

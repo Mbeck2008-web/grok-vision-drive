@@ -1,6 +1,7 @@
 """BeamNG.tech session: connect, player vehicle, electrics/damage/pose + GPS nav hint.
 
-Camera RGB is handled by cameras.py. GPS is a coarse nav hint, not localization.
+Soft Esc grab: one ``vehicle.sensors.poll`` per tick. ``PollGPSGE`` (``GPS.poll``)
+is off that cadence. Camera RGB is handled by cameras.py. GPS is a coarse nav hint, not localization.
 LiDAR / radar / AdvancedIMU attach when config/sensors.yaml enables them — Foxglove /
 future fusion only; the corridor planner stays vision-only. Ultrasonic stays refused.
 Coordinates: GVD vehicle frame is +X right, +Y forward, +Z up. BeamNGpy Camera/GPS
@@ -26,6 +27,10 @@ EARTH_R_M = 6371000.0
 # BeamNG maps have no real-world lat/lon. These put world (0, 0) on the Italy demo sphere.
 DEFAULT_REF_LON = 8.8017
 DEFAULT_REF_LAT = 53.0793
+# GPS.poll sends PollGPSGE, a separate GE roundtrip. Nav is a hint, so grabs
+# inside this window coalesce onto the last sample. That sample is
+# sensors["gps"]="stale": lat/lon stay, and it is not a new fix.
+GPS_POLL_PERIOD_S = 0.5
 
 
 def _num(v: Any) -> float | None:
@@ -149,6 +154,34 @@ def _flatten_gps_samples(raw: Any) -> list[dict[str, Any]]:
     return out
 
 
+def _sensor_map(sensors: Any) -> dict[str, Any]:
+    """Read the vehicle sensor container after poll().
+
+    BeamNGpy ``Sensors.poll`` returns None and the container is not a dict.
+    ``.items()`` / ``.data`` hold the updated Electrics, Damage, and GForces.
+    A dict (tests, older containers) is copied by key.
+    """
+    if sensors is None:
+        return {}
+    if isinstance(sensors, dict):
+        return {str(k): sensors[k] for k in sensors}
+    try:
+        items = sensors.items()
+        return {str(k): v for k, v in items}
+    except Exception:
+        pass
+    data = getattr(sensors, "data", None)
+    if isinstance(data, dict):
+        try:
+            return {str(k): data[k] for k in data}
+        except Exception:
+            pass
+    try:
+        return {str(k): sensors[k] for k in list(sensors)}
+    except Exception:
+        return {}
+
+
 def latest_gps_reading(raw: Any) -> dict[str, Any] | None:
     """Pick the newest lon/lat sample from a BeamNGpy GPS.poll() payload (list, dict, or bulk)."""
     samples = _flatten_gps_samples(raw)
@@ -183,9 +216,14 @@ def nav_snapshot(data: VehicleData | None) -> dict[str, Any]:
     if data is None or not data.connected:
         return empty_nav()
     gps_ok = data.lat is not None and data.lon is not None
+    gps_stale = (data.sensors or {}).get("gps") == "stale"
     pin = None
     if data.pin_lat is not None and data.pin_lon is not None:
         pin = {"lat": data.pin_lat, "lon": data.pin_lon, "name": data.pin_name or ""}
+    note = "nav hint only; not localization; pin is not a route"
+    if gps_ok and gps_stale:
+        # ok means a fix is present. stale means this grab did not send PollGPSGE.
+        note += "; gps is the last PollGPSGE sample (off grab cadence, not a new fix)"
     return {
         "mode": "hint" if gps_ok else "missing",
         "drive_to_pin": False,
@@ -200,7 +238,7 @@ def nav_snapshot(data: VehicleData | None) -> dict[str, Any]:
         "range_m": data.range_m,
         "bearing_deg": data.bearing_deg,
         "bearing_rel_deg": data.bearing_rel_deg,
-        "note": "nav hint only; not localization; pin is not a route",
+        "note": note,
     }
 
 
@@ -1158,6 +1196,8 @@ class TechSession:
         self._imu: Any = None
         self._extra_sensors_yaml: dict[str, Any] | None = None
         self._last_gps: tuple[float, float] | None = None
+        self._gps_reading: dict[str, Any] | None = None
+        self._gps_mono: float | None = None
         self.note = ""
 
     def connect(self, *, explicit: bool = True) -> bool:
@@ -1619,16 +1659,42 @@ class TechSession:
         name = str(nav.get("pin_name") or gps.get("pin_name") or "").strip()
         return lat, lon, name
 
-    def _poll_gps(self) -> dict[str, Any] | None:
+    def _poll_gps(self) -> tuple[dict[str, Any] | None, str]:
+        """Return ``(reading, status)`` with status ``ok`` / ``stale`` / ``missing``.
+
+        ``ok``: this call sent PollGPSGE and stored a lat/lon sample.
+        ``stale``: this grab skipped PollGPSGE (inside ``GPS_POLL_PERIOD_S``)
+        or the new poll failed; lat/lon are the previous sample, not a new fix.
+        ``missing``: no sample. A failed poll still arms the period so a down
+        GPS does not retry on every grab.
+        """
         gps = self._gps
         if gps is None:
-            return None
+            return None, "missing"
+        now = time.monotonic()
+        due = self._gps_mono is None or (now - self._gps_mono) >= GPS_POLL_PERIOD_S
+        if not due:
+            if self._gps_reading is not None:
+                return self._gps_reading, "stale"
+            return None, "missing"
+        self._gps_mono = now
+        reading: dict[str, Any] | None = None
         try:
             raw = gps.poll() if hasattr(gps, "poll") else None
+            reading = latest_gps_reading(raw)
         except Exception as e:
             self._log(f"[GVD] GPS poll failed: {e}")
-            return None
-        return latest_gps_reading(raw)
+            reading = None
+        if (
+            reading is not None
+            and _num(reading.get("lat")) is not None
+            and _num(reading.get("lon")) is not None
+        ):
+            self._gps_reading = reading
+            return reading, "ok"
+        if self._gps_reading is not None:
+            return self._gps_reading, "stale"
+        return None, "missing"
 
     def poll(self) -> VehicleData:
         data = VehicleData(
@@ -1688,24 +1754,36 @@ class TechSession:
             vx, vy, vz = data.vel
             data.speed_mps = math.sqrt(vx * vx + vy * vy + vz * vz)
         self._fill_nav(data)
+        from python.control.actuate import touch_vehicle_sensor_snap
+
+        touch_vehicle_sensor_snap(vehicle)
         return data
 
     def _fill_nav(self, data: VehicleData) -> None:
-        reading = self._poll_gps()
-        if reading:
+        reading, status = self._poll_gps()
+        if reading and status in ("ok", "stale"):
             data.lat = _num(reading.get("lat"))
             data.lon = _num(reading.get("lon"))
             data.gps_x = _num(reading.get("x"))
             data.gps_y = _num(reading.get("y"))
+            # Sample time from the sensor payload, never wall-clock of a reuse.
             data.gps_time = _num(reading.get("time"))
-            data.sensors["gps"] = "ok" if data.lat is not None and data.lon is not None else "missing"
+            have = data.lat is not None and data.lon is not None
+            if not have:
+                data.sensors["gps"] = "missing"
+            elif status == "ok":
+                data.sensors["gps"] = "ok"
+            else:
+                data.sensors["gps"] = "stale"
         elif self.attached.get("gps"):
             data.sensors["gps"] = "missing"
         pin_lat, pin_lon, pin_name = self._nav_pin()
         data.pin_lat, data.pin_lon = pin_lat, pin_lon
         data.pin_name = pin_name or None
         heading: float | None = None
-        if data.lat is not None and data.lon is not None:
+        # Only a PollGPSGE this call may advance the GPS track. A reused
+        # sample must not look like the car sat still for a fresh fix.
+        if status == "ok" and data.lat is not None and data.lon is not None:
             if self._last_gps is not None:
                 plat, plon = self._last_gps
                 if haversine_m(plat, plon, data.lat, data.lon) > 0.5:
@@ -1721,6 +1799,7 @@ class TechSession:
                 data.bearing_rel_deg = wrap180(data.bearing_deg - heading)
 
     def _poll_sensors(self, vehicle: Any) -> dict[str, Any]:
+        """One vehicle.sensors.poll. The map is the tick's ego snapshot."""
         out: dict[str, Any] = {}
         try:
             sensors = getattr(vehicle, "sensors", None)
@@ -1728,16 +1807,12 @@ class TechSession:
                 return out
             if hasattr(sensors, "poll"):
                 sensors.poll()
-            if isinstance(sensors, dict):
-                return {str(k): sensors[k] for k in sensors}
-            # SensorContainer: iterate keys
-            try:
-                for k in list(sensors):
-                    out[str(k)] = sensors[k]
-            except Exception:
-                pass
+            out = _sensor_map(sensors)
         except Exception:
             return out
+        from python.control.actuate import publish_vehicle_sensor_snap
+
+        publish_vehicle_sensor_snap(vehicle, out)
         return out
 
     def _extract(self, sensors: dict[str, Any], key: str) -> dict[str, Any] | None:

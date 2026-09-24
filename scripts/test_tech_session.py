@@ -24,6 +24,8 @@ from python.sensors.cameras import (  # noqa: E402
     REAR_CAM_IDS,
     REAR_GRAB_DIV,
     REAR_GRAB_PHASE,
+    REPEAT_GRAB_DIV,
+    REPEAT_GRAB_PHASE,
     SIDE_CAM_IDS,
     SIDE_GRAB_DIV,
     SIDE_GRAB_PHASE,
@@ -132,6 +134,8 @@ def check_tech_yaml() -> None:
     assert float(by_id["wide"]["far_m"]) == 300
     hitch = rig.get("hitch") or {}
     assert int(hitch.get("side_grab_div")) == SIDE_GRAB_DIV
+    assert int(hitch.get("repeat_grab_div")) == REPEAT_GRAB_DIV
+    assert int(hitch.get("repeat_grab_phase")) == REPEAT_GRAB_PHASE
     assert int(hitch.get("rear_grab_div")) == REAR_GRAB_DIV
     assert int(hitch.get("main_grab_div")) == 1
     assert int(hitch.get("wide_grab_div")) == WIDE_GRAB_DIV
@@ -144,7 +148,10 @@ def check_tech_yaml() -> None:
     for cid in ("pillarL", "pillarR", "repeatL", "repeatR"):
         assert float(by_id[cid]["far_m"]) == 100, cid
         assert float(by_id[cid]["requested_update_time"]) < 0, cid
-        assert camera_grab_div(cid, hitch) == 2, cid
+    assert camera_grab_div("pillarL", hitch) == 2
+    assert camera_grab_div("pillarR", hitch) == 2
+    assert camera_grab_div("repeatL", hitch) == REPEAT_GRAB_DIV == 4
+    assert camera_grab_div("repeatR", hitch) == 4
     assert float(by_id["rear"]["far_m"]) == 100
     assert float(by_id["rear"]["requested_update_time"]) < 0
     assert camera_grab_div("rear", hitch) == 4
@@ -457,6 +464,7 @@ def check_camera_clip_planes() -> None:
     assert camera_grab_div("narrow", {"narrow_grab_div": 4}) == 3  # never ÷4
     assert camera_grab_div("narrow", {"narrow_grab_div": 3}) == 3
     assert camera_grab_div("pillarL") == 2
+    assert camera_grab_div("repeatL") == REPEAT_GRAB_DIV == 4
     assert camera_grab_div("rear") == 4
     assert camera_grab_div("rear", {"rear_grab_div": 4, "side_grab_div": 2}) == 4
     assert grab_due(0, 2, 0) and not grab_due(1, 2, 0)
@@ -478,22 +486,28 @@ def check_camera_clip_planes() -> None:
             for cid in (*SIDE_CAM_IDS, *REAR_CAM_IDS)
             if camera_grab_due(cid, i, hitch)
         ]
-        sides_due = [cid for cid in side_rear if cid in SIDE_CAM_IDS]
-        assert len(sides_due) <= 2, (i, sides_due)
+        reads = [cid for cid in CAM_IDS if camera_grab_due(cid, i, hitch)]
+        assert len(side_rear) <= 2, (i, side_rear)
+        assert len(reads) <= 4, (i, reads)
+        if camera_grab_due("rear", i, hitch):
+            sides_on_rear = [cid for cid in side_rear if cid in SIDE_CAM_IDS]
+            assert len(sides_on_rear) <= 1, (i, sides_on_rear)
         if camera_grab_due("narrow", i, hitch):
-            # Odd tick must not pile narrow together with all four sides and rear.
-            assert len(side_rear) <= 2, (i, side_rear)
+            assert side_rear == ["pillarL", "pillarR"] or set(side_rear) == {"pillarL", "pillarR"}
             assert "rear" not in side_rear
-    for cid in SIDE_CAM_IDS:
+    for cid in ("pillarL", "pillarR"):
         hits = [i for i in range(8) if camera_grab_due(cid, i, hitch)]
-        assert len(hits) == 4, (cid, hits)
+        assert hits == [1, 3, 5, 7], (cid, hits)
+    assert [i for i in range(8) if camera_grab_due("repeatL", i, hitch)] == [0, 4]
+    assert [i for i in range(8) if camera_grab_due("repeatR", i, hitch)] == [2, 6]
     rear_hits = [i for i in range(8) if camera_grab_due("rear", i, hitch)]
     assert rear_hits == [2, 6], rear_hits
-    odd_sides = {cid for cid in SIDE_CAM_IDS if camera_grab_due(cid, 1, hitch)}
-    even_sides = {cid for cid in SIDE_CAM_IDS if camera_grab_due(cid, 0, hitch)}
-    assert len(odd_sides) == 2 and len(even_sides) == 2
-    assert not (odd_sides & even_sides)
-    assert camera_grab_phase("pillarL", hitch) != camera_grab_phase("repeatL", hitch)
+    for i in rear_hits:
+        sides = [cid for cid in SIDE_CAM_IDS if camera_grab_due(cid, i, hitch)]
+        assert sides == ["repeatR"], (i, sides)
+    assert camera_grab_phase("pillarL", hitch) == SIDE_GRAB_PHASE
+    assert camera_grab_phase("repeatL", hitch) == REPEAT_GRAB_PHASE
+    assert camera_grab_phase("repeatR", hitch) == REAR_GRAB_PHASE
     assert camera_grab_due("main", 0, hitch) and camera_grab_due("wide", 0, hitch)
     hitch3 = dict(hitch)
     hitch3["narrow_grab_div"] = 3
@@ -811,12 +825,14 @@ def check_beamngpy_side_grab_half_rate() -> None:
                 assert "wide" in streamed and "narrow" not in streamed
             else:
                 assert "narrow" in streamed and "wide" not in streamed
-                polled = [
-                    cid
-                    for cid in SIDE_CAM_IDS | REAR_CAM_IDS
-                    if polls[f"gvd_{cid}"] > p0.get(f"gvd_{cid}", 0)
-                ]
-                assert len(polled) <= 2, (i, polled)
+            polled = [
+                cid
+                for cid in SIDE_CAM_IDS | REAR_CAM_IDS
+                if polls[f"gvd_{cid}"] > p0.get(f"gvd_{cid}", 0)
+            ]
+            assert len(polled) <= 2, (i, polled)
+            if camera_grab_due("rear", i, be._hitch):
+                assert len([cid for cid in polled if cid in SIDE_CAM_IDS]) <= 1, (i, polled)
             for cid in CAM_IDS:
                 assert bundle.health[cid] != CamHealth.STALE, (i, cid, bundle.health[cid])
         assert last is not None
@@ -837,8 +853,11 @@ def check_beamngpy_side_grab_half_rate() -> None:
         assert polls["gvd_narrow"] == 0
         assert streams["gvd_wide"] == n // 2
         assert streams["gvd_narrow"] == n // 2
-        for cid in SIDE_CAM_IDS:
+        for cid in ("pillarL", "pillarR"):
             assert polls[f"gvd_{cid}"] == n // 2, (cid, polls[f"gvd_{cid}"])
+            assert streams[f"gvd_{cid}"] == 0, cid
+        for cid in ("repeatL", "repeatR"):
+            assert polls[f"gvd_{cid}"] == n // 4, (cid, polls[f"gvd_{cid}"])
             assert streams[f"gvd_{cid}"] == 0, cid
         for cid in REAR_CAM_IDS:
             assert polls[f"gvd_{cid}"] == n // 4, (cid, polls[f"gvd_{cid}"])
@@ -875,7 +894,16 @@ def check_beamngpy_side_grab_half_rate() -> None:
         be._sensors["main"] = FailRaw()
         failed = be.grab()
         assert failed.health["main"] == CamHealth.STALE
+        assert "main" in failed.frames  # last good pixels stay
         assert "main" not in failed.unique_gpu_ids
+        be._cache_frames.pop("main", None)
+        be._cache_ts.pop("main", None)
+        be._frame_sig.pop("main", None)
+        empty = be.grab()
+        assert empty.health["main"] == CamHealth.STALE
+        assert "main" not in empty.frames
+        assert "cam_main" not in empty.frames
+        assert "main" not in empty.unique_gpu_ids
 
         # cache re-show is not a unique GPU frame
         class SameRaw:

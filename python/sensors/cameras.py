@@ -30,20 +30,18 @@ ON_DEMAND_UPDATE_S = -1.0  # no auto GPU update; ad-hoc poll only (sides/rear)
 SIDE_UPDATE_S = ON_DEMAND_UPDATE_S
 REAR_UPDATE_S = ON_DEMAND_UPDATE_S
 MAIN_GRAB_DIV = 1
-# Rank 2: one stream_raw per tick (main). Wide and narrow poll on opposite
-# parities and never share a tick. One poll companion keeps the other cams
-# on non-stream_raw slots.
-#   0 main+wide, 1 main+narrow, 2 main+pillarL, 3 main+pillarR,
-#   4 main+wide, 5 main+repeatL, 6 main+rear, 7 main+repeatR.
-WIDE_GRAB_DIV = 4
-NARROW_GRAB_DIV = 8
+# Rank 2: one stream_raw per tick (main). Companion polls are ÷16.
+# Phases stay: wide 0 (even), narrow 1 (odd), pillarL 2, pillarR 3,
+# repeatL 5, rear 6, repeatR 7. Ticks 4 and 8–15 are main only.
+WIDE_GRAB_DIV = 16
+NARROW_GRAB_DIV = 16
 NARROW_GRAB_PHASE = 1  # odd ticks; wide stays on even ticks
 WIDE_GRAB_PHASE = 0
-SIDE_GRAB_DIV = 8  # each pillar once per wheel
+SIDE_GRAB_DIV = 16  # each pillar once per 16 ticks
 SIDE_GRAB_PHASE = 2  # pillarL; pillarR steps +1 onto phase 3
-REPEAT_GRAB_DIV = 8
+REPEAT_GRAB_DIV = 16
 REPEAT_GRAB_PHASE = 5  # repeatL; repeatR steps +2 onto phase 7
-REAR_GRAB_DIV = 8  # poll rear once per wheel; never drop resolution
+REAR_GRAB_DIV = 16  # poll rear once per 16 ticks; never drop resolution
 REAR_GRAB_PHASE = 6  # main+rear only; no side on this slot
 REPEAT_SPREAD_ORDER = ("repeatL", "repeatR")
 PILLAR_SPREAD_ORDER = ("pillarL", "pillarR")
@@ -324,9 +322,9 @@ def _nonneg_int(v: Any, default: int) -> int:
 
 
 def camera_grab_div(cid: str, hitch: dict[str, Any] | None = None) -> int:
-    """Python grab divisor. main÷1 stream_raw; one poll companion on the wheel.
+    """Python grab divisor. main÷1 stream_raw; companion polls ÷16.
 
-    wide÷4 (even), narrow÷8 (odd), pillars÷8, repeats÷8, rear÷8.
+    wide÷16 (even), narrow÷16 (odd), pillars÷16, repeats÷16, rear÷16.
     """
     hitch = hitch if isinstance(hitch, dict) else {}
     if cid == "main":
@@ -346,7 +344,7 @@ def camera_grab_div(cid: str, hitch: dict[str, Any] | None = None) -> int:
 
 
 def camera_grab_phase(cid: str, hitch: dict[str, Any] | None = None) -> int:
-    """Slot on the 8-tick wheel. Wide (even) and narrow (odd) never share a tick.
+    """Slot on the 16-tick wheel. Wide (even) and narrow (odd) never share a tick.
 
     pillarL is side phase; pillarR steps +1. repeatL is repeat phase; repeatR
     steps +2. Rear sits on its own slot with no side companion.

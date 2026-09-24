@@ -9,13 +9,13 @@
 # Locked far_m (narrow > main; never both-800). Grab stagger is Python-side (not resolution).
 # Every grab is one stream_raw (main, every tick) plus at most one poll:
 #   main:    every tick (÷1, stream_raw)
-#   wide:    ÷4 phase 0 (even ticks 0 and 4; poll)
-#   narrow:  ÷8 phase 1 (odd tick; poll; never shares a tick with wide)
-#   pillarL: ÷8 phase 2
-#   pillarR: ÷8 phase 3
-#   repeatL: ÷8 phase 5
-#   rear:    ÷8 phase 6 (no side on this slot)
-#   repeatR: ÷8 phase 7
+#   wide:    ÷16 phase 0 (even ticks 0 and 16; poll)
+#   narrow:  ÷16 phase 1 (odd tick; poll; never shares a tick with wide)
+#   pillarL: ÷16 phase 2
+#   pillarR: ÷16 phase 3
+#   repeatL: ÷16 phase 5
+#   rear:    ÷16 phase 6 (no side on this slot)
+#   repeatR: ÷16 phase 7
 # Far / GPU (stream_raw on main; wide/narrow poll; never is_streaming=False):
 #   narrow: 800 @ 0.067  priority 0.5   (next far hitch 400 only if live unique-frame Hz <10)
 #   main:   300 @ 0.067  priority 0.0
@@ -27,15 +27,15 @@ origin_offset: [0.0, 0.0, 0.0]
 near_m: 0.05
 hitch:
   main_grab_div: 1
-  wide_grab_div: 4
-  wide_grab_phase: 0     # even ticks 0 and 4; poll, not a second stream_raw
-  narrow_grab_div: 8
+  wide_grab_div: 16
+  wide_grab_phase: 0     # phase unchanged; ÷16 even ticks 0 and 16
+  narrow_grab_div: 16
   narrow_grab_phase: 1   # odd tick; never shares a tick with wide
-  side_grab_div: 8
+  side_grab_div: 16
   side_grab_phase: 2     # pillarL; pillarR steps +1
-  repeat_grab_div: 8
+  repeat_grab_div: 16
   repeat_grab_phase: 5   # repeatL; repeatR steps +2
-  rear_grab_div: 8
+  rear_grab_div: 16
   rear_grab_phase: 6     # main+rear; no side companion
 # OpenCV cabin only. Does not set BeamNGpy clip planes or the hitch ladder.
 # auto = that camera's far_m after hitch (state main_far_m / rear_far_m when set).

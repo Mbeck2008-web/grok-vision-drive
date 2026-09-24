@@ -1111,34 +1111,47 @@ def _check_launch_fail_prints_argv(open_tech_beamngpy) -> None:
 
 
 def _check_hello_timeout() -> None:
-    """Hello socket timeout REFUSEs and does not report a missing vehicle."""
+    """Blocking open() must REFUSE inside socket_timeout on 1.35.1 and 1.36."""
+    import inspect
     import io
     import os
     import socket
     import sys
+    import tempfile
+    import time
     import types
     from contextlib import redirect_stdout
+    from pathlib import Path
 
     from python.sensors.tech import (
         TECH_SOCKET_TIMEOUT_S,
         TechHelloTimeout,
+        TechSession,
+        load_tech_config,
         open_tech_beamngpy,
+        resolve_socket_timeout,
         tech_hold_gate,
     )
 
+    block_s = 3.0
+    cap = 0.4
     os.environ.pop("GVD_TECH_SOCKET_TIMEOUT", None)
     seen: dict = {}
     instances: list = []
 
     class FakeBNG:
+        """1.36-shaped: accepts socket_timeout, then blocks in open()."""
+
         def __init__(self, host, port, **kwargs):
             self.kwargs = dict(kwargs)
             self.binary = "Bin64/BeamNG.tech.x64.exe"
             self.gfx = None
-            self.socket_timeout = None
-            self.quit_on_close = True
+            self.socket_timeout = kwargs.get("socket_timeout")
+            self.quit_on_close = kwargs.get("quit_on_close", True)
             self.last_command_line = None
             self.events: list[str] = []
+            self.host = host
+            self.port = port
             instances.append(self)
 
         def open(self, launch=True, **kwargs):
@@ -1146,7 +1159,7 @@ def _check_hello_timeout() -> None:
             seen["socket_timeout"] = self.socket_timeout
             seen["quit_on_close"] = self.quit_on_close
             seen["binary"] = self.binary
-            raise TimeoutError("timed out")
+            time.sleep(block_s)
 
         def disconnect(self) -> None:
             self.events.append("disconnect")
@@ -1157,6 +1170,19 @@ def _check_hello_timeout() -> None:
         def quit_beamng(self) -> None:
             self.events.append("quit")
 
+    class Fake135(FakeBNG):
+        """1.35.1-shaped: constructor rejects socket_timeout; open() still blocks."""
+
+        def __init__(self, host, port, **kwargs):
+            if "socket_timeout" in kwargs or "gfx" in kwargs or "binary" in kwargs:
+                raise TypeError("unexpected kw")
+            super().__init__(host, port, **kwargs)
+
+    def _bounded(elapsed: float, limit: float) -> None:
+        assert elapsed >= limit * 0.8, elapsed
+        assert elapsed < limit + 1.0, elapsed
+        assert elapsed < block_s * 0.9, elapsed
+
     mod = types.ModuleType("beamngpy")
     mod.BeamNGpy = FakeBNG
     old = sys.modules.get("beamngpy")
@@ -1166,7 +1192,14 @@ def _check_hello_timeout() -> None:
     srv.listen(8)
     port = srv.getsockname()[1]
     try:
+        assert "phase=Hello REFUSE" not in inspect.getsource(TechSession.connect)
+        assert float(load_tech_config().get("socket_timeout")) == TECH_SOCKET_TIMEOUT_S
+        assert resolve_socket_timeout(load_tech_config()) == TECH_SOCKET_TIMEOUT_S
+
+        os.environ["GVD_TECH_SOCKET_TIMEOUT"] = str(cap)
+        assert resolve_socket_timeout(load_tech_config()) == cap
         buf = io.StringIO()
+        started = time.monotonic()
         with redirect_stdout(buf):
             try:
                 open_tech_beamngpy(
@@ -1180,35 +1213,79 @@ def _check_hello_timeout() -> None:
                 assert "Hello timeout" in str(exc)
             else:
                 raise AssertionError("Hello timeout should refuse")
+        elapsed = time.monotonic() - started
+        _bounded(elapsed, cap)
         out = buf.getvalue()
         assert seen["launch"] is False
-        assert seen["socket_timeout"] == TECH_SOCKET_TIMEOUT_S
+        assert seen["socket_timeout"] == cap
         assert seen["quit_on_close"] is False
         assert seen["binary"] == "BeamNG.tech.exe"
-        assert instances[-1].kwargs["socket_timeout"] == TECH_SOCKET_TIMEOUT_S
+        assert instances[-1].kwargs["socket_timeout"] == cap
         assert instances[-1].events == ["disconnect"]
         assert "close" not in instances[-1].events and "quit" not in instances[-1].events
         assert f"phase=attach 127.0.0.1:{port} LISTENING launch=False" in out
-        assert "phase=Hello" in out
-        assert "phase=Hello REFUSE" in out
+        assert f"socket_timeout={cap:g}s" in out
+        assert out.count("phase=Hello REFUSE") == 1
         assert "Not a missing vehicle" in out
         assert "no vehicle spawned" not in out
         assert "launch failed" not in out
+        os.environ.pop("GVD_TECH_SOCKET_TIMEOUT", None)
 
+        mod.BeamNGpy = Fake135
         buf = io.StringIO()
-        with _hold_env():
-            with redirect_stdout(buf):
-                gate = tech_hold_gate(
-                    {
-                        "host": "127.0.0.1",
-                        "port": port,
-                        "launch": True,
-                        "beamngpy_pin": "1.36",
-                        "home": "/opt/techhome",
-                    },
-                    mod_present=True,
-                    beamngpy_version="1.36.1",
+        started = time.monotonic()
+        with redirect_stdout(buf):
+            try:
+                open_tech_beamngpy(
+                    "127.0.0.1",
+                    port,
+                    home="/opt/techhome",
+                    user=None,
+                    launch=False,
+                    socket_timeout=cap,
                 )
+            except TechHelloTimeout as exc:
+                assert "Hello timeout" in str(exc)
+            else:
+                raise AssertionError("1.35.1 Hello should refuse")
+        _bounded(time.monotonic() - started, cap)
+        out = buf.getvalue()
+        assert "socket_timeout" not in instances[-1].kwargs
+        assert instances[-1].events == ["disconnect"]
+        assert "close" not in instances[-1].events and "quit" not in instances[-1].events
+        assert out.count("phase=Hello REFUSE") == 1
+        assert f"socket_timeout={cap:g}s" in out
+
+        mod.BeamNGpy = FakeBNG
+        with tempfile.TemporaryDirectory() as td:
+            yaml_path = Path(td) / "tech.yaml"
+            yaml_path.write_text(
+                "\n".join(
+                    [
+                        "host: 127.0.0.1",
+                        f"port: {port}",
+                        "launch: true",
+                        'beamngpy_pin: "1.36"',
+                        "home: /opt/techhome",
+                        f"socket_timeout: {cap}",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            cfg = load_tech_config(yaml_path)
+            assert float(cfg["socket_timeout"]) == cap
+            assert resolve_socket_timeout(cfg) == cap
+            buf = io.StringIO()
+            started = time.monotonic()
+            with _hold_env():
+                with redirect_stdout(buf):
+                    gate = tech_hold_gate(
+                        cfg,
+                        mod_present=True,
+                        beamngpy_version="1.36.1",
+                    )
+            _bounded(time.monotonic() - started, cap)
         out = buf.getvalue()
         assert gate.hello == "timeout"
         assert gate.vehicle_spawned is False
@@ -1218,11 +1295,55 @@ def _check_hello_timeout() -> None:
         assert "no vehicle spawned" not in gate.note
         assert "vehicle=Hello-timeout" in gate.line
         assert "phase=wait-gate" in gate.line
-        assert "phase=Hello REFUSE" in out
+        assert out.count("phase=Hello REFUSE") == 1
         assert "phase=wait-gate" in out
         assert "no vehicle spawned" not in out
-        assert instances[-1].events[0] == "disconnect"
+        assert "disconnect" in instances[-1].events
         assert "close" not in instances[-1].events and "quit" not in instances[-1].events
+
+        buf = io.StringIO()
+        started = time.monotonic()
+        with redirect_stdout(buf):
+            session = TechSession(
+                {
+                    "host": "127.0.0.1",
+                    "port": port,
+                    "launch": True,
+                    "wait_vehicle_s": 0,
+                    "socket_timeout": cap,
+                    "home": "/opt/techhome",
+                }
+            )
+            assert session.connect(explicit=True) is False
+        _bounded(time.monotonic() - started, cap)
+        out = buf.getvalue()
+        assert out.count("phase=Hello REFUSE") == 1
+        assert "Hello timeout" in session.note
+        assert "no vehicle" not in session.note
+        assert session.bng is None
+        assert "disconnect" in instances[-1].events
+        assert "close" not in instances[-1].events and "quit" not in instances[-1].events
+
+        buf = io.StringIO()
+        with _hold_env():
+            with redirect_stdout(buf):
+                down = tech_hold_gate(
+                    {
+                        "host": "127.0.0.1",
+                        "port": 9,
+                        "launch": False,
+                        "beamngpy_pin": "1.36",
+                        "socket_timeout": 7.5,
+                    },
+                    port_up=False,
+                    mod_present=True,
+                    beamngpy_version="1.36.1",
+                )
+        text = buf.getvalue()
+        assert "phase=attach 127.0.0.1:9 down launch=False socket_timeout=7.5s" in text
+        assert "phase=Hello skipped" in text
+        assert down.hello == "skipped"
+        assert "no vehicle spawned" in down.note
 
         class FakeEmpty(FakeBNG):
             def open(self, launch=True, **kwargs):
@@ -1241,6 +1362,7 @@ def _check_hello_timeout() -> None:
                         "launch": False,
                         "beamngpy_pin": "1.36",
                         "home": "/opt/techhome",
+                        "socket_timeout": cap,
                     },
                     mod_present=True,
                     beamngpy_version="1.36.1",
@@ -1252,6 +1374,7 @@ def _check_hello_timeout() -> None:
         assert "vehicle=no" in empty.line
         assert "close" not in instances[-1].events and "quit" not in instances[-1].events
     finally:
+        os.environ.pop("GVD_TECH_SOCKET_TIMEOUT", None)
         srv.close()
         if old is None:
             sys.modules.pop("beamngpy", None)

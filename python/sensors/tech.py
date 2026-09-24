@@ -12,6 +12,7 @@ from __future__ import annotations
 import inspect
 import math
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -473,6 +474,51 @@ def _force_root_dx11(bng: Any, socket_timeout: float) -> None:
         pass
 
 
+def _open_with_deadline(bng: Any, launch: bool, timeout: float, host: str, port: int) -> None:
+    """Return when ``bng.open`` finishes, or REFUSE at ``timeout``.
+
+    BeamNGpy 1.35.1 has no ``socket_timeout`` argument, so a silent port blocks
+    inside ``open()``. 1.36 accepts the argument and may retry once. The join
+    is the cap for both pins. On expiry the socket is disconnected only.
+    """
+    box: dict[str, BaseException] = {}
+
+    def _run() -> None:
+        try:
+            bng.open(launch=bool(launch))
+        except BaseException as exc:
+            box["exc"] = exc
+
+    worker = threading.Thread(target=_run, name="gvd-hello", daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        print(
+            f"[GVD] phase=Hello REFUSE: socket_timeout {timeout:g}s. Not a missing vehicle.",
+            flush=True,
+        )
+        release_tech_beamngpy(bng)
+        raise TechHelloTimeout(f"Hello timeout after {timeout:g}s on {host}:{int(port)}")
+    exc = box.get("exc")
+    if exc is None:
+        return
+    if isinstance(exc, TechHelloTimeout):
+        print(
+            f"[GVD] phase=Hello REFUSE: socket_timeout {timeout:g}s. Not a missing vehicle.",
+            flush=True,
+        )
+        release_tech_beamngpy(bng)
+        raise exc
+    if isinstance(exc, TimeoutError):
+        print(
+            f"[GVD] phase=Hello REFUSE: socket_timeout {timeout:g}s. Not a missing vehicle.",
+            flush=True,
+        )
+        release_tech_beamngpy(bng)
+        raise TechHelloTimeout(f"Hello timeout after {timeout:g}s on {host}:{int(port)}") from exc
+    raise exc
+
+
 def open_tech_beamngpy(
     host: str,
     port: int,
@@ -484,13 +530,17 @@ def open_tech_beamngpy(
 ) -> Any:
     """Connect with quit_on_close=False. Launch uses the root exe and ``-gfx dx11``.
 
-    A listening research port forces ``launch=False``. Hello uses ``socket_timeout``;
-    a timeout is ``TechHelloTimeout`` (REFUSE), not a missing vehicle.
+    A listening research port forces ``launch=False``. ``bng.open()`` is joined
+    for ``socket_timeout`` seconds on BeamNGpy 1.35 and 1.36. Expiry is
+    ``TechHelloTimeout`` (one ``phase=Hello REFUSE``), not a missing vehicle.
     A launch failure prints the real argv. Attach failures do not print a launch line.
     """
     from beamngpy import BeamNGpy  # type: ignore
 
-    timeout = resolve_socket_timeout() if socket_timeout is None else float(socket_timeout)
+    if socket_timeout is None:
+        timeout = resolve_socket_timeout(load_tech_config())
+    else:
+        timeout = float(socket_timeout)
     if timeout <= 0:
         timeout = TECH_SOCKET_TIMEOUT_S
     listening = research_port_listening(host, int(port))
@@ -529,15 +579,7 @@ def open_tech_beamngpy(
         _force_root_dx11(bng, timeout)
         hold_tech_process(bng)
         print("[GVD] phase=Hello", flush=True)
-        try:
-            bng.open(launch=bool(launch))
-        except TimeoutError as exc:
-            print(
-                f"[GVD] phase=Hello REFUSE: socket_timeout {timeout:g}s. Not a missing vehicle.",
-                flush=True,
-            )
-            release_tech_beamngpy(bng)
-            raise TechHelloTimeout(f"Hello timeout after {timeout:g}s on {host}:{int(port)}") from exc
+        _open_with_deadline(bng, bool(launch), timeout, host, int(port))
         print("[GVD] phase=Hello ok", flush=True)
         hold_tech_process(bng)
         _force_root_dx11(bng, timeout)
@@ -761,7 +803,8 @@ def tech_hold_gate(
         if not listening:
             veh_ok = False
             print(
-                f"[GVD] phase=attach {host}:{port} down launch={will_launch}",
+                f"[GVD] phase=attach {host}:{port} down launch={will_launch} "
+                f"socket_timeout={resolve_socket_timeout(cfg):g}s",
                 flush=True,
             )
             print("[GVD] phase=Hello skipped", flush=True)
@@ -967,8 +1010,8 @@ class TechSession:
             )
             self.bng = bng
         except TechHelloTimeout as e:
+            # The open helper already logged this Hello failure once.
             self.note = str(e)
-            self._log(f"[GVD] phase=Hello REFUSE: {self.note}. Not a missing vehicle.")
             return False
         except Exception as e:
             self.note = f"beamngpy connect failed ({e})"

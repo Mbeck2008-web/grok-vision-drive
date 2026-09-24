@@ -30,21 +30,24 @@ ON_DEMAND_UPDATE_S = -1.0  # no auto GPU update; ad-hoc poll only (sides/rear)
 SIDE_UPDATE_S = ON_DEMAND_UPDATE_S
 REAR_UPDATE_S = ON_DEMAND_UPDATE_S
 MAIN_GRAB_DIV = 1
-# 8-tick wheel: main every tick, exactly one companion. ≤2 colour reads / grab.
-#   0 main+wide, 1 main+pillarL, 2 main+narrow, 3 main+pillarR,
+# Rank 2: one stream_raw per tick (main). Wide and narrow poll on opposite
+# parities and never share a tick. One poll companion keeps the other cams
+# on non-stream_raw slots.
+#   0 main+wide, 1 main+narrow, 2 main+pillarL, 3 main+pillarR,
 #   4 main+wide, 5 main+repeatL, 6 main+rear, 7 main+repeatR.
 WIDE_GRAB_DIV = 4
 NARROW_GRAB_DIV = 8
-NARROW_GRAB_PHASE = 2  # misses wide (phase 0) and both pillar slots
+NARROW_GRAB_PHASE = 1  # odd ticks; wide stays on even ticks
 WIDE_GRAB_PHASE = 0
 SIDE_GRAB_DIV = 8  # each pillar once per wheel
-SIDE_GRAB_PHASE = 1  # pillarL; pillarR steps +2 onto phase 3
+SIDE_GRAB_PHASE = 2  # pillarL; pillarR steps +1 onto phase 3
 REPEAT_GRAB_DIV = 8
 REPEAT_GRAB_PHASE = 5  # repeatL; repeatR steps +2 onto phase 7
 REAR_GRAB_DIV = 8  # poll rear once per wheel; never drop resolution
 REAR_GRAB_PHASE = 6  # main+rear only; no side on this slot
 REPEAT_SPREAD_ORDER = ("repeatL", "repeatR")
 PILLAR_SPREAD_ORDER = ("pillarL", "pillarR")
+PILLAR_SPREAD_STEP = 1
 NARROW_FAR_LIVE_HITCH_M = 400.0  # live unique-frame Hz hitch (800→400 if still <10)
 CAMERA_HZ_TARGET = 10.0
 LIVE_NARROW_HITCH_AFTER_S = 2.0
@@ -321,9 +324,9 @@ def _nonneg_int(v: Any, default: int) -> int:
 
 
 def camera_grab_div(cid: str, hitch: dict[str, Any] | None = None) -> int:
-    """Python grab divisor. main÷1; one companion per tick on an 8-tick wheel.
+    """Python grab divisor. main÷1 stream_raw; one poll companion on the wheel.
 
-    wide÷4, narrow÷8 (floor ÷2), pillars÷8, repeats÷8, rear÷8.
+    wide÷4 (even), narrow÷8 (odd), pillars÷8, repeats÷8, rear÷8.
     """
     hitch = hitch if isinstance(hitch, dict) else {}
     if cid == "main":
@@ -343,9 +346,9 @@ def camera_grab_div(cid: str, hitch: dict[str, Any] | None = None) -> int:
 
 
 def camera_grab_phase(cid: str, hitch: dict[str, Any] | None = None) -> int:
-    """Slot on the 8-tick wheel. Wide and narrow never share a tick.
+    """Slot on the 8-tick wheel. Wide (even) and narrow (odd) never share a tick.
 
-    pillarL is side phase; pillarR steps +2. repeatL is repeat phase; repeatR
+    pillarL is side phase; pillarR steps +1. repeatL is repeat phase; repeatR
     steps +2. Rear sits on its own slot with no side companion.
     """
     hitch = hitch if isinstance(hitch, dict) else {}
@@ -372,7 +375,7 @@ def camera_grab_phase(cid: str, hitch: dict[str, Any] | None = None) -> int:
             slot = PILLAR_SPREAD_ORDER.index(cid)
         except ValueError:
             slot = 0
-        return (base + slot * 2) % div
+        return (base + slot * PILLAR_SPREAD_STEP) % div
     if cid in SIDE_CAM_IDS:
         return _nonneg_int(hitch.get("side_grab_phase"), SIDE_GRAB_PHASE)
     return 0
@@ -622,9 +625,14 @@ def read_camera_colour(
     cid: str,
     resolution: tuple[int, int] | None = None,
 ) -> np.ndarray | None:
-    """Forwards: stream_raw only (no poll). Sides/rear: poll (on-demand -1)."""
+    """Main: stream_raw. Wide, narrow, sides, and rear: poll.
+
+    One stream_raw per grab (main, every tick). Wide and narrow alternate
+    across ticks and never share one. is_streaming stays true; poll is not a
+    second stream_raw.
+    """
     res = resolution or _cam_resolution(cam)
-    if cid in FORWARD_CAM_IDS:
+    if cid == "main":
         if not hasattr(cam, "stream_raw"):
             return None
         try:
@@ -635,7 +643,7 @@ def read_camera_colour(
         if isinstance(raw, dict):
             colour = raw.get("colour") if raw.get("colour") is not None else raw.get("color")
         return colour_to_bgr(colour, res)
-    # sides/rear requested_update_time=-1: need an ad-hoc poll. Never set streaming false.
+    # Wide/narrow and sides/rear: poll. Never set streaming false.
     if not hasattr(cam, "poll"):
         return None
     try:
@@ -1175,7 +1183,7 @@ class BeamNGPyBackend:
                     f"update_priority {prios}; "
                     f"grab_div main={self._grab_div['main']} wide={self._grab_div['wide']} "
                     f"narrow={self._grab_div['narrow']} side={self._side_grab_div} "
-                    f"rear={self._rear_grab_div}; stream_raw forwards; "
+                    f"rear={self._rear_grab_div}; stream_raw main; "
                     f"GVD→BeamNG vehicle-space convert; depth/semantic OFF)."
                 )
             else:

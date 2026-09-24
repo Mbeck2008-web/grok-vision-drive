@@ -22,6 +22,7 @@ from python.sensors.cameras import (  # noqa: E402
     NARROW_GRAB_DIV,
     NARROW_GRAB_PHASE,
     ON_DEMAND_UPDATE_S,
+    PILLAR_SPREAD_STEP,
     REAR_CAM_IDS,
     REAR_GRAB_DIV,
     REAR_GRAB_PHASE,
@@ -162,9 +163,9 @@ def check_tech_yaml() -> None:
     assert camera_grab_div("wide", hitch) == WIDE_GRAB_DIV == 4
     assert camera_grab_div("narrow", hitch) == NARROW_GRAB_DIV == 8
     assert camera_grab_phase("wide", hitch) == 0
-    assert camera_grab_phase("narrow", hitch) == NARROW_GRAB_PHASE == 2
+    assert camera_grab_phase("narrow", hitch) == NARROW_GRAB_PHASE == 1
     assert camera_grab_phase("pillarL", hitch) == SIDE_GRAB_PHASE
-    assert camera_grab_phase("pillarR", hitch) == (SIDE_GRAB_PHASE + 2) % SIDE_GRAB_DIV
+    assert camera_grab_phase("pillarR", hitch) == (SIDE_GRAB_PHASE + PILLAR_SPREAD_STEP) % SIDE_GRAB_DIV
     assert camera_grab_phase("rear", hitch) == REAR_GRAB_PHASE
     assert abs(float(by_id["main"].get("update_priority", 0)) - 0.0) < 1e-9
     assert float(by_id["narrow"].get("update_priority", 0)) > float(by_id["main"].get("update_priority", 0))
@@ -475,8 +476,8 @@ def check_camera_clip_planes() -> None:
     hitch = load_camera_config().get("hitch") or {}
     wheel = {
         0: {"main", "wide"},
-        1: {"main", "pillarL"},
-        2: {"main", "narrow"},
+        1: {"main", "narrow"},
+        2: {"main", "pillarL"},
         3: {"main", "pillarR"},
         4: {"main", "wide"},
         5: {"main", "repeatL"},
@@ -489,12 +490,24 @@ def check_camera_clip_planes() -> None:
             camera_grab_due("wide", i, hitch) and camera_grab_due("narrow", i, hitch)
         ), i
         assert camera_grab_due("main", i, hitch)
+        wide_due = camera_grab_due("wide", i, hitch)
+        narrow_due = camera_grab_due("narrow", i, hitch)
+        if wide_due:
+            assert i % 2 == 0, i
+        if narrow_due:
+            assert i % 2 == 1, i
         side_rear = [
             cid
             for cid in (*SIDE_CAM_IDS, *REAR_CAM_IDS)
             if camera_grab_due(cid, i, hitch)
         ]
         reads = [cid for cid in CAM_IDS if camera_grab_due(cid, i, hitch)]
+        forwards = [cid for cid in ("main", "wide", "narrow") if cid in reads]
+        # main is the only stream_raw; wide/narrow are polls and never both due.
+        assert forwards == ["main"] or set(forwards) <= {"main", "wide", "narrow"}
+        assert "main" in forwards
+        assert not ("wide" in forwards and "narrow" in forwards)
+        assert len([cid for cid in forwards if cid != "main"]) <= 1
         assert len(side_rear) <= 1, (i, side_rear)
         assert len(reads) <= 2, (i, reads)
         assert not forbidden.issubset(set(reads)), (i, reads)
@@ -505,7 +518,10 @@ def check_camera_clip_planes() -> None:
         if camera_grab_due("narrow", i, hitch):
             assert side_rear == []
             assert "rear" not in side_rear
-    assert [i for i in range(8) if camera_grab_due("pillarL", i, hitch)] == [1]
+            assert not camera_grab_due("wide", i, hitch)
+    assert [i for i in range(8) if camera_grab_due("wide", i, hitch)] == [0, 4]
+    assert [i for i in range(8) if camera_grab_due("narrow", i, hitch)] == [1]
+    assert [i for i in range(8) if camera_grab_due("pillarL", i, hitch)] == [2]
     assert [i for i in range(8) if camera_grab_due("pillarR", i, hitch)] == [3]
     assert [i for i in range(8) if camera_grab_due("repeatL", i, hitch)] == [5]
     assert [i for i in range(8) if camera_grab_due("repeatR", i, hitch)] == [7]
@@ -530,7 +546,7 @@ def check_camera_clip_planes() -> None:
         if n:
             n3 += 1
             assert not w
-    # phase 2 ÷3 collides with wide ÷4 on ticks 8 and 20; the wide guard drops those.
+    # phase 1 ÷3 collides with wide ÷4 on ticks 4 and 16; the wide guard drops those.
     assert n3 == 6
     assert CAMERA_HZ_TARGET == 10.0
     assert invert_update_priority(0.0) == 1.0
@@ -684,7 +700,7 @@ def check_beamngpy_open_passes_near_far() -> None:
         assert "grab_div main=1" in log
         assert "wide=4" in log
         assert "narrow=8" in log
-        assert "stream_raw forwards" in log
+        assert "stream_raw main" in log
         assert "rear=8" in log
         assert "depth/semantic OFF" in log
         names = [n for n, _ in captured]
@@ -746,7 +762,7 @@ def check_beamngpy_open_passes_near_far() -> None:
 
 
 def check_beamngpy_side_grab_half_rate() -> None:
-    """main÷1 stream_raw plus one companion. ≤2 colour reads per grab tick."""
+    """main stream_raw every tick. Wide/narrow poll on opposite parities. ≤1 stream_raw."""
     import sys
     import types
 
@@ -821,37 +837,44 @@ def check_beamngpy_side_grab_half_rate() -> None:
         last = None
         wheel = {
             0: {"main", "wide"},
-            1: {"main", "pillarL"},
-            2: {"main", "narrow"},
+            1: {"main", "narrow"},
+            2: {"main", "pillarL"},
             3: {"main", "pillarR"},
             4: {"main", "wide"},
             5: {"main", "repeatL"},
             6: {"main", "rear"},
             7: {"main", "repeatR"},
         }
+        poll_ids = SIDE_CAM_IDS | REAR_CAM_IDS | {"wide", "narrow"}
         for i in range(n):
             s0 = dict(streams)
             p0 = dict(polls)
             bundle = be.grab()
             last = bundle
             streamed = [cid for cid in ("main", "wide", "narrow") if streams[f"gvd_{cid}"] > s0.get(f"gvd_{cid}", 0)]
-            assert not ("wide" in streamed and "narrow" in streamed), (i, streamed)
+            assert streamed == ["main"], (i, streamed)
+            assert "wide" not in streamed and "narrow" not in streamed
             if i == 0:
-                assert set(streamed) == {"main", "wide"}
-                for cid in SIDE_CAM_IDS | REAR_CAM_IDS:
+                for cid in poll_ids:
                     due = camera_grab_due(cid, 0, be._hitch)
                     assert (polls[f"gvd_{cid}"] == 1) == due, (cid, due, polls[f"gvd_{cid}"])
                 assert bundle.health["narrow"] == CamHealth.MISSING  # not read yet
                 assert bundle.health["narrow"] != CamHealth.STALE
             polled = [
                 cid
-                for cid in SIDE_CAM_IDS | REAR_CAM_IDS
+                for cid in poll_ids
                 if polls[f"gvd_{cid}"] > p0.get(f"gvd_{cid}", 0)
             ]
             colour = set(streamed) | set(polled)
+            assert len(streamed) <= 1
             assert len(colour) <= 2, (i, colour)
             assert colour == wheel[i], (i, colour)
-            assert not {"narrow", "main", "pillarL", "pillarR"}.issubset(colour), (i, colour)
+            assert not {"main", "wide"}.issubset(set(streamed))
+            assert not ("wide" in polled and "narrow" in polled)
+            if camera_grab_due("wide", i, be._hitch):
+                assert i % 2 == 0
+            if camera_grab_due("narrow", i, be._hitch):
+                assert i % 2 == 1
             if camera_grab_due("rear", i, be._hitch):
                 assert [cid for cid in polled if cid in SIDE_CAM_IDS] == [], (i, polled)
             for cid in CAM_IDS:
@@ -870,10 +893,10 @@ def check_beamngpy_side_grab_half_rate() -> None:
             assert cid in last.frames
         assert streams["gvd_main"] == n
         assert polls["gvd_main"] == 0
-        assert polls["gvd_wide"] == 0
-        assert polls["gvd_narrow"] == 0
-        assert streams["gvd_wide"] == n // WIDE_GRAB_DIV
-        assert streams["gvd_narrow"] == n // NARROW_GRAB_DIV
+        assert streams["gvd_wide"] == 0
+        assert streams["gvd_narrow"] == 0
+        assert polls["gvd_wide"] == n // WIDE_GRAB_DIV
+        assert polls["gvd_narrow"] == n // NARROW_GRAB_DIV
         for cid in ("pillarL", "pillarR"):
             assert polls[f"gvd_{cid}"] == n // SIDE_GRAB_DIV, (cid, polls[f"gvd_{cid}"])
             assert streams[f"gvd_{cid}"] == 0, cid
@@ -890,16 +913,29 @@ def check_beamngpy_side_grab_half_rate() -> None:
         assert "narrow_div=8" in last.note
         assert "main_div=1" in last.note
 
-        # Forwards never poll even if stream_raw is missing.
+        # Main never polls. Wide/narrow poll and do not stream_raw.
         class NoStream:
             is_streaming = True
             resolution = (8, 8)
 
             def poll(self):
-                raise AssertionError("forward cam must not poll()")
+                raise AssertionError("main must not poll()")
 
         assert read_camera_colour(NoStream(), cid="main", resolution=(8, 8)) is None
         assert "main" in FORWARD_CAM_IDS
+
+        class WidePoll:
+            is_streaming = True
+            resolution = (8, 8)
+
+            def stream_raw(self):
+                raise AssertionError("wide must not stream_raw")
+
+            def poll(self):
+                return {"colour": np.zeros((8, 8, 3), dtype=np.uint8)}
+
+        assert read_camera_colour(WidePoll(), cid="wide", resolution=(8, 8)) is not None
+        assert read_camera_colour(WidePoll(), cid="narrow", resolution=(8, 8)) is not None
 
         # failed stream_raw → STALE. A scheduled skip above stayed OK.
         class FailRaw:
@@ -910,7 +946,7 @@ def check_beamngpy_side_grab_half_rate() -> None:
                 return None
 
             def poll(self):
-                raise AssertionError("forward cam must not poll()")
+                raise AssertionError("main must not poll()")
 
         be._sensors["main"] = FailRaw()
         failed = be.grab()

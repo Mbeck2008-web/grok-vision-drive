@@ -218,6 +218,9 @@ def check_source_contracts(lua: str) -> None:
     write_fn = _fn(lua, "writeText")
     write_exec = re.sub(r"--[^\n]*", "", write_fn)
     assert "FS:writeFile" not in write_exec, "Tech 0.39.4 lua_bus write must not call FS:writeFile"
+    assert "ret ~= false" not in write_exec, "nil must fall through; only a truthy return is success"
+    assert "if ok and ret then return true end" in write_exec
+    assert "if okW and wrote then return true end" in write_exec
     assert "writeFile" in write_exec, "global writeFile is the Tech VFS writer"
     assert "jsonWriteFile" in write_exec
     assert "io.open" in write_exec, "relative Documents/GVD io.open is the last fallback"

@@ -199,27 +199,25 @@ local function writeText(path, data)
   if parent and FS and FS.directoryCreate then
     pcall(function() FS:directoryCreate(parent, true) end)
   end
-  -- Tech 0.39.4 VFS writer. A throw or an explicit false tries the next API.
+  -- Tech 0.39.4 VFS writer. Only a truthy return is success. nil, false, or
+  -- a throw tries the next API.
   if type(writeFile) == 'function' then
     local ok, ret = pcall(writeFile, raw, data)
-    if ok and ret ~= false then return true end
+    if ok and ret then return true end
   end
   if type(jsonWriteFile) == 'function' and type(jsonDecode) == 'function' then
     local okDec, obj = pcall(jsonDecode, data)
     if okDec and type(obj) == 'table' then
       local ok, ret = pcall(jsonWriteFile, raw, obj)
-      if ok and ret ~= false then return true end
+      if ok and ret then return true end
     end
   end
   if io and io.open then
     local fh = io.open(raw, 'w')
     if fh then
-      local ok = pcall(function()
-        fh:write(data)
-        fh:close()
-      end)
-      if ok then return true end
+      local okW, wrote = pcall(function() return fh:write(data) end)
       pcall(function() fh:close() end)
+      if okW and wrote then return true end
     end
   end
   return false

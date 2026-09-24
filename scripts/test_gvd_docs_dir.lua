@@ -197,6 +197,9 @@ check(wi and we, 'writeText is exported before engage writes')
 local writeSrc = src:sub(wi + 1, we - 1)
 local writeExec = writeSrc:gsub('%-%-[^\n]*', '')
 check(not writeExec:find('FS:writeFile', 1, true), 'lua_bus write path has no FS:writeFile')
+check(not writeExec:find('ret ~= false', 1, true), 'nil is not counted as success')
+check(writeExec:find('if ok and ret then return true end', 1, true), 'writeFile/jsonWriteFile need a truthy return')
+check(writeExec:find('if okW and wrote then return true end', 1, true), 'fh:write needs a truthy return')
 check(writeExec:find('writeFile', 1, true), 'global writeFile is the Tech writer')
 check(writeExec:find('jsonWriteFile', 1, true), 'jsonWriteFile is the second writer')
 check(writeExec:find('io.open', 1, true), 'relative io.open is the last writer')
@@ -295,5 +298,86 @@ check(ioSeen.path == 'Documents/GVD/gvd_link.json' and ioSeen.mode == 'w',
 check(ioSeen.data == linkPayload, 'io.open writes the lua_bus payload')
 check(ioWriter('C:/Abs/Documents/GVD/gvd_link.json', linkPayload) == false,
   'io.open fallback refuses an absolute path')
+
+local function decodeLink(s)
+  local bus = tostring(s):match('"lua_bus"%s*:%s*"([^"]*)"')
+  if not bus then return nil end
+  return { lua_bus = bus }
+end
+
+local nilSeen = {}
+local nilWriter = loadWriter({
+  writeFile = function() return nil end,
+  jsonDecode = decodeLink,
+  jsonWriteFile = function(path)
+    nilSeen.path = path
+    return true
+  end,
+  io = { open = function() error('io.open must not run after a nil writeFile fallthrough') end },
+})
+check(nilWriter('Documents/GVD/gvd_link.json', linkPayload) == true, 'nil writeFile falls through to jsonWriteFile')
+check(nilSeen.path == 'Documents/GVD/gvd_link.json', 'nil writeFile used the next writer')
+
+local falseSeen = {}
+local falseWriter = loadWriter({
+  writeFile = function() return false end,
+  jsonDecode = decodeLink,
+  jsonWriteFile = function() return false end,
+  io = {
+    open = function(path)
+      falseSeen.path = path
+      return {
+        write = function(_, data) falseSeen.data = data return true end,
+        close = function() end,
+      }
+    end,
+  },
+})
+check(falseWriter('Documents/GVD/gvd_link.json', linkPayload) == true, 'false writeFile/jsonWriteFile fall through to io.open')
+check(falseSeen.path == 'Documents/GVD/gvd_link.json', 'false returns reached relative io.open')
+check(falseSeen.data == linkPayload, 'false fallthrough still writes the lua_bus payload')
+
+local bytesWriter = loadWriter({
+  writeFile = function() return 12 end,
+  jsonWriteFile = function() error('jsonWriteFile must not run on a truthy byte count') end,
+  io = { open = function() error('io.open must not run on a truthy byte count') end },
+})
+check(bytesWriter('Documents/GVD/gvd_link.json', linkPayload) == true, 'non-empty writeFile return is success')
+
+local fhNil = loadWriter({
+  io = {
+    open = function()
+      return {
+        write = function() return nil end,
+        close = function() end,
+      }
+    end,
+  },
+})
+check(fhNil('Documents/GVD/gvd_link.json', linkPayload) == false, 'nil fh:write is not success')
+
+local fhFalse = loadWriter({
+  io = {
+    open = function()
+      return {
+        write = function() return false end,
+        close = function() end,
+      }
+    end,
+  },
+})
+check(fhFalse('Documents/GVD/gvd_link.json', linkPayload) == false, 'false fh:write is not success')
+
+local fhThrow = loadWriter({
+  io = {
+    open = function()
+      return {
+        write = function() error('disk full') end,
+        close = function() end,
+      }
+    end,
+  },
+})
+check(fhThrow('Documents/GVD/gvd_link.json', linkPayload) == false, 'throwing fh:write is not success')
 
 print('test_gvd_docs_dir: OK')

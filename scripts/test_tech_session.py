@@ -20,6 +20,7 @@ from python.sensors.cameras import (  # noqa: E402
     LIVE_NARROW_HITCH_AFTER_S,
     NARROW_FAR_LIVE_HITCH_M,
     NARROW_GRAB_DIV,
+    NARROW_GRAB_PHASE,
     ON_DEMAND_UPDATE_S,
     REAR_CAM_IDS,
     REAR_GRAB_DIV,
@@ -140,30 +141,30 @@ def check_tech_yaml() -> None:
     assert int(hitch.get("main_grab_div")) == 1
     assert int(hitch.get("wide_grab_div")) == WIDE_GRAB_DIV
     assert int(hitch.get("narrow_grab_div")) == NARROW_GRAB_DIV
-    assert int(hitch.get("narrow_grab_div")) != 4
-    assert int(hitch.get("narrow_grab_phase")) == 1
+    assert int(hitch.get("narrow_grab_phase")) == NARROW_GRAB_PHASE
     assert int(hitch.get("wide_grab_phase")) == 0
     assert int(hitch.get("side_grab_phase")) == SIDE_GRAB_PHASE
     assert int(hitch.get("rear_grab_phase")) == REAR_GRAB_PHASE
     for cid in ("pillarL", "pillarR", "repeatL", "repeatR"):
         assert float(by_id[cid]["far_m"]) == 100, cid
         assert float(by_id[cid]["requested_update_time"]) < 0, cid
-    assert camera_grab_div("pillarL", hitch) == 2
-    assert camera_grab_div("pillarR", hitch) == 2
-    assert camera_grab_div("repeatL", hitch) == REPEAT_GRAB_DIV == 4
-    assert camera_grab_div("repeatR", hitch) == 4
+    assert camera_grab_div("pillarL", hitch) == SIDE_GRAB_DIV == 8
+    assert camera_grab_div("pillarR", hitch) == 8
+    assert camera_grab_div("repeatL", hitch) == REPEAT_GRAB_DIV == 8
+    assert camera_grab_div("repeatR", hitch) == 8
     assert float(by_id["rear"]["far_m"]) == 100
     assert float(by_id["rear"]["requested_update_time"]) < 0
-    assert camera_grab_div("rear", hitch) == 4
+    assert camera_grab_div("rear", hitch) == REAR_GRAB_DIV == 8
     assert abs(float(by_id["main"]["requested_update_time"]) - 0.067) < 1e-9
     assert abs(float(by_id["wide"]["requested_update_time"]) - 0.067) < 1e-9
     assert abs(float(by_id["narrow"]["requested_update_time"]) - 0.067) < 1e-9
     assert camera_grab_div("main", hitch) == 1
-    assert camera_grab_div("wide", hitch) == 2
-    assert camera_grab_div("narrow", hitch) == 2
+    assert camera_grab_div("wide", hitch) == WIDE_GRAB_DIV == 4
+    assert camera_grab_div("narrow", hitch) == NARROW_GRAB_DIV == 8
     assert camera_grab_phase("wide", hitch) == 0
-    assert camera_grab_phase("narrow", hitch) == 1
+    assert camera_grab_phase("narrow", hitch) == NARROW_GRAB_PHASE == 2
     assert camera_grab_phase("pillarL", hitch) == SIDE_GRAB_PHASE
+    assert camera_grab_phase("pillarR", hitch) == (SIDE_GRAB_PHASE + 2) % SIDE_GRAB_DIV
     assert camera_grab_phase("rear", hitch) == REAR_GRAB_PHASE
     assert abs(float(by_id["main"].get("update_priority", 0)) - 0.0) < 1e-9
     assert float(by_id["narrow"].get("update_priority", 0)) > float(by_id["main"].get("update_priority", 0))
@@ -459,56 +460,66 @@ def check_camera_clip_planes() -> None:
     assert camera_grab_div("main") == 1
     assert camera_grab_div("main", {"main_grab_div": 4}) == 1  # clamped every-tick
     assert camera_grab_div("main", {"main_grab_div": 2}) == 1
-    assert camera_grab_div("wide") == 2
-    assert camera_grab_div("narrow") == 2
-    assert camera_grab_div("narrow", {"narrow_grab_div": 4}) == 3  # never ÷4
+    assert camera_grab_div("wide") == WIDE_GRAB_DIV == 4
+    assert camera_grab_div("narrow") == NARROW_GRAB_DIV == 8
+    assert camera_grab_div("narrow", {"narrow_grab_div": 8}) == 8
+    assert camera_grab_div("narrow", {"narrow_grab_div": 4}) == 4
     assert camera_grab_div("narrow", {"narrow_grab_div": 3}) == 3
-    assert camera_grab_div("pillarL") == 2
-    assert camera_grab_div("repeatL") == REPEAT_GRAB_DIV == 4
-    assert camera_grab_div("rear") == 4
-    assert camera_grab_div("rear", {"rear_grab_div": 4, "side_grab_div": 2}) == 4
+    assert camera_grab_div("narrow", {"narrow_grab_div": 1}) == 2  # floor ÷2
+    assert camera_grab_div("pillarL") == SIDE_GRAB_DIV == 8
+    assert camera_grab_div("repeatL") == REPEAT_GRAB_DIV == 8
+    assert camera_grab_div("rear") == REAR_GRAB_DIV == 8
+    assert camera_grab_div("rear", {"rear_grab_div": 8, "side_grab_div": 8}) == 8
     assert grab_due(0, 2, 0) and not grab_due(1, 2, 0)
     assert grab_due(1, 2, 1) and not grab_due(0, 2, 1)
     hitch = load_camera_config().get("hitch") or {}
+    wheel = {
+        0: {"main", "wide"},
+        1: {"main", "pillarL"},
+        2: {"main", "narrow"},
+        3: {"main", "pillarR"},
+        4: {"main", "wide"},
+        5: {"main", "repeatL"},
+        6: {"main", "rear"},
+        7: {"main", "repeatR"},
+    }
+    forbidden = {"narrow", "main", "pillarL", "pillarR"}
     for i in range(32):
         assert not (
             camera_grab_due("wide", i, hitch) and camera_grab_due("narrow", i, hitch)
         ), i
         assert camera_grab_due("main", i, hitch)
-        if i % 2 == 0:
-            assert camera_grab_due("wide", i, hitch)
-            assert not camera_grab_due("narrow", i, hitch)
-        else:
-            assert camera_grab_due("narrow", i, hitch)
-            assert not camera_grab_due("wide", i, hitch)
         side_rear = [
             cid
             for cid in (*SIDE_CAM_IDS, *REAR_CAM_IDS)
             if camera_grab_due(cid, i, hitch)
         ]
         reads = [cid for cid in CAM_IDS if camera_grab_due(cid, i, hitch)]
-        assert len(side_rear) <= 2, (i, side_rear)
-        assert len(reads) <= 4, (i, reads)
+        assert len(side_rear) <= 1, (i, side_rear)
+        assert len(reads) <= 2, (i, reads)
+        assert not forbidden.issubset(set(reads)), (i, reads)
+        assert set(reads) == wheel[i % 8], (i, reads)
         if camera_grab_due("rear", i, hitch):
             sides_on_rear = [cid for cid in side_rear if cid in SIDE_CAM_IDS]
-            assert len(sides_on_rear) <= 1, (i, sides_on_rear)
+            assert sides_on_rear == [], (i, sides_on_rear)
         if camera_grab_due("narrow", i, hitch):
-            assert side_rear == ["pillarL", "pillarR"] or set(side_rear) == {"pillarL", "pillarR"}
+            assert side_rear == []
             assert "rear" not in side_rear
-    for cid in ("pillarL", "pillarR"):
-        hits = [i for i in range(8) if camera_grab_due(cid, i, hitch)]
-        assert hits == [1, 3, 5, 7], (cid, hits)
-    assert [i for i in range(8) if camera_grab_due("repeatL", i, hitch)] == [0, 4]
-    assert [i for i in range(8) if camera_grab_due("repeatR", i, hitch)] == [2, 6]
+    assert [i for i in range(8) if camera_grab_due("pillarL", i, hitch)] == [1]
+    assert [i for i in range(8) if camera_grab_due("pillarR", i, hitch)] == [3]
+    assert [i for i in range(8) if camera_grab_due("repeatL", i, hitch)] == [5]
+    assert [i for i in range(8) if camera_grab_due("repeatR", i, hitch)] == [7]
     rear_hits = [i for i in range(8) if camera_grab_due("rear", i, hitch)]
-    assert rear_hits == [2, 6], rear_hits
+    assert rear_hits == [6], rear_hits
     for i in rear_hits:
         sides = [cid for cid in SIDE_CAM_IDS if camera_grab_due(cid, i, hitch)]
-        assert sides == ["repeatR"], (i, sides)
+        assert sides == [], (i, sides)
     assert camera_grab_phase("pillarL", hitch) == SIDE_GRAB_PHASE
+    assert camera_grab_phase("pillarR", hitch) == 3
     assert camera_grab_phase("repeatL", hitch) == REPEAT_GRAB_PHASE
-    assert camera_grab_phase("repeatR", hitch) == REAR_GRAB_PHASE
+    assert camera_grab_phase("repeatR", hitch) == (REPEAT_GRAB_PHASE + 2) % REPEAT_GRAB_DIV
     assert camera_grab_due("main", 0, hitch) and camera_grab_due("wide", 0, hitch)
+    assert not camera_grab_due("narrow", 0, hitch)
     hitch3 = dict(hitch)
     hitch3["narrow_grab_div"] = 3
     n3 = 0
@@ -519,7 +530,8 @@ def check_camera_clip_planes() -> None:
         if n:
             n3 += 1
             assert not w
-    assert n3 == 8  # 2 per 6 ticks = ÷3, misses wide even
+    # phase 2 ÷3 collides with wide ÷4 on ticks 8 and 20; the wide guard drops those.
+    assert n3 == 6
     assert CAMERA_HZ_TARGET == 10.0
     assert invert_update_priority(0.0) == 1.0
     assert live_narrow_far_m(4.0, 800.0, elapsed_s=0.0, unique_n=10) == 800.0  # warmup
@@ -670,10 +682,10 @@ def check_beamngpy_open_passes_near_far() -> None:
         assert "hitch steps pillarL:" in log
         assert "not resolution" in log
         assert "grab_div main=1" in log
-        assert "wide=2" in log
-        assert "narrow=2" in log
+        assert "wide=4" in log
+        assert "narrow=8" in log
         assert "stream_raw forwards" in log
-        assert "rear=4" in log
+        assert "rear=8" in log
         assert "depth/semantic OFF" in log
         names = [n for n, _ in captured]
         assert names == [f"gvd_{c}" for c in CAM_IDS], names
@@ -702,11 +714,11 @@ def check_beamngpy_open_passes_near_far() -> None:
         assert be._clip_planes["narrow"] == (0.05, 800.0)
         assert be._clip_planes["main"] == (0.05, 300.0)
         assert be._update_s["rear"] == ON_DEMAND_UPDATE_S
-        assert be._side_grab_div == 2
-        assert be._rear_grab_div == 4
+        assert be._side_grab_div == 8
+        assert be._rear_grab_div == 8
         assert be._grab_div["main"] == 1
-        assert be._grab_div["wide"] == 2
-        assert be._grab_div["narrow"] == 2
+        assert be._grab_div["wide"] == 4
+        assert be._grab_div["narrow"] == 8
         hitch_by = {cid: (near, far, rate) for cid, near, far, rate in be._hitch_steps}
         assert hitch_by["narrow"] == (0.05, 800.0, 0.067)
         assert hitch_by["main"] == (0.05, 300.0, 0.067)
@@ -734,7 +746,7 @@ def check_beamngpy_open_passes_near_far() -> None:
 
 
 def check_beamngpy_side_grab_half_rate() -> None:
-    """main÷1 stream_raw; wide÷2 phase0; narrow÷2 phase1; sides spread ÷2; rear poll÷4 phase 2."""
+    """main÷1 stream_raw plus one companion. ≤2 colour reads per grab tick."""
     import sys
     import types
 
@@ -807,6 +819,16 @@ def check_beamngpy_side_grab_half_rate() -> None:
         assert priority_highest_is_zero(be._sensors["main"], 0.0)
         n = 8
         last = None
+        wheel = {
+            0: {"main", "wide"},
+            1: {"main", "pillarL"},
+            2: {"main", "narrow"},
+            3: {"main", "pillarR"},
+            4: {"main", "wide"},
+            5: {"main", "repeatL"},
+            6: {"main", "rear"},
+            7: {"main", "repeatR"},
+        }
         for i in range(n):
             s0 = dict(streams)
             p0 = dict(polls)
@@ -815,24 +837,23 @@ def check_beamngpy_side_grab_half_rate() -> None:
             streamed = [cid for cid in ("main", "wide", "narrow") if streams[f"gvd_{cid}"] > s0.get(f"gvd_{cid}", 0)]
             assert not ("wide" in streamed and "narrow" in streamed), (i, streamed)
             if i == 0:
-                assert streamed == ["main", "wide"] or set(streamed) == {"main", "wide"}
+                assert set(streamed) == {"main", "wide"}
                 for cid in SIDE_CAM_IDS | REAR_CAM_IDS:
                     due = camera_grab_due(cid, 0, be._hitch)
                     assert (polls[f"gvd_{cid}"] == 1) == due, (cid, due, polls[f"gvd_{cid}"])
                 assert bundle.health["narrow"] == CamHealth.MISSING  # not read yet
                 assert bundle.health["narrow"] != CamHealth.STALE
-            if i % 2 == 0:
-                assert "wide" in streamed and "narrow" not in streamed
-            else:
-                assert "narrow" in streamed and "wide" not in streamed
             polled = [
                 cid
                 for cid in SIDE_CAM_IDS | REAR_CAM_IDS
                 if polls[f"gvd_{cid}"] > p0.get(f"gvd_{cid}", 0)
             ]
-            assert len(polled) <= 2, (i, polled)
+            colour = set(streamed) | set(polled)
+            assert len(colour) <= 2, (i, colour)
+            assert colour == wheel[i], (i, colour)
+            assert not {"narrow", "main", "pillarL", "pillarR"}.issubset(colour), (i, colour)
             if camera_grab_due("rear", i, be._hitch):
-                assert len([cid for cid in polled if cid in SIDE_CAM_IDS]) <= 1, (i, polled)
+                assert [cid for cid in polled if cid in SIDE_CAM_IDS] == [], (i, polled)
             for cid in CAM_IDS:
                 assert bundle.health[cid] != CamHealth.STALE, (i, cid, bundle.health[cid])
         assert last is not None
@@ -851,22 +872,22 @@ def check_beamngpy_side_grab_half_rate() -> None:
         assert polls["gvd_main"] == 0
         assert polls["gvd_wide"] == 0
         assert polls["gvd_narrow"] == 0
-        assert streams["gvd_wide"] == n // 2
-        assert streams["gvd_narrow"] == n // 2
+        assert streams["gvd_wide"] == n // WIDE_GRAB_DIV
+        assert streams["gvd_narrow"] == n // NARROW_GRAB_DIV
         for cid in ("pillarL", "pillarR"):
-            assert polls[f"gvd_{cid}"] == n // 2, (cid, polls[f"gvd_{cid}"])
+            assert polls[f"gvd_{cid}"] == n // SIDE_GRAB_DIV, (cid, polls[f"gvd_{cid}"])
             assert streams[f"gvd_{cid}"] == 0, cid
         for cid in ("repeatL", "repeatR"):
-            assert polls[f"gvd_{cid}"] == n // 4, (cid, polls[f"gvd_{cid}"])
+            assert polls[f"gvd_{cid}"] == n // REPEAT_GRAB_DIV, (cid, polls[f"gvd_{cid}"])
             assert streams[f"gvd_{cid}"] == 0, cid
         for cid in REAR_CAM_IDS:
-            assert polls[f"gvd_{cid}"] == n // 4, (cid, polls[f"gvd_{cid}"])
+            assert polls[f"gvd_{cid}"] == n // REAR_GRAB_DIV, (cid, polls[f"gvd_{cid}"])
             assert streams[f"gvd_{cid}"] == 0, cid
         assert be._clip_planes["narrow"][1] > be._clip_planes["main"][1]
-        assert "rear_div=4" in last.note
-        assert "side_div=2" in last.note
-        assert "wide_div=2" in last.note
-        assert "narrow_div=2" in last.note
+        assert "rear_div=8" in last.note
+        assert "side_div=8" in last.note
+        assert "wide_div=4" in last.note
+        assert "narrow_div=8" in last.note
         assert "main_div=1" in last.note
 
         # Forwards never poll even if stream_raw is missing.

@@ -6,13 +6,16 @@
 #
 # BeamNGpy Camera defaults near_far_planes=(0.05, 100) m (BeamNGpy#199). GVD always passes
 # an explicit (near_m, far_m) + requested_update_time from this file. near is 0.05 on every cam.
-# Locked far_m (narrow > main; never both-800). Grab stagger is Python-side (not resolution):
-#   main:   every tick (÷1)
-#   wide:   every 2nd tick (÷2, phase 0)
-#   narrow: every 2nd tick (÷2 start, phase 1; ÷2–3 allowed, never ÷4)
-#   pillars: every 2nd, phase 1 (with narrow; both, not four sides)
-#   repeats: every 4th; repeatL phase 0, repeatR on the rear slot (one side)
-#   rear: every 4th, phase 2 (one repeater, never both pillars)
+# Locked far_m (narrow > main; never both-800). Grab stagger is Python-side (not resolution).
+# Every grab is main plus at most one companion (≤2 colour reads):
+#   main:    every tick (÷1)
+#   wide:    ÷4 phase 0 (ticks 0 and 4)
+#   pillarL: ÷8 phase 1
+#   narrow:  ÷8 phase 2 (never shares a tick with wide)
+#   pillarR: ÷8 phase 3
+#   repeatL: ÷8 phase 5
+#   rear:    ÷8 phase 6 (no side on this slot)
+#   repeatR: ÷8 phase 7
 # Far / GPU (stream_raw on forwards; never is_streaming=False):
 #   narrow: 800 @ 0.067  priority 0.5   (next far hitch 400 only if live unique-frame Hz <10)
 #   main:   300 @ 0.067  priority 0.0
@@ -24,16 +27,16 @@ origin_offset: [0.0, 0.0, 0.0]
 near_m: 0.05
 hitch:
   main_grab_div: 1
-  wide_grab_div: 2
-  wide_grab_phase: 0
-  narrow_grab_div: 2     # start ÷2 (÷2–3); not ÷4
-  narrow_grab_phase: 1   # offset vs wide so they do not share a tick
-  side_grab_div: 2
-  side_grab_phase: 1     # both pillars with narrow
-  repeat_grab_div: 4     # ÷2 would put two repeats on every rear tick
-  repeat_grab_phase: 0   # repeatL; repeatR steps +2 onto the rear slot
-  rear_grab_div: 4
-  rear_grab_phase: 2     # one repeater only
+  wide_grab_div: 4
+  wide_grab_phase: 0     # ticks 0 and 4 with main
+  narrow_grab_div: 8
+  narrow_grab_phase: 2   # own slot; never the wide tick or a pillar tick
+  side_grab_div: 8
+  side_grab_phase: 1     # pillarL; pillarR steps +2
+  repeat_grab_div: 8
+  repeat_grab_phase: 5   # repeatL; repeatR steps +2
+  rear_grab_div: 8
+  rear_grab_phase: 6     # main+rear; no side companion
 # OpenCV cabin only. Does not set BeamNGpy clip planes or the hitch ladder.
 # auto = that camera's far_m after hitch (state main_far_m / rear_far_m when set).
 viz:

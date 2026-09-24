@@ -30,17 +30,21 @@ ON_DEMAND_UPDATE_S = -1.0  # no auto GPU update; ad-hoc poll only (sides/rear)
 SIDE_UPDATE_S = ON_DEMAND_UPDATE_S
 REAR_UPDATE_S = ON_DEMAND_UPDATE_S
 MAIN_GRAB_DIV = 1
-WIDE_GRAB_DIV = 2
-NARROW_GRAB_DIV = 2  # start ÷2 (allowed 2–3; never ÷4)
-NARROW_GRAB_PHASE = 1  # offset vs wide so they do not share a tick
+# 8-tick wheel: main every tick, exactly one companion. ≤2 colour reads / grab.
+#   0 main+wide, 1 main+pillarL, 2 main+narrow, 3 main+pillarR,
+#   4 main+wide, 5 main+repeatL, 6 main+rear, 7 main+repeatR.
+WIDE_GRAB_DIV = 4
+NARROW_GRAB_DIV = 8
+NARROW_GRAB_PHASE = 2  # misses wide (phase 0) and both pillar slots
 WIDE_GRAB_PHASE = 0
-SIDE_GRAB_DIV = 2  # pillars every other grab, both on the narrow tick
-SIDE_GRAB_PHASE = 1  # odd ticks with narrow; not on the rear tick
-REPEAT_GRAB_DIV = 4  # ÷2 would fill both parities and pile onto rear
-REPEAT_GRAB_PHASE = 0  # repeatL; repeatR steps +2 onto the rear slot
-REAR_GRAB_DIV = 4  # poll rear every Nth grab; never drop resolution
-REAR_GRAB_PHASE = 2  # one repeater only; not both pillars
+SIDE_GRAB_DIV = 8  # each pillar once per wheel
+SIDE_GRAB_PHASE = 1  # pillarL; pillarR steps +2 onto phase 3
+REPEAT_GRAB_DIV = 8
+REPEAT_GRAB_PHASE = 5  # repeatL; repeatR steps +2 onto phase 7
+REAR_GRAB_DIV = 8  # poll rear once per wheel; never drop resolution
+REAR_GRAB_PHASE = 6  # main+rear only; no side on this slot
 REPEAT_SPREAD_ORDER = ("repeatL", "repeatR")
+PILLAR_SPREAD_ORDER = ("pillarL", "pillarR")
 NARROW_FAR_LIVE_HITCH_M = 400.0  # live unique-frame Hz hitch (800→400 if still <10)
 CAMERA_HZ_TARGET = 10.0
 LIVE_NARROW_HITCH_AFTER_S = 2.0
@@ -317,7 +321,10 @@ def _nonneg_int(v: Any, default: int) -> int:
 
 
 def camera_grab_div(cid: str, hitch: dict[str, Any] | None = None) -> int:
-    """Python grab divisor. main÷1, wide÷2, narrow÷2 (2–3), pillars÷2, repeats÷4, rear÷4."""
+    """Python grab divisor. main÷1; one companion per tick on an 8-tick wheel.
+
+    wide÷4, narrow÷8 (floor ÷2), pillars÷8, repeats÷8, rear÷8.
+    """
     hitch = hitch if isinstance(hitch, dict) else {}
     if cid == "main":
         return MAIN_GRAB_DIV  # every-tick; hitch yaml cannot raise this
@@ -325,7 +332,7 @@ def camera_grab_div(cid: str, hitch: dict[str, Any] | None = None) -> int:
         return _positive_div(hitch.get("wide_grab_div"), WIDE_GRAB_DIV)
     if cid == "narrow":
         n = _positive_div(hitch.get("narrow_grab_div"), NARROW_GRAB_DIV)
-        return min(3, max(2, n))  # ÷2–3 start; never ÷4
+        return max(2, n)  # floor ÷2 so narrow can still miss a wide tick
     if cid in REAR_CAM_IDS:
         return _positive_div(hitch.get("rear_grab_div"), REAR_GRAB_DIV)
     if cid in REPEAT_CAM_IDS:
@@ -336,10 +343,10 @@ def camera_grab_div(cid: str, hitch: dict[str, Any] | None = None) -> int:
 
 
 def camera_grab_phase(cid: str, hitch: dict[str, Any] | None = None) -> int:
-    """Phase offset so wide (0) and narrow (1) do not grab the same tick.
+    """Slot on the 8-tick wheel. Wide and narrow never share a tick.
 
-    Both pillars stay on the narrow tick. Repeats are ÷4: repeatL on phase 0,
-    repeatR steps onto the rear slot so a rear tick has one side poll, not two.
+    pillarL is side phase; pillarR steps +2. repeatL is repeat phase; repeatR
+    steps +2. Rear sits on its own slot with no side companion.
     """
     hitch = hitch if isinstance(hitch, dict) else {}
     if cid == "narrow":
@@ -358,7 +365,15 @@ def camera_grab_phase(cid: str, hitch: dict[str, Any] | None = None) -> int:
         except ValueError:
             slot = 0
         return (base + slot * 2) % div
-    if cid in PILLAR_CAM_IDS or cid in SIDE_CAM_IDS:
+    if cid in PILLAR_CAM_IDS:
+        base = _nonneg_int(hitch.get("side_grab_phase"), SIDE_GRAB_PHASE)
+        div = max(1, camera_grab_div(cid, hitch))
+        try:
+            slot = PILLAR_SPREAD_ORDER.index(cid)
+        except ValueError:
+            slot = 0
+        return (base + slot * 2) % div
+    if cid in SIDE_CAM_IDS:
         return _nonneg_int(hitch.get("side_grab_phase"), SIDE_GRAB_PHASE)
     return 0
 
@@ -375,12 +390,6 @@ def camera_grab_due(cid: str, grab_i: int, hitch: dict[str, Any] | None = None) 
     div = camera_grab_div(cid, hitch)
     phase = camera_grab_phase(cid, hitch)
     gi = int(grab_i)
-    if cid == "narrow" and div >= 3:
-        # ÷3 rate that misses every wide÷2 tick: two residues per 6, opposite wide parity.
-        wide_parity = int(camera_grab_phase("wide", hitch)) % 2
-        if (gi % 2) == wide_parity:
-            return False
-        return (gi % 3) != 0
     if not grab_due(gi, div, phase):
         return False
     if cid == "narrow":
@@ -1397,9 +1406,9 @@ class BeamNGPyBackend:
             backend=self.name,
             note=(
                 f"beamngpy: {n_ok} colour frame(s) grab={grab_i} unique={unique_n} "
-                f"main_div={self._grab_div.get('main', 1)} "
-                f"wide_div={self._grab_div.get('wide', 2)} "
-                f"narrow_div={self._grab_div.get('narrow', 2)} "
+                f"main_div={self._grab_div.get('main', MAIN_GRAB_DIV)} "
+                f"wide_div={self._grab_div.get('wide', WIDE_GRAB_DIV)} "
+                f"narrow_div={self._grab_div.get('narrow', NARROW_GRAB_DIV)} "
                 f"side_div={self._side_grab_div} "
                 f"repeat_div={self._grab_div.get('repeatL', REPEAT_GRAB_DIV)} "
                 f"rear_div={self._rear_grab_div}"

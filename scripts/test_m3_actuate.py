@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT))
 from python.control.actuate import (
     TECH_DRIVE_GEAR,
     TECH_HOLD_GEAR,
+    TECH_PLAYER_SHIFT_MODE,
     TECH_SHIFT_MODE,
     BeamNGPyActuator,
     CmdJsonActuator,
@@ -140,9 +141,13 @@ def main() -> None:
         def __init__(self) -> None:
             self.calls: list[dict] = []
             self.shifts: list[str] = []
+            self.ai_modes: list[str] = []
 
         def set_shift_mode(self, mode: str) -> None:
             self.shifts.append(mode)
+
+        def ai_set_mode(self, mode: str) -> None:
+            self.ai_modes.append(mode)
 
         def control(self, **kw):
             self.calls.append(kw)
@@ -166,7 +171,10 @@ def main() -> None:
     tech = BeamNGPyActuator(veh)
     tech.note_engaged(False)
     idle = tech.stop(seq=1, reason="not_engaged")
-    assert idle.applied is False and veh.calls == [], veh.calls
+    assert idle.applied is False and idle.throttle == 0.0 and idle.brake == 0.0 and veh.calls == [], veh.calls
+    # A disengaged tick clears a stale brake:1 cmd bus even before this process latched the car.
+    idle_payload = json.loads(cmd_path().read_text(encoding="utf-8"))
+    assert idle_payload["engaged"] is False and idle_payload["brake"] == 0.0 and idle_payload["throttle"] == 0.0
     tech.note_engaged(True)
     drive = tech.apply(DriveCommand(steer=0.2, throttle=0.4, brake=0.0, seq=2, reason="ok"))
     assert drive.applied is True and veh.calls[-1]["throttle"] == 0.4
@@ -234,11 +242,40 @@ def main() -> None:
     tech.note_engaged(False)
     n = len(veh.calls)
     edge = tech.stop(seq=4, reason="not_engaged")
-    assert edge.applied is False
+    assert edge.applied is False and edge.throttle == 0.0 and edge.brake == 0.0
     assert veh.calls[-1] == {"steering": 0.0, "throttle": 0.0, "brake": 0.0, "parkingbrake": 0.0}
     assert veh.calls[-1].get("gear", 0) != -1
+    assert veh.ai_modes[-1] == "disabled"
+    assert veh.shifts[-1] == TECH_PLAYER_SHIFT_MODE == "arcade"
+    edge_payload = json.loads(cmd_path().read_text(encoding="utf-8"))
+    assert edge_payload["engaged"] is False and edge_payload["brake"] == 0.0 and edge_payload["throttle"] == 0.0
     tech.stop(seq=5, reason="not_engaged")
     assert len(veh.calls) == n + 1, veh.calls  # no further takeover while OFF
+    assert len(veh.ai_modes) == 1
+    quiet = json.loads(cmd_path().read_text(encoding="utf-8"))
+    assert quiet["brake"] == 0.0 and quiet["engaged"] is False and quiet["seq"] == 5
+
+    # Hold left brake=1 on the car; Disengage must zero it and release AI, not leave brake=1.
+    tech.note_engaged(True)
+    held = tech.stop(seq=6, reason="preview_blocked")
+    assert held.applied is True and held.brake == 1.0 and veh.calls[-1]["brake"] == 1.0
+    assert veh.shifts[-1] == TECH_SHIFT_MODE
+    tech.note_engaged(False)
+    n_hold = len(veh.calls)
+    n_ai = len(veh.ai_modes)
+    hand = tech.stop(seq=7, reason="not_engaged")
+    assert hand.applied is False and hand.throttle == 0.0 and hand.brake == 0.0
+    assert veh.calls[-1]["throttle"] == 0.0 and veh.calls[-1]["brake"] == 0.0
+    assert veh.calls[-1]["parkingbrake"] == 0.0
+    assert veh.ai_modes[-1] == "disabled" and len(veh.ai_modes) == n_ai + 1
+    assert veh.shifts[-1] == "arcade"
+    hand_payload = json.loads(cmd_path().read_text(encoding="utf-8"))
+    assert hand_payload["engaged"] is False and hand_payload["brake"] == 0.0 and hand_payload["throttle"] == 0.0
+    tech.stop(seq=8, reason="not_engaged")
+    assert len(veh.calls) == n_hold + 1
+    assert len(veh.ai_modes) == n_ai + 1
+    again = json.loads(cmd_path().read_text(encoding="utf-8"))
+    assert again["brake"] == 0.0 and again["throttle"] == 0.0 and again["engaged"] is False
 
     for kw in veh.calls + moving.calls + ng.calls:
         _assert_no_reverse(kw)

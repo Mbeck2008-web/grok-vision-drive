@@ -35,6 +35,8 @@ ENGAGE_FRESH_S = 2.5
 # Use realistic_automatic so brake-hold is not reverse throttle. Gear is int only
 # (-1 R, 0 N, 1+ forward) — never gear=-1, never letter "D".
 TECH_SHIFT_MODE = "realistic_automatic"
+# Player arrows/pedals expect arcade. Restored only on the Disengage handoff.
+TECH_PLAYER_SHIFT_MODE = "arcade"
 TECH_HOLD_BRAKE = 0.99
 # Below this, a full brake is a rest hold (parkingbrake on). Rolling AEB keeps PB off.
 TECH_HOLD_SPEED_MPS = 0.5
@@ -220,6 +222,11 @@ def may_drive(
 
 def stop_command(seq: int = 0, reason: str = "stop") -> DriveCommand:
     return DriveCommand(steer=0.0, throttle=0.0, brake=1.0, seq=seq, applied=False, reason=reason)
+
+
+def release_command(seq: int = 0, reason: str = "not_engaged") -> DriveCommand:
+    """Disengage handoff: pedals at rest. Engaged holds still use stop_command (brake=1)."""
+    return DriveCommand(steer=0.0, throttle=0.0, brake=0.0, seq=seq, applied=False, reason=reason)
 
 
 def _clip01(v: float) -> float:
@@ -503,10 +510,13 @@ class BeamNGPyActuator:
     """Tech drive: vehicle.control only while engaged.
 
     Disengaged ticks must not slam brake=1 (that is takeover). On the falling
-    edge we send zeros once (including parkingbrake) so the last throttle does
-    not stick, then hands off. Engaged gate holds (preview_blocked, AEB, veto)
-    still apply the stop command, remapped off reverse: realistic_automatic,
-    hold gear=0 + brake ±parkingbrake, drive gear>=1, never gear=-1.
+    edge, once, we zero throttle/brake/parkingbrake, set AI mode to disabled,
+    restore arcade shift, and rewrite gvd_cmd.json to brake=0 / engaged=false
+    so a stale brake:1 file cannot keep the pedals. Later disengaged ticks
+    refresh that file and do not call vehicle.control. Engaged gate holds
+    (preview_blocked, AEB, veto) still apply the stop command, remapped off
+    reverse: realistic_automatic, hold gear=0 + brake ±parkingbrake, drive
+    gear>=1, never gear=-1.
     """
 
     name = "beamngpy"
@@ -519,6 +529,52 @@ class BeamNGPyActuator:
 
     def note_engaged(self, engaged: bool) -> None:
         self.engaged = bool(engaged)
+
+    def _write_release_cmd(self, seq: int, reason: str) -> None:
+        """gvd_cmd must not keep brake=1 after Disengage. Lua applies only engaged:true."""
+        payload = {
+            "steer": 0.0,
+            "throttle": 0.0,
+            "brake": 0.0,
+            "seq": int(seq),
+            "engaged": False,
+            "heartbeat_mtime": time.time(),
+            "reason": str(reason),
+        }
+        atomic_write_json(cmd_path(), payload, indent=None)
+
+    def _release_ai(self) -> None:
+        """Drop BeamNG AI so keyboard arrows and pedals own the car again."""
+        veh = self.vehicle
+        if veh is None:
+            return
+        fn = getattr(veh, "ai_set_mode", None)
+        if not callable(fn):
+            ai = getattr(veh, "ai", None)
+            fn = getattr(ai, "set_mode", None) if ai is not None else None
+        if callable(fn):
+            try:
+                fn("disabled")
+                return
+            except Exception:
+                pass
+        q = getattr(veh, "queue_lua_command", None)
+        if callable(q):
+            try:
+                q("if ai and ai.setMode then ai.setMode('disabled') end")
+            except Exception:
+                pass
+
+    def _restore_player_shift(self) -> None:
+        """Arcade is what player arrows drive. Next Engage re-arms realistic_automatic."""
+        veh = self.vehicle
+        self._shift_set = False
+        if veh is None or not hasattr(veh, "set_shift_mode"):
+            return
+        try:
+            veh.set_shift_mode(TECH_PLAYER_SHIFT_MODE)
+        except Exception:
+            pass
 
     def _invoke_control(self, kwargs: dict[str, Any]) -> None:
         """Send control kwargs. Never fall back to arcade brake-hold (no gear, brake=1)."""
@@ -582,14 +638,20 @@ class BeamNGPyActuator:
         return cmd
 
     def stop(self, seq: int = 0, reason: str = "stop") -> DriveCommand:
-        cmd = stop_command(seq=seq, reason=reason)
         if not self.engaged:
+            # Handoff, not a brake hold. ego.brake must not stay at 1, and the
+            # cmd bus must not keep a stale brake:1 while engaged is false.
+            cmd = release_command(seq=seq, reason=reason)
+            self._write_release_cmd(seq, reason)
             if self._latched:
-                self._control(0.0, 0.0, 0.0, release=True)
-                self._latched = False
+                err = self._control(0.0, 0.0, 0.0, release=True)
+                if err is None or err == "no_vehicle":
+                    self._release_ai()
+                    self._restore_player_shift()
+                    self._latched = False
             cmd.applied = False
             return cmd
-        return self.apply(cmd)
+        return self.apply(stop_command(seq=seq, reason=reason))
 
 
 class CmdJsonActuator:

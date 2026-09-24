@@ -85,8 +85,9 @@ end
 
 
 
--- Lua bus reads/writes are userfolder-relative Documents/GVD via VFS / FS:readFile
--- (and FS:writeFile). Tech GELua cannot io.open absolute LOCALAPPDATA paths.
+-- Lua bus reads are userfolder-relative Documents/GVD via VFS readFile / FS:readFile.
+-- Lua bus writes on Tech 0.39.4: global writeFile, then jsonWriteFile, then a
+-- relative Documents/GVD io.open. Absolute LOCALAPPDATA io.open is refused.
 -- Python still writes the product sandbox (dual-path #40):
 --   Tech:  %LOCALAPPDATA%/BeamNG/BeamNG.tech/current/Documents/GVD
 --   Drive: %LOCALAPPDATA%/BeamNG/BeamNG.drive/current/Documents/GVD
@@ -189,15 +190,37 @@ local function busesSame(pythonBus, luaBus)
 end
 
 local function writeText(path, data)
-  if not path then return false end
-  -- Ensure parent Documents/GVD exists when FS can
-  local parent = tostring(path):match('^(.+)/[^/]+$')
+  if not path or data == nil then return false end
+  local raw = tostring(path):gsub('\\', '/')
+  -- Relative dir only (Documents/GVD/…). A bare name would land in cwd.
+  -- An absolute LOCALAPPDATA path is refused.
+  if _isAbsDiskPath(raw) or not raw:find('/', 1, true) then return false end
+  local parent = raw:match('^(.+)/[^/]+$')
   if parent and FS and FS.directoryCreate then
     pcall(function() FS:directoryCreate(parent, true) end)
   end
-  if FS and FS.writeFile then
-    local ok = pcall(function() FS:writeFile(path, data) end)
-    if ok then return true end
+  -- Tech 0.39.4 VFS writer. A throw or an explicit false tries the next API.
+  if type(writeFile) == 'function' then
+    local ok, ret = pcall(writeFile, raw, data)
+    if ok and ret ~= false then return true end
+  end
+  if type(jsonWriteFile) == 'function' and type(jsonDecode) == 'function' then
+    local okDec, obj = pcall(jsonDecode, data)
+    if okDec and type(obj) == 'table' then
+      local ok, ret = pcall(jsonWriteFile, raw, obj)
+      if ok and ret ~= false then return true end
+    end
+  end
+  if io and io.open then
+    local fh = io.open(raw, 'w')
+    if fh then
+      local ok = pcall(function()
+        fh:write(data)
+        fh:close()
+      end)
+      if ok then return true end
+      pcall(function() fh:close() end)
+    end
   end
   return false
 end

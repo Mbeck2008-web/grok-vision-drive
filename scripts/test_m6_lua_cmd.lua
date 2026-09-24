@@ -58,7 +58,10 @@ FS = {
   directoryCreate = function() end,
   getUserPath = function() return DRIVE_USER end,
 }
-local function writeFile(p, s) vfsBus[busRel(p)] = s end
+function writeFile(p, s)
+  vfsBus[busRel(p)] = s
+  return true
+end
 local function readFileAll(p) return vfsBus[busRel(p)] end
 vfsBus[egoPath] = nil
 vfsBus[statePath] = nil

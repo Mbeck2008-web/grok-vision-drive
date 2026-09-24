@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
 
 from python.control.actuate import (
     attach_electrics,
+    last_electrics_ms,
     make_actuator,
     read_ego_feedback,
     read_electrics_inputs,
@@ -482,6 +483,8 @@ def main() -> None:
             grab_ms = float(getattr(bundle, "grab_ms", 0.0) or 0.0)
             if grab_ms <= 0:
                 grab_ms = (time.perf_counter() - t_grab) * 1000.0
+            grab_phase = int(getattr(bundle, "grab_phase", -1))
+            grab_poll_free = bool(getattr(bundle, "grab_poll_free", True))
             main = bundle.main_bgr()
             unique_gpu_n = int(getattr(bundle, "unique_gpu_n", 0) or 0)
             now = time.perf_counter()
@@ -500,7 +503,15 @@ def main() -> None:
                     vdata = backend.poll_vehicle()
                 except Exception:
                     vdata = None
+            sensors_poll_ms = 0.0
+            poll_gps_ms = 0.0
+            poll_gps_sent = False
+            if vdata is not None:
+                sensors_poll_ms = float(getattr(vdata, "sensors_poll_ms", 0.0) or 0.0)
+                poll_gps_ms = float(getattr(vdata, "poll_gps_ms", 0.0) or 0.0)
+                poll_gps_sent = bool(getattr(vdata, "poll_gps_sent", False))
             el = read_electrics_inputs(vehicle)
+            electrics_ms = last_electrics_ms()
             spd, steer_in = el.speed_mps, el.steering_input
             throttle_in, brake_in = el.throttle_input, el.brake_input
             yaw_rate = 0.0
@@ -794,7 +805,27 @@ def main() -> None:
                 extra_miss.append("radar")
             if extra_miss:
                 st["missing_state_keys"] = sorted(set(st["missing_state_keys"] + extra_miss))
+            st["grab_phase"] = grab_phase
+            st["grab_poll_free"] = grab_poll_free
+            st["sensors_poll_ms"] = sensors_poll_ms
+            st["poll_gps_ms"] = poll_gps_ms
+            st["poll_gps_sent"] = poll_gps_sent
+            st["electrics_ms"] = electrics_ms
             st["heartbeat_ms"] = (time.perf_counter() - loop_t0) * 1000.0
+            # Segment line is outside the stamp. grab_ms on a poll-free phase is
+            # the stream_raw cost; a hitch-phase gap is the companion PollCamera.
+            # heartbeat_ms - grab_ms - infer_ms is the ego-poll tail plus the
+            # rest of the tick before this stamp. camera_hz is unchanged.
+            print(
+                f"[GVD] seg grab_ms={grab_ms:.2f} grab_phase={grab_phase} "
+                f"grab_poll_free={int(grab_poll_free)} "
+                f"heartbeat_ms={st['heartbeat_ms']:.2f} "
+                f"infer_ms={float(pout.infer_ms):.2f} "
+                f"sensors_poll_ms={sensors_poll_ms:.2f} "
+                f"poll_gps_ms={poll_gps_ms:.2f} poll_gps_sent={int(poll_gps_sent)} "
+                f"electrics_ms={electrics_ms:.2f}",
+                flush=True,
+            )
 
             # M4 ring + triggers
             wall = time.time()

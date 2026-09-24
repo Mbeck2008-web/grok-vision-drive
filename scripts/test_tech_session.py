@@ -42,6 +42,9 @@ from python.sensors.cameras import (  # noqa: E402
     colour_to_bgr,
     far_hitch_ladder,
     grab_due,
+    grab_is_poll_free,
+    grab_phase_of,
+    grab_wheel,
     invert_update_priority,
     iter_clip_attach_attempts,
     live_narrow_far_m,
@@ -645,6 +648,15 @@ def check_camera_clip_planes() -> None:
     schema = (ROOT / "docs" / "gvd_state_schema.md").read_text(encoding="utf-8")
     assert "`grab_ms`" in schema
     assert "unique GPU-frame" in schema
+    for key in (
+        "grab_phase",
+        "grab_poll_free",
+        "sensors_poll_ms",
+        "poll_gps_ms",
+        "poll_gps_sent",
+        "electrics_ms",
+    ):
+        assert f"`{key}`" in schema, key
 
 
 def check_beamngpy_open_passes_near_far() -> None:
@@ -859,6 +871,9 @@ def check_beamngpy_side_grab_half_rate() -> None:
             p0 = dict(polls)
             bundle = be.grab()
             last = bundle
+            assert bundle.grab_phase == i
+            assert bundle.grab_poll_free is grab_is_poll_free(i, be._hitch)
+            assert bundle.grab_ms >= 0.0
             streamed = [cid for cid in ("main", "wide", "narrow") if streams[f"gvd_{cid}"] > s0.get(f"gvd_{cid}", 0)]
             assert streamed == ["main"], (i, streamed)
             assert "wide" not in streamed and "narrow" not in streamed
@@ -877,6 +892,7 @@ def check_beamngpy_side_grab_half_rate() -> None:
             assert len(streamed) <= 1
             assert len(colour) <= 2, (i, colour)
             assert colour == wheel[i], (i, colour)
+            assert bundle.grab_poll_free is (colour == {"main"}), (i, colour, bundle.grab_poll_free)
             assert not {"main", "wide"}.issubset(set(streamed))
             assert not ("wide" in polled and "narrow" in polled)
             if camera_grab_due("wide", i, be._hitch):
@@ -1002,6 +1018,99 @@ def check_beamngpy_side_grab_half_rate() -> None:
                 sys.modules.pop(k, None)
             else:
                 sys.modules[k] = v
+
+
+def check_soft_esc_segment_timers() -> None:
+    """Soft Esc Tip #2: phase tag + poll / PollGPSGE timers. Hitch schedule stays put."""
+    import time
+
+    hitch = load_camera_config().get("hitch")
+    assert grab_wheel(hitch) == 16
+    assert grab_wheel(None) == 16
+    hitch_slots = [i for i in range(16) if not grab_is_poll_free(i, hitch)]
+    free_slots = [i for i in range(16) if grab_is_poll_free(i, hitch)]
+    assert hitch_slots == [0, 1, 2, 3, 5, 6, 7], hitch_slots
+    assert free_slots == [4, 8, 9, 10, 11, 12, 13, 14, 15], free_slots
+    for i in range(32):
+        assert grab_phase_of(i, hitch) == i % 16
+        assert grab_is_poll_free(i, None) is grab_is_poll_free(i, hitch)
+
+    from python.sensors.cameras import StubBackend
+
+    stub = StubBackend().grab()
+    assert stub.grab_phase == -1 and stub.grab_poll_free is True
+    assert stub.grab_ms == 0.0
+
+    class Box(dict):
+        def __contains__(self, k):
+            return dict.__contains__(self, k)
+
+        def __iter__(self):
+            return dict.__iter__(self)
+
+    class FakeSensors(Box):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.n = 0
+
+        def poll(self):
+            self.n += 1
+            time.sleep(0.02)
+            return self
+
+    class FakeGPS:
+        def __init__(self) -> None:
+            self.n = 0
+            self.removed = False
+
+        def poll(self):
+            self.n += 1
+            time.sleep(0.02)
+            return [{"time": 1.0, "lon": 8.81, "lat": 53.09, "x": 1.0, "y": 2.0}]
+
+        def remove(self) -> None:
+            self.removed = True
+
+    class FakeVeh:
+        vid = "etk_player"
+        options = {"model": "etk800"}
+        state = {"pos": (0.0, 0.0, 0.0), "dir": (0.0, 1.0, 0.0), "up": (0.0, 0.0, 1.0), "vel": (0.0, 1.0, 0.0)}
+
+        def __init__(self) -> None:
+            self.sensors = FakeSensors(
+                electrics={"wheelspeed": 3.0, "steering_input": 0.0, "throttle_input": 0.0, "brake_input": 0.0}
+            )
+
+    session = TechSession({"wait_vehicle_s": 0, "sensors": {"electrics": True, "gps": True}})
+    veh = FakeVeh()
+    session.vehicle = veh
+    session.attached = {"electrics": True, "gps": True}
+    gps = FakeGPS()
+    session._gps = gps
+    first = session.poll()
+    assert first.sensors_poll_ms >= 10.0, first.sensors_poll_ms
+    assert first.poll_gps_sent is True
+    assert first.poll_gps_ms >= 10.0, first.poll_gps_ms
+    assert gps.n == 1 and veh.sensors.n == 1
+    assert first.lat == 53.09 and first.sensors.get("gps") == "ok"
+    second = session.poll()
+    assert second.poll_gps_sent is False
+    assert second.poll_gps_ms == 0.0
+    assert gps.n == 1  # coalesced; no second PollGPSGE
+    assert veh.sensors.n == 2  # ego sensors.poll still once per tick
+    assert second.sensors_poll_ms >= 10.0
+    assert second.sensors.get("gps") == "stale"
+    assert second.lat == 53.09
+    session.close()
+    assert gps.removed is True
+
+    rv = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
+    for key in ("grab_phase", "grab_poll_free", "sensors_poll_ms", "poll_gps_ms", "electrics_ms"):
+        assert f'st["{key}"]' in rv, key
+    assert "[GVD] seg " in rv
+    assert "camera_hz=cam_hz_ema" in rv
+    assert "unique_frame_hz_inst" in rv
+    assert "loop_hz=args.hz" not in rv
 
 
 def check_nvidia_smi_cache_and_honest_hz() -> None:
@@ -1965,6 +2074,7 @@ def main() -> None:
     check_camera_clip_planes()
     check_beamngpy_open_passes_near_far()
     check_beamngpy_side_grab_half_rate()
+    check_soft_esc_segment_timers()
     check_nvidia_smi_cache_and_honest_hz()
     check_auto_backend_not_tech_without_env()
     check_connect_without_beamngpy()

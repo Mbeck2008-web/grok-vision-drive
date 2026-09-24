@@ -1173,6 +1173,10 @@ class VehicleData:
     bearing_rel_deg: float | None = None
     note: str = ""
     sensors: dict[str, str] = field(default_factory=dict)
+    # Soft Esc segment timers. 0 / False when that call did not run this poll.
+    sensors_poll_ms: float = 0.0
+    poll_gps_ms: float = 0.0
+    poll_gps_sent: bool = False
 
     @property
     def pose_ok(self) -> bool:
@@ -1198,6 +1202,9 @@ class TechSession:
         self._last_gps: tuple[float, float] | None = None
         self._gps_reading: dict[str, Any] | None = None
         self._gps_mono: float | None = None
+        self._sensors_poll_ms = 0.0
+        self._poll_gps_ms = 0.0
+        self._poll_gps_sent = False
         self.note = ""
 
     def connect(self, *, explicit: bool = True) -> bool:
@@ -1669,6 +1676,8 @@ class TechSession:
         GPS does not retry on every grab.
         """
         gps = self._gps
+        self._poll_gps_ms = 0.0
+        self._poll_gps_sent = False
         if gps is None:
             return None, "missing"
         now = time.monotonic()
@@ -1679,12 +1688,18 @@ class TechSession:
             return None, "missing"
         self._gps_mono = now
         reading: dict[str, Any] | None = None
+        sent = hasattr(gps, "poll")
+        t0 = time.perf_counter()
         try:
-            raw = gps.poll() if hasattr(gps, "poll") else None
+            raw = gps.poll() if sent else None
             reading = latest_gps_reading(raw)
         except Exception as e:
             self._log(f"[GVD] GPS poll failed: {e}")
             reading = None
+        finally:
+            if sent:
+                self._poll_gps_ms = (time.perf_counter() - t0) * 1000.0
+                self._poll_gps_sent = True
         if (
             reading is not None
             and _num(reading.get("lat")) is not None
@@ -1697,6 +1712,9 @@ class TechSession:
         return None, "missing"
 
     def poll(self) -> VehicleData:
+        self._sensors_poll_ms = 0.0
+        self._poll_gps_ms = 0.0
+        self._poll_gps_sent = False
         data = VehicleData(
             vid=self._vid(self.vehicle),
             model=self._model(self.vehicle),
@@ -1754,6 +1772,9 @@ class TechSession:
             vx, vy, vz = data.vel
             data.speed_mps = math.sqrt(vx * vx + vy * vy + vz * vz)
         self._fill_nav(data)
+        data.sensors_poll_ms = float(self._sensors_poll_ms)
+        data.poll_gps_ms = float(self._poll_gps_ms)
+        data.poll_gps_sent = bool(self._poll_gps_sent)
         from python.control.actuate import touch_vehicle_sensor_snap
 
         touch_vehicle_sensor_snap(vehicle)
@@ -1801,12 +1822,17 @@ class TechSession:
     def _poll_sensors(self, vehicle: Any) -> dict[str, Any]:
         """One vehicle.sensors.poll. The map is the tick's ego snapshot."""
         out: dict[str, Any] = {}
+        self._sensors_poll_ms = 0.0
         try:
             sensors = getattr(vehicle, "sensors", None)
             if sensors is None:
                 return out
             if hasattr(sensors, "poll"):
-                sensors.poll()
+                t0 = time.perf_counter()
+                try:
+                    sensors.poll()
+                finally:
+                    self._sensors_poll_ms = (time.perf_counter() - t0) * 1000.0
             out = _sensor_map(sensors)
         except Exception:
             return out

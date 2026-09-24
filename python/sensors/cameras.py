@@ -113,6 +113,11 @@ class CameraFrameBundle:
     backend: str = "stub"
     note: str = ""
     grab_ms: float = 0.0
+    # Hitch-wheel slot (grab_i % wheel). -1 when this backend has no wheel.
+    # Locked wheel: hitch slots 0,1,2,3,5,6,7; poll-free slots 4 and 8–15.
+    grab_phase: int = -1
+    # True when this grab did not issue a companion PollCamera (main stream_raw only).
+    grab_poll_free: bool = True
     unique_gpu_n: int = 0  # new GPU frames this tick (not cache / stream_raw re-shows)
     unique_gpu_ids: tuple[str, ...] = ()
 
@@ -397,6 +402,30 @@ def camera_grab_due(cid: str, grab_i: int, hitch: dict[str, Any] | None = None) 
         wdiv = camera_grab_div("wide", hitch)
         wph = camera_grab_phase("wide", hitch)
         if grab_due(gi, wdiv, wph):
+            return False
+    return True
+
+
+def grab_wheel(hitch: dict[str, Any] | None = None) -> int:
+    """Hitch-wheel period. The locked schedule is 16. This does not define camera_hz."""
+    return max(camera_grab_div(cid, hitch) for cid in CAM_IDS)
+
+
+def grab_phase_of(grab_i: int, hitch: dict[str, Any] | None = None) -> int:
+    """Wheel slot for this grab index.
+
+    Locked slots 0, 1, 2, 3, 5, 6, 7 each add one companion PollCamera.
+    Slots 4 and 8–15 are main stream_raw only.
+    """
+    return int(grab_i) % grab_wheel(hitch)
+
+
+def grab_is_poll_free(grab_i: int, hitch: dict[str, Any] | None = None) -> bool:
+    """True when the schedule reads main only (no companion PollCamera)."""
+    for cid in CAM_IDS:
+        if cid == "main":
+            continue
+        if camera_grab_due(cid, grab_i, hitch):
             return False
     return True
 
@@ -1375,11 +1404,15 @@ class BeamNGPyBackend:
         ts = time.time()
         grab_i = self._grab_i
         self._grab_i = grab_i + 1
+        phase = grab_phase_of(grab_i, self._hitch)
+        companion_polled = False
         unique_ids: list[str] = []
         for cid, cam in self._sensors.items():
             if not self._grab_this_tick(cid, grab_i):
                 self._reuse_cached(cid, frames, timestamps, health, failed=False)
                 continue
+            if cid != "main":
+                companion_polled = True
             try:
                 bgr = read_camera_colour(cam, cid=cid, resolution=self._resolution.get(cid))
                 if bgr is None:
@@ -1420,6 +1453,8 @@ class BeamNGPyBackend:
                 f"rear_div={self._rear_grab_div}"
             ),
             grab_ms=grab_ms,
+            grab_phase=phase,
+            grab_poll_free=not companion_polled,
             unique_gpu_n=unique_n,
             unique_gpu_ids=tuple(unique_ids),
         )

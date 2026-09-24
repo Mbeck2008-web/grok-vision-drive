@@ -31,8 +31,16 @@ Lua: `gvd_main.drawPath` on `onPreRender` / `onDebugDraw`. Runs whenever the sup
 | `loop_hz` | float | honest supervisor loop EMA (never clamped to a fake ≥10) |
 | `camera_hz` | float | unique GPU-frame EMA — new frames only, not cache re-shows / `main is not None` |
 | `grab_ms` | float | camera grab wall-ms this tick |
+| `grab_phase` | int | Hitch-wheel slot (`grab_i % wheel`, locked wheel 16). `-1` on retail window / stub (no wheel). |
+| `grab_poll_free` | bool | This grab did not issue a companion PollCamera. Locked schedule: poll-free on slots 4 and 8–15 (main `stream_raw` only). Hitch slots 0, 1, 2, 3, 5, 6, 7 each add one companion poll. |
+| `sensors_poll_ms` | float | Wall-ms of this tick's first `vehicle.sensors.poll`. 0 when no vehicle poll ran. |
+| `poll_gps_ms` | float | Wall-ms of `GPS.poll` (PollGPSGE) when this tick sent it. 0 when GPS is absent or the sample was coalesced. |
+| `poll_gps_sent` | bool | True only when this tick called `GPS.poll`. |
+| `electrics_ms` | float | Wall-ms of the grab-loop `read_electrics` (snapshot reuse, or a miss-path poll). |
 | `infer_ms` | float | perception tick ms |
 | `viz_ms` | float | OpenCV stage ms |
+
+Soft Esc reads the same tick from `gvd_state.json` and the `[GVD] seg` line. Poll-free `grab_ms` is the main `stream_raw` cost. The gap versus a hitch-phase `grab_ms` is the companion `PollCamera`. `heartbeat_ms - grab_ms - infer_ms` is the rest of the tick before the heartbeat stamp, including the ego-poll tail (`sensors_poll_ms`, `poll_gps_ms`, `electrics_ms`). `camera_hz` stays the unique GPU-frame EMA.
 
 
 ## M2 fields

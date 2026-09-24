@@ -456,6 +456,14 @@ def take_vehicle_sensor_snap(vehicle: Any) -> dict[str, Any] | None:
     return snap.data
 
 
+_last_electrics_ms = 0.0
+
+
+def last_electrics_ms() -> float:
+    """Wall-ms of the most recent ``read_electrics`` call."""
+    return _last_electrics_ms
+
+
 def read_electrics(vehicle: Any) -> dict[str, Any] | None:
     """Electrics dict. None when the sensor is absent.
 
@@ -465,9 +473,11 @@ def read_electrics(vehicle: Any) -> dict[str, Any] | None:
     snapshot, already consumed, or older than the reuse window) still polls.
     Engage hold reads speed on that miss path.
     """
-    if vehicle is None:
-        return None
+    global _last_electrics_ms
+    t0 = time.perf_counter()
     try:
+        if vehicle is None:
+            return None
         snap = take_vehicle_sensor_snap(vehicle)
         if isinstance(snap, dict):
             el = snap.get("electrics") if "electrics" in snap else snap
@@ -495,6 +505,8 @@ def read_electrics(vehicle: Any) -> dict[str, Any] | None:
         return el if isinstance(el, dict) else None
     except Exception:
         return None
+    finally:
+        _last_electrics_ms = (time.perf_counter() - t0) * 1000.0
 
 
 def read_electrics_inputs(vehicle: Any) -> DriverInputs:

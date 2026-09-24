@@ -21,6 +21,9 @@ from python.control.actuate import (
     is_reverse_control,
     may_drive,
     plan_command,
+    last_electrics_ms,
+    publish_vehicle_sensor_snap,
+    read_electrics,
     read_electrics_speed,
     safe_command,
     tech_control_kwargs,
@@ -30,6 +33,45 @@ from python.control.actuate import (
 class _Pollable(dict):
     def poll(self):
         return self
+
+
+def check_electrics_segment_timer() -> None:
+    """read_electrics wall-ms. Snapshot reuse does not open a second sensors.poll."""
+    import time
+
+    class Slow:
+        def __init__(self) -> None:
+            self.n = 0
+            self.sensors = self
+
+        def poll(self):
+            self.n += 1
+            time.sleep(0.02)
+            return {"electrics": {"wheelspeed": 1.5, "steering_input": 0.0}}
+
+    slow = Slow()
+    el = read_electrics(slow)
+    assert el is not None and el["wheelspeed"] == 1.5
+    assert slow.n == 1
+    assert last_electrics_ms() >= 10.0, last_electrics_ms()
+
+    class Held:
+        def __init__(self) -> None:
+            self.n = 0
+            self.sensors = self
+
+        def poll(self):
+            self.n += 1
+            return {"electrics": {"wheelspeed": 9.0}}
+
+    held = Held()
+    publish_vehicle_sensor_snap(held, {"electrics": {"wheelspeed": 4.0, "steering_input": 0.25}})
+    reused = read_electrics(held)
+    assert reused is not None and reused["wheelspeed"] == 4.0 and reused["steering_input"] == 0.25
+    assert held.n == 0
+    assert 0.0 <= last_electrics_ms() < 10.0, last_electrics_ms()
+    assert read_electrics(None) is None
+    assert last_electrics_ms() >= 0.0
 
 
 def check_grab_loop_poll_before_electrics() -> None:
@@ -361,6 +403,7 @@ def main() -> None:
         _assert_no_reverse(kw)
 
     check_grab_loop_poll_before_electrics()
+    check_electrics_segment_timer()
 
     print("test_m3_actuate: OK")
 

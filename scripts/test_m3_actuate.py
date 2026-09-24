@@ -32,6 +32,27 @@ class _Pollable(dict):
         return self
 
 
+def check_grab_loop_poll_before_electrics() -> None:
+    """Soft Esc grab calls poll_vehicle() before read_electrics_inputs(vehicle).
+
+    Electrics reuse the snapshot that poll just published. A swap is a hard fail.
+    """
+    rv = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
+    start = rv.find("bundle = backend.grab()")
+    assert start >= 0, "run_vision grab missing"
+    grab = rv[start:]
+    end = grab.find("extras_bundle = extras.poll(")
+    assert end > 0, "run_vision grab loop missing extras.poll"
+    grab = grab[:end]
+    poll_at = grab.find("backend.poll_vehicle()")
+    el_at = grab.find("read_electrics_inputs(vehicle)")
+    assert poll_at >= 0, "grab loop must call poll_vehicle()"
+    assert el_at >= 0, "grab loop must call read_electrics_inputs(vehicle)"
+    assert poll_at < el_at, (
+        "grab loop must call poll_vehicle() before read_electrics_inputs(vehicle)"
+    )
+
+
 def main() -> None:
     # 2) stale heartbeat → zero throttle + brake
     cmd = safe_command(
@@ -338,6 +359,8 @@ def main() -> None:
 
     for kw in veh.calls + moving.calls + ng.calls + bare.calls + fail.calls:
         _assert_no_reverse(kw)
+
+    check_grab_loop_poll_before_electrics()
 
     print("test_m3_actuate: OK")
 

@@ -17,9 +17,9 @@
 #   rear:    ÷16 phase 6 (no side on this slot)
 #   repeatR: ÷16 phase 7
 # Far / GPU (stream_raw on main; wide/narrow poll; never is_streaming=False):
-#   narrow: 800 @ 0.067  priority 0.5   (next far hitch 400 only if live unique-frame Hz <10)
+#   narrow: 800 @ -1     priority 0.5   (on-demand; next far hitch 400 only if live unique-frame Hz <10)
 #   main:   300 @ 0.067  priority 0.0
-#   wide:   300 @ 0.067  priority 0.5
+#   wide:   300 @ -1     priority 0.5   (on-demand; no auto GPU)
 #   pillarL / pillarR / repeatL / repeatR / rear: 100 @ -1 (on-demand; no auto GPU)
 # Optional per-cam near_far_planes: [near_m, far_m] still clamped to the role band.
 # Hitch: forward grab stagger + on-demand sides/rear — not resolution. Depth OFF.
@@ -58,7 +58,7 @@ cameras:
     fov_v: 21.4
     live_res: [640, 480]
     far_m: 800
-    requested_update_time: 0.067
+    requested_update_time: -1
     update_priority: 0.5
   - id: main
     role: primary_forward
@@ -83,7 +83,7 @@ cameras:
     fov_v: 88.7
     live_res: [640, 480]
     far_m: 300
-    requested_update_time: 0.067
+    requested_update_time: -1
     update_priority: 0.5
   - id: pillarL
     role: forward_side_left

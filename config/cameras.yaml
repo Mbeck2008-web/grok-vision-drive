@@ -10,8 +10,8 @@
 #   main:   every tick (÷1)
 #   wide:   every 2nd tick (÷2, phase 0)
 #   narrow: every 2nd tick (÷2 start, phase 1; ÷2–3 allowed, never ÷4)
-#   pillar/repeat: every 2nd, phase 1 (miss wide even ticks)
-#   rear: every 4th, phase 1
+#   pillar/repeat: every 2nd; four sides spread off one tick (not all with narrow)
+#   rear: every 4th, phase 2 (wide parity, not the narrow tick)
 # Far / GPU (stream_raw on forwards; never is_streaming=False):
 #   narrow: 800 @ 0.067  priority 0.5   (next far hitch 400 only if live unique-frame Hz <10)
 #   main:   300 @ 0.067  priority 0.0
@@ -28,9 +28,9 @@ hitch:
   narrow_grab_div: 2     # start ÷2 (÷2–3); not ÷4
   narrow_grab_phase: 1   # offset vs wide so they do not share a tick
   side_grab_div: 2
-  side_grab_phase: 1     # miss wide even ticks (tick0 clump)
+  side_grab_phase: 1     # base slot; Python spreads the four sides across the divisor
   rear_grab_div: 4
-  rear_grab_phase: 1     # miss wide even ticks
+  rear_grab_phase: 2     # wide parity so rear is not on the narrow tick
 # OpenCV cabin only. Does not set BeamNGpy clip planes or the hitch ladder.
 # auto = that camera's far_m after hitch (state main_far_m / rear_far_m when set).
 viz:

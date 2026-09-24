@@ -33,9 +33,11 @@ NARROW_GRAB_DIV = 2  # start ÷2 (allowed 2–3; never ÷4)
 NARROW_GRAB_PHASE = 1  # offset vs wide so they do not share a tick
 WIDE_GRAB_PHASE = 0
 SIDE_GRAB_DIV = 2  # poll pillar/repeat every Nth grab; never drop resolution
-SIDE_GRAB_PHASE = 1  # odd ticks — miss wide even (tick0 was main+wide+4sides+rear)
+SIDE_GRAB_PHASE = 1  # base slot; the four sides spread across the divisor
 REAR_GRAB_DIV = 4  # poll rear every Nth grab; never drop resolution
-REAR_GRAB_PHASE = 1  # miss wide even ticks
+REAR_GRAB_PHASE = 2  # even tick with wide, not on the narrow+sides tick
+# Order matters: slot i lands on (base + i) % div so an odd tick is not all four.
+SIDE_SPREAD_ORDER = ("pillarL", "repeatL", "pillarR", "repeatR")
 NARROW_FAR_LIVE_HITCH_M = 400.0  # live unique-frame Hz hitch (800→400 if still <10)
 CAMERA_HZ_TARGET = 10.0
 LIVE_NARROW_HITCH_AFTER_S = 2.0
@@ -331,7 +333,9 @@ def camera_grab_div(cid: str, hitch: dict[str, Any] | None = None) -> int:
 def camera_grab_phase(cid: str, hitch: dict[str, Any] | None = None) -> int:
     """Phase offset so wide (0) and narrow (1) do not grab the same tick.
 
-    Sides/rear default to phase 1 so they miss wide's even ticks (tick0 clump).
+    The four sides share one yaml base phase and then spread across the divisor
+    (two on the wide parity, two on the narrow parity). Rear uses its own phase
+    so it does not join narrow plus every side.
     """
     hitch = hitch if isinstance(hitch, dict) else {}
     if cid == "narrow":
@@ -343,7 +347,13 @@ def camera_grab_phase(cid: str, hitch: dict[str, Any] | None = None) -> int:
     if cid in REAR_CAM_IDS:
         return _nonneg_int(hitch.get("rear_grab_phase"), REAR_GRAB_PHASE)
     if cid in SIDE_CAM_IDS:
-        return _nonneg_int(hitch.get("side_grab_phase"), SIDE_GRAB_PHASE)
+        base = _nonneg_int(hitch.get("side_grab_phase"), SIDE_GRAB_PHASE)
+        div = max(1, camera_grab_div(cid, hitch))
+        try:
+            slot = SIDE_SPREAD_ORDER.index(cid)
+        except ValueError:
+            slot = 0
+        return (base + (slot % div)) % div
     return 0
 
 
@@ -1208,9 +1218,24 @@ class BeamNGPyBackend:
         if cid == "main":
             frames["cam_main"] = bgr
 
-    def _reuse_cached(self, cid: str, frames: dict, timestamps: dict, health: dict) -> None:
-        """Skip / failed stream_raw: keep last pixels for perception, mark STALE (not a camera tick)."""
+    def _reuse_cached(
+        self, cid: str, frames: dict, timestamps: dict, health: dict, *, failed: bool
+    ) -> None:
+        """Keep last pixels for perception.
+
+        A scheduled skip stays OK when a good frame is cached, and stays MISSING
+        when this cam has never been read. STALE is only a failed read.
+        """
         bgr = self._cache_frames.get(cid)
+        if not failed:
+            if bgr is None:
+                return
+            frames[cid] = bgr
+            timestamps[cid] = self._cache_ts.get(cid, time.time())
+            health[cid] = CamHealth.OK
+            if cid == "main":
+                frames["cam_main"] = bgr
+            return
         if bgr is None:
             health[cid] = CamHealth.STALE
             return
@@ -1332,12 +1357,12 @@ class BeamNGPyBackend:
         unique_ids: list[str] = []
         for cid, cam in self._sensors.items():
             if not self._grab_this_tick(cid, grab_i):
-                self._reuse_cached(cid, frames, timestamps, health)
+                self._reuse_cached(cid, frames, timestamps, health, failed=False)
                 continue
             try:
                 bgr = read_camera_colour(cam, cid=cid, resolution=self._resolution.get(cid))
                 if bgr is None:
-                    self._reuse_cached(cid, frames, timestamps, health)
+                    self._reuse_cached(cid, frames, timestamps, health, failed=True)
                     continue
                 bgr = resize_long_side(bgr, self.long_side)
                 sig = frame_signature(bgr)

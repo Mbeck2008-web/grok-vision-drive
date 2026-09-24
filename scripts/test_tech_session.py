@@ -466,15 +466,34 @@ def check_camera_clip_planes() -> None:
         assert not (
             camera_grab_due("wide", i, hitch) and camera_grab_due("narrow", i, hitch)
         ), i
+        assert camera_grab_due("main", i, hitch)
         if i % 2 == 0:
-            assert camera_grab_due("main", i, hitch)
             assert camera_grab_due("wide", i, hitch)
             assert not camera_grab_due("narrow", i, hitch)
-            for sid in SIDE_CAM_IDS | REAR_CAM_IDS:
-                assert not camera_grab_due(sid, i, hitch), (sid, i)
         else:
             assert camera_grab_due("narrow", i, hitch)
             assert not camera_grab_due("wide", i, hitch)
+        side_rear = [
+            cid
+            for cid in (*SIDE_CAM_IDS, *REAR_CAM_IDS)
+            if camera_grab_due(cid, i, hitch)
+        ]
+        sides_due = [cid for cid in side_rear if cid in SIDE_CAM_IDS]
+        assert len(sides_due) <= 2, (i, sides_due)
+        if camera_grab_due("narrow", i, hitch):
+            # Odd tick must not pile narrow together with all four sides and rear.
+            assert len(side_rear) <= 2, (i, side_rear)
+            assert "rear" not in side_rear
+    for cid in SIDE_CAM_IDS:
+        hits = [i for i in range(8) if camera_grab_due(cid, i, hitch)]
+        assert len(hits) == 4, (cid, hits)
+    rear_hits = [i for i in range(8) if camera_grab_due("rear", i, hitch)]
+    assert rear_hits == [2, 6], rear_hits
+    odd_sides = {cid for cid in SIDE_CAM_IDS if camera_grab_due(cid, 1, hitch)}
+    even_sides = {cid for cid in SIDE_CAM_IDS if camera_grab_due(cid, 0, hitch)}
+    assert len(odd_sides) == 2 and len(even_sides) == 2
+    assert not (odd_sides & even_sides)
+    assert camera_grab_phase("pillarL", hitch) != camera_grab_phase("repeatL", hitch)
     assert camera_grab_due("main", 0, hitch) and camera_grab_due("wide", 0, hitch)
     hitch3 = dict(hitch)
     hitch3["narrow_grab_div"] = 3
@@ -701,7 +720,7 @@ def check_beamngpy_open_passes_near_far() -> None:
 
 
 def check_beamngpy_side_grab_half_rate() -> None:
-    """main÷1 stream_raw; wide÷2 phase0; narrow÷2 phase1; sides poll÷2; rear poll÷4."""
+    """main÷1 stream_raw; wide÷2 phase0; narrow÷2 phase1; sides spread ÷2; rear poll÷4 phase 2."""
     import sys
     import types
 
@@ -776,6 +795,7 @@ def check_beamngpy_side_grab_half_rate() -> None:
         last = None
         for i in range(n):
             s0 = dict(streams)
+            p0 = dict(polls)
             bundle = be.grab()
             last = bundle
             streamed = [cid for cid in ("main", "wide", "narrow") if streams[f"gvd_{cid}"] > s0.get(f"gvd_{cid}", 0)]
@@ -783,22 +803,33 @@ def check_beamngpy_side_grab_half_rate() -> None:
             if i == 0:
                 assert streamed == ["main", "wide"] or set(streamed) == {"main", "wide"}
                 for cid in SIDE_CAM_IDS | REAR_CAM_IDS:
-                    assert polls[f"gvd_{cid}"] == 0, cid
+                    due = camera_grab_due(cid, 0, be._hitch)
+                    assert (polls[f"gvd_{cid}"] == 1) == due, (cid, due, polls[f"gvd_{cid}"])
+                assert bundle.health["narrow"] == CamHealth.MISSING  # not read yet
+                assert bundle.health["narrow"] != CamHealth.STALE
             if i % 2 == 0:
                 assert "wide" in streamed and "narrow" not in streamed
             else:
                 assert "narrow" in streamed and "wide" not in streamed
+                polled = [
+                    cid
+                    for cid in SIDE_CAM_IDS | REAR_CAM_IDS
+                    if polls[f"gvd_{cid}"] > p0.get(f"gvd_{cid}", 0)
+                ]
+                assert len(polled) <= 2, (i, polled)
+            for cid in CAM_IDS:
+                assert bundle.health[cid] != CamHealth.STALE, (i, cid, bundle.health[cid])
         assert last is not None
         assert last.health["main"] == CamHealth.OK
         assert last.health["narrow"] == CamHealth.OK
-        assert last.health["wide"] == CamHealth.STALE  # grab_i=7 skip
+        assert last.health["wide"] == CamHealth.OK  # grab_i=7 skip keeps the last good frame
         assert last.grab_ms >= 0.0
         assert last.unique_gpu_n >= 1  # incrementing FakeCamera
         for cid in SIDE_CAM_IDS:
-            assert last.health[cid] == CamHealth.OK, cid  # odd tick, phase 1
+            assert last.health[cid] == CamHealth.OK, cid
             assert cid in last.frames
         for cid in REAR_CAM_IDS:
-            assert last.health[cid] == CamHealth.STALE, cid  # 7 % 4 != 1
+            assert last.health[cid] == CamHealth.OK, cid  # skip is not STALE
             assert cid in last.frames
         assert streams["gvd_main"] == n
         assert polls["gvd_main"] == 0
@@ -830,7 +861,7 @@ def check_beamngpy_side_grab_half_rate() -> None:
         assert read_camera_colour(NoStream(), cid="main", resolution=(8, 8)) is None
         assert "main" in FORWARD_CAM_IDS
 
-        # skip/failed stream_raw → STALE (not a camera tick)
+        # failed stream_raw → STALE. A scheduled skip above stayed OK.
         class FailRaw:
             is_streaming = True
             resolution = (8, 8)

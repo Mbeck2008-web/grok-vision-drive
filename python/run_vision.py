@@ -19,6 +19,9 @@ from python.control.actuate import (
     read_ego_feedback,
     read_electrics_inputs,
     read_engage_flag,
+    soft_esc_state_write_due,
+    soft_esc_state_write_mark,
+    soft_esc_state_write_skips,
     stop_command,
     write_engage_flag,
 )
@@ -456,6 +459,7 @@ def main() -> None:
     last_ego_v = 0.0
     prev_force = bool(args.force_engage)
     prev_preview = bool(args.allow_preview_drive)
+    prev_engaged = False
     try:
         while True:
             loop_t0 = time.perf_counter()
@@ -812,10 +816,18 @@ def main() -> None:
             st["poll_gps_sent"] = poll_gps_sent
             st["electrics_ms"] = electrics_ms
             st["heartbeat_ms"] = (time.perf_counter() - loop_t0) * 1000.0
+            # Soft Esc: one gvd_state.json rewrite per Lua pollEvery (100 ms).
+            # Engage writes every tick. The rising edge flushes this tick.
+            rising_engage = bool(engaged) and not prev_engaged
+            state_due = soft_esc_state_write_due(bool(engaged), rising=rising_engage)
+            prev_engaged = bool(engaged)
+            state_skips = soft_esc_state_write_skips()
+            rel_skips = int(getattr(actuator, "release_cmd_skips", 0) or 0)
             # Segment line is outside the stamp. grab_ms on a poll-free phase is
             # the stream_raw cost; a hitch-phase gap is the companion PollCamera.
             # heartbeat_ms - grab_ms - infer_ms is the ego-poll tail plus the
             # rest of the tick before this stamp. camera_hz is unchanged.
+            # state_write_skip=1 is a Soft Esc rewrite that did not hit disk.
             print(
                 f"[GVD] seg grab_ms={grab_ms:.2f} grab_phase={grab_phase} "
                 f"grab_poll_free={int(grab_poll_free)} "
@@ -823,7 +835,10 @@ def main() -> None:
                 f"infer_ms={float(pout.infer_ms):.2f} "
                 f"sensors_poll_ms={sensors_poll_ms:.2f} "
                 f"poll_gps_ms={poll_gps_ms:.2f} poll_gps_sent={int(poll_gps_sent)} "
-                f"electrics_ms={electrics_ms:.2f}",
+                f"electrics_ms={electrics_ms:.2f} "
+                f"state_write_skip={0 if state_due else 1} "
+                f"state_write_skips={state_skips} "
+                f"release_cmd_skips={rel_skips}",
                 flush=True,
             )
 
@@ -845,7 +860,11 @@ def main() -> None:
             if recorder.last_clip_path:
                 st["last_clip_path"] = recorder.last_clip_path
 
-            write_state(st)
+            # Call-site coalesce only. write_state itself still stamps the beat.
+            # Mark after the write so the 100 ms cap is on the file, not the check.
+            if state_due:
+                write_state(st)
+                soft_esc_state_write_mark()
 
             if win is not None:
                 import cv2

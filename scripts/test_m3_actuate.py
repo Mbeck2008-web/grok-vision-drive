@@ -25,7 +25,11 @@ from python.control.actuate import (
     publish_vehicle_sensor_snap,
     read_electrics,
     read_electrics_speed,
+    reset_soft_esc_state_writes,
     safe_command,
+    soft_esc_state_write_due,
+    soft_esc_state_write_mark,
+    soft_esc_state_write_skips,
     tech_control_kwargs,
 )
 
@@ -93,6 +97,102 @@ def check_grab_loop_poll_before_electrics() -> None:
     assert poll_at < el_at, (
         "grab loop must call poll_vehicle() before read_electrics_inputs(vehicle)"
     )
+
+
+def check_soft_esc_heartbeat_coalesce() -> None:
+    """Soft Esc gvd_state gate and Tech release-cmd: at most one rewrite per 100 ms.
+
+    Engage state writes stay every tick. The rising edge flushes inside the
+    window. A latched Disengage and shutdown still rewrite gvd_cmd.json.
+    """
+    import json
+    import time
+
+    from python.control.actuate import SOFT_ESC_FILE_PERIOD_S, cmd_path
+
+    period = float(SOFT_ESC_FILE_PERIOD_S)
+
+    def _due(engaged: bool, now: float, *, rising: bool = False) -> bool:
+        ok = soft_esc_state_write_due(engaged, rising=rising, now=now)
+        if ok:
+            soft_esc_state_write_mark(now)
+        return ok
+
+    reset_soft_esc_state_writes()
+    try:
+        assert _due(False, 10.0) is True
+        assert _due(False, 10.05) is False
+        assert soft_esc_state_write_skips() == 1
+        assert _due(False, 10.06, rising=True) is True
+        assert soft_esc_state_write_skips() == 1
+        assert _due(True, 10.07) is True
+        assert _due(True, 10.08) is True
+        assert soft_esc_state_write_skips() == 1
+        assert _due(False, 10.09) is False
+        assert soft_esc_state_write_skips() == 2
+        stamped = 10.08 + period + 0.001
+        assert _due(False, stamped) is True
+        assert _due(False, stamped + period - 0.001) is False
+        assert soft_esc_state_write_skips() == 3
+        assert _due(False, stamped + period + 0.001) is True
+        assert soft_esc_state_write_skips() == 3
+    finally:
+        reset_soft_esc_state_writes()
+
+    rv = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
+    loop = rv.split("while True:", 1)[1]
+    assert "rising_engage = bool(engaged) and not prev_engaged" in loop
+    assert "soft_esc_state_write_due(bool(engaged), rising=rising_engage)" in loop
+    assert "state_write_skips=" in loop
+    assert "release_cmd_skips=" in loop
+    assert "if state_due:\n                write_state(st)\n                soft_esc_state_write_mark()" in loop
+    assert rv.count("write_state(") == 2
+
+    class Veh:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+            self.shifts: list[str] = []
+            self.ai_modes: list[str] = []
+
+        def set_shift_mode(self, mode: str) -> None:
+            self.shifts.append(mode)
+
+        def ai_set_mode(self, mode: str) -> None:
+            self.ai_modes.append(mode)
+
+        def control(self, **kw):
+            self.calls.append(kw)
+
+    veh = Veh()
+    tech = BeamNGPyActuator(veh)
+    tech.note_engaged(False)
+    first = tech.stop(seq=1, reason="not_engaged")
+    assert first.brake == 0.0 and first.throttle == 0.0 and veh.calls == []
+    payload = json.loads(cmd_path().read_text(encoding="utf-8"))
+    assert payload["seq"] == 1 and payload["engaged"] is False and payload["brake"] == 0.0
+    held = tech.stop(seq=2, reason="not_engaged")
+    assert held.brake == 0.0 and held.throttle == 0.0
+    assert tech.release_cmd_skips == 1
+    quiet = json.loads(cmd_path().read_text(encoding="utf-8"))
+    assert quiet["seq"] == 1 and quiet["brake"] == 0.0 and quiet["engaged"] is False
+    tech._release_cmd_mono = time.monotonic() - (period + 0.01)
+    tech.stop(seq=3, reason="not_engaged")
+    renewed = json.loads(cmd_path().read_text(encoding="utf-8"))
+    assert renewed["seq"] == 3 and renewed["brake"] == 0.0 and renewed["engaged"] is False
+    assert tech.release_cmd_skips == 1
+    tech.note_engaged(True)
+    tech._latched = True
+    tech.note_engaged(False)
+    tech.stop(seq=4, reason="not_engaged")
+    edge = json.loads(cmd_path().read_text(encoding="utf-8"))
+    assert edge["seq"] == 4 and edge["brake"] == 0.0 and edge["engaged"] is False
+    assert tech.release_cmd_skips == 1
+    assert veh.calls[-1]["brake"] == 0.0 and veh.calls[-1]["throttle"] == 0.0
+    tech.stop(seq=5, reason="shutdown")
+    shut = json.loads(cmd_path().read_text(encoding="utf-8"))
+    assert shut["seq"] == 5 and shut["reason"] == "shutdown"
+    assert shut["brake"] == 0.0 and shut["engaged"] is False
+    assert tech.release_cmd_skips == 1
 
 
 def check_soft_esc_engage_rising_edge() -> None:
@@ -503,7 +603,9 @@ def main() -> None:
     assert len(veh.calls) == n + 1, veh.calls  # no further takeover while OFF
     assert len(veh.ai_modes) == 1
     quiet = json.loads(cmd_path().read_text(encoding="utf-8"))
-    assert quiet["brake"] == 0.0 and quiet["engaged"] is False and quiet["seq"] == 5
+    # Soft Esc release-cmd inside 100 ms keeps the falling-edge file (seq 4).
+    assert quiet["brake"] == 0.0 and quiet["engaged"] is False and quiet["seq"] == 4
+    assert tech.release_cmd_skips == 1
 
     # Hold left brake=1 on the car; Disengage must zero it and release AI, not leave brake=1.
     tech.note_engaged(True)
@@ -592,6 +694,7 @@ def main() -> None:
     check_grab_loop_poll_before_electrics()
     check_electrics_segment_timer()
     check_soft_esc_engage_rising_edge()
+    check_soft_esc_heartbeat_coalesce()
 
     print("test_m3_actuate: OK")
 

@@ -436,6 +436,59 @@ def soft_esc_sensors_every_tick() -> bool:
     return bool(_soft_esc_engaged)
 
 
+# Lua gvd_main.pollEvery. Soft Esc rewrites gvd_state.json and the Tech
+# release cmd at most once per this window, so the beat stays younger than
+# HEARTBEAT_STALE_S. Engage does not use this cap.
+SOFT_ESC_FILE_PERIOD_S = 0.10
+
+_soft_esc_state_mono: float | None = None
+_soft_esc_state_skips = 0
+
+
+def reset_soft_esc_state_writes() -> None:
+    """Clear the Soft Esc gvd_state.json window. Callers that flip it restore it."""
+    global _soft_esc_state_mono, _soft_esc_state_skips
+    _soft_esc_state_mono = None
+    _soft_esc_state_skips = 0
+
+
+def soft_esc_state_write_skips() -> int:
+    """Soft Esc ticks that did not rewrite gvd_state.json."""
+    return int(_soft_esc_state_skips)
+
+
+def soft_esc_state_write_due(
+    engaged: bool, *, rising: bool = False, now: float | None = None
+) -> bool:
+    """True when the supervisor should call write_state on this tick.
+
+    Soft Esc (engaged false, not a rising edge): at most one True per
+    SOFT_ESC_FILE_PERIOD_S, measured from the last ``soft_esc_state_write_mark``.
+    A False increments soft_esc_state_write_skips. Engage is True every tick.
+    A rising edge flushes on that same tick when the Soft Esc window has not
+    elapsed. ``now`` is monotonic seconds for tests; the supervisor omits it.
+    """
+    global _soft_esc_state_skips
+    t = time.monotonic() if now is None else float(now)
+    if engaged or rising:
+        return True
+    last = _soft_esc_state_mono
+    if last is None or (t - last) >= SOFT_ESC_FILE_PERIOD_S:
+        return True
+    _soft_esc_state_skips += 1
+    return False
+
+
+def soft_esc_state_write_mark(now: float | None = None) -> None:
+    """Stamp the Soft Esc window after write_state returns.
+
+    The cap is on the rewrite, not the earlier due-check, so recorder time
+    between the check and the write cannot bunch two files inside 100 ms.
+    """
+    global _soft_esc_state_mono
+    _soft_esc_state_mono = time.monotonic() if now is None else float(now)
+
+
 class _SensorSnap:
     """One vehicle.sensors.poll payload, consumed by the next same-tick reader."""
 
@@ -617,7 +670,8 @@ class BeamNGPyActuator:
     stale brake:1 file cannot keep the pedals. Release does not arm
     realistic_automatic when the shifter was never set. A failed arcade
     restore leaves the latch set so the next disengaged tick retries. After
-    arcade succeeds, later ticks only refresh the cmd file. Engaged gate holds
+    arcade succeeds, later Soft Esc ticks refresh the cmd file at most once
+    per SOFT_ESC_FILE_PERIOD_S. Engaged gate holds
     (preview_blocked, AEB, veto) still apply the stop command, remapped off
     reverse: realistic_automatic, hold gear=0 + brake ±parkingbrake, drive
     gear>=1, never gear=-1.
@@ -630,6 +684,8 @@ class BeamNGPyActuator:
         self._shift_set = False
         self.engaged = False
         self._latched = False
+        self._release_cmd_mono: float | None = None
+        self.release_cmd_skips = 0
 
     def note_engaged(self, engaged: bool) -> None:
         self.engaged = bool(engaged)
@@ -638,8 +694,19 @@ class BeamNGPyActuator:
         # The rising-edge poll reads read_engage_flag itself.
         note_soft_esc_engaged(self.engaged)
 
-    def _write_release_cmd(self, seq: int, reason: str) -> None:
-        """gvd_cmd must not keep brake=1 after Disengage. Lua applies only engaged:true."""
+    def _write_release_cmd(self, seq: int, reason: str, *, force: bool = False) -> bool:
+        """gvd_cmd must not keep brake=1 after Disengage. Lua applies only engaged:true.
+
+        Steady Soft Esc refreshes at most once per SOFT_ESC_FILE_PERIOD_S.
+        The falling-edge latch, the first rewrite, and shutdown pass
+        ``force`` and write this tick. A skipped tick increments
+        ``release_cmd_skips`` and leaves the last release file in place.
+        """
+        now = time.monotonic()
+        last = self._release_cmd_mono
+        if not force and last is not None and (now - last) < SOFT_ESC_FILE_PERIOD_S:
+            self.release_cmd_skips += 1
+            return False
         payload = {
             "steer": 0.0,
             "throttle": 0.0,
@@ -649,7 +716,10 @@ class BeamNGPyActuator:
             "heartbeat_mtime": time.time(),
             "reason": str(reason),
         }
-        atomic_write_json(cmd_path(), payload, indent=None)
+        ok = bool(atomic_write_json(cmd_path(), payload, indent=None))
+        if ok:
+            self._release_cmd_mono = now
+        return ok
 
     def _release_ai(self) -> None:
         """Drop BeamNG AI so keyboard arrows and pedals own the car again."""
@@ -762,7 +832,14 @@ class BeamNGPyActuator:
             # Handoff, not a brake hold. ego.brake must not stay at 1, and the
             # cmd bus must not keep a stale brake:1 while engaged is false.
             cmd = release_command(seq=seq, reason=reason)
-            self._write_release_cmd(seq, reason)
+            # Latched handoff, the first rewrite, and shutdown must hit the
+            # file this tick. Later Soft Esc ticks coalesce to pollEvery.
+            force = (
+                bool(self._latched)
+                or self._release_cmd_mono is None
+                or str(reason) == "shutdown"
+            )
+            self._write_release_cmd(seq, reason, force=force)
             if self._latched:
                 err = self._control(0.0, 0.0, 0.0, release=True)
                 if err is None or err == "no_vehicle":

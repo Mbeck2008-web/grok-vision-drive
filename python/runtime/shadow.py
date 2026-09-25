@@ -17,9 +17,10 @@ from python.control.actuate import DriveCommand, plan_command, stop_command
 from python.control.e2e import E2EIntent, E2EPolicy
 
 # Engage liveness floor. CAMS blit drop remains 8 Hz. Narrow-far hitch remains 10 Hz.
-# Soft Esc idle sits about 7–9 Hz. A measured loop or unique-camera rate under
-# this floor disengages once the arm grace has ended. 0 means the EMA has not
-# started yet.
+# Soft Esc idle sits about 7–9 Hz. With the hitch and viz up, live loop_hz has
+# sat about 5.5–7 and can sag under this floor after the grace (low_loop_hz).
+# A measured loop or unique-camera rate under this floor disengages once the
+# arm grace has ended. 0 means the EMA has not started yet.
 MIN_ACCEPT_HZ = 6.0
 # Arm window. The loop/camera rate is an EMA (alpha 0.2), so the grace has to
 # outlast the engage hitch itself or the smoothed rate is still under the floor

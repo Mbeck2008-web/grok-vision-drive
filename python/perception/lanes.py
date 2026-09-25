@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import cv2
 import numpy as np
@@ -13,6 +14,29 @@ class LaneResult:
     conf: float
     lanes_bev: list[list[dict[str, float]]]  # polylines in ego frame
     curvature: float  # 1/m approx
+
+
+def hough_segments(lines: Any) -> list[tuple[int, int, int, int]]:
+    """Normalize HoughLinesP rows to ``(x1, y1, x2, y2)``.
+
+    OpenCV 4 returns ``(N, 1, 4)``. OpenCV 5 returns ``(N, 4)``. Indexing
+    ``lines[:, 0]`` on the OpenCV 5 layout yields scalars; ``row[1]`` then
+    raises ``IndexError``. ``estimate_lanes`` used to swallow that and report
+    ``lane_conf`` 0 on a frame that already had lane paint.
+    """
+    if lines is None:
+        return []
+    arr = np.asarray(lines)
+    if arr.size == 0:
+        return []
+    if arr.ndim == 3:
+        arr = arr.reshape(-1, arr.shape[-1])
+    if arr.ndim != 2 or arr.shape[1] < 4:
+        return []
+    out: list[tuple[int, int, int, int]] = []
+    for row in arr[:, :4]:
+        out.append((int(row[0]), int(row[1]), int(row[2]), int(row[3])))
+    return out
 
 
 def estimate_lanes(bgr: np.ndarray | None) -> LaneResult:
@@ -36,16 +60,13 @@ def _estimate_lanes_impl(bgr: np.ndarray) -> LaneResult:
     crop = cv2.bitwise_and(edges, mask)
     lines = cv2.HoughLinesP(crop, 1, np.pi / 180, threshold=40, minLineLength=40, maxLineGap=80)
     left, right = [], []
-    if lines is not None:
-        for row in lines[:, 0]:
-            # Cast endpoints to Python int — numpy.int32 unpack raises TypeError on some OpenCV builds
-            x1, y1, x2, y2 = (int(row[0]), int(row[1]), int(row[2]), int(row[3]))
-            if x2 == x1:
-                continue
-            slope = (y2 - y1) / float(x2 - x1)
-            if abs(slope) < 0.3:
-                continue
-            (left if slope < 0 else right).append((x1, y1, x2, y2, slope))
+    for x1, y1, x2, y2 in hough_segments(lines):
+        if x2 == x1:
+            continue
+        slope = (y2 - y1) / float(x2 - x1)
+        if abs(slope) < 0.3:
+            continue
+        (left if slope < 0 else right).append((x1, y1, x2, y2, slope))
     conf = 0.0
     lanes_bev: list[list[dict[str, float]]] = []
     curv = 0.0

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -33,8 +34,9 @@ MAIN_GRAB_DIV = 1
 # Rank 2: one stream_raw per tick (main). Companion polls are ÷16.
 # Phases stay: wide 0 (even), narrow 1 (odd), pillarL 2, pillarR 3,
 # repeatL 5, rear 6, repeatR 7. Ticks 4 and 8–15 are main only.
-# Soft Esc (engaged=false): grab skips companion colour. Main still
-# stream_raw every tick. Engage keeps the hitch polls.
+# Soft Esc (engaged=false): a companion with no last-good frame is coloured
+# once (warm). Later grabs skip companion colour. Main still stream_raw
+# every tick. A missed warm stays STALE, not MISSING. Engage keeps the hitch polls.
 WIDE_GRAB_DIV = 16
 NARROW_GRAB_DIV = 16
 NARROW_GRAB_PHASE = 1  # odd ticks; wide stays on even ticks
@@ -432,18 +434,59 @@ def grab_is_poll_free(grab_i: int, hitch: dict[str, Any] | None = None) -> bool:
     return True
 
 
+def _debug_force_engage() -> bool:
+    """True when debug engage is already requested on this tick.
+
+    ``--force-engage`` and the nerd-panel bit do not write ``gvd_engage.json``.
+    Grab runs before ``note_engaged``, so the latch is still false. Alt+G is
+    the live file. Debug engage is argv, or ``args.force_engage`` /
+    ``ui.debug.force_engage`` already set on the grab caller. Seeing it
+    colours the hitch schedule on this same grab. This does not write the file.
+    """
+    if any(arg == "--force-engage" for arg in sys.argv):
+        return True
+    getframe = getattr(sys, "_getframe", None)
+    if getframe is None:
+        return False
+    frame = getframe(1)
+    try:
+        for _ in range(32):
+            if frame is None:
+                return False
+            try:
+                locs = frame.f_locals
+                args = locs.get("args") if locs else None
+                if getattr(args, "force_engage", None) is True:
+                    return True
+                ui = locs.get("ui") if locs else None
+                debug = getattr(ui, "debug", None) if ui is not None else None
+                if getattr(debug, "force_engage", None) is True:
+                    return True
+            except Exception:
+                pass
+            frame = frame.f_back
+    finally:
+        del frame
+    return False
+
+
 def soft_esc_colour_main_only() -> bool:
     """True when this grab must colour only main.
 
-    Soft Esc is the latch false and ``gvd_engage.json`` not live. Grab runs
-    before ``note_engaged``, so a live engage file refuses the skip on the
-    rising edge the same way ``sensors.poll`` does. Engage keeps hitch colour.
+    Soft Esc is the latch false, ``gvd_engage.json`` not live, and debug
+    force-engage off. Grab runs before ``note_engaged``. A live engage file
+    or debug force-engage refuses the skip on the rising edge the same way
+    the file does for ``sensors.poll``. Engage keeps hitch colour.
     """
     from python.control.actuate import read_engage_flag, soft_esc_sensors_every_tick
 
     if soft_esc_sensors_every_tick():
         return False
-    return not bool(read_engage_flag(default=False))
+    if bool(read_engage_flag(default=False)):
+        return False
+    if _debug_force_engage():
+        return False
+    return True
 
 
 def clamp_far_m(cid: str, far_m: float) -> float:
@@ -1046,6 +1089,9 @@ class BeamNGPyBackend:
         self._grab_i = 0
         self._cache_frames: dict[str, np.ndarray] = {}
         self._cache_ts: dict[str, float] = {}
+        # Companions whose one Soft Esc warm read failed. Later Soft Esc grabs
+        # report STALE and do not poll again. A later good frame clears this.
+        self._soft_esc_warm_failed: set[str] = set()
         self._hitch_steps: list[tuple[str, float, float, float]] = []  # cid, near, far, update_s
         hitch = self.config.get("hitch") if isinstance(self.config.get("hitch"), dict) else {}
         self._hitch = hitch
@@ -1116,6 +1162,7 @@ class BeamNGPyBackend:
         self._unique_n = 0
         self._open_mono = time.monotonic()
         self._narrow_live_hitched = False
+        self._soft_esc_warm_failed.clear()
         for spec in cams:
             cid = str(spec.get("id") or "")
             if not cid or cid not in CAM_IDS:
@@ -1265,6 +1312,7 @@ class BeamNGPyBackend:
         self._frame_sig.clear()
         self._cache_frames.clear()
         self._cache_ts.clear()
+        self._soft_esc_warm_failed.clear()
         self._grab_i = 0
         self._unique_hz_ema = 0.0
         self._unique_n = 0
@@ -1289,8 +1337,10 @@ class BeamNGPyBackend:
     ) -> None:
         """Keep last pixels for perception.
 
-        A scheduled skip stays OK when a good frame is cached, and stays MISSING
-        when this cam has never been read. STALE is only a failed read.
+        A scheduled skip stays OK when a good frame is cached. No cache and
+        not a failed read leaves the default MISSING (Engage hitch skip).
+        STALE is a failed read. Soft Esc uses that after a warm that missed,
+        so a never-coloured companion does not stay MISSING.
         """
         bgr = self._cache_frames.get(cid)
         if not failed:
@@ -1423,15 +1473,24 @@ class BeamNGPyBackend:
         phase = grab_phase_of(grab_i, self._hitch)
         companion_polled = False
         unique_ids: list[str] = []
-        # Soft Esc: stream_raw/colour for main only. Companions stay attached
-        # and reuse last-good (OK) or stay MISSING if never read. A failed
-        # main read is still STALE. Engage uses the hitch colour schedule.
+        # Soft Esc: warm each companion once so a cold cam can leave MISSING,
+        # then stream_raw/colour main only. Last-good stays OK. A warm that
+        # missed stays STALE and is not polled again. Engage uses the hitch
+        # colour schedule (a not-yet-due cam may still be MISSING).
         soft_esc_main = soft_esc_colour_main_only()
+        soft_esc_coloured_companion = False
         for cid, cam in self._sensors.items():
+            warming = False
             if soft_esc_main and cid != "main":
-                self._reuse_cached(cid, frames, timestamps, health, failed=False)
-                continue
-            if not self._grab_this_tick(cid, grab_i):
+                if cid in self._cache_frames:
+                    self._reuse_cached(cid, frames, timestamps, health, failed=False)
+                    continue
+                if cid in self._soft_esc_warm_failed:
+                    self._reuse_cached(cid, frames, timestamps, health, failed=True)
+                    continue
+                warming = True
+                soft_esc_coloured_companion = True
+            elif not self._grab_this_tick(cid, grab_i):
                 self._reuse_cached(cid, frames, timestamps, health, failed=False)
                 continue
             if cid != "main":
@@ -1439,17 +1498,24 @@ class BeamNGPyBackend:
             try:
                 bgr = read_camera_colour(cam, cid=cid, resolution=self._resolution.get(cid))
                 if bgr is None:
+                    if warming:
+                        self._soft_esc_warm_failed.add(cid)
                     self._reuse_cached(cid, frames, timestamps, health, failed=True)
                     continue
                 bgr = resize_long_side(bgr, self.long_side)
                 sig = frame_signature(bgr)
                 unique = sig != self._frame_sig.get(cid)
                 self._store_frame(cid, bgr, ts, frames, timestamps, health)
+                self._soft_esc_warm_failed.discard(cid)
                 if unique:
                     self._frame_sig[cid] = sig
                     unique_ids.append(cid)
             except Exception:
-                health[cid] = CamHealth.ERROR
+                if warming:
+                    self._soft_esc_warm_failed.add(cid)
+                    self._reuse_cached(cid, frames, timestamps, health, failed=True)
+                else:
+                    health[cid] = CamHealth.ERROR
         unique_n = len(unique_ids)
         now = time.perf_counter()
         if grab_i > 0 and self._last_unique_tick_t > 0:
@@ -1470,7 +1536,9 @@ class BeamNGPyBackend:
             f"repeat_div={self._grab_div.get('repeatL', REPEAT_GRAB_DIV)} "
             f"rear_div={self._rear_grab_div}"
         )
-        if soft_esc_main:
+        if soft_esc_main and soft_esc_coloured_companion:
+            note += " soft_esc_warm=1"
+        elif soft_esc_main:
             note += " soft_esc_colour=main"
         return CameraFrameBundle(
             frames=frames,

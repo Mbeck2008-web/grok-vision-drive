@@ -782,9 +782,11 @@ def check_beamngpy_open_passes_near_far() -> None:
 def check_beamngpy_side_grab_half_rate() -> None:
     """Engage: main stream_raw every tick. Companions poll on the hitch wheel.
 
-    Soft Esc (engaged=false): colour and stream_raw are main only. The other
-    seven stay attached and reuse last-good, or stay MISSING if never read.
-    A live gvd_engage.json restores hitch colour before note_engaged.
+    Soft Esc (engaged=false): one warm colour per companion with no last-good
+    frame, then colour and stream_raw are main only. The other seven stay
+    attached and reuse last-good OK, or STALE after a failed warm — not MISSING.
+    A live gvd_engage.json or debug force-engage restores hitch colour on the
+    rising-edge grab, before note_engaged.
     """
     import sys
     import types
@@ -991,18 +993,27 @@ def check_beamngpy_side_grab_half_rate() -> None:
         assert camera_grab_due("wide", n, be._hitch)
         assert not camera_grab_due("narrow", n, be._hitch)
 
-        # Never-read companion stays MISSING. Skip is not a failed read (not STALE).
+        # Cache drop is not a failed read. Soft Esc warms that companion once.
         be._cache_frames.pop("wide", None)
         be._cache_ts.pop("wide", None)
+        be._frame_sig.pop("wide", None)
         wide_polls = polls["gvd_wide"]
+        other_polls = {cid: polls[f"gvd_{cid}"] for cid in CAM_IDS if cid not in ("main", "wide")}
         cold = be.grab()
-        assert cold.health["wide"] == CamHealth.MISSING
+        assert cold.health["wide"] == CamHealth.OK
         assert cold.health["wide"] != CamHealth.STALE
-        assert "wide" not in cold.frames
-        assert polls["gvd_wide"] == wide_polls
+        assert cold.health["wide"] != CamHealth.MISSING
+        assert "wide" in cold.frames
+        assert polls["gvd_wide"] == wide_polls + 1
         assert streams["gvd_wide"] == 0
         assert cold.health["main"] == CamHealth.OK
-        assert cold.grab_poll_free is True
+        assert cold.grab_poll_free is False
+        assert "soft_esc_warm=1" in cold.note
+        assert "soft_esc_colour=main" not in cold.note
+        for cid, n0 in other_polls.items():
+            assert polls[f"gvd_{cid}"] == n0, cid
+            assert cold.health[cid] == CamHealth.OK, cid
+        assert sum(1 for cid in CAM_IDS if cold.health_str()[cid] == "ok") == 8
         assert len(be._sensors) == 8
 
         # Rising edge: latch still false. A live engage file colours the due companion.
@@ -1021,12 +1032,209 @@ def check_beamngpy_side_grab_half_rate() -> None:
         assert edge.health["narrow"] == CamHealth.OK
         assert edge.grab_poll_free is False
         assert "soft_esc_colour=main" not in edge.note
-        assert edge.health["wide"] == CamHealth.MISSING  # not due, still never re-read
+        assert "soft_esc_warm=1" not in edge.note
+        assert polls["gvd_wide"] == wide_polls + 1  # warmed once; this slot is not wide
+        assert edge.health["wide"] == CamHealth.OK
         assert len(be._sensors) == 8
 
         act.write_engage_flag(False)
         act.note_soft_esc_engaged(False)
         assert soft_esc_colour_main_only() is True
+
+        def _cam_ok(bundle) -> int:
+            hs = bundle.health_str()
+            return sum(1 for cid in CAM_IDS if hs.get(cid) == "ok")
+
+        def _drop_companion_caches() -> None:
+            for cid in CAM_IDS:
+                if cid == "main":
+                    continue
+                be._cache_frames.pop(cid, None)
+                be._cache_ts.pop(cid, None)
+                be._frame_sig.pop(cid, None)
+            be._soft_esc_warm_failed.clear()
+
+        # Cold Soft Esc: never-coloured companions warm once, then 8/8 last-good.
+        _drop_companion_caches()
+        cold_before = {cid: polls[f"gvd_{cid}"] for cid in CAM_IDS}
+        cold_streams = {cid: streams[f"gvd_{cid}"] for cid in CAM_IDS}
+        warmed = be.grab()
+        assert warmed.grab_poll_free is False
+        assert "soft_esc_warm=1" in warmed.note
+        assert "soft_esc_colour=main" not in warmed.note
+        assert _cam_ok(warmed) == 8
+        assert streams["gvd_main"] == cold_streams["main"] + 1
+        for cid in CAM_IDS:
+            assert warmed.health[cid] == CamHealth.OK, cid
+            assert cid in warmed.frames, cid
+            if cid == "main":
+                continue
+            assert polls[f"gvd_{cid}"] == cold_before[cid] + 1, cid
+            assert streams[f"gvd_{cid}"] == cold_streams[cid], cid
+        steady_before = {cid: polls[f"gvd_{cid}"] for cid in CAM_IDS}
+        steady = be.grab()
+        assert steady.grab_poll_free is True
+        assert "soft_esc_colour=main" in steady.note
+        assert "soft_esc_warm=1" not in steady.note
+        assert steady.unique_gpu_ids == ("main",)
+        assert _cam_ok(steady) == 8
+        assert streams["gvd_main"] == cold_streams["main"] + 2
+        for cid in CAM_IDS:
+            if cid == "main":
+                continue
+            assert polls[f"gvd_{cid}"] == steady_before[cid], cid
+            assert streams[f"gvd_{cid}"] == cold_streams[cid], cid
+            assert steady.health[cid] == CamHealth.OK, cid
+            assert cid not in steady.unique_gpu_ids
+        assert len(be._sensors) == 8
+
+        def _advance_to_companion_slot() -> None:
+            # Soft Esc only. A force-engage frame would hitch-colour these grabs.
+            assert soft_esc_colour_main_only() is True
+            guard = 0
+            while not any(
+                cid != "main" and camera_grab_due(cid, be._grab_i, be._hitch) for cid in CAM_IDS
+            ):
+                guard += 1
+                assert guard <= 16
+                held = {cid: polls[f"gvd_{cid}"] for cid in CAM_IDS}
+                skipped = be.grab()
+                assert skipped.grab_poll_free is True
+                assert "soft_esc_colour=main" in skipped.note
+                assert _cam_ok(skipped) == 8
+                for cid in CAM_IDS:
+                    if cid == "main":
+                        continue
+                    assert polls[f"gvd_{cid}"] == held[cid], cid
+
+        def _force_edge_grab():
+            gi = be._grab_i
+            due = [cid for cid in CAM_IDS if cid != "main" and camera_grab_due(cid, gi, be._hitch)]
+            assert len(due) == 1, (gi, due)
+            before_p = {cid: polls[f"gvd_{cid}"] for cid in CAM_IDS}
+            before_s = {cid: streams[f"gvd_{cid}"] for cid in CAM_IDS}
+            bundle = be.grab()
+            return due, before_p, before_s, bundle
+
+        def _assert_force_edge(due, before_p, before_s, bundle) -> None:
+            assert soft_esc_colour_main_only() is True
+            assert "soft_esc_colour=main" not in bundle.note
+            assert "soft_esc_warm=1" not in bundle.note
+            assert bundle.grab_poll_free is False
+            assert streams["gvd_main"] == before_s["main"] + 1
+            for cid in CAM_IDS:
+                if cid == "main":
+                    continue
+                assert streams[f"gvd_{cid}"] == before_s[cid], cid
+                assert bundle.health[cid] == CamHealth.OK, cid
+                if cid in due:
+                    assert polls[f"gvd_{cid}"] == before_p[cid] + 1, cid
+                else:
+                    assert polls[f"gvd_{cid}"] == before_p[cid], cid
+            quiet_p = {cid: polls[f"gvd_{cid}"] for cid in CAM_IDS}
+            quiet_main = streams["gvd_main"]
+            quiet = be.grab()
+            assert quiet.grab_poll_free is True
+            assert "soft_esc_colour=main" in quiet.note
+            assert _cam_ok(quiet) == 8
+            assert streams["gvd_main"] == quiet_main + 1
+            for cid in CAM_IDS:
+                if cid == "main":
+                    continue
+                assert polls[f"gvd_{cid}"] == quiet_p[cid], cid
+
+        # Debug --force-engage / force_engage: rising edge hitch-colours the due
+        # companion while the latch is still false and the engage file is absent.
+        def _via_args():
+            args = type("A", (), {"force_engage": True})()
+            assert args.force_engage is True
+            assert act.soft_esc_sensors_every_tick() is False
+            assert soft_esc_colour_main_only() is False
+            return _force_edge_grab()
+
+        _advance_to_companion_slot()
+        _assert_force_edge(*_via_args())
+
+        def _via_ui():
+            ui = type("U", (), {})()
+            ui.debug = type("D", (), {"force_engage": True})()
+            assert soft_esc_colour_main_only() is False
+            return _force_edge_grab()
+
+        _advance_to_companion_slot()
+        _assert_force_edge(*_via_ui())
+
+        _advance_to_companion_slot()
+        saved_argv = list(sys.argv)
+        sys.argv = [*saved_argv, "--force-engage"]
+        try:
+            assert soft_esc_colour_main_only() is False
+            argv_edge = _force_edge_grab()
+        finally:
+            sys.argv = saved_argv
+        _assert_force_edge(*argv_edge)
+
+        # Cold debug engage is hitch colour, not a Soft Esc warm of all seven.
+        def _cold_force():
+            args = type("A", (), {"force_engage": True})()
+            assert soft_esc_colour_main_only() is False
+            _drop_companion_caches()
+            gi = be._grab_i
+            due = [cid for cid in CAM_IDS if cid != "main" and camera_grab_due(cid, gi, be._hitch)]
+            assert len(due) == 1, (gi, due)
+            before_p = {cid: polls[f"gvd_{cid}"] for cid in CAM_IDS}
+            bundle = be.grab()
+            return due[0], before_p, bundle
+
+        _advance_to_companion_slot()
+
+        due_cid, before_p, forced_cold = _cold_force()
+        assert soft_esc_colour_main_only() is True
+        assert polls[f"gvd_{due_cid}"] == before_p[due_cid] + 1
+        assert forced_cold.health[due_cid] == CamHealth.OK
+        assert "soft_esc_warm=1" not in forced_cold.note
+        assert "soft_esc_colour=main" not in forced_cold.note
+        for cid in CAM_IDS:
+            if cid in ("main", due_cid):
+                continue
+            assert polls[f"gvd_{cid}"] == before_p[cid], cid
+            assert forced_cold.health[cid] == CamHealth.MISSING, cid
+
+        # Failed warm sticks at STALE. The next Soft Esc grab does not poll it.
+        fail_n = {"n": 0}
+
+        class FailWide:
+            is_streaming = True
+            resolution = (8, 8)
+
+            def poll(self):
+                fail_n["n"] += 1
+                return None
+
+            def stream_raw(self):
+                raise AssertionError("wide must not stream_raw")
+
+        saved_wide = be._sensors["wide"]
+        be._sensors["wide"] = FailWide()
+        be._cache_frames.pop("wide", None)
+        be._cache_ts.pop("wide", None)
+        be._soft_esc_warm_failed.discard("wide")
+        missed = be.grab()
+        assert missed.health["wide"] == CamHealth.STALE
+        assert missed.health["wide"] != CamHealth.MISSING
+        assert "wide" not in missed.frames
+        assert fail_n["n"] == 1
+        assert "soft_esc_warm=1" in missed.note
+        again = be.grab()
+        assert again.health["wide"] == CamHealth.STALE
+        assert fail_n["n"] == 1
+        assert "soft_esc_colour=main" in again.note
+        assert again.grab_poll_free is True
+        assert all(again.health[cid] != CamHealth.MISSING for cid in CAM_IDS)
+        be._sensors["wide"] = saved_wide
+        be._cache_frames["wide"] = np.zeros((8, 8, 3), dtype=np.uint8)
+        be._cache_ts["wide"] = 0.0
+        be._soft_esc_warm_failed.discard("wide")
 
         # Main never polls. Wide/narrow poll and do not stream_raw.
         class NoStream:

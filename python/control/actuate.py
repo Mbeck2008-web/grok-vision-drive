@@ -408,24 +408,31 @@ class DriverInputs:
 # restarts when poll() returns so PollGPSGE inside the same poll cannot
 # expire the snapshot before electrics are read. A miss still polls; Engage
 # hold reads speed on that path.
-# Soft Esc (latch false) may skip the GE poll for 200 ms and republish the
-# last-good map here so this read does not open a second sensors.poll.
+# Soft Esc (latch false and gvd_engage.json not live) may skip the GE poll
+# for 200 ms and republish the last-good map here so this read does not open
+# a second sensors.poll. TechSession.poll reads the engage flag before that
+# hold, because note_engaged runs after poll_vehicle.
 SENSOR_POLL_REUSE_S = 0.05
 
-# Previous grab's supervisor engage bit. note_engaged runs after poll, so
-# this is one grab behind the rising edge. Default false: Soft Esc coalesces
-# without a run_vision edit. True: TechSession keeps Tip #1 (poll every grab).
+# Engage latch updated by note_engaged after poll_vehicle. Default false:
+# Soft Esc coalesces without a run_vision edit. True: one sensors.poll per
+# grab (Tip #1). The rising edge does not wait for this latch; poll() also
+# refuses the hold when read_engage_flag() is true.
 _soft_esc_engaged = False
 
 
 def note_soft_esc_engaged(engaged: bool) -> None:
-    """Record whether the next ``TechSession.poll`` must poll every grab."""
+    """Latch Engage so a grab with this bit set polls every tick.
+
+    Callers that flip this must restore it. ``TechSession.poll`` does not
+    wait for the latch on the rising edge; it also reads ``read_engage_flag``.
+    """
     global _soft_esc_engaged
     _soft_esc_engaged = bool(engaged)
 
 
 def soft_esc_sensors_every_tick() -> bool:
-    """True when Engage forbids the Soft Esc sensors.poll coalesce."""
+    """True when the engage latch forbids the Soft Esc sensors.poll coalesce."""
     return bool(_soft_esc_engaged)
 
 
@@ -626,7 +633,9 @@ class BeamNGPyActuator:
 
     def note_engaged(self, engaged: bool) -> None:
         self.engaged = bool(engaged)
-        # Next grab. This grab already polled under the previous bit.
+        # Grab loop: poll_vehicle, then note_engaged. The latch covers later
+        # grabs (and force_engage, which does not write gvd_engage.json).
+        # The rising-edge poll reads read_engage_flag itself.
         note_soft_esc_engaged(self.engaged)
 
     def _write_release_cmd(self, seq: int, reason: str) -> None:
@@ -785,6 +794,7 @@ class CmdJsonActuator:
 
     def note_engaged(self, engaged: bool) -> None:
         self.engaged = bool(engaged)
+        # Same latch as BeamNGPyActuator. poll_vehicle already ran this grab.
         note_soft_esc_engaged(self.engaged)
 
     def note_ack(self, fb: EgoFeedback | None) -> None:

@@ -95,6 +95,193 @@ def check_grab_loop_poll_before_electrics() -> None:
     )
 
 
+def check_soft_esc_engage_rising_edge() -> None:
+    """Grab order is poll, then note_engaged. The first engaged poll is real.
+
+    The latch is still false at that poll. A live gvd_engage.json must refuse
+    Soft Esc-hold. Also checks empty-map, thrown poll, close / no-vehicle
+    cache clears, map copy, and latch restore.
+    """
+    import time
+
+    import python.control.actuate as act
+    from python.sensors.tech import TechSession
+
+    class EgoSensors(dict):
+        def __init__(self) -> None:
+            super().__init__()
+            self.n = 0
+            self.speed = 3.0
+            self.empty = False
+            self.boom = False
+
+        def poll(self) -> None:
+            self.n += 1
+            if self.boom:
+                raise RuntimeError("sensors.poll failed")
+            self.clear()
+            if self.empty:
+                return None
+            self["electrics"] = {
+                "wheelspeed": float(self.speed),
+                "steering_input": 0.1,
+                "throttle_input": 0.0,
+                "brake_input": 0.0,
+            }
+            return None
+
+    class EgoVeh:
+        vid = "etk_player"
+        options = {"model": "etk800"}
+
+        def __init__(self) -> None:
+            self.sensors = EgoSensors()
+            self.state = {
+                "pos": (1.0, 2.0, 0.0),
+                "dir": (0.0, 1.0, 0.0),
+                "up": (0.0, 0.0, 1.0),
+                "vel": (0.0, 3.0, 0.0),
+            }
+
+    prev_latch = act.soft_esc_sensors_every_tick()
+    engage = act.engage_path()
+    prev_bytes = engage.read_bytes() if engage.is_file() else None
+    session = TechSession({"wait_vehicle_s": 0, "sensors": {"electrics": True}})
+    veh = EgoVeh()
+    session.vehicle = veh
+    session.attached = {"electrics": True}
+    try:
+        act.note_soft_esc_engaged(False)
+        act.write_engage_flag(False)
+        assert act.read_engage_flag(default=False) is False
+        assert act.soft_esc_sensors_every_tick() is False
+
+        first = session.poll()
+        assert veh.sensors.n == 1
+        assert first.speed_mps == 3.0
+        assert first.pos == (1.0, 2.0, 0.0)
+        cached = session._last_sensor_map
+        assert cached is not None and cached is not veh.sensors
+        assert cached["electrics"] is not veh.sensors["electrics"]
+        veh.sensors["electrics"]["wheelspeed"] = 0.0
+        assert cached["electrics"]["wheelspeed"] == 3.0
+
+        session._sensors_poll_mono = time.monotonic()
+        held = session.poll()
+        assert veh.sensors.n == 1
+        assert held.sensors_poll_ms == 0.0
+        assert held.speed_mps == 3.0
+        assert held.pos == (1.0, 2.0, 0.0)
+        assert "coalesced" in held.note
+        el_held = act.read_electrics(veh)
+        assert el_held is not None and el_held["wheelspeed"] == 3.0
+        assert veh.sensors.n == 1
+
+        veh.sensors.speed = 9.0
+        veh.state["pos"] = (9.0, 1.0, 0.0)
+        veh.state["vel"] = (9.0, 0.0, 0.0)
+        act.write_engage_flag(True)
+        assert act.read_engage_flag(default=False) is True
+        assert act.soft_esc_sensors_every_tick() is False
+        session._sensors_poll_mono = time.monotonic()
+        engaged_grab = session.poll()
+        assert act.soft_esc_sensors_every_tick() is False
+        assert veh.sensors.n == 2
+        assert engaged_grab.speed_mps == 9.0
+        assert engaged_grab.pos == (9.0, 1.0, 0.0)
+        assert "coalesced" not in (engaged_grab.note or "")
+        el_on = act.read_electrics(veh)
+        assert el_on is not None and el_on["wheelspeed"] == 9.0
+        assert veh.sensors.n == 2
+        act.BeamNGPyActuator(veh).note_engaged(True)
+        assert act.soft_esc_sensors_every_tick() is True
+        veh.sensors.speed = 6.0
+        veh.state["pos"] = (6.0, 1.0, 0.0)
+        session._sensors_poll_mono = time.monotonic()
+        latched = session.poll()
+        assert veh.sensors.n == 3
+        assert latched.speed_mps == 6.0
+        assert latched.pos == (6.0, 1.0, 0.0)
+        assert "coalesced" not in (latched.note or "")
+
+        act.note_soft_esc_engaged(False)
+        act.write_engage_flag(False)
+        prior_map = session._last_sensor_map
+        prior_data = session._last_vehicle_data
+        assert prior_map is not None and prior_data is not None
+        assert prior_data.speed_mps == 6.0
+        session._sensors_poll_mono = time.monotonic() - 1.0
+        frozen_mono = session._sensors_poll_mono
+        veh.sensors.empty = True
+        n_empty = veh.sensors.n
+        session.poll()
+        assert veh.sensors.n == n_empty + 1
+        assert session._last_sensor_map is prior_map
+        assert session._last_vehicle_data is prior_data
+        assert session._sensors_poll_mono == frozen_mono
+        assert prior_map["electrics"]["wheelspeed"] == 6.0
+        veh.sensors.empty = False
+
+        veh.sensors.speed = 4.0
+        rearmed = session.poll()
+        assert rearmed.speed_mps == 4.0
+        assert session._sensors_poll_mono is not None
+        assert session._last_sensor_map is not None
+        assert session._last_sensor_map["electrics"]["wheelspeed"] == 4.0
+        session._sensors_poll_mono = time.monotonic()
+        veh.sensors.boom = True
+        act.write_engage_flag(True)
+        n_throw = veh.sensors.n
+        session.poll()
+        assert veh.sensors.n == n_throw + 1
+        assert session._sensors_poll_mono is None
+        assert session._sensors_poll_vehicle_id is None
+        veh.sensors.boom = False
+        veh.sensors.speed = 8.0
+        act.write_engage_flag(False)
+        assert act.soft_esc_sensors_every_tick() is False
+        n_retry = veh.sensors.n
+        retry = session.poll()
+        assert veh.sensors.n == n_retry + 1
+        assert retry.speed_mps == 8.0
+        assert "coalesced" not in (retry.note or "")
+
+        session._sensors_poll_mono = time.monotonic()
+        n_none = veh.sensors.n
+        session.vehicle = None
+        missing = session.poll()
+        assert missing.connected is False
+        assert session._last_sensor_map is None
+        assert session._last_vehicle_data is None
+        assert session._sensors_poll_mono is None
+        assert session._sensors_poll_vehicle_id is None
+        session.vehicle = veh
+        back = session.poll()
+        assert veh.sensors.n == n_none + 1
+        assert back.speed_mps == 8.0
+        assert "coalesced" not in (back.note or "")
+
+        session._sensors_poll_mono = time.monotonic()
+        n_close = veh.sensors.n
+        session.close()
+        assert session.vehicle is None
+        assert session._last_sensor_map is None
+        assert session._last_vehicle_data is None
+        assert session._sensors_poll_mono is None
+        assert session._sensors_poll_vehicle_id is None
+        session.vehicle = veh
+        after_close = session.poll()
+        assert veh.sensors.n == n_close + 1
+        assert after_close.speed_mps == 8.0
+        assert "coalesced" not in (after_close.note or "")
+    finally:
+        act.note_soft_esc_engaged(prev_latch)
+        if prev_bytes is None:
+            engage.unlink(missing_ok=True)
+        else:
+            engage.write_bytes(prev_bytes)
+
+
 def main() -> None:
     # 2) stale heartbeat → zero throttle + brake
     cmd = safe_command(
@@ -404,9 +591,16 @@ def main() -> None:
 
     check_grab_loop_poll_before_electrics()
     check_electrics_segment_timer()
+    check_soft_esc_engage_rising_edge()
 
     print("test_m3_actuate: OK")
 
 
 if __name__ == "__main__":
-    main()
+    import python.control.actuate as _act
+
+    _prev_soft_esc = _act.soft_esc_sensors_every_tick()
+    try:
+        main()
+    finally:
+        _act.note_soft_esc_engaged(_prev_soft_esc)

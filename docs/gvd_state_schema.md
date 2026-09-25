@@ -235,8 +235,8 @@ Lua (`gvd_main.applyCmdJson`, 20 Hz): `input.event('steering', s, 2, 900, 0, nil
 | --- | --- | --- |
 | `speed_mps` | float | `wheelspeed` (fallback `airspeed`) — feeds `ego.speed_mps`, TTC, speed plan |
 | `steering_input` / `throttle_input` / `brake_input` | float | Applied electrics (GVD's command while the Direct Drive source is locked). Fallback override signal when `player_device` is false |
-| `player_device` | bool | True when vehicle Lua saw a non-`gvd` `input.lastInputs` source (physical wheel/pad/keys) |
-| `player_steering` / `player_throttle` / `player_brake` | float | Strongest non-`gvd` lastInputs axis. Override uses these as an absolute axis when `player_device` is true (centered wheel is 0, not residual vs `cmd.steer`) |
+| `player_device` | bool | True when vehicle Lua saw a non-`gvd` `input.lastInputs` source (physical wheel/pad/keys). Sources `adas` / `beamngpy` / `tech` are not a player device |
+| `player_steering` / `player_throttle` / `player_brake` | float | Strongest non-`gvd` lastInputs axis. Retail override uses these as an absolute axis when `player_device` is true (centered wheel is 0, not residual vs `cmd.steer`). Soft Esc beamngpy does not: it judges electrics against the command plus a baseline taken at engage |
 | `applied_seq` | int | Last cmd seq Lua applied. Python claims `cmd_applied` only when `0 <= cmd_seq - applied_seq <= 5` |
 | `applying` | bool | Lua currently holds the inputs |
 | `mtime` | int | `os.time()`; Python uses the file mtime, fresh ≤ 1 s |

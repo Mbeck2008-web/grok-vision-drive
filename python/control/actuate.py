@@ -42,6 +42,37 @@ TECH_HOLD_BRAKE = 0.99
 TECH_HOLD_SPEED_MPS = 0.5
 TECH_HOLD_GEAR = 0
 TECH_DRIVE_GEAR = 1
+# Let neutralSelectionDelay (~0.5 s) finish before asking the lever to move again.
+TECH_DRIVE_ARM_S = 0.55
+# Vehicle VM. Idempotent: shiftUp only from N/0, otherwise jump to the 'D' letter in
+# automaticModes (1-based string.find). Never shiftDown, never gear -1. Parking brake
+# and clutch are zeroed on source gvd so they are not a player lastInputs axis.
+TECH_DRIVE_SHIFT_LUA = (
+    "pcall(function() "
+    "local c=controller and controller.mainController; "
+    "if c and c.setGearboxMode then pcall(function() c.setGearboxMode('realistic') end) end; "
+    "if input and input.event then pcall(function() "
+    "input.event('parkingbrake',0,2,0,0,nil,'gvd'); "
+    "input.event('clutch',0,2,0,0,nil,'gvd') end) end; "
+    "local logic=c and c.shiftLogic; "
+    "local pos=''; "
+    "if logic and logic.getGearPosition then local ok,p=pcall(logic.getGearPosition); "
+    "if ok and p~=nil then pos=tostring(p) end end; "
+    "if pos=='' and electrics and electrics.values and electrics.values.gear~=nil then "
+    "pos=tostring(electrics.values.gear) end; "
+    "local n=tonumber(pos); "
+    "if pos=='D' or pos=='S' or pos=='M' or pos=='L' or (n and n>=1) then return end; "
+    "if (pos=='N' or pos=='0' or n==0) and c and c.shiftUp then "
+    "local up=pcall(function() c.shiftUp() end); "
+    "if not up then up=pcall(function() c:shiftUp() end) end; "
+    "if up then return end end; "
+    "if logic and c and c.shiftToGearIndex then "
+    "local modes=logic.automaticModes or logic.modes; "
+    "if type(modes)=='string' then local d=string.find(modes,'D',1,true); "
+    "if d then local jumped=pcall(function() c.shiftToGearIndex(d) end); "
+    "if not jumped then pcall(function() c:shiftToGearIndex(d) end) end end end end "
+    "end)"
+)
 
 
 @dataclass
@@ -237,6 +268,45 @@ def _clip_steer(v: float) -> float:
     return float(max(-1.0, min(1.0, v)))
 
 
+def gear_is_forward(gear: Any) -> bool:
+    """True when the electrics gear string/index is already a forward range.
+
+    Automatics report the shifter letter (``D`` / ``S`` / ``M`` / ``L``). Manuals
+    report a gear index (``1`` and up). ``N``, ``P``, ``R``, ``0``, and a missing
+    echo are not forward — those still need a drive arm.
+    """
+    if gear is None or isinstance(gear, bool):
+        return False
+    if isinstance(gear, (int, float)):
+        try:
+            return int(gear) >= TECH_DRIVE_GEAR
+        except (TypeError, ValueError):
+            return False
+    text = str(gear).strip().upper()
+    if text in {"D", "S", "M", "L"}:
+        return True
+    if len(text) >= 2 and text[0] == "M" and text[1:].isdigit():
+        return int(text[1:]) >= TECH_DRIVE_GEAR
+    if text.isdigit():
+        return int(text) >= TECH_DRIVE_GEAR
+    return False
+
+
+def _unexpected_kw(err: BaseException) -> str | None:
+    """Pull the name out of ``got an unexpected keyword argument 'clutch'``."""
+    msg = str(err)
+    marker = "unexpected keyword argument "
+    i = msg.find(marker)
+    if i < 0:
+        return None
+    rest = msg[i + len(marker) :].strip()
+    if len(rest) >= 2 and rest[0] in "'\"":
+        end = rest.find(rest[0], 1)
+        if end > 1:
+            return rest[1:end]
+    return None
+
+
 def _tech_gear(value: int) -> int:
     """Clamp to a non-reverse BeamNGpy gear int (0 N, 1+ forward). Never -1 or 'D'."""
     try:
@@ -260,7 +330,8 @@ def tech_control_kwargs(
 
     Shift mode is realistic_automatic (not arcade). Holds: throttle=0, brake=1,
     gear=0, ±parkingbrake. Forward motion only with gear>=1 and throttle>0.
-    gear is int only; never -1, never letter D. clutch optional (omitted).
+    gear is int only; never -1, never letter D. Drive also sends clutch=0 so a
+    resting clutch pedal cannot hold the gearbox out of gear.
     """
     if release:
         return {
@@ -278,6 +349,7 @@ def tech_control_kwargs(
             "throttle": throttle_v,
             "brake": brake_v,
             "parkingbrake": 0.0,
+            "clutch": 0.0,
             "gear": _tech_gear(TECH_DRIVE_GEAR),
         }
     parking = 0.0
@@ -676,7 +748,9 @@ class BeamNGPyActuator:
     per SOFT_ESC_FILE_PERIOD_S. Engaged gate holds
     (preview_blocked, AEB, veto) still apply the stop command, remapped off
     reverse: realistic_automatic, hold gear=0 + brake ±parkingbrake, drive
-    gear>=1, never gear=-1.
+    gear>=1 plus clutch=0, never gear=-1. A failed set_shift_mode is logged
+    and retried. Throttle>0 while the echoed gear is not forward also queues
+    a vehicle-Lua arm that leaves N/P without selecting reverse.
     """
 
     name = "beamngpy"
@@ -688,6 +762,10 @@ class BeamNGPyActuator:
         self._latched = False
         self._release_cmd_mono: float | None = None
         self.release_cmd_skips = 0
+        self._shift_fail_logged = False
+        self._shift_ok_logged = False
+        self._drive_arm_mono: float | None = None
+        self.drive_arm_n = 0
 
     def note_engaged(self, engaged: bool) -> None:
         self.engaged = bool(engaged)
@@ -763,22 +841,108 @@ class BeamNGPyActuator:
         except Exception:
             return False
         self._shift_set = False
+        self._drive_arm_mono = None
+        self.drive_arm_n = 0
+        self._shift_ok_logged = False
+        self._shift_fail_logged = False
         return True
 
+    def _echo_gear(self) -> Any:
+        """Cached electrics gear, if the last poll left it on the vehicle. No extra poll."""
+        sensors = getattr(self.vehicle, "sensors", None)
+        if sensors is None:
+            return None
+        el = None
+        try:
+            el = sensors["electrics"]
+        except Exception:
+            el = None
+        if isinstance(el, dict):
+            return el.get("gear")
+        return None
+
+    def _arm_shift_mode(self) -> None:
+        """Engage arms realistic_automatic. A thrown ack is logged and retried, not swallowed."""
+        veh = self.vehicle
+        if veh is None or not hasattr(veh, "set_shift_mode"):
+            return
+        try:
+            veh.set_shift_mode(TECH_SHIFT_MODE)
+        except Exception as e:
+            self._shift_set = False
+            if not self._shift_fail_logged:
+                self._shift_fail_logged = True
+                print(
+                    f"[GVD] set_shift_mode({TECH_SHIFT_MODE}) failed: {type(e).__name__}: {e}",
+                    flush=True,
+                )
+            return
+        self._shift_set = True
+        if not self._shift_ok_logged:
+            self._shift_ok_logged = True
+            print(f"[GVD] set_shift_mode({TECH_SHIFT_MODE}) ok", flush=True)
+
+    def _queue_drive_shift(self, gear_echo: Any, now: float) -> None:
+        """Ask the vehicle VM to leave N/P without selecting reverse. Rate-limited.
+
+        The chunk itself no-ops once the lever is already in a forward range, so a
+        stale Python echo of ``N`` cannot walk D → 2.
+        """
+        last = self._drive_arm_mono
+        if last is not None and (now - last) < TECH_DRIVE_ARM_S:
+            return
+        q = getattr(self.vehicle, "queue_lua_command", None)
+        if not callable(q):
+            return
+        self._drive_arm_mono = now
+        self.drive_arm_n += 1
+        if self.drive_arm_n == 1 or self.drive_arm_n % 8 == 0:
+            print(
+                f"[GVD] drive arm gear={gear_echo!r} attempt={self.drive_arm_n} "
+                "parkingbrake=0 clutch=0",
+                flush=True,
+            )
+        try:
+            q(TECH_DRIVE_SHIFT_LUA, False)
+        except TypeError:
+            try:
+                q(TECH_DRIVE_SHIFT_LUA)
+            except Exception as e:
+                print(
+                    f"[GVD] drive arm queue_lua_command failed: {type(e).__name__}: {e}",
+                    flush=True,
+                )
+        except Exception as e:
+            print(
+                f"[GVD] drive arm queue_lua_command failed: {type(e).__name__}: {e}",
+                flush=True,
+            )
+
     def _invoke_control(self, kwargs: dict[str, Any]) -> None:
-        """Send control kwargs. Never fall back to arcade brake-hold (no gear, brake=1)."""
-        attempts: list[dict[str, Any]] = [dict(kwargs)]
-        if "gear" in kwargs:
-            attempts.append({k: v for k, v in kwargs.items() if k != "gear"})
+        """Send control kwargs. Never fall back to arcade brake-hold (no gear, brake=1).
+
+        An unexpected keyword (older ``control`` without ``clutch``) is dropped and
+        retried. ``gear`` is dropped only when the error names it, and that drop is logged.
+        """
+        kw = dict(kwargs)
         last_err: Exception | None = None
-        for kw in attempts:
+        for _ in range(6):
             if is_reverse_control(kw) or is_arcade_reverse_hold(kw):
-                continue
+                break
             try:
                 self.vehicle.control(**kw)
                 return
             except TypeError as e:
                 last_err = e
+                name = _unexpected_kw(e)
+                if name in ("steering", "throttle", "brake") or name not in kw:
+                    raise
+                if name == "gear":
+                    print(
+                        f"[GVD] vehicle.control rejected gear: {e}",
+                        flush=True,
+                    )
+                kw = {k: v for k, v in kw.items() if k != name}
                 continue
         if last_err is not None:
             raise last_err
@@ -790,18 +954,11 @@ class BeamNGPyActuator:
         if self.vehicle is None:
             return "no_vehicle"
         try:
-            # Engage arms realistic_automatic once. A release with the shifter
+            # Engage arms realistic_automatic. A release with the shifter
             # still unset must only clear pedals, not arm that mode on the way out.
-            if (
-                not release
-                and not self._shift_set
-                and hasattr(self.vehicle, "set_shift_mode")
-            ):
-                try:
-                    self.vehicle.set_shift_mode(TECH_SHIFT_MODE)
-                    self._shift_set = True
-                except Exception:
-                    pass
+            # A failed ack is logged and retried next tick (_shift_set stays false).
+            if not release and not self._shift_set:
+                self._arm_shift_mode()
             speed_mps = None
             if (
                 not release
@@ -813,6 +970,10 @@ class BeamNGPyActuator:
                 steer, throttle, brake, release=release, speed_mps=speed_mps
             )
             self._invoke_control(kwargs)
+            if not release and float(throttle) > 1e-6:
+                gear_echo = self._echo_gear()
+                if not gear_is_forward(gear_echo):
+                    self._queue_drive_shift(gear_echo, time.monotonic())
             return None
         except Exception as e:
             return f"beamngpy_err:{type(e).__name__}"

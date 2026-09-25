@@ -209,6 +209,10 @@ class OverrideDetector:
 
     Disengage is sticky at the caller (gvd_engage.json stays false until Alt+A) — here
     `update(engaged=False)` just clears the state so re-engaging starts clean.
+
+    `own_axes=True` is Soft Esc / BeamNGpy. The echo can contain the command we just sent
+    (not source=gvd), so the reference stays the command and the first armed sample is a
+    baseline. Retail `player_device` stays an absolute axis.
     """
 
     def __init__(self, cfg: OverrideConfig | None = None) -> None:
@@ -223,6 +227,9 @@ class OverrideDetector:
         self._steer_sign = 0
         self._last_t: float | None = None
         self._armed_at: float | None = None
+        self._base_steer: float | None = None
+        self._base_thr: float | None = None
+        self._base_brk: float | None = None
 
     def note_command(self, *, seq: int, steer: float, throttle: float, brake: float, now: float | None = None) -> None:
         t = time.monotonic() if now is None else float(now)
@@ -246,6 +253,9 @@ class OverrideDetector:
         self._steer_held = 0.0
         self._steer_sign = 0
         self._armed_at = None
+        self._base_steer = None
+        self._base_thr = None
+        self._base_brk = None
         self.verdict = OverrideVerdict()
 
     def armed(self, now: float) -> bool:
@@ -255,8 +265,9 @@ class OverrideDetector:
         """The command in force when the echo was sampled.
 
         `applied_seq` is the mod's own ack, so on the retail bus this is exact. Without one
-        (BeamNGpy polls electrics directly) fall back to the previous command, which is the same
-        one-tick lag by a less certain route.
+        (BeamNGpy polls electrics at the start of the tick, then `update`, then `note_command`)
+        the echo matches the latest command already noted — the one applied last tick. Using the
+        command before that reads a throttle step (0 → 0.55) as `player_throttle`.
         """
         if not self._cmds:
             return Command()
@@ -266,7 +277,7 @@ class OverrideDetector:
                 if cmd.seq == want:
                     return cmd
             return self._cmds[-1]
-        return self._cmds[-2] if len(self._cmds) >= 2 else self._cmds[-1]
+        return self._cmds[-1]
 
     def update(
         self,
@@ -278,6 +289,7 @@ class OverrideDetector:
         applied_seq: int | None = None,
         now: float | None = None,
         player_device: bool = False,
+        own_axes: bool = False,
     ) -> OverrideVerdict:
         cfg = self.cfg
         t = time.monotonic() if now is None else float(now)
@@ -293,19 +305,32 @@ class OverrideDetector:
             return self.verdict
 
         ref = self.reference(applied_seq)
-        # Retail Direct Drive lock: electrics.steering_input is GVD's own command, so residual
-        # vs cmd is 0. The physical wheel/pedals live in lastInputs (player_device=True) as
-        # an absolute axis — centered wheel is 0, a real pull is not. Opposition still uses
-        # GVD's steer so a pull against the command counts a little more.
-        ref_steer = 0.0 if player_device else ref.steer
-        ref_thr = 0.0 if player_device else ref.throttle
-        ref_brk = 0.0 if player_device else ref.brake
+        # Retail Direct Drive lock: electrics are GVD's command (source=gvd), so lastInputs
+        # are the physical wheel/pedals as an absolute axis (centered wheel is 0).
+        # Soft Esc beamngpy is not source=gvd. `own_axes` keeps the command as the reference
+        # so a commanded throttle echoing back is residual 0, then subtracts the resting
+        # device offset sampled on this first armed tick (baseline-at-engage). A quiet wheel
+        # at -0.26 does not become player_steer; a further pull or a real pedal still does.
+        use_absolute = bool(player_device) and not own_axes
+        ref_steer = 0.0 if use_absolute else ref.steer
+        ref_thr = 0.0 if use_absolute else ref.throttle
+        ref_brk = 0.0 if use_absolute else ref.brake
 
         # Pedals: asymmetric and tight. Only a press beyond what GVD asked for counts, so an AEB
         # brake hold echoing back at 1.0 is not the driver standing on it. Brake trips lower than
         # throttle and wins a tie, because that is the reason a player most needs to be told.
         thr_r = max(0.0, _clamp(throttle_input, 0.0, 1.0) - ref_thr) if throttle_input is not None else 0.0
         brk_r = max(0.0, _clamp(brake_input, 0.0, 1.0) - ref_brk) if brake_input is not None else 0.0
+        raw = _clamp(steering_input, -1.0, 1.0) - ref_steer if steering_input is not None else 0.0
+        if own_axes:
+            # First armed sample is the resting device (wheel offset, pedal bias), not a grab.
+            if self._base_steer is None:
+                self._base_steer = raw
+                self._base_thr = thr_r
+                self._base_brk = brk_r
+            raw = raw - float(self._base_steer)
+            thr_r = max(0.0, thr_r - float(self._base_thr or 0.0))
+            brk_r = max(0.0, brk_r - float(self._base_brk or 0.0))
         pedal_channel = "none"
         pedal_r = 0.0
         if brk_r >= cfg.brake_enter:
@@ -314,7 +339,6 @@ class OverrideDetector:
             pedal_channel, pedal_r = "throttle", thr_r
 
         # Steer: residual against the aligned command, spike-rejected, then filtered.
-        raw = _clamp(steering_input, -1.0, 1.0) - ref_steer if steering_input is not None else 0.0
         # Sample-to-sample jump past steer_spike is mechanical: skip the EMA so a kick does
         # not drag the filter with it. last_raw still advances, so a hold after the kick is
         # a zero jump next tick and the filter is allowed to follow.

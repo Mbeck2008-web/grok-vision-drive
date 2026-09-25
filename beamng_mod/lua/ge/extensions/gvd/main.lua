@@ -1035,6 +1035,7 @@ end
 -- zero the gvd source then clear the whitelist so the player's device gets the car back.
 -- Vehicle Lua echoes electrics plus non-gvd lastInputs (the physical wheel/pedals, still recorded even
 -- when not applied) through obj:queueGameEngineLua → M.onEgoFeedback → gvd_ego.json.
+-- Sources adas / beamngpy / tech are software, not a player device, so they are not player_*.
 local VE_HOLD = "if input and input.setAllowedInputSource then "
   .. "input.setAllowedInputSource('steering','gvd',true);"
   .. "input.setAllowedInputSource('steering','local',false);"
@@ -1073,7 +1074,7 @@ local VE_FEEDBACK = "local ev=(electrics and electrics.values) or {};"
   .. "local yr=0;if obj and obj.getYawAngularVelocity then local ok,v=pcall(function() return obj:getYawAngularVelocity() end);if ok then yr=n(v) end end;"
   .. "local ps,pt,pb,np=0,0,0,0;"
   .. "if input and input.lastInputs then for src,ins in pairs(input.lastInputs) do "
-  .. "if src~='gvd' and type(ins)=='table' then np=np+1;"
+  .. "if src~='gvd' and src~='adas' and src~='beamngpy' and src~='tech' and type(ins)=='table' then np=np+1;"
   .. "local a=n(ins.steering);if a*a>(ps*ps) then ps=a end;"
   .. "local t=n(ins.throttle);if t>pt then pt=t end;"
   .. "local b=n(ins.brake);if b>pb then pb=b end;end end end;"

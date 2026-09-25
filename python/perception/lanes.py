@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
 import cv2
 import numpy as np
+
+_LOG = logging.getLogger("gvd.perception.lanes")
 
 
 @dataclass
@@ -40,11 +43,28 @@ def hough_segments(lines: Any) -> list[tuple[int, int, int, int]]:
 
 
 def estimate_lanes(bgr: np.ndarray | None) -> LaneResult:
+    """Fit ego-lane paint on ``cam_main``.
+
+    An empty or undecodable frame is ``lane_conf`` 0. A Hough row-layout
+    ``IndexError`` (OpenCV 5 ``(N, 4)`` indexed as OpenCV 4 ``(N, 1, 4)``)
+    is logged and re-raised so it cannot look like an empty road.
+    """
     if bgr is None or bgr.size == 0:
         return LaneResult(conf=0.0, lanes_bev=[], curvature=0.0)
     try:
         return _estimate_lanes_impl(bgr)
-    except Exception:
+    except IndexError as exc:
+        _LOG.error(
+            "estimate_lanes Hough/layout IndexError (%s); refusing lane_conf=0",
+            exc,
+        )
+        raise
+    except Exception as exc:
+        _LOG.warning(
+            "estimate_lanes failed (%s: %s); reporting lane_conf=0",
+            type(exc).__name__,
+            exc,
+        )
         return LaneResult(conf=0.0, lanes_bev=[], curvature=0.0)
 
 

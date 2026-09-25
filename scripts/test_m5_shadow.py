@@ -279,24 +279,28 @@ def main() -> None:
     assert tick_shadow_stub.should_disengage is False
     assert tick_shadow_stub.applied.reason == "ok"
 
-    # Engage Hz floor is 6. During the arm grace a dip down to ~5 does not disengage.
+    # Engage Hz floor is 6. Arm grace is 3.0 s at floor 5 — a tiny window must not pass.
     assert MIN_ACCEPT_HZ == 6.0
     assert ENGAGE_HZ_GRACE_FLOOR == 5.0
-    assert ENGAGE_HZ_GRACE_S > 0.0
+    assert ENGAGE_HZ_GRACE_S == 3.0
     assert ShadowConfig().min_accept_hz == MIN_ACCEPT_HZ
+    assert ShadowConfig().engage_hz_grace_s == 3.0
+    assert ShadowConfig().engage_hz_grace_floor == 5.0
     loaded = load_shadow_config(
         {
             "veto": {
                 "min_accept_hz": 6,
-                "engage_hz_grace_s": ENGAGE_HZ_GRACE_S,
+                "engage_hz_grace_s": 3.0,
                 "engage_hz_grace_floor": 5,
             }
         }
     )
     assert loaded.min_accept_hz == 6.0
+    assert loaded.engage_hz_grace_s == 3.0
     assert loaded.engage_hz_grace_floor == 5.0
     yaml_text = (ROOT / "config" / "control.yaml").read_text(encoding="utf-8")
     assert "min_accept_hz: 6" in yaml_text
+    assert "engage_hz_grace_s: 3.0" in yaml_text
     assert "engage_hz_grace_floor: 5" in yaml_text
 
     def _drive(**kw):
@@ -346,7 +350,7 @@ def main() -> None:
     assert parked.should_disengage is False
     assert parked.veto_reason == "low_lane_conf", parked.veto_reason
     assert parked.applied.reason == "not_engaged"
-    # Grace does not waive an empty lane fit on e2e/shadow.
+    # Grace does not waive an empty lane fit on e2e or shadow.
     empty_lanes = _drive(
         policy="e2e",
         lane_conf=0.0,
@@ -358,6 +362,17 @@ def main() -> None:
     assert empty_lanes.veto_reason == "low_lane_conf", empty_lanes.veto_reason
     assert empty_lanes.should_disengage is True
     assert empty_lanes.veto_reason != ""
+    empty_shadow = _drive(
+        policy="shadow",
+        lane_conf=0.0,
+        path_conf=0.35,
+        loop_hz=5.2,
+        camera_hz=5.4,
+        engage_age_s=0.2,
+    )
+    assert empty_shadow.veto_reason == "low_lane_conf", empty_shadow.veto_reason
+    assert empty_shadow.should_disengage is True
+    assert empty_shadow.applied.reason == "veto:low_lane_conf"
     # Direct floor helper: exactly 5 during grace passes; exactly 6 after grace passes.
     assert engage_hz_reason(5.0, 5.0, 0.1, cfg) == "none"
     assert engage_hz_reason(5.0, 8.0, ENGAGE_HZ_GRACE_S, cfg) == "low_loop_hz"

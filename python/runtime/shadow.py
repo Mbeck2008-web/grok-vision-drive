@@ -275,6 +275,10 @@ def shadow_tick(
         )
 
     # Modular-only policy: classic plan path; preview gate.
+    # An untrained e2e stub (no models/e2e_current.onnx) is computed above and
+    # stored on `e2e` / `shadow` for the HUD. It is not the applied command.
+    # Modular attach does not copy that stub's brake. A preview hold (no lane
+    # fit) is stop_command from this branch, not veto:e2e_stub.
     if policy == "modular":
         if path_debug_preview and not allow_preview_drive:
             applied = stop_command(seq=seq, reason="preview_blocked")

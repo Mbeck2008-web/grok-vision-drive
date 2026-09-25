@@ -351,28 +351,44 @@ def main() -> None:
     assert parked.veto_reason == "low_lane_conf", parked.veto_reason
     assert parked.applied.reason == "not_engaged"
     # Grace does not waive an empty lane fit on e2e or shadow.
-    empty_lanes = _drive(
-        policy="e2e",
-        lane_conf=0.0,
-        path_conf=0.35,
-        loop_hz=5.2,
-        camera_hz=5.4,
-        engage_age_s=0.2,
+    for pol in ("e2e", "shadow"):
+        empty_lanes = _drive(
+            policy=pol,
+            lane_conf=0.0,
+            path_conf=0.35,
+            loop_hz=5.2,
+            camera_hz=5.4,
+            engage_age_s=0.2,
+        )
+        assert empty_lanes.veto_reason == "low_lane_conf", (pol, empty_lanes.veto_reason)
+        assert empty_lanes.should_disengage is True
+        assert empty_lanes.applied.reason == "veto:low_lane_conf"
+        assert empty_lanes.applied.brake == 1.0
+    # Modular attach keeps the modular command. A stub that brakes is not applied.
+    class _StubBrake:
+        backend = "stub"
+
+        def forward(self, *args, **kwargs) -> E2EIntent:
+            return E2EIntent(
+                steer=0.4, accel=-1.0, throttle=0.0, brake=1.0, ok=True, backend="stub", reason="stub",
+            )
+
+    mod_stub = _drive(
+        policy="modular",
+        lane_conf=0.9,
+        path_conf=0.8,
+        path_debug_preview=False,
+        e2e_policy=_StubBrake(),
+        loop_hz=10.0,
+        camera_hz=10.0,
+        engage_age_s=1.0,
     )
-    assert empty_lanes.veto_reason == "low_lane_conf", empty_lanes.veto_reason
-    assert empty_lanes.should_disengage is True
-    assert empty_lanes.veto_reason != ""
-    empty_shadow = _drive(
-        policy="shadow",
-        lane_conf=0.0,
-        path_conf=0.35,
-        loop_hz=5.2,
-        camera_hz=5.4,
-        engage_age_s=0.2,
-    )
-    assert empty_shadow.veto_reason == "low_lane_conf", empty_shadow.veto_reason
-    assert empty_shadow.should_disengage is True
-    assert empty_shadow.applied.reason == "veto:low_lane_conf"
+    assert mod_stub.e2e.brake == 1.0
+    assert mod_stub.veto_reason == "none", mod_stub.veto_reason
+    assert mod_stub.should_disengage is False
+    assert mod_stub.applied.reason == "ok"
+    assert mod_stub.applied.brake == mod_stub.modular.brake
+    assert mod_stub.applied.brake != 1.0
     # Direct floor helper: exactly 5 during grace passes; exactly 6 after grace passes.
     assert engage_hz_reason(5.0, 5.0, 0.1, cfg) == "none"
     assert engage_hz_reason(5.0, 8.0, ENGAGE_HZ_GRACE_S, cfg) == "low_loop_hz"

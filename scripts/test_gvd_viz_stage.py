@@ -286,6 +286,25 @@ def main() -> None:
     assert int(retail[my + mh // 2, mx + int(mw * 0.78)][1]) > 120
     assert int(retail[ny + nh // 2, nx + int(nw * 0.78)].mean()) < 70
 
+    # Health ok + an all-zero buffer is not a live tile. A real last frame is.
+    from python.sensors.cameras import frame_is_unrendered
+    from python.viz.debug_draw import cam_slot_live
+
+    zero = np.zeros((36, 48, 3), dtype=np.uint8)
+    assert frame_is_unrendered(zero)
+    last = np.full((36, 48, 3), (12, 160, 30), dtype=np.uint8)
+    held_frames = dict(frames)
+    held_frames["narrow"] = zero
+    held_frames["rear"] = last
+    held_health = {cid: "ok" for cid in CAM_IDS}
+    assert cam_slot_live(held_frames, held_health, "narrow") is False
+    assert cam_slot_live(held_frames, held_health, "rear") is True
+    held = render_stage(cams_st, ui=cams_ui, cam_frames=held_frames)
+    nx, ny, nw, nh = rects[list(CAM_IDS).index("narrow")]
+    rx, ry, rw, rh = rects[list(CAM_IDS).index("rear")]
+    assert int(held[ny + nh // 2, nx + int(nw * 0.78)].mean()) < 70, "blank narrow must stay labelled"
+    assert int(held[ry + rh // 2, rx + int(rw * 0.78)][1]) > 120, "last rear frame must paint"
+
     # under 8 Hz: labelled drop, no crash, no fake fill from the colored frames
     slow = dict(cams_st)
     slow["loop_hz"] = 6.0
@@ -625,6 +644,10 @@ def main() -> None:
     assert int(cv2.absdiff(slow_full, fast_signs).sum()) > 0, "under 8 Hz signs drop"
 
     print("test_gvd_viz_stage: OK")
+
+
+def test_gvd_viz_stage() -> None:
+    main()
 
 
 if __name__ == "__main__":

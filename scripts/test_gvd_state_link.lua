@@ -40,15 +40,15 @@ end
 function readFile(path)
   return vfsGet(path)
 end
+function writeFile(path, data)
+  vfsBus[busRel(path)] = data
+  return true
+end
 FS = {
   readFile = function(_, path)
     return vfsGet(path)
   end,
   directoryCreate = function() end,
-  writeFile = function(_, path, data)
-    vfsBus[busRel(path)] = data
-    return true
-  end,
   getUserPath = function()
     return 'C:/Users/Name/AppData/Local/BeamNG/BeamNG.drive/current'
   end,

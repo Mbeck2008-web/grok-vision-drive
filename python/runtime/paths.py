@@ -283,6 +283,21 @@ def _read_lua_bus_field(path: Path, now: float) -> tuple[str | None, float | Non
     return text, age
 
 
+def youngest_lua_handshake(*, now: float | None = None) -> tuple[str | None, float | None]:
+    """Youngest ``gvd_link`` / ``gvd_ego`` ``(lua_bus, age_s)``, even if stale or rejected."""
+    t = time.time() if now is None else float(now)
+    best_raw: str | None = None
+    best_age: float | None = None
+    for path in _probe_lua_bus_files():
+        raw, age = _read_lua_bus_field(path, t)
+        if age is None:
+            continue
+        if best_age is None or age < best_age:
+            best_age = age
+            best_raw = raw
+    return best_raw, best_age
+
+
 def read_live_lua_bus(*, now: float | None = None) -> tuple[Path | None, str]:
     """Fresh ``lua_bus`` from ``gvd_link.json`` / ``gvd_ego.json``, or ``(None, why)``."""
     t = time.time() if now is None else now

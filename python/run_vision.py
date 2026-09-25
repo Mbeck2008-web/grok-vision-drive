@@ -14,10 +14,14 @@ if str(ROOT) not in sys.path:
 
 from python.control.actuate import (
     attach_electrics,
+    last_electrics_ms,
     make_actuator,
     read_ego_feedback,
     read_electrics_inputs,
     read_engage_flag,
+    soft_esc_state_write_due,
+    soft_esc_state_write_mark,
+    soft_esc_state_write_skips,
     stop_command,
     write_engage_flag,
 )
@@ -226,6 +230,11 @@ def main() -> None:
         help="Connect to BeamNG.tech, poll vehicle electrics/pose/damage, exit. No fake cameras.",
     )
     ap.add_argument(
+        "--tech-hold",
+        action="store_true",
+        help="Tech hold preflight only: port LISTENING, mod, vehicle, fresh lua_bus, buses_same. No cameras, no Hz.",
+    )
+    ap.add_argument(
         "--foxglove",
         action="store_true",
         help="Publish extras to a local Foxglove WebSocket (ws://127.0.0.1:8765). Planner stays vision-only.",
@@ -236,11 +245,16 @@ def main() -> None:
         os.environ["GVD_VISION_ONLY"] = "1"
 
     # Product bus matches the running backend (Python default is Drive/retail).
-    if args.tech_probe or args.backend == "beamngpy":
+    if args.tech_hold or args.tech_probe or args.backend == "beamngpy":
         os.environ["GVD_BEAMNG"] = "1"
         os.environ["GVD_BACKEND"] = "beamngpy"
     elif args.backend == "window":
         os.environ["GVD_BACKEND"] = "window"
+
+    if args.tech_hold:
+        from python.sensors.tech import run_tech_hold
+
+        raise SystemExit(run_tech_hold())
 
     if args.tech_probe:
         raise SystemExit(run_probe())
@@ -308,8 +322,28 @@ def main() -> None:
         print(f"[GVD] REFUSE: {reason}")
         raise SystemExit(1)
 
+    if backend_name == "beamngpy":
+        from python.sensors.tech import tech_hold_gate
+
+        # Wait gate before any camera open or unique-frame Hz.
+        # tech_hold_gate logs phase=attach / phase=Hello / phase=wait-gate.
+        hold = tech_hold_gate(retain=True)
+        if not hold.proceed:
+            print(f"[GVD] REFUSE: {hold.note}")
+            print(
+                "[GVD] Tech hold failed before vision. Unique-frame Hz is not measured. "
+                "One starter: install-root BeamNG.tech.exe -tcom -console -gfx dx11 already up, "
+                "mod loaded, vehicle spawned. Attach only (GVD_TECH_LAUNCH=0). "
+                "Hello timeout is REFUSE and is not a missing vehicle. "
+                "Do not kill BeamNG.tech or CrashSender."
+            )
+            raise SystemExit(1)
+
     backend = make_backend(backend_name if args.backend != "auto" else backend_name)
     backend.open()
+    from python.sensors.tech import exit_if_tech_connect_failed
+
+    exit_if_tech_connect_failed(backend, backend_name)
     perc = ModularPerception(allow_synthetic=args.allow_synthetic_detect)
     e2e_policy = make_e2e()
     ui = VizUI()
@@ -425,6 +459,7 @@ def main() -> None:
     last_ego_v = 0.0
     prev_force = bool(args.force_engage)
     prev_preview = bool(args.allow_preview_drive)
+    prev_engaged = False
     try:
         while True:
             loop_t0 = time.perf_counter()
@@ -452,6 +487,8 @@ def main() -> None:
             grab_ms = float(getattr(bundle, "grab_ms", 0.0) or 0.0)
             if grab_ms <= 0:
                 grab_ms = (time.perf_counter() - t_grab) * 1000.0
+            grab_phase = int(getattr(bundle, "grab_phase", -1))
+            grab_poll_free = bool(getattr(bundle, "grab_poll_free", True))
             main = bundle.main_bgr()
             unique_gpu_n = int(getattr(bundle, "unique_gpu_n", 0) or 0)
             now = time.perf_counter()
@@ -470,7 +507,15 @@ def main() -> None:
                     vdata = backend.poll_vehicle()
                 except Exception:
                     vdata = None
+            sensors_poll_ms = 0.0
+            poll_gps_ms = 0.0
+            poll_gps_sent = False
+            if vdata is not None:
+                sensors_poll_ms = float(getattr(vdata, "sensors_poll_ms", 0.0) or 0.0)
+                poll_gps_ms = float(getattr(vdata, "poll_gps_ms", 0.0) or 0.0)
+                poll_gps_sent = bool(getattr(vdata, "poll_gps_sent", False))
             el = read_electrics_inputs(vehicle)
+            electrics_ms = last_electrics_ms()
             spd, steer_in = el.speed_mps, el.steering_input
             throttle_in, brake_in = el.throttle_input, el.brake_input
             yaw_rate = 0.0
@@ -764,7 +809,40 @@ def main() -> None:
                 extra_miss.append("radar")
             if extra_miss:
                 st["missing_state_keys"] = sorted(set(st["missing_state_keys"] + extra_miss))
+            st["grab_phase"] = grab_phase
+            st["grab_poll_free"] = grab_poll_free
+            st["sensors_poll_ms"] = sensors_poll_ms
+            st["poll_gps_ms"] = poll_gps_ms
+            st["poll_gps_sent"] = poll_gps_sent
+            st["electrics_ms"] = electrics_ms
             st["heartbeat_ms"] = (time.perf_counter() - loop_t0) * 1000.0
+            # Soft Esc: gvd_state.json at most once per Lua pollEvery (0.10).
+            # Max rewrite rate. A loop already slower than 100 ms writes at
+            # the loop rate, so heartbeat age tracks the loop.
+            # Engage writes every tick. The rising edge flushes this tick.
+            rising_engage = bool(engaged) and not prev_engaged
+            state_due = soft_esc_state_write_due(bool(engaged), rising=rising_engage)
+            prev_engaged = bool(engaged)
+            state_skips = soft_esc_state_write_skips()
+            rel_skips = int(getattr(actuator, "release_cmd_skips", 0) or 0)
+            # Segment line is outside the stamp. grab_ms on a poll-free phase is
+            # the stream_raw cost; a hitch-phase gap is the companion PollCamera.
+            # heartbeat_ms - grab_ms - infer_ms is the ego-poll tail plus the
+            # rest of the tick before this stamp. camera_hz is unchanged.
+            # state_write_skip=1 is a Soft Esc rewrite that did not hit disk.
+            print(
+                f"[GVD] seg grab_ms={grab_ms:.2f} grab_phase={grab_phase} "
+                f"grab_poll_free={int(grab_poll_free)} "
+                f"heartbeat_ms={st['heartbeat_ms']:.2f} "
+                f"infer_ms={float(pout.infer_ms):.2f} "
+                f"sensors_poll_ms={sensors_poll_ms:.2f} "
+                f"poll_gps_ms={poll_gps_ms:.2f} poll_gps_sent={int(poll_gps_sent)} "
+                f"electrics_ms={electrics_ms:.2f} "
+                f"state_write_skip={0 if state_due else 1} "
+                f"state_write_skips={state_skips} "
+                f"release_cmd_skips={rel_skips}",
+                flush=True,
+            )
 
             # M4 ring + triggers
             wall = time.time()
@@ -784,7 +862,11 @@ def main() -> None:
             if recorder.last_clip_path:
                 st["last_clip_path"] = recorder.last_clip_path
 
-            write_state(st)
+            # Call-site coalesce only. write_state itself still stamps the beat.
+            # Mark after the write so the 100 ms cap is on the file, not the check.
+            if state_due:
+                write_state(st)
+                soft_esc_state_write_mark()
 
             if win is not None:
                 import cv2
@@ -799,6 +881,8 @@ def main() -> None:
                 )
                 cv2.imshow(win, frame)
                 key = cv2.waitKey(1) & 0xFF
+                # q and Esc leave the supervisor. close() disconnects only
+                # (quit_on_close=false) and does not kill BeamNG.tech.
                 if key in (ord("q"), 27):
                     break
                 if key == 255:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -15,6 +16,8 @@ import numpy as np
 CAM_IDS = ("narrow", "main", "wide", "pillarL", "pillarR", "repeatL", "repeatR", "rear")
 MAIN_ALIASES = ("main", "cam_main")
 SIDE_CAM_IDS = frozenset(("pillarL", "pillarR", "repeatL", "repeatR"))
+PILLAR_CAM_IDS = frozenset(("pillarL", "pillarR"))
+REPEAT_CAM_IDS = frozenset(("repeatL", "repeatR"))
 REAR_CAM_IDS = frozenset(("rear",))
 FORWARD_CAM_IDS = frozenset(("narrow", "main", "wide"))
 
@@ -28,14 +31,25 @@ ON_DEMAND_UPDATE_S = -1.0  # no auto GPU update; ad-hoc poll only (sides/rear)
 SIDE_UPDATE_S = ON_DEMAND_UPDATE_S
 REAR_UPDATE_S = ON_DEMAND_UPDATE_S
 MAIN_GRAB_DIV = 1
-WIDE_GRAB_DIV = 2
-NARROW_GRAB_DIV = 2  # start ÷2 (allowed 2–3; never ÷4)
-NARROW_GRAB_PHASE = 1  # offset vs wide so they do not share a tick
+# Rank 2: one stream_raw per tick (main). Companion polls are ÷16.
+# Phases stay: wide 0 (even), narrow 1 (odd), pillarL 2, pillarR 3,
+# repeatL 5, rear 6, repeatR 7. Ticks 4 and 8–15 are main only.
+# Soft Esc (engaged=false): a companion with no last-good frame is coloured
+# once (warm). Later grabs skip companion colour. Main still stream_raw
+# every tick. A missed warm stays STALE, not MISSING. Engage keeps the hitch polls.
+WIDE_GRAB_DIV = 16
+NARROW_GRAB_DIV = 16
+NARROW_GRAB_PHASE = 1  # odd ticks; wide stays on even ticks
 WIDE_GRAB_PHASE = 0
-SIDE_GRAB_DIV = 2  # poll pillar/repeat every Nth grab; never drop resolution
-SIDE_GRAB_PHASE = 1  # odd ticks — miss wide even (tick0 was main+wide+4sides+rear)
-REAR_GRAB_DIV = 4  # poll rear every Nth grab; never drop resolution
-REAR_GRAB_PHASE = 1  # miss wide even ticks
+SIDE_GRAB_DIV = 16  # each pillar once per 16 ticks
+SIDE_GRAB_PHASE = 2  # pillarL; pillarR steps +1 onto phase 3
+REPEAT_GRAB_DIV = 16
+REPEAT_GRAB_PHASE = 5  # repeatL; repeatR steps +2 onto phase 7
+REAR_GRAB_DIV = 16  # poll rear once per 16 ticks; never drop resolution
+REAR_GRAB_PHASE = 6  # main+rear only; no side on this slot
+REPEAT_SPREAD_ORDER = ("repeatL", "repeatR")
+PILLAR_SPREAD_ORDER = ("pillarL", "pillarR")
+PILLAR_SPREAD_STEP = 1
 NARROW_FAR_LIVE_HITCH_M = 400.0  # live unique-frame Hz hitch (800→400 if still <10)
 CAMERA_HZ_TARGET = 10.0
 LIVE_NARROW_HITCH_AFTER_S = 2.0
@@ -103,6 +117,11 @@ class CameraFrameBundle:
     backend: str = "stub"
     note: str = ""
     grab_ms: float = 0.0
+    # Hitch-wheel slot (grab_i % wheel). -1 when this backend has no wheel.
+    # Locked wheel: hitch slots 0,1,2,3,5,6,7; poll-free slots 4 and 8–15.
+    grab_phase: int = -1
+    # True when this grab did not issue a companion PollCamera (main stream_raw only).
+    grab_poll_free: bool = True
     unique_gpu_n: int = 0  # new GPU frames this tick (not cache / stream_raw re-shows)
     unique_gpu_ids: tuple[str, ...] = ()
 
@@ -312,7 +331,10 @@ def _nonneg_int(v: Any, default: int) -> int:
 
 
 def camera_grab_div(cid: str, hitch: dict[str, Any] | None = None) -> int:
-    """Python grab divisor. main÷1 (clamped), wide÷2, narrow÷2 (2–3), sides÷2, rear÷4."""
+    """Python grab divisor. main÷1 stream_raw; companion polls ÷16.
+
+    wide÷16 (even), narrow÷16 (odd), pillars÷16, repeats÷16, rear÷16.
+    """
     hitch = hitch if isinstance(hitch, dict) else {}
     if cid == "main":
         return MAIN_GRAB_DIV  # every-tick; hitch yaml cannot raise this
@@ -320,18 +342,21 @@ def camera_grab_div(cid: str, hitch: dict[str, Any] | None = None) -> int:
         return _positive_div(hitch.get("wide_grab_div"), WIDE_GRAB_DIV)
     if cid == "narrow":
         n = _positive_div(hitch.get("narrow_grab_div"), NARROW_GRAB_DIV)
-        return min(3, max(2, n))  # ÷2–3 start; never ÷4
+        return max(2, n)  # floor ÷2 so narrow can still miss a wide tick
     if cid in REAR_CAM_IDS:
         return _positive_div(hitch.get("rear_grab_div"), REAR_GRAB_DIV)
-    if cid in SIDE_CAM_IDS:
+    if cid in REPEAT_CAM_IDS:
+        return _positive_div(hitch.get("repeat_grab_div"), REPEAT_GRAB_DIV)
+    if cid in PILLAR_CAM_IDS or cid in SIDE_CAM_IDS:
         return _positive_div(hitch.get("side_grab_div"), SIDE_GRAB_DIV)
     return 1
 
 
 def camera_grab_phase(cid: str, hitch: dict[str, Any] | None = None) -> int:
-    """Phase offset so wide (0) and narrow (1) do not grab the same tick.
+    """Slot on the 16-tick wheel. Wide (even) and narrow (odd) never share a tick.
 
-    Sides/rear default to phase 1 so they miss wide's even ticks (tick0 clump).
+    pillarL is side phase; pillarR steps +1. repeatL is repeat phase; repeatR
+    steps +2. Rear sits on its own slot with no side companion.
     """
     hitch = hitch if isinstance(hitch, dict) else {}
     if cid == "narrow":
@@ -342,6 +367,22 @@ def camera_grab_phase(cid: str, hitch: dict[str, Any] | None = None) -> int:
         return _nonneg_int(hitch.get("main_grab_phase"), 0)
     if cid in REAR_CAM_IDS:
         return _nonneg_int(hitch.get("rear_grab_phase"), REAR_GRAB_PHASE)
+    if cid in REPEAT_CAM_IDS:
+        base = _nonneg_int(hitch.get("repeat_grab_phase"), REPEAT_GRAB_PHASE)
+        div = max(1, camera_grab_div(cid, hitch))
+        try:
+            slot = REPEAT_SPREAD_ORDER.index(cid)
+        except ValueError:
+            slot = 0
+        return (base + slot * 2) % div
+    if cid in PILLAR_CAM_IDS:
+        base = _nonneg_int(hitch.get("side_grab_phase"), SIDE_GRAB_PHASE)
+        div = max(1, camera_grab_div(cid, hitch))
+        try:
+            slot = PILLAR_SPREAD_ORDER.index(cid)
+        except ValueError:
+            slot = 0
+        return (base + slot * PILLAR_SPREAD_STEP) % div
     if cid in SIDE_CAM_IDS:
         return _nonneg_int(hitch.get("side_grab_phase"), SIDE_GRAB_PHASE)
     return 0
@@ -359,12 +400,6 @@ def camera_grab_due(cid: str, grab_i: int, hitch: dict[str, Any] | None = None) 
     div = camera_grab_div(cid, hitch)
     phase = camera_grab_phase(cid, hitch)
     gi = int(grab_i)
-    if cid == "narrow" and div >= 3:
-        # ÷3 rate that misses every wide÷2 tick: two residues per 6, opposite wide parity.
-        wide_parity = int(camera_grab_phase("wide", hitch)) % 2
-        if (gi % 2) == wide_parity:
-            return False
-        return (gi % 3) != 0
     if not grab_due(gi, div, phase):
         return False
     if cid == "narrow":
@@ -372,6 +407,85 @@ def camera_grab_due(cid: str, grab_i: int, hitch: dict[str, Any] | None = None) 
         wph = camera_grab_phase("wide", hitch)
         if grab_due(gi, wdiv, wph):
             return False
+    return True
+
+
+def grab_wheel(hitch: dict[str, Any] | None = None) -> int:
+    """Hitch-wheel period. The locked schedule is 16. This does not define camera_hz."""
+    return max(camera_grab_div(cid, hitch) for cid in CAM_IDS)
+
+
+def grab_phase_of(grab_i: int, hitch: dict[str, Any] | None = None) -> int:
+    """Wheel slot for this grab index.
+
+    Locked slots 0, 1, 2, 3, 5, 6, 7 each add one companion PollCamera.
+    Slots 4 and 8–15 are main stream_raw only.
+    """
+    return int(grab_i) % grab_wheel(hitch)
+
+
+def grab_is_poll_free(grab_i: int, hitch: dict[str, Any] | None = None) -> bool:
+    """True when the schedule reads main only (no companion PollCamera)."""
+    for cid in CAM_IDS:
+        if cid == "main":
+            continue
+        if camera_grab_due(cid, grab_i, hitch):
+            return False
+    return True
+
+
+def _debug_force_engage() -> bool:
+    """True when debug engage is already requested on this tick.
+
+    ``--force-engage`` and the nerd-panel bit do not write ``gvd_engage.json``.
+    Grab runs before ``note_engaged``, so the latch is still false. Alt+G is
+    the live file. Debug engage is argv, or ``args.force_engage`` /
+    ``ui.debug.force_engage`` already set on the grab caller. Seeing it
+    colours the hitch schedule on this same grab. This does not write the file.
+    """
+    if any(arg == "--force-engage" for arg in sys.argv):
+        return True
+    getframe = getattr(sys, "_getframe", None)
+    if getframe is None:
+        return False
+    frame = getframe(1)
+    try:
+        for _ in range(32):
+            if frame is None:
+                return False
+            try:
+                locs = frame.f_locals
+                args = locs.get("args") if locs else None
+                if getattr(args, "force_engage", None) is True:
+                    return True
+                ui = locs.get("ui") if locs else None
+                debug = getattr(ui, "debug", None) if ui is not None else None
+                if getattr(debug, "force_engage", None) is True:
+                    return True
+            except Exception:
+                pass
+            frame = frame.f_back
+    finally:
+        del frame
+    return False
+
+
+def soft_esc_colour_main_only() -> bool:
+    """True when this grab must colour only main.
+
+    Soft Esc is the latch false, ``gvd_engage.json`` not live, and debug
+    force-engage off. Grab runs before ``note_engaged``. A live engage file
+    or debug force-engage refuses the skip on the rising edge the same way
+    the file does for ``sensors.poll``. Engage keeps hitch colour.
+    """
+    from python.control.actuate import read_engage_flag, soft_esc_sensors_every_tick
+
+    if soft_esc_sensors_every_tick():
+        return False
+    if bool(read_engage_flag(default=False)):
+        return False
+    if _debug_force_engage():
+        return False
     return True
 
 
@@ -597,9 +711,14 @@ def read_camera_colour(
     cid: str,
     resolution: tuple[int, int] | None = None,
 ) -> np.ndarray | None:
-    """Forwards: stream_raw only (no poll). Sides/rear: poll (on-demand -1)."""
+    """Main: stream_raw. Wide, narrow, sides, and rear: poll.
+
+    One stream_raw per grab (main, every tick). Wide and narrow alternate
+    across ticks and never share one. is_streaming stays true; poll is not a
+    second stream_raw.
+    """
     res = resolution or _cam_resolution(cam)
-    if cid in FORWARD_CAM_IDS:
+    if cid == "main":
         if not hasattr(cam, "stream_raw"):
             return None
         try:
@@ -610,7 +729,7 @@ def read_camera_colour(
         if isinstance(raw, dict):
             colour = raw.get("colour") if raw.get("colour") is not None else raw.get("color")
         return colour_to_bgr(colour, res)
-    # sides/rear requested_update_time=-1: need an ad-hoc poll. Never set streaming false.
+    # Wide/narrow and sides/rear: poll. Never set streaming false.
     if not hasattr(cam, "poll"):
         return None
     try:
@@ -966,9 +1085,13 @@ class BeamNGPyBackend:
         self._resolution: dict[str, tuple[int, int]] = {}
         self._logged = False
         self._ok = False
+        self.connect_failed = False
         self._grab_i = 0
         self._cache_frames: dict[str, np.ndarray] = {}
         self._cache_ts: dict[str, float] = {}
+        # Companions whose one Soft Esc warm read failed. Later Soft Esc grabs
+        # report STALE and do not poll again. A later good frame clears this.
+        self._soft_esc_warm_failed: set[str] = set()
         self._hitch_steps: list[tuple[str, float, float, float]] = []  # cid, near, far, update_s
         hitch = self.config.get("hitch") if isinstance(self.config.get("hitch"), dict) else {}
         self._hitch = hitch
@@ -986,6 +1109,7 @@ class BeamNGPyBackend:
         self._last_unique_tick_t = 0.0
 
     def open(self) -> None:
+        self.connect_failed = False
         try:
             from beamngpy.sensors import Camera  # type: ignore
         except Exception as e:
@@ -993,16 +1117,18 @@ class BeamNGPyBackend:
                 print(f"[GVD] beamngpy not available ({e}); cam_health=missing.")
                 self._logged = True
             self._ok = False
+            self.connect_failed = True
             return
         self._Camera = Camera
 
         if not self.session.connect(explicit=True):
             self._ok = False
             self._logged = True
+            self.connect_failed = True
             return
 
         # Cameras + vehicle sensors attach here, independent of Alt+G / engaged.
-        # Vision LINK and cam_health ok×8 must work with engaged=false.
+        # Soft Esc keeps all 8 attached. Colour while engaged=false is main only.
         try:
             self.session.attach_vehicle_sensors()
         except Exception as e:
@@ -1036,6 +1162,7 @@ class BeamNGPyBackend:
         self._unique_n = 0
         self._open_mono = time.monotonic()
         self._narrow_live_hitched = False
+        self._soft_esc_warm_failed.clear()
         for spec in cams:
             cid = str(spec.get("id") or "")
             if not cid or cid not in CAM_IDS:
@@ -1146,7 +1273,7 @@ class BeamNGPyBackend:
                     f"update_priority {prios}; "
                     f"grab_div main={self._grab_div['main']} wide={self._grab_div['wide']} "
                     f"narrow={self._grab_div['narrow']} side={self._side_grab_div} "
-                    f"rear={self._rear_grab_div}; stream_raw forwards; "
+                    f"rear={self._rear_grab_div}; stream_raw main; "
                     f"GVD→BeamNG vehicle-space convert; depth/semantic OFF)."
                 )
             else:
@@ -1185,6 +1312,7 @@ class BeamNGPyBackend:
         self._frame_sig.clear()
         self._cache_frames.clear()
         self._cache_ts.clear()
+        self._soft_esc_warm_failed.clear()
         self._grab_i = 0
         self._unique_hz_ema = 0.0
         self._unique_n = 0
@@ -1204,9 +1332,26 @@ class BeamNGPyBackend:
         if cid == "main":
             frames["cam_main"] = bgr
 
-    def _reuse_cached(self, cid: str, frames: dict, timestamps: dict, health: dict) -> None:
-        """Skip / failed stream_raw: keep last pixels for perception, mark STALE (not a camera tick)."""
+    def _reuse_cached(
+        self, cid: str, frames: dict, timestamps: dict, health: dict, *, failed: bool
+    ) -> None:
+        """Keep last pixels for perception.
+
+        A scheduled skip stays OK when a good frame is cached. No cache and
+        not a failed read leaves the default MISSING (Engage hitch skip).
+        STALE is a failed read. Soft Esc uses that after a warm that missed,
+        so a never-coloured companion does not stay MISSING.
+        """
         bgr = self._cache_frames.get(cid)
+        if not failed:
+            if bgr is None:
+                return
+            frames[cid] = bgr
+            timestamps[cid] = self._cache_ts.get(cid, time.time())
+            health[cid] = CamHealth.OK
+            if cid == "main":
+                frames["cam_main"] = bgr
+            return
         if bgr is None:
             health[cid] = CamHealth.STALE
             return
@@ -1325,25 +1470,52 @@ class BeamNGPyBackend:
         ts = time.time()
         grab_i = self._grab_i
         self._grab_i = grab_i + 1
+        phase = grab_phase_of(grab_i, self._hitch)
+        companion_polled = False
         unique_ids: list[str] = []
+        # Soft Esc: warm each companion once so a cold cam can leave MISSING,
+        # then stream_raw/colour main only. Last-good stays OK. A warm that
+        # missed stays STALE and is not polled again. Engage uses the hitch
+        # colour schedule (a not-yet-due cam may still be MISSING).
+        soft_esc_main = soft_esc_colour_main_only()
+        soft_esc_coloured_companion = False
         for cid, cam in self._sensors.items():
-            if not self._grab_this_tick(cid, grab_i):
-                self._reuse_cached(cid, frames, timestamps, health)
+            warming = False
+            if soft_esc_main and cid != "main":
+                if cid in self._cache_frames:
+                    self._reuse_cached(cid, frames, timestamps, health, failed=False)
+                    continue
+                if cid in self._soft_esc_warm_failed:
+                    self._reuse_cached(cid, frames, timestamps, health, failed=True)
+                    continue
+                warming = True
+                soft_esc_coloured_companion = True
+            elif not self._grab_this_tick(cid, grab_i):
+                self._reuse_cached(cid, frames, timestamps, health, failed=False)
                 continue
+            if cid != "main":
+                companion_polled = True
             try:
                 bgr = read_camera_colour(cam, cid=cid, resolution=self._resolution.get(cid))
                 if bgr is None:
-                    self._reuse_cached(cid, frames, timestamps, health)
+                    if warming:
+                        self._soft_esc_warm_failed.add(cid)
+                    self._reuse_cached(cid, frames, timestamps, health, failed=True)
                     continue
                 bgr = resize_long_side(bgr, self.long_side)
                 sig = frame_signature(bgr)
                 unique = sig != self._frame_sig.get(cid)
                 self._store_frame(cid, bgr, ts, frames, timestamps, health)
+                self._soft_esc_warm_failed.discard(cid)
                 if unique:
                     self._frame_sig[cid] = sig
                     unique_ids.append(cid)
             except Exception:
-                health[cid] = CamHealth.ERROR
+                if warming:
+                    self._soft_esc_warm_failed.add(cid)
+                    self._reuse_cached(cid, frames, timestamps, health, failed=True)
+                else:
+                    health[cid] = CamHealth.ERROR
         unique_n = len(unique_ids)
         now = time.perf_counter()
         if grab_i > 0 and self._last_unique_tick_t > 0:
@@ -1355,19 +1527,28 @@ class BeamNGPyBackend:
         self._maybe_live_narrow_hitch()
         n_ok = sum(1 for c in CAM_IDS if health.get(c) == CamHealth.OK)
         grab_ms = (time.perf_counter() - t0) * 1000.0
+        note = (
+            f"beamngpy: {n_ok} colour frame(s) grab={grab_i} unique={unique_n} "
+            f"main_div={self._grab_div.get('main', MAIN_GRAB_DIV)} "
+            f"wide_div={self._grab_div.get('wide', WIDE_GRAB_DIV)} "
+            f"narrow_div={self._grab_div.get('narrow', NARROW_GRAB_DIV)} "
+            f"side_div={self._side_grab_div} "
+            f"repeat_div={self._grab_div.get('repeatL', REPEAT_GRAB_DIV)} "
+            f"rear_div={self._rear_grab_div}"
+        )
+        if soft_esc_main and soft_esc_coloured_companion:
+            note += " soft_esc_warm=1"
+        elif soft_esc_main:
+            note += " soft_esc_colour=main"
         return CameraFrameBundle(
             frames=frames,
             timestamps=timestamps,
             health=health,
             backend=self.name,
-            note=(
-                f"beamngpy: {n_ok} colour frame(s) grab={grab_i} unique={unique_n} "
-                f"main_div={self._grab_div.get('main', 1)} "
-                f"wide_div={self._grab_div.get('wide', 2)} "
-                f"narrow_div={self._grab_div.get('narrow', 2)} "
-                f"side_div={self._side_grab_div} rear_div={self._rear_grab_div}"
-            ),
+            note=note,
             grab_ms=grab_ms,
+            grab_phase=phase,
+            grab_poll_free=not companion_polled,
             unique_gpu_n=unique_n,
             unique_gpu_ids=tuple(unique_ids),
         )

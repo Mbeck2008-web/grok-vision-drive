@@ -1,5 +1,14 @@
 """BeamNG.tech session: connect, player vehicle, electrics/damage/pose + GPS nav hint.
 
+Soft Esc (supervisor engaged=false): at most one ``vehicle.sensors.poll`` per
+``SOFT_ESC_SENSOR_POLL_S``. Inside that window the grab reuses the last-good
+ego map and does not send ``PollGPSGE``. A reused GPS sample is
+``sensors["gps"]="stale"`` (same contract as the GPS window below): lat/lon
+stay, and it is not a new fix. Skipped polls record 0 ms. Before that hold,
+``poll`` reads ``read_engage_flag`` and the engage latch. A live
+``gvd_engage.json`` refuses last-good on the rising edge, where the grab loop
+has not called ``note_engaged`` yet. Engage keeps Tip #1: one
+``vehicle.sensors.poll`` every grab. ``PollGPSGE`` stays on ``GPS_POLL_PERIOD_S``.
 Camera RGB is handled by cameras.py. GPS is a coarse nav hint, not localization.
 LiDAR / radar / AdvancedIMU attach when config/sensors.yaml enables them — Foxglove /
 future fusion only; the corridor planner stays vision-only. Ultrasonic stays refused.
@@ -9,11 +18,14 @@ vehicle space is +X left, +Y backward, +Z up. Convert at attach.
 
 from __future__ import annotations
 
+import ctypes
 import inspect
 import math
 import os
+import socket
+import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +35,15 @@ EARTH_R_M = 6371000.0
 # BeamNG maps have no real-world lat/lon. These put world (0, 0) on the Italy demo sphere.
 DEFAULT_REF_LON = 8.8017
 DEFAULT_REF_LAT = 53.0793
+# GPS.poll sends PollGPSGE, a separate GE roundtrip. Nav is a hint, so grabs
+# inside this window coalesce onto the last sample. That sample is
+# sensors["gps"]="stale": lat/lon stay, and it is not a new fix.
+GPS_POLL_PERIOD_S = 0.5
+# Soft Esc only (engaged=false). One vehicle.sensors.poll per this window.
+# A grab inside it reuses the last-good map and does not send PollGPSGE.
+# A live gvd_engage.json or the engage latch ignores the window: one
+# sensors.poll per grab (Tip #1), including the first grab of the rising edge.
+SOFT_ESC_SENSOR_POLL_S = 0.2
 
 
 def _num(v: Any) -> float | None:
@@ -146,6 +167,78 @@ def _flatten_gps_samples(raw: Any) -> list[dict[str, Any]]:
     return out
 
 
+def _sensor_map(sensors: Any) -> dict[str, Any]:
+    """Read the vehicle sensor container after poll().
+
+    BeamNGpy ``Sensors.poll`` returns None and the container is not a dict.
+    ``.items()`` / ``.data`` hold the updated Electrics, Damage, and GForces.
+    A dict (tests, older containers) is copied by key.
+    """
+    if sensors is None:
+        return {}
+    if isinstance(sensors, dict):
+        return {str(k): sensors[k] for k in sensors}
+    try:
+        items = sensors.items()
+        return {str(k): v for k, v in items}
+    except Exception:
+        pass
+    data = getattr(sensors, "data", None)
+    if isinstance(data, dict):
+        try:
+            return {str(k): data[k] for k in data}
+        except Exception:
+            pass
+    try:
+        return {str(k): sensors[k] for k in list(sensors)}
+    except Exception:
+        return {}
+
+
+def _copy_sensor_map(sensors: dict[str, Any]) -> dict[str, Any]:
+    """Copy the poll map so last-good does not alias the live sensor dicts."""
+    out: dict[str, Any] = {}
+    for key, val in sensors.items():
+        out[str(key)] = dict(val) if isinstance(val, dict) else val
+    return out
+
+
+def _soft_esc_map_has_ego(sensors: dict[str, Any]) -> bool:
+    """True when the map still carries electrics or pose worth caching.
+
+    An empty non-throwing ``sensors.poll`` must not arm the Soft Esc window
+    or replace the previous sample.
+    """
+    if not isinstance(sensors, dict) or not sensors:
+        return False
+    if _value_has_electrics(sensors.get("electrics")):
+        return True
+    for key in ("state", "pose"):
+        if _value_has_pose(sensors.get(key)):
+            return True
+    return False
+
+
+def _value_has_electrics(el: Any) -> bool:
+    if el is None:
+        return False
+    if isinstance(el, dict):
+        return bool(el)
+    data = getattr(el, "data", None)
+    if isinstance(data, dict):
+        return bool(data)
+    return True
+
+
+def _value_has_pose(st: Any) -> bool:
+    if st is None:
+        return False
+    src = st if isinstance(st, dict) else getattr(st, "data", None)
+    if not isinstance(src, dict):
+        return False
+    return src.get("pos") is not None or src.get("dir") is not None or src.get("forward") is not None
+
+
 def latest_gps_reading(raw: Any) -> dict[str, Any] | None:
     """Pick the newest lon/lat sample from a BeamNGpy GPS.poll() payload (list, dict, or bulk)."""
     samples = _flatten_gps_samples(raw)
@@ -180,9 +273,14 @@ def nav_snapshot(data: VehicleData | None) -> dict[str, Any]:
     if data is None or not data.connected:
         return empty_nav()
     gps_ok = data.lat is not None and data.lon is not None
+    gps_stale = (data.sensors or {}).get("gps") == "stale"
     pin = None
     if data.pin_lat is not None and data.pin_lon is not None:
         pin = {"lat": data.pin_lat, "lon": data.pin_lon, "name": data.pin_name or ""}
+    note = "nav hint only; not localization; pin is not a route"
+    if gps_ok and gps_stale:
+        # ok means a fix is present. stale means this grab did not send PollGPSGE.
+        note += "; gps is the last PollGPSGE sample (off grab cadence, not a new fix)"
     return {
         "mode": "hint" if gps_ok else "missing",
         "drive_to_pin": False,
@@ -197,7 +295,7 @@ def nav_snapshot(data: VehicleData | None) -> dict[str, Any]:
         "range_m": data.range_m,
         "bearing_deg": data.bearing_deg,
         "bearing_rel_deg": data.bearing_rel_deg,
-        "note": "nav hint only; not localization; pin is not a route",
+        "note": note,
     }
 
 
@@ -281,6 +379,9 @@ def apply_env_overrides(cfg: dict[str, Any]) -> dict[str, Any]:
         out["launch"] = True
     elif launch in ("0", "false", "no"):
         out["launch"] = False
+    py_pin = os.environ.get("GVD_BEAMNGPY_PIN", "").strip()
+    if py_pin:
+        out["beamngpy_pin"] = py_pin
     vid = os.environ.get("GVD_TECH_VEHICLE")
     if vid:
         out["vehicle"] = vid
@@ -311,8 +412,784 @@ def apply_env_overrides(cfg: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+# Research socket. Official binary is the install-root exe, not Bin64.
+TECH_RESEARCH_PORT = 25252
+TECH_ROOT_EXE = "BeamNG.tech.exe"
+TECH_GFX = "dx11"
+# BeamNGpy Hello recv. None blocks past the prove window; this cap REFUSEs.
+TECH_SOCKET_TIMEOUT_S = 10.0
+
+
+class TechHelloTimeout(TimeoutError):
+    """Hello did not return before socket_timeout. Not a missing vehicle."""
+# Human one-starter and the BeamNGpy gfx switch. BeamNGpy also adds -nosteam/-tport.
+TECH_HUMAN_TAIL = ("-tcom", "-console", "-gfx", TECH_GFX)
+# BeamNGpy minor line for the Tech build in use. 0.38 → 1.35, 0.39 → 1.36.
+BEAMNGPY_FOR_TECH = {"1.35": "0.38", "1.36": "0.39"}
+
+
 def wants_tech_attach() -> bool:
     return os.environ.get("GVD_BEAMNG", "").strip().lower() in ("1", "true", "yes")
+
+
+def research_port_listening(host: str, port: int, *, timeout_s: float = 0.4) -> bool:
+    """True when a TCP listener accepts on the Tech research port."""
+    import socket
+
+    try:
+        with socket.create_connection((str(host), int(port)), timeout=timeout_s):
+            return True
+    except OSError:
+        return False
+
+
+def resolve_tech_launch(cfg: dict[str, Any], *, port_listening: bool) -> tuple[bool, str]:
+    """One starter. Port already up → attach, even if launch was requested.
+
+    ``True`` only when launch was asked and nothing is listening yet (BeamNGpy
+    is the only starter). Never launch a second Tech onto a live port.
+    """
+    requested = bool(cfg.get("launch"))
+    if port_listening:
+        if requested:
+            return (
+                False,
+                "research port already LISTENING; attach only "
+                "(GVD_TECH_LAUNCH=1 would double-start BeamNG.tech)",
+            )
+        return False, "attach"
+    if requested:
+        return (
+            True,
+            "single launch path: port is down and GVD_TECH_LAUNCH=1. "
+            "The bat must not also start BeamNG.tech.",
+        )
+    return False, "attach; research port is not LISTENING"
+
+
+def hold_tech_process(bng: Any) -> None:
+    """Esc/q must not quit Tech. BeamNGpy.close() sends quit_beamng when this is true."""
+    if bng is None:
+        return
+    try:
+        bng.quit_on_close = False
+    except Exception:
+        pass
+
+
+def release_tech_beamngpy(bng: Any) -> None:
+    """Disconnect the research socket. Do not close, quit, or kill BeamNG.tech / CrashSender."""
+    if bng is None:
+        return
+    hold_tech_process(bng)
+    disc = getattr(bng, "disconnect", None)
+    if not callable(disc):
+        return
+    try:
+        disc()
+    except Exception:
+        pass
+
+
+class HelloAbandoned(Exception):
+    """Stops a BeamNGpy ``open()`` reconnect loop after the Hello deadline.
+
+    This is not an ``OSError``. ``_recv_exactly`` handles ``socket.error`` by
+    calling ``reconnect()``; a raise from that call leaves ``open()``.
+    """
+
+
+_held_bng: Any = None
+_held_lock = threading.Lock()
+_HELLO_JOIN_GRACE_S = 0.05
+
+
+def park_tech_beamngpy(bng: Any) -> None:
+    """Keep one live BeamNGpy for the supervisor to reuse after the hold."""
+    global _held_bng
+    if bng is None:
+        return
+    with _held_lock:
+        prev = _held_bng
+        _held_bng = bng
+    if prev is not None and prev is not bng:
+        release_tech_beamngpy(prev)
+
+
+def take_tech_beamngpy(port: int | None = None) -> Any:
+    """Remove and return the parked session when its research port matches."""
+    global _held_bng
+    with _held_lock:
+        bng = _held_bng
+        _held_bng = None
+    if bng is None:
+        return None
+    if port is not None:
+        bport = getattr(bng, "port", None)
+        try:
+            mismatch = bport is not None and int(bport) != int(port)
+        except (TypeError, ValueError):
+            mismatch = True
+        if mismatch:
+            release_tech_beamngpy(bng)
+            return None
+    return bng
+
+
+def drop_tech_beamngpy() -> None:
+    """Disconnect a parked session. Idempotent."""
+    release_tech_beamngpy(take_tech_beamngpy())
+
+
+def _close_raw_socket(sock: Any) -> None:
+    if not isinstance(sock, socket.socket):
+        return
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except Exception:
+        pass
+    try:
+        sock.close()
+    except Exception:
+        pass
+
+
+def _patch_reconnect(obj: Any) -> None:
+    if obj is None or isinstance(obj, socket.socket):
+        return
+    if not callable(getattr(obj, "reconnect", None)):
+        return
+
+    def _stop(*_a: Any, **_k: Any) -> None:
+        raise HelloAbandoned("Hello abandoned after socket_timeout")
+
+    try:
+        obj.reconnect = _stop
+    except Exception:
+        pass
+
+
+def _hello_objects(bng: Any) -> list[Any]:
+    objs: list[Any] = []
+    seen: set[int] = set()
+
+    def add(obj: Any) -> None:
+        if obj is None or id(obj) in seen:
+            return
+        seen.add(id(obj))
+        objs.append(obj)
+
+    add(bng)
+    conn = getattr(bng, "connection", None)
+    add(conn)
+    add(getattr(bng, "skt", None))
+    add(getattr(bng, "_hello_sock", None))
+    if conn is not None:
+        add(getattr(conn, "skt", None))
+    return objs
+
+
+def _hello_sockets(bng: Any) -> list[socket.socket]:
+    found: list[socket.socket] = []
+    seen: set[int] = set()
+
+    def add(obj: Any) -> None:
+        if isinstance(obj, socket.socket) and id(obj) not in seen:
+            seen.add(id(obj))
+            found.append(obj)
+
+    for obj in _hello_objects(bng):
+        add(obj)
+        for attr in ("skt", "socket", "sock", "_socket", "_sock"):
+            try:
+                add(getattr(obj, attr, None))
+            except Exception:
+                pass
+        try:
+            for val in vars(obj).values():
+                add(val)
+        except Exception:
+            pass
+    return found
+
+
+def _async_raise(worker: threading.Thread, exc_type: type[BaseException]) -> None:
+    ident = worker.ident
+    if not ident:
+        return
+    for tid_type in (ctypes.c_ulong, ctypes.c_long):
+        try:
+            res = ctypes.pythonapi.PyThreadState_SetAsyncExc(tid_type(ident), ctypes.py_object(exc_type))
+        except Exception:
+            return
+        if res == 0:
+            continue
+        if res > 1:
+            try:
+                ctypes.pythonapi.PyThreadState_SetAsyncExc(tid_type(ident), None)
+            except Exception:
+                pass
+        return
+
+
+def _abandon_hello(bng: Any, worker: threading.Thread) -> None:
+    """Stop a daemon still inside ``bng.open()`` so it cannot reconnect forever.
+
+    BeamNGpy 1.35.1/1.36 treat a closed socket as ``socket.error`` and call
+    ``reconnect()``. 1.35.1 then sets the new socket to blocking. Patch
+    ``reconnect`` before closing so that follow-up raises out of ``open()``.
+    """
+    try:
+        setattr(bng, "_gvd_abandon", True)
+    except Exception:
+        pass
+    for obj in _hello_objects(bng):
+        _patch_reconnect(obj)
+    for sock in _hello_sockets(bng):
+        _close_raw_socket(sock)
+    worker.join(_HELLO_JOIN_GRACE_S)
+    if worker.is_alive():
+        _async_raise(worker, HelloAbandoned)
+        worker.join(_HELLO_JOIN_GRACE_S)
+
+
+def human_one_starter(home: str | None) -> str:
+    """Install-root ``BeamNG.tech.exe -tcom -console -gfx dx11``."""
+    exe = TECH_ROOT_EXE
+    if home and str(home).strip():
+        exe = str(Path(home) / TECH_ROOT_EXE)
+    return " ".join((exe, *TECH_HUMAN_TAIL))
+
+
+def beamngpy_launch_argv(home: str | None, port: int, user: str | None = None) -> list[str]:
+    """Argv BeamNGpy 1.36 builds for the root exe with ``gfx=dx11``.
+
+    Matches ``_prepare_call`` plus ``open()``'s default ``-tcom-listen-ip``.
+    Used when a launch fails before ``last_command_line`` is set. Not a Bin64 path.
+    """
+    exe = TECH_ROOT_EXE
+    if home and str(home).strip():
+        exe = str(Path(home) / TECH_ROOT_EXE)
+    call = [
+        exe,
+        "-nosteam",
+        "-tcom",
+        "-tport",
+        str(int(port)),
+        "-console",
+        "-tcom-listen-ip",
+        "127.0.0.1",
+        "-gfx",
+        TECH_GFX,
+    ]
+    if user and str(user).strip():
+        call.extend(("-userpath", str(user)))
+    return call
+
+
+def real_launch_argv(bng: Any, home: str | None, port: int, user: str | None) -> str:
+    """Command line BeamNGpy actually used, else the root-exe reconstruction.
+
+    ``get_launch_arguments()`` ignores ``self.binary`` when ``last_command_line``
+    is empty, so it is not the failure argv.
+    """
+    line = getattr(bng, "last_command_line", None) if bng is not None else None
+    if isinstance(line, (list, tuple)) and line:
+        return " ".join(str(part) for part in line)
+    if isinstance(line, str) and line.strip():
+        return line.strip()
+    return " ".join(beamngpy_launch_argv(home, port, user))
+
+
+def resolve_socket_timeout(cfg: dict[str, Any] | None = None) -> float:
+    """Attach/Hello cap in seconds. Env, then yaml, then ``TECH_SOCKET_TIMEOUT_S``."""
+    raw: Any = os.environ.get("GVD_TECH_SOCKET_TIMEOUT", "").strip()
+    if not raw and cfg is not None:
+        raw = cfg.get("socket_timeout")
+    if raw is None or raw == "":
+        raw = TECH_SOCKET_TIMEOUT_S
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        val = TECH_SOCKET_TIMEOUT_S
+    if val <= 0:
+        return TECH_SOCKET_TIMEOUT_S
+    return val
+
+
+def _force_root_dx11(bng: Any, socket_timeout: float) -> None:
+    """Root exe, dx11, and a finite Hello socket timeout. No Bin64 default."""
+    try:
+        bng.binary = TECH_ROOT_EXE
+    except Exception:
+        pass
+    try:
+        bng.gfx = TECH_GFX
+    except Exception:
+        pass
+    try:
+        bng.socket_timeout = socket_timeout
+    except Exception:
+        pass
+
+
+def _hello_refuse_line(timeout: float) -> None:
+    print(
+        f"[GVD] phase=Hello REFUSE: socket_timeout {timeout:g}s. Not a missing vehicle.",
+        flush=True,
+    )
+
+
+def _open_with_deadline(bng: Any, launch: bool, timeout: float, host: str, port: int) -> None:
+    """Return when ``bng.open`` finishes, or REFUSE at ``timeout``.
+
+    BeamNGpy 1.35.1 has no ``socket_timeout`` argument, so a silent port blocks
+    inside ``open()``. 1.36 accepts the argument and may retry once. The join
+    is the cap for both pins. On expiry the helper logs one REFUSE, stops the
+    ``open()`` thread, and disconnects. Any other ``open()`` error disconnects
+    too, so a Hello version mismatch cannot leave the socket up.
+    """
+    box: dict[str, BaseException] = {}
+
+    def _run() -> None:
+        try:
+            bng.open(launch=bool(launch))
+        except BaseException as exc:
+            box["exc"] = exc
+
+    worker = threading.Thread(target=_run, name="gvd-hello", daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        _hello_refuse_line(timeout)
+        _abandon_hello(bng, worker)
+        release_tech_beamngpy(bng)
+        raise TechHelloTimeout(f"Hello timeout after {timeout:g}s on {host}:{int(port)}")
+    exc = box.get("exc")
+    if exc is None:
+        return
+    release_tech_beamngpy(bng)
+    if isinstance(exc, TechHelloTimeout):
+        _hello_refuse_line(timeout)
+        raise exc
+    if isinstance(exc, TimeoutError):
+        _hello_refuse_line(timeout)
+        raise TechHelloTimeout(f"Hello timeout after {timeout:g}s on {host}:{int(port)}") from exc
+    raise exc
+
+
+def open_tech_beamngpy(
+    host: str,
+    port: int,
+    *,
+    home: str | None,
+    user: str | None,
+    launch: bool,
+    socket_timeout: float | None = None,
+) -> Any:
+    """Connect with quit_on_close=False. Launch uses the root exe and ``-gfx dx11``.
+
+    A listening research port forces ``launch=False``. ``bng.open()`` is joined
+    for ``socket_timeout`` seconds on BeamNGpy 1.35 and 1.36. Expiry is
+    ``TechHelloTimeout`` (one ``phase=Hello REFUSE``), not a missing vehicle.
+    A launch failure prints the real argv. Attach failures do not print a launch line.
+    """
+    from beamngpy import BeamNGpy  # type: ignore
+
+    if socket_timeout is None:
+        timeout = resolve_socket_timeout(load_tech_config())
+    else:
+        timeout = float(socket_timeout)
+    if timeout <= 0:
+        timeout = TECH_SOCKET_TIMEOUT_S
+    listening = research_port_listening(host, int(port))
+    if listening:
+        launch = False
+    print(
+        f"[GVD] phase=attach {host}:{int(port)} "
+        f"{'LISTENING' if listening else 'down'} "
+        f"launch={launch} socket_timeout={timeout:g}s",
+        flush=True,
+    )
+    kwargs: dict[str, Any] = {
+        "quit_on_close": False,
+        "binary": TECH_ROOT_EXE,
+        "gfx": TECH_GFX,
+        "socket_timeout": timeout,
+    }
+    if home:
+        kwargs["home"] = home
+    if user:
+        kwargs["user"] = user
+    bng = None
+    try:
+        try:
+            bng = BeamNGpy(host, int(port), **kwargs)
+        except TypeError:
+            slim: dict[str, Any] = {}
+            if home:
+                slim["home"] = home
+            if user:
+                slim["user"] = user
+            try:
+                bng = BeamNGpy(host, int(port), quit_on_close=False, **slim)
+            except TypeError:
+                bng = BeamNGpy(host, int(port), **slim) if slim else BeamNGpy(host, int(port))
+        _force_root_dx11(bng, timeout)
+        hold_tech_process(bng)
+        print("[GVD] phase=Hello", flush=True)
+        _open_with_deadline(bng, bool(launch), timeout, host, int(port))
+        print("[GVD] phase=Hello ok", flush=True)
+        hold_tech_process(bng)
+        _force_root_dx11(bng, timeout)
+        return bng
+    except TechHelloTimeout:
+        raise
+    except Exception:
+        if launch:
+            argv = real_launch_argv(bng, home, port, user)
+            print(f"[GVD] beamngpy launch failed. argv: {argv}", flush=True)
+        raise
+
+
+def beamngpy_minor(version: str | None) -> str | None:
+    if version is None:
+        return None
+    parts = str(version).strip().split(".")
+    if len(parts) < 2:
+        return None
+    try:
+        return f"{int(parts[0])}.{int(parts[1])}"
+    except ValueError:
+        return None
+
+
+def beamngpy_pin_ok(installed: str | None, pin: str | None) -> bool:
+    """True when the installed BeamNGpy minor matches the Tech-build pin."""
+    want = beamngpy_minor(pin)
+    got = beamngpy_minor(installed)
+    if not want or not got:
+        return False
+    return want == got
+
+
+def installed_beamngpy_version() -> str | None:
+    try:
+        from importlib.metadata import version
+
+        return version("beamngpy")
+    except Exception:
+        pass
+    try:
+        import beamngpy  # type: ignore
+
+        raw = getattr(beamngpy, "__version__", None)
+        return str(raw) if raw else None
+    except Exception:
+        return None
+
+
+def tech_key_status(home: str | None) -> bool | None:
+    """Diagnose only. True when install-root ``tech.key`` is non-empty.
+
+    A Bin64 ``tech.key`` does not count. Empty or whitespace is False.
+    None when home is unset. This does not gate the wait hold.
+    """
+    if home is None or not str(home).strip():
+        return None
+    key = Path(home) / "tech.key"
+    try:
+        if not key.is_file():
+            return False
+        text = key.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return bool(text.strip())
+
+
+def tech_mod_roots() -> list[Path]:
+    """Unpacked GVD mod: legacy ``BeamNG.tech\\current`` first, then nested."""
+    from python.runtime.paths import local_appdata_dir
+
+    la = local_appdata_dir()
+    if la is None:
+        return []
+    return [
+        la / "BeamNG.tech" / "current" / "mods" / "unpacked" / "gvd",
+        la / "BeamNG" / "BeamNG.tech" / "current" / "mods" / "unpacked" / "gvd",
+    ]
+
+
+def tech_mod_present() -> bool:
+    marker = Path("lua") / "ge" / "extensions" / "gvd" / "main.lua"
+    for root in tech_mod_roots():
+        try:
+            if (root / marker).is_file():
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def probe_spawned_vehicle(
+    host: str,
+    port: int,
+    *,
+    socket_timeout: float | None = None,
+    retain: bool = False,
+) -> bool | None:
+    """Attach-only vehicle poll. None when beamngpy is missing. Never launches or kills.
+
+    ``TechHelloTimeout`` propagates. It is not an empty vehicle list.
+    ``retain=True`` parks the live socket when a vehicle is present so the
+    supervisor can reuse that one Hello.
+    """
+    try:
+        from beamngpy import BeamNGpy  # type: ignore  # noqa: F401
+    except Exception:
+        return None
+    bng = None
+    parked = False
+    try:
+        bng = open_tech_beamngpy(
+            host, port, home=None, user=None, launch=False, socket_timeout=socket_timeout
+        )
+        vehicles = None
+        getter = getattr(bng, "get_current_vehicles", None)
+        if callable(getter):
+            vehicles = getter()
+        else:
+            api = getattr(bng, "vehicles", None)
+            info = getattr(api, "get_current", None) if api is not None else None
+            if callable(info):
+                vehicles = info()
+        if isinstance(vehicles, dict):
+            found = len(vehicles) > 0
+        else:
+            found = bool(vehicles)
+        if retain and found:
+            park_tech_beamngpy(bng)
+            parked = True
+        return found
+    except TechHelloTimeout:
+        raise
+    except Exception:
+        return False
+    finally:
+        if not parked:
+            release_tech_beamngpy(bng)
+
+
+@dataclass(frozen=True)
+class TechHoldGate:
+    """Wait gate before vision / unique-frame Hz. Launch policy is separate."""
+
+    port_listening: bool
+    mod_present: bool
+    vehicle_spawned: bool
+    lua_fresh: bool
+    buses_same: bool
+    link: str
+    pin_ok: bool
+    note: str
+    python_bus: str
+    lua_bus: str
+    lua_age_s: float | None
+    beamngpy_pin: str
+    beamngpy_version: str
+    tech_key: bool | None
+    will_launch: bool
+    host: str
+    port: int
+    hello: str = "skipped"
+    lua_folder: str = ""
+
+    @property
+    def ok(self) -> bool:
+        """Port LISTENING + mod + vehicle + fresh lua_bus + buses_same. Not the pin."""
+        return bool(
+            self.port_listening
+            and self.mod_present
+            and self.vehicle_spawned
+            and self.lua_fresh
+            and self.buses_same
+            and self.link == "ok"
+        )
+
+    @property
+    def proceed(self) -> bool:
+        """Wait gate plus the BeamNGpy pin for the Tech build in use."""
+        return self.ok and self.pin_ok
+
+    @property
+    def line(self) -> str:
+        age = "--" if self.lua_age_s is None else f"{self.lua_age_s:.3f}s"
+        if self.hello == "timeout":
+            vehicle = "Hello-timeout"
+        else:
+            vehicle = "yes" if self.vehicle_spawned else "no"
+        folder = (self.lua_folder or "").strip() or "--"
+        return (
+            f"[GVD] phase=wait-gate port={'LISTENING' if self.port_listening else 'down'} "
+            f"mod={'yes' if self.mod_present else 'no'} "
+            f"vehicle={vehicle} "
+            f"lua_bus={'fresh' if self.lua_fresh else 'stale'} folder={folder} age={age} "
+            f"buses_same={'yes' if self.buses_same else 'no'} link={self.link} "
+            f"pin={self.beamngpy_pin or '--'} beamngpy={self.beamngpy_version or 'missing'} "
+            f"launch={'yes' if self.will_launch else 'attach'}"
+        )
+
+
+def tech_hold_gate(
+    config: dict[str, Any] | None = None,
+    *,
+    port_up: bool | None = None,
+    vehicle_spawned: bool | None = None,
+    mod_present: bool | None = None,
+    beamngpy_version: str | None = None,
+    retain: bool = False,
+) -> TechHoldGate:
+    """Preflight before cameras / unique-frame Hz.
+
+    Wait gate (unchanged): research port LISTENING, unpacked GVD mod, a spawned
+    vehicle, fresh lua_bus (age < 1s), and buses_same(python_bus, lua_bus).
+    ``tech.key`` and the Tech user path are status only and are not part of this gate.
+    ``retain=True`` parks the Hello socket when the gate proceeds so
+    ``TechSession.connect`` reuses that one session.
+    """
+    from python.runtime.paths import bus_identity, buses_same_folder, read_live_lua_bus, youngest_lua_handshake
+
+    drop_tech_beamngpy()
+    cfg = apply_env_overrides(config if config is not None else load_tech_config())
+    host = str(cfg.get("host") or "localhost")
+    port = int(cfg.get("port") or TECH_RESEARCH_PORT)
+    listening = research_port_listening(host, port) if port_up is None else bool(port_up)
+    will_launch, _launch_note = resolve_tech_launch(cfg, port_listening=listening)
+
+    if mod_present is None:
+        mod_ok = tech_mod_present()
+    else:
+        mod_ok = bool(mod_present)
+
+    vehicle_note = ""
+    hello = "skipped"
+    hello_note = ""
+    if vehicle_spawned is None:
+        if not listening:
+            veh_ok = False
+            print(
+                f"[GVD] phase=attach {host}:{port} down launch={will_launch} "
+                f"socket_timeout={resolve_socket_timeout(cfg):g}s",
+                flush=True,
+            )
+            print("[GVD] phase=Hello skipped", flush=True)
+        else:
+            try:
+                probed = probe_spawned_vehicle(
+                    host,
+                    port,
+                    socket_timeout=resolve_socket_timeout(cfg),
+                    retain=retain,
+                )
+            except TechHelloTimeout as exc:
+                veh_ok = False
+                hello = "timeout"
+                hello_note = str(exc)
+            else:
+                hello = "ok"
+                if probed is None:
+                    veh_ok = False
+                    vehicle_note = "beamngpy not available"
+                else:
+                    veh_ok = bool(probed)
+    else:
+        veh_ok = bool(vehicle_spawned)
+
+    ident = bus_identity()
+    live, live_note = read_live_lua_bus()
+    _raw, age = youngest_lua_handshake()
+    fresh = live is not None and live_note == "ok"
+    lua_folder = ident.lua_bus_s if fresh else (str(_raw).strip() if _raw else "")
+    same = bool(
+        buses_same_folder(ident.python_bus, ident.lua_bus)
+        and live is not None
+        and buses_same_folder(ident.python_bus, live)
+    )
+    link = "ok" if fresh and same else "MISMATCH"
+    pin = str(cfg.get("beamngpy_pin") or "").strip()
+    installed = beamngpy_version if beamngpy_version is not None else installed_beamngpy_version()
+    pin_ok = beamngpy_pin_ok(installed, pin)
+    home = str(cfg.get("home") or "").strip() or None
+    key = tech_key_status(home)
+
+    reasons: list[str] = []
+    if not listening:
+        reasons.append(f"research port {host}:{port} not LISTENING")
+    if not mod_ok:
+        reasons.append(r"GVD mod missing under Tech current\mods\unpacked\gvd")
+    if hello == "timeout":
+        reasons.append(hello_note or "Hello timeout")
+    elif not veh_ok:
+        reasons.append(vehicle_note or "no vehicle spawned")
+    if not fresh:
+        reasons.append(live_note or "lua_bus missing or stale")
+    elif not same:
+        reasons.append("python_bus and lua_bus differ")
+    if not pin_ok:
+        got = installed or "missing"
+        tech = BEAMNGPY_FOR_TECH.get(beamngpy_minor(pin) or "", "")
+        extra = f" (Tech {tech})" if tech else ""
+        reasons.append(f"beamngpy {got} != pin {pin or '--'}{extra}")
+    note = "ok" if not reasons else "; ".join(reasons)
+    gate = TechHoldGate(
+        port_listening=listening,
+        mod_present=mod_ok,
+        vehicle_spawned=veh_ok,
+        lua_fresh=fresh,
+        buses_same=same,
+        link=link,
+        pin_ok=pin_ok,
+        note=note,
+        python_bus=ident.python_bus_s,
+        lua_bus=ident.lua_bus_s if fresh else "",
+        lua_age_s=age,
+        beamngpy_pin=pin,
+        beamngpy_version=str(installed or ""),
+        tech_key=key,
+        will_launch=will_launch,
+        host=host,
+        port=port,
+        hello=hello,
+        lua_folder=lua_folder,
+    )
+    if not (retain and gate.proceed):
+        drop_tech_beamngpy()
+    print(gate.line, flush=True)
+    return gate
+
+
+def run_tech_hold(config: dict[str, Any] | None = None) -> int:
+    """Print the wait gate and return 0 only when vision/Hz is allowed to start."""
+    gate = tech_hold_gate(config)
+    cfg = apply_env_overrides(config if config is not None else load_tech_config())
+    home = str(cfg.get("home") or "").strip() or None
+    print(f"[GVD] one starter: {human_one_starter(home)}", flush=True)
+    if gate.tech_key is True:
+        print("[GVD] tech.key: non-empty install-root tech.key (status only, not a hold gate).", flush=True)
+    elif gate.tech_key is False:
+        print("[GVD] tech.key: missing or empty at the install root (status only, not a hold gate).", flush=True)
+    else:
+        print("[GVD] tech.key: not confirmed (set BNG_HOME). Status only, not a hold gate.", flush=True)
+    if gate.proceed:
+        print("[GVD] tech-hold OK. Unique-frame Hz is not measured here.", flush=True)
+        return 0
+    print(f"[GVD] REFUSE: {gate.note}", flush=True)
+    print(
+        "[GVD] Supervisor stays down. Do not kill BeamNG.tech or CrashSender. "
+        f"One starter: {human_one_starter(home)} already running, mod loaded, vehicle spawned, then attach.",
+        flush=True,
+    )
+    return 1
 
 
 @dataclass
@@ -353,6 +1230,10 @@ class VehicleData:
     bearing_rel_deg: float | None = None
     note: str = ""
     sensors: dict[str, str] = field(default_factory=dict)
+    # Soft Esc segment timers. 0 / False when that call did not run this poll.
+    sensors_poll_ms: float = 0.0
+    poll_gps_ms: float = 0.0
+    poll_gps_sent: bool = False
 
     @property
     def pose_ok(self) -> bool:
@@ -376,47 +1257,79 @@ class TechSession:
         self._imu: Any = None
         self._extra_sensors_yaml: dict[str, Any] | None = None
         self._last_gps: tuple[float, float] | None = None
+        self._gps_reading: dict[str, Any] | None = None
+        self._gps_mono: float | None = None
+        self._sensors_poll_ms = 0.0
+        self._poll_gps_ms = 0.0
+        self._poll_gps_sent = False
+        self._sensors_poll_ok = False
+        self._sensors_poll_mono: float | None = None
+        self._sensors_poll_vehicle_id: int | None = None
+        self._last_vehicle_data: VehicleData | None = None
+        self._last_sensor_map: dict[str, Any] | None = None
         self.note = ""
 
     def connect(self, *, explicit: bool = True) -> bool:
-        """Open BeamNGpy. explicit=True when the user asked for --backend beamngpy."""
+        """Open BeamNGpy. explicit=True when the user asked for --backend beamngpy.
+
+        Prefer attach. If the research port is already LISTENING, launch is forced
+        off so a second Tech is not started. A session parked by the wait gate is
+        reused (one Hello). The socket is opened with quit_on_close=False; Esc/q
+        disconnects and leaves the Tech process running.
+        """
         if not explicit and not wants_tech_attach():
             self.note = "set GVD_BEAMNG=1 or --backend beamngpy to attach"
             return False
-        try:
-            from beamngpy import BeamNGpy  # type: ignore
-        except Exception as e:
-            self.note = f"beamngpy not available ({e})"
-            self._log(f"[GVD] {self.note}; vehicle data missing.")
-            return False
 
         host = str(self.config.get("host") or "localhost")
-        port = int(self.config.get("port") or 25252)
+        port = int(self.config.get("port") or TECH_RESEARCH_PORT)
         home = str(self.config.get("home") or "").strip() or None
         user = str(self.config.get("user") or "").strip() or None
-        launch = bool(self.config.get("launch"))
-        kwargs: dict[str, Any] = {}
-        if home:
-            kwargs["home"] = home
-        if user:
-            kwargs["user"] = user
-        try:
-            bng = BeamNGpy(host, port, **kwargs) if kwargs else BeamNGpy(host, port)
-            bng.open(launch=launch)
-            self.bng = bng
-        except Exception as e:
-            self.note = f"beamngpy connect failed ({e})"
+        listening = research_port_listening(host, port)
+        launch, launch_note = resolve_tech_launch(self.config, port_listening=listening)
+        if launch_note not in ("attach",):
+            self._log(f"[GVD] {launch_note}")
+        if not listening:
+            drop_tech_beamngpy()
+        if not listening and not launch:
+            self.note = f"research port {host}:{port} not LISTENING"
             self._log(
-                f"[GVD] {self.note}. Is BeamNG.tech listening on {host}:{port} "
-                f"with tech.key in the install dir?"
+                f"[GVD] {self.note}. Start BeamNG.tech once: {human_one_starter(home)} "
+                "then attach. This path does not start a second Tech."
             )
             return False
+        parked = take_tech_beamngpy(port) if listening else None
+        if parked is not None:
+            hold_tech_process(parked)
+            self.bng = parked
+            self._log(f"[GVD] phase=Hello reuse {host}:{int(port)}")
+        else:
+            try:
+                bng = open_tech_beamngpy(
+                    host,
+                    port,
+                    home=home,
+                    user=user,
+                    launch=launch,
+                    socket_timeout=resolve_socket_timeout(self.config),
+                )
+                self.bng = bng
+            except TechHelloTimeout as e:
+                # The open helper already logged this Hello failure once.
+                self.note = str(e)
+                return False
+            except Exception as e:
+                self.note = f"beamngpy connect failed ({e})"
+                self._log(f"[GVD] {self.note}. Research port {host}:{port}.")
+                return False
 
         wait_s = float(self.config.get("wait_vehicle_s") or 0.0)
         vehicle = self._wait_vehicle(wait_s)
         if vehicle is None:
             self.note = "no vehicle to attach (spawn one in Tech, then retry)"
             self._log(f"[GVD] beamngpy: {self.note}.")
+            release_tech_beamngpy(self.bng)
+            self.bng = None
             return False
         self.vehicle = vehicle
         self.note = f"connected vid={self._vid(vehicle)}"
@@ -815,18 +1728,55 @@ class TechSession:
         name = str(nav.get("pin_name") or gps.get("pin_name") or "").strip()
         return lat, lon, name
 
-    def _poll_gps(self) -> dict[str, Any] | None:
+    def _poll_gps(self) -> tuple[dict[str, Any] | None, str]:
+        """Return ``(reading, status)`` with status ``ok`` / ``stale`` / ``missing``.
+
+        ``ok``: this call sent PollGPSGE and stored a lat/lon sample.
+        ``stale``: this grab skipped PollGPSGE (inside ``GPS_POLL_PERIOD_S``)
+        or the new poll failed; lat/lon are the previous sample, not a new fix.
+        ``missing``: no sample. A failed poll still arms the period so a down
+        GPS does not retry on every grab.
+        """
         gps = self._gps
+        self._poll_gps_ms = 0.0
+        self._poll_gps_sent = False
         if gps is None:
-            return None
+            return None, "missing"
+        now = time.monotonic()
+        due = self._gps_mono is None or (now - self._gps_mono) >= GPS_POLL_PERIOD_S
+        if not due:
+            if self._gps_reading is not None:
+                return self._gps_reading, "stale"
+            return None, "missing"
+        self._gps_mono = now
+        reading: dict[str, Any] | None = None
+        sent = hasattr(gps, "poll")
+        t0 = time.perf_counter()
         try:
-            raw = gps.poll() if hasattr(gps, "poll") else None
+            raw = gps.poll() if sent else None
+            reading = latest_gps_reading(raw)
         except Exception as e:
             self._log(f"[GVD] GPS poll failed: {e}")
-            return None
-        return latest_gps_reading(raw)
+            reading = None
+        finally:
+            if sent:
+                self._poll_gps_ms = (time.perf_counter() - t0) * 1000.0
+                self._poll_gps_sent = True
+        if (
+            reading is not None
+            and _num(reading.get("lat")) is not None
+            and _num(reading.get("lon")) is not None
+        ):
+            self._gps_reading = reading
+            return reading, "ok"
+        if self._gps_reading is not None:
+            return self._gps_reading, "stale"
+        return None, "missing"
 
     def poll(self) -> VehicleData:
+        self._sensors_poll_ms = 0.0
+        self._poll_gps_ms = 0.0
+        self._poll_gps_sent = False
         data = VehicleData(
             vid=self._vid(self.vehicle),
             model=self._model(self.vehicle),
@@ -837,7 +1787,10 @@ class TechSession:
         vehicle = self.vehicle
         if vehicle is None:
             data.note = self.note or "no vehicle"
+            self._clear_soft_esc_cache()
             return data
+        if self._soft_esc_hold(vehicle):
+            return self._coalesced_vehicle_data(vehicle)
         sensors = self._poll_sensors(vehicle)
         el = self._extract(sensors, "electrics")
         dmg = self._extract(sensors, "damage")
@@ -884,24 +1837,134 @@ class TechSession:
             vx, vy, vz = data.vel
             data.speed_mps = math.sqrt(vx * vx + vy * vy + vz * vz)
         self._fill_nav(data)
+        data.sensors_poll_ms = float(self._sensors_poll_ms)
+        data.poll_gps_ms = float(self._poll_gps_ms)
+        data.poll_gps_sent = bool(self._poll_gps_sent)
+        from python.control.actuate import touch_vehicle_sensor_snap
+
+        touch_vehicle_sensor_snap(vehicle)
+        self._remember_sensor_poll(vehicle, data, sensors)
+        return data
+
+    def _soft_esc_engage_blocks_hold(self) -> bool:
+        """True when Engage requires a real ``sensors.poll`` on this grab.
+
+        The grab loop calls ``note_engaged`` after ``poll_vehicle``, so the
+        latch is still false on the rising edge. Lua has already written
+        ``gvd_engage.json``. Either signal refuses Soft Esc-hold.
+        """
+        from python.control.actuate import read_engage_flag, soft_esc_sensors_every_tick
+
+        if soft_esc_sensors_every_tick():
+            return True
+        return bool(read_engage_flag(default=False))
+
+    def _soft_esc_hold(self, vehicle: Any) -> bool:
+        """True when this Soft Esc grab must not send ``vehicle.sensors.poll``.
+
+        Engage (live flag or latch) never holds. With no last-good map yet, the
+        grab polls. A different vehicle object does not reuse the previous car.
+        """
+        if self._soft_esc_engage_blocks_hold():
+            return False
+        if (
+            self._last_vehicle_data is None
+            or self._last_sensor_map is None
+            or self._sensors_poll_mono is None
+            or self._sensors_poll_vehicle_id != id(vehicle)
+        ):
+            return False
+        return (time.monotonic() - self._sensors_poll_mono) < SOFT_ESC_SENSOR_POLL_S
+
+    def _remember_sensor_poll(self, vehicle: Any, data: VehicleData, sensors: dict[str, Any]) -> None:
+        """Arm the Soft Esc window only after a poll that still has ego data.
+
+        An empty map keeps the previous sample and does not refresh the window.
+        The stored map is a copy, not the live sensor container.
+        """
+        if not self._sensors_poll_ok:
+            return
+        if not _soft_esc_map_has_ego(sensors):
+            return
+        self._sensors_poll_mono = time.monotonic()
+        self._sensors_poll_vehicle_id = id(vehicle)
+        self._last_vehicle_data = replace(data, sensors=dict(data.sensors))
+        self._last_sensor_map = _copy_sensor_map(sensors)
+
+    def _expire_soft_esc_window(self) -> None:
+        """Drop Soft Esc eligibility after a thrown ``sensors.poll``.
+
+        The previous sample stays, but the next grab must poll again.
+        """
+        self._sensors_poll_ok = False
+        self._sensors_poll_mono = None
+        self._sensors_poll_vehicle_id = None
+
+    def _clear_soft_esc_cache(self) -> None:
+        """Drop last-good, the window clock, and the vehicle id together."""
+        self._expire_soft_esc_window()
+        self._last_vehicle_data = None
+        self._last_sensor_map = None
+
+    def _coalesced_vehicle_data(self, vehicle: Any) -> VehicleData:
+        """Last-good ego/GPS. No ``sensors.poll``, no ``PollGPSGE``.
+
+        GPS that was ``ok`` on the real poll becomes ``stale``: lat/lon stay,
+        and this grab did not take a new fix. Timers stay 0. The last-good
+        map is published again so ``read_electrics`` does not poll.
+        """
+        prev = self._last_vehicle_data
+        if prev is None or self._last_sensor_map is None:
+            raise RuntimeError("soft esc coalesce without a last-good sample")
+        sensors_status = dict(prev.sensors)
+        if sensors_status.get("gps") == "ok":
+            sensors_status["gps"] = "stale"
+        note = prev.note or ""
+        tag = "soft esc: sensors.poll coalesced; last-good (not a new GPS fix)"
+        if tag not in note:
+            note = f"{note}; {tag}" if note else tag
+        data = replace(
+            prev,
+            sensors=sensors_status,
+            note=note,
+            sensors_poll_ms=0.0,
+            poll_gps_ms=0.0,
+            poll_gps_sent=False,
+        )
+        self._sensors_poll_ms = 0.0
+        self._poll_gps_ms = 0.0
+        self._poll_gps_sent = False
+        from python.control.actuate import publish_vehicle_sensor_snap, touch_vehicle_sensor_snap
+
+        publish_vehicle_sensor_snap(vehicle, _copy_sensor_map(self._last_sensor_map or {}))
+        touch_vehicle_sensor_snap(vehicle)
         return data
 
     def _fill_nav(self, data: VehicleData) -> None:
-        reading = self._poll_gps()
-        if reading:
+        reading, status = self._poll_gps()
+        if reading and status in ("ok", "stale"):
             data.lat = _num(reading.get("lat"))
             data.lon = _num(reading.get("lon"))
             data.gps_x = _num(reading.get("x"))
             data.gps_y = _num(reading.get("y"))
+            # Sample time from the sensor payload, never wall-clock of a reuse.
             data.gps_time = _num(reading.get("time"))
-            data.sensors["gps"] = "ok" if data.lat is not None and data.lon is not None else "missing"
+            have = data.lat is not None and data.lon is not None
+            if not have:
+                data.sensors["gps"] = "missing"
+            elif status == "ok":
+                data.sensors["gps"] = "ok"
+            else:
+                data.sensors["gps"] = "stale"
         elif self.attached.get("gps"):
             data.sensors["gps"] = "missing"
         pin_lat, pin_lon, pin_name = self._nav_pin()
         data.pin_lat, data.pin_lon = pin_lat, pin_lon
         data.pin_name = pin_name or None
         heading: float | None = None
-        if data.lat is not None and data.lon is not None:
+        # Only a PollGPSGE this call may advance the GPS track. A reused
+        # sample must not look like the car sat still for a fresh fix.
+        if status == "ok" and data.lat is not None and data.lon is not None:
             if self._last_gps is not None:
                 plat, plon = self._last_gps
                 if haversine_m(plat, plon, data.lat, data.lon) > 0.5:
@@ -917,23 +1980,33 @@ class TechSession:
                 data.bearing_rel_deg = wrap180(data.bearing_deg - heading)
 
     def _poll_sensors(self, vehicle: Any) -> dict[str, Any]:
+        """One vehicle.sensors.poll. The map is the tick's ego snapshot.
+
+        A throw expires the Soft Esc window so the next grab polls again
+        instead of replaying the pre-throw sample. An empty map stays
+        ``_sensors_poll_ok`` true and is filtered in ``_remember_sensor_poll``.
+        """
         out: dict[str, Any] = {}
+        self._sensors_poll_ms = 0.0
+        self._sensors_poll_ok = False
         try:
             sensors = getattr(vehicle, "sensors", None)
             if sensors is None:
                 return out
             if hasattr(sensors, "poll"):
-                sensors.poll()
-            if isinstance(sensors, dict):
-                return {str(k): sensors[k] for k in sensors}
-            # SensorContainer: iterate keys
-            try:
-                for k in list(sensors):
-                    out[str(k)] = sensors[k]
-            except Exception:
-                pass
+                t0 = time.perf_counter()
+                try:
+                    sensors.poll()
+                finally:
+                    self._sensors_poll_ms = (time.perf_counter() - t0) * 1000.0
+            out = _sensor_map(sensors)
         except Exception:
+            self._expire_soft_esc_window()
             return out
+        from python.control.actuate import publish_vehicle_sensor_snap
+
+        publish_vehicle_sensor_snap(vehicle, out)
+        self._sensors_poll_ok = True
         return out
 
     def _extract(self, sensors: dict[str, Any], key: str) -> dict[str, Any] | None:
@@ -1005,18 +2078,21 @@ class TechSession:
         setattr(self, attr, None)
 
     def close(self) -> None:
+        """Esc/q / supervisor exit. Disconnect only — never BeamNGpy.close().
+
+        BeamNGpy.close() sends quit_beamng even when this instance did not launch
+        Tech (quit_on_close defaults true, process is None) and may kill the
+        process tree, which is how CrashSender shows up after a Soft Esc.
+        The Soft Esc cache is cleared here so a later vehicle object that
+        reuses this ``id()`` cannot replay the previous car inside 200 ms.
+        """
+        self._clear_soft_esc_cache()
         for attr in ("_gps", "_lidar", "_radar", "_imu"):
             self._drop_handle(attr)
         self.vehicle = None
-        if self.bng is not None:
-            try:
-                self.bng.disconnect()
-            except Exception:
-                try:
-                    self.bng.close()
-                except Exception:
-                    pass
+        bng = self.bng
         self.bng = None
+        release_tech_beamngpy(bng)
 
     def _vid(self, vehicle: Any) -> str | None:
         if vehicle is None:
@@ -1040,6 +2116,27 @@ class TechSession:
 
     def _log(self, msg: str) -> None:
         print(msg, flush=True)
+
+
+def exit_if_tech_connect_failed(backend: Any, backend_name: str) -> None:
+    """Exit 1 when a beamngpy backend fails connect after the wait gate.
+
+    ``connect_failed`` is the connect/import miss. ``_ok`` later means cameras
+    attached, so a zero-camera open stays in the vision loop.
+    """
+    if backend_name != "beamngpy" or not getattr(backend, "connect_failed", False):
+        return
+    drop_tech_beamngpy()
+    session = getattr(backend, "session", None)
+    note = getattr(session, "note", "") if session is not None else ""
+    note = str(note or "beamngpy connect failed")
+    print(f"[GVD] REFUSE: {note}", flush=True)
+    print(
+        "[GVD] Post-hold connect failed. Supervisor exits. Unique-frame Hz is not measured. "
+        "Do not kill BeamNG.tech or CrashSender.",
+        flush=True,
+    )
+    raise SystemExit(1)
 
 
 def run_probe(config: dict[str, Any] | None = None) -> int:

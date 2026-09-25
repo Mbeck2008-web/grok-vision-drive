@@ -53,6 +53,7 @@ os.execute('mkdir -p "' .. busDocs() .. '"')
 be = { getPlayerVehicle = function() return nil end }
 guihooks = nil
 FS = nil
+function writeFile() return true end
 
 local function check(cond, msg)
   if not cond then error('FAIL: ' .. msg, 2) end

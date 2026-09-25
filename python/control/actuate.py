@@ -35,6 +35,8 @@ ENGAGE_FRESH_S = 2.5
 # Use realistic_automatic so brake-hold is not reverse throttle. Gear is int only
 # (-1 R, 0 N, 1+ forward) — never gear=-1, never letter "D".
 TECH_SHIFT_MODE = "realistic_automatic"
+# Player arrows/pedals expect arcade. Restored only on the Disengage handoff.
+TECH_PLAYER_SHIFT_MODE = "arcade"
 TECH_HOLD_BRAKE = 0.99
 # Below this, a full brake is a rest hold (parkingbrake on). Rolling AEB keeps PB off.
 TECH_HOLD_SPEED_MPS = 0.5
@@ -222,6 +224,11 @@ def stop_command(seq: int = 0, reason: str = "stop") -> DriveCommand:
     return DriveCommand(steer=0.0, throttle=0.0, brake=1.0, seq=seq, applied=False, reason=reason)
 
 
+def release_command(seq: int = 0, reason: str = "not_engaged") -> DriveCommand:
+    """Disengage handoff: pedals at rest. Engaged holds still use stop_command (brake=1)."""
+    return DriveCommand(steer=0.0, throttle=0.0, brake=0.0, seq=seq, applied=False, reason=reason)
+
+
 def _clip01(v: float) -> float:
     return float(max(0.0, min(1.0, v)))
 
@@ -396,11 +403,166 @@ class DriverInputs:
     brake_input: float | None = None
 
 
-def read_electrics(vehicle: Any) -> dict[str, Any] | None:
-    """One best-effort poll of the BeamNGpy Electrics dict. None when the sensor is absent."""
+# Soft Esc grab calls TechSession.poll, then read_electrics, on one tick.
+# vehicle.sensors.poll is one GE roundtrip. Reuse that map once. The clock
+# restarts when poll() returns so PollGPSGE inside the same poll cannot
+# expire the snapshot before electrics are read. A miss still polls; Engage
+# hold reads speed on that path.
+# Soft Esc (latch false and gvd_engage.json not live) may skip the GE poll
+# for 200 ms and republish the last-good map here so this read does not open
+# a second sensors.poll. TechSession.poll reads the engage flag before that
+# hold, because note_engaged runs after poll_vehicle.
+SENSOR_POLL_REUSE_S = 0.05
+
+# Engage latch updated by note_engaged after poll_vehicle. Default false:
+# Soft Esc coalesces without a run_vision edit. True: one sensors.poll per
+# grab (Tip #1). The rising edge does not wait for this latch; poll() also
+# refuses the hold when read_engage_flag() is true.
+_soft_esc_engaged = False
+
+
+def note_soft_esc_engaged(engaged: bool) -> None:
+    """Latch Engage so a grab with this bit set polls every tick.
+
+    Callers that flip this must restore it. ``TechSession.poll`` does not
+    wait for the latch on the rising edge; it also reads ``read_engage_flag``.
+    """
+    global _soft_esc_engaged
+    _soft_esc_engaged = bool(engaged)
+
+
+def soft_esc_sensors_every_tick() -> bool:
+    """True when the engage latch forbids the Soft Esc sensors.poll coalesce."""
+    return bool(_soft_esc_engaged)
+
+
+# Max rewrite rate for Soft Esc gvd_state.json and the Tech release cmd.
+# Matches Lua gvd_main.pollEvery (0.10): at most one rewrite per window.
+# Heartbeat age can still pass HEARTBEAT_STALE_S. When the Soft Esc loop
+# is already slower than this period, write age tracks the loop. Engage
+# does not use this cap.
+SOFT_ESC_FILE_PERIOD_S = 0.10
+
+_soft_esc_state_mono: float | None = None
+_soft_esc_state_skips = 0
+
+
+def reset_soft_esc_state_writes() -> None:
+    """Clear the Soft Esc gvd_state.json window. Callers that flip it restore it."""
+    global _soft_esc_state_mono, _soft_esc_state_skips
+    _soft_esc_state_mono = None
+    _soft_esc_state_skips = 0
+
+
+def soft_esc_state_write_skips() -> int:
+    """Soft Esc ticks that did not rewrite gvd_state.json."""
+    return int(_soft_esc_state_skips)
+
+
+def soft_esc_state_write_due(
+    engaged: bool, *, rising: bool = False, now: float | None = None
+) -> bool:
+    """True when the supervisor should call write_state on this tick.
+
+    Soft Esc (engaged false, not a rising edge): at most one True per
+    SOFT_ESC_FILE_PERIOD_S, measured from the last ``soft_esc_state_write_mark``.
+    A False increments soft_esc_state_write_skips. Engage is True every tick.
+    A rising edge flushes on that same tick when the Soft Esc window has not
+    elapsed. ``now`` is monotonic seconds for tests; the supervisor omits it.
+    """
+    global _soft_esc_state_skips
+    t = time.monotonic() if now is None else float(now)
+    if engaged or rising:
+        return True
+    last = _soft_esc_state_mono
+    if last is None or (t - last) >= SOFT_ESC_FILE_PERIOD_S:
+        return True
+    _soft_esc_state_skips += 1
+    return False
+
+
+def soft_esc_state_write_mark(now: float | None = None) -> None:
+    """Stamp the Soft Esc window after write_state returns.
+
+    The cap is on the rewrite, not the earlier due-check, so recorder time
+    between the check and the write cannot bunch two files inside 100 ms.
+    """
+    global _soft_esc_state_mono
+    _soft_esc_state_mono = time.monotonic() if now is None else float(now)
+
+
+class _SensorSnap:
+    """One vehicle.sensors.poll payload, consumed by the next same-tick reader."""
+
+    __slots__ = ("mono", "data", "used")
+
+    def __init__(self, mono: float, data: dict[str, Any]) -> None:
+        self.mono = mono
+        self.data = data
+        self.used = False
+
+
+_sensor_snaps: dict[int, _SensorSnap] = {}
+
+
+def publish_vehicle_sensor_snap(vehicle: Any, data: dict[str, Any]) -> None:
+    """Remember this tick's vehicle.sensors.poll map for one follow-up read."""
+    if vehicle is None:
+        return
+    payload = data if isinstance(data, dict) else {}
+    _sensor_snaps[id(vehicle)] = _SensorSnap(time.monotonic(), payload)
+
+
+def touch_vehicle_sensor_snap(vehicle: Any) -> None:
+    """Restart the reuse window when TechSession.poll returns."""
+    if vehicle is None:
+        return
+    snap = _sensor_snaps.get(id(vehicle))
+    if snap is None or snap.used:
+        return
+    snap.mono = time.monotonic()
+
+
+def take_vehicle_sensor_snap(vehicle: Any) -> dict[str, Any] | None:
+    """Return the unconsumed snapshot, or None when it is missing or old."""
     if vehicle is None:
         return None
+    snap = _sensor_snaps.get(id(vehicle))
+    if snap is None or snap.used:
+        return None
+    if time.monotonic() - snap.mono > SENSOR_POLL_REUSE_S:
+        return None
+    snap.used = True
+    return snap.data
+
+
+_last_electrics_ms = 0.0
+
+
+def last_electrics_ms() -> float:
+    """Wall-ms of the most recent ``read_electrics`` call."""
+    return _last_electrics_ms
+
+
+def read_electrics(vehicle: Any) -> dict[str, Any] | None:
+    """Electrics dict. None when the sensor is absent.
+
+    Soft Esc calls this immediately after ``TechSession.poll``. That poll
+    already issued this tick's ``vehicle.sensors.poll``, or republished the
+    last-good map when the 200 ms Soft Esc window skipped the GE poll.
+    Reuse that snapshot once so the grab does not open a second roundtrip.
+    A miss (no snapshot, already consumed, or older than the reuse window)
+    still polls. Engage hold reads speed on that miss path.
+    """
+    global _last_electrics_ms
+    t0 = time.perf_counter()
     try:
+        if vehicle is None:
+            return None
+        snap = take_vehicle_sensor_snap(vehicle)
+        if isinstance(snap, dict):
+            el = snap.get("electrics") if "electrics" in snap else snap
+            return el if isinstance(el, dict) else None
         sensors = getattr(vehicle, "sensors", None)
         if sensors is None:
             return None
@@ -424,6 +586,8 @@ def read_electrics(vehicle: Any) -> dict[str, Any] | None:
         return el if isinstance(el, dict) else None
     except Exception:
         return None
+    finally:
+        _last_electrics_ms = (time.perf_counter() - t0) * 1000.0
 
 
 def read_electrics_inputs(vehicle: Any) -> DriverInputs:
@@ -503,10 +667,16 @@ class BeamNGPyActuator:
     """Tech drive: vehicle.control only while engaged.
 
     Disengaged ticks must not slam brake=1 (that is takeover). On the falling
-    edge we send zeros once (including parkingbrake) so the last throttle does
-    not stick, then hands off. Engaged gate holds (preview_blocked, AEB, veto)
-    still apply the stop command, remapped off reverse: realistic_automatic,
-    hold gear=0 + brake ±parkingbrake, drive gear>=1, never gear=-1.
+    edge we zero throttle/brake/parkingbrake, set AI mode to disabled, restore
+    arcade shift, and rewrite gvd_cmd.json to brake=0 / engaged=false so a
+    stale brake:1 file cannot keep the pedals. Release does not arm
+    realistic_automatic when the shifter was never set. A failed arcade
+    restore leaves the latch set so the next disengaged tick retries. After
+    arcade succeeds, later Soft Esc ticks refresh the cmd file at most once
+    per SOFT_ESC_FILE_PERIOD_S. Engaged gate holds
+    (preview_blocked, AEB, veto) still apply the stop command, remapped off
+    reverse: realistic_automatic, hold gear=0 + brake ±parkingbrake, drive
+    gear>=1, never gear=-1.
     """
 
     name = "beamngpy"
@@ -516,9 +686,84 @@ class BeamNGPyActuator:
         self._shift_set = False
         self.engaged = False
         self._latched = False
+        self._release_cmd_mono: float | None = None
+        self.release_cmd_skips = 0
 
     def note_engaged(self, engaged: bool) -> None:
         self.engaged = bool(engaged)
+        # Grab loop: poll_vehicle, then note_engaged. The latch covers later
+        # grabs (and force_engage, which does not write gvd_engage.json).
+        # The rising-edge poll reads read_engage_flag itself.
+        note_soft_esc_engaged(self.engaged)
+
+    def _write_release_cmd(
+        self, seq: int, reason: str, *, force: bool = False, now: float | None = None
+    ) -> bool:
+        """gvd_cmd must not keep brake=1 after Disengage. Lua applies only engaged:true.
+
+        Steady Soft Esc refreshes at most once per SOFT_ESC_FILE_PERIOD_S.
+        The falling-edge latch, the first rewrite, and shutdown pass
+        ``force`` and write this tick. A skipped tick increments
+        ``release_cmd_skips`` and leaves the last release file in place.
+        ``now`` is monotonic seconds for tests; the supervisor omits it.
+        """
+        t = time.monotonic() if now is None else float(now)
+        last = self._release_cmd_mono
+        if not force and last is not None and (t - last) < SOFT_ESC_FILE_PERIOD_S:
+            self.release_cmd_skips += 1
+            return False
+        payload = {
+            "steer": 0.0,
+            "throttle": 0.0,
+            "brake": 0.0,
+            "seq": int(seq),
+            "engaged": False,
+            "heartbeat_mtime": time.time(),
+            "reason": str(reason),
+        }
+        ok = bool(atomic_write_json(cmd_path(), payload, indent=None))
+        if ok:
+            self._release_cmd_mono = t
+        return ok
+
+    def _release_ai(self) -> None:
+        """Drop BeamNG AI so keyboard arrows and pedals own the car again."""
+        veh = self.vehicle
+        if veh is None:
+            return
+        fn = getattr(veh, "ai_set_mode", None)
+        if not callable(fn):
+            ai = getattr(veh, "ai", None)
+            fn = getattr(ai, "set_mode", None) if ai is not None else None
+        if callable(fn):
+            try:
+                fn("disabled")
+                return
+            except Exception:
+                pass
+        q = getattr(veh, "queue_lua_command", None)
+        if callable(q):
+            try:
+                q("if ai and ai.setMode then ai.setMode('disabled') end")
+            except Exception:
+                pass
+
+    def _restore_player_shift(self) -> bool:
+        """Arcade is what player arrows drive. True only after that restore lands.
+
+        A throw leaves ``_shift_set`` unchanged and returns False so ``stop``
+        keeps ``_latched`` and the next disengaged tick retries.
+        """
+        veh = self.vehicle
+        if veh is None or not hasattr(veh, "set_shift_mode"):
+            self._shift_set = False
+            return True
+        try:
+            veh.set_shift_mode(TECH_PLAYER_SHIFT_MODE)
+        except Exception:
+            return False
+        self._shift_set = False
+        return True
 
     def _invoke_control(self, kwargs: dict[str, Any]) -> None:
         """Send control kwargs. Never fall back to arcade brake-hold (no gear, brake=1)."""
@@ -545,7 +790,13 @@ class BeamNGPyActuator:
         if self.vehicle is None:
             return "no_vehicle"
         try:
-            if not self._shift_set and hasattr(self.vehicle, "set_shift_mode"):
+            # Engage arms realistic_automatic once. A release with the shifter
+            # still unset must only clear pedals, not arm that mode on the way out.
+            if (
+                not release
+                and not self._shift_set
+                and hasattr(self.vehicle, "set_shift_mode")
+            ):
                 try:
                     self.vehicle.set_shift_mode(TECH_SHIFT_MODE)
                     self._shift_set = True
@@ -581,15 +832,30 @@ class BeamNGPyActuator:
         self._latched = True
         return cmd
 
-    def stop(self, seq: int = 0, reason: str = "stop") -> DriveCommand:
-        cmd = stop_command(seq=seq, reason=reason)
+    def stop(
+        self, seq: int = 0, reason: str = "stop", *, now: float | None = None
+    ) -> DriveCommand:
         if not self.engaged:
+            # Handoff, not a brake hold. ego.brake must not stay at 1, and the
+            # cmd bus must not keep a stale brake:1 while engaged is false.
+            cmd = release_command(seq=seq, reason=reason)
+            # Latched handoff, the first rewrite, and shutdown must hit the
+            # file this tick. Later Soft Esc ticks coalesce to pollEvery.
+            force = (
+                bool(self._latched)
+                or self._release_cmd_mono is None
+                or str(reason) == "shutdown"
+            )
+            self._write_release_cmd(seq, reason, force=force, now=now)
             if self._latched:
-                self._control(0.0, 0.0, 0.0, release=True)
-                self._latched = False
+                err = self._control(0.0, 0.0, 0.0, release=True)
+                if err is None or err == "no_vehicle":
+                    self._release_ai()
+                    if self._restore_player_shift():
+                        self._latched = False
             cmd.applied = False
             return cmd
-        return self.apply(cmd)
+        return self.apply(stop_command(seq=seq, reason=reason))
 
 
 class CmdJsonActuator:
@@ -612,6 +878,8 @@ class CmdJsonActuator:
 
     def note_engaged(self, engaged: bool) -> None:
         self.engaged = bool(engaged)
+        # Same latch as BeamNGPyActuator. poll_vehicle already ran this grab.
+        note_soft_esc_engaged(self.engaged)
 
     def note_ack(self, fb: EgoFeedback | None) -> None:
         self.ack = fb

@@ -31,8 +31,16 @@ Lua: `gvd_main.drawPath` on `onPreRender` / `onDebugDraw`. Runs whenever the sup
 | `loop_hz` | float | honest supervisor loop EMA (never clamped to a fake ≥10) |
 | `camera_hz` | float | unique GPU-frame EMA — new frames only, not cache re-shows / `main is not None` |
 | `grab_ms` | float | camera grab wall-ms this tick |
+| `grab_phase` | int | Hitch-wheel slot (`grab_i % wheel`, locked wheel 16). `-1` on retail window / stub (no wheel). |
+| `grab_poll_free` | bool | This grab did not issue a companion PollCamera. Locked schedule: poll-free on slots 4 and 8–15 (main `stream_raw` only). Hitch slots 0, 1, 2, 3, 5, 6, 7 each add one companion poll. |
+| `sensors_poll_ms` | float | Wall-ms of this tick's first `vehicle.sensors.poll`. 0 when no vehicle poll ran. |
+| `poll_gps_ms` | float | Wall-ms of `GPS.poll` (PollGPSGE) when this tick sent it. 0 when GPS is absent or the sample was coalesced. |
+| `poll_gps_sent` | bool | True only when this tick called `GPS.poll`. |
+| `electrics_ms` | float | Wall-ms of the grab-loop `read_electrics` (snapshot reuse, or a miss-path poll). |
 | `infer_ms` | float | perception tick ms |
 | `viz_ms` | float | OpenCV stage ms |
+
+Soft Esc reads the same tick from `gvd_state.json` and the `[GVD] seg` line. Poll-free `grab_ms` is the main `stream_raw` cost. The gap versus a hitch-phase `grab_ms` is the companion `PollCamera`. `heartbeat_ms - grab_ms - infer_ms` is the rest of the tick before the heartbeat stamp, including the ego-poll tail (`sensors_poll_ms`, `poll_gps_ms`, `electrics_ms`). `camera_hz` stays the unique GPU-frame EMA.
 
 
 ## M2 fields
@@ -95,6 +103,8 @@ Also: `Documents/GVD/gvd_cmd.json` = `{steer,throttle,brake,seq,engaged,heartbea
 Python **writes** the **running product** sandbox (Tech `BeamNG.tech\current\Documents\GVD` vs Drive `BeamNG.drive\current\Documents\GVD` under `%LOCALAPPDATA%\BeamNG\`). `GVD_DOCS_DIR` is Python-only — Steam GELua does not inherit it. GELua **reads** relative `Documents/GVD` via VFS / `FS:readFile`. Never `%USERPROFILE%\Documents\GVD`. Never OneDrive. Never a bare `gvd_*.json` under userfolder `current\`. Never absolute `io.open` on the bus.
 
 Both sides print every second: `python_bus=` (absolute) `lua_bus=` (resolved `Documents/GVD`) `product=drive|tech` `state_mtime` `engage` `seq`. If those folders are not the same, `link=MISMATCH` and actuation is refused. VISION paints only from that shared `gvd_state.json`; missing or the other product tree is a loud mismatch, not a fake corridor.
+
+Tech vision does not start camera Hz until the wait gate passes: research port `:25252` LISTENING, the GVD mod under Tech `current\mods\unpacked\gvd`, a spawned vehicle, and a fresh `lua_bus` (handshake age < 1 s) with `buses_same(python_bus, lua_bus)` so `link=ok`. A missing or stale `gvd_link.json` / `gvd_ego.json` stays `link=MISMATCH`. Live `lua_bus` wins over a `GVD_DOCS_DIR` guess. The human one-starter is install-root `BeamNG.tech.exe -tcom -console -gfx dx11`. BeamNGpy launch uses that same root exe and `-gfx dx11`. A missing `tech.key` or user path does not open or close this gate. Attach bounds Hello with `socket_timeout` even when BeamNGpy has no such argument. A Hello timeout refuses once and is not reported as a missing vehicle. A listening `:25252` keeps `launch` false. The wait-gate line includes the lua folder path. The supervisor reuses that Hello session for cameras. A connect failure after the hold exits the supervisor. Esc or `q` in GVD VISION disconnects that socket only (`quit_on_close=false`); it does not quit BeamNG.tech.
 
 | `python_bus` | string | Absolute folder Python wrote |
 | `lua_bus` | string | Resolved `Documents/GVD` (product sandbox) |

@@ -810,6 +810,9 @@ def check_beamngpy_side_grab_half_rate() -> None:
 
     streams: dict[str, int] = {}
     polls: dict[str, int] = {}
+    # Names in this set return an all-zero colour buffer. Every other read
+    # sets one non-zero pixel so it counts as a picture.
+    blank_colour: set[str] = set()
 
     class FakeCamera:
         def __init__(self, name, _bng, _vehicle, **kwargs):
@@ -830,13 +833,15 @@ def check_beamngpy_side_grab_half_rate() -> None:
         def stream_raw(self):
             streams[self.name] += 1
             img = np.zeros((8, 8, 3), dtype=np.uint8)
-            img[0, 0, 0] = streams[self.name] % 256
+            if self.name not in blank_colour:
+                img[0, 0, 0] = (streams[self.name] % 255) + 1
             return {"colour": img}
 
         def poll(self):
             polls[self.name] += 1
             img = np.zeros((8, 8, 3), dtype=np.uint8)
-            img[0, 0, 1] = polls[self.name] % 256
+            if self.name not in blank_colour:
+                img[0, 0, 1] = (polls[self.name] % 255) + 1
             return {"colour": img}
 
         def stream(self):
@@ -1268,6 +1273,69 @@ def check_beamngpy_side_grab_half_rate() -> None:
                 continue
             assert polls[f"gvd_{cid}"] == before_p[cid], cid
             assert forced_cold.health[cid] == CamHealth.MISSING, cid
+
+        # Cold all-zero stream_raw and poll. Zeros stay missing. After one real
+        # frame, the next zero read keeps that picture and does not go black.
+        blank_colour.update(f"gvd_{cid}" for cid in CAM_IDS)
+        _drop_companion_caches()
+        be._cache_frames.pop("main", None)
+        be._cache_ts.pop("main", None)
+        be._frame_sig.pop("main", None)
+        for _step in range(8):
+            gi = be._grab_i
+            due = [cid for cid in CAM_IDS if cid != "main" and camera_grab_due(cid, gi, be._hitch)]
+            main_n = streams["gvd_main"]
+            before_p = {cid: polls[f"gvd_{cid}"] for cid in CAM_IDS}
+            coldz = be.grab()
+            assert streams["gvd_main"] == main_n + 1
+            assert polls["gvd_main"] == 0
+            assert "soft_esc_colour=hitch" in coldz.note
+            assert "cam_main" not in coldz.frames
+            for cid in CAM_IDS:
+                assert coldz.health[cid] == CamHealth.MISSING, (cid, coldz.health[cid])
+                assert cid not in coldz.frames
+            if due:
+                assert polls[f"gvd_{due[0]}"] == before_p[due[0]] + 1
+        blank_colour.clear()
+        gi = be._grab_i
+        due = [cid for cid in CAM_IDS if cid != "main" and camera_grab_due(cid, gi, be._hitch)]
+        live = be.grab()
+        assert live.health["main"] == CamHealth.OK
+        assert int(live.frames["main"].max()) > 0
+        kept = {"main"}
+        main_pic = live.frames["main"].copy()
+        kept_pic = {"main": main_pic}
+        if due:
+            assert live.health[due[0]] == CamHealth.OK
+            assert int(live.frames[due[0]].max()) > 0
+            kept.add(due[0])
+            kept_pic[due[0]] = live.frames[due[0]].copy()
+        for cid in CAM_IDS:
+            if cid not in kept:
+                assert live.health[cid] == CamHealth.MISSING, cid
+                assert cid not in live.frames
+        blank_colour.update(f"gvd_{cid}" for cid in CAM_IDS)
+        gi = be._grab_i
+        due_zero = [cid for cid in CAM_IDS if cid != "main" and camera_grab_due(cid, gi, be._hitch)]
+        main_n = streams["gvd_main"]
+        before_p = {cid: polls[f"gvd_{cid}"] for cid in CAM_IDS}
+        heldz = be.grab()
+        assert streams["gvd_main"] == main_n + 1
+        assert "soft_esc_colour=hitch" in heldz.note
+        for cid, pic in kept_pic.items():
+            assert heldz.health[cid] == CamHealth.OK, cid
+            assert cid in heldz.frames
+            assert np.array_equal(heldz.frames[cid], pic)
+        for cid in CAM_IDS:
+            if cid in kept:
+                continue
+            assert heldz.health[cid] == CamHealth.MISSING, cid
+            assert cid not in heldz.frames
+        if due_zero:
+            assert polls[f"gvd_{due_zero[0]}"] == before_p[due_zero[0]] + 1
+        blank_colour.clear()
+        for _step in range(16):
+            be.grab()
 
         # A failed read with no picture stays missing and is retried on the next
         # wide slot. It is not frozen, and it is not reported OK.

@@ -18,7 +18,7 @@ sys.path.insert(0, str(ROOT))
 
 from python.control.e2e import E2EIntent
 from python.perception import lanes as lanes_mod
-from python.perception.lanes import estimate_lanes, hough_segments
+from python.perception.lanes import estimate_lanes, hough_segments, lane_paint_mask
 from python.runtime.shadow import ShadowConfig
 
 
@@ -112,6 +112,42 @@ def main() -> None:
     r6 = estimate_lanes(clear)
     assert r6.conf >= gate, r6.conf
     assert len(r6.lanes_bev) >= 2, r6.lanes_bev
+    # Dark sky, yellow left and white right, still clears the engage gate.
+    night = _yellow_white_road(
+        sky=(24, 26, 32),
+        asphalt=(48, 50, 54),
+        yellow=(40, 210, 235),
+        white=(236, 236, 238),
+        width=3,
+    )
+    r_night = estimate_lanes(night)
+    assert r_night.conf >= gate, r_night.conf
+    assert len(r_night.lanes_bev) >= 2, r_night.lanes_bev
+    # Unmarked hazy road: stripes removed. Sky (HSV 15,26,195) is not white
+    # paint, and the road/sky wedge must stay under lane_conf_min.
+    bare = _yellow_white_road(
+        asphalt=(168, 170, 172),
+        yellow=(140, 190, 205),
+        white=(198, 198, 200),
+        width=2,
+        stripes=False,
+    )
+    assert int(lane_paint_mask(bare)[8, 8]) == 0
+    r_bare = estimate_lanes(bare)
+    assert r_bare.conf < 0.25, r_bare.conf
+    assert r_bare.conf < gate
+    assert r_bare.lanes_bev == []
+    # Same wedge at higher contrast. Edges that are not paint stay under the gate.
+    sharp = _yellow_white_road(
+        asphalt=(40, 42, 48),
+        yellow=(40, 210, 235),
+        white=(245, 245, 245),
+        width=2,
+        stripes=False,
+    )
+    r_sharp = estimate_lanes(sharp)
+    assert r_sharp.conf < 0.25, r_sharp.conf
+    assert r_sharp.lanes_bev == []
 
     # A Hough layout IndexError must not collapse to a silent lane_conf 0.
     # Other frame failures stay a zero fit, but the handler has to say why.
@@ -169,11 +205,13 @@ def _yellow_white_road(
     white: tuple[int, int, int],
     width: int,
     vp_y: float = 0.46,
+    sky: tuple[int, int, int] = (175, 185, 195),
+    stripes: bool = True,
 ) -> np.ndarray:
-    """640×480 hood view: solid yellow left, solid white right, low contrast ok."""
+    """640×480 hood view. Default sky is the hazy BGR that must not read as white paint."""
     cv2 = __import__("cv2")
     w, h = 640, 480
-    img = np.full((h, w, 3), (175, 185, 195), dtype=np.uint8)
+    img = np.full((h, w, 3), sky, dtype=np.uint8)
     vp = (int(w * 0.5), int(h * vp_y))
     cv2.fillPoly(
         img,
@@ -186,8 +224,9 @@ def _yellow_white_road(
         b = (int(w * 0.5 + (xb / w - 0.5) * 18), int(h * vp_y) + 4)
         cv2.line(img, a, b, color, width)
 
-    _draw(w * 0.28, yellow)
-    _draw(w * 0.72, white)
+    if stripes:
+        _draw(w * 0.28, yellow)
+        _draw(w * 0.72, white)
     cv2.rectangle(img, (0, int(h * 0.93)), (w, h), (35, 35, 38), -1)
     return img
 

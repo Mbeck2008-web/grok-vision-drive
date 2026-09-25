@@ -93,10 +93,12 @@ def lane_paint_mask(bgr: np.ndarray) -> np.ndarray:
     """White and yellow road paint. Grayscale Canny misses a hazy yellow stripe.
 
     OpenCV HSV: H 0–180. Yellow sits near 15–35. White is low saturation and
-    high value, so a bright gray line still counts. A flat gray frame does not.
+    high value, so a bright gray line still counts. Saturation stops at 18:
+    hazy sky (BGR 175,185,195 → HSV 15,26,195) is not a white stripe. A flat
+    gray frame (V below 185) does not count either.
     """
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    white = cv2.inRange(hsv, (0, 0, 185), (180, 55, 255))
+    white = cv2.inRange(hsv, (0, 0, 185), (180, 18, 255))
     yellow = cv2.inRange(hsv, (8, 40, 80), (42, 255, 255))
     return cv2.bitwise_or(white, yellow)
 
@@ -129,7 +131,10 @@ def _estimate_lanes_impl(bgr: np.ndarray) -> LaneResult:
     paint = lane_paint_mask(bgr)
     # Boundary of a solid stripe. A low-gradient yellow line has almost no Canny edge.
     grad = cv2.morphologyEx(paint, cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8))
-    crop = cv2.bitwise_and(cv2.bitwise_or(edges, grad), lane_roi_mask(h, w))
+    # Canny only on the paint. A sky/road wedge is not a stripe, so that
+    # silhouette cannot score a left lane and a right lane.
+    near = cv2.dilate(paint, np.ones((3, 3), np.uint8))
+    crop = cv2.bitwise_and(cv2.bitwise_or(cv2.bitwise_and(edges, near), grad), lane_roi_mask(h, w))
     lines = cv2.HoughLinesP(crop, 1, np.pi / 180, threshold=40, minLineLength=40, maxLineGap=80)
     left, right = [], []
     for x1, y1, x2, y2 in hough_segments(lines):

@@ -13,6 +13,15 @@ veto:
   lane_conf_min: 0.25
   path_conf_min: 0.15
   steer_disagree_max: 0.55
+  # Minimum acceptable loop and unique-camera Hz while engaged.
+  # Separate from the 8 Hz CAMS blit drop and the 10 Hz narrow-far hitch.
+  # A measured rate under this floor disengages after engage_hz_grace_s.
+  # 0 is unmeasured and does not reject. Soft Esc idle is about 7–9 Hz.
+  min_accept_hz: 6
+  # Just after Engage arm, a transient dip down to ~5 Hz does not by itself
+  # disengage. The rate is an EMA, so the window outlasts the hitch.
+  engage_hz_grace_s: 3.0
+  engage_hz_grace_floor: 5
 shadow:
   # Always compute both intents; actuators only when engaged + modular OK.
   write_fields: true

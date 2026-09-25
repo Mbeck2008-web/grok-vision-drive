@@ -701,11 +701,15 @@ def main() -> None:
     print("test_m3_actuate: OK")
 
 
-if __name__ == "__main__":
+def test_m3_actuate() -> None:
     import python.control.actuate as _act
 
-    _prev_soft_esc = _act.soft_esc_sensors_every_tick()
+    prev = _act.soft_esc_sensors_every_tick()
     try:
         main()
     finally:
-        _act.note_soft_esc_engaged(_prev_soft_esc)
+        _act.note_soft_esc_engaged(prev)
+
+
+if __name__ == "__main__":
+    test_m3_actuate()

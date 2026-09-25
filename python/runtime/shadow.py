@@ -4,6 +4,8 @@ Default policy_modular = safety supervisor (may veto E2E).
 Disengaged → no actuate; shadow fields still written.
 Modular veto → hold/disengage; optional clip trigger via recorder.
 Dead-man / heartbeat gates unchanged (caller passes heartbeat_ok).
+Engage rate gate: a measured loop/camera Hz under min_accept_hz disengages
+after the arm grace. During the grace the floor is about 5 Hz.
 """
 
 from __future__ import annotations
@@ -14,12 +16,26 @@ from typing import Any
 from python.control.actuate import DriveCommand, plan_command, stop_command
 from python.control.e2e import E2EIntent, E2EPolicy
 
+# Engage liveness floor. CAMS blit drop remains 8 Hz. Narrow-far hitch remains 10 Hz.
+# Soft Esc idle sits about 7–9 Hz. A measured loop or unique-camera rate under
+# this floor disengages once the arm grace has ended. 0 means the EMA has not
+# started yet.
+MIN_ACCEPT_HZ = 6.0
+# Arm window. The loop/camera rate is an EMA (alpha 0.2), so the grace has to
+# outlast the engage hitch itself or the smoothed rate is still under the floor
+# after the frames have recovered. During the window the floor drops to ~5 Hz.
+ENGAGE_HZ_GRACE_S = 3.0
+ENGAGE_HZ_GRACE_FLOOR = 5.0
+
 
 @dataclass
 class ShadowConfig:
     lane_conf_min: float = 0.25
     steer_disagree_max: float = 0.55
     path_conf_min: float = 0.15
+    min_accept_hz: float = MIN_ACCEPT_HZ
+    engage_hz_grace_s: float = ENGAGE_HZ_GRACE_S
+    engage_hz_grace_floor: float = ENGAGE_HZ_GRACE_FLOOR
 
 
 @dataclass
@@ -43,7 +59,44 @@ def load_shadow_config(cfg: dict[str, Any] | None = None) -> ShadowConfig:
         lane_conf_min=float(veto.get("lane_conf_min", 0.25)),
         steer_disagree_max=float(veto.get("steer_disagree_max", 0.55)),
         path_conf_min=float(veto.get("path_conf_min", 0.15)),
+        min_accept_hz=float(veto.get("min_accept_hz", MIN_ACCEPT_HZ)),
+        engage_hz_grace_s=float(veto.get("engage_hz_grace_s", ENGAGE_HZ_GRACE_S)),
+        engage_hz_grace_floor=float(veto.get("engage_hz_grace_floor", ENGAGE_HZ_GRACE_FLOOR)),
     )
+
+
+def engage_hz_reason(
+    loop_hz: float | None,
+    camera_hz: float | None,
+    engage_age_s: float | None,
+    cfg: ShadowConfig | None = None,
+) -> str:
+    """``low_loop_hz`` or ``none``.
+
+    Measured rates only (``> 0``). During the engage-arm grace a transient dip
+    down to ``engage_hz_grace_floor`` (~5 Hz) does not reject. After the grace
+    the floor is ``min_accept_hz`` (6). An unmeasured 0 does not reject.
+    """
+    cfg = cfg or ShadowConfig()
+    floor = float(cfg.min_accept_hz)
+    age = None if engage_age_s is None else float(engage_age_s)
+    if age is not None and age >= 0.0 and age < float(cfg.engage_hz_grace_s):
+        floor = float(cfg.engage_hz_grace_floor)
+    rates: list[float] = []
+    for raw in (loop_hz, camera_hz):
+        if raw is None:
+            continue
+        try:
+            rate = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if rate > 0.0:
+            rates.append(rate)
+    if not rates:
+        return "none"
+    if min(rates) < floor:
+        return "low_loop_hz"
+    return "none"
 
 
 def modular_intent(
@@ -126,6 +179,9 @@ def shadow_tick(
     wide_bgr: Any = None,
     steer_deg: float = 0.0,
     cfg: ShadowConfig | None = None,
+    loop_hz: float | None = None,
+    camera_hz: float | None = None,
+    engage_age_s: float | None = None,
 ) -> ShadowTick:
     """Compute modular + e2e every tick; choose apply command per policy + gates."""
     cfg = cfg or ShadowConfig()
@@ -196,6 +252,23 @@ def shadow_tick(
             shadow=shadow,
             e2e_ok=False,
             veto_reason="heartbeat_stale",
+            should_disengage=True,
+            clip_trigger="disengage",
+            policy=policy,
+        )
+
+    # Engage-only. A disengaged tick keeps the perception veto (often low_lane_conf)
+    # instead of rewriting it as a rate fault. 0 Hz is unmeasured, not a reject.
+    hz_reason = engage_hz_reason(loop_hz, camera_hz, engage_age_s, cfg)
+    if hz_reason != "none":
+        applied = stop_command(seq=seq, reason=f"veto:{hz_reason}")
+        return ShadowTick(
+            modular=modular,
+            e2e=e2e,
+            applied=applied,
+            shadow=shadow,
+            e2e_ok=False,
+            veto_reason=hz_reason,
             should_disengage=True,
             clip_trigger="disengage",
             policy=policy,

@@ -106,7 +106,6 @@ def check_soft_esc_heartbeat_coalesce() -> None:
     window. A latched Disengage and shutdown still rewrite gvd_cmd.json.
     """
     import json
-    import time
 
     from python.control.actuate import SOFT_ESC_FILE_PERIOD_S, cmd_path
 
@@ -166,29 +165,31 @@ def check_soft_esc_heartbeat_coalesce() -> None:
     veh = Veh()
     tech = BeamNGPyActuator(veh)
     tech.note_engaged(False)
-    first = tech.stop(seq=1, reason="not_engaged")
+    # Injected clock, same pattern as the Soft Esc state-write gate. A stall
+    # between stops must not cross SOFT_ESC_FILE_PERIOD_S on the wall clock.
+    t0 = 10.0
+    first = tech.stop(seq=1, reason="not_engaged", now=t0)
     assert first.brake == 0.0 and first.throttle == 0.0 and veh.calls == []
     payload = json.loads(cmd_path().read_text(encoding="utf-8"))
     assert payload["seq"] == 1 and payload["engaged"] is False and payload["brake"] == 0.0
-    held = tech.stop(seq=2, reason="not_engaged")
+    held = tech.stop(seq=2, reason="not_engaged", now=t0 + (period - 0.001))
     assert held.brake == 0.0 and held.throttle == 0.0
     assert tech.release_cmd_skips == 1
     quiet = json.loads(cmd_path().read_text(encoding="utf-8"))
     assert quiet["seq"] == 1 and quiet["brake"] == 0.0 and quiet["engaged"] is False
-    tech._release_cmd_mono = time.monotonic() - (period + 0.01)
-    tech.stop(seq=3, reason="not_engaged")
+    tech.stop(seq=3, reason="not_engaged", now=t0 + period + 0.01)
     renewed = json.loads(cmd_path().read_text(encoding="utf-8"))
     assert renewed["seq"] == 3 and renewed["brake"] == 0.0 and renewed["engaged"] is False
     assert tech.release_cmd_skips == 1
     tech.note_engaged(True)
     tech._latched = True
     tech.note_engaged(False)
-    tech.stop(seq=4, reason="not_engaged")
+    tech.stop(seq=4, reason="not_engaged", now=t0 + period + 0.02)
     edge = json.loads(cmd_path().read_text(encoding="utf-8"))
     assert edge["seq"] == 4 and edge["brake"] == 0.0 and edge["engaged"] is False
     assert tech.release_cmd_skips == 1
     assert veh.calls[-1]["brake"] == 0.0 and veh.calls[-1]["throttle"] == 0.0
-    tech.stop(seq=5, reason="shutdown")
+    tech.stop(seq=5, reason="shutdown", now=t0 + period + 0.03)
     shut = json.loads(cmd_path().read_text(encoding="utf-8"))
     assert shut["seq"] == 5 and shut["reason"] == "shutdown"
     assert shut["brake"] == 0.0 and shut["engaged"] is False
@@ -591,7 +592,8 @@ def main() -> None:
 
     tech.note_engaged(False)
     n = len(veh.calls)
-    edge = tech.stop(seq=4, reason="not_engaged")
+    # Injected clock so a stall between these stops cannot expire the window.
+    edge = tech.stop(seq=4, reason="not_engaged", now=40.0)
     assert edge.applied is False and edge.throttle == 0.0 and edge.brake == 0.0
     assert veh.calls[-1] == {"steering": 0.0, "throttle": 0.0, "brake": 0.0, "parkingbrake": 0.0}
     assert veh.calls[-1].get("gear", 0) != -1
@@ -599,7 +601,7 @@ def main() -> None:
     assert veh.shifts[-1] == TECH_PLAYER_SHIFT_MODE == "arcade"
     edge_payload = json.loads(cmd_path().read_text(encoding="utf-8"))
     assert edge_payload["engaged"] is False and edge_payload["brake"] == 0.0 and edge_payload["throttle"] == 0.0
-    tech.stop(seq=5, reason="not_engaged")
+    tech.stop(seq=5, reason="not_engaged", now=40.05)
     assert len(veh.calls) == n + 1, veh.calls  # no further takeover while OFF
     assert len(veh.ai_modes) == 1
     quiet = json.loads(cmd_path().read_text(encoding="utf-8"))

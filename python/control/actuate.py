@@ -436,9 +436,11 @@ def soft_esc_sensors_every_tick() -> bool:
     return bool(_soft_esc_engaged)
 
 
-# Lua gvd_main.pollEvery. Soft Esc rewrites gvd_state.json and the Tech
-# release cmd at most once per this window, so the beat stays younger than
-# HEARTBEAT_STALE_S. Engage does not use this cap.
+# Max rewrite rate for Soft Esc gvd_state.json and the Tech release cmd.
+# Matches Lua gvd_main.pollEvery (0.10): at most one rewrite per window.
+# Heartbeat age can still pass HEARTBEAT_STALE_S. When the Soft Esc loop
+# is already slower than this period, write age tracks the loop. Engage
+# does not use this cap.
 SOFT_ESC_FILE_PERIOD_S = 0.10
 
 _soft_esc_state_mono: float | None = None
@@ -694,17 +696,20 @@ class BeamNGPyActuator:
         # The rising-edge poll reads read_engage_flag itself.
         note_soft_esc_engaged(self.engaged)
 
-    def _write_release_cmd(self, seq: int, reason: str, *, force: bool = False) -> bool:
+    def _write_release_cmd(
+        self, seq: int, reason: str, *, force: bool = False, now: float | None = None
+    ) -> bool:
         """gvd_cmd must not keep brake=1 after Disengage. Lua applies only engaged:true.
 
         Steady Soft Esc refreshes at most once per SOFT_ESC_FILE_PERIOD_S.
         The falling-edge latch, the first rewrite, and shutdown pass
         ``force`` and write this tick. A skipped tick increments
         ``release_cmd_skips`` and leaves the last release file in place.
+        ``now`` is monotonic seconds for tests; the supervisor omits it.
         """
-        now = time.monotonic()
+        t = time.monotonic() if now is None else float(now)
         last = self._release_cmd_mono
-        if not force and last is not None and (now - last) < SOFT_ESC_FILE_PERIOD_S:
+        if not force and last is not None and (t - last) < SOFT_ESC_FILE_PERIOD_S:
             self.release_cmd_skips += 1
             return False
         payload = {
@@ -718,7 +723,7 @@ class BeamNGPyActuator:
         }
         ok = bool(atomic_write_json(cmd_path(), payload, indent=None))
         if ok:
-            self._release_cmd_mono = now
+            self._release_cmd_mono = t
         return ok
 
     def _release_ai(self) -> None:
@@ -827,7 +832,9 @@ class BeamNGPyActuator:
         self._latched = True
         return cmd
 
-    def stop(self, seq: int = 0, reason: str = "stop") -> DriveCommand:
+    def stop(
+        self, seq: int = 0, reason: str = "stop", *, now: float | None = None
+    ) -> DriveCommand:
         if not self.engaged:
             # Handoff, not a brake hold. ego.brake must not stay at 1, and the
             # cmd bus must not keep a stale brake:1 while engaged is false.
@@ -839,7 +846,7 @@ class BeamNGPyActuator:
                 or self._release_cmd_mono is None
                 or str(reason) == "shutdown"
             )
-            self._write_release_cmd(seq, reason, force=force)
+            self._write_release_cmd(seq, reason, force=force, now=now)
             if self._latched:
                 err = self._control(0.0, 0.0, 0.0, release=True)
                 if err is None or err == "no_vehicle":

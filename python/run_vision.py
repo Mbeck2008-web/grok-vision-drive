@@ -816,7 +816,9 @@ def main() -> None:
             st["poll_gps_sent"] = poll_gps_sent
             st["electrics_ms"] = electrics_ms
             st["heartbeat_ms"] = (time.perf_counter() - loop_t0) * 1000.0
-            # Soft Esc: one gvd_state.json rewrite per Lua pollEvery (100 ms).
+            # Soft Esc: gvd_state.json at most once per Lua pollEvery (0.10).
+            # Max rewrite rate. A loop already slower than 100 ms writes at
+            # the loop rate, so heartbeat age tracks the loop.
             # Engage writes every tick. The rising edge flushes this tick.
             rising_engage = bool(engaged) and not prev_engaged
             state_due = soft_esc_state_write_due(bool(engaged), rising=rising_engage)

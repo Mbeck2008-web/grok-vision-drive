@@ -188,6 +188,24 @@ def ema_alpha(dt: float, tau_s: float) -> float:
     return 1.0 - math.exp(-dt / tau_s)
 
 
+def own_steer_residual(echo: float, ref_steer: float, rest: float, rest_cmd: float) -> float:
+    """How far `echo` sits outside the resting wheel and that wheel plus the command step.
+
+    Soft Esc's own steer either leaves the wheel where it was armed or carries it
+    with the command (same offset). Both are residual 0. Motion past that span is
+    the player. A frozen ``echo − cmd`` baseline reads a command step on a still
+    wheel as a pull.
+    """
+    delta = float(ref_steer) - float(rest_cmd)
+    lo = float(rest) if delta >= 0.0 else float(rest) + delta
+    hi = float(rest) + delta if delta >= 0.0 else float(rest)
+    if echo < lo:
+        return echo - lo
+    if echo > hi:
+        return echo - hi
+    return 0.0
+
+
 def opposition(ref_steer: float, residual: float) -> float:
     """0..1: how much `residual` fights a steer command of `ref_steer`.
 
@@ -210,9 +228,11 @@ class OverrideDetector:
     Disengage is sticky at the caller (gvd_engage.json stays false until Alt+A) — here
     `update(engaged=False)` just clears the state so re-engaging starts clean.
 
-    `own_axes=True` is Soft Esc / BeamNGpy. The echo can contain the command we just sent
-    (not source=gvd), so the reference stays the command and the first armed sample is a
-    baseline. Retail `player_device` stays an absolute axis.
+    `own_axes=True` is Soft Esc / BeamNGpy. Pedals stay a residual against the command,
+    then the first armed sample. Steer stores the resting wheel angle. A later command
+    may move: an echo that stays on that angle, or that tracks the command with the
+    same offset, is not `player_steer`. A pull past either end still is. Retail
+    `player_device` stays an absolute axis. The Lua override does not share this baseline.
     """
 
     def __init__(self, cfg: OverrideConfig | None = None) -> None:
@@ -228,6 +248,7 @@ class OverrideDetector:
         self._last_t: float | None = None
         self._armed_at: float | None = None
         self._base_steer: float | None = None
+        self._base_steer_cmd: float | None = None
         self._base_thr: float | None = None
         self._base_brk: float | None = None
 
@@ -254,6 +275,7 @@ class OverrideDetector:
         self._steer_sign = 0
         self._armed_at = None
         self._base_steer = None
+        self._base_steer_cmd = None
         self._base_thr = None
         self._base_brk = None
         self.verdict = OverrideVerdict()
@@ -307,10 +329,11 @@ class OverrideDetector:
         ref = self.reference(applied_seq)
         # Retail Direct Drive lock: electrics are GVD's command (source=gvd), so lastInputs
         # are the physical wheel/pedals as an absolute axis (centered wheel is 0).
-        # Soft Esc beamngpy is not source=gvd. `own_axes` keeps the command as the reference
-        # so a commanded throttle echoing back is residual 0, then subtracts the resting
-        # device offset sampled on this first armed tick (baseline-at-engage). A quiet wheel
-        # at -0.26 does not become player_steer; a further pull or a real pedal still does.
+        # Soft Esc beamngpy is not source=gvd. `own_axes` keeps the command as the pedal
+        # reference so a commanded throttle echoing back is residual 0, then subtracts the
+        # first armed pedal sample. Steer stores the resting wheel angle and follows it
+        # when the command changes: a wheel that stays put, or that tracks cmd + offset,
+        # is residual 0. A pull past that span is still player_steer.
         use_absolute = bool(player_device) and not own_axes
         ref_steer = 0.0 if use_absolute else ref.steer
         ref_thr = 0.0 if use_absolute else ref.throttle
@@ -321,14 +344,24 @@ class OverrideDetector:
         # throttle and wins a tie, because that is the reason a player most needs to be told.
         thr_r = max(0.0, _clamp(throttle_input, 0.0, 1.0) - ref_thr) if throttle_input is not None else 0.0
         brk_r = max(0.0, _clamp(brake_input, 0.0, 1.0) - ref_brk) if brake_input is not None else 0.0
-        raw = _clamp(steering_input, -1.0, 1.0) - ref_steer if steering_input is not None else 0.0
-        if own_axes:
-            # First armed sample is the resting device (wheel offset, pedal bias), not a grab.
+        if steering_input is None:
+            raw = 0.0
+        elif own_axes:
+            echo_s = _clamp(steering_input, -1.0, 1.0)
             if self._base_steer is None:
-                self._base_steer = raw
+                self._base_steer = echo_s
+                self._base_steer_cmd = ref_steer
+                raw = 0.0
+            else:
+                raw = own_steer_residual(
+                    echo_s, ref_steer, float(self._base_steer), float(self._base_steer_cmd or 0.0)
+                )
+        else:
+            raw = _clamp(steering_input, -1.0, 1.0) - ref_steer
+        if own_axes:
+            if self._base_thr is None:
                 self._base_thr = thr_r
                 self._base_brk = brk_r
-            raw = raw - float(self._base_steer)
             thr_r = max(0.0, thr_r - float(self._base_thr or 0.0))
             brk_r = max(0.0, brk_r - float(self._base_brk or 0.0))
         pedal_channel = "none"

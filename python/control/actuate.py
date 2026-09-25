@@ -45,8 +45,9 @@ TECH_DRIVE_GEAR = 1
 # Let neutralSelectionDelay (~0.5 s) finish before asking the lever to move again.
 TECH_DRIVE_ARM_S = 0.55
 # Vehicle VM. Idempotent: shiftUp only from N/0, otherwise jump to the 'D' letter in
-# automaticModes (1-based string.find). Never shiftDown, never gear -1. Parking brake
-# and clutch are zeroed on source gvd so they are not a player lastInputs axis.
+# automaticModes (1-based string.find). D/S/M/L, numeric >=1, and M1/M2 already count
+# as forward (same as gear_is_forward), so a stale Python echo cannot move that lever.
+# Never shiftDown, never gear -1. Parking brake and clutch are zeroed on source gvd.
 TECH_DRIVE_SHIFT_LUA = (
     "pcall(function() "
     "local c=controller and controller.mainController; "
@@ -60,8 +61,11 @@ TECH_DRIVE_SHIFT_LUA = (
     "if ok and p~=nil then pos=tostring(p) end end; "
     "if pos=='' and electrics and electrics.values and electrics.values.gear~=nil then "
     "pos=tostring(electrics.values.gear) end; "
+    "pos=string.upper(pos); "
     "local n=tonumber(pos); "
-    "if pos=='D' or pos=='S' or pos=='M' or pos=='L' or (n and n>=1) then return end; "
+    "local manual=pos:match('^M(%d+)$'); "
+    "if pos=='D' or pos=='S' or pos=='M' or pos=='L' or (n and n>=1) "
+    "or (manual and tonumber(manual)>=1) then return end; "
     "if (pos=='N' or pos=='0' or n==0) and c and c.shiftUp then "
     "local up=pcall(function() c.shiftUp() end); "
     "if not up then up=pcall(function() c:shiftUp() end) end; "
@@ -290,6 +294,21 @@ def gear_is_forward(gear: Any) -> bool:
     if text.isdigit():
         return int(text) >= TECH_DRIVE_GEAR
     return False
+
+
+def _gear_value(el: Any) -> Any:
+    """Gear field from a dict or a BeamNGpy electrics object (``.data`` / ``.gear``)."""
+    if el is None:
+        return None
+    if isinstance(el, dict):
+        return el.get("gear")
+    data = getattr(el, "data", None)
+    if isinstance(data, dict):
+        return data.get("gear")
+    gear = getattr(el, "gear", None)
+    if gear is not None and not callable(gear):
+        return gear
+    return None
 
 
 def _unexpected_kw(err: BaseException) -> str | None:
@@ -848,18 +867,33 @@ class BeamNGPyActuator:
         return True
 
     def _echo_gear(self) -> Any:
-        """Cached electrics gear, if the last poll left it on the vehicle. No extra poll."""
+        """Cached electrics gear, if the last poll left it on the vehicle. No extra poll.
+
+        BeamNGpy's sensor container is not a dict. ``.items()`` or ``.data`` hold
+        electrics, and electrics itself may be an object whose ``.data`` is the map.
+        A dict-only read never sees ``D`` and re-queues the drive arm on every throttle.
+        """
         sensors = getattr(self.vehicle, "sensors", None)
         if sensors is None:
             return None
         el = None
-        try:
-            el = sensors["electrics"]
-        except Exception:
-            el = None
-        if isinstance(el, dict):
-            return el.get("gear")
-        return None
+        if isinstance(sensors, dict):
+            el = sensors.get("electrics")
+        else:
+            try:
+                el = {str(k): v for k, v in sensors.items()}.get("electrics")
+            except Exception:
+                el = None
+            if el is None:
+                data = getattr(sensors, "data", None)
+                if isinstance(data, dict):
+                    el = data.get("electrics")
+            if el is None:
+                try:
+                    el = sensors["electrics"]
+                except Exception:
+                    el = None
+        return _gear_value(el)
 
     def _arm_shift_mode(self) -> None:
         """Engage arms realistic_automatic. A thrown ack is logged and retried, not swallowed."""

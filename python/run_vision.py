@@ -655,8 +655,8 @@ def main() -> None:
             # are GVD's own command — use the physical lastInputs axes (absolute). Otherwise the
             # residual is still steering_input - aligned cmd.steer so FFB noise cannot disengage.
             # Soft Esc beamngpy is not source=gvd, so lastInputs / electrics can echo the command
-            # we just sent. own_axes keeps that residual (and a baseline taken at engage) instead
-            # of the absolute player_* path that treats thr 0.55 or a resting wheel as a kick.
+            # we just sent. own_axes keeps the pedal residual, and the steer baseline follows
+            # the resting wheel when the command changes, instead of the absolute player_* path.
             owns_axes = getattr(actuator, "name", "") == "beamngpy"
             if owns_axes:
                 ovr_steer, ovr_thr, ovr_brk, ovr_dev = steer_in, throttle_in, brake_in, False

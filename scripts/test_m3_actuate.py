@@ -81,6 +81,64 @@ def check_electrics_segment_timer() -> None:
     assert last_electrics_ms() >= 0.0
 
 
+def _check_lua_manual_forward() -> None:
+    """Lua 5.1: M2/m2 is already forward. A stale Python echo must not shift that lever."""
+    import shutil
+    import subprocess
+    import tempfile
+
+    lua = shutil.which("lua") or shutil.which("lua5.1")
+    assert lua, "lua 5.1 is required to prove the drive-arm chunk"
+    src = f"""
+local src = [=[{TECH_DRIVE_SHIFT_LUA}]=]
+local function run(gear)
+  local up, jump = 0, 0
+  electrics = {{ values = {{ gear = gear }} }}
+  controller = {{ mainController = {{
+    setGearboxMode = function() end,
+    shiftUp = function() up = up + 1 end,
+    shiftToGearIndex = function() jump = jump + 1 end,
+    shiftLogic = {{
+      automaticModes = 'PRND21',
+      getGearPosition = function() return gear end,
+    }},
+  }} }}
+  input = {{ event = function() end }}
+  assert(loadstring(src))()
+  return up, jump
+end
+local function expect(gear, want_up, want_jump)
+  local up, jump = run(gear)
+  if up ~= want_up or jump ~= want_jump then
+    error(gear .. ' up=' .. tostring(up) .. ' jump=' .. tostring(jump))
+  end
+end
+expect('M2', 0, 0)
+expect('m2', 0, 0)
+expect('M1', 0, 0)
+expect('D', 0, 0)
+expect('d', 0, 0)
+expect('1', 0, 0)
+expect('N', 1, 0)
+expect('0', 1, 0)
+expect('P', 0, 1)
+expect('R', 0, 1)
+print('LUA_ARM_OK')
+"""
+    path = ""
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".lua", delete=False) as handle:
+            handle.write(src)
+            path = handle.name
+        proc = subprocess.run([lua, path], capture_output=True, text=True)
+    finally:
+        if path:
+            import os
+            os.unlink(path)
+    assert proc.returncode == 0, (proc.stdout or "") + (proc.stderr or "")
+    assert "LUA_ARM_OK" in proc.stdout
+
+
 def check_drive_gear_arm() -> None:
     """Throttle>0 leaves Neutral: gear>=1, clutch and parking brake cleared.
 
@@ -97,12 +155,16 @@ def check_drive_gear_arm() -> None:
     assert gear_is_forward(0) is False and gear_is_forward("0") is False
     assert gear_is_forward(-1) is False
     assert gear_is_forward("D") and gear_is_forward("S") and gear_is_forward("M2")
+    assert gear_is_forward("M1") and gear_is_forward("m2")
+    assert gear_is_forward("M0") is False
     assert gear_is_forward(1) and gear_is_forward("3") and gear_is_forward(TECH_DRIVE_GEAR)
     assert "shiftDown" not in TECH_DRIVE_SHIFT_LUA
     assert "-1" not in TECH_DRIVE_SHIFT_LUA
     assert "shiftUp" in TECH_DRIVE_SHIFT_LUA
     assert "automaticModes" in TECH_DRIVE_SHIFT_LUA
     assert "parkingbrake" in TECH_DRIVE_SHIFT_LUA and "clutch" in TECH_DRIVE_SHIFT_LUA
+    assert "M(%d+)" in TECH_DRIVE_SHIFT_LUA
+    assert "string.upper" in TECH_DRIVE_SHIFT_LUA
 
     class ArmVeh:
         def __init__(self, gear: object, *, fail_shift: bool = False) -> None:
@@ -156,6 +218,42 @@ def check_drive_gear_arm() -> None:
     assert forward.lua == []
     assert forward.calls[-1]["gear"] >= TECH_DRIVE_GEAR
     assert forward.calls[-1]["parkingbrake"] == 0.0
+
+    class _ElData:
+        def __init__(self, gear: object) -> None:
+            self.data = {"gear": gear}
+
+    class _ItemSensors:
+        """BeamNGpy container: not a dict. electrics lives on items() and .data."""
+
+        def __init__(self, gear: object) -> None:
+            self._el = _ElData(gear)
+
+        def items(self):
+            return [("electrics", self._el)]
+
+    class _DataSensors:
+        def __init__(self, gear: object) -> None:
+            self.data = {"electrics": {"gear": gear}}
+
+    for sensors in (_ItemSensors("D"), _DataSensors("M2"), _ItemSensors("m2")):
+        boxed = ArmVeh("N")
+        boxed.sensors = sensors
+        tech_box = BeamNGPyActuator(boxed)
+        tech_box.note_engaged(True)
+        with redirect_stdout(io.StringIO()):
+            tech_box.apply(DriveCommand(steer=0.0, throttle=0.4, brake=0.0, seq=8, reason="ok"))
+        assert boxed.lua == [], f"forward gear on a non-dict container still armed: {type(sensors).__name__}"
+
+    still_n = ArmVeh("N")
+    still_n.sensors = _ItemSensors("N")
+    tech_n = BeamNGPyActuator(still_n)
+    tech_n.note_engaged(True)
+    with redirect_stdout(io.StringIO()):
+        tech_n.apply(DriveCommand(steer=0.0, throttle=0.4, brake=0.0, seq=9, reason="ok"))
+    assert still_n.lua == [TECH_DRIVE_SHIFT_LUA]
+
+    _check_lua_manual_forward()
 
     failing = ArmVeh("N", fail_shift=True)
     tech_f = BeamNGPyActuator(failing)

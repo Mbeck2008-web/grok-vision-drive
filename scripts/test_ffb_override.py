@@ -466,6 +466,48 @@ def check_soft_esc_own_axes() -> None:
     assert 'owns_axes = getattr(actuator, "name", "") == "beamngpy"' in rv
     assert "own_axes=owns_axes" in rv
 
+    # Non-tracking: echo stays at the resting angle while cmd steer steps past 0.08.
+    # A frozen (echo − cmd) baseline would read that step as player_steer (~0.35 s).
+    sim = Sim(cfg)
+    sim.warm(**kw)
+    cmd_step = (0.10, 0.55, 0.0)
+    for i in range(40):
+        v = sim.step(
+            cmd=cmd_step, echo=rest, own_axes=True, use_ack=False, player_device=True,
+        )
+        assert not v.active and abs(v.steer_raw) < 1e-6, f"still wheel vs cmd 0.10 kicked at {i}: {v}"
+    cmd_far = (0.25, 0.55, 0.0)
+    for i in range(20):
+        v = sim.step(
+            cmd=cmd_far, echo=rest, own_axes=True, use_ack=False, player_device=True,
+        )
+        assert not v.active and abs(v.steer_raw) < 1e-6, f"still wheel vs cmd 0.25 kicked at {i}: {v}"
+    pulled = False
+    for _ in range(20):
+        v = sim.step(
+            cmd=cmd_far, echo=(-0.60, 0.55, 0.0), own_axes=True, use_ack=False, player_device=True,
+        )
+        if v.active:
+            pulled = True
+            assert v.channel == "steer" and v.reason == REASON_STEER, v
+            break
+    assert pulled, "a pull past the resting angle must still be player_steer after a command step"
+
+    # Tracking: echo = cmd steer − 0.26 (same offset) stays engaged, including the lag tick.
+    sim = Sim(cfg)
+    sim.warm(**kw)
+    for steer in (0.10, 0.25, -0.20):
+        echo_s = steer - 0.26
+        for i in range(20):
+            v = sim.step(
+                cmd=(steer, 0.55, 0.0),
+                echo=(echo_s, 0.55, 0.0),
+                own_axes=True,
+                use_ack=False,
+                player_device=True,
+            )
+            assert not v.active, f"tracking offset cmd {steer} kicked at {i}: {v}"
+
 
 def check_player_device_absolute() -> None:
     """Retail Direct Drive lock: a centered wheel is not residual vs GVD's steer command."""

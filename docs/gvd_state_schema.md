@@ -171,8 +171,10 @@ Live wheel / pedal HUD fields are the same retail Direct Drive echo already writ
 | `shadow.throttle` | float | E2E proposed throttle [0,1] |
 | `shadow.brake` | float | E2E proposed brake [0,1] |
 | `e2e_ok` | bool | False when modular vetoes E2E (low lane_conf / heartbeat / disagreement / forward fail) |
-| `veto_reason` | string | `none` / `aeb_brake` / `aeb_warn` / `low_lane_conf` / `low_path_conf` / `heartbeat_stale` / `disagreement` / `e2e_forward_fail` / `e2e_stub` / `preview_blocked` |
+| `veto_reason` | string | `none` / `aeb_brake` / `aeb_warn` / `low_lane_conf` / `low_path_conf` / `heartbeat_stale` / `disagreement` / `e2e_forward_fail` / `e2e_stub` / `preview_blocked` / `low_loop_hz` |
 | `e2e_backend` | string | `stub` / `onnx` |
+
+While engaged, a measured `loop_hz` or `camera_hz` under `min_accept_hz` (6, `config/control.yaml`) is `veto_reason=low_loop_hz` and disengages. For `engage_hz_grace_s` (3 s) after arm the floor is `engage_hz_grace_floor` (5), so a transient dip to about 5 Hz — including the rate EMA catching up — stays engaged. A stored 0 means the EMA has not started. CAMS blit dropping remains 8 Hz. The narrow-far hitch remains 10 Hz.
 
 Perception always runs (loaded detector, lanes, corridor planner, other-vehicle tracks, E2E shadow). Path ribbon / GVD VISION overlays stay up. The VISION ice ribbon is `path_width / 2` meters each side and only as long as the path being painted. Modular, or e2e/shadow held by a veto (including `e2e_stub`), paints `path_ego`. `policy=e2e` with `e2e_backend=onnx` and `veto_reason=none` paints `path_e2e` or a steer integral of that same length. Shadow keeps the modular ribbon and may add a thinner ghost of the other path when the clean cabin (key 0) is off. Actuators only when engaged **and** modular OK. Shadow mode computes both intents; default apply path stays modular. `e2e_stub` (no trained onnx, `e2e_backend=stub`) holds the brake and stays engaged on `--policy e2e`. Shadow does not treat that stub as a disagreement. Dead-man / heartbeat unchanged. Detector default is shipped `models/yolov8n.onnx`. No E2E checkpoint in git (`models/e2e_current.onnx` still gitignored).
 

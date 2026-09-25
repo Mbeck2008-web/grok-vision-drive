@@ -34,9 +34,11 @@ MAIN_GRAB_DIV = 1
 # Rank 2: one stream_raw per tick (main). Companion polls are ÷16.
 # Phases stay: wide 0 (even), narrow 1 (odd), pillarL 2, pillarR 3,
 # repeatL 5, rear 6, repeatR 7. Ticks 4 and 8–15 are main only.
-# Soft Esc (engaged=false): a companion with no last-good frame is coloured
-# once (warm). Later grabs skip companion colour. Main still stream_raw
-# every tick. A missed warm stays STALE, not MISSING. Engage keeps the hitch polls.
+# Soft Esc (engaged=false) uses this same hitch. It does not burst all seven
+# companions and it does not freeze the first buffer. A zero colour buffer is
+# unrendered, not a picture: the slot stays missing until a real frame arrives,
+# then CAMS keeps that last frame on the ticks that do not poll the cam.
+# Main is still the only stream_raw, every tick.
 WIDE_GRAB_DIV = 16
 NARROW_GRAB_DIV = 16
 NARROW_GRAB_PHASE = 1  # odd ticks; wide stays on even ticks
@@ -471,12 +473,16 @@ def _debug_force_engage() -> bool:
 
 
 def soft_esc_colour_main_only() -> bool:
-    """True when this grab must colour only main.
+    """True when this grab is Soft Esc (not engaged).
 
     Soft Esc is the latch false, ``gvd_engage.json`` not live, and debug
     force-engage off. Grab runs before ``note_engaged``. A live engage file
-    or debug force-engage refuses the skip on the rising edge the same way
-    the file does for ``sensors.poll``. Engage keeps hitch colour.
+    or debug force-engage is the rising edge, same as ``sensors.poll``.
+
+    The name is historical. Soft Esc no longer skips companion colour. Both
+    Soft Esc and Engage poll at most one companion on the ÷16 hitch and keep
+    the last non-blank frame for CAMS. Vision still prioritises main
+    (``stream_raw`` every tick). This is not a full-rate 8-cam colour grab.
     """
     from python.control.actuate import read_engage_flag, soft_esc_sensors_every_tick
 
@@ -740,6 +746,21 @@ def read_camera_colour(
         return None
     colour = images.get("colour") if images.get("colour") is not None else images.get("color")
     return colour_to_bgr(colour, res)
+
+
+def frame_is_unrendered(bgr: Any) -> bool:
+    """True when there is no picture.
+
+    An on-demand BeamNG colour buffer is often all zeros until the first
+    render. That must not be cached as a healthy CAMS tile. One non-zero
+    pixel counts, so a dark frame is kept.
+    """
+    if bgr is None or not isinstance(bgr, np.ndarray) or getattr(bgr, "size", 0) == 0:
+        return True
+    try:
+        return int(bgr.max()) == 0
+    except (TypeError, ValueError):
+        return True
 
 
 def frame_signature(bgr: np.ndarray) -> tuple[Any, ...]:
@@ -1089,9 +1110,6 @@ class BeamNGPyBackend:
         self._grab_i = 0
         self._cache_frames: dict[str, np.ndarray] = {}
         self._cache_ts: dict[str, float] = {}
-        # Companions whose one Soft Esc warm read failed. Later Soft Esc grabs
-        # report STALE and do not poll again. A later good frame clears this.
-        self._soft_esc_warm_failed: set[str] = set()
         self._hitch_steps: list[tuple[str, float, float, float]] = []  # cid, near, far, update_s
         hitch = self.config.get("hitch") if isinstance(self.config.get("hitch"), dict) else {}
         self._hitch = hitch
@@ -1162,7 +1180,6 @@ class BeamNGPyBackend:
         self._unique_n = 0
         self._open_mono = time.monotonic()
         self._narrow_live_hitched = False
-        self._soft_esc_warm_failed.clear()
         for spec in cams:
             cid = str(spec.get("id") or "")
             if not cid or cid not in CAM_IDS:
@@ -1312,7 +1329,6 @@ class BeamNGPyBackend:
         self._frame_sig.clear()
         self._cache_frames.clear()
         self._cache_ts.clear()
-        self._soft_esc_warm_failed.clear()
         self._grab_i = 0
         self._unique_hz_ema = 0.0
         self._unique_n = 0
@@ -1335,14 +1351,17 @@ class BeamNGPyBackend:
     def _reuse_cached(
         self, cid: str, frames: dict, timestamps: dict, health: dict, *, failed: bool
     ) -> None:
-        """Keep last pixels for perception.
+        """Keep the last real picture.
 
-        A scheduled skip stays OK when a good frame is cached. No cache and
-        not a failed read leaves the default MISSING (Engage hitch skip).
-        STALE is a failed read. Soft Esc uses that after a warm that missed,
-        so a never-coloured companion does not stay MISSING.
+        A scheduled skip stays OK when a non-blank frame is cached. No cache
+        leaves MISSING (the slot stays labelled). A failed read that still has
+        a picture is STALE and the pixels stay, so CAMS does not go black
+        between hitch slots. An all-zero buffer is not a picture and is not
+        stored here.
         """
         bgr = self._cache_frames.get(cid)
+        if frame_is_unrendered(bgr):
+            bgr = None
         if not failed:
             if bgr is None:
                 return
@@ -1353,7 +1372,7 @@ class BeamNGPyBackend:
                 frames["cam_main"] = bgr
             return
         if bgr is None:
-            health[cid] = CamHealth.STALE
+            health[cid] = CamHealth.MISSING
             return
         frames[cid] = bgr
         timestamps[cid] = self._cache_ts.get(cid, time.time())
@@ -1473,24 +1492,12 @@ class BeamNGPyBackend:
         phase = grab_phase_of(grab_i, self._hitch)
         companion_polled = False
         unique_ids: list[str] = []
-        # Soft Esc: warm each companion once so a cold cam can leave MISSING,
-        # then stream_raw/colour main only. Last-good stays OK. A warm that
-        # missed stays STALE and is not polled again. Engage uses the hitch
-        # colour schedule (a not-yet-due cam may still be MISSING).
+        # Soft Esc and Engage share the hitch: main stream_raw every tick, at
+        # most one companion poll. Ticks that skip a cam keep its last real
+        # frame for CAMS. A zero buffer is not stored and does not count as OK.
         soft_esc_main = soft_esc_colour_main_only()
-        soft_esc_coloured_companion = False
         for cid, cam in self._sensors.items():
-            warming = False
-            if soft_esc_main and cid != "main":
-                if cid in self._cache_frames:
-                    self._reuse_cached(cid, frames, timestamps, health, failed=False)
-                    continue
-                if cid in self._soft_esc_warm_failed:
-                    self._reuse_cached(cid, frames, timestamps, health, failed=True)
-                    continue
-                warming = True
-                soft_esc_coloured_companion = True
-            elif not self._grab_this_tick(cid, grab_i):
+            if not self._grab_this_tick(cid, grab_i):
                 self._reuse_cached(cid, frames, timestamps, health, failed=False)
                 continue
             if cid != "main":
@@ -1498,24 +1505,31 @@ class BeamNGPyBackend:
             try:
                 bgr = read_camera_colour(cam, cid=cid, resolution=self._resolution.get(cid))
                 if bgr is None:
-                    if warming:
-                        self._soft_esc_warm_failed.add(cid)
                     self._reuse_cached(cid, frames, timestamps, health, failed=True)
+                    continue
+                if frame_is_unrendered(bgr):
+                    cached = self._cache_frames.get(cid)
+                    if cached is not None and not frame_is_unrendered(cached):
+                        self._reuse_cached(cid, frames, timestamps, health, failed=False)
+                    else:
+                        self._cache_frames.pop(cid, None)
+                        self._cache_ts.pop(cid, None)
                     continue
                 bgr = resize_long_side(bgr, self.long_side)
                 sig = frame_signature(bgr)
                 unique = sig != self._frame_sig.get(cid)
                 self._store_frame(cid, bgr, ts, frames, timestamps, health)
-                self._soft_esc_warm_failed.discard(cid)
                 if unique:
                     self._frame_sig[cid] = sig
                     unique_ids.append(cid)
             except Exception:
-                if warming:
-                    self._soft_esc_warm_failed.add(cid)
-                    self._reuse_cached(cid, frames, timestamps, health, failed=True)
-                else:
-                    health[cid] = CamHealth.ERROR
+                health[cid] = CamHealth.ERROR
+                cached = self._cache_frames.get(cid)
+                if cached is not None and not frame_is_unrendered(cached):
+                    frames[cid] = cached
+                    timestamps[cid] = self._cache_ts.get(cid, time.time())
+                    if cid == "main":
+                        frames["cam_main"] = cached
         unique_n = len(unique_ids)
         now = time.perf_counter()
         if grab_i > 0 and self._last_unique_tick_t > 0:
@@ -1536,10 +1550,9 @@ class BeamNGPyBackend:
             f"repeat_div={self._grab_div.get('repeatL', REPEAT_GRAB_DIV)} "
             f"rear_div={self._rear_grab_div}"
         )
-        if soft_esc_main and soft_esc_coloured_companion:
-            note += " soft_esc_warm=1"
-        elif soft_esc_main:
-            note += " soft_esc_colour=main"
+        # hitch = ÷16 companion colour + last-frame paint. Not main-only, not 8 full-rate.
+        if soft_esc_main:
+            note += " soft_esc_colour=hitch"
         return CameraFrameBundle(
             frames=frames,
             timestamps=timestamps,

@@ -11,7 +11,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from python.control.e2e import E2E_H, E2E_W, E2EIntent, make_e2e
-from python.runtime.shadow import ShadowConfig, shadow_tick
+from python.runtime.shadow import (
+    ENGAGE_HZ_GRACE_FLOOR,
+    ENGAGE_HZ_GRACE_S,
+    MIN_ACCEPT_HZ,
+    ShadowConfig,
+    engage_hz_reason,
+    load_shadow_config,
+    shadow_tick,
+)
 
 
 class _FixedE2E:
@@ -271,6 +279,122 @@ def main() -> None:
     assert tick_shadow_stub.should_disengage is False
     assert tick_shadow_stub.applied.reason == "ok"
 
+    # Engage Hz floor is 6. Arm grace is 3.0 s at floor 5 — a tiny window must not pass.
+    assert MIN_ACCEPT_HZ == 6.0
+    assert ENGAGE_HZ_GRACE_FLOOR == 5.0
+    assert ENGAGE_HZ_GRACE_S == 3.0
+    assert ShadowConfig().min_accept_hz == MIN_ACCEPT_HZ
+    assert ShadowConfig().engage_hz_grace_s == 3.0
+    assert ShadowConfig().engage_hz_grace_floor == 5.0
+    loaded = load_shadow_config(
+        {
+            "veto": {
+                "min_accept_hz": 6,
+                "engage_hz_grace_s": 3.0,
+                "engage_hz_grace_floor": 5,
+            }
+        }
+    )
+    assert loaded.min_accept_hz == 6.0
+    assert loaded.engage_hz_grace_s == 3.0
+    assert loaded.engage_hz_grace_floor == 5.0
+    yaml_text = (ROOT / "config" / "control.yaml").read_text(encoding="utf-8")
+    assert "min_accept_hz: 6" in yaml_text
+    assert "engage_hz_grace_s: 3.0" in yaml_text
+    assert "engage_hz_grace_floor: 5" in yaml_text
+
+    def _drive(**kw):
+        base = dict(
+            policy="modular",
+            engaged=True,
+            heartbeat_ok=True,
+            path_debug_preview=False,
+            allow_preview_drive=False,
+            path_ego=_path(x=0.0),
+            planner={"target_v": 10, "aeb": "off"},
+            ego_speed_mps=5.0,
+            lane_conf=0.9,
+            path_conf=0.8,
+            seq=30,
+            e2e_policy=e2e,
+            main_bgr=main,
+            wide_bgr=wide,
+            cfg=cfg,
+        )
+        base.update(kw)
+        return shadow_tick(**base)
+
+    # Grace: ~5 Hz on arm does not disengage. Reason stays a real token.
+    grace = _drive(loop_hz=5.2, camera_hz=5.4, engage_age_s=0.4)
+    assert grace.veto_reason == "none", grace.veto_reason
+    assert grace.should_disengage is False
+    assert grace.applied.reason == "ok"
+    assert grace.veto_reason != ""
+    # Below the grace floor still rejects, even during the window.
+    collapse = _drive(loop_hz=4.5, camera_hz=8.0, engage_age_s=0.4)
+    assert collapse.veto_reason == "low_loop_hz", collapse.veto_reason
+    assert collapse.should_disengage is True
+    assert collapse.applied.reason == "veto:low_loop_hz"
+    # After grace the floor is 6. 5.5 disengages; 6.0 does not.
+    after = _drive(loop_hz=5.5, camera_hz=8.0, engage_age_s=ENGAGE_HZ_GRACE_S)
+    assert after.veto_reason == "low_loop_hz" and after.should_disengage is True
+    held = _drive(loop_hz=6.0, camera_hz=6.0, engage_age_s=ENGAGE_HZ_GRACE_S + 1.0)
+    assert held.veto_reason == "none" and held.should_disengage is False
+    # Unmeasured 0 is not a reject. A slow camera after grace is.
+    unmeasured = _drive(loop_hz=0.0, camera_hz=0.0, engage_age_s=ENGAGE_HZ_GRACE_S + 1.0)
+    assert unmeasured.should_disengage is False and unmeasured.veto_reason == "none"
+    slow_cam = _drive(loop_hz=8.0, camera_hz=5.5, engage_age_s=ENGAGE_HZ_GRACE_S + 1.0)
+    assert slow_cam.veto_reason == "low_loop_hz" and slow_cam.should_disengage is True
+    # Disengaged keeps the perception veto; a low rate does not rewrite it.
+    parked = _drive(engaged=False, loop_hz=4.0, camera_hz=4.0, engage_age_s=10.0, lane_conf=0.0)
+    assert parked.should_disengage is False
+    assert parked.veto_reason == "low_lane_conf", parked.veto_reason
+    assert parked.applied.reason == "not_engaged"
+    # Grace does not waive an empty lane fit on e2e or shadow.
+    for pol in ("e2e", "shadow"):
+        empty_lanes = _drive(
+            policy=pol,
+            lane_conf=0.0,
+            path_conf=0.35,
+            loop_hz=5.2,
+            camera_hz=5.4,
+            engage_age_s=0.2,
+        )
+        assert empty_lanes.veto_reason == "low_lane_conf", (pol, empty_lanes.veto_reason)
+        assert empty_lanes.should_disengage is True
+        assert empty_lanes.applied.reason == "veto:low_lane_conf"
+        assert empty_lanes.applied.brake == 1.0
+    # Modular attach keeps the modular command. A stub that brakes is not applied.
+    class _StubBrake:
+        backend = "stub"
+
+        def forward(self, *args, **kwargs) -> E2EIntent:
+            return E2EIntent(
+                steer=0.4, accel=-1.0, throttle=0.0, brake=1.0, ok=True, backend="stub", reason="stub",
+            )
+
+    mod_stub = _drive(
+        policy="modular",
+        lane_conf=0.9,
+        path_conf=0.8,
+        path_debug_preview=False,
+        e2e_policy=_StubBrake(),
+        loop_hz=10.0,
+        camera_hz=10.0,
+        engage_age_s=1.0,
+    )
+    assert mod_stub.e2e.brake == 1.0
+    assert mod_stub.veto_reason == "none", mod_stub.veto_reason
+    assert mod_stub.should_disengage is False
+    assert mod_stub.applied.reason == "ok"
+    assert mod_stub.applied.brake == mod_stub.modular.brake
+    assert mod_stub.applied.brake != 1.0
+    # Direct floor helper: exactly 5 during grace passes; exactly 6 after grace passes.
+    assert engage_hz_reason(5.0, 5.0, 0.1, cfg) == "none"
+    assert engage_hz_reason(5.0, 8.0, ENGAGE_HZ_GRACE_S, cfg) == "low_loop_hz"
+    assert engage_hz_reason(6.0, 6.0, ENGAGE_HZ_GRACE_S, cfg) == "none"
+    assert engage_hz_reason(None, None, None, cfg) == "none"
+
     # train module imports without weights
     from python.train.train_e2e import smoke_import
 
@@ -281,6 +405,10 @@ def main() -> None:
     assert E2E_W == 320 and E2E_H == 180
 
     print("test_m5_shadow: OK")
+
+
+def test_m5_shadow() -> None:
+    main()
 
 
 if __name__ == "__main__":

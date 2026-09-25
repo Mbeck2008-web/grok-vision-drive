@@ -13,7 +13,7 @@ from typing import Any
 import cv2
 import numpy as np
 
-from python.sensors.cameras import CAM_IDS
+from python.sensors.cameras import CAM_IDS, frame_is_unrendered
 
 # Windshield cluster — Tech attach can blow these white; side/rear stay as-is.
 FRONT_CAM_IDS = frozenset({"narrow", "main", "wide", "cam_main"})
@@ -269,6 +269,17 @@ def clamp_front_overexpose(frame: np.ndarray | None, cid: str = "main") -> np.nd
     return np.clip(frame.astype(np.float32) * scale, 0, 255).astype(np.uint8)
 
 
+def cam_slot_live(frames: dict[str, Any] | None, health: dict[str, Any] | None, cid: str) -> bool:
+    """True when this slot has a real picture and health says ok.
+
+    Health ``ok`` plus an all-zero buffer is not 8/8. The tile stays labelled.
+    """
+    status = str((health or {}).get(cid) or "")
+    if status != "ok":
+        return False
+    return not frame_is_unrendered(cam_frame_for(frames, cid))
+
+
 def cam_frame_for(frames: dict[str, Any] | None, cid: str) -> Any:
     """Look up one slot. `main` also accepts `cam_main`. Never synthesizes a missing feed."""
     if not frames:
@@ -315,6 +326,9 @@ def _paint_cam_tile(
 ) -> tuple[np.ndarray, str, bool]:
     """Build one tile. Missing/dropped stay labelled; never invents pixels from another cam."""
     tile = np.full((slot_h, slot_w, 3), (22, 20, 18), dtype=np.uint8)
+    # A zero buffer is not a camera picture. Leave the slot labelled.
+    if frame_is_unrendered(frame):
+        frame = None
     has = frame is not None and getattr(frame, "size", 0)
     ok = False
     if dropped:

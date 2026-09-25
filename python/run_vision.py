@@ -460,6 +460,7 @@ def main() -> None:
     prev_force = bool(args.force_engage)
     prev_preview = bool(args.allow_preview_drive)
     prev_engaged = False
+    engage_arm_mono: float | None = None
     try:
         while True:
             loop_t0 = time.perf_counter()
@@ -585,10 +586,20 @@ def main() -> None:
             heartbeat_ok = True
             allow_preview = bool(args.allow_preview_drive) or bool(ui.debug.allow_preview)
             policy_tick = ui.debug.effective_policy(policy_active)
+            if engaged:
+                if engage_arm_mono is None:
+                    engage_arm_mono = time.monotonic()
+                engage_age_s: float | None = time.monotonic() - engage_arm_mono
+            else:
+                engage_arm_mono = None
+                engage_age_s = None
             tick_cfg = ShadowConfig(
                 lane_conf_min=float(ui.debug.lane_conf_min),
                 steer_disagree_max=shadow_cfg.steer_disagree_max,
                 path_conf_min=shadow_cfg.path_conf_min,
+                min_accept_hz=shadow_cfg.min_accept_hz,
+                engage_hz_grace_s=shadow_cfg.engage_hz_grace_s,
+                engage_hz_grace_floor=shadow_cfg.engage_hz_grace_floor,
             )
 
             cmd_seq += 1
@@ -615,6 +626,9 @@ def main() -> None:
                 wide_bgr=wide,
                 steer_deg=steer,
                 cfg=tick_cfg,
+                loop_hz=loop_hz_ema,
+                camera_hz=cam_hz_ema,
+                engage_age_s=engage_age_s,
             )
             cmd = tick.applied
 

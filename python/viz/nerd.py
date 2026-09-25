@@ -9,7 +9,7 @@ import numpy as np
 
 from python.runtime.debug_opts import CAMS_DROP_HZ, DEBUG_ROWS, MODEL_ROWS, NERD_TABS, VIZ_ROWS, DebugOpts
 from python.sensors.cameras import CAM_IDS
-from python.viz.debug_draw import draw_cam_tiles
+from python.viz.debug_draw import cam_slot_live, draw_cam_tiles
 
 BG = (16, 13, 12)
 FG = (212, 204, 200)
@@ -213,7 +213,7 @@ def _draw_cams_tab(
     intro = (
         f"grid dropped (loop < {CAMS_DROP_HZ:.0f} Hz) -- slots stay labelled"
         if dropped
-        else "8 slots -- missing stays labelled; attach-only (no engage)"
+        else "8 slots -- last frame kept; missing stays labelled"
     )
     _put(img, _fit(intro, w - PAD_X * 2, FS_DIM), (PAD_X, y), FS_DIM, DIM)
     y += ROW_H
@@ -234,7 +234,7 @@ def _draw_cams_tab(
         dropped=dropped,
     )
     hits.append({"kind": "cams_grid", "n": n, "rect": (PAD_X, y, w - PAD_X, y + grid_h)})
-    ok_n = sum(1 for cid in CAM_IDS if str(health.get(cid) or "missing") == "ok")
+    ok_n = sum(1 for cid in CAM_IDS if cam_slot_live(cam_frames, health, cid))
     miss_n = len(CAM_IDS) - ok_n
     if dropped:
         foot_txt = f"{ok_n}/8 health  blit dropped (<{CAMS_DROP_HZ:.0f} Hz)"

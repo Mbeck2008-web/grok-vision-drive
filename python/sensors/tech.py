@@ -1,7 +1,13 @@
 """BeamNG.tech session: connect, player vehicle, electrics/damage/pose + GPS nav hint.
 
-Soft Esc grab: one ``vehicle.sensors.poll`` per tick. ``PollGPSGE`` (``GPS.poll``)
-is off that cadence. Camera RGB is handled by cameras.py. GPS is a coarse nav hint, not localization.
+Soft Esc (supervisor engaged=false): at most one ``vehicle.sensors.poll`` per
+``SOFT_ESC_SENSOR_POLL_S``. Inside that window the grab reuses the last-good
+ego map and does not send ``PollGPSGE``. A reused GPS sample is
+``sensors["gps"]="stale"`` (same contract as the GPS window below): lat/lon
+stay, and it is not a new fix. Skipped polls record 0 ms. Engage
+(``note_engaged(True)`` from the previous grab) keeps Tip #1: one
+``vehicle.sensors.poll`` every grab. ``PollGPSGE`` stays on ``GPS_POLL_PERIOD_S``.
+Camera RGB is handled by cameras.py. GPS is a coarse nav hint, not localization.
 LiDAR / radar / AdvancedIMU attach when config/sensors.yaml enables them — Foxglove /
 future fusion only; the corridor planner stays vision-only. Ultrasonic stays refused.
 Coordinates: GVD vehicle frame is +X right, +Y forward, +Z up. BeamNGpy Camera/GPS
@@ -17,7 +23,7 @@ import os
 import socket
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +37,10 @@ DEFAULT_REF_LAT = 53.0793
 # inside this window coalesce onto the last sample. That sample is
 # sensors["gps"]="stale": lat/lon stay, and it is not a new fix.
 GPS_POLL_PERIOD_S = 0.5
+# Soft Esc only (engaged=false). One vehicle.sensors.poll per this window.
+# A grab inside it reuses the last-good map and does not send PollGPSGE.
+# Engage ignores the window: one sensors.poll per grab (Tip #1).
+SOFT_ESC_SENSOR_POLL_S = 0.2
 
 
 def _num(v: Any) -> float | None:
@@ -1205,6 +1215,11 @@ class TechSession:
         self._sensors_poll_ms = 0.0
         self._poll_gps_ms = 0.0
         self._poll_gps_sent = False
+        self._sensors_poll_ok = False
+        self._sensors_poll_mono: float | None = None
+        self._sensors_poll_vehicle_id: int | None = None
+        self._last_vehicle_data: VehicleData | None = None
+        self._last_sensor_map: dict[str, Any] | None = None
         self.note = ""
 
     def connect(self, *, explicit: bool = True) -> bool:
@@ -1726,6 +1741,8 @@ class TechSession:
         if vehicle is None:
             data.note = self.note or "no vehicle"
             return data
+        if self._soft_esc_hold(vehicle):
+            return self._coalesced_vehicle_data(vehicle)
         sensors = self._poll_sensors(vehicle)
         el = self._extract(sensors, "electrics")
         dmg = self._extract(sensors, "damage")
@@ -1778,6 +1795,69 @@ class TechSession:
         from python.control.actuate import touch_vehicle_sensor_snap
 
         touch_vehicle_sensor_snap(vehicle)
+        self._remember_sensor_poll(vehicle, data, sensors)
+        return data
+
+    def _soft_esc_hold(self, vehicle: Any) -> bool:
+        """True when this Soft Esc grab must not send ``vehicle.sensors.poll``.
+
+        Engage (latch true) never holds. With no last-good map yet, the grab
+        polls. A different vehicle object does not reuse the previous car.
+        """
+        from python.control.actuate import soft_esc_sensors_every_tick
+
+        if soft_esc_sensors_every_tick():
+            return False
+        if (
+            self._last_vehicle_data is None
+            or self._last_sensor_map is None
+            or self._sensors_poll_mono is None
+            or self._sensors_poll_vehicle_id != id(vehicle)
+        ):
+            return False
+        return (time.monotonic() - self._sensors_poll_mono) < SOFT_ESC_SENSOR_POLL_S
+
+    def _remember_sensor_poll(self, vehicle: Any, data: VehicleData, sensors: dict[str, Any]) -> None:
+        """Arm the Soft Esc window only after a poll that published a map."""
+        if not self._sensors_poll_ok:
+            return
+        self._sensors_poll_mono = time.monotonic()
+        self._sensors_poll_vehicle_id = id(vehicle)
+        self._last_vehicle_data = replace(data, sensors=dict(data.sensors))
+        self._last_sensor_map = sensors
+
+    def _coalesced_vehicle_data(self, vehicle: Any) -> VehicleData:
+        """Last-good ego/GPS. No ``sensors.poll``, no ``PollGPSGE``.
+
+        GPS that was ``ok`` on the real poll becomes ``stale``: lat/lon stay,
+        and this grab did not take a new fix. Timers stay 0. The last-good
+        map is published again so ``read_electrics`` does not poll.
+        """
+        prev = self._last_vehicle_data
+        if prev is None or self._last_sensor_map is None:
+            raise RuntimeError("soft esc coalesce without a last-good sample")
+        sensors_status = dict(prev.sensors)
+        if sensors_status.get("gps") == "ok":
+            sensors_status["gps"] = "stale"
+        note = prev.note or ""
+        tag = "soft esc: sensors.poll coalesced; last-good (not a new GPS fix)"
+        if tag not in note:
+            note = f"{note}; {tag}" if note else tag
+        data = replace(
+            prev,
+            sensors=sensors_status,
+            note=note,
+            sensors_poll_ms=0.0,
+            poll_gps_ms=0.0,
+            poll_gps_sent=False,
+        )
+        self._sensors_poll_ms = 0.0
+        self._poll_gps_ms = 0.0
+        self._poll_gps_sent = False
+        from python.control.actuate import publish_vehicle_sensor_snap, touch_vehicle_sensor_snap
+
+        publish_vehicle_sensor_snap(vehicle, self._last_sensor_map or {})
+        touch_vehicle_sensor_snap(vehicle)
         return data
 
     def _fill_nav(self, data: VehicleData) -> None:
@@ -1820,9 +1900,14 @@ class TechSession:
                 data.bearing_rel_deg = wrap180(data.bearing_deg - heading)
 
     def _poll_sensors(self, vehicle: Any) -> dict[str, Any]:
-        """One vehicle.sensors.poll. The map is the tick's ego snapshot."""
+        """One vehicle.sensors.poll. The map is the tick's ego snapshot.
+
+        A throw leaves ``_sensors_poll_ok`` false so the Soft Esc window does
+        not cache an empty map over a previous good sample.
+        """
         out: dict[str, Any] = {}
         self._sensors_poll_ms = 0.0
+        self._sensors_poll_ok = False
         try:
             sensors = getattr(vehicle, "sensors", None)
             if sensors is None:
@@ -1839,6 +1924,7 @@ class TechSession:
         from python.control.actuate import publish_vehicle_sensor_snap
 
         publish_vehicle_sensor_snap(vehicle, out)
+        self._sensors_poll_ok = True
         return out
 
     def _extract(self, sensors: dict[str, Any], key: str) -> dict[str, Any] | None:

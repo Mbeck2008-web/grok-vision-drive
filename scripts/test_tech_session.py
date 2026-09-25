@@ -1021,7 +1021,11 @@ def check_beamngpy_side_grab_half_rate() -> None:
 
 
 def check_soft_esc_segment_timers() -> None:
-    """Soft Esc Tip #2: phase tag + poll / PollGPSGE timers. Hitch schedule stays put."""
+    """Soft Esc Tip #2 timers, plus Tip #4 coalesce while disengaged.
+
+    Hitch schedule stays put. engaged=false reuses last-good inside 200 ms.
+    Engage polls ``vehicle.sensors.poll`` every grab.
+    """
     import time
 
     hitch = load_camera_config().get("hitch")
@@ -1087,22 +1091,60 @@ def check_soft_esc_segment_timers() -> None:
     session.attached = {"electrics": True, "gps": True}
     gps = FakeGPS()
     session._gps = gps
-    first = session.poll()
-    assert first.sensors_poll_ms >= 10.0, first.sensors_poll_ms
-    assert first.poll_gps_sent is True
-    assert first.poll_gps_ms >= 10.0, first.poll_gps_ms
-    assert gps.n == 1 and veh.sensors.n == 1
-    assert first.lat == 53.09 and first.sensors.get("gps") == "ok"
-    second = session.poll()
-    assert second.poll_gps_sent is False
-    assert second.poll_gps_ms == 0.0
-    assert gps.n == 1  # coalesced; no second PollGPSGE
-    assert veh.sensors.n == 2  # ego sensors.poll still once per tick
-    assert second.sensors_poll_ms >= 10.0
-    assert second.sensors.get("gps") == "stale"
-    assert second.lat == 53.09
-    session.close()
-    assert gps.removed is True
+    import python.control.actuate as act
+    from python.sensors.tech import SOFT_ESC_SENSOR_POLL_S
+
+    act.note_soft_esc_engaged(False)
+    try:
+        assert act.soft_esc_sensors_every_tick() is False
+        first = session.poll()
+        assert first.sensors_poll_ms >= 10.0, first.sensors_poll_ms
+        assert first.poll_gps_sent is True
+        assert first.poll_gps_ms >= 10.0, first.poll_gps_ms
+        assert gps.n == 1 and veh.sensors.n == 1
+        assert first.lat == 53.09 and first.sensors.get("gps") == "ok"
+        # Soft Esc engaged=false: second grab inside 200 ms does not poll.
+        second = session.poll()
+        assert second.poll_gps_sent is False
+        assert second.poll_gps_ms == 0.0
+        assert second.sensors_poll_ms == 0.0
+        assert gps.n == 1  # no PollGPSGE on a coalesced grab
+        assert veh.sensors.n == 1  # no second vehicle.sensors.poll
+        assert second.sensors.get("gps") == "stale"
+        assert second.lat == 53.09 and second.speed_mps == 3.0
+        assert "coalesced" in second.note
+        nav = nav_snapshot(second)
+        assert nav["gps"]["lat"] == 53.09 and "not a new fix" in nav["note"]
+        el = act.read_electrics(veh)
+        assert el is not None and el["wheelspeed"] == 3.0
+        assert veh.sensors.n == 1  # electrics reused the republished last-good map
+        # Window elapsed → one ego poll. GPS period still holds.
+        session._sensors_poll_mono = time.monotonic() - (SOFT_ESC_SENSOR_POLL_S + 0.01)
+        third = session.poll()
+        assert veh.sensors.n == 2
+        assert third.sensors_poll_ms >= 10.0
+        assert gps.n == 1 and third.poll_gps_sent is False and third.poll_gps_ms == 0.0
+        assert third.lat == 53.09 and third.sensors.get("gps") == "stale"
+        # Pin the GPS window so the Engage grabs below stay inside it.
+        session._gps_mono = time.monotonic()
+        # Engage: Tip #1, one sensors.poll per grab. No Soft Esc coalesce.
+        driver = act.BeamNGPyActuator(veh)
+        driver.note_engaged(True)
+        assert act.soft_esc_sensors_every_tick() is True
+        fourth = session.poll()
+        fifth = session.poll()
+        assert veh.sensors.n == 4
+        assert fourth.sensors_poll_ms >= 10.0 and fifth.sensors_poll_ms >= 10.0
+        assert gps.n == 1  # GPS window unchanged while Engage polls every grab
+        driver.note_engaged(False)
+        assert act.soft_esc_sensors_every_tick() is False
+        sixth = session.poll()
+        assert veh.sensors.n == 4 and sixth.sensors_poll_ms == 0.0
+        assert sixth.poll_gps_sent is False and gps.n == 1
+        session.close()
+        assert gps.removed is True
+    finally:
+        act.note_soft_esc_engaged(False)
 
     rv = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
     for key in ("grab_phase", "grab_poll_free", "sensors_poll_ms", "poll_gps_ms", "electrics_ms"):

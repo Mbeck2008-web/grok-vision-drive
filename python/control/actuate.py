@@ -408,7 +408,25 @@ class DriverInputs:
 # restarts when poll() returns so PollGPSGE inside the same poll cannot
 # expire the snapshot before electrics are read. A miss still polls; Engage
 # hold reads speed on that path.
+# Soft Esc (latch false) may skip the GE poll for 200 ms and republish the
+# last-good map here so this read does not open a second sensors.poll.
 SENSOR_POLL_REUSE_S = 0.05
+
+# Previous grab's supervisor engage bit. note_engaged runs after poll, so
+# this is one grab behind the rising edge. Default false: Soft Esc coalesces
+# without a run_vision edit. True: TechSession keeps Tip #1 (poll every grab).
+_soft_esc_engaged = False
+
+
+def note_soft_esc_engaged(engaged: bool) -> None:
+    """Record whether the next ``TechSession.poll`` must poll every grab."""
+    global _soft_esc_engaged
+    _soft_esc_engaged = bool(engaged)
+
+
+def soft_esc_sensors_every_tick() -> bool:
+    """True when Engage forbids the Soft Esc sensors.poll coalesce."""
+    return bool(_soft_esc_engaged)
 
 
 class _SensorSnap:
@@ -468,10 +486,11 @@ def read_electrics(vehicle: Any) -> dict[str, Any] | None:
     """Electrics dict. None when the sensor is absent.
 
     Soft Esc calls this immediately after ``TechSession.poll``. That poll
-    already issued this tick's ``vehicle.sensors.poll``. Reuse that snapshot
-    once so the grab does not open a second GE roundtrip. A miss (no
-    snapshot, already consumed, or older than the reuse window) still polls.
-    Engage hold reads speed on that miss path.
+    already issued this tick's ``vehicle.sensors.poll``, or republished the
+    last-good map when the 200 ms Soft Esc window skipped the GE poll.
+    Reuse that snapshot once so the grab does not open a second roundtrip.
+    A miss (no snapshot, already consumed, or older than the reuse window)
+    still polls. Engage hold reads speed on that miss path.
     """
     global _last_electrics_ms
     t0 = time.perf_counter()
@@ -607,6 +626,8 @@ class BeamNGPyActuator:
 
     def note_engaged(self, engaged: bool) -> None:
         self.engaged = bool(engaged)
+        # Next grab. This grab already polled under the previous bit.
+        note_soft_esc_engaged(self.engaged)
 
     def _write_release_cmd(self, seq: int, reason: str) -> None:
         """gvd_cmd must not keep brake=1 after Disengage. Lua applies only engaged:true."""
@@ -764,6 +785,7 @@ class CmdJsonActuator:
 
     def note_engaged(self, engaged: bool) -> None:
         self.engaged = bool(engaged)
+        note_soft_esc_engaged(self.engaged)
 
     def note_ack(self, fb: EgoFeedback | None) -> None:
         self.ack = fb

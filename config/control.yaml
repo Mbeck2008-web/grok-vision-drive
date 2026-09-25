@@ -17,8 +17,6 @@ veto:
   # Separate from the 8 Hz CAMS blit drop and the 10 Hz narrow-far hitch.
   # A measured rate under this floor disengages after engage_hz_grace_s.
   # 0 is unmeasured and does not reject. Soft Esc idle is about 7–9 Hz.
-  # Hitch + viz Engage has been measured about 5.5–7 Hz. A sustained EMA under
-  # 6 after the grace is veto_reason=low_loop_hz. The floor stays 6.
   min_accept_hz: 6
   # Just after Engage arm, a transient dip down to ~5 Hz does not by itself
   # disengage. The rate is an EMA, so the window outlasts the hitch.

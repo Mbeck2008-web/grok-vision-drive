@@ -780,13 +780,25 @@ def check_beamngpy_open_passes_near_far() -> None:
 
 
 def check_beamngpy_side_grab_half_rate() -> None:
-    """main stream_raw every tick. Wide/narrow poll on opposite parities. ≤1 stream_raw."""
+    """Engage: main stream_raw every tick. Companions poll on the hitch wheel.
+
+    Soft Esc (engaged=false): colour and stream_raw are main only. The other
+    seven stay attached and reuse last-good, or stay MISSING if never read.
+    A live gvd_engage.json restores hitch colour before note_engaged.
+    """
     import sys
     import types
 
     import numpy as np
 
-    from python.sensors.cameras import BeamNGPyBackend, CamHealth, REAR_CAM_IDS, SIDE_CAM_IDS
+    import python.control.actuate as act
+    from python.sensors.cameras import (
+        BeamNGPyBackend,
+        CamHealth,
+        REAR_CAM_IDS,
+        SIDE_CAM_IDS,
+        soft_esc_colour_main_only,
+    )
 
     streams: dict[str, int] = {}
     polls: dict[str, int] = {}
@@ -832,6 +844,9 @@ def check_beamngpy_side_grab_half_rate() -> None:
     old = {k: sys.modules.get(k) for k in ("beamngpy", "beamngpy.sensors")}
     sys.modules["beamngpy"] = beamngpy
     sys.modules["beamngpy.sensors"] = sensors
+    prev_latch = act.soft_esc_sensors_every_tick()
+    engage = act.engage_path()
+    prev_bytes = engage.read_bytes() if engage.is_file() else None
     try:
         be = BeamNGPyBackend(
             config=load_camera_config(),
@@ -849,8 +864,14 @@ def check_beamngpy_side_grab_half_rate() -> None:
         be.session.connect = _connect  # type: ignore[method-assign]
         be.session.attach_vehicle_sensors = lambda: {}  # type: ignore[method-assign]
         be.open()
+        assert len(be._sensors) == 8
+        assert set(be._sensors) == set(CAM_IDS)
         assert read_camera_update_priority(be._sensors["main"]) == 0.0
         assert priority_highest_is_zero(be._sensors["main"], 0.0)
+        # Engage hitch colour. The latch alone keeps companion polls.
+        act.note_soft_esc_engaged(True)
+        act.write_engage_flag(False)
+        assert soft_esc_colour_main_only() is False
         n = 16
         last = None
         wheel = {
@@ -936,6 +957,76 @@ def check_beamngpy_side_grab_half_rate() -> None:
         assert "wide_div=16" in last.note
         assert "narrow_div=16" in last.note
         assert "main_div=1" in last.note
+        assert "soft_esc_colour=main" not in last.note
+
+        # Soft Esc: main stream_raw only. Hitch divs stay. Cams stay attached.
+        act.note_soft_esc_engaged(False)
+        act.write_engage_flag(False)
+        assert act.soft_esc_sensors_every_tick() is False
+        assert soft_esc_colour_main_only() is True
+        s_soft = dict(streams)
+        p_soft = dict(polls)
+        for i in range(n):
+            bundle = be.grab()
+            assert bundle.grab_phase == (n + i) % 16
+            assert bundle.grab_poll_free is True
+            assert "soft_esc_colour=main" in bundle.note
+            assert bundle.health["main"] == CamHealth.OK
+            assert bundle.unique_gpu_ids == ("main",)
+            for cid in CAM_IDS:
+                if cid == "main":
+                    continue
+                assert bundle.health[cid] == CamHealth.OK, cid  # last-good
+                assert cid in bundle.frames
+                assert cid not in bundle.unique_gpu_ids
+        assert streams["gvd_main"] == s_soft["gvd_main"] + n
+        assert polls["gvd_main"] == 0
+        for cid in CAM_IDS:
+            if cid == "main":
+                continue
+            assert streams[f"gvd_{cid}"] == s_soft[f"gvd_{cid}"], cid
+            assert polls[f"gvd_{cid}"] == p_soft[f"gvd_{cid}"], cid
+        assert len(be._sensors) == 8
+        assert set(be._sensors) == set(CAM_IDS)
+        assert camera_grab_due("wide", n, be._hitch)
+        assert not camera_grab_due("narrow", n, be._hitch)
+
+        # Never-read companion stays MISSING. Skip is not a failed read (not STALE).
+        be._cache_frames.pop("wide", None)
+        be._cache_ts.pop("wide", None)
+        wide_polls = polls["gvd_wide"]
+        cold = be.grab()
+        assert cold.health["wide"] == CamHealth.MISSING
+        assert cold.health["wide"] != CamHealth.STALE
+        assert "wide" not in cold.frames
+        assert polls["gvd_wide"] == wide_polls
+        assert streams["gvd_wide"] == 0
+        assert cold.health["main"] == CamHealth.OK
+        assert cold.grab_poll_free is True
+        assert len(be._sensors) == 8
+
+        # Rising edge: latch still false. A live engage file colours the due companion.
+        act.write_engage_flag(True)
+        assert act.soft_esc_sensors_every_tick() is False
+        assert soft_esc_colour_main_only() is False
+        gi = be._grab_i
+        due = [cid for cid in CAM_IDS if cid != "main" and camera_grab_due(cid, gi, be._hitch)]
+        assert due == ["narrow"], (gi, due)
+        narrow_polls = polls["gvd_narrow"]
+        main_streams = streams["gvd_main"]
+        edge = be.grab()
+        assert polls["gvd_narrow"] == narrow_polls + 1
+        assert streams["gvd_narrow"] == 0
+        assert streams["gvd_main"] == main_streams + 1
+        assert edge.health["narrow"] == CamHealth.OK
+        assert edge.grab_poll_free is False
+        assert "soft_esc_colour=main" not in edge.note
+        assert edge.health["wide"] == CamHealth.MISSING  # not due, still never re-read
+        assert len(be._sensors) == 8
+
+        act.write_engage_flag(False)
+        act.note_soft_esc_engaged(False)
+        assert soft_esc_colour_main_only() is True
 
         # Main never polls. Wide/narrow poll and do not stream_raw.
         class NoStream:
@@ -1013,6 +1104,11 @@ def check_beamngpy_side_grab_half_rate() -> None:
         assert abs(be._clip_planes["narrow"][1] - NARROW_FAR_LIVE_HITCH_M) < 1e-9
         assert be._clip_planes["narrow"][1] >= be._clip_planes["main"][1]
     finally:
+        act.note_soft_esc_engaged(prev_latch)
+        if prev_bytes is None:
+            engage.unlink(missing_ok=True)
+        else:
+            engage.write_bytes(prev_bytes)
         for k, v in old.items():
             if v is None:
                 sys.modules.pop(k, None)

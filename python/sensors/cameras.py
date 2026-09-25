@@ -33,6 +33,8 @@ MAIN_GRAB_DIV = 1
 # Rank 2: one stream_raw per tick (main). Companion polls are ÷16.
 # Phases stay: wide 0 (even), narrow 1 (odd), pillarL 2, pillarR 3,
 # repeatL 5, rear 6, repeatR 7. Ticks 4 and 8–15 are main only.
+# Soft Esc (engaged=false): grab skips companion colour. Main still
+# stream_raw every tick. Engage keeps the hitch polls.
 WIDE_GRAB_DIV = 16
 NARROW_GRAB_DIV = 16
 NARROW_GRAB_PHASE = 1  # odd ticks; wide stays on even ticks
@@ -428,6 +430,20 @@ def grab_is_poll_free(grab_i: int, hitch: dict[str, Any] | None = None) -> bool:
         if camera_grab_due(cid, grab_i, hitch):
             return False
     return True
+
+
+def soft_esc_colour_main_only() -> bool:
+    """True when this grab must colour only main.
+
+    Soft Esc is the latch false and ``gvd_engage.json`` not live. Grab runs
+    before ``note_engaged``, so a live engage file refuses the skip on the
+    rising edge the same way ``sensors.poll`` does. Engage keeps hitch colour.
+    """
+    from python.control.actuate import read_engage_flag, soft_esc_sensors_every_tick
+
+    if soft_esc_sensors_every_tick():
+        return False
+    return not bool(read_engage_flag(default=False))
 
 
 def clamp_far_m(cid: str, far_m: float) -> float:
@@ -1066,7 +1082,7 @@ class BeamNGPyBackend:
             return
 
         # Cameras + vehicle sensors attach here, independent of Alt+G / engaged.
-        # Vision LINK and cam_health ok×8 must work with engaged=false.
+        # Soft Esc keeps all 8 attached. Colour while engaged=false is main only.
         try:
             self.session.attach_vehicle_sensors()
         except Exception as e:
@@ -1407,7 +1423,14 @@ class BeamNGPyBackend:
         phase = grab_phase_of(grab_i, self._hitch)
         companion_polled = False
         unique_ids: list[str] = []
+        # Soft Esc: stream_raw/colour for main only. Companions stay attached
+        # and reuse last-good (OK) or stay MISSING if never read. A failed
+        # main read is still STALE. Engage uses the hitch colour schedule.
+        soft_esc_main = soft_esc_colour_main_only()
         for cid, cam in self._sensors.items():
+            if soft_esc_main and cid != "main":
+                self._reuse_cached(cid, frames, timestamps, health, failed=False)
+                continue
             if not self._grab_this_tick(cid, grab_i):
                 self._reuse_cached(cid, frames, timestamps, health, failed=False)
                 continue
@@ -1438,20 +1461,23 @@ class BeamNGPyBackend:
         self._maybe_live_narrow_hitch()
         n_ok = sum(1 for c in CAM_IDS if health.get(c) == CamHealth.OK)
         grab_ms = (time.perf_counter() - t0) * 1000.0
+        note = (
+            f"beamngpy: {n_ok} colour frame(s) grab={grab_i} unique={unique_n} "
+            f"main_div={self._grab_div.get('main', MAIN_GRAB_DIV)} "
+            f"wide_div={self._grab_div.get('wide', WIDE_GRAB_DIV)} "
+            f"narrow_div={self._grab_div.get('narrow', NARROW_GRAB_DIV)} "
+            f"side_div={self._side_grab_div} "
+            f"repeat_div={self._grab_div.get('repeatL', REPEAT_GRAB_DIV)} "
+            f"rear_div={self._rear_grab_div}"
+        )
+        if soft_esc_main:
+            note += " soft_esc_colour=main"
         return CameraFrameBundle(
             frames=frames,
             timestamps=timestamps,
             health=health,
             backend=self.name,
-            note=(
-                f"beamngpy: {n_ok} colour frame(s) grab={grab_i} unique={unique_n} "
-                f"main_div={self._grab_div.get('main', MAIN_GRAB_DIV)} "
-                f"wide_div={self._grab_div.get('wide', WIDE_GRAB_DIV)} "
-                f"narrow_div={self._grab_div.get('narrow', NARROW_GRAB_DIV)} "
-                f"side_div={self._side_grab_div} "
-                f"repeat_div={self._grab_div.get('repeatL', REPEAT_GRAB_DIV)} "
-                f"rear_div={self._rear_grab_div}"
-            ),
+            note=note,
             grab_ms=grab_ms,
             grab_phase=phase,
             grab_poll_free=not companion_polled,

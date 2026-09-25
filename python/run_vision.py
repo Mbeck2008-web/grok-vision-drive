@@ -654,7 +654,13 @@ def main() -> None:
             # Player override. Retail Direct Drive lock: when Lua saw a player device, electrics
             # are GVD's own command — use the physical lastInputs axes (absolute). Otherwise the
             # residual is still steering_input - aligned cmd.steer so FFB noise cannot disengage.
-            if ego_fb is not None and ego_fb.fresh and ego_fb.player_device:
+            # Soft Esc beamngpy is not source=gvd, so lastInputs / electrics can echo the command
+            # we just sent. own_axes keeps the pedal residual, and the steer baseline follows
+            # the resting wheel when the command changes, instead of the absolute player_* path.
+            owns_axes = getattr(actuator, "name", "") == "beamngpy"
+            if owns_axes:
+                ovr_steer, ovr_thr, ovr_brk, ovr_dev = steer_in, throttle_in, brake_in, False
+            elif ego_fb is not None and ego_fb.fresh and ego_fb.player_device:
                 ovr_steer, ovr_thr, ovr_brk, ovr_dev = (
                     ego_fb.player_steering, ego_fb.player_throttle, ego_fb.player_brake, True,
                 )
@@ -666,7 +672,10 @@ def main() -> None:
                 throttle_input=ovr_thr,
                 brake_input=ovr_brk,
                 player_device=ovr_dev,
-                applied_seq=ego_fb.applied_seq if ego_fb is not None and ego_fb.fresh else None,
+                own_axes=owns_axes,
+                applied_seq=None if owns_axes else (
+                    ego_fb.applied_seq if ego_fb is not None and ego_fb.fresh else None
+                ),
             )
             if ovr.active and not ui.debug.ignore_override:
                 engaged = False

@@ -63,7 +63,16 @@ class Sim:
         self.seq = 0
         self.acked = -1
 
-    def step(self, *, cmd=(0.0, 0.0, 0.0), echo=(0.0, 0.0, 0.0), engaged: bool = True, player_device: bool = False):
+    def step(
+        self,
+        *,
+        cmd=(0.0, 0.0, 0.0),
+        echo=(0.0, 0.0, 0.0),
+        engaged: bool = True,
+        player_device: bool = False,
+        own_axes: bool = False,
+        use_ack: bool = True,
+    ):
         self.t += self.tick
         self.seq += 1
         v = self.det.update(
@@ -71,9 +80,10 @@ class Sim:
             steering_input=echo[0],
             throttle_input=echo[1],
             brake_input=echo[2],
-            applied_seq=self.acked,
+            applied_seq=self.acked if use_ack else None,
             now=self.t,
             player_device=player_device,
+            own_axes=own_axes,
         )
         self.det.note_command(seq=self.seq, steer=cmd[0], throttle=cmd[1], brake=cmd[2], now=self.t)
         self.acked = self.seq
@@ -370,17 +380,33 @@ def check_missing_echo() -> None:
 
 
 def check_reference_fallback() -> None:
-    """No applied_seq (BeamNGpy electrics) → previous command, the same one-tick lag."""
+    """No applied_seq (BeamNGpy electrics) matches the latest noted command.
+
+    Production order is electrics, then update, then note_command. The echo belongs
+    to the command already in the ring. Comparing it to the command before that
+    turns a 0 → 0.55 throttle step into player_throttle.
+    """
     det = OverrideDetector(OverrideConfig(lpf_tau_ms=0, steer_hold_ms=0, steer_spike=1.0))
     t = 0.0
-    det.note_command(seq=1, steer=0.0, throttle=0.0, brake=0.0, now=t)
+    det.note_command(seq=1, steer=0.0, throttle=0.0, brake=1.0, now=t)
     t += 0.3
-    det.note_command(seq=2, steer=0.4, throttle=0.0, brake=0.0, now=t)
+    det.note_command(seq=2, steer=0.0, throttle=0.55, brake=0.0, now=t)
     ref = det.reference(None)
-    assert ref.seq == 1 and ref.steer == 0.0
+    assert ref.seq == 2 and ref.throttle == 0.55, ref
     ref = det.reference(2)
-    assert ref.seq == 2 and ref.steer == 0.4
+    assert ref.seq == 2 and ref.throttle == 0.55
     assert det.reference(99).seq == 2  # unknown seq → latest
+    t += 0.05
+    v = det.update(
+        engaged=True,
+        steering_input=-0.26,
+        throttle_input=0.55,
+        brake_input=0.0,
+        applied_seq=None,
+        now=t,
+        own_axes=True,
+    )
+    assert v.armed and not v.active, v
 
 
 def check_aeb_echo_not_brake() -> None:
@@ -390,6 +416,97 @@ def check_aeb_echo_not_brake() -> None:
     for _ in range(20):
         v = sim.step(cmd=(0.0, 0.0, 1.0), echo=(0.0, 0.0, 1.0))
         assert not v.active, f"our own brake=1 echoed back: {v}"
+
+
+def check_soft_esc_own_axes() -> None:
+    """Commanded throttle and a resting wheel are not a player kick.
+
+    Approach: baseline-at-engage plus residual against the command in force
+    (not absolute player_* with ref 0, and not a wider deadband). Retail
+    player_device stays absolute — see check_player_device_absolute.
+    """
+    cfg = load_override_config(yaml.safe_load(CONTROL_YAML.read_text(encoding="utf-8")))
+    rest = (-0.26, 0.55, 0.0)
+    cmd = (0.0, 0.55, 0.0)
+    kw = dict(cmd=cmd, echo=rest, own_axes=True, use_ack=False, player_device=True)
+
+    sim = Sim(cfg)
+    sim.warm(**kw)
+    for i in range(80):  # 4.0 s at 20 Hz
+        v = sim.step(**kw)
+        assert not v.active, f"quiet wheel/commanded thr kicked at {i}: {v}"
+
+    pulled = False
+    for _ in range(20):
+        v = sim.step(cmd=cmd, echo=(-0.60, 0.55, 0.0), own_axes=True, use_ack=False, player_device=True)
+        if v.active:
+            pulled = True
+            assert v.channel == "steer" and v.reason == REASON_STEER, v
+            break
+    assert pulled, "a further wheel pull past the engage baseline must be player_steer"
+
+    sim = Sim(cfg)
+    sim.warm(**kw)
+    v = sim.step(cmd=cmd, echo=(-0.26, 0.80, 0.0), own_axes=True, use_ack=False, player_device=True)
+    assert v.active and v.channel == "throttle" and v.reason == REASON_THROTTLE, v
+
+    sim = Sim(cfg)
+    sim.warm(**kw)
+    v = sim.step(cmd=cmd, echo=(-0.26, 0.55, 0.20), own_axes=True, use_ack=False, player_device=True)
+    assert v.active and v.channel == "brake" and v.reason == REASON_BRAKE, v
+
+    # Electrics path (player_device false) is the same own-axes rule.
+    sim = Sim(cfg)
+    sim.warm(cmd=cmd, echo=rest, own_axes=True, use_ack=False, player_device=False)
+    assert not any(
+        sim.step(cmd=cmd, echo=rest, own_axes=True, use_ack=False).active for _ in range(40)
+    )
+
+    rv = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
+    assert 'owns_axes = getattr(actuator, "name", "") == "beamngpy"' in rv
+    assert "own_axes=owns_axes" in rv
+
+    # Non-tracking: echo stays at the resting angle while cmd steer steps past 0.08.
+    # A frozen (echo − cmd) baseline would read that step as player_steer (~0.35 s).
+    sim = Sim(cfg)
+    sim.warm(**kw)
+    cmd_step = (0.10, 0.55, 0.0)
+    for i in range(40):
+        v = sim.step(
+            cmd=cmd_step, echo=rest, own_axes=True, use_ack=False, player_device=True,
+        )
+        assert not v.active and abs(v.steer_raw) < 1e-6, f"still wheel vs cmd 0.10 kicked at {i}: {v}"
+    cmd_far = (0.25, 0.55, 0.0)
+    for i in range(20):
+        v = sim.step(
+            cmd=cmd_far, echo=rest, own_axes=True, use_ack=False, player_device=True,
+        )
+        assert not v.active and abs(v.steer_raw) < 1e-6, f"still wheel vs cmd 0.25 kicked at {i}: {v}"
+    pulled = False
+    for _ in range(20):
+        v = sim.step(
+            cmd=cmd_far, echo=(-0.60, 0.55, 0.0), own_axes=True, use_ack=False, player_device=True,
+        )
+        if v.active:
+            pulled = True
+            assert v.channel == "steer" and v.reason == REASON_STEER, v
+            break
+    assert pulled, "a pull past the resting angle must still be player_steer after a command step"
+
+    # Tracking: echo = cmd steer − 0.26 (same offset) stays engaged, including the lag tick.
+    sim = Sim(cfg)
+    sim.warm(**kw)
+    for steer in (0.10, 0.25, -0.20):
+        echo_s = steer - 0.26
+        for i in range(20):
+            v = sim.step(
+                cmd=(steer, 0.55, 0.0),
+                echo=(echo_s, 0.55, 0.0),
+                own_axes=True,
+                use_ack=False,
+                player_device=True,
+            )
+            assert not v.active, f"tracking offset cmd {steer} kicked at {i}: {v}"
 
 
 def check_player_device_absolute() -> None:
@@ -436,6 +553,7 @@ def main() -> None:
     check_reference_fallback()
     check_aeb_echo_not_brake()
     check_player_device_absolute()
+    check_soft_esc_own_axes()
     print("test_ffb_override: OK")
 
 

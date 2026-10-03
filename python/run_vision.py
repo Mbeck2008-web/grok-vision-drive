@@ -942,12 +942,15 @@ def main() -> None:
                     dets=getattr(pout, "dets", None),
                 )
                 cv2.imshow(win, frame)
-                key = cv2.waitKey(1) & 0xFF
+                # Full key code. waitKey() & 0xFF folds Qt Up (65362) into 82,
+                # which is also ASCII R, so Up toggled review capture.
+                raw_key = cv2.waitKeyEx(1)
+                key = -1 if raw_key is None else int(raw_key)
                 # q and Esc leave the supervisor. close() disconnects only
                 # (quit_on_close=false) and does not kill BeamNG.tech.
                 if key in (ord("q"), 27):
                     break
-                if key == 255:
+                if key < 0:
                     pass
                 elif ui.handle_key(key):
                     pass

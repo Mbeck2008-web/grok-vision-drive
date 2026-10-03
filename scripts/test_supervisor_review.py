@@ -112,6 +112,15 @@ def check_review() -> None:
     assert ui.debug.review_record is True
     ui.handle_key(ord("r"))
     assert ui.debug.review_record is False
+    # Qt Up is 65362. It must not be read as ASCII R (82).
+    ui.nerd_tab = "viz"
+    ui.viz_sel = 2
+    assert ui.handle_key(65362) is True
+    assert ui.viz_sel == 1
+    assert ui.debug.review_record is False
+    assert ui.handle_key(0) is True
+    assert ui.viz_sel == 0
+    assert ui.debug.review_record is False
     help_text = (ROOT / "python" / "viz" / "nerd.py").read_text(encoding="utf-8")
     assert "review capture" in help_text
     assert "Documents/GVD/review" in help_text
@@ -211,15 +220,27 @@ def check_arcade_hold_not_reverse() -> None:
 
 
 def check_link_and_gear() -> None:
+    import python.control.actuate as act
     from python.control.actuate import HEARTBEAT_STALE_S, TECH_DRIVE_SHIFT_LUA, TECH_SHIFT_MODE
 
     assert TECH_SHIFT_MODE == "arcade"
     assert "setGearboxMode('arcade')" in TECH_DRIVE_SHIFT_LUA
     assert "realistic" not in TECH_DRIVE_SHIFT_LUA
     assert HEARTBEAT_STALE_S == 1.5
+    assert not hasattr(act, "TECH_HOLD_SPEED_MPS")
     lua = (ROOT / "beamng_mod" / "lua" / "ge" / "extensions" / "gvd" / "main.lua").read_text(encoding="utf-8")
     assert "local HB_STALE_S = 1.5" in lua
     assert "local CMD_STALE_S = 0.35" in lua
+    schema = (ROOT / "docs" / "gvd_state_schema.md").read_text(encoding="utf-8")
+    veto = next(ln for ln in schema.splitlines() if "`veto_reason`" in ln)
+    assert "low_loop_hz" not in veto
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "brake=1` ± `parkingbrake`" not in readme
+    assert "neutral + brake" not in readme
+    assert "parkingbrake=1" in readme and "service `brake=0`" in readme
+    vision = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
+    assert "waitKeyEx" in vision
+    assert "waitKey(1) & 0xFF" not in vision
 
 
 def check_frustums() -> None:

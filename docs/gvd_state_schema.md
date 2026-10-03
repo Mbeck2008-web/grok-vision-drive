@@ -173,7 +173,7 @@ Live wheel / pedal HUD fields are the same retail Direct Drive echo already writ
 | `shadow.throttle` | float | E2E proposed throttle [0,1] |
 | `shadow.brake` | float | E2E proposed brake [0,1] |
 | `e2e_ok` | bool | False when modular vetoes E2E (low lane_conf / heartbeat / disagreement / forward fail) |
-| `veto_reason` | string | `none` / `aeb_brake` / `aeb_warn` / `low_lane_conf` / `low_path_conf` / `heartbeat_stale` / `disagreement` / `e2e_forward_fail` / `e2e_stub` / `preview_blocked` / `low_loop_hz` |
+| `veto_reason` | string | `none` / `aeb_brake` / `aeb_warn` / `low_lane_conf` / `low_path_conf` / `heartbeat_stale` / `disagreement` / `e2e_forward_fail` / `e2e_stub` / `preview_blocked` |
 | `e2e_backend` | string | `stub` / `onnx` |
 
 A measured `loop_hz` or `camera_hz` under `min_accept_hz` is not an Engage drop and does not replace the plan with a brake hold. A hitch that used to mark the link stale for a split second was the HOLD flash. CAMS blit dropping remains 8 Hz. The narrow-far hitch remains 10 Hz. The command dead-man is still `CMD_STALE_S` 0.35 s.

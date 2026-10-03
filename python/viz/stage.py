@@ -173,7 +173,8 @@ class VizUI:
             self.show_cams_tab()
             return True
         if key in (ord("r"), ord("R")):
-            # Review capture. Does not quit and does not stop BeamNG.tech.
+            # Review capture. ASCII R is 82. Qt Up is 65362, not 82.
+            # Does not quit and does not stop BeamNG.tech.
             self.debug.review_record = not self.debug.review_record
             self.show_nerd = True
             return True
@@ -197,18 +198,21 @@ class VizUI:
             n = max(1, len(CONTROL_ROWS))
             sel_attr = "debug_sel"
             row_fn = row_at
-        if key in (82, 0, ord("k")):  # up
+        # waitKeyEx arrows. Qt/X11: 65362/65364/65361/65363. Win32: 2490368 and
+        # the 0x00xx0000 set. Windows waitKey() & 0xFF still reports Up as 0.
+        # 82 is ASCII R, so it is review capture and not Up.
+        if key in (0, 65362, 2490368, ord("k")):  # up
             setattr(self, sel_attr, (int(getattr(self, sel_attr)) - 1) % n)
             return True
-        if key in (84, 1, ord("j")):  # down
+        if key in (1, 65364, 2621440, ord("j")):  # down
             setattr(self, sel_attr, (int(getattr(self, sel_attr)) + 1) % n)
             return True
         row = row_fn(int(getattr(self, sel_attr)))
-        if key in (81, 2, ord("h")):  # left
+        if key in (2, 65361, 2424832, ord("h")):  # left
             self.debug.nudge(row, -1)
             self.sync_layers_from_debug()
             return True
-        if key in (83, 3, ord("l")):  # right
+        if key in (3, 65363, 2555904, ord("l")):  # right
             self.debug.nudge(row, +1)
             self.sync_layers_from_debug()
             return True

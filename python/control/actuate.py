@@ -40,8 +40,7 @@ TECH_SHIFT_MODE = "arcade"
 # Player arrows/pedals expect arcade. Restored only on the Disengage handoff.
 TECH_PLAYER_SHIFT_MODE = "arcade"
 TECH_HOLD_BRAKE = 0.99
-# Below this, a full brake is a rest hold (parkingbrake on). Rolling AEB keeps PB off.
-TECH_HOLD_SPEED_MPS = 0.5
+# A full hold ignores speed and always sets the parking brake.
 TECH_HOLD_GEAR = 0
 TECH_DRIVE_GEAR = 1
 # Let neutralSelectionDelay (~0.5 s) finish before asking the lever to move again.
@@ -353,8 +352,8 @@ def tech_control_kwargs(
     Shift mode stays arcade. Throttle>0 pins gear>=1 and clutch=0. A hold,
     stop, or AEB (throttle ~0 and brake >= 0.99) is parkingbrake=1, service
     brake 0, gear 0. Arcade treats that held service brake, with no throttle,
-    as reverse — gear 0 does not make it safe, and dropping the parking brake
-    above 0.5 m/s is the same pattern. gear is int only; never -1, never letter D.
+    as reverse — gear 0 does not make it safe. The hold ignores speed and
+    always sets the parking brake. gear is int only; never -1, never letter D.
     """
     del speed_mps  # moving or stopped, the reverse pedal stays off
     if release:

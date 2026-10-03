@@ -155,6 +155,25 @@ def test_ui_keys_clicks() -> None:
     n = len(CONTROL_ROWS)
     ui.handle_key(ord("j"))
     assert ui.debug_sel == 1 % n
+    # Windows Up is 0. Qt/X11 waitKeyEx Up is 65362. Win32 waitKeyEx Up is 2490368.
+    # 82 is ASCII R, so it records a review and does not move the row.
+    ui.handle_key(0)
+    assert ui.debug_sel == 0
+    ui.handle_key(2490368)
+    assert ui.debug_sel == (n - 1) % n
+    ui.nerd_tab = "viz"
+    ui.viz_sel = 2
+    assert ui.handle_key(65362) is True
+    assert ui.viz_sel == 1
+    assert ui.debug.review_record is False
+    assert ui.handle_key(ord("R")) is True
+    assert ui.debug.review_record is True
+    assert ui.viz_sel == 1
+    ui.nerd_tab = "live"
+    assert ui.handle_key(65362) is False
+    assert ui.debug.review_record is True
+    ui.debug.review_record = False
+    ui.show_drive_tab()
     allow = row_at(0)
     ui.debug_sel = 0
     ui.handle_key(ord(" "))

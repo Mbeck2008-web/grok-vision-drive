@@ -1,13 +1,15 @@
 """Lane graph + road edges for the viz layer (ego frame: x right, y forward).
 
-Honesty: `estimate_lanes` only recovers the ego lane's left/right boundaries from Hough
-segments. Everything wider than that is a *lateral offset* of a boundary we actually saw,
-tagged `kind="predicted"`, and is only produced when a detected boundary exists to anchor
-it. No detected lane → no predicted lane, no road edge. Offsets are flat-road and assume
-the neighbouring lanes run parallel to ours; that holds in the near field and is why the
-app draws predicted geometry dimmer and dashed.
+The live writer is ``lanes_ext_for_live``. It keeps every boundary the fit
+returned and tags those lines ``detected``. A line outside the ego pair is
+that fit, not a sideways copy. No fit means no lane paint and no road edge.
+The kerb is predicted: 0.4 m outside the outermost real line. Predicted
+geometry is drawn dimmer and dashed.
 
-Nothing here feeds the planner. Corridor, CIPV and AEB keep using `lanes_bev` as before.
+``lanes_ext(..., predict=True)`` can still offset a seen boundary. The live
+path does not call it that way.
+
+Nothing here feeds the planner. Corridor, CIPV and AEB keep using ``lanes_bev``.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ LANE_W_MIN = 2.6
 LANE_W_MAX = 4.6
 LANE_W_DEFAULT = 3.5
 LANE_CONF_MIN = 0.25       # below this the Hough fit is too weak to hang predictions on
-EDGE_SHOULDER_M = 0.4      # curb sits just outside the outermost predicted boundary
+EDGE_SHOULDER_M = 0.4      # curb sits just outside the outermost boundary on that side
 MAX_POLYS = 8
 NEIGHBOUR_LANES = 2   # boundaries offset per side: enough for a multi-lane fan, not clutter
 # Pillar/repeat cameras are the only ones that can justify a neighbour lane.
@@ -133,23 +135,16 @@ def lanes_ext_for_live(
     lane_conf: float,
     live_ids: set[str] | frozenset[str] | None,
 ) -> list[dict[str, Any]]:
-    """Lane graph for the cameras that actually delivered a frame.
+    """Boundaries the fit returned. No fixed neighbour fan.
 
-    `live_ids is None` keeps the legacy fan (callers that do not know the rig).
-    No live pillar/repeat camera → detected ego boundaries only, so a main-only
-    hitch cannot draw "1–2 seen + 5 pred". Each live side camera allows one
-    predicted step, capped at `NEIGHBOUR_LANES`.
+    A one-lane road stays the boundaries that were seen. A wider road stays
+    every extra boundary the fit actually returned. Side cameras do not
+    invent parallel copies, and a missing edge is not filled with a straight
+    offset. `live_ids` is accepted so callers can still pass the hitch set;
+    it does not change the count.
     """
-    if live_ids is None:
-        return lanes_ext(lanes_bev, lane_conf)
-    sides = {str(cid) for cid in live_ids} & SIDE_LANE_CAMS
-    if not sides:
-        return lanes_ext(lanes_bev, lane_conf, neighbours=0, predict=False)
-    return lanes_ext(
-        lanes_bev,
-        lane_conf,
-        neighbours=min(NEIGHBOUR_LANES, len(sides)),
-    )
+    del live_ids
+    return lanes_ext(lanes_bev, lane_conf, neighbours=0, predict=False)
 
 
 _HEALTH_DELIVERED = ("ok", "stale")
@@ -204,14 +199,15 @@ def road_edges(lanes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Curb line just outside the outermost boundary on each side.
 
     Always `kind="predicted"`: nothing in the stack detects a kerb, so this is the edge of
-    the road we *assume* given the lanes we can see.
+    the road we *assume* given the lanes we can see. Live extras on one side share
+    index ±2, so the outer line is the one furthest out, not the first max-|index|.
     """
     edges: list[dict[str, Any]] = []
     for side, sign in (("left", -1.0), ("right", 1.0)):
-        cands = [l for l in lanes if l.get("side") == side and l.get("points")]
+        cands = [ln for ln in lanes if ln.get("side") == side and ln.get("points")]
         if not cands:
             continue
-        outer = max(cands, key=lambda l: abs(int(l.get("index", 0))))
+        outer = max(cands, key=lambda ln: sign * _mean_x(ln["points"]))
         edges.append({
             "points": _shift(outer["points"], sign * EDGE_SHOULDER_M),
             "kind": "predicted",

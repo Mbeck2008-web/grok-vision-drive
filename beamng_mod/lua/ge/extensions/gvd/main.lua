@@ -37,8 +37,8 @@ local stripAcc = 0
 -- M6 retail drive state (gvd_cmd.json → player vehicle; electrics echo → gvd_ego.json)
 local CMD_POLL_S = 0.05      -- 20 Hz apply
 -- Dead-man timers (wall / seq age): STALE = brake hold; DEAD = release + disengage.
--- STALE matches Python HEARTBEAT_STALE_S (0.35). DEAD is short (1.0s) so a dead
--- supervisor doesn't leave the car braked indefinitely — was 3.0s, soft-tightened.
+-- CMD_STALE stays 0.35 s. The link uses HB_STALE_S, which is longer so one
+-- grab hitch does not flash the link stale and paint HOLD.
 local CMD_STALE_S = 0.35     -- no new seq for this long → brake hold (dead-man)
 local CMD_DEAD_S = 1.0       -- stream dead this long while we hold the car → release + disengage
 local EGO_POLL_S = 0.10      -- 10 Hz electrics echo whenever a player vehicle exists (HUD + gvd_ego.json)
@@ -67,7 +67,7 @@ local AGENT_PATH_MAX_M = 8.0
 local Z_BIAS = 0.10  -- dual-viz: reduce z-fight on pavement
 local DEFAULT_WIDTH = 2.0
 local MAX_TRACK_GHOSTS = 16
-local HB_STALE_S = 0.35
+local HB_STALE_S = 1.5      -- matches Python HEARTBEAT_STALE_S; a hitch is not a stale link
 
 -- Caps for the geometry we hand to the in-game app (keep the guihooks payload small)
 local UI_PATH_PTS = 28

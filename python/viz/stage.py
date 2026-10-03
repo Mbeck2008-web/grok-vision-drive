@@ -1,6 +1,6 @@
 """GVD VISION cabin stage (OpenCV). Chase 3/4 bird default; BEV via T.
 
-Lexicon (second-screen product viz): void stage, multi-lane fan, ice-blue ego
+Lexicon (second-screen product viz): void stage, seen lane lines, ice-blue ego
 corridor + stop bar, agent boxes (CIPV / in-path / BRAKE), warm curbs,
 sign/light glyphs. Driven from gvd_state.json. Titles stay GVD / VISION.
 """
@@ -44,6 +44,7 @@ from python.viz.debug_draw import (
     draw_planner_cost,
 )
 from python.perception.road_model import paint_lane_behind, suppress_lane_fan
+from python.viz.lane_roles import classify_lane_roles
 from python.runtime.state_io import steer_preview_path_ego
 from python.viz.forecast import predict_modes
 from python.viz.nerd import NERD_WIDTH, hit_test, render_panel, scene_note
@@ -91,6 +92,9 @@ class VizUI:
     viz_sel: int = 0
     model_sel: int = 0
     nerd_hits: list = field(default_factory=list)
+    # Tab or row under the pointer. render_panel paints it. None when the
+    # pointer is not on a selectable item.
+    hover: dict | None = None
     nerd_width: int = NERD_WIDTH
     # Recent DRIVE-tab pedal samples. The viz appends one per frame; the drive loop does not read it.
     pedal_trace: list = field(default_factory=list)
@@ -168,6 +172,12 @@ class VizUI:
         if key in (ord("a"), ord("A")):
             self.show_cams_tab()
             return True
+        if key in (ord("r"), ord("R")):
+            # Review capture. ASCII R is 82. Qt Up is 65362, not 82.
+            # Does not quit and does not stop BeamNG.tech.
+            self.debug.review_record = not self.debug.review_record
+            self.show_nerd = True
+            return True
         if key == ord("["):
             self.cycle_tab(-1)
             return True
@@ -188,18 +198,21 @@ class VizUI:
             n = max(1, len(CONTROL_ROWS))
             sel_attr = "debug_sel"
             row_fn = row_at
-        if key in (82, 0, ord("k")):  # up
+        # waitKeyEx arrows. Qt/X11: 65362/65364/65361/65363. Win32: 2490368 and
+        # the 0x00xx0000 set. Windows waitKey() & 0xFF still reports Up as 0.
+        # 82 is ASCII R, so it is review capture and not Up.
+        if key in (0, 65362, 2490368, ord("k")):  # up
             setattr(self, sel_attr, (int(getattr(self, sel_attr)) - 1) % n)
             return True
-        if key in (84, 1, ord("j")):  # down
+        if key in (1, 65364, 2621440, ord("j")):  # down
             setattr(self, sel_attr, (int(getattr(self, sel_attr)) + 1) % n)
             return True
         row = row_fn(int(getattr(self, sel_attr)))
-        if key in (81, 2, ord("h")):  # left
+        if key in (2, 65361, 2424832, ord("h")):  # left
             self.debug.nudge(row, -1)
             self.sync_layers_from_debug()
             return True
-        if key in (83, 3, ord("l")):  # right
+        if key in (3, 65363, 2555904, ord("l")):  # right
             self.debug.nudge(row, +1)
             self.sync_layers_from_debug()
             return True
@@ -243,6 +256,22 @@ class VizUI:
             self.sync_layers_from_debug()
             return True
         return False
+
+    def handle_hover(self, x: int, y: int, *, stage_w: int) -> None:
+        """Remember the selectable tab or row under the pointer."""
+        if not self.show_nerd or 0 in self.layers or x < stage_w:
+            self.hover = None
+            return
+        hit = hit_test(self.nerd_hits, x - stage_w, y)
+        if not hit or hit.get("kind") not in ("tab", "row"):
+            self.hover = None
+            return
+        self.hover = {
+            "kind": hit.get("kind"),
+            "id": hit.get("id"),
+            "i": hit.get("i"),
+            "part": hit.get("part"),
+        }
 
 
 @dataclass(frozen=True)
@@ -715,39 +744,15 @@ def _clip_poly_y(pts: list[dict[str, float]], y_lo: float, y_hi: float) -> list[
 def _extend_predicted(
     pts: list[dict[str, float]], y_lo: float, y_hi: float,
 ) -> list[list[dict[str, float]]]:
-    """Dashed continuation of a short detected poly. Does not repeat one point as a wall."""
-    if len(pts) < 2:
-        return []
-    pieces: list[list[dict[str, float]]] = []
-    y0, y1 = pts[0]["y"], pts[-1]["y"]
-    if y1 < y_hi - 0.5:
-        a, b = pts[-2], pts[-1]
-        dy = b["y"] - a["y"]
-        slope = 0.0 if abs(dy) < 1e-6 else (b["x"] - a["x"]) / dy
-        ext = [dict(b)]
-        y, x = b["y"], b["x"]
-        while y < y_hi - 1e-3:
-            step = min(8.0, y_hi - y)
-            y += step
-            x += slope * step
-            ext.append({"x": x, "y": y})
-        if len(ext) >= 2:
-            pieces.append(ext)
-    if y0 > y_lo + 0.5:
-        a, b = pts[0], pts[1]
-        dy = b["y"] - a["y"]
-        slope = 0.0 if abs(dy) < 1e-6 else (b["x"] - a["x"]) / dy
-        ext = [dict(a)]
-        y, x = a["y"], a["x"]
-        while y > y_lo + 1e-3:
-            step = min(8.0, y - y_lo)
-            y -= step
-            x -= slope * step
-            ext.append({"x": x, "y": y})
-        ext.reverse()
-        if len(ext) >= 2:
-            pieces.append(ext)
-    return pieces
+    """No invented straight tail.
+
+    The stroke is the seen and predicted points themselves. Continuing the
+    last heading in a straight line past that end fills the view with a rigid
+    line the road did not give us, including after a curve. Callers stop at
+    the last point.
+    """
+    del pts, y_lo, y_hi
+    return []
 
 
 def _stroke_world(
@@ -842,41 +847,67 @@ def _lane_span(cam: Cam, state: dict[str, Any] | None) -> tuple[float, float]:
     return y_lo, y_hi
 
 
-def _draw_lanes(img: np.ndarray, lanes: list, cam: Cam, *, smoke: bool, state: dict[str, Any] | None = None) -> None:
-    y_lo, y_hi = _lane_span(cam, state)
+def drawn_lane_records(
+    state: dict[str, Any] | None,
+    lanes: list | None = None,
+    cam: Cam | None = None,
+) -> list[dict[str, Any]]:
+    """Boundaries the cabin strokes, each tagged through, merge, or exit.
+
+    Points are the ones that get drawn. Nothing is added past the last sample.
+    """
+    state = state or {}
+    if cam is None:
+        draw = resolve_draw_range(state)
+        cam = Cam(ahead_m=draw.ahead_m, behind_m=draw.behind_m, fade_frac=draw.fade_frac)
+    src = lanes if lanes is not None else (state.get("lanes_ext") or state.get("lanes") or [])
+    smoke = _allow_stub(state)
     hide_fan = suppress_lane_fan(state)
-    for ln in lanes or []:
+    y_lo, y_hi = _lane_span(cam, state)
+    pending: list[dict[str, Any]] = []
+    for ln in src or []:
         kind = ln.get("kind") if isinstance(ln, dict) else None
         if hide_fan and str(kind or "") == "predicted":
             continue
-        mode = lane_draw_mode(kind, smoke=smoke)
-        if mode is None:
+        if lane_draw_mode(kind, smoke=smoke) is None:
             continue
         pts = _clip_poly_y(_poly_points(ln), y_lo, y_hi)
         if len(pts) < 2:
             continue
-        idx = 1
         if isinstance(ln, dict):
-            try:
-                idx = int(ln.get("index") if ln.get("index") is not None else ln.get("idx") or 1)
-            except (TypeError, ValueError):
-                idx = 1
+            pending.append({**ln, "points": pts})
+        else:
+            pending.append({"points": pts, "kind": "detected"})
+    return classify_lane_roles(pending)
+
+
+def _draw_lanes(img: np.ndarray, lanes: list, cam: Cam, *, smoke: bool, state: dict[str, Any] | None = None) -> None:
+    del smoke  # drawn_lane_records reads viz_smoke off state; callers still pass it
+    records = drawn_lane_records(state, lanes, cam)
+    if state is not None:
+        state["viz_drawn_lanes"] = records
+    for ln in records:
+        pts = ln["points"]
+        kind = ln.get("kind")
+        mode = lane_draw_mode(kind, smoke=_allow_stub(state or {}))
+        if mode is None:
+            continue
+        idx = 1
+        try:
+            idx = int(ln.get("index") if ln.get("index") is not None else ln.get("idx") or 1)
+        except (TypeError, ValueError):
+            idx = 1
         outer = max(0, abs(idx) - 1)
         fade = max(0.35, 1.0 - 0.22 * outer)
-        style = str(ln.get("style") or "unknown") if isinstance(ln, dict) else "unknown"
+        style = str(ln.get("style") or "unknown")
         dashed = mode == "dashed" or style == "dashed"
         color, thick, dash_default = _lane_color(mode, fade)
+        # Follow every point on this boundary. A curve stays a curve through
+        # the last seen or predicted sample. Nothing is added past that sample.
         _stroke_world(
             img, cam, pts, color, thick,
             dashed=dashed or dash_default, dash=10 if mode == "solid" and not dashed else 8, gap=5,
         )
-        # A finished piece (extend: false) is the road that is already drawn.
-        # Short live paint is still extended as predicted dashes.
-        if isinstance(ln, dict) and ln.get("extend") is False:
-            continue
-        ext_color, ext_thick, _ = _lane_color("dashed", fade * 0.85)
-        for ext in _extend_predicted(pts, y_lo, y_hi):
-            _stroke_world(img, cam, ext, ext_color, ext_thick, dashed=True, dash=8, gap=6)
 
 
 def _draw_edge_piece(
@@ -913,17 +944,6 @@ def _draw_edges(img: np.ndarray, edges: list, cam: Cam, state: dict[str, Any] | 
         if len(far) >= 2 and far[-1]["y"] > fade_y + 0.5:
             mid = 0.5 * (far[0]["y"] + far[-1]["y"])
             _draw_edge_piece(img, cam, far, solid=solid, alpha=_furniture_alpha(cam, mid))
-        for ext in _extend_predicted(raw, y_lo, y_hi):
-            ext_near = [p for p in ext if p["y"] <= fade_y + 1e-6]
-            ext_far = [p for p in ext if p["y"] >= fade_y - 1e-6]
-            if len(ext_near) >= 2:
-                _draw_edge_piece(img, cam, ext_near, solid=False, alpha=0.85)
-            if len(ext_far) >= 2 and ext_far[-1]["y"] > fade_y + 0.5:
-                mid = 0.5 * (ext_far[0]["y"] + ext_far[-1]["y"])
-                _draw_edge_piece(
-                    img, cam, ext_far, solid=False,
-                    alpha=0.85 * _furniture_alpha(cam, mid),
-                )
 
 
 def _draw_signs(img: np.ndarray, signs: list, cam: Cam) -> None:
@@ -1882,7 +1902,8 @@ def smoke(
     if not st.get("lanes_ext"):
         # --smoke has no camera, so the Hough fit finds nothing. Give the stage
         # something to draw, tagged kind="stub" so it can never read as a live detection.
-        # Author the full cabin span. Live Hough stays short; the drawer may dash-extend it.
+        # Author the full cabin span. Live paint is only the points that exist;
+        # the drawer does not continue them in a straight line.
         span_draw = resolve_draw_range(st)
         span = _span_ys(-span_draw.behind_m, span_draw.ahead_m, 3.0)
 

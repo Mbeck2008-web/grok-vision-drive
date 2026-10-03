@@ -600,7 +600,149 @@ def check_soft_esc_engage_rising_edge() -> None:
             engage.write_bytes(prev_bytes)
 
 
+def check_bot_engage_forces_sensor_poll() -> None:
+    """A fresh gvd_bot_engage.json polls on the rising edge. A stale file does not.
+
+    The latch is still false and gvd_engage.json is off. The 200 ms Soft Esc
+    window would otherwise republish the cached speed.
+    """
+    import time
+
+    import python.control.actuate as act
+    from python.sensors.tech import TechSession
+
+    class EgoSensors(dict):
+        def __init__(self) -> None:
+            super().__init__()
+            self.n = 0
+            self.speed = 3.0
+
+        def poll(self) -> None:
+            self.n += 1
+            self.clear()
+            self["electrics"] = {
+                "wheelspeed": float(self.speed),
+                "steering_input": 0.2,
+                "throttle_input": 0.0,
+                "brake_input": 0.0,
+            }
+            return None
+
+    class EgoVeh:
+        vid = "etk_player"
+        options = {"model": "etk800"}
+
+        def __init__(self) -> None:
+            self.sensors = EgoSensors()
+            self.state = {
+                "pos": (1.0, 2.0, 0.0),
+                "dir": (0.0, 1.0, 0.0),
+                "up": (0.0, 0.0, 1.0),
+                "vel": (0.0, 3.0, 0.0),
+            }
+
+    prev_latch = act.soft_esc_sensors_every_tick()
+    engage = act.engage_path()
+    bot = act.bot_engage_path()
+    prev_engage = engage.read_bytes() if engage.is_file() else None
+    prev_bot = bot.read_bytes() if bot.is_file() else None
+    session = TechSession({"wait_vehicle_s": 0, "sensors": {"electrics": True}})
+    veh = EgoVeh()
+    session.vehicle = veh
+    session.attached = {"electrics": True}
+    try:
+        act.note_soft_esc_engaged(False)
+        act.write_engage_flag(False)
+        act.write_bot_engage(False)
+        assert act.soft_esc_sensors_every_tick() is False
+        assert act.read_engage_flag(default=False) is False
+        assert act.bot_engage_fresh() is False
+
+        first = session.poll()
+        assert veh.sensors.n == 1
+        assert first.speed_mps == 3.0
+        session._sensors_poll_mono = time.monotonic()
+        held = session.poll()
+        assert veh.sensors.n == 1
+        assert "coalesced" in held.note
+        assert held.speed_mps == 3.0
+
+        veh.sensors.speed = 11.0
+        veh.state["pos"] = (11.0, 1.0, 0.0)
+        veh.state["vel"] = (0.0, 11.0, 0.0)
+        act.write_bot_engage(True)
+        assert act.bot_engage_fresh() is True
+        assert act.soft_esc_sensors_every_tick() is False
+        session._sensors_poll_mono = time.monotonic()
+        rising = session.poll()
+        assert veh.sensors.n == 2
+        assert rising.speed_mps == 11.0
+        assert rising.pos == (11.0, 1.0, 0.0)
+        assert "coalesced" not in (rising.note or "")
+
+        act.write_bot_engage(True, mtime=time.time() - 10.0)
+        assert act.bot_engage_fresh() is False
+        veh.sensors.speed = 4.0
+        session._sensors_poll_mono = time.monotonic()
+        stale = session.poll()
+        assert veh.sensors.n == 2
+        assert stale.speed_mps == 11.0
+        assert "coalesced" in stale.note
+    finally:
+        act.note_soft_esc_engaged(prev_latch)
+        if prev_engage is None:
+            engage.unlink(missing_ok=True)
+        else:
+            engage.write_bytes(prev_engage)
+        if prev_bot is None:
+            bot.unlink(missing_ok=True)
+        else:
+            bot.write_bytes(prev_bot)
+
+
+def check_bot_engage() -> None:
+    """A fresh bot file latches. off, override clear, and a stale true do not drive."""
+    import time
+
+    from python.control.actuate import BotEngage, bot_engage_path, write_bot_engage
+
+    path = bot_engage_path()
+    prev = path.read_bytes() if path.is_file() else None
+    try:
+        latch = BotEngage()
+        write_bot_engage(True)
+        assert latch.poll() is True
+        assert latch.poll(now=time.time() + 30.0) is True
+        write_bot_engage(False)
+        assert latch.poll() is False
+
+        stale = BotEngage()
+        write_bot_engage(True, mtime=time.time() - 10.0)
+        assert stale.poll() is False
+        write_bot_engage(True)
+        assert stale.poll() is True
+        stale.clear()
+        assert stale.poll() is False
+        write_bot_engage(True)
+        assert stale.poll() is True
+
+        from scripts.bot_engage import main as bot_main
+
+        cmd = BotEngage()
+        assert bot_main(["on"]) == 0
+        assert cmd.poll() is True
+        assert bot_main(["off"]) == 0
+        assert cmd.poll() is False
+        assert bot_main([]) == 2
+    finally:
+        if prev is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_bytes(prev)
+
+
 def main() -> None:
+    check_bot_engage()
     # 2) stale heartbeat → zero throttle + brake
     cmd = safe_command(
         engaged=True,
@@ -613,7 +755,9 @@ def main() -> None:
         seq=1,
     )
     assert cmd.throttle == 0.0 and cmd.brake == 1.0 and cmd.reason == "heartbeat_stale", cmd
-    assert heartbeat_fresh(__import__("time").time() - 1.0) is False
+    # 1.0 s is a grab hitch, not a dead supervisor. 2.0 s is a stale link.
+    assert heartbeat_fresh(__import__("time").time() - 1.0) is True
+    assert heartbeat_fresh(__import__("time").time() - 2.0) is False
     assert heartbeat_fresh(__import__("time").time()) is True
 
     # 3) preview path → no actuate unless flag
@@ -681,14 +825,19 @@ def main() -> None:
 
     rest = tech_control_kwargs(0.0, 0.0, 1.0)
     assert rest["gear"] == TECH_HOLD_GEAR == 0
-    assert rest["brake"] == 1.0 and rest["parkingbrake"] == 1.0
+    assert rest["throttle"] == 0.0 and rest["brake"] == 0.0 and rest["parkingbrake"] == 1.0
     assert rest.get("gear") != -1
     assert not is_reverse_control(rest)
     assert not is_arcade_reverse_hold(rest)
     assert is_reverse_control({"gear": -1})
     assert is_arcade_reverse_hold({"steering": 0.0, "throttle": 0.0, "brake": 1.0})
+    # Gear 0 does not make a held service brake safe, stopped or rolling.
+    assert is_arcade_reverse_hold({"throttle": 0.0, "brake": 1.0, "gear": 0, "parkingbrake": 0.0})
+    assert is_arcade_reverse_hold({"throttle": 0.0, "brake": 1.0, "gear": 0, "parkingbrake": 1.0})
     rolling = tech_control_kwargs(0.1, 0.0, 1.0, speed_mps=12.0)
-    assert rolling["brake"] == 1.0 and rolling["parkingbrake"] == 0.0 and rolling["gear"] == 0
+    assert rolling["brake"] == 0.0 and rolling["parkingbrake"] == 1.0 and rolling["gear"] == 0
+    assert rolling["throttle"] == 0.0
+    assert not is_arcade_reverse_hold(rolling)
     assert rolling.get("gear") != -1
     drive_kw = tech_control_kwargs(0.2, 0.4, 0.0)
     assert drive_kw["throttle"] == 0.4 and drive_kw["parkingbrake"] == 0.0
@@ -704,8 +853,8 @@ def main() -> None:
     assert rel.get("gear", 0) != -1
 
     # Tech: disengaged must not call vehicle.control (no brake takeover). One zero
-    # release on the falling edge, then silence. Engaged stop/hold: realistic_automatic,
-    # gear=0 + brake ±parkingbrake, never gear=-1. Drive pins gear>=1.
+    # release on the falling edge, then silence. Engaged stop/hold/AEB stay arcade:
+    # parkingbrake=1, service brake 0, gear=0. Drive pins gear>=1. Never gear=-1.
     class FakeVeh:
         def __init__(self) -> None:
             self.calls: list[dict] = []
@@ -749,7 +898,9 @@ def main() -> None:
     assert drive.applied is True and veh.calls[-1]["throttle"] == 0.4
     assert veh.calls[-1].get("parkingbrake", 0.0) == 0.0
     assert veh.calls[-1]["gear"] >= TECH_DRIVE_GEAR
-    assert veh.shifts == [TECH_SHIFT_MODE] and TECH_SHIFT_MODE == "realistic_automatic"
+    assert veh.shifts == [TECH_SHIFT_MODE] and TECH_SHIFT_MODE == "arcade"
+    assert "setGearboxMode('arcade')" in TECH_DRIVE_SHIFT_LUA
+    assert "setGearboxMode('realistic')" not in TECH_DRIVE_SHIFT_LUA
     _assert_no_reverse(veh.calls[-1])
 
     hold = tech.stop(seq=3, reason="preview_blocked")
@@ -757,7 +908,7 @@ def main() -> None:
     kw = veh.calls[-1]
     _assert_no_reverse(kw)
     assert kw["gear"] == TECH_HOLD_GEAR == 0
-    assert kw["brake"] == 1.0 and kw["parkingbrake"] == 1.0
+    assert kw["brake"] == 0.0 and kw["parkingbrake"] == 1.0 and kw["throttle"] == 0.0
 
     aeb_cmd = plan_command(
         path_ego=[{"x": 0, "y": float(i), "z": 0} for i in range(12)],
@@ -769,7 +920,8 @@ def main() -> None:
     aeb_out = tech.apply(aeb_cmd)
     assert aeb_out.applied is True and aeb_out.brake == 1.0
     _assert_no_reverse(veh.calls[-1])
-    assert veh.calls[-1]["gear"] == 0 and veh.calls[-1]["brake"] == 1.0
+    assert veh.calls[-1]["gear"] == 0 and veh.calls[-1]["brake"] == 0.0
+    assert veh.calls[-1]["parkingbrake"] == 1.0 and veh.calls[-1]["throttle"] == 0.0
 
     class MovingVeh(FakeVeh):
         def __init__(self) -> None:
@@ -783,7 +935,8 @@ def main() -> None:
     tech_m.note_engaged(True)
     tech_m.apply(DriveCommand(steer=0.0, throttle=0.0, brake=1.0, seq=31, reason="ok"))
     mkw = moving.calls[-1]
-    assert mkw["brake"] == 1.0 and mkw["parkingbrake"] == 0.0 and mkw["gear"] == 0
+    assert mkw["brake"] == 0.0 and mkw["parkingbrake"] == 1.0 and mkw["gear"] == 0
+    assert mkw["throttle"] == 0.0
     _assert_no_reverse(mkw)
 
     class NoGearVeh:
@@ -799,7 +952,7 @@ def main() -> None:
     tech_ng = BeamNGPyActuator(ng)
     tech_ng.note_engaged(True)
     tech_ng.stop(seq=32, reason="preview_blocked")
-    assert ng.calls[-1]["brake"] == 1.0 and ng.calls[-1]["parkingbrake"] == 1.0
+    assert ng.calls[-1]["brake"] == 0.0 and ng.calls[-1]["parkingbrake"] == 1.0
     assert "gear" not in ng.calls[-1]
     _assert_no_reverse(ng.calls[-1])
 
@@ -830,7 +983,8 @@ def main() -> None:
     # Hold left brake=1 on the car; Disengage must zero it and release AI, not leave brake=1.
     tech.note_engaged(True)
     held = tech.stop(seq=6, reason="preview_blocked")
-    assert held.applied is True and held.brake == 1.0 and veh.calls[-1]["brake"] == 1.0
+    assert held.applied is True and held.brake == 1.0 and veh.calls[-1]["brake"] == 0.0
+    assert veh.calls[-1]["parkingbrake"] == 1.0
     assert veh.shifts[-1] == TECH_SHIFT_MODE
     tech.note_engaged(False)
     n_hold = len(veh.calls)
@@ -849,7 +1003,8 @@ def main() -> None:
     again = json.loads(cmd_path().read_text(encoding="utf-8"))
     assert again["brake"] == 0.0 and again["throttle"] == 0.0 and again["engaged"] is False
 
-    # Falling-edge release with the shifter never armed must not call realistic_automatic.
+    # Falling-edge release with the shifter never armed restores arcade and
+    # does not latch the drive shifter.
     bare = FakeVeh()
     tech_bare = BeamNGPyActuator(bare)
     tech_bare._latched = True
@@ -858,8 +1013,7 @@ def main() -> None:
     bare_edge = tech_bare.stop(seq=40, reason="not_engaged")
     assert bare_edge.throttle == 0.0 and bare_edge.brake == 0.0
     assert bare.calls[-1] == {"steering": 0.0, "throttle": 0.0, "brake": 0.0, "parkingbrake": 0.0}
-    assert TECH_SHIFT_MODE not in bare.shifts, bare.shifts
-    assert bare.shifts == [TECH_PLAYER_SHIFT_MODE]
+    assert bare.shifts == [TECH_PLAYER_SHIFT_MODE] == ["arcade"]
     assert bare.ai_modes == ["disabled"]
     assert tech_bare._latched is False and tech_bare._shift_set is False
     n_bare = len(bare.calls)
@@ -874,7 +1028,8 @@ def main() -> None:
 
         def set_shift_mode(self, mode: str) -> None:
             self.shifts.append(mode)
-            if mode == TECH_PLAYER_SHIFT_MODE and not self.arcade_ok:
+            # The first arcade call is the drive arm. Later calls are the handoff.
+            if len(self.shifts) > 1 and mode == TECH_PLAYER_SHIFT_MODE and not self.arcade_ok:
                 raise RuntimeError("arcade handoff failed")
 
     fail = ArcadeFailVeh()
@@ -889,12 +1044,12 @@ def main() -> None:
     assert fail.shifts == [TECH_SHIFT_MODE, TECH_PLAYER_SHIFT_MODE]
     assert tech_fail._latched is True and tech_fail._shift_set is True
     n_fail = len(fail.calls)
-    n_realistic = fail.shifts.count(TECH_SHIFT_MODE)
+    n_shifts = len(fail.shifts)
     tech_fail.stop(seq=44, reason="not_engaged")
-    assert tech_fail._latched is True
+    assert tech_fail._latched is True and tech_fail._shift_set is True
     assert len(fail.calls) == n_fail + 1
     assert fail.calls[-1]["brake"] == 0.0 and fail.calls[-1]["parkingbrake"] == 0.0
-    assert fail.shifts.count(TECH_SHIFT_MODE) == n_realistic
+    assert len(fail.shifts) == n_shifts + 1
     assert fail.shifts[-1] == TECH_PLAYER_SHIFT_MODE
     fail.arcade_ok = True
     n_retry = len(fail.calls)
@@ -915,6 +1070,7 @@ def main() -> None:
     check_grab_loop_poll_before_electrics()
     check_electrics_segment_timer()
     check_soft_esc_engage_rising_edge()
+    check_bot_engage_forces_sensor_poll()
     check_soft_esc_heartbeat_coalesce()
 
     print("test_m3_actuate: OK")

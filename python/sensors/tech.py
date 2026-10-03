@@ -5,9 +5,10 @@ Soft Esc (supervisor engaged=false): at most one ``vehicle.sensors.poll`` per
 ego map and does not send ``PollGPSGE``. A reused GPS sample is
 ``sensors["gps"]="stale"`` (same contract as the GPS window below): lat/lon
 stay, and it is not a new fix. Skipped polls record 0 ms. Before that hold,
-``poll`` reads ``read_engage_flag`` and the engage latch. A live
-``gvd_engage.json`` refuses last-good on the rising edge, where the grab loop
-has not called ``note_engaged`` yet. Engage keeps Tip #1: one
+``poll`` reads ``read_engage_flag``, a fresh ``gvd_bot_engage.json`` (same
+2.5 s window), and the engage latch. Either live file refuses last-good on
+the rising edge, where the grab loop has not called ``note_engaged`` yet.
+Engage keeps Tip #1: one
 ``vehicle.sensors.poll`` every grab. ``PollGPSGE`` stays on ``GPS_POLL_PERIOD_S``.
 Camera RGB is handled by cameras.py. GPS is a coarse nav hint, not localization.
 LiDAR / radar / AdvancedIMU attach when config/sensors.yaml enables them — Foxglove /
@@ -1850,14 +1851,20 @@ class TechSession:
         """True when Engage requires a real ``sensors.poll`` on this grab.
 
         The grab loop calls ``note_engaged`` after ``poll_vehicle``, so the
-        latch is still false on the rising edge. Lua has already written
-        ``gvd_engage.json``. Either signal refuses Soft Esc-hold.
+        latch is still false on the rising edge. A live ``gvd_engage.json``
+        or a fresh ``gvd_bot_engage.json`` (``ENGAGE_FRESH_S``) refuses the hold.
         """
-        from python.control.actuate import read_engage_flag, soft_esc_sensors_every_tick
+        from python.control.actuate import (
+            bot_engage_fresh,
+            read_engage_flag,
+            soft_esc_sensors_every_tick,
+        )
 
         if soft_esc_sensors_every_tick():
             return True
-        return bool(read_engage_flag(default=False))
+        if read_engage_flag(default=False):
+            return True
+        return bot_engage_fresh()
 
     def _soft_esc_hold(self, vehicle: Any) -> bool:
         """True when this Soft Esc grab must not send ``vehicle.sensors.poll``.

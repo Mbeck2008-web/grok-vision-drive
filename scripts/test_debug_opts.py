@@ -26,6 +26,7 @@ from python.runtime.debug_opts import (
     row_at,
     viz_row_at,
 )
+from python.viz.nerd import HOVER_EDGE, image_point_from_window_mouse
 from python.viz.stage import STAGE_H, STAGE_W, VizUI, render_stage
 
 
@@ -154,6 +155,25 @@ def test_ui_keys_clicks() -> None:
     n = len(CONTROL_ROWS)
     ui.handle_key(ord("j"))
     assert ui.debug_sel == 1 % n
+    # Windows Up is 0. Qt/X11 waitKeyEx Up is 65362. Win32 waitKeyEx Up is 2490368.
+    # 82 is ASCII R, so it records a review and does not move the row.
+    ui.handle_key(0)
+    assert ui.debug_sel == 0
+    ui.handle_key(2490368)
+    assert ui.debug_sel == (n - 1) % n
+    ui.nerd_tab = "viz"
+    ui.viz_sel = 2
+    assert ui.handle_key(65362) is True
+    assert ui.viz_sel == 1
+    assert ui.debug.review_record is False
+    assert ui.handle_key(ord("R")) is True
+    assert ui.debug.review_record is True
+    assert ui.viz_sel == 1
+    ui.nerd_tab = "live"
+    assert ui.handle_key(65362) is False
+    assert ui.debug.review_record is True
+    ui.debug.review_record = False
+    ui.show_drive_tab()
     allow = row_at(0)
     ui.debug_sel = 0
     ui.handle_key(ord(" "))
@@ -215,6 +235,106 @@ def test_ui_keys_clicks() -> None:
     assert ui.nerd_tab == "cams"
     render_stage(st, ui=ui)
     assert any(h.get("kind") == "cams_grid" for h in ui.nerd_hits)
+
+
+def _viz_state(ui: VizUI) -> dict:
+    return {
+        "engaged": True,
+        "loop_hz": 12.0,
+        "path_conf": 0.9,
+        "path_width": 2.0,
+        "path_debug_preview": False,
+        "gvd_show_path": True,
+        "show_agent_ghosts": True,
+        "ego": {"speed_mps": 14.0, "brake": 0.0, "steer_deg": 0.0, "throttle": 0.1},
+        "planner": {"cipv_id": 1, "aeb": "off", "target_v": 11.0, "ttc_lead": 2.4, "corridor_width": 2.0},
+        "path_ego": [{"x": 0.0, "y": float(i)} for i in range(0, 36)],
+        "tracks": [{"id": 1, "class": "vehicle", "x": 0.1, "y": 16, "speed_mps": 12, "yaw": 1.57}],
+        "lanes_ext": [],
+        "debug": ui.debug.as_dict(),
+    }
+
+
+def test_resized_window_click_stays_on_the_item() -> None:
+    """A resized client must not shift a highgui image pixel off its control.
+
+    WINDOW_NORMAL already reports image pixels (client * image / client).
+    Scaling that point again by getWindowImageRect was the miss.
+    """
+    ui = VizUI()
+    ui.nerd_tab = "viz"
+    ui.show_nerd = True
+    ui.layers = set()
+    st = _viz_state(ui)
+    render_stage(st, ui=ui)
+    row = next(h for h in ui.nerd_hits if h.get("kind") == "row" and h.get("i") == 0 and h.get("part") == "value")
+    x0, y0, x1, y1 = row["rect"]
+    ix = STAGE_W + (x0 + x1) // 2
+    iy = (y0 + y1) // 2
+    img_w = STAGE_W + ui.nerd_width
+    img_h = STAGE_H
+    # Client grown past the image. Origin is screen position, not a letterbox.
+    window_rect = (80, 48, img_w + 280, img_h + 160)
+    mx, my = image_point_from_window_mouse(ix, iy, image_wh=(img_w, img_h), window_rect=window_rect)
+    assert (mx, my) == (ix, iy)
+    shifted_x = int(ix * img_w / window_rect[2])
+    shifted_y = int(iy * img_h / window_rect[3])
+    assert (shifted_x, shifted_y) != (ix, iy)
+    from python.viz.nerd import hit_test
+
+    on_item = hit_test(ui.nerd_hits, ix - STAGE_W, iy)
+    off_item = hit_test(ui.nerd_hits, shifted_x - STAGE_W, shifted_y)
+    assert on_item is not None and on_item.get("part") == "value" and on_item.get("i") == 0
+    assert off_item is None or off_item.get("i") != 0 or off_item.get("part") != "value"
+    before = ui.debug.viz_dense
+    assert ui.handle_click(mx, my, stage_w=STAGE_W)
+    assert ui.debug.viz_dense is (not before)
+    # Shrinking the window used to push the same pixel the other way.
+    small = (0, 0, max(2, img_w - 200), max(2, img_h - 80))
+    sx, sy = image_point_from_window_mouse(ix, iy, image_wh=(img_w, img_h), window_rect=small)
+    assert (sx, sy) == (ix, iy)
+
+
+def test_hover_highlights_row_and_tab() -> None:
+    import numpy as np
+
+    ui = VizUI()
+    ui.nerd_tab = "viz"
+    ui.show_nerd = True
+    ui.layers = set()
+    st = _viz_state(ui)
+    before = render_stage(st, ui=ui)
+    row = next(h for h in ui.nerd_hits if h.get("kind") == "row" and h.get("i") == 1 and h.get("part") == "row")
+    x0, y0, x1, y1 = row["rect"]
+    cx = STAGE_W + (x0 + x1) // 2
+    cy = (y0 + y1) // 2
+    ui.handle_hover(cx, cy, stage_w=STAGE_W)
+    assert ui.hover is not None and ui.hover.get("kind") == "row" and ui.hover.get("i") == 1
+    after = render_stage(st, ui=ui)
+    roi_b = before[y0:y1, STAGE_W + x0:STAGE_W + x1]
+    roi_a = after[y0:y1, STAGE_W + x0:STAGE_W + x1]
+    assert np.any(roi_b != roi_a)
+    edge = np.all(roi_a == np.array(HOVER_EDGE), axis=2)
+    assert int(edge.sum()) > 20
+    # The tint stays on that row. The rest of the frame is unchanged.
+    mask = np.ones(before.shape[:2], dtype=bool)
+    pad = 2
+    mask[max(0, y0 - pad):min(before.shape[0], y1 + pad + 1), max(0, STAGE_W + x0 - pad):min(before.shape[1], STAGE_W + x1 + pad + 1)] = False
+    assert np.all(before[mask] == after[mask])
+
+    ui.hover = None
+    plain = render_stage(st, ui=ui)
+    tab = next(h for h in ui.nerd_hits if h.get("kind") == "tab" and h.get("id") == "model")
+    tx0, ty0, tx1, ty1 = tab["rect"]
+    ui.handle_hover(STAGE_W + (tx0 + tx1) // 2, (ty0 + ty1) // 2, stage_w=STAGE_W)
+    assert ui.hover is not None and ui.hover.get("kind") == "tab" and ui.hover.get("id") == "model"
+    tabbed = render_stage(st, ui=ui)
+    tab_roi = tabbed[ty0:ty1, STAGE_W + tx0:STAGE_W + tx1]
+    assert np.any(plain[ty0:ty1, STAGE_W + tx0:STAGE_W + tx1] != tab_roi)
+    assert int(np.all(tab_roi == np.array(HOVER_EDGE), axis=2).sum()) > 10
+
+    ui.handle_hover(10, 10, stage_w=STAGE_W)
+    assert ui.hover is None
 
 
 def test_overlay_pixels() -> None:
@@ -281,6 +401,8 @@ def main() -> None:
     test_apply_command()
     test_toggle_nudge()
     test_ui_keys_clicks()
+    test_resized_window_click_stays_on_the_item()
+    test_hover_highlights_row_and_tab()
     test_overlay_pixels()
     test_no_chrome()
     from python.viz.nerd import FS_BODY, NERD_WIDTH

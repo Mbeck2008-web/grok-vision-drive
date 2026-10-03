@@ -18,6 +18,7 @@ from python.control.actuate import (
     make_actuator,
     read_ego_feedback,
     read_electrics_inputs,
+    BotEngage,
     read_engage_flag,
     soft_esc_state_write_due,
     soft_esc_state_write_mark,
@@ -44,6 +45,10 @@ from python.control.override import (
 from python.data.record import ClipRecorder, choose_encoder
 from python.perception.pipeline import ModularPerception
 from python.perception.road_model import lanes_ext_for_live, road_edges
+from python.viz.debug_draw import cabin_drive_word
+from python.viz.review_log import ReviewCapture
+from python.viz.nerd import image_point_from_window_mouse
+from python.viz.stage import drawn_lane_records
 from python.sensors.cameras import CAM_IDS, CamHealth
 from python.runtime.debug_opts import apply_to_command, apply_to_perception
 from python.runtime.hw_probe import ema_hz, gpu_vram_used_gb, probe, refuse_live_start, unique_frame_hz_inst
@@ -433,19 +438,26 @@ def main() -> None:
         viz_note = place_opencv_window(win, screen=args.viz_screen, fullscreen=bool(args.viz_fullscreen))
 
         def _on_mouse(event, x, y, flags, param):
-            if event != cv2.EVENT_LBUTTONDOWN:
+            if event not in (cv2.EVENT_LBUTTONDOWN, cv2.EVENT_MOUSEMOVE):
                 return
+            # Highgui already mapped this point through the resized client
+            # into the image last shown. getWindowImageRect is that client
+            # (screen origin + client size). Do not scale the point again.
             img_w = STAGE_W + (ui.nerd_width if ui.show_nerd and 0 not in ui.layers else 0)
             img_h = STAGE_H
+            window_rect = None
             try:
                 rect = cv2.getWindowImageRect(win)
-                ww, wh = int(rect[2]), int(rect[3])
-                if ww > 1 and wh > 1:
-                    x = int(x * img_w / ww)
-                    y = int(y * img_h / wh)
+                window_rect = (int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3]))
             except Exception:
-                pass
-            ui.handle_click(int(x), int(y), stage_w=STAGE_W)
+                window_rect = None
+            ix, iy = image_point_from_window_mouse(
+                int(x), int(y), image_wh=(img_w, img_h), window_rect=window_rect,
+            )
+            if event == cv2.EVENT_MOUSEMOVE:
+                ui.handle_hover(ix, iy, stage_w=STAGE_W)
+                return
+            ui.handle_click(ix, iy, stage_w=STAGE_W)
 
         cv2.setMouseCallback(win, _on_mouse)
 
@@ -461,7 +473,10 @@ def main() -> None:
     prev_force = bool(args.force_engage)
     prev_preview = bool(args.allow_preview_drive)
     prev_engaged = False
+    bot_engage = BotEngage()
+    prev_bot = False
     engage_arm_mono: float | None = None
+    review_cap = ReviewCapture()
     try:
         while True:
             loop_t0 = time.perf_counter()
@@ -578,7 +593,18 @@ def main() -> None:
             prev_force = bool(ui.debug.force_engage)
             prev_preview = bool(ui.debug.allow_preview)
 
-            engaged = bool(args.force_engage) or bool(ui.debug.force_engage) or read_engage_flag(default=False)
+            bot_on = bot_engage.poll()
+            if bot_on and not prev_bot:
+                print("[GVD] bot engage ON (gvd_bot_engage.json)", flush=True)
+            elif prev_bot and not bot_on:
+                print("[GVD] bot engage off", flush=True)
+            prev_bot = bot_on
+            engaged = (
+                bool(args.force_engage)
+                or bool(ui.debug.force_engage)
+                or read_engage_flag(default=False)
+                or bot_on
+            )
             ident = bus_identity()
             if not ident.matched:
                 engaged = False
@@ -645,6 +671,7 @@ def main() -> None:
                 else:
                     engaged = False
                     disengage_reason = veto_name if veto_name != "none" else "veto"
+                    bot_engage.clear()
                     write_engage_flag(False, disengage_reason=disengage_reason)
             elif cmd.reason == "preview_blocked":
                 disengage_reason = "preview_blocked"
@@ -681,6 +708,7 @@ def main() -> None:
             if ovr.active and not ui.debug.ignore_override:
                 engaged = False
                 disengage_reason = ovr.reason
+                bot_engage.clear()
                 write_engage_flag(False, disengage_reason=ovr.reason)
                 print(f"[GVD] DISENGAGED: {ovr.reason}", flush=True)
                 # Gate reason rides along on the bus so the mod / nerd panel name it, not just
@@ -758,8 +786,8 @@ def main() -> None:
             st["path_e2e"] = list(e2e_path) if e2e_path else []
             st["tracks"] = pout.tracks
             st["lanes_bev"] = pout.lanes_bev
-            # Neighbour lanes only when a side camera delivered a frame. Main-only
-            # keeps the Hough boundaries that camera actually saw.
+            # Boundaries the fit returned. lanes_ext_for_live does not add a fan
+            # from which side cameras delivered a frame.
             live_cams = {
                 cid
                 for cid in CAM_IDS
@@ -904,6 +932,20 @@ def main() -> None:
                 write_state(st)
                 soft_esc_state_write_mark()
 
+            review_cap.write(
+                bool(ui.debug.review_record),
+                lanes=drawn_lane_records(st),
+                path=list(st.get("path_ego") or []),
+                steer=float(applied.steer),
+                throttle=float(applied.throttle),
+                glance=cabin_drive_word(st)[0],
+                disengage_reason=str(st.get("disengage_reason") or "none"),
+                frames=getattr(bundle, "frames", None),
+                brake=float(applied.brake),
+                engaged=bool(st.get("engaged")),
+                cmd_reason=str(st.get("cmd_reason") or ""),
+            )
+
             if win is not None:
                 import cv2
 
@@ -916,12 +958,15 @@ def main() -> None:
                     dets=getattr(pout, "dets", None),
                 )
                 cv2.imshow(win, frame)
-                key = cv2.waitKey(1) & 0xFF
+                # Full key code. waitKey() & 0xFF folds Qt Up (65362) into 82,
+                # which is also ASCII R, so Up toggled review capture.
+                raw_key = cv2.waitKeyEx(1)
+                key = -1 if raw_key is None else int(raw_key)
                 # q and Esc leave the supervisor. close() disconnects only
                 # (quit_on_close=false) and does not kill BeamNG.tech.
                 if key in (ord("q"), 27):
                     break
-                if key == 255:
+                if key < 0:
                     pass
                 elif ui.handle_key(key):
                     pass
@@ -950,6 +995,7 @@ def main() -> None:
         except Exception:
             pass
         try:
+            bot_engage.clear()
             write_engage_flag(False, disengage_reason="shutdown")
         except Exception:
             pass

@@ -23,7 +23,10 @@ from typing import Any, Protocol
 from python.runtime.paths import bus_identity
 from python.runtime.state_io import atomic_write_json, gvd_docs_dir
 
-HEARTBEAT_STALE_S = 0.35
+# Link / ribbon stale. A single grab hitch is well under a second and must
+# not flip the in-game link to stale (that flash is the Engage HOLD). The
+# command dead-man stays at 0.35 s in the mod; this is only the link.
+HEARTBEAT_STALE_S = 1.5
 AEB_BRAKE_TTC = 1.2
 EGO_FRESH_S = 1.0          # gvd_ego.json older than this → treat Lua feedback as gone
 CMD_ACK_SLACK = 5          # Lua acks lag a few seqs (20 Hz apply, 10 Hz echo, 15 Hz loop)
@@ -31,15 +34,13 @@ CMD_ACK_SLACK = 5          # Lua acks lag a few seqs (20 Hz apply, 10 Hz echo, 1
 # A leftover engaged:true from a crashed session must not start Tech vehicle.control.
 ENGAGE_FRESH_S = 2.5
 
-# Tech no-R (research pin): arcade + brake-hold + no throttle auto-selects R.
-# Use realistic_automatic so brake-hold is not reverse throttle. Gear is int only
-# (-1 R, 0 N, 1+ forward) — never gear=-1, never letter "D".
-TECH_SHIFT_MODE = "realistic_automatic"
+# Drive uses arcade. Gear is still int only (-1 is reverse and is never sent,
+# 0 is hold, 1+ is forward). Never letter "D" on vehicle.control.
+TECH_SHIFT_MODE = "arcade"
 # Player arrows/pedals expect arcade. Restored only on the Disengage handoff.
 TECH_PLAYER_SHIFT_MODE = "arcade"
 TECH_HOLD_BRAKE = 0.99
-# Below this, a full brake is a rest hold (parkingbrake on). Rolling AEB keeps PB off.
-TECH_HOLD_SPEED_MPS = 0.5
+# A full hold ignores speed and always sets the parking brake.
 TECH_HOLD_GEAR = 0
 TECH_DRIVE_GEAR = 1
 # Let neutralSelectionDelay (~0.5 s) finish before asking the lever to move again.
@@ -51,7 +52,7 @@ TECH_DRIVE_ARM_S = 0.55
 TECH_DRIVE_SHIFT_LUA = (
     "pcall(function() "
     "local c=controller and controller.mainController; "
-    "if c and c.setGearboxMode then pcall(function() c.setGearboxMode('realistic') end) end; "
+    "if c and c.setGearboxMode then pcall(function() c.setGearboxMode('arcade') end) end; "
     "if input and input.event then pcall(function() "
     "input.event('parkingbrake',0,2,0,0,nil,'gvd'); "
     "input.event('clutch',0,2,0,0,nil,'gvd') end) end; "
@@ -96,6 +97,11 @@ def cmd_path() -> Path:
 
 def engage_path() -> Path:
     return gvd_docs_dir() / "gvd_engage.json"
+
+
+def bot_engage_path() -> Path:
+    """Ship-bot latch. Same folder as ``gvd_engage.json``. No window focus."""
+    return gvd_docs_dir() / "gvd_bot_engage.json"
 
 
 def ego_path() -> Path:
@@ -228,6 +234,94 @@ def write_engage_flag(engaged: bool, disengage_reason: str | None = None) -> Non
     atomic_write_json(engage_path(), payload, indent=None)
 
 
+def _read_bot_engage() -> dict | None:
+    p = bot_engage_path()
+    if not p.is_file():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def bot_engage_fresh(now: float | None = None) -> bool:
+    """True when ``gvd_bot_engage.json`` is engaged and ``mtime`` is fresh.
+
+    Same window as ``read_engage_flag`` (``ENGAGE_FRESH_S``). The grab calls
+    ``poll_vehicle`` before ``note_engaged``, so the in-memory latch is still
+    false on the first bot-engage tick. A fresh file is Engage for that poll.
+    A stale leftover is not.
+    """
+    data = _read_bot_engage()
+    if not data or not bool(data.get("engaged", False)):
+        return False
+    try:
+        age = (time.time() if now is None else float(now)) - float(data["mtime"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if age < -1.0:
+        return False
+    return age <= ENGAGE_FRESH_S
+
+
+def write_bot_engage(engaged: bool, *, mtime: float | None = None) -> float:
+    """One write engages or clears. ``mtime`` must be fresh for a new engage."""
+    stamp = time.time() if mtime is None else float(mtime)
+    atomic_write_json(bot_engage_path(), {"engaged": bool(engaged), "mtime": stamp}, indent=None)
+    return float(json.loads(json.dumps(stamp)))
+
+
+class BotEngage:
+    """Latch for ``gvd_bot_engage.json``.
+
+    A new ``engaged:true`` counts only while ``mtime`` is inside the same
+    window as Alt+G (``ENGAGE_FRESH_S``). After that the latch stays on
+    until ``engaged:false``, ``clear()`` (driver override, a veto that
+    drops Engage, shutdown), or a newer command. A leftover true from a
+    crashed session does not start the car.
+    """
+
+    def __init__(self) -> None:
+        self.latched = False
+        self._seen: float | None = None
+
+    def poll(self, now: float | None = None) -> bool:
+        now_s = time.time() if now is None else float(now)
+        data = _read_bot_engage()
+        if not data or "mtime" not in data:
+            return self.latched
+        try:
+            mtime = float(data["mtime"])
+        except (TypeError, ValueError):
+            return self.latched
+        if self._seen is not None and mtime == self._seen:
+            return self.latched
+        self._seen = mtime
+        if not bool(data.get("engaged", False)):
+            self.latched = False
+            return False
+        age = now_s - mtime
+        if -1.0 <= age <= ENGAGE_FRESH_S:
+            self.latched = True
+        return self.latched
+
+    def clear(self) -> None:
+        """Sticky off. The old true is consumed so it cannot re-engage."""
+        self.latched = False
+        write_bot_engage(False)
+        data = _read_bot_engage()
+        if data and data.get("engaged") is False:
+            try:
+                self._seen = float(data["mtime"])
+                return
+            except (TypeError, ValueError):
+                pass
+        self._seen = None
+
+
 def heartbeat_fresh(heartbeat_mtime: float | None, now: float | None = None, stale_s: float = HEARTBEAT_STALE_S) -> bool:
     if heartbeat_mtime is None:
         return False
@@ -346,13 +440,15 @@ def tech_control_kwargs(
     release: bool = False,
     speed_mps: float | None = None,
 ) -> dict[str, Any]:
-    """BeamNGpy vehicle.control kwargs that never select reverse.
+    """Arcade forward drive. A full hold does not send the reverse pedal.
 
-    Shift mode is realistic_automatic (not arcade). Holds: throttle=0, brake=1,
-    gear=0, ±parkingbrake. Forward motion only with gear>=1 and throttle>0.
-    gear is int only; never -1, never letter D. Drive also sends clutch=0 so a
-    resting clutch pedal cannot hold the gearbox out of gear.
+    Shift mode stays arcade. Throttle>0 pins gear>=1 and clutch=0. A hold,
+    stop, or AEB (throttle ~0 and brake >= 0.99) is parkingbrake=1, service
+    brake 0, gear 0. Arcade treats that held service brake, with no throttle,
+    as reverse — gear 0 does not make it safe. The hold ignores speed and
+    always sets the parking brake. gear is int only; never -1, never letter D.
     """
+    del speed_mps  # moving or stopped, the reverse pedal stays off
     if release:
         return {
             "steering": 0.0,
@@ -372,15 +468,19 @@ def tech_control_kwargs(
             "clutch": 0.0,
             "gear": _tech_gear(TECH_DRIVE_GEAR),
         }
-    parking = 0.0
     if brake_v >= TECH_HOLD_BRAKE:
-        moving = speed_mps is not None and float(speed_mps) > TECH_HOLD_SPEED_MPS
-        parking = 0.0 if moving else 1.0
+        return {
+            "steering": steer_v,
+            "throttle": 0.0,
+            "brake": 0.0,
+            "parkingbrake": 1.0,
+            "gear": _tech_gear(TECH_HOLD_GEAR),
+        }
     return {
         "steering": steer_v,
         "throttle": 0.0,
         "brake": brake_v,
-        "parkingbrake": parking,
+        "parkingbrake": 0.0,
         "gear": _tech_gear(TECH_HOLD_GEAR),
     }
 
@@ -395,21 +495,17 @@ def is_reverse_control(kwargs: dict[str, Any]) -> bool:
 
 
 def is_arcade_reverse_hold(kwargs: dict[str, Any]) -> bool:
-    """Backward-compat alias: arcade brake-hold → R, or an explicit reverse gear."""
+    """True when arcade would select reverse from these kwargs.
+
+    A held service brake with no throttle is reverse throttle. Gear 0 does
+    not make that safe, and neither does the parking brake. Explicit gear < 0
+    is reverse. Parking brake with the service brake released is not.
+    """
     if is_reverse_control(kwargs):
         return True
     throttle = float(kwargs.get("throttle") or 0.0)
     brake = float(kwargs.get("brake") or 0.0)
-    parkingbrake = float(kwargs.get("parkingbrake") or 0.0)
-    gear = kwargs.get("gear")
-    try:
-        if gear is not None and int(gear) == TECH_HOLD_GEAR:
-            return False
-        if gear is not None and int(gear) >= TECH_DRIVE_GEAR:
-            return False
-    except (TypeError, ValueError):
-        pass
-    return throttle <= 1e-6 and brake >= TECH_HOLD_BRAKE and parkingbrake < 0.5
+    return throttle <= 1e-6 and brake >= TECH_HOLD_BRAKE
 
 
 def plan_command(
@@ -422,8 +518,9 @@ def plan_command(
     """Map corridor + speed plan → DriveCommand pedals.
 
     AEB / full stop still return brake=1, throttle=0 (retail JSON + override
-    semantics). Tech remaps that pair in BeamNGPyActuator via tech_control_kwargs
-    (realistic_automatic, hold gear=0 + brake ±parkingbrake; never gear=-1).
+    semantics). Tech remaps that pair in tech_control_kwargs: arcade stays the
+    shift mode, and the hold is parkingbrake=1 with the service brake released
+    so arcade does not select reverse. Never gear=-1.
     """
     planner = planner or {}
     aeb = str(planner.get("aeb") or "off")
@@ -444,8 +541,8 @@ def plan_command(
     throttle = 0.0
     brake = 0.0
     if aeb == "brake" or (ttc is not None and float(ttc) < AEB_BRAKE_TTC):
-        # Keep the command semantic (brake=1). Arcade would treat this as reverse
-        # throttle; Tech remaps at control() (realistic_automatic, gear=0 hold).
+        # Keep the command semantic (brake=1). Arcade would treat a held service
+        # brake as reverse; tech_control_kwargs sends parking brake instead.
         throttle = 0.0
         brake = 1.0
     elif aeb == "warn":
@@ -506,10 +603,10 @@ class DriverInputs:
 # restarts when poll() returns so PollGPSGE inside the same poll cannot
 # expire the snapshot before electrics are read. A miss still polls; Engage
 # hold reads speed on that path.
-# Soft Esc (latch false and gvd_engage.json not live) may skip the GE poll
-# for 200 ms and republish the last-good map here so this read does not open
-# a second sensors.poll. TechSession.poll reads the engage flag before that
-# hold, because note_engaged runs after poll_vehicle.
+# Soft Esc (latch false, gvd_engage.json not live, and gvd_bot_engage.json
+# not fresh) may skip the GE poll for 200 ms and republish the last-good map
+# here so this read does not open a second sensors.poll. TechSession.poll
+# reads both files before that hold, because note_engaged runs after poll_vehicle.
 SENSOR_POLL_REUSE_S = 0.05
 
 # Engage latch updated by note_engaged after poll_vehicle. Default false:
@@ -523,7 +620,8 @@ def note_soft_esc_engaged(engaged: bool) -> None:
     """Latch Engage so a grab with this bit set polls every tick.
 
     Callers that flip this must restore it. ``TechSession.poll`` does not
-    wait for the latch on the rising edge; it also reads ``read_engage_flag``.
+    wait for the latch on the rising edge; it also reads ``read_engage_flag``
+    and a fresh ``gvd_bot_engage.json``.
     """
     global _soft_esc_engaged
     _soft_esc_engaged = bool(engaged)
@@ -771,14 +869,15 @@ class BeamNGPyActuator:
     Disengaged ticks must not slam brake=1 (that is takeover). On the falling
     edge we zero throttle/brake/parkingbrake, set AI mode to disabled, restore
     arcade shift, and rewrite gvd_cmd.json to brake=0 / engaged=false so a
-    stale brake:1 file cannot keep the pedals. Release does not arm
-    realistic_automatic when the shifter was never set. A failed arcade
-    restore leaves the latch set so the next disengaged tick retries. After
-    arcade succeeds, later Soft Esc ticks refresh the cmd file at most once
-    per SOFT_ESC_FILE_PERIOD_S. Engaged gate holds
-    (preview_blocked, AEB, veto) still apply the stop command, remapped off
-    reverse: realistic_automatic, hold gear=0 + brake ±parkingbrake, drive
-    gear>=1 plus clutch=0, never gear=-1. A failed set_shift_mode is logged
+    stale brake:1 file cannot keep the pedals. Release does not arm a new
+    shift mode when the shifter was never set. A failed arcade restore leaves
+    the latch set so the next disengaged tick retries. After arcade succeeds,
+    later Soft Esc ticks refresh the cmd file at most once per
+    SOFT_ESC_FILE_PERIOD_S. Engaged gate holds (preview_blocked, AEB, veto)
+    still apply the stop command. Arcade stays the shift mode. Forward drive
+    is gear>=1 with throttle. A hold is parkingbrake=1 and service brake 0,
+    never gear=-1, so the brake pedal is not reverse throttle. A failed
+    set_shift_mode is logged
     and retried. Throttle>0 while the echoed gear is not forward also queues
     a vehicle-Lua arm that leaves N/P without selecting reverse.
     """
@@ -908,7 +1007,7 @@ class BeamNGPyActuator:
         return _gear_value(el)
 
     def _arm_shift_mode(self) -> None:
-        """Engage arms realistic_automatic. A thrown ack is logged and retried, not swallowed."""
+        """Engage arms arcade. A thrown ack is logged and retried, not swallowed."""
         veh = self.vehicle
         if veh is None or not hasattr(veh, "set_shift_mode"):
             return
@@ -1035,8 +1134,8 @@ class BeamNGPyActuator:
         if camera_ge_socket_busy():
             return "camera_io_busy"
         try:
-            # Engage arms realistic_automatic. A release with the shifter
-            # still unset must only clear pedals, not arm that mode on the way out.
+            # Engage arms arcade. A release with the shifter still unset must
+            # only clear pedals, not arm that mode on the way out.
             # A failed ack is logged and retried next tick (_shift_set stays false).
             if not release and not self._shift_set:
                 self._arm_shift_mode()

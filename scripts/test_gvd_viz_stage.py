@@ -543,13 +543,13 @@ def main() -> None:
 
     span_ys = _span_ys(-draw.behind_m, draw.ahead_m, 3.0)
     assert span_ys[0] <= -draw.behind_min_m and span_ys[-1] >= draw.ahead_min_m
+    # A straight heading past the last point is not a prediction.
     ext_pieces = _extend_predicted(
         [{"x": -1.8, "y": float(y)} for y in range(2, 36, 3)],
         -draw.behind_m,
         draw.ahead_m,
     )
-    ext_ys = [p["y"] for piece in ext_pieces for p in piece]
-    assert ext_ys and min(ext_ys) <= -draw.behind_min_m and max(ext_ys) >= draw.ahead_min_m
+    assert ext_pieces == []
 
     smoke_path = Path(tempfile.mkdtemp()) / "cabin_span.png"
     smoke(use_perception=False, engaged=False, write_bus=False, out=smoke_path)
@@ -582,7 +582,8 @@ def main() -> None:
     assert any(_lane_lit(y) for y in (72.0, 76.0, 80.0, 84.0, 88.0)), "stub lanes must reach ahead_min"
     assert any(_lane_lit(y) for y in (-6.0, -4.0, -2.0)), "stub lanes must show behind the ego"
 
-    # A short live poly is dashed out to the cabin span and is not relabeled in state.
+    # A short live poly is only the points it has. It is not relabeled, and it
+    # is not continued straight to the cabin span.
     short = {
         "engaged": False,
         "loop_hz": 12.0,
@@ -623,8 +624,58 @@ def main() -> None:
         return int(np.count_nonzero(patch.sum(axis=2) > 8))
 
     assert _ext_hit(20.0) > 0, "detected paint still strokes"
-    assert any(_ext_hit(y) > 0 for y in (72.0, 80.0, 88.0)), "predicted dash reaches ahead"
-    assert any(_ext_hit(y) > 0 for y in (-6.0, -4.0, -2.0)), "predicted dash shows behind the ego"
+    assert all(_ext_hit(y) == 0 for y in (72.0, 80.0, 88.0)), "no straight continuation past the last point"
+    assert all(_ext_hit(y) == 0 for y in (-6.0, -4.0, -2.0)), "no straight continuation behind the first point"
+
+    # A bend in the points is still a bend at the far samples. The early
+    # heading is not drawn through those samples, and nothing is invented
+    # past the last point.
+    def _bent_x(y: float) -> float:
+        if y <= 12.0:
+            return -1.8
+        return -1.8 + 0.12 * (y - 12.0)
+
+    bent_pts = [{"x": _bent_x(float(y)), "y": float(y)} for y in range(2, 48, 2)]
+    bent = {**short, "lanes_ext": [{
+        "points": bent_pts,
+        "kind": "detected",
+        "index": -1,
+    }]}
+    bent_on = render_stage(bent, ui=lane_ui)
+    bent_delta = cv2.absdiff(bent_on, lane_off)
+
+    def _bent_hit(x: float, y: float) -> int:
+        px, py = span_cam.project(x, y, 0.02)
+        if not (4 <= px < 1276 and 24 < py < 796):
+            return -1
+        patch = bent_delta[py - 5:py + 6, px - 5:px + 6]
+        return int(np.count_nonzero(patch.sum(axis=2) > 8))
+
+    assert any(_bent_hit(_bent_x(float(y)), float(y)) > 0 for y in (32, 36, 40, 44)), "far points stay on the bend"
+    assert all(_bent_hit(-1.8, float(y)) == 0 for y in (32, 36, 40, 44)), "early heading is not drawn through later points"
+    assert _bent_hit(_bent_x(40.0) + 0.12 * 20.0, 60.0) == 0, "stop at the last point"
+    assert _bent_hit(-1.8, 60.0) == 0
+    pred_pts = [{"x": _bent_x(float(y)) + 3.6, "y": float(y)} for y in range(2, 48, 2)]
+    pred = {**short, "lanes_ext": [{
+        "points": pred_pts,
+        "kind": "predicted",
+        "index": 1,
+    }]}
+    pred_on = render_stage(pred, ui=lane_ui)
+    pred_delta = cv2.absdiff(pred_on, lane_off)
+
+    def _pred_hit(x: float, y: float) -> int:
+        px, py = span_cam.project(x, y, 0.02)
+        if not (4 <= px < 1276 and 24 < py < 796):
+            return -1
+        patch = pred_delta[py - 5:py + 6, px - 5:px + 6]
+        return int(np.count_nonzero(patch.sum(axis=2) > 8))
+
+    assert any(
+        _pred_hit(_bent_x(float(y)) + 3.6, float(y)) > 0 for y in (32, 36, 40, 44)
+    ), "predicted points are followed to their end"
+    assert all(_pred_hit(1.8, float(y)) == 0 for y in (32, 36, 40, 44)), "predicted bend is not replaced by its early heading"
+    assert _pred_hit(_bent_x(40.0) + 3.6 + 2.4, 60.0) == 0, "no straight tail after the last predicted point"
 
     # Main camera only: no neighbour fan, and no lane paint behind the ego.
     from python.perception.road_model import lanes_ext_for_live
@@ -694,7 +745,28 @@ def main() -> None:
         patch = rear_delta[py - 5:py + 6, px - 5:px + 6]
         return int(np.count_nonzero(patch.sum(axis=2) > 8))
 
-    assert any(_rear_hit(y) > 0 for y in (-6.0, -4.0, -2.0)), "a live rear camera may paint behind the ego"
+    assert all(_rear_hit(y) == 0 for y in (-6.0, -4.0, -2.0)), "rear does not invent paint behind the first point"
+    rear_known = {
+        **main_solo,
+        "lanes_ext": [{
+            "points": [{"x": -1.8, "y": float(y)} for y in range(-8, 30, 4)],
+            "kind": "detected",
+            "index": -1,
+        }],
+        "cam_health": rear_health,
+    }
+    rear_known_draw = render_stage(rear_known, ui=lane_ui)
+    rear_known_empty = render_stage({**rear_known, "lanes_ext": []}, ui=lane_ui)
+    rear_known_delta = cv2.absdiff(rear_known_draw, rear_known_empty)
+
+    def _rear_known_hit(y: float) -> int:
+        px, py = span_cam.project(-1.8, y, 0.02)
+        if not (4 <= px < 1276 and 24 < py < 796):
+            return -1
+        patch = rear_known_delta[py - 5:py + 6, px - 5:px + 6]
+        return int(np.count_nonzero(patch.sum(axis=2) > 8))
+
+    assert any(_rear_known_hit(y) > 0 for y in (-6.0, -4.0, -2.0)), "points behind the ego are drawn when a rear camera saw them"
 
     # Under 8 Hz the lane stroke and the ribbon stay. Signs drop.
     slow = dict(short)

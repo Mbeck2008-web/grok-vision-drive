@@ -143,23 +143,37 @@ def draw_occupancy(
         cv2.addWeighted(overlay, 0.32, img, 0.68, 0, img)
 
 
+def frustum_ground_rays(
+    fr: dict[str, Any],
+) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
+    """Mount and the two ground corners, GVD frame (+X right, +Y forward).
+
+    Positive yaw looks right, the same convention as ``yaw_pitch_to_dir_up``.
+    The old ``heading = pi/2 + yaw`` negated X, so a fender wedge was drawn
+    on the opposite side of the car.
+    """
+    yaw = math.radians(float(fr["yaw_deg"]))
+    fov = math.radians(float(fr["fov_h"]))
+    reach = float(fr["range_m"])
+    x0, y0 = float(fr["x"]), float(fr["y"])
+
+    def _ray(delta: float) -> tuple[float, float]:
+        ang = yaw + delta
+        return (x0 + math.sin(ang) * reach, y0 + math.cos(ang) * reach)
+
+    return (x0, y0), _ray(-fov * 0.5), _ray(fov * 0.5)
+
+
 def draw_frustums(img: np.ndarray, cam: Any, health: dict[str, Any] | None = None) -> None:
     health = health or {}
     overlay = img.copy()
     for fr in load_frustums():
         cid = str(fr.get("id") or "")
         ok = str(health.get(cid) or health.get("main" if cid == "main" else cid) or "") == "ok"
-        yaw = math.radians(float(fr["yaw_deg"]))
-        # GVD frame: +Y forward, +X right. yaw 0 = forward.
-        heading = math.pi / 2 + yaw
-        fov = math.radians(float(fr["fov_h"]))
-        reach = float(fr["range_m"])
-        x0, y0 = float(fr["x"]), float(fr["y"])
-        left = heading - fov * 0.5
-        right = heading + fov * 0.5
+        (x0, y0), (xl, yl), (xr, yr) = frustum_ground_rays(fr)
         p_origin = cam.project(x0, y0, 0.4)
-        p_l = cam.project(x0 + math.cos(left) * reach, y0 + math.sin(left) * reach, 0.05)
-        p_r = cam.project(x0 + math.cos(right) * reach, y0 + math.sin(right) * reach, 0.05)
+        p_l = cam.project(xl, yl, 0.05)
+        p_r = cam.project(xr, yr, 0.05)
         col = FOV if ok else (70, 66, 62)
         cv2.polylines(
             overlay,

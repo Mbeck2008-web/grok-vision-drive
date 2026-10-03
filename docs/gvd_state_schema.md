@@ -17,7 +17,7 @@ Path: product sandbox `gvd_state.json` (written by `python/run_vision.py`). **No
 | `gvd_show_path` | bool | Default true |
 | `show_agent_ghosts` | bool | Default false; dim agent mode-0 only |
 | `agents[]` | optional | `id`, `path_ego` for forecast mode 0 |
-| `heartbeat_unix` | float | Age >0.35 s → ribbon fades 0.4 s then hides |
+| `heartbeat_unix` | float | Age >1.5 s → ribbon fades 0.4 s then hides. A shorter hitch does not mark the link stale. |
 | `policy` | string | `map-ai` draws amber (dimmer) instead of ice-blue |
 | `ego.steer_deg` | float | Used for debug preview if path missing |
 
@@ -130,7 +130,7 @@ Written by the in-game **GVD** app (GELua is the only writer). **Wins over** `gv
 
 Drawn by the OpenCV **GVD VISION** window (`python/viz/stage.py`). The in-game **GVD** app is Engage + settings only. None of this feeds the planner — corridor, CIPV and AEB still read `lanes_bev` / `tracks` exactly as before.
 
-| `lanes_ext[]` | `{points:[{x,y}], kind, side, style, index}` | `kind`: `detected` (Hough saw the paint) / `predicted` (a detected boundary offset sideways by the measured lane width) / `stub` (`--smoke` only). `index` counts boundaries out from the ego lane (`±1` = its own edges, out to `±3` for the two-lane-per-side fan). `style` stays `unknown` — nothing classifies solid vs dashed yet |
+| `lanes_ext[]` | `{points:[{x,y}], kind, side, style, index}` | `kind`: `detected` (Hough saw the paint) / `predicted` (a sideways offset of a seen boundary; the live writer does not add one) / `stub` (`--smoke` only). `index` is `±1` for the ego pair. Every extra boundary the fit returned on that side shares `±2`. `style` stays `unknown` — nothing classifies solid vs dashed yet |
 | `road_edges[]` | `{points:[{x,y}], kind, side}` | Kerb line just outside the outermost boundary. **Always `predicted`**: no kerb detector exists, this is the road edge implied by the lanes we can see |
 | `signs[]` | `{cls,x,y,conf,state}` | Road furniture straight from the detector: `stop_sign` (COCO 11), `traffic_light` (9), `pole` (10 / 12 — hydrants and parking meters, drawn as short grey sticks). Never tracked and never offered to CIPV or AEB. `state` is `unknown` for lights — no lamp-colour classifier, so the OpenCV stage draws all three lamps as empty rings |
 | `agents[]` | `{id, path_ego:[{x,y}]}` | Mode-0 constant-yaw-rate forecast fan per moving track, same toy math as the OpenCV view |
@@ -147,9 +147,9 @@ These come from state the stage already has — no extra fields, and each one ne
 | Hard stop bar across the ribbon | planner halted (`target_v <= 0.2` or AEB brake) **and** a CIPV exists — the bar sits at the lead, because that is the constraint being stopped for. No CIPV means no stopping point we can honestly claim, so no bar |
 | Traffic light tinted ice-blue | `signs[].relevant == true`. **Nothing sets it today** — the stack has no route-relevance signal, so every light renders muted |
 
-The only filled surface in the scene is the ego corridor; lane paint, kerbs and the lane fan are thin vector polylines, and the sky is void — there is no backdrop.
+The only filled surface in the scene is the ego corridor; lane paint and kerbs are thin vector polylines, and the sky is void — there is no backdrop.
 
-Predictions need an anchor: with no detected lane there are no predicted lanes and no road edges, and with `lane_conf` under 0.25 only the detected boundaries ship. Sign positions inherit `project_box_to_ego`'s crude pinhole estimate, and sign/light heights in the scene are a drawing convention, not a measurement. The stage draws detected geometry solid and everything predicted dim + dashed, skips `kind=stub` except `--smoke` (`viz_smoke`), and prints e.g. `lanes 2 seen+2 pred · edges pred · 2 signs` under the window. Loop under 8 Hz drops forecast fans, signs and the `cam_main` PIP.
+The live writer keeps every boundary the fit returned and tags them `detected`. A wider road is those extra lines, not a sideways copy of the ego pair. With no fit there is no lane paint and no road edge. The kerb is predicted, 0.4 m outside the outermost real line. Sign positions inherit `project_box_to_ego`'s crude pinhole estimate, and sign/light heights in the scene are a drawing convention, not a measurement. The stage draws detected geometry solid and predicted geometry dim + dashed, skips `kind=stub` except `--smoke` (`viz_smoke`), and a live two-line road prints e.g. `lanes 2 seen · edges pred · 2 signs` under the window. Loop under 8 Hz drops forecast fans, signs and the `cam_main` PIP.
 
 ## In-game app bus
 
@@ -173,12 +173,12 @@ Live wheel / pedal HUD fields are the same retail Direct Drive echo already writ
 | `shadow.throttle` | float | E2E proposed throttle [0,1] |
 | `shadow.brake` | float | E2E proposed brake [0,1] |
 | `e2e_ok` | bool | False when modular vetoes E2E (low lane_conf / heartbeat / disagreement / forward fail) |
-| `veto_reason` | string | `none` / `aeb_brake` / `aeb_warn` / `low_lane_conf` / `low_path_conf` / `heartbeat_stale` / `disagreement` / `e2e_forward_fail` / `e2e_stub` / `preview_blocked` / `low_loop_hz` |
+| `veto_reason` | string | `none` / `aeb_brake` / `aeb_warn` / `low_lane_conf` / `low_path_conf` / `heartbeat_stale` / `disagreement` / `e2e_forward_fail` / `e2e_stub` / `preview_blocked` |
 | `e2e_backend` | string | `stub` / `onnx` |
 
-While engaged, a measured `loop_hz` or `camera_hz` under `min_accept_hz` (6, `config/control.yaml`) is `veto_reason=low_loop_hz` and disengages. For `engage_hz_grace_s` (3 s) after arm the floor is `engage_hz_grace_floor` (5), so a transient dip to about 5 Hz — including the rate EMA catching up — stays engaged. A stored 0 means the EMA has not started. CAMS blit dropping remains 8 Hz. The narrow-far hitch remains 10 Hz.
+A measured `loop_hz` or `camera_hz` under `min_accept_hz` is not an Engage drop and does not replace the plan with a brake hold. A hitch that used to mark the link stale for a split second was the HOLD flash. CAMS blit dropping remains 8 Hz. The narrow-far hitch remains 10 Hz. The command dead-man is still `CMD_STALE_S` 0.35 s.
 
-Perception always runs (loaded detector, lanes, corridor planner, other-vehicle tracks, E2E shadow). Path ribbon / GVD VISION overlays stay up. The VISION ice ribbon is `path_width / 2` meters each side and only as long as the path being painted. Modular, or e2e/shadow held by a veto (including `e2e_stub`), paints `path_ego`. `policy=e2e` with `e2e_backend=onnx` and `veto_reason=none` paints `path_e2e` or a steer integral of that same length. Shadow keeps the modular ribbon and may add a thinner ghost of the other path when the clean cabin (key 0) is off. Actuators only when engaged **and** modular OK. Shadow mode computes both intents; default apply path stays modular. `e2e_stub` (no trained onnx, `e2e_backend=stub`) holds the brake and stays engaged on `--policy e2e`. Shadow does not treat that stub as a disagreement. Dead-man / heartbeat unchanged. Detector default is shipped `models/yolov8n.onnx`. No E2E checkpoint in git (`models/e2e_current.onnx` still gitignored).
+Perception always runs (loaded detector, lanes, corridor planner, other-vehicle tracks, E2E shadow). Path ribbon / GVD VISION overlays stay up. The VISION ice ribbon is `path_width / 2` meters each side and only as long as the path being painted. Modular, or e2e/shadow held by a veto (including `e2e_stub`), paints `path_ego`. `policy=e2e` with `e2e_backend=onnx` and `veto_reason=none` paints `path_e2e` or a steer integral of that same length. Shadow keeps the modular ribbon and may add a thinner ghost of the other path when the clean cabin (key 0) is off. Actuators only when engaged **and** modular OK. Shadow mode computes both intents; default apply path stays modular. `e2e_stub` (no trained onnx, `e2e_backend=stub`) holds the brake and stays engaged on `--policy e2e`. Shadow does not treat that stub as a disagreement. The command dead-man is unchanged (`CMD_STALE_S` 0.35 s, `CMD_DEAD_S` 1.0 s). The link/ribbon stale window is 1.5 s, not 0.35 s, so one grab hitch does not mark the link stale. Detector default is shipped `models/yolov8n.onnx`. No E2E checkpoint in git (`models/e2e_current.onnx` still gitignored).
 
 
 ## M6 — `gvd_engage.json` contract (retail package)
@@ -190,6 +190,7 @@ Path: `Documents/GVD/gvd_engage.json`, shared by GELua and Python.
 | Lua (`gvd_main.writeEngageFile`) | `{"engaged":true\|false,"mtime":<os.time() int>,"disengage_reason":"<why>"}` | Alt+G / GVD app button, `player_steer` / `player_brake` / `player_throttle`, `command_stream_dead`, `extension_unloaded`. This is the only writer of `engaged:true`. |
 | Lua (`M.onUpdate`, every 0.5 s) | same shape, `engaged:true`, fresh `mtime` | While the in-memory latch is on. Does **not** bump `lastEngageWriteUnix`. Refuses to write `true` over a supervisor `false` whose `mtime` ≥ that stamp. |
 | Python (`write_engage_flag`) | `{"engaged": false, "mtime": <time.time() float>, "disengage_reason": "<why>"}` | `player_steer` / `player_brake` / `player_throttle` / modular veto / stale heartbeat / `finally` on exit. Python does not write `engaged:true`. |
+| Ship bot (`scripts/bot_engage.py`) | `gvd_bot_engage.json` `{"engaged": true\|false, "mtime": <time.time()>}` | `on` engages the Python supervisor without a keypress or a focused window. `off` clears it. A new `true` counts only while `mtime` is about 2.5 s fresh, then the latch stays until `off`, a driver override, or a veto that drops Engage. A stale leftover `true` does not engage. |
 
 Python reads the file every tick. `engaged:false` is always off. `engaged:true` counts only when JSON `mtime` age is in `[-1.0, 2.5]` seconds (`ENGAGE_FRESH_S`). Missing `mtime`, or a stamp left from a crashed session, is not engage — Tech must not call `vehicle.control` from it. A missing file returns the caller's default (the supervisor default is false). Lua polls the file every 0.1 s **only while engaged** and adopts `engaged=false` when the file says so and `mtime` ≥ Lua's own last toggle stamp; it logs `[GVD] DISENGAGED by supervisor (<disengage_reason>)`, releases the vehicle inputs and refreshes the HUD/UI app. A file saying `true` never engages Lua — engage always starts in-game (Alt+G or the app button). Both sides write `false` on `player_steer` / `player_brake` / `player_throttle` (sticky, whichever sees it first) and Lua writes `false` when its dead-man fires. The file is the durable record of *why*: later supervisor ticks only see `engaged=false` and write the generic `not_engaged` into `disengage_reason`, so the mod keeps the reason it adopted for the HUD.
 

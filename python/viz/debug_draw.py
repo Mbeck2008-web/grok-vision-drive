@@ -21,15 +21,15 @@ CAM_TILE_GAP = 4
 _OVEREXPOSE_MEAN = 165.0
 _OVEREXPOSE_TARGET = 140.0
 # CAMS tab only. Row-major 3×3. None is the empty center (no cabin camera).
-# Roles are config/cameras.yaml: fender repeaters on the top corners, primary
-# forward in the top center, B-pillar side views on the middle row, rear plate
-# in the bottom center. wide is the left-offset windshield cam; narrow is the
-# right-offset one. There is no rear-corner camera, so those two feeds keep
-# the bottom corners and all eight existing cameras still have a cell.
+# Roles are config/cameras.yaml: wide is the left-offset windshield cam and
+# narrow is the right-offset one, so they sit on the top corners with primary
+# forward (main) in the top center. B-pillar side views stay on the middle
+# row. Fender repeaters sit on the bottom corners, rear plate in the bottom
+# center. All eight existing cameras still have a cell.
 CAMS_PREVIEW_SLOTS: tuple[str | None, ...] = (
-    "repeatL", "main", "repeatR",
+    "wide", "main", "narrow",
     "pillarL", None, "pillarR",
-    "wide", "rear", "narrow",
+    "repeatL", "rear", "repeatR",
 )
 CAMS_PREVIEW_COLS = 3
 CAMS_PREVIEW_ROWS = 3

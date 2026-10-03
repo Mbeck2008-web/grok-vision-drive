@@ -260,9 +260,9 @@ def main() -> None:
     assert len(CAMS_PREVIEW_SLOTS) == 9
     assert {c for c in CAMS_PREVIEW_SLOTS if c} == set(CAM_IDS)
     assert CAMS_PREVIEW_SLOTS == (
-        "repeatL", "main", "repeatR",
+        "wide", "main", "narrow",
         "pillarL", None, "pillarR",
-        "wide", "rear", "narrow",
+        "repeatL", "rear", "repeatR",
     )
 
     colors = {}

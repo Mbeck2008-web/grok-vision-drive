@@ -248,6 +248,13 @@ def check_frustums() -> None:
 
     front = [cid for cid, fr in frs.items() if abs(look(fr)[0]) < 0.3 and look(fr)[3] > 0.5]
     assert sorted(front) == ["main", "narrow", "wide"], front
+    # Pillars look across the corner. More lateral than forward, still short of a pure side view.
+    assert frs["pillarR"]["yaw_deg"] == 68.0
+    assert frs["pillarL"]["yaw_deg"] == -68.0
+    _, _, prx, pry = look(frs["pillarR"])
+    _, _, plx, ply = look(frs["pillarL"])
+    assert prx > pry > 0.0, (prx, pry)
+    assert plx < 0.0 < ply and abs(plx) > ply, (plx, ply)
 
 
 def main() -> None:

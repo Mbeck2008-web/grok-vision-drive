@@ -87,10 +87,10 @@ cameras:
     update_priority: 0.5
   - id: pillarL
     role: forward_side_left
-    note: "toy analogue of a left B-pillar forward-side cam"
+    note: "toy analogue of a left B-pillar cam aimed across the corner, not down the lane"
     mount: left_b_pillar
     pos_m: [-0.88, 0.40, 1.18]
-    yaw_deg: -38
+    yaw_deg: -68
     pitch_deg: -6
     fov_v: 65.3
     live_res: [640, 480]
@@ -99,10 +99,10 @@ cameras:
     update_priority: 1.0
   - id: pillarR
     role: forward_side_right
-    note: "toy analogue of a right B-pillar forward-side cam"
+    note: "toy analogue of a right B-pillar cam aimed across the corner, not down the lane"
     mount: right_b_pillar
     pos_m: [0.88, 0.40, 1.18]
-    yaw_deg: 38
+    yaw_deg: 68
     pitch_deg: -6
     fov_v: 65.3
     live_res: [640, 480]

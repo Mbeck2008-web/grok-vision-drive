@@ -46,6 +46,7 @@ from python.perception.pipeline import ModularPerception
 from python.perception.road_model import lanes_ext_for_live, road_edges
 from python.viz.debug_draw import cabin_drive_word
 from python.viz.review_log import ReviewCapture
+from python.viz.nerd import image_point_from_window_mouse
 from python.viz.stage import drawn_lane_records
 from python.sensors.cameras import CAM_IDS, CamHealth
 from python.runtime.debug_opts import apply_to_command, apply_to_perception
@@ -436,19 +437,26 @@ def main() -> None:
         viz_note = place_opencv_window(win, screen=args.viz_screen, fullscreen=bool(args.viz_fullscreen))
 
         def _on_mouse(event, x, y, flags, param):
-            if event != cv2.EVENT_LBUTTONDOWN:
+            if event not in (cv2.EVENT_LBUTTONDOWN, cv2.EVENT_MOUSEMOVE):
                 return
+            # Highgui already mapped this point through the resized client
+            # into the image last shown. getWindowImageRect is that client
+            # (screen origin + client size). Do not scale the point again.
             img_w = STAGE_W + (ui.nerd_width if ui.show_nerd and 0 not in ui.layers else 0)
             img_h = STAGE_H
+            window_rect = None
             try:
                 rect = cv2.getWindowImageRect(win)
-                ww, wh = int(rect[2]), int(rect[3])
-                if ww > 1 and wh > 1:
-                    x = int(x * img_w / ww)
-                    y = int(y * img_h / wh)
+                window_rect = (int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3]))
             except Exception:
-                pass
-            ui.handle_click(int(x), int(y), stage_w=STAGE_W)
+                window_rect = None
+            ix, iy = image_point_from_window_mouse(
+                int(x), int(y), image_wh=(img_w, img_h), window_rect=window_rect,
+            )
+            if event == cv2.EVENT_MOUSEMOVE:
+                ui.handle_hover(ix, iy, stage_w=STAGE_W)
+                return
+            ui.handle_click(ix, iy, stage_w=STAGE_W)
 
         cv2.setMouseCallback(win, _on_mouse)
 

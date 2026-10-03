@@ -92,6 +92,9 @@ class VizUI:
     viz_sel: int = 0
     model_sel: int = 0
     nerd_hits: list = field(default_factory=list)
+    # Tab or row under the pointer. render_panel paints it. None when the
+    # pointer is not on a selectable item.
+    hover: dict | None = None
     nerd_width: int = NERD_WIDTH
     # Recent DRIVE-tab pedal samples. The viz appends one per frame; the drive loop does not read it.
     pedal_trace: list = field(default_factory=list)
@@ -249,6 +252,22 @@ class VizUI:
             self.sync_layers_from_debug()
             return True
         return False
+
+    def handle_hover(self, x: int, y: int, *, stage_w: int) -> None:
+        """Remember the selectable tab or row under the pointer."""
+        if not self.show_nerd or 0 in self.layers or x < stage_w:
+            self.hover = None
+            return
+        hit = hit_test(self.nerd_hits, x - stage_w, y)
+        if not hit or hit.get("kind") not in ("tab", "row"):
+            self.hover = None
+            return
+        self.hover = {
+            "kind": hit.get("kind"),
+            "id": hit.get("id"),
+            "i": hit.get("i"),
+            "part": hit.get("part"),
+        }
 
 
 @dataclass(frozen=True)

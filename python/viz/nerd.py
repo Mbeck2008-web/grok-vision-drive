@@ -17,6 +17,10 @@ BG = (16, 13, 12)
 FG = (212, 204, 200)
 ICE = (212, 196, 158)
 DIM = (120, 120, 120)
+# Hover sits on top of a drawn tab or row. Warm enough to read on the dark
+# panel and on the ice selected tab.
+HOVER_TINT = (48, 72, 110)
+HOVER_EDGE = (190, 220, 255)
 
 # Second-screen nerd type. OpenCV simplex at ~0.36 was unreadable at cabin distance.
 NERD_WIDTH = 560
@@ -309,6 +313,7 @@ def render_panel(
     if ui is not None:
         ui.nerd_hits = hits
         ui.nerd_tab = tab
+        paint_hover(img, hits, getattr(ui, "hover", None))
     return img
 
 
@@ -487,6 +492,102 @@ def hit_test(hits: list[dict[str, Any]] | None, x: int, y: int) -> dict[str, Any
         if rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
             return item
     return None
+
+
+def image_point_from_window_mouse(
+    x: int,
+    y: int,
+    *,
+    image_wh: tuple[int, int],
+    window_rect: tuple[int, int, int, int] | None,
+) -> tuple[int, int]:
+    """Image pixel under the pointer, including after the window is resized.
+
+    Highgui WINDOW_NORMAL already turns a client point into image pixels.
+    Win32 multiplies by bitmap/client. Qt divides by the viewport ratio.
+    That scale is what follows the resized window.
+
+    ``window_rect`` is ``getWindowImageRect``: on Win32 the origin is the
+    client position on the screen, and width/height are the resized client,
+    not the image. Scaling the callback point by image/client a second time
+    walks the hit off the item. The callback point is already the pixel.
+    """
+    img_w, img_h = int(image_wh[0]), int(image_wh[1])
+    if img_w < 1 or img_h < 1:
+        return int(x), int(y)
+    if window_rect is not None:
+        client_w, client_h = int(window_rect[2]), int(window_rect[3])
+        if client_w < 1 or client_h < 1:
+            return int(x), int(y)
+    return int(x), int(y)
+
+
+def _hover_matches(item: dict[str, Any], hover: dict[str, Any]) -> bool:
+    if str(item.get("kind") or "") != str(hover.get("kind") or ""):
+        return False
+    kind = str(item.get("kind") or "")
+    if kind == "tab":
+        return str(item.get("id") or "") == str(hover.get("id") or "")
+    if kind == "row":
+        return int(item.get("i") or 0) == int(hover.get("i") or 0) and str(item.get("part") or "") == str(
+            hover.get("part") or ""
+        )
+    return False
+
+
+def _tint_rect(img: np.ndarray, rect: tuple[int, int, int, int], color: tuple[int, int, int], alpha: float) -> None:
+    h, w = img.shape[:2]
+    x0 = max(0, min(w, int(rect[0])))
+    y0 = max(0, min(h, int(rect[1])))
+    x1 = max(0, min(w, int(rect[2])))
+    y1 = max(0, min(h, int(rect[3])))
+    if x1 <= x0 or y1 <= y0:
+        return
+    roi = img[y0:y1, x0:x1]
+    tint = np.empty_like(roi)
+    tint[:] = color
+    cv2.addWeighted(tint, float(alpha), roi, 1.0 - float(alpha), 0.0, roi)
+
+
+def paint_hover(img: np.ndarray, hits: list[dict[str, Any]] | None, hover: dict[str, Any] | None) -> None:
+    """Tint the tab or row under the pointer. Drawn on the nerd panel."""
+    if not isinstance(hover, dict) or not hits:
+        return
+    kind = str(hover.get("kind") or "")
+    if kind == "tab":
+        item = next((h for h in hits if _hover_matches(h, hover)), None)
+        if item is None:
+            return
+        rect = item.get("rect")
+        if not rect:
+            return
+        _tint_rect(img, rect, HOVER_TINT, 0.28)
+        cv2.rectangle(img, (int(rect[0]), int(rect[1])), (int(rect[2]), int(rect[3])), HOVER_EDGE, 2)
+        return
+    if kind != "row":
+        return
+    row = next(
+        (
+            h
+            for h in hits
+            if h.get("kind") == "row" and int(h.get("i") or 0) == int(hover.get("i") or 0) and h.get("part") == "row"
+        ),
+        None,
+    )
+    if row is None or not row.get("rect"):
+        return
+    rect = row["rect"]
+    _tint_rect(img, rect, HOVER_TINT, 0.42)
+    cv2.rectangle(img, (int(rect[0]), int(rect[1])), (int(rect[2]), int(rect[3])), HOVER_EDGE, 2)
+    part = str(hover.get("part") or "row")
+    if part == "row":
+        return
+    button = next((h for h in hits if _hover_matches(h, hover)), None)
+    if button is None or not button.get("rect"):
+        return
+    b = button["rect"]
+    _tint_rect(img, b, HOVER_TINT, 0.55)
+    cv2.rectangle(img, (int(b[0]), int(b[1])), (int(b[2]), int(b[3])), HOVER_EDGE, 2)
 
 
 def _help_lines() -> list[str]:

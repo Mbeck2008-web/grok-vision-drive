@@ -111,10 +111,10 @@ cameras:
     update_priority: 1.0
   - id: repeatL
     role: rear_side_left
-    note: "toy analogue of a left fender repeater"
+    note: "toy analogue of a left fender repeater aimed back along the adjacent lane; the ego body is only at the frame edge"
     mount: left_front_fender
     pos_m: [-0.96, 1.45, 0.82]
-    yaw_deg: -128
+    yaw_deg: -160
     pitch_deg: -8
     fov_v: 55.4
     live_res: [640, 480]
@@ -123,10 +123,10 @@ cameras:
     update_priority: 1.0
   - id: repeatR
     role: rear_side_right
-    note: "toy analogue of a right fender repeater"
+    note: "toy analogue of a right fender repeater aimed back along the adjacent lane; the ego body is only at the frame edge"
     mount: right_front_fender
     pos_m: [0.96, 1.45, 0.82]
-    yaw_deg: 128
+    yaw_deg: 160
     pitch_deg: -8
     fov_v: 55.4
     live_res: [640, 480]

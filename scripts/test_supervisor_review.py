@@ -241,6 +241,10 @@ def check_frustums() -> None:
     assert 0.2 < ly < 2.2 and 0.2 < ry < 2.2, (ly, ry)
     assert ldx < 0 < rdx, (ldx, rdx)
     assert ldy < 0 and rdy < 0, (ldy, rdy)
+    # Fenders look back along the next lane (more rear than side), not down the road ahead.
+    assert frs["repeatR"]["yaw_deg"] == 160.0
+    assert frs["repeatL"]["yaw_deg"] == -160.0
+    assert abs(rdy) > abs(rdx) and abs(ldy) > abs(ldx)
 
     behind = [cid for cid, fr in frs.items() if look(fr)[1] < -2.0]
     assert behind == ["rear"], behind

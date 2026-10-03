@@ -600,7 +600,49 @@ def check_soft_esc_engage_rising_edge() -> None:
             engage.write_bytes(prev_bytes)
 
 
+def check_bot_engage() -> None:
+    """A fresh bot file latches. off, override clear, and a stale true do not drive."""
+    import time
+
+    from python.control.actuate import BotEngage, bot_engage_path, write_bot_engage
+
+    path = bot_engage_path()
+    prev = path.read_bytes() if path.is_file() else None
+    try:
+        latch = BotEngage()
+        write_bot_engage(True)
+        assert latch.poll() is True
+        assert latch.poll(now=time.time() + 30.0) is True
+        write_bot_engage(False)
+        assert latch.poll() is False
+
+        stale = BotEngage()
+        write_bot_engage(True, mtime=time.time() - 10.0)
+        assert stale.poll() is False
+        write_bot_engage(True)
+        assert stale.poll() is True
+        stale.clear()
+        assert stale.poll() is False
+        write_bot_engage(True)
+        assert stale.poll() is True
+
+        from scripts.bot_engage import main as bot_main
+
+        cmd = BotEngage()
+        assert bot_main(["on"]) == 0
+        assert cmd.poll() is True
+        assert bot_main(["off"]) == 0
+        assert cmd.poll() is False
+        assert bot_main([]) == 2
+    finally:
+        if prev is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_bytes(prev)
+
+
 def main() -> None:
+    check_bot_engage()
     # 2) stale heartbeat → zero throttle + brake
     cmd = safe_command(
         engaged=True,

@@ -99,6 +99,11 @@ def engage_path() -> Path:
     return gvd_docs_dir() / "gvd_engage.json"
 
 
+def bot_engage_path() -> Path:
+    """Ship-bot latch. Same folder as ``gvd_engage.json``. No window focus."""
+    return gvd_docs_dir() / "gvd_bot_engage.json"
+
+
 def ego_path() -> Path:
     return gvd_docs_dir() / "gvd_ego.json"
 
@@ -227,6 +232,74 @@ def write_engage_flag(engaged: bool, disengage_reason: str | None = None) -> Non
     else:
         payload["disengage_reason"] = str(disengage_reason)
     atomic_write_json(engage_path(), payload, indent=None)
+
+
+def _read_bot_engage() -> dict | None:
+    p = bot_engage_path()
+    if not p.is_file():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def write_bot_engage(engaged: bool, *, mtime: float | None = None) -> float:
+    """One write engages or clears. ``mtime`` must be fresh for a new engage."""
+    stamp = time.time() if mtime is None else float(mtime)
+    atomic_write_json(bot_engage_path(), {"engaged": bool(engaged), "mtime": stamp}, indent=None)
+    return float(json.loads(json.dumps(stamp)))
+
+
+class BotEngage:
+    """Latch for ``gvd_bot_engage.json``.
+
+    A new ``engaged:true`` counts only while ``mtime`` is inside the same
+    window as Alt+G (``ENGAGE_FRESH_S``). After that the latch stays on
+    until ``engaged:false``, ``clear()`` (driver override, a veto that
+    drops Engage, shutdown), or a newer command. A leftover true from a
+    crashed session does not start the car.
+    """
+
+    def __init__(self) -> None:
+        self.latched = False
+        self._seen: float | None = None
+
+    def poll(self, now: float | None = None) -> bool:
+        now_s = time.time() if now is None else float(now)
+        data = _read_bot_engage()
+        if not data or "mtime" not in data:
+            return self.latched
+        try:
+            mtime = float(data["mtime"])
+        except (TypeError, ValueError):
+            return self.latched
+        if self._seen is not None and mtime == self._seen:
+            return self.latched
+        self._seen = mtime
+        if not bool(data.get("engaged", False)):
+            self.latched = False
+            return False
+        age = now_s - mtime
+        if -1.0 <= age <= ENGAGE_FRESH_S:
+            self.latched = True
+        return self.latched
+
+    def clear(self) -> None:
+        """Sticky off. The old true is consumed so it cannot re-engage."""
+        self.latched = False
+        write_bot_engage(False)
+        data = _read_bot_engage()
+        if data and data.get("engaged") is False:
+            try:
+                self._seen = float(data["mtime"])
+                return
+            except (TypeError, ValueError):
+                pass
+        self._seen = None
 
 
 def heartbeat_fresh(heartbeat_mtime: float | None, now: float | None = None, stale_s: float = HEARTBEAT_STALE_S) -> bool:

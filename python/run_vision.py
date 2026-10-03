@@ -18,6 +18,7 @@ from python.control.actuate import (
     make_actuator,
     read_ego_feedback,
     read_electrics_inputs,
+    BotEngage,
     read_engage_flag,
     soft_esc_state_write_due,
     soft_esc_state_write_mark,
@@ -472,6 +473,8 @@ def main() -> None:
     prev_force = bool(args.force_engage)
     prev_preview = bool(args.allow_preview_drive)
     prev_engaged = False
+    bot_engage = BotEngage()
+    prev_bot = False
     engage_arm_mono: float | None = None
     review_cap = ReviewCapture()
     try:
@@ -590,7 +593,18 @@ def main() -> None:
             prev_force = bool(ui.debug.force_engage)
             prev_preview = bool(ui.debug.allow_preview)
 
-            engaged = bool(args.force_engage) or bool(ui.debug.force_engage) or read_engage_flag(default=False)
+            bot_on = bot_engage.poll()
+            if bot_on and not prev_bot:
+                print("[GVD] bot engage ON (gvd_bot_engage.json)", flush=True)
+            elif prev_bot and not bot_on:
+                print("[GVD] bot engage off", flush=True)
+            prev_bot = bot_on
+            engaged = (
+                bool(args.force_engage)
+                or bool(ui.debug.force_engage)
+                or read_engage_flag(default=False)
+                or bot_on
+            )
             ident = bus_identity()
             if not ident.matched:
                 engaged = False
@@ -657,6 +671,7 @@ def main() -> None:
                 else:
                     engaged = False
                     disengage_reason = veto_name if veto_name != "none" else "veto"
+                    bot_engage.clear()
                     write_engage_flag(False, disengage_reason=disengage_reason)
             elif cmd.reason == "preview_blocked":
                 disengage_reason = "preview_blocked"
@@ -693,6 +708,7 @@ def main() -> None:
             if ovr.active and not ui.debug.ignore_override:
                 engaged = False
                 disengage_reason = ovr.reason
+                bot_engage.clear()
                 write_engage_flag(False, disengage_reason=ovr.reason)
                 print(f"[GVD] DISENGAGED: {ovr.reason}", flush=True)
                 # Gate reason rides along on the bus so the mod / nerd panel name it, not just
@@ -979,6 +995,7 @@ def main() -> None:
         except Exception:
             pass
         try:
+            bot_engage.clear()
             write_engage_flag(False, disengage_reason="shutdown")
         except Exception:
             pass

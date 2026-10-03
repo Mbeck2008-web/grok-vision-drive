@@ -515,9 +515,10 @@ def check_bend_not_roundabout_and_blinkers() -> None:
         tracks=[{"class": "vehicle", "x": 0.0, "y": 30.0, "yaw": YAW_AHEAD, "speed_mps": 8.0}],
     )
     paced_cmd = follow_path(paced, ego_speed_mps=8.0)
-    assert _max_y(paced) > 20.0
-    assert paced_cmd.brake < 1.0, paced_cmd
+    assert paced.path_length_m > 28.0
+    assert paced_cmd.brake < 0.35, paced_cmd
 
+    open_road = predict_path(lanes_bev=lanes, lane_conf=0.9, ego_speed_mps=8.0)
     far_stop = predict_path(
         lanes_bev=lanes,
         lane_conf=0.9,
@@ -525,8 +526,8 @@ def check_bend_not_roundabout_and_blinkers() -> None:
         signs=[{"cls": "stop_sign", "x": 2.0, "y": 24.0}],
     )
     far_cmd = follow_path(far_stop, ego_speed_mps=8.0)
-    assert _max_y(far_stop) > 20.0
-    assert far_cmd.brake < 1.0, far_cmd
+    assert 20.0 < _max_y(far_stop) < _max_y(open_road) - 4.0
+    assert far_cmd.brake < 0.35, far_cmd
 
     close = predict_path(
         lanes_bev=lanes,
@@ -650,6 +651,76 @@ def check_bend_not_roundabout_and_blinkers() -> None:
         note_soft_esc_engaged(False)
 
 
+def check_noise_yield_gap_and_short_arc() -> None:
+    """Locks the second critic pass. These fail if a 5 cm glitch is a circle,
+    a bumper car is ignored, a yield does not move the path, a slow close
+    slams the brake, or a 2 m tight arc is driven as a straight."""
+    lanes = _lane(-1.75, 1.75)
+    clean = predict_path(lanes_bev=_forward_bend(), lane_conf=0.8, ego_speed_mps=8.0)
+    noisy_lines = _forward_bend()
+    noisy_lines[0][3]["y"] = float(noisy_lines[0][3]["y"]) - 0.05
+    noisy = predict_path(lanes_bev=noisy_lines, lane_conf=0.8, ego_speed_mps=8.0)
+    assert noisy.prediction != "roundabout", noisy.prediction
+    assert noisy.prediction == clean.prediction
+    assert max(p["x"] for p in noisy.path_ego) < 25.0
+
+    folded = sorted(_roundabout_arc(), key=lambda p: (p["y"], p["x"]))
+    ring = predict_path(lanes_bev=[folded], lane_conf=0.7, ego_speed_mps=0.0)
+    assert ring.prediction == "roundabout", ring.prediction
+    assert len(ring.path_ego) > 10, len(ring.path_ego)
+    ring_cmd = follow_path(ring, ego_speed_mps=0.0)
+    assert ring.blinker == "right"
+    assert ring_cmd.steer > -0.2, ring_cmd
+
+    bumper = predict_path(
+        lanes_bev=lanes,
+        lane_conf=0.9,
+        ego_speed_mps=8.0,
+        tracks=[{"class": "vehicle", "x": 0.0, "y": 0.5, "yaw": YAW_AHEAD, "speed_mps": 0.0}],
+    )
+    bumper_cmd = follow_path(bumper, ego_speed_mps=8.0)
+    assert bumper.stop_reason == "vehicle", bumper.stop_reason
+    assert bumper_cmd.throttle < 0.2 and bumper_cmd.brake > 0.5, bumper_cmd
+
+    def _yield_at(y: float):
+        plan = predict_path(
+            lanes_bev=lanes,
+            lane_conf=0.9,
+            ego_speed_mps=8.0,
+            signs=[{"cls": "yield", "x": 2.0, "y": y}],
+        )
+        return plan, follow_path(plan, ego_speed_mps=8.0)
+
+    free = predict_path(lanes_bev=lanes, lane_conf=0.9, ego_speed_mps=8.0)
+    y20, c20 = _yield_at(20.0)
+    y6, c6 = _yield_at(6.0)
+    y14, c14 = _yield_at(14.0)
+    assert y20.path_length_m < free.path_length_m - 8.0
+    assert y20.stop_reason == "yield"
+    assert c6.brake > c14.brake + 0.05, (c6.brake, c14.brake)
+    assert abs(c6.brake - 0.20) > 0.02 or abs(c14.brake - 0.20) > 0.02
+
+    creep = predict_path(
+        lanes_bev=lanes,
+        lane_conf=0.9,
+        ego_speed_mps=10.0,
+        tracks=[{"class": "vehicle", "x": 0.0, "y": 10.0, "yaw": YAW_AHEAD, "speed_mps": 9.0}],
+    )
+    creep_cmd = follow_path(creep, ego_speed_mps=10.0)
+    assert creep.aeb != "brake"
+    assert 0.05 < creep_cmd.brake < 0.6, creep_cmd
+
+    radius = 7.0
+    glimpse = []
+    for y in (2.0, 2.5, 3.0, 3.5, 4.0):
+        glimpse.append({"x": radius - math.sqrt(radius * radius - y * y), "y": y, "z": 0.0})
+    tight = predict_path(lanes_bev=[glimpse], lane_conf=0.6, ego_speed_mps=5.0)
+    tight_cmd = follow_path(tight, ego_speed_mps=5.0)
+    assert abs(tight.curvature) > 0.04, tight.curvature
+    assert tight.target_v < 12.0, tight.target_v
+    assert not (tight_cmd.throttle > 0.4 and tight.target_v > 16.0 and tight.blinker == "off")
+
+
 def check_missed_sign_and_red_light() -> None:
     import numpy as np
 
@@ -748,6 +819,7 @@ def main() -> None:
     cmd = check_partial_roundabout()
     check_drive_gear_socket_and_override(cmd)
     check_bend_not_roundabout_and_blinkers()
+    check_noise_yield_gap_and_short_arc()
     check_missed_sign_and_red_light()
     check_perception_ignores_wheel()
     print("test_path_predictor: OK")

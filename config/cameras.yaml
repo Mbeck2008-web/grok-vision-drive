@@ -90,7 +90,7 @@ cameras:
     note: "toy analogue of a left B-pillar cam aimed across the corner, not down the lane"
     mount: left_b_pillar
     pos_m: [-0.88, 0.40, 1.18]
-    yaw_deg: -68
+    yaw_deg: -78
     pitch_deg: -6
     fov_v: 65.3
     live_res: [640, 480]
@@ -102,7 +102,7 @@ cameras:
     note: "toy analogue of a right B-pillar cam aimed across the corner, not down the lane"
     mount: right_b_pillar
     pos_m: [0.88, 0.40, 1.18]
-    yaw_deg: 68
+    yaw_deg: 78
     pitch_deg: -6
     fov_v: 65.3
     live_res: [640, 480]
@@ -113,7 +113,7 @@ cameras:
     role: rear_side_left
     note: "toy analogue of a left fender repeater aimed back along the adjacent lane; the ego body is only at the frame edge"
     mount: left_front_fender
-    pos_m: [-0.96, 1.45, 0.82]
+    pos_m: [-0.96, 1.30, 0.82]
     yaw_deg: -160
     pitch_deg: -8
     fov_v: 55.4
@@ -125,7 +125,7 @@ cameras:
     role: rear_side_right
     note: "toy analogue of a right fender repeater aimed back along the adjacent lane; the ego body is only at the frame edge"
     mount: right_front_fender
-    pos_m: [0.96, 1.45, 0.82]
+    pos_m: [0.96, 1.30, 0.82]
     yaw_deg: 160
     pitch_deg: -8
     fov_v: 55.4

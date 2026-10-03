@@ -47,8 +47,10 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
-STEER_ENTER = 0.08
-STEER_EXIT = 0.04
+# Wide on purpose. A slow wheel, or electrics echoing a command the wheel has
+# not reached yet, sits under this. A held pull past it is still a grab.
+STEER_ENTER = 0.35
+STEER_EXIT = 0.18
 STEER_HOLD_MS = 200.0
 STEER_SPIKE = 0.20
 BRAKE_ENTER = 0.06

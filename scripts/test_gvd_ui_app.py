@@ -322,9 +322,26 @@ def _check_road_model() -> None:
     one_edge = [[{"x": -1.8, "y": y} for y in range(2, 30, 4)]]
     one = lanes_ext_for_live(one_edge, 0.40, {"main"})
     assert len(one) == 1 and one[0]["kind"] == "detected"
-    sided = lanes_ext_for_live(lanes, 0.95, {"main", "pillarL"})
-    assert sum(1 for ln in sided if ln["kind"] == "predicted") == 2 * min(NEIGHBOUR_LANES, 1)
-    assert lanes_ext_for_live(lanes, 0.8, None) == lanes_ext(lanes, 0.8)
+    sided = lanes_ext_for_live(lanes, 0.95, {"main", "pillarL", "pillarR", "repeatL", "repeatR"})
+    assert [ln["kind"] for ln in sided] == ["detected", "detected"], sided
+    six = [[{"x": x, "y": y} for y in range(2, 30, 4)] for x in (-8.75, -5.25, -1.75, 1.75, 5.25, 8.75)]
+    wide = lanes_ext_for_live(six, 0.95, {"main", "pillarL", "pillarR"})
+    assert len(wide) == 6 and all(ln["kind"] == "detected" for ln in wide)
+
+    def _lane_count(ext: list) -> int:
+        xs = sorted(
+            sum(p["x"] for p in ln["points"]) / len(ln["points"])
+            for ln in ext
+        )
+        dedup: list[float] = []
+        for x in xs:
+            if not dedup or abs(x - dedup[-1]) > 0.8:
+                dedup.append(x)
+        return max(0, len(dedup) - 1)
+
+    assert _lane_count(sided) == 1
+    assert _lane_count(wide) == 5
+    assert lanes_ext_for_live(lanes, 0.8, None) == lanes_ext(lanes, 0.8, neighbours=0, predict=False)
     assert suppress_lane_fan({"cam_health": {"main": "ok", "rear": "missing"}})
     assert not suppress_lane_fan({"cam_health": {"main": "ok", "pillarL": "stale"}})
     assert not suppress_lane_fan({})

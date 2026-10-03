@@ -715,39 +715,15 @@ def _clip_poly_y(pts: list[dict[str, float]], y_lo: float, y_hi: float) -> list[
 def _extend_predicted(
     pts: list[dict[str, float]], y_lo: float, y_hi: float,
 ) -> list[list[dict[str, float]]]:
-    """Dashed continuation of a short detected poly. Does not repeat one point as a wall."""
-    if len(pts) < 2:
-        return []
-    pieces: list[list[dict[str, float]]] = []
-    y0, y1 = pts[0]["y"], pts[-1]["y"]
-    if y1 < y_hi - 0.5:
-        a, b = pts[-2], pts[-1]
-        dy = b["y"] - a["y"]
-        slope = 0.0 if abs(dy) < 1e-6 else (b["x"] - a["x"]) / dy
-        ext = [dict(b)]
-        y, x = b["y"], b["x"]
-        while y < y_hi - 1e-3:
-            step = min(8.0, y_hi - y)
-            y += step
-            x += slope * step
-            ext.append({"x": x, "y": y})
-        if len(ext) >= 2:
-            pieces.append(ext)
-    if y0 > y_lo + 0.5:
-        a, b = pts[0], pts[1]
-        dy = b["y"] - a["y"]
-        slope = 0.0 if abs(dy) < 1e-6 else (b["x"] - a["x"]) / dy
-        ext = [dict(a)]
-        y, x = a["y"], a["x"]
-        while y > y_lo + 1e-3:
-            step = min(8.0, y - y_lo)
-            y -= step
-            x -= slope * step
-            ext.append({"x": x, "y": y})
-        ext.reverse()
-        if len(ext) >= 2:
-            pieces.append(ext)
-    return pieces
+    """No invented straight tail.
+
+    The stroke is the seen and predicted points themselves. Continuing the
+    last heading in a straight line past that end fills the view with a rigid
+    line the road did not give us, including after a curve. Callers stop at
+    the last point.
+    """
+    del pts, y_lo, y_hi
+    return []
 
 
 def _stroke_world(
@@ -866,17 +842,12 @@ def _draw_lanes(img: np.ndarray, lanes: list, cam: Cam, *, smoke: bool, state: d
         style = str(ln.get("style") or "unknown") if isinstance(ln, dict) else "unknown"
         dashed = mode == "dashed" or style == "dashed"
         color, thick, dash_default = _lane_color(mode, fade)
+        # Follow every point on this boundary. A curve stays a curve through
+        # the last seen or predicted sample. Nothing is added past that sample.
         _stroke_world(
             img, cam, pts, color, thick,
             dashed=dashed or dash_default, dash=10 if mode == "solid" and not dashed else 8, gap=5,
         )
-        # A finished piece (extend: false) is the road that is already drawn.
-        # Short live paint is still extended as predicted dashes.
-        if isinstance(ln, dict) and ln.get("extend") is False:
-            continue
-        ext_color, ext_thick, _ = _lane_color("dashed", fade * 0.85)
-        for ext in _extend_predicted(pts, y_lo, y_hi):
-            _stroke_world(img, cam, ext, ext_color, ext_thick, dashed=True, dash=8, gap=6)
 
 
 def _draw_edge_piece(
@@ -1882,7 +1853,8 @@ def smoke(
     if not st.get("lanes_ext"):
         # --smoke has no camera, so the Hough fit finds nothing. Give the stage
         # something to draw, tagged kind="stub" so it can never read as a live detection.
-        # Author the full cabin span. Live Hough stays short; the drawer may dash-extend it.
+        # Author the full cabin span. Live paint is only the points that exist;
+        # the drawer does not continue them in a straight line.
         span_draw = resolve_draw_range(st)
         span = _span_ys(-span_draw.behind_m, span_draw.ahead_m, 3.0)
 

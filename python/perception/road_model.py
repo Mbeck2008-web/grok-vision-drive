@@ -133,23 +133,16 @@ def lanes_ext_for_live(
     lane_conf: float,
     live_ids: set[str] | frozenset[str] | None,
 ) -> list[dict[str, Any]]:
-    """Lane graph for the cameras that actually delivered a frame.
+    """Boundaries the fit returned. No fixed neighbour fan.
 
-    `live_ids is None` keeps the legacy fan (callers that do not know the rig).
-    No live pillar/repeat camera → detected ego boundaries only, so a main-only
-    hitch cannot draw "1–2 seen + 5 pred". Each live side camera allows one
-    predicted step, capped at `NEIGHBOUR_LANES`.
+    A one-lane road stays the boundaries that were seen. A wider road stays
+    every extra boundary the fit actually returned. Side cameras do not
+    invent parallel copies, and a missing edge is not filled with a straight
+    offset. `live_ids` is accepted so callers can still pass the hitch set;
+    it does not change the count.
     """
-    if live_ids is None:
-        return lanes_ext(lanes_bev, lane_conf)
-    sides = {str(cid) for cid in live_ids} & SIDE_LANE_CAMS
-    if not sides:
-        return lanes_ext(lanes_bev, lane_conf, neighbours=0, predict=False)
-    return lanes_ext(
-        lanes_bev,
-        lane_conf,
-        neighbours=min(NEIGHBOUR_LANES, len(sides)),
-    )
+    del live_ids
+    return lanes_ext(lanes_bev, lane_conf, neighbours=0, predict=False)
 
 
 _HEALTH_DELIVERED = ("ok", "stale")

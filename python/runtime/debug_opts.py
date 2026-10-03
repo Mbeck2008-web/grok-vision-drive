@@ -194,7 +194,7 @@ VIZ_ROWS: tuple[dict[str, Any], ...] = (
         "kind": "bool",
         "label": "camera strip",
         "attr": "viz_cams",
-        "hint": "tiny bottom row; A / CAMS tab is the 8-view wall",
+        "hint": "tiny bottom row; A / CAMS tab is a 3x3 with an empty center",
     },
     {
         "id": "review_record",

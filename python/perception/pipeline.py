@@ -12,8 +12,7 @@ from python.perception.cipv import select_cipv
 from python.perception.detect import STATIC_CLASSES
 from python.perception.lanes import estimate_lanes
 from python.perception.track import IoUTracker
-from python.planning.corridor import build_path_ego
-from python.planning.speed import plan_speed
+from python.planning.path_predictor import predict_path
 
 MAX_SIGNS = 8
 
@@ -57,6 +56,9 @@ class ModularPerception:
         ego_speed_mps: float = 0.0,
         steer_deg: float = 0.0,
     ) -> PerceptionOut:
+        # The wheel is for the override residual and the ego display. The route
+        # is predicted from lanes, vehicles, and signs, then followed.
+        del steer_deg
         t0 = time.perf_counter()
         dets = self.detector.detect(main_bgr)
         # Road furniture is detected but never tracked: tracks feed CIPV / AEB / ghosts,
@@ -79,19 +81,23 @@ class ModularPerception:
         track_dicts = self.tracker.as_dicts()
         lanes = estimate_lanes(main_bgr)
         cipv = select_cipv(track_dicts, path_width=2.0, ego_speed_mps=ego_speed_mps)
-        corridor = build_path_ego(
+        plan = predict_path(
             lanes_bev=lanes.lanes_bev,
             lane_conf=lanes.conf,
             curvature=lanes.curvature,
-            cipv=cipv.track,
-            steer_deg=steer_deg,
-        )
-        speed = plan_speed(
+            tracks=track_dicts,
+            signs=signs,
             ego_speed_mps=ego_speed_mps,
-            curvature=corridor.curvature,
-            ttc_lead=cipv.ttc_lead,
-            aeb=cipv.aeb,
         )
+        cipv_id = plan.cipv_id
+        if cipv_id is None and cipv.track is not None:
+            cipv_id = cipv.track.get("id")
+        ttc = plan.ttc_lead if plan.ttc_lead is not None else cipv.ttc_lead
+        aeb = plan.aeb
+        target_v = plan.target_v
+        if cipv.aeb == "brake" and aeb != "brake":
+            aeb = "brake"
+            target_v = 0.0
         missing = list(self.missing)
         if main_bgr is None:
             missing.append("cam_main_frame")
@@ -107,10 +113,10 @@ class ModularPerception:
             tracks_n=len(track_dicts),
             lane_conf=lanes.conf,
             lanes_bev=lanes.lanes_bev,
-            path_ego=corridor.path_ego,
-            path_width=corridor.path_width,
-            path_conf=corridor.path_conf,
-            path_debug_preview=not corridor.from_planner,
+            path_ego=plan.path_ego,
+            path_width=plan.path_width,
+            path_conf=plan.path_conf,
+            path_debug_preview=not plan.drivable,
             signs=signs,
             dets=[
                 {
@@ -121,12 +127,14 @@ class ModularPerception:
                 for d in dets
             ],
             planner={
-                "corridor_width": corridor.path_width,
-                "curvature": corridor.curvature,
-                "target_v": speed.target_v,
-                "ttc_lead": speed.ttc_lead,
-                "aeb": speed.aeb,
-                "cipv_id": (cipv.track or {}).get("id"),
+                "corridor_width": plan.path_width,
+                "curvature": plan.curvature,
+                "target_v": target_v,
+                "ttc_lead": ttc,
+                "aeb": aeb,
+                "cipv_id": cipv_id,
+                "stop_reason": plan.stop_reason,
+                "prediction": plan.prediction,
             },
             infer_ms=infer_ms,
             missing=missing,

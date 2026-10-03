@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -31,7 +32,7 @@ ON_DEMAND_UPDATE_S = -1.0  # no auto GPU update; ad-hoc poll only (sides/rear)
 SIDE_UPDATE_S = ON_DEMAND_UPDATE_S
 REAR_UPDATE_S = ON_DEMAND_UPDATE_S
 MAIN_GRAB_DIV = 1
-# Rank 2: one stream_raw per tick (main). Companion polls are ÷16.
+# Rank 2: one stream_raw per tick (main). Companion colour is ÷16.
 # Phases stay: wide 0 (even), narrow 1 (odd), pillarL 2, pillarR 3,
 # repeatL 5, rear 6, repeatR 7. Ticks 4 and 8–15 are main only.
 # Soft Esc (engaged=false) uses this same hitch. It does not burst all seven
@@ -39,6 +40,12 @@ MAIN_GRAB_DIV = 1
 # unrendered, not a picture: the slot stays missing until a real frame arrives,
 # then CAMS keeps that last frame on the ticks that do not poll the cam.
 # Main is still the only stream_raw, every tick.
+# On-demand companions (requested_update_time < 0) do not render from poll()
+# or stream_raw() — BeamNGpy documents that a negative rate may have taken no
+# readings. Those cams get one in-flight ad-hoc request. A read that exceeds
+# CAM_READ_BUDGET_S does not stall the grab; the last real frame stays painted.
+CAM_READ_BUDGET_S = 0.05
+_OWED_CAP = 7  # one slot per companion; the owed queue cannot grow past the rig
 WIDE_GRAB_DIV = 16
 NARROW_GRAB_DIV = 16
 NARROW_GRAB_PHASE = 1  # odd ticks; wide stays on even ticks
@@ -126,6 +133,11 @@ class CameraFrameBundle:
     grab_poll_free: bool = True
     unique_gpu_n: int = 0  # new GPU frames this tick (not cache / stream_raw re-shows)
     unique_gpu_ids: tuple[str, ...] = ()
+    # Ad-hoc companion requests not yet collected. Capped at 1.
+    companion_inflight: int = 0
+    # True when a stream_raw / poll / ad-hoc call exceeded CAM_READ_BUDGET_S
+    # or the previous read was still running, so this tick did not wait on it.
+    grab_read_blocked: bool = False
 
     def health_str(self) -> dict[str, str]:
         out = {cid: CamHealth.MISSING.value for cid in CAM_IDS}
@@ -711,6 +723,58 @@ def colour_to_bgr(colour: Any, resolution: tuple[int, int] | None = None) -> np.
     return np.ascontiguousarray(rgb[:, :, ::-1])
 
 
+class _IoMark:
+    """Identity sentinel for a camera read that did not finish on this tick."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __repr__(self) -> str:
+        return self.name
+
+
+_IO_BUSY = _IoMark("busy")
+_IO_TIMEOUT = _IoMark("timeout")
+
+
+def _reading_colour(images: Any, resolution: tuple[int, int] | None) -> np.ndarray | None:
+    if not isinstance(images, dict):
+        return None
+    colour = images.get("colour") if images.get("colour") is not None else images.get("color")
+    return colour_to_bgr(colour, resolution)
+
+
+def camera_uses_adhoc(cam: Any) -> bool:
+    """True when this sensor can render an on-demand frame without poll().
+
+    BeamNGpy Camera.poll / stream_raw on ``requested_update_time < 0`` return
+    the last buffer, which stays zeros until an ad-hoc request is rendered.
+    """
+    return all(
+        callable(getattr(cam, name, None))
+        for name in (
+            "send_ad_hoc_poll_request",
+            "is_ad_hoc_poll_request_ready",
+            "collect_ad_hoc_poll_request",
+        )
+    )
+
+
+def cap_companion_pending(cam: Any) -> None:
+    """Ask the sim to keep a single GPU request queued for this companion.
+
+    poll() on a negative update rate can enqueue renders that never complete.
+    One pending slot stops that queue from growing for the life of the session.
+    """
+    setter = getattr(cam, "set_max_pending_requests", None)
+    if not callable(setter):
+        return
+    try:
+        setter(1)
+    except Exception:
+        pass
+
+
 def read_camera_colour(
     cam: Any,
     *,
@@ -721,7 +785,8 @@ def read_camera_colour(
 
     One stream_raw per grab (main, every tick). Wide and narrow alternate
     across ticks and never share one. is_streaming stays true; poll is not a
-    second stream_raw.
+    second stream_raw. On-demand BeamNGpy cameras take the ad-hoc path in
+    ``BeamNGPyBackend.grab`` instead of this poll — poll does not render them.
     """
     res = resolution or _cam_resolution(cam)
     if cid == "main":
@@ -731,21 +796,18 @@ def read_camera_colour(
             raw = cam.stream_raw()
         except Exception:
             return None
-        colour = None
-        if isinstance(raw, dict):
-            colour = raw.get("colour") if raw.get("colour") is not None else raw.get("color")
-        return colour_to_bgr(colour, res)
+        return _reading_colour(raw, res)
     # Wide/narrow and sides/rear: poll. Never set streaming false.
+    # Cameras that implement ad-hoc are not read here; grab() owns that path.
+    if camera_uses_adhoc(cam):
+        return None
     if not hasattr(cam, "poll"):
         return None
     try:
         images = cam.poll()
     except Exception:
         return None
-    if not isinstance(images, dict):
-        return None
-    colour = images.get("colour") if images.get("colour") is not None else images.get("color")
-    return colour_to_bgr(colour, res)
+    return _reading_colour(images, res)
 
 
 def frame_is_unrendered(bgr: Any) -> bool:
@@ -1125,6 +1187,14 @@ class BeamNGPyBackend:
         self._open_mono = 0.0
         self._narrow_live_hitched = False
         self._last_unique_tick_t = 0.0
+        # One ad-hoc companion render in flight: (cid, request_id).
+        self._adhoc: tuple[str, int] | None = None
+        self._adhoc_ready = False
+        self._owed: list[str] = []
+        self._io_thread: threading.Thread | None = None
+        self._io_box: dict[str, Any] = {}
+        self._io_job: tuple[str, str] | None = None
+        self._read_blocked = False
 
     def open(self) -> None:
         self.connect_failed = False
@@ -1146,7 +1216,7 @@ class BeamNGPyBackend:
             return
 
         # Cameras + vehicle sensors attach here, independent of Alt+G / engaged.
-        # Soft Esc keeps all 8 attached. Colour while engaged=false is main only.
+        # Soft Esc keeps all 8 attached. Colour while engaged=false is the same ÷16 hitch.
         try:
             self.session.attach_vehicle_sensors()
         except Exception as e:
@@ -1267,6 +1337,8 @@ class BeamNGPyBackend:
                         f"update_s {want_rate:g}->{used_rate:g} (not resolution)"
                     )
                 self._sensors[cid] = cam
+                if cid != "main":
+                    cap_companion_pending(cam)
                 self._clip_planes[cid] = (used_near, used_far)
                 self._update_s[cid] = float(used_rate)
                 self._update_priority[cid] = float(used_prio)
@@ -1307,7 +1379,31 @@ class BeamNGPyBackend:
     def bng(self):
         return self.session.bng
 
+    def _socket_io_busy(self) -> bool:
+        """True when a timed-out camera read is still inside a GE round-trip.
+
+        ``stream_raw`` only reads shared memory, so it may overlap ``sensors.poll``.
+        ``poll`` and ad-hoc calls use the one BeamNGpy socket. The rest of the
+        tick must not use that socket until the read returns.
+        """
+        if not self._io_busy():
+            return False
+        job = self._io_job
+        if job is None:
+            return False
+        return job[1] != "stream"
+
     def poll_vehicle(self):
+        if self._socket_io_busy():
+            held = getattr(self.session, "_last_vehicle_data", None)
+            if held is not None:
+                return held
+            from python.sensors.tech import VehicleData
+
+            return VehicleData(
+                connected=self.session.vehicle is not None,
+                note="camera io in flight; sensors.poll skipped",
+            )
         return self.session.poll()
 
     def close(self) -> None:
@@ -1329,6 +1425,9 @@ class BeamNGPyBackend:
         self._frame_sig.clear()
         self._cache_frames.clear()
         self._cache_ts.clear()
+        self._adhoc = None
+        self._adhoc_ready = False
+        self._owed.clear()
         self._grab_i = 0
         self._unique_hz_ema = 0.0
         self._unique_n = 0
@@ -1462,12 +1561,232 @@ class BeamNGPyBackend:
         except Exception:
             return False
         self._sensors[cid] = fresh
+        if cid != "main":
+            cap_companion_pending(fresh)
         self._sensor_kwargs[cid] = new_kwargs
         rate = float(self._update_s.get(cid, FORWARD_UPDATE_S))
         self._clip_planes[cid] = (near, float(far_m))
         self._hitch_steps.append((cid, near, float(far_m), rate))
         self._frame_sig.pop(cid, None)
         return True
+
+    def _io_busy(self) -> bool:
+        thread = self._io_thread
+        return thread is not None and thread.is_alive()
+
+    def _inflight_n(self) -> int:
+        if self._adhoc is not None:
+            return 1
+        job = self._io_job
+        if job is not None and job[1] == "adhoc_send" and self._io_busy():
+            return 1
+        return 0
+
+    def _drop_owed(self, cid: str) -> None:
+        self._owed = [c for c in self._owed if c != cid]
+
+    def _owe(self, cid: str) -> None:
+        """Remember a companion whose hitch slot could not send.
+
+        One entry per camera. The cap is the rig size so a stuck render cannot
+        grow this list for the life of the session.
+        """
+        if cid in self._owed:
+            return
+        if self._adhoc is not None and self._adhoc[0] == cid:
+            return
+        if len(self._owed) >= _OWED_CAP:
+            return
+        self._owed.append(cid)
+
+    def _take_finished_io(self) -> tuple[str, str, Any] | None:
+        thread = self._io_thread
+        if thread is None or thread.is_alive():
+            return None
+        self._io_thread = None
+        cid, kind = self._io_job or ("", "")
+        self._io_job = None
+        box = self._io_box
+        self._io_box = {}
+        if "e" in box:
+            return (cid, kind, None)
+        return (cid, kind, box.get("v"))
+
+    def _cache_late_colour(self, cid: str, bgr: np.ndarray | None) -> None:
+        if not cid or bgr is None or frame_is_unrendered(bgr):
+            return
+        bgr = resize_long_side(bgr, self.long_side)
+        self._cache_frames[cid] = bgr
+        self._cache_ts[cid] = time.time()
+
+    def _apply_late(self, cid: str, kind: str, value: Any) -> None:
+        if kind == "adhoc_send" and isinstance(value, int) and self._adhoc is None:
+            self._adhoc = (cid, value)
+            self._adhoc_ready = False
+            self._drop_owed(cid)
+            return
+        if kind == "adhoc_ready":
+            self._adhoc_ready = bool(value)
+            return
+        if kind == "adhoc_collect":
+            self._adhoc = None
+            self._adhoc_ready = False
+            bgr = _reading_colour(value, self._resolution.get(cid)) if isinstance(value, dict) else None
+            self._cache_late_colour(cid, bgr)
+            return
+        if kind == "poll" and isinstance(value, np.ndarray):
+            self._cache_late_colour(cid, value)
+            return
+        if kind == "stream":
+            bgr = _reading_colour(value, self._resolution.get(cid)) if isinstance(value, dict) else None
+            self._cache_late_colour(cid, bgr)
+
+    def _reap_if_done(self) -> None:
+        late = self._take_finished_io()
+        if late is not None:
+            self._apply_late(*late)
+
+    def _io_call(self, cid: str, kind: str, fn: Any) -> Any:
+        """Run ``fn`` and return its value.
+
+        A call that is still going after ``CAM_READ_BUDGET_S`` returns
+        ``_IO_TIMEOUT`` and leaves that one thread running. The next call
+        does not start another read until it finishes, so a stuck
+        ``stream_raw`` / ``poll`` / ad-hoc round-trip cannot stack or freeze
+        the grab for the 0.5–1 s the sim was holding the socket.
+        """
+        if self._io_busy():
+            self._read_blocked = True
+            return _IO_BUSY
+        self._reap_if_done()
+        box: dict[str, Any] = {}
+
+        def _run() -> None:
+            try:
+                box["v"] = fn()
+            except Exception as exc:
+                box["e"] = exc
+
+        thread = threading.Thread(target=_run, daemon=True, name="gvd-cam-io")
+        self._io_thread = thread
+        self._io_box = box
+        self._io_job = (cid, kind)
+        thread.start()
+        thread.join(CAM_READ_BUDGET_S)
+        if thread.is_alive():
+            self._read_blocked = True
+            return _IO_TIMEOUT
+        finished = self._take_finished_io()
+        if finished is None:
+            return None
+        return finished[2]
+
+    def _publish_read(
+        self,
+        cid: str,
+        bgr: np.ndarray | None,
+        ts: float,
+        frames: dict,
+        timestamps: dict,
+        health: dict,
+        unique_ids: list[str],
+    ) -> None:
+        if bgr is None:
+            self._reuse_cached(cid, frames, timestamps, health, failed=True)
+            return
+        if frame_is_unrendered(bgr):
+            cached = self._cache_frames.get(cid)
+            if cached is not None and not frame_is_unrendered(cached):
+                self._reuse_cached(cid, frames, timestamps, health, failed=False)
+            else:
+                self._cache_frames.pop(cid, None)
+                self._cache_ts.pop(cid, None)
+            return
+        bgr = resize_long_side(bgr, self.long_side)
+        sig = frame_signature(bgr)
+        unique = sig != self._frame_sig.get(cid)
+        self._store_frame(cid, bgr, ts, frames, timestamps, health)
+        if unique:
+            self._frame_sig[cid] = sig
+            unique_ids.append(cid)
+
+    def _kick_adhoc(self, cid: str, cam: Any) -> bool:
+        """Start one ad-hoc render. False when a request is already in flight."""
+        if self._adhoc is not None or self._io_busy():
+            return False
+
+        def _send() -> int:
+            return int(cam.send_ad_hoc_poll_request())
+
+        got = self._io_call(cid, "adhoc_send", _send)
+        if isinstance(got, int):
+            self._adhoc = (cid, got)
+            self._adhoc_ready = False
+            self._drop_owed(cid)
+            return True
+        if got is _IO_TIMEOUT or got is _IO_BUSY:
+            self._drop_owed(cid)
+            return True
+        return False
+
+    def _harvest_adhoc(
+        self,
+        ts: float,
+        frames: dict,
+        timestamps: dict,
+        health: dict,
+        unique_ids: list[str],
+    ) -> None:
+        """Collect a finished ad-hoc render without sending another."""
+        if self._adhoc is None:
+            return
+        cid, rid = self._adhoc
+        cam = self._sensors.get(cid)
+        if cam is None or not camera_uses_adhoc(cam):
+            self._adhoc = None
+            self._adhoc_ready = False
+            return
+        if not self._adhoc_ready:
+            flag = self._io_call(
+                cid, "adhoc_ready", lambda: bool(cam.is_ad_hoc_poll_request_ready(rid))
+            )
+            if flag is _IO_BUSY or flag is _IO_TIMEOUT or flag is not True:
+                return
+        images = self._io_call(cid, "adhoc_collect", lambda: cam.collect_ad_hoc_poll_request(rid))
+        if images is _IO_BUSY or images is _IO_TIMEOUT:
+            self._adhoc_ready = True
+            return
+        self._adhoc = None
+        self._adhoc_ready = False
+        bgr = _reading_colour(images, self._resolution.get(cid)) if isinstance(images, dict) else None
+        self._publish_read(cid, bgr, ts, frames, timestamps, health, unique_ids)
+
+    def _bounded_sensor_colour(self, cid: str, cam: Any) -> np.ndarray | None:
+        """stream_raw (main) or poll (legacy companion), bounded by CAM_READ_BUDGET_S."""
+        res = self._resolution.get(cid)
+
+        if cid == "main":
+            if not hasattr(cam, "stream_raw"):
+                return None
+
+            def _stream() -> Any:
+                try:
+                    return cam.stream_raw()
+                except Exception:
+                    return None
+
+            raw = self._io_call(cid, "stream", _stream)
+            if raw is _IO_BUSY or raw is _IO_TIMEOUT:
+                return None
+            return _reading_colour(raw, res)
+
+        def _poll() -> np.ndarray | None:
+            return read_camera_colour(cam, cid=cid, resolution=res)
+
+        got = self._io_call(cid, "poll", _poll)
+        if got is _IO_BUSY or got is _IO_TIMEOUT or not isinstance(got, np.ndarray):
+            return None
+        return got
 
     def grab(self) -> CameraFrameBundle:
         from python.runtime.hw_probe import ema_hz, unique_frame_hz_inst
@@ -1492,36 +1811,48 @@ class BeamNGPyBackend:
         phase = grab_phase_of(grab_i, self._hitch)
         companion_polled = False
         unique_ids: list[str] = []
+        self._read_blocked = False
         # Soft Esc and Engage share the hitch: main stream_raw every tick, at
-        # most one companion poll. Ticks that skip a cam keep its last real
+        # most one companion request. Ticks that skip a cam keep its last real
         # frame for CAMS. A zero buffer is not stored and does not count as OK.
+        # On-demand cams render through one ad-hoc request. poll() on a
+        # negative requested_update_time does not take that reading, and it
+        # can sit on the GE socket for ~0.5–1 s.
         soft_esc_main = soft_esc_colour_main_only()
+        self._reap_if_done()
+        self._harvest_adhoc(ts, frames, timestamps, health, unique_ids)
+        due_companion = next(
+            (
+                cid
+                for cid in CAM_IDS
+                if cid != "main"
+                and cid in self._sensors
+                and camera_uses_adhoc(self._sensors[cid])
+                and self._grab_this_tick(cid, grab_i)
+            ),
+            None,
+        )
+        send_cid = due_companion if due_companion is not None else (self._owed[0] if self._owed else None)
+        if send_cid is not None:
+            send_cam = self._sensors.get(send_cid)
+            if send_cam is not None and camera_uses_adhoc(send_cam):
+                if self._kick_adhoc(send_cid, send_cam):
+                    companion_polled = True
+                else:
+                    self._owe(send_cid)
         for cid, cam in self._sensors.items():
+            if cid != "main" and camera_uses_adhoc(cam):
+                if cid not in frames:
+                    self._reuse_cached(cid, frames, timestamps, health, failed=False)
+                continue
             if not self._grab_this_tick(cid, grab_i):
                 self._reuse_cached(cid, frames, timestamps, health, failed=False)
                 continue
             if cid != "main":
                 companion_polled = True
             try:
-                bgr = read_camera_colour(cam, cid=cid, resolution=self._resolution.get(cid))
-                if bgr is None:
-                    self._reuse_cached(cid, frames, timestamps, health, failed=True)
-                    continue
-                if frame_is_unrendered(bgr):
-                    cached = self._cache_frames.get(cid)
-                    if cached is not None and not frame_is_unrendered(cached):
-                        self._reuse_cached(cid, frames, timestamps, health, failed=False)
-                    else:
-                        self._cache_frames.pop(cid, None)
-                        self._cache_ts.pop(cid, None)
-                    continue
-                bgr = resize_long_side(bgr, self.long_side)
-                sig = frame_signature(bgr)
-                unique = sig != self._frame_sig.get(cid)
-                self._store_frame(cid, bgr, ts, frames, timestamps, health)
-                if unique:
-                    self._frame_sig[cid] = sig
-                    unique_ids.append(cid)
+                bgr = self._bounded_sensor_colour(cid, cam)
+                self._publish_read(cid, bgr, ts, frames, timestamps, health, unique_ids)
             except Exception:
                 health[cid] = CamHealth.ERROR
                 cached = self._cache_frames.get(cid)
@@ -1564,6 +1895,8 @@ class BeamNGPyBackend:
             grab_poll_free=not companion_polled,
             unique_gpu_n=unique_n,
             unique_gpu_ids=tuple(unique_ids),
+            companion_inflight=self._inflight_n(),
+            grab_read_blocked=bool(self._read_blocked),
         )
 
 

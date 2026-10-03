@@ -43,6 +43,7 @@ from python.viz.debug_draw import (
     draw_pip_boxes,
     draw_planner_cost,
 )
+from python.perception.road_model import paint_lane_behind, suppress_lane_fan
 from python.runtime.state_io import steer_preview_path_ego
 from python.viz.forecast import predict_modes
 from python.viz.nerd import NERD_WIDTH, hit_test, render_panel, scene_note
@@ -826,10 +827,21 @@ def _lane_color(mode: str, fade: float) -> tuple[tuple[int, int, int], int, bool
     return color, 2, True
 
 
-def _draw_lanes(img: np.ndarray, lanes: list, cam: Cam, *, smoke: bool) -> None:
+def _lane_span(cam: Cam, state: dict[str, Any] | None) -> tuple[float, float]:
+    """Ahead stays the cabin span. Behind the ego needs a rear frame."""
     y_lo, y_hi = _draw_y_lo(cam), cam.ahead_m
+    if not paint_lane_behind(state):
+        y_lo = max(0.0, y_lo)
+    return y_lo, y_hi
+
+
+def _draw_lanes(img: np.ndarray, lanes: list, cam: Cam, *, smoke: bool, state: dict[str, Any] | None = None) -> None:
+    y_lo, y_hi = _lane_span(cam, state)
+    hide_fan = suppress_lane_fan(state)
     for ln in lanes or []:
         kind = ln.get("kind") if isinstance(ln, dict) else None
+        if hide_fan and str(kind or "") == "predicted":
+            continue
         mode = lane_draw_mode(kind, smoke=smoke)
         if mode is None:
             continue
@@ -875,8 +887,8 @@ def _draw_edge_piece(
     )
 
 
-def _draw_edges(img: np.ndarray, edges: list, cam: Cam) -> None:
-    y_lo, y_hi = _draw_y_lo(cam), cam.ahead_m
+def _draw_edges(img: np.ndarray, edges: list, cam: Cam, state: dict[str, Any] | None = None) -> None:
+    y_lo, y_hi = _lane_span(cam, state)
     fade_y = cam.ahead_m * (1.0 - cam.fade_frac) if cam.fade_frac > 0 else cam.ahead_m
     for e in edges or []:
         raw = _clip_poly_y(_poly_points(e), y_lo, y_hi)
@@ -1480,9 +1492,9 @@ def render_stage(
     if (not clean) and dbg.viz_occ:
         draw_occupancy(img, cam, list(state.get("tracks") or []), path, path_width)
     if dbg.viz_lanes:
-        _draw_lanes(img, state.get("lanes_ext") or state.get("lanes") or [], cam, smoke=smoke)
+        _draw_lanes(img, state.get("lanes_ext") or state.get("lanes") or [], cam, smoke=smoke, state=state)
     if dbg.viz_lanes:
-        _draw_edges(img, state.get("road_edges") or state.get("edges") or [], cam)
+        _draw_edges(img, state.get("road_edges") or state.get("edges") or [], cam, state)
     if (not clean) and dbg.viz_lane_poly:
         draw_lane_polys(img, cam, state.get("lanes_bev") or [])
 

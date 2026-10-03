@@ -7,6 +7,7 @@ from typing import Any
 import cv2
 import numpy as np
 
+from python.perception.road_model import suppress_lane_fan
 from python.runtime.debug_opts import CAMS_DROP_HZ, DEBUG_ROWS, MODEL_ROWS, NERD_TABS, VIZ_ROWS, DebugOpts
 from python.sensors.cameras import CAM_IDS
 from python.viz.debug_draw import cam_slot_live, draw_cam_tiles
@@ -34,11 +35,14 @@ VAL_COL_W = 148
 def scene_note(s: dict[str, Any]) -> str:
     """Honest lane/edge/sign tally for the OpenCV stage (and the nerd row)."""
     det = pred = stub = 0
+    hide_fan = suppress_lane_fan(s)
     for ln in s.get("lanes_ext") or s.get("lanes") or []:
         if not isinstance(ln, dict):
             det += 1
             continue
         kind = str(ln.get("kind") or "detected")
+        if hide_fan and kind == "predicted":
+            continue
         if kind == "detected":
             det += 1
         elif kind == "stub":

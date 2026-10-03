@@ -656,6 +656,8 @@ def check_camera_clip_planes() -> None:
     for key in (
         "grab_phase",
         "grab_poll_free",
+        "companion_inflight",
+        "grab_read_blocked",
         "sensors_poll_ms",
         "poll_gps_ms",
         "poll_gps_sent",
@@ -1604,7 +1606,15 @@ def check_soft_esc_segment_timers() -> None:
         act.note_soft_esc_engaged(False)
 
     rv = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
-    for key in ("grab_phase", "grab_poll_free", "sensors_poll_ms", "poll_gps_ms", "electrics_ms"):
+    for key in (
+        "grab_phase",
+        "grab_poll_free",
+        "companion_inflight",
+        "grab_read_blocked",
+        "sensors_poll_ms",
+        "poll_gps_ms",
+        "electrics_ms",
+    ):
         assert f'st["{key}"]' in rv, key
     assert "[GVD] seg " in rv
     assert "camera_hz=cam_hz_ema" in rv
@@ -2558,6 +2568,273 @@ def check_tech_hold_gate() -> None:
     assert "close" not in parked.events
 
 
+def check_adhoc_companions_do_not_block_or_pile() -> None:
+    """On-demand companions render via one ad-hoc request, not a blocking poll.
+
+    poll() on requested_update_time < 0 does not take a reading (the hitch stays
+    empty) and the GE round-trip can sit for ~0.5–1 s. A bounded grab must
+    return inside the budget, keep the last real frame, and never stack
+    requests. This is the leak/stall pattern; it is not a 10-minute soak.
+    """
+    import sys
+    import time
+    import types
+
+    import numpy as np
+
+    import python.control.actuate as act
+    from python.sensors.cameras import (
+        CAM_IDS,
+        BeamNGPyBackend,
+        CamHealth,
+        load_camera_config,
+    )
+
+    polls = {"n": 0}
+    leak: list[np.ndarray] = []
+    cams = {}
+
+    class AdHocCamera:
+        def __init__(self, name, _bng, _vehicle, **kwargs):
+            self.name = name
+            self.kwargs = kwargs
+            self.is_streaming = True
+            self.update_priority = float(kwargs.get("update_priority", 0.0))
+            self.resolution = kwargs.get("resolution", (8, 8))
+            self.max_pending = None
+            self.sent: list[int] = []
+            self.collected: list[int] = []
+            self._seq = 0
+            self._ready_after: dict[int, int] = {}
+            cams[name] = self
+
+        def get_update_priority(self):
+            return self.update_priority
+
+        def set_update_priority(self, p):
+            self.update_priority = float(p)
+
+        def set_max_pending_requests(self, n):
+            self.max_pending = int(n)
+
+        def stream_raw(self):
+            img = np.zeros((8, 8, 3), dtype=np.uint8)
+            img[0, 0, 0] = 4
+            return {"colour": img}
+
+        def poll(self):
+            # The live failure mode: blocks, returns zeros, and retains a buffer.
+            polls["n"] += 1
+            leak.append(np.zeros((256, 256, 3), dtype=np.uint8))
+            time.sleep(0.6)
+            return {"colour": np.zeros((8, 8, 3), dtype=np.uint8)}
+
+        def send_ad_hoc_poll_request(self):
+            self._seq += 1
+            rid = self._seq
+            self.sent.append(rid)
+            self._ready_after[rid] = 1
+            return rid
+
+        def is_ad_hoc_poll_request_ready(self, request_id):
+            left = self._ready_after.get(int(request_id), 0)
+            if left <= 0:
+                return True
+            self._ready_after[int(request_id)] = left - 1
+            return False
+
+        def collect_ad_hoc_poll_request(self, request_id):
+            rid = int(request_id)
+            self.collected.append(rid)
+            img = np.zeros((8, 8, 3), dtype=np.uint8)
+            img[0, 0, 1] = (rid % 200) + 1
+            return {"colour": img}
+
+        def remove(self):
+            return None
+
+    sensors = types.ModuleType("beamngpy.sensors")
+    sensors.Camera = AdHocCamera
+    beamngpy = types.ModuleType("beamngpy")
+    beamngpy.sensors = sensors
+    old = {k: sys.modules.get(k) for k in ("beamngpy", "beamngpy.sensors")}
+    sys.modules["beamngpy"] = beamngpy
+    sys.modules["beamngpy.sensors"] = sensors
+    prev_latch = act.soft_esc_sensors_every_tick()
+    engage = act.engage_path()
+    prev_bytes = engage.read_bytes() if engage.is_file() else None
+    try:
+        act.note_soft_esc_engaged(False)
+        act.write_engage_flag(False)
+        be = BeamNGPyBackend(
+            config=load_camera_config(),
+            tech_config={
+                "wait_vehicle_s": 0,
+                "cameras": {
+                    "attach": True,
+                    "rgb_only": True,
+                    "update_s": 0.067,
+                    "shared_memory": True,
+                    "streaming": True,
+                },
+            },
+        )
+
+        def _connect(explicit=True):
+            be.session.vehicle = object()
+            be.session.bng = object()
+            return True
+
+        be.session.connect = _connect  # type: ignore[method-assign]
+        be.session.attach_vehicle_sensors = lambda: {}  # type: ignore[method-assign]
+        be.open()
+        assert set(be._sensors) == set(CAM_IDS)
+        assert cams["gvd_main"].max_pending is None
+        for cid in CAM_IDS:
+            if cid == "main":
+                continue
+            assert cams[f"gvd_{cid}"].max_pending == 1, cid
+
+        durations: list[float] = []
+        max_inflight = 0
+        max_owed = 0
+        seen: set[str] = set()
+        last = None
+        for _i in range(96):
+            t0 = time.perf_counter()
+            bundle = be.grab()
+            durations.append(time.perf_counter() - t0)
+            last = bundle
+            max_inflight = max(max_inflight, int(bundle.companion_inflight))
+            max_owed = max(max_owed, len(be._owed))
+            assert bundle.companion_inflight <= 1
+            assert len(be._owed) <= 7
+            assert len(be._cache_frames) <= 8
+            for cid in CAM_IDS:
+                if cid == "main":
+                    continue
+                frame = bundle.frames.get(cid)
+                if frame is not None and int(frame.max()) > 0 and bundle.health[cid] == CamHealth.OK:
+                    seen.add(cid)
+        assert last is not None
+        assert "soft_esc_colour=hitch" in last.note
+        assert seen == {cid for cid in CAM_IDS if cid != "main"}, seen
+        assert polls["n"] == 0, polls["n"]
+        assert leak == []
+        assert max_inflight <= 1
+        assert max_owed <= 7
+        for cam in cams.values():
+            assert len(cam.sent) - len(cam.collected) <= 1, (cam.name, cam.sent, cam.collected)
+        # Last-frame paint: a later tick still holds every companion picture.
+        held = be.grab()
+        for cid in CAM_IDS:
+            assert cid in held.frames, cid
+            assert int(held.frames[cid].max()) > 0, cid
+        first = sum(durations[:48]) / 48
+        second = sum(durations[48:]) / 48
+        assert second < first * 1.5 + 0.01, (first, second, max(durations))
+        assert max(durations) < 0.25, max(durations)
+
+        class SlowMain:
+            n = 0
+
+            def stream_raw(self):
+                SlowMain.n += 1
+                time.sleep(0.6)
+                img = np.zeros((8, 8, 3), dtype=np.uint8)
+                img[0, 0, 0] = 7
+                return {"colour": img}
+
+            def poll(self):
+                raise AssertionError("main must not poll")
+
+        be._sensors["main"] = SlowMain()
+        be._cache_frames.pop("main", None)
+        be._cache_ts.pop("main", None)
+        be._frame_sig.pop("main", None)
+        t0 = time.perf_counter()
+        blocked = be.grab()
+        assert time.perf_counter() - t0 < 0.25, time.perf_counter() - t0
+        assert blocked.grab_read_blocked is True
+        assert SlowMain.n == 1
+        for cid in CAM_IDS:
+            if cid == "main":
+                continue
+            assert cid in blocked.frames and int(blocked.frames[cid].max()) > 0, cid
+        t1 = time.perf_counter()
+        skipped = be.grab()
+        assert time.perf_counter() - t1 < 0.1
+        assert SlowMain.n == 1
+        assert skipped.grab_read_blocked is True
+        time.sleep(0.7)
+        painted = be.grab()
+        assert "main" in painted.frames
+        assert int(painted.frames["main"].max()) > 0
+        assert painted.health["main"] in (CamHealth.OK, CamHealth.STALE)
+        for cid in CAM_IDS:
+            if cid == "main":
+                continue
+            assert cid in painted.frames and int(painted.frames[cid].max()) > 0
+        time.sleep(0.7)
+        if be._io_thread is not None and be._io_thread.is_alive():
+            be._io_thread.join(1.0)
+        be._reap_if_done()
+        calls = {"n": 0}
+
+        def _counting_poll():
+            calls["n"] += 1
+            return "polled"
+
+        be.session.poll = _counting_poll  # type: ignore[method-assign]
+        be._sensors["main"] = cams["gvd_main"]
+        assert be.poll_vehicle() == "polled"
+        assert calls["n"] == 1
+
+        def _slow_send():
+            time.sleep(0.6)
+            return 99
+
+        for name, cam in cams.items():
+            if name == "gvd_main":
+                continue
+            cam.send_ad_hoc_poll_request = _slow_send  # type: ignore[method-assign]
+        be._adhoc = None
+        be._adhoc_ready = False
+        be._owed.clear()
+        stalled = None
+        for _step in range(16):
+            t_send = time.perf_counter()
+            bundle = be.grab()
+            assert time.perf_counter() - t_send < 0.25
+            if bundle.grab_read_blocked and be._socket_io_busy():
+                stalled = bundle
+                break
+        assert stalled is not None
+        skipped_poll = be.poll_vehicle()
+        assert skipped_poll != "polled"
+        assert calls["n"] == 1
+        assert getattr(skipped_poll, "note", "") == "camera io in flight; sensors.poll skipped"
+        for cid in CAM_IDS:
+            if cid == "main":
+                continue
+            assert cid in stalled.frames and int(stalled.frames[cid].max()) > 0
+        time.sleep(0.7)
+    finally:
+        thread = getattr(locals().get("be", None), "_io_thread", None)
+        if thread is not None and thread.is_alive():
+            thread.join(1.0)
+        act.note_soft_esc_engaged(prev_latch)
+        if prev_bytes is None:
+            engage.unlink(missing_ok=True)
+        else:
+            engage.write_bytes(prev_bytes)
+        for k, v in old.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+
 def main() -> None:
     check_frame_convert()
     check_path_world()
@@ -2573,6 +2850,7 @@ def main() -> None:
     check_camera_clip_planes()
     check_beamngpy_open_passes_near_far()
     check_beamngpy_side_grab_half_rate()
+    check_adhoc_companions_do_not_block_or_pile()
     check_soft_esc_segment_timers()
     check_nvidia_smi_cache_and_honest_hz()
     check_auto_backend_not_tech_without_env()

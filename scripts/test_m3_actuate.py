@@ -683,14 +683,19 @@ def main() -> None:
 
     rest = tech_control_kwargs(0.0, 0.0, 1.0)
     assert rest["gear"] == TECH_HOLD_GEAR == 0
-    assert rest["brake"] == 1.0 and rest["parkingbrake"] == 1.0
+    assert rest["throttle"] == 0.0 and rest["brake"] == 0.0 and rest["parkingbrake"] == 1.0
     assert rest.get("gear") != -1
     assert not is_reverse_control(rest)
     assert not is_arcade_reverse_hold(rest)
     assert is_reverse_control({"gear": -1})
     assert is_arcade_reverse_hold({"steering": 0.0, "throttle": 0.0, "brake": 1.0})
+    # Gear 0 does not make a held service brake safe, stopped or rolling.
+    assert is_arcade_reverse_hold({"throttle": 0.0, "brake": 1.0, "gear": 0, "parkingbrake": 0.0})
+    assert is_arcade_reverse_hold({"throttle": 0.0, "brake": 1.0, "gear": 0, "parkingbrake": 1.0})
     rolling = tech_control_kwargs(0.1, 0.0, 1.0, speed_mps=12.0)
-    assert rolling["brake"] == 1.0 and rolling["parkingbrake"] == 0.0 and rolling["gear"] == 0
+    assert rolling["brake"] == 0.0 and rolling["parkingbrake"] == 1.0 and rolling["gear"] == 0
+    assert rolling["throttle"] == 0.0
+    assert not is_arcade_reverse_hold(rolling)
     assert rolling.get("gear") != -1
     drive_kw = tech_control_kwargs(0.2, 0.4, 0.0)
     assert drive_kw["throttle"] == 0.4 and drive_kw["parkingbrake"] == 0.0
@@ -706,8 +711,8 @@ def main() -> None:
     assert rel.get("gear", 0) != -1
 
     # Tech: disengaged must not call vehicle.control (no brake takeover). One zero
-    # release on the falling edge, then silence. Engaged stop/hold: realistic_automatic,
-    # gear=0 + brake ±parkingbrake, never gear=-1. Drive pins gear>=1.
+    # release on the falling edge, then silence. Engaged stop/hold/AEB stay arcade:
+    # parkingbrake=1, service brake 0, gear=0. Drive pins gear>=1. Never gear=-1.
     class FakeVeh:
         def __init__(self) -> None:
             self.calls: list[dict] = []
@@ -761,7 +766,7 @@ def main() -> None:
     kw = veh.calls[-1]
     _assert_no_reverse(kw)
     assert kw["gear"] == TECH_HOLD_GEAR == 0
-    assert kw["brake"] == 1.0 and kw["parkingbrake"] == 1.0
+    assert kw["brake"] == 0.0 and kw["parkingbrake"] == 1.0 and kw["throttle"] == 0.0
 
     aeb_cmd = plan_command(
         path_ego=[{"x": 0, "y": float(i), "z": 0} for i in range(12)],
@@ -773,7 +778,8 @@ def main() -> None:
     aeb_out = tech.apply(aeb_cmd)
     assert aeb_out.applied is True and aeb_out.brake == 1.0
     _assert_no_reverse(veh.calls[-1])
-    assert veh.calls[-1]["gear"] == 0 and veh.calls[-1]["brake"] == 1.0
+    assert veh.calls[-1]["gear"] == 0 and veh.calls[-1]["brake"] == 0.0
+    assert veh.calls[-1]["parkingbrake"] == 1.0 and veh.calls[-1]["throttle"] == 0.0
 
     class MovingVeh(FakeVeh):
         def __init__(self) -> None:
@@ -787,7 +793,8 @@ def main() -> None:
     tech_m.note_engaged(True)
     tech_m.apply(DriveCommand(steer=0.0, throttle=0.0, brake=1.0, seq=31, reason="ok"))
     mkw = moving.calls[-1]
-    assert mkw["brake"] == 1.0 and mkw["parkingbrake"] == 0.0 and mkw["gear"] == 0
+    assert mkw["brake"] == 0.0 and mkw["parkingbrake"] == 1.0 and mkw["gear"] == 0
+    assert mkw["throttle"] == 0.0
     _assert_no_reverse(mkw)
 
     class NoGearVeh:
@@ -803,7 +810,7 @@ def main() -> None:
     tech_ng = BeamNGPyActuator(ng)
     tech_ng.note_engaged(True)
     tech_ng.stop(seq=32, reason="preview_blocked")
-    assert ng.calls[-1]["brake"] == 1.0 and ng.calls[-1]["parkingbrake"] == 1.0
+    assert ng.calls[-1]["brake"] == 0.0 and ng.calls[-1]["parkingbrake"] == 1.0
     assert "gear" not in ng.calls[-1]
     _assert_no_reverse(ng.calls[-1])
 
@@ -834,7 +841,8 @@ def main() -> None:
     # Hold left brake=1 on the car; Disengage must zero it and release AI, not leave brake=1.
     tech.note_engaged(True)
     held = tech.stop(seq=6, reason="preview_blocked")
-    assert held.applied is True and held.brake == 1.0 and veh.calls[-1]["brake"] == 1.0
+    assert held.applied is True and held.brake == 1.0 and veh.calls[-1]["brake"] == 0.0
+    assert veh.calls[-1]["parkingbrake"] == 1.0
     assert veh.shifts[-1] == TECH_SHIFT_MODE
     tech.note_engaged(False)
     n_hold = len(veh.calls)

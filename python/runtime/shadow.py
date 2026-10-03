@@ -17,14 +17,10 @@ from typing import Any
 from python.control.actuate import DriveCommand, plan_command, stop_command
 from python.control.e2e import E2EIntent, E2EPolicy
 
-# Engage liveness floor. CAMS blit drop remains 8 Hz. Narrow-far hitch remains 10 Hz.
-# Soft Esc idle sits about 7–9 Hz. A measured loop or unique-camera rate under
-# this floor disengages once the arm grace has ended. 0 means the EMA has not
-# started yet.
+# Names a slow loop for logs and tests. shadow_tick does not use them to drop
+# Engage or to replace the plan. CAMS blit drop remains 8 Hz. Narrow-far hitch
+# remains 10 Hz. 0 means the EMA has not started yet.
 MIN_ACCEPT_HZ = 6.0
-# Arm window. The loop/camera rate is an EMA (alpha 0.2), so the grace has to
-# outlast the engage hitch itself or the smoothed rate is still under the floor
-# after the frames have recovered. During the window the floor drops to ~5 Hz.
 ENGAGE_HZ_GRACE_S = 3.0
 ENGAGE_HZ_GRACE_FLOOR = 5.0
 
@@ -72,11 +68,10 @@ def engage_hz_reason(
     engage_age_s: float | None,
     cfg: ShadowConfig | None = None,
 ) -> str:
-    """``low_loop_hz`` or ``none``.
+    """``low_loop_hz`` or ``none``. A report only. ``shadow_tick`` does not call this.
 
-    Measured rates only (``> 0``). During the engage-arm grace a transient dip
-    down to ``engage_hz_grace_floor`` (~5 Hz) does not reject. After the grace
-    the floor is ``min_accept_hz`` (6). An unmeasured 0 does not reject.
+    Measured rates only (``> 0``). The grace numbers describe the old window
+    and are not an Engage gate. An unmeasured 0 is ``none``.
     """
     cfg = cfg or ShadowConfig()
     floor = float(cfg.min_accept_hz)
@@ -258,12 +253,9 @@ def shadow_tick(
             policy=policy,
         )
 
-    # A low rate used to replace the plan with a brake hold and clear Engage
-    # after the arm grace. That was a few seconds of DRIVE, a HOLD, and a
-    # self-disengage, and the steer command twitched between the plan and 0.
-    # The rate is still named by engage_hz_reason. It does not veto.
-    _hz_reason = engage_hz_reason(loop_hz, camera_hz, engage_age_s, cfg)
-    del _hz_reason
+    # loop_hz, camera_hz, and engage_age_s stay on the signature so callers
+    # can keep passing them. They do not gate Engage.
+    del loop_hz, camera_hz, engage_age_s
 
     # Modular-only policy: classic plan path; preview gate.
     # An untrained e2e stub (no models/e2e_current.onnx) is computed above and

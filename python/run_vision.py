@@ -762,8 +762,8 @@ def main() -> None:
             st["path_e2e"] = list(e2e_path) if e2e_path else []
             st["tracks"] = pout.tracks
             st["lanes_bev"] = pout.lanes_bev
-            # Neighbour lanes only when a side camera delivered a frame. Main-only
-            # keeps the Hough boundaries that camera actually saw.
+            # Boundaries the fit returned. lanes_ext_for_live does not add a fan
+            # from which side cameras delivered a frame.
             live_cams = {
                 cid
                 for cid in CAM_IDS

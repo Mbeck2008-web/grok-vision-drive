@@ -77,6 +77,31 @@ def check_roles() -> None:
     assert abs(exit_far["x"] - 1.75) > abs(exit_near["x"] - 1.75)
     assert drawn[5.25]["role"] == "through"
 
+    # Most of this line sits inboard of the real boundary, so its mean x is
+    # closer to the car. The near end is still outside, and the gap closes.
+    inside_pts = [{"x": 5.0, "y": 0.0}] + [
+        {"x": 0.3, "y": float(y)} for y in range(2, 41, 2)
+    ]
+    inside = classify_lane_roles([
+        {"points": _line(-1.75, -1.75), "kind": "detected"},
+        {"points": _line(1.75, 1.75), "kind": "detected"},
+        {"points": inside_pts, "kind": "detected"},
+    ])
+    assert inside[-1]["role"] == "merge", inside[-1]["role"]
+    # Three metres is enough when the gap actually closes.
+    short = classify_lane_roles([
+        {"points": _line(-1.75, -1.75, y1=3.0), "kind": "detected"},
+        {"points": _line(1.75, 1.75, y1=3.0), "kind": "detected"},
+        {"points": _line(5.0, 1.9, y1=3.0), "kind": "detected"},
+    ])
+    assert short[-1]["role"] == "merge", short[-1]["role"]
+    # The right line of a pair may leave. It is not forced to stay through.
+    leaving = classify_lane_roles([
+        {"points": _line(-1.75, -1.75), "kind": "detected"},
+        {"points": _line(1.75, 6.0), "kind": "detected"},
+    ])
+    assert leaving[1]["role"] == "exit", leaving[1]["role"]
+
 
 def check_review() -> None:
     from python.viz.review_log import ReviewCapture, ReviewLog
@@ -125,6 +150,66 @@ def check_review() -> None:
     assert cap.log is None
 
 
+def check_arcade_hold_not_reverse() -> None:
+    from python.control.actuate import (
+        TECH_SHIFT_MODE,
+        BeamNGPyActuator,
+        DriveCommand,
+        is_arcade_reverse_hold,
+        is_reverse_control,
+        plan_command,
+        tech_control_kwargs,
+    )
+
+    assert TECH_SHIFT_MODE == "arcade"
+
+    def _blocked(kw: dict) -> None:
+        assert kw.get("gear") != -1
+        assert not is_reverse_control(kw)
+        assert not is_arcade_reverse_hold(kw), kw
+        assert float(kw["throttle"]) == 0.0
+        assert float(kw["brake"]) == 0.0
+        assert float(kw["parkingbrake"]) == 1.0
+        assert int(kw["gear"]) == 0
+
+    _blocked(tech_control_kwargs(0.0, 0.0, 1.0, speed_mps=0.0))
+    _blocked(tech_control_kwargs(0.1, 0.0, 1.0, speed_mps=12.0))
+    assert is_arcade_reverse_hold({"throttle": 0.0, "brake": 1.0, "gear": 0, "parkingbrake": 0.0})
+
+    class Veh:
+        def __init__(self, speed: float) -> None:
+            self.calls: list[dict] = []
+            self.shifts: list[str] = []
+            self.sensors = {"electrics": {"wheelspeed": speed}}
+
+        def set_shift_mode(self, mode: str) -> None:
+            self.shifts.append(mode)
+
+        def control(self, **kw) -> None:
+            self.calls.append(kw)
+
+    for speed, cmd in (
+        (0.0, DriveCommand(steer=0.0, throttle=0.0, brake=1.0, seq=1, reason="ok")),
+        (8.0, DriveCommand(steer=0.0, throttle=0.0, brake=1.0, seq=2, reason="stop")),
+        (
+            12.0,
+            plan_command(
+                path_ego=[{"x": 0.0, "y": float(i), "z": 0.0} for i in range(12)],
+                planner={"target_v": 0.0, "aeb": "brake", "ttc_lead": 0.4},
+                ego_speed_mps=12.0,
+                seq=3,
+            ),
+        ),
+    ):
+        veh = Veh(speed)
+        act = BeamNGPyActuator(veh)
+        act.note_engaged(True)
+        sent = act.apply(cmd)
+        assert sent.applied is True
+        assert veh.shifts == ["arcade"]
+        _blocked(veh.calls[-1])
+
+
 def check_link_and_gear() -> None:
     from python.control.actuate import HEARTBEAT_STALE_S, TECH_DRIVE_SHIFT_LUA, TECH_SHIFT_MODE
 
@@ -168,6 +253,7 @@ def check_frustums() -> None:
 def main() -> None:
     check_roles()
     check_review()
+    check_arcade_hold_not_reverse()
     check_link_and_gear()
     check_frustums()
     print("test_supervisor_review: OK")

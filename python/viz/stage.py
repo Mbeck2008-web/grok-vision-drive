@@ -921,17 +921,6 @@ def _draw_edges(img: np.ndarray, edges: list, cam: Cam, state: dict[str, Any] | 
         if len(far) >= 2 and far[-1]["y"] > fade_y + 0.5:
             mid = 0.5 * (far[0]["y"] + far[-1]["y"])
             _draw_edge_piece(img, cam, far, solid=solid, alpha=_furniture_alpha(cam, mid))
-        for ext in _extend_predicted(raw, y_lo, y_hi):
-            ext_near = [p for p in ext if p["y"] <= fade_y + 1e-6]
-            ext_far = [p for p in ext if p["y"] >= fade_y - 1e-6]
-            if len(ext_near) >= 2:
-                _draw_edge_piece(img, cam, ext_near, solid=False, alpha=0.85)
-            if len(ext_far) >= 2 and ext_far[-1]["y"] > fade_y + 0.5:
-                mid = 0.5 * (ext_far[0]["y"] + ext_far[-1]["y"])
-                _draw_edge_piece(
-                    img, cam, ext_far, solid=False,
-                    alpha=0.85 * _furniture_alpha(cam, mid),
-                )
 
 
 def _draw_signs(img: np.ndarray, signs: list, cam: Cam) -> None:

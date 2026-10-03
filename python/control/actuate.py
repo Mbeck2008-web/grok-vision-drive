@@ -348,13 +348,15 @@ def tech_control_kwargs(
     release: bool = False,
     speed_mps: float | None = None,
 ) -> dict[str, Any]:
-    """BeamNGpy vehicle.control kwargs that never select reverse.
+    """Arcade forward drive. A full hold does not send the reverse pedal.
 
-    Shift mode is realistic_automatic (not arcade). Holds: throttle=0, brake=1,
-    gear=0, ±parkingbrake. Forward motion only with gear>=1 and throttle>0.
-    gear is int only; never -1, never letter D. Drive also sends clutch=0 so a
-    resting clutch pedal cannot hold the gearbox out of gear.
+    Shift mode stays arcade. Throttle>0 pins gear>=1 and clutch=0. A hold,
+    stop, or AEB (throttle ~0 and brake >= 0.99) is parkingbrake=1, service
+    brake 0, gear 0. Arcade treats that held service brake, with no throttle,
+    as reverse — gear 0 does not make it safe, and dropping the parking brake
+    above 0.5 m/s is the same pattern. gear is int only; never -1, never letter D.
     """
+    del speed_mps  # moving or stopped, the reverse pedal stays off
     if release:
         return {
             "steering": 0.0,
@@ -374,15 +376,19 @@ def tech_control_kwargs(
             "clutch": 0.0,
             "gear": _tech_gear(TECH_DRIVE_GEAR),
         }
-    parking = 0.0
     if brake_v >= TECH_HOLD_BRAKE:
-        moving = speed_mps is not None and float(speed_mps) > TECH_HOLD_SPEED_MPS
-        parking = 0.0 if moving else 1.0
+        return {
+            "steering": steer_v,
+            "throttle": 0.0,
+            "brake": 0.0,
+            "parkingbrake": 1.0,
+            "gear": _tech_gear(TECH_HOLD_GEAR),
+        }
     return {
         "steering": steer_v,
         "throttle": 0.0,
         "brake": brake_v,
-        "parkingbrake": parking,
+        "parkingbrake": 0.0,
         "gear": _tech_gear(TECH_HOLD_GEAR),
     }
 
@@ -397,21 +403,17 @@ def is_reverse_control(kwargs: dict[str, Any]) -> bool:
 
 
 def is_arcade_reverse_hold(kwargs: dict[str, Any]) -> bool:
-    """Backward-compat alias: arcade brake-hold → R, or an explicit reverse gear."""
+    """True when arcade would select reverse from these kwargs.
+
+    A held service brake with no throttle is reverse throttle. Gear 0 does
+    not make that safe, and neither does the parking brake. Explicit gear < 0
+    is reverse. Parking brake with the service brake released is not.
+    """
     if is_reverse_control(kwargs):
         return True
     throttle = float(kwargs.get("throttle") or 0.0)
     brake = float(kwargs.get("brake") or 0.0)
-    parkingbrake = float(kwargs.get("parkingbrake") or 0.0)
-    gear = kwargs.get("gear")
-    try:
-        if gear is not None and int(gear) == TECH_HOLD_GEAR:
-            return False
-        if gear is not None and int(gear) >= TECH_DRIVE_GEAR:
-            return False
-    except (TypeError, ValueError):
-        pass
-    return throttle <= 1e-6 and brake >= TECH_HOLD_BRAKE and parkingbrake < 0.5
+    return throttle <= 1e-6 and brake >= TECH_HOLD_BRAKE
 
 
 def plan_command(
@@ -424,8 +426,9 @@ def plan_command(
     """Map corridor + speed plan → DriveCommand pedals.
 
     AEB / full stop still return brake=1, throttle=0 (retail JSON + override
-    semantics). Tech remaps that pair in BeamNGPyActuator via tech_control_kwargs
-    (realistic_automatic, hold gear=0 + brake ±parkingbrake; never gear=-1).
+    semantics). Tech remaps that pair in tech_control_kwargs: arcade stays the
+    shift mode, and the hold is parkingbrake=1 with the service brake released
+    so arcade does not select reverse. Never gear=-1.
     """
     planner = planner or {}
     aeb = str(planner.get("aeb") or "off")
@@ -446,8 +449,8 @@ def plan_command(
     throttle = 0.0
     brake = 0.0
     if aeb == "brake" or (ttc is not None and float(ttc) < AEB_BRAKE_TTC):
-        # Keep the command semantic (brake=1). Arcade would treat this as reverse
-        # throttle; Tech remaps at control() (realistic_automatic, gear=0 hold).
+        # Keep the command semantic (brake=1). Arcade would treat a held service
+        # brake as reverse; tech_control_kwargs sends parking brake instead.
         throttle = 0.0
         brake = 1.0
     elif aeb == "warn":
@@ -773,14 +776,15 @@ class BeamNGPyActuator:
     Disengaged ticks must not slam brake=1 (that is takeover). On the falling
     edge we zero throttle/brake/parkingbrake, set AI mode to disabled, restore
     arcade shift, and rewrite gvd_cmd.json to brake=0 / engaged=false so a
-    stale brake:1 file cannot keep the pedals. Release does not arm
-    realistic_automatic when the shifter was never set. A failed arcade
-    restore leaves the latch set so the next disengaged tick retries. After
-    arcade succeeds, later Soft Esc ticks refresh the cmd file at most once
-    per SOFT_ESC_FILE_PERIOD_S. Engaged gate holds
-    (preview_blocked, AEB, veto) still apply the stop command, remapped off
-    reverse: realistic_automatic, hold gear=0 + brake ±parkingbrake, drive
-    gear>=1 plus clutch=0, never gear=-1. A failed set_shift_mode is logged
+    stale brake:1 file cannot keep the pedals. Release does not arm a new
+    shift mode when the shifter was never set. A failed arcade restore leaves
+    the latch set so the next disengaged tick retries. After arcade succeeds,
+    later Soft Esc ticks refresh the cmd file at most once per
+    SOFT_ESC_FILE_PERIOD_S. Engaged gate holds (preview_blocked, AEB, veto)
+    still apply the stop command. Arcade stays the shift mode. Forward drive
+    is gear>=1 with throttle. A hold is parkingbrake=1 and service brake 0,
+    never gear=-1, so the brake pedal is not reverse throttle. A failed
+    set_shift_mode is logged
     and retried. Throttle>0 while the echoed gear is not forward also queues
     a vehicle-Lua arm that leaves N/P without selecting reverse.
     """
@@ -910,7 +914,7 @@ class BeamNGPyActuator:
         return _gear_value(el)
 
     def _arm_shift_mode(self) -> None:
-        """Engage arms realistic_automatic. A thrown ack is logged and retried, not swallowed."""
+        """Engage arms arcade. A thrown ack is logged and retried, not swallowed."""
         veh = self.vehicle
         if veh is None or not hasattr(veh, "set_shift_mode"):
             return
@@ -1037,8 +1041,8 @@ class BeamNGPyActuator:
         if camera_ge_socket_busy():
             return "camera_io_busy"
         try:
-            # Engage arms realistic_automatic. A release with the shifter
-            # still unset must only clear pedals, not arm that mode on the way out.
+            # Engage arms arcade. A release with the shifter still unset must
+            # only clear pedals, not arm that mode on the way out.
             # A failed ack is logged and retried next tick (_shift_set stays false).
             if not release and not self._shift_set:
                 self._arm_shift_mode()

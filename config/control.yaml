@@ -13,9 +13,8 @@ veto:
   lane_conf_min: 0.25
   path_conf_min: 0.15
   steer_disagree_max: 0.55
-  # Reported loop and unique-camera Hz. Not an Engage drop: a hitch must
-  # not cycle HOLD and DRIVE or clear the driver's latch. Separate from the
-  # 8 Hz CAMS blit drop and the 10 Hz narrow-far hitch. 0 is unmeasured.
+  # Kept so older callers can still read a rate name. Not an Engage gate.
+  # Separate from the 8 Hz CAMS blit drop and the 10 Hz narrow-far hitch.
   min_accept_hz: 6
   engage_hz_grace_s: 3.0
   engage_hz_grace_floor: 5

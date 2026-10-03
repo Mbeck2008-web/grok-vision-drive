@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 
 from python.perception.road_model import suppress_lane_fan
+from python.planning.path_predictor import path_length_m
 from python.runtime.debug_opts import CAMS_DROP_HZ, DEBUG_ROWS, MODEL_ROWS, NERD_TABS, VIZ_ROWS, DebugOpts
 from python.sensors.cameras import CAM_IDS
 from python.viz.debug_draw import cam_slot_live, draw_cam_tiles
@@ -30,6 +31,14 @@ TAB_H = 36
 PAD_X = 16
 # yolov8n-onnx is 133px at FS_BODY; keep pad so shipped ids are not clipped.
 VAL_COL_W = 148
+# DRIVE tab pedal history. Newest sample is the right edge. Path length uses a 40 m full scale.
+PEDAL_TRACE_N = 60
+PEDAL_GRAPH_H = 168
+PATH_LENGTH_SCALE_M = 40.0
+THR_COLOR = (212, 196, 158)       # actual throttle, 0–1
+THR_PRED_COLOR = (40, 180, 230)   # predicted throttle = path length, meters
+BRK_COLOR = (70, 70, 220)         # actual brake, 0–1
+BRK_PRED_COLOR = (160, 120, 230)  # planner brake, 0–1
 
 
 def scene_note(s: dict[str, Any]) -> str:
@@ -97,6 +106,130 @@ def _put(img: np.ndarray, text: str, xy: tuple[int, int], scale: float, color, t
     cv2.putText(img, text, xy, FONT, scale, color, thick, cv2.LINE_AA)
 
 
+def _finite(value: Any, default: float = 0.0) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    if out != out or out in (float("inf"), float("-inf")):
+        return default
+    return out
+
+
+def _unit(value: Any) -> float:
+    return max(0.0, min(1.0, _finite(value, 0.0)))
+
+
+def pedal_sample(state: dict[str, Any] | None) -> dict[str, float]:
+    """One DRIVE-tab sample.
+
+    Actual throttle and brake are the positions commanded this tick (`ego`).
+    Predicted throttle is the planned route length in meters, not a pedal guess.
+    Predicted brake is the brake the path follower would send, in 0–1.
+    Missing series are zeros.
+    """
+    state = state if isinstance(state, dict) else {}
+    ego = state.get("ego") if isinstance(state.get("ego"), dict) else {}
+    planner = state.get("planner") if isinstance(state.get("planner"), dict) else {}
+    if "path_length_m" in planner:
+        length = max(0.0, _finite(planner.get("path_length_m"), 0.0))
+    else:
+        length = path_length_m(state.get("path_ego"))
+    return {
+        "thr": _unit(ego.get("throttle")),
+        "thr_pred_m": length,
+        "brk": _unit(ego.get("brake")),
+        "brk_pred": _unit(planner.get("pred_brake")),
+    }
+
+
+def _note_pedal_sample(ui: Any, sample: dict[str, float]) -> list[dict[str, float]]:
+    if ui is None:
+        return [sample]
+    hist = getattr(ui, "pedal_trace", None)
+    if not isinstance(hist, list):
+        hist = []
+        try:
+            ui.pedal_trace = hist
+        except Exception:
+            return [sample]
+    hist.append(dict(sample))
+    if len(hist) > PEDAL_TRACE_N:
+        del hist[: len(hist) - PEDAL_TRACE_N]
+    return hist
+
+
+def _spark(
+    img: np.ndarray,
+    samples: list[dict[str, float]],
+    key: str,
+    box: tuple[int, int, int, int],
+    color: tuple[int, int, int],
+    ymax: float,
+) -> None:
+    x0, y0, x1, y1 = box
+    if x1 <= x0 or y1 <= y0 or ymax <= 0.0 or not samples:
+        return
+    pts = []
+    last = max(1, len(samples) - 1)
+    for i, sample in enumerate(samples):
+        frac_x = i / last
+        val = max(0.0, _finite(sample.get(key), 0.0))
+        frac_y = max(0.0, min(1.0, val / ymax))
+        pts.append((int(x0 + frac_x * (x1 - x0)), int(y1 - frac_y * (y1 - y0))))
+    arr = np.array(pts, dtype=np.int32)
+    if len(pts) == 1:
+        cv2.circle(img, pts[0], 3, color, -1, cv2.LINE_AA)
+    else:
+        cv2.polylines(img, [arr], False, color, 2, cv2.LINE_AA)
+
+
+def _draw_pedal_graph(img: np.ndarray, samples: list[dict[str, float]], h: int, w: int) -> None:
+    """Throttle actual vs path length, and brake actual vs planner brake, on the DRIVE tab."""
+    hint_top = h - 16 - ROW_H
+    bottom = hint_top - 8
+    top = bottom - PEDAL_GRAPH_H
+    if top < 40:
+        return
+    left, right = PAD_X, w - PAD_X
+    cv2.rectangle(img, (left, top), (right, bottom), (28, 24, 22), -1)
+    cv2.rectangle(img, (left, top), (right, bottom), (70, 64, 58), 1)
+    mid = top + (bottom - top) // 2
+    cv2.line(img, (left + 8, mid), (right - 8, mid), (48, 42, 38), 1)
+    latest = samples[-1] if samples else pedal_sample({})
+    length_scale = PATH_LENGTH_SCALE_M
+    for sample in samples:
+        length_scale = max(length_scale, _finite(sample.get("thr_pred_m"), 0.0))
+    _put(
+        img,
+        _fit(
+            f"thr {latest['thr']:.2f}   pred {latest['thr_pred_m']:.1f} m path",
+            right - left - 12,
+            FS_DIM,
+        ),
+        (left + 8, top + 18),
+        FS_DIM,
+        FG,
+    )
+    thr_box = (left + 8, top + 26, right - 8, mid - 6)
+    _spark(img, samples, "thr", thr_box, THR_COLOR, 1.0)
+    _spark(img, samples, "thr_pred_m", thr_box, THR_PRED_COLOR, length_scale)
+    _put(
+        img,
+        _fit(
+            f"brk {latest['brk']:.2f}   pred {latest['brk_pred']:.2f}",
+            right - left - 12,
+            FS_DIM,
+        ),
+        (left + 8, mid + 18),
+        FS_DIM,
+        FG,
+    )
+    brk_box = (left + 8, mid + 26, right - 8, bottom - 8)
+    _spark(img, samples, "brk", brk_box, BRK_COLOR, 1.0)
+    _spark(img, samples, "brk_pred", brk_box, BRK_PRED_COLOR, 1.0)
+
+
 def render_panel(
     state: dict[str, Any],
     h: int = 720,
@@ -127,6 +260,10 @@ def render_panel(
     y = 34
     _put(img, "GVD  ·  VISION", (PAD_X, y), FS_TITLE, ICE)
     y = _draw_tabs(img, tab, w, y + 14, hits)
+    try:
+        trace = _note_pedal_sample(ui, pedal_sample(state))
+    except Exception:
+        trace = [{"thr": 0.0, "thr_pred_m": 0.0, "brk": 0.0, "brk_pred": 0.0}]
     live_limit = h - 28 - ROW_H
     if tab == "keys":
         lines = _help_lines()
@@ -141,7 +278,13 @@ def render_panel(
         y = _draw_knob_tab(
             img, opts, sel, y + 8, h, w, hits, DEBUG_ROWS,
             intro="wires into live gates / actuators / AEB",
+            extra_foot=PEDAL_GRAPH_H + ROW_H,
         )
+        try:
+            _draw_pedal_graph(img, trace, h, w)
+        except Exception:
+            # A bad sample must not take down the supervisor frame.
+            pass
     elif tab == "viz":
         y = _draw_knob_tab(
             img, opts, viz_sel, y + 8, h, w, hits, VIZ_ROWS,
@@ -259,13 +402,14 @@ def _draw_knob_tab(
     rows: tuple,
     *,
     intro: str,
+    extra_foot: int = 0,
 ) -> int:
     y = y0
     _put(img, _fit(intro, w - PAD_X * 2, FS_DIM), (PAD_X, y), FS_DIM, DIM)
     y += ROW_H
     n_ctrl = sum(1 for r in rows if r.get("kind") != "header")
     sel_i = (sel % n_ctrl) if n_ctrl else 0
-    foot_reserve = ROW_H * 2 + 8
+    foot_reserve = ROW_H * 2 + 8 + max(0, int(extra_foot))
     max_lines = max(1, (h - y - foot_reserve) // ROW_H)
     lines_before = 0
     ctrl = 0

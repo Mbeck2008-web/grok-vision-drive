@@ -83,6 +83,7 @@ class IoUTracker:
                 "speed_mps": t.speed_mps,
                 "yaw_rate": t.yaw_rate,
                 "hits": t.hits,
+                "misses": t.misses,
                 "age": t.age,
                 "conf": t.conf,
             }

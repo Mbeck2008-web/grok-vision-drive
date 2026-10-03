@@ -48,6 +48,10 @@ class Detection:
     x: float = 0.0
     y: float = 0.0
     yaw: float = 1.57
+    # Lamp colour when the detector has one. Empty means the pipeline must not invent red.
+    state: str | None = None
+    partial: bool = False
+    misses: int = 0
 
 
 def project_box_to_ego(xyxy: tuple[float, float, float, float], img_w: int, img_h: int) -> tuple[float, float, float]:

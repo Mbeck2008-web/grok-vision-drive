@@ -59,6 +59,11 @@ HAZARD = (92, 92, 196)
 KERB = (124, 131, 168)  # warm grey-red, not lane paint
 EGO_BODY = (84, 74, 64)
 EGO_EDGE = (150, 136, 122)
+# Same box _draw_ego paints. The ribbon is a point at this center and
+# reaches this width at the front bumper, half a length ahead.
+EGO_LENGTH_M = 4.4
+EGO_WIDTH_M = 1.85
+RIBBON_FLARE_M = EGO_LENGTH_M * 0.5
 PED = (138, 176, 215)
 BIKE = (90, 184, 224)
 POLE = (136, 128, 120)
@@ -87,6 +92,8 @@ class VizUI:
     model_sel: int = 0
     nerd_hits: list = field(default_factory=list)
     nerd_width: int = NERD_WIDTH
+    # Recent DRIVE-tab pedal samples. The viz appends one per frame; the drive loop does not read it.
+    pedal_trace: list = field(default_factory=list)
 
     def toggle_nerd(self) -> None:
         self.show_nerd = not self.show_nerd
@@ -863,7 +870,10 @@ def _draw_lanes(img: np.ndarray, lanes: list, cam: Cam, *, smoke: bool, state: d
             img, cam, pts, color, thick,
             dashed=dashed or dash_default, dash=10 if mode == "solid" and not dashed else 8, gap=5,
         )
-        # Short live paint is extended as predicted dashes. The source poly is not relabeled.
+        # A finished piece (extend: false) is the road that is already drawn.
+        # Short live paint is still extended as predicted dashes.
+        if isinstance(ln, dict) and ln.get("extend") is False:
+            continue
         ext_color, ext_thick, _ = _lane_color("dashed", fade * 0.85)
         for ext in _extend_predicted(pts, y_lo, y_hi):
             _stroke_world(img, cam, ext, ext_color, ext_thick, dashed=True, dash=8, gap=6)
@@ -1084,6 +1094,87 @@ def resolve_corridors(state: dict[str, Any]) -> tuple[list[dict[str, float]], li
     return modular, ghost
 
 
+def ribbon_half_m(dist_m: float, steady_half: float) -> float:
+    """Ribbon half-width along the route.
+
+    A point at the vehicle center. Car width (the steady half the caller
+    passes, already capped at the ego) by the front bumper. Constant after that.
+    """
+    steady = max(0.0, float(steady_half))
+    dist = max(0.0, float(dist_m))
+    if dist >= RIBBON_FLARE_M or RIBBON_FLARE_M <= 1e-6:
+        return steady
+    return steady * (dist / RIBBON_FLARE_M)
+
+
+def paint_half_m(half_w: float) -> float:
+    """Steady ribbon half-width. A lane-wide corridor still paints about the car."""
+    return min(max(0.0, float(half_w)), EGO_WIDTH_M * 0.5)
+
+
+def _ribbon_centerline(path: list[dict]) -> list[tuple[float, float, float]]:
+    """Drawing centerline. Starts at the vehicle center, then the planned route.
+
+    The planner polyline is not rewritten. A route that begins on a ring gets
+    a straight run from the origin to that first point, outside the island.
+    The first few meters are sampled finely so the flare reads as a wedge.
+    """
+    pts: list[tuple[float, float]] = []
+    for p in path or []:
+        pts.append((float(p.get("x") or 0.0), float(p.get("y") or 0.0)))
+    if len(pts) < 2:
+        return []
+    if math.hypot(pts[0][0], pts[0][1]) > 0.05:
+        gap = math.hypot(pts[0][0], pts[0][1])
+        steps = max(1, int(math.ceil(gap / 0.4)))
+        x1, y1 = pts[0]
+        lead = [(x1 * i / steps, y1 * i / steps) for i in range(steps)]
+        pts = lead + pts
+    dense: list[tuple[float, float]] = [pts[0]]
+    walked = 0.0
+    flare_end = RIBBON_FLARE_M + 0.8
+    for a, b in zip(pts, pts[1:]):
+        seg = math.hypot(b[0] - a[0], b[1] - a[1])
+        if seg < 1e-8:
+            continue
+        if walked < flare_end:
+            n = max(1, int(math.ceil(seg / 0.35)))
+            for i in range(1, n + 1):
+                t = i / n
+                dense.append((a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t))
+            walked += seg
+        else:
+            dense.append(b)
+            walked += seg
+    out: list[tuple[float, float, float]] = []
+    dist = 0.0
+    prev: tuple[float, float] | None = None
+    for x, y in dense:
+        if prev is not None:
+            dist += math.hypot(x - prev[0], y - prev[1])
+        out.append((x, y, dist))
+        prev = (x, y)
+    return out
+
+
+def _cut_ribbon(
+    samples: list[tuple[float, float, float]], max_dist: float,
+) -> list[tuple[float, float, float]]:
+    out: list[tuple[float, float, float]] = []
+    for x, y, d in samples:
+        if d <= max_dist + 1e-6:
+            out.append((x, y, d))
+            continue
+        if not out:
+            break
+        px, py, pd = out[-1]
+        span = d - pd
+        t = 0.0 if span < 1e-6 else (max_dist - pd) / span
+        out.append((px + (x - px) * t, py + (y - py) * t, max_dist))
+        break
+    return out
+
+
 def _draw_filled_corridor(
     img: np.ndarray,
     path: list[dict],
@@ -1094,52 +1185,53 @@ def _draw_filled_corridor(
     intent: float,
     preview: bool,
     gain: float = 1.0,
+    max_dist: float | None = None,
+    mark_origin: bool = False,
 ) -> None:
     if len(path) < 2 or half_w <= 0.0:
         return
-    trimmed: list[tuple[float, float, float]] = []
-    dist = 0.0
-    prev = None
-    for p in path:
-        x, y = float(p.get("x", 0)), float(p.get("y", 0))
-        if prev is not None:
-            dist += math.hypot(x - prev[0], y - prev[1])
-        trimmed.append((x, y, dist if prev is not None else 0.0))
-        prev = (x, y)
-    if len(trimmed) < 2:
+    samples = _ribbon_centerline(path)
+    if len(samples) < 2:
         return
-    total = trimmed[-1][2]
+    total = samples[-1][2]
+    if max_dist is not None:
+        samples = _cut_ribbon(samples, max_dist)
+    if len(samples) < 2:
+        return
     fade_from = total * (1.0 - CORRIDOR_FADE_FRAC)
 
-    left, right, center, alphas = [], [], [], []
-    for i, (x, y, d) in enumerate(trimmed):
-        if i + 1 < len(trimmed):
-            nx, ny = trimmed[i + 1][0], trimmed[i + 1][1]
+    left, right, center, alphas, dists = [], [], [], [], []
+    for i, (x, y, d) in enumerate(samples):
+        if i + 1 < len(samples):
+            nx, ny = samples[i + 1][0], samples[i + 1][1]
         else:
-            nx, ny = trimmed[i - 1][0], trimmed[i - 1][1]
+            nx, ny = samples[i - 1][0], samples[i - 1][1]
             nx, ny = x - (nx - x), y - (ny - y)
         tx, ty = nx - x, ny - y
         norm = math.hypot(tx, ty) + 1e-6
-        px, py = (ty / norm) * half_w, (-tx / norm) * half_w
+        local = ribbon_half_m(d, half_w)
+        ox, oy = (ty / norm) * local, (-tx / norm) * local
         if total <= 1e-3 or d <= fade_from:
             fade = 1.0
         else:
             fade = max(0.0, 1.0 - (d - fade_from) / max(1e-3, total - fade_from))
         cx, cy = cam.project(x, y, 0.03)
-        lx, ly = cam.project(x - px, y - py, 0.03)
-        rx, ry = cam.project(x + px, y + py, 0.03)
-        if abs(rx - lx) < 1 and abs(ry - ly) < 1:
-            half_px = half_w * cam.scale_at(y)
+        lx, ly = cam.project(x - ox, y - oy, 0.03)
+        rx, ry = cam.project(x + ox, y + oy, 0.03)
+        if abs(rx - lx) < 1 and abs(ry - ly) < 1 and local > 0.05:
+            half_px = local * cam.scale_at(y)
             lx, ly = int(round(cx - half_px)), cy
             rx, ry = int(round(cx + half_px)), cy
         left.append((lx, ly))
         right.append((rx, ry))
         center.append((cx, cy))
         alphas.append(fade)
+        dists.append(d)
 
     nseg = len(left) - 1
     for i in range(nseg):
-        near = 1.0 - i / max(1, nseg)
+        # Arc length, not vertex index: the flare is sampled finer than the route.
+        near = 1.0 - min(1.0, dists[i] / max(total, 1e-3))
         a = gain * intent * (0.38 + 0.50 * near) * max(0.25, conf) * (0.55 * alphas[i] + 0.45 * alphas[i + 1])
         if a < 0.02:
             continue
@@ -1153,6 +1245,11 @@ def _draw_filled_corridor(
         _stroke_poly(img, [left[i], left[i + 1]], edge, 2, dashed=preview, dash=5, gap=4)
         _stroke_poly(img, [right[i], right[i + 1]], edge, 2, dashed=preview, dash=5, gap=4)
     _stroke_poly(img, center, _mix(ICE, 0.30), 1, dashed=True, dash=4, gap=5)
+    if mark_origin and dists[0] <= 0.02:
+        sc = cam.scale_at(samples[0][1])
+        rad = max(2, min(4, int(round(0.08 * sc))))
+        cv2.circle(img, center[0], rad, CORRIDOR, -1, cv2.LINE_AA)
+        cv2.circle(img, center[0], rad, ICE_HI, 1, cv2.LINE_AA)
 
 
 def _draw_path_world_overlay(img: np.ndarray, path_world: list, cam: Cam) -> None:
@@ -1332,7 +1429,7 @@ def _draw_ego(img: np.ndarray, cam: Cam, engaged: bool) -> None:
     if engaged:
         _draw_underglow(img, True, cam)
     yaw = math.pi / 2
-    _draw_box(img, cam, 0.0, 0.0, yaw, 4.4, 1.85, 1.5, EGO_BODY, 1.0, EGO_EDGE, 1)
+    _draw_box(img, cam, 0.0, 0.0, yaw, EGO_LENGTH_M, EGO_WIDTH_M, 1.5, EGO_BODY, 1.0, EGO_EDGE, 1)
 
 
 def _pt_xy(p: Any) -> tuple[float, float]:
@@ -1502,26 +1599,29 @@ def render_stage(
     all_tracks = list(state.get("tracks") or [])[:MAX_AGENTS]
     tracks = all_tracks if show_ghosts else []
 
+    ribbon_on_ego = None
     if show_path:
         intent = pace_scale(state)
+        body_half = paint_half_m(half_w)
         # Preview stays dimmer. A shadow ghost is thinner and only off the clean cabin.
         if ghost and not clean:
             _draw_filled_corridor(
                 img, ghost, path_conf, cam,
-                half_w=half_w * 0.62,
+                half_w=paint_half_m(half_w) * 0.62,
                 intent=intent * 0.40,
                 preview=False,
                 gain=0.55 if preview else 1.0,
             )
         _draw_filled_corridor(
             img, path, path_conf, cam,
-            half_w=half_w,
+            half_w=body_half,
             intent=intent,
             preview=preview,
             gain=0.62 if preview else 1.0,
         )
         _draw_stop_bar(img, path, half_w, all_tracks, cipv_id, cam, is_halted(state))
         _draw_path_world_overlay(img, state.get("path_world") or [], cam)
+        ribbon_on_ego = (path, path_conf, body_half, intent, preview)
 
     if (not clean) and dbg.viz_cost:
         draw_planner_cost(img, cam, path, path_width, all_tracks)
@@ -1553,6 +1653,19 @@ def render_stage(
 
     _draw_fog(img, cam)
     _draw_ego(img, cam, engaged)
+    # The body covers the ground under the car. Paint the flare again so the
+    # ribbon is a point at the center that opens to car width by the nose.
+    if ribbon_on_ego is not None:
+        path_r, conf_r, body_half, intent_r, preview_r = ribbon_on_ego
+        _draw_filled_corridor(
+            img, path_r, conf_r, cam,
+            half_w=body_half,
+            intent=intent_r,
+            preview=preview_r,
+            gain=0.62 if preview_r else 1.0,
+            max_dist=RIBBON_FLARE_M + 0.45,
+            mark_origin=True,
+        )
 
     if main_frame is not None and getattr(main_frame, "size", 0) and not drop_heavy and dbg.viz_pip:
         pip = np.full((180, 320, 3), (28, 28, 28), dtype=np.uint8)

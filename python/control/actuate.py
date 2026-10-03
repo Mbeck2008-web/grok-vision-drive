@@ -87,6 +87,7 @@ class DriveCommand:
     seq: int = 0
     applied: bool = False
     reason: str = "ok"
+    blinker: str = "off"  # off | left | right, from the predicted path
 
 
 def cmd_path() -> Path:
@@ -436,6 +437,10 @@ def plan_command(
         x = float(mid.get("x", 0.0))
         steer = max(-1.0, min(1.0, x / 2.5))
 
+    blinker = str(planner.get("blinker") or "off")
+    if blinker not in ("left", "right"):
+        blinker = "off"
+
     throttle = 0.0
     brake = 0.0
     if aeb == "brake" or (ttc is not None and float(ttc) < AEB_BRAKE_TTC):
@@ -455,7 +460,9 @@ def plan_command(
         else:
             throttle = 0.12 if target_v > 1.0 else 0.0
 
-    return DriveCommand(steer=steer, throttle=throttle, brake=brake, seq=seq, reason="plan")
+    return DriveCommand(
+        steer=steer, throttle=throttle, brake=brake, seq=seq, reason="plan", blinker=blinker,
+    )
 
 
 def safe_command(
@@ -789,6 +796,7 @@ class BeamNGPyActuator:
         self._shift_ok_logged = False
         self._drive_arm_mono: float | None = None
         self.drive_arm_n = 0
+        self._blinker: str | None = None
 
     def note_engaged(self, engaged: bool) -> None:
         self.engaged = bool(engaged)
@@ -986,8 +994,39 @@ class BeamNGPyActuator:
             raise last_err
         raise TypeError("vehicle.control rejected non-reverse Tech kwargs")
 
+    def _apply_blinker(self, blinker: str) -> None:
+        """Turn signals after the drive command. Skipped while the camera holds the socket.
+
+        ``_control`` returns before this when ``camera_ge_socket_busy`` is set, so a
+        blinker never opens a second GE call on a busy tick. The signal changes only
+        when the predicted path asks for a different side.
+        """
+        mode = blinker if blinker in ("left", "right") else "off"
+        if mode == self._blinker:
+            return
+        fn = getattr(self.vehicle, "set_lights", None)
+        if not callable(fn):
+            self._blinker = mode
+            return
+        try:
+            fn(left_signal=(mode == "left"), right_signal=(mode == "right"), hazard_signal=False)
+        except TypeError:
+            try:
+                fn(left_signal=(mode == "left"), right_signal=(mode == "right"))
+            except Exception:
+                return
+        except Exception:
+            return
+        self._blinker = mode
+
     def _control(
-        self, steer: float, throttle: float, brake: float, *, release: bool = False
+        self,
+        steer: float,
+        throttle: float,
+        brake: float,
+        *,
+        release: bool = False,
+        blinker: str = "off",
     ) -> str | None:
         if self.vehicle is None:
             return "no_vehicle"
@@ -1012,6 +1051,7 @@ class BeamNGPyActuator:
                 steer, throttle, brake, release=release, speed_mps=speed_mps
             )
             self._invoke_control(kwargs)
+            self._apply_blinker("off" if release else blinker)
             if not release and float(throttle) > 1e-6:
                 gear_echo = self._echo_gear()
                 if not gear_is_forward(gear_echo):
@@ -1026,7 +1066,9 @@ class BeamNGPyActuator:
             if cmd.reason in ("ok", "plan"):
                 cmd.reason = "not_engaged"
             return cmd
-        err = self._control(cmd.steer, cmd.throttle, cmd.brake)
+        err = self._control(
+            cmd.steer, cmd.throttle, cmd.brake, blinker=getattr(cmd, "blinker", "off"),
+        )
         if err:
             cmd.applied = False
             cmd.reason = err

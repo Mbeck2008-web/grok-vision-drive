@@ -27,6 +27,7 @@ def main() -> None:
             hit = re.search(pattern, low)
             assert hit is None, f"{name}: {label} found ({hit.group(0)!r})"
     assert "GVD" in stage_src and "VISION" in stage_src
+    assert "blinker" not in nerd_src, "blinkers stay off the supervisor tabs"
     assert "PATH_FADE" not in stage_src
     assert "CORRIDOR_FADE_FRAC" in stage_src
 
@@ -396,7 +397,8 @@ def main() -> None:
     )
     assert n == 8
 
-    # Corridor width stays path_width/2 meters. A 40 m path does not grow ice past itself.
+    # Past the nose the ribbon is about car width, not a lane-wide bar.
+    # A 40 m path does not grow ice past itself.
     ribbon = {
         "engaged": False,
         "loop_hz": 12.0,
@@ -438,12 +440,13 @@ def main() -> None:
             painted_x.append(float(x))
     assert painted_x, "corridor should paint near the ego"
     world_half = max(abs(min(painted_x)), abs(max(painted_x)))
-    assert abs(world_half - float(ribbon["path_width"]) * 0.5) <= 0.25, world_half
+    paint_half = min(float(ribbon["path_width"]) * 0.5, 1.85 * 0.5)
+    assert abs(world_half - paint_half) <= 0.35, (world_half, paint_half)
     right = max(painted_x)
     half_px = abs(cam.project(right, y_near, 0.03)[0] - cam.project(0.0, y_near, 0.03)[0])
-    expected_half = (float(ribbon["path_width"]) * 0.5) * cam.scale_at(y_near)
-    assert abs(half_px - expected_half) <= max(8.0, 0.20 * expected_half), (
-        f"half-width {half_px:.1f}px != path_width/2 * scale_at ({expected_half:.1f}px)"
+    expected_half = paint_half * cam.scale_at(y_near)
+    assert abs(half_px - expected_half) <= max(8.0, 0.28 * expected_half), (
+        f"half-width {half_px:.1f}px != car-width/2 * scale_at ({expected_half:.1f}px)"
     )
     far_px, far_py = cam.project(2.2, y_near, 0.03)
     assert int(delta[far_py, far_px].sum()) <= 8, "ribbon must not inflate out to the lane fan"
@@ -713,7 +716,167 @@ def main() -> None:
     fast_signs = render_stage({**slow, "loop_hz": 12.0}, ui=sign_ui)
     assert int(cv2.absdiff(slow_full, fast_signs).sum()) > 0, "under 8 Hz signs drop"
 
+    check_drive_pedal_graph()
+    check_ribbon_flare()
+
     print("test_gvd_viz_stage: OK")
+
+
+def check_drive_pedal_graph() -> None:
+    """DRIVE tab: actual pedals vs path length and planner brake. Missing series stay zero."""
+    import numpy as np
+
+    from python.planning.path_predictor import path_length_m
+    from python.viz.nerd import pedal_sample, render_panel
+    from python.viz.stage import VizUI
+
+    path = [{"x": 0.0, "y": float(i), "z": 0.0} for i in range(0, 21)]
+    assert abs(path_length_m(path) - 20.0) < 1e-6
+    state = {
+        "ego": {"throttle": 0.42, "brake": 0.15, "steer_deg": 35.0},
+        "planner": {"path_length_m": 20.0, "pred_brake": 0.8},
+        "path_ego": path,
+    }
+    ui = VizUI()
+    ui.show_drive_tab()
+    painted = render_panel(state, h=800, w=560, ui=ui)
+    assert painted.shape == (800, 560, 3)
+    last = ui.pedal_trace[-1]
+    assert last["thr"] == 0.42
+    assert last["thr_pred_m"] == 20.0
+    assert last["brk"] == 0.15
+    assert last["brk_pred"] == 0.8
+    # Wheel angle is on the state and is not the predicted throttle.
+    spun = dict(state)
+    spun["ego"] = {"throttle": 0.42, "brake": 0.15, "steer_deg": -80.0}
+    assert pedal_sample(spun)["thr_pred_m"] == 20.0
+    assert pedal_sample(spun)["thr"] == 0.42
+
+    short = {
+        "ego": {"throttle": 0.0, "brake": 1.0},
+        "planner": {"path_length_m": 4.0, "pred_brake": 1.0},
+        "path_ego": path[:5],
+    }
+    again = render_panel(short, h=800, w=560, ui=ui)
+    assert not np.array_equal(painted, again)
+    assert ui.pedal_trace[-1]["thr_pred_m"] == 4.0
+    assert ui.pedal_trace[-1]["thr"] == 0.0
+    assert ui.pedal_trace[-1]["brk"] == 1.0
+
+    # No planner fields: predicted throttle is the polyline length, missing brake is 0.
+    measured = pedal_sample({"ego": {"throttle": 0.2}, "path_ego": path, "steer_deg": 12.0})
+    assert measured["thr"] == 0.2
+    assert abs(measured["thr_pred_m"] - 20.0) < 1e-6
+    assert measured["brk"] == 0.0 and measured["brk_pred"] == 0.0
+
+    bare = VizUI()
+    bare.show_drive_tab()
+    empty = render_panel({}, h=800, w=560, ui=bare)
+    assert empty.shape == (800, 560, 3)
+    assert bare.pedal_trace[-1] == {
+        "thr": 0.0,
+        "thr_pred_m": 0.0,
+        "brk": 0.0,
+        "brk_pred": 0.0,
+    }
+    assert "blinker" not in bare.pedal_trace[-1]
+    # The empty graph still paints its frame, so a missing series is not a blank panel.
+    assert int(empty.max()) > 40
+
+
+def check_ribbon_flare() -> None:
+    """Point at the vehicle center, car width by the nose, then into the route.
+
+    A ring that the planner starts on still draws back to the car. The steady
+    width stays the car, even when path_width is a full lane.
+    """
+    import cv2
+    import numpy as np
+
+    from python.viz.stage import (
+        EGO_LENGTH_M,
+        EGO_WIDTH_M,
+        RIBBON_FLARE_M,
+        Cam,
+        VizUI,
+        _ribbon_centerline,
+        paint_half_m,
+        render_stage,
+        ribbon_half_m,
+    )
+
+    car_half = EGO_WIDTH_M * 0.5
+    assert RIBBON_FLARE_M == EGO_LENGTH_M * 0.5
+    assert ribbon_half_m(0.0, car_half) == 0.0
+    assert abs(ribbon_half_m(RIBBON_FLARE_M * 0.5, car_half) - car_half * 0.5) < 1e-6
+    assert abs(ribbon_half_m(RIBBON_FLARE_M, car_half) - car_half) < 1e-6
+    assert abs(ribbon_half_m(20.0, car_half) - car_half) < 1e-6
+    assert abs(paint_half_m(3.5 * 0.5) - car_half) < 1e-6
+    assert paint_half_m(0.4) == 0.4
+
+    ring = []
+    for deg in range(-90, 30, 6):
+        ang = math.radians(deg)
+        ring.append({"x": 12.0 * math.cos(ang), "y": 18.0 + 12.0 * math.sin(ang), "z": 0.0})
+    samples = _ribbon_centerline(ring)
+    assert abs(samples[0][0]) < 1e-6 and abs(samples[0][1]) < 1e-6, samples[0]
+    assert abs(samples[-1][0] - ring[-1]["x"]) < 1e-6
+    assert any(abs(y - RIBBON_FLARE_M) < 0.4 for _x, y, _d in samples)
+
+    st = {
+        "engaged": False,
+        "loop_hz": 12.0,
+        "policy": "modular",
+        "e2e_backend": "stub",
+        "veto_reason": "none",
+        "path_conf": 0.9,
+        "path_width": 3.5,
+        "path_debug_preview": False,
+        "viz_smoke": False,
+        "ego": {"speed_mps": 8.0, "brake": 0.0},
+        "planner": {"aeb": "off", "target_v": 8.0, "ttc_lead": 4.0, "corridor_width": 3.5},
+        "path_ego": ring,
+        "tracks": [],
+        "lanes_ext": [],
+        "road_edges": [],
+        "signs": [],
+    }
+    ui = VizUI()
+    ui.top_down = True
+    ui.show_nerd = False
+    ui.layers = {0}
+    ui.debug.viz_forecast = False
+    ui.debug.viz_lanes = False
+    ui.debug.viz_signs = False
+    ui.debug.viz_ghosts = False
+    painted = render_stage(st, ui=ui)
+    bare = dict(st)
+    bare["path_ego"] = []
+    empty = render_stage(bare, ui=ui)
+    delta = cv2.absdiff(painted, empty)
+    cam = Cam(top_down=True)
+
+    def half_at(y: float) -> float | None:
+        hit = []
+        for x in np.linspace(-3.0, 3.0, 241):
+            px, py = cam.project(float(x), y, 0.03)
+            if 0 <= px < delta.shape[1] and 0 <= py < delta.shape[0] and int(delta[py, px].sum()) > 12:
+                hit.append(float(x))
+        if not hit:
+            return None
+        return max(abs(min(hit)), abs(max(hit)))
+
+    origin = half_at(0.0)
+    assert origin is not None and origin < 0.40, origin
+    nose = half_at(RIBBON_FLARE_M)
+    assert nose is not None and abs(nose - car_half) <= 0.40, nose
+    assert nose < 1.35, nose
+    approach = half_at(4.0)
+    assert approach is not None and abs(approach - car_half) <= 0.40, approach
+    px, py = cam.project(0.0, 4.0, 0.03)
+    assert int(delta[py, px].sum()) > 12, "ribbon must run from the car to the ring"
+    px, py = cam.project(ring[4]["x"], ring[4]["y"], 0.03)
+    assert int(delta[py, px].sum()) > 12, "ribbon must still be on the ring"
 
 
 def test_gvd_viz_stage() -> None:

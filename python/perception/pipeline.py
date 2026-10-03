@@ -15,6 +15,8 @@ from python.perception.track import IoUTracker
 from python.planning.path_predictor import predict_path
 
 MAX_SIGNS = 8
+SIGN_KEEP = 8
+SIGN_MATCH_M = 3.0
 
 
 @dataclass
@@ -42,12 +44,16 @@ class ModularPerception:
 
         self.detector, self.missing = load_detector(detector_id, allow_synthetic=allow_synthetic)
         self.tracker = IoUTracker()
+        self._prior_lanes: list = []
+        self._prior_signs: list[dict[str, Any]] = []
 
     def set_detector(self, detector: Any, missing: list[str] | None = None) -> None:
         """Swap the live detector; reset tracks so CIPV ids do not stick to a dead net."""
         self.detector = detector
         self.missing = list(missing or [])
         self.tracker = IoUTracker()
+        self._prior_lanes = []
+        self._prior_signs = []
 
     def tick(
         self,
@@ -64,22 +70,33 @@ class ModularPerception:
         # Road furniture is detected but never tracked: tracks feed CIPV / AEB / ghosts,
         # and a stop sign is not a lead vehicle. It rides to the UI as `signs` instead.
         moving = [d for d in dets if d.cls not in STATIC_CLASSES]
-        signs = [
-            {
+        fresh_signs = []
+        for d in dets:
+            if d.cls not in STATIC_CLASSES:
+                continue
+            lamp = getattr(d, "state", None)
+            if d.cls == "traffic_light" and lamp in (None, ""):
+                lamp = "unknown"
+            fresh_signs.append({
                 "cls": d.cls,
                 "x": round(float(d.x), 2),
                 "y": round(float(d.y), 2),
                 "conf": round(float(d.conf), 2),
-                # No colour classifier in the stack yet — never guess the aspect.
-                "state": "unknown" if d.cls == "traffic_light" else None,
-            }
-            for d in dets
-            if d.cls in STATIC_CLASSES
-        ][:MAX_SIGNS]
+                "state": lamp,
+                "partial": bool(getattr(d, "partial", False)),
+                "misses": int(getattr(d, "misses", 0) or 0),
+            })
+        signs = _hold_signs(self._prior_signs, fresh_signs)[:MAX_SIGNS]
+        self._prior_signs = list(signs)
         # if detector didn't set ego x/y (onnx path does), leave as-is
         tracks = self.tracker.update(moving, time.time())
         track_dicts = self.tracker.as_dicts()
         lanes = estimate_lanes(main_bgr)
+        prior_lanes = None
+        if lanes.lanes_bev:
+            self._prior_lanes = lanes.lanes_bev
+        elif self._prior_lanes:
+            prior_lanes = self._prior_lanes
         cipv = select_cipv(track_dicts, path_width=2.0, ego_speed_mps=ego_speed_mps)
         plan = predict_path(
             lanes_bev=lanes.lanes_bev,
@@ -88,6 +105,7 @@ class ModularPerception:
             tracks=track_dicts,
             signs=signs,
             ego_speed_mps=ego_speed_mps,
+            prior_lanes=prior_lanes,
         )
         cipv_id = plan.cipv_id
         if cipv_id is None and cipv.track is not None:
@@ -137,8 +155,58 @@ class ModularPerception:
                 "prediction": plan.prediction,
                 "path_length_m": plan.path_length_m,
                 "pred_brake": plan.pred_brake,
+                "blinker": plan.blinker,
             },
             infer_ms=infer_ms,
             missing=missing,
             detector_name=self.detector.name,
         )
+
+
+def _hold_signs(prior: list[dict[str, Any]], fresh: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep a sign that dropped out for a few frames, including a red lamp.
+
+    A fresh light with no colour does not wipe a red we already held.
+    ``misses`` counts frames since the last real detection. ``partial`` marks
+    a sign we are only remembering.
+    """
+    used = [False] * len(prior)
+    out: list[dict[str, Any]] = []
+    for sign in fresh:
+        best_i = None
+        best_d = SIGN_MATCH_M
+        for i, old in enumerate(prior):
+            if used[i] or str(old.get("cls")) != str(sign.get("cls")):
+                continue
+            dx = float(old.get("x") or 0.0) - float(sign.get("x") or 0.0)
+            dy = float(old.get("y") or 0.0) - float(sign.get("y") or 0.0)
+            dist = (dx * dx + dy * dy) ** 0.5
+            if dist < best_d:
+                best_i, best_d = i, dist
+        state = sign.get("state")
+        if best_i is not None:
+            used[best_i] = True
+            held = prior[best_i].get("state")
+            if str(sign.get("cls")) == "traffic_light" and state in (None, "", "unknown"):
+                if held not in (None, "", "unknown"):
+                    state = held
+        out.append({
+            "cls": sign.get("cls"),
+            "x": sign.get("x"),
+            "y": sign.get("y"),
+            "conf": sign.get("conf"),
+            "state": state,
+            "partial": bool(sign.get("partial")),
+            "misses": 0,
+        })
+    for i, old in enumerate(prior):
+        if used[i]:
+            continue
+        misses = int(old.get("misses") or 0) + 1
+        if misses > SIGN_KEEP:
+            continue
+        kept = dict(old)
+        kept["misses"] = misses
+        kept["partial"] = True
+        out.append(kept)
+    return out

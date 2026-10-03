@@ -27,6 +27,7 @@ def main() -> None:
             hit = re.search(pattern, low)
             assert hit is None, f"{name}: {label} found ({hit.group(0)!r})"
     assert "GVD" in stage_src and "VISION" in stage_src
+    assert "blinker" not in nerd_src, "blinkers stay off the supervisor tabs"
     assert "PATH_FADE" not in stage_src
     assert "CORRIDOR_FADE_FRAC" in stage_src
 
@@ -775,6 +776,7 @@ def check_drive_pedal_graph() -> None:
         "brk": 0.0,
         "brk_pred": 0.0,
     }
+    assert "blinker" not in bare.pedal_trace[-1]
     # The empty graph still paints its frame, so a missing series is not a blank panel.
     assert int(empty.max()) > 40
 

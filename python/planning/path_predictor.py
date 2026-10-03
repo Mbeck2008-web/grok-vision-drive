@@ -49,7 +49,15 @@ ROUNDABOUT_RMS_MAX = 0.45
 ROUNDABOUT_SPAN_MIN = 0.35
 
 _OCCUPANTS = frozenset({"vehicle", "car", "truck", "bus", "pedestrian", "bike"})
-_HARD_STOPS = frozenset({"vehicle", "stop_sign", "red_light"})
+# Full brake only when the constraint is close. Farther stops scale with range.
+_FULL_BRAKE_M = 8.0
+_FULL_BRAKE_TTC = 1.2
+_COMFORT_DECEL = 2.5
+_YIELD_SLOW_M = 12.0
+_SIGN_MISS_MAX = 8
+_PARTIAL_GATE_M = 1.6
+_TURN_RAD = 0.35
+_LANE_CHANGE_M = 2.2
 
 
 @dataclass
@@ -70,6 +78,8 @@ class PathPlan:
     path_length_m: float = 0.0
     # Brake the path follower would command, in [0, 1]. Not a wheel reading.
     pred_brake: float = 0.0
+    # Background turn signal from the route: off | left | right. Not a wheel reading.
+    blinker: str = "off"
 
     def planner_dict(self) -> dict[str, Any]:
         return {
@@ -83,6 +93,7 @@ class PathPlan:
             "prediction": self.prediction,
             "path_length_m": self.path_length_m,
             "pred_brake": self.pred_brake,
+            "blinker": self.blinker,
         }
 
 
@@ -121,9 +132,10 @@ def predict_path(
         polys = _polylines(prior_lanes)
         used_prior = bool(polys)
 
-    circle = _fit_roundabout(polys) if polys else None
+    circle = None if _is_forward_lane(polys) else (_fit_roundabout(polys) if polys else None)
+    ring_curv = 0.0
     if circle is not None:
-        raw, width = _roundabout_route(circle, polys, step)
+        raw, width, ring_curv = _roundabout_route(circle, polys, step)
         prediction = "roundabout"
         extended = True
     else:
@@ -142,9 +154,9 @@ def predict_path(
     if len(path) < 2:
         return _expose_pedals(_empty(), ego_speed_mps)
 
-    curv = _path_curvature(path)
+    curv = ring_curv if prediction == "roundabout" and ring_curv > 1e-4 else _path_curvature(path)
     occupants = _predict_occupants(tracks or [])
-    path, stop_reason, cipv_id, ttc, occupied = _apply_scene(
+    path, stop_reason, cipv_id, ttc, occupied, stop_dist = _apply_scene(
         path,
         occupants,
         signs or [],
@@ -155,6 +167,7 @@ def predict_path(
         curv=curv,
         stop_reason=stop_reason,
         ttc=ttc,
+        stop_dist=stop_dist,
         ego_speed_mps=float(ego_speed_mps),
         signs=signs or [],
         path=path,
@@ -207,11 +220,75 @@ def path_length_m(path: list | None) -> float:
 
 
 def _expose_pedals(plan: PathPlan, ego_speed_mps: float) -> PathPlan:
-    """Record path length and the brake the follower would send. The route stays as built."""
+    """Record path length, blinker, and the brake the follower would send."""
     plan.path_length_m = path_length_m(plan.path_ego)
+    plan.blinker = blinker_for_path(plan.path_ego, plan.prediction)
     commanded = follow_path(plan, ego_speed_mps=float(ego_speed_mps))
     plan.pred_brake = float(commanded.brake)
     return plan
+
+
+def _is_forward_lane(polys: list[list[tuple[float, float]]]) -> bool:
+    """True when every visible line is a forward corridor, not a closing circle.
+
+    A bend is a function of y ahead of the car: its nearest point is an end of
+    the line. A roundabout entry dips and comes back, so the nearest point sits
+    in the middle of the arc.
+    """
+    if not polys:
+        return False
+    for poly in polys:
+        if len(poly) < 2:
+            return False
+        ys = [p[1] for p in poly]
+        if min(ys) < -0.25:
+            return False
+        ordered = sorted(ys)
+        if ordered[-1] < ordered[0] + 1.5:
+            return False
+        # A closing circle turns back in y. A bend does not.
+        prev = 0
+        for a, b in zip(ys, ys[1:]):
+            step = b - a
+            d = 1 if step > 0.02 else (-1 if step < -0.02 else 0)
+            if d and prev and d != prev:
+                return False
+            if d:
+                prev = d
+    return True
+
+
+def blinker_for_path(path: list[dict[str, float]] | None, prediction: str = "") -> str:
+    """Turn signal from the route. Straight stays off.
+
+    A roundabout exit signals right (leave the circle). A lane change is a
+    lateral shift that straightens up. A turn is a heading change that stays.
+    """
+    if prediction == "roundabout":
+        return "right"
+    if not path or len(path) < 4:
+        return "off"
+    headings: list[float] = []
+    for a, b in zip(path, path[1:]):
+        dx = float(b["x"]) - float(a["x"])
+        dy = float(b["y"]) - float(a["y"])
+        if dx * dx + dy * dy < 0.04:
+            continue
+        headings.append(math.atan2(dx, dy))
+    if len(headings) < 2:
+        return "off"
+    n = max(1, len(headings) // 5)
+    h0 = sum(headings[:n]) / n
+    h1 = sum(headings[-n:]) / n
+    turn = _wrap(h1 - h0)
+    shift = float(path[-1]["x"]) - float(path[0]["x"])
+    if abs(shift) >= _LANE_CHANGE_M and abs(h1) < 0.22 and abs(turn) < 0.28:
+        return "right" if shift > 0 else "left"
+    if turn > _TURN_RAD:
+        return "right"
+    if turn < -_TURN_RAD:
+        return "left"
+    return "off"
 
 
 def _empty() -> PathPlan:
@@ -259,6 +336,16 @@ def _polylines(lanes: list | None) -> list[list[tuple[float, float]]]:
 
 def _mean_x(pts: list[tuple[float, float]]) -> float:
     return sum(p[0] for p in pts) / len(pts)
+
+
+def _near_x(pts: list[tuple[float, float]]) -> float:
+    """Lateral position of the line next to the car, not the mean of the whole arc."""
+    ordered = _sort_y(pts)
+    y0 = ordered[0][1]
+    near = [p for p in ordered if p[1] <= y0 + 6.0]
+    if not near:
+        near = ordered[:1]
+    return sum(p[0] for p in near) / len(near)
 
 
 def _sort_y(pts: list[tuple[float, float]]) -> list[tuple[float, float]]:
@@ -356,43 +443,40 @@ def _roundabout_route(
     circle: tuple[float, float, float],
     polys: list[list[tuple[float, float]]],
     step: float,
-) -> tuple[list[tuple[float, float]], float]:
+) -> tuple[list[tuple[float, float]], float, float]:
+    """Follow the ring in the direction the visible points already run.
+
+    No radial chord from the bumper to the paint: that cut toward the center.
+    Curvature is 1/radius so a 12 m ring is not given a highway speed.
+    """
     cx, cy, radius = circle
-    cloud = [p for poly in polys for p in poly]
-    angs = [math.atan2(y - cy, x - cx) for x, y in cloud]
-    nearest = min(range(len(cloud)), key=lambda i: math.hypot(cloud[i][0], cloud[i][1]))
-    a_near = angs[nearest]
-    rels = [_wrap(a - a_near) for a in angs]
-    mean_rel = sum(rels) / len(rels)
-    direction = -1.0 if mean_rel > 1e-3 else 1.0
-    ext = max(rel * direction for rel in rels)
-    goal = ext + ROUNDABOUT_EXTRA_RAD
-    entry = (cx + radius * math.cos(a_near), cy + radius * math.sin(a_near))
+    poly = max(polys, key=len)
+    angs = [math.atan2(y - cy, x - cx) for x, y in poly]
+    turn = 0.0
+    for a, b in zip(angs, angs[1:]):
+        turn += _wrap(b - a)
+    direction = 1.0 if turn >= 0.0 else -1.0
+    span = _wrap(angs[-1] - angs[0])
+    if direction > 0.0 and span < 0.0:
+        span += 2.0 * math.pi
+    elif direction < 0.0 and span > 0.0:
+        span -= 2.0 * math.pi
+    goal = abs(span) + ROUNDABOUT_EXTRA_RAD
     path: list[tuple[float, float]] = []
-    gap = math.hypot(entry[0], entry[1])
-    if gap > step:
-        n = max(1, int(gap / step))
-        for i in range(n):
-            t = i / n
-            path.append((entry[0] * t, entry[1] * t))
-    theta = a_near
+    theta = angs[0]
     traveled = 0.0
-    arc_len = goal * radius
-    while traveled <= arc_len + 1e-6 and len(path) < 96:
-        x = cx + radius * math.cos(theta)
-        y = cy + radius * math.sin(theta)
-        if not path or math.hypot(x - path[-1][0], y - path[-1][1]) >= step * 0.4:
-            path.append((x, y))
-        theta += direction * step / radius
+    while traveled <= goal * radius + 1e-6 and len(path) < 96:
+        path.append((cx + radius * math.cos(theta), cy + radius * math.sin(theta)))
+        theta += direction * step / max(radius, 1e-3)
         traveled += step
     width = LANE_W_DEFAULT
     if len(polys) >= 2:
         radii = []
-        for poly in polys:
-            radii.append(sum(math.hypot(x - cx, y - cy) for x, y in poly) / len(poly))
+        for line in polys:
+            radii.append(sum(math.hypot(x - cx, y - cy) for x, y in line) / len(line))
         if len(radii) >= 2:
             width = max(LANE_W_MIN, min(LANE_W_MAX, abs(radii[0] - radii[1])))
-    return path, width
+    return path, width, 1.0 / max(radius, 1e-3)
 
 
 def _near_separation(
@@ -423,7 +507,7 @@ def _pair(
         only = _sort_y(polys[0])
         if len(only) < 2:
             return None
-        if _mean_x(only) <= 0.0:
+        if _near_x(only) <= 0.0:
             left, right = only, [(x + LANE_W_DEFAULT, y) for x, y in only]
         else:
             right, left = only, [(x - LANE_W_DEFAULT, y) for x, y in only]
@@ -435,7 +519,7 @@ def _pair(
             sa, sb = _sort_y(a), _sort_y(b)
             if len(sa) < 2 or len(sb) < 2:
                 continue
-            left, right = (sa, sb) if _mean_x(sa) <= _mean_x(sb) else (sb, sa)
+            left, right = (sa, sb) if _near_x(sa) <= _near_x(sb) else (sb, sa)
             # Width at the bumper, not the mean. A camera lane converges at the
             # horizon, so the average gap collapses even when the near field is
             # a full lane.
@@ -499,13 +583,22 @@ def _lane_route(
 
     extended = y1 < horizon - step
     x, y, h = observed[-1][0], observed[-1][1], heading
+    # Extend along the visible heading, but only while the road still points
+    # forward. A bend must not be completed into a circle behind the car.
+    remain = max(0.0, horizon - max(0.0, y))
     guard = 0
-    while y < horizon - 1e-6 and guard < 200:
-        h = h + curv * step
+    while remain > step * 0.5 and guard < 80:
+        h_next = h + curv * step
+        if math.cos(h_next) < 0.2:
+            break
+        h = h_next
         x = x + math.sin(h) * step
         y = y + math.cos(h) * step
+        if y < -0.5:
+            break
         samples.append((x, y))
         extended = True
+        remain -= step
         guard += 1
     one_sided = len(polys) < 2
     return samples, width, extended or one_sided
@@ -613,6 +706,7 @@ def _predict_occupants(tracks: list) -> list[dict[str, Any]]:
                 "width": width,
                 "unseen_s": unseen,
                 "partial": partial,
+                "speed_mps": speed,
             }
         )
     return out
@@ -641,8 +735,8 @@ def _apply_scene(
     width: float,
     *,
     ego_speed_mps: float,
-) -> tuple[list[dict[str, float]], str, int | None, float | None, list[dict[str, Any]]]:
-    cuts: list[tuple[float, str, int | None, float | None, dict[str, Any] | None]] = []
+) -> tuple[list[dict[str, float]], str, int | None, float | None, list[dict[str, Any]], float | None]:
+    cuts: list[tuple[float, str, int | None, float | None]] = []
     occupied: list[dict[str, Any]] = []
     station = _along(path)
     for occ in occupants:
@@ -651,55 +745,66 @@ def _apply_scene(
         reach = (EGO_WIDTH + float(occ["width"])) * 0.5 + 0.2
         if lateral > reach:
             continue
-        if station[idx] < 1.5:
+        if station[idx] < 0.3:
+            continue
+        along = float(occ.get("speed_mps") or 0.0) * math.sin(float(occ.get("yaw") or (math.pi / 2.0)))
+        closing = float(ego_speed_mps) - along
+        # Matching speed is not a stop. A car at 1 m still is, because it is in the lane now.
+        if closing <= 0.4 and station[idx] > 4.0:
             continue
         back = float(occ["length"]) * 0.5 + STANDOFF_M
         cut_s = station[idx] - back
         occupied.append(dict(occ))
-        closing = max(ego_speed_mps, 0.0)
-        ttc = None if closing <= 0.05 else max(0.0, cut_s) / closing
+        ttc = None if closing <= 0.05 else max(0.0, cut_s) / max(closing, 0.1)
         ident = occ.get("id")
         try:
             ident = None if ident is None else int(ident)
         except (TypeError, ValueError):
             ident = None
-        cuts.append((cut_s, "vehicle", ident, ttc, occ))
+        kind = str(occ.get("cls") or "vehicle")
+        reason = kind if kind in ("pedestrian", "bike") else "vehicle"
+        cuts.append((cut_s, reason, ident, ttc))
 
     for raw in signs or []:
         if not isinstance(raw, dict):
+            continue
+        if _sign_misses(raw) > _SIGN_MISS_MAX:
             continue
         kind = _cls(raw)
         x, y = _f(raw, "x"), _f(raw, "y")
         idx = _nearest(path, x, y)
         lateral = math.hypot(path[idx]["x"] - x, path[idx]["y"] - y)
-        if station[idx] < 1.5:
+        if station[idx] < 0.3:
             continue
         if kind in ("stop_sign", "stop"):
-            if lateral > SHOULDER_M:
+            if lateral > _sign_gate(SHOULDER_M, raw):
                 continue
-            cuts.append((station[idx] - SIGN_STANDOFF_M, "stop_sign", None, None, None))
+            cuts.append((station[idx] - SIGN_STANDOFF_M, "stop_sign", None, _sign_ttc(station[idx], ego_speed_mps)))
         elif kind in ("yield", "yield_sign"):
-            if lateral > SHOULDER_M:
+            if lateral > _sign_gate(SHOULDER_M, raw):
                 continue
-            cuts.append((station[idx] - SIGN_STANDOFF_M, "yield", None, None, None))
+            # In view is not a brake hold. Slow only once the sign is near.
+            if station[idx] > _YIELD_SLOW_M + SIGN_STANDOFF_M:
+                continue
+            cuts.append((station[idx] - SIGN_STANDOFF_M, "yield", None, None))
         elif kind in ("traffic_light", "light"):
-            if lateral > LIGHT_GATE_M:
+            if lateral > _sign_gate(LIGHT_GATE_M, raw):
                 continue
             state = str(raw.get("state") or "").strip().lower()
             if state in ("red", "r"):
-                cuts.append((station[idx] - SIGN_STANDOFF_M, "red_light", None, None, None))
-            elif state in ("yellow", "amber"):
-                if station[idx] < 22.0:
-                    cuts.append((station[idx] - SIGN_STANDOFF_M, "yellow_light", None, None, None))
+                cuts.append((station[idx] - SIGN_STANDOFF_M, "red_light", None, _sign_ttc(station[idx], ego_speed_mps)))
+            elif state in ("yellow", "amber") and station[idx] < 22.0:
+                cuts.append((station[idx] - SIGN_STANDOFF_M, "yellow_light", None, _sign_ttc(station[idx], ego_speed_mps)))
     if not cuts:
-        return path, "none", None, None, occupied
-    cut_s, reason, cipv_id, ttc, _occ = min(cuts, key=lambda c: c[0])
-    trimmed = [p for p, s in zip(path, station) if s <= max(0.0, cut_s) + 1e-6]
+        return path, "none", None, None, occupied, None
+    cut_s, reason, cipv_id, ttc = min(cuts, key=lambda c: c[0])
+    stop_dist = max(0.0, cut_s)
+    trimmed = [p for p, s in zip(path, station) if s <= stop_dist + 1e-6]
     if len(trimmed) < 2:
         trimmed = [path[0], path[1 if len(path) > 1 else 0]]
         if trimmed[0] is trimmed[1]:
             trimmed = [path[0], _pt(path[0]["x"], path[0]["y"] + 0.4)]
-    return trimmed, reason, cipv_id, ttc, occupied
+    return trimmed, reason, cipv_id, ttc, occupied, stop_dist
 
 
 def _limit_mps(signs: list, path: list[dict[str, float]]) -> float | None:
@@ -726,30 +831,67 @@ def _limit_mps(signs: list, path: list[dict[str, float]]) -> float | None:
     return cap
 
 
+def _sign_misses(raw: dict[str, Any]) -> int:
+    try:
+        return max(0, int(raw.get("misses") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _sign_partial(raw: dict[str, Any]) -> bool:
+    if bool(raw.get("partial")):
+        return True
+    try:
+        frac = float(raw.get("seen_fraction"))
+    except (TypeError, ValueError):
+        return False
+    return frac < 0.99
+
+
+def _sign_gate(base: float, raw: dict[str, Any]) -> float:
+    """A partly seen sign may sit just outside the measured shoulder."""
+    return base + (_PARTIAL_GATE_M if _sign_partial(raw) else 0.0)
+
+
+def _sign_ttc(station: float, ego_speed_mps: float) -> float | None:
+    if ego_speed_mps <= 0.05:
+        return None
+    return max(0.0, station - SIGN_STANDOFF_M) / ego_speed_mps
+
+
 def _speed_flags(
     *,
     curv: float,
     stop_reason: str,
     ttc: float | None,
+    stop_dist: float | None,
     ego_speed_mps: float,
     signs: list,
     path: list[dict[str, float]],
 ) -> tuple[str, float]:
-    aeb = "off"
-    if stop_reason in _HARD_STOPS or stop_reason == "yellow_light":
-        aeb = "brake"
-    elif stop_reason == "yield":
-        aeb = "warn"
+    """Brake grows as the gap shrinks and as closing speed rises. Far stops do not slam to 1."""
+    dist = None if stop_dist is None else max(0.0, float(stop_dist))
+    hard = False
+    if dist is not None and stop_reason not in ("none", "yield"):
+        close_ttc = ttc is not None and ttc < _FULL_BRAKE_TTC
+        hard = dist < _FULL_BRAKE_M or bool(close_ttc)
+    # plan_command treats ttc under 1.2 as a full brake. Keep that number only
+    # when this stop is actually in that band.
+    reported_ttc = ttc if hard else (None if ttc is not None and ttc < _FULL_BRAKE_TTC else ttc)
+    aeb = "brake" if hard else "off"
     speed = plan_speed(
         ego_speed_mps=ego_speed_mps,
         curvature=curv,
-        ttc_lead=ttc,
+        ttc_lead=reported_ttc,
         aeb=aeb,
         v_cap=V_CAP,
     )
     target = speed.target_v
-    if stop_reason == "yield":
-        target = min(target, 3.0)
+    if dist is not None and stop_reason not in ("none",) and not hard:
+        if stop_reason == "yield":
+            target = min(target, 4.0)
+        else:
+            target = min(target, math.sqrt(max(0.0, 2.0 * _COMFORT_DECEL * dist)))
     limit = _limit_mps(signs, path)
     if limit is not None:
         target = min(target, max(0.0, limit))

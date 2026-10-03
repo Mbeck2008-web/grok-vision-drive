@@ -32,8 +32,11 @@ def build_path_ego(
     step: float = 1.0,
     path_width: float = 2.0,
 ) -> CorridorResult:
-    """Lane centerline, continued when a side is missing. ``steer_deg`` is ignored."""
-    del steer_deg, path_width
+    """Lane centerline, continued when a side is missing. ``steer_deg`` is ignored.
+
+    ``path_width`` is the corridor width reported to the caller.
+    """
+    del steer_deg
     tracks = [cipv] if isinstance(cipv, dict) else []
     plan = predict_path(
         lanes_bev=lanes_bev,
@@ -45,7 +48,7 @@ def build_path_ego(
     )
     return CorridorResult(
         path_ego=plan.path_ego,
-        path_width=plan.path_width,
+        path_width=float(path_width),
         path_conf=plan.path_conf,
         curvature=plan.curvature,
         from_planner=plan.drivable,

@@ -154,18 +154,19 @@ def predict_path(
 
     curv = ring_curv if prediction == "roundabout" and ring_curv > 1e-4 else _path_curvature(path)
     occupants = _predict_occupants(tracks or [])
-    path, stop_reason, cipv_id, ttc, occupied, stop_dist = _apply_scene(
+    path, stop_reason, cipv_id, ttc, occupied, stop_dist, closing = _apply_scene(
         path,
         occupants,
         signs or [],
         width,
         ego_speed_mps=float(ego_speed_mps),
     )
-    aeb, target = _speed_flags(
+    aeb, target, ttc = _speed_flags(
         curv=curv,
         stop_reason=stop_reason,
         ttc=ttc,
         stop_dist=stop_dist,
+        closing_mps=closing,
         ego_speed_mps=float(ego_speed_mps),
         signs=signs or [],
         path=path,
@@ -745,8 +746,8 @@ def _apply_scene(
     width: float,
     *,
     ego_speed_mps: float,
-) -> tuple[list[dict[str, float]], str, int | None, float | None, list[dict[str, Any]], float | None]:
-    cuts: list[tuple[float, str, int | None, float | None]] = []
+) -> tuple[list[dict[str, float]], str, int | None, float | None, list[dict[str, Any]], float | None, float | None]:
+    cuts: list[tuple[float, str, int | None, float | None, float]] = []
     occupied: list[dict[str, Any]] = []
     station = _along(path)
     for occ in occupants:
@@ -755,9 +756,9 @@ def _apply_scene(
         reach = (EGO_WIDTH + float(occ["width"])) * 0.5 + 0.2
         if lateral > reach:
             continue
-        # The car's own forward distance, not the nearest path vertex. A vehicle
-        # at y=0.5 m sits between the origin and the first station and used to be dropped.
-        if float(occ["y"]) < 0.15 and station[idx] < 0.15:
+        # Behind the bumper only. y=0 is in the path; a nearest vertex at the origin
+        # must not hide it.
+        if float(occ["y"]) < -0.05:
             continue
         along = float(occ.get("speed_mps") or 0.0) * math.sin(float(occ.get("yaw") or (math.pi / 2.0)))
         closing = float(ego_speed_mps) - along
@@ -775,7 +776,7 @@ def _apply_scene(
             ident = None
         kind = str(occ.get("cls") or "vehicle")
         reason = kind if kind in ("pedestrian", "bike") else "vehicle"
-        cuts.append((cut_s, reason, ident, ttc))
+        cuts.append((cut_s, reason, ident, ttc, closing))
 
     for raw in signs or []:
         if not isinstance(raw, dict):
@@ -791,33 +792,40 @@ def _apply_scene(
         if kind in ("stop_sign", "stop"):
             if lateral > _sign_gate(SHOULDER_M, raw):
                 continue
-            cuts.append((station[idx] - SIGN_STANDOFF_M, "stop_sign", None, _sign_ttc(station[idx], ego_speed_mps)))
+            cuts.append((
+                station[idx] - SIGN_STANDOFF_M, "stop_sign", None,
+                _sign_ttc(station[idx], ego_speed_mps), float(ego_speed_mps),
+            ))
         elif kind in ("yield", "yield_sign"):
             if lateral > _sign_gate(SHOULDER_M, raw):
                 continue
-            # A yield in the planning range shortens the route. Brake is scaled
-            # later from the remaining distance, not held at one value.
-            if station[idx] > 32.0:
-                continue
-            cuts.append((station[idx] - SIGN_STANDOFF_M, "yield", None, None))
+            # Same reach as a stop sign on this route. Brake is scaled from the
+            # remaining distance, not held at one value.
+            cuts.append((station[idx] - SIGN_STANDOFF_M, "yield", None, None, float(ego_speed_mps)))
         elif kind in ("traffic_light", "light"):
             if lateral > _sign_gate(LIGHT_GATE_M, raw):
                 continue
             state = str(raw.get("state") or "").strip().lower()
             if state in ("red", "r"):
-                cuts.append((station[idx] - SIGN_STANDOFF_M, "red_light", None, _sign_ttc(station[idx], ego_speed_mps)))
+                cuts.append((
+                    station[idx] - SIGN_STANDOFF_M, "red_light", None,
+                    _sign_ttc(station[idx], ego_speed_mps), float(ego_speed_mps),
+                ))
             elif state in ("yellow", "amber") and station[idx] < 22.0:
-                cuts.append((station[idx] - SIGN_STANDOFF_M, "yellow_light", None, _sign_ttc(station[idx], ego_speed_mps)))
+                cuts.append((
+                    station[idx] - SIGN_STANDOFF_M, "yellow_light", None,
+                    _sign_ttc(station[idx], ego_speed_mps), float(ego_speed_mps),
+                ))
     if not cuts:
-        return path, "none", None, None, occupied, None
-    cut_s, reason, cipv_id, ttc = min(cuts, key=lambda c: c[0])
+        return path, "none", None, None, occupied, None, None
+    cut_s, reason, cipv_id, ttc, closing = min(cuts, key=lambda c: c[0])
     stop_dist = max(0.0, cut_s)
     trimmed = [p for p, s in zip(path, station) if s <= stop_dist + 1e-6]
     if len(trimmed) < 2:
         trimmed = [path[0], path[1 if len(path) > 1 else 0]]
         if trimmed[0] is trimmed[1]:
             trimmed = [path[0], _pt(path[0]["x"], path[0]["y"] + 0.4)]
-    return trimmed, reason, cipv_id, ttc, occupied, stop_dist
+    return trimmed, reason, cipv_id, ttc, occupied, stop_dist, closing
 
 
 def _limit_mps(signs: list, path: list[dict[str, float]]) -> float | None:
@@ -878,27 +886,26 @@ def _speed_flags(
     stop_reason: str,
     ttc: float | None,
     stop_dist: float | None,
+    closing_mps: float | None,
     ego_speed_mps: float,
     signs: list,
     path: list[dict[str, float]],
-) -> tuple[str, float]:
+) -> tuple[str, float, float | None]:
     """Brake grows as the gap shrinks and as closing speed rises. Far stops do not slam to 1."""
     dist = None if stop_dist is None else max(0.0, float(stop_dist))
-    closing = None
-    if dist is not None and ttc is not None and ttc > 0.05:
+    closing = None if closing_mps is None else float(closing_mps)
+    if closing is None and dist is not None and ttc is not None and ttc > 0.05:
         closing = dist / ttc
-    elif dist is not None and dist <= 1.5:
-        closing = float(ego_speed_mps)
     hard = False
     if dist is not None and stop_reason not in ("none", "yield"):
-        # A short gap is not a full stop when the lead is almost matching speed.
-        if dist <= 1.5 and float(ego_speed_mps) > 0.5:
+        close = 0.0 if closing is None else closing
+        lead = float(ego_speed_mps) - close
+        stopped = lead <= 0.4
+        # A bumper gap is a full stop only when that lead is actually stopped.
+        # A 1 m/s close inside 1.5 m stays a scaled brake.
+        if stopped and dist <= 1.5 and float(ego_speed_mps) > 0.5:
             hard = True
-        elif (
-            ttc is not None
-            and ttc < _FULL_BRAKE_TTC
-            and (closing or 0.0) >= 3.0
-        ):
+        elif ttc is not None and ttc < _FULL_BRAKE_TTC and close >= 3.0:
             hard = True
     # plan_command treats ttc under 1.2 as a full brake. Keep that number only
     # when this stop is actually in that band.
@@ -922,4 +929,4 @@ def _speed_flags(
         target = min(target, max(0.0, limit))
     if aeb == "brake":
         target = 0.0
-    return aeb, float(target)
+    return aeb, float(target), reported_ttc

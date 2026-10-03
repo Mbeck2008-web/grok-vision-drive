@@ -721,6 +721,48 @@ def check_noise_yield_gap_and_short_arc() -> None:
     assert not (tight_cmd.throttle > 0.4 and tight.target_v > 16.0 and tight.blinker == "off")
 
 
+def check_slow_close_bumper_and_far_yield() -> None:
+    """Locks the residual critic cases. Brake 1 inside 1.5 m fails when the
+    lead is only 1 m/s slower. y under 0.15 m must still be a stop. A yield
+    past 32 m must still shorten the route."""
+    lanes = _lane(-1.75, 1.75)
+    slow = predict_path(
+        lanes_bev=lanes,
+        lane_conf=0.9,
+        ego_speed_mps=10.0,
+        tracks=[{"class": "vehicle", "x": 0.0, "y": 7.5, "yaw": YAW_AHEAD, "speed_mps": 9.0}],
+    )
+    slow_cmd = follow_path(slow, ego_speed_mps=10.0)
+    assert slow.stop_reason == "vehicle", slow.stop_reason
+    assert slow.aeb != "brake", slow.aeb
+    assert slow_cmd.brake < 0.85, slow_cmd
+    assert slow_cmd.throttle > 0.0 or slow_cmd.brake < 1.0
+
+    for y in (0.14, 0.10, 0.0):
+        hit = predict_path(
+            lanes_bev=lanes,
+            lane_conf=0.9,
+            ego_speed_mps=8.0,
+            tracks=[{"class": "vehicle", "x": 0.0, "y": y, "yaw": YAW_AHEAD, "speed_mps": 0.0}],
+        )
+        cmd = follow_path(hit, ego_speed_mps=8.0)
+        assert hit.stop_reason == "vehicle", (y, hit.stop_reason)
+        assert cmd.throttle < 0.2 and cmd.brake > 0.5, (y, cmd)
+
+    free = predict_path(lanes_bev=lanes, lane_conf=0.9, ego_speed_mps=8.0)
+    for y in (33.0, 35.0):
+        plan = predict_path(
+            lanes_bev=lanes,
+            lane_conf=0.9,
+            ego_speed_mps=8.0,
+            signs=[{"cls": "yield", "x": 2.0, "y": y}],
+        )
+        cmd = follow_path(plan, ego_speed_mps=8.0)
+        assert plan.stop_reason == "yield", (y, plan.stop_reason)
+        assert plan.path_length_m < free.path_length_m - 1.0, (y, plan.path_length_m, free.path_length_m)
+        assert cmd.brake < 0.35, (y, cmd)
+
+
 def check_missed_sign_and_red_light() -> None:
     import numpy as np
 
@@ -820,6 +862,7 @@ def main() -> None:
     check_drive_gear_socket_and_override(cmd)
     check_bend_not_roundabout_and_blinkers()
     check_noise_yield_gap_and_short_arc()
+    check_slow_close_bumper_and_far_yield()
     check_missed_sign_and_red_light()
     check_perception_ignores_wheel()
     print("test_path_predictor: OK")

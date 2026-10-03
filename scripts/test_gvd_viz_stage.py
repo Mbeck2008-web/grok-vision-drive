@@ -238,8 +238,15 @@ def main() -> None:
     assert not np.array_equal(dense, sparse)
 
     from python.sensors.cameras import CAM_IDS
-    from python.viz.debug_draw import cam_tile_rects, clamp_front_overexpose, draw_cam_tiles
-    from python.viz.stage import CAMS_STAGE_BOX, CAMS_STAGE_GRID
+    from python.viz.debug_draw import (
+        CAMS_PREVIEW_DIM,
+        CAMS_PREVIEW_SLOTS,
+        cam_tile_rects,
+        clamp_front_overexpose,
+        dim_preview_frame,
+        draw_cam_tiles,
+    )
+    from python.viz.stage import CAMS_STAGE_BOX, CAMS_STAGE_GRID, VOID
 
     white = np.full((32, 48, 3), 255, dtype=np.uint8)
     clamped = clamp_front_overexpose(white, "main")
@@ -247,6 +254,16 @@ def main() -> None:
     assert float(clamp_front_overexpose(white, "rear").mean()) == 255, "rear must not be clamped"
     dim = np.full((32, 48, 3), 80, dtype=np.uint8)
     assert np.array_equal(clamp_front_overexpose(dim, "main"), dim)
+
+    assert CAMS_STAGE_GRID == (3, 3)
+    assert CAMS_PREVIEW_SLOTS[4] is None
+    assert len(CAMS_PREVIEW_SLOTS) == 9
+    assert {c for c in CAMS_PREVIEW_SLOTS if c} == set(CAM_IDS)
+    assert CAMS_PREVIEW_SLOTS == (
+        "wide", "main", "narrow",
+        "pillarL", None, "pillarR",
+        "repeatL", "rear", "repeatR",
+    )
 
     colors = {}
     frames = {}
@@ -268,22 +285,33 @@ def main() -> None:
     wall = render_stage(cams_st, ui=cams_ui, cam_frames=frames)
     assert wall.shape == (800, 1280, 3)
     rects = cam_tile_rects(*CAMS_STAGE_BOX, *CAMS_STAGE_GRID)
-    assert len(rects) >= 8
-    for cid, (x, y, tw, th) in zip(CAM_IDS, rects):
+    assert len(rects) == 9
+    slot_of = {}
+    for cid, (x, y, tw, th) in zip(CAMS_PREVIEW_SLOTS, rects):
         sx, sy = x + int(tw * 0.78), y + th // 2
         pix = wall[sy, sx]
+        if cid is None:
+            patch = wall[y + 6:y + th - 6, x + 6:x + tw - 6]
+            assert float(patch.std()) < 2.0, "center cell must stay empty"
+            assert np.allclose(pix, VOID, atol=1), f"center {pix} is not void"
+            continue
+        slot_of[cid] = (x, y, tw, th)
         if cid == "rear":
             assert int(pix.mean()) < 70, f"{cid} missing tile should stay dark, got {pix}"
         else:
-            assert np.allclose(pix, colors[cid], atol=8), f"{cid} tile {pix} != {colors[cid]}"
+            expect = dim_preview_frame(np.full((1, 1, 3), colors[cid], np.uint8))[0, 0]
+            assert np.allclose(pix, expect, atol=2), f"{cid} tile {pix} != dimmed {expect}"
+            raw_mean = float(np.array(colors[cid], dtype=np.float32).mean())
+            assert float(pix.mean()) < raw_mean * 0.9, f"{cid} preview is not dimmer than the frame"
+            assert float(pix.mean()) > 12.0, f"{cid} preview crushed to black"
 
     # retail / stub: only main (or cam_main) filled; others labelled missing
     retail_frames = {"cam_main": np.full((36, 48, 3), (30, 200, 30), dtype=np.uint8)}
     retail_health = {cid: "missing" for cid in CAM_IDS}
     retail_health["main"] = "ok"
     retail = render_stage(cams_st, ui=cams_ui, cam_frames=retail_frames)
-    mx, my, mw, mh = rects[list(CAM_IDS).index("main")]
-    nx, ny, nw, nh = rects[list(CAM_IDS).index("narrow")]
+    mx, my, mw, mh = slot_of["main"]
+    nx, ny, nw, nh = slot_of["narrow"]
     assert int(retail[my + mh // 2, mx + int(mw * 0.78)][1]) > 120
     assert int(retail[ny + nh // 2, nx + int(nw * 0.78)].mean()) < 70
 
@@ -301,10 +329,14 @@ def main() -> None:
     assert cam_slot_live(held_frames, held_health, "narrow") is False
     assert cam_slot_live(held_frames, held_health, "rear") is True
     held = render_stage(cams_st, ui=cams_ui, cam_frames=held_frames)
-    nx, ny, nw, nh = rects[list(CAM_IDS).index("narrow")]
-    rx, ry, rw, rh = rects[list(CAM_IDS).index("rear")]
+    nx, ny, nw, nh = slot_of["narrow"]
+    rx, ry, rw, rh = slot_of["rear"]
     assert int(held[ny + nh // 2, nx + int(nw * 0.78)].mean()) < 70, "blank narrow must stay labelled"
-    assert int(held[ry + rh // 2, rx + int(rw * 0.78)][1]) > 120, "last rear frame must paint"
+    rear_expect = dim_preview_frame(last)
+    assert rear_expect is not None
+    assert np.allclose(
+        held[ry + rh // 2, rx + int(rw * 0.78)], rear_expect[0, 0], atol=2
+    ), "last rear frame must paint, dimmed"
 
     # under 8 Hz: labelled drop, no crash, no fake fill from the colored frames
     slow = dict(cams_st)
@@ -324,6 +356,10 @@ def main() -> None:
     assert "cams" in tabs
     grid = next(h for h in nerd_cams.nerd_hits if h.get("kind") == "cams_grid")
     assert int(grid.get("n") or 0) == 8
+    gx0, gy0, gx1, gy1 = grid["rect"]
+    panel = nerd_wall[:, 1280:]
+    center = panel[(gy0 + gy1) // 2, (gx0 + gx1) // 2]
+    assert int(center.mean()) < 40, f"nerd center cell must stay empty, got {center}"
 
     # cabin/default stage is unchanged when CAMS is not selected
     cabin_ui = VizUI()
@@ -396,6 +432,28 @@ def main() -> None:
         x0=4, y0=4, width=790, height=190, cols=4, rows=2, dropped=False,
     )
     assert n == 8
+    bright = np.full((36, 48, 3), 200, dtype=np.uint8)
+    plain = np.zeros((80, 160, 3), np.uint8)
+    dimmed = plain.copy()
+    draw_cam_tiles(
+        plain, {"rear": bright}, {"rear": "ok"},
+        x0=0, y0=0, width=160, height=80, cols=1, rows=1, ids=("rear",),
+    )
+    draw_cam_tiles(
+        dimmed, {"rear": bright}, {"rear": "ok"},
+        x0=0, y0=0, width=160, height=80, cols=1, rows=1, ids=("rear",), dim=CAMS_PREVIEW_DIM,
+    )
+    assert float(plain[40, 100].mean()) > 180
+    assert float(dimmed[40, 100].mean()) < float(plain[40, 100].mean()) - 30
+    assert float(dimmed[40, 100].mean()) > 100
+    hole = np.full((90, 90, 3), 7, np.uint8)
+    n_hole = draw_cam_tiles(
+        hole, frames, health,
+        x0=0, y0=0, width=90, height=90,
+        cols=3, rows=3, ids=CAMS_PREVIEW_SLOTS, dim=CAMS_PREVIEW_DIM,
+    )
+    assert n_hole == 8
+    assert hole[45, 45].tolist() == [7, 7, 7], "center cell must not be painted"
 
     # Past the nose the ribbon is about car width, not a lane-wide bar.
     # A 40 m path does not grow ice past itself.

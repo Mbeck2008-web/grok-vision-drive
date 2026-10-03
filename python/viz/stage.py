@@ -32,6 +32,10 @@ from python.runtime.debug_opts import (
     viz_row_at,
 )
 from python.viz.debug_draw import (
+    CAMS_PREVIEW_COLS,
+    CAMS_PREVIEW_DIM,
+    CAMS_PREVIEW_ROWS,
+    CAMS_PREVIEW_SLOTS,
     clamp_front_overexpose,
     cabin_drive_word,
     draw_cam_strip,
@@ -75,9 +79,9 @@ STAGE_W, STAGE_H = 1280, 800
 # Fade the tail of whatever polyline exists. Do not invent meters past the last point.
 # Furniture fade (cameras.yaml viz.fade_frac) is separate and must not pad this ribbon.
 CORRIDOR_FADE_FRAC = 0.40
-# CAMS tab 4×2 wall on the stage (nerd panel has its own 2×4).
+# CAMS tab 3×3 wall. Center cell stays empty. The nerd panel uses the same slots.
 CAMS_STAGE_BOX = (12, 28, STAGE_W - 24, STAGE_H - 40)
-CAMS_STAGE_GRID = (4, 2)
+CAMS_STAGE_GRID = (CAMS_PREVIEW_COLS, CAMS_PREVIEW_ROWS)
 
 
 @dataclass
@@ -1568,14 +1572,16 @@ def render_stage(
             height=CAMS_STAGE_BOX[3],
             cols=CAMS_STAGE_GRID[0],
             rows=CAMS_STAGE_GRID[1],
+            ids=CAMS_PREVIEW_SLOTS,
             dropped=drop_heavy,
+            dim=CAMS_PREVIEW_DIM,
         )
         cv2.rectangle(img, (0, 0), (STAGE_W, 22), (12, 13, 16), -1)
         cv2.putText(img, "GVD", (12, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, ICE, 1, cv2.LINE_AA)
         cv2.putText(img, "VISION", (52, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1, cv2.LINE_AA)
         word, word_col = cabin_drive_word(state)
         cv2.putText(img, word, (118, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, word_col, 1, cv2.LINE_AA)
-        cam_lbl = "CAMS dropped" if drop_heavy else "CAMS 8-view"
+        cam_lbl = "CAMS dropped" if drop_heavy else "CAMS 3x3"
         cv2.putText(img, cam_lbl, (STAGE_W - 150, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
         note = scene_note(state)
         state["viz_ms"] = (time.perf_counter() - t0) * 1000.0

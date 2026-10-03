@@ -20,6 +20,21 @@ FRONT_CAM_IDS = frozenset({"narrow", "main", "wide", "cam_main"})
 CAM_TILE_GAP = 4
 _OVEREXPOSE_MEAN = 165.0
 _OVEREXPOSE_TARGET = 140.0
+# CAMS tab only. Row-major 3×3. None is the empty center (no cabin camera).
+# Roles are config/cameras.yaml: wide is the left-offset windshield cam and
+# narrow is the right-offset one, so they sit on the top corners with primary
+# forward (main) in the top center. B-pillar side views stay on the middle
+# row. Fender repeaters sit on the bottom corners, rear plate in the bottom
+# center. All eight existing cameras still have a cell.
+CAMS_PREVIEW_SLOTS: tuple[str | None, ...] = (
+    "wide", "main", "narrow",
+    "pillarL", None, "pillarR",
+    "repeatL", "rear", "repeatR",
+)
+CAMS_PREVIEW_COLS = 3
+CAMS_PREVIEW_ROWS = 3
+# Modest darken of CAMS-tab preview pixels. Not a black crush, and not BeamNG exposure.
+CAMS_PREVIEW_DIM = 0.75
 
 OCC = (88, 86, 196)
 FREE = (120, 150, 92)
@@ -267,6 +282,22 @@ def draw_pip_boxes(pip: np.ndarray, dets: list[dict[str, Any]], src_wh: tuple[in
             cv2.putText(pip, cls, (p1[0], max(12, p1[1] - 3)), cv2.FONT_HERSHEY_SIMPLEX, 0.32, PAPER, 1, cv2.LINE_AA)
 
 
+def dim_preview_frame(frame: np.ndarray | None, scale: float = CAMS_PREVIEW_DIM) -> np.ndarray | None:
+    """Scale preview pixels down. Missing tiles and BeamNG exposure are not this."""
+    if frame is None or not getattr(frame, "size", 0):
+        return frame
+    try:
+        s = float(scale)
+    except (TypeError, ValueError):
+        return frame
+    if not math.isfinite(s):
+        return frame
+    s = min(1.0, max(0.55, s))
+    if s >= 0.999:
+        return frame
+    return np.clip(np.round(frame.astype(np.float32) * s), 0, 255).astype(np.uint8)
+
+
 def clamp_front_overexpose(frame: np.ndarray | None, cid: str = "main") -> np.ndarray | None:
     """Scale down blown-white Tech front previews. Side/rear and missing feeds are untouched."""
     if frame is None or not getattr(frame, "size", 0):
@@ -337,6 +368,7 @@ def _paint_cam_tile(
     status: str,
     *,
     dropped: bool,
+    dim: float | None = None,
 ) -> tuple[np.ndarray, str, bool]:
     """Build one tile. Missing/dropped stay labelled; never invents pixels from another cam."""
     tile = np.full((slot_h, slot_w, 3), (22, 20, 18), dtype=np.uint8)
@@ -354,6 +386,10 @@ def _paint_cam_tile(
                 label = str(status or "missing")
             else:
                 tile = cv2.resize(src, (slot_w, slot_h), interpolation=cv2.INTER_AREA)
+                if dim is not None:
+                    dimmed = dim_preview_frame(tile, dim)
+                    if dimmed is not None:
+                        tile = dimmed
                 ok = True
                 label = str(status or "ok")
         except Exception:
@@ -376,19 +412,26 @@ def draw_cam_tiles(
     height: int,
     cols: int = 4,
     rows: int = 2,
-    ids: tuple[str, ...] | None = None,
+    ids: tuple[str | None, ...] | None = None,
     dropped: bool = False,
+    dim: float | None = None,
 ) -> int:
-    """Paint ≤8 honest camera tiles. Empty slots stay labelled; a slow loop may skip the blit.
+    """Paint at most eight honest camera tiles. A None id leaves that cell blank.
 
-    Returns how many slots were drawn. Never raises on a bad/missing frame.
+    Missing slots stay labelled. A slow loop may skip the blit. ``dim`` scales a
+    real frame (CAMS tab). The bottom strip does not pass it. Returns how many
+    camera slots were drawn. Never raises on a bad or missing frame.
     """
     health = health or {}
-    ids = tuple(ids or CAM_IDS)[:8]
+    slots: tuple[str | None, ...] = tuple(CAM_IDS if ids is None else ids)
     rects = cam_tile_rects(x0, y0, width, height, cols, rows)
     ih, iw = img.shape[:2]
     n = 0
-    for cid, rect in zip(ids, rects):
+    for cid, rect in zip(slots, rects):
+        if cid is None:
+            continue
+        if n >= 8:
+            break
         x, y, slot_w, slot_h = rect
         x2 = min(iw, x + slot_w)
         y2 = min(ih, y + slot_h)
@@ -399,7 +442,7 @@ def draw_cam_tiles(
         tw, th = x2 - x, y2 - y
         status = str(health.get(cid) or "")
         raw = cam_frame_for(frames, cid)
-        tile, label, ok = _paint_cam_tile(tw, th, cid, raw, status, dropped=dropped)
+        tile, label, ok = _paint_cam_tile(tw, th, cid, raw, status, dropped=dropped, dim=dim)
         fs_id = 0.28 if th < 80 else 0.45
         fs_st = 0.32 if th < 80 else 0.50
         live = ok and label == "ok"

@@ -6,20 +6,24 @@ Entertainment only. Never use this stack to control a physical car.
 
 First-time clone: point [Grok Build](https://x.ai/cli), Grok Bot, or any computer-use agent at this repo on extra-high reasoning — paste [`AGENTS.md`](AGENTS.md) if the tool does not auto-read the tree. Have it install GVD on this PC, probe or accept the specs, pick **retail** window-capture vs BeamNG.**tech** 8-cam from what is actually installed, and patch [`config/hardware.yaml`](config/hardware.yaml) to that GPU / VRAM / RAM. No step-by-step here — the model can open the project.
 
-## Alpha 1.7.0
+## Alpha 1.7.1
 
 This is **alpha** — may break / not work; improves with fixes.
 
-Canonical pin **1.7.0** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Untagged retail zips use `1.7.0-alpha-<sha>`.
+Canonical pin **1.7.1** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Untagged retail zips use `1.7.1-alpha-<sha>`.
 
 **Versioning** (this line stays **alpha** until a later non-alpha release):
 
 - **point** bumps (`1.7.x`) = fixes / small UI
 - **main alpha** bump (`1.x.0`) = features / core / UI overhaul
 
-## Recent changes (alpha 1.7.0)
+## Recent changes (alpha 1.7.1)
 
 Catch-up from **1.0.1**. Each feature merge since that pin is one main step. The throttle fix is the point in between. Live Alt+G, Tech 8-cam, FFB, and QSV stay **UNPROVEN**.
+
+### 1.7.1 camera grid
+
+- The CAMS tab is a 3×3 with an empty center, and the camera views on that tab are dimmed a little.
 
 ### 1.7.0 lane points and bus engage
 
@@ -201,7 +205,7 @@ What retail is **not**: eight cameras. It captures **one** window (the main view
 
 **Force-feedback wheels.** A wheel is welcome. Override detection looks at `|steering_input − cmd.steer|`, not the absolute angle, then spike-rejects and EMA-filters that residual so self-aligning torque, spring centering and kicks over bumps no longer disengage GVD. A real pull held ~200 ms still wins, and so does any real brake or throttle press. Tune it in `config\control.yaml` under `override:`. Live FFB behaviour is **UNPROVEN**.
 
-Keys in **GVD VISION**: `V` nerd panel, `D` DRIVE tab (gates / actuators / AEB), `G` VIZ tab (overlay layers), `M` MODEL tab (detector / e2e), `A` CAMS tab (8 camera views; missing slots stay labelled), `[` `]` / `?` cycle tabs, `0` clean cabin, `1–5` debug layers (occupancy / detector boxes / lane polynomials / camera FOV / planner samples), `T` chase↔BEV, `C` manual clip, `R` review capture, `q` quit. The title bar shows the same glance word as the in-game app (OFF / ON / HOLD / DRIVE / MISMATCH). Key `0` hides the nerd chrome and keeps that word. Click the nerd tabs and `+`/`−` to change knobs; they write the command this tick. Loop under 8 Hz drops the CAMS blit and the VIZ camera strip (tiles stay labelled `dropped` / `missing`; the supervisor does not crash).
+Keys in **GVD VISION**: `V` nerd panel, `D` DRIVE tab (gates / actuators / AEB), `G` VIZ tab (overlay layers), `M` MODEL tab (detector / e2e), `A` CAMS tab (3×3, empty center; missing slots stay labelled), `[` `]` / `?` cycle tabs, `0` clean cabin, `1–5` debug layers (occupancy / detector boxes / lane polynomials / camera FOV / planner samples), `T` chase↔BEV, `C` manual clip, `R` review capture, `q` quit. The title bar shows the same glance word as the in-game app (OFF / ON / HOLD / DRIVE / MISMATCH). Key `0` hides the nerd chrome and keeps that word. Click the nerd tabs and `+`/`−` to change knobs; they write the command this tick. Loop under 8 Hz drops the CAMS blit and the VIZ camera strip (tiles stay labelled `dropped` / `missing`; the supervisor does not crash).
 
 **How retail drives.** Every tick the supervisor writes `Documents\GVD\gvd_cmd.json` (`steer, throttle, brake, seq, engaged, heartbeat_mtime`). The mod polls it at 20 Hz and, while **both** sides are engaged, feeds the player vehicle as a **secondary Direct Drive wheel + pedals**: `input.event('steering', s, 2, 900, 0, nil, 'gvd')` / `input.event('throttle'|'brake', v, 2, 0, 0, nil, 'gvd')` (`+steer` = right, Direct filter so the command is 1:1, not pad-smoothed), zeros `parkingbrake`/`clutch` on the same source, and `input.setAllowedInputSource(..., 'gvd', true)` / `('local', false)` so a connected keyboard, pad, wheel or pedal cluster cannot overwrite the software every frame. Arcade gearbox once. Vehicle Lua echoes `wheelspeed`, applied electrics, and non-gvd `lastInputs` (the physical wheel/pedals) back through `gvd_ego.json`, which gives the planner real ego speed (closed-loop throttle, TTC/AEB) and lets `cmd_applied` be `true` only on a fresh Lua ack (`cmd_reason`: `cmd_json_applied` / `cmd_json_pending` / `cmd_json_idle`). On disengage the mod zeros the `gvd` source and clears the whitelist so the player's device gets the car back.
 
@@ -242,7 +246,7 @@ Optional bus in `config/sensors.yaml`. Defaults: IMU + GPS **on**; `lidar` / `ra
 
 ## Release zip (M6)
 
-Windows: double-click `scripts\make_release_zip.bat`. Anywhere: `python scripts/make_release_zip.py`. Output: `dist\gvd-retail-<version>.zip` (gitignored), `<version>` = exact git tag if any, else `1.7.0-alpha-<sha>[-dirty]`; override with `--version 1.7.0`, `--out path`, `--flat` (no top-level folder), `--list` (manifest only).
+Windows: double-click `scripts\make_release_zip.bat`. Anywhere: `python scripts/make_release_zip.py`. Output: `dist\gvd-retail-<version>.zip` (gitignored), `<version>` = exact git tag if any, else `1.7.1-alpha-<sha>[-dirty]`; override with `--version 1.7.1`, `--out path`, `--flat` (no top-level folder), `--list` (manifest only).
 
 Packs: `install.bat`, `uninstall.bat`, `play_gvd.bat`, `beamng_mod/`, `python/` (retail runtime), `config/` (including `sensors.yaml`), `requirements.txt` + `requirements-retail.txt`, `LICENSE`, `README.md`, `AGENTS.md`, `docs/*.md`, `models/yolov8n.onnx` + `models/NOTICE.txt`, plus a generated `VERSION.txt` (version, build time, git sha, the retail honesty lines). Excludes `data/clips/`, extra weights (`*.pt`, other `*.onnx`, `*.pth` `*.bin` `*.safetensors`), `.git`, `scripts/` (tests + this tool), `__pycache__`, `dist/`, and `requirements-foxglove.txt`. `*.bat` are written CRLF. After writing, the script re-opens the zip, refuses forbidden members and missing must-haves (mod entry point, `run_vision.py`, launchers, `models/yolov8n.onnx`), and exits non-zero on any problem. Attach the zip to a GitHub Release. Offline check: `PYTHONPATH=. python scripts/test_m6_retail.py`.
 
@@ -304,7 +308,7 @@ Visualization **toy** (not a scientific claim that forecasts match Waymo). On-sc
 
 **In-game (BeamNG world):** ice-blue ribbon drawn on the pavement via GELua `debugDrawer` (`drawSquarePrism`, 3-line fallback) — **1:1** with `path_ego` / `path_world` (x right, y forward, z up). Track ghosts sit on the road at the same transform; CIPV is brighter. Ribbon/ghosts draw while the supervisor is live (dimmer when OFF); Alt+G takes the wheel and lights the ice underglow. GELua reads relative `Documents/GVD` via VFS / `FS:readFile` (Tech/Drive `current\Documents\GVD` under the running userfolder). Python writes the absolute product sandbox; `GVD_DOCS_DIR` wins for writers. Not USERPROFILE Documents. Not OneDrive. This is **not** a 2D camera overlay. In-game strip app: **GVD Strip** (policy plus OFF / ON / HOLD / DRIVE / MISMATCH, then Hz · TTC · N). Ice when on or driving, amber on HOLD, red on MISMATCH.
 
-**Second screen (`GVD VISION`):** OpenCV cabin on monitor 2 when available (`--viz-screen auto|1|2`, `--viz-fullscreen`, or `GVD_VIZ_MONITOR=2`). This is the VISION lexicon: near-black void stage, thin vector lane paint (`lanes_ext`: solid detected / dim-dashed predicted; smoke stubs only), warm-grey kerbs (`road_edges`), ice-blue ego corridor at the planner width (`path_width / 2` meters each side, only as long as the path that exists; intent shade; stop bar when halted behind a CIPV), agent boxes as empty solids (ice-blue in-path, CIPV **LEAD**, red **BRAKE**; no disc on the face), thin forecast lines that start half a length ahead of each track, and stop-sign / traffic-light / pole glyphs when `signs[]` is present. Optional `cam_main` PIP (front overexposure is clamped so a Tech attach does not blow the preview white). The nerd **CAMS** tab (`A`) is an extra 8-slot camera wall on the stage plus a 2×4 in the panel; retail / stub missing feeds stay labelled `missing` (never filled from `cam_main`). Cabin / LIVE stays the default view. The nerd **VIZ** tab / keys `1–5` add a denser debug stack (occupancy from tracks, detector boxes, camera FOV, planner samples) on top of that lexicon — overlay only, still vision-only at inference. Loop under 8 Hz drops fans, signs, PIP blit, the VIZ camera strip blit, and the CAMS grid blit first (labelled empty tiles; no crash). Caps: 32 agents / 16 forecast fans / 3 modes. One monitor → window stays put; drag it, or use motherboard HDMI for UHD 630 as display 2. Live dual-monitor + Alt+G still **UNPROVEN** on Linux / until Windows gate.
+**Second screen (`GVD VISION`):** OpenCV cabin on monitor 2 when available (`--viz-screen auto|1|2`, `--viz-fullscreen`, or `GVD_VIZ_MONITOR=2`). This is the VISION lexicon: near-black void stage, thin vector lane paint (`lanes_ext`: solid detected / dim-dashed predicted; smoke stubs only), warm-grey kerbs (`road_edges`), ice-blue ego corridor at the planner width (`path_width / 2` meters each side, only as long as the path that exists; intent shade; stop bar when halted behind a CIPV), agent boxes as empty solids (ice-blue in-path, CIPV **LEAD**, red **BRAKE**; no disc on the face), thin forecast lines that start half a length ahead of each track, and stop-sign / traffic-light / pole glyphs when `signs[]` is present. Optional `cam_main` PIP (front overexposure is clamped so a Tech attach does not blow the preview white). The nerd **CAMS** tab (`A`) is a 3×3 on the stage and in the panel, center cell empty, views dimmed a little; retail / stub missing feeds stay labelled `missing` (never filled from `cam_main`). Cabin / LIVE stays the default view. The nerd **VIZ** tab / keys `1–5` add a denser debug stack (occupancy from tracks, detector boxes, camera FOV, planner samples) on top of that lexicon — overlay only, still vision-only at inference. Loop under 8 Hz drops fans, signs, PIP blit, the VIZ camera strip blit, and the CAMS grid blit first (labelled empty tiles; no crash). Caps: 32 agents / 16 forecast fans / 3 modes. One monitor → window stays put; drag it, or use motherboard HDMI for UHD 630 as display 2. Live dual-monitor + Alt+G still **UNPROVEN** on Linux / until Windows gate.
 
 ```bash
 pip install -r requirements-viz.txt
@@ -314,11 +318,11 @@ PYTHONPATH=. python python/run_vision.py --viz      # live window + state file f
 PYTHONPATH=. python scripts/test_gvd_viz_stage.py
 ```
 
-Keys in `--viz`: `V` nerd, `D` DRIVE (live actuators), `G` VIZ (occupancy / boxes / FOV / cost), `M` MODEL (detector / e2e), `A` CAMS (8 views), `[` `]` tabs, `j/k` `h/l` / click to edit, `0` clean cabin, `1–5` overlay layers, `T` chase↔BEV, `C` clip, `R` review capture, `q` quit. A resized window still hits the row under the pointer, and that row shows a hover edge. Occupancy is derived from tracks, not a learned grid. CAMS / camera-strip blits drop under 8 Hz.
+Keys in `--viz`: `V` nerd, `D` DRIVE (live actuators), `G` VIZ (occupancy / boxes / FOV / cost), `M` MODEL (detector / e2e), `A` CAMS (3×3, empty center), `[` `]` tabs, `j/k` `h/l` / click to edit, `0` clean cabin, `1–5` overlay layers, `T` chase↔BEV, `C` clip, `R` review capture, `q` quit. A resized window still hits the row under the pointer, and that row shows a hover edge. Occupancy is derived from tracks, not a learned grid. CAMS / camera-strip blits drop under 8 Hz.
 
 ## Status
 
-**Alpha 1.7.0:** this is **alpha** — may break / not work; improves with fixes. **point** bumps = fixes / small UI. **main alpha** bump = features / core / UI overhaul. See [Alpha 1.7.0](#alpha-170). **1.7.0** keeps a stale `gvd_engage.json` from starting the car, holds an untrained E2E stub instead of driving it, shares one glance word (OFF / ON / HOLD / DRIVE / MISMATCH) across the app, the strip, and the VISION title, and draws cabin agent boxes as empty solids.
+**Alpha 1.7.1:** this is **alpha** — may break / not work; improves with fixes. **point** bumps = fixes / small UI. **main alpha** bump = features / core / UI overhaul. See [Alpha 1.7.1](#alpha-171). **1.7.0** keeps a stale `gvd_engage.json` from starting the car, holds an untrained E2E stub instead of driving it, shares one glance word (OFF / ON / HOLD / DRIVE / MISMATCH) across the app, the strip, and the VISION title, and draws cabin agent boxes as empty solids.
 
 **Force-feedback player override:** wheel chatter no longer disengages GVD. Signal is `|steering_input − aligned cmd.steer|` (never an absolute angle), then spike reject → EMA → hysteresis → dwell. Pedals are asymmetric and tight. Live FFB is **UNPROVEN**. Details under [Actuation](#actuation-m3).
 

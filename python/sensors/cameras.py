@@ -1195,6 +1195,7 @@ class BeamNGPyBackend:
         self._io_box: dict[str, Any] = {}
         self._io_job: tuple[str, str] | None = None
         self._read_blocked = False
+        self._late_unique: list[str] = []
 
     def open(self) -> None:
         self.connect_failed = False
@@ -1407,6 +1408,12 @@ class BeamNGPyBackend:
         return self.session.poll()
 
     def close(self) -> None:
+        # A timed-out GE read is still on the one BeamNGpy socket. Wait for it
+        # before remove() and disconnect so close does not race that call.
+        thread = self._io_thread
+        if thread is not None and thread.is_alive():
+            thread.join()
+        self._reap_if_done()
         for cam in list(self._sensors.values()):
             try:
                 cam.remove()
@@ -1428,6 +1435,7 @@ class BeamNGPyBackend:
         self._adhoc = None
         self._adhoc_ready = False
         self._owed.clear()
+        self._late_unique.clear()
         self._grab_i = 0
         self._unique_hz_ema = 0.0
         self._unique_n = 0
@@ -1453,10 +1461,11 @@ class BeamNGPyBackend:
         """Keep the last real picture.
 
         A scheduled skip stays OK when a non-blank frame is cached. No cache
-        leaves MISSING (the slot stays labelled). A failed read that still has
-        a picture is STALE and the pixels stay, so CAMS does not go black
-        between hitch slots. An all-zero buffer is not a picture and is not
-        stored here.
+        leaves MISSING (the slot stays labelled). A read that only missed the
+        time budget is the same skip: the last real frame stays OK so CAMS
+        still counts the tile. A completed read that returns nothing is STALE
+        and the pixels stay, so the tile does not go black. An all-zero buffer
+        is not a picture and is not stored here.
         """
         bgr = self._cache_frames.get(cid)
         if frame_is_unrendered(bgr):
@@ -1523,6 +1532,9 @@ class BeamNGPyBackend:
         nxt = next((f for f in ladder if f < float(planes[1]) - 1e-9), want)
         if abs(nxt - NARROW_FAR_LIVE_HITCH_M) > 1e-6 and abs(want - NARROW_FAR_LIVE_HITCH_M) > 1e-6:
             return
+        # Reattach builds a new Camera on the GE socket and drops the old
+        # request id. Both are refused while a timed-out ad-hoc call is in
+        # that socket; the hitch retries on a later grab.
         if not self._reattach_cam("narrow", far_m=NARROW_FAR_LIVE_HITCH_M):
             return
         self._narrow_live_hitched = True
@@ -1531,12 +1543,31 @@ class BeamNGPyBackend:
             f"hitch narrow far_m {planes[1]:g}->{NARROW_FAR_LIVE_HITCH_M:g}"
         )
 
+    def _drop_adhoc(self, cid: str) -> None:
+        """Forget an in-flight request that belonged to a sensor we are replacing.
+
+        Harvest would otherwise keep asking the new camera for the old id.
+        A False or an exception there never clears the slot, so inflight stays
+        1 and no other companion can send.
+        """
+        if self._adhoc is None or self._adhoc[0] != cid:
+            return
+        self._adhoc = None
+        self._adhoc_ready = False
+        self._owe(cid)
+
     def _reattach_cam(self, cid: str, *, far_m: float) -> bool:
         Camera = self._Camera
         kwargs = self._sensor_kwargs.get(cid)
         cam = self._sensors.get(cid)
         if Camera is None or kwargs is None or self.session.vehicle is None or self.session.bng is None:
             return False
+        # OpenCamera is a GE round-trip. Do not start it while a timed-out
+        # ad-hoc send/ready/collect still holds that socket.
+        if self._socket_io_busy():
+            return False
+        self._reap_if_done()
+        self._drop_adhoc(cid)
         near = float(kwargs.get("near_far_planes", (DEFAULT_NEAR_M, far_m))[0])
         new_kwargs = dict(kwargs)
         new_kwargs["near_far_planes"] = (near, float(far_m))
@@ -1618,6 +1649,18 @@ class BeamNGPyBackend:
         bgr = resize_long_side(bgr, self.long_side)
         self._cache_frames[cid] = bgr
         self._cache_ts[cid] = time.time()
+        sig = frame_signature(bgr)
+        if sig == self._frame_sig.get(cid):
+            return
+        self._frame_sig[cid] = sig
+        if cid not in self._late_unique:
+            self._late_unique.append(cid)
+
+    def _take_late_unique(self, unique_ids: list[str]) -> None:
+        for cid in self._late_unique:
+            if cid not in unique_ids:
+                unique_ids.append(cid)
+        self._late_unique.clear()
 
     def _apply_late(self, cid: str, kind: str, value: Any) -> None:
         if kind == "adhoc_send" and isinstance(value, int) and self._adhoc is None:
@@ -1777,14 +1820,16 @@ class BeamNGPyBackend:
 
             raw = self._io_call(cid, "stream", _stream)
             if raw is _IO_BUSY or raw is _IO_TIMEOUT:
-                return None
+                return raw
             return _reading_colour(raw, res)
 
         def _poll() -> np.ndarray | None:
             return read_camera_colour(cam, cid=cid, resolution=res)
 
         got = self._io_call(cid, "poll", _poll)
-        if got is _IO_BUSY or got is _IO_TIMEOUT or not isinstance(got, np.ndarray):
+        if got is _IO_BUSY or got is _IO_TIMEOUT:
+            return got
+        if not isinstance(got, np.ndarray):
             return None
         return got
 
@@ -1852,7 +1897,11 @@ class BeamNGPyBackend:
                 companion_polled = True
             try:
                 bgr = self._bounded_sensor_colour(cid, cam)
-                self._publish_read(cid, bgr, ts, frames, timestamps, health, unique_ids)
+                if bgr is _IO_BUSY or bgr is _IO_TIMEOUT:
+                    # Budget miss, not a failed picture. Last frame stays ok.
+                    self._reuse_cached(cid, frames, timestamps, health, failed=False)
+                else:
+                    self._publish_read(cid, bgr, ts, frames, timestamps, health, unique_ids)
             except Exception:
                 health[cid] = CamHealth.ERROR
                 cached = self._cache_frames.get(cid)
@@ -1861,6 +1910,8 @@ class BeamNGPyBackend:
                     timestamps[cid] = self._cache_ts.get(cid, time.time())
                     if cid == "main":
                         frames["cam_main"] = cached
+        self._maybe_live_narrow_hitch()
+        self._take_late_unique(unique_ids)
         unique_n = len(unique_ids)
         now = time.perf_counter()
         if grab_i > 0 and self._last_unique_tick_t > 0:
@@ -1869,7 +1920,6 @@ class BeamNGPyBackend:
         self._last_unique_tick_t = now
         if unique_n > 0:
             self._unique_n += 1
-        self._maybe_live_narrow_hitch()
         n_ok = sum(1 for c in CAM_IDS if health.get(c) == CamHealth.OK)
         grab_ms = (time.perf_counter() - t0) * 1000.0
         note = (

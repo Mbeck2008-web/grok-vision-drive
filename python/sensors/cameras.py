@@ -7,6 +7,7 @@ import os
 import sys
 import threading
 import time
+import weakref
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -735,6 +736,22 @@ class _IoMark:
 
 _IO_BUSY = _IoMark("busy")
 _IO_TIMEOUT = _IoMark("timeout")
+_camera_backends: weakref.WeakSet = weakref.WeakSet()
+
+
+def camera_ge_socket_busy() -> bool:
+    """True when some live backend still has a camera read on the GE socket.
+
+    ``stream_raw`` is shared memory and does not count. Callers that would
+    send ``sensors.poll`` or ``vehicle.control`` check this and wait a tick.
+    """
+    for backend in list(_camera_backends):
+        try:
+            if backend._socket_io_busy():
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _reading_colour(images: Any, resolution: tuple[int, int] | None) -> np.ndarray | None:
@@ -1196,6 +1213,7 @@ class BeamNGPyBackend:
         self._io_job: tuple[str, str] | None = None
         self._read_blocked = False
         self._late_unique: list[str] = []
+        _camera_backends.add(self)
 
     def open(self) -> None:
         self.connect_failed = False
@@ -1396,13 +1414,16 @@ class BeamNGPyBackend:
 
     def poll_vehicle(self):
         if self._socket_io_busy():
-            held = getattr(self.session, "_last_vehicle_data", None)
-            if held is not None:
-                return held
+            vehicle = self.session.vehicle
+            last = getattr(self.session, "_last_vehicle_data", None)
+            last_map = getattr(self.session, "_last_sensor_map", None)
+            if vehicle is not None and last is not None and last_map is not None:
+                # Same shape as Soft Esc coalesce: timers 0, snap republished.
+                return self.session._coalesced_vehicle_data(vehicle)
             from python.sensors.tech import VehicleData
 
             return VehicleData(
-                connected=self.session.vehicle is not None,
+                connected=vehicle is not None,
                 note="camera io in flight; sensors.poll skipped",
             )
         return self.session.poll()

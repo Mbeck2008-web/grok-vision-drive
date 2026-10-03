@@ -3102,6 +3102,223 @@ def check_narrow_reattach_and_cam_io_edges() -> None:
                 sys.modules[k] = v
 
 
+def check_busy_socket_skips_vehicle_ge() -> None:
+    """A timed-out ad-hoc read holds the GE socket for the rest of the tick.
+
+    ``poll_vehicle`` must not repeat the last ``sensors_poll_ms`` / ``poll_gps_sent``.
+    It republishes the last sensor map the way Soft Esc coalesce does, so
+    ``read_electrics`` does not call ``sensors.poll``. An engaged apply does not
+    call ``vehicle.control`` while ``_socket_io_busy()`` is true.
+    """
+    import sys
+    import time
+    import types
+
+    import python.control.actuate as act
+    from python.control.actuate import BeamNGPyActuator, DriveCommand, read_electrics_inputs
+    from python.sensors.cameras import BeamNGPyBackend, load_camera_config
+    from python.sensors.tech import VehicleData
+
+    class AdHocCamera:
+        def __init__(self, name, _bng, _vehicle, **kwargs):
+            self.name = name
+            self.is_streaming = True
+            self.update_priority = float(kwargs.get("update_priority", 0.0))
+            self.resolution = kwargs.get("resolution", (8, 8))
+            self._seq = 0
+            self._ready_after: dict[int, int] = {}
+
+        def get_update_priority(self):
+            return self.update_priority
+
+        def set_update_priority(self, p):
+            self.update_priority = float(p)
+
+        def set_max_pending_requests(self, n):
+            return None
+
+        def stream_raw(self):
+            import numpy as np
+
+            img = np.zeros((8, 8, 3), dtype=np.uint8)
+            img[0, 0, 0] = 4
+            return {"colour": img}
+
+        def poll(self):
+            raise AssertionError("adhoc companion must not poll()")
+
+        def send_ad_hoc_poll_request(self):
+            self._seq += 1
+            rid = self._seq
+            self._ready_after[rid] = 1
+            return rid
+
+        def is_ad_hoc_poll_request_ready(self, request_id):
+            rid = int(request_id)
+            left = self._ready_after.get(rid, 0)
+            if left <= 0:
+                return True
+            self._ready_after[rid] = left - 1
+            return False
+
+        def collect_ad_hoc_poll_request(self, request_id):
+            import numpy as np
+
+            img = np.zeros((8, 8, 3), dtype=np.uint8)
+            img[0, 0, 1] = 3
+            return {"colour": img}
+
+        def remove(self):
+            return None
+
+    class VehSensors:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def poll(self):
+            self.n += 1
+            return {
+                "electrics": {
+                    "wheelspeed": 99.0,
+                    "steering_input": 0.9,
+                    "throttle_input": 0.9,
+                    "brake_input": 0.0,
+                }
+            }
+
+    class Veh:
+        def __init__(self) -> None:
+            self.sensors = VehSensors()
+            self.control_n = 0
+
+        def control(self, **_kwargs):
+            self.control_n += 1
+
+    sensors = types.ModuleType("beamngpy.sensors")
+    sensors.Camera = AdHocCamera
+    beamngpy = types.ModuleType("beamngpy")
+    beamngpy.sensors = sensors
+    old = {k: sys.modules.get(k) for k in ("beamngpy", "beamngpy.sensors")}
+    sys.modules["beamngpy"] = beamngpy
+    sys.modules["beamngpy.sensors"] = sensors
+    prev_latch = act.soft_esc_sensors_every_tick()
+    engage = act.engage_path()
+    prev_bytes = engage.read_bytes() if engage.is_file() else None
+    be = None
+    try:
+        act.note_soft_esc_engaged(False)
+        act.write_engage_flag(False)
+        be = BeamNGPyBackend(
+            config=load_camera_config(),
+            tech_config={
+                "wait_vehicle_s": 0,
+                "cameras": {
+                    "attach": True,
+                    "rgb_only": True,
+                    "update_s": 0.067,
+                    "shared_memory": True,
+                    "streaming": True,
+                },
+            },
+        )
+        veh = Veh()
+        session_polls = {"n": 0}
+
+        def _session_poll():
+            session_polls["n"] += 1
+            raise AssertionError("session.poll while camera GE socket is busy")
+
+        def _connect(explicit=True):
+            be.session.vehicle = veh
+            be.session.bng = object()
+            return True
+
+        be.session.connect = _connect  # type: ignore[method-assign]
+        be.session.attach_vehicle_sensors = lambda: {}  # type: ignore[method-assign]
+        be.open()
+        be.session.vehicle = veh
+        be.session.poll = _session_poll  # type: ignore[method-assign]
+        be.session._last_vehicle_data = VehicleData(
+            connected=True,
+            speed_mps=3.0,
+            steering_input=0.1,
+            throttle_input=0.2,
+            brake_input=0.0,
+            sensors={"electrics": "ok", "gps": "ok"},
+            sensors_poll_ms=12.5,
+            poll_gps_ms=4.0,
+            poll_gps_sent=True,
+            lat=53.0,
+            lon=-1.5,
+            note="fresh poll",
+        )
+        be.session._last_sensor_map = {
+            "electrics": {
+                "wheelspeed": 3.0,
+                "steering_input": 0.1,
+                "throttle_input": 0.2,
+                "brake_input": 0.0,
+            }
+        }
+
+        def _slow_send(self):
+            time.sleep(0.3)
+            return 7
+
+        for cid, cam in be._sensors.items():
+            if cid == "main":
+                continue
+            cam.send_ad_hoc_poll_request = _slow_send.__get__(cam, AdHocCamera)
+        be._adhoc = None
+        be._adhoc_ready = False
+        be._owed = ["wide"]
+        stalled = None
+        for _step in range(16):
+            bundle = be.grab()
+            if bundle.grab_read_blocked and be._socket_io_busy():
+                stalled = bundle
+                break
+        assert stalled is not None
+        assert be._socket_io_busy()
+        held = be.poll_vehicle()
+        assert session_polls["n"] == 0
+        assert be._socket_io_busy()
+        assert float(held.sensors_poll_ms) == 0.0
+        assert float(held.poll_gps_ms) == 0.0
+        assert held.poll_gps_sent is False
+        assert held.speed_mps == 3.0
+        assert held.sensors.get("gps") == "stale"
+        el = read_electrics_inputs(veh)
+        assert veh.sensors.n == 0
+        assert el.speed_mps == 3.0
+        assert el.throttle_input == 0.2
+        assert be._socket_io_busy()
+        actuator = BeamNGPyActuator(veh)
+        actuator.note_engaged(True)
+        applied = actuator.apply(DriveCommand(steer=0.1, throttle=0.4, brake=0.0, seq=3, reason="ok"))
+        assert veh.control_n == 0
+        assert applied.applied is False
+        assert session_polls["n"] == 0
+        assert veh.sensors.n == 0
+        assert be._socket_io_busy()
+    finally:
+        act.note_soft_esc_engaged(False)
+        if be is not None:
+            thread = be._io_thread
+            if thread is not None and thread.is_alive():
+                thread.join(1.0)
+        act.note_soft_esc_engaged(prev_latch)
+        if prev_bytes is None:
+            engage.unlink(missing_ok=True)
+        else:
+            engage.write_bytes(prev_bytes)
+        for k, v in old.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+
 def main() -> None:
     check_frame_convert()
     check_path_world()
@@ -3119,6 +3336,7 @@ def main() -> None:
     check_beamngpy_side_grab_half_rate()
     check_adhoc_companions_do_not_block_or_pile()
     check_narrow_reattach_and_cam_io_edges()
+    check_busy_socket_skips_vehicle_ge()
     check_soft_esc_segment_timers()
     check_nvidia_smi_cache_and_honest_hz()
     check_auto_backend_not_tech_without_env()

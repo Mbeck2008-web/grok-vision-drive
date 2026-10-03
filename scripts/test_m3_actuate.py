@@ -613,7 +613,9 @@ def main() -> None:
         seq=1,
     )
     assert cmd.throttle == 0.0 and cmd.brake == 1.0 and cmd.reason == "heartbeat_stale", cmd
-    assert heartbeat_fresh(__import__("time").time() - 1.0) is False
+    # 1.0 s is a grab hitch, not a dead supervisor. 2.0 s is a stale link.
+    assert heartbeat_fresh(__import__("time").time() - 1.0) is True
+    assert heartbeat_fresh(__import__("time").time() - 2.0) is False
     assert heartbeat_fresh(__import__("time").time()) is True
 
     # 3) preview path → no actuate unless flag
@@ -749,7 +751,9 @@ def main() -> None:
     assert drive.applied is True and veh.calls[-1]["throttle"] == 0.4
     assert veh.calls[-1].get("parkingbrake", 0.0) == 0.0
     assert veh.calls[-1]["gear"] >= TECH_DRIVE_GEAR
-    assert veh.shifts == [TECH_SHIFT_MODE] and TECH_SHIFT_MODE == "realistic_automatic"
+    assert veh.shifts == [TECH_SHIFT_MODE] and TECH_SHIFT_MODE == "arcade"
+    assert "setGearboxMode('arcade')" in TECH_DRIVE_SHIFT_LUA
+    assert "setGearboxMode('realistic')" not in TECH_DRIVE_SHIFT_LUA
     _assert_no_reverse(veh.calls[-1])
 
     hold = tech.stop(seq=3, reason="preview_blocked")
@@ -849,7 +853,8 @@ def main() -> None:
     again = json.loads(cmd_path().read_text(encoding="utf-8"))
     assert again["brake"] == 0.0 and again["throttle"] == 0.0 and again["engaged"] is False
 
-    # Falling-edge release with the shifter never armed must not call realistic_automatic.
+    # Falling-edge release with the shifter never armed restores arcade and
+    # does not latch the drive shifter.
     bare = FakeVeh()
     tech_bare = BeamNGPyActuator(bare)
     tech_bare._latched = True
@@ -858,8 +863,7 @@ def main() -> None:
     bare_edge = tech_bare.stop(seq=40, reason="not_engaged")
     assert bare_edge.throttle == 0.0 and bare_edge.brake == 0.0
     assert bare.calls[-1] == {"steering": 0.0, "throttle": 0.0, "brake": 0.0, "parkingbrake": 0.0}
-    assert TECH_SHIFT_MODE not in bare.shifts, bare.shifts
-    assert bare.shifts == [TECH_PLAYER_SHIFT_MODE]
+    assert bare.shifts == [TECH_PLAYER_SHIFT_MODE] == ["arcade"]
     assert bare.ai_modes == ["disabled"]
     assert tech_bare._latched is False and tech_bare._shift_set is False
     n_bare = len(bare.calls)
@@ -874,7 +878,8 @@ def main() -> None:
 
         def set_shift_mode(self, mode: str) -> None:
             self.shifts.append(mode)
-            if mode == TECH_PLAYER_SHIFT_MODE and not self.arcade_ok:
+            # The first arcade call is the drive arm. Later calls are the handoff.
+            if len(self.shifts) > 1 and mode == TECH_PLAYER_SHIFT_MODE and not self.arcade_ok:
                 raise RuntimeError("arcade handoff failed")
 
     fail = ArcadeFailVeh()
@@ -889,12 +894,12 @@ def main() -> None:
     assert fail.shifts == [TECH_SHIFT_MODE, TECH_PLAYER_SHIFT_MODE]
     assert tech_fail._latched is True and tech_fail._shift_set is True
     n_fail = len(fail.calls)
-    n_realistic = fail.shifts.count(TECH_SHIFT_MODE)
+    n_shifts = len(fail.shifts)
     tech_fail.stop(seq=44, reason="not_engaged")
-    assert tech_fail._latched is True
+    assert tech_fail._latched is True and tech_fail._shift_set is True
     assert len(fail.calls) == n_fail + 1
     assert fail.calls[-1]["brake"] == 0.0 and fail.calls[-1]["parkingbrake"] == 0.0
-    assert fail.shifts.count(TECH_SHIFT_MODE) == n_realistic
+    assert len(fail.shifts) == n_shifts + 1
     assert fail.shifts[-1] == TECH_PLAYER_SHIFT_MODE
     fail.arcade_ok = True
     n_retry = len(fail.calls)

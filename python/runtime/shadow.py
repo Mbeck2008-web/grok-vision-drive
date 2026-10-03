@@ -4,8 +4,9 @@ Default policy_modular = safety supervisor (may veto E2E).
 Disengaged → no actuate; shadow fields still written.
 Modular veto → hold/disengage; optional clip trigger via recorder.
 Dead-man / heartbeat gates unchanged (caller passes heartbeat_ok).
-Engage rate gate: a measured loop/camera Hz under min_accept_hz disengages
-after the arm grace. During the grace the floor is about 5 Hz.
+A low loop or camera rate is not an Engage drop. That grace used to drive
+for about three seconds and then disengage, and a hitch in the same window
+showed up as HOLD because the link went stale.
 """
 
 from __future__ import annotations
@@ -257,22 +258,12 @@ def shadow_tick(
             policy=policy,
         )
 
-    # Engage-only. A disengaged tick keeps the perception veto (often low_lane_conf)
-    # instead of rewriting it as a rate fault. 0 Hz is unmeasured, not a reject.
-    hz_reason = engage_hz_reason(loop_hz, camera_hz, engage_age_s, cfg)
-    if hz_reason != "none":
-        applied = stop_command(seq=seq, reason=f"veto:{hz_reason}")
-        return ShadowTick(
-            modular=modular,
-            e2e=e2e,
-            applied=applied,
-            shadow=shadow,
-            e2e_ok=False,
-            veto_reason=hz_reason,
-            should_disengage=True,
-            clip_trigger="disengage",
-            policy=policy,
-        )
+    # A low rate used to replace the plan with a brake hold and clear Engage
+    # after the arm grace. That was a few seconds of DRIVE, a HOLD, and a
+    # self-disengage, and the steer command twitched between the plan and 0.
+    # The rate is still named by engage_hz_reason. It does not veto.
+    _hz_reason = engage_hz_reason(loop_hz, camera_hz, engage_age_s, cfg)
+    del _hz_reason
 
     # Modular-only policy: classic plan path; preview gate.
     # An untrained e2e stub (no models/e2e_current.onnx) is computed above and

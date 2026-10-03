@@ -23,7 +23,10 @@ from typing import Any, Protocol
 from python.runtime.paths import bus_identity
 from python.runtime.state_io import atomic_write_json, gvd_docs_dir
 
-HEARTBEAT_STALE_S = 0.35
+# Link / ribbon stale. A single grab hitch is well under a second and must
+# not flip the in-game link to stale (that flash is the Engage HOLD). The
+# command dead-man stays at 0.35 s in the mod; this is only the link.
+HEARTBEAT_STALE_S = 1.5
 AEB_BRAKE_TTC = 1.2
 EGO_FRESH_S = 1.0          # gvd_ego.json older than this → treat Lua feedback as gone
 CMD_ACK_SLACK = 5          # Lua acks lag a few seqs (20 Hz apply, 10 Hz echo, 15 Hz loop)
@@ -31,10 +34,9 @@ CMD_ACK_SLACK = 5          # Lua acks lag a few seqs (20 Hz apply, 10 Hz echo, 1
 # A leftover engaged:true from a crashed session must not start Tech vehicle.control.
 ENGAGE_FRESH_S = 2.5
 
-# Tech no-R (research pin): arcade + brake-hold + no throttle auto-selects R.
-# Use realistic_automatic so brake-hold is not reverse throttle. Gear is int only
-# (-1 R, 0 N, 1+ forward) — never gear=-1, never letter "D".
-TECH_SHIFT_MODE = "realistic_automatic"
+# Drive uses arcade. Gear is still int only (-1 is reverse and is never sent,
+# 0 is hold, 1+ is forward). Never letter "D" on vehicle.control.
+TECH_SHIFT_MODE = "arcade"
 # Player arrows/pedals expect arcade. Restored only on the Disengage handoff.
 TECH_PLAYER_SHIFT_MODE = "arcade"
 TECH_HOLD_BRAKE = 0.99
@@ -51,7 +53,7 @@ TECH_DRIVE_ARM_S = 0.55
 TECH_DRIVE_SHIFT_LUA = (
     "pcall(function() "
     "local c=controller and controller.mainController; "
-    "if c and c.setGearboxMode then pcall(function() c.setGearboxMode('realistic') end) end; "
+    "if c and c.setGearboxMode then pcall(function() c.setGearboxMode('arcade') end) end; "
     "if input and input.event then pcall(function() "
     "input.event('parkingbrake',0,2,0,0,nil,'gvd'); "
     "input.event('clutch',0,2,0,0,nil,'gvd') end) end; "

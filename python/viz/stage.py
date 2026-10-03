@@ -44,6 +44,7 @@ from python.viz.debug_draw import (
     draw_planner_cost,
 )
 from python.perception.road_model import paint_lane_behind, suppress_lane_fan
+from python.viz.lane_roles import classify_lane_roles
 from python.runtime.state_io import steer_preview_path_ego
 from python.viz.forecast import predict_modes
 from python.viz.nerd import NERD_WIDTH, hit_test, render_panel, scene_note
@@ -167,6 +168,11 @@ class VizUI:
             return True
         if key in (ord("a"), ord("A")):
             self.show_cams_tab()
+            return True
+        if key in (ord("r"), ord("R")):
+            # Review capture. Does not quit and does not stop BeamNG.tech.
+            self.debug.review_record = not self.debug.review_record
+            self.show_nerd = True
             return True
         if key == ord("["):
             self.cycle_tab(-1)
@@ -818,28 +824,59 @@ def _lane_span(cam: Cam, state: dict[str, Any] | None) -> tuple[float, float]:
     return y_lo, y_hi
 
 
-def _draw_lanes(img: np.ndarray, lanes: list, cam: Cam, *, smoke: bool, state: dict[str, Any] | None = None) -> None:
-    y_lo, y_hi = _lane_span(cam, state)
+def drawn_lane_records(
+    state: dict[str, Any] | None,
+    lanes: list | None = None,
+    cam: Cam | None = None,
+) -> list[dict[str, Any]]:
+    """Boundaries the cabin strokes, each tagged through, merge, or exit.
+
+    Points are the ones that get drawn. Nothing is added past the last sample.
+    """
+    state = state or {}
+    if cam is None:
+        draw = resolve_draw_range(state)
+        cam = Cam(ahead_m=draw.ahead_m, behind_m=draw.behind_m, fade_frac=draw.fade_frac)
+    src = lanes if lanes is not None else (state.get("lanes_ext") or state.get("lanes") or [])
+    smoke = _allow_stub(state)
     hide_fan = suppress_lane_fan(state)
-    for ln in lanes or []:
+    y_lo, y_hi = _lane_span(cam, state)
+    pending: list[dict[str, Any]] = []
+    for ln in src or []:
         kind = ln.get("kind") if isinstance(ln, dict) else None
         if hide_fan and str(kind or "") == "predicted":
             continue
-        mode = lane_draw_mode(kind, smoke=smoke)
-        if mode is None:
+        if lane_draw_mode(kind, smoke=smoke) is None:
             continue
         pts = _clip_poly_y(_poly_points(ln), y_lo, y_hi)
         if len(pts) < 2:
             continue
-        idx = 1
         if isinstance(ln, dict):
-            try:
-                idx = int(ln.get("index") if ln.get("index") is not None else ln.get("idx") or 1)
-            except (TypeError, ValueError):
-                idx = 1
+            pending.append({**ln, "points": pts})
+        else:
+            pending.append({"points": pts, "kind": "detected"})
+    return classify_lane_roles(pending)
+
+
+def _draw_lanes(img: np.ndarray, lanes: list, cam: Cam, *, smoke: bool, state: dict[str, Any] | None = None) -> None:
+    del smoke  # drawn_lane_records reads viz_smoke off state; callers still pass it
+    records = drawn_lane_records(state, lanes, cam)
+    if state is not None:
+        state["viz_drawn_lanes"] = records
+    for ln in records:
+        pts = ln["points"]
+        kind = ln.get("kind")
+        mode = lane_draw_mode(kind, smoke=_allow_stub(state or {}))
+        if mode is None:
+            continue
+        idx = 1
+        try:
+            idx = int(ln.get("index") if ln.get("index") is not None else ln.get("idx") or 1)
+        except (TypeError, ValueError):
+            idx = 1
         outer = max(0, abs(idx) - 1)
         fade = max(0.35, 1.0 - 0.22 * outer)
-        style = str(ln.get("style") or "unknown") if isinstance(ln, dict) else "unknown"
+        style = str(ln.get("style") or "unknown")
         dashed = mode == "dashed" or style == "dashed"
         color, thick, dash_default = _lane_color(mode, fade)
         # Follow every point on this boundary. A curve stays a curve through

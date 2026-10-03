@@ -44,6 +44,9 @@ from python.control.override import (
 from python.data.record import ClipRecorder, choose_encoder
 from python.perception.pipeline import ModularPerception
 from python.perception.road_model import lanes_ext_for_live, road_edges
+from python.viz.debug_draw import cabin_drive_word
+from python.viz.review_log import ReviewCapture
+from python.viz.stage import drawn_lane_records
 from python.sensors.cameras import CAM_IDS, CamHealth
 from python.runtime.debug_opts import apply_to_command, apply_to_perception
 from python.runtime.hw_probe import ema_hz, gpu_vram_used_gb, probe, refuse_live_start, unique_frame_hz_inst
@@ -462,6 +465,7 @@ def main() -> None:
     prev_preview = bool(args.allow_preview_drive)
     prev_engaged = False
     engage_arm_mono: float | None = None
+    review_cap = ReviewCapture()
     try:
         while True:
             loop_t0 = time.perf_counter()
@@ -903,6 +907,20 @@ def main() -> None:
             if state_due:
                 write_state(st)
                 soft_esc_state_write_mark()
+
+            review_cap.write(
+                bool(ui.debug.review_record),
+                lanes=drawn_lane_records(st),
+                path=list(st.get("path_ego") or []),
+                steer=float(applied.steer),
+                throttle=float(applied.throttle),
+                glance=cabin_drive_word(st)[0],
+                disengage_reason=str(st.get("disengage_reason") or "none"),
+                frames=getattr(bundle, "frames", None),
+                brake=float(applied.brake),
+                engaged=bool(st.get("engaged")),
+                cmd_reason=str(st.get("cmd_reason") or ""),
+            )
 
             if win is not None:
                 import cv2

@@ -196,6 +196,13 @@ VIZ_ROWS: tuple[dict[str, Any], ...] = (
         "attr": "viz_cams",
         "hint": "tiny bottom row; A / CAMS tab is the 8-view wall",
     },
+    {
+        "id": "review_record",
+        "kind": "bool",
+        "label": "review capture",
+        "attr": "review_record",
+        "hint": "key R: lanes, path, steer/throttle, engage, camera frames",
+    },
 )
 
 # Nerd MODEL tab: cycle nets that are actually loadable (scan models/). Always
@@ -277,6 +284,7 @@ class DebugOpts:
     viz_ids: bool = False
     viz_vel: bool = False
     viz_cams: bool = False
+    review_record: bool = False
     _frozen: DriveCommand | None = field(default=None, repr=False, compare=False)
 
     def effective_policy(self, session_policy: str) -> str:
@@ -326,6 +334,7 @@ class DebugOpts:
             "viz_ids": bool(self.viz_ids),
             "viz_vel": bool(self.viz_vel),
             "viz_cams": bool(self.viz_cams),
+            "review_record": bool(self.review_record),
             "drive_uses": "vision",
         }
 

@@ -330,21 +330,40 @@ def main() -> None:
     assert grace.should_disengage is False
     assert grace.applied.reason == "ok"
     assert grace.veto_reason != ""
-    # Below the grace floor still rejects, even during the window.
+    # A low rate does not drop Engage or replace the plan. That used to be a
+    # few seconds of DRIVE, then HOLD, then a self-disengage, and the steer
+    # command twitched between the plan and 0.
     collapse = _drive(loop_hz=4.5, camera_hz=8.0, engage_age_s=0.4)
-    assert collapse.veto_reason == "low_loop_hz", collapse.veto_reason
-    assert collapse.should_disengage is True
-    assert collapse.applied.reason == "veto:low_loop_hz"
-    # After grace the floor is 6. 5.5 disengages; 6.0 does not.
+    assert collapse.should_disengage is False
+    assert collapse.applied.reason == "ok", collapse.applied.reason
+    assert collapse.veto_reason == "none"
     after = _drive(loop_hz=5.5, camera_hz=8.0, engage_age_s=ENGAGE_HZ_GRACE_S)
-    assert after.veto_reason == "low_loop_hz" and after.should_disengage is True
+    assert after.should_disengage is False and after.applied.reason == "ok"
     held = _drive(loop_hz=6.0, camera_hz=6.0, engage_age_s=ENGAGE_HZ_GRACE_S + 1.0)
     assert held.veto_reason == "none" and held.should_disengage is False
-    # Unmeasured 0 is not a reject. A slow camera after grace is.
     unmeasured = _drive(loop_hz=0.0, camera_hz=0.0, engage_age_s=ENGAGE_HZ_GRACE_S + 1.0)
     assert unmeasured.should_disengage is False and unmeasured.veto_reason == "none"
     slow_cam = _drive(loop_hz=8.0, camera_hz=5.5, engage_age_s=ENGAGE_HZ_GRACE_S + 1.0)
-    assert slow_cam.veto_reason == "low_loop_hz" and slow_cam.should_disengage is True
+    assert slow_cam.should_disengage is False and slow_cam.applied.reason == "ok"
+    steady = [{"x": 0.425, "y": float(i), "z": 0.0} for i in range(12)]
+    steady_plan = {"target_v": 6.25, "aeb": "off"}
+    first = _drive(
+        path_ego=steady, planner=steady_plan, ego_speed_mps=0.0,
+        loop_hz=5.5, camera_hz=5.5, engage_age_s=4.0,
+    )
+    second = _drive(
+        path_ego=steady, planner=steady_plan, ego_speed_mps=0.0,
+        loop_hz=5.5, camera_hz=5.5, engage_age_s=4.2,
+    )
+    assert first.should_disengage is False and second.should_disengage is False
+    assert abs(first.applied.steer - 0.17) < 1e-6, first.applied.steer
+    assert abs(second.applied.steer - first.applied.steer) < 1e-9
+    assert abs(first.applied.throttle - second.applied.throttle) < 1e-9
+    assert first.applied.brake < 0.5, first.applied
+    from python.control.actuate import plan_command
+    planned = plan_command(path_ego=steady, planner=steady_plan, ego_speed_mps=0.0, seq=30)
+    assert abs(first.applied.throttle - planned.throttle) < 1e-6
+    assert abs(first.applied.steer - planned.steer) < 1e-6
     # Disengaged keeps the perception veto; a low rate does not rewrite it.
     parked = _drive(engaged=False, loop_hz=4.0, camera_hz=4.0, engage_age_s=10.0, lane_conf=0.0)
     assert parked.should_disengage is False

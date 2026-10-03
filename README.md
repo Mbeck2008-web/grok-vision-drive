@@ -14,31 +14,60 @@ Canonical pin **1.7.0** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Un
 
 **Versioning** (this line stays **alpha** until a later non-alpha release):
 
-- **point** bumps (`1.0.x`) = fixes / small UI
+- **point** bumps (`1.7.x`) = fixes / small UI
 - **main alpha** bump (`1.x.0`) = features / core / UI overhaul
 
 ## Recent changes (alpha 1.7.0)
 
-Catch-up from **1.0.1**. Each feature merge since that pin is one main step, and the throttle fix is the point in between: **1.1.0** cabin UI, **1.2.0** draw range, **1.3.0** Tech hold, **1.4.0** lanes and CAMS, **1.4.1** own-throttle and Neutral, **1.5.0** companion cameras, **1.6.0** predicted path, **1.7.0** lane points and a bus file that can engage. Live Alt+G, Tech 8-cam, FFB, and QSV stay **UNPROVEN**.
+Catch-up from **1.0.1**. Each feature merge since that pin is one main step. The throttle fix is the point in between. Live Alt+G, Tech 8-cam, FFB, and QSV stay **UNPROVEN**.
 
-Architecture
+### 1.7.0 lane points and bus engage
 
-- A leftover `gvd_engage.json` `engaged:true` does not start the car. Python honors that flag only while its `mtime` is about 2.5 s fresh. Lua refreshes the stamp every 0.5 s while the in-game latch is on, and will not write `true` over a newer supervisor `false`.
-- Engage starts in the game (Alt+G or the app button) or from a fresh gvd_bot_engage.json. A leftover true does not start the car.
+- A drawn lane follows the points that were seen or predicted, then stops. It does not continue in a straight line, and it does not invent a fan of extra lanes. One lane stays one lane.
+- A boundary that closes on the ego pair is a merge. One that opens is an exit. A parallel line stays a through lane.
+- The kerb sits 0.4 m outside the outermost real line on that side. It is predicted, not detected.
+- The ice ribbon is a point at the car center and opens to the car's width by the nose, then follows the path.
+- Pillar cameras aim 68 degrees off the lane, so a turn can see traffic on the cross street. Fender cameras aim 160 degrees, back along the next lane, so the ego body is only at the frame edge.
+- A click in a resized GVD VISION window hits the row under the pointer. That row shows a hover edge.
+- Key `R`, or the VIZ-tab **review capture** row, writes each tick under `Documents/GVD/review/<UTC stamp>/`. The json has the lanes and their roles, the path points, steer, throttle, brake, engage, the glance word, and the disengage reason, plus a jpeg per camera. Capture does not stop BeamNG.tech.
+- One slow grab no longer marks the link stale. The link window is 1.5 s. A low loop or camera rate does not drop Engage, and it does not zero a steer command that was already steady.
+- Tech drive is arcade. A hold, a stop, or AEB sets the parking brake and releases the service brake, so gear 0 plus a held brake is not reverse.
+- `python scripts/bot_engage.py on` writes `gvd_bot_engage.json` in the live bus folder. `off` clears it. A new `on` counts only while its timestamp is about 2.5 s old, then the latch stays on. A leftover true does not start the car. A driver override or a veto that already drops Engage clears the latch. BeamNG.tech stays up.
+
+### 1.6.0 predicted path
+
+- Soft Esc follows a predicted path for lanes, cars, signs, and lights, including where the cameras cannot see them yet. The wheel angle is not the path.
+
+### 1.5.0 companion cameras
+
+- The companion cameras stay on their own side of the car. The rear overlay is the rear camera only. Lane paint follows the fit instead of a copied neighbour.
+
+### 1.4.1 own throttle and Neutral
+
+- Engage no longer treats GVD's own throttle echo as the driver lifting off. A hold does not leave the gearbox in reverse.
+
+### 1.4.0 lanes and CAMS
+
+- Yellow and white lane lines both count. A CAMS slot keeps its last good frame instead of going blank. A missing camera stays labelled missing.
+
+### 1.3.0 Tech hold
+
+- Tech attach waits until the research port is listening, the mod is unpacked, a vehicle is spawned, and the lua bus is fresh. It does not start a second BeamNG.tech.
+
+### 1.2.0 draw range
+
+- Cabin ground, lanes, curbs, signs, and agent boxes follow the camera far distance, ahead of the car and behind it. The chase camera stays just behind the car. The ice corridor ends where the path ends.
+
+### 1.1.0 cabin
+
+- Agent boxes are empty solids. LEAD and BRAKE stay. The forecast is a thin line with no disc and no bright center. The app, the strip, and the GVD VISION title share one glance word: OFF / ON / HOLD / DRIVE / MISMATCH.
+
+### Still in force from 1.0.1
+
+- A leftover `gvd_engage.json` `engaged:true` does not start the car. Python honors that flag only while its timestamp is about 2.5 s fresh. Lua refreshes the stamp every 0.5 s while the in-game latch is on, and will not write true over a newer supervisor false.
 - `--policy e2e` with no `models/e2e_current.onnx` holds the brake (`veto:e2e_stub`) and stays engaged. Shadow keeps the modular command.
-- `cmd_applied` is true only when the Lua ack is this `seq` or up to 5 behind. An old high `applied_seq` is not an ack.
-- Retail stays one window (`cams=1/8`). Tech 8-cam is still the other product. `--backend auto` still does not pick Tech because `beamngpy` imports.
-
-UI
-
-- The app, the strip, and the GVD VISION title share one glance word: OFF / ON / HOLD / DRIVE / MISMATCH. HOLD is a brake hold (preview, veto, AEB, untrained e2e, or a link that is not live). DRIVE means a command is actually applied.
-- The default app stays 330×440. The bus folder moved into `+ nerd`. The toy footer stays pinned on that tile.
-- The strip uses ice when on or driving, amber on HOLD, and red on MISMATCH.
-- Key `0` still hides nerd chrome. The title word stays, because that bar is already on the clean cabin.
-- Cabin agent boxes are empty solids. LEAD and BRAKE stay. The forecast is a thin ice line that starts half a length ahead of the track and is drawn under the box, so the face has no disc and no bright center mark. Occupancy and planner samples stay on nerd layers `1–5`.
-- The ice corridor stays `path_width / 2` meters each side and ends where that path ends. A live tick does not stretch it to a fixed preview length. Smoke may still draw a long authored ribbon. Key `0` hides the shadow ghost ribbon.
-- Cabin ground, lanes, curbs, signs, and agent boxes follow `cameras.yaml` `viz` and camera `far_m`, ahead and behind the ego. The chase camera stays just behind the ego. The mid 1080 Ti clamps that span. The ice ribbon still ends on the running path.
-- The smoke and README cabin author a pack of cars in the lanes so the shot reads as traffic. Those boxes are furniture, not a live detector.
+- `cmd_applied` is true only when the Lua ack is this `seq` or up to 5 behind.
+- Retail stays one window (`cams=1/8`). Tech 8-cam is the other product. `--backend auto` does not pick Tech because `beamngpy` imports.
 
 ## Honesty (M0)
 
@@ -183,11 +212,11 @@ Keys in **GVD VISION**: `V` nerd panel, `D` DRIVE tab (gates / actuators / AEB),
 - the supervisor quits (`q`, window closed, Ctrl+C): its `finally` block writes a stop and `engaged=false`, the mod releases the car;
 - the modular supervisor vetoes an E2E/shadow policy (`--policy e2e|shadow`: low `lane_conf` / `path_conf`, disagreement, AEB). An untrained E2E (`e2e_backend=stub`, no `models/e2e_current.onnx`) is `veto:e2e_stub`: brake hold, stay engaged, HUD **HOLD**. Shadow still applies the modular command and does not disengage on that stub. A measured loop or camera rate under `min_accept_hz` does not drop Engage. The default `modular` policy disengages via Alt+G, override, supervisor exit, and the dead-man.
 
-The mod reads `engaged=false` back and flips the HUD to **OFF** within ~0.1 s (it never turns engage *on* from a file — engage always starts in-game). Python treats `gvd_engage.json` `engaged:true` as live only while its `mtime` is fresh (about 2.5 s). Lua refreshes that stamp every 0.5 s while the in-game latch is on, and does not refresh it over a newer supervisor `false`. A file left `true` after a crash does not engage. Re-engage with Alt+G. A clip is flushed on every disengage, AEB brake and near-miss (`clips\clip_<time>_<trigger>` under the bus dir).
+The mod reads `engaged=false` back and flips the HUD to **OFF** within ~0.1 s. `gvd_engage.json` never turns engage on. A fresh `gvd_bot_engage.json` can. Alt+G still can. Python treats `gvd_engage.json` `engaged:true` as live only while its `mtime` is fresh (about 2.5 s). Lua refreshes that stamp every 0.5 s while the in-game latch is on, and does not refresh it over a newer supervisor `false`. A file left `true` after a crash does not engage. Re-engage with Alt+G. A clip is flushed on every disengage, AEB brake and near-miss (`clips\clip_<time>_<trigger>` under the bus dir).
 
 **Ship bot engage** (no GVD VISION focus): `python scripts/bot_engage.py on` writes `gvd_bot_engage.json` in the live bus folder, and `off` clears it. The supervisor reads that file every tick. A new `on` counts only while its `mtime` is about 2.5 s fresh, then the latch stays on until `off`, a driver override, or a veto that already drops Engage. A real stop can still hold the brake. On Tech the file is `%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\Documents\GVD\gvd_bot_engage.json` (same folder as `gvd_engage.json`; `GVD_DOCS_DIR` wins when set). The Python supervisor must be started from this code before it will see the file. BeamNG.tech stays up.
 
-**Bus dir (not `%USERPROFILE%\Documents\GVD`, not OneDrive):** Drive/retail = nested `%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\Documents\GVD`. Tech **bus → nested** `%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\Documents\GVD` (Tech **mods → legacy** is a different tree). `GVD_DOCS_DIR` override wins when set (**Python writers**). Steam GELua does **not** inherit that env — live Lua reads relative `Documents/GVD` via VFS / `FS:readFile` (follows the **running** userfolder). No absolute `io.open`. Files: `{gvd_state.json, gvd_engage.json, gvd_bot_engage.json, gvd_cmd.json, gvd_ego.json, gvd_ui_prefs.json, clips\, python\, config\}`. `uninstall.bat` removes the mod only; delete the sandbox yourself if you want a clean slate. Nothing here talks to a real car and nothing carries Tesla / “FSD” branding.
+**Bus dir (not `%USERPROFILE%\Documents\GVD`, not OneDrive):** Drive/retail = nested `%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\Documents\GVD`. Tech **bus → nested** `%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\Documents\GVD` (Tech **mods → legacy** is a different tree). `GVD_DOCS_DIR` override wins when set (**Python writers**). Steam GELua does **not** inherit that env — live Lua reads relative `Documents/GVD` via VFS / `FS:readFile` (follows the **running** userfolder). No absolute `io.open`. Files: `{gvd_state.json, gvd_engage.json, gvd_bot_engage.json, gvd_cmd.json, gvd_ego.json, gvd_ui_prefs.json, clips\, review\, python\, config\}`. `uninstall.bat` removes the mod only; delete the sandbox yourself if you want a clean slate. Nothing here talks to a real car and nothing carries Tesla / “FSD” branding.
 
 Troubleshooting: blank GVD Apps tile, or console `Could not create a description for binding keyboard0::alt+g` → fully quit BeamNG, wipe `mods\unpacked\gvd`, re-run `install.bat` (in-game CEF / ActionMap need the ASCII app from this tip). Mod missing in Mod Manager → run `install.bat` again and check the path it prints. “Python not found” → install Python 3 with *Add to PATH*. “Missing Python packages” → answer `Y` or run `pip install -r requirements-retail.txt`. No `cam_main` PIP / `capture_note` says *fullscreen/monitor* → make the BeamNG window visible with **BeamNG** in its title, or run fullscreen; `window via unavailable` → `pip install mss`. HUD stays `HOLD` or `ON`, never `DRIVE` → GVD only drives once it sees both lane lines (nerd panel `lane` conf, `preview=`); `--allow-preview-drive` follows the steer-preview path instead (debug only). `ON` or `cmd_json_pending` and the car does nothing → the mod is not acking (mod not enabled, no player vehicle, or the supervisor is engaged while the game is not). Boot refuses (`REFUSE: dGPU VRAM … < 10 GB while BeamNG is up`) → `play_gvd.bat --vision-only` (drops the GPU guard, nothing else).
 
@@ -285,7 +314,7 @@ PYTHONPATH=. python python/run_vision.py --viz      # live window + state file f
 PYTHONPATH=. python scripts/test_gvd_viz_stage.py
 ```
 
-Keys in `--viz`: `V` nerd, `D` DRIVE (live actuators), `G` VIZ (occupancy / boxes / FOV / cost), `M` MODEL (detector / e2e), `A` CAMS (8 views), `[` `]` tabs, `j/k` `h/l` / click to edit, `0` clean cabin, `1–5` overlay layers, `T` chase↔BEV, `C` clip, `q` quit. Occupancy is derived from tracks, not a learned grid. CAMS / camera-strip blits drop under 8 Hz.
+Keys in `--viz`: `V` nerd, `D` DRIVE (live actuators), `G` VIZ (occupancy / boxes / FOV / cost), `M` MODEL (detector / e2e), `A` CAMS (8 views), `[` `]` tabs, `j/k` `h/l` / click to edit, `0` clean cabin, `1–5` overlay layers, `T` chase↔BEV, `C` clip, `R` review capture, `q` quit. A resized window still hits the row under the pointer, and that row shows a hover edge. Occupancy is derived from tracks, not a learned grid. CAMS / camera-strip blits drop under 8 Hz.
 
 ## Status
 

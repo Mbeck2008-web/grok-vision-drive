@@ -11,7 +11,14 @@ from python.perception.road_model import suppress_lane_fan
 from python.planning.path_predictor import path_length_m
 from python.runtime.debug_opts import CAMS_DROP_HZ, DEBUG_ROWS, MODEL_ROWS, NERD_TABS, VIZ_ROWS, DebugOpts
 from python.sensors.cameras import CAM_IDS
-from python.viz.debug_draw import cam_slot_live, draw_cam_tiles
+from python.viz.debug_draw import (
+    CAMS_PREVIEW_COLS,
+    CAMS_PREVIEW_DIM,
+    CAMS_PREVIEW_ROWS,
+    CAMS_PREVIEW_SLOTS,
+    cam_slot_live,
+    draw_cam_tiles,
+)
 
 BG = (16, 13, 12)
 FG = (212, 204, 200)
@@ -359,13 +366,13 @@ def _draw_cams_tab(
     hits: list[dict[str, Any]],
     cam_frames: dict[str, Any] | None = None,
 ) -> int:
-    """Nerd CAMS body: ≤8 honest tiles + health. Empty slots stay labelled."""
+    """Nerd CAMS body: 3×3, empty center, eight feeds. Missing slots stay labelled."""
     y = y0
     dropped = _cams_dropped(state)
     intro = (
         f"grid dropped (loop < {CAMS_DROP_HZ:.0f} Hz) -- slots stay labelled"
         if dropped
-        else "8 slots -- last frame kept; missing stays labelled"
+        else "3x3 -- empty center; last frame kept; missing stays labelled"
     )
     _put(img, _fit(intro, w - PAD_X * 2, FS_DIM), (PAD_X, y), FS_DIM, DIM)
     y += ROW_H
@@ -380,10 +387,11 @@ def _draw_cams_tab(
         y0=y,
         width=max(8, w - PAD_X * 2),
         height=grid_h,
-        cols=2,
-        rows=4,
-        ids=CAM_IDS,
+        cols=CAMS_PREVIEW_COLS,
+        rows=CAMS_PREVIEW_ROWS,
+        ids=CAMS_PREVIEW_SLOTS,
         dropped=dropped,
+        dim=CAMS_PREVIEW_DIM,
     )
     hits.append({"kind": "cams_grid", "n": n, "rect": (PAD_X, y, w - PAD_X, y + grid_h)})
     ok_n = sum(1 for cid in CAM_IDS if cam_slot_live(cam_frames, health, cid))
@@ -597,7 +605,7 @@ def _help_lines() -> list[str]:
         "  D  DRIVE tab (gates / actuators / AEB)",
         "  G  VIZ tab (overlay layers)",
         "  M  MODEL tab (detector / e2e nets)",
-        "  A  CAMS tab (8 camera views; missing stays labelled)",
+        "  A  CAMS tab (3x3, empty center; missing stays labelled)",
         "  [ ] cycle LIVE / DRIVE / VIZ / MODEL / CAMS / KEYS",
         "  j/k  select row   h/l nudge",
         "  Enter / click  toggle",

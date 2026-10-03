@@ -263,8 +263,11 @@ def check_frustums() -> None:
     assert ldx < 0 < rdx, (ldx, rdx)
     assert ldy < 0 and rdy < 0, (ldy, rdy)
     # Fenders look back along the next lane (more rear than side), not down the road ahead.
+    # Yaw stays ±160. The mount is 0.15 m further back than the old 1.45 fender point.
     assert frs["repeatR"]["yaw_deg"] == 160.0
     assert frs["repeatL"]["yaw_deg"] == -160.0
+    assert frs["repeatL"]["y"] == 1.30 and frs["repeatR"]["y"] == 1.30
+    assert frs["repeatL"]["x"] == -0.96 and frs["repeatR"]["x"] == 0.96
     assert abs(rdy) > abs(rdx) and abs(ldy) > abs(ldx)
 
     behind = [cid for cid, fr in frs.items() if look(fr)[1] < -2.0]
@@ -273,9 +276,20 @@ def check_frustums() -> None:
 
     front = [cid for cid, fr in frs.items() if abs(look(fr)[0]) < 0.3 and look(fr)[3] > 0.5]
     assert sorted(front) == ["main", "narrow", "wide"], front
-    # Pillars look across the corner. More lateral than forward, still short of a pure side view.
-    assert frs["pillarR"]["yaw_deg"] == 68.0
-    assert frs["pillarL"]["yaw_deg"] == -68.0
+    # Pillars look across the corner, 10 degrees further back than 68.
+    # More lateral than forward, still short of a pure side view. Mounts stay put.
+    assert frs["pillarR"]["yaw_deg"] == 78.0
+    assert frs["pillarL"]["yaw_deg"] == -78.0
+    assert frs["pillarL"]["x"] == -0.88 and frs["pillarL"]["y"] == 0.40
+    assert frs["pillarR"]["x"] == 0.88 and frs["pillarR"]["y"] == 0.40
+    for cid, yaw, x, y in (
+        ("narrow", 0.0, 0.03, 1.20),
+        ("main", 0.0, 0.00, 1.20),
+        ("wide", 0.0, -0.03, 1.20),
+        ("rear", 180.0, 0.00, -2.25),
+    ):
+        assert frs[cid]["yaw_deg"] == yaw, (cid, frs[cid]["yaw_deg"])
+        assert (frs[cid]["x"], frs[cid]["y"]) == (x, y), (cid, frs[cid]["x"], frs[cid]["y"])
     _, _, prx, pry = look(frs["pillarR"])
     _, _, plx, ply = look(frs["pillarL"])
     assert prx > pry > 0.0, (prx, pry)

@@ -135,6 +135,8 @@ class ModularPerception:
                 "cipv_id": cipv_id,
                 "stop_reason": plan.stop_reason,
                 "prediction": plan.prediction,
+                "path_length_m": plan.path_length_m,
+                "pred_brake": plan.pred_brake,
             },
             infer_ms=infer_ms,
             missing=missing,

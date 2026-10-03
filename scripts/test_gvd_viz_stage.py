@@ -713,7 +713,70 @@ def main() -> None:
     fast_signs = render_stage({**slow, "loop_hz": 12.0}, ui=sign_ui)
     assert int(cv2.absdiff(slow_full, fast_signs).sum()) > 0, "under 8 Hz signs drop"
 
+    check_drive_pedal_graph()
+
     print("test_gvd_viz_stage: OK")
+
+
+def check_drive_pedal_graph() -> None:
+    """DRIVE tab: actual pedals vs path length and planner brake. Missing series stay zero."""
+    import numpy as np
+
+    from python.planning.path_predictor import path_length_m
+    from python.viz.nerd import pedal_sample, render_panel
+    from python.viz.stage import VizUI
+
+    path = [{"x": 0.0, "y": float(i), "z": 0.0} for i in range(0, 21)]
+    assert abs(path_length_m(path) - 20.0) < 1e-6
+    state = {
+        "ego": {"throttle": 0.42, "brake": 0.15, "steer_deg": 35.0},
+        "planner": {"path_length_m": 20.0, "pred_brake": 0.8},
+        "path_ego": path,
+    }
+    ui = VizUI()
+    ui.show_drive_tab()
+    painted = render_panel(state, h=800, w=560, ui=ui)
+    assert painted.shape == (800, 560, 3)
+    last = ui.pedal_trace[-1]
+    assert last["thr"] == 0.42
+    assert last["thr_pred_m"] == 20.0
+    assert last["brk"] == 0.15
+    assert last["brk_pred"] == 0.8
+    # Wheel angle is on the state and is not the predicted throttle.
+    spun = dict(state)
+    spun["ego"] = {"throttle": 0.42, "brake": 0.15, "steer_deg": -80.0}
+    assert pedal_sample(spun)["thr_pred_m"] == 20.0
+    assert pedal_sample(spun)["thr"] == 0.42
+
+    short = {
+        "ego": {"throttle": 0.0, "brake": 1.0},
+        "planner": {"path_length_m": 4.0, "pred_brake": 1.0},
+        "path_ego": path[:5],
+    }
+    again = render_panel(short, h=800, w=560, ui=ui)
+    assert not np.array_equal(painted, again)
+    assert ui.pedal_trace[-1]["thr_pred_m"] == 4.0
+    assert ui.pedal_trace[-1]["thr"] == 0.0
+    assert ui.pedal_trace[-1]["brk"] == 1.0
+
+    # No planner fields: predicted throttle is the polyline length, missing brake is 0.
+    measured = pedal_sample({"ego": {"throttle": 0.2}, "path_ego": path, "steer_deg": 12.0})
+    assert measured["thr"] == 0.2
+    assert abs(measured["thr_pred_m"] - 20.0) < 1e-6
+    assert measured["brk"] == 0.0 and measured["brk_pred"] == 0.0
+
+    bare = VizUI()
+    bare.show_drive_tab()
+    empty = render_panel({}, h=800, w=560, ui=bare)
+    assert empty.shape == (800, 560, 3)
+    assert bare.pedal_trace[-1] == {
+        "thr": 0.0,
+        "thr_pred_m": 0.0,
+        "brk": 0.0,
+        "brk_pred": 0.0,
+    }
+    # The empty graph still paints its frame, so a missing series is not a blank panel.
+    assert int(empty.max()) > 40
 
 
 def test_gvd_viz_stage() -> None:

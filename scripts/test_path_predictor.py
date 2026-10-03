@@ -30,7 +30,7 @@ from python.control.actuate import (  # noqa: E402
     soft_esc_sensors_every_tick,
 )
 from python.control.override import OverrideDetector, load_override_config  # noqa: E402
-from python.planning.path_predictor import follow_path, predict_path  # noqa: E402
+from python.planning.path_predictor import follow_path, path_length_m, predict_path  # noqa: E402
 from python.runtime.shadow import ShadowConfig, shadow_tick  # noqa: E402
 
 CONTROL_YAML = ROOT / "config" / "control.yaml"
@@ -90,6 +90,13 @@ def check_full_lane_and_commands() -> None:
     cmd = follow_path(plan, ego_speed_mps=5.0, seq=3)
     assert cmd.throttle > 0.0 and cmd.brake == 0.0, cmd
     assert abs(cmd.steer) < 0.2, cmd
+    # Predicted throttle is the route length in meters, not the pedal command.
+    measured = path_length_m(plan.path_ego)
+    assert abs(plan.path_length_m - measured) < 1e-6, (plan.path_length_m, measured)
+    assert plan.path_length_m > 10.0
+    assert plan.planner_dict()["path_length_m"] == plan.path_length_m
+    assert abs(plan.pred_brake - cmd.brake) < 1e-6
+    assert plan.path_length_m != cmd.throttle
 
 
 def check_partial_lane_is_continued() -> None:
@@ -145,6 +152,8 @@ def check_car_stop_sign_and_light() -> None:
     assert car.aeb == "brake" and car.target_v == 0.0
     assert _max_y(car) < 18.0 - 1.5
     assert _max_y(car) < _max_y(free) - 5.0
+    assert car.path_length_m < free.path_length_m - 4.0
+    assert abs(car.path_length_m - path_length_m(car.path_ego)) < 1e-6
     held = follow_path(car, ego_speed_mps=8.0, seq=1)
     assert held.throttle == 0.0 and held.brake == 1.0, held
 

@@ -66,6 +66,10 @@ class PathPlan:
     stop_reason: str = "none"
     prediction: str = "none"
     occupied: list[dict[str, Any]] = field(default_factory=list)
+    # Polyline length in meters. The supervisor graph plots this as predicted throttle.
+    path_length_m: float = 0.0
+    # Brake the path follower would command, in [0, 1]. Not a wheel reading.
+    pred_brake: float = 0.0
 
     def planner_dict(self) -> dict[str, Any]:
         return {
@@ -77,6 +81,8 @@ class PathPlan:
             "cipv_id": self.cipv_id,
             "stop_reason": self.stop_reason,
             "prediction": self.prediction,
+            "path_length_m": self.path_length_m,
+            "pred_brake": self.pred_brake,
         }
 
 
@@ -123,7 +129,7 @@ def predict_path(
     else:
         built = _lane_route(polys, horizon, step) if polys else None
         if built is None:
-            return _empty()
+            return _expose_pedals(_empty(), ego_speed_mps)
         raw, width, extended = built
         if used_prior:
             prediction = "context"
@@ -134,7 +140,7 @@ def predict_path(
 
     path = [_pt(x, y) for x, y in raw]
     if len(path) < 2:
-        return _empty()
+        return _expose_pedals(_empty(), ego_speed_mps)
 
     curv = _path_curvature(path)
     occupants = _predict_occupants(tracks or [])
@@ -154,7 +160,7 @@ def predict_path(
         path=path,
     )
     conf = _confidence(prediction, float(lane_conf), extended=extended or used_prior)
-    return PathPlan(
+    plan = PathPlan(
         path_ego=path,
         path_width=float(width),
         path_conf=conf,
@@ -168,6 +174,44 @@ def predict_path(
         prediction=prediction,
         occupied=occupied,
     )
+    return _expose_pedals(plan, ego_speed_mps)
+
+
+def path_length_m(path: list | None) -> float:
+    """Arc length of a route polyline, in meters.
+
+    Ego frame: +x right, +y forward, +z up. Each step is the straight
+    distance between consecutive points, including z when a point has it.
+    """
+    if not path:
+        return 0.0
+    total = 0.0
+    prev: tuple[float, float, float] | None = None
+    for raw in path:
+        if isinstance(raw, dict):
+            x, y, z = raw.get("x"), raw.get("y"), raw.get("z", 0.0)
+        else:
+            try:
+                x, y = raw[0], raw[1]
+                z = raw[2] if len(raw) > 2 else 0.0
+            except (TypeError, IndexError):
+                continue
+        try:
+            point = (float(x), float(y), float(z or 0.0))
+        except (TypeError, ValueError):
+            continue
+        if prev is not None:
+            total += math.dist(prev, point)
+        prev = point
+    return float(total)
+
+
+def _expose_pedals(plan: PathPlan, ego_speed_mps: float) -> PathPlan:
+    """Record path length and the brake the follower would send. The route stays as built."""
+    plan.path_length_m = path_length_m(plan.path_ego)
+    commanded = follow_path(plan, ego_speed_mps=float(ego_speed_mps))
+    plan.pred_brake = float(commanded.brake)
+    return plan
 
 
 def _empty() -> PathPlan:

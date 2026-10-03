@@ -87,6 +87,8 @@ class VizUI:
     model_sel: int = 0
     nerd_hits: list = field(default_factory=list)
     nerd_width: int = NERD_WIDTH
+    # Recent DRIVE-tab pedal samples. The viz appends one per frame; the drive loop does not read it.
+    pedal_trace: list = field(default_factory=list)
 
     def toggle_nerd(self) -> None:
         self.show_nerd = not self.show_nerd

@@ -102,8 +102,8 @@ def check_config() -> None:
     cfg = load_override_config(yaml.safe_load(CONTROL_YAML.read_text(encoding="utf-8")))
     ov = yaml.safe_load(CONTROL_YAML.read_text(encoding="utf-8"))["override"]
     assert set(ov) == set(PIN_KEYS), sorted(ov)
-    assert cfg.steer_enter == STEER_ENTER == ov["steer_enter"] == 0.35
-    assert cfg.steer_exit == STEER_EXIT == ov["steer_exit"] == 0.18
+    assert cfg.steer_enter == STEER_ENTER == ov["steer_enter"] == 0.08
+    assert cfg.steer_exit == STEER_EXIT == ov["steer_exit"] == 0.04
     assert cfg.steer_hold_ms == STEER_HOLD_MS == ov["steer_hold_ms"] == 200
     assert cfg.steer_spike == STEER_SPIKE == ov["steer_spike"] == 0.20
     assert cfg.brake_enter == ov["brake_enter"] == 0.06
@@ -240,8 +240,8 @@ def check_real_driver_wins() -> None:
 
     sim = Sim(cfg)
     sim.warm()
-    seen = [sim.step(echo=(0.60, 0.0, 0.0)) for _ in range(int(cfg.steer_hold_s / TICK) + 12)]
-    # The first tick off rest is a spike (0.60 > 0.20); the hold starts on the next.
+    seen = [sim.step(echo=(0.25, 0.0, 0.0)) for _ in range(int(cfg.steer_hold_s / TICK) + 12)]
+    # The first tick off rest is a spike (0.25 > 0.20); the hold starts on the next.
     assert seen[0].spike and not seen[0].active, seen[0]
     first = next(i for i, v in enumerate(seen) if v.active)
     assert seen[first].channel == "steer" and seen[first].reason == REASON_STEER
@@ -249,7 +249,7 @@ def check_real_driver_wins() -> None:
     # Left is the same story.
     sim = Sim(cfg)
     sim.warm()
-    assert any(sim.step(echo=(-0.60, 0.0, 0.0)).active for _ in range(20))
+    assert any(sim.step(echo=(-0.25, 0.0, 0.0)).active for _ in range(20))
 
     # Pedals: asymmetric, tight, no filter, no dwell. Brake is the lower threshold.
     sim = Sim(cfg)
@@ -285,11 +285,9 @@ def check_hysteresis_and_opposition() -> None:
 
     sim = Sim(cfg)
     sim.warm()
-    # Get the filter onto a residual past enter (the first tick off rest is a spike).
-    for _ in range(12):
-        sim.step(echo=(0.70, 0.0, 0.0))
-        if sim.det.verdict.steer_held_ms > 0.0:
-            break
+    # Get the filter onto a real residual (second tick is not a spike), then freeze in the band.
+    sim.step(echo=(0.25, 0.0, 0.0))
+    sim.step(echo=(0.25, 0.0, 0.0))
     held = sim.det.verdict.steer_held_ms
     assert held > 0.0
     for _ in range(8):
@@ -310,7 +308,7 @@ def check_hysteresis_and_opposition() -> None:
     assert opposition(0.4, -0.1) == 1.0
     assert opposition(0.4, 0.1) == 0.0
     assert opposition(0.0, 0.2) == 0.0
-    raw = 0.30  # just under enter; opposition gain pushes it over
+    raw = 0.07  # just under enter
     assert raw < STEER_ENTER < raw * (1.0 + OPPOSITION_GAIN)
 
 
@@ -440,7 +438,7 @@ def check_soft_esc_own_axes() -> None:
 
     pulled = False
     for _ in range(20):
-        v = sim.step(cmd=cmd, echo=(-0.90, 0.55, 0.0), own_axes=True, use_ack=False, player_device=True)
+        v = sim.step(cmd=cmd, echo=(-0.60, 0.55, 0.0), own_axes=True, use_ack=False, player_device=True)
         if v.active:
             pulled = True
             assert v.channel == "steer" and v.reason == REASON_STEER, v
@@ -487,7 +485,7 @@ def check_soft_esc_own_axes() -> None:
     pulled = False
     for _ in range(20):
         v = sim.step(
-            cmd=cmd_far, echo=(-0.90, 0.55, 0.0), own_axes=True, use_ack=False, player_device=True,
+            cmd=cmd_far, echo=(-0.60, 0.55, 0.0), own_axes=True, use_ack=False, player_device=True,
         )
         if v.active:
             pulled = True
@@ -511,32 +509,17 @@ def check_soft_esc_own_axes() -> None:
             assert not v.active, f"tracking offset cmd {steer} kicked at {i}: {v}"
 
 
-def check_steer_dead_zone() -> None:
-    """Slow wheel motion inside 0.35 is not player_steer. A pull well outside is.
+def check_ahead_command_echo() -> None:
+    """An echo of a command already ahead at arm is residual 0 at any magnitude.
 
-    Soft Esc locks the steer baseline on the first armed sample. If the command
-    is already ahead of the echo then, the allowed span is a point. Electrics
-    that later echo that same command are GVD's own steer. A couple hundredths,
-    a 0.20 creep (above the old 0.08), and a 0.20 catch-up stay engaged. A pull
-    of 0.60 still drops Engage.
+    The resting span runs from the armed wheel to that command and follows later
+    command steps. A slow catch-up inside the span stays engaged. A pull past the
+    span is player_steer, and so is a held absolute pull of 0.25.
     """
     cfg = load_override_config(yaml.safe_load(CONTROL_YAML.read_text(encoding="utf-8")))
-    assert cfg.steer_enter == 0.35 and cfg.steer_exit == 0.18
-    kw = dict(own_axes=True, use_ack=False, player_device=True)
+    assert cfg.steer_enter == 0.08 and cfg.steer_exit == 0.04
 
-    def hold(cmd, echo, n=40):
-        sim = Sim(cfg)
-        sim.warm(cmd=(0.0, 0.55, 0.0), echo=(0.0, 0.55, 0.0), **kw)
-        last = None
-        for _ in range(n):
-            last = sim.step(cmd=cmd, echo=echo, **kw)
-            assert not last.active and last.reason != REASON_STEER, last
-        return last
-
-    hold((0.0, 0.55, 0.0), (-0.02, 0.55, 0.0))
-    hold((0.0, 0.55, 0.0), (0.20, 0.55, 0.0))
-
-    def catch_up(command: float) -> bool:
+    def arm_ahead(command: float) -> OverrideDetector:
         det = OverrideDetector(cfg)
         t = 100.0
         for i in range(8):
@@ -552,7 +535,12 @@ def check_steer_dead_zone() -> None:
             )
             det.note_command(seq=i + 1, steer=command, throttle=0.55, brake=0.0, now=t)
         assert det.armed(t), "warm-up did not arm before the echo caught the command"
-        tripped = False
+        return det
+
+    def echo_command(command: float) -> None:
+        det = arm_ahead(command)
+        t = 100.0 + 8 * TICK
+        saw = False
         for i in range(40):
             t += TICK
             echo = command if i >= 6 else 0.0
@@ -566,28 +554,72 @@ def check_steer_dead_zone() -> None:
                 player_device=True,
             )
             det.note_command(seq=100 + i, steer=command, throttle=0.55, brake=0.0, now=t)
-            if v.active:
-                assert v.channel == "steer" and v.reason == REASON_STEER, v
-                tripped = True
-                break
-        return tripped
+            assert not v.active and v.reason != REASON_STEER, v
+            if echo == command and v.armed:
+                assert abs(v.steer_raw) < 1e-6, v
+                saw = True
+        assert saw, "the echo of the ahead command was never judged"
 
-    assert not catch_up(0.20), "echo catching a 0.20 command must stay inside the dead zone"
-    assert catch_up(0.60), "echo catching a 0.60 command is a grab past the dead zone"
+    echo_command(0.20)
+    echo_command(0.60)
 
-    sim = Sim(cfg)
-    sim.warm(cmd=(0.4, 0.3, 0.0), echo=(0.0, 0.0, 0.0), player_device=True)
-    for _ in range(40):
-        v = sim.step(cmd=(0.4, 0.3, 0.0), echo=(0.20, 0.0, 0.0), player_device=True)
-        assert not v.active and v.reason != REASON_STEER, v
+    det = arm_ahead(0.60)
+    t = 100.0 + 8 * TICK
+    for step in range(1, 12):
+        t += TICK
+        echo = min(0.60, step * 0.05)
+        v = det.update(
+            engaged=True,
+            steering_input=echo,
+            throttle_input=0.55,
+            brake_input=0.0,
+            now=t,
+            own_axes=True,
+            player_device=True,
+        )
+        det.note_command(seq=200 + step, steer=0.60, throttle=0.55, brake=0.0, now=t)
+        assert not v.active and abs(v.steer_raw) < 1e-6, v
+
     pulled = False
     for _ in range(20):
-        v = sim.step(cmd=(0.4, 0.3, 0.0), echo=(0.60, 0.0, 0.0), player_device=True)
+        t += TICK
+        v = det.update(
+            engaged=True,
+            steering_input=-0.25,
+            throttle_input=0.55,
+            brake_input=0.0,
+            now=t,
+            own_axes=True,
+            player_device=True,
+        )
+        det.note_command(seq=300, steer=0.60, throttle=0.55, brake=0.0, now=t)
         if v.active:
             assert v.channel == "steer" and v.reason == REASON_STEER, v
             pulled = True
             break
-    assert pulled, "a physical wheel pull of 0.60 must be player_steer"
+    assert pulled, "a pull of 0.25 past the resting span must be player_steer"
+
+    sim = Sim(cfg)
+    sim.warm(cmd=(0.0, 0.0, 0.0), echo=(0.0, 0.0, 0.0), player_device=True)
+    straight = False
+    for _ in range(20):
+        v = sim.step(cmd=(0.0, 0.0, 0.0), echo=(0.25, 0.0, 0.0), player_device=True)
+        if v.active:
+            assert v.channel == "steer" and v.reason == REASON_STEER, v
+            straight = True
+            break
+    assert straight, "a held absolute pull of 0.25 on a straight command must be player_steer"
+
+    sim = Sim(cfg)
+    sim.warm(cmd=(0.4, 0.3, 0.0), echo=(0.0, 0.0, 0.0), player_device=True)
+    absolute = False
+    for _ in range(20):
+        v = sim.step(cmd=(0.4, 0.3, 0.0), echo=(0.25, 0.0, 0.0), player_device=True)
+        if v.active:
+            assert v.channel == "steer" and v.reason == REASON_STEER, v
+            absolute = True
+            break
+    assert absolute, "a held absolute pull of 0.25 must be player_steer"
 
 
 def check_player_device_absolute() -> None:
@@ -601,12 +633,12 @@ def check_player_device_absolute() -> None:
 
     tripped = False
     for _ in range(8):
-        v = sim.step(cmd=(0.4, 0.3, 0.0), echo=(0.60, 0.0, 0.0), player_device=True)
+        v = sim.step(cmd=(0.4, 0.3, 0.0), echo=(0.25, 0.0, 0.0), player_device=True)
         if v.active:
             tripped = True
             assert v.channel == "steer", v
             break
-    assert tripped, "physical wheel pull 0.60 must be player_steer when player_device"
+    assert tripped, "physical wheel pull 0.25 must be player_steer when player_device"
 
     # Same lock for pedals: GVD throttle 0.4 with resting lastInputs is not an override.
     sim = Sim(cfg)
@@ -635,7 +667,7 @@ def main() -> None:
     check_aeb_echo_not_brake()
     check_player_device_absolute()
     check_soft_esc_own_axes()
-    check_steer_dead_zone()
+    check_ahead_command_echo()
     print("test_ffb_override: OK")
 
 

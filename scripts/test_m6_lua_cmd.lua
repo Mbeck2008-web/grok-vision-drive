@@ -443,7 +443,7 @@ for _ = 1, 6 do driveTick(0, 0.3, 0) end
 check(M.isEngaged(), 'one-tick FFB kick does not disengage')
 
 -- a held residual past enter, in one direction, for steer_hold_ms
-echo(0.60, 0.3, 0)
+echo(0.25, 0.3, 0)
 for _ = 1, 8 do driveTick(0, 0.3, 0) end
 check(not M.isEngaged(), 'steer residual held past enter in one direction -> player_steer')
 check(logs[#logs]:find('player_steer') ~= nil, 'override logged player_steer')
@@ -485,16 +485,16 @@ check(logs[#logs]:find('enter 0.020') ~= nil or logs[#logs - 1]:find('enter 0.02
   'mirrored override_cfg logged (enter 0.020)')
 echo(0.05, 0.3, 0)
 driveTick(0, 0.3, 0, tuned); driveTick(0, 0.3, 0, tuned)
-check(not M.isEngaged(), 'tuned steer_enter 0.02 trips on a 0.05 residual the default 0.35 ignores')
+check(not M.isEngaged(), 'tuned steer_enter 0.02 trips on a 0.05 residual the default 0.08 ignores')
 
 -- swapping vehicles re-arms the warm-up: the new car's echo says nothing about the old car's commands
-local pin = '{"steer_enter":0.35,"steer_exit":0.18,"steer_hold_ms":200,"steer_spike":0.20,"brake_enter":0.06,"throttle_enter":0.10,"lpf_tau_ms":80}'
+local pin = '{"steer_enter":0.08,"steer_exit":0.04,"steer_hold_ms":200,"steer_spike":0.20,"brake_enter":0.06,"throttle_enter":0.10,"lpf_tau_ms":80}'
 echo(0, 0.3, 0)
 M.toggleEngage()
 warmDrive(0, 0.3, 0, pin)
 check(M.isEngaged(), 'driving before the vehicle switch')
 currentVeh = otherVeh
-echo(0.60, 0.3, 0)
+echo(0.25, 0.3, 0)
 driveTick(0, 0.3, 0, pin); driveTick(0, 0.3, 0, pin)
 check(M.isEngaged(), 'vehicle switch re-arms the override warm-up')
 for _ = 1, 8 do driveTick(0, 0.3, 0, pin) end
@@ -513,9 +513,9 @@ check(M.isEngaged(), 'centered physical wheel while GVD steers 0.4 is not an ove
 local egoPd = readFileAll(egoPath)
 check(egoPd and egoPd:find('"player_device":true') and egoPd:find('"player_steering":0.000'),
   'gvd_ego.json carries player_device + centered wheel (' .. tostring(egoPd) .. ')')
-veEnv.input.lastInputs.wheel.steering = 0.60
+veEnv.input.lastInputs.wheel.steering = 0.25
 for _ = 1, 8 do driveTick(0.4, 0.3, 0, pin) end
-check(not M.isEngaged(), 'physical wheel pull 0.60 with the Direct Drive source locked -> player_steer')
+check(not M.isEngaged(), 'physical wheel pull 0.25 with the Direct Drive source locked -> player_steer')
 
 -- 13c) secondary Direct Drive pedals: resting lastInputs is not an override; a real brake press is.
 -- Clutch / handbrake lastInputs must not trip override (GVD zeros those axes; they are not a takeover).

@@ -1093,8 +1093,8 @@ local VE_FEEDBACK = "local ev=(electrics and electrics.values) or {};"
 -- Same maths as python/control/override.py; these defaults must match config/control.yaml,
 -- which the supervisor mirrors into gvd_state.json.override_cfg. Live FFB UNPROVEN.
 local OVR = {
-  steer_enter = 0.35,
-  steer_exit = 0.18,
+  steer_enter = 0.08,
+  steer_exit = 0.04,
   steer_hold_ms = 200,
   steer_spike = 0.20,
   brake_enter = 0.06,

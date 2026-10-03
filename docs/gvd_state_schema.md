@@ -200,7 +200,7 @@ Python reads the file every tick. `engaged:false` is always off. `engaged:true` 
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `override_cfg.steer_enter` / `steer_exit` | float | 0.35 / 0.18. Dwell charges above enter, discharges below exit, frozen between |
+| `override_cfg.steer_enter` / `steer_exit` | float | 0.08 / 0.04. Dwell charges above enter, discharges below exit, frozen between |
 | `override_cfg.steer_hold_ms` | float | 200. How long the player has to keep pushing one way |
 | `override_cfg.steer_spike` | float | 0.20. Sample-to-sample jump past this is mechanical: the EMA holds |
 | `override_cfg.lpf_tau_ms` | float | 80. EMA time constant, on the residual only |

@@ -6,25 +6,25 @@ Entertainment only. Never use this stack to control a physical car.
 
 First-time clone: point [Grok Build](https://x.ai/cli), Grok Bot, or any computer-use agent at this repo on extra-high reasoning — paste [`AGENTS.md`](AGENTS.md) if the tool does not auto-read the tree. Have it install GVD on this PC, probe or accept the specs, pick **retail** window-capture vs BeamNG.**tech** 8-cam from what is actually installed, and patch [`config/hardware.yaml`](config/hardware.yaml) to that GPU / VRAM / RAM. No step-by-step here — the model can open the project.
 
-## Alpha 1.0.1
+## Alpha 1.7.0
 
 This is **alpha** — may break / not work; improves with fixes.
 
-Canonical pin **1.0.1** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Untagged retail zips use `1.0.1-alpha-<sha>`.
+Canonical pin **1.7.0** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Untagged retail zips use `1.7.0-alpha-<sha>`.
 
 **Versioning** (this line stays **alpha** until a later non-alpha release):
 
 - **point** bumps (`1.0.x`) = fixes / small UI
 - **main alpha** bump (`1.x.0`) = features / core / UI overhaul
 
-## Recent changes (alpha 1.0.1)
+## Recent changes (alpha 1.7.0)
 
-Point bump: bus safety fixes and a small HUD polish. Live Alt+G, Tech 8-cam, FFB, and QSV stay **UNPROVEN**.
+Catch-up from **1.0.1**. Each feature merge since that pin is one main step, and the throttle fix is the point in between: **1.1.0** cabin UI, **1.2.0** draw range, **1.3.0** Tech hold, **1.4.0** lanes and CAMS, **1.4.1** own-throttle and Neutral, **1.5.0** companion cameras, **1.6.0** predicted path, **1.7.0** lane points and a bus file that can engage. Live Alt+G, Tech 8-cam, FFB, and QSV stay **UNPROVEN**.
 
 Architecture
 
 - A leftover `gvd_engage.json` `engaged:true` does not start the car. Python honors that flag only while its `mtime` is about 2.5 s fresh. Lua refreshes the stamp every 0.5 s while the in-game latch is on, and will not write `true` over a newer supervisor `false`.
-- Engage still starts only in the game (Alt+G or the app button). A file cannot turn it on.
+- Engage starts in the game (Alt+G or the app button) or from a fresh gvd_bot_engage.json. A leftover true does not start the car.
 - `--policy e2e` with no `models/e2e_current.onnx` holds the brake (`veto:e2e_stub`) and stays engaged. Shadow keeps the modular command.
 - `cmd_applied` is true only when the Lua ack is this `seq` or up to 5 behind. An old high `applied_seq` is not an ack.
 - Retail stays one window (`cams=1/8`). Tech 8-cam is still the other product. `--backend auto` still does not pick Tech because `beamngpy` imports.
@@ -54,7 +54,7 @@ Credits: [VisionPilot](https://github.com/visionpilot-project/VisionPilot), Beam
 
 ## Screenshots
 
-No recent live GVD cabin or in-game UI photos from the Windows live machine are in the repo (only `docs/gvd_viz_smoke.png` and the 64px `app.png` icon). These shots are **synthetic**. They are not live BeamNG photos. Soft Esc parked. Not Engage. 1.0.1 keeps the same void cabin and the same 330px face: one glance word, a pinned toy footer, and the bus folder inside `+ nerd`. Swap in cropped live shots later and change the caption to **real**. Provenance: [`docs/media/SOURCE.md`](docs/media/SOURCE.md).
+No recent live GVD cabin or in-game UI photos from the Windows live machine are in the repo (only `docs/gvd_viz_smoke.png` and the 64px `app.png` icon). These shots are **synthetic**. They are not live BeamNG photos. Soft Esc parked. Not Engage. 1.7.0 keeps the same void cabin and the same 330px face: one glance word, a pinned toy footer, and the bus folder inside `+ nerd`. Swap in cropped live shots later and change the caption to **real**. Provenance: [`docs/media/SOURCE.md`](docs/media/SOURCE.md).
 
 **Cabin — GVD VISION (synthetic).** OpenCV `python/viz/stage.py` parked clean cabin (chase 3/4 just behind the ego, no nerd chrome, ice underglow off). The title reads **OFF**. Agent boxes are empty solids (LEAD / BRAKE tags, no center disc). Stub lanes run with the `cameras.yaml` viz span. The cars are an authored traffic pack in those lanes, not a live detector. The ice ribbon is the authored smoke path and ends with that path. Same lexicon as `PYTHONPATH=. python python/run_vision.py --smoke`. Not a live second-screen photo.
 
@@ -213,7 +213,7 @@ Optional bus in `config/sensors.yaml`. Defaults: IMU + GPS **on**; `lidar` / `ra
 
 ## Release zip (M6)
 
-Windows: double-click `scripts\make_release_zip.bat`. Anywhere: `python scripts/make_release_zip.py`. Output: `dist\gvd-retail-<version>.zip` (gitignored), `<version>` = exact git tag if any, else `1.0.1-alpha-<sha>[-dirty]`; override with `--version 1.0.1`, `--out path`, `--flat` (no top-level folder), `--list` (manifest only).
+Windows: double-click `scripts\make_release_zip.bat`. Anywhere: `python scripts/make_release_zip.py`. Output: `dist\gvd-retail-<version>.zip` (gitignored), `<version>` = exact git tag if any, else `1.7.0-alpha-<sha>[-dirty]`; override with `--version 1.7.0`, `--out path`, `--flat` (no top-level folder), `--list` (manifest only).
 
 Packs: `install.bat`, `uninstall.bat`, `play_gvd.bat`, `beamng_mod/`, `python/` (retail runtime), `config/` (including `sensors.yaml`), `requirements.txt` + `requirements-retail.txt`, `LICENSE`, `README.md`, `AGENTS.md`, `docs/*.md`, `models/yolov8n.onnx` + `models/NOTICE.txt`, plus a generated `VERSION.txt` (version, build time, git sha, the retail honesty lines). Excludes `data/clips/`, extra weights (`*.pt`, other `*.onnx`, `*.pth` `*.bin` `*.safetensors`), `.git`, `scripts/` (tests + this tool), `__pycache__`, `dist/`, and `requirements-foxglove.txt`. `*.bat` are written CRLF. After writing, the script re-opens the zip, refuses forbidden members and missing must-haves (mod entry point, `run_vision.py`, launchers, `models/yolov8n.onnx`), and exits non-zero on any problem. Attach the zip to a GitHub Release. Offline check: `PYTHONPATH=. python scripts/test_m6_retail.py`.
 
@@ -289,7 +289,7 @@ Keys in `--viz`: `V` nerd, `D` DRIVE (live actuators), `G` VIZ (occupancy / boxe
 
 ## Status
 
-**Alpha 1.0.1:** this is **alpha** — may break / not work; improves with fixes. **point** bumps = fixes / small UI. **main alpha** bump = features / core / UI overhaul. See [Alpha 1.0.1](#alpha-101). **1.0.1** keeps a stale `gvd_engage.json` from starting the car, holds an untrained E2E stub instead of driving it, shares one glance word (OFF / ON / HOLD / DRIVE / MISMATCH) across the app, the strip, and the VISION title, and draws cabin agent boxes as empty solids.
+**Alpha 1.7.0:** this is **alpha** — may break / not work; improves with fixes. **point** bumps = fixes / small UI. **main alpha** bump = features / core / UI overhaul. See [Alpha 1.7.0](#alpha-170). **1.7.0** keeps a stale `gvd_engage.json` from starting the car, holds an untrained E2E stub instead of driving it, shares one glance word (OFF / ON / HOLD / DRIVE / MISMATCH) across the app, the strip, and the VISION title, and draws cabin agent boxes as empty solids.
 
 **Force-feedback player override:** wheel chatter no longer disengages GVD. Signal is `|steering_input − aligned cmd.steer|` (never an absolute angle), then spike reject → EMA → hysteresis → dwell. Pedals are asymmetric and tight. Live FFB is **UNPROVEN**. Details under [Actuation](#actuation-m3).
 

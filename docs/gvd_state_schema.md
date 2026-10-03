@@ -149,7 +149,7 @@ These come from state the stage already has — no extra fields, and each one ne
 
 The only filled surface in the scene is the ego corridor; lane paint and kerbs are thin vector polylines, and the sky is void — there is no backdrop.
 
-Predictions need an anchor: with no detected lane there are no predicted lanes and no road edges, and with `lane_conf` under 0.25 only the detected boundaries ship. Sign positions inherit `project_box_to_ego`'s crude pinhole estimate, and sign/light heights in the scene are a drawing convention, not a measurement. The stage draws detected geometry solid and everything predicted dim + dashed, skips `kind=stub` except `--smoke` (`viz_smoke`), and prints e.g. `lanes 2 seen+2 pred · edges pred · 2 signs` under the window. Loop under 8 Hz drops forecast fans, signs and the `cam_main` PIP.
+The live writer keeps every boundary the fit returned and tags them `detected`. A wider road is those extra lines, not a sideways copy of the ego pair. With no fit there is no lane paint and no road edge. The kerb is predicted, 0.4 m outside the outermost real line. Sign positions inherit `project_box_to_ego`'s crude pinhole estimate, and sign/light heights in the scene are a drawing convention, not a measurement. The stage draws detected geometry solid and predicted geometry dim + dashed, skips `kind=stub` except `--smoke` (`viz_smoke`), and a live two-line road prints e.g. `lanes 2 seen · edges pred · 2 signs` under the window. Loop under 8 Hz drops forecast fans, signs and the `cam_main` PIP.
 
 ## In-game app bus
 

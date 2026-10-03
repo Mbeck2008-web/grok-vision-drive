@@ -247,6 +247,26 @@ def _read_bot_engage() -> dict | None:
     return data
 
 
+def bot_engage_fresh(now: float | None = None) -> bool:
+    """True when ``gvd_bot_engage.json`` is engaged and ``mtime`` is fresh.
+
+    Same window as ``read_engage_flag`` (``ENGAGE_FRESH_S``). The grab calls
+    ``poll_vehicle`` before ``note_engaged``, so the in-memory latch is still
+    false on the first bot-engage tick. A fresh file is Engage for that poll.
+    A stale leftover is not.
+    """
+    data = _read_bot_engage()
+    if not data or not bool(data.get("engaged", False)):
+        return False
+    try:
+        age = (time.time() if now is None else float(now)) - float(data["mtime"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if age < -1.0:
+        return False
+    return age <= ENGAGE_FRESH_S
+
+
 def write_bot_engage(engaged: bool, *, mtime: float | None = None) -> float:
     """One write engages or clears. ``mtime`` must be fresh for a new engage."""
     stamp = time.time() if mtime is None else float(mtime)
@@ -583,10 +603,10 @@ class DriverInputs:
 # restarts when poll() returns so PollGPSGE inside the same poll cannot
 # expire the snapshot before electrics are read. A miss still polls; Engage
 # hold reads speed on that path.
-# Soft Esc (latch false and gvd_engage.json not live) may skip the GE poll
-# for 200 ms and republish the last-good map here so this read does not open
-# a second sensors.poll. TechSession.poll reads the engage flag before that
-# hold, because note_engaged runs after poll_vehicle.
+# Soft Esc (latch false, gvd_engage.json not live, and gvd_bot_engage.json
+# not fresh) may skip the GE poll for 200 ms and republish the last-good map
+# here so this read does not open a second sensors.poll. TechSession.poll
+# reads both files before that hold, because note_engaged runs after poll_vehicle.
 SENSOR_POLL_REUSE_S = 0.05
 
 # Engage latch updated by note_engaged after poll_vehicle. Default false:
@@ -600,7 +620,8 @@ def note_soft_esc_engaged(engaged: bool) -> None:
     """Latch Engage so a grab with this bit set polls every tick.
 
     Callers that flip this must restore it. ``TechSession.poll`` does not
-    wait for the latch on the rising edge; it also reads ``read_engage_flag``.
+    wait for the latch on the rising edge; it also reads ``read_engage_flag``
+    and a fresh ``gvd_bot_engage.json``.
     """
     global _soft_esc_engaged
     _soft_esc_engaged = bool(engaged)

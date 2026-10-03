@@ -1,13 +1,15 @@
 """Lane graph + road edges for the viz layer (ego frame: x right, y forward).
 
-Honesty: `estimate_lanes` only recovers the ego lane's left/right boundaries from Hough
-segments. Everything wider than that is a *lateral offset* of a boundary we actually saw,
-tagged `kind="predicted"`, and is only produced when a detected boundary exists to anchor
-it. No detected lane → no predicted lane, no road edge. Offsets are flat-road and assume
-the neighbouring lanes run parallel to ours; that holds in the near field and is why the
-app draws predicted geometry dimmer and dashed.
+The live writer is ``lanes_ext_for_live``. It keeps every boundary the fit
+returned and tags those lines ``detected``. A line outside the ego pair is
+that fit, not a sideways copy. No fit means no lane paint and no road edge.
+The kerb is predicted: 0.4 m outside the outermost real line. Predicted
+geometry is drawn dimmer and dashed.
 
-Nothing here feeds the planner. Corridor, CIPV and AEB keep using `lanes_bev` as before.
+``lanes_ext(..., predict=True)`` can still offset a seen boundary. The live
+path does not call it that way.
+
+Nothing here feeds the planner. Corridor, CIPV and AEB keep using ``lanes_bev``.
 """
 
 from __future__ import annotations

@@ -600,6 +600,106 @@ def check_soft_esc_engage_rising_edge() -> None:
             engage.write_bytes(prev_bytes)
 
 
+def check_bot_engage_forces_sensor_poll() -> None:
+    """A fresh gvd_bot_engage.json polls on the rising edge. A stale file does not.
+
+    The latch is still false and gvd_engage.json is off. The 200 ms Soft Esc
+    window would otherwise republish the cached speed.
+    """
+    import time
+
+    import python.control.actuate as act
+    from python.sensors.tech import TechSession
+
+    class EgoSensors(dict):
+        def __init__(self) -> None:
+            super().__init__()
+            self.n = 0
+            self.speed = 3.0
+
+        def poll(self) -> None:
+            self.n += 1
+            self.clear()
+            self["electrics"] = {
+                "wheelspeed": float(self.speed),
+                "steering_input": 0.2,
+                "throttle_input": 0.0,
+                "brake_input": 0.0,
+            }
+            return None
+
+    class EgoVeh:
+        vid = "etk_player"
+        options = {"model": "etk800"}
+
+        def __init__(self) -> None:
+            self.sensors = EgoSensors()
+            self.state = {
+                "pos": (1.0, 2.0, 0.0),
+                "dir": (0.0, 1.0, 0.0),
+                "up": (0.0, 0.0, 1.0),
+                "vel": (0.0, 3.0, 0.0),
+            }
+
+    prev_latch = act.soft_esc_sensors_every_tick()
+    engage = act.engage_path()
+    bot = act.bot_engage_path()
+    prev_engage = engage.read_bytes() if engage.is_file() else None
+    prev_bot = bot.read_bytes() if bot.is_file() else None
+    session = TechSession({"wait_vehicle_s": 0, "sensors": {"electrics": True}})
+    veh = EgoVeh()
+    session.vehicle = veh
+    session.attached = {"electrics": True}
+    try:
+        act.note_soft_esc_engaged(False)
+        act.write_engage_flag(False)
+        act.write_bot_engage(False)
+        assert act.soft_esc_sensors_every_tick() is False
+        assert act.read_engage_flag(default=False) is False
+        assert act.bot_engage_fresh() is False
+
+        first = session.poll()
+        assert veh.sensors.n == 1
+        assert first.speed_mps == 3.0
+        session._sensors_poll_mono = time.monotonic()
+        held = session.poll()
+        assert veh.sensors.n == 1
+        assert "coalesced" in held.note
+        assert held.speed_mps == 3.0
+
+        veh.sensors.speed = 11.0
+        veh.state["pos"] = (11.0, 1.0, 0.0)
+        veh.state["vel"] = (0.0, 11.0, 0.0)
+        act.write_bot_engage(True)
+        assert act.bot_engage_fresh() is True
+        assert act.soft_esc_sensors_every_tick() is False
+        session._sensors_poll_mono = time.monotonic()
+        rising = session.poll()
+        assert veh.sensors.n == 2
+        assert rising.speed_mps == 11.0
+        assert rising.pos == (11.0, 1.0, 0.0)
+        assert "coalesced" not in (rising.note or "")
+
+        act.write_bot_engage(True, mtime=time.time() - 10.0)
+        assert act.bot_engage_fresh() is False
+        veh.sensors.speed = 4.0
+        session._sensors_poll_mono = time.monotonic()
+        stale = session.poll()
+        assert veh.sensors.n == 2
+        assert stale.speed_mps == 11.0
+        assert "coalesced" in stale.note
+    finally:
+        act.note_soft_esc_engaged(prev_latch)
+        if prev_engage is None:
+            engage.unlink(missing_ok=True)
+        else:
+            engage.write_bytes(prev_engage)
+        if prev_bot is None:
+            bot.unlink(missing_ok=True)
+        else:
+            bot.write_bytes(prev_bot)
+
+
 def check_bot_engage() -> None:
     """A fresh bot file latches. off, override clear, and a stale true do not drive."""
     import time
@@ -970,6 +1070,7 @@ def main() -> None:
     check_grab_loop_poll_before_electrics()
     check_electrics_segment_timer()
     check_soft_esc_engage_rising_edge()
+    check_bot_engage_forces_sensor_poll()
     check_soft_esc_heartbeat_coalesce()
 
     print("test_m3_actuate: OK")

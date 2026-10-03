@@ -654,6 +654,10 @@ def read_electrics(vehicle: Any) -> dict[str, Any] | None:
         if isinstance(snap, dict):
             el = snap.get("electrics") if "electrics" in snap else snap
             return el if isinstance(el, dict) else None
+        from python.sensors.cameras import camera_ge_socket_busy
+
+        if camera_ge_socket_busy():
+            return None
         sensors = getattr(vehicle, "sensors", None)
         if sensors is None:
             return None
@@ -987,6 +991,10 @@ class BeamNGPyActuator:
     ) -> str | None:
         if self.vehicle is None:
             return "no_vehicle"
+        from python.sensors.cameras import camera_ge_socket_busy
+
+        if camera_ge_socket_busy():
+            return "camera_io_busy"
         try:
             # Engage arms realistic_automatic. A release with the shifter
             # still unset must only clear pedals, not arm that mode on the way out.

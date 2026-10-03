@@ -287,7 +287,14 @@ def _check_road_model() -> None:
     """Predicted lanes need a detected anchor; kerbs are never claimed as detected."""
     sys.path.insert(0, str(ROOT))
     from python.perception.detect import STATIC_CLASSES, coco_class_name
-    from python.perception.road_model import LANE_CONF_MIN, NEIGHBOUR_LANES, lanes_ext, road_edges
+    from python.perception.road_model import (
+        LANE_CONF_MIN,
+        NEIGHBOUR_LANES,
+        lanes_ext,
+        lanes_ext_for_live,
+        road_edges,
+        suppress_lane_fan,
+    )
 
     assert coco_class_name(9) == "traffic_light" and coco_class_name(11) == "stop_sign"
     assert coco_class_name(10) == "pole" and coco_class_name(12) == "pole"
@@ -309,6 +316,18 @@ def _check_road_model() -> None:
     assert lanes_ext([], 0.9) == [] and road_edges([]) == []
     weak = lanes_ext(lanes, LANE_CONF_MIN - 0.01)
     assert all(l["kind"] == "detected" for l in weak) and len(weak) == 2
+    # Main-only: no filled edge and no neighbour fan, even when lane_conf is high.
+    main_only = lanes_ext_for_live(lanes, 0.95, {"main"})
+    assert [ln["kind"] for ln in main_only] == ["detected", "detected"]
+    one_edge = [[{"x": -1.8, "y": y} for y in range(2, 30, 4)]]
+    one = lanes_ext_for_live(one_edge, 0.40, {"main"})
+    assert len(one) == 1 and one[0]["kind"] == "detected"
+    sided = lanes_ext_for_live(lanes, 0.95, {"main", "pillarL"})
+    assert sum(1 for ln in sided if ln["kind"] == "predicted") == 2 * min(NEIGHBOUR_LANES, 1)
+    assert lanes_ext_for_live(lanes, 0.8, None) == lanes_ext(lanes, 0.8)
+    assert suppress_lane_fan({"cam_health": {"main": "ok", "rear": "missing"}})
+    assert not suppress_lane_fan({"cam_health": {"main": "ok", "pillarL": "stale"}})
+    assert not suppress_lane_fan({})
 
     # Road furniture must never reach the tracker (CIPV / AEB / ghosts read tracks).
     from python.perception.pipeline import ModularPerception

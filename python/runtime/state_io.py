@@ -72,6 +72,8 @@ def default_state(**overrides: Any) -> dict[str, Any]:
         "grab_ms": 0.0,
         "grab_phase": -1,
         "grab_poll_free": True,
+        "companion_inflight": 0,
+        "grab_read_blocked": False,
         "sensors_poll_ms": 0.0,
         "poll_gps_ms": 0.0,
         "poll_gps_sent": False,

@@ -623,6 +623,76 @@ def main() -> None:
     assert any(_ext_hit(y) > 0 for y in (72.0, 80.0, 88.0)), "predicted dash reaches ahead"
     assert any(_ext_hit(y) > 0 for y in (-6.0, -4.0, -2.0)), "predicted dash shows behind the ego"
 
+    # Main camera only: no neighbour fan, and no lane paint behind the ego.
+    from python.perception.road_model import lanes_ext_for_live
+    from python.sensors.cameras import CAM_IDS
+
+    main_health = {cid: ("ok" if cid == "main" else "missing") for cid in CAM_IDS}
+    pair = [
+        [{"x": -1.8, "y": float(y)} for y in range(2, 30, 4)],
+        [{"x": 1.8, "y": float(y)} for y in range(2, 30, 4)],
+    ]
+    main_lanes = lanes_ext_for_live(pair, 0.95, {"main"})
+    assert [ln["kind"] for ln in main_lanes] == ["detected", "detected"]
+    one_lane = lanes_ext_for_live(
+        [[{"x": -1.8, "y": float(y)} for y in range(2, 30, 4)]],
+        0.40,
+        {"main"},
+    )
+    assert len(one_lane) == 1 and one_lane[0]["kind"] == "detected"
+    fan_note = scene_note({
+        "lanes_ext": [
+            {"kind": "detected"},
+            {"kind": "detected"},
+            {"kind": "predicted"},
+            {"kind": "predicted"},
+            {"kind": "predicted"},
+            {"kind": "predicted"},
+            {"kind": "predicted"},
+        ],
+        "cam_health": main_health,
+    })
+    assert fan_note.startswith("lanes 2 seen") and "pred" not in fan_note
+    low_note = scene_note({"lanes_ext": one_lane, "cam_health": main_health})
+    high_note = scene_note({"lanes_ext": main_lanes, "cam_health": main_health})
+    assert "pred" not in low_note and "pred" not in high_note
+    fan_pts = {
+        "points": [{"x": -5.3, "y": float(y)} for y in range(2, 36, 3)],
+        "kind": "predicted",
+        "index": -2,
+    }
+    main_draw = {**short, "lanes_ext": [short["lanes_ext"][0], fan_pts], "cam_health": main_health}
+    main_solo = {**short, "lanes_ext": [short["lanes_ext"][0]], "cam_health": main_health}
+    drawn = render_stage(main_draw, ui=lane_ui)
+    solo = render_stage(main_solo, ui=lane_ui)
+    assert int(cv2.absdiff(drawn, solo).sum()) == 0, "main-only does not stroke a predicted fan"
+    empty = render_stage({**main_solo, "lanes_ext": []}, ui=lane_ui)
+    main_delta = cv2.absdiff(drawn, empty)
+
+    def _main_hit(x: float, y: float) -> int:
+        px, py = span_cam.project(x, y, 0.02)
+        if not (4 <= px < 1276 and 24 < py < 796):
+            return -1
+        patch = main_delta[py - 5:py + 6, px - 5:px + 6]
+        return int(np.count_nonzero(patch.sum(axis=2) > 8))
+
+    assert _main_hit(-1.8, 20.0) > 0, "main-only still strokes the seen lane"
+    assert all(_main_hit(-1.8, y) == 0 for y in (-6.0, -4.0, -2.0)), "no lane paint behind the ego"
+    rear_health = dict(main_health)
+    rear_health["rear"] = "ok"
+    rear_draw = render_stage({**main_solo, "cam_health": rear_health}, ui=lane_ui)
+    rear_empty = render_stage({**main_solo, "lanes_ext": [], "cam_health": rear_health}, ui=lane_ui)
+    rear_delta = cv2.absdiff(rear_draw, rear_empty)
+
+    def _rear_hit(y: float) -> int:
+        px, py = span_cam.project(-1.8, y, 0.02)
+        if not (4 <= px < 1276 and 24 < py < 796):
+            return -1
+        patch = rear_delta[py - 5:py + 6, px - 5:px + 6]
+        return int(np.count_nonzero(patch.sum(axis=2) > 8))
+
+    assert any(_rear_hit(y) > 0 for y in (-6.0, -4.0, -2.0)), "a live rear camera may paint behind the ego"
+
     # Under 8 Hz the lane stroke and the ribbon stay. Signs drop.
     slow = dict(short)
     slow["loop_hz"] = 6.0

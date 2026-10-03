@@ -21,6 +21,9 @@ LANE_CONF_MIN = 0.25       # below this the Hough fit is too weak to hang predic
 EDGE_SHOULDER_M = 0.4      # curb sits just outside the outermost predicted boundary
 MAX_POLYS = 8
 NEIGHBOUR_LANES = 2   # boundaries offset per side: enough for a multi-lane fan, not clutter
+# Pillar/repeat cameras are the only ones that can justify a neighbour lane.
+# Main, wide, and narrow see the ego lane. Rear does not add a forward fan.
+SIDE_LANE_CAMS = frozenset(("pillarL", "pillarR", "repeatL", "repeatR"))
 
 
 def _points(poly: Any) -> list[dict[str, float]]:
@@ -59,12 +62,21 @@ def measure_lane_width(left: list[dict[str, float]] | None,
     return LANE_W_DEFAULT, False
 
 
-def lanes_ext(lanes_bev: Any, lane_conf: float, *, neighbours: int = 2) -> list[dict[str, Any]]:
+def lanes_ext(
+    lanes_bev: Any,
+    lane_conf: float,
+    *,
+    neighbours: int = 2,
+    predict: bool = True,
+) -> list[dict[str, Any]]:
     """Ego-lane boundaries as detected, plus `neighbours` predicted boundaries per side.
 
     `index` counts boundaries out from the ego lane: -1 / +1 are its own edges, -2 / +2 the
     far side of the neighbouring lane, and so on. `style` stays "unknown" — the Hough fit
     says nothing about solid vs dashed paint.
+
+    `predict=False` keeps only boundaries the fit actually saw. That is the main-camera
+    case: no filled ego edge and no lateral fan from cameras that did not deliver a frame.
     """
     detected: list[dict[str, Any]] = []
     for poly in (lanes_bev or [])[:MAX_POLYS]:
@@ -96,7 +108,7 @@ def lanes_ext(lanes_bev: Any, lane_conf: float, *, neighbours: int = 2) -> list[
             side = "left" if d["mean_x"] < 0 else "right"
             add(d["points"], "detected", side, -2 if side == "left" else 2)
 
-    if float(lane_conf or 0.0) < LANE_CONF_MIN:
+    if not predict or float(lane_conf or 0.0) < LANE_CONF_MIN:
         return out
 
     width, _measured = measure_lane_width(left["points"] if left else None,
@@ -114,6 +126,78 @@ def lanes_ext(lanes_bev: Any, lane_conf: float, *, neighbours: int = 2) -> list[
         if right:
             add(_shift(right["points"], width * i), "predicted", "right", 1 + i)
     return out
+
+
+def lanes_ext_for_live(
+    lanes_bev: Any,
+    lane_conf: float,
+    live_ids: set[str] | frozenset[str] | None,
+) -> list[dict[str, Any]]:
+    """Lane graph for the cameras that actually delivered a frame.
+
+    `live_ids is None` keeps the legacy fan (callers that do not know the rig).
+    No live pillar/repeat camera → detected ego boundaries only, so a main-only
+    hitch cannot draw "1–2 seen + 5 pred". Each live side camera allows one
+    predicted step, capped at `NEIGHBOUR_LANES`.
+    """
+    if live_ids is None:
+        return lanes_ext(lanes_bev, lane_conf)
+    sides = {str(cid) for cid in live_ids} & SIDE_LANE_CAMS
+    if not sides:
+        return lanes_ext(lanes_bev, lane_conf, neighbours=0, predict=False)
+    return lanes_ext(
+        lanes_bev,
+        lane_conf,
+        neighbours=min(NEIGHBOUR_LANES, len(sides)),
+    )
+
+
+_HEALTH_DELIVERED = ("ok", "stale")
+_RIG_CAMS = ("narrow", "main", "wide", "pillarL", "pillarR", "repeatL", "repeatR", "rear")
+
+
+def _health_map(state: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(state, dict):
+        return None
+    health = state.get("cam_health")
+    if not isinstance(health, dict) or not health:
+        return None
+    return health
+
+
+def _cam_delivered(health: dict[str, Any], cid: str) -> bool:
+    return str(health.get(cid) or "missing") in _HEALTH_DELIVERED
+
+
+def rig_has_frame(state: dict[str, Any] | None) -> bool:
+    """True when cam health names at least one camera that delivered a frame."""
+    health = _health_map(state)
+    if health is None:
+        return False
+    return any(_cam_delivered(health, cid) for cid in _RIG_CAMS)
+
+
+def suppress_lane_fan(state: dict[str, Any] | None) -> bool:
+    """True when a live rig has no pillar/repeat frame to justify neighbour lanes.
+
+    All-missing health (smoke, no cameras yet) does not suppress. The legacy
+    cabin fan stays for those callers.
+    """
+    if not rig_has_frame(state):
+        return False
+    health = _health_map(state) or {}
+    return not any(_cam_delivered(health, cid) for cid in SIDE_LANE_CAMS)
+
+
+def paint_lane_behind(state: dict[str, Any] | None) -> bool:
+    """False when a live rig has no rear frame.
+
+    Unknown health keeps the cabin span, including the chase view behind the ego.
+    """
+    if not rig_has_frame(state):
+        return True
+    health = _health_map(state) or {}
+    return _cam_delivered(health, "rear")
 
 
 def road_edges(lanes: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -43,7 +43,8 @@ from python.control.override import (
 )
 from python.data.record import ClipRecorder, choose_encoder
 from python.perception.pipeline import ModularPerception
-from python.perception.road_model import lanes_ext, road_edges
+from python.perception.road_model import lanes_ext_for_live, road_edges
+from python.sensors.cameras import CAM_IDS, CamHealth
 from python.runtime.debug_opts import apply_to_command, apply_to_perception
 from python.runtime.hw_probe import ema_hz, gpu_vram_used_gb, probe, refuse_live_start, unique_frame_hz_inst
 from python.runtime.models import ModelRuntime
@@ -757,8 +758,14 @@ def main() -> None:
             st["path_e2e"] = list(e2e_path) if e2e_path else []
             st["tracks"] = pout.tracks
             st["lanes_bev"] = pout.lanes_bev
-            # Viz road model: detected boundaries + labelled predictions, never invented lanes.
-            st["lanes_ext"] = lanes_ext(pout.lanes_bev, pout.lane_conf)
+            # Neighbour lanes only when a side camera delivered a frame. Main-only
+            # keeps the Hough boundaries that camera actually saw.
+            live_cams = {
+                cid
+                for cid in CAM_IDS
+                if bundle.health.get(cid) in (CamHealth.OK, CamHealth.STALE)
+            }
+            st["lanes_ext"] = lanes_ext_for_live(pout.lanes_bev, pout.lane_conf, live_cams)
             st["road_edges"] = road_edges(st["lanes_ext"])
             st["signs"] = pout.signs
             st["agents"] = _forecast_agents(pout.tracks)
@@ -834,6 +841,10 @@ def main() -> None:
                 st["missing_state_keys"] = sorted(set(st["missing_state_keys"] + extra_miss))
             st["grab_phase"] = grab_phase
             st["grab_poll_free"] = grab_poll_free
+            companion_inflight = int(getattr(bundle, "companion_inflight", 0) or 0)
+            grab_read_blocked = bool(getattr(bundle, "grab_read_blocked", False))
+            st["companion_inflight"] = companion_inflight
+            st["grab_read_blocked"] = grab_read_blocked
             st["sensors_poll_ms"] = sensors_poll_ms
             st["poll_gps_ms"] = poll_gps_ms
             st["poll_gps_sent"] = poll_gps_sent
@@ -856,6 +867,8 @@ def main() -> None:
             print(
                 f"[GVD] seg grab_ms={grab_ms:.2f} grab_phase={grab_phase} "
                 f"grab_poll_free={int(grab_poll_free)} "
+                f"companion_inflight={companion_inflight} "
+                f"grab_read_blocked={int(grab_read_blocked)} "
                 f"heartbeat_ms={st['heartbeat_ms']:.2f} "
                 f"infer_ms={float(pout.infer_ms):.2f} "
                 f"sensors_poll_ms={sensors_poll_ms:.2f} "

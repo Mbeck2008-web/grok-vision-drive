@@ -1,6 +1,6 @@
 """GVD VISION cabin stage (OpenCV). Chase 3/4 bird default; BEV via T.
 
-Lexicon (second-screen product viz): void stage, multi-lane fan, ice-blue ego
+Lexicon (second-screen product viz): void stage, seen lane lines, ice-blue ego
 corridor + stop bar, agent boxes (CIPV / in-path / BRAKE), warm curbs,
 sign/light glyphs. Driven from gvd_state.json. Titles stay GVD / VISION.
 """

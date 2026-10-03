@@ -341,6 +341,17 @@ def _check_road_model() -> None:
 
     assert _lane_count(sided) == 1
     assert _lane_count(wide) == 5
+    # Extras on a side share index ±2. The kerb follows the outermost line, not the first of those.
+    right_lines = [[{"x": x, "y": y} for y in range(0, 40, 10)] for x in (1.75, 5.25, 8.75)]
+    right_ext = lanes_ext_for_live(right_lines, 0.9, None)
+    assert sorted(ln["index"] for ln in right_ext) == [1, 2, 2]
+    right_kerb = road_edges(right_ext)
+    assert len(right_kerb) == 1 and right_kerb[0]["side"] == "right"
+    assert all(p["x"] > 8.75 for p in right_kerb[0]["points"])
+    assert all(abs(p["x"] - (8.75 + 0.4)) < 0.02 for p in right_kerb[0]["points"])
+    wide_edges = {e["side"]: e for e in road_edges(wide)}
+    assert all(p["x"] > 8.75 for p in wide_edges["right"]["points"])
+    assert all(p["x"] < -8.75 for p in wide_edges["left"]["points"])
     assert lanes_ext_for_live(lanes, 0.8, None) == lanes_ext(lanes, 0.8, neighbours=0, predict=False)
     assert suppress_lane_fan({"cam_health": {"main": "ok", "rear": "missing"}})
     assert not suppress_lane_fan({"cam_health": {"main": "ok", "pillarL": "stale"}})

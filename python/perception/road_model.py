@@ -18,7 +18,7 @@ LANE_W_MIN = 2.6
 LANE_W_MAX = 4.6
 LANE_W_DEFAULT = 3.5
 LANE_CONF_MIN = 0.25       # below this the Hough fit is too weak to hang predictions on
-EDGE_SHOULDER_M = 0.4      # curb sits just outside the outermost predicted boundary
+EDGE_SHOULDER_M = 0.4      # curb sits just outside the outermost boundary on that side
 MAX_POLYS = 8
 NEIGHBOUR_LANES = 2   # boundaries offset per side: enough for a multi-lane fan, not clutter
 # Pillar/repeat cameras are the only ones that can justify a neighbour lane.
@@ -197,14 +197,15 @@ def road_edges(lanes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Curb line just outside the outermost boundary on each side.
 
     Always `kind="predicted"`: nothing in the stack detects a kerb, so this is the edge of
-    the road we *assume* given the lanes we can see.
+    the road we *assume* given the lanes we can see. Live extras on one side share
+    index ±2, so the outer line is the one furthest out, not the first max-|index|.
     """
     edges: list[dict[str, Any]] = []
     for side, sign in (("left", -1.0), ("right", 1.0)):
-        cands = [l for l in lanes if l.get("side") == side and l.get("points")]
+        cands = [ln for ln in lanes if ln.get("side") == side and ln.get("points")]
         if not cands:
             continue
-        outer = max(cands, key=lambda l: abs(int(l.get("index", 0))))
+        outer = max(cands, key=lambda ln: sign * _mean_x(ln["points"]))
         edges.append({
             "points": _shift(outer["points"], sign * EDGE_SHOULDER_M),
             "kind": "predicted",

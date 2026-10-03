@@ -130,7 +130,7 @@ Written by the in-game **GVD** app (GELua is the only writer). **Wins over** `gv
 
 Drawn by the OpenCV **GVD VISION** window (`python/viz/stage.py`). The in-game **GVD** app is Engage + settings only. None of this feeds the planner — corridor, CIPV and AEB still read `lanes_bev` / `tracks` exactly as before.
 
-| `lanes_ext[]` | `{points:[{x,y}], kind, side, style, index}` | `kind`: `detected` (Hough saw the paint) / `predicted` (a detected boundary offset sideways by the measured lane width) / `stub` (`--smoke` only). `index` counts boundaries out from the ego lane (`±1` = its own edges, out to `±3` for the two-lane-per-side fan). `style` stays `unknown` — nothing classifies solid vs dashed yet |
+| `lanes_ext[]` | `{points:[{x,y}], kind, side, style, index}` | `kind`: `detected` (Hough saw the paint) / `predicted` (a sideways offset of a seen boundary; the live writer does not add one) / `stub` (`--smoke` only). `index` is `±1` for the ego pair. Every extra boundary the fit returned on that side shares `±2`. `style` stays `unknown` — nothing classifies solid vs dashed yet |
 | `road_edges[]` | `{points:[{x,y}], kind, side}` | Kerb line just outside the outermost boundary. **Always `predicted`**: no kerb detector exists, this is the road edge implied by the lanes we can see |
 | `signs[]` | `{cls,x,y,conf,state}` | Road furniture straight from the detector: `stop_sign` (COCO 11), `traffic_light` (9), `pole` (10 / 12 — hydrants and parking meters, drawn as short grey sticks). Never tracked and never offered to CIPV or AEB. `state` is `unknown` for lights — no lamp-colour classifier, so the OpenCV stage draws all three lamps as empty rings |
 | `agents[]` | `{id, path_ego:[{x,y}]}` | Mode-0 constant-yaw-rate forecast fan per moving track, same toy math as the OpenCV view |
@@ -147,7 +147,7 @@ These come from state the stage already has — no extra fields, and each one ne
 | Hard stop bar across the ribbon | planner halted (`target_v <= 0.2` or AEB brake) **and** a CIPV exists — the bar sits at the lead, because that is the constraint being stopped for. No CIPV means no stopping point we can honestly claim, so no bar |
 | Traffic light tinted ice-blue | `signs[].relevant == true`. **Nothing sets it today** — the stack has no route-relevance signal, so every light renders muted |
 
-The only filled surface in the scene is the ego corridor; lane paint, kerbs and the lane fan are thin vector polylines, and the sky is void — there is no backdrop.
+The only filled surface in the scene is the ego corridor; lane paint and kerbs are thin vector polylines, and the sky is void — there is no backdrop.
 
 Predictions need an anchor: with no detected lane there are no predicted lanes and no road edges, and with `lane_conf` under 0.25 only the detected boundaries ship. Sign positions inherit `project_box_to_ego`'s crude pinhole estimate, and sign/light heights in the scene are a drawing convention, not a measurement. The stage draws detected geometry solid and everything predicted dim + dashed, skips `kind=stub` except `--smoke` (`viz_smoke`), and prints e.g. `lanes 2 seen+2 pred · edges pred · 2 signs` under the window. Loop under 8 Hz drops forecast fans, signs and the `cam_main` PIP.
 

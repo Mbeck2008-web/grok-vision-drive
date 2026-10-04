@@ -30,6 +30,20 @@ from python.data.strip_writer import (  # noqa: E402
     read_state_jsonl,
 )
 from python.planning.path_predictor import predict_path  # noqa: E402
+from python.train.fit import (  # noqa: E402
+    TrainFitError,
+    USABLE_DEN,
+    USABLE_NUM,
+    canvas_bytes,
+    fit_with_probe,
+    measure_driving_file,
+    plan_fit,
+    read_free_ram_bytes,
+    read_free_vram_bytes,
+    shrink_batch,
+    step_bytes,
+    usable_bytes,
+)
 from python.train.scene_net import (  # noqa: E402
     LOSS_TERMS,
     MEMORY_S,
@@ -48,6 +62,14 @@ from python.train.scene_net import (  # noqa: E402
     scene_to_predict_kwargs,
     step_dt,
 )
+from python.train.status_window import (  # noqa: E402
+    TrainStatus,
+    TrainWindow,
+    format_status,
+    predict_eta_s,
+    steps_per_second,
+)
+from python.train.train_scene import train_directory  # noqa: E402
 
 
 def _colors() -> dict[str, tuple[int, int, int]]:
@@ -409,15 +431,264 @@ def torch_isfinite(pred: ScenePrediction) -> bool:
     return True
 
 
+def _free_covering(need: int) -> int:
+    return (int(need) * USABLE_DEN + USABLE_NUM - 1) // USABLE_NUM
+
+
+def check_fit_and_window() -> None:
+    n_strips = 4
+    window_strips = 4
+    n_windows = 16
+    small_file = canvas_bytes() * n_strips
+    free = _free_covering(step_bytes(4, file_bytes=small_file, n_strips=n_strips, window_strips=window_strips))
+    assert usable_bytes(free) >= step_bytes(4, file_bytes=small_file, n_strips=n_strips, window_strips=window_strips)
+    small = plan_fit(
+        file_bytes=small_file,
+        n_strips=n_strips,
+        free_vram_bytes=free,
+        free_ram_bytes=0,
+        n_windows=n_windows,
+        window_strips=window_strips,
+    )
+    assert small.device == "cuda" and small.recommended and small.batch == 4, small
+    assert small.file_bytes == small_file
+
+    dropped = None
+    for factor in (2, 3, 4, 5, 6, 8):
+        big_file = canvas_bytes() * n_strips * factor
+        try:
+            big = plan_fit(
+                file_bytes=big_file,
+                n_strips=n_strips,
+                free_vram_bytes=free,
+                free_ram_bytes=0,
+                n_windows=n_windows,
+                window_strips=window_strips,
+            )
+        except TrainFitError:
+            continue
+        if big.device == "cuda" and big.recommended and big.batch < small.batch:
+            dropped = big
+            break
+    assert dropped is not None, "a larger driving file should shrink the GPU batch"
+
+    one = step_bytes(1, file_bytes=small_file, n_strips=n_strips, window_strips=window_strips)
+    two = step_bytes(2, file_bytes=small_file, n_strips=n_strips, window_strips=window_strips)
+    free_one = _free_covering(one)
+    assert usable_bytes(free_one) < two
+    tight = plan_fit(
+        file_bytes=small_file,
+        n_strips=n_strips,
+        free_vram_bytes=free_one,
+        free_ram_bytes=free_one * 30,
+        n_windows=n_windows,
+        window_strips=window_strips,
+    )
+    assert tight.device == "cuda" and tight.recommended and tight.batch == 1, tight
+
+    free_vram = max(1, one // 8)
+    free_ram = _free_covering(one)
+    assert free_ram > free_vram
+    cpu = plan_fit(
+        file_bytes=small_file,
+        n_strips=n_strips,
+        free_vram_bytes=free_vram,
+        free_ram_bytes=free_ram,
+        n_windows=n_windows,
+        window_strips=window_strips,
+    )
+    assert cpu.device == "cpu" and cpu.recommended is False and cpu.batch >= 1, cpu
+
+    for free_vram_bytes, free_ram_bytes in ((1024, 2048), (4096, 1024)):
+        try:
+            plan_fit(
+                file_bytes=small_file,
+                n_strips=n_strips,
+                free_vram_bytes=free_vram_bytes,
+                free_ram_bytes=free_ram_bytes,
+                n_windows=n_windows,
+                window_strips=window_strips,
+            )
+        except TrainFitError:
+            pass
+        else:
+            raise AssertionError("step should not fit")
+
+    huge = _free_covering(step_bytes(32, file_bytes=small_file, n_strips=n_strips, window_strips=window_strips))
+    capped = plan_fit(
+        file_bytes=small_file,
+        n_strips=n_strips,
+        free_vram_bytes=huge,
+        free_ram_bytes=1,
+        n_windows=2,
+        window_strips=window_strips,
+    )
+    assert capped.batch == 2 and capped.device == "cuda" and capped.recommended
+
+    calls: list[tuple[str, int]] = []
+
+    def accept_gpu(device: str, batch: int) -> bool:
+        calls.append((device, batch))
+        return True
+
+    probed = fit_with_probe(small, accept_gpu, n_windows=n_windows)
+    assert probed.device == "cuda" and probed.recommended and probed.batch == small.batch
+    assert calls == [("cuda", small.batch)]
+
+    calls.clear()
+
+    def shrink_gpu(device: str, batch: int) -> bool:
+        calls.append((device, batch))
+        return device == "cuda" and batch <= 1
+
+    shrunk = fit_with_probe(small, shrink_gpu, n_windows=n_windows)
+    assert shrunk.device == "cuda" and shrunk.recommended and shrunk.batch == 1, shrunk
+    assert calls[0] == ("cuda", small.batch)
+    assert calls[-1] == ("cuda", 1)
+    assert all(device == "cuda" for device, _batch in calls)
+
+    rich = plan_fit(
+        file_bytes=small_file,
+        n_strips=n_strips,
+        free_vram_bytes=free,
+        free_ram_bytes=free * 4,
+        n_windows=4,
+        window_strips=window_strips,
+    )
+    assert rich.device == "cuda" and rich.recommended
+    calls.clear()
+
+    def gpu_miss(device: str, batch: int) -> bool:
+        calls.append((device, batch))
+        return device == "cpu" and batch <= 2
+
+    fallen = fit_with_probe(rich, gpu_miss, n_windows=4)
+    assert fallen.device == "cpu" and fallen.recommended is False and fallen.batch == 2, fallen
+    assert any(device == "cuda" for device, _batch in calls)
+    assert ("cpu", 2) in calls
+
+    calls.clear()
+
+    def accept_cpu(device: str, batch: int) -> bool:
+        calls.append((device, batch))
+        return True
+
+    stayed = fit_with_probe(cpu, accept_cpu, n_windows=n_windows)
+    assert stayed.device == "cpu" and stayed.recommended is False
+    assert calls and all(device == "cpu" for device, _batch in calls)
+
+    assert shrink_batch(8) == 4
+    assert shrink_batch(3) == 1
+    assert shrink_batch(1) == 0
+
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = Path(tmp)
+        (folder / "state.jsonl").write_text("abc", encoding="utf-8")
+        (folder / "strips").mkdir()
+        (folder / "strips" / "000000.jpg").write_bytes(b"12345")
+        assert measure_driving_file(folder) == 8
+    assert read_free_ram_bytes() > 0
+    assert read_free_vram_bytes() >= 0
+
+    gpu_text = format_status(
+        TrainStatus(
+            eta_s=90,
+            loss=0.25,
+            lr=1e-3,
+            steps_per_sec=2.5,
+            memory_bytes=1610612736,
+            memory_kind="vram",
+            device="cuda",
+            batch=4,
+            recommended=True,
+            step=3,
+            steps=10,
+        )
+    )
+    assert "time left 1m 30s" in gpu_text
+    assert "loss 0.2500" in gpu_text
+    assert "lr 0.001" in gpu_text
+    assert "steps/s 2.50" in gpu_text
+    assert "VRAM 1.50 GB" in gpu_text
+    assert "not recommended" not in gpu_text
+    assert "cuda  batch 4  recommended" in gpu_text
+
+    cpu_text = format_status(
+        TrainStatus(
+            eta_s=None,
+            loss=None,
+            lr=1e-3,
+            steps_per_sec=0.0,
+            memory_bytes=2 * 1024 * 1024,
+            memory_kind="ram",
+            device="cpu",
+            batch=1,
+            recommended=False,
+            step=0,
+            steps=4,
+        )
+    )
+    assert "time left --" in cpu_text
+    assert "loss --" in cpu_text
+    assert "steps/s 0.00" in cpu_text
+    assert "RAM 2 MB" in cpu_text
+    assert "cpu  batch 1  not recommended" in cpu_text
+    assert "VRAM" not in cpu_text
+    assert predict_eta_s(0, 10.0, 5) is None
+    assert predict_eta_s(4, 2.0, 4) == 2.0
+    assert steps_per_second(4, 2.0) == 2.0
+
+    window = TrainWindow()
+    window.update(
+        TrainStatus(
+            eta_s=12,
+            loss=1.5,
+            lr=1e-3,
+            steps_per_sec=1.0,
+            memory_bytes=1024 * 1024,
+            memory_kind="ram",
+            device="cpu",
+            batch=1,
+            recommended=False,
+            step=1,
+            steps=3,
+        )
+    )
+    assert "not recommended" in window.lines
+    assert window.available is False
+
+
 def check_trainer_is_offline() -> None:
-    text = (ROOT / "python" / "train" / "train_scene.py").read_text(encoding="utf-8").lower()
-    for bad in ("taskkill", "os.kill", "close_beamng", "quit_beamng", "beamng.disconnect"):
+    files = (
+        ROOT / "python" / "train" / "train_scene.py",
+        ROOT / "python" / "train" / "fit.py",
+        ROOT / "python" / "train" / "status_window.py",
+    )
+    text = "\n".join(path.read_text(encoding="utf-8").lower() for path in files)
+    for bad in (
+        "taskkill",
+        "os.kill",
+        "close_beamng",
+        "quit_beamng",
+        "beamng.disconnect",
+        "flask",
+        "http.server",
+        "socketserver",
+        "fastapi",
+    ):
         assert bad not in text, bad
+    body = inspect.getsource(train_directory)
+    assert body.index("measure_driving_file") < body.index("plan_fit")
+    assert body.index("read_free_vram_bytes") < body.index("plan_fit")
+    assert body.index("plan_fit") < body.index("_optimizer_step")
+    assert "step_dt" in text
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "Soft Esc parked" in readme
     assert "## Alpha 1.7.8" in readme
     assert "1.7.9" not in readme
     assert "2272" in readme
+    assert "free VRAM" in readme
+    assert "not recommended" in readme
 
 
 def main() -> None:
@@ -427,6 +698,7 @@ def main() -> None:
     check_sectors_and_ego_edge()
     check_rate_helpers_and_precision()
     check_assignment_and_planner()
+    check_fit_and_window()
     check_trainer_is_offline()
     check_net_cpu()
     print("test_scene_strip: OK")

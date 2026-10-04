@@ -856,7 +856,7 @@ if torch is not None:
             layers: list[nn.Module] = []
             cin = 3
             for cout in STEM_CHANNELS:
-                # One strip per step, so this is not batch norm.
+                # Batch 1 is a legal step, so this is not batch norm.
                 layers.append(nn.Conv2d(cin, cout, kernel_size=3, stride=2, padding=1, bias=True))
                 layers.append(nn.ReLU(inplace=False))
                 cin = cout
@@ -889,18 +889,32 @@ if torch is not None:
             self.sign_state_head = nn.Linear(hidden, N_SIGNS * len(LAMP_STATES))
             self.sign_valid_head = nn.Linear(hidden, N_SIGNS)
 
-        def initial_state(self, device: Any = None, dtype: Any = None) -> SceneState:
+        def initial_state(self, device: Any = None, dtype: Any = None, batch: int = 1) -> SceneState:
             device = device or torch.device("cpu")
             dtype = dtype or torch.float32
+            width = max(1, int(batch))
             return SceneState(
-                h=torch.zeros(1, 1, GRU_HIDDEN, device=device, dtype=dtype),
-                tokens=torch.zeros(1, RESIDUAL_TOKENS, TOKEN_DIM, device=device, dtype=dtype),
-                mask=torch.zeros(1, RESIDUAL_TOKENS, device=device, dtype=dtype),
+                h=torch.zeros(1, width, GRU_HIDDEN, device=device, dtype=dtype),
+                tokens=torch.zeros(width, RESIDUAL_TOKENS, TOKEN_DIM, device=device, dtype=dtype),
+                mask=torch.zeros(width, RESIDUAL_TOKENS, device=device, dtype=dtype),
             )
 
         def forward(self, strip: Any, dt: Any, state: SceneState) -> tuple[ScenePrediction, SceneState]:
-            """One strip, seconds since the previous strip, and the GRU state."""
+            """One strip, seconds since the previous strip, and the GRU state.
+
+            Planner tensors have no batch dimension. A training batch uses
+            ``forward_batch`` and keeps the leading dimension.
+            """
             image = _strip_nchw(strip)
+            pred, new_state = self._forward_batched(image, dt, state)
+            return _prediction_at(pred, 0), new_state
+
+        def forward_batch(self, strip: Any, dt: Any, state: SceneState) -> tuple[ScenePrediction, SceneState]:
+            """Several strips in one step. Outputs keep the batch dimension."""
+            image = _strip_nchw(strip, allow_batch=True)
+            return self._forward_batched(image, dt, state)
+
+        def _forward_batched(self, image: Any, dt: Any, state: SceneState) -> tuple[ScenePrediction, SceneState]:
             state = _state_on(state, image)
             token = self._token(image)
             dt_col = _dt_column(dt, image)
@@ -913,8 +927,7 @@ if torch is not None:
             residual = (new_tokens * new_mask.unsqueeze(-1)).sum(dim=1) / denom
             # The last 8 tokens are only this residual. They have no head of their own.
             feat = gru_out[:, 0, :] + residual
-            pred = _heads(self, feat[0])
-            return pred, SceneState(h=h_new, tokens=new_tokens, mask=new_mask)
+            return _heads_batch(self, feat), SceneState(h=h_new, tokens=new_tokens, mask=new_mask)
 
         def _token(self, image: Any) -> Any:
             parts = []
@@ -925,20 +938,24 @@ if torch is not None:
                 parts.append(self.stem(crop))
             return torch.cat(parts, dim=-1).unsqueeze(1)
 
-    def _heads(net: SceneNet, feat: Any) -> ScenePrediction:
+    def _heads_batch(net: SceneNet, feat: Any) -> ScenePrediction:
+        width = int(feat.shape[0])
         return ScenePrediction(
-            lanes=net.lane_head(feat).view(N_LANES, LANE_POINTS, 2),
-            lane_valid=torch.sigmoid(net.lane_valid_head(feat)),
-            curbs=net.curb_head(feat).view(N_CURBS, LANE_POINTS, 2),
-            curb_valid=torch.sigmoid(net.curb_valid_head(feat)),
-            objects=net.object_head(feat).view(N_OBJECTS, OBJECT_FEAT),
-            object_class=net.object_class_head(feat).view(N_OBJECTS, len(OBJECT_CLASSES)),
-            object_valid=torch.sigmoid(net.object_valid_head(feat)),
-            signs=net.sign_head(feat).view(N_SIGNS, SIGN_FEAT),
-            sign_class=net.sign_class_head(feat).view(N_SIGNS, len(SIGN_CLASSES)),
-            sign_state=net.sign_state_head(feat).view(N_SIGNS, len(LAMP_STATES)),
-            sign_valid=torch.sigmoid(net.sign_valid_head(feat)),
+            lanes=net.lane_head(feat).view(width, N_LANES, LANE_POINTS, 2),
+            lane_valid=torch.sigmoid(net.lane_valid_head(feat)).view(width, N_LANES),
+            curbs=net.curb_head(feat).view(width, N_CURBS, LANE_POINTS, 2),
+            curb_valid=torch.sigmoid(net.curb_valid_head(feat)).view(width, N_CURBS),
+            objects=net.object_head(feat).view(width, N_OBJECTS, OBJECT_FEAT),
+            object_class=net.object_class_head(feat).view(width, N_OBJECTS, len(OBJECT_CLASSES)),
+            object_valid=torch.sigmoid(net.object_valid_head(feat)).view(width, N_OBJECTS),
+            signs=net.sign_head(feat).view(width, N_SIGNS, SIGN_FEAT),
+            sign_class=net.sign_class_head(feat).view(width, N_SIGNS, len(SIGN_CLASSES)),
+            sign_state=net.sign_state_head(feat).view(width, N_SIGNS, len(LAMP_STATES)),
+            sign_valid=torch.sigmoid(net.sign_valid_head(feat)).view(width, N_SIGNS),
         )
+
+    def _prediction_at(pred: ScenePrediction, index: int) -> ScenePrediction:
+        return ScenePrediction(**{name: getattr(pred, name)[index] for name in OUTPUT_FIELDS})
 
     def _letterbox_wide(crop: Any) -> Any:
         import torch.nn.functional as functional
@@ -950,7 +967,7 @@ if torch is not None:
         out[:, :, y0 : y0 + nh, x0 : x0 + nw] = resized
         return out
 
-    def _strip_nchw(strip: Any) -> Any:
+    def _strip_nchw(strip: Any, *, allow_batch: bool = False) -> Any:
         if not torch.is_tensor(strip):
             strip = torch.from_numpy(np.ascontiguousarray(strip))
         if strip.dim() == 3 and strip.shape[0] == 3:
@@ -959,8 +976,12 @@ if torch is not None:
             strip = strip.permute(2, 0, 1).unsqueeze(0)
         elif strip.dim() == 4 and strip.shape[-1] == 3:
             strip = strip.permute(0, 3, 1, 2)
-        if strip.shape[0] != 1 or strip.shape[1] != 3 or tuple(strip.shape[-2:]) != (CANVAS_H, CANVAS_W):
-            raise ValueError(f"strip must be 1x3x{CANVAS_H}x{CANVAS_W}, got {tuple(strip.shape)}")
+        width = int(strip.shape[0]) if strip.dim() == 4 else 0
+        spatial_ok = strip.dim() == 4 and int(strip.shape[1]) == 3 and tuple(strip.shape[-2:]) == (CANVAS_H, CANVAS_W)
+        batch_ok = width == 1 if not allow_batch else width >= 1
+        if not spatial_ok or not batch_ok:
+            want = f"Bx3x{CANVAS_H}x{CANVAS_W}" if allow_batch else f"1x3x{CANVAS_H}x{CANVAS_W}"
+            raise ValueError(f"strip must be {want}, got {tuple(strip.shape)}")
         if strip.dtype == torch.uint8:
             strip = strip.float() / 255.0
         else:
@@ -970,19 +991,32 @@ if torch is not None:
         return strip
 
     def _dt_column(dt: Any, image: Any) -> Any:
+        width = int(image.shape[0])
         if not torch.is_tensor(dt):
-            value = 0.0 if dt is None else float(dt)
-            dt = torch.tensor(value, device=image.device, dtype=image.dtype)
+            if isinstance(dt, (list, tuple)):
+                dt = torch.tensor(list(dt), device=image.device, dtype=image.dtype)
+            else:
+                value = 0.0 if dt is None else float(dt)
+                dt = torch.full((width,), value, device=image.device, dtype=image.dtype)
         else:
             dt = dt.to(device=image.device, dtype=image.dtype)
-        return dt.reshape(1, 1, 1)
+        dt = dt.reshape(-1)
+        if int(dt.numel()) == 1 and width != 1:
+            dt = dt.expand(width)
+        if int(dt.numel()) != width:
+            raise ValueError(f"dt length {int(dt.numel())} does not match batch {width}")
+        return dt.reshape(width, 1, 1)
 
     def _state_on(state: SceneState, image: Any) -> SceneState:
-        return SceneState(
+        width = int(image.shape[0])
+        moved = SceneState(
             h=state.h.to(device=image.device, dtype=image.dtype),
             tokens=state.tokens.to(device=image.device, dtype=image.dtype),
             mask=state.mask.to(device=image.device, dtype=image.dtype),
         )
+        if int(moved.h.shape[1]) != width or int(moved.tokens.shape[0]) != width or int(moved.mask.shape[0]) != width:
+            raise ValueError(f"state batch does not match strips {width}")
+        return moved
 
     class _OnnxScene(nn.Module):
         def __init__(self, net: SceneNet) -> None:
@@ -1024,6 +1058,9 @@ else:
             raise ImportError("PyTorch is not installed")
 
         def forward(self, *_args: Any, **_kwargs: Any) -> Any:
+            raise ImportError("PyTorch is not installed")
+
+        def forward_batch(self, *_args: Any, **_kwargs: Any) -> Any:
             raise ImportError("PyTorch is not installed")
 
     def export_scene_onnx(path: Path | str, net: Any = None) -> Path:

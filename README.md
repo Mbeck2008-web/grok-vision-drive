@@ -17,7 +17,7 @@ Canonical pin **1.7.5** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Un
 - **point** bumps (`1.7.x`) = fixes / small UI
 - **main alpha** bump (`1.x.0`) = features / core / UI overhaul
 
-## Recent changes (alpha 1.7.4)
+## Recent changes (alpha 1.7.5)
 
 Catch-up from **1.0.1**. Each feature merge since that pin is one main step. The throttle fix is the point in between. Live Alt+G, Tech 8-cam, FFB, and QSV stay **UNPROVEN**.
 

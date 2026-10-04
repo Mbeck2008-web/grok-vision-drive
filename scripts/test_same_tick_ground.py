@@ -173,6 +173,7 @@ def _check_same_tick_stitch() -> None:
 
     reads: list[str] = []
     blank = {"on": False}
+    blank_ids: set[str] = set()
     colour = {"n": 0}
 
     class Cam:
@@ -195,7 +196,7 @@ def _check_same_tick_stitch() -> None:
         def stream_raw(self):
             reads.append(self.name)
             img = np.zeros((8, 8, 3), dtype=np.uint8)
-            if not blank["on"]:
+            if not blank["on"] and self.name not in blank_ids:
                 img[0, 0, 1] = 40 + (colour["n"] % 200)
                 img[1, 1, 1] = 20
             return {"colour": img}
@@ -274,6 +275,31 @@ def _check_same_tick_stitch() -> None:
         st2 = stitch_frames(bundle_tick_frames(second))
         assert not np.array_equal(st.bgr, st2.bgr)
 
+        # One empty buffer stays missing. The other seven from this tick are
+        # published. A cached picture for the empty id is not the stitch.
+        cached_rear = np.full((8, 8, 3), 17, dtype=np.uint8)
+        cached_rear[0, 0, 2] = 200
+        be._cache_frames["rear"] = cached_rear
+        be._cache_ts["rear"] = 1.0
+        blank_ids.add("gvd_rear")
+        partial = be.grab()
+        blank_ids.clear()
+        assert partial.health["rear"] == CamHealth.MISSING
+        assert "rear" not in partial.frames
+        for cid in CAM_IDS:
+            if cid == "rear":
+                continue
+            assert partial.health[cid] == CamHealth.OK, cid
+            assert int(partial.frames[cid].max()) > 0, cid
+        partial_tick = bundle_tick_frames(partial)
+        assert "rear" not in partial_tick
+        assert set(CAM_IDS) - {"rear"} <= set(partial_tick)
+        partial_stitch = stitch_frames(partial_tick)
+        rear_sec = next(sec for sec in partial_stitch.sectors if sec.cam_id == "rear")
+        assert rear_sec.present is False
+        assert int(partial_stitch.bgr[:, rear_sec.x0 : rear_sec.x1].max()) == 0
+        assert all(sec.present for sec in partial_stitch.sectors if sec.cam_id != "rear")
+
         sentinel = np.full((8, 8, 3), 17, dtype=np.uint8)
         sentinel[0, 0, 2] = 200
         for cid in CAM_IDS:
@@ -298,7 +324,10 @@ def _check_same_tick_stitch() -> None:
         rear_sec = next(sec for sec in dropped.sectors if sec.cam_id == "rear")
         assert rear_sec.present is False
 
-        # A slow narrow read holds the one socket after main has already landed.
+        # BeamNG limit: one GE socket. stream_raw is shared memory and is not
+        # that socket, so a narrow read still running does not drop the cameras
+        # that already returned a colour frame on this tick. The late narrow
+        # bytes are not published as this tick, and a cached tile is not either.
         narrow = be._sensors["narrow"]
 
         def _slow_narrow():
@@ -315,14 +344,28 @@ def _check_same_tick_stitch() -> None:
         assert "main" in slow.frames and int(slow.frames["main"].max()) > 0
         assert slow.health["narrow"] == CamHealth.MISSING
         assert "narrow" not in slow.frames
+        assert slow.grab_read_blocked is True
         for cid in ("wide", "pillarL", "pillarR", "repeatL", "repeatR", "rear"):
-            assert cid not in slow.frames, cid
-            assert slow.health[cid] == CamHealth.MISSING, cid
+            assert cid in slow.frames, cid
+            assert int(slow.frames[cid].max()) > 0, cid
+            assert slow.health[cid] == CamHealth.OK, cid
+        slow_tick = bundle_tick_frames(slow)
+        assert "narrow" not in slow_tick
+        assert "main" in slow_tick
+        slow_stitch = stitch_frames(slow_tick)
+        assert next(sec for sec in slow_stitch.sectors if sec.cam_id == "narrow").present is False
+        assert next(sec for sec in slow_stitch.sectors if sec.cam_id == "main").present is True
         waiting = be.grab()
-        assert waiting.frames == {}
-        assert waiting.health["main"] == CamHealth.MISSING
-        if be._io_thread is not None and be._io_thread.is_alive():
-            be._io_thread.join(1.0)
+        assert waiting.health["narrow"] == CamHealth.MISSING
+        assert "narrow" not in waiting.frames
+        assert waiting.health["main"] == CamHealth.OK
+        assert "main" in waiting.frames
+        for cid in ("wide", "pillarL", "pillarR", "repeatL", "repeatR", "rear"):
+            assert waiting.health[cid] == CamHealth.OK, cid
+            assert cid in waiting.frames, cid
+        for thread in list(be._stream_threads.values()):
+            if thread is not None and thread.is_alive():
+                thread.join(1.0)
         be._reap_if_done()
         act.note_soft_esc_engaged(prev)
         if prev_bytes is None:

@@ -175,9 +175,8 @@ def check_tech_yaml() -> None:
         assert int(hitch.get(div_key)) == 16, div_key
     assert (int(hitch.get("wide_grab_phase")), int(hitch.get("narrow_grab_phase")), int(hitch.get("side_grab_phase")), int(hitch.get("repeat_grab_phase")), int(hitch.get("rear_grab_phase"))) == (0, 1, 2, 5, 6)
     assert camera_grab_phase("rear", hitch) == REAR_GRAB_PHASE == 6
-    assert abs(float(by_id["main"].get("update_priority", 0)) - 0.0) < 1e-9
-    assert float(by_id["narrow"].get("update_priority", 0)) > float(by_id["main"].get("update_priority", 0))
-    assert float(by_id["pillarL"].get("update_priority", 0)) >= float(by_id["narrow"].get("update_priority", 0))
+    for cid in CAM_IDS:
+        assert abs(float(by_id[cid].get("update_priority", 1)) - 0.0) < 1e-9, cid
     for spec in rig.get("cameras") or []:
         res = list(spec.get("live_res") or [])
         assert res and max(int(res[0]), int(res[1])) == 640, spec.get("id")
@@ -516,8 +515,8 @@ def check_camera_clip_planes() -> None:
     assert far_hitch_ladder("narrow", 800.0, unique_hz=12.0) == (800.0,)
 
     assert abs(camera_update_priority({"id": "main"}, cid="main") - 0.0) < 1e-9
-    assert camera_update_priority({"id": "narrow"}, cid="narrow") > camera_update_priority({"id": "main"}, cid="main")
-    assert DEFAULT_UPDATE_PRIORITY["rear"] >= DEFAULT_UPDATE_PRIORITY["narrow"]
+    assert camera_update_priority({"id": "narrow"}, cid="narrow") == camera_update_priority({"id": "main"}, cid="main")
+    assert DEFAULT_UPDATE_PRIORITY["rear"] == DEFAULT_UPDATE_PRIORITY["narrow"] == 0.0
 
     narrow_tries = iter_clip_attach_attempts({"id": "narrow", "far_m": 800, "requested_update_time": 0.067})
     assert narrow_tries == [(0.05, 800.0, 0.067)]
@@ -673,16 +672,16 @@ def check_beamngpy_open_passes_near_far() -> None:
             be.open()
         log = buf.getvalue()
         assert "hitch steps narrow:" in log
-        assert "far_m=800@requested_update_time=1" in log
+        assert f"far_m=800@requested_update_time={COMPANION_OFFSCREEN_UPDATE_S:g}" in log
         assert "update_s=-1" not in log
         assert "hitch steps rear:" in log
-        assert "far_m=100@requested_update_time=1" in log
+        assert f"far_m=100@requested_update_time={COMPANION_OFFSCREEN_UPDATE_S:g}" in log
         assert "hitch steps pillarL:" in log
         assert "not resolution" in log
         assert "grab_div main=1" in log
         assert "wide=16" in log
         assert "narrow=16" in log
-        assert "stream_raw offscreen requested_update_time 1" in log
+        assert f"stream_raw offscreen requested_update_time {COMPANION_OFFSCREEN_UPDATE_S:g}" in log
         assert "rear=16" in log
         assert "depth/semantic OFF" in log
         names = [n for n, _ in captured]
@@ -693,9 +692,10 @@ def check_beamngpy_open_passes_near_far() -> None:
         assert by["gvd_wide"]["near_far_planes"] == (0.05, 300.0)
         assert by["gvd_narrow"]["requested_update_time"] == COMPANION_OFFSCREEN_UPDATE_S
         assert by["gvd_main"]["requested_update_time"] == 0.067
+        assert by["gvd_narrow"]["requested_update_time"] == by["gvd_main"]["requested_update_time"]
         assert by["gvd_wide"]["requested_update_time"] == COMPANION_OFFSCREEN_UPDATE_S
         assert by["gvd_main"]["update_priority"] == 0.0
-        assert by["gvd_narrow"]["update_priority"] > by["gvd_main"]["update_priority"]
+        assert by["gvd_narrow"]["update_priority"] == by["gvd_main"]["update_priority"]
         assert read_camera_update_priority(be._sensors["main"]) == 0.0
         assert priority_highest_is_zero(be._sensors["main"], 0.0)
         assert invert_update_priority(0.0) == 1.0
@@ -2481,11 +2481,8 @@ def check_adhoc_companions_do_not_block_or_pile() -> None:
         be.session.attach_vehicle_sensors = lambda: {}  # type: ignore[method-assign]
         be.open()
         assert set(be._sensors) == set(CAM_IDS)
-        assert cams["gvd_main"].max_pending is None
         for cid in CAM_IDS:
-            if cid == "main":
-                continue
-            assert cams[f"gvd_{cid}"].max_pending == 1, cid
+            assert cams[f"gvd_{cid}"].max_pending is None, cid
 
         durations: list[float] = []
         max_inflight = 0
@@ -2550,26 +2547,33 @@ def check_adhoc_companions_do_not_block_or_pile() -> None:
         assert time.perf_counter() - t0 < 0.25, time.perf_counter() - t0
         assert blocked.grab_read_blocked is True
         assert SlowMain.n == 1
-        # Main is read first. A slow main holds the socket, so main and every
-        # companion on this tick are missing. An older picture is not filled in.
+        # stream_raw is shared memory, not the one GE socket. A main read that
+        # is still running leaves main missing. Companions that rendered on
+        # this tick stay in the bundle. An older picture is not filled in.
         assert "main" not in blocked.frames
         assert blocked.health["main"] == CamHealth.MISSING
         for cid in ("narrow", "wide", "pillarL", "pillarR", "repeatL", "repeatR", "rear"):
-            assert cid not in blocked.frames, cid
-            assert blocked.health[cid] == CamHealth.MISSING, cid
+            assert cid in blocked.frames, cid
+            assert int(blocked.frames[cid].max()) > 0, cid
+            assert blocked.health[cid] == CamHealth.OK, cid
         t1 = time.perf_counter()
         skipped = be.grab()
         assert time.perf_counter() - t1 < 0.1
         assert SlowMain.n == 1
         assert skipped.grab_read_blocked is True
-        assert skipped.frames == {}
+        assert "main" not in skipped.frames
+        assert skipped.health["main"] == CamHealth.MISSING
+        for cid in ("narrow", "wide", "pillarL", "pillarR", "repeatL", "repeatR", "rear"):
+            assert cid in skipped.frames, cid
+            assert skipped.health[cid] == CamHealth.OK, cid
         time.sleep(0.7)
         painted = be.grab()
         assert SlowMain.n == 2
         assert "main" not in painted.frames
         assert painted.health["main"] == CamHealth.MISSING
-        assert "narrow" not in painted.frames
-        assert painted.health["narrow"] == CamHealth.MISSING
+        assert "narrow" in painted.frames
+        assert int(painted.frames["narrow"].max()) > 0
+        assert painted.health["narrow"] == CamHealth.OK
         time.sleep(0.7)
         if be._io_thread is not None and be._io_thread.is_alive():
             be._io_thread.join(1.0)

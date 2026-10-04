@@ -58,7 +58,7 @@ The settled game view. Soft Esc parked.
 
 ![rear](docs/cams/rear.jpg)
 
-## Recent changes (alpha 1.7.9)
+## Recent changes (alpha 1.7.10)
 
 Catch-up from **1.0.1**. Each feature merge since that pin is one main step. The throttle fix is the point in between. Live Alt+G, Tech 8-cam, FFB, and QSV stay **UNPROVEN**.
 
@@ -150,11 +150,15 @@ Fender repeaters move closer to the body, lower, and slightly back. repeatL is X
 
 One supervisor tick reads all eight cameras, then builds the stitch. A camera from an older tick is not reused. Pillar, repeater, and rear lane pixels use that camera's pose, so a side pixel lands beside the car and a rear pixel lands behind it. The steer tick can use those points. Drawn lane lines follow the real points past the blue path and stop where the lane cannot be seen or predicted.
 
-## Alpha 1.7.9
+## 1.7.10 same-tick cameras
+
+All eight Tech cameras are asked to update offscreen on the same period as main. A grab reads each camera's shared memory on that tick. A camera whose buffer is empty, or whose own read is still running, stays missing. The other cameras from that tick are still published. An older picture is not put in the stitch. The hitch numbers do not skip a camera. The game view is not flashed to force a frame.
+
+## Alpha 1.7.10
 
 This is **alpha** — may break / not work; improves with fixes.
 
-Canonical pin **1.7.9** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Untagged retail zips use `1.7.9-alpha-<sha>`.
+Canonical pin **1.7.10** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Untagged retail zips use `1.7.10-alpha-<sha>`.
 
 **Versioning** (this line stays **alpha** until a later non-alpha release):
 
@@ -177,9 +181,9 @@ With a blue path in the frame, a drawn lane follows its own points past that pat
 
 ### Companion cameras and colour
 
-Each grab reads all eight cameras from shared memory on that tick. A camera that was not read this tick is missing. An older frame is not reused. A zero buffer is not stored.
+Each grab reads all eight cameras from shared memory on that tick. Yaml `-1` is the hitch label. The sensor `requested_update_time` is 0.067 on every id, and `update_priority` is 0. A camera that was not read this tick is missing. A read still running after 50 ms leaves that id missing and does not drop the cameras that already returned colour. Those late bytes are not this tick. An older frame is not reused. A zero buffer is not stored.
 
-Companion cameras are not requested with an ad-hoc render. That render steps the game view's exposure for one frame, and the shadows go bright blue. Companions update offscreen. The grab reads their shared memory.
+Companion cameras are not requested with an ad-hoc render. That render steps the game view's exposure for one frame, and the shadows go bright blue. Companions update offscreen on main's period. The grab reads their shared memory. Attach does not cap a companion's pending GPU requests.
 
 The companion check runs before the tone curve. A buffer that is both brighter and bluer than the settled frame, by 18 levels on each, is not stored. Main is not put through that check. A washed companion that is not that flash is tone-matched and stored.
 

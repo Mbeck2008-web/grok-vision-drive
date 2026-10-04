@@ -10,12 +10,14 @@
 # Every supervisor tick reads all eight cameras before the stitch is built.
 # The hitch div/phase keys below name the old slots. They do not skip a camera.
 # Far / GPU (stream_raw for every cam; never is_streaming=False; never ad-hoc):
-#   Yaml -1 attaches the sensor offscreen. Python reads every camera each tick.
-#   SendAdHocRequestCamera is not sent. That request flashes the game view.
-#   narrow: 800 @ -1     priority 0.5   (hitch read; next far hitch 400 only if live unique-frame Hz <10)
-#   main:   300 @ 0.067  priority 0.0
-#   wide:   300 @ -1     priority 0.5
-#   pillarL / pillarR / repeatL / repeatR / rear: 100 @ -1
+#   Yaml -1 is the hitch label. The sensor requested_update_time is 0.067,
+#   the same offscreen period as main, so each colour buffer updates with main.
+#   A negative rate is not sent. SendAdHocRequestCamera flashes the game view.
+#   update_priority is 0 on every id (0 = highest).
+#   narrow: 800 @ -1     priority 0   (next far hitch 400 only if live unique-frame Hz <10)
+#   main:   300 @ 0.067  priority 0
+#   wide:   300 @ -1     priority 0
+#   pillarL / pillarR / repeatL / repeatR / rear: 100 @ -1  priority 0
 # Optional per-cam near_far_planes: [near_m, far_m] still clamped to the role band.
 # Depth OFF. Div/phase numbers are not the live skip schedule.
 origin_offset: [0.0, 0.0, 0.0]
@@ -54,7 +56,7 @@ cameras:
     live_res: [640, 480]
     far_m: 800
     requested_update_time: -1
-    update_priority: 0.5
+    update_priority: 0.0
   - id: main
     role: primary_forward
     note: "toy analogue of the primary forward windshield cam; alias cam_main"
@@ -79,7 +81,7 @@ cameras:
     live_res: [640, 360]
     far_m: 300
     requested_update_time: -1
-    update_priority: 0.5
+    update_priority: 0.0
   - id: pillarL
     role: forward_side_left
     note: "toy analogue of a left B-pillar cam aimed across the corner, not down the lane"
@@ -91,7 +93,7 @@ cameras:
     live_res: [640, 480]
     far_m: 100
     requested_update_time: -1
-    update_priority: 1.0
+    update_priority: 0.0
   - id: pillarR
     role: forward_side_right
     note: "toy analogue of a right B-pillar cam aimed across the corner, not down the lane"
@@ -103,7 +105,7 @@ cameras:
     live_res: [640, 480]
     far_m: 100
     requested_update_time: -1
-    update_priority: 1.0
+    update_priority: 0.0
   - id: repeatL
     role: rear_side_left
     note: "toy analogue of a left fender repeater aimed back along the adjacent lane; the ego body is only at the frame edge"
@@ -115,7 +117,7 @@ cameras:
     live_res: [640, 480]
     far_m: 100
     requested_update_time: -1
-    update_priority: 1.0
+    update_priority: 0.0
   - id: repeatR
     role: rear_side_right
     note: "toy analogue of a right fender repeater aimed back along the adjacent lane; the ego body is only at the frame edge"
@@ -127,7 +129,7 @@ cameras:
     live_res: [640, 480]
     far_m: 100
     requested_update_time: -1
-    update_priority: 1.0
+    update_priority: 0.0
   - id: rear
     role: rear_traffic
     note: "toy analogue of a rear license-plate cam"
@@ -139,4 +141,4 @@ cameras:
     live_res: [640, 360]
     far_m: 100
     requested_update_time: -1
-    update_priority: 1.0
+    update_priority: 0.0

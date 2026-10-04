@@ -76,6 +76,7 @@ from python.train.scene_net import (  # noqa: E402
     export_scene_onnx,
     labels_from_tech,
     letterbox_rect,
+    live_strip_fields,
     loss_mask,
     memory_windows,
     moment_ok,
@@ -729,6 +730,9 @@ def check_recorded_hours_minutes() -> None:
         assert window.losses == []
         assert read_recorded_seconds(empty) == 0.0
         assert format_recorded_hm(0) == "0 hours 0 minutes"
+        assert format_recorded_hm(3600) == "1 hour 0 minutes"
+        assert format_recorded_hm(60) == "0 hours 1 minute"
+        assert format_recorded_hm(3660) == "1 hour 1 minute"
         assert (empty / "notes.txt").read_bytes() == b"leave-me"
         assert not (empty / "state.jsonl").exists()
         assert not (empty / "meta.json").exists()
@@ -743,7 +747,7 @@ def check_recorded_hours_minutes() -> None:
         before = state.read_bytes()
         assert abs(read_recorded_seconds(folder) - 3720.0) < 1e-6
         window.load_folder(folder)
-        assert "1 hours 2 minutes" in window.lines
+        assert "1 hour 2 minutes" in window.lines
         assert window.recorded_s == read_recorded_seconds(folder)
         shown = format_status(
             TrainStatus(
@@ -761,7 +765,7 @@ def check_recorded_hours_minutes() -> None:
                 recorded_s=window.recorded_s,
             )
         )
-        assert shown.splitlines()[0] == "recorded 1 hours 2 minutes"
+        assert shown.splitlines()[0] == "recorded 1 hour 2 minutes"
         window.update(
             TrainStatus(
                 eta_s=10,
@@ -777,7 +781,7 @@ def check_recorded_hours_minutes() -> None:
                 steps=2,
             )
         )
-        assert window.lines.splitlines()[0] == "recorded 1 hours 2 minutes"
+        assert window.lines.splitlines()[0] == "recorded 1 hour 2 minutes"
         assert state.read_bytes() == before
         assert planted.read_bytes() == b"keep-jpeg"
         assert not (folder / "meta.json").exists()
@@ -786,7 +790,7 @@ def check_recorded_hours_minutes() -> None:
         with state.open("a", encoding="utf-8") as fh:
             fh.write(extra)
         window.refresh_recorded()
-        assert "1 hours 3 minutes" in window.lines
+        assert "1 hour 3 minutes" in window.lines
         assert abs(window.recorded_s - 3780.0) < 1e-6
         assert state.read_bytes().startswith(before)
         assert planted.read_bytes() == b"keep-jpeg"
@@ -1182,7 +1186,7 @@ def check_train_panel_loss_graph() -> None:
         assert float(live_patch.mean()) > fill + 5
 
     text = window.lines
-    assert "1 hours 2 minutes" in text
+    assert "1 hour 2 minutes" in text
     assert "time left 1m 30s" in text
     assert "loss 0.8000" in text
     assert "lr 0.001" in text
@@ -1548,6 +1552,91 @@ def check_continual_bptt_and_yaw() -> None:
     assert body.index("plan_fit") < body.index("_optimizer_step")
 
 
+def _readme_offline_ok(text: str) -> bool:
+    """The trainer stays offline on this README and on a 1.7.9 README.
+
+    The 1.7.8 heading is not required. A pin of 1.7.9 is enough.
+    """
+    if "Soft Esc parked" not in text:
+        return False
+    if "2272" not in text or "free VRAM" not in text or "not recommended" not in text:
+        return False
+    return ("1.7.8" in text) or ("1.7.9" in text)
+
+
+def check_live_strip_supervision() -> None:
+    """The live window stores scene labels, and a bad override is gated."""
+    from python.data.strip_writer import StripRecordControl, read_state_jsonl
+    from python.viz.stage import VizUI
+
+    colors = _colors()
+    frames = _bundle(colors)
+    lanes = [[{"x": -1.75, "y": float(y)} for y in (0, 10, 20)]]
+    signs = [{"cls": "stop_sign", "x": 2.2, "y": 24.0, "state": "unknown"}]
+    good = live_strip_fields(
+        lanes=lanes,
+        tracks=[{"cls": "car", "x": 0.1, "y": 18.0}],
+        signs=signs,
+        steer=0.1,
+        throttle=0.2,
+        brake=0.0,
+        override_reason="none",
+    )
+    bad = live_strip_fields(
+        lanes=lanes,
+        signs=signs,
+        steer=0.4,
+        throttle=0.0,
+        brake=0.8,
+        override_reason="player_brake",
+    )
+    assert good["tech"]["lanes"] == lanes
+    assert good["tech"]["signs"][0]["cls"] == "stop_sign"
+    assert "reason" not in good["wheel"]
+    assert bad["pedals"]["reason"] == "player_brake"
+    steer_mark = live_strip_fields(lanes=lanes, steer=0.2, override_reason="player_steer")
+    assert steer_mark["wheel"]["reason"] == "player_steer"
+    assert live_strip_fields(steer=0.0)["tech"] is None
+
+    body = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
+    assert "live_strip_fields(" in body
+    assert 'tech=fields["tech"]' in body
+
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = Path(tmp) / "live"
+        ui = VizUI()
+        ui.record = StripRecordControl(destination=str(folder))
+        ui.record.start()
+        ui.feed_strip(
+            frames,
+            timestamps=_stamps(frames, 1.0),
+            t=1.0,
+            engaged=False,
+            ego={"speed_mps": 8.0},
+            wheel=good["wheel"],
+            pedals=good["pedals"],
+            tech=good["tech"],
+        )
+        ui.feed_strip(
+            frames,
+            timestamps=_stamps(frames, 1.2),
+            t=1.2,
+            engaged=True,
+            ego={"speed_mps": 8.0},
+            wheel=bad["wheel"],
+            pedals=bad["pedals"],
+            tech=bad["tech"],
+        )
+        rows = read_state_jsonl(folder / "state.jsonl")
+    assert len(rows) == 2
+    assert rows[0]["tech"]["lanes"][0][0]["x"] == -1.75
+    assert rows[0]["tech"]["signs"][0]["cls"] == "stop_sign"
+    assert loss_mask(rows[0])
+    assert rows[1]["pedals"]["reason"] == "player_brake"
+    assert not loss_mask(rows[1])
+    assert sum(1 for row in rows if loss_mask(row)) >= 1
+
+
 def check_trainer_is_offline() -> None:
     files = (
         ROOT / "python" / "train" / "train_scene.py",
@@ -1573,12 +1662,12 @@ def check_trainer_is_offline() -> None:
     assert body.index("plan_fit") < body.index("_optimizer_step")
     assert "step_dt" in text
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "Soft Esc parked" in readme
-    assert "## Alpha 1.7.8" in readme
-    assert "1.7.9" not in readme
-    assert "2272" in readme
-    assert "free VRAM" in readme
-    assert "not recommended" in readme
+    assert _readme_offline_ok(readme)
+    # Main pins 1.7.9. That README has no 1.7.8 heading, and this check allows it.
+    later = readme.replace("## Alpha 1.7.8", "## Alpha 1.7.9").replace("1.7.8", "1.7.9")
+    assert "## Alpha 1.7.8" not in later
+    assert "1.7.9" in later
+    assert _readme_offline_ok(later)
 
 
 def main() -> None:
@@ -1596,6 +1685,7 @@ def main() -> None:
     check_parameter_count_hand_sum()
     check_pause_checkpoint_roundtrip()
     check_continual_bptt_and_yaw()
+    check_live_strip_supervision()
     check_trainer_is_offline()
     check_net_cpu()
     print("test_scene_strip: OK")

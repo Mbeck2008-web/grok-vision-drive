@@ -147,12 +147,17 @@ def read_recorded_seconds(root: Path | str) -> float:
     return sum_recorded_seconds(rows)
 
 
+def _count_unit(count: int, singular: str, plural: str) -> str:
+    name = singular if int(count) == 1 else plural
+    return f"{int(count)} {name}"
+
+
 def format_recorded_hm(seconds: float) -> str:
     """Whole hours and minutes. Seconds within the last minute are not rounded up."""
     whole = int(math.floor(max(0.0, float(seconds)) + 1e-9))
     hours, rem = divmod(whole, 3600)
     minutes = rem // 60
-    return f"{hours} hours {minutes} minutes"
+    return f"{_count_unit(hours, 'hour', 'hours')} {_count_unit(minutes, 'minute', 'minutes')}"
 
 
 _NO_SESSION = object()

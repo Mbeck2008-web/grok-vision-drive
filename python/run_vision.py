@@ -49,6 +49,7 @@ from python.perception.road_model import lanes_ext_for_live, road_edges
 from python.viz.debug_draw import cabin_drive_word
 from python.viz.review_log import ReviewCapture
 from python.viz.nerd import image_point_from_window_mouse
+from python.train.scene_net import live_strip_fields
 from python.viz.stage import drawn_lane_records
 from python.sensors.cameras import CAM_IDS, CamHealth
 from python.runtime.debug_opts import apply_to_command, apply_to_perception
@@ -944,17 +945,24 @@ def main() -> None:
             )
 
             # Strip training is its own switch. Engage does not start or stop it.
+            fields = live_strip_fields(
+                lanes=pout.lanes_bev,
+                tracks=pout.tracks,
+                signs=pout.signs,
+                steer=float(steer_in or 0.0),
+                throttle=float(throttle_in or 0.0),
+                brake=float(brake_in or 0.0),
+                override_reason=ovr.reason,
+            )
             ui.feed_strip(
                 getattr(bundle, "frames", None),
                 timestamps=getattr(bundle, "timestamps", None),
                 t=time.time(),
                 engaged=bool(engaged),
                 ego={"speed_mps": float(ego_v or 0.0)},
-                wheel={"steer": float(steer_in or 0.0)},
-                pedals={
-                    "throttle": float(throttle_in or 0.0),
-                    "brake": float(brake_in or 0.0),
-                },
+                wheel=fields["wheel"],
+                pedals=fields["pedals"],
+                tech=fields["tech"],
             )
 
             # M4 ring + triggers

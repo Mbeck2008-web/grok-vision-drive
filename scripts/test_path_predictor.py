@@ -23,7 +23,6 @@ sys.path.insert(0, str(ROOT))
 import yaml  # noqa: E402
 
 from python.control.actuate import (  # noqa: E402
-    TECH_DRIVE_GEAR,
     TECH_SHIFT_MODE,
     BeamNGPyActuator,
     note_soft_esc_engaged,
@@ -411,7 +410,7 @@ def check_drive_gear_socket_and_override(cmd) -> None:
         drove = veh.calls[0]
         assert abs(drove["steering"] - fresh.steer) < 1e-6
         assert abs(drove["throttle"] - fresh.throttle) < 1e-6
-        assert int(drove["gear"]) >= TECH_DRIVE_GEAR
+        assert "gear" not in drove
         # Electrics still say the wheel is left. The command is the path's right turn.
         assert drove["steering"] != veh.sensors["electrics"]["steering_input"]
         assert drove["steering"] > 0.3 and veh.sensors["electrics"]["steering_input"] < 0.0

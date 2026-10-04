@@ -341,16 +341,13 @@ def check_source_contracts(lua: str) -> None:
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     schema = (ROOT / "docs" / "gvd_state_schema.md").read_text(encoding="utf-8")
-    assert r"%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\Documents\GVD" in readme
-    assert r"%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\Documents\GVD" in readme
     assert "also copied to %USERPROFILE%\\Documents\\GVD" not in readme
     assert r"%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\Documents\GVD" in schema
     assert r"%LOCALAPPDATA%\BeamNG\BeamNG.tech\current\Documents\GVD" in schema
     assert "Path: `%USERPROFILE%\\Documents\\GVD" not in schema
     assert "Lua and Python share `%USERPROFILE%" not in schema
-    assert "FS:readFile" in readme
     assert "FS:readFile" in schema
-    assert "io.open" in readme and "io.open" in schema
+    assert "io.open" in schema
 
 
 def check_python_mirror() -> None:

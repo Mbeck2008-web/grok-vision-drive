@@ -29,7 +29,10 @@ FORWARD_CAM_IDS = frozenset(("narrow", "main", "wide"))
 DEFAULT_NEAR_M = 0.05
 BNGPY_DEFAULT_FAR_M = 100.0
 FORWARD_UPDATE_S = 0.067  # ~15 Hz suggestion to the Tech sensor manager
-ON_DEMAND_UPDATE_S = -1.0  # no auto GPU update; ad-hoc poll only (sides/rear)
+ON_DEMAND_UPDATE_S = -1.0  # yaml: sample on the hitch, not every tick
+# Offscreen sensor period when yaml says on-demand. Not an ad-hoc viewport render.
+# SendAdHocRequestCamera steps the game view's exposure for one frame (blue shadows).
+COMPANION_OFFSCREEN_UPDATE_S = 1.0
 SIDE_UPDATE_S = ON_DEMAND_UPDATE_S
 REAR_UPDATE_S = ON_DEMAND_UPDATE_S
 MAIN_GRAB_DIV = 1
@@ -40,11 +43,12 @@ MAIN_GRAB_DIV = 1
 # companions and it does not freeze the first buffer. A zero colour buffer is
 # unrendered, not a picture: the slot stays missing until a real frame arrives,
 # then CAMS keeps that last frame on the ticks that do not poll the cam.
-# Main is still the only stream_raw, every tick.
-# On-demand companions (requested_update_time < 0) do not render from poll()
-# or stream_raw() — BeamNGpy documents that a negative rate may have taken no
-# readings. Those cams get one in-flight ad-hoc request. A read that exceeds
-# CAM_READ_BUDGET_S does not stall the grab; the last real frame stays painted.
+# Main is stream_raw every tick. A live companion is stream_raw on its hitch slot.
+# Yaml -1 is the hitch, not a viewport render. The sensor is attached at
+# COMPANION_OFFSCREEN_UPDATE_S and read with stream_raw. SendAdHocRequestCamera
+# is not used: that render steps the game view's exposure for one frame.
+# A read that exceeds CAM_READ_BUDGET_S does not stall the grab; the last
+# real frame stays painted.
 CAM_READ_BUDGET_S = 0.05
 _OWED_CAP = 7  # one slot per companion; the owed queue cannot grow past the rig
 WIDE_GRAB_DIV = 16
@@ -632,6 +636,19 @@ def iter_clip_attach_attempts(
     return [(near_m, f, rate) for f in far_hitch_ladder(cam_id, far_m)]
 
 
+def sensor_requested_update_s(update_s: float) -> float:
+    """Camera ``requested_update_time`` for a yaml rate.
+
+    Yaml ``-1`` is the hitch. The sensor still renders offscreen at
+    ``COMPANION_OFFSCREEN_UPDATE_S``. A negative rate is not sent: that would
+    need SendAdHocRequestCamera, which flashes the game view.
+    """
+    rate = float(update_s)
+    if rate < 0:
+        return COMPANION_OFFSCREEN_UPDATE_S
+    return rate
+
+
 def beamng_camera_sensor_kwargs(
     *,
     pos: tuple[float, float, float],
@@ -653,8 +670,12 @@ def beamng_camera_sensor_kwargs(
     for callers but never written False.
     """
     _ = streaming  # kept so call sites stay stable; never set is_streaming False
+    # A negative rate would need SendAdHocRequestCamera to get a picture.
+    # That request renders through the game view and flashes exposure for one
+    # frame. The sensor still updates offscreen; GVD only reads it on the hitch.
+    rate = sensor_requested_update_s(update_s)
     return {
-        "requested_update_time": float(update_s),
+        "requested_update_time": rate,
         "update_priority": float(min(1.0, max(0.0, update_priority))),
         "pos": pos,
         "dir": direction,
@@ -686,8 +707,167 @@ def _cam_resolution(cam: Any) -> tuple[int, int] | None:
     return (w, h)
 
 
-def colour_to_bgr(colour: Any, resolution: tuple[int, int] | None = None) -> np.ndarray | None:
-    """RGB(A) / BGRA bytes / array / PIL → BGR uint8. Empty → None."""
+# A daylight colour buffer can sit in the top of the 8-bit range. Pavement
+# and a thin lane stripe are then both white paint, so the stripe is not a
+# separate region. The viewport picture keeps that road near mid gray.
+# Correct it once, here, on the frame that is stored. The lane fit, the
+# model, the CAMS tiles, and the PIP all read that frame. A display dim
+# never reaches the fit. Mid-gray, dark, and all-zero frames stay put.
+_TONE_P40_MIN = 188.0
+_TONE_SPREAD_MAX = 70.0
+_TONE_ANCHOR_PCT = 78.0
+_TONE_TARGET = 136.0
+_TONE_GAMMA_CAP = 9.0
+_TONE_SAT_MAX = 22.0
+# Highway geometry paints the hood from here to the bottom. That panel is
+# low-saturation and can be near white while the asphalt is already mid gray.
+# It is not the road sample.
+_TONE_HOOD_TOP = 0.93
+# The rectangle from 42% to the hood is mostly sky. The road is a triangle
+# under the vanishing point, so the 40th percentile of that rectangle is the
+# sky (186.85 on the test sky, just under the gate). A sky a few levels
+# brighter then sets the curve and crushes a mid-gray road. The sample is
+# this trapezoid: below the vanishing point, inside the sky corners, above
+# the hood.
+_TONE_ROAD_TOP = 0.75
+_TONE_ROAD_TOP_X0 = 0.25
+_TONE_ROAD_TOP_X1 = 0.75
+_TONE_ROAD_BOT_X0 = 0.08
+_TONE_ROAD_BOT_X1 = 0.92
+
+
+def _shadow_luma_blue(bgr: np.ndarray) -> tuple[float, float] | None:
+    """Darker low-saturation pixels: mean luma, and mean (B - R).
+
+    A settled gray road is a small blue excess. The one-frame companion
+    flash is that same shadow, brighter and much bluer. A red/blue channel
+    swap does not do this: a gray pixel stays gray.
+    """
+    if bgr.ndim != 3 or bgr.shape[2] < 3 or bgr.size == 0:
+        return None
+    img = bgr[:, :, :3]
+    if int(img.shape[0]) >= 8:
+        img = img[int(img.shape[0]) * 45 // 100 :]
+    sample = img.astype(np.float32, copy=False)
+    luma = 0.114 * sample[:, :, 0] + 0.587 * sample[:, :, 1] + 0.299 * sample[:, :, 2]
+    blue = sample[:, :, 0] - sample[:, :, 2]
+    if int(luma.size) < 8:
+        return None
+    # Darker pixels are the road shadow. A white lane is brighter and stays out.
+    cut = float(np.percentile(luma, 45))
+    dark = luma <= cut
+    if int(np.count_nonzero(dark)) < 8:
+        dark = np.ones(luma.shape, dtype=bool)
+    return float(luma[dark].mean()), float(blue[dark].mean())
+
+
+def companion_frame_is_flash(new_bgr: np.ndarray, held_bgr: np.ndarray | None) -> bool:
+    """True when this companion buffer is the one bright-blue frame.
+
+    Brightness and the blue shadow are one frame, not two faults. A channel
+    swap is not it. Main is not passed here. No settled frame yet → False.
+    """
+    if held_bgr is None or frame_is_unrendered(held_bgr) or frame_is_unrendered(new_bgr):
+        return False
+    if new_bgr.shape[:2] != held_bgr.shape[:2]:
+        return False
+    new_s = _shadow_luma_blue(new_bgr)
+    held_s = _shadow_luma_blue(held_bgr)
+    if new_s is None or held_s is None:
+        return False
+    new_luma, new_blue = new_s
+    held_luma, held_blue = held_s
+    return (new_luma - held_luma) >= 18.0 and (new_blue - held_blue) >= 18.0
+
+
+def _tone_road_pixels(bgr: np.ndarray) -> np.ndarray:
+    """Road-body pixels above the hood, shape ``(N, 3)``.
+
+    A full-width band in that range counts the sky beside the road. This
+    trapezoid stays on the asphalt.
+    """
+    height = int(bgr.shape[0])
+    width = int(bgr.shape[1])
+    y0 = int(height * _TONE_ROAD_TOP)
+    y1 = int(height * _TONE_HOOD_TOP)
+    if y1 <= y0 + 4 or width < 8:
+        return bgr.reshape(-1, 3)
+    rows = bgr[y0:y1]
+    span = float(max(int(rows.shape[0]) - 1, 1))
+    t = np.arange(int(rows.shape[0]), dtype=np.float32) / span
+    left = width * (_TONE_ROAD_TOP_X0 + t * (_TONE_ROAD_BOT_X0 - _TONE_ROAD_TOP_X0))
+    right = width * (_TONE_ROAD_TOP_X1 + t * (_TONE_ROAD_BOT_X1 - _TONE_ROAD_TOP_X1))
+    xs = np.arange(width, dtype=np.float32)
+    mask = (xs[None, :] >= left[:, None]) & (xs[None, :] < right[:, None])
+    picked = rows[mask]
+    if int(picked.shape[0]) < 32:
+        return rows.reshape(-1, 3)
+    return np.ascontiguousarray(picked)
+
+
+def recover_viewport_tone(bgr: np.ndarray) -> np.ndarray:
+    """Pull a sun-blown colour buffer toward the viewport picture.
+
+    A highlight knee that keeps a fraction of the levels above 140 pulls the
+    road and the stripe together, and the stripe drops through the white-paint
+    cut. A power curve on a near-white, low-contrast road does the opposite:
+    the road lands near mid gray and the few brighter stripe levels stay above
+    that cut. The sample is the road body above the hood, inside the sky
+    corners. A frame whose road is already mid gray is returned as it was.
+    An all-zero buffer is returned as it was.
+    """
+    if not isinstance(bgr, np.ndarray) or bgr.ndim != 3 or bgr.shape[2] != 3:
+        return bgr
+    # Nothing in the white-paint range. Mid gray, dark, and all-zero stay put.
+    if bgr.dtype != np.uint8 or bgr.size == 0 or int(bgr.max()) < int(_TONE_P40_MIN):
+        return bgr
+    pixels = _tone_road_pixels(bgr)
+    if pixels.size == 0:
+        return bgr
+    sample = pixels.astype(np.float32, copy=False)
+    luma = 0.114 * sample[:, 0] + 0.587 * sample[:, 1] + 0.299 * sample[:, 2]
+    # Road body. The 42%–93% rectangle's 40th percentile is the sky, and warm
+    # asphalt sits above the low-sat cut, so either of those samples
+    # gamma-crushes a mid-gray road.
+    if float(np.percentile(luma, 40)) < _TONE_P40_MIN:
+        return bgr
+    hi = sample.max(axis=1)
+    lo = sample.min(axis=1)
+    sat = np.where(hi > 0.0, (hi - lo) * 255.0 / np.maximum(hi, 1.0), 0.0)
+    chosen = luma[sat <= _TONE_SAT_MAX]
+    if int(chosen.size) < max(32, int(luma.size) // 20):
+        chosen = luma.reshape(-1)
+    p40 = float(np.percentile(chosen, 40))
+    anchor = float(np.percentile(chosen, _TONE_ANCHOR_PCT))
+    spread = float(np.percentile(chosen, 90) - p40)
+    if p40 < _TONE_P40_MIN or spread > _TONE_SPREAD_MAX:
+        return bgr
+    x = min(anchor, 250.0) / 255.0
+    y = _TONE_TARGET / 255.0
+    if x <= y or x >= 0.999:
+        return bgr
+    gamma = math.log(y) / math.log(x)
+    if not math.isfinite(gamma) or gamma < 1.05:
+        return bgr
+    gamma = min(_TONE_GAMMA_CAP, gamma)
+    levels = np.arange(256, dtype=np.float32) / 255.0
+    lut = np.clip(np.rint(np.power(levels, gamma) * 255.0), 0, 255).astype(np.uint8)
+    return lut[bgr]
+
+
+def colour_to_bgr(
+    colour: Any,
+    resolution: tuple[int, int] | None = None,
+    *,
+    tone: bool = True,
+) -> np.ndarray | None:
+    """RGB(A) / BGRA bytes / array / PIL → BGR uint8. Empty → None.
+
+    ``tone=True`` matches a sun-blown buffer to the viewport picture on the
+    returned frame. The live store path passes ``tone=False`` so the companion
+    flash check sees the buffer before that curve, then tones only the frame
+    it keeps.
+    """
     if colour is None:
         return None
     arr: np.ndarray | None = None
@@ -721,7 +901,10 @@ def colour_to_bgr(colour: Any, resolution: tuple[int, int] | None = None) -> np.
     rgb = arr[:, :, :3]
     if rgb.dtype != np.uint8:
         rgb = rgb.astype(np.uint8)
-    return np.ascontiguousarray(rgb[:, :, ::-1])
+    bgr = np.ascontiguousarray(rgb[:, :, ::-1])
+    if not tone:
+        return bgr
+    return recover_viewport_tone(bgr)
 
 
 class _IoMark:
@@ -758,7 +941,8 @@ def _reading_colour(images: Any, resolution: tuple[int, int] | None) -> np.ndarr
     if not isinstance(images, dict):
         return None
     colour = images.get("colour") if images.get("colour") is not None else images.get("color")
-    return colour_to_bgr(colour, resolution)
+    # Flash is judged on this buffer. Tone runs later, on the frame that is stored.
+    return colour_to_bgr(colour, resolution, tone=False)
 
 
 def camera_uses_adhoc(cam: Any) -> bool:
@@ -1145,6 +1329,8 @@ class WindowBackend:
         if img.dtype != np.uint8:
             img = img.astype(np.uint8)
         img = resize_long_side(img, self.long_side)
+        if getattr(img, "ndim", 0) == 3 and img.shape[2] == 3 and img.dtype == np.uint8:
+            img = recover_viewport_tone(img)
         ts = time.time()
         frames["main"] = img
         frames["cam_main"] = img
@@ -1294,7 +1480,10 @@ class BeamNGPyBackend:
                 used_near, used_far, used_rate = want_near, want_far, want_rate
                 used_prio = want_prio
                 attempts = iter_clip_attach_attempts(spec, cid=cid, defaults=clip_defaults)
-                step_s = " ".join(f"far_m={try_far:g}@update_s={try_rate:g}" for _n, try_far, try_rate in attempts)
+                step_s = " ".join(
+                    f"far_m={try_far:g}@requested_update_time={sensor_requested_update_s(try_rate):g}"
+                    for _n, try_far, try_rate in attempts
+                )
                 print(f"[GVD] beamngpy Camera hitch steps {cid}: {step_s} (not resolution)")
                 for try_near, try_far, try_rate in attempts:
                     kwargs = beamng_camera_sensor_kwargs(
@@ -1373,7 +1562,10 @@ class BeamNGPyBackend:
         if not self._logged:
             if self._ok:
                 clips = " ".join(f"{k}={v[1]:g}" for k, v in self._clip_planes.items())
-                rates = " ".join(f"{k}={v:g}" for k, v in self._update_s.items())
+                rates = " ".join(
+                    f"{k}={float(self._sensor_kwargs.get(k, {}).get('requested_update_time', v)):g}"
+                    for k, v in self._update_s.items()
+                )
                 prios = " ".join(f"{k}={v:g}" for k, v in self._update_priority.items())
                 print(
                     f"[GVD] beamngpy attached {attached} color Camera(s) from cameras.yaml "
@@ -1381,7 +1573,8 @@ class BeamNGPyBackend:
                     f"update_priority {prios}; "
                     f"grab_div main={self._grab_div['main']} wide={self._grab_div['wide']} "
                     f"narrow={self._grab_div['narrow']} side={self._side_grab_div} "
-                    f"rear={self._rear_grab_div}; stream_raw main; "
+                    f"rear={self._rear_grab_div}; "
+                    f"stream_raw offscreen requested_update_time 1; "
                     f"GVD→BeamNG vehicle-space convert; depth/semantic OFF)."
                 )
             else:
@@ -1668,6 +1861,9 @@ class BeamNGPyBackend:
         if not cid or bgr is None or frame_is_unrendered(bgr):
             return
         bgr = resize_long_side(bgr, self.long_side)
+        if cid != "main" and companion_frame_is_flash(bgr, self._cache_frames.get(cid)):
+            return
+        bgr = recover_viewport_tone(bgr)
         self._cache_frames[cid] = bgr
         self._cache_ts[cid] = time.time()
         sig = frame_signature(bgr)
@@ -1767,6 +1963,12 @@ class BeamNGPyBackend:
                 self._cache_ts.pop(cid, None)
             return
         bgr = resize_long_side(bgr, self.long_side)
+        if cid != "main" and companion_frame_is_flash(bgr, self._cache_frames.get(cid)):
+            # Same bad frame: brighter and blue in the shadows. Keep the settled road.
+            # Judged before the tone curve. The curve itself can raise blue excess.
+            self._reuse_cached(cid, frames, timestamps, health, failed=False)
+            return
+        bgr = recover_viewport_tone(bgr)
         sig = frame_signature(bgr)
         unique = sig != self._frame_sig.get(cid)
         self._store_frame(cid, bgr, ts, frames, timestamps, health)
@@ -1825,14 +2027,25 @@ class BeamNGPyBackend:
         bgr = _reading_colour(images, self._resolution.get(cid)) if isinstance(images, dict) else None
         self._publish_read(cid, bgr, ts, frames, timestamps, health, unique_ids)
 
+    def _reads_shared_memory(self, cid: str, cam: Any) -> bool:
+        """Main, and any live camera that also offers ad-hoc.
+
+        Ad-hoc is a viewport render. stream_raw only reads the offscreen buffer.
+        A legacy companion with poll and no shared memory stays on poll.
+        """
+        if not hasattr(cam, "stream_raw"):
+            return False
+        return cid == "main" or camera_uses_adhoc(cam)
+
     def _bounded_sensor_colour(self, cid: str, cam: Any) -> np.ndarray | None:
-        """stream_raw (main) or poll (legacy companion), bounded by CAM_READ_BUDGET_S."""
+        """stream_raw when the buffer is shared. Legacy poll has no ad-hoc API.
+
+        SendAdHocRequestCamera is not used. It renders on the game view and
+        the exposure flashes blue for one frame.
+        """
         res = self._resolution.get(cid)
 
-        if cid == "main":
-            if not hasattr(cam, "stream_raw"):
-                return None
-
+        if self._reads_shared_memory(cid, cam):
             def _stream() -> Any:
                 try:
                     return cam.stream_raw()
@@ -1879,38 +2092,14 @@ class BeamNGPyBackend:
         unique_ids: list[str] = []
         self._read_blocked = False
         # Soft Esc and Engage share the hitch: main stream_raw every tick, at
-        # most one companion request. Ticks that skip a cam keep its last real
+        # most one companion read. Ticks that skip a cam keep its last real
         # frame for CAMS. A zero buffer is not stored and does not count as OK.
-        # On-demand cams render through one ad-hoc request. poll() on a
-        # negative requested_update_time does not take that reading, and it
-        # can sit on the GE socket for ~0.5–1 s.
+        # Companions are not SendAdHocRequestCamera. That render steps the game
+        # view's exposure for one frame (bright blue shadows). They update
+        # offscreen; this grab only reads shared memory on the hitch.
         soft_esc_main = soft_esc_colour_main_only()
         self._reap_if_done()
-        self._harvest_adhoc(ts, frames, timestamps, health, unique_ids)
-        due_companion = next(
-            (
-                cid
-                for cid in CAM_IDS
-                if cid != "main"
-                and cid in self._sensors
-                and camera_uses_adhoc(self._sensors[cid])
-                and self._grab_this_tick(cid, grab_i)
-            ),
-            None,
-        )
-        send_cid = due_companion if due_companion is not None else (self._owed[0] if self._owed else None)
-        if send_cid is not None:
-            send_cam = self._sensors.get(send_cid)
-            if send_cam is not None and camera_uses_adhoc(send_cam):
-                if self._kick_adhoc(send_cid, send_cam):
-                    companion_polled = True
-                else:
-                    self._owe(send_cid)
         for cid, cam in self._sensors.items():
-            if cid != "main" and camera_uses_adhoc(cam):
-                if cid not in frames:
-                    self._reuse_cached(cid, frames, timestamps, health, failed=False)
-                continue
             if not self._grab_this_tick(cid, grab_i):
                 self._reuse_cached(cid, frames, timestamps, health, failed=False)
                 continue

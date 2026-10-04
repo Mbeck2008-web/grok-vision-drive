@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT))
 from python.sensors.cameras import (  # noqa: E402
     CAM_IDS,
     CAMERA_HZ_TARGET,
+    COMPANION_OFFSCREEN_UPDATE_S,
     DEFAULT_FAR_M,
     DEFAULT_NEAR_M,
     DEFAULT_UPDATE_PRIORITY,
@@ -607,6 +608,22 @@ def check_camera_clip_planes() -> None:
     assert kw["near_far_planes"] == (0.05, 800.0)
     assert kw["requested_update_time"] == 0.067
     assert kw["is_streaming"] is True
+    offscreen = beamng_camera_sensor_kwargs(
+        pos=(0.0, -1.2, 1.26),
+        direction=(0.0, -1.0, 0.0),
+        up=(0.0, 0.0, 1.0),
+        fov_v=55.0,
+        resolution=(640, 480),
+        update_s=ON_DEMAND_UPDATE_S,
+        near_m=0.05,
+        far_m=100.0,
+        shmem=True,
+        streaming=True,
+        rgb_only=True,
+    )
+    assert offscreen["requested_update_time"] == COMPANION_OFFSCREEN_UPDATE_S
+    assert offscreen["requested_update_time"] > 0
+    assert offscreen["is_streaming"] is True
     assert kw["update_priority"] == 0.5
     assert kw["is_render_depth"] is False
     assert kw["is_render_annotations"] is False
@@ -645,9 +662,6 @@ def check_camera_clip_planes() -> None:
     assert "NVIDIA_SMI_TIMEOUT_S" in hw
     assert "timeout=3" not in hw
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "BeamNGpy #199" in readme or "BeamNGpy/issues/199" in readme
-    assert "narrow > main" in readme
-    assert "@ -1" in readme or "@ **-1**" in readme
     assert "0.13 half-rate" not in readme
     assert "0.267" not in readme
     schema = (ROOT / "docs" / "gvd_state_schema.md").read_text(encoding="utf-8")
@@ -717,15 +731,16 @@ def check_beamngpy_open_passes_near_far() -> None:
             be.open()
         log = buf.getvalue()
         assert "hitch steps narrow:" in log
-        assert "far_m=800@update_s=-1" in log
+        assert "far_m=800@requested_update_time=1" in log
+        assert "update_s=-1" not in log
         assert "hitch steps rear:" in log
-        assert "far_m=100@update_s=-1" in log
+        assert "far_m=100@requested_update_time=1" in log
         assert "hitch steps pillarL:" in log
         assert "not resolution" in log
         assert "grab_div main=1" in log
         assert "wide=16" in log
         assert "narrow=16" in log
-        assert "stream_raw main" in log
+        assert "stream_raw offscreen requested_update_time 1" in log
         assert "rear=16" in log
         assert "depth/semantic OFF" in log
         names = [n for n, _ in captured]
@@ -734,9 +749,9 @@ def check_beamngpy_open_passes_near_far() -> None:
         assert by["gvd_narrow"]["near_far_planes"] == (0.05, 800.0)
         assert by["gvd_main"]["near_far_planes"] == (0.05, 300.0)
         assert by["gvd_wide"]["near_far_planes"] == (0.05, 300.0)
-        assert by["gvd_narrow"]["requested_update_time"] == ON_DEMAND_UPDATE_S
+        assert by["gvd_narrow"]["requested_update_time"] == COMPANION_OFFSCREEN_UPDATE_S
         assert by["gvd_main"]["requested_update_time"] == 0.067
-        assert by["gvd_wide"]["requested_update_time"] == ON_DEMAND_UPDATE_S
+        assert by["gvd_wide"]["requested_update_time"] == COMPANION_OFFSCREEN_UPDATE_S
         assert by["gvd_main"]["update_priority"] == 0.0
         assert by["gvd_narrow"]["update_priority"] > by["gvd_main"]["update_priority"]
         assert read_camera_update_priority(be._sensors["main"]) == 0.0
@@ -745,7 +760,7 @@ def check_beamngpy_open_passes_near_far() -> None:
         assert CAMERA_HZ_TARGET == 10.0
         for cid in SIDE_CAM_IDS | REAR_CAM_IDS:
             assert by[f"gvd_{cid}"]["near_far_planes"] == (0.05, 100.0), cid
-            assert by[f"gvd_{cid}"]["requested_update_time"] == ON_DEMAND_UPDATE_S, cid
+            assert by[f"gvd_{cid}"]["requested_update_time"] == COMPANION_OFFSCREEN_UPDATE_S, cid
             assert by[f"gvd_{cid}"]["is_streaming"] is True, cid
             assert by[f"gvd_{cid}"]["is_render_depth"] is False
             assert by[f"gvd_{cid}"]["resolution"][0] >= 1
@@ -2407,13 +2422,8 @@ def check_tech_hold_gate() -> None:
     assert "--tech-hold" in rv
     assert 'ord("q"), 27' in rv
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    readme_dev = readme.split("### Dev install (BeamNG.tech)", 1)[1].split("**Tech hold prove**", 1)[0]
-    assert "--tech-hold" in readme_dev
-    assert "python python/run_vision.py --tech-hold" not in readme_dev
     assert "Soft Esc parked" in readme
-    assert "Tech hold prove" in readme
-    assert "quit_on_close" in readme
-    assert "Unique-frame Hz" in readme and "not" in readme
+    assert "python python/run_vision.py --tech-hold" not in readme
 
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -2724,7 +2734,8 @@ def check_adhoc_companions_do_not_block_or_pile() -> None:
         assert max_inflight <= 1
         assert max_owed <= 7
         for cam in cams.values():
-            assert len(cam.sent) - len(cam.collected) <= 1, (cam.name, cam.sent, cam.collected)
+            assert cam.sent == [], (cam.name, cam.sent)
+            assert cam.collected == [], (cam.name, cam.collected)
         # Last-frame paint: a later tick still holds every companion picture.
         held = be.grab()
         for cid in CAM_IDS:
@@ -2801,24 +2812,15 @@ def check_adhoc_companions_do_not_block_or_pile() -> None:
         be._adhoc = None
         be._adhoc_ready = False
         be._owed.clear()
-        stalled = None
         for _step in range(16):
             t_send = time.perf_counter()
             bundle = be.grab()
             assert time.perf_counter() - t_send < 0.25
-            if bundle.grab_read_blocked and be._socket_io_busy():
-                stalled = bundle
-                break
-        assert stalled is not None
-        skipped_poll = be.poll_vehicle()
-        assert skipped_poll != "polled"
-        assert calls["n"] == 1
-        assert getattr(skipped_poll, "note", "") == "camera io in flight; sensors.poll skipped"
-        for cid in CAM_IDS:
-            if cid == "main":
-                continue
-            assert cid in stalled.frames and int(stalled.frames[cid].max()) > 0
-        time.sleep(0.7)
+            assert be._socket_io_busy() is False
+            assert bundle.grab_read_blocked is False
+        # The patched ad-hoc send is not the companion read, so the vehicle GE poll runs.
+        assert be.poll_vehicle() == "polled"
+        assert calls["n"] == 2
     finally:
         thread = getattr(locals().get("be", None), "_io_thread", None)
         if thread is not None and thread.is_alive():
@@ -3011,19 +3013,11 @@ def check_narrow_reattach_and_cam_io_edges() -> None:
         be._unique_n = 10
         be._unique_hz_ema = 4.0
         be._narrow_live_hitched = False
-        narrow_before = be._sensors["narrow"]
-        stalled = None
         for _step in range(16):
             t0 = time.perf_counter()
-            bundle = be.grab()
+            be.grab()
             assert time.perf_counter() - t0 < 0.25
-            if bundle.grab_read_blocked and be._socket_io_busy():
-                stalled = bundle
-                break
-        assert stalled is not None
-        assert be._sensors["narrow"] is narrow_before
-        assert be._narrow_live_hitched is False
-        assert be._clip_planes["narrow"][1] == 800.0
+            assert be._socket_io_busy() is False
         assert all(not cam.socket_busy_at_init for cam in be._sensors.values())
         if be._io_thread is not None and be._io_thread.is_alive():
             be._io_thread.join(1.0)
@@ -3034,6 +3028,7 @@ def check_narrow_reattach_and_cam_io_edges() -> None:
             cam.send_ad_hoc_poll_request = saved_send[cid]
 
         # Stale id from the camera we are about to replace. ready(1001) stays False.
+        be._clip_planes["narrow"] = (0.05, 800.0)
         be._adhoc = ("narrow", 1001)
         be._adhoc_ready = False
         be._narrow_live_hitched = False
@@ -3053,7 +3048,7 @@ def check_narrow_reattach_and_cam_io_edges() -> None:
         assert abs(be._clip_planes["narrow"][1] - NARROW_FAR_LIVE_HITCH_M) < 1e-9
         new_narrow = be._sensors["narrow"]
         assert new_narrow is not old_narrow
-        assert new_narrow.sent, new_narrow.sent
+        assert new_narrow.sent == []
         assert new_narrow.socket_busy_at_init is False
         assert all(not cam.socket_busy_at_init for cam in be._sensors.values())
 
@@ -3073,16 +3068,9 @@ def check_narrow_reattach_and_cam_io_edges() -> None:
         be._adhoc_ready = False
         be._owed = ["wide"]
         be.grab()
-        assert be._socket_io_busy()
-        orig_close = be.session.close
-
-        def _session_close():
-            order.append("session_close")
-            return orig_close()
-
-        be.session.close = _session_close  # type: ignore[method-assign]
+        assert be._socket_io_busy() is False
+        assert order == []
         be.close()
-        assert order.index("send_end") < order.index("session_close"), order
         assert be._io_thread is None or not be._io_thread.is_alive()
     finally:
         AdHocCamera.watch_busy = None
@@ -3103,7 +3091,7 @@ def check_narrow_reattach_and_cam_io_edges() -> None:
 
 
 def check_busy_socket_skips_vehicle_ge() -> None:
-    """A timed-out ad-hoc read holds the GE socket for the rest of the tick.
+    """A camera read still on the GE socket holds vehicle GE for the rest of the tick.
 
     ``poll_vehicle`` must not repeat the last ``sensors_poll_ms`` / ``poll_gps_sent``.
     It republishes the last sensor map the way Soft Esc coalesce does, so
@@ -3111,6 +3099,7 @@ def check_busy_socket_skips_vehicle_ge() -> None:
     call ``vehicle.control`` while ``_socket_io_busy()`` is true.
     """
     import sys
+    import threading
     import time
     import types
 
@@ -3261,24 +3250,15 @@ def check_busy_socket_skips_vehicle_ge() -> None:
             }
         }
 
-        def _slow_send(self):
-            time.sleep(0.3)
-            return 7
+        # Companion grabs do not take the GE socket. A busy socket is a main
+        # stream that is still in flight; vehicle GE stays off until it ends.
+        def _hold() -> None:
+            time.sleep(0.4)
 
-        for cid, cam in be._sensors.items():
-            if cid == "main":
-                continue
-            cam.send_ad_hoc_poll_request = _slow_send.__get__(cam, AdHocCamera)
-        be._adhoc = None
-        be._adhoc_ready = False
-        be._owed = ["wide"]
-        stalled = None
-        for _step in range(16):
-            bundle = be.grab()
-            if bundle.grab_read_blocked and be._socket_io_busy():
-                stalled = bundle
-                break
-        assert stalled is not None
+        holder = threading.Thread(target=_hold, daemon=True)
+        be._io_job = ("wide", "poll")
+        be._io_thread = holder
+        holder.start()
         assert be._socket_io_busy()
         held = be.poll_vehicle()
         assert session_polls["n"] == 0

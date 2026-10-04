@@ -1066,7 +1066,9 @@ local VE_RELEASE = "input.event('steering',0,2,900,0,nil,'gvd');"
   .. "input.setAllowedInputSource('parkingbrake',nil);"
   .. "input.setAllowedInputSource('clutch',nil);"
   .. "end"
-local VE_ARCADE = "if drivetrain and drivetrain.setShifterMode then pcall(drivetrain.setShifterMode,'arcade') end"
+-- Mode 2 is arcade. The word 'arcade' is not that number: setShifterMode then
+-- selects realistic, and a later arcade write flips the car back and forth.
+local VE_ARCADE = "if drivetrain and drivetrain.setShifterMode then pcall(drivetrain.setShifterMode,2) end"
 local VE_FEEDBACK = "local ev=(electrics and electrics.values) or {};"
   .. "local s=sensors or {};"
   .. "local function n(x) x=tonumber(x) or 0;if x~=x or x==math.huge or x==-math.huge then x=0 end;return x end;"

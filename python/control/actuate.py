@@ -34,48 +34,28 @@ CMD_ACK_SLACK = 5          # Lua acks lag a few seqs (20 Hz apply, 10 Hz echo, 1
 # A leftover engaged:true from a crashed session must not start Tech vehicle.control.
 ENGAGE_FRESH_S = 2.5
 
-# Drive uses arcade. Gear is still int only (-1 is reverse and is never sent,
-# 0 is hold, 1+ is forward). Never letter "D" on vehicle.control.
+# Drive uses arcade. Set once at engage. A gear field on vehicle.control is
+# shiftToGearIndex, and arcade's shiftToGearIndex enters realistic, so control
+# omits gear. Echo letters D/S/M/L and indexes >= 1 are already forward.
 TECH_SHIFT_MODE = "arcade"
 # Player arrows/pedals expect arcade. Restored only on the Disengage handoff.
 TECH_PLAYER_SHIFT_MODE = "arcade"
 TECH_HOLD_BRAKE = 0.99
-# A full hold ignores speed and always sets the parking brake.
+# Electrics neutral / first forward index. Read from the echo. Not sent.
 TECH_HOLD_GEAR = 0
 TECH_DRIVE_GEAR = 1
-# Let neutralSelectionDelay (~0.5 s) finish before asking the lever to move again.
+# Let a resting handbrake finish releasing before asking again.
 TECH_DRIVE_ARM_S = 0.55
-# Vehicle VM. Idempotent: shiftUp only from N/0, otherwise jump to the 'D' letter in
-# automaticModes (1-based string.find). D/S/M/L, numeric >=1, and M1/M2 already count
-# as forward (same as gear_is_forward), so a stale Python echo cannot move that lever.
-# Never shiftDown, never gear -1. Parking brake and clutch are zeroed on source gvd.
+# Vehicle VM. Parking brake and clutch are zeroed on source gvd.
+# This chunk must not call setGearboxMode or shiftToGearIndex. Arcade's
+# shiftToGearIndex is switchToRealisticBehavior, and setGearboxMode always
+# runs gearboxBehaviorChanged. Repeating either one flips arcade ↔ realistic
+# and the car brakes, then the throttle catches.
 TECH_DRIVE_SHIFT_LUA = (
     "pcall(function() "
-    "local c=controller and controller.mainController; "
-    "if c and c.setGearboxMode then pcall(function() c.setGearboxMode('arcade') end) end; "
     "if input and input.event then pcall(function() "
     "input.event('parkingbrake',0,2,0,0,nil,'gvd'); "
-    "input.event('clutch',0,2,0,0,nil,'gvd') end) end; "
-    "local logic=c and c.shiftLogic; "
-    "local pos=''; "
-    "if logic and logic.getGearPosition then local ok,p=pcall(logic.getGearPosition); "
-    "if ok and p~=nil then pos=tostring(p) end end; "
-    "if pos=='' and electrics and electrics.values and electrics.values.gear~=nil then "
-    "pos=tostring(electrics.values.gear) end; "
-    "pos=string.upper(pos); "
-    "local n=tonumber(pos); "
-    "local manual=pos:match('^M(%d+)$'); "
-    "if pos=='D' or pos=='S' or pos=='M' or pos=='L' or (n and n>=1) "
-    "or (manual and tonumber(manual)>=1) then return end; "
-    "if (pos=='N' or pos=='0' or n==0) and c and c.shiftUp then "
-    "local up=pcall(function() c.shiftUp() end); "
-    "if not up then up=pcall(function() c:shiftUp() end) end; "
-    "if up then return end end; "
-    "if logic and c and c.shiftToGearIndex then "
-    "local modes=logic.automaticModes or logic.modes; "
-    "if type(modes)=='string' then local d=string.find(modes,'D',1,true); "
-    "if d then local jumped=pcall(function() c.shiftToGearIndex(d) end); "
-    "if not jumped then pcall(function() c:shiftToGearIndex(d) end) end end end end "
+    "input.event('clutch',0,2,0,0,nil,'gvd') end) end "
     "end)"
 )
 
@@ -378,9 +358,12 @@ def gear_is_forward(gear: Any) -> bool:
         return False
     if isinstance(gear, (int, float)):
         try:
-            return int(gear) >= TECH_DRIVE_GEAR
+            g = int(gear)
         except (TypeError, ValueError):
             return False
+        if g == TECH_HOLD_GEAR:
+            return False
+        return g >= TECH_DRIVE_GEAR
     text = str(gear).strip().upper()
     if text in {"D", "S", "M", "L"}:
         return True
@@ -421,17 +404,6 @@ def _unexpected_kw(err: BaseException) -> str | None:
     return None
 
 
-def _tech_gear(value: int) -> int:
-    """Clamp to a non-reverse BeamNGpy gear int (0 N, 1+ forward). Never -1 or 'D'."""
-    try:
-        g = int(value)
-    except (TypeError, ValueError):
-        return TECH_HOLD_GEAR
-    if g < 0:
-        return TECH_HOLD_GEAR
-    return g
-
-
 def tech_control_kwargs(
     steer: float,
     throttle: float,
@@ -442,11 +414,13 @@ def tech_control_kwargs(
 ) -> dict[str, Any]:
     """Arcade forward drive. A full hold does not send the reverse pedal.
 
-    Shift mode stays arcade. Throttle>0 pins gear>=1 and clutch=0. A hold,
-    stop, or AEB (throttle ~0 and brake >= 0.99) is parkingbrake=1, service
-    brake 0, gear 0. Arcade treats that held service brake, with no throttle,
-    as reverse — gear 0 does not make it safe. The hold ignores speed and
-    always sets the parking brake. gear is int only; never -1, never letter D.
+    Shift mode stays the arcade set at engage. The kwargs omit gear. BeamNG
+    routes a gear field through shiftToGearIndex, and in arcade that function
+    is switchToRealisticBehavior, so every control tick was leaving arcade.
+    Throttle>0 releases the parking brake and the clutch. A hold, stop, or
+    AEB (throttle ~0 and brake >= 0.99) is parkingbrake=1 and service brake 0.
+    Arcade treats that held service brake, with no throttle, as reverse. The
+    hold ignores speed and always sets the parking brake.
     """
     del speed_mps  # moving or stopped, the reverse pedal stays off
     if release:
@@ -466,7 +440,6 @@ def tech_control_kwargs(
             "brake": brake_v,
             "parkingbrake": 0.0,
             "clutch": 0.0,
-            "gear": _tech_gear(TECH_DRIVE_GEAR),
         }
     if brake_v >= TECH_HOLD_BRAKE:
         return {
@@ -474,14 +447,12 @@ def tech_control_kwargs(
             "throttle": 0.0,
             "brake": 0.0,
             "parkingbrake": 1.0,
-            "gear": _tech_gear(TECH_HOLD_GEAR),
         }
     return {
         "steering": steer_v,
         "throttle": 0.0,
         "brake": brake_v,
         "parkingbrake": 0.0,
-        "gear": _tech_gear(TECH_HOLD_GEAR),
     }
 
 
@@ -520,7 +491,7 @@ def plan_command(
     AEB / full stop still return brake=1, throttle=0 (retail JSON + override
     semantics). Tech remaps that pair in tech_control_kwargs: arcade stays the
     shift mode, and the hold is parkingbrake=1 with the service brake released
-    so arcade does not select reverse. Never gear=-1.
+    so arcade does not select reverse. The Tech control message has no gear field.
     """
     planner = planner or {}
     aeb = str(planner.get("aeb") or "off")
@@ -874,12 +845,14 @@ class BeamNGPyActuator:
     the latch set so the next disengaged tick retries. After arcade succeeds,
     later Soft Esc ticks refresh the cmd file at most once per
     SOFT_ESC_FILE_PERIOD_S. Engaged gate holds (preview_blocked, AEB, veto)
-    still apply the stop command. Arcade stays the shift mode. Forward drive
-    is gear>=1 with throttle. A hold is parkingbrake=1 and service brake 0,
-    never gear=-1, so the brake pedal is not reverse throttle. A failed
+    still apply the stop command. Arcade stays the shift mode set once at
+    engage. Forward drive is throttle with the parking brake and clutch
+    released. A hold is parkingbrake=1 and service brake 0, so the brake
+    pedal is not reverse throttle. Control omits gear: that field is
+    shiftToGearIndex, and arcade uses it to enter realistic. A failed
     set_shift_mode is logged
     and retried. Throttle>0 while the echoed gear is not forward also queues
-    a vehicle-Lua arm that leaves N/P without selecting reverse.
+    a vehicle-Lua arm that releases the parking brake and the clutch.
     """
 
     name = "beamngpy"
@@ -1028,10 +1001,10 @@ class BeamNGPyActuator:
             print(f"[GVD] set_shift_mode({TECH_SHIFT_MODE}) ok", flush=True)
 
     def _queue_drive_shift(self, gear_echo: Any, now: float) -> None:
-        """Ask the vehicle VM to leave N/P without selecting reverse. Rate-limited.
+        """Release a resting parking brake and clutch. Rate-limited.
 
-        The chunk itself no-ops once the lever is already in a forward range, so a
-        stale Python echo of ``N`` cannot walk D → 2.
+        Queued only while the echoed gear is not forward. The chunk does not
+        change gearbox mode and does not call shiftToGearIndex.
         """
         last = self._drive_arm_mono
         if last is not None and (now - last) < TECH_DRIVE_ARM_S:

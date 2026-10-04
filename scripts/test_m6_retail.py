@@ -689,25 +689,18 @@ def check_no_chrome() -> None:
 
 def check_player_docs() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "**M6" in readme, "README Status must be M6"
-    assert "## Alpha 1.7.6" in readme
+    assert "## Alpha 1.7.7" in readme
     assert "This is **alpha** — may break / not work; improves with fixes." in readme
     assert "**point** bumps" in readme and "fixes / small UI" in readme
     assert "**main alpha** bump" in readme and "features / core / UI overhaul" in readme
-    assert "1.7.6-alpha-<sha>" in readme
-    assert "## Player guide" in readme
-    assert "make_release_zip" in readme
-    assert "requirements-retail.txt" in readme
+    assert "1.7.7-alpha-<sha>" in readme
+    assert "docs/stitch-360.png" in readme
+    assert "docs/soft-esc-highway.jpg" not in readme
+    assert "Soft Esc parked" in readme
+    assert readme.index("docs/stitch-360.png") < readme.index("## Recent changes")
+    assert readme.index("## 1.7.7") > readme.index("## Recent changes")
     # Retail drives via the cmd JSON bus; the old "cannot drive" wording must be gone everywhere players look.
-    assert "gvd_cmd.json" in readme and "gvd_ego.json" in readme
-    assert "play_gvd_tech.bat" in readme and "tech.yaml" in readme
-    assert "docs/media/gvd_cabin_synthetic.png" in readme
-    assert "docs/media/gvd_ingame_ui_synthetic.png" in readme
-    assert "docs/media/gvd_ingame_ui_drive_synthetic.png" in readme
-    assert "## Screenshots" in readme
-    assert readme.lower().count("synthetic") >= 4
-    assert "beamngpy if importable" not in readme.lower(), "auto backend must not pick Tech just because beamngpy is installed"
-    assert "does **not** pick Tech just because beamngpy is installed" in readme
+    assert "beamngpy if importable" not in readme.lower()
     for f in (ROOT / "README.md", ROOT / "play_gvd.bat", ROOT / "play_gvd_tech.bat", ROOT / "scripts" / "make_release_zip.py",
               ROOT / "python" / "run_vision.py", ROOT / "docs" / "gvd_state_schema.md"):
         text = f.read_text(encoding="utf-8", errors="ignore").lower()

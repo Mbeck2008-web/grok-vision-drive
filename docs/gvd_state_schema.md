@@ -32,9 +32,9 @@ Lua: `gvd_main.drawPath` on `onPreRender` / `onDebugDraw`. Runs whenever the sup
 | `camera_hz` | float | unique GPU-frame EMA — new frames only, not cache re-shows / `main is not None` |
 | `grab_ms` | float | camera grab wall-ms this tick |
 | `grab_phase` | int | Hitch-wheel slot (`grab_i % wheel`, locked wheel 16). `-1` on retail window / stub (no wheel). |
-| `grab_poll_free` | bool | This grab did not issue a companion PollCamera or ad-hoc send. Locked schedule: poll-free on slots 4 and 8–15 (main `stream_raw` only). Hitch slots 0, 1, 2, 3, 5, 6, 7 each add one companion request. An owed companion (previous ad-hoc still in flight) may send on the next idle tick. |
-| `companion_inflight` | int | Ad-hoc companion renders not yet collected. Capped at 1. A climb means requests are stacking. |
-| `grab_read_blocked` | bool | This tick did not wait out a `stream_raw` / `poll` / ad-hoc call that was still running after 50 ms. The last real frame stays painted. |
+| `grab_poll_free` | bool | This grab did not read a companion. Locked schedule: poll-free on slots 4 and 8–15 (main `stream_raw` only). Hitch slots 0, 1, 2, 3, 5, 6, 7 each read one companion with `stream_raw`. Yaml `update_s: -1` is that hitch. The sensor `requested_update_time` is 1 s, offscreen. Grab does not send `SendAdHocRequestCamera`. |
+| `companion_inflight` | int | Ad-hoc companion renders still in flight. The live grab does not start those renders, so this stays 0. |
+| `grab_read_blocked` | bool | This tick did not wait out a `stream_raw` or legacy `poll` that was still running after 50 ms. The last real frame stays painted. |
 | `sensors_poll_ms` | float | Wall-ms of this tick's first `vehicle.sensors.poll`. 0 when no vehicle poll ran. |
 | `poll_gps_ms` | float | Wall-ms of `GPS.poll` (PollGPSGE) when this tick sent it. 0 when GPS is absent or the sample was coalesced. |
 | `poll_gps_sent` | bool | True only when this tick called `GPS.poll`. |
@@ -42,7 +42,7 @@ Lua: `gvd_main.drawPath` on `onPreRender` / `onDebugDraw`. Runs whenever the sup
 | `infer_ms` | float | perception tick ms |
 | `viz_ms` | float | OpenCV stage ms |
 
-Soft Esc reads the same tick from `gvd_state.json` and the `[GVD] seg` line. Poll-free `grab_ms` is the main `stream_raw` cost. The gap versus a hitch-phase `grab_ms` is the companion request. `companion_inflight` stays 0 or 1. `grab_read_blocked=1` means the tick moved on instead of waiting out a blocked read. `heartbeat_ms - grab_ms - infer_ms` is the rest of the tick before the heartbeat stamp, including the ego-poll tail (`sensors_poll_ms`, `poll_gps_ms`, `electrics_ms`). `camera_hz` stays the unique GPU-frame EMA. `rss_mb` is the supervisor RSS sample for a long-run sag check.
+Soft Esc reads the same tick from `gvd_state.json` and the `[GVD] seg` line. Poll-free `grab_ms` is the main `stream_raw` cost. The gap versus a hitch-phase `grab_ms` is the companion `stream_raw`. `companion_inflight` stays 0. `grab_read_blocked=1` means the tick moved on instead of waiting out a blocked read. `heartbeat_ms - grab_ms - infer_ms` is the rest of the tick before the heartbeat stamp, including the ego-poll tail (`sensors_poll_ms`, `poll_gps_ms`, `electrics_ms`). `camera_hz` stays the unique GPU-frame EMA. `rss_mb` is the supervisor RSS sample for a long-run sag check.
 
 
 ## M2 fields
@@ -230,7 +230,7 @@ On a trip both sides write `gvd_engage.json` `engaged=false` with the `player_*`
 | `heartbeat_mtime` | float | `time.time()`; Lua ignores files whose stamp is > `CMD_DEAD_S` (1.0 s) behind `os.time()` (old session) |
 | `reason` | string | `ok` / `preview_blocked` / `not_engaged` / `veto:*` / … (diagnostic) |
 
-Lua (`gvd_main.applyCmdJson`, 20 Hz): `input.event('steering', s, 2, 900, 0, nil, 'gvd')`; `input.event('throttle', t, 2, 0, 0, nil, 'gvd')`; `input.event('brake', b, 2, 0, 0, nil, 'gvd')`; `input.event('parkingbrake', 0, 2, 0, 0, nil, 'gvd')`; `input.event('clutch', 0, 2, 0, 0, nil, 'gvd')` on `be:getPlayerVehicle(0)` via `queueLuaCommand` (FILTER_DIRECT; steering angle 900 marks Direct Drive, lockType 0 so -1..1 is already fraction of vehicle lock; pedal angle 0 is unused); `input.setAllowedInputSource(..., 'gvd', true)` and `('local', false)` on steering/throttle/brake/parkingbrake/clutch while applying so a connected device cannot overwrite; `drivetrain.setShifterMode('arcade')` once. On release: zeros on source `gvd`, then `setAllowedInputSource(..., nil)` to give the player device back. No new seq for `CMD_STALE_S` (0.35 s) → steer 0 / throttle 0 / brake 1 hold; after `CMD_DEAD_S` (1.0 s) → release (all 0), `engaged=false`, `gvd_engage.json` false. Any disengage (Alt+G, supervisor false, unload) sends one release and stops applying. `cmd.engaged=false` → release immediately (no brake tap on the player).
+Lua (`gvd_main.applyCmdJson`, 20 Hz): `input.event('steering', s, 2, 900, 0, nil, 'gvd')`; `input.event('throttle', t, 2, 0, 0, nil, 'gvd')`; `input.event('brake', b, 2, 0, 0, nil, 'gvd')`; `input.event('parkingbrake', 0, 2, 0, 0, nil, 'gvd')`; `input.event('clutch', 0, 2, 0, 0, nil, 'gvd')` on `be:getPlayerVehicle(0)` via `queueLuaCommand` (FILTER_DIRECT; steering angle 900 marks Direct Drive, lockType 0 so -1..1 is already fraction of vehicle lock; pedal angle 0 is unused); `input.setAllowedInputSource(..., 'gvd', true)` and `('local', false)` on steering/throttle/brake/parkingbrake/clutch while applying so a connected device cannot overwrite; `drivetrain.setShifterMode(2)` once (mode 2 is arcade). On release: zeros on source `gvd`, then `setAllowedInputSource(..., nil)` to give the player device back. No new seq for `CMD_STALE_S` (0.35 s) → steer 0 / throttle 0 / brake 1 hold; after `CMD_DEAD_S` (1.0 s) → release (all 0), `engaged=false`, `gvd_engage.json` false. Any disengage (Alt+G, supervisor false, unload) sends one release and stops applying. `cmd.engaged=false` → release immediately (no brake tap on the player).
 
 `Documents/GVD/gvd_ego.json` — written by Lua at ~10 Hz while the supervisor's state heartbeat is alive (vehicle Lua `electrics.values` → `obj:queueGameEngineLua` → `gvd_main.onEgoFeedback`):
 

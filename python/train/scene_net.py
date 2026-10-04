@@ -7,9 +7,9 @@ the previous strip. FP32 on compute capability older than 7.0 (Pascal 6.1).
 Automatic mixed precision at 7.0 and newer. The exported ONNX graph is FP32
 either way.
 
-Memory is 15 seconds of real time, grouped by the trainer. It is not a fixed
-step count. The last 8 tokens are a residual on the GRU output, not a second
-model.
+Memory is 15 seconds of real time. It is not a fixed step count. A short
+skip adds the recent tokens whose age is still inside ``RESIDUAL_S`` seconds.
+That skip is not a fixed 8 steps, and it is not a second model.
 """
 
 from __future__ import annotations
@@ -35,7 +35,14 @@ STEM_CHANNELS = (32, 64, 128, 128)
 SECTOR_FEAT = 64
 TOKEN_DIM = 512
 GRU_HIDDEN = 512
-RESIDUAL_TOKENS = 8
+# The skip covers this many seconds of real time, not a fixed step count.
+RESIDUAL_S = 1.5
+# The ring is sized for a 60 Hz step so a faster-than-5 Hz strip still fits
+# the whole span. Slower steps simply leave more of the ring unused.
+RESIDUAL_MIN_DT = 1.0 / 60.0
+RESIDUAL_TOKENS = int(math.ceil(RESIDUAL_S / RESIDUAL_MIN_DT))
+# Dropout on the vector that enters the GRU. Not on the hidden state.
+GRU_IN_DROPOUT = 0.1
 N_LANES = 6
 LANE_POINTS = 16
 N_CURBS = 2
@@ -255,10 +262,41 @@ def letterbox_rect(
 
 
 def step_dt(dt_s: float | None) -> float:
-    """Seconds the GRU consumes. The first strip has no previous step."""
+    """Seconds the GRU consumes. The first strip has no previous step.
+
+    The value is the recorded gap. It is not rewritten to 0.2 s.
+    """
     if dt_s is None:
         return 0.0
     return float(dt_s)
+
+
+def residual_ages(
+    dts: list[float],
+    span_s: float = RESIDUAL_S,
+    capacity: int = RESIDUAL_TOKENS,
+) -> list[float]:
+    """Age of each ring slot after consuming the real step times.
+
+    Empty slots start older than ``span_s``. Each step ages the ring by that
+    step's seconds, drops the oldest slot, and appends the new token at age 0.
+    """
+    empty = float(span_s) + 1.0
+    ages = [empty] * int(capacity)
+    for dt in dts:
+        step = float(dt)
+        ages = [age + step for age in ages]
+        ages = ages[1:] + [0.0]
+    return ages
+
+
+def residual_keep_count(
+    dts: list[float],
+    span_s: float = RESIDUAL_S,
+    capacity: int = RESIDUAL_TOKENS,
+) -> int:
+    """How many ring slots are still inside the skip span."""
+    return sum(1 for age in residual_ages(dts, span_s, capacity) if age <= float(span_s))
 
 
 def memory_windows(rows: list[Mapping[str, Any]], memory_s: float = MEMORY_S) -> list[list[Mapping[str, Any]]]:
@@ -819,7 +857,12 @@ class ScenePrediction:
 
 @dataclass
 class SceneState:
-    """GRU hidden plus the residual ring of the last 8 tokens."""
+    """GRU hidden plus a residual ring.
+
+    ``mask`` stores each token's age in seconds. A slot older than
+    ``RESIDUAL_S`` is left out of the skip. The ring length is only the
+    storage cap.
+    """
 
     h: Any
     tokens: Any
@@ -961,6 +1004,8 @@ if torch is not None:
             cin = 3
             for cout in STEM_CHANNELS:
                 # Batch 1 is a legal step, so this is not batch norm.
+                # GroupNorm is not added either: the stem stays free of
+                # normalization parameters so a paused checkpoint still loads.
                 layers.append(nn.Conv2d(cin, cout, kernel_size=3, stride=2, padding=1, bias=True))
                 layers.append(nn.ReLU(inplace=False))
                 cin = cout
@@ -979,6 +1024,8 @@ if torch is not None:
             if TOKEN_DIM != len(SECTORS) * SECTOR_FEAT:
                 raise RuntimeError("8 sector features must concatenate to the 512-d token")
             self.stem = SharedStem()
+            # The dropped tensor is the GRU input. ``state.h`` is not dropped.
+            self.gru_in_drop = nn.Dropout(p=GRU_IN_DROPOUT)
             self.gru = nn.GRU(TOKEN_DIM + 1, GRU_HIDDEN, num_layers=1, batch_first=True)
             hidden = GRU_HIDDEN
             for name, out in scene_head_sizes():
@@ -988,10 +1035,11 @@ if torch is not None:
             device = device or torch.device("cpu")
             dtype = dtype or torch.float32
             width = max(1, int(batch))
+            empty_age = float(RESIDUAL_S) + 1.0
             return SceneState(
                 h=torch.zeros(1, width, GRU_HIDDEN, device=device, dtype=dtype),
                 tokens=torch.zeros(width, RESIDUAL_TOKENS, TOKEN_DIM, device=device, dtype=dtype),
-                mask=torch.zeros(width, RESIDUAL_TOKENS, device=device, dtype=dtype),
+                mask=torch.full((width, RESIDUAL_TOKENS), empty_age, device=device, dtype=dtype),
             )
 
         def forward(self, strip: Any, dt: Any, state: SceneState) -> tuple[ScenePrediction, SceneState]:
@@ -1014,13 +1062,18 @@ if torch is not None:
             token = self._token(image)
             dt_col = _dt_column(dt, image)
             # The step time is the value that arrived. It is not rewritten to a fixed period.
-            gru_out, h_new = self.gru(torch.cat([token, dt_col], dim=-1), state.h)
+            # Dropout is on the token. dt and the recurrent state are not dropped.
+            dropped = self.gru_in_drop(token)
+            gru_out, h_new = self.gru(torch.cat([dropped, dt_col], dim=-1), state.h)
+            # Same ring update as residual_ages: age by this dt, drop the oldest, append age 0.
+            width = int(image.shape[0])
+            aged = state.mask + dt_col.reshape(width, 1)
+            zeros = torch.zeros(width, 1, device=image.device, dtype=image.dtype)
+            new_mask = torch.cat([aged[:, 1:], zeros], dim=1)
             new_tokens = torch.cat([state.tokens[:, 1:], token], dim=1)
-            ones = torch.ones(image.shape[0], 1, device=image.device, dtype=image.dtype)
-            new_mask = torch.cat([state.mask[:, 1:], ones], dim=1)
-            denom = new_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
-            residual = (new_tokens * new_mask.unsqueeze(-1)).sum(dim=1) / denom
-            # The last 8 tokens are only this residual. They have no head of their own.
+            in_span = (new_mask <= float(RESIDUAL_S)).to(dtype=image.dtype)
+            denom = in_span.sum(dim=1, keepdim=True).clamp(min=1.0)
+            residual = (new_tokens * in_span.unsqueeze(-1)).sum(dim=1) / denom
             feat = gru_out[:, 0, :] + residual
             return _heads_batch(self, feat), SceneState(h=h_new, tokens=new_tokens, mask=new_mask)
 

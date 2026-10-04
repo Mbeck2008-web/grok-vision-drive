@@ -1,8 +1,10 @@
 """Train the scene net from a strip directory.
 
 Reads ``meta.json``, ``strips/*.jpg``, and ``state.jsonl``. Each step uses the
-recorded seconds since the previous strip. Windows cover 15 seconds of real
-time. Before the first step the trainer measures that directory and the free
+recorded seconds since the previous strip. The GRU state carries across
+overlapping chunks of one recording and clears on a gap or a new recording.
+Backprop stops at the chunk. It does not run through the 15 second carry.
+Before the first step the trainer measures that directory and the free
 VRAM, then shrinks the batch until the step fits. CPU is used only when the
 card cannot hold one step and the machine has more CPU RAM, and that path is
 not recommended. The run is drawn on the same dark panel as the supervisor. This process does not start or
@@ -25,8 +27,21 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from python.data.strip_writer import CANVAS_H, CANVAS_W, read_state_jsonl  # noqa: E402
+from python.train.continual import (  # noqa: E402
+    GRAD_CLIP,
+    WEIGHT_DECAY,
+    chunk_stride,
+    chunk_vram_budget,
+    choose_chunk_length,
+    holdout_stopped,
+    offcenter_view,
+    ordered_learning_rates,
+    pass_plan,
+    pick_learning_rate,
+)
 from python.train.fit import (  # noqa: E402
     TrainFitError,
+    bytes_per_strip,
     fit_with_probe,
     largest_batch,
     measure_driving_file,
@@ -35,18 +50,16 @@ from python.train.fit import (  # noqa: E402
     read_free_vram_bytes,
     read_used_ram_bytes,
     read_used_vram_bytes,
-    shrink_batch,
     usable_bytes,
 )
 from python.train.scene_net import (  # noqa: E402
-    MEMORY_S,
     OUTPUT_FIELDS,
     ScenePrediction,
+    SceneState,
     default_onnx_path,
     export_scene_onnx,
     labels_from_tech,
     loss_mask,
-    memory_windows,
     precision_for_capability,
     scene_loss,
     step_dt,
@@ -207,8 +220,20 @@ def _probe_cuda(net: Any, batch: int, window_strips: int, amp: bool, device: Any
     return ok
 
 
-def _blank() -> Any:
-    return np.zeros((CANVAS_H, CANVAS_W, 3), dtype=np.uint8)
+def _detach_state(state: SceneState) -> SceneState:
+    """Copy the hidden state off the graph so the next chunk cannot backprop into this one."""
+    return SceneState(
+        h=state.h.detach().clone(),
+        tokens=state.tokens.detach().clone(),
+        mask=state.mask.detach().clone(),
+    )
+
+
+def _frame_row(root: Path, row: Mapping[str, Any]) -> tuple[Any, Mapping[str, Any]]:
+    frame = np.ascontiguousarray(_load_bgr(root, int(row["i"])))
+    # The stitch is not a yaw roll, so this returns the frame and the row.
+    frame, row = offcenter_view(frame, row)
+    return frame, row
 
 
 def _optimizer_step(
@@ -216,60 +241,100 @@ def _optimizer_step(
     opt: Any,
     scaler: Any,
     root: Path,
-    chunk: list[list[Mapping[str, Any]]],
+    rows: list[Mapping[str, Any]],
+    state: SceneState,
+    *,
+    device: Any,
+    amp: bool,
+    view: TrainWindow | None,
+    stride: int,
+    clip: float,
+) -> tuple[float | None, int, SceneState, SceneState]:
+    """Backprop through this chunk only.
+
+    ``state`` is already detached from the previous chunk. The returned carry
+    is the state ``stride`` frames in, also detached, so the next backward
+    pass starts before this chunk ends and does not grow the graph.
+    """
+    import torch
+
+    net.train()
+    opt.zero_grad(set_to_none=True)
+    state = _detach_state(state)
+    total = None
+    n_loss = 0
+    stride_mark: SceneState | None = None
+    step_at = max(1, int(stride))
+    for tick, row in enumerate(rows):
+        frame, row = _frame_row(root, row)
+        image = torch.from_numpy(frame).to(device)
+        dt = torch.tensor([step_dt(row.get("dt_s"))], dtype=torch.float32, device=device)
+        with _autocast(amp):
+            pred, state = net.forward_batch(image, dt, state)
+        if loss_mask(row):
+            step = scene_loss(_prediction_at(pred, 0), _as_target(labels_from_tech(row.get("tech")), device))
+            value = step["total"]
+            total = value if total is None else total + value
+            n_loss += 1
+        if tick + 1 == step_at:
+            stride_mark = state
+        if view is not None:
+            view.pump()
+    end_state = _detach_state(state)
+    carry = end_state if stride_mark is None else _detach_state(stride_mark)
+    if total is None or n_loss == 0:
+        return None, 0, carry, end_state
+    loss = total / n_loss
+    if scaler is not None:
+        scaler.scale(loss).backward()
+        scaler.unscale_(opt)
+        torch.nn.utils.clip_grad_norm_(net.parameters(), float(clip))
+        scaler.step(opt)
+        scaler.update()
+    else:
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(net.parameters(), float(clip))
+        opt.step()
+    net.zero_grad(set_to_none=True)
+    return float(loss.detach().item()), n_loss, carry, end_state
+
+
+def _eval_sequence(
+    net: Any,
+    root: Path,
+    rows: list[Mapping[str, Any]],
+    state: SceneState,
     *,
     device: Any,
     amp: bool,
     view: TrainWindow | None,
 ) -> tuple[float | None, int]:
+    """Holdout forward. No optimizer step and no gradient through these frames."""
     import torch
 
-    length = max(len(window) for window in chunk)
-    width = len(chunk)
-    blank = _blank()
-    net.train()
-    opt.zero_grad(set_to_none=True)
-    state = net.initial_state(device=device, batch=width)
+    net.eval()
     total = None
     n_loss = 0
-    for tick in range(length):
-        frames = []
-        dts = []
-        for window in chunk:
-            if tick < len(window):
-                row = window[tick]
-                frames.append(_load_bgr(root, int(row["i"])))
-                dts.append(step_dt(row.get("dt_s")))
-            else:
-                frames.append(blank)
-                dts.append(0.0)
-        image = torch.from_numpy(np.stack(frames)).to(device)
-        dt = torch.tensor(dts, dtype=torch.float32, device=device)
-        with _autocast(amp):
-            pred, state = net.forward_batch(image, dt, state)
-        for index, window in enumerate(chunk):
-            if tick >= len(window):
-                continue
-            row = window[tick]
-            if not loss_mask(row):
-                continue
-            step = scene_loss(_prediction_at(pred, index), _as_target(labels_from_tech(row.get("tech")), device))
-            value = step["total"]
-            total = value if total is None else total + value
-            n_loss += 1
-        if view is not None:
-            view.pump()
+    try:
+        with torch.no_grad():
+            for row in rows:
+                frame, row = _frame_row(root, row)
+                image = torch.from_numpy(frame).to(device)
+                dt = torch.tensor([step_dt(row.get("dt_s"))], dtype=torch.float32, device=device)
+                with _autocast(amp):
+                    pred, state = net.forward_batch(image, dt, state)
+                if not loss_mask(row):
+                    continue
+                value = scene_loss(_prediction_at(pred, 0), _as_target(labels_from_tech(row.get("tech")), device))["total"]
+                total = value if total is None else total + value
+                n_loss += 1
+                if view is not None:
+                    view.pump()
+    finally:
+        net.train()
     if total is None or n_loss == 0:
         return None, 0
-    loss = total / n_loss
-    if scaler is not None:
-        scaler.scale(loss).backward()
-        scaler.step(opt)
-        scaler.update()
-    else:
-        loss.backward()
-        opt.step()
-    return float(loss.detach().item()), n_loss
+    return float((total / n_loss).detach().item()), n_loss
 
 
 def _publish(view: TrainWindow, status: TrainStatus, *, record_loss: bool = True) -> None:
@@ -341,7 +406,12 @@ def _apply_checkpoint(net: Any, opt: Any, scaler: Any, fields: Mapping[str, Any]
         state = tree.get("state")
         if isinstance(state, dict):
             tree["state"] = {int(key): value for key, value in state.items()}
-        opt.load_state_dict(tree)
+        try:
+            opt.load_state_dict(tree)
+        except (RuntimeError, ValueError, KeyError):
+            # Weights are already loaded. A mismatched optimizer (an older Adam
+            # file, for example) keeps a fresh AdamW instead of dropping them.
+            return
         for bucket in opt.state.values():
             for key, value in list(bucket.items()):
                 if torch.is_tensor(value):
@@ -413,11 +483,12 @@ def train_directory(
         free_vram_bytes = read_free_vram_bytes()
     if free_ram_bytes is None:
         free_ram_bytes = read_free_ram_bytes()
-    windows = memory_windows(rows, MEMORY_S)
     own_view = view is None
     if view is None:
         view = TrainWindow()
     view.load_folder(root)
+    # The CLI epoch count is not the stop. The holdout decides.
+    requested_epochs = int(epochs)
 
     def _empty(precision: str = "fp32") -> dict[str, Any]:
         if export_path is not None:
@@ -435,24 +506,27 @@ def train_directory(
             "file_bytes": file_bytes,
             "free_vram_bytes": int(free_vram_bytes),
             "free_ram_bytes": int(free_ram_bytes),
+            "requested_epochs": requested_epochs,
         }
 
-    if not windows:
+    if not rows:
         return _empty()
 
-    window_strips = max(len(window) for window in windows)
+    frame_bytes = bytes_per_strip(file_bytes, len(rows))
+    chunk_len = choose_chunk_length(frame_bytes, chunk_vram_budget(int(free_vram_bytes)))
+    stride = chunk_stride(chunk_len)
     plan = plan_fit(
         file_bytes=file_bytes,
         n_strips=len(rows),
         free_vram_bytes=int(free_vram_bytes),
         free_ram_bytes=int(free_ram_bytes),
-        n_windows=len(windows),
-        window_strips=window_strips,
+        n_windows=1,
+        window_strips=chunk_len,
     )
     torch.manual_seed(0)
     holder: dict[str, Any] = {}
 
-    def _arm(device_name: str) -> None:
+    def _arm(device_name: str, learning_rate: float | None = None) -> None:
         device = torch.device(device_name)
         if "net" not in holder:
             holder["net"] = SceneNet().to(device)
@@ -461,11 +535,13 @@ def train_directory(
             _release_cuda()
         cap = _capability(device, capability)
         amp = precision_for_capability(cap) == "amp" and device.type == "cuda"
+        rate = float(holder.get("lr", lr) if learning_rate is None else learning_rate)
         holder["device"] = device
         holder["cap"] = cap
         holder["amp"] = amp
         holder["precision"] = "amp" if amp else "fp32"
-        holder["opt"] = torch.optim.Adam(holder["net"].parameters(), lr=float(lr))
+        holder["lr"] = rate
+        holder["opt"] = torch.optim.AdamW(holder["net"].parameters(), lr=rate, weight_decay=WEIGHT_DECAY)
         holder["scaler"] = _scaler(amp)
 
     def probe(device_name: str, batch: int) -> bool:
@@ -474,130 +550,150 @@ def train_directory(
         if not torch.cuda.is_available():
             return False
         _arm("cuda")
-        return _probe_cuda(holder["net"], int(batch), window_strips, bool(holder["amp"]), holder["device"])
+        return _probe_cuda(holder["net"], int(batch), chunk_len, bool(holder["amp"]), holder["device"])
 
     if plan.device == "cuda":
-        plan = fit_with_probe(plan, probe, n_windows=len(windows))
+        plan = fit_with_probe(plan, probe, n_windows=1)
     _arm(plan.device)
 
     device = holder["device"]
     net = holder["net"]
-    batch = int(plan.batch)
+    batch = 1
     recommended = bool(plan.recommended) and device.type == "cuda"
     note = "recommended" if recommended else "not recommended"
     print(
         f"[GVD] scene fit file={file_bytes} free_vram={int(free_vram_bytes)} "
-        f"free_ram={int(free_ram_bytes)} device={device.type} batch={batch} {note}",
+        f"free_ram={int(free_ram_bytes)} device={device.type} batch={batch} "
+        f"chunk={chunk_len} {note}",
         flush=True,
     )
     view.open()
-    epochs_n = max(1, int(epochs))
     supervised = 0
     paused_exit = False
     epoch = 0
     cursor = 0
     done = 0
     last_loss: float | None = None
+    windows = 0
     started = time.perf_counter()
-    try:
+
+    def _clone_weights() -> dict[str, Any]:
+        return {key: value.detach().cpu().clone() for key, value in net.state_dict().items()}
+
+    def _load_weights(blob: Mapping[str, Any]) -> None:
+        current = net.state_dict()
+        mapped = {
+            key: value.detach().to(device=current[key].device, dtype=current[key].dtype)
+            for key, value in blob.items()
+        }
+        net.load_state_dict(mapped)
+
+    def _pause_now() -> bool:
+        nonlocal paused_exit, device, net
+        payload = _save_pause(
+            root,
+            net,
+            holder["opt"],
+            holder["scaler"],
+            view,
+            step=done,
+            epoch=epoch,
+            cursor=cursor,
+            loss=last_loss,
+            lr=float(holder["lr"]),
+            epochs=requested_epochs,
+            batch=batch,
+            device_name=device.type,
+            recommended=recommended,
+        )
+        view.mark_paused(payload)
         if not _wait_for_start(view):
             paused_exit = True
-        else:
-            existing = load_checkpoint(root)
-            if existing is not None:
-                fields = resume_fields(existing)
-                _apply_checkpoint(net, holder["opt"], holder["scaler"], fields, device)
-                epoch = int(fields["epoch"])
-                cursor = int(fields["cursor"])
-                done = int(fields["step"])
-                last_loss = fields["loss"]
-                view.restore_losses(fields["losses"])
-            else:
-                # No pause file: a new run. Strip JPEGs and state lines stay.
-                epoch = 0
-                cursor = 0
-                done = 0
-                last_loss = None
-            view.mark_running()
-            remaining = ((len(windows) + batch - 1) // batch) * epochs_n
-            used, kind = _memory_reading(device.type)
-            _publish(
-                view,
-                TrainStatus(
-                    eta_s=None,
-                    loss=last_loss,
-                    lr=float(holder["opt"].param_groups[0]["lr"]),
-                    steps_per_sec=0.0,
-                    memory_bytes=used,
-                    memory_kind=kind,
-                    device=device.type,
-                    batch=batch,
-                    recommended=recommended,
-                    step=done,
-                    steps=max(done, remaining),
-                ),
-                record_loss=False,
-            )
-            started = time.perf_counter()
-        while epoch < epochs_n and not paused_exit:
-            if view.consume_pause():
-                payload = _save_pause(
-                    root,
-                    net,
-                    holder["opt"],
-                    holder["scaler"],
-                    view,
-                    step=done,
-                    epoch=epoch,
-                    cursor=cursor,
-                    loss=last_loss,
-                    lr=float(holder["opt"].param_groups[0]["lr"]),
-                    epochs=epochs_n,
-                    batch=batch,
-                    device_name=device.type,
-                    recommended=recommended,
-                )
-                view.mark_paused(payload)
-                if not _wait_for_start(view):
-                    paused_exit = True
+            return True
+        view.mark_running()
+        return False
+
+    def _state_for(incoming: str, carry: SceneState | None, end_state: SceneState | None, chunk_in: SceneState | None) -> SceneState:
+        if incoming == "reset" or (incoming == "carry" and carry is None):
+            return net.initial_state(device=device, batch=1)
+        if incoming == "chunk":
+            if chunk_in is None:
+                return net.initial_state(device=device, batch=1)
+            return chunk_in
+        if incoming == "end":
+            if end_state is None:
+                return net.initial_state(device=device, batch=1)
+            return end_state
+        if carry is None:
+            return net.initial_state(device=device, batch=1)
+        return carry
+
+    def _train_passes() -> float | None:
+        nonlocal paused_exit, epoch, cursor, done, last_loss, supervised
+        nonlocal device, net, batch, recommended, windows
+        history: list[float] = []
+        best_value: float | None = None
+        best_blob: dict[str, Any] | None = None
+        while not paused_exit:
+            plan_steps = pass_plan(rows, chunk_len, stride)
+            windows = sum(1 for item in plan_steps if item["kind"] == "train")
+            carry: SceneState | None = None
+            end_state: SceneState | None = None
+            chunk_in: SceneState | None = None
+            hold_sum = 0.0
+            hold_n = 0
+            index = 0
+            while index < len(plan_steps) and not paused_exit:
+                if view.consume_pause() and _pause_now():
                     break
-                view.mark_running()
-                continue
-            if cursor >= len(windows):
-                epoch += 1
-                cursor = 0
-                continue
-            chunk = windows[cursor : cursor + batch]
-            try:
-                step_loss, n_sup = _optimizer_step(
-                    net,
-                    holder["opt"],
-                    holder["scaler"],
-                    root,
-                    chunk,
-                    device=device,
-                    amp=bool(holder["amp"]),
-                    view=view,
-                )
-                if step_loss is not None:
-                    last_loss = step_loss
-            except RuntimeError as exc:
-                if not _is_oom(exc):
-                    raise
-                net.zero_grad(set_to_none=True)
-                _release_cuda()
-                smaller = shrink_batch(batch) if device.type == "cuda" else 0
-                if device.type == "cuda" and smaller >= 1:
-                    batch = smaller
-                    recommended = True
+                item = plan_steps[index]
+                state_in = _state_for(str(item["incoming"]), carry, end_state, chunk_in)
+                if item["kind"] == "holdout":
+                    held_loss, held_count = _eval_sequence(
+                        net,
+                        root,
+                        list(item["rows"]),
+                        state_in,
+                        device=device,
+                        amp=bool(holder["amp"]),
+                        view=view,
+                    )
+                    if held_loss is not None and held_count:
+                        hold_sum += float(held_loss) * int(held_count)
+                        hold_n += int(held_count)
+                    index += 1
                     continue
-                if device.type == "cuda" and int(free_ram_bytes) > int(free_vram_bytes):
+                if item["incoming"] != "chunk":
+                    chunk_in = state_in
+                try:
+                    step_loss, n_sup, carry, end_state = _optimizer_step(
+                        net,
+                        holder["opt"],
+                        holder["scaler"],
+                        root,
+                        list(item["rows"]),
+                        state_in,
+                        device=device,
+                        amp=bool(holder["amp"]),
+                        view=view,
+                        stride=int(item["stride"]),
+                        clip=GRAD_CLIP,
+                    )
+                except RuntimeError as exc:
+                    if not _is_oom(exc):
+                        raise
+                    net.zero_grad(set_to_none=True)
+                    _release_cuda()
+                    if device.type != "cuda" or not (int(free_ram_bytes) > int(free_vram_bytes)):
+                        raise TrainFitError(
+                            "the training step fits neither free VRAM nor a larger pool of CPU RAM"
+                        ) from exc
                     cpu_batch = largest_batch(
                         usable_bytes(int(free_ram_bytes)),
                         file_bytes=file_bytes,
                         n_strips=len(rows),
-                        window_strips=window_strips,
-                        limit=len(windows),
+                        window_strips=chunk_len,
+                        limit=1,
                     )
                     if cpu_batch < 1:
                         raise TrainFitError(
@@ -606,35 +702,122 @@ def train_directory(
                     _arm("cpu")
                     device = holder["device"]
                     net = holder["net"]
-                    batch = cpu_batch
+                    batch = 1
                     recommended = False
+                    index = 0
+                    carry = None
+                    end_state = None
+                    chunk_in = None
                     continue
-                raise TrainFitError(
-                    "the training step fits neither free VRAM nor a larger pool of CPU RAM"
-                ) from exc
-            supervised += n_sup
-            cursor += len(chunk)
-            done += 1
-            elapsed = time.perf_counter() - started
-            remaining_windows = (epochs_n - epoch - 1) * len(windows) + (len(windows) - cursor)
-            remaining_steps = (remaining_windows + batch - 1) // batch if remaining_windows else 0
-            used, kind = _memory_reading(device.type)
-            _publish(
-                view,
-                TrainStatus(
-                    eta_s=predict_eta_s(done, elapsed, remaining_steps),
-                    loss=last_loss,
-                    lr=float(holder["opt"].param_groups[0]["lr"]),
-                    steps_per_sec=steps_per_second(done, elapsed),
-                    memory_bytes=used,
-                    memory_kind=kind,
-                    device=device.type,
-                    batch=batch,
-                    recommended=recommended,
-                    step=done,
-                    steps=done + remaining_steps,
-                ),
-            )
+                if step_loss is not None:
+                    last_loss = step_loss
+                supervised += n_sup
+                cursor += 1
+                done += 1
+                index += 1
+                elapsed = time.perf_counter() - started
+                remaining_steps = sum(1 for later in plan_steps[index:] if later["kind"] == "train")
+                used, kind = _memory_reading(device.type)
+                _publish(
+                    view,
+                    TrainStatus(
+                        eta_s=predict_eta_s(done, elapsed, remaining_steps),
+                        loss=last_loss,
+                        lr=float(holder["lr"]),
+                        steps_per_sec=steps_per_second(done, elapsed),
+                        memory_bytes=used,
+                        memory_kind=kind,
+                        device=device.type,
+                        batch=batch,
+                        recommended=recommended,
+                        step=done,
+                        steps=done + remaining_steps,
+                    ),
+                )
+            if paused_exit:
+                break
+            if hold_n <= 0:
+                break
+            mean = hold_sum / hold_n
+            history.append(mean)
+            if best_value is None or mean < best_value:
+                best_value = mean
+                best_blob = _clone_weights()
+            if holdout_stopped(history):
+                break
+            epoch += 1
+        if not paused_exit and best_blob is not None:
+            _load_weights(best_blob)
+        return best_value
+
+    try:
+        if not _wait_for_start(view):
+            paused_exit = True
+        else:
+            existing = load_checkpoint(root)
+            if existing is not None:
+                fields = resume_fields(existing)
+                _arm(device.type, float(fields["lr"]))
+                device = holder["device"]
+                net = holder["net"]
+                _apply_checkpoint(net, holder["opt"], holder["scaler"], fields, device)
+                # Weights, step, and optimizer resume. The pass starts again so the
+                # GRU state is rebuilt; that activation is not stored in the pause file.
+                epoch = int(fields["epoch"])
+                cursor = int(fields["cursor"])
+                done = int(fields["step"])
+                last_loss = fields["loss"]
+                view.restore_losses(fields["losses"])
+                view.mark_running()
+                used, kind = _memory_reading(device.type)
+                _publish(
+                    view,
+                    TrainStatus(
+                        eta_s=None,
+                        loss=last_loss,
+                        lr=float(holder["lr"]),
+                        steps_per_sec=0.0,
+                        memory_bytes=used,
+                        memory_kind=kind,
+                        device=device.type,
+                        batch=batch,
+                        recommended=recommended,
+                        step=done,
+                        steps=done,
+                    ),
+                    record_loss=False,
+                )
+                started = time.perf_counter()
+                _train_passes()
+            else:
+                # No pause file: a new run. Strip JPEGs and state lines stay.
+                init_blob = _clone_weights()
+                scores: dict[float, float] = {}
+                blobs: dict[float, dict[str, Any]] = {}
+                series: dict[float, list[float]] = {}
+                view.mark_running()
+                for rate in ordered_learning_rates(lr):
+                    _load_weights(init_blob)
+                    _arm(device.type, rate)
+                    started = time.perf_counter()
+                    device = holder["device"]
+                    net = holder["net"]
+                    epoch = 0
+                    cursor = 0
+                    done = 0
+                    last_loss = None
+                    view.losses = []
+                    score = _train_passes()
+                    if paused_exit:
+                        break
+                    scores[rate] = float("inf") if score is None else float(score)
+                    blobs[rate] = _clone_weights()
+                    series[rate] = [float(value) for value in view.losses]
+                if not paused_exit and scores:
+                    winner = pick_learning_rate(scores)
+                    _load_weights(blobs[winner])
+                    holder["lr"] = float(winner)
+                    view.restore_losses(series.get(winner, []))
         if not paused_exit and export_path is not None:
             export_scene_onnx(export_path, net)
         if not paused_exit:
@@ -644,10 +827,10 @@ def train_directory(
             view.close()
     return {
         "strips": len(rows),
-        "windows": len(windows),
+        "windows": windows,
         "supervised": supervised,
-        "precision": holder["precision"],
-        "capability": holder["cap"],
+        "precision": holder.get("precision", "fp32"),
+        "capability": holder.get("cap", capability),
         "export": None if export_path is None else str(export_path),
         "device": device.type,
         "batch": batch,
@@ -655,6 +838,9 @@ def train_directory(
         "file_bytes": file_bytes,
         "free_vram_bytes": int(free_vram_bytes),
         "free_ram_bytes": int(free_ram_bytes),
+        "requested_epochs": requested_epochs,
+        "chunk": chunk_len,
+        "lr": float(holder.get("lr", lr)),
     }
 
 

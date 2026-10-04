@@ -46,11 +46,30 @@ from python.train.fit import (  # noqa: E402
     step_bytes,
     usable_bytes,
 )
+from python.train.continual import (  # noqa: E402
+    CANDIDATE_LRS,
+    GRAD_CLIP,
+    WEIGHT_DECAY,
+    choose_chunk_length,
+    chunk_stride,
+    chunk_vram_budget,
+    holdout_stopped,
+    is_rare_row,
+    offcenter_view,
+    oversample_repeats,
+    pass_plan,
+    pick_learning_rate,
+    should_reset_state,
+    simulate_carry,
+    strip_roll_is_yaw,
+)
 from python.train.scene_net import (  # noqa: E402
     LOSS_TERMS,
     MEMORY_S,
     OUTPUT_FIELDS,
     PREDICT_PATH_ARGS,
+    RESIDUAL_S,
+    RESIDUAL_TOKENS,
     ScenePrediction,
     amp_enabled,
     assign_min_cost,
@@ -61,6 +80,7 @@ from python.train.scene_net import (  # noqa: E402
     memory_windows,
     moment_ok,
     precision_for_capability,
+    residual_keep_count,
     scene_loss,
     scene_to_predict_kwargs,
     step_dt,
@@ -442,8 +462,8 @@ def _assert_prediction(pred: ScenePrediction, state: object) -> None:
     assert tuple(pred.sign_state.shape) == (8, 4)
     assert tuple(pred.sign_valid.shape) == (8,)
     assert tuple(state.h.shape) == (1, 1, 512)  # type: ignore[attr-defined]
-    assert tuple(state.tokens.shape) == (1, 8, 512)  # type: ignore[attr-defined]
-    assert tuple(state.mask.shape) == (1, 8)  # type: ignore[attr-defined]
+    assert tuple(state.tokens.shape) == (1, RESIDUAL_TOKENS, 512)  # type: ignore[attr-defined]
+    assert tuple(state.mask.shape) == (1, RESIDUAL_TOKENS)  # type: ignore[attr-defined]
     assert torch_isfinite(pred)
 
 
@@ -1394,6 +1414,140 @@ def check_pause_checkpoint_roundtrip() -> None:
         assert float(fresh_net.bias.detach().reshape(-1)[0]) == -0.5
 
 
+def _hand_keep(dts: list[float], span_s: float = RESIDUAL_S) -> int:
+    """Tokens whose age, measured forward from later steps, is still inside the span."""
+    return sum(1 for index in range(len(dts)) if sum(dts[index + 1 :]) <= span_s)
+
+
+def check_continual_bptt_and_yaw() -> None:
+    """dt changes the step, state crosses a chunk, and the strip is not rolled."""
+    assert step_dt(0.05) == 0.05
+    assert step_dt(0.40) == 0.40
+    assert step_dt(0.05) != 0.2
+    assert step_dt(0.40) != 0.2
+    assert step_dt(0.05) + step_dt(0.40) == 0.45
+
+    fast = [0.05] * 30
+    slow = [0.5] * 3
+    assert residual_keep_count(fast) == _hand_keep(fast) == 30
+    assert residual_keep_count(slow) == _hand_keep(slow) == 3
+    assert residual_keep_count(fast) > residual_keep_count(slow)
+    assert residual_keep_count(fast) != 8
+    assert residual_keep_count(slow) != 8
+    assert RESIDUAL_TOKENS > 8
+
+    rows = [
+        {"session": "a", "t": index * 0.2, "dt_s": None if index == 0 else 0.2}
+        for index in range(30)
+    ]
+    traced = simulate_carry(rows, 12, 6)
+    assert traced[0]["reset"] is True
+    assert traced[0]["hidden_in"] == 0.0
+    assert traced[1]["reset"] is False
+    assert traced[1]["start"] < traced[0]["end"]
+    assert traced[1]["hidden_in"] == traced[0]["hidden_at_stride"]
+    assert traced[1]["hidden_in"] != 0.0
+    assert all(item["grad_frames"] <= 12 for item in traced)
+    assert max(item["grad_frames"] for item in traced) < int(MEMORY_S / 0.2)
+    assert not should_reset_state("a", "a", 0.05)
+    assert should_reset_state("a", "a", None)
+    assert should_reset_state("a", "b", 0.05)
+    assert should_reset_state("a", "a", MEMORY_S + 1.0)
+
+    gapped = rows + [{"session": "a", "t": 100.0, "dt_s": MEMORY_S + 1.0}]
+    gap_trace = simulate_carry(gapped, 12, 6)
+    assert gap_trace[-1]["reset"] is True
+    assert gap_trace[-1]["hidden_in"] == 0.0
+    switched = rows[:8] + [{"session": "b", "t": 0.0, "dt_s": None}]
+    assert simulate_carry(switched, 8, 4)[-1]["reset"] is True
+
+    long_rows = [
+        {"session": "a", "t": index * 0.2, "dt_s": None if index == 0 else 0.2, "i": index}
+        for index in range(80)
+    ]
+    plan = pass_plan(long_rows, 12, 6)
+    train = [item for item in plan if item["kind"] == "train"]
+    hold = [row for item in plan if item["kind"] == "holdout" for row in item["rows"]]
+    assert train
+    assert hold
+    assert train[0]["incoming"] == "reset"
+    assert train[1]["incoming"] == "carry"
+    assert train[1]["rows"][0] is train[0]["rows"][6]
+    assert all(item["grad_frames"] <= 12 for item in train)
+    assert max(item["grad_frames"] for item in train) < int(MEMORY_S / 0.2)
+    assert all(row not in hold for item in train for row in item["rows"])
+
+    rare_rows = []
+    for index in range(10):
+        tech: dict[str, object] = {}
+        if index == 1:
+            tech = {"signs": [{"cls": "traffic_light", "state": "red"}]}
+        if index == 3:
+            tech = {"turn": "unprotected"}
+        if index == 9:
+            tech = {"signs": [{"cls": "stop_sign", "x": 1.0, "y": 2.0}]}
+        rare_rows.append(
+            {
+                "session": "a",
+                "t": float(index),
+                "dt_s": None if index == 0 else 1.0,
+                "tech": tech,
+                "i": index,
+            }
+        )
+    rare_plan = pass_plan(rare_rows, 8, 4)
+    rare_train = [item for item in rare_plan if item["kind"] == "train"]
+    rare_hold = [row for item in rare_plan if item["kind"] == "holdout" for row in item["rows"]]
+    assert any(row["i"] == 9 for row in rare_hold)
+    assert all(row["i"] != 9 for item in rare_train for row in item["rows"])
+    assert sum(1 for item in rare_train for row in item["rows"] if row["i"] == 1) >= 2
+    assert is_rare_row({"tech": {"signs": [{"cls": "stop_sign"}]}})
+    assert is_rare_row({"tech": {"unprotected_turn": True}})
+    assert not is_rare_row({"tech": {"signs": [{"cls": "traffic_light", "state": "green"}]}})
+    assert oversample_repeats([{"tech": {}}]) == 1
+    assert oversample_repeats([{"tech": {"signs": [{"cls": "traffic_light", "state": "red"}]}}]) == 2
+
+    assert holdout_stopped([0.5]) is False
+    assert holdout_stopped([0.5, 0.4]) is False
+    assert holdout_stopped([0.5, 0.4, 0.45]) is True
+    assert pick_learning_rate({1e-3: 0.4, 1e-4: 0.2}) == 1e-4
+    assert pick_learning_rate({1e-3: 0.2, 1e-4: 0.4}) == 1e-3
+    assert pick_learning_rate({1e-3: 0.2, 1e-4: 0.2}) == CANDIDATE_LRS[0]
+    assert WEIGHT_DECAY == 0.01
+    assert GRAD_CLIP == 1.0
+    assert choose_chunk_length(1, 10**9) == 16
+    assert choose_chunk_length(10, 100) == 10
+    assert choose_chunk_length(20, 100) == 8
+    assert chunk_vram_budget(12 * 1024**3) == 11 * 1024**3
+    assert chunk_stride(12) < 12
+
+    pixels = np.arange(12, dtype=np.uint8).reshape(3, 4)
+    labels = {"lanes": [{"x": 1.0, "y": 2.0}], "signs": [{"cls": "stop_sign", "x": 3.0, "y": 4.0}]}
+    out_pixels, out_labels = offcenter_view(pixels, labels)
+    assert strip_roll_is_yaw() is False
+    assert out_pixels is pixels
+    assert out_labels is labels
+    assert np.array_equal(out_pixels, pixels)
+    note = inspect.getsource(strip_roll_is_yaw) + inspect.getsource(offcenter_view)
+    assert "not a yaw roll" in note
+
+    from python.train.train_scene import _eval_sequence, _optimizer_step
+
+    step_src = inspect.getsource(_optimizer_step)
+    assert "initial_state" not in step_src
+    assert "step_dt" in step_src
+    assert "clip_grad_norm_" in step_src
+    assert "no_grad" in inspect.getsource(_eval_sequence)
+    body = inspect.getsource(train_directory)
+    assert "while epoch <" not in body
+    assert "AdamW" in body
+    assert "WEIGHT_DECAY" in body
+    assert "GRAD_CLIP" in body
+    assert "pass_plan" in body
+    assert "holdout_stopped" in body
+    assert body.index("plan_fit") < body.index("_optimizer_step")
+
+
 def check_trainer_is_offline() -> None:
     files = (
         ROOT / "python" / "train" / "train_scene.py",
@@ -1441,6 +1595,7 @@ def main() -> None:
     check_train_panel_loss_graph()
     check_parameter_count_hand_sum()
     check_pause_checkpoint_roundtrip()
+    check_continual_bptt_and_yaw()
     check_trainer_is_offline()
     check_net_cpu()
     print("test_scene_strip: OK")

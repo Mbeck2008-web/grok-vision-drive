@@ -198,6 +198,7 @@ def main() -> None:
     _check_gap_is_not_one_polyline()
     _check_curve_stays_one_line()
     _check_stitch_view_and_past_path()
+    _check_stitch_lane_meters_and_empty_band()
     print("test_lanes_hough_int: OK")
 
 
@@ -270,6 +271,57 @@ def _check_stitch_view_and_past_path() -> None:
 
     assert _hit(32.0) > 0, "lane line runs past the blue path"
     assert _hit(80.0) == 0, "lane line does not run out to the cabin span"
+
+
+def _near_xs(lanes_bev: list) -> list[float]:
+    out: list[float] = []
+    for poly in lanes_bev:
+        near = min(poly, key=lambda p: float(p["y"]))
+        out.append(float(near["x"]))
+    return sorted(out)
+
+
+def _check_stitch_lane_meters_and_empty_band() -> None:
+    """Windshield sectors stay in road meters. An empty band uses main."""
+    from python.perception.lanes import lanes_from_view
+    from python.perception.stitch360 import stitch_frames
+    from python.planning.path_predictor import predict_path
+
+    road = _yellow_white_road(
+        asphalt=(40, 40, 42),
+        yellow=(0, 220, 220),
+        white=(230, 230, 230),
+        width=6,
+    )
+    direct = lanes_from_view(road, None)
+    plan_direct = predict_path(
+        lanes_bev=direct.lanes_bev, lane_conf=direct.conf, ego_speed_mps=5.0,
+    )
+    assert plan_direct.drivable and len(plan_direct.path_ego) >= 30, plan_direct
+    stitched = lanes_from_view(np.zeros_like(road), stitch_frames({"main": road}).bgr)
+    assert stitched.conf >= 0.9, stitched.conf
+    near = _near_xs(stitched.lanes_bev)
+    assert len(near) >= 2, stitched.lanes_bev
+    width = near[-1] - near[0]
+    assert width >= 1.2, near
+    direct_near = _near_xs(direct.lanes_bev)
+    assert abs(near[0] - direct_near[0]) < 0.45, (near, direct_near)
+    assert abs(near[-1] - direct_near[-1]) < 0.45, (near, direct_near)
+    plan = predict_path(
+        lanes_bev=stitched.lanes_bev, lane_conf=stitched.conf, ego_speed_mps=5.0,
+    )
+    assert plan.drivable and plan.path_ego, plan
+    assert plan.prediction != "none", plan.prediction
+    assert max(float(p["y"]) for p in plan.path_ego) > 30.0
+
+    rear = np.full((48, 80, 3), (0, 180, 0), dtype=np.uint8)
+    pillar = np.full((48, 80, 3), (180, 180, 180), dtype=np.uint8)
+    for frames in ({"rear": rear}, {"pillarL": pillar}):
+        canvas = stitch_frames(frames).bgr
+        fit = lanes_from_view(road, canvas)
+        assert fit.conf >= 0.9 and fit.lanes_bev, (frames, fit)
+        again = predict_path(lanes_bev=fit.lanes_bev, lane_conf=fit.conf, ego_speed_mps=5.0)
+        assert again.drivable and again.path_ego, again
 
 
 def _px(ex: float, ey: float, w: int = 640, h: int = 480) -> tuple[float, float]:

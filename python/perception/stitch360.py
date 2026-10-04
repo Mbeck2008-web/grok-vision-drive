@@ -151,6 +151,22 @@ def _frame_for(frames: Mapping[str, Any], cam_id: str) -> Any:
     return img
 
 
+def windshield_x_spans(bgr: np.ndarray) -> tuple[tuple[int, int], ...] | None:
+    """Pixel spans of wide, main, and narrow inside a windshield band.
+
+    Each span is one camera. ``None`` means the image is already a single
+    frame, so the usual full-width ego-x scale applies.
+    """
+    if not isinstance(bgr, np.ndarray) or bgr.ndim < 2:
+        return None
+    height, width = int(bgr.shape[0]), int(bgr.shape[1])
+    band_w = 3 * SECTOR_W + 2 * GAP_PX
+    if height != SECTOR_H or width != band_w:
+        return None
+    step = SECTOR_W + GAP_PX
+    return tuple((i * step, i * step + SECTOR_W) for i in range(3))
+
+
 def forward_lane_view(bgr: np.ndarray) -> np.ndarray:
     """Windshield band of a stitch canvas. Any other image is returned as-is.
 

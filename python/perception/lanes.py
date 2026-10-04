@@ -60,6 +60,7 @@ def estimate_lanes(
     *,
     far_m: float = _MAIN_FAR_M,
     roi_top: float = 0.40,
+    x_spans: tuple[tuple[int, int], ...] | None = None,
 ) -> LaneResult:
     """Fit ego-lane paint on one image.
 
@@ -75,7 +76,12 @@ def estimate_lanes(
     if bgr is None or bgr.size == 0:
         return LaneResult(conf=0.0, lanes_bev=[], curvature=0.0)
     try:
-        return _estimate_lanes_impl(bgr, far_m=float(far_m), roi_top=float(roi_top))
+        return _estimate_lanes_impl(
+            bgr,
+            far_m=float(far_m),
+            roi_top=float(roi_top),
+            x_spans=x_spans,
+        )
     except IndexError as exc:
         _LOG.error(
             "estimate_lanes Hough/layout IndexError (%s); refusing lane_conf=0",
@@ -141,15 +147,52 @@ def lane_roi_mask(height: int, width: int, top_frac: float = 0.40) -> np.ndarray
     return mask
 
 
+def _span_of(
+    x: float,
+    spans: tuple[tuple[int, int], ...] | None,
+) -> tuple[int, int] | None:
+    """Sector that contains ``x``. A gap pixel uses the nearest sector."""
+    if not spans:
+        return None
+    best: tuple[int, int] | None = None
+    best_d = 1e9
+    for x0, x1 in spans:
+        if x0 <= x < x1:
+            return (x0, x1)
+        d = min(abs(x - x0), abs(x - (x1 - 1)))
+        if d < best_d:
+            best, best_d = (x0, x1), d
+    return best
+
+
+def _ego_x(
+    x: float,
+    width: float,
+    x_spans: tuple[tuple[int, int], ...] | None = None,
+) -> float:
+    """Lateral meters. One camera is ±3 m across its own width.
+
+    A windshield band is several cameras side by side. Scaling the whole
+    band as one camera squeezes a real lane under a meter. Each painted
+    sector keeps the single-camera scale, so 0.9 m is still a road distance.
+    """
+    span = _span_of(float(x), x_spans)
+    if span is None:
+        return ((float(x) / float(width)) - 0.5) * 6.0
+    x0, x1 = span
+    return ((float(x) - x0) / float(max(1, x1 - x0)) - 0.5) * 6.0
+
+
 def _ego_point(
     x: float,
     y: float,
     width: float,
     height: float,
     far_m: float = _MAIN_FAR_M,
+    x_spans: tuple[tuple[int, int], ...] | None = None,
 ) -> dict[str, float]:
     """Crude pixel → ego meters (x right, y forward)."""
-    ex = ((float(x) / float(width)) - 0.5) * 6.0
+    ex = _ego_x(x, width, x_spans)
     ey = max(2.0, float(far_m) * (1.0 - float(y) / float(height)))
     return {"x": float(ex), "y": float(ey), "z": 0.0}
 
@@ -159,10 +202,11 @@ def _ordered_ego_segment(
     width: float,
     height: float,
     far_m: float = _MAIN_FAR_M,
+    x_spans: tuple[tuple[int, int], ...] | None = None,
 ) -> tuple[dict[str, float], dict[str, float]]:
     x1, y1, x2, y2 = seg[0], seg[1], seg[2], seg[3]
-    a = _ego_point(x1, y1, width, height, far_m)
-    b = _ego_point(x2, y2, width, height, far_m)
+    a = _ego_point(x1, y1, width, height, far_m, x_spans)
+    b = _ego_point(x2, y2, width, height, far_m, x_spans)
     if a["y"] <= b["y"]:
         return a, b
     return b, a
@@ -187,6 +231,7 @@ def chain_lane_segments(
     width: int,
     height: int,
     far_m: float = _MAIN_FAR_M,
+    x_spans: tuple[tuple[int, int], ...] | None = None,
 ) -> list[list[dict[str, float]]]:
     """Polylines for one slope group. Pieces that do not meet stay apart.
 
@@ -196,7 +241,7 @@ def chain_lane_segments(
     starts a new polyline instead of kinking the one in hand. Each returned
     line is ordered by increasing forward distance.
     """
-    pieces = [_ordered_ego_segment(s, width, height, far_m) for s in segs[:8]]
+    pieces = [_ordered_ego_segment(s, width, height, far_m, x_spans) for s in segs[:8]]
     pieces.sort(key=lambda ab: (ab[0]["y"], ab[0]["x"], ab[1]["y"]))
     chains: list[list[tuple[dict[str, float], dict[str, float]]]] = []
     for near, far in pieces:
@@ -235,16 +280,22 @@ def lanes_from_view(
     main_bgr: np.ndarray | None,
     stitch_bgr: np.ndarray | None = None,
 ) -> LaneResult:
-    """Fit lanes on the 360 strip when that frame has pixels, else on main.
+    """Fit lanes on the windshield band when that band has pixels, else on main.
 
-    The strip's windshield band is the image. Repeater and rear sectors stay
-    out of this fit. An empty stitch falls back to ``cam_main``.
+    Repeater and rear pixels do not make a lane frame. An empty windshield
+    band falls back to ``cam_main`` even if some other sector is painted.
     """
-    from python.perception.stitch360 import forward_lane_view
+    from python.perception.stitch360 import forward_lane_view, windshield_x_spans
     from python.sensors.cameras import frame_is_unrendered
 
     if stitch_bgr is not None and not frame_is_unrendered(stitch_bgr):
-        return estimate_lanes(forward_lane_view(stitch_bgr), far_m=STITCH_LANE_FAR_M)
+        band = forward_lane_view(stitch_bgr)
+        if not frame_is_unrendered(band):
+            return estimate_lanes(
+                band,
+                far_m=STITCH_LANE_FAR_M,
+                x_spans=windshield_x_spans(band),
+            )
     return estimate_lanes(main_bgr)
 
 
@@ -252,6 +303,7 @@ def _estimate_lanes_impl(
     bgr: np.ndarray,
     far_m: float = _MAIN_FAR_M,
     roi_top: float = 0.40,
+    x_spans: tuple[tuple[int, int], ...] | None = None,
 ) -> LaneResult:
     bgr = _as_bgr(bgr)
     h, w = bgr.shape[:2]
@@ -281,10 +333,10 @@ def _estimate_lanes_impl(
     lanes_bev: list[list[dict[str, float]]] = []
     curv = 0.0
     if left:
-        lanes_bev.extend(chain_lane_segments(left, w, h, far_m))
+        lanes_bev.extend(chain_lane_segments(left, w, h, far_m, x_spans))
         conf += 0.4
     if right:
-        lanes_bev.extend(chain_lane_segments(right, w, h, far_m))
+        lanes_bev.extend(chain_lane_segments(right, w, h, far_m, x_spans))
         conf += 0.4
     if left and right:
         # crude curvature from mean slope asymmetry

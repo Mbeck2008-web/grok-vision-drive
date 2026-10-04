@@ -689,11 +689,11 @@ def check_no_chrome() -> None:
 
 def check_player_docs() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "## Alpha 1.7.9" in readme
+    assert "## Alpha 1.7.10" in readme
     assert "This is **alpha** — may break / not work; improves with fixes." in readme
     assert "**point** bumps" in readme and "fixes / small UI" in readme
     assert "**main alpha** bump" in readme and "features / core / UI overhaul" in readme
-    assert "1.7.9-alpha-<sha>" in readme
+    assert "1.7.10-alpha-<sha>" in readme
     assert "docs/stitch-360.png" in readme
     assert "docs/soft-esc-highway.jpg" not in readme
     assert "Soft Esc parked" in readme

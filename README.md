@@ -21,10 +21,6 @@ Canonical pin **1.7.4** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Un
 
 Catch-up from **1.0.1**. Each feature merge since that pin is one main step. The throttle fix is the point in between. Live Alt+G, Tech 8-cam, FFB, and QSV stay **UNPROVEN**.
 
-### 1.7.4 wheel rotation
-
-- Disengage uses wheel rotation against the commanded steer. Force-feedback torque is not a signal. An echo of a command already ahead of the wheel is residual 0, a later smaller command keeps that catch-up inside the span, and a held rotation of 0.25 drops Engage.
-
 ### 1.7.3 side cameras
 
 - Pillar yaws turn 10 degrees further back, from 68 to 78. Fender repeaters move 0.15 m back so less of the car is in frame.
@@ -420,3 +416,7 @@ PYTHONPATH=. python -m python.train.train_e2e --smoke
 ```
 
 Modular veto thresholds: `config/control.yaml`. E2E input 320×180: `config/perception.yaml` / `control.yaml`. Weights stay out of git.
+
+### 1.7.4 wheel rotation
+
+- Disengage uses wheel rotation against the commanded steer. Force-feedback torque is not a signal. An echo of a command already ahead of the wheel is residual 0, a later smaller command keeps that catch-up inside the span, and a held rotation of 0.25 drops Engage.

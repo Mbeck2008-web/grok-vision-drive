@@ -372,7 +372,7 @@ def _draw_cams_tab(
     intro = (
         f"grid dropped (loop < {CAMS_DROP_HZ:.0f} Hz) -- slots stay labelled"
         if dropped
-        else "3x3 -- empty center; last frame kept; missing stays labelled"
+        else "3x3 -- empty center; missed camera is an empty labelled slot"
     )
     _put(img, _fit(intro, w - PAD_X * 2, FS_DIM), (PAD_X, y), FS_DIM, DIM)
     y += ROW_H

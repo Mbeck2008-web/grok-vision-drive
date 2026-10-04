@@ -401,10 +401,10 @@ def camera_grab_div(cid: str, hitch: dict[str, Any] | None = None) -> int:
 
 
 def camera_grab_phase(cid: str, hitch: dict[str, Any] | None = None) -> int:
-    """Slot on the 16-tick wheel. Wide (even) and narrow (odd) never share a tick.
+    """Stored slot on the 16-tick wheel. The live grab reads every camera on that tick.
 
     pillarL is side phase; pillarR steps +1. repeatL is repeat phase; repeatR
-    steps +2. Rear sits on its own slot with no side companion.
+    steps +2. Rear sits on its own stored slot.
     """
     hitch = hitch if isinstance(hitch, dict) else {}
     if cid == "narrow":
@@ -1004,12 +1004,12 @@ def read_camera_colour(
     cid: str,
     resolution: tuple[int, int] | None = None,
 ) -> np.ndarray | None:
-    """Main: stream_raw. Wide, narrow, sides, and rear: poll.
+    """Legacy colour read when a camera has no shared-memory buffer.
 
-    One stream_raw per grab (main, every tick). Wide and narrow alternate
-    across ticks and never share one. is_streaming stays true; poll is not a
-    second stream_raw. On-demand BeamNGpy cameras take the ad-hoc path in
-    ``BeamNGPyBackend.grab`` instead of this poll — poll does not render them.
+    The live grab reads shared memory for all eight cameras on that tick and
+    does not send an ad-hoc render. Called here, main uses stream_raw and a
+    legacy companion uses poll. is_streaming stays true; poll is not a second
+    stream_raw.
     """
     res = resolution or _cam_resolution(cam)
     if cid == "main":
@@ -1020,8 +1020,8 @@ def read_camera_colour(
         except Exception:
             return None
         return _reading_colour(raw, res)
-    # Wide/narrow and sides/rear: poll. Never set streaming false.
-    # Cameras that implement ad-hoc are not read here; grab() owns that path.
+    # Legacy companion with poll and no shared memory. grab() reads the eight
+    # shared-memory cameras itself and does not send an ad-hoc render.
     if camera_uses_adhoc(cam):
         return None
     if not hasattr(cam, "poll"):

@@ -179,4 +179,4 @@ A sun-blown colour buffer is matched once, on the frame the lane fit, the model,
 
 ### Arcade
 
-Engage arms arcade once. A failed arm is retried on a later tick. Letting go of the car does not arm arcade on the way out. The control message omits gear. Throttle releases the parking brake and the clutch. A hold, a stop, or AEB sets the parking brake and releases the service brake. The drive arm releases the parking brake and the clutch, and it leaves the gearbox mode alone. Retail queues shifter mode 2 once per vehicle. Mode 2 is arcade.
+Engage arms arcade once. A failed arm is retried on a later tick. The release does not latch the drive arm, and the handoff restores arcade for the player. The control message omits gear. Throttle releases the parking brake and the clutch. A hold, a stop, or AEB sets the parking brake and releases the service brake. The drive arm releases the parking brake and the clutch, and it leaves the gearbox mode alone. Retail queues shifter mode 2 once per vehicle. Mode 2 is arcade.

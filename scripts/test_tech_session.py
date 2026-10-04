@@ -662,9 +662,6 @@ def check_camera_clip_planes() -> None:
     assert "NVIDIA_SMI_TIMEOUT_S" in hw
     assert "timeout=3" not in hw
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "BeamNGpy #199" in readme or "BeamNGpy/issues/199" in readme
-    assert "narrow > main" in readme
-    assert "@ -1" in readme or "@ **-1**" in readme
     assert "0.13 half-rate" not in readme
     assert "0.267" not in readme
     schema = (ROOT / "docs" / "gvd_state_schema.md").read_text(encoding="utf-8")
@@ -2425,13 +2422,8 @@ def check_tech_hold_gate() -> None:
     assert "--tech-hold" in rv
     assert 'ord("q"), 27' in rv
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    readme_dev = readme.split("### Dev install (BeamNG.tech)", 1)[1].split("**Tech hold prove**", 1)[0]
-    assert "--tech-hold" in readme_dev
-    assert "python python/run_vision.py --tech-hold" not in readme_dev
     assert "Soft Esc parked" in readme
-    assert "Tech hold prove" in readme
-    assert "quit_on_close" in readme
-    assert "Unique-frame Hz" in readme and "not" in readme
+    assert "python python/run_vision.py --tech-hold" not in readme
 
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)

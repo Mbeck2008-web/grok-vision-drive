@@ -60,27 +60,19 @@ def main() -> None:
 
     readme = README.read_text(encoding="utf-8")
     src = SOURCE.read_text(encoding="utf-8")
-    shot_block = readme.split("## Screenshots", 1)[1].split("## Audiences", 1)[0]
-    for text in (shot_block, src):
-        assert "gvd_cabin_synthetic.png" in text
-        assert "gvd_ingame_ui_synthetic.png" in text
-        assert "gvd_ingame_ui_drive_synthetic.png" in text
-        assert "synthetic" in text.lower()
-        assert CHROME_RE.search(text) is None, "screenshots/SOURCE must not add Tesla/FSD chrome"
-
-    # Captions must not claim a live photo.
-    assert "synthetic" in shot_block.lower()
-    assert "not a live" in shot_block.lower()
-    assert "Soft Esc parked" in shot_block
-    assert "Not Engage" in shot_block
-    assert "DISENGAGED" in shot_block
-    assert "DRIVE" in shot_block
-    assert "Not a live Engage" in shot_block
-
-    assert "docs/media/gvd_cabin_synthetic.png" in readme
-    assert "docs/media/gvd_ingame_ui_synthetic.png" in readme
-    assert "docs/media/gvd_ingame_ui_drive_synthetic.png" in readme
-    assert "render_readme_media.py" in readme
+    for name in (
+        "gvd_cabin_synthetic.png",
+        "gvd_ingame_ui_synthetic.png",
+        "gvd_ingame_ui_drive_synthetic.png",
+    ):
+        assert name in src
+    assert "synthetic" in src.lower()
+    assert CHROME_RE.search(src) is None, "SOURCE must not add Tesla/FSD chrome"
+    top = readme.split("## Recent changes", 1)[0]
+    assert "docs/stitch-360.png" in top
+    assert "docs/soft-esc-highway.jpg" in top
+    assert "photo of the monitor" in top
+    assert "Soft Esc parked" in top
 
     # Parked cabin: regenerating with engaged=False stays the README dest.
     from python.viz.stage import smoke

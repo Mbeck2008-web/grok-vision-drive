@@ -241,7 +241,7 @@ def check_link_and_gear() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "brake=1` ± `parkingbrake`" not in readme
     assert "neutral + brake" not in readme
-    assert "parkingbrake=1" in readme and "service `brake=0`" in readme
+    assert "sets the parking brake and releases the service brake" in readme
     vision = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
     assert "waitKeyEx" in vision
     assert "waitKey(1) & 0xFF" not in vision

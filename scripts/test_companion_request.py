@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from python.sensors.cameras import (  # noqa: E402
+    _reading_colour,
     CAM_IDS,
     COMPANION_OFFSCREEN_UPDATE_S,
     ON_DEMAND_UPDATE_S,
@@ -26,6 +27,7 @@ from python.sensors.cameras import (  # noqa: E402
     camera_grab_due,
     colour_to_bgr,
     companion_frame_is_flash,
+    recover_viewport_tone,
     load_camera_config,
 )
 
@@ -74,8 +76,40 @@ def _check_flash_frame_does_not_land() -> None:
     assert np.array_equal(main_landed["main"], flash)
 
 
+def _check_washed_companion_is_toned_and_stored() -> None:
+    """Flash is the buffer before the curve. A washed road is not that flash.
+
+    Asphalt (228, 220, 210) against a settled road is under the blue bar.
+    After the curve the blue excess clears the bar, and the old gate dropped
+    the companion. The frame that lands is the tone-matched road.
+    """
+    settled = _road((108, 102, 98))
+    washed = _road((228, 220, 210))
+    rgb = np.ascontiguousarray(washed[:, :, ::-1])
+    raw = colour_to_bgr(rgb, tone=False)
+    assert raw is not None
+    assert tuple(int(v) for v in raw[10, 10]) == (228, 220, 210)
+    assert companion_frame_is_flash(raw, settled) is False
+    toned = recover_viewport_tone(raw)
+    assert tuple(int(v) for v in toned[10, 10]) == (163, 141, 117)
+    assert companion_frame_is_flash(toned, settled) is True
+    read = _reading_colour({"colour": rgb}, None)
+    assert read is not None and np.array_equal(read, raw)
+    be = BeamNGPyBackend.__new__(BeamNGPyBackend)
+    be.long_side = 640
+    be._cache_frames = {"wide": settled.copy(), "main": settled.copy()}
+    be._cache_ts = {"wide": 0.0, "main": 0.0}
+    be._frame_sig = {}
+    wide = _publish(be, "wide", read)
+    assert np.array_equal(wide["wide"], toned)
+    assert tuple(int(v) for v in be._cache_frames["wide"][10, 10]) == (163, 141, 117)
+    main = _publish(be, "main", read)
+    assert np.array_equal(main["main"], toned)
+
+
 def main() -> None:
     _check_flash_frame_does_not_land()
+    _check_washed_companion_is_toned_and_stored()
     off = beamng_camera_sensor_kwargs(
         pos=(0.0, 0.0, 1.2),
         direction=(0.0, -1.0, 0.0),

@@ -117,6 +117,11 @@ def main() -> None:
     _assert_stitch_uses_corrected(corrected)
     again = recover_viewport_tone(corrected)
     assert np.array_equal(again, corrected)
+    # A bright gray hood is not the road. Mid-gray asphalt stays, and the
+    # lane fit does not drop a lane or grow two more. colour_to_bgr is the
+    # store path for sensor frames; recover_viewport_tone is the window grab.
+    _assert_midgray_hood_stays((128, 118, 108), (236, 236, 236))
+    _assert_midgray_hood_stays((140, 132, 124), (220, 220, 220))
     print("test_sensor_tone: OK")
 
 
@@ -203,6 +208,30 @@ def _highlight_knee(img: np.ndarray, knee: float = 140.0, keep: float = 0.35) ->
     return np.clip(np.rint(y), 0, 255).astype(np.uint8)
 
 
+def _assert_midgray_hood_stays(
+    asphalt: tuple[int, int, int],
+    hood: tuple[int, int, int],
+) -> None:
+    raw = _highway(
+        asphalt=asphalt,
+        yellow=(40, 210, 235),
+        white=(245, 245, 245),
+        sky=(175, 185, 195),
+        width=4,
+        hood=hood,
+    )
+    before = estimate_lanes(raw)
+    assert before.conf >= 0.9 and len(before.lanes_bev) == 2, before
+    via = colour_to_bgr(np.ascontiguousarray(raw[:, :, ::-1]))
+    window = recover_viewport_tone(raw)
+    assert via is not None
+    assert np.array_equal(via, raw), tuple(int(v) for v in via[360, 320])
+    assert np.array_equal(window, raw), tuple(int(v) for v in window[360, 320])
+    assert tuple(int(v) for v in via[360, 320]) == asphalt
+    after = estimate_lanes(via)
+    assert after.conf >= 0.9 and len(after.lanes_bev) == 2, after
+
+
 def _highway(
     *,
     asphalt: tuple[int, int, int],
@@ -211,6 +240,7 @@ def _highway(
     sky: tuple[int, int, int],
     width: int,
     stripes: bool = True,
+    hood: tuple[int, int, int] = (35, 35, 38),
 ) -> np.ndarray:
     cv2 = __import__("cv2")
     w, h = 640, 480
@@ -230,7 +260,7 @@ def _highway(
     if stripes:
         _draw(w * 0.28, yellow)
         _draw(w * 0.72, white)
-    cv2.rectangle(img, (0, int(h * 0.93)), (w, h), (35, 35, 38), -1)
+    cv2.rectangle(img, (0, int(h * 0.93)), (w, h), hood, -1)
     return img
 
 

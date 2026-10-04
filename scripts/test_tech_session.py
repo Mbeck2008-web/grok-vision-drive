@@ -734,9 +734,10 @@ def check_beamngpy_open_passes_near_far() -> None:
             be.open()
         log = buf.getvalue()
         assert "hitch steps narrow:" in log
-        assert "far_m=800@update_s=-1" in log
+        assert "far_m=800@requested_update_time=1" in log
+        assert "update_s=-1" not in log
         assert "hitch steps rear:" in log
-        assert "far_m=100@update_s=-1" in log
+        assert "far_m=100@requested_update_time=1" in log
         assert "hitch steps pillarL:" in log
         assert "not resolution" in log
         assert "grab_div main=1" in log

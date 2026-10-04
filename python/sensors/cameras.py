@@ -636,6 +636,19 @@ def iter_clip_attach_attempts(
     return [(near_m, f, rate) for f in far_hitch_ladder(cam_id, far_m)]
 
 
+def sensor_requested_update_s(update_s: float) -> float:
+    """Camera ``requested_update_time`` for a yaml rate.
+
+    Yaml ``-1`` is the hitch. The sensor still renders offscreen at
+    ``COMPANION_OFFSCREEN_UPDATE_S``. A negative rate is not sent: that would
+    need SendAdHocRequestCamera, which flashes the game view.
+    """
+    rate = float(update_s)
+    if rate < 0:
+        return COMPANION_OFFSCREEN_UPDATE_S
+    return rate
+
+
 def beamng_camera_sensor_kwargs(
     *,
     pos: tuple[float, float, float],
@@ -660,9 +673,7 @@ def beamng_camera_sensor_kwargs(
     # A negative rate would need SendAdHocRequestCamera to get a picture.
     # That request renders through the game view and flashes exposure for one
     # frame. The sensor still updates offscreen; GVD only reads it on the hitch.
-    rate = float(update_s)
-    if rate < 0:
-        rate = COMPANION_OFFSCREEN_UPDATE_S
+    rate = sensor_requested_update_s(update_s)
     return {
         "requested_update_time": rate,
         "update_priority": float(min(1.0, max(0.0, update_priority))),
@@ -709,6 +720,10 @@ _TONE_TARGET = 136.0
 _TONE_GAMMA_CAP = 9.0
 _TONE_SAT_MAX = 22.0
 _TONE_Y0 = 0.42
+# Highway geometry paints the hood from here to the bottom. That panel is
+# low-saturation and can be near white while the asphalt is already mid gray.
+# It is not the road sample.
+_TONE_HOOD_TOP = 0.93
 
 
 def _shadow_luma_blue(bgr: np.ndarray) -> tuple[float, float] | None:
@@ -755,28 +770,45 @@ def companion_frame_is_flash(new_bgr: np.ndarray, held_bgr: np.ndarray | None) -
     return (new_luma - held_luma) >= 18.0 and (new_blue - held_blue) >= 18.0
 
 
+def _tone_road_band(bgr: np.ndarray) -> np.ndarray:
+    """Lower frame above the hood. The hood is not the road."""
+    height = int(bgr.shape[0])
+    y0 = int(height * _TONE_Y0)
+    y1 = int(height * _TONE_HOOD_TOP)
+    if y1 <= y0 + 8:
+        return bgr[y0:]
+    return bgr[y0:y1]
+
+
 def recover_viewport_tone(bgr: np.ndarray) -> np.ndarray:
     """Pull a sun-blown colour buffer toward the viewport picture.
 
     A highlight knee that keeps a fraction of the levels above 140 pulls the
     road and the stripe together, and the stripe drops through the white-paint
-    cut. A power curve on a near-white, low-contrast lower frame does the
-    opposite: the road lands near mid gray and the few brighter stripe levels
-    stay above that cut. A frame that is already mid gray is returned as it
-    was. An all-zero buffer is returned as it was.
+    cut. A power curve on a near-white, low-contrast road does the opposite:
+    the road lands near mid gray and the few brighter stripe levels stay above
+    that cut. The sample is the road body above the hood. A bright gray hood
+    is low saturation and must not set the curve. A frame whose road is
+    already mid gray is returned as it was. An all-zero buffer is returned
+    as it was.
     """
     if not isinstance(bgr, np.ndarray) or bgr.ndim != 3 or bgr.shape[2] != 3:
         return bgr
     # Nothing in the white-paint range. Mid gray, dark, and all-zero stay put.
     if bgr.dtype != np.uint8 or bgr.size == 0 or int(bgr.max()) < int(_TONE_P40_MIN):
         return bgr
-    height = int(bgr.shape[0])
-    band = bgr[int(height * _TONE_Y0) :]
+    band = _tone_road_band(bgr)
+    if band.size == 0:
+        return bgr
     sample = band.astype(np.float32, copy=False)
+    luma = 0.114 * sample[:, :, 0] + 0.587 * sample[:, :, 1] + 0.299 * sample[:, :, 2]
+    # Road body, not the low-saturation hood. Warm asphalt sits above the
+    # low-sat cut, so a hood-only sample would gamma-crush a mid-gray road.
+    if float(np.percentile(luma, 40)) < _TONE_P40_MIN:
+        return bgr
     hi = sample.max(axis=2)
     lo = sample.min(axis=2)
     sat = np.where(hi > 0.0, (hi - lo) * 255.0 / np.maximum(hi, 1.0), 0.0)
-    luma = 0.114 * sample[:, :, 0] + 0.587 * sample[:, :, 1] + 0.299 * sample[:, :, 2]
     chosen = luma[sat <= _TONE_SAT_MAX]
     if int(chosen.size) < max(32, int(luma.size) // 20):
         chosen = luma.reshape(-1)
@@ -798,11 +830,18 @@ def recover_viewport_tone(bgr: np.ndarray) -> np.ndarray:
     return lut[bgr]
 
 
-def colour_to_bgr(colour: Any, resolution: tuple[int, int] | None = None) -> np.ndarray | None:
+def colour_to_bgr(
+    colour: Any,
+    resolution: tuple[int, int] | None = None,
+    *,
+    tone: bool = True,
+) -> np.ndarray | None:
     """RGB(A) / BGRA bytes / array / PIL → BGR uint8. Empty → None.
 
-    The returned frame is the one every consumer stores. A sun-blown buffer
-    is matched to the viewport picture here, not as a later display dim.
+    ``tone=True`` matches a sun-blown buffer to the viewport picture on the
+    returned frame. The live store path passes ``tone=False`` so the companion
+    flash check sees the buffer before that curve, then tones only the frame
+    it keeps.
     """
     if colour is None:
         return None
@@ -837,7 +876,10 @@ def colour_to_bgr(colour: Any, resolution: tuple[int, int] | None = None) -> np.
     rgb = arr[:, :, :3]
     if rgb.dtype != np.uint8:
         rgb = rgb.astype(np.uint8)
-    return recover_viewport_tone(np.ascontiguousarray(rgb[:, :, ::-1]))
+    bgr = np.ascontiguousarray(rgb[:, :, ::-1])
+    if not tone:
+        return bgr
+    return recover_viewport_tone(bgr)
 
 
 class _IoMark:
@@ -874,7 +916,8 @@ def _reading_colour(images: Any, resolution: tuple[int, int] | None) -> np.ndarr
     if not isinstance(images, dict):
         return None
     colour = images.get("colour") if images.get("colour") is not None else images.get("color")
-    return colour_to_bgr(colour, resolution)
+    # Flash is judged on this buffer. Tone runs later, on the frame that is stored.
+    return colour_to_bgr(colour, resolution, tone=False)
 
 
 def camera_uses_adhoc(cam: Any) -> bool:
@@ -1412,7 +1455,10 @@ class BeamNGPyBackend:
                 used_near, used_far, used_rate = want_near, want_far, want_rate
                 used_prio = want_prio
                 attempts = iter_clip_attach_attempts(spec, cid=cid, defaults=clip_defaults)
-                step_s = " ".join(f"far_m={try_far:g}@update_s={try_rate:g}" for _n, try_far, try_rate in attempts)
+                step_s = " ".join(
+                    f"far_m={try_far:g}@requested_update_time={sensor_requested_update_s(try_rate):g}"
+                    for _n, try_far, try_rate in attempts
+                )
                 print(f"[GVD] beamngpy Camera hitch steps {cid}: {step_s} (not resolution)")
                 for try_near, try_far, try_rate in attempts:
                     kwargs = beamng_camera_sensor_kwargs(
@@ -1791,6 +1837,7 @@ class BeamNGPyBackend:
         bgr = resize_long_side(bgr, self.long_side)
         if cid != "main" and companion_frame_is_flash(bgr, self._cache_frames.get(cid)):
             return
+        bgr = recover_viewport_tone(bgr)
         self._cache_frames[cid] = bgr
         self._cache_ts[cid] = time.time()
         sig = frame_signature(bgr)
@@ -1892,8 +1939,10 @@ class BeamNGPyBackend:
         bgr = resize_long_side(bgr, self.long_side)
         if cid != "main" and companion_frame_is_flash(bgr, self._cache_frames.get(cid)):
             # Same bad frame: brighter and blue in the shadows. Keep the settled road.
+            # Judged before the tone curve. The curve itself can raise blue excess.
             self._reuse_cached(cid, frames, timestamps, health, failed=False)
             return
+        bgr = recover_viewport_tone(bgr)
         sig = frame_signature(bgr)
         unique = sig != self._frame_sig.get(cid)
         self._store_frame(cid, bgr, ts, frames, timestamps, health)

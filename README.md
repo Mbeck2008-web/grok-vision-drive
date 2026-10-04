@@ -1,10 +1,30 @@
 # Grok Vision Drive (GVD)
 
-Grok Vision Drive is an MIT camera-only autopilot toy for BeamNG.drive and BeamNG.tech. Entertainment only. It is not a physical-car controller, and it is not Tesla.
+Grok Vision Drive is a camera-only driving toy for BeamNG.drive and BeamNG.tech. It is for entertainment. It is not a controller for a real car, and it is not Tesla.
 
-The strip below is what the model is fed. Left to right: repeatL, pillarL, wide, main, narrow, pillarR, repeatR, rear. Empty gaps sit between the cameras. The repeater views keep the ego body at the cleared edge. Soft Esc parked.
+## How to start
 
-![Flat 360 strip fed to the model](docs/stitch-360.png)
+Windows. You do not need an administrator account.
+
+1. Quit BeamNG if it is open.
+2. Double-click `install.bat`.
+3. Start BeamNG again. In Mod Manager, enable **Grok Vision Drive**.
+4. If Python 3 is missing, install it from python.org and tick **Add to PATH**.
+5. Double-click `play_gvd.bat`. If it asks to install the Python packages, choose Yes. It also tries to open BeamNG.drive. If the game does not open, start it yourself.
+6. In the game, press Esc, open **UI Apps**, and add **GVD**.
+7. Press Alt+G, or use the GVD app, to engage. Steer, or press Alt+G again, to take over. In the GVD VISION window, press `q` to quit.
+
+BeamNG.tech is separate. Start BeamNG.tech yourself, then double-click `play_gvd_tech.bat`.
+
+## Cameras
+
+The strip is one picture made from all eight cameras. This is what the driving model sees. Left to right: repeatL, pillarL, wide, main, narrow, pillarR, repeatR, rear.
+
+![One picture from all eight cameras](docs/stitch-360.png)
+
+The settled game view. Soft Esc parked.
+
+![Settled game view](docs/settled-game.jpg)
 
 ### repeatL
 
@@ -135,20 +155,28 @@ The tone sample is the road under the sky and above the hood. Sky (190, 200, 210
 
 ## Technical detail
 
-The photos above are the frame path. The strip is what the model is fed. Each named photo is that camera's tile, in the same left-to-right order, with the empty gaps left out. Soft Esc parked. Esc is BeamNG's pause menu. It is not Engage.
+### One picture
 
-### Colour
+The rig is laid left to right as repeatL, pillarL, wide, main, narrow, pillarR, repeatR, rear. Seams are empty gaps. There is no overlap calibration and no pose warp. A missing camera stays an empty sector and is not filled from another camera. The inboard edge of repeatL is the image left, and the inboard edge of repeatR is the image right. Those columns are the ego body. They are cleared, and they are not another vehicle.
 
-One tone curve runs on the colour buffer the lane fit, the model, the CAMS tiles, and the PIP all read. The sample is the road under the sky and above the hood. A sun-blown road comes down toward mid gray and a thin lane stripe stays separable from the pavement. A frame that is already mid gray stays as it is. A missing or all-zero camera stays empty. A bright gray hood is not the road sample.
+The model reads that strip as one picture. Both image slots carry the same strip. The lane fit reads the windshield band, wide then main then narrow, when that band has pixels. An empty band is fit on the main camera.
 
-### Companions
+Pillar cameras aim 78 degrees off the lane. Repeater cameras aim 160 degrees back along the next lane, mounted 1.30 m forward. The three windshield cameras aim straight ahead. The rear camera aims straight back.
 
-Companion colour is a shared-memory read of an offscreen sensor update (`stream_raw`). The attach log prints `requested_update_time` 1 for a yaml hitch of -1. Main is read every tick. One companion is read on its hitch slot, and the last frame is kept in between. The companion flash check reads the buffer before the tone curve. A bright-blue road shadow is not stored. A washed companion that is not that flash is tone-matched and stored.
+### Lane lines
 
-### Stitch
+With a blue path in the frame, a drawn lane follows its own points, then continues on its last heading until it passes that path. The extra point is the same piece. It stops 2 m past the far point of the path, not out at the cabin span. A line that already passes the path is not lengthened. With no blue path, nothing is added past the last sample. A curve stays a curve.
 
-Delivered rig frames stitch left to right as repeatL, pillarL, wide, main, narrow, pillarR, repeatR, rear. A missing camera is an empty sector. Seams are gaps, with no pose warp. Repeater ego-body pixels are not another vehicle. The lane fit reads the windshield band of that stitch when the band has pixels, in the same road meters as one camera, and the main camera when that band is empty.
+### Companion cameras and colour
 
-### Drive
+Each grab reads main from shared memory, and at most one companion on the hitch. A skipped camera keeps its last real frame. A zero buffer is not stored.
 
-Tech control leaves the gearbox in arcade. `vehicle.control` has no gear field. Arcade is armed once at engage. The drive arm releases the parking brake and the clutch. A hold, a stop, or AEB sets the parking brake and releases the service brake. Retail queues `drivetrain.setShifterMode(2)` once per vehicle. Mode 2 is arcade. Retail is one window (`cams=1/8`). Tech 8-cam is the other product. Live Alt+G, Tech 8-cam, FFB, and QSV stay unproven.
+Companion cameras are not requested with an ad-hoc render. That render steps the game view's exposure for one frame, and the shadows go bright blue. Companions update offscreen. The grab reads their shared memory.
+
+The companion check runs before the tone curve. A buffer that is both brighter and bluer than the settled frame, by 18 levels on each, is not stored. Main is not put through that check. A washed companion that is not that flash is tone-matched and stored.
+
+A sun-blown colour buffer is matched once, on the frame the lane fit, the model, the camera tiles, and the picture-in-picture read. The sample is the road trapezoid under the sky and above the hood. The hood is not the road sample. A frame whose road is already mid gray is left as it is.
+
+### Arcade
+
+Engage arms arcade once. A failed arm is retried on a later tick. Letting go of the car does not arm arcade on the way out. The control message omits gear. Throttle releases the parking brake and the clutch. A hold, a stop, or AEB sets the parking brake and releases the service brake. The drive arm releases the parking brake and the clutch, and it leaves the gearbox mode alone. Retail queues shifter mode 2 once per vehicle. Mode 2 is arcade.

@@ -686,8 +686,70 @@ def _cam_resolution(cam: Any) -> tuple[int, int] | None:
     return (w, h)
 
 
+# A daylight colour buffer can sit in the top of the 8-bit range. Pavement
+# and a thin lane stripe are then both white paint, so the stripe is not a
+# separate region. The viewport picture keeps that road near mid gray.
+# Correct it once, here, on the frame that is stored. The lane fit, the
+# model, the CAMS tiles, and the PIP all read that frame. A display dim
+# never reaches the fit. Mid-gray, dark, and all-zero frames stay put.
+_TONE_P40_MIN = 188.0
+_TONE_SPREAD_MAX = 70.0
+_TONE_ANCHOR_PCT = 78.0
+_TONE_TARGET = 136.0
+_TONE_GAMMA_CAP = 9.0
+_TONE_SAT_MAX = 22.0
+_TONE_Y0 = 0.42
+
+
+def recover_viewport_tone(bgr: np.ndarray) -> np.ndarray:
+    """Pull a sun-blown colour buffer toward the viewport picture.
+
+    A highlight knee that keeps a fraction of the levels above 140 pulls the
+    road and the stripe together, and the stripe drops through the white-paint
+    cut. A power curve on a near-white, low-contrast lower frame does the
+    opposite: the road lands near mid gray and the few brighter stripe levels
+    stay above that cut. A frame that is already mid gray is returned as it
+    was. An all-zero buffer is returned as it was.
+    """
+    if not isinstance(bgr, np.ndarray) or bgr.ndim != 3 or bgr.shape[2] != 3:
+        return bgr
+    # Nothing in the white-paint range. Mid gray, dark, and all-zero stay put.
+    if bgr.dtype != np.uint8 or bgr.size == 0 or int(bgr.max()) < int(_TONE_P40_MIN):
+        return bgr
+    height = int(bgr.shape[0])
+    band = bgr[int(height * _TONE_Y0) :]
+    sample = band.astype(np.float32, copy=False)
+    hi = sample.max(axis=2)
+    lo = sample.min(axis=2)
+    sat = np.where(hi > 0.0, (hi - lo) * 255.0 / np.maximum(hi, 1.0), 0.0)
+    luma = 0.114 * sample[:, :, 0] + 0.587 * sample[:, :, 1] + 0.299 * sample[:, :, 2]
+    chosen = luma[sat <= _TONE_SAT_MAX]
+    if int(chosen.size) < max(32, int(luma.size) // 20):
+        chosen = luma.reshape(-1)
+    p40 = float(np.percentile(chosen, 40))
+    anchor = float(np.percentile(chosen, _TONE_ANCHOR_PCT))
+    spread = float(np.percentile(chosen, 90) - p40)
+    if p40 < _TONE_P40_MIN or spread > _TONE_SPREAD_MAX:
+        return bgr
+    x = min(anchor, 250.0) / 255.0
+    y = _TONE_TARGET / 255.0
+    if x <= y or x >= 0.999:
+        return bgr
+    gamma = math.log(y) / math.log(x)
+    if not math.isfinite(gamma) or gamma < 1.05:
+        return bgr
+    gamma = min(_TONE_GAMMA_CAP, gamma)
+    levels = np.arange(256, dtype=np.float32) / 255.0
+    lut = np.clip(np.rint(np.power(levels, gamma) * 255.0), 0, 255).astype(np.uint8)
+    return lut[bgr]
+
+
 def colour_to_bgr(colour: Any, resolution: tuple[int, int] | None = None) -> np.ndarray | None:
-    """RGB(A) / BGRA bytes / array / PIL → BGR uint8. Empty → None."""
+    """RGB(A) / BGRA bytes / array / PIL → BGR uint8. Empty → None.
+
+    The returned frame is the one every consumer stores. A sun-blown buffer
+    is matched to the viewport picture here, not as a later display dim.
+    """
     if colour is None:
         return None
     arr: np.ndarray | None = None
@@ -721,7 +783,7 @@ def colour_to_bgr(colour: Any, resolution: tuple[int, int] | None = None) -> np.
     rgb = arr[:, :, :3]
     if rgb.dtype != np.uint8:
         rgb = rgb.astype(np.uint8)
-    return np.ascontiguousarray(rgb[:, :, ::-1])
+    return recover_viewport_tone(np.ascontiguousarray(rgb[:, :, ::-1]))
 
 
 class _IoMark:
@@ -1145,6 +1207,8 @@ class WindowBackend:
         if img.dtype != np.uint8:
             img = img.astype(np.uint8)
         img = resize_long_side(img, self.long_side)
+        if getattr(img, "ndim", 0) == 3 and img.shape[2] == 3 and img.dtype == np.uint8:
+            img = recover_viewport_tone(img)
         ts = time.time()
         frames["main"] = img
         frames["cam_main"] = img

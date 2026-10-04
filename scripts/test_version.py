@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline pin for GVD alpha 1.7.6 (no BeamNG). Canonical spots must stay in lockstep."""
+"""Offline pin for GVD alpha 1.7.7 (no BeamNG). Canonical spots must stay in lockstep."""
 from __future__ import annotations
 
 import json
@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import make_release_zip as rel  # noqa: E402
 import python as gvd  # noqa: E402
 
-PIN = "1.7.6"
+PIN = "1.7.7"
 CHANNEL = "alpha"
 
 

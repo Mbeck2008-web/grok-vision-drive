@@ -173,6 +173,7 @@ def shadow_tick(
     e2e_policy: E2EPolicy,
     main_bgr: Any = None,
     wide_bgr: Any = None,
+    stitch_bgr: Any = None,
     steer_deg: float = 0.0,
     cfg: ShadowConfig | None = None,
     loop_hz: float | None = None,
@@ -192,6 +193,7 @@ def shadow_tick(
     e2e = e2e_policy.forward(
         main_bgr,
         wide_bgr,
+        stitch_bgr=stitch_bgr,
         speed_mps=ego_speed_mps,
         steer_deg=steer_deg,
     )

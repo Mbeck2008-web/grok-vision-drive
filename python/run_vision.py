@@ -44,6 +44,7 @@ from python.control.override import (
 )
 from python.data.record import ClipRecorder, choose_encoder
 from python.perception.pipeline import ModularPerception
+from python.perception.stitch360 import stitch_frames
 from python.perception.road_model import lanes_ext_for_live, road_edges
 from python.viz.debug_draw import cabin_drive_word
 from python.viz.review_log import ReviewCapture
@@ -635,6 +636,8 @@ def main() -> None:
                 wide = bundle.frames.get("wide")
             except Exception:
                 wide = None
+            # E2E reads the flat 360 strip. The lane fit above still uses main.
+            rig_view = stitch_frames(getattr(bundle, "frames", None))
 
             tick = shadow_tick(
                 policy=policy_tick,
@@ -651,6 +654,7 @@ def main() -> None:
                 e2e_policy=e2e_policy,
                 main_bgr=main,
                 wide_bgr=wide,
+                stitch_bgr=rig_view.bgr,
                 steer_deg=steer,
                 cfg=tick_cfg,
                 loop_hz=loop_hz_ema,

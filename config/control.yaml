@@ -3,7 +3,8 @@ policy_default: modular   # modular | e2e | shadow
 e2e:
   input_w: 320
   input_h: 180
-  cams: [main, wide]
+  # Live image is the flat 360 strip. main+wide is only the no-stitch fallback.
+  cams: [stitch360]
   model: models/e2e_current.onnx
   # Toy VRAM budget when ONNX/EP present; stub uses CPU numpy.
   vram_gb_min: 0.15

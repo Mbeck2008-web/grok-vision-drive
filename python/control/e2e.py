@@ -1,6 +1,7 @@
 """PilotNet-scale tiny E2E stub for GVD M5.
 
-Inputs: named main/wide RGB 1×3×180×320 + kin 1×2 → {steer [-1,1], accel [-1,1]}.
+Live view: the flat 360° stitch, one RGB 1×3×180×320 + kin 1×2.
+``forward(main, wide)`` with no stitch still reads those two crops.
 Loads models/e2e_current.onnx when present (onnxruntime); else numpy random stub.
 Toy VRAM footprint ~0.15–0.4 GB — no transformers / ViT / BEV / AutoSteer-HD.
 """
@@ -117,6 +118,10 @@ class E2EPolicy:
         self._b1 = np.zeros((hidden,), dtype=np.float32)
         self._w2 = (self._rng.standard_normal((hidden, 2)) * 0.05).astype(np.float32)
         self._b2 = np.zeros((2,), dtype=np.float32)
+        # Image the last forward actually read. "stitch" is the 360 strip.
+        # "main_wide" is the older two-crop path.
+        self.last_source = ""
+        self.last_view: np.ndarray | None = None
         self._try_load_onnx()
 
     def _try_load_onnx(self) -> None:
@@ -151,27 +156,48 @@ class E2EPolicy:
         main_bgr: np.ndarray | None,
         wide_bgr: np.ndarray | None,
         *,
+        stitch_bgr: np.ndarray | None = None,
         speed_mps: float = 0.0,
         steer_deg: float = 0.0,
-    ) -> dict[str, np.ndarray]:
-        # Research pin: named feeds main/wide 1x3x180x320 + kin 1x2 (not concatenated).
-        main = _resize_bgr(main_bgr)
-        wide = _resize_bgr(wide_bgr if wide_bgr is not None else main_bgr)
-        main_nchw = main.transpose(2, 0, 1)[None, ...].astype(np.float32)  # 1,3,H,W
-        wide_nchw = wide.transpose(2, 0, 1)[None, ...].astype(np.float32)
+    ) -> dict[str, Any]:
+        """Build the tensors the forward pass reads.
+
+        A stitch is one 360° picture. Both image slots of the old two-cam
+        stack carry that picture, so a main/wide ONNX still sees the strip
+        and not the main crop. With no stitch, the slots stay main and wide.
+        """
         kin = np.array(
             [[float(speed_mps) / 30.0, float(steer_deg) / 30.0]],
             dtype=np.float32,
         )  # 1,2
-        # Stub MLP still wants stacked cams + flat ego.
+        if stitch_bgr is not None:
+            view = _resize_bgr(stitch_bgr)
+            view_nchw = view.transpose(2, 0, 1)[None, ...].astype(np.float32)
+            cams = np.concatenate([view_nchw, view_nchw], axis=0)  # 2,3,H,W
+            return {
+                "main": view_nchw,
+                "wide": view_nchw,
+                "stitch": view_nchw,
+                "kin": kin,
+                "cams": cams,
+                "ego": kin.reshape(2),
+                "source": "stitch",
+                "view": view,
+            }
+        main = _resize_bgr(main_bgr)
+        wide = _resize_bgr(wide_bgr if wide_bgr is not None else main_bgr)
+        main_nchw = main.transpose(2, 0, 1)[None, ...].astype(np.float32)  # 1,3,H,W
+        wide_nchw = wide.transpose(2, 0, 1)[None, ...].astype(np.float32)
         cams = np.concatenate([main_nchw, wide_nchw], axis=0)  # 2,3,H,W
-        ego = kin.reshape(2)
         return {
             "main": main_nchw,
             "wide": wide_nchw,
+            "stitch": None,
             "kin": kin,
             "cams": cams,
-            "ego": ego,
+            "ego": kin.reshape(2),
+            "source": "main_wide",
+            "view": main,
         }
 
     def forward(
@@ -179,10 +205,20 @@ class E2EPolicy:
         main_bgr: np.ndarray | None,
         wide_bgr: np.ndarray | None = None,
         *,
+        stitch_bgr: np.ndarray | None = None,
         speed_mps: float = 0.0,
         steer_deg: float = 0.0,
     ) -> E2EIntent:
-        feats = self.preprocess(main_bgr, wide_bgr, speed_mps=speed_mps, steer_deg=steer_deg)
+        feats = self.preprocess(
+            main_bgr,
+            wide_bgr,
+            stitch_bgr=stitch_bgr,
+            speed_mps=speed_mps,
+            steer_deg=steer_deg,
+        )
+        self.last_source = str(feats["source"])
+        view = feats["view"]
+        self.last_view = None if view is None else np.array(view, copy=True)
         try:
             if self._session is not None:
                 return self._forward_onnx(feats)
@@ -196,7 +232,10 @@ class E2EPolicy:
         feed: dict[str, np.ndarray] = {}
         for inp in inputs:
             name = inp.name.lower()
-            if name == "main" or name.endswith("/main") or name.startswith("main"):
+            if any(key in name for key in ("stitch", "pano", "360")):
+                stitch = feats.get("stitch")
+                feed[inp.name] = feats["main"] if stitch is None else stitch
+            elif name == "main" or name.endswith("/main") or name.startswith("main"):
                 feed[inp.name] = feats["main"]
             elif name == "wide" or name.endswith("/wide") or name.startswith("wide"):
                 feed[inp.name] = feats["wide"]

@@ -10,7 +10,7 @@ import numpy as np
 
 from python.perception.cipv import select_cipv
 from python.perception.detect import STATIC_CLASSES
-from python.perception.lanes import estimate_lanes
+from python.perception.lanes import lanes_from_view
 from python.perception.track import IoUTracker
 from python.planning.path_predictor import predict_path
 
@@ -59,6 +59,7 @@ class ModularPerception:
         self,
         main_bgr: np.ndarray | None,
         *,
+        stitch_bgr: np.ndarray | None = None,
         ego_speed_mps: float = 0.0,
         steer_deg: float = 0.0,
     ) -> PerceptionOut:
@@ -91,7 +92,7 @@ class ModularPerception:
         # if detector didn't set ego x/y (onnx path does), leave as-is
         tracks = self.tracker.update(moving, time.time())
         track_dicts = self.tracker.as_dicts()
-        lanes = estimate_lanes(main_bgr)
+        lanes = lanes_from_view(main_bgr, stitch_bgr)
         prior_lanes = None
         if lanes.lanes_bev:
             self._prior_lanes = lanes.lanes_bev

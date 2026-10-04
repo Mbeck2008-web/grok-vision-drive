@@ -44,6 +44,7 @@ from python.control.override import (
 )
 from python.data.record import ClipRecorder, choose_encoder
 from python.perception.pipeline import ModularPerception
+from python.perception.stitch360 import stitch_frames
 from python.perception.road_model import lanes_ext_for_live, road_edges
 from python.viz.debug_draw import cabin_drive_word
 from python.viz.review_log import ReviewCapture
@@ -581,7 +582,14 @@ def main() -> None:
                 print(f"[GVD] {note}", flush=True)
 
             # Loaded detector / lanes / planner / E2E shadow run every tick, engaged or not.
-            pout = perc.tick(main, ego_speed_mps=ego_v, steer_deg=steer)
+            # The lane fit reads the 360 strip when that frame has pixels.
+            rig_view = stitch_frames(getattr(bundle, "frames", None))
+            pout = perc.tick(
+                main,
+                stitch_bgr=rig_view.bgr,
+                ego_speed_mps=ego_v,
+                steer_deg=steer,
+            )
             pout = apply_to_perception(ui.debug, pout)
 
             if ui.debug.force_engage and not prev_force:
@@ -635,7 +643,6 @@ def main() -> None:
                 wide = bundle.frames.get("wide")
             except Exception:
                 wide = None
-
             tick = shadow_tick(
                 policy=policy_tick,
                 engaged=engaged,
@@ -651,6 +658,7 @@ def main() -> None:
                 e2e_policy=e2e_policy,
                 main_bgr=main,
                 wide_bgr=wide,
+                stitch_bgr=rig_view.bgr,
                 steer_deg=steer,
                 cfg=tick_cfg,
                 loop_hz=loop_hz_ema,

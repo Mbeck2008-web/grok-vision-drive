@@ -5,7 +5,8 @@ lanes:
 e2e:
   input_w: 320
   input_h: 180
-  cams: [main, wide]
+  # Live image is the flat 360 strip. main+wide is only the no-stitch fallback.
+  cams: [stitch360]
 detector:
   prefer: yolov8n-onnx
   allow_synthetic_default: false

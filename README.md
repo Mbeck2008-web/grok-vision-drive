@@ -6,18 +6,18 @@ Entertainment only. Never use this stack to control a physical car.
 
 First-time clone: point [Grok Build](https://x.ai/cli), Grok Bot, or any computer-use agent at this repo on extra-high reasoning — paste [`AGENTS.md`](AGENTS.md) if the tool does not auto-read the tree. Have it install GVD on this PC, probe or accept the specs, pick **retail** window-capture vs BeamNG.**tech** 8-cam from what is actually installed, and patch [`config/hardware.yaml`](config/hardware.yaml) to that GPU / VRAM / RAM. No step-by-step here — the model can open the project.
 
-## Alpha 1.7.4
+## Alpha 1.7.5
 
 This is **alpha** — may break / not work; improves with fixes.
 
-Canonical pin **1.7.4** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Untagged retail zips use `1.7.4-alpha-<sha>`.
+Canonical pin **1.7.5** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Untagged retail zips use `1.7.5-alpha-<sha>`.
 
 **Versioning** (this line stays **alpha** until a later non-alpha release):
 
 - **point** bumps (`1.7.x`) = fixes / small UI
 - **main alpha** bump (`1.x.0`) = features / core / UI overhaul
 
-## Recent changes (alpha 1.7.4)
+## Recent changes (alpha 1.7.5)
 
 Catch-up from **1.0.1**. Each feature merge since that pin is one main step. The throttle fix is the point in between. Live Alt+G, Tech 8-cam, FFB, and QSV stay **UNPROVEN**.
 
@@ -250,7 +250,7 @@ Optional bus in `config/sensors.yaml`. Defaults: IMU + GPS **on**; `lidar` / `ra
 
 ## Release zip (M6)
 
-Windows: double-click `scripts\make_release_zip.bat`. Anywhere: `python scripts/make_release_zip.py`. Output: `dist\gvd-retail-<version>.zip` (gitignored), `<version>` = exact git tag if any, else `1.7.4-alpha-<sha>[-dirty]`; override with `--version 1.7.4`, `--out path`, `--flat` (no top-level folder), `--list` (manifest only).
+Windows: double-click `scripts\make_release_zip.bat`. Anywhere: `python scripts/make_release_zip.py`. Output: `dist\gvd-retail-<version>.zip` (gitignored), `<version>` = exact git tag if any, else `1.7.5-alpha-<sha>[-dirty]`; override with `--version 1.7.5`, `--out path`, `--flat` (no top-level folder), `--list` (manifest only).
 
 Packs: `install.bat`, `uninstall.bat`, `play_gvd.bat`, `beamng_mod/`, `python/` (retail runtime), `config/` (including `sensors.yaml`), `requirements.txt` + `requirements-retail.txt`, `LICENSE`, `README.md`, `AGENTS.md`, `docs/*.md`, `models/yolov8n.onnx` + `models/NOTICE.txt`, plus a generated `VERSION.txt` (version, build time, git sha, the retail honesty lines). Excludes `data/clips/`, extra weights (`*.pt`, other `*.onnx`, `*.pth` `*.bin` `*.safetensors`), `.git`, `scripts/` (tests + this tool), `__pycache__`, `dist/`, and `requirements-foxglove.txt`. `*.bat` are written CRLF. After writing, the script re-opens the zip, refuses forbidden members and missing must-haves (mod entry point, `run_vision.py`, launchers, `models/yolov8n.onnx`), and exits non-zero on any problem. Attach the zip to a GitHub Release. Offline check: `PYTHONPATH=. python scripts/test_m6_retail.py`.
 
@@ -326,7 +326,7 @@ Keys in `--viz`: `V` nerd, `D` DRIVE (live actuators), `G` VIZ (occupancy / boxe
 
 ## Status
 
-**Alpha 1.7.4:** this is **alpha** — may break / not work; improves with fixes. **point** bumps = fixes / small UI. **main alpha** bump = features / core / UI overhaul. See [Alpha 1.7.4](#alpha-174). **1.7.0** keeps a stale `gvd_engage.json` from starting the car, holds an untrained E2E stub instead of driving it, shares one glance word (OFF / ON / HOLD / DRIVE / MISMATCH) across the app, the strip, and the VISION title, and draws cabin agent boxes as empty solids.
+**Alpha 1.7.5:** this is **alpha** — may break / not work; improves with fixes. **point** bumps = fixes / small UI. **main alpha** bump = features / core / UI overhaul. See [Alpha 1.7.5](#alpha-175). **1.7.0** keeps a stale `gvd_engage.json` from starting the car, holds an untrained E2E stub instead of driving it, shares one glance word (OFF / ON / HOLD / DRIVE / MISMATCH) across the app, the strip, and the VISION title, and draws cabin agent boxes as empty solids.
 
 **Force-feedback player override:** wheel chatter no longer disengages GVD. Signal is `|steering_input − aligned cmd.steer|` (never an absolute angle), then spike reject → EMA → hysteresis → dwell. Pedals are asymmetric and tight. Live FFB is **UNPROVEN**. Details under [Actuation](#actuation-m3).
 
@@ -420,3 +420,7 @@ Modular veto thresholds: `config/control.yaml`. E2E input 320×180: `config/perc
 ## 1.7.4 wheel rotation
 
 - Disengage uses wheel rotation against the commanded steer. Force-feedback torque is not a signal. An echo of a command already ahead of the wheel is residual 0, a later smaller command keeps that catch-up inside the span, and a held rotation of 0.25 drops Engage.
+
+## 1.7.5
+
+Lane pieces that do not meet stay separate polylines, so a gap is not drawn as a kink. A curve that is one line still draws.

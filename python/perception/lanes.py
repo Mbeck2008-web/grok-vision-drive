@@ -12,6 +12,10 @@ import numpy as np
 _LOG = logging.getLogger("gvd.perception.lanes")
 # One warning per failure text. A fit that fails every tick must not flood the console.
 _lane_fit_logged: set[str] = set()
+# A later piece joins a chain only when its near end still lies on that chain.
+# The live kink steps about 2.6 m sideways between y=10 m and y=12 m, so it
+# stays its own polyline. Pieces of one curve stay under this miss.
+_JOIN_LATERAL_M = 0.9
 
 
 @dataclass
@@ -122,6 +126,88 @@ def lane_roi_mask(height: int, width: int) -> np.ndarray:
     return mask
 
 
+def _ego_point(x: float, y: float, width: float, height: float) -> dict[str, float]:
+    """Crude cam_main pixel → ego meters (x right, y forward)."""
+    ex = ((float(x) / float(width)) - 0.5) * 6.0
+    ey = max(2.0, 35.0 * (1.0 - float(y) / float(height)))
+    return {"x": float(ex), "y": float(ey), "z": 0.0}
+
+
+def _ordered_ego_segment(
+    seg: tuple,
+    width: float,
+    height: float,
+) -> tuple[dict[str, float], dict[str, float]]:
+    x1, y1, x2, y2 = seg[0], seg[1], seg[2], seg[3]
+    a = _ego_point(x1, y1, width, height)
+    b = _ego_point(x2, y2, width, height)
+    if a["y"] <= b["y"]:
+        return a, b
+    return b, a
+
+
+def _lateral_miss(
+    a: dict[str, float],
+    b: dict[str, float],
+    pt: dict[str, float],
+) -> float:
+    """Meters of sideways error if `pt` is read off the line through `a` and `b`."""
+    dy = b["y"] - a["y"]
+    dx = b["x"] - a["x"]
+    if abs(dy) < 1e-4:
+        return abs(pt["x"] - b["x"])
+    pred = b["x"] + (dx / dy) * (pt["y"] - b["y"])
+    return abs(pt["x"] - pred)
+
+
+def chain_lane_segments(
+    segs: list,
+    width: int,
+    height: int,
+) -> list[list[dict[str, float]]]:
+    """Polylines for one slope group. Pieces that do not meet stay apart.
+
+    Up to eight Hough segments are mapped with the same ego scale as before.
+    A piece is appended only when its nearer end lies within
+    ``_JOIN_LATERAL_M`` of a segment already on that chain. A sideways jump
+    starts a new polyline instead of kinking the one in hand. Each returned
+    line is ordered by increasing forward distance.
+    """
+    pieces = [_ordered_ego_segment(s, width, height) for s in segs[:8]]
+    pieces.sort(key=lambda ab: (ab[0]["y"], ab[0]["x"], ab[1]["y"]))
+    chains: list[list[tuple[dict[str, float], dict[str, float]]]] = []
+    for near, far in pieces:
+        best_i: int | None = None
+        best_miss: float | None = None
+        for i, chain in enumerate(chains):
+            miss = min(_lateral_miss(a, b, near) for a, b in chain)
+            if miss <= _JOIN_LATERAL_M and (best_miss is None or miss < best_miss):
+                best_i = i
+                best_miss = miss
+        if best_i is None:
+            chains.append([(near, far)])
+        else:
+            chains[best_i].append((near, far))
+    out: list[list[dict[str, float]]] = []
+    for chain in chains:
+        pts: list[dict[str, float]] = []
+        for near, far in chain:
+            pts.extend((near, far))
+        pts.sort(key=lambda p: (p["y"], p["x"]))
+        deduped: list[dict[str, float]] = []
+        for p in pts:
+            if (
+                deduped
+                and abs(deduped[-1]["y"] - p["y"]) < 1e-3
+                and abs(deduped[-1]["x"] - p["x"]) < 1e-3
+            ):
+                continue
+            deduped.append(p)
+        if len(deduped) >= 2:
+            out.append(deduped)
+    return out
+
+
 def _estimate_lanes_impl(bgr: np.ndarray) -> LaneResult:
     bgr = _as_bgr(bgr)
     h, w = bgr.shape[:2]
@@ -147,22 +233,11 @@ def _estimate_lanes_impl(bgr: np.ndarray) -> LaneResult:
     conf = 0.0
     lanes_bev: list[list[dict[str, float]]] = []
     curv = 0.0
-    def _to_ego_poly(segs: list) -> list[dict[str, float]]:
-        pts = []
-        for x1, y1, x2, y2, _ in segs[:8]:
-            for x, y in ((x1, y1), (x2, y2)):
-                # image → crude ego
-                ex = ((x / w) - 0.5) * 6.0
-                ey = max(2.0, 35.0 * (1.0 - y / h))
-                pts.append({"x": float(ex), "y": float(ey), "z": 0.0})
-        pts.sort(key=lambda p: p["y"])
-        return pts
-
     if left:
-        lanes_bev.append(_to_ego_poly(left))
+        lanes_bev.extend(chain_lane_segments(left, w, h))
         conf += 0.4
     if right:
-        lanes_bev.append(_to_ego_poly(right))
+        lanes_bev.extend(chain_lane_segments(right, w, h))
         conf += 0.4
     if left and right:
         # crude curvature from mean slope asymmetry

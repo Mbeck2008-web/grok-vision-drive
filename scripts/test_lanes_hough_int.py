@@ -18,7 +18,7 @@ sys.path.insert(0, str(ROOT))
 
 from python.control.e2e import E2EIntent
 from python.perception import lanes as lanes_mod
-from python.perception.lanes import estimate_lanes, hough_segments, lane_paint_mask
+from python.perception.lanes import chain_lane_segments, estimate_lanes, hough_segments, lane_paint_mask
 from python.runtime.shadow import ShadowConfig
 
 
@@ -195,7 +195,85 @@ def main() -> None:
     src = (ROOT / "python" / "perception" / "lanes.py").read_text(encoding="utf-8")
     assert "except (cv2.error, ValueError, TypeError)" in src
     assert "except Exception" not in src
+    _check_gap_is_not_one_polyline()
+    _check_curve_stays_one_line()
     print("test_lanes_hough_int: OK")
+
+
+def _px(ex: float, ey: float, w: int = 640, h: int = 480) -> tuple[float, float]:
+    return ((ex / 6.0 + 0.5) * w, h * (1.0 - ey / 35.0))
+
+
+def _seg(a: tuple[float, float], b: tuple[float, float]) -> tuple[float, float, float, float, float]:
+    x1, y1 = _px(*a)
+    x2, y2 = _px(*b)
+    return (x1, y1, x2, y2, -1.0)
+
+
+def _spans_jump(poly: list[dict]) -> bool:
+    xs = [float(p["x"]) for p in poly]
+    return min(xs) < -1.0 and max(xs) > 0.5
+
+
+def _check_gap_is_not_one_polyline() -> None:
+    """Pieces at about x=-1.5,y=10 and x=+1.1,y=12 are not one polyline."""
+    segs = [
+        _seg((-1.55, 6.0), (-1.45, 10.0)),
+        _seg((1.05, 12.0), (1.15, 14.0)),
+    ]
+    polys = chain_lane_segments(segs, 640, 480)
+    assert len(polys) == 2, polys
+    assert not any(_spans_jump(p) for p in polys), polys
+    cv2 = __import__("cv2")
+    img = np.zeros((480, 640, 3), dtype=np.uint8)
+    for seg in segs:
+        cv2.line(
+            img,
+            (int(round(seg[0])), int(round(seg[1]))),
+            (int(round(seg[2])), int(round(seg[3]))),
+            (220, 220, 220),
+            3,
+        )
+    # The second piece is short in ego y. Lengthen it so Hough can see it.
+    far = _seg((1.05, 12.0), (1.15, 18.0))
+    cv2.line(
+        img,
+        (int(round(far[0])), int(round(far[1]))),
+        (int(round(far[2])), int(round(far[3]))),
+        (220, 220, 220),
+        3,
+    )
+    fit = estimate_lanes(img)
+    assert fit.lanes_bev, fit
+    assert not any(_spans_jump(p) for p in fit.lanes_bev), fit.lanes_bev
+
+
+def _check_curve_stays_one_line() -> None:
+    """A curve whose pieces meet stays one polyline, in forward order."""
+    knots = [(-1.8, 4.0), (-1.5, 10.0), (-0.9, 18.0), (-0.2, 28.0)]
+    segs = [_seg(a, b) for a, b in zip(knots, knots[1:])]
+    polys = chain_lane_segments(segs, 640, 480)
+    assert len(polys) == 1, polys
+    poly = polys[0]
+    ys = [float(p["y"]) for p in poly]
+    assert ys == sorted(ys), poly
+    assert poly[0]["y"] < 5.0 and poly[-1]["y"] > 25.0, poly
+    assert poly[-1]["x"] > poly[0]["x"], poly
+    cv2 = __import__("cv2")
+    img = np.zeros((480, 640, 3), dtype=np.uint8)
+    pts = np.array([(int(round(x)), int(round(y))) for x, y in (_px(*k) for k in knots)], np.int32)
+    cv2.polylines(img, [pts], False, (220, 220, 220), 3)
+    fit = estimate_lanes(img)
+    assert fit.lanes_bev, fit
+    spanned = [
+        p for p in fit.lanes_bev
+        if min(float(q["y"]) for q in p) < 6.0 and max(float(q["y"]) for q in p) > 18.0
+    ]
+    assert spanned, fit.lanes_bev
+    for poly in spanned:
+        got = [float(p["y"]) for p in poly]
+        assert got == sorted(got), poly
+        assert not _spans_jump(poly), poly
 
 
 def _yellow_white_road(

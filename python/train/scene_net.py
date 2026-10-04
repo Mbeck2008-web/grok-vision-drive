@@ -99,6 +99,99 @@ _BAD_REASONS = frozenset({"player_steer", "player_brake", "player_throttle"})
 SCENE_ONNX_NAME = "e2e_scene.onnx"
 
 
+def scene_head_sizes() -> tuple[tuple[str, int], ...]:
+    """Linear heads on the GRU hidden state. Names match the exported net."""
+    return (
+        ("lane_head", N_LANES * LANE_POINTS * 2),
+        ("lane_valid_head", N_LANES),
+        ("curb_head", N_CURBS * LANE_POINTS * 2),
+        ("curb_valid_head", N_CURBS),
+        ("object_head", N_OBJECTS * OBJECT_FEAT),
+        ("object_class_head", N_OBJECTS * len(OBJECT_CLASSES)),
+        ("object_valid_head", N_OBJECTS),
+        ("sign_head", N_SIGNS * SIGN_FEAT),
+        ("sign_class_head", N_SIGNS * len(SIGN_CLASSES)),
+        ("sign_state_head", N_SIGNS * len(LAMP_STATES)),
+        ("sign_valid_head", N_SIGNS),
+    )
+
+
+def conv2d_parameter_count(
+    in_channels: int,
+    out_channels: int,
+    kernel: int = 3,
+    *,
+    bias: bool = True,
+) -> int:
+    """Weights in one conv. Bias adds one value per output channel."""
+    weights = int(out_channels) * int(in_channels) * int(kernel) * int(kernel)
+    if bias:
+        weights += int(out_channels)
+    return weights
+
+
+def linear_parameter_count(in_features: int, out_features: int, *, bias: bool = True) -> int:
+    """Weights in one linear layer."""
+    weights = int(out_features) * int(in_features)
+    if bias:
+        weights += int(out_features)
+    return weights
+
+
+def gru_parameter_count(
+    input_size: int,
+    hidden_size: int,
+    num_layers: int = 1,
+    *,
+    bias: bool = True,
+    bidirectional: bool = False,
+) -> int:
+    """Weights in a PyTorch GRU.
+
+    Each layer has three gates. ``weight_ih`` is ``3H x input``, ``weight_hh``
+    is ``3H x H``, and bias adds two vectors of length ``3H`` when enabled.
+    """
+    directions = 2 if bidirectional else 1
+    total = 0
+    hidden = int(hidden_size)
+    for layer in range(int(num_layers)):
+        layer_in = int(input_size) if layer == 0 else hidden * directions
+        gates = 3 * hidden
+        per_direction = gates * layer_in + gates * hidden
+        if bias:
+            per_direction += gates + gates
+        total += per_direction * directions
+    return total
+
+
+def architecture_parameter_count() -> int:
+    """Trainable weights of the exported scene net, from the layer sizes.
+
+    The stem is shared, so it is counted once. ReLU, the residual, and the
+    sigmoids add no weights. This is the count before any tensor exists.
+    """
+    total = 0
+    cin = 3
+    for cout in STEM_CHANNELS:
+        total += conv2d_parameter_count(cin, int(cout), 3, bias=True)
+        cin = int(cout)
+    total += linear_parameter_count(STEM_CHANNELS[-1], SECTOR_FEAT, bias=True)
+    total += gru_parameter_count(TOKEN_DIM + 1, GRU_HIDDEN, num_layers=1, bias=True)
+    for _name, out in scene_head_sizes():
+        total += linear_parameter_count(GRU_HIDDEN, out, bias=True)
+    return total
+
+
+def count_module_parameters(module: Any) -> int:
+    """Sum trainable parameter elements on a built module."""
+    total = 0
+    for param in module.parameters():
+        if not bool(getattr(param, "requires_grad", True)):
+            continue
+        total += int(param.numel())
+    return total
+
+
 def default_onnx_path() -> Path:
     return Path(__file__).resolve().parents[2] / "models" / SCENE_ONNX_NAME
 
@@ -888,17 +981,8 @@ if torch is not None:
             self.stem = SharedStem()
             self.gru = nn.GRU(TOKEN_DIM + 1, GRU_HIDDEN, num_layers=1, batch_first=True)
             hidden = GRU_HIDDEN
-            self.lane_head = nn.Linear(hidden, N_LANES * LANE_POINTS * 2)
-            self.lane_valid_head = nn.Linear(hidden, N_LANES)
-            self.curb_head = nn.Linear(hidden, N_CURBS * LANE_POINTS * 2)
-            self.curb_valid_head = nn.Linear(hidden, N_CURBS)
-            self.object_head = nn.Linear(hidden, N_OBJECTS * OBJECT_FEAT)
-            self.object_class_head = nn.Linear(hidden, N_OBJECTS * len(OBJECT_CLASSES))
-            self.object_valid_head = nn.Linear(hidden, N_OBJECTS)
-            self.sign_head = nn.Linear(hidden, N_SIGNS * SIGN_FEAT)
-            self.sign_class_head = nn.Linear(hidden, N_SIGNS * len(SIGN_CLASSES))
-            self.sign_state_head = nn.Linear(hidden, N_SIGNS * len(LAMP_STATES))
-            self.sign_valid_head = nn.Linear(hidden, N_SIGNS)
+            for name, out in scene_head_sizes():
+                setattr(self, name, nn.Linear(hidden, out))
 
         def initial_state(self, device: Any = None, dtype: Any = None, batch: int = 1) -> SceneState:
             device = device or torch.device("cpu")
@@ -1067,6 +1151,27 @@ else:
 
     def _trace_scene_onnx(model: Any, args: tuple[Any, ...], path_str: str) -> None:
         raise ImportError("PyTorch is not installed")
+
+
+_SCENE_COUNT: tuple[int, bool] | None = None
+
+
+def scene_parameter_count(net: Any = None) -> tuple[int, bool]:
+    """Return ``(trainable count, approximate)`` for the exported scene net.
+
+    A built module is summed, and that count is exact. With no module and no
+    PyTorch, the count is ``architecture_parameter_count`` and approximate is
+    True, because the weights do not exist yet.
+    """
+    global _SCENE_COUNT
+    if net is not None:
+        return count_module_parameters(net), False
+    if _SCENE_COUNT is None:
+        if torch is not None:
+            _SCENE_COUNT = (count_module_parameters(SceneNet()), False)
+        else:
+            _SCENE_COUNT = (architecture_parameter_count(), True)
+    return _SCENE_COUNT
 
 
 def cpu_export_inputs(net: Any, zeros: Any) -> tuple[Any, tuple[Any, ...]]:

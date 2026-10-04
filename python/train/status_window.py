@@ -2,8 +2,9 @@
 
 Colors, type, and row spacing match the nerd panel in ``python/viz/nerd.py``.
 The window shows recorded hours and minutes from the strip folder, time left,
-loss, learning rate, steps per second, and the memory in use. The loss graph
-is the steps this run has reported. There is no server.
+loss, learning rate, steps per second, the memory in use, and the scene net's
+parameter count. The loss graph is the steps this run has reported. There is
+no server.
 """
 
 from __future__ import annotations
@@ -177,6 +178,31 @@ def format_bytes(num: int) -> str:
     return f"{num / (1024 ** 2):.0f} MB"
 
 
+def format_parameter_count(count: int) -> str:
+    """Plain unit. One million is ``1.0 million``."""
+    number = max(0, int(count))
+    if number >= 1_000_000:
+        return f"{number / 1_000_000:.1f} million"
+    if number >= 1_000:
+        return f"{number / 1_000:.1f} thousand"
+    return str(number)
+
+
+def parameter_fact() -> str:
+    """Scene-net size for the panel.
+
+    The words say approximate when the count is the architecture sum and the
+    weights have not been built.
+    """
+    from python.train.scene_net import scene_parameter_count
+
+    count, approximate = scene_parameter_count()
+    unit = format_parameter_count(count)
+    if approximate:
+        return f"params approximate {unit}"
+    return f"params {unit}"
+
+
 def format_status(status: TrainStatus) -> str:
     loss = "--" if status.loss is None else f"{status.loss:.4f}"
     kind = "VRAM" if status.memory_kind == "vram" else "RAM"
@@ -191,6 +217,7 @@ def format_status(status: TrainStatus) -> str:
             f"steps/s {status.steps_per_sec:.2f}",
             f"{kind} {format_bytes(status.memory_bytes)}",
             f"{status.device}  batch {int(status.batch)}  {note}",
+            parameter_fact(),
         )
     )
 
@@ -329,7 +356,7 @@ class TrainWindow:
     def _show_recorded(self, seconds: float) -> None:
         self.recorded_s = float(seconds)
         if self._status is None:
-            self.lines = f"recorded {format_recorded_hm(self.recorded_s)}\nidle"
+            self.lines = f"recorded {format_recorded_hm(self.recorded_s)}\n{parameter_fact()}\nidle"
             self._paint()
             return
         self._status.recorded_s = self.recorded_s

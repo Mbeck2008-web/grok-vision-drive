@@ -81,8 +81,10 @@ from python.train.status_window import (  # noqa: E402
     TH,
     TrainStatus,
     TrainWindow,
+    format_parameter_count,
     format_recorded_hm,
     format_status,
+    parameter_fact,
     loss_graph_box,
     loss_plot_box,
     loss_polyline,
@@ -1184,6 +1186,73 @@ def check_train_panel_loss_graph() -> None:
     assert window.panel is not None
 
 
+def check_parameter_count_hand_sum() -> None:
+    """A tiny built net's trainable count matches a hand sum of its layers."""
+    from python.train.scene_net import (
+        architecture_parameter_count,
+        conv2d_parameter_count,
+        count_module_parameters,
+        gru_parameter_count,
+        linear_parameter_count,
+        scene_parameter_count,
+        torch_ready,
+    )
+
+    # Conv2d(2, 3, kernel 3, bias): weight 3*2*3*3 = 54, bias 3, total 57.
+    # Linear(3, 4, bias): weight 4*3 = 12, bias 4, total 16.
+    # GRU(input 4, hidden 2, one layer, bias): ih 3*2*4 = 24, hh 3*2*2 = 12,
+    # bias_ih 6, bias_hh 6, total 48.
+    hand = 57 + 16 + 48
+    counted = (
+        conv2d_parameter_count(2, 3, 3, bias=True)
+        + linear_parameter_count(3, 4, bias=True)
+        + gru_parameter_count(4, 2, num_layers=1, bias=True)
+    )
+    assert counted == hand == 121
+    if torch_ready():
+        from torch import nn
+
+        from python.train.scene_net import SceneNet
+
+        class Tiny(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.conv = nn.Conv2d(2, 3, kernel_size=3, bias=True)
+                self.fc = nn.Linear(3, 4, bias=True)
+                self.gru = nn.GRU(4, 2, num_layers=1, batch_first=True)
+
+        tiny = Tiny()
+        assert count_module_parameters(tiny) == hand
+        summed, exact = scene_parameter_count(tiny)
+        assert summed == hand and exact is False
+        frozen = tiny.fc.bias
+        frozen.requires_grad_(False)
+        assert count_module_parameters(tiny) == hand - 4
+        real = count_module_parameters(SceneNet())
+        assert real == architecture_parameter_count()
+        shown, approximate = scene_parameter_count()
+        assert shown == real and approximate is False
+    else:
+        # No tensors. The real net is the same layer rules as the tiny net.
+        shown, approximate = scene_parameter_count()
+        assert approximate is True
+        assert shown == architecture_parameter_count()
+        assert shown > hand
+    fact = parameter_fact()
+    assert format_parameter_count(shown) in fact
+    if approximate:
+        assert fact.startswith("params approximate ")
+    else:
+        assert fact.startswith("params ")
+        assert "approximate" not in fact
+    assert fact in format_status(_status_for_graph())
+    idle = TrainWindow()
+    idle.load_folder(Path("/no/such/gvd-strips-params"))
+    assert idle.lines.splitlines()[0] == "recorded 0 hours 0 minutes"
+    assert fact in idle.lines
+    assert "idle" in idle.lines
+
+
 def check_trainer_is_offline() -> None:
     files = (
         ROOT / "python" / "train" / "train_scene.py",
@@ -1229,6 +1298,7 @@ def main() -> None:
     check_fit_and_window()
     check_recorded_hours_minutes()
     check_train_panel_loss_graph()
+    check_parameter_count_hand_sum()
     check_trainer_is_offline()
     check_net_cpu()
     print("test_scene_strip: OK")

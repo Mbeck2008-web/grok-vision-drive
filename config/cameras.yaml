@@ -84,7 +84,7 @@ cameras:
     yaw_deg: 0
     pitch_deg: -8
     fov_v: 88.7
-    live_res: [640, 480]
+    live_res: [640, 360]
     far_m: 300
     requested_update_time: -1
     update_priority: 0.5
@@ -116,8 +116,8 @@ cameras:
     role: rear_side_left
     note: "toy analogue of a left fender repeater aimed back along the adjacent lane; the ego body is only at the frame edge"
     mount: left_front_fender
-    pos_m: [-0.96, 1.30, 0.82]
-    yaw_deg: -160
+    pos_m: [-0.81, 1.25, 0.67]
+    yaw_deg: -150
     pitch_deg: -8
     fov_v: 55.4
     live_res: [640, 480]
@@ -128,8 +128,8 @@ cameras:
     role: rear_side_right
     note: "toy analogue of a right fender repeater aimed back along the adjacent lane; the ego body is only at the frame edge"
     mount: right_front_fender
-    pos_m: [0.96, 1.30, 0.82]
-    yaw_deg: 160
+    pos_m: [0.81, 1.25, 0.67]
+    yaw_deg: 150
     pitch_deg: -8
     fov_v: 55.4
     live_res: [640, 480]

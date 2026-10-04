@@ -58,7 +58,7 @@ The settled game view. Soft Esc parked.
 
 ![rear](docs/cams/rear.jpg)
 
-## Recent changes (alpha 1.7.7)
+## Recent changes (alpha 1.7.8)
 
 Catch-up from **1.0.1**. Each feature merge since that pin is one main step. The throttle fix is the point in between. Live Alt+G, Tech 8-cam, FFB, and QSV stay **UNPROVEN**.
 
@@ -142,11 +142,15 @@ A bright gray hood is not the road sample. Mid-gray asphalt under that hood stay
 
 The tone sample is the road under the sky and above the hood. Sky (190, 200, 210) over asphalt (128, 118, 108) stays mid gray with a dark hood, the lane fit stays at 2 lanes, and that sky stays off the white-paint mask.
 
-## Alpha 1.7.7
+## 1.7.8 repeater mounts
+
+Fender repeaters move closer to the body, lower, and slightly back. repeatL is X -0.81, Y 1.25, Z 0.67, yaw -150. repeatR is X 0.81, Y 1.25, Z 0.67, yaw 150. The aim is 10 degrees farther out from the car than 160, still more rear than side. They still ignore only the ego car. Pillar and rear cameras stay put. Narrow and main stay put. The wide camera keeps its aim. Its picture widens from 4:3 to 16:9.
+
+## Alpha 1.7.8
 
 This is **alpha** — may break / not work; improves with fixes.
 
-Canonical pin **1.7.7** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Untagged retail zips use `1.7.7-alpha-<sha>`.
+Canonical pin **1.7.8** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Untagged retail zips use `1.7.8-alpha-<sha>`.
 
 **Versioning** (this line stays **alpha** until a later non-alpha release):
 

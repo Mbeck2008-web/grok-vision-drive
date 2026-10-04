@@ -521,8 +521,14 @@ def _pair(
             width = _near_separation(left, right)
             if width < 1.2:
                 continue
+            # A pair that still reaches ahead of the bumper beats a pair that
+            # lives entirely behind, even when the rear pair is closer to 3.5 m.
+            # A rear-only or beside-only scene still pairs: nothing ahead loses
+            # that key, and the width keys below are unchanged.
+            ahead = left[-1][1] > 0.0 and right[-1][1] > 0.0
             straddles = _mean_x(left) <= 0.6 and _mean_x(right) >= -0.6
             score = (
+                0 if ahead else 1,
                 0 if straddles else 1,
                 abs(width - LANE_W_DEFAULT),
                 abs((_mean_x(left) + _mean_x(right)) * 0.5),
@@ -579,8 +585,10 @@ def _lane_route(
 
     extended = y1 < horizon - step
     x, y, h = observed[-1][0], observed[-1][1], heading
-    # Extend along the visible heading, but only while the road still points
-    # forward. A bend must not be completed into a circle behind the car.
+    # Extend along the visible heading while it still points forward. A lane
+    # that is still behind the bumper keeps stepping, so the route is not
+    # stuck aft of the car. A step that falls behind the bumper without
+    # moving forward is the road turning back on itself, and that stops.
     remain = max(0.0, horizon - max(0.0, y))
     guard = 0
     while remain > step * 0.5 and guard < 80:
@@ -588,9 +596,10 @@ def _lane_route(
         if math.cos(h_next) < 0.2:
             break
         h = h_next
+        y_prev = y
         x = x + math.sin(h) * step
         y = y + math.cos(h) * step
-        if y < -0.5:
+        if y < -0.5 and y <= y_prev:
             break
         samples.append((x, y))
         extended = True

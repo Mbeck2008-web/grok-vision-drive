@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -254,7 +255,8 @@ def _check_same_tick_stitch() -> None:
         reads.clear()
         colour["n"] = 3
         first = be.grab()
-        assert reads[:8] == [f"gvd_{cid}" for cid in CAM_IDS], reads
+        read_order = ["main"] + [cid for cid in CAM_IDS if cid != "main"]
+        assert reads[:8] == [f"gvd_{cid}" for cid in read_order], reads
         assert len(reads) == 8
         for cid in CAM_IDS:
             assert first.health[cid] == CamHealth.OK, cid
@@ -268,7 +270,7 @@ def _check_same_tick_stitch() -> None:
         colour["n"] = 9
         reads.clear()
         second = be.grab()
-        assert reads == [f"gvd_{cid}" for cid in CAM_IDS]
+        assert reads == [f"gvd_{cid}" for cid in read_order]
         st2 = stitch_frames(bundle_tick_frames(second))
         assert not np.array_equal(st.bgr, st2.bgr)
 
@@ -295,6 +297,33 @@ def _check_same_tick_stitch() -> None:
         dropped = stitch_frames(kept)
         rear_sec = next(sec for sec in dropped.sectors if sec.cam_id == "rear")
         assert rear_sec.present is False
+
+        # A slow narrow read holds the one socket after main has already landed.
+        narrow = be._sensors["narrow"]
+
+        def _slow_narrow():
+            time.sleep(0.2)
+            img = np.zeros((8, 8, 3), dtype=np.uint8)
+            img[0, 0, 1] = 3
+            return {"colour": img}
+
+        narrow.stream_raw = _slow_narrow  # type: ignore[method-assign]
+        t0 = time.perf_counter()
+        slow = be.grab()
+        assert time.perf_counter() - t0 < 0.25, time.perf_counter() - t0
+        assert slow.health["main"] == CamHealth.OK
+        assert "main" in slow.frames and int(slow.frames["main"].max()) > 0
+        assert slow.health["narrow"] == CamHealth.MISSING
+        assert "narrow" not in slow.frames
+        for cid in ("wide", "pillarL", "pillarR", "repeatL", "repeatR", "rear"):
+            assert cid not in slow.frames, cid
+            assert slow.health[cid] == CamHealth.MISSING, cid
+        waiting = be.grab()
+        assert waiting.frames == {}
+        assert waiting.health["main"] == CamHealth.MISSING
+        if be._io_thread is not None and be._io_thread.is_alive():
+            be._io_thread.join(1.0)
+        be._reap_if_done()
         act.note_soft_esc_engaged(prev)
         if prev_bytes is None:
             engage.unlink(missing_ok=True)

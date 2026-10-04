@@ -43,8 +43,11 @@ MAIN_GRAB_DIV = 1
 # frame. Yaml -1 is still the offscreen attach period, not a viewport render.
 # The sensor is attached at COMPANION_OFFSCREEN_UPDATE_S and read with
 # stream_raw. SendAdHocRequestCamera is not used: that render steps the game
-# view's exposure for one frame. A read that exceeds CAM_READ_BUDGET_S does
-# not stall the rest of the grab and does not fill the slot from an older tick.
+# view's exposure for one frame. One in-flight read holds the socket. Main
+# is read before any companion, so a companion that runs past
+# CAM_READ_BUDGET_S cannot drop main. Every camera after that miss on this
+# tick is missing. The next grab does not start another read until the thread
+# finishes. A miss is not filled from an older tick.
 CAM_READ_BUDGET_S = 0.05
 _OWED_CAP = 7  # one slot per companion; the owed queue cannot grow past the rig
 WIDE_GRAB_DIV = 16
@@ -1688,39 +1691,6 @@ class BeamNGPyBackend:
         if cid == "main":
             frames["cam_main"] = bgr
 
-    def _reuse_cached(
-        self, cid: str, frames: dict, timestamps: dict, health: dict, *, failed: bool
-    ) -> None:
-        """Keep the last real picture.
-
-        A scheduled skip stays OK when a non-blank frame is cached. No cache
-        leaves MISSING (the slot stays labelled). A read that only missed the
-        time budget is the same skip: the last real frame stays OK so CAMS
-        still counts the tile. A completed read that returns nothing is STALE
-        and the pixels stay, so the tile does not go black. An all-zero buffer
-        is not a picture and is not stored here.
-        """
-        bgr = self._cache_frames.get(cid)
-        if frame_is_unrendered(bgr):
-            bgr = None
-        if not failed:
-            if bgr is None:
-                return
-            frames[cid] = bgr
-            timestamps[cid] = self._cache_ts.get(cid, time.time())
-            health[cid] = CamHealth.OK
-            if cid == "main":
-                frames["cam_main"] = bgr
-            return
-        if bgr is None:
-            health[cid] = CamHealth.MISSING
-            return
-        frames[cid] = bgr
-        timestamps[cid] = self._cache_ts.get(cid, time.time())
-        health[cid] = CamHealth.STALE
-        if cid == "main":
-            frames["cam_main"] = bgr
-
     def _confirm_priority_scale(self) -> None:
         """BeamNGpy getter: 0=highest. If main reads ~1, invert so main is not starved."""
         main = self._sensors.get("main")
@@ -2111,13 +2081,19 @@ class BeamNGPyBackend:
         unique_ids: list[str] = []
         self._read_blocked = False
         # Soft Esc and Engage both read all eight cameras on this tick.
-        # A skipped, timed-out, or empty read stays missing. The previous
-        # picture is not the stitch. Companions are not SendAdHocRequestCamera.
-        # That render steps the game view's exposure for one frame. They
-        # update offscreen; this grab reads shared memory.
+        # Main is first. One in-flight read holds the socket, so a companion
+        # that misses CAM_READ_BUDGET_S leaves every later camera missing
+        # and the next grab waits. A skipped, timed-out, or empty read stays
+        # missing. The previous picture is not the stitch. Companions are
+        # not SendAdHocRequestCamera. That render steps the game view's
+        # exposure for one frame. They update offscreen; this grab reads
+        # shared memory.
         soft_esc_main = soft_esc_colour_main_only()
         self._reap_if_done()
-        for cid, cam in self._sensors.items():
+        sensors = list(self._sensors.items())
+        main_first = [item for item in sensors if item[0] == "main"]
+        main_first.extend(item for item in sensors if item[0] != "main")
+        for cid, cam in main_first:
             if not self._grab_this_tick(cid, grab_i):
                 self._omit_unread(cid, frames, timestamps, health)
                 continue

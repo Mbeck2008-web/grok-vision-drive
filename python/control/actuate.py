@@ -500,10 +500,7 @@ def plan_command(
 
     steer = 0.0
     if path_ego and len(path_ego) >= 3:
-        # lateral of a near point ≈ steering demand
-        mid = path_ego[min(8, len(path_ego) - 1)]
-        x = float(mid.get("x", 0.0))
-        steer = max(-1.0, min(1.0, x / 2.5))
+        steer = path_steer_from_ego(path_ego)
 
     blinker = str(planner.get("blinker") or "off")
     if blinker not in ("left", "right"):
@@ -1256,8 +1253,28 @@ def make_actuator(vehicle: Any | None = None, prefer_beamngpy: bool = True) -> A
     return CmdJsonActuator()
 
 
+def steer_sample_point(path_ego: list[dict[str, float]]) -> dict[str, float] | None:
+    """Point the wheel reads.
+
+    A path that starts at the bumper with 1 m steps has its old index-8
+    sample at about 8 m. Prefer the first point at least that far ahead.
+    Points beside and behind the car stay on the route, but they are not
+    the sample. If the visible piece ends before 8 m, use the farthest
+    point still ahead of the bumper. Nothing ahead leaves the wheel centered.
+    """
+    ahead = [p for p in path_ego if float(p.get("y", 0.0)) >= 8.0]
+    if ahead:
+        return ahead[0]
+    forward = [p for p in path_ego if float(p.get("y", 0.0)) > 0.0]
+    if not forward:
+        return None
+    return max(forward, key=lambda p: float(p.get("y", 0.0)))
+
+
 def path_steer_from_ego(path_ego: list[dict[str, float]] | None) -> float:
     if not path_ego or len(path_ego) < 2:
         return 0.0
-    mid = path_ego[min(8, len(path_ego) - 1)]
+    mid = steer_sample_point(path_ego)
+    if mid is None:
+        return 0.0
     return max(-1.0, min(1.0, float(mid.get("x", 0.0)) / 2.5))

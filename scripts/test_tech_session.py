@@ -2365,7 +2365,7 @@ def check_adhoc_companions_do_not_block_or_pile() -> None:
 
     poll() on requested_update_time < 0 does not take a reading (the hitch stays
     empty) and the GE round-trip can sit for ~0.5–1 s. A bounded grab must
-    return inside the budget, keep the last real frame, and never stack
+    return inside the budget, leave a missed camera empty, and never stack
     requests. This is the leak/stall pattern; it is not a 10-minute soak.
     """
     import sys
@@ -2518,7 +2518,7 @@ def check_adhoc_companions_do_not_block_or_pile() -> None:
         for cam in cams.values():
             assert cam.sent == [], (cam.name, cam.sent)
             assert cam.collected == [], (cam.name, cam.collected)
-        # Last-frame paint: a later tick still holds every companion picture.
+        # Every tick re-reads, so a later grab still holds every companion picture.
         held = be.grab()
         for cid in CAM_IDS:
             assert cid in held.frames, cid
@@ -2550,12 +2550,11 @@ def check_adhoc_companions_do_not_block_or_pile() -> None:
         assert time.perf_counter() - t0 < 0.25, time.perf_counter() - t0
         assert blocked.grab_read_blocked is True
         assert SlowMain.n == 1
-        # narrow is attached before main, so it lands. main and everything
-        # after it do not, and an older picture is not filled in.
-        assert "narrow" in blocked.frames and int(blocked.frames["narrow"].max()) > 0
+        # Main is read first. A slow main holds the socket, so main and every
+        # companion on this tick are missing. An older picture is not filled in.
         assert "main" not in blocked.frames
         assert blocked.health["main"] == CamHealth.MISSING
-        for cid in ("wide", "pillarL", "pillarR", "repeatL", "repeatR", "rear"):
+        for cid in ("narrow", "wide", "pillarL", "pillarR", "repeatL", "repeatR", "rear"):
             assert cid not in blocked.frames, cid
             assert blocked.health[cid] == CamHealth.MISSING, cid
         t1 = time.perf_counter()
@@ -2569,7 +2568,8 @@ def check_adhoc_companions_do_not_block_or_pile() -> None:
         assert SlowMain.n == 2
         assert "main" not in painted.frames
         assert painted.health["main"] == CamHealth.MISSING
-        assert "narrow" in painted.frames
+        assert "narrow" not in painted.frames
+        assert painted.health["narrow"] == CamHealth.MISSING
         time.sleep(0.7)
         if be._io_thread is not None and be._io_thread.is_alive():
             be._io_thread.join(1.0)

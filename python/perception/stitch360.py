@@ -1,9 +1,8 @@
 """Flat 360° strip of the rig frames already delivered on one tick.
 
-``CameraFrameBundle.frames`` holds every camera that has a real picture on
-that grab. Companions are polled on a hitch, and the bundle keeps the last
-real frame, so the eight slots are together even when only one of them is
-new this tick.
+The live stitch is ``bundle_tick_frames``. Only cameras that share this
+grab's timestamp are painted. A miss is an empty sector. An older frame is
+not kept, so eight slots do not fill when only one camera is new.
 
 The strip is left to right around the car:
 

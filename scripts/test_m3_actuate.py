@@ -10,7 +10,6 @@ sys.path.insert(0, str(ROOT))
 
 from python.control.actuate import (
     TECH_DRIVE_GEAR,
-    TECH_HOLD_GEAR,
     TECH_PLAYER_SHIFT_MODE,
     TECH_SHIFT_MODE,
     BeamNGPyActuator,
@@ -81,8 +80,12 @@ def check_electrics_segment_timer() -> None:
     assert last_electrics_ms() >= 0.0
 
 
-def _check_lua_manual_forward() -> None:
-    """Lua 5.1: M2/m2 is already forward. A stale Python echo must not shift that lever."""
+def _check_lua_arm_leaves_mode_alone() -> None:
+    """The drive arm releases the parking brake and does not touch the gearbox mode.
+
+    Arcade shiftToGearIndex is switchToRealisticBehavior. setGearboxMode always
+    runs gearboxBehaviorChanged. Either call is the arcade ↔ realistic flip.
+    """
     import shutil
     import subprocess
     import tempfile
@@ -91,38 +94,22 @@ def _check_lua_manual_forward() -> None:
     assert lua, "lua 5.1 is required to prove the drive-arm chunk"
     src = f"""
 local src = [=[{TECH_DRIVE_SHIFT_LUA}]=]
-local function run(gear)
-  local up, jump = 0, 0
-  electrics = {{ values = {{ gear = gear }} }}
-  controller = {{ mainController = {{
-    setGearboxMode = function() end,
-    shiftUp = function() up = up + 1 end,
-    shiftToGearIndex = function() jump = jump + 1 end,
-    shiftLogic = {{
-      automaticModes = 'PRND21',
-      getGearPosition = function() return gear end,
-    }},
-  }} }}
-  input = {{ event = function() end }}
-  assert(loadstring(src))()
-  return up, jump
+local modes, ups, jumps = 0, 0, 0
+local pb, cl = nil, nil
+controller = {{ mainController = {{
+  setGearboxMode = function() modes = modes + 1 end,
+  shiftUp = function() ups = ups + 1 end,
+  shiftToGearIndex = function() jumps = jumps + 1 end,
+}} }}
+input = {{ event = function(kind, value)
+  if kind == 'parkingbrake' then pb = value
+  elseif kind == 'clutch' then cl = value end
+end }}
+assert(loadstring(src))()
+if modes ~= 0 or ups ~= 0 or jumps ~= 0 or pb ~= 0 or cl ~= 0 then
+  error('modes=' .. modes .. ' up=' .. ups .. ' jump=' .. jumps
+    .. ' pb=' .. tostring(pb) .. ' cl=' .. tostring(cl))
 end
-local function expect(gear, want_up, want_jump)
-  local up, jump = run(gear)
-  if up ~= want_up or jump ~= want_jump then
-    error(gear .. ' up=' .. tostring(up) .. ' jump=' .. tostring(jump))
-  end
-end
-expect('M2', 0, 0)
-expect('m2', 0, 0)
-expect('M1', 0, 0)
-expect('D', 0, 0)
-expect('d', 0, 0)
-expect('1', 0, 0)
-expect('N', 1, 0)
-expect('0', 1, 0)
-expect('P', 0, 1)
-expect('R', 0, 1)
 print('LUA_ARM_OK')
 """
     path = ""
@@ -140,10 +127,11 @@ print('LUA_ARM_OK')
 
 
 def check_drive_gear_arm() -> None:
-    """Throttle>0 leaves Neutral: gear>=1, clutch and parking brake cleared.
+    """Throttle>0 releases the parking brake and the clutch, and omits gear.
 
-    set_shift_mode failures are logged and retried. The vehicle-Lua arm shifts
-    up from N or jumps to the D letter. It never shiftDown and never requests -1.
+    A gear field is shiftToGearIndex. In arcade that function sets realistic.
+    set_shift_mode failures are logged and retried. The vehicle-Lua arm does
+    not call setGearboxMode, shiftUp, or shiftToGearIndex.
     """
     import io
     import time
@@ -159,12 +147,13 @@ def check_drive_gear_arm() -> None:
     assert gear_is_forward("M0") is False
     assert gear_is_forward(1) and gear_is_forward("3") and gear_is_forward(TECH_DRIVE_GEAR)
     assert "shiftDown" not in TECH_DRIVE_SHIFT_LUA
+    assert "shiftUp" not in TECH_DRIVE_SHIFT_LUA
+    assert "shiftToGearIndex" not in TECH_DRIVE_SHIFT_LUA
+    assert "setGearboxMode" not in TECH_DRIVE_SHIFT_LUA
+    assert "automaticModes" not in TECH_DRIVE_SHIFT_LUA
+    assert "realistic" not in TECH_DRIVE_SHIFT_LUA
     assert "-1" not in TECH_DRIVE_SHIFT_LUA
-    assert "shiftUp" in TECH_DRIVE_SHIFT_LUA
-    assert "automaticModes" in TECH_DRIVE_SHIFT_LUA
     assert "parkingbrake" in TECH_DRIVE_SHIFT_LUA and "clutch" in TECH_DRIVE_SHIFT_LUA
-    assert "M(%d+)" in TECH_DRIVE_SHIFT_LUA
-    assert "string.upper" in TECH_DRIVE_SHIFT_LUA
 
     class ArmVeh:
         def __init__(self, gear: object, *, fail_shift: bool = False) -> None:
@@ -195,7 +184,7 @@ def check_drive_gear_arm() -> None:
     assert out.applied is True
     kw = neutral.calls[-1]
     assert kw["throttle"] == 0.55 and kw["parkingbrake"] == 0.0 and kw["clutch"] == 0.0
-    assert int(kw["gear"]) >= TECH_DRIVE_GEAR and int(kw["gear"]) != -1
+    assert "gear" not in kw
     assert not is_reverse_control(kw)
     assert neutral.shifts == [TECH_SHIFT_MODE]
     assert "ok" in log and TECH_SHIFT_MODE in log
@@ -203,7 +192,7 @@ def check_drive_gear_arm() -> None:
     assert tech.drive_arm_n == 1
     with redirect_stdout(io.StringIO()):
         tech.apply(DriveCommand(steer=0.1, throttle=0.55, brake=0.0, seq=2, reason="ok"))
-    assert len(neutral.lua) == 1, "second arm inside the delay must not shiftUp again"
+    assert len(neutral.lua) == 1, "second arm inside the delay must not queue again"
     tech._drive_arm_mono = time.monotonic() - (TECH_DRIVE_ARM_S + 0.05)
     with redirect_stdout(io.StringIO()):
         tech.apply(DriveCommand(steer=0.1, throttle=0.55, brake=0.0, seq=3, reason="ok"))
@@ -216,7 +205,7 @@ def check_drive_gear_arm() -> None:
     with redirect_stdout(io.StringIO()):
         tech_d.apply(DriveCommand(steer=0.0, throttle=0.4, brake=0.0, seq=4, reason="ok"))
     assert forward.lua == []
-    assert forward.calls[-1]["gear"] >= TECH_DRIVE_GEAR
+    assert "gear" not in forward.calls[-1]
     assert forward.calls[-1]["parkingbrake"] == 0.0
 
     class _ElData:
@@ -253,7 +242,7 @@ def check_drive_gear_arm() -> None:
         tech_n.apply(DriveCommand(steer=0.0, throttle=0.4, brake=0.0, seq=9, reason="ok"))
     assert still_n.lua == [TECH_DRIVE_SHIFT_LUA]
 
-    _check_lua_manual_forward()
+    _check_lua_arm_leaves_mode_alone()
 
     failing = ArmVeh("N", fail_shift=True)
     tech_f = BeamNGPyActuator(failing)
@@ -267,7 +256,7 @@ def check_drive_gear_arm() -> None:
     assert tech_f._shift_set is False
     assert failing.shifts == [TECH_SHIFT_MODE, TECH_SHIFT_MODE]
     assert "failed" in flog and "ShiftModeSet" in flog
-    assert failing.calls[-1]["gear"] >= TECH_DRIVE_GEAR
+    assert "gear" not in failing.calls[-1]
     assert failing.lua  # still armed the lever; the ack failure is not silent
 
     class NoClutch:
@@ -291,7 +280,7 @@ def check_drive_gear_arm() -> None:
     with redirect_stdout(io.StringIO()):
         tech_b.apply(DriveCommand(steer=0.2, throttle=0.3, brake=0.0, seq=7, reason="ok"))
     assert "clutch" not in bare.calls[-1]
-    assert bare.calls[-1]["gear"] >= TECH_DRIVE_GEAR
+    assert bare.calls[-1]["gear"] is None
     assert bare.calls[-1]["parkingbrake"] == 0.0
 
 
@@ -824,9 +813,8 @@ def main() -> None:
     assert "parkingbrake" not in payload and "gear" not in payload, payload
 
     rest = tech_control_kwargs(0.0, 0.0, 1.0)
-    assert rest["gear"] == TECH_HOLD_GEAR == 0
+    assert "gear" not in rest
     assert rest["throttle"] == 0.0 and rest["brake"] == 0.0 and rest["parkingbrake"] == 1.0
-    assert rest.get("gear") != -1
     assert not is_reverse_control(rest)
     assert not is_arcade_reverse_hold(rest)
     assert is_reverse_control({"gear": -1})
@@ -835,26 +823,27 @@ def main() -> None:
     assert is_arcade_reverse_hold({"throttle": 0.0, "brake": 1.0, "gear": 0, "parkingbrake": 0.0})
     assert is_arcade_reverse_hold({"throttle": 0.0, "brake": 1.0, "gear": 0, "parkingbrake": 1.0})
     rolling = tech_control_kwargs(0.1, 0.0, 1.0, speed_mps=12.0)
-    assert rolling["brake"] == 0.0 and rolling["parkingbrake"] == 1.0 and rolling["gear"] == 0
+    assert rolling["brake"] == 0.0 and rolling["parkingbrake"] == 1.0
+    assert "gear" not in rolling
     assert rolling["throttle"] == 0.0
     assert not is_arcade_reverse_hold(rolling)
-    assert rolling.get("gear") != -1
     drive_kw = tech_control_kwargs(0.2, 0.4, 0.0)
     assert drive_kw["throttle"] == 0.4 and drive_kw["parkingbrake"] == 0.0
     assert drive_kw["clutch"] == 0.0
-    assert drive_kw["gear"] >= TECH_DRIVE_GEAR and drive_kw["gear"] != -1
+    assert "gear" not in drive_kw
     slow = tech_control_kwargs(0.0, 0.0, 0.6)
     assert slow["brake"] == 0.6 and slow.get("parkingbrake", 0.0) == 0.0
-    assert slow["gear"] == TECH_HOLD_GEAR == 0  # forward gear only with throttle>0
+    assert "gear" not in slow
     coast = tech_control_kwargs(0.0, 0.0, 0.0)
-    assert coast["gear"] == 0 and coast["throttle"] == 0.0
+    assert "gear" not in coast and coast["throttle"] == 0.0
     rel = tech_control_kwargs(0.9, 0.9, 0.9, release=True)
     assert rel == {"steering": 0.0, "throttle": 0.0, "brake": 0.0, "parkingbrake": 0.0}
-    assert rel.get("gear", 0) != -1
+    assert "gear" not in rel
 
     # Tech: disengaged must not call vehicle.control (no brake takeover). One zero
     # release on the falling edge, then silence. Engaged stop/hold/AEB stay arcade:
-    # parkingbrake=1, service brake 0, gear=0. Drive pins gear>=1. Never gear=-1.
+    # parkingbrake=1, service brake 0, no gear field. Drive is throttle with the
+    # parking brake released. A gear field would call shiftToGearIndex.
     class FakeVeh:
         def __init__(self) -> None:
             self.calls: list[dict] = []
@@ -872,17 +861,9 @@ def main() -> None:
 
     def _assert_no_reverse(kw: dict) -> None:
         assert not is_reverse_control(kw), kw
-        gear = kw.get("gear")
-        assert gear != -1, kw
-        assert not isinstance(gear, str), kw  # never letter "D"
-        if gear is not None:
-            assert isinstance(gear, int) and gear >= 0, kw
-        if float(kw.get("throttle") or 0.0) > 1e-6:
-            assert int(kw["gear"]) >= TECH_DRIVE_GEAR, kw
+        assert "gear" not in kw, kw
         if float(kw.get("throttle") or 0.0) <= 1e-6 and float(kw.get("brake") or 0.0) >= 0.99:
             assert float(kw.get("brake") or 0.0) > 0.0 or float(kw.get("parkingbrake") or 0.0) > 0.0, kw
-            if gear is not None:
-                assert gear == 0 or gear >= 1, kw
         assert not is_arcade_reverse_hold(kw), kw
 
     veh = FakeVeh()
@@ -897,17 +878,17 @@ def main() -> None:
     drive = tech.apply(DriveCommand(steer=0.2, throttle=0.4, brake=0.0, seq=2, reason="ok"))
     assert drive.applied is True and veh.calls[-1]["throttle"] == 0.4
     assert veh.calls[-1].get("parkingbrake", 0.0) == 0.0
-    assert veh.calls[-1]["gear"] >= TECH_DRIVE_GEAR
+    assert "gear" not in veh.calls[-1]
     assert veh.shifts == [TECH_SHIFT_MODE] and TECH_SHIFT_MODE == "arcade"
-    assert "setGearboxMode('arcade')" in TECH_DRIVE_SHIFT_LUA
-    assert "setGearboxMode('realistic')" not in TECH_DRIVE_SHIFT_LUA
+    assert "setGearboxMode" not in TECH_DRIVE_SHIFT_LUA
+    assert "realistic" not in TECH_DRIVE_SHIFT_LUA
     _assert_no_reverse(veh.calls[-1])
 
     hold = tech.stop(seq=3, reason="preview_blocked")
     assert hold.applied is True and hold.brake == 1.0 and hold.throttle == 0.0
     kw = veh.calls[-1]
     _assert_no_reverse(kw)
-    assert kw["gear"] == TECH_HOLD_GEAR == 0
+    assert "gear" not in kw
     assert kw["brake"] == 0.0 and kw["parkingbrake"] == 1.0 and kw["throttle"] == 0.0
 
     aeb_cmd = plan_command(
@@ -920,7 +901,7 @@ def main() -> None:
     aeb_out = tech.apply(aeb_cmd)
     assert aeb_out.applied is True and aeb_out.brake == 1.0
     _assert_no_reverse(veh.calls[-1])
-    assert veh.calls[-1]["gear"] == 0 and veh.calls[-1]["brake"] == 0.0
+    assert "gear" not in veh.calls[-1] and veh.calls[-1]["brake"] == 0.0
     assert veh.calls[-1]["parkingbrake"] == 1.0 and veh.calls[-1]["throttle"] == 0.0
 
     class MovingVeh(FakeVeh):
@@ -935,7 +916,7 @@ def main() -> None:
     tech_m.note_engaged(True)
     tech_m.apply(DriveCommand(steer=0.0, throttle=0.0, brake=1.0, seq=31, reason="ok"))
     mkw = moving.calls[-1]
-    assert mkw["brake"] == 0.0 and mkw["parkingbrake"] == 1.0 and mkw["gear"] == 0
+    assert mkw["brake"] == 0.0 and mkw["parkingbrake"] == 1.0 and "gear" not in mkw
     assert mkw["throttle"] == 0.0
     _assert_no_reverse(mkw)
 
@@ -958,7 +939,7 @@ def main() -> None:
 
     resume = tech.apply(DriveCommand(steer=0.0, throttle=0.35, brake=0.0, seq=33, reason="ok"))
     assert resume.applied is True
-    assert veh.calls[-1]["gear"] >= 1 and veh.calls[-1]["parkingbrake"] == 0.0
+    assert "gear" not in veh.calls[-1] and veh.calls[-1]["parkingbrake"] == 0.0
     _assert_no_reverse(veh.calls[-1])
 
     tech.note_engaged(False)
@@ -967,7 +948,7 @@ def main() -> None:
     edge = tech.stop(seq=4, reason="not_engaged", now=40.0)
     assert edge.applied is False and edge.throttle == 0.0 and edge.brake == 0.0
     assert veh.calls[-1] == {"steering": 0.0, "throttle": 0.0, "brake": 0.0, "parkingbrake": 0.0}
-    assert veh.calls[-1].get("gear", 0) != -1
+    assert "gear" not in veh.calls[-1]
     assert veh.ai_modes[-1] == "disabled"
     assert veh.shifts[-1] == TECH_PLAYER_SHIFT_MODE == "arcade"
     edge_payload = json.loads(cmd_path().read_text(encoding="utf-8"))

@@ -276,7 +276,7 @@ check(lastAllowedFor('parkingbrake', 'local') and lastAllowedFor('parkingbrake',
   'setAllowedInputSource(parkingbrake, local, false) so a resting handbrake cannot pin the car')
 check(lastAllowedFor('clutch', 'local') and lastAllowedFor('clutch', 'local')[3] == false,
   'setAllowedInputSource(clutch, local, false) so a resting clutch cannot pin the car')
-check(#shifter == 1 and shifter[1] == 'arcade', 'arcade shifter mode queued once on first drive')
+check(#shifter == 1 and shifter[1] == 2, 'arcade shifter mode 2 queued once on first drive')
 
 -- 3) electrics echo → GE → gvd_ego.json with applied seq
 electricsValues.wheelspeed = 5.5
@@ -392,7 +392,7 @@ for _, e in ipairs(events) do
 end
 check(releasedOld, 'previous vehicle 101 got release zeros')
 check(droveNew, 'new vehicle 202 receives the drive command')
-check(#shifter == 1 and shifter[1] == 'arcade', 'arcade re-armed for the new vehicle')
+check(#shifter == 1 and shifter[1] == 2, 'arcade mode 2 re-armed for the new vehicle')
 clearEvents()
 M.toggleEngage()
 check(lastEvent('throttle').veh == 202 and near(lastEvent('throttle')[2], 0), 'disengage releases the vehicle we actually drove')

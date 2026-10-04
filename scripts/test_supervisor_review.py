@@ -267,11 +267,12 @@ def check_frustums() -> None:
     assert ldx < 0 < rdx, (ldx, rdx)
     assert ldy < 0 and rdy < 0, (ldy, rdy)
     # Fenders look back along the next lane (more rear than side), not down the road ahead.
-    # Yaw stays ±160. The mount is 0.15 m further back than the old 1.45 fender point.
-    assert frs["repeatR"]["yaw_deg"] == 160.0
-    assert frs["repeatL"]["yaw_deg"] == -160.0
-    assert frs["repeatL"]["y"] == 1.30 and frs["repeatR"]["y"] == 1.30
-    assert frs["repeatL"]["x"] == -0.96 and frs["repeatR"]["x"] == 0.96
+    # 1.7.8: closer to the body, slightly farther back, lower, and 10° farther out than ±160.
+    assert frs["repeatR"]["yaw_deg"] == 150.0
+    assert frs["repeatL"]["yaw_deg"] == -150.0
+    assert frs["repeatL"]["y"] == 1.25 and frs["repeatR"]["y"] == 1.25
+    assert frs["repeatL"]["z"] == 0.67 and frs["repeatR"]["z"] == 0.67
+    assert frs["repeatL"]["x"] == -0.81 and frs["repeatR"]["x"] == 0.81
     assert abs(rdy) > abs(rdx) and abs(ldy) > abs(ldx)
 
     behind = [cid for cid, fr in frs.items() if look(fr)[1] < -2.0]

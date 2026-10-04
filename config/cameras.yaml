@@ -6,26 +6,18 @@
 #
 # BeamNGpy Camera defaults near_far_planes=(0.05, 100) m (BeamNGpy#199). GVD always passes
 # an explicit (near_m, far_m) + requested_update_time from this file. near is 0.05 on every cam.
-# Locked far_m (narrow > main; never both-800). Grab stagger is Python-side (not resolution).
-# Every grab is one stream_raw (main, every tick) plus at most one poll:
-#   main:    every tick (÷1, stream_raw)
-#   wide:    ÷16 phase 0 (even ticks 0 and 16; poll)
-#   narrow:  ÷16 phase 1 (odd tick; poll; never shares a tick with wide)
-#   pillarL: ÷16 phase 2
-#   pillarR: ÷16 phase 3
-#   repeatL: ÷16 phase 5
-#   rear:    ÷16 phase 6 (no side on this slot)
-#   repeatR: ÷16 phase 7
+# Locked far_m (narrow > main; never both-800).
+# Every supervisor tick reads all eight cameras before the stitch is built.
+# The hitch div/phase keys below name the old slots. They do not skip a camera.
 # Far / GPU (stream_raw for every cam; never is_streaming=False; never ad-hoc):
-#   Yaml -1 is the hitch (Python reads ÷16). The sensor is attached at a slow
-#   offscreen period so SendAdHocRequestCamera is not sent. That request flashes
-#   the game view's exposure for one frame.
+#   Yaml -1 attaches the sensor offscreen. Python reads every camera each tick.
+#   SendAdHocRequestCamera is not sent. That request flashes the game view.
 #   narrow: 800 @ -1     priority 0.5   (hitch read; next far hitch 400 only if live unique-frame Hz <10)
 #   main:   300 @ 0.067  priority 0.0
 #   wide:   300 @ -1     priority 0.5
 #   pillarL / pillarR / repeatL / repeatR / rear: 100 @ -1
 # Optional per-cam near_far_planes: [near_m, far_m] still clamped to the role band.
-# Hitch: forward grab stagger + on-demand sides/rear — not resolution. Depth OFF.
+# Depth OFF. Div/phase numbers are not the live skip schedule.
 origin_offset: [0.0, 0.0, 0.0]
 near_m: 0.05
 hitch:
@@ -33,7 +25,7 @@ hitch:
   wide_grab_div: 16
   wide_grab_phase: 0     # phase unchanged; ÷16 even ticks 0 and 16
   narrow_grab_div: 16
-  narrow_grab_phase: 1   # odd tick; never shares a tick with wide
+  narrow_grab_phase: 1   # phase label only; the live grab reads narrow with wide
   side_grab_div: 16
   side_grab_phase: 2     # pillarL; pillarR steps +1
   repeat_grab_div: 16

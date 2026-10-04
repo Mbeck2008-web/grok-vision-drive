@@ -3,7 +3,7 @@
 
 That request renders on the game view and steps exposure for one frame
 (bright blue shadows). The supervisor tiles do not show that flash.
-Companions are read with stream_raw, on the same hitch as before.
+Companions are read with stream_raw, on the same tick as main.
 """
 from __future__ import annotations
 
@@ -64,7 +64,7 @@ def _check_flash_frame_does_not_land() -> None:
     be._cache_ts = {"wide": 0.0}
     be._frame_sig = {}
     landed = _publish(be, "wide", flash)
-    assert np.array_equal(landed["wide"], settled)
+    assert "wide" not in landed
     assert np.array_equal(be._cache_frames["wide"], settled)
     quiet = _road((112, 106, 102))
     landed2 = _publish(be, "wide", quiet)
@@ -215,17 +215,16 @@ def main() -> None:
             else:
                 assert be._sensors[cid].kwargs["requested_update_time"] == COMPANION_OFFSCREEN_UPDATE_S
         hitch = load_camera_config().get("hitch") or {}
-        seen: set[str] = set()
-        for i in range(16):
-            bundle = be.grab()
-            due = [cid for cid in CAM_IDS if cid != "main" and camera_grab_due(cid, i, hitch)]
-            assert len(due) <= 1, (i, due)
-            for cid in due:
-                assert bundle.health[cid] == CamHealth.OK, (i, cid)
-                assert int(bundle.frames[cid].max()) > 0
-                seen.add(cid)
-            assert bundle.health["main"] == CamHealth.OK
-        assert seen == {cid for cid in CAM_IDS if cid != "main"}, seen
+        bundle = be.grab()
+        due = [cid for cid in CAM_IDS if cid != "main" and camera_grab_due(cid, 0, hitch)]
+        assert set(due) == {cid for cid in CAM_IDS if cid != "main"}, due
+        stamps = []
+        for cid in CAM_IDS:
+            assert bundle.health[cid] == CamHealth.OK, cid
+            assert int(bundle.frames[cid].max()) > 0
+            stamps.append(float(bundle.timestamps[cid]))
+        assert max(stamps) - min(stamps) < 1e-6
+        assert "same_tick=8" in bundle.note
         assert sent == []
         assert polled == []
         assert streamed, "stream_raw never ran"

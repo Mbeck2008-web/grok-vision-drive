@@ -868,10 +868,12 @@ def _continue_past_path(
 ) -> list[dict[str, float]]:
     """Carry one polyline along its own last heading until it passes the path.
 
-    A missing path leaves the samples alone. A line that already passes the
-    path is not lengthened. The extra point is the same piece, not a second
-    Hough segment joined across a gap, and it stops just past the path
-    instead of running out to the cabin span.
+    Real points already past the path stay. They are not cut back to the
+    ribbon. A missing path leaves the samples alone. A line that already
+    passes the path is not lengthened. The extra point is the same piece,
+    not a second Hough segment joined across a gap, and it stops just past
+    the path instead of running out to the cabin span. The stroke ends at
+    the last point that was seen or predicted.
     """
     if path_far_y is None or len(pts) < 2:
         return pts
@@ -901,9 +903,10 @@ def drawn_lane_records(
 ) -> list[dict[str, Any]]:
     """Boundaries the cabin strokes, each tagged through, merge, or exit.
 
-    Points are the ones that get drawn. With no blue path, nothing is added
-    past the last sample. With a path, that same polyline continues on its
-    last heading until it passes the path.
+    Points are the ones that get drawn. Real points past the blue path stay,
+    including a point beside or behind the car. With no blue path, nothing
+    is added past the last sample. With a path, a line that still ends short
+    of it continues on its last heading until it passes the path, then stops.
     """
     state = state or {}
     if cam is None:

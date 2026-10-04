@@ -31,7 +31,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 # Canonical product pin (also VERSION, python/__init__.py, BeamNG app.json).
-VERSION = "1.7.8"
+VERSION = "1.7.9"
 RELEASE_CHANNEL = "alpha"
 RELEASE_LABEL = f"{VERSION}-{RELEASE_CHANNEL}"
 

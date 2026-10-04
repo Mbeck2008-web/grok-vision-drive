@@ -631,11 +631,22 @@ def assign_min_cost(cost: np.ndarray) -> list[tuple[int, int]]:
     """Minimum-cost assignment. Each row and each column is used at most once.
 
     Rectangular costs assign ``min(rows, cols)`` pairs. Pairs are ``(row, col)``
-    in the original matrix.
+    in the original matrix. A non-finite cost never enters the search: NaN does
+    not compare as less-than, and an all-NaN matrix would not return.
     """
-    matrix = np.asarray(cost, dtype=np.float64)
+    matrix = np.array(cost, dtype=np.float64, copy=True)
     if matrix.ndim != 2 or matrix.size == 0:
         return []
+    finite = np.isfinite(matrix)
+    if not bool(finite.any()):
+        return []
+    if not bool(finite.all()):
+        finite_vals = matrix[finite]
+        span = float(np.max(finite_vals) - np.min(finite_vals))
+        penalty = float(np.max(finite_vals)) + span + 1.0
+        if not np.isfinite(penalty):
+            return []
+        matrix[~finite] = penalty
     n_rows, n_cols = matrix.shape
     transposed = False
     work = matrix
@@ -1028,17 +1039,9 @@ if torch is not None:
             fields = tuple(getattr(pred, name) for name in OUTPUT_FIELDS)
             return fields + (state.h, state.tokens, state.mask)
 
-    def export_scene_onnx(path: Path | str, net: SceneNet | None = None) -> Path:
-        """Write the FP32 graph. Mixed precision does not change this file."""
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        model = net if net is not None else SceneNet()
-        model = model.eval()
+    def _trace_scene_onnx(model: Any, args: tuple[Any, ...], path_str: str) -> None:
+        """Trace the FP32 graph. The module and ``args`` are already on CPU."""
         wrapper = _OnnxScene(model).eval()
-        strip = torch.zeros(1, 3, CANVAS_H, CANVAS_W)
-        dt = torch.zeros(1)
-        state = model.initial_state()
-        args = (strip, dt, state.h, state.tokens, state.mask)
         output_names = list(OUTPUT_FIELDS) + ["h", "tokens", "mask"]
         export_kwargs = dict(
             input_names=["strip", "dt", "h", "tokens", "mask"],
@@ -1046,10 +1049,9 @@ if torch is not None:
             opset_version=17,
         )
         try:
-            torch.onnx.export(wrapper, args, str(path), dynamo=False, **export_kwargs)
+            torch.onnx.export(wrapper, args, path_str, dynamo=False, **export_kwargs)
         except TypeError:
-            torch.onnx.export(wrapper, args, str(path), **export_kwargs)
-        return path
+            torch.onnx.export(wrapper, args, path_str, **export_kwargs)
 
 else:
 
@@ -1063,5 +1065,48 @@ else:
         def forward_batch(self, *_args: Any, **_kwargs: Any) -> Any:
             raise ImportError("PyTorch is not installed")
 
-    def export_scene_onnx(path: Path | str, net: Any = None) -> Path:
+    def _trace_scene_onnx(model: Any, args: tuple[Any, ...], path_str: str) -> None:
         raise ImportError("PyTorch is not installed")
+
+
+def cpu_export_inputs(net: Any, zeros: Any) -> tuple[Any, tuple[Any, ...]]:
+    """Move ``net`` to CPU and build the tracer examples on CPU.
+
+    Training may have left the module on CUDA. The tracer is given CPU
+    examples, so the module has to be on CPU too or the export raises.
+    """
+    model = net.to("cpu")
+    model = model.eval()
+    strip = zeros(1, 3, CANVAS_H, CANVAS_W, device="cpu")
+    dt = zeros(1, device="cpu")
+    state = model.initial_state(device="cpu")
+    return model, (strip, dt, state.h, state.tokens, state.mask)
+
+
+def export_scene_onnx(
+    path: Path | str,
+    net: Any = None,
+    *,
+    zeros: Any = None,
+    trace: Any = None,
+) -> Path:
+    """Write the FP32 graph. Mixed precision does not change this file.
+
+    The module and the example inputs are moved to CPU before the tracer runs.
+    ``zeros`` and ``trace`` default to PyTorch. A test can pass both and skip
+    a GPU.
+    """
+    path = Path(path)
+    if net is None or zeros is None or trace is None:
+        if torch is None:
+            raise ImportError("PyTorch is not installed")
+    if net is None:
+        net = SceneNet()
+    if zeros is None:
+        zeros = torch.zeros
+    path.parent.mkdir(parents=True, exist_ok=True)
+    model, args = cpu_export_inputs(net, zeros)
+    if trace is None:
+        trace = _trace_scene_onnx
+    trace(model, args, str(path))
+    return path

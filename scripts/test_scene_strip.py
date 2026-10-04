@@ -52,6 +52,7 @@ from python.train.scene_net import (  # noqa: E402
     ScenePrediction,
     amp_enabled,
     assign_min_cost,
+    export_scene_onnx,
     labels_from_tech,
     letterbox_rect,
     loss_mask,
@@ -658,6 +659,73 @@ def check_fit_and_window() -> None:
     assert window.available is False
 
 
+def check_nan_cost_and_cpu_export() -> None:
+    """All-NaN assignment returns, and export builds CPU inputs for a CUDA module."""
+    blank = np.full((3, 2), np.nan, dtype=np.float64)
+    assert assign_min_cost(blank) == []
+    assert assign_min_cost(np.full((2, 2), np.inf)) == []
+    mixed = np.array([[np.nan, 0.5], [0.25, np.nan]], dtype=np.float64)
+    assert dict(assign_min_cost(mixed)) == {0: 1, 1: 0}
+    assert "cpu_export_inputs" in inspect.getsource(export_scene_onnx)
+
+    class _Device:
+        def __init__(self, name: str) -> None:
+            self.type = name
+
+        def __str__(self) -> str:
+            return self.type
+
+    class _Tensor:
+        def __init__(self, device: _Device) -> None:
+            self.device = device
+
+    class _State:
+        def __init__(self, device: _Device) -> None:
+            self.h = _Tensor(device)
+            self.tokens = _Tensor(device)
+            self.mask = _Tensor(device)
+
+    class _CudaNet:
+        def __init__(self) -> None:
+            self.device = _Device("cuda")
+
+        def to(self, device: object) -> "_CudaNet":
+            name = getattr(device, "type", None) or str(device)
+            self.device = _Device(str(name))
+            return self
+
+        def eval(self) -> "_CudaNet":
+            return self
+
+        def initial_state(self, device: object = None, dtype: object = None, batch: int = 1) -> _State:
+            del dtype, batch
+            name = "cpu" if device is None else (getattr(device, "type", None) or str(device))
+            return _State(_Device(str(name)))
+
+    def zeros(*_shape: int, device: object = None, **_kwargs: object) -> _Tensor:
+        name = "cpu" if device is None else (getattr(device, "type", None) or str(device))
+        return _Tensor(_Device(str(name)))
+
+    seen: dict[str, object] = {}
+
+    def trace(model: _CudaNet, args: tuple[_Tensor, ...], path_str: str) -> None:
+        seen["model"] = model
+        seen["args"] = args
+        Path(path_str).write_bytes(b"onnx")
+
+    net = _CudaNet()
+    assert net.device.type != "cpu"
+    with tempfile.TemporaryDirectory() as tmp:
+        out = export_scene_onnx(Path(tmp) / "e2e_scene.onnx", net, zeros=zeros, trace=trace)
+        assert out.is_file()
+    traced = seen["model"]
+    assert isinstance(traced, _CudaNet)
+    assert traced.device.type == "cpu"
+    args = seen["args"]
+    assert isinstance(args, tuple) and len(args) == 5
+    assert all(tensor.device.type == "cpu" for tensor in args)
+
+
 def check_trainer_is_offline() -> None:
     files = (
         ROOT / "python" / "train" / "train_scene.py",
@@ -698,6 +766,7 @@ def main() -> None:
     check_sectors_and_ego_edge()
     check_rate_helpers_and_precision()
     check_assignment_and_planner()
+    check_nan_cost_and_cpu_export()
     check_fit_and_window()
     check_trainer_is_offline()
     check_net_cpu()

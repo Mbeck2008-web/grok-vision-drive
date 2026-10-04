@@ -417,6 +417,6 @@ PYTHONPATH=. python -m python.train.train_e2e --smoke
 
 Modular veto thresholds: `config/control.yaml`. E2E input 320×180: `config/perception.yaml` / `control.yaml`. Weights stay out of git.
 
-### 1.7.4 wheel rotation
+## 1.7.4 wheel rotation
 
 - Disengage uses wheel rotation against the commanded steer. Force-feedback torque is not a signal. An echo of a command already ahead of the wheel is residual 0, a later smaller command keeps that catch-up inside the span, and a held rotation of 0.25 drops Engage.

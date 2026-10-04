@@ -58,7 +58,7 @@ The settled game view. Soft Esc parked.
 
 ![rear](docs/cams/rear.jpg)
 
-## Recent changes (alpha 1.7.8)
+## Recent changes (alpha 1.7.9)
 
 Catch-up from **1.0.1**. Each feature merge since that pin is one main step. The throttle fix is the point in between. Live Alt+G, Tech 8-cam, FFB, and QSV stay **UNPROVEN**.
 
@@ -146,11 +146,15 @@ The tone sample is the road under the sky and above the hood. Sky (190, 200, 210
 
 Fender repeaters move closer to the body, lower, and slightly back. repeatL is X -0.81, Y 1.25, Z 0.67, yaw -150. repeatR is X 0.81, Y 1.25, Z 0.67, yaw 150. The aim is 10 degrees farther out from the car than 160, still more rear than side. They still ignore only the ego car. Pillar and rear cameras stay put. Narrow and main stay put. The wide camera keeps its aim. Its picture widens from 4:3 to 16:9.
 
-## Alpha 1.7.8
+## 1.7.9 around the car
+
+One supervisor tick reads all eight cameras, then builds the stitch. A camera from an older tick is not reused. Pillar, repeater, and rear lane pixels use that camera's pose, so a side pixel lands beside the car and a rear pixel lands behind it. The steer tick can use those points. Drawn lane lines follow the real points past the blue path and stop where the lane cannot be seen or predicted.
+
+## Alpha 1.7.9
 
 This is **alpha** — may break / not work; improves with fixes.
 
-Canonical pin **1.7.8** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Untagged retail zips use `1.7.8-alpha-<sha>`.
+Canonical pin **1.7.9** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Untagged retail zips use `1.7.9-alpha-<sha>`.
 
 **Versioning** (this line stays **alpha** until a later non-alpha release):
 
@@ -163,17 +167,17 @@ Canonical pin **1.7.8** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Un
 
 The rig is laid left to right as repeatL, pillarL, wide, main, narrow, pillarR, repeatR, rear. Seams are empty gaps. There is no overlap calibration and no pose warp. A missing camera stays an empty sector and is not filled from another camera. The inboard edge of repeatL is the image left, and the inboard edge of repeatR is the image right. Those columns are the ego body. They are cleared, and they are not another vehicle.
 
-The model reads that strip as one picture. Both image slots carry the same strip. The lane fit reads the windshield band, wide then main then narrow, when that band has pixels. An empty band is fit on the main camera.
+The model reads that strip as one picture. Both image slots carry the same strip. The lane fit reads the windshield band, wide then main then narrow, on the forward ground map when that band has pixels. Pillar, repeater, and rear sectors on the same strip become lane points through each camera's pose. An empty windshield band is fit on the main camera.
 
 Pillar cameras aim 78 degrees off the lane. Repeater yaw is ±150, mounted at Y 1.25, back along the next lane. The three windshield cameras aim straight ahead. The rear camera aims straight back.
 
 ### Lane lines
 
-With a blue path in the frame, a drawn lane follows its own points, then continues on its last heading until it passes that path. The extra point is the same piece. It stops 2 m past the far point of the path, not out at the cabin span. A line that already passes the path is not lengthened. With no blue path, nothing is added past the last sample. A curve stays a curve.
+With a blue path in the frame, a drawn lane follows its own points past that path, including points beside and behind the car. A line that still ends short of the path continues on its last heading until it passes the path. That extra point is the same piece. It stops where the lane cannot be seen or predicted, not out at the cabin span. A line that already passes the path is not lengthened. With no blue path, nothing is added past the last sample. A curve stays a curve.
 
 ### Companion cameras and colour
 
-Each grab reads main from shared memory, and at most one companion on the hitch. A skipped camera keeps its last real frame. A zero buffer is not stored.
+Each grab reads all eight cameras from shared memory on that tick. A camera that was not read this tick is missing. An older frame is not reused. A zero buffer is not stored.
 
 Companion cameras are not requested with an ad-hoc render. That render steps the game view's exposure for one frame, and the shadows go bright blue. Companions update offscreen. The grab reads their shared memory.
 

@@ -50,7 +50,7 @@ from python.viz.debug_draw import cabin_drive_word
 from python.viz.review_log import ReviewCapture
 from python.viz.nerd import image_point_from_window_mouse
 from python.viz.stage import drawn_lane_records
-from python.sensors.cameras import CAM_IDS, CamHealth
+from python.sensors.cameras import CAM_IDS, CamHealth, bundle_tick_frames
 from python.runtime.debug_opts import apply_to_command, apply_to_perception
 from python.runtime.hw_probe import ema_hz, gpu_vram_used_gb, probe, refuse_live_start, unique_frame_hz_inst
 from python.runtime.models import ModelRuntime
@@ -582,8 +582,8 @@ def main() -> None:
                 print(f"[GVD] {note}", flush=True)
 
             # Loaded detector / lanes / planner / E2E shadow run every tick, engaged or not.
-            # The lane fit reads the 360 strip when that frame has pixels.
-            rig_view = stitch_frames(getattr(bundle, "frames", None))
+            # The stitch is this grab only: eight cameras, one timestamp.
+            rig_view = stitch_frames(bundle_tick_frames(bundle))
             pout = perc.tick(
                 main,
                 stitch_bgr=rig_view.bgr,

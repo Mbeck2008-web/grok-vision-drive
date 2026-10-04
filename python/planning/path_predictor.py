@@ -242,8 +242,6 @@ def _is_forward_lane(polys: list[list[tuple[float, float]]]) -> bool:
 def _smooth_forward(poly: list[tuple[float, float]]) -> bool:
     if len(poly) < 2:
         return False
-    if min(p[1] for p in poly) < -0.25:
-        return False
     ordered = sorted(poly, key=lambda p: (p[1], p[0]))
     if ordered[-1][1] - ordered[0][1] < 1.5:
         return False
@@ -548,7 +546,8 @@ def _lane_route(
     if paired is None:
         return None
     left, right, width = paired
-    y0 = max(left[0][1], right[0][1], 0.0)
+    # Overlap may start beside or behind the car. Do not clamp it to the bumper.
+    y0 = max(left[0][1], right[0][1])
     y1 = min(left[-1][1], right[-1][1])
     if y1 - y0 < 0.5:
         y0 = min(left[0][1], right[0][1])

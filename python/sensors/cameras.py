@@ -36,19 +36,15 @@ COMPANION_OFFSCREEN_UPDATE_S = 1.0
 SIDE_UPDATE_S = ON_DEMAND_UPDATE_S
 REAR_UPDATE_S = ON_DEMAND_UPDATE_S
 MAIN_GRAB_DIV = 1
-# Rank 2: one stream_raw per tick (main). Companion colour is ÷16.
-# Phases stay: wide 0 (even), narrow 1 (odd), pillarL 2, pillarR 3,
-# repeatL 5, rear 6, repeatR 7. Ticks 4 and 8–15 are main only.
-# Soft Esc (engaged=false) uses this same hitch. It does not burst all seven
-# companions and it does not freeze the first buffer. A zero colour buffer is
-# unrendered, not a picture: the slot stays missing until a real frame arrives,
-# then CAMS keeps that last frame on the ticks that do not poll the cam.
-# Main is stream_raw every tick. A live companion is stream_raw on its hitch slot.
-# Yaml -1 is the hitch, not a viewport render. The sensor is attached at
-# COMPANION_OFFSCREEN_UPDATE_S and read with stream_raw. SendAdHocRequestCamera
-# is not used: that render steps the game view's exposure for one frame.
-# A read that exceeds CAM_READ_BUDGET_S does not stall the grab; the last
-# real frame stays painted.
+# One supervisor tick reads all eight cameras before the stitch is built.
+# A camera that was not read on this tick is missing. An older buffer is not
+# painted into the bundle. Soft Esc and Engage use that same grab. A zero
+# colour buffer is unrendered, not a picture, and it does not keep a previous
+# frame. Yaml -1 is still the offscreen attach period, not a viewport render.
+# The sensor is attached at COMPANION_OFFSCREEN_UPDATE_S and read with
+# stream_raw. SendAdHocRequestCamera is not used: that render steps the game
+# view's exposure for one frame. A read that exceeds CAM_READ_BUDGET_S does
+# not stall the rest of the grab and does not fill the slot from an older tick.
 CAM_READ_BUDGET_S = 0.05
 _OWED_CAP = 7  # one slot per companion; the owed queue cannot grow past the rig
 WIDE_GRAB_DIV = 16
@@ -144,6 +140,10 @@ class CameraFrameBundle:
     # or the previous read was still running, so this tick did not wait on it.
     grab_read_blocked: bool = False
 
+    def tick_frames(self) -> dict[str, np.ndarray]:
+        """Pictures whose timestamps are this grab. An older stamp is left out."""
+        return bundle_tick_frames(self)
+
     def health_str(self) -> dict[str, str]:
         out = {cid: CamHealth.MISSING.value for cid in CAM_IDS}
         for k, v in self.health.items():
@@ -156,6 +156,31 @@ class CameraFrameBundle:
             if k in self.frames:
                 return self.frames[k]
         return None
+
+
+def bundle_tick_frames(bundle: CameraFrameBundle | None) -> dict[str, np.ndarray]:
+    """Frames from one grab. A camera stamped on another tick is left out.
+
+    ``cam_main`` is the main alias when main is on this tick. It is not a
+    ninth camera. A bundle with no timestamps contributes nothing, so a
+    cached picture cannot sneak into the stitch.
+    """
+    if bundle is None:
+        return {}
+    frames = getattr(bundle, "frames", None) or {}
+    stamps = getattr(bundle, "timestamps", None) or {}
+    present = [cid for cid in CAM_IDS if cid in frames and cid in stamps]
+    if not present:
+        return {}
+    tick = float(stamps[present[0]])
+    out: dict[str, np.ndarray] = {}
+    for cid in present:
+        if abs(float(stamps[cid]) - tick) > 1e-4:
+            continue
+        out[cid] = frames[cid]
+    if "main" in out:
+        out["cam_main"] = out["main"]
+    return out
 
 
 def resize_long_side(img: np.ndarray, long_side: int) -> np.ndarray:
@@ -350,9 +375,10 @@ def _nonneg_int(v: Any, default: int) -> int:
 
 
 def camera_grab_div(cid: str, hitch: dict[str, Any] | None = None) -> int:
-    """Python grab divisor. main÷1 stream_raw; companion polls ÷16.
+    """Configured divisor. The live grab does not skip on it.
 
-    wide÷16 (even), narrow÷16 (odd), pillars÷16, repeats÷16, rear÷16.
+    ``camera_grab_due`` reads every rig camera every tick. These numbers stay
+    so a hitch file can still name the old slots. They do not drop a camera.
     """
     hitch = hitch if isinstance(hitch, dict) else {}
     if cid == "main":
@@ -414,19 +440,14 @@ def grab_due(grab_i: int, div: int, phase: int = 0) -> bool:
 
 
 def camera_grab_due(cid: str, grab_i: int, hitch: dict[str, Any] | None = None) -> bool:
-    """Whether this cam should GPU-read on grab_i. Narrow never shares a tick with wide."""
-    hitch = hitch if isinstance(hitch, dict) else {}
-    div = camera_grab_div(cid, hitch)
-    phase = camera_grab_phase(cid, hitch)
-    gi = int(grab_i)
-    if not grab_due(gi, div, phase):
-        return False
-    if cid == "narrow":
-        wdiv = camera_grab_div("wide", hitch)
-        wph = camera_grab_phase("wide", hitch)
-        if grab_due(gi, wdiv, wph):
-            return False
-    return True
+    """True for every rig camera on this supervisor tick.
+
+    Companions are not updated one per tick. Wide and narrow share the tick.
+    ``grab_i`` and the hitch divisors do not skip a camera. A stitch built
+    from the bundle is this tick only.
+    """
+    del grab_i, hitch
+    return cid in CAM_IDS
 
 
 def grab_wheel(hitch: dict[str, Any] | None = None) -> int:
@@ -435,16 +456,15 @@ def grab_wheel(hitch: dict[str, Any] | None = None) -> int:
 
 
 def grab_phase_of(grab_i: int, hitch: dict[str, Any] | None = None) -> int:
-    """Wheel slot for this grab index.
-
-    Locked slots 0, 1, 2, 3, 5, 6, 7 each add one companion PollCamera.
-    Slots 4 and 8–15 are main stream_raw only.
-    """
+    """Wheel slot for this grab index. Every slot reads the whole rig."""
     return int(grab_i) % grab_wheel(hitch)
 
 
 def grab_is_poll_free(grab_i: int, hitch: dict[str, Any] | None = None) -> bool:
-    """True when the schedule reads main only (no companion PollCamera)."""
+    """True when this tick reads main only.
+
+    The live schedule reads every camera, so a rig tick is not poll-free.
+    """
     for cid in CAM_IDS:
         if cid == "main":
             continue
@@ -496,10 +516,9 @@ def soft_esc_colour_main_only() -> bool:
     force-engage off. Grab runs before ``note_engaged``. A live engage file
     or debug force-engage is the rising edge, same as ``sensors.poll``.
 
-    The name is historical. Soft Esc no longer skips companion colour. Both
-    Soft Esc and Engage poll at most one companion on the ÷16 hitch and keep
-    the last non-blank frame for CAMS. Vision still prioritises main
-    (``stream_raw`` every tick). This is not a full-rate 8-cam colour grab.
+    The name is historical. Soft Esc and Engage both read all eight cameras
+    on the tick. The flag only chooses the grab note. It does not skip a
+    camera and it does not keep an older frame.
     """
     from python.control.actuate import read_engage_flag, soft_esc_sensors_every_tick
 
@@ -1941,6 +1960,14 @@ class BeamNGPyBackend:
             return None
         return finished[2]
 
+    def _omit_unread(self, cid: str, frames: dict, timestamps: dict, health: dict) -> None:
+        """This tick has no picture for ``cid``. Do not copy an older one."""
+        frames.pop(cid, None)
+        timestamps.pop(cid, None)
+        if cid == "main":
+            frames.pop("cam_main", None)
+        health[cid] = CamHealth.MISSING
+
     def _publish_read(
         self,
         cid: str,
@@ -1951,22 +1978,14 @@ class BeamNGPyBackend:
         health: dict,
         unique_ids: list[str],
     ) -> None:
-        if bgr is None:
-            self._reuse_cached(cid, frames, timestamps, health, failed=True)
-            return
-        if frame_is_unrendered(bgr):
-            cached = self._cache_frames.get(cid)
-            if cached is not None and not frame_is_unrendered(cached):
-                self._reuse_cached(cid, frames, timestamps, health, failed=False)
-            else:
-                self._cache_frames.pop(cid, None)
-                self._cache_ts.pop(cid, None)
+        if bgr is None or frame_is_unrendered(bgr):
+            self._omit_unread(cid, frames, timestamps, health)
             return
         bgr = resize_long_side(bgr, self.long_side)
         if cid != "main" and companion_frame_is_flash(bgr, self._cache_frames.get(cid)):
-            # Same bad frame: brighter and blue in the shadows. Keep the settled road.
-            # Judged before the tone curve. The curve itself can raise blue excess.
-            self._reuse_cached(cid, frames, timestamps, health, failed=False)
+            # Brighter and blue in the shadows. Not stored, and not replaced
+            # by the previous tick. Judged before the tone curve.
+            self._omit_unread(cid, frames, timestamps, health)
             return
         bgr = recover_viewport_tone(bgr)
         sig = frame_signature(bgr)
@@ -2091,35 +2110,31 @@ class BeamNGPyBackend:
         companion_polled = False
         unique_ids: list[str] = []
         self._read_blocked = False
-        # Soft Esc and Engage share the hitch: main stream_raw every tick, at
-        # most one companion read. Ticks that skip a cam keep its last real
-        # frame for CAMS. A zero buffer is not stored and does not count as OK.
-        # Companions are not SendAdHocRequestCamera. That render steps the game
-        # view's exposure for one frame (bright blue shadows). They update
-        # offscreen; this grab only reads shared memory on the hitch.
+        # Soft Esc and Engage both read all eight cameras on this tick.
+        # A skipped, timed-out, or empty read stays missing. The previous
+        # picture is not the stitch. Companions are not SendAdHocRequestCamera.
+        # That render steps the game view's exposure for one frame. They
+        # update offscreen; this grab reads shared memory.
         soft_esc_main = soft_esc_colour_main_only()
         self._reap_if_done()
         for cid, cam in self._sensors.items():
             if not self._grab_this_tick(cid, grab_i):
-                self._reuse_cached(cid, frames, timestamps, health, failed=False)
+                self._omit_unread(cid, frames, timestamps, health)
                 continue
             if cid != "main":
                 companion_polled = True
             try:
                 bgr = self._bounded_sensor_colour(cid, cam)
                 if bgr is _IO_BUSY or bgr is _IO_TIMEOUT:
-                    # Budget miss, not a failed picture. Last frame stays ok.
-                    self._reuse_cached(cid, frames, timestamps, health, failed=False)
+                    self._omit_unread(cid, frames, timestamps, health)
                 else:
                     self._publish_read(cid, bgr, ts, frames, timestamps, health, unique_ids)
             except Exception:
                 health[cid] = CamHealth.ERROR
-                cached = self._cache_frames.get(cid)
-                if cached is not None and not frame_is_unrendered(cached):
-                    frames[cid] = cached
-                    timestamps[cid] = self._cache_ts.get(cid, time.time())
-                    if cid == "main":
-                        frames["cam_main"] = cached
+                frames.pop(cid, None)
+                timestamps.pop(cid, None)
+                if cid == "main":
+                    frames.pop("cam_main", None)
         self._maybe_live_narrow_hitch()
         self._take_late_unique(unique_ids)
         unique_n = len(unique_ids)
@@ -2141,7 +2156,8 @@ class BeamNGPyBackend:
             f"repeat_div={self._grab_div.get('repeatL', REPEAT_GRAB_DIV)} "
             f"rear_div={self._rear_grab_div}"
         )
-        # hitch = ÷16 companion colour + last-frame paint. Not main-only, not 8 full-rate.
+        # All eight cameras, this tick. Not one companion and not a cached frame.
+        note += " same_tick=8"
         if soft_esc_main:
             note += " soft_esc_colour=hitch"
         return CameraFrameBundle(

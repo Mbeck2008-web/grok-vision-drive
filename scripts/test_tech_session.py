@@ -488,82 +488,23 @@ def check_camera_clip_planes() -> None:
     assert grab_due(0, 2, 0) and not grab_due(1, 2, 0)
     assert grab_due(1, 2, 1) and not grab_due(0, 2, 1)
     hitch = load_camera_config().get("hitch") or {}
-    wheel = {
-        0: {"main", "wide"},
-        1: {"main", "narrow"},
-        2: {"main", "pillarL"},
-        3: {"main", "pillarR"},
-        4: {"main"},
-        5: {"main", "repeatL"},
-        6: {"main", "rear"},
-        7: {"main", "repeatR"},
-    }
-    for slot in range(8, 16):
-        wheel[slot] = {"main"}
-    forbidden = {"narrow", "main", "pillarL", "pillarR"}
     for i in range(32):
-        assert not (
-            camera_grab_due("wide", i, hitch) and camera_grab_due("narrow", i, hitch)
-        ), i
-        assert camera_grab_due("main", i, hitch)
-        wide_due = camera_grab_due("wide", i, hitch)
-        narrow_due = camera_grab_due("narrow", i, hitch)
-        if wide_due:
-            assert i % 2 == 0, i
-        if narrow_due:
-            assert i % 2 == 1, i
-        side_rear = [
-            cid
-            for cid in (*SIDE_CAM_IDS, *REAR_CAM_IDS)
-            if camera_grab_due(cid, i, hitch)
-        ]
         reads = [cid for cid in CAM_IDS if camera_grab_due(cid, i, hitch)]
-        forwards = [cid for cid in ("main", "wide", "narrow") if cid in reads]
-        # main is the only stream_raw; wide/narrow are polls and never both due.
-        assert forwards == ["main"] or set(forwards) <= {"main", "wide", "narrow"}
-        assert "main" in forwards
-        assert not ("wide" in forwards and "narrow" in forwards)
-        assert len([cid for cid in forwards if cid != "main"]) <= 1
-        assert len(side_rear) <= 1, (i, side_rear)
-        assert len(reads) <= 2, (i, reads)
-        assert not forbidden.issubset(set(reads)), (i, reads)
-        assert set(reads) == wheel[i % 16], (i, reads)
-        if camera_grab_due("rear", i, hitch):
-            sides_on_rear = [cid for cid in side_rear if cid in SIDE_CAM_IDS]
-            assert sides_on_rear == [], (i, sides_on_rear)
-        if camera_grab_due("narrow", i, hitch):
-            assert side_rear == []
-            assert "rear" not in side_rear
-            assert not camera_grab_due("wide", i, hitch)
-    assert [i for i in range(16) if camera_grab_due("wide", i, hitch)] == [0]
-    assert [i for i in range(16) if camera_grab_due("narrow", i, hitch)] == [1]
-    assert [i for i in range(16) if camera_grab_due("pillarL", i, hitch)] == [2]
-    assert [i for i in range(16) if camera_grab_due("pillarR", i, hitch)] == [3]
-    assert [i for i in range(16) if camera_grab_due("repeatL", i, hitch)] == [5]
-    assert [i for i in range(16) if camera_grab_due("repeatR", i, hitch)] == [7]
-    rear_hits = [i for i in range(16) if camera_grab_due("rear", i, hitch)]
-    assert rear_hits == [6], rear_hits
-    for i in rear_hits:
-        sides = [cid for cid in SIDE_CAM_IDS if camera_grab_due(cid, i, hitch)]
-        assert sides == [], (i, sides)
+        assert set(reads) == set(CAM_IDS), (i, reads)
+        assert camera_grab_due("wide", i, hitch) and camera_grab_due("narrow", i, hitch)
+        assert camera_grab_due("main", i, hitch)
+        assert camera_grab_due("rear", i, hitch)
+        assert camera_grab_due("pillarL", i, hitch) and camera_grab_due("repeatR", i, hitch)
     assert camera_grab_phase("pillarL", hitch) == SIDE_GRAB_PHASE
     assert camera_grab_phase("pillarR", hitch) == 3
     assert camera_grab_phase("repeatL", hitch) == REPEAT_GRAB_PHASE
     assert camera_grab_phase("repeatR", hitch) == (REPEAT_GRAB_PHASE + 2) % REPEAT_GRAB_DIV
     assert camera_grab_due("main", 0, hitch) and camera_grab_due("wide", 0, hitch)
-    assert not camera_grab_due("narrow", 0, hitch)
+    assert camera_grab_due("narrow", 0, hitch)
     hitch3 = dict(hitch)
     hitch3["narrow_grab_div"] = 3
-    n3 = 0
     for i in range(24):
-        w = camera_grab_due("wide", i, hitch3)
-        n = camera_grab_due("narrow", i, hitch3)
-        assert not (w and n), i
-        if n:
-            n3 += 1
-            assert not w
-    # phase 1 ÷3 collides with wide ÷16 on tick 16; the wide guard drops that one.
-    assert n3 == 7
+        assert camera_grab_due("wide", i, hitch3) and camera_grab_due("narrow", i, hitch3)
     assert CAMERA_HZ_TARGET == 10.0
     assert invert_update_priority(0.0) == 1.0
     assert live_narrow_far_m(4.0, 800.0, elapsed_s=0.0, unique_n=10) == 800.0  # warmup
@@ -803,14 +744,13 @@ def check_beamngpy_open_passes_near_far() -> None:
 
 
 def check_beamngpy_side_grab_half_rate() -> None:
-    """Engage and Soft Esc: main stream_raw every tick. Companions poll on the hitch.
+    """Engage and Soft Esc: one tick reads all eight cameras.
 
-    Soft Esc does not burst all seven and does not skip the wheel. At most one
-    companion is polled per tick (÷16). A tick that skips a cam keeps the last
-    non-blank frame and health OK. An all-zero buffer is not a picture: the
-    slot stays missing until a real frame arrives. capture_note says
-    soft_esc_colour=hitch, not main-only. A live engage file or debug
-    force-engage is the same hitch (the note omits the soft-esc tag).
+    Main uses stream_raw. Legacy companions poll. Wide and narrow share the
+    tick. A missed, zero, or timed-out read stays missing. The previous
+    picture is not copied in. capture_note says soft_esc_colour=hitch when
+    Soft Esc is the note, not main-only. A live engage file or debug
+    force-engage omits that tag and still reads all eight.
     """
     import sys
     import types
@@ -905,82 +845,44 @@ def check_beamngpy_side_grab_half_rate() -> None:
         assert soft_esc_colour_main_only() is False
         n = 16
         last = None
-        wheel = {
-            0: {"main", "wide"},
-            1: {"main", "narrow"},
-            2: {"main", "pillarL"},
-            3: {"main", "pillarR"},
-            4: {"main"},
-            5: {"main", "repeatL"},
-            6: {"main", "rear"},
-            7: {"main", "repeatR"},
-        }
-        for slot in range(8, 16):
-            wheel[slot] = {"main"}
         poll_ids = SIDE_CAM_IDS | REAR_CAM_IDS | {"wide", "narrow"}
+        companions = {cid for cid in CAM_IDS if cid != "main"}
         for i in range(n):
             s0 = dict(streams)
             p0 = dict(polls)
             bundle = be.grab()
             last = bundle
             assert bundle.grab_phase == i
+            assert bundle.grab_poll_free is False
             assert bundle.grab_poll_free is grab_is_poll_free(i, be._hitch)
             assert bundle.grab_ms >= 0.0
+            assert "same_tick=8" in bundle.note
+            assert "soft_esc_colour=hitch" not in bundle.note
             streamed = [cid for cid in ("main", "wide", "narrow") if streams[f"gvd_{cid}"] > s0.get(f"gvd_{cid}", 0)]
             assert streamed == ["main"], (i, streamed)
-            assert "wide" not in streamed and "narrow" not in streamed
-            if i == 0:
-                for cid in poll_ids:
-                    due = camera_grab_due(cid, 0, be._hitch)
-                    assert (polls[f"gvd_{cid}"] == 1) == due, (cid, due, polls[f"gvd_{cid}"])
-                assert bundle.health["narrow"] == CamHealth.MISSING  # not read yet
-                assert bundle.health["narrow"] != CamHealth.STALE
             polled = [
                 cid
                 for cid in poll_ids
                 if polls[f"gvd_{cid}"] > p0.get(f"gvd_{cid}", 0)
             ]
-            colour = set(streamed) | set(polled)
-            assert len(streamed) <= 1
-            assert len(colour) <= 2, (i, colour)
-            assert colour == wheel[i], (i, colour)
-            assert bundle.grab_poll_free is (colour == {"main"}), (i, colour, bundle.grab_poll_free)
-            assert not {"main", "wide"}.issubset(set(streamed))
-            assert not ("wide" in polled and "narrow" in polled)
-            if camera_grab_due("wide", i, be._hitch):
-                assert i % 2 == 0
-            if camera_grab_due("narrow", i, be._hitch):
-                assert i % 2 == 1
-            if camera_grab_due("rear", i, be._hitch):
-                assert [cid for cid in polled if cid in SIDE_CAM_IDS] == [], (i, polled)
+            assert set(polled) == poll_ids, (i, polled)
+            assert "wide" in polled and "narrow" in polled
+            stamps = [float(bundle.timestamps[cid]) for cid in CAM_IDS]
+            assert max(stamps) - min(stamps) < 1e-6, stamps
             for cid in CAM_IDS:
-                assert bundle.health[cid] != CamHealth.STALE, (i, cid, bundle.health[cid])
+                assert bundle.health[cid] == CamHealth.OK, (i, cid, bundle.health[cid])
+                assert cid in bundle.frames
+                assert int(bundle.frames[cid].max()) > 0
+                assert bundle.health[cid] != CamHealth.STALE
         assert last is not None
-        assert last.health["main"] == CamHealth.OK
-        assert last.health["narrow"] == CamHealth.OK
-        assert last.health["wide"] == CamHealth.OK  # grab_i=7 skip keeps the last good frame
         assert last.grab_ms >= 0.0
         assert last.unique_gpu_n >= 1  # incrementing FakeCamera
-        for cid in SIDE_CAM_IDS:
-            assert last.health[cid] == CamHealth.OK, cid
-            assert cid in last.frames
-        for cid in REAR_CAM_IDS:
-            assert last.health[cid] == CamHealth.OK, cid  # skip is not STALE
-            assert cid in last.frames
         assert streams["gvd_main"] == n
         assert polls["gvd_main"] == 0
         assert streams["gvd_wide"] == 0
         assert streams["gvd_narrow"] == 0
-        assert polls["gvd_wide"] == n // WIDE_GRAB_DIV
-        assert polls["gvd_narrow"] == n // NARROW_GRAB_DIV
-        for cid in ("pillarL", "pillarR"):
-            assert polls[f"gvd_{cid}"] == n // SIDE_GRAB_DIV, (cid, polls[f"gvd_{cid}"])
-            assert streams[f"gvd_{cid}"] == 0, cid
-        for cid in ("repeatL", "repeatR"):
-            assert polls[f"gvd_{cid}"] == n // REPEAT_GRAB_DIV, (cid, polls[f"gvd_{cid}"])
-            assert streams[f"gvd_{cid}"] == 0, cid
-        for cid in REAR_CAM_IDS:
-            assert polls[f"gvd_{cid}"] == n // REAR_GRAB_DIV, (cid, polls[f"gvd_{cid}"])
+        for cid in companions:
+            assert polls[f"gvd_{cid}"] == n, (cid, polls[f"gvd_{cid}"])
             assert streams[f"gvd_{cid}"] == 0, cid
         assert be._clip_planes["narrow"][1] > be._clip_planes["main"][1]
         assert "rear_div=16" in last.note
@@ -988,9 +890,10 @@ def check_beamngpy_side_grab_half_rate() -> None:
         assert "wide_div=16" in last.note
         assert "narrow_div=16" in last.note
         assert "main_div=1" in last.note
+        assert "same_tick=8" in last.note
         assert "soft_esc_colour=main" not in last.note
 
-        # Soft Esc: same ÷16 hitch. Last non-blank frame stays on a skip tick.
+        # Soft Esc still reads all eight. The note is hitch, not main-only.
         act.note_soft_esc_engaged(False)
         act.write_engage_flag(False)
         assert act.soft_esc_sensors_every_tick() is False
@@ -1002,9 +905,10 @@ def check_beamngpy_side_grab_half_rate() -> None:
             before_p = {cid: polls[f"gvd_{cid}"] for cid in CAM_IDS}
             bundle = be.grab()
             assert bundle.grab_phase == gi % 16
-            assert len(due) <= 1, (gi, due)
-            assert bundle.grab_poll_free is (len(due) == 0)
+            assert set(due) == poll_ids, (gi, due)
+            assert bundle.grab_poll_free is False
             assert "soft_esc_colour=hitch" in bundle.note
+            assert "same_tick=8" in bundle.note
             assert "soft_esc_colour=main" not in bundle.note
             assert "soft_esc_warm" not in bundle.note
             assert bundle.health["main"] == CamHealth.OK
@@ -1013,7 +917,7 @@ def check_beamngpy_side_grab_half_rate() -> None:
             for cid in CAM_IDS:
                 if cid == "main":
                     continue
-                assert polls[f"gvd_{cid}"] == before_p[cid] + (1 if cid in due else 0), cid
+                assert polls[f"gvd_{cid}"] == before_p[cid] + 1, cid
                 assert streams[f"gvd_{cid}"] == s_soft[f"gvd_{cid}"], cid
                 assert bundle.health[cid] == CamHealth.OK, cid
                 assert cid in bundle.frames
@@ -1021,75 +925,47 @@ def check_beamngpy_side_grab_half_rate() -> None:
         assert len(be._sensors) == 8
         assert set(be._sensors) == set(CAM_IDS)
         assert camera_grab_due("wide", n, be._hitch)
-        assert not camera_grab_due("narrow", n, be._hitch)
+        assert camera_grab_due("narrow", n, be._hitch)
 
-        # Dropping wide does not colour it until its hitch slot, and does not
-        # poll the other six on that same tick. Until then the slot is missing,
-        # not a black OK. After the slot, later ticks keep the last frame.
+        # Dropping the wide cache does not skip the read. This tick polls it.
         be._cache_frames.pop("wide", None)
         be._cache_ts.pop("wide", None)
         be._frame_sig.pop("wide", None)
-        seen_wide = False
-        for _step in range(16):
-            gi = be._grab_i
-            due = [cid for cid in poll_ids if camera_grab_due(cid, gi, be._hitch)]
-            before_p = {cid: polls[f"gvd_{cid}"] for cid in CAM_IDS}
-            cold = be.grab()
-            assert "soft_esc_colour=hitch" in cold.note
-            assert "soft_esc_warm" not in cold.note
-            assert len(due) <= 1
-            for cid in poll_ids:
-                assert polls[f"gvd_{cid}"] == before_p[cid] + (1 if cid in due else 0), cid
-            assert cold.health["main"] == CamHealth.OK
-            if "wide" in due:
-                assert cold.health["wide"] == CamHealth.OK
-                assert int(cold.frames["wide"].max()) > 0
-                assert cold.grab_poll_free is False
-                seen_wide = True
-            elif not seen_wide:
-                assert cold.health["wide"] == CamHealth.MISSING
-                assert "wide" not in cold.frames
-            else:
-                assert cold.health["wide"] == CamHealth.OK
-                assert "wide" in cold.frames
-                assert int(cold.frames["wide"].max()) > 0
-            for cid in poll_ids:
-                if cid == "wide":
-                    continue
-                assert cold.health[cid] == CamHealth.OK, cid
-                assert cid in cold.frames
-        assert seen_wide
+        before_wide = polls["gvd_wide"]
+        cold = be.grab()
+        assert "soft_esc_colour=hitch" in cold.note
+        assert "soft_esc_warm" not in cold.note
+        assert cold.grab_poll_free is False
+        assert polls["gvd_wide"] == before_wide + 1
+        assert cold.health["wide"] == CamHealth.OK
+        assert int(cold.frames["wide"].max()) > 0
+        for cid in CAM_IDS:
+            assert cold.health[cid] == CamHealth.OK, cid
+            assert cid in cold.frames
         assert streams["gvd_wide"] == 0
         assert len(be._sensors) == 8
 
-        # Rising edge: latch still false. A live engage file colours the due companion.
-        guard = 0
-        while [
-            cid for cid in CAM_IDS if cid != "main" and camera_grab_due(cid, be._grab_i, be._hitch)
-        ] != ["narrow"]:
-            guard += 1
-            assert guard <= 16
-            be.grab()
+        # Rising edge: latch still false. A live engage file reads all eight
+        # and omits the Soft Esc note.
         act.write_engage_flag(True)
         assert act.soft_esc_sensors_every_tick() is False
         assert soft_esc_colour_main_only() is False
         gi = be._grab_i
         due = [cid for cid in CAM_IDS if cid != "main" and camera_grab_due(cid, gi, be._hitch)]
-        assert due == ["narrow"], (gi, due)
-        narrow_polls = polls["gvd_narrow"]
-        wide_polls = polls["gvd_wide"]
+        assert set(due) == companions, (gi, due)
+        before_p = {cid: polls[f"gvd_{cid}"] for cid in CAM_IDS}
         main_streams = streams["gvd_main"]
         edge = be.grab()
-        assert polls["gvd_narrow"] == narrow_polls + 1
-        assert streams["gvd_narrow"] == 0
         assert streams["gvd_main"] == main_streams + 1
-        assert edge.health["narrow"] == CamHealth.OK
         assert edge.grab_poll_free is False
         assert "soft_esc_colour=hitch" not in edge.note
         assert "soft_esc_colour=main" not in edge.note
         assert "soft_esc_warm" not in edge.note
-        assert polls["gvd_wide"] == wide_polls  # this slot is narrow, not wide
-        assert edge.health["wide"] == CamHealth.OK
+        assert "same_tick=8" in edge.note
+        for cid in companions:
+            assert polls[f"gvd_{cid}"] == before_p[cid] + 1, cid
+            assert streams[f"gvd_{cid}"] == 0
+            assert edge.health[cid] == CamHealth.OK
         assert len(be._sensors) == 8
 
         act.write_engage_flag(False)
@@ -1108,81 +984,39 @@ def check_beamngpy_side_grab_half_rate() -> None:
                 be._cache_ts.pop(cid, None)
                 be._frame_sig.pop(cid, None)
 
-        # Cold Soft Esc: one companion per hitch slot, then last-frame 8/8.
-        # Not a single-tick warm of all seven.
+        # Cold Soft Esc fills every camera on the first tick. The next tick
+        # reads them again. It does not republish the cache.
         _drop_companion_caches()
         cold_before = {cid: polls[f"gvd_{cid}"] for cid in CAM_IDS}
         cold_streams = {cid: streams[f"gvd_{cid}"] for cid in CAM_IDS}
-        got: set[str] = set()
-        for step in range(16):
-            gi = be._grab_i
-            due = [cid for cid in CAM_IDS if cid != "main" and camera_grab_due(cid, gi, be._hitch)]
-            warmed = be.grab()
-            assert len(due) <= 1, (gi, due)
-            assert "soft_esc_colour=hitch" in warmed.note
-            assert "soft_esc_warm" not in warmed.note
-            assert streams["gvd_main"] == cold_streams["main"] + step + 1
-            got.update(due)
-            for cid in CAM_IDS:
-                if cid == "main":
-                    assert warmed.health[cid] == CamHealth.OK
-                    continue
-                assert streams[f"gvd_{cid}"] == cold_streams[cid], cid
-                if cid in got:
-                    assert warmed.health[cid] == CamHealth.OK, cid
-                    assert cid in warmed.frames
-                    assert int(warmed.frames[cid].max()) > 0
-                else:
-                    assert warmed.health[cid] == CamHealth.MISSING, cid
-                    assert cid not in warmed.frames
-        for cid in CAM_IDS:
-            if cid == "main":
-                continue
-            assert polls[f"gvd_{cid}"] == cold_before[cid] + 1, cid
+        warmed = be.grab()
+        assert "soft_esc_colour=hitch" in warmed.note
+        assert "soft_esc_warm" not in warmed.note
+        assert streams["gvd_main"] == cold_streams["main"] + 1
         assert _cam_ok(warmed) == 8
-        # Next tick keeps every last frame. Only the due companion is polled again.
+        for cid in companions:
+            assert streams[f"gvd_{cid}"] == cold_streams[cid], cid
+            assert polls[f"gvd_{cid}"] == cold_before[cid] + 1, cid
+            assert warmed.health[cid] == CamHealth.OK, cid
+            assert cid in warmed.frames
         steady_before = {cid: polls[f"gvd_{cid}"] for cid in CAM_IDS}
-        gi = be._grab_i
-        due = [cid for cid in CAM_IDS if cid != "main" and camera_grab_due(cid, gi, be._hitch)]
         steady = be.grab()
         assert "soft_esc_colour=hitch" in steady.note
         assert "soft_esc_warm" not in steady.note
-        assert steady.grab_poll_free is (len(due) == 0)
+        assert steady.grab_poll_free is False
         assert _cam_ok(steady) == 8
         for cid in CAM_IDS:
             assert cid in steady.frames, cid
             assert int(steady.frames[cid].max()) > 0
-            if cid == "main":
-                continue
-            assert polls[f"gvd_{cid}"] == steady_before[cid] + (1 if cid in due else 0), cid
+        for cid in companions:
+            assert polls[f"gvd_{cid}"] == steady_before[cid] + 1, cid
             assert streams[f"gvd_{cid}"] == cold_streams[cid], cid
-            if cid not in due:
-                assert cid not in steady.unique_gpu_ids
         assert len(be._sensors) == 8
-
-        def _advance_to_companion_slot() -> None:
-            # Soft Esc only. A force-engage frame would hitch-colour these grabs.
-            assert soft_esc_colour_main_only() is True
-            guard = 0
-            while not any(
-                cid != "main" and camera_grab_due(cid, be._grab_i, be._hitch) for cid in CAM_IDS
-            ):
-                guard += 1
-                assert guard <= 16
-                held = {cid: polls[f"gvd_{cid}"] for cid in CAM_IDS}
-                skipped = be.grab()
-                assert skipped.grab_poll_free is True
-                assert "soft_esc_colour=hitch" in skipped.note
-                assert _cam_ok(skipped) == 8
-                for cid in CAM_IDS:
-                    if cid == "main":
-                        continue
-                    assert polls[f"gvd_{cid}"] == held[cid], cid
 
         def _force_edge_grab():
             gi = be._grab_i
             due = [cid for cid in CAM_IDS if cid != "main" and camera_grab_due(cid, gi, be._hitch)]
-            assert len(due) == 1, (gi, due)
+            assert set(due) == companions, (gi, due)
             before_p = {cid: polls[f"gvd_{cid}"] for cid in CAM_IDS}
             before_s = {cid: streams[f"gvd_{cid}"] for cid in CAM_IDS}
             bundle = be.grab()
@@ -1190,50 +1024,25 @@ def check_beamngpy_side_grab_half_rate() -> None:
 
         def _assert_force_edge(due, before_p, before_s, bundle) -> None:
             assert soft_esc_colour_main_only() is True
+            assert "soft_esc_colour=hitch" not in bundle.note
             assert "soft_esc_colour=main" not in bundle.note
             assert "soft_esc_warm=1" not in bundle.note
             assert bundle.grab_poll_free is False
             assert streams["gvd_main"] == before_s["main"] + 1
-            for cid in CAM_IDS:
-                if cid == "main":
-                    continue
+            for cid in companions:
+                assert cid in due
                 assert streams[f"gvd_{cid}"] == before_s[cid], cid
                 assert bundle.health[cid] == CamHealth.OK, cid
-                if cid in due:
-                    assert polls[f"gvd_{cid}"] == before_p[cid] + 1, cid
-                else:
-                    assert polls[f"gvd_{cid}"] == before_p[cid], cid
-            # The slot after a companion is not always poll-free (0 then 1).
-            # Walk to the next main-only tick. Last frames stay painted.
-            guard = 0
-            while not grab_is_poll_free(be._grab_i, be._hitch):
-                guard += 1
-                assert guard <= 16
-                gi = be._grab_i
-                due_now = [cid for cid in CAM_IDS if cid != "main" and camera_grab_due(cid, gi, be._hitch)]
-                mid_p = {cid: polls[f"gvd_{cid}"] for cid in CAM_IDS}
-                mid = be.grab()
-                assert mid.grab_poll_free is False
-                assert "soft_esc_colour=hitch" in mid.note
-                assert _cam_ok(mid) == 8
-                for cid in CAM_IDS:
-                    if cid == "main":
-                        continue
-                    assert polls[f"gvd_{cid}"] == mid_p[cid] + (1 if cid in due_now else 0), cid
-                    assert cid in mid.frames
-            quiet_p = {cid: polls[f"gvd_{cid}"] for cid in CAM_IDS}
-            quiet_main = streams["gvd_main"]
-            quiet = be.grab()
-            assert quiet.grab_poll_free is True
-            assert "soft_esc_colour=hitch" in quiet.note
-            assert _cam_ok(quiet) == 8
-            assert streams["gvd_main"] == quiet_main + 1
-            for cid in CAM_IDS:
-                if cid == "main":
-                    continue
-                assert polls[f"gvd_{cid}"] == quiet_p[cid], cid
-                assert cid in quiet.frames
-                assert int(quiet.frames[cid].max()) > 0
+                assert polls[f"gvd_{cid}"] == before_p[cid] + 1, cid
+                assert cid in bundle.frames
+            nxt_p = {cid: polls[f"gvd_{cid}"] for cid in CAM_IDS}
+            nxt = be.grab()
+            assert nxt.grab_poll_free is False
+            assert "soft_esc_colour=hitch" in nxt.note
+            assert _cam_ok(nxt) == 8
+            for cid in companions:
+                assert polls[f"gvd_{cid}"] == nxt_p[cid] + 1, cid
+                assert cid in nxt.frames
 
         # Debug --force-engage / force_engage: rising edge hitch-colours the due
         # companion while the latch is still false and the engage file is absent.
@@ -1244,7 +1053,6 @@ def check_beamngpy_side_grab_half_rate() -> None:
             assert soft_esc_colour_main_only() is False
             return _force_edge_grab()
 
-        _advance_to_companion_slot()
         _assert_force_edge(*_via_args())
 
         def _via_ui():
@@ -1253,10 +1061,8 @@ def check_beamngpy_side_grab_half_rate() -> None:
             assert soft_esc_colour_main_only() is False
             return _force_edge_grab()
 
-        _advance_to_companion_slot()
         _assert_force_edge(*_via_ui())
 
-        _advance_to_companion_slot()
         saved_argv = list(sys.argv)
         sys.argv = [*saved_argv, "--force-engage"]
         try:
@@ -1266,42 +1072,36 @@ def check_beamngpy_side_grab_half_rate() -> None:
             sys.argv = saved_argv
         _assert_force_edge(*argv_edge)
 
-        # Cold debug engage is hitch colour, not a Soft Esc warm of all seven.
+        # Cold debug engage reads every companion on that tick.
         def _cold_force():
             args = type("A", (), {"force_engage": True})()
             assert soft_esc_colour_main_only() is False
             _drop_companion_caches()
             gi = be._grab_i
             due = [cid for cid in CAM_IDS if cid != "main" and camera_grab_due(cid, gi, be._hitch)]
-            assert len(due) == 1, (gi, due)
+            assert set(due) == companions, (gi, due)
             before_p = {cid: polls[f"gvd_{cid}"] for cid in CAM_IDS}
             bundle = be.grab()
-            return due[0], before_p, bundle
+            return before_p, bundle
 
-        _advance_to_companion_slot()
-
-        due_cid, before_p, forced_cold = _cold_force()
+        before_p, forced_cold = _cold_force()
         assert soft_esc_colour_main_only() is True
-        assert polls[f"gvd_{due_cid}"] == before_p[due_cid] + 1
-        assert forced_cold.health[due_cid] == CamHealth.OK
         assert "soft_esc_warm=1" not in forced_cold.note
         assert "soft_esc_colour=main" not in forced_cold.note
-        for cid in CAM_IDS:
-            if cid in ("main", due_cid):
-                continue
-            assert polls[f"gvd_{cid}"] == before_p[cid], cid
-            assert forced_cold.health[cid] == CamHealth.MISSING, cid
+        assert "soft_esc_colour=hitch" not in forced_cold.note
+        for cid in companions:
+            assert polls[f"gvd_{cid}"] == before_p[cid] + 1, cid
+            assert forced_cold.health[cid] == CamHealth.OK, cid
+            assert cid in forced_cold.frames
 
-        # Cold all-zero stream_raw and poll. Zeros stay missing. After one real
-        # frame, the next zero read keeps that picture and does not go black.
+        # An all-zero buffer is not a picture. The next zero does not keep
+        # the real frame from the tick before it.
         blank_colour.update(f"gvd_{cid}" for cid in CAM_IDS)
         _drop_companion_caches()
         be._cache_frames.pop("main", None)
         be._cache_ts.pop("main", None)
         be._frame_sig.pop("main", None)
-        for _step in range(8):
-            gi = be._grab_i
-            due = [cid for cid in CAM_IDS if cid != "main" and camera_grab_due(cid, gi, be._hitch)]
+        for _step in range(2):
             main_n = streams["gvd_main"]
             before_p = {cid: polls[f"gvd_{cid}"] for cid in CAM_IDS}
             coldz = be.grab()
@@ -1312,47 +1112,26 @@ def check_beamngpy_side_grab_half_rate() -> None:
             for cid in CAM_IDS:
                 assert coldz.health[cid] == CamHealth.MISSING, (cid, coldz.health[cid])
                 assert cid not in coldz.frames
-            if due:
-                assert polls[f"gvd_{due[0]}"] == before_p[due[0]] + 1
+            for cid in companions:
+                assert polls[f"gvd_{cid}"] == before_p[cid] + 1, cid
         blank_colour.clear()
-        gi = be._grab_i
-        due = [cid for cid in CAM_IDS if cid != "main" and camera_grab_due(cid, gi, be._hitch)]
         live = be.grab()
-        assert live.health["main"] == CamHealth.OK
-        assert int(live.frames["main"].max()) > 0
-        kept = {"main"}
-        main_pic = live.frames["main"].copy()
-        kept_pic = {"main": main_pic}
-        if due:
-            assert live.health[due[0]] == CamHealth.OK
-            assert int(live.frames[due[0]].max()) > 0
-            kept.add(due[0])
-            kept_pic[due[0]] = live.frames[due[0]].copy()
         for cid in CAM_IDS:
-            if cid not in kept:
-                assert live.health[cid] == CamHealth.MISSING, cid
-                assert cid not in live.frames
+            assert live.health[cid] == CamHealth.OK, cid
+            assert int(live.frames[cid].max()) > 0
+        kept_pic = {cid: live.frames[cid].copy() for cid in CAM_IDS}
         blank_colour.update(f"gvd_{cid}" for cid in CAM_IDS)
-        gi = be._grab_i
-        due_zero = [cid for cid in CAM_IDS if cid != "main" and camera_grab_due(cid, gi, be._hitch)]
-        main_n = streams["gvd_main"]
         before_p = {cid: polls[f"gvd_{cid}"] for cid in CAM_IDS}
         heldz = be.grab()
-        assert streams["gvd_main"] == main_n + 1
         assert "soft_esc_colour=hitch" in heldz.note
-        for cid, pic in kept_pic.items():
-            assert heldz.health[cid] == CamHealth.OK, cid
-            assert cid in heldz.frames
-            assert np.array_equal(heldz.frames[cid], pic)
         for cid in CAM_IDS:
-            if cid in kept:
-                continue
             assert heldz.health[cid] == CamHealth.MISSING, cid
             assert cid not in heldz.frames
-        if due_zero:
-            assert polls[f"gvd_{due_zero[0]}"] == before_p[due_zero[0]] + 1
+        for cid in companions:
+            assert polls[f"gvd_{cid}"] == before_p[cid] + 1, cid
+        assert kept_pic["main"] is not None
         blank_colour.clear()
-        for _step in range(16):
+        for _step in range(2):
             be.grab()
 
         # A failed read with no picture stays missing and is retried on the next
@@ -1429,7 +1208,7 @@ def check_beamngpy_side_grab_half_rate() -> None:
         assert read_camera_colour(WidePoll(), cid="wide", resolution=(8, 8)) is not None
         assert read_camera_colour(WidePoll(), cid="narrow", resolution=(8, 8)) is not None
 
-        # failed stream_raw → STALE. A scheduled skip above stayed OK.
+        # A failed stream_raw is missing. The last good pixels stay off this tick.
         class FailRaw:
             is_streaming = True
             resolution = (8, 8)
@@ -1442,8 +1221,9 @@ def check_beamngpy_side_grab_half_rate() -> None:
 
         be._sensors["main"] = FailRaw()
         failed = be.grab()
-        assert failed.health["main"] == CamHealth.STALE
-        assert "main" in failed.frames  # last good pixels stay
+        assert failed.health["main"] == CamHealth.MISSING
+        assert "main" not in failed.frames
+        assert "cam_main" not in failed.frames
         assert "main" not in failed.unique_gpu_ids
         be._cache_frames.pop("main", None)
         be._cache_ts.pop("main", None)
@@ -1498,7 +1278,8 @@ def check_beamngpy_side_grab_half_rate() -> None:
 def check_soft_esc_segment_timers() -> None:
     """Soft Esc Tip #2 timers, plus Tip #4 coalesce while disengaged.
 
-    Hitch schedule stays put. engaged=false reuses last-good inside 200 ms.
+    The camera rig is read every tick, so no slot is poll-free.
+    engaged=false still reuses last-good electrics and GPS inside 200 ms.
     Engage polls ``vehicle.sensors.poll`` every grab.
     """
     import time
@@ -1508,8 +1289,8 @@ def check_soft_esc_segment_timers() -> None:
     assert grab_wheel(None) == 16
     hitch_slots = [i for i in range(16) if not grab_is_poll_free(i, hitch)]
     free_slots = [i for i in range(16) if grab_is_poll_free(i, hitch)]
-    assert hitch_slots == [0, 1, 2, 3, 5, 6, 7], hitch_slots
-    assert free_slots == [4, 8, 9, 10, 11, 12, 13, 14, 15], free_slots
+    assert hitch_slots == list(range(16)), hitch_slots
+    assert free_slots == [], free_slots
     for i in range(32):
         assert grab_phase_of(i, hitch) == i % 16
         assert grab_is_poll_free(i, None) is grab_is_poll_free(i, hitch)
@@ -2769,24 +2550,26 @@ def check_adhoc_companions_do_not_block_or_pile() -> None:
         assert time.perf_counter() - t0 < 0.25, time.perf_counter() - t0
         assert blocked.grab_read_blocked is True
         assert SlowMain.n == 1
-        for cid in CAM_IDS:
-            if cid == "main":
-                continue
-            assert cid in blocked.frames and int(blocked.frames[cid].max()) > 0, cid
+        # narrow is attached before main, so it lands. main and everything
+        # after it do not, and an older picture is not filled in.
+        assert "narrow" in blocked.frames and int(blocked.frames["narrow"].max()) > 0
+        assert "main" not in blocked.frames
+        assert blocked.health["main"] == CamHealth.MISSING
+        for cid in ("wide", "pillarL", "pillarR", "repeatL", "repeatR", "rear"):
+            assert cid not in blocked.frames, cid
+            assert blocked.health[cid] == CamHealth.MISSING, cid
         t1 = time.perf_counter()
         skipped = be.grab()
         assert time.perf_counter() - t1 < 0.1
         assert SlowMain.n == 1
         assert skipped.grab_read_blocked is True
+        assert skipped.frames == {}
         time.sleep(0.7)
         painted = be.grab()
-        assert "main" in painted.frames
-        assert int(painted.frames["main"].max()) > 0
-        assert painted.health["main"] in (CamHealth.OK, CamHealth.STALE)
-        for cid in CAM_IDS:
-            if cid == "main":
-                continue
-            assert cid in painted.frames and int(painted.frames[cid].max()) > 0
+        assert SlowMain.n == 2
+        assert "main" not in painted.frames
+        assert painted.health["main"] == CamHealth.MISSING
+        assert "narrow" in painted.frames
         time.sleep(0.7)
         if be._io_thread is not None and be._io_thread.is_alive():
             be._io_thread.join(1.0)
@@ -2843,8 +2626,8 @@ def check_narrow_reattach_and_cam_io_edges() -> None:
 
     A live narrow request must not survive the 800→400 reattach, and that ctor
     must not run while an ad-hoc send still holds the GE socket. A main read
-    that only misses the 50 ms budget keeps health ok. A frame that arrives
-    after the budget still counts toward unique_gpu_n. close() waits for the
+    that misses the 50 ms budget stays missing on this tick. The frame that
+    arrives later is not painted as this tick. close() waits for the
     in-flight GE call before disconnect.
     """
     import sys
@@ -2976,19 +2759,17 @@ def check_narrow_reattach_and_cam_io_edges() -> None:
         be._sensors["main"] = SlowMain()
         missed = be.grab()
         assert missed.grab_read_blocked is True
-        assert missed.health["main"] == CamHealth.OK
-        assert cam_slot_live(missed.frames, missed.health_str(), "main")
+        assert missed.health["main"] == CamHealth.MISSING
+        assert "main" not in missed.frames
+        assert cam_slot_live(missed.frames, missed.health_str(), "main") is False
         assert "main" not in missed.unique_gpu_ids
-        # colour_to_bgr swaps RGB→BGR, so the primed R pixel lands in channel 2.
-        assert int(missed.frames["main"][0, 0, 2]) == 4
         time.sleep(0.25)
         landed = be.grab()
         assert landed.grab_read_blocked is True
-        assert landed.health["main"] == CamHealth.OK
-        assert cam_slot_live(landed.frames, landed.health_str(), "main")
-        assert "main" in landed.unique_gpu_ids
-        assert int(landed.frames["main"][0, 0, 0]) == 9
-        assert landed.unique_gpu_ids.count("main") == 1
+        assert landed.health["main"] == CamHealth.MISSING
+        assert "main" not in landed.frames
+        assert cam_slot_live(landed.frames, landed.health_str(), "main") is False
+        assert SlowMain.n == 2
         if be._io_thread is not None and be._io_thread.is_alive():
             be._io_thread.join(1.0)
         be._reap_if_done()

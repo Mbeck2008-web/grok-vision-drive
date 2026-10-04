@@ -562,6 +562,60 @@ def check_ahead_command_echo() -> None:
 
     echo_command(0.20)
     echo_command(0.60)
+    echo_command(-0.60)
+
+    # Caught 0.60, then the command falls to 0.40. The wheel walks toward the
+    # new steer 0.02 per tick. That path stays inside the span.
+    det = arm_ahead(0.60)
+    t = 100.0 + 8 * TICK
+    for step in range(1, 13):
+        t += TICK
+        echo = min(0.60, step * 0.05)
+        v = det.update(
+            engaged=True,
+            steering_input=echo,
+            throttle_input=0.55,
+            brake_input=0.0,
+            now=t,
+            own_axes=True,
+            player_device=True,
+        )
+        det.note_command(seq=200 + step, steer=0.60, throttle=0.55, brake=0.0, now=t)
+        assert not v.active and abs(v.steer_raw) < 1e-6, v
+    echo = 0.60
+    for _ in range(40):
+        t += TICK
+        echo = max(0.40, echo - 0.02)
+        v = det.update(
+            engaged=True,
+            steering_input=echo,
+            throttle_input=0.55,
+            brake_input=0.0,
+            now=t,
+            own_axes=True,
+            player_device=True,
+        )
+        det.note_command(seq=400, steer=0.40, throttle=0.55, brake=0.0, now=t)
+        assert not v.active and v.reason != REASON_STEER, v
+        assert abs(v.steer_raw) < 1e-6, v
+    past = False
+    for _ in range(20):
+        t += TICK
+        v = det.update(
+            engaged=True,
+            steering_input=0.65,
+            throttle_input=0.55,
+            brake_input=0.0,
+            now=t,
+            own_axes=True,
+            player_device=True,
+        )
+        det.note_command(seq=500, steer=0.40, throttle=0.55, brake=0.0, now=t)
+        if v.active:
+            assert v.channel == "steer" and v.reason == REASON_STEER, v
+            past = True
+            break
+    assert past, "a wheel 0.25 past the new command must be player_steer"
 
     det = arm_ahead(0.60)
     t = 100.0 + 8 * TICK

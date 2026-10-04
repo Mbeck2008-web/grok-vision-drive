@@ -184,3 +184,9 @@ A sun-blown colour buffer is matched once, on the frame the lane fit, the model,
 ### Arcade
 
 Engage arms arcade once. A failed arm is retried on a later tick. The release does not latch the drive arm, and the handoff restores arcade for the player. The control message omits gear. Throttle releases the parking brake and the clutch. A hold, a stop, or AEB sets the parking brake and releases the service brake. The drive arm releases the parking brake and the clutch, and it leaves the gearbox mode alone. Retail queues shifter mode 2 once per vehicle. Mode 2 is arcade.
+
+### Training strip
+
+The scene recorder writes one 2272×192 JPEG for each tick that arrives, and one `state.jsonl` line with that timestamp, the seconds since the previous strip, ego, wheel, and pedals. Tech labels are on the line when the tick has them. The file keeps the machine's own rate. 5 Hz is what this desktop is expected to record, and it is not a requirement of the file. A camera that missed the tick is an empty sector. A tick whose picture timestamps disagree is refused.
+
+Six sectors are 256×192 (repeatL, pillarL, main, narrow, pillarR, repeatR). Wide and rear are 340×192. Seven gaps are 8 px. The scene net crops those sectors, letterboxes the wide ones to 256×192, and steps a GRU with the real seconds since the previous strip. It predicts lanes, curbs, cars, signs, and lights, including ones the cameras cannot fully see. The hardcoded path planner turns that scene into the path and remains the driver. Training is `python -m python.train.train_scene`. It leaves BeamNG running. Compute 6.1 stays FP32. Compute 7.0 and newer select automatic mixed precision. Both export the same ONNX graph, `models/e2e_scene.onnx`. Wheel and pedals can drop a bad moment from the loss. They are not a loss term.

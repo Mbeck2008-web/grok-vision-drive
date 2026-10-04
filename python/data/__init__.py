@@ -1,1 +1,1 @@
-"""M4 clip recorder (cam_main ring + encode flush)."""
+"""Clip ring (cam_main) and the continuous 360 strip writer."""

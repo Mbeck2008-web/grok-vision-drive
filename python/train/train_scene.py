@@ -5,7 +5,7 @@ recorded seconds since the previous strip. Windows cover 15 seconds of real
 time. Before the first step the trainer measures that directory and the free
 VRAM, then shrinks the batch until the step fits. CPU is used only when the
 card cannot hold one step and the machine has more CPU RAM, and that path is
-not recommended. A plain window shows the run. This process does not start or
+not recommended. The run is drawn on the same dark panel as the supervisor. This process does not start or
 close BeamNG.
 """
 

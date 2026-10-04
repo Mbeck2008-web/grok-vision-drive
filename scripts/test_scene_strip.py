@@ -66,12 +66,29 @@ from python.train.scene_net import (  # noqa: E402
     step_dt,
 )
 from python.train.status_window import (  # noqa: E402
+    BG,
+    FG,
+    FONT,
+    FS_BODY,
+    FS_DIM,
+    FS_TITLE,
+    ICE,
+    PAD_X,
+    GRAPH_FILL,
+    GRAPH_H,
+    PANEL_W,
+    ROW_H,
+    TH,
     TrainStatus,
     TrainWindow,
     format_recorded_hm,
     format_status,
+    loss_graph_box,
+    loss_plot_box,
+    loss_polyline,
     predict_eta_s,
     read_recorded_seconds,
+    render_train_panel,
     steps_per_second,
 )
 from python.train.train_scene import train_directory  # noqa: E402
@@ -685,7 +702,9 @@ def check_recorded_hours_minutes() -> None:
         (empty / "notes.txt").write_bytes(b"leave-me")
         window = TrainWindow()
         window.load_folder(empty)
-        assert window.lines == "recorded 0 hours 0 minutes"
+        assert window.lines.splitlines()[0] == "recorded 0 hours 0 minutes"
+        assert "idle" in window.lines
+        assert window.losses == []
         assert read_recorded_seconds(empty) == 0.0
         assert format_recorded_hm(0) == "0 hours 0 minutes"
         assert (empty / "notes.txt").read_bytes() == b"leave-me"
@@ -1069,6 +1088,102 @@ def check_append_and_confirm_wipe() -> None:
         assert ui_prefs.is_file()
 
 
+def _status_for_graph(**overrides: object) -> TrainStatus:
+    fields: dict[str, object] = {
+        "eta_s": 90,
+        "loss": None,
+        "lr": 1e-3,
+        "steps_per_sec": 2.5,
+        "memory_bytes": 1610612736,
+        "memory_kind": "vram",
+        "device": "cuda",
+        "batch": 4,
+        "recommended": True,
+        "step": 1,
+        "steps": 10,
+        "recorded_s": 3720.0,
+    }
+    fields.update(overrides)
+    return TrainStatus(**fields)  # type: ignore[arg-type]
+
+
+def check_train_panel_loss_graph() -> None:
+    """The panel is the supervisor's dark type, and the loss curve is the given series."""
+    from python.viz import nerd
+
+    assert BG == nerd.BG
+    assert FG == nerd.FG
+    assert ICE == nerd.ICE
+    assert FONT == nerd.FONT
+    assert FS_TITLE == nerd.FS_TITLE
+    assert FS_BODY == nerd.FS_BODY
+    assert FS_DIM == nerd.FS_DIM
+    assert TH == nerd.TH
+    assert ROW_H == nerd.ROW_H
+    assert PAD_X == nerd.PAD_X
+    assert PANEL_W == nerd.NERD_WIDTH
+
+    idle_window = TrainWindow()
+    idle_window.load_folder(Path("/no/such/gvd-strips"))
+    assert idle_window.available is False
+    assert idle_window.losses == []
+    assert idle_window.panel is not None
+    assert idle_window.panel.shape[1] == PANEL_W
+    assert idle_window.panel.shape[0] > GRAPH_H
+    assert tuple(int(channel) for channel in idle_window.panel[0, 0]) == BG
+    assert float(idle_window.panel.mean()) < 80
+    assert "0 hours 0 minutes" in idle_window.lines
+    assert "idle" in idle_window.lines
+    plot = loss_plot_box(loss_graph_box(idle_window.panel.shape[0], idle_window.panel.shape[1]))
+    assert loss_polyline([], plot) == []
+    idle_crop = idle_window.panel[plot[1] : plot[3], plot[0] : plot[2]]
+    assert np.all(idle_crop == np.array(GRAPH_FILL, dtype=np.uint8))
+
+    window = TrainWindow()
+    series = [1.0, 0.25, 0.8]
+    panels = []
+    for index, loss in enumerate(series, start=1):
+        window.update(_status_for_graph(loss=loss, step=index))
+        assert window.panel is not None
+        panels.append(window.panel.copy())
+    assert window.losses == series
+    assert not np.array_equal(panels[0], panels[-1])
+    plot = loss_plot_box(loss_graph_box(window.panel.shape[0], window.panel.shape[1]))
+    points = loss_polyline(window.losses, plot)
+    assert len(points) == 3
+    assert points[0][0] < points[1][0] < points[2][0]
+    assert points[0][1] < points[2][1] < points[1][1]
+    live = window.panel
+    fill = float(np.array(GRAPH_FILL).mean())
+    for x, y in points:
+        live_patch = live[y - 2 : y + 3, x - 2 : x + 3]
+        assert float(live_patch.mean()) > fill + 5
+
+    text = window.lines
+    assert "1 hours 2 minutes" in text
+    assert "time left 1m 30s" in text
+    assert "loss 0.8000" in text
+    assert "lr 0.001" in text
+    assert "steps/s 2.50" in text
+    assert "VRAM 1.50 GB" in text
+    assert "not recommended" not in text
+    window.update(_status_for_graph(loss=None, step=4))
+    assert window.losses == series
+    assert len(loss_polyline(window.losses, plot)) == 3
+
+    cpu = format_status(
+        _status_for_graph(device="cpu", recommended=False, memory_kind="ram", batch=1, loss=0.8)
+    )
+    assert "cpu  batch 1  not recommended" in cpu
+    cpu_panel = render_train_panel(cpu.splitlines(), [0.8])
+    assert tuple(int(channel) for channel in cpu_panel[0, 0]) == BG
+    assert cpu_panel.shape[1] == PANEL_W
+    assert cpu_panel.shape[0] > GRAPH_H
+    window.open()
+    window.close()
+    assert window.panel is not None
+
+
 def check_trainer_is_offline() -> None:
     files = (
         ROOT / "python" / "train" / "train_scene.py",
@@ -1113,6 +1228,7 @@ def main() -> None:
     check_nan_cost_and_cpu_export()
     check_fit_and_window()
     check_recorded_hours_minutes()
+    check_train_panel_loss_graph()
     check_trainer_is_offline()
     check_net_cpu()
     print("test_scene_strip: OK")

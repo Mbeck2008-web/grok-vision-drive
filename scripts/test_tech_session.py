@@ -181,6 +181,7 @@ def check_tech_yaml() -> None:
     for spec in rig.get("cameras") or []:
         res = list(spec.get("live_res") or [])
         assert res and max(int(res[0]), int(res[1])) == 640, spec.get("id")
+    assert [int(v) for v in by_id["wide"]["live_res"]] == [640, 360]
 
 
 def check_env_overrides(monkey: dict[str, str]) -> None:

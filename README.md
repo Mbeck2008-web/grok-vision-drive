@@ -165,7 +165,7 @@ The rig is laid left to right as repeatL, pillarL, wide, main, narrow, pillarR, 
 
 The model reads that strip as one picture. Both image slots carry the same strip. The lane fit reads the windshield band, wide then main then narrow, when that band has pixels. An empty band is fit on the main camera.
 
-Pillar cameras aim 78 degrees off the lane. Repeater cameras aim 160 degrees back along the next lane, mounted 1.30 m forward. The three windshield cameras aim straight ahead. The rear camera aims straight back.
+Pillar cameras aim 78 degrees off the lane. Repeater yaw is ±150, mounted at Y 1.25, back along the next lane. The three windshield cameras aim straight ahead. The rear camera aims straight back.
 
 ### Lane lines
 

@@ -19,7 +19,7 @@ The horizontal spans already add up to more than a circle, because narrow,
 main, and wide share yaw 0 and the rear plate covers both repeater aims.
 A small field-of-view or yaw nudge would not turn those seams into one
 viewpoint, so this strip does not retune the rig. Pillar yaw stays ±78°
-and the repeater mounts stay at Y 1.30.
+and repeater yaw stays ±150, mounted at Y 1.25.
 
 A missing or unrendered camera leaves that sector empty. It is not filled
 from another camera.
@@ -55,7 +55,7 @@ SECTOR_H = 96
 GAP_PX = 8
 
 # Inboard edge of a repeater frame. A body-volume projection into the
-# ±160° repeater (fov_v 55.4, 4:3) stays inside this fraction. It is the
+# ±150° repeater (fov_v 55.4, 4:3) stays inside this fraction. It is the
 # frame edge, not a measured mesh.
 EGO_EDGE_FRAC = 0.25
 EGO_EDGE: dict[str, str] = {"repeatL": "left", "repeatR": "right"}

@@ -711,6 +711,50 @@ _TONE_SAT_MAX = 22.0
 _TONE_Y0 = 0.42
 
 
+def _shadow_luma_blue(bgr: np.ndarray) -> tuple[float, float] | None:
+    """Darker low-saturation pixels: mean luma, and mean (B - R).
+
+    A settled gray road is a small blue excess. The one-frame companion
+    flash is that same shadow, brighter and much bluer. A red/blue channel
+    swap does not do this: a gray pixel stays gray.
+    """
+    if bgr.ndim != 3 or bgr.shape[2] < 3 or bgr.size == 0:
+        return None
+    img = bgr[:, :, :3]
+    if int(img.shape[0]) >= 8:
+        img = img[int(img.shape[0]) * 45 // 100 :]
+    sample = img.astype(np.float32, copy=False)
+    luma = 0.114 * sample[:, :, 0] + 0.587 * sample[:, :, 1] + 0.299 * sample[:, :, 2]
+    blue = sample[:, :, 0] - sample[:, :, 2]
+    if int(luma.size) < 8:
+        return None
+    # Darker pixels are the road shadow. A white lane is brighter and stays out.
+    cut = float(np.percentile(luma, 45))
+    dark = luma <= cut
+    if int(np.count_nonzero(dark)) < 8:
+        dark = np.ones(luma.shape, dtype=bool)
+    return float(luma[dark].mean()), float(blue[dark].mean())
+
+
+def companion_frame_is_flash(new_bgr: np.ndarray, held_bgr: np.ndarray | None) -> bool:
+    """True when this companion buffer is the one bright-blue frame.
+
+    Brightness and the blue shadow are one frame, not two faults. A channel
+    swap is not it. Main is not passed here. No settled frame yet → False.
+    """
+    if held_bgr is None or frame_is_unrendered(held_bgr) or frame_is_unrendered(new_bgr):
+        return False
+    if new_bgr.shape[:2] != held_bgr.shape[:2]:
+        return False
+    new_s = _shadow_luma_blue(new_bgr)
+    held_s = _shadow_luma_blue(held_bgr)
+    if new_s is None or held_s is None:
+        return False
+    new_luma, new_blue = new_s
+    held_luma, held_blue = held_s
+    return (new_luma - held_luma) >= 18.0 and (new_blue - held_blue) >= 18.0
+
+
 def recover_viewport_tone(bgr: np.ndarray) -> np.ndarray:
     """Pull a sun-blown colour buffer toward the viewport picture.
 
@@ -1745,6 +1789,8 @@ class BeamNGPyBackend:
         if not cid or bgr is None or frame_is_unrendered(bgr):
             return
         bgr = resize_long_side(bgr, self.long_side)
+        if cid != "main" and companion_frame_is_flash(bgr, self._cache_frames.get(cid)):
+            return
         self._cache_frames[cid] = bgr
         self._cache_ts[cid] = time.time()
         sig = frame_signature(bgr)
@@ -1844,6 +1890,10 @@ class BeamNGPyBackend:
                 self._cache_ts.pop(cid, None)
             return
         bgr = resize_long_side(bgr, self.long_side)
+        if cid != "main" and companion_frame_is_flash(bgr, self._cache_frames.get(cid)):
+            # Same bad frame: brighter and blue in the shadows. Keep the settled road.
+            self._reuse_cached(cid, frames, timestamps, health, failed=False)
+            return
         sig = frame_signature(bgr)
         unique = sig != self._frame_sig.get(cid)
         self._store_frame(cid, bgr, ts, frames, timestamps, health)

@@ -24,11 +24,58 @@ from python.sensors.cameras import (  # noqa: E402
     CamHealth,
     beamng_camera_sensor_kwargs,
     camera_grab_due,
+    colour_to_bgr,
+    companion_frame_is_flash,
     load_camera_config,
 )
 
 
+def _road(color: tuple[int, int, int]) -> np.ndarray:
+    img = np.full((48, 64, 3), color, dtype=np.uint8)
+    img[30:46, 28:36] = (245, 245, 245)
+    return img
+
+
+def _publish(be: BeamNGPyBackend, cid: str, frame: np.ndarray) -> dict:
+    frames: dict = {}
+    be._publish_read(cid, frame, 0.0, frames, {}, {}, [])
+    return frames
+
+
+def _check_flash_frame_does_not_land() -> None:
+    # Settled gray-blue road, then the one bad frame: brighter and bluer together.
+    settled = _road((108, 102, 98))
+    flash = _road((210, 140, 70))
+    assert companion_frame_is_flash(flash, settled) is True
+    # A channel swap of the settled road is not that frame. Gray stays gray.
+    gray = np.full((48, 64, 3), 140, dtype=np.uint8)
+    swapped = colour_to_bgr(gray)
+    assert swapped is not None
+    assert abs(int(swapped[20, 20, 0]) - int(swapped[20, 20, 2])) <= 1
+    assert companion_frame_is_flash(settled[:, :, ::-1].copy(), settled) is False
+    # Brighter but still gray is a real lighting change, not the blue flash.
+    brighter = _road((140, 138, 136))
+    assert companion_frame_is_flash(brighter, settled) is False
+    be = BeamNGPyBackend.__new__(BeamNGPyBackend)
+    be.long_side = 640
+    be._cache_frames = {"wide": settled.copy()}
+    be._cache_ts = {"wide": 0.0}
+    be._frame_sig = {}
+    landed = _publish(be, "wide", flash)
+    assert np.array_equal(landed["wide"], settled)
+    assert np.array_equal(be._cache_frames["wide"], settled)
+    quiet = _road((112, 106, 102))
+    landed2 = _publish(be, "wide", quiet)
+    assert np.array_equal(landed2["wide"], quiet)
+    # Main is not this gate.
+    be._cache_frames["main"] = settled.copy()
+    be._cache_ts["main"] = 0.0
+    main_landed = _publish(be, "main", flash)
+    assert np.array_equal(main_landed["main"], flash)
+
+
 def main() -> None:
+    _check_flash_frame_does_not_land()
     off = beamng_camera_sensor_kwargs(
         pos=(0.0, 0.0, 1.2),
         direction=(0.0, -1.0, 0.0),

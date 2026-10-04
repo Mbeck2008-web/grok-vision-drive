@@ -188,17 +188,32 @@ def ema_alpha(dt: float, tau_s: float) -> float:
     return 1.0 - math.exp(-dt / tau_s)
 
 
-def own_steer_residual(echo: float, ref_steer: float, rest: float, rest_cmd: float) -> float:
-    """How far `echo` sits outside the resting wheel and that wheel plus the command step.
+def own_steer_residual(
+    echo: float,
+    ref_steer: float,
+    rest: float,
+    rest_cmd: float,
+    caught: float | None = None,
+) -> float:
+    """How far `echo` sits outside the resting span.
 
-    Soft Esc's own steer either leaves the wheel where it was armed or carries it
-    with the command (same offset). Both are residual 0. Motion past that span is
-    the player. A frozen ``echo − cmd`` baseline reads a command step on a still
-    wheel as a pull.
+    The axis is wheel rotation, not force-feedback torque. The span covers the
+    armed wheel, that wheel plus any later command step, the command itself,
+    and a wheel that already caught an earlier command. A later smaller command
+    keeps the path from that caught angle to the new steer inside the span.
+    An echo of a command that was already ahead on the first armed sample is
+    residual 0 at any magnitude. Rotation past either end, away from the
+    commanded steer, is the player. A frozen ``echo − cmd`` baseline reads a
+    command step on a still wheel as a pull.
     """
-    delta = float(ref_steer) - float(rest_cmd)
-    lo = float(rest) if delta >= 0.0 else float(rest) + delta
-    hi = float(rest) + delta if delta >= 0.0 else float(rest)
+    rest_f = float(rest)
+    ref_f = float(ref_steer)
+    tracked = rest_f + (ref_f - float(rest_cmd))
+    pts = [rest_f, tracked, ref_f]
+    if caught is not None:
+        pts.append(float(caught))
+    lo = min(pts)
+    hi = max(pts)
     if echo < lo:
         return echo - lo
     if echo > hi:
@@ -229,9 +244,11 @@ class OverrideDetector:
     `update(engaged=False)` just clears the state so re-engaging starts clean.
 
     `own_axes=True` is Soft Esc / BeamNGpy. Pedals stay a residual against the command,
-    then the first armed sample. Steer stores the resting wheel angle. A later command
-    may move: an echo that stays on that angle, or that tracks the command with the
-    same offset, is not `player_steer`. A pull past either end still is. Retail
+    then the first armed sample. Steer stores the resting wheel angle. The span runs
+    from that wheel through a command already ahead of it, and follows later command
+    steps. A later smaller command keeps the path from the caught angle to the new
+    steer inside the span. Staying put, catching up inside the span, or echoing the
+    command is not `player_steer`. A pull past either end still is. Retail
     `player_device` stays an absolute axis. The Lua override does not share this baseline.
     """
 
@@ -249,6 +266,7 @@ class OverrideDetector:
         self._armed_at: float | None = None
         self._base_steer: float | None = None
         self._base_steer_cmd: float | None = None
+        self._caught: float | None = None
         self._base_thr: float | None = None
         self._base_brk: float | None = None
 
@@ -276,6 +294,7 @@ class OverrideDetector:
         self._armed_at = None
         self._base_steer = None
         self._base_steer_cmd = None
+        self._caught = None
         self._base_thr = None
         self._base_brk = None
         self.verdict = OverrideVerdict()
@@ -331,9 +350,10 @@ class OverrideDetector:
         # are the physical wheel/pedals as an absolute axis (centered wheel is 0).
         # Soft Esc beamngpy is not source=gvd. `own_axes` keeps the command as the pedal
         # reference so a commanded throttle echoing back is residual 0, then subtracts the
-        # first armed pedal sample. Steer stores the resting wheel angle and follows it
-        # when the command changes: a wheel that stays put, or that tracks cmd + offset,
-        # is residual 0. A pull past that span is still player_steer.
+        # first armed pedal sample. Steer stores the resting wheel angle. The span includes
+        # a command already ahead of that wheel, so electrics echoing it are residual 0.
+        # A wheel that stays put, catches up inside the span, or tracks cmd + offset is
+        # residual 0. A pull past that span is still player_steer.
         use_absolute = bool(player_device) and not own_axes
         ref_steer = 0.0 if use_absolute else ref.steer
         ref_thr = 0.0 if use_absolute else ref.throttle
@@ -351,11 +371,18 @@ class OverrideDetector:
             if self._base_steer is None:
                 self._base_steer = echo_s
                 self._base_steer_cmd = ref_steer
+                self._caught = echo_s
                 raw = 0.0
             else:
                 raw = own_steer_residual(
-                    echo_s, ref_steer, float(self._base_steer), float(self._base_steer_cmd or 0.0)
+                    echo_s,
+                    ref_steer,
+                    float(self._base_steer),
+                    float(self._base_steer_cmd or 0.0),
+                    self._caught,
                 )
+                if raw == 0.0:
+                    self._caught = echo_s
         else:
             raw = _clamp(steering_input, -1.0, 1.0) - ref_steer
         if own_axes:

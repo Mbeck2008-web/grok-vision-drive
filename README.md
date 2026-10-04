@@ -6,18 +6,18 @@ Entertainment only. Never use this stack to control a physical car.
 
 First-time clone: point [Grok Build](https://x.ai/cli), Grok Bot, or any computer-use agent at this repo on extra-high reasoning — paste [`AGENTS.md`](AGENTS.md) if the tool does not auto-read the tree. Have it install GVD on this PC, probe or accept the specs, pick **retail** window-capture vs BeamNG.**tech** 8-cam from what is actually installed, and patch [`config/hardware.yaml`](config/hardware.yaml) to that GPU / VRAM / RAM. No step-by-step here — the model can open the project.
 
-## Alpha 1.7.3
+## Alpha 1.7.4
 
 This is **alpha** — may break / not work; improves with fixes.
 
-Canonical pin **1.7.3** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Untagged retail zips use `1.7.3-alpha-<sha>`.
+Canonical pin **1.7.4** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Untagged retail zips use `1.7.4-alpha-<sha>`.
 
 **Versioning** (this line stays **alpha** until a later non-alpha release):
 
 - **point** bumps (`1.7.x`) = fixes / small UI
 - **main alpha** bump (`1.x.0`) = features / core / UI overhaul
 
-## Recent changes (alpha 1.7.3)
+## Recent changes (alpha 1.7.4)
 
 Catch-up from **1.0.1**. Each feature merge since that pin is one main step. The throttle fix is the point in between. Live Alt+G, Tech 8-cam, FFB, and QSV stay **UNPROVEN**.
 
@@ -207,7 +207,7 @@ What retail is **not**: eight cameras. It captures **one** window (the main view
 4. Double-click `play_gvd.bat`. It opens the supervisor console (`cmd /k`, so errors stay readable), the **GVD VISION** window, and BeamNG via Steam. Window capture locks onto a visible window titled **BeamNG** as soon as it appears; if none is found it grabs the primary monitor, so run BeamNG fullscreen in that case (the nerd panel `capture` line tells you which).
 5. Drive onto a road with visible lane lines. As soon as `play_gvd.bat` is up, GVD VISION and the in-game ribbon/ghosts already follow the loaded nets (path, planner, other vehicles) — you are still driving. Press **Alt+G** (fallback **Ctrl+Alt+G**) or the app's **Engage** when you want GVD to take the wheel. **Alt+A** stays BeamNG's stock range display (`toggleRangeStatus`); GVD does not steal it. The HUD strip reads `modular|ON` while engaged and waiting, `modular|HOLD` while the brake is held (`preview_blocked`, a veto, AEB, or a stale link), and `modular|DRIVE` only once both lane lines are seen (`path_debug_preview=false`) and the command is applied. Until the lanes are seen it holds the brake (`preview_blocked`). Take over any time by steering against it (`player_steer`), touching a pedal (`player_brake` / `player_throttle`), or pressing Alt+G — sticky until the next Alt+G.
 
-**Force-feedback wheels.** A wheel is welcome. Override detection looks at `|steering_input − cmd.steer|`, not the absolute angle, then spike-rejects and EMA-filters that residual so self-aligning torque, spring centering and kicks over bumps no longer disengage GVD. A real pull held ~200 ms still wins, and so does any real brake or throttle press. Tune it in `config\control.yaml` under `override:`. Live FFB behaviour is **UNPROVEN**.
+**Force-feedback wheels.** A wheel is welcome. Soft Esc uses the resting span: wheel rotation against the commanded steer, not `|steering_input − cmd.steer|`. A held rotation of 0.25 drops Engage. Live FFB behaviour is **UNPROVEN**.
 
 Keys in **GVD VISION**: `V` nerd panel, `D` DRIVE tab (gates / actuators / AEB), `G` VIZ tab (overlay layers), `M` MODEL tab (detector / e2e), `A` CAMS tab (3×3, empty center; missing slots stay labelled), `[` `]` / `?` cycle tabs, `0` clean cabin, `1–5` debug layers (occupancy / detector boxes / lane polynomials / camera FOV / planner samples), `T` chase↔BEV, `C` manual clip, `R` review capture, `q` quit. The title bar shows the same glance word as the in-game app (OFF / ON / HOLD / DRIVE / MISMATCH). Key `0` hides the nerd chrome and keeps that word. Click the nerd tabs and `+`/`−` to change knobs; they write the command this tick. Loop under 8 Hz drops the CAMS blit and the VIZ camera strip (tiles stay labelled `dropped` / `missing`; the supervisor does not crash).
 
@@ -250,7 +250,7 @@ Optional bus in `config/sensors.yaml`. Defaults: IMU + GPS **on**; `lidar` / `ra
 
 ## Release zip (M6)
 
-Windows: double-click `scripts\make_release_zip.bat`. Anywhere: `python scripts/make_release_zip.py`. Output: `dist\gvd-retail-<version>.zip` (gitignored), `<version>` = exact git tag if any, else `1.7.3-alpha-<sha>[-dirty]`; override with `--version 1.7.3`, `--out path`, `--flat` (no top-level folder), `--list` (manifest only).
+Windows: double-click `scripts\make_release_zip.bat`. Anywhere: `python scripts/make_release_zip.py`. Output: `dist\gvd-retail-<version>.zip` (gitignored), `<version>` = exact git tag if any, else `1.7.4-alpha-<sha>[-dirty]`; override with `--version 1.7.4`, `--out path`, `--flat` (no top-level folder), `--list` (manifest only).
 
 Packs: `install.bat`, `uninstall.bat`, `play_gvd.bat`, `beamng_mod/`, `python/` (retail runtime), `config/` (including `sensors.yaml`), `requirements.txt` + `requirements-retail.txt`, `LICENSE`, `README.md`, `AGENTS.md`, `docs/*.md`, `models/yolov8n.onnx` + `models/NOTICE.txt`, plus a generated `VERSION.txt` (version, build time, git sha, the retail honesty lines). Excludes `data/clips/`, extra weights (`*.pt`, other `*.onnx`, `*.pth` `*.bin` `*.safetensors`), `.git`, `scripts/` (tests + this tool), `__pycache__`, `dist/`, and `requirements-foxglove.txt`. `*.bat` are written CRLF. After writing, the script re-opens the zip, refuses forbidden members and missing must-haves (mod entry point, `run_vision.py`, launchers, `models/yolov8n.onnx`), and exits non-zero on any problem. Attach the zip to a GitHub Release. Offline check: `PYTHONPATH=. python scripts/test_m6_retail.py`.
 
@@ -326,7 +326,7 @@ Keys in `--viz`: `V` nerd, `D` DRIVE (live actuators), `G` VIZ (occupancy / boxe
 
 ## Status
 
-**Alpha 1.7.3:** this is **alpha** — may break / not work; improves with fixes. **point** bumps = fixes / small UI. **main alpha** bump = features / core / UI overhaul. See [Alpha 1.7.3](#alpha-173). **1.7.0** keeps a stale `gvd_engage.json` from starting the car, holds an untrained E2E stub instead of driving it, shares one glance word (OFF / ON / HOLD / DRIVE / MISMATCH) across the app, the strip, and the VISION title, and draws cabin agent boxes as empty solids.
+**Alpha 1.7.4:** this is **alpha** — may break / not work; improves with fixes. **point** bumps = fixes / small UI. **main alpha** bump = features / core / UI overhaul. See [Alpha 1.7.4](#alpha-174). **1.7.0** keeps a stale `gvd_engage.json` from starting the car, holds an untrained E2E stub instead of driving it, shares one glance word (OFF / ON / HOLD / DRIVE / MISMATCH) across the app, the strip, and the VISION title, and draws cabin agent boxes as empty solids.
 
 **Force-feedback player override:** wheel chatter no longer disengages GVD. Signal is `|steering_input − aligned cmd.steer|` (never an absolute angle), then spike reject → EMA → hysteresis → dwell. Pedals are asymmetric and tight. Live FFB is **UNPROVEN**. Details under [Actuation](#actuation-m3).
 
@@ -391,7 +391,7 @@ PYTHONPATH=. python python/run_vision.py --backend beamngpy --viz   # Tech path
 
 Safety: Alt+G engage; heartbeat dead-man; AEB `brake=1`/`throttle=0`; driver override (below) disengages and stays off until Alt+G; kill Python → `finally` stop + `engaged=false`, Lua releases the car and fades the ribbon; Lua-side dead-man holds the brake after `CMD_STALE_S` (0.35 s) without a new `seq` and releases + disengages after `CMD_DEAD_S` (1.0 s). `--force-engage` is **debug-only** (never default). Live drive on Windows = Windows live smoke / still UNPROVEN here. Live Tech / FFB / Alt+G still **UNPROVEN**.
 
-**Player override (force-feedback residual).** Retail: `python/control/override.py` and `gvd_main` run the same maths. The Soft Esc `own_axes` steer baseline is Python only; Lua does not apply it. With no extra player device the signal is `|steering_input − cmd.steer|` against the command that was in force when the echo was sampled (`applied_seq` / last applied), never an absolute angle — so GVD's own steer coming back is residual 0. On retail, while GVD holds the car as a secondary Direct Drive wheel + pedals, hydros electrics are GVD's command; override then reads `input.lastInputs` of the physical wheel/pedals (`player_device` in `gvd_ego.json`) as an absolute axis (centered wheel is 0). Soft Esc beamngpy does not use that absolute path. Electrics are judged in Python against the latest command already applied (a commanded throttle that echoes back is residual 0, not `player_throttle`). The steer baseline is the resting wheel angle from the first armed sample: a later steer command may move, and the echo may stay put or track that command with the same offset, without becoming `player_steer`. A real pedal or a further wheel pull still disengages. Then: spike reject (`steer_spike` 0.20, a sample-to-sample jump is mechanical, the EMA holds) → EMA on the residual only (`lpf_tau_ms` 80) → soft opposition bias (a residual fighting GVD's steer counts a little more) → hysteresis (`steer_enter` 0.08 / `steer_exit` 0.04) → dwell (`steer_hold_ms` 200). Pedals are asymmetric and tight: no filter, no dwell, one-sided (only a press beyond what GVD asked for), `brake_enter` 0.06 / `throttle_enter` 0.10. Reasons: `player_steer` / `player_brake` / `player_throttle`. Thresholds: `config/control.yaml` `override:`, mirrored into `gvd_state.json` as `override_cfg`. This does **not** change `CMD_DEAD_S`. Live FFB is **UNPROVEN**. Offline check: `PYTHONPATH=. python scripts/test_ffb_override.py`.
+**Player override (force-feedback residual).** Retail: `python/control/override.py` and `gvd_main` run the same maths. The Soft Esc `own_axes` steer baseline is Python only; Lua does not apply it. With no extra player device the signal is `|steering_input − cmd.steer|` against the command that was in force when the echo was sampled (`applied_seq` / last applied), never an absolute angle — so GVD's own steer coming back is residual 0. On retail, while GVD holds the car as a secondary Direct Drive wheel + pedals, hydros electrics are GVD's command; override then reads `input.lastInputs` of the physical wheel/pedals (`player_device` in `gvd_ego.json`) as an absolute axis (centered wheel is 0). Soft Esc beamngpy does not use that absolute path. Electrics are judged in Python against the latest command already applied (a commanded throttle that echoes back is residual 0, not `player_throttle`). The steer baseline is the resting wheel angle from the first armed sample, and the span includes a command already ahead of that wheel: a later steer command may move, and the echo may stay put, catch up inside that span, or track the command with the same offset, without becoming `player_steer`. A real pedal or a further wheel pull still disengages. Then: spike reject (`steer_spike` 0.20, a sample-to-sample jump is mechanical, the EMA holds) → EMA on the residual only (`lpf_tau_ms` 80) → soft opposition bias (a residual fighting GVD's steer counts a little more) → hysteresis (`steer_enter` 0.08 / `steer_exit` 0.04) → dwell (`steer_hold_ms` 200). Pedals are asymmetric and tight: no filter, no dwell, one-sided (only a press beyond what GVD asked for), `brake_enter` 0.06 / `throttle_enter` 0.10. Reasons: `player_steer` / `player_brake` / `player_throttle`. Thresholds: `config/control.yaml` `override:`, mirrored into `gvd_state.json` as `override_cfg`. This does **not** change `CMD_DEAD_S`. Live FFB is **UNPROVEN**. Offline check: `PYTHONPATH=. python scripts/test_ffb_override.py`.
 
 `cmd_json` (retail, `window` backend — no BeamNGpy vehicle) writes `gvd_cmd.json` = `{steer, throttle, brake, seq, engaged, heartbeat_mtime, reason}` every tick. `gvd_main.applyCmdJson` applies it only while the mod is engaged **and** the payload says `engaged` **and** `seq` keeps advancing; it echoes `applied_seq` plus electrics in `gvd_ego.json`. `cmd_applied=true` / `cmd_reason=cmd_json_applied` only when the echoed `applied_seq` is this `seq` or up to 5 behind (a higher seq from a previous supervisor is not an ack); `cmd_json_pending` = written but not acked (mod off, no vehicle); `cmd_json_idle` = not engaged, Lua hands off. Gate reasons (`not_engaged`, `preview_blocked`, `veto:*`, `player_steer`, `player_brake`, `player_throttle`) pass through unchanged. Engaged gate holds (e.g. `preview_blocked`) ride along as `brake=1` and are applied.
 
@@ -416,3 +416,7 @@ PYTHONPATH=. python -m python.train.train_e2e --smoke
 ```
 
 Modular veto thresholds: `config/control.yaml`. E2E input 320×180: `config/perception.yaml` / `control.yaml`. Weights stay out of git.
+
+## 1.7.4 wheel rotation
+
+- Disengage uses wheel rotation against the commanded steer. Force-feedback torque is not a signal. An echo of a command already ahead of the wheel is residual 0, a later smaller command keeps that catch-up inside the span, and a held rotation of 0.25 drops Engage.

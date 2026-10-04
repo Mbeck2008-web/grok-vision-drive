@@ -466,7 +466,7 @@ def check_soft_esc_own_axes() -> None:
     assert 'owns_axes = getattr(actuator, "name", "") == "beamngpy"' in rv
     assert "own_axes=owns_axes" in rv
 
-    # Non-tracking: echo stays at the resting angle while cmd steer steps past 0.08.
+    # Non-tracking: echo stays at the resting angle while cmd steer steps.
     # A frozen (echo − cmd) baseline would read that step as player_steer (~0.35 s).
     sim = Sim(cfg)
     sim.warm(**kw)
@@ -507,6 +507,173 @@ def check_soft_esc_own_axes() -> None:
                 player_device=True,
             )
             assert not v.active, f"tracking offset cmd {steer} kicked at {i}: {v}"
+
+
+def check_ahead_command_echo() -> None:
+    """An echo of a command already ahead at arm is residual 0 at any magnitude.
+
+    The resting span runs from the armed wheel to that command and follows later
+    command steps. A slow catch-up inside the span stays engaged. A pull past the
+    span is player_steer, and so is a held absolute pull of 0.25.
+    """
+    cfg = load_override_config(yaml.safe_load(CONTROL_YAML.read_text(encoding="utf-8")))
+    assert cfg.steer_enter == 0.08 and cfg.steer_exit == 0.04
+
+    def arm_ahead(command: float) -> OverrideDetector:
+        det = OverrideDetector(cfg)
+        t = 100.0
+        for i in range(8):
+            t += TICK
+            det.update(
+                engaged=True,
+                steering_input=0.0,
+                throttle_input=0.55,
+                brake_input=0.0,
+                now=t,
+                own_axes=True,
+                player_device=True,
+            )
+            det.note_command(seq=i + 1, steer=command, throttle=0.55, brake=0.0, now=t)
+        assert det.armed(t), "warm-up did not arm before the echo caught the command"
+        return det
+
+    def echo_command(command: float) -> None:
+        det = arm_ahead(command)
+        t = 100.0 + 8 * TICK
+        saw = False
+        for i in range(40):
+            t += TICK
+            echo = command if i >= 6 else 0.0
+            v = det.update(
+                engaged=True,
+                steering_input=echo,
+                throttle_input=0.55,
+                brake_input=0.0,
+                now=t,
+                own_axes=True,
+                player_device=True,
+            )
+            det.note_command(seq=100 + i, steer=command, throttle=0.55, brake=0.0, now=t)
+            assert not v.active and v.reason != REASON_STEER, v
+            if echo == command and v.armed:
+                assert abs(v.steer_raw) < 1e-6, v
+                saw = True
+        assert saw, "the echo of the ahead command was never judged"
+
+    echo_command(0.20)
+    echo_command(0.60)
+    echo_command(-0.60)
+
+    # Caught 0.60, then the command falls to 0.40. The wheel walks toward the
+    # new steer 0.02 per tick. That path stays inside the span.
+    det = arm_ahead(0.60)
+    t = 100.0 + 8 * TICK
+    for step in range(1, 13):
+        t += TICK
+        echo = min(0.60, step * 0.05)
+        v = det.update(
+            engaged=True,
+            steering_input=echo,
+            throttle_input=0.55,
+            brake_input=0.0,
+            now=t,
+            own_axes=True,
+            player_device=True,
+        )
+        det.note_command(seq=200 + step, steer=0.60, throttle=0.55, brake=0.0, now=t)
+        assert not v.active and abs(v.steer_raw) < 1e-6, v
+    echo = 0.60
+    for _ in range(40):
+        t += TICK
+        echo = max(0.40, echo - 0.02)
+        v = det.update(
+            engaged=True,
+            steering_input=echo,
+            throttle_input=0.55,
+            brake_input=0.0,
+            now=t,
+            own_axes=True,
+            player_device=True,
+        )
+        det.note_command(seq=400, steer=0.40, throttle=0.55, brake=0.0, now=t)
+        assert not v.active and v.reason != REASON_STEER, v
+        assert abs(v.steer_raw) < 1e-6, v
+    past = False
+    for _ in range(20):
+        t += TICK
+        v = det.update(
+            engaged=True,
+            steering_input=0.65,
+            throttle_input=0.55,
+            brake_input=0.0,
+            now=t,
+            own_axes=True,
+            player_device=True,
+        )
+        det.note_command(seq=500, steer=0.40, throttle=0.55, brake=0.0, now=t)
+        if v.active:
+            assert v.channel == "steer" and v.reason == REASON_STEER, v
+            past = True
+            break
+    assert past, "a wheel 0.25 past the new command must be player_steer"
+
+    det = arm_ahead(0.60)
+    t = 100.0 + 8 * TICK
+    for step in range(1, 12):
+        t += TICK
+        echo = min(0.60, step * 0.05)
+        v = det.update(
+            engaged=True,
+            steering_input=echo,
+            throttle_input=0.55,
+            brake_input=0.0,
+            now=t,
+            own_axes=True,
+            player_device=True,
+        )
+        det.note_command(seq=200 + step, steer=0.60, throttle=0.55, brake=0.0, now=t)
+        assert not v.active and abs(v.steer_raw) < 1e-6, v
+
+    pulled = False
+    for _ in range(20):
+        t += TICK
+        v = det.update(
+            engaged=True,
+            steering_input=-0.25,
+            throttle_input=0.55,
+            brake_input=0.0,
+            now=t,
+            own_axes=True,
+            player_device=True,
+        )
+        det.note_command(seq=300, steer=0.60, throttle=0.55, brake=0.0, now=t)
+        if v.active:
+            assert v.channel == "steer" and v.reason == REASON_STEER, v
+            pulled = True
+            break
+    assert pulled, "a pull of 0.25 past the resting span must be player_steer"
+
+    sim = Sim(cfg)
+    sim.warm(cmd=(0.0, 0.0, 0.0), echo=(0.0, 0.0, 0.0), player_device=True)
+    straight = False
+    for _ in range(20):
+        v = sim.step(cmd=(0.0, 0.0, 0.0), echo=(0.25, 0.0, 0.0), player_device=True)
+        if v.active:
+            assert v.channel == "steer" and v.reason == REASON_STEER, v
+            straight = True
+            break
+    assert straight, "a held absolute pull of 0.25 on a straight command must be player_steer"
+
+    sim = Sim(cfg)
+    sim.warm(cmd=(0.4, 0.3, 0.0), echo=(0.0, 0.0, 0.0), player_device=True)
+    absolute = False
+    for _ in range(20):
+        v = sim.step(cmd=(0.4, 0.3, 0.0), echo=(0.25, 0.0, 0.0), player_device=True)
+        if v.active:
+            assert v.channel == "steer" and v.reason == REASON_STEER, v
+            absolute = True
+            break
+    assert absolute, "a held absolute pull of 0.25 must be player_steer"
 
 
 def check_player_device_absolute() -> None:
@@ -554,6 +721,7 @@ def main() -> None:
     check_aeb_echo_not_brake()
     check_player_device_absolute()
     check_soft_esc_own_axes()
+    check_ahead_command_echo()
     print("test_ffb_override: OK")
 
 

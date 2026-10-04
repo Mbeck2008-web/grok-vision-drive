@@ -24,10 +24,12 @@ from python.data.strip_writer import (  # noqa: E402
     GAP_PX,
     SECTORS,
     STRIP_ORDER,
+    StripRecordControl,
     StripTimestampError,
     StripWriter,
     compose_strip,
     read_state_jsonl,
+    wipe_training,
 )
 from python.planning.path_predictor import predict_path  # noqa: E402
 from python.train.fit import (  # noqa: E402
@@ -726,6 +728,257 @@ def check_nan_cost_and_cpu_export() -> None:
     assert all(tensor.device.type == "cpu" for tensor in args)
 
 
+def _jpeg_bytes(folder: Path) -> dict[str, bytes]:
+    strips = folder / "strips"
+    if not strips.is_dir():
+        return {}
+    return {path.name: path.read_bytes() for path in strips.glob("*.jpg")}
+
+
+def check_append_and_confirm_wipe() -> None:
+    """A second start only adds files. Wipe deletes only after confirm, and only in that folder."""
+    colors = _colors()
+    frames = _bundle(colors)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        folder = root / "disk_a"
+        other = root / "disk_b"
+        prefs = root / "remember" / "gvd_strip_record.json"
+        decoy = root / "elsewhere" / "strips" / "000000.jpg"
+        decoy.parent.mkdir(parents=True)
+        decoy.write_bytes(b"not-this-folder")
+
+        orphan = root / "orphan"
+        (orphan / "strips").mkdir(parents=True)
+        planted = orphan / "strips" / "000000.jpg"
+        planted.write_bytes(b"keep-orphan")
+        old_state = '{"i": 0, "t": 1.0, "dt_s": null, "kept": true}\n'
+        (orphan / "state.jsonl").write_text(old_state, encoding="utf-8")
+        writer = StripWriter(orphan)
+        rec = writer.write(frames, t=2.0, timestamps=_stamps(frames, 2.0), **_controls())
+        assert planted.read_bytes() == b"keep-orphan"
+        assert rec.path.name == "000001.jpg"
+        assert (orphan / "state.jsonl").read_text(encoding="utf-8").startswith(old_state)
+        real_append = writer._append_state
+
+        def fail_append(_line: dict) -> None:
+            raise OSError("full")
+
+        writer._append_state = fail_append
+        try:
+            writer.write(frames, t=2.5, timestamps=_stamps(frames, 2.5), **_controls())
+        except OSError:
+            pass
+        else:
+            raise AssertionError("a failed state line was swallowed")
+        assert planted.read_bytes() == b"keep-orphan"
+        assert (orphan / "strips" / "000001.jpg").read_bytes() == rec.path.read_bytes()
+        orphan_new = orphan / "strips" / "000002.jpg"
+        assert orphan_new.is_file()
+        assert len(read_state_jsonl(orphan / "state.jsonl")) == 2
+        writer._append_state = real_append
+        assert wipe_training(orphan, confirm=False) == []
+        assert planted.read_bytes() == b"keep-orphan"
+        assert "unlink" not in inspect.getsource(StripWriter.write)
+        assert "unlink" not in inspect.getsource(StripWriter._create_exclusive)
+        assert "wipe_training" not in inspect.getsource(StripRecordControl.stop)
+        assert "wipe_training" not in inspect.getsource(StripRecordControl.start)
+        assert "wipe_training" not in inspect.getsource(StripRecordControl.set_destination)
+        assert "rmtree" not in (ROOT / "python" / "data" / "strip_writer.py").read_text(encoding="utf-8")
+
+        ctl = StripRecordControl(prefs_path=prefs, destination=str(folder))
+        assert ctl.status_text() == "recording off"
+        assert ctl.offer(frames, t=1.0, timestamps=_stamps(frames, 1.0), **_controls()) is None
+        ctl.note_engaged(True)
+        assert ctl.recording is False
+        ctl.start()
+        assert ctl.status_text() == "recording on"
+        assert ctl.recording is True
+        first = ctl.offer(frames, t=10.0, timestamps=_stamps(frames, 10.0), **_controls())
+        second = ctl.offer(frames, t=10.2, timestamps=_stamps(frames, 10.2), **_controls())
+        assert first is not None and second is not None
+        assert first.path.name == "000000.jpg"
+        assert second.path.name == "000001.jpg"
+        assert abs((second.dt_s or 0.0) - 0.2) < 1e-6
+        ctl.stop()
+        assert ctl.recording is False
+        assert ctl.status_text() == "recording off"
+        ctl.note_engaged(True)
+        assert ctl.offer(frames, t=10.4, timestamps=_stamps(frames, 10.4), **_controls()) is None
+        session_one = _jpeg_bytes(folder)
+        state_one = (folder / "state.jsonl").read_text(encoding="utf-8")
+        assert set(session_one) == {"000000.jpg", "000001.jpg"}
+
+        remembered = StripRecordControl(prefs_path=prefs)
+        assert remembered.destination == str(folder)
+        assert remembered.recording is False
+        assert _jpeg_bytes(folder) == session_one
+        assert (folder / "state.jsonl").read_text(encoding="utf-8") == state_one
+
+        ctl.start()
+        assert _jpeg_bytes(folder) == session_one
+        assert (folder / "state.jsonl").read_text(encoding="utf-8") == state_one
+        added = ctl.offer(frames, t=80.0, timestamps=_stamps(frames, 80.0), **_controls())
+        assert added is not None
+        assert added.path.name not in session_one
+        assert added.dt_s is None
+        kept = {name: data for name, data in _jpeg_bytes(folder).items() if name in session_one}
+        assert kept == session_one
+        state_two = (folder / "state.jsonl").read_text(encoding="utf-8")
+        assert state_two.startswith(state_one)
+        rows = read_state_jsonl(folder / "state.jsonl")
+        assert rows[0]["session"] == rows[1]["session"]
+        assert rows[-1]["session"] != rows[0]["session"]
+        ctl.note_engaged(True)
+        assert ctl.recording is True
+        followed = ctl.offer(frames, t=80.4, timestamps=_stamps(frames, 80.4), **_controls())
+        assert followed is not None
+        assert abs((followed.dt_s or 0.0) - 0.4) < 1e-6
+        assert followed.path.name not in session_one
+        ctl.note_engaged(False)
+        assert ctl.recording is True
+        stale = _bundle(colors)
+        stamps = _stamps(stale, 80.9)
+        stamps["wide"] = 1.0
+        for cam_id in stale:
+            stale[cam_id] = _frame((255, 255, 255), cam_id)
+        missed = ctl.offer(stale, t=80.9, timestamps=stamps, **_controls())
+        assert missed is not None
+        missed_bgr = _read_jpeg(missed.path)
+        wide = next(sec for sec in SECTORS if sec.cam_id == "wide")
+        inset = missed_bgr[16:-16, wide.x0 + 16 : wide.x1 - 16]
+        assert int(inset.max()) <= 3
+        ctl.stop()
+        assert ctl.recording is False
+        stopped = _jpeg_bytes(folder)
+        state_stopped = (folder / "state.jsonl").read_text(encoding="utf-8")
+        assert session_one.keys() <= stopped.keys()
+        for name, data in session_one.items():
+            assert stopped[name] == data
+
+        ctl.set_destination("D:/gvd_strips")
+        assert ctl.destination == "D:/gvd_strips"
+        assert json.loads(prefs.read_text(encoding="utf-8"))["destination"] == "D:/gvd_strips"
+        assert not Path("D:/gvd_strips").exists()
+        reloaded = StripRecordControl(prefs_path=prefs)
+        assert reloaded.destination == "D:/gvd_strips"
+        assert reloaded.recording is False
+        assert _jpeg_bytes(folder) == stopped
+        ctl.set_destination(str(other))
+        assert ctl.recording is False
+        ctl.start()
+        moved = ctl.offer(frames, t=3.0, timestamps=_stamps(frames, 3.0), **_controls())
+        assert moved is not None
+        assert moved.path.parent.parent == other
+        assert _jpeg_bytes(folder) == stopped
+        assert (folder / "state.jsonl").read_text(encoding="utf-8") == state_stopped
+        ctl.arm_free_space()
+        ctl.set_destination(str(folder))
+        assert ctl.free_space_armed is False
+        assert ctl.confirm_free_space() == []
+        assert _jpeg_bytes(folder) == stopped
+        assert _jpeg_bytes(other) != {}
+
+        (folder / "notes.txt").write_bytes(b"keep-me")
+        (folder / "strips" / "side.txt").write_bytes(b"keep-side")
+        (folder / "strips" / "000099.jpg.tmp").write_bytes(b"partial")
+        (folder / "extra").mkdir()
+        (folder / "extra" / "000000.jpg").write_bytes(b"not-a-strip")
+        (folder / "extra" / "state.jsonl").write_text("leave\n", encoding="utf-8")
+        assert wipe_training(folder, confirm=False) == []
+        assert _jpeg_bytes(folder) == stopped
+        ctl.arm_free_space()
+        assert ctl.free_space_armed is True
+        assert _jpeg_bytes(folder) == stopped
+        stranger = StripRecordControl(prefs_path=prefs)
+        assert stranger.confirm_free_space() == []
+        assert _jpeg_bytes(folder) == stopped
+        removed = ctl.confirm_free_space()
+        assert removed
+        assert _jpeg_bytes(folder) == {}
+        assert not (folder / "state.jsonl").exists()
+        assert not (folder / "meta.json").exists()
+        assert not (folder / "strips" / "000099.jpg.tmp").exists()
+        assert (folder / "notes.txt").read_bytes() == b"keep-me"
+        assert (folder / "strips" / "side.txt").read_bytes() == b"keep-side"
+        assert (folder / "extra" / "000000.jpg").read_bytes() == b"not-a-strip"
+        assert (folder / "extra" / "state.jsonl").read_text(encoding="utf-8") == "leave\n"
+        assert decoy.read_bytes() == b"not-this-folder"
+        assert _jpeg_bytes(other) != {}
+        assert prefs.is_file()
+        assert ctl.confirm_free_space() == []
+        assert (folder / "notes.txt").read_bytes() == b"keep-me"
+
+        from python.viz.nerd import render_panel
+        from python.viz.stage import STAGE_W, VizUI
+
+        ui_prefs = root / "ui_prefs.json"
+        (other / "keep.txt").write_bytes(b"keep-other")
+        (other / "strips" / "side.txt").write_bytes(b"keep-other-side")
+        other_before = _jpeg_bytes(other)
+        ui = VizUI()
+        ui.show_nerd = True
+        ui.nerd_tab = "live"
+        ui.record = StripRecordControl(prefs_path=ui_prefs, destination=str(other))
+        panel = render_panel({"engaged": True}, h=800, w=560, ui=ui)
+        assert panel.shape[0] == 800
+        ids = {h.get("id") for h in ui.nerd_hits if h.get("kind") == "record"}
+        assert {"start", "stop", "free", "confirm", "dest", "status"} <= ids
+
+        def click(ident: str) -> None:
+            hit = next(h for h in ui.nerd_hits if h.get("kind") == "record" and h.get("id") == ident)
+            rect = hit["rect"]
+            x = STAGE_W + (int(rect[0]) + int(rect[2])) // 2
+            y = (int(rect[1]) + int(rect[3])) // 2
+            assert ui.handle_click(x, y, stage_w=STAGE_W)
+
+        ui.feed_strip(frames, timestamps=_stamps(frames, 4.0), t=4.0, engaged=True)
+        assert ui.record.recording is False
+        assert ui.record.engaged is True
+        click("start")
+        assert ui.record.status_text() == "recording on"
+        ui.feed_strip(frames, timestamps=_stamps(frames, 4.2), t=4.2, engaged=True)
+        assert ui.record.recording is True
+        panel = render_panel({"engaged": True}, h=800, w=560, ui=ui)
+        mark = next(h for h in ui.nerd_hits if h.get("kind") == "record" and h.get("id") == "status")
+        mx = (int(mark["rect"][0]) + int(mark["rect"][2])) // 2
+        my = (int(mark["rect"][1]) + int(mark["rect"][3])) // 2
+        on_px = panel[my, mx]
+        assert int(on_px[1]) > int(on_px[2])
+        grown = _jpeg_bytes(other)
+        assert other_before.keys() <= grown.keys()
+        for name, data in other_before.items():
+            assert grown[name] == data
+        assert len(grown) > len(other_before)
+        click("stop")
+        assert ui.record.status_text() == "recording off"
+        assert ui.record.recording is False
+        held = _jpeg_bytes(other)
+        ui.feed_strip(frames, timestamps=_stamps(frames, 4.8), t=4.8, engaged=True)
+        assert ui.record.recording is False
+        assert _jpeg_bytes(other) == held
+        panel = render_panel({"engaged": True}, h=800, w=560, ui=ui)
+        mark = next(h for h in ui.nerd_hits if h.get("kind") == "record" and h.get("id") == "status")
+        mx = (int(mark["rect"][0]) + int(mark["rect"][2])) // 2
+        my = (int(mark["rect"][1]) + int(mark["rect"][3])) // 2
+        off_px = panel[my, mx]
+        assert int(off_px[2]) > int(off_px[1])
+        click("confirm")
+        assert _jpeg_bytes(other) == held
+        click("free")
+        assert ui.record.free_space_armed is True
+        assert _jpeg_bytes(other) == held
+        click("confirm")
+        assert _jpeg_bytes(other) == {}
+        assert not (other / "state.jsonl").exists()
+        assert not (other / "meta.json").exists()
+        assert (other / "keep.txt").read_bytes() == b"keep-other"
+        assert (other / "strips" / "side.txt").read_bytes() == b"keep-other-side"
+        assert decoy.read_bytes() == b"not-this-folder"
+        assert (folder / "notes.txt").read_bytes() == b"keep-me"
+        assert ui_prefs.is_file()
+
+
 def check_trainer_is_offline() -> None:
     files = (
         ROOT / "python" / "train" / "train_scene.py",
@@ -763,6 +1016,7 @@ def main() -> None:
     check_canvas_geometry()
     check_variable_rate_and_one_strip()
     check_timestamp_refusal_and_empty_sector()
+    check_append_and_confirm_wipe()
     check_sectors_and_ego_edge()
     check_rate_helpers_and_precision()
     check_assignment_and_planner()

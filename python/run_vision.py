@@ -125,6 +125,32 @@ def _path_world_from_vehicle(path_ego: list, vehicle, vdata: VehicleData | None 
 
 
 
+def _ask_strip_folder() -> str | None:
+    """Pick a strip folder. Cancel leaves the current folder in place."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception:
+        return None
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        try:
+            root.attributes("-topmost", True)
+        except Exception:
+            pass
+        chosen = filedialog.askdirectory(title="GVD training strips")
+    except Exception:
+        return None
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+    text = str(chosen or "").strip()
+    return text or None
+
+
 def _read_ui_prefs() -> dict:
     """Documents/GVD/gvd_ui_prefs.json — UI toggles; honor over forced defaults."""
     try:
@@ -354,6 +380,7 @@ def main() -> None:
     perc = ModularPerception(allow_synthetic=args.allow_synthetic_detect)
     e2e_policy = make_e2e()
     ui = VizUI()
+    ui.record_browser = _ask_strip_folder
     ui.debug.detector_id = str(args.detector or "auto")
     ui.debug.e2e_id = str(args.e2e_model or "auto")
     models_rt = ModelRuntime(detector_id="", e2e_id="")
@@ -914,6 +941,20 @@ def main() -> None:
                 f"state_write_skips={state_skips} "
                 f"release_cmd_skips={rel_skips}",
                 flush=True,
+            )
+
+            # Strip training is its own switch. Engage does not start or stop it.
+            ui.feed_strip(
+                getattr(bundle, "frames", None),
+                timestamps=getattr(bundle, "timestamps", None),
+                t=time.time(),
+                engaged=bool(engaged),
+                ego={"speed_mps": float(ego_v or 0.0)},
+                wheel={"steer": float(steer_in or 0.0)},
+                pedals={
+                    "throttle": float(throttle_in or 0.0),
+                    "brake": float(brake_in or 0.0),
+                },
             )
 
             # M4 ring + triggers

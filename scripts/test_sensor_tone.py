@@ -122,6 +122,12 @@ def main() -> None:
     # store path for sensor frames; recover_viewport_tone is the window grab.
     _assert_midgray_hood_stays((128, 118, 108), (236, 236, 236))
     _assert_midgray_hood_stays((140, 132, 124), (220, 220, 220))
+    # Sky (190, 200, 210) sits a few levels over the gate. The 42%–93% band
+    # is mostly that sky, so its 40th percentile used to open the curve,
+    # crush asphalt (128, 118, 108) to about (40, 32, 25), paint the sky,
+    # and grow the fit from 2 lanes to 4. A dark hood reproduces it. The
+    # road sample leaves this frame mid gray at 2 lanes.
+    _assert_midgray_under_bright_sky()
     print("test_sensor_tone: OK")
 
 
@@ -228,6 +234,29 @@ def _assert_midgray_hood_stays(
     assert np.array_equal(via, raw), tuple(int(v) for v in via[360, 320])
     assert np.array_equal(window, raw), tuple(int(v) for v in window[360, 320])
     assert tuple(int(v) for v in via[360, 320]) == asphalt
+    after = estimate_lanes(via)
+    assert after.conf >= 0.9 and len(after.lanes_bev) == 2, after
+
+
+def _assert_midgray_under_bright_sky() -> None:
+    raw = _highway(
+        asphalt=(128, 118, 108),
+        yellow=(40, 210, 235),
+        white=(245, 245, 245),
+        sky=(190, 200, 210),
+        width=4,
+        hood=(35, 35, 38),
+    )
+    before = estimate_lanes(raw)
+    assert before.conf >= 0.9 and len(before.lanes_bev) == 2, before
+    via = colour_to_bgr(np.ascontiguousarray(raw[:, :, ::-1]))
+    window = recover_viewport_tone(raw)
+    assert via is not None
+    road = tuple(int(v) for v in via[360, 320])
+    assert np.array_equal(via, raw), road
+    assert np.array_equal(window, raw), tuple(int(v) for v in window[360, 320])
+    assert road == (128, 118, 108)
+    assert int(lane_paint_mask(via)[30, 320]) == 0, "sky must stay off the paint mask"
     after = estimate_lanes(via)
     assert after.conf >= 0.9 and len(after.lanes_bev) == 2, after
 

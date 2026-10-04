@@ -719,11 +719,21 @@ _TONE_ANCHOR_PCT = 78.0
 _TONE_TARGET = 136.0
 _TONE_GAMMA_CAP = 9.0
 _TONE_SAT_MAX = 22.0
-_TONE_Y0 = 0.42
 # Highway geometry paints the hood from here to the bottom. That panel is
 # low-saturation and can be near white while the asphalt is already mid gray.
 # It is not the road sample.
 _TONE_HOOD_TOP = 0.93
+# The rectangle from 42% to the hood is mostly sky. The road is a triangle
+# under the vanishing point, so the 40th percentile of that rectangle is the
+# sky (186.85 on the test sky, just under the gate). A sky a few levels
+# brighter then sets the curve and crushes a mid-gray road. The sample is
+# this trapezoid: below the vanishing point, inside the sky corners, above
+# the hood.
+_TONE_ROAD_TOP = 0.75
+_TONE_ROAD_TOP_X0 = 0.25
+_TONE_ROAD_TOP_X1 = 0.75
+_TONE_ROAD_BOT_X0 = 0.08
+_TONE_ROAD_BOT_X1 = 0.92
 
 
 def _shadow_luma_blue(bgr: np.ndarray) -> tuple[float, float] | None:
@@ -770,14 +780,29 @@ def companion_frame_is_flash(new_bgr: np.ndarray, held_bgr: np.ndarray | None) -
     return (new_luma - held_luma) >= 18.0 and (new_blue - held_blue) >= 18.0
 
 
-def _tone_road_band(bgr: np.ndarray) -> np.ndarray:
-    """Lower frame above the hood. The hood is not the road."""
+def _tone_road_pixels(bgr: np.ndarray) -> np.ndarray:
+    """Road-body pixels above the hood, shape ``(N, 3)``.
+
+    A full-width band in that range counts the sky beside the road. This
+    trapezoid stays on the asphalt.
+    """
     height = int(bgr.shape[0])
-    y0 = int(height * _TONE_Y0)
+    width = int(bgr.shape[1])
+    y0 = int(height * _TONE_ROAD_TOP)
     y1 = int(height * _TONE_HOOD_TOP)
-    if y1 <= y0 + 8:
-        return bgr[y0:]
-    return bgr[y0:y1]
+    if y1 <= y0 + 4 or width < 8:
+        return bgr.reshape(-1, 3)
+    rows = bgr[y0:y1]
+    span = float(max(int(rows.shape[0]) - 1, 1))
+    t = np.arange(int(rows.shape[0]), dtype=np.float32) / span
+    left = width * (_TONE_ROAD_TOP_X0 + t * (_TONE_ROAD_BOT_X0 - _TONE_ROAD_TOP_X0))
+    right = width * (_TONE_ROAD_TOP_X1 + t * (_TONE_ROAD_BOT_X1 - _TONE_ROAD_TOP_X1))
+    xs = np.arange(width, dtype=np.float32)
+    mask = (xs[None, :] >= left[:, None]) & (xs[None, :] < right[:, None])
+    picked = rows[mask]
+    if int(picked.shape[0]) < 32:
+        return rows.reshape(-1, 3)
+    return np.ascontiguousarray(picked)
 
 
 def recover_viewport_tone(bgr: np.ndarray) -> np.ndarray:
@@ -787,27 +812,27 @@ def recover_viewport_tone(bgr: np.ndarray) -> np.ndarray:
     road and the stripe together, and the stripe drops through the white-paint
     cut. A power curve on a near-white, low-contrast road does the opposite:
     the road lands near mid gray and the few brighter stripe levels stay above
-    that cut. The sample is the road body above the hood. A bright gray hood
-    is low saturation and must not set the curve. A frame whose road is
-    already mid gray is returned as it was. An all-zero buffer is returned
-    as it was.
+    that cut. The sample is the road body above the hood, inside the sky
+    corners. A frame whose road is already mid gray is returned as it was.
+    An all-zero buffer is returned as it was.
     """
     if not isinstance(bgr, np.ndarray) or bgr.ndim != 3 or bgr.shape[2] != 3:
         return bgr
     # Nothing in the white-paint range. Mid gray, dark, and all-zero stay put.
     if bgr.dtype != np.uint8 or bgr.size == 0 or int(bgr.max()) < int(_TONE_P40_MIN):
         return bgr
-    band = _tone_road_band(bgr)
-    if band.size == 0:
+    pixels = _tone_road_pixels(bgr)
+    if pixels.size == 0:
         return bgr
-    sample = band.astype(np.float32, copy=False)
-    luma = 0.114 * sample[:, :, 0] + 0.587 * sample[:, :, 1] + 0.299 * sample[:, :, 2]
-    # Road body, not the low-saturation hood. Warm asphalt sits above the
-    # low-sat cut, so a hood-only sample would gamma-crush a mid-gray road.
+    sample = pixels.astype(np.float32, copy=False)
+    luma = 0.114 * sample[:, 0] + 0.587 * sample[:, 1] + 0.299 * sample[:, 2]
+    # Road body. The 42%–93% rectangle's 40th percentile is the sky, and warm
+    # asphalt sits above the low-sat cut, so either of those samples
+    # gamma-crushes a mid-gray road.
     if float(np.percentile(luma, 40)) < _TONE_P40_MIN:
         return bgr
-    hi = sample.max(axis=2)
-    lo = sample.min(axis=2)
+    hi = sample.max(axis=1)
+    lo = sample.min(axis=1)
     sat = np.where(hi > 0.0, (hi - lo) * 255.0 / np.maximum(hi, 1.0), 0.0)
     chosen = luma[sat <= _TONE_SAT_MAX]
     if int(chosen.size) < max(32, int(luma.size) // 20):
@@ -1548,7 +1573,8 @@ class BeamNGPyBackend:
                     f"update_priority {prios}; "
                     f"grab_div main={self._grab_div['main']} wide={self._grab_div['wide']} "
                     f"narrow={self._grab_div['narrow']} side={self._side_grab_div} "
-                    f"rear={self._rear_grab_div}; stream_raw main; "
+                    f"rear={self._rear_grab_div}; "
+                    f"stream_raw offscreen requested_update_time 1; "
                     f"GVD→BeamNG vehicle-space convert; depth/semantic OFF)."
                 )
             else:

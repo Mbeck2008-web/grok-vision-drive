@@ -743,7 +743,7 @@ def check_beamngpy_open_passes_near_far() -> None:
         assert "grab_div main=1" in log
         assert "wide=16" in log
         assert "narrow=16" in log
-        assert "stream_raw main" in log
+        assert "stream_raw offscreen requested_update_time 1" in log
         assert "rear=16" in log
         assert "depth/semantic OFF" in log
         names = [n for n, _ in captured]

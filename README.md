@@ -432,3 +432,5 @@ Delivered rig frames stitch left to right around the car as repeatL, pillarL, wi
 ## 1.7.7
 
 A sun-blown camera colour buffer is matched to the viewport picture once, on the frame the lane fit, the model, the CAMS tiles, and the PIP all read. Near-white pavement comes down to mid gray and a thin lane stripe stays separable from the road. A frame that is already mid gray is left as it is. A missing or all-zero camera stays empty.
+
+Companion colour is a shared-memory read of an offscreen sensor update. It does not send an ad-hoc render request, so that request cannot step the game view's exposure for one frame. The hitch is unchanged: main every tick, one companion on its slot, last frame kept in between.

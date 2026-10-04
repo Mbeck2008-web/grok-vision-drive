@@ -16,11 +16,14 @@
 #   repeatL: ÷16 phase 5
 #   rear:    ÷16 phase 6 (no side on this slot)
 #   repeatR: ÷16 phase 7
-# Far / GPU (stream_raw on main; wide/narrow poll; never is_streaming=False):
-#   narrow: 800 @ -1     priority 0.5   (on-demand; next far hitch 400 only if live unique-frame Hz <10)
+# Far / GPU (stream_raw for every cam; never is_streaming=False; never ad-hoc):
+#   Yaml -1 is the hitch (Python reads ÷16). The sensor is attached at a slow
+#   offscreen period so SendAdHocRequestCamera is not sent. That request flashes
+#   the game view's exposure for one frame.
+#   narrow: 800 @ -1     priority 0.5   (hitch read; next far hitch 400 only if live unique-frame Hz <10)
 #   main:   300 @ 0.067  priority 0.0
-#   wide:   300 @ -1     priority 0.5   (on-demand; no auto GPU)
-#   pillarL / pillarR / repeatL / repeatR / rear: 100 @ -1 (on-demand; no auto GPU)
+#   wide:   300 @ -1     priority 0.5
+#   pillarL / pillarR / repeatL / repeatR / rear: 100 @ -1
 # Optional per-cam near_far_planes: [near_m, far_m] still clamped to the role band.
 # Hitch: forward grab stagger + on-demand sides/rear — not resolution. Depth OFF.
 origin_offset: [0.0, 0.0, 0.0]

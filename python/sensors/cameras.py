@@ -29,7 +29,10 @@ FORWARD_CAM_IDS = frozenset(("narrow", "main", "wide"))
 DEFAULT_NEAR_M = 0.05
 BNGPY_DEFAULT_FAR_M = 100.0
 FORWARD_UPDATE_S = 0.067  # ~15 Hz suggestion to the Tech sensor manager
-ON_DEMAND_UPDATE_S = -1.0  # no auto GPU update; ad-hoc poll only (sides/rear)
+ON_DEMAND_UPDATE_S = -1.0  # yaml: sample on the hitch, not every tick
+# Offscreen sensor period when yaml says on-demand. Not an ad-hoc viewport render.
+# SendAdHocRequestCamera steps the game view's exposure for one frame (blue shadows).
+COMPANION_OFFSCREEN_UPDATE_S = 1.0
 SIDE_UPDATE_S = ON_DEMAND_UPDATE_S
 REAR_UPDATE_S = ON_DEMAND_UPDATE_S
 MAIN_GRAB_DIV = 1
@@ -40,11 +43,12 @@ MAIN_GRAB_DIV = 1
 # companions and it does not freeze the first buffer. A zero colour buffer is
 # unrendered, not a picture: the slot stays missing until a real frame arrives,
 # then CAMS keeps that last frame on the ticks that do not poll the cam.
-# Main is still the only stream_raw, every tick.
-# On-demand companions (requested_update_time < 0) do not render from poll()
-# or stream_raw() — BeamNGpy documents that a negative rate may have taken no
-# readings. Those cams get one in-flight ad-hoc request. A read that exceeds
-# CAM_READ_BUDGET_S does not stall the grab; the last real frame stays painted.
+# Main is stream_raw every tick. A live companion is stream_raw on its hitch slot.
+# Yaml -1 is the hitch, not a viewport render. The sensor is attached at
+# COMPANION_OFFSCREEN_UPDATE_S and read with stream_raw. SendAdHocRequestCamera
+# is not used: that render steps the game view's exposure for one frame.
+# A read that exceeds CAM_READ_BUDGET_S does not stall the grab; the last
+# real frame stays painted.
 CAM_READ_BUDGET_S = 0.05
 _OWED_CAP = 7  # one slot per companion; the owed queue cannot grow past the rig
 WIDE_GRAB_DIV = 16
@@ -653,8 +657,14 @@ def beamng_camera_sensor_kwargs(
     for callers but never written False.
     """
     _ = streaming  # kept so call sites stay stable; never set is_streaming False
+    # A negative rate would need SendAdHocRequestCamera to get a picture.
+    # That request renders through the game view and flashes exposure for one
+    # frame. The sensor still updates offscreen; GVD only reads it on the hitch.
+    rate = float(update_s)
+    if rate < 0:
+        rate = COMPANION_OFFSCREEN_UPDATE_S
     return {
-        "requested_update_time": float(update_s),
+        "requested_update_time": rate,
         "update_priority": float(min(1.0, max(0.0, update_priority))),
         "pos": pos,
         "dir": direction,
@@ -1437,7 +1447,10 @@ class BeamNGPyBackend:
         if not self._logged:
             if self._ok:
                 clips = " ".join(f"{k}={v[1]:g}" for k, v in self._clip_planes.items())
-                rates = " ".join(f"{k}={v:g}" for k, v in self._update_s.items())
+                rates = " ".join(
+                    f"{k}={float(self._sensor_kwargs.get(k, {}).get('requested_update_time', v)):g}"
+                    for k, v in self._update_s.items()
+                )
                 prios = " ".join(f"{k}={v:g}" for k, v in self._update_priority.items())
                 print(
                     f"[GVD] beamngpy attached {attached} color Camera(s) from cameras.yaml "
@@ -1889,14 +1902,25 @@ class BeamNGPyBackend:
         bgr = _reading_colour(images, self._resolution.get(cid)) if isinstance(images, dict) else None
         self._publish_read(cid, bgr, ts, frames, timestamps, health, unique_ids)
 
+    def _reads_shared_memory(self, cid: str, cam: Any) -> bool:
+        """Main, and any live camera that also offers ad-hoc.
+
+        Ad-hoc is a viewport render. stream_raw only reads the offscreen buffer.
+        A legacy companion with poll and no shared memory stays on poll.
+        """
+        if not hasattr(cam, "stream_raw"):
+            return False
+        return cid == "main" or camera_uses_adhoc(cam)
+
     def _bounded_sensor_colour(self, cid: str, cam: Any) -> np.ndarray | None:
-        """stream_raw (main) or poll (legacy companion), bounded by CAM_READ_BUDGET_S."""
+        """stream_raw when the buffer is shared. Legacy poll has no ad-hoc API.
+
+        SendAdHocRequestCamera is not used. It renders on the game view and
+        the exposure flashes blue for one frame.
+        """
         res = self._resolution.get(cid)
 
-        if cid == "main":
-            if not hasattr(cam, "stream_raw"):
-                return None
-
+        if self._reads_shared_memory(cid, cam):
             def _stream() -> Any:
                 try:
                     return cam.stream_raw()
@@ -1943,38 +1967,14 @@ class BeamNGPyBackend:
         unique_ids: list[str] = []
         self._read_blocked = False
         # Soft Esc and Engage share the hitch: main stream_raw every tick, at
-        # most one companion request. Ticks that skip a cam keep its last real
+        # most one companion read. Ticks that skip a cam keep its last real
         # frame for CAMS. A zero buffer is not stored and does not count as OK.
-        # On-demand cams render through one ad-hoc request. poll() on a
-        # negative requested_update_time does not take that reading, and it
-        # can sit on the GE socket for ~0.5–1 s.
+        # Companions are not SendAdHocRequestCamera. That render steps the game
+        # view's exposure for one frame (bright blue shadows). They update
+        # offscreen; this grab only reads shared memory on the hitch.
         soft_esc_main = soft_esc_colour_main_only()
         self._reap_if_done()
-        self._harvest_adhoc(ts, frames, timestamps, health, unique_ids)
-        due_companion = next(
-            (
-                cid
-                for cid in CAM_IDS
-                if cid != "main"
-                and cid in self._sensors
-                and camera_uses_adhoc(self._sensors[cid])
-                and self._grab_this_tick(cid, grab_i)
-            ),
-            None,
-        )
-        send_cid = due_companion if due_companion is not None else (self._owed[0] if self._owed else None)
-        if send_cid is not None:
-            send_cam = self._sensors.get(send_cid)
-            if send_cam is not None and camera_uses_adhoc(send_cam):
-                if self._kick_adhoc(send_cid, send_cam):
-                    companion_polled = True
-                else:
-                    self._owe(send_cid)
         for cid, cam in self._sensors.items():
-            if cid != "main" and camera_uses_adhoc(cam):
-                if cid not in frames:
-                    self._reuse_cached(cid, frames, timestamps, health, failed=False)
-                continue
             if not self._grab_this_tick(cid, grab_i):
                 self._reuse_cached(cid, frames, timestamps, health, failed=False)
                 continue

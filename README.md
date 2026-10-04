@@ -58,28 +58,44 @@ The settled game view. Soft Esc parked.
 
 ![rear](docs/cams/rear.jpg)
 
-## Alpha 1.7.7
-
-This is **alpha** — may break / not work; improves with fixes.
-
-Canonical pin **1.7.7** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Untagged retail zips use `1.7.7-alpha-<sha>`.
-
-**Versioning** (this line stays **alpha** until a later non-alpha release):
-
-- **point** bumps (`1.7.x`) = fixes / small UI
-- **main alpha** bump (`1.x.0`) = features / core / UI overhaul
-
 ## Recent changes (alpha 1.7.7)
 
 Catch-up from **1.0.1**. Each feature merge since that pin is one main step. The throttle fix is the point in between. Live Alt+G, Tech 8-cam, FFB, and QSV stay **UNPROVEN**.
 
-## 1.7.3 side cameras
+## Still in force from 1.0.1
 
-- Pillar yaws turn 10 degrees further back, from 68 to 78. Fender repeaters move 0.15 m back so less of the car is in frame.
+- A leftover `gvd_engage.json` `engaged:true` does not start the car. Python honors that flag only while its timestamp is about 2.5 s fresh. Lua refreshes the stamp every 0.5 s while the in-game latch is on, and will not write true over a newer supervisor false.
+- `--policy e2e` with no `models/e2e_current.onnx` holds the brake (`veto:e2e_stub`) and stays engaged. Shadow keeps the modular command.
+- `cmd_applied` is true only when the Lua ack is this `seq` or up to 5 behind.
+- Retail stays one window (`cams=1/8`). Tech 8-cam is the other product. `--backend auto` does not pick Tech because `beamngpy` imports.
 
-## 1.7.1 camera grid
+## 1.1.0 cabin
 
-- The CAMS tab is a 3×3 with an empty center, and the camera views on that tab are dimmed a little.
+- Agent boxes are empty solids. LEAD and BRAKE stay. The forecast is a thin line with no disc and no bright center. The app, the strip, and the GVD VISION title share one glance word: OFF / ON / HOLD / DRIVE / MISMATCH.
+
+## 1.2.0 draw range
+
+- Cabin ground, lanes, curbs, signs, and agent boxes follow the camera far distance, ahead of the car and behind it. The chase camera stays just behind the car. The ice corridor ends where the path ends.
+
+## 1.3.0 Tech hold
+
+- Tech attach waits until the research port is listening, the mod is unpacked, a vehicle is spawned, and the lua bus is fresh. It does not start a second BeamNG.tech.
+
+## 1.4.0 lanes and CAMS
+
+- Yellow and white lane lines both count. A CAMS slot keeps its last good frame instead of going blank. A missing camera stays labelled missing.
+
+## 1.4.1 own throttle and Neutral
+
+- Engage no longer treats GVD's own throttle echo as the driver lifting off. A hold does not leave the gearbox in reverse.
+
+## 1.5.0 companion cameras
+
+- The companion cameras stay on their own side of the car. The rear overlay is the rear camera only. Lane paint follows the fit instead of a copied neighbour.
+
+## 1.6.0 predicted path
+
+- Soft Esc follows a predicted path for lanes, cars, signs, and lights, including where the cameras cannot see them yet. The wheel angle is not the path.
 
 ## 1.7.0 lane points and bus engage
 
@@ -94,40 +110,13 @@ Catch-up from **1.0.1**. Each feature merge since that pin is one main step. The
 - Tech drive is arcade. A hold, a stop, or AEB sets the parking brake and releases the service brake, so gear 0 plus a held brake is not reverse.
 - `python scripts/bot_engage.py on` writes `gvd_bot_engage.json` in the live bus folder. `off` clears it. A new `on` counts only while its timestamp is about 2.5 s old, then the latch stays on. A leftover true does not start the car. A driver override or a veto that already drops Engage clears the latch. BeamNG.tech stays up.
 
-## 1.6.0 predicted path
+## 1.7.1 camera grid
 
-- Soft Esc follows a predicted path for lanes, cars, signs, and lights, including where the cameras cannot see them yet. The wheel angle is not the path.
+- The CAMS tab is a 3×3 with an empty center, and the camera views on that tab are dimmed a little.
 
-## 1.5.0 companion cameras
+## 1.7.3 side cameras
 
-- The companion cameras stay on their own side of the car. The rear overlay is the rear camera only. Lane paint follows the fit instead of a copied neighbour.
-
-## 1.4.1 own throttle and Neutral
-
-- Engage no longer treats GVD's own throttle echo as the driver lifting off. A hold does not leave the gearbox in reverse.
-
-## 1.4.0 lanes and CAMS
-
-- Yellow and white lane lines both count. A CAMS slot keeps its last good frame instead of going blank. A missing camera stays labelled missing.
-
-## 1.3.0 Tech hold
-
-- Tech attach waits until the research port is listening, the mod is unpacked, a vehicle is spawned, and the lua bus is fresh. It does not start a second BeamNG.tech.
-
-## 1.2.0 draw range
-
-- Cabin ground, lanes, curbs, signs, and agent boxes follow the camera far distance, ahead of the car and behind it. The chase camera stays just behind the car. The ice corridor ends where the path ends.
-
-## 1.1.0 cabin
-
-- Agent boxes are empty solids. LEAD and BRAKE stay. The forecast is a thin line with no disc and no bright center. The app, the strip, and the GVD VISION title share one glance word: OFF / ON / HOLD / DRIVE / MISMATCH.
-
-## Still in force from 1.0.1
-
-- A leftover `gvd_engage.json` `engaged:true` does not start the car. Python honors that flag only while its timestamp is about 2.5 s fresh. Lua refreshes the stamp every 0.5 s while the in-game latch is on, and will not write true over a newer supervisor false.
-- `--policy e2e` with no `models/e2e_current.onnx` holds the brake (`veto:e2e_stub`) and stays engaged. Shadow keeps the modular command.
-- `cmd_applied` is true only when the Lua ack is this `seq` or up to 5 behind.
-- Retail stays one window (`cams=1/8`). Tech 8-cam is the other product. `--backend auto` does not pick Tech because `beamngpy` imports.
+- Pillar yaws turn 10 degrees further back, from 68 to 78. Fender repeaters move 0.15 m back so less of the car is in frame.
 
 ## 1.7.4 wheel rotation
 
@@ -152,6 +141,17 @@ Tech control leaves the gearbox in arcade. `vehicle.control` has no gear field, 
 A bright gray hood is not the road sample. Mid-gray asphalt under that hood stays mid gray, and the lane fit keeps the lanes it had. The companion flash check reads the buffer before the tone curve. A washed companion that is not the blue flash is tone-matched and stored. The attach log prints the sensor `requested_update_time` (1 s for a yaml hitch of -1). Companions are that offscreen `stream_raw`.
 
 The tone sample is the road under the sky and above the hood. Sky (190, 200, 210) over asphalt (128, 118, 108) stays mid gray with a dark hood, the lane fit stays at 2 lanes, and that sky stays off the white-paint mask.
+
+## Alpha 1.7.7
+
+This is **alpha** — may break / not work; improves with fixes.
+
+Canonical pin **1.7.7** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Untagged retail zips use `1.7.7-alpha-<sha>`.
+
+**Versioning** (this line stays **alpha** until a later non-alpha release):
+
+- **point** bumps (`1.7.x`) = fixes / small UI
+- **main alpha** bump (`1.x.0`) = features / core / UI overhaul
 
 ## Technical detail
 

@@ -49,6 +49,7 @@ from python.perception.road_model import lanes_ext_for_live, road_edges
 from python.viz.debug_draw import cabin_drive_word
 from python.viz.review_log import ReviewCapture
 from python.viz.nerd import image_point_from_window_mouse
+from python.train.scene_net import live_strip_fields
 from python.viz.stage import drawn_lane_records
 from python.sensors.cameras import CAM_IDS, CamHealth, bundle_tick_frames
 from python.runtime.debug_opts import apply_to_command, apply_to_perception
@@ -123,6 +124,32 @@ def _path_world_from_vehicle(path_ego: list, vehicle, vdata: VehicleData | None 
     except Exception:
         return None
 
+
+
+def _ask_strip_folder() -> str | None:
+    """Pick a strip folder. Cancel leaves the current folder in place."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception:
+        return None
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        try:
+            root.attributes("-topmost", True)
+        except Exception:
+            pass
+        chosen = filedialog.askdirectory(title="GVD training strips")
+    except Exception:
+        return None
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+    text = str(chosen or "").strip()
+    return text or None
 
 
 def _read_ui_prefs() -> dict:
@@ -354,6 +381,7 @@ def main() -> None:
     perc = ModularPerception(allow_synthetic=args.allow_synthetic_detect)
     e2e_policy = make_e2e()
     ui = VizUI()
+    ui.record_browser = _ask_strip_folder
     ui.debug.detector_id = str(args.detector or "auto")
     ui.debug.e2e_id = str(args.e2e_model or "auto")
     models_rt = ModelRuntime(detector_id="", e2e_id="")
@@ -914,6 +942,27 @@ def main() -> None:
                 f"state_write_skips={state_skips} "
                 f"release_cmd_skips={rel_skips}",
                 flush=True,
+            )
+
+            # Strip training is its own switch. Engage does not start or stop it.
+            fields = live_strip_fields(
+                lanes=pout.lanes_bev,
+                tracks=pout.tracks,
+                signs=pout.signs,
+                steer=float(steer_in or 0.0),
+                throttle=float(throttle_in or 0.0),
+                brake=float(brake_in or 0.0),
+                override_reason=ovr.reason,
+            )
+            ui.feed_strip(
+                getattr(bundle, "frames", None),
+                timestamps=getattr(bundle, "timestamps", None),
+                t=time.time(),
+                engaged=bool(engaged),
+                ego={"speed_mps": float(ego_v or 0.0)},
+                wheel=fields["wheel"],
+                pedals=fields["pedals"],
+                tech=fields["tech"],
             )
 
             # M4 ring + triggers

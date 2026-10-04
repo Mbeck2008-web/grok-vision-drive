@@ -1,1 +1,1 @@
-"""Optional offline trainers (M5 E2E)."""
+"""Offline trainers. Scene strips use python.train.train_scene."""

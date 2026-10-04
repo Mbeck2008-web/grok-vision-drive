@@ -102,6 +102,10 @@ class VizUI:
     nerd_width: int = NERD_WIDTH
     # Recent DRIVE-tab pedal samples. The viz appends one per frame; the drive loop does not read it.
     pedal_trace: list = field(default_factory=list)
+    # Strip training recorder. None until the LIVE controls or the drive loop ask for it.
+    record: Any = None
+    # Optional folder picker. Cancel returns a falsy value and leaves the folder in place.
+    record_browser: Any = None
 
     def toggle_nerd(self) -> None:
         self.show_nerd = not self.show_nerd
@@ -259,7 +263,66 @@ class VizUI:
                 self.debug.toggle(row)
             self.sync_layers_from_debug()
             return True
+        if hit.get("kind") == "record":
+            self._handle_record_hit(str(hit.get("id") or ""))
+            return True
         return False
+
+    def ensure_record(self) -> Any:
+        if self.record is None:
+            from python.data.strip_writer import StripRecordControl
+
+            self.record = StripRecordControl()
+        return self.record
+
+    def feed_strip(
+        self,
+        frames: Any,
+        *,
+        timestamps: Any = None,
+        t: float,
+        engaged: bool = False,
+        ego: Any = None,
+        wheel: Any = None,
+        pedals: Any = None,
+        tech: Any = None,
+    ) -> Any:
+        """Offer one tick to the strip recorder. Engage does not start or stop it."""
+        try:
+            rec = self.ensure_record()
+            rec.note_engaged(engaged)
+            return rec.offer(
+                frames,
+                t=t,
+                timestamps=timestamps,
+                ego=ego,
+                wheel=wheel,
+                pedals=pedals,
+                tech=tech,
+            )
+        except Exception:
+            return None
+
+    def _handle_record_hit(self, ident: str) -> None:
+        try:
+            rec = self.ensure_record()
+            if ident == "start":
+                rec.start()
+            elif ident == "stop":
+                rec.stop()
+            elif ident == "free":
+                rec.arm_free_space()
+            elif ident == "confirm":
+                rec.confirm_free_space()
+            elif ident == "dest":
+                ask = self.record_browser
+                if ask is None:
+                    return
+                chosen = ask()
+                if chosen:
+                    rec.set_destination(str(chosen))
+        except Exception:
+            return
 
     def handle_hover(self, x: int, y: int, *, stage_w: int) -> None:
         """Remember the selectable tab or row under the pointer."""
@@ -267,7 +330,7 @@ class VizUI:
             self.hover = None
             return
         hit = hit_test(self.nerd_hits, x - stage_w, y)
-        if not hit or hit.get("kind") not in ("tab", "row"):
+        if not hit or hit.get("kind") not in ("tab", "row", "record"):
             self.hover = None
             return
         self.hover = {

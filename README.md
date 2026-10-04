@@ -188,3 +188,34 @@ A sun-blown colour buffer is matched once, on the frame the lane fit, the model,
 ### Arcade
 
 Engage arms arcade once. A failed arm is retried on a later tick. The release does not latch the drive arm, and the handoff restores arcade for the player. The control message omits gear. Throttle releases the parking brake and the clutch. A hold, a stop, or AEB sets the parking brake and releases the service brake. The drive arm releases the parking brake and the clutch, and it leaves the gearbox mode alone. Retail queues shifter mode 2 once per vehicle. Mode 2 is arcade.
+
+### Training strip
+
+The scene recorder writes one 2272×192 JPEG for each tick that arrives, and one `state.jsonl` line with that timestamp, the seconds since the previous strip, ego, wheel, and pedals. Tech labels are on the line when the tick has them. The file keeps the machine's own rate. 5 Hz is what this desktop is expected to record, and it is not a requirement of the file. A camera that missed the tick is an empty sector. A tick whose picture timestamps disagree is refused.
+
+The vision window LIVE tab has Start recording and Stop recording. The status shows recording on or recording off. Recording keeps going while Engage is on, and Engage does not start or stop it. The folder is remembered across restarts, including a path on another drive. Starting again only adds files under new names. Free up space does nothing until Confirm, and Confirm deletes the training files in that folder only. Stop, a restart, and a destination change leave the old files where they are.
+
+Six sectors are 256×192 (repeatL, pillarL, main, narrow, pillarR, repeatR). Wide and rear are 340×192. Seven gaps are 8 px. The scene net crops those sectors, letterboxes the wide ones to 256×192, and steps a GRU with the real seconds since the previous strip. It predicts lanes, curbs, cars, signs, and lights, including ones the cameras cannot fully see. The hardcoded path planner turns that scene into the path and remains the driver. Training is `python -m python.train.train_scene`. It leaves BeamNG running. Compute 6.1 stays FP32. Compute 7.0 and newer select automatic mixed precision. Both export the same ONNX graph, `models/e2e_scene.onnx`. Wheel and pedals can drop a bad moment from the loss. They are not a loss term. Before the first step the trainer measures the strip directory and free VRAM and shrinks the batch until the step fits. When the card cannot hold one step and the machine has more CPU RAM, training uses the CPU and the window marks that path not recommended. A fit on the GPU stays on the GPU. The window updates time left, loss, learning rate, steps per second, and VRAM or RAM in use. It also shows recorded hours and minutes, summed from each line's dt_s in that folder. A new session is included. An empty folder shows 0 hours 0 minutes. The panel uses the supervisor's dark ground, ice type, and row spacing. Its loss graph is the steps of this run. Before a run it shows the recorded duration and sits idle.
+
+### Credits
+
+GVD uses these outside projects. Each one is its authors' work.
+
+- [BeamNG.drive](https://www.beamng.com/). Retail play captures the BeamNG.drive window.
+- [BeamNG.tech](https://beamng.tech/). The eight-camera session runs in BeamNG.tech.
+- [BeamNGpy](https://github.com/BeamNG/BeamNGpy). Tech sessions, cameras, and electrics use BeamNGpy.
+- [NumPy](https://numpy.org/). Frames and the planner math are NumPy arrays.
+- [OpenCV](https://opencv.org/). The vision window, strip JPEGs, lane fit, and training panel use OpenCV.
+- [PyYAML](https://pyyaml.org/). Config files are loaded with PyYAML.
+- [PyTorch](https://pytorch.org/). Scene-net training and ONNX export use PyTorch.
+- [ONNX](https://onnx.ai/). The exported scene graph and the detector files are ONNX.
+- [ONNX Runtime](https://onnxruntime.ai/). Play time runs those graphs with ONNX Runtime.
+- [Ultralytics](https://github.com/ultralytics/ultralytics). The shipped YOLOv8n detector is an Ultralytics checkpoint, and the ultra path loads it with their library.
+- [YOLOX](https://github.com/Megvii-BaseDetection/YOLOX). An optional detector path reads a Megvii YOLOX ONNX file.
+- [Foxglove SDK](https://github.com/foxglove/foxglove-sdk). An optional live view publishes with the Foxglove SDK.
+- [BetterCam](https://github.com/RootKit-Org/BetterCam). Windows window capture uses BetterCam.
+- [mss](https://github.com/BoboTiG/python-mss). Window capture uses mss when BetterCam is unavailable.
+- [pywin32](https://github.com/mhammond/pywin32). Windows matches the BeamNG window title with pywin32.
+- [FFmpeg](https://ffmpeg.org/). Review clips are encoded with FFmpeg when it is on PATH.
+
+GVD's license is MIT (`LICENSE`). Detector weight notices are in `models/NOTICE.txt`.

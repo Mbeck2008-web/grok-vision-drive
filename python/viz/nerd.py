@@ -276,6 +276,7 @@ def render_panel(
     except Exception:
         trace = [{"thr": 0.0, "thr_pred_m": 0.0, "brk": 0.0, "brk_pred": 0.0}]
     live_limit = h - 28 - ROW_H
+    record_top = h - 16 - ROW_H - (ROW_H * 4)
     if tab == "keys":
         lines = _help_lines()
         y += 10
@@ -314,8 +315,9 @@ def render_panel(
             col = DIM if line.startswith(" ") else FG
             _put(img, _fit(line, w - PAD_X * 2, FS_BODY), (PAD_X, y), FS_BODY, col)
             y += ROW_H
-            if y > live_limit:
+            if y > record_top - 4:
                 break
+        _draw_record_block(img, ui, h, w, hits)
     _put(img, _fit("D drive  G viz  M model  A cams  [ ] tab  V hide", w - 24, FS_DIM), (12, h - 16), FS_DIM, DIM)
     if ui is not None:
         ui.nerd_hits = hits
@@ -540,6 +542,8 @@ def _hover_matches(item: dict[str, Any], hover: dict[str, Any]) -> bool:
         return int(item.get("i") or 0) == int(hover.get("i") or 0) and str(item.get("part") or "") == str(
             hover.get("part") or ""
         )
+    if kind == "record":
+        return str(item.get("id") or "") == str(hover.get("id") or "")
     return False
 
 
@@ -570,6 +574,14 @@ def paint_hover(img: np.ndarray, hits: list[dict[str, Any]] | None, hover: dict[
         if not rect:
             return
         _tint_rect(img, rect, HOVER_TINT, 0.28)
+        cv2.rectangle(img, (int(rect[0]), int(rect[1])), (int(rect[2]), int(rect[3])), HOVER_EDGE, 2)
+        return
+    if kind == "record":
+        item = next((h for h in hits if _hover_matches(h, hover)), None)
+        if item is None or not item.get("rect"):
+            return
+        rect = item["rect"]
+        _tint_rect(img, rect, HOVER_TINT, 0.35)
         cv2.rectangle(img, (int(rect[0]), int(rect[1])), (int(rect[2]), int(rect[3])), HOVER_EDGE, 2)
         return
     if kind != "row":
@@ -618,6 +630,8 @@ def _help_lines() -> list[str]:
         "  T  toggle BEV debug / chase 3/4 bird",
         "  C  manual clip",
         "  R  review capture (lanes, path, steer, engage, cameras)",
+        "  LIVE  Start recording / Stop recording (engage leaves it running)",
+        "  Free up space deletes that folder's strips only after Confirm",
         "  q  quit",
         "",
         "R writes Documents/GVD/review/<stamp>/tick_NNNNNN.json",
@@ -627,6 +641,66 @@ def _help_lines() -> list[str]:
         "DRIVE writes the command this tick.",
         "force engage is debug-only. Sim toy.",
     ]
+
+
+REC_ON = (50, 180, 60)
+REC_OFF = (50, 50, 190)
+
+
+def _record_button(
+    img: np.ndarray,
+    label: str,
+    x: int,
+    y: int,
+    hits: list[dict[str, Any]],
+    ident: str,
+    *,
+    on: bool,
+) -> int:
+    tw, _th = _text_size(label, FS_DIM)
+    rect = (x, y - 18, x + tw + 16, y + 6)
+    bg = ICE if on else (42, 38, 36)
+    fg = (16, 13, 12) if on else FG
+    cv2.rectangle(img, (rect[0], rect[1]), (rect[2], rect[3]), bg, -1)
+    _put(img, label, (x + 8, y), FS_DIM, fg)
+    hits.append({"kind": "record", "id": ident, "rect": rect})
+    return rect[2] + 8
+
+
+def _draw_record_block(
+    img: np.ndarray,
+    ui: Any,
+    h: int,
+    w: int,
+    hits: list[dict[str, Any]],
+) -> None:
+    """LIVE strip recorder. Start and Stop are separate from Free up space."""
+    rec = getattr(ui, "record", None) if ui is not None else None
+    recording = bool(getattr(rec, "recording", False))
+    armed = bool(getattr(rec, "free_space_armed", False))
+    dest = str(getattr(rec, "destination", "") or "")
+    if rec is not None and hasattr(rec, "status_text"):
+        status = str(rec.status_text())
+    else:
+        status = "recording on" if recording else "recording off"
+    if armed:
+        status = status + "  confirm to delete"
+    y = h - 16 - ROW_H - (ROW_H * 4) + 22
+    mark = (PAD_X, y - 16, PAD_X + 18, y + 2)
+    cv2.rectangle(img, (mark[0], mark[1]), (mark[2], mark[3]), REC_ON if recording else REC_OFF, -1)
+    hits.append({"kind": "record", "id": "status", "rect": mark})
+    _put(img, _fit(status, w - PAD_X * 2 - 28, FS_BODY), (PAD_X + 24, y), FS_BODY, FG)
+    y += ROW_H
+    x = _record_button(img, "Start recording", PAD_X, y, hits, "start", on=recording)
+    _record_button(img, "Stop recording", x, y, hits, "stop", on=not recording)
+    y += ROW_H
+    shown = dest if dest else "(no folder)"
+    path_rect = (PAD_X, y - 20, w - PAD_X, y + 6)
+    _put(img, _fit(shown, w - PAD_X * 2, FS_DIM), (PAD_X, y), FS_DIM, ICE if dest else DIM)
+    hits.append({"kind": "record", "id": "dest", "rect": path_rect})
+    y += ROW_H
+    x = _record_button(img, "Free up space", PAD_X, y, hits, "free", on=armed)
+    _record_button(img, "Confirm", x, y, hits, "confirm", on=armed)
 
 
 def _vehicle_line(s: dict[str, Any]) -> str:

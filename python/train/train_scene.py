@@ -296,6 +296,7 @@ def train_directory(
     own_view = view is None
     if view is None:
         view = TrainWindow()
+    view.load_folder(root)
 
     def _empty(precision: str = "fp32") -> dict[str, Any]:
         if export_path is not None:

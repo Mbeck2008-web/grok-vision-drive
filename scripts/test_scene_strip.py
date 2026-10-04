@@ -68,8 +68,10 @@ from python.train.scene_net import (  # noqa: E402
 from python.train.status_window import (  # noqa: E402
     TrainStatus,
     TrainWindow,
+    format_recorded_hm,
     format_status,
     predict_eta_s,
+    read_recorded_seconds,
     steps_per_second,
 )
 from python.train.train_scene import train_directory  # noqa: E402
@@ -661,6 +663,94 @@ def check_fit_and_window() -> None:
     assert window.available is False
 
 
+def _state_line(index: int, t: float, dt_s: float | None, session: str) -> str:
+    return json.dumps({"i": index, "t": t, "dt_s": dt_s, "session": session}) + "\n"
+
+
+def check_recorded_hours_minutes() -> None:
+    """Two sessions, one gap that is not 0.2 s, shown as hours and minutes."""
+    # 0.5 + 3.5 + 3716 = 3720 s = 1 hour 2 minutes.
+    # The parked jump from t=1004 to t=50000 is a null dt_s and is not driving.
+    # Five frames at 5 Hz would be 1 second, which is 0 hours 0 minutes.
+    session_a = (
+        _state_line(0, 1000.0, None, "s1")
+        + _state_line(1, 1000.5, 0.5, "s1")
+        + _state_line(2, 1004.0, 3.5, "s1")
+    )
+    session_b = _state_line(3, 50000.0, None, "s2") + _state_line(4, 53716.0, 3716.0, "s2")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        empty = root / "empty"
+        empty.mkdir()
+        (empty / "notes.txt").write_bytes(b"leave-me")
+        window = TrainWindow()
+        window.load_folder(empty)
+        assert window.lines == "recorded 0 hours 0 minutes"
+        assert read_recorded_seconds(empty) == 0.0
+        assert format_recorded_hm(0) == "0 hours 0 minutes"
+        assert (empty / "notes.txt").read_bytes() == b"leave-me"
+        assert not (empty / "state.jsonl").exists()
+        assert not (empty / "meta.json").exists()
+
+        folder = root / "strips_out"
+        folder.mkdir()
+        (folder / "strips").mkdir()
+        planted = folder / "strips" / "000000.jpg"
+        planted.write_bytes(b"keep-jpeg")
+        state = folder / "state.jsonl"
+        state.write_text(session_a + session_b, encoding="utf-8")
+        before = state.read_bytes()
+        assert abs(read_recorded_seconds(folder) - 3720.0) < 1e-6
+        window.load_folder(folder)
+        assert "1 hours 2 minutes" in window.lines
+        assert window.recorded_s == read_recorded_seconds(folder)
+        shown = format_status(
+            TrainStatus(
+                eta_s=None,
+                loss=None,
+                lr=1e-3,
+                steps_per_sec=0.0,
+                memory_bytes=0,
+                memory_kind="ram",
+                device="cpu",
+                batch=1,
+                recommended=False,
+                step=0,
+                steps=1,
+                recorded_s=window.recorded_s,
+            )
+        )
+        assert shown.splitlines()[0] == "recorded 1 hours 2 minutes"
+        window.update(
+            TrainStatus(
+                eta_s=10,
+                loss=0.1,
+                lr=1e-3,
+                steps_per_sec=1.0,
+                memory_bytes=1024,
+                memory_kind="ram",
+                device="cpu",
+                batch=1,
+                recommended=False,
+                step=1,
+                steps=2,
+            )
+        )
+        assert window.lines.splitlines()[0] == "recorded 1 hours 2 minutes"
+        assert state.read_bytes() == before
+        assert planted.read_bytes() == b"keep-jpeg"
+        assert not (folder / "meta.json").exists()
+
+        extra = _state_line(5, 53776.0, 60.0, "s2")
+        with state.open("a", encoding="utf-8") as fh:
+            fh.write(extra)
+        window.refresh_recorded()
+        assert "1 hours 3 minutes" in window.lines
+        assert abs(window.recorded_s - 3780.0) < 1e-6
+        assert state.read_bytes().startswith(before)
+        assert planted.read_bytes() == b"keep-jpeg"
+
+
 def check_nan_cost_and_cpu_export() -> None:
     """All-NaN assignment returns, and export builds CPU inputs for a CUDA module."""
     blank = np.full((3, 2), np.nan, dtype=np.float64)
@@ -1022,6 +1112,7 @@ def main() -> None:
     check_assignment_and_planner()
     check_nan_cost_and_cpu_export()
     check_fit_and_window()
+    check_recorded_hours_minutes()
     check_trainer_is_offline()
     check_net_cpu()
     print("test_scene_strip: OK")

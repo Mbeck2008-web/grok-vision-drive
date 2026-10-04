@@ -10,6 +10,38 @@ The highway picture is the settled BeamNG game view. It is a photo of the monito
 
 ![Soft Esc parked](docs/soft-esc-highway.jpg)
 
+### repeatL
+
+![repeatL](docs/cams/repeatL.jpg)
+
+### pillarL
+
+![pillarL](docs/cams/pillarL.jpg)
+
+### wide
+
+![wide](docs/cams/wide.jpg)
+
+### main
+
+![main](docs/cams/main.jpg)
+
+### narrow
+
+![narrow](docs/cams/narrow.jpg)
+
+### pillarR
+
+![pillarR](docs/cams/pillarR.jpg)
+
+### repeatR
+
+![repeatR](docs/cams/repeatR.jpg)
+
+### rear
+
+![rear](docs/cams/rear.jpg)
+
 ## Alpha 1.7.7
 
 This is **alpha** — may break / not work; improves with fixes.
@@ -104,3 +136,23 @@ Tech control leaves the gearbox in arcade. `vehicle.control` has no gear field, 
 A bright gray hood is not the road sample. Mid-gray asphalt under that hood stays mid gray, and the lane fit keeps the lanes it had. The companion flash check reads the buffer before the tone curve. A washed companion that is not the blue flash is tone-matched and stored. The attach log prints the sensor `requested_update_time` (1 s for a yaml hitch of -1). Companions are that offscreen `stream_raw`.
 
 The tone sample is the road under the sky and above the hood. Sky (190, 200, 210) over asphalt (128, 118, 108) stays mid gray with a dark hood, the lane fit stays at 2 lanes, and that sky stays off the white-paint mask.
+
+## Technical detail
+
+The photos above are the frame path. The strip is what the model is fed. Each named photo is that camera's tile, in the same left-to-right order, with the empty gaps left out. The highway picture is the settled game view. Soft Esc parked. Esc is BeamNG's pause menu. It is not Engage.
+
+### Colour
+
+One tone curve runs on the colour buffer the lane fit, the model, the CAMS tiles, and the PIP all read. The sample is the road under the sky and above the hood. A sun-blown road comes down toward mid gray and a thin lane stripe stays separable from the pavement. A frame that is already mid gray stays as it is. A missing or all-zero camera stays empty. A bright gray hood is not the road sample.
+
+### Companions
+
+Companion colour is a shared-memory read of an offscreen sensor update (`stream_raw`). The attach log prints `requested_update_time` 1 for a yaml hitch of -1. Main is read every tick. One companion is read on its hitch slot, and the last frame is kept in between. The companion flash check reads the buffer before the tone curve. A bright-blue road shadow is not stored. A washed companion that is not that flash is tone-matched and stored.
+
+### Stitch
+
+Delivered rig frames stitch left to right as repeatL, pillarL, wide, main, narrow, pillarR, repeatR, rear. A missing camera is an empty sector. Seams are gaps, with no pose warp. Repeater ego-body pixels are not another vehicle. The lane fit reads the windshield band of that stitch when the band has pixels, in the same road meters as one camera, and the main camera when that band is empty.
+
+### Drive
+
+Tech control leaves the gearbox in arcade. `vehicle.control` has no gear field. Arcade is armed once at engage. The drive arm releases the parking brake and the clutch. A hold, a stop, or AEB sets the parking brake and releases the service brake. Retail queues `drivetrain.setShifterMode(2)` once per vehicle. Mode 2 is arcade. Retail is one window (`cams=1/8`). Tech 8-cam is the other product. Live Alt+G, Tech 8-cam, FFB, and QSV stay unproven.

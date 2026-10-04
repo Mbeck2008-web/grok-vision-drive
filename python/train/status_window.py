@@ -204,9 +204,10 @@ def parameter_fact() -> str:
 
     count, approximate = scene_parameter_count()
     unit = format_parameter_count(count)
+    # The rounded unit stays. The integer is the architecture sum, including GroupNorm.
     if approximate:
-        return f"params approximate {unit}"
-    return f"params {unit}"
+        return f"params approximate {unit} ({count})"
+    return f"params {unit} ({count})"
 
 
 def format_status(status: TrainStatus) -> str:

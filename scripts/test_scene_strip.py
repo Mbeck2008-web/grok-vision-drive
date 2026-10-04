@@ -1213,13 +1213,20 @@ def check_train_panel_loss_graph() -> None:
 def check_parameter_count_hand_sum() -> None:
     """A tiny built net's trainable count matches a hand sum of its layers."""
     from python.train.scene_net import (
+        GRU_HIDDEN,
+        STEM_CHANNELS,
+        TOKEN_DIM,
         architecture_parameter_count,
         conv2d_parameter_count,
         count_module_parameters,
+        groupnorm_parameter_count,
         gru_parameter_count,
         linear_parameter_count,
+        scene_head_sizes,
         scene_parameter_count,
+        stem_spec,
         torch_ready,
+        SECTOR_FEAT,
     )
 
     # Conv2d(2, 3, kernel 3, bias): weight 3*2*3*3 = 54, bias 3, total 57.
@@ -1252,7 +1259,11 @@ def check_parameter_count_hand_sum() -> None:
         frozen = tiny.fc.bias
         frozen.requires_grad_(False)
         assert count_module_parameters(tiny) == hand - 4
-        real = count_module_parameters(SceneNet())
+        net = SceneNet()
+        mods = list(net.stem.conv.children())
+        assert any(isinstance(mod, nn.GroupNorm) for mod in mods)
+        assert not any("BatchNorm" in type(mod).__name__ for mod in mods)
+        real = count_module_parameters(net)
         assert real == architecture_parameter_count()
         shown, approximate = scene_parameter_count()
         assert shown == real and approximate is False
@@ -1262,8 +1273,33 @@ def check_parameter_count_hand_sum() -> None:
         assert approximate is True
         assert shown == architecture_parameter_count()
         assert shown > hand
+    spec = stem_spec()
+    kinds = [kind for kind, _left, _right in spec]
+    assert kinds == ["conv", "groupnorm", "relu"] * len(STEM_CHANNELS)
+    assert "batchnorm" not in kinds
+    gn = sum(groupnorm_parameter_count(width) for width in STEM_CHANNELS)
+    assert gn == 2 * sum(int(width) for width in STEM_CHANNELS)
+    expected = gn
+    cin = 3
+    for width in STEM_CHANNELS:
+        expected += conv2d_parameter_count(cin, int(width), 3, bias=True)
+        cin = int(width)
+    expected += linear_parameter_count(STEM_CHANNELS[-1], SECTOR_FEAT, bias=True)
+    expected += gru_parameter_count(TOKEN_DIM + 1, GRU_HIDDEN, num_layers=1, bias=True)
+    for _name, out in scene_head_sizes():
+        expected += linear_parameter_count(GRU_HIDDEN, out, bias=True)
+    assert shown == expected == architecture_parameter_count()
+    stem_at = (ROOT / "python" / "train" / "scene_net.py").read_text(encoding="utf-8")
+    stem_body = stem_at[stem_at.index("class SharedStem") : stem_at.index("class SceneNet")]
+    assert "nn.GroupNorm(" in stem_body
+    assert "stem_spec()" in stem_body
+    assert "nn.BatchNorm" not in stem_body
+    assert "not added" not in stem_body
+    print(f"scene parameters: {shown}")
+
     fact = parameter_fact()
     assert format_parameter_count(shown) in fact
+    assert str(shown) in fact
     if approximate:
         assert fact.startswith("params approximate ")
     else:
@@ -1325,6 +1361,7 @@ def check_pause_checkpoint_roundtrip() -> None:
         loaded = load_checkpoint(folder)
         assert loaded is not None
         fields = resume_fields(loaded)
+        assert fields["arch"] is None
         assert fields["step"] == 4
         assert fields["epoch"] == 1
         assert fields["cursor"] == 2
@@ -1385,9 +1422,28 @@ def check_pause_checkpoint_roundtrip() -> None:
         assert load_checkpoint(folder) is None
         assert not jpeg.exists()
 
+    from python.train.scene_net import checkpoint_arch
+    from python.train.train_scene import _apply_checkpoint, pause_matches_stem, stamp_pause
+
     body = inspect.getsource(train_directory)
     assert "wipe_training" not in body
     assert "shutil.rmtree" not in body
+    unstamped = {"step": 4, "weights": {"stem.conv.0.weight": np.zeros((1,), dtype=np.float32)}}
+    assert resume_fields(unstamped)["arch"] is None
+    assert pause_matches_stem(resume_fields(unstamped)) is False
+    assert pause_matches_stem(stamp_pause({"weights": {"w": np.zeros((1,), dtype=np.float32)}})) is True
+    assert checkpoint_arch().startswith("groupnorm-stem:")
+
+    class _StemSentinel:
+        def state_dict(self) -> dict:
+            raise AssertionError("old pause was loaded into the stem")
+
+    try:
+        _apply_checkpoint(_StemSentinel(), None, None, resume_fields(unstamped), "cpu")
+    except ValueError as exc:
+        assert "GroupNorm" in str(exc)
+    else:
+        raise AssertionError("old pause loaded")
     if torch_ready():
         import torch
         from torch import nn
@@ -1408,6 +1464,7 @@ def check_pause_checkpoint_roundtrip() -> None:
                 {
                     "step": 4,
                     "loss": 0.2,
+                    "arch": checkpoint_arch(),
                     "weights": {key: value.detach().cpu().numpy() for key, value in source.state_dict().items()},
                     "optimizer": {},
                 }
@@ -1535,13 +1592,17 @@ def check_continual_bptt_and_yaw() -> None:
     note = inspect.getsource(strip_roll_is_yaw) + inspect.getsource(offcenter_view)
     assert "not a yaw roll" in note
 
-    from python.train.train_scene import _eval_sequence, _optimizer_step
+    from python.train.scene_net import torch_ready
+    from python.train.train_scene import overlap_gradient_cut
 
-    step_src = inspect.getsource(_optimizer_step)
-    assert "initial_state" not in step_src
-    assert "step_dt" in step_src
-    assert "clip_grad_norm_" in step_src
-    assert "no_grad" in inspect.getsource(_eval_sequence)
+    report = overlap_gradient_cut()
+    if report is None:
+        assert torch_ready() is False
+        print("overlap gradient: skipped (torch missing)")
+    else:
+        assert report["overlap"] is True
+        assert report["earlier_reached"] is False
+        assert report["own_reached"] is True
     body = inspect.getsource(train_directory)
     assert "while epoch <" not in body
     assert "AdamW" in body

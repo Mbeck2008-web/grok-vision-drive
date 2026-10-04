@@ -56,6 +56,7 @@ from python.train.scene_net import (  # noqa: E402
     OUTPUT_FIELDS,
     ScenePrediction,
     SceneState,
+    checkpoint_arch,
     default_onnx_path,
     export_scene_onnx,
     labels_from_tech,
@@ -229,6 +230,69 @@ def _detach_state(state: SceneState) -> SceneState:
     )
 
 
+def overlap_gradient_cut() -> dict[str, bool] | None:
+    """Backward two overlapping chunks. ``None`` when PyTorch is not installed.
+
+    The second chunk starts from ``_detach_state`` at the stride, the same cut
+    ``_optimizer_step`` uses between chunks. Its gradient has to land on its
+    own frames and must not land on the first chunk's frames.
+    """
+    if not torch_ready():
+        return None
+    import torch
+    from torch import nn
+
+    torch.manual_seed(0)
+    hidden = 8
+    length = 4
+    stride = 2
+    step = nn.Linear(hidden, hidden)
+
+    def cell(frame: Any, state: SceneState) -> tuple[Any, SceneState]:
+        mixed = torch.tanh(step(state.h.reshape(1, hidden) + frame.reshape(1, hidden)))
+        h_new = mixed.reshape(1, 1, hidden)
+        tokens = state.tokens + frame.reshape(1, 1, hidden)
+        mask = state.mask + 0.2
+        return mixed.sum(), SceneState(h=h_new, tokens=tokens, mask=mask)
+
+    def run(frames: list[Any], state: SceneState) -> tuple[Any, SceneState]:
+        state = _detach_state(state)
+        total = None
+        mark: SceneState | None = None
+        for tick, frame in enumerate(frames):
+            value, state = cell(frame, state)
+            total = value if total is None else total + value
+            if tick + 1 == stride:
+                mark = state
+        end = _detach_state(state)
+        carry = end if mark is None else _detach_state(mark)
+        return total, carry
+
+    first = [torch.randn(hidden, requires_grad=True) for _ in range(length)]
+    second = [torch.randn(hidden, requires_grad=True) for _ in range(length)]
+    state = SceneState(
+        h=torch.zeros(1, 1, hidden),
+        tokens=torch.zeros(1, 1, hidden),
+        mask=torch.zeros(1, 1),
+    )
+    _loss1, carry = run(first, state)
+    loss2, _carry2 = run(second, carry)
+    loss2.backward()
+
+    def reached(frames: list[Any]) -> bool:
+        for frame in frames:
+            grad = frame.grad
+            if grad is not None and float(grad.detach().abs().sum()) > 0.0:
+                return True
+        return False
+
+    return {
+        "overlap": stride < length,
+        "earlier_reached": reached(first),
+        "own_reached": reached(second),
+    }
+
+
 def _frame_row(root: Path, row: Mapping[str, Any]) -> tuple[Any, Mapping[str, Any]]:
     frame = np.ascontiguousarray(_load_bgr(root, int(row["i"])))
     # The stitch is not a yaw roll, so this returns the frame and the row.
@@ -385,8 +449,27 @@ def _from_numpy_tree(obj: Any) -> Any:
     return obj
 
 
+def pause_matches_stem(fields: Mapping[str, Any]) -> bool:
+    """True when this pause file was written for the current GroupNorm stem."""
+    return fields.get("arch") == checkpoint_arch()
+
+
+def stamp_pause(payload: dict[str, Any]) -> dict[str, Any]:
+    """Mark a pause file with the stem it may load into."""
+    payload["arch"] = checkpoint_arch()
+    return payload
+
+
 def _apply_checkpoint(net: Any, opt: Any, scaler: Any, fields: Mapping[str, Any], device: Any) -> None:
-    """Load the paused weights and optimizer. Does not touch the strip folder."""
+    """Load the paused weights and optimizer. Does not touch the strip folder.
+
+    An older conv-relu file has no GroupNorm tag. It is refused before any
+    weight is copied, so those tensors are not applied to the new stem.
+    """
+    if not pause_matches_stem(fields):
+        raise ValueError(
+            f"pause checkpoint arch {fields.get('arch')!r} does not match the GroupNorm stem {checkpoint_arch()}"
+        )
     import torch
 
     current = net.state_dict()
@@ -442,21 +525,23 @@ def _save_pause(
     recommended: bool,
 ) -> dict[str, Any]:
     """Save weights before the loop stops. Strip files are not rewritten."""
-    payload = {
-        "step": int(step),
-        "epoch": int(epoch),
-        "cursor": int(cursor),
-        "loss": loss,
-        "lr": float(lr),
-        "epochs": int(epochs),
-        "batch": int(batch),
-        "device": str(device_name),
-        "recommended": bool(recommended),
-        "losses": [float(value) for value in view.losses],
-        "weights": {key: value.detach().cpu().numpy() for key, value in net.state_dict().items()},
-        "optimizer": _to_numpy_tree(opt.state_dict()),
-        "scaler": None if scaler is None else _to_numpy_tree(scaler.state_dict()),
-    }
+    payload = stamp_pause(
+        {
+            "step": int(step),
+            "epoch": int(epoch),
+            "cursor": int(cursor),
+            "loss": loss,
+            "lr": float(lr),
+            "epochs": int(epochs),
+            "batch": int(batch),
+            "device": str(device_name),
+            "recommended": bool(recommended),
+            "losses": [float(value) for value in view.losses],
+            "weights": {key: value.detach().cpu().numpy() for key, value in net.state_dict().items()},
+            "optimizer": _to_numpy_tree(opt.state_dict()),
+            "scaler": None if scaler is None else _to_numpy_tree(scaler.state_dict()),
+        }
+    )
     save_checkpoint(root, payload)
     return payload
 

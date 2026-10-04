@@ -43,6 +43,8 @@ RESIDUAL_MIN_DT = 1.0 / 60.0
 RESIDUAL_TOKENS = int(math.ceil(RESIDUAL_S / RESIDUAL_MIN_DT))
 # Dropout on the vector that enters the GRU. Not on the hidden state.
 GRU_IN_DROPOUT = 0.1
+# GroupNorm groups for every stem width. 32, 64, and 128 all divide by 8.
+STEM_GROUPS = 8
 N_LANES = 6
 LANE_POINTS = 16
 N_CURBS = 2
@@ -171,22 +173,56 @@ def gru_parameter_count(
     return total
 
 
+def groupnorm_parameter_count(num_channels: int) -> int:
+    """Affine GroupNorm: one scale and one shift per channel. Groups add none."""
+    return 2 * int(num_channels)
+
+
+def stem_spec() -> tuple[tuple[str, int, int], ...]:
+    """Shared stem as Conv, GroupNorm, ReLU for each width.
+
+    BatchNorm is not in this stack. A batch of one strip is a legal step.
+    """
+    rows: list[tuple[str, int, int]] = []
+    cin = 3
+    for cout in STEM_CHANNELS:
+        width = int(cout)
+        if width % STEM_GROUPS != 0:
+            raise ValueError(f"stem width {width} is not divisible by {STEM_GROUPS} groups")
+        rows.append(("conv", cin, width))
+        rows.append(("groupnorm", STEM_GROUPS, width))
+        rows.append(("relu", 0, width))
+        cin = width
+    return tuple(rows)
+
+
 def architecture_parameter_count() -> int:
     """Trainable weights of the exported scene net, from the layer sizes.
 
-    The stem is shared, so it is counted once. ReLU, the residual, and the
-    sigmoids add no weights. This is the count before any tensor exists.
+    The stem is shared, so it is counted once. GroupNorm adds its affine
+    scale and shift. ReLU, the residual, and the sigmoids add no weights.
+    This is the count before any tensor exists.
     """
     total = 0
-    cin = 3
-    for cout in STEM_CHANNELS:
-        total += conv2d_parameter_count(cin, int(cout), 3, bias=True)
-        cin = int(cout)
+    for kind, left, right in stem_spec():
+        if kind == "conv":
+            total += conv2d_parameter_count(left, right, 3, bias=True)
+        elif kind == "groupnorm":
+            total += groupnorm_parameter_count(right)
     total += linear_parameter_count(STEM_CHANNELS[-1], SECTOR_FEAT, bias=True)
     total += gru_parameter_count(TOKEN_DIM + 1, GRU_HIDDEN, num_layers=1, bias=True)
     for _name, out in scene_head_sizes():
         total += linear_parameter_count(GRU_HIDDEN, out, bias=True)
     return total
+
+
+def checkpoint_arch() -> str:
+    """Stem identity stored in a pause file.
+
+    A file from the conv-relu stem has no tag, or a different count, and
+    must not load into this GroupNorm stem.
+    """
+    return f"groupnorm-stem:{architecture_parameter_count()}"
 
 
 def count_module_parameters(module: Any) -> int:
@@ -1045,19 +1081,23 @@ def scene_loss(pred: ScenePrediction, target: Mapping[str, Any]) -> dict[str, An
 if torch is not None:
 
     class SharedStem(nn.Module):
-        """Shared stride-2 stem: channels 32, 64, 128, 128, then 64 floats."""
+        """Shared stride-2 stem: Conv, GroupNorm, ReLU, then 64 floats.
+
+        GroupNorm, not BatchNorm. A batch of one strip is a legal step.
+        """
 
         def __init__(self) -> None:
             super().__init__()
             layers: list[nn.Module] = []
-            cin = 3
-            for cout in STEM_CHANNELS:
-                # Batch 1 is a legal step, so this is not batch norm.
-                # GroupNorm is not added either: the stem stays free of
-                # normalization parameters so a paused checkpoint still loads.
-                layers.append(nn.Conv2d(cin, cout, kernel_size=3, stride=2, padding=1, bias=True))
-                layers.append(nn.ReLU(inplace=False))
-                cin = cout
+            for kind, left, right in stem_spec():
+                if kind == "conv":
+                    layers.append(nn.Conv2d(left, right, kernel_size=3, stride=2, padding=1, bias=True))
+                elif kind == "groupnorm":
+                    layers.append(nn.GroupNorm(left, right))
+                elif kind == "relu":
+                    layers.append(nn.ReLU(inplace=False))
+                else:
+                    raise RuntimeError(f"stem has no {kind} layer")
             self.conv = nn.Sequential(*layers)
             self.fc = nn.Linear(STEM_CHANNELS[-1], SECTOR_FEAT)
 

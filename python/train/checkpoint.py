@@ -161,4 +161,5 @@ def resume_fields(payload: Mapping[str, Any]) -> dict[str, Any]:
         "weights": weights,
         "optimizer": optimizer,
         "scaler": payload.get("scaler"),
+        "arch": None if payload.get("arch") is None else str(payload.get("arch")),
     }

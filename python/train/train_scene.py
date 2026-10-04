@@ -52,6 +52,12 @@ from python.train.scene_net import (  # noqa: E402
     step_dt,
     torch_ready,
 )
+from python.train.checkpoint import (  # noqa: E402
+    clear_checkpoint,
+    load_checkpoint,
+    resume_fields,
+    save_checkpoint,
+)
 from python.train.status_window import (  # noqa: E402
     TrainStatus,
     TrainWindow,
@@ -266,8 +272,123 @@ def _optimizer_step(
     return float(loss.detach().item()), n_loss
 
 
-def _publish(view: TrainWindow, status: TrainStatus) -> None:
-    view.update(status)
+def _publish(view: TrainWindow, status: TrainStatus, *, record_loss: bool = True) -> None:
+    view.update(status, record_loss=record_loss)
+
+
+def _wait_for_start(view: TrainWindow) -> bool:
+    """Wait until Start. With no window, the run begins instead of blocking."""
+    if view.consume_start():
+        return True
+    if not view.available:
+        return True
+    while view.available and view.window_visible():
+        view.pump()
+        if view.consume_start():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _to_numpy_tree(obj: Any) -> Any:
+    import torch
+
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu().numpy()
+    if isinstance(obj, dict):
+        return {str(key): _to_numpy_tree(value) for key, value in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_numpy_tree(value) for value in obj]
+    if isinstance(obj, np.ndarray):
+        return np.array(obj, copy=True)
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+    raise TypeError(f"cannot pause {type(obj).__name__}")
+
+
+def _from_numpy_tree(obj: Any) -> Any:
+    import torch
+
+    if isinstance(obj, np.ndarray):
+        return torch.tensor(np.array(obj, copy=True))
+    if isinstance(obj, dict):
+        return {str(key): _from_numpy_tree(value) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [_from_numpy_tree(value) for value in obj]
+    return obj
+
+
+def _apply_checkpoint(net: Any, opt: Any, scaler: Any, fields: Mapping[str, Any], device: Any) -> None:
+    """Load the paused weights and optimizer. Does not touch the strip folder."""
+    import torch
+
+    current = net.state_dict()
+    mapped = {}
+    for key, value in fields["weights"].items():
+        if key not in current:
+            raise KeyError(f"pause weight {key} is not in the scene net")
+        ref = current[key]
+        mapped[key] = torch.tensor(np.array(value, copy=True), dtype=ref.dtype, device=ref.device)
+    missing = [key for key in current if key not in mapped]
+    if missing:
+        raise KeyError(f"pause checkpoint is missing {missing[0]}")
+    net.load_state_dict(mapped)
+    optimizer = fields.get("optimizer") or {}
+    if optimizer:
+        tree = _from_numpy_tree(optimizer)
+        state = tree.get("state")
+        if isinstance(state, dict):
+            tree["state"] = {int(key): value for key, value in state.items()}
+        opt.load_state_dict(tree)
+        for bucket in opt.state.values():
+            for key, value in list(bucket.items()):
+                if torch.is_tensor(value):
+                    bucket[key] = value.to(device)
+    scaler_state = fields.get("scaler")
+    if scaler is not None and scaler_state:
+        try:
+            scaler.load_state_dict(_from_numpy_tree(scaler_state))
+        except Exception:
+            pass
+
+
+def _save_pause(
+    root: Path,
+    net: Any,
+    opt: Any,
+    scaler: Any,
+    view: TrainWindow,
+    *,
+    step: int,
+    epoch: int,
+    cursor: int,
+    loss: float | None,
+    lr: float,
+    epochs: int,
+    batch: int,
+    device_name: str,
+    recommended: bool,
+) -> dict[str, Any]:
+    """Save weights before the loop stops. Strip files are not rewritten."""
+    payload = {
+        "step": int(step),
+        "epoch": int(epoch),
+        "cursor": int(cursor),
+        "loss": loss,
+        "lr": float(lr),
+        "epochs": int(epochs),
+        "batch": int(batch),
+        "device": str(device_name),
+        "recommended": bool(recommended),
+        "losses": [float(value) for value in view.losses],
+        "weights": {key: value.detach().cpu().numpy() for key, value in net.state_dict().items()},
+        "optimizer": _to_numpy_tree(opt.state_dict()),
+        "scaler": None if scaler is None else _to_numpy_tree(scaler.state_dict()),
+    }
+    save_checkpoint(root, payload)
+    return payload
 
 
 def train_directory(
@@ -372,31 +493,76 @@ def train_directory(
     view.open()
     epochs_n = max(1, int(epochs))
     supervised = 0
+    paused_exit = False
+    epoch = 0
+    cursor = 0
+    done = 0
+    last_loss: float | None = None
+    started = time.perf_counter()
     try:
-        remaining = ((len(windows) + batch - 1) // batch) * epochs_n
-        used, kind = _memory_reading(device.type)
-        _publish(
-            view,
-            TrainStatus(
-                eta_s=None,
-                loss=None,
-                lr=float(lr),
-                steps_per_sec=0.0,
-                memory_bytes=used,
-                memory_kind=kind,
-                device=device.type,
-                batch=batch,
-                recommended=recommended,
-                step=0,
-                steps=remaining,
-            ),
-        )
-        epoch = 0
-        cursor = 0
-        done = 0
-        last_loss: float | None = None
-        started = time.perf_counter()
-        while epoch < epochs_n:
+        if not _wait_for_start(view):
+            paused_exit = True
+        else:
+            existing = load_checkpoint(root)
+            if existing is not None:
+                fields = resume_fields(existing)
+                _apply_checkpoint(net, holder["opt"], holder["scaler"], fields, device)
+                epoch = int(fields["epoch"])
+                cursor = int(fields["cursor"])
+                done = int(fields["step"])
+                last_loss = fields["loss"]
+                view.restore_losses(fields["losses"])
+            else:
+                # No pause file: a new run. Strip JPEGs and state lines stay.
+                epoch = 0
+                cursor = 0
+                done = 0
+                last_loss = None
+            view.mark_running()
+            remaining = ((len(windows) + batch - 1) // batch) * epochs_n
+            used, kind = _memory_reading(device.type)
+            _publish(
+                view,
+                TrainStatus(
+                    eta_s=None,
+                    loss=last_loss,
+                    lr=float(holder["opt"].param_groups[0]["lr"]),
+                    steps_per_sec=0.0,
+                    memory_bytes=used,
+                    memory_kind=kind,
+                    device=device.type,
+                    batch=batch,
+                    recommended=recommended,
+                    step=done,
+                    steps=max(done, remaining),
+                ),
+                record_loss=False,
+            )
+            started = time.perf_counter()
+        while epoch < epochs_n and not paused_exit:
+            if view.consume_pause():
+                payload = _save_pause(
+                    root,
+                    net,
+                    holder["opt"],
+                    holder["scaler"],
+                    view,
+                    step=done,
+                    epoch=epoch,
+                    cursor=cursor,
+                    loss=last_loss,
+                    lr=float(holder["opt"].param_groups[0]["lr"]),
+                    epochs=epochs_n,
+                    batch=batch,
+                    device_name=device.type,
+                    recommended=recommended,
+                )
+                view.mark_paused(payload)
+                if not _wait_for_start(view):
+                    paused_exit = True
+                    break
+                view.mark_running()
+                continue
             if cursor >= len(windows):
                 epoch += 1
                 cursor = 0
@@ -469,8 +635,10 @@ def train_directory(
                     steps=done + remaining_steps,
                 ),
             )
-        if export_path is not None:
+        if not paused_exit and export_path is not None:
             export_scene_onnx(export_path, net)
+        if not paused_exit:
+            clear_checkpoint(root)
     finally:
         if own_view:
             view.close()

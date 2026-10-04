@@ -1253,6 +1253,147 @@ def check_parameter_count_hand_sum() -> None:
     assert "idle" in idle.lines
 
 
+def check_pause_checkpoint_roundtrip() -> None:
+    """A tiny pause file keeps its step and a weight, outside the strip folder."""
+    from python.train.checkpoint import (
+        checkpoint_path,
+        clear_checkpoint,
+        load_checkpoint,
+        resume_fields,
+        save_checkpoint,
+    )
+    from python.train.scene_net import torch_ready
+
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = Path(tmp) / "scene_strips"
+        (folder / "strips").mkdir(parents=True)
+        jpeg = folder / "strips" / "000000.jpg"
+        state = folder / "state.jsonl"
+        jpeg.write_bytes(b"jpeg-bytes-stay")
+        state.write_text('{"i":0,"t":1.0,"dt_s":null}\n', encoding="utf-8")
+        before_jpeg = jpeg.read_bytes()
+        before_state = state.read_bytes()
+        weight = np.array([1.25, -0.5], dtype=np.float32)
+        saved = save_checkpoint(
+            folder,
+            {
+                "step": 4,
+                "epoch": 1,
+                "cursor": 2,
+                "loss": 0.2,
+                "lr": 1e-3,
+                "epochs": 3,
+                "batch": 2,
+                "device": "cpu",
+                "recommended": True,
+                "losses": [0.5, 0.2],
+                "weights": {"w": weight},
+                "optimizer": {"param_groups": [{"lr": 0.001, "params": [0]}], "state": {"0": {"step": 4}}},
+            },
+        )
+        assert saved == checkpoint_path(folder)
+        assert saved.parent == folder.parent
+        assert folder not in saved.parents
+        assert jpeg.read_bytes() == before_jpeg
+        assert state.read_bytes() == before_state
+        assert sorted(p.name for p in (folder / "strips").iterdir()) == ["000000.jpg"]
+
+        loaded = load_checkpoint(folder)
+        assert loaded is not None
+        fields = resume_fields(loaded)
+        assert fields["step"] == 4
+        assert fields["epoch"] == 1
+        assert fields["cursor"] == 2
+        assert fields["loss"] == 0.2
+        assert float(np.asarray(fields["weights"]["w"]).reshape(-1)[0]) == np.float32(1.25)
+        assert float(np.asarray(fields["weights"]["w"]).reshape(-1)[1]) == np.float32(-0.5)
+        assert fields["optimizer"]["param_groups"][0]["lr"] == 0.001
+
+        first = TrainWindow()
+        first.load_folder(folder)
+        assert first.phase == "paused"
+        assert "paused" in first.lines
+        assert "step 4" in first.lines
+        assert "loss 0.2000" in first.lines
+        assert "0 hours 0 minutes" in first.lines
+        assert first.losses == [0.5, 0.2]
+        assert len(loss_polyline(first.losses, loss_plot_box(loss_graph_box(first.panel.shape[0], first.panel.shape[1])))) == 2
+        start = next(item for item in first.hits if item["id"] == "start")
+        sx = (start["rect"][0] + start["rect"][2]) // 2
+        sy = (start["rect"][1] + start["rect"][3]) // 2
+        assert first.handle_click(sx, sy) == "start"
+        assert first.consume_start() is True
+        first.close()
+
+        again = TrainWindow()
+        again.load_folder(folder)
+        assert again.phase == "paused"
+        assert "paused" in again.lines
+        assert "step 4" in again.lines
+        reloaded = resume_fields(load_checkpoint(folder))
+        assert reloaded["step"] == 4
+        assert float(np.asarray(reloaded["weights"]["w"]).reshape(-1)[0]) == np.float32(1.25)
+        again.close()
+
+        fresh = Path(tmp) / "new_run"
+        (fresh / "strips").mkdir(parents=True)
+        fresh_jpeg = fresh / "strips" / "000000.jpg"
+        fresh_jpeg.write_bytes(b"new-run-jpeg")
+        (fresh / "state.jsonl").write_text('{"i":0,"t":1.0,"dt_s":null}\n', encoding="utf-8")
+        assert load_checkpoint(fresh) is None
+        idle = TrainWindow()
+        idle.load_folder(fresh)
+        assert idle.phase == "idle"
+        assert "idle" in idle.lines
+        assert "paused" not in idle.lines
+        assert fresh_jpeg.read_bytes() == b"new-run-jpeg"
+        idle.close()
+
+        wiped = wipe_training(folder, confirm=True)
+        assert jpeg in wiped or not jpeg.exists()
+        assert not jpeg.exists()
+        assert not state.exists()
+        survived = load_checkpoint(folder)
+        assert survived is not None
+        assert resume_fields(survived)["step"] == 4
+        assert float(np.asarray(resume_fields(survived)["weights"]["w"]).reshape(-1)[0]) == np.float32(1.25)
+        clear_checkpoint(folder)
+        assert load_checkpoint(folder) is None
+        assert not jpeg.exists()
+
+    body = inspect.getsource(train_directory)
+    assert "wipe_training" not in body
+    assert "shutil.rmtree" not in body
+    if torch_ready():
+        import torch
+        from torch import nn
+
+        from python.train.train_scene import _apply_checkpoint
+
+        source = nn.Linear(1, 1, bias=True)
+        with torch.no_grad():
+            source.weight.fill_(1.25)
+            source.bias.fill_(-0.5)
+        fresh_net = nn.Linear(1, 1, bias=True)
+        fresh_opt = torch.optim.SGD(fresh_net.parameters(), lr=0.02)
+        _apply_checkpoint(
+            fresh_net,
+            fresh_opt,
+            None,
+            resume_fields(
+                {
+                    "step": 4,
+                    "loss": 0.2,
+                    "weights": {key: value.detach().cpu().numpy() for key, value in source.state_dict().items()},
+                    "optimizer": {},
+                }
+            ),
+            torch.device("cpu"),
+        )
+        assert float(fresh_net.weight.detach().reshape(-1)[0]) == 1.25
+        assert float(fresh_net.bias.detach().reshape(-1)[0]) == -0.5
+
+
 def check_trainer_is_offline() -> None:
     files = (
         ROOT / "python" / "train" / "train_scene.py",
@@ -1299,6 +1440,7 @@ def main() -> None:
     check_recorded_hours_minutes()
     check_train_panel_loss_graph()
     check_parameter_count_hand_sum()
+    check_pause_checkpoint_roundtrip()
     check_trainer_is_offline()
     check_net_cpu()
     print("test_scene_strip: OK")

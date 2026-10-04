@@ -3,8 +3,9 @@
 Colors, type, and row spacing match the nerd panel in ``python/viz/nerd.py``.
 The window shows recorded hours and minutes from the strip folder, time left,
 loss, learning rate, steps per second, the memory in use, and the scene net's
-parameter count. The loss graph is the steps this run has reported. There is
-no server.
+parameter count. Start begins a run. Pause writes a checkpoint beside the
+strip folder and the panel says paused. The loss graph is the steps this run
+has reported. There is no server.
 """
 
 from __future__ import annotations
@@ -291,11 +292,41 @@ def _paint_loss_graph(img: np.ndarray, values: list[float], graph: tuple[int, in
     cv2.polylines(img, [np.array(points, dtype=np.int32)], False, ICE, 2, cv2.LINE_AA)
 
 
-def render_train_panel(lines: Iterable[str], losses: list[float] | None = None) -> np.ndarray:
+def _button(
+    img: np.ndarray,
+    label: str,
+    x: int,
+    y: int,
+    hits: list[dict[str, Any]] | None,
+    ident: str,
+    *,
+    on: bool,
+) -> int:
+    tw, _th = _text_size(label, FS_BODY)
+    rect = (x, y - 22, x + tw + 20, y + 8)
+    bg = ICE if on else (42, 38, 36)
+    fg = (16, 13, 12) if on else FG
+    cv2.rectangle(img, (rect[0], rect[1]), (rect[2], rect[3]), bg, -1)
+    _put(img, label, (x + 10, y), FS_BODY, fg)
+    if hits is not None:
+        hits.append({"kind": "train", "id": ident, "rect": rect})
+    return rect[2] + 12
+
+
+def render_train_panel(
+    lines: Iterable[str],
+    losses: list[float] | None = None,
+    *,
+    phase: str = "idle",
+    hits: list[dict[str, Any]] | None = None,
+) -> np.ndarray:
     """Dark panel. ``losses`` is plotted as given. An empty list stays idle."""
     text_lines = [str(line) for line in lines]
+    if hits is not None:
+        hits.clear()
     first = 34 + 14 + ROW_H
-    graph_top = first + max(1, len(text_lines)) * ROW_H + 8
+    button_top = first + max(1, len(text_lines)) * ROW_H + 8
+    graph_top = button_top + ROW_H
     height = graph_top + GRAPH_H + 16
     img = np.full((height, PANEL_W, 3), BG, dtype=np.uint8)
     y = 34
@@ -305,10 +336,16 @@ def render_train_panel(lines: Iterable[str], losses: list[float] | None = None) 
         color = FG
         if text.strip() == "idle":
             color = DIM
+        elif text.strip() == "paused":
+            color = ICE
         elif "not recommended" in text:
             color = (70, 70, 220)
         _put(img, _fit(text, PANEL_W - PAD_X * 2, FS_BODY), (PAD_X, y), FS_BODY, color)
         y += ROW_H
+    running = phase == "running"
+    baseline = button_top + 22
+    x = _button(img, "Start", PAD_X, baseline, hits, "start", on=not running)
+    _button(img, "Pause", x, baseline, hits, "pause", on=running)
     graph = (PAD_X, graph_top, PANEL_W - PAD_X, graph_top + GRAPH_H)
     _paint_loss_graph(img, list(losses or []), graph)
     return img
@@ -322,9 +359,14 @@ class TrainWindow:
         self.recorded_s = 0.0
         self.losses: list[float] = []
         self.panel: np.ndarray | None = None
+        self.phase = "idle"
+        self.hits: list[dict[str, Any]] = []
         self._folder: Path | None = None
         self._status: TrainStatus | None = None
+        self._checkpoint: dict[str, Any] | None = None
         self._shown = False
+        self._start_requested = False
+        self._pause_requested = False
 
     @property
     def available(self) -> bool:
@@ -337,14 +379,28 @@ class TrainWindow:
             cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
             cv2.resizeWindow(WIN_NAME, PANEL_W, PANEL_H)
             cv2.moveWindow(WIN_NAME, 80, 80)
+            cv2.setMouseCallback(WIN_NAME, self._on_mouse)
         except Exception:
             return
         self._shown = True
         self._paint()
 
     def load_folder(self, root: Path | str) -> None:
-        """Read recorded time from ``root`` and show it. Does not write the folder."""
+        """Read recorded time from ``root`` and show it. Does not write the folder.
+
+        A pause file beside the folder shows paused, with that run's loss curve.
+        """
+        from python.train.checkpoint import load_checkpoint
+
         self._folder = Path(root)
+        loaded = load_checkpoint(self._folder)
+        if loaded is not None:
+            self._remember_pause(loaded)
+        else:
+            self.phase = "idle"
+            self._checkpoint = None
+            if self._status is None:
+                self.losses = []
         self._show_recorded(read_recorded_seconds(self._folder))
 
     def refresh_recorded(self) -> None:
@@ -353,31 +409,110 @@ class TrainWindow:
             return
         self._show_recorded(read_recorded_seconds(self._folder))
 
-    def _show_recorded(self, seconds: float) -> None:
-        self.recorded_s = float(seconds)
-        if self._status is None:
-            self.lines = f"recorded {format_recorded_hm(self.recorded_s)}\n{parameter_fact()}\nidle"
-            self._paint()
-            return
-        self._status.recorded_s = self.recorded_s
-        self.lines = format_status(self._status)
+    def request_start(self) -> None:
+        self._start_requested = True
+
+    def request_pause(self) -> None:
+        self._pause_requested = True
+
+    def consume_start(self) -> bool:
+        armed = self._start_requested
+        self._start_requested = False
+        return armed
+
+    def consume_pause(self) -> bool:
+        armed = self._pause_requested
+        self._pause_requested = False
+        return armed
+
+    def handle_click(self, x: int, y: int) -> str | None:
+        hit = None
+        for item in reversed(self.hits):
+            rect = item.get("rect") or (0, 0, 0, 0)
+            if rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
+                hit = item
+                break
+        if hit is None:
+            return None
+        ident = str(hit.get("id") or "")
+        if ident == "start" and self.phase != "running":
+            self._start_requested = True
+            return "start"
+        if ident == "pause" and self.phase == "running":
+            self._pause_requested = True
+            return "pause"
+        return None
+
+    def mark_running(self) -> None:
+        self.phase = "running"
+        self._apply_lines()
         self._paint()
 
-    def update(self, status: TrainStatus) -> None:
+    def mark_paused(self, checkpoint: Mapping[str, Any]) -> None:
+        """Show paused. The loss series becomes the saved one."""
+        self._remember_pause(checkpoint)
+        self._pause_requested = False
+        self._apply_lines()
+        self._paint()
+
+    def restore_losses(self, losses: Iterable[float]) -> None:
+        self.losses = []
+        for raw in losses:
+            value = _finite_number(raw)
+            if value is not None and value >= 0:
+                self.losses.append(value)
+
+    def _remember_pause(self, checkpoint: Mapping[str, Any]) -> None:
+        self.phase = "paused"
+        self._checkpoint = dict(checkpoint)
+        self.restore_losses(checkpoint.get("losses") or [])
+
+    def _standby_lines(self) -> str:
+        head = f"recorded {format_recorded_hm(self.recorded_s)}\n{parameter_fact()}"
+        if self.phase == "paused" and self._checkpoint is not None:
+            raw_loss = self._checkpoint.get("loss")
+            loss = _finite_number(raw_loss)
+            loss_s = "--" if loss is None else f"{loss:.4f}"
+            step = int(self._checkpoint.get("step") or 0)
+            return f"{head}\npaused\nstep {step}\nloss {loss_s}"
+        return f"{head}\nidle"
+
+    def _apply_lines(self) -> None:
+        if self.phase == "paused":
+            if self._status is not None:
+                self.lines = format_status(self._status) + "\npaused"
+                return
+            self.lines = self._standby_lines()
+            return
+        if self._status is None:
+            self.lines = self._standby_lines()
+            return
+        self.lines = format_status(self._status)
+
+    def _show_recorded(self, seconds: float) -> None:
+        self.recorded_s = float(seconds)
+        if self._status is not None:
+            self._status.recorded_s = self.recorded_s
+        self._apply_lines()
+        self._paint()
+
+    def update(self, status: TrainStatus, *, record_loss: bool = True) -> None:
         self._status = status
+        self.phase = "running"
         if self._folder is not None:
             status.recorded_s = read_recorded_seconds(self._folder)
             self.recorded_s = float(status.recorded_s)
         else:
             self.recorded_s = float(status.recorded_s)
-        value = _finite_number(status.loss)
-        if value is not None and value >= 0:
-            self.losses.append(value)
-        self.lines = format_status(status)
+        if record_loss:
+            value = _finite_number(status.loss)
+            if value is not None and value >= 0:
+                self.losses.append(value)
+        self._apply_lines()
         self._paint()
 
     def _paint(self) -> None:
-        self.panel = render_train_panel(self.lines.splitlines(), self.losses)
+        self.panel = render_train_panel(self.lines.splitlines(), self.losses, phase=self.phase, hits=self.hits)
         if not self._shown:
             return
         try:
@@ -387,6 +522,31 @@ class TrainWindow:
             cv2.waitKey(1)
         except Exception:
             self._shown = False
+
+    def window_visible(self) -> bool:
+        if not self._shown:
+            return False
+        try:
+            return float(cv2.getWindowProperty(WIN_NAME, cv2.WND_PROP_VISIBLE)) >= 1
+        except Exception:
+            return False
+
+    def _on_mouse(self, event: int, x: int, y: int, _flags: int, _param: Any) -> None:
+        if event != cv2.EVENT_LBUTTONDOWN or self.panel is None:
+            return
+        ix, iy = int(x), int(y)
+        try:
+            rect = cv2.getWindowImageRect(WIN_NAME)
+            window_rect = (int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3]))
+        except Exception:
+            window_rect = None
+        from python.viz.nerd import image_point_from_window_mouse
+
+        height, width = self.panel.shape[:2]
+        ix, iy = image_point_from_window_mouse(
+            ix, iy, image_wh=(width, height), window_rect=window_rect,
+        )
+        self.handle_click(ix, iy)
 
     def pump(self) -> None:
         if not self._shown or self.panel is None:

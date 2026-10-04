@@ -165,7 +165,7 @@ def main() -> None:
     log.addHandler(cap)
     log.setLevel(logging.WARNING)
 
-    def _layout_break(_bgr: np.ndarray):
+    def _layout_break(_bgr: np.ndarray, *args, **kwargs):
         raise IndexError("(N, 4) Hough row")
 
     lanes_mod._estimate_lanes_impl = _layout_break
@@ -180,7 +180,7 @@ def main() -> None:
 
         records.clear()
 
-        def _bad_frame(_bgr: np.ndarray):
+        def _bad_frame(_bgr: np.ndarray, *args, **kwargs):
             raise ValueError("undecodable frame")
 
         lanes_mod._estimate_lanes_impl = _bad_frame
@@ -197,7 +197,79 @@ def main() -> None:
     assert "except Exception" not in src
     _check_gap_is_not_one_polyline()
     _check_curve_stays_one_line()
+    _check_stitch_view_and_past_path()
     print("test_lanes_hough_int: OK")
+
+
+def _check_stitch_view_and_past_path() -> None:
+    """A stitch frame is the lane image. Drawn lines pass the blue path."""
+    cv2 = __import__("cv2")
+    from python.perception.lanes import STITCH_LANE_FAR_M, lanes_from_view
+    from python.perception.stitch360 import stitch_frames
+    from python.viz.stage import Cam, VizUI, drawn_lane_records, render_stage
+
+    road = _yellow_white_road(
+        asphalt=(40, 40, 42),
+        yellow=(0, 220, 220),
+        white=(230, 230, 230),
+        width=6,
+    )
+    blank = np.zeros_like(road)
+    flat = np.full_like(road, 140)
+    gate = ShadowConfig().lane_conf_min
+    from_stitch = lanes_from_view(blank, road)
+    assert from_stitch.conf >= gate and from_stitch.lanes_bev, from_stitch
+    assert lanes_from_view(road, flat).conf < gate
+    assert lanes_from_view(road, None).conf >= gate
+    # An all-zero stitch is not a frame, so the main camera still fits.
+    assert lanes_from_view(road, blank).conf >= gate
+    via_canvas = lanes_from_view(blank, stitch_frames({"main": road}).bgr)
+    assert via_canvas.lanes_bev, via_canvas
+    horizon_m = STITCH_LANE_FAR_M * (1.0 - 0.40)
+    assert horizon_m > 36.0, horizon_m
+
+    short = [{"x": -1.7, "y": float(y)} for y in (4.0, 10.0, 18.0)]
+    path = [{"x": 0.0, "y": float(y)} for y in range(0, 31, 2)]
+    state = {
+        "engaged": False,
+        "loop_hz": 12.0,
+        "policy": "modular",
+        "path_ego": path,
+        "path_width": 3.5,
+        "path_debug_preview": False,
+        "viz_smoke": False,
+        "lanes_ext": [{"points": list(short), "kind": "detected", "index": -1, "side": "left"}],
+        "road_edges": [],
+        "tracks": [],
+        "signs": [],
+        "missing_state_keys": ["live cameras"],
+    }
+    drawn = drawn_lane_records(state)
+    far = max(float(p["y"]) for p in drawn[0]["points"])
+    assert far > 30.0, far
+    assert far < 50.0, far
+    held = drawn_lane_records({**state, "path_ego": []})
+    assert max(float(p["y"]) for p in held[0]["points"]) == 18.0
+
+    ui = VizUI()
+    ui.layers = {0}
+    ui.show_nerd = False
+    ui.debug.viz_forecast = False
+    ui.debug.viz_signs = False
+    on = render_stage(state, ui=ui)
+    off = render_stage({**state, "lanes_ext": []}, ui=ui)
+    delta = cv2.absdiff(on, off)
+    cam = Cam()
+
+    def _hit(y: float) -> int:
+        px, py = cam.project(-1.7, y, 0.02)
+        if not (4 <= px < on.shape[1] - 4 and 24 < py < on.shape[0] - 4):
+            return -1
+        patch = delta[py - 4:py + 5, px - 4:px + 5]
+        return int(np.count_nonzero(patch.sum(axis=2) > 8))
+
+    assert _hit(32.0) > 0, "lane line runs past the blue path"
+    assert _hit(80.0) == 0, "lane line does not run out to the cabin span"
 
 
 def _px(ex: float, ey: float, w: int = 640, h: int = 480) -> tuple[float, float]:

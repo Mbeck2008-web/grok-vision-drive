@@ -151,6 +151,25 @@ def _frame_for(frames: Mapping[str, Any], cam_id: str) -> Any:
     return img
 
 
+def forward_lane_view(bgr: np.ndarray) -> np.ndarray:
+    """Windshield band of a stitch canvas. Any other image is returned as-is.
+
+    wide, main, and narrow sit in the middle of the strip. The lane fit reads
+    that band instead of the repeater and rear sectors.
+    """
+    if not isinstance(bgr, np.ndarray) or bgr.ndim < 2:
+        return bgr
+    height, width = bgr.shape[:2]
+    expect_w = len(STITCH_ORDER) * SECTOR_W + (len(STITCH_ORDER) - 1) * GAP_PX
+    if height != SECTOR_H or width != expect_w:
+        return bgr
+    i0 = STITCH_ORDER.index("wide")
+    i1 = STITCH_ORDER.index("narrow")
+    x0 = i0 * (SECTOR_W + GAP_PX)
+    x1 = i1 * (SECTOR_W + GAP_PX) + SECTOR_W
+    return np.ascontiguousarray(bgr[:, x0:x1])
+
+
 def stitch_frames(frames: Mapping[str, Any] | Any | None) -> Stitch360:
     """Lay delivered frames into one strip. Missing slots stay empty."""
     if frames is not None and not isinstance(frames, Mapping) and hasattr(frames, "frames"):

@@ -427,4 +427,4 @@ Lane pieces that do not meet stay separate polylines, so a gap is not drawn as a
 
 ## 1.7.6
 
-Delivered rig frames stitch left to right around the car as repeatL, pillarL, wide, main, narrow, pillarR, repeatR, rear. A missing camera is an empty sector. Seams are gaps, with no pose warp. Pillar yaw stays ±78° and repeater mounts stay at Y 1.30. The hardcoded E2E model reads that stitch. Repeater ego-body pixels are not another vehicle. The main-camera lane fit still runs on main.
+Delivered rig frames stitch left to right around the car as repeatL, pillarL, wide, main, narrow, pillarR, repeatR, rear. A missing camera is an empty sector. Seams are gaps, with no pose warp. Pillar yaw stays ±78° and repeater mounts stay at Y 1.30. The hardcoded E2E model reads that stitch. Repeater ego-body pixels are not another vehicle. The lane fit reads that stitch when the frame has pixels, and the main camera when it does not. Drawn lane lines run past the blue path.

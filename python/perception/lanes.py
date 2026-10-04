@@ -48,8 +48,20 @@ def hough_segments(lines: Any) -> list[tuple[int, int, int, int]]:
     return out
 
 
-def estimate_lanes(bgr: np.ndarray | None) -> LaneResult:
-    """Fit ego-lane paint on ``cam_main``.
+# cam_main maps the top of the frame to about 35 m. The blue path runs to
+# 36 m, so a stitch fit uses a longer scale: the same horizon row lands
+# past that path. The join rule is unchanged.
+_MAIN_FAR_M = 35.0
+STITCH_LANE_FAR_M = 70.0
+
+
+def estimate_lanes(
+    bgr: np.ndarray | None,
+    *,
+    far_m: float = _MAIN_FAR_M,
+    roi_top: float = 0.40,
+) -> LaneResult:
+    """Fit ego-lane paint on one image.
 
     White and yellow stripes are masked in HSV, so a hazy yellow line that
     grayscale Canny misses can still clear the engage gate. An empty or
@@ -57,11 +69,13 @@ def estimate_lanes(bgr: np.ndarray | None) -> LaneResult:
     (OpenCV 5 ``(N, 4)`` indexed as OpenCV 4 ``(N, 1, 4)``) is logged and
     re-raised so it cannot look like an empty road. Other fit errors
     (``cv2.error``, ``ValueError``, ``TypeError``) log once and return 0.
+    ``far_m`` is the ego distance of the top row. The default is the
+    cam_main scale.
     """
     if bgr is None or bgr.size == 0:
         return LaneResult(conf=0.0, lanes_bev=[], curvature=0.0)
     try:
-        return _estimate_lanes_impl(bgr)
+        return _estimate_lanes_impl(bgr, far_m=float(far_m), roi_top=float(roi_top))
     except IndexError as exc:
         _LOG.error(
             "estimate_lanes Hough/layout IndexError (%s); refusing lane_conf=0",
@@ -107,17 +121,18 @@ def lane_paint_mask(bgr: np.ndarray) -> np.ndarray:
     return cv2.bitwise_or(white, yellow)
 
 
-def lane_roi_mask(height: int, width: int) -> np.ndarray:
+def lane_roi_mask(height: int, width: int, top_frac: float = 0.40) -> np.ndarray:
     """Forward-cam trapezoid. Top sits above mid-frame so hood-cam lines that
     converge near the horizon are still inside the mask.
     """
     h, w = int(height), int(width)
+    top = int(max(0.0, min(0.95, float(top_frac))) * h)
     mask = np.zeros((h, w), dtype=np.uint8)
     poly = np.array(
         [[
             (int(0.05 * w), h - 1),
-            (int(0.36 * w), int(0.40 * h)),
-            (int(0.64 * w), int(0.40 * h)),
+            (int(0.36 * w), top),
+            (int(0.64 * w), top),
             (int(0.95 * w), h - 1),
         ]],
         dtype=np.int32,
@@ -126,10 +141,16 @@ def lane_roi_mask(height: int, width: int) -> np.ndarray:
     return mask
 
 
-def _ego_point(x: float, y: float, width: float, height: float) -> dict[str, float]:
-    """Crude cam_main pixel → ego meters (x right, y forward)."""
+def _ego_point(
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+    far_m: float = _MAIN_FAR_M,
+) -> dict[str, float]:
+    """Crude pixel → ego meters (x right, y forward)."""
     ex = ((float(x) / float(width)) - 0.5) * 6.0
-    ey = max(2.0, 35.0 * (1.0 - float(y) / float(height)))
+    ey = max(2.0, float(far_m) * (1.0 - float(y) / float(height)))
     return {"x": float(ex), "y": float(ey), "z": 0.0}
 
 
@@ -137,10 +158,11 @@ def _ordered_ego_segment(
     seg: tuple,
     width: float,
     height: float,
+    far_m: float = _MAIN_FAR_M,
 ) -> tuple[dict[str, float], dict[str, float]]:
     x1, y1, x2, y2 = seg[0], seg[1], seg[2], seg[3]
-    a = _ego_point(x1, y1, width, height)
-    b = _ego_point(x2, y2, width, height)
+    a = _ego_point(x1, y1, width, height, far_m)
+    b = _ego_point(x2, y2, width, height, far_m)
     if a["y"] <= b["y"]:
         return a, b
     return b, a
@@ -164,6 +186,7 @@ def chain_lane_segments(
     segs: list,
     width: int,
     height: int,
+    far_m: float = _MAIN_FAR_M,
 ) -> list[list[dict[str, float]]]:
     """Polylines for one slope group. Pieces that do not meet stay apart.
 
@@ -173,7 +196,7 @@ def chain_lane_segments(
     starts a new polyline instead of kinking the one in hand. Each returned
     line is ordered by increasing forward distance.
     """
-    pieces = [_ordered_ego_segment(s, width, height) for s in segs[:8]]
+    pieces = [_ordered_ego_segment(s, width, height, far_m) for s in segs[:8]]
     pieces.sort(key=lambda ab: (ab[0]["y"], ab[0]["x"], ab[1]["y"]))
     chains: list[list[tuple[dict[str, float], dict[str, float]]]] = []
     for near, far in pieces:
@@ -208,7 +231,28 @@ def chain_lane_segments(
     return out
 
 
-def _estimate_lanes_impl(bgr: np.ndarray) -> LaneResult:
+def lanes_from_view(
+    main_bgr: np.ndarray | None,
+    stitch_bgr: np.ndarray | None = None,
+) -> LaneResult:
+    """Fit lanes on the 360 strip when that frame has pixels, else on main.
+
+    The strip's windshield band is the image. Repeater and rear sectors stay
+    out of this fit. An empty stitch falls back to ``cam_main``.
+    """
+    from python.perception.stitch360 import forward_lane_view
+    from python.sensors.cameras import frame_is_unrendered
+
+    if stitch_bgr is not None and not frame_is_unrendered(stitch_bgr):
+        return estimate_lanes(forward_lane_view(stitch_bgr), far_m=STITCH_LANE_FAR_M)
+    return estimate_lanes(main_bgr)
+
+
+def _estimate_lanes_impl(
+    bgr: np.ndarray,
+    far_m: float = _MAIN_FAR_M,
+    roi_top: float = 0.40,
+) -> LaneResult:
     bgr = _as_bgr(bgr)
     h, w = bgr.shape[:2]
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -220,7 +264,10 @@ def _estimate_lanes_impl(bgr: np.ndarray) -> LaneResult:
     # Canny only on the paint. A sky/road wedge is not a stripe, so that
     # silhouette cannot score a left lane and a right lane.
     near = cv2.dilate(paint, np.ones((3, 3), np.uint8))
-    crop = cv2.bitwise_and(cv2.bitwise_or(cv2.bitwise_and(edges, near), grad), lane_roi_mask(h, w))
+    crop = cv2.bitwise_and(
+        cv2.bitwise_or(cv2.bitwise_and(edges, near), grad),
+        lane_roi_mask(h, w, roi_top),
+    )
     lines = cv2.HoughLinesP(crop, 1, np.pi / 180, threshold=40, minLineLength=40, maxLineGap=80)
     left, right = [], []
     for x1, y1, x2, y2 in hough_segments(lines):
@@ -234,10 +281,10 @@ def _estimate_lanes_impl(bgr: np.ndarray) -> LaneResult:
     lanes_bev: list[list[dict[str, float]]] = []
     curv = 0.0
     if left:
-        lanes_bev.extend(chain_lane_segments(left, w, h))
+        lanes_bev.extend(chain_lane_segments(left, w, h, far_m))
         conf += 0.4
     if right:
-        lanes_bev.extend(chain_lane_segments(right, w, h))
+        lanes_bev.extend(chain_lane_segments(right, w, h, far_m))
         conf += 0.4
     if left and right:
         # crude curvature from mean slope asymmetry

@@ -851,6 +851,49 @@ def _lane_span(cam: Cam, state: dict[str, Any] | None) -> tuple[float, float]:
     return y_lo, y_hi
 
 
+def _path_far_y(path: Any) -> float | None:
+    """Forward reach of the blue path, in meters."""
+    ys: list[float] = []
+    for p in _as_path(path):
+        ys.append(float(p["y"]))
+    if not ys:
+        return None
+    return max(ys)
+
+
+def _continue_past_path(
+    pts: list[dict[str, float]],
+    path_far_y: float | None,
+    margin_m: float = 2.0,
+) -> list[dict[str, float]]:
+    """Carry one polyline along its own last heading until it passes the path.
+
+    A missing path leaves the samples alone. A line that already passes the
+    path is not lengthened. The extra point is the same piece, not a second
+    Hough segment joined across a gap, and it stops just past the path
+    instead of running out to the cabin span.
+    """
+    if path_far_y is None or len(pts) < 2:
+        return pts
+    ordered = sorted(pts, key=lambda p: (float(p["y"]), float(p["x"])))
+    end = ordered[-1]
+    prev = ordered[-2]
+    if float(end["y"]) > float(path_far_y) + 1e-3:
+        return ordered
+    dy = float(end["y"]) - float(prev["y"])
+    dx = float(end["x"]) - float(prev["x"])
+    if dy <= 1e-3:
+        return ordered
+    target = float(path_far_y) + float(margin_m)
+    tail = {
+        "x": float(end["x"]) + (dx / dy) * (target - float(end["y"])),
+        "y": target,
+    }
+    if "z" in end:
+        tail["z"] = end["z"]
+    return ordered + [tail]
+
+
 def drawn_lane_records(
     state: dict[str, Any] | None,
     lanes: list | None = None,
@@ -858,7 +901,9 @@ def drawn_lane_records(
 ) -> list[dict[str, Any]]:
     """Boundaries the cabin strokes, each tagged through, merge, or exit.
 
-    Points are the ones that get drawn. Nothing is added past the last sample.
+    Points are the ones that get drawn. With no blue path, nothing is added
+    past the last sample. With a path, that same polyline continues on its
+    last heading until it passes the path.
     """
     state = state or {}
     if cam is None:
@@ -868,6 +913,7 @@ def drawn_lane_records(
     smoke = _allow_stub(state)
     hide_fan = suppress_lane_fan(state)
     y_lo, y_hi = _lane_span(cam, state)
+    path_far = _path_far_y(state.get("path_ego"))
     pending: list[dict[str, Any]] = []
     for ln in src or []:
         kind = ln.get("kind") if isinstance(ln, dict) else None
@@ -876,6 +922,8 @@ def drawn_lane_records(
         if lane_draw_mode(kind, smoke=smoke) is None:
             continue
         pts = _clip_poly_y(_poly_points(ln), y_lo, y_hi)
+        pts = _continue_past_path(pts, path_far)
+        pts = _clip_poly_y(pts, y_lo, y_hi)
         if len(pts) < 2:
             continue
         if isinstance(ln, dict):
@@ -906,8 +954,9 @@ def _draw_lanes(img: np.ndarray, lanes: list, cam: Cam, *, smoke: bool, state: d
         style = str(ln.get("style") or "unknown")
         dashed = mode == "dashed" or style == "dashed"
         color, thick, dash_default = _lane_color(mode, fade)
-        # Follow every point on this boundary. A curve stays a curve through
-        # the last seen or predicted sample. Nothing is added past that sample.
+        # Follow every point on this boundary, including the short run past
+        # the blue path when that path is in the frame. A curve stays a curve.
+        # The run does not continue out to the cabin span.
         _stroke_world(
             img, cam, pts, color, thick,
             dashed=dashed or dash_default, dash=10 if mode == "solid" and not dashed else 8, gap=5,

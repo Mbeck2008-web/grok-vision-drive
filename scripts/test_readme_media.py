@@ -70,8 +70,8 @@ def main() -> None:
     assert CHROME_RE.search(src) is None, "SOURCE must not add Tesla/FSD chrome"
     top = readme.split("## Recent changes", 1)[0]
     assert "docs/stitch-360.png" in top
-    assert "docs/soft-esc-highway.jpg" in top
-    assert "photo of the monitor" in top
+    assert "docs/soft-esc-highway.jpg" not in top
+    assert "photo of the monitor" not in readme
     assert "Soft Esc parked" in top
 
     # Parked cabin: regenerating with engaged=False stays the README dest.

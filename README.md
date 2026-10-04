@@ -2,13 +2,9 @@
 
 Grok Vision Drive is an MIT camera-only autopilot toy for BeamNG.drive and BeamNG.tech. Entertainment only. It is not a physical-car controller, and it is not Tesla.
 
-The strip below is what the model is fed. Left to right: repeatL, pillarL, wide, main, narrow, pillarR, repeatR, rear. Empty gaps sit between the cameras. The repeater views keep the ego body at the cleared edge.
+The strip below is what the model is fed. Left to right: repeatL, pillarL, wide, main, narrow, pillarR, repeatR, rear. Empty gaps sit between the cameras. The repeater views keep the ego body at the cleared edge. Soft Esc parked.
 
 ![Flat 360 strip fed to the model](docs/stitch-360.png)
-
-The highway picture is the settled BeamNG game view. It is a photo of the monitor, not a render. Soft Esc parked.
-
-![Soft Esc parked](docs/soft-esc-highway.jpg)
 
 ### repeatL
 
@@ -139,7 +135,7 @@ The tone sample is the road under the sky and above the hood. Sky (190, 200, 210
 
 ## Technical detail
 
-The photos above are the frame path. The strip is what the model is fed. Each named photo is that camera's tile, in the same left-to-right order, with the empty gaps left out. The highway picture is the settled game view. Soft Esc parked. Esc is BeamNG's pause menu. It is not Engage.
+The photos above are the frame path. The strip is what the model is fed. Each named photo is that camera's tile, in the same left-to-right order, with the empty gaps left out. Soft Esc parked. Esc is BeamNG's pause menu. It is not Engage.
 
 ### Colour
 

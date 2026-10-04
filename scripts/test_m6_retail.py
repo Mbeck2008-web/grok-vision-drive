@@ -695,7 +695,7 @@ def check_player_docs() -> None:
     assert "**main alpha** bump" in readme and "features / core / UI overhaul" in readme
     assert "1.7.7-alpha-<sha>" in readme
     assert "docs/stitch-360.png" in readme
-    assert "docs/soft-esc-highway.jpg" in readme
+    assert "docs/soft-esc-highway.jpg" not in readme
     assert "Soft Esc parked" in readme
     assert readme.index("docs/stitch-360.png") < readme.index("## Recent changes")
     assert readme.index("## 1.7.7") > readme.index("## Recent changes")

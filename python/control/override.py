@@ -221,6 +221,36 @@ def own_steer_residual(
     return 0.0
 
 
+def tech_override_steer(
+    steering_input: float | None,
+    ego_fb: Any,
+    *,
+    steer_locked: bool,
+) -> float | None:
+    """Wheel angle for the Tech 1.7.4 residual.
+
+    After the steer hold, ``electrics.steering_input`` is the gvd command. The
+    physical wheel is ``player_steering`` from ``input.lastInputs`` (still
+    recorded when local is blocked). Using the command echo as the wheel would
+    baseline the detector on GVD's own steer. With the lock on and no player
+    echo yet, return None so that baseline waits. Before the lock, electrics
+    are still the wheel, because the wheel is the last writer.
+    """
+    fresh = bool(getattr(ego_fb, "fresh", False)) if ego_fb is not None else False
+    device = bool(getattr(ego_fb, "player_device", False)) if ego_fb is not None else False
+    wheel = getattr(ego_fb, "player_steering", None) if ego_fb is not None else None
+    if fresh and device and wheel is not None:
+        try:
+            w = float(wheel)
+        except (TypeError, ValueError):
+            w = None
+        if w is not None and w == w:
+            return w
+    if steer_locked:
+        return None
+    return steering_input
+
+
 def opposition(ref_steer: float, residual: float) -> float:
     """0..1: how much `residual` fights a steer command of `ref_steer`.
 
@@ -250,6 +280,8 @@ class OverrideDetector:
     steer inside the span. Staying put, catching up inside the span, or echoing the
     command is not `player_steer`. A pull past either end still is. Retail
     `player_device` stays an absolute axis. The Lua override does not share this baseline.
+    On Tech the caller passes the physical wheel (`tech_override_steer`), not the
+    electrics echo, once the steer hold has made electrics equal the command.
     """
 
     def __init__(self, cfg: OverrideConfig | None = None) -> None:

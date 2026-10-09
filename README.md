@@ -154,6 +154,10 @@ Fender repeaters move closer to the body, lower, and slightly back. repeatL is X
 
 With no cameras, Engage plus preview drive is a stop. Throttle is 0, steer is 0, and the brake is `min(0.6, 0.05 * echo speed)` (0.275 at the 5.5 m/s retail echo). A two-lane frame still commands throttle. `.github/workflows/tests.yml` runs the offline scripts on Ubuntu. Windows-only and live BeamNG scripts are skipped. Live Alt+G, Tech 8-cam, force feedback, and Quick Sync stay **UNPROVEN**.
 
+## Engaged steer
+
+While Engage is on in BeamNG.tech, the car follows the controller steer. A physical wheel sitting at center leaves that steer in place. The wheel angle is still read. A held rotation of 0.25 away from the command drops Engage, and the wheel drives the car again. Quit, a supervisor exit, or a dead supervisor gives the wheel back. The product pin stays 1.7.12.
+
 ## 1.7.9 around the car
 
 One supervisor tick reads all eight cameras, then builds the stitch. A camera from an older tick is not reused. Pillar, repeater, and rear lane pixels use that camera's pose, so a side pixel lands beside the car and a rear pixel lands behind it. The steer tick can use those points. Drawn lane lines follow the real points past the blue path and stop where the lane cannot be seen or predicted.

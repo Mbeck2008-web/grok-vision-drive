@@ -573,6 +573,63 @@ check(not M.isEngaged(), 'supervisor OFF still wins after a heartbeat')
 local stayed = readFileAll(engagePath)
 check(stayed and stayed:find('"engaged": false', 1, true), 'heartbeat did not rewrite supervisor OFF (' .. tostring(stayed) .. ')')
 
+-- 16) Tech steer hold: a dead supervisor, or a hold flag going false, gives the wheel back.
+-- Python queues the lock. This mod only clears it. Retail applying is left alone.
+clearEvents()
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":true,"cmd_seq":%d}',
+  os.time() + 50, DRIVE_BUS, DRIVE_BUS, seq))
+M.onUpdate(0.2)
+check(lastAllowed('steering') == nil, 'live tech_steer_hold does not clear the player wheel')
+clearEvents()
+local nLog = #logs
+M.onUpdate(2.2)
+check(lastAllowed('steering') and lastAllowed('steering')[2] == nil,
+  'stale supervisor heartbeat restores player steering')
+local hit = false
+for i = nLog + 1, #logs do
+  if tostring(logs[i]):find('tech steer release', 1, true) then hit = true end
+end
+check(hit, 'stale heartbeat logs tech steer release')
+clearEvents()
+M.onUpdate(0.2)
+check(#allowed == 0, 'a still-stale hold file does not re-arm the release')
+
+clearEvents()
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":true,"cmd_seq":%d}',
+  os.time() + 80, DRIVE_BUS, DRIVE_BUS, seq))
+M.onUpdate(0.2)
+check(lastAllowed('steering') == nil, 'a fresh hold does not release')
+writeFile(statePath, string.format(
+  '{"engaged":false,"disengage_reason":"player_steer","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":false,"cmd_seq":%d}',
+  os.time() + 81, DRIVE_BUS, DRIVE_BUS, seq))
+nLog = #logs
+M.onUpdate(0.2)
+check(lastAllowed('steering') and lastAllowed('steering')[2] == nil,
+  'tech_steer_hold false restores player steering')
+hit = false
+for i = nLog + 1, #logs do
+  if tostring(logs[i]):find('supervisor off', 1, true) then hit = true end
+end
+check(hit, 'hold false logs supervisor off')
+
+clearEvents()
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":true,"cmd_seq":%d}',
+  os.time() + 90, DRIVE_BUS, DRIVE_BUS, seq))
+M.onUpdate(0.2)
+clearEvents()
+nLog = #logs
+M.onExtensionUnloaded()
+check(lastAllowed('steering') and lastAllowed('steering')[2] == nil,
+  'extension unload restores player steering')
+hit = false
+for i = nLog + 1, #logs do
+  if tostring(logs[i]):find('extension unloaded', 1, true) then hit = true end
+end
+check(hit, 'unload logs tech steer release')
+
 -- 12) chrome check on everything we push to the vehicle / HUD
 for _, e in ipairs(logs) do assert(not e:lower():find('tesla') and not e:find('FSD'), 'chrome in log: ' .. e) end
 

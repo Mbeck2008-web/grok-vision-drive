@@ -3,7 +3,12 @@
 -- Retail (window capture): Documents/GVD/gvd_cmd.json is applied to the player vehicle only while
 -- engaged, as a secondary Direct Drive wheel + pedals (FILTER_DIRECT + source gvd + allowedInputSources).
 -- A connected keyboard/pad/wheel/pedal cluster otherwise overwrites pad-smoothed input.event every
--- frame, so the software never actually holds the sim car. No DLL / hooks. Tech still uses BeamNGpy.
+-- frame, so the software never actually holds the sim car. No DLL / hooks.
+-- Tech vehicle.control is that same pad filter on source local, so a centered wheel
+-- overwrites the steer after Python sends it. Python queues a steering-only gvd hold
+-- while engaged. This extension clears that whitelist when the supervisor drops the
+-- hold flag or its heartbeat goes stale, and on unload, so a dead process cannot
+-- leave the wheel disabled. Pedal locks stay on the retail path.
 -- Detector, path, planner and track ghosts keep running/drawing while the supervisor is live;
 -- Alt+G is the takeover latch (ice underglow + actuators), not the start of perception.
 local M = {}
@@ -1054,6 +1059,12 @@ local VE_APPLY_FMT = VE_HOLD
   .. "input.event('brake',%.4f,2,0,0,nil,'gvd');"
   .. "input.event('parkingbrake',0,2,0,0,nil,'gvd');"
   .. "input.event('clutch',0,2,0,0,nil,'gvd')"
+-- Steering-only undo of the Tech hold. Same text as Python TECH_STEER_RELEASE_LUA.
+-- Retail VE_RELEASE still clears every axis; this one leaves pedals alone.
+M.techSteerRelease = "input.event('steering',0,2,900,0,nil,'gvd');"
+  .. "if input and input.setAllowedInputSource then "
+  .. "input.setAllowedInputSource('steering',nil);"
+  .. "end"
 local VE_RELEASE = "input.event('steering',0,2,900,0,nil,'gvd');"
   .. "input.event('throttle',0,2,0,0,nil,'gvd');"
   .. "input.event('brake',0,2,0,0,nil,'gvd');"
@@ -1676,6 +1687,11 @@ local function pollStateFile()
   if firstGood then
     pushUi()
   end
+  -- Arm the Tech steer-release watch from a live supervisor. A stale file must
+  -- not re-arm it after we already gave the wheel back.
+  if stateBeatAcc <= 2.0 and lastGood and lastGood.tech_steer_hold == true then
+    M.techSteerOwed = true
+  end
 end
 
 local function pollState(dt)
@@ -1686,6 +1702,19 @@ local function pollState(dt)
   pollStateFile()
   -- After the state read so the logged reason is the supervisor's fresh disengage_reason.
   syncEngageFromSupervisor()
+  -- Tech steer hold is not retail `applying`. Python queues the release on a
+  -- clean stop. If that process dies, the heartbeat stops and this clears
+  -- the steering whitelist. Retail applying owns the whitelist itself.
+  if M.techSteerOwed and not applying then
+    local hold = lastGood and lastGood.tech_steer_hold == true
+    if stateBeatAcc > 2.0 or not hold then
+      M.techSteerOwed = false
+      local why = (stateBeatAcc > 2.0) and 'supervisor heartbeat stale' or 'supervisor off'
+      queueVehicle(applyVeh or getPlayerVeh(), M.techSteerRelease)
+      log('I', 'GVD', '[GVD] tech steer release (' .. why .. ')')
+      print('[GVD] tech steer release (' .. why .. ')')
+    end
+  end
 end
 
 local preRenderSeen = false
@@ -1985,6 +2014,12 @@ end
 
 function M.onExtensionUnloaded()
   releaseInputs('extension unloaded')
+  if M.techSteerOwed and not applying then
+    queueVehicle(getPlayerVeh(), M.techSteerRelease)
+    log('I', 'GVD', '[GVD] tech steer release (extension unloaded)')
+    print('[GVD] tech steer release (extension unloaded)')
+  end
+  M.techSteerOwed = false
   engaged = false
   writeEngageFile('extension_unloaded')
   lastGood = nil

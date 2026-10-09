@@ -58,7 +58,7 @@ The settled game view. Soft Esc parked.
 
 ![rear](docs/cams/rear.jpg)
 
-## Recent changes (alpha 1.7.9)
+## Recent changes (alpha 1.7.11)
 
 Catch-up from **1.0.1**. Each feature merge since that pin is one main step. The throttle fix is the point in between. Live Alt+G, Tech 8-cam, FFB, and QSV stay **UNPROVEN**.
 
@@ -146,15 +146,19 @@ The tone sample is the road under the sky and above the hood. Sky (190, 200, 210
 
 Fender repeaters move closer to the body, lower, and slightly back. repeatL is X -0.81, Y 1.25, Z 0.67, yaw -150. repeatR is X 0.81, Y 1.25, Z 0.67, yaw 150. The aim is 10 degrees farther out from the car than 160, still more rear than side. They still ignore only the ego car. Pillar and rear cameras stay put. Narrow and main stay put. The wide camera keeps its aim. Its picture widens from 4:3 to 16:9.
 
+## 1.7.11 engaged steer
+
+While Engage is on in BeamNG.tech, the car follows the controller steer. A physical wheel sitting at center leaves that steer in place. The wheel angle is still read. A held rotation of 0.25 away from the command drops Engage, and the wheel drives the car again. Quit, a supervisor exit, or a dead supervisor gives the wheel back. Point 1.7.10 is the open cameras pull request, so this fix is 1.7.11.
+
 ## 1.7.9 around the car
 
 One supervisor tick reads all eight cameras, then builds the stitch. A camera from an older tick is not reused. Pillar, repeater, and rear lane pixels use that camera's pose, so a side pixel lands beside the car and a rear pixel lands behind it. The steer tick can use those points. Drawn lane lines follow the real points past the blue path and stop where the lane cannot be seen or predicted.
 
-## Alpha 1.7.9
+## Alpha 1.7.11
 
 This is **alpha** — may break / not work; improves with fixes.
 
-Canonical pin **1.7.9** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Untagged retail zips use `1.7.9-alpha-<sha>`.
+Canonical pin **1.7.11** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Untagged retail zips use `1.7.11-alpha-<sha>`. 1.7.10 is the open cameras pull request.
 
 **Versioning** (this line stays **alpha** until a later non-alpha release):
 

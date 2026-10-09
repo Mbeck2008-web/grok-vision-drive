@@ -60,7 +60,8 @@ Soft Esc reads the same tick from `gvd_state.json` and the `[GVD] seg` line. Pol
 | `disengage_reason` | string | `none` / `not_engaged` / `preview_blocked` / `heartbeat_stale` / `player_steer` / `player_brake` / `player_throttle` / … (sticky reasons live in `gvd_engage.json`) |
 | `actuator` | string | `beamngpy` (Tech) / `cmd_json` (retail: GELua applies) / `null` |
 | `cmd_seq` | int | Monotonic command sequence |
-| `cmd_applied` | bool | True when BeamNGpy `vehicle.control` ran, **or** the mod acked this seq via `gvd_ego.json` (fresh, `applying`, `applied_seq` equal to `cmd_seq` or up to 5 behind — a higher seq from a previous supervisor is not an ack) |
+| `cmd_applied` | bool | True when BeamNGpy `vehicle.control` ran, **or** the mod acked this seq via `gvd_ego.json` (fresh, `applying`, `applied_seq` equal to `cmd_seq` or up to 5 behind — a higher seq from a previous supervisor is not an ack). On Tech, `vehicle.control` returning does not mean the wheel left that steer in place; `tech_steer_hold` is the lock that does |
+| `tech_steer_hold` | bool | Tech only. True while the steering whitelist is queued (`source=gvd`, `local` blocked). False after the release chunk is queued. The mod clears that whitelist when this flag is false or the state heartbeat is stale, and on unload |
 | `cmd_reason` | string | Gate / plan reason; `cmd_json_applied` (acked) / `cmd_json_pending` (written, no ack) / `cmd_json_idle` (not engaged) |
 | `ego.speed_mps` | float | From Electrics `wheelspeed`/`airspeed` (BeamNGpy) or the mod's `gvd_ego.json` echo; else last known (not invented 10) |
 | `ego.throttle` / `ego.brake` | float | Last commanded values |
@@ -196,7 +197,7 @@ Python reads the file every tick. `engaged:false` is always off. `engaged:true` 
 
 ## Player override (force-feedback residual)
 
-`config/control.yaml` `override:` owns the research-pin thresholds; the supervisor mirrors them into `override_cfg` every tick so `gvd_main` runs the same numbers without parsing YAML. Without a player device the signal is `|steering_input − cmd.steer|` against the command in force when the echo was sampled. On retail while the secondary Direct Drive source is locked, electrics are GVD's command and override reads `player_*` lastInputs as an absolute axis. Live FFB is **UNPROVEN**. `CMD_DEAD_S` is not part of this.
+`config/control.yaml` `override:` owns the research-pin thresholds; the supervisor mirrors them into `override_cfg` every tick so `gvd_main` runs the same numbers without parsing YAML. Without a player device the signal is `|steering_input − cmd.steer|` against the command in force when the echo was sampled. On retail while the secondary Direct Drive source is locked, electrics are GVD's command and override reads `player_*` lastInputs as an absolute axis. On Tech while `tech_steer_hold` is set, electrics are the gvd steer and the 1.7.4 residual reads `player_steering` (the physical wheel). A missing player echo while the hold is on is not treated as the command. Live FFB is **UNPROVEN**. `CMD_DEAD_S` is not part of this.
 
 | Field | Type | Notes |
 | --- | --- | --- |
@@ -239,7 +240,7 @@ Lua (`gvd_main.applyCmdJson`, 20 Hz): `input.event('steering', s, 2, 900, 0, nil
 | `speed_mps` | float | `wheelspeed` (fallback `airspeed`) — feeds `ego.speed_mps`, TTC, speed plan |
 | `steering_input` / `throttle_input` / `brake_input` | float | Applied electrics (GVD's command while the Direct Drive source is locked). Fallback override signal when `player_device` is false |
 | `player_device` | bool | True when vehicle Lua saw a non-`gvd` `input.lastInputs` source (physical wheel/pad/keys). Sources `adas` / `beamngpy` / `tech` are not a player device |
-| `player_steering` / `player_throttle` / `player_brake` | float | Strongest non-`gvd` lastInputs axis. Retail override uses these as an absolute axis when `player_device` is true (centered wheel is 0, not residual vs `cmd.steer`). Soft Esc beamngpy does not: it judges electrics against the command plus a baseline taken at engage |
+| `player_steering` / `player_throttle` / `player_brake` | float | Strongest non-`gvd` / `adas` / `beamngpy` / `tech` lastInputs axis. Recorded even when that source is blocked. Retail override uses these as an absolute axis when `player_device` is true (centered wheel is 0, not residual vs `cmd.steer`). Tech steer hold uses `player_steering` as the 1.7.4 wheel (span vs the command, a held rotation of 0.25 drops Engage). Pedals on Tech stay the electrics residual; they are not in the steering whitelist |
 | `applied_seq` | int | Last cmd seq Lua applied. Python claims `cmd_applied` only when `0 <= cmd_seq - applied_seq <= 5` |
 | `applying` | bool | Lua currently holds the inputs |
 | `mtime` | int | `os.time()`; Python uses the file mtime, fresh ≤ 1 s |
@@ -247,6 +248,8 @@ Lua (`gvd_main.applyCmdJson`, 20 Hz): `input.event('steering', s, 2, 900, 0, nil
 | `pos` / `dir` | `{x,y,z}`? | Player vehicle world pose from GE (`getPosition` / `getDirectionVector`); GPS lat/lon is derived from this × `gps.ref_*` |
 
 Retail (`capture_backend=window`): `actuator=cmd_json`; `cmd_applied` follows the ack. Boot line: `backend=window cams=1/8 path=retail (1 window capture; not 8; drive=gvd_cmd.json->mod Lua secondary Direct Drive wheel+pedals)`.
+
+Tech (`actuator=beamngpy`): pedals, parking brake, and clutch stay on `vehicle.control` (arcade, no gear field). That message's steer is pad filter 1 on source `local`, the same source as the physical wheel, and the wheel's later event wins. While engaged, Python also queues `tech_steer_hold_lua`: `setAllowedInputSource('steering','gvd',true)`, `('steering','local',false)`, then `input.event('steering', s, 2, 900, 0, nil, 'gvd')`. The wheel angle remains in `lastInputs` / `player_steering`. A held rotation of 0.25 away from the command is `player_steer` (1.7.4 span) and drops Engage. Disengage or shutdown queues `TECH_STEER_RELEASE_LUA` (`input.event` zero on source `gvd`, then `setAllowedInputSource('steering',nil)`). The mod queues that same release when `tech_steer_hold` is false, when the state heartbeat is stale past 2 s, or on extension unload, so a dead supervisor does not leave the wheel blocked. Log lines: `[GVD] tech steer hold <steer> (player wheel locked out; source=gvd)` and `[GVD] tech steer release (player wheel restored)` (Python) or `[GVD] tech steer release (supervisor heartbeat stale|supervisor off|extension unloaded)` (Lua).
 
 ## Debug knobs (`debug`)
 

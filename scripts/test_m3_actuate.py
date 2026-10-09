@@ -33,6 +33,7 @@ from python.control.actuate import (
     TECH_DRIVE_SHIFT_LUA,
     gear_is_forward,
     tech_control_kwargs,
+    tech_steer_hold_lua,
 )
 
 
@@ -188,15 +189,20 @@ def check_drive_gear_arm() -> None:
     assert not is_reverse_control(kw)
     assert neutral.shifts == [TECH_SHIFT_MODE]
     assert "ok" in log and TECH_SHIFT_MODE in log
-    assert neutral.lua == [TECH_DRIVE_SHIFT_LUA]
+    def _arms(veh: ArmVeh) -> list[str]:
+        return [c for c in veh.lua if c == TECH_DRIVE_SHIFT_LUA]
+
+    assert _arms(neutral) == [TECH_DRIVE_SHIFT_LUA]
+    assert neutral.lua[-1] == tech_steer_hold_lua(0.1)
     assert tech.drive_arm_n == 1
     with redirect_stdout(io.StringIO()):
         tech.apply(DriveCommand(steer=0.1, throttle=0.55, brake=0.0, seq=2, reason="ok"))
-    assert len(neutral.lua) == 1, "second arm inside the delay must not queue again"
+    assert len(_arms(neutral)) == 1, "second arm inside the delay must not queue again"
+    assert neutral.lua[-1] == tech_steer_hold_lua(0.1)
     tech._drive_arm_mono = time.monotonic() - (TECH_DRIVE_ARM_S + 0.05)
     with redirect_stdout(io.StringIO()):
         tech.apply(DriveCommand(steer=0.1, throttle=0.55, brake=0.0, seq=3, reason="ok"))
-    assert len(neutral.lua) == 2
+    assert len(_arms(neutral)) == 2
     assert all("shiftDown" not in chunk and "-1" not in chunk for chunk in neutral.lua)
 
     forward = ArmVeh("D")
@@ -204,7 +210,7 @@ def check_drive_gear_arm() -> None:
     tech_d.note_engaged(True)
     with redirect_stdout(io.StringIO()):
         tech_d.apply(DriveCommand(steer=0.0, throttle=0.4, brake=0.0, seq=4, reason="ok"))
-    assert forward.lua == []
+    assert forward.lua == [tech_steer_hold_lua(0.0)]
     assert "gear" not in forward.calls[-1]
     assert forward.calls[-1]["parkingbrake"] == 0.0
 
@@ -232,7 +238,10 @@ def check_drive_gear_arm() -> None:
         tech_box.note_engaged(True)
         with redirect_stdout(io.StringIO()):
             tech_box.apply(DriveCommand(steer=0.0, throttle=0.4, brake=0.0, seq=8, reason="ok"))
-        assert boxed.lua == [], f"forward gear on a non-dict container still armed: {type(sensors).__name__}"
+        assert all(c != TECH_DRIVE_SHIFT_LUA for c in boxed.lua), (
+            f"forward gear on a non-dict container still armed: {type(sensors).__name__}"
+        )
+        assert boxed.lua == [tech_steer_hold_lua(0.0)]
 
     still_n = ArmVeh("N")
     still_n.sensors = _ItemSensors("N")
@@ -240,7 +249,8 @@ def check_drive_gear_arm() -> None:
     tech_n.note_engaged(True)
     with redirect_stdout(io.StringIO()):
         tech_n.apply(DriveCommand(steer=0.0, throttle=0.4, brake=0.0, seq=9, reason="ok"))
-    assert still_n.lua == [TECH_DRIVE_SHIFT_LUA]
+    assert still_n.lua[0] == TECH_DRIVE_SHIFT_LUA
+    assert still_n.lua[-1] == tech_steer_hold_lua(0.0)
 
     _check_lua_arm_leaves_mode_alone()
 

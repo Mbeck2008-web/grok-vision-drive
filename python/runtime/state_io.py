@@ -271,7 +271,8 @@ def load_paint_state(path: Path | None = None) -> dict[str, Any]:
     return st
 
 
-def write_state(state: dict[str, Any], path: Path | None = None) -> Path:
+def write_state(state: dict[str, Any], path: Path | None = None) -> Path | None:
+    """Write gvd_state.json. None when the atomic replace did not land."""
     p = path or state_path()
     state = dict(state)
     attach_bus_identity(state)
@@ -279,7 +280,8 @@ def write_state(state: dict[str, Any], path: Path | None = None) -> Path:
     state["python_bus"] = str(p.parent)
     state["heartbeat_unix"] = int(time.time())  # match Lua os.time() seconds
     state["heartbeat_mtime"] = time.time()  # high-res for Lua dead-man
-    atomic_write_json(p, state)
+    if not atomic_write_json(p, state):
+        return None
     print_py_bus(p, state)
     return p
 

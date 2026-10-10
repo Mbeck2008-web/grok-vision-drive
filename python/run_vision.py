@@ -73,22 +73,36 @@ from python.viz.stage import STAGE_W, STAGE_H, VizUI, render_stage, smoke
 
 
 
+_STEER_GRAB_BLIND_LOGGED = False
+
+
 def sample_tech_wheel(actuator: object, steer_in: float | None) -> float | None:
     """Wheel angle the Tech override should see.
 
     A non-Tech actuator returns the electrics sample. On Tech, a fresh
     ``player_steering`` from ``gvd_ego.json`` is the physical wheel
     (``lastInputs``, still recorded when local is blocked). While the hold
-    is on and that echo is missing, return None so the detector does not
-    baseline on the command.
+    is on and that echo is missing, return None. The detector seeds rest at
+    0 once it is armed, so that missing echo is not a wheel at the command.
+    The first time the hold is on and the echo stays missing, log once: the
+    grab path cannot see the wheel.
     """
+    global _STEER_GRAB_BLIND_LOGGED
     if getattr(actuator, "name", "") != "beamngpy":
         return steer_in
-    return tech_override_steer(
+    locked = bool(getattr(actuator, "steer_locked", False))
+    sampled = tech_override_steer(
         steer_in,
         read_ego_feedback(),
-        steer_locked=bool(getattr(actuator, "steer_locked", False)),
+        steer_locked=locked,
     )
+    if locked and sampled is None and not _STEER_GRAB_BLIND_LOGGED:
+        _STEER_GRAB_BLIND_LOGGED = True
+        print(
+            "[GVD] tech steer grab blind: player_steering missing while hold is on",
+            flush=True,
+        )
+    return sampled
 
 
 def _load_control_yaml() -> dict:
@@ -740,7 +754,7 @@ def main() -> None:
             # Tech omits steering from vehicle.control and locks local out of the hydros, so
             # lastInputs.local.steering stays the wheel. The 1.7.4 residual reads that echo
             # from gvd_ego.json. own_axes keeps the pedal residual on electrics (pedals are
-            # not locked) and the steer baseline follows the resting wheel when the command changes.
+            # not locked). While the hold is on, rest is 0 until a real wheel sample arrives.
             owns_axes = getattr(actuator, "name", "") == "beamngpy"
             if owns_axes:
                 ovr_steer = sample_tech_wheel(actuator, steer_in)
@@ -758,6 +772,7 @@ def main() -> None:
                 brake_input=ovr_brk,
                 player_device=ovr_dev,
                 own_axes=owns_axes,
+                steer_locked=bool(getattr(actuator, "steer_locked", False)) if owns_axes else False,
                 applied_seq=None if owns_axes else (
                     ego_fb.applied_seq if ego_fb is not None and ego_fb.fresh else None
                 ),

@@ -232,9 +232,11 @@ def tech_override_steer(
     After the steer hold, ``electrics.steering_input`` is the gvd command. The
     physical wheel is ``player_steering`` from ``input.lastInputs`` (still
     recorded when local is blocked). Using the command echo as the wheel would
-    baseline the detector on GVD's own steer. With the lock on and no player
-    echo yet, return None so that baseline waits. Before the lock, electrics
-    are still the wheel, because the wheel is the last writer.
+    baseline the detector on GVD's own steer.     With the lock on and no player
+    echo yet, return None. Once the detector is armed, that missing echo
+    seeds rest at 0 so the next wheel sample is not stored as the resting
+    angle. Before the lock, electrics are still the wheel, because the wheel
+    is the last writer.
     """
     fresh = bool(getattr(ego_fb, "fresh", False)) if ego_fb is not None else False
     device = bool(getattr(ego_fb, "player_device", False)) if ego_fb is not None else False
@@ -363,6 +365,7 @@ class OverrideDetector:
         now: float | None = None,
         player_device: bool = False,
         own_axes: bool = False,
+        steer_locked: bool = False,
     ) -> OverrideVerdict:
         cfg = self.cfg
         t = time.monotonic() if now is None else float(now)
@@ -396,6 +399,14 @@ class OverrideDetector:
         # throttle and wins a tie, because that is the reason a player most needs to be told.
         thr_r = max(0.0, _clamp(throttle_input, 0.0, 1.0) - ref_thr) if throttle_input is not None else 0.0
         brk_r = max(0.0, _clamp(brake_input, 0.0, 1.0) - ref_brk) if brake_input is not None else 0.0
+        # Tech hold: rest is 0, the command's origin. A missing echo must not
+        # leave rest unset, or the next wheel sample is stored as rest and a
+        # grab already in hand at arm time is the baseline. Unlocked own_axes
+        # still takes the first real wheel sample as the resting angle.
+        if own_axes and steer_locked and self._base_steer is None:
+            self._base_steer = 0.0
+            self._base_steer_cmd = ref_steer
+            self._caught = 0.0
         if steering_input is None:
             raw = 0.0
         elif own_axes:

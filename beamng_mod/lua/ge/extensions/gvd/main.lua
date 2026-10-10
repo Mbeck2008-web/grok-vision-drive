@@ -9,8 +9,12 @@
 -- and a held wheel grab would read back as the command. This extension clears the
 -- steering whitelist when the supervisor drops the hold flag or its heartbeat goes
 -- stale, and on unload, then replays lastInputs.local.steering so a wheel already
--- held drives without waiting for the next onChange. The latch stays set until that
--- queue succeeds. Pedal locks stay on the retail path.
+-- held drives without waiting for the next onChange. The replay uses an angle and
+-- lock type stored beside that value when they are present. Otherwise it is Direct
+-- Drive filter 2, angle 900, lock type 0. The latch stays set until that queue
+-- succeeds. Unload retries the release and leaves tech_steer_hold true on disk
+-- until a try succeeds, so the next load still arms the watch. Pedal locks stay
+-- on the retail path.
 -- Detector, path, planner and track ghosts keep running/drawing while the supervisor is live;
 -- Alt+G is the takeover latch (ice underglow + actuators), not the start of perception.
 local M = {}
@@ -1065,15 +1069,31 @@ local VE_APPLY_FMT = VE_HOLD
 -- Clear the whitelist, then replay the stored local wheel. A held wheel is
 -- onChange and will not write again until it moves. Pedals stay alone.
 -- 'local' is a keyword, so the source is lastInputs['local'].
+-- lastInputs normally stores only the axis value. A table may carry value,
+-- angle, and lockType. A number may have sibling steeringAngle / angle and
+-- steeringLockType / lockType. Otherwise filter 2, angle 900, lockType 0,
+-- which does not reproduce a non-direct player binding.
 M.techSteerRelease = "if input and input.setAllowedInputSource then "
   .. "input.setAllowedInputSource('steering',nil);"
   .. "end;"
-  .. "local s=0;"
+  .. "local s,ang,lk=0,900,0;"
   .. "if input and input.lastInputs and input.lastInputs['local'] then "
-  .. "s=tonumber(input.lastInputs['local'].steering) or 0;"
+  .. "local slot=input.lastInputs['local'];"
+  .. "local raw=slot.steering;"
+  .. "if type(raw)=='table' then "
+  .. "s=tonumber(raw.value or raw[1]) or 0;"
+  .. "ang=tonumber(raw.angle) or ang;"
+  .. "lk=tonumber(raw.lockType or raw.lock) or lk;"
+  .. "else "
+  .. "s=tonumber(raw) or 0;"
+  .. "ang=tonumber(slot.steeringAngle or slot.angle) or ang;"
+  .. "lk=tonumber(slot.steeringLockType or slot.lockType) or lk;"
+  .. "end;"
   .. "end;"
   .. "if s~=s or s==math.huge or s==-math.huge then s=0 end;"
-  .. "input.event('steering',s,2,900,0,nil,'local')"
+  .. "if ang~=ang or ang==math.huge or ang==-math.huge then ang=900 end;"
+  .. "if lk~=lk or lk==math.huge or lk==-math.huge then lk=0 end;"
+  .. "input.event('steering',s,2,ang,lk,nil,'local')"
 local VE_RELEASE = "input.event('steering',0,2,900,0,nil,'gvd');"
   .. "input.event('throttle',0,2,0,0,nil,'gvd');"
   .. "input.event('brake',0,2,0,0,nil,'gvd');"
@@ -2022,13 +2042,49 @@ function M.onExtensionLoaded()
     .. '; drives the player vehicle from gvd_cmd.json as a secondary Direct Drive wheel+pedals (retail). BeamNGpy direct control on Tech.')
 end
 
+function M.noteTechSteerHold(held)
+  -- Keep or clear the disk flag without a new chunk local. A failed unload
+  -- must leave tech_steer_hold true so the next load still arms the watch.
+  local raw = readText(STATE_REL)
+  local flag = held and 'true' or 'false'
+  if type(raw) ~= 'string' or raw == '' then
+    raw = '{}'
+  end
+  local patched, n = raw:gsub('"tech_steer_hold"%s*:%s*[%w]+', '"tech_steer_hold":' .. flag, 1)
+  if n == 0 then
+    if raw:match('^%s*{%s*}%s*$') then
+      patched = '{"tech_steer_hold":' .. flag .. '}'
+    else
+      local inserted, n2 = raw:gsub('%}%s*$', ',"tech_steer_hold":' .. flag .. '}', 1)
+      if n2 == 0 then
+        patched = '{"tech_steer_hold":' .. flag .. '}'
+      else
+        patched = inserted
+      end
+    end
+  end
+  if not writeText(STATE_REL, patched) then
+    log('W', 'GVD', '[GVD] tech steer hold flag publish failed')
+    print('[GVD] tech steer hold flag publish failed')
+  end
+end
+
 function M.onExtensionUnloaded()
   releaseInputs('extension unloaded')
   if M.techSteerOwed and not applying then
-    if queueVehicle(getPlayerVeh(), M.techSteerRelease) then
+    local released = false
+    local tries = 0
+    while tries < 3 and not released do
+      tries = tries + 1
+      released = queueVehicle(applyVeh or getPlayerVeh(), M.techSteerRelease)
+    end
+    if released then
       M.techSteerOwed = false
+      M.noteTechSteerHold(false)
       log('I', 'GVD', '[GVD] tech steer release (extension unloaded)')
       print('[GVD] tech steer release (extension unloaded)')
+    else
+      M.noteTechSteerHold(true)
     end
   end
   engaged = false

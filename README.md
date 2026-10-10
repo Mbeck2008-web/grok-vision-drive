@@ -148,7 +148,7 @@ Fender repeaters move closer to the body, lower, and slightly back. repeatL is X
 
 ## 1.7.11 engaged steer
 
-While Engage is on in BeamNG.tech, the car follows the controller steer. `vehicle.control` does not carry steering on that path, so a wheel held at an angle stays the grab signal. A physical wheel sitting at center leaves the controller steer in place. The wheel angle is still read. A held rotation of 0.25 away from the command drops Engage, and that held angle drives the car again without waiting for the wheel to move. Quit, a supervisor exit, or a dead supervisor gives the wheel back. Point 1.7.10 is the open cameras pull request, so this fix is 1.7.11.
+While Engage is on in BeamNG.tech, the car follows the controller steer. `vehicle.control` does not carry steering on that path, so a wheel held at an angle stays the grab signal. A physical wheel sitting at center leaves the controller steer in place. The wheel angle is still read. A held rotation of 0.25 away from the command drops Engage, and that held angle drives the car again without waiting for the wheel to move. While the hold is on and the wheel echo is missing, the grab baseline is 0, so that 0.25 is the grab. If the steer-hold queue does not land, the command stays unapplied and the next tick still omits steering. Quit, a supervisor exit, or a dead supervisor gives the wheel back. Unload retries the release and leaves `tech_steer_hold` true on disk until a release queue succeeds. When an angle and a lock type sit beside the stored wheel value, the release uses them; otherwise the replay is Direct Drive filter 2, angle 900, lock type 0. Point 1.7.10 is the open cameras pull request, so this fix is 1.7.11.
 
 ## 1.7.9 around the car
 

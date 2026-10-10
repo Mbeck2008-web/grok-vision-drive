@@ -644,6 +644,9 @@ def check_bend_not_roundabout_and_blinkers() -> None:
         def set_lights(self, **kw) -> None:
             self.lights.append(kw)
 
+        def queue_lua_command(self, chunk, response: bool = False) -> None:
+            return None
+
     veh = _Lights()
     act = BeamNGPyActuator(veh)
     try:

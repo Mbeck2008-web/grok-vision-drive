@@ -284,6 +284,9 @@ def check_drive_gear_arm() -> None:
                 }
             )
 
+        def queue_lua_command(self, chunk, response: bool = False) -> None:
+            return None
+
     bare = NoClutch()
     tech_b = BeamNGPyActuator(bare)
     tech_b.note_engaged(True)
@@ -869,6 +872,9 @@ def main() -> None:
         def control(self, **kw):
             self.calls.append(kw)
 
+        def queue_lua_command(self, chunk, response: bool = False) -> None:
+            return None
+
     def _assert_no_reverse(kw: dict) -> None:
         assert not is_reverse_control(kw), kw
         assert "gear" not in kw, kw
@@ -938,6 +944,9 @@ def main() -> None:
             self.calls.append(
                 {"steering": steering, "throttle": throttle, "brake": brake, "parkingbrake": parkingbrake}
             )
+
+        def queue_lua_command(self, chunk, response: bool = False) -> None:
+            return None
 
     ng = NoGearVeh()
     tech_ng = BeamNGPyActuator(ng)

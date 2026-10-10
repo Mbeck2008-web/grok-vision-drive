@@ -18,7 +18,9 @@
 -- arms the watch. Unload retries the release and, when every try fails, writes
 -- the flag true if the state file can be read. tech_steer_hold_vid is a
 -- beamngpy vehicle name: scenetree.findObject, then be:getObjectByID when the
--- id is numeric, then the player vehicle, so the whitelist cannot stay stuck.
+-- id is numeric, then the player vehicle. A player-only fallback still queues
+-- the release, and the latch stays until the named vehicle is the one released.
+-- nPlayer == 0 writes player_steering as JSON null so a live zero is missing.
 -- Pedal locks stay on the retail path.
 -- Detector, path, planner and track ghosts keep running/drawing while the supervisor is live;
 -- Alt+G is the takeover latch (ice underglow + actuators), not the start of perception.
@@ -1417,19 +1419,26 @@ local function writeEgoFile()
     if okd then dirJson = jsonVec3(dir) end
   end
   local np = math.floor(tonumber(egoFb.nPlayer) or 0)
+  -- No player source: a live 0 would look like a centered wheel and silence
+  -- tech_wheel_blind. JSON null is a missing echo. A real device at 0 still
+  -- writes 0.0000.
+  local pSteerJson = 'null'
+  if np > 0 then
+    pSteerJson = string.format('%.4f', tonumber(egoFb.pSteer) or 0)
+  end
   local bus = tostring(luaBusPath()):gsub('"', '')
   local payload = string.format(
     '{"speed_mps":%.3f,"steering_input":%.4f,"throttle_input":%.4f,"brake_input":%.4f,'
       .. '"applied_seq":%d,"applying":%s,"mtime":%d,'
       .. '"gx":%s,"gy":%s,"gz":%s,"yaw_rate":%s,"pos":%s,"dir":%s,'
-      .. '"player_device":%s,"player_steering":%.4f,"player_throttle":%.4f,"player_brake":%.4f,'
+      .. '"player_device":%s,"player_steering":%s,"player_throttle":%.4f,"player_brake":%.4f,'
       .. '"lua_bus":"%s"}',
     egoFb.speed, egoFb.steer, egoFb.throttle, egoFb.brake,
     math.floor(tonumber(lastAppliedSeq) or -1), applying and 'true' or 'false', os.time(),
     jsonNum(egoFb.gx), jsonNum(egoFb.gy), jsonNum(egoFb.gz), jsonNum(egoFb.yawRate, '%.5f'),
     posJson, dirJson,
     np > 0 and 'true' or 'false',
-    tonumber(egoFb.pSteer) or 0, tonumber(egoFb.pThr) or 0, tonumber(egoFb.pBrk) or 0,
+    pSteerJson, tonumber(egoFb.pThr) or 0, tonumber(egoFb.pBrk) or 0,
     bus)
   writeText(gvdFile('gvd_ego.json'), payload)
 end
@@ -1744,11 +1753,24 @@ local function pollStateFile()
   if loadWatch and M.techSteerOwed and lastGood and M.techSteerBeatStale(lastGood) then
     M.techSteerLoadReplay = true
     if queueVehicle(M.techSteerTarget(), M.techSteerRelease) then
-      M.finishTechSteerLoadReplay()
-      log('I', 'GVD', '[GVD] tech steer release (load replay)')
-      print('[GVD] tech steer release (load replay)')
+      if M.techSteerTargetFallback then
+        M.noteTechSteerFallback()
+      else
+        M.techSteerFallbackLogged = nil
+        M.finishTechSteerLoadReplay()
+        log('I', 'GVD', '[GVD] tech steer release (load replay)')
+        print('[GVD] tech steer release (load replay)')
+      end
     end
   end
+end
+
+function M.noteTechSteerFallback()
+  -- The named vehicle was not the one released. Log once and keep the latch.
+  if M.techSteerFallbackLogged then return end
+  M.techSteerFallbackLogged = true
+  log('I', 'GVD', '[GVD] tech steer release (player fallback)')
+  print('[GVD] tech steer release (player fallback)')
 end
 
 function M.techSteerBeatStale(st)
@@ -1769,7 +1791,9 @@ end
 
 function M.techSteerTarget()
   -- BeamNGpy vid is a vehicle name. Resolve that name, then a numeric id,
-  -- then the player vehicle so a dead supervisor cannot leave the whitelist up.
+  -- then the player vehicle. The player fallback sets techSteerTargetFallback
+  -- so the caller keeps the latch until the named vehicle is released.
+  M.techSteerTargetFallback = nil
   local id = M.techSteerVehId
   if id ~= nil then
     if scenetree and scenetree.findObject then
@@ -1781,6 +1805,7 @@ function M.techSteerTarget()
       local ok, got = pcall(function() return be:getObjectByID(n) end)
       if ok and got and got.queueLuaCommand then return got end
     end
+    M.techSteerTargetFallback = true
     return getPlayerVeh()
   end
   if applyVeh and applyVeh.queueLuaCommand then return applyVeh end
@@ -1803,13 +1828,18 @@ local function pollState(dt)
     if stateBeatAcc > 2.0 or not hold then
       local why = (stateBeatAcc > 2.0) and 'supervisor heartbeat stale' or 'hold flag clear'
       if queueVehicle(M.techSteerTarget(), M.techSteerRelease) then
-        if M.techSteerLoadReplay then
-          M.finishTechSteerLoadReplay()
+        if M.techSteerTargetFallback then
+          M.noteTechSteerFallback()
         else
-          M.techSteerOwed = false
+          M.techSteerFallbackLogged = nil
+          if M.techSteerLoadReplay then
+            M.finishTechSteerLoadReplay()
+          else
+            M.techSteerOwed = false
+          end
+          log('I', 'GVD', '[GVD] tech steer release (' .. why .. ')')
+          print('[GVD] tech steer release (' .. why .. ')')
         end
-        log('I', 'GVD', '[GVD] tech steer release (' .. why .. ')')
-        print('[GVD] tech steer release (' .. why .. ')')
       end
     end
   end
@@ -2148,10 +2178,12 @@ function M.onExtensionUnloaded()
       tries = tries + 1
       released = queueVehicle(M.techSteerTarget(), M.techSteerRelease)
     end
-    if released then
+    if released and not M.techSteerTargetFallback then
       M.techSteerOwed = false
       log('I', 'GVD', '[GVD] tech steer release (extension unloaded)')
       print('[GVD] tech steer release (extension unloaded)')
+    elseif released then
+      M.noteTechSteerFallback()
     else
       M.noteTechSteerHold(true)
     end

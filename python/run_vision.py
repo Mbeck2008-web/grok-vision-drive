@@ -74,9 +74,13 @@ from python.viz.stage import STAGE_W, STAGE_H, VizUI, render_stage, smoke
 
 
 _STEER_GRAB_BLIND_LOGGED = False
+_STEER_GRAB_BLIND_SINCE: float | None = None
+_STEER_WHEEL_BLIND_S = 2.0
 
 
-def sample_tech_wheel(actuator: object, steer_in: float | None) -> float | None:
+def sample_tech_wheel(
+    actuator: object, steer_in: float | None, *, now: float | None = None
+) -> float | None:
     """Wheel angle the Tech override should see.
 
     A non-Tech actuator returns the electrics sample. On Tech, a fresh
@@ -85,9 +89,10 @@ def sample_tech_wheel(actuator: object, steer_in: float | None) -> float | None:
     is on and that echo is missing, return None. The detector seeds rest at
     0 once it is armed, so that missing echo is not a wheel at the command.
     The first time the hold is on and the echo stays missing, log once: the
-    grab path cannot see the wheel.
+    grab path cannot see the wheel. A real sample, or the lock dropping,
+    clears that log so the next lock can say it again.
     """
-    global _STEER_GRAB_BLIND_LOGGED
+    global _STEER_GRAB_BLIND_LOGGED, _STEER_GRAB_BLIND_SINCE
     if getattr(actuator, "name", "") != "beamngpy":
         return steer_in
     locked = bool(getattr(actuator, "steer_locked", False))
@@ -96,13 +101,35 @@ def sample_tech_wheel(actuator: object, steer_in: float | None) -> float | None:
         read_ego_feedback(),
         steer_locked=locked,
     )
-    if locked and sampled is None and not _STEER_GRAB_BLIND_LOGGED:
+    if not locked or sampled is not None:
+        _STEER_GRAB_BLIND_LOGGED = False
+        _STEER_GRAB_BLIND_SINCE = None
+        return sampled
+    t = time.monotonic() if now is None else float(now)
+    if _STEER_GRAB_BLIND_SINCE is None:
+        _STEER_GRAB_BLIND_SINCE = t
+    if not _STEER_GRAB_BLIND_LOGGED:
         _STEER_GRAB_BLIND_LOGGED = True
         print(
             "[GVD] tech steer grab blind: player_steering missing while hold is on",
             flush=True,
         )
     return sampled
+
+
+def tech_wheel_blind_reason(*, now: float | None = None) -> str | None:
+    """Drop Engage when the locked grab path has been blind for more than 2 s.
+
+    A grab has to be able to disengage. ``player_steering`` missing while the
+    hold is up means that path cannot see the wheel.
+    """
+    since = _STEER_GRAB_BLIND_SINCE
+    if since is None:
+        return None
+    t = time.monotonic() if now is None else float(now)
+    if (t - since) > _STEER_WHEEL_BLIND_S:
+        return "tech_wheel_blind"
+    return None
 
 
 def _load_control_yaml() -> dict:
@@ -765,6 +792,18 @@ def main() -> None:
                 )
             else:
                 ovr_steer, ovr_thr, ovr_brk, ovr_dev = steer_in, throttle_in, brake_in, False
+            if (
+                owns_axes
+                and engaged
+                and not ui.debug.ignore_override
+                and tech_wheel_blind_reason() == "tech_wheel_blind"
+            ):
+                engaged = False
+                disengage_reason = "tech_wheel_blind"
+                bot_engage.clear()
+                write_engage_flag(False, disengage_reason=disengage_reason)
+                print("[GVD] DISENGAGED: tech_wheel_blind", flush=True)
+                cmd = stop_command(seq=cmd_seq, reason="tech_wheel_blind")
             ovr = override.update(
                 engaged=engaged,
                 steering_input=ovr_steer,
@@ -888,9 +927,19 @@ def main() -> None:
             st["viz_note"] = viz_note
             st["detector"] = pout.detector_name
             st["actuator"] = actuator.name
-            # Rising edge already flushed this flag before queue_lua_command.
-            # This is the steady snapshot after the tick.
-            st["tech_steer_hold"] = bool(getattr(actuator, "steer_locked", False))
+            # Steady snapshot after the tick. True while a hold is pending or
+            # the lock is up, until a release queue is accepted.
+            hold_fn = getattr(actuator, "tech_steer_hold_for_state", None)
+            if callable(hold_fn):
+                st["tech_steer_hold"] = bool(hold_fn())
+            else:
+                st["tech_steer_hold"] = bool(getattr(actuator, "steer_locked", False))
+            if st["tech_steer_hold"]:
+                vid = getattr(actuator, "steer_hold_vid", None)
+                if vid is None:
+                    vid = getattr(actuator, "_steer_hold_vid", None)
+                if vid is not None:
+                    st["tech_steer_hold_vid"] = vid
             st["cmd_seq"] = int(applied.seq)
             st["cmd_reason"] = applied.reason
             st["cmd_applied"] = bool(applied.applied)

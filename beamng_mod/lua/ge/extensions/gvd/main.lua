@@ -9,12 +9,14 @@
 -- and a held wheel grab would read back as the command. This extension clears the
 -- steering whitelist when the supervisor drops the hold flag or its heartbeat goes
 -- stale, and on unload, then replays lastInputs.local.steering so a wheel already
--- held drives without waiting for the next onChange. The replay uses an angle and
--- lock type stored beside that value when they are present. Otherwise it is Direct
--- Drive filter 2, angle 900, lock type 0. The latch stays set until that queue
--- succeeds. Unload retries the release and leaves tech_steer_hold true on disk
--- until a try succeeds, so the next load still arms the watch. Pedal locks stay
--- on the retail path.
+-- held drives without waiting for the next onChange. The replay uses a filter,
+-- angle, and lock type stored beside that value when they are present. Otherwise
+-- it is Direct Drive filter 2, angle 900, lock type 0. The latch stays set until
+-- that queue is accepted. Accepting the queue does not clear tech_steer_hold;
+-- the next load arms the watch again and re-releases. Unload retries the release
+-- and, when every try fails, writes the flag true if the state file can be read.
+-- A remembered tech_steer_hold_vid is the only vehicle that release is queued
+-- on. A missing object waits for a later tick. Pedal locks stay on the retail path.
 -- Detector, path, planner and track ghosts keep running/drawing while the supervisor is live;
 -- Alt+G is the takeover latch (ice underglow + actuators), not the start of perception.
 local M = {}
@@ -1070,13 +1072,13 @@ local VE_APPLY_FMT = VE_HOLD
 -- onChange and will not write again until it moves. Pedals stay alone.
 -- 'local' is a keyword, so the source is lastInputs['local'].
 -- lastInputs normally stores only the axis value. A table may carry value,
--- angle, and lockType. A number may have sibling steeringAngle / angle and
--- steeringLockType / lockType. Otherwise filter 2, angle 900, lockType 0,
--- which does not reproduce a non-direct player binding.
+-- angle, lockType, and filter. A number may have sibling steeringAngle / angle,
+-- steeringLockType / lockType, and steeringFilter / filter. Otherwise filter 2,
+-- angle 900, lockType 0, which does not reproduce a non-direct player binding.
 M.techSteerRelease = "if input and input.setAllowedInputSource then "
   .. "input.setAllowedInputSource('steering',nil);"
   .. "end;"
-  .. "local s,ang,lk=0,900,0;"
+  .. "local s,ang,lk,flt=0,900,0,2;"
   .. "if input and input.lastInputs and input.lastInputs['local'] then "
   .. "local slot=input.lastInputs['local'];"
   .. "local raw=slot.steering;"
@@ -1084,16 +1086,19 @@ M.techSteerRelease = "if input and input.setAllowedInputSource then "
   .. "s=tonumber(raw.value or raw[1]) or 0;"
   .. "ang=tonumber(raw.angle) or ang;"
   .. "lk=tonumber(raw.lockType or raw.lock) or lk;"
+  .. "flt=tonumber(raw.filter or raw.filt) or flt;"
   .. "else "
   .. "s=tonumber(raw) or 0;"
   .. "ang=tonumber(slot.steeringAngle or slot.angle) or ang;"
   .. "lk=tonumber(slot.steeringLockType or slot.lockType) or lk;"
+  .. "flt=tonumber(slot.steeringFilter or slot.filter) or flt;"
   .. "end;"
   .. "end;"
   .. "if s~=s or s==math.huge or s==-math.huge then s=0 end;"
   .. "if ang~=ang or ang==math.huge or ang==-math.huge then ang=900 end;"
   .. "if lk~=lk or lk==math.huge or lk==-math.huge then lk=0 end;"
-  .. "input.event('steering',s,2,ang,lk,nil,'local')"
+  .. "if flt~=flt or flt==math.huge or flt==-math.huge then flt=2 end;"
+  .. "input.event('steering',s,flt,ang,lk,nil,'local')"
 local VE_RELEASE = "input.event('steering',0,2,900,0,nil,'gvd');"
   .. "input.event('throttle',0,2,0,0,nil,'gvd');"
   .. "input.event('brake',0,2,0,0,nil,'gvd');"
@@ -1659,6 +1664,8 @@ local function syncEngageFromSupervisor()
 end
 
 local function pollStateFile()
+  local loadWatch = M.techSteerLoadWatch
+  M.techSteerLoadWatch = nil
   local path = STATE_REL
   local raw = readText(path)
   if not raw then
@@ -1716,11 +1723,33 @@ local function pollStateFile()
   if firstGood then
     pushUi()
   end
-  -- Arm the Tech steer-release watch from a live supervisor. A stale file must
-  -- not re-arm it after we already gave the wheel back.
-  if stateBeatAcc <= 2.0 and lastGood and lastGood.tech_steer_hold == true then
+  -- Arm the Tech steer-release watch from a live supervisor, or once on load
+  -- even when the file is already stale, so a reload re-releases. A later
+  -- stale poll must not re-arm it after we already gave the wheel back.
+  if lastGood and lastGood.tech_steer_hold_vid ~= nil then
+    M.techSteerVehId = lastGood.tech_steer_hold_vid
+  end
+  if lastGood and lastGood.tech_steer_hold == true and (stateBeatAcc <= 2.0 or loadWatch) then
     M.techSteerOwed = true
   end
+end
+
+function M.techSteerTarget()
+  -- The vehicle the hold was queued on. A stored id that is not in the world
+  -- yet returns nil so the next tick retries, instead of releasing some other
+  -- player vehicle. With no id, use the last applied vehicle or the player.
+  local id = M.techSteerVehId
+  if id ~= nil then
+    local obj = nil
+    if be and be.getObjectByID then
+      local ok, got = pcall(function() return be:getObjectByID(id) end)
+      if ok then obj = got end
+    end
+    if obj and obj.queueLuaCommand then return obj end
+    return nil
+  end
+  if applyVeh and applyVeh.queueLuaCommand then return applyVeh end
+  return getPlayerVeh()
 end
 
 local function pollState(dt)
@@ -1738,7 +1767,7 @@ local function pollState(dt)
     local hold = lastGood and lastGood.tech_steer_hold == true
     if stateBeatAcc > 2.0 or not hold then
       local why = (stateBeatAcc > 2.0) and 'supervisor heartbeat stale' or 'hold flag clear'
-      if queueVehicle(applyVeh or getPlayerVeh(), M.techSteerRelease) then
+      if queueVehicle(M.techSteerTarget(), M.techSteerRelease) then
         M.techSteerOwed = false
         log('I', 'GVD', '[GVD] tech steer release (' .. why .. ')')
         print('[GVD] tech steer release (' .. why .. ')')
@@ -2018,6 +2047,7 @@ function M.onUpdate(dt)
 end
 
 function M.onExtensionLoaded()
+  M.techSteerLoadWatch = true
   gvdDocsDir()  -- resolve + log once
   readUiPrefs()
   -- Do not wait for onUpdate/onPreRender: CEF Apps poke pushUiState while lastGood
@@ -2043,13 +2073,14 @@ function M.onExtensionLoaded()
 end
 
 function M.noteTechSteerHold(held)
-  -- Keep or clear the disk flag without a new chunk local. A failed unload
-  -- must leave tech_steer_hold true so the next load still arms the watch.
+  -- Keep or set the disk flag without a new chunk local. A missing file is
+  -- left missing: do not invent a stub. A failed unload writes true when the
+  -- file can be read so the next load still arms the watch.
   local raw = readText(STATE_REL)
-  local flag = held and 'true' or 'false'
   if type(raw) ~= 'string' or raw == '' then
-    raw = '{}'
+    return
   end
+  local flag = held and 'true' or 'false'
   local patched, n = raw:gsub('"tech_steer_hold"%s*:%s*[%w]+', '"tech_steer_hold":' .. flag, 1)
   if n == 0 then
     if raw:match('^%s*{%s*}%s*$') then
@@ -2076,11 +2107,10 @@ function M.onExtensionUnloaded()
     local tries = 0
     while tries < 3 and not released do
       tries = tries + 1
-      released = queueVehicle(applyVeh or getPlayerVeh(), M.techSteerRelease)
+      released = queueVehicle(M.techSteerTarget(), M.techSteerRelease)
     end
     if released then
       M.techSteerOwed = false
-      M.noteTechSteerHold(false)
       log('I', 'GVD', '[GVD] tech steer release (extension unloaded)')
       print('[GVD] tech steer release (extension unloaded)')
     else

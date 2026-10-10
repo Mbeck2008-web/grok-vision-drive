@@ -193,7 +193,8 @@ def check_drive_gear_arm() -> None:
         return [c for c in veh.lua if c == TECH_DRIVE_SHIFT_LUA]
 
     assert _arms(neutral) == [TECH_DRIVE_SHIFT_LUA]
-    assert neutral.lua[-1] == tech_steer_hold_lua(0.1)
+    assert neutral.lua[0] == tech_steer_hold_lua(0.1)
+    assert neutral.lua[-1] == TECH_DRIVE_SHIFT_LUA
     assert tech.drive_arm_n == 1
     with redirect_stdout(io.StringIO()):
         tech.apply(DriveCommand(steer=0.1, throttle=0.55, brake=0.0, seq=2, reason="ok"))
@@ -249,8 +250,8 @@ def check_drive_gear_arm() -> None:
     tech_n.note_engaged(True)
     with redirect_stdout(io.StringIO()):
         tech_n.apply(DriveCommand(steer=0.0, throttle=0.4, brake=0.0, seq=9, reason="ok"))
-    assert still_n.lua[0] == TECH_DRIVE_SHIFT_LUA
-    assert still_n.lua[-1] == tech_steer_hold_lua(0.0)
+    assert still_n.lua[0] == tech_steer_hold_lua(0.0)
+    assert still_n.lua[-1] == TECH_DRIVE_SHIFT_LUA
 
     _check_lua_arm_leaves_mode_alone()
 

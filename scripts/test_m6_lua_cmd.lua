@@ -692,6 +692,19 @@ check(ev and ev[6] == 'local' and near(ev[2], -0.2) and ev[3] == 2 and ev[4] == 
   'release uses a table angle and lockType ('
   .. tostring(ev and ev[2]) .. ' ang ' .. tostring(ev and ev[4]) .. ')')
 
+-- A stored filter is replayed when it sits beside the value.
+clearEvents()
+veEnv.input.lastInputs['local'] = { steering = 0.2, steeringFilter = 1, steeringAngle = 900, steeringLockType = 0 }
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":true,"cmd_seq":%d}',
+  os.time() + 97, DRIVE_BUS, DRIVE_BUS, seq))
+M.onUpdate(0.2)
+clearEvents()
+M.onUpdate(2.2)
+ev = lastEvent('steering')
+check(ev and ev[6] == 'local' and near(ev[2], 0.2) and ev[3] == 1 and ev[4] == 900 and ev[5] == 0,
+  'release uses steeringFilter (' .. tostring(ev and ev[3]) .. ')')
+
 -- Unload retries inside one call. One failed queue is consumed by the retry.
 clearEvents()
 veEnv.input.lastInputs['local'] = { steering = 0.55 }
@@ -713,8 +726,10 @@ for i = nLog + 1, #logs do
 end
 check(hit, 'unload logs tech steer release')
 local disk = readFileAll(statePath)
-check(disk and disk:find('"tech_steer_hold":false', 1, true),
-  'successful unload clears the hold flag (' .. tostring(disk) .. ')')
+check(disk and disk:find('"tech_steer_hold":true', 1, true),
+  'queue accept leaves the hold flag (' .. tostring(disk) .. ')')
+M.onExtensionLoaded()
+check(M.techSteerOwed == true, 'next load re-arms a hold the unload did not clear')
 
 -- Every retry fails: latch stays, disk flag is forced true, the next load arms.
 local keptBeat = os.time() + 110
@@ -741,6 +756,50 @@ check(disk and disk:find('"tech_steer_hold":true', 1, true),
 M.techSteerOwed = false
 M.onExtensionLoaded()
 check(M.techSteerOwed == true, 'next load arms from the hold flag the failed unload kept')
+
+-- Remembered vehicle id. getPlayerVeh nil, object missing on the first try.
+local remembered = setmetatable({ id = 303 }, Veh)
+local lookups = 0
+local savedGet = be.getPlayerVehicle
+be.getPlayerVehicle = function() return nil end
+be.getObjectByID = function(_, id)
+  lookups = lookups + 1
+  if lookups == 1 then return nil end
+  if id == 303 then return remembered end
+  return nil
+end
+clearEvents()
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":true,"tech_steer_hold_vid":303,"cmd_seq":%d}',
+  os.time() + 120, DRIVE_BUS, DRIVE_BUS, seq))
+M.techSteerOwed = false
+M.techSteerVehId = nil
+M.onUpdate(0.2)
+check(M.techSteerOwed == true, 'vid hold arms the watch')
+clearEvents()
+nLog = #logs
+M.onUpdate(2.2)
+check(M.techSteerOwed == true, 'nil target keeps the latch for a later tick')
+hit = false
+for i = nLog + 1, #logs do
+  if tostring(logs[i]):find('tech steer release', 1, true) then hit = true end
+end
+check(not hit, 'nil target skips the success log')
+clearEvents()
+M.onUpdate(0.2)
+check(M.techSteerOwed == false, 'later tick releases on the remembered vehicle')
+local foundVid = false
+for i = 1, #events do
+  if events[i][1] == 'steering' and events[i].veh == 303 then foundVid = true end
+end
+check(foundVid, 'release queued on vehicle 303')
+be.getPlayerVehicle = savedGet
+be.getObjectByID = nil
+
+-- A missing state file is not replaced.
+vfsBus[statePath] = nil
+M.noteTechSteerHold(true)
+check(vfsBus[statePath] == nil, 'noteTechSteerHold skips a missing file')
 
 -- 12) chrome check on everything we push to the vehicle / HUD
 for _, e in ipairs(logs) do assert(not e:lower():find('tesla') and not e:find('FSD'), 'chrome in log: ' .. e) end

@@ -54,6 +54,8 @@ STEER_SPIKE = 0.20
 BRAKE_ENTER = 0.06
 THROTTLE_ENTER = 0.10
 LPF_TAU_MS = 80.0
+# Tech lock only. Wheel angle inside this of centre is centring slop, not a grab.
+STEER_CENTER_DEADBAND = 0.15
 
 # Soft opposition bias. Not yaml knobs: the pin fixes the thresholds, and this only leans on
 # them. A residual fighting GVD's steer counts up to +25 % more, ramped in by how hard GVD is
@@ -84,6 +86,7 @@ class OverrideConfig:
     brake_enter: float = BRAKE_ENTER
     throttle_enter: float = THROTTLE_ENTER
     lpf_tau_ms: float = LPF_TAU_MS
+    steer_center_deadband: float = STEER_CENTER_DEADBAND
 
     @property
     def steer_hold_s(self) -> float:
@@ -155,6 +158,7 @@ def load_override_config(cfg: dict[str, Any] | None = None) -> OverrideConfig:
         brake_enter=num("brake_enter", BRAKE_ENTER, 0.005, 1.0),
         throttle_enter=num("throttle_enter", THROTTLE_ENTER, 0.005, 1.0),
         lpf_tau_ms=num("lpf_tau_ms", LPF_TAU_MS, 0.0, 1000.0),
+        steer_center_deadband=num("steer_center_deadband", STEER_CENTER_DEADBAND, 0.0, 1.0),
     )
 
 
@@ -168,6 +172,7 @@ def config_mirror(cfg: OverrideConfig) -> dict[str, Any]:
         "brake_enter": round(cfg.brake_enter, 4),
         "throttle_enter": round(cfg.throttle_enter, 4),
         "lpf_tau_ms": round(cfg.lpf_tau_ms, 3),
+        "steer_center_deadband": round(cfg.steer_center_deadband, 4),
     }
 
 
@@ -221,22 +226,27 @@ def own_steer_residual(
     return 0.0
 
 
-def command_side_residual(echo: float, ref_steer: float) -> float:
-    """Grab past the command, on the command's side.
+def locked_steer_residual(echo: float, ref_steer: float, deadband: float) -> float:
+    """Wheel residual while the Tech steer hold is up.
 
-    A straight command (near 0) has no side, so the residual is the wheel
-    angle. A wheel of 0.10 against command 0 is past ``steer_enter`` 0.08
-    and a sustained hold drops Engage. A nonzero command ignores the wheel
-    until it passes that command on the same side: wheel 0 or a small
-    opposite offset against command 0.35 is residual 0.
+    ``c`` is the command, ``w`` is the wheel, ``D`` is the straight/centre
+    deadband (``steer_center_deadband``, 0.15). A wheel between 0 and ``c``
+    is following. Past ``c`` on ``c``'s side the residual is ``|w - c|``.
+    On the opposite side of 0, or when the command is straight
+    (``|c| <= 1e-3``), the residual is ``max(0, |w| - D)``. A held 0.25 in
+    any of those directions is past ``steer_enter`` after the dwell. A wheel
+    resting at 0.10 from force-feedback or centring slop is inside ``D``.
     """
-    cmd = float(ref_steer)
-    wheel = float(echo)
-    if abs(cmd) <= 1e-3:
-        return wheel
-    if cmd > 0.0:
-        return 0.0 if wheel <= cmd else wheel - cmd
-    return 0.0 if wheel >= cmd else wheel - cmd
+    c = float(ref_steer)
+    w = float(echo)
+    d = float(deadband)
+    if abs(c) <= 1e-3:
+        return max(0.0, abs(w) - d)
+    if (c > 0.0 and 0.0 <= w <= c) or (c < 0.0 and c <= w <= 0.0):
+        return 0.0
+    if (c > 0.0 and w > c) or (c < 0.0 and w < c):
+        return abs(w - c)
+    return max(0.0, abs(w) - d)
 
 
 def tech_override_steer(
@@ -248,18 +258,19 @@ def tech_override_steer(
     """Wheel angle for the Tech 1.7.4 residual.
 
     After the steer hold, ``electrics.steering_input`` is the gvd command. The
-    physical wheel is ``player_steering`` from ``input.lastInputs`` (still
-    recorded when local is blocked). Using the command echo as the wheel would
-    baseline the detector on GVD's own steer. With the lock on and no player
-    echo yet, return None. Once the detector is armed, that missing echo
+    physical wheel is a fresh numeric ``player_steering`` from
+    ``input.lastInputs`` (still recorded when local is blocked). That number
+    counts even when ``player_device`` is false. Using the command echo as
+    the wheel would baseline the detector on GVD's own steer. With the lock
+    on and no fresh numeric echo, return None: the field is absent, or
+    ``gvd_ego.json`` is stale. Once the detector is armed, that missing echo
     seeds rest at 0 so the next wheel sample is not stored as the resting
-    angle. Before the lock, electrics are still the wheel, because the wheel
-    is the last writer.
+    angle. Before the lock, electrics are still the wheel when the echo is
+    missing, because the wheel is the last writer.
     """
     fresh = bool(getattr(ego_fb, "fresh", False)) if ego_fb is not None else False
-    device = bool(getattr(ego_fb, "player_device", False)) if ego_fb is not None else False
     wheel = getattr(ego_fb, "player_steering", None) if ego_fb is not None else None
-    if fresh and device and wheel is not None:
+    if fresh and wheel is not None:
         try:
             w = float(wheel)
         except (TypeError, ValueError):
@@ -418,8 +429,8 @@ class OverrideDetector:
         thr_r = max(0.0, _clamp(throttle_input, 0.0, 1.0) - ref_thr) if throttle_input is not None else 0.0
         brk_r = max(0.0, _clamp(brake_input, 0.0, 1.0) - ref_brk) if brake_input is not None else 0.0
         # Tech hold: rest is 0 so a grab already in hand is not the baseline.
-        # Opposition counts only past the command on the command's side.
-        # Unlocked own_axes still takes the first real wheel sample as rest.
+        # The locked residual uses the centre deadband. Unlocked own_axes
+        # still takes the first real wheel sample as rest.
         if own_axes and steer_locked and self._base_steer is None:
             self._base_steer = 0.0
             self._base_steer_cmd = ref_steer
@@ -427,7 +438,11 @@ class OverrideDetector:
         if steering_input is None:
             raw = 0.0
         elif own_axes and steer_locked:
-            raw = command_side_residual(_clamp(steering_input, -1.0, 1.0), ref_steer)
+            raw = locked_steer_residual(
+                _clamp(steering_input, -1.0, 1.0),
+                ref_steer,
+                self.cfg.steer_center_deadband,
+            )
         elif own_axes:
             echo_s = _clamp(steering_input, -1.0, 1.0)
             if self._base_steer is None:

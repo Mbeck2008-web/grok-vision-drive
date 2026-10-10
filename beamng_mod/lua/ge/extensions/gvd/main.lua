@@ -12,11 +12,14 @@
 -- held drives without waiting for the next onChange. The replay uses a filter,
 -- angle, and lock type stored beside that value when they are present. Otherwise
 -- it is Direct Drive filter 2, angle 900, lock type 0. The latch stays set until
--- that queue is accepted. Accepting the queue does not clear tech_steer_hold;
--- the next load arms the watch again and re-releases. Unload retries the release
--- and, when every try fails, writes the flag true if the state file can be read.
--- A remembered tech_steer_hold_vid is the only vehicle that release is queued
--- on. A missing object waits for a later tick. Pedal locks stay on the retail path.
+-- that queue is accepted. Accepting the queue does not clear tech_steer_hold.
+-- The next load replays the release once when the heartbeat is already stale,
+-- then clears the flag so the latch does not stay owed. A live heartbeat only
+-- arms the watch. Unload retries the release and, when every try fails, writes
+-- the flag true if the state file can be read. tech_steer_hold_vid is a
+-- beamngpy vehicle name: scenetree.findObject, then be:getObjectByID when the
+-- id is numeric, then the player vehicle, so the whitelist cannot stay stuck.
+-- Pedal locks stay on the retail path.
 -- Detector, path, planner and track ghosts keep running/drawing while the supervisor is live;
 -- Alt+G is the takeover latch (ice underglow + actuators), not the start of perception.
 local M = {}
@@ -1147,6 +1150,8 @@ local OVR = {
   brake_enter = 0.06,
   throttle_enter = 0.10,
   lpf_tau_ms = 80,
+  -- Tech locked residual only. Retail override math does not read this.
+  steer_center_deadband = 0.15,
 }
 -- Soft opposition bias: a residual fighting GVD's steer counts up to 25 % more, ramped in by how
 -- hard GVD is actually steering. Not a threshold of its own, so not a mirrored config key.
@@ -1213,6 +1218,7 @@ local function readOverrideCfg(st)
   num('brake_enter', 0.005, 1)
   num('throttle_enter', 0.005, 1)
   num('lpf_tau_ms', 0, 1000)
+  num('steer_center_deadband', 0, 1)
   -- Exit at or above enter would leave the dwell unable to discharge.
   if OVR.steer_exit >= OVR.steer_enter then OVR.steer_exit = OVR.steer_enter * 0.95 end
   if not ovrCfgLogged then
@@ -1732,21 +1738,50 @@ local function pollStateFile()
   if lastGood and lastGood.tech_steer_hold == true and (stateBeatAcc <= 2.0 or loadWatch) then
     M.techSteerOwed = true
   end
+  -- The load that follows an accepted unload replays the release once when
+  -- the supervisor is already stale, then clears the disk flag so the latch
+  -- does not stay owed. A live heartbeat only arms the watch.
+  if loadWatch and M.techSteerOwed and lastGood and M.techSteerBeatStale(lastGood) then
+    M.techSteerLoadReplay = true
+    if queueVehicle(M.techSteerTarget(), M.techSteerRelease) then
+      M.finishTechSteerLoadReplay()
+      log('I', 'GVD', '[GVD] tech steer release (load replay)')
+      print('[GVD] tech steer release (load replay)')
+    end
+  end
+end
+
+function M.techSteerBeatStale(st)
+  -- Wall clock, not stateBeatAcc. A fresh extension load resets the accumulator
+  -- when it first sees a beat, so a future or live heartbeat must not replay.
+  if not st then return true end
+  local mt = tonumber(st.heartbeat_mtime)
+  if mt == nil then return true end
+  return (os.time() - mt) > 2
+end
+
+function M.finishTechSteerLoadReplay()
+  M.techSteerLoadReplay = nil
+  M.techSteerOwed = false
+  if lastGood then lastGood.tech_steer_hold = false end
+  M.noteTechSteerHold(false)
 end
 
 function M.techSteerTarget()
-  -- The vehicle the hold was queued on. A stored id that is not in the world
-  -- yet returns nil so the next tick retries, instead of releasing some other
-  -- player vehicle. With no id, use the last applied vehicle or the player.
+  -- BeamNGpy vid is a vehicle name. Resolve that name, then a numeric id,
+  -- then the player vehicle so a dead supervisor cannot leave the whitelist up.
   local id = M.techSteerVehId
   if id ~= nil then
-    local obj = nil
-    if be and be.getObjectByID then
-      local ok, got = pcall(function() return be:getObjectByID(id) end)
-      if ok then obj = got end
+    if scenetree and scenetree.findObject then
+      local ok, got = pcall(function() return scenetree.findObject(tostring(id)) end)
+      if ok and got and got.queueLuaCommand then return got end
     end
-    if obj and obj.queueLuaCommand then return obj end
-    return nil
+    local n = tonumber(id)
+    if n ~= nil and be and be.getObjectByID then
+      local ok, got = pcall(function() return be:getObjectByID(n) end)
+      if ok and got and got.queueLuaCommand then return got end
+    end
+    return getPlayerVeh()
   end
   if applyVeh and applyVeh.queueLuaCommand then return applyVeh end
   return getPlayerVeh()
@@ -1768,7 +1803,11 @@ local function pollState(dt)
     if stateBeatAcc > 2.0 or not hold then
       local why = (stateBeatAcc > 2.0) and 'supervisor heartbeat stale' or 'hold flag clear'
       if queueVehicle(M.techSteerTarget(), M.techSteerRelease) then
-        M.techSteerOwed = false
+        if M.techSteerLoadReplay then
+          M.finishTechSteerLoadReplay()
+        else
+          M.techSteerOwed = false
+        end
         log('I', 'GVD', '[GVD] tech steer release (' .. why .. ')')
         print('[GVD] tech steer release (' .. why .. ')')
       end

@@ -796,6 +796,103 @@ check(foundVid, 'release queued on vehicle 303')
 be.getPlayerVehicle = savedGet
 be.getObjectByID = nil
 
+-- BeamNGpy vid is a vehicle name. scenetree.findObject resolves the string.
+local named = setmetatable({ id = 404 }, Veh)
+scenetree = {
+  findObject = function(name)
+    if name == 'gvdcar' then return named end
+    return nil
+  end,
+}
+clearEvents()
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":true,"tech_steer_hold_vid":"gvdcar","cmd_seq":%d}',
+  os.time() + 140, DRIVE_BUS, DRIVE_BUS, seq))
+M.techSteerOwed = false
+M.techSteerVehId = nil
+M.onUpdate(0.2)
+check(M.techSteerOwed == true, 'string vid arms the watch')
+check(M.techSteerVehId == 'gvdcar', 'string vid is stored (' .. tostring(M.techSteerVehId) .. ')')
+clearEvents()
+M.onUpdate(2.2)
+check(M.techSteerOwed == false, 'string vid release clears the latch')
+local foundName = false
+for i = 1, #events do
+  if events[i][1] == 'steering' and events[i].veh == 404 then foundName = true end
+end
+check(foundName, 'release queued on scenetree.findObject vehicle 404')
+
+-- An unresolvable name falls back to the player vehicle.
+clearEvents()
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":true,"tech_steer_hold_vid":"nosuch","cmd_seq":%d}',
+  os.time() + 150, DRIVE_BUS, DRIVE_BUS, seq))
+M.techSteerOwed = false
+M.techSteerVehId = nil
+M.onUpdate(0.2)
+check(M.techSteerOwed == true, 'unresolvable name arms the watch')
+clearEvents()
+M.onUpdate(2.2)
+check(M.techSteerOwed == false, 'unresolvable name falls back to the player and clears the latch')
+local foundPlayer = false
+for i = 1, #events do
+  if events[i][1] == 'steering' and events[i].veh == 101 then foundPlayer = true end
+end
+check(foundPlayer, 'unresolvable name released on player vehicle 101')
+
+-- An unresolvable numeric id falls back to the player vehicle too.
+be.getObjectByID = function(_, _id) return nil end
+clearEvents()
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":true,"tech_steer_hold_vid":999,"cmd_seq":%d}',
+  os.time() + 160, DRIVE_BUS, DRIVE_BUS, seq))
+M.techSteerOwed = false
+M.techSteerVehId = nil
+M.onUpdate(0.2)
+clearEvents()
+M.onUpdate(2.2)
+check(M.techSteerOwed == false, 'unresolvable numeric id falls back to the player')
+foundPlayer = false
+for i = 1, #events do
+  if events[i][1] == 'steering' and events[i].veh == 101 then foundPlayer = true end
+end
+check(foundPlayer, 'unresolvable numeric id released on player vehicle 101')
+be.getObjectByID = nil
+scenetree = nil
+
+-- Unload's release was accepted. A later load with a stale heartbeat replays
+-- that release once and clears tech_steer_hold so the latch does not stay owed.
+clearEvents()
+veEnv.input.lastInputs['local'] = { steering = 0.33 }
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":true,"cmd_seq":%d}',
+  os.time() + 200, DRIVE_BUS, DRIVE_BUS, seq))
+M.techSteerOwed = false
+M.techSteerVehId = nil
+M.techSteerLoadReplay = nil
+releaseFails = 0
+M.onUpdate(0.2)
+check(M.techSteerOwed == true, 'load-replay setup arms the watch')
+M.onExtensionUnloaded()
+check(M.techSteerOwed == false, 'accepted unload clears the latch')
+disk = readFileAll(statePath)
+check(disk and disk:find('"tech_steer_hold":true', 1, true),
+  'accepted unload leaves the hold flag (' .. tostring(disk) .. ')')
+writeFile(statePath, string.format(
+  '{"engaged":false,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":true,"cmd_seq":%d}',
+  os.time() - 10, DRIVE_BUS, DRIVE_BUS, seq))
+nLog = #logs
+M.onExtensionLoaded()
+check(M.techSteerOwed == false, 'stale load replay does not leave the latch owed')
+disk = readFileAll(statePath)
+check(disk and disk:find('"tech_steer_hold":false', 1, true),
+  'load replay clears tech_steer_hold (' .. tostring(disk) .. ')')
+hit = false
+for i = nLog + 1, #logs do
+  if tostring(logs[i]):find('load replay', 1, true) then hit = true end
+end
+check(hit, 'load replay logs tech steer release')
+
 -- A missing state file is not replaced.
 vfsBus[statePath] = nil
 M.noteTechSteerHold(true)

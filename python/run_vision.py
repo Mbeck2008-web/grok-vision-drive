@@ -84,13 +84,15 @@ def sample_tech_wheel(
     """Wheel angle the Tech override should see.
 
     A non-Tech actuator returns the electrics sample. On Tech, a fresh
-    ``player_steering`` from ``gvd_ego.json`` is the physical wheel
-    (``lastInputs``, still recorded when local is blocked). While the hold
-    is on and that echo is missing, return None. The detector seeds rest at
-    0 once it is armed, so that missing echo is not a wheel at the command.
-    The first time the hold is on and the echo stays missing, log once: the
-    grab path cannot see the wheel. A real sample, or the lock dropping,
-    clears that log so the next lock can say it again.
+    numeric ``player_steering`` from ``gvd_ego.json`` is the physical wheel
+    (``lastInputs``, still recorded when local is blocked), even when
+    ``player_device`` is false. While the hold is on and that field is
+    absent or the file is stale, return None and start the blind timer.
+    The detector seeds rest at 0 once it is armed, so that missing echo is
+    not a wheel at the command. The first time the hold is on and the echo
+    stays missing, log once: the grab path cannot see the wheel. A real
+    sample, or the lock dropping, clears that log so the next lock can say
+    it again.
     """
     global _STEER_GRAB_BLIND_LOGGED, _STEER_GRAB_BLIND_SINCE
     if getattr(actuator, "name", "") != "beamngpy":

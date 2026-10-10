@@ -37,7 +37,9 @@ override:
   # Tech steer hold only. Straight/centre deadband on the physical wheel.
   # A wheel resting at 0.10 from force-feedback or centring slop stays inside
   # it. A held 0.25 in any direction (straight, past the command, or opposite)
-  # is past it and drops Engage after the dwell. Retail Lua does not use this.
+  # is past it and drops Engage after the dwell. Python treats |command| < 0.02
+  # as straight, so command 0.002 with the wheel at 0.10 stays engaged.
+  # Retail Lua does not use this.
   steer_center_deadband: 0.15
   # Pedals asymmetric and tight: no filter, no dwell, one-sided (only a press beyond what GVD
   # asked for), and brake lower than throttle.

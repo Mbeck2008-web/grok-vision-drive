@@ -56,6 +56,10 @@ THROTTLE_ENTER = 0.10
 LPF_TAU_MS = 80.0
 # Tech lock only. Wheel angle inside this of centre is centring slop, not a grab.
 STEER_CENTER_DEADBAND = 0.15
+# Commands inside this band use the straight/centre formula. Wider than 1e-3 so
+# command 0.002 with a wheel at 0.10 stays engaged. Narrower than the centre
+# deadband so a real command keeps the owner magnitude rule.
+STRAIGHT_CMD_BAND = 0.02
 
 # Soft opposition bias. Not yaml knobs: the pin fixes the thresholds, and this only leans on
 # them. A residual fighting GVD's steer counts up to +25 % more, ramped in by how hard GVD is
@@ -226,27 +230,38 @@ def own_steer_residual(
     return 0.0
 
 
+def _signed_center_residual(wheel: float, deadband: float) -> float:
+    """``sign(w) * max(0, |w| - D)``. Zero stays zero."""
+    mag = max(0.0, abs(float(wheel)) - float(deadband))
+    if mag <= 0.0:
+        return 0.0
+    return math.copysign(mag, float(wheel))
+
+
 def locked_steer_residual(echo: float, ref_steer: float, deadband: float) -> float:
     """Wheel residual while the Tech steer hold is up.
 
     ``c`` is the command, ``w`` is the wheel, ``D`` is the straight/centre
-    deadband (``steer_center_deadband``, 0.15). A wheel between 0 and ``c``
-    is following. Past ``c`` on ``c``'s side the residual is ``|w - c|``.
-    On the opposite side of 0, or when the command is straight
-    (``|c| <= 1e-3``), the residual is ``max(0, |w| - D)``. A held 0.25 in
-    any of those directions is past ``steer_enter`` after the dwell. A wheel
-    resting at 0.10 from force-feedback or centring slop is inside ``D``.
+    deadband (``steer_center_deadband``, 0.15). Magnitude matches the owner
+    rule. A wheel between 0 and ``c`` is 0. Past ``c`` on ``c``'s side the
+    residual is ``(w - c)``. On the opposite side of 0, or when the command
+    is straight (``|c| < 0.02``, ``STRAIGHT_CMD_BAND``), the residual is
+    ``sign(w) * max(0, |w| - D)``. Opposition and the dwell see that sign, so
+    reversing restarts the dwell. A held 0.25 in any of those directions is
+    past ``steer_enter`` after the dwell. A wheel resting at 0.10 from
+    force-feedback or centring slop is inside ``D``. Command 0.002 with the
+    wheel at 0.10 is inside the straight band and stays engaged.
     """
     c = float(ref_steer)
     w = float(echo)
     d = float(deadband)
-    if abs(c) <= 1e-3:
-        return max(0.0, abs(w) - d)
+    if abs(c) < STRAIGHT_CMD_BAND:
+        return _signed_center_residual(w, d)
     if (c > 0.0 and 0.0 <= w <= c) or (c < 0.0 and c <= w <= 0.0):
         return 0.0
     if (c > 0.0 and w > c) or (c < 0.0 and w < c):
-        return abs(w - c)
-    return max(0.0, abs(w) - d)
+        return w - c
+    return _signed_center_residual(w, d)
 
 
 def tech_override_steer(
@@ -260,9 +275,11 @@ def tech_override_steer(
     After the steer hold, ``electrics.steering_input`` is the gvd command. The
     physical wheel is a fresh numeric ``player_steering`` from
     ``input.lastInputs`` (still recorded when local is blocked). That number
-    counts even when ``player_device`` is false. Using the command echo as
-    the wheel would baseline the detector on GVD's own steer. With the lock
-    on and no fresh numeric echo, return None: the field is absent, or
+    counts even when ``player_device`` is false. JSON null is a missing echo:
+    Lua writes null when no player source is in ``lastInputs``. A live 0 from
+    a player device is a centered wheel. Using the command echo as the wheel
+    would baseline the detector on GVD's own steer. With the lock on and no
+    fresh numeric echo, return None: the field is absent, null, or
     ``gvd_ego.json`` is stale. Once the detector is armed, that missing echo
     seeds rest at 0 so the next wheel sample is not stored as the resting
     angle. Before the lock, electrics are still the wheel when the echo is

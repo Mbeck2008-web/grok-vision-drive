@@ -798,9 +798,12 @@ be.getObjectByID = nil
 
 -- BeamNGpy vid is a vehicle name. scenetree.findObject resolves the string.
 local named = setmetatable({ id = 404 }, Veh)
+local lateNamed = setmetatable({ id = 505 }, Veh)
+local resolveNosuch = false
 scenetree = {
   findObject = function(name)
     if name == 'gvdcar' then return named end
+    if name == 'nosuch' and resolveNosuch then return lateNamed end
     return nil
   end,
 }
@@ -832,16 +835,37 @@ M.techSteerVehId = nil
 M.onUpdate(0.2)
 check(M.techSteerOwed == true, 'unresolvable name arms the watch')
 clearEvents()
+nLog = #logs
 M.onUpdate(2.2)
-check(M.techSteerOwed == false, 'unresolvable name falls back to the player and clears the latch')
+check(M.techSteerOwed == true, 'unresolvable name keeps the latch after the player fallback')
 local foundPlayer = false
 for i = 1, #events do
   if events[i][1] == 'steering' and events[i].veh == 101 then foundPlayer = true end
 end
 check(foundPlayer, 'unresolvable name released on player vehicle 101')
+hit = false
+for i = nLog + 1, #logs do
+  if tostring(logs[i]):find('player fallback', 1, true) then hit = true end
+end
+check(hit, 'player fallback is logged')
+resolveNosuch = true
+clearEvents()
+nLog = #logs
+M.onUpdate(0.2)
+check(M.techSteerOwed == false, 'later named-vehicle release clears the latch')
+local foundLate = false
+for i = 1, #events do
+  if events[i][1] == 'steering' and events[i].veh == 505 then foundLate = true end
+end
+check(foundLate, 'release queued on the named vehicle once it resolves')
 
 -- An unresolvable numeric id falls back to the player vehicle too.
-be.getObjectByID = function(_, _id) return nil end
+local resolve999 = false
+local veh999 = setmetatable({ id = 999 }, Veh)
+be.getObjectByID = function(_, id)
+  if resolve999 and id == 999 then return veh999 end
+  return nil
+end
 clearEvents()
 writeFile(statePath, string.format(
   '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":true,"tech_steer_hold_vid":999,"cmd_seq":%d}',
@@ -850,13 +874,23 @@ M.techSteerOwed = false
 M.techSteerVehId = nil
 M.onUpdate(0.2)
 clearEvents()
+nLog = #logs
 M.onUpdate(2.2)
-check(M.techSteerOwed == false, 'unresolvable numeric id falls back to the player')
+check(M.techSteerOwed == true, 'unresolvable numeric id keeps the latch after the player fallback')
 foundPlayer = false
 for i = 1, #events do
   if events[i][1] == 'steering' and events[i].veh == 101 then foundPlayer = true end
 end
 check(foundPlayer, 'unresolvable numeric id released on player vehicle 101')
+resolve999 = true
+clearEvents()
+M.onUpdate(0.2)
+check(M.techSteerOwed == false, 'later numeric id release clears the latch')
+local found999 = false
+for i = 1, #events do
+  if events[i][1] == 'steering' and events[i].veh == 999 then found999 = true end
+end
+check(found999, 'release queued on vehicle 999 once it resolves')
 be.getObjectByID = nil
 scenetree = nil
 
@@ -892,6 +926,18 @@ for i = nLog + 1, #logs do
   if tostring(logs[i]):find('load replay', 1, true) then hit = true end
 end
 check(hit, 'load replay logs tech steer release')
+
+-- nPlayer == 0 writes player_steering null. A real device at 0 writes 0.0000.
+M.onEgoFeedback(1.0, 0.2, 0, 0, 0, 0, 0, 0, 0.4, 0, 0, 0)
+local egoNull = readFileAll(egoPath)
+check(egoNull and egoNull:find('"player_steering":null', 1, true)
+  and egoNull:find('"player_device":false', 1, true),
+  'nPlayer 0 writes player_steering null (' .. tostring(egoNull) .. ')')
+M.onEgoFeedback(1.0, 0.2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1)
+local egoZero = readFileAll(egoPath)
+check(egoZero and egoZero:find('"player_steering":0.0000', 1, true)
+  and egoZero:find('"player_device":true', 1, true),
+  'nPlayer 1 writes a centered wheel (' .. tostring(egoZero) .. ')')
 
 -- A missing state file is not replaced.
 vfsBus[statePath] = nil

@@ -23,6 +23,7 @@ from python.control.actuate import (
     soft_esc_state_write_due,
     soft_esc_state_write_mark,
     soft_esc_state_write_skips,
+    publish_shutdown_steer_hold,
     stop_command,
     write_engage_flag,
 )
@@ -117,6 +118,27 @@ def sample_tech_wheel(
             flush=True,
         )
     return sampled
+
+
+def override_note_steer(applied: object, actuator: object) -> float:
+    """Steer the override residual is measured against.
+
+    A failed hold refresh after the lock still sends pedals and leaves
+    ``applied`` false. The detector keeps the last steer that was actually
+    queued, so a wheel sitting on that steer is not read as a grab against
+    a command the car never took.
+    """
+    if not bool(getattr(applied, "applied", True)) and bool(getattr(actuator, "steer_locked", False)):
+        queued = getattr(actuator, "steer_hold_command", None)
+        if queued is not None:
+            try:
+                return float(queued)
+            except (TypeError, ValueError):
+                pass
+    try:
+        return float(getattr(applied, "steer", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def tech_wheel_blind_reason(*, now: float | None = None) -> str | None:
@@ -845,7 +867,10 @@ def main() -> None:
             # command its echo belongs to. Gate holds ride along as brake=1 and the car echoes
             # those back just like a real command, so they have to be in here too.
             override.note_command(
-                seq=applied.seq, steer=applied.steer, throttle=applied.throttle, brake=applied.brake
+                seq=applied.seq,
+                steer=override_note_steer(applied, actuator),
+                throttle=applied.throttle,
+                brake=applied.brake,
             )
 
             st = default_state(
@@ -1139,6 +1164,9 @@ def main() -> None:
             if hasattr(actuator, "note_engaged"):
                 actuator.note_engaged(False)  # cmd_json: Lua releases the car at once
             actuator.stop(seq=cmd_seq + 1, reason="shutdown")
+            # The loop's snapshot does not run after this. Clear the disk
+            # flag only when the release queue was accepted.
+            publish_shutdown_steer_hold(actuator)
         except Exception:
             pass
         try:

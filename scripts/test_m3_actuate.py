@@ -273,7 +273,7 @@ def check_drive_gear_arm() -> None:
         def __init__(self) -> None:
             self.calls: list[dict] = []
 
-        def control(self, steering, throttle, brake, parkingbrake=0.0, gear=None):
+        def control(self, throttle, brake, parkingbrake=0.0, gear=None, steering=None):
             self.calls.append(
                 {
                     "steering": steering,
@@ -934,7 +934,7 @@ def main() -> None:
         def __init__(self) -> None:
             self.calls: list[dict] = []
 
-        def control(self, steering, throttle, brake, parkingbrake=0.0):
+        def control(self, throttle, brake, parkingbrake=0.0, steering=None):
             self.calls.append(
                 {"steering": steering, "throttle": throttle, "brake": brake, "parkingbrake": parkingbrake}
             )
@@ -957,7 +957,7 @@ def main() -> None:
     # Injected clock so a stall between these stops cannot expire the window.
     edge = tech.stop(seq=4, reason="not_engaged", now=40.0)
     assert edge.applied is False and edge.throttle == 0.0 and edge.brake == 0.0
-    assert veh.calls[-1] == {"steering": 0.0, "throttle": 0.0, "brake": 0.0, "parkingbrake": 0.0}
+    assert veh.calls[-1] == {"throttle": 0.0, "brake": 0.0, "parkingbrake": 0.0}
     assert "gear" not in veh.calls[-1]
     assert veh.ai_modes[-1] == "disabled"
     assert veh.shifts[-1] == TECH_PLAYER_SHIFT_MODE == "arcade"
@@ -1003,7 +1003,7 @@ def main() -> None:
     tech_bare.note_engaged(False)
     bare_edge = tech_bare.stop(seq=40, reason="not_engaged")
     assert bare_edge.throttle == 0.0 and bare_edge.brake == 0.0
-    assert bare.calls[-1] == {"steering": 0.0, "throttle": 0.0, "brake": 0.0, "parkingbrake": 0.0}
+    assert bare.calls[-1] == {"throttle": 0.0, "brake": 0.0, "parkingbrake": 0.0}
     assert bare.shifts == [TECH_PLAYER_SHIFT_MODE] == ["arcade"]
     assert bare.ai_modes == ["disabled"]
     assert tech_bare._latched is False and tech_bare._shift_set is False

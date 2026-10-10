@@ -4,11 +4,13 @@
 -- engaged, as a secondary Direct Drive wheel + pedals (FILTER_DIRECT + source gvd + allowedInputSources).
 -- A connected keyboard/pad/wheel/pedal cluster otherwise overwrites pad-smoothed input.event every
 -- frame, so the software never actually holds the sim car. No DLL / hooks.
--- Tech vehicle.control is that same pad filter on source local, so a centered wheel
--- overwrites the steer after Python sends it. Python queues a steering-only gvd hold
--- while engaged. This extension clears that whitelist when the supervisor drops the
--- hold flag or its heartbeat goes stale, and on unload, so a dead process cannot
--- leave the wheel disabled. Pedal locks stay on the retail path.
+-- Tech steer is a gvd Direct Drive hold. vehicle.control does not send steering
+-- while that hold is up, or the Control message would overwrite lastInputs.local.steering
+-- and a held wheel grab would read back as the command. This extension clears the
+-- steering whitelist when the supervisor drops the hold flag or its heartbeat goes
+-- stale, and on unload, then replays lastInputs.local.steering so a wheel already
+-- held drives without waiting for the next onChange. The latch stays set until that
+-- queue succeeds. Pedal locks stay on the retail path.
 -- Detector, path, planner and track ghosts keep running/drawing while the supervisor is live;
 -- Alt+G is the takeover latch (ice underglow + actuators), not the start of perception.
 local M = {}
@@ -1060,11 +1062,18 @@ local VE_APPLY_FMT = VE_HOLD
   .. "input.event('parkingbrake',0,2,0,0,nil,'gvd');"
   .. "input.event('clutch',0,2,0,0,nil,'gvd')"
 -- Steering-only undo of the Tech hold. Same text as Python TECH_STEER_RELEASE_LUA.
--- Retail VE_RELEASE still clears every axis; this one leaves pedals alone.
-M.techSteerRelease = "input.event('steering',0,2,900,0,nil,'gvd');"
-  .. "if input and input.setAllowedInputSource then "
+-- Clear the whitelist, then replay the stored local wheel. A held wheel is
+-- onChange and will not write again until it moves. Pedals stay alone.
+-- 'local' is a keyword, so the source is lastInputs['local'].
+M.techSteerRelease = "if input and input.setAllowedInputSource then "
   .. "input.setAllowedInputSource('steering',nil);"
-  .. "end"
+  .. "end;"
+  .. "local s=0;"
+  .. "if input and input.lastInputs and input.lastInputs['local'] then "
+  .. "s=tonumber(input.lastInputs['local'].steering) or 0;"
+  .. "end;"
+  .. "if s~=s or s==math.huge or s==-math.huge then s=0 end;"
+  .. "input.event('steering',s,2,900,0,nil,'local')"
 local VE_RELEASE = "input.event('steering',0,2,900,0,nil,'gvd');"
   .. "input.event('throttle',0,2,0,0,nil,'gvd');"
   .. "input.event('brake',0,2,0,0,nil,'gvd');"
@@ -1708,11 +1717,12 @@ local function pollState(dt)
   if M.techSteerOwed and not applying then
     local hold = lastGood and lastGood.tech_steer_hold == true
     if stateBeatAcc > 2.0 or not hold then
-      M.techSteerOwed = false
-      local why = (stateBeatAcc > 2.0) and 'supervisor heartbeat stale' or 'supervisor off'
-      queueVehicle(applyVeh or getPlayerVeh(), M.techSteerRelease)
-      log('I', 'GVD', '[GVD] tech steer release (' .. why .. ')')
-      print('[GVD] tech steer release (' .. why .. ')')
+      local why = (stateBeatAcc > 2.0) and 'supervisor heartbeat stale' or 'hold flag clear'
+      if queueVehicle(applyVeh or getPlayerVeh(), M.techSteerRelease) then
+        M.techSteerOwed = false
+        log('I', 'GVD', '[GVD] tech steer release (' .. why .. ')')
+        print('[GVD] tech steer release (' .. why .. ')')
+      end
     end
   end
 end
@@ -2015,11 +2025,12 @@ end
 function M.onExtensionUnloaded()
   releaseInputs('extension unloaded')
   if M.techSteerOwed and not applying then
-    queueVehicle(getPlayerVeh(), M.techSteerRelease)
-    log('I', 'GVD', '[GVD] tech steer release (extension unloaded)')
-    print('[GVD] tech steer release (extension unloaded)')
+    if queueVehicle(getPlayerVeh(), M.techSteerRelease) then
+      M.techSteerOwed = false
+      log('I', 'GVD', '[GVD] tech steer release (extension unloaded)')
+      print('[GVD] tech steer release (extension unloaded)')
+    end
   end
-  M.techSteerOwed = false
   engaged = false
   writeEngageFile('extension_unloaded')
   lastGood = nil

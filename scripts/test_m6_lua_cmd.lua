@@ -575,6 +575,16 @@ check(stayed and stayed:find('"engaged": false', 1, true), 'heartbeat did not re
 
 -- 16) Tech steer hold: a dead supervisor, or a hold flag going false, gives the wheel back.
 -- Python queues the lock. This mod only clears it. Retail applying is left alone.
+-- A failed queue keeps the latch and does not log success. The next poll retries.
+local releaseFails = 0
+local queueLuaCommand = Veh.queueLuaCommand
+function Veh:queueLuaCommand(code)
+  if releaseFails > 0 and type(code) == 'string' and code:find("lastInputs['local']", 1, true) then
+    releaseFails = releaseFails - 1
+    error('release queue failed')
+  end
+  return queueLuaCommand(self, code)
+end
 clearEvents()
 writeFile(statePath, string.format(
   '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":true,"cmd_seq":%d}',
@@ -610,18 +620,68 @@ check(lastAllowed('steering') and lastAllowed('steering')[2] == nil,
   'tech_steer_hold false restores player steering')
 hit = false
 for i = nLog + 1, #logs do
-  if tostring(logs[i]):find('supervisor off', 1, true) then hit = true end
+  if tostring(logs[i]):find('hold flag clear', 1, true) then hit = true end
 end
-check(hit, 'hold false logs supervisor off')
+check(hit, 'hold false logs hold flag clear')
+
+-- Failed queue keeps the latch. The next poll still sends the release.
+clearEvents()
+veEnv.input.lastInputs['local'] = { steering = 0.55 }
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":true,"cmd_seq":%d}',
+  os.time() + 85, DRIVE_BUS, DRIVE_BUS, seq))
+M.onUpdate(0.2)
+check(M.techSteerOwed == true, 'fresh hold arms the release watch')
+releaseFails = 1
+clearEvents()
+nLog = #logs
+M.onUpdate(2.2)
+check(M.techSteerOwed == true, 'failed release keeps the latch')
+check(lastAllowed('steering') == nil, 'failed release does not touch the whitelist')
+hit = false
+for i = nLog + 1, #logs do
+  if tostring(logs[i]):find('tech steer release', 1, true) then hit = true end
+end
+check(not hit, 'failed release skips the success log')
+clearEvents()
+nLog = #logs
+M.onUpdate(0.2)
+check(M.techSteerOwed == false, 'next poll clears the latch after the release is queued')
+check(lastAllowed('steering') and lastAllowed('steering')[2] == nil,
+  'next poll restores player steering')
+local ev = lastEvent('steering')
+check(ev and ev[6] == 'local' and near(ev[2], 0.55),
+  'release replays lastInputs.local.steering (' .. tostring(ev and ev[2]) .. ' src ' .. tostring(ev and ev[6]) .. ')')
+hit = false
+for i = nLog + 1, #logs do
+  if tostring(logs[i]):find('supervisor heartbeat stale', 1, true) then hit = true end
+end
+check(hit, 'retried release logs the stale heartbeat')
+clearEvents()
+M.onUpdate(0.2)
+check(#allowed == 0, 'a still-stale hold file does not re-arm after a successful release')
+check(M.techSteerOwed ~= true, 'stale file does not re-arm the latch')
 
 clearEvents()
 writeFile(statePath, string.format(
   '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":true,"cmd_seq":%d}',
   os.time() + 90, DRIVE_BUS, DRIVE_BUS, seq))
 M.onUpdate(0.2)
+check(M.techSteerOwed == true, 'hold before unload arms the watch')
+releaseFails = 1
 clearEvents()
 nLog = #logs
 M.onExtensionUnloaded()
+check(M.techSteerOwed == true, 'unload keeps the latch when the queue fails')
+hit = false
+for i = nLog + 1, #logs do
+  if tostring(logs[i]):find('tech steer release (extension unloaded)', 1, true) then hit = true end
+end
+check(not hit, 'failed unload skips the success log')
+clearEvents()
+nLog = #logs
+M.onExtensionUnloaded()
+check(M.techSteerOwed == false, 'second unload clears the latch')
 check(lastAllowed('steering') and lastAllowed('steering')[2] == nil,
   'extension unload restores player steering')
 hit = false

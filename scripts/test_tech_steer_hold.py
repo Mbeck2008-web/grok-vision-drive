@@ -32,6 +32,7 @@ from python.control.override import (  # noqa: E402
     REASON_STEER,
     OverrideDetector,
     load_override_config,
+    locked_steer_residual,
     tech_override_steer,
 )
 
@@ -270,6 +271,7 @@ def check_grab_survives_control_messages() -> None:
             brake_input=0.0,
             now=t,
             own_axes=True,
+            steer_locked=True,
         )
         det.note_command(seq=i + 1, steer=0.3, throttle=0.2, brake=0.0, now=t)
         if det.armed(t):
@@ -285,6 +287,7 @@ def check_grab_survives_control_messages() -> None:
             brake_input=0.0,
             now=t,
             own_axes=True,
+            steer_locked=True,
         )
         det.note_command(seq=50 + i, steer=0.3, throttle=0.2, brake=0.0, now=t)
         assert not held.active, held
@@ -469,7 +472,9 @@ def check_override_signal_is_the_wheel() -> None:
     assert tech_override_steer(0.0, None, steer_locked=False) == 0.0
     assert tech_override_steer(0.3, _Ego(0.55), steer_locked=True) == 0.55
     quiet = _Ego(0.0, device=False)
-    assert tech_override_steer(0.3, quiet, steer_locked=True) is None
+    assert tech_override_steer(0.3, quiet, steer_locked=True) == 0.0
+    # A fresh numeric echo counts even when player_device is false.
+    assert tech_override_steer(0.3, _Ego(0.22, device=False), steer_locked=True) == 0.22
 
     from python.control.actuate import ego_path
     from python.run_vision import sample_tech_wheel
@@ -510,6 +515,28 @@ def check_override_signal_is_the_wheel() -> None:
     with redirect_stdout(buf2):
         assert sample_tech_wheel(locked, 0.3, now=14.0) is None
     assert buf2.getvalue().count("tech steer grab blind") == 1, buf2.getvalue()
+    # Fresh player_steering with player_device false is the wheel. The 2 s
+    # timer starts when that field is absent or gvd_ego.json is stale.
+    import time
+
+    rv._STEER_GRAB_BLIND_LOGGED = False
+    rv._STEER_GRAB_BLIND_SINCE = None
+    locked._steer_locked = True
+    ego_path().write_text(
+        json.dumps(
+            {"player_device": False, "player_steering": 0.22, "steering_input": 0.3}
+        ),
+        encoding="utf-8",
+    )
+    assert sample_tech_wheel(locked, 0.3, now=20.0) == 0.22
+    assert rv._STEER_GRAB_BLIND_SINCE is None
+    stale = time.time() - 5.0
+    os.utime(ego_path(), (stale, stale))
+    buf3 = io.StringIO()
+    with redirect_stdout(buf3):
+        assert sample_tech_wheel(locked, 0.3, now=21.0) is None
+    assert rv._STEER_GRAB_BLIND_SINCE == 21.0
+    assert buf3.getvalue().count("tech steer grab blind") == 1, buf3.getvalue()
     open_wheel = BeamNGPyActuator(TechVeh(PlayerWheel()))
     ego_path().write_text("{}", encoding="utf-8")
     assert sample_tech_wheel(open_wheel, 0.0) == 0.0
@@ -703,51 +730,83 @@ def check_retry_kill_keeps_disk_flag() -> None:
     assert disk.get("tech_steer_hold_vid") == 303, disk
 
 
-def check_command_side_grab() -> None:
-    """Opposition applies only past the command on the command's side.
-
-    Wheel 0 against command 0.35 stays engaged for the full dwell. Wheel
-    0.10 against a straight command is the grab: the residual is the wheel
-    angle, and 0.10 is past steer_enter 0.08, so Engage drops. Wheel 0.10
-    against command 0.35 is still inside the command and stays engaged.
-    """
-    centered = _cfg()
-    t = _feed_missing_echo(centered, 700.0)
-    centered.note_command(seq=700, steer=0.35, throttle=0.2, brake=0.0, now=t)
+def _stay_engaged(det: OverrideDetector, *, cmd: float, wheel: float, t0: float) -> None:
+    t = t0
     for i in range(40):
         t += TICK
-        verdict = centered.update(
+        verdict = det.update(
             engaged=True,
-            steering_input=0.0,
+            steering_input=wheel,
             throttle_input=0.2,
             brake_input=0.0,
             now=t,
             own_axes=True,
             steer_locked=True,
         )
-        centered.note_command(seq=701 + i, steer=0.35, throttle=0.2, brake=0.0, now=t)
-        assert not verdict.active, verdict
+        det.note_command(seq=200 + i, steer=cmd, throttle=0.2, brake=0.0, now=t)
+        assert not verdict.active, (cmd, wheel, verdict)
 
-    opposite = _cfg()
-    t = _feed_missing_echo(opposite, 800.0)
-    opposite.note_command(seq=800, steer=0.35, throttle=0.2, brake=0.0, now=t)
-    assert not _hold_until_steer(opposite, cmd=0.35, wheel=-0.08, t0=t)
 
-    inside = _cfg()
-    t = _feed_missing_echo(inside, 900.0)
-    inside.note_command(seq=900, steer=0.35, throttle=0.2, brake=0.0, now=t)
-    assert not _hold_until_steer(inside, cmd=0.35, wheel=0.10, t0=t)
+def check_command_side_grab() -> None:
+    """Locked residual: between 0 and the command is 0; past it is |w-c|.
 
-    straight = _cfg()
-    t = _feed_missing_echo(straight, 1000.0)
-    assert _hold_until_steer(straight, cmd=0.0, wheel=0.10, t0=t), (
-        "wheel 0.10 vs command 0 is past steer_enter 0.08"
+    Opposite side of 0, and a straight command, use max(0, |w| - 0.15).
+    A held 0.25 in any direction drops Engage. A wheel at 0.10, at 0, or
+    at -0.08 against command 0.35 stays engaged for the full dwell.
+    """
+    d = 0.15
+    assert locked_steer_residual(0.0, 0.35, d) == 0.0
+    assert abs(locked_steer_residual(-0.25, 0.35, d) - 0.10) < 1e-9
+    assert abs(locked_steer_residual(-1.0, 0.35, d) - 0.85) < 1e-9
+    assert locked_steer_residual(0.10, 0.0, d) == 0.0
+    assert abs(locked_steer_residual(0.25, 0.0, d) - 0.10) < 1e-9
+    assert abs(locked_steer_residual(0.60, 0.35, d) - 0.25) < 1e-9
+    assert locked_steer_residual(-0.08, 0.35, d) == 0.0
+    assert abs(locked_steer_residual(0.25, -0.35, d) - 0.10) < 1e-9
+
+    cases = (
+        (0.35, -0.25, True),
+        (-0.35, 0.25, True),
+        (0.35, -1.0, True),
+        (0.35, 0.0, False),
+        (0.0, 0.10, False),
+        (0.0, 0.25, True),
+        (0.35, 0.60, True),
+        (0.35, -0.08, False),
     )
+    for n, (cmd, wheel, trips) in enumerate(cases):
+        det = _cfg()
+        t = _feed_missing_echo(det, 700.0 + n * 100.0)
+        det.note_command(seq=700 + n, steer=cmd, throttle=0.2, brake=0.0, now=t)
+        if trips:
+            assert _hold_until_steer(det, cmd=cmd, wheel=wheel, t0=t), (cmd, wheel)
+        else:
+            _stay_engaged(det, cmd=cmd, wheel=wheel, t0=t)
 
-    past = _cfg()
-    t = _feed_missing_echo(past, 1100.0)
-    past.note_command(seq=1100, steer=-0.35, throttle=0.2, brake=0.0, now=t)
-    assert _hold_until_steer(past, cmd=-0.35, wheel=-0.60, t0=t)
+
+def check_locked_refresh_sends_pedals() -> None:
+    """After the lock is up, a failed hold refresh still sends pedals.
+
+    Steering stays off the control message. The pre-lock failure path is
+    covered by check_failed_hold_not_applied.
+    """
+    wheel = PlayerWheel(0.0)
+    veh = TechVeh(wheel)
+    act = BeamNGPyActuator(veh)
+    act.note_engaged(True)
+    first = act.apply(DriveCommand(steer=0.2, throttle=0.2, brake=0.0, seq=1, reason="ok"))
+    assert first.applied is True and act.steer_locked is True
+    veh.fail_queue = True
+    veh.calls.clear()
+    sent = act.apply(DriveCommand(steer=0.2, throttle=0.1, brake=0.8, seq=2, reason="ok"))
+    assert sent.applied is True, sent
+    assert sent.reason == "ok", sent.reason
+    assert act.steer_locked is True
+    assert veh.calls, "locked refresh sent no vehicle.control"
+    call = veh.calls[-1]
+    assert call.get("throttle") == 0.1, call
+    assert call.get("brake") == 0.8, call
+    assert "steering" not in call, call
 
 
 def check_release_text_matches_mod() -> None:
@@ -766,6 +825,11 @@ def check_release_text_matches_mod() -> None:
     assert "tech_steer_hold" in lua
     assert "queueVehicle(M.techSteerTarget(), M.techSteerRelease)" in lua
     assert "function M.techSteerTarget()" in lua
+    assert "scenetree.findObject" in lua
+    assert "getObjectByID" in lua
+    assert "return getPlayerVeh()" in lua
+    assert "function M.finishTechSteerLoadReplay()" in lua
+    assert "tech steer release (load replay)" in lua
     assert "M.noteTechSteerHold" in lua
     body = lua[lua.index("M.techSteerRelease"):lua.index("local VE_RELEASE")]
     compact = body.replace(" ", "").replace("\n", "").replace("..", "").replace('"', "")
@@ -789,6 +853,7 @@ def main() -> None:
         check_failed_hold_not_applied()
         check_retry_kill_keeps_disk_flag()
         check_command_side_grab()
+        check_locked_refresh_sends_pedals()
         check_release_text_matches_mod()
     finally:
         if prev is None:

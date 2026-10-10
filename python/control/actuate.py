@@ -966,9 +966,10 @@ class BeamNGPyActuator:
     so the next disengaged tick retries. The hold is queued before
     ``vehicle.control``. The hold flag is written immediately before every
     queue until the lock is up, so a kill inside a later queue still leaves
-    the mod a watcher. A failed flag write or a failed queue leaves
-    ``applied`` false, does not latch the lock, and does not send
-    ``vehicle.control`` (the car keeps the pedals it already had). The mod
+    the mod a watcher. Before the lock lands, a failed flag write or a failed
+    queue leaves ``applied`` false and does not send ``vehicle.control`` (the
+    car keeps the pedals it already had). After the lock is up, a failed hold
+    refresh still sends throttle and brake with steering omitted. The mod
     clears the whitelist and replays the stored wheel if this process dies.
     """
 
@@ -1233,13 +1234,14 @@ class BeamNGPyActuator:
     def _queue_steer_hold(self, steer: float) -> str | None:
         """Block local steering and write the controller steer on source gvd.
 
-        Queued before ``vehicle.control``. On error the caller returns without
-        sending throttle or brake, so a failed hold leaves the pedals alone.
-        After the lock is up, ``vehicle.control`` still omits steering so a
-        held wheel stays in ``lastInputs.local.steering``. The hold flag is
-        written immediately before every queue until the lock is up, including
-        retries and the next engage. A kill inside that queue leaves the
-        watcher armed. A disengage with no lock clears the pending flag.
+        Queued before ``vehicle.control``. Before the lock lands, an error
+        makes the caller return without sending throttle or brake. After the
+        lock is up, a failed refresh still lets the caller send pedals, and
+        ``vehicle.control`` still omits steering so a held wheel stays in
+        ``lastInputs.local.steering``. The hold flag is written immediately
+        before every queue until the lock is up, including retries and the
+        next engage. A kill inside that queue leaves the watcher armed. A
+        disengage with no lock clears the pending flag.
         """
         chunk = tech_steer_hold_lua(steer)
         q = getattr(self.vehicle, "queue_lua_command", None) if self.vehicle is not None else None
@@ -1358,14 +1360,16 @@ class BeamNGPyActuator:
         if camera_ge_socket_busy():
             return "camera_io_busy"
         try:
-            # Hold first. A failed queue returns before pedals, shift, or
-            # blinkers, so the car keeps the controls it already had.
-            # Engage arms arcade only after that queue lands. A release with
-            # the shifter still unset only clears pedals. A failed ack is
-            # logged and retried next tick (_shift_set stays false).
+            # Hold first. Before the lock lands, a failed queue returns
+            # before pedals, shift, or blinkers, so the car keeps the
+            # controls it already had. After the lock is up, a failed
+            # refresh still sends the pedal command with steering omitted.
+            # Engage arms arcade only after the first queue lands. A release
+            # with the shifter still unset only clears pedals. A failed ack
+            # is logged and retried next tick (_shift_set stays false).
             if not release:
                 hold_err = self._queue_steer_hold(steer)
-                if hold_err:
+                if hold_err and not self._steer_locked:
                     return hold_err
                 if not self._shift_set:
                     self._arm_shift_mode()

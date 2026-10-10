@@ -130,6 +130,7 @@ class TechVeh:
         self.lua: list[str] = []
         self.fail_queue = False
         self.die_in_queue = False
+        self.accept_then_die = False
         self.expect_flag_before_queue = False
         self.flag_seen = False
         self.sensors = {"electrics": {"gear": "D", "wheelspeed": 5.0, "steering_input": 0.0}}
@@ -154,6 +155,10 @@ class TechVeh:
             st = read_state()
             assert st is not None and st.get("tech_steer_hold") is True, st
             self.flag_seen = True
+        if self.accept_then_die and "setAllowedInputSource('steering','gvd',true)" in chunk:
+            self.lua.append(chunk)
+            apply_steer_chunk(self.wheel_sim, chunk)
+            raise SystemExit("killed after accept")
         if self.die_in_queue and "setAllowedInputSource('steering','gvd',true)" in chunk:
             raise SystemExit("killed during queue")
         if self.fail_queue:
@@ -231,6 +236,7 @@ def _hold_until_steer(det: OverrideDetector, *, cmd: float, wheel: float, t0: fl
             brake_input=0.0,
             now=t,
             own_axes=True,
+            steer_locked=True,
         )
         det.note_command(seq=100 + i, steer=cmd, throttle=0.2, brake=0.0, now=t)
         if verdict.active:
@@ -486,11 +492,24 @@ def check_override_signal_is_the_wheel() -> None:
     import python.run_vision as rv
 
     rv._STEER_GRAB_BLIND_LOGGED = False
+    rv._STEER_GRAB_BLIND_SINCE = None
     buf = io.StringIO()
     with redirect_stdout(buf):
-        assert sample_tech_wheel(locked, 0.3) is None
-        assert sample_tech_wheel(locked, 0.3) is None
+        assert sample_tech_wheel(locked, 0.3, now=10.0) is None
+        assert sample_tech_wheel(locked, 0.3, now=10.1) is None
     assert buf.getvalue().count("tech steer grab blind") == 1, buf.getvalue()
+    assert rv.tech_wheel_blind_reason(now=12.0) is None
+    assert rv.tech_wheel_blind_reason(now=12.1) == "tech_wheel_blind"
+    locked._steer_locked = False
+    with redirect_stdout(io.StringIO()):
+        assert sample_tech_wheel(locked, 0.3, now=13.0) == 0.3
+    assert rv._STEER_GRAB_BLIND_LOGGED is False
+    assert rv._STEER_GRAB_BLIND_SINCE is None
+    locked._steer_locked = True
+    buf2 = io.StringIO()
+    with redirect_stdout(buf2):
+        assert sample_tech_wheel(locked, 0.3, now=14.0) is None
+    assert buf2.getvalue().count("tech steer grab blind") == 1, buf2.getvalue()
     open_wheel = BeamNGPyActuator(TechVeh(PlayerWheel()))
     ego_path().write_text("{}", encoding="utf-8")
     assert sample_tech_wheel(open_wheel, 0.0) == 0.0
@@ -507,10 +526,10 @@ def check_hold_flag_before_queue() -> None:
     n = {"n": 0}
     orig = act_mod.flush_tech_steer_hold
 
-    def spy(held: bool) -> bool:
+    def spy(held: bool, **_k: object) -> bool:
         n["n"] += 1
         assert held is True
-        return bool(orig(held))
+        return bool(orig(held, **_k))
 
     act_mod.flush_tech_steer_hold = spy
     try:
@@ -549,20 +568,20 @@ def check_hold_flag_before_queue() -> None:
 
 
 def check_failed_hold_not_applied() -> None:
-    """A raising queue leaves applied false and still omits steering.
+    """A raising queue leaves applied false and sends no vehicle.control.
 
-    The hold flag is published once for that pre-lock episode. A missing
-    queue and a failed flag write also leave the command unapplied.
+    Each pre-lock try flushes the hold flag. A missing queue and a failed
+    flag write also leave the command unapplied, with no throttle or brake.
     """
     import python.control.actuate as act_mod
 
     n = {"n": 0}
     orig = act_mod.flush_tech_steer_hold
 
-    def spy(held: bool) -> bool:
+    def spy(held: bool, **_k: object) -> bool:
         n["n"] += 1
         assert held is True
-        return bool(orig(held))
+        return bool(orig(held, **_k))
 
     act_mod.flush_tech_steer_hold = spy
     try:
@@ -575,13 +594,11 @@ def check_failed_hold_not_applied() -> None:
         assert sent.applied is False, sent
         assert sent.reason == "tech_steer_hold_queue", sent.reason
         assert act.steer_locked is False
-        assert "steering" not in veh.calls[-1], veh.calls[-1]
-        assert veh.calls[-1]["throttle"] == 0.2
+        assert veh.calls == []
         sent2 = act.apply(DriveCommand(steer=0.4, throttle=0.2, brake=0.0, seq=2, reason="ok"))
         assert sent2.applied is False and act.steer_locked is False
-        assert "steering" not in veh.calls[-1]
-        assert veh.calls[-1]["throttle"] == 0.2
-        assert n["n"] == 1, n
+        assert veh.calls == []
+        assert n["n"] == 2, n
     finally:
         act_mod.flush_tech_steer_hold = orig
 
@@ -602,9 +619,9 @@ def check_failed_hold_not_applied() -> None:
     missing = act_b.apply(DriveCommand(steer=0.4, throttle=0.2, brake=0.0, seq=1, reason="ok"))
     assert missing.applied is False and missing.reason == "tech_steer_hold_no_queue"
     assert act_b.steer_locked is False
-    assert "steering" not in bare.calls[-1] and bare.calls[-1]["throttle"] == 0.2
+    assert bare.calls == [] and bare.shifts == []
     again = act_b.apply(DriveCommand(steer=0.4, throttle=0.2, brake=0.0, seq=2, reason="ok"))
-    assert again.applied is False and "steering" not in bare.calls[-1]
+    assert again.applied is False and bare.calls == []
 
     import python.runtime.state_io as sio
 
@@ -622,10 +639,115 @@ def check_failed_hold_not_applied() -> None:
         assert wrote.applied is False and wrote.reason == "tech_steer_hold_flag", wrote
         assert act_w.steer_locked is False
         assert blocked.lua == []
-        assert "steering" not in blocked.calls[-1]
-        assert blocked.calls[-1]["throttle"] == 0.2
+        assert blocked.calls == []
     finally:
         sio.write_state = orig_write
+
+
+def _steady(act: BeamNGPyActuator) -> None:
+    """Write the supervisor snapshot the way run_vision does after a tick."""
+    from python.runtime.state_io import read_state, write_state
+
+    prev = read_state()
+    st = dict(prev) if isinstance(prev, dict) else {}
+    st["tech_steer_hold"] = act.tech_steer_hold_for_state()
+    if st["tech_steer_hold"] and act.steer_hold_vid is not None:
+        st["tech_steer_hold_vid"] = act.steer_hold_vid
+    elif "tech_steer_hold_vid" in st and not st["tech_steer_hold"]:
+        st.pop("tech_steer_hold_vid", None)
+    write_state(st)
+
+
+def check_retry_kill_keeps_disk_flag() -> None:
+    """Failed queue, steady snapshot, re-engage, accepted queue, then kill.
+
+    The disk flag stays true. The snapshot after the failure keeps the
+    watcher armed, and the queue that finally lands flushes again before
+    it runs.
+    """
+    from python.runtime.state_io import read_state
+
+    wheel = PlayerWheel(0.0)
+    veh = TechVeh(wheel)
+    veh.vid = 303
+    veh.fail_queue = True
+    act = BeamNGPyActuator(veh)
+    act.note_engaged(True)
+    failed = act.apply(DriveCommand(steer=0.4, throttle=0.2, brake=0.0, seq=1, reason="ok"))
+    assert failed.applied is False and failed.reason == "tech_steer_hold_queue"
+    assert act.tech_steer_hold_for_state() is True
+    assert veh.calls == []
+    _steady(act)
+    st = read_state()
+    assert st is not None and st.get("tech_steer_hold") is True, st
+    assert st.get("tech_steer_hold_vid") == 303, st
+
+    act.note_engaged(False)
+    assert act.tech_steer_hold_for_state() is False
+    _steady(act)
+    cleared = read_state()
+    assert cleared is not None and cleared.get("tech_steer_hold") is False, cleared
+
+    veh.fail_queue = False
+    veh.accept_then_die = True
+    act.note_engaged(True)
+    raised = False
+    try:
+        act.apply(DriveCommand(steer=0.4, throttle=0.2, brake=0.0, seq=2, reason="ok"))
+    except SystemExit:
+        raised = True
+    assert raised
+    assert tech_steer_hold_lua(0.4) in veh.lua
+    disk = read_state()
+    assert disk is not None and disk.get("tech_steer_hold") is True, disk
+    assert disk.get("tech_steer_hold_vid") == 303, disk
+
+
+def check_command_side_grab() -> None:
+    """Opposition applies only past the command on the command's side.
+
+    Wheel 0 against command 0.35 stays engaged for the full dwell. Wheel
+    0.10 against a straight command is the grab: the residual is the wheel
+    angle, and 0.10 is past steer_enter 0.08, so Engage drops. Wheel 0.10
+    against command 0.35 is still inside the command and stays engaged.
+    """
+    centered = _cfg()
+    t = _feed_missing_echo(centered, 700.0)
+    centered.note_command(seq=700, steer=0.35, throttle=0.2, brake=0.0, now=t)
+    for i in range(40):
+        t += TICK
+        verdict = centered.update(
+            engaged=True,
+            steering_input=0.0,
+            throttle_input=0.2,
+            brake_input=0.0,
+            now=t,
+            own_axes=True,
+            steer_locked=True,
+        )
+        centered.note_command(seq=701 + i, steer=0.35, throttle=0.2, brake=0.0, now=t)
+        assert not verdict.active, verdict
+
+    opposite = _cfg()
+    t = _feed_missing_echo(opposite, 800.0)
+    opposite.note_command(seq=800, steer=0.35, throttle=0.2, brake=0.0, now=t)
+    assert not _hold_until_steer(opposite, cmd=0.35, wheel=-0.08, t0=t)
+
+    inside = _cfg()
+    t = _feed_missing_echo(inside, 900.0)
+    inside.note_command(seq=900, steer=0.35, throttle=0.2, brake=0.0, now=t)
+    assert not _hold_until_steer(inside, cmd=0.35, wheel=0.10, t0=t)
+
+    straight = _cfg()
+    t = _feed_missing_echo(straight, 1000.0)
+    assert _hold_until_steer(straight, cmd=0.0, wheel=0.10, t0=t), (
+        "wheel 0.10 vs command 0 is past steer_enter 0.08"
+    )
+
+    past = _cfg()
+    t = _feed_missing_echo(past, 1100.0)
+    past.note_command(seq=1100, steer=-0.35, throttle=0.2, brake=0.0, now=t)
+    assert _hold_until_steer(past, cmd=-0.35, wheel=-0.60, t0=t)
 
 
 def check_release_text_matches_mod() -> None:
@@ -633,15 +755,17 @@ def check_release_text_matches_mod() -> None:
     assert "M.techSteerRelease" in lua
     assert "setAllowedInputSource('steering',nil)" in TECH_STEER_RELEASE_LUA
     assert "input.lastInputs['local']" in TECH_STEER_RELEASE_LUA
-    assert "input.event('steering',s,2,ang,lk,nil,'local')" in TECH_STEER_RELEASE_LUA
+    assert "input.event('steering',s,flt,ang,lk,nil,'local')" in TECH_STEER_RELEASE_LUA
     assert "steeringAngle" in TECH_STEER_RELEASE_LUA
+    assert "steeringFilter" in TECH_STEER_RELEASE_LUA
     assert "lockType" in TECH_STEER_RELEASE_LUA
     assert "900" in TECH_STEER_RELEASE_LUA
     assert "input.setAllowedInputSource('steering',nil);" in lua
     assert "input.lastInputs['local']" in lua
     assert "M.techSteerOwed" in lua
     assert "tech_steer_hold" in lua
-    assert "queueVehicle(applyVeh or getPlayerVeh(), M.techSteerRelease)" in lua
+    assert "queueVehicle(M.techSteerTarget(), M.techSteerRelease)" in lua
+    assert "function M.techSteerTarget()" in lua
     assert "M.noteTechSteerHold" in lua
     body = lua[lua.index("M.techSteerRelease"):lua.index("local VE_RELEASE")]
     compact = body.replace(" ", "").replace("\n", "").replace("..", "").replace('"', "")
@@ -663,6 +787,8 @@ def main() -> None:
         check_override_signal_is_the_wheel()
         check_hold_flag_before_queue()
         check_failed_hold_not_applied()
+        check_retry_kill_keeps_disk_flag()
+        check_command_side_grab()
         check_release_text_matches_mod()
     finally:
         if prev is None:

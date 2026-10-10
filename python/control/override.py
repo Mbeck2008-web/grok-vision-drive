@@ -221,6 +221,24 @@ def own_steer_residual(
     return 0.0
 
 
+def command_side_residual(echo: float, ref_steer: float) -> float:
+    """Grab past the command, on the command's side.
+
+    A straight command (near 0) has no side, so the residual is the wheel
+    angle. A wheel of 0.10 against command 0 is past ``steer_enter`` 0.08
+    and a sustained hold drops Engage. A nonzero command ignores the wheel
+    until it passes that command on the same side: wheel 0 or a small
+    opposite offset against command 0.35 is residual 0.
+    """
+    cmd = float(ref_steer)
+    wheel = float(echo)
+    if abs(cmd) <= 1e-3:
+        return wheel
+    if cmd > 0.0:
+        return 0.0 if wheel <= cmd else wheel - cmd
+    return 0.0 if wheel >= cmd else wheel - cmd
+
+
 def tech_override_steer(
     steering_input: float | None,
     ego_fb: Any,
@@ -232,7 +250,7 @@ def tech_override_steer(
     After the steer hold, ``electrics.steering_input`` is the gvd command. The
     physical wheel is ``player_steering`` from ``input.lastInputs`` (still
     recorded when local is blocked). Using the command echo as the wheel would
-    baseline the detector on GVD's own steer.     With the lock on and no player
+    baseline the detector on GVD's own steer. With the lock on and no player
     echo yet, return None. Once the detector is armed, that missing echo
     seeds rest at 0 so the next wheel sample is not stored as the resting
     angle. Before the lock, electrics are still the wheel, because the wheel
@@ -399,16 +417,17 @@ class OverrideDetector:
         # throttle and wins a tie, because that is the reason a player most needs to be told.
         thr_r = max(0.0, _clamp(throttle_input, 0.0, 1.0) - ref_thr) if throttle_input is not None else 0.0
         brk_r = max(0.0, _clamp(brake_input, 0.0, 1.0) - ref_brk) if brake_input is not None else 0.0
-        # Tech hold: rest is 0, the command's origin. A missing echo must not
-        # leave rest unset, or the next wheel sample is stored as rest and a
-        # grab already in hand at arm time is the baseline. Unlocked own_axes
-        # still takes the first real wheel sample as the resting angle.
+        # Tech hold: rest is 0 so a grab already in hand is not the baseline.
+        # Opposition counts only past the command on the command's side.
+        # Unlocked own_axes still takes the first real wheel sample as rest.
         if own_axes and steer_locked and self._base_steer is None:
             self._base_steer = 0.0
             self._base_steer_cmd = ref_steer
             self._caught = 0.0
         if steering_input is None:
             raw = 0.0
+        elif own_axes and steer_locked:
+            raw = command_side_residual(_clamp(steering_input, -1.0, 1.0), ref_steer)
         elif own_axes:
             echo_s = _clamp(steering_input, -1.0, 1.0)
             if self._base_steer is None:

@@ -197,6 +197,9 @@ def check_arcade_hold_not_reverse() -> None:
         def control(self, **kw) -> None:
             self.calls.append(kw)
 
+        def queue_lua_command(self, chunk, response: bool = False) -> None:
+            return None
+
     for speed, cmd in (
         (0.0, DriveCommand(steer=0.0, throttle=0.0, brake=1.0, seq=1, reason="ok")),
         (8.0, DriveCommand(steer=0.0, throttle=0.0, brake=1.0, seq=2, reason="stop")),

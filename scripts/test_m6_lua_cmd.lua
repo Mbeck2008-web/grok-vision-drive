@@ -573,6 +573,427 @@ check(not M.isEngaged(), 'supervisor OFF still wins after a heartbeat')
 local stayed = readFileAll(engagePath)
 check(stayed and stayed:find('"engaged": false', 1, true), 'heartbeat did not rewrite supervisor OFF (' .. tostring(stayed) .. ')')
 
+-- 16) Tech steer hold: a dead supervisor, or a hold flag going false, gives the wheel back.
+-- Python queues the lock. This mod only clears it. Retail applying is left alone.
+-- A failed queue keeps the latch and does not log success. The next poll retries.
+local releaseFails = 0
+local queueLuaCommand = Veh.queueLuaCommand
+function Veh:queueLuaCommand(code)
+  if releaseFails > 0 and type(code) == 'string' and code:find("lastInputs['local']", 1, true) then
+    releaseFails = releaseFails - 1
+    error('release queue failed')
+  end
+  return queueLuaCommand(self, code)
+end
+clearEvents()
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":true,"cmd_seq":%d}',
+  os.time() + 50, DRIVE_BUS, DRIVE_BUS, seq))
+M.onUpdate(0.2)
+check(lastAllowed('steering') == nil, 'live tech_steer_hold does not clear the player wheel')
+clearEvents()
+local nLog = #logs
+M.onUpdate(2.2)
+check(lastAllowed('steering') and lastAllowed('steering')[2] == nil,
+  'stale supervisor heartbeat restores player steering')
+local hit = false
+for i = nLog + 1, #logs do
+  if tostring(logs[i]):find('tech steer release', 1, true) then hit = true end
+end
+check(hit, 'stale heartbeat logs tech steer release')
+clearEvents()
+M.onUpdate(0.2)
+check(#allowed == 0, 'a still-stale hold file does not re-arm the release')
+
+clearEvents()
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":true,"cmd_seq":%d}',
+  os.time() + 80, DRIVE_BUS, DRIVE_BUS, seq))
+M.onUpdate(0.2)
+check(lastAllowed('steering') == nil, 'a fresh hold does not release')
+writeFile(statePath, string.format(
+  '{"engaged":false,"disengage_reason":"player_steer","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":false,"cmd_seq":%d}',
+  os.time() + 81, DRIVE_BUS, DRIVE_BUS, seq))
+nLog = #logs
+M.onUpdate(0.2)
+check(lastAllowed('steering') and lastAllowed('steering')[2] == nil,
+  'tech_steer_hold false restores player steering')
+hit = false
+for i = nLog + 1, #logs do
+  if tostring(logs[i]):find('hold flag clear', 1, true) then hit = true end
+end
+check(hit, 'hold false logs hold flag clear')
+
+-- Failed queue keeps the latch. The next poll still sends the release.
+clearEvents()
+veEnv.input.lastInputs['local'] = { steering = 0.55 }
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":true,"cmd_seq":%d}',
+  os.time() + 85, DRIVE_BUS, DRIVE_BUS, seq))
+M.onUpdate(0.2)
+check(M.techSteerOwed == true, 'fresh hold arms the release watch')
+releaseFails = 1
+clearEvents()
+nLog = #logs
+M.onUpdate(2.2)
+check(M.techSteerOwed == true, 'failed release keeps the latch')
+check(lastAllowed('steering') == nil, 'failed release does not touch the whitelist')
+hit = false
+for i = nLog + 1, #logs do
+  if tostring(logs[i]):find('tech steer release', 1, true) then hit = true end
+end
+check(not hit, 'failed release skips the success log')
+clearEvents()
+nLog = #logs
+M.onUpdate(0.2)
+check(M.techSteerOwed == false, 'next poll clears the latch after the release is queued')
+check(lastAllowed('steering') and lastAllowed('steering')[2] == nil,
+  'next poll restores player steering')
+local ev = lastEvent('steering')
+check(ev and ev[6] == 'local' and near(ev[2], 0.55) and ev[3] == 2 and ev[4] == 900 and ev[5] == 0,
+  'release replays lastInputs.local.steering with Direct Drive fallback ('
+  .. tostring(ev and ev[2]) .. ' f ' .. tostring(ev and ev[3])
+  .. ' ang ' .. tostring(ev and ev[4]) .. ' lk ' .. tostring(ev and ev[5]) .. ')')
+hit = false
+for i = nLog + 1, #logs do
+  if tostring(logs[i]):find('supervisor heartbeat stale', 1, true) then hit = true end
+end
+check(hit, 'retried release logs the stale heartbeat')
+clearEvents()
+M.onUpdate(0.2)
+check(#allowed == 0, 'a still-stale hold file does not re-arm after a successful release')
+check(M.techSteerOwed ~= true, 'stale file does not re-arm the latch')
+
+-- Binding angle and lock type sit beside the stored value.
+clearEvents()
+veEnv.input.lastInputs['local'] = { steering = 0.4, steeringAngle = 450, steeringLockType = 1 }
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":true,"cmd_seq":%d}',
+  os.time() + 90, DRIVE_BUS, DRIVE_BUS, seq))
+M.onUpdate(0.2)
+check(M.techSteerOwed == true, 'binding hold arms the watch')
+clearEvents()
+M.onUpdate(2.2)
+ev = lastEvent('steering')
+check(ev and ev[6] == 'local' and near(ev[2], 0.4) and ev[3] == 2 and ev[4] == 450 and ev[5] == 1,
+  'release uses steeringAngle and steeringLockType ('
+  .. tostring(ev and ev[4]) .. ' lk ' .. tostring(ev and ev[5]) .. ')')
+
+clearEvents()
+veEnv.input.lastInputs['local'] = { steering = { value = -0.2, angle = 1200, lockType = 2 } }
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":true,"cmd_seq":%d}',
+  os.time() + 95, DRIVE_BUS, DRIVE_BUS, seq))
+M.onUpdate(0.2)
+clearEvents()
+M.onUpdate(2.2)
+ev = lastEvent('steering')
+check(ev and ev[6] == 'local' and near(ev[2], -0.2) and ev[3] == 2 and ev[4] == 1200 and ev[5] == 2,
+  'release uses a table angle and lockType ('
+  .. tostring(ev and ev[2]) .. ' ang ' .. tostring(ev and ev[4]) .. ')')
+
+-- A stored filter is replayed when it sits beside the value.
+clearEvents()
+veEnv.input.lastInputs['local'] = { steering = 0.2, steeringFilter = 1, steeringAngle = 900, steeringLockType = 0 }
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":true,"cmd_seq":%d}',
+  os.time() + 97, DRIVE_BUS, DRIVE_BUS, seq))
+M.onUpdate(0.2)
+clearEvents()
+M.onUpdate(2.2)
+ev = lastEvent('steering')
+check(ev and ev[6] == 'local' and near(ev[2], 0.2) and ev[3] == 1 and ev[4] == 900 and ev[5] == 0,
+  'release uses steeringFilter (' .. tostring(ev and ev[3]) .. ')')
+
+-- Unload retries inside one call. One failed queue is consumed by the retry.
+clearEvents()
+veEnv.input.lastInputs['local'] = { steering = 0.55 }
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":true,"cmd_seq":%d}',
+  os.time() + 100, DRIVE_BUS, DRIVE_BUS, seq))
+M.onUpdate(0.2)
+check(M.techSteerOwed == true, 'hold before unload arms the watch')
+releaseFails = 1
+clearEvents()
+nLog = #logs
+M.onExtensionUnloaded()
+check(M.techSteerOwed == false, 'unload retries a failed release and clears the latch')
+check(lastAllowed('steering') and lastAllowed('steering')[2] == nil,
+  'extension unload restores player steering')
+hit = false
+for i = nLog + 1, #logs do
+  if tostring(logs[i]):find('extension unloaded', 1, true) then hit = true end
+end
+check(hit, 'unload logs tech steer release')
+local disk = readFileAll(statePath)
+check(disk and disk:find('"tech_steer_hold":true', 1, true),
+  'queue accept leaves the hold flag (' .. tostring(disk) .. ')')
+M.onExtensionLoaded()
+check(M.techSteerOwed == true, 'next load re-arms a hold the unload did not clear')
+
+-- Every retry fails: latch stays, disk flag is forced true, the next load arms.
+local keptBeat = os.time() + 110
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":true,"cmd_seq":%d}',
+  keptBeat, DRIVE_BUS, DRIVE_BUS, seq))
+M.onExtensionLoaded()
+check(M.techSteerOwed == true, 'reload arms from a live hold flag')
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":false,"cmd_seq":%d}',
+  keptBeat, DRIVE_BUS, DRIVE_BUS, seq))
+releaseFails = 3
+nLog = #logs
+M.onExtensionUnloaded()
+check(M.techSteerOwed == true, 'unload keeps the latch when every release try fails')
+hit = false
+for i = nLog + 1, #logs do
+  if tostring(logs[i]):find('tech steer release (extension unloaded)', 1, true) then hit = true end
+end
+check(not hit, 'failed unload skips the success log')
+disk = readFileAll(statePath)
+check(disk and disk:find('"tech_steer_hold":true', 1, true),
+  'failed unload keeps the hold flag (' .. tostring(disk) .. ')')
+M.techSteerOwed = false
+M.onExtensionLoaded()
+check(M.techSteerOwed == true, 'next load arms from the hold flag the failed unload kept')
+
+-- Remembered vehicle id. getPlayerVeh nil, object missing on the first try.
+local remembered = setmetatable({ id = 303 }, Veh)
+local lookups = 0
+local savedGet = be.getPlayerVehicle
+be.getPlayerVehicle = function() return nil end
+be.getObjectByID = function(_, id)
+  lookups = lookups + 1
+  if lookups == 1 then return nil end
+  if id == 303 then return remembered end
+  return nil
+end
+clearEvents()
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":true,"tech_steer_hold_vid":303,"cmd_seq":%d}',
+  os.time() + 120, DRIVE_BUS, DRIVE_BUS, seq))
+M.techSteerOwed = false
+M.techSteerVehId = nil
+M.onUpdate(0.2)
+check(M.techSteerOwed == true, 'vid hold arms the watch')
+clearEvents()
+nLog = #logs
+M.onUpdate(2.2)
+check(M.techSteerOwed == true, 'nil target keeps the latch for a later tick')
+hit = false
+for i = nLog + 1, #logs do
+  if tostring(logs[i]):find('tech steer release', 1, true) then hit = true end
+end
+check(not hit, 'nil target skips the success log')
+clearEvents()
+M.onUpdate(0.2)
+check(M.techSteerOwed == false, 'later tick releases on the remembered vehicle')
+local foundVid = false
+for i = 1, #events do
+  if events[i][1] == 'steering' and events[i].veh == 303 then foundVid = true end
+end
+check(foundVid, 'release queued on vehicle 303')
+be.getPlayerVehicle = savedGet
+be.getObjectByID = nil
+
+-- BeamNGpy vid is a vehicle name. scenetree.findObject resolves the string.
+local named = setmetatable({ id = 404 }, Veh)
+local lateNamed = setmetatable({ id = 505 }, Veh)
+local resolveNosuch = false
+scenetree = {
+  findObject = function(name)
+    if name == 'gvdcar' then return named end
+    if name == 'nosuch' and resolveNosuch then return lateNamed end
+    return nil
+  end,
+}
+clearEvents()
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":true,"tech_steer_hold_vid":"gvdcar","cmd_seq":%d}',
+  os.time() + 140, DRIVE_BUS, DRIVE_BUS, seq))
+M.techSteerOwed = false
+M.techSteerVehId = nil
+M.onUpdate(0.2)
+check(M.techSteerOwed == true, 'string vid arms the watch')
+check(M.techSteerVehId == 'gvdcar', 'string vid is stored (' .. tostring(M.techSteerVehId) .. ')')
+clearEvents()
+M.onUpdate(2.2)
+check(M.techSteerOwed == false, 'string vid release clears the latch')
+local foundName = false
+for i = 1, #events do
+  if events[i][1] == 'steering' and events[i].veh == 404 then foundName = true end
+end
+check(foundName, 'release queued on scenetree.findObject vehicle 404')
+
+-- An unresolvable name falls back to the player vehicle.
+clearEvents()
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":true,"tech_steer_hold_vid":"nosuch","cmd_seq":%d}',
+  os.time() + 150, DRIVE_BUS, DRIVE_BUS, seq))
+M.techSteerOwed = false
+M.techSteerVehId = nil
+M.onUpdate(0.2)
+check(M.techSteerOwed == true, 'unresolvable name arms the watch')
+clearEvents()
+nLog = #logs
+M.onUpdate(2.2)
+check(M.techSteerOwed == true, 'unresolvable name keeps the latch after the player fallback')
+local foundPlayer = false
+for i = 1, #events do
+  if events[i][1] == 'steering' and events[i].veh == 101 then foundPlayer = true end
+end
+check(foundPlayer, 'unresolvable name released on player vehicle 101')
+hit = false
+for i = nLog + 1, #logs do
+  if tostring(logs[i]):find('player fallback', 1, true) then hit = true end
+end
+check(hit, 'player fallback is logged')
+local function countPlayerRelease()
+  local n = 0
+  for i = 1, #events do
+    if events[i][1] == 'steering' and events[i].veh == 101 and events[i][6] == 'local' then
+      n = n + 1
+    end
+  end
+  return n
+end
+local playerQueues = countPlayerRelease()
+check(playerQueues == 1, 'first fallback queues once (' .. tostring(playerQueues) .. ')')
+local nFallback = 0
+for i = nLog + 1, #logs do
+  if tostring(logs[i]):find('player fallback', 1, true) then nFallback = nFallback + 1 end
+end
+for _ = 1, 5 do
+  M.onUpdate(0.2)
+end
+playerQueues = countPlayerRelease()
+check(playerQueues == 1, 'later polls do not re-queue the player fallback (' .. tostring(playerQueues) .. ')')
+check(M.techSteerOwed == true, 'latch stays while the named vehicle is missing')
+local nFallbackAfter = 0
+for i = nLog + 1, #logs do
+  if tostring(logs[i]):find('player fallback', 1, true) then nFallbackAfter = nFallbackAfter + 1 end
+end
+check(nFallbackAfter == nFallback, 'fallback log stays once (' .. tostring(nFallbackAfter) .. ')')
+resolveNosuch = true
+clearEvents()
+nLog = #logs
+M.onUpdate(0.2)
+check(M.techSteerOwed == false, 'later named-vehicle release clears the latch')
+local foundLate = false
+for i = 1, #events do
+  if events[i][1] == 'steering' and events[i].veh == 505 then foundLate = true end
+end
+check(foundLate, 'release queued on the named vehicle once it resolves')
+
+-- An unresolvable numeric id falls back to the player vehicle too.
+local resolve999 = false
+local veh999 = setmetatable({ id = 999 }, Veh)
+be.getObjectByID = function(_, id)
+  if resolve999 and id == 999 then return veh999 end
+  return nil
+end
+clearEvents()
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":true,"tech_steer_hold_vid":999,"cmd_seq":%d}',
+  os.time() + 160, DRIVE_BUS, DRIVE_BUS, seq))
+M.techSteerOwed = false
+M.techSteerVehId = nil
+M.onUpdate(0.2)
+clearEvents()
+nLog = #logs
+M.onUpdate(2.2)
+check(M.techSteerOwed == true, 'unresolvable numeric id keeps the latch after the player fallback')
+foundPlayer = false
+for i = 1, #events do
+  if events[i][1] == 'steering' and events[i].veh == 101 then foundPlayer = true end
+end
+check(foundPlayer, 'unresolvable numeric id released on player vehicle 101')
+resolve999 = true
+clearEvents()
+M.onUpdate(0.2)
+check(M.techSteerOwed == false, 'later numeric id release clears the latch')
+local found999 = false
+for i = 1, #events do
+  if events[i][1] == 'steering' and events[i].veh == 999 then found999 = true end
+end
+check(found999, 'release queued on vehicle 999 once it resolves')
+be.getObjectByID = nil
+scenetree = nil
+
+-- Unload's release was accepted. A later load with a stale heartbeat replays
+-- that release once and clears tech_steer_hold so the latch does not stay owed.
+clearEvents()
+veEnv.input.lastInputs['local'] = { steering = 0.33 }
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":true,"cmd_seq":%d}',
+  os.time() + 200, DRIVE_BUS, DRIVE_BUS, seq))
+M.techSteerOwed = false
+M.techSteerVehId = nil
+M.techSteerLoadReplay = nil
+releaseFails = 0
+M.onUpdate(0.2)
+check(M.techSteerOwed == true, 'load-replay setup arms the watch')
+M.onExtensionUnloaded()
+check(M.techSteerOwed == false, 'accepted unload clears the latch')
+disk = readFileAll(statePath)
+check(disk and disk:find('"tech_steer_hold":true', 1, true),
+  'accepted unload leaves the hold flag (' .. tostring(disk) .. ')')
+writeFile(statePath, string.format(
+  '{"engaged":false,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","tech_steer_hold":true,"cmd_seq":%d}',
+  os.time() - 10, DRIVE_BUS, DRIVE_BUS, seq))
+nLog = #logs
+M.onExtensionLoaded()
+check(M.techSteerOwed == false, 'stale load replay does not leave the latch owed')
+disk = readFileAll(statePath)
+check(disk and disk:find('"tech_steer_hold":false', 1, true),
+  'load replay clears tech_steer_hold (' .. tostring(disk) .. ')')
+hit = false
+for i = nLog + 1, #logs do
+  if tostring(logs[i]):find('load replay', 1, true) then hit = true end
+end
+check(hit, 'load replay logs tech steer release')
+
+-- nPlayer == 0 writes player_steering null. A real device at 0 writes 0.0000.
+M.onEgoFeedback(1.0, 0.2, 0, 0, 0, 0, 0, 0, 0.4, 0, 0, 0)
+local egoNull = readFileAll(egoPath)
+check(egoNull and egoNull:find('"player_steering":null', 1, true)
+  and egoNull:find('"player_device":false', 1, true),
+  'nPlayer 0 writes player_steering null (' .. tostring(egoNull) .. ')')
+M.onEgoFeedback(1.0, 0.2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1)
+local egoZero = readFileAll(egoPath)
+check(egoZero and egoZero:find('"player_steering":0.0000', 1, true)
+  and egoZero:find('"player_device":true', 1, true),
+  'nPlayer 1 writes a centered wheel (' .. tostring(egoZero) .. ')')
+
+-- Glance word: beamngpy with the lock up, or tech_steer_hold_queue, is DRIVE.
+local lastTag = nil
+guihooks = {
+  trigger = function(name, payload)
+    if name == 'gvdUi' and type(payload) == 'table' then lastTag = payload.tag end
+  end,
+}
+M.setEngaged(true)
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","actuator":"beamngpy","cmd_applied":false,"tech_steer_hold":true,"cmd_reason":"ok","cmd_seq":%d}',
+  os.time() + 30, DRIVE_BUS, DRIVE_BUS, seq))
+M.pushUiState()
+check(lastTag == 'DRIVE', 'beamngpy lock up glance is DRIVE (' .. tostring(lastTag) .. ')')
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","actuator":"beamngpy","cmd_applied":false,"tech_steer_hold":false,"cmd_reason":"tech_steer_hold_queue","cmd_seq":%d}',
+  os.time() + 40, DRIVE_BUS, DRIVE_BUS, seq))
+M.pushUiState()
+check(lastTag == 'DRIVE', 'tech_steer_hold_queue glance is DRIVE (' .. tostring(lastTag) .. ')')
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","actuator":"beamngpy","cmd_applied":false,"cmd_reason":"ok","cmd_seq":%d}',
+  os.time() + 50, DRIVE_BUS, DRIVE_BUS, seq))
+M.pushUiState()
+check(lastTag == 'ON', 'beamngpy without a lock stays ON (' .. tostring(lastTag) .. ')')
+
+-- A missing state file is not replaced.
+vfsBus[statePath] = nil
+M.noteTechSteerHold(true)
+check(vfsBus[statePath] == nil, 'noteTechSteerHold skips a missing file')
+
 -- 12) chrome check on everything we push to the vehicle / HUD
 for _, e in ipairs(logs) do assert(not e:lower():find('tesla') and not e:find('FSD'), 'chrome in log: ' .. e) end
 

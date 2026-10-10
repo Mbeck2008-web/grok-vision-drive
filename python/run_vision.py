@@ -23,6 +23,7 @@ from python.control.actuate import (
     soft_esc_state_write_due,
     soft_esc_state_write_mark,
     soft_esc_state_write_skips,
+    publish_shutdown_steer_hold,
     stop_command,
     write_engage_flag,
 )
@@ -41,6 +42,7 @@ from python.control.override import (
     OverrideDetector,
     config_mirror,
     load_override_config,
+    tech_override_steer,
 )
 from python.data.record import ClipRecorder, choose_encoder
 from python.perception.pipeline import ModularPerception
@@ -70,6 +72,90 @@ from python.sensors.cameras import make_backend, resolve_backend_name
 from python.viz.monitors import place_opencv_window
 from python.viz.stage import STAGE_W, STAGE_H, VizUI, render_stage, smoke
 
+
+
+_STEER_GRAB_BLIND_LOGGED = False
+_STEER_GRAB_BLIND_SINCE: float | None = None
+_STEER_WHEEL_BLIND_S = 2.0
+
+
+def sample_tech_wheel(
+    actuator: object, steer_in: float | None, *, now: float | None = None
+) -> float | None:
+    """Wheel angle the Tech override should see.
+
+    A non-Tech actuator returns the electrics sample. On Tech, a fresh
+    numeric ``player_steering`` from ``gvd_ego.json`` is the physical wheel
+    (``lastInputs``, still recorded when local is blocked), even when
+    ``player_device`` is false. JSON null is a missing echo: Lua writes null
+    when no player source is in ``lastInputs``. While the hold is on and that
+    field is absent, null, or the file is stale, return None and start the
+    blind timer.
+    The detector seeds rest at 0 once it is armed, so that missing echo is
+    not a wheel at the command. The first time the hold is on and the echo
+    stays missing, log once: the grab path cannot see the wheel. A real
+    sample, or the lock dropping, clears that log so the next lock can say
+    it again.
+    """
+    global _STEER_GRAB_BLIND_LOGGED, _STEER_GRAB_BLIND_SINCE
+    if getattr(actuator, "name", "") != "beamngpy":
+        return steer_in
+    locked = bool(getattr(actuator, "steer_locked", False))
+    sampled = tech_override_steer(
+        steer_in,
+        read_ego_feedback(),
+        steer_locked=locked,
+    )
+    if not locked or sampled is not None:
+        _STEER_GRAB_BLIND_LOGGED = False
+        _STEER_GRAB_BLIND_SINCE = None
+        return sampled
+    t = time.monotonic() if now is None else float(now)
+    if _STEER_GRAB_BLIND_SINCE is None:
+        _STEER_GRAB_BLIND_SINCE = t
+    if not _STEER_GRAB_BLIND_LOGGED:
+        _STEER_GRAB_BLIND_LOGGED = True
+        print(
+            "[GVD] tech steer grab blind: player_steering missing while hold is on",
+            flush=True,
+        )
+    return sampled
+
+
+def override_note_steer(applied: object, actuator: object) -> float:
+    """Steer the override residual is measured against.
+
+    A failed hold refresh after the lock still sends pedals and leaves
+    ``applied`` false. The detector keeps the last steer that was actually
+    queued, so a wheel sitting on that steer is not read as a grab against
+    a command the car never took.
+    """
+    if not bool(getattr(applied, "applied", True)) and bool(getattr(actuator, "steer_locked", False)):
+        queued = getattr(actuator, "steer_hold_command", None)
+        if queued is not None:
+            try:
+                return float(queued)
+            except (TypeError, ValueError):
+                pass
+    try:
+        return float(getattr(applied, "steer", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def tech_wheel_blind_reason(*, now: float | None = None) -> str | None:
+    """Drop Engage when the locked grab path has been blind for more than 2 s.
+
+    A grab has to be able to disengage. ``player_steering`` missing while the
+    hold is up means that path cannot see the wheel.
+    """
+    since = _STEER_GRAB_BLIND_SINCE
+    if since is None:
+        return None
+    t = time.monotonic() if now is None else float(now)
+    if (t - since) > _STEER_WHEEL_BLIND_S:
+        return "tech_wheel_blind"
+    return None
 
 
 def _load_control_yaml() -> dict:
@@ -718,18 +804,32 @@ def main() -> None:
             # Player override. Retail Direct Drive lock: when Lua saw a player device, electrics
             # are GVD's own command — use the physical lastInputs axes (absolute). Otherwise the
             # residual is still steering_input - aligned cmd.steer so FFB noise cannot disengage.
-            # Soft Esc beamngpy is not source=gvd, so lastInputs / electrics can echo the command
-            # we just sent. own_axes keeps the pedal residual, and the steer baseline follows
-            # the resting wheel when the command changes, instead of the absolute player_* path.
+            # Tech omits steering from vehicle.control and locks local out of the hydros, so
+            # lastInputs.local.steering stays the wheel. The 1.7.4 residual reads that echo
+            # from gvd_ego.json. own_axes keeps the pedal residual on electrics (pedals are
+            # not locked). While the hold is on, rest is 0 until a real wheel sample arrives.
             owns_axes = getattr(actuator, "name", "") == "beamngpy"
             if owns_axes:
-                ovr_steer, ovr_thr, ovr_brk, ovr_dev = steer_in, throttle_in, brake_in, False
+                ovr_steer = sample_tech_wheel(actuator, steer_in)
+                ovr_thr, ovr_brk, ovr_dev = throttle_in, brake_in, False
             elif ego_fb is not None and ego_fb.fresh and ego_fb.player_device:
                 ovr_steer, ovr_thr, ovr_brk, ovr_dev = (
                     ego_fb.player_steering, ego_fb.player_throttle, ego_fb.player_brake, True,
                 )
             else:
                 ovr_steer, ovr_thr, ovr_brk, ovr_dev = steer_in, throttle_in, brake_in, False
+            if (
+                owns_axes
+                and engaged
+                and not ui.debug.ignore_override
+                and tech_wheel_blind_reason() == "tech_wheel_blind"
+            ):
+                engaged = False
+                disengage_reason = "tech_wheel_blind"
+                bot_engage.clear()
+                write_engage_flag(False, disengage_reason=disengage_reason)
+                print("[GVD] DISENGAGED: tech_wheel_blind", flush=True)
+                cmd = stop_command(seq=cmd_seq, reason="tech_wheel_blind")
             ovr = override.update(
                 engaged=engaged,
                 steering_input=ovr_steer,
@@ -737,6 +837,7 @@ def main() -> None:
                 brake_input=ovr_brk,
                 player_device=ovr_dev,
                 own_axes=owns_axes,
+                steer_locked=bool(getattr(actuator, "steer_locked", False)) if owns_axes else False,
                 applied_seq=None if owns_axes else (
                     ego_fb.applied_seq if ego_fb is not None and ego_fb.fresh else None
                 ),
@@ -768,7 +869,10 @@ def main() -> None:
             # command its echo belongs to. Gate holds ride along as brake=1 and the car echoes
             # those back just like a real command, so they have to be in here too.
             override.note_command(
-                seq=applied.seq, steer=applied.steer, throttle=applied.throttle, brake=applied.brake
+                seq=applied.seq,
+                steer=override_note_steer(applied, actuator),
+                throttle=applied.throttle,
+                brake=applied.brake,
             )
 
             st = default_state(
@@ -852,6 +956,19 @@ def main() -> None:
             st["viz_note"] = viz_note
             st["detector"] = pout.detector_name
             st["actuator"] = actuator.name
+            # Steady snapshot after the tick. True while a hold is pending or
+            # the lock is up, until a release queue is accepted.
+            hold_fn = getattr(actuator, "tech_steer_hold_for_state", None)
+            if callable(hold_fn):
+                st["tech_steer_hold"] = bool(hold_fn())
+            else:
+                st["tech_steer_hold"] = bool(getattr(actuator, "steer_locked", False))
+            if st["tech_steer_hold"]:
+                vid = getattr(actuator, "steer_hold_vid", None)
+                if vid is None:
+                    vid = getattr(actuator, "_steer_hold_vid", None)
+                if vid is not None:
+                    st["tech_steer_hold_vid"] = vid
             st["cmd_seq"] = int(applied.seq)
             st["cmd_reason"] = applied.reason
             st["cmd_applied"] = bool(applied.applied)
@@ -1049,6 +1166,9 @@ def main() -> None:
             if hasattr(actuator, "note_engaged"):
                 actuator.note_engaged(False)  # cmd_json: Lua releases the car at once
             actuator.stop(seq=cmd_seq + 1, reason="shutdown")
+            # The loop's snapshot does not run after this. Clear the disk
+            # flag only when the release queue was accepted.
+            publish_shutdown_steer_hold(actuator)
         except Exception:
             pass
         try:

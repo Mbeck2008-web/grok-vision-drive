@@ -3,7 +3,27 @@
 -- Retail (window capture): Documents/GVD/gvd_cmd.json is applied to the player vehicle only while
 -- engaged, as a secondary Direct Drive wheel + pedals (FILTER_DIRECT + source gvd + allowedInputSources).
 -- A connected keyboard/pad/wheel/pedal cluster otherwise overwrites pad-smoothed input.event every
--- frame, so the software never actually holds the sim car. No DLL / hooks. Tech still uses BeamNGpy.
+-- frame, so the software never actually holds the sim car. No DLL / hooks.
+-- Tech steer is a gvd Direct Drive hold. vehicle.control does not send steering
+-- while that hold is up, or the Control message would overwrite lastInputs.local.steering
+-- and a held wheel grab would read back as the command. This extension clears the
+-- steering whitelist when the supervisor drops the hold flag or its heartbeat goes
+-- stale, and on unload, then replays lastInputs.local.steering so a wheel already
+-- held drives without waiting for the next onChange. The replay uses a filter,
+-- angle, and lock type stored beside that value when they are present. Otherwise
+-- it is Direct Drive filter 2, angle 900, lock type 0. The latch stays set until
+-- that queue is accepted. Accepting the queue does not clear tech_steer_hold.
+-- The next load replays the release once when the heartbeat is already stale,
+-- then clears the flag so the latch does not stay owed. A live heartbeat only
+-- arms the watch. Unload retries the release and, when every try fails, writes
+-- the flag true if the state file can be read. tech_steer_hold_vid is a
+-- beamngpy vehicle name: scenetree.findObject, then be:getObjectByID when the
+-- id is numeric, then the player vehicle. A player-only fallback queues the
+-- release once per latch. Later polls keep looking for the named vehicle
+-- and do not queue the player again. The latch stays until that named
+-- vehicle is the one released.
+-- nPlayer == 0 writes player_steering as JSON null so a live zero is missing.
+-- Pedal locks stay on the retail path.
 -- Detector, path, planner and track ghosts keep running/drawing while the supervisor is live;
 -- Alt+G is the takeover latch (ice underglow + actuators), not the start of perception.
 local M = {}
@@ -888,17 +908,20 @@ local function uiPayload()
   local camOk, camTotal, camList = uiCams(st)
   local reason = st and tostring(st.cmd_reason or '') or ''
   local aeb = pl.aeb and tostring(pl.aeb) or ''
-  -- preview / veto / AEB / stale link are holds. DRIVE only while a live command is applied.
+  -- preview / veto / AEB / stale link are holds. DRIVE while a live command
+  -- is applied, while the Tech steer lock is up, or when the reason is
+  -- tech_steer_hold_queue.
   local hold = link ~= 'live' or reason == 'preview_blocked' or reason == 'heartbeat_stale'
     or reason:sub(1, 5) == 'veto:' or aeb == 'brake' or aeb == 'warn'
   local actuator = st and tostring(st.actuator or '') or ''
   local applied = st and st.cmd_applied == true
+  local steerHold = st and st.tech_steer_hold == true
   local modeTag = '|OFF'
   if link == 'mismatch' then
     modeTag = '|MISMATCH'
   elseif engaged and hold then
     modeTag = '|HOLD'
-  elseif engaged and (applying or (actuator == 'beamngpy' and applied)) then
+  elseif engaged and (applying or (actuator == 'beamngpy' and (applied or steerHold)) or reason == 'tech_steer_hold_queue') then
     modeTag = '|DRIVE'
   elseif engaged then
     modeTag = '|ON'
@@ -1054,6 +1077,38 @@ local VE_APPLY_FMT = VE_HOLD
   .. "input.event('brake',%.4f,2,0,0,nil,'gvd');"
   .. "input.event('parkingbrake',0,2,0,0,nil,'gvd');"
   .. "input.event('clutch',0,2,0,0,nil,'gvd')"
+-- Steering-only undo of the Tech hold. Same text as Python TECH_STEER_RELEASE_LUA.
+-- Clear the whitelist, then replay the stored local wheel. A held wheel is
+-- onChange and will not write again until it moves. Pedals stay alone.
+-- 'local' is a keyword, so the source is lastInputs['local'].
+-- lastInputs normally stores only the axis value. A table may carry value,
+-- angle, lockType, and filter. A number may have sibling steeringAngle / angle,
+-- steeringLockType / lockType, and steeringFilter / filter. Otherwise filter 2,
+-- angle 900, lockType 0, which does not reproduce a non-direct player binding.
+M.techSteerRelease = "if input and input.setAllowedInputSource then "
+  .. "input.setAllowedInputSource('steering',nil);"
+  .. "end;"
+  .. "local s,ang,lk,flt=0,900,0,2;"
+  .. "if input and input.lastInputs and input.lastInputs['local'] then "
+  .. "local slot=input.lastInputs['local'];"
+  .. "local raw=slot.steering;"
+  .. "if type(raw)=='table' then "
+  .. "s=tonumber(raw.value or raw[1]) or 0;"
+  .. "ang=tonumber(raw.angle) or ang;"
+  .. "lk=tonumber(raw.lockType or raw.lock) or lk;"
+  .. "flt=tonumber(raw.filter or raw.filt) or flt;"
+  .. "else "
+  .. "s=tonumber(raw) or 0;"
+  .. "ang=tonumber(slot.steeringAngle or slot.angle) or ang;"
+  .. "lk=tonumber(slot.steeringLockType or slot.lockType) or lk;"
+  .. "flt=tonumber(slot.steeringFilter or slot.filter) or flt;"
+  .. "end;"
+  .. "end;"
+  .. "if s~=s or s==math.huge or s==-math.huge then s=0 end;"
+  .. "if ang~=ang or ang==math.huge or ang==-math.huge then ang=900 end;"
+  .. "if lk~=lk or lk==math.huge or lk==-math.huge then lk=0 end;"
+  .. "if flt~=flt or flt==math.huge or flt==-math.huge then flt=2 end;"
+  .. "input.event('steering',s,flt,ang,lk,nil,'local')"
 local VE_RELEASE = "input.event('steering',0,2,900,0,nil,'gvd');"
   .. "input.event('throttle',0,2,0,0,nil,'gvd');"
   .. "input.event('brake',0,2,0,0,nil,'gvd');"
@@ -1102,6 +1157,8 @@ local OVR = {
   brake_enter = 0.06,
   throttle_enter = 0.10,
   lpf_tau_ms = 80,
+  -- Tech locked residual only. Retail override math does not read this.
+  steer_center_deadband = 0.15,
 }
 -- Soft opposition bias: a residual fighting GVD's steer counts up to 25 % more, ramped in by how
 -- hard GVD is actually steering. Not a threshold of its own, so not a mirrored config key.
@@ -1168,6 +1225,7 @@ local function readOverrideCfg(st)
   num('brake_enter', 0.005, 1)
   num('throttle_enter', 0.005, 1)
   num('lpf_tau_ms', 0, 1000)
+  num('steer_center_deadband', 0, 1)
   -- Exit at or above enter would leave the dwell unable to discharge.
   if OVR.steer_exit >= OVR.steer_enter then OVR.steer_exit = OVR.steer_enter * 0.95 end
   if not ovrCfgLogged then
@@ -1366,19 +1424,26 @@ local function writeEgoFile()
     if okd then dirJson = jsonVec3(dir) end
   end
   local np = math.floor(tonumber(egoFb.nPlayer) or 0)
+  -- No player source: a live 0 would look like a centered wheel and silence
+  -- tech_wheel_blind. JSON null is a missing echo. A real device at 0 still
+  -- writes 0.0000.
+  local pSteerJson = 'null'
+  if np > 0 then
+    pSteerJson = string.format('%.4f', tonumber(egoFb.pSteer) or 0)
+  end
   local bus = tostring(luaBusPath()):gsub('"', '')
   local payload = string.format(
     '{"speed_mps":%.3f,"steering_input":%.4f,"throttle_input":%.4f,"brake_input":%.4f,'
       .. '"applied_seq":%d,"applying":%s,"mtime":%d,'
       .. '"gx":%s,"gy":%s,"gz":%s,"yaw_rate":%s,"pos":%s,"dir":%s,'
-      .. '"player_device":%s,"player_steering":%.4f,"player_throttle":%.4f,"player_brake":%.4f,'
+      .. '"player_device":%s,"player_steering":%s,"player_throttle":%.4f,"player_brake":%.4f,'
       .. '"lua_bus":"%s"}',
     egoFb.speed, egoFb.steer, egoFb.throttle, egoFb.brake,
     math.floor(tonumber(lastAppliedSeq) or -1), applying and 'true' or 'false', os.time(),
     jsonNum(egoFb.gx), jsonNum(egoFb.gy), jsonNum(egoFb.gz), jsonNum(egoFb.yawRate, '%.5f'),
     posJson, dirJson,
     np > 0 and 'true' or 'false',
-    tonumber(egoFb.pSteer) or 0, tonumber(egoFb.pThr) or 0, tonumber(egoFb.pBrk) or 0,
+    pSteerJson, tonumber(egoFb.pThr) or 0, tonumber(egoFb.pBrk) or 0,
     bus)
   writeText(gvdFile('gvd_ego.json'), payload)
 end
@@ -1619,6 +1684,8 @@ local function syncEngageFromSupervisor()
 end
 
 local function pollStateFile()
+  local loadWatch = M.techSteerLoadWatch
+  M.techSteerLoadWatch = nil
   local path = STATE_REL
   local raw = readText(path)
   if not raw then
@@ -1676,6 +1743,92 @@ local function pollStateFile()
   if firstGood then
     pushUi()
   end
+  -- Arm the Tech steer-release watch from a live supervisor, or once on load
+  -- even when the file is already stale, so a reload re-releases. A later
+  -- stale poll must not re-arm it after we already gave the wheel back.
+  if lastGood and lastGood.tech_steer_hold_vid ~= nil then
+    M.techSteerVehId = lastGood.tech_steer_hold_vid
+  end
+  if lastGood and lastGood.tech_steer_hold == true and (stateBeatAcc <= 2.0 or loadWatch) then
+    M.techSteerOwed = true
+  end
+  -- The load that follows an accepted unload replays the release once when
+  -- the supervisor is already stale, then clears the disk flag so the latch
+  -- does not stay owed. A live heartbeat only arms the watch.
+  if loadWatch and M.techSteerOwed and lastGood and M.techSteerBeatStale(lastGood) then
+    M.techSteerLoadReplay = true
+    if M.queueOwedSteerRelease() == 'released' then
+      M.finishTechSteerLoadReplay()
+      log('I', 'GVD', '[GVD] tech steer release (load replay)')
+      print('[GVD] tech steer release (load replay)')
+    end
+  end
+end
+
+function M.noteTechSteerFallback()
+  -- The named vehicle was not the one released. Log once and keep the latch.
+  if M.techSteerFallbackLogged then return end
+  M.techSteerFallbackLogged = true
+  log('I', 'GVD', '[GVD] tech steer release (player fallback)')
+  print('[GVD] tech steer release (player fallback)')
+end
+
+function M.queueOwedSteerRelease()
+  -- Queue the owed release. A player fallback is queued once per latch.
+  -- Later polls still resolve the name and return 'waiting' until it appears.
+  -- 'released' means the named vehicle took the queue.
+  local veh = M.techSteerTarget()
+  if M.techSteerTargetFallback and M.techSteerFallbackQueued then
+    return 'waiting'
+  end
+  if not queueVehicle(veh, M.techSteerRelease) then return nil end
+  if M.techSteerTargetFallback then
+    M.techSteerFallbackQueued = true
+    M.noteTechSteerFallback()
+    return 'fallback'
+  end
+  M.techSteerFallbackLogged = nil
+  M.techSteerFallbackQueued = nil
+  return 'released'
+end
+
+function M.techSteerBeatStale(st)
+  -- Wall clock, not stateBeatAcc. A fresh extension load resets the accumulator
+  -- when it first sees a beat, so a future or live heartbeat must not replay.
+  if not st then return true end
+  local mt = tonumber(st.heartbeat_mtime)
+  if mt == nil then return true end
+  return (os.time() - mt) > 2
+end
+
+function M.finishTechSteerLoadReplay()
+  M.techSteerLoadReplay = nil
+  M.techSteerOwed = false
+  if lastGood then lastGood.tech_steer_hold = false end
+  M.noteTechSteerHold(false)
+end
+
+function M.techSteerTarget()
+  -- BeamNGpy vid is a vehicle name. Resolve that name, then a numeric id,
+  -- then the player vehicle. The player fallback sets techSteerTargetFallback
+  -- so the caller keeps the latch until the named vehicle is released.
+  M.techSteerTargetFallback = nil
+  local id = M.techSteerVehId
+  if id ~= nil then
+    if scenetree and scenetree.findObject then
+      local ok, got = pcall(function() return scenetree.findObject(tostring(id)) end)
+      if ok and got and got.queueLuaCommand then return got end
+    end
+    local n = tonumber(id)
+    if n ~= nil and be and be.getObjectByID then
+      local ok, got = pcall(function() return be:getObjectByID(n) end)
+      if ok and got and got.queueLuaCommand then return got end
+    end
+    M.techSteerTargetFallback = true
+    return getPlayerVeh()
+  end
+  if applyVeh and applyVeh.queueLuaCommand then return applyVeh end
+  return getPlayerVeh()
 end
 
 local function pollState(dt)
@@ -1686,6 +1839,24 @@ local function pollState(dt)
   pollStateFile()
   -- After the state read so the logged reason is the supervisor's fresh disengage_reason.
   syncEngageFromSupervisor()
+  -- Tech steer hold is not retail `applying`. Python queues the release on a
+  -- clean stop. If that process dies, the heartbeat stops and this clears
+  -- the steering whitelist. Retail applying owns the whitelist itself.
+  if M.techSteerOwed and not applying then
+    local hold = lastGood and lastGood.tech_steer_hold == true
+    if stateBeatAcc > 2.0 or not hold then
+      local why = (stateBeatAcc > 2.0) and 'supervisor heartbeat stale' or 'hold flag clear'
+      if M.queueOwedSteerRelease() == 'released' then
+        if M.techSteerLoadReplay then
+          M.finishTechSteerLoadReplay()
+        else
+          M.techSteerOwed = false
+        end
+        log('I', 'GVD', '[GVD] tech steer release (' .. why .. ')')
+        print('[GVD] tech steer release (' .. why .. ')')
+      end
+    end
+  end
 end
 
 local preRenderSeen = false
@@ -1959,6 +2130,7 @@ function M.onUpdate(dt)
 end
 
 function M.onExtensionLoaded()
+  M.techSteerLoadWatch = true
   gvdDocsDir()  -- resolve + log once
   readUiPrefs()
   -- Do not wait for onUpdate/onPreRender: CEF Apps poke pushUiState while lastGood
@@ -1983,8 +2155,53 @@ function M.onExtensionLoaded()
     .. '; drives the player vehicle from gvd_cmd.json as a secondary Direct Drive wheel+pedals (retail). BeamNGpy direct control on Tech.')
 end
 
+function M.noteTechSteerHold(held)
+  -- Keep or set the disk flag without a new chunk local. A missing file is
+  -- left missing: do not invent a stub. A failed unload writes true when the
+  -- file can be read so the next load still arms the watch.
+  local raw = readText(STATE_REL)
+  if type(raw) ~= 'string' or raw == '' then
+    return
+  end
+  local flag = held and 'true' or 'false'
+  local patched, n = raw:gsub('"tech_steer_hold"%s*:%s*[%w]+', '"tech_steer_hold":' .. flag, 1)
+  if n == 0 then
+    if raw:match('^%s*{%s*}%s*$') then
+      patched = '{"tech_steer_hold":' .. flag .. '}'
+    else
+      local inserted, n2 = raw:gsub('%}%s*$', ',"tech_steer_hold":' .. flag .. '}', 1)
+      if n2 == 0 then
+        patched = '{"tech_steer_hold":' .. flag .. '}'
+      else
+        patched = inserted
+      end
+    end
+  end
+  if not writeText(STATE_REL, patched) then
+    log('W', 'GVD', '[GVD] tech steer hold flag publish failed')
+    print('[GVD] tech steer hold flag publish failed')
+  end
+end
+
 function M.onExtensionUnloaded()
   releaseInputs('extension unloaded')
+  if M.techSteerOwed and not applying then
+    local released = false
+    local tries = 0
+    while tries < 3 and not released do
+      tries = tries + 1
+      released = queueVehicle(M.techSteerTarget(), M.techSteerRelease)
+    end
+    if released and not M.techSteerTargetFallback then
+      M.techSteerOwed = false
+      log('I', 'GVD', '[GVD] tech steer release (extension unloaded)')
+      print('[GVD] tech steer release (extension unloaded)')
+    elseif released then
+      M.noteTechSteerFallback()
+    else
+      M.noteTechSteerHold(true)
+    end
+  end
   engaged = false
   writeEngageFile('extension_unloaded')
   lastGood = nil

@@ -52,7 +52,9 @@ PAPER = (225, 230, 232)
 def cabin_drive_word(state: dict[str, Any]) -> tuple[str, tuple[int, int, int]]:
     """Same glance word as the in-game app: OFF / ENGAGED is ON here, HOLD, DRIVE, MISMATCH.
 
-    Preview, veto, and AEB are HOLD. DRIVE only when engaged and the command is a live apply.
+    Preview, veto, and AEB are HOLD. DRIVE when engaged and the command is a
+    live apply, when beamngpy has the steer lock up, or when the reason is
+    ``tech_steer_hold_queue``.
     """
     link = str(state.get("link") or "")
     bus = str(state.get("bus_link") or "")
@@ -74,8 +76,15 @@ def cabin_drive_word(state: dict[str, Any]) -> tuple[str, tuple[int, int, int]]:
     applied = bool(state.get("cmd_applied"))
     lua_applying = bool(state.get("lua_applying"))
     actuator = str(state.get("actuator") or "")
-    # Pending retail writes are armed, not driving. DRIVE needs a live apply.
-    if lua_applying or (actuator == "beamngpy" and applied) or (reason == "cmd_json_applied" and applied):
+    steer_hold = bool(state.get("tech_steer_hold"))
+    # Pending retail writes are armed, not driving. A Tech lock that is up,
+    # or a failed hold refresh, is still the drive path.
+    if (
+        lua_applying
+        or (actuator == "beamngpy" and (applied or steer_hold))
+        or reason == "tech_steer_hold_queue"
+        or (reason == "cmd_json_applied" and applied)
+    ):
         return "DRIVE", ICE_HI
     if reason in ("ok", "plan") and applied:
         return "DRIVE", ICE_HI

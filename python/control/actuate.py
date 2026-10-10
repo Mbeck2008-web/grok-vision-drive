@@ -10,6 +10,20 @@ on steering/throttle/brake/parkingbrake/clutch) so a connected keyboard/pad/whee
 cannot overwrite the software. Echoes wheelspeed /
 inputs / applied seq back through gvd_ego.json. `cmd_applied` is only claimed once that
 ack is fresh. No DLL / hooks / process inject. Live BeamNG still UNPROVEN on Linux.
+
+Tech `vehicle.control` is a `Control` message. BeamNG applies a steering field as
+pad filter 1 on source `local`, the same slot as the physical wheel. That write is
+blocked from the hydros once the gvd hold is up, but it still overwrites
+``lastInputs.local.steering``, so a held wheel grab is replaced by the command and
+the override echo stays at the command. While the hold is the steer path, Tech
+omits ``steering`` from ``vehicle.control`` and queues a steering-only Direct Drive
+hold (source `gvd`, local blocked). Throttle, brake, parking brake, and clutch stay
+on ``vehicle.control``. The rising edge publishes ``tech_steer_hold`` before that
+queue, and only after the write lands. A failed write or a failed queue leaves
+the command unapplied. Disengage, shutdown, and the mod's watcher clear the
+whitelist and replay ``lastInputs.local.steering`` so a wheel already held drives
+again. The replay uses a binding angle and lock type when they sit beside that
+value. Otherwise it is Direct Drive filter 2, angle 900, lock type 0.
 """
 
 from __future__ import annotations
@@ -58,6 +72,116 @@ TECH_DRIVE_SHIFT_LUA = (
     "input.event('clutch',0,2,0,0,nil,'gvd') end) end "
     "end)"
 )
+# Steering only. Pedals stay on vehicle.control (source local). Once any source is
+# listed, BeamNG allows only sources set true, so local and any other device are out
+# and the gvd event is the steer that sticks. Release clears that whitelist, then
+# replays the stored local wheel angle: a held wheel is onChange and will not
+# write again until it moves. Must match the mod's M.techSteerRelease.
+# lastInputs normally stores only the axis value, so a non-direct player binding
+# is not reproduced. When the stored steering is a table, value / angle / lockType
+# (or lock) / filter (or filt) are used. When it is a number, sibling
+# steeringAngle or angle, steeringLockType or lockType, and steeringFilter or
+# filter are used. Otherwise the replay is Direct Drive filter 2, angle 900,
+# lockType 0.
+TECH_STEER_RELEASE_LUA = (
+    "if input and input.setAllowedInputSource then "
+    "input.setAllowedInputSource('steering',nil);"
+    "end;"
+    "local s,ang,lk,flt=0,900,0,2;"
+    "if input and input.lastInputs and input.lastInputs['local'] then "
+    "local slot=input.lastInputs['local'];"
+    "local raw=slot.steering;"
+    "if type(raw)=='table' then "
+    "s=tonumber(raw.value or raw[1]) or 0;"
+    "ang=tonumber(raw.angle) or ang;"
+    "lk=tonumber(raw.lockType or raw.lock) or lk;"
+    "flt=tonumber(raw.filter or raw.filt) or flt;"
+    "else "
+    "s=tonumber(raw) or 0;"
+    "ang=tonumber(slot.steeringAngle or slot.angle) or ang;"
+    "lk=tonumber(slot.steeringLockType or slot.lockType) or lk;"
+    "flt=tonumber(slot.steeringFilter or slot.filter) or flt;"
+    "end;"
+    "end;"
+    "if s~=s or s==math.huge or s==-math.huge then s=0 end;"
+    "if ang~=ang or ang==math.huge or ang==-math.huge then ang=900 end;"
+    "if lk~=lk or lk==math.huge or lk==-math.huge then lk=0 end;"
+    "if flt~=flt or flt==math.huge or flt==-math.huge then flt=2 end;"
+    "input.event('steering',s,flt,ang,lk,nil,'local')"
+)
+
+
+def tech_steer_hold_lua(steer: float) -> str:
+    """Vehicle Lua: controller steer wins, the physical wheel does not move the car.
+
+    FILTER_DIRECT (2), angle 900, lockType 0, source ``gvd``. Same Direct Drive
+    steering event retail uses. ``local`` is blocked so the wheel's later
+    ``input.event`` is recorded in ``lastInputs`` and does not change hydros.
+    """
+    try:
+        s = float(steer)
+    except (TypeError, ValueError):
+        s = 0.0
+    if s != s:
+        s = 0.0
+    s = max(-1.0, min(1.0, s))
+    return (
+        "if input and input.setAllowedInputSource then "
+        "input.setAllowedInputSource('steering','gvd',true);"
+        "input.setAllowedInputSource('steering','local',false);"
+        "end;"
+        f"input.event('steering',{s:.4f},2,900,0,nil,'gvd')"
+    )
+
+
+def flush_tech_steer_hold(held: bool, veh_id: Any = None) -> bool:
+    """Publish ``tech_steer_hold`` immediately before a hold queue.
+
+    True only when the file write landed. A failed write must not be followed
+    by the hold queue. Called before every queue until the lock is up, so a
+    steady snapshot that ran after an earlier failure cannot leave the watcher
+    disarmed for the queue that finally lands. ``veh_id`` is the beamngpy
+    vehicle the hold is aimed at.
+    """
+    from python.runtime.state_io import read_state, write_state
+
+    try:
+        prev = read_state()
+    except Exception:
+        prev = None
+    if not isinstance(prev, dict):
+        prev = {}
+    prev["tech_steer_hold"] = bool(held)
+    prev["actuator"] = "beamngpy"
+    if held and veh_id is not None:
+        prev["tech_steer_hold_vid"] = veh_id
+    elif not held:
+        prev.pop("tech_steer_hold_vid", None)
+    try:
+        written = write_state(prev)
+    except Exception as e:
+        print(
+            f"[GVD] tech steer hold flag publish failed: {type(e).__name__}",
+            flush=True,
+        )
+        return False
+    if written is None:
+        print("[GVD] tech steer hold flag publish failed: write", flush=True)
+        return False
+    return True
+
+
+def publish_shutdown_steer_hold(actuator: object) -> bool:
+    """Write ``tech_steer_hold`` false after quit accepts the steer release.
+
+    The supervisor's steady snapshot does not run again after ``finally``.
+    A release that did not land leaves the disk flag set so the mod keeps
+    the watch. A kill inside the hold queue never sets
+    ``steer_release_accepted``, so this write does not disarm that watcher.
+    """
+    if not getattr(actuator, "steer_release_accepted", False):
+        return False
+    return flush_tech_steer_hold(False)
 
 
 @dataclass
@@ -126,7 +250,11 @@ def _num(v: Any) -> float | None:
 
 
 def read_ego_feedback(now: float | None = None) -> EgoFeedback | None:
-    """Parse gvd_ego.json (Lua writes it non-atomically; a torn read just returns None)."""
+    """Parse gvd_ego.json (Lua writes it non-atomically; a torn read just returns None).
+
+    ``player_steering`` JSON null is a missing wheel. A numeric 0 is a centered
+    player device.
+    """
     p = ego_path()
     try:
         if not p.is_file():
@@ -848,8 +976,23 @@ class BeamNGPyActuator:
     pedal is not reverse throttle. Control omits gear: that field is
     shiftToGearIndex, and arcade uses it to enter realistic. A failed
     set_shift_mode is logged
-    and retried. Throttle>0 while the echoed gear is not forward also queues
+    and retried.     Throttle>0 while the echoed gear is not forward also queues
     a vehicle-Lua arm that releases the parking brake and the clutch.
+    While engaged, steer is a Direct Drive hold on source ``gvd``, not a field
+    on ``vehicle.control``. That field would overwrite ``lastInputs.local.steering``
+    and erase a held wheel grab. ``steer_locked`` stays set until the release
+    chunk is queued, including shutdown. A failed release keeps the latch
+    so the next disengaged tick retries. The hold is queued before
+    ``vehicle.control``. The hold flag is written immediately before every
+    queue until the lock is up, so a kill inside a later queue still leaves
+    the mod a watcher. Before the lock lands, a failed flag write or a failed
+    queue leaves ``applied`` false and does not send ``vehicle.control`` (the
+    car keeps the pedals it already had). After the lock is up, a failed hold
+    refresh still sends throttle and brake with steering omitted, and
+    ``applied`` stays false. The override residual keeps the last steer that
+    was actually queued. Quit writes ``tech_steer_hold`` false only after
+    that release queue is accepted. The mod
+    clears the whitelist and replays the stored wheel if this process dies.
     """
 
     name = "beamngpy"
@@ -866,13 +1009,65 @@ class BeamNGPyActuator:
         self._drive_arm_mono: float | None = None
         self.drive_arm_n = 0
         self._blinker: str | None = None
+        self._steer_locked = False
+        self._steer_hold_logged = False
+        self._steer_hold_move_logged = False
+        self._steer_hold_logged_v = 0.0
+        self._steer_hold_fail_logged = False
+        self._steer_hold_flag_sent = False
+        self._steer_hold_vid: Any = None
+        self._steer_hold_cmd: float | None = None
+        self._steer_release_accepted = False
+
+    @property
+    def steer_locked(self) -> bool:
+        """True after the player-wheel whitelist is queued, until release lands."""
+        return bool(self._steer_locked)
+
+    @property
+    def steer_hold_vid(self) -> Any:
+        """BeamNGpy vehicle id the hold was queued on, if one was known."""
+        return self._steer_hold_vid
+
+    @property
+    def steer_hold_command(self) -> float | None:
+        """Last steer whose hold queue landed. None before the first success."""
+        return self._steer_hold_cmd
+
+    @property
+    def steer_release_accepted(self) -> bool:
+        """True after this process queued a release that cleared the lock."""
+        return bool(self._steer_release_accepted)
 
     def note_engaged(self, engaged: bool) -> None:
         self.engaged = bool(engaged)
+        # A failed queue never took the lock. Drop the pending flag so the
+        # next engage flushes again immediately before its queue.
+        if not self.engaged and not self._steer_locked:
+            self._steer_hold_flag_sent = False
+            self._steer_hold_vid = None
         # Grab loop: poll_vehicle, then note_engaged. The latch covers later
         # grabs (and force_engage, which does not write gvd_engage.json).
         # The rising-edge poll reads read_engage_flag itself.
         note_soft_esc_engaged(self.engaged)
+
+    def tech_steer_hold_for_state(self) -> bool:
+        """Steady snapshot: true while a hold is pending or the lock is up.
+
+        Stays true until a release queue is accepted. A failed queue keeps it
+        true so the following full-state write does not clear the watcher.
+        """
+        return bool(self._steer_locked or self._steer_hold_flag_sent)
+
+    def _hold_vehicle_id(self) -> Any:
+        veh = self.vehicle
+        if veh is None:
+            return None
+        for name in ("vid", "id"):
+            value = getattr(veh, name, None)
+            if value is not None and not callable(value):
+                return value
+        return self._steer_hold_vid
 
     def _write_release_cmd(
         self, seq: int, reason: str, *, force: bool = False, now: float | None = None
@@ -1033,6 +1228,110 @@ class BeamNGPyActuator:
                 flush=True,
             )
 
+    def _queue_vehicle_lua(self, chunk: str) -> bool:
+        """Queue a vehicle-VM snippet. False when the handle cannot take it."""
+        veh = self.vehicle
+        q = getattr(veh, "queue_lua_command", None) if veh is not None else None
+        if not callable(q):
+            return False
+        try:
+            try:
+                q(chunk, False)
+            except TypeError:
+                q(chunk)
+        except Exception:
+            return False
+        return True
+
+    def _log_steer_hold(self, steer: float) -> None:
+        """One line when the lock lands, and one when the command leaves that value."""
+        if not self._steer_hold_logged:
+            self._steer_hold_logged = True
+            self._steer_hold_logged_v = steer
+            print(
+                f"[GVD] tech steer hold {steer:.3f} "
+                "(player wheel locked out; source=gvd)",
+                flush=True,
+            )
+            return
+        if self._steer_hold_move_logged:
+            return
+        if abs(steer - self._steer_hold_logged_v) < 0.05:
+            return
+        self._steer_hold_move_logged = True
+        print(
+            f"[GVD] tech steer hold {steer:.3f} "
+            "(player wheel locked out; source=gvd)",
+            flush=True,
+        )
+
+    def _queue_steer_hold(self, steer: float) -> str | None:
+        """Block local steering and write the controller steer on source gvd.
+
+        Queued before ``vehicle.control``. Before the lock lands, an error
+        makes the caller return without sending throttle or brake. After the
+        lock is up, a failed refresh still lets the caller send pedals and
+        then report the error so ``applied`` stays false. ``vehicle.control``
+        still omits steering so a held wheel stays in
+        ``lastInputs.local.steering``. The last steer that landed stays on
+        ``steer_hold_command`` for the override residual. The hold flag is written immediately
+        before every queue until the lock is up, including retries and the
+        next engage. A kill inside that queue leaves the watcher armed. A
+        disengage with no lock clears the pending flag. A new hold clears
+        ``steer_release_accepted`` before the queue, so an earlier release
+        cannot clear the watcher this flush just armed.
+        """
+        self._steer_release_accepted = False
+        chunk = tech_steer_hold_lua(steer)
+        q = getattr(self.vehicle, "queue_lua_command", None) if self.vehicle is not None else None
+        if not callable(q):
+            if not self._steer_hold_fail_logged:
+                self._steer_hold_fail_logged = True
+                print(
+                    "[GVD] tech steer hold skipped: no queue_lua_command",
+                    flush=True,
+                )
+            return "tech_steer_hold_no_queue"
+        if not self._steer_locked:
+            vid = self._hold_vehicle_id()
+            if not flush_tech_steer_hold(True, veh_id=vid):
+                return "tech_steer_hold_flag"
+            self._steer_hold_flag_sent = True
+            self._steer_hold_vid = vid
+        if not self._queue_vehicle_lua(chunk):
+            if not self._steer_hold_fail_logged:
+                self._steer_hold_fail_logged = True
+                print("[GVD] tech steer hold queue failed", flush=True)
+            return "tech_steer_hold_queue"
+        self._steer_hold_fail_logged = False
+        self._steer_locked = True
+        self._steer_hold_cmd = float(steer)
+        self._log_steer_hold(float(steer))
+        return None
+
+    def _queue_steer_release(self) -> bool:
+        """Give steering back to the player. True when no lock remains.
+
+        Retries while ``steer_locked`` is set. A vehicle with no queue
+        cannot have taken the lock, so that case is already clear.
+        """
+        if not self._steer_locked:
+            return True
+        if not self._queue_vehicle_lua(TECH_STEER_RELEASE_LUA):
+            self._steer_release_accepted = False
+            print("[GVD] tech steer release failed; will retry", flush=True)
+            return False
+        self._steer_locked = False
+        self._steer_hold_flag_sent = False
+        self._steer_hold_vid = None
+        self._steer_hold_cmd = None
+        self._steer_release_accepted = True
+        self._steer_hold_logged = False
+        self._steer_hold_move_logged = False
+        self._steer_hold_logged_v = 0.0
+        print("[GVD] tech steer release (player wheel restored)", flush=True)
+        return True
+
     def _invoke_control(self, kwargs: dict[str, Any]) -> None:
         """Send control kwargs. Never fall back to arcade brake-hold (no gear, brake=1).
 
@@ -1104,11 +1403,23 @@ class BeamNGPyActuator:
         if camera_ge_socket_busy():
             return "camera_io_busy"
         try:
-            # Engage arms arcade. A release with the shifter still unset must
-            # only clear pedals, not arm that mode on the way out.
-            # A failed ack is logged and retried next tick (_shift_set stays false).
-            if not release and not self._shift_set:
-                self._arm_shift_mode()
+            # Hold first. Before the lock lands, a failed queue returns
+            # before pedals, shift, or blinkers, so the car keeps the
+            # controls it already had. After the lock is up, a failed
+            # refresh still sends the pedal command with steering omitted,
+            # then returns the error so applied stays false. The override
+            # residual keeps steer_hold_command, the last steer that was
+            # actually queued. Engage arms arcade only after the first queue
+            # lands. A release with the shifter still unset only clears
+            # pedals. A failed ack is logged and retried next tick
+            # (_shift_set stays false).
+            hold_err: str | None = None
+            if not release:
+                hold_err = self._queue_steer_hold(steer)
+                if hold_err and not self._steer_locked:
+                    return hold_err
+                if not self._shift_set:
+                    self._arm_shift_mode()
             speed_mps = None
             if (
                 not release
@@ -1119,12 +1430,19 @@ class BeamNGPyActuator:
             kwargs = tech_control_kwargs(
                 steer, throttle, brake, release=release, speed_mps=speed_mps
             )
+            # Steer is the gvd hold. A steering field on this message is
+            # input.event on source local: blocked from the hydros, but it
+            # overwrites lastInputs.local.steering, so the next echo is the
+            # command and a held grab never reaches the detector.
+            kwargs.pop("steering", None)
             self._invoke_control(kwargs)
             self._apply_blinker("off" if release else blinker)
             if not release and float(throttle) > 1e-6:
                 gear_echo = self._echo_gear()
                 if not gear_is_forward(gear_echo):
                     self._queue_drive_shift(gear_echo, time.monotonic())
+            if hold_err:
+                return hold_err
             return None
         except Exception as e:
             return f"beamngpy_err:{type(e).__name__}"
@@ -1161,9 +1479,12 @@ class BeamNGPyActuator:
                 or str(reason) == "shutdown"
             )
             self._write_release_cmd(seq, reason, force=force, now=now)
+            # Wheel first, even when the camera holds the socket or control throws.
+            # A failed release keeps the latch so the next disengaged tick retries.
+            steer_ok = self._queue_steer_release()
             if self._latched:
                 err = self._control(0.0, 0.0, 0.0, release=True)
-                if err is None or err == "no_vehicle":
+                if steer_ok and (err is None or err == "no_vehicle"):
                     self._release_ai()
                     if self._restore_player_shift():
                         self._latched = False

@@ -54,6 +54,13 @@ STEER_SPIKE = 0.20
 BRAKE_ENTER = 0.06
 THROTTLE_ENTER = 0.10
 LPF_TAU_MS = 80.0
+# Tech lock only. Wheel angle inside this of centre is centring slop, not a grab.
+STEER_CENTER_DEADBAND = 0.15
+# Commands inside this band use the straight/centre formula. The comparison is
+# strict: |c| == 0.02 keeps the owner magnitude branches. Wider than 1e-3 so
+# command 0.002 with a wheel at 0.10 stays engaged. Narrower than the centre
+# deadband so a real command keeps the owner magnitude rule.
+STRAIGHT_CMD_BAND = 0.02
 
 # Soft opposition bias. Not yaml knobs: the pin fixes the thresholds, and this only leans on
 # them. A residual fighting GVD's steer counts up to +25 % more, ramped in by how hard GVD is
@@ -84,6 +91,7 @@ class OverrideConfig:
     brake_enter: float = BRAKE_ENTER
     throttle_enter: float = THROTTLE_ENTER
     lpf_tau_ms: float = LPF_TAU_MS
+    steer_center_deadband: float = STEER_CENTER_DEADBAND
 
     @property
     def steer_hold_s(self) -> float:
@@ -155,6 +163,7 @@ def load_override_config(cfg: dict[str, Any] | None = None) -> OverrideConfig:
         brake_enter=num("brake_enter", BRAKE_ENTER, 0.005, 1.0),
         throttle_enter=num("throttle_enter", THROTTLE_ENTER, 0.005, 1.0),
         lpf_tau_ms=num("lpf_tau_ms", LPF_TAU_MS, 0.0, 1000.0),
+        steer_center_deadband=num("steer_center_deadband", STEER_CENTER_DEADBAND, 0.0, 1.0),
     )
 
 
@@ -168,6 +177,7 @@ def config_mirror(cfg: OverrideConfig) -> dict[str, Any]:
         "brake_enter": round(cfg.brake_enter, 4),
         "throttle_enter": round(cfg.throttle_enter, 4),
         "lpf_tau_ms": round(cfg.lpf_tau_ms, 3),
+        "steer_center_deadband": round(cfg.steer_center_deadband, 4),
     }
 
 
@@ -221,6 +231,79 @@ def own_steer_residual(
     return 0.0
 
 
+def _signed_center_residual(wheel: float, deadband: float) -> float:
+    """``sign(w) * max(0, |w| - D)``. Zero stays zero."""
+    mag = max(0.0, abs(float(wheel)) - float(deadband))
+    if mag <= 0.0:
+        return 0.0
+    return math.copysign(mag, float(wheel))
+
+
+def locked_steer_residual(echo: float, ref_steer: float, deadband: float) -> float:
+    """Wheel residual while the Tech steer hold is up.
+
+    ``c`` is the command, ``w`` is the wheel, ``D`` is the straight/centre
+    deadband (``steer_center_deadband``, 0.15). Magnitude matches the owner
+    rule. A wheel between 0 and ``c`` is 0. Past ``c`` on ``c``'s side the
+    residual is ``(w - c)``. On the opposite side of 0, or when the command
+    is straight (``|c| < 0.02``, ``STRAIGHT_CMD_BAND``), the residual is
+    ``sign(w) * max(0, |w| - D)``. The straight band is exclusive: a command
+    of exactly 0.02 keeps the owner magnitude branches. The dwell sees that
+    sign, so reversing restarts the dwell. While the hold is on, the detector
+    compares the filtered residual to ``steer_enter`` with no opposition
+    gain, so a wheel at ±0.22 against a command of ±0.35 (raw 0.07) stays
+    engaged. A held 0.25 in any of those directions is past ``steer_enter``
+    after the dwell. A wheel resting at 0.10 from force-feedback or centring
+    slop is inside ``D``. Command 0.002 with the wheel at 0.10 is inside the
+    straight band and stays engaged.
+    """
+    c = float(ref_steer)
+    w = float(echo)
+    d = float(deadband)
+    if abs(c) < STRAIGHT_CMD_BAND:
+        return _signed_center_residual(w, d)
+    if (c > 0.0 and 0.0 <= w <= c) or (c < 0.0 and c <= w <= 0.0):
+        return 0.0
+    if (c > 0.0 and w > c) or (c < 0.0 and w < c):
+        return w - c
+    return _signed_center_residual(w, d)
+
+
+def tech_override_steer(
+    steering_input: float | None,
+    ego_fb: Any,
+    *,
+    steer_locked: bool,
+) -> float | None:
+    """Wheel angle for the Tech 1.7.4 residual.
+
+    After the steer hold, ``electrics.steering_input`` is the gvd command. The
+    physical wheel is a fresh numeric ``player_steering`` from
+    ``input.lastInputs`` (still recorded when local is blocked). That number
+    counts even when ``player_device`` is false. JSON null is a missing echo:
+    Lua writes null when no player source is in ``lastInputs``. A live 0 from
+    a player device is a centered wheel. Using the command echo as the wheel
+    would baseline the detector on GVD's own steer. With the lock on and no
+    fresh numeric echo, return None: the field is absent, null, or
+    ``gvd_ego.json`` is stale. Once the detector is armed, that missing echo
+    seeds rest at 0 so the next wheel sample is not stored as the resting
+    angle. Before the lock, electrics are still the wheel when the echo is
+    missing, because the wheel is the last writer.
+    """
+    fresh = bool(getattr(ego_fb, "fresh", False)) if ego_fb is not None else False
+    wheel = getattr(ego_fb, "player_steering", None) if ego_fb is not None else None
+    if fresh and wheel is not None:
+        try:
+            w = float(wheel)
+        except (TypeError, ValueError):
+            w = None
+        if w is not None and w == w:
+            return w
+    if steer_locked:
+        return None
+    return steering_input
+
+
 def opposition(ref_steer: float, residual: float) -> float:
     """0..1: how much `residual` fights a steer command of `ref_steer`.
 
@@ -250,6 +333,8 @@ class OverrideDetector:
     steer inside the span. Staying put, catching up inside the span, or echoing the
     command is not `player_steer`. A pull past either end still is. Retail
     `player_device` stays an absolute axis. The Lua override does not share this baseline.
+    On Tech the caller passes the physical wheel (`tech_override_steer`), not the
+    electrics echo, once the steer hold has made electrics equal the command.
     """
 
     def __init__(self, cfg: OverrideConfig | None = None) -> None:
@@ -331,6 +416,7 @@ class OverrideDetector:
         now: float | None = None,
         player_device: bool = False,
         own_axes: bool = False,
+        steer_locked: bool = False,
     ) -> OverrideVerdict:
         cfg = self.cfg
         t = time.monotonic() if now is None else float(now)
@@ -364,8 +450,21 @@ class OverrideDetector:
         # throttle and wins a tie, because that is the reason a player most needs to be told.
         thr_r = max(0.0, _clamp(throttle_input, 0.0, 1.0) - ref_thr) if throttle_input is not None else 0.0
         brk_r = max(0.0, _clamp(brake_input, 0.0, 1.0) - ref_brk) if brake_input is not None else 0.0
+        # Tech hold: rest is 0 so a grab already in hand is not the baseline.
+        # The locked residual uses the centre deadband. Unlocked own_axes
+        # still takes the first real wheel sample as rest.
+        if own_axes and steer_locked and self._base_steer is None:
+            self._base_steer = 0.0
+            self._base_steer_cmd = ref_steer
+            self._caught = 0.0
         if steering_input is None:
             raw = 0.0
+        elif own_axes and steer_locked:
+            raw = locked_steer_residual(
+                _clamp(steering_input, -1.0, 1.0),
+                ref_steer,
+                self.cfg.steer_center_deadband,
+            )
         elif own_axes:
             echo_s = _clamp(steering_input, -1.0, 1.0)
             if self._base_steer is None:
@@ -406,7 +505,13 @@ class OverrideDetector:
         self._last_raw = raw
         if not spike:
             self._filt += ema_alpha(dt, cfg.lpf_tau_s) * (raw - self._filt)
-        opp = opposition(ref.steer, self._filt)
+        # Unlocked retail still leans on a residual that fights the command.
+        # While the Tech hold is up, compare the filtered residual itself:
+        # opposition gain would turn a 0.07 opposite slop into a grab.
+        if steer_locked:
+            opp = 0.0
+        else:
+            opp = opposition(ref.steer, self._filt)
         eff = self._filt * (1.0 + OPPOSITION_GAIN * opp)
 
         mag = abs(eff)

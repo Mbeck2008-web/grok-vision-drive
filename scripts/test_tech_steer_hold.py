@@ -810,9 +810,11 @@ def check_command_side_grab() -> None:
     """Locked residual keeps the owner magnitude and carries a sign.
 
     Past the command the residual is (w - c). Opposite and straight use
-    sign(w) * max(0, |w| - 0.15). |c| < 0.02 is straight. A 0.07 overshoot
-    stays engaged on both signs. Opposite raw 0.08 trips in the same time
-    for left and right commands.
+    sign(w) * max(0, |w| - 0.15). |c| < 0.02 is straight; |c| == 0.02 keeps
+    the command-side rule. A 0.07 overshoot stays engaged on both signs.
+    While the hold is on there is no opposition gain, so opposite raw 0.08
+    stays engaged and opposite raw 0.09 trips in the same time for left and
+    right commands.
     """
     d = 0.15
     assert locked_steer_residual(0.0, 0.35, d) == 0.0
@@ -828,6 +830,12 @@ def check_command_side_grab() -> None:
     assert locked_steer_residual(0.10, 0.002, d) == 0.0
     assert abs(locked_steer_residual(-0.23, 0.35, d) - (-0.08)) < 1e-9
     assert abs(locked_steer_residual(0.23, -0.35, d) - 0.08) < 1e-9
+    # Opposite slop of 0.07. Opposition gain would boost this past steer_enter.
+    assert abs(locked_steer_residual(-0.22, 0.35, d) - (-0.07)) < 1e-9
+    assert abs(locked_steer_residual(0.22, -0.35, d) - 0.07) < 1e-9
+    # |c| == 0.02 stays on the command-side rule. Documented, not widened.
+    assert locked_steer_residual(0.0, 0.02, d) == 0.0
+    assert abs(locked_steer_residual(0.10, 0.02, d) - 0.08) < 1e-9
 
     cases = (
         (0.35, -0.25, True),
@@ -841,6 +849,8 @@ def check_command_side_grab() -> None:
         (0.35, 0.42, False),
         (-0.35, -0.42, False),
         (0.002, 0.10, False),
+        (0.35, -0.22, False),
+        (-0.35, 0.22, False),
     )
     for n, (cmd, wheel, trips) in enumerate(cases):
         det = _cfg()
@@ -852,15 +862,46 @@ def check_command_side_grab() -> None:
             _stay_engaged(det, cmd=cmd, wheel=wheel, t0=t)
 
     # Same start time so the dwell clock is the same binary sequence.
+    # Raw 0.09 is past steer_enter with no opposition gain. Raw 0.08 only
+    # approaches that threshold, so both sides stay engaged.
     right = _cfg()
     t = _feed_missing_echo(right, 2000.0)
     right.note_command(seq=2000, steer=0.35, throttle=0.2, brake=0.0, now=t)
-    right_ticks = _ticks_until_steer(right, cmd=0.35, wheel=-0.23, t0=t)
+    right_ticks = _ticks_until_steer(right, cmd=0.35, wheel=-0.24, t0=t)
     left = _cfg()
     t = _feed_missing_echo(left, 2000.0)
     left.note_command(seq=2000, steer=-0.35, throttle=0.2, brake=0.0, now=t)
-    left_ticks = _ticks_until_steer(left, cmd=-0.35, wheel=0.23, t0=t)
+    left_ticks = _ticks_until_steer(left, cmd=-0.35, wheel=0.24, t0=t)
     assert right_ticks is not None and right_ticks == left_ticks, (right_ticks, left_ticks)
+    for cmd, wheel in ((0.35, -0.23), (-0.35, 0.23)):
+        det = _cfg()
+        t = _feed_missing_echo(det, 2000.0)
+        det.note_command(seq=2000, steer=cmd, throttle=0.2, brake=0.0, now=t)
+        assert _ticks_until_steer(det, cmd=cmd, wheel=wheel, t0=t) is None, (cmd, wheel)
+
+    # Filtered residual vs steer_enter, with no opposition gain, both signs.
+    for cmd, wheel in ((0.35, -0.22), (-0.35, 0.22)):
+        det = _cfg()
+        t = _feed_missing_echo(det, 4100.0)
+        det.note_command(seq=4100, steer=cmd, throttle=0.2, brake=0.0, now=t)
+        verdict = None
+        for i in range(40):
+            t += TICK
+            verdict = det.update(
+                engaged=True,
+                steering_input=wheel,
+                throttle_input=0.2,
+                brake_input=0.0,
+                now=t,
+                own_axes=True,
+                steer_locked=True,
+            )
+            det.note_command(seq=4101 + i, steer=cmd, throttle=0.2, brake=0.0, now=t)
+            assert verdict.opposition == 0.0, (cmd, wheel, verdict)
+            assert abs(verdict.steer_eff) < det.cfg.steer_enter, (cmd, wheel, verdict)
+            assert not verdict.active, (cmd, wheel, verdict)
+        assert verdict is not None
+        assert abs(abs(verdict.steer_raw) - 0.07) < 1e-9, (cmd, wheel, verdict)
 
 
 def check_locked_refresh_sends_pedals() -> None:
@@ -894,6 +935,96 @@ def check_locked_refresh_sends_pedals() -> None:
     # be a grab; measuring it against 0.35 stays engaged.
     assert abs(locked_steer_residual(0.35, 0.0, 0.15) - 0.20) < 1e-9
     assert locked_steer_residual(0.35, 0.35, 0.15) == 0.0
+    # The detector uses the queued steer. The unsent command 0 would be a grab.
+    noted = override_note_steer(sent, act)
+    assert noted == 0.35
+    held = _cfg()
+    t = _feed_missing_echo(held, 5000.0)
+    held.note_command(seq=5000, steer=noted, throttle=0.1, brake=0.8, now=t)
+    _stay_engaged(held, cmd=noted, wheel=0.35, t0=t)
+    bare = _cfg()
+    t = _feed_missing_echo(bare, 5000.0)
+    bare.note_command(seq=5000, steer=float(sent.steer), throttle=0.1, brake=0.8, now=t)
+    assert _hold_until_steer(bare, cmd=float(sent.steer), wheel=0.35, t0=t)
+
+
+def check_new_hold_clears_release_accepted() -> None:
+    """A new hold queue clears a previous accepted release before it queues.
+
+    Quit after that queue fails must leave the freshly armed watcher set.
+    """
+    from python.runtime.state_io import read_state
+
+    wheel = PlayerWheel(0.0)
+    veh = TechVeh(wheel)
+    act = BeamNGPyActuator(veh)
+    act.note_engaged(True)
+    act.apply(DriveCommand(steer=0.3, throttle=0.2, brake=0.0, seq=1, reason="ok"))
+    act.note_engaged(False)
+    act.stop(seq=2, reason="shutdown")
+    assert act.steer_release_accepted is True
+    assert publish_shutdown_steer_hold(act) is True
+    act.note_engaged(True)
+    veh.fail_queue = True
+    failed = act.apply(DriveCommand(steer=0.2, throttle=0.1, brake=0.0, seq=3, reason="ok"))
+    assert failed.applied is False
+    assert act.steer_release_accepted is False
+    assert publish_shutdown_steer_hold(act) is False
+    disk = read_state()
+    assert disk is not None and disk.get("tech_steer_hold") is True, disk
+
+    veh.fail_queue = False
+    landed = act.apply(DriveCommand(steer=0.2, throttle=0.1, brake=0.0, seq=4, reason="ok"))
+    assert landed.applied is True and act.steer_locked is True
+    assert act.steer_release_accepted is False
+
+    act.note_engaged(False)
+    act.stop(seq=5, reason="shutdown")
+    assert act.steer_release_accepted is True
+    veh.die_in_queue = True
+    act.note_engaged(True)
+    raised = False
+    try:
+        act.apply(DriveCommand(steer=0.4, throttle=0.1, brake=0.0, seq=6, reason="ok"))
+    except SystemExit:
+        raised = True
+    assert raised
+    assert act.steer_release_accepted is False
+    assert publish_shutdown_steer_hold(act) is False
+    disk = read_state()
+    assert disk is not None and disk.get("tech_steer_hold") is True, disk
+
+
+def check_glance_drive_while_hold() -> None:
+    """beamngpy with the lock up, or a failed hold refresh, glances DRIVE."""
+    from python.viz.debug_draw import cabin_drive_word
+
+    locked = cabin_drive_word({
+        "engaged": True,
+        "actuator": "beamngpy",
+        "cmd_applied": False,
+        "tech_steer_hold": True,
+        "cmd_reason": "ok",
+        "link": "live",
+    })
+    assert locked[0] == "DRIVE", locked
+    refresh = cabin_drive_word({
+        "engaged": True,
+        "actuator": "beamngpy",
+        "cmd_applied": False,
+        "tech_steer_hold": False,
+        "cmd_reason": "tech_steer_hold_queue",
+        "link": "live",
+    })
+    assert refresh[0] == "DRIVE", refresh
+    waiting = cabin_drive_word({
+        "engaged": True,
+        "actuator": "beamngpy",
+        "cmd_applied": False,
+        "cmd_reason": "ok",
+        "link": "live",
+    })
+    assert waiting[0] == "ON", waiting
 
 
 def check_release_text_matches_mod() -> None:
@@ -919,6 +1050,8 @@ def check_release_text_matches_mod() -> None:
     assert "tech steer release (load replay)" in lua
     assert "tech steer release (player fallback)" in lua
     assert "M.techSteerTargetFallback" in lua
+    assert "function M.queueOwedSteerRelease()" in lua
+    assert "M.techSteerFallbackQueued" in lua
     assert '"player_steering":%s' in lua
     assert "M.noteTechSteerHold" in lua
     body = lua[lua.index("M.techSteerRelease"):lua.index("local VE_RELEASE")]
@@ -944,6 +1077,8 @@ def main() -> None:
         check_retry_kill_keeps_disk_flag()
         check_command_side_grab()
         check_locked_refresh_sends_pedals()
+        check_new_hold_clears_release_accepted()
+        check_glance_drive_while_hold()
         check_release_text_matches_mod()
     finally:
         if prev is None:

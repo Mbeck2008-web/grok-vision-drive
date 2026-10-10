@@ -56,7 +56,8 @@ THROTTLE_ENTER = 0.10
 LPF_TAU_MS = 80.0
 # Tech lock only. Wheel angle inside this of centre is centring slop, not a grab.
 STEER_CENTER_DEADBAND = 0.15
-# Commands inside this band use the straight/centre formula. Wider than 1e-3 so
+# Commands inside this band use the straight/centre formula. The comparison is
+# strict: |c| == 0.02 keeps the owner magnitude branches. Wider than 1e-3 so
 # command 0.002 with a wheel at 0.10 stays engaged. Narrower than the centre
 # deadband so a real command keeps the owner magnitude rule.
 STRAIGHT_CMD_BAND = 0.02
@@ -246,11 +247,15 @@ def locked_steer_residual(echo: float, ref_steer: float, deadband: float) -> flo
     rule. A wheel between 0 and ``c`` is 0. Past ``c`` on ``c``'s side the
     residual is ``(w - c)``. On the opposite side of 0, or when the command
     is straight (``|c| < 0.02``, ``STRAIGHT_CMD_BAND``), the residual is
-    ``sign(w) * max(0, |w| - D)``. Opposition and the dwell see that sign, so
-    reversing restarts the dwell. A held 0.25 in any of those directions is
-    past ``steer_enter`` after the dwell. A wheel resting at 0.10 from
-    force-feedback or centring slop is inside ``D``. Command 0.002 with the
-    wheel at 0.10 is inside the straight band and stays engaged.
+    ``sign(w) * max(0, |w| - D)``. The straight band is exclusive: a command
+    of exactly 0.02 keeps the owner magnitude branches. The dwell sees that
+    sign, so reversing restarts the dwell. While the hold is on, the detector
+    compares the filtered residual to ``steer_enter`` with no opposition
+    gain, so a wheel at ±0.22 against a command of ±0.35 (raw 0.07) stays
+    engaged. A held 0.25 in any of those directions is past ``steer_enter``
+    after the dwell. A wheel resting at 0.10 from force-feedback or centring
+    slop is inside ``D``. Command 0.002 with the wheel at 0.10 is inside the
+    straight band and stays engaged.
     """
     c = float(ref_steer)
     w = float(echo)
@@ -500,7 +505,13 @@ class OverrideDetector:
         self._last_raw = raw
         if not spike:
             self._filt += ema_alpha(dt, cfg.lpf_tau_s) * (raw - self._filt)
-        opp = opposition(ref.steer, self._filt)
+        # Unlocked retail still leans on a residual that fights the command.
+        # While the Tech hold is up, compare the filtered residual itself:
+        # opposition gain would turn a 0.07 opposite slop into a grab.
+        if steer_locked:
+            opp = 0.0
+        else:
+            opp = opposition(ref.steer, self._filt)
         eff = self._filt * (1.0 + OPPOSITION_GAIN * opp)
 
         mag = abs(eff)

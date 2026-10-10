@@ -18,8 +18,10 @@
 -- arms the watch. Unload retries the release and, when every try fails, writes
 -- the flag true if the state file can be read. tech_steer_hold_vid is a
 -- beamngpy vehicle name: scenetree.findObject, then be:getObjectByID when the
--- id is numeric, then the player vehicle. A player-only fallback still queues
--- the release, and the latch stays until the named vehicle is the one released.
+-- id is numeric, then the player vehicle. A player-only fallback queues the
+-- release once per latch. Later polls keep looking for the named vehicle
+-- and do not queue the player again. The latch stays until that named
+-- vehicle is the one released.
 -- nPlayer == 0 writes player_steering as JSON null so a live zero is missing.
 -- Pedal locks stay on the retail path.
 -- Detector, path, planner and track ghosts keep running/drawing while the supervisor is live;
@@ -906,17 +908,20 @@ local function uiPayload()
   local camOk, camTotal, camList = uiCams(st)
   local reason = st and tostring(st.cmd_reason or '') or ''
   local aeb = pl.aeb and tostring(pl.aeb) or ''
-  -- preview / veto / AEB / stale link are holds. DRIVE only while a live command is applied.
+  -- preview / veto / AEB / stale link are holds. DRIVE while a live command
+  -- is applied, while the Tech steer lock is up, or when the reason is
+  -- tech_steer_hold_queue.
   local hold = link ~= 'live' or reason == 'preview_blocked' or reason == 'heartbeat_stale'
     or reason:sub(1, 5) == 'veto:' or aeb == 'brake' or aeb == 'warn'
   local actuator = st and tostring(st.actuator or '') or ''
   local applied = st and st.cmd_applied == true
+  local steerHold = st and st.tech_steer_hold == true
   local modeTag = '|OFF'
   if link == 'mismatch' then
     modeTag = '|MISMATCH'
   elseif engaged and hold then
     modeTag = '|HOLD'
-  elseif engaged and (applying or (actuator == 'beamngpy' and applied)) then
+  elseif engaged and (applying or (actuator == 'beamngpy' and (applied or steerHold)) or reason == 'tech_steer_hold_queue') then
     modeTag = '|DRIVE'
   elseif engaged then
     modeTag = '|ON'
@@ -1752,15 +1757,10 @@ local function pollStateFile()
   -- does not stay owed. A live heartbeat only arms the watch.
   if loadWatch and M.techSteerOwed and lastGood and M.techSteerBeatStale(lastGood) then
     M.techSteerLoadReplay = true
-    if queueVehicle(M.techSteerTarget(), M.techSteerRelease) then
-      if M.techSteerTargetFallback then
-        M.noteTechSteerFallback()
-      else
-        M.techSteerFallbackLogged = nil
-        M.finishTechSteerLoadReplay()
-        log('I', 'GVD', '[GVD] tech steer release (load replay)')
-        print('[GVD] tech steer release (load replay)')
-      end
+    if M.queueOwedSteerRelease() == 'released' then
+      M.finishTechSteerLoadReplay()
+      log('I', 'GVD', '[GVD] tech steer release (load replay)')
+      print('[GVD] tech steer release (load replay)')
     end
   end
 end
@@ -1771,6 +1771,25 @@ function M.noteTechSteerFallback()
   M.techSteerFallbackLogged = true
   log('I', 'GVD', '[GVD] tech steer release (player fallback)')
   print('[GVD] tech steer release (player fallback)')
+end
+
+function M.queueOwedSteerRelease()
+  -- Queue the owed release. A player fallback is queued once per latch.
+  -- Later polls still resolve the name and return 'waiting' until it appears.
+  -- 'released' means the named vehicle took the queue.
+  local veh = M.techSteerTarget()
+  if M.techSteerTargetFallback and M.techSteerFallbackQueued then
+    return 'waiting'
+  end
+  if not queueVehicle(veh, M.techSteerRelease) then return nil end
+  if M.techSteerTargetFallback then
+    M.techSteerFallbackQueued = true
+    M.noteTechSteerFallback()
+    return 'fallback'
+  end
+  M.techSteerFallbackLogged = nil
+  M.techSteerFallbackQueued = nil
+  return 'released'
 end
 
 function M.techSteerBeatStale(st)
@@ -1827,19 +1846,14 @@ local function pollState(dt)
     local hold = lastGood and lastGood.tech_steer_hold == true
     if stateBeatAcc > 2.0 or not hold then
       local why = (stateBeatAcc > 2.0) and 'supervisor heartbeat stale' or 'hold flag clear'
-      if queueVehicle(M.techSteerTarget(), M.techSteerRelease) then
-        if M.techSteerTargetFallback then
-          M.noteTechSteerFallback()
+      if M.queueOwedSteerRelease() == 'released' then
+        if M.techSteerLoadReplay then
+          M.finishTechSteerLoadReplay()
         else
-          M.techSteerFallbackLogged = nil
-          if M.techSteerLoadReplay then
-            M.finishTechSteerLoadReplay()
-          else
-            M.techSteerOwed = false
-          end
-          log('I', 'GVD', '[GVD] tech steer release (' .. why .. ')')
-          print('[GVD] tech steer release (' .. why .. ')')
+          M.techSteerOwed = false
         end
+        log('I', 'GVD', '[GVD] tech steer release (' .. why .. ')')
+        print('[GVD] tech steer release (' .. why .. ')')
       end
     end
   end

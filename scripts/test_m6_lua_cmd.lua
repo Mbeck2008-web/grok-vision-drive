@@ -848,6 +848,32 @@ for i = nLog + 1, #logs do
   if tostring(logs[i]):find('player fallback', 1, true) then hit = true end
 end
 check(hit, 'player fallback is logged')
+local function countPlayerRelease()
+  local n = 0
+  for i = 1, #events do
+    if events[i][1] == 'steering' and events[i].veh == 101 and events[i][6] == 'local' then
+      n = n + 1
+    end
+  end
+  return n
+end
+local playerQueues = countPlayerRelease()
+check(playerQueues == 1, 'first fallback queues once (' .. tostring(playerQueues) .. ')')
+local nFallback = 0
+for i = nLog + 1, #logs do
+  if tostring(logs[i]):find('player fallback', 1, true) then nFallback = nFallback + 1 end
+end
+for _ = 1, 5 do
+  M.onUpdate(0.2)
+end
+playerQueues = countPlayerRelease()
+check(playerQueues == 1, 'later polls do not re-queue the player fallback (' .. tostring(playerQueues) .. ')')
+check(M.techSteerOwed == true, 'latch stays while the named vehicle is missing')
+local nFallbackAfter = 0
+for i = nLog + 1, #logs do
+  if tostring(logs[i]):find('player fallback', 1, true) then nFallbackAfter = nFallbackAfter + 1 end
+end
+check(nFallbackAfter == nFallback, 'fallback log stays once (' .. tostring(nFallbackAfter) .. ')')
 resolveNosuch = true
 clearEvents()
 nLog = #logs
@@ -938,6 +964,30 @@ local egoZero = readFileAll(egoPath)
 check(egoZero and egoZero:find('"player_steering":0.0000', 1, true)
   and egoZero:find('"player_device":true', 1, true),
   'nPlayer 1 writes a centered wheel (' .. tostring(egoZero) .. ')')
+
+-- Glance word: beamngpy with the lock up, or tech_steer_hold_queue, is DRIVE.
+local lastTag = nil
+guihooks = {
+  trigger = function(name, payload)
+    if name == 'gvdUi' and type(payload) == 'table' then lastTag = payload.tag end
+  end,
+}
+M.setEngaged(true)
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","actuator":"beamngpy","cmd_applied":false,"tech_steer_hold":true,"cmd_reason":"ok","cmd_seq":%d}',
+  os.time() + 30, DRIVE_BUS, DRIVE_BUS, seq))
+M.pushUiState()
+check(lastTag == 'DRIVE', 'beamngpy lock up glance is DRIVE (' .. tostring(lastTag) .. ')')
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","actuator":"beamngpy","cmd_applied":false,"tech_steer_hold":false,"cmd_reason":"tech_steer_hold_queue","cmd_seq":%d}',
+  os.time() + 40, DRIVE_BUS, DRIVE_BUS, seq))
+M.pushUiState()
+check(lastTag == 'DRIVE', 'tech_steer_hold_queue glance is DRIVE (' .. tostring(lastTag) .. ')')
+writeFile(statePath, string.format(
+  '{"engaged":true,"disengage_reason":"none","heartbeat_mtime":%.3f,"policy":"modular","loop_hz":15,"python_bus":"%s","lua_bus":"%s","product":"tech","actuator":"beamngpy","cmd_applied":false,"cmd_reason":"ok","cmd_seq":%d}',
+  os.time() + 50, DRIVE_BUS, DRIVE_BUS, seq))
+M.pushUiState()
+check(lastTag == 'ON', 'beamngpy without a lock stays ON (' .. tostring(lastTag) .. ')')
 
 -- A missing state file is not replaced.
 vfsBus[statePath] = nil

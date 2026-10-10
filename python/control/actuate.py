@@ -1277,8 +1277,11 @@ class BeamNGPyActuator:
         ``steer_hold_command`` for the override residual. The hold flag is written immediately
         before every queue until the lock is up, including retries and the
         next engage. A kill inside that queue leaves the watcher armed. A
-        disengage with no lock clears the pending flag.
+        disengage with no lock clears the pending flag. A new hold clears
+        ``steer_release_accepted`` before the queue, so an earlier release
+        cannot clear the watcher this flush just armed.
         """
+        self._steer_release_accepted = False
         chunk = tech_steer_hold_lua(steer)
         q = getattr(self.vehicle, "queue_lua_command", None) if self.vehicle is not None else None
         if not callable(q):

@@ -73,6 +73,24 @@ from python.viz.stage import STAGE_W, STAGE_H, VizUI, render_stage, smoke
 
 
 
+def sample_tech_wheel(actuator: object, steer_in: float | None) -> float | None:
+    """Wheel angle the Tech override should see.
+
+    A non-Tech actuator returns the electrics sample. On Tech, a fresh
+    ``player_steering`` from ``gvd_ego.json`` is the physical wheel
+    (``lastInputs``, still recorded when local is blocked). While the hold
+    is on and that echo is missing, return None so the detector does not
+    baseline on the command.
+    """
+    if getattr(actuator, "name", "") != "beamngpy":
+        return steer_in
+    return tech_override_steer(
+        steer_in,
+        read_ego_feedback(),
+        steer_locked=bool(getattr(actuator, "steer_locked", False)),
+    )
+
+
 def _load_control_yaml() -> dict:
     try:
         import yaml  # type: ignore
@@ -719,18 +737,13 @@ def main() -> None:
             # Player override. Retail Direct Drive lock: when Lua saw a player device, electrics
             # are GVD's own command — use the physical lastInputs axes (absolute). Otherwise the
             # residual is still steering_input - aligned cmd.steer so FFB noise cannot disengage.
-            # Tech beamngpy locks local steering while engaged, so electrics become the command.
-            # The wheel for the 1.7.4 residual is player_steering from gvd_ego.json. own_axes
-            # keeps the pedal residual on electrics (pedals are not locked) and the steer
-            # baseline follows the resting wheel when the command changes.
+            # Tech omits steering from vehicle.control and locks local out of the hydros, so
+            # lastInputs.local.steering stays the wheel. The 1.7.4 residual reads that echo
+            # from gvd_ego.json. own_axes keeps the pedal residual on electrics (pedals are
+            # not locked) and the steer baseline follows the resting wheel when the command changes.
             owns_axes = getattr(actuator, "name", "") == "beamngpy"
             if owns_axes:
-                wheel_fb = read_ego_feedback()
-                ovr_steer = tech_override_steer(
-                    steer_in,
-                    wheel_fb,
-                    steer_locked=bool(getattr(actuator, "steer_locked", False)),
-                )
+                ovr_steer = sample_tech_wheel(actuator, steer_in)
                 ovr_thr, ovr_brk, ovr_dev = throttle_in, brake_in, False
             elif ego_fb is not None and ego_fb.fresh and ego_fb.player_device:
                 ovr_steer, ovr_thr, ovr_brk, ovr_dev = (
@@ -860,6 +873,8 @@ def main() -> None:
             st["viz_note"] = viz_note
             st["detector"] = pout.detector_name
             st["actuator"] = actuator.name
+            # Rising edge already flushed this flag before queue_lua_command.
+            # This is the steady snapshot after the tick.
             st["tech_steer_hold"] = bool(getattr(actuator, "steer_locked", False))
             st["cmd_seq"] = int(applied.seq)
             st["cmd_reason"] = applied.reason

@@ -64,7 +64,7 @@ The settled game view. Soft Esc parked.
 
 ## Recent changes (alpha 1.7.9)
 
-Catch-up from **1.0.1**. Each feature merge since that pin is one main step. The throttle fix is the point in between. Live Alt+G, Tech 8-cam, FFB, and QSV stay **UNPROVEN**.
+Catch-up from **1.0.1**. Each feature merge since that pin is one main step. The throttle fix is the point in between. Live Alt+G, Tech 8-cam, and QSV stay **UNPROVEN**.
 
 ## Still in force from 1.0.1
 
@@ -124,7 +124,7 @@ Catch-up from **1.0.1**. Each feature merge since that pin is one main step. The
 
 ## 1.7.4 wheel rotation
 
-- Disengage uses wheel rotation against the commanded steer. Force-feedback torque is not a signal. An echo of a command already ahead of the wheel is residual 0, a later smaller command keeps that catch-up inside the span, and a held rotation of 0.25 drops Engage.
+- Disengage uses wheel rotation against the commanded steer. An echo of a command already ahead of the wheel is residual 0, a later smaller command keeps that catch-up inside the span, and a held rotation of 0.25 drops Engage.
 
 ## 1.7.5
 

@@ -16,6 +16,10 @@ Windows. You do not need an administrator account.
 
 BeamNG.tech is separate. Start BeamNG.tech yourself, then double-click `play_gvd_tech.bat`.
 
+### Steering wheels
+
+Unplug any steering wheel, including force feedback wheels, before you engage. Turning off force feedback is not enough. While GVD is engaged, a connected wheel can overwrite GVD's steering, so the car goes straight instead of holding the lane. To take over without a wheel, press Alt+G.
+
 ## Cameras
 
 The strip is one picture made from all eight cameras. This is what the driving model sees. Left to right: repeatL, pillarL, wide, main, narrow, pillarR, repeatR, rear.

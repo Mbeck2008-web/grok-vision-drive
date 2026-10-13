@@ -525,6 +525,7 @@ def check_run_vision_e2e() -> None:
     st = read_state()
     assert st and st["engaged"] is False and st["cmd_applied"] is False and st["actuator"] == "cmd_json"
     assert st["cmd_reason"] == "not_engaged" and st["ego_source"] == "none"
+    assert st.get("heartbeat_ok") is True
     # Loaded nets keep writing path / tracks / shadow while the car is still yours.
     assert isinstance(st.get("path_ego"), list) and len(st["path_ego"]) >= 2, st.get("path_ego")
     assert isinstance(st.get("tracks"), list)
@@ -561,6 +562,7 @@ def check_run_vision_e2e() -> None:
     assert cmd["steer"] == 0.0, cmd
     st = read_state()
     assert st and st["engaged"] is True and st["cmd_applied"] is True, {k: st.get(k) for k in ("engaged", "cmd_applied", "cmd_reason")}
+    assert st.get("heartbeat_ok") is True
     assert st["cmd_reason"] == "cmd_json_applied" and st["ego_source"] == "lua" and st["lua_applying"] is True
     assert abs(float(st["ego"]["speed_mps"]) - echo_speed) < 1e-6, st["ego"]
     assert st["cmd_ack_seq"] >= st["cmd_seq"] - 5
@@ -797,11 +799,11 @@ def check_no_chrome() -> None:
 
 def check_player_docs() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "## Alpha 1.7.13" in readme
+    assert "## Alpha 1.7.12" in readme
     assert "This is **alpha** — may break / not work; improves with fixes." in readme
     assert "**point** bumps" in readme and "fixes / small UI" in readme
     assert "**main alpha** bump" in readme and "features / core / UI overhaul" in readme
-    assert "1.7.13-alpha-<sha>" in readme
+    assert "1.7.12-alpha-<sha>" in readme
     assert "docs/stitch-360.png" in readme
     assert "docs/soft-esc-highway.jpg" not in readme
     assert "Soft Esc parked" in readme

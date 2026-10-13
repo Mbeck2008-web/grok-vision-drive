@@ -329,6 +329,30 @@ def heartbeat_fresh(heartbeat_mtime: float | None, now: float | None = None, sta
     return (t - float(heartbeat_mtime)) <= stale_s
 
 
+def engage_heartbeat_ok(now: float | None = None) -> bool:
+    """True unless ``gvd_engage.json`` claims Engage on a stale stamp.
+
+    Lua rewrites that ``mtime`` with ``os.time()`` while its latch is on.
+    A file that is missing or says ``engaged:false`` is not a dead link.
+    The window is ``ENGAGE_FRESH_S`` (about 2.5 s), the same check
+    ``read_engage_flag`` uses. ``--force-engage`` does not call this.
+    """
+    p = engage_path()
+    if not p.is_file():
+        return True
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not isinstance(data, dict) or not bool(data.get("engaged", False)):
+        return True
+    try:
+        mtime = float(data["mtime"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return heartbeat_fresh(mtime, now=now, stale_s=ENGAGE_FRESH_S)
+
+
 def may_drive(
     *,
     engaged: bool,

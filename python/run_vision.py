@@ -20,6 +20,7 @@ from python.control.actuate import (
     read_electrics_inputs,
     BotEngage,
     disarm_supervisor_start,
+    engage_heartbeat_ok,
     read_engage_flag,
     soft_esc_state_write_due,
     soft_esc_state_write_mark,
@@ -655,7 +656,11 @@ def main() -> None:
                 engaged = False
                 # Refuse actuation. Do not guess Drive vs Tech or honor a Python-only override.
             disengage_reason = "none" if ident.matched else "bus_mismatch"
-            heartbeat_ok = True
+            # Lua's engage-file stamp, not a constant. --force-engage is a
+            # dev latch and does not read that file.
+            heartbeat_ok = engage_heartbeat_ok()
+            if bool(args.force_engage) or bool(ui.debug.force_engage):
+                heartbeat_ok = True
             allow_preview = bool(args.allow_preview_drive) or bool(ui.debug.allow_preview)
             policy_tick = ui.debug.effective_policy(policy_active)
             if engaged:
@@ -799,6 +804,7 @@ def main() -> None:
                 gpu_vram_total_gb=float(hw.dgpu_vram_gb or 11.0),
                 gpu_vram_used_gb=gpu_vram_used_gb(),
             )
+            st["heartbeat_ok"] = bool(heartbeat_ok)
             st["ego"]["speed_mps"] = ego_v
             st["ego"]["steer_deg"] = steer
             st["ego"]["throttle"] = float(applied.throttle)

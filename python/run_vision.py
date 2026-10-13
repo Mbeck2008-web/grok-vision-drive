@@ -25,6 +25,7 @@ from python.control.actuate import (
     soft_esc_state_write_skips,
     publish_shutdown_steer_hold,
     stop_command,
+    tech_hold_api_reason,
     write_engage_flag,
 )
 from python.sensors.tech import (
@@ -88,9 +89,9 @@ def sample_tech_wheel(
     numeric ``player_steering`` from ``gvd_ego.json`` is the physical wheel
     (``lastInputs``, still recorded when local is blocked), even when
     ``player_device`` is false. JSON null is a missing echo: Lua writes null
-    when no player source is in ``lastInputs``. While the hold is on and that
-    field is absent, null, or the file is stale, return None and start the
-    blind timer.
+    when no player source has a steering key. A pedal-only ``local`` slot
+    is that missing echo. While the hold is on and that field is absent,
+    null, or the file is stale, return None and start the blind timer.
     The detector seeds rest at 0 once it is armed, so that missing echo is
     not a wheel at the command. The first time the hold is on and the echo
     stays missing, log once: the grab path cannot see the wheel. A real
@@ -861,6 +862,18 @@ def main() -> None:
                 actuator.note_engaged(engaged)
             if hasattr(actuator, "note_ack"):
                 actuator.note_ack(ego_fb)
+            # The probe queued above can land a sync echo on this same tick.
+            # An explicit false means the whitelist API is absent, so Engage
+            # must not command a hold that the vehicle will ignore.
+            if owns_axes and engaged and tech_hold_api_reason(actuator, ego_fb) == "tech_hold_api_missing":
+                engaged = False
+                disengage_reason = "tech_hold_api_missing"
+                bot_engage.clear()
+                write_engage_flag(False, disengage_reason=disengage_reason)
+                print("[GVD] DISENGAGED: tech_hold_api_missing", flush=True)
+                cmd = stop_command(seq=cmd_seq, reason="tech_hold_api_missing")
+                if hasattr(actuator, "note_engaged"):
+                    actuator.note_engaged(False)
             if engaged and cmd.reason == "ok":
                 applied = actuator.apply(cmd)
             else:

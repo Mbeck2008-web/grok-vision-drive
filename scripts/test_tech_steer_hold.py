@@ -23,13 +23,19 @@ sys.path.insert(0, str(ROOT))
 import yaml  # noqa: E402
 
 from python.control.actuate import (  # noqa: E402
+    STEER_HOLD_KEEPALIVE_S,
+    STEER_HOLD_REQUEUE_EPS,
+    TECH_HOLD_API_PROBE_LUA,
     TECH_STEER_RELEASE_LUA,
     BeamNGPyActuator,
+    CmdJsonActuator,
     DriveCommand,
+    plan_command,
     publish_shutdown_steer_hold,
+    tech_hold_api_reason,
     tech_steer_hold_lua,
 )
-from python.run_vision import override_note_steer  # noqa: E402
+from python.run_vision import override_note_steer, sample_tech_wheel  # noqa: E402
 from python.control.override import (  # noqa: E402
     REASON_STEER,
     OverrideDetector,
@@ -704,7 +710,7 @@ def check_failed_hold_not_applied() -> None:
         wrote = act_w.apply(DriveCommand(steer=0.4, throttle=0.2, brake=0.0, seq=1, reason="ok"))
         assert wrote.applied is False and wrote.reason == "tech_steer_hold_flag", wrote
         assert act_w.steer_locked is False
-        assert blocked.lua == []
+        assert blocked.lua == [TECH_HOLD_API_PROBE_LUA]
         assert blocked.calls == []
     finally:
         sio.write_state = orig_write
@@ -1060,6 +1066,169 @@ def check_release_text_matches_mod() -> None:
     assert want in compact, compact
 
 
+def check_hold_api_probe_and_refuse() -> None:
+    """Engage probes setAllowedInputSource. A false echo refuses. Unknown stays engaged."""
+    from python.control.actuate import ego_path, read_ego_feedback
+
+    wheel = PlayerWheel(0.0)
+    veh = TechVeh(wheel)
+    act = BeamNGPyActuator(veh)
+    act.note_engaged(True)
+    assert veh.lua[0] == TECH_HOLD_API_PROBE_LUA
+    assert "type(input.setAllowedInputSource)=='function'" in TECH_HOLD_API_PROBE_LUA
+    assert "onTechHoldApi" in TECH_HOLD_API_PROBE_LUA
+    assert tech_hold_api_reason(act, None) is None
+    ego_path().write_text(
+        json.dumps({"tech_hold_api": False, "player_steering": 0.0}),
+        encoding="utf-8",
+    )
+    fb = read_ego_feedback()
+    assert fb is not None and fb.tech_hold_api is False
+    assert tech_hold_api_reason(act, fb) == "tech_hold_api_missing"
+    ego_path().write_text(json.dumps({"tech_hold_api": True}), encoding="utf-8")
+    assert tech_hold_api_reason(act, read_ego_feedback()) is None
+    ego_path().write_text(json.dumps({"player_steering": 0.1}), encoding="utf-8")
+    unknown = read_ego_feedback()
+    assert unknown is not None and unknown.tech_hold_api is None
+    assert tech_hold_api_reason(act, unknown) is None
+    src = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
+    assert "tech_hold_api_missing" in src
+    lua = MAIN_LUA.read_text(encoding="utf-8")
+    assert "function M.onTechHoldApi" in lua
+    assert "if ins.steering~=nil then ns=ns+1" in lua
+
+    class MissingApi(TechVeh):
+        def queue_lua_command(self, chunk: str, response: bool = False) -> None:
+            super().queue_lua_command(chunk, response)
+            if "onTechHoldApi" in chunk:
+                self.gvd_tech_hold_api = False
+
+    missing = MissingApi(PlayerWheel(0.0))
+    act_m = BeamNGPyActuator(missing)
+    act_m.note_engaged(True)
+    assert act_m.tech_hold_api is False
+    assert tech_hold_api_reason(act_m, None) == "tech_hold_api_missing"
+    n = len(missing.lua)
+    act_m.note_engaged(True)
+    assert len(missing.lua) == n, "a known false echo does not probe again"
+
+
+def check_hold_and_aeb_keep_last_steer() -> None:
+    """A preview hold and an AEB brake keep the steer that was already queued."""
+    from python.control.actuate import cmd_path
+
+    wheel = PlayerWheel(0.0)
+    veh = TechVeh(wheel)
+    act = BeamNGPyActuator(veh)
+    act.note_engaged(True)
+    act.apply(DriveCommand(steer=0.35, throttle=0.2, brake=0.0, seq=1, reason="ok"))
+    held = act.stop(seq=2, reason="preview_blocked")
+    assert held.applied is True and held.reason == "preview_blocked"
+    assert abs(held.steer - 0.35) < 1e-9, held.steer
+    assert tech_steer_hold_lua(0.0) not in veh.lua
+    assert veh.lua.count(tech_steer_hold_lua(0.35)) == 1
+    assert veh.calls[-1]["parkingbrake"] == 1.0
+    assert "steering" not in veh.calls[-1]
+    aeb = plan_command(
+        path_ego=None,
+        planner={"aeb": "brake", "target_v": 0},
+        ego_speed_mps=10.0,
+        seq=3,
+    )
+    assert aeb.steer == 0.0 and aeb.brake == 1.0
+    aeb.reason = "ok"
+    sent = act.apply(aeb)
+    assert abs(sent.steer - 0.35) < 1e-9, sent.steer
+    assert veh.lua.count(tech_steer_hold_lua(0.35)) == 1
+    assert abs(wheel.state["steering"] - 0.35) < 1e-9
+    turn = plan_command(
+        path_ego=[{"x": 1.0, "y": float(i), "z": 0.0} for i in range(12)],
+        planner={"aeb": "brake", "target_v": 0},
+        ego_speed_mps=10.0,
+        seq=4,
+    )
+    turn.reason = "ok"
+    assert turn.steer > 0.3 and turn.brake == 1.0
+    turned = act.apply(turn)
+    assert abs(turned.steer - turn.steer) < 1e-9
+    assert tech_steer_hold_lua(turn.steer) in veh.lua
+
+    prev_bus = os.environ.get("GVD_DOCS_DIR")
+    bus = Path(prev_bus or ".") / "live" / "Documents" / "GVD"
+    bus.mkdir(parents=True, exist_ok=True)
+    os.environ["GVD_DOCS_DIR"] = str(bus)
+    (bus / "gvd_link.json").write_text(
+        json.dumps({"lua_bus": str(bus.resolve())}),
+        encoding="utf-8",
+    )
+    try:
+        retail = CmdJsonActuator()
+        retail.note_engaged(True)
+        retail.apply(DriveCommand(steer=-0.35, throttle=0.2, brake=0.0, seq=1, reason="ok"))
+        retail.stop(seq=2, reason="preview_blocked")
+        payload = json.loads(cmd_path().read_text(encoding="utf-8"))
+        assert payload["engaged"] is True and payload["brake"] == 1.0, payload
+        assert abs(float(payload["steer"]) - (-0.35)) < 1e-9, payload
+    finally:
+        if prev_bus is None:
+            os.environ.pop("GVD_DOCS_DIR", None)
+        else:
+            os.environ["GVD_DOCS_DIR"] = prev_bus
+
+
+def check_steer_hold_queues_on_epsilon_and_keepalive() -> None:
+    """An unchanged locked steer skips Lua until it moves or the keepalive elapses."""
+    import time
+
+    wheel = PlayerWheel(0.0)
+    veh = TechVeh(wheel)
+    act = BeamNGPyActuator(veh)
+    act.note_engaged(True)
+    act.apply(DriveCommand(steer=0.30, throttle=0.2, brake=0.0, seq=1, reason="ok"))
+    assert veh.lua.count(tech_steer_hold_lua(0.30)) == 1
+    n_lua = len(veh.lua)
+    n_calls = len(veh.calls)
+    act.apply(DriveCommand(steer=0.30, throttle=0.2, brake=0.0, seq=2, reason="ok"))
+    assert len(veh.lua) == n_lua
+    assert len(veh.calls) == n_calls + 1
+    assert veh.calls[-1]["throttle"] == 0.2
+    small = 0.30 + (STEER_HOLD_REQUEUE_EPS * 0.5)
+    act.apply(DriveCommand(steer=small, throttle=0.2, brake=0.0, seq=3, reason="ok"))
+    assert len(veh.lua) == n_lua
+    moved = 0.30 + STEER_HOLD_REQUEUE_EPS
+    act.apply(DriveCommand(steer=moved, throttle=0.2, brake=0.0, seq=4, reason="ok"))
+    assert veh.lua[-1] == tech_steer_hold_lua(moved)
+    act._steer_hold_queued_mono = time.monotonic() - (STEER_HOLD_KEEPALIVE_S + 0.05)
+    act.apply(DriveCommand(steer=moved, throttle=0.2, brake=0.0, seq=5, reason="ok"))
+    assert veh.lua[-1] == tech_steer_hold_lua(moved)
+    assert veh.lua.count(tech_steer_hold_lua(moved)) == 2
+
+
+def check_pedal_slot_starts_blind_timer() -> None:
+    """player_device from pedals with null player_steering is still a missing wheel."""
+    import python.run_vision as rv
+    from python.control.actuate import ego_path, read_ego_feedback
+
+    rv._STEER_GRAB_BLIND_LOGGED = False
+    rv._STEER_GRAB_BLIND_SINCE = None
+    locked = BeamNGPyActuator(TechVeh(PlayerWheel()))
+    locked._steer_locked = True
+    ego_path().write_text(
+        json.dumps({"player_device": True, "player_steering": None, "player_throttle": 0.4}),
+        encoding="utf-8",
+    )
+    fb = read_ego_feedback()
+    assert fb is not None and fb.player_device is True and fb.player_steering is None
+    assert sample_tech_wheel(locked, 0.3, now=20.0) is None
+    assert rv._STEER_GRAB_BLIND_SINCE == 20.0
+    ego_path().write_text(
+        json.dumps({"player_device": True, "player_steering": 0.0, "player_throttle": 0.4}),
+        encoding="utf-8",
+    )
+    assert sample_tech_wheel(locked, 0.3, now=21.0) == 0.0
+    assert rv._STEER_GRAB_BLIND_SINCE is None
+
+
 def main() -> None:
     prev = os.environ.get("GVD_DOCS_DIR")
     tmp = tempfile.TemporaryDirectory()
@@ -1080,6 +1249,10 @@ def main() -> None:
         check_new_hold_clears_release_accepted()
         check_glance_drive_while_hold()
         check_release_text_matches_mod()
+        check_hold_api_probe_and_refuse()
+        check_hold_and_aeb_keep_last_steer()
+        check_steer_hold_queues_on_epsilon_and_keepalive()
+        check_pedal_slot_starts_blind_timer()
     finally:
         if prev is None:
             os.environ.pop("GVD_DOCS_DIR", None)

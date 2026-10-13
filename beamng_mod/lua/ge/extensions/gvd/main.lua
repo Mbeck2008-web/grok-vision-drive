@@ -22,8 +22,9 @@
 -- release once per latch. Later polls keep looking for the named vehicle
 -- and do not queue the player again. The latch stays until that named
 -- vehicle is the one released.
--- nPlayer == 0 writes player_steering as JSON null so a live zero is missing.
--- Pedal locks stay on the retail path.
+-- nSteer == 0 writes player_steering as JSON null. A pedal-only local
+-- slot still sets nPlayer, and that is not a wheel. A 12-arg echo with
+-- no nSteer keeps the old nPlayer rule. Pedal locks stay on the retail path.
 -- Detector, path, planner and track ghosts keep running/drawing while the supervisor is live;
 -- Alt+G is the takeover latch (ice underglow + actuators), not the start of perception.
 local M = {}
@@ -1129,14 +1130,14 @@ local VE_FEEDBACK = "local ev=(electrics and electrics.values) or {};"
   .. "local function n(x) x=tonumber(x) or 0;if x~=x or x==math.huge or x==-math.huge then x=0 end;return x end;"
   .. "local gx=n(s.gx2 or s.gx);local gy=n(s.gy2 or s.gy);local gz=n(s.gz2 or s.gz);"
   .. "local yr=0;if obj and obj.getYawAngularVelocity then local ok,v=pcall(function() return obj:getYawAngularVelocity() end);if ok then yr=n(v) end end;"
-  .. "local ps,pt,pb,np=0,0,0,0;"
+  .. "local ps,pt,pb,np,ns=0,0,0,0,0;"
   .. "if input and input.lastInputs then for src,ins in pairs(input.lastInputs) do "
   .. "if src~='gvd' and src~='adas' and src~='beamngpy' and src~='tech' and type(ins)=='table' then np=np+1;"
-  .. "local a=n(ins.steering);if a*a>(ps*ps) then ps=a end;"
+  .. "if ins.steering~=nil then ns=ns+1;local a=n(ins.steering);if a*a>(ps*ps) then ps=a end end;"
   .. "local t=n(ins.throttle);if t>pt then pt=t end;"
   .. "local b=n(ins.brake);if b>pb then pb=b end;end end end;"
-  .. "obj:queueGameEngineLua(string.format('extensions.gvd_main.onEgoFeedback(%.3f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d)',"
-  .. "n(ev.wheelspeed or ev.airspeed),n(ev.steering_input),n(ev.throttle_input),n(ev.brake_input),gx,gy,gz,yr,ps,pt,pb,np))"
+  .. "obj:queueGameEngineLua(string.format('extensions.gvd_main.onEgoFeedback(%.3f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%d)',"
+  .. "n(ev.wheelspeed or ev.airspeed),n(ev.steering_input),n(ev.throttle_input),n(ev.brake_input),gx,gy,gz,yr,ps,pt,pb,np,ns))"
 
 -- ───────────── player override: steer residual, force-feedback tolerant ─────────────
 -- Force-feedback / racing wheels move electrics.steering_input around whatever GVD commands
@@ -1424,12 +1425,23 @@ local function writeEgoFile()
     if okd then dirJson = jsonVec3(dir) end
   end
   local np = math.floor(tonumber(egoFb.nPlayer) or 0)
-  -- No player source: a live 0 would look like a centered wheel and silence
-  -- tech_wheel_blind. JSON null is a missing echo. A real device at 0 still
-  -- writes 0.0000.
+  -- A steering key is the wheel. Pedals in the same slot are not. JSON null
+  -- is a missing echo. A real steering value of 0 still writes 0.0000.
+  -- A 12-arg echo leaves nSteer nil and keeps the nPlayer rule.
+  local ns = egoFb.nSteer
+  local haveSteer = np > 0
+  if ns ~= nil then
+    haveSteer = math.floor(tonumber(ns) or 0) > 0
+  end
   local pSteerJson = 'null'
-  if np > 0 then
+  if haveSteer then
     pSteerJson = string.format('%.4f', tonumber(egoFb.pSteer) or 0)
+  end
+  local apiJson = 'null'
+  if egoFb.techHoldApi == true then
+    apiJson = 'true'
+  elseif egoFb.techHoldApi == false then
+    apiJson = 'false'
   end
   local bus = tostring(luaBusPath()):gsub('"', '')
   local payload = string.format(
@@ -1437,20 +1449,20 @@ local function writeEgoFile()
       .. '"applied_seq":%d,"applying":%s,"mtime":%d,'
       .. '"gx":%s,"gy":%s,"gz":%s,"yaw_rate":%s,"pos":%s,"dir":%s,'
       .. '"player_device":%s,"player_steering":%s,"player_throttle":%.4f,"player_brake":%.4f,'
-      .. '"lua_bus":"%s"}',
+      .. '"tech_hold_api":%s,"lua_bus":"%s"}',
     egoFb.speed, egoFb.steer, egoFb.throttle, egoFb.brake,
     math.floor(tonumber(lastAppliedSeq) or -1), applying and 'true' or 'false', os.time(),
     jsonNum(egoFb.gx), jsonNum(egoFb.gy), jsonNum(egoFb.gz), jsonNum(egoFb.yawRate, '%.5f'),
     posJson, dirJson,
     np > 0 and 'true' or 'false',
     pSteerJson, tonumber(egoFb.pThr) or 0, tonumber(egoFb.pBrk) or 0,
-    bus)
+    apiJson, bus)
   writeText(gvdFile('gvd_ego.json'), payload)
 end
 
 -- Called from vehicle Lua (VE_FEEDBACK) via obj:queueGameEngineLua.
 -- Extra IMU args are optional so a 4-arg call still works.
-function M.onEgoFeedback(speed, steerIn, thrIn, brkIn, gx, gy, gz, yawRate, pSteer, pThr, pBrk, nPlayer)
+function M.onEgoFeedback(speed, steerIn, thrIn, brkIn, gx, gy, gz, yawRate, pSteer, pThr, pBrk, nPlayer, nSteer)
   egoFb = {
     speed = tonumber(speed) or 0,
     steer = tonumber(steerIn) or 0,
@@ -1465,6 +1477,11 @@ function M.onEgoFeedback(speed, steerIn, thrIn, brkIn, gx, gy, gz, yawRate, pSte
     pBrk = tonumber(pBrk) or 0,
     nPlayer = math.floor(tonumber(nPlayer) or 0),
   }
+  -- Omit nSteer on a 12-arg echo so writeEgoFile keeps the nPlayer rule.
+  -- `cond and nil or n` cannot store nil: nil is false and the or-branch runs.
+  if nSteer ~= nil then
+    egoFb.nSteer = math.floor(tonumber(nSteer) or 0)
+  end
   -- Pin the reference the residual is measured against to this sample. Vehicle Lua runs the
   -- apply snippet and the electrics echo in that order in the same tick, so the command in
   -- force when these values were read is the one we most recently pushed.
@@ -1473,6 +1490,21 @@ function M.onEgoFeedback(speed, steerIn, thrIn, brkIn, gx, gy, gz, yawRate, pSte
   -- File bus is for the Python supervisor; the in-game HUD reads egoFb from gvdUi either way.
   -- Wheel/pedal bars ride this same echo via the single 10 Hz tickPush path (not a second pusher).
   if supervisorAlive() then writeEgoFile() end
+end
+
+function M.onTechHoldApi(present)
+  -- Echo from the Engage probe. False refuses Engage in Python. A missing
+  -- ego row still writes the flag so the supervisor can see it this tick.
+  local ok = (present == true or present == 1)
+  M.techHoldApi = ok
+  if egoFb == nil then
+    egoFb = {
+      speed = 0, steer = 0, throttle = 0, brake = 0,
+      pSteer = 0, pThr = 0, pBrk = 0, nPlayer = 0, nSteer = 0,
+    }
+  end
+  egoFb.techHoldApi = ok
+  writeEgoFile()
 end
 
 local function pollEgo(dt)

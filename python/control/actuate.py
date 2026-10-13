@@ -134,6 +134,66 @@ def tech_steer_hold_lua(steer: float) -> str:
     )
 
 
+# Re-queue a locked steer when it moves, and again so a dropped vehicle
+# command cannot leave the whitelist stuck on a stale angle.
+STEER_HOLD_REQUEUE_EPS = 0.01
+STEER_HOLD_KEEPALIVE_S = 0.5
+_KEEP_STEER_ABS = 1e-3
+
+# Vehicle Lua: report whether the whitelist API exists. Electrics carry a
+# sync echo; queueGameEngineLua carries the async echo into gvd_ego.json.
+TECH_HOLD_API_PROBE_LUA = (
+    "local present=(input and type(input.setAllowedInputSource)=='function') and true or false;"
+    "if electrics and electrics.values then "
+    "electrics.values.gvdTechHoldApi=present and 1 or 0;"
+    "end;"
+    "if obj and obj.queueGameEngineLua then "
+    "obj:queueGameEngineLua('extensions.gvd_main.onTechHoldApi('..(present and 'true' or 'false')..')');"
+    "end"
+)
+
+
+def kept_hold_steer(
+    steer: float,
+    brake: float,
+    reason: str,
+    last: float | None,
+    *,
+    engaged: bool,
+) -> tuple[float, float | None]:
+    """While engaged, a full stop or a gate hold keeps the last steer.
+
+    A command with a real steer is sent and remembered. Straight driving
+    remembers 0. A hold whose steer is ~0 keeps ``last`` when one exists,
+    so emergency braking does not snap the wheel straight. Disengaged
+    commands pass through and leave ``last`` unchanged.
+    """
+    try:
+        s = float(steer)
+    except (TypeError, ValueError):
+        s = 0.0
+    if s != s or s in (float("inf"), float("-inf")):
+        s = 0.0
+    try:
+        b = float(brake)
+    except (TypeError, ValueError):
+        b = 0.0
+    if not engaged:
+        return s, last
+    if abs(s) > _KEEP_STEER_ABS:
+        return s, s
+    why = str(reason or "")
+    hold = b >= TECH_HOLD_BRAKE or why in ("preview_blocked", "heartbeat_stale") or why.startswith("veto:")
+    if hold and last is not None:
+        try:
+            kept = float(last)
+        except (TypeError, ValueError):
+            kept = 0.0
+        if kept == kept:
+            return kept, last
+    return s, s
+
+
 def flush_tech_steer_hold(held: bool, veh_id: Any = None) -> bool:
     """Publish ``tech_steer_hold`` immediately before a hold queue.
 
@@ -233,10 +293,32 @@ class EgoFeedback:
     player_steering: float | None = None
     player_throttle: float | None = None
     player_brake: float | None = None
+    tech_hold_api: bool | None = None
 
     @property
     def fresh(self) -> bool:
         return self.age_s <= EGO_FRESH_S
+
+
+def _tri_bool(v: Any) -> bool | None:
+    """True, false, or unknown. Numbers 0 and 1 are the electrics echo."""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)) and v == v:
+        if v == 1:
+            return True
+        if v == 0:
+            return False
+        return None
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s == "true":
+            return True
+        if s == "false":
+            return False
+    return None
 
 
 def _num(v: Any) -> float | None:
@@ -302,7 +384,25 @@ def read_ego_feedback(now: float | None = None) -> EgoFeedback | None:
         player_steering=_num(data.get("player_steering")),
         player_throttle=_num(data.get("player_throttle")),
         player_brake=_num(data.get("player_brake")),
+        tech_hold_api=_tri_bool(data.get("tech_hold_api")) if "tech_hold_api" in data else None,
     )
+
+
+def tech_hold_api_reason(actuator: object, ego: EgoFeedback | None = None) -> str | None:
+    """Refuse Engage when the whitelist API echo is explicitly false.
+
+    Unknown (no echo yet) stays None so the first tick can still queue the
+    probe. A false echo from the ego file or from the vehicle attribute
+    is ``tech_hold_api_missing``.
+    """
+    flags: list[bool | None] = []
+    if ego is not None:
+        flags.append(getattr(ego, "tech_hold_api", None))
+    flags.append(getattr(actuator, "tech_hold_api", None))
+    for flag in flags:
+        if flag is False:
+            return "tech_hold_api_missing"
+    return None
 
 
 def read_engage_flag(default: bool = False) -> bool:
@@ -1018,6 +1118,9 @@ class BeamNGPyActuator:
         self._steer_hold_vid: Any = None
         self._steer_hold_cmd: float | None = None
         self._steer_release_accepted = False
+        self._steer_hold_queued_mono: float | None = None
+        self._api_probe_mono: float | None = None
+        self._last_command_steer: float | None = None
 
     @property
     def steer_locked(self) -> bool:
@@ -1039,7 +1142,19 @@ class BeamNGPyActuator:
         """True after this process queued a release that cleared the lock."""
         return bool(self._steer_release_accepted)
 
+    @property
+    def tech_hold_api(self) -> bool | None:
+        """Whitelist API echo on the vehicle, if a probe has landed.
+
+        None until the vehicle records ``gvd_tech_hold_api``. False means
+        ``input.setAllowedInputSource`` is absent.
+        """
+        veh = self.vehicle
+        raw = getattr(veh, "gvd_tech_hold_api", None) if veh is not None else None
+        return _tri_bool(raw)
+
     def note_engaged(self, engaged: bool) -> None:
+        rising = bool(engaged) and not self.engaged
         self.engaged = bool(engaged)
         # A failed queue never took the lock. Drop the pending flag so the
         # next engage flushes again immediately before its queue.
@@ -1050,6 +1165,22 @@ class BeamNGPyActuator:
         # grabs (and force_engage, which does not write gvd_engage.json).
         # The rising-edge poll reads read_engage_flag itself.
         note_soft_esc_engaged(self.engaged)
+        if self.engaged and self._hold_api_probe_due(rising):
+            self._queue_hold_api_probe()
+
+    def _hold_api_probe_due(self, rising: bool, *, now: float | None = None) -> bool:
+        """Probe on the rising edge, and again while the echo is unknown."""
+        if self.tech_hold_api is not None:
+            return False
+        if rising or self._api_probe_mono is None:
+            return True
+        t = time.monotonic() if now is None else float(now)
+        return (t - float(self._api_probe_mono)) >= STEER_HOLD_KEEPALIVE_S
+
+    def _queue_hold_api_probe(self, *, now: float | None = None) -> None:
+        t = time.monotonic() if now is None else float(now)
+        self._api_probe_mono = t
+        self._queue_vehicle_lua(TECH_HOLD_API_PROBE_LUA)
 
     def tech_steer_hold_for_state(self) -> bool:
         """Steady snapshot: true while a hold is pending or the lock is up.
@@ -1265,6 +1396,18 @@ class BeamNGPyActuator:
             flush=True,
         )
 
+    def _steer_hold_requeue_due(self, steer: float, now: float) -> bool:
+        """True when the lock is down, the steer moved, or the keepalive elapsed."""
+        if not self._steer_locked or self._steer_hold_cmd is None or self._steer_hold_queued_mono is None:
+            return True
+        try:
+            delta = abs(float(steer) - float(self._steer_hold_cmd))
+        except (TypeError, ValueError):
+            return True
+        if delta >= STEER_HOLD_REQUEUE_EPS:
+            return True
+        return (now - float(self._steer_hold_queued_mono)) >= STEER_HOLD_KEEPALIVE_S
+
     def _queue_steer_hold(self, steer: float) -> str | None:
         """Block local steering and write the controller steer on source gvd.
 
@@ -1279,9 +1422,15 @@ class BeamNGPyActuator:
         next engage. A kill inside that queue leaves the watcher armed. A
         disengage with no lock clears the pending flag. A new hold clears
         ``steer_release_accepted`` before the queue, so an earlier release
-        cannot clear the watcher this flush just armed.
+        cannot clear the watcher this flush just armed. Once locked, an
+        unchanged steer skips the Lua queue until it moves by
+        ``STEER_HOLD_REQUEUE_EPS`` or ``STEER_HOLD_KEEPALIVE_S`` elapses.
+        A failed queue clears that timer so the next tick retries.
         """
         self._steer_release_accepted = False
+        now = time.monotonic()
+        if not self._steer_hold_requeue_due(steer, now):
+            return None
         chunk = tech_steer_hold_lua(steer)
         q = getattr(self.vehicle, "queue_lua_command", None) if self.vehicle is not None else None
         if not callable(q):
@@ -1299,6 +1448,7 @@ class BeamNGPyActuator:
             self._steer_hold_flag_sent = True
             self._steer_hold_vid = vid
         if not self._queue_vehicle_lua(chunk):
+            self._steer_hold_queued_mono = None
             if not self._steer_hold_fail_logged:
                 self._steer_hold_fail_logged = True
                 print("[GVD] tech steer hold queue failed", flush=True)
@@ -1306,6 +1456,7 @@ class BeamNGPyActuator:
         self._steer_hold_fail_logged = False
         self._steer_locked = True
         self._steer_hold_cmd = float(steer)
+        self._steer_hold_queued_mono = now
         self._log_steer_hold(float(steer))
         return None
 
@@ -1325,6 +1476,7 @@ class BeamNGPyActuator:
         self._steer_hold_flag_sent = False
         self._steer_hold_vid = None
         self._steer_hold_cmd = None
+        self._steer_hold_queued_mono = None
         self._steer_release_accepted = True
         self._steer_hold_logged = False
         self._steer_hold_move_logged = False
@@ -1453,6 +1605,14 @@ class BeamNGPyActuator:
             if cmd.reason in ("ok", "plan"):
                 cmd.reason = "not_engaged"
             return cmd
+        sent, remembered = kept_hold_steer(
+            cmd.steer,
+            cmd.brake,
+            cmd.reason,
+            self._last_command_steer,
+            engaged=True,
+        )
+        cmd.steer = sent
         err = self._control(
             cmd.steer, cmd.throttle, cmd.brake, blinker=getattr(cmd, "blinker", "off"),
         )
@@ -1460,6 +1620,7 @@ class BeamNGPyActuator:
             cmd.applied = False
             cmd.reason = err
             return cmd
+        self._last_command_steer = remembered
         cmd.applied = True
         self._latched = True
         return cmd
@@ -1510,6 +1671,7 @@ class CmdJsonActuator:
         self.ack: EgoFeedback | None = None
         self.last_seq = 0
         self.write_ok = True
+        self._last_command_steer: float | None = None
 
     def note_engaged(self, engaged: bool) -> None:
         self.engaged = bool(engaged)
@@ -1541,6 +1703,17 @@ class CmdJsonActuator:
                 cmd.throttle = 0.0
                 cmd.brake = 1.0
             driving = False
+        sent = float(cmd.steer)
+        remembered = self._last_command_steer
+        if driving:
+            sent, remembered = kept_hold_steer(
+                cmd.steer,
+                cmd.brake,
+                cmd.reason,
+                self._last_command_steer,
+                engaged=True,
+            )
+            cmd.steer = sent
         payload = {
             "steer": float(max(-1.0, min(1.0, cmd.steer))),
             "throttle": float(max(0.0, min(1.0, cmd.throttle))),
@@ -1552,6 +1725,8 @@ class CmdJsonActuator:
         }
         self.write_ok = atomic_write_json(cmd_path(), payload)
         self.last_seq = int(cmd.seq)
+        if driving and self.write_ok:
+            self._last_command_steer = remembered
         cmd.applied = bool(driving and self.write_ok and self.acked(cmd.seq))
         if cmd.reason in self._PASSTHROUGH_TAGS or cmd.reason.startswith("beamngpy"):
             if cmd.applied:

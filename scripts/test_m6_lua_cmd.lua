@@ -965,6 +965,63 @@ check(egoZero and egoZero:find('"player_steering":0.0000', 1, true)
   and egoZero:find('"player_device":true', 1, true),
   'nPlayer 1 writes a centered wheel (' .. tostring(egoZero) .. ')')
 
+-- nSteer == 0 with pedals present is not a wheel. Legacy 12-arg stays above.
+M.onEgoFeedback(1.0, 0.2, 0, 0, 0, 0, 0, 0, 0, 0.4, 0.2, 1, 0)
+local egoPedals = readFileAll(egoPath)
+check(egoPedals and egoPedals:find('"player_steering":null', 1, true)
+  and egoPedals:find('"player_device":true', 1, true)
+  and egoPedals:find('"player_throttle":0.4000', 1, true),
+  'nSteer 0 with nPlayer 1 writes null steering (' .. tostring(egoPedals) .. ')')
+
+-- The vehicle feedback counts a steering key, not the local slot itself.
+veEnv.input.lastInputs = { gvd = { steering = 0.4 }, ['local'] = { throttle = 0.55, brake = 0.10 } }
+geQueue = {}
+M.onUpdate(0.25)
+drainGE()
+local egoSlot = readFileAll(egoPath)
+check(egoSlot and egoSlot:find('"player_steering":null', 1, true)
+  and egoSlot:find('"player_device":true', 1, true)
+  and egoSlot:find('"player_throttle":0.5500', 1, true),
+  'pedal-only local slot is not a wheel (' .. tostring(egoSlot) .. ')')
+veEnv.input.lastInputs = { ['local'] = { steering = 0, throttle = 0.55 } }
+geQueue = {}
+M.onUpdate(0.25)
+drainGE()
+local egoKeyed = readFileAll(egoPath)
+check(egoKeyed and egoKeyed:find('"player_steering":0.0000', 1, true),
+  'a steering key of 0 is a centered wheel (' .. tostring(egoKeyed) .. ')')
+
+-- Engage probe: the queued vehicle snippet is the Python constant.
+local pyFile = assert(io.open('python/control/actuate.py', 'r'))
+local pySrc = pyFile:read('*a')
+pyFile:close()
+local probeBlock = pySrc:match('TECH_HOLD_API_PROBE_LUA = (%b())')
+check(probeBlock ~= nil, 'TECH_HOLD_API_PROBE_LUA is in actuate.py')
+local probeParts = {}
+for piece in probeBlock:gmatch('"([^"]*)"') do
+  probeParts[#probeParts + 1] = piece
+end
+local probe = table.concat(probeParts)
+check(probe:find("type(input.setAllowedInputSource)=='function'", 1, true) ~= nil,
+  'probe checks setAllowedInputSource')
+local savedAllow = veEnv.input.setAllowedInputSource
+veEnv.input.setAllowedInputSource = nil
+geQueue = {}
+fakeVeh:queueLuaCommand(probe)
+drainGE()
+local egoMissing = readFileAll(egoPath)
+check(egoMissing and egoMissing:find('"tech_hold_api":false', 1, true),
+  'missing API echoes false (' .. tostring(egoMissing) .. ')')
+check(electricsValues.gvdTechHoldApi == 0, 'electrics echo is 0 when the API is absent')
+veEnv.input.setAllowedInputSource = savedAllow
+geQueue = {}
+fakeVeh:queueLuaCommand(probe)
+drainGE()
+local egoPresent = readFileAll(egoPath)
+check(egoPresent and egoPresent:find('"tech_hold_api":true', 1, true),
+  'present API echoes true (' .. tostring(egoPresent) .. ')')
+check(electricsValues.gvdTechHoldApi == 1, 'electrics echo is 1 when the API exists')
+
 -- Glance word: beamngpy with the lock up, or tech_steer_hold_queue, is DRIVE.
 local lastTag = nil
 guihooks = {

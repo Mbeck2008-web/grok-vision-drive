@@ -32,6 +32,7 @@ from python.control.actuate import (
     TECH_DRIVE_ARM_S,
     TECH_DRIVE_SHIFT_LUA,
     gear_is_forward,
+    TECH_HOLD_API_PROBE_LUA,
     tech_control_kwargs,
     tech_steer_hold_lua,
 )
@@ -193,13 +194,16 @@ def check_drive_gear_arm() -> None:
         return [c for c in veh.lua if c == TECH_DRIVE_SHIFT_LUA]
 
     assert _arms(neutral) == [TECH_DRIVE_SHIFT_LUA]
-    assert neutral.lua[0] == tech_steer_hold_lua(0.1)
+    assert neutral.lua[0] == TECH_HOLD_API_PROBE_LUA
+    assert tech_steer_hold_lua(0.1) in neutral.lua
     assert neutral.lua[-1] == TECH_DRIVE_SHIFT_LUA
     assert tech.drive_arm_n == 1
     with redirect_stdout(io.StringIO()):
         tech.apply(DriveCommand(steer=0.1, throttle=0.55, brake=0.0, seq=2, reason="ok"))
     assert len(_arms(neutral)) == 1, "second arm inside the delay must not queue again"
-    assert neutral.lua[-1] == tech_steer_hold_lua(0.1)
+    # Same steer inside the keepalive does not queue another hold.
+    assert [c for c in neutral.lua if c == tech_steer_hold_lua(0.1)] == [tech_steer_hold_lua(0.1)]
+    assert neutral.lua[-1] == TECH_DRIVE_SHIFT_LUA
     tech._drive_arm_mono = time.monotonic() - (TECH_DRIVE_ARM_S + 0.05)
     with redirect_stdout(io.StringIO()):
         tech.apply(DriveCommand(steer=0.1, throttle=0.55, brake=0.0, seq=3, reason="ok"))
@@ -211,7 +215,7 @@ def check_drive_gear_arm() -> None:
     tech_d.note_engaged(True)
     with redirect_stdout(io.StringIO()):
         tech_d.apply(DriveCommand(steer=0.0, throttle=0.4, brake=0.0, seq=4, reason="ok"))
-    assert forward.lua == [tech_steer_hold_lua(0.0)]
+    assert forward.lua == [TECH_HOLD_API_PROBE_LUA, tech_steer_hold_lua(0.0)]
     assert "gear" not in forward.calls[-1]
     assert forward.calls[-1]["parkingbrake"] == 0.0
 
@@ -242,7 +246,7 @@ def check_drive_gear_arm() -> None:
         assert all(c != TECH_DRIVE_SHIFT_LUA for c in boxed.lua), (
             f"forward gear on a non-dict container still armed: {type(sensors).__name__}"
         )
-        assert boxed.lua == [tech_steer_hold_lua(0.0)]
+        assert boxed.lua == [TECH_HOLD_API_PROBE_LUA, tech_steer_hold_lua(0.0)]
 
     still_n = ArmVeh("N")
     still_n.sensors = _ItemSensors("N")
@@ -250,7 +254,8 @@ def check_drive_gear_arm() -> None:
     tech_n.note_engaged(True)
     with redirect_stdout(io.StringIO()):
         tech_n.apply(DriveCommand(steer=0.0, throttle=0.4, brake=0.0, seq=9, reason="ok"))
-    assert still_n.lua[0] == tech_steer_hold_lua(0.0)
+    assert still_n.lua[0] == TECH_HOLD_API_PROBE_LUA
+    assert tech_steer_hold_lua(0.0) in still_n.lua
     assert still_n.lua[-1] == TECH_DRIVE_SHIFT_LUA
 
     _check_lua_arm_leaves_mode_alone()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,6 +53,20 @@ class Detection:
     state: str | None = None
     partial: bool = False
     misses: int = 0
+
+
+def pose_ok(det: Detection) -> bool:
+    """A detection the tracker can ingest. Non-finite pose is not a vehicle.
+
+    ``NaN`` fails every distance test, so the old matcher treated it as a
+    miss and then spawned a new track at ``y=NaN``. Downstream ``max`` of a
+    NaN gap collapsed the brake law onto a full stop.
+    """
+    try:
+        vals = (float(det.x), float(det.y), float(det.yaw), float(det.conf))
+    except (TypeError, ValueError):
+        return False
+    return all(math.isfinite(v) for v in vals)
 
 
 def project_box_to_ego(xyxy: tuple[float, float, float, float], img_w: int, img_h: int) -> tuple[float, float, float]:

@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 
 from python.perception.cipv import select_cipv
-from python.perception.detect import STATIC_CLASSES
+from python.perception.detect import STATIC_CLASSES, pose_ok
 from python.perception.lanes import lanes_from_view
 from python.perception.track import IoUTracker
 from python.planning.path_predictor import predict_path
@@ -67,7 +67,7 @@ class ModularPerception:
         # is predicted from lanes, vehicles, and signs, then followed.
         del steer_deg
         t0 = time.perf_counter()
-        dets = self.detector.detect(main_bgr)
+        dets = [d for d in self.detector.detect(main_bgr) if pose_ok(d)]
         # Road furniture is detected but never tracked: tracks feed CIPV / AEB / ghosts,
         # and a stop sign is not a lead vehicle. It rides to the UI as `signs` instead.
         moving = [d for d in dets if d.cls not in STATIC_CLASSES]
@@ -90,7 +90,7 @@ class ModularPerception:
         signs = _hold_signs(self._prior_signs, fresh_signs)[:MAX_SIGNS]
         self._prior_signs = list(signs)
         # if detector didn't set ego x/y (onnx path does), leave as-is
-        tracks = self.tracker.update(moving, time.time())
+        tracks = self.tracker.update(moving, time.time(), ego_speed_mps=ego_speed_mps)
         track_dicts = self.tracker.as_dicts()
         lanes = lanes_from_view(main_bgr, stitch_bgr)
         prior_lanes = None
@@ -98,7 +98,6 @@ class ModularPerception:
             self._prior_lanes = lanes.lanes_bev
         elif self._prior_lanes:
             prior_lanes = self._prior_lanes
-        cipv = select_cipv(track_dicts, path_width=2.0, ego_speed_mps=ego_speed_mps)
         plan = predict_path(
             lanes_bev=lanes.lanes_bev,
             lane_conf=lanes.conf,
@@ -108,15 +107,16 @@ class ModularPerception:
             ego_speed_mps=ego_speed_mps,
             prior_lanes=prior_lanes,
         )
-        cipv_id = plan.cipv_id
-        if cipv_id is None and cipv.track is not None:
-            cipv_id = cipv.track.get("id")
-        ttc = plan.ttc_lead if plan.ttc_lead is not None else cipv.ttc_lead
-        aeb = plan.aeb
-        target_v = plan.target_v
-        if cipv.aeb == "brake" and aeb != "brake":
-            aeb = "brake"
-            target_v = 0.0
+        # After the route exists. The straight tube full-braked a car the
+        # curve had already left behind, and that brake overrode the path.
+        route = plan.route_ego or plan.path_ego
+        cipv = select_cipv(
+            track_dicts,
+            path_width=float(plan.path_width or 2.0),
+            ego_speed_mps=ego_speed_mps,
+            path_ego=route or None,
+        )
+        planner = publish_planner(plan, cipv)
         missing = list(self.missing)
         if main_bgr is None:
             missing.append("cam_main_frame")
@@ -145,23 +145,62 @@ class ModularPerception:
                 }
                 for d in dets
             ],
-            planner={
-                "corridor_width": plan.path_width,
-                "curvature": plan.curvature,
-                "target_v": target_v,
-                "ttc_lead": ttc,
-                "aeb": aeb,
-                "cipv_id": cipv_id,
-                "stop_reason": plan.stop_reason,
-                "prediction": plan.prediction,
-                "path_length_m": plan.path_length_m,
-                "pred_brake": plan.pred_brake,
-                "blinker": plan.blinker,
-            },
+            planner=planner,
             infer_ms=infer_ms,
             missing=missing,
             detector_name=self.detector.name,
         )
+
+
+def publish_planner(plan: Any, cipv: Any = None) -> dict[str, Any]:
+    """Planner dict the live tick hands to ``plan_command``.
+
+    Starts from ``PathPlan.planner_dict()`` so ``range_brake`` is on the
+    dict the actuator reads. Building that dict by hand dropped the key,
+    and the live pedal path never saw the partial stop brake. CIPV may
+    still promote a short time-to-collision to a full stop.
+    """
+    planner = dict(plan.planner_dict())
+    cipv_id = planner.get("cipv_id")
+    ttc = planner.get("ttc_lead")
+    aeb = planner.get("aeb")
+    target_v = planner.get("target_v")
+    if cipv is not None:
+        track = getattr(cipv, "track", None)
+        # A straight-tube CIPV must not override a route that already
+        # left that car off the path. Its time-to-collision is the same
+        # override: plan_command treats ttc under 1.2 as a full stop.
+        # No route means there is nothing to disagree with.
+        on_route = True
+        route = getattr(plan, "route_ego", None) or getattr(plan, "path_ego", None)
+        if route and isinstance(track, dict):
+            from python.planning.path_predictor import vehicle_on_route
+
+            try:
+                tx = float(track.get("x", 0.0))
+                ty = float(track.get("y", 0.0))
+            except (TypeError, ValueError):
+                on_route = False
+            else:
+                width = track.get("width", track.get("width_m"))
+                try:
+                    width_m = None if width is None else float(width)
+                except (TypeError, ValueError):
+                    width_m = None
+                on_route = vehicle_on_route(tx, ty, route, width_m)
+        if on_route:
+            if cipv_id is None and track is not None:
+                cipv_id = track.get("id")
+            if ttc is None:
+                ttc = getattr(cipv, "ttc_lead", None)
+            if getattr(cipv, "aeb", "off") == "brake" and aeb != "brake":
+                aeb = "brake"
+                target_v = 0.0
+    planner["cipv_id"] = cipv_id
+    planner["ttc_lead"] = ttc
+    planner["aeb"] = aeb
+    planner["target_v"] = target_v
+    return planner
 
 
 def _hold_signs(prior: list[dict[str, Any]], fresh: list[dict[str, Any]]) -> list[dict[str, Any]]:

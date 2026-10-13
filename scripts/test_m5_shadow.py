@@ -228,6 +228,68 @@ def main() -> None:
     assert tick_warn.applied.throttle == 0.0 and tick_warn.applied.brake == 1.0
     assert tick_warn.applied.reason.startswith("veto:")
 
+    # policy=e2e used to apply the network throttle and ignore range_brake.
+    tick_range = shadow_tick(
+        policy="e2e",
+        engaged=True,
+        heartbeat_ok=True,
+        path_debug_preview=False,
+        allow_preview_drive=False,
+        path_ego=_path(x=0.0),
+        planner={"target_v": 10, "aeb": "off", "range_brake": 0.4},
+        ego_speed_mps=5.0,
+        lane_conf=0.9,
+        path_conf=0.8,
+        seq=11,
+        e2e_policy=_FixedE2E(steer=0.2, accel=0.4),
+        main_bgr=main,
+        wide_bgr=wide,
+        cfg=cfg,
+    )
+    assert tick_range.veto_reason == "none", tick_range.veto_reason
+    assert tick_range.should_disengage is False
+    assert tick_range.applied.steer == 0.2
+    assert tick_range.applied.throttle == 0.0, tick_range.applied.throttle
+    assert abs(tick_range.applied.brake - 0.4) < 1e-6, tick_range.applied.brake
+    tick_range_max = shadow_tick(
+        policy="e2e",
+        engaged=True,
+        heartbeat_ok=True,
+        path_debug_preview=False,
+        allow_preview_drive=False,
+        path_ego=_path(x=0.0),
+        planner={"target_v": 10, "aeb": "off", "range_brake": 0.4},
+        ego_speed_mps=5.0,
+        lane_conf=0.9,
+        path_conf=0.8,
+        seq=12,
+        e2e_policy=_FixedE2E(steer=-0.15, accel=-0.7),
+        main_bgr=main,
+        wide_bgr=wide,
+        cfg=cfg,
+    )
+    assert tick_range_max.applied.throttle == 0.0
+    assert abs(tick_range_max.applied.brake - 0.7) < 1e-6, tick_range_max.applied.brake
+    tick_nan_range = shadow_tick(
+        policy="e2e",
+        engaged=True,
+        heartbeat_ok=True,
+        path_debug_preview=False,
+        allow_preview_drive=False,
+        path_ego=_path(x=0.0),
+        planner={"target_v": 10, "aeb": "off", "range_brake": float("nan")},
+        ego_speed_mps=5.0,
+        lane_conf=0.9,
+        path_conf=0.8,
+        seq=13,
+        e2e_policy=_FixedE2E(steer=0.2, accel=0.4),
+        main_bgr=main,
+        wide_bgr=wide,
+        cfg=cfg,
+    )
+    assert abs(tick_nan_range.applied.throttle - 0.4) < 1e-6, tick_nan_range.applied
+    assert tick_nan_range.applied.brake == 0.0
+
     # No trained ONNX: the numpy stub must not be applied as an e2e policy.
     class _StubE2E(_FixedE2E):
         def forward(self, *args, **kwargs):

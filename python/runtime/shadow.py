@@ -11,6 +11,7 @@ showed up as HOLD because the link went stale.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -110,6 +111,18 @@ def modular_intent(
     )
 
 
+def planner_range_brake(planner: dict[str, Any] | None) -> float:
+    """Finite ``range_brake`` in [0, 1]. Missing or NaN is no extra brake."""
+    raw = (planner or {}).get("range_brake")
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(val):
+        return 0.0
+    return max(0.0, min(1.0, val))
+
+
 def evaluate_veto(
     *,
     modular: DriveCommand,
@@ -127,6 +140,9 @@ def evaluate_veto(
     if not heartbeat_ok:
         return "heartbeat_stale"
     # AEB from modular planner: never apply E2E actuators under brake (and warn).
+    # A partial range_brake is merged onto the e2e pedals below. It is not
+    # this veto: a 0.4 request must raise the brake to 0.4 and cut throttle,
+    # not replace the command with a full stop.
     aeb = str((planner or {}).get("aeb") or "off").lower()
     if aeb == "brake":
         return "aeb_brake"
@@ -315,10 +331,23 @@ def shadow_tick(
             # Already covered by veto for e2e; belt-and-suspenders.
             applied = stop_command(seq=seq, reason="preview_blocked")
         else:
+            # Modular range_brake still applies when e2e is the driver.
+            # Brake is the max of the two requests. Any positive range
+            # request cuts throttle, which a pure e2e throttle used to ignore.
+            range_brake = planner_range_brake(planner)
+            throttle = float(e2e.throttle)
+            brake = float(e2e.brake)
+            if not math.isfinite(throttle):
+                throttle = 0.0
+            if not math.isfinite(brake):
+                brake = 0.0
+            if range_brake > 1e-6:
+                throttle = 0.0
+                brake = max(brake, range_brake)
             applied = DriveCommand(
                 steer=float(e2e.steer),
-                throttle=float(e2e.throttle),
-                brake=float(e2e.brake),
+                throttle=throttle,
+                brake=brake,
                 seq=seq,
                 reason="ok",
             )

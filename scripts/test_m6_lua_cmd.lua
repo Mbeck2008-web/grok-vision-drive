@@ -1016,6 +1016,17 @@ local egoTableZero = readFileAll(egoPath)
 check(egoTableZero and egoTableZero:find('"player_steering":0.0000', 1, true),
   'a steering table of 0 is a centered wheel (' .. tostring(egoTableZero) .. ')')
 
+-- Throttle and brake use the same table shape as steering. tonumber(table) is nil.
+veEnv.input.lastInputs = { ['local'] = { throttle = { value = 0.55 }, brake = { value = 0.2 } } }
+geQueue = {}
+M.onUpdate(0.25)
+drainGE()
+local egoPedalTable = readFileAll(egoPath)
+check(egoPedalTable and egoPedalTable:find('"player_throttle":0.5500', 1, true)
+  and egoPedalTable:find('"player_brake":0.2000', 1, true)
+  and egoPedalTable:find('"player_steering":null', 1, true),
+  'pedal tables use value (' .. tostring(egoPedalTable) .. ')')
+
 -- Engage probe: the queued vehicle snippet is the Python constant.
 local pyFile = assert(io.open('python/control/actuate.py', 'r'))
 local pySrc = pyFile:read('*a')

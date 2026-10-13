@@ -1434,12 +1434,15 @@ def check_nvidia_smi_cache_and_honest_hz() -> None:
     old = __import__("subprocess").check_output
     __import__("subprocess").check_output = _fake_check_output  # type: ignore[method-assign]
     try:
-        a = hw.gpu_vram_used_gb(now=10.0, force=True)
-        b = hw.gpu_vram_used_gb(now=10.2)
+        # The vision-loop read never launches nvidia-smi, even with force=True.
+        assert hw.gpu_vram_used_gb(now=10.0, force=True) == 0.0
+        assert calls["n"] == 0
+        a = hw.sample_gpu_vram(now=10.0)
+        b = hw.gpu_vram_used_gb(now=10.2, force=True)
         assert abs(a - 2.0) < 1e-9
         assert b == a
         assert calls["n"] == 1
-        c = hw.gpu_vram_used_gb(now=10.51)
+        c = hw.sample_gpu_vram(now=10.51)
         assert calls["n"] == 2
         assert c == a
     finally:
@@ -1454,6 +1457,8 @@ def check_nvidia_smi_cache_and_honest_hz() -> None:
     assert abs(hw.unique_frame_hz_inst(1, 0.1) - 10.0) < 1e-9
     assert abs(hw.unique_frame_hz_inst(8, 0.1) - 10.0) < 1e-9  # one tick, not 80 Hz
     assert hw.NVIDIA_SMI_TIMEOUT_S <= 2.0
+    rv = Path(__file__).resolve().parents[1].joinpath("python", "run_vision.py").read_text(encoding="utf-8")
+    assert "start_gpu_vram_poll()" in rv
 
 
 def check_auto_backend_not_tech_without_env() -> None:

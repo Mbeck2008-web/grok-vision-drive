@@ -11,7 +11,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from python.data.record import RING_CAP_BYTES, ClipRecorder, choose_encoder, clips_dir
+from python.data.record import CLIP_RING_CEILING_BYTES, ClipRecorder, choose_encoder, clip_ring_cap_bytes, clips_dir
 
 
 def main() -> None:
@@ -57,7 +57,20 @@ def main() -> None:
         tiny.push(big, {"engaged": False}, now=t0 + i * 0.01)
     assert tiny.ring_bytes <= tiny.max_bytes, (tiny.ring_bytes, tiny.max_bytes)
 
-    assert RING_CAP_BYTES == 2 * 1024 * 1024 * 1024
+    # Time trim does not wait for a gigabyte. A long run stays inside the window.
+    windowed = ClipRecorder(dry_run=True, max_bytes=32 * 1024 * 1024, pre_s=1.0, post_s=1.0)
+    small = np.zeros((32, 32, 3), dtype=np.uint8)
+    for i in range(400):
+        windowed.push(small, {"engaged": False}, now=t0 + i * 0.1)
+    assert windowed._buf
+    span = windowed._buf[-1].t - windowed._buf[0].t
+    assert span <= 1.0 + 1.0 + 1.0 + 0.15, span
+    cap = clip_ring_cap_bytes()
+    assert cap <= CLIP_RING_CEILING_BYTES
+    assert CLIP_RING_CEILING_BYTES < 1024 ** 3
+    assert cap <= 64 * 1024 * 1024
+    fresh = ClipRecorder(dry_run=True)
+    assert fresh.max_bytes == cap
     print("test_m4_clips: OK")
 
 

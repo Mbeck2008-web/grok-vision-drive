@@ -7,6 +7,7 @@ import platform
 import re
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -174,10 +175,12 @@ def beamng_process_running() -> bool:
     return False
 
 
-NVIDIA_SMI_TIMEOUT_S = 2.0  # hung nvidia-smi must not stall the vision loop
-GPU_VRAM_CACHE_S = 0.5  # nvidia-smi at 1–2 Hz, not every vision tick
+NVIDIA_SMI_TIMEOUT_S = 2.0  # hung nvidia-smi must not stall the poll thread
+GPU_VRAM_CACHE_S = 0.5  # background poll at 1–2 Hz, never on the vision tick
 _gpu_vram_cached_at = 0.0
 _gpu_vram_cached_gb = 0.0
+_gpu_stop = threading.Event()
+_gpu_thread: threading.Thread | None = None
 
 
 def ema_hz(prev: float, inst: float, alpha: float = 0.2) -> float:
@@ -195,25 +198,55 @@ def unique_frame_hz_inst(unique_gpu_n: int, dt: float) -> float:
     return 1.0 / max(1e-6, float(dt))
 
 
-def gpu_vram_used_gb(*, now: float | None = None, force: bool = False) -> float:
-    """Cached nvidia-smi memory.used. TTL 0.5 s (~2 Hz)."""
-    global _gpu_vram_cached_at, _gpu_vram_cached_gb
-    t = time.monotonic() if now is None else float(now)
-    if not force and _gpu_vram_cached_at > 0 and (t - _gpu_vram_cached_at) < GPU_VRAM_CACHE_S:
-        return _gpu_vram_cached_gb
-    val = 0.0
+def _query_gpu_vram_gb() -> float | None:
     try:
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
             text=True,
             timeout=NVIDIA_SMI_TIMEOUT_S,
         ).strip().splitlines()[0]
-        val = float(out) / 1024.0
+        return float(out) / 1024.0
     except Exception:
+        return None
+
+
+def sample_gpu_vram(*, now: float | None = None) -> float:
+    """One nvidia-smi read for the background poll. Not for the vision tick."""
+    global _gpu_vram_cached_at, _gpu_vram_cached_gb
+    val = _query_gpu_vram_gb()
+    t = time.monotonic() if now is None else float(now)
+    if val is None:
         val = _gpu_vram_cached_gb if _gpu_vram_cached_at > 0 else 0.0
     _gpu_vram_cached_at = t
     _gpu_vram_cached_gb = val
     return val
+
+
+def _gpu_vram_loop() -> None:
+    while not _gpu_stop.is_set():
+        sample_gpu_vram()
+        if _gpu_stop.wait(GPU_VRAM_CACHE_S):
+            return
+
+
+def start_gpu_vram_poll() -> None:
+    """Start the daemon poll. The vision loop only reads ``gpu_vram_used_gb``."""
+    global _gpu_thread
+    if _gpu_thread is not None and _gpu_thread.is_alive():
+        return
+    _gpu_stop.clear()
+    _gpu_thread = threading.Thread(target=_gpu_vram_loop, name="gvd-nvidia-smi", daemon=True)
+    _gpu_thread.start()
+
+
+def gpu_vram_used_gb(*, now: float | None = None, force: bool = False) -> float:
+    """Last background sample. This call does not run nvidia-smi.
+
+    ``now`` and ``force`` are accepted so older call sites stay valid. They
+    do not start a query on this thread.
+    """
+    del now, force
+    return _gpu_vram_cached_gb
 
 
 def refuse_live_start(report: HwReport, *, vision_only: bool = False) -> str | None:

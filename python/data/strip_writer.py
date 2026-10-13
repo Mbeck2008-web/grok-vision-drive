@@ -251,21 +251,45 @@ class StripWriter:
         self.strips.mkdir(parents=True, exist_ok=True)
         self.state_path = self.root / "state.jsonl"
         self._session = _new_session_id()
-        self._n = self._next_index()
+        self._state_fd: int | None = None
+        self._n_lines = 0
+        self._state_offset = 0
+        self._last_fsync = 0.0
         # A new session has no previous strip. dt_s on its first line is null.
         self._prev_t: float | None = None
+        self._n = self._seed_state()
         self._write_meta()
 
-    def _next_index(self) -> int:
+    def _seed_state(self) -> int:
+        """One pass over state.jsonl at open. Later strips do not read it again.
+
+        The in-memory tail is the line count and the file offset. ``write``
+        appends from there.
+        """
         used: set[int] = set()
-        for row in read_state_jsonl(self.state_path):
-            raw = row.get("i")
-            if isinstance(raw, bool):
-                continue
-            try:
-                used.add(int(raw))
-            except (TypeError, ValueError):
-                continue
+        lines = 0
+        offset = 0
+        if self.state_path.is_file():
+            with self.state_path.open("rb") as handle:
+                for raw in handle:
+                    offset += len(raw)
+                    text = raw.decode("utf-8", "replace").strip()
+                    if not text:
+                        continue
+                    lines += 1
+                    try:
+                        row = json.loads(text)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(row, dict):
+                        continue
+                    raw_i = row.get("i")
+                    if isinstance(raw_i, bool):
+                        continue
+                    try:
+                        used.add(int(raw_i))
+                    except (TypeError, ValueError):
+                        continue
         if self.strips.is_dir():
             for path in self.strips.iterdir():
                 if not path.is_file():
@@ -273,10 +297,23 @@ class StripWriter:
                 idx = _index_in_name(path.name)
                 if idx is not None:
                     used.add(idx)
+        self._n_lines = lines
+        self._state_offset = offset
         n = 0
         while n in used:
             n += 1
         return n
+
+    def close(self) -> None:
+        """Flush the state tail and refresh meta. Safe to call more than once."""
+        fd = self._state_fd
+        self._state_fd = None
+        if fd is not None:
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        self._write_meta()
 
     def _write_meta(self) -> None:
         sectors = [
@@ -298,7 +335,7 @@ class StripWriter:
             "gap_px": GAP_PX,
             "order": list(STRIP_ORDER),
             "sectors": sectors,
-            "n_strips": len(read_state_jsonl(self.state_path)),
+            "n_strips": self._n_lines,
             "fixed_hz": None,
             "note": (
                 "One JPEG per tick, written as it arrives. "
@@ -372,14 +409,23 @@ class StripWriter:
         raise RuntimeError("no free strip filename")
 
     def _append_state(self, line: dict[str, Any]) -> None:
-        """Append one JSON line. ``O_APPEND`` does not truncate the file."""
+        """Append one JSON line. Does not reread ``state.jsonl``.
+
+        ``O_APPEND`` does not truncate the file. The descriptor stays open.
+        ``fsync`` runs about once a second, and again from ``close``.
+        """
         blob = (json.dumps(line) + "\n").encode("utf-8")
-        fd = os.open(str(self.state_path), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644)
-        try:
-            _write_all(fd, blob)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        if self._state_fd is None:
+            self._state_fd = os.open(
+                str(self.state_path), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644
+            )
+        _write_all(self._state_fd, blob)
+        self._n_lines += 1
+        self._state_offset += len(blob)
+        now = time.monotonic()
+        if now - self._last_fsync >= 1.0:
+            os.fsync(self._state_fd)
+            self._last_fsync = now
 
 
 def _finite_stamp(value: Any) -> float | None:
@@ -562,7 +608,10 @@ class StripRecordControl:
 
     def stop(self) -> None:
         self.recording = False
+        writer = self._writer
         self._writer = None
+        if writer is not None:
+            writer.close()
 
     def set_destination(self, path: str) -> None:
         """Point new files at ``path``. The previous folder is left in place."""
@@ -573,7 +622,10 @@ class StripRecordControl:
             self._save()
             return
         self.destination = text
+        writer = self._writer
         self._writer = None
+        if writer is not None:
+            writer.close()
         if self.free_space_armed:
             self.free_space_armed = False
             self._armed_destination = ""
@@ -596,6 +648,8 @@ class StripRecordControl:
             return None
         writer = self._writer
         if writer is None or writer.root != Path(self.destination):
+            if writer is not None:
+                writer.close()
             writer = StripWriter(self.destination)
             self._writer = writer
         kept, stamps, tick = same_tick_frames(frames, timestamps, t)
@@ -628,7 +682,10 @@ class StripRecordControl:
         self._armed_destination = ""
         if not root or root != self.destination:
             return []
+        writer = self._writer
         self._writer = None
+        if writer is not None:
+            writer.close()
         return wipe_training(root, confirm=True)
 
     def _save(self) -> None:

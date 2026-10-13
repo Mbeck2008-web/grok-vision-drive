@@ -53,7 +53,14 @@ from python.train.scene_net import live_strip_fields
 from python.viz.stage import drawn_lane_records
 from python.sensors.cameras import CAM_IDS, CamHealth, bundle_tick_frames
 from python.runtime.debug_opts import apply_to_command, apply_to_perception
-from python.runtime.hw_probe import ema_hz, gpu_vram_used_gb, probe, refuse_live_start, unique_frame_hz_inst
+from python.runtime.hw_probe import (
+    ema_hz,
+    gpu_vram_used_gb,
+    probe,
+    refuse_live_start,
+    start_gpu_vram_poll,
+    unique_frame_hz_inst,
+)
 from python.runtime.models import ModelRuntime
 from python.runtime.shadow import ShadowConfig, load_shadow_config, shadow_tick
 from python.runtime.state_io import (
@@ -84,18 +91,83 @@ def _load_control_yaml() -> dict:
     return {}
 
 
+def _rss_mb_proc() -> float:
+    """Current Linux resident set from ``/proc``. 0.0 when that file is absent."""
+    try:
+        with open("/proc/self/status", encoding="ascii") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    return float(line.split()[1]) / 1024.0
+    except Exception:
+        return 0.0
+    return 0.0
+
+
+def _rss_mb_windows() -> float:
+    """Working set via ``GetProcessMemoryInfo``. 0.0 off Windows or if the call fails.
+
+    ``resource`` does not exist on Windows, and ``psutil`` is not a retail
+    dependency, so the previous fallback returned 0.0 for every tick.
+    """
+    if os.name != "nt":
+        return 0.0
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _Counters(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        counters = _Counters()
+        counters.cb = ctypes.sizeof(_Counters)
+        handle = ctypes.windll.kernel32.GetCurrentProcess()
+        ok = ctypes.windll.psapi.GetProcessMemoryInfo(
+            handle, ctypes.byref(counters), counters.cb
+        )
+        if not ok:
+            return 0.0
+        return float(counters.WorkingSetSize) / (1024.0 * 1024.0)
+    except Exception:
+        return 0.0
+
+
 def _rss_mb() -> float:
+    """Resident set in MiB. 0.0 only when every probe fails."""
+    if os.name == "nt":
+        win = _rss_mb_windows()
+        if win > 0.0:
+            return win
     try:
         import resource
 
-        return float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) / 1024.0
+        raw = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        # Linux reports KiB. macOS reports bytes.
+        if sys.platform == "darwin":
+            return raw / (1024.0 * 1024.0)
+        if raw > 0.0:
+            return raw / 1024.0
     except Exception:
-        try:
-            import psutil  # type: ignore
+        pass
+    proc = _rss_mb_proc()
+    if proc > 0.0:
+        return proc
+    try:
+        import psutil  # type: ignore
 
-            return psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
-        except Exception:
-            return 0.0
+        return float(psutil.Process(os.getpid()).memory_info().rss) / (1024.0 * 1024.0)
+    except Exception:
+        return 0.0
 
 
 
@@ -203,6 +275,9 @@ def _ui_request_is_live(prefs: dict, start_unix: float) -> bool:
 
 
 def main() -> None:
+    from python.runtime.logio import harden_stdio
+
+    harden_stdio()
     ap = argparse.ArgumentParser(description="GVD supervisor + M2/M3/M4/M5")
     ap.add_argument("--viz", action="store_true")
     ap.add_argument("--smoke", action="store_true")
@@ -506,6 +581,7 @@ def main() -> None:
     prev_bot = False
     engage_arm_mono: float | None = None
     review_cap = ReviewCapture()
+    start_gpu_vram_poll()
     try:
         while True:
             loop_t0 = time.perf_counter()

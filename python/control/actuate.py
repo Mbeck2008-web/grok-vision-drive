@@ -480,6 +480,19 @@ def is_arcade_reverse_hold(kwargs: dict[str, Any]) -> bool:
     return throttle <= 1e-6 and brake >= TECH_HOLD_BRAKE
 
 
+def _positive_ttc(ttc: Any) -> float | None:
+    """Finite time-to-collision above zero. Anything else is not a brake."""
+    if ttc is None:
+        return None
+    try:
+        value = float(ttc)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value <= 0.0:
+        return None
+    return value
+
+
 def plan_command(
     *,
     path_ego: list[dict[str, float]] | None,
@@ -509,7 +522,10 @@ def plan_command(
 
     throttle = 0.0
     brake = 0.0
-    if aeb == "brake" or (ttc is not None and float(ttc) < AEB_BRAKE_TTC):
+    # Zero, negative, and non-finite time-to-collision are not a lead in
+    # front of us. Only a finite positive ttc under the brake line stops.
+    ttc_s = _positive_ttc(ttc)
+    if aeb == "brake" or (ttc_s is not None and ttc_s < AEB_BRAKE_TTC):
         # Keep the command semantic (brake=1). Arcade would treat a held service
         # brake as reverse; tech_control_kwargs sends parking brake instead.
         throttle = 0.0
@@ -538,7 +554,9 @@ def plan_command(
         if not math.isfinite(asked):
             asked = 0.0
         asked = max(0.0, min(1.0, asked))
-        if asked > 1e-6:
+        # A couple of hundredths is the noise floor of the range law.
+        # Holding it for a minute is a phantom slowdown, not a stop.
+        if asked >= 0.025:
             throttle = 0.0
             brake = max(brake, asked)
 

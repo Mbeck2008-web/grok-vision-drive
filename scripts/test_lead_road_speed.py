@@ -202,14 +202,26 @@ def _decel(brake: float) -> float:
     return 8.0 * max(0.0, min(1.0, float(brake)))
 
 
-def _drive(tracker: IoUTracker, y: float, t: float, ego: float, seq: int, kind: str = "vehicle"):
+def _drive(
+    tracker: IoUTracker,
+    y: float,
+    t: float,
+    ego: float,
+    seq: int,
+    kind: str = "vehicle",
+    x: float = 0.0,
+    lanes=None,
+):
     det = Detection(
-        cls=kind, conf=0.9, xyxy=(0, 0, 10, 10), x=0.0, y=y, yaw=math.pi / 2,
+        cls=kind, conf=0.9, xyxy=(0, 0, 10, 10), x=x, y=y, yaw=math.pi / 2,
     )
     tracker.update([det], t, ego_speed_mps=ego)
     tracks = tracker.as_dicts()
     plan = predict_path(
-        lanes_bev=_lanes(), lane_conf=0.9, ego_speed_mps=ego, tracks=tracks,
+        lanes_bev=_lanes() if lanes is None else lanes,
+        lane_conf=0.9,
+        ego_speed_mps=ego,
+        tracks=tracks,
     )
     planner, cmd = _live(plan, tracks, ego, seq)
     return plan, cmd, planner
@@ -749,7 +761,11 @@ def check_pacing_lead_brake() -> None:
                 found[(y0, noise, hz)] = worst
     print("lead-brake gaps m:", {k: round(v, 2) for k, v in found.items()})
     for (y0, noise, hz), gap in found.items():
-        if noise <= 0.5 or y0 >= 36.0:
+        if y0 == 12.5 and noise <= 0.5:
+            # 6 m/s² from 12.5 m, clean and ±0.5 m. The stop has to leave
+            # at least a metre when the brake can still make that gap.
+            assert gap >= 1.0, (y0, noise, hz, gap)
+        elif noise <= 0.5 or y0 >= 36.0:
             # A quiet pace that breaks gets a full stop in time. ±1 m and
             # ±2 m can hide that break, and the filter then meets a short
             # gap late.
@@ -945,6 +961,188 @@ def check_faster_lead_is_not_closing() -> None:
         assert plan.stop_reason == "none", (y, plan.stop_reason)
 
 
+def _roll(gap_fn, seconds: float, hz: float = 10.0, ego0: float = 18.0, xy_fn=None):
+    """Brake-only roll through ``plan_command``. Loss is the drop from ego0."""
+    dt = 1.0 / hz
+    ego = ego0
+    t = 0.0
+    tracker = IoUTracker()
+    min_ego = ego
+    tripped = False
+    for i in range(int(seconds * hz)):
+        gap = float(gap_fn(t))
+        if xy_fn is None:
+            x, y, lanes = 0.0, gap, None
+        else:
+            x, y, lanes = xy_fn(t, gap)
+        plan, cmd, _planner = _drive(tracker, y, t, ego, i, x=x, lanes=lanes)
+        tripped = tripped or plan.aeb == "brake" or cmd.brake >= 0.99
+        a = _decel(cmd.brake)
+        ego = max(0.0, ego - a * dt)
+        min_ego = min(min_ego, ego)
+        t += dt
+    ids = [tr.id for tr in tracker.tracks]
+    rate = tracker.tracks[0].range_rate_mps if tracker.tracks else None
+    return {
+        "loss": ego0 - min_ego,
+        "aeb": tripped,
+        "tracks": len(tracker.tracks),
+        "ids": ids,
+        "rate": rate,
+        "brake": cmd.brake,
+    }
+
+
+def _assert_no_phantom(name: str, row: dict) -> None:
+    assert row["loss"] <= 1.5, (name, round(row["loss"], 2), row)
+    assert row["aeb"] is False, (name, row)
+
+
+def check_gap_drop_does_not_phantom_stop() -> None:
+    """A route-gap wiggle is not a latched full stop.
+
+    The old latch forced brake 1.0 after the filtered rate was already
+    flat, and that promoted aeb. These rolls go through ``plan_command``.
+    A 1.6 m step, a same-track 2.5 m or 4 m swap, a 1.2 m sine, and 45 s
+    of correlated noise each stay inside 1.5 m/s with aeb off.
+    """
+    def step(time: float) -> float:
+        return 27.0 if time < 2.0 else 25.4
+
+    row = _roll(step, 6.0)
+    _assert_no_phantom("step-1.6", row)
+    assert row["tracks"] == 1 and row["ids"] == [1], row
+    assert abs(row["rate"]) < 0.5, row
+    assert row["brake"] < 0.2, row
+
+    for jump in (2.5, 4.0):
+        def swap(time: float, jump: float = jump) -> float:
+            return 27.0 if time < 2.0 else 27.0 - jump
+
+        row = _roll(swap, 5.0)
+        _assert_no_phantom(f"swap-{jump}", row)
+        assert row["tracks"] == 1 and row["ids"] == [1], row
+
+    def sine(time: float) -> float:
+        return 27.0 + 1.2 * math.sin(2.0 * math.pi * time / 4.0)
+
+    row = _roll(sine, 8.0)
+    _assert_no_phantom("sine-1.2", row)
+
+    losses = []
+    for seed in range(6):
+        rng = random.Random(seed)
+        noise = 0.0
+
+        def ar(time: float, rng: random.Random = rng) -> float:
+            nonlocal noise
+            noise = 0.9 * noise + 0.45 * rng.gauss(0.0, 1.0)
+            return 27.0 + noise
+
+        row = _roll(ar, 45.0)
+        _assert_no_phantom(f"ar-{seed}", row)
+        losses.append(round(row["loss"], 2))
+    print("phantom-drop losses m/s:", {"ar": losses})
+
+
+def _radius_for_forward(y: float, gap: float) -> float:
+    """Radius whose centerline forward range is ``y`` at arc gap ``gap``."""
+    lo, hi = 40.0, 400.0
+    for _ in range(50):
+        mid = 0.5 * (lo + hi)
+        if mid * math.sin(gap / mid) < y:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def check_curve_entry_does_not_phantom_stop() -> None:
+    """Entering a 40 m curve shrinks ego-frame y. That is not a stop.
+
+    The curve's own speed limit sheds speed with no lead. The lead, held
+    at a constant arc gap, must not add more than 1.5 m/s, and must not
+    promote aeb. The radius moves so forward range changes by less than
+    0.2 m per frame: a discontinuous jump is a different bug.
+    """
+    gap = 30.0
+    y_far = 400.0 * math.sin(gap / 400.0)
+    y_near = 40.0 * math.sin(gap / 40.0)
+
+    def xy(time: float, _gap: float):
+        if time < 1.0:
+            radius = 400.0
+            y = y_far
+        else:
+            u = min(1.0, (time - 1.0) / 3.0)
+            y = y_far + (y_near - y_far) * u
+            radius = 400.0 if u <= 0.0 else (40.0 if u >= 1.0 else _radius_for_forward(y, gap))
+        lanes = _curve_lanes(radius, 1.0)
+        x = radius * (1.0 - math.cos(gap / radius))
+        return x, y, lanes
+
+    lead = _roll(lambda _time: gap, 6.0, xy_fn=xy)
+    # Same bend, no vehicle. Reuse the roller with a gap the driver never sees.
+    empty_loss = 0.0
+    dt = 0.1
+    ego = 18.0
+    min_ego = ego
+    for i in range(60):
+        time = i * dt
+        _x, _y, lanes = xy(time, gap)
+        plan = predict_path(
+            lanes_bev=lanes, lane_conf=0.9, ego_speed_mps=ego, tracks=[],
+        )
+        _planner, cmd = _live(plan, [], ego, i)
+        assert plan.aeb != "brake" and cmd.brake < 0.99, (time, plan.aeb, cmd.brake)
+        a = _decel(cmd.brake)
+        ego = max(0.0, ego - a * dt)
+        min_ego = min(min_ego, ego)
+    empty_loss = 18.0 - min_ego
+    excess = lead["loss"] - empty_loss
+    print(
+        "curve-entry excess m/s:",
+        round(excess, 2),
+        "lead",
+        round(lead["loss"], 2),
+        "empty",
+        round(empty_loss, 2),
+    )
+    assert excess <= 1.5, (excess, lead, empty_loss)
+    assert lead["aeb"] is False, lead
+
+
+def check_nonpositive_ttc_is_not_a_brake() -> None:
+    """Zero, negative, and non-finite time-to-collision do not full-brake.
+
+    A finite ttc above 0 and under 1.2 still does. 1.2 itself does not.
+    """
+    path = [{"x": 0.0, "y": float(i)} for i in range(0, 30, 2)]
+    base = {"aeb": "off", "target_v": 18.0, "range_brake": 0.0, "blinker": "off"}
+    for bad in (-1.0, 0.0, float("-inf"), float("nan"), float("inf")):
+        cmd = plan_command(
+            path_ego=path,
+            planner=dict(base, ttc_lead=bad),
+            ego_speed_mps=18.0,
+            seq=1,
+        )
+        assert cmd.brake < 0.99, (bad, cmd.brake)
+    full = plan_command(
+        path_ego=path,
+        planner=dict(base, ttc_lead=1.0),
+        ego_speed_mps=18.0,
+        seq=2,
+    )
+    assert full.brake >= 0.99, full.brake
+    edge = plan_command(
+        path_ego=path,
+        planner=dict(base, ttc_lead=1.2),
+        ego_speed_mps=18.0,
+        seq=3,
+    )
+    assert edge.brake < 0.99, edge.brake
+
+
 def main() -> None:
     check_first_sample_is_not_ego()
     check_sign()
@@ -967,6 +1165,9 @@ def main() -> None:
     check_curve_cipv_follows_the_path()
     check_live_tick_publishes_range_brake()
     check_faster_lead_is_not_closing()
+    check_gap_drop_does_not_phantom_stop()
+    check_curve_entry_does_not_phantom_stop()
+    check_nonpositive_ttc_is_not_a_brake()
     print("test_lead_road_speed: OK")
 
 

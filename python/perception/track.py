@@ -29,26 +29,23 @@ _RATE_VALID_SIGMA = 2.2
 # The old 4 m gate missed that jump, left the first track coasting, and
 # the coast kept the brake it had already armed.
 _MATCH_GATE_M = 6.0
-# Long enough for a paced-gap baseline 1–2 s behind the latest grab.
+# Long enough for a route-gap slope a couple of seconds behind the latest grab.
 _SAMPLE_KEEP_S = 2.6
 _SAMPLE_KEEP = 48
-# A lead that was holding a gap, then the last 0.4 s (4 samples at 10 Hz)
-# sits more than 1.5 m closer. The constant-velocity filter is still
-# catching up at that moment. The window is in seconds so 15 Hz uses more
-# samples of the same gap. The 1.5 m floor grows with the pace-window
-# noise so a ±2 m grab does not look like a brake.
-_PACE_RECENT_S = 0.40
-_PACE_OLD_LO_S = 1.00
-_PACE_OLD_HI_S = 2.20
-_PACE_DROP_M = 1.5
-_PACE_DROP_KSIG = 4.0
-# Above this high-frequency residual the pace is not quiet enough to call.
-# A ±2 m grab stays with the Kalman. ±0.5 m still clears the 1.5 m floor.
-_PACE_HF_MAX = 0.70
-# Peak-to-peak of a quiet pace. A ±0.5 m grab spans at most 1.0 m, so that
-# is the whole allowance. A steady close that noise has flattened still
-# sticks out past it.
-_PACE_FLAT_SPAN_M = 1.0
+# A same-track swap inside the match gate. 2.5 m and 4 m reset the route
+# baseline. A 1.6 m step is smaller than this and has to fade on its own
+# once the filtered rate is flat again.
+_ROUTE_RESET_M = 2.2
+# Do not snap the range filter on a ±2 m grab. Two grabs can differ by
+# 4 m, and throwing those updates out left a real 2 m/s close looking
+# like a pace. 5 m is past that grab and inside the match gate, so a
+# same-track teleport still does not become a new closing speed.
+_RATE_SNAP_M = 5.0
+# Match the lead's road speed only after the filtered rate has stayed
+# at least this fast for _CLOSE_HOLD_S. A correlated wander crosses
+# 1 m/s of closing. It does not stay at 1.5.
+_CLOSE_ARM_MPS = -1.5
+_CLOSE_OPEN_MPS = 0.3
 
 
 def lead_road_speed(ego_speed_mps: float, dy_m: float, dt_s: float) -> tuple[float, float]:
@@ -143,13 +140,18 @@ class Track:
     range_rate_mps: float = 0.0
     range_rate_sigma: float = PRIOR_RATE_SIGMA_MPS
     range_rate_valid: bool = False
+    # Seconds the filtered rate has stayed at least 1.5 m/s closing.
+    # A short blip is not a lead we have to match yet.
+    close_hold_s: float = 0.0
     # (time, measured forward range). Kept so a dropped window can still
     # report how far the range moved. The rate itself is the Kalman state.
     samples: list[tuple[float, float]] | None = None
-    # Latched when a quiet pace breaks by more than the drop floor.
-    # The pair is (paced gap, threshold). None while the lead is still pacing.
-    gap_drop_brake: bool = False
-    _pace_hold: tuple[float, float] | None = None
+    # (time, route-arc station) filled by the planner. A new track starts
+    # empty, which is the reset on a track-id change. Not a shared default.
+    route_gaps: list | None = None
+    # [locked lead decel m/s², seconds the curvature has been hot,
+    # cooldown-until]. The planner writes this. A swap clears it.
+    drop_state: list | None = None
     # Filter state. None until the first measurement.
     _kf_r: float = 0.0
     _kf_rd: float = 0.0
@@ -158,6 +160,12 @@ class Track:
     _kf_p11: float = 0.0
     _kf_n: int = 0
     _kf_t: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.route_gaps is None:
+            self.route_gaps = []
+        if self.drop_state is None:
+            self.drop_state = [0.0, 0.0, 0.0]
 
 
 class IoUTracker:
@@ -204,6 +212,16 @@ class IoUTracker:
             unmatched.discard(best_i)
             if tr.samples is None:
                 tr.samples = []
+            if tr.route_gaps is None:
+                tr.route_gaps = []
+            if tr.drop_state is None:
+                tr.drop_state = [0.0, 0.0, 0.0]
+            # A swap stays one track (the match gate is 6 m) but it is not
+            # the same gap. Drop the route baseline so the jump is not a brake.
+            if tr.samples and abs(float(d.y) - float(tr.samples[-1][1])) >= _ROUTE_RESET_M:
+                tr.route_gaps.clear()
+                for i in range(len(tr.drop_state)):
+                    tr.drop_state[i] = 0.0
             tr.samples.append((float(now), float(d.y)))
             _trim_samples(tr.samples, float(now))
             _measure_track(tr, float(d.y), float(now), ego)
@@ -259,7 +277,12 @@ class IoUTracker:
                 "range_rate_valid": bool(t.range_rate_valid),
                 # Positive when the retained window's range has decreased.
                 "range_drop_m": _range_drop_m(t.samples),
-                "gap_drop_brake": bool(t.gap_drop_brake),
+                # Same objects the planner appends to. A copy would forget
+                # the route gap on the next frame.
+                "samples": t.samples if t.samples is not None else [],
+                "route_gaps": t.route_gaps if t.route_gaps is not None else [],
+                "drop_state": t.drop_state if t.drop_state is not None else [0.0, 0.0, 0.0],
+                "close_hold_s": t.close_hold_s,
                 "yaw_rate": t.yaw_rate,
                 "hits": t.hits,
                 "misses": t.misses,
@@ -292,6 +315,21 @@ def _measure_track(tr: Track, measured_m: float, now: float, ego: float) -> None
         tr.speed_mps = 0.0
         return
     dt = max(1e-3, float(now) - float(tr._kf_t))
+    predicted = tr._kf_r + dt * tr._kf_rd
+    # A settled track that jumps by more than a ±2 m grab can explain is a
+    # teleport, not a new closing speed. Keep the rate. The new range is
+    # the baseline. A 4 m swap is smaller than that and goes through the
+    # filter, so a real close is not mistaken for a pace.
+    if tr.range_rate_valid and abs(float(measured_m) - predicted) >= _RATE_SNAP_M:
+        tr._kf_r = float(measured_m)
+        tr._kf_p00 = max(tr._kf_p00, MEASURE_SIGMA_M * MEASURE_SIGMA_M)
+        tr._kf_t = float(now)
+        tr._kf_n += 1
+        tr.range_rate_mps = float(tr._kf_rd)
+        tr.range_rate_sigma = float(math.sqrt(max(0.0, tr._kf_p11)))
+        tr.speed_mps = float(max(0.0, min(_SPEED_CAP, ego + tr.range_rate_mps)))
+        _bump_close_hold(tr, dt)
+        return
     tr._kf_r, tr._kf_rd, tr._kf_p00, tr._kf_p01, tr._kf_p11 = _kalman_update(
         tr._kf_r, tr._kf_rd, tr._kf_p00, tr._kf_p01, tr._kf_p11, measured_m, dt,
     )
@@ -305,9 +343,24 @@ def _measure_track(tr: Track, measured_m: float, now: float, ego: float) -> None
     tr.range_rate_valid = sigma <= _RATE_VALID_SIGMA
     if tr.range_rate_valid:
         tr.speed_mps = float(max(0.0, min(_SPEED_CAP, ego + tr.range_rate_mps)))
+        _bump_close_hold(tr, dt)
     else:
         tr.speed_mps = 0.0
-    _gap_drop_update(tr, float(now))
+        tr.close_hold_s = 0.0
+
+
+def _bump_close_hold(tr: Track, dt: float) -> None:
+    """Accumulate a close only while the filtered rate stays fast.
+
+    A frame between the arm line and an opening does not wipe the hold.
+    An opening does.
+    """
+    if tr.range_rate_mps <= _CLOSE_ARM_MPS:
+        tr.close_hold_s = float(tr.close_hold_s) + dt
+    elif tr.range_rate_mps > _CLOSE_OPEN_MPS:
+        tr.close_hold_s = 0.0
+    else:
+        tr.close_hold_s = max(0.0, float(tr.close_hold_s) - dt)
 
 
 def _trim_samples(samples: list[tuple[float, float]], now: float) -> None:
@@ -319,75 +372,6 @@ def _trim_samples(samples: list[tuple[float, float]], now: float) -> None:
     if len(keep) > _SAMPLE_KEEP:
         keep = keep[-_SAMPLE_KEEP:]
     samples[:] = keep
-
-
-def _pace_stats(
-    pace: list[tuple[float, float]],
-) -> tuple[float, float, float] | None:
-    """High-frequency residual, peak-to-peak, and mean of a pace window.
-
-    The window has to be long enough that a reflected walk cannot hide its
-    crest in it. Peak-to-peak is the flatness test. A median step is not:
-    ±0.5 m noise moves that median by metres per second.
-    """
-    span = pace[-1][0] - pace[0][0]
-    if span < 0.80 or len(pace) < 4:
-        return None
-    slope = (pace[-1][1] - pace[0][1]) / span
-    res: list[float] = []
-    for a, b in zip(pace, pace[1:]):
-        dt = b[0] - a[0]
-        res.append(b[1] - a[1] - slope * max(dt, 0.0))
-    hf = math.sqrt(sum(v * v for v in res) / len(res)) if res else 0.0
-    ys = [y for _, y in pace]
-    return hf, max(ys) - min(ys), sum(ys) / len(ys)
-
-
-def _gap_drop_update(tr: Track, now: float) -> None:
-    """Latch a full stop when a quiet paced gap breaks.
-
-    The baseline is the mean range from about 1 s to 2 s ago, and only
-    while that window is flat. The recent mean is the last 0.4 s. A drop
-    past 1.5 m, widened by the residual of a noisy pace, is a lead that
-    has started braking. The latch stays until the gap comes back, so one
-    frame of braking does not erase the baseline. A window that was never
-    flat (a steady close, a stopped lead) does not latch.
-    """
-    samples = tr.samples or []
-    recent = [
-        (t, y)
-        for t, y in samples
-        if math.isfinite(y) and 0.0 <= now - t <= _PACE_RECENT_S + 1e-9
-    ]
-    pace = [
-        (t, y)
-        for t, y in samples
-        if math.isfinite(y) and _PACE_OLD_LO_S - 1e-9 <= now - t <= _PACE_OLD_HI_S + 1e-9
-    ]
-    rm = None
-    if len(recent) >= 3:
-        rm = sum(y for _, y in recent) / len(recent)
-    held = tr._pace_hold
-    if held is None and rm is not None and len(pace) >= 4:
-        stats = _pace_stats(pace)
-        if stats is not None:
-            hf, span_y, pm = stats
-            # Peak-to-peak, not the median step. ±0.5 m noise moves the
-            # median step by a couple of metres per second and would hide
-            # a real brake. A reflected walk over this long a window still
-            # covers more than 1.25 m. A quiet ±0.5 m pace does not.
-            flat = span_y <= _PACE_FLAT_SPAN_M
-            if hf <= _PACE_HF_MAX and flat:
-                mean_sigma = hf * math.sqrt(1.0 / len(recent) + 1.0 / len(pace))
-                thresh = max(_PACE_DROP_M, _PACE_DROP_KSIG * mean_sigma)
-                if pm - rm > thresh:
-                    held = (float(pm), float(thresh))
-    if held is not None and rm is not None:
-        pm, thresh = held
-        if rm > pm - 0.4 * thresh:
-            held = None
-    tr._pace_hold = held
-    tr.gap_drop_brake = held is not None
 
 
 def _range_drop_m(samples: list[tuple[float, float]] | None) -> float:

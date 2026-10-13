@@ -70,6 +70,33 @@ _CLOSING_K = 0.85
 # brake until the car is stopped, even when the close has fallen off.
 # It is the standoff box in front of the bumper, not a lead-gap gate.
 _VRU_HOLD_M = STANDOFF_M + VEHICLE_LENGTH * 0.5
+# A slower lead is matched only after the filtered close has held this
+# long. Correlated range noise reaches a second of mild closing and lets
+# go. A real 2 m/s close does not.
+_CLOSE_HOLD_S = 1.5
+# Route-gap drop. Two slopes on a short moving average. A lead that keeps
+# braking bends the gap for as long as the bend lasts. A constant-rate
+# close is not a quiet pace first, so it never arms this term.
+_DROP_WIN_S = 0.40
+_DROP_ARM_A = 2.2
+# 15 Hz ±0.5 m reaches this and then dips. 0.28 s waited for one more
+# frame that the dip ate, and a 20 m lead was already inside the stop.
+_DROP_ARM_S = 0.22
+# Flat or opening. The pedal comes off as soon as the route slope is here,
+# and also when the filtered range-rate is. The level of the gap is not a brake.
+_DROP_RELEASE = -0.25
+# A 1.2 m wave with a 4 s period reaches about −1.9 m/s and no steeper.
+# The command stays off until the route gap is closing faster than that,
+# so the wave can arm nothing that the pedals can feel.
+_DROP_EMIT_MPS = -2.05
+# Under the 0.99 line that promotes aeb. The drop alone must not disengage.
+_DROP_CAP = 0.98
+_SWAP_JUMP_M = 2.2
+# Peak-to-peak of the pace behind the drop. ±0.5 m still fits. A sine of
+# 1.2 m over the same stretch does not, so the wave never arms.
+_QUIET_SPAN_M = 1.35
+_STEP_JUMP_M = 1.45
+_STEP_COOL_S = 0.60
 _SIGN_MISS_MAX = 8
 _PARTIAL_GATE_M = 1.6
 _TURN_RAD = 0.35
@@ -180,7 +207,7 @@ def predict_path(
 
     # On the full route, before a lead trims it. The trimmed end sits short
     # of the bumper, and a lateral test against that end would miss the car.
-    asked_brake = _lead_range_brake(tracks or [], route, float(ego_speed_mps))
+    kalman_brake, drop_brake = _lead_range_brake(tracks or [], route, float(ego_speed_mps))
     curv = ring_curv if prediction == "roundabout" and ring_curv > 1e-4 else _path_curvature(path)
     occupants = _predict_occupants(tracks or [])
     path, stop_reason, cipv_id, ttc, occupied, stop_dist, closing = _apply_scene(
@@ -200,16 +227,15 @@ def predict_path(
         signs=signs or [],
         path=path,
     )
-    # Required decel from the conservative closing speed and the gap
-    # past the reserve. Partial while the request is small, full when
-    # the gap itself cannot be held at 8 m/s². No 8/12/4.5 m wall.
+    # Kalman required-decel can still be a full stop. A route-gap drop is
+    # graded and capped under that, so it cannot promote aeb on its own.
     range_brake = 0.0
     if aeb != "brake":
-        if asked_brake >= 0.99:
+        if kalman_brake >= 0.99:
             aeb = "brake"
             target = 0.0
-        elif asked_brake > 0.0:
-            range_brake = asked_brake
+        else:
+            range_brake = max(kalman_brake, min(_DROP_CAP, drop_brake))
     conf = _confidence(prediction, float(lane_conf), extended=extended or used_prior)
     plan = PathPlan(
         path_ego=path,
@@ -842,16 +868,221 @@ def _required_brake(gap_m: float, rate_mps: float, sigma_mps: float) -> float:
     return max(0.0, min(1.0, a_req / _BRAKE_DECEL))
 
 
-def _lead_range_brake(tracks: list, path: list[dict[str, float]], ego_speed_mps: float) -> float:
-    """Strongest in-path vehicle brake from the range/range-rate law.
+def _route_station(path: list[dict[str, float]], x: float, y: float) -> float | None:
+    """Arc length to the closest point on the polyline, not the nearest vertex."""
+    if len(path) < 2:
+        return None
+    best_d = 1e18
+    best_s = None
+    travelled = 0.0
+    for a, b in zip(path, path[1:]):
+        ax = _num(a.get("x"))
+        ay = _num(a.get("y"))
+        bx = _num(b.get("x"))
+        by = _num(b.get("y"))
+        if ax is None or ay is None or bx is None or by is None:
+            continue
+        dx = bx - ax
+        dy = by - ay
+        seg2 = dx * dx + dy * dy
+        seg = math.sqrt(seg2) if seg2 > 0.0 else 0.0
+        if seg2 < 1e-12:
+            t = 0.0
+        else:
+            t = ((x - ax) * dx + (y - ay) * dy) / seg2
+            if t < 0.0:
+                t = 0.0
+            elif t > 1.0:
+                t = 1.0
+        px = ax + t * dx
+        py = ay + t * dy
+        dist = (px - x) ** 2 + (py - y) ** 2
+        if dist < best_d:
+            best_d = dist
+            best_s = travelled + seg * t
+        travelled += seg
+    return best_s
+
+
+def _window_points(
+    series: list, now: float, window: float,
+) -> list[tuple[float, float]]:
+    out: list[tuple[float, float]] = []
+    for item in series:
+        if not isinstance(item, (tuple, list)) or len(item) < 2:
+            continue
+        t = _num(item[0])
+        s = _num(item[1])
+        if t is None or s is None:
+            continue
+        if now - window - 1e-9 <= t <= now + 1e-6:
+            out.append((t, s))
+    return out
+
+
+def _ls_slope(pts: list[tuple[float, float]]) -> float | None:
+    if len(pts) < 3:
+        return None
+    span = pts[-1][0] - pts[0][0]
+    if span < 0.12:
+        return None
+    n = float(len(pts))
+    mt = sum(t for t, _ in pts) / n
+    ms = sum(s for _, s in pts) / n
+    var_t = sum((t - mt) ** 2 for t, _ in pts)
+    if var_t < 1e-8:
+        return None
+    cov = sum((t - mt) * (s - ms) for t, s in pts)
+    return cov / var_t
+
+
+def _smooth_gap(series: list, k: int = 3) -> list[tuple[float, float]]:
+    """Causal moving average so one noisy grab does not flip the curvature."""
+    raw: list[tuple[float, float]] = []
+    for item in series:
+        if not isinstance(item, (tuple, list)) or len(item) < 2:
+            continue
+        t = _num(item[0])
+        s = _num(item[1])
+        if t is None or s is None:
+            continue
+        raw.append((t, s))
+    out: list[tuple[float, float]] = []
+    for i, (t, _s) in enumerate(raw):
+        chunk = raw[max(0, i - k + 1): i + 1]
+        out.append((t, sum(v for _, v in chunk) / len(chunk)))
+    return out
+
+
+def _quiet_pace(series: list, now: float) -> bool:
+    """The gap behind this window was holding, not wandering or oscillating."""
+    old = _window_points(series, now - 0.50, 0.80)
+    if len(old) < 4 or old[-1][0] - old[0][0] < 0.35:
+        return False
+    vals = [s for _, s in old]
+    return max(vals) - min(vals) <= _QUIET_SPAN_M
+
+
+def _record_route_gap(raw: dict[str, Any], station: float, now: float) -> list | None:
+    """Append this frame's arc station. A swap clears the list first."""
+    series = raw.get("route_gaps")
+    state = raw.get("drop_state")
+    if not isinstance(series, list) or not isinstance(state, list) or len(state) < 2:
+        return None
+    if series:
+        prev_t = _num(series[-1][0]) if isinstance(series[-1], (tuple, list)) and series[-1] else None
+        prev_s = _num(series[-1][1]) if isinstance(series[-1], (tuple, list)) and len(series[-1]) > 1 else None
+        if prev_t is not None and abs(prev_t - now) < 1e-4:
+            return series
+        if prev_s is not None and abs(station - prev_s) >= _SWAP_JUMP_M:
+            series.clear()
+            for i in range(len(state)):
+                state[i] = 0.0
+    series.append((float(now), float(station)))
+    if len(series) > 48:
+        del series[:-48]
+    return series
+
+
+def _drop_brake(raw: dict[str, Any], station: float, now: float) -> float:
+    """Graded brake from how fast the route gap is curving closed.
+
+    Arms only after a quiet pace, and only once the curvature has held.
+    A one-frame step starts a cooldown instead of a stop. A swap clears
+    the series before this runs. The command is 0 as soon as the route
+    slope is flat or the filtered range-rate is flat or opening. Nothing
+    here is stored as a full stop, and nothing here sets ``aeb``.
+    """
+    series = _record_route_gap(raw, station, now)
+    state = raw.get("drop_state")
+    if series is None or not isinstance(state, list) or len(state) < 2:
+        return 0.0
+    while len(state) < 3:
+        state.append(0.0)
+    smooth = _smooth_gap(series, 3)
+    slope = _ls_slope(_window_points(smooth, now, _DROP_WIN_S))
+    prev = _ls_slope(_window_points(smooth, now - _DROP_WIN_S, _DROP_WIN_S))
+    a_lead = 0.0
+    if slope is not None and prev is not None:
+        a_lead = max(0.0, -(slope - prev) / _DROP_WIN_S)
+    if not math.isfinite(a_lead):
+        a_lead = 0.0
+    rate = _num(raw.get("range_rate_mps"))
+    valid = raw.get("range_rate_valid") is True
+    flat_rate = valid and rate is not None and rate >= _DROP_RELEASE
+    if slope is None or slope >= _DROP_RELEASE:
+        state[0] = 0.0
+        state[1] = 0.0
+        if len(state) > 3:
+            state[3] = 0.0
+        return 0.0
+    # A single grab. Do not let the smoothed slope treat it as a lead brake.
+    if len(series) >= 2:
+        prev_s = _num(series[-2][1]) if isinstance(series[-2], (tuple, list)) else None
+        curr_s = _num(series[-1][1]) if isinstance(series[-1], (tuple, list)) else None
+        if prev_s is not None and curr_s is not None and prev_s - curr_s >= _STEP_JUMP_M:
+            state[2] = float(now) + _STEP_COOL_S
+            if (_num(state[0]) or 0.0) < 1.0:
+                state[1] = 0.0
+                a_lead = 0.0
+    dt = 0.1
+    if len(series) >= 2:
+        t1 = _num(series[-1][0])
+        t0 = _num(series[-2][0])
+        if t1 is not None and t0 is not None:
+            dt = max(1e-3, min(0.25, t1 - t0))
+    locked = _num(state[0]) or 0.0
+    hot = _num(state[1]) or 0.0
+    cool = _num(state[2]) or 0.0
+    if now < cool and locked < 1.0:
+        hot = 0.0
+        a_lead = 0.0
+    if a_lead >= _DROP_ARM_A and (locked >= 1.0 or _quiet_pace(series, now)):
+        hot += dt
+    elif locked < 1.0 and a_lead < 1.0:
+        # A dip under the arm line still belongs to the same bend. Only a
+        # curvature that has actually gone away gives the timer back.
+        hot = max(0.0, hot - dt)
+    if hot >= _DROP_ARM_S and a_lead >= 2.2:
+        # A real brake's curvature is noisy at ±0.5 m, so the first lock
+        # is at least 5 m/s². It still cannot promote aeb: the cap is 0.98.
+        locked = min(7.6, max(locked, a_lead, 5.0))
+    state[0] = float(locked)
+    state[1] = float(hot)
+    # Filtered rate ~0 or opening: the pedal is off this frame.
+    # A slope a 1.2 m wave can reach is off too. The lock can stay, but
+    # it does not hold a stop once the bend is no steeper than that wave.
+    if flat_rate or locked < 1.0 or slope > _DROP_EMIT_MPS:
+        return 0.0
+    if station <= _RANGE_RESERVE_M:
+        return _DROP_CAP
+    usable = max(0.25, station - _RANGE_RESERVE_M)
+    closing = max(0.0, -slope)
+    # The locked decel is for a lead braking inside the distance a pace
+    # at 18 m/s can still stop. Farther out, the same curvature is what
+    # correlated noise does to a 27 m gap, and it must not be a stop.
+    lead_a = min(locked, 7.6) if station <= 18.0 else 0.0
+    a_req = lead_a + (closing * closing) / (2.0 * usable)
+    if not math.isfinite(a_req):
+        return 0.0
+    return max(0.0, min(_DROP_CAP, a_req / _BRAKE_DECEL))
+
+
+def _lead_range_brake(
+    tracks: list, path: list[dict[str, float]], ego_speed_mps: float,
+) -> tuple[float, float]:
+    """Kalman brake, and a graded route-gap brake that cannot arm AEB alone.
 
     Anything still in front of the bumper counts, including a lead under
-    4 m. Confirmed and unconfirmed leads both use the same law.
+    4 m. Confirmed and unconfirmed leads both use the same Kalman law.
+    The second value uses arc distance along ``path``. Ego-frame y shrinks
+    in a curve while that arc length does not, so a bend is not a drop.
     """
     ego = _num(ego_speed_mps)
     if not path or ego is None or ego < 0.05:
-        return 0.0
-    asked = 0.0
+        return 0.0, 0.0
+    kalman = 0.0
+    drop = 0.0
     for raw in tracks or []:
         if not isinstance(raw, dict):
             continue
@@ -867,13 +1098,19 @@ def _lead_range_brake(tracks: list, path: list[dict[str, float]], ego_speed_mps:
         if not vehicle_on_route(x, y, path, half):
             continue
         rate, sigma = _rate_and_sigma(raw, ego_speed_mps)
-        asked = max(asked, _required_brake(y, rate, sigma))
-        # A quiet pace that then drops is a lead braking harder than the
-        # filter has admitted. The stop that keeps the gap is full: the
-        # 1.5 m break is already most of a second of lead deceleration.
-        if raw.get("gap_drop_brake") is True:
-            asked = max(asked, 1.0)
-    return asked
+        station = _route_station(path, x, y)
+        # The filter is on ego-frame range. Its brake stays on that range.
+        # The drop below is the arc length, which does not shrink in a bend.
+        kalman = max(kalman, _required_brake(y, rate, sigma))
+        samples = raw.get("samples")
+        now = None
+        if isinstance(samples, list) and samples:
+            last = samples[-1]
+            if isinstance(last, (tuple, list)) and last:
+                now = _num(last[0])
+        if station is not None and now is not None:
+            drop = max(drop, _drop_brake(raw, station, now))
+    return kalman, drop
 
 
 def _predict_occupants(tracks: list) -> list[dict[str, Any]]:
@@ -936,6 +1173,7 @@ def _predict_occupants(tracks: list) -> list[dict[str, Any]]:
                 "partial": partial,
                 "speed_mps": speed,
                 "range_rate_sigma": sigma,
+                "close_hold_s": raw.get("close_hold_s") or 0.0,
             }
         )
     return out
@@ -995,6 +1233,9 @@ def _apply_scene(
         # side of the same sigma. A pedestrian or bike already inside the
         # stop box still counts.
         optimistic = closing - _CLOSING_K * sigma
+        # Under about 1 m/s of closing past the noise, the mean is a wander,
+        # not a car we have to stop for. The range law still brakes a real
+        # close. Cutting the path here used to turn that wander into a wall.
         if optimistic <= 0.4 and float(occ["y"]) > 4.0:
             if kind not in _VRU:
                 continue
@@ -1005,13 +1246,24 @@ def _apply_scene(
         cut_s = station[idx] - back
         occupied.append(dict(occ))
         ttc = None if closing <= 0.05 else max(0.0, cut_s) / max(closing, 0.1)
+        # A closing rate has to hold before we match it. A correlated
+        # wander crosses 1 m/s and lets go. A real slower lead does not.
+        try:
+            hold_s = float(occ.get("close_hold_s") or 0.0)
+        except (TypeError, ValueError):
+            hold_s = 0.0
+        if not math.isfinite(hold_s):
+            hold_s = 0.0
+        reported = closing
+        if kind not in _VRU and hold_s < _CLOSE_HOLD_S and closing < 3.5:
+            reported = min(closing, 0.9)
         ident = occ.get("id")
         try:
             ident = None if ident is None else int(ident)
         except (TypeError, ValueError):
             ident = None
         reason = kind if kind in ("pedestrian", "bike") else "vehicle"
-        cuts.append((cut_s, reason, ident, ttc, closing))
+        cuts.append((cut_s, reason, ident, ttc, reported))
 
     for raw in signs or []:
         if not isinstance(raw, dict):
@@ -1168,7 +1420,15 @@ def _speed_flags(
         if stop_reason == "yield":
             target = min(target, max(1.5, 0.45 * dist))
         else:
-            target = min(target, math.sqrt(max(0.0, 2.0 * _COMFORT_DECEL * dist)))
+            close_now = 0.0 if closing is None else closing
+            lead_v = float(ego_speed_mps) - close_now
+            # Stop-distance speed is for a fixed obstacle. A lead that still
+            # has road speed is matched. Treating it as a wall is what turned
+            # a correlated range wander into a multi-second slowdown.
+            if lead_v > 1.0:
+                target = min(target, lead_v)
+            else:
+                target = min(target, math.sqrt(max(0.0, 2.0 * _COMFORT_DECEL * dist)))
     limit = _limit_mps(signs, path)
     if limit is not None:
         target = min(target, max(0.0, limit))

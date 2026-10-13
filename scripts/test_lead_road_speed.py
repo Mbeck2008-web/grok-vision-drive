@@ -221,28 +221,87 @@ def check_step_and_random_noise_do_not_full_brake() -> None:
     assert full == 0, full
 
 
-def check_fast_close_stops_with_margin() -> None:
-    """Ego 18 m/s, lead first seen at 30 m, must stop before the lead.
+def _full(plan, cmd) -> bool:
+    return plan.aeb == "brake" or cmd.brake >= 0.99
 
-    Waiting six grabs at 10 Hz spends the gap. A clean close confirms
-    sooner, and the unconfirmed gap already grades the brake.
+
+def check_ramp_and_reflected_do_not_full_brake() -> None:
+    """A 0.5 m ramp and a reflected walk inside 16±2 are not a close.
+
+    Five even steps from 18 m to 14 m fit a slope. That slope used to
+    full-brake a lead that never left the noise band. A 14→18 jump used
+    to miss the 4 m gate and leave the first track braking.
     """
-    def margin(hz: float) -> float:
+    ego = 12.0
+    ramp = [18.0 - 0.5 * i for i in range(9)]
+    assert ramp[0] == 18.0 and ramp[-1] == 14.0
+    for hz in (10.0, 15.0):
+        dt = 1.0 / hz
+        tracker = IoUTracker()
+        t = 0.0
+        for i, y in enumerate(ramp):
+            plan, cmd = _drive(tracker, y, t, ego, i)
+            assert not _full(plan, cmd), (hz, i, y, plan.aeb, cmd.brake)
+            assert len(tracker.tracks) == 1, (hz, i, len(tracker.tracks))
+            t += dt
+
+    rng = random.Random(81)
+    full = 0
+    for _trial in range(300):
+        for hz in (10.0, 15.0):
+            dt = 1.0 / hz
+            y = 16.0
+            sign = -1.0 if rng.random() < 0.5 else 1.0
+            noisy = IoUTracker()
+            t = 0.0
+            hit = False
+            for i in range(24):
+                y += sign * 0.5
+                if y > 18.0:
+                    y = 18.0 - (y - 18.0)
+                    sign = -1.0
+                elif y < 14.0:
+                    y = 14.0 + (14.0 - y)
+                    sign = 1.0
+                y = min(18.0, max(14.0, y))
+                plan, cmd = _drive(noisy, y, t, ego, i)
+                if _full(plan, cmd) or len(noisy.tracks) != 1:
+                    hit = True
+                    break
+                t += dt
+            if hit:
+                full += 1
+                break
+    assert full == 0, full
+
+    jumped = IoUTracker()
+    _drive(jumped, 14.0, 0.0, ego, 0)
+    plan, cmd = _drive(jumped, 18.0, 0.1, ego, 1)
+    assert len(jumped.tracks) == 1, len(jumped.tracks)
+    assert jumped.tracks[0].misses == 0
+    assert not _full(plan, cmd), (plan.aeb, cmd.brake)
+
+
+def check_noisy_close_stops_with_margin() -> None:
+    """Ego 18 m/s, lead first seen at 30 m, ±0.5 m and ±1 m, must stop.
+
+    The rate may never clear the noise. The brake is the decel the gap
+    asks for, so the stop does not wait on a fit.
+    """
+    def margin(hz: float, noise: float, seed: int) -> float:
+        rng = random.Random(seed)
         dt = 1.0 / hz
         ego = 18.0
         s = 0.0
         lead = 30.0
         t = 0.0
         tracker = IoUTracker()
-        saw = False
-        for i in range(int(8 * hz) + 2):
-            y = lead - s
-            assert y > 0.0, (hz, t, y)
-            plan, cmd = _drive(tracker, y, t, ego, i)
-            if cmd.brake >= 0.3:
-                saw = True
-            if cmd.brake >= 0.99:
-                assert tracker.tracks[0].range_rate_valid is True
+        for i in range(int(10 * hz) + 2):
+            true_y = lead - s
+            if true_y <= 0.0:
+                return true_y
+            y = max(0.4, true_y + rng.uniform(-noise, noise))
+            _plan, cmd = _drive(tracker, y, t, ego, i)
             a = _decel(cmd.brake)
             if ego <= 0.05 or (a > 1e-6 and a * dt >= ego):
                 if a > 1e-6:
@@ -252,13 +311,67 @@ def check_fast_close_stops_with_margin() -> None:
             s += ego * dt - 0.5 * a * dt * dt
             ego = max(0.0, ego - a * dt)
             t += dt
-        assert ego <= 0.05, (hz, ego, lead - s)
-        assert saw, hz
+        assert ego <= 0.05, (hz, noise, seed, ego, lead - s)
         return lead - s
 
-    for hz in (10.0, 15.0):
-        left = margin(hz)
-        assert left >= 3.0, (hz, left)
+    for noise in (0.5, 1.0):
+        for hz in (10.0, 15.0):
+            left = [margin(hz, noise, 1000 + trial) for trial in range(40)]
+            worst = min(left)
+            assert worst >= 2.0, (hz, noise, worst, left)
+
+
+def check_close_vehicle_and_first_pedestrian_brake() -> None:
+    """A vehicle at 3.9 m brakes. A first pedestrian at 12 m is AEB."""
+    ego = 12.0
+    close = predict_path(
+        lanes_bev=_lanes(),
+        lane_conf=0.9,
+        ego_speed_mps=ego,
+        tracks=[{
+            "class": "vehicle",
+            "x": 0.0,
+            "y": 3.9,
+            "yaw": math.pi / 2,
+            "speed_mps": 0.0,
+            "range_rate_valid": False,
+        }],
+    )
+    close_cmd = follow_path(close, ego_speed_mps=ego, seq=0)
+    assert close_cmd.throttle == 0.0, close_cmd
+    assert close_cmd.brake >= 0.99, close_cmd
+
+    person = predict_path(
+        lanes_bev=_lanes(),
+        lane_conf=0.9,
+        ego_speed_mps=ego,
+        tracks=[{
+            "class": "pedestrian",
+            "x": 0.0,
+            "y": 12.0,
+            "yaw": math.pi / 2,
+            "speed_mps": 0.0,
+            "range_rate_valid": False,
+        }],
+    )
+    person_cmd = follow_path(person, ego_speed_mps=ego, seq=1)
+    assert person.aeb == "brake", person.aeb
+    assert person_cmd.brake >= 0.99, person_cmd
+    rider = predict_path(
+        lanes_bev=_lanes(),
+        lane_conf=0.9,
+        ego_speed_mps=ego,
+        tracks=[{
+            "class": "bike",
+            "x": 0.0,
+            "y": 12.0,
+            "yaw": math.pi / 2,
+            "speed_mps": 0.0,
+            "range_rate_valid": False,
+        }],
+    )
+    rider_cmd = follow_path(rider, ego_speed_mps=ego, seq=2)
+    assert rider.aeb == "brake" and rider_cmd.brake >= 0.99, (rider.aeb, rider_cmd.brake)
 
 
 def check_faster_lead_is_not_closing() -> None:
@@ -279,7 +392,9 @@ def main() -> None:
     check_slower_lead_aeb()
     check_noisy_range_rate_does_not_aeb()
     check_step_and_random_noise_do_not_full_brake()
-    check_fast_close_stops_with_margin()
+    check_ramp_and_reflected_do_not_full_brake()
+    check_noisy_close_stops_with_margin()
+    check_close_vehicle_and_first_pedestrian_brake()
     check_faster_lead_is_not_closing()
     print("test_lead_road_speed: OK")
 

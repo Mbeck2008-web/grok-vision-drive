@@ -525,6 +525,19 @@ def plan_command(
         else:
             throttle = 0.12 if target_v > 1.0 else 0.0
 
+    # Range-only brake. The speed-error term above stops at 0.6, which
+    # cannot halt 18 m/s inside 30 m. This one scales with v²/2·gap and
+    # may be 1.0. Throttle stays off while it is asking for brake.
+    raw_range = planner.get("range_brake")
+    if raw_range is not None:
+        try:
+            asked = max(0.0, min(1.0, float(raw_range)))
+        except (TypeError, ValueError):
+            asked = 0.0
+        if asked > 1e-6:
+            throttle = 0.0
+            brake = max(brake, asked)
+
     return DriveCommand(
         steer=steer, throttle=throttle, brake=brake, seq=seq, reason="plan", blinker=blinker,
     )

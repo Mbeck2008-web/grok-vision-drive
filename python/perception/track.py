@@ -8,18 +8,19 @@ from python.perception.detect import Detection
 
 # speed_mps on a track is road speed, not |Δrange/Δt|.
 _SPEED_CAP = 40.0
-# A clean, even close can confirm in this many grabs. A noisier fit waits
-# for ``_RATE_MIN``. Either way the slope has to be a line, not one step.
-_RATE_FAST = 5
-_RATE_MIN = 6
-_RATE_WINDOW = 8
-# ±2 m of grab noise sits near 1 m RMSE. A real range line does not.
-_RMSE_MAX = 0.55
-# Fast confirm: successive range steps match each other, and each step is
-# a real close (15 Hz at 18 m/s is 1.2 m; 10 Hz at 9 m/s is 0.9 m).
-_FAST_STEP_TOL = 0.20
-_FAST_MIN_STEP_M = 0.45
-_FAST_RMSE_MAX = 0.15
+# Least squares over about a second. A 5-grab ramp inside ±2 m is the same
+# shape as a real close, so a short fit never becomes a range-rate.
+_RATE_MIN_N = 8
+_RATE_MIN_SPAN_S = 0.7
+_RATE_WINDOW = 16
+# ±2 m of range noise can walk 18 m down to 14 m. A closing rate has to
+# move farther than that band, and the slope has to beat its own stderr.
+_CLOSE_NET_M = 4.5
+_SLOPE_SIGMA = 3.0
+# A same-lane lead can jump 4 m between grabs when each one is ±2 m off.
+# The old 4 m gate missed that jump, left the first track coasting, and
+# the coast kept the brake it had already armed.
+_MATCH_GATE_M = 6.0
 
 
 def lead_road_speed(ego_speed_mps: float, dy_m: float, dt_s: float) -> tuple[float, float]:
@@ -64,105 +65,30 @@ def _fit_range_rate(samples: list[tuple[float, float]]) -> tuple[float, float, f
     return float(slope), float(rmse), float(se)
 
 
-def _range_steps(ys: list[float]) -> list[float]:
-    return [ys[i + 1] - ys[i] for i in range(len(ys) - 1)]
-
-
-def _steps_agree(ys: list[float], *, closing: bool) -> bool:
-    """True when every step moves the same way by about the same amount."""
-    ds = _range_steps(ys)
-    if len(ds) < _RATE_FAST - 1:
-        return False
-    if closing:
-        if any(d >= -_FAST_MIN_STEP_M for d in ds):
-            return False
-    elif any(d <= _FAST_MIN_STEP_M for d in ds):
-        return False
-    mean = sum(ds) / len(ds)
-    span = _FAST_STEP_TOL * abs(mean)
-    return all(abs(d - mean) <= span for d in ds)
-
-
-def _one_step(ys: list[float]) -> bool:
-    """True when one jump, not a steady trend, carries the range change.
-
-    Three samples at +2 m then three at −2 m fit about −10 m/s. The range
-    is flat on both sides of that single step.
-    """
-    ds = _range_steps(ys)
-    if len(ds) < 2:
-        return False
-    net = ys[-1] - ys[0]
-    if abs(net) < 0.5:
-        return False
-    biggest = max(ds, key=abs)
-    others = abs(net) - abs(biggest)
-    return abs(biggest) > 0.65 * abs(net) and others < 0.5 * abs(biggest)
-
-
-def _regular_close(ys: list[float]) -> bool:
-    """True when the range steps are a steady close, not a noisy walk.
-
-    A random ±2 m walk can still sit on a straight line for six grabs.
-    Those steps are uneven. A real close keeps moving the same way, including
-    after the car is already braking and each step gets smaller.
-    """
-    ds = _range_steps(ys)
-    if len(ds) < 4:
-        return False
-    # One grab jumping back out is noise. A brake curve only shrinks the step.
-    if any(d > 0.15 for d in ds):
-        return False
-    mean = sum(ds) / len(ds)
-    if mean >= -0.05:
-        return False
-    var = sum((d - mean) ** 2 for d in ds) / len(ds)
-    return var ** 0.5 <= 0.30
-
-
-def _trend_agrees(ys: list[float], slope: float) -> bool:
-    ds = _range_steps(ys)
-    if slope < 0.0:
-        good = sum(d < -0.2 for d in ds)
-        bad = sum(d > 0.2 for d in ds)
-    else:
-        good = sum(d > 0.2 for d in ds)
-        bad = sum(d < -0.2 for d in ds)
-    return good >= 3 and good > bad
-
-
 def consistent_range_rate(samples: list[tuple[float, float]]) -> tuple[bool, float]:
-    """Range-rate once the grabs agree on a line. Otherwise not valid.
+    """Range-rate from a long least-squares line, or not valid yet.
 
-    A +2/−2 step over six grabs fits about −10 m/s with no residual check,
-    and that slope full-brakes a lead that is not closing. The slope is
-    used only when the line is tight, or when every recent step is a real
-    close of about the same size. One step does not confirm.
+    Five grabs of a 0.5 m ramp fit a clean slope and are still just ±2 m of
+    noise on a lead that is not moving. The fit has to cover most of a
+    second, the slope has to clear its stderr, and a closing call has to
+    move the range by more than that noise band. Full braking does not use
+    this flag: a short gap brakes from the range alone.
     """
-    if len(samples) < _RATE_FAST:
+    if len(samples) < _RATE_MIN_N:
         return False, 0.0
     window = samples[-_RATE_WINDOW:]
-    ys = [y for _, y in window]
-    # Even steps first, so a hard close is confirmed before six noisy grabs.
-    if len(ys) >= _RATE_FAST and _steps_agree(ys[-_RATE_FAST:], closing=True):
-        slope, rmse, _se = _fit_range_rate(window[-_RATE_FAST:])
-        if slope < -3.0 and rmse <= _FAST_RMSE_MAX:
-            return True, float(slope)
-    if len(window) < _RATE_MIN:
+    if window[-1][0] - window[0][0] < _RATE_MIN_SPAN_S:
         return False, 0.0
-    slope, rmse, se = _fit_range_rate(window)
-    if rmse > _RMSE_MAX or _one_step(ys):
+    slope, _rmse, se = _fit_range_rate(window)
+    if se > 1e-6 and abs(slope) < _SLOPE_SIGMA * se:
         return False, 0.0
-    if slope <= -1.0:
-        if se > 1e-6 and abs(slope) < 3.0 * se:
-            return False, 0.0
-        if not _regular_close(ys):
-            return False, 0.0
-    elif slope >= 1.0:
-        if se > 1e-6 and abs(slope) < 3.0 * se:
-            return False, 0.0
-        if not _trend_agrees(ys, slope):
-            return False, 0.0
+    net = window[-1][1] - window[0][1]
+    # A closing slope inside the ±2 m band is the ramp, not a lead we are
+    # catching. An opening slope still has to actually increase the range.
+    if slope < -1.0 and net > -_CLOSE_NET_M:
+        return False, 0.0
+    if slope > 1.0 and net < 1.0:
+        return False, 0.0
     return True, float(slope)
 
 
@@ -189,7 +115,7 @@ class Track:
 
 
 class IoUTracker:
-    def __init__(self, max_misses: int = 5, gate_m: float = 4.0) -> None:
+    def __init__(self, max_misses: int = 5, gate_m: float = _MATCH_GATE_M) -> None:
         self.max_misses = max_misses
         self.gate_m = gate_m
         self._next_id = 1

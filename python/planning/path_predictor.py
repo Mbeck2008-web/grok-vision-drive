@@ -49,8 +49,15 @@ ROUNDABOUT_RMS_MAX = 0.45
 ROUNDABOUT_SPAN_MIN = 0.35
 
 _OCCUPANTS = frozenset({"vehicle", "car", "truck", "bus", "pedestrian", "bike"})
-# Full brake only when closing speed is real. A short gap alone does not slam it.
+_VEHICLES = frozenset({"vehicle", "car", "truck", "bus"})
+_VRU = frozenset({"pedestrian", "bike"})
+# Time-to-collision full brake. A vehicle rate can arm this. A pedestrian
+# or bike in the path arms it from the gap alone.
 _FULL_BRAKE_TTC = 1.2
+# Brake 1.0 is 8 m/s². The range law asks for v²/2(gap − reserve) and
+# scales that into the brake, up to 1.0 when the gap itself demands it.
+_BRAKE_DECEL = 8.0
+_RANGE_RESERVE_M = 3.0
 _COMFORT_DECEL = 2.5
 _SIGN_MISS_MAX = 8
 _PARTIAL_GATE_M = 1.6
@@ -78,6 +85,9 @@ class PathPlan:
     pred_brake: float = 0.0
     # Background turn signal from the route: off | left | right. Not a wheel reading.
     blinker: str = "off"
+    # Extra brake in [0, 1] for an in-path lead whose range-rate is not in yet.
+    # 0 leaves the speed-error brake alone. It can be 1 when the gap is short.
+    range_brake: float = 0.0
 
     def planner_dict(self) -> dict[str, Any]:
         return {
@@ -92,6 +102,7 @@ class PathPlan:
             "path_length_m": self.path_length_m,
             "pred_brake": self.pred_brake,
             "blinker": self.blinker,
+            "range_brake": self.range_brake,
         }
 
 
@@ -171,13 +182,19 @@ def predict_path(
         signs=signs or [],
         path=path,
     )
-    # An unconfirmed lead is not AEB. A short gap for this speed still
-    # cuts throttle and grades the brake until the range-rate exists.
+    # An unconfirmed vehicle is not a stopped-lead AEB. The gap still
+    # sets a brake from v²/2·gap, and that brake is 1.0 when the range
+    # alone cannot be covered any other way. Pedestrians already did.
+    range_brake = 0.0
     if aeb != "brake":
-        gap = _unconfirmed_lead_y(tracks or [], path, width)
-        cap = None if gap is None else _caution_target(gap, float(ego_speed_mps))
-        if cap is not None:
-            target = min(float(target), cap)
+        gap = _unconfirmed_vehicle_y(tracks or [], path)
+        if gap is not None:
+            asked = _range_brake(gap, float(ego_speed_mps))
+            if asked >= 0.99:
+                aeb = "brake"
+                target = 0.0
+            elif asked > 0.0:
+                range_brake = asked
     conf = _confidence(prediction, float(lane_conf), extended=extended or used_prior)
     plan = PathPlan(
         path_ego=path,
@@ -192,6 +209,7 @@ def predict_path(
         stop_reason=stop_reason,
         prediction=prediction,
         occupied=occupied,
+        range_brake=range_brake,
     )
     return _expose_pedals(plan, ego_speed_mps)
 
@@ -698,8 +716,12 @@ def _unseen_s(track: dict[str, Any]) -> float:
     return max(0.0, misses) * tick
 
 
-def _unconfirmed_lead_y(tracks: list, path: list[dict[str, float]], width: float) -> float | None:
-    """Nearest in-path lead whose range-rate is explicitly not confirmed."""
+def _unconfirmed_vehicle_y(tracks: list, path: list[dict[str, float]]) -> float | None:
+    """Nearest in-path vehicle whose range-rate is explicitly not confirmed.
+
+    Anything still in front of the bumper counts, including a lead under 4 m.
+    Skipping that band left throttle on at 3.9 m.
+    """
     best: float | None = None
     reach = (EGO_WIDTH + VEHICLE_WIDTH) * 0.5 + 0.2
     for raw in tracks or []:
@@ -707,10 +729,10 @@ def _unconfirmed_lead_y(tracks: list, path: list[dict[str, float]], width: float
             continue
         if raw.get("range_rate_valid") is not False:
             continue
-        if _cls(raw) != "vehicle":
+        if _cls(raw) not in _VEHICLES:
             continue
         y = _f(raw, "y")
-        if y < 4.0:
+        if y <= 0.3:
             continue
         x = _f(raw, "x")
         idx = _nearest(path, x, y)
@@ -720,30 +742,30 @@ def _unconfirmed_lead_y(tracks: list, path: list[dict[str, float]], width: float
             continue
         if best is None or y < best:
             best = y
-    del width
     return best
 
 
-def _caution_target(gap_m: float, ego_speed_mps: float) -> float | None:
-    """Target speed for a lead whose range-rate is not confirmed yet.
+def _range_brake(gap_m: float, ego_speed_mps: float) -> float:
+    """Brake in [0, 1] to stop ``reserve`` metres short of ``gap_m``.
 
-    Stopping from ``ego`` at 6 m/s² needs ``v²/12`` metres. When that
-    distance is a large fraction of the gap, cut throttle and grade the
-    brake. The grade stays under 1.0 so grab noise cannot full-brake.
-    ``None`` leaves the cruise target alone.
+    ``v² / (2 · gap)`` is the decel the range itself asks for. Divided by
+    8 m/s² that is the brake command, and it reaches 1.0 when the gap is
+    too short for anything milder. No range-rate is required.
     """
     ego = max(0.0, float(ego_speed_mps))
     gap = float(gap_m)
-    if ego < 1.0 or gap <= 0.5:
-        return None
-    need = ego * ego / 12.0
-    ratio = need / gap
-    if ratio < 0.35:
-        return None
-    brake = min(0.6, 0.15 + 0.45 * min(1.0, (ratio - 0.35) / 0.85))
-    # plan_command: brake = min(0.6, -0.05 * (target - ego)) once target is
-    # more than 1 m/s under ego.
-    return max(0.0, ego - brake / 0.05)
+    if ego < 0.05:
+        return 0.0
+    if gap <= _RANGE_RESERVE_M + 0.5:
+        return 1.0
+    usable = gap - _RANGE_RESERVE_M
+    needed = (ego * ego) / (2.0 * usable)
+    asked = max(0.0, min(1.0, needed / _BRAKE_DECEL))
+    # v²/2s feathers off and never quite stops. Once the car is already
+    # slow and the lead is inside the stop, hold a real brake to finish.
+    if ego < 3.0 and gap < _RANGE_RESERVE_M + 6.0:
+        asked = max(asked, min(1.0, ego / _BRAKE_DECEL + 0.15))
+    return asked
 
 
 def _predict_occupants(tracks: list) -> list[dict[str, Any]]:
@@ -754,12 +776,14 @@ def _predict_occupants(tracks: list) -> list[dict[str, Any]]:
         kind = _cls(raw)
         if kind not in _OCCUPANTS:
             continue
-        # speed 0 before a range-rate exists is not a stopped lead.
-        # The caller still sees the gap and may grade the pedals.
-        if raw.get("range_rate_valid") is False:
+        # A vehicle at speed 0 before a range-rate exists is not a stopped
+        # lead. Pedestrians and bikes in the path still are: the gap alone
+        # is the brake, on the first sample.
+        unconfirmed = raw.get("range_rate_valid") is False
+        if unconfirmed and kind not in _VRU:
             continue
         yaw = _f(raw, "yaw", "heading", default=math.pi / 2.0)
-        speed = max(0.0, _f(raw, "speed_mps", "speed"))
+        speed = 0.0 if unconfirmed else max(0.0, _f(raw, "speed_mps", "speed"))
         unseen = _unseen_s(raw)
         x = _f(raw, "x") + math.cos(yaw) * speed * unseen
         y = _f(raw, "y") + math.sin(yaw) * speed * unseen

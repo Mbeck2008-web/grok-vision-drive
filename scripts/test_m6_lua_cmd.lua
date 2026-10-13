@@ -991,6 +991,31 @@ local egoKeyed = readFileAll(egoPath)
 check(egoKeyed and egoKeyed:find('"player_steering":0.0000', 1, true),
   'a steering key of 0 is a centered wheel (' .. tostring(egoKeyed) .. ')')
 
+-- lastInputs may store steering as {value=...}. tonumber(table) is nil, and
+-- n(nil) is 0, which looks like a centered wheel and never starts the blind timer.
+veEnv.input.lastInputs = { ['local'] = { steering = { value = 0.42 } } }
+geQueue = {}
+M.onUpdate(0.25)
+drainGE()
+local egoTable = readFileAll(egoPath)
+check(egoTable and egoTable:find('"player_steering":0.4200', 1, true)
+  and egoTable:find('"player_device":true', 1, true),
+  'a steering table uses value (' .. tostring(egoTable) .. ')')
+veEnv.input.lastInputs = { ['local'] = { steering = { value = -0.2 } } }
+geQueue = {}
+M.onUpdate(0.25)
+drainGE()
+local egoNeg = readFileAll(egoPath)
+check(egoNeg and egoNeg:find('"player_steering":-0.2000', 1, true),
+  'a steering table keeps a negative value (' .. tostring(egoNeg) .. ')')
+veEnv.input.lastInputs = { ['local'] = { steering = { value = 0 } } }
+geQueue = {}
+M.onUpdate(0.25)
+drainGE()
+local egoTableZero = readFileAll(egoPath)
+check(egoTableZero and egoTableZero:find('"player_steering":0.0000', 1, true),
+  'a steering table of 0 is a centered wheel (' .. tostring(egoTableZero) .. ')')
+
 -- Engage probe: the queued vehicle snippet is the Python constant.
 local pyFile = assert(io.open('python/control/actuate.py', 'r'))
 local pySrc = pyFile:read('*a')

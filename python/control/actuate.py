@@ -1407,10 +1407,14 @@ class BeamNGPyActuator:
             return False
         try:
             try:
-                q(chunk, False)
+                queued = q(chunk, False)
             except TypeError:
-                q(chunk)
+                queued = q(chunk)
         except Exception:
+            return False
+        # BeamNGpy returns None on accept. False is a refused queue, the
+        # same as a raise: the lock must not land and the caller retries.
+        if queued is False:
             return False
         return True
 

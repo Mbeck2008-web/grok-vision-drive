@@ -138,6 +138,8 @@ class TechVeh:
         self.ai_modes: list[str] = []
         self.lua: list[str] = []
         self.fail_queue = False
+        self.refuse_queue = False
+        self.hold_queue_n = 0
         self.die_in_queue = False
         self.accept_then_die = False
         self.expect_flag_before_queue = False
@@ -172,6 +174,9 @@ class TechVeh:
             raise SystemExit("killed during queue")
         if self.fail_queue:
             raise RuntimeError("queue failed")
+        if self.refuse_queue and "input.event('steering'" in chunk:
+            self.hold_queue_n += 1
+            return False
         self.lua.append(chunk)
         apply_steer_chunk(self.wheel_sim, chunk)
 
@@ -716,6 +721,30 @@ def check_failed_hold_not_applied() -> None:
         sio.write_state = orig_write
 
 
+def check_refused_queue_does_not_lock() -> None:
+    """A queue that returns False does not lock the wheel or send pedals.
+
+    Raising is already a failure. Returning False used to be ignored, so
+    the lock landed and the next control message went out with steering
+    removed. The next tick has to try the queue again.
+    """
+    wheel = PlayerWheel(0.0)
+    veh = TechVeh(wheel)
+    veh.refuse_queue = True
+    act = BeamNGPyActuator(veh)
+    act.note_engaged(True)
+    sent = act.apply(DriveCommand(steer=0.4, throttle=0.2, brake=0.1, seq=1, reason="ok"))
+    assert sent.applied is False, sent
+    assert sent.reason == "tech_steer_hold_queue", sent.reason
+    assert act.steer_locked is False
+    assert veh.calls == []
+    sent2 = act.apply(DriveCommand(steer=0.4, throttle=0.2, brake=0.1, seq=2, reason="ok"))
+    assert sent2.applied is False and sent2.reason == "tech_steer_hold_queue"
+    assert act.steer_locked is False
+    assert veh.calls == []
+    assert veh.hold_queue_n >= 2, veh.hold_queue_n
+
+
 def _steady(act: BeamNGPyActuator) -> None:
     """Write the supervisor snapshot the way run_vision does after a tick."""
     from python.runtime.state_io import read_state, write_state
@@ -1255,6 +1284,7 @@ def main() -> None:
         check_override_signal_is_the_wheel()
         check_hold_flag_before_queue()
         check_failed_hold_not_applied()
+        check_refused_queue_does_not_lock()
         check_retry_kill_keeps_disk_flag()
         check_command_side_grab()
         check_locked_refresh_sends_pedals()

@@ -108,15 +108,7 @@ class ModularPerception:
             ego_speed_mps=ego_speed_mps,
             prior_lanes=prior_lanes,
         )
-        cipv_id = plan.cipv_id
-        if cipv_id is None and cipv.track is not None:
-            cipv_id = cipv.track.get("id")
-        ttc = plan.ttc_lead if plan.ttc_lead is not None else cipv.ttc_lead
-        aeb = plan.aeb
-        target_v = plan.target_v
-        if cipv.aeb == "brake" and aeb != "brake":
-            aeb = "brake"
-            target_v = 0.0
+        planner = publish_planner(plan, cipv)
         missing = list(self.missing)
         if main_bgr is None:
             missing.append("cam_main_frame")
@@ -145,23 +137,40 @@ class ModularPerception:
                 }
                 for d in dets
             ],
-            planner={
-                "corridor_width": plan.path_width,
-                "curvature": plan.curvature,
-                "target_v": target_v,
-                "ttc_lead": ttc,
-                "aeb": aeb,
-                "cipv_id": cipv_id,
-                "stop_reason": plan.stop_reason,
-                "prediction": plan.prediction,
-                "path_length_m": plan.path_length_m,
-                "pred_brake": plan.pred_brake,
-                "blinker": plan.blinker,
-            },
+            planner=planner,
             infer_ms=infer_ms,
             missing=missing,
             detector_name=self.detector.name,
         )
+
+
+def publish_planner(plan: Any, cipv: Any = None) -> dict[str, Any]:
+    """Planner dict the live tick hands to ``plan_command``.
+
+    Starts from ``PathPlan.planner_dict()`` so ``range_brake`` is on the
+    dict the actuator reads. Building that dict by hand dropped the key,
+    and the live pedal path never saw the partial stop brake. CIPV may
+    still promote a short time-to-collision to a full stop.
+    """
+    planner = dict(plan.planner_dict())
+    cipv_id = planner.get("cipv_id")
+    ttc = planner.get("ttc_lead")
+    aeb = planner.get("aeb")
+    target_v = planner.get("target_v")
+    if cipv is not None:
+        track = getattr(cipv, "track", None)
+        if cipv_id is None and track is not None:
+            cipv_id = track.get("id")
+        if ttc is None:
+            ttc = getattr(cipv, "ttc_lead", None)
+        if getattr(cipv, "aeb", "off") == "brake" and aeb != "brake":
+            aeb = "brake"
+            target_v = 0.0
+    planner["cipv_id"] = cipv_id
+    planner["ttc_lead"] = ttc
+    planner["aeb"] = aeb
+    planner["target_v"] = target_v
+    return planner
 
 
 def _hold_signs(prior: list[dict[str, Any]], fresh: list[dict[str, Any]]) -> list[dict[str, Any]]:

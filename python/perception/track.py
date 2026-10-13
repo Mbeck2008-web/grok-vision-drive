@@ -149,8 +149,8 @@ class Track:
     # (time, route-arc station) filled by the planner. A new track starts
     # empty, which is the reset on a track-id change. Not a shared default.
     route_gaps: list | None = None
-    # [locked lead decel m/s², seconds the curvature has been hot,
-    # cooldown-until]. The planner writes this. A swap clears it.
+    # [locked lead decel m/s², seconds the closing slope has held,
+    # seconds the filtered rate has been flat or opening]. A swap clears it.
     drop_state: list | None = None
     # Filter state. None until the first measurement.
     _kf_r: float = 0.0

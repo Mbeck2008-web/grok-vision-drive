@@ -765,10 +765,16 @@ def check_pacing_lead_brake() -> None:
             # 6 m/s² from 12.5 m, clean and ±0.5 m. The stop has to leave
             # at least a metre when the brake can still make that gap.
             assert gap >= 1.0, (y0, noise, hz, gap)
+        elif y0 == 12.5 and noise <= 1.0:
+            # ±1 m at 12.5 m can graze. It must not go past half a metre.
+            assert gap > -0.5, (y0, noise, hz, gap)
+        elif y0 in (16.0, 20.0) and noise == 1.0:
+            # ±1 m from 16 m and 20 m used to overlap. The comfort stop
+            # inside the cut has to leave a positive gap on every seed.
+            assert gap > 0.0, (y0, noise, hz, gap)
         elif noise <= 0.5 or y0 >= 36.0:
-            # A quiet pace that breaks gets a full stop in time. ±1 m and
-            # ±2 m can hide that break, and the filter then meets a short
-            # gap late.
+            # A quiet pace that breaks gets a full stop in time. ±2 m can
+            # hide that break, and the filter then meets a short gap late.
             assert gap > 0.5, (y0, noise, hz, gap)
         else:
             assert gap > -1.5, (y0, noise, hz, gap)
@@ -1014,6 +1020,7 @@ def check_gap_drop_does_not_phantom_stop() -> None:
     assert row["tracks"] == 1 and row["ids"] == [1], row
     assert abs(row["rate"]) < 0.5, row
     assert row["brake"] < 0.2, row
+    phantom = {"step": round(row["loss"], 2)}
 
     for jump in (2.5, 4.0):
         def swap(time: float, jump: float = jump) -> float:
@@ -1022,12 +1029,14 @@ def check_gap_drop_does_not_phantom_stop() -> None:
         row = _roll(swap, 5.0)
         _assert_no_phantom(f"swap-{jump}", row)
         assert row["tracks"] == 1 and row["ids"] == [1], row
+        phantom[f"swap-{jump}"] = round(row["loss"], 2)
 
     def sine(time: float) -> float:
         return 27.0 + 1.2 * math.sin(2.0 * math.pi * time / 4.0)
 
     row = _roll(sine, 8.0)
     _assert_no_phantom("sine-1.2", row)
+    phantom["sine"] = round(row["loss"], 2)
 
     losses = []
     for seed in range(6):
@@ -1042,7 +1051,8 @@ def check_gap_drop_does_not_phantom_stop() -> None:
         row = _roll(ar, 45.0)
         _assert_no_phantom(f"ar-{seed}", row)
         losses.append(round(row["loss"], 2))
-    print("phantom-drop losses m/s:", {"ar": losses})
+    phantom["ar"] = losses
+    print("phantom-drop losses m/s:", phantom)
 
 
 def _radius_for_forward(y: float, gap: float) -> float:

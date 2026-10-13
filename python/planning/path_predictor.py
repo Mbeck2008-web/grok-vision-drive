@@ -74,29 +74,45 @@ _VRU_HOLD_M = STANDOFF_M + VEHICLE_LENGTH * 0.5
 # long. Correlated range noise reaches a second of mild closing and lets
 # go. A real 2 m/s close does not.
 _CLOSE_HOLD_S = 1.5
-# Route-gap drop. Two slopes on a short moving average. A lead that keeps
-# braking bends the gap for as long as the bend lasts. A constant-rate
-# close is not a quiet pace first, so it never arms this term.
-_DROP_WIN_S = 0.40
-_DROP_ARM_A = 2.2
-# 15 Hz ±0.5 m reaches this and then dips. 0.28 s waited for one more
-# frame that the dip ate, and a 20 m lead was already inside the stop.
-_DROP_ARM_S = 0.22
-# Flat or opening. The pedal comes off as soon as the route slope is here,
-# and also when the filtered range-rate is. The level of the gap is not a brake.
+# Route-gap drop. A 0.40 s curvature under ±1 m is about 31 m/s² of
+# noise, so a real 6 m/s² brake never clears it. The arm is the least-
+# squares slope over a second, which has to be steeper than a 1.2 m wave
+# on a 4 s period (about −1.9 m/s). A half-second slope sees the same
+# brake sooner, and inside the last 12 m that slope can be milder because
+# the wave lives farther out. Once either slope holds, the pedal stays
+# down until the filtered rate has been flat.
+_DROP_WIN_S = 1.0
+_DROP_ARM_MPS = -2.3
+_DROP_FAST_S = 0.50
+_DROP_FAST_MPS = -2.8
+# One frame at 10 Hz and at 15 Hz, inside the short gap only. Farther
+# out, one noisy half-second at ±2 m is not a lead brake, so that arm
+# waits. A second frame of the same slope was the difference between
+# stopping short of a 12.5 m lead and touching it.
+_DROP_ARM_S = 0.06
+_DROP_HOLD_S = 0.15
+# Inside this station a held 5 m/s² still loses to a lead braking at 6.
+# The half-second slope is still catching up, so the short gap arms on a
+# milder slope once the filtered rate is already closing. The cap stays
+# under the line that promotes aeb. A 27 m wander is outside this station.
+_DROP_HARD_M = 12.0
+_DROP_HARD_A = 7.6
+_DROP_SHORT_MPS = -1.7
+# A locked decel inside this station. 18 m was a ±2 m grab on a matched
+# 18 m pace, and the 5 m/s² floor then shed more than that pace can spare.
+_DROP_LEAD_M = 15.0
+# Release only after the filtered rate has been flat or opening this long.
+# One shallow slope window is not a release, and neither is a single frame.
 _DROP_RELEASE = -0.25
-# A 1.2 m wave with a 4 s period reaches about −1.9 m/s and no steeper.
-# The command stays off until the route gap is closing faster than that,
-# so the wave can arm nothing that the pedals can feel.
-_DROP_EMIT_MPS = -2.05
+_DROP_RELEASE_S = 0.50
 # Under the 0.99 line that promotes aeb. The drop alone must not disengage.
 _DROP_CAP = 0.98
 _SWAP_JUMP_M = 2.2
-# Peak-to-peak of the pace behind the drop. ±0.5 m still fits. A sine of
-# 1.2 m over the same stretch does not, so the wave never arms.
-_QUIET_SPAN_M = 1.35
-_STEP_JUMP_M = 1.45
-_STEP_COOL_S = 0.60
+# Comfort stop once the cut is inside this remaining distance. Farther out,
+# matching a lead that still has road speed keeps a wander from being a wall.
+# 16 m of cut is a lead whose bumper is still around 22 m: the 16 m and 20 m
+# brakes live here, and a 27 m wander does not.
+_COMFORT_CUT_M = 16.0
 _SIGN_MISS_MAX = 8
 _PARTIAL_GATE_M = 1.6
 _TURN_RAD = 0.35
@@ -954,15 +970,6 @@ def _smooth_gap(series: list, k: int = 3) -> list[tuple[float, float]]:
     return out
 
 
-def _quiet_pace(series: list, now: float) -> bool:
-    """The gap behind this window was holding, not wandering or oscillating."""
-    old = _window_points(series, now - 0.50, 0.80)
-    if len(old) < 4 or old[-1][0] - old[0][0] < 0.35:
-        return False
-    vals = [s for _, s in old]
-    return max(vals) - min(vals) <= _QUIET_SPAN_M
-
-
 def _record_route_gap(raw: dict[str, Any], station: float, now: float) -> list | None:
     """Append this frame's arc station. A swap clears the list first."""
     series = raw.get("route_gaps")
@@ -984,14 +991,30 @@ def _record_route_gap(raw: dict[str, Any], station: float, now: float) -> list |
     return series
 
 
-def _drop_brake(raw: dict[str, Any], station: float, now: float) -> float:
-    """Graded brake from how fast the route gap is curving closed.
+def _drop_slope(series: list, now: float, window: float) -> float | None:
+    """Closing rate of the route gap over ``window`` seconds.
 
-    Arms only after a quiet pace, and only once the curvature has held.
-    A one-frame step starts a cooldown instead of a stop. A swap clears
-    the series before this runs. The command is 0 as soon as the route
-    slope is flat or the filtered range-rate is flat or opening. Nothing
-    here is stored as a full stop, and nothing here sets ``aeb``.
+    A window that has not covered most of that span is not a slope yet.
+    One grab, including a 1.6 m step, does not fill a half-second slope
+    by itself once the span test is the window.
+    """
+    pts = _window_points(_smooth_gap(series, 3), now, window)
+    if len(pts) < 3 or pts[-1][0] - pts[0][0] < 0.65 * window:
+        return None
+    slope = _ls_slope(pts)
+    if slope is None or not math.isfinite(slope):
+        return None
+    return slope
+
+
+def _drop_brake(raw: dict[str, Any], station: float, now: float) -> float:
+    """Graded brake from a one-second route-gap slope, then held.
+
+    Arms when that slope is steeper than a 1.2 m / 4 s wave and stays
+    there. A swap clears the series before this runs. The pedal stays
+    down across a shallow window. It comes off only after the filtered
+    range-rate has been flat or opening for half a second. Nothing here
+    is stored as a full stop, and nothing here sets ``aeb``.
     """
     series = _record_route_gap(raw, station, now)
     state = raw.get("drop_state")
@@ -999,69 +1022,74 @@ def _drop_brake(raw: dict[str, Any], station: float, now: float) -> float:
         return 0.0
     while len(state) < 3:
         state.append(0.0)
-    smooth = _smooth_gap(series, 3)
-    slope = _ls_slope(_window_points(smooth, now, _DROP_WIN_S))
-    prev = _ls_slope(_window_points(smooth, now - _DROP_WIN_S, _DROP_WIN_S))
-    a_lead = 0.0
-    if slope is not None and prev is not None:
-        a_lead = max(0.0, -(slope - prev) / _DROP_WIN_S)
-    if not math.isfinite(a_lead):
-        a_lead = 0.0
+    slow = _drop_slope(series, now, _DROP_WIN_S)
+    fast = _drop_slope(series, now, _DROP_FAST_S)
     rate = _num(raw.get("range_rate_mps"))
     valid = raw.get("range_rate_valid") is True
-    flat_rate = valid and rate is not None and rate >= _DROP_RELEASE
-    if slope is None or slope >= _DROP_RELEASE:
-        state[0] = 0.0
-        state[1] = 0.0
-        if len(state) > 3:
-            state[3] = 0.0
-        return 0.0
-    # A single grab. Do not let the smoothed slope treat it as a lead brake.
-    if len(series) >= 2:
-        prev_s = _num(series[-2][1]) if isinstance(series[-2], (tuple, list)) else None
-        curr_s = _num(series[-1][1]) if isinstance(series[-1], (tuple, list)) else None
-        if prev_s is not None and curr_s is not None and prev_s - curr_s >= _STEP_JUMP_M:
-            state[2] = float(now) + _STEP_COOL_S
-            if (_num(state[0]) or 0.0) < 1.0:
-                state[1] = 0.0
-                a_lead = 0.0
     dt = 0.1
     if len(series) >= 2:
-        t1 = _num(series[-1][0])
-        t0 = _num(series[-2][0])
+        t1 = _num(series[-1][0]) if isinstance(series[-1], (tuple, list)) else None
+        t0 = _num(series[-2][0]) if isinstance(series[-2], (tuple, list)) else None
         if t1 is not None and t0 is not None:
             dt = max(1e-3, min(0.25, t1 - t0))
     locked = _num(state[0]) or 0.0
     hot = _num(state[1]) or 0.0
-    cool = _num(state[2]) or 0.0
-    if now < cool and locked < 1.0:
-        hot = 0.0
-        a_lead = 0.0
-    if a_lead >= _DROP_ARM_A and (locked >= 1.0 or _quiet_pace(series, now)):
+    flat_s = _num(state[2]) or 0.0
+    # The flat timer starts when the lock does. A pace that was already
+    # flat must not erase a lock on the frame it arms.
+    if locked >= 1.0:
+        if valid and rate is not None and rate >= _DROP_RELEASE:
+            flat_s += dt
+        else:
+            flat_s = 0.0
+        if flat_s >= _DROP_RELEASE_S:
+            state[0] = 0.0
+            state[1] = 0.0
+            state[2] = 0.0
+            return 0.0
+    else:
+        flat_s = 0.0
+    long_steep = (fast is not None and fast <= _DROP_FAST_MPS) or (
+        slow is not None and slow <= _DROP_ARM_MPS
+    )
+    # A pace whose rate is still flat can throw a steep half-second.
+    # That is not a lead brake. Once the filtered rate is closing, it is.
+    rate_closing = valid and rate is not None and rate <= -0.8
+    # The 12.5 m stop is already gone by the time the half-second slope
+    # clears −2.8. Inside that station the milder slope is enough, and
+    # only after the filtered rate itself is closing at 1 m/s.
+    rate_hard = valid and rate is not None and rate <= -1.0
+    short_steep = (
+        station <= _DROP_HARD_M
+        and rate_hard
+        and fast is not None
+        and fast <= _DROP_SHORT_MPS
+    )
+    steep = long_steep or short_steep
+    if steep and (locked >= 1.0 or rate_closing):
         hot += dt
-    elif locked < 1.0 and a_lead < 1.0:
-        # A dip under the arm line still belongs to the same bend. Only a
-        # curvature that has actually gone away gives the timer back.
+    elif locked < 1.0:
         hot = max(0.0, hot - dt)
-    if hot >= _DROP_ARM_S and a_lead >= 2.2:
-        # A real brake's curvature is noisy at ±0.5 m, so the first lock
-        # is at least 5 m/s². It still cannot promote aeb: the cap is 0.98.
-        locked = min(7.6, max(locked, a_lead, 5.0))
+    if hot >= (_DROP_ARM_S if station <= _DROP_HARD_M else _DROP_HOLD_S) and steep:
+        # Farther out, the first lock is 5 m/s². Inside the last 12 m the
+        # same slope is a lead that is already braking harder than that,
+        # so the hold goes to the cap. Either way the pedal stays at 0.98.
+        floor = _DROP_HARD_A if station <= _DROP_HARD_M else 5.0
+        locked = min(_DROP_HARD_A, max(locked, floor))
     state[0] = float(locked)
     state[1] = float(hot)
-    # Filtered rate ~0 or opening: the pedal is off this frame.
-    # A slope a 1.2 m wave can reach is off too. The lock can stay, but
-    # it does not hold a stop once the bend is no steeper than that wave.
-    if flat_rate or locked < 1.0 or slope > _DROP_EMIT_MPS:
+    state[2] = float(flat_s)
+    if locked < 1.0:
         return 0.0
     if station <= _RANGE_RESERVE_M:
         return _DROP_CAP
     usable = max(0.25, station - _RANGE_RESERVE_M)
-    closing = max(0.0, -slope)
-    # The locked decel is for a lead braking inside the distance a pace
-    # at 18 m/s can still stop. Farther out, the same curvature is what
-    # correlated noise does to a 27 m gap, and it must not be a stop.
-    lead_a = min(locked, 7.6) if station <= 18.0 else 0.0
+    slope = slow if fast is None else fast if slow is None else min(slow, fast)
+    closing = 0.0 if slope is None else max(0.0, -slope)
+    # The locked decel is for a lead braking inside _DROP_LEAD_M. Farther
+    # out, the same slope is what correlated noise does to a longer gap,
+    # and it must not be a stop.
+    lead_a = min(locked, _DROP_HARD_A) if station <= _DROP_LEAD_M else 0.0
     a_req = lead_a + (closing * closing) / (2.0 * usable)
     if not math.isfinite(a_req):
         return 0.0
@@ -1422,13 +1450,15 @@ def _speed_flags(
         else:
             close_now = 0.0 if closing is None else closing
             lead_v = float(ego_speed_mps) - close_now
-            # Stop-distance speed is for a fixed obstacle. A lead that still
-            # has road speed is matched. Treating it as a wall is what turned
-            # a correlated range wander into a multi-second slowdown.
-            if lead_v > 1.0:
-                target = min(target, lead_v)
+            comfort = math.sqrt(max(0.0, 2.0 * _COMFORT_DECEL * dist))
+            # Inside the stop, the gap is the brake. Matching a lagged
+            # lead speed here left the pedal at a few hundredths where
+            # this comfort stop was already 0.6. Farther out, a lead that
+            # still has road speed is matched so a wander is not a wall.
+            if dist <= _COMFORT_CUT_M or lead_v <= 1.0:
+                target = min(target, comfort)
             else:
-                target = min(target, math.sqrt(max(0.0, 2.0 * _COMFORT_DECEL * dist)))
+                target = min(target, lead_v)
     limit = _limit_mps(signs, path)
     if limit is not None:
         target = min(target, max(0.0, limit))

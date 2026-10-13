@@ -20,6 +20,7 @@ def main() -> None:
     assert "pull_request:" in workflow
     assert "branches: [main]" in workflow
     assert "run_offline_suite.py" in workflow
+    assert "xvfb-run -a python scripts/run_offline_suite.py" in workflow
 
     windows = ROOT / "scripts" / "test_m6_retail.py"
     assert suite._skip_reason(windows) is None

@@ -16,8 +16,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Lua 5.1
-        run: sudo apt-get update && sudo apt-get install -y lua5.1
+      - name: Lua 5.1 and a display
+        run: sudo apt-get update && sudo apt-get install -y lua5.1 xvfb
 
       - name: Python packages
         run: |
@@ -25,4 +25,6 @@ jobs:
           python -m pip install -r requirements-retail.txt -r requirements-viz.txt onnx
 
       - name: Offline suite
-        run: python scripts/run_offline_suite.py
+        # opencv's Qt build only ships the xcb plugin. A headless runner aborts
+        # in cv2.namedWindow (the train panel). xvfb is a display, not offscreen Qt.
+        run: xvfb-run -a python scripts/run_offline_suite.py

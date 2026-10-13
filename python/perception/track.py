@@ -8,10 +8,18 @@ from python.perception.detect import Detection
 
 # speed_mps on a track is road speed, not |Δrange/Δt|.
 _SPEED_CAP = 40.0
-# Least-squares range-rate over this many grabs. Fewer than this is not
-# a measurement: speed 0 would look like a stopped lead to the AEB gate.
+# A clean, even close can confirm in this many grabs. A noisier fit waits
+# for ``_RATE_MIN``. Either way the slope has to be a line, not one step.
+_RATE_FAST = 5
 _RATE_MIN = 6
 _RATE_WINDOW = 8
+# ±2 m of grab noise sits near 1 m RMSE. A real range line does not.
+_RMSE_MAX = 0.55
+# Fast confirm: successive range steps match each other, and each step is
+# a real close (15 Hz at 18 m/s is 1.2 m; 10 Hz at 9 m/s is 0.9 m).
+_FAST_STEP_TOL = 0.20
+_FAST_MIN_STEP_M = 0.45
+_FAST_RMSE_MAX = 0.15
 
 
 def lead_road_speed(ego_speed_mps: float, dy_m: float, dt_s: float) -> tuple[float, float]:
@@ -34,8 +42,8 @@ def lead_road_speed(ego_speed_mps: float, dy_m: float, dt_s: float) -> tuple[flo
     return float(road), float(rate)
 
 
-def _fit_range_rate(samples: list[tuple[float, float]]) -> float:
-    """Signed range-rate (m/s) from a least-squares line through (t, range)."""
+def _fit_range_rate(samples: list[tuple[float, float]]) -> tuple[float, float, float]:
+    """Slope (m/s), RMSE (m), and slope stderr from a line through (t, range)."""
     n = len(samples)
     t0 = samples[0][0]
     ts = [s[0] - t0 for s in samples]
@@ -44,20 +52,118 @@ def _fit_range_rate(samples: list[tuple[float, float]]) -> float:
     mean_y = sum(ys) / n
     var_t = sum((t - mean_t) ** 2 for t in ts)
     if var_t < 1e-8:
-        return 0.0
-    return sum((t - mean_t) * (y - mean_y) for t, y in zip(ts, ys)) / var_t
+        return 0.0, 0.0, 0.0
+    slope = sum((t - mean_t) * (y - mean_y) for t, y in zip(ts, ys)) / var_t
+    sse = 0.0
+    for t, y in zip(ts, ys):
+        err = y - (mean_y + slope * (t - mean_t))
+        sse += err * err
+    rmse = (sse / n) ** 0.5
+    dof = max(1, n - 2)
+    se = ((sse / dof) / var_t) ** 0.5
+    return float(slope), float(rmse), float(se)
+
+
+def _range_steps(ys: list[float]) -> list[float]:
+    return [ys[i + 1] - ys[i] for i in range(len(ys) - 1)]
+
+
+def _steps_agree(ys: list[float], *, closing: bool) -> bool:
+    """True when every step moves the same way by about the same amount."""
+    ds = _range_steps(ys)
+    if len(ds) < _RATE_FAST - 1:
+        return False
+    if closing:
+        if any(d >= -_FAST_MIN_STEP_M for d in ds):
+            return False
+    elif any(d <= _FAST_MIN_STEP_M for d in ds):
+        return False
+    mean = sum(ds) / len(ds)
+    span = _FAST_STEP_TOL * abs(mean)
+    return all(abs(d - mean) <= span for d in ds)
+
+
+def _one_step(ys: list[float]) -> bool:
+    """True when one jump, not a steady trend, carries the range change.
+
+    Three samples at +2 m then three at −2 m fit about −10 m/s. The range
+    is flat on both sides of that single step.
+    """
+    ds = _range_steps(ys)
+    if len(ds) < 2:
+        return False
+    net = ys[-1] - ys[0]
+    if abs(net) < 0.5:
+        return False
+    biggest = max(ds, key=abs)
+    others = abs(net) - abs(biggest)
+    return abs(biggest) > 0.65 * abs(net) and others < 0.5 * abs(biggest)
+
+
+def _regular_close(ys: list[float]) -> bool:
+    """True when the range steps are a steady close, not a noisy walk.
+
+    A random ±2 m walk can still sit on a straight line for six grabs.
+    Those steps are uneven. A real close keeps moving the same way, including
+    after the car is already braking and each step gets smaller.
+    """
+    ds = _range_steps(ys)
+    if len(ds) < 4:
+        return False
+    # One grab jumping back out is noise. A brake curve only shrinks the step.
+    if any(d > 0.15 for d in ds):
+        return False
+    mean = sum(ds) / len(ds)
+    if mean >= -0.05:
+        return False
+    var = sum((d - mean) ** 2 for d in ds) / len(ds)
+    return var ** 0.5 <= 0.30
+
+
+def _trend_agrees(ys: list[float], slope: float) -> bool:
+    ds = _range_steps(ys)
+    if slope < 0.0:
+        good = sum(d < -0.2 for d in ds)
+        bad = sum(d > 0.2 for d in ds)
+    else:
+        good = sum(d > 0.2 for d in ds)
+        bad = sum(d < -0.2 for d in ds)
+    return good >= 3 and good > bad
 
 
 def consistent_range_rate(samples: list[tuple[float, float]]) -> tuple[bool, float]:
-    """Range-rate once several grabs agree on a line. Otherwise not valid.
+    """Range-rate once the grabs agree on a line. Otherwise not valid.
 
-    One ±2 m grab at 10 Hz is about ±20 m/s. A single smoothed step of that
-    still looks like a hard close. The line through the window is the rate,
-    and it is withheld until ``_RATE_MIN`` samples exist.
+    A +2/−2 step over six grabs fits about −10 m/s with no residual check,
+    and that slope full-brakes a lead that is not closing. The slope is
+    used only when the line is tight, or when every recent step is a real
+    close of about the same size. One step does not confirm.
     """
-    if len(samples) < _RATE_MIN:
+    if len(samples) < _RATE_FAST:
         return False, 0.0
-    return True, float(_fit_range_rate(samples[-_RATE_WINDOW:]))
+    window = samples[-_RATE_WINDOW:]
+    ys = [y for _, y in window]
+    # Even steps first, so a hard close is confirmed before six noisy grabs.
+    if len(ys) >= _RATE_FAST and _steps_agree(ys[-_RATE_FAST:], closing=True):
+        slope, rmse, _se = _fit_range_rate(window[-_RATE_FAST:])
+        if slope < -3.0 and rmse <= _FAST_RMSE_MAX:
+            return True, float(slope)
+    if len(window) < _RATE_MIN:
+        return False, 0.0
+    slope, rmse, se = _fit_range_rate(window)
+    if rmse > _RMSE_MAX or _one_step(ys):
+        return False, 0.0
+    if slope <= -1.0:
+        if se > 1e-6 and abs(slope) < 3.0 * se:
+            return False, 0.0
+        if not _regular_close(ys):
+            return False, 0.0
+    elif slope >= 1.0:
+        if se > 1e-6 and abs(slope) < 3.0 * se:
+            return False, 0.0
+        if not _trend_agrees(ys, slope):
+            return False, 0.0
+    return True, float(slope)
 
 
 @dataclass

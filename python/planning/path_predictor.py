@@ -171,6 +171,13 @@ def predict_path(
         signs=signs or [],
         path=path,
     )
+    # An unconfirmed lead is not AEB. A short gap for this speed still
+    # cuts throttle and grades the brake until the range-rate exists.
+    if aeb != "brake":
+        gap = _unconfirmed_lead_y(tracks or [], path, width)
+        cap = None if gap is None else _caution_target(gap, float(ego_speed_mps))
+        if cap is not None:
+            target = min(float(target), cap)
     conf = _confidence(prediction, float(lane_conf), extended=extended or used_prior)
     plan = PathPlan(
         path_ego=path,
@@ -691,6 +698,54 @@ def _unseen_s(track: dict[str, Any]) -> float:
     return max(0.0, misses) * tick
 
 
+def _unconfirmed_lead_y(tracks: list, path: list[dict[str, float]], width: float) -> float | None:
+    """Nearest in-path lead whose range-rate is explicitly not confirmed."""
+    best: float | None = None
+    reach = (EGO_WIDTH + VEHICLE_WIDTH) * 0.5 + 0.2
+    for raw in tracks or []:
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("range_rate_valid") is not False:
+            continue
+        if _cls(raw) != "vehicle":
+            continue
+        y = _f(raw, "y")
+        if y < 4.0:
+            continue
+        x = _f(raw, "x")
+        idx = _nearest(path, x, y)
+        lateral = math.hypot(path[idx]["x"] - x, path[idx]["y"] - y)
+        half = float(raw.get("width") or raw.get("width_m") or VEHICLE_WIDTH)
+        if lateral > max(reach, (EGO_WIDTH + half) * 0.5 + 0.2):
+            continue
+        if best is None or y < best:
+            best = y
+    del width
+    return best
+
+
+def _caution_target(gap_m: float, ego_speed_mps: float) -> float | None:
+    """Target speed for a lead whose range-rate is not confirmed yet.
+
+    Stopping from ``ego`` at 6 m/s² needs ``v²/12`` metres. When that
+    distance is a large fraction of the gap, cut throttle and grade the
+    brake. The grade stays under 1.0 so grab noise cannot full-brake.
+    ``None`` leaves the cruise target alone.
+    """
+    ego = max(0.0, float(ego_speed_mps))
+    gap = float(gap_m)
+    if ego < 1.0 or gap <= 0.5:
+        return None
+    need = ego * ego / 12.0
+    ratio = need / gap
+    if ratio < 0.35:
+        return None
+    brake = min(0.6, 0.15 + 0.45 * min(1.0, (ratio - 0.35) / 0.85))
+    # plan_command: brake = min(0.6, -0.05 * (target - ego)) once target is
+    # more than 1 m/s under ego.
+    return max(0.0, ego - brake / 0.05)
+
+
 def _predict_occupants(tracks: list) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for raw in tracks or []:
@@ -700,6 +755,7 @@ def _predict_occupants(tracks: list) -> list[dict[str, Any]]:
         if kind not in _OCCUPANTS:
             continue
         # speed 0 before a range-rate exists is not a stopped lead.
+        # The caller still sees the gap and may grade the pedals.
         if raw.get("range_rate_valid") is False:
             continue
         yaw = _f(raw, "yaw", "heading", default=math.pi / 2.0)

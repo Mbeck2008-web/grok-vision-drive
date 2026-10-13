@@ -7,6 +7,7 @@ from about 28 m to 4 m with throttle on, and the first brake was 0.6.
 from __future__ import annotations
 
 import math
+import random
 import sys
 from pathlib import Path
 
@@ -169,6 +170,97 @@ def check_noisy_range_rate_does_not_aeb() -> None:
         t += dt
 
 
+def _decel(brake: float) -> float:
+    """Tire limit used by the stop-margin sim. Brake 1.0 is 8 m/s²."""
+    return 8.0 * max(0.0, min(1.0, float(brake)))
+
+
+def _drive(tracker: IoUTracker, y: float, t: float, ego: float, seq: int):
+    det = Detection(
+        cls="vehicle", conf=0.9, xyxy=(0, 0, 10, 10), x=0.0, y=y, yaw=math.pi / 2,
+    )
+    tracker.update([det], t, ego_speed_mps=ego)
+    plan = predict_path(
+        lanes_bev=_lanes(), lane_conf=0.9, ego_speed_mps=ego, tracks=tracker.as_dicts(),
+    )
+    cmd = follow_path(plan, ego_speed_mps=ego, seq=seq)
+    return plan, cmd
+
+
+def check_step_and_random_noise_do_not_full_brake() -> None:
+    """A +2/−2 step and random ±2 m must not full-brake a constant lead.
+
+    Six grabs of three high then three low fit about −10 m/s. That used to
+    be a 1.0 brake at 12–20 m with ego at 12 m/s. Random ±2 m did it too.
+    """
+    ego = 12.0
+    dt = 0.1
+    tracker = IoUTracker()
+    t = 0.0
+    for i in range(24):
+        step = 2.0 if (i // 3) % 2 == 0 else -2.0
+        y = 16.0 + step
+        assert 12.0 <= y <= 20.0
+        plan, cmd = _drive(tracker, y, t, ego, i)
+        assert plan.aeb != "brake", (i, y, plan.aeb, tracker.tracks[0].range_rate_mps)
+        assert cmd.brake < 0.99, (i, y, cmd.brake)
+        t += dt
+
+    rng = random.Random(81)
+    full = 0
+    for trial in range(400):
+        noisy = IoUTracker()
+        t = 0.0
+        for i in range(24):
+            y = 16.0 + rng.uniform(-2.0, 2.0)
+            plan, cmd = _drive(noisy, y, t, ego, i)
+            if plan.aeb == "brake" or cmd.brake >= 0.99:
+                full += 1
+                break
+            t += dt
+    assert full == 0, full
+
+
+def check_fast_close_stops_with_margin() -> None:
+    """Ego 18 m/s, lead first seen at 30 m, must stop before the lead.
+
+    Waiting six grabs at 10 Hz spends the gap. A clean close confirms
+    sooner, and the unconfirmed gap already grades the brake.
+    """
+    def margin(hz: float) -> float:
+        dt = 1.0 / hz
+        ego = 18.0
+        s = 0.0
+        lead = 30.0
+        t = 0.0
+        tracker = IoUTracker()
+        saw = False
+        for i in range(int(8 * hz) + 2):
+            y = lead - s
+            assert y > 0.0, (hz, t, y)
+            plan, cmd = _drive(tracker, y, t, ego, i)
+            if cmd.brake >= 0.3:
+                saw = True
+            if cmd.brake >= 0.99:
+                assert tracker.tracks[0].range_rate_valid is True
+            a = _decel(cmd.brake)
+            if ego <= 0.05 or (a > 1e-6 and a * dt >= ego):
+                if a > 1e-6:
+                    s += ego * ego / (2.0 * a)
+                ego = 0.0
+                break
+            s += ego * dt - 0.5 * a * dt * dt
+            ego = max(0.0, ego - a * dt)
+            t += dt
+        assert ego <= 0.05, (hz, ego, lead - s)
+        assert saw, hz
+        return lead - s
+
+    for hz in (10.0, 15.0):
+        left = margin(hz)
+        assert left >= 3.0, (hz, left)
+
+
 def check_faster_lead_is_not_closing() -> None:
     rows = _approach(12.0, 16.0)
     late = [row for row in rows if row[0] > 45.0]
@@ -186,6 +278,8 @@ def main() -> None:
     check_stopped_lead_aeb()
     check_slower_lead_aeb()
     check_noisy_range_rate_does_not_aeb()
+    check_step_and_random_noise_do_not_full_brake()
+    check_fast_close_stops_with_margin()
     check_faster_lead_is_not_closing()
     print("test_lead_road_speed: OK")
 

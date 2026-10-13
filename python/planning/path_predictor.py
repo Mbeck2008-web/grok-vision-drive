@@ -768,6 +768,8 @@ def _apply_scene(
         # must not hide it.
         if float(occ["y"]) < -0.05:
             continue
+        # speed_mps is the lead's road speed. Closing is ego minus that,
+        # and time-to-collision is the gap divided by closing.
         along = float(occ.get("speed_mps") or 0.0) * math.sin(float(occ.get("yaw") or (math.pi / 2.0)))
         closing = float(ego_speed_mps) - along
         # Matching speed is not a stop. Anything actually in front of the bumper is.

@@ -90,7 +90,7 @@ class ModularPerception:
         signs = _hold_signs(self._prior_signs, fresh_signs)[:MAX_SIGNS]
         self._prior_signs = list(signs)
         # if detector didn't set ego x/y (onnx path does), leave as-is
-        tracks = self.tracker.update(moving, time.time())
+        tracks = self.tracker.update(moving, time.time(), ego_speed_mps=ego_speed_mps)
         track_dicts = self.tracker.as_dicts()
         lanes = lanes_from_view(main_bgr, stitch_bgr)
         prior_lanes = None

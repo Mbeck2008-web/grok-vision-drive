@@ -14,6 +14,8 @@ if str(ROOT) not in sys.path:
 
 from python.control.actuate import (
     attach_electrics,
+    follow_lane_steer,
+    LaneSteerState,
     last_electrics_ms,
     make_actuator,
     read_ego_feedback,
@@ -23,6 +25,7 @@ from python.control.actuate import (
     soft_esc_state_write_due,
     soft_esc_state_write_mark,
     soft_esc_state_write_skips,
+    steer_sample_point,
     stop_command,
     write_engage_flag,
 )
@@ -506,11 +509,14 @@ def main() -> None:
     prev_bot = False
     engage_arm_mono: float | None = None
     review_cap = ReviewCapture()
+    lane_steer = LaneSteerState()
     try:
         while True:
             loop_t0 = time.perf_counter()
+            tick_dt: float | None = None
             if frame_i > 0:
                 dt_loop = max(1e-6, loop_t0 - last_loop_t)
+                tick_dt = dt_loop
                 loop_hz_ema = ema_hz(loop_hz_ema, 1.0 / dt_loop)
             last_loop_t = loop_t0
 
@@ -751,6 +757,28 @@ def main() -> None:
                 # the generic not_engaged the following ticks write.
                 cmd = stop_command(seq=cmd_seq, reason=ovr.reason)
 
+            # Lookahead the steer law reads. Logged every tick. The PR 75
+            # capture stored curvature and the clipped command, not this point.
+            sample = steer_sample_point(pout.path_ego) if pout.path_ego else None
+            lane_x = None if sample is None else float(sample.get("x", 0.0))
+            lane_y = None if sample is None else float(sample.get("y", 0.0))
+            frame_ts = None
+            for _stamp_key in ("main", "cam_main"):
+                _stamps = getattr(bundle, "timestamps", None) or {}
+                if _stamp_key in _stamps:
+                    try:
+                        frame_ts = float(_stamps[_stamp_key])
+                    except (TypeError, ValueError):
+                        frame_ts = None
+                    break
+            frame_cmd_ms = (time.time() - frame_ts) * 1000.0 if frame_ts is not None else -1.0
+            if engaged and cmd.reason == "ok":
+                cmd.steer = follow_lane_steer(cmd.steer, lane_x, lane_steer, tick_dt)
+            else:
+                # A gate hold or a disengage sends steer 0. Do not resume the
+                # next path command from a value the car was not holding.
+                lane_steer.reset()
+            # Debug gain, invert, cap, and steer-off still have the last word.
             cmd = apply_to_command(ui.debug, cmd)
 
             # Actuators only when engaged + command ok (path / tracks / shadow already on this tick).
@@ -855,6 +883,12 @@ def main() -> None:
             st["cmd_seq"] = int(applied.seq)
             st["cmd_reason"] = applied.reason
             st["cmd_applied"] = bool(applied.applied)
+            st["lane_hold"] = {
+                "lateral_m": None if lane_x is None else float(lane_x),
+                "lookahead_y_m": None if lane_y is None else float(lane_y),
+                "steer": float(applied.steer),
+                "frame_cmd_ms": float(frame_cmd_ms),
+            }
             st["ego_source"] = ego_source
             st["cmd_ack_seq"] = int(ego_fb.applied_seq) if ego_fb is not None else -1
             st["lua_applying"] = bool(ego_fb.applying and ego_fb.fresh) if ego_fb is not None else False
@@ -940,7 +974,11 @@ def main() -> None:
                 f"electrics_ms={electrics_ms:.2f} "
                 f"state_write_skip={0 if state_due else 1} "
                 f"state_write_skips={state_skips} "
-                f"release_cmd_skips={rel_skips}",
+                f"release_cmd_skips={rel_skips} "
+                f"lane_x={'na' if lane_x is None else f'{lane_x:.4f}'} "
+                f"lane_y={'na' if lane_y is None else f'{lane_y:.2f}'} "
+                f"steer={float(applied.steer):+.4f} "
+                f"frame_cmd_ms={frame_cmd_ms:.1f}",
                 flush=True,
             )
 

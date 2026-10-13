@@ -15,6 +15,7 @@ ack is fresh. No DLL / hooks / process inject. Live BeamNG still UNPROVEN on Lin
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -1253,6 +1254,38 @@ def make_actuator(vehicle: Any | None = None, prefer_beamngpy: bool = True) -> A
     return CmdJsonActuator()
 
 
+# steering_input ±1 is ±30 deg at the road wheel (ego.steer_deg = input * 30).
+STEER_LOCK_DEG = 30.0
+STEER_LOCK_RAD = math.radians(STEER_LOCK_DEG)
+# Pure-pursuit wheelbase. The old law divided lateral meters by this same 2.5
+# and sent the quotient as steering_input, so 2.5 m of offset was full lock.
+WHEELBASE_M = 2.5
+# Damping on lookahead-lateral rate, in normalized steer per (m/s). Capped so a
+# one-tick lane jump cannot itself command full lock.
+STEER_KD = 0.05
+STEER_D_CAP = 0.20
+# Normalized steer per second. A live tick was ~0.3 s, so this blocks a
+# one-tick reversal from +1 to -1 (that reversal happened 102 times in the
+# first 741 commands of the PR 75 run).
+STEER_RATE_PER_S = 0.75
+
+
+@dataclass
+class LaneSteerState:
+    """Memory for the lane follower. Reset when the path command is not applied."""
+
+    steer: float = 0.0
+    lateral_m: float = 0.0
+    have_lateral: bool = False
+    armed: bool = False
+
+    def reset(self) -> None:
+        self.steer = 0.0
+        self.lateral_m = 0.0
+        self.have_lateral = False
+        self.armed = False
+
+
 def steer_sample_point(path_ego: list[dict[str, float]]) -> dict[str, float] | None:
     """Point the wheel reads.
 
@@ -1272,9 +1305,74 @@ def steer_sample_point(path_ego: list[dict[str, float]]) -> dict[str, float] | N
 
 
 def path_steer_from_ego(path_ego: list[dict[str, float]] | None) -> float:
+    """Normalized steer from the lookahead point.
+
+    Pure pursuit: front-wheel angle ``atan(2 * L * x / ld^2)``, divided by the
+    ±30 deg lock. The previous law sent ``x / 2.5`` straight into
+    ``steering_input`` and clipped at ±1, so a 2.5 m offset (or an 8 m point
+    on an 18 deg heading) was full lock. The PR 75 run saturated 43% of
+    commands that way and reversed sign 102 times in the first 741.
+    """
     if not path_ego or len(path_ego) < 2:
         return 0.0
     mid = steer_sample_point(path_ego)
     if mid is None:
         return 0.0
-    return max(-1.0, min(1.0, float(mid.get("x", 0.0)) / 2.5))
+    x = float(mid.get("x", 0.0))
+    y = max(float(mid.get("y", 0.0)), 1.0)
+    # atan2(opposite, adjacent) keeps the sign of x. ld^2 is always > 0.
+    delta = math.atan2(2.0 * WHEELBASE_M * x, x * x + y * y)
+    return max(-1.0, min(1.0, delta / STEER_LOCK_RAD))
+
+
+def follow_lane_steer(
+    geometric: float,
+    lateral_m: float | None,
+    state: LaneSteerState,
+    dt_s: float | None,
+) -> float:
+    """PD on the pursuit command, then a steer-rate limit.
+
+    ``geometric`` is ``path_steer_from_ego``. Debug gain, invert, and the
+    steer cap run after this in the live loop, so they still have the last
+    word. The D term opposes a jumping lookahead so a sign change in
+    ``lateral_m`` does not reverse the command in the same tick. With no
+    clock the geometric value is stored and returned, which is what the
+    stateless callers want.
+    """
+    try:
+        raw = float(geometric)
+    except (TypeError, ValueError):
+        raw = 0.0
+    if raw != raw or raw in (float("inf"), float("-inf")):
+        raw = 0.0
+    lat: float | None
+    if lateral_m is None:
+        lat = None
+    else:
+        try:
+            lat = float(lateral_m)
+        except (TypeError, ValueError):
+            lat = None
+        if lat is None or lat != lat or lat in (float("inf"), float("-inf")):
+            lat = None
+    d_term = 0.0
+    if (
+        lat is not None
+        and state.have_lateral
+        and dt_s is not None
+        and dt_s > 1e-4
+    ):
+        d_lat = (lat - state.lateral_m) / float(dt_s)
+        d_term = max(-STEER_D_CAP, min(STEER_D_CAP, -STEER_KD * d_lat))
+    raw = max(-1.0, min(1.0, raw + d_term))
+    if dt_s is not None and dt_s > 1e-4:
+        step = STEER_RATE_PER_S * float(dt_s)
+        origin = state.steer if state.armed else 0.0
+        raw = max(origin - step, min(origin + step, raw))
+    state.steer = raw
+    state.armed = True
+    if lat is not None:
+        state.lateral_m = lat
+        state.have_lateral = True
+    return raw

@@ -2076,6 +2076,13 @@ class BeamNGPyBackend:
         # One repeat is still this picture. A stuck buffer is a loss only
         # after several identical grabs, while moving, and after the prior
         # window. Until then the last good frame stays in the bundle.
+        # Tests build a backend with ``__new__`` and only some of these maps.
+        if not isinstance(getattr(self, "_frame_sig", None), dict):
+            self._frame_sig = {}
+        if not isinstance(getattr(self, "_stuck_n", None), dict):
+            self._stuck_n = {}
+        if not isinstance(getattr(self, "_good_ts", None), dict):
+            self._good_ts = {}
         is_loss, is_unique = classify_frame_signature(
             self._frame_sig, self._stuck_n, self._good_ts, cid, sig, ts
         )

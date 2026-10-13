@@ -351,6 +351,7 @@ def _run_supervisor(
     steer_echo: Callable[[int], float] | None = None,
     brake_bias: float = 0.0,
     expect_disengage: str | None = None,
+    engage: bool = False,
 ) -> dict | None:
     """Run run_vision.py headless for `seconds`; optionally play the mod's ack role meanwhile.
 
@@ -368,6 +369,7 @@ def _run_supervisor(
     _touch_lua_bus()
     # Never PIPE. A full pipe freezes the supervisor (engaged, cmd_json_pending), and
     # Windows TerminateProcess discards the child's unflushed stdout anyway.
+    spawned = time.time()
     proc = subprocess.Popen(
         args,
         cwd=str(ROOT),
@@ -375,6 +377,32 @@ def _run_supervisor(
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    if engage:
+        # Boot writes engaged:false (supervisor_start) and would clobber a
+        # pre-written true. Re-engage only after that disarm is on disk.
+        deadline = time.time() + 15.0
+        armed = False
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                raise AssertionError(f"run_vision exited early ({proc.returncode})")
+            _touch_lua_bus()
+            data = _read_json(engage_path())
+            if (
+                data.get("engaged") is False
+                and data.get("disengage_reason") == "supervisor_start"
+                and float(data.get("mtime") or 0) >= spawned - 1.0
+            ):
+                write_engage_flag(True)
+                armed = True
+                break
+            time.sleep(0.02)
+        if not armed:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            raise AssertionError("supervisor_start never appeared; refusing to engage")
     latched: dict | None = None
 
     def _ack_once() -> None:
@@ -497,6 +525,7 @@ def check_run_vision_e2e() -> None:
     st = read_state()
     assert st and st["engaged"] is False and st["cmd_applied"] is False and st["actuator"] == "cmd_json"
     assert st["cmd_reason"] == "not_engaged" and st["ego_source"] == "none"
+    assert st.get("heartbeat_ok") is True
     # Loaded nets keep writing path / tracks / shadow while the car is still yours.
     assert isinstance(st.get("path_ego"), list) and len(st["path_ego"]) >= 2, st.get("path_ego")
     assert isinstance(st.get("tracks"), list)
@@ -533,6 +562,7 @@ def check_run_vision_e2e() -> None:
     assert cmd["steer"] == 0.0, cmd
     st = read_state()
     assert st and st["engaged"] is True and st["cmd_applied"] is True, {k: st.get(k) for k in ("engaged", "cmd_applied", "cmd_reason")}
+    assert st.get("heartbeat_ok") is True
     assert st["cmd_reason"] == "cmd_json_applied" and st["ego_source"] == "lua" and st["lua_applying"] is True
     assert abs(float(st["ego"]["speed_mps"]) - echo_speed) < 1e-6, st["ego"]
     assert st["cmd_ack_seq"] >= st["cmd_seq"] - 5
@@ -603,8 +633,14 @@ def check_ffb_override_live() -> None:
         ego_path().unlink()
 
     # Force-feedback chatter — alternating kicks keyed off the seq so the sign flips every tick.
-    write_engage_flag(True)
-    _run_supervisor(["--allow-preview-drive"], seconds=3.0, ack=True, steer_echo=lambda seq: 0.9 if seq % 2 else -0.9)
+    # Engage only after boot writes supervisor_start. A pre-written true is disarmed.
+    _run_supervisor(
+        ["--allow-preview-drive"],
+        seconds=3.0,
+        ack=True,
+        steer_echo=lambda seq: 0.9 if seq % 2 else -0.9,
+        engage=True,
+    )
     assert read_engage_flag(default=False) is True, "force-feedback chatter disengaged GVD"
     assert _read_json(engage_path()).get("disengage_reason") == "none"
     cmd = json.loads(cmd_path().read_text(encoding="utf-8"))
@@ -620,13 +656,13 @@ def check_ffb_override_live() -> None:
 
     # A driver actually holding the wheel over. Latch on gvd_engage.json / gvd_state.json,
     # not stdout — Windows PIPE + SIGKILL only kept boot lines through the preview WARNING.
-    write_engage_flag(True)
     snap = _run_supervisor(
         ["--allow-preview-drive"],
         seconds=3.0,
         ack=True,
         steer_echo=lambda _seq: 0.25,
         expect_disengage="player_steer",
+        engage=True,
     )
     assert snap is not None, "player_steer never appeared on gvd_engage.json / gvd_state.json"
     eng = snap["engage"]
@@ -642,13 +678,13 @@ def check_ffb_override_live() -> None:
     assert json.loads(cmd_path().read_text(encoding="utf-8"))["engaged"] is False
 
     # Pedals stay tight: a brake press on top of the command is an override with no dwell.
-    write_engage_flag(True)
     snap = _run_supervisor(
         ["--allow-preview-drive"],
         seconds=2.0,
         ack=True,
         brake_bias=0.4,
         expect_disengage="player_brake",
+        engage=True,
     )
     assert snap is not None, "player_brake never appeared on gvd_engage.json / gvd_state.json"
     eng = snap["engage"]

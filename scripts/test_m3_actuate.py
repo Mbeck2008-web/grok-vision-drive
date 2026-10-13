@@ -15,7 +15,11 @@ from python.control.actuate import (
     BeamNGPyActuator,
     CmdJsonActuator,
     DriveCommand,
+    ENGAGE_FRESH_S,
+    engage_heartbeat_ok,
+    engage_path,
     heartbeat_fresh,
+    write_engage_flag,
     is_arcade_reverse_hold,
     is_reverse_control,
     may_drive,
@@ -730,6 +734,39 @@ def check_bot_engage() -> None:
             path.write_bytes(prev)
 
 
+def check_engage_file_heartbeat() -> None:
+    """gvd_engage.json mtime is the heartbeat. A stale claim is not ok.
+
+    A file that does not claim Engage is not a dead link. The state field
+    written by the supervisor is this check, not a constant true.
+    """
+    import json
+    import time
+
+    src = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
+    assert "engage_heartbeat_ok()" in src
+    assert 'st["heartbeat_ok"]' in src
+    p = engage_path()
+    prev = p.read_bytes() if p.is_file() else None
+    try:
+        write_engage_flag(False)
+        assert engage_heartbeat_ok() is True
+        write_engage_flag(True)
+        assert engage_heartbeat_ok() is True
+        data = json.loads(p.read_text(encoding="utf-8"))
+        data["mtime"] = time.time() - (ENGAGE_FRESH_S + 1.0)
+        p.write_text(json.dumps(data), encoding="utf-8")
+        assert engage_heartbeat_ok() is False
+        data["engaged"] = False
+        p.write_text(json.dumps(data), encoding="utf-8")
+        assert engage_heartbeat_ok() is True
+    finally:
+        if prev is None:
+            p.unlink(missing_ok=True)
+        else:
+            p.write_bytes(prev)
+
+
 def main() -> None:
     check_bot_engage()
     # 2) stale heartbeat → zero throttle + brake
@@ -748,6 +785,7 @@ def main() -> None:
     assert heartbeat_fresh(__import__("time").time() - 1.0) is True
     assert heartbeat_fresh(__import__("time").time() - 2.0) is False
     assert heartbeat_fresh(__import__("time").time()) is True
+    check_engage_file_heartbeat()
 
     # 3) preview path → no actuate unless flag
     cmd2 = safe_command(

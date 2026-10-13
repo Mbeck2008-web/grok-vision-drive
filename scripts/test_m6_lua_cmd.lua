@@ -573,6 +573,104 @@ check(not M.isEngaged(), 'supervisor OFF still wins after a heartbeat')
 local stayed = readFileAll(engagePath)
 check(stayed and stayed:find('"engaged": false', 1, true), 'heartbeat did not rewrite supervisor OFF (' .. tostring(stayed) .. ')')
 
+-- 16) Tech-like dead supervisor: latch on, heartbeat frozen, not applying.
+-- Retail's command dead-man only runs while applying, so this is the Tech gap.
+-- onUpdate-only timer must drop the latch and zero throttle inside ~2.5 s.
+-- A heartbeat that keeps moving for more than 2 s must leave the latch on.
+electricsValues.wheelspeed = 5.5
+M.toggleEngage()
+writeCmd(false, 0, 0, 0)
+for _ = 1, 50 do
+  seq = seq + 1
+  beatState(true)
+  M.onUpdate(0.05)
+end
+check(M.isEngaged(), 'fresh heartbeat for >2 s keeps the latch')
+M.toggleEngage()
+M.toggleEngage()
+beatState(true, 'none')
+writeCmd(false, 0, 0, 0)
+clearEvents()
+M.onUpdate(0.05)
+check(M.isEngaged(), 'still engaged before the lost-supervisor window')
+for _ = 1, 3 do M.onUpdate(0.5) end
+check(M.isEngaged(), 'under 2 s of a frozen heartbeat keeps the latch (retail dead-man stays first)')
+M.onUpdate(0.5)
+check(not M.isEngaged(), 'frozen heartbeat >= 2 s drops the latch')
+local lost = readFileAll(engagePath)
+check(lost and lost:find('supervisor_lost') ~= nil, 'engage file reason supervisor_lost (' .. tostring(lost) .. ')')
+local sawThr0, sawBrk = false, false
+for _, e in ipairs(events) do
+  if e[1] == 'throttle' and near(e[2], 0) then sawThr0 = true end
+  if e[1] == 'brake' and near(e[2], 0.6) then sawBrk = true end
+end
+local sawSteer0 = false
+for _, e in ipairs(events) do
+  if e[1] == 'steering' and near(e[2], 0) and e[3] == 1 and e[6] == 'local' then sawSteer0 = true end
+end
+check(sawThr0, 'stale heartbeat queued throttle 0')
+check(sawBrk, 'moving car got service brake 0.6 (not a parking-brake hold)')
+check(sawSteer0, 'stale heartbeat queued steer 0 on the vehicle.control pad (source local)')
+local sawStaleLog = false
+for _, line in ipairs(logs) do
+  if tostring(line):find('supervisor heartbeat stale', 1, true) then sawStaleLog = true end
+end
+check(sawStaleLog, 'logged supervisor heartbeat stale')
+
+-- 16b) no vehicle at the moment of the drop: latch still falls, pedals follow once a car exists
+M.toggleEngage()
+beatState(true, 'none')
+writeCmd(false, 0, 0, 0)
+electricsValues.wheelspeed = 0
+local savedVeh = currentVeh
+currentVeh = nil
+clearEvents()
+M.onUpdate(0.05)
+for _ = 1, 4 do M.onUpdate(0.5) end
+check(not M.isEngaged(), 'latch drops even when getPlayerVeh is nil')
+check(#events == 0, 'no pedal event until a vehicle exists')
+local lostNil = readFileAll(engagePath)
+check(lostNil and lostNil:find('supervisor_lost') ~= nil, 'nil vehicle still wrote supervisor_lost')
+currentVeh = savedVeh
+M.onUpdate(0.05)
+local sawPark, sawBrk0, sawThrStop = false, false, false
+for _, e in ipairs(events) do
+  if e[1] == 'parkingbrake' and near(e[2], 1) then sawPark = true end
+  if e[1] == 'brake' and near(e[2], 0) then sawBrk0 = true end
+  if e[1] == 'throttle' and near(e[2], 0) then sawThrStop = true end
+end
+check(sawThrStop and sawPark and sawBrk0, 'nearly stopped: throttle 0, parking brake on, service brake released')
+electricsValues.wheelspeed = 5.5
+
+-- 16c) a failed queue stays owed across a new heartbeat, then lands
+M.toggleEngage()
+beatState(true, 'none')
+writeCmd(false, 0, 0, 0)
+electricsValues.wheelspeed = 5.5
+local savedQueue = Veh.queueLuaCommand
+function Veh:queueLuaCommand() error('queue down') end
+clearEvents()
+M.onUpdate(0.05)
+for _ = 1, 5 do M.onUpdate(0.5) end
+check(not M.isEngaged(), 'latch drops while the vehicle queue is down')
+check(#events == 0, 'failed queue leaves no pedal event')
+seq = seq + 1
+beatState(true)
+M.onUpdate(0.5)
+check(#events == 0, 'a new heartbeat does not cancel an unqueued release')
+check(not M.isEngaged(), 'heartbeat return does not re-engage before the release queues')
+Veh.queueLuaCommand = savedQueue
+clearEvents()
+M.onUpdate(0.05)
+local sawRetrySteer, sawRetryThr, sawRetryBrk = false, false, false
+for _, e in ipairs(events) do
+  if e[1] == 'steering' and near(e[2], 0) and e[3] == 1 and e[6] == 'local' then sawRetrySteer = true end
+  if e[1] == 'throttle' and near(e[2], 0) then sawRetryThr = true end
+  if e[1] == 'brake' and near(e[2], 0.6) then sawRetryBrk = true end
+end
+check(sawRetrySteer and sawRetryThr and sawRetryBrk,
+  'retry after a failed queue sends steer 0, throttle 0, service brake on source local')
+
 -- 12) chrome check on everything we push to the vehicle / HUD
 for _, e in ipairs(logs) do assert(not e:lower():find('tesla') and not e:find('FSD'), 'chrome in log: ' .. e) end
 

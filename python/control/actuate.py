@@ -214,6 +214,26 @@ def write_engage_flag(engaged: bool, disengage_reason: str | None = None) -> Non
     atomic_write_json(engage_path(), payload, indent=None)
 
 
+def disarm_supervisor_start() -> dict:
+    """A new supervisor is not Engage. Lua adopts this newer false.
+
+    Writes ``engaged:false`` with reason ``supervisor_start`` and clears the
+    bot-engage latch. A later fresh ``engaged:true`` (Alt+G) can still drive.
+    ``--force-engage`` is a separate dev flag and does not read this file.
+    """
+    write_engage_flag(False, disengage_reason="supervisor_start")
+    BotEngage().clear()
+    try:
+        data = json.loads(engage_path().read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("engaged", False)
+    data.setdefault("disengage_reason", "supervisor_start")
+    return data
+
+
 def _read_bot_engage() -> dict | None:
     p = bot_engage_path()
     if not p.is_file():
@@ -307,6 +327,30 @@ def heartbeat_fresh(heartbeat_mtime: float | None, now: float | None = None, sta
         return False
     t = now if now is not None else time.time()
     return (t - float(heartbeat_mtime)) <= stale_s
+
+
+def engage_heartbeat_ok(now: float | None = None) -> bool:
+    """True unless ``gvd_engage.json`` claims Engage on a stale stamp.
+
+    Lua rewrites that ``mtime`` with ``os.time()`` while its latch is on.
+    A file that is missing or says ``engaged:false`` is not a dead link.
+    The window is ``ENGAGE_FRESH_S`` (about 2.5 s), the same check
+    ``read_engage_flag`` uses. ``--force-engage`` does not call this.
+    """
+    p = engage_path()
+    if not p.is_file():
+        return True
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not isinstance(data, dict) or not bool(data.get("engaged", False)):
+        return True
+    try:
+        mtime = float(data["mtime"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return heartbeat_fresh(mtime, now=now, stale_s=ENGAGE_FRESH_S)
 
 
 def may_drive(

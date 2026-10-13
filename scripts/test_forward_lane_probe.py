@@ -14,7 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from python.control.actuate import plan_command, steer_sample_point  # noqa: E402
+from python.control.actuate import path_steer_from_ego, plan_command, steer_sample_point  # noqa: E402
 from python.planning.path_predictor import predict_path  # noqa: E402
 
 
@@ -57,7 +57,7 @@ def check_forward_lane_beats_rear_pair() -> None:
         seq=1,
     )
     assert abs(cmd.steer) < 0.05, cmd
-    assert abs(cmd.steer - float(sample["x"]) / 2.5) < 1e-6
+    assert abs(cmd.steer - path_steer_from_ego(plan.path_ego)) < 1e-9
 
 
 def check_curved_rear_steers_ahead() -> None:
@@ -85,7 +85,7 @@ def check_curved_rear_steers_ahead() -> None:
     behind_steer = max(-1.0, min(1.0, float(behind["x"]) / 2.5))
     assert abs(behind_steer + 0.384) < 1e-6, behind_steer
     assert abs(cmd.steer - behind_steer) > 0.05, (cmd.steer, behind_steer)
-    assert abs(cmd.steer - float(sample["x"]) / 2.5) < 1e-6
+    assert abs(cmd.steer - path_steer_from_ego(path)) < 1e-9
 
 
 def check_beside_and_rear_points_stay() -> None:

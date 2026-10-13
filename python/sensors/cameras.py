@@ -1054,6 +1054,84 @@ def frame_signature(bgr: np.ndarray) -> tuple[Any, ...]:
     return (arr.shape, arr.dtype.str, hash(arr.tobytes()))
 
 
+# A stuck buffer is a loss only after this many identical grabs, and only
+# while the car is moving. One repeat is still this picture.
+STUCK_FRAME_GRABS = 4
+# Same nearly-stopped band as the Tech supervisor release (parking brake).
+CREEP_MPS = 1.5
+# Below this, a dark-camera hold may release the pedals.
+STOPPED_MPS = 0.05
+
+_GRAB_EGO_MPS = 0.0
+
+
+def note_grab_ego_speed(speed_mps: float) -> None:
+    """Ego speed from the previous tick, read before this grab."""
+    global _GRAB_EGO_MPS
+    try:
+        _GRAB_EGO_MPS = max(0.0, float(speed_mps))
+    except (TypeError, ValueError):
+        _GRAB_EGO_MPS = 0.0
+
+
+def grab_ego_speed() -> float:
+    return float(_GRAB_EGO_MPS)
+
+
+def classify_frame_signature(
+    sigs: dict[str, tuple[Any, ...]],
+    stuck: dict[str, int],
+    good_ts: dict[str, float],
+    cid: str,
+    sig: tuple[Any, ...],
+    ts: float,
+) -> tuple[bool, bool]:
+    """Return ``(is_loss, is_unique)``.
+
+    A new signature is unique and resets the stuck count. The same bytes
+    stay a published frame until they have repeated across several grabs,
+    the car is above creep, and the last new frame is older than
+    ``PRIOR_LANE_MAX_S``. All-zero buffers are rejected before this.
+    """
+    from python.perception.pipeline import PRIOR_LANE_MAX_S
+
+    prev = sigs.get(cid)
+    if sig != prev:
+        sigs[cid] = sig
+        stuck[cid] = 1
+        good_ts[cid] = float(ts)
+        return False, True
+    n = int(stuck.get(cid, 1)) + 1
+    stuck[cid] = n
+    age = float(ts) - float(good_ts.get(cid, ts))
+    loss = (
+        n >= STUCK_FRAME_GRABS
+        and grab_ego_speed() > CREEP_MPS
+        and age > PRIOR_LANE_MAX_S
+    )
+    return loss, False
+
+
+def _clear_sig_state(owner: Any, cid: str | None = None) -> None:
+    sigs = getattr(owner, "_frame_sig", None)
+    stuck = getattr(owner, "_stuck_n", None)
+    good = getattr(owner, "_good_ts", None)
+    if cid is None:
+        if isinstance(sigs, dict):
+            sigs.clear()
+        if isinstance(stuck, dict):
+            stuck.clear()
+        if isinstance(good, dict):
+            good.clear()
+        return
+    if isinstance(sigs, dict):
+        sigs.pop(cid, None)
+    if isinstance(stuck, dict):
+        stuck.pop(cid, None)
+    if isinstance(good, dict):
+        good.pop(cid, None)
+
+
 @runtime_checkable
 class CameraBackend(Protocol):
     name: str
@@ -1198,6 +1276,9 @@ class WindowBackend:
         self._region: dict[str, int] | None = None
         self._note = "retail: 1 window"
         self._title_match = False
+        self._frame_sig: dict[str, tuple[Any, ...]] = {}
+        self._stuck_n: dict[str, int] = {}
+        self._good_ts: dict[str, float] = {}
 
     def _apply_window_rect(self, rect: tuple[int, int, int, int] | None) -> None:
         """Lock onto the Drive window when it exists; keep last region if the title flickers."""
@@ -1242,6 +1323,7 @@ class WindowBackend:
 
     def close(self) -> None:
         self._cam = None
+        _clear_sig_state(self)
         if self._mss is not None:
             try:
                 self._mss.close()
@@ -1354,6 +1436,30 @@ class WindowBackend:
         if getattr(img, "ndim", 0) == 3 and img.shape[2] == 3 and img.dtype == np.uint8:
             img = recover_viewport_tone(img)
         ts = time.time()
+        if frame_is_unrendered(img):
+            health["main"] = CamHealth.MISSING
+            return CameraFrameBundle(
+                frames={},
+                timestamps={},
+                health=health,
+                backend=self.name,
+                note=self._note,
+                unique_gpu_n=0,
+            )
+        sig = frame_signature(img)
+        is_loss, is_unique = classify_frame_signature(
+            self._frame_sig, self._stuck_n, self._good_ts, "main", sig, ts
+        )
+        if is_loss:
+            health["main"] = CamHealth.MISSING
+            return CameraFrameBundle(
+                frames={},
+                timestamps={},
+                health=health,
+                backend=self.name,
+                note=self._note,
+                unique_gpu_n=0,
+            )
         frames["main"] = img
         frames["cam_main"] = img
         timestamps["main"] = ts
@@ -1365,8 +1471,8 @@ class WindowBackend:
             health=health,
             backend=self.name,
             note=self._note,
-            unique_gpu_n=1,
-            unique_gpu_ids=("main",),
+            unique_gpu_n=1 if is_unique else 0,
+            unique_gpu_ids=("main",) if is_unique else (),
         )
 
 
@@ -1407,6 +1513,8 @@ class BeamNGPyBackend:
         self._Camera: Any = None
         self._sensor_kwargs: dict[str, dict[str, Any]] = {}
         self._frame_sig: dict[str, tuple[Any, ...]] = {}
+        self._stuck_n: dict[str, int] = {}
+        self._good_ts: dict[str, float] = {}
         self._unique_hz_ema = 0.0
         self._unique_n = 0
         self._open_mono = 0.0
@@ -1473,6 +1581,8 @@ class BeamNGPyBackend:
         self._hitch_steps = []
         self._sensor_kwargs = {}
         self._frame_sig = {}
+        self._stuck_n = {}
+        self._good_ts = {}
         self._unique_hz_ema = 0.0
         self._unique_n = 0
         self._open_mono = time.monotonic()
@@ -1666,6 +1776,8 @@ class BeamNGPyBackend:
         self._hitch_steps.clear()
         self._sensor_kwargs.clear()
         self._frame_sig.clear()
+        self._stuck_n.clear()
+        self._good_ts.clear()
         self._cache_frames.clear()
         self._cache_ts.clear()
         self._adhoc = None
@@ -1801,7 +1913,7 @@ class BeamNGPyBackend:
         rate = float(self._update_s.get(cid, FORWARD_UPDATE_S))
         self._clip_planes[cid] = (near, float(far_m))
         self._hitch_steps.append((cid, near, float(far_m), rate))
-        self._frame_sig.pop(cid, None)
+        _clear_sig_state(self, cid)
         return True
 
     def _io_busy(self) -> bool:
@@ -1859,6 +1971,8 @@ class BeamNGPyBackend:
         if sig == self._frame_sig.get(cid):
             return
         self._frame_sig[cid] = sig
+        self._stuck_n[cid] = 1
+        self._good_ts[cid] = float(self._cache_ts.get(cid, time.time()))
         if cid not in self._late_unique:
             self._late_unique.append(cid)
 
@@ -1959,10 +2073,24 @@ class BeamNGPyBackend:
             return
         bgr = recover_viewport_tone(bgr)
         sig = frame_signature(bgr)
-        unique = sig != self._frame_sig.get(cid)
+        # One repeat is still this picture. A stuck buffer is a loss only
+        # after several identical grabs, while moving, and after the prior
+        # window. Until then the last good frame stays in the bundle.
+        # Tests build a backend with ``__new__`` and only some of these maps.
+        if not isinstance(getattr(self, "_frame_sig", None), dict):
+            self._frame_sig = {}
+        if not isinstance(getattr(self, "_stuck_n", None), dict):
+            self._stuck_n = {}
+        if not isinstance(getattr(self, "_good_ts", None), dict):
+            self._good_ts = {}
+        is_loss, is_unique = classify_frame_signature(
+            self._frame_sig, self._stuck_n, self._good_ts, cid, sig, ts
+        )
+        if is_loss:
+            self._omit_unread(cid, frames, timestamps, health)
+            return
         self._store_frame(cid, bgr, ts, frames, timestamps, health)
-        if unique:
-            self._frame_sig[cid] = sig
+        if is_unique:
             unique_ids.append(cid)
 
     def _kick_adhoc(self, cid: str, cam: Any) -> bool:

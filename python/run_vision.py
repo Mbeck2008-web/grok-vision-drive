@@ -51,11 +51,17 @@ from python.viz.review_log import ReviewCapture
 from python.viz.nerd import image_point_from_window_mouse
 from python.train.scene_net import live_strip_fields
 from python.viz.stage import drawn_lane_records
-from python.sensors.cameras import CAM_IDS, CamHealth, bundle_tick_frames
+from python.sensors.cameras import CAM_IDS, CamHealth, bundle_tick_frames, note_grab_ego_speed
 from python.runtime.debug_opts import apply_to_command, apply_to_perception
 from python.runtime.hw_probe import ema_hz, gpu_vram_used_gb, probe, refuse_live_start, unique_frame_hz_inst
 from python.runtime.models import ModelRuntime
-from python.runtime.shadow import ShadowConfig, load_shadow_config, shadow_tick
+from python.runtime.shadow import (
+    ShadowConfig,
+    VisionLoss,
+    hold_for_vision_loss,
+    load_shadow_config,
+    shadow_tick,
+)
 from python.runtime.state_io import (
     default_state,
     load_paint_state,
@@ -258,6 +264,12 @@ def main() -> None:
         help="GVD VISION monitor: auto|1|2 (or GVD_VIZ_MONITOR). auto→non-primary if present",
     )
     ap.add_argument("--viz-fullscreen", action="store_true", help="Fullscreen GVD VISION on chosen monitor")
+    ap.add_argument(
+        "--max-ticks",
+        type=int,
+        default=0,
+        help="Stop after this many supervisor ticks. 0 runs until quit.",
+    )
     ap.add_argument(
         "--tech-probe",
         action="store_true",
@@ -503,6 +515,7 @@ def main() -> None:
     prev_preview = bool(args.allow_preview_drive)
     prev_engaged = False
     bot_engage = BotEngage()
+    vision_loss = VisionLoss()
     prev_bot = False
     engage_arm_mono: float | None = None
     review_cap = ReviewCapture()
@@ -529,6 +542,7 @@ def main() -> None:
                     )
 
             t_grab = time.perf_counter()
+            note_grab_ego_speed(last_ego_v)
             bundle = backend.grab()
             grab_ms = float(getattr(bundle, "grab_ms", 0.0) or 0.0)
             if grab_ms <= 0:
@@ -665,6 +679,18 @@ def main() -> None:
                 engage_hz_grace_floor=shadow_cfg.engage_hz_grace_floor,
             )
 
+            planner_now = pout.planner if isinstance(pout.planner, dict) else {}
+            loss_age = vision_loss.age(
+                str(planner_now.get("lanes_source") or ""),
+                time.monotonic(),
+                camera_lost=bool(planner_now.get("camera_lost")),
+                windshield_live=bool(planner_now.get("windshield_live")),
+            )
+            if vision_loss.dropped or vision_loss.hold_until_stop:
+                # This episode already dropped Engage. A leftover flag or
+                # --force-engage must not resume. Side lanes that look live
+                # do not end it, and the brake hold lasts until the car stops.
+                engaged = False
             cmd_seq += 1
             wide = None
             try:
@@ -692,6 +718,7 @@ def main() -> None:
                 loop_hz=loop_hz_ema,
                 camera_hz=cam_hz_ema,
                 engage_age_s=engage_age_s,
+                vision_loss_age_s=loss_age,
             )
             cmd = tick.applied
 
@@ -700,15 +727,30 @@ def main() -> None:
                 cmd = stop_command(seq=cmd_seq, reason="bus_mismatch")
             elif not engaged:
                 disengage_reason = "not_engaged"
-            elif tick.should_disengage:
+            elif cmd.reason in ("camera_lost", "lanes_lost") or tick.should_disengage:
                 veto_name = str(tick.veto_reason or "veto")
-                if ui.debug.ignore_veto_disengage and veto_name != "heartbeat_stale":
+                if cmd.reason in ("camera_lost", "lanes_lost"):
+                    veto_name = cmd.reason
+                # A dark camera is not a debug-ignore. The brake stays the
+                # speed-law command already on ``cmd`` (not brake=1).
+                if (
+                    ui.debug.ignore_veto_disengage
+                    and veto_name not in ("heartbeat_stale", "camera_lost", "lanes_lost")
+                ):
                     disengage_reason = veto_name if veto_name != "none" else "veto"
-                else:
+                elif tick.should_disengage:
                     engaged = False
                     disengage_reason = veto_name if veto_name != "none" else "veto"
+                    if veto_name in ("camera_lost", "lanes_lost"):
+                        vision_loss.note_disengage()
                     bot_engage.clear()
-                    write_engage_flag(False, disengage_reason=disengage_reason)
+                    # A moving dark-camera drop keeps the engage file so retail
+                    # Lua does not releaseInputs. The file goes false at a stop.
+                    if not vision_loss.defer_release:
+                        write_engage_flag(False, disengage_reason=disengage_reason)
+                    print(f"[GVD] DISENGAGED: {disengage_reason}", flush=True)
+                else:
+                    disengage_reason = veto_name
             elif cmd.reason == "preview_blocked":
                 disengage_reason = "preview_blocked"
             elif cmd.reason == "heartbeat_stale":
@@ -753,15 +795,38 @@ def main() -> None:
 
             cmd = apply_to_command(ui.debug, cmd)
 
+            # A dropped dark-camera episode keeps braking until the car is
+            # stopped. not_engaged / stop() would release the pedals. The hold
+            # stays up while moving even if side lanes cleared the loss clock.
+            holding_blind = False
+            if vision_loss.hold_until_stop or vision_loss.dropped:
+                cmd, holding_blind = hold_for_vision_loss(
+                    cmd, ego_speed_mps=ego_v, seq=cmd_seq
+                )
+                if not holding_blind:
+                    vision_loss.hold_until_stop = False
+                    if vision_loss.defer_release:
+                        write_engage_flag(False, disengage_reason=disengage_reason or cmd.reason)
+                        vision_loss.defer_release = False
+
             # Actuators only when engaged + command ok (path / tracks / shadow already on this tick).
             # cmd_json: Lua applies whatever we write only while `engaged` rides along in the payload.
             # beamngpy: note_engaged(False) makes stop() release once, then not call vehicle.control.
+            # hold() is release=False and does not check Engage.
             if hasattr(actuator, "note_engaged"):
                 actuator.note_engaged(engaged)
             if hasattr(actuator, "note_ack"):
                 actuator.note_ack(ego_fb)
-            if engaged and cmd.reason == "ok":
+            blind_stop = cmd.reason in ("camera_lost", "lanes_lost")
+            hold = getattr(actuator, "hold", None) if holding_blind else None
+            if holding_blind and callable(hold):
+                applied = hold(cmd)
+            elif (engaged and cmd.reason == "ok") or (blind_stop and (engaged or tick.should_disengage)):
+                # The disengage tick still sends the smooth brake, not stop().
                 applied = actuator.apply(cmd)
+            elif holding_blind:
+                applied = cmd
+                applied.applied = False
             else:
                 applied = actuator.stop(seq=cmd_seq, reason=cmd.reason)
             # Reference for the override residual, keyed by seq so the mod's ack can find the
@@ -1040,6 +1105,8 @@ def main() -> None:
                     ui.set_layer(int(chr(key)))
 
             frame_i += 1
+            if args.max_ticks and frame_i >= args.max_ticks:
+                break
             dt = 1.0 / max(args.hz, 1.0)
             time.sleep(max(0.0, dt - (time.perf_counter() - loop_t0)))
     except KeyboardInterrupt:

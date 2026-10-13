@@ -17,6 +17,9 @@ from python.planning.path_predictor import predict_path
 MAX_SIGNS = 8
 SIGN_KEEP = 8
 SIGN_MATCH_M = 3.0
+# Remembered lanes are for the drawn path only, and only this long.
+# Real seconds, not ticks. They are not shifted with the car.
+PRIOR_LANE_MAX_S = 0.75
 
 
 @dataclass
@@ -45,6 +48,8 @@ class ModularPerception:
         self.detector, self.missing = load_detector(detector_id, allow_synthetic=allow_synthetic)
         self.tracker = IoUTracker()
         self._prior_lanes: list = []
+        self._prior_lanes_mono = 0.0
+        self._seen_live_lanes = False
         self._prior_signs: list[dict[str, Any]] = []
 
     def set_detector(self, detector: Any, missing: list[str] | None = None) -> None:
@@ -53,6 +58,8 @@ class ModularPerception:
         self.missing = list(missing or [])
         self.tracker = IoUTracker()
         self._prior_lanes = []
+        self._prior_lanes_mono = 0.0
+        self._seen_live_lanes = False
         self._prior_signs = []
 
     def tick(
@@ -62,6 +69,7 @@ class ModularPerception:
         stitch_bgr: np.ndarray | None = None,
         ego_speed_mps: float = 0.0,
         steer_deg: float = 0.0,
+        now: float | None = None,
     ) -> PerceptionOut:
         # The wheel is for the override residual and the ego display. The route
         # is predicted from lanes, vehicles, and signs, then followed.
@@ -93,11 +101,26 @@ class ModularPerception:
         tracks = self.tracker.update(moving, time.time())
         track_dicts = self.tracker.as_dicts()
         lanes = lanes_from_view(main_bgr, stitch_bgr)
+        mono = time.monotonic() if now is None else float(now)
         prior_lanes = None
-        if lanes.lanes_bev:
-            self._prior_lanes = lanes.lanes_bev
-        elif self._prior_lanes:
+        # Side and rear pose lines are not the road ahead. A windshield fit
+        # on a real main picture is the only live source. Posed lanes must
+        # not refresh the prior timer or look like a recovery.
+        main_missing = _main_picture_missing(main_bgr)
+        windshield = int(getattr(lanes, "forward_n", 0) or 0) > 0 and not main_missing
+        if windshield:
+            self._prior_lanes = list(lanes.lanes_bev)
+            self._prior_lanes_mono = mono
+            self._seen_live_lanes = True
+            lanes_source = "live"
+        elif self._seen_live_lanes and self._prior_lanes and (mono - self._prior_lanes_mono) <= PRIOR_LANE_MAX_S:
             prior_lanes = self._prior_lanes
+            lanes_source = "prior"
+        elif self._seen_live_lanes:
+            self._prior_lanes = []
+            lanes_source = "none"
+        else:
+            lanes_source = "unseen"
         cipv = select_cipv(track_dicts, path_width=2.0, ego_speed_mps=ego_speed_mps)
         plan = predict_path(
             lanes_bev=lanes.lanes_bev,
@@ -157,11 +180,24 @@ class ModularPerception:
                 "path_length_m": plan.path_length_m,
                 "pred_brake": plan.pred_brake,
                 "blinker": plan.blinker,
+                "lanes_source": lanes_source,
+                "camera_lost": main_missing,
+                "windshield_live": windshield,
             },
             infer_ms=infer_ms,
             missing=missing,
             detector_name=self.detector.name,
         )
+
+
+def _main_picture_missing(main_bgr: np.ndarray | None) -> bool:
+    """True when this tick has no main picture. An all-zero buffer is not a frame."""
+    if main_bgr is None or not isinstance(main_bgr, np.ndarray) or main_bgr.size == 0:
+        return True
+    try:
+        return int(main_bgr.max()) == 0
+    except (TypeError, ValueError):
+        return True
 
 
 def _hold_signs(prior: list[dict[str, Any]], fresh: list[dict[str, Any]]) -> list[dict[str, Any]]:

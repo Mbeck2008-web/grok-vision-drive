@@ -154,6 +154,10 @@ Fender repeaters move closer to the body, lower, and slightly back. repeatL is X
 
 With no cameras, Engage plus preview drive is a stop. Throttle is 0, steer is 0, and the brake is `min(0.6, 0.05 * echo speed)` (0.275 at the 5.5 m/s retail echo). A two-lane frame still commands throttle. `.github/workflows/tests.yml` runs the offline scripts on Ubuntu. Windows-only and live BeamNG scripts are skipped. Live Alt+G, Tech 8-cam, force feedback, and Quick Sync stay **UNPROVEN**.
 
+## Dark cameras
+
+One repeated frame is still that picture. A stuck buffer counts as a loss only after several identical grabs, while the car is above creep, and once the last new frame is older than 0.75 s. An all-zero buffer is unrendered. Until that loss, the last good frame stays in the bundle. After the fit has seen lanes, a dark main camera or a failed fit stops following the remembered path. The command is the speed-law brake (at most 0.6, steer 0), not a full brake of 1. Engage drops after about 1 s with reason `camera_lost` or `lanes_lost`. While that episode is still moving, Tech keeps `vehicle.control` on the brake (`release` false), including the parking brake when nearly stopped, and releases only after a stop. `camera_lost` still wins when lanes are marked live. Remembered lanes are dropped after 0.75 s. They are not moved with the car. A stub that has never seen lanes is unchanged. Covering a camera on a live car is **UNPROVEN** here. The product pin stays **1.7.12** until this batch merges.
+
 ## 1.7.9 around the car
 
 One supervisor tick reads all eight cameras, then builds the stitch. A camera from an older tick is not reused. Pillar, repeater, and rear lane pixels use that camera's pose, so a side pixel lands beside the car and a rear pixel lands behind it. The steer tick can use those points. Drawn lane lines follow the real points past the blue path and stop where the lane cannot be seen or predicted.

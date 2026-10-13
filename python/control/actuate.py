@@ -1146,6 +1146,23 @@ class BeamNGPyActuator:
         self._latched = True
         return cmd
 
+    def hold(self, cmd: DriveCommand) -> DriveCommand:
+        """Send this command with ``release=False`` even when Engage is off.
+
+        A dark camera drops the latch and must keep braking. ``stop()`` while
+        disengaged is the pedal release. ``apply()`` refuses when not engaged.
+        """
+        err = self._control(
+            cmd.steer, cmd.throttle, cmd.brake, release=False, blinker="off",
+        )
+        if err:
+            cmd.applied = False
+            cmd.reason = err
+            return cmd
+        cmd.applied = True
+        self._latched = True
+        return cmd
+
     def stop(
         self, seq: int = 0, reason: str = "stop", *, now: float | None = None
     ) -> DriveCommand:
@@ -1240,6 +1257,20 @@ class CmdJsonActuator:
             else:
                 cmd.reason = "cmd_json_idle"  # not engaged: Lua keeps its hands off the car
         return cmd
+
+    def hold(self, cmd: DriveCommand) -> DriveCommand:
+        """Keep writing this brake with ``engaged: true`` until the car is stopped.
+
+        ``apply`` while the latch is off writes ``engaged: false``. Retail Lua
+        releases on that flag and a later tick that does not write leaves the
+        release in place. A hold puts the brake on the bus every tick.
+        """
+        saved = self.engaged
+        self.engaged = True
+        try:
+            return self.apply(cmd)
+        finally:
+            self.engaged = saved
 
     def stop(self, seq: int = 0, reason: str = "stop") -> DriveCommand:
         cmd = stop_command(seq=seq, reason=reason)

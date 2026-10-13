@@ -1249,7 +1249,11 @@ def check_beamngpy_side_grab_half_rate() -> None:
         first = be.grab()
         second = be.grab()
         assert "main" in first.unique_gpu_ids
+        assert "main" in first.frames
         assert "main" not in second.unique_gpu_ids
+        # One repeat is still this picture. It is not a new GPU frame.
+        assert "main" in second.frames
+        assert second.health["main"] == CamHealth.OK
 
         # live unique-Hz hitch 800→400 (warmup already elapsed)
         import time as _time

@@ -65,7 +65,7 @@ def cabin_drive_word(state: dict[str, Any]) -> tuple[str, tuple[int, int, int]]:
     aeb = str((planner or {}).get("aeb") or "off")
     veto = str(state.get("veto_reason") or "none")
     if (
-        reason in ("preview_blocked", "heartbeat_stale", "bus_mismatch")
+        reason in ("preview_blocked", "heartbeat_stale", "bus_mismatch", "camera_lost", "lanes_lost")
         or reason.startswith("veto:")
         or aeb in ("brake", "warn")
         or veto == "e2e_stub"

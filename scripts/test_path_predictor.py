@@ -369,14 +369,17 @@ class _Veh:
     def control(self, **kw) -> None:
         self.calls.append(kw)
 
-    def queue_lua_command(self, *_a, **_k) -> None:
+    def queue_lua_command(self, chunk, *_a, **_k) -> None:
+        self.lua = getattr(self, "lua", [])
+        self.lua.append(chunk)
         return None
 
 
 def check_drive_gear_socket_and_override(cmd) -> None:
-    """Engaged and in drive: vehicle.control gets the path, not the wheel.
+    """Engaged and in drive: the gvd hold gets the path steer, not the wheel.
 
-    The socket skip and the pedal override stay in front of that command.
+    vehicle.control keeps the pedals and omits steering. The socket skip and
+    the pedal override stay in front of that command.
     """
     import python.sensors.cameras as cams
 
@@ -408,12 +411,17 @@ def check_drive_gear_socket_and_override(cmd) -> None:
         assert veh.shifts == [TECH_SHIFT_MODE]
         assert len(veh.calls) == 1, veh.calls
         drove = veh.calls[0]
-        assert abs(drove["steering"] - fresh.steer) < 1e-6
+        assert "steering" not in drove
         assert abs(drove["throttle"] - fresh.throttle) < 1e-6
         assert "gear" not in drove
-        # Electrics still say the wheel is left. The command is the path's right turn.
-        assert drove["steering"] != veh.sensors["electrics"]["steering_input"]
-        assert drove["steering"] > 0.3 and veh.sensors["electrics"]["steering_input"] < 0.0
+        assert "brake" in drove and "parkingbrake" in drove
+        # The path's right turn is the gvd hold. Control must not write the
+        # shared local steer slot, or a held wheel grab is replaced by the command.
+        from python.control.actuate import tech_steer_hold_lua
+
+        assert tech_steer_hold_lua(fresh.steer) in veh.lua
+        assert veh.sensors["electrics"]["steering_input"] < 0.0
+        assert fresh.steer > 0.3
 
         cfg = load_override_config(yaml.safe_load(CONTROL_YAML.read_text(encoding="utf-8")))
         det = OverrideDetector(cfg)
@@ -635,6 +643,9 @@ def check_bend_not_roundabout_and_blinkers() -> None:
 
         def set_lights(self, **kw) -> None:
             self.lights.append(kw)
+
+        def queue_lua_command(self, chunk, response: bool = False) -> None:
+            return None
 
     veh = _Lights()
     act = BeamNGPyActuator(veh)

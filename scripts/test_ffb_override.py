@@ -46,6 +46,7 @@ PIN_KEYS = (
     "brake_enter",
     "throttle_enter",
     "lpf_tau_ms",
+    "steer_center_deadband",
 )
 
 
@@ -109,6 +110,7 @@ def check_config() -> None:
     assert cfg.brake_enter == ov["brake_enter"] == 0.06
     assert cfg.throttle_enter == ov["throttle_enter"] == 0.10
     assert cfg.lpf_tau_ms == LPF_TAU_MS == ov["lpf_tau_ms"] == 80
+    assert cfg.steer_center_deadband == ov["steer_center_deadband"] == 0.15
     assert cfg.steer_exit < cfg.steer_enter
     assert cfg.brake_enter < cfg.throttle_enter, "pedals are asymmetric: brake is tighter"
 

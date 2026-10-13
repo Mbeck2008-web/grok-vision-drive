@@ -154,6 +154,10 @@ Fender repeaters move closer to the body, lower, and slightly back. repeatL is X
 
 With no cameras, Engage plus preview drive is a stop. Throttle is 0, steer is 0, and the brake is `min(0.6, 0.05 * echo speed)` (0.275 at the 5.5 m/s retail echo). A two-lane frame still commands throttle. `.github/workflows/tests.yml` runs the offline scripts on Ubuntu. Windows-only and live BeamNG scripts are skipped. Live Alt+G, Tech 8-cam, force feedback, and Quick Sync stay **UNPROVEN**.
 
+## Engaged steer
+
+While Engage is on in BeamNG.tech, the car follows the controller steer. `vehicle.control` does not carry steering on that path, so a wheel held at an angle stays the grab signal. A physical wheel sitting at center leaves the controller steer in place. The locked residual uses a straight/centre deadband of 0.15. A wheel between 0 and the command stays engaged. A held 0.25 past that deadband drops Engage, and that held angle drives the car again. JSON null before any numeric wheel sample is no steering device, so it does not start the 2 second `tech_wheel_blind` timer. After a number has been seen, a later null, a missing field, or a stale `gvd_ego.json` does. Arcade at rest can report gear `N` while another field is already drive; one drive-arm queue is enough, and a later standstill `N` is not re-queued. The product pin stays **1.7.12**.
+
 ## 1.7.9 around the car
 
 One supervisor tick reads all eight cameras, then builds the stitch. A camera from an older tick is not reused. Pillar, repeater, and rear lane pixels use that camera's pose, so a side pixel lands beside the car and a rear pixel lands behind it. The steer tick can use those points. Drawn lane lines follow the real points past the blue path and stop where the lane cannot be seen or predicted.

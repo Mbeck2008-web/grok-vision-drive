@@ -53,7 +53,14 @@ from python.train.scene_net import live_strip_fields
 from python.viz.stage import drawn_lane_records
 from python.sensors.cameras import CAM_IDS, CamHealth, bundle_tick_frames
 from python.runtime.debug_opts import apply_to_command, apply_to_perception
-from python.runtime.hw_probe import ema_hz, gpu_vram_used_gb, probe, refuse_live_start, unique_frame_hz_inst
+from python.runtime.hw_probe import (
+    ema_hz,
+    gpu_vram_used_gb,
+    probe,
+    refuse_live_start,
+    start_gpu_vram_poll,
+    unique_frame_hz_inst,
+)
 from python.runtime.models import ModelRuntime
 from python.runtime.shadow import ShadowConfig, load_shadow_config, shadow_tick
 from python.runtime.state_io import (
@@ -506,6 +513,7 @@ def main() -> None:
     prev_bot = False
     engage_arm_mono: float | None = None
     review_cap = ReviewCapture()
+    start_gpu_vram_poll()
     try:
         while True:
             loop_t0 = time.perf_counter()

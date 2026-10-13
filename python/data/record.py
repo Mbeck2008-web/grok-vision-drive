@@ -1,7 +1,8 @@
 """M4 clips: ring-buffer cam_main + state jsonl, flush on trigger.
 
 Encode preference: h264_qsv (UHD 630) → libx264 → (only if --encode nvenc) h264_nvenc.
-Ring cap ≤2 GB. Atomic flush via temp dir + rename. Never invent frames.
+The ring keeps pre+post seconds and is capped by config, well under 1 GiB.
+Atomic flush via temp dir + rename. Never invent frames.
 Live QSV still UNPROVEN until Windows smoke.
 """
 
@@ -21,10 +22,33 @@ import numpy as np
 
 from python.runtime.state_io import gvd_docs_dir
 
-RING_CAP_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
+# Hard ceiling. A config value above this is clamped. Well under 1 GiB.
+CLIP_RING_CEILING_BYTES = 256 * 1024 * 1024
+CLIP_RING_DEFAULT_MB = 64
 DEFAULT_PRE_S = 4.0
 DEFAULT_POST_S = 2.0
 TRIGGER_COOLDOWN_S = 8.0
+
+
+def clip_ring_cap_bytes() -> int:
+    """Configured ring cap from ``config/hardware.yaml`` ``clip_ring_max_mb``.
+
+    Default 64 MiB. Never above ``CLIP_RING_CEILING_BYTES``.
+    """
+    mb = float(CLIP_RING_DEFAULT_MB)
+    path = Path(__file__).resolve().parents[2] / "config" / "hardware.yaml"
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.split("#", 1)[0].strip()
+            if stripped.startswith("clip_ring_max_mb:"):
+                mb = float(stripped.split(":", 1)[1].strip())
+                break
+    except (OSError, ValueError):
+        mb = float(CLIP_RING_DEFAULT_MB)
+    if mb <= 0:
+        mb = float(CLIP_RING_DEFAULT_MB)
+    nbytes = int(mb * 1024 * 1024)
+    return min(max(nbytes, 1), CLIP_RING_CEILING_BYTES)
 
 
 def clips_dir() -> Path:
@@ -112,7 +136,7 @@ class RingFrame:
 class ClipRecorder:
     """Rolling cam_main ring; flush to Documents/GVD/clips/ on trigger."""
 
-    max_bytes: int = RING_CAP_BYTES
+    max_bytes: int = 0
     pre_s: float = DEFAULT_PRE_S
     post_s: float = DEFAULT_POST_S
     encode_prefer: str = "qsv"
@@ -133,6 +157,9 @@ class ClipRecorder:
     encoder: str = "none"
 
     def __post_init__(self) -> None:
+        if self.max_bytes <= 0:
+            self.max_bytes = clip_ring_cap_bytes()
+        self.max_bytes = min(int(self.max_bytes), CLIP_RING_CEILING_BYTES)
         self.encoder = choose_encoder(prefer=self.encode_prefer, allow_nvenc=self.allow_nvenc)
 
     def _encode_jpeg(self, bgr: np.ndarray) -> bytes | None:
@@ -177,11 +204,12 @@ class ClipRecorder:
         fr = RingFrame(t=t, jpeg=jpeg, state=slim)
         self._buf.append(fr)
         self._bytes += fr.nbytes
-        self._trim()
+        # Keep only the clip window. Do not wait until the ring is half a gigabyte.
         cutoff = t - (self.pre_s + self.post_s + 1.0)
-        while self._buf and self._buf[0].t < cutoff and self._bytes > self.max_bytes // 2:
+        while self._buf and self._buf[0].t < cutoff:
             old = self._buf.popleft()
             self._bytes -= old.nbytes
+        self._trim()
         return True
 
     def note_engage(self, engaged: bool) -> str | None:

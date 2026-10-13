@@ -16,11 +16,13 @@ dgpu:
   tensor_cores: false
 igpu: uhd_630
 igpu_roles: [qsv_encode, optional_osd_display]
+# Clip ring cap in MiB. Clamped in code to 256 MiB, well under 1 GiB.
+clip_ring_max_mb: 64
 ram_budget_gb:
   windows: 6
   beamng: 12
   gvd_peak: 10
-  clip_ring: 2
+  clip_ring: 0.064
   unallocated_headroom: 4
 encode:
   backend: qsv          # h264_qsv / hevc_qsv

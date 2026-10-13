@@ -1928,6 +1928,55 @@ end
 
 function M.onUpdate(dt)
   pollState(dt)
+  -- Lost-supervisor timer counts onUpdate only. pollState also runs from onPreRender
+  -- and would halve a shared accumulator. About 2 s here is about 2 s in game.
+  -- Tech never sets `applying`, so the retail command dead-man does not zero
+  -- vehicle.control. This queues throttle 0 on filter 1 and on source gvd, then
+  -- a service brake while moving or the parking brake when nearly stopped
+  -- (arcade treats a held service brake with no throttle as reverse).
+  local techDead = "input.event('throttle',0,1);"
+    .. "input.event('throttle',0,2,0,0,nil,'gvd');"
+    .. "local ev=(electrics and electrics.values) or {};"
+    .. "local sp=tonumber(ev.wheelspeed or ev.airspeed) or 0;"
+    .. "if sp<1.5 then "
+    .. "input.event('brake',0,1);input.event('brake',0,2,0,0,nil,'gvd');"
+    .. "input.event('parkingbrake',1,1);input.event('parkingbrake',1,2,0,0,nil,'gvd');"
+    .. "else "
+    .. "input.event('parkingbrake',0,1);input.event('parkingbrake',0,2,0,0,nil,'gvd');"
+    .. "input.event('brake',0.6,1);input.event('brake',0.6,2,0,0,nil,'gvd');"
+    .. "end"
+  if not engaged or lastGood == nil then
+    M.supLostAcc = 0
+    M.supLostFired = nil
+  else
+    local beat = tonumber(lastGood.heartbeat_mtime)
+    if beat ~= M.supLostBeat then
+      M.supLostBeat = beat
+      M.supLostAcc = 0
+      M.supLostFired = nil
+      M.supLostNeedPedal = nil
+    end
+    M.supLostAcc = (M.supLostAcc or 0) + (dt or 0)
+    if M.supLostAcc >= 2.0 and not M.supLostFired then
+      M.supLostFired = true
+      M.supLostNeedPedal = true
+      if applying then releaseInputs('supervisor heartbeat stale') end
+      engaged = false
+      fadeAcc = 0
+      writeEngageFile('supervisor_lost')
+      log('W', 'GVD', '[GVD] DISENGAGED: supervisor heartbeat stale')
+      print('[GVD] DISENGAGED: supervisor heartbeat stale')
+      pushUi()
+    end
+  end
+  -- Retry until a vehicle exists. Dropping the latch must not wait on getPlayerVeh,
+  -- and a nil vehicle must not leave the last Tech throttle applied.
+  if M.supLostNeedPedal then
+    local veh = getPlayerVeh()
+    if veh and queueVehicle(veh, techDead) then
+      M.supLostNeedPedal = nil
+    end
+  end
   -- Python honors engaged:true only while mtime is fresh (~2.5 s). Refresh the stamp
   -- while the in-game latch is on. Do not move lastEngageWriteUnix, and do not write
   -- true over a supervisor false that pollState has not adopted yet. Kept inline so

@@ -62,13 +62,13 @@ The settled game view. Soft Esc parked.
 
 ![rear](docs/cams/rear.jpg)
 
-## Recent changes (alpha 1.7.12)
+## Recent changes (alpha 1.7.13)
 
-The offline suite names the no-lane stop, and GitHub Actions runs that suite on pull requests and on pushes to main. Catch-up from **1.0.1**. Each feature merge since that pin is one main step. The throttle fix is the point in between. Live Alt+G, Tech 8-cam, and QSV stay **UNPROVEN**.
+The offline suite names the no-lane stop, and GitHub Actions runs that suite on pull requests and on pushes to main. Catch-up from **1.0.1**. Each feature merge since that pin is one main step. The throttle fix is the point in between. Live Alt+G, Tech 8-cam, and QSV stay **UNPROVEN**. A new supervisor starts disengaged. A stale heartbeat drops the in-game latch and zeros Tech throttle.
 
 ## Still in force from 1.0.1
 
-- A leftover `gvd_engage.json` `engaged:true` does not start the car. Python honors that flag only while its timestamp is about 2.5 s fresh. Lua refreshes the stamp every 0.5 s while the in-game latch is on, and will not write true over a newer supervisor false.
+- A new supervisor writes `gvd_engage.json` `engaged:false` with reason `supervisor_start` before it drives. A leftover `engaged:true` does not start the car. If the supervisor heartbeat stops moving for about 2 s, Lua drops the latch, writes `supervisor_lost`, zeros throttle, and applies the brake (parking brake when nearly stopped). Lua still refreshes the stamp every 0.5 s while the latch is on, and will not write true over a newer supervisor false. `--force-engage` is a dev flag for that process: retail Lua still waits for Alt+G; Tech `vehicle.control` can still drive under the flag.
 - `--policy e2e` with no `models/e2e_current.onnx` holds the brake (`veto:e2e_stub`) and stays engaged. Shadow keeps the modular command.
 - `cmd_applied` is true only when the Lua ack is this `seq` or up to 5 behind.
 - Retail stays one window (`cams=1/8`). Tech 8-cam is the other product. `--backend auto` does not pick Tech because `beamngpy` imports.
@@ -154,15 +154,19 @@ Fender repeaters move closer to the body, lower, and slightly back. repeatL is X
 
 With no cameras, Engage plus preview drive is a stop. Throttle is 0, steer is 0, and the brake is `min(0.6, 0.05 * echo speed)` (0.275 at the 5.5 m/s retail echo). A two-lane frame still commands throttle. `.github/workflows/tests.yml` runs the offline scripts on Ubuntu. Windows-only and live BeamNG scripts are skipped. Live Alt+G, Tech 8-cam, force feedback, and Quick Sync stay **UNPROVEN**.
 
+## 1.7.13 supervisor start
+
+A new supervisor writes `engaged:false` (`supervisor_start`) before the driving loop. Tech hold, Tech probe, and smoke do not. If `gvd_state.json` `heartbeat_mtime` stays still for about 2 s, the mod drops Engage (`supervisor_lost`) and queues throttle 0 on the pad filter and on source `gvd`. Above about 1.5 m/s that is a service brake. Below that it is the parking brake with the service brake released, so arcade does not treat the hold as reverse. The 2 s timer counts `onUpdate` only. Closing the supervisor console on a live car is **UNPROVEN** here.
+
 ## 1.7.9 around the car
 
 One supervisor tick reads all eight cameras, then builds the stitch. A camera from an older tick is not reused. Pillar, repeater, and rear lane pixels use that camera's pose, so a side pixel lands beside the car and a rear pixel lands behind it. The steer tick can use those points. Drawn lane lines follow the real points past the blue path and stop where the lane cannot be seen or predicted.
 
-## Alpha 1.7.12
+## Alpha 1.7.13
 
 This is **alpha** — may break / not work; improves with fixes.
 
-Canonical pin **1.7.12** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Untagged retail zips use `1.7.12-alpha-<sha>`.
+Canonical pin **1.7.13** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Untagged retail zips use `1.7.13-alpha-<sha>`.
 
 **Versioning** (this line stays **alpha** until a later non-alpha release):
 

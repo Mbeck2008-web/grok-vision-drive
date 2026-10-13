@@ -214,6 +214,26 @@ def write_engage_flag(engaged: bool, disengage_reason: str | None = None) -> Non
     atomic_write_json(engage_path(), payload, indent=None)
 
 
+def disarm_supervisor_start() -> dict:
+    """A new supervisor is not Engage. Lua adopts this newer false.
+
+    Writes ``engaged:false`` with reason ``supervisor_start`` and clears the
+    bot-engage latch. A later fresh ``engaged:true`` (Alt+G) can still drive.
+    ``--force-engage`` is a separate dev flag and does not read this file.
+    """
+    write_engage_flag(False, disengage_reason="supervisor_start")
+    BotEngage().clear()
+    try:
+        data = json.loads(engage_path().read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("engaged", False)
+    data.setdefault("disengage_reason", "supervisor_start")
+    return data
+
+
 def _read_bot_engage() -> dict | None:
     p = bot_engage_path()
     if not p.is_file():

@@ -19,6 +19,7 @@ from python.control.actuate import (
     read_ego_feedback,
     read_electrics_inputs,
     BotEngage,
+    disarm_supervisor_start,
     read_engage_flag,
     soft_esc_state_write_due,
     soft_esc_state_write_mark,
@@ -506,6 +507,14 @@ def main() -> None:
     prev_bot = False
     engage_arm_mono: float | None = None
     review_cap = ReviewCapture()
+    # Before any drive tick. A leftover Alt+G latch must not start the car.
+    # Tech hold, Tech probe, and smoke return above and do not write this.
+    boot_engage = disarm_supervisor_start()
+    print(
+        "[GVD] supervisor start: engaged="
+        f"{boot_engage.get('engaged')} reason={boot_engage.get('disengage_reason')}",
+        flush=True,
+    )
     try:
         while True:
             loop_t0 = time.perf_counter()

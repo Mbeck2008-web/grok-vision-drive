@@ -573,6 +573,56 @@ check(not M.isEngaged(), 'supervisor OFF still wins after a heartbeat')
 local stayed = readFileAll(engagePath)
 check(stayed and stayed:find('"engaged": false', 1, true), 'heartbeat did not rewrite supervisor OFF (' .. tostring(stayed) .. ')')
 
+-- 16) Tech-like dead supervisor: latch on, heartbeat frozen, not applying.
+-- Retail's command dead-man only runs while applying, so this is the Tech gap.
+-- onUpdate-only timer must drop the latch and zero throttle inside ~2.5 s.
+electricsValues.wheelspeed = 5.5
+M.toggleEngage()
+beatState(true, 'none')
+writeCmd(false, 0, 0, 0)
+clearEvents()
+M.onUpdate(0.05)
+check(M.isEngaged(), 'still engaged before the lost-supervisor window')
+for _ = 1, 3 do M.onUpdate(0.5) end
+check(M.isEngaged(), 'under 2 s of a frozen heartbeat keeps the latch (retail dead-man stays first)')
+M.onUpdate(0.5)
+check(not M.isEngaged(), 'frozen heartbeat >= 2 s drops the latch')
+local lost = readFileAll(engagePath)
+check(lost and lost:find('supervisor_lost') ~= nil, 'engage file reason supervisor_lost (' .. tostring(lost) .. ')')
+local sawThr0, sawBrk = false, false
+for _, e in ipairs(events) do
+  if e[1] == 'throttle' and near(e[2], 0) then sawThr0 = true end
+  if e[1] == 'brake' and near(e[2], 0.6) then sawBrk = true end
+end
+check(sawThr0, 'stale heartbeat queued throttle 0')
+check(sawBrk, 'moving car got service brake 0.6 (not a parking-brake hold)')
+check(logs[#logs]:find('supervisor heartbeat stale') ~= nil, 'logged supervisor heartbeat stale')
+
+-- 16b) no vehicle at the moment of the drop: latch still falls, pedals follow once a car exists
+M.toggleEngage()
+beatState(true, 'none')
+writeCmd(false, 0, 0, 0)
+electricsValues.wheelspeed = 0
+local savedVeh = currentVeh
+currentVeh = nil
+clearEvents()
+M.onUpdate(0.05)
+for _ = 1, 4 do M.onUpdate(0.5) end
+check(not M.isEngaged(), 'latch drops even when getPlayerVeh is nil')
+check(#events == 0, 'no pedal event until a vehicle exists')
+local lostNil = readFileAll(engagePath)
+check(lostNil and lostNil:find('supervisor_lost') ~= nil, 'nil vehicle still wrote supervisor_lost')
+currentVeh = savedVeh
+M.onUpdate(0.05)
+local sawPark, sawBrk0, sawThrStop = false, false, false
+for _, e in ipairs(events) do
+  if e[1] == 'parkingbrake' and near(e[2], 1) then sawPark = true end
+  if e[1] == 'brake' and near(e[2], 0) then sawBrk0 = true end
+  if e[1] == 'throttle' and near(e[2], 0) then sawThrStop = true end
+end
+check(sawThrStop and sawPark and sawBrk0, 'nearly stopped: throttle 0, parking brake on, service brake released')
+electricsValues.wheelspeed = 5.5
+
 -- 12) chrome check on everything we push to the vehicle / HUD
 for _, e in ipairs(logs) do assert(not e:lower():find('tesla') and not e:find('FSD'), 'chrome in log: ' .. e) end
 

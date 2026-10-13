@@ -99,6 +99,9 @@ class PathPlan:
     # Extra brake in [0, 1] from the range/range-rate law. 0 leaves the
     # speed-error brake alone. It reaches 1 when the gap demands a full stop.
     range_brake: float = 0.0
+    # Full polyline before a lead trims it. Lateral tests use this, because
+    # the trimmed end sits short of the bumper and misses the car.
+    route_ego: list[dict[str, float]] = field(default_factory=list)
 
     def planner_dict(self) -> dict[str, Any]:
         return {
@@ -173,10 +176,11 @@ def predict_path(
     path = [_pt(x, y) for x, y in raw]
     if len(path) < 2:
         return _expose_pedals(_empty(), ego_speed_mps)
+    route = list(path)
 
     # On the full route, before a lead trims it. The trimmed end sits short
     # of the bumper, and a lateral test against that end would miss the car.
-    asked_brake = _lead_range_brake(tracks or [], path, float(ego_speed_mps))
+    asked_brake = _lead_range_brake(tracks or [], route, float(ego_speed_mps))
     curv = ring_curv if prediction == "roundabout" and ring_curv > 1e-4 else _path_curvature(path)
     occupants = _predict_occupants(tracks or [])
     path, stop_reason, cipv_id, ttc, occupied, stop_dist, closing = _apply_scene(
@@ -221,6 +225,7 @@ def predict_path(
         prediction=prediction,
         occupied=occupied,
         range_brake=range_brake,
+        route_ego=route,
     )
     return _expose_pedals(plan, ego_speed_mps)
 
@@ -764,6 +769,52 @@ def _rate_and_sigma(raw: dict[str, Any], ego_speed_mps: float) -> tuple[float, f
     return _f(raw, "speed_mps", "speed") - float(ego_speed_mps), 0.0
 
 
+def _num(value: Any, default: float | None = None) -> float | None:
+    """Finite float, or None when the value is missing or not a number."""
+    if value is None:
+        return default
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(out):
+        return default
+    return out
+
+
+def vehicle_on_route(
+    x: float,
+    y: float,
+    path: list[dict[str, float]],
+    width_m: float | None = None,
+) -> bool:
+    """Same lateral test the range brake uses. Off the polyline is not a lead.
+
+    A straight ``|x| < 1.4`` tube still contains a car in the next lane once
+    an 80 m curve has bent the route out from under it.
+    """
+    if not path:
+        return False
+    if not math.isfinite(x) or not math.isfinite(y) or y < -0.05:
+        return False
+    idx = _nearest(path, x, y)
+    px = _num(path[idx].get("x"))
+    py = _num(path[idx].get("y"))
+    if px is None or py is None:
+        return False
+    lateral = math.hypot(px - x, py - y)
+    if not math.isfinite(lateral):
+        return False
+    half = VEHICLE_WIDTH if width_m is None else width_m
+    if not math.isfinite(half) or half <= 0.0:
+        half = VEHICLE_WIDTH
+    reach = max(
+        (EGO_WIDTH + VEHICLE_WIDTH) * 0.5 + 0.2,
+        (EGO_WIDTH + half) * 0.5 + 0.2,
+    )
+    return lateral <= reach
+
+
 def _required_brake(gap_m: float, rate_mps: float, sigma_mps: float) -> float:
     """Brake in [0, 1] from required decel.
 
@@ -772,14 +823,22 @@ def _required_brake(gap_m: float, rate_mps: float, sigma_mps: float) -> float:
     Brake is ``a_req / 8``: under the comfort decel while the request is
     small, and 1 when the request reaches the brake limit. The reserve is
     the gap the formula keeps, not an 8 m wall. A gap inside the reserve
-    is already at the bumper.
+    is already at the bumper. A non-finite gap is not a bumper.
     """
-    gap = float(gap_m)
+    gap = _num(gap_m)
+    rate = _num(rate_mps)
+    sigma = _num(sigma_mps)
+    if gap is None or rate is None or sigma is None:
+        return 0.0
     if gap <= _RANGE_RESERVE_M:
         return 1.0
     usable = max(0.25, gap - _RANGE_RESERVE_M)
-    closing = max(0.0, -(float(rate_mps) - _CLOSING_K * max(0.0, float(sigma_mps))))
+    closing = max(0.0, -(rate - _CLOSING_K * max(0.0, sigma)))
+    if not math.isfinite(closing) or not math.isfinite(usable) or usable <= 0.0:
+        return 0.0
     a_req = (closing * closing) / (2.0 * usable)
+    if not math.isfinite(a_req):
+        return 0.0
     return max(0.0, min(1.0, a_req / _BRAKE_DECEL))
 
 
@@ -789,26 +848,31 @@ def _lead_range_brake(tracks: list, path: list[dict[str, float]], ego_speed_mps:
     Anything still in front of the bumper counts, including a lead under
     4 m. Confirmed and unconfirmed leads both use the same law.
     """
-    if not path or float(ego_speed_mps) < 0.05:
+    ego = _num(ego_speed_mps)
+    if not path or ego is None or ego < 0.05:
         return 0.0
     asked = 0.0
-    reach = (EGO_WIDTH + VEHICLE_WIDTH) * 0.5 + 0.2
     for raw in tracks or []:
         if not isinstance(raw, dict):
             continue
         if _cls(raw) not in _VEHICLES:
             continue
-        y = _f(raw, "y")
-        if y < -0.05:
+        y = _num(raw.get("y"))
+        x = _num(raw.get("x"))
+        if y is None or x is None or y < -0.05:
             continue
-        x = _f(raw, "x")
-        idx = _nearest(path, x, y)
-        lateral = math.hypot(path[idx]["x"] - x, path[idx]["y"] - y)
-        half = float(raw.get("width") or raw.get("width_m") or VEHICLE_WIDTH)
-        if lateral > max(reach, (EGO_WIDTH + half) * 0.5 + 0.2):
+        half = _num(raw.get("width"), None)
+        if half is None:
+            half = _num(raw.get("width_m"), VEHICLE_WIDTH)
+        if not vehicle_on_route(x, y, path, half):
             continue
         rate, sigma = _rate_and_sigma(raw, ego_speed_mps)
         asked = max(asked, _required_brake(y, rate, sigma))
+        # A quiet pace that then drops is a lead braking harder than the
+        # filter has admitted. The stop that keeps the gap is full: the
+        # 1.5 m break is already most of a second of lead deceleration.
+        if raw.get("gap_drop_brake") is True:
+            asked = max(asked, 1.0)
     return asked
 
 
@@ -834,11 +898,23 @@ def _predict_occupants(tracks: list) -> list[dict[str, Any]]:
                 sigma = max(0.0, float(raw.get("range_rate_sigma")))
             except (TypeError, ValueError):
                 sigma = 0.0
+            if not math.isfinite(sigma):
+                sigma = 0.0
         unseen = _unseen_s(raw)
-        x = _f(raw, "x") + math.cos(yaw) * speed * unseen
-        y = _f(raw, "y") + math.sin(yaw) * speed * unseen
+        x0 = _num(raw.get("x"))
+        y0 = _num(raw.get("y"))
+        if x0 is None or y0 is None:
+            continue
+        x = x0 + math.cos(yaw) * speed * unseen
+        y = y0 + math.sin(yaw) * speed * unseen
+        if not math.isfinite(x) or not math.isfinite(y):
+            continue
         length = _f(raw, "length", "length_m", default=VEHICLE_LENGTH)
         width = _f(raw, "width", "width_m", default=VEHICLE_WIDTH)
+        if not math.isfinite(length):
+            length = VEHICLE_LENGTH
+        if not math.isfinite(width):
+            width = VEHICLE_WIDTH
         partial = bool(raw.get("partial")) or _f(raw, "seen_fraction", default=1.0) < 0.99
         if partial or length <= 0.0:
             length = max(length, VEHICLE_LENGTH)
@@ -893,8 +969,12 @@ def _apply_scene(
     occupied: list[dict[str, Any]] = []
     station = _along(path)
     for occ in occupants:
+        if not math.isfinite(float(occ["x"])) or not math.isfinite(float(occ["y"])):
+            continue
         idx = _nearest(path, occ["x"], occ["y"])
         lateral = math.hypot(path[idx]["x"] - occ["x"], path[idx]["y"] - occ["y"])
+        if not math.isfinite(lateral):
+            continue
         reach = (EGO_WIDTH + float(occ["width"])) * 0.5 + 0.2
         if lateral > reach:
             continue

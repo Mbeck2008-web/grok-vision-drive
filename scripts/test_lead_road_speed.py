@@ -34,7 +34,10 @@ def _live(plan, tracks, ego: float, seq: int):
     ``follow_path`` reads ``PathPlan.planner_dict()``, which already carried
     ``range_brake``. The live tick used to build a second dict and drop it.
     """
-    cipv = select_cipv(tracks, path_width=2.0, ego_speed_mps=ego)
+    route = plan.route_ego or plan.path_ego
+    cipv = select_cipv(
+        tracks, path_width=2.0, ego_speed_mps=ego, path_ego=route or None,
+    )
     planner = publish_planner(plan, cipv)
     assert "range_brake" in planner
     assert planner["range_brake"] == plan.range_brake
@@ -706,7 +709,7 @@ def check_pacing_lead_brake() -> None:
     """
     found: dict[tuple[float, float, float], float] = {}
     for y0 in (12.5, 16.0, 20.0, 36.0):
-        for noise in (0.5, 1.0, 2.0):
+        for noise in (0.0, 0.5, 1.0, 2.0):
             for hz in (10.0, 15.0):
                 worst = 99.0
                 for seed in range(40):
@@ -746,11 +749,12 @@ def check_pacing_lead_brake() -> None:
                 found[(y0, noise, hz)] = worst
     print("lead-brake gaps m:", {k: round(v, 2) for k, v in found.items()})
     for (y0, noise, hz), gap in found.items():
-        if y0 >= 36.0:
+        if noise <= 0.5 or y0 >= 36.0:
+            # A quiet pace that breaks gets a full stop in time. ±1 m and
+            # ±2 m can hide that break, and the filter then meets a short
+            # gap late.
             assert gap > 0.5, (y0, noise, hz, gap)
         else:
-            # A few centimetres through the bumper is the kinematic limit.
-            # Metres of overlap is a brake that never came on.
             assert gap > -1.5, (y0, noise, hz, gap)
 
 
@@ -795,6 +799,141 @@ def check_live_tick_publishes_range_brake() -> None:
     assert bare.brake < cmd.brake, (bare.brake, cmd.brake)
 
 
+def check_nonfinite_pose_does_not_brake() -> None:
+    """NaN range is not a miss that spawns a track, and it is not a full stop."""
+    from python.perception.detect import pose_ok
+    from python.planning.path_predictor import _required_brake
+
+    nan = Detection(
+        cls="vehicle", conf=0.9, xyxy=(0, 0, 10, 10),
+        x=0.0, y=float("nan"), yaw=math.pi / 2,
+    )
+    assert pose_ok(nan) is False
+    inf = Detection(
+        cls="vehicle", conf=0.9, xyxy=(0, 0, 10, 10),
+        x=float("inf"), y=12.0, yaw=math.pi / 2,
+    )
+    assert pose_ok(inf) is False
+    fresh = IoUTracker()
+    fresh.update([nan, inf], 0.0, ego_speed_mps=12.0)
+    assert fresh.tracks == []
+
+    held = IoUTracker()
+    good = Detection(
+        cls="vehicle", conf=0.9, xyxy=(0, 0, 10, 10),
+        x=0.0, y=16.0, yaw=math.pi / 2,
+    )
+    held.update([good], 0.0, ego_speed_mps=12.0)
+    held.update([nan], 0.1, ego_speed_mps=12.0)
+    assert len(held.tracks) == 1
+    assert held.tracks[0].misses == 1
+    # Coast may slide the prediction. The pose itself stays a real range.
+    assert math.isfinite(held.tracks[0].y)
+    assert abs(held.tracks[0].y - 16.0) < 1.0
+
+    assert _required_brake(float("nan"), -8.0, 0.2) == 0.0
+    assert _required_brake(12.0, float("nan"), 0.2) == 0.0
+    assert _required_brake(12.0, -8.0, float("inf")) == 0.0
+    for bad_y in (float("nan"), float("inf"), float("-inf")):
+        tracks = [{
+            "class": "vehicle",
+            "x": 0.0,
+            "y": bad_y,
+            "yaw": math.pi / 2,
+            "speed_mps": 0.0,
+            "range_rate_mps": -18.0,
+            "range_rate_sigma": 0.2,
+            "range_rate_valid": True,
+        }]
+        plan = predict_path(
+            lanes_bev=_lanes(), lane_conf=0.9, ego_speed_mps=18.0, tracks=tracks,
+        )
+        _planner, cmd = _live(plan, tracks, 18.0, 0)
+        assert plan.aeb != "brake", (bad_y, plan.aeb)
+        assert cmd.brake < 0.99, (bad_y, cmd.brake)
+
+
+def _curve_lanes(radius: float, sign: float) -> list:
+    """Lane lines on an arc. ``sign`` +1 turns right, -1 turns left."""
+    left, right = [], []
+    center = sign * radius
+    for i in range(0, 46):
+        theta = i * 1.5 / radius
+        # Outer line is the left line on a right turn.
+        for radius_line, bucket, side in (
+            (radius + 1.75, left, -1.0),
+            (radius - 1.75, right, 1.0),
+        ):
+            if sign < 0:
+                bucket = right if side < 0 else left
+            x = center - sign * radius_line * math.cos(theta)
+            y = radius_line * math.sin(theta)
+            bucket.append({"x": x, "y": y})
+    return [left, right]
+
+
+def check_curve_cipv_follows_the_path() -> None:
+    """A stopped car in the straight tube is not a lead once the path has bent.
+
+    Both directions. On the path, the same stop still brakes. Off the path,
+    a forged straight-tube CIPV brake does not override the route.
+    """
+    ego = 18.0
+    for sign in (1.0, -1.0):
+        lanes = _curve_lanes(80.0, sign)
+        empty = predict_path(lanes_bev=lanes, lane_conf=0.9, ego_speed_mps=ego)
+        route = empty.route_ego or empty.path_ego
+        assert len(route) >= 8, (sign, len(route))
+        on = min(route, key=lambda p: abs(p["y"] - 20.0))
+        assert abs(on["y"] - 20.0) < 2.0, on
+        off = {
+            "class": "vehicle",
+            "id": 3,
+            "x": 0.0,
+            "y": 20.0,
+            "yaw": math.pi / 2,
+            "speed_mps": 0.0,
+        }
+        tube = select_cipv([off], ego_speed_mps=ego)
+        assert tube.aeb == "brake", (sign, tube.aeb, tube.ttc_lead)
+        along = select_cipv([off], ego_speed_mps=ego, path_ego=route)
+        assert along.aeb == "off", (sign, along.aeb, on)
+        off_plan = predict_path(
+            lanes_bev=lanes, lane_conf=0.9, ego_speed_mps=ego, tracks=[off],
+        )
+        _planner, off_cmd = _live(off_plan, [off], ego, 0)
+        assert off_plan.aeb != "brake", (sign, off_plan.aeb, off_plan.range_brake)
+        assert off_cmd.brake < 0.99, (sign, off_cmd.brake, off_cmd.throttle)
+
+        class _Forged:
+            track = off
+            ttc_lead = 20.0 / ego
+            aeb = "brake"
+
+        forced = publish_planner(off_plan, _Forged())
+        assert forced["aeb"] != "brake", (sign, forced["aeb"])
+        forced_cmd = plan_command(
+            path_ego=off_plan.path_ego, planner=forced, ego_speed_mps=ego, seq=1,
+        )
+        assert forced_cmd.brake < 0.99, (sign, forced_cmd)
+
+        lead = {
+            "class": "vehicle",
+            "id": 4,
+            "x": on["x"],
+            "y": on["y"],
+            "yaw": math.pi / 2,
+            "speed_mps": 0.0,
+        }
+        hit = select_cipv([lead], ego_speed_mps=ego, path_ego=route)
+        assert hit.aeb == "brake", (sign, hit.aeb, on)
+        on_plan = predict_path(
+            lanes_bev=lanes, lane_conf=0.9, ego_speed_mps=ego, tracks=[lead],
+        )
+        _planner, on_cmd = _live(on_plan, [lead], ego, 2)
+        assert on_cmd.brake >= 0.99, (sign, on_cmd.brake, on_plan.aeb, on)
+
+
 def check_faster_lead_is_not_closing() -> None:
     rows = _approach(12.0, 16.0)
     late = [row for row in rows if row[0] > 45.0]
@@ -824,6 +963,8 @@ def main() -> None:
     check_stopped_lead_margins()
     check_slow_close_brakes_early()
     check_pacing_lead_brake()
+    check_nonfinite_pose_does_not_brake()
+    check_curve_cipv_follows_the_path()
     check_live_tick_publishes_range_brake()
     check_faster_lead_is_not_closing()
     print("test_lead_road_speed: OK")

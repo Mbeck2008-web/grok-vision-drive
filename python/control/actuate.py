@@ -15,6 +15,7 @@ ack is fresh. No DLL / hooks / process inject. Live BeamNG still UNPROVEN on Lin
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -531,9 +532,12 @@ def plan_command(
     raw_range = planner.get("range_brake")
     if raw_range is not None:
         try:
-            asked = max(0.0, min(1.0, float(raw_range)))
+            asked = float(raw_range)
         except (TypeError, ValueError):
             asked = 0.0
+        if not math.isfinite(asked):
+            asked = 0.0
+        asked = max(0.0, min(1.0, asked))
         if asked > 1e-6:
             throttle = 0.0
             brake = max(brake, asked)

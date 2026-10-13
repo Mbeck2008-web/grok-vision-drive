@@ -1205,12 +1205,16 @@ def check_steer_hold_queues_on_epsilon_and_keepalive() -> None:
 
 
 def check_pedal_slot_starts_blind_timer() -> None:
-    """player_device from pedals with null player_steering is still a missing wheel."""
+    """Null player_steering with no wheel seen yet does not start the blind timer.
+
+    After a numeric sample, including a centered 0, a later null does.
+    """
     import python.run_vision as rv
     from python.control.actuate import ego_path, read_ego_feedback
 
     rv._STEER_GRAB_BLIND_LOGGED = False
     rv._STEER_GRAB_BLIND_SINCE = None
+    rv._STEER_WHEEL_SEEN = False
     locked = BeamNGPyActuator(TechVeh(PlayerWheel()))
     locked._steer_locked = True
     ego_path().write_text(
@@ -1220,13 +1224,21 @@ def check_pedal_slot_starts_blind_timer() -> None:
     fb = read_ego_feedback()
     assert fb is not None and fb.player_device is True and fb.player_steering is None
     assert sample_tech_wheel(locked, 0.3, now=20.0) is None
-    assert rv._STEER_GRAB_BLIND_SINCE == 20.0
+    assert rv._STEER_GRAB_BLIND_SINCE is None
+    assert rv.tech_wheel_blind_reason(now=23.0) is None
     ego_path().write_text(
         json.dumps({"player_device": True, "player_steering": 0.0, "player_throttle": 0.4}),
         encoding="utf-8",
     )
     assert sample_tech_wheel(locked, 0.3, now=21.0) == 0.0
+    assert rv._STEER_WHEEL_SEEN is True
     assert rv._STEER_GRAB_BLIND_SINCE is None
+    ego_path().write_text(
+        json.dumps({"player_device": True, "player_steering": None, "player_throttle": 0.4}),
+        encoding="utf-8",
+    )
+    assert sample_tech_wheel(locked, 0.3, now=22.0) is None
+    assert rv._STEER_GRAB_BLIND_SINCE == 22.0
 
 
 def main() -> None:

@@ -207,8 +207,17 @@ def check_drive_gear_arm() -> None:
     tech._drive_arm_mono = time.monotonic() - (TECH_DRIVE_ARM_S + 0.05)
     with redirect_stdout(io.StringIO()):
         tech.apply(DriveCommand(steer=0.1, throttle=0.55, brake=0.0, seq=3, reason="ok"))
-    assert len(_arms(neutral)) == 2
+    assert len(_arms(neutral)) == 1, "arcade is set; standstill N does not arm again"
+    assert tech._shift_set is True
     assert all("shiftDown" not in chunk and "-1" not in chunk for chunk in neutral.lua)
+
+    indexed = ArmVeh("N")
+    indexed.sensors = {"electrics": {"gear": "N", "gearIndex": 1, "gearMode": "arcade"}}
+    tech_i = BeamNGPyActuator(indexed)
+    tech_i.note_engaged(True)
+    with redirect_stdout(io.StringIO()):
+        tech_i.apply(DriveCommand(steer=0.0, throttle=0.4, brake=0.0, seq=11, reason="ok"))
+    assert all(c != TECH_DRIVE_SHIFT_LUA for c in indexed.lua), indexed.lua
 
     forward = ArmVeh("D")
     tech_d = BeamNGPyActuator(forward)
@@ -274,6 +283,12 @@ def check_drive_gear_arm() -> None:
     assert "failed" in flog and "ShiftModeSet" in flog
     assert "gear" not in failing.calls[-1]
     assert failing.lua  # still armed the lever; the ack failure is not silent
+    armed_fail = len([c for c in failing.lua if c == TECH_DRIVE_SHIFT_LUA])
+    tech_f._drive_arm_mono = time.monotonic() - (TECH_DRIVE_ARM_S + 0.05)
+    with redirect_stdout(io.StringIO()):
+        tech_f.apply(DriveCommand(steer=0.0, throttle=0.4, brake=0.0, seq=12, reason="ok"))
+    assert tech_f._shift_set is False
+    assert len([c for c in failing.lua if c == TECH_DRIVE_SHIFT_LUA]) == armed_fail + 1
 
     class NoClutch:
         def __init__(self) -> None:

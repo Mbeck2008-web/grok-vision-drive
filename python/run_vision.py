@@ -77,6 +77,7 @@ from python.viz.stage import STAGE_W, STAGE_H, VizUI, render_stage, smoke
 
 _STEER_GRAB_BLIND_LOGGED = False
 _STEER_GRAB_BLIND_SINCE: float | None = None
+_STEER_WHEEL_SEEN = False
 _STEER_WHEEL_BLIND_S = 2.0
 
 
@@ -88,17 +89,18 @@ def sample_tech_wheel(
     A non-Tech actuator returns the electrics sample. On Tech, a fresh
     numeric ``player_steering`` from ``gvd_ego.json`` is the physical wheel
     (``lastInputs``, still recorded when local is blocked), even when
-    ``player_device`` is false. JSON null is a missing echo: Lua writes null
+    ``player_device`` is false.     JSON null is a missing echo: Lua writes null
     when no player source has a steering key. A pedal-only ``local`` slot
-    is that missing echo. While the hold is on and that field is absent,
-    null, or the file is stale, return None and start the blind timer.
-    The detector seeds rest at 0 once it is armed, so that missing echo is
-    not a wheel at the command. The first time the hold is on and the echo
-    stays missing, log once: the grab path cannot see the wheel. A real
-    sample, or the lock dropping, clears that log so the next lock can say
-    it again.
+    is that missing echo. Null before any numeric sample is no steering
+    device, so it does not start the blind timer. After a number, including
+    a centered 0, a later null, a missing field, or a stale file does.
+    Seeing a wheel is kept across unlock, so a re-lock with a missing echo
+    still arms. The detector seeds rest at 0 once it is armed. The first
+    time the hold is on and the echo stays missing, log once. A real
+    sample, or the lock dropping, clears that log so the next lock can
+    say it again.
     """
-    global _STEER_GRAB_BLIND_LOGGED, _STEER_GRAB_BLIND_SINCE
+    global _STEER_GRAB_BLIND_LOGGED, _STEER_GRAB_BLIND_SINCE, _STEER_WHEEL_SEEN
     if getattr(actuator, "name", "") != "beamngpy":
         return steer_in
     locked = bool(getattr(actuator, "steer_locked", False))
@@ -107,10 +109,14 @@ def sample_tech_wheel(
         read_ego_feedback(),
         steer_locked=locked,
     )
+    if locked and sampled is not None:
+        _STEER_WHEEL_SEEN = True
     if not locked or sampled is not None:
         _STEER_GRAB_BLIND_LOGGED = False
         _STEER_GRAB_BLIND_SINCE = None
         return sampled
+    if not _STEER_WHEEL_SEEN:
+        return None
     t = time.monotonic() if now is None else float(now)
     if _STEER_GRAB_BLIND_SINCE is None:
         _STEER_GRAB_BLIND_SINCE = t

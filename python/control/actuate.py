@@ -602,19 +602,57 @@ def gear_is_forward(gear: Any) -> bool:
     return False
 
 
-def _gear_value(el: Any) -> Any:
-    """Gear field from a dict or a BeamNGpy electrics object (``.data`` / ``.gear``)."""
-    if el is None:
-        return None
+_GEAR_KEYS = ("gear", "gearIndex", "gear_index", "shifterPosition", "gearMode")
+
+
+def _gear_map(el: Any) -> dict | None:
     if isinstance(el, dict):
-        return el.get("gear")
+        return el
     data = getattr(el, "data", None)
     if isinstance(data, dict):
-        return data.get("gear")
-    gear = getattr(el, "gear", None)
-    if gear is not None and not callable(gear):
-        return gear
+        return data
     return None
+
+
+def _not_a_gear_word(val: Any) -> bool:
+    return isinstance(val, str) and val.strip().lower() == "arcade"
+
+
+def _preferred_gear(el: Any) -> Any:
+    """Prefer a forward reading over arcade's standstill letter ``N``.
+
+    ``gearIndex`` 1 with ``gear`` ``N`` is already in drive. The word
+    ``arcade`` is a shift mode, not a gear.
+    """
+    raw = _gear_map(el)
+    if raw is None:
+        if el is None:
+            return None
+        gear = getattr(el, "gear", None)
+        if gear is not None and not callable(gear) and not _not_a_gear_word(gear):
+            return gear
+        return None
+    found: list[Any] = []
+    for key in _GEAR_KEYS:
+        if key not in raw:
+            continue
+        val = raw[key]
+        if _not_a_gear_word(val):
+            continue
+        found.append(val)
+    for val in found:
+        if gear_is_forward(val):
+            return val
+    return found[0] if found else None
+
+
+def _standstill_neutral(gear: Any) -> bool:
+    return isinstance(gear, str) and gear.strip().upper() == "N"
+
+
+def _gear_value(el: Any) -> Any:
+    """Gear field from a dict or a BeamNGpy electrics object (``.data`` / ``.gear``)."""
+    return _preferred_gear(el)
 
 
 def _unexpected_kw(err: BaseException) -> str | None:
@@ -1591,7 +1629,15 @@ class BeamNGPyActuator:
             self._apply_blinker("off" if release else blinker)
             if not release and float(throttle) > 1e-6:
                 gear_echo = self._echo_gear()
-                if not gear_is_forward(gear_echo):
+                # Arcade at rest reports N while the HUD can already say D.
+                # One arm after set_shift_mode is enough. Repeating the
+                # parking-brake/clutch events fights the gearbox.
+                standstill = (
+                    self._shift_set
+                    and self.drive_arm_n >= 1
+                    and _standstill_neutral(gear_echo)
+                )
+                if not gear_is_forward(gear_echo) and not standstill:
                     self._queue_drive_shift(gear_echo, time.monotonic())
             if hold_err:
                 return hold_err

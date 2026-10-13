@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import zipfile
 from pathlib import Path
 
@@ -507,19 +508,92 @@ def check_run_vision_e2e() -> None:
     cmd = json.loads(cmd_path().read_text(encoding="utf-8"))
     assert cmd["engaged"] is True and cmd["brake"] == 1.0 and cmd["throttle"] == 0.0 and cmd["reason"] == "preview_blocked", cmd
 
-    # Engaged + preview allowed → real drive command every tick; Lua ack flips cmd_applied and ego speed.
+    # Engaged + preview allowed, still no cameras. Since the lane-fit path
+    # replaced the 36 m steer fallback, an empty view is a stop: target_v is 0,
+    # the fake echo is 5.5 m/s, and err < -1 selects
+    # brake = min(0.6, 0.05 * echo speed). Throttle stays 0. Steer stays 0.
+    # The ack path is unchanged.
+    echo_speed = 5.5
+    expected_brake = min(0.6, 0.05 * echo_speed)
+    from python.control.actuate import plan_command
+
+    law = plan_command(
+        path_ego=[],
+        planner={"target_v": 0.0, "aeb": "off"},
+        ego_speed_mps=echo_speed,
+        seq=1,
+    )
+    assert law.throttle == 0.0 and law.steer == 0.0, law
+    assert abs(law.brake - expected_brake) < 1e-9, law
     _run_supervisor(["--force-engage", "--allow-preview-drive"], seconds=2.5, ack=True)
     cmd = json.loads(cmd_path().read_text(encoding="utf-8"))
     assert cmd["engaged"] is True and cmd["reason"] == "ok" and cmd["seq"] >= 10, cmd
-    assert cmd["throttle"] > 0.0 and cmd["brake"] == 0.0 and -1.0 <= cmd["steer"] <= 1.0, cmd
+    assert cmd["throttle"] == 0.0, cmd
+    assert abs(float(cmd["brake"]) - expected_brake) < 1e-4, cmd
+    assert cmd["steer"] == 0.0, cmd
     st = read_state()
     assert st and st["engaged"] is True and st["cmd_applied"] is True, {k: st.get(k) for k in ("engaged", "cmd_applied", "cmd_reason")}
     assert st["cmd_reason"] == "cmd_json_applied" and st["ego_source"] == "lua" and st["lua_applying"] is True
-    assert abs(float(st["ego"]["speed_mps"]) - 5.5) < 1e-6, st["ego"]
+    assert abs(float(st["ego"]["speed_mps"]) - echo_speed) < 1e-6, st["ego"]
     assert st["cmd_ack_seq"] >= st["cmd_seq"] - 5
+    planner = st.get("planner") if isinstance(st.get("planner"), dict) else {}
+    assert planner.get("prediction") == "none", planner
+    assert float(planner.get("target_v") or 0.0) == 0.0, planner
+    assert abs(float(planner.get("pred_brake") or 0.0) - expected_brake) < 1e-4, planner
+    assert not st.get("lanes_bev"), st.get("lanes_bev")
+    assert float(st.get("lane_conf") or 0.0) == 0.0, st.get("lane_conf")
+    assert st.get("path_debug_preview") is True, st.get("path_debug_preview")
 
     write_engage_flag(False)
     ego_path().unlink()
+
+
+def check_synthetic_lanes_drive() -> None:
+    """Engaged with a real two-lane frame commands throttle. The stub e2e does not.
+
+    The no-camera supervisor check above is a stop. This one feeds the same
+    hood view the lane-fit regression uses, through perception and the modular
+    policy, and requires throttle with the brake released.
+    """
+    import test_lanes_hough_int as lanes_fix
+    from python.control.e2e import E2EPolicy
+    from python.perception.detect import EmptyDetector
+    from python.perception.pipeline import ModularPerception
+    from python.runtime.shadow import shadow_tick
+
+    road = lanes_fix._yellow_white_road(
+        asphalt=(110, 108, 105),
+        yellow=(40, 210, 235),
+        white=(245, 245, 245),
+        width=4,
+    )
+    perc = ModularPerception(allow_synthetic=False, detector_id="empty")
+    perc.set_detector(EmptyDetector(), ["yolo_weights"])
+    echo_speed = 5.5
+    pout = perc.tick(road, ego_speed_mps=echo_speed)
+    assert float(pout.lane_conf) > 0.0 and len(pout.lanes_bev) >= 2, (pout.lane_conf, pout.lanes_bev)
+    assert pout.path_debug_preview is False, pout.planner
+    assert float(pout.planner.get("target_v") or 0.0) > echo_speed, pout.planner
+    held = shadow_tick(
+        policy="modular",
+        engaged=True,
+        heartbeat_ok=True,
+        path_debug_preview=bool(pout.path_debug_preview),
+        allow_preview_drive=False,
+        path_ego=pout.path_ego,
+        planner=pout.planner,
+        ego_speed_mps=echo_speed,
+        lane_conf=float(pout.lane_conf),
+        path_conf=float(pout.path_conf),
+        seq=1,
+        e2e_policy=E2EPolicy(),
+        main_bgr=road,
+    )
+    cmd = held.applied
+    assert cmd.reason == "ok", cmd
+    assert cmd.throttle > 0.0 and cmd.brake == 0.0, cmd
+    assert -1.0 <= cmd.steer <= 1.0, cmd
+    assert held.should_disengage is False
 
 
 def check_ffb_override_live() -> None:
@@ -689,11 +763,11 @@ def check_no_chrome() -> None:
 
 def check_player_docs() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "## Alpha 1.7.9" in readme
+    assert "## Alpha 1.7.12" in readme
     assert "This is **alpha** — may break / not work; improves with fixes." in readme
     assert "**point** bumps" in readme and "fixes / small UI" in readme
     assert "**main alpha** bump" in readme and "features / core / UI overhaul" in readme
-    assert "1.7.9-alpha-<sha>" in readme
+    assert "1.7.12-alpha-<sha>" in readme
     assert "docs/stitch-360.png" in readme
     assert "docs/soft-esc-highway.jpg" not in readme
     assert "Soft Esc parked" in readme
@@ -718,18 +792,30 @@ def check_player_docs() -> None:
 
 
 def main() -> None:
-    check_release_zip()
-    check_boot_line_honesty()
-    check_window_backend_one_cam()
-    check_window_picker_prefers_drive()
-    check_cmd_json_drive_bus()
-    check_engage_path_contract()
-    check_gvd_docs_dir()
-    check_no_chrome()
-    check_player_docs()
-    check_lua_harness()
-    check_run_vision_e2e()
-    check_ffb_override_live()
+    checks = (
+        check_release_zip,
+        check_boot_line_honesty,
+        check_window_backend_one_cam,
+        check_window_picker_prefers_drive,
+        check_cmd_json_drive_bus,
+        check_engage_path_contract,
+        check_gvd_docs_dir,
+        check_no_chrome,
+        check_player_docs,
+        check_lua_harness,
+        check_run_vision_e2e,
+        check_synthetic_lanes_drive,
+        check_ffb_override_live,
+    )
+    failed: list[str] = []
+    for fn in checks:
+        try:
+            fn()
+        except Exception:
+            failed.append(fn.__name__)
+            traceback.print_exc()
+    if failed:
+        raise SystemExit("test_m6_retail failed: " + ", ".join(failed))
     print("test_m6_retail: OK")
 
 

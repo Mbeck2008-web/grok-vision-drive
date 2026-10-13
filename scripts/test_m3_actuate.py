@@ -317,6 +317,23 @@ def check_drive_gear_arm() -> None:
     assert bare.calls[-1]["gear"] is None
     assert bare.calls[-1]["parkingbrake"] == 0.0
 
+    class BoomQueue(ArmVeh):
+        def queue_lua_command(self, chunk: str, response: bool = False) -> None:
+            if chunk == TECH_DRIVE_SHIFT_LUA:
+                raise RuntimeError("queue refused")
+            self.lua.append(chunk)
+
+    boom = BoomQueue("N")
+    tech_boom = BeamNGPyActuator(boom)
+    tech_boom.note_engaged(True)
+    with redirect_stdout(io.StringIO()):
+        tech_boom.apply(DriveCommand(steer=0.1, throttle=0.4, brake=0.0, seq=20, reason="ok"))
+    assert tech_boom.drive_arm_n == 0, tech_boom.drive_arm_n
+    assert all(c != TECH_DRIVE_SHIFT_LUA for c in boom.lua)
+    with redirect_stdout(io.StringIO()):
+        tech_boom.apply(DriveCommand(steer=0.1, throttle=0.4, brake=0.0, seq=21, reason="ok"))
+    assert tech_boom.drive_arm_n == 0
+
 
 def check_grab_loop_poll_before_electrics() -> None:
     """Soft Esc grab calls poll_vehicle() before read_electrics_inputs(vehicle).

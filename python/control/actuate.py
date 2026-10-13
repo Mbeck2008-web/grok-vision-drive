@@ -1373,27 +1373,29 @@ class BeamNGPyActuator:
         q = getattr(self.vehicle, "queue_lua_command", None)
         if not callable(q):
             return
+        try:
+            try:
+                queued = q(TECH_DRIVE_SHIFT_LUA, False)
+            except TypeError:
+                queued = q(TECH_DRIVE_SHIFT_LUA)
+        except Exception as e:
+            print(
+                f"[GVD] drive arm queue_lua_command failed: {type(e).__name__}: {e}",
+                flush=True,
+            )
+            return
+        if queued is False:
+            print(
+                f"[GVD] drive arm queue_lua_command failed: gear={gear_echo!r}",
+                flush=True,
+            )
+            return
         self._drive_arm_mono = now
         self.drive_arm_n += 1
         if self.drive_arm_n == 1 or self.drive_arm_n % 8 == 0:
             print(
                 f"[GVD] drive arm gear={gear_echo!r} attempt={self.drive_arm_n} "
                 "parkingbrake=0 clutch=0",
-                flush=True,
-            )
-        try:
-            q(TECH_DRIVE_SHIFT_LUA, False)
-        except TypeError:
-            try:
-                q(TECH_DRIVE_SHIFT_LUA)
-            except Exception as e:
-                print(
-                    f"[GVD] drive arm queue_lua_command failed: {type(e).__name__}: {e}",
-                    flush=True,
-                )
-        except Exception as e:
-            print(
-                f"[GVD] drive arm queue_lua_command failed: {type(e).__name__}: {e}",
                 flush=True,
             )
 

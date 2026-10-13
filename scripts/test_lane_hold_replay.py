@@ -119,7 +119,6 @@ def check_curvature_is_not_the_steer_input() -> None:
     explained = 0
     straight_but_saturated = 0
     straight_explained = 0
-    rows = []
     for cmd in cmds:
         if cmd["reason"] != "ok":
             continue
@@ -139,22 +138,6 @@ def check_curvature_is_not_the_steer_input() -> None:
             assert abs(arc_steer) < 0.05, (curvature, arc_steer, logged)
         if abs(arc_steer - logged) < 0.05:
             explained += 1
-        if len(rows) < 12:
-            lateral = None
-            if abs(logged) < 0.999:
-                lateral = round(logged * 2.5, 4)
-            rows.append((logged, curvature, arc_steer, lateral))
-    print("replay  logged_steer  curvature  arc_legacy  sample_x  pursuit_of_x")
-    for logged, curvature, arc_steer, lateral in rows:
-        if lateral is None:
-            pursuit = path_steer_from_ego(_path_at(math.copysign(2.5, logged)))
-            x_txt = ">=2.5"
-        else:
-            pursuit = path_steer_from_ego(_path_at(lateral))
-            x_txt = f"{lateral:+.4f}"
-        print(
-            f"  {logged:+.5f}  {curvature:+.5f}  {arc_steer:+.5f}  {x_txt:>8}  {pursuit:+.5f}"
-        )
     assert straight_but_saturated >= 5, straight_but_saturated
     assert straight_explained == 0, straight_explained
     # Bends that really are curved still match. They are not the straight ones.
@@ -166,11 +149,16 @@ def _flips(values: list[float]) -> int:
 
 
 def check_rate_limit_blocks_log_flips() -> None:
-    cmds, _samples = _load()
+    cmds, samples = _load()
+    t0 = float(cmds[0]["t"])
     state = LaneSteerState()
     prev_t = None
     out: list[float] = []
     logged_ok: list[float] = []
+    printed = 0
+    # sample_x is the logged lookahead (recovered). old_steer is x/2.5.
+    # pursuit is the wheel-angle law. limited is that law after the PD slew.
+    print("replay  sample_x  curvature  old_steer  pursuit  limited")
     for cmd in cmds:
         t = float(cmd["t"])
         dt = None if prev_t is None else t - prev_t
@@ -183,8 +171,10 @@ def check_rate_limit_blocks_log_flips() -> None:
         logged_ok.append(steer)
         if abs(steer) >= 0.999:
             lateral = math.copysign(2.5, steer)
+            x_txt = ">=2.5"
         else:
             lateral = round(steer * 2.5, 4)
+            x_txt = f"{lateral:+.4f}"
         armed_before = state.armed
         origin = state.steer if armed_before else 0.0
         geometric = path_steer_from_ego(_path_at(lateral))
@@ -194,8 +184,19 @@ def check_rate_limit_blocks_log_flips() -> None:
             assert abs(followed - origin) <= STEER_RATE_PER_S * dt + 1e-9, (
                 followed, origin, dt,
             )
+        if printed < 12:
+            sample = _nearest_sample(samples, t, t0)
+            if sample is None:
+                continue
+            curvature = float(sample["planner"]["curvature"])
+            print(
+                f"  {x_txt:>8}  {curvature:+.5f}  {steer:+.5f}  {geometric:+.5f}  {followed:+.5f}"
+            )
+            printed += 1
+    assert printed == 12
     logged_flips = _flips(logged_ok)
     out_flips = _flips(out)
+    print(f"sign_flips old={logged_flips} new={out_flips}")
     assert logged_flips >= 8, logged_flips
     assert out_flips < logged_flips, (out_flips, logged_flips)
     assert max(abs(v) for v in out) < 0.6

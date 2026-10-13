@@ -123,6 +123,7 @@ def main() -> None:
         streaming=True,
         rgb_only=True,
     )
+    assert COMPANION_OFFSCREEN_UPDATE_S == 0.067
     assert off["requested_update_time"] == COMPANION_OFFSCREEN_UPDATE_S
     assert off["requested_update_time"] > 0
     assert off["is_streaming"] is True

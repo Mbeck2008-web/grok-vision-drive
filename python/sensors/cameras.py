@@ -30,9 +30,10 @@ DEFAULT_NEAR_M = 0.05
 BNGPY_DEFAULT_FAR_M = 100.0
 FORWARD_UPDATE_S = 0.067  # ~15 Hz suggestion to the Tech sensor manager
 ON_DEMAND_UPDATE_S = -1.0  # yaml: sample on the hitch, not every tick
-# Offscreen sensor period when yaml says on-demand. Not an ad-hoc viewport render.
+# Offscreen period for a yaml hitch of -1. Same period as main, so the colour
+# buffer is asked to update on main's tick. Not an ad-hoc viewport render.
 # SendAdHocRequestCamera steps the game view's exposure for one frame (blue shadows).
-COMPANION_OFFSCREEN_UPDATE_S = 1.0
+COMPANION_OFFSCREEN_UPDATE_S = FORWARD_UPDATE_S
 SIDE_UPDATE_S = ON_DEMAND_UPDATE_S
 REAR_UPDATE_S = ON_DEMAND_UPDATE_S
 MAIN_GRAB_DIV = 1
@@ -40,14 +41,12 @@ MAIN_GRAB_DIV = 1
 # A camera that was not read on this tick is missing. An older buffer is not
 # painted into the bundle. Soft Esc and Engage use that same grab. A zero
 # colour buffer is unrendered, not a picture, and it does not keep a previous
-# frame. Yaml -1 is still the offscreen attach period, not a viewport render.
-# The sensor is attached at COMPANION_OFFSCREEN_UPDATE_S and read with
-# stream_raw. SendAdHocRequestCamera is not used: that render steps the game
-# view's exposure for one frame. One in-flight read holds the socket. Main
-# is read before any companion, so a companion that runs past
-# CAM_READ_BUDGET_S cannot drop main. Every camera after that miss on this
-# tick is missing. The next grab does not start another read until the thread
-# finishes. A miss is not filled from an older tick.
+# frame. Yaml -1 stays the hitch label. The sensor is attached at
+# COMPANION_OFFSCREEN_UPDATE_S (main's 0.067) and read with stream_raw.
+# SendAdHocRequestCamera is not used: that render steps the game view's
+# exposure for one frame. stream_raw is shared memory, one buffer per camera.
+# A read that is still running marks that id missing and the grab still reads
+# the other ids. The next grab does not publish the late bytes as this tick.
 CAM_READ_BUDGET_S = 0.05
 _OWED_CAP = 7  # one slot per companion; the owed queue cannot grow past the rig
 WIDE_GRAB_DIV = 16
@@ -87,16 +86,18 @@ DEFAULT_UPDATE_S = {
     "repeatR": ON_DEMAND_UPDATE_S,
     "rear": ON_DEMAND_UPDATE_S,
 }
-# BeamNGpy update_priority: 0 highest → 1 lowest (getter contract). Starve non-main.
+# BeamNGpy update_priority: 0 highest → 1 lowest (getter contract).
+# Every rig camera is 0 so the GPU scheduler does not leave a companion's
+# colour buffer unwritten while main keeps the slot.
 DEFAULT_UPDATE_PRIORITY = {
     "main": 0.0,
-    "narrow": 0.5,
-    "wide": 0.5,
-    "pillarL": 1.0,
-    "pillarR": 1.0,
-    "repeatL": 1.0,
-    "repeatR": 1.0,
-    "rear": 1.0,
+    "narrow": 0.0,
+    "wide": 0.0,
+    "pillarL": 0.0,
+    "pillarR": 0.0,
+    "repeatL": 0.0,
+    "repeatR": 0.0,
+    "rear": 0.0,
 }
 # Role bands pin the lock (narrow 800 > main 300; never both-800).
 # Narrow lo 400 is the live hitch floor (still ≥ main 300); attach stays 800.
@@ -320,7 +321,7 @@ def camera_update_priority(
     *,
     cid: str | None = None,
 ) -> float:
-    """BeamNGpy update_priority in [0, 1], 0 = highest. Starve non-main."""
+    """BeamNGpy update_priority in [0, 1], 0 = highest. Rig cameras share 0."""
     spec = spec or {}
     cam_id = str(cid or spec.get("id") or "")
     v = _as_float(spec.get("update_priority"))
@@ -661,9 +662,10 @@ def iter_clip_attach_attempts(
 def sensor_requested_update_s(update_s: float) -> float:
     """Camera ``requested_update_time`` for a yaml rate.
 
-    Yaml ``-1`` is the hitch. The sensor still renders offscreen at
-    ``COMPANION_OFFSCREEN_UPDATE_S``. A negative rate is not sent: that would
-    need SendAdHocRequestCamera, which flashes the game view.
+    Yaml ``-1`` is the hitch label. The sensor still renders offscreen at
+    ``COMPANION_OFFSCREEN_UPDATE_S``, the same period as main. A negative
+    rate is not sent: that would need SendAdHocRequestCamera, which flashes
+    the game view.
     """
     rate = float(update_s)
     if rate < 0:
@@ -694,7 +696,7 @@ def beamng_camera_sensor_kwargs(
     _ = streaming  # kept so call sites stay stable; never set is_streaming False
     # A negative rate would need SendAdHocRequestCamera to get a picture.
     # That request renders through the game view and flashes exposure for one
-    # frame. The sensor still updates offscreen; GVD only reads it on the hitch.
+    # frame. The sensor updates offscreen on main's period; this grab reads it.
     rate = sensor_requested_update_s(update_s)
     return {
         "requested_update_time": rate,
@@ -987,7 +989,8 @@ def cap_companion_pending(cam: Any) -> None:
     """Ask the sim to keep a single GPU request queued for this companion.
 
     poll() on a negative update rate can enqueue renders that never complete.
-    One pending slot stops that queue from growing for the life of the session.
+    The live attach does not call this. A cap of 1 on companions left their
+    colour buffer unsubmitted while main, which is not capped, kept rendering.
     """
     setter = getattr(cam, "set_max_pending_requests", None)
     if not callable(setter):
@@ -1419,6 +1422,10 @@ class BeamNGPyBackend:
         self._io_thread: threading.Thread | None = None
         self._io_box: dict[str, Any] = {}
         self._io_job: tuple[str, str] | None = None
+        # stream_raw is per camera. One shared-memory read does not hold the
+        # others, and it does not hold the GE socket.
+        self._stream_threads: dict[str, threading.Thread] = {}
+        self._stream_boxes: dict[str, dict[str, Any]] = {}
         self._read_blocked = False
         self._late_unique: list[str] = []
         _camera_backends.add(self)
@@ -1567,8 +1574,6 @@ class BeamNGPyBackend:
                         f"update_s {want_rate:g}->{used_rate:g} (not resolution)"
                     )
                 self._sensors[cid] = cam
-                if cid != "main":
-                    cap_companion_pending(cam)
                 self._clip_planes[cid] = (used_near, used_far)
                 self._update_s[cid] = float(used_rate)
                 self._update_priority[cid] = float(used_prio)
@@ -1596,7 +1601,7 @@ class BeamNGPyBackend:
                     f"grab_div main={self._grab_div['main']} wide={self._grab_div['wide']} "
                     f"narrow={self._grab_div['narrow']} side={self._side_grab_div} "
                     f"rear={self._rear_grab_div}; "
-                    f"stream_raw offscreen requested_update_time 1; "
+                    f"stream_raw offscreen requested_update_time {COMPANION_OFFSCREEN_UPDATE_S:g}; "
                     f"GVD→BeamNG vehicle-space convert; depth/semantic OFF)."
                 )
             else:
@@ -1644,8 +1649,14 @@ class BeamNGPyBackend:
         return self.session.poll()
 
     def close(self) -> None:
-        # A timed-out GE read is still on the one BeamNGpy socket. Wait for it
-        # before remove() and disconnect so close does not race that call.
+        # A timed-out shared-memory read is still in its own thread. A timed-out
+        # GE read is still on the one BeamNGpy socket. Wait for both before
+        # remove() and disconnect.
+        for thread in list(self._stream_threads.values()):
+            if thread is not None and thread.is_alive():
+                thread.join()
+        self._stream_threads.clear()
+        self._stream_boxes.clear()
         thread = self._io_thread
         if thread is not None and thread.is_alive():
             thread.join()
@@ -1795,14 +1806,62 @@ class BeamNGPyBackend:
         except Exception:
             return False
         self._sensors[cid] = fresh
-        if cid != "main":
-            cap_companion_pending(fresh)
         self._sensor_kwargs[cid] = new_kwargs
         rate = float(self._update_s.get(cid, FORWARD_UPDATE_S))
         self._clip_planes[cid] = (near, float(far_m))
         self._hitch_steps.append((cid, near, float(far_m), rate))
         self._frame_sig.pop(cid, None)
         return True
+
+    def _stream_busy(self, cid: str) -> bool:
+        thread = self._stream_threads.get(cid)
+        return thread is not None and thread.is_alive()
+
+    def _discard_finished_stream(self, cid: str) -> None:
+        """Drop a shared-memory read that finished after its tick.
+
+        Those bytes are not this grab. They are not stored for a later stitch.
+        """
+        thread = self._stream_threads.get(cid)
+        if thread is None or thread.is_alive():
+            return
+        self._stream_threads.pop(cid, None)
+        self._stream_boxes.pop(cid, None)
+
+    def _read_stream(self, cid: str, cam: Any) -> Any:
+        """Read this camera's shared memory.
+
+        ``stream_raw`` does not use the GE socket. A read that is still running
+        for another id does not skip this one. A read that runs past
+        ``CAM_READ_BUDGET_S`` leaves this id missing and leaves that thread
+        running. The next grab of this id waits until that thread finishes,
+        then reads again. The late bytes are discarded.
+        """
+        if self._stream_busy(cid):
+            self._read_blocked = True
+            return _IO_BUSY
+        self._discard_finished_stream(cid)
+        box: dict[str, Any] = {}
+
+        def _run() -> None:
+            try:
+                box["v"] = cam.stream_raw()
+            except Exception as exc:
+                box["e"] = exc
+
+        thread = threading.Thread(target=_run, daemon=True, name=f"gvd-cam-{cid}")
+        self._stream_threads[cid] = thread
+        self._stream_boxes[cid] = box
+        thread.start()
+        thread.join(CAM_READ_BUDGET_S)
+        if thread.is_alive():
+            self._read_blocked = True
+            return _IO_TIMEOUT
+        self._stream_threads.pop(cid, None)
+        self._stream_boxes.pop(cid, None)
+        if "e" in box:
+            return None
+        return _reading_colour(box.get("v"), self._resolution.get(cid))
 
     def _io_busy(self) -> bool:
         thread = self._io_thread
@@ -2035,16 +2094,7 @@ class BeamNGPyBackend:
         res = self._resolution.get(cid)
 
         if self._reads_shared_memory(cid, cam):
-            def _stream() -> Any:
-                try:
-                    return cam.stream_raw()
-                except Exception:
-                    return None
-
-            raw = self._io_call(cid, "stream", _stream)
-            if raw is _IO_BUSY or raw is _IO_TIMEOUT:
-                return raw
-            return _reading_colour(raw, res)
+            return self._read_stream(cid, cam)
 
         def _poll() -> np.ndarray | None:
             return read_camera_colour(cam, cid=cid, resolution=res)
@@ -2081,13 +2131,15 @@ class BeamNGPyBackend:
         unique_ids: list[str] = []
         self._read_blocked = False
         # Soft Esc and Engage both read all eight cameras on this tick.
-        # Main is first. One in-flight read holds the socket, so a companion
-        # that misses CAM_READ_BUDGET_S leaves every later camera missing
-        # and the next grab waits. A skipped, timed-out, or empty read stays
-        # missing. The previous picture is not the stitch. Companions are
-        # not SendAdHocRequestCamera. That render steps the game view's
-        # exposure for one frame. They update offscreen; this grab reads
-        # shared memory.
+        # Main is first. stream_raw is shared memory, one buffer per camera,
+        # so a read that is still running marks that id missing and the other
+        # ids are still read. A legacy poll shares the one GE socket; that
+        # call still waits its own budget and does not stand in for a camera
+        # that already has shared memory. A skipped, timed-out, or empty read
+        # stays missing. The previous picture is not the stitch. Companions
+        # are not SendAdHocRequestCamera. That render steps the game view's
+        # exposure for one frame. They update offscreen on main's period;
+        # this grab reads shared memory.
         soft_esc_main = soft_esc_colour_main_only()
         self._reap_if_done()
         sensors = list(self._sensors.items())

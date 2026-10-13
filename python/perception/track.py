@@ -17,6 +17,9 @@ _RATE_WINDOW = 16
 # move farther than that band, and the slope has to beat its own stderr.
 _CLOSE_NET_M = 4.5
 _SLOPE_SIGMA = 3.0
+# A flat window this close is the car already next to the lead. Confirming
+# rate 0 there copies ego speed onto the lead and the planner lets go.
+_FLAT_HOLD_M = 12.0
 # A same-lane lead can jump 4 m between grabs when each one is ±2 m off.
 # The old 4 m gate missed that jump, left the first track coasting, and
 # the coast kept the brake it had already armed.
@@ -70,9 +73,13 @@ def consistent_range_rate(samples: list[tuple[float, float]]) -> tuple[bool, flo
 
     Five grabs of a 0.5 m ramp fit a clean slope and are still just ±2 m of
     noise on a lead that is not moving. The fit has to cover most of a
-    second, the slope has to clear its stderr, and a closing call has to
-    move the range by more than that noise band. Full braking does not use
-    this flag: a short gap brakes from the range alone.
+    second. A full window whose range has not fallen past that noise band,
+    and that is still well ahead, is confirmed not-closing: the rate is 0,
+    including when the slope is lost in the noise. Calling that invalid
+    forever stored speed 0 and the planner braked every pacing lead as a
+    stopped car. The same flat window up close stays invalid, so the stop
+    hold does not release. A window that has closed past the band, but
+    whose slope is still mush, stays invalid so the gap stop law can run.
     """
     if len(samples) < _RATE_MIN_N:
         return False, 0.0
@@ -80,12 +87,26 @@ def consistent_range_rate(samples: list[tuple[float, float]]) -> tuple[bool, flo
     if window[-1][0] - window[0][0] < _RATE_MIN_SPAN_S:
         return False, 0.0
     slope, _rmse, se = _fit_range_rate(window)
-    if se > 1e-6 and abs(slope) < _SLOPE_SIGMA * se:
-        return False, 0.0
     net = window[-1][1] - window[0][1]
-    # A closing slope inside the ±2 m band is the ramp, not a lead we are
-    # catching. An opening slope still has to actually increase the range.
-    if slope < -1.0 and net > -_CLOSE_NET_M:
+    # Not past the noise band. A noisy constant gap, and a ramp that stays
+    # inside ±2 m, are not a lead we are catching. An opening slope still
+    # has to actually increase the range.
+    if net > -_CLOSE_NET_M:
+        if slope > 1.0 and net < 1.0:
+            return False, 0.0
+        if slope > 1.0:
+            return True, float(slope)
+        insignificant = se > 1e-6 and abs(slope) < _SLOPE_SIGMA * se
+        # A clean closing line that is still inside the band is the ramp,
+        # not a confirmed rate. Up close, a flat line stays unconfirmed so
+        # the stop hold does not release.
+        if not insignificant and slope < -1.0:
+            return False, 0.0
+        if window[-1][1] <= _FLAT_HOLD_M:
+            return False, 0.0
+        return True, 0.0
+    insignificant = se > 1e-6 and abs(slope) < _SLOPE_SIGMA * se
+    if insignificant:
         return False, 0.0
     if slope > 1.0 and net < 1.0:
         return False, 0.0
@@ -110,7 +131,8 @@ class Track:
     range_rate_mps: float = 0.0
     range_rate_valid: bool = False
     # (time, measured forward range). A closing rate needs a long line.
-    # The planner still brakes from the gap while this is short.
+    # While it is short, the planner brakes only if this range has already
+    # closed past the noise band, or the gap is critically short.
     samples: list[tuple[float, float]] | None = None
 
 
@@ -209,6 +231,8 @@ class IoUTracker:
                 "speed_mps": t.speed_mps,
                 "range_rate_mps": t.range_rate_mps,
                 "range_rate_valid": bool(t.range_rate_valid),
+                # Positive when the retained window's range has decreased.
+                "range_drop_m": _range_drop_m(t.samples),
                 "yaw_rate": t.yaw_rate,
                 "hits": t.hits,
                 "misses": t.misses,
@@ -217,3 +241,9 @@ class IoUTracker:
             }
             for t in self.tracks
         ]
+
+
+def _range_drop_m(samples: list[tuple[float, float]] | None) -> float:
+    if not samples or len(samples) < 2:
+        return 0.0
+    return float(samples[0][1] - samples[-1][1])

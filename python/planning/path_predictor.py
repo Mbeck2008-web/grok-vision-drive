@@ -59,6 +59,16 @@ _FULL_BRAKE_TTC = 1.2
 _BRAKE_DECEL = 8.0
 _RANGE_RESERVE_M = 3.0
 _COMFORT_DECEL = 2.5
+# Unconfirmed caution stays at or under this. 2.5 m/s² is 0.3125 of brake.
+_COMFORT_BRAKE = _COMFORT_DECEL / _BRAKE_DECEL
+# Same band as the tracker's closing gate. A ±2 m grab can walk 4 m;
+# 4.5 m is past that, so the range really did close.
+_NOISE_DROP_M = 4.5
+# Hard minimum. 3.9 m still stops. A matched cut-in at 16 m does not.
+_CRITICAL_GAP_M = 8.0
+# Remaining stop distance inside which a ped, bike, or stopped lead
+# holds the brake down to a standstill.
+_FINISH_DIST_M = 8.0
 _SIGN_MISS_MAX = 8
 _PARTIAL_GATE_M = 1.6
 _TURN_RAD = 0.35
@@ -182,14 +192,18 @@ def predict_path(
         signs=signs or [],
         path=path,
     )
-    # An unconfirmed vehicle is not a stopped-lead AEB. The gap still
-    # sets a brake from v²/2·gap, and that brake is 1.0 when the range
-    # alone cannot be covered any other way. Pedestrians already did.
+    # An unconfirmed vehicle is not a stopped lead. The stop law runs
+    # only after the range has closed past the noise band, or the gap is
+    # under the hard minimum. Anything else stays at or under comfort,
+    # and a flat gap is 0 so a pacing lead does not slow down.
     range_brake = 0.0
     if aeb != "brake":
-        gap = _unconfirmed_vehicle_y(tracks or [], path)
-        if gap is not None:
-            asked = _range_brake(gap, float(ego_speed_mps))
+        lead = _unconfirmed_vehicle(tracks or [], path)
+        if lead is not None:
+            gap, drop = lead
+            asked = _range_brake(
+                gap, float(ego_speed_mps), closed=drop >= _NOISE_DROP_M,
+            )
             if asked >= 0.99:
                 aeb = "brake"
                 target = 0.0
@@ -716,13 +730,15 @@ def _unseen_s(track: dict[str, Any]) -> float:
     return max(0.0, misses) * tick
 
 
-def _unconfirmed_vehicle_y(tracks: list, path: list[dict[str, float]]) -> float | None:
-    """Nearest in-path vehicle whose range-rate is explicitly not confirmed.
+def _unconfirmed_vehicle(tracks: list, path: list[dict[str, float]]) -> tuple[float, float] | None:
+    """Nearest in-path unconfirmed vehicle, as (gap, range drop).
 
     Anything still in front of the bumper counts, including a lead under 4 m.
-    Skipping that band left throttle on at 3.9 m.
+    Skipping that band left throttle on at 3.9 m. The drop is how far the
+    retained window has closed; 0 when the caller did not measure one.
     """
-    best: float | None = None
+    best_y: float | None = None
+    best_drop = 0.0
     reach = (EGO_WIDTH + VEHICLE_WIDTH) * 0.5 + 0.2
     for raw in tracks or []:
         if not isinstance(raw, dict):
@@ -740,22 +756,34 @@ def _unconfirmed_vehicle_y(tracks: list, path: list[dict[str, float]]) -> float 
         half = float(raw.get("width") or raw.get("width_m") or VEHICLE_WIDTH)
         if lateral > max(reach, (EGO_WIDTH + half) * 0.5 + 0.2):
             continue
-        if best is None or y < best:
-            best = y
-    return best
+        if best_y is None or y < best_y:
+            best_y = y
+            best_drop = max(0.0, _f(raw, "range_drop_m"))
+    if best_y is None:
+        return None
+    return best_y, best_drop
 
 
-def _range_brake(gap_m: float, ego_speed_mps: float) -> float:
-    """Brake in [0, 1] to stop ``reserve`` metres short of ``gap_m``.
+def _range_brake(gap_m: float, ego_speed_mps: float, *, closed: bool) -> float:
+    """Brake in [0, 1] for an unconfirmed in-path vehicle.
 
-    ``v² / (2 · gap)`` is the decel the range itself asks for. Divided by
-    8 m/s² that is the brake command, and it reaches 1.0 when the gap is
-    too short for anything milder. No range-rate is required.
+    The stop law (``v² / (2 · gap)``, up to 1.0, plus the low-speed hold)
+    runs only when the range has closed past the noise band, or the gap is
+    under the hard minimum. Otherwise the command is 0. That is inside the
+    comfort cap of 2.5 m/s². Holding comfort for the whole unconfirmed
+    window would already shed more than 1 m/s off a pacing lead.
     """
     ego = max(0.0, float(ego_speed_mps))
     gap = float(gap_m)
     if ego < 0.05:
         return 0.0
+    critical = gap <= _CRITICAL_GAP_M
+    if not closed and not critical:
+        # Flat gap asks for nothing. Comfort (2.5 m/s²) is the ceiling if
+        # this branch ever asks for more; holding that ceiling for the fit
+        # window would already shed more than 1 m/s off a pacing lead.
+        unconfirmed_caution = 0.0
+        return min(unconfirmed_caution, _COMFORT_BRAKE)
     if gap <= _RANGE_RESERVE_M + 0.5:
         return 1.0
     usable = gap - _RANGE_RESERVE_M
@@ -999,6 +1027,19 @@ def _speed_flags(
         if stopped and dist <= 1.5 and float(ego_speed_mps) > 0.5:
             hard = True
         elif ttc is not None and ttc < _FULL_BRAKE_TTC and close >= 3.0:
+            hard = True
+        # Below 0.5 m/s, and whenever closing is under 3 m/s, the two laws
+        # above both let go. A pedestrian or bike still in the stop box,
+        # and a stopped vehicle there, holds the brake to a standstill.
+        # A lead that is only a little slower stays on the scaled brake.
+        if (
+            float(ego_speed_mps) > 0.05
+            and dist <= _FINISH_DIST_M
+            and (
+                stop_reason in _VRU
+                or (stop_reason == "vehicle" and stopped)
+            )
+        ):
             hard = True
     # plan_command treats ttc under 1.2 as a full brake. Keep that number only
     # when this stop is actually in that band.

@@ -191,9 +191,10 @@ def check_step_and_random_noise_do_not_full_brake() -> None:
     """A +2/−2 step and random ±2 m must not full-brake a constant lead.
 
     Six grabs of three high then three low fit about −10 m/s. That used to
-    be a 1.0 brake at 12–20 m with ego at 12 m/s. Random ±2 m did it too.
+    be a 1.0 brake at 12–20 m. At ego 18 the old stop law was 1.0 for any
+    gap under about 23 m, so this band is run at 18.
     """
-    ego = 12.0
+    ego = 18.0
     dt = 0.1
     tracker = IoUTracker()
     t = 0.0
@@ -285,8 +286,8 @@ def check_ramp_and_reflected_do_not_full_brake() -> None:
 def check_noisy_close_stops_with_margin() -> None:
     """Ego 18 m/s, lead first seen at 30 m, ±0.5 m and ±1 m, must stop.
 
-    The rate may never clear the noise. The brake is the decel the gap
-    asks for, so the stop does not wait on a fit.
+    A flat gap is not a stop. The brake waits until the measured range has
+    closed past the noise band, then uses the uncapped gap law.
     """
     def margin(hz: float, noise: float, seed: int) -> float:
         rng = random.Random(seed)
@@ -323,55 +324,227 @@ def check_noisy_close_stops_with_margin() -> None:
 
 def check_close_vehicle_and_first_pedestrian_brake() -> None:
     """A vehicle at 3.9 m brakes. A first pedestrian at 12 m is AEB."""
-    ego = 12.0
-    close = predict_path(
-        lanes_bev=_lanes(),
-        lane_conf=0.9,
-        ego_speed_mps=ego,
-        tracks=[{
-            "class": "vehicle",
-            "x": 0.0,
-            "y": 3.9,
-            "yaw": math.pi / 2,
-            "speed_mps": 0.0,
-            "range_rate_valid": False,
-        }],
-    )
-    close_cmd = follow_path(close, ego_speed_mps=ego, seq=0)
-    assert close_cmd.throttle == 0.0, close_cmd
-    assert close_cmd.brake >= 0.99, close_cmd
+    for ego in (12.0, 18.0):
+        close = predict_path(
+            lanes_bev=_lanes(),
+            lane_conf=0.9,
+            ego_speed_mps=ego,
+            tracks=[{
+                "class": "vehicle",
+                "x": 0.0,
+                "y": 3.9,
+                "yaw": math.pi / 2,
+                "speed_mps": 0.0,
+                "range_rate_valid": False,
+            }],
+        )
+        close_cmd = follow_path(close, ego_speed_mps=ego, seq=0)
+        assert close_cmd.throttle == 0.0, (ego, close_cmd)
+        assert close_cmd.brake >= 0.99, (ego, close_cmd)
 
-    person = predict_path(
-        lanes_bev=_lanes(),
-        lane_conf=0.9,
-        ego_speed_mps=ego,
-        tracks=[{
-            "class": "pedestrian",
-            "x": 0.0,
-            "y": 12.0,
-            "yaw": math.pi / 2,
-            "speed_mps": 0.0,
-            "range_rate_valid": False,
-        }],
-    )
-    person_cmd = follow_path(person, ego_speed_mps=ego, seq=1)
-    assert person.aeb == "brake", person.aeb
-    assert person_cmd.brake >= 0.99, person_cmd
-    rider = predict_path(
-        lanes_bev=_lanes(),
-        lane_conf=0.9,
-        ego_speed_mps=ego,
-        tracks=[{
-            "class": "bike",
-            "x": 0.0,
-            "y": 12.0,
-            "yaw": math.pi / 2,
-            "speed_mps": 0.0,
-            "range_rate_valid": False,
-        }],
-    )
-    rider_cmd = follow_path(rider, ego_speed_mps=ego, seq=2)
-    assert rider.aeb == "brake" and rider_cmd.brake >= 0.99, (rider.aeb, rider_cmd.brake)
+        person = predict_path(
+            lanes_bev=_lanes(),
+            lane_conf=0.9,
+            ego_speed_mps=ego,
+            tracks=[{
+                "class": "pedestrian",
+                "x": 0.0,
+                "y": 12.0,
+                "yaw": math.pi / 2,
+                "speed_mps": 0.0,
+                "range_rate_valid": False,
+            }],
+        )
+        person_cmd = follow_path(person, ego_speed_mps=ego, seq=1)
+        assert person.aeb == "brake", (ego, person.aeb)
+        assert person_cmd.brake >= 0.99, (ego, person_cmd)
+        rider = predict_path(
+            lanes_bev=_lanes(),
+            lane_conf=0.9,
+            ego_speed_mps=ego,
+            tracks=[{
+                "class": "bike",
+                "x": 0.0,
+                "y": 12.0,
+                "yaw": math.pi / 2,
+                "speed_mps": 0.0,
+                "range_rate_valid": False,
+            }],
+        )
+        rider_cmd = follow_path(rider, ego_speed_mps=ego, seq=2)
+        assert rider.aeb == "brake" and rider_cmd.brake >= 0.99, (
+            ego, rider.aeb, rider_cmd.brake,
+        )
+
+
+def check_flat_gap_confirms_not_closing() -> None:
+    """A noisy constant gap is rate ~0 once the window is full, not invalid."""
+    ego = 18.0
+    rng = random.Random(4)
+    tracker = IoUTracker()
+    t = 0.0
+    for i in range(20):
+        y = 36.0 + rng.uniform(-0.3, 0.3)
+        det = Detection(
+            cls="vehicle", conf=0.9, xyxy=(0, 0, 10, 10), x=0.0, y=y, yaw=math.pi / 2,
+        )
+        tracker.update([det], t, ego_speed_mps=ego)
+        t += 0.1
+    tr = tracker.tracks[0]
+    assert tr.range_rate_valid is True, (tr.range_rate_valid, tr.range_rate_mps)
+    assert abs(tr.range_rate_mps) < 0.2, tr.range_rate_mps
+    assert abs(tr.speed_mps - ego) < 0.2, tr.speed_mps
+
+
+def check_pacing_lead_holds_speed() -> None:
+    """A lead matching our speed, with range noise, must not slow us.
+
+    Ego 12 and 18, gaps of 1.5 s and 2 s, noise ±0.3 / ±1 / ±2 m. Over 8 s
+    the speed stays within about 1 m/s. The old stop law took 18 down to 5.6.
+    """
+    for ego0 in (12.0, 18.0):
+        for headway in (1.5, 2.0):
+            for noise in (0.3, 1.0, 2.0):
+                for hz in (10.0, 15.0):
+                    for seed in range(3):
+                        rng = random.Random(seed + int(hz) + int(noise * 10) + int(ego0))
+                        dt = 1.0 / hz
+                        ego = ego0
+                        gap0 = ego0 * headway
+                        lead_s = 0.0
+                        ego_s = 0.0
+                        t = 0.0
+                        tracker = IoUTracker()
+                        steps = int(8.0 * hz)
+                        slowest = ego
+                        for i in range(steps):
+                            true_gap = gap0 + lead_s - ego_s
+                            y = max(0.4, true_gap + rng.uniform(-noise, noise))
+                            plan, cmd = _drive(tracker, y, t, ego, i)
+                            assert not _full(plan, cmd), (
+                                ego0, headway, noise, hz, seed, i, y, plan.aeb, cmd.brake,
+                            )
+                            a = _decel(cmd.brake)
+                            if a > 1e-6 and a * dt >= ego:
+                                ego_s += ego * ego / (2.0 * a)
+                                ego = 0.0
+                            else:
+                                ego_s += ego * dt - 0.5 * a * dt * dt
+                                ego = max(0.0, ego - a * dt)
+                            lead_s += ego0 * dt
+                            t += dt
+                            slowest = min(slowest, ego)
+                        assert ego0 - slowest <= 1.0, (
+                            ego0, headway, noise, hz, seed, slowest, ego,
+                        )
+
+
+def check_matched_cut_in_no_full_brake() -> None:
+    """A cut-in at our speed, 16–20 m out, must not hold brake 1.0."""
+    for ego in (12.0, 18.0):
+        for y0 in (16.0, 18.0, 20.0):
+            raw = predict_path(
+                lanes_bev=_lanes(),
+                lane_conf=0.9,
+                ego_speed_mps=ego,
+                tracks=[{
+                    "class": "vehicle",
+                    "x": 0.0,
+                    "y": y0,
+                    "yaw": math.pi / 2,
+                    "speed_mps": 0.0,
+                    "range_rate_valid": False,
+                }],
+            )
+            raw_cmd = follow_path(raw, ego_speed_mps=ego, seq=0)
+            assert not _full(raw, raw_cmd), (ego, y0, raw.aeb, raw_cmd.brake)
+            rng = random.Random(int(ego) + int(y0))
+            tracker = IoUTracker()
+            t = 0.0
+            dt = 0.1
+            for i in range(30):
+                y = y0 + rng.uniform(-0.3, 0.3)
+                plan, cmd = _drive(tracker, y, t, ego, i)
+                assert not _full(plan, cmd), (ego, y0, i, y, plan.aeb, cmd.brake)
+                t += dt
+
+
+def check_stopped_lead_at_ego_18() -> None:
+    """The ego-12 stopped-lead case still brakes outside 8 m at ego 18."""
+    rows = _approach(18.0, 0.0)
+    far = [row for row in rows if 4.0 < row[0] <= 28.0]
+    assert far
+    for y, tr, plan, cmd in far:
+        assert tr.speed_mps < 1.0, (y, tr.speed_mps)
+        assert tr.range_rate_mps < -10.0, (y, tr.range_rate_mps)
+        assert cmd.throttle == 0.0, (y, cmd.throttle, cmd.brake, plan.aeb)
+    aeb = [row for row in far if row[3].brake >= 0.99 and row[2].aeb == "brake"]
+    assert aeb, "stopped lead at ego 18 never reached AEB before 4 m"
+    assert max(row[0] for row in aeb) > 8.0
+
+
+def _roll_to_stop(kind: str, ego: float, y0: float, hz: float = 10.0) -> tuple[float, float]:
+    """Approach a fixed VRU. Return (remaining range, speed)."""
+    dt = 1.0 / hz
+    traveled = 0.0
+    t_ego = ego
+    for i in range(int(8.0 * hz)):
+        y = y0 - traveled
+        if y <= 0.0:
+            return y, t_ego
+        plan = predict_path(
+            lanes_bev=_lanes(),
+            lane_conf=0.9,
+            ego_speed_mps=t_ego,
+            tracks=[{
+                "class": kind,
+                "x": 0.0,
+                "y": y,
+                "yaw": math.pi / 2,
+                "speed_mps": 0.0,
+            }],
+        )
+        cmd = follow_path(plan, ego_speed_mps=t_ego, seq=i)
+        a = _decel(cmd.brake)
+        if t_ego <= 0.05 or (a > 1e-6 and a * dt >= t_ego):
+            if a > 1e-6:
+                traveled += t_ego * t_ego / (2.0 * a)
+            return y0 - traveled, 0.0
+        traveled += t_ego * dt - 0.5 * a * dt * dt
+        t_ego = max(0.0, t_ego - a * dt)
+    return y0 - traveled, t_ego
+
+
+def check_vru_finish_hold() -> None:
+    """Below 0.5 m/s a stopped ped used to drop the brake and creep in.
+
+    The reported contact was 3.76 m. Hold the brake while the ped or bike
+    is still in the stop box, and stop before the bumper reaches them.
+    """
+    for kind in ("pedestrian", "bike"):
+        for ego in (0.2, 0.4, 0.49, 1.0, 2.0):
+            for valid in (None, False):
+                track = {
+                    "class": kind,
+                    "x": 0.0,
+                    "y": 3.76,
+                    "yaw": math.pi / 2,
+                    "speed_mps": 0.0,
+                }
+                if valid is False:
+                    track["range_rate_valid"] = False
+                plan = predict_path(
+                    lanes_bev=_lanes(), lane_conf=0.9, ego_speed_mps=ego, tracks=[track],
+                )
+                cmd = follow_path(plan, ego_speed_mps=ego, seq=0)
+                assert plan.aeb == "brake", (kind, ego, valid, plan.aeb, plan.stop_reason)
+                assert cmd.brake >= 0.99, (kind, ego, valid, cmd.brake)
+        left, speed = _roll_to_stop(kind, 0.45, 3.76)
+        assert speed <= 0.05, (kind, speed, left)
+        assert left > 3.0, (kind, left)
+        left, speed = _roll_to_stop(kind, 4.0, 8.0)
+        assert speed <= 0.05, (kind, speed, left)
+        assert left > 1.0, (kind, left)
 
 
 def check_faster_lead_is_not_closing() -> None:
@@ -395,6 +568,11 @@ def main() -> None:
     check_ramp_and_reflected_do_not_full_brake()
     check_noisy_close_stops_with_margin()
     check_close_vehicle_and_first_pedestrian_brake()
+    check_flat_gap_confirms_not_closing()
+    check_pacing_lead_holds_speed()
+    check_matched_cut_in_no_full_brake()
+    check_stopped_lead_at_ego_18()
+    check_vru_finish_hold()
     check_faster_lead_is_not_closing()
     print("test_lead_road_speed: OK")
 

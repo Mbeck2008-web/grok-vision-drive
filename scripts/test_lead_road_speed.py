@@ -53,11 +53,22 @@ def _approach(ego: float, lead_v: float, y0: float = 40.0):
 def check_first_sample_is_not_ego() -> None:
     tracker = IoUTracker()
     det = Detection(
-        cls="vehicle", conf=0.9, xyxy=(0, 0, 10, 10), x=0.0, y=28.0, yaw=math.pi / 2,
+        cls="vehicle", conf=0.9, xyxy=(0, 0, 10, 10), x=0.0, y=16.0, yaw=math.pi / 2,
     )
     tracker.update([det], 0.0, ego_speed_mps=12.0)
-    assert tracker.tracks[0].speed_mps == 0.0
-    assert tracker.tracks[0].range_rate_mps == 0.0
+    tr = tracker.tracks[0]
+    assert tr.speed_mps == 0.0
+    assert tr.range_rate_mps == 0.0
+    assert tr.range_rate_valid is False
+    # speed 0 at 16 m used to be a stopped lead and a full brake.
+    plan = predict_path(
+        lanes_bev=_lanes(), lane_conf=0.9, ego_speed_mps=12.0, tracks=tracker.as_dicts(),
+    )
+    cmd = follow_path(plan, ego_speed_mps=12.0, seq=0)
+    assert plan.aeb != "brake", plan.aeb
+    assert cmd.brake < 0.99, cmd.brake
+    cipv = select_cipv(tracker.as_dicts(), ego_speed_mps=12.0)
+    assert cipv.aeb == "off"
 
 
 def check_sign() -> None:
@@ -115,42 +126,47 @@ def check_slower_lead_aeb() -> None:
 
 
 def check_noisy_range_rate_does_not_aeb() -> None:
-    """A lead that is not closing, with a jumpy range, must not full-brake.
+    """±2 m grab noise at 12–20 m must not full-brake. A real stop still does.
 
-    The stored range-rate is smoothed. One bad sample is not the raw
-    Δrange/Δt, and it does not command brake 1.
+    One 4 m jump in 0.1 s is 40 m/s. A 0.25 blend of that is still about
+    10 m/s of closing, and at 16 m that is a 1.0 brake. The rate has to
+    come from several frames before it can arm AEB.
     """
-    tracker = IoUTracker()
     ego = 12.0
-    # Far enough that one smoothed spike (closing ~10 m/s) stays above the 1.2 s full-brake band.
-    y0 = 28.0
-    t = 0.0
     dt = 0.1
-    saw_raw = False
-    for i in range(30):
+    tracker = IoUTracker()
+    t = 0.0
+    for i in range(24):
         jitter = 2.0 if i % 2 == 0 else -2.0
-        y = y0 + jitter
+        y = 16.0 + jitter
+        assert 12.0 <= y <= 20.0
         det = Detection(
             cls="vehicle", conf=0.9, xyxy=(0, 0, 10, 10), x=0.0, y=y, yaw=math.pi / 2,
         )
-        if tracker.tracks:
-            prev_y = tracker.tracks[0].measured_y
-            raw = (y - prev_y) / dt
-        else:
-            raw = 0.0
         tracker.update([det], t, ego_speed_mps=ego)
         tr = tracker.tracks[0]
-        if i >= 1 and abs(raw) > 20.0:
-            saw_raw = True
-            assert abs(tr.range_rate_mps) < abs(raw) * 0.5, (i, raw, tr.range_rate_mps)
         plan = predict_path(
             lanes_bev=_lanes(), lane_conf=0.9, ego_speed_mps=ego, tracks=tracker.as_dicts(),
         )
         cmd = follow_path(plan, ego_speed_mps=ego, seq=i)
-        assert plan.aeb != "brake", (i, plan.aeb, tr.range_rate_mps, y)
-        assert cmd.brake < 0.99, (i, cmd.brake, tr.range_rate_mps, y)
+        assert plan.aeb != "brake", (i, y, plan.aeb, tr.range_rate_mps, tr.range_rate_valid)
+        assert cmd.brake < 0.99, (i, y, cmd.brake, tr.range_rate_mps)
         t += dt
-    assert saw_raw
+    # A single late jump after a steady 16 m lead is the same rule.
+    steady = IoUTracker()
+    t = 0.0
+    for i in range(10):
+        y = 16.0 if i < 9 else 14.0
+        det = Detection(
+            cls="vehicle", conf=0.9, xyxy=(0, 0, 10, 10), x=0.0, y=y, yaw=math.pi / 2,
+        )
+        steady.update([det], t, ego_speed_mps=ego)
+        plan = predict_path(
+            lanes_bev=_lanes(), lane_conf=0.9, ego_speed_mps=ego, tracks=steady.as_dicts(),
+        )
+        cmd = follow_path(plan, ego_speed_mps=ego, seq=i)
+        assert plan.aeb != "brake" and cmd.brake < 0.99, (i, y, plan.aeb, cmd.brake)
+        t += dt
 
 
 def check_faster_lead_is_not_closing() -> None:

@@ -31,6 +31,9 @@ def select_cipv(
             continue
         if abs(x) > half:
             continue
+        # A new track has no range-rate. speed 0 is not a stopped lead.
+        if tr.get("range_rate_valid") is False:
+            continue
         candidates.append(tr)
     if not candidates:
         return CipvResult(track=None, ttc_lead=None, aeb="off")

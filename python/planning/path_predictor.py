@@ -699,6 +699,9 @@ def _predict_occupants(tracks: list) -> list[dict[str, Any]]:
         kind = _cls(raw)
         if kind not in _OCCUPANTS:
             continue
+        # speed 0 before a range-rate exists is not a stopped lead.
+        if raw.get("range_rate_valid") is False:
+            continue
         yaw = _f(raw, "yaw", "heading", default=math.pi / 2.0)
         speed = max(0.0, _f(raw, "speed_mps", "speed"))
         unseen = _unseen_s(raw)

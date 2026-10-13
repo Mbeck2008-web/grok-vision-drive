@@ -103,7 +103,12 @@ class ModularPerception:
         lanes = lanes_from_view(main_bgr, stitch_bgr)
         mono = time.monotonic() if now is None else float(now)
         prior_lanes = None
-        if lanes.lanes_bev:
+        # Side and rear pose lines are not the road ahead. A windshield fit
+        # on a real main picture is the only live source. Posed lanes must
+        # not refresh the prior timer or look like a recovery.
+        main_missing = _main_picture_missing(main_bgr)
+        windshield = int(getattr(lanes, "forward_n", 0) or 0) > 0 and not main_missing
+        if windshield:
             self._prior_lanes = list(lanes.lanes_bev)
             self._prior_lanes_mono = mono
             self._seen_live_lanes = True
@@ -176,7 +181,8 @@ class ModularPerception:
                 "pred_brake": plan.pred_brake,
                 "blinker": plan.blinker,
                 "lanes_source": lanes_source,
-                "camera_lost": _main_picture_missing(main_bgr),
+                "camera_lost": main_missing,
+                "windshield_live": windshield,
             },
             infer_ms=infer_ms,
             missing=missing,

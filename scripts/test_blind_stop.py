@@ -6,7 +6,11 @@ shadow gate run. Time is injected; nothing sleeps.
 """
 from __future__ import annotations
 
+import io
+import json
 import sys
+import time
+from contextlib import redirect_stdout
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +24,7 @@ from python.perception.pipeline import PRIOR_LANE_MAX_S, ModularPerception  # no
 import python.perception.pipeline as pipeline  # noqa: E402
 from python.runtime.shadow import (  # noqa: E402
     CAMERA_LOSS_DISENGAGE_S,
+    WINDSHIELD_RECOVER_S,
     VisionLoss,
     hold_for_vision_loss,
     shadow_tick,
@@ -40,7 +45,8 @@ def _line(x: float) -> list[dict[str, float]]:
 
 
 def _live() -> LaneResult:
-    return LaneResult(conf=0.9, lanes_bev=[_line(-1.8), _line(1.8)], curvature=0.0)
+    lanes = [_line(-1.8), _line(1.8)]
+    return LaneResult(conf=0.9, lanes_bev=lanes, curvature=0.0, forward_n=len(lanes))
 
 
 def _blank() -> LaneResult:
@@ -320,12 +326,338 @@ def check_dark_camera_brakes_then_disengages() -> None:
         pipeline.lanes_from_view = old
 
 
+def check_side_lanes_are_not_a_recovery() -> None:
+    """A live lanes_source from side pose lines does not end a dark episode.
+
+    Recovery is a healthy windshield, held for ``WINDSHIELD_RECOVER_S``.
+    Clearing the loss clock does not clear the brake hold.
+    """
+    clock = VisionLoss()
+    clock.note_disengage()
+    assert clock.dropped and clock.hold_until_stop
+    age = clock.age("live", 10.0, camera_lost=True, windshield_live=False)
+    assert clock.dropped and clock.hold_until_stop
+    assert age == 0.0
+    # One healthy windshield frame is still inside the recover window.
+    held = clock.age("live", 10.2, camera_lost=False, windshield_live=True)
+    assert clock.dropped and held is not None
+    assert WINDSHIELD_RECOVER_S >= 0.5
+    done = clock.age("live", 10.2 + WINDSHIELD_RECOVER_S, camera_lost=False, windshield_live=True)
+    assert done is None and clock.dropped is False
+    assert clock.hold_until_stop is True
+
+    def posed(_main, _stitch=None):
+        return LaneResult(conf=0.8, lanes_bev=[_line(6.0)], curvature=0.0, forward_n=0)
+
+    def live_fit(_main, _stitch=None):
+        return _live()
+
+    old = pipeline.lanes_from_view
+    pipeline.lanes_from_view = live_fit
+    try:
+        perc = ModularPerception(allow_synthetic=False, detector_id="empty")
+        picture = np.zeros((8, 8, 3), dtype=np.uint8)
+        picture[0, 0] = (30, 30, 30)
+        live = perc.tick(picture, now=0.0, ego_speed_mps=12.0)
+        assert live.planner["lanes_source"] == "live", live.planner
+        assert live.planner["windshield_live"] is True
+        assert live.planner["camera_lost"] is False
+        pipeline.lanes_from_view = posed
+        dark = perc.tick(None, now=0.1, ego_speed_mps=12.0)
+        assert dark.planner["lanes_source"] != "live", dark.planner
+        assert dark.planner["lanes_source"] == "prior", dark.planner
+        assert dark.planner["camera_lost"] is True
+        assert dark.planner["windshield_live"] is False
+    finally:
+        pipeline.lanes_from_view = old
+
+
+def check_stale_heartbeat_dark_camera_brakes() -> None:
+    """A stale stamp while the camera is dark brakes. It does not release.
+
+    Stopped, the heartbeat gate may still stop. Moving, blind braking wins.
+    """
+    planner = {
+        "lanes_source": "live",
+        "camera_lost": True,
+        "windshield_live": False,
+        "target_v": 20.0,
+        "aeb": "off",
+    }
+    moving = shadow_tick(
+        policy="modular",
+        engaged=True,
+        heartbeat_ok=False,
+        path_debug_preview=False,
+        allow_preview_drive=True,
+        path_ego=[{"x": 0.0, "y": float(i), "z": 0.0} for i in range(12)],
+        planner=planner,
+        ego_speed_mps=12.0,
+        lane_conf=0.9,
+        path_conf=0.8,
+        seq=1,
+        e2e_policy=make_e2e(),
+        main_bgr=None,
+        cfg=None,
+        vision_loss_age_s=0.2,
+    )
+    assert moving.applied.reason == "camera_lost", moving.applied
+    assert moving.applied.brake > 0.3 and moving.applied.throttle == 0.0
+    assert moving.should_disengage is True
+    assert moving.veto_reason == "camera_lost"
+    stopped = shadow_tick(
+        policy="modular",
+        engaged=True,
+        heartbeat_ok=False,
+        path_debug_preview=False,
+        allow_preview_drive=True,
+        path_ego=[{"x": 0.0, "y": float(i), "z": 0.0} for i in range(12)],
+        planner=planner,
+        ego_speed_mps=0.0,
+        lane_conf=0.9,
+        path_conf=0.8,
+        seq=2,
+        e2e_policy=make_e2e(),
+        main_bgr=None,
+        cfg=None,
+        vision_loss_age_s=0.2,
+    )
+    assert stopped.applied.reason == "heartbeat_stale", stopped.applied
+    assert stopped.should_disengage is True
+
+
+class _TickScript:
+    """Shared grab clock for one ``run_vision.main`` pass."""
+
+    n = 0
+    phase = "boot"
+    speed = 0.0
+    tech = False
+    dark_mono: float | None = None
+    rows: list[tuple] = []
+
+
+def _fresh_bus(speed: float) -> None:
+    from python.control.actuate import ego_path
+    from python.runtime import paths as gvd_paths
+
+    pin = gvd_paths.predicted_gvd_docs_path()
+    pin.mkdir(parents=True, exist_ok=True)
+    folder = pin if pin.is_absolute() else pin.resolve()
+    folder.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({"lua_bus": str(folder)})
+    (folder / "gvd_link.json").write_text(payload, encoding="utf-8")
+    ego_path().write_text(
+        json.dumps(
+            {
+                "speed_mps": speed,
+                "steering_input": 0.0,
+                "throttle_input": 0.0,
+                "brake_input": 0.0,
+                "applied_seq": 0,
+                "applying": False,
+                "player_device": False,
+                "lua_bus": str(folder),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _run_supervisor_ticks(*, tech: bool) -> tuple[list[tuple], str]:
+    """Drive ``run_vision.main``. Does not call ``hold`` or ``stop`` itself.
+
+    Live windshield, then a dark main with a posed side line, then a stop.
+    """
+    import python.control.actuate as actuate
+    import python.run_vision as rv
+    from python.runtime.paths import bus_identity
+    from python.sensors.cameras import CameraFrameBundle, CamHealth, StubBackend
+
+    _TickScript.n = 0
+    _TickScript.phase = "boot"
+    _TickScript.speed = 0.0
+    _TickScript.tech = tech
+    _TickScript.dark_mono = None
+    _TickScript.rows = []
+
+    class _Veh:
+        def __init__(self) -> None:
+            self.electrics = {
+                "wheelspeed": 12.0,
+                "steering_input": 0.0,
+                "throttle_input": 0.0,
+                "brake_input": 0.0,
+            }
+            self.sensors = self
+
+        def poll(self):
+            return {"electrics": dict(self.electrics)}
+
+        def control(self, **kw):
+            _TickScript.rows.append(
+                ("control", _TickScript.phase, _TickScript.speed, time.monotonic(), dict(kw))
+            )
+
+        def set_shift_mode(self, _mode):
+            return None
+
+        def queue_lua_command(self, _chunk, _response=False):
+            return True
+
+    orig_init = StubBackend.__init__
+    orig_grab = StubBackend.grab
+    orig_write = actuate.atomic_write_json
+    orig_lanes = pipeline.lanes_from_view
+
+    def init(self, long_side=None):
+        orig_init(self, long_side)
+        if _TickScript.tech:
+            self.vehicle = _Veh()
+
+    def grab(self):
+        _TickScript.n += 1
+        n = _TickScript.n
+        if n <= 8:
+            phase, speed = "live", 12.0
+        elif n <= 50:
+            phase, speed = "dark", 12.0
+        else:
+            phase, speed = "stop", 0.0
+        if phase == "dark" and _TickScript.dark_mono is None:
+            _TickScript.dark_mono = time.monotonic()
+        _TickScript.phase = phase
+        _TickScript.speed = speed
+        veh = getattr(self, "vehicle", None)
+        if veh is not None:
+            veh.electrics["wheelspeed"] = speed
+        _fresh_bus(speed)
+        if phase == "live":
+            img = np.zeros((8, 8, 3), dtype=np.uint8)
+            img[0, 0] = (40, 50, 60)
+            stamp = time.time()
+            return CameraFrameBundle(
+                frames={"main": img},
+                timestamps={"main": stamp},
+                health={"main": CamHealth.OK},
+                backend="stub",
+                unique_gpu_n=1,
+                unique_gpu_ids=("main",),
+            )
+        return CameraFrameBundle(
+            frames={},
+            timestamps={},
+            health={"main": CamHealth.MISSING},
+            backend="stub",
+            note="main dark",
+            unique_gpu_n=0,
+        )
+
+    def lanes(_main, _stitch=None):
+        if _TickScript.phase == "live":
+            return _live()
+        # Side pose only. forward_n stays 0 so this is not a windshield recovery.
+        return LaneResult(conf=0.7, lanes_bev=[_line(6.0)], curvature=0.0, forward_n=0)
+
+    def write_json(path, payload, *args, **kwargs):
+        ok = orig_write(path, payload, *args, **kwargs)
+        if Path(path).name == "gvd_cmd.json" and isinstance(payload, dict):
+            _TickScript.rows.append(
+                ("cmd", _TickScript.phase, _TickScript.speed, time.monotonic(), dict(payload))
+            )
+        if Path(path).name == "gvd_engage.json" and isinstance(payload, dict):
+            _TickScript.rows.append(
+                ("engage", _TickScript.phase, _TickScript.speed, time.monotonic(), dict(payload))
+            )
+        return ok
+
+    _fresh_bus(12.0)
+    ident = bus_identity()
+    assert ident.matched, ident.note
+    StubBackend.__init__ = init
+    StubBackend.grab = grab
+    actuate.atomic_write_json = write_json
+    pipeline.lanes_from_view = lanes
+    argv = sys.argv
+    buf = io.StringIO()
+    sys.argv = [
+        "run_vision",
+        "--backend", "stub",
+        "--hz", "20",
+        "--max-ticks", "62",
+        "--force-engage",
+        "--allow-preview-drive",
+        "--detector", "empty",
+    ]
+    try:
+        with redirect_stdout(buf):
+            rv.main()
+    except BaseException as exc:
+        tail = buf.getvalue()[-2500:]
+        raise AssertionError(f"run_vision.main failed: {exc!r}\n{tail}") from exc
+    finally:
+        sys.argv = argv
+        StubBackend.__init__ = orig_init
+        StubBackend.grab = orig_grab
+        actuate.atomic_write_json = orig_write
+        pipeline.lanes_from_view = orig_lanes
+    return list(_TickScript.rows), buf.getvalue()
+
+
+def _late_rows(rows: list[tuple], kind: str) -> list[dict]:
+    start = _TickScript.dark_mono
+    assert start is not None, "dark phase never started"
+    out = []
+    for key, phase, speed, mono, payload in rows:
+        if key != kind or phase != "dark" or speed <= 1.0:
+            continue
+        if mono - start >= 1.05:
+            out.append(payload)
+    return out
+
+
+def check_supervisor_tick_holds_brake() -> None:
+    """Retail and Tech supervisor ticks keep braking after the drop, while moving.
+
+    The loop is ``run_vision.main``. Side lanes stay fitted and the main
+    picture is gone. A stopped car is the only release.
+    """
+    retail, retail_log = _run_supervisor_ticks(tech=False)
+    assert "DISENGAGED: camera_lost" in retail_log, retail_log[-1500:]
+    late_cmd = _late_rows(retail, "cmd")
+    assert len(late_cmd) >= 2, [(c.get("engaged"), c.get("brake"), c.get("reason")) for c in late_cmd]
+    for cmd in late_cmd:
+        assert cmd.get("engaged") is True, cmd
+        assert float(cmd.get("brake") or 0.0) > 0.2, cmd
+        assert float(cmd.get("throttle") or 0.0) == 0.0, cmd
+        assert cmd.get("reason") in ("camera_lost", "lanes_lost"), cmd
+    late_engage = _late_rows(retail, "engage")
+    assert all(item.get("engaged") is not False for item in late_engage), late_engage
+    # The car then stops. The release is allowed only on that phase.
+    stopped_cmd = [p for k, phase, _s, _m, p in retail if k == "cmd" and phase == "stop"]
+    assert stopped_cmd, "no command after the stop"
+    assert any(p.get("engaged") is False for p in stopped_cmd), stopped_cmd[-1]
+
+    tech, tech_log = _run_supervisor_ticks(tech=True)
+    assert "DISENGAGED: camera_lost" in tech_log, tech_log[-1500:]
+    late_ctl = _late_rows(tech, "control")
+    assert len(late_ctl) >= 2, late_ctl
+    for kw in late_ctl:
+        brake = float(kw.get("brake") or 0.0)
+        park = float(kw.get("parkingbrake") or 0.0)
+        assert brake > 0.2 or park > 0.5, kw
+        assert not (brake == 0.0 and park == 0.0), kw
+
+
 def main() -> None:
     check_unchanged_buffer_is_missing()
     check_window_stuck_buffer()
     check_live_camera_lost_is_not_ignored()
     check_blind_hold_keeps_tech_brake()
     check_dark_camera_brakes_then_disengages()
+    check_side_lanes_are_not_a_recovery()
+    check_stale_heartbeat_dark_camera_brakes()
+    check_supervisor_tick_holds_brake()
     print("test_blind_stop: OK")
 
 

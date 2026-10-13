@@ -265,6 +265,12 @@ def main() -> None:
     )
     ap.add_argument("--viz-fullscreen", action="store_true", help="Fullscreen GVD VISION on chosen monitor")
     ap.add_argument(
+        "--max-ticks",
+        type=int,
+        default=0,
+        help="Stop after this many supervisor ticks. 0 runs until quit.",
+    )
+    ap.add_argument(
         "--tech-probe",
         action="store_true",
         help="Connect to BeamNG.tech, poll vehicle electrics/pose/damage, exit. No fake cameras.",
@@ -673,13 +679,17 @@ def main() -> None:
                 engage_hz_grace_floor=shadow_cfg.engage_hz_grace_floor,
             )
 
+            planner_now = pout.planner if isinstance(pout.planner, dict) else {}
             loss_age = vision_loss.age(
-                str((pout.planner or {}).get("lanes_source") or ""),
+                str(planner_now.get("lanes_source") or ""),
                 time.monotonic(),
+                camera_lost=bool(planner_now.get("camera_lost")),
+                windshield_live=bool(planner_now.get("windshield_live")),
             )
-            if vision_loss.dropped:
+            if vision_loss.dropped or vision_loss.hold_until_stop:
                 # This episode already dropped Engage. A leftover flag or
-                # --force-engage must not resume until live lanes return.
+                # --force-engage must not resume. Side lanes that look live
+                # do not end it, and the brake hold lasts until the car stops.
                 engaged = False
             cmd_seq += 1
             wide = None
@@ -734,7 +744,10 @@ def main() -> None:
                     if veto_name in ("camera_lost", "lanes_lost"):
                         vision_loss.note_disengage()
                     bot_engage.clear()
-                    write_engage_flag(False, disengage_reason=disengage_reason)
+                    # A moving dark-camera drop keeps the engage file so retail
+                    # Lua does not releaseInputs. The file goes false at a stop.
+                    if not vision_loss.defer_release:
+                        write_engage_flag(False, disengage_reason=disengage_reason)
                     print(f"[GVD] DISENGAGED: {disengage_reason}", flush=True)
                 else:
                     disengage_reason = veto_name
@@ -783,12 +796,18 @@ def main() -> None:
             cmd = apply_to_command(ui.debug, cmd)
 
             # A dropped dark-camera episode keeps braking until the car is
-            # stopped. not_engaged / stop() would release the pedals.
+            # stopped. not_engaged / stop() would release the pedals. The hold
+            # stays up while moving even if side lanes cleared the loss clock.
             holding_blind = False
-            if vision_loss.dropped:
+            if vision_loss.hold_until_stop or vision_loss.dropped:
                 cmd, holding_blind = hold_for_vision_loss(
                     cmd, ego_speed_mps=ego_v, seq=cmd_seq
                 )
+                if not holding_blind:
+                    vision_loss.hold_until_stop = False
+                    if vision_loss.defer_release:
+                        write_engage_flag(False, disengage_reason=disengage_reason or cmd.reason)
+                        vision_loss.defer_release = False
 
             # Actuators only when engaged + command ok (path / tracks / shadow already on this tick).
             # cmd_json: Lua applies whatever we write only while `engaged` rides along in the payload.
@@ -1086,6 +1105,8 @@ def main() -> None:
                     ui.set_layer(int(chr(key)))
 
             frame_i += 1
+            if args.max_ticks and frame_i >= args.max_ticks:
+                break
             dt = 1.0 / max(args.hz, 1.0)
             time.sleep(max(0.0, dt - (time.perf_counter() - loop_t0)))
     except KeyboardInterrupt:

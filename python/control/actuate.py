@@ -1258,6 +1258,20 @@ class CmdJsonActuator:
                 cmd.reason = "cmd_json_idle"  # not engaged: Lua keeps its hands off the car
         return cmd
 
+    def hold(self, cmd: DriveCommand) -> DriveCommand:
+        """Keep writing this brake with ``engaged: true`` until the car is stopped.
+
+        ``apply`` while the latch is off writes ``engaged: false``. Retail Lua
+        releases on that flag and a later tick that does not write leaves the
+        release in place. A hold puts the brake on the bus every tick.
+        """
+        saved = self.engaged
+        self.engaged = True
+        try:
+            return self.apply(cmd)
+        finally:
+            self.engaged = saved
+
     def stop(self, seq: int = 0, reason: str = "stop") -> DriveCommand:
         cmd = stop_command(seq=seq, reason=reason)
         return self.apply(cmd)

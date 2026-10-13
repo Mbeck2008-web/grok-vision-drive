@@ -28,6 +28,8 @@ class LaneResult:
     conf: float
     lanes_bev: list[list[dict[str, float]]]  # polylines in ego frame
     curvature: float  # 1/m approx
+    # Polylines from the windshield fit. Side and rear pose lines are not in this count.
+    forward_n: int = 0
 
 
 def hough_segments(lines: Any) -> list[tuple[int, int, int, int]]:
@@ -539,6 +541,7 @@ def lanes_from_view(
             )
     if forward is None:
         forward = estimate_lanes(main_bgr)
+    forward.forward_n = len(forward.lanes_bev)
     if not posed:
         return forward
     conf = float(forward.conf)
@@ -550,6 +553,7 @@ def lanes_from_view(
         conf=conf,
         lanes_bev=[*forward.lanes_bev, *posed],
         curvature=forward.curvature,
+        forward_n=len(forward.lanes_bev),
     )
 
 

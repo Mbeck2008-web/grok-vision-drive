@@ -26,6 +26,8 @@ ENGAGE_HZ_GRACE_FLOOR = 5.0
 # Dark or stale cameras: smooth brake immediately, drop Engage after this.
 # Measured in real seconds from the first lost tick. Inside the 2 s accept.
 CAMERA_LOSS_DISENGAGE_S = 1.0
+# Main picture plus a windshield fit, held this long, before a drop is over.
+WINDSHIELD_RECOVER_S = 0.5
 BLIND_REASONS = ("camera_lost", "lanes_lost")
 
 
@@ -100,23 +102,58 @@ def engage_hz_reason(
 
 
 class VisionLoss:
-    """Clock for a dark-camera episode. Cleared when live lanes return."""
+    """Clock for a dark-camera episode.
+
+    Recovery is a healthy main picture and a windshield fit, held for
+    ``WINDSHIELD_RECOVER_S``. ``lanes_source`` live from side or rear pose
+    lines does not clear the episode. After a drop, ``hold_until_stop``
+    stays set until the car is stopped, even if the picture comes back.
+    """
 
     def __init__(self) -> None:
         self.since: float | None = None
         self.dropped = False
+        self.hold_until_stop = False
+        self.defer_release = False
+        self._healthy_since: float | None = None
 
-    def age(self, lanes_source: str, now: float) -> float | None:
-        if lanes_source in ("prior", "none"):
-            if self.since is None:
-                self.since = float(now)
-            return float(now) - self.since
-        self.since = None
-        self.dropped = False
-        return None
+    def age(
+        self,
+        lanes_source: str,
+        now: float,
+        *,
+        camera_lost: bool = False,
+        windshield_live: bool = False,
+    ) -> float | None:
+        t = float(now)
+        source = str(lanes_source or "")
+        healthy = (not camera_lost) and bool(windshield_live) and source == "live"
+        if healthy:
+            if self.since is None and not self.dropped:
+                self._healthy_since = None
+                return None
+            if self._healthy_since is None:
+                self._healthy_since = t
+            if (t - self._healthy_since) < WINDSHIELD_RECOVER_S:
+                if self.since is None:
+                    self.since = t
+                return t - self.since
+            self.since = None
+            self.dropped = False
+            self._healthy_since = None
+            return None
+        self._healthy_since = None
+        # A backend that has never seen the road is not this gate.
+        if source in ("", "unseen") and not camera_lost and not self.dropped and self.since is None:
+            return None
+        if self.since is None:
+            self.since = t
+        return t - self.since
 
     def note_disengage(self) -> None:
         self.dropped = True
+        self.hold_until_stop = True
+        self.defer_release = True
 
 
 def blind_brake_command(*, ego_speed_mps: float, seq: int, reason: str) -> DriveCommand:
@@ -325,6 +362,34 @@ def shadow_tick(
             policy=policy,
         )
 
+    # loop_hz, camera_hz, and engage_age_s stay on the signature so callers
+    # can keep passing them. They do not gate Engage.
+    del loop_hz, camera_hz, engage_age_s
+
+    # A dark camera while the car is moving brakes. That wins over a stale
+    # heartbeat, which would otherwise return stop() and release the pedals.
+    from python.sensors.cameras import STOPPED_MPS
+
+    loss_reason = vision_loss_reason(planner)
+    moving = max(0.0, float(ego_speed_mps)) > STOPPED_MPS
+    if loss_reason is not None and (moving or heartbeat_ok):
+        applied = blind_brake_command(
+            ego_speed_mps=ego_speed_mps, seq=seq, reason=loss_reason
+        )
+        age = None if vision_loss_age_s is None else float(vision_loss_age_s)
+        drop = (age is not None and age >= CAMERA_LOSS_DISENGAGE_S) or not heartbeat_ok
+        return ShadowTick(
+            modular=modular,
+            e2e=e2e,
+            applied=applied,
+            shadow=shadow,
+            e2e_ok=e2e_ok,
+            veto_reason=loss_reason if drop else "none",
+            should_disengage=drop,
+            clip_trigger="disengage" if drop else None,
+            policy=policy,
+        )
+
     if not heartbeat_ok:
         applied = stop_command(seq=seq, reason="heartbeat_stale")
         return ShadowTick(
@@ -336,32 +401,6 @@ def shadow_tick(
             veto_reason="heartbeat_stale",
             should_disengage=True,
             clip_trigger="disengage",
-            policy=policy,
-        )
-
-    # loop_hz, camera_hz, and engage_age_s stay on the signature so callers
-    # can keep passing them. They do not gate Engage.
-    del loop_hz, camera_hz, engage_age_s
-
-    # Remembered lanes (or none after they expire) do not drive. The command
-    # is the speed-law brake on this tick, including the tick that disengages,
-    # so a dark camera is not followed by an instant brake=1.
-    loss_reason = vision_loss_reason(planner)
-    if loss_reason is not None:
-        applied = blind_brake_command(
-            ego_speed_mps=ego_speed_mps, seq=seq, reason=loss_reason
-        )
-        age = None if vision_loss_age_s is None else float(vision_loss_age_s)
-        drop = age is not None and age >= CAMERA_LOSS_DISENGAGE_S
-        return ShadowTick(
-            modular=modular,
-            e2e=e2e,
-            applied=applied,
-            shadow=shadow,
-            e2e_ok=e2e_ok,
-            veto_reason=loss_reason if drop else "none",
-            should_disengage=drop,
-            clip_trigger="disengage" if drop else None,
             policy=policy,
         )
 

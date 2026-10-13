@@ -62,9 +62,9 @@ The settled game view. Soft Esc parked.
 
 ![rear](docs/cams/rear.jpg)
 
-## Recent changes (alpha 1.7.12)
+## Recent changes (alpha 1.7.14)
 
-The offline suite names the no-lane stop, and GitHub Actions runs that suite on pull requests and on pushes to main. Catch-up from **1.0.1**. Each feature merge since that pin is one main step. The throttle fix is the point in between. Live Alt+G, Tech 8-cam, and QSV stay **UNPROVEN**.
+The offline suite names the no-lane stop, and GitHub Actions runs that suite on pull requests and on pushes to main. Catch-up from **1.0.1**. Each feature merge since that pin is one main step. The throttle fix is the point in between. Live Alt+G, Tech 8-cam, and QSV stay **UNPROVEN**. A dark or frozen camera brakes and then disengages. It does not keep the last lanes.
 
 ## Still in force from 1.0.1
 
@@ -154,15 +154,19 @@ Fender repeaters move closer to the body, lower, and slightly back. repeatL is X
 
 With no cameras, Engage plus preview drive is a stop. Throttle is 0, steer is 0, and the brake is `min(0.6, 0.05 * echo speed)` (0.275 at the 5.5 m/s retail echo). A two-lane frame still commands throttle. `.github/workflows/tests.yml` runs the offline scripts on Ubuntu. Windows-only and live BeamNG scripts are skipped. Live Alt+G, Tech 8-cam, force feedback, and Quick Sync stay **UNPROVEN**.
 
+## 1.7.14 dark cameras
+
+An unchanged camera buffer is not this tick. That sector stays empty. After the fit has seen lanes, a dark main camera or a failed fit stops following the remembered path. The command is the speed-law brake (at most 0.6, steer 0), not a full brake of 1. Engage drops after about 1 s with reason `camera_lost` or `lanes_lost`. Remembered lanes are dropped after 0.75 s. They are not moved with the car. A stub that has never seen lanes is unchanged. Covering a camera on a live car is **UNPROVEN** here.
+
 ## 1.7.9 around the car
 
 One supervisor tick reads all eight cameras, then builds the stitch. A camera from an older tick is not reused. Pillar, repeater, and rear lane pixels use that camera's pose, so a side pixel lands beside the car and a rear pixel lands behind it. The steer tick can use those points. Drawn lane lines follow the real points past the blue path and stop where the lane cannot be seen or predicted.
 
-## Alpha 1.7.12
+## Alpha 1.7.14
 
 This is **alpha** — may break / not work; improves with fixes.
 
-Canonical pin **1.7.12** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Untagged retail zips use `1.7.12-alpha-<sha>`.
+Canonical pin **1.7.14** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Untagged retail zips use `1.7.14-alpha-<sha>`.
 
 **Versioning** (this line stays **alpha** until a later non-alpha release):
 

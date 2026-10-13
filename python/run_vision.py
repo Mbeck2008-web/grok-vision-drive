@@ -55,7 +55,7 @@ from python.sensors.cameras import CAM_IDS, CamHealth, bundle_tick_frames
 from python.runtime.debug_opts import apply_to_command, apply_to_perception
 from python.runtime.hw_probe import ema_hz, gpu_vram_used_gb, probe, refuse_live_start, unique_frame_hz_inst
 from python.runtime.models import ModelRuntime
-from python.runtime.shadow import ShadowConfig, load_shadow_config, shadow_tick
+from python.runtime.shadow import ShadowConfig, VisionLoss, load_shadow_config, shadow_tick
 from python.runtime.state_io import (
     default_state,
     load_paint_state,
@@ -503,6 +503,7 @@ def main() -> None:
     prev_preview = bool(args.allow_preview_drive)
     prev_engaged = False
     bot_engage = BotEngage()
+    vision_loss = VisionLoss()
     prev_bot = False
     engage_arm_mono: float | None = None
     review_cap = ReviewCapture()
@@ -665,6 +666,14 @@ def main() -> None:
                 engage_hz_grace_floor=shadow_cfg.engage_hz_grace_floor,
             )
 
+            loss_age = vision_loss.age(
+                str((pout.planner or {}).get("lanes_source") or ""),
+                time.monotonic(),
+            )
+            if vision_loss.dropped:
+                # This episode already dropped Engage. A leftover flag or
+                # --force-engage must not resume until live lanes return.
+                engaged = False
             cmd_seq += 1
             wide = None
             try:
@@ -692,6 +701,7 @@ def main() -> None:
                 loop_hz=loop_hz_ema,
                 camera_hz=cam_hz_ema,
                 engage_age_s=engage_age_s,
+                vision_loss_age_s=loss_age,
             )
             cmd = tick.applied
 
@@ -700,15 +710,27 @@ def main() -> None:
                 cmd = stop_command(seq=cmd_seq, reason="bus_mismatch")
             elif not engaged:
                 disengage_reason = "not_engaged"
-            elif tick.should_disengage:
+            elif cmd.reason in ("camera_lost", "lanes_lost") or tick.should_disengage:
                 veto_name = str(tick.veto_reason or "veto")
-                if ui.debug.ignore_veto_disengage and veto_name != "heartbeat_stale":
+                if cmd.reason in ("camera_lost", "lanes_lost"):
+                    veto_name = cmd.reason
+                # A dark camera is not a debug-ignore. The brake stays the
+                # speed-law command already on ``cmd`` (not brake=1).
+                if (
+                    ui.debug.ignore_veto_disengage
+                    and veto_name not in ("heartbeat_stale", "camera_lost", "lanes_lost")
+                ):
                     disengage_reason = veto_name if veto_name != "none" else "veto"
-                else:
+                elif tick.should_disengage:
                     engaged = False
                     disengage_reason = veto_name if veto_name != "none" else "veto"
+                    if veto_name in ("camera_lost", "lanes_lost"):
+                        vision_loss.note_disengage()
                     bot_engage.clear()
                     write_engage_flag(False, disengage_reason=disengage_reason)
+                    print(f"[GVD] DISENGAGED: {disengage_reason}", flush=True)
+                else:
+                    disengage_reason = veto_name
             elif cmd.reason == "preview_blocked":
                 disengage_reason = "preview_blocked"
             elif cmd.reason == "heartbeat_stale":
@@ -760,7 +782,9 @@ def main() -> None:
                 actuator.note_engaged(engaged)
             if hasattr(actuator, "note_ack"):
                 actuator.note_ack(ego_fb)
-            if engaged and cmd.reason == "ok":
+            blind_stop = cmd.reason in ("camera_lost", "lanes_lost")
+            if (engaged and cmd.reason == "ok") or (blind_stop and (engaged or tick.should_disengage)):
+                # The disengage tick still sends the smooth brake, not stop().
                 applied = actuator.apply(cmd)
             else:
                 applied = actuator.stop(seq=cmd_seq, reason=cmd.reason)

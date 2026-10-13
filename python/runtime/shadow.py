@@ -23,6 +23,10 @@ from python.control.e2e import E2EIntent, E2EPolicy
 MIN_ACCEPT_HZ = 6.0
 ENGAGE_HZ_GRACE_S = 3.0
 ENGAGE_HZ_GRACE_FLOOR = 5.0
+# Dark or stale cameras: smooth brake immediately, drop Engage after this.
+# Measured in real seconds from the first lost tick. Inside the 2 s accept.
+CAMERA_LOSS_DISENGAGE_S = 1.0
+BLIND_REASONS = ("camera_lost", "lanes_lost")
 
 
 @dataclass
@@ -93,6 +97,56 @@ def engage_hz_reason(
     if min(rates) < floor:
         return "low_loop_hz"
     return "none"
+
+
+class VisionLoss:
+    """Clock for a dark-camera episode. Cleared when live lanes return."""
+
+    def __init__(self) -> None:
+        self.since: float | None = None
+        self.dropped = False
+
+    def age(self, lanes_source: str, now: float) -> float | None:
+        if lanes_source in ("prior", "none"):
+            if self.since is None:
+                self.since = float(now)
+            return float(now) - self.since
+        self.since = None
+        self.dropped = False
+        return None
+
+    def note_disengage(self) -> None:
+        self.dropped = True
+
+
+def blind_brake_command(*, ego_speed_mps: float, seq: int, reason: str) -> DriveCommand:
+    """Speed-law stop. Not ``stop_command`` (brake=1), which Tech treats as a hold.
+
+    Steer is 0 so a remembered curve is not followed while the car slows.
+    """
+    cmd = plan_command(
+        path_ego=[],
+        planner={"target_v": 0.0, "aeb": "off"},
+        ego_speed_mps=float(ego_speed_mps),
+        seq=seq,
+    )
+    cmd.reason = reason
+    cmd.steer = 0.0
+    return cmd
+
+
+def vision_loss_reason(planner: dict[str, Any] | None) -> str | None:
+    """``camera_lost`` / ``lanes_lost`` when this tick must not drive on remembered lanes.
+
+    ``lanes_source`` absent or ``live`` / ``unseen`` is not a loss. A stub that
+    has never seen lanes stays on the normal preview path.
+    """
+    source = str((planner or {}).get("lanes_source") or "")
+    if source not in ("prior", "none"):
+        return None
+    if bool((planner or {}).get("camera_lost")):
+        return "camera_lost"
+    return "lanes_lost"
 
 
 def modular_intent(
@@ -179,6 +233,7 @@ def shadow_tick(
     loop_hz: float | None = None,
     camera_hz: float | None = None,
     engage_age_s: float | None = None,
+    vision_loss_age_s: float | None = None,
 ) -> ShadowTick:
     """Compute modular + e2e every tick; choose apply command per policy + gates."""
     cfg = cfg or ShadowConfig()
@@ -258,6 +313,28 @@ def shadow_tick(
     # loop_hz, camera_hz, and engage_age_s stay on the signature so callers
     # can keep passing them. They do not gate Engage.
     del loop_hz, camera_hz, engage_age_s
+
+    # Remembered lanes (or none after they expire) do not drive. The command
+    # is the speed-law brake on this tick, including the tick that disengages,
+    # so a dark camera is not followed by an instant brake=1.
+    loss_reason = vision_loss_reason(planner)
+    if loss_reason is not None:
+        applied = blind_brake_command(
+            ego_speed_mps=ego_speed_mps, seq=seq, reason=loss_reason
+        )
+        age = None if vision_loss_age_s is None else float(vision_loss_age_s)
+        drop = age is not None and age >= CAMERA_LOSS_DISENGAGE_S
+        return ShadowTick(
+            modular=modular,
+            e2e=e2e,
+            applied=applied,
+            shadow=shadow,
+            e2e_ok=e2e_ok,
+            veto_reason=loss_reason if drop else "none",
+            should_disengage=drop,
+            clip_trigger="disengage" if drop else None,
+            policy=policy,
+        )
 
     # Modular-only policy: classic plan path; preview gate.
     # An untrained e2e stub (no models/e2e_current.onnx) is computed above and

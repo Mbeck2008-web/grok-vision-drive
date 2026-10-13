@@ -1959,11 +1959,14 @@ class BeamNGPyBackend:
             return
         bgr = recover_viewport_tone(bgr)
         sig = frame_signature(bgr)
-        unique = sig != self._frame_sig.get(cid)
+        # An unchanged buffer is the previous picture, not this tick.
+        # Leave the sector empty so a frozen grab cannot keep the stitch alive.
+        if sig == self._frame_sig.get(cid):
+            self._omit_unread(cid, frames, timestamps, health)
+            return
         self._store_frame(cid, bgr, ts, frames, timestamps, health)
-        if unique:
-            self._frame_sig[cid] = sig
-            unique_ids.append(cid)
+        self._frame_sig[cid] = sig
+        unique_ids.append(cid)
 
     def _kick_adhoc(self, cid: str, cam: Any) -> bool:
         """Start one ad-hoc render. False when a request is already in flight."""

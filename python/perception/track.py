@@ -109,8 +109,8 @@ class Track:
     measured_y: float = 0.0
     range_rate_mps: float = 0.0
     range_rate_valid: bool = False
-    # (time, measured forward range). The AEB gate ignores the track until
-    # this window can support a range-rate.
+    # (time, measured forward range). A closing rate needs a long line.
+    # The planner still brakes from the gap while this is short.
     samples: list[tuple[float, float]] | None = None
 
 

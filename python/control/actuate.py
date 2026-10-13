@@ -1146,6 +1146,23 @@ class BeamNGPyActuator:
         self._latched = True
         return cmd
 
+    def hold(self, cmd: DriveCommand) -> DriveCommand:
+        """Send this command with ``release=False`` even when Engage is off.
+
+        A dark camera drops the latch and must keep braking. ``stop()`` while
+        disengaged is the pedal release. ``apply()`` refuses when not engaged.
+        """
+        err = self._control(
+            cmd.steer, cmd.throttle, cmd.brake, release=False, blinker="off",
+        )
+        if err:
+            cmd.applied = False
+            cmd.reason = err
+            return cmd
+        cmd.applied = True
+        self._latched = True
+        return cmd
+
     def stop(
         self, seq: int = 0, reason: str = "stop", *, now: float | None = None
     ) -> DriveCommand:

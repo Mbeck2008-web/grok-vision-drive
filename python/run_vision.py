@@ -51,11 +51,17 @@ from python.viz.review_log import ReviewCapture
 from python.viz.nerd import image_point_from_window_mouse
 from python.train.scene_net import live_strip_fields
 from python.viz.stage import drawn_lane_records
-from python.sensors.cameras import CAM_IDS, CamHealth, bundle_tick_frames
+from python.sensors.cameras import CAM_IDS, CamHealth, bundle_tick_frames, note_grab_ego_speed
 from python.runtime.debug_opts import apply_to_command, apply_to_perception
 from python.runtime.hw_probe import ema_hz, gpu_vram_used_gb, probe, refuse_live_start, unique_frame_hz_inst
 from python.runtime.models import ModelRuntime
-from python.runtime.shadow import ShadowConfig, VisionLoss, load_shadow_config, shadow_tick
+from python.runtime.shadow import (
+    ShadowConfig,
+    VisionLoss,
+    hold_for_vision_loss,
+    load_shadow_config,
+    shadow_tick,
+)
 from python.runtime.state_io import (
     default_state,
     load_paint_state,
@@ -530,6 +536,7 @@ def main() -> None:
                     )
 
             t_grab = time.perf_counter()
+            note_grab_ego_speed(last_ego_v)
             bundle = backend.grab()
             grab_ms = float(getattr(bundle, "grab_ms", 0.0) or 0.0)
             if grab_ms <= 0:
@@ -775,17 +782,32 @@ def main() -> None:
 
             cmd = apply_to_command(ui.debug, cmd)
 
+            # A dropped dark-camera episode keeps braking until the car is
+            # stopped. not_engaged / stop() would release the pedals.
+            holding_blind = False
+            if vision_loss.dropped:
+                cmd, holding_blind = hold_for_vision_loss(
+                    cmd, ego_speed_mps=ego_v, seq=cmd_seq
+                )
+
             # Actuators only when engaged + command ok (path / tracks / shadow already on this tick).
             # cmd_json: Lua applies whatever we write only while `engaged` rides along in the payload.
             # beamngpy: note_engaged(False) makes stop() release once, then not call vehicle.control.
+            # hold() is release=False and does not check Engage.
             if hasattr(actuator, "note_engaged"):
                 actuator.note_engaged(engaged)
             if hasattr(actuator, "note_ack"):
                 actuator.note_ack(ego_fb)
             blind_stop = cmd.reason in ("camera_lost", "lanes_lost")
-            if (engaged and cmd.reason == "ok") or (blind_stop and (engaged or tick.should_disengage)):
+            hold = getattr(actuator, "hold", None) if holding_blind else None
+            if holding_blind and callable(hold):
+                applied = hold(cmd)
+            elif (engaged and cmd.reason == "ok") or (blind_stop and (engaged or tick.should_disengage)):
                 # The disengage tick still sends the smooth brake, not stop().
                 applied = actuator.apply(cmd)
+            elif holding_blind:
+                applied = cmd
+                applied.applied = False
             else:
                 applied = actuator.stop(seq=cmd_seq, reason=cmd.reason)
             # Reference for the override residual, keyed by seq so the mod's ack can find the

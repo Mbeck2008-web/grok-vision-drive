@@ -138,15 +138,44 @@ def blind_brake_command(*, ego_speed_mps: float, seq: int, reason: str) -> Drive
 def vision_loss_reason(planner: dict[str, Any] | None) -> str | None:
     """``camera_lost`` / ``lanes_lost`` when this tick must not drive on remembered lanes.
 
-    ``lanes_source`` absent or ``live`` / ``unseen`` is not a loss. A stub that
-    has never seen lanes stays on the normal preview path.
+    ``camera_lost`` wins even when ``lanes_source`` is ``live``. A planner that
+    has never seen lanes (``unseen`` or empty) is not this gate. ``prior`` /
+    ``none`` without a dark camera is ``lanes_lost``.
     """
-    source = str((planner or {}).get("lanes_source") or "")
+    planner = planner or {}
+    source = str(planner.get("lanes_source") or "")
+    lost = bool(planner.get("camera_lost"))
+    if lost and source not in ("", "unseen"):
+        return "camera_lost"
     if source not in ("prior", "none"):
         return None
-    if bool((planner or {}).get("camera_lost")):
+    if lost:
         return "camera_lost"
     return "lanes_lost"
+
+
+def hold_for_vision_loss(
+    cmd: DriveCommand, *, ego_speed_mps: float, seq: int
+) -> tuple[DriveCommand, bool]:
+    """While a dark-camera episode is still moving, do not release the pedals.
+
+    Returns ``(command, hold)``. ``hold`` is false only once speed is at a
+    stop, so the caller may ``stop()`` (release). Above creep the command is
+    the speed-law brake. Between creep and a stop it is ``stop_command``
+    (brake 1), which Tech maps to the parking brake with ``release=False``.
+    """
+    from python.sensors.cameras import CREEP_MPS, STOPPED_MPS
+
+    speed = max(0.0, float(ego_speed_mps))
+    if speed <= STOPPED_MPS:
+        return cmd, False
+    reason = cmd.reason if cmd.reason in ("camera_lost", "lanes_lost") else "camera_lost"
+    if speed > CREEP_MPS:
+        return (
+            blind_brake_command(ego_speed_mps=speed, seq=seq, reason=reason),
+            True,
+        )
+    return stop_command(seq=seq, reason=reason), True
 
 
 def modular_intent(

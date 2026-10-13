@@ -156,7 +156,7 @@ With no cameras, Engage plus preview drive is a stop. Throttle is 0, steer is 0,
 
 ## 1.7.13 supervisor start
 
-A new supervisor writes `engaged:false` (`supervisor_start`) before the driving loop. Tech hold, Tech probe, and smoke do not. If `gvd_state.json` `heartbeat_mtime` stays still for about 2 s, the mod drops Engage (`supervisor_lost`) and queues throttle 0 on the pad filter and on source `gvd`. Above about 1.5 m/s that is a service brake. Below that it is the parking brake with the service brake released, so arcade does not treat the hold as reverse. The 2 s timer counts `onUpdate` only. Closing the supervisor console on a live car is **UNPROVEN** here.
+A new supervisor writes `engaged:false` (`supervisor_start`) before the driving loop. Tech hold, Tech probe, and smoke do not. If `gvd_state.json` `heartbeat_mtime` stays still for about 2 s, the mod drops Engage (`supervisor_lost`). The release is the Tech control slot (pad filter 1, source `local`): steer 0, throttle 0, service brake 0.6 while moving, parking brake when nearly stopped. A gvd Direct Drive event does not clear `vehicle.control`. The queue retries while the vehicle is missing or `queueLuaCommand` fails. A newer heartbeat clears that retry only after a queue has landed. The 2 s timer counts `onUpdate` only. Closing the supervisor console on a live car is **UNPROVEN** here.
 
 ## 1.7.9 around the car
 

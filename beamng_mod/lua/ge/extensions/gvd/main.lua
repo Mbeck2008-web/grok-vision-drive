@@ -1931,20 +1931,24 @@ function M.onUpdate(dt)
   -- Lost-supervisor timer counts onUpdate only. pollState also runs from onPreRender
   -- and would halve a shared accumulator. About 2 s here is about 2 s in game.
   -- Tech never sets `applying`, so the retail command dead-man does not zero
-  -- vehicle.control. This queues throttle 0 on filter 1 and on source gvd, then
-  -- a service brake while moving or the parking brake when nearly stopped
-  -- (arcade treats a held service brake with no throttle as reverse).
-  local techDead = "input.event('throttle',0,1);"
-    .. "input.event('throttle',0,2,0,0,nil,'gvd');"
-    .. "local ev=(electrics and electrics.values) or {};"
+  -- vehicle.control. That Control message is pad filter 1 on source local, and
+  -- techCore keeps reapplying it. A gvd Direct Drive event does not clear it.
+  -- This is the release stop(release=False) uses while the car is still moving:
+  -- steer 0, throttle 0, service brake 0.6 above ~1.5 m/s, parking brake when
+  -- nearly stopped (arcade treats a held service brake with no throttle as reverse).
+  -- setVehicleControl, when this build has it, replaces the stored Control.
+  local techDead = "local ev=(electrics and electrics.values) or {};"
     .. "local sp=tonumber(ev.wheelspeed or ev.airspeed) or 0;"
-    .. "if sp<1.5 then "
-    .. "input.event('brake',0,1);input.event('brake',0,2,0,0,nil,'gvd');"
-    .. "input.event('parkingbrake',1,1);input.event('parkingbrake',1,2,0,0,nil,'gvd');"
-    .. "else "
-    .. "input.event('parkingbrake',0,1);input.event('parkingbrake',0,2,0,0,nil,'gvd');"
-    .. "input.event('brake',0.6,1);input.event('brake',0.6,2,0,0,nil,'gvd');"
-    .. "end"
+    .. "local br,pb=0.6,0;"
+    .. "if sp<1.5 then br,pb=0,1 end;"
+    .. "local function pad(name,val) "
+    .. "if input and input.event then input.event(name,val,1,nil,nil,nil,'local') end "
+    .. "end;"
+    .. "pad('steering',0);pad('throttle',0);pad('brake',br);pad('parkingbrake',pb);"
+    .. "pcall(function() "
+    .. "local tech=extensions and extensions.tech_techCore;"
+    .. "if tech and tech.setVehicleControl then tech.setVehicleControl(0,0,br,pb) end "
+    .. "end)"
   if not engaged or lastGood == nil then
     M.supLostAcc = 0
     M.supLostFired = nil
@@ -1954,12 +1958,17 @@ function M.onUpdate(dt)
       M.supLostBeat = beat
       M.supLostAcc = 0
       M.supLostFired = nil
-      M.supLostNeedPedal = nil
+      -- A fresh heartbeat must not forget a release that never queued.
+      if M.supLostPedalQueued then
+        M.supLostNeedPedal = nil
+        M.supLostPedalQueued = nil
+      end
     end
     M.supLostAcc = (M.supLostAcc or 0) + (dt or 0)
     if M.supLostAcc >= 2.0 and not M.supLostFired then
       M.supLostFired = true
       M.supLostNeedPedal = true
+      M.supLostPedalQueued = nil
       if applying then releaseInputs('supervisor heartbeat stale') end
       engaged = false
       fadeAcc = 0
@@ -1969,12 +1978,22 @@ function M.onUpdate(dt)
       pushUi()
     end
   end
-  -- Retry until a vehicle exists. Dropping the latch must not wait on getPlayerVeh,
-  -- and a nil vehicle must not leave the last Tech throttle applied.
+  -- Retry while the vehicle is missing or queueLuaCommand fails. After one
+  -- queue lands, keep sending it until a newer heartbeat: techCore reapplies
+  -- the previous Control every frame, so one input.event does not stick.
+  -- Clear the owed release on that new heartbeat only.
   if M.supLostNeedPedal then
     local veh = getPlayerVeh()
     if veh and queueVehicle(veh, techDead) then
-      M.supLostNeedPedal = nil
+      M.supLostPedalQueued = true
+    end
+    if M.supLostPedalQueued and lastGood then
+      local beat = tonumber(lastGood.heartbeat_mtime)
+      if beat ~= nil and beat ~= M.supLostBeat then
+        M.supLostBeat = beat
+        M.supLostNeedPedal = nil
+        M.supLostPedalQueued = nil
+      end
     end
   end
   -- Python honors engaged:true only while mtime is fresh (~2.5 s). Refresh the stamp

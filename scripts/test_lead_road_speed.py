@@ -1004,6 +1004,106 @@ def _assert_no_phantom(name: str, row: dict) -> None:
     assert row["aeb"] is False, (name, row)
 
 
+def check_jump_and_short_pace_do_not_hold_brake() -> None:
+    """A same-track jump, and pacing inside 14 m, must not hold the brake.
+
+    The comfort wall used to treat a 4 m step at 16 m as a stopped lead.
+    A ±2 m pace at 12 m, and an AR(1) wander at 14 m, used to lock the
+    short-gap floor after the gap had stopped closing. Each roll is
+    closed-loop: the lead holds 18 m/s and the gap moves with both cars.
+    """
+    from python.planning.path_predictor import _required_brake
+
+    # Unconfirmed rate, gap still outside 5 m: under the aeb line.
+    soft = _required_brake(10.44, -7.17, 4.89)
+    assert soft <= 0.98, soft
+    # Inside 5 m an unconfirmed rate may still be a full brake.
+    assert _required_brake(4.0, -8.0, 4.0) >= 0.99
+
+    def jump(y0: float, step: float) -> tuple[float, bool]:
+        dt = 0.1
+        ego = 18.0
+        gap = y0
+        tracker = IoUTracker()
+        min_ego = ego
+        tripped = False
+        for i in range(80):
+            if i == 20:
+                gap -= step
+            plan, cmd, _planner = _drive(tracker, max(0.4, gap), i * dt, ego, i)
+            tripped = tripped or plan.aeb == "brake" or cmd.brake >= 0.99
+            a = _decel(cmd.brake)
+            move = ego * dt - 0.5 * a * dt * dt
+            gap = gap + 18.0 * dt - move
+            ego = max(0.0, ego - a * dt)
+            min_ego = min(min_ego, ego)
+        return 18.0 - min_ego, tripped
+
+    jumps = {}
+    for y0, step in ((16.0, 4.0), (20.0, 2.5)):
+        loss, tripped = jump(y0, step)
+        assert loss <= 1.5, (y0, step, round(loss, 2))
+        assert tripped is False, (y0, step, loss)
+        jumps[f"{step:g}@{y0:g}"] = round(loss, 2)
+
+    pace = {}
+    for gap0 in (12.0, 14.0):
+        worst = 0.0
+        for seed in range(40):
+            rng = random.Random(seed)
+            dt = 0.1
+            ego = 18.0
+            lead_s = ego_s = 0.0
+            tracker = IoUTracker()
+            min_ego = ego
+            for i in range(80):
+                true_gap = gap0 + lead_s - ego_s
+                y = max(0.4, true_gap + rng.uniform(-2.0, 2.0))
+                plan, cmd, _planner = _drive(tracker, y, i * dt, ego, i)
+                tr = tracker.tracks[0]
+                if true_gap > 5.0 and tr.range_rate_sigma > 2.2:
+                    assert plan.aeb != "brake" and cmd.brake < 0.99, (
+                        gap0, seed, i, y, tr.range_rate_sigma, plan.aeb, cmd.brake,
+                    )
+                assert plan.aeb != "brake" and cmd.brake < 0.99, (
+                    gap0, seed, i, plan.aeb, cmd.brake,
+                )
+                a = _decel(cmd.brake)
+                ego_s += ego * dt - 0.5 * a * dt * dt
+                ego = max(0.0, ego - a * dt)
+                lead_s += 18.0 * dt
+                min_ego = min(min_ego, ego)
+            worst = max(worst, 18.0 - min_ego)
+        assert worst <= 1.5, (gap0, round(worst, 2))
+        pace[gap0] = round(worst, 2)
+
+    ars = []
+    for seed in range(6):
+        rng = random.Random(seed)
+        noise = 0.0
+        dt = 0.1
+        ego = 18.0
+        lead_s = ego_s = 0.0
+        tracker = IoUTracker()
+        min_ego = ego
+        tripped = False
+        for i in range(450):
+            true_gap = 14.0 + lead_s - ego_s
+            noise = 0.9 * noise + 0.45 * rng.gauss(0.0, 1.0)
+            y = max(0.4, true_gap + noise)
+            plan, cmd, _planner = _drive(tracker, y, i * dt, ego, i)
+            tripped = tripped or plan.aeb == "brake" or cmd.brake >= 0.99
+            a = _decel(cmd.brake)
+            ego_s += ego * dt - 0.5 * a * dt * dt
+            ego = max(0.0, ego - a * dt)
+            lead_s += 18.0 * dt
+            min_ego = min(min_ego, ego)
+        loss = 18.0 - min_ego
+        assert loss <= 1.5 and tripped is False, (seed, round(loss, 2), tripped)
+        ars.append(round(loss, 2))
+    print("jump/pace/ar losses m/s:", jumps, pace, ars)
+
+
 def check_gap_drop_does_not_phantom_stop() -> None:
     """A route-gap wiggle is not a latched full stop.
 
@@ -1175,6 +1275,7 @@ def main() -> None:
     check_curve_cipv_follows_the_path()
     check_live_tick_publishes_range_brake()
     check_faster_lead_is_not_closing()
+    check_jump_and_short_pace_do_not_hold_brake()
     check_gap_drop_does_not_phantom_stop()
     check_curve_entry_does_not_phantom_stop()
     check_nonpositive_ttc_is_not_a_brake()

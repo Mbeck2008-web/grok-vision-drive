@@ -218,7 +218,14 @@ class IoUTracker:
                 tr.drop_state = [0.0, 0.0, 0.0]
             # A swap stays one track (the match gate is 6 m) but it is not
             # the same gap. Drop the route baseline so the jump is not a brake.
-            if tr.samples and abs(float(d.y) - float(tr.samples[-1][1])) >= _ROUTE_RESET_M:
+            # A lead that is already closing can move 2 m in one noisy frame.
+            # That is the same car, and wiping the slope there is a late stop.
+            already_closing = bool(tr.range_rate_valid) and tr.range_rate_mps <= -0.4
+            jumped = (
+                tr.samples
+                and abs(float(d.y) - float(tr.samples[-1][1])) >= _ROUTE_RESET_M
+            )
+            if jumped and not already_closing:
                 tr.route_gaps.clear()
                 for i in range(len(tr.drop_state)):
                     tr.drop_state[i] = 0.0

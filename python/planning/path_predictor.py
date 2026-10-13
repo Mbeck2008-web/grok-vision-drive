@@ -27,7 +27,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any
 
-from python.perception.track import PRIOR_RATE_SIGMA_MPS
+from python.perception.track import PRIOR_RATE_SIGMA_MPS, _RATE_VALID_SIGMA
 from python.planning.speed import plan_speed
 
 LANE_W_DEFAULT = 3.5
@@ -103,8 +103,29 @@ _DROP_SHORT_MPS = -1.7
 _DROP_LEAD_M = 15.0
 # Release only after the filtered rate has been flat or opening this long.
 # One shallow slope window is not a release, and neither is a single frame.
+# A rate that is clearly opening, or a route slope that has been opening
+# for this long, lets go on that frame instead of waiting out a flat spell.
 _DROP_RELEASE = -0.25
 _DROP_RELEASE_S = 0.50
+_DROP_OPEN_MPS = 0.5
+# Inside 15 m the arm has to clear the noise, not a fixed 1 m/s. A ±2 m
+# grab at 12 m has a sigma near 2, and −1 m/s of mean is still inside it.
+_DROP_ARM_PAD = 0.4
+# Comfort is a wall. The lower bound on closing (mean minus k sigma,
+# written as a positive closing speed) has to clear this, or the drop
+# has to be locked. A 4 m same-track jump peaks near 2.1 m/s on a
+# matched lead and has to follow that lead instead.
+_COMFORT_CLOSE_MPS = 2.5
+# An unconfirmed rate must not promote aeb. Inside this gap the bumper
+# is close enough that the full brake still stands.
+_AEB_CONFIRM_M = 5.0
+# Slow-side closing (mean plus k sigma, as a positive close) that is
+# still a real stop while sigma itself is not valid yet. Below this, a
+# short gap contributes no pedal: ±2 m at 12 m looks like several m/s
+# of close for most of a second. A longer gap keeps a light pedal so a
+# stopped lead is already slowing when the filter settles.
+_UNCERTAIN_CLOSE_MPS = 3.0
+_UNCERTAIN_LIGHT_M = 18.0
 # Under the 0.99 line that promotes aeb. The drop alone must not disengage.
 _DROP_CAP = 0.98
 _SWAP_JUMP_M = 2.2
@@ -226,7 +247,7 @@ def predict_path(
     kalman_brake, drop_brake = _lead_range_brake(tracks or [], route, float(ego_speed_mps))
     curv = ring_curv if prediction == "roundabout" and ring_curv > 1e-4 else _path_curvature(path)
     occupants = _predict_occupants(tracks or [])
-    path, stop_reason, cipv_id, ttc, occupied, stop_dist, closing = _apply_scene(
+    path, stop_reason, cipv_id, ttc, occupied, stop_dist, closing, comfort_stop = _apply_scene(
         path,
         occupants,
         signs or [],
@@ -242,9 +263,13 @@ def predict_path(
         ego_speed_mps=float(ego_speed_mps),
         signs=signs or [],
         path=path,
+        comfort_stop=comfort_stop,
     )
-    # Kalman required-decel can still be a full stop. A route-gap drop is
-    # graded and capped under that, so it cannot promote aeb on its own.
+    # Kalman required-decel can still be a full stop once the rate sigma is
+    # inside the valid band, or the gap is already inside 5 m. Farther out,
+    # an unconfirmed rate is capped at 0.98 in _required_brake, so this 0.99
+    # line cannot promote aeb from noise. A route-gap drop is graded and
+    # capped under that, so it cannot promote aeb on its own.
     range_brake = 0.0
     if aeb != "brake":
         if kalman_brake >= 0.99:
@@ -875,13 +900,31 @@ def _required_brake(gap_m: float, rate_mps: float, sigma_mps: float) -> float:
     if gap <= _RANGE_RESERVE_M:
         return 1.0
     usable = max(0.25, gap - _RANGE_RESERVE_M)
-    closing = max(0.0, -(rate - _CLOSING_K * max(0.0, sigma)))
+    # A confirmed rate brakes the fast side of the noise. An unconfirmed
+    # rate uses that same side, but the pedal stays at or under 0.98 so
+    # it cannot promote aeb. The slow side has to show a real close
+    # before that pedal is allowed. A short gap whose slow side is still
+    # inside the noise is not a stop. A longer gap keeps a light pedal
+    # so a stopped lead is already slowing while sigma settles.
+    uncertain = sigma > _RATE_VALID_SIGMA and gap > _AEB_CONFIRM_M
+    signed = max(0.0, sigma)
+    closing = max(0.0, -(rate - _CLOSING_K * signed))
+    confirmed_close = max(0.0, -(rate + _CLOSING_K * signed))
     if not math.isfinite(closing) or not math.isfinite(usable) or usable <= 0.0:
         return 0.0
     a_req = (closing * closing) / (2.0 * usable)
     if not math.isfinite(a_req):
         return 0.0
-    return max(0.0, min(1.0, a_req / _BRAKE_DECEL))
+    brake = max(0.0, min(1.0, a_req / _BRAKE_DECEL))
+    if uncertain:
+        if confirmed_close >= _UNCERTAIN_CLOSE_MPS:
+            cap = _DROP_CAP
+        elif gap >= _UNCERTAIN_LIGHT_M:
+            cap = 0.20
+        else:
+            cap = 0.0
+        brake = min(brake, cap)
+    return brake
 
 
 def _route_station(path: list[dict[str, float]], x: float, y: float) -> float | None:
@@ -981,7 +1024,11 @@ def _record_route_gap(raw: dict[str, Any], station: float, now: float) -> list |
         prev_s = _num(series[-1][1]) if isinstance(series[-1], (tuple, list)) and len(series[-1]) > 1 else None
         if prev_t is not None and abs(prev_t - now) < 1e-4:
             return series
-        if prev_s is not None and abs(station - prev_s) >= _SWAP_JUMP_M:
+        rate_now = _num(raw.get("range_rate_mps"))
+        already_closing = raw.get("range_rate_valid") is True and (
+            rate_now is not None and rate_now <= -0.4
+        )
+        if prev_s is not None and abs(station - prev_s) >= _SWAP_JUMP_M and not already_closing:
             series.clear()
             for i in range(len(state)):
                 state[i] = 0.0
@@ -1035,10 +1082,23 @@ def _drop_brake(raw: dict[str, Any], station: float, now: float) -> float:
     locked = _num(state[0]) or 0.0
     hot = _num(state[1]) or 0.0
     flat_s = _num(state[2]) or 0.0
-    # The flat timer starts when the lock does. A pace that was already
-    # flat must not erase a lock on the frame it arms.
+    sigma = _num(raw.get("range_rate_sigma"))
+    if sigma is None or not math.isfinite(sigma):
+        sigma = 0.0
+    sigma = max(0.0, sigma)
+    # Clearly opening: the pedal comes off on this frame. A positive route
+    # slope has to hold, the same way a flat rate does, before it releases.
+    slope_open = (slow is not None and slow > 0.0) or (
+        slow is None and fast is not None and fast > 0.0
+    )
     if locked >= 1.0:
-        if valid and rate is not None and rate >= _DROP_RELEASE:
+        if valid and rate is not None and rate > _DROP_OPEN_MPS:
+            state[0] = 0.0
+            state[1] = 0.0
+            state[2] = 0.0
+            return 0.0
+        rate_flat = valid and rate is not None and rate >= _DROP_RELEASE
+        if rate_flat or slope_open:
             flat_s += dt
         else:
             flat_s = 0.0
@@ -1055,10 +1115,22 @@ def _drop_brake(raw: dict[str, Any], station: float, now: float) -> float:
     # A pace whose rate is still flat can throw a steep half-second.
     # That is not a lead brake. Once the filtered rate is closing, it is.
     rate_closing = valid and rate is not None and rate <= -0.8
+    # Inside 15 m the mean has to clear k sigma plus a small pad before
+    # a new lock. A fixed −1 m/s line sits inside a ±2 m grab. The short
+    # stop still arms on −1 m/s once the slope is already steep: its
+    # rate is only about −1.2 on the frame the gap would otherwise be
+    # given up, and the floor below does not stay unless that close
+    # keeps deepening.
+    beyond = -(_DROP_ARM_PAD + _CLOSING_K * sigma)
+    rate_beyond = valid and rate is not None and rate <= beyond
+    short_zone = station <= _DROP_LEAD_M
+    rate_early = valid and rate is not None and rate <= -1.0
+    rate_hard = rate_early if station <= _DROP_HARD_M else (
+        rate_beyond if short_zone else rate_closing
+    )
     # The 12.5 m stop is already gone by the time the half-second slope
     # clears −2.8. Inside that station the milder slope is enough, and
-    # only after the filtered rate itself is closing at 1 m/s.
-    rate_hard = valid and rate is not None and rate <= -1.0
+    # only after the filtered rate itself is closing past the noise.
     short_steep = (
         station <= _DROP_HARD_M
         and rate_hard
@@ -1066,11 +1138,14 @@ def _drop_brake(raw: dict[str, Any], station: float, now: float) -> float:
         and fast <= _DROP_SHORT_MPS
     )
     steep = long_steep or short_steep
-    if steep and (locked >= 1.0 or rate_closing):
+    if steep and (locked >= 1.0 or rate_hard):
         hot += dt
     elif locked < 1.0:
         hot = max(0.0, hot - dt)
-    if hot >= (_DROP_ARM_S if station <= _DROP_HARD_M else _DROP_HOLD_S) and steep:
+    was_locked = locked >= 1.0
+    if hot >= (_DROP_ARM_S if station <= _DROP_HARD_M else _DROP_HOLD_S) and steep and (
+        locked >= 1.0 or rate_hard
+    ):
         # Farther out, the first lock is 5 m/s². Inside the last 12 m the
         # same slope is a lead that is already braking harder than that,
         # so the hold goes to the cap. Either way the pedal stays at 0.98.
@@ -1086,10 +1161,47 @@ def _drop_brake(raw: dict[str, Any], station: float, now: float) -> float:
     usable = max(0.25, station - _RANGE_RESERVE_M)
     slope = slow if fast is None else fast if slow is None else min(slow, fast)
     closing = 0.0 if slope is None else max(0.0, -slope)
-    # The locked decel is for a lead braking inside _DROP_LEAD_M. Farther
-    # out, the same slope is what correlated noise does to a longer gap,
-    # and it must not be a stop.
-    lead_a = min(locked, _DROP_HARD_A) if station <= _DROP_LEAD_M else 0.0
+    # A noise dip can match a lead brake for one frame and then let go.
+    # The floor stays for that opening frame. It stays after that when
+    # the one-second slope is already a close and the filtered rate is
+    # still past 1.5 m/s, or when the rate itself has become a hard
+    # close. A ±2 m grab does not keep both. An opening rate drops the
+    # floor on this frame.
+    deep_close = valid and rate is not None and rate <= -2.5
+    # hot can sit at one frame after the slope lets go. That is not a
+    # new arm. Only the frame that raises the lock counts.
+    just_armed = locked >= 1.0 and not was_locked
+    # Inside the short gap the one-second slope only has to be a real
+    # close. Farther out, a wander sits on about −2 m/s and must not
+    # keep the floor; a lead brake is steeper than that.
+    if station <= _DROP_HARD_M:
+        # Both windows. A dip whose half-second slope has already
+        # turned is not still a lead brake, even if the one-second
+        # slope is still negative.
+        slow_closing = (
+            slow is not None
+            and slow <= -1.2
+            and fast is not None
+            and fast <= _DROP_SHORT_MPS
+        )
+    else:
+        # A 14 m wander reached about −3.5 m/s on the one-second slope.
+        # A lead braking at 6 m/s² is steeper than −4 once that window fills.
+        slow_closing = slow is not None and slow <= -4.0
+    rate_held = valid and rate is not None and rate <= -1.5
+    still_closing = deep_close or (
+        just_armed and valid and rate is not None and rate < 0.0
+    ) or (slow_closing and rate_held)
+    lead_a = (
+        min(locked, _DROP_HARD_A)
+        if station <= _DROP_LEAD_M and still_closing
+        else 0.0
+    )
+    # The opening frame of a noise dip is not yet the 7.6 m/s² hold.
+    # A real brake is already on the one-second slope, or it deepens
+    # on the next frames and the hold catches up.
+    if just_armed and not deep_close and not (slow_closing and rate_held):
+        lead_a = min(lead_a, 5.0)
     a_req = lead_a + (closing * closing) / (2.0 * usable)
     if not math.isfinite(a_req):
         return 0.0
@@ -1200,8 +1312,10 @@ def _predict_occupants(tracks: list) -> list[dict[str, Any]]:
                 "unseen_s": unseen,
                 "partial": partial,
                 "speed_mps": speed,
+                "range_rate_mps": raw.get("range_rate_mps"),
                 "range_rate_sigma": sigma,
                 "close_hold_s": raw.get("close_hold_s") or 0.0,
+                "drop_state": raw.get("drop_state"),
             }
         )
     return out
@@ -1230,8 +1344,11 @@ def _apply_scene(
     width: float,
     *,
     ego_speed_mps: float,
-) -> tuple[list[dict[str, float]], str, int | None, float | None, list[dict[str, Any]], float | None, float | None]:
-    cuts: list[tuple[float, str, int | None, float | None, float]] = []
+) -> tuple[
+    list[dict[str, float]], str, int | None, float | None,
+    list[dict[str, Any]], float | None, float | None, bool,
+]:
+    cuts: list[tuple[float, str, int | None, float | None, float, bool]] = []
     occupied: list[dict[str, Any]] = []
     station = _along(path)
     for occ in occupants:
@@ -1291,7 +1408,22 @@ def _apply_scene(
         except (TypeError, ValueError):
             ident = None
         reason = kind if kind in ("pedestrian", "bike") else "vehicle"
-        cuts.append((cut_s, reason, ident, ttc, reported))
+        # Lower bound on closing: the mean minus k sigma. A jump can cut
+        # the path while that bound is only a metre and a half. Comfort is
+        # a wall, so it waits for a real close or for the drop to lock.
+        drop = occ.get("drop_state")
+        locked = (
+            isinstance(drop, list)
+            and bool(drop)
+            and (_num(drop[0]) or 0.0) >= 1.0
+        )
+        # A stored lock is not a wall once the filtered rate has let up.
+        # The floor itself already dropped. Comfort waits for a hard close.
+        rate_now = _num(occ.get("range_rate_mps"))
+        lock_hard = locked and rate_now is not None and rate_now <= -2.5
+        bound = closing - _CLOSING_K * max(0.0, sigma)
+        comfort = bool(lock_hard or bound >= _COMFORT_CLOSE_MPS)
+        cuts.append((cut_s, reason, ident, ttc, reported, comfort))
 
     for raw in signs or []:
         if not isinstance(raw, dict):
@@ -1309,14 +1441,17 @@ def _apply_scene(
                 continue
             cuts.append((
                 station[idx] - SIGN_STANDOFF_M, "stop_sign", None,
-                _sign_ttc(station[idx], ego_speed_mps), float(ego_speed_mps),
+                _sign_ttc(station[idx], ego_speed_mps), float(ego_speed_mps), True,
             ))
         elif kind in ("yield", "yield_sign"):
             if lateral > _sign_gate(SHOULDER_M, raw):
                 continue
             # Same reach as a stop sign on this route. Brake is scaled from the
             # remaining distance, not held at one value.
-            cuts.append((station[idx] - SIGN_STANDOFF_M, "yield", None, None, float(ego_speed_mps)))
+            cuts.append((
+                station[idx] - SIGN_STANDOFF_M, "yield", None, None,
+                float(ego_speed_mps), True,
+            ))
         elif kind in ("traffic_light", "light"):
             if lateral > _sign_gate(LIGHT_GATE_M, raw):
                 continue
@@ -1324,23 +1459,23 @@ def _apply_scene(
             if state in ("red", "r"):
                 cuts.append((
                     station[idx] - SIGN_STANDOFF_M, "red_light", None,
-                    _sign_ttc(station[idx], ego_speed_mps), float(ego_speed_mps),
+                    _sign_ttc(station[idx], ego_speed_mps), float(ego_speed_mps), True,
                 ))
             elif state in ("yellow", "amber") and station[idx] < 22.0:
                 cuts.append((
                     station[idx] - SIGN_STANDOFF_M, "yellow_light", None,
-                    _sign_ttc(station[idx], ego_speed_mps), float(ego_speed_mps),
+                    _sign_ttc(station[idx], ego_speed_mps), float(ego_speed_mps), True,
                 ))
     if not cuts:
-        return path, "none", None, None, occupied, None, None
-    cut_s, reason, cipv_id, ttc, closing = min(cuts, key=lambda c: c[0])
+        return path, "none", None, None, occupied, None, None, False
+    cut_s, reason, cipv_id, ttc, closing, comfort = min(cuts, key=lambda c: c[0])
     stop_dist = max(0.0, cut_s)
     trimmed = [p for p, s in zip(path, station) if s <= stop_dist + 1e-6]
     if len(trimmed) < 2:
         trimmed = [path[0], path[1 if len(path) > 1 else 0]]
         if trimmed[0] is trimmed[1]:
             trimmed = [path[0], _pt(path[0]["x"], path[0]["y"] + 0.4)]
-    return trimmed, reason, cipv_id, ttc, occupied, stop_dist, closing
+    return trimmed, reason, cipv_id, ttc, occupied, stop_dist, closing, bool(comfort)
 
 
 def _limit_mps(signs: list, path: list[dict[str, float]]) -> float | None:
@@ -1405,6 +1540,7 @@ def _speed_flags(
     ego_speed_mps: float,
     signs: list,
     path: list[dict[str, float]],
+    comfort_stop: bool = False,
 ) -> tuple[str, float, float | None]:
     """Brake grows as the gap shrinks and as closing speed rises. Far stops do not slam to 1."""
     dist = None if stop_dist is None else max(0.0, float(stop_dist))
@@ -1451,11 +1587,15 @@ def _speed_flags(
             close_now = 0.0 if closing is None else closing
             lead_v = float(ego_speed_mps) - close_now
             comfort = math.sqrt(max(0.0, 2.0 * _COMFORT_DECEL * dist))
-            # Inside the stop, the gap is the brake. Matching a lagged
-            # lead speed here left the pedal at a few hundredths where
-            # this comfort stop was already 0.6. Farther out, a lead that
-            # still has road speed is matched so a wander is not a wall.
-            if dist <= _COMFORT_CUT_M or lead_v <= 1.0:
+            # The comfort target is a wall. It applies when the lower
+            # bound on closing is a real close, or the drop is locked and
+            # the filtered rate is still a hard close. A stored lock whose
+            # rate has already let up is not a wall. A same-track jump can
+            # still cut the path while that bound is only a couple of m/s;
+            # matching the lead's speed there does not shed the way the
+            # wall does. A stop or a light sets the flag itself, and a
+            # lead that is already near a standstill still uses the wall.
+            if comfort_stop and (dist <= _COMFORT_CUT_M or lead_v <= 1.0):
                 target = min(target, comfort)
             else:
                 target = min(target, lead_v)

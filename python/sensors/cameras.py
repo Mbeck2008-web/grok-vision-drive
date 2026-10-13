@@ -15,6 +15,8 @@ from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 
+from python.runtime.logio import safe_print
+
 CAM_IDS = ("narrow", "main", "wide", "pillarL", "pillarR", "repeatL", "repeatR", "rear")
 MAIN_ALIASES = ("main", "cam_main")
 SIDE_CAM_IDS = frozenset(("pillarL", "pillarR", "repeatL", "repeatR"))
@@ -1589,7 +1591,7 @@ class BeamNGPyBackend:
                     for k, v in self._update_s.items()
                 )
                 prios = " ".join(f"{k}={v:g}" for k, v in self._update_priority.items())
-                print(
+                safe_print(
                     f"[GVD] beamngpy attached {attached} color Camera(s) from cameras.yaml "
                     f"(near_far_planes far_m {clips}; requested_update_time {rates}; "
                     f"update_priority {prios}; "

@@ -156,7 +156,7 @@ With no cameras, Engage plus preview drive is a stop. Throttle is 0, steer is 0,
 
 ## 1.7.15 recorder
 
-Each strip appends one state line and remembers the file offset. It does not read `state.jsonl` again. The line is synced about once a second, and when recording stops. `config/hardware.yaml` `clip_ring_max_mb` caps the clip ring (default 64, never above 256). Frames older than the pre-roll plus post-roll plus one second are dropped as they age. `nvidia-smi` is a background poll. The vision tick only reads the last sample. A long recording on this PC is **UNPROVEN** here.
+Each strip appends one state line and remembers the file offset. It does not read `state.jsonl` again. The line is synced about once a second, and when recording stops. `config/hardware.yaml` `clip_ring_max_mb` caps the clip ring (default 64, never above 256). Frames older than the pre-roll plus post-roll plus one second are dropped as they age. `nvidia-smi` is a background poll. The vision tick only reads the last sample. `rss_mb` reads the working set (Windows) or `/proc` when `resource` is missing, so a piped supervisor does not report 0.0. The camera attach line replaces characters the pipe cannot encode. A long recording on this PC is **UNPROVEN** here.
 
 ## 1.7.9 around the car
 

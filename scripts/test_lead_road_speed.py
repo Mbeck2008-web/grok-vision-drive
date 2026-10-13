@@ -114,6 +114,45 @@ def check_slower_lead_aeb() -> None:
     assert max(row[0] for row in aeb) > 8.0
 
 
+def check_noisy_range_rate_does_not_aeb() -> None:
+    """A lead that is not closing, with a jumpy range, must not full-brake.
+
+    The stored range-rate is smoothed. One bad sample is not the raw
+    Δrange/Δt, and it does not command brake 1.
+    """
+    tracker = IoUTracker()
+    ego = 12.0
+    # Far enough that one smoothed spike (closing ~10 m/s) stays above the 1.2 s full-brake band.
+    y0 = 28.0
+    t = 0.0
+    dt = 0.1
+    saw_raw = False
+    for i in range(30):
+        jitter = 2.0 if i % 2 == 0 else -2.0
+        y = y0 + jitter
+        det = Detection(
+            cls="vehicle", conf=0.9, xyxy=(0, 0, 10, 10), x=0.0, y=y, yaw=math.pi / 2,
+        )
+        if tracker.tracks:
+            prev_y = tracker.tracks[0].measured_y
+            raw = (y - prev_y) / dt
+        else:
+            raw = 0.0
+        tracker.update([det], t, ego_speed_mps=ego)
+        tr = tracker.tracks[0]
+        if i >= 1 and abs(raw) > 20.0:
+            saw_raw = True
+            assert abs(tr.range_rate_mps) < abs(raw) * 0.5, (i, raw, tr.range_rate_mps)
+        plan = predict_path(
+            lanes_bev=_lanes(), lane_conf=0.9, ego_speed_mps=ego, tracks=tracker.as_dicts(),
+        )
+        cmd = follow_path(plan, ego_speed_mps=ego, seq=i)
+        assert plan.aeb != "brake", (i, plan.aeb, tr.range_rate_mps, y)
+        assert cmd.brake < 0.99, (i, cmd.brake, tr.range_rate_mps, y)
+        t += dt
+    assert saw_raw
+
+
 def check_faster_lead_is_not_closing() -> None:
     rows = _approach(12.0, 16.0)
     late = [row for row in rows if row[0] > 45.0]
@@ -130,6 +169,7 @@ def main() -> None:
     check_sign()
     check_stopped_lead_aeb()
     check_slower_lead_aeb()
+    check_noisy_range_rate_does_not_aeb()
     check_faster_lead_is_not_closing()
     print("test_lead_road_speed: OK")
 

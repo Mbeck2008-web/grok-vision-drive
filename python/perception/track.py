@@ -8,6 +8,9 @@ from python.perception.detect import Detection
 
 # speed_mps on a track is road speed, not |Δrange/Δt|.
 _SPEED_CAP = 40.0
+# Weight of this grab's range-rate. The rest is the previous rate.
+# One noisy gap must not look like a stopped lead.
+_RATE_ALPHA = 0.25
 
 
 def lead_road_speed(ego_speed_mps: float, dy_m: float, dt_s: float) -> tuple[float, float]:
@@ -87,11 +90,13 @@ class IoUTracker:
                 continue
             d = dets[best_i]
             unmatched.discard(best_i)
-            road, rate = lead_road_speed(ego, d.y - tr.measured_y, dt)
-            # Half the new measurement, so a stopped lead is not still
-            # "matching speed" for the whole approach.
-            tr.speed_mps = float(max(0.0, min(_SPEED_CAP, 0.5 * tr.speed_mps + 0.5 * road)))
-            tr.range_rate_mps = rate
+            _road, raw_rate = lead_road_speed(ego, d.y - tr.measured_y, dt)
+            # Smooth the rate, then take road speed from that. A single
+            # jumpy range is a quarter of the new rate, not a full stop.
+            tr.range_rate_mps = float(
+                (1.0 - _RATE_ALPHA) * tr.range_rate_mps + _RATE_ALPHA * raw_rate
+            )
+            tr.speed_mps = float(max(0.0, min(_SPEED_CAP, ego + tr.range_rate_mps)))
             tr.measured_y = d.y
             tr.x, tr.y, tr.yaw = d.x, d.y, d.yaw
             tr.conf = d.conf

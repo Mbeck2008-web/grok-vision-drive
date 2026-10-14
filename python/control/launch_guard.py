@@ -4,7 +4,10 @@ The 47b430e ground-truth run went from 0 to 12.5 m/s in 4 s and yawed about
 67 degrees into a building. During the first few seconds the throttle is
 capped and a growing heading error (versus the heading at engage) replaces
 the lane steer with the command that reduces that error. A damage jump or
-a car that stops moving after a hit disengages and brakes.
+a car that stops moving after a hit disengages and brakes. The ground-truth
+row is written after ``engaged`` is cleared, so the engaged rows stay at
+damage 0 and the jump (the efc25e3 run, 0 → 467) is on the first
+disengaged row. That is the crash, not a stuck trigger with no hit.
 """
 
 from __future__ import annotations
@@ -25,6 +28,35 @@ CRASH_TOTAL = 800.0
 STUCK_S = 1.5
 STUCK_MOVE_M = 0.4
 STUCK_DAMAGE = 200.0
+# After the launch window a stale or held lane must not be followed at speed.
+# The efc25e3 run went 4.4 → 10.8 m/s on a lane frozen for half a second.
+STALE_LANE_S = 0.25
+STALE_SPEED_MPS = 6.0
+
+
+def apply_stale_speed_cap(
+    cmd: Any,
+    *,
+    speed_mps: float | None,
+    lane_age_s: float | None,
+    lane_src: str | None,
+) -> bool:
+    """Hold the car near 6 m/s when the lane picture is old or the center is held.
+
+    Returns True when the cap changed the command. A fresh ``take`` is left
+    alone. The launch cap is tighter and still runs first.
+    """
+    src = str(lane_src or "")
+    held = "hold" in src
+    stale = lane_age_s is not None and float(lane_age_s) > STALE_LANE_S
+    if not held and not stale:
+        return False
+    if speed_mps is not None and float(speed_mps) > STALE_SPEED_MPS:
+        cmd.throttle = 0.0
+        cmd.brake = max(float(cmd.brake), 0.3)
+    else:
+        cmd.throttle = min(float(cmd.throttle), 0.25)
+    return True
 
 
 def _unwrap(prev: float, heading: float) -> float:

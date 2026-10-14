@@ -32,6 +32,10 @@ from python.planning.speed import plan_speed
 LANE_W_DEFAULT = 3.5
 LANE_W_MIN = 2.4
 LANE_W_MAX = 5.2
+# A pair outside this band is two different roads, not the ego lane.
+# The efc25e3 run held det (−4.11, +6.64), a 10.7 m gap, and called it a pair.
+LANE_PAIR_W_MIN = 2.7
+LANE_PAIR_W_MAX = 4.5
 # A paint point farther than this is not this road's lane. Two widths at the
 # bumper, opening slightly with distance. -16 m at y=8 is past it. A lane
 # sitting one width beside the car is not.
@@ -113,6 +117,40 @@ class PathPlan:
             "blinker": self.blinker,
             "lane_source": self.lane_source,
         }
+
+
+def reckon_ego_x(x_m: float, y_m: float, *, yaw_rate: float, dt: float) -> float:
+    """Move a point fixed in the world into the ego frame after ``dt``.
+
+    ``yaw_rate`` is counterclockwise, the same sign as the ground-truth
+    heading. A right turn is negative, so a point ahead of the car moves
+    toward −x. Speed does not change x while the lane is parallel to the car.
+    """
+    theta = float(yaw_rate) * float(dt)
+    return float(x_m) * math.cos(theta) + float(y_m) * math.sin(theta)
+
+
+def reckon_path(
+    path: list[dict[str, float]] | None,
+    *,
+    speed_mps: float,
+    yaw_rate: float,
+    dt: float,
+) -> list[dict[str, float]]:
+    """Rigid ego update of a remembered route. Points that fall behind drop out."""
+    theta = float(yaw_rate) * float(dt)
+    c = math.cos(theta)
+    s = math.sin(theta)
+    vdt = max(0.0, float(speed_mps)) * float(dt)
+    out: list[dict[str, float]] = []
+    for pt in path or []:
+        x = float(pt["x"])
+        y = float(pt["y"])
+        x2 = x * c + y * s
+        y2 = -x * s + y * c - vdt
+        if y2 > 0.4:
+            out.append({"x": float(x2), "y": float(y2), "z": 0.0})
+    return out
 
 
 def lane_x_limit(y_m: float) -> float:
@@ -647,6 +685,37 @@ def _one_side(near_x: float, track: LaneTrack | None) -> str:
     return "left" if near_x <= 0.0 else "right"
 
 
+def _one_close_line(
+    polys: list[list[tuple[float, float]]],
+    track: LaneTrack | None,
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]], float, str] | None:
+    """One boundary within 2.5 m, when no pair has a real lane width."""
+    nearest: list[tuple[float, float]] | None = None
+    nearest_abs: float | None = None
+    for poly in polys:
+        ordered = _sort_y(poly)
+        if len(ordered) < 2:
+            continue
+        dist = abs(_near_x(ordered))
+        if nearest is None or nearest_abs is None or dist < nearest_abs:
+            nearest = ordered
+            nearest_abs = dist
+    # One lane width. The curb-and-wall case sits near 3 m; a 10 m pair's
+    # nearer line is past this and is not a boundary.
+    if nearest is None or nearest_abs is None or nearest_abs > LANE_W_DEFAULT:
+        return None
+    side = _one_side(_near_x(nearest), track)
+    if side == "left":
+        left = nearest
+        right = [(x + LANE_W_DEFAULT, y) for x, y in nearest]
+    else:
+        right = nearest
+        left = [(x - LANE_W_DEFAULT, y) for x, y in nearest]
+    if track is not None:
+        track.side = side
+    return left, right, LANE_W_DEFAULT, f"one_{side}"
+
+
 def _pair(
     polys: list[list[tuple[float, float]]],
     track: LaneTrack | None = None,
@@ -681,7 +750,10 @@ def _pair(
             # horizon, so the average gap collapses even when the near field is
             # a full lane.
             width = _near_separation(left, right)
-            if width < 1.2:
+            # 10 m between the two lines is not one lane. Skip it so a closer
+            # pair can still win, and so the average of two far lines is not
+            # stored as the center.
+            if width < LANE_PAIR_W_MIN or width > LANE_PAIR_W_MAX:
                 continue
             # A pair that still reaches ahead of the bumper beats a pair that
             # lives entirely behind, even when the rear pair is closer to 3.5 m.
@@ -698,7 +770,7 @@ def _pair(
             if best is None or score < best[0]:
                 best = (score, left, right, width)
     if best is None:
-        return None
+        return _one_close_line(polys, track)
     left, right, width = best[1], best[2], best[3]
     # x next to the bumper, not the far end of a rear line.
     near_l = min(left, key=lambda p: abs(p[1]))[0]

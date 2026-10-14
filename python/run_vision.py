@@ -51,7 +51,7 @@ from python.perception.pipeline import ModularPerception
 from python.perception.stitch360 import stitch_frames
 from python.perception.road_model import lanes_ext_for_live, road_edges
 from python.viz.debug_draw import cabin_drive_word
-from python.control.launch_guard import LaunchGuard
+from python.control.launch_guard import LaunchGuard, apply_stale_speed_cap
 from python.debug.gt_geom import heading_from_dir
 from python.debug.gt_logger import GroundTruthLogger, gt_log_enabled
 from python.viz.review_log import ReviewCapture
@@ -637,6 +637,8 @@ def main() -> None:
                 stitch_bgr=rig_view.bgr,
                 ego_speed_mps=ego_v,
                 steer_deg=steer,
+                yaw_rate=yaw_rate,
+                dt_s=tick_dt,
             )
             pout = apply_to_perception(ui.debug, pout)
 
@@ -837,6 +839,14 @@ def main() -> None:
                 damage=dmg,
                 pos_xy=pos_xy,
             )
+            lane_age_s = float(getattr(pout, "frame_age_s", 0.0) or 0.0)
+            if engaged and (cmd.reason == "ok" or holding):
+                apply_stale_speed_cap(
+                    cmd,
+                    speed_mps=spd_now,
+                    lane_age_s=lane_age_s,
+                    lane_src=str(getattr(pout, "lane_source", "") or ""),
+                )
             if crash_reason:
                 engaged = False
                 disengage_reason = crash_reason
@@ -845,7 +855,10 @@ def main() -> None:
                 launch_guard.reset()
                 bot_engage.clear()
                 write_engage_flag(False, disengage_reason=crash_reason)
-                print(f"[GVD] DISENGAGED: {crash_reason}", flush=True)
+                print(
+                    f"[GVD] DISENGAGED: {crash_reason} damage={dmg}",
+                    flush=True,
+                )
                 cmd = stop_command(seq=cmd_seq, reason=crash_reason)
 
             # Actuators only when engaged + command ok (path / tracks / shadow already on this tick).
@@ -1049,6 +1062,7 @@ def main() -> None:
                 f"steer={float(applied.steer):+.4f} "
                 f"steer_why={lane_steer.reason} "
                 f"lane_src={getattr(pout, 'lane_source', 'none')} "
+                f"frame_age_s={float(getattr(pout, 'frame_age_s', 0.0) or 0.0):.3f} "
                 f"frame_cmd_ms={frame_cmd_ms:.1f}",
                 flush=True,
             )
@@ -1108,6 +1122,7 @@ def main() -> None:
                     steer=float(applied.steer),
                     steer_why=lane_steer.reason,
                     frame_cmd_ms=float(frame_cmd_ms),
+                    frame_age_s=float(getattr(pout, "frame_age_s", 0.0) or 0.0),
                     stitch=getattr(rig_view, "bgr", None),
                     lanes_bev=getattr(pout, "lanes_bev", None),
                     socket_busy=bool(getattr(bundle, "grab_read_blocked", False)),

@@ -15,7 +15,14 @@ import time
 from pathlib import Path
 from typing import Any
 
-from python.debug.gt_geom import RoadHit, RoadPoly, heading_from_dir, parse_road_edges, project_road
+from python.debug.gt_geom import (
+    RoadHit,
+    RoadPoly,
+    ego_center_x,
+    heading_from_dir,
+    parse_road_edges,
+    project_road,
+)
 
 FRAME_EVERY_S = 4.0
 DEPART_BURST = 3
@@ -163,6 +170,46 @@ def load_road_polys(bng: Any) -> tuple[list[RoadPoly], str]:
     elif not notes:
         notes.append("beamngpy has no get_road_network or get_roads")
     return [], "; ".join(notes) if notes else "no road network"
+
+
+def _x_at_y(poly: list, y_m: float) -> float | None:
+    pts: list[tuple[float, float]] = []
+    for raw in poly or []:
+        if isinstance(raw, dict):
+            x, y = raw.get("x"), raw.get("y")
+        elif isinstance(raw, (list, tuple)) and len(raw) >= 2:
+            x, y = raw[0], raw[1]
+        else:
+            continue
+        try:
+            pts.append((float(x), float(y)))
+        except (TypeError, ValueError):
+            continue
+    if len(pts) < 2:
+        return None
+    pts.sort(key=lambda p: p[1])
+    if y_m < pts[0][1] or y_m > pts[-1][1]:
+        # Nearest end if the line does not reach the lookahead.
+        end = pts[0] if abs(pts[0][1] - y_m) < abs(pts[-1][1] - y_m) else pts[-1]
+        if abs(end[1] - y_m) > 4.0:
+            return None
+        return end[0]
+    for a, b in zip(pts, pts[1:]):
+        if a[1] <= y_m <= b[1] or b[1] <= y_m <= a[1]:
+            dy = b[1] - a[1]
+            if abs(dy) < 1e-6:
+                return (a[0] + b[0]) * 0.5
+            t = (y_m - a[1]) / dy
+            return a[0] + t * (b[0] - a[0])
+    return None
+
+
+def detected_lane_xs(lanes_bev: list | None, y_m: float = 8.0) -> tuple[float | None, float | None, float | None]:
+    """Left, right, and mean x of detected polylines at ``y_m`` (x right)."""
+    xs = [x for poly in (lanes_bev or []) if (x := _x_at_y(poly, y_m)) is not None]
+    if not xs:
+        return None, None, None
+    return min(xs), max(xs), sum(xs) / len(xs)
 
 
 def _pose(vdata: Any) -> tuple[tuple[float, float, float] | None, float | None, float | None]:
@@ -348,6 +395,15 @@ class GroundTruthLogger:
             self._prev_damage = damage
         lane_off = None if hit is None else hit.lane_offset_m
         width = None if hit is None else hit.lane_width_m
+        gt_center = None
+        gt_left = None
+        gt_right = None
+        if hit is not None and lane_off is not None and width is not None:
+            gt_center = ego_center_x(lane_off, hit.heading_err_rad, 8.0)
+            half = float(width) * 0.5
+            gt_left = gt_center - half
+            gt_right = gt_center + half
+        det_left, det_right, det_center = detected_lane_xs(lanes_bev, 8.0)
         in_lane = None
         if hit is not None and width is not None and width > 0.0:
             in_lane = (not hit.off_road) and abs(lane_off or 0.0) <= width * 0.5
@@ -375,6 +431,12 @@ class GroundTruthLogger:
             "damage": damage,
             "damage_delta": delta,
             "lane_x": None if lane_x is None else float(lane_x),
+            "gt_center_x": gt_center,
+            "gt_left_x": gt_left,
+            "gt_right_x": gt_right,
+            "det_left_x": det_left,
+            "det_right_x": det_right,
+            "det_center_x": det_center,
             "lane_src": str(lane_src or "none"),
             "steer": float(steer),
             "steer_why": str(steer_why or ""),

@@ -177,6 +177,36 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "frame_cmd_ms_mean": None if not lats else sum(lats) / len(lats),
         "frame_cmd_ms_p50": None if not lats else _percentile(lats, 0.50),
         "frame_cmd_ms_p90": None if not lats else _percentile(lats, 0.90),
+        **_perception(rows),
+    }
+
+
+def _perception(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """lane_x against the ground-truth center in the ego frame."""
+    xs: list[float] = []
+    truth: list[float] = []
+    for row in rows:
+        if not row.get("engaged"):
+            continue
+        lx = _f(row, "lane_x")
+        gt = _f(row, "gt_center_x")
+        if lx is None or gt is None:
+            continue
+        xs.append(lx)
+        truth.append(gt)
+    if not xs:
+        return {
+            "perception_n": 0,
+            "perception_bias_m": None,
+            "perception_rms_m": None,
+            "lane_x_vs_gt_center_r": None,
+        }
+    err = [a - b for a, b in zip(xs, truth)]
+    return {
+        "perception_n": len(xs),
+        "perception_bias_m": sum(err) / len(err),
+        "perception_rms_m": math.sqrt(sum(e * e for e in err) / len(err)),
+        "lane_x_vs_gt_center_r": pearson(xs, truth),
     }
 
 
@@ -221,6 +251,12 @@ def format_report(summary: dict[str, Any], *, source: str = "") -> str:
         f"frame_cmd_ms n={summary.get('frame_cmd_ms_n')} "
         f"mean={num('frame_cmd_ms_mean', 1)} "
         f"p50={num('frame_cmd_ms_p50', 1)} p90={num('frame_cmd_ms_p90', 1)}"
+    )
+    lines.append(
+        f"perception n={summary.get('perception_n')} "
+        f"bias_m={num('perception_bias_m', 3)} "
+        f"rms_m={num('perception_rms_m', 3)} "
+        f"lane_x_vs_gt_center_r={num('lane_x_vs_gt_center_r', 3)}"
     )
     return "\n".join(lines)
 

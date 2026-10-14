@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
 from python.control.actuate import (
     attach_electrics,
     follow_lane_steer,
+    lane_sample_hold_reason,
     LaneSteerState,
     last_electrics_ms,
     make_actuator,
@@ -772,8 +773,28 @@ def main() -> None:
                         frame_ts = None
                     break
             frame_cmd_ms = (time.time() - frame_ts) * 1000.0 if frame_ts is not None else -1.0
-            if engaged and cmd.reason == "ok":
+            # A missing sample, a point in front of the bumper, or a heading
+            # past a lane, is not a command to center the wheel. Hold the last
+            # steer (creeping toward 0) and say why. preview_blocked still
+            # brakes; it no longer snaps steer to 0 while that hold is armed.
+            miss = None
+            if lane_x is None:
+                miss = "lane_hold"
+            elif lane_y is not None:
+                miss = lane_sample_hold_reason(lane_x, lane_y)
+            holding = False
+            if engaged and cmd.reason == "ok" and miss is None:
                 cmd.steer = follow_lane_steer(cmd.steer, lane_x, lane_steer, tick_dt)
+            elif (
+                engaged
+                and cmd.reason in ("ok", "preview_blocked")
+                and miss is not None
+                and lane_steer.armed
+            ):
+                cmd.steer = follow_lane_steer(
+                    0.0, None, lane_steer, tick_dt, miss_reason=miss,
+                )
+                holding = True
             else:
                 # A gate hold or a disengage sends steer 0. Do not resume the
                 # next path command from a value the car was not holding.
@@ -788,7 +809,7 @@ def main() -> None:
                 actuator.note_engaged(engaged)
             if hasattr(actuator, "note_ack"):
                 actuator.note_ack(ego_fb)
-            if engaged and cmd.reason == "ok":
+            if engaged and (cmd.reason == "ok" or holding):
                 applied = actuator.apply(cmd)
             else:
                 applied = actuator.stop(seq=cmd_seq, reason=cmd.reason)
@@ -888,6 +909,7 @@ def main() -> None:
                 "lookahead_y_m": None if lane_y is None else float(lane_y),
                 "steer": float(applied.steer),
                 "frame_cmd_ms": float(frame_cmd_ms),
+                "why": lane_steer.reason,
             }
             st["ego_source"] = ego_source
             st["cmd_ack_seq"] = int(ego_fb.applied_seq) if ego_fb is not None else -1
@@ -978,6 +1000,7 @@ def main() -> None:
                 f"lane_x={'na' if lane_x is None else f'{lane_x:.4f}'} "
                 f"lane_y={'na' if lane_y is None else f'{lane_y:.2f}'} "
                 f"steer={float(applied.steer):+.4f} "
+                f"steer_why={lane_steer.reason} "
                 f"frame_cmd_ms={frame_cmd_ms:.1f}",
                 flush=True,
             )

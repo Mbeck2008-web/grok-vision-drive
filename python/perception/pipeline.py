@@ -93,20 +93,15 @@ class ModularPerception:
         tracks = self.tracker.update(moving, time.time())
         track_dicts = self.tracker.as_dicts()
         lanes = lanes_from_view(main_bgr, stitch_bgr)
-        prior_lanes = None
-        if lanes.lanes_bev:
-            self._prior_lanes = lanes.lanes_bev
-        elif self._prior_lanes:
-            prior_lanes = self._prior_lanes
         cipv = select_cipv(track_dicts, path_width=2.0, ego_speed_mps=ego_speed_mps)
-        plan = predict_path(
-            lanes_bev=lanes.lanes_bev,
+        plan, self._prior_lanes = drive_plan_from_lanes(
+            lanes.lanes_bev,
+            self._prior_lanes,
             lane_conf=lanes.conf,
             curvature=lanes.curvature,
             tracks=track_dicts,
             signs=signs,
             ego_speed_mps=ego_speed_mps,
-            prior_lanes=prior_lanes,
         )
         cipv_id = plan.cipv_id
         if cipv_id is None and cipv.track is not None:
@@ -162,6 +157,50 @@ class ModularPerception:
             missing=missing,
             detector_name=self.detector.name,
         )
+
+
+def drive_plan_from_lanes(
+    fresh: list,
+    prior: list,
+    *,
+    lane_conf: float,
+    curvature: float,
+    tracks: list,
+    signs: list,
+    ego_speed_mps: float,
+) -> tuple[Any, list]:
+    """Route from the live lines, or from the last lines that actually routed.
+
+    A non-empty frame that does not make a route used to replace the memory.
+    The next tick then had nothing to follow (``lane_x=na`` and steer 0 on
+    the PR 82 run). Predict from the last drivable lines instead, and only
+    store a frame that produced a route.
+    """
+    stored = list(prior or [])
+    live = list(fresh or [])
+    prior_arg = stored if (not live and stored) else None
+    plan = predict_path(
+        lanes_bev=live,
+        lane_conf=lane_conf,
+        curvature=curvature,
+        tracks=tracks,
+        signs=signs,
+        ego_speed_mps=ego_speed_mps,
+        prior_lanes=prior_arg,
+    )
+    if not plan.drivable and live and stored:
+        plan = predict_path(
+            lanes_bev=[],
+            lane_conf=lane_conf,
+            curvature=curvature,
+            tracks=tracks,
+            signs=signs,
+            ego_speed_mps=ego_speed_mps,
+            prior_lanes=stored,
+        )
+    if plan.drivable and live:
+        stored = live
+    return plan, stored
 
 
 def _hold_signs(prior: list[dict[str, Any]], fresh: list[dict[str, Any]]) -> list[dict[str, Any]]:

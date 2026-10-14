@@ -310,11 +310,11 @@ def predict_path(
     del curvature  # image-slope hint is not the route; the polyline is
     step = max(0.4, float(step_m))
     horizon = max(8.0, float(length_m))
-    live = _polylines(lanes_bev)
+    live = _lines_for_lane_x(lanes_bev, horizon, step)
     used_prior = False
     polys = live
     if not polys:
-        polys = _polylines(prior_lanes)
+        polys = _lines_for_lane_x(prior_lanes, horizon, step)
         used_prior = bool(polys)
 
     # Rear and repeater lines sit behind the bumper. A building edge beside
@@ -517,12 +517,19 @@ def _f(obj: dict[str, Any], *keys: str, default: float = 0.0) -> float:
 
 
 def _polylines(lanes: list | None) -> list[list[tuple[float, float]]]:
-    out: list[list[tuple[float, float]]] = []
+    return [pts for pts, _src in _tagged_polylines(lanes)]
+
+
+def _tagged_polylines(lanes: list | None) -> list[tuple[list[tuple[float, float]], str]]:
+    out: list[tuple[list[tuple[float, float]], str]] = []
     for poly in lanes or []:
         pts: list[tuple[float, float]] = []
+        src = ""
         for p in poly or []:
             if isinstance(p, dict):
                 x, y = p.get("x"), p.get("y")
+                if not src and p.get("src"):
+                    src = str(p.get("src"))
             else:
                 try:
                     x, y = p[0], p[1]
@@ -532,8 +539,36 @@ def _polylines(lanes: list | None) -> list[list[tuple[float, float]]]:
                 continue
             pts.append((float(x), float(y)))
         if len(pts) >= 2:
-            out.append(pts)
+            out.append((pts, src))
     return out
+
+
+def _lines_for_lane_x(
+    lanes: list | None,
+    horizon: float,
+    step: float,
+) -> list[list[tuple[float, float]]]:
+    """Main-camera lines when they form a pair. Otherwise every line.
+
+    A main-only route that comes out one-sided is discarded and the wide,
+    narrow, and side lines are used. The probe track is thrown away, so
+    this check does not seed or hold the caller's center. Untagged points
+    are the synthetic lanes the tests build.
+    """
+    main: list[list[tuple[float, float]]] = []
+    rest: list[list[tuple[float, float]]] = []
+    for pts, src in _tagged_polylines(lanes):
+        if src == "main":
+            main.append(pts)
+        else:
+            rest.append(pts)
+    everything = main + rest
+    if len(main) < 2:
+        return everything
+    built = _lane_route(main, horizon, step, lane_track=LaneTrack(), remember=True)
+    if built is not None and str(built[3]).startswith("pair"):
+        return main
+    return everything
 
 
 def _mean_x(pts: list[tuple[float, float]]) -> float:

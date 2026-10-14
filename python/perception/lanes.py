@@ -549,7 +549,10 @@ def lanes_from_view(
                 sector = _stitch_sector(stitch_bgr, cid)
                 if sector is None or frame_is_unrendered(sector):
                     continue
-                posed.extend(posed_lanes_from_image(sector, cid))
+                for poly in posed_lanes_from_image(sector, cid):
+                    for point in poly:
+                        point["src"] = "side"
+                    posed.append(poly)
         else:
             forward = estimate_lanes(
                 stitch_bgr,
@@ -774,6 +777,8 @@ def _estimate_span_lanes(
         for poly in _fit_sector(crop, far_m, cam_id=cam_id):
             # Do not copy a far pixel's x down to y=8. That row is a different
             # distance, and the copy pinned lane_x on the wrong side of the car.
+            for point in poly:
+                point["src"] = cam_id or ""
             mean_x = sum(float(p["x"]) for p in poly) / float(len(poly))
             if mean_x < 0.0:
                 saw_left = True

@@ -32,6 +32,15 @@ STUCK_DAMAGE = 200.0
 # The efc25e3 run went 4.4 → 10.8 m/s on a lane frozen for half a second.
 STALE_LANE_S = 0.25
 STALE_SPEED_MPS = 6.0
+# gt_run7 left the lane with steer near 0. lane_x was +2.27 m for the first
+# 1.9 s (pursuit of that point is steer +0.31, and the log matched it), which
+# yawed the car 0.33 rad right. Then lane_x fell to ~0, the wheel centered,
+# and the heading stayed. A lookahead past this, or a nose this far off the
+# engage heading, is treated as leaving. The 4 m/s launch cap only braked
+# at 0.2 and speed still climbed 4.3 → 6.1 m/s inside the window.
+EXIT_LANE_X_M = 1.25
+EXIT_YAW_RAD = 0.22
+EXIT_BRAKE = 0.8
 
 
 def apply_stale_speed_cap(
@@ -56,6 +65,41 @@ def apply_stale_speed_cap(
         cmd.brake = max(float(cmd.brake), 0.3)
     else:
         cmd.throttle = min(float(cmd.throttle), 0.25)
+    return True
+
+
+def apply_lane_exit_brake(
+    cmd: Any,
+    *,
+    lane_x: float | None,
+    heading_err_rad: float | None,
+) -> bool:
+    """Cut throttle and brake hard when the car is aimed out of the lane.
+
+    ``lane_x`` is the lookahead the wheel is following. ``heading_err_rad``
+    is the yaw since engage (same sign as road heading error on a straight
+    road). Either one past its limit is enough. A point inside both limits
+    is left alone, so a centered lane still drives.
+    """
+    leave = False
+    if lane_x is not None:
+        try:
+            x = float(lane_x)
+        except (TypeError, ValueError):
+            x = 0.0
+        if x == x and abs(x) > EXIT_LANE_X_M:
+            leave = True
+    if heading_err_rad is not None:
+        try:
+            err = float(heading_err_rad)
+        except (TypeError, ValueError):
+            err = 0.0
+        if err == err and abs(err) > EXIT_YAW_RAD:
+            leave = True
+    if not leave:
+        return False
+    cmd.throttle = 0.0
+    cmd.brake = max(float(getattr(cmd, "brake", 0.0) or 0.0), EXIT_BRAKE)
     return True
 
 

@@ -51,7 +51,11 @@ from python.perception.pipeline import ModularPerception
 from python.perception.stitch360 import stitch_frames
 from python.perception.road_model import lanes_ext_for_live, road_edges
 from python.viz.debug_draw import cabin_drive_word
-from python.control.launch_guard import LaunchGuard, apply_stale_speed_cap
+from python.control.launch_guard import (
+    LaunchGuard,
+    apply_lane_exit_brake,
+    apply_stale_speed_cap,
+)
 from python.debug.gt_geom import heading_from_dir
 from python.debug.gt_logger import GroundTruthLogger, gt_log_enabled
 from python.viz.review_log import ReviewCapture
@@ -846,6 +850,12 @@ def main() -> None:
                     speed_mps=spd_now,
                     lane_age_s=lane_age_s,
                     lane_src=str(getattr(pout, "lane_source", "") or ""),
+                )
+                yaw_from_engage = None
+                if launch_guard.heading is not None and launch_guard.heading0 is not None:
+                    yaw_from_engage = float(launch_guard.heading) - float(launch_guard.heading0)
+                apply_lane_exit_brake(
+                    cmd, lane_x=lane_x, heading_err_rad=yaw_from_engage,
                 )
             if crash_reason:
                 engaged = False

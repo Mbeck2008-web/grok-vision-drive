@@ -176,13 +176,15 @@ def follow_lane_center(
         track.pending_x = None
         track.pending_n = 0
         return measured, "take"
+    # A prior-lane sample is already in a stale ego frame. Do not absorb it,
+    # even when it still sits inside the gate.
+    if not count:
+        return float(track.center_x), "hold"
     if abs(measured - track.center_x) <= CENTER_GATE_M:
         track.center_x = measured
         track.pending_x = None
         track.pending_n = 0
         return track.center_x, "take"
-    if not count:
-        return float(track.center_x), "hold"
     if track.pending_x is None or abs(measured - track.pending_x) > CENTER_GATE_M:
         track.pending_x = measured
         track.pending_n = 1

@@ -43,9 +43,11 @@ LANE_OUTLIER_WIDTHS = 2.0
 LANE_OUTLIER_PER_M = 0.35
 # Ego-lane center memory. The PR 82 run's lookahead flipped between about
 # -1.1 m and +1.5 m in one tick (one boundary, side chosen by the sign of x,
-# center jumping by a full lane). A step inside the gate is the same lane.
-# A larger step has to repeat, then creeps across. The creep is under 2 m,
-# which is the jump the replay refuses.
+# center jumping by a full lane). A step inside CENTER_INNOV_M is blended.
+# A larger step has to repeat on the same side of the stored center, then
+# creeps across. The creep is under 2 m, which is the jump the replay refuses.
+# CENTER_GATE_M is the old same-value window. gt_run6 never filled it: each
+# new sample was more than 1.25 m from the previous one, so +2.04 stayed put.
 CENTER_GATE_M = 1.25
 CENTER_HYST_TICKS = 3
 CENTER_SLEW_M = 0.35
@@ -196,6 +198,11 @@ class LaneTrack:
     side: str | None = None
     pending_x: float | None = None
     pending_n: int = 0
+    # +1 / -1: which side of the stored center the repeated samples sit on.
+    # The value itself may jitter by more than CENTER_GATE_M. gt_run6 held
+    # +2.04 for 1.7 s because each new sample was more than 1.25 m from the
+    # previous pending value, so the count never reached three.
+    pending_sign: int = 0
     source: str = "none"
 
     def reset(self) -> None:
@@ -203,6 +210,7 @@ class LaneTrack:
         self.side = None
         self.pending_x = None
         self.pending_n = 0
+        self.pending_sign = 0
         self.source = "none"
 
 
@@ -216,16 +224,20 @@ def follow_lane_center(
 
     ``measured_x`` is the midpoint the lines imply this tick. The first
     sample is stored. A later sample inside ``CENTER_INNOV_M`` is blended
-    in. A larger step does not land until it has repeated
-    ``CENTER_HYST_TICKS`` times, and then moves at most ``CENTER_SLEW_M``
-    per call. ``count`` false holds the memory still (a prior-lane fallback
-    must not vote).
+    in. A larger step does not land until the same side of the stored
+    center has repeated ``CENTER_HYST_TICKS`` times, and then moves at
+    most ``CENTER_SLEW_M`` per call. The samples do not have to match
+    each other within ``CENTER_GATE_M``: a lane that keeps sitting left
+    of a wrong center still counts, even when the raw values jitter.
+    One sample on the other side starts the count over. ``count`` false
+    holds the memory still (a prior-lane fallback must not vote).
     """
     measured = float(measured_x)
     if track.center_x is None:
         track.center_x = measured
         track.pending_x = None
         track.pending_n = 0
+        track.pending_sign = 0
         return measured, "take"
     # A prior-lane sample is already in a stale ego frame. Do not absorb it,
     # even when it still sits inside the gate.
@@ -236,20 +248,25 @@ def follow_lane_center(
         track.center_x = float(track.center_x) + CENTER_BLEND * innov
         track.pending_x = None
         track.pending_n = 0
+        track.pending_sign = 0
         return float(track.center_x), "take"
-    if track.pending_x is None or abs(measured - track.pending_x) > CENTER_GATE_M:
+    sign = 1 if innov > 0.0 else -1
+    if track.pending_sign != sign:
+        track.pending_sign = sign
         track.pending_x = measured
         track.pending_n = 1
     else:
         track.pending_n += 1
+        track.pending_x = measured
     if track.pending_n < CENTER_HYST_TICKS:
         return float(track.center_x), "hold"
-    step = max(-CENTER_SLEW_M, min(CENTER_SLEW_M, track.pending_x - track.center_x))
+    step = max(-CENTER_SLEW_M, min(CENTER_SLEW_M, float(track.pending_x) - track.center_x))
     track.center_x = float(track.center_x) + step
-    if abs(track.pending_x - track.center_x) <= CENTER_GATE_M:
+    if abs(float(track.pending_x) - track.center_x) <= CENTER_INNOV_M:
         track.center_x = float(track.pending_x)
         track.pending_x = None
         track.pending_n = 0
+        track.pending_sign = 0
     return float(track.center_x), "slew"
 
 

@@ -92,6 +92,37 @@ def _replay(rows: list[dict]) -> list[dict]:
     return out
 
 
+def check_same_sign_error_releases_and_one_spike_does_not() -> None:
+    """gt_run6 held +2.04 because each new sample missed the last one by >1.25 m.
+
+    Three samples that all sit left of the stored center have to start the
+    slew even when they disagree with each other by more than the old gate.
+    One sample on the other side must not move the center.
+    """
+    track = LaneTrack()
+    follow_lane_center(track, 2.04)
+    for sample in (-1.2, -2.8):
+        held, mode = follow_lane_center(track, sample)
+        assert mode == "hold", (sample, held, mode)
+        assert abs(held - 2.04) < 1e-6, held
+    moved, mode = follow_lane_center(track, -0.4)
+    assert mode == "slew", (moved, mode)
+    assert moved < 2.04 - 0.2, moved
+    for sample in (-1.6, -2.2, -0.9, -1.4, -2.0, -1.1, -1.8):
+        moved, _mode = follow_lane_center(track, sample)
+    assert moved < 0.0, moved
+
+    spiked = LaneTrack()
+    follow_lane_center(spiked, 2.04)
+    held, mode = follow_lane_center(spiked, -5.0)
+    assert mode == "hold" and abs(held - 2.04) < 1e-6, (held, mode)
+    # The run5 case: one 1 m step still does not land.
+    once = LaneTrack()
+    follow_lane_center(once, 0.2)
+    held, mode = follow_lane_center(once, 1.2)
+    assert mode == "hold" and abs(held - 0.2) < 0.05, (held, mode)
+
+
 def check_log_flips_and_tracker_does_not(played: list[dict]) -> None:
     raw = [row["before_x"] for row in played]
     tracked = [row["after_x"] for row in played]
@@ -201,6 +232,7 @@ def _print_table(played: list[dict]) -> None:
 def main() -> None:
     check_one_line_is_half_a_lane_and_does_not_flip()
     check_outlier_never_enters_the_fit()
+    check_same_sign_error_releases_and_one_spike_does_not()
     played = _replay(_load())
     check_log_flips_and_tracker_does_not(played)
     _print_table(played)

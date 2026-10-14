@@ -85,6 +85,8 @@ PREDICT_PATH_ARGS = (
     "prior_lanes",
     "length_m",
     "step_m",
+    "lane_track",
+    "remember",
 )
 
 OUTPUT_FIELDS = (

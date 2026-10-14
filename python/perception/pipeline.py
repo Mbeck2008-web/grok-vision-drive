@@ -188,6 +188,7 @@ def drive_plan_from_lanes(
         ego_speed_mps=ego_speed_mps,
         prior_lanes=prior_arg,
     )
+    from_live = bool(plan.drivable and live)
     if not plan.drivable and live and stored:
         plan = predict_path(
             lanes_bev=[],
@@ -198,7 +199,7 @@ def drive_plan_from_lanes(
             ego_speed_mps=ego_speed_mps,
             prior_lanes=stored,
         )
-    if plan.drivable and live:
+    if from_live:
         stored = live
     return plan, stored
 

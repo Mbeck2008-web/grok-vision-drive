@@ -773,10 +773,10 @@ def main() -> None:
                         frame_ts = None
                     break
             frame_cmd_ms = (time.time() - frame_ts) * 1000.0 if frame_ts is not None else -1.0
-            # A missing sample, a point in front of the bumper, or a heading
-            # past a lane, is not a command to center the wheel. Hold the last
-            # steer (creeping toward 0) and say why. preview_blocked still
-            # brakes; it no longer snaps steer to 0 while that hold is armed.
+            # A missing sample, a point closer than 4 m, or a heading past a
+            # lane, is not a command to center the wheel. Hold the last steer
+            # (creeping toward 0) and say why. preview_blocked still brakes;
+            # it no longer snaps steer to 0 while that hold is armed.
             miss = None
             if lane_x is None:
                 miss = "lane_hold"

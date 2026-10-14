@@ -1,0 +1,343 @@
+"""Sim-only ground-truth logger.
+
+Off unless ``GVD_GT_LOG=1`` or the supervisor ``--gt-log`` flag. Each tick
+appends one JSON object under ``logs/gt_<stamp>.jsonl``. Road edges are read
+once from BeamNG (``get_roads`` / ``get_road_edges``) and then queried
+locally, so a later tick does not sit on the research socket. Missing road
+data is a null offset, not a guessed lane.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+from pathlib import Path
+from typing import Any
+
+from python.debug.gt_geom import RoadHit, RoadPoly, heading_from_dir, parse_road_edges, project_road
+
+FRAME_EVERY_S = 4.0
+DEPART_BURST = 3
+
+
+def gt_log_enabled(flag: bool = False) -> bool:
+    if flag:
+        return True
+    raw = os.environ.get("GVD_GT_LOG", "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def logs_dir(root: Path | None = None) -> Path:
+    base = Path(root) if root is not None else Path(__file__).resolve().parents[2] / "logs"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def _num(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if out != out or out in (float("inf"), float("-inf")):
+        return None
+    return out
+
+
+def read_sim_time(bng: Any) -> float | None:
+    """Simulation clock, if this BeamNGpy build exposes one. None if it does not."""
+    if bng is None:
+        return None
+    for name in ("get_gamestate", "get_game_state"):
+        fn = getattr(bng, name, None)
+        if not callable(fn):
+            continue
+        try:
+            state = fn()
+        except Exception:
+            continue
+        if isinstance(state, dict):
+            for key in ("time", "simTime", "simulationTime"):
+                found = _num(state.get(key))
+                if found is not None:
+                    return found
+    return None
+
+
+def load_road_polys(bng: Any) -> tuple[list[RoadPoly], str]:
+    """One snapshot of the level's road network. Empty list and a note on failure."""
+    if bng is None:
+        return [], "no beamng"
+    get_roads = getattr(bng, "get_roads", None)
+    get_edges = getattr(bng, "get_road_edges", None)
+    if not callable(get_roads) or not callable(get_edges):
+        return [], "beamngpy has no get_roads/get_road_edges"
+    try:
+        roads = get_roads()
+    except Exception as exc:
+        return [], f"get_roads failed: {type(exc).__name__}"
+    if not isinstance(roads, dict) or not roads:
+        return [], "get_roads returned no roads"
+    polys: list[RoadPoly] = []
+    for road_id in roads:
+        try:
+            edges = get_edges(road_id)
+        except Exception:
+            continue
+        poly = parse_road_edges(str(road_id), edges)
+        if poly is not None:
+            polys.append(poly)
+    if not polys:
+        return [], "road edges were empty"
+    return polys, ""
+
+
+def _pose(vdata: Any) -> tuple[tuple[float, float, float] | None, float | None, float | None]:
+    if vdata is None:
+        return None, None, None
+    pos = getattr(vdata, "pos", None)
+    direction = getattr(vdata, "dir", None)
+    speed = _num(getattr(vdata, "speed_mps", None))
+    if not isinstance(pos, (list, tuple)) or len(pos) < 3:
+        return None, None, speed
+    try:
+        xyz = (float(pos[0]), float(pos[1]), float(pos[2]))
+    except (TypeError, ValueError):
+        return None, None, speed
+    heading = None
+    if isinstance(direction, (list, tuple)) and len(direction) >= 2:
+        try:
+            heading = heading_from_dir(float(direction[0]), float(direction[1]))
+        except (TypeError, ValueError):
+            heading = None
+    return xyz, heading, speed
+
+
+def _draw_bev(lanes_bev: list | None, lane_x: float | None) -> Any:
+    import cv2
+    import numpy as np
+
+    size = 220
+    img = np.full((size, size, 3), 245, dtype=np.uint8)
+    cx, cy = size // 2, size - 28
+    scale = 6.0  # px per metre
+
+    def pix(x: float, y: float) -> tuple[int, int]:
+        return int(cx + x * scale), int(cy - y * scale)
+
+    cv2.line(img, (cx, 8), (cx, size - 8), (220, 220, 220), 1)
+    cv2.circle(img, (cx, cy), 4, (40, 40, 40), -1, cv2.LINE_AA)
+    for poly in lanes_bev or []:
+        pts = []
+        for p in poly or []:
+            if isinstance(p, dict):
+                x, y = p.get("x"), p.get("y")
+            elif isinstance(p, (list, tuple)) and len(p) >= 2:
+                x, y = p[0], p[1]
+            else:
+                continue
+            try:
+                pts.append(pix(float(x), float(y)))
+            except (TypeError, ValueError):
+                continue
+        if len(pts) >= 2:
+            cv2.polylines(img, [np.array(pts, dtype=np.int32)], False, (40, 140, 60), 2, cv2.LINE_AA)
+    if lane_x is not None:
+        cv2.circle(img, pix(float(lane_x), 8.0), 4, (40, 90, 200), -1, cv2.LINE_AA)
+    return img
+
+
+def save_debug_frame(
+    path: Path,
+    *,
+    stitch: Any = None,
+    lanes_bev: list | None = None,
+    hud: list[str] | None = None,
+    lane_x: float | None = None,
+) -> Path | None:
+    """Stitch (if we have one) with a bird's-eye of the lane lines in the corner."""
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        return None
+    bev = _draw_bev(lanes_bev, lane_x)
+    if stitch is None:
+        canvas = bev
+    else:
+        frame = np.asarray(stitch)
+        if frame.ndim != 3 or frame.shape[2] != 3:
+            canvas = bev
+        else:
+            canvas = frame.copy()
+            bh, bw = bev.shape[:2]
+            h, w = canvas.shape[:2]
+            if h >= bh + 8 and w >= bw + 8:
+                canvas[8 : 8 + bh, w - bw - 8 : w - 8] = bev
+    y = 22
+    for line in hud or []:
+        cv2.putText(
+            canvas, line[:80], (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+            (255, 255, 255), 3, cv2.LINE_AA,
+        )
+        cv2.putText(
+            canvas, line[:80], (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+            (20, 20, 20), 1, cv2.LINE_AA,
+        )
+        y += 18
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(path), canvas):
+        return None
+    return path
+
+
+class GroundTruthLogger:
+    """Append-only session. ``path`` is the JSONL file."""
+
+    def __init__(self, path: Path, frames: Path) -> None:
+        self.path = Path(path)
+        self.frames = Path(frames)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.frames.mkdir(parents=True, exist_ok=True)
+        self._roads: list[RoadPoly] | None = None
+        self._road_note = "road network pending"
+        self._prev_damage: float | None = None
+        self._last_sim: float | None = None
+        self._wall0 = time.time()
+        self._last_frame_wall = 0.0
+        self._burst = 0
+        self._was_out = False
+        self._ticks = 0
+
+    @classmethod
+    def open(cls, root: Path | None = None) -> GroundTruthLogger:
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+        folder = logs_dir(root)
+        path = folder / f"gt_{stamp}.jsonl"
+        n = 2
+        while path.exists():
+            path = folder / f"gt_{stamp}_{n}.jsonl"
+            n += 1
+        frames = path.with_suffix("")
+        return cls(path, frames)
+
+    def _ensure_roads(self, bng: Any, socket_busy: bool) -> None:
+        if self._roads is not None:
+            return
+        if socket_busy:
+            return
+        polys, note = load_road_polys(bng)
+        if polys:
+            self._roads = polys
+            self._road_note = ""
+            print(f"[GVD] gt roads={len(polys)}", flush=True)
+        else:
+            self._road_note = note
+
+    def write(
+        self,
+        *,
+        bng: Any = None,
+        vdata: Any = None,
+        engaged: bool = False,
+        lane_x: float | None = None,
+        lane_src: str = "none",
+        steer: float = 0.0,
+        steer_why: str = "idle",
+        frame_cmd_ms: float = -1.0,
+        stitch: Any = None,
+        lanes_bev: list | None = None,
+        socket_busy: bool = False,
+    ) -> dict[str, Any]:
+        self._ensure_roads(bng, socket_busy)
+        pos, heading, speed = _pose(vdata)
+        sim = None if socket_busy else read_sim_time(bng)
+        if sim is None:
+            t = time.time() - self._wall0
+            t_source = "wall"
+        else:
+            self._last_sim = sim
+            t = sim
+            t_source = "sim"
+        hit: RoadHit | None = None
+        if pos is not None and self._roads:
+            hit = project_road(self._roads, pos[0], pos[1], heading)
+        damage = _num(getattr(vdata, "damage", None)) if vdata is not None else None
+        delta = None
+        if damage is not None and self._prev_damage is not None:
+            delta = damage - self._prev_damage
+        if damage is not None:
+            self._prev_damage = damage
+        lane_off = None if hit is None else hit.lane_offset_m
+        width = None if hit is None else hit.lane_width_m
+        in_lane = None
+        if hit is not None and width is not None and width > 0.0:
+            in_lane = (not hit.off_road) and abs(lane_off or 0.0) <= width * 0.5
+        out = bool(engaged and in_lane is False)
+        departed = out and not self._was_out
+        self._was_out = out
+        if departed:
+            self._burst = DEPART_BURST
+        row: dict[str, Any] = {
+            "t": t,
+            "t_source": t_source,
+            "wall": time.time(),
+            "pos": None if pos is None else [pos[0], pos[1], pos[2]],
+            "heading_rad": heading,
+            "speed_mps": speed,
+            "road_id": None if hit is None else hit.road_id,
+            "road_offset_m": None if hit is None else hit.offset_m,
+            "road_heading_err_rad": None if hit is None else hit.heading_err_rad,
+            "lane_id": None if hit is None else hit.lane_id,
+            "lane_offset_m": lane_off,
+            "lane_width_m": width,
+            "off_road": None if hit is None else hit.off_road,
+            "dist_m": None if hit is None else hit.dist_m,
+            "in_lane": in_lane,
+            "damage": damage,
+            "damage_delta": delta,
+            "lane_x": None if lane_x is None else float(lane_x),
+            "lane_src": str(lane_src or "none"),
+            "steer": float(steer),
+            "steer_why": str(steer_why or ""),
+            "frame_cmd_ms": float(frame_cmd_ms),
+            "engaged": bool(engaged),
+            "road_note": self._road_note,
+            "departed": departed,
+        }
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+        self._ticks += 1
+        self._maybe_frame(row, stitch, lanes_bev, lane_x, departed)
+        return row
+
+    def _maybe_frame(
+        self,
+        row: dict[str, Any],
+        stitch: Any,
+        lanes_bev: list | None,
+        lane_x: float | None,
+        departed: bool,
+    ) -> None:
+        now = time.time()
+        periodic = (now - self._last_frame_wall) >= FRAME_EVERY_S
+        burst = self._burst > 0
+        if not periodic and not burst:
+            return
+        if periodic:
+            self._last_frame_wall = now
+        if burst:
+            self._burst -= 1
+        tag = "depart" if departed or burst else "frame"
+        name = f"{tag}_{self._ticks:06d}.jpg"
+        off = row.get("lane_offset_m")
+        off_s = "na" if off is None else f"{float(off):+.2f}"
+        hud = [
+            f"t={float(row['t']):.2f} engaged={int(bool(row['engaged']))} in_lane={row.get('in_lane')}",
+            f"offset={off_s} lane_x={row.get('lane_x')} src={row.get('lane_src')}",
+            f"steer={float(row['steer']):+.3f} {row.get('steer_why')} off_road={row.get('off_road')}",
+        ]
+        save_debug_frame(self.frames / name, stitch=stitch, lanes_bev=lanes_bev, hud=hud, lane_x=lane_x)

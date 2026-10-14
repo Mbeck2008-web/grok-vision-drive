@@ -1,5 +1,6 @@
 *.pyc
 .venv/
+logs/
 __pycache__/
 data/clips/
 venv/

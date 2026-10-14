@@ -51,6 +51,7 @@ from python.perception.pipeline import ModularPerception
 from python.perception.stitch360 import stitch_frames
 from python.perception.road_model import lanes_ext_for_live, road_edges
 from python.viz.debug_draw import cabin_drive_word
+from python.debug.gt_logger import GroundTruthLogger, gt_log_enabled
 from python.viz.review_log import ReviewCapture
 from python.viz.nerd import image_point_from_window_mouse
 from python.train.scene_net import live_strip_fields
@@ -276,6 +277,11 @@ def main() -> None:
         "--foxglove",
         action="store_true",
         help="Publish extras to a local Foxglove WebSocket (ws://127.0.0.1:8765). Planner stays vision-only.",
+    )
+    ap.add_argument(
+        "--gt-log",
+        action="store_true",
+        help="Sim ground truth JSONL under logs/ (or set GVD_GT_LOG=1). Off in normal play.",
     )
     args = ap.parse_args()
 
@@ -511,6 +517,10 @@ def main() -> None:
     engage_arm_mono: float | None = None
     review_cap = ReviewCapture()
     lane_steer = LaneSteerState()
+    gt_log = None
+    if gt_log_enabled(bool(args.gt_log)):
+        gt_log = GroundTruthLogger.open()
+        print(f"[GVD] ground truth -> {gt_log.path}", flush=True)
     try:
         while True:
             loop_t0 = time.perf_counter()
@@ -1051,6 +1061,21 @@ def main() -> None:
             if state_due:
                 write_state(st)
                 soft_esc_state_write_mark()
+
+            if gt_log is not None:
+                gt_log.write(
+                    bng=bng,
+                    vdata=vdata,
+                    engaged=bool(engaged),
+                    lane_x=lane_x,
+                    lane_src=str(getattr(pout, "lane_source", "none") or "none"),
+                    steer=float(applied.steer),
+                    steer_why=lane_steer.reason,
+                    frame_cmd_ms=float(frame_cmd_ms),
+                    stitch=getattr(rig_view, "bgr", None),
+                    lanes_bev=getattr(pout, "lanes_bev", None),
+                    socket_busy=bool(getattr(bundle, "grab_read_blocked", False)),
+                )
 
             review_cap.write(
                 bool(ui.debug.review_record),

@@ -10,6 +10,10 @@ from typing import Any
 IN_LANE_HALF = 0.5
 DT_CAP_S = 1.0
 STEER_DEAD = 0.02
+# A run that stays in the lane because the car is parked is not a pass.
+# gt_run9: 120 s engaged, in_lane 100%, driven 36.7 m, mean speed 0.37 m/s.
+MIN_DRIVEN_M = 300.0
+MIN_MEAN_SPEED_MPS = 4.0
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -160,6 +164,7 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
             was_off = False
     flips = steer_sign_changes(steers)
     pct = None if known_s <= 1e-6 else 100.0 * in_lane_s / known_s
+    driven_m, mean_speed = _travel(rows, dts)
     return {
         "ticks": len(rows),
         "engaged_s": engaged_s,
@@ -173,12 +178,61 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "steer_sign_changes": flips,
         "steer_sign_per_s": None if engaged_s <= 1e-6 else flips / engaged_s,
         "lane_x_vs_offset_r": pearson(corr_x, corr_y),
+        "driven_m": driven_m,
+        "mean_speed_mps": mean_speed,
         "frame_cmd_ms_n": len(lats),
         "frame_cmd_ms_mean": None if not lats else sum(lats) / len(lats),
         "frame_cmd_ms_p50": None if not lats else _percentile(lats, 0.50),
         "frame_cmd_ms_p90": None if not lats else _percentile(lats, 0.90),
         **_perception(rows),
     }
+
+
+def _travel(rows: list[dict[str, Any]], dts: list[float]) -> tuple[float, float | None]:
+    """Path length and mean ``speed_mps`` while engaged.
+
+    Distance is the sum of position steps. When a row has no position, that
+    step uses ``speed_mps * dt`` instead. The mean is the speed field, which
+    is what stays near 0 when the parking brake is holding the car.
+    """
+    driven = 0.0
+    speeds: list[float] = []
+    prev: tuple[float, float] | None = None
+    for row, dt in zip(rows, dts):
+        if not row.get("engaged"):
+            prev = None
+            continue
+        spd = _f(row, "speed_mps")
+        if spd is not None:
+            speeds.append(spd)
+        pos = row.get("pos")
+        xy: tuple[float, float] | None = None
+        if isinstance(pos, (list, tuple)) and len(pos) >= 2:
+            try:
+                xy = (float(pos[0]), float(pos[1]))
+            except (TypeError, ValueError):
+                xy = None
+        if xy is not None and prev is not None:
+            driven += math.hypot(xy[0] - prev[0], xy[1] - prev[1])
+        elif spd is not None:
+            driven += max(0.0, spd) * dt
+        prev = xy
+    mean = None if not speeds else sum(speeds) / len(speeds)
+    return driven, mean
+
+
+def distance_failure(summary: dict[str, Any]) -> str | None:
+    """Why this run did not drive far enough, or None when it did."""
+    driven = summary.get("driven_m")
+    speed = summary.get("mean_speed_mps")
+    driven_v = 0.0 if driven is None else float(driven)
+    speed_v = 0.0 if speed is None else float(speed)
+    if driven_v >= MIN_DRIVEN_M and speed_v >= MIN_MEAN_SPEED_MPS:
+        return None
+    return (
+        f"driven_m={driven_v:.1f} need>={MIN_DRIVEN_M:.0f} "
+        f"mean_speed_mps={speed_v:.2f} need>={MIN_MEAN_SPEED_MPS:.0f}"
+    )
 
 
 def _perception(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -225,7 +279,8 @@ def format_report(summary: dict[str, Any], *, source: str = "") -> str:
     lines.append(
         f"engaged_s={num('engaged_s')} in_lane_pct={pct_s} "
         f"mean_abs_offset_m={num('mean_abs_offset_m', 3)} "
-        f"max_abs_offset_m={num('max_abs_offset_m', 3)}"
+        f"max_abs_offset_m={num('max_abs_offset_m', 3)} "
+        f"driven_m={num('driven_m', 1)} mean_speed_mps={num('mean_speed_mps', 2)}"
     )
     deps = summary.get("departures") or []
     lines.append(f"departures={len(deps)}")

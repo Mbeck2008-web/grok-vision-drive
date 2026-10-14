@@ -16,7 +16,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from python.debug.gt_summary import format_report, load_jsonl, render_plot, summarize  # noqa: E402
+from python.debug.gt_summary import (  # noqa: E402
+    distance_failure,
+    format_report,
+    load_jsonl,
+    render_plot,
+    summarize,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -45,12 +51,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"plot={png}")
     except Exception as exc:
         print(f"plot=failed {type(exc).__name__}: {exc}", file=sys.stderr)
-    if args.min_in_lane is None:
-        return 0
-    pct = summary.get("in_lane_pct")
-    if pct is None or float(pct) < float(args.min_in_lane):
-        return 1
-    return 0
+    failed = False
+    reason = distance_failure(summary)
+    if reason is not None:
+        print(f"gt report: FAIL {reason}", file=sys.stderr)
+        failed = True
+    if args.min_in_lane is not None:
+        pct = summary.get("in_lane_pct")
+        if pct is None or float(pct) < float(args.min_in_lane):
+            print(
+                f"gt report: FAIL in_lane_pct={pct} need>={args.min_in_lane}",
+                file=sys.stderr,
+            )
+            failed = True
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

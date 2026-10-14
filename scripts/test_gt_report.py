@@ -18,6 +18,9 @@ from python.debug.gt_geom import (  # noqa: E402
 )
 from python.debug.gt_logger import GroundTruthLogger, gt_log_enabled  # noqa: E402
 from python.debug.gt_summary import (  # noqa: E402
+    MIN_DRIVEN_M,
+    MIN_MEAN_SPEED_MPS,
+    distance_failure,
     format_report,
     load_jsonl,
     pearson,
@@ -124,6 +127,30 @@ def check_report_math() -> None:
     text = format_report(summary, source="sample")
     assert "in_lane_pct=84.0" in text
     assert "departures=2" in text
+    assert "driven_m=0.0" in text
+    assert "mean_speed_mps=na" in text
+    assert distance_failure(summary) is not None
+    moving = []
+    x = 0.0
+    for i in range(40):
+        x += 10.0
+        moving.append({
+            "t": i * 0.5,
+            "engaged": True,
+            "lane_offset_m": 0.2,
+            "lane_width_m": 3.5,
+            "off_road": False,
+            "lane_x": 0.1,
+            "steer": 0.05,
+            "gt_center_x": 0.1,
+            "speed_mps": 8.0,
+            "pos": (x, 0.0, 0.0),
+            "frame_cmd_ms": 100.0,
+        })
+    fast = summarize(moving)
+    assert fast["driven_m"] >= MIN_DRIVEN_M, fast["driven_m"]
+    assert fast["mean_speed_mps"] >= MIN_MEAN_SPEED_MPS
+    assert distance_failure(fast) is None
     ident = pearson([1.0, 2.0, 3.0], [1.0, 2.0, 3.0])
     assert ident is not None and abs(ident - 1.0) < 1e-9, ident
     on_disk = load_jsonl(FIXTURE)

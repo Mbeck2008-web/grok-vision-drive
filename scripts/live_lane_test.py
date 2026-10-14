@@ -106,7 +106,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--port", type=int, default=None)
     args = ap.parse_args(argv)
 
-    from python.debug.gt_summary import format_report, load_jsonl, render_plot, summarize
+    from python.debug.gt_summary import (
+        distance_failure,
+        format_report,
+        load_jsonl,
+        render_plot,
+        summarize,
+    )
     from python.sensors.tech import (
         load_tech_config,
         open_tech_beamngpy,
@@ -198,10 +204,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"plot={png}")
     except Exception as exc:
         print(f"plot=failed {type(exc).__name__}: {exc}", file=sys.stderr)
+    failed = False
+    reason = distance_failure(summary)
+    if reason is not None:
+        print(f"[GVD] FAIL {reason}", file=sys.stderr)
+        failed = True
     pct = summary.get("in_lane_pct")
     if pct is None or float(pct) < float(args.min_in_lane):
-        return 1
-    return 0
+        print(f"[GVD] FAIL in_lane_pct={pct} need>={args.min_in_lane}", file=sys.stderr)
+        failed = True
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

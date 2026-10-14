@@ -38,9 +38,13 @@ STALE_SPEED_MPS = 6.0
 # and the heading stayed. A lookahead past this, or a nose this far off the
 # engage heading, is treated as leaving. The 4 m/s launch cap only braked
 # at 0.2 and speed still climbed 4.3 → 6.1 m/s inside the window.
+# gt_run8 sent brake 0.8 with throttle 0. Arcade treats that service brake
+# as reverse, so the car backed out of the lane at 11 m/s into a building.
+# 1.0 is at or above TECH_HOLD_BRAKE, which the tech actuator turns into
+# parkingbrake=1 and service brake 0.
 EXIT_LANE_X_M = 1.25
 EXIT_YAW_RAD = 0.22
-EXIT_BRAKE = 0.8
+EXIT_BRAKE = 1.0
 
 
 def apply_stale_speed_cap(

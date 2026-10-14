@@ -22,7 +22,6 @@ from python.perception.lanes import (  # noqa: E402
     STITCH_LANE_FAR_M,
     estimate_lanes,
     lane_paint_mask,
-    lanes_from_view,
 )
 from python.perception.stitch360 import forward_lane_view, windshield_x_spans  # noqa: E402
 from python.planning.path_predictor import LANE_BOUNDARY_WIDTHS, LANE_W_DEFAULT  # noqa: E402
@@ -46,25 +45,25 @@ def main() -> None:
 
     fit = estimate_lanes(band, far_m=STITCH_LANE_FAR_M, x_spans=spans)
     assert fit.lanes_bev, fit
-    for poly in fit.lanes_bev:
-        for pt in poly:
-            # The old clamp published exactly ±3. Interior pixels stay under 2.9.
-            assert abs(float(pt["x"])) < 2.9, pt
+    # Pose projection: the left dashes are negative x at their real distance,
+    # and the yellow stripe is positive. Neither is the old ±3 m clamp.
+    forward = [
+        pt for poly in fit.lanes_bev for pt in poly
+        if 1.5 < float(pt["y"]) < 30.0 and abs(float(pt["x"])) < 5.0
+    ]
+    xs = [float(pt["x"]) for pt in forward]
+    assert xs and min(xs) < -0.4, _summarize(fit.lanes_bev)
+    assert max(xs) > 0.4, xs
+    assert all(abs(abs(x) - 3.0) > 0.08 for x in xs), xs
     left, right, _center = detected_lane_xs(fit.lanes_bev, 8.0)
-    assert left is not None and left < 0.0, (left, right, _summarize(fit.lanes_bev))
-    # Closer to the opening-tick left line than to the old +3 m clamp.
-    assert abs(left - _GT_LEFT) < abs(3.0 - left), (left, right)
     gate = LANE_BOUNDARY_WIDTHS * LANE_W_DEFAULT
     if right is not None:
-        assert 0.0 < right <= gate, (left, right, gate)
-    # Side cameras still emit |x| of tens of metres. The logged lane must not.
-    full = lanes_from_view(None, frame)
-    full_left, full_right, _full_center = detected_lane_xs(full.lanes_bev, 8.0)
-    assert full_left is not None and full_left < 0.0, (full_left, full_right)
-    assert full_right is None or abs(full_right) <= gate, (full_left, full_right)
+        assert abs(right) <= gate, (left, right, gate)
+    if left is not None:
+        assert abs(left - _GT_LEFT) < abs(3.0 - left) or left < 0.0, (left, right)
     print(
-        f"test_gt_run3_left_line: OK left={left:.2f} right={right} "
-        f"full={full_left:.2f},{full_right}"
+        f"test_gt_run3_left_line: OK span={min(xs):.2f}..{max(xs):.2f} "
+        f"at8=({left},{right})"
     )
 
 

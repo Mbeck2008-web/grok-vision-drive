@@ -651,8 +651,39 @@ def _trim_to_interior(
     return ax, ay, bx, by
 
 
-def _fit_sector(bgr: np.ndarray, far_m: float) -> list[list[dict[str, float]]]:
-    """Lane pieces in one windshield camera. x is that camera's ±3 m scale."""
+def _ground_projector(cam_id: str, width: int, height: int):
+    """Pixel on a windshield sector → ego ground, using that camera's pose.
+
+    The linear map ``far_m * (1 - row/height)`` put y=8 m on the bottom row
+    of a 96 px sector. That row is about 4 m in front of the bumper. The
+    yellow line there sits on the right edge, so the sample came out positive
+    while the center 8 m ahead was to the left (gt_run5, r=−0.40).
+    """
+    pose = camera_pose(cam_id)
+    if pose is None:
+        return None
+
+    def project(x: float, y: float) -> dict[str, float] | None:
+        hit = project_pose_pixel(
+            pose, float(x), float(y), width=int(width), height=int(height),
+        )
+        if hit is None:
+            return None
+        if hit["y"] < 1.5 or hit["y"] > 40.0:
+            return None
+        if abs(hit["x"]) > 5.0:
+            return None
+        return hit
+
+    return project
+
+
+def _fit_sector(
+    bgr: np.ndarray,
+    far_m: float,
+    cam_id: str | None = None,
+) -> list[list[dict[str, float]]]:
+    """Lane pieces in one windshield camera."""
     image = _as_bgr(bgr)
     height, width = image.shape[:2]
     stripe = _lane_stripe_mask(image)
@@ -663,6 +694,7 @@ def _fit_sector(bgr: np.ndarray, far_m: float) -> list[list[dict[str, float]]]:
     lines = cv2.HoughLinesP(
         crop, 1, np.pi / 180, threshold=8, minLineLength=8, maxLineGap=14
     )
+    projector = _ground_projector(cam_id, width, height) if cam_id else None
     pieces: list[tuple[float, float, float, float, float, float, float]] = []
     for x1, y1, x2, y2 in hough_segments(lines):
         if x1 == x2 and y1 == y2:
@@ -679,8 +711,14 @@ def _fit_sector(bgr: np.ndarray, far_m: float) -> list[list[dict[str, float]]]:
         if trimmed is None:
             continue
         tx1, ty1, tx2, ty2 = trimmed
-        e1 = _ego_x(tx1, width, None)
-        e2 = _ego_x(tx2, width, None)
+        if projector is None:
+            e1 = _ego_x(tx1, width, None)
+            e2 = _ego_x(tx2, width, None)
+        else:
+            a = projector(tx1, ty1)
+            b = projector(tx2, ty2)
+            e1 = None if a is None else float(a["x"])
+            e2 = None if b is None else float(b["x"])
         if e1 is None or e2 is None:
             continue
         # One segment that runs from the left dash to the yellow stripe is
@@ -702,25 +740,12 @@ def _fit_sector(bgr: np.ndarray, far_m: float) -> list[list[dict[str, float]]]:
             continue
         longest = sorted(side, key=lambda p: p[0], reverse=True)[:8]
         packed = [(p[1], p[2], p[3], p[4], p[5]) for p in longest]
-        out.extend(chain_lane_segments(packed, width, height, far_m, None))
+        out.extend(
+            chain_lane_segments(
+                packed, width, height, far_m, None, project=projector,
+            )
+        )
     return out
-
-
-def _hold_near_end(
-    poly: list[dict[str, float]],
-    *,
-    y_m: float,
-    max_gap_m: float,
-) -> list[dict[str, float]]:
-    """Repeat the nearest measured x back to ``y_m`` when the stripe ends early."""
-    if len(poly) < 2:
-        return poly
-    near = min(poly, key=lambda p: float(p["y"]))
-    gap = float(near["y"]) - float(y_m)
-    if gap <= 0.5 or gap > float(max_gap_m):
-        return poly
-    held = {"x": float(near["x"]), "y": float(y_m), "z": 0.0}
-    return [held, *poly]
 
 
 def _estimate_span_lanes(
@@ -738,17 +763,17 @@ def _estimate_span_lanes(
     saw_left = False
     saw_right = False
     width = int(bgr.shape[1])
-    for x0, x1 in x_spans:
+    names = ("wide", "main", "narrow")
+    for index, (x0, x1) in enumerate(x_spans):
         if x1 - x0 < 8 or x0 >= width:
             continue
         crop = np.ascontiguousarray(bgr[:, int(x0) : int(min(width, x1))])
         if crop.size == 0 or int(crop.max()) == 0:
             continue
-        for poly in _fit_sector(crop, far_m):
-            # The white dash leaves the frame before the 8 m row. Hold its
-            # last x down to that row so the log and the route still see it.
-            # The held x is the measured end, not the ±3 m sector edge.
-            poly = _hold_near_end(poly, y_m=8.0, max_gap_m=40.0)
+        cam_id = names[index] if index < len(names) else None
+        for poly in _fit_sector(crop, far_m, cam_id=cam_id):
+            # Do not copy a far pixel's x down to y=8. That row is a different
+            # distance, and the copy pinned lane_x on the wrong side of the car.
             mean_x = sum(float(p["x"]) for p in poly) / float(len(poly))
             if mean_x < 0.0:
                 saw_left = True

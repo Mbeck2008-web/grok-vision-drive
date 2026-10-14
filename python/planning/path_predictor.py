@@ -243,7 +243,15 @@ def predict_path(
         polys = _polylines(prior_lanes)
         used_prior = bool(polys)
 
-    circle = None if _is_forward_lane(polys) else (_fit_roundabout(polys) if polys else None)
+    # Rear and repeater lines sit behind the bumper. A building edge beside
+    # the car is not a smooth forward lane. Either one, mixed in, makes the
+    # whole set look like a roundabout (src=roundabout at t=8.9 s).
+    # Drop far points first so one bad vertex does not throw away the line.
+    polys = _drop_lane_outliers(polys)
+    ahead = [p for p in polys if max(pt[1] for pt in p) > 1.0] or list(polys)
+    smooth = [p for p in ahead if _smooth_forward(p)]
+    route_polys = smooth if smooth and _is_forward_lane(smooth) else ahead
+    circle = None if _is_forward_lane(route_polys) else (_fit_roundabout(route_polys) if route_polys else None)
     ring_curv = 0.0
     lane_source = "none"
     if circle is not None:
@@ -253,7 +261,7 @@ def predict_path(
         extended = True
     else:
         built = (
-            _lane_route(polys, horizon, step, lane_track=lane_track, remember=remember)
+            _lane_route(route_polys, horizon, step, lane_track=lane_track, remember=remember)
             if polys
             else None
         )
@@ -684,10 +692,32 @@ def _pair(
                 best = (score, left, right, width)
     if best is None:
         return None
-    width = best[3]
-    if width < LANE_W_MIN or width > LANE_W_MAX:
+    left, right, width = best[1], best[2], best[3]
+    # x next to the bumper, not the far end of a rear line.
+    near_l = min(left, key=lambda p: abs(p[1]))[0]
+    near_r = min(right, key=lambda p: abs(p[1]))[0]
+    # Two edges on the same side of the car are a curb and a wall, not the
+    # ego lane. The 47b430e/ede174a run kept a positive center while the car
+    # crossed the road to the right. Use the nearer line, offset by half a
+    # lane toward the car, when that line is close enough to be our boundary.
+    same_side = near_l > 0.35 or near_r < -0.35
+    bad_width = width < LANE_W_MIN or width > LANE_W_MAX
+    nearer = left if abs(near_l) <= abs(near_r) else right
+    if (same_side or bad_width) and min(abs(near_l), abs(near_r)) < 2.5:
+        only = _sort_y(nearer)
+        side = _one_side(_near_x(only), track)
+        if side == "left":
+            left = only
+            right = [(x + LANE_W_DEFAULT, y) for x, y in only]
+        else:
+            right = only
+            left = [(x - LANE_W_DEFAULT, y) for x, y in only]
+        if track is not None:
+            track.side = side
+        return left, right, LANE_W_DEFAULT, f"one_{side}"
+    if bad_width:
         width = LANE_W_DEFAULT
-    return best[1], best[2], float(width), "pair"
+    return left, right, float(width), "pair"
 
 
 def _drop_lane_outliers(

@@ -94,6 +94,19 @@ def lane_count(width_m: float) -> int:
     return max(1, int(round(float(width_m) / LANE_W_M)))
 
 
+def ego_center_x(lane_offset_m: float, heading_err_rad: float | None, y_m: float = 8.0) -> float:
+    """Where the lane center sits in the ego frame, x right, y forward.
+
+    ``lane_offset_m`` is positive when the car is right of the center, so the
+    center is to the left (negative x) at the bumper. ``heading_err_rad`` is
+    positive when the car points left of the road, which swings the center
+    ahead toward the right. This is the straight-road lookahead the GT log
+    compares with ``lane_x``.
+    """
+    h = 0.0 if heading_err_rad is None else float(heading_err_rad)
+    return -float(lane_offset_m) + float(y_m) * math.sin(h)
+
+
 def lane_center_offsets(width_m: float) -> list[float]:
     """Signed offsets of each lane center from the road middle.
 

@@ -66,32 +66,103 @@ def read_sim_time(bng: Any) -> float | None:
     return None
 
 
-def load_road_polys(bng: Any) -> tuple[list[RoadPoly], str]:
-    """One snapshot of the level's road network. Empty list and a note on failure."""
-    if bng is None:
-        return [], "no beamng"
-    get_roads = getattr(bng, "get_roads", None)
-    get_edges = getattr(bng, "get_road_edges", None)
-    if not callable(get_roads) or not callable(get_edges):
-        return [], "beamngpy has no get_roads/get_road_edges"
+def _exc_text(exc: BaseException) -> str:
+    detail = str(exc).strip() or type(exc).__name__
+    return f"{type(exc).__name__}: {detail}"
+
+
+def _call(fn: Any, *args: Any, **kwargs: Any) -> tuple[Any, str]:
     try:
-        roads = get_roads()
-    except Exception as exc:
-        return [], f"get_roads failed: {type(exc).__name__}"
-    if not isinstance(roads, dict) or not roads:
-        return [], "get_roads returned no roads"
-    polys: list[RoadPoly] = []
-    for road_id in roads:
+        return fn(*args, **kwargs), ""
+    except TypeError:
         try:
-            edges = get_edges(road_id)
-        except Exception:
-            continue
+            return fn(*args), ""
+        except Exception as exc:
+            return None, _exc_text(exc)
+    except Exception as exc:
+        return None, _exc_text(exc)
+
+
+def polys_from_network(spec: Any) -> list[RoadPoly]:
+    """Roads from ``get_road_network(include_edges=True)``."""
+    if isinstance(spec, dict) and "roads" in spec and isinstance(spec["roads"], dict):
+        spec = spec["roads"]
+    elif isinstance(spec, dict) and "network" in spec and isinstance(spec["network"], dict):
+        spec = spec["network"]
+    if not isinstance(spec, dict):
+        return []
+    polys: list[RoadPoly] = []
+    for road_id, road in spec.items():
+        edges = None
+        if isinstance(road, dict):
+            driv = road.get("drivability", road.get("drivable", 1))
+            try:
+                if float(driv) <= 0.0:
+                    continue
+            except (TypeError, ValueError):
+                pass
+            edges = road.get("edges") or road.get("nodes")
+        elif isinstance(road, list):
+            edges = road
         poly = parse_road_edges(str(road_id), edges)
         if poly is not None:
             polys.append(poly)
-    if not polys:
-        return [], "road edges were empty"
-    return polys, ""
+    return polys
+
+
+def load_road_polys(bng: Any) -> tuple[list[RoadPoly], str]:
+    """One snapshot of the level's road network.
+
+    BeamNGpy 1.36 deprecates ``get_roads``; Tech 0.39 raises ``BNGError``
+    from it. ``scenario.get_road_network(include_edges=True)`` is the call
+    that returns left/middle/right edges. The note keeps the exception text.
+    """
+    if bng is None:
+        return [], "no beamng"
+    notes: list[str] = []
+    owners = []
+    scenario = getattr(bng, "scenario", None)
+    if scenario is not None:
+        owners.append(scenario)
+    owners.append(bng)
+    for owner in owners:
+        fn = getattr(owner, "get_road_network", None)
+        if not callable(fn):
+            continue
+        spec, note = _call(fn, include_edges=True, drivable_only=True)
+        if note:
+            notes.append(f"get_road_network {note}")
+            spec, note2 = _call(fn)
+            if note2:
+                notes.append(f"get_road_network() {note2}")
+        polys = polys_from_network(spec)
+        if polys:
+            return polys, ""
+        if spec is not None and not note:
+            notes.append("get_road_network returned no edges")
+    get_roads = getattr(bng, "get_roads", None)
+    get_edges = getattr(bng, "get_road_edges", None)
+    if callable(get_roads):
+        roads, note = _call(get_roads)
+        if note:
+            notes.append(f"get_roads failed: {note}")
+        elif isinstance(roads, dict) and roads and callable(get_edges):
+            polys = []
+            for road_id in roads:
+                edges, edge_note = _call(get_edges, road_id)
+                if edge_note or edges is None:
+                    continue
+                poly = parse_road_edges(str(road_id), edges)
+                if poly is not None:
+                    polys.append(poly)
+            if polys:
+                return polys, ""
+            notes.append("get_road_edges returned no centerlines")
+        elif not note:
+            notes.append("get_roads returned no roads")
+    elif not notes:
+        notes.append("beamngpy has no get_road_network or get_roads")
+    return [], "; ".join(notes) if notes else "no road network"
 
 
 def _pose(vdata: Any) -> tuple[tuple[float, float, float] | None, float | None, float | None]:
@@ -204,6 +275,7 @@ class GroundTruthLogger:
         self.frames.mkdir(parents=True, exist_ok=True)
         self._roads: list[RoadPoly] | None = None
         self._road_note = "road network pending"
+        self._road_try_wall = 0.0
         self._prev_damage: float | None = None
         self._last_sim: float | None = None
         self._wall0 = time.time()
@@ -225,10 +297,12 @@ class GroundTruthLogger:
         return cls(path, frames)
 
     def _ensure_roads(self, bng: Any, socket_busy: bool) -> None:
-        if self._roads is not None:
+        if self._roads is not None or socket_busy or bng is None:
             return
-        if socket_busy:
+        now = time.time()
+        if self._road_try_wall and (now - self._road_try_wall) < 2.0:
             return
+        self._road_try_wall = now
         polys, note = load_road_polys(bng)
         if polys:
             self._roads = polys
@@ -236,6 +310,7 @@ class GroundTruthLogger:
             print(f"[GVD] gt roads={len(polys)}", flush=True)
         else:
             self._road_note = note
+            print(f"[GVD] gt roads: {note}", flush=True)
 
     def write(
         self,

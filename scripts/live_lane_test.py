@@ -61,6 +61,33 @@ def _load_level(bng) -> None:
     bng.start_scenario()
 
 
+def _log_says_crash(path: Path) -> bool:
+    """True when the logger already recorded a damage jump or a stuck car."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    prev = None
+    for line in lines[-40:]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            import json
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        delta = row.get("damage_delta")
+        if isinstance(delta, (int, float)) and float(delta) >= 400.0:
+            return True
+        damage = row.get("damage")
+        if prev is not None and isinstance(damage, (int, float)) and damage - prev >= 400.0:
+            return True
+        if isinstance(damage, (int, float)):
+            prev = float(damage)
+    return False
+
+
 def _newest_log(since: float) -> Path | None:
     folder = ROOT / "logs"
     if not folder.is_dir():
@@ -80,7 +107,12 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     from python.debug.gt_summary import format_report, load_jsonl, render_plot, summarize
-    from python.sensors.tech import load_tech_config, open_tech_beamngpy, release_tech_beamngpy
+    from python.sensors.tech import (
+        load_tech_config,
+        open_tech_beamngpy,
+        release_tech_beamngpy,
+        widen_socket_timeout,
+    )
 
     cfg = load_tech_config()
     host = args.host or str(cfg.get("host") or "localhost")
@@ -98,6 +130,9 @@ def main(argv: list[str] | None = None) -> int:
     started = time.time()
     try:
         try:
+            # Hello stays short. Loading west_coast_usa takes about 30 s and
+            # the 10 s socket timeout aborted it.
+            widen_socket_timeout(bng, 90.0)
             _load_level(bng)
         except Exception as exc:
             print(f"[GVD] live lane test: scenario load failed ({type(exc).__name__}: {exc})", file=sys.stderr)
@@ -133,7 +168,12 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         _lua(bng, "extensions.gvd_main.engage()")
         print(f"[GVD] engaged for {args.seconds:.0f}s  log={log}", flush=True)
-        time.sleep(max(0.0, float(args.seconds)))
+        end = time.time() + max(0.0, float(args.seconds))
+        while time.time() < end:
+            time.sleep(0.5)
+            if _log_says_crash(log):
+                print("[GVD] crash or stuck in the ground-truth log; stopping early", flush=True)
+                break
         _lua(bng, "extensions.gvd_main.disengage()")
         time.sleep(0.5)
     finally:

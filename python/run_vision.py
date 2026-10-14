@@ -671,6 +671,19 @@ def main() -> None:
             if not ident.matched:
                 engaged = False
                 # Refuse actuation. Do not guess Drive vs Tech or honor a Python-only override.
+            if engaged and not prev_engaged:
+                # The tick above may have held a pre-engage one-side center.
+                # Refit with the seed gate so that value cannot steer.
+                perc.arm_lane_seed()
+                pout = perc.tick(
+                    main,
+                    stitch_bgr=rig_view.bgr,
+                    ego_speed_mps=ego_v,
+                    steer_deg=steer,
+                    yaw_rate=yaw_rate,
+                    dt_s=tick_dt,
+                )
+                pout = apply_to_perception(ui.debug, pout)
             disengage_reason = "none" if ident.matched else "bus_mismatch"
             heartbeat_ok = True
             allow_preview = bool(args.allow_preview_drive) or bool(ui.debug.allow_preview)

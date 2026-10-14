@@ -204,6 +204,10 @@ class LaneTrack:
     # previous pending value, so the count never reached three.
     pending_sign: int = 0
     source: str = "none"
+    # Set at engage. A one-sided or held sample must not become the center
+    # until a fresh pair has been taken. gt_run8 engaged on one_right/hold
+    # at +5.41 m, which was fit before engage.
+    awaiting_pair: bool = False
 
     def reset(self) -> None:
         self.center_x = None
@@ -212,6 +216,7 @@ class LaneTrack:
         self.pending_n = 0
         self.pending_sign = 0
         self.source = "none"
+        self.awaiting_pair = False
 
 
 def follow_lane_center(
@@ -869,6 +874,20 @@ def _lane_route(
     if paired is None:
         return None
     left, right, width, base = paired
+    # Before the first fresh pair, a one-sided line or a hold is not the
+    # center. Drive straight at x=0. A pair with remember set is the seed.
+    if lane_track is not None and lane_track.awaiting_pair and not (base == "pair" and remember):
+        lane_track.side = prev_side
+        straight: list[tuple[float, float]] = []
+        y_hold = 0.0
+        guard_hold = 0
+        while y_hold <= horizon + 1e-6 and guard_hold < 200:
+            straight.append((0.0, y_hold))
+            y_hold += step
+            guard_hold += 1
+        if len(straight) < 2:
+            return None
+        return straight, LANE_W_DEFAULT, False, "seed"
     # Overlap may start beside or behind the car. Do not clamp it to the bumper.
     y0 = max(left[0][1], right[0][1])
     y1 = min(left[-1][1], right[-1][1])
@@ -937,6 +956,8 @@ def _lane_route(
         mode = "take"
     else:
         chosen, mode = follow_lane_center(lane_track, x_ref, count=remember)
+        if lane_track.awaiting_pair and base == "pair" and mode == "take":
+            lane_track.awaiting_pair = False
     shift = chosen - x_ref
     if abs(shift) > 1e-9:
         samples = [(x + shift, y) for x, y in samples]

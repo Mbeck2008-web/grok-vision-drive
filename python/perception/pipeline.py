@@ -61,6 +61,22 @@ class ModularPerception:
         self._last_plan: Any = None
         self._last_lanes: LaneResult | None = None
 
+    def arm_lane_seed(self) -> None:
+        """Drop any center fit before engage. The next pair may seed it.
+
+        Pre-engage ticks still run the fitter. gt_run8 stored one_right at
+        +5.41 m while idle, then engaged on one_right/hold and steered that
+        value. Until a fresh pair is taken, the route stays at x=0.
+        """
+        self._lane_track.reset()
+        self._lane_track.awaiting_pair = True
+        self._prior_lanes = []
+        self._lane_sig = None
+        self._lane_mono = 0.0
+        self._taken_mono = 0.0
+        self._last_plan = None
+        self._last_lanes = None
+
     def set_detector(self, detector: Any, missing: list[str] | None = None) -> None:
         """Swap the live detector; reset tracks so CIPV ids do not stick to a dead net."""
         self.detector = detector

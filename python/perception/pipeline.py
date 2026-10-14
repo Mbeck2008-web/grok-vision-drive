@@ -12,7 +12,7 @@ from python.perception.cipv import select_cipv
 from python.perception.detect import STATIC_CLASSES
 from python.perception.lanes import lanes_from_view
 from python.perception.track import IoUTracker
-from python.planning.path_predictor import predict_path
+from python.planning.path_predictor import LaneTrack, predict_path
 
 MAX_SIGNS = 8
 SIGN_KEEP = 8
@@ -36,6 +36,7 @@ class PerceptionOut:
     infer_ms: float = 0.0
     missing: list[str] = field(default_factory=list)
     detector_name: str = ""
+    lane_source: str = "none"
 
 
 class ModularPerception:
@@ -46,6 +47,7 @@ class ModularPerception:
         self.tracker = IoUTracker()
         self._prior_lanes: list = []
         self._prior_signs: list[dict[str, Any]] = []
+        self._lane_track = LaneTrack()
 
     def set_detector(self, detector: Any, missing: list[str] | None = None) -> None:
         """Swap the live detector; reset tracks so CIPV ids do not stick to a dead net."""
@@ -54,6 +56,7 @@ class ModularPerception:
         self.tracker = IoUTracker()
         self._prior_lanes = []
         self._prior_signs = []
+        self._lane_track = LaneTrack()
 
     def tick(
         self,
@@ -102,6 +105,7 @@ class ModularPerception:
             tracks=track_dicts,
             signs=signs,
             ego_speed_mps=ego_speed_mps,
+            lane_track=self._lane_track,
         )
         cipv_id = plan.cipv_id
         if cipv_id is None and cipv.track is not None:
@@ -152,10 +156,12 @@ class ModularPerception:
                 "path_length_m": plan.path_length_m,
                 "pred_brake": plan.pred_brake,
                 "blinker": plan.blinker,
+                "lane_source": plan.lane_source,
             },
             infer_ms=infer_ms,
             missing=missing,
             detector_name=self.detector.name,
+            lane_source=plan.lane_source,
         )
 
 
@@ -168,6 +174,7 @@ def drive_plan_from_lanes(
     tracks: list,
     signs: list,
     ego_speed_mps: float,
+    lane_track: LaneTrack | None = None,
 ) -> tuple[Any, list]:
     """Route from the live lines, or from the last lines that actually routed.
 
@@ -179,6 +186,7 @@ def drive_plan_from_lanes(
     stored = list(prior or [])
     live = list(fresh or [])
     prior_arg = stored if (not live and stored) else None
+    seeded = lane_track is not None and lane_track.center_x is not None
     plan = predict_path(
         lanes_bev=live,
         lane_conf=lane_conf,
@@ -187,6 +195,8 @@ def drive_plan_from_lanes(
         signs=signs,
         ego_speed_mps=ego_speed_mps,
         prior_lanes=prior_arg,
+        lane_track=lane_track,
+        remember=bool(live) or not seeded,
     )
     from_live = bool(plan.drivable and live)
     if not plan.drivable and live and stored:
@@ -198,6 +208,8 @@ def drive_plan_from_lanes(
             signs=signs,
             ego_speed_mps=ego_speed_mps,
             prior_lanes=stored,
+            lane_track=lane_track,
+            remember=lane_track is None or lane_track.center_x is None,
         )
     if from_live:
         stored = live

@@ -910,6 +910,7 @@ def main() -> None:
                 "steer": float(applied.steer),
                 "frame_cmd_ms": float(frame_cmd_ms),
                 "why": lane_steer.reason,
+                "source": getattr(pout, "lane_source", "none"),
             }
             st["ego_source"] = ego_source
             st["cmd_ack_seq"] = int(ego_fb.applied_seq) if ego_fb is not None else -1
@@ -1001,6 +1002,7 @@ def main() -> None:
                 f"lane_y={'na' if lane_y is None else f'{lane_y:.2f}'} "
                 f"steer={float(applied.steer):+.4f} "
                 f"steer_why={lane_steer.reason} "
+                f"lane_src={getattr(pout, 'lane_source', 'none')} "
                 f"frame_cmd_ms={frame_cmd_ms:.1f}",
                 flush=True,
             )

@@ -177,9 +177,11 @@ def _ego_x(
 ) -> float:
     """Lateral meters. One camera is ±3 m across its own width.
 
-    A windshield band is several cameras side by side. Scaling the whole
-    band as one camera squeezes a real lane under a meter. Each painted
-    sector keeps the single-camera scale, so 0.9 m is still a road distance.
+    Image-right is +x. A windshield band is several cameras side by side.
+    Scaling the whole band as one camera squeezes a real lane under a meter.
+    Each painted sector keeps the single-camera scale, so 0.9 m is still a
+    road distance. The ede174a ground-truth run's first samples were within
+    0.2 m of the road center, so this map is not the later positive bias.
     """
     span = _span_of(float(x), x_spans)
     if span is None:

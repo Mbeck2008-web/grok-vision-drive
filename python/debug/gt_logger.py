@@ -205,8 +205,22 @@ def _x_at_y(poly: list, y_m: float) -> float | None:
 
 
 def detected_lane_xs(lanes_bev: list | None, y_m: float = 8.0) -> tuple[float | None, float | None, float | None]:
-    """Left, right, and mean x of detected polylines at ``y_m`` (x right)."""
-    xs = [x for poly in (lanes_bev or []) if (x := _x_at_y(poly, y_m)) is not None]
+    """Left, right, and mean x of detected polylines at ``y_m`` (x right).
+
+    A boundary past 1.9 lane widths (6.65 m) is the next road or a
+    side-camera miss. The ecf5d35 log's det_right_x of +8..+16 m was that
+    miss. It is not the ego lane, so it does not count here.
+    """
+    from python.planning.path_predictor import LANE_BOUNDARY_WIDTHS, lane_point_plausible
+
+    xs: list[float] = []
+    for poly in lanes_bev or []:
+        x = _x_at_y(poly, y_m)
+        if x is None:
+            continue
+        if not lane_point_plausible(x, y_m, widths=LANE_BOUNDARY_WIDTHS):
+            continue
+        xs.append(x)
     if not xs:
         return None, None, None
     return min(xs), max(xs), sum(xs) / len(xs)

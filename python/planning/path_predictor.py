@@ -126,15 +126,22 @@ def lane_x_limit(y_m: float) -> float:
     return LANE_OUTLIER_WIDTHS * LANE_W_DEFAULT + LANE_OUTLIER_PER_M * max(0.0, y)
 
 
-def lane_point_plausible(x_m: float, y_m: float) -> bool:
+def lane_point_plausible(x_m: float, y_m: float, *, widths: float | None = None) -> bool:
     """False when this point is too far sideways to be a lane boundary."""
     try:
         x = float(x_m)
+        y = float(y_m)
     except (TypeError, ValueError):
         return False
     if x != x or x in (float("inf"), float("-inf")):
         return False
-    return abs(x) <= lane_x_limit(y_m)
+    if widths is None:
+        limit = lane_x_limit(y)
+    else:
+        # Flat. The per-metre term would keep a +8 m miss at the 8 m row
+        # and still drop the beside line at x=-6.4 m that the ground test paints.
+        limit = float(widths) * LANE_W_DEFAULT
+    return abs(x) <= limit
 
 
 @dataclass
@@ -720,13 +727,21 @@ def _pair(
     return left, right, float(width), "pair"
 
 
+# Logged lane lines only. A curve at 18 m is wider than this and still a
+# lane, so the route keeps the looser per-metre gate. 1.9 widths is 6.65 m:
+# the ecf5d35 det_right_x of +8..+16 m is not the ego lane.
+LANE_BOUNDARY_WIDTHS = 1.9
+
+
 def _drop_lane_outliers(
     polys: list[list[tuple[float, float]]],
+    *,
+    widths: float | None = None,
 ) -> list[list[tuple[float, float]]]:
     """Drop paint points too far sideways to be this lane, before the fit."""
     kept: list[list[tuple[float, float]]] = []
     for poly in polys:
-        pts = [(x, y) for x, y in poly if lane_point_plausible(x, y)]
+        pts = [(x, y) for x, y in poly if lane_point_plausible(x, y, widths=widths)]
         if len(pts) >= 2:
             kept.append(pts)
     return kept

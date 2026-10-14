@@ -128,7 +128,10 @@ def lane_paint_mask(bgr: np.ndarray) -> np.ndarray:
     """
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     white = cv2.inRange(hsv, (0, 0, 185), (180, 18, 255))
-    yellow = cv2.inRange(hsv, (8, 40, 80), (42, 255, 255))
+    # West-coast center paint in the ecf5d35 frames is hazy yellow, about
+    # HSV 19,33–38,210. Saturation 40 dropped it. Sky in the same frames is
+    # about HSV 15,24–26, so 28 still leaves the sky out.
+    yellow = cv2.inRange(hsv, (8, 28, 80), (42, 255, 255))
     return cv2.bitwise_or(white, yellow)
 
 
@@ -174,7 +177,7 @@ def _ego_x(
     x: float,
     width: float,
     x_spans: tuple[tuple[int, int], ...] | None = None,
-) -> float:
+) -> float | None:
     """Lateral meters. One camera is ±3 m across its own width.
 
     Image-right is +x. A windshield band is several cameras side by side.
@@ -185,9 +188,16 @@ def _ego_x(
     """
     span = _span_of(float(x), x_spans)
     if span is None:
-        return ((float(x) / float(width)) - 0.5) * 6.0
-    x0, x1 = span
-    return ((float(x) - x0) / float(max(1, x1 - x0)) - 0.5) * 6.0
+        u = float(x) / float(width)
+    else:
+        x0, x1 = span
+        u = (float(x) - x0) / float(max(1, x1 - x0))
+    # The sector edge is exactly ±3 m. That is the scale running out, not a
+    # lane. The ecf5d35 run logged det_left_x at +2.8..+3.0 on every early
+    # tick. Drop the pixel instead of publishing the clamp.
+    if u <= 0.04 or u >= 0.96:
+        return None
+    return (u - 0.5) * 6.0
 
 
 def _ego_point(
@@ -197,9 +207,11 @@ def _ego_point(
     height: float,
     far_m: float = _MAIN_FAR_M,
     x_spans: tuple[tuple[int, int], ...] | None = None,
-) -> dict[str, float]:
-    """Crude pixel → ego meters (x right, y forward)."""
+) -> dict[str, float] | None:
+    """Crude pixel → ego meters (x right, y forward). None on a sector edge."""
     ex = _ego_x(x, width, x_spans)
+    if ex is None:
+        return None
     ey = max(2.0, float(far_m) * (1.0 - float(y) / float(height)))
     return {"x": float(ex), "y": float(ey), "z": 0.0}
 
@@ -210,10 +222,12 @@ def _ordered_ego_segment(
     height: float,
     far_m: float = _MAIN_FAR_M,
     x_spans: tuple[tuple[int, int], ...] | None = None,
-) -> tuple[dict[str, float], dict[str, float]]:
+) -> tuple[dict[str, float], dict[str, float]] | None:
     x1, y1, x2, y2 = seg[0], seg[1], seg[2], seg[3]
     a = _ego_point(x1, y1, width, height, far_m, x_spans)
     b = _ego_point(x2, y2, width, height, far_m, x_spans)
+    if a is None or b is None:
+        return None
     if a["y"] <= b["y"]:
         return a, b
     return b, a
@@ -254,7 +268,10 @@ def chain_lane_segments(
     pieces: list[tuple[dict[str, float], dict[str, float]]] = []
     for seg in segs[:8]:
         if project is None:
-            pieces.append(_ordered_ego_segment(seg, width, height, far_m, x_spans))
+            ordered = _ordered_ego_segment(seg, width, height, far_m, x_spans)
+            if ordered is None:
+                continue
+            pieces.append(ordered)
             continue
         a = project(float(seg[0]), float(seg[1]))
         b = project(float(seg[2]), float(seg[3]))
@@ -555,6 +572,199 @@ def lanes_from_view(
     )
 
 
+def _lane_stripe_mask(bgr: np.ndarray) -> np.ndarray:
+    """Thin yellow and white stripes. A sunlit sheet is not a lane line.
+
+    ``lane_paint_mask`` still marks a bright gray road, which the tone tests
+    check. On the ecf5d35 main camera that same cut painted the sunlit
+    asphalt (S under 18, V about 185–210). Hough then followed the edge of
+    that sheet into the yellow stripe and the fit never saw the white dash.
+    A stripe is paint that is more saturated, or brighter, than the pixels
+    around it.
+    """
+    hsv = cv2.cvtColor(_as_bgr(bgr), cv2.COLOR_BGR2HSV)
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+    yellow = cv2.inRange(hsv, (8, 28, 80), (42, 255, 255))
+    white = cv2.inRange(hsv, (0, 0, 185), (180, 18, 255))
+    sat_med = cv2.medianBlur(sat, 15)
+    val_med = cv2.medianBlur(val, 15)
+    yel = (yellow > 0) & (sat.astype(np.int16) - sat_med.astype(np.int16) >= 12)
+    wht = (white > 0) & (val.astype(np.int16) - val_med.astype(np.int16) >= 18)
+    out = np.zeros(yellow.shape, dtype=np.uint8)
+    out[yel | wht] = 255
+    return out
+
+
+def _sector_roi(height: int, width: int) -> np.ndarray:
+    """Full width of one camera, below the sky.
+
+    ``lane_roi_mask`` is a trapezoid on the whole windshield band. At the
+    horizon it keeps only 36–64% of that band, so the left edge of ``main``
+    (the white dash in the ecf5d35 start frame) is outside the mask.
+    """
+    h, w = int(height), int(width)
+    top = int(0.28 * h)
+    mask = np.zeros((h, w), dtype=np.uint8)
+    poly = np.array(
+        [[
+            (0, h - 1),
+            (max(0, int(0.02 * w)), top),
+            (min(w - 1, int(0.98 * w)), top),
+            (w - 1, h - 1),
+        ]],
+        dtype=np.int32,
+    )
+    cv2.fillPoly(mask, poly, 255)
+    return mask
+
+
+def _trim_to_interior(
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    width: float,
+) -> tuple[float, float, float, float] | None:
+    """Drop the part of a segment that sits on the ±3 m sector edge.
+
+    The kept piece is the measured interior. It is not moved onto the limit.
+    """
+    def inside(x: float) -> bool:
+        u = float(x) / float(width)
+        return 0.05 < u < 0.95
+
+    if inside(x1) and inside(x2):
+        return float(x1), float(y1), float(x2), float(y2)
+    kept: list[tuple[float, float]] = []
+    for t in np.linspace(0.0, 1.0, 24):
+        x = float(x1) + (float(x2) - float(x1)) * float(t)
+        y = float(y1) + (float(y2) - float(y1)) * float(t)
+        if inside(x):
+            kept.append((x, y))
+    if len(kept) < 2:
+        return None
+    ax, ay = kept[0]
+    bx, by = kept[-1]
+    if abs(ax - bx) + abs(ay - by) < 4.0:
+        return None
+    return ax, ay, bx, by
+
+
+def _fit_sector(bgr: np.ndarray, far_m: float) -> list[list[dict[str, float]]]:
+    """Lane pieces in one windshield camera. x is that camera's ±3 m scale."""
+    image = _as_bgr(bgr)
+    height, width = image.shape[:2]
+    stripe = _lane_stripe_mask(image)
+    thin = cv2.dilate(stripe, np.ones((3, 3), np.uint8))
+    grad = cv2.morphologyEx(stripe, cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8))
+    crop = cv2.bitwise_and(cv2.bitwise_or(thin, grad), _sector_roi(height, width))
+    # A 96 px sector. minLineLength 40 is half the frame and drops the dash.
+    lines = cv2.HoughLinesP(
+        crop, 1, np.pi / 180, threshold=8, minLineLength=8, maxLineGap=14
+    )
+    pieces: list[tuple[float, float, float, float, float, float, float]] = []
+    for x1, y1, x2, y2 in hough_segments(lines):
+        if x1 == x2 and y1 == y2:
+            continue
+        if x1 == x2:
+            slope = 1.0e6
+        else:
+            slope = (y2 - y1) / float(x2 - x1)
+            # 0.3 was tuned on a 480 px frame. On a 96 px sector a real
+            # lane is shallower, but a flat horizon is still under 0.2.
+            if abs(slope) < 0.20:
+                continue
+        trimmed = _trim_to_interior(x1, y1, x2, y2, width)
+        if trimmed is None:
+            continue
+        tx1, ty1, tx2, ty2 = trimmed
+        e1 = _ego_x(tx1, width, None)
+        e2 = _ego_x(tx2, width, None)
+        if e1 is None or e2 is None:
+            continue
+        # One segment that runs from the left dash to the yellow stripe is
+        # the sunlit sheet, not a boundary. Both ends stay on one side.
+        if min(e1, e2) < -0.15 and max(e1, e2) > 0.15:
+            continue
+        if abs(e1 - e2) > 2.4:
+            continue
+        length = math.hypot(tx2 - tx1, ty2 - ty1)
+        pieces.append((length, tx1, ty1, tx2, ty2, slope, (e1 + e2) * 0.5))
+    out: list[list[dict[str, float]]] = []
+    # chain_lane_segments keeps eight pieces. Take the longest on each side
+    # so a short dash is not pushed out by the yellow stripe.
+    for side in (
+        [p for p in pieces if p[6] < 0.0],
+        [p for p in pieces if p[6] >= 0.0],
+    ):
+        if not side:
+            continue
+        longest = sorted(side, key=lambda p: p[0], reverse=True)[:8]
+        packed = [(p[1], p[2], p[3], p[4], p[5]) for p in longest]
+        out.extend(chain_lane_segments(packed, width, height, far_m, None))
+    return out
+
+
+def _hold_near_end(
+    poly: list[dict[str, float]],
+    *,
+    y_m: float,
+    max_gap_m: float,
+) -> list[dict[str, float]]:
+    """Repeat the nearest measured x back to ``y_m`` when the stripe ends early."""
+    if len(poly) < 2:
+        return poly
+    near = min(poly, key=lambda p: float(p["y"]))
+    gap = float(near["y"]) - float(y_m)
+    if gap <= 0.5 or gap > float(max_gap_m):
+        return poly
+    held = {"x": float(near["x"]), "y": float(y_m), "z": 0.0}
+    return [held, *poly]
+
+
+def _estimate_span_lanes(
+    bgr: np.ndarray,
+    far_m: float,
+    x_spans: tuple[tuple[int, int], ...],
+) -> LaneResult:
+    """Fit wide, main, and narrow separately, then stack the polylines.
+
+    One Hough on the whole band treats three cameras as one image. The left
+    edge of each camera falls outside the shared trapezoid, and a line that
+    ends on a sector boundary becomes exactly ±3 m.
+    """
+    lanes: list[list[dict[str, float]]] = []
+    saw_left = False
+    saw_right = False
+    width = int(bgr.shape[1])
+    for x0, x1 in x_spans:
+        if x1 - x0 < 8 or x0 >= width:
+            continue
+        crop = np.ascontiguousarray(bgr[:, int(x0) : int(min(width, x1))])
+        if crop.size == 0 or int(crop.max()) == 0:
+            continue
+        for poly in _fit_sector(crop, far_m):
+            # The white dash leaves the frame before the 8 m row. Hold its
+            # last x down to that row so the log and the route still see it.
+            # The held x is the measured end, not the ±3 m sector edge.
+            poly = _hold_near_end(poly, y_m=8.0, max_gap_m=40.0)
+            mean_x = sum(float(p["x"]) for p in poly) / float(len(poly))
+            if mean_x < 0.0:
+                saw_left = True
+            else:
+                saw_right = True
+            lanes.append(poly)
+    conf = 0.0
+    if saw_left:
+        conf += 0.4
+    if saw_right:
+        conf += 0.4
+    if saw_left and saw_right:
+        conf = min(1.0, conf + 0.15)
+    return LaneResult(conf=float(conf), lanes_bev=lanes, curvature=0.0)
+
+
 def _estimate_lanes_impl(
     bgr: np.ndarray,
     far_m: float = _MAIN_FAR_M,
@@ -562,6 +772,8 @@ def _estimate_lanes_impl(
     x_spans: tuple[tuple[int, int], ...] | None = None,
 ) -> LaneResult:
     bgr = _as_bgr(bgr)
+    if x_spans:
+        return _estimate_span_lanes(bgr, far_m, x_spans)
     h, w = bgr.shape[:2]
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)

@@ -78,13 +78,17 @@ def apply_lane_exit_brake(
     lane_x: float | None,
     heading_err_rad: float | None,
 ) -> bool:
-    """Cut throttle and brake hard when the car is aimed out of the lane.
+    """Cut throttle and brake hard while the lookahead is outside the lane.
 
-    ``lane_x`` is the lookahead the wheel is following. ``heading_err_rad``
-    is the yaw since engage (same sign as road heading error on a straight
-    road). Either one past its limit is enough. A point inside both limits
-    is left alone, so a centered lane still drives.
+    ``lane_x`` is the lookahead the wheel is following. The brake is this
+    tick only. When ``|lane_x|`` comes back inside ``EXIT_LANE_X_M`` the
+    pedals are left alone, so a good lane releases the stop.
+
+    ``heading_err_rad`` is accepted and ignored. Yaw since engage stayed
+    above 0.22 rad for about 90 s on gt_run9 after ``lane_x`` was already
+    under 0.4 m, and that held the parking brake for the rest of the run.
     """
+    del heading_err_rad
     leave = False
     if lane_x is not None:
         try:
@@ -92,13 +96,6 @@ def apply_lane_exit_brake(
         except (TypeError, ValueError):
             x = 0.0
         if x == x and abs(x) > EXIT_LANE_X_M:
-            leave = True
-    if heading_err_rad is not None:
-        try:
-            err = float(heading_err_rad)
-        except (TypeError, ValueError):
-            err = 0.0
-        if err == err and abs(err) > EXIT_YAW_RAD:
             leave = True
     if not leave:
         return False

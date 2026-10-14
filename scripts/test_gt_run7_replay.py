@@ -29,7 +29,6 @@ from python.control.actuate import (  # noqa: E402
 from python.control.launch_guard import (  # noqa: E402
     EXIT_BRAKE,
     EXIT_LANE_X_M,
-    EXIT_YAW_RAD,
     LAUNCH_S,
     apply_lane_exit_brake,
 )
@@ -129,7 +128,9 @@ def check_exit_brake_on_this_run(rows: list[dict]) -> None:
             cmd, lane_x=float(row["lane_x"]), heading_err_rad=err,
         )
         x = float(row["lane_x"])
-        leaving = abs(x) > EXIT_LANE_X_M or abs(err) > EXIT_YAW_RAD
+        # Yaw since engage does not hold the brake. gt_run9 sat at 0.33 rad
+        # for 90 s after lane_x was already small.
+        leaving = abs(x) > EXIT_LANE_X_M
         assert fired is leaving, (row["t"], x, err, fired)
         if abs(x - 2.27) < 0.02:
             assert cmd.throttle == 0.0 and cmd.brake >= EXIT_BRAKE
@@ -139,7 +140,8 @@ def check_exit_brake_on_this_run(rows: list[dict]) -> None:
             and abs(x) < 0.1
             and abs(err) > 0.30
         ):
-            assert cmd.throttle == 0.0 and cmd.brake >= EXIT_BRAKE
+            assert fired is False
+            assert cmd.throttle == 0.4 and cmd.brake == 0.0
             walk_brake += 1
     assert locked_brake >= 8, locked_brake
     assert walk_brake >= 6, walk_brake
@@ -151,8 +153,8 @@ def check_exit_brake_on_this_run(rows: list[dict]) -> None:
     assert apply_lane_exit_brake(wide, lane_x=2.27, heading_err_rad=0.0) is True
     assert wide.brake >= EXIT_BRAKE and wide.throttle == 0.0
     nosed = DriveCommand(steer=0.0, throttle=0.4, brake=0.0, seq=1, reason="ok")
-    assert apply_lane_exit_brake(nosed, lane_x=-0.02, heading_err_rad=-0.33) is True
-    assert nosed.brake >= EXIT_BRAKE
+    assert apply_lane_exit_brake(nosed, lane_x=-0.02, heading_err_rad=-0.33) is False
+    assert nosed.throttle == 0.4 and nosed.brake == 0.0
 
 
 def main() -> None:

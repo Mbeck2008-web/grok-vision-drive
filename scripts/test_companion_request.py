@@ -20,6 +20,8 @@ from python.sensors.cameras import (  # noqa: E402
     _reading_colour,
     CAM_IDS,
     COMPANION_OFFSCREEN_UPDATE_S,
+    LANE_CAM_UPDATE_S,
+    LANE_SENSOR_CAM_IDS,
     ON_DEMAND_UPDATE_S,
     BeamNGPyBackend,
     CamHealth,
@@ -210,10 +212,13 @@ def main() -> None:
         be.open()
         assert set(be._sensors) == set(CAM_IDS)
         for cid in CAM_IDS:
+            got = be._sensors[cid].kwargs["requested_update_time"]
             if cid == "main":
-                assert be._sensors[cid].kwargs["requested_update_time"] == 0.067
+                assert got == 0.067
+            elif cid in LANE_SENSOR_CAM_IDS:
+                assert got == LANE_CAM_UPDATE_S, cid
             else:
-                assert be._sensors[cid].kwargs["requested_update_time"] == COMPANION_OFFSCREEN_UPDATE_S
+                assert got == COMPANION_OFFSCREEN_UPDATE_S, cid
         hitch = load_camera_config().get("hitch") or {}
         bundle = be.grab()
         due = [cid for cid in CAM_IDS if cid != "main" and camera_grab_due(cid, 0, hitch)]

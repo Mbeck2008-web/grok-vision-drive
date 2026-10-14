@@ -48,7 +48,12 @@ LANE_OUTLIER_PER_M = 0.35
 # which is the jump the replay refuses.
 CENTER_GATE_M = 1.25
 CENTER_HYST_TICKS = 3
-CENTER_SLEW_M = 0.75
+CENTER_SLEW_M = 0.35
+# A single frame may not move the center by more than this. The gt_run5
+# lane_x series jumped about ±1 m inside the old 1.25 m instant-take gate,
+# and the wheel followed the noise.
+CENTER_INNOV_M = 0.40
+CENTER_BLEND = 0.5
 # One visible line within this band of the last side decision keeps that
 # side. Crossing it is the other boundary.
 ONE_SIDE_DEADBAND_M = 0.75
@@ -210,10 +215,11 @@ def follow_lane_center(
     """Center x to drive, and take | hold | slew.
 
     ``measured_x`` is the midpoint the lines imply this tick. The first
-    sample is stored. A later sample inside ``CENTER_GATE_M`` replaces it.
-    A larger step does not land until it has repeated ``CENTER_HYST_TICKS``
-    times, and then moves at most ``CENTER_SLEW_M`` per call. ``count``
-    false holds the memory still (a prior-lane fallback must not vote).
+    sample is stored. A later sample inside ``CENTER_INNOV_M`` is blended
+    in. A larger step does not land until it has repeated
+    ``CENTER_HYST_TICKS`` times, and then moves at most ``CENTER_SLEW_M``
+    per call. ``count`` false holds the memory still (a prior-lane fallback
+    must not vote).
     """
     measured = float(measured_x)
     if track.center_x is None:
@@ -225,11 +231,12 @@ def follow_lane_center(
     # even when it still sits inside the gate.
     if not count:
         return float(track.center_x), "hold"
-    if abs(measured - track.center_x) <= CENTER_GATE_M:
-        track.center_x = measured
+    innov = measured - float(track.center_x)
+    if abs(innov) <= CENTER_INNOV_M:
+        track.center_x = float(track.center_x) + CENTER_BLEND * innov
         track.pending_x = None
         track.pending_n = 0
-        return track.center_x, "take"
+        return float(track.center_x), "take"
     if track.pending_x is None or abs(measured - track.pending_x) > CENTER_GATE_M:
         track.pending_x = measured
         track.pending_n = 1

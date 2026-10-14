@@ -57,6 +57,7 @@ class ModularPerception:
         self._lane_track = LaneTrack()
         self._lane_sig: bytes | None = None
         self._lane_mono: float = 0.0
+        self._taken_mono: float = 0.0
         self._last_plan: Any = None
         self._last_lanes: LaneResult | None = None
 
@@ -70,6 +71,7 @@ class ModularPerception:
         self._lane_track = LaneTrack()
         self._lane_sig = None
         self._lane_mono = 0.0
+        self._taken_mono = 0.0
         self._last_plan = None
         self._last_lanes = None
 
@@ -118,7 +120,7 @@ class ModularPerception:
         if fresh:
             self._lane_sig = sig
             self._lane_mono = now
-        frame_age_s = 0.0 if fresh else max(0.0, now - self._lane_mono)
+        pixel_age = 0.0 if fresh else max(0.0, now - self._lane_mono)
         dt = 0.05 if dt_s is None or dt_s <= 0.0 else float(dt_s)
         if fresh or self._last_plan is None:
             lanes = lanes_from_view(main_bgr, stitch_bgr)
@@ -158,6 +160,18 @@ class ModularPerception:
                 drivable=len(path) >= 2,
             )
             self._last_plan = plan
+        src = str(plan.lane_source or "")
+        held = any(token in src for token in ("hold", "stale", "prior"))
+        if held or src in ("", "none"):
+            if self._taken_mono <= 0.0:
+                self._taken_mono = now
+            decision_age = max(0.0, now - self._taken_mono)
+        else:
+            self._taken_mono = now
+            decision_age = 0.0
+        # Pixel identity resets only when the bytes repeat. A hold on a new
+        # picture used to report age 0, because main's pixels change every tick.
+        frame_age_s = max(pixel_age, decision_age)
         cipv_id = plan.cipv_id
         if cipv_id is None and cipv.track is not None:
             cipv_id = cipv.track.get("id")

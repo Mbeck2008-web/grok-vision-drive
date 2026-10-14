@@ -1343,8 +1343,33 @@ def path_steer_from_ego(path_ego: list[dict[str, float]] | None) -> float:
     x = float(mid.get("x", 0.0))
     y = max(float(mid.get("y", 0.0)), 1.0)
     # atan2(opposite, adjacent) keeps the sign of x. ld^2 is always > 0.
+    # +x is right, so +steer is a right turn. The 47b430e GT run confirms the
+    # actuator: mean steer about +0.35 while unwrapped heading atan2(dir_y,
+    # dir_x) fell from -2.42 to -3.53 rad (clockwise, driver's right).
     delta = math.atan2(2.0 * WHEELBASE_M * x, x * x + y * y)
     return max(-1.0, min(1.0, delta / STEER_LOCK_RAD))
+
+
+# +steer decreases heading. Restoring steer therefore has the same sign as
+# the heading error (a counter-clockwise error needs a clockwise correction).
+HEADING_STEER_GAIN = 0.6
+
+
+def steer_for_heading_error(heading_err_rad: float) -> float:
+    """Normalized steer that reduces heading error.
+
+    ``heading_err_rad`` is current heading minus the reference, unwrapped,
+    with heading = atan2(dir_y, dir_x). Positive error is counter-clockwise
+    of the reference. Positive steer yaws clockwise, so the restoring
+    command has the same sign as the error.
+    """
+    try:
+        err = float(heading_err_rad)
+    except (TypeError, ValueError):
+        return 0.0
+    if err != err or err in (float("inf"), float("-inf")):
+        return 0.0
+    return max(-1.0, min(1.0, HEADING_STEER_GAIN * err))
 
 
 def lane_sample_hold_reason(lateral_m: float, lookahead_y_m: float) -> str | None:

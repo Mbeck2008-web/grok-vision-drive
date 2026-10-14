@@ -183,12 +183,13 @@ def check_prior_fills_a_bad_frame() -> None:
         bad, stored, lane_conf=0.0, curvature=0.0, tracks=[], signs=[], ego_speed_mps=5.0,
     )
     assert held.drivable and held.prediction == "context", held.prediction
-    assert stored_after == stored
+    # Used once, then dropped. A prior kept in the ego frame yaws with the car.
+    assert stored_after == []
     empty, still = drive_plan_from_lanes(
         [], stored, lane_conf=0.0, curvature=0.0, tracks=[], signs=[], ego_speed_mps=5.0,
     )
     assert empty.drivable and empty.prediction == "context"
-    assert still == stored
+    assert still == []
 
 
 def _print_table(played: list[dict]) -> None:

@@ -51,6 +51,8 @@ from python.perception.pipeline import ModularPerception
 from python.perception.stitch360 import stitch_frames
 from python.perception.road_model import lanes_ext_for_live, road_edges
 from python.viz.debug_draw import cabin_drive_word
+from python.control.launch_guard import LaunchGuard
+from python.debug.gt_geom import heading_from_dir
 from python.debug.gt_logger import GroundTruthLogger, gt_log_enabled
 from python.viz.review_log import ReviewCapture
 from python.viz.nerd import image_point_from_window_mouse
@@ -517,6 +519,7 @@ def main() -> None:
     engage_arm_mono: float | None = None
     review_cap = ReviewCapture()
     lane_steer = LaneSteerState()
+    launch_guard = LaunchGuard()
     gt_log = None
     if gt_log_enabled(bool(args.gt_log)):
         gt_log = GroundTruthLogger.open()
@@ -809,8 +812,41 @@ def main() -> None:
                 # A gate hold or a disengage sends steer 0. Do not resume the
                 # next path command from a value the car was not holding.
                 lane_steer.reset()
-            # Debug gain, invert, cap, and steer-off still have the last word.
+            # Debug gain, invert, and the steer cap still have the last word
+            # before the launch cap. A crash after that brakes and disengages.
             cmd = apply_to_command(ui.debug, cmd)
+            hdg = None
+            dmg = None
+            pos_xy = None
+            spd_now = None
+            if vdata is not None:
+                dmg = getattr(vdata, "damage", None)
+                spd_now = getattr(vdata, "speed_mps", None)
+                direction = getattr(vdata, "dir", None)
+                if direction is not None and len(direction) >= 2:
+                    hdg = heading_from_dir(float(direction[0]), float(direction[1]))
+                pose = getattr(vdata, "pos", None)
+                if pose is not None and len(pose) >= 2:
+                    pos_xy = (float(pose[0]), float(pose[1]))
+            crash_reason = launch_guard.update(
+                cmd,
+                engaged=bool(engaged) and (cmd.reason == "ok" or holding),
+                dt_s=tick_dt,
+                heading_rad=hdg,
+                speed_mps=spd_now,
+                damage=dmg,
+                pos_xy=pos_xy,
+            )
+            if crash_reason:
+                engaged = False
+                disengage_reason = crash_reason
+                holding = False
+                lane_steer.reset()
+                launch_guard.reset()
+                bot_engage.clear()
+                write_engage_flag(False, disengage_reason=crash_reason)
+                print(f"[GVD] DISENGAGED: {crash_reason}", flush=True)
+                cmd = stop_command(seq=cmd_seq, reason=crash_reason)
 
             # Actuators only when engaged + command ok (path / tracks / shadow already on this tick).
             # cmd_json: Lua applies whatever we write only while `engaged` rides along in the payload.

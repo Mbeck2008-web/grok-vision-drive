@@ -199,6 +199,7 @@ def drive_plan_from_lanes(
         remember=bool(live) or not seeded,
     )
     from_live = bool(plan.drivable and live)
+    used_prior = bool(plan.drivable and not live and prior_arg)
     if not plan.drivable and live and stored:
         plan = predict_path(
             lanes_bev=[],
@@ -209,10 +210,16 @@ def drive_plan_from_lanes(
             ego_speed_mps=ego_speed_mps,
             prior_lanes=stored,
             lane_track=lane_track,
-            remember=lane_track is None or lane_track.center_x is None,
+            remember=False,
         )
+        used_prior = bool(plan.drivable)
     if from_live:
         stored = live
+    elif used_prior:
+        # The prior is in the ego frame of the tick it was seen. Keeping it
+        # while the car yaws freezes lane_x off to one side (the 47b430e run
+        # held +2.83 m and steered into a building).
+        stored = []
     return plan, stored
 
 

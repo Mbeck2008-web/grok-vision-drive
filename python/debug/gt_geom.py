@@ -500,9 +500,41 @@ def road_ahead_split(
                 if cont_delta is None or delta < cont_delta:
                     cont_delta = delta
                     cont = other
-            elif delta < 2.6:
+            elif delta < 2.6 and math.hypot(end[0] - tip_x, end[1] - tip_y) <= 4.0:
+                # A road that merely passes nearby is not a fork. The end has
+                # to meet this tip.
                 others += 1
     return cont, others > 0
+
+
+LABEL_JUMP_M = 2.0
+
+
+def label_center_x(hit: RoadHit | None, y_m: float = 5.0) -> float | None:
+    """Ego-frame lane center at ``y_m``. This is ``lane_gt[0]`` at 5 m."""
+    if hit is None or hit.off_road or hit.lane_offset_m is None:
+        return None
+    return ego_center_x(float(hit.lane_offset_m), hit.heading_err_rad, y_m)
+
+
+def hold_lane_label(previous: RoadHit | None, proposed: RoadHit | None) -> RoadHit | None:
+    """Drop a one-tick lane swap.
+
+    The 6-minute run's cruise jumps were a lane-index flip of about 3 m, or
+    a polyline heading flip, while the car moved less than a metre. A real
+    lane change shifts this center by a fraction of a metre per tick.
+    """
+    if proposed is None:
+        return previous
+    if previous is None or proposed.off_road:
+        return proposed
+    old = label_center_x(previous)
+    new = label_center_x(proposed)
+    if old is None or new is None:
+        return proposed
+    if abs(new - old) > LABEL_JUMP_M:
+        return previous
+    return proposed
 
 
 def stabilize_lane(hit: RoadHit, follow: RoadFollow) -> RoadHit:
@@ -511,10 +543,11 @@ def stabilize_lane(hit: RoadHit, follow: RoadFollow) -> RoadHit:
         follow.lane_id = int(hit.lane_id)
         follow.lane_center_m = float(hit.offset_m - hit.lane_offset_m)
         return hit
-    lane_w = float(hit.lane_width_m) if hit.lane_width_m and hit.lane_width_m > 0.0 else LANE_W_M
-    if abs(float(hit.offset_m) - float(follow.lane_center_m)) <= lane_w * 0.5 + 0.2:
+    new_center = float(hit.offset_m - hit.lane_offset_m)
+    # Stay with the held lane unless the other center is clearly closer.
+    # The midpoint between two lanes is where a nearest-lane pick flips.
+    if abs(hit.offset_m - new_center) + 0.75 >= abs(float(hit.offset_m) - float(follow.lane_center_m)):
         lane_off = float(hit.offset_m) - float(follow.lane_center_m)
-        follow.lane_id = int(follow.lane_id)
         return RoadHit(
             road_id=hit.road_id,
             offset_m=hit.offset_m,
@@ -529,7 +562,7 @@ def stabilize_lane(hit: RoadHit, follow: RoadFollow) -> RoadHit:
             discontinuous=hit.discontinuous,
         )
     follow.lane_id = int(hit.lane_id)
-    follow.lane_center_m = float(hit.offset_m - hit.lane_offset_m)
+    follow.lane_center_m = new_center
     return hit
 
 
@@ -565,6 +598,9 @@ def follow_label(
     if hit.off_road:
         return hit, last, bool(hit.discontinuous)
     held = stabilize_lane(hit, follow)
+    chosen = hold_lane_label(last, held)
+    if chosen is not held and chosen is not None:
+        return chosen, chosen, True
     return held, held, False
 
 

@@ -680,8 +680,8 @@ def main(argv: list[str] | None = None) -> int:
             CRUISE_S,
             excursion_commands,
             excursion_path,
+            gate_reason,
             near_junction,
-            route_is_open,
             targets_for,
         )
 
@@ -694,6 +694,8 @@ def main(argv: list[str] | None = None) -> int:
         segment_open = False
         follow = RoadFollow()
         label_hit = None
+        gate_note = ""
+        gate_log_t = 0.0
         warmup_since: float | None = None
         last_ai: tuple[Any, ...] | None = None
         held_tag: Excursion | None = None
@@ -837,6 +839,7 @@ def main(argv: list[str] | None = None) -> int:
                 segment_open = False
                 follow = RoadFollow()
                 label_hit = None
+                gate_note = ""
                 warmup_since = None
                 if opened.spawn is not None:
                     spawn_pos = (float(opened.spawn[0]), float(opened.spawn[1]), float(opened.spawn[2]))
@@ -1016,6 +1019,7 @@ def main(argv: list[str] | None = None) -> int:
                 heading,
             )
             window_ok = True
+            start_kind: str | None = None
             if (
                 excursions_on
                 and not waypoint
@@ -1024,15 +1028,26 @@ def main(argv: list[str] | None = None) -> int:
                 and clock.phase_t + tick_dt >= CRUISE_S
                 and pos is not None
             ):
-                window_ok = route_is_open(
-                    roads,
-                    hit,
-                    float(pos[0]),
-                    float(pos[1]),
-                    heading,
-                    clock.peek_kind(lanes_here),
-                    speed,
+                kind = clock.peek_kind(lanes_here)
+                gate = gate_reason(
+                    roads, hit, float(pos[0]), float(pos[1]), heading, kind, speed,
                 )
+                if gate != "open" and kind != "weave":
+                    # A lane change needs a second lane and a clear stretch.
+                    # An in-lane weave does not.
+                    weave = gate_reason(
+                        roads, hit, float(pos[0]), float(pos[1]), heading, "weave", speed,
+                    )
+                    kind = "weave"
+                    gate = weave
+                start_kind = kind
+                window_ok = gate == "open"
+                now_gate = time.monotonic()
+                if gate != gate_note or now_gate - gate_log_t >= 5.0:
+                    word = "open" if gate == "open" else f"blocked {gate}"
+                    print(f"collect gate {segment_id} {kind} {word}", flush=True)
+                    gate_note = gate
+                    gate_log_t = now_gate
             if excursions_on and not waypoint and driving:
                 move = clock.update(
                     tick_dt,
@@ -1044,6 +1059,7 @@ def main(argv: list[str] | None = None) -> int:
                     traffic=bool(args.traffic),
                     n_lanes=lanes_here,
                     window_ok=window_ok,
+                    start_kind=start_kind,
                 )
             else:
                 move = Excursion("cruise", 0.0, 0.0, 1, "")

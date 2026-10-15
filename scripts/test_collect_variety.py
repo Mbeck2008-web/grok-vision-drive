@@ -85,7 +85,8 @@ def check_clock_and_junctions() -> None:
     clock = ExcursionClock()
     held = _advance(clock, 5.0, near_junction=True)
     assert held.phase == "cruise"
-    assert clock.phase_t == 0.0
+    # A junction no longer wipes the cruise timer. The window check blocks the start.
+    assert clock.phase_t > 4.0
     # A junction must not stick after the road opens up again.
     released = _advance(clock, CRUISE_S, near_junction=False)
     assert released.phase == "weave"
@@ -789,6 +790,19 @@ def check_windows_and_piece_boundaries() -> None:
     assert chosen is not None and chosen.road_id == "w", chosen
     nearest = project_road([narrow, wide], 3.2, 20.0, math.pi / 2.0)
     assert nearest is not None and nearest.road_id == "n"
+    # Side-road ends within 8 m of the lane used to count as a junction on every tick.
+    highway = RoadPoly("hwy", [(0.0, float(i)) for i in range(0, 201)], 7.0)
+    side = [
+        RoadPoly(f"s{i}", [(6.0, float(i)), (12.0, float(i))], 4.0)
+        for i in range(0, 201, 10)
+    ]
+    busy = [highway, *side]
+    busy_hit = project_road(busy, -1.75, 50.0, math.pi / 2.0)
+    assert busy_hit is not None and busy_hit.road_id == "hwy"
+    assert near_junction(busy_hit, busy, -1.75, 50.0, math.pi / 2.0) is False
+    from python.collect.excursion import gate_reason
+
+    assert gate_reason(busy, busy_hit, -1.75, 50.0, math.pi / 2.0, "weave", 8.0) == "open"
     one = [RoadPoly("only", [(0.0, 0.0), (0.0, 400.0)], 3.5)]
     one_hit = project_road(one, 0.0, 20.0, math.pi / 2.0)
     assert route_is_open(one, one_hit, 0.0, 20.0, math.pi / 2.0, "weave", 8.0)

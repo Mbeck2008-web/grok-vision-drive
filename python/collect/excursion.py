@@ -117,6 +117,7 @@ class ExcursionClock:
         traffic: bool = False,
         n_lanes: int | None = None,
         window_ok: bool = True,
+        start_kind: str | None = None,
     ) -> Excursion:
         dt = max(0.0, float(dt_s))
         reason = unsafe_reason(
@@ -133,7 +134,11 @@ class ExcursionClock:
             self.phase_t = 0.0
             self.reason = reason
             self._saw_offset = False
-        elif reason and self.phase == "cruise":
+        elif reason and self.phase == "cruise" and reason != "junction":
+            # A junction does not wipe the cruise timer. The window check
+            # refuses to start while a real fork is close. The old test
+            # treated every nearby road end as a junction and the timer
+            # never reached 20 s, so the 6-minute run stayed in cruise.
             self.reason = reason
             self.phase_t = 0.0
         else:
@@ -141,7 +146,13 @@ class ExcursionClock:
                 self.reason = ""
             self.phase_t += dt
             self._advance(
-                offset_m, heading_rad, lane_width_m, traffic, n_lanes=n_lanes, window_ok=window_ok,
+                offset_m,
+                heading_rad,
+                lane_width_m,
+                traffic,
+                n_lanes=n_lanes,
+                window_ok=window_ok,
+                start_kind=start_kind,
             )
         return self._sample(lane_width_m)
 
@@ -162,13 +173,14 @@ class ExcursionClock:
         traffic: bool,
         n_lanes: int | None,
         window_ok: bool = True,
+        start_kind: str | None = None,
     ) -> None:
         if self.phase == "cruise" and self.phase_t >= CRUISE_S and not self.reason:
             if not window_ok:
                 # The timer elapsed on a curve or a junction. Look again shortly.
                 self.phase_t = max(0.0, CRUISE_S - 2.0)
                 return
-            self._start_next(lane_width_m, traffic, n_lanes)
+            self._start_next(lane_width_m, traffic, n_lanes, chosen=start_kind)
         elif self.phase == "weave" and self.phase_t >= WEAVE_S:
             self._to_cruise()
         elif self.phase == "lane_change" and self.phase_t >= LANE_CHANGE_S:
@@ -193,12 +205,18 @@ class ExcursionClock:
             return "weave"
         return kind
 
-    def _start_next(self, lane_width_m: float | None, traffic: bool, n_lanes: int | None) -> None:
+    def _start_next(
+        self,
+        lane_width_m: float | None,
+        traffic: bool,
+        n_lanes: int | None,
+        chosen: str | None = None,
+    ) -> None:
         if traffic:
             self.phase_t = 0.0
             self.reason = "traffic"
             return
-        kind = ("weave", "lane_change", "recover")[self._kind % 3]
+        kind = chosen if chosen in ACTIVE else ("weave", "lane_change", "recover")[self._kind % 3]
         self._kind += 1
         if kind == "lane_change" and n_lanes is not None and int(n_lanes) < 2:
             kind = "weave"
@@ -432,11 +450,6 @@ def _chain(
             if h0 is None:
                 h0 = heading_now
             heading_span = max(heading_span, abs(math.atan2(math.sin(heading_now - h0), math.cos(heading_now - h0))))
-            if _foreign_branch(roads, current.road_id, px, py, heading_now):
-                branched = True
-                break
-        if branched:
-            break
         base = samples[-1][4]
         if base >= float(distance_m) - 1e-3:
             break
@@ -453,31 +466,37 @@ def _chain(
     return length, branched, heading_span, samples
 
 
-# A weave or a lane change on a bend tighter than this is not the window.
-STRAIGHT_RAD = 0.35
+# A usable excursion window: 60 m whose heading changes slower than this,
+# and no fork of this road inside 40 m. 0.01/m is a 100 m radius.
+WINDOW_M = 60.0
+JUNCTION_AHEAD_M = 40.0
+CURVATURE_MAX = 0.01
 
 
-def route_is_open(
+def gate_reason(
     roads: list[RoadPoly],
     hit: object,
     x: float,
     y: float,
     heading: float | None,
     phase: str,
-    speed_mps: float,
-) -> bool:
-    """True when ``phase`` fits on a straight, junction-free stretch ahead.
+    speed_mps: float = 0.0,
+) -> str:
+    """Why ``phase`` cannot start, or ``open``.
 
     Weave only needs the current lane. A lane change needs a second lane.
-    Both refuse a branch, a dead end, or a turn larger than ``STRAIGHT_RAD``.
+    Curvature is the heading change along the next 60 m divided by that
+    distance. A nearby road that does not meet this tip is not a junction.
+    ``speed_mps`` is unused; the window is a distance, not a time.
     """
+    del speed_mps
     if phase not in ACTIVE or hit is None or not roads:
-        return False
+        return "no_hit"
     if bool(getattr(hit, "off_road", False)) or bool(getattr(hit, "discontinuous", False)):
-        return False
+        return "off_road"
     road = _road_of(roads, hit)
     if road is None:
-        return False
+        return "no_hit"
     lane_w = getattr(hit, "lane_width_m", None)
     lane_id = int(getattr(hit, "lane_id", 0) or 0)
     directions = [1, -1] if phase == "lane_change" else [1]
@@ -492,38 +511,28 @@ def route_is_open(
         is not None
         for direction in directions
     ):
-        return False
-    duration = {"weave": WEAVE_S, "lane_change": LANE_CHANGE_S, "recover": RECOVER_S}[phase]
-    need = max(MIN_PATH_M, min(400.0, abs(float(speed_mps)) * duration))
-    length, branched, span = _span(roads, road, x, y, heading, need)
-    if branched or span > STRAIGHT_RAD:
-        return False
-    return length + 1e-3 >= need * 0.85
+        return "narrow"
+    length, branched, span = _span(roads, road, x, y, heading, WINDOW_M)
+    if branched and length < JUNCTION_AHEAD_M:
+        return "junction"
+    if length + 1e-3 < WINDOW_M:
+        return "short"
+    if span / max(length, 1.0) >= CURVATURE_MAX:
+        return "curve"
+    return "open"
 
 
-def _foreign_branch(
+def route_is_open(
     roads: list[RoadPoly],
-    road_id: str,
+    hit: object,
     x: float,
     y: float,
-    heading: float,
+    heading: float | None,
+    phase: str,
+    speed_mps: float,
 ) -> bool:
-    """True when some other road leaves this point at a crossing angle."""
-    for other in roads:
-        if other.road_id == road_id or len(other.xy) < 2:
-            continue
-        ends = (
-            (other.xy[0], other.xy[1]),
-            (other.xy[-1], other.xy[-2]),
-        )
-        for end, nxt in ends:
-            if math.hypot(end[0] - x, end[1] - y) > 8.0:
-                continue
-            leave = math.atan2(nxt[1] - end[1], nxt[0] - end[0])
-            delta = abs(math.atan2(math.sin(leave - heading), math.cos(leave - heading)))
-            if 0.5 < delta < 2.6:
-                return True
-    return False
+    """True when ``gate_reason`` is ``open``."""
+    return gate_reason(roads, hit, x, y, heading, phase, speed_mps) == "open"
 
 
 def _walk_piece(
@@ -575,6 +584,26 @@ def _walk_piece(
         fx, fy = ux, uy
         samples.append((px, py, fx, fy, travelled))
         next_at += max(1.0, float(step_m))
+    if travelled < distance - 0.05 and 0 <= idx < len(pts):
+        guard2 = 0
+        while travelled < distance - 0.05 and 0 <= idx < len(pts) and guard2 < 80:
+            guard2 += 1
+            nx, ny = pts[idx]
+            dx, dy = nx - px, ny - py
+            seg = math.hypot(dx, dy)
+            if seg < 1e-6:
+                idx += step_i
+                continue
+            ux, uy = dx / seg, dy / seg
+            need = distance - travelled
+            if seg >= need - 1e-9:
+                samples.append((px + ux * need, py + uy * need, ux, uy, distance))
+                travelled = distance
+                break
+            px, py = nx, ny
+            travelled += seg
+            fx, fy = ux, uy
+            idx += step_i
     if (idx < 0 or idx >= len(pts)) and travelled > samples[-1][4] + 0.05:
         samples.append((px, py, fx, fy, travelled))
     return samples
@@ -629,13 +658,12 @@ def excursion_path(
     directions = [1 if int(move.direction) >= 0 else -1]
     if move.phase == "lane_change":
         directions.append(-directions[0])
-    duration = {"weave": WEAVE_S, "lane_change": LANE_CHANGE_S, "recover": RECOVER_S}[move.phase]
-    need = max(MIN_PATH_M, abs(float(speed_mps)) * duration)
-    need = min(400.0, need)
+    del speed_mps
+    need = WINDOW_M
     lane_id = int(getattr(hit, "lane_id", 0) or 0)
     lane_w = getattr(hit, "lane_width_m", None)
-    _length, branched, _span_h, samples = _chain(roads, road, x, y, heading, need, PATH_STEP_M)
-    if branched or len(samples) < 2 or samples[-1][4] + 1e-3 < need * 0.85:
+    _length, _branched, _span_h, samples = _chain(roads, road, x, y, heading, need, PATH_STEP_M)
+    if len(samples) < 2 or samples[-1][4] + 1e-3 < need * 0.85:
         return None, int(move.direction)
     for direction in directions:
         spec = targets_for(

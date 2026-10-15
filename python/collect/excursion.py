@@ -23,7 +23,10 @@ RECOVER_S = 12.0
 ABORT_S = 3.0
 # Stay this far inside the painted lane during a weave.
 WEAVE_MARGIN_M = 0.5
-WEAVE_AMP_M = 0.45
+# In-lane only. Large enough to see, small enough to stay off the next lane.
+WEAVE_AMP_M = 0.6
+WEAVE_AMP_LO_M = 0.3
+WEAVE_AMP_HI_M = 0.8
 WEAVE_WAVE_M = 40.0
 # A recovery starts this far from the lane center, then returns.
 RECOVER_OFFSET_M = (0.5, 1.5)
@@ -199,11 +202,10 @@ class ExcursionClock:
             self._to_cruise()
 
     def peek_kind(self, n_lanes: int | None) -> str:
-        """The phase the cruise timer would start, without starting it."""
-        kind = ("weave", "lane_change", "recover")[self._kind % 3]
-        if kind == "lane_change" and n_lanes is not None and int(n_lanes) < 2:
-            return "weave"
-        return kind
+        """Mostly weaves. Every fourth start may be a lane change."""
+        if self._kind % 4 == 3 and n_lanes is not None and int(n_lanes) >= 2:
+            return "lane_change"
+        return "weave"
 
     def _start_next(
         self,
@@ -216,9 +218,9 @@ class ExcursionClock:
             self.phase_t = 0.0
             self.reason = "traffic"
             return
-        kind = chosen if chosen in ACTIVE else ("weave", "lane_change", "recover")[self._kind % 3]
+        kind = chosen if chosen in ("weave", "lane_change") else self.peek_kind(n_lanes)
         self._kind += 1
-        if kind == "lane_change" and n_lanes is not None and int(n_lanes) < 2:
+        if kind == "lane_change" and (n_lanes is None or int(n_lanes) < 2):
             kind = "weave"
         self.phase = kind
         self.phase_t = 0.0
@@ -268,16 +270,24 @@ def targets_for(
     lane_here = road_w / float(len(centers))
     if phase == "weave":
         half = max(0.0, lane_here * 0.5 - WEAVE_MARGIN_M)
-        amp = min(WEAVE_AMP_M, half)
-        if amp < 0.2:
+        if half < WEAVE_AMP_LO_M:
             return None
+        amp = min(WEAVE_AMP_HI_M, max(WEAVE_AMP_LO_M, min(WEAVE_AMP_M, half)))
         heading = math.atan(amp * 2.0 * math.pi / WEAVE_WAVE_M)
         return (direction * amp, -direction * heading)
     if phase == "lane_change":
         nxt = lane_i + direction
         if nxt < 0 or nxt >= len(centers):
             return None
-        delta = float(centers[nxt] - centers[lane_i])
+        here = float(centers[lane_i])
+        there = float(centers[nxt])
+        # Right-hand traffic: the left half of the centerline is oncoming.
+        # Crossing into it, or onto the paint at the road edge, is not a lane change.
+        if there < -0.25 and here >= -0.25:
+            return None
+        if abs(there) > road_w * 0.5 - 0.8:
+            return None
+        delta = there - here
         if abs(delta) < 0.4:
             return None
         return (delta, _heading(direction))
@@ -353,8 +363,8 @@ def near_junction(
         if road is None:
             return True
         span = _span(roads, road, float(x), float(y), heading, float(CURVATURE_AHEAD_M))
-        if span[1]:
-            return True
+        # Only a dead end inside the lookahead aborts a move. A side road
+        # beside a continuing highway is not that.
         return span[0] < float(CURVATURE_AHEAD_M) - 0.05
     ahead = getattr(hit, "ahead_m", 0.0)
     try:
@@ -409,13 +419,13 @@ def _span(
     heading: float | None,
     distance_m: float,
 ) -> tuple[float, bool, float]:
-    """``(length, branched, heading_span)`` along this road and its continuations.
+    """``(length, fork_m or None, heading_span)`` along this road and its continuations.
 
-    The walk stops at a junction. ``heading_span`` is the largest turn away
-    from the heading at the start of the walk.
+    A side road is recorded as ``fork_m`` but the walk follows the straight
+    continuation. ``heading_span`` is the largest turn away from the start.
     """
-    length, branched, span, _samples = _chain(roads, road, x, y, heading, distance_m, 8.0)
-    return length, branched, span
+    length, fork_at, span, _samples = _chain(roads, road, x, y, heading, distance_m, 8.0)
+    return length, fork_at, span
 
 
 def _chain(
@@ -434,7 +444,7 @@ def _chain(
     cx, cy = float(x), float(y)
     face = heading
     base = 0.0
-    branched = False
+    fork_at: float | None = None
     heading_span = 0.0
     h0: float | None = None
     while current is not None and len(visited) < 12 and base < float(distance_m) - 1e-3:
@@ -454,16 +464,19 @@ def _chain(
         if base >= float(distance_m) - 1e-3:
             break
         cont, split = road_ahead_split(roads, current, samples[-1][0], samples[-1][1], math.atan2(samples[-1][3], samples[-1][2]))
-        if split:
-            branched = True
-            break
+        # A side road at this tip is a fork, but the straight continuation
+        # is still the road. Stopping here made every west-coast node look
+        # like a junction, so the weave gate never opened. The replay of
+        # collect3 had no side roads, which is why it started five weaves.
+        if split and fork_at is None:
+            fork_at = base
         if cont is None:
             break
         cx, cy = samples[-1][0], samples[-1][1]
         face = math.atan2(samples[-1][3], samples[-1][2])
         current = cont
     length = samples[-1][4] if samples else 0.0
-    return length, branched, heading_span, samples
+    return length, fork_at, heading_span, samples
 
 
 # A usable excursion window: 60 m whose heading changes slower than this,
@@ -512,8 +525,10 @@ def gate_reason(
         for direction in directions
     ):
         return "narrow"
-    length, branched, span = _span(roads, road, x, y, heading, WINDOW_M)
-    if branched and length < JUNCTION_AHEAD_M:
+    length, fork_at, span = _span(roads, road, x, y, heading, WINDOW_M)
+    # Weaves stay in the lane, so a driveway does not block them.
+    # A lane change does not start when a fork is inside 40 m.
+    if phase != "weave" and fork_at is not None and fork_at < JUNCTION_AHEAD_M:
         return "junction"
     if length + 1e-3 < WINDOW_M:
         return "short"
@@ -662,7 +677,7 @@ def excursion_path(
     need = WINDOW_M
     lane_id = int(getattr(hit, "lane_id", 0) or 0)
     lane_w = getattr(hit, "lane_width_m", None)
-    _length, _branched, _span_h, samples = _chain(roads, road, x, y, heading, need, PATH_STEP_M)
+    _length, _fork, _span_h, samples = _chain(roads, road, x, y, heading, need, PATH_STEP_M)
     if len(samples) < 2 or samples[-1][4] + 1e-3 < need * 0.85:
         return None, int(move.direction)
     for direction in directions:

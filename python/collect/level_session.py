@@ -668,6 +668,31 @@ def _network_spec(bng: Any) -> Any:
     return None
 
 
+def recover_points(
+    pos: tuple[float, float, float] | None,
+    spawn: tuple[float, float, float] | None,
+) -> list[tuple[float, float, float]]:
+    """Where to look for a centerline after a stall. The car's own point first.
+
+    The italy lane change stopped near (165, -849). Snapping the original
+    spawn instead threw the car back to the start, and the next pose tipped.
+    """
+    points: list[tuple[float, float, float]] = []
+    for raw in (pos, spawn):
+        if raw is None or len(raw) < 3:
+            continue
+        try:
+            point = (float(raw[0]), float(raw[1]), float(raw[2]))
+        except (TypeError, ValueError):
+            continue
+        if not all(math.isfinite(v) for v in point):
+            continue
+        if points and all(abs(point[i] - points[0][i]) < 1.0 for i in range(3)):
+            continue
+        points.append(point)
+    return points
+
+
 def snap_to_road(
     bng: Any,
     near: tuple[float, float, float] | None,

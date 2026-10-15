@@ -762,6 +762,7 @@ def main(argv: list[str] | None = None) -> int:
         def _abort(reason: str) -> int | None:
             """Stop this segment. The first failure respawns. The second exits."""
             nonlocal segment_aborts, last_error, clock, last_ai, held_tag, prev_dir, prev_dir_t, spawn_pos
+            nonlocal segment_open, follow, label_hit
             segment_aborts += 1
             print(f"collect abort {reason} segment={segment_id}", flush=True)
             last_error = f"{segment_id} {reason}"
@@ -773,12 +774,16 @@ def main(argv: list[str] | None = None) -> int:
                 _write_collect_crash(status_root, message, {})
                 print(f"collect stop {message}", flush=True)
                 return 2
-            from python.collect.level_session import place_vehicle, snap_to_road
+            from python.collect.level_session import place_vehicle, recover_points, snap_to_road
 
-            near = spawn_pos
-            if near is None and isinstance(pos, (list, tuple)) and len(pos) >= 3:
-                near = (float(pos[0]), float(pos[1]), float(pos[2]))
-            placed = None if near is None else snap_to_road(bng, near)
+            here = None
+            if isinstance(pos, (list, tuple)) and len(pos) >= 3:
+                here = (float(pos[0]), float(pos[1]), float(pos[2]))
+            placed = None
+            for near in recover_points(here, spawn_pos):
+                placed = snap_to_road(bng, near)
+                if placed is not None:
+                    break
             if placed is None:
                 message = f"{segment_id} aborted: {reason}; no road pose to respawn"
             else:
@@ -798,6 +803,9 @@ def main(argv: list[str] | None = None) -> int:
                     held_tag = None
                     prev_dir = None
                     prev_dir_t = None
+                    follow = RoadFollow()
+                    label_hit = None
+                    segment_open = False
                     spawn_pos = moved
                     return None
             last_error = message

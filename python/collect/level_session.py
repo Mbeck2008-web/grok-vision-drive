@@ -17,16 +17,26 @@ from typing import Any, Callable
 
 from python.debug.gt_geom import project_road
 
-# BeamNGpy's west_coast_usa highway example. Used when that point still lies on a road.
+# Poses taken from BeamNGpy examples, not from a zeroed info.json spawn.
+# west_coast_usa: examples/west_coast_IMU.py and the README.
+# italy: examples/feature_overview.ipynb and examples/GPS_trajectory.py.
+# east_coast_usa: examples/east_coast_random.py.
+# hirochi_raceway: examples/ai_waypoints.py.
+# gridmap_v2: examples/ultrasonic_demo.py.
+# small_island: BeamNGRL's small_island start pose.
 KNOWN_SPAWNS: dict[str, tuple[tuple[float, float, float], tuple[float, float, float, float]]] = {
     "west_coast_usa": ((-717.121, 101.0, 118.675), (0.0, 0.0, 0.3826834, 0.9238795)),
+    "italy": ((245.11, -906.94, 247.46), (0.0010, 0.1242, 0.9884, -0.0872)),
+    "east_coast_usa": ((-426.68, -43.59, 31.11), (0.0, 0.0, 1.0, 0.0)),
+    "hirochi_raceway": ((-408.5, 260.2, 25.22), (-0.006664, -0.002505, -0.2799, 0.96)),
+    "gridmap_v2": ((531.91, 263.99, 100.3), (0.0053479, 0.0082936, 0.7021236, 0.7119867)),
+    "small_island": ((-67.0, 336.0, 34.5), (0.0, 0.0, 0.3826834, 0.9238795)),
 }
 ROAD_WAIT_S = 8.0
 PLAYER_WAIT_S = 8.0
 POLL_S = 0.5
 SPAWN_Z_M = 250.0
-# Used only so a scenario can start. The car is moved onto a centerline after.
-DEFAULT_SPAWN = ((0.0, 0.0, 50.0), (0.0, 0.0, 0.0, 1.0))
+SCENARIO_TIMEOUT_S = 120.0
 
 
 @dataclass
@@ -223,6 +233,13 @@ def choose_spawn(level: str, roads: list[Any]) -> tuple[tuple[float, float, floa
     return road_spawn(roads)
 
 
+def spawn_is_origin(pos: tuple[float, float, float] | None) -> bool:
+    """True for a missing point or the (0, 0, 0) info.json parse."""
+    if pos is None or len(pos) < 3:
+        return True
+    return abs(float(pos[0])) + abs(float(pos[1])) + abs(float(pos[2])) < 1.0
+
+
 class ScriptScenario:
     """Scenario stand-in used when ``beamngpy`` cannot be imported."""
 
@@ -231,24 +248,41 @@ class ScriptScenario:
         self.name = name
         self.pos = pos
         self.rot = rot
+        self.path: str | None = None
+        self.made = False
         self.vehicles = [("gvd_ego", pos, rot)]
+        self.safe_spawn = True
 
     def make(self, bng: Any) -> None:
         del bng
+        self.made = True
+        self.path = f"script/{self.level}/{self.name}"
 
 
-def make_collect_scenario(level: str, pos: tuple[float, float, float], rot: tuple[float, float, float, float]) -> Any:
+def _add_vehicle(scenario: Any, vehicle: Any, pos: tuple[float, float, float], rot: tuple[float, float, float, float]) -> None:
+    """``safe_spawn`` is the current flag. ``cling`` only remains for older BeamNGpy."""
+    try:
+        scenario.add_vehicle(vehicle, pos=pos, rot_quat=rot, safe_spawn=True)
+        return
+    except TypeError:
+        scenario.add_vehicle(vehicle, pos=pos, rot_quat=rot)
+
+
+def make_collect_scenario(
+    level: str,
+    pos: tuple[float, float, float],
+    rot: tuple[float, float, float, float],
+    *,
+    name: str,
+) -> Any:
     """A one-vehicle scenario. The real BeamNGpy classes are used when they import."""
     try:
         from beamngpy import Scenario, Vehicle  # type: ignore
     except Exception:
-        return ScriptScenario(level, "gvd_collect", pos, rot)
-    scenario = Scenario(level, "gvd_collect", description="GVD scene collect")
+        return ScriptScenario(level, name, pos, rot)
+    scenario = Scenario(level, name, description="GVD scene collect")
     vehicle = Vehicle("gvd_ego", model="etk800")
-    try:
-        scenario.add_vehicle(vehicle, pos=pos, rot_quat=rot, cling=True)
-    except TypeError:
-        scenario.add_vehicle(vehicle, pos=pos, rot_quat=rot)
+    _add_vehicle(scenario, vehicle, pos, rot)
     return scenario
 
 
@@ -292,36 +326,70 @@ def _scenario_ops(bng: Any) -> tuple[Callable[..., Any] | None, Callable[..., An
     return (load if callable(load) else None), (start if callable(start) else None)
 
 
+def widen_scenario_timeout(bng: Any, seconds: float = SCENARIO_TIMEOUT_S) -> None:
+    """One scenario load can sit longer than the 10 s Hello cap. Big maps need about 120 s."""
+    from python.sensors.tech import widen_socket_timeout
+
+    widen_socket_timeout(bng, float(seconds))
+    conn = getattr(bng, "connection", None)
+    if conn is not None:
+        for name in ("timeout", "socket_timeout"):
+            try:
+                setattr(conn, name, float(seconds))
+            except Exception:
+                pass
+
+
 def spawn_scenario(bng: Any, level: str, pos: tuple[float, float, float], rot: tuple[float, float, float, float]) -> str:
-    """``Scenario.add_vehicle`` / ``make`` / ``load`` / ``start``. Empty string on a queued start."""
+    """``make``, then ``load_scenario``, then ``start_scenario``. One retry after a timeout.
+
+    ``make`` has to set ``scenario.path``. Loading without that path is the
+    ``Scenario not found, empty path`` error.
+    """
     clean = level_token(level)
     if not clean:
         return "spawn needs a level name"
-    try:
-        scenario = make_collect_scenario(clean, pos, rot)
-    except Exception as exc:
-        if is_session_error(exc) or isinstance(exc, (TypeError, ValueError, AttributeError)):
-            return session_text(exc)
-        raise
-    make = getattr(scenario, "make", None)
-    if callable(make):
+    if spawn_is_origin(pos):
+        return f"refusing origin spawn for {clean}"
+    last = "scenario did not start"
+    for attempt, name in enumerate((f"gvd_collect_{clean}", f"gvd_collect_{clean}_retry"), start=1):
+        widen_scenario_timeout(bng, SCENARIO_TIMEOUT_S)
+        try:
+            scenario = make_collect_scenario(clean, pos, rot, name=name)
+        except Exception as exc:
+            if is_session_error(exc) or isinstance(exc, (TypeError, ValueError, AttributeError)):
+                last = session_text(exc)
+                continue
+            raise
+        make = getattr(scenario, "make", None)
+        if not callable(make):
+            return "scenario has no make()"
         try:
             make(bng)
         except Exception as exc:
-            if not is_session_error(exc) and not isinstance(exc, (TypeError, ValueError, AttributeError, OSError)):
-                raise
-    load, start = _scenario_ops(bng)
-    if load is None:
-        return "no scenario load"
-    try:
-        load(scenario)
-        if start is not None:
-            start()
-    except Exception as exc:
-        if is_session_error(exc) or isinstance(exc, (TypeError, ValueError, AttributeError)):
-            return session_text(exc)
-        raise
-    return ""
+            if is_session_error(exc) or isinstance(exc, (TypeError, ValueError, AttributeError, OSError)):
+                last = session_text(exc)
+                continue
+            raise
+        if not getattr(scenario, "path", None):
+            last = "scenario.make() did not set a path"
+            continue
+        load, start = _scenario_ops(bng)
+        if load is None:
+            return "no scenario load"
+        try:
+            load(scenario)
+            if start is not None:
+                start()
+            return ""
+        except Exception as exc:
+            if is_session_error(exc) or isinstance(exc, (TypeError, ValueError, AttributeError)):
+                last = session_text(exc)
+                if attempt == 2:
+                    return last
+                continue
+            raise
+    return last
 
 
 def spawn_direct(bng: Any, pos: tuple[float, float, float], rot: tuple[float, float, float, float]) -> str:
@@ -339,7 +407,7 @@ def spawn_direct(bng: Any, pos: tuple[float, float, float], rot: tuple[float, fl
             fn = getattr(getattr(bng, "vehicles", None), "spawn", None)
         if callable(fn):
             try:
-                fn(vehicle, pos, rot_quat=rot, cling=True)
+                fn(vehicle, pos, rot_quat=rot, safe_spawn=True)
                 return ""
             except TypeError:
                 try:
@@ -516,59 +584,15 @@ def official_spawn(bng: Any, level: str) -> tuple[tuple[float, float, float], tu
 
 
 def resolve_spawn(bng: Any, level: str) -> tuple[tuple[float, float, float], tuple[float, float, float, float], str]:
-    """Where to place ``etk800`` so the scenario can start."""
+    """Table pose first. An info.json point is used only when it is not the origin."""
     clean = level_token(level)
-    official = official_spawn(bng, clean)
-    if official is not None:
-        return official[0], official[1], "info"
     known = KNOWN_SPAWNS.get(clean)
-    if known is not None:
+    if known is not None and not spawn_is_origin(known[0]):
         return known[0], known[1], "known"
-    return DEFAULT_SPAWN[0], DEFAULT_SPAWN[1], "default"
-
-
-def teleport_vehicle(
-    bng: Any,
-    vehicle: Any,
-    pos: tuple[float, float, float],
-    rot: tuple[float, float, float, float],
-) -> str:
-    """Move the player onto a centerline. Empty string when the call was queued."""
-    fn = getattr(vehicle, "teleport", None)
-    if callable(fn):
-        try:
-            fn(pos, rot_quat=rot, reset=True)
-            return ""
-        except TypeError:
-            try:
-                fn(pos, rot_quat=rot)
-                return ""
-            except Exception as exc:
-                if not is_session_error(exc) and not isinstance(exc, TypeError):
-                    raise
-        except Exception as exc:
-            if not is_session_error(exc):
-                raise
-    x, y, z = pos
-    qx, qy, qz, qw = rot
-    return _send(
-        bng,
-        "local v = be:getPlayerVehicle(0) "
-        "if v then "
-        f"local x, y = {x:.2f}, {y:.2f} "
-        f"local z = {z:.2f} "
-        "local ok, h = pcall(be.getSurfaceHeightBelow, be, vec3(x, y, 2000)) "
-        "if ok and type(h) == 'number' then z = h + 0.6 end "
-        f"v:setPositionRotation(x, y, z, {qx:.5f}, {qy:.5f}, {qz:.5f}, {qw:.5f}) "
-        "end",
-    )
-
-
-def _on_road(roads: list[Any], pos: tuple[float, float, float] | None) -> bool:
-    if pos is None or not roads:
-        return False
-    hit = project_road(list(roads), float(pos[0]), float(pos[1]), None)
-    return hit is not None and not bool(hit.off_road)
+    official = official_spawn(bng, clean)
+    if official is not None and not spawn_is_origin(official[0]):
+        return official[0], official[1], "info"
+    return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0), "missing"
 
 
 def begin_level(bng: Any, level: str) -> OpenedLevel:
@@ -587,6 +611,8 @@ def begin_level(bng: Any, level: str) -> OpenedLevel:
             detail = player_note or note or "no vehicle after load"
             return OpenedLevel(vehicle, list(roads or []), detail, None, "current")
         pos, rot, source = resolve_spawn(bng, clean)
+        if source == "missing" or spawn_is_origin(pos):
+            return OpenedLevel(None, [], f"no known spawn for {clean}", pos, source)
         print(
             f"collect spawn {clean} source={source} ({pos[0]:.1f},{pos[1]:.1f},{pos[2]:.1f})",
             flush=True,
@@ -618,19 +644,6 @@ def begin_level(bng: Any, level: str) -> OpenedLevel:
         if not roads:
             detail = note or "no road network"
             return OpenedLevel(vehicle, [], f"no road network after loading {clean} ({detail})", pos, source)
-        if source == "default" or not _on_road(roads, pos):
-            spot = road_spawn(list(roads))
-            if spot is not None:
-                moved, mrot = spot
-                print(
-                    f"collect teleport {clean} ({moved[0]:.1f},{moved[1]:.1f},{moved[2]:.1f})",
-                    flush=True,
-                )
-                shift = teleport_vehicle(bng, vehicle, moved, mrot)
-                if shift:
-                    return OpenedLevel(vehicle, list(roads), shift, pos, source)
-                pos = moved
-                source = "centerline"
         return OpenedLevel(vehicle, list(roads), "", pos, source)
     except Exception as exc:
         if is_session_error(exc) or isinstance(exc, (TypeError, ValueError, AttributeError)):

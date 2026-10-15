@@ -29,6 +29,7 @@ Excursions (weaves, lane changes, recoveries) are on unless
 is a smoke collect: if those PNGs do not decode, the process stops.
 ``--check-maps`` loads each level as a scenario and exits without recording.
 
+    py -3 scripts\\collect_scene_lanes.py --check-maps --list-levels
     py -3 scripts\\collect_scene_lanes.py --check-maps --maps west_coast_usa,italy,east_coast_usa,utah,jungle_rock_island
     py -3 scripts\\collect_scene_lanes.py --minutes 120 --maps west_coast_usa,italy,east_coast_usa,utah,jungle_rock_island --segment-min 12 --smoke-s 60 --speed-min 8 --speed-max 17
 """
@@ -231,6 +232,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Load each map, print spawn, road edges, and cameras, then exit.",
     )
+    parser.add_argument(
+        "--list-levels",
+        action="store_true",
+        help="With --check-maps, print installed level names and which have a spawn table, then exit.",
+    )
     return parser
 
 
@@ -387,18 +393,48 @@ def format_check_line(level: str, opened: Any) -> str:
     return line
 
 
-def run_map_checks(bng: Any, levels: tuple[str, ...] | list[str], cfg: dict[str, Any]) -> int:
+def run_map_checks(
+    bng: Any,
+    levels: tuple[str, ...] | list[str],
+    cfg: dict[str, Any],
+    skipped: list[str] | None = None,
+) -> int:
     """Load each level, report spawn/edges/cameras, and exit. No recording."""
+    from python.data.data_root import logs_dir, use_data_disk
+
     failed = 0
     cams: dict[str, Any] = {}
+    lines = [f"collect skip level {name} (not in this Tech install)" for name in (skipped or [])]
     for level in levels:
         opened = enter_map(bng, level, cfg, cams)
         cams = dict(getattr(opened, "cameras", None) or {})
-        print(format_check_line(level, opened), flush=True)
+        line = format_check_line(level, opened)
+        print(line, flush=True)
+        lines.append(line)
         if opened.error or not opened.roads or not opened.cameras:
             failed += 1
     drop_cameras(cams)
+    if use_data_disk():
+        path = logs_dir() / "check_maps.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print(f"collect check log {path}", flush=True)
     return 2 if failed else 0
+
+
+def list_installed_levels(bng: Any) -> int:
+    """Print every level Tech reports, and whether this repo has a spawn pose for it."""
+    from python.collect.level_session import KNOWN_SPAWNS, installed_levels
+
+    names, note = installed_levels(bng)
+    if not names:
+        print(f"collect level list unavailable ({note})", flush=True)
+        return 2
+    print(f"collect levels {len(names)}", flush=True)
+    for name in sorted(names):
+        pose = "known" if name in KNOWN_SPAWNS else "no-spawn-table"
+        print(f"collect level {name} {pose}", flush=True)
+    return 0
 
 
 def record_session_failure(status_root: Any, message: str) -> None:
@@ -570,27 +606,30 @@ def main(argv: list[str] | None = None) -> int:
         record_session_failure(status_root, session_text(exc))
         print(f"collect stop {session_text(exc)}", flush=True)
         return 2
-    widen_socket_timeout(bng, 90.0)
+    widen_socket_timeout(bng, 120.0)
     writer = None
     try:
+        skipped_levels: list[str] = []
         if map_names:
             installed, list_note = installed_levels(bng)
             if installed is None:
                 print(f"collect level list unavailable ({list_note}); trying the requested maps", flush=True)
             else:
-                kept, skipped = select_maps(map_names, installed)
-                for name in skipped:
+                kept, skipped_levels = select_maps(map_names, installed)
+                for name in skipped_levels:
                     print(f"collect skip level {name} (not in this Tech install)", flush=True)
                 map_names = tuple(kept)
-                if not map_names:
+                if not map_names and not args.list_levels:
                     message = "none of the requested maps are in this Tech install"
                     record_session_failure(status_root, message)
                     print(f"collect stop {message}", flush=True)
                     return 2
         elif args.reload_level:
             print(f"collect reload level={args.reload_level}", flush=True)
+        if args.list_levels:
+            return list_installed_levels(bng)
         if args.check_maps:
-            code = run_map_checks(bng, map_names, cam_cfg)
+            code = run_map_checks(bng, map_names, cam_cfg, skipped_levels)
             if code != 0:
                 record_session_failure(status_root, "check-maps failed")
             return code

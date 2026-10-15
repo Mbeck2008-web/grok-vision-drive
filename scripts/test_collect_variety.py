@@ -532,14 +532,51 @@ def check_level_load_spawns_and_switches() -> None:
         opened2 = collect.enter_map(host, "italy", {}, opened.cameras)
         assert opened2.error == "", opened2.error
         assert opened2.vehicle is host.ego and opened2.roads
-        assert opened2.spawn_source == "centerline"
+        assert opened2.spawn_source == "known"
+        assert abs(float(opened2.spawn[1]) + 906.94) < 0.05
         assert len(attached) == 2 and len(opened2.cameras) == 8
         assert len(removed) == 8
         assert host.scenario.starts == 2
         assert host.road_reads >= 2
         assert host.early_road is False
-        assert any("setPositionRotation" in line for line in host.commands)
+        assert host.scenario.loaded[0].made and host.scenario.loaded[1].made
+        assert host.scenario.loaded[0].path
+        assert not any("setPositionRotation" in line for line in host.commands)
         assert not any("startFreeroam" in line for line in host.commands)
+        from python.collect.level_session import begin_level, resolve_spawn, spawn_is_origin
+
+        class _Zero:
+            def get_levels(self) -> dict[str, object]:
+                return {"italy": {"spawnPoints": [{"pos": [0, 0, 0]}]}}
+
+            def queue_lua_command(self, *args: object, **kwargs: object) -> str:
+                del args, kwargs
+                return "0.000 0.000 0.000 0 0 0 1"
+
+        pos, _rot, source = resolve_spawn(_Zero(), "italy")
+        assert source == "known" and abs(pos[1] + 906.94) < 0.05
+        pos, _rot, source = resolve_spawn(_Zero(), "east_coast_usa")
+        assert source == "known" and abs(pos[0] + 426.68) < 0.05
+        pos, _rot, source = resolve_spawn(_Zero(), "jungle_rock_island")
+        assert source == "missing" and spawn_is_origin(pos)
+
+        class _Once(_ScenarioApi):
+            def __init__(self, owner: _Host) -> None:
+                super().__init__(owner)
+                self.loads = 0
+
+            def load(self, scenario: object) -> None:
+                self.loads += 1
+                self.loaded.append(scenario)
+                if self.loads == 1:
+                    raise TimeoutError("timed out")
+
+        flaky = _Host(spawn_works=True, levels={"italy": {}})
+        flaky.scenario = _Once(flaky)
+        retried = begin_level(flaky, "italy")
+        assert retried.error == "", retried.error
+        assert flaky.scenario.loads == 2
+        assert flaky.scenario.loaded[-1].made
     finally:
         collect._attach_cameras = previous_attach
         _restore_clock(level_session, previous)
@@ -677,10 +714,39 @@ def check_map_preflight() -> None:
             assert code == 0, (code, text)
             assert "collect skip level utah" in text
             assert "collect check west_coast_usa" in text and "source=known" in text
-            assert "collect check italy" in text and "edges=" in text and "cameras=8" in text
+            assert "collect check italy" in text and "source=known" in text and "cameras=8" in text
+            log = root / "logs" / "check_maps.txt"
+            assert log.is_file() and "collect check west_coast_usa" in log.read_text(encoding="utf-8")
             assert host.early_road is False
             assert host.scenario.starts == 2
             assert "startFreeroam" not in text
+            listed = _Host(
+                spawn_works=True,
+                levels={
+                    "west_coast_usa": {},
+                    "italy": {},
+                    "gridmap_v2": {},
+                    "automation_test_track": {},
+                    "hirochi_raceway": {},
+                    "small_island": {},
+                    "derby": {},
+                },
+            )
+            tech.open_tech_beamngpy = lambda *a, **k: listed  # type: ignore[assignment]
+            buf = io.StringIO()
+            sys.stdout = buf
+            try:
+                listed_code = collect.main(
+                    ["--check-maps", "--list-levels", "--data-dir", str(root), "--out", str(root / "scene")]
+                )
+            finally:
+                sys.stdout = old_out
+            listed_text = buf.getvalue()
+            assert listed_code == 0, listed_text
+            assert "collect level gridmap_v2 known" in listed_text
+            assert "collect level derby no-spawn-table" in listed_text
+            assert "collect level automation_test_track no-spawn-table" in listed_text
+            assert listed.scenario.starts == 0
     finally:
         _restore_clock(level_session, previous)
 

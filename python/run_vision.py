@@ -291,10 +291,11 @@ def main() -> None:
     )
     ap.add_argument(
         "--lane-source",
-        default="hough",
-        choices=["hough", "scene"],
+        default=os.environ.get("GVD_LANE_SOURCE", "hough"),
+        choices=["hough", "scene", "gt"],
         help="hough keeps the pixel lane finder. scene reads lane_x from models/e2e_scene.onnx "
-        "and stops when that confidence is low.",
+        "and stops when that confidence is low. gt feeds the road-network center at 8 m "
+        "as lane_x (GVD_LANE_SOURCE=gt). A missing road hit stops.",
     )
     ap.add_argument(
         "--scene-onnx",
@@ -558,6 +559,8 @@ def main() -> None:
                 f"[GVD] lane source=scene onnx={scene_lane.path} ready={scene_lane.ready} ({scene_lane.reason})",
                 flush=True,
             )
+        elif args.lane_source == "gt":
+            print("[GVD] lane source=gt road-network center at 8 m", flush=True)
         while True:
             loop_t0 = time.perf_counter()
             tick_dt: float | None = None
@@ -734,9 +737,33 @@ def main() -> None:
             )
 
             scene_stop = False
+            gt_stop = False
             scene_lane_x = None
             scene_conf = None
-            if scene_lane is not None:
+            if args.lane_source == "gt":
+                from python.train.scene_lane_runtime import straight_lane_path
+
+                gt_x = None
+                if gt_log is not None:
+                    gt_x = gt_log.center_x(
+                        vdata,
+                        bng,
+                        socket_busy=bool(getattr(bundle, "grab_read_blocked", False)),
+                    )
+                if gt_x is None:
+                    gt_stop = True
+                    pout.path_ego = []
+                    pout.lane_conf = 0.0
+                    pout.path_conf = 0.0
+                    pout.lane_source = "gt/stop"
+                else:
+                    pout.path_ego = straight_lane_path(float(gt_x))
+                    pout.lane_conf = 1.0
+                    pout.path_conf = 1.0
+                    pout.lane_source = "gt"
+                    pout.path_debug_preview = False
+                    pout.frame_age_s = 0.0
+            elif scene_lane is not None:
                 from python.data.strip_writer import compose_strip
                 from python.train.scene_lane_runtime import (
                     scene_lane_decision,
@@ -790,6 +817,8 @@ def main() -> None:
             cmd = tick.applied
             if scene_stop:
                 cmd = stop_command(seq=cmd_seq, reason="scene_lane_low")
+            elif gt_stop:
+                cmd = stop_command(seq=cmd_seq, reason="gt_lane_missing")
 
             if not ident.matched:
                 disengage_reason = "bus_mismatch"

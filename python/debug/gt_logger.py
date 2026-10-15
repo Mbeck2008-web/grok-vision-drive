@@ -390,6 +390,24 @@ class GroundTruthLogger:
             self._road_note = note
             print(f"[GVD] gt roads: {note}", flush=True)
 
+    def center_x(self, vdata: Any, bng: Any = None, socket_busy: bool = False) -> float | None:
+        """Road-network center at 8 m, the same number the log stores as ``gt_center_x``.
+
+        Off-road or a missing pose is None. The caller does not invent a lane.
+        """
+        self._ensure_roads(bng, socket_busy)
+        if not self._roads:
+            return None
+        pos, heading, _speed = _pose(vdata)
+        if pos is None:
+            return None
+        hit = project_road(self._roads, pos[0], pos[1], heading)
+        if hit is None or hit.off_road or hit.lane_offset_m is None:
+            return None
+        if hit.lane_width_m is None or float(hit.lane_width_m) <= 0.0:
+            return None
+        return float(ego_center_x(hit.lane_offset_m, hit.heading_err_rad, 8.0))
+
     def write(
         self,
         *,

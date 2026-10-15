@@ -100,13 +100,23 @@ def _newest_log(since: float) -> Path | None:
     return max(found, key=lambda p: p.stat().st_mtime)
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Live lane-keep check on a running BeamNG.tech")
     ap.add_argument("--seconds", type=float, default=30.0, help="Engaged seconds")
     ap.add_argument("--min-in-lane", type=float, default=80.0, help="Required engaged in-lane percent")
     ap.add_argument("--host", default=None)
     ap.add_argument("--port", type=int, default=None)
-    args = ap.parse_args(argv)
+    ap.add_argument(
+        "--lane-source",
+        default=os.environ.get("GVD_LANE_SOURCE", "hough"),
+        choices=["hough", "scene", "gt"],
+        help="gt feeds the road-network center at 8 m as lane_x.",
+    )
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
 
     from python.debug.gt_summary import (
         distance_failure,
@@ -155,11 +165,13 @@ def main(argv: list[str] | None = None) -> int:
         env["GVD_TECH_LAUNCH"] = "0"
         env["GVD_BEAMNG"] = "1"
         env["GVD_BACKEND"] = "beamngpy"
+        env["GVD_LANE_SOURCE"] = str(args.lane_source)
         env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
         sup = subprocess.Popen(
             [
                 sys.executable, "-u", str(ROOT / "python" / "run_vision.py"),
                 "--backend", "beamngpy", "--gt-log", "--hz", "10", "--encode", "cpu",
+                "--lane-source", str(args.lane_source),
             ],
             cwd=str(ROOT),
             env=env,

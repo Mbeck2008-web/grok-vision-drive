@@ -121,6 +121,16 @@ the one the live log uses.
 `--check-targets` only checks that the file has targets. It does not
 need PyTorch.
 
+## Controller with perfect lanes
+
+```
+py -3 scripts\live_lane_test.py --lane-source gt --seconds 120 --min-in-lane 80
+```
+
+`GVD_LANE_SOURCE=gt` does the same thing. The supervisor uses the road-network center at 8 m as `lane_x` and stops when that hit is missing. Scene-net lanes stay off this path.
+
+On the saved logs, engaged ticks with `|steer|>=0.95` are 0 of 1186 across runs 5, 6, 7, and 9. Run 8 (the reverse) is 6 of 28 and is not in that share. Run 10's log is not in the tree. An offline bicycle with that same 8 m center holds a straight road and a 200 m curve for 120 s and more than 300 m.
+
 ## Live
 
 ```

@@ -289,6 +289,18 @@ def main() -> None:
         action="store_true",
         help="Sim ground truth JSONL under logs/ (or set GVD_GT_LOG=1). Off in normal play.",
     )
+    ap.add_argument(
+        "--lane-source",
+        default="hough",
+        choices=["hough", "scene"],
+        help="hough keeps the pixel lane finder. scene reads lane_x from models/e2e_scene.onnx "
+        "and stops when that confidence is low.",
+    )
+    ap.add_argument(
+        "--scene-onnx",
+        default="",
+        help="Scene-net ONNX path. Empty uses models/e2e_scene.onnx.",
+    )
     args = ap.parse_args()
 
     if args.vision_only:
@@ -529,6 +541,15 @@ def main() -> None:
         gt_log = GroundTruthLogger.open()
         print(f"[GVD] ground truth -> {gt_log.path}", flush=True)
     try:
+        scene_lane = None
+        if args.lane_source == "scene":
+            from python.train.scene_lane_runtime import SceneLaneRuntime
+
+            scene_lane = SceneLaneRuntime(args.scene_onnx or None)
+            print(
+                f"[GVD] lane source=scene onnx={scene_lane.path} ready={scene_lane.ready} ({scene_lane.reason})",
+                flush=True,
+            )
         while True:
             loop_t0 = time.perf_counter()
             tick_dt: float | None = None
@@ -704,6 +725,28 @@ def main() -> None:
                 engage_hz_grace_floor=shadow_cfg.engage_hz_grace_floor,
             )
 
+            scene_stop = False
+            if scene_lane is not None:
+                from python.data.strip_writer import compose_strip
+                from python.train.scene_lane_runtime import (
+                    scene_lane_decision,
+                    straight_lane_path,
+                )
+
+                frames = getattr(bundle, "frames", None)
+                strip = compose_strip(frames if isinstance(frames, dict) else None)
+                lane_hat, conf = scene_lane.observe(strip, tick_dt)
+                if scene_lane_decision(lane_hat, conf) != "lane":
+                    scene_stop = True
+                    pout.path_ego = []
+                    pout.lane_conf = float(conf)
+                    pout.lane_source = "scene/stop"
+                else:
+                    pout.path_ego = straight_lane_path(float(lane_hat))
+                    pout.lane_conf = float(conf)
+                    pout.path_conf = float(conf)
+                    pout.lane_source = "scene"
+                    pout.path_debug_preview = False
             cmd_seq += 1
             wide = None
             try:
@@ -733,6 +776,8 @@ def main() -> None:
                 engage_age_s=engage_age_s,
             )
             cmd = tick.applied
+            if scene_stop:
+                cmd = stop_command(seq=cmd_seq, reason="scene_lane_low")
 
             if not ident.matched:
                 disengage_reason = "bus_mismatch"

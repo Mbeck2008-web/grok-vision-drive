@@ -99,6 +99,7 @@ def bad_row_reasons(rows: list[Mapping[str, Any]]) -> dict[int, str]:
     slow_ids: list[int] = []
     slow_s = 0.0
     prev_damage: float | None = None
+    prev_segment = ""
     for row in rows:
         try:
             index = int(row.get("i"))
@@ -114,12 +115,23 @@ def bad_row_reasons(rows: list[Mapping[str, Any]]) -> dict[int, str]:
         if damage is not None:
             prev_damage = damage
         speed = _num(ego.get("speed_mps"))
+        segment = str(row.get("segment") or "")
+        switched = bool(segment and prev_segment and segment != prev_segment)
+        if segment:
+            prev_segment = segment
+        if switched:
+            # The map load sits in the first dt of the new segment.
+            slow_ids = []
+            slow_s = 0.0
         # Missing speed is not a stall. Rows written before this field
         # existed would otherwise be thrown out.
         stalled = speed is not None and speed < STALL_SPEED_MPS
         if stalled:
             slow_ids.append(index)
-            slow_s += max(0.0, _num(row.get("dt_s")) or 0.0)
+            step = max(0.0, _num(row.get("dt_s")) or 0.0)
+            if switched and step > 2.0:
+                step = 0.0
+            slow_s += step
             if slow_s > STALL_S:
                 for item in slow_ids:
                     reasons.setdefault(item, "stationary")

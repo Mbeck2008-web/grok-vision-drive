@@ -335,14 +335,12 @@ def check_stuck_car_aborts_without_weaving() -> None:
     assert text.count("collect abort stationary") == 2
     assert "aborted twice: stationary" in text
     assert "collect recover" in text
+    assert "weave" not in text
     assert any("0.90" in line for line in bng.commands), bng.commands
     assert not any("250.00" in line for line in bng.commands)
-    rows = [json.loads(line) for line in (out / "state.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
-    phases = [(row.get("excursion") or {}).get("phase") for row in rows]
-    assert len(rows) >= 15, len(rows)
-    assert set(phases) == {"cruise"}, phases
+    assert not (out / "state.jsonl").is_file()
     assert any("ai.setSpeed" in line for line in vehicle.commands)
-    print(f"stuck abort rows={len(rows)} phases={set(phases)}")
+    print("stuck abort wrote nothing")
 
 
 def check_tipped_car_exits() -> None:
@@ -378,8 +376,57 @@ def check_tipped_car_exits() -> None:
     print("tipped abort wrote nothing")
 
 
+def check_masked_labels_and_map_switch() -> None:
+    from python.debug.dataset_check import _issues_for_row
+    from python.debug.lane_targets import tech_from_hit
+
+    masked_tech = tech_from_hit(None, None, None, True)
+    issues, _t, _i, _seg, masked = _issues_for_row(
+        {"i": 0, "t": 0.0, "tech": masked_tech, "ego": {"speed_mps": 8.0}},
+        None,
+        None,
+        "",
+    )
+    assert masked and not any("NaN" in item for item in issues), issues
+    gap_issues, *_rest = _issues_for_row(
+        {
+            "i": 1,
+            "t": 35.0,
+            "dt_s": 35.0,
+            "segment": "italy#1",
+            "tech": tech_from_hit(0.2, 0.0, 3.5, False),
+            "ego": {"speed_mps": 8.0, "dir": [0.0, 1.0, 0.0]},
+        },
+        0.0,
+        0,
+        "west_coast_usa#0",
+    )
+    assert not any("gap" in item for item in gap_issues), gap_issues
+    same, *_rest = _issues_for_row(
+        {
+            "i": 1,
+            "t": 35.0,
+            "dt_s": 35.0,
+            "segment": "italy#1",
+            "tech": tech_from_hit(0.2, 0.0, 3.5, False),
+            "ego": {"speed_mps": 8.0},
+        },
+        0.0,
+        0,
+        "italy#1",
+    )
+    assert any("gap" in item for item in same), same
+    switch = [
+        {"i": 0, "dt_s": 0.1, "segment": "west_coast_usa#0", "ego": {"speed_mps": 0.1, "dir": [0.0, 1.0, 0.0]}},
+        {"i": 1, "dt_s": 36.0, "segment": "italy#1", "ego": {"speed_mps": 0.1, "dir": [0.0, 1.0, 0.0]}},
+    ]
+    assert bad_row_reasons(switch) == {}
+    print("masked lane_gt and map switch are not issues")
+
+
 def main() -> None:
     check_guard_and_row_rules()
+    check_masked_labels_and_map_switch()
     check_snap_uses_node_z()
     check_validator_drops_parked_span()
     check_warmup_skips_partial_cameras()

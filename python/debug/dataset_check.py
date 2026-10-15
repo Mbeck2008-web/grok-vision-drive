@@ -54,7 +54,8 @@ def _issues_for_row(
     row: dict[str, Any],
     prev_t: float | None,
     prev_i: int | None = None,
-) -> tuple[list[str], float | None, int | None]:
+    prev_segment: str = "",
+) -> tuple[list[str], float | None, int | None, str, bool]:
     issues: list[str] = []
     idx = row.get("i")
     try:
@@ -70,11 +71,13 @@ def _issues_for_row(
     if t is not None and not math.isfinite(t):
         issues.append(f"row {idx}: t is not finite")
         t = None
+    segment = str(row.get("segment") or "")
+    switched = bool(segment and prev_segment and segment != prev_segment)
     if t is not None and prev_t is not None:
         gap = t - prev_t
         if gap < 0.0:
             issues.append(f"row {idx}: time went backwards by {gap:.3f}s")
-        elif gap > GAP_S:
+        elif gap > GAP_S and not switched:
             step = None if prev_i is None or this_i is None else this_i - prev_i
             if step == 1:
                 issues.append(
@@ -100,9 +103,15 @@ def _issues_for_row(
     values, mask = lane_gt_from_record(tech if isinstance(tech, dict) else None)
     if int(values.size) != LANE_GT_DIM:
         issues.append(f"row {idx}: lane_gt length {int(values.size)}")
+    masked_row = False
     for slot, value in enumerate(values.tolist()):
-        if not math.isfinite(float(value)):
-            issues.append(f"row {idx}: lane_gt[{slot}] is NaN or Inf")
+        if math.isfinite(float(value)):
+            continue
+        covered = slot < int(mask.size) and float(mask[slot]) <= 0.5
+        if covered:
+            masked_row = True
+            continue
+        issues.append(f"row {idx}: lane_gt[{slot}] is NaN or Inf")
     heading = float(values[12]) if values.size > 12 else 0.0
     if float(mask[12]) > 0.0 and abs(heading) > math.pi + 1e-3:
         issues.append(f"row {idx}: heading {heading:.3f} rad is outside [-pi, pi]")
@@ -121,7 +130,7 @@ def _issues_for_row(
                 issues.append(
                     f"row {idx}: {name} at {LOOKAHEADS_M[i]:.0f}m is {got:.1f} m"
                 )
-    return issues, t, this_i if t is not None else prev_i
+    return issues, t, this_i if t is not None else prev_i, segment or prev_segment, masked_row
 
 
 def _blank_counts(path: Path) -> tuple[dict[str, int] | None, str | None]:
@@ -170,11 +179,15 @@ def _validate_raw(
                 issues.append(f"row {idx}: missing raw frame for {cam_id}")
     prev_t: float | None = None
     prev_i: int | None = None
+    prev_segment = ""
     nan_rows = 0
+    masked_rows = 0
     for row in rows:
-        row_issues, prev_t, prev_i = _issues_for_row(row, prev_t, prev_i)
+        row_issues, prev_t, prev_i, prev_segment, masked = _issues_for_row(row, prev_t, prev_i, prev_segment)
         if any("NaN" in item or "not finite" in item for item in row_issues):
             nan_rows += 1
+        if masked:
+            masked_rows += 1
         issues.extend(row_issues)
     issues.extend(motion_issue_lines(rows))
     counts = raw_image_counts(raw_images)
@@ -230,6 +243,8 @@ def _validate_raw(
         "per_cam": counts["per_cam"],
         "frames_checked": checked,
         "nan_rows": nan_rows,
+        "masked_rows": masked_rows,
+        "masked_fraction": 0.0 if not rows else float(masked_rows) / float(len(rows)),
         "blank_frames": blank,
         "issues": issues,
         "issue_count": len(issues),
@@ -291,11 +306,15 @@ def _report_without_frames(
     issues = ["no raw frames and no strips"]
     prev_t: float | None = None
     prev_i: int | None = None
+    prev_segment = ""
     nan_rows = 0
+    masked_rows = 0
     for row in rows:
-        row_issues, prev_t, prev_i = _issues_for_row(row, prev_t, prev_i)
+        row_issues, prev_t, prev_i, prev_segment, masked = _issues_for_row(row, prev_t, prev_i, prev_segment)
         if any("NaN" in item or "not finite" in item for item in row_issues):
             nan_rows += 1
+        if masked:
+            masked_rows += 1
         issues.extend(row_issues)
     issues.extend(motion_issue_lines(rows))
     report = {
@@ -308,6 +327,8 @@ def _report_without_frames(
         "per_cam": {},
         "frames_checked": 0,
         "nan_rows": nan_rows,
+        "masked_rows": masked_rows,
+        "masked_fraction": 0.0 if not rows else float(masked_rows) / float(len(rows)),
         "blank_frames": {},
         "issues": issues,
         "issue_count": len(issues),
@@ -358,11 +379,15 @@ def validate_dataset(
         issues.append(f"jpeg with no state row {extra_jpeg[:8]}")
     prev_t: float | None = None
     prev_i: int | None = None
+    prev_segment = ""
     nan_rows = 0
+    masked_rows = 0
     for row in rows:
-        row_issues, prev_t, prev_i = _issues_for_row(row, prev_t, prev_i)
+        row_issues, prev_t, prev_i, prev_segment, masked = _issues_for_row(row, prev_t, prev_i, prev_segment)
         if any("NaN" in item or "not finite" in item for item in row_issues):
             nan_rows += 1
+        if masked:
+            masked_rows += 1
         issues.extend(row_issues)
     issues.extend(motion_issue_lines(rows))
     blank = {sec.cam_id: 0 for sec in SECTORS}
@@ -407,6 +432,8 @@ def validate_dataset(
         "jpegs": len(jpegs),
         "frames_checked": checked,
         "nan_rows": nan_rows,
+        "masked_rows": masked_rows,
+        "masked_fraction": 0.0 if not rows else float(masked_rows) / float(len(rows)),
         "blank_frames": blank,
         "issues": issues,
         "issue_count": len(issues),

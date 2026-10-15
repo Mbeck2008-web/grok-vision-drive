@@ -719,8 +719,10 @@ def check_map_preflight() -> None:
             assert "collect skip level utah" in text
             assert "collect check west_coast_usa" in text and "source=known" in text
             assert "collect check italy" in text and "source=known" in text and "cameras=8" in text
-            log = root / "logs" / "check_maps.txt"
-            assert log.is_file() and "collect check west_coast_usa" in log.read_text(encoding="utf-8")
+            logs = list((root / "logs").glob("check_maps_*.txt"))
+            assert len(logs) == 1, [path.name for path in (root / "logs").glob("*")]
+            assert "collect check west_coast_usa" in logs[0].read_text(encoding="utf-8")
+            assert logs[0].name != "check_maps.txt"
             assert host.early_road is False
             assert host.scenario.starts == 2
             assert "startFreeroam" not in text
@@ -755,9 +757,49 @@ def check_map_preflight() -> None:
         _restore_clock(level_session, previous)
 
 
+def check_windows_and_piece_boundaries() -> None:
+    """A decal split is not a junction, and a dead end does not start a weave."""
+    from python.collect.excursion import route_is_open
+    from python.debug.gt_geom import RoadFollow, follow_label
+
+    first = RoadPoly("a", [(0.0, float(i)) for i in range(0, 41)], 7.0)
+    second = RoadPoly("b", [(0.0, 40.0 + float(i)) for i in range(0, 200)], 7.0)
+    roads = [first, second]
+    hit = project_road(roads, -1.75, 36.0, math.pi / 2.0)
+    assert hit is not None
+    assert near_junction(hit) is True
+    assert near_junction(hit, roads, -1.75, 36.0, math.pi / 2.0) is False
+    assert route_is_open(roads, hit, -1.75, 36.0, math.pi / 2.0, "weave", 10.0)
+    points, _used = excursion_path(
+        roads, -1.75, 36.0, math.pi / 2.0, Excursion("weave", 0.4, 0.0, 1, ""), hit, 10.0,
+    )
+    assert points is not None and points[-1][1] > 40.0
+
+    dead = [RoadPoly("short", [(0.0, 0.0), (0.0, 30.0)], 7.0)]
+    dead_hit = project_road(dead, 0.0, 5.0, math.pi / 2.0)
+    assert route_is_open(dead, dead_hit, 0.0, 5.0, math.pi / 2.0, "weave", 10.0) is False
+    clock = ExcursionClock()
+    held = _advance(clock, CRUISE_S, window_ok=False)
+    assert held.phase == "cruise"
+
+    narrow = RoadPoly("n", [(2.0, 0.0), (2.0, 80.0)], 3.0)
+    wide = RoadPoly("w", [(0.0, 0.0), (0.0, 80.0)], 12.0)
+    follow = RoadFollow()
+    chosen, _mem, _jump = follow_label([narrow, wide], 3.2, 20.0, math.pi / 2.0, follow, 8.0, None)
+    assert chosen is not None and chosen.road_id == "w", chosen
+    nearest = project_road([narrow, wide], 3.2, 20.0, math.pi / 2.0)
+    assert nearest is not None and nearest.road_id == "n"
+    one = [RoadPoly("only", [(0.0, 0.0), (0.0, 400.0)], 3.5)]
+    one_hit = project_road(one, 0.0, 20.0, math.pi / 2.0)
+    assert route_is_open(one, one_hit, 0.0, 20.0, math.pi / 2.0, "weave", 8.0)
+    assert route_is_open(one, one_hit, 0.0, 20.0, math.pi / 2.0, "lane_change", 8.0) is False
+    print("windows skip dead ends and a one-lane weave still fits")
+
+
 def main() -> None:
     check_clock_and_junctions()
     check_paths_stay_on_the_road()
+    check_windows_and_piece_boundaries()
     check_segment_holdout()
     check_smoke_rate_and_flags()
     check_level_load_spawns_and_switches()

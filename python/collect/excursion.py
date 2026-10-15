@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from python.debug.gt_geom import CURVATURE_AHEAD_M, RoadPoly, lane_center_offsets
+from python.debug.gt_geom import CURVATURE_AHEAD_M, RoadPoly, lane_center_offsets, road_ahead_split
 
 PHASES = ("cruise", "weave", "lane_change", "recover", "abort")
 ACTIVE = ("weave", "lane_change", "recover")
@@ -116,6 +116,7 @@ class ExcursionClock:
         near_junction: bool = False,
         traffic: bool = False,
         n_lanes: int | None = None,
+        window_ok: bool = True,
     ) -> Excursion:
         dt = max(0.0, float(dt_s))
         reason = unsafe_reason(
@@ -139,7 +140,9 @@ class ExcursionClock:
             if self.phase == "cruise":
                 self.reason = ""
             self.phase_t += dt
-            self._advance(offset_m, heading_rad, lane_width_m, traffic, n_lanes=n_lanes)
+            self._advance(
+                offset_m, heading_rad, lane_width_m, traffic, n_lanes=n_lanes, window_ok=window_ok,
+            )
         return self._sample(lane_width_m)
 
     def force_abort(self, reason: str) -> Excursion:
@@ -158,8 +161,13 @@ class ExcursionClock:
         lane_width_m: float | None,
         traffic: bool,
         n_lanes: int | None,
+        window_ok: bool = True,
     ) -> None:
         if self.phase == "cruise" and self.phase_t >= CRUISE_S and not self.reason:
+            if not window_ok:
+                # The timer elapsed on a curve or a junction. Look again shortly.
+                self.phase_t = max(0.0, CRUISE_S - 2.0)
+                return
             self._start_next(lane_width_m, traffic, n_lanes)
         elif self.phase == "weave" and self.phase_t >= WEAVE_S:
             self._to_cruise()
@@ -177,6 +185,13 @@ class ExcursionClock:
                 self._to_cruise()
         elif self.phase == "abort" and self.phase_t >= ABORT_S:
             self._to_cruise()
+
+    def peek_kind(self, n_lanes: int | None) -> str:
+        """The phase the cruise timer would start, without starting it."""
+        kind = ("weave", "lane_change", "recover")[self._kind % 3]
+        if kind == "lane_change" and n_lanes is not None and int(n_lanes) < 2:
+            return "weave"
+        return kind
 
     def _start_next(self, lane_width_m: float | None, traffic: bool, n_lanes: int | None) -> None:
         if traffic:
@@ -298,17 +313,31 @@ def lua_set_line(points: list[tuple[float, float]], speed_mps: float) -> str:
     return f"ai.setLine({{{body}}}, true)"
 
 
-def near_junction(hit: object) -> bool:
-    """True when this polyline ends inside the curvature lookahead, or the hit is missing.
+def near_junction(
+    hit: object,
+    roads: list[RoadPoly] | None = None,
+    x: float | None = None,
+    y: float | None = None,
+    heading: float | None = None,
+) -> bool:
+    """True when a junction or a dead end sits inside the curvature lookahead.
 
-    ``project_road`` reports ``ahead_m`` as how far that walk got. A full walk
-    is a continuing road, not a junction. The old ``< 20 m`` test fired on
-    every healthy sample because the walk itself is only 12 m.
+    Without ``roads``, a polyline that ends inside that lookahead counts.
+    With ``roads``, a piece boundary that has one colinear continuation does
+    not. A second road leaving the tip does.
     """
     if hit is None:
         return True
     if bool(getattr(hit, "off_road", False)) or bool(getattr(hit, "discontinuous", False)):
         return True
+    if roads and x is not None and y is not None:
+        road = _road_of(roads, hit)
+        if road is None:
+            return True
+        span = _span(roads, road, float(x), float(y), heading, float(CURVATURE_AHEAD_M))
+        if span[1]:
+            return True
+        return span[0] < float(CURVATURE_AHEAD_M) - 0.05
     ahead = getattr(hit, "ahead_m", 0.0)
     try:
         ahead_m = float(ahead)
@@ -354,7 +383,150 @@ def _locate(
     return i, cx, cy, fx, fy
 
 
-def _walk(
+def _span(
+    roads: list[RoadPoly],
+    road: RoadPoly,
+    x: float,
+    y: float,
+    heading: float | None,
+    distance_m: float,
+) -> tuple[float, bool, float]:
+    """``(length, branched, heading_span)`` along this road and its continuations.
+
+    The walk stops at a junction. ``heading_span`` is the largest turn away
+    from the heading at the start of the walk.
+    """
+    length, branched, span, _samples = _chain(roads, road, x, y, heading, distance_m, 8.0)
+    return length, branched, span
+
+
+def _chain(
+    roads: list[RoadPoly],
+    road: RoadPoly,
+    x: float,
+    y: float,
+    heading: float | None,
+    distance_m: float,
+    step_m: float,
+) -> tuple[float, bool, float, list[tuple[float, float, float, float, float]]]:
+    """Walk forward across colinear pieces. A branch ends the walk."""
+    samples: list[tuple[float, float, float, float, float]] = []
+    visited: list[str] = []
+    current: RoadPoly | None = road
+    cx, cy = float(x), float(y)
+    face = heading
+    base = 0.0
+    branched = False
+    heading_span = 0.0
+    h0: float | None = None
+    while current is not None and len(visited) < 12 and base < float(distance_m) - 1e-3:
+        if current.road_id in visited:
+            break
+        visited.append(current.road_id)
+        piece = _walk_piece(current, cx, cy, face, float(distance_m) - base, step_m)
+        if not piece:
+            break
+        for px, py, fx, fy, s_m in piece:
+            samples.append((px, py, fx, fy, s_m + base))
+            heading_now = math.atan2(fy, fx)
+            if h0 is None:
+                h0 = heading_now
+            heading_span = max(heading_span, abs(math.atan2(math.sin(heading_now - h0), math.cos(heading_now - h0))))
+            if _foreign_branch(roads, current.road_id, px, py, heading_now):
+                branched = True
+                break
+        if branched:
+            break
+        base = samples[-1][4]
+        if base >= float(distance_m) - 1e-3:
+            break
+        cont, split = road_ahead_split(roads, current, samples[-1][0], samples[-1][1], math.atan2(samples[-1][3], samples[-1][2]))
+        if split:
+            branched = True
+            break
+        if cont is None:
+            break
+        cx, cy = samples[-1][0], samples[-1][1]
+        face = math.atan2(samples[-1][3], samples[-1][2])
+        current = cont
+    length = samples[-1][4] if samples else 0.0
+    return length, branched, heading_span, samples
+
+
+# A weave or a lane change on a bend tighter than this is not the window.
+STRAIGHT_RAD = 0.35
+
+
+def route_is_open(
+    roads: list[RoadPoly],
+    hit: object,
+    x: float,
+    y: float,
+    heading: float | None,
+    phase: str,
+    speed_mps: float,
+) -> bool:
+    """True when ``phase`` fits on a straight, junction-free stretch ahead.
+
+    Weave only needs the current lane. A lane change needs a second lane.
+    Both refuse a branch, a dead end, or a turn larger than ``STRAIGHT_RAD``.
+    """
+    if phase not in ACTIVE or hit is None or not roads:
+        return False
+    if bool(getattr(hit, "off_road", False)) or bool(getattr(hit, "discontinuous", False)):
+        return False
+    road = _road_of(roads, hit)
+    if road is None:
+        return False
+    lane_w = getattr(hit, "lane_width_m", None)
+    lane_id = int(getattr(hit, "lane_id", 0) or 0)
+    directions = [1, -1] if phase == "lane_change" else [1]
+    if not any(
+        targets_for(
+            phase,
+            direction,
+            None if lane_w is None else float(lane_w),
+            lane_id=lane_id,
+            road_width_m=float(road.width_m),
+        )
+        is not None
+        for direction in directions
+    ):
+        return False
+    duration = {"weave": WEAVE_S, "lane_change": LANE_CHANGE_S, "recover": RECOVER_S}[phase]
+    need = max(MIN_PATH_M, min(400.0, abs(float(speed_mps)) * duration))
+    length, branched, span = _span(roads, road, x, y, heading, need)
+    if branched or span > STRAIGHT_RAD:
+        return False
+    return length + 1e-3 >= need * 0.85
+
+
+def _foreign_branch(
+    roads: list[RoadPoly],
+    road_id: str,
+    x: float,
+    y: float,
+    heading: float,
+) -> bool:
+    """True when some other road leaves this point at a crossing angle."""
+    for other in roads:
+        if other.road_id == road_id or len(other.xy) < 2:
+            continue
+        ends = (
+            (other.xy[0], other.xy[1]),
+            (other.xy[-1], other.xy[-2]),
+        )
+        for end, nxt in ends:
+            if math.hypot(end[0] - x, end[1] - y) > 8.0:
+                continue
+            leave = math.atan2(nxt[1] - end[1], nxt[0] - end[0])
+            delta = abs(math.atan2(math.sin(leave - heading), math.cos(leave - heading)))
+            if 0.5 < delta < 2.6:
+                return True
+    return False
+
+
+def _walk_piece(
     road: RoadPoly,
     x: float,
     y: float,
@@ -362,7 +534,7 @@ def _walk(
     distance_m: float,
     step_m: float,
 ) -> list[tuple[float, float, float, float, float]]:
-    """Centerline samples ``(x, y, fx, fy, s)`` looking forward along the road."""
+    """Centerline samples ``(x, y, fx, fy, s)`` on one polyline."""
     located = _locate(road, x, y, heading)
     if located is None:
         return []
@@ -403,6 +575,8 @@ def _walk(
         fx, fy = ux, uy
         samples.append((px, py, fx, fy, travelled))
         next_at += max(1.0, float(step_m))
+    if (idx < 0 or idx >= len(pts)) and travelled > samples[-1][4] + 0.05:
+        samples.append((px, py, fx, fy, travelled))
     return samples
 
 
@@ -460,6 +634,9 @@ def excursion_path(
     need = min(400.0, need)
     lane_id = int(getattr(hit, "lane_id", 0) or 0)
     lane_w = getattr(hit, "lane_width_m", None)
+    _length, branched, _span_h, samples = _chain(roads, road, x, y, heading, need, PATH_STEP_M)
+    if branched or len(samples) < 2 or samples[-1][4] + 1e-3 < need * 0.85:
+        return None, int(move.direction)
     for direction in directions:
         spec = targets_for(
             move.phase,
@@ -475,9 +652,6 @@ def excursion_path(
         if lane_id < 0 or lane_id >= len(centers):
             continue
         base = float(centers[lane_id])
-        samples = _walk(road, x, y, heading, need, PATH_STEP_M)
-        if len(samples) < 2 or samples[-1][4] + 1e-3 < need * 0.85:
-            continue
         limit = float(road.width_m) * 0.5 - EDGE_M
         points: list[tuple[float, float]] = []
         ok = True

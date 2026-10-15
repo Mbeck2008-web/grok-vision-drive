@@ -28,6 +28,7 @@ from python.debug.gt_geom import (
     lane_still_beside,
     parse_road_edges,
     project_follow,
+    road_width_floor,
     project_road,
     update_curve_preview,
 )
@@ -131,7 +132,7 @@ def polys_from_network(spec: Any) -> list[RoadPoly]:
             edges = road
         poly = parse_road_edges(str(road_id), edges)
         if poly is not None:
-            polys.append(poly)
+            polys.append(road_width_floor(poly, road))
     return polys
 
 

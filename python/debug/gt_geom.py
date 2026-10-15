@@ -64,10 +64,16 @@ class RoadHit:
 
 @dataclass
 class RoadFollow:
-    """Which polyline the wheel is currently on, and which way it runs."""
+    """Which polyline the wheel is currently on, and which way it runs.
+
+    ``lane_id`` stays put while the car is still inside that lane, so a
+    sample on the painted line does not swap the label to the next lane.
+    """
 
     road_id: str = ""
     forward_heading: float | None = None
+    lane_id: int | None = None
+    lane_center_m: float | None = None
 
 
 @dataclass
@@ -110,6 +116,70 @@ def _xy3(raw: object) -> tuple[float, float] | None:
         return None
 
 
+def _positive(value: object) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if out != out or out <= 0.0 or out > 80.0:
+        return None
+    return out
+
+
+def _edge_width(edge: dict, left: tuple[float, float] | None, right: tuple[float, float] | None) -> float | None:
+    """Full road width. A node ``radius`` is half of that.
+
+    Left/right span is the painted width. Some Tech dumps store the same
+    distance again as ``width``, and some store the radius under ``width``.
+    A value much smaller than the span is treated as a radius. The largest
+    plausible reading wins so a narrow edge pair does not shrink the road.
+    """
+    span = None
+    if left is not None and right is not None:
+        span = math.hypot(right[0] - left[0], right[1] - left[1])
+        if span < 0.5:
+            span = None
+    cands: list[float] = []
+    if span is not None:
+        cands.append(span)
+    radius = _positive(edge.get("radius"))
+    if radius is not None:
+        cands.append(radius * 2.0)
+    width = _positive(edge.get("width"))
+    if width is not None:
+        cands.append(width)
+        if span is not None and width < span * 0.75:
+            cands.append(width * 2.0)
+    if not cands:
+        return None
+    return max(cands)
+
+
+def road_width_floor(poly: RoadPoly, road: object) -> RoadPoly:
+    """Raise ``poly.width_m`` from a road-level radius, width, or lane count."""
+    if not isinstance(road, dict):
+        return poly
+    extra: list[float] = []
+    radius = _positive(road.get("radius"))
+    if radius is not None:
+        extra.append(radius * 2.0)
+    width = _positive(road.get("width"))
+    if width is not None:
+        extra.append(width)
+    lanes = road.get("lanes")
+    try:
+        count = int(lanes)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        count = 0
+    if 1 <= count <= 6:
+        extra.append(count * LANE_W_M)
+    if extra:
+        poly.width_m = float(min(40.0, max([poly.width_m, *extra])))
+    return poly
+
+
 def parse_road_edges(road_id: str, edges: object) -> RoadPoly | None:
     """Centerline from BeamNG ``get_road_edges`` records.
 
@@ -132,16 +202,12 @@ def parse_road_edges(road_id: str, edges: object) -> RoadPoly | None:
         if mid is None:
             continue
         xy.append(mid)
-        if left is not None and right is not None:
-            widths.append(math.hypot(right[0] - left[0], right[1] - left[1]))
-        elif edge.get("width") is not None:
-            try:
-                widths.append(abs(float(edge["width"])))
-            except (TypeError, ValueError):
-                pass
+        got = _edge_width(edge, left, right)
+        if got is not None:
+            widths.append(got)
     if len(xy) < 2:
         return None
-    width = sum(widths) / len(widths) if widths else 2.0 * LANE_W_M
+    width = max(widths) if widths else 2.0 * LANE_W_M
     if width < 2.0:
         width = LANE_W_M
     return RoadPoly(road_id=str(road_id), xy=xy, width_m=float(width))
@@ -264,6 +330,39 @@ def project_road(
     return best
 
 
+def _acquire(
+    roads: list[RoadPoly],
+    x: float,
+    y: float,
+    heading_rad: float | None,
+) -> RoadHit | None:
+    """The road the car is in, not merely the nearest centerline.
+
+    A narrow spline beside the carriageway can be closer than the road
+    center. Prefer a centerline the car actually sits inside, aligned with
+    its heading, and closest to a lane center.
+    """
+    nearest: RoadHit | None = None
+    inside: RoadHit | None = None
+    inside_key: tuple[float, float, float] | None = None
+    for road in roads:
+        hit = _project_onto(road, x, y, heading_rad)
+        if hit is None:
+            continue
+        if nearest is None or hit.dist_m < nearest.dist_m:
+            nearest = hit
+        contained = abs(hit.offset_m) <= road.width_m * 0.5 + SHOULDER_M and hit.dist_m <= OFF_NETWORK_M
+        heading_pen = 0.0 if hit.heading_err_rad is None else abs(hit.heading_err_rad)
+        aligned = heading_rad is None or heading_pen <= CONNECT_HEADING
+        if not contained or not aligned:
+            continue
+        key = (heading_pen, abs(hit.lane_offset_m), hit.dist_m)
+        if inside_key is None or key < inside_key:
+            inside_key = key
+            inside = hit
+    return inside if inside is not None else nearest
+
+
 def _road_heading(vehicle_heading: float | None, heading_err: float | None) -> float | None:
     if vehicle_heading is None or heading_err is None:
         return None
@@ -366,6 +465,109 @@ def _successor(
     return None if best is None else best[1]
 
 
+def road_ahead_split(
+    roads: list[RoadPoly],
+    road: RoadPoly,
+    x: float,
+    y: float,
+    heading_rad: float | None,
+) -> tuple[RoadPoly | None, bool]:
+    """Colinear continuation, and whether another road leaves this tip.
+
+    A piece boundary with one continuation is the same road. A second
+    leave-heading is a junction. The continuation itself is not counted.
+    """
+    tip = _forward_tip(road, x, y, heading_rad)
+    if tip is None:
+        return None, False
+    tip_x, tip_y, tip_h = tip
+    cont: RoadPoly | None = None
+    cont_delta: float | None = None
+    others = 0
+    for other in roads:
+        if other.road_id == road.road_id or len(other.xy) < 2:
+            continue
+        ends = (
+            (other.xy[0], other.xy[1]),
+            (other.xy[-1], other.xy[-2]),
+        )
+        for end, nxt in ends:
+            if math.hypot(end[0] - tip_x, end[1] - tip_y) > CONNECT_M:
+                continue
+            leave = math.atan2(nxt[1] - end[1], nxt[0] - end[0])
+            delta = abs(wrap_rad(leave - tip_h))
+            if delta <= CONNECT_HEADING:
+                if cont_delta is None or delta < cont_delta:
+                    cont_delta = delta
+                    cont = other
+            elif delta < 2.6:
+                others += 1
+    return cont, others > 0
+
+
+def stabilize_lane(hit: RoadHit, follow: RoadFollow) -> RoadHit:
+    """Keep the lane id until the car has clearly left that lane."""
+    if follow.road_id != hit.road_id or follow.lane_center_m is None or follow.lane_id is None:
+        follow.lane_id = int(hit.lane_id)
+        follow.lane_center_m = float(hit.offset_m - hit.lane_offset_m)
+        return hit
+    lane_w = float(hit.lane_width_m) if hit.lane_width_m and hit.lane_width_m > 0.0 else LANE_W_M
+    if abs(float(hit.offset_m) - float(follow.lane_center_m)) <= lane_w * 0.5 + 0.2:
+        lane_off = float(hit.offset_m) - float(follow.lane_center_m)
+        follow.lane_id = int(follow.lane_id)
+        return RoadHit(
+            road_id=hit.road_id,
+            offset_m=hit.offset_m,
+            heading_err_rad=hit.heading_err_rad,
+            lane_id=int(follow.lane_id),
+            lane_offset_m=lane_off,
+            lane_width_m=hit.lane_width_m,
+            off_road=hit.off_road,
+            dist_m=hit.dist_m,
+            curvature=hit.curvature,
+            ahead_m=hit.ahead_m,
+            discontinuous=hit.discontinuous,
+        )
+    follow.lane_id = int(hit.lane_id)
+    follow.lane_center_m = float(hit.offset_m - hit.lane_offset_m)
+    return hit
+
+
+def follow_label(
+    roads: list[RoadPoly],
+    x: float,
+    y: float,
+    heading_rad: float | None,
+    follow: RoadFollow,
+    speed_mps: float = 0.0,
+    last: RoadHit | None = None,
+) -> tuple[RoadHit | None, RoadHit | None, bool]:
+    """Lane sample for labels. Returns ``(label, memory, rejected_jump)``.
+
+    Stays on the current polyline. A crossing road is not adopted: the
+    previous lane is kept and ``rejected_jump`` is true so an excursion
+    does not start on that tick.
+    """
+    prev_road = follow.road_id
+    hit = project_follow(roads, x, y, heading_rad, follow, speed_mps=speed_mps)
+    if hit is None:
+        return None, last, False
+    if hit.road_id != prev_road:
+        follow.lane_id = None
+        follow.lane_center_m = None
+    bad_jump = (
+        hit.discontinuous
+        and hit.heading_err_rad is not None
+        and abs(hit.heading_err_rad) > CONNECT_HEADING
+    )
+    if bad_jump and last is not None:
+        return last, last, True
+    if hit.off_road:
+        return hit, last, bool(hit.discontinuous)
+    held = stabilize_lane(hit, follow)
+    return held, held, False
+
+
 # Parking brake on gt_ctrl1 shed about 4.5 m/s^2. The mesh has to be at
 # least a stop shorter than that or the brake starts too late.
 PARK_DECEL_MPS2 = 4.5
@@ -435,7 +637,7 @@ def project_follow(
                 return hit
             hit.discontinuous = True
             return hit
-    nearest = project_road(roads, x, y, heading_rad)
+    nearest = _acquire(roads, x, y, heading_rad)
     if nearest is None:
         return None
     road_h = _road_heading(heading_rad, nearest.heading_err_rad)

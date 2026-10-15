@@ -45,10 +45,16 @@ def main(argv: list[str] | None = None) -> int:
     report = validate_dataset(args.strips, out, montage_n=max(1, int(args.montage)))
     per = report.get("per_cam") or {}
     per_text = " ".join(f"{name}={count}" for name, count in sorted(per.items()))
+    rows_n = int(report.get("rows") or 0)
+    masked_n = report.get("masked_rows")
+    masked_text = ""
+    if masked_n is not None and rows_n:
+        masked_text = f" masked={int(masked_n)}/{rows_n} ({float(report.get('masked_fraction') or 0.0):.2f})"
     print(
         f"validate rows={report['rows']} jpegs={report['jpegs']} "
         f"raw={report.get('raw_frames', 0)}"
         + (f" {per_text}" if per_text else "")
+        + masked_text
         + f" issues={report['issue_count']} report={out / 'report.json'}",
         flush=True,
     )

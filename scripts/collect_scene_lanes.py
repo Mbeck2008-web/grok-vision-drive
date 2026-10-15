@@ -415,7 +415,8 @@ def run_map_checks(
             failed += 1
     drop_cameras(cams)
     if use_data_disk():
-        path = logs_dir() / "check_maps.txt"
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+        path = logs_dir() / f"check_maps_{stamp}.txt"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         print(f"collect check log {path}", flush=True)
@@ -518,7 +519,7 @@ def main(argv: list[str] | None = None) -> int:
         yaw_rate_from_dirs,
     )
     from python.data.raw_queue import RawWriteQueue
-    from python.debug.gt_geom import heading_from_dir, project_road
+    from python.debug.gt_geom import RoadFollow, follow_label, heading_from_dir
     from python.debug.gt_logger import load_road_polys
     from python.debug.lane_targets import tech_from_hit
     from python.sensors.cameras import load_camera_config
@@ -676,9 +677,11 @@ def main(argv: list[str] | None = None) -> int:
             ACTIVE,
             Excursion,
             ExcursionClock,
+            CRUISE_S,
             excursion_commands,
             excursion_path,
             near_junction,
+            route_is_open,
             targets_for,
         )
 
@@ -688,6 +691,9 @@ def main(argv: list[str] | None = None) -> int:
         live = Liveness()
         segment_aborts = 0
         cams_ready = False
+        segment_open = False
+        follow = RoadFollow()
+        label_hit = None
         warmup_since: float | None = None
         last_ai: tuple[Any, ...] | None = None
         held_tag: Excursion | None = None
@@ -828,6 +834,9 @@ def main(argv: list[str] | None = None) -> int:
                 live.reset()
                 segment_aborts = 0
                 cams_ready = False
+                segment_open = False
+                follow = RoadFollow()
+                label_hit = None
                 warmup_since = None
                 if opened.spawn is not None:
                     spawn_pos = (float(opened.spawn[0]), float(opened.spawn[1]), float(opened.spawn[2]))
@@ -942,15 +951,88 @@ def main(argv: list[str] | None = None) -> int:
             if direction is not None:
                 heading = heading_from_dir(direction[0], direction[1])
             hit = None
-            if pos is not None:
-                hit = project_road(roads, pos[0], pos[1], heading)
+            rejected = False
+            if pos is not None and roads:
+                hit, label_hit, rejected = follow_label(
+                    roads,
+                    float(pos[0]),
+                    float(pos[1]),
+                    heading,
+                    follow,
+                    speed_mps_f or 0.0,
+                    label_hit,
+                )
+            driving = car_is_driving(speed_mps_f, dir_z)
+            if not segment_open:
+                if driving:
+                    segment_open = True
+                    live.reset()
+                    clock = ExcursionClock()
+                    last_ai = None
+                    held_tag = None
+                    print(f"collect driving {segment_id}", flush=True)
+                else:
+                    if last_ai is None:
+                        for command in ai_commands(speed, waypoint, traffic=bool(args.traffic)):
+                            try:
+                                _queue(vehicle, command)
+                            except Exception as exc:
+                                last_error = f"{type(exc).__name__}: {exc}"
+                        last_ai = (round(speed, 3), waypoint, "cruise", 1, map_name)
+                        print(
+                            f"collect ai speed={speed:.0f} m/s route={waypoint or map_name or 'span'} "
+                            f"excursion=cruise",
+                            flush=True,
+                        )
+                    why = live.update(
+                        tick_dt,
+                        speed_mps_f,
+                        dir_z,
+                        damage_f,
+                        ai_should_move=True,
+                    )
+                    if why:
+                        code = _abort(why)
+                        if code is not None:
+                            return code
+                        time.sleep(tick_sleep_s(time.monotonic() - tick_mark, 0.1))
+                        tick_dt = max(1e-3, time.monotonic() - tick_mark)
+                        continue
+                    time.sleep(tick_sleep_s(time.monotonic() - tick_mark, 0.1))
+                    tick_dt = max(1e-3, time.monotonic() - tick_mark)
+                    continue
             tech = tech_from_hit(
                 None if hit is None else hit.lane_offset_m,
                 None if hit is None else hit.heading_err_rad,
                 None if hit is None else hit.lane_width_m,
                 None if hit is None else hit.off_road,
             )
-            driving = car_is_driving(speed_mps_f, dir_z)
+            lanes_here = road_lanes(roads, hit)
+            junction = rejected or near_junction(
+                hit,
+                roads,
+                None if pos is None else float(pos[0]),
+                None if pos is None else float(pos[1]),
+                heading,
+            )
+            window_ok = True
+            if (
+                excursions_on
+                and not waypoint
+                and driving
+                and clock.phase == "cruise"
+                and clock.phase_t + tick_dt >= CRUISE_S
+                and pos is not None
+            ):
+                window_ok = route_is_open(
+                    roads,
+                    hit,
+                    float(pos[0]),
+                    float(pos[1]),
+                    heading,
+                    clock.peek_kind(lanes_here),
+                    speed,
+                )
             if excursions_on and not waypoint and driving:
                 move = clock.update(
                     tick_dt,
@@ -958,9 +1040,10 @@ def main(argv: list[str] | None = None) -> int:
                     heading_rad=None if hit is None else hit.heading_err_rad,
                     lane_width_m=None if hit is None else hit.lane_width_m,
                     off_road=bool(hit.off_road) if hit is not None else False,
-                    near_junction=near_junction(hit),
+                    near_junction=junction,
                     traffic=bool(args.traffic),
-                    n_lanes=road_lanes(roads, hit),
+                    n_lanes=lanes_here,
+                    window_ok=window_ok,
                 )
             else:
                 move = Excursion("cruise", 0.0, 0.0, 1, "")

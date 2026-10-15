@@ -17,6 +17,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from python.control.actuate import curve_speed_mps  # noqa: E402
+from python.control.gt_lane_loop import run_gt_lane  # noqa: E402
+from python.debug.gt_geom import (  # noqa: E402
+    RoadFollow,
+    RoadPoly,
+    project_follow,
+    project_road,
+)
 from python.debug.gt_summary import load_jsonl, pearson, summarize  # noqa: E402
 
 FIXTURE = ROOT / "tests" / "fixtures" / "gt_ctrl2" / "gt.jsonl"
@@ -74,10 +82,96 @@ def check_hold_is_why_r_falls() -> None:
     assert hold_n >= 20
 
 
+def _roads() -> tuple[RoadPoly, RoadPoly, RoadPoly]:
+    """A runs north and ends. C crosses at the end. B continues north."""
+    ahead = RoadPoly("A", [(0.0, float(i)) for i in range(0, 31)], 7.0)
+    cross = RoadPoly("C", [(float(i) - 15.0, 30.0) for i in range(0, 31)], 7.0)
+    cont = [(0.0, 30.0)]
+    for i in range(1, 31):
+        cont.append((0.0, 30.0 + float(i)))
+    return ahead, cross, RoadPoly("B", cont, 7.0)
+
+
+def check_follow_ignores_the_cross_street() -> None:
+    ahead, _cross, _cont = _roads()
+    # C crosses A at y=20, and the car sits on C so the raw nearest is C.
+    cross = RoadPoly("C", [(float(i) - 15.0, 20.0) for i in range(0, 31)], 7.0)
+    car = (1.2, 20.0)
+    heading = 1.5707963
+    nearest = project_road([ahead, cross], car[0], car[1], heading)
+    assert nearest is not None and nearest.road_id == "C", nearest
+    follow = RoadFollow(road_id="A", forward_heading=heading)
+    held = project_follow([ahead, cross], car[0], car[1], heading, follow)
+    assert held is not None
+    print(f"mid-road nearest={nearest.road_id} follow={held.road_id} disc={held.discontinuous}")
+    assert held.road_id == "A"
+    assert held.discontinuous is False
+
+
+def check_follow_chains_and_a_dead_end_stops() -> None:
+    ahead, cross, cont = _roads()
+    # Past A's tip, closer to the cross street than to the continuation.
+    car = (3.0, 32.0)
+    heading = 1.5707963
+    nearest = project_road([ahead, cross, cont], car[0], car[1], heading)
+    assert nearest is not None and nearest.road_id == "C", nearest
+    follow = RoadFollow(road_id="A", forward_heading=heading)
+    chained = project_follow([ahead, cross, cont], car[0], car[1], heading, follow)
+    assert chained is not None
+    print(f"junction nearest={nearest.road_id} chained={chained.road_id}")
+    assert chained.road_id == "B"
+    assert chained.discontinuous is False
+
+    follow = RoadFollow(road_id="A", forward_heading=heading)
+    dead = project_follow([ahead, cross], car[0], car[1], heading, follow)
+    assert dead is not None
+    print(f"dead-end follow={dead.road_id} disc={dead.discontinuous} dist={dead.dist_m:.1f}")
+    assert dead.road_id == "A"
+    assert dead.discontinuous is True
+    # 12 m/s needs ~16 m to stop. Ten metres of mesh left is already late.
+    follow = RoadFollow(road_id="A", forward_heading=heading)
+    early = project_follow([ahead], 0.2, 20.0, heading, follow, speed_mps=12.0)
+    assert early is not None and early.discontinuous is True, early
+    follow = RoadFollow(road_id="A", forward_heading=heading)
+    room = project_follow([ahead], 0.2, 5.0, heading, follow, speed_mps=12.0)
+    assert room is not None and room.discontinuous is False, room
+
+
+def check_speed_cap_and_immediate_brake() -> None:
+    cap = curve_speed_mps(1.0 / 40.0)
+    print(f"40 m bend cap={cap:.2f}")
+    assert abs(cap - (2.5 * 40.0) ** 0.5) < 1e-6
+    assert curve_speed_mps(0.0) == float("inf")
+    # gt_ctrl2 was still at 12 m/s a second and a half after the mesh ended.
+    # The brake is on the first dropped tick, so a second later the car
+    # has already shed several m/s and has not been flung out to 19 m.
+    drop = run_gt_lane(
+        seconds=4,
+        speed_mps=12.0,
+        offset_m=0.2,
+        heading_err_rad=0.0,
+        curvature=1.0 / 80.0,
+        gap_at_s=0.2,
+        gap_s=3.0,
+        half_width_m=1.7,
+        skip_launch=True,
+        law="curve",
+    )
+    print(
+        f"discontinuity max_off={drop['max_abs_offset_m']:.2f} "
+        f"final_v_proxy mean={drop['mean_speed_mps']:.2f}"
+    )
+    assert drop["max_abs_offset_m"] < 1.5
+    assert drop["mean_speed_mps"] < 8.0
+
+
 def main() -> None:
     check_fixture()
     check_hold_is_why_r_falls()
-    print("gt_ctrl2 fixture recorded")
+    check_follow_ignores_the_cross_street()
+    check_follow_chains_and_a_dead_end_stops()
+    check_speed_cap_and_immediate_brake()
+    print("gt_ctrl2 replay: follower stays on the continuous road")
 
 
 if __name__ == "__main__":

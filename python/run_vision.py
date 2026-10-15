@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
 
 from python.control.actuate import (
     attach_electrics,
+    curve_speed_mps,
     curve_steer,
     follow_lane_steer,
     lane_sample_hold_reason,
@@ -967,16 +968,17 @@ def main() -> None:
                 pos_xy=pos_xy,
             )
             lane_age_s = float(getattr(pout, "frame_age_s", 0.0) or 0.0)
-            if (
-                engaged
-                and gt_preview is not None
-                and gt_preview.lost
-                and (cmd.reason == "ok" or holding)
-            ):
-                # Slow down on the held curve. stop_command would zero the
-                # wheel, which is how gt_ctrl1 left the bend at 14 m/s.
-                cmd.throttle = 0.0
-                cmd.brake = max(float(cmd.brake), 1.0)
+            if engaged and gt_preview is not None and (cmd.reason == "ok" or holding):
+                cap = curve_speed_mps(gt_preview.curvature)
+                spd_cap = spd_now if spd_now is not None else ego_v
+                if spd_cap is not None and float(spd_cap) > cap:
+                    cmd.throttle = 0.0
+                if gt_preview.lost:
+                    # Polyline end or a rejected jump. Brake now. The wheel
+                    # stays on the held curve; stop_command would zero it,
+                    # which is how gt_ctrl1 left the bend at 14 m/s.
+                    cmd.throttle = 0.0
+                    cmd.brake = max(float(cmd.brake), 1.0)
             if engaged and (cmd.reason == "ok" or holding):
                 apply_stale_speed_cap(
                     cmd,

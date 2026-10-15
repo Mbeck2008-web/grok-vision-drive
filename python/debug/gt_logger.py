@@ -17,14 +17,17 @@ from typing import Any
 
 from python.debug.lane_targets import LOOKAHEADS_M, lookahead_xs
 from python.debug.gt_geom import (
+    CONNECT_HEADING,
     CurvePreview,
     PreviewMemory,
+    RoadFollow,
     RoadHit,
     RoadPoly,
     ego_center_x,
     heading_from_dir,
     lane_still_beside,
     parse_road_edges,
+    project_follow,
     project_road,
     update_curve_preview,
 )
@@ -366,6 +369,11 @@ class GroundTruthLogger:
         self._was_out = False
         self._ticks = 0
         self._preview = PreviewMemory()
+        self._follow = RoadFollow()
+        # Set by curve_preview. write() uses it so gt_center is the road
+        # the wheel accepted, not a crossing polyline chosen the same tick.
+        self._followed: RoadHit | None = None
+        self._last_good: RoadHit | None = None
 
     @classmethod
     def open(cls, root: Path | None = None) -> GroundTruthLogger:
@@ -420,17 +428,20 @@ class GroundTruthLogger:
         socket_busy: bool = False,
         dt_s: float | None = None,
     ) -> CurvePreview | None:
-        """Lane sample for the wheel, held through a bad projection.
+        """Lane sample for the wheel, held on the road we are already on.
 
-        A crossing road or the end of a polyline does not clear the steer.
-        ``lost`` means the hold is old enough that the caller should slow
-        down. The curvature in the sample is what feedforward steers.
+        A crossing polyline does not replace that road. The end of the
+        mesh, with no continuation, is lost immediately: the caller brakes
+        and the last curve stays on the wheel. ``gt_center_x`` logged from
+        ``write`` uses this same hit, so it matches ``lane_x`` instead of
+        the rejected polyline.
         """
         self._ensure_roads(bng, socket_busy)
         dt = 0.1 if dt_s is None else dt_s
+        self._followed = None
         if not self._roads:
             return None
-        pos, heading, _speed = _pose(vdata)
+        pos, heading, speed_pose = _pose(vdata)
         if pos is None or heading is None:
             return update_curve_preview(
                 self._preview,
@@ -440,8 +451,24 @@ class GroundTruthLogger:
                 road_id="",
                 beside=False,
                 dt_s=dt,
+                discontinuous=True,
             )
-        hit = project_road(self._roads, pos[0], pos[1], heading)
+        hit = project_follow(
+            self._roads, pos[0], pos[1], heading, self._follow, speed_mps=speed_pose or 0.0,
+        )
+        # A rejected crossing road still carries that road's offset. Log the
+        # last accepted polyline instead, which is what lane_x is held to.
+        bad_jump = (
+            hit is not None
+            and hit.discontinuous
+            and hit.heading_err_rad is not None
+            and abs(hit.heading_err_rad) > CONNECT_HEADING
+        )
+        if hit is not None and not bad_jump:
+            self._last_good = hit
+            self._followed = hit
+        else:
+            self._followed = self._last_good
         if hit is None or hit.heading_err_rad is None or hit.lane_offset_m is None:
             return update_curve_preview(
                 self._preview,
@@ -451,20 +478,24 @@ class GroundTruthLogger:
                 road_id="",
                 beside=False,
                 dt_s=dt,
+                discontinuous=True,
             )
         kappa = float(hit.curvature)
         # The walk died at the end of the mesh. Keep the bend we already had
         # instead of commanding a straight line off the end.
         if hit.ahead_m < 4.0 and self._preview.offset_m is not None:
             kappa = float(self._preview.curvature)
+        aligned = abs(hit.heading_err_rad) <= CONNECT_HEADING
+        beside = (not hit.discontinuous) and (lane_still_beside(hit) or aligned)
         return update_curve_preview(
             self._preview,
             offset_m=hit.lane_offset_m,
             heading_err_rad=hit.heading_err_rad,
             curvature=kappa,
             road_id=hit.road_id,
-            beside=lane_still_beside(hit),
+            beside=beside,
             dt_s=dt,
+            discontinuous=bool(hit.discontinuous),
         )
 
     def write(
@@ -495,8 +526,8 @@ class GroundTruthLogger:
             self._last_sim = sim
             t = sim
             t_source = "sim"
-        hit: RoadHit | None = None
-        if pos is not None and self._roads:
+        hit: RoadHit | None = self._followed
+        if hit is None and pos is not None and self._roads:
             hit = project_road(self._roads, pos[0], pos[1], heading)
         damage = _num(getattr(vdata, "damage", None)) if vdata is not None else None
         delta = None

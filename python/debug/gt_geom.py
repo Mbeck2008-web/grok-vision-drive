@@ -24,10 +24,17 @@ class RoadPoly:
 
 
 # A heading jump bigger than this in one tick is a different road, not a yaw.
-# gt_ctrl1 spiked by ~1.5 rad when the nearest polyline changed.
+# gt_ctrl1 spiked by ~1.5 rad when the nearest polyline changed. gt_ctrl2's
+# crossing polylines were the same size, about 1.5 rad.
 PREVIEW_JUMP_RAD = 0.6
 # Hold the last good curve this long, then slow down without centering the wheel.
+# A discontinuity (polyline end, rejected jump) does not wait this out.
 PREVIEW_LOST_S = 1.5
+# A road whose endpoint sits this close to ours, and whose heading is within
+# this angle, is the continuation. A cross street at the same point is not.
+CONNECT_M = 8.0
+CONNECT_HEADING = 0.5
+AHEAD_MIN_M = 4.0
 # Walk this far along the centerline for curvature. A kink tighter than 8 m
 # is clamped; that is already near full lock.
 CURVATURE_AHEAD_M = 12.0
@@ -46,6 +53,17 @@ class RoadHit:
     dist_m: float
     curvature: float = 0.0
     ahead_m: float = 0.0
+    # The mesh ended and nothing ahead continues this heading. gt_ctrl2
+    # drove 13 m past that point at 12 m/s before the hold aged out.
+    discontinuous: bool = False
+
+
+@dataclass
+class RoadFollow:
+    """Which polyline the wheel is currently on, and which way it runs."""
+
+    road_id: str = ""
+    forward_heading: float | None = None
 
 
 @dataclass
@@ -153,6 +171,68 @@ def lane_center_offsets(width_m: float) -> list[float]:
     return [-float(width_m) / 2.0 + (i + 0.5) * lane_w for i in range(n)]
 
 
+def _project_onto(
+    road: RoadPoly,
+    x: float,
+    y: float,
+    heading_rad: float | None,
+) -> RoadHit | None:
+    """Closest sample on one polyline. None when the road has no segment."""
+    best: tuple[float, int, float, float] | None = None
+    px, py = float(x), float(y)
+    pts = road.xy
+    for i in range(len(pts) - 1):
+        ax, ay = pts[i]
+        bx, by = pts[i + 1]
+        dx, dy = bx - ax, by - ay
+        length2 = dx * dx + dy * dy
+        if length2 < 1e-6:
+            continue
+        t = ((px - ax) * dx + (py - ay) * dy) / length2
+        t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else t
+        cx = ax + t * dx
+        cy = ay + t * dy
+        dist = math.hypot(px - cx, py - cy)
+        if best is None or dist < best[0]:
+            best = (dist, i, cx, cy)
+    if best is None:
+        return None
+    dist, i, cx, cy = best
+    ax, ay = pts[i]
+    bx, by = pts[i + 1]
+    fx, fy = bx - ax, by - ay
+    flen = math.hypot(fx, fy) or 1.0
+    fx, fy = fx / flen, fy / flen
+    if heading_rad is not None:
+        vx, vy = math.cos(float(heading_rad)), math.sin(float(heading_rad))
+        if fx * vx + fy * vy < 0.0:
+            fx, fy = -fx, -fy
+    rx, ry = fy, -fx
+    offset = (px - cx) * rx + (py - cy) * ry
+    heading_err = None
+    if heading_rad is not None:
+        vx, vy = math.cos(float(heading_rad)), math.sin(float(heading_rad))
+        heading_err = math.atan2(fx * vy - fy * vx, fx * vx + fy * vy)
+    centers = lane_center_offsets(road.width_m)
+    lane_id = min(range(len(centers)), key=lambda k: abs(offset - centers[k]))
+    lane_w = road.width_m / len(centers)
+    lane_off = offset - centers[lane_id]
+    off = dist > OFF_NETWORK_M or abs(offset) > road.width_m * 0.5 + SHOULDER_M
+    kappa, ahead = curvature_ahead(road, i, cx, cy, fx, fy, CURVATURE_AHEAD_M)
+    return RoadHit(
+        road_id=road.road_id,
+        offset_m=float(offset),
+        heading_err_rad=None if heading_err is None else float(heading_err),
+        lane_id=int(lane_id),
+        lane_offset_m=float(lane_off),
+        lane_width_m=float(lane_w),
+        off_road=bool(off),
+        dist_m=float(dist),
+        curvature=float(kappa),
+        ahead_m=float(ahead),
+    )
+
+
 def project_road(
     roads: list[RoadPoly],
     x: float,
@@ -166,64 +246,199 @@ def project_road(
     ``heading_err_rad`` is positive when the vehicle points left of the road
     (counter-clockwise). ``off_road`` is outside the road plus a shoulder,
     or farther than ``OFF_NETWORK_M`` from every centerline.
+
+    This is the raw nearest polyline. Through a junction it will pick a
+    crossing road. ``project_follow`` stays on the one the car is already on.
     """
-    best: tuple[float, RoadPoly, int, float, float, float] | None = None
-    px, py = float(x), float(y)
+    best: RoadHit | None = None
     for road in roads:
-        pts = road.xy
-        for i in range(len(pts) - 1):
-            ax, ay = pts[i]
-            bx, by = pts[i + 1]
-            dx, dy = bx - ax, by - ay
-            length2 = dx * dx + dy * dy
-            if length2 < 1e-6:
-                continue
-            t = ((px - ax) * dx + (py - ay) * dy) / length2
-            t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else t
-            cx = ax + t * dx
-            cy = ay + t * dy
-            dist = math.hypot(px - cx, py - cy)
-            if best is None or dist < best[0]:
-                best = (dist, road, i, cx, cy, t)
+        hit = _project_onto(road, x, y, heading_rad)
+        if hit is None:
+            continue
+        if best is None or hit.dist_m < best.dist_m:
+            best = hit
+    return best
+
+
+def _road_heading(vehicle_heading: float | None, heading_err: float | None) -> float | None:
+    if vehicle_heading is None or heading_err is None:
+        return None
+    return wrap_rad(float(vehicle_heading) - float(heading_err))
+
+
+def _remember(follow: RoadFollow, hit: RoadHit, vehicle_heading: float | None) -> None:
+    follow.road_id = str(hit.road_id)
+    road_h = _road_heading(vehicle_heading, hit.heading_err_rad)
+    if road_h is not None:
+        follow.forward_heading = road_h
+
+
+def _forward_tip(
+    road: RoadPoly,
+    x: float,
+    y: float,
+    heading_rad: float | None,
+) -> tuple[float, float, float] | None:
+    """Point and heading at the end of ``road`` in the direction of travel."""
+    px, py = float(x), float(y)
+    pts = road.xy
+    best: tuple[float, int, float, float, float, float] | None = None
+    for i in range(len(pts) - 1):
+        ax, ay = pts[i]
+        bx, by = pts[i + 1]
+        dx, dy = bx - ax, by - ay
+        length2 = dx * dx + dy * dy
+        if length2 < 1e-6:
+            continue
+        t = ((px - ax) * dx + (py - ay) * dy) / length2
+        t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else t
+        cx = ax + t * dx
+        cy = ay + t * dy
+        dist = math.hypot(px - cx, py - cy)
+        flen = math.hypot(dx, dy) or 1.0
+        fx, fy = dx / flen, dy / flen
+        if best is None or dist < best[0]:
+            best = (dist, i, cx, cy, fx, fy)
     if best is None:
         return None
-    dist, road, i, cx, cy, _t = best
-    ax, ay = road.xy[i]
-    bx, by = road.xy[i + 1]
-    fx, fy = bx - ax, by - ay
-    flen = math.hypot(fx, fy) or 1.0
-    fx, fy = fx / flen, fy / flen
+    _dist, i, cx, cy, fx, fy = best
     if heading_rad is not None:
         vx, vy = math.cos(float(heading_rad)), math.sin(float(heading_rad))
         if fx * vx + fy * vy < 0.0:
             fx, fy = -fx, -fy
-    # Right of the road direction: forward × up.
-    rx, ry = fy, -fx
-    offset = (px - cx) * rx + (py - cy) * ry
-    heading_err = None
-    if heading_rad is not None:
-        vx, vy = math.cos(float(heading_rad)), math.sin(float(heading_rad))
-        heading_err = math.atan2(fx * vy - fy * vx, fx * vx + fy * vy)
-    centers = lane_center_offsets(road.width_m)
-    lane_id = min(range(len(centers)), key=lambda k: abs(offset - centers[k]))
-    lane_w = road.width_m / len(centers)
-    lane_off = offset - centers[lane_id]
-    off = dist > OFF_NETWORK_M or abs(offset) > road.width_m * 0.5 + SHOULDER_M
-    kappa, ahead = curvature_ahead(
-        road, i, cx, cy, fx, fy, CURVATURE_AHEAD_M,
-    )
-    return RoadHit(
-        road_id=road.road_id,
-        offset_m=float(offset),
-        heading_err_rad=None if heading_err is None else float(heading_err),
-        lane_id=int(lane_id),
-        lane_offset_m=float(lane_off),
-        lane_width_m=float(lane_w),
-        off_road=bool(off),
-        dist_m=float(dist),
-        curvature=float(kappa),
-        ahead_m=float(ahead),
-    )
+    forward = (pts[i + 1][0] - pts[i][0]) * fx + (pts[i + 1][1] - pts[i][1]) * fy >= 0.0
+    idx = i + 1 if forward else i
+    step = 1 if forward else -1
+    last_hx, last_hy = fx, fy
+    tip_x, tip_y = cx, cy
+    guard = 0
+    while 0 <= idx < len(pts) and guard < 400:
+        guard += 1
+        nx, ny = pts[idx]
+        dx, dy = nx - tip_x, ny - tip_y
+        seg = math.hypot(dx, dy)
+        if seg >= 1e-6:
+            last_hx, last_hy = dx / seg, dy / seg
+            tip_x, tip_y = nx, ny
+        idx += step
+    return tip_x, tip_y, math.atan2(last_hy, last_hx)
+
+
+def _successor(
+    roads: list[RoadPoly],
+    current: RoadPoly,
+    x: float,
+    y: float,
+    heading_rad: float | None,
+) -> RoadPoly | None:
+    """The polyline that continues past the end of ``current``.
+
+    Shares a neighbourhood with the forward tip and leaves along nearly
+    the same heading. A cross street at the junction fails the heading test.
+    """
+    tip = _forward_tip(current, x, y, heading_rad)
+    if tip is None:
+        return None
+    tip_x, tip_y, tip_h = tip
+    best: tuple[float, RoadPoly] | None = None
+    for road in roads:
+        if road.road_id == current.road_id or len(road.xy) < 2:
+            continue
+        # Either end can be the junction. The neighbour point is the
+        # direction we would drive after joining there.
+        ends = (
+            (road.xy[0], road.xy[1]),
+            (road.xy[-1], road.xy[-2]),
+        )
+        for end, nxt in ends:
+            if math.hypot(end[0] - tip_x, end[1] - tip_y) > CONNECT_M:
+                continue
+            leave = math.atan2(nxt[1] - end[1], nxt[0] - end[0])
+            delta = abs(wrap_rad(leave - tip_h))
+            if delta > CONNECT_HEADING:
+                continue
+            if best is None or delta < best[0]:
+                best = (delta, road)
+    return None if best is None else best[1]
+
+
+# Parking brake on gt_ctrl1 shed about 4.5 m/s^2. The mesh has to be at
+# least a stop shorter than that or the brake starts too late.
+PARK_DECEL_MPS2 = 4.5
+
+
+def _stop_ahead_m(speed_mps: float) -> float:
+    try:
+        speed = float(speed_mps)
+    except (TypeError, ValueError):
+        speed = 0.0
+    if speed != speed or speed < 0.0:
+        speed = 0.0
+    return max(AHEAD_MIN_M, speed * speed / (2.0 * PARK_DECEL_MPS2))
+
+
+def project_follow(
+    roads: list[RoadPoly],
+    x: float,
+    y: float,
+    heading_rad: float | None,
+    follow: RoadFollow,
+    speed_mps: float = 0.0,
+) -> RoadHit | None:
+    """Stay on the polyline we are already following, then its continuation.
+
+    ``project_road`` picks the globally nearest centerline. gt_ctrl2 did
+    that at three junctions (heading error jumped by ~1.5 rad for one
+    tick) and again at the end of road 119441, where the next nearest
+    polyline was 19 m away. This keeps the current road while the car is
+    still beside it. When that mesh runs out it takes a road that leaves
+    the tip along the same heading, and otherwise marks the hit
+    discontinuous so the caller brakes without adopting the cross street.
+    """
+    current = None
+    if follow.road_id:
+        for road in roads:
+            if road.road_id == follow.road_id:
+                current = road
+                break
+    if current is not None:
+        hit = _project_onto(current, x, y, heading_rad)
+        if hit is not None and lane_still_beside(hit):
+            # ahead_m stops growing at the curvature lookahead, so a full
+            # walk means the end is not in sight. A short walk is the real
+            # distance left. Brake once that is inside the stopping distance.
+            # gt_ctrl2 only noticed the end once the car was already past it.
+            sees_end = hit.ahead_m < CURVATURE_AHEAD_M - 0.05
+            if not sees_end or hit.ahead_m >= _stop_ahead_m(speed_mps):
+                _remember(follow, hit, heading_rad)
+                return hit
+            nxt = _successor(roads, current, x, y, heading_rad)
+            if nxt is not None:
+                chained = _project_onto(nxt, x, y, heading_rad)
+                if (
+                    chained is not None
+                    and chained.heading_err_rad is not None
+                    and abs(chained.heading_err_rad) <= CONNECT_HEADING
+                ):
+                    _remember(follow, chained, heading_rad)
+                    return chained
+            hit.discontinuous = True
+            return hit
+    nearest = project_road(roads, x, y, heading_rad)
+    if nearest is None:
+        return None
+    road_h = _road_heading(heading_rad, nearest.heading_err_rad)
+    if (
+        follow.forward_heading is not None
+        and road_h is not None
+        and abs(wrap_rad(road_h - follow.forward_heading)) > PREVIEW_JUMP_RAD
+    ):
+        nearest.discontinuous = True
+        # Do not adopt the crossing road. The caller holds the last curve.
+        nearest.road_id = follow.road_id or nearest.road_id
+        return nearest
+    _remember(follow, nearest, heading_rad)
+    return nearest
 
 
 def curvature_ahead(
@@ -302,14 +517,16 @@ def update_curve_preview(
     road_id: str,
     beside: bool,
     dt_s: float,
+    discontinuous: bool = False,
 ) -> CurvePreview | None:
     """Accept a sample, or keep the last one through a jump or a short gap.
 
     A heading change past ``PREVIEW_JUMP_RAD`` is rejected even when the
     new road's lane offset is small. gt_ctrl1 had that at t=46 s: offset
-    −0.8 m, heading error −1.56 rad, and the wheel was held instead of
-    steered. After ``PREVIEW_LOST_S`` the sample is marked lost so the
-    caller slows down. The steer command stays the held curve.
+    −0.8 m, heading error −1.56 rad. A discontinuity (the mesh ended, or
+    that jump) is lost immediately so the caller brakes. gt_ctrl2 waited
+    out ``PREVIEW_LOST_S`` at 12 m/s and was 19 m onto the next polyline
+    before the brake. The steer command stays the held curve either way.
     """
     try:
         dt = float(dt_s)
@@ -329,9 +546,13 @@ def update_curve_preview(
         else:
             if offset != offset or heading != heading:
                 fresh = False
+    jumped = False
     if fresh and memory.offset_m is not None:
         if abs(wrap_rad(heading - memory.heading_err_rad)) > PREVIEW_JUMP_RAD:
             fresh = False
+            jumped = True
+    if discontinuous:
+        fresh = False
     if fresh:
         try:
             kappa = float(curvature)
@@ -356,6 +577,6 @@ def update_curve_preview(
         curvature=float(memory.curvature),
         lane_x=ego_center_x(float(memory.offset_m), float(memory.heading_err_rad), 8.0),
         held=held,
-        lost=memory.age_s > PREVIEW_LOST_S,
+        lost=bool(discontinuous or jumped or memory.age_s > PREVIEW_LOST_S),
         road_id=memory.road_id,
     )

@@ -1461,6 +1461,27 @@ def curve_steer(
     return max(-1.0, min(1.0, feedforward + heading_term + cross))
 
 
+# gt_ctrl2 reached 3.3 m/s^2 lateral on a 37 m bend at 11 m/s.
+LAT_ACCEL_MAX = 2.5
+
+
+def curve_speed_mps(curvature: float, accel_max: float = LAT_ACCEL_MAX) -> float:
+    """Speed whose lateral accel on this bend is ``accel_max``.
+
+    A straight road (curvature ~ 0) does not impose a limit. A 40 m bend
+    caps at 10 m/s. The caller cuts throttle above this. A discontinuity
+    is a separate, harder brake.
+    """
+    try:
+        kappa = abs(float(curvature))
+        accel = float(accel_max)
+    except (TypeError, ValueError):
+        return float("inf")
+    if kappa != kappa or accel != accel or accel <= 0.0 or kappa < 1.0e-4:
+        return float("inf")
+    return math.sqrt(accel / kappa)
+
+
 def steer_for_heading_error(heading_err_rad: float) -> float:
     """Normalized steer that reduces heading error.
 

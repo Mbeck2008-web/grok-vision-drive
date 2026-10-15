@@ -8,8 +8,9 @@ in one tick. Instant zero hid the coast off a curve.
 ``law="legacy"`` is the steer that drove gt_ctrl1: pursuit of the straight
 8 m center, and steer 0 plus the parking brake when the measurement drops.
 ``law="curve"`` is Stanley, a speed-scaled crosstrack lookahead, and
-curvature feedforward. A dropped measurement keeps that command for
-``PREVIEW_LOST_S``, then slows down with the wheel still on the curve.
+curvature feedforward. Speed is capped so lateral accel stays near
+2.5 m/s^2. A dropped measurement brakes on that tick and keeps the
+last curve on the wheel.
 """
 
 from __future__ import annotations
@@ -24,13 +25,14 @@ from python.control.actuate import (
     WHEELBASE_M,
     DriveCommand,
     LaneSteerState,
+    curve_speed_mps,
     curve_steer,
     follow_lane_steer,
     lane_sample_hold_reason,
     path_steer_from_ego,
 )
 from python.control.launch_guard import LAUNCH_S, LaunchGuard, apply_lane_exit_brake
-from python.debug.gt_geom import PREVIEW_LOST_S, ego_center_x
+from python.debug.gt_geom import ego_center_x
 from python.debug.gt_summary import MIN_DRIVEN_M, MIN_MEAN_SPEED_MPS
 from python.train.scene_lane_runtime import straight_lane_path
 
@@ -146,26 +148,26 @@ def run_gt_lane(
     held_offset = offset
     held_heading = heading_err
     held_kappa = kappa
-    gap_age = 0.0
     for step in range(limit):
         now = step * dt
         dropped = gap_at_s is not None and float(gap_at_s) <= now < float(gap_at_s) + float(gap_s)
         lane_x: float | None
         if law == "curve":
-            if dropped:
-                gap_age += dt
-            else:
+            if not dropped:
                 held_offset = offset
                 held_heading = heading_err
                 held_kappa = kappa
-                gap_age = 0.0
             lane_x = ego_center_x(held_offset, held_heading, LOOKAHEAD_M)
             geometric = curve_steer(held_offset, held_heading, held_kappa, speed)
             cmd = DriveCommand(throttle=CRUISE_THROTTLE, brake=0.0, reason="ok")
             cmd.steer = follow_lane_steer(geometric, lane_x, steer_state, dt)
-            # Past the hold, slow down. The wheel stays on the last curve
-            # instead of centering while the car is still moving.
-            if dropped and gap_age > PREVIEW_LOST_S:
+            cap = curve_speed_mps(held_kappa)
+            if speed > cap:
+                cmd.throttle = 0.0
+            # A dropped measurement is the polyline ending under the car.
+            # gt_ctrl2 waited 1.5 s at 12 m/s. Brake on the first such tick.
+            # The wheel stays on the last curve.
+            if dropped:
                 cmd.throttle = 0.0
                 cmd.brake = max(float(cmd.brake), 1.0)
         elif dropped:

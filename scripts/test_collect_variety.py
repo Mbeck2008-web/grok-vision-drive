@@ -121,6 +121,32 @@ def check_clock_and_junctions() -> None:
     edged.phase = "weave"
     edged = edged.update(0.1, offset_m=5.0, heading_rad=0.0, lane_width_m=3.5, n_lanes=2)
     assert edged.phase == "abort" and edged.reason == "road_edge"
+    # A 4 m lane offset on a 10 m road is still on the pavement. The paved
+    # edge, not the lane half-width, is what aborts a weave.
+    on_paint = ExcursionClock()
+    on_paint.phase = "weave"
+    on_paint = on_paint.update(
+        0.1,
+        offset_m=4.0,
+        heading_rad=0.0,
+        lane_width_m=3.5,
+        n_lanes=2,
+        road_offset_m=1.0,
+        road_width_m=10.0,
+    )
+    assert on_paint.phase == "weave", on_paint
+    past = ExcursionClock()
+    past.phase = "weave"
+    past = past.update(
+        0.1,
+        offset_m=1.0,
+        heading_rad=0.0,
+        lane_width_m=3.5,
+        n_lanes=2,
+        road_offset_m=6.0,
+        road_width_m=10.0,
+    )
+    assert past.phase == "abort" and past.reason == "road_edge", past
     yawed = ExcursionClock()
     yawed.phase = "lane_change"
     yawed = yawed.update(0.1, offset_m=0.2, heading_rad=math.radians(25.0), lane_width_m=3.5, n_lanes=2)

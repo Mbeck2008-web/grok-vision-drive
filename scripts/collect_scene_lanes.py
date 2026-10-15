@@ -1158,7 +1158,9 @@ def main(argv: list[str] | None = None) -> int:
                 None if hit is None else hit.off_road,
             )
             lanes_here = road_lanes(roads, hit)
-            junction = near_junction(
+            # A missing label is an ambiguous tick, not a junction. Aborting the
+            # weave on it turned every masked sample into a failed excursion.
+            junction = False if hit is None else near_junction(
                 hit,
                 roads,
                 None if pos is None else float(pos[0]),
@@ -1196,6 +1198,7 @@ def main(argv: list[str] | None = None) -> int:
                     gate_note = gate
                     gate_log_t = now_gate
             if excursions_on and not waypoint and driving:
+                paved = road_for(roads, hit) if hit is not None else None
                 move = clock.update(
                     tick_dt,
                     offset_m=None if hit is None else hit.lane_offset_m,
@@ -1207,6 +1210,8 @@ def main(argv: list[str] | None = None) -> int:
                     n_lanes=lanes_here,
                     window_ok=window_ok,
                     start_kind=start_kind,
+                    road_offset_m=None if hit is None else hit.offset_m,
+                    road_width_m=None if paved is None else paved.width_m,
                 )
             else:
                 move = Excursion("cruise", 0.0, 0.0, 1, "")

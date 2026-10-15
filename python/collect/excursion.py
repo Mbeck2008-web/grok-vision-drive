@@ -34,6 +34,9 @@ HEADING_DEG = (5.0, 15.0)
 HEADING_TARGET_DEG = 10.0
 # Past the lane edge plus this margin, the move is no longer on the road.
 EDGE_M = 0.2
+# During a weave or lane change, the car may sit well off the lane center
+# while still on the pavement. Abort only past the paved edge by this much.
+PAVED_PAST_M = 0.5
 PATH_STEP_M = 4.0
 MIN_PATH_M = 25.0
 # A lane change that never saw this much offset is still in progress.
@@ -71,6 +74,20 @@ def _heading(direction: int, degrees: float | None = None) -> float:
     return sign * _deg(deg)
 
 
+def _past_paved_edge(road_offset_m: float | None, road_width_m: float | None) -> bool:
+    """True when the car is more than ``PAVED_PAST_M`` outside the median road span."""
+    if road_offset_m is None or road_width_m is None:
+        return False
+    try:
+        offset = abs(float(road_offset_m))
+        width = float(road_width_m)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(offset) or not math.isfinite(width) or width <= 0.0:
+        return False
+    return offset > width * 0.5 + PAVED_PAST_M
+
+
 def unsafe_reason(
     *,
     offset_m: float | None,
@@ -80,18 +97,29 @@ def unsafe_reason(
     near_junction: bool,
     traffic: bool,
     phase: str,
+    road_offset_m: float | None = None,
+    road_width_m: float | None = None,
 ) -> str:
-    """Why an excursion must stop. Empty when the move may continue."""
+    """Why an excursion must stop. Empty when the move may continue.
+
+    A weave or lane change is aborted for ``road_edge`` only when the car is
+    past the paved edge. ``road_width_m`` is the median left-right span, not
+    the widest junction node. Cruise still uses the lane half-width.
+    """
     if off_road:
         return "off_road"
     if near_junction:
         return "junction"
     if traffic and phase != "abort":
         return "traffic"
-    width = None if lane_width_m is None else float(lane_width_m)
-    if offset_m is not None and width is not None and width > 0.0:
-        if abs(float(offset_m)) > width * 0.5 + EDGE_M:
+    if phase in ("weave", "lane_change", "recover") and road_width_m is not None and road_offset_m is not None:
+        if _past_paved_edge(road_offset_m, road_width_m):
             return "road_edge"
+    else:
+        width = None if lane_width_m is None else float(lane_width_m)
+        if offset_m is not None and width is not None and width > 0.0:
+            if abs(float(offset_m)) > width * 0.5 + EDGE_M:
+                return "road_edge"
     if phase != "cruise" and heading_rad is not None and abs(float(heading_rad)) > _deg(20.0):
         return "heading"
     return ""
@@ -121,6 +149,8 @@ class ExcursionClock:
         n_lanes: int | None = None,
         window_ok: bool = True,
         start_kind: str | None = None,
+        road_offset_m: float | None = None,
+        road_width_m: float | None = None,
     ) -> Excursion:
         dt = max(0.0, float(dt_s))
         reason = unsafe_reason(
@@ -131,6 +161,8 @@ class ExcursionClock:
             near_junction=near_junction,
             traffic=traffic,
             phase=self.phase,
+            road_offset_m=road_offset_m,
+            road_width_m=road_width_m,
         )
         if reason and self.phase not in ("cruise", "abort"):
             self.phase = "abort"
@@ -621,7 +653,10 @@ def _walk_piece(
             travelled += seg
             fx, fy = ux, uy
             idx += step_i
-    if (idx < 0 or idx >= len(pts)) and travelled > samples[-1][4] + 0.05:
+    # A step of 8 m toward a 12 m lookahead can finish 3 cm short of the
+    # target and leave that distance off the sample list. The junction test
+    # then reads 8 m and aborts a weave that still has road ahead.
+    if travelled > samples[-1][4] + 0.05:
         samples.append((px, py, fx, fy, travelled))
     return samples
 

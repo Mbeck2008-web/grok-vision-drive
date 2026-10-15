@@ -17,6 +17,7 @@ import argparse
 import contextlib
 import faulthandler
 import math
+import os
 import sys
 import time
 import traceback
@@ -47,8 +48,8 @@ from python.train.fit import (  # noqa: E402
     bytes_per_strip,
     fit_with_probe,
     largest_batch,
-    measure_driving_file,
     plan_fit,
+    step_bytes,
     read_free_ram_bytes,
     read_free_vram_bytes,
     read_used_ram_bytes,
@@ -121,8 +122,47 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run two steps and print tensor shapes.",
     )
+    parser.add_argument(
+        "--no-panel",
+        action="store_true",
+        help="Do not open the training window. The run starts on its own.",
+    )
+    parser.add_argument(
+        "--autostart",
+        action="store_true",
+        help="Start without the Start button. The window still opens when a display is attached.",
+    )
     parser.add_argument("--metrics-every", type=int, default=10, help="Write metrics.jsonl every N steps.")
     return parser
+
+
+def headless_requested() -> bool:
+    return os.environ.get("GVD_HEADLESS", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def interactive_display() -> bool:
+    """True when a desktop is attached. A service session and a headless Linux box are false."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            # SM_CMONITORS
+            return int(ctypes.windll.user32.GetSystemMetrics(80)) > 0
+        except (AttributeError, OSError):
+            return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def resolve_panel(*, no_panel: bool, autostart: bool) -> tuple[bool, bool]:
+    """Whether to open the window, and whether to start without the Start button.
+
+    No interactive display, ``GVD_HEADLESS=1``, and ``--no-panel`` all start
+    on their own. ``--autostart`` skips the button and can still show the panel.
+    """
+    headless = headless_requested() or not interactive_display()
+    open_panel = not bool(no_panel) and not headless
+    start_now = bool(autostart) or bool(no_panel) or headless
+    return open_panel, start_now
 
 
 # Two optimizer steps on a handful of frames. Longer than a slow disk read,
@@ -162,10 +202,11 @@ def disarm_dry_run_watchdog() -> None:
     faulthandler.cancel_dump_traceback_later()
 
 
-def _confirm_start(view: TrainWindow, *, dry_run: bool) -> bool:
-    """Dry-run starts immediately. A full run still waits for the Start button."""
-    if dry_run:
-        print("[GVD] dry-run: starting without the Start button", flush=True)
+def _confirm_start(view: TrainWindow, *, dry_run: bool, autostart: bool = False) -> bool:
+    """Dry-run and autostart begin immediately. A panel run waits for Start."""
+    if dry_run or autostart:
+        why = "dry-run" if dry_run else "autostart"
+        print(f"[GVD] {why}: starting without the Start button", flush=True)
         return True
     return _wait_for_start(view)
 
@@ -350,8 +391,13 @@ def overlap_gradient_cut() -> dict[str, bool] | None:
     }
 
 
-def _frame_row(root: Path, row: Mapping[str, Any]) -> tuple[Any, Mapping[str, Any]]:
-    frame = np.ascontiguousarray(_load_bgr(root, int(row["i"])))
+def _frame_row(root: Path, row: Mapping[str, Any]) -> tuple[Any, Mapping[str, Any]] | None:
+    """Stitch one tick. A missing frame is a gap, not a crash."""
+    try:
+        frame = np.ascontiguousarray(_load_bgr(root, int(row["i"])))
+    except FileNotFoundError as exc:
+        print(f"[GVD] scene load skip i={row.get('i')}: {exc}", flush=True)
+        return None
     # The stitch is not a yaw roll, so this returns the frame and the row.
     frame, row = offcenter_view(frame, row)
     return frame, row
@@ -432,7 +478,10 @@ def _optimizer_step(
                 f"[GVD] scene load {tick + 1}/{len(rows)} i={row.get('i')}",
                 flush=True,
             )
-        frame, row = _frame_row(root, row)
+        loaded = _frame_row(root, row)
+        if loaded is None:
+            continue
+        frame, row = loaded
         image = torch.from_numpy(frame).to(device)
         dt = torch.tensor([step_dt(row.get("dt_s"))], dtype=torch.float32, device=device)
         with _autocast(amp):
@@ -527,7 +576,10 @@ def _eval_sequence(
     try:
         with torch.no_grad():
             for row in rows:
-                frame, row = _frame_row(root, row)
+                loaded = _frame_row(root, row)
+                if loaded is None:
+                    continue
+                frame, row = loaded
                 image = torch.from_numpy(frame).to(device)
                 dt = torch.tensor([step_dt(row.get("dt_s"))], dtype=torch.float32, device=device)
                 with _autocast(amp):
@@ -722,24 +774,31 @@ def train_directory(
     dry_run: bool = False,
     metrics_every: int = 10,
     status_root: Path | None = None,
+    autostart: bool = False,
+    open_panel: bool = True,
 ) -> dict[str, Any]:
     import torch
 
     from python.train.scene_net import SceneNet
 
     root = Path(root)
-    from python.data.raw_frames import load_scene_rows
-    from python.train.scene_loader import default_num_workers
+    from python.data.raw_frames import load_scene_rows, training_frame_bytes
+    from python.train.scene_loader import default_num_workers, select_training_rows
 
     print("[GVD] scene index: reading state.jsonl", flush=True)
-    rows = load_scene_rows(root)
-    print(f"[GVD] scene index: {len(rows)} rows", flush=True)
-    print("[GVD] scene index: measuring files", flush=True)
+    state_rows = load_scene_rows(root)
+    print(f"[GVD] scene index: {len(state_rows)} state rows", flush=True)
+    print("[GVD] scene index: measuring frames", flush=True)
 
-    def _index_progress(n_files: int, n_bytes: int) -> None:
-        print(f"[GVD] scene index: {n_files} files {n_bytes} bytes", flush=True)
+    def _index_progress(n_frames: int, n_bytes: int) -> None:
+        print(f"[GVD] scene index: {n_frames} frames {n_bytes} bytes", flush=True)
 
-    file_bytes = measure_driving_file(root, progress=_index_progress)
+    file_bytes, _n_image_files = training_frame_bytes(root, progress=_index_progress)
+    rows, missing_rows = select_training_rows(root, state_rows)
+    print(
+        f"[GVD] scene index: {len(rows)} rows with frames, {missing_rows} missing",
+        flush=True,
+    )
     if free_vram_bytes is None:
         free_vram_bytes = read_free_vram_bytes()
     if free_ram_bytes is None:
@@ -822,14 +881,33 @@ def train_directory(
 
     device = holder["device"]
     net = holder["net"]
+    # One recording is one GRU stream. A larger batch would be parallel
+    # recordings, which this folder does not have. parallel_fit is how many
+    # such streams the free VRAM could hold at this chunk length.
     batch = 1
+    parallel_fit = 0
+    if int(free_vram_bytes) > 0 and len(rows) > 0:
+        parallel_fit = largest_batch(
+            usable_bytes(int(free_vram_bytes)),
+            file_bytes=file_bytes,
+            n_strips=len(rows),
+            window_strips=chunk_len,
+            limit=32,
+        )
+    est_step = step_bytes(
+        batch,
+        file_bytes=file_bytes,
+        n_strips=max(1, len(rows)),
+        window_strips=chunk_len,
+    )
     recommended = bool(plan.recommended) and device.type == "cuda"
     note = "recommended" if recommended else "not recommended"
     workers = default_num_workers()
     print(
         f"[GVD] scene fit file={file_bytes} free_vram={int(free_vram_bytes)} "
         f"free_ram={int(free_ram_bytes)} device={device.type} batch={batch} "
-        f"chunk={chunk_len} workers={workers} {note}",
+        f"chunk={chunk_len} step={est_step} parallel_fit={parallel_fit} "
+        f"workers={workers} {note}",
         flush=True,
     )
     from python.debug.remote_status import (
@@ -1199,8 +1277,9 @@ def train_directory(
             print(f"[GVD] sanity lane_gt={lane_loss} step={done} ok={sanity_ok}", flush=True)
 
     try:
-        view.open()
-        if not _confirm_start(view, dry_run=dry_run):
+        if open_panel:
+            view.open()
+        if not _confirm_start(view, dry_run=dry_run, autostart=autostart or not open_panel):
             paused_exit = True
         elif dry_run or sanity:
             view.mark_running()
@@ -1338,6 +1417,9 @@ def main(argv: list[str] | None = None) -> None:
     if not torch_ready():
         print("[GVD] scene train needs PyTorch")
         sys.exit(2)
+    open_panel, start_now = resolve_panel(no_panel=bool(args.no_panel), autostart=bool(args.autostart))
+    if not open_panel:
+        print("[GVD] scene train: no panel", flush=True)
     try:
         stats = train_directory(
             Path(args.strips),
@@ -1349,6 +1431,8 @@ def main(argv: list[str] | None = None) -> None:
             sanity=bool(args.sanity) and not bool(args.dry_run),
             dry_run=bool(args.dry_run),
             metrics_every=int(args.metrics_every),
+            autostart=start_now,
+            open_panel=open_panel,
         )
     except TrainFitError as exc:
         print(f"[GVD] scene train: {exc}")

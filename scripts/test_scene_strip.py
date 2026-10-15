@@ -1718,7 +1718,7 @@ def check_trainer_is_offline() -> None:
     ):
         assert bad not in text, bad
     body = inspect.getsource(train_directory)
-    assert body.index("measure_driving_file") < body.index("plan_fit")
+    assert body.index("training_frame_bytes") < body.index("plan_fit")
     assert body.index("read_free_vram_bytes") < body.index("plan_fit")
     assert body.index("plan_fit") < body.index("_optimizer_step")
     assert "step_dt" in text

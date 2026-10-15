@@ -15,14 +15,30 @@ sys.path.insert(0, str(ROOT))
 
 import numpy as np  # noqa: E402
 
-from python.data.raw_frames import _png_bytes, load_training_bgr, read_image_file  # noqa: E402
+from python.data.raw_frames import (  # noqa: E402
+    _png_bytes,
+    load_training_bgr,
+    read_image_file,
+    training_frame_bytes,
+)
 from python.data.strip_writer import compose_strip  # noqa: E402
-from python.train.fit import _windows_memory, read_free_ram_bytes, read_used_ram_bytes  # noqa: E402
-from python.train.scene_loader import _spawn_load, default_num_workers  # noqa: E402
+from python.train.continual import choose_chunk_length, chunk_vram_budget, should_reset_state  # noqa: E402
+from python.train.fit import (  # noqa: E402
+    _windows_memory,
+    bytes_per_strip,
+    largest_batch,
+    read_free_ram_bytes,
+    read_used_ram_bytes,
+    step_bytes,
+    usable_bytes,
+)
+from python.train.scene_loader import _spawn_load, default_num_workers, select_training_rows  # noqa: E402
+from python.train.scene_net import MEMORY_S  # noqa: E402
 from python.train.train_scene import (  # noqa: E402
     _confirm_start,
     arm_dry_run_watchdog,
     disarm_dry_run_watchdog,
+    resolve_panel,
     train_directory,
 )
 
@@ -133,10 +149,131 @@ def check_spawn_reads_repaired() -> None:
     print(f"spawn loader shape={shape}")
 
 
+def _row(index: int, t: float, dt: float | None) -> dict:
+    return {
+        "i": index,
+        "t": t,
+        "dt_s": dt,
+        "session": "rec",
+        "cams": {"main": {"file": f"raw/main/{index:06d}.png"}},
+    }
+
+
+def check_leading_rows_without_frames() -> None:
+    """The first state rows can be older than the first PNG. They are not a crash."""
+    colour = np.zeros((8, 12, 3), dtype=np.uint8)
+    colour[:, :, 1] = 50
+    encoded = _png_bytes(colour)
+    assert encoded is not None
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        main = root / "raw" / "main"
+        main.mkdir(parents=True)
+        # Indices 0 and 1 were recorded before any camera file existed.
+        (main / "000002.png").write_bytes(encoded)
+        corrupt = encoded.replace(b"\n", b"\r\n")
+        (main / "000003.png").write_bytes(corrupt)
+        repaired = root / "raw_repaired" / "main"
+        repaired.mkdir(parents=True)
+        (repaired / "000003.png").write_bytes(encoded)
+        rows = [
+            _row(0, 0.0, None),
+            _row(1, 0.1, 0.1),
+            _row(2, 10.0, 0.1),
+            _row(3, 40.0, 0.1),
+        ]
+        try:
+            load_training_bgr(root, 0)
+        except FileNotFoundError as exc:
+            assert "000000" in str(exc)
+            assert "raw" in str(exc)
+        else:
+            raise AssertionError("index 0 has no frame")
+        kept, missing = select_training_rows(root, rows)
+        assert missing == 2
+        assert [int(row["i"]) for row in kept] == [2, 3]
+        assert kept[0]["dt_s"] is None
+        assert abs(float(kept[1]["dt_s"]) - 30.0) < 1e-9
+        assert should_reset_state("rec", "rec", kept[1]["dt_s"], memory_s=MEMORY_S)
+        assert [int(row["i"]) for row in kept[:4]] == [2, 3]
+        loaded = load_training_bgr(root, 3)
+        assert loaded.shape[2] == 3
+        assert read_image_file(main / "000003.png") is None
+    print("leading rows without frames skipped")
+
+
+def check_frames_counted_once() -> None:
+    colour = np.full((6, 8, 3), 9, dtype=np.uint8)
+    encoded = _png_bytes(colour)
+    assert encoded is not None
+    other = np.full((20, 30, 3), 3, dtype=np.uint8)
+    second = _png_bytes(other)
+    assert second is not None and len(second) != len(encoded)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        raw = root / "raw" / "main"
+        raw.mkdir(parents=True)
+        fixed = root / "raw_repaired" / "main"
+        fixed.mkdir(parents=True)
+        (raw / "000000.png").write_bytes(encoded.replace(b"\n", b"\r\n"))
+        (fixed / "000000.png").write_bytes(encoded)
+        (raw / "000001.png").write_bytes(second)
+        (fixed / "000001.png").write_bytes(encoded)
+        (root / "state.jsonl").write_text("{}\n", encoding="utf-8")
+        total, frames = training_frame_bytes(root)
+        assert frames == 2
+        assert total == len(encoded) + len(second) + len("{}\n".encode("utf-8"))
+    print(f"frames counted once bytes={total}")
+
+
+def check_panel_flags_and_vram_room() -> None:
+    import python.train.train_scene as trainer
+
+    real_display = trainer.interactive_display
+    real_headless = trainer.headless_requested
+    try:
+        trainer.interactive_display = lambda: True
+        trainer.headless_requested = lambda: False
+        assert resolve_panel(no_panel=False, autostart=False) == (True, False)
+        assert resolve_panel(no_panel=True, autostart=False) == (False, True)
+        assert resolve_panel(no_panel=False, autostart=True) == (True, True)
+        trainer.headless_requested = lambda: True
+        assert resolve_panel(no_panel=False, autostart=False) == (False, True)
+        trainer.headless_requested = lambda: False
+        trainer.interactive_display = lambda: False
+        assert resolve_panel(no_panel=False, autostart=False) == (False, True)
+    finally:
+        trainer.interactive_display = real_display
+        trainer.headless_requested = real_headless
+    assert _confirm_start(_HangWindow(), dry_run=False, autostart=True) is True
+
+    # 1080 Ti, about 7.9 GiB free, FP32, one repaired copy of the 45-minute set.
+    free = int(7.9 * (1024 ** 3))
+    file_bytes = 8_500_000_000
+    n_strips = 4726
+    per = bytes_per_strip(file_bytes, n_strips)
+    chunk = choose_chunk_length(per, chunk_vram_budget(free))
+    one = step_bytes(1, file_bytes=file_bytes, n_strips=n_strips, window_strips=chunk)
+    room = largest_batch(
+        usable_bytes(free),
+        file_bytes=file_bytes,
+        n_strips=n_strips,
+        window_strips=chunk,
+        limit=32,
+    )
+    assert chunk == 16
+    assert one < usable_bytes(free)
+    assert room > 1
+    print(f"1080 Ti FP32 chunk={chunk} step={one} parallel_fit={room}")
+
+
 def main() -> None:
     check_windows_memory_status()
     check_workers_and_dry_run_start()
     check_spawn_reads_repaired()
+    check_leading_rows_without_frames()
+    check_frames_counted_once()
+    check_panel_flags_and_vram_room()
     print("scene loader ok")
 
 

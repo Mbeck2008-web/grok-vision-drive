@@ -11,7 +11,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from python.data.raw_frames import load_training_bgr
+from python.data.raw_frames import load_training_bgr, row_has_decodable_frame
 
 
 def default_num_workers() -> int:
@@ -30,6 +30,47 @@ def default_num_workers() -> int:
 def load_canvas(root: Path | str, index: int):
     """Stitch this tick. A text-mode PNG is read from ``raw_repaired``."""
     return load_training_bgr(root, index)
+
+
+def _stamp(value: object) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        stamp = float(value)
+    except (TypeError, ValueError):
+        return None
+    if stamp != stamp or stamp in (float("inf"), float("-inf")):
+        return None
+    return stamp
+
+
+def select_training_rows(
+    root: Path | str,
+    rows: list,
+) -> tuple[list, int]:
+    """Keep rows that have a decodable strip camera. Count the rest as missing.
+
+    ``dt_s`` is rewritten from the timestamps of the kept rows. A hole where
+    frames were never saved becomes one gap, and a gap longer than the GRU
+    memory clears the state. The original state file is not rewritten.
+    """
+    kept: list = []
+    missing = 0
+    prev_t: float | None = None
+    for row in rows:
+        if not isinstance(row, dict) or not row_has_decodable_frame(root, row):
+            missing += 1
+            continue
+        item = dict(row)
+        stamp = _stamp(item.get("t"))
+        if prev_t is None or stamp is None:
+            item["dt_s"] = None
+        else:
+            item["dt_s"] = stamp - prev_t
+        kept.append(item)
+        if stamp is not None:
+            prev_t = stamp
+    return kept, missing
 
 
 def _spawn_load(root: str, index: int, queue) -> None:

@@ -14,8 +14,8 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from python.data.binary_io import os_binary, write_new_file
-from python.data.strip_writer import compose_strip, read_state_jsonl
+from python.data.binary_io import PNG_SIG, os_binary, write_new_file
+from python.data.strip_writer import STRIP_ORDER, compose_strip, read_state_jsonl
 
 # The collector sleeps 0.1 s, so 10 Hz is the planning rate. A slower poll
 # shows up in the measured minute line, not in this ceiling.
@@ -485,6 +485,115 @@ def repaired_copies(path: Path) -> list[Path]:
         root = file.parent.parent.parent
         found.append(root / "raw_repaired" / file.parent.name / file.name)
     return found
+
+
+def png_signature_ok(path: Path | str) -> bool:
+    """True when the file starts with the real PNG signature, not a CRLF rewrite."""
+    try:
+        with Path(path).open("rb") as handle:
+            return handle.read(8) == PNG_SIG
+    except OSError:
+        return False
+
+
+def image_file_decodable(path: Path | str) -> bool:
+    """True when this path, or its repaired PNG sibling, can be opened as an image.
+
+    A PNG is accepted on its signature. Full decode stays in the loader.
+    ``raw`` and ``raw_repaired`` are not both required.
+    """
+    file = Path(path)
+    if file.suffix.lower() == ".npy" and file.is_file():
+        return True
+    if file.suffix.lower() == ".png":
+        if file.is_file() and png_signature_ok(file):
+            return True
+        for alt in repaired_copies(file):
+            if alt.is_file() and png_signature_ok(alt):
+                return True
+    return False
+
+
+def training_image_path(path: Path | str) -> Path | None:
+    """The one file the loader will read for this capture, or None."""
+    file = Path(path)
+    if file.suffix.lower() == ".npy":
+        return file if file.is_file() else None
+    if file.suffix.lower() != ".png":
+        return None
+    if file.is_file() and png_signature_ok(file):
+        return file
+    for alt in repaired_copies(file):
+        if alt.is_file() and png_signature_ok(alt):
+            return alt
+    return None
+
+
+def cameras_for_row(row: Mapping[str, Any] | None) -> list[str]:
+    """Strip cameras this tick recorded. The net paints any missing sector black."""
+    cams = None if row is None else row.get("cams")
+    if isinstance(cams, dict) and cams:
+        names = [str(key) for key in cams if str(key) in STRIP_ORDER]
+        if names:
+            return names
+    return list(STRIP_ORDER)
+
+
+def row_has_decodable_frame(root: Path | str, row: Mapping[str, Any]) -> bool:
+    """True when at least one camera the strip uses has a decodable file."""
+    try:
+        index = int(row.get("i"))
+    except (TypeError, ValueError):
+        return False
+    raw = Path(root) / "raw"
+    stem = f"{index:06d}"
+    for cam in cameras_for_row(row):
+        if image_file_decodable(raw / cam / f"{stem}.png"):
+            return True
+        if image_file_decodable(raw / cam / f"{stem}.npy"):
+            return True
+    return False
+
+
+def training_frame_bytes(
+    root: Path | str,
+    *,
+    progress: Any = None,
+) -> tuple[int, int]:
+    """Bytes and frame count the trainer reads. Each capture is counted once.
+
+    A repaired PNG replaces the original in the total. The two copies are
+    not added together. State and camera sidecars are included once.
+    """
+    root = Path(root)
+    if not root.exists():
+        return 0, 0
+    total = 0
+    frames = 0
+    for path in root.rglob("*"):
+        if not path.is_file() or path.is_symlink():
+            continue
+        if "raw_repaired" in path.parts:
+            continue
+        if path.parent.parent.name == "raw" and path.suffix.lower() in {".png", ".npy"}:
+            chosen = training_image_path(path)
+            if chosen is None:
+                continue
+            try:
+                total += int(chosen.stat().st_size)
+            except OSError:
+                continue
+            frames += 1
+            if progress is not None and frames % 5000 == 0:
+                progress(frames, total)
+            continue
+        try:
+            total += int(path.stat().st_size)
+        except OSError:
+            continue
+    if progress is not None:
+        progress(frames, total)
+    return total, frames
 
 
 def read_image_with_repair(path: Path | str) -> np.ndarray | None:

@@ -56,6 +56,16 @@ class FrameCache:
                     continue
                 self._by_index.setdefault(index, []).append((name, cam, slot))
 
+    def __getstate__(self) -> dict[str, Any]:
+        """Drop memory maps. A spawned worker reopens them on the first read."""
+        state = dict(self.__dict__)
+        state["_open"] = {}
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._open = {}
+
     def has(self, index: int) -> bool:
         return int(index) in self._by_index
 

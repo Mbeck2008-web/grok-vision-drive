@@ -236,6 +236,76 @@ def check_subset_forward_probe_and_export() -> None:
     print("subset forward and export shape")
 
 
+def check_spawn_loader_reads_cache() -> None:
+    """Windows starts DataLoader workers with spawn. A lambda collate does not pickle."""
+    import multiprocessing as mp
+    import pickle
+
+    from python.train.frame_cache import FrameCache, build_frame_cache
+    from python.train.scene_net import torch_ready
+    from python.train.train_scene import (
+        _EpochWindows,
+        _first_item,
+        _prefetch_loader,
+        _release_worker_handles,
+    )
+
+    if not torch_ready():
+        print("spawn loader skipped (torch missing)")
+        return
+    import cv2
+    from torch.utils.data import DataLoader
+
+    colour = np.zeros((16, 16, 3), dtype=np.uint8)
+    colour[:, :] = (40, 80, 120)
+    ok, encoded = cv2.imencode(".png", colour)
+    assert ok
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "scene"
+        cam = root / "raw" / "main"
+        cam.mkdir(parents=True)
+        lines = []
+        for index in range(4):
+            (cam / f"{index:06d}.png").write_bytes(encoded.tobytes())
+            lines.append({"i": index, "t": float(index), "cams": {"main": {"file": f"raw/main/{index:06d}.png"}}})
+        (root / "state.jsonl").write_text("\n".join(json.dumps(row) for row in lines) + "\n", encoding="utf-8")
+        cache_dir = Path(tmp) / "cache"
+        build_frame_cache(root, cache_dir, ("main",))
+        cache = FrameCache(cache_dir)
+        items = [
+            {"kind": "train", "rows": [lines[0], lines[1]], "stride": 2, "incoming": "carry"},
+            {"kind": "train", "rows": [lines[2], lines[3]], "stride": 2, "incoming": "carry"},
+            {"kind": "holdout", "rows": [lines[0]], "stride": 0},
+        ]
+        dataset = _EpochWindows(items[:2], root, ("main",), str(cache_dir), 1.0)
+        pickle.dumps(_first_item)
+        pickle.dumps(dataset)
+        pickle.dumps(cache)
+        loader = DataLoader(
+            dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=2,
+            persistent_workers=True,
+            collate_fn=_first_item,
+            worker_init_fn=_release_worker_handles,
+            multiprocessing_context=mp.get_context("spawn"),
+        )
+        seen = []
+        for batch in loader:
+            assert batch["incoming"] == "reset"
+            assert len(batch["frames"]) == 2
+            assert batch["frames"][0].shape == (192, 256, 3)
+            seen.append(batch["rows"][0]["i"])
+        assert sorted(seen) == [0, 2]
+        del loader
+        wrapped = _prefetch_loader(items, root, ("main",), cache, 1.0, workers=2, cuda=False)
+        assert wrapped is not None and wrapped.collate_fn is _first_item
+        assert len(wrapped.dataset) == 2
+        del wrapped
+    print("spawn loader")
+
+
 def check_sanity_overfits_cached_main() -> None:
     """Sanity repeats one main-camera batch until lane_gt is under 0.05."""
     from python.train.frame_cache import FrameCache, build_frame_cache
@@ -320,6 +390,7 @@ def main() -> None:
     check_cache_chunks()
     check_epoch_windows()
     check_subset_forward_probe_and_export()
+    check_spawn_loader_reads_cache()
     check_sanity_overfits_cached_main()
     print("train options ok")
 

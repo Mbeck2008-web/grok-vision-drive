@@ -477,7 +477,7 @@ def _frame_row(
     scale: float = 1.0,
 ) -> tuple[Any, Mapping[str, Any]] | None:
     """Stitch one tick. A missing frame is a gap, not a crash."""
-    from python.data.strip_writer import STRIP_ORDER
+    from python.data.strip_writer import CANVAS_W, STRIP_ORDER
     from python.train.cam_strip import extract_cams, photometric_jitter
 
     index = int(row["i"])
@@ -490,8 +490,14 @@ def _frame_row(
         except FileNotFoundError as exc:
             print(f"[GVD] scene load skip i={row.get('i')}: {exc}", flush=True)
             return None
-        if cams and tuple(cams) != tuple(STRIP_ORDER):
-            frame = extract_cams(frame, tuple(cams))
+    # An all-camera cache is the full strip. A main-only net needs that sector cut out.
+    if (
+        frame is not None
+        and cams
+        and tuple(cams) != tuple(STRIP_ORDER)
+        and int(frame.shape[1]) == CANVAS_W
+    ):
+        frame = extract_cams(frame, tuple(cams))
     if scale < 0.999:
         from python.train.cam_strip import scale_canvas
 
@@ -886,6 +892,16 @@ def _save_pause(
     return payload
 
 
+def _first_item(batch: list[Any]) -> Any:
+    """Collate for a batch of one window. Must be a module function so spawn can pickle it."""
+    return batch[0]
+
+
+def _release_worker_handles(worker_id: int) -> None:
+    """Spawn starts from a pickle. Handles are opened on the first cache read."""
+    del worker_id
+
+
 class _EpochWindows:
     """One training window per index. Workers decode; the step stays on the parent."""
 
@@ -899,25 +915,39 @@ class _EpochWindows:
     ) -> None:
         self.items = list(items)
         self.root = str(root)
-        self.cams = cams
-        self.cache_dir = cache_dir
+        self.cams = None if cams is None else tuple(cams)
+        self.cache_dir = str(cache_dir or "")
         self.scale = float(scale)
+        self._cache: Any = None
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = dict(self.__dict__)
+        state["_cache"] = None
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._cache = None
 
     def __len__(self) -> int:
         return len(self.items)
 
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        from python.train.frame_cache import FrameCache
+    def _reader(self) -> Any:
+        if self._cache is None and self.cache_dir:
+            from python.train.frame_cache import FrameCache
 
+            self._cache = FrameCache(self.cache_dir)
+        return self._cache
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
         item = self.items[index]
-        cache = FrameCache(self.cache_dir) if self.cache_dir else None
         frames: list[Any] = []
         for row in item.get("rows") or []:
             loaded = _frame_row(
                 Path(self.root),
                 row,
                 cams=self.cams,
-                cache=cache,
+                cache=self._reader(),
                 augment=False,
                 scale=self.scale,
             )
@@ -949,7 +979,8 @@ def _prefetch_loader(items: list[dict[str, Any]], root: Path, cams, cache, scale
         dataset,
         batch_size=1,
         shuffle=False,
-        collate_fn=lambda batch: batch[0],
+        collate_fn=_first_item,
+        worker_init_fn=_release_worker_handles,
         **settings,
     )
 
@@ -1116,7 +1147,6 @@ def train_directory(
     )
     recommended = bool(plan.recommended) and device.type == "cuda"
     note = "recommended" if recommended else "not recommended"
-    workers = default_num_workers()
     print(
         f"[GVD] scene fit file={file_bytes} free_vram={int(free_vram_bytes)} "
         f"free_ram={int(free_ram_bytes)} device={device.type} batch={batch} "

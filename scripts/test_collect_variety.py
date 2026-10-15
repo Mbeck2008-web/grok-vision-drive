@@ -35,6 +35,7 @@ from scripts.collect_scene_lanes import (  # noqa: E402
     achieved_hz,
     decode_issues,
     segment_at,
+    share_maps,
     segment_env,
     start_freeroam,
     tick_sleep_s,
@@ -273,6 +274,24 @@ def check_smoke_rate_and_flags() -> None:
     assert segment_at(0.0, ("west_coast_usa", "italy"), 12 * 60) == ("west_coast_usa", 0)
     assert segment_at(12 * 60, ("west_coast_usa", "italy"), 12 * 60) == ("italy", 1)
     assert segment_at(0.0, (), 60.0) == ("", 0)
+    weighted = (
+        "west_coast_usa",
+        "italy",
+        "east_coast_usa",
+        "hirochi_raceway",
+        "gridmap_v2",
+        "small_island",
+    )
+    weights = {"west_coast_usa": 0.6}
+    shares = share_maps(weighted, weights)
+    assert abs(sum(share for _name, share in shares) - 1.0) < 1e-9
+    assert abs(shares[0][1] - 0.6) < 1e-9
+    assert abs(shares[1][1] - 0.08) < 1e-9
+    total = 120.0 * 60.0
+    assert segment_at(0.0, weighted, 12 * 60, weights, total)[0] == "west_coast_usa"
+    assert segment_at(72.0 * 60.0 - 1.0, weighted, 12 * 60, weights, total)[0] == "west_coast_usa"
+    assert segment_at(72.0 * 60.0, weighted, 12 * 60, weights, total)[0] == "italy"
+    assert segment_at(119.0 * 60.0, weighted, 12 * 60, weights, total)[0] == "small_island"
     assert segment_env(0) == ("", "")
     assert segment_env(1)[1] == "clear"
     opts = AutoOptions(minutes=120, maps=",".join(DEFAULT_MAPS), excursions=True, smoke_s=60, vary_env=True)

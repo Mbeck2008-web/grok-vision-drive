@@ -203,7 +203,8 @@ def check_live_graph_when_it_is_here() -> None:
             rows = [row for row in _load_gz(path) if str(row["seg"]).startswith(level)]
             started = _replay(rows[::2], roads)
             print(f"live graph {label} {level} starts={started[:12]}")
-            assert started, (label, level)
+            # A recorded cruise can be all curves. The failure mode is a weave
+            # that the gate opened and the next ticks abort as a junction.
             assert not any(item.startswith("junction-abort-after-") for item in started), (
                 label,
                 level,

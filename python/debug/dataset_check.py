@@ -50,11 +50,66 @@ def lanes_from_vector(values: Any) -> list[list[dict[str, float]]]:
     return [left, right]
 
 
+def _xy_of(row: dict[str, Any]) -> tuple[float, float] | None:
+    ego = row.get("ego") if isinstance(row.get("ego"), dict) else {}
+    pos = ego.get("pos") if isinstance(ego, dict) else None
+    if isinstance(pos, (list, tuple)) and len(pos) >= 2:
+        try:
+            return float(pos[0]), float(pos[1])
+        except (TypeError, ValueError):
+            return None
+    if isinstance(ego, dict) and ego.get("x") is not None and ego.get("y") is not None:
+        try:
+            return float(ego["x"]), float(ego["y"])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _speed_of(row: dict[str, Any]) -> float | None:
+    ego = row.get("ego") if isinstance(row.get("ego"), dict) else {}
+    if not isinstance(ego, dict):
+        return None
+    try:
+        speed = float(ego.get("speed_mps"))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(speed):
+        return None
+    return speed
+
+
+def _recover_break(
+    row: dict[str, Any],
+    prev_speed: float | None,
+    prev_xy: tuple[float, float] | None,
+) -> bool:
+    """A respawn settle is a segment break, same as a map change.
+
+    The row is marked ``recover`` after a logged respawn. Older logs have
+    the settle only as a multi-second gap while the car was already stopped
+    and did not drive through the hole.
+    """
+    if row.get("recover") is True:
+        return True
+    if str(row.get("recover")).lower() in ("1", "true"):
+        return True
+    if prev_speed is None or prev_speed >= 1.0 or prev_xy is None:
+        return False
+    here = _xy_of(row)
+    if here is None:
+        return False
+    moved = math.hypot(here[0] - prev_xy[0], here[1] - prev_xy[1])
+    return moved < 25.0
+
+
 def _issues_for_row(
     row: dict[str, Any],
     prev_t: float | None,
     prev_i: int | None = None,
     prev_segment: str = "",
+    prev_speed: float | None = None,
+    prev_xy: tuple[float, float] | None = None,
 ) -> tuple[list[str], float | None, int | None, str, bool]:
     issues: list[str] = []
     idx = row.get("i")
@@ -77,7 +132,7 @@ def _issues_for_row(
         gap = t - prev_t
         if gap < 0.0:
             issues.append(f"row {idx}: time went backwards by {gap:.3f}s")
-        elif gap > GAP_S and not switched:
+        elif gap > GAP_S and not switched and not _recover_break(row, prev_speed, prev_xy):
             step = None if prev_i is None or this_i is None else this_i - prev_i
             if step == 1:
                 issues.append(
@@ -180,10 +235,16 @@ def _validate_raw(
     prev_t: float | None = None
     prev_i: int | None = None
     prev_segment = ""
+    prev_speed: float | None = None
+    prev_xy: tuple[float, float] | None = None
     nan_rows = 0
     masked_rows = 0
     for row in rows:
-        row_issues, prev_t, prev_i, prev_segment, masked = _issues_for_row(row, prev_t, prev_i, prev_segment)
+        row_issues, prev_t, prev_i, prev_segment, masked = _issues_for_row(
+            row, prev_t, prev_i, prev_segment, prev_speed, prev_xy
+        )
+        prev_speed = _speed_of(row)
+        prev_xy = _xy_of(row)
         if any("NaN" in item or "not finite" in item for item in row_issues):
             nan_rows += 1
         if masked:
@@ -307,10 +368,16 @@ def _report_without_frames(
     prev_t: float | None = None
     prev_i: int | None = None
     prev_segment = ""
+    prev_speed: float | None = None
+    prev_xy: tuple[float, float] | None = None
     nan_rows = 0
     masked_rows = 0
     for row in rows:
-        row_issues, prev_t, prev_i, prev_segment, masked = _issues_for_row(row, prev_t, prev_i, prev_segment)
+        row_issues, prev_t, prev_i, prev_segment, masked = _issues_for_row(
+            row, prev_t, prev_i, prev_segment, prev_speed, prev_xy
+        )
+        prev_speed = _speed_of(row)
+        prev_xy = _xy_of(row)
         if any("NaN" in item or "not finite" in item for item in row_issues):
             nan_rows += 1
         if masked:
@@ -380,10 +447,16 @@ def validate_dataset(
     prev_t: float | None = None
     prev_i: int | None = None
     prev_segment = ""
+    prev_speed: float | None = None
+    prev_xy: tuple[float, float] | None = None
     nan_rows = 0
     masked_rows = 0
     for row in rows:
-        row_issues, prev_t, prev_i, prev_segment, masked = _issues_for_row(row, prev_t, prev_i, prev_segment)
+        row_issues, prev_t, prev_i, prev_segment, masked = _issues_for_row(
+            row, prev_t, prev_i, prev_segment, prev_speed, prev_xy
+        )
+        prev_speed = _speed_of(row)
+        prev_xy = _xy_of(row)
         if any("NaN" in item or "not finite" in item for item in row_issues):
             nan_rows += 1
         if masked:

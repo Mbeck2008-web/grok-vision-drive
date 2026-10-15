@@ -132,6 +132,13 @@ def polys_from_network(spec: Any) -> list[RoadPoly]:
             edges = road
         poly = parse_road_edges(str(road_id), edges)
         if poly is not None:
+            if isinstance(road, dict):
+                try:
+                    count = int(float(road.get("lanesLeft") or 0)) + int(float(road.get("lanesRight") or 0))
+                except (TypeError, ValueError):
+                    count = 0
+                if 1 <= count <= 8:
+                    poly.lanes = count
             polys.append(road_width_floor(poly, road))
     return polys
 

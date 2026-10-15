@@ -107,6 +107,11 @@ def check_parse_edges() -> None:
         {"left": [-1, 20, 0], "right": [1, 20, 0], "middle": [0, 20, 0], "radius": 4.0},
     ])
     assert wide is not None and abs(wide.width_m - 8.0) < 1e-6, wide
+    # One junction node is 10 m. The road itself is 6 m. The median wins.
+    flare = [{"left": [-3, float(i), 0], "right": [3, float(i), 0], "middle": [0, float(i), 0]} for i in range(0, 30, 5)]
+    flare.append({"left": [-5, 30, 0], "right": [5, 30, 0], "middle": [0, 30, 0]})
+    flared = parse_road_edges("flare", flare)
+    assert flared is not None and abs(flared.width_m - 6.0) < 1e-6, flared
 
 
 def check_report_math() -> None:

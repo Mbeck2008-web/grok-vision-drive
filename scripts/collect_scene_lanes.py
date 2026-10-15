@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -224,6 +225,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated levels to rotate. Empty keeps the current level.",
     )
     parser.add_argument("--segment-min", type=float, default=12.0, help="Minutes on each map segment.")
+    parser.add_argument(
+        "--map-weights",
+        default="",
+        help="Time shares, for example west_coast_usa=0.6. Unlisted maps split the rest. Empty rotates equally.",
+    )
     parser.add_argument("--no-excursions", action="store_true", help="Stay centered. Default weaves and lane changes.")
     parser.add_argument("--smoke-s", type=float, default=60.0, help="Collect this many seconds, check PNG decode, then continue. 0 skips the check.")
     parser.add_argument("--no-vary-env", action="store_true", help="Do not change weather or time of day on each segment.")
@@ -245,13 +251,83 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def segment_at(elapsed_s: float, maps: tuple[str, ...], segment_s: float) -> tuple[str, int]:
-    """Map name and segment index. Empty maps stay on the loaded level."""
+def parse_map_weights(text: str) -> dict[str, float]:
+    """``west_coast_usa=0.6,italy=0.08`` into a dict. Empty text is no weighting."""
+    weights: dict[str, float] = {}
+    for part in str(text or "").split(","):
+        item = part.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"map weight {item!r} needs name=share")
+        name, raw = item.split("=", 1)
+        name = name.strip()
+        share = float(raw)
+        if not name or share < 0.0 or not math.isfinite(share):
+            raise ValueError(f"map weight {item!r} is not a positive share")
+        weights[name] = share
+    return weights
+
+
+def share_maps(maps: tuple[str, ...], weights: dict[str, float]) -> list[tuple[str, float]]:
+    """Time fraction for each map, in ``maps`` order, summing to 1.
+
+    A listed weight is that map's share. Maps without a weight split whatever
+    is left. Weights that already sum past 1, with nothing left to split, are
+    scaled down.
+    """
+    explicit = {name: float(weights[name]) for name in maps if name in weights}
+    missing = [name for name in maps if name not in weights]
+    used = sum(explicit.values())
+    if missing:
+        left = max(0.0, 1.0 - used)
+        each = left / len(missing)
+        shares = [(name, explicit.get(name, each)) for name in maps]
+        total = sum(share for _name, share in shares)
+        if total > 0.0 and abs(total - 1.0) > 1e-6:
+            shares = [(name, share / total) for name, share in shares]
+        return shares
+    scale = used if used > 0.0 else 1.0
+    return [(name, explicit.get(name, 0.0) / scale) for name in maps]
+
+
+def segment_at(
+    elapsed_s: float,
+    maps: tuple[str, ...],
+    segment_s: float,
+    weights: dict[str, float] | None = None,
+    total_s: float | None = None,
+) -> tuple[str, int]:
+    """Map name and segment index. Empty maps stay on the loaded level.
+
+    Without weights, each map gets ``segment_s`` and the list repeats.
+    With weights, one pass of ``total_s`` (or a cycle long enough that the
+    smallest map gets ``segment_s``) is split by those shares.
+    """
     if not maps:
         return "", 0
-    span = max(1.0, float(segment_s))
-    index = int(max(0.0, float(elapsed_s)) // span)
-    return maps[index % len(maps)], index
+    elapsed = max(0.0, float(elapsed_s))
+    if not weights:
+        span = max(1.0, float(segment_s))
+        index = int(elapsed // span)
+        return maps[index % len(maps)], index
+    shares = share_maps(maps, weights)
+    if total_s is not None and math.isfinite(float(total_s)) and float(total_s) > 0.0:
+        cycle = float(total_s)
+    else:
+        positive = [share for _name, share in shares if share > 1e-9]
+        small = min(positive) if positive else 1.0
+        cycle = max(1.0, float(segment_s)) / small
+    durations = [(name, max(0.0, share) * cycle) for name, share in shares]
+    cycle_len = sum(dur for _name, dur in durations) or 1.0
+    which = int(elapsed // cycle_len)
+    pos = elapsed - which * cycle_len
+    acc = 0.0
+    for i, (name, dur) in enumerate(durations):
+        acc += dur
+        if pos < acc or i == len(durations) - 1:
+            return name, which * len(durations) + i
+    return durations[-1][0], which * len(durations) + len(durations) - 1
 
 
 def decode_issues(root: Path) -> list[str]:
@@ -599,6 +675,11 @@ def main(argv: list[str] | None = None) -> int:
         random.Random(1).shuffle(bag)
         names = tuple(bag)
     map_names = tuple(part.strip() for part in str(args.maps).split(",") if part.strip())
+    try:
+        map_weights = parse_map_weights(args.map_weights)
+    except ValueError as exc:
+        print(f"collect {exc}", file=sys.stderr)
+        return 2
     if (args.check_maps or args.dump_roads) and not map_names:
         from python.collect.auto_mode import DEFAULT_MAPS
 
@@ -745,6 +826,7 @@ def main(argv: list[str] | None = None) -> int:
         segment_open = False
         follow = RoadFollow()
         label_hit = None
+        mark_recover = False
         gate_note = ""
         gate_log_t = 0.0
         warmup_since: float | None = None
@@ -813,7 +895,7 @@ def main(argv: list[str] | None = None) -> int:
         def _abort(reason: str) -> int | None:
             """Stop this segment. The first failure respawns. The second exits."""
             nonlocal segment_aborts, last_error, clock, last_ai, held_tag, prev_dir, prev_dir_t, spawn_pos
-            nonlocal segment_open, follow, label_hit
+            nonlocal segment_open, follow, label_hit, mark_recover
             segment_aborts += 1
             print(f"collect abort {reason} segment={segment_id}", flush=True)
             last_error = f"{segment_id} {reason}"
@@ -858,6 +940,7 @@ def main(argv: list[str] | None = None) -> int:
                     label_hit = None
                     segment_open = False
                     spawn_pos = moved
+                    mark_recover = True
                     return None
             last_error = message
             save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
@@ -875,7 +958,13 @@ def main(argv: list[str] | None = None) -> int:
             elapsed = done_s
             speed = speed_at(elapsed, speeds)
             waypoint = waypoint_at(elapsed, names)
-            map_name, seg_index = segment_at(elapsed, map_names, segment_s)
+            map_name, seg_index = segment_at(
+                elapsed,
+                map_names,
+                segment_s,
+                map_weights or None,
+                None if target_s == float("inf") else target_s,
+            )
             segment_id = f"{map_name}#{seg_index}" if map_name else "current#0"
             if map_name and map_name != loaded_map:
                 print(f"collect segment {segment_id}", flush=True)
@@ -1203,6 +1292,14 @@ def main(argv: list[str] | None = None) -> int:
                 time.sleep(tick_sleep_s(time.monotonic() - tick_mark, 0.1))
                 tick_dt = max(1e-3, time.monotonic() - tick_mark)
                 continue
+            tags = {
+                "segment": segment_id,
+                "map": map_name or None,
+                "excursion": move.as_tag(),
+            }
+            if mark_recover:
+                tags["recover"] = True
+                mark_recover = False
             queued = writer.submit(
                 due,
                 t=now,
@@ -1220,11 +1317,7 @@ def main(argv: list[str] | None = None) -> int:
                 pedals={"throttle": sample.get("throttle"), "brake": sample.get("brake")},
                 tech=tech,
                 driver="beamng_ai",
-                tags={
-                    "segment": segment_id,
-                    "map": map_name or None,
-                    "excursion": move.as_tag(),
-                },
+                tags=tags,
             )
             if not queued:
                 for cid, prev in held:

@@ -21,6 +21,8 @@ class RoadPoly:
     road_id: str
     xy: list[tuple[float, float]]
     width_m: float
+    # lanesLeft + lanesRight when the dump has them. 0 derives a count from width.
+    lanes: int = 0
 
 
 # A heading jump bigger than this in one tick is a different road, not a yaw.
@@ -74,6 +76,13 @@ class RoadFollow:
     forward_heading: float | None = None
     lane_id: int | None = None
     lane_center_m: float | None = None
+    # Heading of the edge the label is locked to. A kink in one segment does
+    # not replace this while the car still points along it.
+    tangent_heading: float | None = None
+    last_lane_off: float | None = None
+    last_gt: float | None = None
+    last_xy: tuple[float, float] | None = None
+    label_fresh: bool = False
 
 
 @dataclass
@@ -207,7 +216,14 @@ def parse_road_edges(road_id: str, edges: object) -> RoadPoly | None:
             widths.append(got)
     if len(xy) < 2:
         return None
-    width = max(widths) if widths else 2.0 * LANE_W_M
+    # The widest node is a junction flare. The median span is the road the
+    # car is on; using the flare made a 6 m two-lane road look 10 m wide and
+    # put the lane boundary under the car.
+    if widths:
+        ordered = sorted(widths)
+        width = ordered[len(ordered) // 2]
+    else:
+        width = 2.0 * LANE_W_M
     if width < 2.0:
         width = LANE_W_M
     return RoadPoly(road_id=str(road_id), xy=xy, width_m=float(width))
@@ -230,13 +246,14 @@ def ego_center_x(lane_offset_m: float, heading_err_rad: float | None, y_m: float
     return -float(lane_offset_m) + float(y_m) * math.sin(h)
 
 
-def lane_center_offsets(width_m: float) -> list[float]:
+def lane_center_offsets(width_m: float, lanes: int | None = None) -> list[float]:
     """Signed offsets of each lane center from the road middle.
 
     Index 0 is the leftmost lane. Positive is to the right of the road
     direction. A 7 m two-lane road is at about −1.75 m and +1.75 m.
+    ``lanes`` is the dump's lane count when it is known.
     """
-    n = lane_count(width_m)
+    n = int(lanes) if lanes is not None and 1 <= int(lanes) <= 8 else lane_count(width_m)
     lane_w = float(width_m) / n
     return [-float(width_m) / 2.0 + (i + 0.5) * lane_w for i in range(n)]
 
@@ -283,7 +300,7 @@ def _project_onto(
     if heading_rad is not None:
         vx, vy = math.cos(float(heading_rad)), math.sin(float(heading_rad))
         heading_err = math.atan2(fx * vy - fy * vx, fx * vx + fy * vy)
-    centers = lane_center_offsets(road.width_m)
+    centers = lane_center_offsets(road.width_m, road.lanes)
     lane_id = min(range(len(centers)), key=lambda k: abs(offset - centers[k]))
     lane_w = road.width_m / len(centers)
     lane_off = offset - centers[lane_id]
@@ -549,7 +566,10 @@ def stabilize_lane(hit: RoadHit, follow: RoadFollow) -> RoadHit:
     new_center = float(hit.offset_m - hit.lane_offset_m)
     # Stay with the held lane unless the other center is clearly closer.
     # The midpoint between two lanes is where a nearest-lane pick flips.
-    if abs(hit.offset_m - new_center) + 0.75 >= abs(float(hit.offset_m) - float(follow.lane_center_m)):
+    # Half a lane is not enough: the car sits on the boundary and a 4 cm
+    # step flips the label by a full lane. Require the other center to be
+    # closer by two metres, which is past the painted line.
+    if abs(hit.offset_m - new_center) + 1.5 >= abs(float(hit.offset_m) - float(follow.lane_center_m)):
         lane_off = float(hit.offset_m) - float(follow.lane_center_m)
         return RoadHit(
             road_id=hit.road_id,
@@ -569,6 +589,356 @@ def stabilize_lane(hit: RoadHit, follow: RoadFollow) -> RoadHit:
     return hit
 
 
+# A label may follow a successor only when that edge points within about 30
+# degrees of the car. A cross street is ~90 degrees and is not a candidate.
+LABEL_ALIGN_RAD = math.radians(30.0)
+# Published heading error stays inside this. Above it the label is invalid
+# rather than a snapped edge. 0.30 rad is the cruise bar from the live runs.
+LABEL_HEADING_RAD = 0.30
+LABEL_BESIDE_M = 18.0
+LABEL_JOIN_M = 8.0
+
+
+def _segment_views(
+    road: RoadPoly,
+    x: float,
+    y: float,
+    heading_rad: float,
+) -> list[tuple[float, float, float, float]]:
+    """``(dist, heading_err, offset, road_heading)`` for each segment."""
+    vx, vy = math.cos(heading_rad), math.sin(heading_rad)
+    out: list[tuple[float, float, float, float]] = []
+    pts = road.xy
+    for i in range(len(pts) - 1):
+        ax, ay = pts[i]
+        bx, by = pts[i + 1]
+        dx, dy = bx - ax, by - ay
+        length2 = dx * dx + dy * dy
+        if length2 < 1e-6:
+            continue
+        t = ((x - ax) * dx + (y - ay) * dy) / length2
+        t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else t
+        cx = ax + t * dx
+        cy = ay + t * dy
+        dist = math.hypot(x - cx, y - cy)
+        flen = math.sqrt(length2)
+        fx, fy = dx / flen, dy / flen
+        if fx * vx + fy * vy < 0.0:
+            fx, fy = -fx, -fy
+        herr = math.atan2(fx * vy - fy * vx, fx * vx + fy * vy)
+        rx, ry = fy, -fx
+        offset = (x - cx) * rx + (y - cy) * ry
+        out.append((dist, herr, offset, math.atan2(fy, fx)))
+    return out
+
+
+def _beside_view(
+    road: RoadPoly,
+    x: float,
+    y: float,
+    heading_rad: float | None,
+) -> tuple[tuple[float, float, float, float], tuple[float, float, float, float]] | None:
+    """Closest foot on ``road``, and the nearby segment that best matches heading.
+
+    None when the car is not laterally on this road. The heading match may
+    still be large; the caller decides whether that is a label.
+    """
+    if heading_rad is None or not math.isfinite(float(heading_rad)):
+        return None
+    views = _segment_views(road, x, y, float(heading_rad))
+    if not views:
+        return None
+    foot = min(views, key=lambda item: item[0])
+    if foot[0] > LABEL_BESIDE_M:
+        return None
+    if abs(foot[2]) > road.width_m * 0.5 + SHOULDER_M:
+        return None
+    near = [item for item in views if item[0] <= foot[0] + 8.0]
+    aligned = min(near, key=lambda item: abs(item[1]))
+    return foot, aligned
+
+
+def _chord_heading(
+    road: RoadPoly,
+    x: float,
+    y: float,
+    heading_rad: float,
+    half_m: float = 8.0,
+) -> float | None:
+    """Heading of the centerline across ``half_m`` behind and ahead of the car.
+
+    One kinked segment swings the nearest tangent. The chord across the
+    neighbouring nodes does not.
+    """
+    pts = road.xy
+    best: tuple[float, int, float] | None = None
+    for i in range(len(pts) - 1):
+        ax, ay = pts[i]
+        bx, by = pts[i + 1]
+        dx, dy = bx - ax, by - ay
+        length2 = dx * dx + dy * dy
+        if length2 < 1e-6:
+            continue
+        t = ((x - ax) * dx + (y - ay) * dy) / length2
+        t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else t
+        dist = math.hypot(x - (ax + t * dx), y - (ay + t * dy))
+        if best is None or dist < best[0]:
+            best = (dist, i, t)
+    if best is None:
+        return None
+    _dist, i, t = best
+
+    def walk(sign: float) -> tuple[float, float]:
+        rem = float(half_m)
+        if sign > 0.0:
+            cx = pts[i][0] + t * (pts[i + 1][0] - pts[i][0])
+            cy = pts[i][1] + t * (pts[i + 1][1] - pts[i][1])
+            left = math.hypot(pts[i + 1][0] - cx, pts[i + 1][1] - cy)
+            if left >= rem:
+                flen = math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]) or 1.0
+                return cx + (pts[i + 1][0] - pts[i][0]) / flen * rem, cy + (pts[i + 1][1] - pts[i][1]) / flen * rem
+            rem -= left
+            j = i + 1
+            while j < len(pts) - 1 and rem > 1e-6:
+                dx = pts[j + 1][0] - pts[j][0]
+                dy = pts[j + 1][1] - pts[j][1]
+                seg = math.hypot(dx, dy)
+                if seg < 1e-6:
+                    j += 1
+                    continue
+                if seg >= rem:
+                    return pts[j][0] + dx / seg * rem, pts[j][1] + dy / seg * rem
+                rem -= seg
+                j += 1
+            return pts[-1]
+        cx = pts[i][0] + t * (pts[i + 1][0] - pts[i][0])
+        cy = pts[i][1] + t * (pts[i + 1][1] - pts[i][1])
+        left = math.hypot(cx - pts[i][0], cy - pts[i][1])
+        if left >= rem:
+            flen = math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]) or 1.0
+            return cx - (pts[i + 1][0] - pts[i][0]) / flen * rem, cy - (pts[i + 1][1] - pts[i][1]) / flen * rem
+        rem -= left
+        j = i
+        while j > 0 and rem > 1e-6:
+            dx = pts[j][0] - pts[j - 1][0]
+            dy = pts[j][1] - pts[j - 1][1]
+            seg = math.hypot(dx, dy)
+            if seg < 1e-6:
+                j -= 1
+                continue
+            if seg >= rem:
+                return pts[j][0] - dx / seg * rem, pts[j][1] - dy / seg * rem
+            rem -= seg
+            j -= 1
+        return pts[0]
+
+    back = walk(-1.0)
+    fore = walk(1.0)
+    road_h = math.atan2(fore[1] - back[1], fore[0] - back[0])
+    vx, vy = math.cos(heading_rad), math.sin(heading_rad)
+    if math.cos(road_h) * vx + math.sin(road_h) * vy < 0.0:
+        road_h = wrap_rad(road_h + math.pi)
+    return road_h
+
+
+def _roads_meet(left: RoadPoly, right: RoadPoly, limit_m: float = LABEL_JOIN_M) -> bool:
+    """True when an endpoint of each road sits on the same junction."""
+    for ax, ay in (left.xy[0], left.xy[-1]):
+        for bx, by in (right.xy[0], right.xy[-1]):
+            if math.hypot(ax - bx, ay - by) <= limit_m:
+                return True
+    return False
+
+
+def _road_grid(roads: list[RoadPoly]) -> dict[tuple[int, int], list[RoadPoly]]:
+    """Coarse cells so a tick does not walk every edge on the map.
+
+    Cached on the list identity. A road is stored in the cells its vertices
+    and long segments pass through, plus the neighbouring cell.
+    """
+    key = id(roads)
+    cached = _GRID_CACHE.get(key)
+    if cached is not None and cached[0] == len(roads):
+        return cached[1]
+    cell = 40.0
+    grid: dict[tuple[int, int], list[RoadPoly]] = {}
+    for road in roads:
+        pts = road.xy
+        placed: set[tuple[int, int]] = set()
+
+        def add(px: float, py: float) -> None:
+            ix = int(math.floor(px / cell))
+            iy = int(math.floor(py / cell))
+            for ox in (-1, 0, 1):
+                for oy in (-1, 0, 1):
+                    slot = (ix + ox, iy + oy)
+                    if slot in placed:
+                        continue
+                    placed.add(slot)
+                    grid.setdefault(slot, []).append(road)
+
+        for px, py in pts:
+            add(px, py)
+        for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+            span = math.hypot(x1 - x0, y1 - y0)
+            if span <= cell:
+                continue
+            steps = int(span // cell)
+            for step in range(1, steps + 1):
+                t = step / (steps + 1)
+                add(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t)
+    _GRID_CACHE.clear()
+    _GRID_CACHE[key] = (len(roads), grid)
+    return grid
+
+
+_GRID_CACHE: dict[int, tuple[int, dict[tuple[int, int], list[RoadPoly]]]] = {}
+
+
+def _cell_roads(
+    grid: dict[tuple[int, int], list[RoadPoly]],
+    x: float,
+    y: float,
+) -> list[RoadPoly]:
+    return grid.get((int(float(x) // 40.0), int(float(y) // 40.0)), [])
+
+
+def _heading_for_label(
+    aligned_err: float,
+    road_heading: float,
+    vehicle_heading: float,
+    follow: RoadFollow,
+    same_road: bool,
+) -> float | None:
+    """Heading error to publish, or None when this tick has no honest label.
+
+    A segment kink can flip the tangent by several tenths of a radian while
+    the car has not yawed. Keep the tangent the car was already following.
+    """
+    if same_road and follow.tangent_heading is not None:
+        held = wrap_rad(vehicle_heading - follow.tangent_heading)
+        swung = abs(wrap_rad(road_heading - follow.tangent_heading))
+        if swung > 0.15 and abs(held) <= LABEL_HEADING_RAD:
+            return held
+    if abs(aligned_err) <= LABEL_HEADING_RAD:
+        follow.tangent_heading = road_heading
+        return aligned_err
+    if (
+        same_road
+        and follow.tangent_heading is not None
+        and abs(wrap_rad(vehicle_heading - follow.tangent_heading)) <= LABEL_HEADING_RAD
+    ):
+        return wrap_rad(vehicle_heading - follow.tangent_heading)
+    return None
+
+
+def _hit_from_view(
+    road: RoadPoly,
+    x: float,
+    y: float,
+    heading_rad: float,
+    herr: float,
+) -> RoadHit | None:
+    """Lane numbers from the foot of the perpendicular, heading from ``herr``."""
+    hit = _project_onto(road, x, y, heading_rad)
+    if hit is None:
+        return None
+    hit.heading_err_rad = float(herr)
+    hit.off_road = abs(hit.offset_m) > road.width_m * 0.5 + SHOULDER_M
+    return hit
+
+
+def label_edge(
+    roads: list[RoadPoly],
+    x: float,
+    y: float,
+    heading_rad: float | None,
+    follow: RoadFollow,
+) -> RoadHit | None:
+    """The edge the car is on, or None when that edge is ambiguous.
+
+    The lock stays on the current road while the car is laterally inside it.
+    A successor is taken only when its heading is within about 30 degrees of
+    travel and it is the only such road. A crossing edge is never selected.
+    """
+    if heading_rad is None or not roads:
+        return None
+    heading = float(heading_rad)
+    grid = _road_grid(roads)
+    bag = _cell_roads(grid, x, y)
+    current = next((road for road in roads if road.road_id == follow.road_id), None) if follow.road_id else None
+    chosen: RoadPoly | None = None
+    view = None
+    if current is not None:
+        view = _beside_view(current, x, y, heading)
+        if view is not None:
+            chosen = current
+        else:
+            successors = []
+            for road in bag:
+                if road.road_id == current.road_id or not _roads_meet(current, road):
+                    continue
+                got = _beside_view(road, x, y, heading)
+                if got is None or abs(got[1][1]) > LABEL_ALIGN_RAD:
+                    continue
+                successors.append((abs(got[1][1]), got[0][0], road, got))
+            successors.sort()
+            if len(successors) == 1 or (
+                len(successors) > 1 and successors[1][0] > successors[0][0] + 0.12
+            ):
+                chosen = successors[0][2]
+                view = successors[0][3]
+                if chosen.road_id != follow.road_id:
+                    follow.lane_id = None
+                    follow.lane_center_m = None
+            elif len(successors) > 1:
+                # Two continuations within 30 degrees. Keep the lock and publish nothing.
+                return None
+            else:
+                # The locked edge ended and nothing connected continues. Look again.
+                follow.road_id = ""
+                follow.tangent_heading = None
+                follow.lane_id = None
+                follow.lane_center_m = None
+    if chosen is None or view is None:
+        ranked = []
+        for road in bag:
+            got = _beside_view(road, x, y, heading)
+            if got is None or abs(got[1][1]) > LABEL_ALIGN_RAD:
+                continue
+            centers = lane_center_offsets(road.width_m, road.lanes)
+            lane_fit = min(abs(got[0][2] - center) for center in centers)
+            ranked.append((lane_fit, got[0][0], abs(got[1][1]), road, got))
+        ranked.sort()
+        if not ranked:
+            follow.road_id = ""
+            follow.tangent_heading = None
+            return None
+        chosen = ranked[0][3]
+        view = ranked[0][4]
+        if chosen.road_id != follow.road_id:
+            follow.lane_id = None
+            follow.lane_center_m = None
+    _foot, aligned = view
+    chord = _chord_heading(chosen, x, y, heading, 8.0)
+    if chord is None:
+        aligned_err, road_h = aligned[1], aligned[3]
+    else:
+        road_h = chord
+        aligned_err = wrap_rad(heading - chord)
+    herr = _heading_for_label(
+        aligned_err,
+        road_h,
+        heading,
+        follow,
+        follow.tangent_heading is not None,
+    )
+    follow.road_id = chosen.road_id
+    if herr is None:
+        return None
+    return _hit_from_view(chosen, x, y, heading, herr)
+
+
 def follow_label(
     roads: list[RoadPoly],
     x: float,
@@ -578,41 +948,52 @@ def follow_label(
     speed_mps: float = 0.0,
     last: RoadHit | None = None,
 ) -> tuple[RoadHit | None, RoadHit | None, bool]:
-    """Project the car onto the followed edge chain this tick.
+    """Project the car onto the locked edge this tick.
 
-    Returns ``(label, memory, refused_cross)``. The lane id sticks only
-    across the painted boundary (hysteresis). The offset is recomputed
-    from this tick's position, so a bad center cannot latch. ``last`` is
-    unused; it remains so older callers keep working.
+    Returns ``(label, memory, refused)``. The lane id sticks across the
+    painted line. A tick whose edge is ambiguous or points the wrong way
+    returns no label, and does not adopt that edge. ``speed_mps`` and
+    ``last`` stay in the signature so older callers keep working.
     """
-    del last
+    del speed_mps, last
     prev_road = follow.road_id
-    prev_center = follow.lane_center_m
-    prev_lane = follow.lane_id
-    hit = project_follow(roads, x, y, heading_rad, follow, speed_mps=speed_mps)
-    if hit is None:
-        return None, None, False
-    refused = False
+    prev_off = follow.last_lane_off
+    hit = label_edge(roads, x, y, heading_rad, follow)
+    if hit is None or hit.off_road or hit.lane_offset_m is None:
+        follow.label_fresh = False
+        return hit, None, hit is None
+    if hit.road_id != prev_road and prev_off is not None and follow.lane_center_m is None:
+        # The new edge has no held lane yet. Continue the previous lane offset
+        # so a piece boundary does not jump the label by a lane width.
+        road = next((item for item in roads if item.road_id == hit.road_id), None)
+        if road is not None:
+            centers = lane_center_offsets(road.width_m, road.lanes)
+            center = min(centers, key=lambda item: abs((hit.offset_m - item) - prev_off))
+            follow.lane_center_m = float(center)
+            follow.lane_id = centers.index(center)
+    stab = stabilize_lane(hit, follow)
+    gt = label_center_x(stab)
+    moved = None
+    if follow.last_xy is not None:
+        moved = math.hypot(float(x) - follow.last_xy[0], float(y) - follow.last_xy[1])
     if (
-        hit.discontinuous
-        and hit.heading_err_rad is not None
-        and abs(hit.heading_err_rad) > CONNECT_HEADING
-        and prev_road
+        follow.label_fresh
+        and follow.last_gt is not None
+        and gt is not None
+        and abs(gt - follow.last_gt) > LABEL_JUMP_M
+        and moved is not None
+        and moved < 2.0
     ):
-        current = next((road for road in roads if road.road_id == prev_road), None)
-        repro = None if current is None else _project_onto(current, x, y, heading_rad)
-        if repro is not None and lane_still_beside(repro):
-            hit = repro
-            refused = True
-    if hit.road_id != prev_road and prev_center is not None:
-        follow.lane_center_m = prev_center
-        follow.lane_id = prev_lane
-    elif hit.road_id != prev_road:
-        follow.lane_id = None
-        follow.lane_center_m = None
-    if hit.off_road:
-        return hit, None, refused
-    return stabilize_lane(hit, follow), hit, False
+        # The car barely moved and the 5 m lane center stepped by more than 2 m.
+        # That is a bad edge, not a lane change. Skip this tick; the lock stays.
+        follow.label_fresh = False
+        return None, None, True
+    if stab.lane_offset_m is not None:
+        follow.last_lane_off = float(stab.lane_offset_m)
+    follow.last_gt = gt
+    follow.last_xy = (float(x), float(y))
+    follow.label_fresh = True
+    return stab, hit, False
 
 
 # Parking brake on gt_ctrl1 shed about 4.5 m/s^2. The mesh has to be at

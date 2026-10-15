@@ -416,6 +416,40 @@ def check_masked_labels_and_map_switch() -> None:
         "italy#1",
     )
     assert any("gap" in item for item in same), same
+    # collect6 row 2249: 3.9 s after the italy recover, car still on the same spot.
+    recover_gap, *_rest = _issues_for_row(
+        {
+            "i": 2249,
+            "t": 3.888,
+            "dt_s": 3.888,
+            "segment": "italy#1",
+            "recover": True,
+            "tech": tech_from_hit(0.2, 0.0, 3.5, False),
+            "ego": {"speed_mps": 1.37, "pos": [313.8, -886.9, 266.6]},
+        },
+        0.0,
+        2248,
+        "italy#1",
+        0.03,
+        (315.9, -886.4),
+    )
+    assert not any("gap" in item for item in recover_gap), recover_gap
+    driven_hole, *_rest = _issues_for_row(
+        {
+            "i": 2,
+            "t": 4.0,
+            "dt_s": 4.0,
+            "segment": "italy#1",
+            "tech": tech_from_hit(0.2, 0.0, 3.5, False),
+            "ego": {"speed_mps": 12.0, "pos": [40.0, 0.0, 0.0]},
+        },
+        0.0,
+        1,
+        "italy#1",
+        12.0,
+        (0.0, 0.0),
+    )
+    assert any("gap" in item for item in driven_hole), driven_hole
     switch = [
         {"i": 0, "dt_s": 0.1, "segment": "west_coast_usa#0", "ego": {"speed_mps": 0.1, "dir": [0.0, 1.0, 0.0]}},
         {"i": 1, "dt_s": 36.0, "segment": "italy#1", "ego": {"speed_mps": 0.1, "dir": [0.0, 1.0, 0.0]}},

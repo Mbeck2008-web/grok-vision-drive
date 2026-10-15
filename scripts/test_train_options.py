@@ -101,6 +101,25 @@ def check_epoch_windows() -> None:
     assert all(item["rows"] is not empty for item in train)
     assert sum(1 for item in train if item["rows"][0]["i"] >= 8) >= 2
     print("epoch windows")
+    plan_steps = [
+        {"kind": "train", "rows": [1]},
+        {"kind": "train", "rows": [2]},
+        {"kind": "holdout", "rows": [3]},
+    ]
+    packed = iter([{"frames": ["a"]}, {"frames": ["b"]}])
+    got = []
+    for item in plan_steps:
+        if item["kind"] == "holdout":
+            got.append(None)
+            continue
+        got.append(next(packed)["frames"])
+    try:
+        next(packed)
+        raise AssertionError("cache loader outlasted the plan")
+    except StopIteration:
+        pass
+    assert got == [["a"], ["b"], None]
+    print("prefetch covers every train window")
 
 
 def check_extract_and_jitter() -> None:
@@ -217,12 +236,91 @@ def check_subset_forward_probe_and_export() -> None:
     print("subset forward and export shape")
 
 
+def check_sanity_overfits_cached_main() -> None:
+    """Sanity repeats one main-camera batch until lane_gt is under 0.05."""
+    from python.train.frame_cache import FrameCache, build_frame_cache
+    from python.train.scene_net import torch_ready
+    from python.train.train_scene import train_directory
+
+    if not torch_ready():
+        print("sanity overfit skipped (torch missing)")
+        return
+    import cv2
+
+    colour = np.zeros((24, 32, 3), dtype=np.uint8)
+    colour[:, :] = (30, 60, 90)
+    ok, encoded = cv2.imencode(".png", colour)
+    assert ok
+    lane = [0.25, -1.5, 2.0, 0.25, -1.5, 2.0, 0.25, -1.5, 2.0, 0.25, -1.5, 2.0, 0.0, 1.0]
+    mask = [1.0] * 13 + [1.0]
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "scene"
+        cam = root / "raw" / "main"
+        cam.mkdir(parents=True)
+        state_lines = []
+        gt_lines = []
+        for index in range(8):
+            (cam / f"{index:06d}.png").write_bytes(encoded.tobytes())
+            state_lines.append(
+                {
+                    "i": index,
+                    "t": float(index) * 0.1,
+                    "dt_s": None if index == 0 else 0.1,
+                    "segment": "west_coast_usa#0",
+                    "cams": {"main": {"file": f"raw/main/{index:06d}.png"}},
+                    "wheel": {"steer": 0.1},
+                    "pedals": {"throttle": 0.2, "brake": 0.0},
+                }
+            )
+            gt_lines.append(
+                {
+                    "i": index,
+                    "t": float(index) * 0.1,
+                    "tech": {"lane_gt": lane, "lane_gt_valid": mask, "heading_err_rad": 0.0},
+                }
+            )
+        (root / "state.jsonl").write_text(
+            "\n".join(json.dumps(row) for row in state_lines) + "\n", encoding="utf-8"
+        )
+        (root / "gt.jsonl").write_text(
+            "\n".join(json.dumps(row) for row in gt_lines) + "\n", encoding="utf-8"
+        )
+        cache_dir = Path(tmp) / "cache"
+        build_frame_cache(root, cache_dir, ("main",))
+        cache = FrameCache(cache_dir)
+        assert cache.has(0)
+        image = cache.canvas(0)
+        assert image is not None and image.shape == (192, 256, 3)
+        stats = train_directory(
+            root,
+            epochs=1,
+            lr=1e-3,
+            capability=None,
+            export_path=None,
+            free_vram_bytes=0,
+            free_ram_bytes=8_000_000_000,
+            resume=False,
+            sanity=True,
+            dry_run=False,
+            open_panel=False,
+            autostart=True,
+            cams=("main",),
+            heads=("lane_gt",),
+            cache=cache,
+            augment=True,
+            workers=0,
+        )
+        assert stats.get("sanity_ok") is True, stats
+    print("sanity overfit")
+
+
 def main() -> None:
     check_cams_and_heads()
     check_extract_and_jitter()
     check_cache_chunks()
     check_epoch_windows()
     check_subset_forward_probe_and_export()
+    check_sanity_overfits_cached_main()
     print("train options ok")
 
 

@@ -1332,6 +1332,12 @@ def train_directory(
                 int(workers),
                 device.type == "cuda",
             )
+            if prefetch is not None:
+                train_n = sum(1 for item in plan_steps if item.get("kind") != "holdout")
+                if len(prefetch.dataset) != train_n:
+                    raise RuntimeError(
+                        f"cache loader has {len(prefetch.dataset)} windows, the plan has {train_n}"
+                    )
             prefetch_iter = iter(prefetch) if prefetch is not None else None
             while index < len(plan_steps) and not paused_exit:
                 if view.consume_pause() and _pause_now():
@@ -1530,45 +1536,43 @@ def train_directory(
         return best_value
 
     def _limited(limit: int, subset: list[Mapping[str, Any]], shapes: bool) -> None:
+        """Repeat one fixed batch for the whole budget.
+
+        Dry-run and sanity used to walk the shuffled plan once. Eight frames
+        are a single window, so sanity exited at step 1. Augment stays off.
+        """
         nonlocal last_loss, done, sanity_ok, last_batch, supervised, windows
         step_trace["print_shapes"] = shapes
         if not subset:
             sanity_ok = False
             print("[GVD] scene train: no strips for this mode", flush=True)
             return
-        from python.train.continual import epoch_windows
-
-        planned = [
-            item
-            for item in epoch_windows(
-                pass_plan(list(subset), chunk_len, stride),
-                window_rng,
-                min_valid=float(min_valid),
-                balance=bool(balance),
-            )
-            if item.get("kind") != "holdout"
-        ]
-        if not planned:
-            planned = [{"rows": list(subset), "stride": max(1, len(subset)), "incoming": "reset"}]
+        batch_rows = list(subset)
+        steps = max(1, int(limit))
+        print(
+            f"[GVD] {'dry' if shapes else 'sanity'} batch rows={len(batch_rows)} "
+            f"steps={steps} augment=off lr={float(holder.get('lr', lr))}",
+            flush=True,
+        )
         lane_loss = None
-        for step_i, item in enumerate(planned[: max(1, int(limit))]):
+        for step_i in range(steps):
             state = net.initial_state(device=device, batch=1)
             last_batch = {
                 "step": step_i,
                 "epoch": 0,
-                "rows": [row.get("i") for row in item["rows"]],
+                "rows": [row.get("i") for row in batch_rows],
             }
-            loss, n_sup, _carry, state = _optimizer_step(
+            loss, n_sup, _carry, _state = _optimizer_step(
                 net,
                 holder["opt"],
                 holder["scaler"],
                 root,
-                list(item["rows"]),
+                batch_rows,
                 state,
                 device=device,
                 amp=bool(holder["amp"]),
                 view=view,
-                stride=max(1, int(item.get("stride") or 1)),
+                stride=max(1, len(batch_rows)),
                 clip=grad_clip,
                 trace=step_trace,
                 cams=train_cams,
@@ -1590,7 +1594,7 @@ def train_directory(
                 continue
             if sanity_reached(lane_loss):
                 sanity_ok = True
-                print(f"[GVD] sanity lane_gt={lane_loss} step={done}", flush=True)
+                print(f"[GVD] sanity lane_gt={lane_loss} step={done} ok=True", flush=True)
                 return
         if not shapes:
             sanity_ok = sanity_reached(lane_loss)

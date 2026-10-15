@@ -375,6 +375,18 @@ def gear_is_forward(gear: Any) -> bool:
     return False
 
 
+def gear_is_reverse(gear: Any) -> bool:
+    """True when the echoed gear is reverse. Missing and neutral are not."""
+    if gear is None or isinstance(gear, bool):
+        return False
+    if isinstance(gear, (int, float)):
+        try:
+            return int(gear) < 0
+        except (TypeError, ValueError):
+            return False
+    return str(gear).strip().upper() in {"R", "REVERSE"}
+
+
 def _gear_value(el: Any) -> Any:
     """Gear field from a dict or a BeamNGpy electrics object (``.data`` / ``.gear``)."""
     if el is None:
@@ -1122,6 +1134,10 @@ class BeamNGPyActuator:
             # A failed ack is logged and retried next tick (_shift_set stays false).
             if not release and not self._shift_set:
                 self._arm_shift_mode()
+            if not release and gear_is_reverse(self._echo_gear()):
+                # Do not power a reverse gear. Park until the echo is forward.
+                throttle = 0.0
+                brake = 1.0
             speed_mps = None
             if (
                 not release

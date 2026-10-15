@@ -53,6 +53,10 @@ def check_wire_never_sends_the_reverse_pedal() -> None:
         assert float(kw.get("brake") or 0.0) == 0.0, kw
         if throttle <= 1e-6 and brake > 0.01:
             assert kw["parkingbrake"] == 1.0 and kw["brake"] == 0.0, kw
+    from python.control.actuate import gear_is_reverse
+
+    assert gear_is_reverse(-1) and gear_is_reverse("R") and gear_is_reverse("reverse")
+    assert not gear_is_reverse("D") and not gear_is_reverse(1) and not gear_is_reverse(None)
     assert is_arcade_reverse_hold({"throttle": 0.0, "brake": 0.8, "parkingbrake": 0.0})
     assert is_arcade_reverse_hold({"throttle": 0.0, "brake": 0.2})
     assert not is_arcade_reverse_hold({"throttle": 0.0, "brake": 0.0, "parkingbrake": 1.0})
@@ -105,6 +109,15 @@ def check_reverse_guard_parks() -> None:
     assert veh.calls[-1]["parkingbrake"] == 1.0
     act.note_engaged(True)
     assert act._park_hold is False
+    rev = Veh()
+    rev.sensors = {"electrics": {"gear": "R", "wheelspeed": 1.0}}
+    rev_act = BeamNGPyActuator(rev)
+    rev_act.note_engaged(True)
+    rev_act._shift_set = True
+    rev_act.apply(DriveCommand(steer=0.0, throttle=0.4, brake=0.0, seq=4, reason="ok"))
+    assert rev.calls[-1]["throttle"] == 0.0
+    assert rev.calls[-1]["brake"] == 0.0
+    assert rev.calls[-1]["parkingbrake"] == 1.0
 
 
 def _backward_rows(path: Path) -> list[tuple[float, float]]:

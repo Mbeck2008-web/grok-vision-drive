@@ -14,6 +14,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from python.data.binary_io import os_binary, write_new_file
 from python.data.strip_writer import compose_strip, read_state_jsonl
 
 # The collector sleeps 0.1 s, so 10 Hz is the planning rate. A slower poll
@@ -214,23 +215,22 @@ def _next_index(used: set[int]) -> int:
 
 
 def _write_bytes(path: Path, payload: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-    try:
-        view = memoryview(payload)
-        while view:
-            wrote = os.write(fd, view)
-            if wrote <= 0:
-                raise OSError(f"raw write made no progress: {path}")
-            view = view[wrote:]
-    finally:
-        os.close(fd)
+    """Exclusive binary create, then a signature and size check.
+
+    ``O_BINARY`` is required. Without it Windows rewrites every ``\\n`` as
+    ``\\r\\n`` and the PNG signature becomes ``\\x89PNG\\r\\r\\n\\x1a``.
+    """
+    write_new_file(path, payload)
 
 
 def _append_line(path: Path, line: Mapping[str, Any]) -> None:
     blob = (json.dumps(line, separators=(",", ":")) + "\n").encode("utf-8")
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(path), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644)
+    fd = os.open(
+        str(path),
+        os.O_CREAT | os.O_APPEND | os.O_WRONLY | os_binary(),
+        0o644,
+    )
     try:
         view = memoryview(blob)
         while view:
@@ -471,9 +471,42 @@ def read_image_file(path: Path | str) -> np.ndarray | None:
     is a normal PNG. Reading the bytes and decoding them is the same
     pixels, and it is what the validator and the trainer both use.
     """
+    return _decode_image_file(Path(path))
+
+
+def repaired_copies(path: Path) -> list[Path]:
+    """Repaired siblings of one capture. The original path is not included."""
+    file = Path(path)
+    found: list[Path] = []
+    alongside = file.with_name(file.stem + ".repaired.png")
+    if alongside != file:
+        found.append(alongside)
+    if file.parent.parent.name == "raw":
+        root = file.parent.parent.parent
+        found.append(root / "raw_repaired" / file.parent.name / file.name)
+    return found
+
+
+def read_image_with_repair(path: Path | str) -> np.ndarray | None:
+    """Decode ``path``, then a repaired copy if the original does not decode.
+
+    The original file is only read. Nothing here deletes or rewrites it.
+    """
+    file = Path(path)
+    image = _decode_image_file(file)
+    if image is not None:
+        return image
+    for alt in repaired_copies(file):
+        if alt.is_file():
+            image = _decode_image_file(alt)
+            if image is not None:
+                return image
+    return None
+
+
+def _decode_image_file(file: Path) -> np.ndarray | None:
     import cv2
 
-    file = Path(path)
     try:
         data = np.fromfile(file, dtype=np.uint8)
     except OSError:
@@ -487,7 +520,11 @@ def read_image_file(path: Path | str) -> np.ndarray | None:
 
 
 def load_raw_cameras(root: Path | str, index: int) -> dict[str, np.ndarray]:
-    """Read this tick's camera files. No resize and no channel drop."""
+    """Read this tick's camera files. No resize and no channel drop.
+
+    A text-mode PNG that does not decode is replaced, for this read only, by
+    ``raw_repaired/<cam>/NNNNNN.png`` when that copy exists.
+    """
     root = Path(root)
     raw = root / "raw"
     frames: dict[str, np.ndarray] = {}
@@ -499,7 +536,7 @@ def load_raw_cameras(root: Path | str, index: int) -> dict[str, np.ndarray]:
         png = folder / f"{int(index):06d}.png"
         npy = folder / f"{int(index):06d}.npy"
         if png.is_file():
-            image = read_image_file(png)
+            image = read_image_with_repair(png)
             if image is not None:
                 frames[folder.name] = image
         elif npy.is_file():
@@ -510,16 +547,26 @@ def load_raw_cameras(root: Path | str, index: int) -> dict[str, np.ndarray]:
 def load_training_bgr(root: Path | str, index: int) -> np.ndarray:
     """Stitch and resize at load time. The files on disk stay as saved.
 
-    A legacy ``strips/NNNNNN.jpg`` is used only when this tick has no raw cameras.
+    A recording that has ``raw/`` never falls through to ``strips/*.jpg``.
+    Legacy strips are only for a folder that has no raw tree.
     """
-    frames = load_raw_cameras(root, index)
-    if frames:
+    root = Path(root)
+    raw = root / "raw"
+    if raw.is_dir():
+        frames = load_raw_cameras(root, index)
+        if not frames:
+            raise FileNotFoundError(
+                f"no decodable raw frame for index {int(index):06d} under {raw}"
+            )
         return compose_strip(frames)
+    strips = root / "strips"
+    if not strips.is_dir():
+        raise FileNotFoundError(f"no raw frames and no strips under {root}")
     import cv2
 
     from python.data.strip_writer import CANVAS_H, CANVAS_W
 
-    path = Path(root) / "strips" / f"{int(index):06d}.jpg"
+    path = strips / f"{int(index):06d}.jpg"
     bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if bgr is None:
         raise FileNotFoundError(path)

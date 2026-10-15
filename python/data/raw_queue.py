@@ -145,10 +145,14 @@ class RawWriteQueue:
                 self._committing += 1
                 self._next += 1
             try:
-                if self._encoded:
-                    self.writer.write_encoded(payload, **kwargs)
-                else:
-                    self.writer.write(payload, **kwargs)
+                try:
+                    if self._encoded:
+                        self.writer.write_encoded(payload, **kwargs)
+                    else:
+                        self.writer.write(payload, **kwargs)
+                except Exception as exc:
+                    print(f"collect write failed: {exc}", flush=True)
+                    raise
             finally:
                 with self._lock:
                     self._committing -= 1

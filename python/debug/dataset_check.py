@@ -14,7 +14,7 @@ from typing import Any
 
 import numpy as np
 
-from python.data.raw_frames import list_raw_images, load_scene_rows, load_training_bgr
+from python.data.raw_frames import list_raw_images, load_scene_rows, load_training_bgr, read_image_with_repair
 from python.data.strip_writer import CANVAS_H, CANVAS_W, SECTORS
 from python.debug.lane_targets import LOOKAHEADS_M, LANE_GT_DIM, lane_gt_from_record
 
@@ -234,9 +234,7 @@ def _read_raw_image(path: Path) -> np.ndarray | None:
             return np.load(path)
         except (OSError, ValueError):
             return None
-    from python.data.raw_frames import read_image_file
-
-    return read_image_file(path)
+    return read_image_with_repair(path)
 
 
 def _draw_canvas(path: Path, canvas: np.ndarray | None, values: np.ndarray, title: str) -> bool:
@@ -271,6 +269,40 @@ def _draw_montage(path: Path, strip_path: Path, values: np.ndarray, title: str) 
     return saved is not None
 
 
+def _report_without_frames(
+    root: Path,
+    out: Path,
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """State-only folder. Do not invent a ``strips/*.jpg`` path."""
+    issues = ["no raw frames and no strips"]
+    prev_t: float | None = None
+    prev_i: int | None = None
+    nan_rows = 0
+    for row in rows:
+        row_issues, prev_t, prev_i = _issues_for_row(row, prev_t, prev_i)
+        if any("NaN" in item or "not finite" in item for item in row_issues):
+            nan_rows += 1
+        issues.extend(row_issues)
+    report = {
+        "kind": "validate",
+        "root": str(root),
+        "rows": len(rows),
+        "jpegs": 0,
+        "raw_frames": 0,
+        "frames_checked": 0,
+        "nan_rows": nan_rows,
+        "blank_frames": {},
+        "issues": issues,
+        "issue_count": len(issues),
+        "montages": [],
+    }
+    from python.debug.remote_status import write_json
+
+    write_json(out / "report.json", report)
+    return report
+
+
 def validate_dataset(
     root: Path | str,
     out_dir: Path | str,
@@ -283,10 +315,13 @@ def validate_dataset(
     out.mkdir(parents=True, exist_ok=True)
     rows = load_scene_rows(root)
     raw_images = list_raw_images(root)
-    if raw_images:
+    raw_dir = root / "raw"
+    if raw_dir.is_dir() or raw_images:
         return _validate_raw(root, out, rows, raw_images, montage_n=montage_n)
     strips = root / "strips"
     jpegs = sorted(p for p in strips.glob("*.jpg") if p.is_file()) if strips.is_dir() else []
+    if not jpegs:
+        return _report_without_frames(root, out, rows)
     jpeg_ids = set()
     for path in jpegs:
         head = path.stem

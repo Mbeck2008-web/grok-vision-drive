@@ -33,6 +33,11 @@ class _Proc:
     def terminate(self) -> None:
         self.returncode = 0
 
+    def wait(self, timeout: float = 0.0):
+        del timeout
+        self.returncode = 0
+        return 0
+
 
 def check_options_and_status() -> None:
     opts = AutoOptions(map_name="west_coast_usa", route="random", waypoints="a,b", minutes=30, traffic=True)

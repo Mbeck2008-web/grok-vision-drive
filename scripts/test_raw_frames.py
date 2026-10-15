@@ -147,6 +147,7 @@ def check_pixels_roundtrip_and_load_time_stitch() -> None:
         again = RawFrameWriter(root, pose)
         third = again.write({"main": colour}, t=10.2, timestamps={"main": 10.2}, tech=tech)
         assert third["i"] == 2
+        assert writer.stored_bytes > 0 and again.stored_bytes > 0
         main_png = (root / "raw" / "main" / "000000.png").read_bytes()
         loaded = load_raw_cameras(root, 0)
         assert np.array_equal(loaded["main"], colour)

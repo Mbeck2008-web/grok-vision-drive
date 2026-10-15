@@ -370,6 +370,7 @@ def main(argv: list[str] | None = None) -> int:
 
         meter = CollectMeter(STRIP_ORDER)
         status_root = status_dir()
+        seed_bytes = directory_bytes(out)
         last_print = time.monotonic()
         last_disk = last_print
         last_ai: tuple[float, str | None] | None = None
@@ -383,10 +384,18 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
 
+        def _used_bytes() -> int:
+            extra = 0
+            try:
+                extra = int(writer.stats().get("bytes_written") or 0)
+            except Exception:
+                extra = 0
+            return int(seed_bytes) + extra
+
         def _publish(free: int | None, speed_now: float, route: str | None) -> None:
             payload = meter.snapshot(
                 elapsed_s=done_s,
-                disk_bytes=directory_bytes(out),
+                disk_bytes=_used_bytes(),
                 free_bytes=free,
                 ai_speed_mps=speed_now,
                 ai_mode=("manual" if route else "traffic" if args.traffic else "span"),
@@ -498,7 +507,7 @@ def main(argv: list[str] | None = None) -> int:
             done_s += time.monotonic() - tick_mark
             now_m = time.monotonic()
             if now_m - last_disk >= DISK_CHECK_S:
-                nbytes = directory_bytes(out)
+                nbytes = _used_bytes()
                 try:
                     free = check_data_path(out)
                 except DataDriveError as exc:
@@ -517,7 +526,7 @@ def main(argv: list[str] | None = None) -> int:
                     last_print = now_m
         save_progress(progress_path, done_s, target_s if target_s < float("inf") else done_s)
         _publish(None, speed_at(done_s, speeds), waypoint_at(done_s, names))
-        print(format_disk_line(done_s, directory_bytes(out), ceiling_gb_per_hour=ceiling_gb), flush=True)
+        print(format_disk_line(done_s, _used_bytes(), ceiling_gb_per_hour=ceiling_gb), flush=True)
         print(format_queue_line(writer.stats()), flush=True)
         return 0
     finally:

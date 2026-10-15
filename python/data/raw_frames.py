@@ -288,6 +288,7 @@ class RawFrameWriter:
         self._by_id = {str(cam["id"]): cam for cam in self.cameras if cam.get("id")}
         self._prev_t: float | None = None
         self._prev_cam_t: dict[str, float] = {}
+        self.stored_bytes = 0
         self._n = _next_index(_used_indices(self.root))
         self._write_cameras()
 
@@ -340,14 +341,17 @@ class RawFrameWriter:
                 final = folder / f"{idx:06d}.png"
                 _write_bytes(final, png)
                 stored = final
+                self.stored_bytes += len(png)
             else:
                 import io
 
                 final = folder / f"{idx:06d}.npy"
                 buf = io.BytesIO()
                 np.save(buf, arr)
-                _write_bytes(final, buf.getvalue())
+                blob = buf.getvalue()
+                _write_bytes(final, blob)
                 stored = final
+                self.stored_bytes += len(blob)
             wall, sensor_t = _stamp_of(None if timestamps is None else timestamps.get(cam_id))
             cam_dt = None
             prev = self._prev_cam_t.get(str(cam_id))

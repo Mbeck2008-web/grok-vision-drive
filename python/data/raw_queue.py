@@ -58,6 +58,7 @@ class RawWriteQueue:
             "dropped_frames": dropped,
             "enqueued": enqueued,
             "written": written,
+            "bytes_written": int(getattr(self.writer, "stored_bytes", 0) or 0),
         }
 
     def close(self, timeout_s: float = 30.0) -> None:

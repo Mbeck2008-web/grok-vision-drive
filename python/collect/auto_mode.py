@@ -220,7 +220,10 @@ class AutoSession:
             stop_file(out).write_text("stop\n", encoding="utf-8")
         proc = self.proc
         if proc is not None and proc.poll() is None:
-            proc.terminate()
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
         self.error = ""
 
     def status_lines(self) -> list[str]:

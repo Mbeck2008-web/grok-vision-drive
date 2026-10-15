@@ -10,6 +10,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from python.data.data_root import (  # noqa: E402
+    DataDriveError,
+    drive_letter,
+    refuse_system_drive,
+    space_failure,
+)
 from python.debug.gt_geom import ego_center_x  # noqa: E402
 from python.debug.lane_targets import (  # noqa: E402
     LOOKAHEADS_M,
@@ -101,6 +107,24 @@ def check_collect_schedule_and_resume() -> None:
         assert raw["target_s"] == 2700.0
 
 
+def check_data_disk_rules() -> None:
+    assert drive_letter(r"E:\GVD_data") == "E"
+    assert drive_letter("C:/temp") == "C"
+    assert drive_letter("D:/GVD") == "D"
+    assert drive_letter("/tmp/gvd") == ""
+    for bad in (r"C:\GVD_data", r"D:\GVD_data", "C:/foo"):
+        try:
+            refuse_system_drive(bad)
+        except DataDriveError:
+            pass
+        else:
+            raise AssertionError(bad)
+    refuse_system_drive(r"E:\GVD_data")
+    refuse_system_drive("/tmp/gvd")
+    assert space_failure(19 * 1024 ** 3) is not None
+    assert space_failure(21 * 1024 ** 3) is None
+
+
 def check_eval_command_on_a_short_recording() -> None:
     from scripts.eval_scene_lanes import main as eval_main
 
@@ -119,6 +143,7 @@ def main() -> None:
     check_holdout_is_the_end_of_the_clock()
     check_low_confidence_stops()
     check_collect_schedule_and_resume()
+    check_data_disk_rules()
     check_eval_command_on_a_short_recording()
     print("test_lane_targets: OK")
 

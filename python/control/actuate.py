@@ -418,10 +418,9 @@ def tech_control_kwargs(
     Shift mode stays the arcade set at engage. The kwargs omit gear. BeamNG
     routes a gear field through shiftToGearIndex, and in arcade that function
     is switchToRealisticBehavior, so every control tick was leaving arcade.
-    Throttle>0 releases the parking brake and the clutch. A hold, stop, or
-    AEB (throttle ~0 and brake >= 0.99) is parkingbrake=1 and service brake 0.
-    Arcade treats that held service brake, with no throttle, as reverse. The
-    hold ignores speed and always sets the parking brake.
+    Throttle>0 releases the parking brake and the clutch. Any brake with
+    throttle ~0 is parkingbrake=1 and service brake 0. Run 8 reversed on a
+    partial service brake (0.8), not only a full pedal. Coast is brake 0.
     """
     del speed_mps  # moving or stopped, the reverse pedal stays off
     if release:
@@ -442,7 +441,9 @@ def tech_control_kwargs(
             "parkingbrake": 0.0,
             "clutch": 0.0,
         }
-    if brake_v >= TECH_HOLD_BRAKE:
+    # Any service brake with no throttle is arcade reverse, including a partial
+    # pedal. Holds and trims both become the parking brake. Coast is brake 0.
+    if brake_v > 0.01:
         return {
             "steering": steer_v,
             "throttle": 0.0,
@@ -452,7 +453,7 @@ def tech_control_kwargs(
     return {
         "steering": steer_v,
         "throttle": 0.0,
-        "brake": brake_v,
+        "brake": 0.0,
         "parkingbrake": 0.0,
     }
 
@@ -477,7 +478,8 @@ def is_arcade_reverse_hold(kwargs: dict[str, Any]) -> bool:
         return True
     throttle = float(kwargs.get("throttle") or 0.0)
     brake = float(kwargs.get("brake") or 0.0)
-    return throttle <= 1e-6 and brake >= TECH_HOLD_BRAKE
+    # Run 8 reversed on brake 0.8 with throttle 0, not only on a full pedal.
+    return throttle <= 1e-6 and brake > 0.01
 
 
 def plan_command(
@@ -867,8 +869,15 @@ class BeamNGPyActuator:
         self._drive_arm_mono: float | None = None
         self.drive_arm_n = 0
         self._blinker: str | None = None
+        self._park_hold = False
+
+    def note_park_hold(self) -> None:
+        """Keep the parking brake on after a reverse disengage."""
+        self._park_hold = True
 
     def note_engaged(self, engaged: bool) -> None:
+        if engaged:
+            self._park_hold = False
         self.engaged = bool(engaged)
         # Grab loop: poll_vehicle, then note_engaged. The latch covers later
         # grabs (and force_engage, which does not write gvd_engage.json).
@@ -900,6 +909,9 @@ class BeamNGPyActuator:
             "heartbeat_mtime": time.time(),
             "reason": str(reason),
         }
+        if self._park_hold:
+            payload["brake"] = 1.0
+            payload["hold_park"] = True
         ok = bool(atomic_write_json(cmd_path(), payload, indent=None))
         if ok:
             self._release_cmd_mono = t
@@ -1150,6 +1162,16 @@ class BeamNGPyActuator:
     def stop(
         self, seq: int = 0, reason: str = "stop", *, now: float | None = None
     ) -> DriveCommand:
+        if not self.engaged and (self._park_hold or reason == "reverse"):
+            self._park_hold = True
+            try:
+                self._invoke_control(tech_control_kwargs(0.0, 0.0, 1.0))
+            except Exception:
+                pass
+            self._write_release_cmd(seq, reason, force=True, now=now)
+            cmd = stop_command(seq=seq, reason=reason)
+            cmd.applied = False
+            return cmd
         if not self.engaged:
             # Handoff, not a brake hold. ego.brake must not stay at 1, and the
             # cmd bus must not keep a stale brake:1 while engaged is false.
@@ -1190,8 +1212,14 @@ class CmdJsonActuator:
         self.ack: EgoFeedback | None = None
         self.last_seq = 0
         self.write_ok = True
+        self._park_hold = False
+
+    def note_park_hold(self) -> None:
+        self._park_hold = True
 
     def note_engaged(self, engaged: bool) -> None:
+        if engaged:
+            self._park_hold = False
         self.engaged = bool(engaged)
         # Same latch as BeamNGPyActuator. poll_vehicle already ran this grab.
         note_soft_esc_engaged(self.engaged)
@@ -1230,6 +1258,10 @@ class CmdJsonActuator:
             "heartbeat_mtime": time.time(),
             "reason": cmd.reason,
         }
+        if self._park_hold and not driving:
+            payload["throttle"] = 0.0
+            payload["brake"] = 1.0
+            payload["hold_park"] = True
         self.write_ok = atomic_write_json(cmd_path(), payload)
         self.last_seq = int(cmd.seq)
         cmd.applied = bool(driving and self.write_ok and self.acked(cmd.seq))

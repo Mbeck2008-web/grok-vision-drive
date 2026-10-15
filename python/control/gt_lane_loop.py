@@ -88,7 +88,8 @@ def run_gt_lane(
         steer = max(-1.0, min(1.0, float(cmd.steer)))
         throttle = max(0.0, min(1.0, float(cmd.throttle)))
         brake = max(0.0, min(1.0, float(cmd.brake)))
-        if brake >= 0.99 and throttle <= 0.0:
+        # No-throttle brake is the parking brake on the wire, not a reverse pedal.
+        if brake > 0.01 and throttle <= 1e-6:
             speed = 0.0
             accel = 0.0
         else:

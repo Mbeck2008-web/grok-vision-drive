@@ -1054,6 +1054,13 @@ local VE_APPLY_FMT = VE_HOLD
   .. "input.event('brake',%.4f,2,0,0,nil,'gvd');"
   .. "input.event('parkingbrake',0,2,0,0,nil,'gvd');"
   .. "input.event('clutch',0,2,0,0,nil,'gvd')"
+-- Service brake with no throttle is arcade reverse. A hold is the parking brake.
+local VE_PARK_FMT = VE_HOLD
+  .. "input.event('steering',%.4f,2,900,0,nil,'gvd');"
+  .. "input.event('throttle',0,2,0,0,nil,'gvd');"
+  .. "input.event('brake',0,2,0,0,nil,'gvd');"
+  .. "input.event('parkingbrake',1,2,0,0,nil,'gvd');"
+  .. "input.event('clutch',0,2,0,0,nil,'gvd')"
 local VE_RELEASE = "input.event('steering',0,2,900,0,nil,'gvd');"
   .. "input.event('throttle',0,2,0,0,nil,'gvd');"
   .. "input.event('brake',0,2,0,0,nil,'gvd');"
@@ -1310,11 +1317,15 @@ local function applyInputs(veh, steer, throttle, brake)
   steer = clamp(tonumber(steer) or 0, -1, 1)
   throttle = clamp(tonumber(throttle) or 0, 0, 1)
   brake = clamp(tonumber(brake) or 0, 0, 1)
-  if brake > 0.01 then throttle = 0 end  -- never both pedals (AEB semantics; arcade auto-reverse guard)
+  if brake > 0.01 then throttle = 0 end  -- never both pedals
   ovrNoteCommand(steer, throttle, brake)  -- reference the override residual is measured against
   if not holdLogged then
     holdLogged = true
     log('I', 'GVD', '[GVD] retail drive: secondary Direct Drive wheel+pedals (source=gvd, filter=direct) so the software can hold the sim car')
+  end
+  -- No throttle and any brake is arcade reverse. Pin the parking brake instead.
+  if throttle <= 0.01 and brake > 0.01 then
+    return queueVehicle(veh, string.format(VE_PARK_FMT, steer))
   end
   return queueVehicle(veh, string.format(VE_APPLY_FMT, steer, throttle, brake))
 end
@@ -1503,6 +1514,17 @@ local function applyCmdJson(dt)
     return
   end
   if not engaged then
+    local rawPark = readText(CMD_REL)
+    local parkCmd = rawPark and decodeJson(rawPark) or nil
+    if type(parkCmd) == 'table' and parkCmd.hold_park == true then
+      local vehPark = getPlayerVeh()
+      if vehPark then
+        applying = true
+        applyVeh = vehPark
+        applyInputs(vehPark, 0, 0, 1)
+      end
+      return
+    end
     releaseInputs('disengaged')
     cmdStaleAcc = 0
     return

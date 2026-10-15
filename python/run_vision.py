@@ -54,6 +54,8 @@ from python.viz.debug_draw import cabin_drive_word
 from python.control.launch_guard import (
     LaunchGuard,
     apply_lane_exit_brake,
+    longitudinal_mps,
+    moving_backward,
     apply_stale_speed_cap,
 )
 from python.debug.gt_geom import heading_from_dir
@@ -969,6 +971,24 @@ def main() -> None:
                     flush=True,
                 )
                 cmd = stop_command(seq=cmd_seq, reason=crash_reason)
+            long_v = None
+            if vdata is not None:
+                long_v = longitudinal_mps(getattr(vdata, "vel", None), direction)
+            if engaged and moving_backward(long_v):
+                engaged = False
+                disengage_reason = "reverse"
+                holding = False
+                lane_steer.reset()
+                launch_guard.reset()
+                bot_engage.clear()
+                write_engage_flag(False, disengage_reason="reverse")
+                print(
+                    f"[GVD] DISENGAGED: reverse long_mps={long_v:.2f}",
+                    flush=True,
+                )
+                cmd = stop_command(seq=cmd_seq, reason="reverse")
+                if hasattr(actuator, "note_park_hold"):
+                    actuator.note_park_hold()
 
             # Actuators only when engaged + command ok (path / tracks / shadow already on this tick).
             # cmd_json: Lua applies whatever we write only while `engaged` rides along in the payload.

@@ -293,7 +293,8 @@ check(ego and ego:find('"lua_bus":"' .. DRIVE_BUS, 1, true),
 clearEvents()
 writeCmd(true, 0.0, 0.5, 1.0)
 M.onUpdate(0.06)
-check(near(lastEvent('brake')[2], 1.0) and near(lastEvent('throttle')[2], 0.0), 'brake>0 → throttle forced 0')
+check(near(lastEvent('throttle')[2], 0.0) and near(lastEvent('brake')[2], 0.0) and near(lastEvent('parkingbrake')[2], 1.0),
+  'brake with no throttle is the parking brake, not arcade reverse')
 
 -- 5) stale stream (>0.35 s without a new seq) → brake hold, steering straight
 clearEvents()
@@ -303,7 +304,9 @@ check(near(lastEvent('steering')[2], 0.6), 'fresh cmd applied (steer 0.6)')
 clearEvents()
 M.onUpdate(0.2); M.onUpdate(0.2)
 local sh = lastEvent('steering'); local bh = lastEvent('brake'); local thh = lastEvent('throttle')
-check(sh and near(sh[2], 0) and bh and near(bh[2], 1) and thh and near(thh[2], 0), 'stale > 0.35 s → steer 0 / throttle 0 / brake 1 hold')
+local ph = lastEvent('parkingbrake')
+check(sh and near(sh[2], 0) and bh and near(bh[2], 0) and thh and near(thh[2], 0) and ph and near(ph[2], 1),
+  'stale > 0.35 s → steer 0 / throttle 0 / parking brake hold')
 check(M.isEngaged(), 'still engaged during short stall')
 
 -- 6) stream resumes → normal apply again
@@ -365,8 +368,8 @@ check(near(lastEvent('brake')[2], 0) and near(lastEvent('throttle')[2], 0), 'dea
 local ef = readFileAll(engagePath)
 check(ef and ef:find('"engaged":false') ~= nil, 'dead-man wrote gvd_engage.json engaged=false')
 local sawHold = false
-for _, e in ipairs(events) do if e[1] == 'brake' and near(e[2], 1) then sawHold = true end end
-check(sawHold, 'brake hold happened before the dead-man release')
+for _, e in ipairs(events) do if e[1] == 'parkingbrake' and near(e[2], 1) then sawHold = true end end
+check(sawHold, 'parking-brake hold happened before the dead-man release')
 
 -- 10) left-over file from an old session (heartbeat_mtime far in the past) is never applied
 M.toggleEngage()

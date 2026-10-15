@@ -106,6 +106,8 @@ class VizUI:
     record: Any = None
     # Optional folder picker. Cancel returns a falsy value and leaves the folder in place.
     record_browser: Any = None
+    # Automatic Mode collector. None until the AUTO tab is used.
+    auto: Any = None
 
     def toggle_nerd(self) -> None:
         self.show_nerd = not self.show_nerd
@@ -133,6 +135,11 @@ class VizUI:
 
     def show_cams_tab(self) -> None:
         self.nerd_tab = "cams"
+        self.show_help = False
+        self.show_nerd = True
+
+    def show_auto_tab(self) -> None:
+        self.nerd_tab = "auto"
         self.show_help = False
         self.show_nerd = True
 
@@ -179,6 +186,9 @@ class VizUI:
             return True
         if key in (ord("a"), ord("A")):
             self.show_cams_tab()
+            return True
+        if key in (ord("u"), ord("U")):
+            self.show_auto_tab()
             return True
         if key in (ord("r"), ord("R")):
             # Review capture. ASCII R is 82. Qt Up is 65362, not 82.
@@ -266,7 +276,29 @@ class VizUI:
         if hit.get("kind") == "record":
             self._handle_record_hit(str(hit.get("id") or ""))
             return True
+        if hit.get("kind") == "auto":
+            self._handle_auto_hit(str(hit.get("id") or ""))
+            return True
         return False
+
+    def ensure_auto(self) -> Any:
+        if self.auto is None:
+            from python.collect.auto_mode import AutoSession
+
+            self.auto = AutoSession()
+        return self.auto
+
+    def _handle_auto_hit(self, ident: str) -> None:
+        try:
+            session = self.ensure_auto()
+            if ident == "start":
+                session.start()
+            elif ident == "stop":
+                session.stop()
+            else:
+                session.options.cycle(ident)
+        except Exception:
+            return
 
     def ensure_record(self) -> Any:
         if self.record is None:
@@ -330,7 +362,7 @@ class VizUI:
             self.hover = None
             return
         hit = hit_test(self.nerd_hits, x - stage_w, y)
-        if not hit or hit.get("kind") not in ("tab", "row", "record"):
+        if not hit or hit.get("kind") not in ("tab", "row", "record", "auto"):
             self.hover = None
             return
         self.hover = {

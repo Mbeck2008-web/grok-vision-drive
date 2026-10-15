@@ -205,6 +205,22 @@ The vision window LIVE tab has Start recording and Stop recording. The status sh
 
 Six sectors are 256×192 (repeatL, pillarL, main, narrow, pillarR, repeatR). Wide and rear are 340×192. Seven gaps are 8 px. The scene net crops those sectors, letterboxes the wide ones to 256×192, and steps a GRU with the real seconds since the previous strip. It predicts lanes, curbs, cars, signs, and lights, including ones the cameras cannot fully see. The hardcoded path planner turns that scene into the path and remains the driver. Training is `python -m python.train.train_scene`. It leaves BeamNG running. Compute 6.1 stays FP32. Compute 7.0 and newer select automatic mixed precision. Both export the same ONNX graph, `models/e2e_scene.onnx`. Wheel and pedals can drop a bad moment from the loss. They are not a loss term. Before the first step the trainer measures the strip directory and free VRAM and shrinks the batch until the step fits. When the card cannot hold one step and the machine has more CPU RAM, training uses the CPU and the window marks that path not recommended. A fit on the GPU stays on the GPU. The window updates time left, loss, learning rate, steps per second, and VRAM or RAM in use. It also shows recorded hours and minutes, summed from each line's dt_s in that folder. A new session is included. An empty folder shows 0 hours 0 minutes. The panel uses the supervisor's dark ground, ice type, and row spacing. Its loss graph is the steps of this run. Before a run it shows the recorded duration and sits idle.
 
+### Automatic Mode
+
+Automatic Mode records while BeamNG's own AI drives. It is not GVD steering. Every saved tick is labeled `driver=beamng_ai`.
+
+Start BeamNG.tech, then either press `U` in the GVD VISION window and click **Start**, or run:
+
+```
+py -3 scripts\collect_scene_lanes.py --minutes 45
+```
+
+The panel and that command use the same raw recorder. Frames go to `E:\GVD_data\scene_lanes\raw\`, one lossless file per camera. `GVD_DATA_DIR` moves the tree. C: and D: are refused. The run stops if that disk drops under 20 GB free. **Stop** writes a stop file and ends the collector. It does not close BeamNG.
+
+Options are the map, span / waypoints / random route, a speed range, a duration or until-disk, which cameras and rates, traffic on or off, and a time of day or weather when you set one. The panel shows minutes, frames, gigabytes used, free space, the AI state, and the last error.
+
+Do not run Automatic Mode while the supervisor is also attaching cameras.
+
 ### Credits
 
 GVD uses these outside projects. Each one is its authors' work.

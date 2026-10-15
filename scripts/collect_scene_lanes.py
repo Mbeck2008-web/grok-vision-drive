@@ -60,9 +60,16 @@ def waypoint_at(elapsed_s: float, names: tuple[str, ...]) -> str | None:
     return names[index]
 
 
-def ai_commands(speed_mps: float, waypoint: str | None) -> list[str]:
-    """Vehicle-Lua lines. Span is traffic-free road following."""
+def ai_commands(speed_mps: float, waypoint: str | None, *, traffic: bool = False) -> list[str]:
+    """Vehicle-Lua lines. Span is traffic-free. Traffic uses the traffic AI."""
     speed = float(speed_mps)
+    if traffic and not waypoint:
+        return [
+            'ai.setMode("traffic")',
+            'ai.driveInLane("on")',
+            'ai.setSpeedMode("limit")',
+            f"ai.setSpeed({speed})",
+        ]
     if waypoint:
         safe = str(waypoint).replace("\\", "").replace('"', "")
         return [
@@ -146,7 +153,17 @@ def save_progress(path: Path, done_s: float, target_s: float) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Record AI driving strips with GT lane targets")
-    parser.add_argument("--minutes", type=float, default=45.0, help="Stop after this much driving. 30-60 is the target.")
+    parser.add_argument("--minutes", type=float, default=45.0, help="Stop after this much driving. 0 with --until-disk runs to the 20 GB floor.")
+    parser.add_argument("--until-disk", action="store_true", help="Ignore the clock. Stop only under 20 GB free.")
+    parser.add_argument("--map", default="", help="Level to load. Empty keeps the current level.")
+    parser.add_argument("--route", default="span", choices=["span", "waypoints", "random"])
+    parser.add_argument("--speed-min", type=float, default=8.0)
+    parser.add_argument("--speed-max", type=float, default=17.0)
+    parser.add_argument("--cameras", default="", help="Comma list. Empty keeps every camera at its plan rate.")
+    parser.add_argument("--rates", default="", help="Overrides, for example main=10,rear=1")
+    parser.add_argument("--traffic", action="store_true", help="Traffic AI. Off is span, traffic-free.")
+    parser.add_argument("--time-of-day", default="", help="0-1 day fraction, or an hour 0-24. Empty leaves the sky.")
+    parser.add_argument("--weather", default="", help="clear, rain, or fog. Empty leaves the weather.")
     parser.add_argument(
         "--out",
         type=Path,
@@ -265,7 +282,22 @@ def main(argv: list[str] | None = None) -> int:
     except DataDriveError as exc:
         print(f"collect {exc}", file=sys.stderr)
         return 2
+    from python.collect.auto_mode import environment_commands, rates_table, speeds_for, stop_file
+
     names = tuple(part.strip() for part in str(args.waypoints).split(",") if part.strip())
+    if args.route == "span":
+        names = ()
+    elif args.route == "random" and names:
+        import random
+
+        bag = list(names)
+        random.Random(1).shuffle(bag)
+        names = tuple(bag)
+    speeds = speeds_for(args.speed_min, args.speed_max)
+    cam_rates = rates_table(args.rates, args.cameras)
+    until_disk = bool(args.until_disk) or float(args.minutes) <= 0.0
+    if args.map:
+        args.reload_level = args.map
     out = Path(args.out) if args.out is not None else scene_lanes_dir()
     try:
         check_data_path(out)
@@ -274,7 +306,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     progress_path = out / "collect.json"
     done_s = load_progress(progress_path)
-    target_s = max(60.0, float(args.minutes) * 60.0)
+    target_s = float("inf") if until_disk else max(60.0, float(args.minutes) * 60.0)
+    flag = stop_file(out)
+    if flag.is_file():
+        flag.unlink()
     if done_s >= target_s:
         print(f"collect already reached {done_s / 60.0:.1f} min in {out}")
         return 0
@@ -341,6 +376,12 @@ def main(argv: list[str] | None = None) -> int:
         last_cam: dict[str, float] = {}
         prev_dir: list[float] | None = None
         prev_dir_t: float | None = None
+        last_error = ""
+        for command in environment_commands(args.time_of_day, args.weather):
+            try:
+                _queue(vehicle, command)
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
 
         def _publish(free: int | None, speed_now: float, route: str | None) -> None:
             payload = meter.snapshot(
@@ -348,7 +389,7 @@ def main(argv: list[str] | None = None) -> int:
                 disk_bytes=directory_bytes(out),
                 free_bytes=free,
                 ai_speed_mps=speed_now,
-                ai_mode="manual" if route else "span",
+                ai_mode=("manual" if route else "traffic" if args.traffic else "span"),
                 ai_waypoint=route,
                 out=str(out),
                 target_s=target_s,
@@ -356,18 +397,29 @@ def main(argv: list[str] | None = None) -> int:
             payload["raw_png_gb_per_hour"] = float(ceiling_gb)
             payload["raw_uncompressed_gb_per_hour"] = float(totals["uncompressed_gb_per_hour"])
             payload.update(writer.stats())
+            payload["driver"] = "beamng_ai"
+            payload["automatic"] = True
+            payload["error"] = last_error
+            payload["until_disk"] = bool(until_disk)
+            if target_s == float("inf"):
+                payload["target_s"] = None
             write_collect_status(status_root, payload)
 
-        _publish(None, speed_at(done_s), waypoint_at(done_s, names))
+        _publish(None, speed_at(done_s, speeds), waypoint_at(done_s, names))
         if status_root is not None:
             print(f"collect status={status_root / 'collect.json'}", flush=True)
         while done_s < target_s:
+            if stop_file(out).is_file():
+                save_progress(progress_path, done_s, target_s if target_s < float("inf") else done_s)
+                _publish(None, speed_at(done_s, speeds), waypoint_at(done_s, names))
+                print("collect stop requested", flush=True)
+                return 0
             tick_mark = time.monotonic()
             elapsed = done_s
-            speed = speed_at(elapsed)
+            speed = speed_at(elapsed, speeds)
             waypoint = waypoint_at(elapsed, names)
             if last_ai != (speed, waypoint):
-                for command in ai_commands(speed, waypoint):
+                for command in ai_commands(speed, waypoint, traffic=bool(args.traffic)):
                     _queue(vehicle, command)
                 last_ai = (speed, waypoint)
                 print(f"collect ai speed={speed:.0f} m/s route={waypoint or 'span'}", flush=True)
@@ -377,7 +429,7 @@ def main(argv: list[str] | None = None) -> int:
             due_stamps: dict[str, Any] = {}
             held: list[tuple[str, float | None]] = []
             for cid, image in frames.items():
-                if not camera_due(cid, mono, last_cam):
+                if not camera_due(cid, mono, last_cam, cam_rates):
                     continue
                 held.append((cid, last_cam.get(cid)))
                 last_cam[cid] = mono
@@ -450,7 +502,7 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     free = check_data_path(out)
                 except DataDriveError as exc:
-                    save_progress(progress_path, done_s, target_s)
+                    save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
                     _publish(None, speed, waypoint)
                     print(format_disk_line(done_s, nbytes, ceiling_gb_per_hour=ceiling_gb), flush=True)
                     print(format_queue_line(writer.stats()), flush=True)
@@ -460,11 +512,11 @@ def main(argv: list[str] | None = None) -> int:
                 if now_m - last_print >= 60.0:
                     print(format_disk_line(done_s, nbytes, free, ceiling_gb_per_hour=ceiling_gb), flush=True)
                     print(format_queue_line(writer.stats()), flush=True)
-                    save_progress(progress_path, done_s, target_s)
+                    save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
                     _publish(free, speed, waypoint)
                     last_print = now_m
-        save_progress(progress_path, done_s, target_s)
-        _publish(None, speed_at(done_s), waypoint_at(done_s, names))
+        save_progress(progress_path, done_s, target_s if target_s < float("inf") else done_s)
+        _publish(None, speed_at(done_s, speeds), waypoint_at(done_s, names))
         print(format_disk_line(done_s, directory_bytes(out), ceiling_gb_per_hour=ceiling_gb), flush=True)
         print(format_queue_line(writer.stats()), flush=True)
         return 0

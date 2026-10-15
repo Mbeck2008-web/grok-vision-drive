@@ -13,6 +13,18 @@ It prints free disk, collection, the training heartbeat (step and ETA),
 the last metrics line, a crash file if training died, the live lane
 line, the validator, and the eval summary.
 
+## Automatic Mode
+
+BeamNG AI collection. The GVD VISION **AUTO** tab (`U`, then Start / Stop) and this command are the same recorder. Every tick is `driver=beamng_ai`. Files stay under `E:\GVD_data`. The 20 GB free stop still applies. Status is `E:\GVD_data\status\collect.json`.
+
+```
+py -3 scripts\collect_scene_lanes.py --minutes 45
+py -3 scripts\collect_scene_lanes.py --map west_coast_usa --route random --waypoints a,b --speed-min 8 --speed-max 16 --minutes 30
+py -3 scripts\collect_scene_lanes.py --until-disk --traffic --cameras main,narrow,wide --time-of-day 0.5 --weather clear
+```
+
+`--until-disk` ignores the clock and stops only under 20 GB free. `--traffic` uses the traffic AI. Off is span, traffic-free. Time of day and weather are sent when set. Empty leaves the sky alone.
+
 ## Collect
 
 ```

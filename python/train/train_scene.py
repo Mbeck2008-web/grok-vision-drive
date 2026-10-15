@@ -930,9 +930,21 @@ def train_directory(
 
 
 def main(argv: list[str] | None = None) -> None:
+    from python.data.data_root import DataDriveError, check_data_path, ensure_cache_dirs, scene_lanes_dir
+
+    try:
+        ensure_cache_dirs()
+    except DataDriveError as exc:
+        print(f"[GVD] scene train: {exc}")
+        sys.exit(2)
     args = build_parser().parse_args(argv)
     export_path = None if args.export is None else Path(args.export)
     if export_path is not None and not args.strips:
+        try:
+            check_data_path(export_path)
+        except DataDriveError as exc:
+            print(f"[GVD] scene train: {exc}")
+            sys.exit(2)
         if not torch_ready():
             print("[GVD] scene export needs PyTorch")
             sys.exit(2)
@@ -940,8 +952,14 @@ def main(argv: list[str] | None = None) -> None:
         print(f"[GVD] exported {path}")
         return
     if not args.strips:
-        print("[GVD] scene train: pass --strips, or --export to write the ONNX graph")
-        return
+        args.strips = str(scene_lanes_dir())
+    try:
+        check_data_path(args.strips)
+        if export_path is not None:
+            check_data_path(export_path)
+    except DataDriveError as exc:
+        print(f"[GVD] scene train: {exc}")
+        sys.exit(2)
     if not torch_ready():
         print("[GVD] scene train needs PyTorch")
         sys.exit(2)

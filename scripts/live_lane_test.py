@@ -89,7 +89,9 @@ def _log_says_crash(path: Path) -> bool:
 
 
 def _newest_log(since: float) -> Path | None:
-    folder = ROOT / "logs"
+    from python.data.data_root import logs_dir
+
+    folder = logs_dir()
     if not folder.is_dir():
         return None
     found = [p for p in folder.glob("gt_*.jsonl") if p.stat().st_mtime >= since - 1.0]
@@ -147,6 +149,9 @@ def main(argv: list[str] | None = None) -> int:
         started = time.time()
         env = os.environ.copy()
         env["GVD_GT_LOG"] = "1"
+        env["GVD_DATA_DIR"] = os.environ.get("GVD_DATA_DIR", r"E:\GVD_data")
+        env["TMP"] = env["TEMP"] = env["TMPDIR"] = str(Path(env["GVD_DATA_DIR"]) / "tmp")
+        env["TORCH_HOME"] = str(Path(env["GVD_DATA_DIR"]) / "cache" / "torch")
         env["GVD_TECH_LAUNCH"] = "0"
         env["GVD_BEAMNG"] = "1"
         env["GVD_BACKEND"] = "beamngpy"
@@ -170,7 +175,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             time.sleep(0.5)
         if log is None:
-            print("[GVD] no logs/gt_*.jsonl after 45 s", file=sys.stderr)
+            print("[GVD] no gt_*.jsonl under the data logs folder after 45 s", file=sys.stderr)
             return 2
         _lua(bng, "extensions.gvd_main.engage()")
         print(f"[GVD] engaged for {args.seconds:.0f}s  log={log}", flush=True)

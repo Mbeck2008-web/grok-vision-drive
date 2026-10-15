@@ -37,7 +37,17 @@ def gt_log_enabled(flag: bool = False) -> bool:
 
 
 def logs_dir(root: Path | None = None) -> Path:
-    base = Path(root) if root is not None else Path(__file__).resolve().parents[2] / "logs"
+    """Live GT logs. Default is ``E:\\GVD_data\\logs`` (or ``GVD_DATA_DIR``)."""
+    if root is not None:
+        base = Path(root)
+    else:
+        from python.data.data_root import logs_dir as data_logs
+        from python.data.data_root import use_data_disk
+
+        if use_data_disk():
+            base = data_logs()
+        else:
+            base = Path(__file__).resolve().parents[2] / "logs"
     base.mkdir(parents=True, exist_ok=True)
     return base
 

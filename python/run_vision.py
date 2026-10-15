@@ -303,6 +303,14 @@ def main() -> None:
     )
     args = ap.parse_args()
 
+    from python.data.data_root import DataDriveError, ensure_cache_dirs
+
+    try:
+        ensure_cache_dirs()
+    except DataDriveError as exc:
+        print(f"[GVD] {exc}", flush=True)
+        raise SystemExit(2)
+
     if args.vision_only:
         os.environ["GVD_VISION_ONLY"] = "1"
 

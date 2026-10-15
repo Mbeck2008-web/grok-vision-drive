@@ -241,7 +241,10 @@ def count_module_parameters(module: Any) -> int:
 
 
 def default_onnx_path() -> Path:
-    return Path(__file__).resolve().parents[2] / "models" / SCENE_ONNX_NAME
+    """FP32 export. Lives on the data disk, not in the repo."""
+    from python.data.data_root import models_dir
+
+    return models_dir() / SCENE_ONNX_NAME
 
 
 def torch_ready() -> bool:

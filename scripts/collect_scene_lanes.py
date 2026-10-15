@@ -18,12 +18,13 @@ live log's 8 m sample.
 The output directory is resumable. A second start appends strips and keeps
 counting until ``--minutes`` is reached.
 
-    .venv\\Scripts\\python scripts\\collect_scene_lanes.py --minutes 45 --out data\\scene_lanes
+    .venv\\Scripts\\python scripts\\collect_scene_lanes.py --minutes 45
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -85,10 +86,13 @@ def directory_bytes(root: Path) -> int:
     return total
 
 
-def format_disk_line(elapsed_s: float, nbytes: int) -> str:
+def format_disk_line(elapsed_s: float, nbytes: int, free_bytes: int | None = None) -> str:
     minutes = max(elapsed_s, 1e-6) / 60.0
     mb = nbytes / (1024.0 * 1024.0)
-    return f"collect t={elapsed_s / 60.0:.1f} min disk={mb:.1f} MB rate={mb / minutes:.2f} MB/min"
+    line = f"collect t={elapsed_s / 60.0:.1f} min disk={mb:.1f} MB rate={mb / minutes:.2f} MB/min"
+    if free_bytes is not None:
+        line += f" free={free_bytes / (1024.0 ** 3):.1f} GB"
+    return line
 
 
 def load_progress(path: Path) -> float:
@@ -115,7 +119,17 @@ def save_progress(path: Path, done_s: float, target_s: float) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Record AI driving strips with GT lane targets")
     parser.add_argument("--minutes", type=float, default=45.0, help="Stop after this much driving. 30-60 is the target.")
-    parser.add_argument("--out", type=Path, default=Path("data/scene_lanes"))
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Strip folder. Default: GVD_DATA_DIR/scene_lanes or E:\\GVD_data\\scene_lanes.",
+    )
+    parser.add_argument(
+        "--data-dir",
+        default="",
+        help="Override GVD_DATA_DIR for this process. Refuses C: and D:.",
+    )
     parser.add_argument("--host", default=None)
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument(
@@ -181,6 +195,12 @@ def _colour(payload: Any) -> Any:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    from python.data.data_root import (
+        DataDriveError,
+        check_data_path,
+        ensure_cache_dirs,
+        scene_lanes_dir,
+    )
     from python.data.strip_writer import StripWriter
     from python.debug.gt_geom import heading_from_dir, project_road
     from python.debug.gt_logger import load_road_polys
@@ -197,8 +217,20 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_tech_config()
     host = args.host or str(cfg.get("host") or "localhost")
     port = int(args.port if args.port is not None else cfg.get("port") or 25252)
+    if args.data_dir:
+        os.environ["GVD_DATA_DIR"] = str(args.data_dir)
+    try:
+        ensure_cache_dirs()
+    except DataDriveError as exc:
+        print(f"collect {exc}", file=sys.stderr)
+        return 2
     names = tuple(part.strip() for part in str(args.waypoints).split(",") if part.strip())
-    out = Path(args.out)
+    out = Path(args.out) if args.out is not None else scene_lanes_dir()
+    try:
+        check_data_path(out)
+    except DataDriveError as exc:
+        print(f"collect {exc}", file=sys.stderr)
+        return 2
     progress_path = out / "collect.json"
     done_s = load_progress(progress_path)
     target_s = max(60.0, float(args.minutes) * 60.0)
@@ -272,7 +304,14 @@ def main(argv: list[str] | None = None) -> int:
             done_s += time.monotonic() - tick_mark
             if time.monotonic() - last_print >= 60.0:
                 nbytes = directory_bytes(out)
-                print(format_disk_line(done_s, nbytes), flush=True)
+                try:
+                    free = check_data_path(out)
+                except DataDriveError as exc:
+                    save_progress(progress_path, done_s, target_s)
+                    print(format_disk_line(done_s, nbytes), flush=True)
+                    print(f"collect stop {exc}", flush=True)
+                    return 3
+                print(format_disk_line(done_s, nbytes, free), flush=True)
                 save_progress(progress_path, done_s, target_s)
                 last_print = time.monotonic()
         save_progress(progress_path, done_s, target_s)

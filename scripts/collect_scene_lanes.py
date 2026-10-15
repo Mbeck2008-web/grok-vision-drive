@@ -193,7 +193,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--speed-max", type=float, default=17.0)
     parser.add_argument("--cameras", default="", help="Comma list. Empty keeps every camera at its plan rate.")
     parser.add_argument("--rates", default="", help="Overrides, for example main=10,rear=1")
-    parser.add_argument("--traffic", action="store_true", help="Traffic AI. Off is span, traffic-free.")
+    parser.add_argument(
+        "--traffic",
+        nargs="?",
+        const=1,
+        default=None,
+        type=int,
+        help="Companion AI cars ahead and behind. West coast defaults to 2. 0 disables them.",
+    )
+    parser.add_argument(
+        "--respawn-min",
+        type=float,
+        default=0.0,
+        help="On west_coast_usa, teleport to a new stratified spawn after this many minutes.",
+    )
     parser.add_argument("--time-of-day", default="", help="0-1 day fraction, or an hour 0-24. Empty leaves the sky.")
     parser.add_argument("--weather", default="", help="clear, rain, or fog. Empty leaves the weather.")
     parser.add_argument(
@@ -996,6 +1009,11 @@ def main(argv: list[str] | None = None) -> int:
         held_tag: Excursion | None = None
         loaded_map = ""
         loaded_index = -1
+        speed_span = [speeds]
+        spawn_deck = None
+        spawn_kind = ""
+        spawn_mark = -1.0e9
+        respawn_s = max(0.0, float(args.respawn_min)) * 60.0
         tick_dt = 0.1
         last_cam: dict[str, float] = {}
         prev_dir: list[float] | None = None
@@ -1023,7 +1041,7 @@ def main(argv: list[str] | None = None) -> int:
                 disk_bytes=_used_bytes(),
                 free_bytes=free,
                 ai_speed_mps=speed_now,
-                ai_mode=("manual" if route else "traffic" if args.traffic else "span"),
+                ai_mode=("manual" if route else "span"),
                 ai_waypoint=route,
                 out=str(out),
                 target_s=target_s,
@@ -1147,6 +1165,62 @@ def main(argv: list[str] | None = None) -> int:
             print(f"collect stop {message}", flush=True)
             return 2
 
+        def _apply_spawn(force: bool) -> None:
+            """Teleport west coast to the next unused stratified spawn."""
+            nonlocal spawn_deck, spawn_kind, spawn_mark, spawn_pos, last_ai, segment_open, speed
+            if map_name != "west_coast_usa" or vehicle is None:
+                return
+            if not force and (respawn_s <= 0.0 or done_s - spawn_mark < respawn_s):
+                return
+            if spawn_deck is None:
+                from python.collect.spawn_mix import SpawnDeck
+
+                dump = None
+                try:
+                    from python.data.data_root import roads_dir
+
+                    candidate = roads_dir() / "west_coast_usa.json.gz"
+                    if candidate.is_file():
+                        dump = candidate
+                except Exception:
+                    dump = None
+                if dump is None:
+                    bundled = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "roads" / "west_coast_usa.json.gz"
+                    if bundled.is_file():
+                        dump = bundled
+                if dump is None:
+                    return
+                spawn_deck = SpawnDeck.load(dump)
+            picked = spawn_deck.take()
+            if picked is None:
+                return
+            from python.collect.level_session import place_vehicle
+            from python.collect.spawn_mix import traffic_count, traffic_lua
+
+            shift = place_vehicle(bng, vehicle, picked.pos, picked.rot)
+            if shift:
+                print(f"collect spawn {segment_id} {picked.kind} failed {shift}", flush=True)
+                return
+            spawn_kind = picked.kind
+            spawn_mark = done_s
+            spawn_pos = picked.pos
+            speed_span[0] = speeds_for(picked.speed[0], picked.speed[1])
+            speed = speed_at(done_s, tuple(speed_span[0]))
+            last_ai = None
+            live.reset()
+            segment_open = False
+            count = traffic_count(args.traffic, map_name)
+            ge = getattr(bng, "queue_lua_command", None)
+            if count and callable(ge):
+                for command in traffic_lua(picked, count):
+                    ge(command)
+            print(
+                f"collect spawn {segment_id} {picked.kind} "
+                f"({picked.pos[0]:.1f},{picked.pos[1]:.1f},{picked.pos[2]:.1f}) "
+                f"speed={picked.speed[0]:.0f}-{picked.speed[1]:.0f} traffic={count}",
+                flush=True,
+            )
+
         while done_s < target_s:
             if stop_file(out).is_file():
                 save_progress(progress_path, done_s, target_s if target_s < float("inf") else done_s)
@@ -1154,7 +1228,7 @@ def main(argv: list[str] | None = None) -> int:
                 print("collect stop requested", flush=True)
                 return 0
             elapsed = done_s
-            speed = speed_at(elapsed, speeds)
+            speed = speed_at(elapsed, tuple(speed_span[0]))
             waypoint = waypoint_at(elapsed, names)
             map_name, seg_index = segment_at(
                 elapsed + schedule_cut,
@@ -1164,6 +1238,8 @@ def main(argv: list[str] | None = None) -> int:
                 None if target_s == float("inf") else target_s,
             )
             segment_id = f"{map_name}#{seg_index}" if map_name else "current#0"
+            if map_name == loaded_map and seg_index == loaded_index:
+                _apply_spawn(False)
             if segment_changed(loaded_map, loaded_index, map_name, seg_index):
                 print(f"collect segment {segment_id}", flush=True)
                 opened = enter_map(bng, map_name, cam_cfg, cams)
@@ -1198,6 +1274,7 @@ def main(argv: list[str] | None = None) -> int:
                     sky_commands = environment_commands(tod, sky)
                 else:
                     sky_commands = environment_commands(args.time_of_day, args.weather)
+                _apply_spawn(True)
                 for command in sky_commands:
                     try:
                         _queue(vehicle, command)
@@ -1322,7 +1399,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"collect driving {segment_id}", flush=True)
                 else:
                     if last_ai is None:
-                        for command in ai_commands(speed, waypoint, traffic=bool(args.traffic)):
+                        for command in ai_commands(speed, waypoint, traffic=False):
                             try:
                                 _queue(vehicle, command)
                             except Exception as exc:
@@ -1405,7 +1482,7 @@ def main(argv: list[str] | None = None) -> int:
                     lane_width_m=None if hit is None else hit.lane_width_m,
                     off_road=bool(hit.off_road) if hit is not None else False,
                     near_junction=junction,
-                    traffic=bool(args.traffic),
+                    traffic=False,
                     n_lanes=lanes_here,
                     window_ok=window_ok,
                     start_kind=start_kind,
@@ -1458,11 +1535,11 @@ def main(argv: list[str] | None = None) -> int:
                         speed,
                         resolved.phase,
                         resolved.direction,
-                        traffic=bool(args.traffic),
+                        traffic=False,
                         path=path,
                     )
                     if excursions_on and not waypoint
-                    else ai_commands(speed, waypoint, traffic=bool(args.traffic))
+                    else ai_commands(speed, waypoint, traffic=False)
                 )
                 for command in commands:
                     try:
@@ -1501,6 +1578,8 @@ def main(argv: list[str] | None = None) -> int:
                 "map": map_name or None,
                 "excursion": move.as_tag(),
             }
+            if spawn_kind:
+                tags["spawn_type"] = spawn_kind
             if mark_recover:
                 tags["recover"] = True
                 mark_recover = False

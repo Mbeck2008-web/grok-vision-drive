@@ -388,6 +388,97 @@ def split_segment_time_holdout(
     return prefix, hold
 
 
+def valid_fraction(rows: list[Mapping[str, Any]]) -> float:
+    """Share of rows whose 5 m and 10 m lane centers are marked valid."""
+    from python.debug.lane_targets import lane_center_is_valid, lane_gt_from_record
+
+    if not rows:
+        return 0.0
+    good = 0
+    for row in rows:
+        tech = row.get("tech") if isinstance(row.get("tech"), Mapping) else row
+        _values, mask = lane_gt_from_record(tech if isinstance(tech, Mapping) else None)
+        if lane_center_is_valid(mask):
+            good += 1
+    return good / float(len(rows))
+
+
+def window_difficulty(rows: list[Mapping[str, Any]]) -> float:
+    """How much this window bends, changes lane, or leaves a straight.
+
+    Straights sit near 0. A weave, a ramp, or a large steer or heading
+    error pushes the score up so ``--balance`` can repeat the window.
+    """
+    from python.debug.lane_targets import lane_gt_from_record
+
+    if not rows:
+        return 0.0
+    total = 0.0
+    prev: float | None = None
+    for row in rows:
+        tech = row.get("tech") if isinstance(row.get("tech"), Mapping) else row
+        if not isinstance(tech, Mapping):
+            tech = {}
+        try:
+            heading = abs(float(tech.get("heading_err_rad") or 0.0))
+        except (TypeError, ValueError):
+            heading = 0.0
+        wheel = row.get("wheel") if isinstance(row.get("wheel"), Mapping) else {}
+        try:
+            steer = abs(float(wheel.get("steer") or 0.0))
+        except (TypeError, ValueError):
+            steer = 0.0
+        values, mask = lane_gt_from_record(tech)
+        center = abs(float(values[0])) if float(mask[0]) > 0.5 else 0.0
+        delta = 0.0 if prev is None else abs(center - prev)
+        prev = center
+        excursion = row.get("excursion") if isinstance(row.get("excursion"), Mapping) else {}
+        phase = str(excursion.get("phase") or "")
+        bonus = 1.0 if phase in ("weave", "lane_change") else 0.0
+        if str(row.get("spawn_type") or "") == "ramp":
+            bonus += 0.75
+        total += heading * 5.0 + steer + delta + bonus
+    return total / float(len(rows))
+
+
+def epoch_windows(
+    plan: list[dict[str, Any]],
+    rng: Any,
+    *,
+    min_valid: float = 0.3,
+    balance: bool = False,
+) -> list[dict[str, Any]]:
+    """Shuffle train windows. Holdout stays in time order, after them.
+
+    Every training window starts from a fresh GRU state. Carrying a
+    straight-road hidden state into the next curve was the loss spike.
+    """
+    train: list[dict[str, Any]] = []
+    hold: list[dict[str, Any]] = []
+    floor = float(min_valid)
+    for item in plan:
+        if item.get("kind") == "holdout":
+            hold.append(item)
+            continue
+        rows = list(item.get("rows") or [])
+        if floor > 0.0 and valid_fraction(rows) < floor:
+            continue
+        fresh = dict(item)
+        fresh["incoming"] = "reset"
+        fresh["rows"] = rows
+        copies = 1
+        if balance:
+            score = window_difficulty(rows)
+            if score >= 0.45:
+                copies = 4
+            elif score >= 0.15:
+                copies = 2
+        for _ in range(copies):
+            train.append(dict(fresh))
+    rng.shuffle(train)
+    return train + hold
+
+
 def pass_plan(
     rows: list[Mapping[str, Any]],
     length: int,

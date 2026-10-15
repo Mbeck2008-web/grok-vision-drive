@@ -4,17 +4,28 @@ Grok Vision Drive is a camera-only driving toy for BeamNG.drive and BeamNG.tech.
 
 ## How to start
 
-Windows. You do not need an administrator account.
+Windows. You do not need an administrator account. The agent procedure, with the Tech 0.39 launch flags, the data disk, collect, validate, and train, is [AGENTS.md](AGENTS.md). Verify each step. Ask before a multi-GB download. Do not skip `--check-maps`.
 
-1. Quit BeamNG if it is open.
-2. Double-click `install.bat`.
-3. Start BeamNG again. In Mod Manager, enable **Grok Vision Drive**.
-4. If Python 3 is missing, install it from python.org and tick **Add to PATH**.
-5. Double-click `play_gvd.bat`. If it asks to install the Python packages, choose Yes. It also tries to open BeamNG.drive. If the game does not open, start it yourself.
-6. In the game, press Esc, open **UI Apps**, and add **GVD**.
-7. Press Alt+G, or use the GVD app, to engage. Steer, or press Alt+G again, to take over. In the GVD VISION window, press `q` to quit.
+BeamNG.tech 0.39 is the beamngpy path. Start one process with `BeamNG.tech.exe -tcom -console -gfx dx11` (port 25252), then `play_gvd_tech.bat`. Engage from the GVD VISION supervisor. `q` quits the supervisor and leaves BeamNG open. Retail `play_gvd.bat` is the one-window product, not eight cameras.
 
-BeamNG.tech is separate. Start BeamNG.tech yourself, then double-click `play_gvd_tech.bat`.
+## Set up with an agent
+
+Follow `AGENTS.md`. Short form:
+
+1. Probe the GPU and patch `config/hardware.yaml`. Pascal stays FP32. Compute 7.0 and newer use mixed precision.
+2. Ask, then install PyTorch 2.14 cu126, plus onnx and onnxruntime. Learning rate stays `1e-3`.
+3. Set `GVD_DATA_DIR` to a large drive. The run stops under 20 GB free. FAT32 files cannot exceed 4 GB. Cache chunks stay under 3.5 GB.
+4. `--check-maps` before any collect. West coast rotates in 12-minute chunks. `--respawn-min 3` and `--traffic 2` cover several city, highway, and ramp spawns.
+5. Validate. Close BeamNG. Then dry-run, sanity, and the full train.
+
+```
+py -3 -m python.train.train_scene --strips E:\GVD_data\scene_lanes --cams main --build-cache C:\GVD_cache
+py -3 -m python.train.train_scene --strips E:\GVD_data\scene_lanes --cams main --heads lane_gt --augment --cache C:\GVD_cache --dry-run
+py -3 -m python.train.train_scene --strips E:\GVD_data\scene_lanes --cams main --heads lane_gt --augment --cache C:\GVD_cache --sanity
+py -3 -m python.train.train_scene --strips E:\GVD_data\scene_lanes --cams main --heads lane_gt --augment --balance --cache C:\GVD_cache --epochs 30 --clip 1.0 --lane-loss huber --min-valid 0.3 --export E:\GVD_data\models\e2e_scene.onnx
+```
+
+`--heads lane_gt` zeros the other losses. `--augment` is photometric and is off for validation. `--workers` defaults to 4 on Windows. `--scale` downscales before the cache and the net. Each epoch shuffles training windows.
 
 ### Steering wheels
 

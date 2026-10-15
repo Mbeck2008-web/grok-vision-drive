@@ -22,6 +22,7 @@ from python.train.scene_net import (
     GRU_HIDDEN,
     RESIDUAL_S,
     RESIDUAL_TOKENS,
+    SECTOR_FEAT,
     TOKEN_DIM,
     default_onnx_path,
 )
@@ -70,6 +71,9 @@ class SceneLaneRuntime:
         self.reason = "not loaded"
         self._input_names: list[str] = []
         self._output_names: list[str] = []
+        self.cams: tuple[str, ...] = ()
+        self.canvas_w = 0
+        self.token_dim = TOKEN_DIM
         self.h = np.zeros((1, 1, GRU_HIDDEN), dtype=np.float32)
         self.tokens = np.zeros((1, RESIDUAL_TOKENS, TOKEN_DIM), dtype=np.float32)
         self.mask = np.full((1, RESIDUAL_TOKENS), float(RESIDUAL_S) + 1.0, dtype=np.float32)
@@ -96,6 +100,21 @@ class SceneLaneRuntime:
             self.session = None
             self.reason = "onnx has no lane_gt output; retrain and export"
             return
+        from python.data.strip_writer import CANVAS_W
+        from python.train.cam_strip import cams_from_metadata
+
+        meta: dict[str, str] = {}
+        try:
+            meta = dict(self.session.get_modelmeta().custom_metadata_map)
+        except Exception:
+            meta = {}
+        self.cams = cams_from_metadata(meta)
+        try:
+            self.canvas_w = int(meta.get("gvd_canvas_w") or CANVAS_W)
+        except (TypeError, ValueError):
+            self.canvas_w = CANVAS_W
+        self.token_dim = len(self.cams) * SECTOR_FEAT
+        self.tokens = np.zeros((1, RESIDUAL_TOKENS, self.token_dim), dtype=np.float32)
         self.ready = True
         self.reason = "ok"
 
@@ -103,7 +122,10 @@ class SceneLaneRuntime:
         """Return ``(lane_x at 8 m, confidence)``. A cold runtime is confidence 0."""
         if not self.ready or self.session is None or strip_bgr is None:
             return None, 0.0
-        image = _strip_nchw(strip_bgr)
+        from python.train.cam_strip import prepare_model_strip
+
+        prepared = prepare_model_strip(np.asarray(strip_bgr), self.cams, self.canvas_w)
+        image = None if prepared is None else _strip_nchw(prepared, width=self.canvas_w)
         if image is None:
             return None, 0.0
         dt = np.asarray([0.0 if dt_s is None else float(dt_s)], dtype=np.float32)
@@ -132,13 +154,14 @@ class SceneLaneRuntime:
         return lane_x_from_vector(vector), confidence_from_vector(vector)
 
 
-def _strip_nchw(strip_bgr: Any) -> np.ndarray | None:
+def _strip_nchw(strip_bgr: Any, width: int | None = None) -> np.ndarray | None:
     from python.data.strip_writer import CANVAS_H, CANVAS_W
 
     arr = np.asarray(strip_bgr)
     if arr.ndim != 3 or arr.shape[-1] != 3:
         return None
-    if arr.shape[0] != CANVAS_H or arr.shape[1] != CANVAS_W:
+    expect_w = CANVAS_W if width is None else int(width)
+    if arr.shape[0] != CANVAS_H or arr.shape[1] != expect_w:
         return None
     if arr.dtype != np.float32:
         arr = arr.astype(np.float32)

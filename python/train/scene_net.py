@@ -21,7 +21,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from python.data.strip_writer import CANVAS_H, CANVAS_W, SECTORS
+from python.data.strip_writer import CANVAS_H, CANVAS_W, SECTORS, STRIP_ORDER
 from python.debug.lane_targets import LANE_GT_DIM, lane_gt_from_record
 
 try:
@@ -106,6 +106,7 @@ OUTPUT_FIELDS = (
 )
 
 LOSS_TERMS = ("points", "class", "lamps", "valid", "lane_gt")
+HEAD_NAMES = ("lanes", "curbs", "objects", "signs", "lane_gt")
 
 _BAD_REASONS = frozenset({"player_steer", "player_brake", "player_throttle"})
 
@@ -221,13 +222,17 @@ def architecture_parameter_count() -> int:
     return total
 
 
-def checkpoint_arch() -> str:
+def checkpoint_arch(cams: tuple[str, ...] | None = None) -> str:
     """Stem identity stored in a pause file.
 
     A file from the conv-relu stem has no tag, or a different count, and
-    must not load into this GroupNorm stem.
+    must not load into this GroupNorm stem. A camera subset adds its names
+    so an eight-camera pause is not loaded into a main-only net.
     """
-    return f"groupnorm-stem:{architecture_parameter_count()}"
+    base = f"groupnorm-stem:{architecture_parameter_count()}"
+    if cams and tuple(cams) != tuple(STRIP_ORDER):
+        return base + ":cams=" + ",".join(cams)
+    return base
 
 
 def count_module_parameters(module: Any) -> int:
@@ -985,6 +990,8 @@ def _lane_gt_loss(
     device: Any,
     dtype: Any,
     zero: Any,
+    *,
+    lane_loss: str = "huber",
 ) -> Any:
     """Smooth-L1 on the lookaheads and heading, BCE on the confidence.
 
@@ -1002,13 +1009,35 @@ def _lane_gt_loss(
     goal_v = torch.nan_to_num(goal[:, :-1], nan=0.0)
     value_mask = mask[:, :-1]
     denom = value_mask.sum().clamp(min=1.0)
-    residual = functional.smooth_l1_loss(values, goal_v, reduction="none")
+    kind = str(lane_loss or "huber").strip().lower()
+    if kind in ("mse", "l2"):
+        residual = functional.mse_loss(values, goal_v, reduction="none")
+    elif kind == "l1":
+        residual = functional.l1_loss(values, goal_v, reduction="none")
+    else:
+        # Huber. Smooth-L1 is that loss: quadratic near zero, linear past 1.
+        residual = functional.smooth_l1_loss(values, goal_v, reduction="none")
     # Masked slots stay out of the mean. A stored NaN is not a real zero.
     residual = torch.where(value_mask > 0.5, residual, torch.zeros_like(residual))
     return bce + residual.sum() / denom
 
 
-def _scene_loss_body(pred: ScenePrediction, target: Mapping[str, Any]) -> dict[str, Any]:
+def head_names(heads: tuple[str, ...] | list[str] | None) -> frozenset[str]:
+    """Which scene heads contribute loss. Empty means every head."""
+    from python.train.cam_strip import parse_heads
+
+    if not heads:
+        return frozenset(HEAD_NAMES)
+    return frozenset(parse_heads(",".join(str(name) for name in heads)))
+
+
+def _scene_loss_body(
+    pred: ScenePrediction,
+    target: Mapping[str, Any],
+    heads: tuple[str, ...] | list[str] | None = None,
+    *,
+    lane_loss: str = "huber",
+) -> dict[str, Any]:
     if torch is None:
         raise ImportError("PyTorch is not installed")
     import torch.nn.functional as functional
@@ -1016,10 +1045,17 @@ def _scene_loss_body(pred: ScenePrediction, target: Mapping[str, Any]) -> dict[s
     device = pred.lanes.device
     dtype = torch.float32
     zero = torch.zeros((), device=device, dtype=dtype)
-    points = zero.clone()
+    wanted = head_names(heads)
+    lane_points = zero.clone()
+    curb_points = zero.clone()
+    obj_points = zero.clone()
+    sign_points = zero.clone()
     classes = zero.clone()
     lamps = zero.clone()
-    valid = zero.clone()
+    lane_valid = zero.clone()
+    curb_valid = zero.clone()
+    obj_valid = zero.clone()
+    sign_valid = zero.clone()
 
     def bce(score: Any, goal: Any) -> Any:
         # Valid scores are probabilities. Cast out of autocast so the loss stays FP32.
@@ -1027,54 +1063,73 @@ def _scene_loss_body(pred: ScenePrediction, target: Mapping[str, Any]) -> dict[s
             score.float().clamp(1e-6, 1.0 - 1e-6), goal.float()
         )
 
-    lane_v = target["lane_valid"].to(device=device, dtype=dtype).reshape(-1)
-    valid = valid + bce(pred.lane_valid, lane_v)
-    lane_on = lane_v > 0.5
-    if bool(lane_on.any()):
-        gt_lanes = target["lanes"].to(device=device, dtype=dtype)
-        points = points + functional.smooth_l1_loss(pred.lanes[lane_on].float(), gt_lanes[lane_on])
+    if "lanes" in wanted:
+        lane_v = target["lane_valid"].to(device=device, dtype=dtype).reshape(-1)
+        lane_valid = lane_valid + bce(pred.lane_valid, lane_v)
+        lane_on = lane_v > 0.5
+        if bool(lane_on.any()):
+            gt_lanes = target["lanes"].to(device=device, dtype=dtype)
+            lane_points = lane_points + functional.smooth_l1_loss(pred.lanes[lane_on].float(), gt_lanes[lane_on])
 
-    curb_v = target["curb_valid"].to(device=device, dtype=dtype).reshape(-1)
-    valid = valid + bce(pred.curb_valid, curb_v)
-    curb_on = curb_v > 0.5
-    if bool(curb_on.any()):
-        gt_curbs = target["curbs"].to(device=device, dtype=dtype)
-        points = points + functional.smooth_l1_loss(pred.curbs[curb_on].float(), gt_curbs[curb_on])
+    if "curbs" in wanted:
+        curb_v = target["curb_valid"].to(device=device, dtype=dtype).reshape(-1)
+        curb_valid = curb_valid + bce(pred.curb_valid, curb_v)
+        curb_on = curb_v > 0.5
+        if bool(curb_on.any()):
+            gt_curbs = target["curbs"].to(device=device, dtype=dtype)
+            curb_points = curb_points + functional.smooth_l1_loss(pred.curbs[curb_on].float(), gt_curbs[curb_on])
 
-    points, classes, valid = _match_continuous(
-        functional,
-        pred.objects,
-        pred.object_class,
-        pred.object_valid,
-        target["objects"].to(device=device, dtype=torch.float32),
-        target["object_class"].to(device=device, dtype=torch.long),
-        target["object_valid"].to(device=device, dtype=dtype).reshape(-1),
-        points,
-        classes,
-        valid,
-        bce,
-        state_logits=None,
-        gt_state=None,
-        lamps=None,
+    if "objects" in wanted:
+        obj_points, classes, obj_valid = _match_continuous(
+            functional,
+            pred.objects,
+            pred.object_class,
+            pred.object_valid,
+            target["objects"].to(device=device, dtype=torch.float32),
+            target["object_class"].to(device=device, dtype=torch.long),
+            target["object_valid"].to(device=device, dtype=dtype).reshape(-1),
+            obj_points,
+            classes,
+            obj_valid,
+            bce,
+            state_logits=None,
+            gt_state=None,
+            lamps=None,
+        )
+    if "signs" in wanted:
+        sign_points, classes, sign_valid, lamps = _match_continuous(
+            functional,
+            pred.signs,
+            pred.sign_class,
+            pred.sign_valid,
+            target["signs"].to(device=device, dtype=torch.float32),
+            target["sign_class"].to(device=device, dtype=torch.long),
+            target["sign_valid"].to(device=device, dtype=dtype).reshape(-1),
+            sign_points,
+            classes,
+            sign_valid,
+            bce,
+            state_logits=pred.sign_state,
+            gt_state=target["sign_state"].to(device=device, dtype=torch.long),
+            lamps=lamps,
+        )
+    lane_gt_term = (
+        _lane_gt_loss(functional, pred, target, device, dtype, zero, lane_loss=lane_loss)
+        if "lane_gt" in wanted
+        else zero.clone()
     )
-    points, classes, valid, lamps = _match_continuous(
-        functional,
-        pred.signs,
-        pred.sign_class,
-        pred.sign_valid,
-        target["signs"].to(device=device, dtype=torch.float32),
-        target["sign_class"].to(device=device, dtype=torch.long),
-        target["sign_valid"].to(device=device, dtype=dtype).reshape(-1),
-        points,
-        classes,
-        valid,
-        bce,
-        state_logits=pred.sign_state,
-        gt_state=target["sign_state"].to(device=device, dtype=torch.long),
-        lamps=lamps,
-    )
-    lane_gt_term = _lane_gt_loss(functional, pred, target, device, dtype, zero)
-    total = points + classes + lamps + valid + lane_gt_term
+    points = lane_points + curb_points + obj_points + sign_points
+    valid = lane_valid + curb_valid + obj_valid + sign_valid
+    # A lane-only run must not backprop the other heads. Those zeros are
+    # fresh tensors, not a slice of the polyline or the match loss.
+    if wanted == frozenset({"lane_gt"}):
+        points = zero.detach().clone()
+        classes = zero.detach().clone()
+        lamps = zero.detach().clone()
+        valid = zero.detach().clone()
+        total = lane_gt_term
+    else:
+        total = points + classes + lamps + valid + lane_gt_term
     out = {
         "points": points,
         "class": classes,
@@ -1132,12 +1187,20 @@ def _match_continuous(
     return points, classes, valid, lamps
 
 
-def scene_loss(pred: ScenePrediction, target: Mapping[str, Any]) -> dict[str, Any]:
+def scene_loss(
+    pred: ScenePrediction,
+    target: Mapping[str, Any],
+    heads: tuple[str, ...] | list[str] | None = None,
+    *,
+    lane_loss: str = "huber",
+) -> dict[str, Any]:
     """Smooth-L1 on points, cross-entropy on class and lamps, match on objects and signs.
 
-    Wheel and pedals are not terms.
+    ``heads`` limits which of those terms are non-zero. ``lane_loss`` is
+    ``huber`` (smooth-L1, the default), ``l1``, or ``mse``. The forward pass
+    and the export still carry every head. Wheel and pedals are not terms.
     """
-    return _scene_loss_body(pred, target)
+    return _scene_loss_body(pred, target, heads, lane_loss=lane_loss)
 
 
 if torch is not None:
@@ -1170,14 +1233,20 @@ if torch is not None:
     class SceneNet(nn.Module):
         """Strip in, planner tensors out. Hidden size 512. No steer head."""
 
-        def __init__(self) -> None:
+        def __init__(self, cams: tuple[str, ...] | None = None, scale: float = 1.0) -> None:
             super().__init__()
-            if TOKEN_DIM != len(SECTORS) * SECTOR_FEAT:
+            from python.train.cam_strip import parse_cams, scaled_layout
+
+            self.cams = parse_cams(",".join(cams) if cams else "")
+            self.scale = 1.0 if float(scale) >= 0.999 else float(scale)
+            self.sectors, self.canvas_h, self.canvas_w = scaled_layout(self.cams, self.scale)
+            self.token_dim = len(self.sectors) * SECTOR_FEAT
+            if self.cams == tuple(STRIP_ORDER) and self.token_dim != TOKEN_DIM:
                 raise RuntimeError("8 sector features must concatenate to the 512-d token")
             self.stem = SharedStem()
             # The dropped tensor is the GRU input. ``state.h`` is not dropped.
             self.gru_in_drop = nn.Dropout(p=GRU_IN_DROPOUT)
-            self.gru = nn.GRU(TOKEN_DIM + 1, GRU_HIDDEN, num_layers=1, batch_first=True)
+            self.gru = nn.GRU(self.token_dim + 1, GRU_HIDDEN, num_layers=1, batch_first=True)
             hidden = GRU_HIDDEN
             for name, out in scene_head_sizes():
                 setattr(self, name, nn.Linear(hidden, out))
@@ -1189,7 +1258,7 @@ if torch is not None:
             empty_age = float(RESIDUAL_S) + 1.0
             return SceneState(
                 h=torch.zeros(1, width, GRU_HIDDEN, device=device, dtype=dtype),
-                tokens=torch.zeros(width, RESIDUAL_TOKENS, TOKEN_DIM, device=device, dtype=dtype),
+                tokens=torch.zeros(width, RESIDUAL_TOKENS, self.token_dim, device=device, dtype=dtype),
                 mask=torch.full((width, RESIDUAL_TOKENS), empty_age, device=device, dtype=dtype),
             )
 
@@ -1199,13 +1268,13 @@ if torch is not None:
             Planner tensors have no batch dimension. A training batch uses
             ``forward_batch`` and keeps the leading dimension.
             """
-            image = _strip_nchw(strip)
+            image = _strip_nchw(strip, width=self.canvas_w, height=self.canvas_h)
             pred, new_state = self._forward_batched(image, dt, state)
             return _prediction_at(pred, 0), new_state
 
         def forward_batch(self, strip: Any, dt: Any, state: SceneState) -> tuple[ScenePrediction, SceneState]:
             """Several strips in one step. Outputs keep the batch dimension."""
-            image = _strip_nchw(strip, allow_batch=True)
+            image = _strip_nchw(strip, allow_batch=True, width=self.canvas_w, height=self.canvas_h)
             return self._forward_batched(image, dt, state)
 
         def _forward_batched(self, image: Any, dt: Any, state: SceneState) -> tuple[ScenePrediction, SceneState]:
@@ -1230,10 +1299,11 @@ if torch is not None:
 
         def _token(self, image: Any) -> Any:
             parts = []
-            for sec in SECTORS:
+            for sec in self.sectors:
                 crop = image[:, :, :, sec.x0 : sec.x1]
                 if sec.wide:
-                    crop = _letterbox_wide(crop)
+                    narrow = 256 if self.scale >= 0.999 else max(1, int(round(256 * self.scale)))
+                    crop = _letterbox_wide(crop, self.canvas_h, narrow)
                 parts.append(self.stem(crop))
             return torch.cat(parts, dim=-1).unsqueeze(1)
 
@@ -1262,17 +1332,25 @@ if torch is not None:
     def _prediction_at(pred: ScenePrediction, index: int) -> ScenePrediction:
         return ScenePrediction(**{name: getattr(pred, name)[index] for name in OUTPUT_FIELDS})
 
-    def _letterbox_wide(crop: Any) -> Any:
+    def _letterbox_wide(crop: Any, out_h: int = CANVAS_H, out_w: int = 256) -> Any:
         import torch.nn.functional as functional
 
         _b, _c, src_h, src_w = crop.shape
-        nw, nh, x0, y0 = letterbox_rect(int(src_w), int(src_h), 256, CANVAS_H)
+        nw, nh, x0, y0 = letterbox_rect(int(src_w), int(src_h), int(out_w), int(out_h))
         resized = functional.interpolate(crop, size=(nh, nw), mode="bilinear", align_corners=False)
-        out = crop.new_zeros(crop.shape[0], crop.shape[1], CANVAS_H, 256)
+        out = crop.new_zeros(crop.shape[0], crop.shape[1], int(out_h), int(out_w))
         out[:, :, y0 : y0 + nh, x0 : x0 + nw] = resized
         return out
 
-    def _strip_nchw(strip: Any, *, allow_batch: bool = False) -> Any:
+    def _strip_nchw(
+        strip: Any,
+        *,
+        allow_batch: bool = False,
+        width: int = CANVAS_W,
+        height: int = CANVAS_H,
+    ) -> Any:
+        canvas_w = int(width)
+        canvas_h = int(height)
         if not torch.is_tensor(strip):
             strip = torch.from_numpy(np.ascontiguousarray(strip))
         if strip.dim() == 3 and strip.shape[0] == 3:
@@ -1281,11 +1359,11 @@ if torch is not None:
             strip = strip.permute(2, 0, 1).unsqueeze(0)
         elif strip.dim() == 4 and strip.shape[-1] == 3:
             strip = strip.permute(0, 3, 1, 2)
-        width = int(strip.shape[0]) if strip.dim() == 4 else 0
-        spatial_ok = strip.dim() == 4 and int(strip.shape[1]) == 3 and tuple(strip.shape[-2:]) == (CANVAS_H, CANVAS_W)
-        batch_ok = width == 1 if not allow_batch else width >= 1
+        spatial_ok = strip.dim() == 4 and int(strip.shape[1]) == 3 and tuple(strip.shape[-2:]) == (canvas_h, canvas_w)
+        batch_n = int(strip.shape[0]) if strip.dim() == 4 else 0
+        batch_ok = batch_n == 1 if not allow_batch else batch_n >= 1
         if not spatial_ok or not batch_ok:
-            want = f"Bx3x{CANVAS_H}x{CANVAS_W}" if allow_batch else f"1x3x{CANVAS_H}x{CANVAS_W}"
+            want = f"Bx3x{canvas_h}x{canvas_w}" if allow_batch else f"1x3x{canvas_h}x{canvas_w}"
             raise ValueError(f"strip must be {want}, got {tuple(strip.shape)}")
         if strip.dtype == torch.uint8:
             strip = strip.float() / 255.0
@@ -1392,7 +1470,13 @@ def cpu_export_inputs(net: Any, zeros: Any) -> tuple[Any, tuple[Any, ...]]:
     """
     model = net.to("cpu")
     model = model.eval()
-    strip = zeros(1, 3, CANVAS_H, CANVAS_W, device="cpu")
+    strip = zeros(
+        1,
+        3,
+        int(getattr(net, "canvas_h", CANVAS_H)),
+        int(getattr(net, "canvas_w", CANVAS_W)),
+        device="cpu",
+    )
     dt = zeros(1, device="cpu")
     state = model.initial_state(device="cpu")
     return model, (strip, dt, state.h, state.tokens, state.mask)
@@ -1404,6 +1488,8 @@ def export_scene_onnx(
     *,
     zeros: Any = None,
     trace: Any = None,
+    cams: tuple[str, ...] | None = None,
+    heads: tuple[str, ...] | None = None,
 ) -> Path:
     """Write the FP32 graph. Mixed precision does not change this file.
 
@@ -1416,7 +1502,7 @@ def export_scene_onnx(
         if torch is None:
             raise ImportError("PyTorch is not installed")
     if net is None:
-        net = SceneNet()
+        net = SceneNet(cams=cams) if cams else SceneNet()
     if zeros is None:
         zeros = torch.zeros
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1424,4 +1510,13 @@ def export_scene_onnx(
     if trace is None:
         trace = _trace_scene_onnx
     trace(model, args, str(path))
+    from python.train.cam_strip import metadata_dict, stamp_onnx_metadata
+
+    used = tuple(getattr(net, "cams", ()) or ())
+    width = int(getattr(net, "canvas_w", CANVAS_W))
+    if used:
+        stamp_onnx_metadata(
+            str(path),
+            metadata_dict(used, heads, height=CANVAS_H, width=width),
+        )
     return path

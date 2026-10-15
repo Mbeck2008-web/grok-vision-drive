@@ -134,6 +134,67 @@ def build_parser() -> argparse.ArgumentParser:
         help="Start without the Start button. The window still opens when a display is attached.",
     )
     parser.add_argument("--metrics-every", type=int, default=10, help="Write metrics.jsonl every N steps.")
+    parser.add_argument(
+        "--cams",
+        default="",
+        help="Comma list of cameras to train and export. Empty uses all eight.",
+    )
+    parser.add_argument(
+        "--heads",
+        default="",
+        help="Comma list of heads that receive loss. Empty trains every head. The export still has every output.",
+    )
+    parser.add_argument(
+        "--augment",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Photometric jitter on training steps. Off for validation. --no-augment disables it.",
+    )
+    parser.add_argument(
+        "--cache",
+        default="",
+        help="Directory of pre-decoded camera chunks. The loader uses them when the index is present.",
+    )
+    parser.add_argument(
+        "--build-cache",
+        default="",
+        help="Decode --cams into this directory (chunks under 3.5 GB) and exit.",
+    )
+    parser.add_argument(
+        "--clip",
+        type=float,
+        default=1.0,
+        help="Max gradient norm. 1.0 clips the spikes from a curve after a straight.",
+    )
+    parser.add_argument(
+        "--lane-loss",
+        default="huber",
+        choices=("huber", "l1", "mse"),
+        help="lane_gt regression. huber is smooth-L1 and is the default.",
+    )
+    parser.add_argument(
+        "--balance",
+        action="store_true",
+        help="Repeat windows with curves, weaves, ramps, or large steer.",
+    )
+    parser.add_argument(
+        "--min-valid",
+        type=float,
+        default=0.3,
+        help="Drop a training window when fewer than this fraction of rows have a lane center.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="DataLoader workers. Default is 4 on Windows and 0 elsewhere.",
+    )
+    parser.add_argument(
+        "--scale",
+        type=float,
+        default=1.0,
+        help="Downscale the canvas before the cache and the net. 1 keeps the recorded size.",
+    )
     return parser
 
 
@@ -309,7 +370,9 @@ def _probe_cuda(net: Any, batch: int, window_strips: int, amp: bool, device: Any
         state = net.initial_state(device=device, batch=batch)
         total = None
         for _ in range(max(1, int(window_strips))):
-            strip = torch.zeros(int(batch), 3, CANVAS_H, CANVAS_W, device=device)
+            canvas_h = int(getattr(net, "canvas_h", CANVAS_H))
+            canvas_w = int(getattr(net, "canvas_w", CANVAS_W))
+            strip = torch.zeros(int(batch), 3, canvas_h, canvas_w, device=device)
             dt = torch.zeros(int(batch), device=device)
             with _autocast(amp):
                 pred, state = net.forward_batch(strip, dt, state)
@@ -403,13 +466,38 @@ def overlap_gradient_cut() -> dict[str, bool] | None:
     }
 
 
-def _frame_row(root: Path, row: Mapping[str, Any]) -> tuple[Any, Mapping[str, Any]] | None:
+def _frame_row(
+    root: Path,
+    row: Mapping[str, Any],
+    *,
+    cams: tuple[str, ...] | None = None,
+    cache: Any = None,
+    augment: bool = False,
+    rng: np.random.RandomState | None = None,
+    scale: float = 1.0,
+) -> tuple[Any, Mapping[str, Any]] | None:
     """Stitch one tick. A missing frame is a gap, not a crash."""
-    try:
-        frame = np.ascontiguousarray(_load_bgr(root, int(row["i"])))
-    except FileNotFoundError as exc:
-        print(f"[GVD] scene load skip i={row.get('i')}: {exc}", flush=True)
-        return None
+    from python.data.strip_writer import STRIP_ORDER
+    from python.train.cam_strip import extract_cams, photometric_jitter
+
+    index = int(row["i"])
+    frame = None
+    if cache is not None and cache.has(index):
+        frame = cache.canvas(index)
+    if frame is None:
+        try:
+            frame = np.ascontiguousarray(_load_bgr(root, index))
+        except FileNotFoundError as exc:
+            print(f"[GVD] scene load skip i={row.get('i')}: {exc}", flush=True)
+            return None
+        if cams and tuple(cams) != tuple(STRIP_ORDER):
+            frame = extract_cams(frame, tuple(cams))
+    if scale < 0.999:
+        from python.train.cam_strip import scale_canvas
+
+        frame = scale_canvas(frame, scale, cams)
+    if augment:
+        frame = photometric_jitter(frame, rng)
     # The stitch is not a yaw roll, so this returns the frame and the row.
     frame, row = offcenter_view(frame, row)
     return frame, row
@@ -462,6 +550,14 @@ def _optimizer_step(
     stride: int,
     clip: float,
     trace: dict[str, Any] | None = None,
+    cams: tuple[str, ...] | None = None,
+    cache: Any = None,
+    augment: bool = False,
+    rng: np.random.RandomState | None = None,
+    heads: tuple[str, ...] | None = None,
+    lane_loss: str = "huber",
+    frames: list[Any] | None = None,
+    scale: float = 1.0,
 ) -> tuple[float | None, int, SceneState, SceneState]:
     """Backprop through this chunk only.
 
@@ -490,17 +586,24 @@ def _optimizer_step(
                 f"[GVD] scene load {tick + 1}/{len(rows)} i={row.get('i')}",
                 flush=True,
             )
-        loaded = _frame_row(root, row)
-        if loaded is None:
-            continue
-        frame, row = loaded
+        if frames is not None:
+            if tick >= len(frames) or frames[tick] is None:
+                continue
+            frame = frames[tick]
+        else:
+            loaded = _frame_row(
+                root, row, cams=cams, cache=cache, augment=augment, rng=rng, scale=scale,
+            )
+            if loaded is None:
+                continue
+            frame, row = loaded
         image = torch.from_numpy(frame).to(device)
         dt = torch.tensor([step_dt(row.get("dt_s"))], dtype=torch.float32, device=device)
         with _autocast(amp):
             pred, state = net.forward_batch(image, dt, state)
         if loss_mask(row):
             one = _prediction_at(pred, 0)
-            step = scene_loss(one, _as_target(labels_for_row(row), device))
+            step = scene_loss(one, _as_target(labels_for_row(row), device), heads, lane_loss=lane_loss)
             if trace is not None and trace.get("print_shapes") and not trace.get("shapes_printed"):
                 _print_step_shapes(image, one, step, state)
                 trace["shapes_printed"] = True
@@ -578,6 +681,10 @@ def _eval_sequence(
     amp: bool,
     view: TrainWindow | None,
     pairs: list[tuple[float, float]] | None = None,
+    cams: tuple[str, ...] | None = None,
+    cache: Any = None,
+    heads: tuple[str, ...] | None = None,
+    scale: float = 1.0,
 ) -> tuple[float | None, int]:
     """Holdout forward. No optimizer step and no gradient through these frames."""
     import torch
@@ -588,7 +695,7 @@ def _eval_sequence(
     try:
         with torch.no_grad():
             for row in rows:
-                loaded = _frame_row(root, row)
+                loaded = _frame_row(root, row, cams=cams, cache=cache, augment=False, scale=scale)
                 if loaded is None:
                     continue
                 frame, row = loaded
@@ -619,7 +726,7 @@ def _eval_sequence(
                         )
                 if not loss_mask(row):
                     continue
-                value = scene_loss(one, _as_target(labels_for_row(row), device))["total"]
+                value = scene_loss(one, _as_target(labels_for_row(row), device), heads)["total"]
                 total = value if total is None else total + value
                 n_loss += 1
                 if view is not None:
@@ -679,14 +786,14 @@ def _from_numpy_tree(obj: Any) -> Any:
     return obj
 
 
-def pause_matches_stem(fields: Mapping[str, Any]) -> bool:
+def pause_matches_stem(fields: Mapping[str, Any], cams: tuple[str, ...] | None = None) -> bool:
     """True when this pause file was written for the current GroupNorm stem."""
-    return fields.get("arch") == checkpoint_arch()
+    return fields.get("arch") == checkpoint_arch(cams)
 
 
-def stamp_pause(payload: dict[str, Any]) -> dict[str, Any]:
+def stamp_pause(payload: dict[str, Any], cams: tuple[str, ...] | None = None) -> dict[str, Any]:
     """Mark a pause file with the stem it may load into."""
-    payload["arch"] = checkpoint_arch()
+    payload["arch"] = checkpoint_arch(cams)
     return payload
 
 
@@ -696,9 +803,10 @@ def _apply_checkpoint(net: Any, opt: Any, scaler: Any, fields: Mapping[str, Any]
     An older conv-relu file has no GroupNorm tag. It is refused before any
     weight is copied, so those tensors are not applied to the new stem.
     """
-    if not pause_matches_stem(fields):
+    used_cams = tuple(getattr(net, "cams", ()) or ()) or None
+    if not pause_matches_stem(fields, used_cams):
         raise ValueError(
-            f"pause checkpoint arch {fields.get('arch')!r} does not match the GroupNorm stem {checkpoint_arch()}"
+            f"pause checkpoint arch {fields.get('arch')!r} does not match the GroupNorm stem {checkpoint_arch(used_cams)}"
         )
     import torch
 
@@ -755,6 +863,7 @@ def _save_pause(
     recommended: bool,
 ) -> dict[str, Any]:
     """Save weights before the loop stops. Strip files are not rewritten."""
+    used_cams = tuple(getattr(net, "cams", ()) or ()) or None
     payload = stamp_pause(
         {
             "step": int(step),
@@ -770,10 +879,79 @@ def _save_pause(
             "weights": {key: value.detach().cpu().numpy() for key, value in net.state_dict().items()},
             "optimizer": _to_numpy_tree(opt.state_dict()),
             "scaler": None if scaler is None else _to_numpy_tree(scaler.state_dict()),
-        }
+        },
+        used_cams,
     )
     save_checkpoint(root, payload)
     return payload
+
+
+class _EpochWindows:
+    """One training window per index. Workers decode; the step stays on the parent."""
+
+    def __init__(
+        self,
+        items: list[dict[str, Any]],
+        root: Path,
+        cams: tuple[str, ...] | None,
+        cache_dir: str,
+        scale: float,
+    ) -> None:
+        self.items = list(items)
+        self.root = str(root)
+        self.cams = cams
+        self.cache_dir = cache_dir
+        self.scale = float(scale)
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        from python.train.frame_cache import FrameCache
+
+        item = self.items[index]
+        cache = FrameCache(self.cache_dir) if self.cache_dir else None
+        frames: list[Any] = []
+        for row in item.get("rows") or []:
+            loaded = _frame_row(
+                Path(self.root),
+                row,
+                cams=self.cams,
+                cache=cache,
+                augment=False,
+                scale=self.scale,
+            )
+            frames.append(None if loaded is None else loaded[0])
+        return {
+            "frames": frames,
+            "rows": list(item.get("rows") or []),
+            "stride": int(item.get("stride") or 1),
+            "kind": item.get("kind") or "train",
+            "incoming": "reset",
+        }
+
+
+def _prefetch_loader(items: list[dict[str, Any]], root: Path, cams, cache, scale: float, workers: int, cuda: bool):
+    """A DataLoader over train windows, or None when this process stays in-line."""
+    if int(workers) <= 0 or not items:
+        return None
+    import torch
+    from torch.utils.data import DataLoader
+
+    from python.train.scene_loader import loader_settings
+
+    cache_dir = str(getattr(cache, "root", "") or "")
+    dataset = _EpochWindows([item for item in items if item.get("kind") != "holdout"], root, cams, cache_dir, scale)
+    if len(dataset) == 0:
+        return None
+    settings = loader_settings(int(workers), cuda=bool(cuda) and torch.cuda.is_available())
+    return DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=False,
+        collate_fn=lambda batch: batch[0],
+        **settings,
+    )
 
 
 def train_directory(
@@ -793,12 +971,30 @@ def train_directory(
     status_root: Path | None = None,
     autostart: bool = False,
     open_panel: bool = True,
+    cams: tuple[str, ...] | None = None,
+    heads: tuple[str, ...] | None = None,
+    cache: Any = None,
+    augment: bool = True,
+    clip: float = GRAD_CLIP,
+    lane_loss: str = "huber",
+    balance: bool = False,
+    min_valid: float = 0.3,
+    workers: int = 0,
+    scale: float = 1.0,
 ) -> dict[str, Any]:
     import torch
 
     from python.train.scene_net import SceneNet
 
     root = Path(root)
+    train_cams = tuple(cams) if cams else None
+    train_heads = tuple(heads) if heads else None
+    use_augment = bool(augment) and not bool(sanity) and not bool(dry_run)
+    augment_rng = np.random.RandomState(0)
+    window_rng = np.random.RandomState(1)
+    grad_clip = float(clip)
+    lane_kind = str(lane_loss or "huber")
+    input_scale = float(scale) if float(scale) > 0.0 else 1.0
     from python.data.raw_frames import load_scene_rows, training_frame_bytes
     from python.train.scene_loader import default_num_workers, select_training_rows
 
@@ -830,7 +1026,7 @@ def train_directory(
 
     def _empty(precision: str = "fp32") -> dict[str, Any]:
         if export_path is not None:
-            export_scene_onnx(export_path)
+            export_scene_onnx(export_path, cams=train_cams, heads=train_heads)
         return {
             "strips": len(rows),
             "windows": 0,
@@ -870,7 +1066,7 @@ def train_directory(
     def _arm(device_name: str, learning_rate: float | None = None) -> None:
         device = torch.device(device_name)
         if "net" not in holder:
-            holder["net"] = SceneNet().to(device)
+            holder["net"] = SceneNet(cams=train_cams, scale=input_scale).to(device)
         elif holder["device"].type != device_name:
             holder["net"].to(device)
             _release_cuda()
@@ -1111,7 +1307,14 @@ def train_directory(
         best_value: float | None = None
         best_blob: dict[str, Any] | None = None
         while not paused_exit:
-            plan_steps = pass_plan(rows, chunk_len, stride)
+            from python.train.continual import epoch_windows
+
+            plan_steps = epoch_windows(
+                pass_plan(rows, chunk_len, stride),
+                window_rng,
+                min_valid=float(min_valid),
+                balance=bool(balance),
+            )
             windows = sum(1 for item in plan_steps if item["kind"] == "train")
             carry: SceneState | None = None
             end_state: SceneState | None = None
@@ -1120,10 +1323,27 @@ def train_directory(
             hold_n = 0
             val_pairs: list[tuple[float, float]] = []
             index = 0
+            prefetch = _prefetch_loader(
+                plan_steps,
+                root,
+                train_cams,
+                cache,
+                input_scale,
+                int(workers),
+                device.type == "cuda",
+            )
+            prefetch_iter = iter(prefetch) if prefetch is not None else None
             while index < len(plan_steps) and not paused_exit:
                 if view.consume_pause() and _pause_now():
                     break
                 item = plan_steps[index]
+                prefetched_frames = None
+                if prefetch_iter is not None and item.get("kind") != "holdout":
+                    try:
+                        packed = next(prefetch_iter)
+                        prefetched_frames = packed.get("frames")
+                    except StopIteration:
+                        prefetched_frames = None
                 state_in = _state_for(str(item["incoming"]), carry, end_state, chunk_in)
                 if item["kind"] == "holdout":
                     held_loss, held_count = _eval_sequence(
@@ -1135,6 +1355,10 @@ def train_directory(
                         amp=bool(holder["amp"]),
                         view=view,
                         pairs=val_pairs,
+                        cams=train_cams,
+                        cache=cache,
+                        heads=train_heads,
+                        scale=input_scale,
                     )
                     if held_loss is not None and held_count:
                         hold_sum += float(held_loss) * int(held_count)
@@ -1160,8 +1384,16 @@ def train_directory(
                         amp=bool(holder["amp"]),
                         view=view,
                         stride=int(item["stride"]),
-                        clip=GRAD_CLIP,
+                        clip=grad_clip,
                         trace=step_trace,
+                        cams=train_cams,
+                        cache=cache,
+                        augment=use_augment,
+                        rng=augment_rng,
+                        heads=train_heads,
+                        lane_loss=lane_kind,
+                        scale=input_scale,
+                        frames=prefetched_frames,
                     )
                 except RuntimeError as exc:
                     if not _is_oom(exc):
@@ -1189,6 +1421,7 @@ def train_directory(
                     batch = 1
                     recommended = False
                     index = 0
+                    prefetch_iter = None
                     carry = None
                     end_state = None
                     chunk_in = None
@@ -1303,27 +1536,47 @@ def train_directory(
             sanity_ok = False
             print("[GVD] scene train: no strips for this mode", flush=True)
             return
-        state = net.initial_state(device=device, batch=1)
+        from python.train.continual import epoch_windows
+
+        planned = [
+            item
+            for item in epoch_windows(
+                pass_plan(list(subset), chunk_len, stride),
+                window_rng,
+                min_valid=float(min_valid),
+                balance=bool(balance),
+            )
+            if item.get("kind") != "holdout"
+        ]
+        if not planned:
+            planned = [{"rows": list(subset), "stride": max(1, len(subset)), "incoming": "reset"}]
         lane_loss = None
-        for step_i in range(max(1, int(limit))):
+        for step_i, item in enumerate(planned[: max(1, int(limit))]):
+            state = net.initial_state(device=device, batch=1)
             last_batch = {
                 "step": step_i,
                 "epoch": 0,
-                "rows": [row.get("i") for row in subset],
+                "rows": [row.get("i") for row in item["rows"]],
             }
             loss, n_sup, _carry, state = _optimizer_step(
                 net,
                 holder["opt"],
                 holder["scaler"],
                 root,
-                list(subset),
+                list(item["rows"]),
                 state,
                 device=device,
                 amp=bool(holder["amp"]),
                 view=view,
-                stride=max(1, len(subset)),
-                clip=GRAD_CLIP,
+                stride=max(1, int(item.get("stride") or 1)),
+                clip=grad_clip,
                 trace=step_trace,
+                cams=train_cams,
+                cache=cache,
+                augment=False,
+                heads=train_heads,
+                lane_loss=lane_kind,
+                scale=input_scale,
             )
             done = step_i + 1
             windows = done
@@ -1425,7 +1678,7 @@ def train_directory(
                     holder["lr"] = float(winner)
                     view.restore_losses(series.get(winner, []))
         if not paused_exit and not dry_run and not sanity and export_path is not None:
-            export_scene_onnx(export_path, net)
+            export_scene_onnx(export_path, net, heads=train_heads)
         if not paused_exit and not dry_run and not sanity:
             clear_checkpoint(root)
     except Exception:
@@ -1467,6 +1720,30 @@ def main(argv: list[str] | None = None) -> None:
         print(f"[GVD] scene train: {exc}")
         sys.exit(2)
     args = build_parser().parse_args(argv)
+    from python.train.cam_strip import parse_cams, parse_heads
+    from python.train.frame_cache import FrameCache, build_frame_cache
+    from python.train.scene_loader import default_num_workers
+
+    try:
+        cam_names = parse_cams(args.cams)
+        head_names = parse_heads(args.heads)
+    except ValueError as exc:
+        print(f"[GVD] scene train: {exc}")
+        sys.exit(2)
+    if args.build_cache:
+        manifest = build_frame_cache(
+            args.strips or scene_lanes_dir(),
+            args.build_cache,
+            cam_names,
+            scale=float(args.scale),
+        )
+        print(
+            f"[GVD] cache {args.build_cache} cams={','.join(cam_names)} "
+            f"chunks={len(manifest.get('chunks') or [])} frames={manifest.get('frames')}",
+            flush=True,
+        )
+        return
+    frame_cache = FrameCache(args.cache) if args.cache else None
     export_path = None if args.export is None else Path(args.export)
     if export_path is not None and not args.strips:
         try:
@@ -1477,7 +1754,7 @@ def main(argv: list[str] | None = None) -> None:
         if not torch_ready():
             print("[GVD] scene export needs PyTorch")
             sys.exit(2)
-        path = export_scene_onnx(export_path)
+        path = export_scene_onnx(export_path, cams=cam_names, heads=head_names)
         print(f"[GVD] exported {path}")
         return
     if not args.strips:
@@ -1508,6 +1785,16 @@ def main(argv: list[str] | None = None) -> None:
             metrics_every=int(args.metrics_every),
             autostart=start_now,
             open_panel=open_panel,
+            cams=cam_names,
+            heads=head_names,
+            cache=frame_cache,
+            augment=bool(args.augment),
+            clip=float(args.clip),
+            lane_loss=str(args.lane_loss),
+            balance=bool(args.balance),
+            min_valid=float(args.min_valid),
+            workers=default_num_workers() if args.workers is None else int(args.workers),
+            scale=float(args.scale),
         )
     except TrainFitError as exc:
         print(f"[GVD] scene train: {exc}")

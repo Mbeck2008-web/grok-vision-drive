@@ -15,16 +15,27 @@ from python.data.raw_frames import load_training_bgr, row_has_decodable_frame
 
 
 def default_num_workers() -> int:
-    """In-process loading.
+    """Prefetch workers for a window DataLoader.
 
-    ``sys.platform == "win32"`` is called out because spawn is the only
-    start method there. A non-zero count deadlocks behind CUDA and the
-    status window. The GRU also consumes frames in file order, so more
-    workers would not be a batch map.
+    Windows defaults to 4 so PNG decode is not on the GPU thread.
+    Other hosts stay in-process: a spawned worker that re-imports this
+    package while the parent holds CUDA and the status window can stall.
+    ``--workers`` overrides the default. ``persistent_workers`` stays on
+    for the whole epoch when the count is above zero.
     """
     if sys.platform == "win32":
-        return 0
+        return 4
     return 0
+
+
+def loader_settings(workers: int, *, cuda: bool) -> dict[str, int | bool]:
+    """DataLoader kwargs. ``pin_memory`` only helps a CUDA copy."""
+    count = max(0, int(workers))
+    return {
+        "num_workers": count,
+        "persistent_workers": count > 0,
+        "pin_memory": bool(cuda) and count > 0,
+    }
 
 
 def load_canvas(root: Path | str, index: int):

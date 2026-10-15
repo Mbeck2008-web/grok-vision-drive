@@ -15,6 +15,7 @@ ack is fresh. No DLL / hooks / process inject. Live BeamNG still UNPROVEN on Lin
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -1253,6 +1254,60 @@ def make_actuator(vehicle: Any | None = None, prefer_beamngpy: bool = True) -> A
     return CmdJsonActuator()
 
 
+# steering_input ±1 is ±30 deg at the road wheel (ego.steer_deg = input * 30).
+STEER_LOCK_DEG = 30.0
+STEER_LOCK_RAD = math.radians(STEER_LOCK_DEG)
+# Pure-pursuit wheelbase. The old law divided lateral meters by this same 2.5
+# and sent the quotient as steering_input, so 2.5 m of offset was full lock.
+WHEELBASE_M = 2.5
+# Frame-to-command delay on the PR 82 Tech run (median frame_cmd_ms 115,
+# p90 136). A derivative on that late, jumpy lookahead was subtracting up to
+# STEER_D_CAP from a growing lane_x, so the wheel stayed modest while the
+# sample ran from about 0.7 m to 8 m. D is now a small damper, and only on a
+# rate a car can actually yaw. The lead term is the same delay, the other way:
+# steer for where a physical rate will be when the command lands.
+STEER_LATENCY_S = 0.12
+STEER_KD = 0.01
+STEER_D_CAP = 0.05
+# m/s of the lookahead x. Faster than this is a bad sample (the PR 82 run
+# jumped tens of metres in one 140 ms tick), not a yaw to damp or predict.
+STEER_D_RATE_MAX = 4.0
+# Steer per metre of lookahead x near x=0, y=8: d(atan(2 L x / y^2))/dx / 30 deg.
+STEER_PER_M = 0.15
+# A pursuit point closer than this saturates. The PR 82 log hit ±1 from a
+# sample at y≈0.4 m. Farther than this heading is not a lane offset: one
+# camera's ego x is ±3 m (lanes._ego_x), and 8–12 m at y≈8 is a kink.
+STEER_MIN_LOOKAHEAD_M = 4.0
+STEER_MAX_HEADING_DEG = 35.0
+# Missing or rejected lane: creep the last command toward 0. Slower than the
+# rate limit, so a dropout does not center the wheel. 0.12/s keeps a 0.4
+# command alive for a few seconds.
+LANE_HOLD_DECAY_PER_S = 0.12
+# Normalized steer per second. A live tick was ~0.3 s, so this blocks a
+# one-tick reversal from +1 to -1 (that reversal happened 102 times in the
+# first 741 commands of the PR 75 run).
+STEER_RATE_PER_S = 0.75
+
+
+@dataclass
+class LaneSteerState:
+    """Memory for the lane follower. Reset when the path command is not applied."""
+
+    steer: float = 0.0
+    lateral_m: float = 0.0
+    have_lateral: bool = False
+    armed: bool = False
+    # pursuit, lane_hold, lane_near, lane_far, lane_none, idle.
+    reason: str = "idle"
+
+    def reset(self) -> None:
+        self.steer = 0.0
+        self.lateral_m = 0.0
+        self.have_lateral = False
+        self.armed = False
+        self.reason = "idle"
+
+
 def steer_sample_point(path_ego: list[dict[str, float]]) -> dict[str, float] | None:
     """Point the wheel reads.
 
@@ -1272,9 +1327,152 @@ def steer_sample_point(path_ego: list[dict[str, float]]) -> dict[str, float] | N
 
 
 def path_steer_from_ego(path_ego: list[dict[str, float]] | None) -> float:
+    """Normalized steer from the lookahead point.
+
+    Pure pursuit: front-wheel angle ``atan(2 * L * x / ld^2)``, divided by the
+    ±30 deg lock. The previous law sent ``x / 2.5`` straight into
+    ``steering_input`` and clipped at ±1, so a 2.5 m offset (or an 8 m point
+    on an 18 deg heading) was full lock. The PR 75 run saturated 43% of
+    commands that way and reversed sign 102 times in the first 741.
+    """
     if not path_ego or len(path_ego) < 2:
         return 0.0
     mid = steer_sample_point(path_ego)
     if mid is None:
         return 0.0
-    return max(-1.0, min(1.0, float(mid.get("x", 0.0)) / 2.5))
+    x = float(mid.get("x", 0.0))
+    y = max(float(mid.get("y", 0.0)), 1.0)
+    # atan2(opposite, adjacent) keeps the sign of x. ld^2 is always > 0.
+    # +x is right, so +steer is a right turn. The 47b430e GT run confirms the
+    # actuator: mean steer about +0.35 while unwrapped heading atan2(dir_y,
+    # dir_x) fell from -2.42 to -3.53 rad (clockwise, driver's right).
+    delta = math.atan2(2.0 * WHEELBASE_M * x, x * x + y * y)
+    return max(-1.0, min(1.0, delta / STEER_LOCK_RAD))
+
+
+# +steer decreases heading. Restoring steer therefore has the same sign as
+# the heading error (a counter-clockwise error needs a clockwise correction).
+HEADING_STEER_GAIN = 0.6
+
+
+def steer_for_heading_error(heading_err_rad: float) -> float:
+    """Normalized steer that reduces heading error.
+
+    ``heading_err_rad`` is current heading minus the reference, unwrapped,
+    with heading = atan2(dir_y, dir_x). Positive error is counter-clockwise
+    of the reference. Positive steer yaws clockwise, so the restoring
+    command has the same sign as the error.
+    """
+    try:
+        err = float(heading_err_rad)
+    except (TypeError, ValueError):
+        return 0.0
+    if err != err or err in (float("inf"), float("-inf")):
+        return 0.0
+    return max(-1.0, min(1.0, HEADING_STEER_GAIN * err))
+
+
+def lane_sample_hold_reason(lateral_m: float, lookahead_y_m: float) -> str | None:
+    """Why this lookahead must not move the wheel, or None when it may.
+
+    ``lane_near``: the visible piece ends before ``STEER_MIN_LOOKAHEAD_M``.
+    Pure pursuit on that point saturates (y is floored at 1 m inside
+    ``path_steer_from_ego``). ``lane_far``: the heading to the sample is
+    past ``STEER_MAX_HEADING_DEG``. That x is not a bumper offset. One
+    camera spans ±3 m, and the PR 82 run's 8–12 m samples were this case.
+    """
+    try:
+        x = float(lateral_m)
+        y = float(lookahead_y_m)
+    except (TypeError, ValueError):
+        return "lane_hold"
+    if x != x or y != y or x in (float("inf"), float("-inf")) or y in (float("inf"), float("-inf")):
+        return "lane_hold"
+    if y < STEER_MIN_LOOKAHEAD_M:
+        return "lane_near"
+    if abs(math.atan2(x, max(y, 0.2))) > math.radians(STEER_MAX_HEADING_DEG):
+        return "lane_far"
+    return None
+
+
+def follow_lane_steer(
+    geometric: float,
+    lateral_m: float | None,
+    state: LaneSteerState,
+    dt_s: float | None,
+    *,
+    miss_reason: str = "lane_hold",
+) -> float:
+    """Pursuit command, a small latency lead, then a steer-rate limit.
+
+    ``geometric`` is ``path_steer_from_ego``. Debug gain, invert, and the
+    steer cap run after this in the live loop, so they still have the last
+    word. With no clock the geometric value is stored and returned, which
+    is what the stateless callers want.
+
+    A missing lateral does not command zero. The last output is kept and
+    crept toward 0 (``miss_reason`` is logged on the state). The rate limit
+    still applies, including across that hold, so a dropout cannot snap the
+    wheel to center and the next good sample cannot reverse it in one tick.
+    """
+    try:
+        raw = float(geometric)
+    except (TypeError, ValueError):
+        raw = 0.0
+    if raw != raw or raw in (float("inf"), float("-inf")):
+        raw = 0.0
+    lat: float | None
+    if lateral_m is None:
+        lat = None
+    else:
+        try:
+            lat = float(lateral_m)
+        except (TypeError, ValueError):
+            lat = None
+        if lat is None or lat != lat or lat in (float("inf"), float("-inf")):
+            lat = None
+    dt: float | None = None
+    if dt_s is not None:
+        try:
+            dt = float(dt_s)
+        except (TypeError, ValueError):
+            dt = None
+        if dt is None or dt != dt or dt <= 1e-4:
+            dt = None
+    if lat is None:
+        if state.armed:
+            target = float(state.steer)
+            if dt is not None and LANE_HOLD_DECAY_PER_S > 0.0:
+                decay = LANE_HOLD_DECAY_PER_S * dt
+                if target > 0.0:
+                    target = max(0.0, target - decay)
+                elif target < 0.0:
+                    target = min(0.0, target + decay)
+            raw = target
+            state.reason = miss_reason or "lane_hold"
+        else:
+            raw = 0.0
+            state.reason = "lane_none"
+    else:
+        correction = 0.0
+        if state.have_lateral and dt is not None:
+            rate = (lat - state.lateral_m) / dt
+            # A late derivative used to cancel the pursuit term whenever
+            # lane_x grew. Only a physical rate is led by the frame delay
+            # and lightly damped. A jump is left to the rate limit.
+            if abs(rate) <= STEER_D_RATE_MAX:
+                lead = STEER_PER_M * rate * STEER_LATENCY_S
+                damp = -STEER_KD * rate
+                correction = max(-STEER_D_CAP, min(STEER_D_CAP, lead + damp))
+        raw = max(-1.0, min(1.0, raw + correction))
+        state.reason = "pursuit"
+    if dt is not None:
+        step = STEER_RATE_PER_S * dt
+        origin = state.steer if state.armed else 0.0
+        raw = max(origin - step, min(origin + step, raw))
+    state.steer = raw
+    state.armed = True
+    if lat is not None:
+        state.lateral_m = lat
+        state.have_lateral = True
+    return raw

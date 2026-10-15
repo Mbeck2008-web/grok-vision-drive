@@ -33,6 +33,13 @@ ON_DEMAND_UPDATE_S = -1.0  # yaml: sample on the hitch, not every tick
 # Offscreen sensor period when yaml says on-demand. Not an ad-hoc viewport render.
 # SendAdHocRequestCamera steps the game view's exposure for one frame (blue shadows).
 COMPANION_OFFSCREEN_UPDATE_S = 1.0
+# Windshield and pillar cameras feed the lane fit. Yaml -1 is still not an
+# ad-hoc viewport render. These sensors update offscreen at 10 Hz. Rear and
+# repeaters stay on the 1 s companion period. The efc25e3 run's unique-frame
+# rate was 2.18 Hz because every companion was attached at 1 s, so stream_raw
+# kept handing back the same buffer.
+LANE_CAM_UPDATE_S = 0.1
+LANE_SENSOR_CAM_IDS = frozenset(("wide", "narrow", "pillarL", "pillarR"))
 SIDE_UPDATE_S = ON_DEMAND_UPDATE_S
 REAR_UPDATE_S = ON_DEMAND_UPDATE_S
 MAIN_GRAB_DIV = 1
@@ -41,8 +48,9 @@ MAIN_GRAB_DIV = 1
 # painted into the bundle. Soft Esc and Engage use that same grab. A zero
 # colour buffer is unrendered, not a picture, and it does not keep a previous
 # frame. Yaml -1 is still the offscreen attach period, not a viewport render.
-# The sensor is attached at COMPANION_OFFSCREEN_UPDATE_S and read with
-# stream_raw. SendAdHocRequestCamera is not used: that render steps the game
+# Lane cameras attach at LANE_CAM_UPDATE_S. Rear and repeaters attach at
+# COMPANION_OFFSCREEN_UPDATE_S. All of them are read with stream_raw.
+# SendAdHocRequestCamera is not used: that render steps the game
 # view's exposure for one frame. One in-flight read holds the socket. Main
 # is read before any companion, so a companion that runs past
 # CAM_READ_BUDGET_S cannot drop main. Every camera after that miss on this
@@ -92,8 +100,8 @@ DEFAULT_UPDATE_PRIORITY = {
     "main": 0.0,
     "narrow": 0.5,
     "wide": 0.5,
-    "pillarL": 1.0,
-    "pillarR": 1.0,
+    "pillarL": 0.5,
+    "pillarR": 0.5,
     "repeatL": 1.0,
     "repeatR": 1.0,
     "rear": 1.0,
@@ -658,15 +666,18 @@ def iter_clip_attach_attempts(
     return [(near_m, f, rate) for f in far_hitch_ladder(cam_id, far_m)]
 
 
-def sensor_requested_update_s(update_s: float) -> float:
+def sensor_requested_update_s(update_s: float, cid: str | None = None) -> float:
     """Camera ``requested_update_time`` for a yaml rate.
 
-    Yaml ``-1`` is the hitch. The sensor still renders offscreen at
-    ``COMPANION_OFFSCREEN_UPDATE_S``. A negative rate is not sent: that would
-    need SendAdHocRequestCamera, which flashes the game view.
+    Yaml ``-1`` is the hitch. A negative rate is not sent: that would need
+    SendAdHocRequestCamera, which flashes the game view. Lane cameras
+    (wide, narrow, both pillars) render offscreen at ``LANE_CAM_UPDATE_S``
+    (10 Hz). Rear and repeaters stay at ``COMPANION_OFFSCREEN_UPDATE_S``.
     """
     rate = float(update_s)
     if rate < 0:
+        if cid in LANE_SENSOR_CAM_IDS:
+            return LANE_CAM_UPDATE_S
         return COMPANION_OFFSCREEN_UPDATE_S
     return rate
 
@@ -685,6 +696,7 @@ def beamng_camera_sensor_kwargs(
     streaming: bool,
     rgb_only: bool,
     update_priority: float = 0.0,
+    cid: str | None = None,
 ) -> dict[str, Any]:
     """Kwargs for beamngpy.sensors.Camera (name, bng, vehicle stay positional).
 
@@ -695,7 +707,7 @@ def beamng_camera_sensor_kwargs(
     # A negative rate would need SendAdHocRequestCamera to get a picture.
     # That request renders through the game view and flashes exposure for one
     # frame. The sensor still updates offscreen; GVD only reads it on the hitch.
-    rate = sensor_requested_update_s(update_s)
+    rate = sensor_requested_update_s(update_s, cid)
     return {
         "requested_update_time": rate,
         "update_priority": float(min(1.0, max(0.0, update_priority))),
@@ -1503,7 +1515,7 @@ class BeamNGPyBackend:
                 used_prio = want_prio
                 attempts = iter_clip_attach_attempts(spec, cid=cid, defaults=clip_defaults)
                 step_s = " ".join(
-                    f"far_m={try_far:g}@requested_update_time={sensor_requested_update_s(try_rate):g}"
+                    f"far_m={try_far:g}@requested_update_time={sensor_requested_update_s(try_rate, cid):g}"
                     for _n, try_far, try_rate in attempts
                 )
                 print(f"[GVD] beamngpy Camera hitch steps {cid}: {step_s} (not resolution)")
@@ -1521,6 +1533,7 @@ class BeamNGPyBackend:
                         streaming=True,
                         rgb_only=rgb_only,
                         update_priority=want_prio,
+                        cid=cid,
                     )
                     try:
                         cam = Camera(f"gvd_{cid}", bng, vehicle, **kwargs)
@@ -1596,7 +1609,8 @@ class BeamNGPyBackend:
                     f"grab_div main={self._grab_div['main']} wide={self._grab_div['wide']} "
                     f"narrow={self._grab_div['narrow']} side={self._side_grab_div} "
                     f"rear={self._rear_grab_div}; "
-                    f"stream_raw offscreen requested_update_time 1; "
+                    f"stream_raw offscreen lane_update_s={LANE_CAM_UPDATE_S:g} "
+                    f"companion_update_s={COMPANION_OFFSCREEN_UPDATE_S:g}; "
                     f"GVD→BeamNG vehicle-space convert; depth/semantic OFF)."
                 )
             else:

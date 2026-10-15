@@ -13,6 +13,8 @@ from python.sensors.cameras import (  # noqa: E402
     CAM_IDS,
     CAMERA_HZ_TARGET,
     COMPANION_OFFSCREEN_UPDATE_S,
+    LANE_CAM_UPDATE_S,
+    LANE_SENSOR_CAM_IDS,
     DEFAULT_FAR_M,
     DEFAULT_NEAR_M,
     DEFAULT_UPDATE_PRIORITY,
@@ -673,7 +675,7 @@ def check_beamngpy_open_passes_near_far() -> None:
             be.open()
         log = buf.getvalue()
         assert "hitch steps narrow:" in log
-        assert "far_m=800@requested_update_time=1" in log
+        assert "far_m=800@requested_update_time=0.1" in log
         assert "update_s=-1" not in log
         assert "hitch steps rear:" in log
         assert "far_m=100@requested_update_time=1" in log
@@ -682,7 +684,7 @@ def check_beamngpy_open_passes_near_far() -> None:
         assert "grab_div main=1" in log
         assert "wide=16" in log
         assert "narrow=16" in log
-        assert "stream_raw offscreen requested_update_time 1" in log
+        assert "stream_raw offscreen lane_update_s=0.1 companion_update_s=1" in log
         assert "rear=16" in log
         assert "depth/semantic OFF" in log
         names = [n for n, _ in captured]
@@ -691,9 +693,9 @@ def check_beamngpy_open_passes_near_far() -> None:
         assert by["gvd_narrow"]["near_far_planes"] == (0.05, 800.0)
         assert by["gvd_main"]["near_far_planes"] == (0.05, 300.0)
         assert by["gvd_wide"]["near_far_planes"] == (0.05, 300.0)
-        assert by["gvd_narrow"]["requested_update_time"] == COMPANION_OFFSCREEN_UPDATE_S
+        assert by["gvd_narrow"]["requested_update_time"] == LANE_CAM_UPDATE_S
         assert by["gvd_main"]["requested_update_time"] == 0.067
-        assert by["gvd_wide"]["requested_update_time"] == COMPANION_OFFSCREEN_UPDATE_S
+        assert by["gvd_wide"]["requested_update_time"] == LANE_CAM_UPDATE_S
         assert by["gvd_main"]["update_priority"] == 0.0
         assert by["gvd_narrow"]["update_priority"] > by["gvd_main"]["update_priority"]
         assert read_camera_update_priority(be._sensors["main"]) == 0.0
@@ -702,7 +704,8 @@ def check_beamngpy_open_passes_near_far() -> None:
         assert CAMERA_HZ_TARGET == 10.0
         for cid in SIDE_CAM_IDS | REAR_CAM_IDS:
             assert by[f"gvd_{cid}"]["near_far_planes"] == (0.05, 100.0), cid
-            assert by[f"gvd_{cid}"]["requested_update_time"] == COMPANION_OFFSCREEN_UPDATE_S, cid
+            want_rate = LANE_CAM_UPDATE_S if cid in LANE_SENSOR_CAM_IDS else COMPANION_OFFSCREEN_UPDATE_S
+            assert by[f"gvd_{cid}"]["requested_update_time"] == want_rate, cid
             assert by[f"gvd_{cid}"]["is_streaming"] is True, cid
             assert by[f"gvd_{cid}"]["is_render_depth"] is False
             assert by[f"gvd_{cid}"]["resolution"][0] >= 1

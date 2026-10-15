@@ -702,6 +702,19 @@ def real_launch_argv(bng: Any, home: str | None, port: int, user: str | None) ->
     return " ".join(beamngpy_launch_argv(home, port, user))
 
 
+def widen_socket_timeout(bng: Any, seconds: float) -> None:
+    """Raise the research-socket timeout. A west_coast scenario load is about 30 s."""
+    try:
+        bng.socket_timeout = float(seconds)
+    except Exception:
+        pass
+    for sock in _hello_sockets(bng):
+        try:
+            sock.settimeout(float(seconds))
+        except Exception:
+            pass
+
+
 def resolve_socket_timeout(cfg: dict[str, Any] | None = None) -> float:
     """Attach/Hello cap in seconds. Env, then yaml, then ``TECH_SOCKET_TIMEOUT_S``."""
     raw: Any = os.environ.get("GVD_TECH_SOCKET_TIMEOUT", "").strip()

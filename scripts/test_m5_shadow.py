@@ -2,6 +2,7 @@
 """Offline M5 shadow / E2E checks (Spec verify)."""
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -356,7 +357,12 @@ def main() -> None:
         loop_hz=5.5, camera_hz=5.5, engage_age_s=4.2,
     )
     assert first.should_disengage is False and second.should_disengage is False
-    assert abs(first.applied.steer - 0.17) < 1e-6, first.applied.steer
+    # 0.425 m at y=8 m used to be 0.425/2.5 = 0.17 (full lock at 2.5 m).
+    # It is now the pure-pursuit angle over the ±30 deg lock.
+    x, y = 0.425, 8.0
+    expect = math.atan2(2.0 * 2.5 * x, x * x + y * y) / math.radians(30.0)
+    assert abs(expect - 0.17) > 0.05, expect
+    assert abs(first.applied.steer - expect) < 1e-9, first.applied.steer
     assert abs(second.applied.steer - first.applied.steer) < 1e-9
     assert abs(first.applied.throttle - second.applied.throttle) < 1e-9
     assert first.applied.brake < 0.5, first.applied

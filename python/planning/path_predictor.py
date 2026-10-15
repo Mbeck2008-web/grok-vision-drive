@@ -32,6 +32,33 @@ from python.planning.speed import plan_speed
 LANE_W_DEFAULT = 3.5
 LANE_W_MIN = 2.4
 LANE_W_MAX = 5.2
+# A pair outside this band is two different roads, not the ego lane.
+# The efc25e3 run held det (−4.11, +6.64), a 10.7 m gap, and called it a pair.
+LANE_PAIR_W_MIN = 2.7
+LANE_PAIR_W_MAX = 4.5
+# A paint point farther than this is not this road's lane. Two widths at the
+# bumper, opening slightly with distance. -16 m at y=8 is past it. A lane
+# sitting one width beside the car is not.
+LANE_OUTLIER_WIDTHS = 2.0
+LANE_OUTLIER_PER_M = 0.35
+# Ego-lane center memory. The PR 82 run's lookahead flipped between about
+# -1.1 m and +1.5 m in one tick (one boundary, side chosen by the sign of x,
+# center jumping by a full lane). A step inside CENTER_INNOV_M is blended.
+# A larger step has to repeat on the same side of the stored center, then
+# creeps across. The creep is under 2 m, which is the jump the replay refuses.
+# CENTER_GATE_M is the old same-value window. gt_run6 never filled it: each
+# new sample was more than 1.25 m from the previous one, so +2.04 stayed put.
+CENTER_GATE_M = 1.25
+CENTER_HYST_TICKS = 3
+CENTER_SLEW_M = 0.35
+# A single frame may not move the center by more than this. The gt_run5
+# lane_x series jumped about ±1 m inside the old 1.25 m instant-take gate,
+# and the wheel followed the noise.
+CENTER_INNOV_M = 0.40
+CENTER_BLEND = 0.5
+# One visible line within this band of the last side decision keeps that
+# side. Crossing it is the other boundary.
+ONE_SIDE_DEADBAND_M = 0.75
 LENGTH_M = 36.0
 STEP_M = 1.0
 EGO_WIDTH = 1.9
@@ -78,6 +105,9 @@ class PathPlan:
     pred_brake: float = 0.0
     # Background turn signal from the route: off | left | right. Not a wheel reading.
     blinker: str = "off"
+    # pair | one_left | one_right, plus /hold or /slew when the center memory
+    # did not take the raw midpoint. none when there is no route.
+    lane_source: str = "none"
 
     def planner_dict(self) -> dict[str, Any]:
         return {
@@ -92,7 +122,157 @@ class PathPlan:
             "path_length_m": self.path_length_m,
             "pred_brake": self.pred_brake,
             "blinker": self.blinker,
+            "lane_source": self.lane_source,
         }
+
+
+def reckon_ego_x(x_m: float, y_m: float, *, yaw_rate: float, dt: float) -> float:
+    """Move a point fixed in the world into the ego frame after ``dt``.
+
+    ``yaw_rate`` is counterclockwise, the same sign as the ground-truth
+    heading. A right turn is negative, so a point ahead of the car moves
+    toward −x. Speed does not change x while the lane is parallel to the car.
+    """
+    theta = float(yaw_rate) * float(dt)
+    return float(x_m) * math.cos(theta) + float(y_m) * math.sin(theta)
+
+
+def reckon_path(
+    path: list[dict[str, float]] | None,
+    *,
+    speed_mps: float,
+    yaw_rate: float,
+    dt: float,
+) -> list[dict[str, float]]:
+    """Rigid ego update of a remembered route. Points that fall behind drop out."""
+    theta = float(yaw_rate) * float(dt)
+    c = math.cos(theta)
+    s = math.sin(theta)
+    vdt = max(0.0, float(speed_mps)) * float(dt)
+    out: list[dict[str, float]] = []
+    for pt in path or []:
+        x = float(pt["x"])
+        y = float(pt["y"])
+        x2 = x * c + y * s
+        y2 = -x * s + y * c - vdt
+        if y2 > 0.4:
+            out.append({"x": float(x2), "y": float(y2), "z": 0.0})
+    return out
+
+
+def lane_x_limit(y_m: float) -> float:
+    """Largest |x| a lane point at this forward distance may have."""
+    try:
+        y = float(y_m)
+    except (TypeError, ValueError):
+        y = 0.0
+    if y != y:
+        y = 0.0
+    return LANE_OUTLIER_WIDTHS * LANE_W_DEFAULT + LANE_OUTLIER_PER_M * max(0.0, y)
+
+
+def lane_point_plausible(x_m: float, y_m: float, *, widths: float | None = None) -> bool:
+    """False when this point is too far sideways to be a lane boundary."""
+    try:
+        x = float(x_m)
+        y = float(y_m)
+    except (TypeError, ValueError):
+        return False
+    if x != x or x in (float("inf"), float("-inf")):
+        return False
+    if widths is None:
+        limit = lane_x_limit(y)
+    else:
+        # Flat. The per-metre term would keep a +8 m miss at the 8 m row
+        # and still drop the beside line at x=-6.4 m that the ground test paints.
+        limit = float(widths) * LANE_W_DEFAULT
+    return abs(x) <= limit
+
+
+@dataclass
+class LaneTrack:
+    """Ego-lane center remembered across ticks. Owned by the perception loop."""
+
+    center_x: float | None = None
+    # One-sided: "left" means the visible line is the left boundary.
+    side: str | None = None
+    pending_x: float | None = None
+    pending_n: int = 0
+    # +1 / -1: which side of the stored center the repeated samples sit on.
+    # The value itself may jitter by more than CENTER_GATE_M. gt_run6 held
+    # +2.04 for 1.7 s because each new sample was more than 1.25 m from the
+    # previous pending value, so the count never reached three.
+    pending_sign: int = 0
+    source: str = "none"
+    # Set at engage. A one-sided or held sample must not become the center
+    # until a fresh pair has been taken. gt_run8 engaged on one_right/hold
+    # at +5.41 m, which was fit before engage.
+    awaiting_pair: bool = False
+
+    def reset(self) -> None:
+        self.center_x = None
+        self.side = None
+        self.pending_x = None
+        self.pending_n = 0
+        self.pending_sign = 0
+        self.source = "none"
+        self.awaiting_pair = False
+
+
+def follow_lane_center(
+    track: LaneTrack,
+    measured_x: float,
+    *,
+    count: bool = True,
+) -> tuple[float, str]:
+    """Center x to drive, and take | hold | slew.
+
+    ``measured_x`` is the midpoint the lines imply this tick. The first
+    sample is stored. A later sample inside ``CENTER_INNOV_M`` is blended
+    in. A larger step does not land until the same side of the stored
+    center has repeated ``CENTER_HYST_TICKS`` times, and then moves at
+    most ``CENTER_SLEW_M`` per call. The samples do not have to match
+    each other within ``CENTER_GATE_M``: a lane that keeps sitting left
+    of a wrong center still counts, even when the raw values jitter.
+    One sample on the other side starts the count over. ``count`` false
+    holds the memory still (a prior-lane fallback must not vote).
+    """
+    measured = float(measured_x)
+    if track.center_x is None:
+        track.center_x = measured
+        track.pending_x = None
+        track.pending_n = 0
+        track.pending_sign = 0
+        return measured, "take"
+    # A prior-lane sample is already in a stale ego frame. Do not absorb it,
+    # even when it still sits inside the gate.
+    if not count:
+        return float(track.center_x), "hold"
+    innov = measured - float(track.center_x)
+    if abs(innov) <= CENTER_INNOV_M:
+        track.center_x = float(track.center_x) + CENTER_BLEND * innov
+        track.pending_x = None
+        track.pending_n = 0
+        track.pending_sign = 0
+        return float(track.center_x), "take"
+    sign = 1 if innov > 0.0 else -1
+    if track.pending_sign != sign:
+        track.pending_sign = sign
+        track.pending_x = measured
+        track.pending_n = 1
+    else:
+        track.pending_n += 1
+        track.pending_x = measured
+    if track.pending_n < CENTER_HYST_TICKS:
+        return float(track.center_x), "hold"
+    step = max(-CENTER_SLEW_M, min(CENTER_SLEW_M, float(track.pending_x) - track.center_x))
+    track.center_x = float(track.center_x) + step
+    if abs(float(track.pending_x) - track.center_x) <= CENTER_INNOV_M:
+        track.center_x = float(track.pending_x)
+        track.pending_x = None
+        track.pending_n = 0
+        track.pending_sign = 0
+    return float(track.center_x), "slew"
 
 
 def follow_path(plan: PathPlan, *, ego_speed_mps: float, seq: int = 0) -> Any:
@@ -118,31 +298,54 @@ def predict_path(
     prior_lanes: list | None = None,
     length_m: float = LENGTH_M,
     step_m: float = STEP_M,
+    lane_track: LaneTrack | None = None,
+    remember: bool = True,
 ) -> PathPlan:
-    """Predict a drivable route from the scene. Wheel angle is not an argument."""
+    """Predict a drivable route from the scene. Wheel angle is not an argument.
+
+    ``lane_track`` keeps the ego-lane center across calls. ``remember``
+    false still shifts the route onto that center, but the sample does not
+    count toward a lane switch.
+    """
     del curvature  # image-slope hint is not the route; the polyline is
     step = max(0.4, float(step_m))
     horizon = max(8.0, float(length_m))
-    live = _polylines(lanes_bev)
+    live = _lines_for_lane_x(lanes_bev, horizon, step)
     used_prior = False
     polys = live
     if not polys:
-        polys = _polylines(prior_lanes)
+        polys = _lines_for_lane_x(prior_lanes, horizon, step)
         used_prior = bool(polys)
 
-    circle = None if _is_forward_lane(polys) else (_fit_roundabout(polys) if polys else None)
+    # Rear and repeater lines sit behind the bumper. A building edge beside
+    # the car is not a smooth forward lane. Either one, mixed in, makes the
+    # whole set look like a roundabout (src=roundabout at t=8.9 s).
+    # Drop far points first so one bad vertex does not throw away the line.
+    polys = _drop_lane_outliers(polys)
+    ahead = [p for p in polys if max(pt[1] for pt in p) > 1.0] or list(polys)
+    smooth = [p for p in ahead if _smooth_forward(p)]
+    route_polys = smooth if smooth and _is_forward_lane(smooth) else ahead
+    circle = None if _is_forward_lane(route_polys) else (_fit_roundabout(route_polys) if route_polys else None)
     ring_curv = 0.0
+    lane_source = "none"
     if circle is not None:
         raw, width, ring_curv = _roundabout_route(circle, polys, step)
         prediction = "roundabout"
+        lane_source = "roundabout"
         extended = True
     else:
-        built = _lane_route(polys, horizon, step) if polys else None
+        built = (
+            _lane_route(route_polys, horizon, step, lane_track=lane_track, remember=remember)
+            if polys
+            else None
+        )
         if built is None:
             return _expose_pedals(_empty(), ego_speed_mps)
-        raw, width, extended = built
+        raw, width, extended, lane_source = built
         if used_prior:
             prediction = "context"
+            if lane_source != "none":
+                lane_source = f"prior/{lane_source}"
         elif extended:
             prediction = "extended"
         else:
@@ -185,7 +388,10 @@ def predict_path(
         stop_reason=stop_reason,
         prediction=prediction,
         occupied=occupied,
+        lane_source=lane_source,
     )
+    if lane_track is not None:
+        lane_track.source = lane_source
     return _expose_pedals(plan, ego_speed_mps)
 
 
@@ -311,12 +517,19 @@ def _f(obj: dict[str, Any], *keys: str, default: float = 0.0) -> float:
 
 
 def _polylines(lanes: list | None) -> list[list[tuple[float, float]]]:
-    out: list[list[tuple[float, float]]] = []
+    return [pts for pts, _src in _tagged_polylines(lanes)]
+
+
+def _tagged_polylines(lanes: list | None) -> list[tuple[list[tuple[float, float]], str]]:
+    out: list[tuple[list[tuple[float, float]], str]] = []
     for poly in lanes or []:
         pts: list[tuple[float, float]] = []
+        src = ""
         for p in poly or []:
             if isinstance(p, dict):
                 x, y = p.get("x"), p.get("y")
+                if not src and p.get("src"):
+                    src = str(p.get("src"))
             else:
                 try:
                     x, y = p[0], p[1]
@@ -326,8 +539,36 @@ def _polylines(lanes: list | None) -> list[list[tuple[float, float]]]:
                 continue
             pts.append((float(x), float(y)))
         if len(pts) >= 2:
-            out.append(pts)
+            out.append((pts, src))
     return out
+
+
+def _lines_for_lane_x(
+    lanes: list | None,
+    horizon: float,
+    step: float,
+) -> list[list[tuple[float, float]]]:
+    """Main-camera lines when they form a pair. Otherwise every line.
+
+    A main-only route that comes out one-sided is discarded and the wide,
+    narrow, and side lines are used. The probe track is thrown away, so
+    this check does not seed or hold the caller's center. Untagged points
+    are the synthetic lanes the tests build.
+    """
+    main: list[list[tuple[float, float]]] = []
+    rest: list[list[tuple[float, float]]] = []
+    for pts, src in _tagged_polylines(lanes):
+        if src == "main":
+            main.append(pts)
+        else:
+            rest.append(pts)
+    everything = main + rest
+    if len(main) < 2:
+        return everything
+    built = _lane_route(main, horizon, step, lane_track=LaneTrack(), remember=True)
+    if built is not None and str(built[3]).startswith("pair"):
+        return main
+    return everything
 
 
 def _mean_x(pts: list[tuple[float, float]]) -> float:
@@ -493,20 +734,74 @@ def _near_separation(
     return sum(acc) / len(acc)
 
 
+def _one_side(near_x: float, track: LaneTrack | None) -> str:
+    """Which boundary a single line is. The last side sticks across x=0.
+
+    A line just left of the car and the same line just right of the car are
+    not two lanes. The center is half a width off this line either way, so
+    flipping the side jumps the center by a full lane.
+    """
+    prev = None if track is None else track.side
+    if prev == "left" and near_x < ONE_SIDE_DEADBAND_M:
+        return "left"
+    if prev == "right" and near_x > -ONE_SIDE_DEADBAND_M:
+        return "right"
+    return "left" if near_x <= 0.0 else "right"
+
+
+def _one_close_line(
+    polys: list[list[tuple[float, float]]],
+    track: LaneTrack | None,
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]], float, str] | None:
+    """One boundary within 2.5 m, when no pair has a real lane width."""
+    nearest: list[tuple[float, float]] | None = None
+    nearest_abs: float | None = None
+    for poly in polys:
+        ordered = _sort_y(poly)
+        if len(ordered) < 2:
+            continue
+        dist = abs(_near_x(ordered))
+        if nearest is None or nearest_abs is None or dist < nearest_abs:
+            nearest = ordered
+            nearest_abs = dist
+    # One lane width. The curb-and-wall case sits near 3 m; a 10 m pair's
+    # nearer line is past this and is not a boundary.
+    if nearest is None or nearest_abs is None or nearest_abs > LANE_W_DEFAULT:
+        return None
+    side = _one_side(_near_x(nearest), track)
+    if side == "left":
+        left = nearest
+        right = [(x + LANE_W_DEFAULT, y) for x, y in nearest]
+    else:
+        right = nearest
+        left = [(x - LANE_W_DEFAULT, y) for x, y in nearest]
+    if track is not None:
+        track.side = side
+    return left, right, LANE_W_DEFAULT, f"one_{side}"
+
+
 def _pair(
     polys: list[list[tuple[float, float]]],
-) -> tuple[list[tuple[float, float]], list[tuple[float, float]], float] | None:
+    track: LaneTrack | None = None,
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]], float, str] | None:
     if not polys:
         return None
     if len(polys) == 1:
         only = _sort_y(polys[0])
         if len(only) < 2:
             return None
-        if _near_x(only) <= 0.0:
-            left, right = only, [(x + LANE_W_DEFAULT, y) for x, y in only]
+        side = _one_side(_near_x(only), track)
+        # Half a lane toward the center. The other boundary is the full
+        # width away, so the midpoint is not the paint line itself.
+        if side == "left":
+            left = only
+            right = [(x + LANE_W_DEFAULT, y) for x, y in only]
         else:
-            right, left = only, [(x - LANE_W_DEFAULT, y) for x, y in only]
-        return left, right, LANE_W_DEFAULT
+            right = only
+            left = [(x - LANE_W_DEFAULT, y) for x, y in only]
+        if track is not None:
+            track.side = side
+        return left, right, LANE_W_DEFAULT, f"one_{side}"
 
     best: tuple[tuple, list, list, float] | None = None
     for i, a in enumerate(polys):
@@ -519,7 +814,10 @@ def _pair(
             # horizon, so the average gap collapses even when the near field is
             # a full lane.
             width = _near_separation(left, right)
-            if width < 1.2:
+            # 10 m between the two lines is not one lane. Skip it so a closer
+            # pair can still win, and so the average of two far lines is not
+            # stored as the center.
+            if width < LANE_PAIR_W_MIN or width > LANE_PAIR_W_MAX:
                 continue
             # A pair that still reaches ahead of the bumper beats a pair that
             # lives entirely behind, even when the rear pair is closer to 3.5 m.
@@ -536,22 +834,95 @@ def _pair(
             if best is None or score < best[0]:
                 best = (score, left, right, width)
     if best is None:
-        return None
-    width = best[3]
-    if width < LANE_W_MIN or width > LANE_W_MAX:
+        return _one_close_line(polys, track)
+    left, right, width = best[1], best[2], best[3]
+    # x next to the bumper, not the far end of a rear line.
+    near_l = min(left, key=lambda p: abs(p[1]))[0]
+    near_r = min(right, key=lambda p: abs(p[1]))[0]
+    # Two edges on the same side of the car are a curb and a wall, not the
+    # ego lane. The 47b430e/ede174a run kept a positive center while the car
+    # crossed the road to the right. Use the nearer line, offset by half a
+    # lane toward the car, when that line is close enough to be our boundary.
+    same_side = near_l > 0.35 or near_r < -0.35
+    bad_width = width < LANE_W_MIN or width > LANE_W_MAX
+    nearer = left if abs(near_l) <= abs(near_r) else right
+    if (same_side or bad_width) and min(abs(near_l), abs(near_r)) < 2.5:
+        only = _sort_y(nearer)
+        side = _one_side(_near_x(only), track)
+        if side == "left":
+            left = only
+            right = [(x + LANE_W_DEFAULT, y) for x, y in only]
+        else:
+            right = only
+            left = [(x - LANE_W_DEFAULT, y) for x, y in only]
+        if track is not None:
+            track.side = side
+        return left, right, LANE_W_DEFAULT, f"one_{side}"
+    if bad_width:
         width = LANE_W_DEFAULT
-    return best[1], best[2], float(width)
+    return left, right, float(width), "pair"
+
+
+# Logged lane lines only. A curve at 18 m is wider than this and still a
+# lane, so the route keeps the looser per-metre gate. 1.9 widths is 6.65 m:
+# the ecf5d35 det_right_x of +8..+16 m is not the ego lane.
+LANE_BOUNDARY_WIDTHS = 1.9
+
+
+def _drop_lane_outliers(
+    polys: list[list[tuple[float, float]]],
+    *,
+    widths: float | None = None,
+) -> list[list[tuple[float, float]]]:
+    """Drop paint points too far sideways to be this lane, before the fit."""
+    kept: list[list[tuple[float, float]]] = []
+    for poly in polys:
+        pts = [(x, y) for x, y in poly if lane_point_plausible(x, y, widths=widths)]
+        if len(pts) >= 2:
+            kept.append(pts)
+    return kept
+
+
+def _steer_ref(samples: list[tuple[float, float]]) -> tuple[float, float]:
+    """The lookahead the wheel reads: first point at 8 m, else the farthest ahead."""
+    ahead = [p for p in samples if p[1] >= 8.0]
+    if ahead:
+        return ahead[0]
+    forward = [p for p in samples if p[1] > 0.0]
+    if forward:
+        return max(forward, key=lambda p: p[1])
+    return samples[0]
 
 
 def _lane_route(
     polys: list[list[tuple[float, float]]],
     horizon: float,
     step: float,
-) -> tuple[list[tuple[float, float]], float, bool] | None:
-    paired = _pair(polys)
+    lane_track: LaneTrack | None = None,
+    remember: bool = True,
+) -> tuple[list[tuple[float, float]], float, bool, str] | None:
+    polys = _drop_lane_outliers(polys)
+    if not polys:
+        return None
+    prev_side = None if lane_track is None else lane_track.side
+    paired = _pair(polys, lane_track)
     if paired is None:
         return None
-    left, right, width = paired
+    left, right, width, base = paired
+    # Before the first fresh pair, a one-sided line or a hold is not the
+    # center. Drive straight at x=0. A pair with remember set is the seed.
+    if lane_track is not None and lane_track.awaiting_pair and not (base == "pair" and remember):
+        lane_track.side = prev_side
+        straight: list[tuple[float, float]] = []
+        y_hold = 0.0
+        guard_hold = 0
+        while y_hold <= horizon + 1e-6 and guard_hold < 200:
+            straight.append((0.0, y_hold))
+            y_hold += step
+            guard_hold += 1
+        if len(straight) < 2:
+            return None
+        return straight, LANE_W_DEFAULT, False, "seed"
     # Overlap may start beside or behind the car. Do not clamp it to the bumper.
     y0 = max(left[0][1], right[0][1])
     y1 = min(left[-1][1], right[-1][1])
@@ -606,7 +977,31 @@ def _lane_route(
         remain -= step
         guard += 1
     one_sided = len(polys) < 2
-    return samples, width, extended or one_sided
+    x_ref, y_ref = _steer_ref(samples)
+    source = base
+    if not lane_point_plausible(x_ref, y_ref):
+        # The fit ran off. Keep the last center if we have one. Do not
+        # publish a lookahead tens of metres off the road.
+        if lane_track is None or lane_track.center_x is None:
+            return None
+        chosen = float(lane_track.center_x)
+        mode = "hold"
+    elif lane_track is None:
+        chosen = x_ref
+        mode = "take"
+    else:
+        chosen, mode = follow_lane_center(lane_track, x_ref, count=remember)
+        if lane_track.awaiting_pair and base == "pair" and mode == "take":
+            lane_track.awaiting_pair = False
+    shift = chosen - x_ref
+    if abs(shift) > 1e-9:
+        samples = [(x + shift, y) for x, y in samples]
+    if mode == "hold" and lane_track is not None:
+        # A rejected sample must not flip which boundary the next tick trusts.
+        lane_track.side = prev_side
+    if mode != "take":
+        source = f"{base}/{mode}"
+    return samples, width, extended or one_sided, source
 
 
 def _boundary_x(pts: list[tuple[float, float]], y: float) -> float:

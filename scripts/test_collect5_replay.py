@@ -3,10 +3,10 @@
 
 The live graph is not in this tree yet. ``--dump-roads`` writes it to
 ``E:\\GVD_data\\roads\\<map>.json.gz``. Drop those files at
-``tests/fixtures/roads/<map>.json.gz`` and this replay drives the collect5
-trajectory on them. Until then, a graph of short edges plus a driveway
-checks the two live failures: a weave aborted as ``junction`` one tick
-after the gate opened, and a lane center latched at -6.74.
+``tests/fixtures/roads/<map>.json.gz`` and this replay drives the collect4
+and collect5 trajectories on them. Until then, a graph of short edges plus
+a driveway checks the two live failures: a weave aborted as ``junction``
+one tick after the gate opened, and a lane center latched at -6.74.
 """
 from __future__ import annotations
 
@@ -31,12 +31,17 @@ from python.collect.road_dump import load_road_dump, write_road_dump  # noqa: E4
 from python.debug.gt_geom import RoadFollow, RoadHit, RoadPoly, follow_label, heading_from_dir, project_follow  # noqa: E402
 
 FIXTURE = ROOT / "tests" / "fixtures" / "collect5" / "trace.jsonl.gz"
+COLLECT4 = ROOT / "tests" / "fixtures" / "collect4" / "trace.jsonl.gz"
 ROADS = ROOT / "tests" / "fixtures" / "roads"
 
 
-def _load() -> list[dict]:
-    with gzip.open(FIXTURE, "rt", encoding="utf-8") as handle:
+def _load_gz(path: Path) -> list[dict]:
+    with gzip.open(path, "rt", encoding="utf-8") as handle:
         return [json.loads(line) for line in handle if line.strip()]
+
+
+def _load() -> list[dict]:
+    return _load_gz(FIXTURE)
 
 
 def _pieces() -> list[RoadPoly]:
@@ -184,19 +189,32 @@ def _replay(rows: list[dict], roads: list[RoadPoly]) -> list[str]:
 
 
 def check_live_graph_when_it_is_here() -> None:
-    """Drive collect5 on a dumped Tech graph, once those files are in the tree."""
-    west_rows = [row for row in _load() if row["seg"] == "west_coast_usa#0"]
-    dump = ROADS / "west_coast_usa.json.gz"
-    if not dump.is_file():
-        print("no tests/fixtures/roads/west_coast_usa.json.gz yet; synthetic graph only")
-        return
-    roads, payload = load_road_dump(dump)
-    assert payload.get("map") == "west_coast_usa"
-    assert len(roads) > 10, len(roads)
-    started = _replay(west_rows[::2], roads)
-    print(f"live graph west starts={started[:12]}")
-    assert started
-    assert not any(item.startswith("junction-abort-after-") for item in started)
+    """Drive collect4 and collect5 on dumped Tech graphs, once those files are in the tree."""
+    missing: list[str] = []
+    for level in ("west_coast_usa", "italy"):
+        dump = ROADS / f"{level}.json.gz"
+        if not dump.is_file():
+            missing.append(level)
+            continue
+        roads, payload = load_road_dump(dump)
+        assert payload.get("map") == level
+        assert len(roads) > 10, (level, len(roads))
+        for label, path in (("collect5", FIXTURE), ("collect4", COLLECT4)):
+            rows = [row for row in _load_gz(path) if str(row["seg"]).startswith(level)]
+            started = _replay(rows[::2], roads)
+            print(f"live graph {label} {level} starts={started[:12]}")
+            assert started, (label, level)
+            assert not any(item.startswith("junction-abort-after-") for item in started), (
+                label,
+                level,
+                started,
+            )
+    if missing:
+        print(
+            "no tests/fixtures/roads/"
+            + ",".join(f"{name}.json.gz" for name in missing)
+            + " yet; synthetic graph only"
+        )
 
 
 def main() -> None:

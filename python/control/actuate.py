@@ -1409,6 +1409,58 @@ def path_steer_from_ego(path_ego: list[dict[str, float]] | None) -> float:
 HEADING_STEER_GAIN = 0.6
 
 
+def steer_lookahead_m(speed_mps: float) -> float:
+    """Lookahead for the crosstrack term. Longer as speed rises, never under 6 m.
+
+    The 8 m pure-pursuit gain needs about 0.7 m of offset to hold a 50 m
+    bend. Curvature feedforward carries that bend. This distance only
+    sets how hard the residual is pulled back.
+    """
+    try:
+        speed = float(speed_mps)
+    except (TypeError, ValueError):
+        speed = 0.0
+    if speed != speed or speed < 0.0:
+        speed = 0.0
+    return max(6.0, min(14.0, 4.0 + 0.55 * speed))
+
+
+def curve_steer(
+    offset_m: float,
+    heading_err_rad: float | None,
+    curvature: float,
+    speed_mps: float,
+) -> float:
+    """Stanley plus curvature feedforward, normalized to the steering input.
+
+    ``offset_m`` is positive when the car is right of the lane center.
+    ``heading_err_rad`` is positive when the nose points left of the road.
+    ``curvature`` is 1/radius, positive for a left bend. Feedforward is
+    divided by ``ACTUATOR_YAW_GAIN`` so the 0.89 wheel response measured
+    on gt_ctrl1 actually produces that curvature. Heading and crosstrack
+    are separate: the straight 8 m center already mixes them, and adding
+    that mix on top of feedforward double-counts.
+    """
+    try:
+        offset = float(offset_m)
+        heading = 0.0 if heading_err_rad is None else float(heading_err_rad)
+        kappa = float(curvature)
+        speed = float(speed_mps)
+    except (TypeError, ValueError):
+        return 0.0
+    if offset != offset or heading != heading or kappa != kappa or speed != speed:
+        return 0.0
+    if abs(offset) == float("inf") or abs(heading) == float("inf") or abs(kappa) == float("inf"):
+        return 0.0
+    kappa = max(-0.125, min(0.125, kappa))
+    feedforward = -math.atan(WHEELBASE_M * kappa) / (STEER_LOCK_RAD * ACTUATOR_YAW_GAIN)
+    # Same sign as steer_for_heading_error: a nose left of the road needs +steer.
+    heading_term = HEADING_STEER_GAIN * heading
+    lookahead = steer_lookahead_m(speed)
+    cross = math.atan2(2.0 * WHEELBASE_M * (-offset), lookahead * lookahead) / STEER_LOCK_RAD
+    return max(-1.0, min(1.0, feedforward + heading_term + cross))
+
+
 def steer_for_heading_error(heading_err_rad: float) -> float:
     """Normalized steer that reduces heading error.
 

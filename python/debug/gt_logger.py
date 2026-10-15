@@ -17,12 +17,16 @@ from typing import Any
 
 from python.debug.lane_targets import LOOKAHEADS_M, lookahead_xs
 from python.debug.gt_geom import (
+    CurvePreview,
+    PreviewMemory,
     RoadHit,
     RoadPoly,
     ego_center_x,
     heading_from_dir,
+    lane_still_beside,
     parse_road_edges,
     project_road,
+    update_curve_preview,
 )
 
 FRAME_EVERY_S = 4.0
@@ -361,6 +365,7 @@ class GroundTruthLogger:
         self._burst = 0
         self._was_out = False
         self._ticks = 0
+        self._preview = PreviewMemory()
 
     @classmethod
     def open(cls, root: Path | None = None) -> GroundTruthLogger:
@@ -407,6 +412,60 @@ class GroundTruthLogger:
         if hit.lane_width_m is None or float(hit.lane_width_m) <= 0.0:
             return None
         return float(ego_center_x(hit.lane_offset_m, hit.heading_err_rad, 8.0))
+
+    def curve_preview(
+        self,
+        vdata: Any,
+        bng: Any = None,
+        socket_busy: bool = False,
+        dt_s: float | None = None,
+    ) -> CurvePreview | None:
+        """Lane sample for the wheel, held through a bad projection.
+
+        A crossing road or the end of a polyline does not clear the steer.
+        ``lost`` means the hold is old enough that the caller should slow
+        down. The curvature in the sample is what feedforward steers.
+        """
+        self._ensure_roads(bng, socket_busy)
+        dt = 0.1 if dt_s is None else dt_s
+        if not self._roads:
+            return None
+        pos, heading, _speed = _pose(vdata)
+        if pos is None or heading is None:
+            return update_curve_preview(
+                self._preview,
+                offset_m=None,
+                heading_err_rad=None,
+                curvature=0.0,
+                road_id="",
+                beside=False,
+                dt_s=dt,
+            )
+        hit = project_road(self._roads, pos[0], pos[1], heading)
+        if hit is None or hit.heading_err_rad is None or hit.lane_offset_m is None:
+            return update_curve_preview(
+                self._preview,
+                offset_m=None,
+                heading_err_rad=None,
+                curvature=0.0,
+                road_id="",
+                beside=False,
+                dt_s=dt,
+            )
+        kappa = float(hit.curvature)
+        # The walk died at the end of the mesh. Keep the bend we already had
+        # instead of commanding a straight line off the end.
+        if hit.ahead_m < 4.0 and self._preview.offset_m is not None:
+            kappa = float(self._preview.curvature)
+        return update_curve_preview(
+            self._preview,
+            offset_m=hit.lane_offset_m,
+            heading_err_rad=hit.heading_err_rad,
+            curvature=kappa,
+            road_id=hit.road_id,
+            beside=lane_still_beside(hit),
+            dt_s=dt,
+        )
 
     def write(
         self,

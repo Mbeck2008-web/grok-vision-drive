@@ -23,6 +23,17 @@ class RoadPoly:
     width_m: float
 
 
+# A heading jump bigger than this in one tick is a different road, not a yaw.
+# gt_ctrl1 spiked by ~1.5 rad when the nearest polyline changed.
+PREVIEW_JUMP_RAD = 0.6
+# Hold the last good curve this long, then slow down without centering the wheel.
+PREVIEW_LOST_S = 1.5
+# Walk this far along the centerline for curvature. A kink tighter than 8 m
+# is clamped; that is already near full lock.
+CURVATURE_AHEAD_M = 12.0
+CURVATURE_CAP = 0.125
+
+
 @dataclass
 class RoadHit:
     road_id: str
@@ -33,6 +44,30 @@ class RoadHit:
     lane_width_m: float
     off_road: bool
     dist_m: float
+    curvature: float = 0.0
+    ahead_m: float = 0.0
+
+
+@dataclass
+class PreviewMemory:
+    """Last curve sample the wheel is allowed to follow."""
+
+    offset_m: float | None = None
+    heading_err_rad: float = 0.0
+    curvature: float = 0.0
+    road_id: str = ""
+    age_s: float = 0.0
+
+
+@dataclass
+class CurvePreview:
+    offset_m: float
+    heading_err_rad: float
+    curvature: float
+    lane_x: float
+    held: bool
+    lost: bool
+    road_id: str
 
 
 def heading_from_dir(dx: float, dy: float) -> float:
@@ -174,6 +209,9 @@ def project_road(
     lane_w = road.width_m / len(centers)
     lane_off = offset - centers[lane_id]
     off = dist > OFF_NETWORK_M or abs(offset) > road.width_m * 0.5 + SHOULDER_M
+    kappa, ahead = curvature_ahead(
+        road, i, cx, cy, fx, fy, CURVATURE_AHEAD_M,
+    )
     return RoadHit(
         road_id=road.road_id,
         offset_m=float(offset),
@@ -183,4 +221,141 @@ def project_road(
         lane_width_m=float(lane_w),
         off_road=bool(off),
         dist_m=float(dist),
+        curvature=float(kappa),
+        ahead_m=float(ahead),
+    )
+
+
+def curvature_ahead(
+    road: RoadPoly,
+    seg_index: int,
+    cx: float,
+    cy: float,
+    fx: float,
+    fy: float,
+    distance_m: float,
+) -> tuple[float, float]:
+    """Signed curvature along the centerline, and how far the walk got.
+
+    Positive is a left bend (road heading increases counter-clockwise).
+    ``fx, fy`` is the forward unit vector already aligned with the vehicle.
+    A walk that dies at the end of the polyline returns 0 so the caller
+    can keep the previous curvature instead of commanding straight.
+    """
+    pts = road.xy
+    n = len(pts)
+    distance = float(distance_m)
+    if n < 2 or distance <= 0.5 or seg_index < 0 or seg_index >= n - 1:
+        return 0.0, 0.0
+    ax, ay = pts[seg_index]
+    bx, by = pts[seg_index + 1]
+    forward = (bx - ax) * fx + (by - ay) * fy >= 0.0
+    h0 = math.atan2(fy, fx)
+    travelled = 0.0
+    px, py = float(cx), float(cy)
+    idx = seg_index + 1 if forward else seg_index
+    step = 1 if forward else -1
+    last_hx, last_hy = fx, fy
+    guard = 0
+    while travelled < distance - 1e-6 and guard < 400:
+        guard += 1
+        if idx < 0 or idx >= n:
+            break
+        nx, ny = pts[idx]
+        dx, dy = nx - px, ny - py
+        seg = math.hypot(dx, dy)
+        if seg < 1e-6:
+            idx += step
+            continue
+        last_hx, last_hy = dx / seg, dy / seg
+        if travelled + seg >= distance:
+            travelled = distance
+            break
+        travelled += seg
+        px, py = nx, ny
+        idx += step
+    if travelled < 2.0:
+        return 0.0, travelled
+    kappa = wrap_rad(math.atan2(last_hy, last_hx) - h0) / travelled
+    return max(-CURVATURE_CAP, min(CURVATURE_CAP, kappa)), travelled
+
+
+def lane_still_beside(hit: RoadHit) -> bool:
+    """True when the car is still next to its lane, including past a polyline end.
+
+    ``off_road`` is also true when the nearest centerline sample is an
+    endpoint more than ``OFF_NETWORK_M`` away. gt_ctrl1 did that at lane
+    offset 0 and the controller zeroed the wheel at 14 m/s.
+    """
+    if hit.lane_offset_m is None:
+        return False
+    width = hit.lane_width_m if hit.lane_width_m and hit.lane_width_m > 0.0 else LANE_W_M
+    return abs(float(hit.lane_offset_m)) <= float(width) * 0.5 + SHOULDER_M
+
+
+def update_curve_preview(
+    memory: PreviewMemory,
+    *,
+    offset_m: float | None,
+    heading_err_rad: float | None,
+    curvature: float,
+    road_id: str,
+    beside: bool,
+    dt_s: float,
+) -> CurvePreview | None:
+    """Accept a sample, or keep the last one through a jump or a short gap.
+
+    A heading change past ``PREVIEW_JUMP_RAD`` is rejected even when the
+    new road's lane offset is small. gt_ctrl1 had that at t=46 s: offset
+    −0.8 m, heading error −1.56 rad, and the wheel was held instead of
+    steered. After ``PREVIEW_LOST_S`` the sample is marked lost so the
+    caller slows down. The steer command stays the held curve.
+    """
+    try:
+        dt = float(dt_s)
+    except (TypeError, ValueError):
+        dt = 0.1
+    if dt != dt or dt < 0.0:
+        dt = 0.1
+    fresh = bool(beside) and offset_m is not None and heading_err_rad is not None
+    heading = 0.0
+    offset = 0.0
+    if fresh:
+        try:
+            offset = float(offset_m)
+            heading = float(heading_err_rad)
+        except (TypeError, ValueError):
+            fresh = False
+        else:
+            if offset != offset or heading != heading:
+                fresh = False
+    if fresh and memory.offset_m is not None:
+        if abs(wrap_rad(heading - memory.heading_err_rad)) > PREVIEW_JUMP_RAD:
+            fresh = False
+    if fresh:
+        try:
+            kappa = float(curvature)
+        except (TypeError, ValueError):
+            kappa = 0.0
+        if kappa != kappa:
+            kappa = 0.0
+        memory.offset_m = offset
+        memory.heading_err_rad = heading
+        memory.curvature = max(-CURVATURE_CAP, min(CURVATURE_CAP, kappa))
+        memory.road_id = str(road_id)
+        memory.age_s = 0.0
+        held = False
+    elif memory.offset_m is not None:
+        memory.age_s += dt
+        held = True
+    else:
+        return None
+    return CurvePreview(
+        offset_m=float(memory.offset_m),
+        heading_err_rad=float(memory.heading_err_rad),
+        curvature=float(memory.curvature),
+        lane_x=ego_center_x(float(memory.offset_m), float(memory.heading_err_rad), 8.0),
+        held=held,
+        lost=memory.age_s > PREVIEW_LOST_S,
+        road_id=memory.road_id,
     )

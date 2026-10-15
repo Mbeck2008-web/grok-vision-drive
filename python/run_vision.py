@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
 
 from python.control.actuate import (
     attach_electrics,
+    curve_steer,
     follow_lane_steer,
     lane_sample_hold_reason,
     LaneSteerState,
@@ -740,28 +741,31 @@ def main() -> None:
 
             scene_stop = False
             gt_stop = False
+            gt_preview = None
             scene_lane_x = None
             scene_conf = None
             if args.lane_source == "gt":
                 from python.train.scene_lane_runtime import straight_lane_path
 
-                gt_x = None
                 if gt_log is not None:
-                    gt_x = gt_log.center_x(
+                    gt_preview = gt_log.curve_preview(
                         vdata,
                         bng,
                         socket_busy=bool(getattr(bundle, "grab_read_blocked", False)),
+                        dt_s=tick_dt,
                     )
-                if gt_x is None:
+                if gt_preview is None:
                     gt_stop = True
                     pout.path_ego = []
                     pout.lane_conf = 0.0
                     pout.path_conf = 0.0
                     pout.lane_source = "gt/stop"
                 else:
-                    pout.path_ego = straight_lane_path(float(gt_x))
+                    pout.path_ego = straight_lane_path(float(gt_preview.lane_x))
                     pout.lane_conf = 1.0
                     pout.path_conf = 1.0
+                    # Not "hold": the stale-speed cap treats that word as a frozen
+                    # camera lane and would parking-brake above 6 m/s.
                     pout.lane_source = "gt"
                     pout.path_debug_preview = False
                     pout.frame_age_s = 0.0
@@ -903,7 +907,25 @@ def main() -> None:
             elif lane_y is not None:
                 miss = lane_sample_hold_reason(lane_x, lane_y)
             holding = False
-            if engaged and cmd.reason == "ok" and miss is None:
+            # GT curvature is not in the straight 8 m center. Steer Stanley
+            # plus feedforward, and do not treat a large heading as lane_far:
+            # that decay is what parked gt_ctrl1 sideways after the projection
+            # jumped. A held sample keeps the last bend instead of centering.
+            if (
+                engaged
+                and args.lane_source == "gt"
+                and gt_preview is not None
+                and cmd.reason == "ok"
+            ):
+                geometric = curve_steer(
+                    gt_preview.offset_m,
+                    gt_preview.heading_err_rad,
+                    gt_preview.curvature,
+                    float(ego_v or 0.0),
+                )
+                cmd.steer = follow_lane_steer(geometric, gt_preview.lane_x, lane_steer, tick_dt)
+                lane_steer.reason = "curve_hold" if gt_preview.held else "curve"
+            elif engaged and cmd.reason == "ok" and miss is None:
                 cmd.steer = follow_lane_steer(cmd.steer, lane_x, lane_steer, tick_dt)
             elif (
                 engaged
@@ -945,6 +967,16 @@ def main() -> None:
                 pos_xy=pos_xy,
             )
             lane_age_s = float(getattr(pout, "frame_age_s", 0.0) or 0.0)
+            if (
+                engaged
+                and gt_preview is not None
+                and gt_preview.lost
+                and (cmd.reason == "ok" or holding)
+            ):
+                # Slow down on the held curve. stop_command would zero the
+                # wheel, which is how gt_ctrl1 left the bend at 14 m/s.
+                cmd.throttle = 0.0
+                cmd.brake = max(float(cmd.brake), 1.0)
             if engaged and (cmd.reason == "ok" or holding):
                 apply_stale_speed_cap(
                     cmd,

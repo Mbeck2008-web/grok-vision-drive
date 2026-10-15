@@ -5,9 +5,11 @@ The plant yaws at ``ACTUATOR_YAW_GAIN`` of the 30 deg bicycle, one
 ``PARK_DECEL_MPS2`` (gt_ctrl1 fell from 14 m/s to 0 in about 3.2 s), not
 in one tick. Instant zero hid the coast off a curve.
 
-``lane_x`` is still ``ego_center_x`` at 8 m. That number does not see
-curvature. ``law="legacy"`` is the steer that drove gt_ctrl1: pursuit of
-that point, and steer 0 plus the parking brake when the measurement drops.
+``law="legacy"`` is the steer that drove gt_ctrl1: pursuit of the straight
+8 m center, and steer 0 plus the parking brake when the measurement drops.
+``law="curve"`` is Stanley, a speed-scaled crosstrack lookahead, and
+curvature feedforward. A dropped measurement keeps that command for
+``PREVIEW_LOST_S``, then slows down with the wheel still on the curve.
 """
 
 from __future__ import annotations
@@ -22,12 +24,13 @@ from python.control.actuate import (
     WHEELBASE_M,
     DriveCommand,
     LaneSteerState,
+    curve_steer,
     follow_lane_steer,
     lane_sample_hold_reason,
     path_steer_from_ego,
 )
 from python.control.launch_guard import LAUNCH_S, LaunchGuard, apply_lane_exit_brake
-from python.debug.gt_geom import ego_center_x
+from python.debug.gt_geom import PREVIEW_LOST_S, ego_center_x
 from python.debug.gt_summary import MIN_DRIVEN_M, MIN_MEAN_SPEED_MPS
 from python.train.scene_lane_runtime import straight_lane_path
 
@@ -100,7 +103,7 @@ def run_gt_lane(
     heading_err_rad: float = 0.05,
     curvature: float = 0.0,
     half_width_m: float = LANE_HALF_M,
-    law: str = "legacy",
+    law: str = "curve",
     gap_at_s: float | None = None,
     gap_s: float = 0.0,
     speed_mps: float = 0.0,
@@ -111,9 +114,10 @@ def run_gt_lane(
     Offset is metres to the right of the center. Heading error is radians,
     positive when the nose points left of the road. ``law="legacy"`` is the
     gt_ctrl1 controller. A gap is a dropped measurement (polyline end):
-    legacy zeros the wheel and parks.
+    legacy zeros the wheel and parks. ``law="curve"`` holds the last
+    curvature and keeps steering.
     """
-    if law != "legacy":
+    if law not in ("legacy", "curve"):
         raise ValueError(law)
     offset = float(offset_m)
     heading_err = float(heading_err_rad)
@@ -139,11 +143,32 @@ def run_gt_lane(
     limit = max(1, int(round(float(seconds) / dt)))
     sent: list[tuple[float, float]] = []
     clock = 0.0
+    held_offset = offset
+    held_heading = heading_err
+    held_kappa = kappa
+    gap_age = 0.0
     for step in range(limit):
         now = step * dt
         dropped = gap_at_s is not None and float(gap_at_s) <= now < float(gap_at_s) + float(gap_s)
         lane_x: float | None
-        if dropped:
+        if law == "curve":
+            if dropped:
+                gap_age += dt
+            else:
+                held_offset = offset
+                held_heading = heading_err
+                held_kappa = kappa
+                gap_age = 0.0
+            lane_x = ego_center_x(held_offset, held_heading, LOOKAHEAD_M)
+            geometric = curve_steer(held_offset, held_heading, held_kappa, speed)
+            cmd = DriveCommand(throttle=CRUISE_THROTTLE, brake=0.0, reason="ok")
+            cmd.steer = follow_lane_steer(geometric, lane_x, steer_state, dt)
+            # Past the hold, slow down. The wheel stays on the last curve
+            # instead of centering while the car is still moving.
+            if dropped and gap_age > PREVIEW_LOST_S:
+                cmd.throttle = 0.0
+                cmd.brake = max(float(cmd.brake), 1.0)
+        elif dropped:
             # gt_ctrl1: off_road cleared the path, stop_command set steer 0
             # and brake 1, and the steer state was reset.
             lane_x = None

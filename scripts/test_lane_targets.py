@@ -75,6 +75,13 @@ def check_holdout_is_the_end_of_the_clock() -> None:
     assert scored["n"] == 4
     assert scored["r"] is not None and scored["r"] > 0.9
     assert scored["rms"] is not None and scored["rms"] > 0.0
+    mean_pred = score_centers([1.5, 1.5, 1.5, 1.5], [0.0, 1.0, 2.0, 3.0])
+    assert mean_pred["r"] is None
+    assert mean_pred["rms_mean"] is not None and abs(float(mean_pred["rms"]) - float(mean_pred["rms_mean"])) < 1e-9
+    from python.debug.lane_targets import lane_center_is_valid
+
+    assert lane_center_is_valid([1, 1, 1, 1, 1, 1])
+    assert not lane_center_is_valid([0, 0, 0, 0])
 
 
 def check_low_confidence_stops() -> None:

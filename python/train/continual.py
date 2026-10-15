@@ -369,13 +369,23 @@ def remaining_until_holdout_can_stop(
     return remaining
 
 
-def holdout_stopped(losses: list[float]) -> bool:
-    """True once the latest holdout loss is not strictly better than the best so far.
+def holdout_stopped(
+    losses: list[float],
+    *,
+    tol: float = 0.0,
+    window: int = 0,
+) -> bool:
+    """True once the latest holdout score is not strictly better than the best so far.
 
-    The first measurement cannot stop the run. There is no epoch cap here.
+    Lower is better. The first measurement cannot stop the run. There is no
+    epoch cap here. ``tol`` and ``window`` stop a plateau: the last ``window``
+    scores stay inside ``tol`` (metres, when the score is the lane-center rms).
     """
     if len(losses) < 2:
         return False
+    if float(tol) > 0.0 and int(window) >= 2 and len(losses) >= int(window):
+        recent = [float(value) for value in losses[-int(window) :]]
+        return max(recent) - min(recent) <= float(tol)
     best = min(float(value) for value in losses[:-1])
     return float(losses[-1]) >= best
 

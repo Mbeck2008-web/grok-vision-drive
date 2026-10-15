@@ -1571,6 +1571,9 @@ def check_continual_bptt_and_yaw() -> None:
     assert holdout_stopped([0.5]) is False
     assert holdout_stopped([0.5, 0.4]) is False
     assert holdout_stopped([0.5, 0.4, 0.45]) is True
+    flat = [2.333, 2.327, 2.290, 2.282, 2.280]
+    assert holdout_stopped(flat[:3], tol=0.02, window=3) is False
+    assert holdout_stopped(flat, tol=0.02, window=3) is True
     assert pick_learning_rate({1e-3: 0.4, 1e-4: 0.2}) == 1e-4
     assert pick_learning_rate({1e-3: 0.2, 1e-4: 0.4}) == 1e-3
     assert pick_learning_rate({1e-3: 0.2, 1e-4: 0.2}) == CANDIDATE_LRS[0]

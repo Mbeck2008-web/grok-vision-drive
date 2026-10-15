@@ -598,20 +598,25 @@ def _eval_sequence(
                     pred, state = net.forward_batch(image, dt, state)
                 one = _prediction_at(pred, 0)
                 if pairs is not None:
-                    from python.debug.lane_targets import lane_gt_from_record, lane_x_from_vector
+                    from python.debug.lane_targets import (
+                        lane_center_is_valid,
+                        lane_gt_from_record,
+                        lane_x_from_vector,
+                    )
 
                     lane = getattr(one, "lane_gt", None)
                     vec = None if lane is None else lane.detach().float().cpu().numpy().reshape(-1)
                     tech = row.get("tech") if isinstance(row.get("tech"), dict) else row
-                    gt_vec, _mask = lane_gt_from_record(tech if isinstance(tech, dict) else None)
-                    pred_x = None if vec is None else lane_x_from_vector(vec)
-                    gt_x = lane_x_from_vector(gt_vec)
-                    pairs.append(
-                        (
-                            float("nan") if pred_x is None else float(pred_x),
-                            float("nan") if gt_x is None else float(gt_x),
+                    gt_vec, gt_mask = lane_gt_from_record(tech if isinstance(tech, dict) else None)
+                    if lane_center_is_valid(gt_mask):
+                        pred_x = None if vec is None else lane_x_from_vector(vec)
+                        gt_x = lane_x_from_vector(gt_vec)
+                        pairs.append(
+                            (
+                                float("nan") if pred_x is None else float(pred_x),
+                                float("nan") if gt_x is None else float(gt_x),
+                            )
                         )
-                    )
                 if not loss_mask(row):
                     continue
                 value = scene_loss(one, _as_target(labels_for_row(row), device))["total"]
@@ -1237,6 +1242,7 @@ def train_directory(
             if hold_n <= 0:
                 break
             mean = hold_sum / hold_n
+            scored: dict[str, Any] = {}
             if val_pairs:
                 from python.debug.lane_targets import score_centers
 
@@ -1255,19 +1261,34 @@ def train_directory(
                         "n": scored["n"],
                         "r": json_num(scored["r"]),
                         "rms": json_num(scored["rms"]),
+                        "rms_mean": json_num(scored["rms_mean"]),
                         "bias": json_num(scored["bias"]),
                     },
                 )
                 print(
                     f"[GVD] val step={done} n={scored['n']} r={scored['r']} "
-                    f"rms={scored['rms']} bias={scored['bias']}",
+                    f"rms={scored['rms']} rms_mean={scored['rms_mean']} "
+                    f"bias={scored['bias']} loss={mean}",
                     flush=True,
                 )
-            history.append(mean)
-            if best_value is None or mean < best_value:
-                best_value = mean
+            # Stop on the 8 m center rms, not the composite loss. A tiny drop in
+            # the other heads was keeping the run alive after the lane had plateaued.
+            if scored.get("rms") is not None:
+                history.append(float(scored["rms"]))
+                improved = best_value is None or float(scored["rms"]) < best_value
+            else:
+                history.append(mean)
+                improved = best_value is None or mean < best_value
+            if improved:
+                best_value = history[-1]
                 best_blob = _clone_weights()
-            if holdout_stopped(history):
+            plateau = holdout_stopped(history, tol=0.02, window=3) if scored.get("rms") is not None else holdout_stopped(history)
+            if plateau:
+                print(
+                    f"[GVD] holdout stopped at step={done} "
+                    f"rms={scored.get('rms')} rms_mean={scored.get('rms_mean')}",
+                    flush=True,
+                )
                 break
             epoch += 1
         if not paused_exit and best_blob is not None:

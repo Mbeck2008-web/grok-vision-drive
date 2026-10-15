@@ -83,6 +83,18 @@ def pack_lane_gt(
     return values, valid
 
 
+def lane_center_is_valid(mask: Any) -> bool:
+    """True when the 5 m and 10 m center slots are marked valid.
+
+    The live 8 m sample is interpolated from those two. An invalid vector is
+    stored as zeros, which would otherwise look like a centered lane.
+    """
+    arr = np.asarray(mask if mask is not None else [], dtype=np.float64).reshape(-1)
+    if arr.size < 4:
+        return False
+    return float(arr[0]) > 0.5 and float(arr[3]) > 0.5
+
+
 def lane_x_from_vector(values: Any, y_m: float = LIVE_LANE_Y_M) -> float | None:
     """Center x at ``y_m``, interpolated between the stored lookaheads."""
     arr = np.asarray(values, dtype=np.float64).reshape(-1)
@@ -217,13 +229,17 @@ def score_centers(pred: Any, truth: Any) -> dict[str, float | int | None]:
     err = [a - b for a, b in pairs]
     rms = math.sqrt(sum(e * e for e in err) / n)
     bias = sum(err) / n
-    if n < 3:
-        return {"n": n, "r": None, "rms": rms, "bias": bias}
-    mx = sum(a for a, _b in pairs) / n
     my = sum(b for _a, b in pairs) / n
+    # Predicting the mean of the truth. This is the floor for an uncorrelated guess.
+    rms_mean = math.sqrt(sum((b - my) ** 2 for _a, b in pairs) / n)
+    base = {"n": n, "r": None, "rms": rms, "rms_mean": rms_mean, "bias": bias}
+    if n < 3:
+        return base
+    mx = sum(a for a, _b in pairs) / n
     vx = sum((a - mx) ** 2 for a, _b in pairs)
     vy = sum((b - my) ** 2 for _a, b in pairs)
     if vx < 1e-12 or vy < 1e-12:
-        return {"n": n, "r": None, "rms": rms, "bias": bias}
+        return base
     cov = sum((a - mx) * (b - my) for a, b in pairs)
-    return {"n": n, "r": cov / math.sqrt(vx * vy), "rms": rms, "bias": bias}
+    base["r"] = cov / math.sqrt(vx * vy)
+    return base

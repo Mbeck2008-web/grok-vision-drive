@@ -99,6 +99,20 @@ class RawWriteQueue:
                 "bytes_written": int(getattr(self.writer, "stored_bytes", 0) or 0),
             }
 
+    def wait_empty(self, timeout_s: float = 30.0) -> bool:
+        """Block until every submitted frame has been committed, or time runs out."""
+        import time
+
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        while True:
+            with self._lock:
+                idle = self._inflight() == 0 and int(self.written) >= int(self.enqueued)
+            if idle:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+
     def close(self, timeout_s: float = 120.0) -> None:
         for _ in self._threads:
             self._q.put(_STOP)

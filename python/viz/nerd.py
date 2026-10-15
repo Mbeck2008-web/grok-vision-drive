@@ -719,9 +719,15 @@ def _draw_auto_tab(
     traffic = "on" if bool(getattr(opts, "traffic", False)) else "off"
     weather = str(getattr(opts, "weather", "") or "sky")
     tod = str(getattr(opts, "time_of_day", "") or "sky")
+    excursion = "on" if bool(getattr(opts, "excursions", True)) else "off"
+    raw_maps = str(getattr(opts, "maps", "") or "")
+    parts = [part for part in raw_maps.split(",") if part.strip()]
+    maps = "current" if not parts else (parts[0] if len(parts) == 1 else f"{len(parts)} maps")
     rows = (
         ("map", f"map {map_name}"),
+        ("maps", f"maps {maps}"),
         ("route", f"route {route}"),
+        ("excursion", f"excursion {excursion}"),
         ("speed+", f"speed {speed} m/s"),
         ("disk", f"time {duration}"),
         ("cameras", f"cameras {cams}"),

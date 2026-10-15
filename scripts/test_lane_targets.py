@@ -7,6 +7,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -60,9 +62,14 @@ def check_lookaheads_match_the_8m_log() -> None:
     )
     assert float(empty_mask.sum()) == 0.0
     assert float(empty[-1]) == 0.0
+    assert not np.isfinite(float(empty[0]))
     labels = labels_for_row({"tech": tech_from_hit(-0.4, 0.2, 3.5, False)})
     assert "lane_gt" in labels and labels["lane_gt"].shape == (LANE_GT_DIM,)
     assert "lane_gt" in LOSS_TERMS
+    masked = labels_for_row({"tech": tech_from_hit(None, None, None, True)})
+    assert float(masked["lane_gt_valid"].sum()) == 0.0
+    assert not np.isfinite(float(masked["lane_gt"][0]))
+    assert float(masked["lane_gt"][-1]) == 0.0
 
 
 def check_holdout_is_the_end_of_the_clock() -> None:

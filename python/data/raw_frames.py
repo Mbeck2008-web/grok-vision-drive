@@ -349,6 +349,7 @@ class RawFrameWriter:
         pedals: Mapping[str, Any] | None = None,
         tech: Mapping[str, Any] | None = None,
         driver: str | None = None,
+        tags: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         return self.write_encoded(
             encode_cameras(frames),
@@ -359,6 +360,7 @@ class RawFrameWriter:
             pedals=pedals,
             tech=tech,
             driver=driver,
+            tags=tags,
         )
 
     def write_encoded(
@@ -372,6 +374,7 @@ class RawFrameWriter:
         pedals: Mapping[str, Any] | None = None,
         tech: Mapping[str, Any] | None = None,
         driver: str | None = None,
+        tags: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Write already-encoded camera bytes and one state line.
 
@@ -439,6 +442,8 @@ class RawFrameWriter:
             },
             "cams": cams,
         }
+        for key, value in dict(tags or {}).items():
+            line[str(key)] = _jsonable(value)
         _append_line(self.state_path, line)
         if tech is not None:
             _append_line(

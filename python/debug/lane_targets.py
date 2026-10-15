@@ -56,10 +56,11 @@ def pack_lane_gt(
     """Return ``(values[14], valid[14])``.
 
     Values are center/left/right at each lookahead, then heading error, then
-    confidence in ``[0, 1]``. Invalid slots are 0. Off-road or a missing hit
-    sets confidence to 0 and clears the mask.
+    confidence in ``[0, 1]``. Invalid geometry is NaN and its mask is 0, so
+    a missing hit is not scored as a centered lane. Confidence is 0.
     """
-    values = np.zeros((LANE_GT_DIM,), dtype=np.float32)
+    values = np.full((LANE_GT_DIM,), np.nan, dtype=np.float32)
+    values[-1] = 0.0
     valid = np.zeros((LANE_GT_DIM,), dtype=np.float32)
     usable = (
         lane_offset_m is not None
@@ -86,8 +87,8 @@ def pack_lane_gt(
 def lane_center_is_valid(mask: Any) -> bool:
     """True when the 5 m and 10 m center slots are marked valid.
 
-    The live 8 m sample is interpolated from those two. An invalid vector is
-    stored as zeros, which would otherwise look like a centered lane.
+    The live 8 m sample is interpolated from those two. Invalid geometry is
+    NaN, and this mask is what keeps it out of the score.
     """
     arr = np.asarray(mask if mask is not None else [], dtype=np.float64).reshape(-1)
     if arr.size < 4:
@@ -225,7 +226,7 @@ def score_centers(pred: Any, truth: Any) -> dict[str, float | int | None]:
     pairs = [(a, b) for a, b in zip(xs, ys) if math.isfinite(a) and math.isfinite(b)]
     n = len(pairs)
     if n == 0:
-        return {"n": 0, "r": None, "rms": None, "bias": None}
+        return {"n": 0, "r": None, "rms": None, "rms_mean": None, "bias": None}
     err = [a - b for a, b in pairs]
     rms = math.sqrt(sum(e * e for e in err) / n)
     bias = sum(err) / n

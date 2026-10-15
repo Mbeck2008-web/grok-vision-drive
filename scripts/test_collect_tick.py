@@ -141,6 +141,8 @@ def check_one_tick() -> None:
     assert state.is_file(), sorted(p.name for p in out.iterdir())
     row = json.loads(state.read_text(encoding="utf-8").splitlines()[0])
     assert row.get("driver") == "beamng_ai"
+    assert (row.get("excursion") or {}).get("phase") == "cruise"
+    assert row.get("segment") == "current#0"
     wheel = row.get("wheel") or {}
     assert wheel.get("steer") == 0.15
     pngs = list((out / "raw" / "main").glob("*.png"))

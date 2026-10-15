@@ -736,8 +736,8 @@ def labels_from_tech(tech: Mapping[str, Any] | None) -> dict[str, np.ndarray]:
 def labels_for_row(row: Mapping[str, Any] | None) -> dict[str, np.ndarray]:
     """Scene labels plus the ground-truth lane vector when the row has one.
 
-    Old strips without ``lane_gt`` still train the polyline heads. The lane
-    vector is zeros and its mask is clear, so that term does not pull.
+    Old strips without ``lane_gt`` still train the polyline heads. Invalid
+    geometry is NaN and its mask is clear, so that term does not pull.
     """
     row = row or {}
     tech = row.get("tech") if isinstance(row.get("tech"), Mapping) else row
@@ -998,11 +998,16 @@ def _lane_gt_loss(
     mask = target["lane_gt_valid"].to(device=device, dtype=dtype).reshape(-1, LANE_GT_DIM)
     conf = pred_v[:, -1].clamp(1e-6, 1.0 - 1e-6)
     bce = functional.binary_cross_entropy(conf, goal[:, -1])
-    values = pred_v[:, :-1]
+    import torch
+
+    values = torch.nan_to_num(pred_v[:, :-1], nan=0.0)
+    goal_v = torch.nan_to_num(goal[:, :-1], nan=0.0)
     value_mask = mask[:, :-1]
     denom = value_mask.sum().clamp(min=1.0)
-    residual = functional.smooth_l1_loss(values, goal[:, :-1], reduction="none")
-    return bce + (residual * value_mask).sum() / denom
+    residual = functional.smooth_l1_loss(values, goal_v, reduction="none")
+    # Masked slots stay out of the mean. A stored NaN is not a real zero.
+    residual = torch.where(value_mask > 0.5, residual, torch.zeros_like(residual))
+    return bce + residual.sum() / denom
 
 
 def _scene_loss_body(pred: ScenePrediction, target: Mapping[str, Any]) -> dict[str, Any]:

@@ -15,7 +15,9 @@ from typing import Any, Callable
 from python.data.raw_frames import CAMERA_HZ
 from python.debug.remote_status import COLLECT_NAME, read_json, status_dir
 
-MAPS = ("", "west_coast_usa", "italy", "east_coast_usa", "jungle_rock_island")
+MAPS = ("", "west_coast_usa", "italy", "east_coast_usa", "utah", "jungle_rock_island")
+# Levels that ship with BeamNG.tech 0.39. A multi-map run rotates these.
+DEFAULT_MAPS = ("west_coast_usa", "italy", "east_coast_usa", "utah", "jungle_rock_island")
 ROUTES = ("span", "waypoints", "random")
 LANE_CAMERAS = "main,narrow,wide"
 CAMERA_PRESETS = ("", LANE_CAMERAS)
@@ -37,6 +39,11 @@ class AutoOptions:
     time_of_day: str = ""
     weather: str = ""
     out: Path | None = None
+    excursions: bool = True
+    maps: str = ""
+    segment_min: float = 12.0
+    smoke_s: float = 60.0
+    vary_env: bool = True
 
     def cycle(self, ident: str) -> None:
         if ident == "map":
@@ -54,6 +61,11 @@ class AutoOptions:
         elif ident == "time":
             order = ("", "0.25", "0.5", "0.75")
             self.time_of_day = _next(order, self.time_of_day)
+        elif ident == "excursion":
+            self.excursions = not self.excursions
+        elif ident == "maps":
+            joined = ",".join(DEFAULT_MAPS)
+            self.maps = "" if self.maps == joined else joined
         elif ident == "speed+":
             self.speed_max = min(30.0, float(self.speed_max) + 1.0)
         elif ident == "speed-":
@@ -152,6 +164,14 @@ def collect_argv(opts: AutoOptions, script: Path | str, python: str | None = Non
         cmd += ["--time-of-day", str(opts.time_of_day)]
     if opts.weather:
         cmd += ["--weather", str(opts.weather)]
+    if not opts.excursions:
+        cmd.append("--no-excursions")
+    if opts.maps:
+        cmd += ["--maps", str(opts.maps), "--segment-min", str(float(opts.segment_min))]
+        if not opts.vary_env:
+            cmd.append("--no-vary-env")
+    if float(opts.smoke_s) > 0.0:
+        cmd += ["--smoke-s", str(float(opts.smoke_s))]
     if opts.out is not None:
         cmd += ["--out", str(opts.out)]
     return cmd

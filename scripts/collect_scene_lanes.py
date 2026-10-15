@@ -24,7 +24,11 @@ about 231.7 GB/h. The run stops if the data disk drops under 20 GB free.
 The output directory is resumable. A second start appends strips and keeps
 counting until ``--minutes`` is reached.
 
-    .venv\\Scripts\\python scripts\\collect_scene_lanes.py --minutes 45
+Excursions (weaves, lane changes, recoveries) are on unless
+``--no-excursions``. ``--maps`` rotates whole segments. The first minute
+is a smoke collect: if those PNGs do not decode, the process stops.
+
+    py -3 scripts\\collect_scene_lanes.py --minutes 120 --maps west_coast_usa,italy,east_coast_usa,utah,jungle_rock_island --segment-min 12 --smoke-s 60 --speed-min 8 --speed-max 17
 """
 from __future__ import annotations
 
@@ -110,6 +114,7 @@ def format_disk_line(
     free_bytes: int | None = None,
     *,
     ceiling_gb_per_hour: float | None = None,
+    hz: float | None = None,
 ) -> str:
     minutes = max(elapsed_s, 1e-6) / 60.0
     mb = nbytes / (1024.0 * 1024.0)
@@ -122,7 +127,26 @@ def format_disk_line(
         line += f" ceiling={float(ceiling_gb_per_hour):.1f} GB/h"
     if free_bytes is not None:
         line += f" free={free_bytes / (1024.0 ** 3):.1f} GB"
+    if hz is not None:
+        line += f" hz={float(hz):.2f}"
     return line
+
+
+def tick_sleep_s(elapsed_tick_s: float, period_s: float = 0.1) -> float:
+    """Sleep only the remainder of the plan period. A slow tick does not add another."""
+    return max(0.0, float(period_s) - max(0.0, float(elapsed_tick_s)))
+
+
+def achieved_hz(frames: int, elapsed_s: float) -> float:
+    return float(frames) / max(float(elapsed_s), 1e-6)
+
+
+_SEGMENT_ENV = (("", ""), ("0.35", "clear"), ("0.7", ""), ("0.2", "rain"), ("0.55", "fog"))
+
+
+def segment_env(index: int) -> tuple[str, str]:
+    """Weather and time of day for this segment. The first segment leaves the sky."""
+    return _SEGMENT_ENV[int(index) % len(_SEGMENT_ENV)]
 
 
 def format_queue_line(stats: dict | None) -> str:
@@ -191,7 +215,89 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Load this level before driving. Empty keeps the level that is already running.",
     )
+    parser.add_argument(
+        "--maps",
+        default="",
+        help="Comma-separated levels to rotate. Empty keeps the current level.",
+    )
+    parser.add_argument("--segment-min", type=float, default=12.0, help="Minutes on each map segment.")
+    parser.add_argument("--no-excursions", action="store_true", help="Stay centered. Default weaves and lane changes.")
+    parser.add_argument("--smoke-s", type=float, default=60.0, help="Collect this many seconds, check PNG decode, then continue. 0 skips the check.")
+    parser.add_argument("--no-vary-env", action="store_true", help="Do not change weather or time of day on each segment.")
     return parser
+
+
+def segment_at(elapsed_s: float, maps: tuple[str, ...], segment_s: float) -> tuple[str, int]:
+    """Map name and segment index. Empty maps stay on the loaded level."""
+    if not maps:
+        return "", 0
+    span = max(1.0, float(segment_s))
+    index = int(max(0.0, float(elapsed_s)) // span)
+    return maps[index % len(maps)], index
+
+
+def decode_issues(root: Path) -> list[str]:
+    """Problems that mean the smoke capture cannot be trained on."""
+    from python.data.raw_frames import list_raw_images, png_signature_ok
+
+    if not (Path(root) / "state.jsonl").is_file():
+        return ["smoke wrote no state.jsonl"]
+    images = [path for path in list_raw_images(root) if path.suffix.lower() == ".png"]
+    if not images:
+        return ["smoke wrote no png frames"]
+    bad = [path.name for path in images if not png_signature_ok(path)]
+    if bad:
+        return [f"unreadable {name}" for name in bad[:8]]
+    return []
+
+
+def start_freeroam(bng: Any, level: str) -> bool:
+    """Ask the running session to load ``level``. Does not close BeamNGpy."""
+    clean = "".join(ch for ch in str(level) if ch.isalnum() or ch in "_-")
+    if not clean:
+        return False
+    send = getattr(getattr(bng, "control", None), "queue_lua_command", None) or getattr(
+        bng, "queue_lua_command", None
+    )
+    if not callable(send):
+        return False
+    send(f'freeroam_freeroam.startFreeroam("{clean}")')
+    time.sleep(8.0)
+    return True
+
+
+def drop_cameras(cams: dict[str, Any] | None) -> None:
+    """Detach the previous level's sensors. This does not quit the game."""
+    for cam in list((cams or {}).values()):
+        fn = getattr(cam, "remove", None)
+        if not callable(fn):
+            continue
+        try:
+            fn()
+        except Exception:
+            continue
+
+
+def road_for(roads: list[Any], hit: object) -> Any:
+    if hit is None:
+        return None
+    want = str(getattr(hit, "road_id", "") or "")
+    for road in roads:
+        if str(getattr(road, "road_id", "")) == want:
+            return road
+    return None
+
+
+def road_lanes(roads: list[Any], hit: object) -> int | None:
+    road = road_for(roads, hit)
+    if road is None:
+        return None
+    from python.debug.gt_geom import lane_count
+
+    try:
+        return int(lane_count(float(road.width_m)))
+    except (TypeError, ValueError):
+        return None
 
 
 def _queue(vehicle: Any, command: str) -> None:
@@ -316,6 +422,10 @@ def main(argv: list[str] | None = None) -> int:
         bag = list(names)
         random.Random(1).shuffle(bag)
         names = tuple(bag)
+    map_names = tuple(part.strip() for part in str(args.maps).split(",") if part.strip())
+    segment_s = max(60.0, float(args.segment_min) * 60.0)
+    excursions_on = not bool(args.no_excursions)
+    vary_env = bool(map_names) and not bool(args.no_vary_env)
     speeds = speeds_for(args.speed_min, args.speed_max)
     cam_rates = rates_table(args.rates, args.cameras)
     until_disk = bool(args.until_disk) or float(args.minutes) <= 0.0
@@ -372,15 +482,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.reload_level:
             print(f"collect reload level={args.reload_level}", flush=True)
             # The running level is replaced. The socket stays open.
-            loader = getattr(getattr(bng, "scenario", None), "load_level", None) or getattr(bng, "load_level", None)
-            # Prefer the control queue so we do not invent a scenario object.
-            queue = getattr(bng, "control", None)
-            send = getattr(queue, "queue_lua_command", None) or getattr(bng, "queue_lua_command", None)
-            if callable(send):
-                send(f'freeroam_freeroam.startFreeroam("{args.reload_level}")')
-                time.sleep(8.0)
-            elif callable(loader):
-                loader(args.reload_level)
+            if not start_freeroam(bng, str(args.reload_level)):
+                loader = getattr(getattr(bng, "scenario", None), "load_level", None) or getattr(bng, "load_level", None)
+                if callable(loader):
+                    loader(args.reload_level)
         vehicle = _player_vehicle(bng)
         roads, note = load_road_polys(bng)
         if not roads:
@@ -396,7 +501,21 @@ def main(argv: list[str] | None = None) -> int:
         seed_bytes = directory_bytes(out)
         last_print = time.monotonic()
         last_disk = last_print
-        last_ai: tuple[float, str | None] | None = None
+        from python.collect.excursion import (
+            ACTIVE,
+            Excursion,
+            ExcursionClock,
+            excursion_commands,
+            excursion_path,
+            near_junction,
+            targets_for,
+        )
+
+        clock = ExcursionClock()
+        last_ai: tuple[Any, ...] | None = None
+        held_tag: Excursion | None = None
+        loaded_map = ""
+        tick_dt = 0.1
         last_cam: dict[str, float] = {}
         prev_dir: list[float] | None = None
         prev_dir_t: float | None = None
@@ -439,26 +558,66 @@ def main(argv: list[str] | None = None) -> int:
                 payload["target_s"] = None
             write_collect_status(status_root, payload)
 
+        def _hz() -> float:
+            try:
+                written = int(writer.stats().get("written") or 0)
+            except Exception:
+                written = 0
+            return achieved_hz(written if written > 0 else meter.frames, done_s)
+
         _publish(None, speed_at(done_s, speeds), waypoint_at(done_s, names))
         if status_root is not None:
             print(f"collect status={status_root / 'collect.json'}", flush=True)
         all_stale_since: float | None = None
         last_reason_line = ""
+        smoke_ok = done_s > 0.0 or float(args.smoke_s) <= 0.0
         while done_s < target_s:
             if stop_file(out).is_file():
                 save_progress(progress_path, done_s, target_s if target_s < float("inf") else done_s)
                 _publish(None, speed_at(done_s, speeds), waypoint_at(done_s, names))
                 print("collect stop requested", flush=True)
                 return 0
-            tick_mark = time.monotonic()
             elapsed = done_s
             speed = speed_at(elapsed, speeds)
             waypoint = waypoint_at(elapsed, names)
-            if last_ai != (speed, waypoint):
-                for command in ai_commands(speed, waypoint, traffic=bool(args.traffic)):
-                    _queue(vehicle, command)
-                last_ai = (speed, waypoint)
-                print(f"collect ai speed={speed:.0f} m/s route={waypoint or 'span'}", flush=True)
+            map_name, seg_index = segment_at(elapsed, map_names, segment_s)
+            segment_id = f"{map_name}#{seg_index}" if map_name else "current#0"
+            if map_name and map_name != loaded_map:
+                print(f"collect segment {segment_id}", flush=True)
+                drop_cameras(cams)
+                if not start_freeroam(bng, map_name):
+                    last_error = f"could not load {map_name}"
+                    save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
+                    print(f"collect stop {last_error}", flush=True)
+                    return 2
+                try:
+                    vehicle = _player_vehicle(bng)
+                except RuntimeError as exc:
+                    last_error = str(exc)
+                    save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
+                    print(f"collect stop {last_error}", flush=True)
+                    return 2
+                roads, note = load_road_polys(bng)
+                if not roads:
+                    save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
+                    print(f"collect no road network ({note})", file=sys.stderr)
+                    return 2
+                cams = _attach_cameras(bng, vehicle, cam_cfg)
+                loaded_map = map_name
+                last_ai = None
+                held_tag = None
+                clock = ExcursionClock()
+                prev_dir = None
+                prev_dir_t = None
+                last_cam = {}
+                if vary_env:
+                    tod, sky = segment_env(seg_index)
+                    for command in environment_commands(tod, sky):
+                        try:
+                            _queue(vehicle, command)
+                        except Exception as exc:
+                            last_error = f"{type(exc).__name__}: {exc}"
+            tick_mark = time.monotonic()
             frames, stamps, cam_reasons = _poll_cameras(cams)
             reason_line = ", ".join(f"{cid}={cam_reasons[cid]}" for cid in sorted(cam_reasons))
             if reason_line and reason_line != last_reason_line:
@@ -514,6 +673,72 @@ def main(argv: list[str] | None = None) -> int:
                 None if hit is None else hit.lane_width_m,
                 None if hit is None else hit.off_road,
             )
+            if excursions_on and not waypoint:
+                move = clock.update(
+                    tick_dt,
+                    offset_m=None if hit is None else hit.lane_offset_m,
+                    heading_rad=None if hit is None else hit.heading_err_rad,
+                    lane_width_m=None if hit is None else hit.lane_width_m,
+                    off_road=bool(hit.off_road) if hit is not None else False,
+                    near_junction=near_junction(hit),
+                    traffic=bool(args.traffic),
+                    n_lanes=road_lanes(roads, hit),
+                )
+            else:
+                move = Excursion("cruise", 0.0, 0.0, 1, "")
+            resolved = held_tag if held_tag is not None and held_tag.phase == move.phase else move
+            path = None
+            ai_key = (round(speed, 3), waypoint, resolved.phase, resolved.direction, map_name)
+            if last_ai != ai_key and excursions_on and not waypoint and move.phase in ACTIVE and pos is not None:
+                path, used = excursion_path(
+                    roads,
+                    float(pos[0]),
+                    float(pos[1]),
+                    heading,
+                    move,
+                    hit,
+                    speed,
+                )
+                road = road_for(roads, hit)
+                spec = None if path is None else targets_for(
+                    move.phase,
+                    used,
+                    None if hit is None else hit.lane_width_m,
+                    lane_id=0 if hit is None else int(getattr(hit, "lane_id", 0) or 0),
+                    road_width_m=None if road is None else float(road.width_m),
+                )
+                if path is None or spec is None:
+                    resolved = clock.force_abort("no_path")
+                    path = None
+                else:
+                    clock.direction = int(used)
+                    resolved = Excursion(move.phase, float(spec[0]), float(spec[1]), int(used), move.reason)
+                ai_key = (round(speed, 3), waypoint, resolved.phase, resolved.direction, map_name)
+            if last_ai != ai_key:
+                commands = (
+                    excursion_commands(
+                        speed,
+                        resolved.phase,
+                        resolved.direction,
+                        traffic=bool(args.traffic),
+                        path=path,
+                    )
+                    if excursions_on and not waypoint
+                    else ai_commands(speed, waypoint, traffic=bool(args.traffic))
+                )
+                for command in commands:
+                    try:
+                        _queue(vehicle, command)
+                    except Exception as exc:
+                        last_error = f"{type(exc).__name__}: {exc}"
+                last_ai = ai_key
+                held_tag = resolved
+                print(
+                    f"collect ai speed={speed:.0f} m/s route={waypoint or map_name or 'span'} "
+                    f"excursion={resolved.phase}",
+                    flush=True,
+                )
+            move = resolved
             queued = writer.submit(
                 due,
                 t=now,
@@ -530,6 +755,11 @@ def main(argv: list[str] | None = None) -> int:
                 pedals={"throttle": sample.get("throttle"), "brake": sample.get("brake")},
                 tech=tech,
                 driver="beamng_ai",
+                tags={
+                    "segment": segment_id,
+                    "map": map_name or None,
+                    "excursion": move.as_tag(),
+                },
             )
             if not queued:
                 for cid, prev in held:
@@ -548,8 +778,23 @@ def main(argv: list[str] | None = None) -> int:
             except TypeError:
                 gt_ok = False
             meter.note(set(frames), gt_ok)
-            time.sleep(0.1)
-            done_s += time.monotonic() - tick_mark
+            time.sleep(tick_sleep_s(time.monotonic() - tick_mark, 0.1))
+            tick_dt = max(1e-3, time.monotonic() - tick_mark)
+            done_s += tick_dt
+            if not smoke_ok and done_s >= float(args.smoke_s):
+                if not writer.wait_empty(30.0):
+                    print("collect smoke failed ['writer did not finish']", flush=True)
+                    return 5
+                issues = decode_issues(out)
+                if issues:
+                    print(f"collect smoke failed {issues}", flush=True)
+                    return 5
+                hz_now = _hz()
+                print(
+                    f"collect smoke ok t={done_s:.0f}s frames={meter.frames} hz={hz_now:.2f}",
+                    flush=True,
+                )
+                smoke_ok = True
             now_m = time.monotonic()
             if now_m - last_disk >= DISK_CHECK_S:
                 nbytes = _used_bytes()
@@ -558,20 +803,32 @@ def main(argv: list[str] | None = None) -> int:
                 except DataDriveError as exc:
                     save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
                     _publish(None, speed, waypoint)
-                    print(format_disk_line(done_s, nbytes, ceiling_gb_per_hour=ceiling_gb), flush=True)
+                    print(
+                        format_disk_line(done_s, nbytes, ceiling_gb_per_hour=ceiling_gb, hz=_hz()),
+                        flush=True,
+                    )
                     print(format_queue_line(writer.stats()), flush=True)
                     print(f"collect stop {exc}", flush=True)
                     return 3
                 last_disk = now_m
                 if now_m - last_print >= 60.0:
-                    print(format_disk_line(done_s, nbytes, free, ceiling_gb_per_hour=ceiling_gb), flush=True)
+                    print(
+                        format_disk_line(
+                            done_s,
+                            nbytes,
+                            free,
+                            ceiling_gb_per_hour=ceiling_gb,
+                            hz=_hz(),
+                        ),
+                        flush=True,
+                    )
                     print(format_queue_line(writer.stats()), flush=True)
                     save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
                     _publish(free, speed, waypoint)
                     last_print = now_m
         save_progress(progress_path, done_s, target_s if target_s < float("inf") else done_s)
         _publish(None, speed_at(done_s, speeds), waypoint_at(done_s, names))
-        print(format_disk_line(done_s, _used_bytes(), ceiling_gb_per_hour=ceiling_gb), flush=True)
+        print(format_disk_line(done_s, _used_bytes(), ceiling_gb_per_hour=ceiling_gb, hz=_hz()), flush=True)
         print(format_queue_line(writer.stats()), flush=True)
         return 0
     finally:

@@ -299,6 +299,37 @@ def oversample_repeats(rows: list[Mapping[str, Any]]) -> int:
     return 1
 
 
+def _segment_groups(rows: list[Mapping[str, Any]]) -> list[tuple[str, list[Mapping[str, Any]]]] | None:
+    """Consecutive ``segment`` blocks. None when any row has no segment."""
+    if not rows:
+        return []
+    groups: list[tuple[str, list[Mapping[str, Any]]]] = []
+    for row in rows:
+        if not isinstance(row, Mapping) or not row.get("segment"):
+            return None
+        seg = str(row.get("segment"))
+        if not groups or groups[-1][0] != seg:
+            groups.append((seg, [row]))
+        else:
+            groups[-1][1].append(row)
+    return groups
+
+
+def holdout_segment_names(rows: list[Mapping[str, Any]]) -> set[str]:
+    """Whole segments held out of training.
+
+    Two or more segments: the last one, so a single drive is not cut at 80%.
+    Five or more: every fifth segment. One segment stays entirely in train.
+    """
+    groups = _segment_groups(rows)
+    if not groups or len(groups) < 2:
+        return set()
+    names = [seg for seg, _rows in groups]
+    if len(names) < 5:
+        return {names[-1]}
+    return {name for index, name in enumerate(names) if (index + 1) % 5 == 0}
+
+
 def pass_plan(
     rows: list[Mapping[str, Any]],
     length: int,
@@ -307,13 +338,17 @@ def pass_plan(
     memory_s: float = MEMORY_S,
     fraction: float = HOLDOUT_FRACTION,
 ) -> list[dict[str, Any]]:
-    """One pass: overlapping train chunks on the prefix, then the holdout.
+    """One pass: overlapping train chunks, then the holdout.
 
+    Rows tagged with ``segment`` hold out whole segments. A recording
+    without that tag still holds out the last fraction of each span.
     A rare chunk is listed twice so the trainer steps twice from the same
     incoming state. Holdout rows are never listed as train rows. The second
     copy of a rare chunk uses ``incoming == "chunk"`` so it does not advance
     the carry on its own.
     """
+    if _segment_groups(rows) is not None:
+        return _pass_plan_segments(rows, length, stride, memory_s=memory_s)
     plan: list[dict[str, Any]] = []
     for start, end in recording_spans(rows, memory_s=memory_s):
         segment = list(rows[start:end])
@@ -343,6 +378,46 @@ def pass_plan(
                     "grad_frames": 0,
                 }
             )
+    return plan
+
+
+def _train_only_plan(
+    rows: list[Mapping[str, Any]],
+    length: int,
+    stride: int,
+    *,
+    memory_s: float,
+) -> list[dict[str, Any]]:
+    """Train chunks for these rows. No time-based holdout inside the block."""
+    return pass_plan(rows, length, stride, memory_s=memory_s, fraction=0.0)
+
+
+def _pass_plan_segments(
+    rows: list[Mapping[str, Any]],
+    length: int,
+    stride: int,
+    *,
+    memory_s: float,
+) -> list[dict[str, Any]]:
+    groups = _segment_groups(rows) or []
+    held = holdout_segment_names(rows)
+    plan: list[dict[str, Any]] = []
+    for seg, block in groups:
+        plain = [dict(row) for row in block]
+        for row in plain:
+            row.pop("segment", None)
+        if seg in held:
+            plan.append(
+                {
+                    "kind": "holdout",
+                    "rows": list(block),
+                    "incoming": "reset",
+                    "stride": 0,
+                    "grad_frames": 0,
+                }
+            )
+            continue
+        plan.extend(_train_only_plan(plain, length, stride, memory_s=memory_s))
     return plan
 
 

@@ -223,7 +223,6 @@ def _write_bytes(path: Path, payload: bytes) -> None:
             if wrote <= 0:
                 raise OSError(f"raw write made no progress: {path}")
             view = view[wrote:]
-        os.fsync(fd)
     finally:
         os.close(fd)
 
@@ -239,9 +238,30 @@ def _append_line(path: Path, line: Mapping[str, Any]) -> None:
             if wrote <= 0:
                 raise OSError(f"raw state write made no progress: {path}")
             view = view[wrote:]
-        os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def encode_cameras(
+    frames: Mapping[str, Any] | None,
+) -> list[tuple[str, bytes, str, tuple[int, ...], str]]:
+    """Lossless bytes for one tick. PNG level 1 for uint8, otherwise ``.npy``."""
+    encoded: list[tuple[str, bytes, str, tuple[int, ...], str]] = []
+    for cam_id, image in dict(frames or {}).items():
+        if not isinstance(image, np.ndarray) or image.size == 0 or image.ndim < 2:
+            continue
+        arr = np.ascontiguousarray(image)
+        png = _png_bytes(arr)
+        shape = tuple(int(v) for v in arr.shape)
+        if png is not None:
+            encoded.append((str(cam_id), png, ".png", shape, str(arr.dtype)))
+            continue
+        import io
+
+        buf = io.BytesIO()
+        np.save(buf, arr)
+        encoded.append((str(cam_id), buf.getvalue(), ".npy", shape, str(arr.dtype)))
+    return encoded
 
 
 def _png_bytes(arr: np.ndarray) -> bytes | None:
@@ -252,7 +272,12 @@ def _png_bytes(arr: np.ndarray) -> bytes | None:
         return None
     import cv2
 
-    ok, buf = cv2.imencode(".png", np.ascontiguousarray(arr))
+    # Level 1 is still lossless. The default (3–6) was too slow to hold 10 Hz.
+    ok, buf = cv2.imencode(
+        ".png",
+        np.ascontiguousarray(arr),
+        [int(cv2.IMWRITE_PNG_COMPRESSION), 1],
+    )
     if not ok:
         return None
     return buf.tobytes()
@@ -325,33 +350,43 @@ class RawFrameWriter:
         tech: Mapping[str, Any] | None = None,
         driver: str | None = None,
     ) -> dict[str, Any]:
-        src = frames or {}
+        return self.write_encoded(
+            encode_cameras(frames),
+            t=t,
+            timestamps=timestamps,
+            ego=ego,
+            wheel=wheel,
+            pedals=pedals,
+            tech=tech,
+            driver=driver,
+        )
+
+    def write_encoded(
+        self,
+        encoded: list[tuple[str, bytes, str, tuple[int, ...], str]],
+        *,
+        t: float,
+        timestamps: Mapping[str, Any] | None = None,
+        ego: Mapping[str, Any] | None = None,
+        wheel: Mapping[str, Any] | None = None,
+        pedals: Mapping[str, Any] | None = None,
+        tech: Mapping[str, Any] | None = None,
+        driver: str | None = None,
+    ) -> dict[str, Any]:
+        """Write already-encoded camera bytes and one state line.
+
+        Callers that encode on several threads still commit here one tick
+        at a time, in capture order, so ``dt_s`` stays the capture gap.
+        """
         idx = self._n
         t_store = round(float(t), 6)
         dt_s = None if self._prev_t is None else round(t_store - self._prev_t, 6)
         cams: dict[str, Any] = {}
-        for cam_id, image in src.items():
-            if not isinstance(image, np.ndarray) or image.size == 0 or image.ndim < 2:
-                continue
-            # Contiguous only. Values, shape, and channel count stay as returned.
-            arr = np.ascontiguousarray(image)
+        for cam_id, payload, suffix, shape, dtype in encoded:
             folder = self.raw / str(cam_id)
-            png = _png_bytes(arr)
-            if png is not None:
-                final = folder / f"{idx:06d}.png"
-                _write_bytes(final, png)
-                stored = final
-                self.stored_bytes += len(png)
-            else:
-                import io
-
-                final = folder / f"{idx:06d}.npy"
-                buf = io.BytesIO()
-                np.save(buf, arr)
-                blob = buf.getvalue()
-                _write_bytes(final, blob)
-                stored = final
-                self.stored_bytes += len(blob)
+            final = folder / f"{idx:06d}{suffix}"
+            _write_bytes(final, payload)
+            self.stored_bytes += len(payload)
             wall, sensor_t = _stamp_of(None if timestamps is None else timestamps.get(cam_id))
             cam_dt = None
             prev = self._prev_cam_t.get(str(cam_id))
@@ -361,12 +396,12 @@ class RawFrameWriter:
                 self._prev_cam_t[str(cam_id)] = float(wall)
             pose = dict(self._by_id.get(str(cam_id)) or {})
             cams[str(cam_id)] = {
-                "file": str(stored.relative_to(self.root)).replace("\\", "/"),
+                "file": str(final.relative_to(self.root)).replace("\\", "/"),
                 "t": wall,
                 "sensor_t": sensor_t,
                 "dt_s": cam_dt,
-                "shape": [int(v) for v in arr.shape],
-                "dtype": str(arr.dtype),
+                "shape": [int(v) for v in shape],
+                "dtype": str(dtype),
                 "pos_m": pose.get("pos_m"),
                 "yaw_deg": pose.get("yaw_deg"),
                 "pitch_deg": pose.get("pitch_deg"),
@@ -429,6 +464,28 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+def read_image_file(path: Path | str) -> np.ndarray | None:
+    """Decode a PNG (or other OpenCV image) without ``imread``.
+
+    ``cv2.imread`` returns None for some Windows paths even when the file
+    is a normal PNG. Reading the bytes and decoding them is the same
+    pixels, and it is what the validator and the trainer both use.
+    """
+    import cv2
+
+    file = Path(path)
+    try:
+        data = np.fromfile(file, dtype=np.uint8)
+    except OSError:
+        return None
+    if int(data.size) == 0:
+        return None
+    image = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
+    if image is None:
+        return None
+    return image
+
+
 def load_raw_cameras(root: Path | str, index: int) -> dict[str, np.ndarray]:
     """Read this tick's camera files. No resize and no channel drop."""
     root = Path(root)
@@ -436,15 +493,13 @@ def load_raw_cameras(root: Path | str, index: int) -> dict[str, np.ndarray]:
     frames: dict[str, np.ndarray] = {}
     if not raw.is_dir():
         return frames
-    import cv2
-
     for folder in raw.iterdir():
         if not folder.is_dir():
             continue
         png = folder / f"{int(index):06d}.png"
         npy = folder / f"{int(index):06d}.npy"
         if png.is_file():
-            image = cv2.imread(str(png), cv2.IMREAD_UNCHANGED)
+            image = read_image_file(png)
             if image is not None:
                 frames[folder.name] = image
         elif npy.is_file():

@@ -180,10 +180,42 @@ def check_pixels_roundtrip_and_load_time_stitch() -> None:
         assert report["issue_count"] == 0, report["issues"]
 
 
+def check_validator_reads_raw_and_names_time_holes() -> None:
+    """Collector output is raw/<cam>/NNNNNN.png, not strips/NNNNNN.jpg.
+
+    A large dt between index i and i+1 is a real hole in the recording
+    (the writer dropped ticks). It is not an off-by-one in the file number.
+    """
+    colour = np.zeros((8, 12, 3), dtype=np.uint8)
+    colour[:, :, 1] = 30
+    tech = tech_from_hit(0.2, 0.0, 3.5, False)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        writer = RawFrameWriter(root, [])
+        writer.write({"main": colour}, t=1000.0, tech=tech, driver="beamng_ai")
+        writer.write({"main": colour}, t=1000.2, tech=tech, driver="beamng_ai")
+        writer.write({"main": colour}, t=1329.228, tech=tech, driver="beamng_ai")
+        canvas = load_training_bgr(root, 0)
+        assert canvas.shape[2] == 3
+        report = validate_dataset(root, root / "validate_out", montage_n=1)
+        text = "\n".join(report["issues"])
+        assert report["format"] == "raw"
+        assert report["raw_frames"] == 3
+        assert "strips" not in text
+        assert ".jpg" not in text
+        assert "unreadable" not in text
+        assert "time hole" in text
+        assert "1000" not in text or "329" in text
+        hole = [item for item in report["issues"] if "gap" in item]
+        assert len(hole) == 1 and "index 1->2" in hole[0] and "329.028s" in hole[0]
+        print(hole[0])
+
+
 def main() -> None:
     check_disk_ceiling()
     check_rates_and_controls()
     check_pixels_roundtrip_and_load_time_stitch()
+    check_validator_reads_raw_and_names_time_holes()
     print("raw frames ok")
 
 

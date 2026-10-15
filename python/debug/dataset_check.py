@@ -42,7 +42,11 @@ def lanes_from_vector(values: Any) -> list[list[dict[str, float]]]:
     return [left, right]
 
 
-def _issues_for_row(row: dict[str, Any], prev_t: float | None) -> tuple[list[str], float | None]:
+def _issues_for_row(
+    row: dict[str, Any],
+    prev_t: float | None,
+    prev_i: int | None = None,
+) -> tuple[list[str], float | None, int | None]:
     issues: list[str] = []
     idx = row.get("i")
     try:
@@ -50,6 +54,11 @@ def _issues_for_row(row: dict[str, Any], prev_t: float | None) -> tuple[list[str
     except (TypeError, ValueError):
         issues.append(f"row {idx}: t is not a number")
         t = None
+    this_i: int | None
+    try:
+        this_i = int(idx) if idx is not None else None
+    except (TypeError, ValueError):
+        this_i = None
     if t is not None and not math.isfinite(t):
         issues.append(f"row {idx}: t is not finite")
         t = None
@@ -58,7 +67,16 @@ def _issues_for_row(row: dict[str, Any], prev_t: float | None) -> tuple[list[str
         if gap < 0.0:
             issues.append(f"row {idx}: time went backwards by {gap:.3f}s")
         elif gap > GAP_S:
-            issues.append(f"row {idx}: gap {gap:.3f}s")
+            step = None if prev_i is None or this_i is None else this_i - prev_i
+            if step == 1:
+                issues.append(
+                    f"row {idx}: gap {gap:.3f}s between recorded samples "
+                    f"(index {prev_i}->{this_i}, a time hole, not a missing file number)"
+                )
+            else:
+                issues.append(
+                    f"row {idx}: gap {gap:.3f}s (index {prev_i}->{this_i}, step {step})"
+                )
     raw_dt = row.get("dt_s")
     if raw_dt is not None:
         try:
@@ -95,7 +113,7 @@ def _issues_for_row(row: dict[str, Any], prev_t: float | None) -> tuple[list[str
                 issues.append(
                     f"row {idx}: {name} at {LOOKAHEADS_M[i]:.0f}m is {got:.1f} m"
                 )
-    return issues, t
+    return issues, t, this_i if t is not None else prev_i
 
 
 def _blank_counts(path: Path) -> tuple[dict[str, int] | None, str | None]:
@@ -143,9 +161,10 @@ def _validate_raw(
             elif cam_id not in by_cam or idx not in by_cam.get(cam_id, set()):
                 issues.append(f"row {idx}: missing raw frame for {cam_id}")
     prev_t: float | None = None
+    prev_i: int | None = None
     nan_rows = 0
     for row in rows:
-        row_issues, prev_t = _issues_for_row(row, prev_t)
+        row_issues, prev_t, prev_i = _issues_for_row(row, prev_t, prev_i)
         if any("NaN" in item or "not finite" in item for item in row_issues):
             nan_rows += 1
         issues.extend(row_issues)
@@ -215,10 +234,9 @@ def _read_raw_image(path: Path) -> np.ndarray | None:
             return np.load(path)
         except (OSError, ValueError):
             return None
-    import cv2
+    from python.data.raw_frames import read_image_file
 
-    image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-    return image
+    return read_image_file(path)
 
 
 def _draw_canvas(path: Path, canvas: np.ndarray | None, values: np.ndarray, title: str) -> bool:
@@ -288,9 +306,10 @@ def validate_dataset(
     if extra_jpeg:
         issues.append(f"jpeg with no state row {extra_jpeg[:8]}")
     prev_t: float | None = None
+    prev_i: int | None = None
     nan_rows = 0
     for row in rows:
-        row_issues, prev_t = _issues_for_row(row, prev_t)
+        row_issues, prev_t, prev_i = _issues_for_row(row, prev_t, prev_i)
         if any("NaN" in item or "not finite" in item for item in row_issues):
             nan_rows += 1
         issues.extend(row_issues)

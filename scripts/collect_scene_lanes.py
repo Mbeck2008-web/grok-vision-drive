@@ -387,7 +387,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"collect no road network ({note})", file=sys.stderr)
             return 2
         cams = _attach_cameras(bng, vehicle, cam_cfg)
-        writer = RawWriteQueue(RawFrameWriter(out, camera_sidecar(cam_cfg)), max_depth=8)
+        writer = RawWriteQueue(RawFrameWriter(out, camera_sidecar(cam_cfg)))
         from python.data.strip_writer import STRIP_ORDER
         from python.debug.remote_status import CollectMeter, status_dir, write_collect_status
 
@@ -537,7 +537,11 @@ def main(argv: list[str] | None = None) -> int:
                         last_cam.pop(cid, None)
                     else:
                         last_cam[cid] = prev
-                print(f"collect drop {format_queue_line(writer.stats())}", flush=True)
+                print(
+                    f"collect drop writer queue full cams={sorted(due)} "
+                    f"{format_queue_line(writer.stats())}",
+                    flush=True,
+                )
             mask = tech.get("lane_gt_valid") or []
             try:
                 gt_ok = float(sum(mask)) > 0.0

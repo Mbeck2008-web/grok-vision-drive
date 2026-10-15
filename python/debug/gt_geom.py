@@ -24,17 +24,21 @@ class RoadPoly:
 
 
 # A heading jump bigger than this in one tick is a different road, not a yaw.
-# gt_ctrl1 spiked by ~1.5 rad when the nearest polyline changed. gt_ctrl2's
-# crossing polylines were the same size, about 1.5 rad.
-PREVIEW_JUMP_RAD = 0.6
+# gt_ctrl1 and gt_ctrl2 spiked by ~1.5 rad on a crossing polyline. A bend at
+# a join is smaller than that. 1.0 rad still rejects a cross street (~1.57).
+PREVIEW_JUMP_RAD = 1.0
 # Hold the last good curve this long, then slow down without centering the wheel.
-# A discontinuity (polyline end, rejected jump) does not wait this out.
+# A real run-off (past the tip, no continuation) does not wait this out.
 PREVIEW_LOST_S = 1.5
 # A road whose endpoint sits this close to ours, and whose heading is within
 # this angle, is the continuation. A cross street at the same point is not.
-CONNECT_M = 8.0
-CONNECT_HEADING = 0.5
+# 8 m / 0.5 rad missed the join on gt_ctrl3 and the car parked in the lane.
+CONNECT_M = 18.0
+CONNECT_HEADING = 1.0
 AHEAD_MIN_M = 4.0
+# Metres past the polyline tip before a missing continuation is a dead end.
+# gt_ctrl3 set the brake while still on the lane, longitudinal miss ~0.
+PAST_TIP_M = 3.0
 # Walk this far along the centerline for curvature. A kink tighter than 8 m
 # is clamped; that is already near full lock.
 CURVATURE_AHEAD_M = 12.0
@@ -406,8 +410,9 @@ def project_follow(
         if hit is not None and lane_still_beside(hit):
             # ahead_m stops growing at the curvature lookahead, so a full
             # walk means the end is not in sight. A short walk is the real
-            # distance left. Brake once that is inside the stopping distance.
-            # gt_ctrl2 only noticed the end once the car was already past it.
+            # distance left. Being near that end is not a dead end: gt_ctrl3
+            # was centered in the lane with the tip still ahead, and the
+            # brake held it there for the rest of the minute.
             sees_end = hit.ahead_m < CURVATURE_AHEAD_M - 0.05
             if not sees_end or hit.ahead_m >= _stop_ahead_m(speed_mps):
                 _remember(follow, hit, heading_rad)
@@ -422,6 +427,12 @@ def project_follow(
                 ):
                     _remember(follow, chained, heading_rad)
                     return chained
+            # Still on the polyline. Only a car that has run past the tip
+            # with nothing continuous ahead is the gt_ctrl2 departure.
+            along = math.sqrt(max(0.0, hit.dist_m * hit.dist_m - hit.offset_m * hit.offset_m))
+            if along < PAST_TIP_M and hit.dist_m <= OFF_NETWORK_M:
+                _remember(follow, hit, heading_rad)
+                return hit
             hit.discontinuous = True
             return hit
     nearest = project_road(roads, x, y, heading_rad)

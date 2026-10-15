@@ -11,6 +11,7 @@ the first disengaged row.
 """
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -127,14 +128,27 @@ def check_follow_chains_and_a_dead_end_stops() -> None:
     assert dead is not None
     print(f"dead-end follow={dead.road_id} disc={dead.discontinuous} dist={dead.dist_m:.1f}")
     assert dead.road_id == "A"
-    assert dead.discontinuous is True
-    # 12 m/s needs ~16 m to stop. Ten metres of mesh left is already late.
+    # Ten metres past the tip, still the nearest cross street, nothing continues.
+    follow = RoadFollow(road_id="A", forward_heading=heading)
+    gone = project_follow([ahead, cross], 1.0, 40.0, heading, follow)
+    assert gone is not None and gone.road_id == "A" and gone.discontinuous is True, gone
+    # Still on the lane with the tip ahead. gt_ctrl3 parked here for 69 s.
     follow = RoadFollow(road_id="A", forward_heading=heading)
     early = project_follow([ahead], 0.2, 20.0, heading, follow, speed_mps=12.0)
-    assert early is not None and early.discontinuous is True, early
+    assert early is not None and early.discontinuous is False, early
     follow = RoadFollow(road_id="A", forward_heading=heading)
     room = project_follow([ahead], 0.2, 5.0, heading, follow, speed_mps=12.0)
     assert room is not None and room.discontinuous is False, room
+    # Join the old gates missed: 12 m gap, 0.7 rad bend. A cross street is ~1.57.
+    bend = [(0.0, 42.0)]
+    aim = heading + 0.7
+    for i in range(1, 20):
+        bend.append((0.0 + i * math.sin(aim), 42.0 + i * math.cos(aim)))
+    follow = RoadFollow(road_id="A", forward_heading=heading)
+    joined = project_follow(
+        [ahead, cross, RoadPoly("D", bend, 7.0)], 0.2, 28.0, heading, follow, speed_mps=8.0,
+    )
+    assert joined is not None and joined.road_id == "D" and joined.discontinuous is False, joined
 
 
 def check_speed_cap_and_immediate_brake() -> None:

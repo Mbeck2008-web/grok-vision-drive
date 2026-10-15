@@ -74,7 +74,9 @@ class _Bng:
 
 class _Cam:
     def poll(self) -> dict[str, object]:
-        return {"colour": np.zeros((8, 8, 3), dtype=np.uint8)}
+        image = np.zeros((8, 8, 3), dtype=np.uint8)
+        image[0, 0] = (8, 16, 24)
+        return {"colour": image}
 
 
 def check_read_vehicle() -> None:
@@ -141,11 +143,68 @@ def check_one_tick() -> None:
     assert row.get("driver") == "beamng_ai"
     wheel = row.get("wheel") or {}
     assert wheel.get("steer") == 0.15
-    print(f"state steer={wheel.get('steer')} driver={row.get('driver')}")
+    pngs = list((out / "raw" / "main").glob("*.png"))
+    assert pngs, sorted(p.name for p in out.rglob("*") if p.is_file())
+    print(f"state steer={wheel.get('steer')} png={pngs[0].name}")
+
+
+class _StreamCam:
+    def __init__(self, raw: object, *, poison_poll: bool = False) -> None:
+        self.raw = raw
+        self.poison_poll = poison_poll
+        self.resolution = (8, 8)
+        self.polls = 0
+
+    def stream_raw(self) -> object:
+        return self.raw
+
+    def poll(self) -> object:
+        self.polls += 1
+        if self.poison_poll:
+            raise AssertionError("shared-memory camera must be read with stream_raw")
+        return self.raw
+
+
+def check_stream_raw_not_poll() -> None:
+    image = np.zeros((8, 8, 3), dtype=np.uint8)
+    image[0, 0] = (10, 20, 30)
+    cam = _StreamCam({"colour": image}, poison_poll=True)
+    frames, _stamps, reasons = collect._poll_cameras({"main": cam})
+    assert cam.polls == 0
+    assert "main" in frames and frames["main"].shape == (8, 8, 3)
+    assert reasons == {}
+    print(f"stream_raw kept main shape={frames['main'].shape}")
+
+
+def check_drop_reasons() -> None:
+    empty = _StreamCam(None)
+    zeros = np.zeros((4, 4, 3), dtype=np.uint8)
+    blank = _StreamCam({"colour": zeros})
+    frames, _stamps, reasons = collect._poll_cameras({"main": empty, "wide": blank})
+    assert frames == {}
+    assert "returned None" in reasons["main"]
+    assert "unrendered" in reasons["wide"]
+    print(f"drop reasons={reasons}")
+
+
+def check_all_cameras_dead() -> None:
+    reasons = {"main": "stream_raw returned None", "wide": "stream_raw unrendered (all zeros)"}
+    since, message = collect.camera_outage(None, 0.0, False, reasons)
+    assert since == 0.0 and message is None
+    since, message = collect.camera_outage(since, 9.0, False, reasons)
+    assert message is None
+    _since, message = collect.camera_outage(since, 10.1, False, reasons)
+    assert message is not None and "main=" in message and "wide=" in message
+    cleared, gone = collect.camera_outage(since, 11.0, True, {})
+    assert cleared is None and gone is None
+    print(f"outage={message}")
 
 
 def main() -> None:
     check_read_vehicle()
+    check_stream_raw_not_poll()
+    check_drop_reasons()
+    check_all_cameras_dead()
     check_one_tick()
     print("collect tick ok")
 

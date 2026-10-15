@@ -46,6 +46,8 @@ SPEEDS_MPS = (8.0, 11.0, 14.0, 17.0, 10.0)
 SPEED_HOLD_S = 180.0
 WAYPOINT_HOLD_S = 180.0
 DISK_CHECK_S = 10.0
+# No picture from any camera for this long is a dead attach, not a slow disk.
+ALL_CAM_STALE_S = 10.0
 
 
 def speed_at(elapsed_s: float, speeds: tuple[float, ...] = SPEEDS_MPS) -> float:
@@ -240,6 +242,26 @@ def _colour(payload: Any) -> Any:
     return payload
 
 
+def camera_outage(
+    since: float | None,
+    now: float,
+    got_any: bool,
+    reasons: dict[str, str],
+) -> tuple[float | None, str | None]:
+    """Start or finish the all-cameras-dead timer.
+
+    ``got_any`` clears it. Otherwise the clock runs from the first empty
+    tick, and after ``ALL_CAM_STALE_S`` the message names each camera.
+    """
+    if got_any:
+        return None, None
+    start = float(now) if since is None else float(since)
+    if float(now) - start <= ALL_CAM_STALE_S:
+        return start, None
+    detail = ", ".join(f"{cid}={reasons.get(cid, 'missing')}" for cid in sorted(reasons))
+    return start, f"every camera stale for >{ALL_CAM_STALE_S:.0f}s ({detail})"
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     from python.data.data_root import (
@@ -379,6 +401,7 @@ def main(argv: list[str] | None = None) -> int:
         prev_dir: list[float] | None = None
         prev_dir_t: float | None = None
         last_error = ""
+        cam_reasons: dict[str, str] = {}
         for command in environment_commands(args.time_of_day, args.weather):
             try:
                 _queue(vehicle, command)
@@ -410,6 +433,7 @@ def main(argv: list[str] | None = None) -> int:
             payload["driver"] = "beamng_ai"
             payload["automatic"] = True
             payload["error"] = last_error
+            payload["cam_drop_reason"] = dict(cam_reasons)
             payload["until_disk"] = bool(until_disk)
             if target_s == float("inf"):
                 payload["target_s"] = None
@@ -418,6 +442,8 @@ def main(argv: list[str] | None = None) -> int:
         _publish(None, speed_at(done_s, speeds), waypoint_at(done_s, names))
         if status_root is not None:
             print(f"collect status={status_root / 'collect.json'}", flush=True)
+        all_stale_since: float | None = None
+        last_reason_line = ""
         while done_s < target_s:
             if stop_file(out).is_file():
                 save_progress(progress_path, done_s, target_s if target_s < float("inf") else done_s)
@@ -433,7 +459,21 @@ def main(argv: list[str] | None = None) -> int:
                     _queue(vehicle, command)
                 last_ai = (speed, waypoint)
                 print(f"collect ai speed={speed:.0f} m/s route={waypoint or 'span'}", flush=True)
-            frames, stamps = _poll_cameras(cams)
+            frames, stamps, cam_reasons = _poll_cameras(cams)
+            reason_line = ", ".join(f"{cid}={cam_reasons[cid]}" for cid in sorted(cam_reasons))
+            if reason_line and reason_line != last_reason_line:
+                print(f"collect cam drop {reason_line}", flush=True)
+                last_reason_line = reason_line
+            all_stale_since, outage = camera_outage(
+                all_stale_since, time.monotonic(), bool(frames), cam_reasons,
+            )
+            if outage:
+                last_error = outage
+                save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
+                _publish(None, speed, waypoint)
+                _write_collect_crash(status_root, outage, cam_reasons)
+                print(f"collect stop {outage}", flush=True)
+                return 4
             mono = time.monotonic()
             due: dict[str, Any] = {}
             due_stamps: dict[str, Any] = {}
@@ -585,29 +625,90 @@ def _attach_cameras(bng: Any, vehicle: Any, cfg: dict[str, Any]) -> dict[str, An
     return attached
 
 
-def _poll_cameras(cams: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Pictures as the sensor returned them, plus the wall time of that poll."""
+def _camera_resolution(cam: Any) -> tuple[int, int] | None:
+    res = getattr(cam, "resolution", None)
+    if res is None:
+        return None
+    try:
+        width, height = int(res[0]), int(res[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if width < 1 or height < 1:
+        return None
+    return width, height
+
+
+def _read_camera(cid: str, cam: Any) -> tuple[Any, str, Any]:
+    """One picture, why it was dropped, and the raw reading for its timestamp.
+
+    Live grab reads shared memory with ``stream_raw``. ``poll`` is a
+    game-engine round trip per camera; eight of those, plus the 0.1 s
+    sleep, is the ~2.3 Hz collect loop. A streaming camera has no picture
+    in the poll reply.
+    """
     import numpy as np
 
+    from python.sensors.cameras import colour_to_bgr, frame_is_unrendered
+
+    resolution = _camera_resolution(cam)
+    raw: Any = None
+    how = "poll"
+    if callable(getattr(cam, "stream_raw", None)):
+        how = "stream_raw"
+        try:
+            raw = cam.stream_raw()
+        except Exception as exc:
+            return None, f"stream_raw {type(exc).__name__}: {exc}", None
+    elif callable(getattr(cam, "poll", None)):
+        try:
+            raw = cam.poll()
+        except Exception as exc:
+            return None, f"poll {type(exc).__name__}: {exc}", None
+    else:
+        return None, "no stream_raw or poll", None
+    if raw is None:
+        return None, f"{how} returned None", None
+    if isinstance(raw, np.ndarray):
+        image = colour_to_bgr(raw, resolution, tone=False)
+    elif isinstance(raw, dict):
+        image = colour_to_bgr(_colour(raw), resolution, tone=False)
+    else:
+        return None, f"{how} returned {type(raw).__name__}", raw
+    if image is None:
+        keys = ",".join(sorted(raw)) if isinstance(raw, dict) else ""
+        return None, f"{how} had no colour array" + (f" keys={keys}" if keys else ""), raw
+    if frame_is_unrendered(image):
+        return None, f"{how} unrendered (all zeros)", raw
+    return image, "", raw
+
+
+def _poll_cameras(cams: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
+    """Pictures as the sensor returned them, plus why each camera was dropped."""
     frames: dict[str, Any] = {}
     stamps: dict[str, Any] = {}
+    reasons: dict[str, str] = {}
     for cid, cam in cams.items():
-        try:
-            payload = cam.poll()
-        except Exception:
-            continue
-        image = _colour(payload)
-        if not isinstance(image, np.ndarray) or image.size == 0:
+        image, reason, raw = _read_camera(cid, cam)
+        if image is None:
+            reasons[str(cid)] = reason or "missing"
             continue
         frames[cid] = image
         sensor_t = None
-        if isinstance(payload, dict):
+        if isinstance(raw, dict):
             for key in ("timestamp", "time", "t"):
-                if payload.get(key) is not None:
-                    sensor_t = payload.get(key)
+                if raw.get(key) is not None:
+                    sensor_t = raw.get(key)
                     break
         stamps[cid] = {"wall": time.time(), "sensor_t": sensor_t}
-    return frames, stamps
+    return frames, stamps, reasons
+
+
+def _write_collect_crash(directory: Any, message: str, reasons: dict[str, str]) -> None:
+    if directory is None:
+        return
+    path = Path(directory) / "collect_crash.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(message.rstrip() + "\n" + json.dumps(reasons, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def _read_vehicle(vehicle: Any) -> dict[str, Any]:

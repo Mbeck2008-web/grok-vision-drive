@@ -40,6 +40,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from python.data.raw_frames import controls_from_state
+
 SPEEDS_MPS = (8.0, 11.0, 14.0, 17.0, 10.0)
 SPEED_HOLD_S = 180.0
 WAYPOINT_HOLD_S = 180.0
@@ -254,7 +256,6 @@ def main(argv: list[str] | None = None) -> int:
         camera_due,
         camera_sidecar,
         capture_plan,
-        controls_from_state,
         frame_nbytes,
         plan_totals,
         yaw_rate_from_dirs,

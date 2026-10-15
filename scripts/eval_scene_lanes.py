@@ -36,6 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Check the recording only. Do not load weights.",
     )
+    parser.add_argument("--out", type=Path, default=None, help="CSV and PNG directory. Default: <data>/eval")
+    parser.add_argument("--worst", type=int, default=8, help="How many worst frames to save.")
     return parser
 
 
@@ -103,6 +105,7 @@ def main(argv: list[str] | None = None) -> int:
     net.eval()
     # One sequence. dt is the recorded step, not a fixed period.
     pred: list[float] = []
+    samples: list[dict] = []
     hidden = net.initial_state()
     from python.train.train_scene import _load_bgr
 
@@ -111,8 +114,21 @@ def main(argv: list[str] | None = None) -> int:
         dt = row.get("dt_s")
         with torch.no_grad():
             out, hidden = net(image, 0.0 if dt is None else float(dt), hidden)
-        center = lane_x_from_vector(out.lane_gt.detach().cpu().numpy())
+        vec = out.lane_gt.detach().float().cpu().numpy().reshape(-1)
+        tech = row.get("tech") if isinstance(row.get("tech"), dict) else row
+        gt_vec, _mask = lane_gt_from_record(tech if isinstance(tech, dict) else None)
+        center = lane_x_from_vector(vec)
         pred.append(float("nan") if center is None else float(center))
+        samples.append(
+            {
+                "i": row.get("i"),
+                "t": row.get("t"),
+                "pred": vec,
+                "gt": gt_vec,
+                "conf": None if vec.size < 1 else float(vec[-1]),
+                "image": image,
+            }
+        )
     scored = score_centers(pred, gt)
     r = scored["r"]
     rms = scored["rms"]
@@ -120,6 +136,18 @@ def main(argv: list[str] | None = None) -> int:
         f"eval holdout n={scored['n']} r={r if r is None else f'{r:.3f}'} "
         f"rms_m={rms if rms is None else f'{rms:.3f}'} bias_m={scored['bias']}"
     )
+    from python.debug.eval_report import lookahead_table, write_eval_bundle
+    from python.debug.remote_status import eval_dir
+
+    for item in lookahead_table(samples):
+        print(
+            f"eval y={item['y_m']} n={item['n']} r={item['r']} rms={item['rms']} bias={item['bias']}",
+            flush=True,
+        )
+    dest = args.out if args.out is not None else eval_dir()
+    if dest is not None:
+        write_eval_bundle(dest, samples, k=max(1, int(args.worst)))
+        print(f"eval wrote {dest}", flush=True)
     return 0
 
 

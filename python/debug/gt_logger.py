@@ -288,7 +288,13 @@ def _draw_bev(lanes_bev: list | None, lane_x: float | None) -> Any:
         if len(pts) >= 2:
             cv2.polylines(img, [np.array(pts, dtype=np.int32)], False, (40, 140, 60), 2, cv2.LINE_AA)
     if lane_x is not None:
-        cv2.circle(img, pix(float(lane_x), 8.0), 4, (40, 90, 200), -1, cv2.LINE_AA)
+        try:
+            x = float(lane_x)
+            y_px = 8.0
+        except (TypeError, ValueError):
+            x = None
+        if x is not None and x == x:
+            cv2.circle(img, pix(x, y_px), 4, (40, 90, 200), -1, cv2.LINE_AA)
     return img
 
 
@@ -399,6 +405,8 @@ class GroundTruthLogger:
         stitch: Any = None,
         lanes_bev: list | None = None,
         socket_busy: bool = False,
+        model_lane_x: float | None = None,
+        model_conf: float | None = None,
     ) -> dict[str, Any]:
         self._ensure_roads(bng, socket_busy)
         pos, heading, speed = _pose(vdata)
@@ -459,6 +467,8 @@ class GroundTruthLogger:
             "damage": damage,
             "damage_delta": delta,
             "lane_x": None if lane_x is None else float(lane_x),
+            "model_lane_x": None if model_lane_x is None else float(model_lane_x),
+            "model_conf": None if model_conf is None else float(model_conf),
             "gt_center_x": gt_center,
             "gt_left_x": gt_left,
             "gt_right_x": gt_right,
@@ -482,6 +492,20 @@ class GroundTruthLogger:
             handle.write(json.dumps(row, separators=(",", ":")) + "\n")
         self._ticks += 1
         self._maybe_frame(row, stitch, lanes_bev, lane_x, departed)
+        from python.debug.remote_status import note_live
+
+        note_live(
+            {
+                "lane_x": row.get("lane_x"),
+                "model_lane_x": row.get("model_lane_x"),
+                "model_conf": row.get("model_conf"),
+                "gt_center_x": row.get("gt_center_x"),
+                "lane_src": row.get("lane_src"),
+                "engaged": row.get("engaged"),
+                "speed_mps": row.get("speed_mps"),
+                "log": str(self.path),
+            }
+        )
         return row
 
     def _maybe_frame(
@@ -505,9 +529,17 @@ class GroundTruthLogger:
         name = f"{tag}_{self._ticks:06d}.jpg"
         off = row.get("lane_offset_m")
         off_s = "na" if off is None else f"{float(off):+.2f}"
+        model_x = row.get("model_lane_x")
+        model_c = row.get("model_conf")
+        gt_c = row.get("gt_center_x")
         hud = [
             f"t={float(row['t']):.2f} engaged={int(bool(row['engaged']))} in_lane={row.get('in_lane')}",
             f"offset={off_s} lane_x={row.get('lane_x')} src={row.get('lane_src')}",
+            (
+                f"model_x={'na' if model_x is None else f'{float(model_x):+.2f}'} "
+                f"conf={'na' if model_c is None else f'{float(model_c):.2f}'} "
+                f"gt={'na' if gt_c is None else f'{float(gt_c):+.2f}'}"
+            ),
             f"steer={float(row['steer']):+.3f} {row.get('steer_why')} off_road={row.get('off_road')}",
         ]
         save_debug_frame(self.frames / name, stitch=stitch, lanes_bev=lanes_bev, hud=hud, lane_x=lane_x)

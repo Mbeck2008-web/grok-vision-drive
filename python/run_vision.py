@@ -734,6 +734,8 @@ def main() -> None:
             )
 
             scene_stop = False
+            scene_lane_x = None
+            scene_conf = None
             if scene_lane is not None:
                 from python.data.strip_writer import compose_strip
                 from python.train.scene_lane_runtime import (
@@ -744,6 +746,8 @@ def main() -> None:
                 frames = getattr(bundle, "frames", None)
                 strip = compose_strip(frames if isinstance(frames, dict) else None)
                 lane_hat, conf = scene_lane.observe(strip, tick_dt)
+                scene_lane_x = lane_hat
+                scene_conf = conf
                 if scene_lane_decision(lane_hat, conf) != "lane":
                     scene_stop = True
                     pout.path_ego = []
@@ -1135,6 +1139,8 @@ def main() -> None:
                 f"release_cmd_skips={rel_skips} "
                 f"lane_x={'na' if lane_x is None else f'{lane_x:.4f}'} "
                 f"lane_y={'na' if lane_y is None else f'{lane_y:.2f}'} "
+                f"model_lane_x={'na' if scene_lane_x is None else f'{float(scene_lane_x):.4f}'} "
+                f"model_conf={'na' if scene_conf is None else f'{float(scene_conf):.3f}'} "
                 f"steer={float(applied.steer):+.4f} "
                 f"steer_why={lane_steer.reason} "
                 f"lane_src={getattr(pout, 'lane_source', 'none')} "
@@ -1202,6 +1208,8 @@ def main() -> None:
                     stitch=getattr(rig_view, "bgr", None),
                     lanes_bev=getattr(pout, "lanes_bev", None),
                     socket_busy=bool(getattr(bundle, "grab_read_blocked", False)),
+                    model_lane_x=None if scene_lane_x is None else float(scene_lane_x),
+                    model_conf=None if scene_conf is None else float(scene_conf),
                 )
 
             review_cap.write(

@@ -266,8 +266,32 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         cams = _attach_cameras(bng, vehicle, load_camera_config())
         writer = StripWriter(out)
+        from python.data.strip_writer import STRIP_ORDER
+        from python.debug.remote_status import CollectMeter, status_dir, write_collect_status
+
+        meter = CollectMeter(STRIP_ORDER)
+        status_root = status_dir()
         last_print = time.monotonic()
         last_ai: tuple[float, str | None] | None = None
+
+        def _publish(free: int | None, speed_now: float, route: str | None) -> None:
+            write_collect_status(
+                status_root,
+                meter.snapshot(
+                    elapsed_s=done_s,
+                    disk_bytes=directory_bytes(out),
+                    free_bytes=free,
+                    ai_speed_mps=speed_now,
+                    ai_mode="manual" if route else "span",
+                    ai_waypoint=route,
+                    out=str(out),
+                    target_s=target_s,
+                ),
+            )
+
+        _publish(None, speed_at(done_s), waypoint_at(done_s, names))
+        if status_root is not None:
+            print(f"collect status={status_root / 'collect.json'}", flush=True)
         while done_s < target_s:
             tick_mark = time.monotonic()
             elapsed = done_s
@@ -300,6 +324,12 @@ def main(argv: list[str] | None = None) -> int:
                 ego={"speed_mps": speed_now, "x": None if pos is None else pos[0], "y": None if pos is None else pos[1]},
                 tech=tech,
             )
+            mask = tech.get("lane_gt_valid") or []
+            try:
+                gt_ok = float(sum(mask)) > 0.0
+            except TypeError:
+                gt_ok = False
+            meter.note(set(frames), gt_ok)
             time.sleep(0.1)
             done_s += time.monotonic() - tick_mark
             if time.monotonic() - last_print >= 60.0:
@@ -308,13 +338,16 @@ def main(argv: list[str] | None = None) -> int:
                     free = check_data_path(out)
                 except DataDriveError as exc:
                     save_progress(progress_path, done_s, target_s)
+                    _publish(None, speed, waypoint)
                     print(format_disk_line(done_s, nbytes), flush=True)
                     print(f"collect stop {exc}", flush=True)
                     return 3
                 print(format_disk_line(done_s, nbytes, free), flush=True)
                 save_progress(progress_path, done_s, target_s)
+                _publish(free, speed, waypoint)
                 last_print = time.monotonic()
         save_progress(progress_path, done_s, target_s)
+        _publish(None, speed_at(done_s), waypoint_at(done_s, names))
         print(format_disk_line(done_s, directory_bytes(out)), flush=True)
         return 0
     finally:

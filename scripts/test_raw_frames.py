@@ -17,6 +17,7 @@ from python.data.raw_frames import (  # noqa: E402
     COLLECT_HZ,
     RawFrameWriter,
     camera_sidecar,
+    capture_plan,
     describe_raw_disk,
     gb_per_hour,
     load_raw_cameras,
@@ -30,6 +31,49 @@ from python.debug.dataset_check import validate_dataset  # noqa: E402
 from python.debug.lane_targets import tech_from_hit  # noqa: E402
 from python.sensors.cameras import load_camera_config  # noqa: E402
 from scripts.collect_scene_lanes import DISK_CHECK_S  # noqa: E402
+
+
+def check_rates_and_controls() -> None:
+    from python.data.raw_frames import CAMERA_HZ, camera_due, controls_from_state, plan_totals, yaw_rate_from_dirs
+
+    cfg = load_camera_config()
+    rows = capture_plan(cfg, 0.619)
+    totals = plan_totals(rows)
+    by_id = {row["id"]: row for row in rows}
+    assert by_id["main"]["hz"] == 10.0
+    assert by_id["narrow"]["hz"] == 10.0
+    assert by_id["wide"]["hz"] == 10.0
+    assert by_id["pillarL"]["hz"] == 2.0
+    assert by_id["rear"]["hz"] == 1.0
+    assert by_id["main"]["uncompressed_bytes"] == 640 * 480 * 3
+    assert totals["png_gb_per_hour"] < 80.0
+    assert totals["uncompressed_gb_per_hour"] < totals["png_gb_per_hour"] / 0.5
+    assert camera_due("main", 0.0, {})
+    assert not camera_due("main", 0.05, {"main": 0.0})
+    assert camera_due("main", 0.1, {"main": 0.0})
+    assert not camera_due("rear", 0.5, {"rear": 0.0})
+    assert camera_due("rear", 1.0, {"rear": 0.0})
+    sample = controls_from_state(
+        {
+            "pos": [1.0, 2.0, 3.0],
+            "dir": [0.0, 1.0, 0.0],
+            "vel": [0.0, 4.0, 0.0],
+            "electrics": {"steering_input": 0.2, "throttle_input": 0.3, "brake_input": 0.0},
+        }
+    )
+    assert sample["steer"] == 0.2 and sample["throttle"] == 0.3 and sample["brake"] == 0.0
+    assert abs(sample["speed_mps"] - 4.0) < 1e-6
+    yaw = yaw_rate_from_dirs((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), 0.5)
+    assert yaw is not None and abs(yaw - 3.14159265 / 2 / 0.5) < 1e-6
+    print(
+        f"plan png={totals['png_gb_per_hour']:.2f} GB/h "
+        f"uncompressed={totals['uncompressed_gb_per_hour']:.2f} GB/h"
+    )
+    for row in rows:
+        print(
+            f"  {row['id']} {row['width']}x{row['height']} @{row['hz']:.0f}Hz "
+            f"png={row['png_gb_per_hour']:.2f} GB/h"
+        )
 
 
 def check_disk_ceiling() -> None:
@@ -137,6 +181,7 @@ def check_pixels_roundtrip_and_load_time_stitch() -> None:
 
 def main() -> None:
     check_disk_ceiling()
+    check_rates_and_controls()
     check_pixels_roundtrip_and_load_time_stitch()
     print("raw frames ok")
 

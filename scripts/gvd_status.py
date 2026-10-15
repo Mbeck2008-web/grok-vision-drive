@@ -61,7 +61,8 @@ def summarize(directory: Path | None, eval_directory: Path | None) -> list[str]:
             _line(
                 "collect",
                 f"frames={collect.get('frames')} hz={collect.get('hz')} "
-                f"raw_gb_h={collect.get('raw_uncompressed_gb_per_hour')} "
+                f"raw_gb_h={collect.get('raw_png_gb_per_hour')} "
+                f"queue={collect.get('queue_depth')} dropped={collect.get('dropped_frames')} "
                 f"gt_valid_frac={collect.get('gt_valid_frac')} "
                 f"stale={collect.get('stale_cams')} "
                 f"free_gb={_gb(collect.get('disk_free_bytes'))} "

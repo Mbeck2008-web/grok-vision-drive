@@ -19,6 +19,23 @@ from python.data.strip_writer import compose_strip, read_state_jsonl
 # The collector sleeps 0.1 s, so 10 Hz is the planning rate. A slower poll
 # shows up in the measured minute line, not in this ceiling.
 COLLECT_HZ = 10.0
+# PNG size / uint8 size, measured on the 85 real BeamNG frames in
+# tests/fixtures/gt_run*.jpg (1336x96 strips). Mean 0.507, worst 0.619.
+PNG_RATIO_MEAN = 0.507
+PNG_RATIO_MAX = 0.619
+# Lane cameras stay at the collect rate. Pillars are slower. Repeaters and
+# the rear camera are context, so they are slower still.
+CAMERA_HZ = {
+    "narrow": 10.0,
+    "main": 10.0,
+    "wide": 10.0,
+    "pillarL": 2.0,
+    "pillarR": 2.0,
+    "repeatL": 1.0,
+    "repeatR": 1.0,
+    "rear": 1.0,
+}
+DRIVERS = ("beamng_ai", "gvd", "human")
 
 
 def uncompressed_tick_bytes(sizes: list[tuple[int, int, int]]) -> int:
@@ -32,6 +49,48 @@ def uncompressed_tick_bytes(sizes: list[tuple[int, int, int]]) -> int:
 def gb_per_hour(tick_bytes: int, hz: float) -> float:
     """GiB per hour, same 1024-based GB the disk lines already print."""
     return float(tick_bytes) * float(hz) * 3600.0 / (1024.0 ** 3)
+
+
+def camera_due(cam_id: str, now_s: float, last_s: Mapping[str, float], rates: Mapping[str, float] | None = None) -> bool:
+    """True when this camera's period has elapsed. ``now_s`` is monotonic."""
+    table = CAMERA_HZ if rates is None else rates
+    hz = float(table.get(str(cam_id), 0.0))
+    if hz <= 0.0:
+        return False
+    prev = last_s.get(str(cam_id))
+    if prev is None:
+        return True
+    return (float(now_s) - float(prev)) + 1e-4 >= (1.0 / hz)
+
+
+def capture_plan(cfg: Mapping[str, Any] | None, ratio: float = PNG_RATIO_MAX) -> list[dict[str, Any]]:
+    """Per-camera bytes and GB/h at ``CAMERA_HZ`` and a PNG/raw ratio."""
+    rows = []
+    for cam in camera_sidecar(cfg):
+        cid = str(cam["id"])
+        width, height = cam["resolution"]
+        raw = int(width) * int(height) * 3
+        hz = float(CAMERA_HZ.get(cid, 0.0))
+        rows.append(
+            {
+                "id": cid,
+                "width": int(width),
+                "height": int(height),
+                "channels": 3,
+                "hz": hz,
+                "uncompressed_bytes": raw,
+                "uncompressed_gb_per_hour": gb_per_hour(raw, hz),
+                "png_gb_per_hour": gb_per_hour(raw, hz) * float(ratio),
+            }
+        )
+    return rows
+
+
+def plan_totals(rows: list[Mapping[str, Any]]) -> dict[str, float]:
+    return {
+        "uncompressed_gb_per_hour": sum(float(row["uncompressed_gb_per_hour"]) for row in rows),
+        "png_gb_per_hour": sum(float(row["png_gb_per_hour"]) for row in rows),
+    }
 
 
 def describe_raw_disk(tick_bytes: int, hz: float) -> str:
@@ -242,6 +301,13 @@ class RawFrameWriter:
                 "Resize, stitch, and the ego-edge mask run in the trainer loader."
             ),
             "cameras": self.cameras,
+            "hz": dict(CAMERA_HZ),
+            "png_ratio_measured": {
+                "mean": PNG_RATIO_MEAN,
+                "max": PNG_RATIO_MAX,
+                "frames": 85,
+                "source": "tests/fixtures/gt_run*.jpg",
+            },
         }
         path = self.root / "cameras.json"
         path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -256,6 +322,7 @@ class RawFrameWriter:
         wheel: Mapping[str, Any] | None = None,
         pedals: Mapping[str, Any] | None = None,
         tech: Mapping[str, Any] | None = None,
+        driver: str | None = None,
     ) -> dict[str, Any]:
         src = frames or {}
         idx = self._n
@@ -304,13 +371,33 @@ class RawFrameWriter:
                 "far_m": pose.get("far_m"),
                 "resolution": pose.get("resolution"),
             }
+        ego_d = {str(k): _jsonable(v) for k, v in dict(ego or {}).items()}
+        wheel_d = {str(k): _jsonable(v) for k, v in dict(wheel or {}).items()}
+        pedals_d = {str(k): _jsonable(v) for k, v in dict(pedals or {}).items()}
+        who = str(driver or "")
+        if who and who not in DRIVERS:
+            who = "unknown"
         line = {
             "i": idx,
             "t": t_store,
             "dt_s": dt_s,
-            "ego": {str(k): v for k, v in dict(ego or {}).items()},
-            "wheel": {str(k): v for k, v in dict(wheel or {}).items()},
-            "pedals": {str(k): v for k, v in dict(pedals or {}).items()},
+            "driver": who or None,
+            "ego": ego_d,
+            "wheel": wheel_d,
+            "pedals": pedals_d,
+            "capture": {
+                "t": t_store,
+                "dt_s": dt_s,
+                "steer": wheel_d.get("steer", wheel_d.get("steering_input")),
+                "throttle": pedals_d.get("throttle"),
+                "brake": pedals_d.get("brake"),
+                "speed_mps": ego_d.get("speed_mps"),
+                "yaw_rate": ego_d.get("yaw_rate"),
+                "pos": ego_d.get("pos"),
+                "dir": ego_d.get("dir"),
+                "driver": who or None,
+                "gt": "gt.jsonl",
+            },
             "cams": cams,
         }
         _append_line(self.state_path, line)
@@ -380,6 +467,87 @@ def load_training_bgr(root: Path | str, index: int) -> np.ndarray:
     if int(bgr.shape[0]) != CANVAS_H or int(bgr.shape[1]) != CANVAS_W:
         raise ValueError(f"{path} is {bgr.shape[1]}x{bgr.shape[0]}, expected {CANVAS_W}x{CANVAS_H}")
     return bgr
+
+
+def _finite(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if out != out or out in (float("inf"), float("-inf")):
+        return None
+    return out
+
+
+def _pick(sources: tuple[Mapping[str, Any], ...], keys: tuple[str, ...]) -> float | None:
+    for src in sources:
+        for key in keys:
+            if key in src and src.get(key) is not None:
+                got = _finite(src.get(key))
+                if got is not None:
+                    return got
+    return None
+
+
+def _vec3(value: Any) -> list[float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) < 3:
+        return None
+    out = []
+    for item in value[:3]:
+        got = _finite(item)
+        if got is None:
+            return None
+        out.append(got)
+    return out
+
+
+def controls_from_state(state: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Steer, pedals, speed, yaw, and pose from a BeamNG vehicle state.
+
+    Missing fields stay None. This does not invent a driver.
+    """
+    state = dict(state or {})
+    electrics = state.get("electrics") if isinstance(state.get("electrics"), dict) else {}
+    sources = (electrics, state)
+    pos = _vec3(state.get("pos"))
+    direction = _vec3(state.get("dir") or state.get("forward"))
+    vel = _vec3(state.get("vel") or state.get("velocity"))
+    speed = _pick(sources, ("wheelspeed", "airspeed", "speed_mps"))
+    if speed is None and vel is not None:
+        speed = (vel[0] ** 2 + vel[1] ** 2 + vel[2] ** 2) ** 0.5
+    return {
+        "steer": _pick(sources, ("steering_input", "steering", "steer")),
+        "throttle": _pick(sources, ("throttle_input", "throttle")),
+        "brake": _pick(sources, ("brake_input", "brake")),
+        "speed_mps": speed,
+        "yaw_rate": _pick(sources, ("yaw_rate", "yawRate")),
+        "pos": pos,
+        "dir": direction,
+    }
+
+
+def yaw_rate_from_dirs(prev: Any, curr: Any, dt_s: float) -> float | None:
+    """Yaw rate about Z from two forward vectors. Radians per second, CCW positive."""
+    import math
+
+    a = _vec3(prev)
+    b = _vec3(curr)
+    dt = _finite(dt_s)
+    if a is None or b is None or dt is None or dt <= 0.0:
+        return None
+
+    def norm(v: list[float]) -> tuple[float, float]:
+        length = math.sqrt(v[0] ** 2 + v[1] ** 2 + v[2] ** 2)
+        if length < 1e-9:
+            return 0.0, 0.0
+        return v[0] / length, v[1] / length
+
+    ax, ay = norm(a)
+    bx, by = norm(b)
+    dot = max(-1.0, min(1.0, ax * bx + ay * by))
+    return math.atan2(ax * by - ay * bx, dot) / dt
 
 
 def list_raw_images(root: Path | str) -> list[Path]:

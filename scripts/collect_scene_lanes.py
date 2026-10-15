@@ -114,6 +114,15 @@ def format_disk_line(
     return line
 
 
+def format_queue_line(stats: dict | None) -> str:
+    stats = stats or {}
+    return (
+        f"queue={int(stats.get('queue_depth') or 0)} "
+        f"peak={int(stats.get('queue_peak') or 0)} "
+        f"dropped={int(stats.get('dropped_frames') or 0)}"
+    )
+
+
 def load_progress(path: Path) -> float:
     if not path.is_file():
         return 0.0
@@ -221,14 +230,19 @@ def main(argv: list[str] | None = None) -> int:
         scene_lanes_dir,
     )
     from python.data.raw_frames import (
-        COLLECT_HZ,
+        CAMERA_HZ,
+        PNG_RATIO_MAX,
+        PNG_RATIO_MEAN,
         RawFrameWriter,
+        camera_due,
         camera_sidecar,
-        describe_raw_disk,
+        capture_plan,
+        controls_from_state,
         frame_nbytes,
-        gb_per_hour,
-        rig_tick_bytes,
+        plan_totals,
+        yaw_rate_from_dirs,
     )
+    from python.data.raw_queue import RawWriteQueue
     from python.debug.gt_geom import heading_from_dir, project_road
     from python.debug.gt_logger import load_road_polys
     from python.debug.lane_targets import tech_from_hit
@@ -265,18 +279,37 @@ def main(argv: list[str] | None = None) -> int:
         print(f"collect already reached {done_s / 60.0:.1f} min in {out}")
         return 0
     cam_cfg = load_camera_config()
-    ceiling_bytes = rig_tick_bytes(cam_cfg)
-    ceiling_gb = gb_per_hour(ceiling_bytes, COLLECT_HZ)
+    plan = capture_plan(cam_cfg, PNG_RATIO_MAX)
+    totals = plan_totals(plan)
+    ceiling_gb = float(totals["png_gb_per_hour"])
     print(
         f"collect resume={done_s / 60.0:.1f} min target={target_s / 60.0:.1f} min out={out} "
         f"mode={'waypoints ' + ','.join(names) if names else 'span traffic-free'}",
         flush=True,
     )
-    print(describe_raw_disk(ceiling_bytes, COLLECT_HZ) + " stop under 20 GB free", flush=True)
+    print(
+        f"collect png ratio measured mean={PNG_RATIO_MEAN:.3f} max={PNG_RATIO_MAX:.3f} "
+        f"on 85 real frames (tests/fixtures/gt_run*.jpg)",
+        flush=True,
+    )
+    for row in plan:
+        print(
+            f"collect cam {row['id']} {row['width']}x{row['height']}x{row['channels']} "
+            f"@ {row['hz']:.0f} Hz raw={row['uncompressed_bytes']} B "
+            f"png={row['png_gb_per_hour']:.2f} GB/h",
+            flush=True,
+        )
+    print(
+        f"collect plan png={totals['png_gb_per_hour']:.1f} GB/h "
+        f"uncompressed={totals['uncompressed_gb_per_hour']:.1f} GB/h "
+        f"stop under 20 GB free",
+        flush=True,
+    )
     bng = open_tech_beamngpy(
         host, port, home=cfg.get("home") or None, user=cfg.get("user") or None, launch=False,
     )
     widen_socket_timeout(bng, 90.0)
+    writer = None
     try:
         if args.reload_level:
             print(f"collect reload level={args.reload_level}", flush=True)
@@ -296,7 +329,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"collect no road network ({note})", file=sys.stderr)
             return 2
         cams = _attach_cameras(bng, vehicle, cam_cfg)
-        writer = RawFrameWriter(out, camera_sidecar(cam_cfg))
+        writer = RawWriteQueue(RawFrameWriter(out, camera_sidecar(cam_cfg)), max_depth=8)
         from python.data.strip_writer import STRIP_ORDER
         from python.debug.remote_status import CollectMeter, status_dir, write_collect_status
 
@@ -305,6 +338,9 @@ def main(argv: list[str] | None = None) -> int:
         last_print = time.monotonic()
         last_disk = last_print
         last_ai: tuple[float, str | None] | None = None
+        last_cam: dict[str, float] = {}
+        prev_dir: list[float] | None = None
+        prev_dir_t: float | None = None
 
         def _publish(free: int | None, speed_now: float, route: str | None) -> None:
             payload = meter.snapshot(
@@ -317,8 +353,9 @@ def main(argv: list[str] | None = None) -> int:
                 out=str(out),
                 target_s=target_s,
             )
-            payload["raw_uncompressed_bytes_per_tick"] = int(ceiling_bytes)
-            payload["raw_uncompressed_gb_per_hour"] = float(ceiling_gb)
+            payload["raw_png_gb_per_hour"] = float(ceiling_gb)
+            payload["raw_uncompressed_gb_per_hour"] = float(totals["uncompressed_gb_per_hour"])
+            payload.update(writer.stats())
             write_collect_status(status_root, payload)
 
         _publish(None, speed_at(done_s), waypoint_at(done_s, names))
@@ -335,9 +372,34 @@ def main(argv: list[str] | None = None) -> int:
                 last_ai = (speed, waypoint)
                 print(f"collect ai speed={speed:.0f} m/s route={waypoint or 'span'}", flush=True)
             frames, stamps = _poll_cameras(cams)
-            if meter.frames == 0 and frames:
-                print(describe_raw_disk(frame_nbytes(frames), COLLECT_HZ) + " (first tick)", flush=True)
-            pos, direction, speed_now = _pose(vehicle)
+            mono = time.monotonic()
+            due: dict[str, Any] = {}
+            due_stamps: dict[str, Any] = {}
+            held: list[tuple[str, float | None]] = []
+            for cid, image in frames.items():
+                if not camera_due(cid, mono, last_cam):
+                    continue
+                held.append((cid, last_cam.get(cid)))
+                last_cam[cid] = mono
+                due[cid] = image
+                if cid in stamps:
+                    due_stamps[cid] = stamps[cid]
+            if meter.frames == 0 and due:
+                print(
+                    f"collect first tick cams={sorted(due)} bytes={frame_nbytes(due)}",
+                    flush=True,
+                )
+            sample = _read_vehicle(vehicle)
+            pos = sample.get("pos")
+            direction = sample.get("dir")
+            now = time.time()
+            if sample.get("yaw_rate") is None:
+                sample["yaw_rate"] = yaw_rate_from_dirs(
+                    prev_dir, direction, 0.0 if prev_dir_t is None else now - prev_dir_t,
+                )
+            if direction is not None:
+                prev_dir = direction
+                prev_dir_t = now
             heading = None
             if direction is not None:
                 heading = heading_from_dir(direction[0], direction[1])
@@ -350,14 +412,30 @@ def main(argv: list[str] | None = None) -> int:
                 None if hit is None else hit.lane_width_m,
                 None if hit is None else hit.off_road,
             )
-            now = time.time()
-            writer.write(
-                frames,
+            queued = writer.submit(
+                due,
                 t=now,
-                timestamps=stamps,
-                ego={"speed_mps": speed_now, "x": None if pos is None else pos[0], "y": None if pos is None else pos[1]},
+                timestamps=due_stamps,
+                ego={
+                    "speed_mps": sample.get("speed_mps"),
+                    "yaw_rate": sample.get("yaw_rate"),
+                    "pos": pos,
+                    "dir": direction,
+                    "x": None if pos is None else pos[0],
+                    "y": None if pos is None else pos[1],
+                },
+                wheel={"steer": sample.get("steer")},
+                pedals={"throttle": sample.get("throttle"), "brake": sample.get("brake")},
                 tech=tech,
+                driver="beamng_ai",
             )
+            if not queued:
+                for cid, prev in held:
+                    if prev is None:
+                        last_cam.pop(cid, None)
+                    else:
+                        last_cam[cid] = prev
+                print(f"collect drop {format_queue_line(writer.stats())}", flush=True)
             mask = tech.get("lane_gt_valid") or []
             try:
                 gt_ok = float(sum(mask)) > 0.0
@@ -375,19 +453,24 @@ def main(argv: list[str] | None = None) -> int:
                     save_progress(progress_path, done_s, target_s)
                     _publish(None, speed, waypoint)
                     print(format_disk_line(done_s, nbytes, ceiling_gb_per_hour=ceiling_gb), flush=True)
+                    print(format_queue_line(writer.stats()), flush=True)
                     print(f"collect stop {exc}", flush=True)
                     return 3
                 last_disk = now_m
                 if now_m - last_print >= 60.0:
                     print(format_disk_line(done_s, nbytes, free, ceiling_gb_per_hour=ceiling_gb), flush=True)
+                    print(format_queue_line(writer.stats()), flush=True)
                     save_progress(progress_path, done_s, target_s)
                     _publish(free, speed, waypoint)
                     last_print = now_m
         save_progress(progress_path, done_s, target_s)
         _publish(None, speed_at(done_s), waypoint_at(done_s, names))
         print(format_disk_line(done_s, directory_bytes(out), ceiling_gb_per_hour=ceiling_gb), flush=True)
+        print(format_queue_line(writer.stats()), flush=True)
         return 0
     finally:
+        if writer is not None:
+            writer.close()
         release_tech_beamngpy(bng)
 
 
@@ -465,7 +548,8 @@ def _poll_cameras(cams: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]
     return frames, stamps
 
 
-def _pose(vehicle: Any) -> tuple[tuple[float, float, float] | None, tuple[float, float, float] | None, float | None]:
+def _read_vehicle(vehicle: Any) -> dict[str, Any]:
+    """One sensor poll. Controls are whatever the vehicle state actually holds."""
     try:
         if hasattr(vehicle, "poll_sensors"):
             vehicle.poll_sensors()
@@ -477,21 +561,12 @@ def _pose(vehicle: Any) -> tuple[tuple[float, float, float] | None, tuple[float,
             state = vehicle.sensors.poll() if hasattr(vehicle, "sensors") else None
         except Exception:
             state = None
-    if not isinstance(state, dict):
-        return None, None, None
-    pos = state.get("pos")
-    direction = state.get("dir")
-    vel = state.get("vel")
-    speed = None
-    if isinstance(vel, (list, tuple)) and len(vel) >= 2:
-        speed = (float(vel[0]) ** 2 + float(vel[1]) ** 2) ** 0.5
-    pos_t = None
-    if isinstance(pos, (list, tuple)) and len(pos) >= 3:
-        pos_t = (float(pos[0]), float(pos[1]), float(pos[2]))
-    dir_t = None
-    if isinstance(direction, (list, tuple)) and len(direction) >= 2:
-        dir_t = (float(direction[0]), float(direction[1]), float(direction[2]) if len(direction) > 2 else 0.0)
-    return pos_t, dir_t, speed
+    sample = controls_from_state(state if isinstance(state, dict) else None)
+    if sample.get("pos") is None and isinstance(state, dict):
+        pos = state.get("pos")
+        if isinstance(pos, (list, tuple)) and len(pos) >= 3:
+            sample["pos"] = [float(pos[0]), float(pos[1]), float(pos[2])]
+    return sample
 
 
 if __name__ == "__main__":

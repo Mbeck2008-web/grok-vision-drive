@@ -548,7 +548,7 @@ def main() -> None:
     lane_steer = LaneSteerState()
     launch_guard = LaunchGuard()
     gt_log = None
-    if gt_log_enabled(bool(args.gt_log)):
+    if gt_log_enabled(bool(args.gt_log)) or args.lane_source == "gt":
         gt_log = GroundTruthLogger.open()
         print(f"[GVD] ground truth -> {gt_log.path}", flush=True)
     try:

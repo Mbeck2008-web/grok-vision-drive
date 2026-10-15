@@ -50,6 +50,7 @@ def check_wire_never_sends_the_reverse_pedal() -> None:
     for steer, throttle, brake in samples:
         kw = tech_control_kwargs(steer, throttle, brake, speed_mps=8.0)
         _assert_forward(kw)
+        assert float(kw.get("brake") or 0.0) == 0.0, kw
         if throttle <= 1e-6 and brake > 0.01:
             assert kw["parkingbrake"] == 1.0 and kw["brake"] == 0.0, kw
     assert is_arcade_reverse_hold({"throttle": 0.0, "brake": 0.8, "parkingbrake": 0.0})

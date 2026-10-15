@@ -433,22 +433,22 @@ def tech_control_kwargs(
     steer_v = _clip_steer(steer)
     throttle_v = _clip01(throttle)
     brake_v = _clip01(brake)
-    if throttle_v > 1e-6:
-        return {
-            "steering": steer_v,
-            "throttle": throttle_v,
-            "brake": brake_v,
-            "parkingbrake": 0.0,
-            "clutch": 0.0,
-        }
-    # Any service brake with no throttle is arcade reverse, including a partial
-    # pedal. Holds and trims both become the parking brake. Coast is brake 0.
+    # A service brake is never sent. With or without throttle, arcade can
+    # treat that pedal as reverse. A requested brake is the parking brake.
     if brake_v > 0.01:
         return {
             "steering": steer_v,
             "throttle": 0.0,
             "brake": 0.0,
             "parkingbrake": 1.0,
+        }
+    if throttle_v > 1e-6:
+        return {
+            "steering": steer_v,
+            "throttle": throttle_v,
+            "brake": 0.0,
+            "parkingbrake": 0.0,
+            "clutch": 0.0,
         }
     return {
         "steering": steer_v,

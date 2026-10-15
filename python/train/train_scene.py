@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import faulthandler
 import math
 import sys
 import time
@@ -124,11 +125,49 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _load_bgr(root: Path, index: int) -> Any:
-    """Training canvas. Raw cameras are stitched here, not in the recording."""
-    from python.data.raw_frames import load_training_bgr
+# Two optimizer steps on a handful of frames. Longer than a slow disk read,
+# short enough that a stuck Start button or a decode wait does not sit for
+# a quarter hour with no stack.
+DRY_RUN_TIMEOUT_S = 300.0
 
-    return load_training_bgr(root, index)
+
+def _load_bgr(root: Path, index: int) -> Any:
+    """Training canvas. Raw cameras are stitched here, not in the recording.
+
+    A PNG that does not decode is read from ``raw_repaired`` when that copy
+    exists. The original file is left as it was written.
+    """
+    from python.train.scene_loader import load_canvas
+
+    return load_canvas(root, index)
+
+
+def arm_dry_run_watchdog(timeout_s: float = DRY_RUN_TIMEOUT_S) -> None:
+    """Dump every thread and exit if the dry run is still inside ``timeout_s``."""
+    faulthandler.enable(file=sys.stderr, all_threads=True)
+    print(
+        f"[GVD] dry-run watchdog {float(timeout_s):.0f}s; "
+        "a hang dumps every thread stack and exits",
+        flush=True,
+    )
+    faulthandler.dump_traceback_later(
+        float(timeout_s),
+        repeat=False,
+        file=sys.stderr,
+        exit=True,
+    )
+
+
+def disarm_dry_run_watchdog() -> None:
+    faulthandler.cancel_dump_traceback_later()
+
+
+def _confirm_start(view: TrainWindow, *, dry_run: bool) -> bool:
+    """Dry-run starts immediately. A full run still waits for the Start button."""
+    if dry_run:
+        print("[GVD] dry-run: starting without the Start button", flush=True)
+        return True
+    return _wait_for_start(view)
 
 
 def _autocast(enabled: bool) -> Any:
@@ -388,6 +427,11 @@ def _optimizer_step(
     stride_mark: SceneState | None = None
     step_at = max(1, int(stride))
     for tick, row in enumerate(rows):
+        if trace is not None and trace.get("print_shapes"):
+            print(
+                f"[GVD] scene load {tick + 1}/{len(rows)} i={row.get('i')}",
+                flush=True,
+            )
         frame, row = _frame_row(root, row)
         image = torch.from_numpy(frame).to(device)
         dt = torch.tensor([step_dt(row.get("dt_s"))], dtype=torch.float32, device=device)
@@ -685,9 +729,17 @@ def train_directory(
 
     root = Path(root)
     from python.data.raw_frames import load_scene_rows
+    from python.train.scene_loader import default_num_workers
 
+    print("[GVD] scene index: reading state.jsonl", flush=True)
     rows = load_scene_rows(root)
-    file_bytes = measure_driving_file(root)
+    print(f"[GVD] scene index: {len(rows)} rows", flush=True)
+    print("[GVD] scene index: measuring files", flush=True)
+
+    def _index_progress(n_files: int, n_bytes: int) -> None:
+        print(f"[GVD] scene index: {n_files} files {n_bytes} bytes", flush=True)
+
+    file_bytes = measure_driving_file(root, progress=_index_progress)
     if free_vram_bytes is None:
         free_vram_bytes = read_free_vram_bytes()
     if free_ram_bytes is None:
@@ -773,21 +825,13 @@ def train_directory(
     batch = 1
     recommended = bool(plan.recommended) and device.type == "cuda"
     note = "recommended" if recommended else "not recommended"
+    workers = default_num_workers()
     print(
         f"[GVD] scene fit file={file_bytes} free_vram={int(free_vram_bytes)} "
         f"free_ram={int(free_ram_bytes)} device={device.type} batch={batch} "
-        f"chunk={chunk_len} {note}",
+        f"chunk={chunk_len} workers={workers} {note}",
         flush=True,
     )
-    view.open()
-    supervised = 0
-    paused_exit = False
-    epoch = 0
-    cursor = 0
-    done = 0
-    last_loss: float | None = None
-    windows = 0
-    started = time.perf_counter()
     from python.debug.remote_status import (
         CHECKPOINT_S,
         DRY_RUN_STEPS,
@@ -803,6 +847,36 @@ def train_directory(
     )
 
     debug_dir = status_dir(status_root)
+    write_heartbeat(
+        debug_dir,
+        {
+            "kind": "train",
+            "phase": "loading",
+            "updated": time.time(),
+            "step": 0,
+            "epoch": 0,
+            "loss": None,
+            "eta_s": None,
+            "lr": float(holder.get("lr", lr)),
+            "device": str(device.type),
+            "strips": str(root),
+            "free_ram_bytes": int(free_ram_bytes),
+            "free_vram_bytes": int(free_vram_bytes),
+            "workers": int(workers),
+            "dry_run": bool(dry_run),
+        },
+    )
+    print(f"[GVD] scene status: heartbeat {debug_dir}", flush=True)
+    if dry_run:
+        arm_dry_run_watchdog(DRY_RUN_TIMEOUT_S)
+    supervised = 0
+    paused_exit = False
+    epoch = 0
+    cursor = 0
+    done = 0
+    last_loss: float | None = None
+    windows = 0
+    started = time.perf_counter()
     last_batch: dict[str, Any] = {"step": 0, "rows": []}
     last_heart = time.monotonic()
     last_ckpt = time.monotonic()
@@ -1125,7 +1199,8 @@ def train_directory(
             print(f"[GVD] sanity lane_gt={lane_loss} step={done} ok={sanity_ok}", flush=True)
 
     try:
-        if not _wait_for_start(view):
+        view.open()
+        if not _confirm_start(view, dry_run=dry_run):
             paused_exit = True
         elif dry_run or sanity:
             view.mark_running()
@@ -1204,6 +1279,8 @@ def train_directory(
         write_crash(debug_dir, traceback.format_exc(), last_batch)
         raise
     finally:
+        if dry_run:
+            disarm_dry_run_watchdog()
         if own_view:
             view.close()
     return {

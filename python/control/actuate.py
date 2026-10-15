@@ -1305,6 +1305,12 @@ def make_actuator(vehicle: Any | None = None, prefer_beamngpy: bool = True) -> A
 # steering_input ±1 is ±30 deg at the road wheel (ego.steer_deg = input * 30).
 STEER_LOCK_DEG = 30.0
 STEER_LOCK_RAD = math.radians(STEER_LOCK_DEG)
+# gt_ctrl1 (2026-10-15, --lane-source gt). Vehicle heading, integrated from
+# commanded steer, matches this bicycle best at gain 0.89 and the 0.12 s
+# frame delay below: rms 0.029 rad over the moving portion before the
+# departure. Gain 1.0 at the same delay is 0.048 rad. The command reaches
+# the wheels. It is not a sign error and it is not a stuck actuator.
+ACTUATOR_YAW_GAIN = 0.89
 # Pure-pursuit wheelbase. The old law divided lateral meters by this same 2.5
 # and sent the quotient as steering_input, so 2.5 m of offset was full lock.
 WHEELBASE_M = 2.5

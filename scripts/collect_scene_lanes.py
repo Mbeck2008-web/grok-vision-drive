@@ -27,7 +27,9 @@ counting until ``--minutes`` is reached.
 Excursions (weaves, lane changes, recoveries) are on unless
 ``--no-excursions``. ``--maps`` rotates whole segments. The first minute
 is a smoke collect: if those PNGs do not decode, the process stops.
+``--check-maps`` loads each level as a scenario and exits without recording.
 
+    py -3 scripts\\collect_scene_lanes.py --check-maps --maps west_coast_usa,italy,east_coast_usa,utah,jungle_rock_island
     py -3 scripts\\collect_scene_lanes.py --minutes 120 --maps west_coast_usa,italy,east_coast_usa,utah,jungle_rock_island --segment-min 12 --smoke-s 60 --speed-min 8 --speed-max 17
 """
 from __future__ import annotations
@@ -224,6 +226,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-excursions", action="store_true", help="Stay centered. Default weaves and lane changes.")
     parser.add_argument("--smoke-s", type=float, default=60.0, help="Collect this many seconds, check PNG decode, then continue. 0 skips the check.")
     parser.add_argument("--no-vary-env", action="store_true", help="Do not change weather or time of day on each segment.")
+    parser.add_argument(
+        "--check-maps",
+        action="store_true",
+        help="Load each map, print spawn, road edges, and cameras, then exit.",
+    )
     return parser
 
 
@@ -332,33 +339,66 @@ def enter_map(
     level: str,
     cfg: dict[str, Any],
     cams: dict[str, Any] | None,
-) -> tuple[Any, list[Any], dict[str, Any], str]:
-    """Drop the old cameras, open the level, spawn if needed, attach every camera.
+) -> Any:
+    """Drop the old cameras, start a scenario, then attach every camera.
 
-    Returns ``(vehicle, roads, cameras, error)``. The error is empty on success
-    and is safe to store in ``status/collect.json``.
+    The returned object's ``error`` is empty on success and is safe to store
+    in ``status/collect.json``. Roads are read only after the scenario starts.
     """
-    from python.collect.level_session import begin_level, is_session_error, session_text
+    from python.collect.level_session import OpenedLevel, begin_level, is_session_error, session_text
 
     drop_cameras(cams)
     try:
-        vehicle, roads, err = begin_level(bng, level)
+        opened = begin_level(bng, level)
     except Exception as exc:
         if is_session_error(exc):
-            return None, [], {}, session_text(exc)
+            return OpenedLevel(error=session_text(exc))
         raise
-    if err or vehicle is None:
-        return None, list(roads or []), {}, err or "no vehicle after load"
-    if not roads:
-        return vehicle, [], {}, "no road network"
+    if opened.error or opened.vehicle is None:
+        opened.error = opened.error or "no vehicle after load"
+        return opened
+    if not opened.roads:
+        opened.error = opened.error or "no road network"
+        return opened
     try:
-        attached = _attach_cameras(bng, vehicle, cfg)
+        opened.cameras = _attach_cameras(bng, opened.vehicle, cfg)
     except Exception as exc:
         if is_session_error(exc) or isinstance(exc, RuntimeError):
-            return vehicle, list(roads), {}, session_text(exc)
+            opened.error = session_text(exc)
+            return opened
         raise
-    print(f"collect cameras {len(attached)} ({', '.join(sorted(attached))})", flush=True)
-    return vehicle, list(roads), attached, ""
+    print(f"collect cameras {len(opened.cameras)} ({', '.join(sorted(opened.cameras))})", flush=True)
+    return opened
+
+
+def format_check_line(level: str, opened: Any) -> str:
+    """One pre-flight line: spawn, edge count, camera count."""
+    spawn = getattr(opened, "spawn", None)
+    pos = "na" if not spawn else f"({float(spawn[0]):.1f},{float(spawn[1]):.1f},{float(spawn[2]):.1f})"
+    source = str(getattr(opened, "spawn_source", "") or "na")
+    edges = len(getattr(opened, "roads", None) or [])
+    cameras = len(getattr(opened, "cameras", None) or {})
+    error = str(getattr(opened, "error", "") or "")
+    if not error and (edges < 1 or cameras < 1):
+        error = "missing edges or cameras"
+    line = f"collect check {level} spawn={pos} source={source} edges={edges} cameras={cameras}"
+    if error:
+        line += f" error={error}"
+    return line
+
+
+def run_map_checks(bng: Any, levels: tuple[str, ...] | list[str], cfg: dict[str, Any]) -> int:
+    """Load each level, report spawn/edges/cameras, and exit. No recording."""
+    failed = 0
+    cams: dict[str, Any] = {}
+    for level in levels:
+        opened = enter_map(bng, level, cfg, cams)
+        cams = dict(getattr(opened, "cameras", None) or {})
+        print(format_check_line(level, opened), flush=True)
+        if opened.error or not opened.roads or not opened.cameras:
+            failed += 1
+    drop_cameras(cams)
+    return 2 if failed else 0
 
 
 def record_session_failure(status_root: Any, message: str) -> None:
@@ -462,6 +502,10 @@ def main(argv: list[str] | None = None) -> int:
         random.Random(1).shuffle(bag)
         names = tuple(bag)
     map_names = tuple(part.strip() for part in str(args.maps).split(",") if part.strip())
+    if args.check_maps and not map_names:
+        from python.collect.auto_mode import DEFAULT_MAPS
+
+        map_names = tuple(DEFAULT_MAPS)
     segment_s = max(60.0, float(args.segment_min) * 60.0)
     excursions_on = not bool(args.no_excursions)
     vary_env = bool(map_names) and not bool(args.no_vary_env)
@@ -545,13 +589,19 @@ def main(argv: list[str] | None = None) -> int:
                     return 2
         elif args.reload_level:
             print(f"collect reload level={args.reload_level}", flush=True)
+        if args.check_maps:
+            code = run_map_checks(bng, map_names, cam_cfg)
+            if code != 0:
+                record_session_failure(status_root, "check-maps failed")
+            return code
         # A map rotation enters the level on the first segment, after the
-        # writer exists. A single-level run needs the vehicle before the loop.
+        # writer exists. A single-level run keeps the scenario already started.
         vehicle = None
         roads: list[Any] = []
         cams: dict[str, Any] = {}
         if not map_names:
-            vehicle, roads, cams, err = enter_map(bng, str(args.reload_level or ""), cam_cfg, {})
+            opened = enter_map(bng, str(args.reload_level or ""), cam_cfg, {})
+            vehicle, roads, cams, err = opened.vehicle, opened.roads, opened.cameras, opened.error
             if err or vehicle is None or not roads:
                 message = err or "no vehicle after load"
                 record_session_failure(status_root, message)
@@ -651,7 +701,8 @@ def main(argv: list[str] | None = None) -> int:
             segment_id = f"{map_name}#{seg_index}" if map_name else "current#0"
             if map_name and map_name != loaded_map:
                 print(f"collect segment {segment_id}", flush=True)
-                vehicle, roads, cams, err = enter_map(bng, map_name, cam_cfg, cams)
+                opened = enter_map(bng, map_name, cam_cfg, cams)
+                vehicle, roads, cams, err = opened.vehicle, opened.roads, opened.cameras, opened.error
                 if err or vehicle is None or not roads or not cams:
                     last_error = err or "no vehicle after load"
                     save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)

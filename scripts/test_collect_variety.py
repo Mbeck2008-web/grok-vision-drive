@@ -402,11 +402,15 @@ class _ScenarioApi:
     def get_road_network(self, **kwargs: object) -> dict[str, object]:
         del kwargs
         self.host.road_reads += 1
+        # Freeroam is not a started scenario. Edges exist only after start().
+        if self.starts < 1:
+            self.host.early_road = True
+            raise _NoVehicle("Need to be in a started scenario to get its DecalRoad data.")
         return {
             "roads": {
                 "main": [
-                    {"middle": [0, 0, 12], "left": [-2, 0, 12], "right": [2, 0, 12]},
-                    {"middle": [0, 400, 12], "left": [-2, 400, 12], "right": [2, 400, 12]},
+                    {"middle": [-717.121, 0, 118], "left": [-724, 0, 118], "right": [-710, 0, 118]},
+                    {"middle": [-717.121, 500, 118], "left": [-724, 500, 118], "right": [-710, 500, 118]},
                 ]
             }
         }
@@ -427,6 +431,7 @@ class _Host:
         self.ego = _Ego()
         self.player_calls = 0
         self.road_reads = 0
+        self.early_road = False
         self.commands: list[str] = []
         self.levels = levels
         self.vehicles = _Vehicles(self)
@@ -510,21 +515,31 @@ def check_level_load_spawns_and_switches() -> None:
             spawn_works=True,
             levels={"west_coast_usa": {"levelName": "west_coast_usa"}, "italy": {}},
         )
-        vehicle, roads, cams, err = collect.enter_map(host, "west_coast_usa", {}, {})
-        assert err == "", err
-        assert vehicle is host.ego
-        assert roads and len(cams) == 8
+        opened = collect.enter_map(host, "west_coast_usa", {}, {})
+        assert opened.error == "", opened.error
+        assert opened.vehicle is host.ego
+        assert opened.roads and len(opened.cameras) == 8
+        assert opened.spawn_source == "known"
+        assert abs(float(opened.spawn[0]) + 717.121) < 0.05
         assert host.scenario.starts == 1
         assert host.scenario.loaded and getattr(host.scenario.loaded[-1], "level", "") == "west_coast_usa"
+        started_at = getattr(host.scenario.loaded[0], "pos", None)
+        if started_at is not None:
+            assert abs(float(started_at[1]) - 101.0) < 0.05
+        assert host.early_road is False
         assert host.player_calls >= 1
-        vehicle2, roads2, cams2, err2 = collect.enter_map(host, "italy", {}, cams)
-        assert err2 == "", err2
-        assert vehicle2 is host.ego and roads2
-        assert len(attached) == 2 and len(cams2) == 8
+        assert not any("startFreeroam" in line for line in host.commands)
+        opened2 = collect.enter_map(host, "italy", {}, opened.cameras)
+        assert opened2.error == "", opened2.error
+        assert opened2.vehicle is host.ego and opened2.roads
+        assert opened2.spawn_source == "centerline"
+        assert len(attached) == 2 and len(opened2.cameras) == 8
         assert len(removed) == 8
         assert host.scenario.starts == 2
         assert host.road_reads >= 2
-        assert any("startFreeroam(\"italy\")" in line for line in host.commands)
+        assert host.early_road is False
+        assert any("setPositionRotation" in line for line in host.commands)
+        assert not any("startFreeroam" in line for line in host.commands)
     finally:
         collect._attach_cameras = previous_attach
         _restore_clock(level_session, previous)
@@ -595,13 +610,77 @@ def check_missing_level_and_bng_error_are_status() -> None:
             assert code == 2, (code, buf.getvalue())
             assert dead.player_calls > 1
             assert dead.scenario.starts == 1
-            assert dead.road_reads >= 1
+            assert dead.early_road is False
             status = json.loads((root / "status" / "collect.json").read_text(encoding="utf-8"))
             crash = (root / "status" / "collect_crash.txt").read_text(encoding="utf-8")
             assert "BNGError" in str(status.get("error"))
             assert "There is no vehicle" in str(status.get("error"))
             assert "BNGError" in crash and "There is no vehicle" in crash
             assert "Traceback" not in buf.getvalue()
+    finally:
+        _restore_clock(level_session, previous)
+
+
+def check_map_preflight() -> None:
+    import io
+    import scripts.collect_scene_lanes as collect
+    import python.sensors.tech as tech
+
+    level_session, previous = _fast_clock()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            host = _Host(
+                spawn_works=True,
+                levels={
+                    "west_coast_usa": {"levelName": "west_coast_usa"},
+                    "italy": {},
+                    "east_coast_usa": {},
+                },
+            )
+
+            def _open(*args: object, **kwargs: object) -> _Host:
+                del args, kwargs
+                return host
+
+            tech.open_tech_beamngpy = _open  # type: ignore[assignment]
+            tech.widen_socket_timeout = lambda *a, **k: None  # type: ignore[assignment]
+            tech.release_tech_beamngpy = lambda *a, **k: None  # type: ignore[assignment]
+            previous_attach = collect._attach_cameras
+
+            def _attach(bng: object, vehicle: object, cfg: object) -> dict[str, object]:
+                del bng, vehicle, cfg
+                from python.sensors.cameras import CAM_IDS
+
+                return {cid: object() for cid in CAM_IDS}
+
+            collect._attach_cameras = _attach
+            buf = io.StringIO()
+            old_out = sys.stdout
+            sys.stdout = buf
+            try:
+                code = collect.main(
+                    [
+                        "--check-maps",
+                        "--maps",
+                        "utah,west_coast_usa,italy",
+                        "--data-dir",
+                        str(root),
+                        "--out",
+                        str(root / "scene"),
+                    ]
+                )
+            finally:
+                sys.stdout = old_out
+                collect._attach_cameras = previous_attach
+            text = buf.getvalue()
+            assert code == 0, (code, text)
+            assert "collect skip level utah" in text
+            assert "collect check west_coast_usa" in text and "source=known" in text
+            assert "collect check italy" in text and "edges=" in text and "cameras=8" in text
+            assert host.early_road is False
+            assert host.scenario.starts == 2
+            assert "startFreeroam" not in text
     finally:
         _restore_clock(level_session, previous)
 
@@ -613,6 +692,7 @@ def main() -> None:
     check_smoke_rate_and_flags()
     check_level_load_spawns_and_switches()
     check_missing_level_and_bng_error_are_status()
+    check_map_preflight()
     print("collect variety ok")
 
 

@@ -1,15 +1,18 @@
-"""Load a Tech level and make sure a player vehicle exists.
+"""Load a Tech level as a started scenario with one vehicle.
 
-``freeroam_freeroam.startFreeroam`` opens the map and does not spawn a car.
-This waits for the road network, then builds a scenario with one vehicle on
-that network. Session errors (including BeamNGpy ``BNGError``) stay inside
-the call and come back as text.
+The 45-minute capture read ``scenario.get_road_network`` on a scenario that
+was already started. Freeroam is not that: Tech answers ``Need to be in a
+started scenario to get its DecalRoad data.`` Each named level is therefore
+``Scenario`` + ``etk800``, ``make``, ``load_scenario``, ``start_scenario``,
+and only then the road network. Session errors (including ``BNGError``) stay
+inside the call and come back as text.
 """
 
 from __future__ import annotations
 
 import math
 import time
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from python.debug.gt_geom import project_road
@@ -18,10 +21,22 @@ from python.debug.gt_geom import project_road
 KNOWN_SPAWNS: dict[str, tuple[tuple[float, float, float], tuple[float, float, float, float]]] = {
     "west_coast_usa": ((-717.121, 101.0, 118.675), (0.0, 0.0, 0.3826834, 0.9238795)),
 }
-ROAD_WAIT_S = 45.0
-PLAYER_WAIT_S = 15.0
+ROAD_WAIT_S = 8.0
+PLAYER_WAIT_S = 8.0
 POLL_S = 0.5
 SPAWN_Z_M = 250.0
+# Used only so a scenario can start. The car is moved onto a centerline after.
+DEFAULT_SPAWN = ((0.0, 0.0, 50.0), (0.0, 0.0, 0.0, 1.0))
+
+
+@dataclass
+class OpenedLevel:
+    vehicle: Any = None
+    roads: list[Any] = field(default_factory=list)
+    error: str = ""
+    spawn: tuple[float, float, float] | None = None
+    spawn_source: str = ""
+    cameras: dict[str, Any] = field(default_factory=dict)
 _SESSION_NAMES = {"BNGError", "BNGValueError", "BNGDisconnectedError"}
 
 
@@ -258,30 +273,6 @@ def _send(bng: Any, command: str) -> str:
         raise
 
 
-def current_level_name(bng: Any) -> str:
-    """Name of the loaded level, or empty when this BeamNGpy build does not say."""
-    owners = (bng, getattr(bng, "scenario", None), getattr(bng, "control", None))
-    for owner in owners:
-        if owner is None:
-            continue
-        for name in ("get_current_level", "get_level_name", "get_current_level_name"):
-            fn = getattr(owner, name, None)
-            if not callable(fn):
-                continue
-            try:
-                raw = fn()
-            except Exception as exc:
-                if is_session_error(exc):
-                    return ""
-                raise
-            if isinstance(raw, dict):
-                raw = raw.get("level") or raw.get("levelName") or raw.get("name") or ""
-            token = level_token(str(raw or ""))
-            if token:
-                return token
-    return ""
-
-
 def queue_level(bng: Any, level: str) -> str:
     """Ask Tech to open ``level``. Empty string means the command was queued."""
     clean = level_token(level)
@@ -392,90 +383,256 @@ def _roads(bng: Any) -> tuple[list[Any], str]:
     return list(roads or []), str(note or "")
 
 
-def begin_level(bng: Any, level: str) -> tuple[Any | None, list[Any], str]:
-    """Open ``level`` (empty keeps the current one) and return ``(vehicle, roads, error)``.
+def lua_call(bng: Any, command: str) -> Any:
+    """Run one Lua chunk and return its reply. ``None`` when this build cannot reply."""
+    for owner in (getattr(bng, "control", None), bng):
+        if owner is None:
+            continue
+        fn = getattr(owner, "queue_lua_command", None)
+        if not callable(fn):
+            continue
+        try:
+            return fn(command, True)
+        except TypeError:
+            try:
+                return fn(command, response=True)
+            except TypeError:
+                return None
+        except Exception as exc:
+            if is_session_error(exc):
+                return None
+            raise
+    return None
 
-    The error is empty when a player vehicle and a road network are both in hand.
-    ``BNGError: There is no vehicle`` is retried by spawning, and if that still
-    fails the same text is returned instead of escaping.
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_spawn_point(raw: Any) -> tuple[tuple[float, float, float], tuple[float, float, float, float]] | None:
+    """One spawn from a level info record, a reply string, or a pos/rot pair."""
+    if isinstance(raw, dict):
+        for key in ("result", "resp", "data", "return", "ret"):
+            if key in raw:
+                parsed = parse_spawn_point(raw[key])
+                if parsed is not None:
+                    return parsed
+        pos = raw.get("pos") or raw.get("position") or raw.get("spawn")
+        rot = raw.get("rot") or raw.get("rotQuat") or raw.get("rot_quat")
+        if pos is None and all(key in raw for key in ("x", "y")):
+            pos = raw
+        if pos is not None:
+            return parse_spawn_point((pos, rot if rot is not None else (0.0, 0.0, 0.0, 1.0)))
+        return None
+    if isinstance(raw, str):
+        parts = raw.replace(",", " ").split()
+        try:
+            nums = [float(part) for part in parts]
+        except ValueError:
+            return None
+        if len(nums) >= 7:
+            return (nums[0], nums[1], nums[2]), (nums[3], nums[4], nums[5], nums[6])
+        if len(nums) >= 3:
+            return (nums[0], nums[1], nums[2]), (0.0, 0.0, 0.0, 1.0)
+        return None
+    if isinstance(raw, (list, tuple)) and len(raw) >= 2 and isinstance(raw[0], (list, tuple, dict)):
+        pos = parse_spawn_point(raw[0])
+        quat = raw[1]
+        if pos is None:
+            return None
+        if isinstance(quat, (list, tuple)) and len(quat) >= 4:
+            return pos[0], (_as_float(quat[0]), _as_float(quat[1]), _as_float(quat[2]), _as_float(quat[3], 1.0))
+        return pos
+    if isinstance(raw, (list, tuple)) and len(raw) >= 3 and not isinstance(raw[0], (list, tuple, dict)):
+        return (_as_float(raw[0]), _as_float(raw[1]), _as_float(raw[2])), (0.0, 0.0, 0.0, 1.0)
+    return None
+
+
+def _levels_payload(bng: Any) -> Any:
+    for owner in (bng, getattr(bng, "scenario", None)):
+        if owner is None:
+            continue
+        fn = getattr(owner, "get_levels", None)
+        if not callable(fn):
+            continue
+        try:
+            return fn()
+        except Exception as exc:
+            if is_session_error(exc):
+                return None
+            raise
+    return None
+
+
+def _spawn_from_info(info: Any) -> tuple[tuple[float, float, float], tuple[float, float, float, float]] | None:
+    if not isinstance(info, dict):
+        return None
+    points = info.get("spawnPoints") or info.get("spawnpoints") or info.get("spawn_points")
+    if isinstance(points, dict):
+        points = list(points.values())
+    if isinstance(points, (list, tuple)) and points:
+        parsed = parse_spawn_point(points[0])
+        if parsed is not None:
+            return parsed
+    return parse_spawn_point(info.get("spawn") or info.get("defaultSpawn"))
+
+
+def official_spawn(bng: Any, level: str) -> tuple[tuple[float, float, float], tuple[float, float, float, float]] | None:
+    """Spawn published by the level list or ``levels/<name>/info.json``."""
+    clean = level_token(level)
+    if not clean:
+        return None
+    payload = _levels_payload(bng)
+    if isinstance(payload, dict):
+        nested = payload.get("levels") if "levelName" not in payload else None
+        table = nested if isinstance(nested, dict) else payload
+        if isinstance(table, dict):
+            parsed = _spawn_from_info(table.get(clean))
+            if parsed is not None:
+                return parsed
+    reply = lua_call(
+        bng,
+        "local info = jsonReadFile('levels/"
+        + clean
+        + "/info.json') or {} "
+        "local pts = info.spawnPoints or info.spawnpoints or {} "
+        "local sp = pts[1] "
+        "if type(sp) ~= 'table' then return '' end "
+        "local p = sp.pos or sp.position or {} "
+        "local x = tonumber(p.x or p[1]) or 0 "
+        "local y = tonumber(p.y or p[2]) or 0 "
+        "local z = tonumber(p.z or p[3]) or 0 "
+        "local r = sp.rot or sp.rotQuat or {0,0,0,1} "
+        "local qx = tonumber(r.x or r[1]) or 0 "
+        "local qy = tonumber(r.y or r[2]) or 0 "
+        "local qz = tonumber(r.z or r[3]) or 0 "
+        "local qw = tonumber(r.w or r[4]) or 1 "
+        "return string.format('%.3f %.3f %.3f %.5f %.5f %.5f %.5f', x, y, z, qx, qy, qz, qw)",
+    )
+    return parse_spawn_point(reply)
+
+
+def resolve_spawn(bng: Any, level: str) -> tuple[tuple[float, float, float], tuple[float, float, float, float], str]:
+    """Where to place ``etk800`` so the scenario can start."""
+    clean = level_token(level)
+    official = official_spawn(bng, clean)
+    if official is not None:
+        return official[0], official[1], "info"
+    known = KNOWN_SPAWNS.get(clean)
+    if known is not None:
+        return known[0], known[1], "known"
+    return DEFAULT_SPAWN[0], DEFAULT_SPAWN[1], "default"
+
+
+def teleport_vehicle(
+    bng: Any,
+    vehicle: Any,
+    pos: tuple[float, float, float],
+    rot: tuple[float, float, float, float],
+) -> str:
+    """Move the player onto a centerline. Empty string when the call was queued."""
+    fn = getattr(vehicle, "teleport", None)
+    if callable(fn):
+        try:
+            fn(pos, rot_quat=rot, reset=True)
+            return ""
+        except TypeError:
+            try:
+                fn(pos, rot_quat=rot)
+                return ""
+            except Exception as exc:
+                if not is_session_error(exc) and not isinstance(exc, TypeError):
+                    raise
+        except Exception as exc:
+            if not is_session_error(exc):
+                raise
+    x, y, z = pos
+    qx, qy, qz, qw = rot
+    return _send(
+        bng,
+        "local v = be:getPlayerVehicle(0) "
+        "if v then "
+        f"local x, y = {x:.2f}, {y:.2f} "
+        f"local z = {z:.2f} "
+        "local ok, h = pcall(be.getSurfaceHeightBelow, be, vec3(x, y, 2000)) "
+        "if ok and type(h) == 'number' then z = h + 0.6 end "
+        f"v:setPositionRotation(x, y, z, {qx:.5f}, {qy:.5f}, {qz:.5f}, {qw:.5f}) "
+        "end",
+    )
+
+
+def _on_road(roads: list[Any], pos: tuple[float, float, float] | None) -> bool:
+    if pos is None or not roads:
+        return False
+    hit = project_road(list(roads), float(pos[0]), float(pos[1]), None)
+    return hit is not None and not bool(hit.off_road)
+
+
+def begin_level(bng: Any, level: str) -> OpenedLevel:
+    """Open ``level`` as a started scenario. Empty keeps the session already running.
+
+    Roads are read only after ``start_scenario``. An empty level is the
+    45-minute path: the vehicle and ``get_road_network`` that are already there.
     """
     clean = level_token(level)
-    notes: list[str] = []
     try:
-        before, _before_note = _roads(bng) if clean else ([], "")
-        before_ids = {str(getattr(road, "road_id", "")) for road in before}
-        names_levels = bool(current_level_name(bng))
-        if clean:
-            queued = queue_level(bng, clean)
-            if queued and queued != "no queue_lua_command":
-                notes.append(queued)
-
-        def _fresh_roads() -> list[Any] | None:
-            if clean and names_levels:
-                current = current_level_name(bng)
-                if current and current != clean:
-                    return None
-            now, _note = _roads(bng)
-            if not now:
-                return None
-            ids = {str(getattr(road, "road_id", "")) for road in now}
-            # Freeroam can keep serving the previous level's roads for a moment.
-            if before_ids and ids == before_ids and not (names_levels and current_level_name(bng) == clean):
-                return None
-            return list(now)
-
-        found = _wait(_fresh_roads, ROAD_WAIT_S) if clean else _wait(lambda: _roads(bng)[0] or None, ROAD_WAIT_S)
-        if found:
-            roads = list(found)
-            note = ""
-        else:
+        if not clean:
+            vehicle, player_note = player_vehicle(bng)
             roads, note = _roads(bng)
-            roads = list(roads or [])
-            if clean and before_ids and {str(getattr(road, "road_id", "")) for road in roads} == before_ids:
-                notes.append("roads still match the previous level")
-        if not roads:
-            detail = note or (notes[-1] if notes else "no road network")
-            label = clean or "current"
-            return None, [], f"no road network after loading {label} ({detail})"
+            if vehicle is not None and roads:
+                return OpenedLevel(vehicle, list(roads), "", None, "current")
+            detail = player_note or note or "no vehicle after load"
+            return OpenedLevel(vehicle, list(roads or []), detail, None, "current")
+        pos, rot, source = resolve_spawn(bng, clean)
+        print(
+            f"collect spawn {clean} source={source} ({pos[0]:.1f},{pos[1]:.1f},{pos[2]:.1f})",
+            flush=True,
+        )
+        started = spawn_scenario(bng, clean, pos, rot)
+        if started:
+            return OpenedLevel(None, [], started, pos, source)
         vehicle, player_note = player_vehicle(bng)
         if vehicle is None:
-            if player_note:
-                notes.append(player_note)
-            spawn = choose_spawn(clean, roads)
-            if spawn is None:
-                return None, list(roads), f"no vehicle after load ({player_note or 'There is no vehicle.'})"
-            pos, rot = spawn
-            print(
-                f"collect spawn {clean or 'current'} ({pos[0]:.1f},{pos[1]:.1f},{pos[2]:.1f})",
-                flush=True,
-            )
-            spawned = spawn_scenario(bng, clean, pos, rot) if clean else "spawn needs a level name"
-            if spawned:
-                notes.append(spawned)
-            vehicle, player_note = player_vehicle(bng)
-            if vehicle is None:
-                # Scenario start can return before the car is registered.
-                vehicle = _wait(lambda: player_vehicle(bng)[0], 2.0)
+            vehicle = _wait(lambda: player_vehicle(bng)[0], PLAYER_WAIT_S)
             if vehicle is None:
                 direct = spawn_direct(bng, pos, rot)
                 if direct:
-                    notes.append(direct)
+                    player_note = direct
                 vehicle = _wait(lambda: player_vehicle(bng)[0], PLAYER_WAIT_S)
                 if vehicle is None:
                     vehicle, player_note = player_vehicle(bng)
-            fresh, note = _roads(bng)
-            if fresh:
-                roads = list(fresh)
-            elif note:
-                notes.append(note)
         if vehicle is None:
-            detail = player_note or (notes[-1] if notes else "There is no vehicle.")
-            return None, list(roads or []), f"no vehicle after load ({detail})"
+            return OpenedLevel(None, [], f"no vehicle after load ({player_note or 'There is no vehicle.'})", pos, source)
+        roads, note = _roads(bng)
+        if not roads:
+            found = _wait(lambda: _roads(bng)[0] or None, ROAD_WAIT_S)
+            if found:
+                roads = list(found)
+                note = ""
+            else:
+                roads, note = _roads(bng)
+                roads = list(roads or [])
         if not roads:
             detail = note or "no road network"
-            return None, [], f"no road network after spawn ({detail})"
-        return vehicle, list(roads), ""
+            return OpenedLevel(vehicle, [], f"no road network after loading {clean} ({detail})", pos, source)
+        if source == "default" or not _on_road(roads, pos):
+            spot = road_spawn(list(roads))
+            if spot is not None:
+                moved, mrot = spot
+                print(
+                    f"collect teleport {clean} ({moved[0]:.1f},{moved[1]:.1f},{moved[2]:.1f})",
+                    flush=True,
+                )
+                shift = teleport_vehicle(bng, vehicle, moved, mrot)
+                if shift:
+                    return OpenedLevel(vehicle, list(roads), shift, pos, source)
+                pos = moved
+                source = "centerline"
+        return OpenedLevel(vehicle, list(roads), "", pos, source)
     except Exception as exc:
         if is_session_error(exc) or isinstance(exc, (TypeError, ValueError, AttributeError)):
-            return None, [], session_text(exc)
+            return OpenedLevel(None, [], session_text(exc))
         raise

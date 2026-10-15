@@ -356,16 +356,18 @@ def near_junction(
     """
     if hit is None:
         return True
-    if bool(getattr(hit, "off_road", False)) or bool(getattr(hit, "discontinuous", False)):
-        return True
     if roads and x is not None and y is not None:
+        # Same rule as the weave gate: a piece that ends is not a junction
+        # when a straight continuation exists. ``discontinuous`` on the hit
+        # is only this edge running out, and that was aborting every weave
+        # one or two ticks after the gate opened.
         road = _road_of(roads, hit)
         if road is None:
             return True
         span = _span(roads, road, float(x), float(y), heading, float(CURVATURE_AHEAD_M))
-        # Only a dead end inside the lookahead aborts a move. A side road
-        # beside a continuing highway is not that.
         return span[0] < float(CURVATURE_AHEAD_M) - 0.05
+    if bool(getattr(hit, "off_road", False)) or bool(getattr(hit, "discontinuous", False)):
+        return True
     ahead = getattr(hit, "ahead_m", 0.0)
     try:
         ahead_m = float(ahead)

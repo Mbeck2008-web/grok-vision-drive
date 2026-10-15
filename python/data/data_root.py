@@ -67,6 +67,11 @@ def logs_dir() -> Path:
     return data_root() / "logs"
 
 
+def roads_dir() -> Path:
+    """Live road-network dumps, one gzip per map."""
+    return data_root() / "roads"
+
+
 def models_dir() -> Path:
     return data_root() / "models"
 

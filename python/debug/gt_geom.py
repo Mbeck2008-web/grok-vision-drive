@@ -287,7 +287,10 @@ def _project_onto(
     lane_id = min(range(len(centers)), key=lambda k: abs(offset - centers[k]))
     lane_w = road.width_m / len(centers)
     lane_off = offset - centers[lane_id]
-    off = dist > OFF_NETWORK_M or abs(offset) > road.width_m * 0.5 + SHOULDER_M
+    # Lateral only. A car still inside the lane but past a short edge is on
+    # the next piece, not off the road. Distance-to-endpoint was marking
+    # about 9% of the west-coast cruise off-road.
+    off = abs(offset) > road.width_m * 0.5 + SHOULDER_M
     kappa, ahead = curvature_ahead(road, i, cx, cy, fx, fy, CURVATURE_AHEAD_M)
     return RoadHit(
         road_id=road.road_id,
@@ -575,33 +578,41 @@ def follow_label(
     speed_mps: float = 0.0,
     last: RoadHit | None = None,
 ) -> tuple[RoadHit | None, RoadHit | None, bool]:
-    """Lane sample for labels. Returns ``(label, memory, rejected_jump)``.
+    """Project the car onto the followed edge chain this tick.
 
-    Stays on the current polyline. A crossing road is not adopted: the
-    previous lane is kept and ``rejected_jump`` is true so an excursion
-    does not start on that tick.
+    Returns ``(label, memory, refused_cross)``. The lane id sticks only
+    across the painted boundary (hysteresis). The offset is recomputed
+    from this tick's position, so a bad center cannot latch. ``last`` is
+    unused; it remains so older callers keep working.
     """
+    del last
     prev_road = follow.road_id
+    prev_center = follow.lane_center_m
+    prev_lane = follow.lane_id
     hit = project_follow(roads, x, y, heading_rad, follow, speed_mps=speed_mps)
     if hit is None:
-        return None, last, False
-    if hit.road_id != prev_road:
-        follow.lane_id = None
-        follow.lane_center_m = None
-    bad_jump = (
+        return None, None, False
+    refused = False
+    if (
         hit.discontinuous
         and hit.heading_err_rad is not None
         and abs(hit.heading_err_rad) > CONNECT_HEADING
-    )
-    if bad_jump and last is not None:
-        return last, last, True
+        and prev_road
+    ):
+        current = next((road for road in roads if road.road_id == prev_road), None)
+        repro = None if current is None else _project_onto(current, x, y, heading_rad)
+        if repro is not None and lane_still_beside(repro):
+            hit = repro
+            refused = True
+    if hit.road_id != prev_road and prev_center is not None:
+        follow.lane_center_m = prev_center
+        follow.lane_id = prev_lane
+    elif hit.road_id != prev_road:
+        follow.lane_id = None
+        follow.lane_center_m = None
     if hit.off_road:
-        return hit, last, bool(hit.discontinuous)
-    held = stabilize_lane(hit, follow)
-    chosen = hold_lane_label(last, held)
-    if chosen is not held and chosen is not None:
-        return chosen, chosen, True
-    return held, held, False
+        return hit, None, refused
+    return stabilize_lane(hit, follow), hit, False
 
 
 # Parking brake on gt_ctrl1 shed about 4.5 m/s^2. The mesh has to be at

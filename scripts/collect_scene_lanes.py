@@ -233,6 +233,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Load each map, print spawn, road edges, and cameras, then exit.",
     )
     parser.add_argument(
+        "--dump-roads",
+        action="store_true",
+        help="Load each map and write E:\\GVD_data\\roads\\<map>.json.gz, then exit.",
+    )
+    parser.add_argument(
         "--list-levels",
         action="store_true",
         help="With --check-maps, print installed level names and which have a spawn table, then exit.",
@@ -423,6 +428,47 @@ def run_map_checks(
     return 2 if failed else 0
 
 
+def run_road_dumps(
+    bng: Any,
+    levels: tuple[str, ...] | list[str],
+    cfg: dict[str, Any],
+    skipped: list[str] | None = None,
+) -> int:
+    """Load each level and write ``roads/<map>.json.gz``. No recording."""
+    from python.collect.road_dump import write_road_dump
+    from python.data.data_root import roads_dir, use_data_disk
+    from python.debug.gt_logger import raw_road_network
+
+    if not use_data_disk():
+        print("collect roads need GVD_DATA_DIR (E:\\GVD_data on the driving PC)", flush=True)
+        return 2
+    failed = 0
+    cams: dict[str, Any] = {}
+    for name in skipped or []:
+        print(f"collect skip level {name} (not in this Tech install)", flush=True)
+    for level in levels:
+        opened = enter_map(bng, level, cfg, cams)
+        cams = dict(getattr(opened, "cameras", None) or {})
+        spec, roads, note = raw_road_network(bng)
+        if opened.error:
+            note = opened.error
+        path = write_road_dump(
+            roads_dir() / f"{level}.json.gz",
+            level=level,
+            spawn=getattr(opened, "spawn", None),
+            spawn_source=str(getattr(opened, "spawn_source", "") or ""),
+            road_network=spec,
+            roads=roads,
+            note=note,
+        )
+        edges = len(getattr(opened, "roads", None) or [])
+        print(f"collect roads {level} edges={edges} file={path}", flush=True)
+        if opened.error or edges < 1 or spec is None:
+            failed += 1
+    drop_cameras(cams)
+    return 2 if failed else 0
+
+
 def list_installed_levels(bng: Any) -> int:
     """Print every level Tech reports, and whether this repo has a spawn pose for it."""
     from python.collect.level_session import KNOWN_SPAWNS, installed_levels
@@ -553,7 +599,7 @@ def main(argv: list[str] | None = None) -> int:
         random.Random(1).shuffle(bag)
         names = tuple(bag)
     map_names = tuple(part.strip() for part in str(args.maps).split(",") if part.strip())
-    if args.check_maps and not map_names:
+    if (args.check_maps or args.dump_roads) and not map_names:
         from python.collect.auto_mode import DEFAULT_MAPS
 
         map_names = tuple(DEFAULT_MAPS)
@@ -643,6 +689,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"collect reload level={args.reload_level}", flush=True)
         if args.list_levels:
             return list_installed_levels(bng)
+        if args.dump_roads:
+            code = run_road_dumps(bng, map_names, cam_cfg, skipped_levels)
+            if code != 0:
+                record_session_failure(status_root, "dump-roads failed")
+            return code
         if args.check_maps:
             code = run_map_checks(bng, map_names, cam_cfg, skipped_levels)
             if code != 0:
@@ -962,9 +1013,8 @@ def main(argv: list[str] | None = None) -> int:
             if direction is not None:
                 heading = heading_from_dir(direction[0], direction[1])
             hit = None
-            rejected = False
             if pos is not None and roads:
-                hit, label_hit, rejected = follow_label(
+                hit, label_hit, _refused = follow_label(
                     roads,
                     float(pos[0]),
                     float(pos[1]),
@@ -1019,7 +1069,7 @@ def main(argv: list[str] | None = None) -> int:
                 None if hit is None else hit.off_road,
             )
             lanes_here = road_lanes(roads, hit)
-            junction = rejected or near_junction(
+            junction = near_junction(
                 hit,
                 roads,
                 None if pos is None else float(pos[0]),

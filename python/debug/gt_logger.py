@@ -136,6 +136,47 @@ def polys_from_network(spec: Any) -> list[RoadPoly]:
     return polys
 
 
+def raw_road_network(bng: Any) -> tuple[Any, Any, str]:
+    """``(road_network spec, get_roads dict or None, note)``.
+
+    The spec is whatever ``get_road_network`` returned, before it is parsed
+    into centerlines. ``get_roads`` is included when that call succeeds.
+    """
+    if bng is None:
+        return None, None, "no beamng"
+    notes: list[str] = []
+    spec = None
+    owners = []
+    scenario = getattr(bng, "scenario", None)
+    if scenario is not None:
+        owners.append(scenario)
+    owners.append(bng)
+    for owner in owners:
+        fn = getattr(owner, "get_road_network", None)
+        if not callable(fn):
+            continue
+        got, note = _call(fn, include_edges=True, drivable_only=True)
+        if note:
+            notes.append(f"get_road_network {note}")
+            got, note2 = _call(fn)
+            if note2:
+                notes.append(f"get_road_network() {note2}")
+        if got is not None:
+            spec = got
+            break
+    roads = None
+    get_roads = getattr(bng, "get_roads", None)
+    if callable(get_roads):
+        got, note = _call(get_roads)
+        if note:
+            notes.append(f"get_roads failed: {note}")
+        elif isinstance(got, dict):
+            roads = got
+    if spec is None and roads is None:
+        return None, None, "; ".join(notes) if notes else "no road network"
+    return spec, roads, ""
+
+
 def load_road_polys(bng: Any) -> tuple[list[RoadPoly], str]:
     """One snapshot of the level's road network.
 

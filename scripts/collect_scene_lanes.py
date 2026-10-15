@@ -252,18 +252,14 @@ def decode_issues(root: Path) -> list[str]:
 
 
 def start_freeroam(bng: Any, level: str) -> bool:
-    """Ask the running session to load ``level``. Does not close BeamNGpy."""
-    clean = "".join(ch for ch in str(level) if ch.isalnum() or ch in "_-")
-    if not clean:
-        return False
-    send = getattr(getattr(bng, "control", None), "queue_lua_command", None) or getattr(
-        bng, "queue_lua_command", None
-    )
-    if not callable(send):
-        return False
-    send(f'freeroam_freeroam.startFreeroam("{clean}")')
-    time.sleep(8.0)
-    return True
+    """Ask the running session to load ``level``. Does not close BeamNGpy.
+
+    Opening the level does not spawn a car. ``enter_map`` waits, then builds
+    a scenario if ``get_player_vehicle_id`` reports that there is no vehicle.
+    """
+    from python.collect.level_session import queue_level
+
+    return queue_level(bng, level) == ""
 
 
 def drop_cameras(cams: dict[str, Any] | None) -> None:
@@ -313,31 +309,74 @@ def _queue(vehicle: Any, command: str) -> None:
 
 
 def _player_vehicle(bng: Any) -> Any:
-    api = getattr(bng, "vehicles", None)
-    vehicles: dict[str, Any] = {}
-    if api is not None and hasattr(api, "get_current"):
-        cur = api.get_current()
-        if isinstance(cur, dict):
-            vehicles = {str(k): v for k, v in cur.items() if v is not None}
-    vid = None
-    if api is not None and hasattr(api, "get_player_vehicle_id"):
-        info = api.get_player_vehicle_id()
-        if isinstance(info, dict):
-            vid = info.get("vid") or info.get("name")
-        elif info:
-            vid = info
-    veh = vehicles.get(str(vid)) if vid else None
-    if veh is None and vehicles:
-        veh = next(iter(vehicles.values()))
+    """Player vehicle, or ``RuntimeError`` carrying the BeamNGpy text.
+
+    ``BNGError: There is no vehicle`` used to escape because only
+    ``RuntimeError`` was caught. The text is preserved either way.
+    """
+    from python.collect.level_session import player_vehicle, session_text, is_session_error
+
+    try:
+        veh, note = player_vehicle(bng)
+    except Exception as exc:
+        if is_session_error(exc):
+            raise RuntimeError(session_text(exc)) from exc
+        raise
     if veh is None:
-        raise RuntimeError("no vehicle in the running session")
-    if hasattr(veh, "connect"):
-        try:
-            if not getattr(veh, "is_connected", lambda: True)():
-                veh.connect(bng)
-        except Exception:
-            pass
+        raise RuntimeError(note or "no vehicle in the running session")
     return veh
+
+
+def enter_map(
+    bng: Any,
+    level: str,
+    cfg: dict[str, Any],
+    cams: dict[str, Any] | None,
+) -> tuple[Any, list[Any], dict[str, Any], str]:
+    """Drop the old cameras, open the level, spawn if needed, attach every camera.
+
+    Returns ``(vehicle, roads, cameras, error)``. The error is empty on success
+    and is safe to store in ``status/collect.json``.
+    """
+    from python.collect.level_session import begin_level, is_session_error, session_text
+
+    drop_cameras(cams)
+    try:
+        vehicle, roads, err = begin_level(bng, level)
+    except Exception as exc:
+        if is_session_error(exc):
+            return None, [], {}, session_text(exc)
+        raise
+    if err or vehicle is None:
+        return None, list(roads or []), {}, err or "no vehicle after load"
+    if not roads:
+        return vehicle, [], {}, "no road network"
+    try:
+        attached = _attach_cameras(bng, vehicle, cfg)
+    except Exception as exc:
+        if is_session_error(exc) or isinstance(exc, RuntimeError):
+            return vehicle, list(roads), {}, session_text(exc)
+        raise
+    print(f"collect cameras {len(attached)} ({', '.join(sorted(attached))})", flush=True)
+    return vehicle, list(roads), attached, ""
+
+
+def record_session_failure(status_root: Any, message: str) -> None:
+    """Write the session error where ``gvd_status`` already looks."""
+    from python.debug.remote_status import write_collect_status
+
+    text = str(message or "session error")
+    _write_collect_crash(status_root, text, {})
+    write_collect_status(
+        status_root,
+        {
+            "kind": "collect",
+            "error": text,
+            "driver": "beamng_ai",
+            "automatic": True,
+            "updated": time.time(),
+        },
+    )
 
 
 def _colour(payload: Any) -> Any:
@@ -473,25 +512,51 @@ def main(argv: list[str] | None = None) -> int:
         f"stop under 20 GB free",
         flush=True,
     )
-    bng = open_tech_beamngpy(
-        host, port, home=cfg.get("home") or None, user=cfg.get("user") or None, launch=False,
-    )
+    from python.collect.level_session import installed_levels, is_session_error, select_maps, session_text
+    from python.debug.remote_status import status_dir as _status_dir
+
+    status_root = _status_dir()
+    try:
+        bng = open_tech_beamngpy(
+            host, port, home=cfg.get("home") or None, user=cfg.get("user") or None, launch=False,
+        )
+    except Exception as exc:
+        if not is_session_error(exc):
+            raise
+        record_session_failure(status_root, session_text(exc))
+        print(f"collect stop {session_text(exc)}", flush=True)
+        return 2
     widen_socket_timeout(bng, 90.0)
     writer = None
     try:
-        if args.reload_level:
+        if map_names:
+            installed, list_note = installed_levels(bng)
+            if installed is None:
+                print(f"collect level list unavailable ({list_note}); trying the requested maps", flush=True)
+            else:
+                kept, skipped = select_maps(map_names, installed)
+                for name in skipped:
+                    print(f"collect skip level {name} (not in this Tech install)", flush=True)
+                map_names = tuple(kept)
+                if not map_names:
+                    message = "none of the requested maps are in this Tech install"
+                    record_session_failure(status_root, message)
+                    print(f"collect stop {message}", flush=True)
+                    return 2
+        elif args.reload_level:
             print(f"collect reload level={args.reload_level}", flush=True)
-            # The running level is replaced. The socket stays open.
-            if not start_freeroam(bng, str(args.reload_level)):
-                loader = getattr(getattr(bng, "scenario", None), "load_level", None) or getattr(bng, "load_level", None)
-                if callable(loader):
-                    loader(args.reload_level)
-        vehicle = _player_vehicle(bng)
-        roads, note = load_road_polys(bng)
-        if not roads:
-            print(f"collect no road network ({note})", file=sys.stderr)
-            return 2
-        cams = _attach_cameras(bng, vehicle, cam_cfg)
+        # A map rotation enters the level on the first segment, after the
+        # writer exists. A single-level run needs the vehicle before the loop.
+        vehicle = None
+        roads: list[Any] = []
+        cams: dict[str, Any] = {}
+        if not map_names:
+            vehicle, roads, cams, err = enter_map(bng, str(args.reload_level or ""), cam_cfg, {})
+            if err or vehicle is None or not roads:
+                message = err or "no vehicle after load"
+                record_session_failure(status_root, message)
+                print(f"collect stop {message}", flush=True)
+                return 2
         writer = RawWriteQueue(RawFrameWriter(out, camera_sidecar(cam_cfg)))
         from python.data.strip_writer import STRIP_ORDER
         from python.debug.remote_status import CollectMeter, status_dir, write_collect_status
@@ -521,11 +586,12 @@ def main(argv: list[str] | None = None) -> int:
         prev_dir_t: float | None = None
         last_error = ""
         cam_reasons: dict[str, str] = {}
-        for command in environment_commands(args.time_of_day, args.weather):
-            try:
-                _queue(vehicle, command)
-            except Exception as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
+        if vehicle is not None:
+            for command in environment_commands(args.time_of_day, args.weather):
+                try:
+                    _queue(vehicle, command)
+                except Exception as exc:
+                    last_error = session_text(exc) if is_session_error(exc) else f"{type(exc).__name__}: {exc}"
 
         def _used_bytes() -> int:
             extra = 0
@@ -571,6 +637,7 @@ def main(argv: list[str] | None = None) -> int:
         all_stale_since: float | None = None
         last_reason_line = ""
         smoke_ok = done_s > 0.0 or float(args.smoke_s) <= 0.0
+        session_faults = 0
         while done_s < target_s:
             if stop_file(out).is_file():
                 save_progress(progress_path, done_s, target_s if target_s < float("inf") else done_s)
@@ -584,25 +651,14 @@ def main(argv: list[str] | None = None) -> int:
             segment_id = f"{map_name}#{seg_index}" if map_name else "current#0"
             if map_name and map_name != loaded_map:
                 print(f"collect segment {segment_id}", flush=True)
-                drop_cameras(cams)
-                if not start_freeroam(bng, map_name):
-                    last_error = f"could not load {map_name}"
+                vehicle, roads, cams, err = enter_map(bng, map_name, cam_cfg, cams)
+                if err or vehicle is None or not roads or not cams:
+                    last_error = err or "no vehicle after load"
                     save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
+                    _publish(None, speed, waypoint)
+                    _write_collect_crash(status_root, last_error, {})
                     print(f"collect stop {last_error}", flush=True)
                     return 2
-                try:
-                    vehicle = _player_vehicle(bng)
-                except RuntimeError as exc:
-                    last_error = str(exc)
-                    save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
-                    print(f"collect stop {last_error}", flush=True)
-                    return 2
-                roads, note = load_road_polys(bng)
-                if not roads:
-                    save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
-                    print(f"collect no road network ({note})", file=sys.stderr)
-                    return 2
-                cams = _attach_cameras(bng, vehicle, cam_cfg)
                 loaded_map = map_name
                 last_ai = None
                 held_tag = None
@@ -612,13 +668,32 @@ def main(argv: list[str] | None = None) -> int:
                 last_cam = {}
                 if vary_env:
                     tod, sky = segment_env(seg_index)
-                    for command in environment_commands(tod, sky):
-                        try:
-                            _queue(vehicle, command)
-                        except Exception as exc:
-                            last_error = f"{type(exc).__name__}: {exc}"
+                    sky_commands = environment_commands(tod, sky)
+                else:
+                    sky_commands = environment_commands(args.time_of_day, args.weather)
+                for command in sky_commands:
+                    try:
+                        _queue(vehicle, command)
+                    except Exception as exc:
+                        last_error = session_text(exc) if is_session_error(exc) else f"{type(exc).__name__}: {exc}"
+                        _write_collect_crash(status_root, last_error, {})
             tick_mark = time.monotonic()
-            frames, stamps, cam_reasons = _poll_cameras(cams)
+            try:
+                frames, stamps, cam_reasons = _poll_cameras(cams)
+            except Exception as exc:
+                if not is_session_error(exc):
+                    raise
+                last_error = session_text(exc)
+                _publish(None, speed, waypoint)
+                _write_collect_crash(status_root, last_error, {})
+                print(f"collect session {last_error}", flush=True)
+                session_faults += 1
+                if session_faults >= 3:
+                    save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
+                    return 2
+                time.sleep(0.5)
+                continue
+            session_faults = 0
             reason_line = ", ".join(f"{cid}={cam_reasons[cid]}" for cid in sorted(cam_reasons))
             if reason_line and reason_line != last_reason_line:
                 print(f"collect cam drop {reason_line}", flush=True)

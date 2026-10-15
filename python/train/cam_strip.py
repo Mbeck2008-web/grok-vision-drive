@@ -220,7 +220,10 @@ def stamp_onnx_metadata(path: str, props: Mapping[str, str]) -> bool:
         import onnx  # type: ignore
     except ImportError:
         return False
-    model = onnx.load(path)
+    try:
+        model = onnx.load(path)
+    except Exception:
+        return False
     kept = [item for item in model.metadata_props if item.key not in props]
     del model.metadata_props[:]
     for item in kept:

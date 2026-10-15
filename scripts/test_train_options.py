@@ -154,11 +154,75 @@ def check_cache_chunks() -> None:
     print("cache chunks")
 
 
+def check_subset_forward_probe_and_export() -> None:
+    """A one-camera token is 64-d. The GRU hidden state stays 512."""
+    from python.train.scene_net import GRU_HIDDEN, SceneNet, export_scene_onnx, torch_ready
+    from python.train.train_scene import _probe_cuda
+
+    if not torch_ready():
+        print("subset forward skipped (torch missing)")
+        return
+    import torch
+
+    def exercise(cams: tuple[str, ...], scale: float = 1.0) -> None:
+        net = SceneNet(cams=cams, scale=scale).cpu().train()
+        assert net.token_dim == len(cams) * 64
+        assert net.token_dim != GRU_HIDDEN or net.skip is None
+        if net.token_dim != GRU_HIDDEN:
+            assert net.skip is not None and net.skip.out_features == GRU_HIDDEN
+        image = torch.zeros(1, 3, net.canvas_h, net.canvas_w)
+        state = net.initial_state(device="cpu", batch=1)
+        pred, _state = net.forward_batch(image, torch.zeros(1), state)
+        assert tuple(pred.lane_gt.shape)[-1] == 14
+        assert _probe_cuda(net, 1, 2, False, torch.device("cpu")) is True
+
+    exercise(("main",))
+    exercise(("main", "narrow"))
+    exercise(("main",), scale=0.5)
+    full = SceneNet().cpu()
+    assert full.skip is None and full.token_dim == GRU_HIDDEN
+
+    cached = torch.zeros(full.canvas_h, 256, 3)
+    main = SceneNet(cams=("main",)).cpu().eval()
+    assert cached.shape == (main.canvas_h, main.canvas_w, 3)
+    pred, _state = main.forward(cached, torch.zeros(1), main.initial_state(device="cpu"))
+    assert tuple(pred.lane_gt.shape) == (14,)
+
+    captured: dict[str, object] = {}
+
+    def _trace(model: object, args: tuple, path: str) -> None:
+        del model
+        captured["shape"] = tuple(args[0].shape)
+        Path(path).write_bytes(b"not-a-real-onnx")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = Path(tmp) / "main.onnx"
+        export_scene_onnx(dest, cams=("main",), heads=("lane_gt",), zeros=torch.zeros, trace=_trace)
+        assert captured["shape"] == (1, 3, main.canvas_h, main.canvas_w)
+        assert dest.is_file()
+        try:
+            import onnx
+        except ImportError:
+            onnx = None
+        if onnx is not None:
+            real = Path(tmp) / "main_real.onnx"
+            export_scene_onnx(real, SceneNet(cams=("main",)).cpu().eval(), heads=("lane_gt",))
+            model = onnx.load(real)
+            onnx.checker.check_model(model)
+            meta = {item.key: item.value for item in model.metadata_props}
+            assert meta["gvd_cams"] == "main"
+            strip = model.graph.input[0]
+            dims = [dim.dim_value for dim in strip.type.tensor_type.shape.dim]
+            assert dims == [1, 3, main.canvas_h, main.canvas_w]
+    print("subset forward and export shape")
+
+
 def main() -> None:
     check_cams_and_heads()
     check_extract_and_jitter()
     check_cache_chunks()
     check_epoch_windows()
+    check_subset_forward_probe_and_export()
     print("train options ok")
 
 

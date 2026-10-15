@@ -1247,6 +1247,10 @@ if torch is not None:
             # The dropped tensor is the GRU input. ``state.h`` is not dropped.
             self.gru_in_drop = nn.Dropout(p=GRU_IN_DROPOUT)
             self.gru = nn.GRU(self.token_dim + 1, GRU_HIDDEN, num_layers=1, batch_first=True)
+            # Eight cameras make a 512-d token, the same width as the GRU.
+            # A subset is narrower. The skip has to land in hidden space or
+            # ``gru_out + residual`` raises before the first step.
+            self.skip = None if self.token_dim == GRU_HIDDEN else nn.Linear(self.token_dim, GRU_HIDDEN)
             hidden = GRU_HIDDEN
             for name, out in scene_head_sizes():
                 setattr(self, name, nn.Linear(hidden, out))
@@ -1294,6 +1298,8 @@ if torch is not None:
             in_span = (new_mask <= float(RESIDUAL_S)).to(dtype=image.dtype)
             denom = in_span.sum(dim=1, keepdim=True).clamp(min=1.0)
             residual = (new_tokens * in_span.unsqueeze(-1)).sum(dim=1) / denom
+            if self.skip is not None:
+                residual = self.skip(residual)
             feat = gru_out[:, 0, :] + residual
             return _heads_batch(self, feat), SceneState(h=h_new, tokens=new_tokens, mask=new_mask)
 

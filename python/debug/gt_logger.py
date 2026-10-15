@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from python.debug.lane_targets import LOOKAHEADS_M, lookahead_xs
 from python.debug.gt_geom import (
     RoadHit,
     RoadPoly,
@@ -413,11 +414,13 @@ class GroundTruthLogger:
         gt_center = None
         gt_left = None
         gt_right = None
+        ahead = None
         if hit is not None and lane_off is not None and width is not None:
             gt_center = ego_center_x(lane_off, hit.heading_err_rad, 8.0)
             half = float(width) * 0.5
             gt_left = gt_center - half
             gt_right = gt_center + half
+            ahead = lookahead_xs(lane_off, hit.heading_err_rad, width, ys=LOOKAHEADS_M)
         det_left, det_right, det_center = detected_lane_xs(lanes_bev, 8.0)
         in_lane = None
         if hit is not None and width is not None and width > 0.0:
@@ -449,6 +452,10 @@ class GroundTruthLogger:
             "gt_center_x": gt_center,
             "gt_left_x": gt_left,
             "gt_right_x": gt_right,
+            "gt_lookahead_m": None if ahead is None else ahead["y_m"],
+            "gt_center_xs": None if ahead is None else ahead["center_x"],
+            "gt_left_xs": None if ahead is None else ahead["left_x"],
+            "gt_right_xs": None if ahead is None else ahead["right_x"],
             "det_left_x": det_left,
             "det_right_x": det_right,
             "det_center_x": det_center,

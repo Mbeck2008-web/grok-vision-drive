@@ -1,0 +1,148 @@
+"""Lane center from the scene-net ONNX graph.
+
+The supervisor asks this for ``lane_x`` when ``--lane-source scene`` is set.
+A missing file, a missing runtime, or a confidence under the floor is a stop,
+not a return to the pixel lane finder. The step time is the real seconds
+since the previous strip.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from python.debug.lane_targets import (
+    LANE_GT_DIM,
+    confidence_from_vector,
+    lane_x_from_vector,
+)
+from python.train.scene_net import (
+    GRU_HIDDEN,
+    RESIDUAL_S,
+    RESIDUAL_TOKENS,
+    TOKEN_DIM,
+    default_onnx_path,
+)
+
+SCENE_LANE_MIN_CONF = 0.40
+
+
+def scene_lane_decision(
+    lane_x: float | None,
+    confidence: float | None,
+    *,
+    min_conf: float = SCENE_LANE_MIN_CONF,
+) -> str:
+    """``lane`` when the net is sure, otherwise ``stop``."""
+    if lane_x is None or confidence is None:
+        return "stop"
+    try:
+        conf = float(confidence)
+        x = float(lane_x)
+    except (TypeError, ValueError):
+        return "stop"
+    if conf != conf or x != x or conf < float(min_conf):
+        return "stop"
+    return "lane"
+
+
+def straight_lane_path(lane_x: float, *, length_m: float = 36.0, step_m: float = 1.0) -> list[dict[str, float]]:
+    """Ego polyline the wheel already knows how to follow. x is constant."""
+    path: list[dict[str, float]] = []
+    y = 0.0
+    guard = 0
+    while y <= float(length_m) + 1e-6 and guard < 80:
+        path.append({"x": float(lane_x), "y": float(y), "z": 0.0})
+        y += float(step_m)
+        guard += 1
+    return path
+
+
+class SceneLaneRuntime:
+    """One ONNX session and its GRU state. Not tied to a fixed frame rate."""
+
+    def __init__(self, path: Path | str | None = None) -> None:
+        self.path = Path(path) if path is not None else default_onnx_path()
+        self.session: Any = None
+        self.ready = False
+        self.reason = "not loaded"
+        self._input_names: list[str] = []
+        self._output_names: list[str] = []
+        self.h = np.zeros((1, 1, GRU_HIDDEN), dtype=np.float32)
+        self.tokens = np.zeros((1, RESIDUAL_TOKENS, TOKEN_DIM), dtype=np.float32)
+        self.mask = np.full((1, RESIDUAL_TOKENS), float(RESIDUAL_S) + 1.0, dtype=np.float32)
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path.is_file():
+            self.reason = f"missing {self.path}"
+            return
+        try:
+            import onnxruntime as ort  # type: ignore
+        except Exception as exc:
+            self.reason = f"onnxruntime missing ({type(exc).__name__})"
+            return
+        try:
+            self.session = ort.InferenceSession(str(self.path), providers=["CPUExecutionProvider"])
+            self._input_names = [item.name for item in self.session.get_inputs()]
+            self._output_names = [item.name for item in self.session.get_outputs()]
+        except Exception as exc:
+            self.session = None
+            self.reason = f"onnx load failed ({type(exc).__name__})"
+            return
+        if "lane_gt" not in self._output_names:
+            self.session = None
+            self.reason = "onnx has no lane_gt output; retrain and export"
+            return
+        self.ready = True
+        self.reason = "ok"
+
+    def observe(self, strip_bgr: Any, dt_s: float | None) -> tuple[float | None, float]:
+        """Return ``(lane_x at 8 m, confidence)``. A cold runtime is confidence 0."""
+        if not self.ready or self.session is None or strip_bgr is None:
+            return None, 0.0
+        image = _strip_nchw(strip_bgr)
+        if image is None:
+            return None, 0.0
+        dt = np.asarray([0.0 if dt_s is None else float(dt_s)], dtype=np.float32)
+        feeds = {
+            "strip": image,
+            "dt": dt,
+            "h": self.h,
+            "tokens": self.tokens,
+            "mask": self.mask,
+        }
+        feeds = {name: feeds[name] for name in self._input_names if name in feeds}
+        try:
+            outputs = self.session.run(None, feeds)
+        except Exception:
+            return None, 0.0
+        by_name = {name: value for name, value in zip(self._output_names, outputs)}
+        vector = np.asarray(by_name.get("lane_gt"), dtype=np.float32).reshape(-1)
+        if vector.size < LANE_GT_DIM:
+            return None, 0.0
+        if "h" in by_name:
+            self.h = np.asarray(by_name["h"], dtype=np.float32)
+        if "tokens" in by_name:
+            self.tokens = np.asarray(by_name["tokens"], dtype=np.float32)
+        if "mask" in by_name:
+            self.mask = np.asarray(by_name["mask"], dtype=np.float32)
+        return lane_x_from_vector(vector), confidence_from_vector(vector)
+
+
+def _strip_nchw(strip_bgr: Any) -> np.ndarray | None:
+    from python.data.strip_writer import CANVAS_H, CANVAS_W
+
+    arr = np.asarray(strip_bgr)
+    if arr.ndim != 3 or arr.shape[-1] != 3:
+        return None
+    if arr.shape[0] != CANVAS_H or arr.shape[1] != CANVAS_W:
+        return None
+    if arr.dtype != np.float32:
+        arr = arr.astype(np.float32)
+    if float(arr.max()) > 1.5:
+        arr = arr / 255.0
+    chw = np.transpose(arr, (2, 0, 1))
+    return np.ascontiguousarray(chw[None, ...])

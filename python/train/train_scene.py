@@ -59,7 +59,7 @@ from python.train.scene_net import (  # noqa: E402
     checkpoint_arch,
     default_onnx_path,
     export_scene_onnx,
-    labels_from_tech,
+    labels_for_row,
     loss_mask,
     precision_for_capability,
     scene_loss,
@@ -336,7 +336,7 @@ def _optimizer_step(
         with _autocast(amp):
             pred, state = net.forward_batch(image, dt, state)
         if loss_mask(row):
-            step = scene_loss(_prediction_at(pred, 0), _as_target(labels_from_tech(row.get("tech")), device))
+            step = scene_loss(_prediction_at(pred, 0), _as_target(labels_for_row(row), device))
             value = step["total"]
             total = value if total is None else total + value
             n_loss += 1
@@ -389,7 +389,7 @@ def _eval_sequence(
                     pred, state = net.forward_batch(image, dt, state)
                 if not loss_mask(row):
                     continue
-                value = scene_loss(_prediction_at(pred, 0), _as_target(labels_from_tech(row.get("tech")), device))["total"]
+                value = scene_loss(_prediction_at(pred, 0), _as_target(labels_for_row(row), device))["total"]
                 total = value if total is None else total + value
                 n_loss += 1
                 if view is not None:

@@ -22,6 +22,7 @@ from typing import Any, Mapping
 import numpy as np
 
 from python.data.strip_writer import CANVAS_H, CANVAS_W, SECTORS
+from python.debug.lane_targets import LANE_GT_DIM, lane_gt_from_record
 
 try:
     import torch
@@ -101,9 +102,10 @@ OUTPUT_FIELDS = (
     "sign_class",
     "sign_state",
     "sign_valid",
+    "lane_gt",
 )
 
-LOSS_TERMS = ("points", "class", "lamps", "valid")
+LOSS_TERMS = ("points", "class", "lamps", "valid", "lane_gt")
 
 _BAD_REASONS = frozenset({"player_steer", "player_brake", "player_throttle"})
 
@@ -124,6 +126,7 @@ def scene_head_sizes() -> tuple[tuple[str, int], ...]:
         ("sign_class_head", N_SIGNS * len(SIGN_CLASSES)),
         ("sign_state_head", N_SIGNS * len(LAMP_STATES)),
         ("sign_valid_head", N_SIGNS),
+        ("lane_gt_head", LANE_GT_DIM),
     )
 
 
@@ -727,6 +730,21 @@ def labels_from_tech(tech: Mapping[str, Any] | None) -> dict[str, np.ndarray]:
     }
 
 
+def labels_for_row(row: Mapping[str, Any] | None) -> dict[str, np.ndarray]:
+    """Scene labels plus the ground-truth lane vector when the row has one.
+
+    Old strips without ``lane_gt`` still train the polyline heads. The lane
+    vector is zeros and its mask is clear, so that term does not pull.
+    """
+    row = row or {}
+    tech = row.get("tech") if isinstance(row.get("tech"), Mapping) else row
+    labels = labels_from_tech(tech if isinstance(tech, Mapping) else None)
+    values, mask = lane_gt_from_record(tech if isinstance(tech, Mapping) else None)
+    labels["lane_gt"] = values
+    labels["lane_gt_valid"] = mask
+    return labels
+
+
 def _field(scene: Any, name: str, default: Any = None) -> Any:
     if isinstance(scene, dict):
         return scene.get(name, default)
@@ -937,6 +955,7 @@ class ScenePrediction:
     sign_class: Any
     sign_state: Any
     sign_valid: Any
+    lane_gt: Any = None
 
     def as_dict(self) -> dict[str, Any]:
         return {name: getattr(self, name) for name in OUTPUT_FIELDS}
@@ -954,6 +973,33 @@ class SceneState:
     h: Any
     tokens: Any
     mask: Any
+
+
+def _lane_gt_loss(
+    functional: Any,
+    pred: ScenePrediction,
+    target: Mapping[str, Any],
+    device: Any,
+    dtype: Any,
+    zero: Any,
+) -> Any:
+    """Smooth-L1 on the lookaheads and heading, BCE on the confidence.
+
+    A recording without the vector contributes nothing. The confidence slot
+    is a probability already (sigmoid in the head).
+    """
+    if torch is None or pred.lane_gt is None or "lane_gt" not in target or "lane_gt_valid" not in target:
+        return zero
+    pred_v = pred.lane_gt.to(device=device, dtype=dtype).reshape(-1, LANE_GT_DIM)
+    goal = target["lane_gt"].to(device=device, dtype=dtype).reshape(-1, LANE_GT_DIM)
+    mask = target["lane_gt_valid"].to(device=device, dtype=dtype).reshape(-1, LANE_GT_DIM)
+    conf = pred_v[:, -1].clamp(1e-6, 1.0 - 1e-6)
+    bce = functional.binary_cross_entropy(conf, goal[:, -1])
+    values = pred_v[:, :-1]
+    value_mask = mask[:, :-1]
+    denom = value_mask.sum().clamp(min=1.0)
+    residual = functional.smooth_l1_loss(values, goal[:, :-1], reduction="none")
+    return bce + (residual * value_mask).sum() / denom
 
 
 def _scene_loss_body(pred: ScenePrediction, target: Mapping[str, Any]) -> dict[str, Any]:
@@ -1021,8 +1067,16 @@ def _scene_loss_body(pred: ScenePrediction, target: Mapping[str, Any]) -> dict[s
         gt_state=target["sign_state"].to(device=device, dtype=torch.long),
         lamps=lamps,
     )
-    total = points + classes + lamps + valid
-    out = {"points": points, "class": classes, "lamps": lamps, "valid": valid, "total": total}
+    lane_gt_term = _lane_gt_loss(functional, pred, target, device, dtype, zero)
+    total = points + classes + lamps + valid + lane_gt_term
+    out = {
+        "points": points,
+        "class": classes,
+        "lamps": lamps,
+        "valid": valid,
+        "lane_gt": lane_gt_term,
+        "total": total,
+    }
     if set(LOSS_TERMS) - set(out):
         raise RuntimeError("scene loss is missing a term")
     return out
@@ -1177,6 +1231,11 @@ if torch is not None:
                 parts.append(self.stem(crop))
             return torch.cat(parts, dim=-1).unsqueeze(1)
 
+    def _lane_gt_output(net: SceneNet, feat: Any) -> Any:
+        raw = net.lane_gt_head(feat)
+        conf = torch.sigmoid(raw[:, -1:])
+        return torch.cat([raw[:, :-1], conf], dim=-1)
+
     def _heads_batch(net: SceneNet, feat: Any) -> ScenePrediction:
         width = int(feat.shape[0])
         return ScenePrediction(
@@ -1191,6 +1250,7 @@ if torch is not None:
             sign_class=net.sign_class_head(feat).view(width, N_SIGNS, len(SIGN_CLASSES)),
             sign_state=net.sign_state_head(feat).view(width, N_SIGNS, len(LAMP_STATES)),
             sign_valid=torch.sigmoid(net.sign_valid_head(feat)).view(width, N_SIGNS),
+            lane_gt=_lane_gt_output(net, feat),
         )
 
     def _prediction_at(pred: ScenePrediction, index: int) -> ScenePrediction:

@@ -333,7 +333,8 @@ def check_stuck_car_aborts_without_weaving() -> None:
     text = buf.getvalue()
     assert code == 2, (code, text)
     assert text.count("collect abort stationary") == 2
-    assert "aborted twice: stationary" in text
+    assert "collect segment end" in text and "stationary" in text
+    assert "recover lost" in text
     assert "collect recover" in text
     assert "weave" not in text
     assert any("0.90" in line for line in bng.commands), bng.commands
@@ -371,9 +372,25 @@ def check_tipped_car_exits() -> None:
     text = buf.getvalue()
     assert code == 2, (code, text)
     assert text.count("collect abort tipped") == 2
-    assert "aborted twice: tipped" in text
+    assert "collect segment end" in text and "tipped" in text
+    assert "recover lost" in text
     assert not (out / "state.jsonl").is_file()
     print("tipped abort wrote nothing")
+
+
+def check_second_stall_ends_the_segment() -> None:
+    from scripts.collect_scene_lanes import segment_fail_action
+
+    failed: dict[str, set[str]] = {}
+    assert segment_fail_action("stationary", "italy", failed, 0.0, 60.0, 360.0) == "continue"
+    assert segment_fail_action("stationary", "italy", failed, 0.0, 60.0, 360.0) == "continue"
+    assert failed["stationary"] == {"italy"}
+    assert segment_fail_action("stationary", "east_coast_usa", failed, 0.0, 60.0, 360.0) == "continue"
+    assert segment_fail_action("stationary", "hirochi_raceway", failed, 0.0, 60.0, 360.0) == "exit"
+    lost = segment_fail_action("tipped", "west_coast_usa", {}, 0.0, 30.0, 120.0)
+    assert lost == "exit"
+    assert segment_fail_action("damage", "italy", {}, 0.0, 10.0, 7200.0) == "continue"
+    print("second stall ends the segment")
 
 
 def check_masked_labels_and_map_switch() -> None:
@@ -466,6 +483,7 @@ def main() -> None:
     check_warmup_skips_partial_cameras()
     check_stuck_car_aborts_without_weaving()
     check_tipped_car_exits()
+    check_second_stall_ends_the_segment()
     print("liveness ok")
 
 

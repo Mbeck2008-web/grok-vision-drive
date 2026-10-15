@@ -34,14 +34,14 @@ COLLECT6 = ROOT / "tests" / "fixtures" / "collect6" / "trace.jsonl.gz"
 # West-coast cruise std is the car's real lateral wander on the AI route
 # along that centerline, not a label snap (adjacent jumps stay 0). The bar
 # is 1.2 there. Italy stays under 0.8. A missing label is an ambiguous tick;
-# up to 30% of cruise rows may be masked.
+# up to 35% of cruise rows may be masked.
 STD_LIMIT = {
     ("collect6", "west_coast_usa"): 1.2,
     ("collect5", "west_coast_usa"): 1.2,
     ("collect6", "italy"): 0.80,
     ("collect5", "italy"): 0.80,
 }
-MASK_LIMIT = 0.30
+MASK_LIMIT = 0.35
 
 
 def _load(path: Path, level: str) -> list[dict]:

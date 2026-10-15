@@ -291,6 +291,40 @@ def share_maps(maps: tuple[str, ...], weights: dict[str, float]) -> list[tuple[s
     return [(name, explicit.get(name, 0.0) / scale) for name in maps]
 
 
+# A second stall, tip, or damage hit ends the segment. The same reason on
+# three maps, or recoveries that eat this much of the plan, end the run.
+HARD_SEGMENT_REASONS = ("stationary", "tipped", "damage")
+SEGMENT_FAIL_MAPS = 3
+RECOVER_LOST_FRACTION = 0.20
+
+
+def segment_fail_action(
+    reason: str,
+    map_name: str,
+    failed: dict[str, set[str]],
+    lost_s: float,
+    skip_s: float,
+    target_s: float,
+) -> str:
+    """``exit`` or ``continue`` after a segment's second hard abort.
+
+    Records ``map_name`` under ``reason``. Three maps with that reason, or
+    recoveries plus the skipped remainder past 20% of a finite plan, exit.
+    """
+    bucket = failed.setdefault(str(reason), set())
+    bucket.add(map_name or "current")
+    if len(bucket) >= SEGMENT_FAIL_MAPS:
+        return "exit"
+    planned = float(target_s)
+    if (
+        math.isfinite(planned)
+        and planned > 0.0
+        and (float(lost_s) + max(0.0, float(skip_s))) > RECOVER_LOST_FRACTION * planned
+    ):
+        return "exit"
+    return "continue"
+
+
 def segment_at(
     elapsed_s: float,
     maps: tuple[str, ...],
@@ -822,6 +856,8 @@ def main(argv: list[str] | None = None) -> int:
 
         live = Liveness()
         segment_aborts = 0
+        recover_lost_s = 0.0
+        segment_fail_maps: dict[str, set[str]] = {}
         cams_ready = False
         segment_open = False
         follow = RoadFollow()
@@ -892,21 +928,68 @@ def main(argv: list[str] | None = None) -> int:
         smoke_ok = done_s > 0.0 or float(args.smoke_s) <= 0.0
         session_faults = 0
 
+        def _segment_end(now: float) -> float | None:
+            """Elapsed time where the next segment starts, or None with no rotation."""
+            if not map_names:
+                return None
+            weights = map_weights or None
+            planned = None if target_s == float("inf") else target_s
+            _name, index = segment_at(now, map_names, segment_s, weights, planned)
+            limit = target_s if target_s < float("inf") else now + segment_s * max(1, len(map_names))
+            step = 1.0
+            cursor = now
+            while cursor < limit:
+                cursor = min(limit, cursor + step)
+                if segment_at(cursor, map_names, segment_s, weights, planned)[1] != index:
+                    return cursor
+            return limit
+
         def _abort(reason: str) -> int | None:
-            """Stop this segment. The first failure respawns. The second exits."""
+            """Respawn once. A second hard abort ends the segment and continues."""
             nonlocal segment_aborts, last_error, clock, last_ai, held_tag, prev_dir, prev_dir_t, spawn_pos
-            nonlocal segment_open, follow, label_hit, mark_recover
+            nonlocal segment_open, follow, label_hit, mark_recover, done_s, recover_lost_s
             segment_aborts += 1
             print(f"collect abort {reason} segment={segment_id}", flush=True)
             last_error = f"{segment_id} {reason}"
-            if segment_aborts >= 2:
-                message = f"{segment_id} aborted twice: {reason}"
-                last_error = message
-                save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
-                _publish(None, speed, waypoint)
-                _write_collect_crash(status_root, message, {})
-                print(f"collect stop {message}", flush=True)
-                return 2
+            if segment_aborts >= 2 and reason in HARD_SEGMENT_REASONS:
+                skip_to = _segment_end(done_s)
+                if skip_to is None:
+                    skip = max(0.0, (target_s if target_s < float("inf") else done_s) - done_s)
+                else:
+                    skip = max(0.0, skip_to - done_s)
+                action = segment_fail_action(
+                    reason,
+                    map_name or segment_id,
+                    segment_fail_maps,
+                    recover_lost_s,
+                    skip,
+                    target_s,
+                )
+                print(f"collect segment end {segment_id} {reason}", flush=True)
+                if action == "exit":
+                    n_maps = len(segment_fail_maps.get(reason, ()))
+                    if n_maps >= SEGMENT_FAIL_MAPS:
+                        message = f"{reason} on {n_maps} maps"
+                    else:
+                        planned = target_s if target_s < float("inf") else 1.0
+                        share = (recover_lost_s + skip) / planned
+                        message = f"recover lost {share:.0%} of the plan"
+                    last_error = f"{segment_id} {message}"
+                    save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
+                    _publish(None, speed, waypoint)
+                    _write_collect_crash(status_root, last_error, {})
+                    print(f"collect stop {last_error}", flush=True)
+                    return 2
+                recover_lost_s += skip
+                if skip_to is None or skip_to >= target_s:
+                    save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
+                    _publish(None, speed, waypoint)
+                    print(f"collect stop {segment_id} ended", flush=True)
+                    return 0
+                done_s = skip_to
+                segment_aborts = 0
+                segment_open = False
+                return None
             from python.collect.level_session import place_vehicle, recover_points, snap_to_road
 
             here = None
@@ -930,6 +1013,7 @@ def main(argv: list[str] | None = None) -> int:
                         flush=True,
                     )
                     time.sleep(SETTLE_S)
+                    recover_lost_s += float(SETTLE_S)
                     live.reset()
                     clock = ExcursionClock()
                     last_ai = None

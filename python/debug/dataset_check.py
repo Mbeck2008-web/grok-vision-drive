@@ -14,7 +14,8 @@ from typing import Any
 
 import numpy as np
 
-from python.data.strip_writer import CANVAS_H, CANVAS_W, SECTORS, read_state_jsonl
+from python.data.raw_frames import list_raw_images, load_scene_rows, load_training_bgr
+from python.data.strip_writer import CANVAS_H, CANVAS_W, SECTORS
 from python.debug.lane_targets import LOOKAHEADS_M, LANE_GT_DIM, lane_gt_from_record
 
 GAP_S = 2.0
@@ -113,6 +114,124 @@ def _blank_counts(path: Path) -> tuple[dict[str, int] | None, str | None]:
     return counts, None
 
 
+def _validate_raw(
+    root: Path,
+    out: Path,
+    rows: list[dict[str, Any]],
+    raw_images: list[Path],
+    *,
+    montage_n: int,
+) -> dict[str, Any]:
+    """Check per-camera files. Montages are written only under ``out``."""
+    issues: list[str] = []
+    by_cam: dict[str, set[int]] = {}
+    for path in raw_images:
+        cam_id = path.parent.name
+        by_cam.setdefault(cam_id, set()).add(int(path.stem))
+    row_ids = []
+    for row in rows:
+        try:
+            row_ids.append(int(row.get("i")))
+        except (TypeError, ValueError):
+            row_ids.append(None)
+    for row, idx in zip(rows, row_ids):
+        cams = row.get("cams") if isinstance(row.get("cams"), dict) else {}
+        for cam_id, meta in cams.items():
+            rel = str((meta or {}).get("file") or "")
+            if rel and not (root / rel).is_file():
+                issues.append(f"row {idx}: missing {rel}")
+            elif cam_id not in by_cam or idx not in by_cam.get(cam_id, set()):
+                issues.append(f"row {idx}: missing raw frame for {cam_id}")
+    prev_t: float | None = None
+    nan_rows = 0
+    for row in rows:
+        row_issues, prev_t = _issues_for_row(row, prev_t)
+        if any("NaN" in item or "not finite" in item for item in row_issues):
+            nan_rows += 1
+        issues.extend(row_issues)
+    blank = {cam_id: 0 for cam_id in by_cam}
+    checked = 0
+    seen_index: set[int] = set()
+    for path in raw_images:
+        image = _read_raw_image(path)
+        if image is None:
+            issues.append(f"unreadable {path.name}")
+            continue
+        seen_index.add(int(path.stem))
+        if sector_is_blank(image):
+            blank[path.parent.name] = blank.get(path.parent.name, 0) + 1
+    checked = len(seen_index)
+    if checked:
+        for cam_id, n_blank in blank.items():
+            n_files = len(by_cam.get(cam_id, ()))
+            if n_files and int(n_blank) == n_files:
+                issues.append(f"{cam_id} is blank on all {n_files} frames")
+    montage_rows = []
+    for row in rows:
+        tech = row.get("tech") if isinstance(row.get("tech"), dict) else None
+        values, mask = lane_gt_from_record(tech)
+        if float(mask.sum()) <= 0.0 or not bool(np.isfinite(values).all()):
+            continue
+        try:
+            idx = int(row.get("i"))
+        except (TypeError, ValueError):
+            continue
+        montage_rows.append((idx, values))
+    if len(montage_rows) > montage_n:
+        step = max(1, len(montage_rows) // montage_n)
+        montage_rows = montage_rows[::step][:montage_n]
+    montages: list[str] = []
+    for idx, values in montage_rows:
+        dest = out / f"montage_{idx:06d}.png"
+        try:
+            canvas = load_training_bgr(root, idx)
+        except (FileNotFoundError, ValueError):
+            canvas = None
+        if _draw_canvas(dest, canvas, values, f"i={idx} gt lanes"):
+            montages.append(str(dest))
+    report = {
+        "kind": "validate",
+        "format": "raw",
+        "root": str(root),
+        "rows": len(rows),
+        "jpegs": 0,
+        "raw_frames": len(raw_images),
+        "frames_checked": checked,
+        "nan_rows": nan_rows,
+        "blank_frames": blank,
+        "issues": issues,
+        "issue_count": len(issues),
+        "montages": montages,
+    }
+    from python.debug.remote_status import write_json
+
+    write_json(out / "report.json", report)
+    return report
+
+
+def _read_raw_image(path: Path) -> np.ndarray | None:
+    if path.suffix == ".npy":
+        try:
+            return np.load(path)
+        except (OSError, ValueError):
+            return None
+    import cv2
+
+    image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    return image
+
+
+def _draw_canvas(path: Path, canvas: np.ndarray | None, values: np.ndarray, title: str) -> bool:
+    from python.debug.gt_logger import save_debug_frame
+
+    lanes = lanes_from_vector(values)
+    center = None
+    if values.size >= 6 and bool(np.isfinite(values[:6]).all()):
+        center = float(values[0]) + 0.6 * (float(values[3]) - float(values[0]))
+    saved = save_debug_frame(path, stitch=canvas, lanes_bev=lanes, hud=[title], lane_x=center)
+    return saved is not None
+
+
 def _draw_montage(path: Path, strip_path: Path, values: np.ndarray, title: str) -> bool:
     import cv2
 
@@ -144,7 +263,10 @@ def validate_dataset(
     root = Path(root)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    rows = read_state_jsonl(root / "state.jsonl")
+    rows = load_scene_rows(root)
+    raw_images = list_raw_images(root)
+    if raw_images:
+        return _validate_raw(root, out, rows, raw_images, montage_n=montage_n)
     strips = root / "strips"
     jpegs = sorted(p for p in strips.glob("*.jpg") if p.is_file()) if strips.is_dir() else []
     jpeg_ids = set()

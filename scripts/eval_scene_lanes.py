@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from python.data.strip_writer import read_state_jsonl  # noqa: E402
+from python.data.raw_frames import load_scene_rows  # noqa: E402
 from python.debug.lane_targets import (  # noqa: E402
     lane_gt_from_record,
     lane_x_from_vector,
@@ -42,7 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _rows(root: Path) -> list[dict]:
-    rows = read_state_jsonl(root / "state.jsonl")
+    rows = load_scene_rows(root)
     rows.sort(key=lambda row: float(row.get("t") or 0.0))
     return rows
 

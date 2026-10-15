@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from python.data.strip_writer import CANVAS_H, CANVAS_W, read_state_jsonl  # noqa: E402
+from python.data.strip_writer import CANVAS_H, CANVAS_W  # noqa: E402
 from python.train.continual import (  # noqa: E402
     GRAD_CLIP,
     WEIGHT_DECAY,
@@ -125,15 +125,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _load_bgr(root: Path, index: int) -> Any:
-    import cv2
+    """Training canvas. Raw cameras are stitched here, not in the recording."""
+    from python.data.raw_frames import load_training_bgr
 
-    path = root / "strips" / f"{index:06d}.jpg"
-    bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
-    if bgr is None:
-        raise FileNotFoundError(path)
-    if int(bgr.shape[0]) != CANVAS_H or int(bgr.shape[1]) != CANVAS_W:
-        raise ValueError(f"{path} is {bgr.shape[1]}x{bgr.shape[0]}, expected {CANVAS_W}x{CANVAS_H}")
-    return bgr
+    return load_training_bgr(root, index)
 
 
 def _autocast(enabled: bool) -> Any:
@@ -689,7 +684,9 @@ def train_directory(
     from python.train.scene_net import SceneNet
 
     root = Path(root)
-    rows = read_state_jsonl(root / "state.jsonl")
+    from python.data.raw_frames import load_scene_rows
+
+    rows = load_scene_rows(root)
     file_bytes = measure_driving_file(root)
     if free_vram_bytes is None:
         free_vram_bytes = read_free_vram_bytes()

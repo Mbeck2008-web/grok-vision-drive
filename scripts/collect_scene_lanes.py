@@ -10,10 +10,16 @@ at a time, still traffic-free. The level is whatever is loaded. Start on
 west_coast_usa. Reloading a map is a separate ``--reload-level`` and
 replaces the current session.
 
-Each tick writes one JPEG and one state line with the real ``dt_s``. The
-scene net does not assume a fixed rate. Ground-truth lane targets are the
+Each tick writes one lossless file per camera, exactly the array BeamNG
+returned (PNG for uint8, otherwise ``.npy``). Cameras stay in separate
+folders. ``state.jsonl`` holds the raw timestamps, ``dt_s``, and the camera
+pose and intrinsics. Lane targets go in ``gt.jsonl``. Nothing here resizes,
+stitches, or draws on the frames. The trainer does that when it loads.
+
+The scene net does not assume a fixed rate. Ground-truth lane targets are the
 road network at 5/10/20/30 m plus heading error, same geometry as the
-live log's 8 m sample.
+live log's 8 m sample. Uncompressed uint8 for the yaml rig at 10 Hz is
+about 231.7 GB/h. The run stops if the data disk drops under 20 GB free.
 
 The output directory is resumable. A second start appends strips and keeps
 counting until ``--minutes`` is reached.
@@ -37,6 +43,7 @@ if str(ROOT) not in sys.path:
 SPEEDS_MPS = (8.0, 11.0, 14.0, 17.0, 10.0)
 SPEED_HOLD_S = 180.0
 WAYPOINT_HOLD_S = 180.0
+DISK_CHECK_S = 10.0
 
 
 def speed_at(elapsed_s: float, speeds: tuple[float, ...] = SPEEDS_MPS) -> float:
@@ -86,10 +93,22 @@ def directory_bytes(root: Path) -> int:
     return total
 
 
-def format_disk_line(elapsed_s: float, nbytes: int, free_bytes: int | None = None) -> str:
+def format_disk_line(
+    elapsed_s: float,
+    nbytes: int,
+    free_bytes: int | None = None,
+    *,
+    ceiling_gb_per_hour: float | None = None,
+) -> str:
     minutes = max(elapsed_s, 1e-6) / 60.0
     mb = nbytes / (1024.0 * 1024.0)
-    line = f"collect t={elapsed_s / 60.0:.1f} min disk={mb:.1f} MB rate={mb / minutes:.2f} MB/min"
+    measured_gb_h = (nbytes / max(elapsed_s, 1e-6)) * 3600.0 / (1024.0 ** 3)
+    line = (
+        f"collect t={elapsed_s / 60.0:.1f} min disk={mb:.1f} MB "
+        f"rate={mb / minutes:.2f} MB/min measured={measured_gb_h:.2f} GB/h"
+    )
+    if ceiling_gb_per_hour is not None:
+        line += f" ceiling={float(ceiling_gb_per_hour):.1f} GB/h"
     if free_bytes is not None:
         line += f" free={free_bytes / (1024.0 ** 3):.1f} GB"
     return line
@@ -201,7 +220,15 @@ def main(argv: list[str] | None = None) -> int:
         ensure_cache_dirs,
         scene_lanes_dir,
     )
-    from python.data.strip_writer import StripWriter
+    from python.data.raw_frames import (
+        COLLECT_HZ,
+        RawFrameWriter,
+        camera_sidecar,
+        describe_raw_disk,
+        frame_nbytes,
+        gb_per_hour,
+        rig_tick_bytes,
+    )
     from python.debug.gt_geom import heading_from_dir, project_road
     from python.debug.gt_logger import load_road_polys
     from python.debug.lane_targets import tech_from_hit
@@ -237,11 +264,15 @@ def main(argv: list[str] | None = None) -> int:
     if done_s >= target_s:
         print(f"collect already reached {done_s / 60.0:.1f} min in {out}")
         return 0
+    cam_cfg = load_camera_config()
+    ceiling_bytes = rig_tick_bytes(cam_cfg)
+    ceiling_gb = gb_per_hour(ceiling_bytes, COLLECT_HZ)
     print(
         f"collect resume={done_s / 60.0:.1f} min target={target_s / 60.0:.1f} min out={out} "
         f"mode={'waypoints ' + ','.join(names) if names else 'span traffic-free'}",
         flush=True,
     )
+    print(describe_raw_disk(ceiling_bytes, COLLECT_HZ) + " stop under 20 GB free", flush=True)
     bng = open_tech_beamngpy(
         host, port, home=cfg.get("home") or None, user=cfg.get("user") or None, launch=False,
     )
@@ -264,30 +295,31 @@ def main(argv: list[str] | None = None) -> int:
         if not roads:
             print(f"collect no road network ({note})", file=sys.stderr)
             return 2
-        cams = _attach_cameras(bng, vehicle, load_camera_config())
-        writer = StripWriter(out)
+        cams = _attach_cameras(bng, vehicle, cam_cfg)
+        writer = RawFrameWriter(out, camera_sidecar(cam_cfg))
         from python.data.strip_writer import STRIP_ORDER
         from python.debug.remote_status import CollectMeter, status_dir, write_collect_status
 
         meter = CollectMeter(STRIP_ORDER)
         status_root = status_dir()
         last_print = time.monotonic()
+        last_disk = last_print
         last_ai: tuple[float, str | None] | None = None
 
         def _publish(free: int | None, speed_now: float, route: str | None) -> None:
-            write_collect_status(
-                status_root,
-                meter.snapshot(
-                    elapsed_s=done_s,
-                    disk_bytes=directory_bytes(out),
-                    free_bytes=free,
-                    ai_speed_mps=speed_now,
-                    ai_mode="manual" if route else "span",
-                    ai_waypoint=route,
-                    out=str(out),
-                    target_s=target_s,
-                ),
+            payload = meter.snapshot(
+                elapsed_s=done_s,
+                disk_bytes=directory_bytes(out),
+                free_bytes=free,
+                ai_speed_mps=speed_now,
+                ai_mode="manual" if route else "span",
+                ai_waypoint=route,
+                out=str(out),
+                target_s=target_s,
             )
+            payload["raw_uncompressed_bytes_per_tick"] = int(ceiling_bytes)
+            payload["raw_uncompressed_gb_per_hour"] = float(ceiling_gb)
+            write_collect_status(status_root, payload)
 
         _publish(None, speed_at(done_s), waypoint_at(done_s, names))
         if status_root is not None:
@@ -302,7 +334,9 @@ def main(argv: list[str] | None = None) -> int:
                     _queue(vehicle, command)
                 last_ai = (speed, waypoint)
                 print(f"collect ai speed={speed:.0f} m/s route={waypoint or 'span'}", flush=True)
-            frames = _poll_cameras(cams)
+            frames, stamps = _poll_cameras(cams)
+            if meter.frames == 0 and frames:
+                print(describe_raw_disk(frame_nbytes(frames), COLLECT_HZ) + " (first tick)", flush=True)
             pos, direction, speed_now = _pose(vehicle)
             heading = None
             if direction is not None:
@@ -320,7 +354,7 @@ def main(argv: list[str] | None = None) -> int:
             writer.write(
                 frames,
                 t=now,
-                timestamps={cid: now for cid in frames},
+                timestamps=stamps,
                 ego={"speed_mps": speed_now, "x": None if pos is None else pos[0], "y": None if pos is None else pos[1]},
                 tech=tech,
             )
@@ -332,23 +366,26 @@ def main(argv: list[str] | None = None) -> int:
             meter.note(set(frames), gt_ok)
             time.sleep(0.1)
             done_s += time.monotonic() - tick_mark
-            if time.monotonic() - last_print >= 60.0:
+            now_m = time.monotonic()
+            if now_m - last_disk >= DISK_CHECK_S:
                 nbytes = directory_bytes(out)
                 try:
                     free = check_data_path(out)
                 except DataDriveError as exc:
                     save_progress(progress_path, done_s, target_s)
                     _publish(None, speed, waypoint)
-                    print(format_disk_line(done_s, nbytes), flush=True)
+                    print(format_disk_line(done_s, nbytes, ceiling_gb_per_hour=ceiling_gb), flush=True)
                     print(f"collect stop {exc}", flush=True)
                     return 3
-                print(format_disk_line(done_s, nbytes, free), flush=True)
-                save_progress(progress_path, done_s, target_s)
-                _publish(free, speed, waypoint)
-                last_print = time.monotonic()
+                last_disk = now_m
+                if now_m - last_print >= 60.0:
+                    print(format_disk_line(done_s, nbytes, free, ceiling_gb_per_hour=ceiling_gb), flush=True)
+                    save_progress(progress_path, done_s, target_s)
+                    _publish(free, speed, waypoint)
+                    last_print = now_m
         save_progress(progress_path, done_s, target_s)
         _publish(None, speed_at(done_s), waypoint_at(done_s, names))
-        print(format_disk_line(done_s, directory_bytes(out)), flush=True)
+        print(format_disk_line(done_s, directory_bytes(out), ceiling_gb_per_hour=ceiling_gb), flush=True)
         return 0
     finally:
         release_tech_beamngpy(bng)
@@ -403,17 +440,29 @@ def _attach_cameras(bng: Any, vehicle: Any, cfg: dict[str, Any]) -> dict[str, An
     return attached
 
 
-def _poll_cameras(cams: dict[str, Any]) -> dict[str, Any]:
+def _poll_cameras(cams: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Pictures as the sensor returned them, plus the wall time of that poll."""
+    import numpy as np
+
     frames: dict[str, Any] = {}
+    stamps: dict[str, Any] = {}
     for cid, cam in cams.items():
         try:
             payload = cam.poll()
         except Exception:
             continue
         image = _colour(payload)
-        if image is not None:
-            frames[cid] = image
-    return frames
+        if not isinstance(image, np.ndarray) or image.size == 0:
+            continue
+        frames[cid] = image
+        sensor_t = None
+        if isinstance(payload, dict):
+            for key in ("timestamp", "time", "t"):
+                if payload.get(key) is not None:
+                    sensor_t = payload.get(key)
+                    break
+        stamps[cid] = {"wall": time.time(), "sensor_t": sensor_t}
+    return frames, stamps
 
 
 def _pose(vehicle: Any) -> tuple[tuple[float, float, float] | None, tuple[float, float, float] | None, float | None]:

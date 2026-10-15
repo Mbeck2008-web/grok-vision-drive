@@ -19,11 +19,25 @@ line, the validator, and the eval summary.
 py -3 scripts\collect_scene_lanes.py --minutes 45
 ```
 
+Each camera is saved on its own, lossless, as BeamNG returned it:
+`E:\GVD_data\scene_lanes\raw\<cam>\NNNNNN.png` (uint8) or `.npy` (any
+other dtype). No JPEG, resize, crop, colour change, overlay, or stitch
+is written into those files. `state.jsonl` has the timestamps, `dt_s`,
+and the camera pose and intrinsics. Lane targets are `gt.jsonl`. The
+trainer stitches and resizes when it loads.
+
+The eight-camera rig in `config/cameras.yaml` is 6.59 MiB of uint8 per
+tick. At the 10 Hz loop that is **231.7 GB/h** uncompressed and about
+3.9 GB/min. PNG is lossless and smaller; the minute line prints the
+measured GB/h plus that ceiling. Free space is checked every 10 seconds.
+The run stops under 20 GB free, so the uncompressed ceiling fits about
+two hours on a drive with 525 GB free.
+
 Every minute, and once at start and stop, this rewrites
 `E:\GVD_data\status\collect.json`: frames, Hz, dropped cameras, cameras
 that have been missing for several ticks, the fraction of ticks with a
-valid lane target, free disk, and the AI speed and mode. The run stops
-itself under 20 GB free.
+valid lane target, free disk, the AI speed and mode, and the raw GB/h
+ceiling.
 
 ## Check a recording
 
@@ -33,8 +47,9 @@ py -3 scripts\validate_scene_lanes.py --strips E:\GVD_data\scene_lanes
 
 Writes `E:\GVD_data\status\validate\report.json` and a few
 `montage_NNNNNN.png` files with the ground-truth lane drawn. The report
-counts rows against JPEGs, timestamp gaps, NaNs, target ranges, and
-blank sectors per camera. Exit 1 means the report has issues.
+counts rows against the raw camera files, timestamp gaps, NaNs, target
+ranges, and blank frames per camera. Montage PNGs are written beside the
+report, not onto the recorded frames. Exit 1 means the report has issues.
 
 ## Train
 

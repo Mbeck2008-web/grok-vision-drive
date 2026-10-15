@@ -137,6 +137,28 @@ def check_validate_and_status_command() -> None:
         blob = "\n".join(lines)
         assert "step=12" in blob
         assert "boom" in blob or "RuntimeError" in blob
+        from scripts.gvd_status import crash_is_current
+
+        crash_path = status / "train_crash.txt"
+        os.utime(crash_path, (1_700_000_000, 1_700_000_000))
+        write_heartbeat(
+            status,
+            {
+                "kind": "train",
+                "step": 173,
+                "epoch": 0,
+                "loss": 0.4,
+                "eta_s": 478,
+                "updated": 1_800_000_000,
+                "lr": 0.001,
+                "device": "cuda",
+            },
+        )
+        assert crash_is_current(crash_path, {"updated": 1_800_000_000}) is False
+        assert crash_is_current(crash_path, {"started": 1_700_000_100}) is False
+        assert crash_is_current(crash_path, {"started": 1_600_000_000}) is True
+        stale = summarize(status, root / "eval")
+        assert "boom" not in "\n".join(stale)
         assert "frames=" in blob
         os.environ["GVD_DATA_DIR"] = str(root)
         try:

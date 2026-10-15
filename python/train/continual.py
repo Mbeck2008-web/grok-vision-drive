@@ -346,6 +346,29 @@ def pass_plan(
     return plan
 
 
+def remaining_until_holdout_can_stop(
+    remaining_this_pass: int,
+    steps_per_pass: int,
+    *,
+    epoch: int,
+    has_holdout: bool,
+    rates_after: int,
+) -> int:
+    """Steps from here until the holdout is allowed to stop the run.
+
+    The first pass cannot stop. Each later learning rate gets the same shape:
+    one pass, plus a second when a holdout exists. ``--epochs`` does not
+    multiply this. If val loss keeps falling, the run continues past it.
+    """
+    remaining = max(0, int(remaining_this_pass))
+    per = max(0, int(steps_per_pass))
+    if has_holdout and int(epoch) <= 0:
+        remaining += per
+    later = per * (2 if has_holdout else 1)
+    remaining += max(0, int(rates_after)) * later
+    return remaining
+
+
 def holdout_stopped(losses: list[float]) -> bool:
     """True once the latest holdout loss is not strictly better than the best so far.
 

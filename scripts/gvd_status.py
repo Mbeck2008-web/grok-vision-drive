@@ -41,6 +41,42 @@ def _line(name: str, text: str) -> str:
     return f"{name}: {text}"
 
 
+def _stamp(value: object) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        stamp = float(value)
+    except (TypeError, ValueError):
+        return None
+    if stamp != stamp or stamp in (float("inf"), float("-inf")):
+        return None
+    return stamp
+
+
+def crash_is_current(crash: Path, heart: dict | None) -> bool:
+    """A crash file from before this run's heartbeat is not the current failure.
+
+    ``started`` is the run clock. A heartbeat that only has ``updated`` (the
+    live trainer before that field existed) still wins when it is newer than
+    the crash file, because a real crash is written after the last heartbeat.
+    """
+    if not crash.is_file():
+        return False
+    try:
+        mtime = float(crash.stat().st_mtime)
+    except OSError:
+        return False
+    if not heart:
+        return True
+    started = _stamp(heart.get("started"))
+    if started is not None:
+        return mtime + 1.0 >= started
+    updated = _stamp(heart.get("updated"))
+    if updated is not None:
+        return mtime + 1.0 >= updated
+    return True
+
+
 def summarize(directory: Path | None, eval_directory: Path | None) -> list[str]:
     lines: list[str] = []
     if directory is None:
@@ -75,14 +111,18 @@ def summarize(directory: Path | None, eval_directory: Path | None) -> list[str]:
     if heart is None:
         lines.append(_line("train", "none"))
     else:
-        lines.append(
-            _line(
-                "train",
-                f"step={heart.get('step')} epoch={heart.get('epoch')} "
-                f"loss={heart.get('loss')} eta_s={heart.get('eta_s')} "
-                f"lr={heart.get('lr')} device={heart.get('device')}",
-            )
+        train = (
+            f"step={heart.get('step')} epoch={heart.get('epoch')} "
+            f"loss={heart.get('loss')} eta_s={heart.get('eta_s')} "
+            f"lr={heart.get('lr')} device={heart.get('device')}"
         )
+        if heart.get("eta_pass_s") is not None:
+            train += (
+                f" eta_pass_s={heart.get('eta_pass_s')} "
+                f"steps_per_epoch={heart.get('steps_per_epoch')} "
+                f"supervised={heart.get('supervised')}"
+            )
+        lines.append(_line("train", train))
     metrics = tail_jsonl(directory / METRICS_NAME, 1)
     if not metrics:
         lines.append(_line("metrics", "none"))
@@ -98,7 +138,7 @@ def summarize(directory: Path | None, eval_directory: Path | None) -> list[str]:
             )
         )
     crash = directory / CRASH_NAME
-    if crash.is_file():
+    if crash_is_current(crash, heart):
         text = crash.read_text(encoding="utf-8", errors="replace").strip().splitlines()
         head = text[0] if text else "empty"
         lines.append(_line("crash", f"{crash} {head}"))
@@ -140,7 +180,7 @@ def summarize(directory: Path | None, eval_directory: Path | None) -> list[str]:
         collect is None
         and heart is None
         and not metrics
-        and not crash.is_file()
+        and not crash_is_current(crash, heart)
         and live is None
         and report is None
         and summary is None

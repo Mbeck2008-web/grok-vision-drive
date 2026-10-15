@@ -42,6 +42,7 @@ from python.train.continual import (  # noqa: E402
     ordered_learning_rates,
     pass_plan,
     pick_learning_rate,
+    remaining_until_holdout_can_stop,
 )
 from python.train.fit import (  # noqa: E402
     TrainFitError,
@@ -202,10 +203,21 @@ def disarm_dry_run_watchdog() -> None:
     faulthandler.cancel_dump_traceback_later()
 
 
-def _confirm_start(view: TrainWindow, *, dry_run: bool, autostart: bool = False) -> bool:
-    """Dry-run and autostart begin immediately. A panel run waits for Start."""
-    if dry_run or autostart:
-        why = "dry-run" if dry_run else "autostart"
+def _confirm_start(
+    view: TrainWindow,
+    *,
+    dry_run: bool,
+    sanity: bool = False,
+    autostart: bool = False,
+) -> bool:
+    """Dry-run, sanity, and autostart begin immediately. A panel run waits for Start."""
+    if dry_run or sanity or autostart:
+        if dry_run:
+            why = "dry-run"
+        elif sanity:
+            why = "sanity"
+        else:
+            why = "autostart"
         print(f"[GVD] {why}: starting without the Start button", flush=True)
         return True
     return _wait_for_start(view)
@@ -925,11 +937,13 @@ def train_directory(
     )
 
     debug_dir = status_dir(status_root)
+    run_started = time.time()
     write_heartbeat(
         debug_dir,
         {
             "kind": "train",
             "phase": "loading",
+            "started": run_started,
             "updated": time.time(),
             "step": 0,
             "epoch": 0,
@@ -961,6 +975,10 @@ def train_directory(
     step_trace: dict[str, Any] = {}
     sanity_ok: bool | None = None
     every = max(1, int(metrics_every))
+    steps_per_epoch = 0
+    eta_pass: float | None = None
+    rates_after = 0
+    schedule_printed = False
 
     def _log_step(kind: str, eta: float | None, mem_bytes: int, *, save: bool) -> None:
         nonlocal last_heart, last_ckpt
@@ -991,11 +1009,17 @@ def train_directory(
                 debug_dir,
                 {
                     "kind": "train",
+                    "started": run_started,
                     "updated": time.time(),
                     "step": int(done),
                     "epoch": int(epoch),
+                    "epochs": int(requested_epochs),
                     "loss": json_num(last_loss),
                     "eta_s": json_num(eta),
+                    "eta_pass_s": json_num(eta_pass),
+                    "steps_per_epoch": int(steps_per_epoch),
+                    "supervised": int(supervised),
+                    "windows": int(done),
                     "lr": json_num(holder.get("lr")),
                     "device": str(device.type),
                     "strips": str(root),
@@ -1076,6 +1100,7 @@ def train_directory(
     def _train_passes() -> float | None:
         nonlocal paused_exit, epoch, cursor, done, last_loss, supervised
         nonlocal device, net, batch, recommended, windows, last_batch
+        nonlocal steps_per_epoch, eta_pass, schedule_printed
         history: list[float] = []
         best_value: float | None = None
         best_blob: dict[str, Any] | None = None
@@ -1170,8 +1195,26 @@ def train_directory(
                 index += 1
                 elapsed = time.perf_counter() - started
                 remaining_steps = sum(1 for later in plan_steps[index:] if later["kind"] == "train")
+                steps_per_epoch = sum(1 for item in plan_steps if item["kind"] == "train")
+                has_holdout = any(item["kind"] == "holdout" for item in plan_steps)
+                if not schedule_printed:
+                    schedule_printed = True
+                    print(
+                        f"[GVD] scene schedule steps_per_epoch={steps_per_epoch} "
+                        f"epoch={epoch} rates_after={rates_after} "
+                        f"--epochs {requested_epochs} is recorded; the holdout stops the run",
+                        flush=True,
+                    )
+                job_steps = remaining_until_holdout_can_stop(
+                    remaining_steps,
+                    steps_per_epoch,
+                    epoch=epoch,
+                    has_holdout=has_holdout,
+                    rates_after=rates_after,
+                )
                 used, kind = _memory_reading(device.type)
-                eta = predict_eta_s(done, elapsed, remaining_steps)
+                eta_pass = predict_eta_s(done, elapsed, remaining_steps)
+                eta = predict_eta_s(done, elapsed, job_steps)
                 _log_step("train", eta, used, save=True)
                 _publish(
                     view,
@@ -1232,7 +1275,7 @@ def train_directory(
         return best_value
 
     def _limited(limit: int, subset: list[Mapping[str, Any]], shapes: bool) -> None:
-        nonlocal last_loss, done, sanity_ok, last_batch
+        nonlocal last_loss, done, sanity_ok, last_batch, supervised, windows
         step_trace["print_shapes"] = shapes
         if not subset:
             sanity_ok = False
@@ -1246,7 +1289,7 @@ def train_directory(
                 "epoch": 0,
                 "rows": [row.get("i") for row in subset],
             }
-            loss, _n_sup, _carry, state = _optimizer_step(
+            loss, n_sup, _carry, state = _optimizer_step(
                 net,
                 holder["opt"],
                 holder["scaler"],
@@ -1261,6 +1304,8 @@ def train_directory(
                 trace=step_trace,
             )
             done = step_i + 1
+            windows = done
+            supervised += int(n_sup)
             if loss is not None:
                 last_loss = loss
             lane_loss = step_trace.get("lane_gt")
@@ -1279,7 +1324,12 @@ def train_directory(
     try:
         if open_panel:
             view.open()
-        if not _confirm_start(view, dry_run=dry_run, autostart=autostart or not open_panel):
+        if not _confirm_start(
+            view,
+            dry_run=dry_run,
+            sanity=sanity,
+            autostart=autostart or not open_panel,
+        ):
             paused_exit = True
         elif dry_run or sanity:
             view.mark_running()
@@ -1328,7 +1378,9 @@ def train_directory(
                 blobs: dict[float, dict[str, Any]] = {}
                 series: dict[float, list[float]] = {}
                 view.mark_running()
-                for rate in ordered_learning_rates(lr):
+                rates = ordered_learning_rates(lr)
+                for rate_index, rate in enumerate(rates):
+                    rates_after = len(rates) - rate_index - 1
                     _load_weights(init_blob)
                     _arm(device.type, rate)
                     started = time.perf_counter()
@@ -1364,8 +1416,9 @@ def train_directory(
             view.close()
     return {
         "strips": len(rows),
-        "windows": windows,
-        "supervised": supervised,
+        "windows": int(done),
+        "supervised": int(supervised),
+        "steps_per_epoch": int(steps_per_epoch),
         "precision": holder.get("precision", "fp32"),
         "capability": holder.get("cap", capability),
         "export": None if export_path is None else str(export_path),
@@ -1442,8 +1495,9 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(1)
     note = "recommended" if stats["recommended"] else "not recommended"
     print(
-        f"[GVD] scene train strips={stats['strips']} windows={stats['windows']} "
-        f"supervised={stats['supervised']} precision={stats['precision']} "
+        f"[GVD] scene train strips={stats['strips']} steps={stats['windows']} "
+        f"supervised={stats['supervised']} steps_per_epoch={stats.get('steps_per_epoch', 0)} "
+        f"precision={stats['precision']} "
         f"device={stats['device']} batch={stats['batch']} {note}"
     )
     if stats["export"]:

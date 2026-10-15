@@ -22,7 +22,12 @@ from python.data.raw_frames import (  # noqa: E402
     training_frame_bytes,
 )
 from python.data.strip_writer import compose_strip  # noqa: E402
-from python.train.continual import choose_chunk_length, chunk_vram_budget, should_reset_state  # noqa: E402
+from python.train.continual import (  # noqa: E402
+    choose_chunk_length,
+    chunk_vram_budget,
+    remaining_until_holdout_can_stop,
+    should_reset_state,
+)
 from python.train.fit import (  # noqa: E402
     _windows_memory,
     bytes_per_strip,
@@ -246,6 +251,18 @@ def check_panel_flags_and_vram_room() -> None:
         trainer.interactive_display = real_display
         trainer.headless_requested = real_headless
     assert _confirm_start(_HangWindow(), dry_run=False, autostart=True) is True
+    assert _confirm_start(_HangWindow(), dry_run=False, sanity=True) is True
+    # Rest of this pass, plus the forced second pass, plus two passes of the other rate.
+    # 435 left in a 608-step epoch, one learning rate still waiting.
+    job = remaining_until_holdout_can_stop(
+        435,
+        608,
+        epoch=0,
+        has_holdout=True,
+        rates_after=1,
+    )
+    assert job == 435 + 608 + 2 * 608
+    assert remaining_until_holdout_can_stop(10, 40, epoch=1, has_holdout=True, rates_after=0) == 10
 
     # 1080 Ti, about 7.9 GiB free, FP32, one repaired copy of the 45-minute set.
     free = int(7.9 * (1024 ** 3))

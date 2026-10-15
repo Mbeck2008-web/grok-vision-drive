@@ -141,8 +141,30 @@ def bad_row_reasons(rows: list[Mapping[str, Any]]) -> dict[int, str]:
     return reasons
 
 
+def _logged_motion_break(row: Mapping[str, Any] | None) -> bool:
+    """True when this row is the recover or hard abort that closed a stall.
+
+    The frames are still a bad training span. Validate treats the gap the
+    same way it treats a map change.
+    """
+    if not row:
+        return False
+    flag = row.get("recover")
+    if flag is True or str(flag).lower() in ("1", "true"):
+        return True
+    excursion = row.get("excursion")
+    if not isinstance(excursion, dict):
+        return False
+    reason = str(excursion.get("reason") or "")
+    return reason in ("stationary", "tipped", "damage")
+
+
 def motion_issue_lines(rows: list[Mapping[str, Any]]) -> list[str]:
-    """One line per contiguous bad span, not one line per frame."""
+    """One line per contiguous bad span, not one line per frame.
+
+    A stationary span that ends on a logged recover or stall abort is a
+    segment break. A stall that runs to the end of the file is still an issue.
+    """
     reasons = bad_row_reasons(rows)
     if not reasons:
         return []
@@ -164,9 +186,16 @@ def motion_issue_lines(rows: list[Mapping[str, Any]]) -> list[str]:
         except (TypeError, ValueError):
             continue
 
-    def close() -> None:
+    def close(follower: Mapping[str, Any] | None = None) -> None:
         nonlocal start, prev, reason, span_s
         if start is None or prev is None:
+            return
+        tail = by_index.get(prev)
+        if reason == "stationary" and (_logged_motion_break(tail) or _logged_motion_break(follower)):
+            start = None
+            prev = None
+            reason = ""
+            span_s = 0.0
             return
         lines.append(f"{reason} i={start}-{prev} {span_s:.1f}s")
         start = None
@@ -177,7 +206,7 @@ def motion_issue_lines(rows: list[Mapping[str, Any]]) -> list[str]:
     for index in order:
         why = reasons.get(index)
         if why is None:
-            close()
+            close(by_index.get(index))
             continue
         row = by_index.get(index) or {}
         step = max(0.0, _num(row.get("dt_s")) or 0.0)

@@ -255,6 +255,78 @@ def _restore(collect: object, previous: tuple, tech: object, gt: object) -> None
     del gt
 
 
+def check_recover_stall_is_a_break() -> None:
+    """The 10 s before a logged recover is a segment break, not a validate issue."""
+    stalled = [
+        {
+            "i": index,
+            "dt_s": 0.0 if index == 0 else 1.0,
+            "segment": "west_coast_usa#0",
+            "excursion": {"phase": "cruise", "reason": ""},
+            "ego": {"speed_mps": 0.1, "dir": [0.0, 1.0, 0.0]},
+        }
+        for index in range(12)
+    ]
+    recover = {
+        "i": 12,
+        "dt_s": 5.3,
+        "segment": "west_coast_usa#0",
+        "recover": True,
+        "excursion": {"phase": "cruise", "reason": ""},
+        "ego": {"speed_mps": 1.16, "dir": [0.0, 1.0, 0.0]},
+    }
+    rows = stalled + [recover]
+    assert set(bad_row_reasons(rows)) == set(range(12))
+    assert motion_issue_lines(rows) == []
+    fast = {
+        "i": 12,
+        "dt_s": 1.0,
+        "segment": "west_coast_usa#0",
+        "ego": {"speed_mps": 8.0, "dir": [0.0, 1.0, 0.0]},
+    }
+    assert any(line.startswith("stationary i=0-11") for line in motion_issue_lines(stalled + [fast]))
+    assert any(line.startswith("stationary") for line in motion_issue_lines(stalled))
+    abort = {
+        "i": 12,
+        "dt_s": 0.2,
+        "segment": "west_coast_usa#0",
+        "excursion": {"phase": "abort", "reason": "stationary"},
+        "ego": {"speed_mps": 8.0, "dir": [0.0, 1.0, 0.0]},
+    }
+    assert motion_issue_lines(stalled + [abort]) == []
+
+    colour = np.zeros((8, 12, 3), dtype=np.uint8)
+    colour[:, :, 1] = 40
+    tech = tech_from_hit(0.2, 0.0, 3.5, False)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        writer = RawFrameWriter(root, [])
+        for index in range(12):
+            writer.write(
+                {"main": colour},
+                t=float(index),
+                ego={"speed_mps": 0.1, "dir": [0.0, 1.0, 0.0]},
+                tech=tech,
+                driver="beamng_ai",
+                tags={"segment": "west_coast_usa#0"},
+            )
+        writer.write(
+            {"main": colour},
+            t=17.0,
+            ego={"speed_mps": 1.16, "dir": [0.0, 1.0, 0.0]},
+            tech=tech,
+            driver="beamng_ai",
+            tags={"segment": "west_coast_usa#0", "recover": True},
+        )
+        stored = load_scene_rows(root)
+        report = validate_dataset(root, root / "validate_out", montage_n=1)
+        assert not any(item.startswith("stationary") for item in report["issues"]), report["issues"]
+        kept, missing, excluded = select_training_rows(root, stored)
+        assert missing == 0 and excluded == 12
+        assert [int(row["i"]) for row in kept] == [12]
+    print("recover stall is a segment break")
+
+
 def check_warmup_skips_partial_cameras() -> None:
     import scripts.collect_scene_lanes as collect
     from python.collect.auto_mode import stop_file
@@ -370,10 +442,11 @@ def check_tipped_car_exits() -> None:
         sys.stdout = old
         _restore(collect, previous, tech, None)
     text = buf.getvalue()
-    assert code == 2, (code, text)
+    assert code == 0, (code, text)
     assert text.count("collect abort tipped") == 2
     assert "collect segment end" in text and "tipped" in text
-    assert "recover lost" in text
+    assert "ended" in text
+    assert "recover lost" not in text
     assert not (out / "state.jsonl").is_file()
     print("tipped abort wrote nothing")
 
@@ -387,8 +460,9 @@ def check_second_stall_ends_the_segment() -> None:
     assert failed["stationary"] == {"italy"}
     assert segment_fail_action("stationary", "east_coast_usa", failed, 0.0, 60.0, 360.0) == "continue"
     assert segment_fail_action("stationary", "hirochi_raceway", failed, 0.0, 60.0, 360.0) == "exit"
-    lost = segment_fail_action("tipped", "west_coast_usa", {}, 0.0, 30.0, 120.0)
-    assert lost == "exit"
+    # The skipped remainder is reassigned. Only real lost seconds fail the plan.
+    assert segment_fail_action("tipped", "west_coast_usa", {}, 0.0, 30.0, 120.0) == "continue"
+    assert segment_fail_action("tipped", "west_coast_usa", {}, 30.0, 0.0, 120.0) == "exit"
     assert segment_fail_action("damage", "italy", {}, 0.0, 10.0, 7200.0) == "continue"
     print("second stall ends the segment")
 
@@ -480,6 +554,7 @@ def main() -> None:
     check_masked_labels_and_map_switch()
     check_snap_uses_node_z()
     check_validator_drops_parked_span()
+    check_recover_stall_is_a_break()
     check_warmup_skips_partial_cameras()
     check_stuck_car_aborts_without_weaving()
     check_tipped_car_exits()

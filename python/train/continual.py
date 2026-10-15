@@ -19,6 +19,10 @@ CANDIDATE_LRS = (1e-3, 1e-4)
 WEIGHT_DECAY = 0.01
 GRAD_CLIP = 1.0
 HOLDOUT_FRACTION = 0.2
+# Rows within this many seconds of the cut are neither train nor holdout.
+HOLDOUT_GAP_S = 4.0
+# A segment longer than this is cut in time even when other segments exist.
+LONG_SEGMENT_S = 15.0 * 60.0
 CHUNK_MIN = 8
 CHUNK_MAX = 16
 # A backward chunk has to fit on an 11 GB card.
@@ -318,8 +322,9 @@ def _segment_groups(rows: list[Mapping[str, Any]]) -> list[tuple[str, list[Mappi
 def holdout_segment_names(rows: list[Mapping[str, Any]]) -> set[str]:
     """Whole segments held out of training.
 
-    Two or more segments: the last one, so a single drive is not cut at 80%.
-    Five or more: every fifth segment. One segment stays entirely in train.
+    Two or more short segments: the last one. Five or more: every fifth.
+    One segment, or any segment longer than about 15 minutes, is not in
+    this set. Those are cut by time inside the segment.
     """
     groups = _segment_groups(rows)
     if not groups or len(groups) < 2:
@@ -328,6 +333,59 @@ def holdout_segment_names(rows: list[Mapping[str, Any]]) -> set[str]:
     if len(names) < 5:
         return {names[-1]}
     return {name for index, name in enumerate(names) if (index + 1) % 5 == 0}
+
+
+def _row_time(row: Mapping[str, Any]) -> float | None:
+    try:
+        stamp = float(row["t"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not math.isfinite(stamp):
+        return None
+    return stamp
+
+
+def segment_span_s(rows: list[Mapping[str, Any]]) -> float:
+    """Seconds from the first timestamp to the last. Zero when time is missing."""
+    times = [stamp for stamp in (_row_time(row) for row in rows) if stamp is not None]
+    if len(times) < 2:
+        return 0.0
+    return max(times) - min(times)
+
+
+def split_segment_time_holdout(
+    rows: list[Mapping[str, Any]],
+    fraction: float = HOLDOUT_FRACTION,
+    *,
+    gap_s: float = HOLDOUT_GAP_S,
+) -> tuple[list[Mapping[str, Any]], list[Mapping[str, Any]]]:
+    """Last ``fraction`` of this segment's time, with a gap at the cut.
+
+    The gap is neither trained nor scored, so the holdout does not start
+    on the same second as the last training frame. A span with no holdout
+    sample stays entirely in the prefix.
+    """
+    times = [_row_time(row) for row in rows]
+    known = [stamp for stamp in times if stamp is not None]
+    if len(known) < 2:
+        return list(rows), []
+    t0 = min(known)
+    span = max(known) - t0
+    portion = min(1.0, max(0.0, float(fraction)))
+    if span <= 0.0 or portion <= 0.0:
+        return list(rows), []
+    cut = t0 + (1.0 - portion) * span
+    gap_at = cut - max(0.0, float(gap_s))
+    prefix: list[Mapping[str, Any]] = []
+    hold: list[Mapping[str, Any]] = []
+    for row, stamp in zip(rows, times):
+        if stamp is None or stamp < gap_at:
+            prefix.append(row)
+        elif stamp >= cut:
+            hold.append(row)
+    if not hold:
+        return list(rows), []
+    return prefix, hold
 
 
 def pass_plan(
@@ -340,15 +398,18 @@ def pass_plan(
 ) -> list[dict[str, Any]]:
     """One pass: overlapping train chunks, then the holdout.
 
-    Rows tagged with ``segment`` hold out whole segments. A recording
-    without that tag still holds out the last fraction of each span.
+    Rows tagged with ``segment`` hold out whole short segments when there
+    are two or more. One segment, and any segment longer than about 15
+    minutes, holds out the last fraction of its own time, with a few
+    seconds dropped at the cut. A recording without a segment tag still
+    holds out the last fraction of each span.
     A rare chunk is listed twice so the trainer steps twice from the same
     incoming state. Holdout rows are never listed as train rows. The second
     copy of a rare chunk uses ``incoming == "chunk"`` so it does not advance
     the carry on its own.
     """
     if _segment_groups(rows) is not None:
-        return _pass_plan_segments(rows, length, stride, memory_s=memory_s)
+        return _pass_plan_segments(rows, length, stride, memory_s=memory_s, fraction=fraction)
     plan: list[dict[str, Any]] = []
     for start, end in recording_spans(rows, memory_s=memory_s):
         segment = list(rows[start:end])
@@ -398,11 +459,30 @@ def _pass_plan_segments(
     stride: int,
     *,
     memory_s: float,
+    fraction: float = HOLDOUT_FRACTION,
 ) -> list[dict[str, Any]]:
     groups = _segment_groups(rows) or []
     held = holdout_segment_names(rows)
+    few = len(groups) < 2
     plan: list[dict[str, Any]] = []
     for seg, block in groups:
+        if few or segment_span_s(block) > LONG_SEGMENT_S:
+            prefix, hold = split_segment_time_holdout(block, fraction)
+            plain = [dict(row) for row in prefix]
+            for row in plain:
+                row.pop("segment", None)
+            plan.extend(_train_only_plan(plain, length, stride, memory_s=memory_s))
+            if hold:
+                plan.append(
+                    {
+                        "kind": "holdout",
+                        "rows": list(hold),
+                        "incoming": "reset",
+                        "stride": 0,
+                        "grad_frames": 0,
+                    }
+                )
+            continue
         plain = [dict(row) for row in block]
         for row in plain:
             row.pop("segment", None)

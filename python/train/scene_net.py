@@ -998,8 +998,6 @@ def _lane_gt_loss(
     mask = target["lane_gt_valid"].to(device=device, dtype=dtype).reshape(-1, LANE_GT_DIM)
     conf = pred_v[:, -1].clamp(1e-6, 1.0 - 1e-6)
     bce = functional.binary_cross_entropy(conf, goal[:, -1])
-    import torch
-
     values = torch.nan_to_num(pred_v[:, :-1], nan=0.0)
     goal_v = torch.nan_to_num(goal[:, :-1], nan=0.0)
     value_mask = mask[:, :-1]

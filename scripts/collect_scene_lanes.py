@@ -224,11 +224,19 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Comma-separated levels to rotate. Empty keeps the current level.",
     )
-    parser.add_argument("--segment-min", type=float, default=12.0, help="Minutes on each map segment.")
+    parser.add_argument(
+        "--segment-min",
+        type=float,
+        default=12.0,
+        help="Minutes per segment. Weighted time is split into chunks of this length.",
+    )
     parser.add_argument(
         "--map-weights",
         default="",
-        help="Time shares, for example west_coast_usa=0.6. Unlisted maps split the rest. Empty rotates equally.",
+        help=(
+            "Time shares, for example west_coast_usa=0.6. Unlisted maps split the rest. "
+            "Each share is cut into --segment-min chunks and rotated. Empty rotates equally."
+        ),
     )
     parser.add_argument("--no-excursions", action="store_true", help="Stay centered. Default weaves and lane changes.")
     parser.add_argument("--smoke-s", type=float, default=60.0, help="Collect this many seconds, check PNG decode, then continue. 0 skips the check.")
@@ -291,8 +299,9 @@ def share_maps(maps: tuple[str, ...], weights: dict[str, float]) -> list[tuple[s
     return [(name, explicit.get(name, 0.0) / scale) for name in maps]
 
 
-# A second stall, tip, or damage hit ends the segment. The same reason on
-# three maps, or recoveries that eat this much of the plan, end the run.
+# A second stall, tip, or damage hit ends the segment. The remainder of
+# that segment is reassigned, not lost. The same reason on three maps, or
+# real stall and settle seconds past this much of the plan, end the run.
 HARD_SEGMENT_REASONS = ("stationary", "tipped", "damage")
 SEGMENT_FAIL_MAPS = 3
 RECOVER_LOST_FRACTION = 0.20
@@ -309,20 +318,75 @@ def segment_fail_action(
     """``exit`` or ``continue`` after a segment's second hard abort.
 
     Records ``map_name`` under ``reason``. Three maps with that reason, or
-    recoveries plus the skipped remainder past 20% of a finite plan, exit.
+    real stall and settle seconds past 20% of a finite plan, exit.
+    ``skip_s`` is the remainder handed to later segments. It is not lost
+    time, so one short segment cannot fail a long plan.
     """
+    del skip_s
     bucket = failed.setdefault(str(reason), set())
     bucket.add(map_name or "current")
     if len(bucket) >= SEGMENT_FAIL_MAPS:
         return "exit"
     planned = float(target_s)
-    if (
-        math.isfinite(planned)
-        and planned > 0.0
-        and (float(lost_s) + max(0.0, float(skip_s))) > RECOVER_LOST_FRACTION * planned
-    ):
+    if math.isfinite(planned) and planned > 0.0 and float(lost_s) > RECOVER_LOST_FRACTION * planned:
         return "exit"
     return "continue"
+
+
+def weighted_pieces(
+    maps: tuple[str, ...],
+    segment_s: float,
+    weights: dict[str, float],
+    total_s: float | None,
+) -> list[tuple[str, float]]:
+    """Chunks of at most ``segment_s`` that sum to each map's share.
+
+    The heaviest map alternates with the others, so a 60% west-coast share
+    is several short visits rather than one block at the front. A map whose
+    share is already shorter than ``segment_s`` is a single chunk.
+    """
+    shares = share_maps(maps, weights)
+    if total_s is not None and math.isfinite(float(total_s)) and float(total_s) > 0.0:
+        cycle = float(total_s)
+    else:
+        positive = [share for _name, share in shares if share > 1e-9]
+        small = min(positive) if positive else 1.0
+        cycle = max(1.0, float(segment_s)) / small
+    span = max(1.0, float(segment_s))
+    budgets = [(name, max(0.0, share) * cycle) for name, share in shares]
+    budgets = [(name, dur) for name, dur in budgets if dur > 0.05]
+    if not budgets:
+        return [(maps[0], span)]
+
+    def _chunks(name: str, budget: float) -> list[tuple[str, float]]:
+        pieces: list[tuple[str, float]] = []
+        left = float(budget)
+        while left > 0.05 and len(pieces) < 10000:
+            take = min(span, left)
+            if left - take <= 0.05:
+                take = left
+            pieces.append((name, take))
+            left -= take
+        return pieces
+
+    heavy_at = max(range(len(budgets)), key=lambda i: (budgets[i][1], -i))
+    heavy = _chunks(budgets[heavy_at][0], budgets[heavy_at][1])
+    others: list[tuple[str, float]] = []
+    for index, (name, dur) in enumerate(budgets):
+        if index == heavy_at:
+            continue
+        others.extend(_chunks(name, dur))
+    pieces: list[tuple[str, float]] = []
+    heavy_i = 0
+    other_i = 0
+    while heavy_i < len(heavy) or other_i < len(others):
+        if heavy_i < len(heavy):
+            pieces.append(heavy[heavy_i])
+            heavy_i += 1
+        if other_i < len(others):
+            pieces.append(others[other_i])
+            other_i += 1
+    return pieces
 
 
 def segment_at(
@@ -335,8 +399,8 @@ def segment_at(
     """Map name and segment index. Empty maps stay on the loaded level.
 
     Without weights, each map gets ``segment_s`` and the list repeats.
-    With weights, one pass of ``total_s`` (or a cycle long enough that the
-    smallest map gets ``segment_s``) is split by those shares.
+    With weights, ``weighted_pieces`` rotates those chunks across the plan.
+    The index keeps climbing when the cycle repeats.
     """
     if not maps:
         return "", 0
@@ -345,23 +409,83 @@ def segment_at(
         span = max(1.0, float(segment_s))
         index = int(elapsed // span)
         return maps[index % len(maps)], index
-    shares = share_maps(maps, weights)
-    if total_s is not None and math.isfinite(float(total_s)) and float(total_s) > 0.0:
-        cycle = float(total_s)
-    else:
-        positive = [share for _name, share in shares if share > 1e-9]
-        small = min(positive) if positive else 1.0
-        cycle = max(1.0, float(segment_s)) / small
-    durations = [(name, max(0.0, share) * cycle) for name, share in shares]
-    cycle_len = sum(dur for _name, dur in durations) or 1.0
+    pieces = weighted_pieces(maps, segment_s, weights, total_s)
+    cycle_len = sum(dur for _name, dur in pieces) or 1.0
     which = int(elapsed // cycle_len)
     pos = elapsed - which * cycle_len
     acc = 0.0
-    for i, (name, dur) in enumerate(durations):
+    for i, (name, dur) in enumerate(pieces):
         acc += dur
-        if pos < acc or i == len(durations) - 1:
-            return name, which * len(durations) + i
-    return durations[-1][0], which * len(durations) + len(durations) - 1
+        if pos < acc or i == len(pieces) - 1:
+            return name, which * len(pieces) + i
+    return pieces[-1][0], which * len(pieces) + len(pieces) - 1
+
+
+def segment_boundary(
+    elapsed_s: float,
+    maps: tuple[str, ...],
+    segment_s: float,
+    weights: dict[str, float] | None = None,
+    total_s: float | None = None,
+) -> float | None:
+    """Schedule time where the current segment index changes. None with no maps."""
+    if not maps:
+        return None
+    elapsed = max(0.0, float(elapsed_s))
+    if not weights:
+        span = max(1.0, float(segment_s))
+        return (int(elapsed // span) + 1) * span
+    pieces = weighted_pieces(maps, segment_s, weights, total_s)
+    cycle_len = sum(dur for _name, dur in pieces) or 1.0
+    which = int(elapsed // cycle_len)
+    pos = elapsed - which * cycle_len
+    acc = 0.0
+    for _name, dur in pieces:
+        acc += dur
+        if pos < acc:
+            return which * cycle_len + acc
+    return (which + 1) * cycle_len
+
+
+def segment_changed(loaded_map: str, loaded_index: int, map_name: str, seg_index: int) -> bool:
+    """True when this piece needs a fresh level load.
+
+    Two west-coast chunks are different segments even though the level name
+    matches. An empty name is the single-level collect and does not reload.
+    """
+    return bool(map_name) and (map_name != loaded_map or seg_index != loaded_index)
+
+
+def continue_after_segment_end(
+    done_s: float,
+    cut_s: float,
+    lost_s: float,
+    reason: str,
+    map_name: str,
+    failed: dict[str, set[str]],
+    maps: tuple[str, ...],
+    segment_s: float,
+    weights: dict[str, float] | None,
+    total_s: float,
+) -> tuple[str, float, float]:
+    """``(action, new_cut_s, skipped_s)`` after a segment's second hard abort.
+
+    ``action`` is ``exit``, ``stop`` (nothing left to rotate to), or
+    ``continue``. The unspent remainder is added to the schedule cut so the
+    next lookup starts the following piece. ``done_s`` stays put: those
+    minutes are still to be collected, on the later segments.
+    """
+    action = segment_fail_action(reason, map_name, failed, lost_s, 0.0, total_s)
+    if action == "exit":
+        return "exit", cut_s, 0.0
+    planned = None
+    if math.isfinite(float(total_s)) and float(total_s) > 0.0:
+        planned = float(total_s)
+    boundary = segment_boundary(done_s + cut_s, maps, segment_s, weights, planned)
+    if boundary is None:
+        return "stop", cut_s, 0.0
+    skipped = max(0.0, float(boundary) - (float(done_s) + float(cut_s)))
+    return "continue", float(cut_s) + skipped, skipped
 
 
 def decode_issues(root: Path) -> list[str]:
@@ -857,6 +981,8 @@ def main(argv: list[str] | None = None) -> int:
         live = Liveness()
         segment_aborts = 0
         recover_lost_s = 0.0
+        schedule_cut = 0.0
+        last_end_done = -1.0
         segment_fail_maps: dict[str, set[str]] = {}
         cams_ready = False
         segment_open = False
@@ -869,6 +995,7 @@ def main(argv: list[str] | None = None) -> int:
         last_ai: tuple[Any, ...] | None = None
         held_tag: Excursion | None = None
         loaded_map = ""
+        loaded_index = -1
         tick_dt = 0.1
         last_cam: dict[str, float] = {}
         prev_dir: list[float] | None = None
@@ -928,41 +1055,27 @@ def main(argv: list[str] | None = None) -> int:
         smoke_ok = done_s > 0.0 or float(args.smoke_s) <= 0.0
         session_faults = 0
 
-        def _segment_end(now: float) -> float | None:
-            """Elapsed time where the next segment starts, or None with no rotation."""
-            if not map_names:
-                return None
-            weights = map_weights or None
-            planned = None if target_s == float("inf") else target_s
-            _name, index = segment_at(now, map_names, segment_s, weights, planned)
-            limit = target_s if target_s < float("inf") else now + segment_s * max(1, len(map_names))
-            step = 1.0
-            cursor = now
-            while cursor < limit:
-                cursor = min(limit, cursor + step)
-                if segment_at(cursor, map_names, segment_s, weights, planned)[1] != index:
-                    return cursor
-            return limit
-
         def _abort(reason: str) -> int | None:
             """Respawn once. A second hard abort ends the segment and continues."""
             nonlocal segment_aborts, last_error, clock, last_ai, held_tag, prev_dir, prev_dir_t, spawn_pos
             nonlocal segment_open, follow, label_hit, mark_recover, done_s, recover_lost_s
+            nonlocal schedule_cut, last_end_done
             segment_aborts += 1
             print(f"collect abort {reason} segment={segment_id}", flush=True)
             last_error = f"{segment_id} {reason}"
+            stall_s = max(0.0, float(live.slow_s)) if reason == "stationary" else 0.0
             if segment_aborts >= 2 and reason in HARD_SEGMENT_REASONS:
-                skip_to = _segment_end(done_s)
-                if skip_to is None:
-                    skip = max(0.0, (target_s if target_s < float("inf") else done_s) - done_s)
-                else:
-                    skip = max(0.0, skip_to - done_s)
-                action = segment_fail_action(
+                recover_lost_s += stall_s
+                action, schedule_cut, _skipped = continue_after_segment_end(
+                    done_s,
+                    schedule_cut,
+                    recover_lost_s,
                     reason,
                     map_name or segment_id,
                     segment_fail_maps,
-                    recover_lost_s,
-                    skip,
+                    map_names,
+                    segment_s,
+                    map_weights or None,
                     target_s,
                 )
                 print(f"collect segment end {segment_id} {reason}", flush=True)
@@ -972,7 +1085,7 @@ def main(argv: list[str] | None = None) -> int:
                         message = f"{reason} on {n_maps} maps"
                     else:
                         planned = target_s if target_s < float("inf") else 1.0
-                        share = (recover_lost_s + skip) / planned
+                        share = recover_lost_s / planned
                         message = f"recover lost {share:.0%} of the plan"
                     last_error = f"{segment_id} {message}"
                     save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
@@ -980,13 +1093,14 @@ def main(argv: list[str] | None = None) -> int:
                     _write_collect_crash(status_root, last_error, {})
                     print(f"collect stop {last_error}", flush=True)
                     return 2
-                recover_lost_s += skip
-                if skip_to is None or skip_to >= target_s:
+                # No map to rotate to, or the clock never moved, so another
+                # cut would spin on the same stuck pose.
+                if action == "stop" or (last_end_done >= 0.0 and done_s <= last_end_done + 1e-3):
                     save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
                     _publish(None, speed, waypoint)
                     print(f"collect stop {segment_id} ended", flush=True)
                     return 0
-                done_s = skip_to
+                last_end_done = done_s
                 segment_aborts = 0
                 segment_open = False
                 return None
@@ -1013,7 +1127,7 @@ def main(argv: list[str] | None = None) -> int:
                         flush=True,
                     )
                     time.sleep(SETTLE_S)
-                    recover_lost_s += float(SETTLE_S)
+                    recover_lost_s += stall_s + float(SETTLE_S)
                     live.reset()
                     clock = ExcursionClock()
                     last_ai = None
@@ -1043,14 +1157,14 @@ def main(argv: list[str] | None = None) -> int:
             speed = speed_at(elapsed, speeds)
             waypoint = waypoint_at(elapsed, names)
             map_name, seg_index = segment_at(
-                elapsed,
+                elapsed + schedule_cut,
                 map_names,
                 segment_s,
                 map_weights or None,
                 None if target_s == float("inf") else target_s,
             )
             segment_id = f"{map_name}#{seg_index}" if map_name else "current#0"
-            if map_name and map_name != loaded_map:
+            if segment_changed(loaded_map, loaded_index, map_name, seg_index):
                 print(f"collect segment {segment_id}", flush=True)
                 opened = enter_map(bng, map_name, cam_cfg, cams)
                 vehicle, roads, cams, err = opened.vehicle, opened.roads, opened.cameras, opened.error
@@ -1062,6 +1176,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"collect stop {last_error}", flush=True)
                     return 2
                 loaded_map = map_name
+                loaded_index = seg_index
                 last_ai = None
                 held_tag = None
                 clock = ExcursionClock()

@@ -28,7 +28,11 @@ from python.collect.excursion import (  # noqa: E402
 from python.data.raw_frames import RawFrameWriter  # noqa: E402
 from python.data.raw_queue import RawWriteQueue  # noqa: E402
 from python.debug.gt_geom import RoadPoly, lane_center_offsets, project_road  # noqa: E402
-from python.train.continual import pass_plan  # noqa: E402
+from python.train.continual import (  # noqa: E402
+    HOLDOUT_GAP_S,
+    LONG_SEGMENT_S,
+    pass_plan,
+)
 from python.viz.nerd import render_panel  # noqa: E402
 from python.viz.stage import VizUI  # noqa: E402
 from scripts.collect_scene_lanes import (  # noqa: E402
@@ -261,9 +265,67 @@ def _segment_rows(names: list[str], count: int = 30) -> list[dict[str, object]]:
 def check_segment_holdout() -> None:
     one = _segment_rows(["west#0"])
     plan = pass_plan(one, 12, 6, fraction=0.2)
-    assert plan and all(item["kind"] == "train" for item in plan)
-    trained = {int(row["i"]) for item in plan for row in item["rows"]}
-    assert trained == {int(row["i"]) for row in one}
+    hold = [row for item in plan if item["kind"] == "holdout" for row in item["rows"]]
+    train = [row for item in plan if item["kind"] == "train" for row in item["rows"]]
+    assert hold and train
+    assert all(item["incoming"] == "reset" for item in plan if item["kind"] == "holdout")
+    train_ids = {int(row["i"]) for row in train}
+    hold_ids = {int(row["i"]) for row in hold}
+    assert train_ids.isdisjoint(hold_ids)
+    span = float(one[-1]["t"]) - float(one[0]["t"])
+    cut = float(one[0]["t"]) + 0.8 * span
+    gap_ids = {
+        int(row["i"])
+        for row in one
+        if cut - HOLDOUT_GAP_S <= float(row["t"]) < cut
+    }
+    assert gap_ids and gap_ids.isdisjoint(train_ids) and gap_ids.isdisjoint(hold_ids)
+    assert max(hold_ids) == int(one[-1]["i"])
+
+    # One 40-minute segment, the west-coast collect that never rotated.
+    long_one = []
+    for index in range(40 * 60):
+        long_one.append(
+            {
+                "i": index,
+                "segment": "west_coast_usa#0",
+                "t": float(index),
+                "dt_s": None if index == 0 else 1.0,
+                "session": "a",
+            }
+        )
+    plan = pass_plan(long_one, 12, 6, fraction=0.2)
+    hold = [row for item in plan if item["kind"] == "holdout" for row in item["rows"]]
+    train = [row for item in plan if item["kind"] == "train" for row in item["rows"]]
+    assert hold and train
+    assert min(float(row["t"]) for row in hold) >= 0.8 * float(long_one[-1]["t"]) - 1e-6
+    assert max(float(row["t"]) for row in train) <= min(float(row["t"]) for row in hold) - HOLDOUT_GAP_S + 1e-6
+    trained = {int(row["i"]) for row in train}
+    assert int(long_one[-1]["i"]) not in trained
+
+    # A segment longer than 15 minutes is cut in time even beside another map.
+    short = _segment_rows(["italy#0"], count=20)
+    base = float(short[-1]["t"]) + 1.0
+    stretched = list(short)
+    for index in range(int(LONG_SEGMENT_S) + 30):
+        stretched.append(
+            {
+                "i": 1000 + index,
+                "segment": "west_coast_usa#1",
+                "t": base + float(index),
+                "dt_s": 1.0,
+                "session": "a",
+            }
+        )
+    plan = pass_plan(stretched, 12, 6, fraction=0.2)
+    hold = [row for item in plan if item["kind"] == "holdout" for row in item["rows"]]
+    train = [row for item in plan if item["kind"] == "train" for row in item["rows"]]
+    assert {row["segment"] for row in hold} == {"west_coast_usa#1"}
+    assert any(int(row["i"]) >= 1000 for row in train)
+    assert any(int(row["i"]) < 1000 for row in train)
+    west_train_t = [float(row["t"]) for row in train if int(row["i"]) >= 1000]
+    west_hold_t = [float(row["t"]) for row in hold]
+    assert west_train_t and max(west_train_t) <= min(west_hold_t) - HOLDOUT_GAP_S + 1e-6
 
     two = _segment_rows(["west#0", "italy#1"])
     plan = pass_plan(two, 12, 6, fraction=0.2)
@@ -293,6 +355,29 @@ def check_segment_holdout() -> None:
     assert all(row["i"] != 9 for item in plain_plan if item["kind"] == "train" for row in item["rows"])
 
 
+def check_lane_gt_loss_does_not_shadow_torch() -> None:
+    """An inner ``import torch`` made the module name a local and raised."""
+    from python.train.scene_net import ScenePrediction, _lane_gt_loss
+
+    pred = ScenePrediction(
+        lanes=None,
+        lane_valid=None,
+        curbs=None,
+        curb_valid=None,
+        objects=None,
+        object_class=None,
+        object_valid=None,
+        signs=None,
+        sign_class=None,
+        sign_state=None,
+        sign_valid=None,
+        lane_gt=None,
+    )
+    token = object()
+    assert _lane_gt_loss(None, pred, {}, None, None, token) is token
+    print("lane gt loss reads the module torch")
+
+
 def check_smoke_rate_and_flags() -> None:
     assert abs(tick_sleep_s(0.04, 0.1) - 0.06) < 1e-9
     assert tick_sleep_s(0.25, 0.1) == 0.0
@@ -314,10 +399,12 @@ def check_smoke_rate_and_flags() -> None:
     assert abs(shares[0][1] - 0.6) < 1e-9
     assert abs(shares[1][1] - 0.08) < 1e-9
     total = 120.0 * 60.0
-    assert segment_at(0.0, weighted, 12 * 60, weights, total)[0] == "west_coast_usa"
-    assert segment_at(72.0 * 60.0 - 1.0, weighted, 12 * 60, weights, total)[0] == "west_coast_usa"
-    assert segment_at(72.0 * 60.0, weighted, 12 * 60, weights, total)[0] == "italy"
-    assert segment_at(119.0 * 60.0, weighted, 12 * 60, weights, total)[0] == "small_island"
+    segment_s = 12 * 60.0
+    assert segment_at(0.0, weighted, segment_s, weights, total) == ("west_coast_usa", 0)
+    # 12 min chunks, rotated. Minute 13 is the next map, not more west coast.
+    assert segment_at(segment_s - 1.0, weighted, segment_s, weights, total)[0] == "west_coast_usa"
+    assert segment_at(segment_s, weighted, segment_s, weights, total)[0] == "italy"
+    assert segment_at(20.0 * 60.0, weighted, segment_s, weights, total)[0] == "italy"
     assert segment_env(0) == ("", "")
     assert segment_env(1)[1] == "clear"
     opts = AutoOptions(minutes=120, maps=",".join(DEFAULT_MAPS), excursions=True, smoke_s=60, vary_env=True)
@@ -860,6 +947,7 @@ def main() -> None:
     check_paths_stay_on_the_road()
     check_windows_and_piece_boundaries()
     check_segment_holdout()
+    check_lane_gt_loss_does_not_shadow_torch()
     check_smoke_rate_and_flags()
     check_level_load_spawns_and_switches()
     check_missing_level_and_bng_error_are_status()

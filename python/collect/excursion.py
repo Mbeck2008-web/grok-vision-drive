@@ -35,8 +35,10 @@ HEADING_TARGET_DEG = 10.0
 # Past the lane edge plus this margin, the move is no longer on the road.
 EDGE_M = 0.2
 # During a weave or lane change, the car may sit well off the lane center
-# while still on the pavement. Abort only past the paved edge by this much.
-PAVED_PAST_M = 0.5
+# while still on the pavement. The navgraph left/right is the paint. West
+# coast weaves were 0.5–0.6 m outside that line, still on the shoulder.
+# Abort only once the car is a metre past the paint.
+PAVED_PAST_M = 1.0
 PATH_STEP_M = 4.0
 MIN_PATH_M = 25.0
 # A lane change that never saw this much offset is still in progress.
@@ -283,6 +285,7 @@ def targets_for(
     *,
     lane_id: int = 0,
     road_width_m: float | None = None,
+    lanes: int | None = None,
 ) -> tuple[float, float] | None:
     """Lane-center offset and heading for this phase, or None when it cannot stay on the road.
 
@@ -295,7 +298,7 @@ def targets_for(
     lane_w = 3.5 if lane_width_m is None or float(lane_width_m) <= 0.0 else float(lane_width_m)
     road_w = float(road_width_m) if road_width_m is not None and float(road_width_m) > 0.0 else lane_w * 2.0
     direction = 1 if int(direction) >= 0 else -1
-    centers = lane_center_offsets(road_w)
+    centers = lane_center_offsets(road_w, lanes)
     if not centers:
         return None
     lane_i = max(0, min(int(lane_id), len(centers) - 1))
@@ -714,6 +717,11 @@ def excursion_path(
     need = WINDOW_M
     lane_id = int(getattr(hit, "lane_id", 0) or 0)
     lane_w = getattr(hit, "lane_width_m", None)
+    # The label counted lanes from lanesLeft/Right. Width/3.5 does not match
+    # that on a 5 m two-lane road or a 10 m road, so the path aimed at a
+    # different center, or refused the lane id and aborted no_path.
+    n_lanes = int(getattr(road, "lanes", 0) or 0)
+    lane_count = n_lanes if 1 <= n_lanes <= 8 else None
     _length, _fork, _span_h, samples = _chain(roads, road, x, y, heading, need, PATH_STEP_M)
     if len(samples) < 2 or samples[-1][4] + 1e-3 < need * 0.85:
         return None, int(move.direction)
@@ -724,11 +732,12 @@ def excursion_path(
             None if lane_w is None else float(lane_w),
             lane_id=lane_id,
             road_width_m=float(road.width_m),
+            lanes=lane_count,
         )
         if spec is None:
             continue
         delta = float(spec[0])
-        centers = lane_center_offsets(float(road.width_m))
+        centers = lane_center_offsets(float(road.width_m), lane_count)
         if lane_id < 0 or lane_id >= len(centers):
             continue
         base = float(centers[lane_id])

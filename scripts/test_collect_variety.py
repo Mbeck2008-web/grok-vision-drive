@@ -143,7 +143,7 @@ def check_clock_and_junctions() -> None:
         heading_rad=0.0,
         lane_width_m=3.5,
         n_lanes=2,
-        road_offset_m=6.0,
+        road_offset_m=7.0,
         road_width_m=10.0,
     )
     assert past.phase == "abort" and past.reason == "road_edge", past

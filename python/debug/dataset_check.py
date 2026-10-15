@@ -14,7 +14,15 @@ from typing import Any
 
 import numpy as np
 
-from python.data.raw_frames import list_raw_images, load_scene_rows, load_training_bgr, read_image_with_repair
+from python.collect.liveness import motion_issue_lines
+from python.data.raw_frames import (
+    list_raw_images,
+    load_scene_rows,
+    load_training_bgr,
+    raw_count_issues,
+    raw_image_counts,
+    read_image_with_repair,
+)
 from python.data.strip_writer import CANVAS_H, CANVAS_W, SECTORS
 from python.debug.lane_targets import LOOKAHEADS_M, LANE_GT_DIM, lane_gt_from_record
 
@@ -168,6 +176,9 @@ def _validate_raw(
         if any("NaN" in item or "not finite" in item for item in row_issues):
             nan_rows += 1
         issues.extend(row_issues)
+    issues.extend(motion_issue_lines(rows))
+    counts = raw_image_counts(raw_images)
+    issues.extend(raw_count_issues(counts["per_cam"]))
     blank = {cam_id: 0 for cam_id in by_cam}
     checked = 0
     seen_index: set[int] = set()
@@ -214,7 +225,9 @@ def _validate_raw(
         "root": str(root),
         "rows": len(rows),
         "jpegs": 0,
-        "raw_frames": len(raw_images),
+        "raw_frames": counts["raw_frames"],
+        "raw_files": counts["raw_files"],
+        "per_cam": counts["per_cam"],
         "frames_checked": checked,
         "nan_rows": nan_rows,
         "blank_frames": blank,
@@ -284,12 +297,15 @@ def _report_without_frames(
         if any("NaN" in item or "not finite" in item for item in row_issues):
             nan_rows += 1
         issues.extend(row_issues)
+    issues.extend(motion_issue_lines(rows))
     report = {
         "kind": "validate",
         "root": str(root),
         "rows": len(rows),
         "jpegs": 0,
         "raw_frames": 0,
+        "raw_files": 0,
+        "per_cam": {},
         "frames_checked": 0,
         "nan_rows": nan_rows,
         "blank_frames": {},
@@ -348,6 +364,7 @@ def validate_dataset(
         if any("NaN" in item or "not finite" in item for item in row_issues):
             nan_rows += 1
         issues.extend(row_issues)
+    issues.extend(motion_issue_lines(rows))
     blank = {sec.cam_id: 0 for sec in SECTORS}
     checked = 0
     for path in jpegs:

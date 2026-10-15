@@ -541,7 +541,11 @@ def check_level_load_spawns_and_switches() -> None:
         assert host.early_road is False
         assert host.scenario.loaded[0].made and host.scenario.loaded[1].made
         assert host.scenario.loaded[0].path
-        assert not any("setPositionRotation" in line for line in host.commands)
+        places = [line for line in host.commands if "setPositionRotation" in line]
+        assert len(places) == 1, places
+        assert "118.50" in places[0], places[0]
+        assert "250.00" not in places[0]
+        assert "0.00000,0.00000" in places[0]
         assert not any("startFreeroam" in line for line in host.commands)
         from python.collect.level_session import begin_level, resolve_spawn, spawn_is_origin
 

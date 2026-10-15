@@ -194,8 +194,8 @@ def check_leading_rows_without_frames() -> None:
             assert "raw" in str(exc)
         else:
             raise AssertionError("index 0 has no frame")
-        kept, missing = select_training_rows(root, rows)
-        assert missing == 2
+        kept, missing, excluded = select_training_rows(root, rows)
+        assert missing == 2 and excluded == 0
         assert [int(row["i"]) for row in kept] == [2, 3]
         assert kept[0]["dt_s"] is None
         assert abs(float(kept[1]["dt_s"]) - 30.0) < 1e-9

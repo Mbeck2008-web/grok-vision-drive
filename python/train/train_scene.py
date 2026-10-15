@@ -811,9 +811,10 @@ def train_directory(
         print(f"[GVD] scene index: {n_frames} frames {n_bytes} bytes", flush=True)
 
     file_bytes, _n_image_files = training_frame_bytes(root, progress=_index_progress)
-    rows, missing_rows = select_training_rows(root, state_rows)
+    rows, missing_rows, excluded_rows = select_training_rows(root, state_rows)
     print(
-        f"[GVD] scene index: {len(rows)} rows with frames, {missing_rows} missing",
+        f"[GVD] scene index: {len(rows)} rows with frames, {missing_rows} missing, "
+        f"{excluded_rows} stationary or tipped",
         flush=True,
     )
     if free_vram_bytes is None:

@@ -595,6 +595,146 @@ def resolve_spawn(bng: Any, level: str) -> tuple[tuple[float, float, float], tup
     return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0), "missing"
 
 
+def _xyz(value: Any) -> tuple[float, float, float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
+        return None
+    try:
+        x = float(value[0])
+        y = float(value[1])
+        z = float(value[2]) if len(value) > 2 else 0.0
+    except (TypeError, ValueError):
+        return None
+    return x, y, z
+
+
+def polylines_xyz(spec: Any) -> list[list[tuple[float, float, float]]]:
+    """Centerline nodes with z, from a ``get_road_network`` payload."""
+    if isinstance(spec, dict) and isinstance(spec.get("roads"), dict):
+        spec = spec["roads"]
+    if not isinstance(spec, dict):
+        return []
+    lines: list[list[tuple[float, float, float]]] = []
+    for road in spec.values():
+        edges = None
+        if isinstance(road, dict):
+            try:
+                if float(road.get("drivability", road.get("drivable", 1)) or 0) <= 0.0:
+                    continue
+            except (TypeError, ValueError):
+                pass
+            edges = road.get("edges") or road.get("nodes")
+        elif isinstance(road, list):
+            edges = road
+        if not isinstance(edges, list):
+            continue
+        line: list[tuple[float, float, float]] = []
+        for edge in edges:
+            if not isinstance(edge, dict):
+                continue
+            point = _xyz(edge.get("middle") or edge.get("mid") or edge.get("center"))
+            if point is None:
+                left = _xyz(edge.get("left"))
+                right = _xyz(edge.get("right"))
+                if left is not None and right is not None:
+                    point = ((left[0] + right[0]) * 0.5, (left[1] + right[1]) * 0.5, (left[2] + right[2]) * 0.5)
+            if point is not None:
+                line.append(point)
+        if len(line) >= 2:
+            lines.append(line)
+    return lines
+
+
+def _network_spec(bng: Any) -> Any:
+    owners = (getattr(bng, "scenario", None), bng)
+    for owner in owners:
+        if owner is None:
+            continue
+        fn = getattr(owner, "get_road_network", None)
+        if not callable(fn):
+            continue
+        try:
+            return fn(include_edges=True, drivable_only=True)
+        except TypeError:
+            try:
+                return fn()
+            except Exception as exc:
+                if is_session_error(exc):
+                    return None
+                raise
+        except Exception as exc:
+            if is_session_error(exc):
+                return None
+            raise
+    return None
+
+
+def snap_to_road(
+    bng: Any,
+    near: tuple[float, float, float] | None,
+) -> tuple[tuple[float, float, float], tuple[float, float, float, float]] | None:
+    """Nearest centerline pose: node z plus half a metre, heading along the road.
+
+    Points farther than 40 m are ignored so a bad ray does not throw the car
+    across the map at z=250.
+    """
+    lines = polylines_xyz(_network_spec(bng))
+    if not lines or near is None:
+        return None
+    px, py = float(near[0]), float(near[1])
+    best: tuple[float, float, float, float, float, float] | None = None
+    for line in lines:
+        for (ax, ay, az), (bx, by, bz) in zip(line, line[1:]):
+            dx, dy = bx - ax, by - ay
+            length2 = dx * dx + dy * dy
+            if length2 < 1e-6:
+                continue
+            t = ((px - ax) * dx + (py - ay) * dy) / length2
+            t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else t
+            cx = ax + t * dx
+            cy = ay + t * dy
+            cz = az + t * (bz - az)
+            dist = math.hypot(px - cx, py - cy)
+            if best is None or dist < best[0]:
+                best = (dist, cx, cy, cz, dx, dy)
+    if best is None or best[0] > 40.0:
+        return None
+    _dist, cx, cy, cz, dx, dy = best
+    return (cx, cy, cz + 0.5), _yaw_quat(dx, dy)
+
+
+def place_vehicle(
+    bng: Any,
+    vehicle: Any,
+    pos: tuple[float, float, float],
+    rot: tuple[float, float, float, float],
+) -> str:
+    """Upright move onto the road. Empty string when the call was accepted."""
+    fn = getattr(vehicle, "teleport", None)
+    if callable(fn):
+        try:
+            fn(pos, rot_quat=rot, reset=True)
+            return ""
+        except TypeError:
+            try:
+                fn(pos, rot_quat=rot)
+                return ""
+            except Exception as exc:
+                if not is_session_error(exc) and not isinstance(exc, TypeError):
+                    raise
+        except Exception as exc:
+            if not is_session_error(exc):
+                raise
+    x, y, z = pos
+    qx, qy, qz, qw = rot
+    return _send(
+        bng,
+        "local v = be:getPlayerVehicle(0) "
+        "if v then "
+        f"v:setPositionRotation({x:.2f},{y:.2f},{z:.2f},{qx:.5f},{qy:.5f},{qz:.5f},{qw:.5f}) "
+        "end",
+    )
+
+
 def begin_level(bng: Any, level: str) -> OpenedLevel:
     """Open ``level`` as a started scenario. Empty keeps the session already running.
 
@@ -644,6 +784,20 @@ def begin_level(bng: Any, level: str) -> OpenedLevel:
         if not roads:
             detail = note or "no road network"
             return OpenedLevel(vehicle, [], f"no road network after loading {clean} ({detail})", pos, source)
+        placed = snap_to_road(bng, pos)
+        if placed is not None:
+            moved, mrot = placed
+            print(
+                f"collect place {clean} ({moved[0]:.1f},{moved[1]:.1f},{moved[2]:.1f})",
+                flush=True,
+            )
+            shift = place_vehicle(bng, vehicle, moved, mrot)
+            if shift:
+                return OpenedLevel(vehicle, list(roads), shift, pos, source)
+            pos = moved
+            from python.collect.liveness import SETTLE_S
+
+            time.sleep(SETTLE_S)
         return OpenedLevel(vehicle, list(roads), "", pos, source)
     except Exception as exc:
         if is_session_error(exc) or isinstance(exc, (TypeError, ValueError, AttributeError)):

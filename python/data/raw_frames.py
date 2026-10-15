@@ -745,6 +745,7 @@ def controls_from_state(state: Mapping[str, Any] | None) -> dict[str, Any]:
         "yaw_rate": _pick(sources, ("yaw_rate", "yawRate")),
         "pos": pos,
         "dir": direction,
+        "damage": _pick(sources, ("damage",)),
     }
 
 
@@ -779,3 +780,45 @@ def list_raw_images(root: Path | str) -> list[Path]:
         if path.is_file() and path.suffix in {".png", ".npy"} and path.stem.isdigit():
             found.append(path)
     return sorted(found)
+
+
+def raw_image_counts(paths: list[Path]) -> dict[str, Any]:
+    """Tick count is one camera, not the sum of every camera file.
+
+    ``raw_frames`` is the main-camera count when that camera was recorded,
+    otherwise the smallest camera count. ``raw_files`` is the sum.
+    """
+    per_cam: dict[str, int] = {}
+    for path in paths:
+        cam = path.parent.name
+        per_cam[cam] = per_cam.get(cam, 0) + 1
+    if "main" in per_cam:
+        ticks = int(per_cam["main"])
+    elif per_cam:
+        ticks = int(min(per_cam.values()))
+    else:
+        ticks = 0
+    return {"raw_frames": ticks, "raw_files": int(sum(per_cam.values())), "per_cam": per_cam}
+
+
+def raw_count_issues(per_cam: Mapping[str, int]) -> list[str]:
+    """Cameras that share a planned rate should have the same file count.
+
+    Pillars and the rear camera are slower on purpose, so they are not
+    compared with the 10 Hz cameras.
+    """
+    groups: dict[float, list[str]] = {}
+    for cam in per_cam:
+        if cam not in CAMERA_HZ:
+            continue
+        groups.setdefault(float(CAMERA_HZ[cam]), []).append(str(cam))
+    issues: list[str] = []
+    for hz, cams in sorted(groups.items()):
+        if len(cams) < 2:
+            continue
+        counts = {int(per_cam[cam]) for cam in cams}
+        if len(counts) == 1:
+            continue
+        detail = ", ".join(f"{cam}={int(per_cam[cam])}" for cam in sorted(cams))
+        issues.append(f"raw count mismatch at {hz:.0f} Hz ({detail})")
+    return issues

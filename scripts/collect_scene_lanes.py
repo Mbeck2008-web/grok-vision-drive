@@ -483,6 +483,20 @@ def camera_outage(
     return start, f"every camera stale for >{ALL_CAM_STALE_S:.0f}s ({detail})"
 
 
+def attached_frames_ready(cams: dict[str, Any], frames: dict[str, Any]) -> bool:
+    """True when every attached rig camera returned a picture.
+
+    The first tick often has all-zero buffers. Those are already dropped by
+    the reader, so a camera that has not rendered yet is simply absent.
+    """
+    from python.sensors.cameras import CAM_IDS
+
+    expected = [str(cid) for cid in cams if str(cid) in CAM_IDS]
+    if not expected:
+        return False
+    return all(cid in frames for cid in expected)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     from python.data.data_root import (
@@ -638,6 +652,7 @@ def main(argv: list[str] | None = None) -> int:
         vehicle = None
         roads: list[Any] = []
         cams: dict[str, Any] = {}
+        spawn_pos: tuple[float, float, float] | None = None
         if not map_names:
             opened = enter_map(bng, str(args.reload_level or ""), cam_cfg, {})
             vehicle, roads, cams, err = opened.vehicle, opened.roads, opened.cameras, opened.error
@@ -646,6 +661,8 @@ def main(argv: list[str] | None = None) -> int:
                 record_session_failure(status_root, message)
                 print(f"collect stop {message}", flush=True)
                 return 2
+            if opened.spawn is not None:
+                spawn_pos = (float(opened.spawn[0]), float(opened.spawn[1]), float(opened.spawn[2]))
         writer = RawWriteQueue(RawFrameWriter(out, camera_sidecar(cam_cfg)))
         from python.data.strip_writer import STRIP_ORDER
         from python.debug.remote_status import CollectMeter, status_dir, write_collect_status
@@ -666,6 +683,12 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         clock = ExcursionClock()
+        from python.collect.liveness import Liveness, SETTLE_S, car_is_driving
+
+        live = Liveness()
+        segment_aborts = 0
+        cams_ready = False
+        warmup_since: float | None = None
         last_ai: tuple[Any, ...] | None = None
         held_tag: Excursion | None = None
         loaded_map = ""
@@ -727,6 +750,55 @@ def main(argv: list[str] | None = None) -> int:
         last_reason_line = ""
         smoke_ok = done_s > 0.0 or float(args.smoke_s) <= 0.0
         session_faults = 0
+
+        def _abort(reason: str) -> int | None:
+            """Stop this segment. The first failure respawns. The second exits."""
+            nonlocal segment_aborts, last_error, clock, last_ai, held_tag, prev_dir, prev_dir_t, spawn_pos
+            segment_aborts += 1
+            print(f"collect abort {reason} segment={segment_id}", flush=True)
+            last_error = f"{segment_id} {reason}"
+            if segment_aborts >= 2:
+                message = f"{segment_id} aborted twice: {reason}"
+                last_error = message
+                save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
+                _publish(None, speed, waypoint)
+                _write_collect_crash(status_root, message, {})
+                print(f"collect stop {message}", flush=True)
+                return 2
+            from python.collect.level_session import place_vehicle, snap_to_road
+
+            near = spawn_pos
+            if near is None and isinstance(pos, (list, tuple)) and len(pos) >= 3:
+                near = (float(pos[0]), float(pos[1]), float(pos[2]))
+            placed = None if near is None else snap_to_road(bng, near)
+            if placed is None:
+                message = f"{segment_id} aborted: {reason}; no road pose to respawn"
+            else:
+                moved, mrot = placed
+                shift = place_vehicle(bng, vehicle, moved, mrot)
+                if shift:
+                    message = f"{segment_id} aborted: {reason}; respawn failed: {shift}"
+                else:
+                    print(
+                        f"collect recover {segment_id} ({moved[0]:.1f},{moved[1]:.1f},{moved[2]:.1f})",
+                        flush=True,
+                    )
+                    time.sleep(SETTLE_S)
+                    live.reset()
+                    clock = ExcursionClock()
+                    last_ai = None
+                    held_tag = None
+                    prev_dir = None
+                    prev_dir_t = None
+                    spawn_pos = moved
+                    return None
+            last_error = message
+            save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
+            _publish(None, speed, waypoint)
+            _write_collect_crash(status_root, message, {})
+            print(f"collect stop {message}", flush=True)
+            return 2
+
         while done_s < target_s:
             if stop_file(out).is_file():
                 save_progress(progress_path, done_s, target_s if target_s < float("inf") else done_s)
@@ -753,6 +825,12 @@ def main(argv: list[str] | None = None) -> int:
                 last_ai = None
                 held_tag = None
                 clock = ExcursionClock()
+                live.reset()
+                segment_aborts = 0
+                cams_ready = False
+                warmup_since = None
+                if opened.spawn is not None:
+                    spawn_pos = (float(opened.spawn[0]), float(opened.spawn[1]), float(opened.spawn[2]))
                 prev_dir = None
                 prev_dir_t = None
                 last_cam = {}
@@ -798,6 +876,51 @@ def main(argv: list[str] | None = None) -> int:
                 _write_collect_crash(status_root, outage, cam_reasons)
                 print(f"collect stop {outage}", flush=True)
                 return 4
+            sample = _read_vehicle(vehicle)
+            pos = sample.get("pos")
+            direction = sample.get("dir")
+            now = time.time()
+            if sample.get("yaw_rate") is None:
+                sample["yaw_rate"] = yaw_rate_from_dirs(
+                    prev_dir, direction, 0.0 if prev_dir_t is None else now - prev_dir_t,
+                )
+            if direction is not None:
+                prev_dir = direction
+                prev_dir_t = now
+            dir_z = None
+            if isinstance(direction, (list, tuple)) and len(direction) >= 3:
+                try:
+                    dir_z = float(direction[2])
+                except (TypeError, ValueError):
+                    dir_z = None
+            try:
+                speed_mps_f = None if sample.get("speed_mps") is None else float(sample.get("speed_mps"))
+            except (TypeError, ValueError):
+                speed_mps_f = None
+            try:
+                damage_f = None if sample.get("damage") is None else float(sample.get("damage"))
+            except (TypeError, ValueError):
+                damage_f = None
+            if not cams_ready:
+                if attached_frames_ready(cams, frames):
+                    cams_ready = True
+                    warmup_since = None
+                    print(f"collect cameras live {sorted(cams)}", flush=True)
+                else:
+                    if warmup_since is None:
+                        warmup_since = time.monotonic()
+                    elif time.monotonic() - warmup_since > ALL_CAM_STALE_S:
+                        waiting = ", ".join(cid for cid in cams if cid not in frames) or "none"
+                        message = f"cameras did not all render within {ALL_CAM_STALE_S:.0f}s ({waiting})"
+                        last_error = message
+                        save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
+                        _publish(None, speed, waypoint)
+                        _write_collect_crash(status_root, message, cam_reasons)
+                        print(f"collect stop {message}", flush=True)
+                        return 4
+                    time.sleep(tick_sleep_s(time.monotonic() - tick_mark, 0.1))
+                    tick_dt = max(1e-3, time.monotonic() - tick_mark)
+                    continue
             mono = time.monotonic()
             due: dict[str, Any] = {}
             due_stamps: dict[str, Any] = {}
@@ -815,17 +938,6 @@ def main(argv: list[str] | None = None) -> int:
                     f"collect first tick cams={sorted(due)} bytes={frame_nbytes(due)}",
                     flush=True,
                 )
-            sample = _read_vehicle(vehicle)
-            pos = sample.get("pos")
-            direction = sample.get("dir")
-            now = time.time()
-            if sample.get("yaw_rate") is None:
-                sample["yaw_rate"] = yaw_rate_from_dirs(
-                    prev_dir, direction, 0.0 if prev_dir_t is None else now - prev_dir_t,
-                )
-            if direction is not None:
-                prev_dir = direction
-                prev_dir_t = now
             heading = None
             if direction is not None:
                 heading = heading_from_dir(direction[0], direction[1])
@@ -838,7 +950,8 @@ def main(argv: list[str] | None = None) -> int:
                 None if hit is None else hit.lane_width_m,
                 None if hit is None else hit.off_road,
             )
-            if excursions_on and not waypoint:
+            driving = car_is_driving(speed_mps_f, dir_z)
+            if excursions_on and not waypoint and driving:
                 move = clock.update(
                     tick_dt,
                     offset_m=None if hit is None else hit.lane_offset_m,
@@ -854,7 +967,14 @@ def main(argv: list[str] | None = None) -> int:
             resolved = held_tag if held_tag is not None and held_tag.phase == move.phase else move
             path = None
             ai_key = (round(speed, 3), waypoint, resolved.phase, resolved.direction, map_name)
-            if last_ai != ai_key and excursions_on and not waypoint and move.phase in ACTIVE and pos is not None:
+            if (
+                driving
+                and last_ai != ai_key
+                and excursions_on
+                and not waypoint
+                and move.phase in ACTIVE
+                and pos is not None
+            ):
                 path, used = excursion_path(
                     roads,
                     float(pos[0]),
@@ -879,7 +999,10 @@ def main(argv: list[str] | None = None) -> int:
                     clock.direction = int(used)
                     resolved = Excursion(move.phase, float(spec[0]), float(spec[1]), int(used), move.reason)
                 ai_key = (round(speed, 3), waypoint, resolved.phase, resolved.direction, map_name)
-            if last_ai != ai_key:
+            send_ai = last_ai != ai_key
+            if not driving and not waypoint and last_ai is not None:
+                send_ai = False
+            if send_ai:
                 commands = (
                     excursion_commands(
                         speed,
@@ -904,13 +1027,33 @@ def main(argv: list[str] | None = None) -> int:
                     flush=True,
                 )
             move = resolved
+            why = live.update(
+                tick_dt,
+                speed_mps_f,
+                dir_z,
+                damage_f,
+                ai_should_move=not bool(waypoint),
+            )
+            if why:
+                for cid, prev in held:
+                    if prev is None:
+                        last_cam.pop(cid, None)
+                    else:
+                        last_cam[cid] = prev
+                code = _abort(why)
+                if code is not None:
+                    return code
+                time.sleep(tick_sleep_s(time.monotonic() - tick_mark, 0.1))
+                tick_dt = max(1e-3, time.monotonic() - tick_mark)
+                continue
             queued = writer.submit(
                 due,
                 t=now,
                 timestamps=due_stamps,
                 ego={
-                    "speed_mps": sample.get("speed_mps"),
+                    "speed_mps": speed_mps_f,
                     "yaw_rate": sample.get("yaw_rate"),
+                    "damage": damage_f,
                     "pos": pos,
                     "dir": direction,
                     "x": None if pos is None else pos[0],

@@ -47,18 +47,34 @@ def _stamp(value: object) -> float | None:
 def select_training_rows(
     root: Path | str,
     rows: list,
-) -> tuple[list, int]:
+) -> tuple[list, int, int]:
     """Keep rows that have a decodable strip camera. Count the rest as missing.
 
-    ``dt_s`` is rewritten from the timestamps of the kept rows. A hole where
-    frames were never saved becomes one gap, and a gap longer than the GRU
-    memory clears the state. The original state file is not rewritten.
+    Stationary, tipped, and damage spans are a third count and are not
+    trained. ``dt_s`` is rewritten from the timestamps of the kept rows. A
+    hole where frames were never saved becomes one gap, and a gap longer
+    than the GRU memory clears the state. The original state file is not
+    rewritten.
     """
+    from python.collect.liveness import bad_row_reasons
+
+    bad = bad_row_reasons([row for row in rows if isinstance(row, dict)])
     kept: list = []
     missing = 0
+    excluded = 0
     prev_t: float | None = None
     for row in rows:
-        if not isinstance(row, dict) or not row_has_decodable_frame(root, row):
+        if not isinstance(row, dict):
+            missing += 1
+            continue
+        try:
+            index = int(row.get("i"))
+        except (TypeError, ValueError):
+            index = None
+        if index is not None and index in bad:
+            excluded += 1
+            continue
+        if not row_has_decodable_frame(root, row):
             missing += 1
             continue
         item = dict(row)
@@ -70,7 +86,7 @@ def select_training_rows(
         kept.append(item)
         if stamp is not None:
             prev_t = stamp
-    return kept, missing
+    return kept, missing, excluded
 
 
 def _spawn_load(root: str, index: int, queue) -> None:

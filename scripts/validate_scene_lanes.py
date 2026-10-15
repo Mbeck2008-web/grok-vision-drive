@@ -43,10 +43,13 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         out = base / "validate"
     report = validate_dataset(args.strips, out, montage_n=max(1, int(args.montage)))
+    per = report.get("per_cam") or {}
+    per_text = " ".join(f"{name}={count}" for name, count in sorted(per.items()))
     print(
         f"validate rows={report['rows']} jpegs={report['jpegs']} "
-        f"raw={report.get('raw_frames', 0)} "
-        f"issues={report['issue_count']} report={out / 'report.json'}",
+        f"raw={report.get('raw_frames', 0)}"
+        + (f" {per_text}" if per_text else "")
+        + f" issues={report['issue_count']} report={out / 'report.json'}",
         flush=True,
     )
     for issue in report["issues"][:20]:

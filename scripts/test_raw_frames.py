@@ -177,7 +177,10 @@ def check_pixels_roundtrip_and_load_time_stitch() -> None:
         assert report["format"] == "raw"
         assert report["montages"]
         assert Path(report["montages"][0]).is_file()
-        assert report["issue_count"] == 0, report["issues"]
+        assert report["raw_frames"] == 3
+        assert report["raw_files"] == 5
+        assert report["per_cam"]["main"] == 3 and report["per_cam"]["wide"] == 2
+        assert report["issues"] == ["raw count mismatch at 10 Hz (main=3, wide=2)"], report["issues"]
 
 
 def check_validator_reads_raw_and_names_time_holes() -> None:
@@ -211,11 +214,36 @@ def check_validator_reads_raw_and_names_time_holes() -> None:
         print(hole[0])
 
 
+def check_raw_count_is_one_camera() -> None:
+    """Eight cameras must not be added into the printed raw tick count."""
+    colour = np.zeros((8, 12, 3), dtype=np.uint8)
+    colour[:, :, 1] = 40
+    tech = tech_from_hit(0.2, 0.0, 3.5, False)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        writer = RawFrameWriter(root, [])
+        for index in range(3):
+            writer.write(
+                {"main": colour, "wide": colour},
+                t=float(index),
+                ego={"speed_mps": 8.0, "dir": [0.0, 1.0, 0.0]},
+                tech=tech,
+                driver="beamng_ai",
+            )
+        report = validate_dataset(root, root / "validate_out", montage_n=1)
+        assert report["raw_frames"] == 3, report
+        assert report["raw_files"] == 6
+        assert report["per_cam"] == {"main": 3, "wide": 3}
+        assert report["issue_count"] == 0, report["issues"]
+    print("raw count is per camera")
+
+
 def main() -> None:
     check_disk_ceiling()
     check_rates_and_controls()
     check_pixels_roundtrip_and_load_time_stitch()
     check_validator_reads_raw_and_names_time_holes()
+    check_raw_count_is_one_camera()
     print("raw frames ok")
 
 

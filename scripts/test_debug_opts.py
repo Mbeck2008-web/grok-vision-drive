@@ -150,6 +150,10 @@ def test_ui_keys_clicks() -> None:
     assert ui.handle_key(ord("a"))
     assert ui.nerd_tab == "cams" and ui.show_nerd
     assert ui.handle_key(ord("]"))
+    assert ui.nerd_tab == "auto"
+    assert ui.handle_key(ord("u"))
+    assert ui.nerd_tab == "auto"
+    assert ui.handle_key(ord("]"))
     assert ui.nerd_tab == "keys"
     ui.show_drive_tab()
     n = len(CONTROL_ROWS)
@@ -413,9 +417,9 @@ def main() -> None:
     from python.runtime.debug_opts import NERD_TAB_IDS
     from python.viz.nerd import FS_TAB, _text_size
 
-    assert NERD_TAB_IDS == ("live", "drive", "viz", "model", "cams", "keys")
+    assert NERD_TAB_IDS == ("live", "drive", "viz", "model", "cams", "auto", "keys")
     tab_x = 12
-    for label in ("LIVE", "DRIVE", "VIZ", "MODEL", "CAMS", "KEYS"):
+    for label in ("LIVE", "DRIVE", "VIZ", "MODEL", "CAMS", "AUTO", "KEYS"):
         tw = _text_size(label, FS_TAB)[0]
         tab_x += tw + 26
         assert tw + 18 < NERD_WIDTH - 16, label

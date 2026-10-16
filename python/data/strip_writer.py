@@ -22,6 +22,8 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from python.data.binary_io import os_binary, verify_written
+
 # Left to right, same order as the live strip. Widths are the training canvas,
 # not the live 160×96 preview.
 STRIP_ORDER: tuple[str, ...] = (
@@ -357,7 +359,11 @@ class StripWriter:
                 self._n = idx + 1
                 continue
             try:
-                fd = os.open(str(final), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                fd = os.open(
+                    str(final),
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY | os_binary(),
+                    0o644,
+                )
             except FileExistsError:
                 self._n = idx + 1
                 continue
@@ -368,13 +374,18 @@ class StripWriter:
                 self._n = idx + 1
                 raise
             os.close(fd)
+            verify_written(final, payload)
             return idx, final
         raise RuntimeError("no free strip filename")
 
     def _append_state(self, line: dict[str, Any]) -> None:
         """Append one JSON line. ``O_APPEND`` does not truncate the file."""
         blob = (json.dumps(line) + "\n").encode("utf-8")
-        fd = os.open(str(self.state_path), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644)
+        fd = os.open(
+            str(self.state_path),
+            os.O_CREAT | os.O_APPEND | os.O_WRONLY | os_binary(),
+            0o644,
+        )
         try:
             _write_all(fd, blob)
             os.fsync(fd)

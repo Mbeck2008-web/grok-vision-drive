@@ -45,6 +45,8 @@ STALE_SPEED_MPS = 6.0
 EXIT_LANE_X_M = 1.25
 EXIT_YAW_RAD = 0.22
 EXIT_BRAKE = 1.0
+# Nose-forward speed below this is reverse. The guard disengages and parks.
+REVERSE_LONG_MPS = 0.3
 
 
 def apply_stale_speed_cap(
@@ -70,6 +72,36 @@ def apply_stale_speed_cap(
     else:
         cmd.throttle = min(float(cmd.throttle), 0.25)
     return True
+
+
+def longitudinal_mps(vel: Any, forward: Any) -> float | None:
+    """Speed along the nose. Negative is backward. ``forward`` need not be a unit vector."""
+    if vel is None or forward is None:
+        return None
+    try:
+        vx, vy = float(vel[0]), float(vel[1])
+        fx, fy = float(forward[0]), float(forward[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if vx != vx or vy != vy or fx != fx or fy != fy:
+        return None
+    norm = math.hypot(fx, fy)
+    if norm < 1e-6:
+        return None
+    return (vx * fx + vy * fy) / norm
+
+
+def moving_backward(long_mps: float | None, limit: float = REVERSE_LONG_MPS) -> bool:
+    """True when the car is moving backward faster than ``limit`` m/s."""
+    if long_mps is None:
+        return False
+    try:
+        speed = float(long_mps)
+    except (TypeError, ValueError):
+        return False
+    if speed != speed:
+        return False
+    return speed < -float(limit)
 
 
 def apply_lane_exit_brake(

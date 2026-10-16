@@ -101,6 +101,17 @@ def check_parse_edges() -> None:
         {"left": [0, 8, 0], "right": [4, 8, 0]},
     ])
     assert implied is not None and implied.xy[0] == (2.0, 0.0)
+    # radius is half-width. A 2 m left/right span with radius 4 is an 8 m road.
+    wide = parse_road_edges("r3", [
+        {"left": [-1, 0, 0], "right": [1, 0, 0], "middle": [0, 0, 0], "radius": 4.0},
+        {"left": [-1, 20, 0], "right": [1, 20, 0], "middle": [0, 20, 0], "radius": 4.0},
+    ])
+    assert wide is not None and abs(wide.width_m - 8.0) < 1e-6, wide
+    # One junction node is 10 m. The road itself is 6 m. The median wins.
+    flare = [{"left": [-3, float(i), 0], "right": [3, float(i), 0], "middle": [0, float(i), 0]} for i in range(0, 30, 5)]
+    flare.append({"left": [-5, 30, 0], "right": [5, 30, 0], "middle": [0, 30, 0]})
+    flared = parse_road_edges("flare", flare)
+    assert flared is not None and abs(flared.width_m - 6.0) < 1e-6, flared
 
 
 def check_report_math() -> None:

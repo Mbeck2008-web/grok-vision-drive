@@ -375,6 +375,18 @@ def gear_is_forward(gear: Any) -> bool:
     return False
 
 
+def gear_is_reverse(gear: Any) -> bool:
+    """True when the echoed gear is reverse. Missing and neutral are not."""
+    if gear is None or isinstance(gear, bool):
+        return False
+    if isinstance(gear, (int, float)):
+        try:
+            return int(gear) < 0
+        except (TypeError, ValueError):
+            return False
+    return str(gear).strip().upper() in {"R", "REVERSE"}
+
+
 def _gear_value(el: Any) -> Any:
     """Gear field from a dict or a BeamNGpy electrics object (``.data`` / ``.gear``)."""
     if el is None:
@@ -418,10 +430,9 @@ def tech_control_kwargs(
     Shift mode stays the arcade set at engage. The kwargs omit gear. BeamNG
     routes a gear field through shiftToGearIndex, and in arcade that function
     is switchToRealisticBehavior, so every control tick was leaving arcade.
-    Throttle>0 releases the parking brake and the clutch. A hold, stop, or
-    AEB (throttle ~0 and brake >= 0.99) is parkingbrake=1 and service brake 0.
-    Arcade treats that held service brake, with no throttle, as reverse. The
-    hold ignores speed and always sets the parking brake.
+    Throttle>0 releases the parking brake and the clutch. Any brake with
+    throttle ~0 is parkingbrake=1 and service brake 0. Run 8 reversed on a
+    partial service brake (0.8), not only a full pedal. Coast is brake 0.
     """
     del speed_mps  # moving or stopped, the reverse pedal stays off
     if release:
@@ -434,25 +445,27 @@ def tech_control_kwargs(
     steer_v = _clip_steer(steer)
     throttle_v = _clip01(throttle)
     brake_v = _clip01(brake)
-    if throttle_v > 1e-6:
-        return {
-            "steering": steer_v,
-            "throttle": throttle_v,
-            "brake": brake_v,
-            "parkingbrake": 0.0,
-            "clutch": 0.0,
-        }
-    if brake_v >= TECH_HOLD_BRAKE:
+    # A service brake is never sent. With or without throttle, arcade can
+    # treat that pedal as reverse. A requested brake is the parking brake.
+    if brake_v > 0.01:
         return {
             "steering": steer_v,
             "throttle": 0.0,
             "brake": 0.0,
             "parkingbrake": 1.0,
         }
+    if throttle_v > 1e-6:
+        return {
+            "steering": steer_v,
+            "throttle": throttle_v,
+            "brake": 0.0,
+            "parkingbrake": 0.0,
+            "clutch": 0.0,
+        }
     return {
         "steering": steer_v,
         "throttle": 0.0,
-        "brake": brake_v,
+        "brake": 0.0,
         "parkingbrake": 0.0,
     }
 
@@ -477,7 +490,8 @@ def is_arcade_reverse_hold(kwargs: dict[str, Any]) -> bool:
         return True
     throttle = float(kwargs.get("throttle") or 0.0)
     brake = float(kwargs.get("brake") or 0.0)
-    return throttle <= 1e-6 and brake >= TECH_HOLD_BRAKE
+    # Run 8 reversed on brake 0.8 with throttle 0, not only on a full pedal.
+    return throttle <= 1e-6 and brake > 0.01
 
 
 def plan_command(
@@ -867,8 +881,15 @@ class BeamNGPyActuator:
         self._drive_arm_mono: float | None = None
         self.drive_arm_n = 0
         self._blinker: str | None = None
+        self._park_hold = False
+
+    def note_park_hold(self) -> None:
+        """Keep the parking brake on after a reverse disengage."""
+        self._park_hold = True
 
     def note_engaged(self, engaged: bool) -> None:
+        if engaged:
+            self._park_hold = False
         self.engaged = bool(engaged)
         # Grab loop: poll_vehicle, then note_engaged. The latch covers later
         # grabs (and force_engage, which does not write gvd_engage.json).
@@ -900,6 +921,9 @@ class BeamNGPyActuator:
             "heartbeat_mtime": time.time(),
             "reason": str(reason),
         }
+        if self._park_hold:
+            payload["brake"] = 1.0
+            payload["hold_park"] = True
         ok = bool(atomic_write_json(cmd_path(), payload, indent=None))
         if ok:
             self._release_cmd_mono = t
@@ -1110,6 +1134,10 @@ class BeamNGPyActuator:
             # A failed ack is logged and retried next tick (_shift_set stays false).
             if not release and not self._shift_set:
                 self._arm_shift_mode()
+            if not release and gear_is_reverse(self._echo_gear()):
+                # Do not power a reverse gear. Park until the echo is forward.
+                throttle = 0.0
+                brake = 1.0
             speed_mps = None
             if (
                 not release
@@ -1150,6 +1178,16 @@ class BeamNGPyActuator:
     def stop(
         self, seq: int = 0, reason: str = "stop", *, now: float | None = None
     ) -> DriveCommand:
+        if not self.engaged and (self._park_hold or reason == "reverse"):
+            self._park_hold = True
+            try:
+                self._invoke_control(tech_control_kwargs(0.0, 0.0, 1.0))
+            except Exception:
+                pass
+            self._write_release_cmd(seq, reason, force=True, now=now)
+            cmd = stop_command(seq=seq, reason=reason)
+            cmd.applied = False
+            return cmd
         if not self.engaged:
             # Handoff, not a brake hold. ego.brake must not stay at 1, and the
             # cmd bus must not keep a stale brake:1 while engaged is false.
@@ -1190,8 +1228,14 @@ class CmdJsonActuator:
         self.ack: EgoFeedback | None = None
         self.last_seq = 0
         self.write_ok = True
+        self._park_hold = False
+
+    def note_park_hold(self) -> None:
+        self._park_hold = True
 
     def note_engaged(self, engaged: bool) -> None:
+        if engaged:
+            self._park_hold = False
         self.engaged = bool(engaged)
         # Same latch as BeamNGPyActuator. poll_vehicle already ran this grab.
         note_soft_esc_engaged(self.engaged)
@@ -1230,6 +1274,10 @@ class CmdJsonActuator:
             "heartbeat_mtime": time.time(),
             "reason": cmd.reason,
         }
+        if self._park_hold and not driving:
+            payload["throttle"] = 0.0
+            payload["brake"] = 1.0
+            payload["hold_park"] = True
         self.write_ok = atomic_write_json(cmd_path(), payload)
         self.last_seq = int(cmd.seq)
         cmd.applied = bool(driving and self.write_ok and self.acked(cmd.seq))
@@ -1257,6 +1305,12 @@ def make_actuator(vehicle: Any | None = None, prefer_beamngpy: bool = True) -> A
 # steering_input ±1 is ±30 deg at the road wheel (ego.steer_deg = input * 30).
 STEER_LOCK_DEG = 30.0
 STEER_LOCK_RAD = math.radians(STEER_LOCK_DEG)
+# gt_ctrl1 (2026-10-15, --lane-source gt). Vehicle heading, integrated from
+# commanded steer, matches this bicycle best at gain 0.89 and the 0.12 s
+# frame delay below: rms 0.029 rad over the moving portion before the
+# departure. Gain 1.0 at the same delay is 0.048 rad. The command reaches
+# the wheels. It is not a sign error and it is not a stuck actuator.
+ACTUATOR_YAW_GAIN = 0.89
 # Pure-pursuit wheelbase. The old law divided lateral meters by this same 2.5
 # and sent the quotient as steering_input, so 2.5 m of offset was full lock.
 WHEELBASE_M = 2.5
@@ -1353,6 +1407,79 @@ def path_steer_from_ego(path_ego: list[dict[str, float]] | None) -> float:
 # +steer decreases heading. Restoring steer therefore has the same sign as
 # the heading error (a counter-clockwise error needs a clockwise correction).
 HEADING_STEER_GAIN = 0.6
+
+
+def steer_lookahead_m(speed_mps: float) -> float:
+    """Lookahead for the crosstrack term. Longer as speed rises, never under 6 m.
+
+    The 8 m pure-pursuit gain needs about 0.7 m of offset to hold a 50 m
+    bend. Curvature feedforward carries that bend. This distance only
+    sets how hard the residual is pulled back.
+    """
+    try:
+        speed = float(speed_mps)
+    except (TypeError, ValueError):
+        speed = 0.0
+    if speed != speed or speed < 0.0:
+        speed = 0.0
+    return max(6.0, min(14.0, 4.0 + 0.55 * speed))
+
+
+def curve_steer(
+    offset_m: float,
+    heading_err_rad: float | None,
+    curvature: float,
+    speed_mps: float,
+) -> float:
+    """Stanley plus curvature feedforward, normalized to the steering input.
+
+    ``offset_m`` is positive when the car is right of the lane center.
+    ``heading_err_rad`` is positive when the nose points left of the road.
+    ``curvature`` is 1/radius, positive for a left bend. Feedforward is
+    divided by ``ACTUATOR_YAW_GAIN`` so the 0.89 wheel response measured
+    on gt_ctrl1 actually produces that curvature. Heading and crosstrack
+    are separate: the straight 8 m center already mixes them, and adding
+    that mix on top of feedforward double-counts.
+    """
+    try:
+        offset = float(offset_m)
+        heading = 0.0 if heading_err_rad is None else float(heading_err_rad)
+        kappa = float(curvature)
+        speed = float(speed_mps)
+    except (TypeError, ValueError):
+        return 0.0
+    if offset != offset or heading != heading or kappa != kappa or speed != speed:
+        return 0.0
+    if abs(offset) == float("inf") or abs(heading) == float("inf") or abs(kappa) == float("inf"):
+        return 0.0
+    kappa = max(-0.125, min(0.125, kappa))
+    feedforward = -math.atan(WHEELBASE_M * kappa) / (STEER_LOCK_RAD * ACTUATOR_YAW_GAIN)
+    # Same sign as steer_for_heading_error: a nose left of the road needs +steer.
+    heading_term = HEADING_STEER_GAIN * heading
+    lookahead = steer_lookahead_m(speed)
+    cross = math.atan2(2.0 * WHEELBASE_M * (-offset), lookahead * lookahead) / STEER_LOCK_RAD
+    return max(-1.0, min(1.0, feedforward + heading_term + cross))
+
+
+# gt_ctrl2 reached 3.3 m/s^2 lateral on a 37 m bend at 11 m/s.
+LAT_ACCEL_MAX = 2.5
+
+
+def curve_speed_mps(curvature: float, accel_max: float = LAT_ACCEL_MAX) -> float:
+    """Speed whose lateral accel on this bend is ``accel_max``.
+
+    A straight road (curvature ~ 0) does not impose a limit. A 40 m bend
+    caps at 10 m/s. The caller cuts throttle above this. A discontinuity
+    is a separate, harder brake.
+    """
+    try:
+        kappa = abs(float(curvature))
+        accel = float(accel_max)
+    except (TypeError, ValueError):
+        return float("inf")
+    if kappa != kappa or accel != accel or accel <= 0.0 or kappa < 1.0e-4:
+        return float("inf")
+    return math.sqrt(accel / kappa)
 
 
 def steer_for_heading_error(heading_err_rad: float) -> float:

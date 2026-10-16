@@ -14,6 +14,8 @@ if str(ROOT) not in sys.path:
 
 from python.control.actuate import (
     attach_electrics,
+    curve_speed_mps,
+    curve_steer,
     follow_lane_steer,
     lane_sample_hold_reason,
     LaneSteerState,
@@ -54,6 +56,8 @@ from python.viz.debug_draw import cabin_drive_word
 from python.control.launch_guard import (
     LaunchGuard,
     apply_lane_exit_brake,
+    longitudinal_mps,
+    moving_backward,
     apply_stale_speed_cap,
 )
 from python.debug.gt_geom import heading_from_dir
@@ -289,7 +293,28 @@ def main() -> None:
         action="store_true",
         help="Sim ground truth JSONL under logs/ (or set GVD_GT_LOG=1). Off in normal play.",
     )
+    ap.add_argument(
+        "--lane-source",
+        default=os.environ.get("GVD_LANE_SOURCE", "hough"),
+        choices=["hough", "scene", "gt"],
+        help="hough keeps the pixel lane finder. scene reads lane_x from models/e2e_scene.onnx "
+        "and stops when that confidence is low. gt feeds the road-network center at 8 m "
+        "as lane_x (GVD_LANE_SOURCE=gt). A missing road hit stops.",
+    )
+    ap.add_argument(
+        "--scene-onnx",
+        default="",
+        help="Scene-net ONNX path. Empty uses models/e2e_scene.onnx.",
+    )
     args = ap.parse_args()
+
+    from python.data.data_root import DataDriveError, ensure_cache_dirs
+
+    try:
+        ensure_cache_dirs()
+    except DataDriveError as exc:
+        print(f"[GVD] {exc}", flush=True)
+        raise SystemExit(2)
 
     if args.vision_only:
         os.environ["GVD_VISION_ONLY"] = "1"
@@ -525,10 +550,21 @@ def main() -> None:
     lane_steer = LaneSteerState()
     launch_guard = LaunchGuard()
     gt_log = None
-    if gt_log_enabled(bool(args.gt_log)):
+    if gt_log_enabled(bool(args.gt_log)) or args.lane_source == "gt":
         gt_log = GroundTruthLogger.open()
         print(f"[GVD] ground truth -> {gt_log.path}", flush=True)
     try:
+        scene_lane = None
+        if args.lane_source == "scene":
+            from python.train.scene_lane_runtime import SceneLaneRuntime
+
+            scene_lane = SceneLaneRuntime(args.scene_onnx or None)
+            print(
+                f"[GVD] lane source=scene onnx={scene_lane.path} ready={scene_lane.ready} ({scene_lane.reason})",
+                flush=True,
+            )
+        elif args.lane_source == "gt":
+            print("[GVD] lane source=gt road-network center at 8 m", flush=True)
         while True:
             loop_t0 = time.perf_counter()
             tick_dt: float | None = None
@@ -704,6 +740,59 @@ def main() -> None:
                 engage_hz_grace_floor=shadow_cfg.engage_hz_grace_floor,
             )
 
+            scene_stop = False
+            gt_stop = False
+            gt_preview = None
+            scene_lane_x = None
+            scene_conf = None
+            if args.lane_source == "gt":
+                from python.train.scene_lane_runtime import straight_lane_path
+
+                if gt_log is not None:
+                    gt_preview = gt_log.curve_preview(
+                        vdata,
+                        bng,
+                        socket_busy=bool(getattr(bundle, "grab_read_blocked", False)),
+                        dt_s=tick_dt,
+                    )
+                if gt_preview is None:
+                    gt_stop = True
+                    pout.path_ego = []
+                    pout.lane_conf = 0.0
+                    pout.path_conf = 0.0
+                    pout.lane_source = "gt/stop"
+                else:
+                    pout.path_ego = straight_lane_path(float(gt_preview.lane_x))
+                    pout.lane_conf = 1.0
+                    pout.path_conf = 1.0
+                    # Not "hold": the stale-speed cap treats that word as a frozen
+                    # camera lane and would parking-brake above 6 m/s.
+                    pout.lane_source = "gt"
+                    pout.path_debug_preview = False
+                    pout.frame_age_s = 0.0
+            elif scene_lane is not None:
+                from python.data.strip_writer import compose_strip
+                from python.train.scene_lane_runtime import (
+                    scene_lane_decision,
+                    straight_lane_path,
+                )
+
+                frames = getattr(bundle, "frames", None)
+                strip = compose_strip(frames if isinstance(frames, dict) else None)
+                lane_hat, conf = scene_lane.observe(strip, tick_dt)
+                scene_lane_x = lane_hat
+                scene_conf = conf
+                if scene_lane_decision(lane_hat, conf) != "lane":
+                    scene_stop = True
+                    pout.path_ego = []
+                    pout.lane_conf = float(conf)
+                    pout.lane_source = "scene/stop"
+                else:
+                    pout.path_ego = straight_lane_path(float(lane_hat))
+                    pout.lane_conf = float(conf)
+                    pout.path_conf = float(conf)
+                    pout.lane_source = "scene"
+                    pout.path_debug_preview = False
             cmd_seq += 1
             wide = None
             try:
@@ -733,6 +822,10 @@ def main() -> None:
                 engage_age_s=engage_age_s,
             )
             cmd = tick.applied
+            if scene_stop:
+                cmd = stop_command(seq=cmd_seq, reason="scene_lane_low")
+            elif gt_stop:
+                cmd = stop_command(seq=cmd_seq, reason="gt_lane_missing")
 
             if not ident.matched:
                 disengage_reason = "bus_mismatch"
@@ -815,7 +908,25 @@ def main() -> None:
             elif lane_y is not None:
                 miss = lane_sample_hold_reason(lane_x, lane_y)
             holding = False
-            if engaged and cmd.reason == "ok" and miss is None:
+            # GT curvature is not in the straight 8 m center. Steer Stanley
+            # plus feedforward, and do not treat a large heading as lane_far:
+            # that decay is what parked gt_ctrl1 sideways after the projection
+            # jumped. A held sample keeps the last bend instead of centering.
+            if (
+                engaged
+                and args.lane_source == "gt"
+                and gt_preview is not None
+                and cmd.reason == "ok"
+            ):
+                geometric = curve_steer(
+                    gt_preview.offset_m,
+                    gt_preview.heading_err_rad,
+                    gt_preview.curvature,
+                    float(ego_v or 0.0),
+                )
+                cmd.steer = follow_lane_steer(geometric, gt_preview.lane_x, lane_steer, tick_dt)
+                lane_steer.reason = "curve_hold" if gt_preview.held else "curve"
+            elif engaged and cmd.reason == "ok" and miss is None:
                 cmd.steer = follow_lane_steer(cmd.steer, lane_x, lane_steer, tick_dt)
             elif (
                 engaged
@@ -857,6 +968,17 @@ def main() -> None:
                 pos_xy=pos_xy,
             )
             lane_age_s = float(getattr(pout, "frame_age_s", 0.0) or 0.0)
+            if engaged and gt_preview is not None and (cmd.reason == "ok" or holding):
+                cap = curve_speed_mps(gt_preview.curvature)
+                spd_cap = spd_now if spd_now is not None else ego_v
+                if spd_cap is not None and float(spd_cap) > cap:
+                    cmd.throttle = 0.0
+                if gt_preview.lost:
+                    # Polyline end or a rejected jump. Brake now. The wheel
+                    # stays on the held curve; stop_command would zero it,
+                    # which is how gt_ctrl1 left the bend at 14 m/s.
+                    cmd.throttle = 0.0
+                    cmd.brake = max(float(cmd.brake), 1.0)
             if engaged and (cmd.reason == "ok" or holding):
                 apply_stale_speed_cap(
                     cmd,
@@ -883,6 +1005,24 @@ def main() -> None:
                     flush=True,
                 )
                 cmd = stop_command(seq=cmd_seq, reason=crash_reason)
+            long_v = None
+            if vdata is not None:
+                long_v = longitudinal_mps(getattr(vdata, "vel", None), direction)
+            if engaged and moving_backward(long_v):
+                engaged = False
+                disengage_reason = "reverse"
+                holding = False
+                lane_steer.reset()
+                launch_guard.reset()
+                bot_engage.clear()
+                write_engage_flag(False, disengage_reason="reverse")
+                print(
+                    f"[GVD] DISENGAGED: reverse long_mps={long_v:.2f}",
+                    flush=True,
+                )
+                cmd = stop_command(seq=cmd_seq, reason="reverse")
+                if hasattr(actuator, "note_park_hold"):
+                    actuator.note_park_hold()
 
             # Actuators only when engaged + command ok (path / tracks / shadow already on this tick).
             # cmd_json: Lua applies whatever we write only while `engaged` rides along in the payload.
@@ -1082,6 +1222,8 @@ def main() -> None:
                 f"release_cmd_skips={rel_skips} "
                 f"lane_x={'na' if lane_x is None else f'{lane_x:.4f}'} "
                 f"lane_y={'na' if lane_y is None else f'{lane_y:.2f}'} "
+                f"model_lane_x={'na' if scene_lane_x is None else f'{float(scene_lane_x):.4f}'} "
+                f"model_conf={'na' if scene_conf is None else f'{float(scene_conf):.3f}'} "
                 f"steer={float(applied.steer):+.4f} "
                 f"steer_why={lane_steer.reason} "
                 f"lane_src={getattr(pout, 'lane_source', 'none')} "
@@ -1149,6 +1291,8 @@ def main() -> None:
                     stitch=getattr(rig_view, "bgr", None),
                     lanes_bev=getattr(pout, "lanes_bev", None),
                     socket_busy=bool(getattr(bundle, "grab_read_blocked", False)),
+                    model_lane_x=None if scene_lane_x is None else float(scene_lane_x),
+                    model_conf=None if scene_conf is None else float(scene_conf),
                 )
 
             review_cap.write(

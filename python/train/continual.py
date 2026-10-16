@@ -15,10 +15,16 @@ from typing import Any, Mapping
 from python.train.scene_net import MEMORY_S, step_dt
 
 # AdamW candidates. The run keeps the one with the better holdout loss.
+# Kept so the search helper can be unit-tested. train_directory does not
+# call it: the run stays at the requested rate, which defaults to 1e-3.
 CANDIDATE_LRS = (1e-3, 1e-4)
 WEIGHT_DECAY = 0.01
 GRAD_CLIP = 1.0
 HOLDOUT_FRACTION = 0.2
+# Rows within this many seconds of the cut are neither train nor holdout.
+HOLDOUT_GAP_S = 4.0
+# A segment longer than this is cut in time even when other segments exist.
+LONG_SEGMENT_S = 15.0 * 60.0
 CHUNK_MIN = 8
 CHUNK_MAX = 16
 # A backward chunk has to fit on an 11 GB card.
@@ -299,6 +305,182 @@ def oversample_repeats(rows: list[Mapping[str, Any]]) -> int:
     return 1
 
 
+def _segment_groups(rows: list[Mapping[str, Any]]) -> list[tuple[str, list[Mapping[str, Any]]]] | None:
+    """Consecutive ``segment`` blocks. None when any row has no segment."""
+    if not rows:
+        return []
+    groups: list[tuple[str, list[Mapping[str, Any]]]] = []
+    for row in rows:
+        if not isinstance(row, Mapping) or not row.get("segment"):
+            return None
+        seg = str(row.get("segment"))
+        if not groups or groups[-1][0] != seg:
+            groups.append((seg, [row]))
+        else:
+            groups[-1][1].append(row)
+    return groups
+
+
+def holdout_segment_names(rows: list[Mapping[str, Any]]) -> set[str]:
+    """Whole segments held out of training.
+
+    Two or more short segments: the last one. Five or more: every fifth.
+    One segment, or any segment longer than about 15 minutes, is not in
+    this set. Those are cut by time inside the segment.
+    """
+    groups = _segment_groups(rows)
+    if not groups or len(groups) < 2:
+        return set()
+    names = [seg for seg, _rows in groups]
+    if len(names) < 5:
+        return {names[-1]}
+    return {name for index, name in enumerate(names) if (index + 1) % 5 == 0}
+
+
+def _row_time(row: Mapping[str, Any]) -> float | None:
+    try:
+        stamp = float(row["t"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not math.isfinite(stamp):
+        return None
+    return stamp
+
+
+def segment_span_s(rows: list[Mapping[str, Any]]) -> float:
+    """Seconds from the first timestamp to the last. Zero when time is missing."""
+    times = [stamp for stamp in (_row_time(row) for row in rows) if stamp is not None]
+    if len(times) < 2:
+        return 0.0
+    return max(times) - min(times)
+
+
+def split_segment_time_holdout(
+    rows: list[Mapping[str, Any]],
+    fraction: float = HOLDOUT_FRACTION,
+    *,
+    gap_s: float = HOLDOUT_GAP_S,
+) -> tuple[list[Mapping[str, Any]], list[Mapping[str, Any]]]:
+    """Last ``fraction`` of this segment's time, with a gap at the cut.
+
+    The gap is neither trained nor scored, so the holdout does not start
+    on the same second as the last training frame. A span with no holdout
+    sample stays entirely in the prefix.
+    """
+    times = [_row_time(row) for row in rows]
+    known = [stamp for stamp in times if stamp is not None]
+    if len(known) < 2:
+        return list(rows), []
+    t0 = min(known)
+    span = max(known) - t0
+    portion = min(1.0, max(0.0, float(fraction)))
+    if span <= 0.0 or portion <= 0.0:
+        return list(rows), []
+    cut = t0 + (1.0 - portion) * span
+    gap_at = cut - max(0.0, float(gap_s))
+    prefix: list[Mapping[str, Any]] = []
+    hold: list[Mapping[str, Any]] = []
+    for row, stamp in zip(rows, times):
+        if stamp is None or stamp < gap_at:
+            prefix.append(row)
+        elif stamp >= cut:
+            hold.append(row)
+    if not hold:
+        return list(rows), []
+    return prefix, hold
+
+
+def valid_fraction(rows: list[Mapping[str, Any]]) -> float:
+    """Share of rows whose 5 m and 10 m lane centers are marked valid."""
+    from python.debug.lane_targets import lane_center_is_valid, lane_gt_from_record
+
+    if not rows:
+        return 0.0
+    good = 0
+    for row in rows:
+        tech = row.get("tech") if isinstance(row.get("tech"), Mapping) else row
+        _values, mask = lane_gt_from_record(tech if isinstance(tech, Mapping) else None)
+        if lane_center_is_valid(mask):
+            good += 1
+    return good / float(len(rows))
+
+
+def window_difficulty(rows: list[Mapping[str, Any]]) -> float:
+    """How much this window bends, changes lane, or leaves a straight.
+
+    Straights sit near 0. A weave, a ramp, or a large steer or heading
+    error pushes the score up so ``--balance`` can repeat the window.
+    """
+    from python.debug.lane_targets import lane_gt_from_record
+
+    if not rows:
+        return 0.0
+    total = 0.0
+    prev: float | None = None
+    for row in rows:
+        tech = row.get("tech") if isinstance(row.get("tech"), Mapping) else row
+        if not isinstance(tech, Mapping):
+            tech = {}
+        try:
+            heading = abs(float(tech.get("heading_err_rad") or 0.0))
+        except (TypeError, ValueError):
+            heading = 0.0
+        wheel = row.get("wheel") if isinstance(row.get("wheel"), Mapping) else {}
+        try:
+            steer = abs(float(wheel.get("steer") or 0.0))
+        except (TypeError, ValueError):
+            steer = 0.0
+        values, mask = lane_gt_from_record(tech)
+        center = abs(float(values[0])) if float(mask[0]) > 0.5 else 0.0
+        delta = 0.0 if prev is None else abs(center - prev)
+        prev = center
+        excursion = row.get("excursion") if isinstance(row.get("excursion"), Mapping) else {}
+        phase = str(excursion.get("phase") or "")
+        bonus = 1.0 if phase in ("weave", "lane_change") else 0.0
+        if str(row.get("spawn_type") or "") == "ramp":
+            bonus += 0.75
+        total += heading * 5.0 + steer + delta + bonus
+    return total / float(len(rows))
+
+
+def epoch_windows(
+    plan: list[dict[str, Any]],
+    rng: Any,
+    *,
+    min_valid: float = 0.3,
+    balance: bool = False,
+) -> list[dict[str, Any]]:
+    """Shuffle train windows. Holdout stays in time order, after them.
+
+    Every training window starts from a fresh GRU state. Carrying a
+    straight-road hidden state into the next curve was the loss spike.
+    """
+    train: list[dict[str, Any]] = []
+    hold: list[dict[str, Any]] = []
+    floor = float(min_valid)
+    for item in plan:
+        if item.get("kind") == "holdout":
+            hold.append(item)
+            continue
+        rows = list(item.get("rows") or [])
+        if floor > 0.0 and valid_fraction(rows) < floor:
+            continue
+        fresh = dict(item)
+        fresh["incoming"] = "reset"
+        fresh["rows"] = rows
+        copies = 1
+        if balance:
+            score = window_difficulty(rows)
+            if score >= 0.45:
+                copies = 4
+            elif score >= 0.15:
+                copies = 2
+        for _ in range(copies):
+            train.append(dict(fresh))
+    rng.shuffle(train)
+    return train + hold
+
+
 def pass_plan(
     rows: list[Mapping[str, Any]],
     length: int,
@@ -307,13 +489,20 @@ def pass_plan(
     memory_s: float = MEMORY_S,
     fraction: float = HOLDOUT_FRACTION,
 ) -> list[dict[str, Any]]:
-    """One pass: overlapping train chunks on the prefix, then the holdout.
+    """One pass: overlapping train chunks, then the holdout.
 
+    Rows tagged with ``segment`` hold out whole short segments when there
+    are two or more. One segment, and any segment longer than about 15
+    minutes, holds out the last fraction of its own time, with a few
+    seconds dropped at the cut. A recording without a segment tag still
+    holds out the last fraction of each span.
     A rare chunk is listed twice so the trainer steps twice from the same
     incoming state. Holdout rows are never listed as train rows. The second
     copy of a rare chunk uses ``incoming == "chunk"`` so it does not advance
     the carry on its own.
     """
+    if _segment_groups(rows) is not None:
+        return _pass_plan_segments(rows, length, stride, memory_s=memory_s, fraction=fraction)
     plan: list[dict[str, Any]] = []
     for start, end in recording_spans(rows, memory_s=memory_s):
         segment = list(rows[start:end])
@@ -346,13 +535,105 @@ def pass_plan(
     return plan
 
 
-def holdout_stopped(losses: list[float]) -> bool:
-    """True once the latest holdout loss is not strictly better than the best so far.
+def _train_only_plan(
+    rows: list[Mapping[str, Any]],
+    length: int,
+    stride: int,
+    *,
+    memory_s: float,
+) -> list[dict[str, Any]]:
+    """Train chunks for these rows. No time-based holdout inside the block."""
+    return pass_plan(rows, length, stride, memory_s=memory_s, fraction=0.0)
 
-    The first measurement cannot stop the run. There is no epoch cap here.
+
+def _pass_plan_segments(
+    rows: list[Mapping[str, Any]],
+    length: int,
+    stride: int,
+    *,
+    memory_s: float,
+    fraction: float = HOLDOUT_FRACTION,
+) -> list[dict[str, Any]]:
+    groups = _segment_groups(rows) or []
+    held = holdout_segment_names(rows)
+    few = len(groups) < 2
+    plan: list[dict[str, Any]] = []
+    for seg, block in groups:
+        if few or segment_span_s(block) > LONG_SEGMENT_S:
+            prefix, hold = split_segment_time_holdout(block, fraction)
+            plain = [dict(row) for row in prefix]
+            for row in plain:
+                row.pop("segment", None)
+            plan.extend(_train_only_plan(plain, length, stride, memory_s=memory_s))
+            if hold:
+                plan.append(
+                    {
+                        "kind": "holdout",
+                        "rows": list(hold),
+                        "incoming": "reset",
+                        "stride": 0,
+                        "grad_frames": 0,
+                    }
+                )
+            continue
+        plain = [dict(row) for row in block]
+        for row in plain:
+            row.pop("segment", None)
+        if seg in held:
+            plan.append(
+                {
+                    "kind": "holdout",
+                    "rows": list(block),
+                    "incoming": "reset",
+                    "stride": 0,
+                    "grad_frames": 0,
+                }
+            )
+            continue
+        plan.extend(_train_only_plan(plain, length, stride, memory_s=memory_s))
+    return plan
+
+
+def remaining_until_holdout_can_stop(
+    remaining_this_pass: int,
+    steps_per_pass: int,
+    *,
+    epoch: int,
+    has_holdout: bool,
+    rates_after: int,
+) -> int:
+    """Steps from here until the holdout is allowed to stop the run.
+
+    The first pass cannot stop. Each later learning rate gets the same shape:
+    one pass, plus a second when a holdout exists. ``--epochs`` does not
+    multiply this. If val loss keeps falling, the run continues past it.
+    """
+    remaining = max(0, int(remaining_this_pass))
+    per = max(0, int(steps_per_pass))
+    if has_holdout and int(epoch) <= 0:
+        remaining += per
+    later = per * (2 if has_holdout else 1)
+    remaining += max(0, int(rates_after)) * later
+    return remaining
+
+
+def holdout_stopped(
+    losses: list[float],
+    *,
+    tol: float = 0.0,
+    window: int = 0,
+) -> bool:
+    """True once the latest holdout score is not strictly better than the best so far.
+
+    Lower is better. The first measurement cannot stop the run. There is no
+    epoch cap here. ``tol`` and ``window`` stop a plateau: the last ``window``
+    scores stay inside ``tol`` (metres, when the score is the lane-center rms).
     """
     if len(losses) < 2:
         return False
+    if float(tol) > 0.0 and int(window) >= 2 and len(losses) >= int(window):
+        recent = [float(value) for value in losses[-int(window) :]]
+        return max(recent) - min(recent) <= float(tol)
     best = min(float(value) for value in losses[:-1])
     return float(losses[-1]) >= best
 
@@ -393,8 +674,28 @@ def chunk_vram_budget(free_vram_bytes: int) -> int:
     return min(free, VRAM_BUDGET_BYTES)
 
 
+def resume_learning_rate(requested: float, paused: float | None = None) -> float:
+    """The command-line rate. A pause file cannot continue a lower-rate pass.
+
+    ``paused`` is the rate stored in the pause file. It is not returned.
+    Holdout stop does not schedule the next candidate. Passing ``--lr`` is
+    the only way to leave the default ``1e-3``.
+    """
+    del paused
+    try:
+        rate = float(requested)
+    except (TypeError, ValueError):
+        return float(CANDIDATE_LRS[0])
+    if not math.isfinite(rate) or rate <= 0.0:
+        return float(CANDIDATE_LRS[0])
+    return rate
+
+
 def ordered_learning_rates(requested: float) -> tuple[float, ...]:
-    """The two candidates, with ``requested`` first when it is one of them."""
+    """The two candidates, with ``requested`` first when it is one of them.
+
+    The trainer does not call this. ``resume_learning_rate`` is the schedule.
+    """
     try:
         rate = float(requested)
     except (TypeError, ValueError):

@@ -57,6 +57,7 @@ def check_cams_and_heads() -> None:
     assert parser.parse_args(["--no-augment"]).augment is False
     sched = parser.parse_args([])
     assert sched.lr == 1e-3
+    assert sched.batch == 0
     assert sched.clip == 1.0 and sched.lane_loss == "huber" and sched.min_valid == 0.3
     assert sched.balance is False and sched.scale == 1.0 and sched.workers is None
     assert loader_settings(4, cuda=True) == {
@@ -384,6 +385,186 @@ def check_sanity_overfits_cached_main() -> None:
     print("sanity overfit")
 
 
+def _bar(x: int, height: int = 192, width: int = 256) -> np.ndarray:
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    col = int(np.clip(x, 2, width - 3))
+    frame[:, col - 2 : col + 3] = 255
+    return frame
+
+
+def _offset_row(index: int, offset: float) -> dict:
+    values = [0.0] * 14
+    mask = [0.0] * 14
+    values[0] = float(offset)
+    values[-1] = 1.0
+    mask[0] = 1.0
+    mask[-1] = 1.0
+    return {
+        "i": index,
+        "t": float(index) * 0.1,
+        "dt_s": 0.1,
+        "wheel": {"steer": 0.0},
+        "pedals": {"throttle": 0.2, "brake": 0.0},
+        "tech": {"lane_gt": values, "lane_gt_valid": mask},
+    }
+
+
+def check_lane_position_learns() -> None:
+    """64 distinct lane positions overfit, and a disjoint set still correlates.
+
+    Global average pooling made every horizontal shift the same vector, so
+    this fit stayed near r=0. The stem now keeps eight horizontal bins.
+    """
+    from python.debug.lane_targets import score_centers
+    from python.train.continual import WEIGHT_DECAY
+    from python.train.scene_net import HORIZ_BINS, SceneNet, scene_loss, torch_ready
+    from python.train.train_scene import _optimizer_group, resolve_scene_batch
+
+    assert resolve_scene_batch(0, 8) == 8
+    assert resolve_scene_batch(4, 8) == 4
+    assert resolve_scene_batch(0, 0) == 1
+    if not torch_ready():
+        print("lane position skipped (torch missing)")
+        return
+    import torch
+    import torch.nn.functional as functional
+
+    np.random.seed(0)
+    torch.manual_seed(0)
+    width = 256
+    net = SceneNet(cams=("main",))
+    # Dropout stays on in the real trainer. It is off here so a short CPU
+    # fit of 64 images is not a coin flip.
+    net.gru_in_drop.p = 0.0
+    left = torch.from_numpy(_bar(40)).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+    right = torch.from_numpy(_bar(200)).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+    with torch.no_grad():
+        pooled = []
+        for image in (left, right):
+            horiz = net.stem.conv(image).mean(dim=2)
+            pooled.append(functional.adaptive_avg_pool1d(horiz, HORIZ_BINS).flatten())
+    stem_cos = float(functional.cosine_similarity(pooled[0], pooled[1], dim=0))
+    assert stem_cos < 0.95, stem_cos
+
+    train_x = [20 + i * 3 for i in range(64)]
+    hold_x = [21 + i * 12 for i in range(16)]
+    assert len(set(train_x)) == 64
+    assert set(hold_x).isdisjoint(train_x)
+
+    def pack(xs: list[int]) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[float]]:
+        images = np.stack([_bar(x) for x in xs])
+        values = np.zeros((len(xs), 14), np.float32)
+        mask = np.zeros((len(xs), 14), np.float32)
+        offsets: list[float] = []
+        for i, x in enumerate(xs):
+            offset = (float(x) - width / 2.0) / (width / 4.0)
+            values[i, 0] = offset
+            values[i, -1] = 1.0
+            mask[i, 0] = 1.0
+            mask[i, -1] = 1.0
+            offsets.append(offset)
+        return images, values, mask, offsets
+
+    opt = torch.optim.AdamW(net.parameters(), lr=1e-3, weight_decay=WEIGHT_DECAY)
+    net.train()
+    order = np.arange(64)
+    last = 1.0
+    for _epoch in range(20):
+        np.random.shuffle(order)
+        total = 0.0
+        steps = 0
+        for start in range(0, 64, 8):
+            chosen = [train_x[int(i)] for i in order[start : start + 8]]
+            images, values, mask, _offsets = pack(chosen)
+            state = net.initial_state(batch=len(chosen))
+            pred, _state = net.forward_batch(torch.from_numpy(images), 0.1, state)
+            loss = scene_loss(
+                pred,
+                {"lane_gt": torch.from_numpy(values), "lane_gt_valid": torch.from_numpy(mask)},
+                ("lane_gt",),
+                lane_loss="huber",
+            )["total"]
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+            opt.step()
+            total += float(loss.detach())
+            steps += 1
+        last = total / steps
+        if last < 0.05 and _epoch >= 3:
+            break
+    assert last < 0.05, last
+
+    def predict(xs: list[int]) -> tuple[list[float], list[float]]:
+        net.eval()
+        images, _values, _mask, offsets = pack(xs)
+        with torch.no_grad():
+            state = net.initial_state(batch=len(xs))
+            pred, _state = net.forward_batch(torch.from_numpy(images), 0.1, state)
+            centers = [float(v) for v in pred.lane_gt[:, 0].detach()]
+        return centers, offsets
+
+    train_pred, train_true = predict(train_x)
+    hold_pred, hold_true = predict(hold_x)
+    train_score = score_centers(train_pred, train_true)
+    hold_score = score_centers(hold_pred, hold_true)
+    assert float(train_score["r"]) > 0.9, train_score
+    assert float(hold_score["r"]) > 0.5, hold_score
+    grad_net = SceneNet(cams=("main",))
+    grad_net.train()
+    images, values, mask, _offsets = pack(train_x[:8])
+    state = grad_net.initial_state(batch=8)
+    pred, _state = grad_net.forward_batch(torch.from_numpy(images), 0.1, state)
+    loss = scene_loss(
+        pred,
+        {"lane_gt": torch.from_numpy(values), "lane_gt_valid": torch.from_numpy(mask)},
+        ("lane_gt",),
+    )["total"]
+    loss.backward()
+    stem_grad = float(grad_net.stem.conv[0].weight.grad.abs().sum())
+    assert stem_grad > 0.0, stem_grad
+    print(
+        f"lane position loss={last:.4f} r={train_score['r']:.3f} "
+        f"hold_r={hold_score['r']:.3f} stem_cos={stem_cos:.3f} stem_grad={stem_grad:.3f}"
+    )
+
+    # The trainer step has to see every window in the stack, not only index 0.
+    opt = torch.optim.AdamW(net.parameters(), lr=1e-3, weight_decay=0.0)
+    net.train()
+    sequences = []
+    frames = []
+    targets = [1.2, 0.4, -0.4, -1.2]
+    columns = [40, 90, 160, 210]
+    for index, (offset, column) in enumerate(zip(targets, columns)):
+        sequences.append([_offset_row(index, offset)])
+        frames.append([_bar(column)])
+    group_loss = None
+    for _step in range(8):
+        group_loss, n_sup, _carry, _end = _optimizer_group(
+            net,
+            opt,
+            None,
+            Path("."),
+            sequences,
+            device=torch.device("cpu"),
+            amp=False,
+            view=None,
+            clip=1.0,
+            heads=("lane_gt",),
+            lane_loss="huber",
+            frame_sets=frames,
+        )
+        assert n_sup == 4
+    assert group_loss is not None and group_loss < 0.2, group_loss
+    net.eval()
+    with torch.no_grad():
+        state = net.initial_state(batch=4)
+        pred, _state = net.forward_batch(torch.from_numpy(np.stack([_bar(c) for c in columns])), 0.1, state)
+        got = [float(v) for v in pred.lane_gt[:, 0].detach()]
+    assert score_centers(got, targets)["r"] > 0.9, got
+    print(f"group step loss={group_loss:.4f} r={score_centers(got, targets)['r']:.3f}")
+
+
 def main() -> None:
     check_cams_and_heads()
     check_extract_and_jitter()
@@ -392,6 +573,7 @@ def main() -> None:
     check_subset_forward_probe_and_export()
     check_spawn_loader_reads_cache()
     check_sanity_overfits_cached_main()
+    check_lane_position_learns()
     print("train options ok")
 
 

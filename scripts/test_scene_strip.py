@@ -1214,6 +1214,7 @@ def check_parameter_count_hand_sum() -> None:
     """A tiny built net's trainable count matches a hand sum of its layers."""
     from python.train.scene_net import (
         GRU_HIDDEN,
+        HORIZ_BINS,
         STEM_CHANNELS,
         TOKEN_DIM,
         architecture_parameter_count,
@@ -1284,7 +1285,7 @@ def check_parameter_count_hand_sum() -> None:
     for width in STEM_CHANNELS:
         expected += conv2d_parameter_count(cin, int(width), 3, bias=True)
         cin = int(width)
-    expected += linear_parameter_count(STEM_CHANNELS[-1], SECTOR_FEAT, bias=True)
+    expected += linear_parameter_count(STEM_CHANNELS[-1] * HORIZ_BINS, SECTOR_FEAT, bias=True)
     expected += gru_parameter_count(TOKEN_DIM + 1, GRU_HIDDEN, num_layers=1, bias=True)
     for _name, out in scene_head_sizes():
         expected += linear_parameter_count(GRU_HIDDEN, out, bias=True)
@@ -1293,6 +1294,8 @@ def check_parameter_count_hand_sum() -> None:
     stem_body = stem_at[stem_at.index("class SharedStem") : stem_at.index("class SceneNet")]
     assert "nn.GroupNorm(" in stem_body
     assert "stem_spec()" in stem_body
+    assert "adaptive_avg_pool1d" in stem_body
+    assert "mean(dim=(2, 3))" not in stem_body
     assert "nn.BatchNorm" not in stem_body
     assert "not added" not in stem_body
     print(f"scene parameters: {shown}")
@@ -1613,6 +1616,8 @@ def check_continual_bptt_and_yaw() -> None:
     assert "GRAD_CLIP" in body
     assert "pass_plan" in body
     assert "holdout_stopped" in body
+    assert "ordered_learning_rates" not in body
+    assert "pick_learning_rate" not in body
     assert body.index("plan_fit") < body.index("_optimizer_step")
 
 

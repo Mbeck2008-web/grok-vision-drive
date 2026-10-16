@@ -15,6 +15,8 @@ from typing import Any, Mapping
 from python.train.scene_net import MEMORY_S, step_dt
 
 # AdamW candidates. The run keeps the one with the better holdout loss.
+# Kept so the search helper can be unit-tested. train_directory does not
+# call it: the run stays at the requested rate, which defaults to 1e-3.
 CANDIDATE_LRS = (1e-3, 1e-4)
 WEIGHT_DECAY = 0.01
 GRAD_CLIP = 1.0

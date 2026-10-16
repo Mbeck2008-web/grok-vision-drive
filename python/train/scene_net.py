@@ -46,6 +46,9 @@ RESIDUAL_TOKENS = int(math.ceil(RESIDUAL_S / RESIDUAL_MIN_DT))
 GRU_IN_DROPOUT = 0.1
 # GroupNorm groups for every stem width. 32, 64, and 128 all divide by 8.
 STEM_GROUPS = 8
+# Bins across the sector width. Averaging the whole map made a lane on the
+# left and a lane on the right the same 64 floats, so the head stayed a constant.
+HORIZ_BINS = 8
 N_LANES = 6
 LANE_POINTS = 16
 N_CURBS = 2
@@ -215,7 +218,7 @@ def architecture_parameter_count() -> int:
             total += conv2d_parameter_count(left, right, 3, bias=True)
         elif kind == "groupnorm":
             total += groupnorm_parameter_count(right)
-    total += linear_parameter_count(STEM_CHANNELS[-1], SECTOR_FEAT, bias=True)
+    total += linear_parameter_count(STEM_CHANNELS[-1] * HORIZ_BINS, SECTOR_FEAT, bias=True)
     total += gru_parameter_count(TOKEN_DIM + 1, GRU_HIDDEN, num_layers=1, bias=True)
     for _name, out in scene_head_sizes():
         total += linear_parameter_count(GRU_HIDDEN, out, bias=True)
@@ -1209,6 +1212,8 @@ if torch is not None:
         """Shared stride-2 stem: Conv, GroupNorm, ReLU, then 64 floats.
 
         GroupNorm, not BatchNorm. A batch of one strip is a legal step.
+        Height is averaged. Width is kept as ``HORIZ_BINS`` so a lane offset
+        still changes the vector.
         """
 
         def __init__(self) -> None:
@@ -1224,11 +1229,15 @@ if torch is not None:
                 else:
                     raise RuntimeError(f"stem has no {kind} layer")
             self.conv = nn.Sequential(*layers)
-            self.fc = nn.Linear(STEM_CHANNELS[-1], SECTOR_FEAT)
+            self.fc = nn.Linear(STEM_CHANNELS[-1] * HORIZ_BINS, SECTOR_FEAT)
 
         def forward(self, x: Any) -> Any:
-            feat = self.conv(x).mean(dim=(2, 3))
-            return self.fc(feat)
+            import torch.nn.functional as functional
+
+            feat = self.conv(x)
+            horiz = feat.mean(dim=2)
+            pooled = functional.adaptive_avg_pool1d(horiz, HORIZ_BINS)
+            return self.fc(pooled.flatten(1))
 
     class SceneNet(nn.Module):
         """Strip in, planner tensors out. Hidden size 512. No steer head."""

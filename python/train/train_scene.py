@@ -39,9 +39,7 @@ from python.train.continual import (  # noqa: E402
     choose_chunk_length,
     holdout_stopped,
     offcenter_view,
-    ordered_learning_rates,
     pass_plan,
-    pick_learning_rate,
     remaining_until_holdout_can_stop,
 )
 from python.train.fit import (  # noqa: E402
@@ -85,11 +83,39 @@ from python.train.status_window import (  # noqa: E402
 )
 
 
+def resolve_scene_batch(requested: int, parallel_fit: int) -> int:
+    """Windows in one optimizer step.
+
+    ``requested`` 0 uses the batch that fits in free VRAM. A positive value
+    is that many windows. The floor is one window.
+    """
+    if int(requested) > 0:
+        return int(requested)
+    if int(parallel_fit) > 0:
+        return int(parallel_fit)
+    return 1
+
+
+def _maybe_jitter(frame: Any, augment: bool, rng: np.random.RandomState | None) -> Any:
+    """Photometric jitter on a decoded frame. The row's metres are not an input."""
+    if not augment or frame is None:
+        return frame
+    from python.train.cam_strip import photometric_jitter
+
+    return photometric_jitter(frame, rng)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train the GVD scene net from recorded strips")
     parser.add_argument("--strips", type=str, default="", help="Directory with meta.json, strips/, state.jsonl")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--batch",
+        type=int,
+        default=0,
+        help="Windows per optimizer step. 0 fits the largest batch in free VRAM.",
+    )
     parser.add_argument(
         "--capability",
         type=float,
@@ -403,6 +429,15 @@ def _detach_state(state: SceneState) -> SceneState:
     )
 
 
+def _state_first(state: SceneState) -> SceneState:
+    """One stream, for the next window that is not part of this stacked step."""
+    return SceneState(
+        h=state.h[:, :1].detach().clone(),
+        tokens=state.tokens[:1].detach().clone(),
+        mask=state.mask[:1].detach().clone(),
+    )
+
+
 def overlap_gradient_cut() -> dict[str, bool] | None:
     """Backward two overlapping chunks. ``None`` when PyTorch is not installed.
 
@@ -595,7 +630,7 @@ def _optimizer_step(
         if frames is not None:
             if tick >= len(frames) or frames[tick] is None:
                 continue
-            frame = frames[tick]
+            frame = _maybe_jitter(frames[tick], augment, rng)
         else:
             loaded = _frame_row(
                 root, row, cams=cams, cache=cache, augment=augment, rng=rng, scale=scale,
@@ -675,6 +710,145 @@ def _optimizer_step(
             }
         )
     return float(loss.detach().item()), n_loss, carry, end_state
+
+
+def _optimizer_group(
+    net: Any,
+    opt: Any,
+    scaler: Any,
+    root: Path,
+    sequences: list[list[Mapping[str, Any]]],
+    *,
+    device: Any,
+    amp: bool,
+    view: TrainWindow | None,
+    clip: float,
+    trace: dict[str, Any] | None = None,
+    cams: tuple[str, ...] | None = None,
+    cache: Any = None,
+    augment: bool = False,
+    rng: np.random.RandomState | None = None,
+    heads: tuple[str, ...] | None = None,
+    lane_loss: str = "huber",
+    frame_sets: list[list[Any] | None] | None = None,
+    scale: float = 1.0,
+) -> tuple[float | None, int, SceneState, SceneState]:
+    """One step on several windows that each start from a fresh GRU state.
+
+    Shorter windows are padded for the forward and left out of the loss.
+    """
+    import torch
+
+    from python.train.scene_net import LOSS_TERMS
+
+    started = time.perf_counter()
+    net.train()
+    opt.zero_grad(set_to_none=True)
+    width = len(sequences)
+    length = max((len(seq) for seq in sequences), default=0)
+    state = net.initial_state(device=device, batch=max(1, width))
+    total = None
+    n_loss = 0
+    head_acc = {key: 0.0 for key in LOSS_TERMS}
+    nan_n = 0
+    inf_n = 0
+    blank = None
+    presets = list(frame_sets) if frame_sets is not None else [None] * width
+    for tick in range(length):
+        chosen: list[Any] = []
+        alive: list[Mapping[str, Any] | None] = []
+        dts: list[float] = []
+        for b, seq in enumerate(sequences):
+            frame = None
+            row = None
+            if tick < len(seq):
+                preset = presets[b] if b < len(presets) else None
+                if preset is not None:
+                    if tick < len(preset) and preset[tick] is not None:
+                        frame = _maybe_jitter(preset[tick], augment, rng)
+                        row = seq[tick]
+                else:
+                    loaded = _frame_row(
+                        root, seq[tick], cams=cams, cache=cache, augment=augment, rng=rng, scale=scale,
+                    )
+                    if loaded is not None:
+                        frame, row = loaded
+            if frame is not None and blank is None:
+                blank = np.zeros_like(frame)
+            chosen.append(frame)
+            alive.append(row if frame is not None else None)
+            dts.append(step_dt(None if row is None else row.get("dt_s")))
+        if blank is None or not any(frame is not None for frame in chosen):
+            continue
+        stacked = [blank if frame is None else frame for frame in chosen]
+        image = torch.from_numpy(np.ascontiguousarray(np.stack(stacked))).to(device)
+        dt = torch.tensor(dts, dtype=torch.float32, device=device)
+        with _autocast(amp):
+            pred, state = net.forward_batch(image, dt, state)
+        for b, row in enumerate(alive):
+            if row is None or not loss_mask(row):
+                continue
+            one = _prediction_at(pred, b)
+            step = scene_loss(one, _as_target(labels_for_row(row), device), heads, lane_loss=lane_loss)
+            value = step["total"]
+            item_loss = float(value.detach().item())
+            if math.isnan(item_loss):
+                nan_n += 1
+            elif not math.isfinite(item_loss):
+                inf_n += 1
+            for key in LOSS_TERMS:
+                head_acc[key] += float(step[key].detach().item())
+            total = value if total is None else total + value
+            n_loss += 1
+        if view is not None:
+            view.pump()
+    end_state = _state_first(state)
+    if total is None or n_loss == 0:
+        if trace is not None:
+            trace.update(
+                {
+                    "loss": None,
+                    "heads": {key: None for key in LOSS_TERMS},
+                    "n_loss": 0,
+                    "grad_norm": None,
+                    "nan": nan_n,
+                    "inf": inf_n,
+                    "step_s": time.perf_counter() - started,
+                    "lane_gt": None,
+                }
+            )
+        return None, 0, end_state, end_state
+    loss = total / n_loss
+    grad_norm = None
+    if scaler is not None:
+        scaler.scale(loss).backward()
+        scaler.unscale_(opt)
+        grad_norm = float(torch.nn.utils.clip_grad_norm_(net.parameters(), float(clip)))
+        scaler.step(opt)
+        scaler.update()
+    else:
+        loss.backward()
+        grad_norm = float(torch.nn.utils.clip_grad_norm_(net.parameters(), float(clip)))
+        opt.step()
+    bad_nan, bad_inf = _grad_bad_counts(net)
+    nan_n += bad_nan
+    inf_n += bad_inf
+    net.zero_grad(set_to_none=True)
+    head_mean = {key: head_acc[key] / n_loss for key in LOSS_TERMS}
+    if trace is not None:
+        trace.update(
+            {
+                "loss": float(loss.detach().item()),
+                "heads": head_mean,
+                "n_loss": n_loss,
+                "grad_norm": grad_norm,
+                "nan": nan_n,
+                "inf": inf_n,
+                "step_s": time.perf_counter() - started,
+                "lane_gt": head_mean.get("lane_gt"),
+            }
+        )
+    return float(loss.detach().item()), n_loss, end_state, end_state
 
 
 def _eval_sequence(
@@ -1012,6 +1186,7 @@ def train_directory(
     min_valid: float = 0.3,
     workers: int = 0,
     scale: float = 1.0,
+    batch_size: int = 0,
 ) -> dict[str, Any]:
     import torch
 
@@ -1126,10 +1301,8 @@ def train_directory(
 
     device = holder["device"]
     net = holder["net"]
-    # One recording is one GRU stream. A larger batch would be parallel
-    # recordings, which this folder does not have. parallel_fit is how many
-    # such streams the free VRAM could hold at this chunk length.
-    batch = 1
+    # Each shuffled window starts from a reset GRU, so several windows fit
+    # in one step. parallel_fit is how many this free VRAM can hold.
     parallel_fit = 0
     if int(free_vram_bytes) > 0 and len(rows) > 0:
         parallel_fit = largest_batch(
@@ -1139,6 +1312,7 @@ def train_directory(
             window_strips=chunk_len,
             limit=32,
         )
+    batch = resolve_scene_batch(int(batch_size), parallel_fit)
     est_step = step_bytes(
         batch,
         file_bytes=file_bytes,
@@ -1337,6 +1511,7 @@ def train_directory(
         best_value: float | None = None
         best_blob: dict[str, Any] | None = None
         while not paused_exit:
+            refit = False
             from python.train.continual import epoch_windows
 
             plan_steps = epoch_windows(
@@ -1401,41 +1576,84 @@ def train_directory(
                         hold_n += int(held_count)
                     index += 1
                     continue
+                group = [item]
+                group_frames: list[Any] = [prefetched_frames]
+                if int(batch) > 1 and str(item.get("incoming")) == "reset":
+                    while len(group) < int(batch) and index + len(group) < len(plan_steps):
+                        nxt = plan_steps[index + len(group)]
+                        if nxt.get("kind") == "holdout" or str(nxt.get("incoming")) != "reset":
+                            break
+                        nxt_frames = None
+                        if prefetch_iter is not None:
+                            try:
+                                packed = next(prefetch_iter)
+                                nxt_frames = packed.get("frames")
+                            except StopIteration:
+                                nxt_frames = None
+                        group.append(nxt)
+                        group_frames.append(nxt_frames)
                 if item["incoming"] != "chunk":
                     chunk_in = state_in
                 last_batch = {
                     "step": int(done),
                     "epoch": int(epoch),
-                    "rows": [row.get("i") for row in item["rows"]],
+                    "rows": [row.get("i") for piece in group for row in piece["rows"]],
                 }
                 try:
-                    step_loss, n_sup, carry, end_state = _optimizer_step(
-                        net,
-                        holder["opt"],
-                        holder["scaler"],
-                        root,
-                        list(item["rows"]),
-                        state_in,
-                        device=device,
-                        amp=bool(holder["amp"]),
-                        view=view,
-                        stride=int(item["stride"]),
-                        clip=grad_clip,
-                        trace=step_trace,
-                        cams=train_cams,
-                        cache=cache,
-                        augment=use_augment,
-                        rng=augment_rng,
-                        heads=train_heads,
-                        lane_loss=lane_kind,
-                        scale=input_scale,
-                        frames=prefetched_frames,
-                    )
+                    if len(group) == 1:
+                        step_loss, n_sup, carry, end_state = _optimizer_step(
+                            net,
+                            holder["opt"],
+                            holder["scaler"],
+                            root,
+                            list(item["rows"]),
+                            state_in,
+                            device=device,
+                            amp=bool(holder["amp"]),
+                            view=view,
+                            stride=int(item["stride"]),
+                            clip=grad_clip,
+                            trace=step_trace,
+                            cams=train_cams,
+                            cache=cache,
+                            augment=use_augment,
+                            rng=augment_rng,
+                            heads=train_heads,
+                            lane_loss=lane_kind,
+                            scale=input_scale,
+                            frames=prefetched_frames,
+                        )
+                    else:
+                        step_loss, n_sup, carry, end_state = _optimizer_group(
+                            net,
+                            holder["opt"],
+                            holder["scaler"],
+                            root,
+                            [list(piece["rows"]) for piece in group],
+                            device=device,
+                            amp=bool(holder["amp"]),
+                            view=view,
+                            clip=grad_clip,
+                            trace=step_trace,
+                            cams=train_cams,
+                            cache=cache,
+                            augment=use_augment,
+                            rng=augment_rng,
+                            heads=train_heads,
+                            lane_loss=lane_kind,
+                            frame_sets=group_frames,
+                            scale=input_scale,
+                        )
                 except RuntimeError as exc:
                     if not _is_oom(exc):
                         raise
                     net.zero_grad(set_to_none=True)
                     _release_cuda()
+                    if device.type == "cuda" and int(batch) > 1:
+                        batch = max(1, int(batch) // 2)
+                        refit = True
+                        print(f"[GVD] scene fit oom, retry batch={batch}", flush=True)
+                        break
                     if device.type != "cuda" or not (int(free_ram_bytes) > int(free_vram_bytes)):
                         raise TrainFitError(
                             "the training step fits neither free VRAM nor a larger pool of CPU RAM"
@@ -1465,9 +1683,9 @@ def train_directory(
                 if step_loss is not None:
                     last_loss = step_loss
                 supervised += n_sup
-                cursor += 1
-                done += 1
-                index += 1
+                cursor += len(group)
+                done += len(group)
+                index += len(group)
                 elapsed = time.perf_counter() - started
                 remaining_steps = sum(1 for later in plan_steps[index:] if later["kind"] == "train")
                 steps_per_epoch = sum(1 for item in plan_steps if item["kind"] == "train")
@@ -1507,6 +1725,8 @@ def train_directory(
                         steps=done + remaining_steps,
                     ),
                 )
+            if refit:
+                continue
             if paused_exit:
                 break
             if hold_n <= 0:
@@ -1681,36 +1901,21 @@ def train_directory(
                 started = time.perf_counter()
                 _train_passes()
             else:
-                # No pause file: a new run. Strip JPEGs and state lines stay.
-                init_blob = _clone_weights()
-                scores: dict[float, float] = {}
-                blobs: dict[float, dict[str, Any]] = {}
-                series: dict[float, list[float]] = {}
+                # One rate for the whole run. A second pass at 1e-4 reloaded the
+                # initial weights and threw away the 1e-3 fit.
                 view.mark_running()
-                rates = ordered_learning_rates(lr)
-                for rate_index, rate in enumerate(rates):
-                    rates_after = len(rates) - rate_index - 1
-                    _load_weights(init_blob)
-                    _arm(device.type, rate)
-                    started = time.perf_counter()
-                    device = holder["device"]
-                    net = holder["net"]
-                    epoch = 0
-                    cursor = 0
-                    done = 0
-                    last_loss = None
-                    view.losses = []
-                    score = _train_passes()
-                    if paused_exit:
-                        break
-                    scores[rate] = float("inf") if score is None else float(score)
-                    blobs[rate] = _clone_weights()
-                    series[rate] = [float(value) for value in view.losses]
-                if not paused_exit and scores:
-                    winner = pick_learning_rate(scores)
-                    _load_weights(blobs[winner])
-                    holder["lr"] = float(winner)
-                    view.restore_losses(series.get(winner, []))
+                rates_after = 0
+                _arm(device.type, float(lr))
+                started = time.perf_counter()
+                device = holder["device"]
+                net = holder["net"]
+                epoch = 0
+                cursor = 0
+                done = 0
+                last_loss = None
+                view.losses = []
+                print(f"[GVD] scene lr={float(holder['lr'])} fixed", flush=True)
+                _train_passes()
         if not paused_exit and not dry_run and not sanity and export_path is not None:
             export_scene_onnx(export_path, net, heads=train_heads)
         if not paused_exit and not dry_run and not sanity:
@@ -1829,6 +2034,7 @@ def main(argv: list[str] | None = None) -> None:
             min_valid=float(args.min_valid),
             workers=default_num_workers() if args.workers is None else int(args.workers),
             scale=float(args.scale),
+            batch_size=int(args.batch),
         )
     except TrainFitError as exc:
         print(f"[GVD] scene train: {exc}")

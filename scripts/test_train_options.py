@@ -58,6 +58,8 @@ def check_cams_and_heads() -> None:
     sched = parser.parse_args([])
     assert sched.lr == 1e-3
     assert sched.batch == 0
+    wider = parser.parse_args(["--batch", "8"])
+    assert wider.batch == 8 and wider.lr == 1e-3
     assert sched.clip == 1.0 and sched.lane_loss == "huber" and sched.min_valid == 0.3
     assert sched.balance is False and sched.scale == 1.0 and sched.workers is None
     assert loader_settings(4, cuda=True) == {

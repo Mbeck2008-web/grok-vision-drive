@@ -41,6 +41,7 @@ from python.train.continual import (  # noqa: E402
     offcenter_view,
     pass_plan,
     remaining_until_holdout_can_stop,
+    resume_learning_rate,
 )
 from python.train.fit import (  # noqa: E402
     TrainFitError,
@@ -81,6 +82,21 @@ from python.train.status_window import (  # noqa: E402
     predict_eta_s,
     steps_per_second,
 )
+
+
+def _pin_optimizer_lr(opt: Any, rate: float) -> None:
+    """Write ``rate`` onto every param group.
+
+    Loading a pause restores the learning rate that was saved with it. A
+    1e-4 group must not replace the command-line rate.
+    """
+    groups = getattr(opt, "param_groups", None)
+    if not isinstance(groups, list):
+        return
+    pinned = float(rate)
+    for group in groups:
+        if isinstance(group, dict):
+            group["lr"] = pinned
 
 
 def resolve_scene_batch(requested: int, parallel_fit: int) -> int:
@@ -1383,7 +1399,6 @@ def train_directory(
     every = max(1, int(metrics_every))
     steps_per_epoch = 0
     eta_pass: float | None = None
-    rates_after = 0
     schedule_printed = False
 
     def _log_step(kind: str, eta: float | None, mem_bytes: int, *, save: bool) -> None:
@@ -1694,8 +1709,8 @@ def train_directory(
                     schedule_printed = True
                     print(
                         f"[GVD] scene schedule steps_per_epoch={steps_per_epoch} "
-                        f"epoch={epoch} rates_after={rates_after} "
-                        f"--epochs {requested_epochs} is recorded; the holdout stops the run",
+                        f"epoch={epoch} lr={float(holder['lr'])} fixed "
+                        f"--epochs {requested_epochs} is recorded; holdout stop ends the run",
                         flush=True,
                     )
                 job_steps = remaining_until_holdout_can_stop(
@@ -1703,7 +1718,7 @@ def train_directory(
                     steps_per_epoch,
                     epoch=epoch,
                     has_holdout=has_holdout,
-                    rates_after=rates_after,
+                    rates_after=0,
                 )
                 used, kind = _memory_reading(device.type)
                 eta_pass = predict_eta_s(done, elapsed, remaining_steps)
@@ -1868,10 +1883,18 @@ def train_directory(
             existing = load_checkpoint(root) if resume else None
             if existing is not None:
                 fields = resume_fields(existing)
-                _arm(device.type, float(fields["lr"]))
+                rate = resume_learning_rate(lr, fields.get("lr"))
+                _arm(device.type, rate)
                 device = holder["device"]
                 net = holder["net"]
                 _apply_checkpoint(net, holder["opt"], holder["scaler"], fields, device)
+                _pin_optimizer_lr(holder["opt"], rate)
+                paused_lr = fields.get("lr")
+                if paused_lr is None or not math.isclose(float(paused_lr), rate, rel_tol=0.0, abs_tol=1e-12):
+                    print(
+                        f"[GVD] scene lr={rate} fixed (pause had {paused_lr}; that rate does not continue)",
+                        flush=True,
+                    )
                 # Weights, step, and optimizer resume. The pass starts again so the
                 # GRU state is rebuilt; that activation is not stored in the pause file.
                 epoch = int(fields["epoch"])
@@ -1901,11 +1924,10 @@ def train_directory(
                 started = time.perf_counter()
                 _train_passes()
             else:
-                # One rate for the whole run. A second pass at 1e-4 reloaded the
-                # initial weights and threw away the 1e-3 fit.
+                # One rate for the whole run. Holdout stop returns. It does not
+                # reload the initial weights and try 1e-4.
                 view.mark_running()
-                rates_after = 0
-                _arm(device.type, float(lr))
+                _arm(device.type, resume_learning_rate(lr))
                 started = time.perf_counter()
                 device = holder["device"]
                 net = holder["net"]

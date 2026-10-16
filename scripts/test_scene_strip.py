@@ -59,6 +59,7 @@ from python.train.continual import (  # noqa: E402
     oversample_repeats,
     pass_plan,
     pick_learning_rate,
+    resume_learning_rate,
     should_reset_state,
     simulate_carry,
     strip_roll_is_yaw,
@@ -1580,6 +1581,13 @@ def check_continual_bptt_and_yaw() -> None:
     assert pick_learning_rate({1e-3: 0.4, 1e-4: 0.2}) == 1e-4
     assert pick_learning_rate({1e-3: 0.2, 1e-4: 0.4}) == 1e-3
     assert pick_learning_rate({1e-3: 0.2, 1e-4: 0.2}) == CANDIDATE_LRS[0]
+    # The live val pair (rms 1.139 then 1.142) is a holdout stop. The pause
+    # rate from the following 1e-4 pass is not the next schedule.
+    assert holdout_stopped([1.139, 1.142], tol=0.02, window=3) is True
+    assert resume_learning_rate(1e-3, paused=1e-4) == 1e-3
+    assert resume_learning_rate(1e-3, paused=1e-3) == 1e-3
+    assert resume_learning_rate(1e-4, paused=1e-3) == 1e-4
+    assert resume_learning_rate(float("nan"), paused=1e-4) == 1e-3
     assert WEIGHT_DECAY == 0.01
     assert GRAD_CLIP == 1.0
     assert choose_chunk_length(1, 10**9) == 16
@@ -1618,7 +1626,19 @@ def check_continual_bptt_and_yaw() -> None:
     assert "holdout_stopped" in body
     assert "ordered_learning_rates" not in body
     assert "pick_learning_rate" not in body
+    assert "for rate_index" not in body
+    assert "resume_learning_rate" in body
+    assert "rates_after=0" in body
     assert body.index("plan_fit") < body.index("_optimizer_step")
+    from python.train.train_scene import _pin_optimizer_lr
+
+    class _Groups:
+        def __init__(self) -> None:
+            self.param_groups = [{"lr": 1e-4, "params": []}]
+
+    pinned = _Groups()
+    _pin_optimizer_lr(pinned, 1e-3)
+    assert pinned.param_groups[0]["lr"] == 1e-3
 
 
 def _readme_offline_ok(text: str) -> bool:

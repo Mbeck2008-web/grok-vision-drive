@@ -66,7 +66,7 @@ City speed is 8–14 m/s, highway 20–30, ramps 10–18, when the spawn type is
 py -3 scripts\validate_scene_lanes.py --strips E:\GVD_data\scene_lanes
 ```
 
-Quit BeamNG before training so the GPU is not shared with the game. Order is dry-run, then sanity, then the full run. Learning rate stays **1e-3**.
+Quit BeamNG before training so the GPU is not shared with the game. Order is dry-run, then sanity, then the full run. Learning rate stays **1e-3** for the whole run. Holdout stop ends the run. It does not start a second pass at `1e-4`. `--batch` does not change the learning rate. A pause file cannot resume a lower rate. After a failed 1e-4 pass, start the next run with `--no-resume` once that process has exited.
 
 ```
 py -3 -m python.train.train_scene --strips E:\GVD_data\scene_lanes --cams main --build-cache C:\GVD_cache
@@ -107,6 +107,6 @@ The runtime refuses a graph with no `lane_gt` output. A low confidence stops. It
 - **C: or D: refused / under 20 GB:** Point `GVD_DATA_DIR` at the data disk.
 - **Cache file over 4 GB:** The disk is FAT32. Rebuild with `--cams` limited to the cameras you train. Chunks are capped at 3.5 GB.
 - **Train loss sits near zero then spikes:** The old loader walked the drive in order. Shuffle, `--balance`, and `--clip 1.0` are the fix. `--heads lane_gt` must show points, valid, class, and lamps at 0.
-- **Val rms worse than `rms_mean` after one pass:** The head is still a flat guess. Train and holdout use the same metre labels. There is no per-target normalization to turn on. Keep going with main-only, lane_gt-only, and the cache. Do not drop the learning rate below `1e-3` to hide it.
+- **Val rms worse than `rms_mean` after one pass:** The head is still a flat guess. Train and holdout use the same metre labels. There is no per-target normalization to turn on. Keep going with main-only, lane_gt-only, and the cache. Do not drop the learning rate below `1e-3`. Holdout stop ends the run.
 - **UnboundLocalError in `_lane_gt_loss`:** An inner `import torch` shadowed the module. That import is gone. Update to a commit that has the fix.
 - **Do not claim** a live Tech drive, Alt+G, or eight-camera collect unless this PC just did it.

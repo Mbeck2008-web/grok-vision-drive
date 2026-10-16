@@ -674,8 +674,28 @@ def chunk_vram_budget(free_vram_bytes: int) -> int:
     return min(free, VRAM_BUDGET_BYTES)
 
 
+def resume_learning_rate(requested: float, paused: float | None = None) -> float:
+    """The command-line rate. A pause file cannot continue a lower-rate pass.
+
+    ``paused`` is the rate stored in the pause file. It is not returned.
+    Holdout stop does not schedule the next candidate. Passing ``--lr`` is
+    the only way to leave the default ``1e-3``.
+    """
+    del paused
+    try:
+        rate = float(requested)
+    except (TypeError, ValueError):
+        return float(CANDIDATE_LRS[0])
+    if not math.isfinite(rate) or rate <= 0.0:
+        return float(CANDIDATE_LRS[0])
+    return rate
+
+
 def ordered_learning_rates(requested: float) -> tuple[float, ...]:
-    """The two candidates, with ``requested`` first when it is one of them."""
+    """The two candidates, with ``requested`` first when it is one of them.
+
+    The trainer does not call this. ``resume_learning_rate`` is the schedule.
+    """
     try:
         rate = float(requested)
     except (TypeError, ValueError):

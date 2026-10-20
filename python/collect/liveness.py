@@ -150,6 +150,8 @@ class ImpactWatch:
 class YieldGuard:
     """Rolling share of moving rows with a painted lane 10 m ahead.
 
+    Lateral frame: validity only, so frame-insensitive.
+
     ``update`` takes one written row. Rows under LIVE_YIELD_MOVING_MPS and
     ``settle`` rows are not counted. It returns True when the last
     ``window_s`` seconds of counted rows are full and their time-weighted

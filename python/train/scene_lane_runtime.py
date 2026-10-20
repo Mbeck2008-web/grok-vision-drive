@@ -71,7 +71,10 @@ def scene_lane_decision(
 
 
 def straight_lane_path(lane_x: float, *, length_m: float = 36.0, step_m: float = 1.0) -> list[dict[str, float]]:
-    """Ego polyline the wheel already knows how to follow. x is constant."""
+    """Ego polyline the wheel already knows how to follow. x is constant.
+
+    Lateral frame: whatever frame ``lane_x`` is in (frame-agnostic).
+    """
     path: list[dict[str, float]] = []
     y = 0.0
     guard = 0
@@ -129,7 +132,15 @@ class SceneLaneGuard:
 
 
 class SceneLaneRuntime:
-    """One ONNX session and its GRU state. Not tied to a fixed frame rate."""
+    """One ONNX session and its GRU state. Not tied to a fixed frame rate.
+
+    Frame: ``observe`` returns lane_x in the frame of the labels the model
+    was trained on (``gt_origin``): ref node for v102 and earlier, body
+    centreline for v103 (``scripts/relabel_v103.py``).
+    """
+
+    # The only ONNX outputs this runtime reads. Each must be a trained head.
+    READS = ("lane_gt",)
 
     def __init__(self, path: Path | str | None = None) -> None:
         self.path = Path(path) if path is not None else default_onnx_path()
@@ -139,6 +150,8 @@ class SceneLaneRuntime:
         self._input_names: list[str] = []
         self._output_names: list[str] = []
         self.cams: tuple[str, ...] = ()
+        self.untrained: frozenset[str] = frozenset()
+        self._last: dict[str, Any] = {}
         self.canvas_w = 0
         self.token_dim = TOKEN_DIM
         self.h = np.zeros((1, 1, GRU_HIDDEN), dtype=np.float32)
@@ -175,6 +188,17 @@ class SceneLaneRuntime:
             meta = dict(self.session.get_modelmeta().custom_metadata_map)
         except Exception:
             meta = {}
+        from python.train.cam_strip import UntrainedOutputError, require_trained, untrained_outputs
+
+        # observe() reads lane_gt only. A model whose export marks lane_gt
+        # untrained (--heads without lane_gt) is refused, never read.
+        try:
+            require_trained(meta, self.READS)
+        except UntrainedOutputError as exc:
+            self.session = None
+            self.reason = str(exc)
+            return
+        self.untrained = untrained_outputs(meta)
         self.cams = cams_from_metadata(meta)
         try:
             self.canvas_w = int(meta.get("gvd_canvas_w") or CANVAS_W)
@@ -234,6 +258,7 @@ class SceneLaneRuntime:
         except Exception:
             return None, 0.0
         by_name = {_base_name(name): value for name, value in zip(self._output_names, outputs)}
+        self._last = by_name
         vector = np.asarray(by_name.get("lane_gt"), dtype=np.float32).reshape(-1)
         if vector.size < LANE_GT_DIM:
             return None, 0.0
@@ -244,6 +269,18 @@ class SceneLaneRuntime:
         if "mask" in by_name:
             self.mask = np.asarray(by_name["mask"], dtype=np.float32)
         return lane_x_from_vector(vector), confidence_from_vector(vector)
+
+    def output(self, name: str) -> Any:
+        """The last tick's value of one ONNX output.
+
+        Raises ``UntrainedOutputError`` for an output the model marks
+        untrained (``gvd_outputs_untrained``): e.g. ``lanes`` from a
+        ``--heads lane_gt`` export is random-init and is never handed out.
+        """
+        from python.train.cam_strip import require_trained
+
+        require_trained({"gvd_outputs_untrained": ",".join(sorted(self.untrained))}, [name])
+        return self._last.get(name)
 
 
 def _strip_nchw(strip_bgr: Any, width: int | None = None) -> np.ndarray | None:

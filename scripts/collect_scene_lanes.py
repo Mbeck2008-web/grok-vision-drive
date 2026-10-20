@@ -2558,6 +2558,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                         print(f"collect excursion {segment_id} {clock.phase} line end, back to lane", flush=True)
                         clock.force_abort("line_end")
                         line_left_m = None
+            # LATERAL FRAME: ref node (state pos), gt_origin state_pos_ref_node. This live label
+            # stays ref-frame; training labels are relabelled offline in the body-centreline
+            # frame (scripts/relabel_v103.py, python/debug/vehicle_origin.py).
             # Label from the painted lines the camera sees. The nav-spline hit
             # still drives the excursion controller below, but it is not a label:
             # road_invisible AI splines split into equal 1/1 lanes are not the paint.
@@ -2570,6 +2573,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             else:
                 tech = tech_from_hit(None, None, None, None)
             lanes_here = road_lanes(roads, hit)
+            # LATERAL FRAME: ref node. body_past_paint_edge treats this origin as the body centre;
+            # that check moves to the centreline frame in a follow-up (PR B).
             # The painted lane at the car (y = 0), vehicle frame: the weave's
             # lane edges and width. Same DecalRoad source as the labels.
             paint_lane_now: tuple[float, float] | None = None

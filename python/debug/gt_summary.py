@@ -41,6 +41,7 @@ def _f(row: dict[str, Any], key: str) -> float | None:
     return out
 
 
+# LATERAL FRAME: lane_offset_m is the nav-road offset of the state pos (ref node).
 def _in_lane(row: dict[str, Any]) -> bool | None:
     """True when the car is inside its lane. None when the offset is missing."""
     if row.get("off_road") is True:

@@ -169,8 +169,25 @@ def tech_from_hit(
     }
 
 
-def tech_from_painted(lanes: list[tuple[float, float] | None]) -> dict[str, Any]:
+# ``gt_origin`` values. The ref-node frame is v102 and earlier (and the live
+# collector's own gt.jsonl); the centreline frame is v103 (scripts/relabel_v103.py).
+ORIGIN_REF_NODE = "state_pos_ref_node"
+ORIGIN_CENTRELINE = "body_centreline"
+
+
+def tech_from_painted(
+    lanes: list[tuple[float, float] | None],
+    *,
+    origin: str = ORIGIN_REF_NODE,
+    ref_right_of_origin_m: float = 0.0,
+) -> dict[str, Any]:
     """Tech dict from painted lane edges at each lookahead (vehicle frame).
+
+    ``origin`` names the lateral origin the x values are measured from, and
+    ``ref_right_of_origin_m`` is where the state ``pos`` ref node sits in that
+    frame (0.0 for the ref-node frame; ``vehicle_origin.ref_right_of_centre_m``
+    for a centreline frame).
+    Both are written into the dict so every row declares its frame.
 
     Each lookahead carries its own measured center/left/right, so a curve is
     a curve. A lookahead without paint on both sides is NaN with mask 0.
@@ -209,7 +226,8 @@ def tech_from_painted(lanes: list[tuple[float, float] | None]) -> dict[str, Any]
         "lane_gt_valid": valid.tolist(),
         "gt_lookahead_m": [float(y) for y in LOOKAHEADS_M],
         "gt_source": "painted_decals",
-        "gt_origin": "state_pos_ref_node",
+        "gt_origin": str(origin),
+        "gt_ref_right_of_origin_m": float(ref_right_of_origin_m),
         "heading_err_rad": heading,
         "off_road": False if ok else None,
     }

@@ -358,6 +358,7 @@ def paint_coverage(
     for x, y, z, fx, fy in samples:
         rx, ry = fy, -fx
         for off in offsets:
+            # LATERAL FRAME: only whether a lane exists is used; frame-insensitive.
             got = painted.lane_at((x + rx * off, y + ry * off, z), (fx, fy, 0.0), (float(probe_y_m),))
             if got and got[0] is not None:
                 good += 1

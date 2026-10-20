@@ -339,6 +339,8 @@ def lane_count(width_m: float) -> int:
     return max(1, int(round(float(width_m) / LANE_W_M)))
 
 
+# LATERAL FRAME: lane_offset_m comes from the state pos (ref node), not the body
+# centreline (python/debug/vehicle_origin.py).
 def ego_center_x(lane_offset_m: float, heading_err_rad: float | None, y_m: float = 8.0) -> float:
     """Where the lane center sits in the ego frame, x right, y forward.
 

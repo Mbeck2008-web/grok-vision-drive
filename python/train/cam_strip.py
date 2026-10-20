@@ -8,7 +8,7 @@ is in metres, and a crop does not move those metres by a known amount.
 
 from __future__ import annotations
 
-from typing import Mapping
+from typing import Iterable, Mapping
 
 import numpy as np
 
@@ -24,6 +24,16 @@ from python.data.strip_writer import (
 )
 
 HEAD_NAMES = ("lanes", "curbs", "objects", "signs", "lane_gt")
+# ONNX outputs each head writes (scene_net.OUTPUT_FIELDS, split by head). An
+# export carries every output; the ones whose head was not in --heads are
+# random-init and are listed in ``gvd_outputs_untrained``.
+HEAD_OUTPUTS = {
+    "lanes": ("lanes", "lane_valid"),
+    "curbs": ("curbs", "curb_valid"),
+    "objects": ("objects", "object_class", "object_valid"),
+    "signs": ("signs", "sign_class", "sign_state", "sign_valid"),
+    "lane_gt": ("lane_gt",),
+}
 _HEAD_ALIASES = {
     "lane": "lanes",
     "lane_gt": "lane_gt",
@@ -195,13 +205,54 @@ def metadata_dict(
     height: int,
     width: int,
 ) -> dict[str, str]:
-    """String metadata stored on the ONNX model."""
+    """String metadata stored on the ONNX model.
+
+    ``gvd_heads_trained`` is the heads the run trained (``--heads``; empty =
+    all). ``gvd_outputs_untrained`` lists every exported output of a head that
+    was not trained: those values are random-init and no reader may use them
+    (``untrained_outputs`` / ``require_trained``).
+    """
+    trained = tuple(heads) if heads else HEAD_NAMES
+    untrained = [out for head in HEAD_NAMES if head not in trained for out in HEAD_OUTPUTS[head]]
     return {
         "gvd_cams": ",".join(cams),
-        "gvd_heads": ",".join(heads) if heads else ",".join(HEAD_NAMES),
+        "gvd_heads": ",".join(trained),
+        "gvd_heads_trained": ",".join(trained),
+        "gvd_outputs_untrained": ",".join(untrained),
         "gvd_canvas_h": str(int(height)),
         "gvd_canvas_w": str(int(width)),
     }
+
+
+class UntrainedOutputError(RuntimeError):
+    """A reader asked for an ONNX output whose head was not trained."""
+
+
+def untrained_outputs(meta: Mapping[str, str] | None) -> frozenset[str]:
+    """Outputs the model marks untrained.
+
+    ``gvd_outputs_untrained`` when present; else derived from
+    ``gvd_heads_trained`` / ``gvd_heads``. A model without any of them (an
+    export older than this metadata) marks nothing.
+    """
+    meta = dict(meta or {})
+    if "gvd_outputs_untrained" in meta:
+        return frozenset(p.strip() for p in str(meta["gvd_outputs_untrained"]).split(",") if p.strip())
+    raw = meta.get("gvd_heads_trained", meta.get("gvd_heads"))
+    if raw is None:
+        return frozenset()
+    trained = {p.strip() for p in str(raw).split(",") if p.strip()}
+    return frozenset(out for head in HEAD_NAMES if head not in trained for out in HEAD_OUTPUTS[head])
+
+
+def require_trained(meta: Mapping[str, str] | None, outputs: Iterable[str]) -> None:
+    """Raise ``UntrainedOutputError`` when any of ``outputs`` is marked untrained."""
+    bad = sorted(set(outputs) & untrained_outputs(meta))
+    if bad:
+        raise UntrainedOutputError(
+            f"ONNX outputs {','.join(bad)} come from heads this model did not train "
+            f"(gvd_heads_trained={dict(meta or {}).get('gvd_heads_trained', dict(meta or {}).get('gvd_heads', '?'))})"
+        )
 
 
 def cams_from_metadata(meta: Mapping[str, str] | None) -> tuple[str, ...]:

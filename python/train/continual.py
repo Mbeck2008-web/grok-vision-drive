@@ -62,6 +62,7 @@ def strip_roll_is_yaw() -> bool:
     return False
 
 
+# LATERAL FRAME: identity on pixels and labels, so frame-agnostic.
 def offcenter_view(pixels: Any, labels: Any) -> tuple[Any, Any]:
     """Leave the strip and the ego-frame labels unchanged.
 

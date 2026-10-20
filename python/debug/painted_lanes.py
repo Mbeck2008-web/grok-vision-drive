@@ -7,9 +7,14 @@ corridor, and whose lanesLeft/lanesRight default to 1/1. Splitting that
 width into equal lanes gave 1.75-7.5 m lanes that do not sit on the paint.
 
 Here the lane is bracketed by painted line decals (``line_white``,
-``line_yellow``, ``line_dashed_*`` ...), in the vehicle frame (x right, y
-forward, origin at the state ``pos`` ref node). The ego lane is the pair of
-lines that contains the car at y = 0; each lookahead follows those same two
+``line_yellow``, ``line_dashed_*`` ...; only ``LANE_LINE_MATERIALS``), in
+the vehicle frame: x right, y forward. By default the origin is the state
+``pos``, which is the BeamNG ref node. The ref node is NOT the body centre:
+on the etk800 it is ``f2r``, right of the body centreline by the offset
+``python.debug.vehicle_origin`` reads from the jbeam.
+``lane_at(origin_right_m=...)`` moves the lateral origin; the v103 labels (``scripts/relabel_v103.py``) put it on the
+body centreline, where the main camera is mounted. The ego lane is the pair of
+lines that contains the origin at y = 0; each lookahead follows those same two
 lines, so curves are modelled and no lookahead picks a different lane. A
 ``LaneTracker`` keeps that choice from tick to tick (hysteresis). No paint on
 one side means the slot is invalid (NaN, mask 0), never a synthetic 3.5 m
@@ -52,9 +57,35 @@ HEADING_MAX_DEG = 45.0
 _CELL = 25.0
 
 
+# DecalRoad materials that are lane lines, by name, from the west_coast_usa
+# level (every ``line*`` / ``m_line*`` material it uses, with its median decal
+# width). In: line_white, line_yellow, m_line_white, m_line_yellow (solid
+# lines, 0.20 m); line_dashed_short, line_dashed_short_yellow,
+# line_dashed_long (dashed lane lines, 0.20 m); line_yellowblack (0.6 m: a
+# double yellow centre line on a black contrast band, its texture is two
+# yellow stripes); line_reflectors (raised pavement markers laid as the lane
+# line where there is no paint). Out: line_parking1 (a 5.4 m wide
+# parking-bay decal; its centreline is not a line) and line_parking2 (0.5 m
+# parking stall marks). The old prefix rule (``line*``) took the parking
+# decals too.
+LANE_LINE_MATERIALS = frozenset(
+    {
+        "line_white",
+        "line_yellow",
+        "line_dashed_short",
+        "line_dashed_short_yellow",
+        "line_dashed_long",
+        "line_yellowblack",
+        "line_reflectors",
+        "m_line_white",
+        "m_line_yellow",
+    }
+)
+
+
 def is_paint(material: Any) -> bool:
-    m = str(material or "").lower()
-    return m.startswith("line") or m.startswith("m_line")
+    """True for a lane-line material (``LANE_LINE_MATERIALS``), case-insensitive."""
+    return str(material or "").strip().lower() in LANE_LINE_MATERIALS
 
 
 def _catmull_rom(nodes: list[list[float]], k: int = 4) -> np.ndarray:
@@ -199,11 +230,19 @@ class PaintedLanes:
         z_max_m: float | None = Z_MAX_M,
         heading_max_deg: float | None = HEADING_MAX_DEG,
         tracker: LaneTracker | None = None,
+        origin_right_m: float = 0.0,
     ) -> list[tuple[float, float] | None]:
         """``(left_x, right_x)`` of the painted ego lane at each ``y``, vehicle frame.
 
+        ``pos`` is the state ``pos`` (the ref node). ``origin_right_m`` puts the
+        frame's lateral origin that far right of it (negative = left), so every
+        x comes back relative to that point, and the ego lane is the one that
+        contains it. 0.0 is the ref-node frame (v102 and earlier). The body
+        centreline is ``vehicle_origin.centreline_origin_right_m(model)``
+        (negative: left of the ref node). y stays measured from the ref node.
+
         The ego lane is the pair of adjacent painted lines that contains the
-        car at y = 0 (the car's own position), ``LANE_MIN_M``-``LANE_MAX_M``
+        frame origin at y = 0, ``LANE_MIN_M``-``LANE_MAX_M``
         wide. Each lookahead then follows those same two lines: each line is
         walked forward in ``FOLLOW_STEP_M`` steps, at each step the paint
         nearest where its last crossing and slope put it (within
@@ -213,13 +252,19 @@ class PaintedLanes:
 
         ``tracker`` (a ``LaneTracker``, one per drive; reset it on a respawn or
         a new segment) keeps the previous tick's pair: it stays the ego lane
-        until the car centre is more than ``SWITCH_MARGIN_M`` past one of its
+        until the frame origin is more than ``SWITCH_MARGIN_M`` past one of its
         lines, or the pair is gone (see ``LaneTracker``). Without a tracker
         each call is stateless.
 
         ``z_max_m`` / ``heading_max_deg`` of None disable that filter
         (diagnostics only). ``pos`` without a z skips the z filter.
         """
+        if origin_right_m and pos is not None and direction is not None:
+            fx, fy = float(direction[0]), float(direction[1])
+            fn = math.hypot(fx, fy)
+            if fn > 1e-6:
+                o = float(origin_right_m) / fn  # right = (fy, -fx) / |f|
+                pos = [float(pos[0]) + o * fy, float(pos[1]) - o * fx, *[float(v) for v in list(pos)[2:3]]]
         frame = self._frame(pos, direction, z_max_m, heading_max_deg)
         if frame is None:
             if tracker is not None:
@@ -250,12 +295,14 @@ class PaintedLanes:
         return out
 
 
-# Hysteresis margin for the ego-lane choice, fixed from the car before any
-# replay census: half the ego half width, 0.5 * 1.01 m (2.02 m car) = 0.505 m.
-# The pair the car was in stays the ego lane until the car centre (the state
-# pos ref node, the body's lateral centre) is more than this past one of its
-# lines. At that point three quarters of the body (1.515 of 2.02 m) is over
-# the line. Short of it the car straddles the line, and a car straddling a
+# SWITCH_MARGIN_M is a lateral lane-switch hysteresis margin, not a forward
+# offset. It was fixed from the car before any replay census: half the ego
+# half width, 0.5 * 1.01 m (2.02 m car) = 0.505 m. The pair the car was in
+# stays the ego lane until the frame origin is more than this past one of its
+# lines. The origin is the state pos ref node unless ``origin_right_m`` moves
+# it; the ref node is not the body's lateral centre (etk800: f2r, right of
+# it), so only a centreline origin makes this the body centre. At that
+# point three quarters of the body (1.515 of 2.02 m) is over the line. Short of it the car straddles the line, and a car straddling a
 # line has not changed lanes: it keeps the lane it came from.
 SWITCH_MARGIN_M = 0.505
 # A line of the previous pair matches a line seen this tick when it is this
@@ -387,9 +434,9 @@ class LaneTracker:
     last seen, and its world direction. Next tick it is projected onto the
     car's new y = 0 and matched (``MATCH_M``) to a line seen there.
 
-    The kept pair is replaced by the pair that contains the car (or by none)
-    only when the car centre is more than ``SWITCH_MARGIN_M`` past one of its
-    lines, or the pair is no longer a lane: both lines unseen, a line
+    The kept pair is replaced by the pair that contains the frame origin (or
+    by none) only when that origin (``lane_at`` ``origin_right_m``) is more
+    than ``SWITCH_MARGIN_M`` past one of its lines, or the pair is no longer a lane: both lines unseen, a line
     carried more than ``CARRY_M`` behind the car, paint seen between the two
     (they are not adjacent), or the two out of the lane width range.
     ``reset()`` forgets it (a respawn, a new segment, a new map).

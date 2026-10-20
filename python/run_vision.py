@@ -784,6 +784,7 @@ def main() -> None:
                     pout.path_conf = 0.0
                     pout.lane_source = "gt/stop"
                 else:
+                    # LATERAL FRAME: GT preview lane_x is about the state pos (ref node).
                     pout.path_ego = straight_lane_path(float(gt_preview.lane_x))
                     pout.lane_conf = 1.0
                     pout.path_conf = 1.0
@@ -814,6 +815,8 @@ def main() -> None:
                     pout.lane_conf = float(conf)
                     pout.lane_source = "scene/stop"
                 else:
+                    # LATERAL FRAME: lane_hat is in the frame the model was trained in (tech.gt_origin):
+                    # ref node for v102 models, body centreline for v103 models.
                     pout.path_ego = straight_lane_path(float(lane_hat))
                     pout.lane_conf = float(conf)
                     pout.path_conf = float(conf)

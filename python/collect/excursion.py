@@ -87,6 +87,8 @@ SPEED_BANDS = ((12.0, "<12"), (18.0, "12-18"), (24.0, "18-24"), (float("inf"), "
 @dataclass(frozen=True)
 class Excursion:
     phase: str
+    # LATERAL FRAME: offsets here are of the state pos (ref node) from the nav-road
+    # lane centre; the body centreline is vehicle_origin.ref_right_of_centre_m left of it.
     target_offset_m: float
     target_heading_rad: float
     direction: int
@@ -396,8 +398,11 @@ def body_past_paint_edge(
     """True when either body edge is more than EDGE_M outside the painted lane.
 
     FROM: the ego body edges, x = -half_width and +half_width in the vehicle
-    frame (x right, origin at the BeamNG state ``pos`` ref node, the body's
-    lateral center). AGAINST: ``paint_lane`` = (left_x, right_x), the painted
+    frame (x right, origin at the BeamNG state ``pos`` ref node). The ref node
+    is NOT the body's lateral centre (etk800: ``f2r``, right of it by
+    ``vehicle_origin.ref_right_of_centre_m``), so these edges sit that far
+    right of the real body edges. Moving this check to the centreline frame
+    is a follow-up (PR B). AGAINST: ``paint_lane`` = (left_x, right_x), the painted
     lane lines at the car (y = 0) from ``PaintedLanes.lane_at``: the level's
     DecalRoad line decals in world space, the same source the lane labels use.
     Not the navgraph: on west_coast_usa most navgraph roads are road_invisible
@@ -666,6 +671,8 @@ def targets_for(
     if phase == "weave":
         lane_w_weave = float(weave_lane_w) if weave_lane_w is not None and float(weave_lane_w) > 0.0 else lane_here
         hw = EGO_HALF_WIDTH_M if half_width_m is None else float(half_width_m)
+        # LATERAL FRAME: room is about the ref node (the weave target), not the body
+        # centre; see vehicle_origin. Unchanged here (PR B).
         room = lane_w_weave * 0.5 - hw - WEAVE_SLACK_M
         if room < WEAVE_AMP_LO_M - 1e-9:
             return None
@@ -1312,6 +1319,8 @@ def excursion_path(
     need = weave_length_m(speed) if move.phase == "weave" else WINDOW_M
     paint_w = None
     paint_base = None
+    # LATERAL FRAME: paint_lane and off are both from the state pos (ref node), so the
+    # line's world placement is consistent; only the body sits off the ref node.
     if move.phase == "weave" and paint_lane is not None:
         paint_w = float(paint_lane[1]) - float(paint_lane[0])
         off = getattr(hit, "offset_m", None)

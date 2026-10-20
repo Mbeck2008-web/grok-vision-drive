@@ -309,8 +309,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--mask-events",
         action="store_true",
         help=(
-            "Leave out rows inside an impacts.jsonl window [pre_t0, impact_end] (matched by time t) "
-            "and rows the collector flagged settle or stall. Off by default."
+            "Leave out rows inside an impacts.jsonl window [pre_t0, impact_end] (matched by time t), "
+            "every excursion.phase=abort row (see --keep-abort-reasons), and rows the collector "
+            "flagged settle or stall. Off by default."
+        ),
+    )
+    parser.add_argument(
+        "--keep-abort-reasons",
+        default="",
+        help=(
+            "With --mask-events, comma list of excursion.reason values whose abort rows are kept. "
+            "Default empty: every abort row is masked whatever its reason."
         ),
     )
     parser.add_argument(
@@ -1555,6 +1564,7 @@ def train_directory(
     freeze_backbone: bool = False,
     backbone_lr_mult: float = 1.0,
     mask_events: bool = False,
+    keep_abort_reasons: str = "",
 ) -> dict[str, Any]:
     import torch
 
@@ -1601,7 +1611,7 @@ def train_directory(
         from python.train.event_mask import describe, mask_event_rows
 
         before = len(rows)
-        rows, event_counts = mask_event_rows(root, rows)
+        rows, event_counts = mask_event_rows(root, rows, keep_abort_reasons=keep_abort_reasons)
         print(f"[GVD] mask-events: {describe(event_counts, before)}", flush=True)
         # A masked run is one gap; past MEMORY_S it resets the GRU.
         rows = recompute_dt(rows)
@@ -2592,6 +2602,7 @@ def main(argv: list[str] | None = None) -> None:
             freeze_backbone=bool(args.freeze_backbone),
             backbone_lr_mult=float(args.backbone_lr_mult),
             mask_events=bool(args.mask_events),
+            keep_abort_reasons=str(args.keep_abort_reasons or ""),
         )
     except TrainFitError as exc:
         print(f"[GVD] scene train: {exc}")

@@ -16,6 +16,11 @@
   ``settle`` run (every spawn, teleport and recover starts one). With no
   respawn in the rows the window runs to the end of the segment, which also
   covers an impact with no end line yet.
+* ``excursion.phase == "abort"``: every abort row is masked whatever its
+  ``excursion.reason`` (lane_edge, no_path, line_end, ...), unless the reason
+  is listed in ``keep_abort_reasons`` (``--keep-abort-reasons``, default
+  empty). An abort run with no impact is masked too. Counts are kept per
+  reason.
 * Row flags written by the collector: ``settle`` (first 3 s after a spawn,
   teleport, recover or level load) and ``stall`` (under 1 m/s while the AI
   should move).
@@ -90,6 +95,20 @@ def _phase(row: Mapping[str, Any]) -> Any:
     return exc.get("phase") if isinstance(exc, Mapping) else exc
 
 
+def _abort_reason(row: Mapping[str, Any]) -> str:
+    exc = row.get("excursion")
+    reason = exc.get("reason") if isinstance(exc, Mapping) else None
+    return str(reason or "")
+
+
+def parse_reasons(value: str | Iterable[str] | None) -> frozenset[str]:
+    """``"a,b"`` or an iterable -> a set of non-empty, stripped reasons."""
+    if value is None:
+        return frozenset()
+    items = value.split(",") if isinstance(value, str) else list(value)
+    return frozenset(str(item).strip() for item in items if str(item).strip())
+
+
 def _seg_rows(rows: list[Mapping[str, Any]]) -> dict[Any, list[tuple[float, Mapping[str, Any]]]]:
     by_seg: dict[Any, list[tuple[float, Mapping[str, Any]]]] = {}
     for row in rows:
@@ -151,8 +170,13 @@ def event_mask(
     impacts: Iterable[Mapping[str, Any]] = (),
     *,
     flags: tuple[str, ...] = ROW_FLAGS,
-) -> tuple[list[bool], dict[str, int]]:
+    keep_abort_reasons: str | Iterable[str] | None = (),
+) -> tuple[list[bool], dict[str, Any]]:
     """Per-row True = masked, plus counts by reason (a row counts once, first reason wins).
+
+    Order: impact window, then an abort row (``abort``, with the per-reason
+    split in ``abort_reasons``), then the row flags. ``abort_kept`` counts
+    abort rows left in because their reason is in ``keep_abort_reasons``.
 
     ``impact_extended`` counts the impact rows outside the old pre_t0..impact_end span
     (the 3 s floor, the abort run, and after the impact until the next respawn).
@@ -161,8 +185,11 @@ def event_mask(
     full = impact_windows(rows, spans)
     windows = sorted((a, b) for a, b, _oa, _ob in full)
     old = [(oa, ob) for _a, _b, oa, ob in full]
-    counts = {"impact": 0, **{name: 0 for name in flags}, "masked": 0, "impact_spans": len(spans),
-              "impact_open": sum(1 for s in spans if s["end"] is None), "impact_extended": 0}
+    keep = parse_reasons(keep_abort_reasons)
+    abort_reasons: dict[str, int] = {}
+    counts: dict[str, Any] = {"impact": 0, "abort": 0, **{name: 0 for name in flags}, "masked": 0,
+                              "impact_spans": len(spans), "impact_open": sum(1 for s in spans if s["end"] is None),
+                              "impact_extended": 0, "abort_kept": 0, "abort_reasons": abort_reasons}
     mask: list[bool] = []
     for row in rows:
         t = _num(row.get("t"))
@@ -171,7 +198,13 @@ def event_mask(
             why = "impact"
             if not any(a <= t <= b for a, b in old):
                 counts["impact_extended"] += 1
+        elif _phase(row) == "abort" and _abort_reason(row) not in keep:
+            why = "abort"
+            reason = _abort_reason(row) or "(none)"
+            abort_reasons[reason] = abort_reasons.get(reason, 0) + 1
         else:
+            if _phase(row) == "abort":
+                counts["abort_kept"] += 1
             for name in flags:
                 if row.get(name):
                     why = name
@@ -183,18 +216,26 @@ def event_mask(
     return mask, counts
 
 
-def mask_event_rows(root: Path | str, rows: list[Mapping[str, Any]]) -> tuple[list[Mapping[str, Any]], dict[str, int]]:
+def mask_event_rows(
+    root: Path | str,
+    rows: list[Mapping[str, Any]],
+    *,
+    keep_abort_reasons: str | Iterable[str] | None = (),
+) -> tuple[list[Mapping[str, Any]], dict[str, Any]]:
     """Rows with the event rows left out of training, and the counts. Nothing on disk is deleted."""
-    mask, counts = event_mask(rows, read_impacts(root))
+    mask, counts = event_mask(rows, read_impacts(root), keep_abort_reasons=keep_abort_reasons)
     return [row for row, drop in zip(rows, mask) if not drop], counts
 
 
-def describe(counts: Mapping[str, int], total: int) -> str:
+def describe(counts: Mapping[str, Any], total: int) -> str:
     share = 100.0 * counts.get("masked", 0) / max(1, int(total))
+    by_reason = counts.get("abort_reasons") or {}
+    reasons = ",".join(f"{key}={by_reason[key]}" for key in sorted(by_reason)) or "none"
     return (
         f"masked {counts.get('masked', 0)} of {int(total)} rows ({share:.1f}%): "
         f"impact window {counts.get('impact', 0)} ({counts.get('impact_spans', 0)} impacts, "
         f"{counts.get('impact_open', 0)} without an end line, {counts.get('impact_extended', 0)} from the "
-        f"3 s / abort run / until-respawn extension), settle {counts.get('settle', 0)}, "
-        f"stall {counts.get('stall', 0)}"
+        f"3 s / abort run / until-respawn extension), abort {counts.get('abort', 0)} "
+        f"(by reason: {reasons}; {counts.get('abort_kept', 0)} kept by --keep-abort-reasons), "
+        f"settle {counts.get('settle', 0)}, stall {counts.get('stall', 0)}"
     )

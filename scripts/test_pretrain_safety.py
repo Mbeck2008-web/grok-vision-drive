@@ -6,6 +6,9 @@
 (b) ``dt_s`` is recomputed after every removal: a dropped no-main row and an
     event-masked run each become one gap, and a gap over MEMORY_S resets the
     GRU (``recording_spans``) while a short one does not.
+(a) --mask-events masks every ``excursion.phase == "abort"`` row whatever its
+    reason (a lane_edge abort with no impact included), unless the reason is
+    on --keep-abort-reasons; counts are logged per reason.
 """
 from __future__ import annotations
 
@@ -109,7 +112,42 @@ def check_dt_after_removals() -> None:
     )
 
 
+def check_abort_mask() -> None:
+    from python.train.event_mask import describe, event_mask
+
+    def run(reason_of):
+        return [
+            {"i": i, "t": 100 + 0.1 * i, "segment": "s#0",
+             "excursion": {"phase": "abort" if reason_of(i) else ("weave" if i < 50 else "cruise"),
+                           "reason": reason_of(i) or ""}}
+            for i in range(200)
+        ]
+
+    # r7: a lane_edge abort run (rows 50-79) with no impact.
+    rows = run(lambda i: "lane_edge" if 50 <= i < 80 else None)
+    mask, counts = event_mask(rows, [])
+    hit = sum(m for r, m in zip(rows, mask) if r["excursion"]["phase"] == "abort")
+    assert hit == 30 and counts["abort"] == 30 and counts["masked"] == 30, counts
+    assert counts["abort_reasons"] == {"lane_edge": 30}, counts
+    assert not any(m for r, m in zip(rows, mask) if r["excursion"]["phase"] != "abort")
+    # Every reason is masked by default; --keep-abort-reasons keeps only the listed ones.
+    reasons = {50: "lane_edge", 51: "no_path", 52: "line_end", 53: "overspeed", 54: "no_paint", 55: ""}
+    mixed = run(lambda i: reasons.get(i) if i in reasons else None)
+    mixed[55]["excursion"]["phase"] = "abort"
+    _m, all_counts = event_mask(mixed, [])
+    assert all_counts["abort"] == 6, all_counts
+    assert all_counts["abort_reasons"] == {"lane_edge": 1, "no_path": 1, "line_end": 1, "overspeed": 1,
+                                           "no_paint": 1, "(none)": 1}, all_counts
+    kmask, kept = event_mask(mixed, [], keep_abort_reasons="no_path, line_end")
+    assert kept["abort"] == 4 and kept["abort_kept"] == 2 and not kmask[51] and not kmask[52] and kmask[50], kept
+    line = describe(kept, len(mixed))
+    assert "abort 4 (by reason: (none)=1,lane_edge=1,no_paint=1,overspeed=1" in line and "2 kept" in line, line
+    print(f"(a) lane_edge abort with no impact: {hit}/30 masked; all 6 reasons masked by default; "
+          f"--keep-abort-reasons no_path,line_end keeps 2 OK\n    {line}")
+
+
 def main() -> None:
+    check_abort_mask()
     check_no_main_dropped()
     check_dt_after_removals()
     print("test_pretrain_safety: OK")

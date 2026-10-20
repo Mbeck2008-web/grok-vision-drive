@@ -331,6 +331,19 @@ def check_code_pin() -> None:
     print(f"code pin ok: {head[:12]} dirty={dirty}")
 
 
+def check_vehicle_width() -> None:
+    """No bbox and not an etk800: no known body width, so the run stops (no silent default)."""
+    code, text, out = sf._run_collector({"speed_at": lambda n: 10.0, "stop_at": 120, "bbox_w": None, "model": "pickup"}, [])
+    status = _check_stop(code, text, out, "vehicle_width", 2)
+    assert "bbox failed: RuntimeError" in status["stop_detail"] and "model=pickup is not etk800" in status["stop_detail"], status
+    assert not (out / "state.jsonl").is_file() or not (out / "state.jsonl").read_text(encoding="utf-8").strip()
+    # Excursions off: no weave, no width needed.
+    code, text, out = sf._run_collector({"speed_at": lambda n: 10.0, "stop_at": 120, "bbox_w": None, "model": "pickup"},
+                                        ["--no-excursions"])
+    _check_stop(code, text, out, "requested", 0)
+    print("vehicle_width: unknown model without bbox stops with code 2; --no-excursions runs")
+
+
 def main() -> None:
     check_heartbeat_interval()
     check_requested_and_target()
@@ -346,6 +359,7 @@ def main() -> None:
     check_camera_warmup()
     check_session_faults()
     check_code_pin()
+    check_vehicle_width()
     print("collect stops ok")
 
 

@@ -497,6 +497,8 @@ _NoVehicle.__name__ = "BNGError"
 
 
 class _Ego:
+    model = "etk800"  # no get_bbox: the collector logs the etk800 width
+
     def connect(self, bng: object) -> None:
         del bng
 

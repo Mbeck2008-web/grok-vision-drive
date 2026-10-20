@@ -135,6 +135,8 @@ def check_validator_drops_parked_span() -> None:
 
 
 class _Vehicle:
+    model = "etk800"  # no get_bbox: the collector logs the etk800 width
+
     def __init__(self, state: dict[str, object], stop: Path | None = None, stop_on: int = 0) -> None:
         self.state = state
         self.stop = stop

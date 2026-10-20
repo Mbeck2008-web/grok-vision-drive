@@ -21,8 +21,6 @@ WEAVE_S = 12.0
 LANE_CHANGE_S = 8.0
 RECOVER_S = 12.0
 ABORT_S = 3.0
-# Stay this far inside the painted lane during a weave.
-WEAVE_MARGIN_M = 0.5
 # In-lane only. Large enough to see, small enough to stay off the next lane.
 WEAVE_AMP_M = 0.6
 WEAVE_AMP_LO_M = 0.3
@@ -40,10 +38,15 @@ WEAVE_SLOW_MPS = 10.0
 WEAVE_FAST_MPS = 22.0
 WEAVE_AMP_FAST_M = 0.35
 WEAVE_LAT_ACC_MPS2 = 1.0
-# Ego body half-width for the weave lane-edge test. The collector always
-# drives an etk800 (level_session.py); 1.8 m is path_predictor.VEHICLE_WIDTH.
-# No bbox request: a live query that BeamNG may not answer is not used here.
-EGO_HALF_WIDTH_M = 0.9
+# The planned weave keeps the body (half width) plus WEAVE_SLACK_M inside the
+# painted lane edge: amp <= lane_w / 2 - half_width - WEAVE_SLACK_M. Under
+# WEAVE_AMP_LO_M the weave is refused.
+WEAVE_SLACK_M = 0.3
+# etk800 half width (1.8 m, path_predictor.VEHICLE_WIDTH). The collector reads
+# the vehicle bbox at spawn and uses this only, logged, when the bbox read
+# fails and the model is etk800; any other model without a bbox stops the run.
+ETK800_HALF_WIDTH_M = 0.9
+EGO_HALF_WIDTH_M = ETK800_HALF_WIDTH_M  # default for library callers without a measured width
 # A recovery starts this far from the lane center, then returns.
 RECOVER_OFFSET_M = (0.5, 1.5)
 HEADING_DEG = (5.0, 15.0)
@@ -129,6 +132,52 @@ def weave_lat_acc(amp_m: float, wave_m: float, speed_mps: float) -> float:
     return float(amp_m) * k * k * float(speed_mps) ** 2
 
 
+def weave_length_m(speed_mps: float | None) -> float:
+    """Length of the weave line that is sent: whole half-waves, the count nearest WINDOW_M, at least one.
+
+    The line starts and ends on the lane center. At 5 m/s per metre of wave
+    a half wave passes WINDOW_M (60 m) above 24 m/s; there the line is one
+    half wave (2.5 v metres: out to one side and back), e.g. 82.5 m at 33 m/s.
+    """
+    half = 0.5 * weave_wave_m(speed_mps)
+    k = max(1, int(math.floor(WINDOW_M / half + 0.5)))
+    return k * half
+
+
+def _menger(a: tuple[float, float], b: tuple[float, float], c: tuple[float, float]) -> float:
+    """Signed curvature through three points (1/m)."""
+    abx, aby = b[0] - a[0], b[1] - a[1]
+    bcx, bcy = c[0] - b[0], c[1] - b[1]
+    acx, acy = c[0] - a[0], c[1] - a[1]
+    den = math.hypot(abx, aby) * math.hypot(bcx, bcy) * math.hypot(acx, acy)
+    if den < 1e-9:
+        return 0.0
+    return 2.0 * (abx * bcy - aby * bcx) / den
+
+
+def path_lat_acc(
+    points: list[tuple[float, float]],
+    centerline: list[tuple[float, float]],
+    speed_mps: float,
+) -> tuple[float, float]:
+    """``(weave, total)`` peak lateral acceleration of a sent line driven at ``speed_mps``.
+
+    ``total`` is v^2 * |curvature| of the line itself. ``weave`` is v^2 *
+    |line curvature - road centerline curvature| at the same samples: what
+    the weave adds on top of the road's own bend. The 1.0 m/s^2 limit is on
+    ``weave``; the road's bend is the gate's curvature rule, not the weave's.
+    """
+    v2 = float(speed_mps) ** 2
+    weave = total = 0.0
+    n = min(len(points), len(centerline))
+    for i in range(1, n - 1):
+        kp = _menger(points[i - 1], points[i], points[i + 1])
+        kr = _menger(centerline[i - 1], centerline[i], centerline[i + 1])
+        weave = max(weave, v2 * abs(kp - kr))
+        total = max(total, v2 * abs(kp))
+    return weave, total
+
+
 def weave_plan(speed_mps: float | None, room_m: float) -> tuple[float, float] | None:
     """``(amp_m, wave_m)`` for a weave at this speed, or None when it cannot start.
 
@@ -157,30 +206,25 @@ def _speed(speed_mps: float | None) -> float | None:
     return v if math.isfinite(v) else None
 
 
-def body_past_lane_edge(
-    lane_offset_m: float | None,
-    lane_width_m: float | None,
-    half_width_m: float = EGO_HALF_WIDTH_M,
+def body_past_paint_edge(
+    paint_lane: tuple[float, float] | None,
+    half_width_m: float,
 ) -> bool:
-    """True when the ego body edge is more than EDGE_M outside its lane's painted edge.
+    """True when either body edge is more than EDGE_M outside the painted lane.
 
-    Measured FROM the body edge: the car's lateral offset from its lane
-    center (``lane_offset_m``, the BeamNG vehicle position projected onto the
-    navgraph road) plus or minus ``half_width_m``. Measured AGAINST the lane
-    edge in WORLD road geometry: the navgraph RoadPoly lane center
-    (``lane_center_offsets`` of the road width and lane count) plus or minus
-    half the lane width. Not the painted-lane labels in the camera rows.
+    FROM: the ego body edges, x = -half_width and +half_width in the vehicle
+    frame (x right, origin at the BeamNG state ``pos`` ref node, the body's
+    lateral center). AGAINST: ``paint_lane`` = (left_x, right_x), the painted
+    lane lines at the car (y = 0) from ``PaintedLanes.lane_at``: the level's
+    DecalRoad line decals in world space, the same source the lane labels use.
+    Not the navgraph: on west_coast_usa most navgraph roads are road_invisible
+    AI splines whose width is the whole corridor, split into 1/1 lanes.
     """
-    if lane_offset_m is None or lane_width_m is None:
+    if paint_lane is None:
         return False
-    try:
-        off = abs(float(lane_offset_m))
-        width = float(lane_width_m)
-    except (TypeError, ValueError):
-        return False
-    if not math.isfinite(off) or not math.isfinite(width) or width <= 0.0:
-        return False
-    return off + float(half_width_m) > width * 0.5 + EDGE_M
+    left, right = float(paint_lane[0]), float(paint_lane[1])
+    hw = float(half_width_m)
+    return hw > right + EDGE_M or -hw < left - EDGE_M
 
 
 def unsafe_reason(
@@ -195,12 +239,15 @@ def unsafe_reason(
     road_offset_m: float | None = None,
     road_width_m: float | None = None,
     half_width_m: float | None = None,
+    paint_lane: tuple[float, float] | None = None,
+    paint_lost: bool = False,
 ) -> str:
     """Why an excursion must stop. Empty when the move may continue.
 
-    A weave is aborted for ``lane_edge`` once its body edge is EDGE_M past
-    the lane edge (``body_past_lane_edge``; ``offset_m`` / ``lane_width_m``
-    come from the world road, and ``half_width_m`` None skips it). A weave,
+    A weave is aborted for ``lane_edge`` once a body edge is EDGE_M past the
+    painted lane edge (``body_past_paint_edge``), and for ``no_paint`` when
+    the collector has lost the painted lane at the car (``paint_lost``).
+    ``half_width_m`` None skips both (library callers). A weave,
     lane change or recovery is aborted for ``road_edge`` only when the car is
     past the paved edge. ``road_width_m`` is the median left-right span, not
     the widest junction node. Cruise still uses the lane half-width.
@@ -211,8 +258,11 @@ def unsafe_reason(
         return "junction"
     if traffic and phase != "abort":
         return "traffic"
-    if phase == "weave" and half_width_m is not None and body_past_lane_edge(offset_m, lane_width_m, half_width_m):
-        return "lane_edge"
+    if phase == "weave" and half_width_m is not None:
+        if body_past_paint_edge(paint_lane, half_width_m):
+            return "lane_edge"
+        if paint_lost:
+            return "no_paint"
     if phase in ("weave", "lane_change", "recover") and road_width_m is not None and road_offset_m is not None:
         if _past_paved_edge(road_offset_m, road_width_m):
             return "road_edge"
@@ -255,6 +305,8 @@ class ExcursionClock:
         road_width_m: float | None = None,
         speed_mps: float | None = None,
         half_width_m: float | None = None,
+        paint_lane: tuple[float, float] | None = None,
+        paint_lost: bool = False,
     ) -> Excursion:
         dt = max(0.0, float(dt_s))
         self.speed_mps = speed_mps
@@ -269,6 +321,8 @@ class ExcursionClock:
             road_offset_m=road_offset_m,
             road_width_m=road_width_m,
             half_width_m=half_width_m,
+            paint_lane=paint_lane,
+            paint_lost=paint_lost,
         )
         if reason and self.phase not in ("cruise", "abort"):
             self.phase = "abort"
@@ -391,13 +445,15 @@ def targets_for(
     road_width_m: float | None = None,
     lanes: int | None = None,
     speed_mps: float | None = None,
+    weave_lane_w: float | None = None,
+    half_width_m: float | None = None,
 ) -> tuple[float, float] | None:
     """Lane-center offset and heading for this phase, or None when it cannot stay on the road.
 
-    A weave's amplitude and wavelength come from ``weave_plan(speed_mps)``.
-    Its room keeps the center WEAVE_MARGIN_M inside the paint and the body
-    (EGO_HALF_WIDTH_M) inside the lane, so the planned peak sits EDGE_M
-    short of the ``lane_edge`` abort.
+    A weave's amplitude and wavelength come from ``weave_plan(speed_mps)``
+    with room ``lane_w / 2 - half_width - WEAVE_SLACK_M``; ``lane_w`` is the
+    painted lane width (``weave_lane_w``) when given, else the navgraph lane
+    (library callers). Under WEAVE_AMP_LO_M of room the weave is refused.
 
     Offset is positive to the right of the current lane center. Heading is
     positive when the path points left of the road. Without a measured road
@@ -414,10 +470,12 @@ def targets_for(
     lane_i = max(0, min(int(lane_id), len(centers) - 1))
     lane_here = road_w / float(len(centers))
     if phase == "weave":
-        half = max(0.0, min(lane_here * 0.5 - WEAVE_MARGIN_M, lane_here * 0.5 - EGO_HALF_WIDTH_M))
-        if half < WEAVE_AMP_LO_M:
+        lane_w_weave = float(weave_lane_w) if weave_lane_w is not None and float(weave_lane_w) > 0.0 else lane_here
+        hw = EGO_HALF_WIDTH_M if half_width_m is None else float(half_width_m)
+        room = lane_w_weave * 0.5 - hw - WEAVE_SLACK_M
+        if room < WEAVE_AMP_LO_M - 1e-9:
             return None
-        plan = weave_plan(speed_mps, half)
+        plan = weave_plan(speed_mps, room)
         if plan is None:
             return None
         amp, wave = plan
@@ -644,13 +702,18 @@ def gate_reason(
     heading: float | None,
     phase: str,
     speed_mps: float = 0.0,
+    *,
+    weave_lane_w: float | None = None,
+    half_width_m: float | None = None,
 ) -> str:
     """Why ``phase`` cannot start, or ``open``.
 
     Weave only needs the current lane. A lane change needs a second lane.
     Curvature is the heading change along the next 60 m divided by that
     distance. A nearby road that does not meet this tip is not a junction.
-    ``speed_mps`` sizes the weave (``weave_plan``); the window is a distance.
+    ``speed_mps`` sizes the weave (``weave_plan``); a weave needs
+    ``max(WINDOW_M, weave_length_m(v))`` of road. ``weave_lane_w`` /
+    ``half_width_m`` are the painted lane width and the ego half width.
     """
     if phase not in ACTIVE or hit is None or not roads:
         return "no_hit"
@@ -670,17 +733,20 @@ def gate_reason(
             lane_id=lane_id,
             road_width_m=float(road.width_m),
             speed_mps=speed_mps if speed_mps else None,
+            weave_lane_w=weave_lane_w if phase == "weave" else None,
+            half_width_m=half_width_m,
         )
         is not None
         for direction in directions
     ):
         return "narrow"
-    length, fork_at, span = _span(roads, road, x, y, heading, WINDOW_M)
+    need = max(WINDOW_M, weave_length_m(speed_mps if speed_mps else None)) if phase == "weave" else WINDOW_M
+    length, fork_at, span = _span(roads, road, x, y, heading, need)
     # Weaves stay in the lane, so a driveway does not block them.
     # A lane change does not start when a fork is inside 40 m.
     if phase != "weave" and fork_at is not None and fork_at < JUNCTION_AHEAD_M:
         return "junction"
-    if length + 1e-3 < WINDOW_M:
+    if length + 1e-3 < need:
         return "short"
     if span / max(length, 1.0) >= CURVATURE_MAX:
         return "curve"
@@ -833,12 +899,24 @@ def excursion_path(
     move: Excursion,
     hit: object,
     speed_mps: float,
+    *,
+    paint_lane: tuple[float, float] | None = None,
+    half_width_m: float | None = None,
+    info: dict | None = None,
 ) -> tuple[list[tuple[float, float]] | None, int]:
     """World points for ``ai.setLine``, and the direction that stays on the road.
 
     The second value flips when the requested lane change would leave the
     pavement and the other side would not. ``(None, direction)`` means do
     not send a line.
+
+    A weave line is ``weave_length_m(v)`` long. With ``paint_lane`` (painted
+    lane at the car, vehicle frame) it is centred on the painted lane center
+    and sized from the painted width. The sent line is then checked:
+    ``path_lat_acc`` of the actual points over the road centerline must stay
+    within WEAVE_LAT_ACC_MPS2; a line over it is rebuilt with the amplitude
+    scaled down, and refused (None) once that is under WEAVE_AMP_LO_M.
+    ``info`` gets amp_m, wave_m, length_m, lat_acc_mps2, total_lat_acc_mps2.
     """
     if move.phase not in ACTIVE or hit is None or not roads:
         return None, int(move.direction)
@@ -850,8 +928,14 @@ def excursion_path(
         directions.append(-directions[0])
     speed = _speed(speed_mps)
     wave = weave_wave_m(speed)
-    # A long highway wave is sent as its first half: out and back to center.
-    need = max(WINDOW_M, 0.5 * wave) if move.phase == "weave" else WINDOW_M
+    need = weave_length_m(speed) if move.phase == "weave" else WINDOW_M
+    paint_w = None
+    paint_base = None
+    if move.phase == "weave" and paint_lane is not None:
+        paint_w = float(paint_lane[1]) - float(paint_lane[0])
+        off = getattr(hit, "offset_m", None)
+        if off is not None:
+            paint_base = float(off) + 0.5 * (float(paint_lane[0]) + float(paint_lane[1]))
     lane_id = int(getattr(hit, "lane_id", 0) or 0)
     lane_w = getattr(hit, "lane_width_m", None)
     # The label counted lanes from lanesLeft/Right. Width/3.5 does not match
@@ -871,6 +955,8 @@ def excursion_path(
             road_width_m=float(road.width_m),
             lanes=lane_count,
             speed_mps=speed,
+            weave_lane_w=paint_w,
+            half_width_m=half_width_m,
         )
         if spec is None:
             continue
@@ -878,17 +964,32 @@ def excursion_path(
         centers = lane_center_offsets(float(road.width_m), lane_count)
         if lane_id < 0 or lane_id >= len(centers):
             continue
-        base = float(centers[lane_id])
+        base = float(centers[lane_id]) if paint_base is None else paint_base
         limit = float(road.width_m) * 0.5 - EDGE_M
-        points: list[tuple[float, float]] = []
-        ok = True
-        for cx, cy, fx, fy, s_m in samples:
-            lat = _lateral(move.phase, s_m, base, delta, wave)
-            if abs(lat) > limit + 1e-6:
-                ok = False
+        centerline = [(cx, cy) for cx, cy, _fx, _fy, _s in samples]
+        for _try in range(4):
+            points: list[tuple[float, float]] = []
+            ok = True
+            for cx, cy, fx, fy, s_m in samples:
+                lat = _lateral(move.phase, s_m, base, delta, wave)
+                if abs(lat) > limit + 1e-6:
+                    ok = False
+                    break
+                rx, ry = fy, -fx
+                points.append((cx + rx * lat, cy + ry * lat))
+            if not ok or len(points) < 2:
                 break
-            rx, ry = fy, -fx
-            points.append((cx + rx * lat, cy + ry * lat))
-        if ok and len(points) >= 2:
-            return points, direction
+            if move.phase != "weave" or speed is None:
+                return points, direction
+            weave_acc, total_acc = path_lat_acc(points, centerline, speed)
+            if weave_acc <= WEAVE_LAT_ACC_MPS2 + 1e-9:
+                if info is not None:
+                    info.update(amp_m=abs(delta), wave_m=wave, length_m=samples[-1][4],
+                                lat_acc_mps2=weave_acc, total_lat_acc_mps2=total_acc, shrunk=_try)
+                return points, direction
+            delta *= 0.97 * WEAVE_LAT_ACC_MPS2 / weave_acc
+            if abs(delta) < WEAVE_AMP_LO_M - 1e-9:
+                if info is not None:
+                    info.update(refused="lat_acc", lat_acc_mps2=weave_acc)
+                return None, int(move.direction)
     return None, int(move.direction)

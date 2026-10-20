@@ -723,6 +723,27 @@ def check_road_area_holdout() -> None:
           f"in train and val, nearest train row {nearest:.0f} m from val; default on for 2 recordings OK")
 
 
+def check_label_floor(row: dict) -> None:
+    """(o) both sides of the label floor, on share and on row count."""
+    from python.train.scene_net import LABEL_FLOOR_ROWS, LABEL_FLOOR_SHARE, labelled_heads
+
+    assert (LABEL_FLOOR_SHARE, LABEL_FLOOR_ROWS) == (0.01, 100)
+    blank = {"tech": {}}
+    cases = (
+        (100, 9900, True, "100 rows = 1.00%: on both floors"),
+        (99, 9801, False, "99 rows = 1.00%: under the row floor"),
+        (100, 10001, False, "100 rows = 0.9999%: under the share floor"),
+        (150, 0, True, "150 rows = 100%"),
+        (5, 0, False, "5 rows = 100%: share is not enough"),
+    )
+    for good, bad, want, why in cases:
+        stamped, below, counts = labelled_heads([row] * good + [blank] * bad, ("lane_gt",))
+        assert (stamped == ("lane_gt",)) is want and (below == ("lane_gt",)) is not want, why
+        assert counts["lane_gt"]["labelled_rows"] == good and counts["lane_gt"]["stamped"] is want, (why, counts)
+    print(f"(o) label floor {LABEL_FLOOR_SHARE:.0%} and {LABEL_FLOOR_ROWS} rows: "
+          + "; ".join(f"{why} -> {'stamped' if want else 'left off'}" for _g, _b, want, why in cases) + " OK")
+
+
 def check_heads_contract() -> None:
     from python.debug.lane_targets import LANE_GT_DIM
     from python.train.cam_strip import metadata_dict
@@ -756,10 +777,12 @@ def check_heads_contract() -> None:
     # The trainer stamps only heads that had a label (rec5b-like rows: lane_gt and lane polylines, nothing else).
     row = {"tech": {"lane_gt": [0.1] * LANE_GT_DIM, "lane_gt_valid": [1] * LANE_GT_DIM,
                     "lanes": [[{"x": 0.0, "y": 5.0}, {"x": 0.0, "y": 30.0}]]}}
-    stamped, unlabelled = labelled_heads([row] * 50, None)
+    stamped, unlabelled, counts = labelled_heads([row] * 500, None)
     assert "lane_gt" in stamped and {"objects", "signs", "curbs"} <= set(unlabelled), (stamped, unlabelled)
-    assert labelled_heads([row], ("lane_gt",)) == (("lane_gt",), ())
-    assert labelled_heads([{"tech": {}}], ("lane_gt",)) == ((), ("lane_gt",))
+    assert counts["objects"] == {"labelled_rows": 0, "labelled_share": 0.0, "stamped": False}
+    assert counts["lane_gt"] == {"labelled_rows": 500, "labelled_share": 1.0, "stamped": True}
+    assert labelled_heads([{"tech": {}}] * 500, ("lane_gt",))[:2] == ((), ("lane_gt",))
+    check_label_floor(row)
     assert metadata_dict(("main",), (), height=1, width=1)["gvd_heads"] == "", "no labelled head stamps nothing"
     assert metadata_dict(("main",), ("lane_gt",), height=1, width=1)["gvd_heads"] == "lane_gt"
 

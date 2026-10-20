@@ -2060,17 +2060,24 @@ def train_directory(
     from python.data.strip_writer import STRIP_ORDER as _ALL_CAMS
 
     run_cams = list(train_cams or _ALL_CAMS)
-    from python.train.scene_net import labelled_heads
+    from python.train.scene_net import LABEL_FLOOR_ROWS, LABEL_FLOOR_SHARE, labelled_heads
 
-    # Trained-heads contract: a head with no label in these rows trains only
-    # toward "absent"; it is left off gvd_heads and the live runtime ignores it.
-    stamp_heads, unlabelled_heads = labelled_heads(rows, train_heads)
+    # Trained-heads contract: a head whose labels are under the floor trains
+    # mostly toward "absent"; it is left off gvd_heads and the live runtime ignores it.
+    stamp_heads, unlabelled_heads, head_labels = labelled_heads(rows, train_heads)
+    label_floor = {"share": LABEL_FLOOR_SHARE, "rows": LABEL_FLOOR_ROWS}
+    print(
+        "[GVD] head labels: "
+        + " ".join(f"{h}={c['labelled_rows']}({c['labelled_share']:.1%})" for h, c in head_labels.items())
+        + f" floor={LABEL_FLOOR_SHARE:.0%} and {LABEL_FLOOR_ROWS} rows",
+        flush=True,
+    )
     if unlabelled_heads:
         print(
-            f"[GVD] heads without any label in these rows: {','.join(unlabelled_heads)}; trained toward absent "
-            f"only and NOT stamped in gvd_heads ("
+            f"[GVD] heads below the label floor: {','.join(unlabelled_heads)}; trained mostly toward absent "
+            f"and NOT stamped in gvd_heads ("
             + (f"pass --heads {','.join(stamp_heads)} to skip them)" if stamp_heads
-               else "no head has a label: the live runtime will refuse this model)"),
+               else "no head clears it: the live runtime will refuse this model)"),
             flush=True,
         )
     # Run metadata: the camera and head contracts the export stamps as gvd_cams / gvd_heads.
@@ -2078,6 +2085,8 @@ def train_directory(
                                "heads": list(stamp_heads),
                                "heads_requested": list(train_heads or ()) or "all",
                                "heads_unlabelled": list(unlabelled_heads),
+                               "head_labels": head_labels,
+                               "label_floor": label_floor,
                                "recordings": run_recordings,
                                "rows_by_recording": recording_counts(rows),
                                "holdout": holdout_meta})

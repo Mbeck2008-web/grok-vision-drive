@@ -750,30 +750,47 @@ HEAD_VALID = {
 }
 
 
-def labelled_heads(
-    rows: list[Mapping[str, Any]], heads: tuple[str, ...] | None, *, sample: int = 2000
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """(heads with any valid label, heads with none) over an even sample of rows.
+# A head is stamped as trained (gvd_heads) only when its labels clear BOTH:
+# at least LABEL_FLOOR_SHARE of the rows it trains on (1%: below that the
+# head mostly learns "absent") and at least LABEL_FLOOR_ROWS such rows (100,
+# about 10 s of 10 Hz driving: too few examples to have learned a shape).
+LABEL_FLOOR_SHARE = 0.01
+LABEL_FLOOR_ROWS = 100
 
-    A head with no label anywhere is trained only toward "absent"; it is
-    left off ``gvd_heads`` so the live runtime never reads it.
+
+def labelled_heads(
+    rows: list[Mapping[str, Any]],
+    heads: tuple[str, ...] | None,
+    *,
+    min_share: float = LABEL_FLOOR_SHARE,
+    min_rows: int = LABEL_FLOOR_ROWS,
+) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, dict[str, Any]]]:
+    """(stamped heads, heads below the floor, per-head label counts).
+
+    A row is labelled for a head when any of its valid flags is set. Every
+    requested head gets ``labelled_rows`` and ``labelled_share`` (of
+    ``rows``); it is stamped only when it clears ``min_share`` and
+    ``min_rows``. A head below the floor trains mostly toward "absent"; it
+    is left off ``gvd_heads`` so the live runtime never reads it.
     """
     wanted = tuple(heads) if heads else HEAD_NAMES
-    if not rows:
-        return (), wanted
-    step = max(1, len(rows) // max(1, int(sample)))
-    seen: set[str] = set()
-    for row in rows[::step]:
+    labelled = {head: 0 for head in wanted}
+    for row in rows:
         labels = labels_for_row(row)
         for head in wanted:
-            if head in seen:
-                continue
             valid = labels.get(HEAD_VALID.get(head, ""))
             if valid is not None and float(np.nansum(np.asarray(valid, dtype=np.float64))) > 0:
-                seen.add(head)
-        if len(seen) == len(wanted):
-            break
-    return tuple(h for h in wanted if h in seen), tuple(h for h in wanted if h not in seen)
+                labelled[head] += 1
+    total = len(rows)
+    counts: dict[str, dict[str, Any]] = {}
+    stamped: list[str] = []
+    below: list[str] = []
+    for head in wanted:
+        share = (labelled[head] / float(total)) if total else 0.0
+        ok = labelled[head] >= int(min_rows) and share >= float(min_share)
+        counts[head] = {"labelled_rows": int(labelled[head]), "labelled_share": round(share, 6), "stamped": ok}
+        (stamped if ok else below).append(head)
+    return tuple(stamped), tuple(below), counts
 
 
 def labels_for_row(row: Mapping[str, Any] | None) -> dict[str, np.ndarray]:

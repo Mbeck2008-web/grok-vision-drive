@@ -221,6 +221,8 @@ def check_collector_run() -> None:
     assert ws["aborted"] == {"weave": {"overspeed": 1}} and ws["aborted_total"] == 1, ws
     assert ws["by_speed_band"]["<12"] == {"started": 1, "refused": 0, "refused_attempts": 0, "aborted": 1}, ws
     assert status["notes"]["weave_stats"] == WEAVE_STATS_NOTES, status.get("notes")
+    assert status["lane_change_tag"] == "peak_so_far", status.get("lane_change_tag")
+    assert status["notes"]["lane_change_tag"].startswith("peak_so_far: "), status.get("notes")
     assert status["speed_ranges"]["current#0"][0]["range"] == [8.0, 17.0], status["speed_ranges"]
     # Under 15% over: no abort.
     collect.painted_for = lambda level: harness._Paint(lambda x, y: True)  # type: ignore[assignment]

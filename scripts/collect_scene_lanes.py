@@ -2120,7 +2120,13 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             extra["impact_respawn"] = {"on": impact_respawn_on, **impact_respawns}
             extra["speed_ranges"] = {k: list(v) for k, v in speed_ranges.items()}
             extra["weave_stats"] = weave_stats.summary()
-            extra["notes"] = {"weave_stats": dict(WEAVE_STATS_NOTES)}
+            # Lane-change rows carry the peak heading reached so far (older recordings: the full-ramp peak).
+            extra["lane_change_tag"] = "peak_so_far"
+            extra["notes"] = {
+                "weave_stats": dict(WEAVE_STATS_NOTES),
+                "lane_change_tag": "peak_so_far: a lane-change row's target_heading_rad is the peak heading the sent "
+                                   "line has reached so far; older recordings used the full-ramp peak",
+            }
             if ego_width:
                 extra["ego_width"] = dict(ego_width)
             return extra or None

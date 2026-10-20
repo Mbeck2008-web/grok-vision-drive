@@ -1570,7 +1570,7 @@ def train_directory(
     lane_kind = str(lane_loss or "huber")
     input_scale = float(scale) if float(scale) > 0.0 else 1.0
     from python.data.raw_frames import load_scene_rows, training_frame_bytes
-    from python.train.scene_loader import default_num_workers, select_training_rows
+    from python.train.scene_loader import default_num_workers, recompute_dt, select_training_rows
 
     print("[GVD] scene index: reading state.jsonl", flush=True)
     from python.data.raw_frames import refuse_lossy
@@ -1603,6 +1603,8 @@ def train_directory(
         before = len(rows)
         rows, event_counts = mask_event_rows(root, rows)
         print(f"[GVD] mask-events: {describe(event_counts, before)}", flush=True)
+        # A masked run is one gap; past MEMORY_S it resets the GRU.
+        rows = recompute_dt(rows)
     blank_scan = count_near_black_main(rows, cache, train_cams, input_scale)
     near_rule = (
         f"mean<{NEAR_BLACK_MEAN} or >{NEAR_BLACK_FRAC:.0%} of px below {NEAR_BLACK_LEVEL}/255"

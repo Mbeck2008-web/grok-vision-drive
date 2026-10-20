@@ -58,6 +58,26 @@ def _stamp(value: object) -> float | None:
     return stamp
 
 
+def recompute_dt(rows: list) -> list:
+    """Copies of ``rows`` with ``dt_s`` rewritten from the kept timestamps.
+
+    Run after every row removal (missing frames, no main picture, the event
+    mask): a removed run becomes one gap, so a gap longer than the GRU
+    memory resets the state in ``recording_spans`` and ``_eval_sequence``.
+    The first row, and a row after one without a timestamp, gets ``None``.
+    """
+    out: list = []
+    prev_t: float | None = None
+    for row in rows:
+        item = dict(row)
+        stamp = _stamp(item.get("t"))
+        item["dt_s"] = None if prev_t is None or stamp is None else stamp - prev_t
+        out.append(item)
+        if stamp is not None:
+            prev_t = stamp
+    return out
+
+
 def select_training_rows(
     root: Path | str,
     rows: list,
@@ -85,7 +105,6 @@ def select_training_rows(
     kept: list = []
     missing = 0
     excluded = 0
-    prev_t: float | None = None
     for row in rows:
         if not isinstance(row, dict):
             missing += 1
@@ -113,16 +132,8 @@ def select_training_rows(
             if dropped is not None:
                 dropped["no_main"] = int(dropped.get("no_main", 0)) + 1
             continue
-        item = dict(row)
-        stamp = _stamp(item.get("t"))
-        if prev_t is None or stamp is None:
-            item["dt_s"] = None
-        else:
-            item["dt_s"] = stamp - prev_t
-        kept.append(item)
-        if stamp is not None:
-            prev_t = stamp
-    return kept, missing, excluded
+        kept.append(row)
+    return recompute_dt(kept), missing, excluded
 
 
 def _spawn_load(root: str, index: int, queue) -> None:

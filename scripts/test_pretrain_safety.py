@@ -3,6 +3,9 @@
 
 (f) with all cameras (no --cams), a row without a decodable main picture is
     dropped (``dropped["no_main"]``), not stitched with a black front sector.
+(b) ``dt_s`` is recomputed after every removal: a dropped no-main row and an
+    event-masked run each become one gap, and a gap over MEMORY_S resets the
+    GRU (``recording_spans``) while a short one does not.
 """
 from __future__ import annotations
 
@@ -64,8 +67,51 @@ def check_no_main_dropped() -> None:
     print("(f) no-main rows dropped with all cameras: kept [0, 2, 4], dropped no_main=2 OK")
 
 
+def check_dt_after_removals() -> None:
+    from python.train.continual import recording_spans
+    from python.train.event_mask import mask_event_rows
+    from python.train.scene_loader import recompute_dt, select_training_rows
+    from python.train.scene_net import MEMORY_S
+
+    main_cams = ("main",)
+    side = ("pillarL",)
+    # 10 Hz: rows 0-9 drive, row 5 has no main picture, rows 10-209 (20 s)
+    # are a settle run the event mask removes, rows 210-219 drive on.
+    layout = [side if i == 5 else main_cams for i in range(220)]
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        rows = _recording(tmp, layout)
+        for row in rows[10:210]:
+            row["settle"] = True
+        kept, _missing, _excluded = select_training_rows(tmp, rows, cams=None, dropped={})
+        by_i = {r["i"]: r for r in kept}
+        assert 5 not in by_i and abs(by_i[6]["dt_s"] - 0.2) < 1e-6, by_i[6]["dt_s"]
+        masked, counts = mask_event_rows(tmp, kept)
+        assert counts["settle"] == 200, counts
+        stale = {r["i"]: r for r in masked}[210]["dt_s"]
+        assert abs(stale - 0.1) < 1e-6, stale  # what the GRU saw before this fix
+        assert len(recording_spans(masked)) == 1
+        fixed = recompute_dt(masked)
+        f_i = {r["i"]: r for r in fixed}
+        gap = f_i[210]["dt_s"]
+        assert abs(gap - 20.1) < 1e-6 and gap > MEMORY_S, gap
+        assert abs(f_i[6]["dt_s"] - 0.2) < 1e-6
+        spans = recording_spans(fixed)
+        assert spans == [(0, 9), (9, 19)], spans
+        assert fixed[0]["dt_s"] is None
+        # A short masked run (2 s) is one gap but keeps the state.
+        short = recompute_dt([r for r in kept if not 10 <= r["i"] < 30])
+        assert len(recording_spans(short)) == 1
+        assert abs({r["i"]: r for r in short}[30]["dt_s"] - 2.1) < 1e-6
+    print(
+        f"(b) dropped row dt_s=0.2 s (no reset); masked 20 s run dt_s {stale:.1f} -> {gap:.1f} s "
+        f"> MEMORY_S={MEMORY_S:.0f} s: spans {spans} (GRU reset); 2 s mask keeps one span OK"
+    )
+
+
 def main() -> None:
     check_no_main_dropped()
+    check_dt_after_removals()
     print("test_pretrain_safety: OK")
 
 

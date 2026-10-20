@@ -1,0 +1,710 @@
+#!/usr/bin/env python3
+"""Collector fixes: paint-coverage spawns, impacts, settle rows, tip check, damage.
+
+Offline. ``lane_at`` and the speed trace are mocked; no BeamNG is needed.
+"""
+from __future__ import annotations
+
+import gzip
+import io
+import json
+import sys
+import tempfile
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from python.collect.liveness import (  # noqa: E402
+    IMPACT_STALL_S,
+    PRE_IMPACT_S,
+    SETTLE_FLAG_S,
+    TIP_DIR_Z_LIVE,
+    TIP_Z,
+    LIVE_YIELD_MAX_CUTS,
+    ImpactWatch,
+    Liveness,
+    SettleWindow,
+    YieldGuard,
+    car_is_driving,
+    is_tipped,
+)
+from python.collect.spawn_mix import (  # noqa: E402
+    CITY,
+    HIGHWAY,
+    RAMP,
+    SpawnDeck,
+    paint_coverage,
+    road_ahead,
+    sample_along,
+)
+from python.debug.gt_geom import RoadPoly  # noqa: E402
+
+
+# --------------------------------------------------------------------- (a)
+class _Paint:
+    """``lane_at`` stand-in: a lane exists wherever ``painted(x, y)`` is true."""
+
+    def __init__(self, painted) -> None:
+        self.painted = painted
+        self.calls = 0
+
+    def __bool__(self) -> bool:
+        return True
+
+    def lane_at(self, pos, direction, ys=(5.0, 10.0, 20.0, 30.0)):
+        self.calls += 1
+        out = []
+        for y in ys:
+            x = float(pos[0]) + float(direction[0]) * float(y)
+            yy = float(pos[1]) + float(direction[1]) * float(y)
+            out.append((-1.75, 1.75) if self.painted(x, yy) else None)
+        return out
+
+
+def _road(rid: str, pts, *, lanes: int = 2, oneway: bool = False) -> dict:
+    pts = [(float(x), float(y), 10.0) for x, y in pts]
+    length = sum(((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2) ** 0.5 for a, b in zip(pts, pts[1:]))
+    return {"id": rid, "pts": pts, "lanes": lanes, "length": length, "oneway": oneway}
+
+
+def check_coverage_walks_ahead() -> None:
+    # A 60 m road joined to a 340 m road. Paint only on x < 100.
+    a = _road("a", [(0, 0), (30, 0), (60, 0)])
+    b = _road("b", [(60, 0), (200, 0), (400, 0)])
+    side = _road("side", [(60, 0), (60, 200)])  # a 90 deg turn is not "ahead"
+    deck = SpawnDeck({CITY: [a, b, side], HIGHWAY: [], RAMP: []}, painted=_Paint(lambda x, y: x < 100.0), min_paint_cov=0.5)
+    chain = road_ahead(a, deck._by_id, deck._ends)
+    assert abs(chain[0][0] - 24.0) < 1e-6, chain[0]  # the spawn point is 40% along
+    assert chain[-1][0] == 400.0 and all(abs(p[1]) < 1e-9 for p in chain), chain
+    samples = sample_along(chain)
+    assert len(samples) == 30 and abs(samples[1][0] - 34.0) < 1e-6
+    cov = deck.coverage(a)
+    # Probes at x = 24..314; lane 10 m ahead exists for x + 10 < 100 -> 24..84 = 7 of 30.
+    assert abs(cov - 7 / 30) < 1e-9, cov
+    # A one-way road is not walked against its direction.
+    back = _road("back", [(400, 0), (60, 0)], oneway=True)
+    deck2 = SpawnDeck({CITY: [a, back], HIGHWAY: [], RAMP: []})
+    assert road_ahead(a, deck2._by_id, deck2._ends)[-1][0] == 60.0
+    assert paint_coverage(_Paint(lambda x, y: True), []) == 0.0
+    print(f"coverage ahead ok cov={cov:.3f}")
+
+
+def check_short_probe_is_not_full_coverage() -> None:
+    """rec3 #1/#3 ramps: the walk ahead stopped after 9-14 m (1-2 probes), so a
+    painted stub scored 1.00. Missing probes under 100 m now count as unpainted."""
+    stub = _road("stub", [(0, 0), (25, 0)])  # spawn at 10 m, walk 15 m, nothing joins
+    everywhere = _Paint(lambda x, y: True)
+    deck = SpawnDeck({CITY: [stub], HIGHWAY: [], RAMP: []}, painted=everywhere, min_paint_cov=0.5)
+    assert len(sample_along(road_ahead(stub, deck._by_id, deck._ends))) == 2
+    assert abs(deck.coverage(stub) - 0.2) < 1e-9, deck.coverage(stub)
+    old = SpawnDeck({CITY: [stub], HIGHWAY: [], RAMP: []}, painted=everywhere, min_paint_cov=0.5, min_probe_m=0.0)
+    assert old.coverage(stub) == 1.0
+    # A walk of 100 m or more is scored as before.
+    long_road = _road("long", [(0, 0), (500, 0)])
+    deck = SpawnDeck({CITY: [long_road], HIGHWAY: [], RAMP: []}, painted=everywhere, min_paint_cov=0.5)
+    assert deck.coverage(long_road) == 1.0
+    assert paint_coverage(everywhere, [(0.0, 0.0, 0.0, 1.0, 0.0)], min_samples=10) == 0.1
+    print("short probe: a 15 m walk scores 0.20, not 1.00; 100 m+ unchanged")
+
+
+def _pools(low: int, high: int, kind: str = CITY) -> dict:
+    roads = [_road(f"low{j}", [(0, 3000 * j), (400, 3000 * j)]) for j in range(low)]
+    roads += [_road(f"high{j}", [(0, -5000 - 3000 * j), (400, -5000 - 3000 * j)]) for j in range(high)]
+    pools = {CITY: [], HIGHWAY: [], RAMP: []}
+    pools[kind] = roads
+    return pools
+
+
+PAINT_SOUTH = _Paint(lambda x, y: y < -1000.0)  # only the "high" roads are painted
+
+
+def check_deck_skips_and_logs() -> None:
+    log: list[str] = []
+    deck = SpawnDeck(_pools(5, 1), painted=PAINT_SOUTH, min_paint_cov=0.5, log=log.append)
+    pick = deck.take()
+    assert pick is not None and pick.road_id == "high0", pick
+    assert pick.paint_cov is not None and pick.paint_cov >= 0.5
+    skips = [line for line in log if line.startswith("spawn skip")]
+    assert len(skips) == deck.skipped and all("paint_cov=0.00" in line for line in skips), log
+    assert log[-1].startswith("spawn pick city road=high0 paint_cov=1.00"), log
+    # Skipped roads are spent: the next take never offers them again.
+    assert all(f"low{j}" in deck.used for j in range(5) if any(f"road=low{j} " in s for s in skips))
+    print(f"deck skip ok skipped={deck.skipped} log={log[-1]!r}")
+
+
+def check_deck_disabled_is_unchanged() -> None:
+    paint = _Paint(lambda x, y: False)
+    plain = SpawnDeck(_pools(4, 1))
+    off = SpawnDeck(_pools(4, 1), painted=paint, min_paint_cov=0.0)
+    for _ in range(5):
+        a, b = plain.take(), off.take()
+        assert a == b and a.paint_cov is None
+    assert paint.calls == 0
+    assert plain.take() is None and off.take() is None
+    print("deck with min_paint_cov 0 matches the old deck")
+
+
+def check_deck_fallback_and_next_kind() -> None:
+    log: list[str] = []
+    deck = SpawnDeck(_pools(6, 0), painted=PAINT_SOUTH, min_paint_cov=0.5, max_tries=2, log=log.append)
+    pick = deck.take()
+    assert pick is not None and pick.paint_cov == 0.0
+    assert deck.skipped == 2 and len(deck.used) == 2, deck.used
+    assert log[-1].startswith("spawn fallback"), log
+    # City all unpainted, highway painted: the city budget runs out, then highway.
+    pools = _pools(4, 0)
+    pools[HIGHWAY] = _pools(0, 1, HIGHWAY)[HIGHWAY]
+    deck = SpawnDeck(pools, painted=PAINT_SOUTH, min_paint_cov=0.5, max_tries=3)
+    pick = deck.take()
+    assert pick is not None and pick.kind == HIGHWAY and pick.paint_cov == 1.0, pick
+    assert deck.counts[HIGHWAY] == 1 and deck.counts[CITY] == 0
+    print("deck fallback ok")
+
+
+def check_real_west_coast_if_present() -> None:
+    nav = Path(r"E:\GVD_data\roads\west_coast_usa.json.gz")
+    lines = Path(r"E:\GVD_data\roads\west_coast_usa_lines.json.gz")
+    if not (nav.is_file() and lines.is_file()):
+        print("real west coast deck skipped (no E:\\GVD_data\\roads dump)")
+        return
+    from python.debug.painted_lanes import PaintedLanes
+
+    with gzip.open(lines, "rt", encoding="utf-8") as fh:
+        painted = PaintedLanes(json.load(fh))
+    deck = SpawnDeck.load(nav, painted=painted, min_paint_cov=0.5)
+    picks = [deck.take() for _ in range(20)]
+    assert all(p is not None and p.paint_cov >= 0.5 for p in picks), [p.paint_cov for p in picks]
+    assert "890092.0" not in {p.road_id for p in picks}  # the drift loop at (-1119, 1940)
+    print(f"real west coast: 20 picks >= 0.50, skipped {deck.skipped}")
+
+
+# --------------------------------------------------------------------- (b)
+def check_impact_watch() -> None:
+    watch = ImpactWatch()
+    t = 0.0
+    hits = []
+    trace = [15.0] * 30 + [14.5] + [14.0] * 10 + [9.0] + [8.0] + [0.2] * 25
+    for i, speed in enumerate(trace):
+        t += 0.1
+        got = watch.update(0.1, speed)
+        if got is not None:
+            hits.append((i, round(got, 1), watch.pre_window()))
+        watch.note_row(t, i)
+    # 14 -> 9 m/s in 0.1 s is 50 m/s^2. 15 -> 14.5 (5 m/s^2) is braking, not an impact.
+    # 8 -> 0.2 a tick later is inside the 2 s debounce.
+    assert [h[0] for h in hits] == [41], hits
+    assert hits[0][1] == 50.0
+    pre_t, pre_i = hits[0][2]
+    assert pre_i == 41 - int(round(PRE_IMPACT_S / 0.1)), hits  # first row inside the 2 s run-up
+    assert abs(pre_t - (pre_i + 1) * 0.1) < 1e-6
+    assert watch.should_respawn() and watch.stall_s >= IMPACT_STALL_S
+    # A long gap (teleport, a stall in the loop) is not a deceleration.
+    gap = ImpactWatch()
+    gap.update(0.1, 20.0)
+    assert gap.update(1.0, 0.0) is None and not gap.open
+    # Driving on after an impact closes it.
+    on = ImpactWatch()
+    on.update(0.1, 12.0)
+    assert on.update(0.1, 9.0) is not None
+    for _ in range(85):
+        on.update(0.1, 9.0)
+    assert on.drove_off() and not on.should_respawn()
+    on.close()
+    assert not on.open
+    print(f"impact watch ok hit={hits[0][:2]} pre_i0={pre_i}")
+
+
+# --------------------------------------------------------------------- (c)
+def check_settle_window() -> None:
+    win = SettleWindow()
+    assert not win.active(0.0)
+    win.start(100.0)
+    assert win.active(100.0) and win.active(100.0 + SETTLE_FLAG_S - 0.05)
+    assert not win.active(100.0 + SETTLE_FLAG_S)
+    win.start(500.0)
+    assert win.active(501.0)
+    print("settle window ok")
+
+
+# --------------------------------------------------------------------- (d)
+def check_tip_rules() -> None:
+    # 20 deg grade: dir_z 0.34, up_z 0.94. The old rule called that tipped.
+    assert is_tipped(0.34)
+    assert not is_tipped(0.34, up_z=0.94)
+    assert not is_tipped(0.34, tip_z=TIP_DIR_Z_LIVE)
+    assert is_tipped(0.0, up_z=0.2)  # on its side
+    assert is_tipped(0.97, tip_z=TIP_DIR_Z_LIVE)  # nose up, no up vector
+    assert car_is_driving(8.0, 0.34, 0.94, TIP_DIR_Z_LIVE)
+    assert not car_is_driving(8.0, 0.0, -0.9, TIP_DIR_Z_LIVE)
+    live = Liveness()
+    assert live.update(0.1, 8.0, 0.34, None, ai_should_move=True, up_z=0.94, tip_z=TIP_DIR_Z_LIVE) == ""
+    assert live.update(0.1, 8.0, 0.34, None, ai_should_move=True) == "tipped"  # default rule kept
+    assert TIP_Z == 0.3
+    print("tip rules ok")
+
+
+def check_weave_guard_helpers() -> None:
+    import scripts.collect_scene_lanes as collect
+    from python.debug.lane_targets import tech_from_painted
+
+    full = tech_from_painted([(-1.7, 1.7)] * 4)
+    half = tech_from_painted([(-1.7, 1.7), (-1.7, 1.7), None, None])
+    none = tech_from_painted([None] * 4)
+    assert collect.paint_share(full) == 1.0 and collect.paint_share(half) == 0.5 and collect.paint_share(none) == 0.0
+    assert collect.weave_guard_reason(1.0, None, 0.5, 40.0) == "open"
+    assert collect.weave_guard_reason(0.25, None, 0.5, 40.0) == "paint_ahead"
+    assert collect.weave_guard_reason(1.0, 24.0, 0.5, 40.0) == "junction_ahead"
+    assert collect.weave_guard_reason(1.0, 48.0, 0.5, 40.0) == "open"
+    assert abs(collect.polyline_length([(0, 0), (3, 4), (3, 10)]) - 11.0) < 1e-9
+    args = collect.build_parser().parse_args([])
+    assert args.min_paint_cov == 0.5 and args.weave_guard is False
+    args = collect.build_parser().parse_args(["--min-paint-cov", "0", "--weave-guard"])
+    assert args.min_paint_cov == 0.0 and args.weave_guard is True
+    assert "impact" in collect.HARD_SEGMENT_REASONS
+    print("weave guard helpers ok")
+
+
+def check_paint_share_slot_order() -> None:
+    """paint_share must read the center slot of lane_gt_valid, as lane_targets writes it."""
+    import math
+
+    import scripts.collect_scene_lanes as collect
+    from python.debug.lane_targets import (
+        LOOKAHEADS_M,
+        SLOT_CENTER,
+        SLOT_LEFT,
+        SLOT_RIGHT,
+        lookahead_slot,
+        tech_from_painted,
+    )
+
+    # Distinct left/right/center at every lookahead, so each value has one home.
+    lanes = [(-1.0 - 0.3 * k, 2.0 + 0.7 * k) for k in range(len(LOOKAHEADS_M))]
+    tech = tech_from_painted(lanes)
+    values, valid = list(tech["lane_gt"]), list(tech["lane_gt_valid"])
+    triples = 3 * len(LOOKAHEADS_M)
+    for k, (left, right) in enumerate(lanes):
+        for part, want in ((SLOT_CENTER, 0.5 * (left + right)), (SLOT_LEFT, left), (SLOT_RIGHT, right)):
+            # Where the real writer put it, found by value, not by the helper.
+            home = [i for i in range(triples) if abs(values[i] - want) < 1e-5]
+            assert home == [lookahead_slot(k, part)], (k, part, home)
+            assert valid[home[0]] == 1.0  # the mask uses the same slot as the value
+    assert collect.paint_share(tech) == 1.0
+    # Lookahead 2: NaN center, left and right still valid. Not a usable lane.
+    centre = [i for i in range(triples) if abs(values[i] - 0.5 * sum(lanes[2])) < 1e-5][0]
+    values[centre] = float("nan")
+    valid[centre] = 0.0
+    side = [i for i in range(triples) if abs(values[i] - lanes[2][0]) < 1e-5 or abs(values[i] - lanes[2][1]) < 1e-5]
+    assert len(side) == 2 and all(valid[i] == 1.0 for i in side)
+    broken = dict(tech, lane_gt=values, lane_gt_valid=valid)
+    assert math.isnan(broken["lane_gt"][lookahead_slot(2, SLOT_CENTER)])
+    assert collect.paint_share(broken) == 0.75, collect.paint_share(broken)
+    # The writer's own "no paint at 20 m" vector agrees.
+    missing = tech_from_painted([lanes[0], lanes[1], None, lanes[3]])
+    assert collect.paint_share(missing) == 0.75
+    print("paint_share reads the center slot (NaN center with valid sides counts invalid)")
+
+
+def check_spawn_mix_summary() -> None:
+    import scripts.collect_scene_lanes as collect
+
+    pools = _pools(6, 0)
+    pools[HIGHWAY] = _pools(0, 2, HIGHWAY)[HIGHWAY]
+    deck = SpawnDeck(pools, painted=PAINT_SOUTH, min_paint_cov=0.5, max_tries=2)
+    first = deck.take()  # city wanted, unpainted: 2 skips, then a painted highway
+    assert first.kind == HIGHWAY and deck.cross_kind == 1 and deck.best_seen == 0
+    second = deck.take()  # city still behind its share: 2 more skips, then highway again
+    assert second.kind == HIGHWAY and deck.cross_kind == 2
+    third = deck.take()  # no highway left: the best-covered skipped city road
+    assert third.kind == CITY and third.paint_cov == 0.0 and deck.best_seen == 1 and deck.cross_kind == 2
+    s = deck.summary()
+    assert s["picks"] == 3 and s["counts"] == {CITY: 1, HIGHWAY: 2, RAMP: 0}, s
+    assert s["cross_kind_fallback"] == deck.cross_kind and s["skipped"] == deck.skipped
+    assert len(deck.select_ms) == 3 and deck.last_ms >= 0.0 and s["select_ms_max"] >= s["select_ms_mean"]
+    line = deck.summary_line()
+    assert line.startswith("spawn mix picks=3 city=1 highway=2 ramp=0 ") and "best_seen=1" in line, line
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "collect.json"
+        collect.save_progress(path, 12.5, 60.0, {"spawn_mix": s})
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        assert saved["spawn_mix"]["counts"] == s["counts"]
+        assert collect.load_progress(path) == 12.5
+        collect.save_progress(path, 3.0, 60.0)
+        assert set(json.loads(path.read_text(encoding="utf-8"))) == {"done_s", "target_s"}
+    print(f"spawn mix summary ok: {line}")
+
+
+# --------------------------------------------------------------------- (e)
+class _Sensors(dict):
+    pass
+
+
+class _DamageVehicle:
+    def __init__(self) -> None:
+        self.state = {"pos": [1.0, 2.0, 3.0], "dir": [0.0, 1.0, 0.1], "up": [0.0, -0.1, 0.99], "vel": [0.0, 5.0, 0.0]}
+        self.sensors = _Sensors(damage={"damage": 512.0, "part_damage": {}})
+
+    def poll_sensors(self) -> None:
+        pass
+
+
+def check_damage_and_up_are_read() -> None:
+    import scripts.collect_scene_lanes as collect
+
+    sample = collect._read_vehicle(_DamageVehicle())
+    assert sample["damage"] == 512.0, sample
+    assert sample["up"] == [0.0, -0.1, 0.99]
+    print("damage sensor and up vector read")
+
+
+# ------------------------------------------------------ collector, end to end
+class _CrashVehicle:
+    """10 m/s, a crash to 0.2 m/s, stopped, then driving again, then the stop file."""
+
+    def __init__(self, stop: Path, speed_at=None, stop_at: int = 120, damage_at=None) -> None:
+        self.stop = stop
+        self.speed_at = speed_at or (lambda n: 10.0 if n <= 40 or n > 75 else 0.2)
+        self.damage_at = damage_at
+        self.stop_at = int(stop_at)
+        self.polls = 0
+        self.commands: list[str] = []
+        self.state: dict = {}
+        self._set(10.0)
+
+    def _set(self, speed: float) -> None:
+        self.state = {
+            "pos": [0.4, 12.0, 0.5],
+            "dir": [0.0, 1.0, 0.0],
+            "up": [0.0, 0.0, 1.0],
+            "electrics": {"wheelspeed": speed, "steering_input": 0.0, "throttle_input": 0.3, "brake_input": 0.0},
+        }
+
+    def poll_sensors(self) -> None:
+        self.polls += 1
+        self._set(float(self.speed_at(self.polls)))
+        if self.damage_at is not None:
+            self.state["damage"] = float(self.damage_at(self.polls))
+        if self.polls >= self.stop_at:
+            self.stop.write_text("stop", encoding="utf-8")
+
+    def queue_lua_command(self, command: str, *args: object) -> None:
+        del args
+        self.commands.append(str(command))
+
+    def connect(self, bng: object) -> None:
+        del bng
+
+    def is_connected(self) -> bool:
+        return True
+
+
+class _Api:
+    def __init__(self, vehicle) -> None:
+        self.vehicle = vehicle
+
+    def get_current(self):
+        return {"ego": self.vehicle}
+
+    def get_player_vehicle_id(self):
+        return {"vid": "ego"}
+
+
+class _Bng:
+    def __init__(self, vehicle) -> None:
+        self.vehicles = _Api(vehicle)
+        self.commands: list[str] = []
+
+    def queue_lua_command(self, command: str, *args: object) -> None:
+        del args
+        self.commands.append(str(command))
+
+    def get_road_network(self, **kwargs: object):
+        del kwargs
+        return {"roads": {"main": [{"middle": [0.0, 0.0, 0.4]}, {"middle": [0.0, 80.0, 0.4]}]}}
+
+
+class _Cam:
+    def poll(self):
+        image = np.zeros((8, 8, 3), dtype=np.uint8)
+        image[0, 0] = (8, 16, 24)
+        return {"colour": image}
+
+
+def _run_collector(vehicle_args: dict, extra: list[str]) -> tuple[int, str, Path]:
+    import python.data.raw_queue as raw_queue
+    import python.debug.gt_logger as gt_logger
+    import python.sensors.tech as tech
+    import scripts.collect_scene_lanes as collect
+    from python.collect.auto_mode import stop_file
+
+    base_queue = raw_queue.RawWriteQueue
+
+    class _DeepQueue(base_queue):  # the mocked loop outruns the PNG workers
+        def __init__(self, writer, max_depth: int = 64, **kwargs) -> None:
+            del max_depth
+            super().__init__(writer, 100000, **kwargs)
+
+    root = Path(tempfile.mkdtemp())
+    out = root / "scene"
+    vehicle = _CrashVehicle(stop_file(out), **vehicle_args)
+    bng = _Bng(vehicle)
+    previous = (
+        tech.open_tech_beamngpy,
+        tech.widen_socket_timeout,
+        tech.release_tech_beamngpy,
+        gt_logger.load_road_polys,
+        collect._attach_cameras,
+        collect.time.sleep,
+        collect.time.monotonic,
+        collect.tick_sleep_s,
+    )
+    clock = {"t": 0.0}
+
+    def sleep(seconds: float) -> None:
+        clock["t"] += float(seconds or 0.0)
+
+    tech.open_tech_beamngpy = lambda *a, **k: bng  # type: ignore[assignment]
+    tech.widen_socket_timeout = lambda *a, **k: None  # type: ignore[assignment]
+    tech.release_tech_beamngpy = lambda *a, **k: None  # type: ignore[assignment]
+    gt_logger.load_road_polys = lambda session: ([RoadPoly("r", [(0.0, 0.0), (0.0, 80.0)], 7.0)], "")  # type: ignore[assignment]
+    collect._attach_cameras = lambda session, veh, cfg: {"main": _Cam()}  # type: ignore[assignment]
+    collect.time.sleep = sleep  # type: ignore[method-assign]
+    collect.time.monotonic = lambda: clock["t"]  # type: ignore[method-assign]
+    collect.tick_sleep_s = lambda _elapsed, _period=0.1: 0.1  # type: ignore[method-assign]
+    raw_queue.RawWriteQueue = _DeepQueue  # type: ignore[misc]
+    buf = io.StringIO()
+    old = sys.stdout
+    sys.stdout = buf
+    try:
+        code = collect.main(
+            ["--minutes", "5", "--smoke-s", "0", "--data-dir", str(root), "--out", str(out),
+             "--host", "127.0.0.1", "--port", "1"] + list(extra)
+        )
+    finally:
+        sys.stdout = old
+        (
+            tech.open_tech_beamngpy,
+            tech.widen_socket_timeout,
+            tech.release_tech_beamngpy,
+            gt_logger.load_road_polys,
+            collect._attach_cameras,
+            collect.time.sleep,
+            collect.time.monotonic,
+            collect.tick_sleep_s,
+        ) = previous
+        raw_queue.RawWriteQueue = base_queue  # type: ignore[misc]
+    return code, buf.getvalue(), out
+
+
+def check_collector_impact_rows() -> None:
+    code, text, out = _run_collector({}, ["--no-excursions"])
+    assert code == 0, (code, text)
+    assert "collect impact current#0 decel=98.0 m/s2 v=10.0->0.2" in text, text
+    assert "respawning" in text and "collect abort impact" in text and "collect recover" in text, text
+    assert "collect abort stationary" not in text
+    rows = [json.loads(line) for line in (out / "state.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+    hit = [row for row in rows if row.get("impact")]
+    assert len(hit) == 1 and hit[0]["impact_decel_mps2"] == 98.0, hit
+    i_hit = int(hit[0]["i"])
+    stalled = [row for row in rows if row.get("stall")]
+    assert stalled and min(int(r["i"]) for r in stalled) == i_hit, [r["i"] for r in stalled]
+    # The impact is about 2 s of stall before the respawn, not 10 s.
+    assert len(stalled) <= int(IMPACT_STALL_S / 0.1) + 2, len(stalled)
+    rec = [row for row in rows if row.get("recover")]
+    assert len(rec) == 1
+    i_rec = int(rec[0]["i"])
+    settled = [int(row["i"]) for row in rows if row.get("settle")]
+    # 3 s of 0.1 s rows; the float clock may let one more row in.
+    assert settled[0] == i_rec and len(settled) - int(round(SETTLE_FLAG_S / 0.1)) in (0, 1), settled
+    assert settled == list(range(i_rec, i_rec + len(settled)))
+    assert not any(row.get("settle") for row in rows if int(row["i"]) < i_rec)
+    assert all(row["ego"].get("up") == [0.0, 0.0, 1.0] for row in rows)
+    events = [json.loads(line) for line in (out / "impacts.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [e["kind"] for e in events] == ["impact", "impact_end"], events
+    ev, end = events
+    assert ev["i"] == i_hit and abs(ev["t"] - hit[0]["t"]) < 1e-9, (ev, hit[0])
+    pre = [row for row in rows if row["i"] == ev["pre_i0"]]
+    assert pre and abs(pre[0]["t"] - ev["pre_t0"]) < 1e-9
+    assert i_hit - ev["pre_i0"] == int(round(PRE_IMPACT_S / 0.1)), ev
+    assert end["how"] == "respawn" and end["t"] >= ev["t"]
+    print(f"collector impact rows ok impact i={i_hit} pre_i0={ev['pre_i0']} recover i={i_rec} settle={len(settled)} rows")
+
+
+def check_weave_guard_runs() -> None:
+    """No paint on this mocked level, so the guard keeps the weave from starting."""
+    code, text, out = _run_collector({"speed_at": lambda n: 10.0, "stop_at": 260}, ["--weave-guard"])
+    assert code == 0, (code, text)
+    assert "collect gate current#0 weave blocked paint_ahead" in text, text[-3000:]
+    assert "excursion=weave" not in text
+    code, text, out = _run_collector({"speed_at": lambda n: 10.0, "stop_at": 260}, [])
+    assert code == 0, (code, text)
+    assert "excursion=weave" in text, text[-3000:]  # without the flag the weave is unchanged
+    assert "line end" not in text
+    # Painted everywhere: the guard lets the weave start, then ends it before
+    # the 60 m line runs out (5.5 s at 10 m/s) instead of after the 12 s weave.
+    import scripts.collect_scene_lanes as collect
+
+    previous = collect.painted_for
+    collect.painted_for = lambda level: _Paint(lambda x, y: True)  # type: ignore[assignment]
+    try:
+        code, text, out = _run_collector({"speed_at": lambda n: 10.0, "stop_at": 300}, ["--weave-guard"])
+    finally:
+        collect.painted_for = previous  # type: ignore[assignment]
+    assert code == 0, (code, text)
+    assert "collect gate current#0 weave open" in text, text[-3000:]
+    assert "collect excursion current#0 weave line end, back to lane" in text, text[-3000:]
+    after = text.split("line end, back to lane", 1)[1]
+    assert "excursion=abort" in after, after[:400]
+    rows = [json.loads(line) for line in (out / "state.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+    weave_rows = [row for row in rows if (row.get("excursion") or {}).get("phase") == "weave"]
+    assert weave_rows and 50 <= len(weave_rows) <= 58, len(weave_rows)
+    print(f"weave guard: unpainted weave blocked, off by default, line end after {len(weave_rows)} rows")
+
+
+def _rows(out: Path) -> list[dict]:
+    return [json.loads(line) for line in (out / "state.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def check_impact_on_an_abort_tick_names_a_row() -> None:
+    """The crash tick also aborts on damage, so it writes no row; the impact
+    still names the last written row (rec3 had two ``i: null`` events)."""
+    code, text, out = _run_collector({"damage_at": lambda n: 0.0 if n <= 40 else 1000.0}, ["--no-excursions"])
+    assert code == 0, (code, text)
+    assert "collect impact current#0 decel=98.0" in text and "collect abort damage" in text, text[-2000:]
+    rows = _rows(out)
+    events = [json.loads(line) for line in (out / "impacts.jsonl").read_text(encoding="utf-8").splitlines()]
+    hits = [e for e in events if e["kind"] == "impact"]
+    assert len(hits) == 1, events
+    ev = hits[0]
+    assert isinstance(ev["i"], int) and ev["i_row"] == "previous", ev
+    by_i = {int(r["i"]): r for r in rows}
+    assert ev["i"] in by_i, ev
+    # The mocked loop runs faster than the wall clock, so go by index: the
+    # named row is the one right before the recover row that follows the abort.
+    i_rec = min(int(r["i"]) for r in rows if r.get("recover"))
+    assert ev["i"] == i_rec - 1, (ev, i_rec)
+    assert not any(r.get("impact") for r in rows)  # the impact tick itself has no row
+    assert ev["pre_i0"] in by_i and ev["pre_i0"] < ev["i"]
+    # The normal path still names the impact row itself.
+    code, text, out = _run_collector({}, ["--no-excursions"])
+    ev2 = [json.loads(line) for line in (out / "impacts.jsonl").read_text(encoding="utf-8").splitlines()][0]
+    row = [r for r in _rows(out) if r.get("impact")][0]
+    assert ev2["i"] == row["i"] and ev2["i_row"] == "impact", (ev2, row["i"])
+    print(f"impact on an abort tick -> i={ev['i']} (previous row), normal impact -> its own row i={ev2['i']}")
+
+
+def check_yield_guard() -> None:
+    off = YieldGuard(0.0)
+    assert not off.enabled and not any(off.update(0.1, 10.0, False, False) for _ in range(2000))
+    g = YieldGuard(0.25)
+    fired = [n for n in range(1, 700) if g.update(0.1, 10.0, False, False)]
+    assert fired and fired[0] in (600, 601), fired[:3]  # a full 60 s of moving rows first
+    # Settle rows, stopped rows and a missing speed are not counted.
+    g = YieldGuard(0.25)
+    assert not any(g.update(0.1, 10.0, False, True) for _ in range(1000))
+    assert not any(g.update(0.1, 0.5, False, False) for _ in range(1000))
+    assert not any(g.update(0.1, None, False, False) for _ in range(1000))
+    assert g.moving_s == 0.0
+    # A long tick is credited at most 0.5 s.
+    g.update(5.0, 10.0, False, False)
+    assert abs(g.moving_s - 0.5) < 1e-9
+    # 30% valid stays; 20% valid cuts.
+    for share, cuts in ((3, False), (2, True)):
+        g = YieldGuard(0.25)
+        fire = [g.update(0.1, 10.0, (n % 10) < share, False) for n in range(800)]
+        assert any(fire) is cuts, (share, g.rate)
+    # Cut empties the window; three cuts in a row pause it until a healthy window.
+    g = YieldGuard(0.25)
+    for k in range(LIVE_YIELD_MAX_CUTS):
+        n = 0
+        while not g.update(0.1, 10.0, False, False):
+            n += 1
+            assert n < 700
+        assert n + 1 in (600, 601), n
+        g.cut()
+        assert g.moving_s == 0.0 and g.in_a_row == k + 1
+    assert g.paused and g.total_cuts == LIVE_YIELD_MAX_CUTS
+    assert not any(g.update(0.1, 10.0, False, False) for _ in range(2000))
+    assert not any(g.update(0.1, 10.0, True, False) for _ in range(600))
+    assert not g.paused and g.in_a_row == 0
+    assert any(g.update(0.1, 10.0, False, False) for _ in range(700))
+    # Reset (a spawn) empties the window without counting a cut.
+    g = YieldGuard(0.25)
+    for _ in range(590):
+        g.update(0.1, 10.0, False, False)
+    g.reset()
+    assert not any(g.update(0.1, 10.0, False, False) for _ in range(590)) and g.total_cuts == 0
+    import scripts.collect_scene_lanes as collect
+
+    assert collect.low_yield_plan(True, 500.0, 100.0, 0.0) == ("respawn", 0.0)
+    assert collect.low_yield_plan(False, None, 100.0, 0.0) == ("keep", 0.0)
+    assert collect.low_yield_plan(False, 720.0, 100.0, 20.0) == ("segment_end", 620.0)
+    tech = {"lane_gt_valid": [1.0, 1.0, 1.0, 0.0, 1.0, 1.0] + [1.0] * 8}
+    assert collect.label_valid_at(tech, 5.0) and not collect.label_valid_at(tech, 10.0)
+    assert not collect.label_valid_at({}, 10.0)
+    print("yield guard: off at 0, 60 s window, settle/stopped ignored, pauses after 3 cuts, re-arms")
+
+
+def check_yield_guard_runs() -> None:
+    """Unpainted mock level: the guard logs 3 cuts with position and roads, then
+    pauses. Every row is kept. Off by default; painted everywhere, no cut."""
+    args = {"speed_at": lambda n: 10.0, "stop_at": 2600}
+    code, text, out = _run_collector(args, ["--no-excursions", "--min-live-yield", "0.25"])
+    assert code == 0, (code, text[-2000:])
+    lines = [line for line in text.splitlines() if line.startswith("collect low_yield current#0")]
+    assert len(lines) == LIVE_YIELD_MAX_CUTS, lines
+    assert all("valid10=0.00 < 0.25 over 60s moving pos=(0.4,12.0,0.5) road=r spawn_road=na" in s for s in lines), lines
+    assert all(s.endswith("-> keep") for s in lines), lines  # no deck and no map rotation here
+    assert "collect low_yield paused after 3 cuts in a row" in text
+    cuts = [json.loads(line) for line in (out / "cuts.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [c["kind"] for c in cuts] == ["low_yield"] * LIVE_YIELD_MAX_CUTS
+    rows = _rows(out)
+    ids = [int(r["i"]) for r in rows]
+    assert ids == list(range(len(ids))), "rows were dropped"
+    assert all(c["i"] in ids and c["road"] == "r" and c["pos"] == [0.4, 12.0, 0.5] and c["action"] == "keep" for c in cuts), cuts
+    gaps = [b["done_s"] - a["done_s"] for a, b in zip(cuts, cuts[1:])]
+    assert all(59.0 <= g <= 61.5 for g in gaps), gaps
+    status = json.loads((out / "collect.json").read_text(encoding="utf-8"))
+    assert status.get("live_yield", {}).get("cuts") == LIVE_YIELD_MAX_CUTS, status
+    code, text_off, out_off = _run_collector(args, ["--no-excursions"])
+    assert code == 0 and "low_yield" not in text_off and not (out_off / "cuts.jsonl").exists()
+    assert len(_rows(out_off)) == len(rows), (len(_rows(out_off)), len(rows))
+    import scripts.collect_scene_lanes as collect
+
+    previous = collect.painted_for
+    collect.painted_for = lambda level: _Paint(lambda x, y: True)  # type: ignore[assignment]
+    try:
+        code, text_ok, out_ok = _run_collector(args, ["--no-excursions", "--min-live-yield", "0.25"])
+    finally:
+        collect.painted_for = previous  # type: ignore[assignment]
+    assert code == 0 and "low_yield" not in text_ok, text_ok[-1500:]
+    print(f"yield guard run: {len(lines)} cuts 60 s apart then paused, {len(rows)} rows kept, off by default")
+
+
+def main() -> None:
+    check_coverage_walks_ahead()
+    check_short_probe_is_not_full_coverage()
+    check_deck_skips_and_logs()
+    check_deck_disabled_is_unchanged()
+    check_deck_fallback_and_next_kind()
+    check_real_west_coast_if_present()
+    check_impact_watch()
+    check_settle_window()
+    check_tip_rules()
+    check_weave_guard_helpers()
+    check_paint_share_slot_order()
+    check_spawn_mix_summary()
+    check_damage_and_up_are_read()
+    check_collector_impact_rows()
+    check_impact_on_an_abort_tick_names_a_row()
+    check_yield_guard()
+    check_yield_guard_runs()
+    check_weave_guard_runs()
+    print("collect spawn fix ok")
+
+
+if __name__ == "__main__":
+    main()

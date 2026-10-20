@@ -574,6 +574,28 @@ def gate_reason(
     return "open"
 
 
+def fork_ahead_m(
+    roads: list[RoadPoly],
+    hit: object,
+    x: float,
+    y: float,
+    heading: float | None,
+    distance_m: float = WINDOW_M,
+) -> float | None:
+    """Distance to the first side road on this road's continuation, or None.
+
+    The same walk ``gate_reason`` uses. The weave gate ignores it; the
+    collector's ``--weave-guard`` does not.
+    """
+    if hit is None or not roads:
+        return None
+    road = _road_of(roads, hit)
+    if road is None:
+        return None
+    _length, fork_at, _span_h = _span(roads, road, x, y, heading, distance_m)
+    return None if fork_at is None else float(fork_at)
+
+
 def route_is_open(
     roads: list[RoadPoly],
     hit: object,

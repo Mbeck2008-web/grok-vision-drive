@@ -21,6 +21,15 @@ LOOKAHEADS_M = (5.0, 10.0, 20.0, 30.0)
 LIVE_LANE_Y_M = 8.0
 # Per lookahead: center, left, right. Then heading error. Then confidence.
 LANE_GT_DIM = len(LOOKAHEADS_M) * 3 + 2
+# Offsets inside one lookahead's triple, the same in lane_gt and lane_gt_valid.
+SLOT_CENTER = 0
+SLOT_LEFT = 1
+SLOT_RIGHT = 2
+
+
+def lookahead_slot(k: int, part: int = SLOT_CENTER) -> int:
+    """Index of ``part`` (SLOT_CENTER/LEFT/RIGHT) for lookahead ``k`` in a lane_gt vector."""
+    return 3 * int(k) + int(part)
 
 
 def lookahead_xs(

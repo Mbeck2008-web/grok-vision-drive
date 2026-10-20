@@ -1188,6 +1188,8 @@ def _eval_sequence(
     """
     import torch
 
+    # LATERAL FRAME: gt and prediction are both in the label file's frame (tech.gt_origin):
+    # ref node for v102 and earlier, body centreline for v103. The metric is frame-agnostic.
     from python.debug.lane_targets import lane_center_is_valid, lane_gt_from_record, lane_x_from_vector
 
     chunked = int(reset_every) > 0

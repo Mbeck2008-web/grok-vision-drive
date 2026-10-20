@@ -1,0 +1,16 @@
+// excerpt of vehicles/etk800/etk800_body_sedan.jbeam (BeamNG.tech 0.39): refNodes and the nodes it names
+{"etk800_body_sedan": {
+    "refNodes":[
+        ["ref:", "back:", "left:", "up:", "leftCorner:", "rightCorner:"],
+        ["f2r", "f3r", "f2l", "f7r", "f15ll", "f15rr"],
+    ],
+"nodes":[
+["id", "posX", "posY", "posZ"],
+         ["f2r",  -0.33,  -0.23,   0.23],
+         ["f2l",   0.33,  -0.23,   0.23],
+         ["f3r",  -0.33,   0.30,   0.23],
+         ["f7r",  -0.33,  -0.23,   0.43],
+         ["f15rr",-0.75,  -1.74,   0.81],
+         ["f15ll", 0.75,  -1.74,   0.81],
+]
+}}

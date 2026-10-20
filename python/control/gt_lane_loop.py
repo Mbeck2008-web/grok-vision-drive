@@ -177,6 +177,7 @@ def run_gt_lane(
             cmd = DriveCommand(steer=0.0, throttle=0.0, brake=1.0, reason="gt_lane_missing")
             steer_state.reset()
         else:
+            # LATERAL FRAME: offset is the nav-road offset of the state pos (ref node).
             lane_x = ego_center_x(offset, heading_err, LOOKAHEAD_M)
             path = straight_lane_path(lane_x)
             geometric = path_steer_from_ego(path)

@@ -59,6 +59,7 @@ def _centers(rows: list[dict]) -> list[float]:
     out = []
     for row in rows:
         tech = row.get("tech") if isinstance(row.get("tech"), dict) else row
+        # LATERAL FRAME: the label file's own frame (tech.gt_origin); frame-agnostic metric.
         values, _mask = lane_gt_from_record(tech)
         center = lane_x_from_vector(values)
         out.append(float("nan") if center is None else float(center))

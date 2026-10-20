@@ -38,9 +38,12 @@ def loader_settings(workers: int, *, cuda: bool) -> dict[str, int | bool]:
     }
 
 
-def load_canvas(root: Path | str, index: int):
-    """Stitch this tick. A text-mode PNG is read from ``raw_repaired``."""
-    return load_training_bgr(root, index)
+def load_canvas(root: Path | str, index: int, *, allow_lossy: bool = False):
+    """Stitch this tick. A text-mode PNG is read from ``raw_repaired``.
+
+    JPEG ``strips/`` are refused unless ``allow_lossy`` (eval only).
+    """
+    return load_training_bgr(root, index, allow_lossy=allow_lossy)
 
 
 def _stamp(value: object) -> float | None:

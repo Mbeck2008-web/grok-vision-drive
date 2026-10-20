@@ -679,11 +679,33 @@ def load_raw_cameras(root: Path | str, index: int) -> dict[str, np.ndarray]:
     return frames
 
 
-def load_training_bgr(root: Path | str, index: int) -> np.ndarray:
+class LossyFramesError(RuntimeError):
+    """The folder has no ``raw/`` tree, only lossy ``strips/*.jpg``."""
+
+
+def lossy_only(root: Path | str) -> bool:
+    """True when ``root`` has ``strips/`` but no ``raw/``: frames would be JPEG."""
+    root = Path(root)
+    return not (root / "raw").is_dir() and (root / "strips").is_dir()
+
+
+def refuse_lossy(root: Path | str, *, what: str = "training") -> None:
+    """Raise ``LossyFramesError`` when ``root`` only has lossy JPEG strips."""
+    if lossy_only(root):
+        raise LossyFramesError(
+            f"{root} has no raw/ folder, only lossy strips/*.jpg. {what} reads lossless "
+            f"raw/<cam>/NNNNNN.png (or .npy) frames and refuses JPEG. "
+            f"Only eval_scene_lanes --allow-lossy-eval reads the JPEG strips, for an eval."
+        )
+
+
+def load_training_bgr(root: Path | str, index: int, *, allow_lossy: bool = False) -> np.ndarray:
     """Stitch and resize at load time. The files on disk stay as saved.
 
     A recording that has ``raw/`` never falls through to ``strips/*.jpg``.
-    Legacy strips are only for a folder that has no raw tree.
+    A folder with only legacy ``strips/*.jpg`` raises ``LossyFramesError``
+    unless ``allow_lossy`` (eval_scene_lanes ``--allow-lossy-eval``, or the
+    dataset checker) asks for the JPEG.
     """
     root = Path(root)
     raw = root / "raw"
@@ -697,6 +719,8 @@ def load_training_bgr(root: Path | str, index: int) -> np.ndarray:
     strips = root / "strips"
     if not strips.is_dir():
         raise FileNotFoundError(f"no raw frames and no strips under {root}")
+    if not allow_lossy:
+        refuse_lossy(root)
     import cv2
 
     from python.data.strip_writer import CANVAS_H, CANVAS_W

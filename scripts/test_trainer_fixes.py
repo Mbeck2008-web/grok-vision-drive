@@ -406,6 +406,102 @@ def check_backbone_pool_and_lr() -> None:
     print("backbone pool/lr: 4x8 pool == adaptive_avg_pool2d, vertical position survives, lr_mult 1.0 -> one rate, 0.5 kept through pinning OK")
 
 
+def check_event_mask() -> None:
+    """--mask-events: impact windows by time t (not i), settle and stall flags."""
+    import json as _json
+
+    from python.train.event_mask import event_mask, mask_event_rows
+
+    rows = [{"i": k, "t": 100.0 + 0.1 * k, "segment": "wc#0"} for k in range(200)]
+    rows += [{"i": 200 + k, "t": 200.0 + 0.1 * k, "segment": "wc#1"} for k in range(50)]
+    rows[30]["settle"] = True
+    rows[31]["stall"] = True
+    rows[31]["stall_s"] = 0.4
+    impacts = [
+        # i_row="previous": i points at row 2, far before the window. Only t counts.
+        {"kind": "impact", "t": 106.0, "i": 2, "i_row": "previous", "pre_t0": 105.0, "segment": "wc#0"},
+        {"kind": "impact_end", "t": 107.5, "how": "respawn", "segment": "wc#0"},
+        # i is null and no end line yet: masks to the end of its segment, not into wc#1.
+        {"kind": "impact", "t": 118.0, "i": None, "pre_t0": 117.0, "segment": "wc#0"},
+    ]
+    mask, counts = event_mask(rows, impacts)
+    masked_t = [r["t"] for r, m in zip(rows, mask) if m]
+    assert not mask[2], "row i=2 is outside the window even though the impact names i=2"
+    assert all(mask[k] for k in range(50, 76)) and not mask[49] and not mask[76]
+    assert all(mask[k] for k in range(170, 200)) and not any(mask[200:])
+    assert mask[30] and mask[31] and not mask[29]
+    assert counts["settle"] == 1 and counts["stall"] == 1 and counts["impact_spans"] == 2 and counts["impact_open"] == 1
+    assert counts["masked"] == len(masked_t) == counts["impact"] + 2
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        with open(root / "impacts.jsonl", "w", encoding="utf-8") as fh:
+            for item in impacts:
+                fh.write(_json.dumps(item) + "\n")
+            fh.write('{"kind": "impact", "t": 1')  # half-written last line of a live recording
+        kept, file_counts = mask_event_rows(root, rows)
+        assert file_counts == counts and len(kept) == len(rows) - counts["masked"]
+        kept_none, none_counts = mask_event_rows(Path(tmp) / "missing", rows)
+        assert none_counts["impact"] == 0 and len(kept_none) == len(rows) - 2
+    print(f"event mask: impact window by t (i_row=previous / i=null ignored), open impact to segment end, settle+stall; masked {counts['masked']}/{len(rows)} OK")
+
+
+def check_lossy_refused() -> None:
+    """Training refuses JPEG strips/ when there is no raw/; only eval may opt in."""
+    import cv2
+
+    from python.data.raw_frames import LossyFramesError, load_training_bgr
+    from python.data.strip_writer import CANVAS_H, CANVAS_W
+    from python.train import train_scene
+    from scripts import eval_scene_lanes
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "jpeg_only"
+        (root / "strips").mkdir(parents=True)
+        ok, buf = cv2.imencode(".jpg", np.full((CANVAS_H, CANVAS_W, 3), 90, np.uint8))
+        assert ok
+        for k in range(6):
+            (root / "strips" / f"{k:06d}.jpg").write_bytes(buf.tobytes())
+        (root / "state.jsonl").write_text(
+            "".join(f'{{"i": {k}, "t": {k * 0.1}, "dt_s": 0.1}}\n' for k in range(6)), encoding="utf-8"
+        )
+        try:
+            load_training_bgr(root, 0)
+        except LossyFramesError as exc:
+            assert "raw/" in str(exc) and "--allow-lossy-eval" in str(exc)
+        else:
+            raise AssertionError("JPEG strips were loaded for training")
+        assert load_training_bgr(root, 0, allow_lossy=True).shape == (CANVAS_H, CANVAS_W, 3)
+        try:
+            train_scene._load_bgr(root, 0)
+        except LossyFramesError:
+            pass
+        else:
+            raise AssertionError("train_scene._load_bgr read JPEG")
+        try:
+            train_scene.train_directory(root, epochs=1, lr=1e-3, capability=None, export_path=None,
+                                        open_panel=False, autostart=True, dry_run=True)
+        except LossyFramesError:
+            pass
+        else:
+            raise AssertionError("train_directory accepted a JPEG-only folder")
+        import contextlib
+        import io
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                train_scene.build_parser().parse_args(["--strips", str(root), "--allow-lossy-eval"])
+            except SystemExit:
+                pass
+            else:
+                raise AssertionError("train_scene must not accept --allow-lossy-eval")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                code = eval_scene_lanes.main(["--strips", str(root)])
+        assert code == 2 and "no raw/" in err.getvalue(), (code, err.getvalue())
+        assert eval_scene_lanes.build_parser().parse_args(["--strips", str(root), "--allow-lossy-eval"]).allow_lossy_eval
+    print("lossy: JPEG-only folder refused by load_training_bgr/_load_bgr/train_directory; train_scene has no --allow-lossy-eval; eval needs it OK")
+
+
 def check_real(root: Path) -> None:
     from python.data.raw_frames import load_scene_rows
     from python.train.scene_loader import select_training_rows
@@ -436,6 +532,8 @@ def main() -> None:
     check_backbone()
     check_near_black()
     check_backbone_pool_and_lr()
+    check_event_mask()
+    check_lossy_refused()
     if args.real:
         check_real(Path(args.real))
     print("test_trainer_fixes: all OK")

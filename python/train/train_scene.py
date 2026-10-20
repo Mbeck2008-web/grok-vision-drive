@@ -1,6 +1,8 @@
 """Train the scene net from a strip directory.
 
-Reads ``meta.json``, ``strips/*.jpg``, and ``state.jsonl``. Each step uses the
+Reads ``state.jsonl`` and the lossless ``raw/<cam>/NNNNNN.png`` camera frames
+(``raw/`` is required: a folder with only lossy ``strips/*.jpg`` is refused).
+Each step uses the
 recorded seconds since the previous strip. The GRU state carries across
 overlapping chunks of one recording and clears on a gap or a new recording.
 Backprop stops at the chunk. It does not run through the 15 second carry.
@@ -30,6 +32,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from python.data.raw_frames import LossyFramesError  # noqa: E402
 from python.data.strip_writer import CANVAS_H, CANVAS_W  # noqa: E402
 from python.train.continual import (  # noqa: E402
     CHUNK_MAX,
@@ -125,7 +128,7 @@ def _maybe_jitter(frame: Any, augment: bool, rng: np.random.RandomState | None) 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train the GVD scene net from recorded strips")
-    parser.add_argument("--strips", type=str, default="", help="Directory with meta.json, strips/, state.jsonl")
+    parser.add_argument("--strips", type=str, default="", help="Recording directory with state.jsonl and raw/<cam>/ frames. JPEG strips/ are refused.")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument(
@@ -303,6 +306,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--mask-events",
+        action="store_true",
+        help=(
+            "Leave out rows inside an impacts.jsonl window [pre_t0, impact_end] (matched by time t) "
+            "and rows the collector flagged settle or stall. Off by default."
+        ),
+    )
+    parser.add_argument(
         "--backbone-lr-mult",
         type=float,
         default=1.0,
@@ -365,15 +376,16 @@ def resolve_panel(*, no_panel: bool, autostart: bool) -> tuple[bool, bool]:
 DRY_RUN_TIMEOUT_S = 300.0
 
 
-def _load_bgr(root: Path, index: int) -> Any:
+def _load_bgr(root: Path, index: int, *, allow_lossy: bool = False) -> Any:
     """Training canvas. Raw cameras are stitched here, not in the recording.
 
     A PNG that does not decode is read from ``raw_repaired`` when that copy
-    exists. The original file is left as it was written.
+    exists. The original file is left as it was written. JPEG ``strips/``
+    raise ``LossyFramesError``; only eval_scene_lanes passes ``allow_lossy``.
     """
     from python.train.scene_loader import load_canvas
 
-    return load_canvas(root, index)
+    return load_canvas(root, index, allow_lossy=allow_lossy)
 
 
 def arm_dry_run_watchdog(timeout_s: float = DRY_RUN_TIMEOUT_S) -> None:
@@ -1542,6 +1554,7 @@ def train_directory(
     backbone: str = "scratch",
     freeze_backbone: bool = False,
     backbone_lr_mult: float = 1.0,
+    mask_events: bool = False,
 ) -> dict[str, Any]:
     import torch
 
@@ -1560,6 +1573,9 @@ def train_directory(
     from python.train.scene_loader import default_num_workers, select_training_rows
 
     print("[GVD] scene index: reading state.jsonl", flush=True)
+    from python.data.raw_frames import refuse_lossy
+
+    refuse_lossy(root)
     state_rows = load_scene_rows(root)
     print(f"[GVD] scene index: {len(state_rows)} state rows", flush=True)
     print("[GVD] scene index: measuring frames", flush=True)
@@ -1580,6 +1596,12 @@ def train_directory(
         f"trained camera ({','.join(train_cams or ()) or 'all'}; main required when trained)",
         flush=True,
     )
+    if mask_events:
+        from python.train.event_mask import describe, mask_event_rows
+
+        before = len(rows)
+        rows, event_counts = mask_event_rows(root, rows)
+        print(f"[GVD] mask-events: {describe(event_counts, before)}", flush=True)
     blank_scan = count_near_black_main(rows, cache, train_cams, input_scale)
     near_rule = (
         f"mean<{NEAR_BLACK_MEAN} or >{NEAR_BLACK_FRAC:.0%} of px below {NEAR_BLACK_LEVEL}/255"
@@ -2566,9 +2588,13 @@ def main(argv: list[str] | None = None) -> None:
             backbone=str(args.backbone),
             freeze_backbone=bool(args.freeze_backbone),
             backbone_lr_mult=float(args.backbone_lr_mult),
+            mask_events=bool(args.mask_events),
         )
     except TrainFitError as exc:
         print(f"[GVD] scene train: {exc}")
+        sys.exit(2)
+    except LossyFramesError as exc:
+        print(f"[GVD] scene train: {exc}", flush=True)
         sys.exit(2)
     if args.sanity and not args.dry_run and not stats.get("sanity_ok"):
         print("[GVD] sanity failed: lane_gt loss did not fall below 0.05", flush=True)

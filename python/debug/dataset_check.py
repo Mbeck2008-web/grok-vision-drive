@@ -288,7 +288,8 @@ def _validate_raw(
     for idx, values in montage_rows:
         dest = out / f"montage_{idx:06d}.png"
         try:
-            canvas = load_training_bgr(root, idx)
+            # The checker inspects legacy JPEG strips too; it does not train.
+            canvas = load_training_bgr(root, idx, allow_lossy=True)
         except (FileNotFoundError, ValueError):
             canvas = None
         if _draw_canvas(dest, canvas, values, f"i={idx} gt lanes"):

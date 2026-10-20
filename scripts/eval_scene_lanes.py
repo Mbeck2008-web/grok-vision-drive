@@ -38,6 +38,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--out", type=Path, default=None, help="CSV and PNG directory. Default: <data>/eval")
     parser.add_argument("--worst", type=int, default=8, help="How many worst frames to save.")
+    parser.add_argument(
+        "--allow-lossy-eval",
+        action="store_true",
+        help=(
+            "Read legacy strips/*.jpg when the folder has no raw/. JPEG is lossy: an eval only. "
+            "train_scene has no such flag."
+        ),
+    )
     return parser
 
 
@@ -59,6 +67,14 @@ def _centers(rows: list[dict]) -> list[float]:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    from python.data.raw_frames import LossyFramesError, refuse_lossy
+
+    if not args.check_targets and not args.allow_lossy_eval:
+        try:
+            refuse_lossy(args.strips, what="eval")
+        except LossyFramesError as exc:
+            print(f"eval: {exc}", file=sys.stderr)
+            return 2
     rows = _rows(args.strips)
     if len(rows) < 5:
         print(f"eval: {args.strips} has {len(rows)} rows", file=sys.stderr)
@@ -110,7 +126,7 @@ def main(argv: list[str] | None = None) -> int:
     from python.train.train_scene import _load_bgr
 
     for row in hold:
-        image = _load_bgr(args.strips, int(row["i"]))
+        image = _load_bgr(args.strips, int(row["i"]), allow_lossy=bool(args.allow_lossy_eval))
         dt = row.get("dt_s")
         with torch.no_grad():
             out, hidden = net(image, 0.0 if dt is None else float(dt), hidden)

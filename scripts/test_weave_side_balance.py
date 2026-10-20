@@ -21,9 +21,10 @@ startup, recover, segment and respawn (rec5b 46 R / 0 L, rec5c 109 R / 0 L).
 * end lines: in a mocked collector run every started weave, on each side,
   logs exactly one ``collect excursion <seg> weave end <reason> side=L|R``
   (timeout, line_end; stop when the run stops inside a weave, error when it
-  exits on an exception inside one); no ``weave abort line_end`` /
-  ``weave abort timeout``; per side started == completed + sum(aborted), and
-  a stop is in collect.json.
+  exits on an exception inside one, smoke_failed when the smoke check fails
+  inside one); no ``weave abort line_end`` / ``weave abort timeout``; per side
+  started == completed + sum(aborted) in collect.json for code-0 runs (a stop
+  is in it) and in memory for every run.
 """
 from __future__ import annotations
 
@@ -245,12 +246,15 @@ def check_stats() -> list[str]:
     return ["weave_stats.sides: started / completed / refused / aborted per side"]
 
 
-def _collector_run(stop_at: int, extra: list[str], raise_in_weave: int | None = None) -> tuple[str, dict | None, dict]:
+def _collector_run(stop_at: int, extra: list[str], raise_in_weave: int | None = None,
+                   smoke_issue: bool = False) -> tuple[str, dict | None, dict, int]:
     """The mocked collector run of test_collect_spawn_fix, painted everywhere, on a 3 km straight.
 
     Gives the log, collect.json ``weave_stats.sides`` and the run's in-memory ``weave_stats.sides``.
     ``raise_in_weave=n``: the n-th overspeed check of a driving excursion raises, so the run exits on an
-    exception inside a weave (collect.main re-raises it; it is caught here)."""
+    exception inside a weave (collect.main re-raises it; it is caught here). ``smoke_issue``: the smoke
+    check fails at --smoke-s and the run exits 5 (in this harness the writer is not drained in time;
+    decode_issues is also patched to report an issue)."""
     import python.collect.excursion as excursion
     from scripts import test_collect_spawn_fix as fix
 
@@ -279,22 +283,25 @@ def _collector_run(stop_at: int, extra: list[str], raise_in_weave: int | None = 
             caught.append(exc)
             return -1
 
-    previous = (collect.painted_for, excursion.WeaveStats, excursion.overspeed, collect.main)
+    previous = (collect.painted_for, excursion.WeaveStats, excursion.overspeed, collect.main, collect.decode_issues)
+    if smoke_issue:
+        collect.decode_issues = lambda root: ["mocked decode issue"]  # type: ignore[assignment]
     collect.painted_for = lambda level: fix._Paint(lambda x, y: True)  # type: ignore[assignment]
     excursion.WeaveStats, excursion.overspeed, collect.main = _Stats, _overspeed, _main  # type: ignore[misc]
     try:
         code, text, out = fix._run_collector({"speed_at": lambda n: 10.0, "stop_at": stop_at, "x": 1.75}, extra,
                                              roads=[RoadPoly("r", [(0.0, 0.0), (0.0, 3000.0)], 7.0)])
     finally:
-        collect.painted_for, excursion.WeaveStats, excursion.overspeed, collect.main = previous  # type: ignore[misc]
-    if raise_in_weave is None:
-        assert code == 0 and not caught, (code, caught, text[-3000:])
-    else:
+        (collect.painted_for, excursion.WeaveStats, excursion.overspeed, collect.main,
+         collect.decode_issues) = previous  # type: ignore[misc]
+    if raise_in_weave is not None:
         assert code == -1 and len(caught) == 1, (code, caught, text[-3000:])
+    else:
+        assert code == (5 if smoke_issue else 0) and not caught, (code, caught, text[-3000:])
     assert len(made) == 1, made
     saved = json.loads((out / "collect.json").read_text(encoding="utf-8"))
     sides = (saved.get("weave_stats") or {}).get("sides")  # none if the run never reached a save with stats
-    return text, sides, made[0].summary()["sides"]
+    return text, sides, made[0].summary()["sides"], code
 
 
 def _balanced(sides: dict) -> None:
@@ -310,38 +317,47 @@ def check_one_end_line_per_weave() -> list[str]:
     assert 'f"collect excursion {segment_id} {clock.phase} abort overspeed "' in src  # unchanged
     # Without --weave-guard the weaves run WEAVE_S (timeout) and the stop file lands inside the third:
     # it ends as `stop` in the log and in collect.json. With --weave-guard each line ends (line_end) and
-    # the run stops in cruise. The last run raises inside its first weave: `error`, log and in-memory
-    # stats (an exception exit has no final collect.json save).
-    runs = (("stop mid-weave", 900, [], None, {"timeout", "stop"}),
-            ("--weave-guard", 1300, ["--weave-guard"], None, {"line_end"}),
-            ("exception mid-weave", 260, [], 20, {"error"}))
-    for label, stop_at, extra, raise_in_weave, reasons in runs:
-        text, sides, live = _collector_run(stop_at, extra, raise_in_weave)
+    # the run stops in cruise. A smoke check that fails at 25 s (inside the first weave, 20-32 s) ends it
+    # as `smoke_failed`; a run that raises inside its first weave ends it as `error`. Neither exit saves
+    # collect.json, so for non-zero exits the end lines are checked from the log against the in-memory
+    # stats, and the per-side collect.json invariant only for code-0 runs.
+    runs = (("stop mid-weave", 900, [], None, False, {"timeout", "stop"}),
+            # 1250: the 4th weave ends near row 1100 and the 5th would start near 1300 (1300 was on the edge).
+            ("--weave-guard", 1250, ["--weave-guard"], None, False, {"line_end"}),
+            ("smoke check fails mid-weave", 900, ["--smoke-s", "25"], None, True, {"smoke_failed"}),
+            ("exception mid-weave", 260, [], 20, False, {"error"}))
+    for label, stop_at, extra, raise_in_weave, smoke_issue, reasons in runs:
+        text, sides, live, code = _collector_run(stop_at, extra, raise_in_weave, smoke_issue)
         assert not re.search(r"weave abort (line_end|timeout)", text), text[-3000:]
         ends = re.findall(r"^collect excursion \S+ weave end (\S+) side=([LR])$", text, flags=re.M)
         starts = re.findall(r"^collect weave \S+ v_plan=.* side=([LR])$", text, flags=re.M)
         assert {why for why, _s in ends} == reasons, ends
-        assert raise_in_weave is not None or sides is not None, label
         _balanced(live)
-        stats = live if raise_in_weave is not None else sides
-        if raise_in_weave is None:
+        if code == 0:
+            assert sides is not None, label
             _balanced(sides)
             assert sides == live, (sides, live)
         got = {}
         for name, letter in (("left", "L"), ("right", "R")):
             n_end = sum(1 for _why, s in ends if s == letter)
-            n_start = stats[name]["started"]
+            n_start = live[name]["started"]
             assert n_end == n_start == starts.count(letter), (name, n_end, n_start, starts, ends)
-            for why in ("stop", "error"):  # the log's stop / error ends are in the stats too
-                assert stats[name]["aborted"].get(why, 0) == sum(1 for w, s in ends if s == letter and w == why), \
-                    (name, why, stats, ends)
+            for why in ("stop", "error", "smoke_failed"):  # these log ends are in the stats too
+                assert live[name]["aborted"].get(why, 0) == sum(1 for w, s in ends if s == letter and w == why), \
+                    (name, why, live, ends)
             got[name] = n_start
-        if raise_in_weave is None:
+        if code == 0:
             assert got["left"] >= 1 and got["right"] >= 1, got
         else:
-            assert got == {"left": 0, "right": 1} and "Traceback" not in text, (got, text[-2000:])
-        out.append(f"end lines, {label}: started L {got['left']} / R {got['right']}, one 'weave end' each "
-                   f"({', '.join(sorted(reasons))}), started == completed + aborted per side")
+            # The one weave open at the exit: exactly one end line, with the exit's reason, no `stop`.
+            assert got == {"left": 0, "right": 1} and ends == [(next(iter(reasons)), "R")], (got, ends)
+            assert "Traceback" not in text, text[-2000:]
+        if smoke_issue:
+            # Either smoke exit (writer not drained, or the mocked decode issue): both end the weave the same way.
+            assert re.search(r"^collect smoke failed \[", text, flags=re.M), text[-2000:]
+        out.append(f"end lines, {label} (code {code}): started L {got['left']} / R {got['right']}, one 'weave end' "
+                   f"each ({', '.join(sorted(reasons))}), started == completed + aborted per side "
+                   f"({'collect.json and in memory' if code == 0 else 'in memory; ends from the log'})")
     return out
 
 

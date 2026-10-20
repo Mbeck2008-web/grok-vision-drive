@@ -3076,11 +3076,13 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             if not smoke_ok and done_s >= float(args.smoke_s):
                 if not writer.wait_empty(30.0):
                     print("collect smoke failed ['writer did not finish']", flush=True)
+                    _end_open_weave("smoke_failed")  # no save on this exit
                     run.stop("smoke_failed", "writer did not finish")
                     return 5
                 issues = decode_issues(out)
                 if issues:
                     print(f"collect smoke failed {issues}", flush=True)
+                    _end_open_weave("smoke_failed")  # no save on this exit
                     run.stop("smoke_failed", str(issues))
                     return 5
                 hz_now = _hz()
@@ -3135,7 +3137,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         return 0
     finally:
         if weave_open is not None:
-            # Still open: an exception (no final save, as before) or an exit with no save.
+            # Still open: the run is exiting on an exception (no final save, as before).
             end_why = "error" if sys.exc_info()[0] is not None else "stop"
             weave_stats.weave_end(weave_open[1], end_why)
             print(f"collect excursion {weave_open[2]} weave end {end_why} "

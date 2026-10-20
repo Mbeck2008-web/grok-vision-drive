@@ -63,11 +63,14 @@ from python.train.fit import (  # noqa: E402
 )
 from python.train.scene_net import (  # noqa: E402
     OUTPUT_FIELDS,
+    LaneGtCoverage,
     ScenePrediction,
     SceneState,
     checkpoint_arch,
     default_onnx_path,
     export_scene_onnx,
+    has_lane_gt,
+    head_names,
     labels_for_row,
     loss_mask,
     precision_for_capability,
@@ -1059,6 +1062,7 @@ def _optimizer_step(
     head_acc = {key: 0.0 for key in LOSS_TERMS}
     nan_n = 0
     inf_n = 0
+    lane_gt_rows = 0
     stride_mark: SceneState | None = None
     step_at = max(1, int(stride))
     for tick, row in enumerate(rows):
@@ -1084,8 +1088,10 @@ def _optimizer_step(
             pred, state = net.forward_batch(image, dt, state)
         if loss_mask(row):
             one = _prediction_at(pred, 0)
+            labels = labels_for_row(row)
+            lane_gt_rows += int(has_lane_gt(labels))
             step = scene_loss(
-                one, _as_target(labels_for_row(row), device), heads, lane_loss=lane_loss, conf_weight=conf_weight
+                one, _as_target(labels, device), heads, lane_loss=lane_loss, conf_weight=conf_weight
             )
             if trace is not None and trace.get("print_shapes") and not trace.get("shapes_printed"):
                 _print_step_shapes(image, one, step, state)
@@ -1118,6 +1124,7 @@ def _optimizer_step(
                     "inf": inf_n,
                     "step_s": time.perf_counter() - started,
                     "lane_gt": None,
+                    "lane_gt_rows": lane_gt_rows,
                 }
             )
         return None, 0, carry, end_state
@@ -1149,6 +1156,7 @@ def _optimizer_step(
                 "inf": inf_n,
                 "step_s": time.perf_counter() - started,
                 "lane_gt": heads.get("lane_gt"),
+                "lane_gt_rows": lane_gt_rows,
             }
         )
     return float(loss.detach().item()), n_loss, carry, end_state
@@ -1195,6 +1203,7 @@ def _optimizer_group(
     head_acc = {key: 0.0 for key in LOSS_TERMS}
     nan_n = 0
     inf_n = 0
+    lane_gt_rows = 0
     blank = None
     presets = list(frame_sets) if frame_sets is not None else [None] * width
     for tick in range(length):
@@ -1232,8 +1241,10 @@ def _optimizer_group(
             if row is None or not loss_mask(row):
                 continue
             one = _prediction_at(pred, b)
+            labels = labels_for_row(row)
+            lane_gt_rows += int(has_lane_gt(labels))
             step = scene_loss(
-                one, _as_target(labels_for_row(row), device), heads, lane_loss=lane_loss, conf_weight=conf_weight
+                one, _as_target(labels, device), heads, lane_loss=lane_loss, conf_weight=conf_weight
             )
             value = step["total"]
             item_loss = float(value.detach().item())
@@ -1260,6 +1271,7 @@ def _optimizer_group(
                     "inf": inf_n,
                     "step_s": time.perf_counter() - started,
                     "lane_gt": None,
+                    "lane_gt_rows": lane_gt_rows,
                 }
             )
         return None, 0, end_state, end_state
@@ -1291,6 +1303,7 @@ def _optimizer_group(
                 "inf": inf_n,
                 "step_s": time.perf_counter() - started,
                 "lane_gt": head_mean.get("lane_gt"),
+                "lane_gt_rows": lane_gt_rows,
             }
         )
     return float(loss.detach().item()), n_loss, end_state, end_state
@@ -2358,16 +2371,26 @@ def train_directory(
         history: list[float] = []
         best_value: float | None = None
         best_blob: dict[str, Any] | None = None
+        lane_gt_seen = LaneGtCoverage("lane_gt" in head_names(train_heads))
+        filter_logged = False
         while not paused_exit:
             refit = False
-            from python.train.continual import epoch_windows
+            lane_gt_seen.reset()
+            from python.train.continual import epoch_windows, report_valid_filter
 
+            filter_stats: dict[str, Any] = {}
             plan_steps = epoch_windows(
                 pass_plan(rows, chunk_len, stride, blocks=int(holdout_blocks), cells=cell_spec),
                 window_rng,
                 min_valid=float(min_valid),
                 balance=bool(balance),
+                stats=filter_stats,
+                recording=root.name or str(root),
             )
+            # Log what --min-valid removed (first epoch, or whenever a whole
+            # recording goes); a recording with no train window left raises.
+            report_valid_filter(filter_stats, epoch=int(epoch), quiet=filter_logged)
+            filter_logged = True
             windows = sum(1 for item in plan_steps if item["kind"] == "train")
             carry: SceneState | None = None
             end_state: SceneState | None = None
@@ -2540,6 +2563,8 @@ def train_directory(
                     continue
                 if step_loss is not None:
                     last_loss = step_loss
+                if n_sup:
+                    lane_gt_seen.note(int(step_trace.get("lane_gt_rows") or 0) > 0)
                 supervised += n_sup
                 cursor += len(group)
                 done += len(group)
@@ -2587,6 +2612,10 @@ def train_directory(
                 continue
             if paused_exit:
                 break
+            # Log the epoch's share of batches without a lane_gt target; all of
+            # them missing with the lane_gt head on raises LaneGtMissingError.
+            # Windows planned but zero lane_gt steps taken raises as well.
+            lane_gt_seen.close_epoch(epoch, planned=windows)
             if hold_n <= 0:
                 break
             mean = hold_sum / hold_n

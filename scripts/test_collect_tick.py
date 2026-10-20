@@ -24,6 +24,8 @@ from python.debug.gt_geom import RoadPoly  # noqa: E402
 
 
 class _Vehicle:
+    model = "etk800"  # no get_bbox: the collector logs the etk800 width
+
     def __init__(self, stop: Path) -> None:
         self.stop = stop
         self.commands: list[str] = []

@@ -48,6 +48,7 @@ from python.control.override import (
     config_mirror,
     load_override_config,
 )
+from python.control.echo_link import MIN_MOD_VERSION, STATUS_OUTDATED, EchoGate, outdated_message
 from python.data.record import ClipRecorder, choose_encoder
 from python.perception.pipeline import ModularPerception
 from python.perception.stitch360 import stitch_frames
@@ -64,8 +65,9 @@ from python.debug.gt_geom import heading_from_dir
 from python.debug.gt_logger import GroundTruthLogger, gt_log_enabled
 from python.viz.review_log import ReviewCapture
 from python.viz.nerd import image_point_from_window_mouse
-from python.train.scene_net import live_strip_fields
-from python.train.scene_lane_runtime import SCENE_SHAPE_HOLD
+# scene_live, not scene_net / scene_lane_runtime: those import torch at load (~0.8 s), and
+# the supervisor only needs torch-free helpers here. The scene runtime is imported lazily below.
+from python.train.scene_live import SCENE_SHAPE_HOLD, live_strip_fields
 from python.viz.stage import drawn_lane_records
 from python.sensors.cameras import CAM_IDS, CamHealth, bundle_tick_frames
 from python.runtime.debug_opts import apply_to_command, apply_to_perception
@@ -446,6 +448,10 @@ def main() -> None:
     shadow_cfg = load_shadow_config(_ctrl_yaml)
     override_cfg = load_override_config(_ctrl_yaml)
     override = OverrideDetector(override_cfg)
+    # Retail echo freshness: the filter only eats new echoes; a frozen or pre-contract echo
+    # disengages / refuses instead of reading as "no override".
+    echo_gate = EchoGate()
+    echo_fault_prev: str | None = None
 
     allow_nvenc = args.encode == "nvenc"
     if args.encode == "nvenc":
@@ -888,6 +894,30 @@ def main() -> None:
             # we just sent. own_axes keeps the pedal residual, and the steer baseline follows
             # the resting wheel when the command changes, instead of the absolute player_* path.
             owns_axes = getattr(actuator, "name", "") == "beamngpy"
+            # Retail cmd_json bus: the wheel only reaches us through the mod's 10 Hz echo, so
+            # only a fresh echo is a new sample. BeamNGpy polls electrics itself every tick.
+            echo_bus = vehicle is None and not owns_axes
+            echo = echo_gate.observe(engaged=bool(engaged) and echo_bus, ego_fb=ego_fb, now=time.monotonic())
+            echo_fault = echo.fault if engaged else None
+            if echo_fault:
+                # Link fault (echo frozen while engaged) or a mod too old to stamp its echo.
+                # Same disengage path a player override takes; the brake hold is unchanged.
+                engaged = False
+                disengage_reason = echo_fault
+                bot_engage.clear()
+                write_engage_flag(False, disengage_reason=echo_fault)
+                cmd = stop_command(seq=cmd_seq, reason=echo_fault)
+                if echo_fault != echo_fault_prev:
+                    if echo.status == STATUS_OUTDATED:
+                        print(f"[GVD] REFUSE ENGAGE: {outdated_message(ego_fb)}", flush=True)
+                    else:
+                        why = (
+                            f"no new electrics echo for {echo.since_ms:.0f} ms"
+                            if echo.since_ms > 0.0
+                            else "every recent echo arrived after a gap"
+                        )
+                        print(f"[GVD] DISENGAGED: {echo_fault} ({why})", flush=True)
+            echo_fault_prev = echo_fault
             if owns_axes:
                 ovr_steer, ovr_thr, ovr_brk, ovr_dev = steer_in, throttle_in, brake_in, False
             elif ego_fb is not None and ego_fb.fresh and ego_fb.player_device:
@@ -906,6 +936,8 @@ def main() -> None:
                 applied_seq=None if owns_axes else (
                     ego_fb.applied_seq if ego_fb is not None and ego_fb.fresh else None
                 ),
+                fresh=echo.fresh if echo_bus else True,
+                gap=echo.gap if echo_bus else False,
             )
             if ovr.active and not ui.debug.ignore_override:
                 engaged = False
@@ -1187,7 +1219,12 @@ def main() -> None:
                 "opposition": ovr.opposition,
                 "ref_seq": ovr.ref_seq,
                 "armed": bool(ovr.armed),
+                "fresh": bool(ovr.fresh),
+                "gap_hold": bool(ovr.gap_hold),
             }
+            st["echo"] = {**echo.telemetry(), "min_mod_version": MIN_MOD_VERSION}
+            if echo.status == STATUS_OUTDATED:
+                st["echo"]["message"] = outdated_message(ego_fb)
             st["shadow"] = {
                 "steer": float(tick.shadow.get("steer", 0.0)),
                 "throttle": float(tick.shadow.get("throttle", 0.0)),
@@ -1232,9 +1269,11 @@ def main() -> None:
             # Soft Esc: gvd_state.json at most once per Lua pollEvery (0.10).
             # Max rewrite rate. A loop already slower than 100 ms writes at
             # the loop rate, so heartbeat age tracks the loop.
-            # Engage writes every tick. The rising edge flushes this tick.
+            # Engage writes every tick. The rising edge flushes this tick, and so
+            # does the falling edge: the disengage reason is on that tick only.
             rising_engage = bool(engaged) and not prev_engaged
-            state_due = soft_esc_state_write_due(bool(engaged), rising=rising_engage)
+            falling_engage = prev_engaged and not bool(engaged)
+            state_due = soft_esc_state_write_due(bool(engaged), rising=rising_engage, falling=falling_engage)
             prev_engaged = bool(engaged)
             state_skips = soft_esc_state_write_skips()
             rel_skips = int(getattr(actuator, "release_cmd_skips", 0) or 0)

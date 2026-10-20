@@ -181,7 +181,7 @@ def straight_lane_path(lane_x: float, *, length_m: float = 36.0, step_m: float =
     return path
 
 
-SCENE_SHAPE_HOLD = "scene_hold:input_shape"
+from python.train.scene_live import SCENE_SHAPE_HOLD  # noqa: E402,F401  (one string, shared with run_vision)
 
 
 class SceneLaneGuard:

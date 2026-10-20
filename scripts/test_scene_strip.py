@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 import math
 import sys
 import tempfile
@@ -17,6 +18,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from gvd_test_env import skip_check  # noqa: E402
 
 from python.data.strip_writer import (  # noqa: E402
     CANVAS_H,
@@ -414,7 +416,7 @@ def check_net_cpu() -> None:
     try:
         import torch
     except ImportError:
-        print("scene net: skipped (torch missing)")
+        skip_check("net_cpu", "torch missing")
         return
     from python.train.scene_net import SceneNet
 
@@ -1271,6 +1273,7 @@ def check_parameter_count_hand_sum() -> None:
         assert shown == real and approximate is False
     else:
         # No tensors. The real net is the same layer rules as the tiny net.
+        skip_check("parameter_count_modules", "torch missing (counted without modules only)")
         shown, approximate = scene_parameter_count()
         assert approximate is True
         assert shown == architecture_parameter_count()
@@ -1477,6 +1480,8 @@ def check_pause_checkpoint_roundtrip() -> None:
         )
         assert float(fresh_net.weight.detach().reshape(-1)[0]) == 1.25
         assert float(fresh_net.bias.detach().reshape(-1)[0]) == -0.5
+    else:
+        skip_check("pause_checkpoint_apply_weights", "torch missing")
 
 
 def _hand_keep(dts: list[float], span_s: float = RESIDUAL_S) -> int:
@@ -1612,7 +1617,7 @@ def check_continual_bptt_and_yaw() -> None:
     report = overlap_gradient_cut()
     if report is None:
         assert torch_ready() is False
-        print("overlap gradient: skipped (torch missing)")
+        skip_check("overlap_gradient", "torch missing")
     else:
         assert report["overlap"] is True
         assert report["earlier_reached"] is False
@@ -1642,15 +1647,19 @@ def check_continual_bptt_and_yaw() -> None:
 
 
 def _readme_offline_ok(text: str) -> bool:
-    """The trainer stays offline on this README and on a 1.7.9 README.
+    """The README documents an offline trainer, for any pinned version.
 
-    The 1.7.8 heading is not required. A pin of 1.7.9 is enough.
+    It names the rule that the trainer leaves BeamNG alone, the 2272 px strip,
+    the free-VRAM batch fit and the not-recommended CPU path, and it states a
+    `VERSION` pin. A version bump must not break this check.
     """
     if "Soft Esc parked" not in text:
         return False
     if "2272" not in text or "free VRAM" not in text or "not recommended" not in text:
         return False
-    return ("1.7.8" in text) or ("1.7.9" in text)
+    if "The trainer does not start or stop it." not in text:
+        return False
+    return re.search(r"\(`VERSION` \d+\.\d+\.\d+\)", text) is not None
 
 
 def check_live_strip_supervision() -> None:
@@ -1752,10 +1761,9 @@ def check_trainer_is_offline() -> None:
     assert "step_dt" in text
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert _readme_offline_ok(readme)
-    # Main pins 1.7.9. That README has no 1.7.8 heading, and this check allows it.
-    later = readme.replace("## Alpha 1.7.8", "## Alpha 1.7.9").replace("1.7.8", "1.7.9")
-    assert "## Alpha 1.7.8" not in later
-    assert "1.7.9" in later
+    # A version bump keeps the check green.
+    later = re.sub(r"\(`VERSION` \d+\.\d+\.\d+\)", "(`VERSION` 9.9.9)", readme)
+    assert later != readme and "(`VERSION` 9.9.9)" in later
     assert _readme_offline_ok(later)
 
 

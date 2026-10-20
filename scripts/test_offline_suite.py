@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-"""The offline runner skips Windows-only and BeamNG-dependent scripts cleanly."""
+"""The offline runner skips Windows-only and BeamNG-dependent scripts cleanly.
+
+A check skipped inside a passing script (``gvd_test_env.skip_check``) is
+returned to the runner and counted, not folded into a plain pass.
+"""
 from __future__ import annotations
 
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -10,6 +15,43 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import run_offline_suite as suite  # noqa: E402
+
+
+def check_skip_tally() -> None:
+    """skip_check lines reach the runner; a script that skips nothing reports none."""
+    with tempfile.TemporaryDirectory() as tmp:
+        skipper = Path(tmp) / "skipper.py"
+        skipper.write_text(
+            "import sys\n"
+            f"sys.path.insert(0, {str(ROOT / 'scripts')!r})\n"
+            "from gvd_test_env import skip_check\n"
+            "skip_check('needs_gpu', 'no gpu here')\n"
+            "skip_check('needs_torch', 'torch missing')\n",
+            encoding="utf-8",
+        )
+        plain = Path(tmp) / "plain.py"
+        plain.write_text("print('nothing skipped')\n", encoding="utf-8")
+        status, code, skips = suite._run([sys.executable, str(skipper)], "skipper.py")
+        assert (status, code) == ("pass", 0), (status, code)
+        assert skips == [
+            "SKIP-CHECK skipper.py needs_gpu: no gpu here",
+            "SKIP-CHECK skipper.py needs_torch: torch missing",
+        ], skips
+        status, code, skips = suite._run([sys.executable, str(plain)], "plain.py")
+        assert (status, code, skips) == ("pass", 0, []), (status, code, skips)
+    print("skip tally: in-script skips are returned to the runner OK")
+
+
+def check_thread_env() -> None:
+    """Each test process gets one OpenMP / MKL thread unless the caller chose a count."""
+    from gvd_test_env import THREAD_ENV, isolated_env
+
+    with tempfile.TemporaryDirectory() as tmp:
+        env = isolated_env({"PATH": "/bin"}, Path(tmp) / "a")
+        assert all(env[name] == "1" for name in THREAD_ENV), env
+        env = isolated_env({"PATH": "/bin", "OMP_NUM_THREADS": "4"}, Path(tmp) / "b")
+        assert env["OMP_NUM_THREADS"] == "4" and env["MKL_NUM_THREADS"] == "1", env
+    print("thread env: one OpenMP / MKL thread per test unless set OK")
 
 
 def main() -> None:
@@ -45,6 +87,8 @@ def main() -> None:
     finally:
         fake_win.unlink(missing_ok=True)
         fake_bng.unlink(missing_ok=True)
+    check_skip_tally()
+    check_thread_env()
     print("test_offline_suite: OK")
 
 

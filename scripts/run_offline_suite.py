@@ -8,9 +8,23 @@ cannot run on this host is skipped, and the skip is printed:
 * ``# gvd-ci: requires beamng`` — skipped unless BeamNG.drive or BeamNG.tech
   is installed (a ``tech.key`` beside a Tech executable, or a Steam
   ``BeamNG.drive`` install). ``beamngpy`` on ``PYTHONPATH`` is not enough.
+* ``# gvd-ci: requires torch`` — skipped unless this interpreter can import
+  ``torch``. Only for a script with nothing to check without it; a script
+  with torch-free parts skips those parts itself with
+  ``gvd_test_env.skip_check``.
+
+A check skipped inside a script (``skip_check``) is listed at the end and
+counted on the summary line, so "passed" never hides a check that did not run.
 
 Lua scripts need ``lua5.1`` (then ``lua``). A missing interpreter fails the
 suite; it is not a skip.
+
+Each script runs with its own temp HOME / USERPROFILE / APPDATA /
+LOCALAPPDATA / TMPDIR / TORCH_HOME (``gvd_test_env``), removed afterwards,
+so GVD bus files (``gvd_state.json``, ``gvd_cmd.json``,
+``gvd_strip_record.json``, ...) cannot leak from one test into the next or
+into the real home. A script that leaves files in its torch hub folder
+(downloaded weights) fails.
 """
 from __future__ import annotations
 
@@ -18,12 +32,17 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+
+from gvd_test_env import SKIP_LOG_ENV, isolated_env, read_skips, torch_hub_files  # noqa: E402
 MARKER_WINDOWS = "gvd-ci: requires windows"
 MARKER_BEAMNG = "gvd-ci: requires beamng"
+MARKER_TORCH = "gvd-ci: requires torch"
 TIMEOUT_S = 300
 
 
@@ -70,11 +89,19 @@ def _beamng_installed() -> bool:
     return False
 
 
+def _torch_installed() -> bool:
+    import importlib.util
+
+    return importlib.util.find_spec("torch") is not None
+
+
 def _skip_reason(path: Path) -> str | None:
     if _has_directive(path, MARKER_WINDOWS) and sys.platform != "win32":
         return "windows-only (marker); this host is not Windows"
     if _has_directive(path, MARKER_BEAMNG) and not _beamng_installed():
         return "BeamNG-dependent (marker); BeamNG is not installed"
+    if _has_directive(path, MARKER_TORCH) and not _torch_installed():
+        return "torch-dependent (marker); torch is not installed"
     return None
 
 
@@ -86,25 +113,39 @@ def _lua_exe() -> str | None:
     return None
 
 
-def _run(cmd: list[str], label: str) -> tuple[str, int]:
-    env = dict(os.environ)
-    env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
-    env.setdefault("PYTHONUNBUFFERED", "1")
+def _run(cmd: list[str], label: str) -> tuple[str, int, list[str]]:
+    """Run one script isolated. Returns status, exit code, and the checks it skipped."""
+    scratch = Path(tempfile.mkdtemp(prefix="gvd-suite-"))
+    skips: list[str] = []
     try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(ROOT),
-            env=env,
-            timeout=TIMEOUT_S,
-        )
-    except subprocess.TimeoutExpired:
-        print(f"FAIL {label}: timed out after {TIMEOUT_S}s", flush=True)
-        return "fail", 1
+        env = isolated_env(os.environ, scratch)
+        skip_log = scratch / "skipped_checks.txt"
+        env[SKIP_LOG_ENV] = str(skip_log)
+        env["PYTHONPATH"] = str(ROOT) + os.pathsep + os.environ.get("PYTHONPATH", "")
+        env.setdefault("PYTHONUNBUFFERED", "1")
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(ROOT),
+                env=env,
+                timeout=TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"FAIL {label}: timed out after {TIMEOUT_S}s", flush=True)
+            return "fail", 1, read_skips(skip_log)
+        downloaded = torch_hub_files(env)
+        skips = read_skips(skip_log)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    if downloaded:
+        print(f"FAIL {label}: downloaded weights into the torch hub: {', '.join(downloaded[:5])}", flush=True)
+        return "fail", 1, skips
     if proc.returncode == 0:
-        print(f"PASS {label}", flush=True)
-        return "pass", 0
+        note = f" ({len(skips)} check(s) skipped)" if skips else ""
+        print(f"PASS {label}{note}", flush=True)
+        return "pass", 0, skips
     print(f"FAIL {label}: exit {proc.returncode}", flush=True)
-    return "fail", proc.returncode
+    return "fail", proc.returncode, skips
 
 
 def main() -> None:
@@ -116,6 +157,7 @@ def main() -> None:
     passed = 0
     failed = 0
     skipped = 0
+    check_skips: list[str] = []
     lua = _lua_exe()
 
     for path in py_tests:
@@ -124,7 +166,8 @@ def main() -> None:
             skipped += 1
             print(f"SKIP {path.name}: {reason}", flush=True)
             continue
-        status, _ = _run([sys.executable, str(path)], path.name)
+        status, _, skips = _run([sys.executable, str(path)], path.name)
+        check_skips.extend(skips)
         if status == "pass":
             passed += 1
         else:
@@ -140,14 +183,18 @@ def main() -> None:
                 skipped += 1
                 print(f"SKIP {path.name}: {reason}", flush=True)
                 continue
-            status, _ = _run([lua, str(path)], path.name)
+            status, _, skips = _run([lua, str(path)], path.name)
+            check_skips.extend(skips)
             if status == "pass":
                 passed += 1
             else:
                 failed += 1
 
+    for line in check_skips:
+        print(line, flush=True)
     print(
-        f"run_offline_suite: {passed} passed, {failed} failed, {skipped} skipped",
+        f"run_offline_suite: {passed} passed, {failed} failed, {skipped} skipped"
+        f" (+{len(check_skips)} checks skipped inside scripts)",
         flush=True,
     )
     if failed:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import json
 import os
 import re
@@ -25,7 +26,9 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import make_release_zip as rel  # noqa: E402
+from gvd_test_env import isolated_home  # noqa: E402
 from python.control.actuate import (  # noqa: E402
+    ENGAGE_FRESH_S,
     CmdJsonActuator,
     DriveCommand,
     cmd_path,
@@ -203,6 +206,74 @@ def check_window_picker_prefers_drive() -> None:
     assert _pick_best_beamng_rect([tiny, drive]) == (10, 10, 1280, 720)
 
 
+class _FakeClock:
+    """A wall clock only the test moves. ``now`` is what ``time.time()`` returns in GVD's
+    actuate / paths / state_io modules while ``fake_clock`` is active."""
+
+    def __init__(self, start: float) -> None:
+        self.now = float(start)
+
+    def advance(self, seconds: float) -> float:
+        self.now += float(seconds)
+        return self.now
+
+
+class _TimeProxy:
+    """Stands in for the ``time`` module: ``time()`` reads the fake clock, the rest is real."""
+
+    def __init__(self, clock: _FakeClock) -> None:
+        self._clock = clock
+
+    def time(self) -> float:
+        return self._clock.now
+
+    def __getattr__(self, name: str):
+        return getattr(time, name)
+
+
+_CLOCK: _FakeClock | None = None
+FAKE_CLOCK_START = 1_800_000_000.0
+
+
+@contextlib.contextmanager
+def fake_clock(start: float = FAKE_CLOCK_START):
+    """In-process checks judge freshness on a clock the test owns, not on how fast it runs.
+
+    Patches ``time`` in the modules that stamp and judge (engage flag, cmd heartbeat, ego
+    ack, lua_bus handshake), and the fake mod's files get their mtimes on the same clock
+    (``_stamp_file``). Only for checks that call GVD in-process; a spawned supervisor runs
+    on the real clock and is judged on its own stamps instead.
+    """
+    global _CLOCK
+    from python.control import actuate as _actuate
+    from python.runtime import paths as _paths
+    from python.runtime import state_io as _state_io
+
+    clock = _FakeClock(start)
+    saved = [(mod, mod.time) for mod in (_actuate, _paths, _state_io)]
+    for mod, _ in saved:
+        mod.time = _TimeProxy(clock)
+    _CLOCK = clock
+    try:
+        yield clock
+    finally:
+        for mod, real in saved:
+            mod.time = real
+        _CLOCK = None
+
+
+def _now() -> float:
+    return time.time() if _CLOCK is None else _CLOCK.now
+
+
+def _stamp_file(path: Path, age_s: float = 0.0) -> None:
+    """Under a fake clock a file the fake mod writes is stamped `age_s` before its now."""
+    if _CLOCK is None and not age_s:
+        return
+    t = _now() - float(age_s)
+    os.utime(path, (t, t))
+
+
 def _touch_lua_bus() -> Path:
     """Keep a fresh lua_bus handshake at the predicted pin so cmd tests can actuate."""
     from python.runtime import paths as gvd_paths
@@ -213,9 +284,30 @@ def _touch_lua_bus() -> Path:
     abs_pin.mkdir(parents=True, exist_ok=True)
     payload = json.dumps({"lua_bus": str(abs_pin)})
     (pin / "gvd_link.json").write_text(payload, encoding="utf-8")
+    _stamp_file(pin / "gvd_link.json")
     if abs_pin != pin:
         (abs_pin / "gvd_link.json").write_text(payload, encoding="utf-8")
+        _stamp_file(abs_pin / "gvd_link.json")
     return abs_pin
+
+
+# The fake mod plays gvd_main's meaning of echo_seq: its own counter, +1 per echo written
+# (`onEgoFeedback`), never the command seq it last applied (that is `applied_seq`).
+_FAKE_ECHO = {"k": 0}
+# What the current mod stamps as mod_version (M.MOD_VERSION in gvd_main).
+_MOD_VERSION = re.search(
+    r"M\.MOD_VERSION\s*=\s*'([^']+)'",
+    (ROOT / "beamng_mod" / "lua" / "ge" / "extensions" / "gvd" / "main.lua").read_text(encoding="utf-8"),
+).group(1)
+FAKE_ECHO_PERIOD_S = 0.1  # gvd_main EGO_POLL_S: the mod echoes at 10 Hz, whatever the loop does
+# Most run_vision may take to write its first gvd_cmd.json (imports, model load). Startup only:
+# the `seconds` a check asks for, and its timed windows, start when that first command lands.
+SUPERVISOR_STARTUP_S = 30.0
+
+
+def _next_echo_seq() -> int:
+    _FAKE_ECHO["k"] += 1
+    return _FAKE_ECHO["k"]
 
 
 def _write_ego(
@@ -227,30 +319,45 @@ def _write_ego(
     throttle_in: float = 0.0,
     brake_in: float = 0.0,
     age_s: float = 0.0,
+    echo_seq: int | None = None,
+    stamp_echo: bool = True,
+    mod_version: str | None = None,
 ) -> None:
+    """Play gvd_main's gvd_ego.json. `seq` is the command seq the mod last applied
+    (`applied_seq`). `echo_seq` is the mod's own echo counter: by default the next value of it,
+    one per call, whatever `seq` is. `stamp_echo=False` is a mod from before the echo_seq
+    contract (no echo_seq, no mod_version). `mod_version` defaults to the current mod's."""
     root = _touch_lua_bus()
-    ego_path().write_text(
-        json.dumps(
-            {
-                "speed_mps": speed,
-                "steering_input": steer_in,
-                "throttle_input": throttle_in,
-                "brake_input": brake_in,
-                "applied_seq": seq,
-                "applying": applying,
-                "mtime": int(time.time()),
-                "lua_bus": str(root),
-            }
-        ),
-        encoding="utf-8",
-    )
-    if age_s:
-        old = time.time() - age_s
-        os.utime(ego_path(), (old, old))
+    payload = {
+        "speed_mps": speed,
+        "steering_input": steer_in,
+        "throttle_input": throttle_in,
+        "brake_input": brake_in,
+        "applied_seq": seq,
+        "applying": applying,
+        "mtime": int(_now()),
+        "lua_bus": str(root),
+    }
+    if stamp_echo:
+        payload["echo_seq"] = _next_echo_seq() if echo_seq is None else int(echo_seq)
+        payload["mod_version"] = _MOD_VERSION if mod_version is None else mod_version
+    ego_path().write_text(json.dumps(payload), encoding="utf-8")
+    _stamp_file(ego_path(), age_s)
 
 
 def check_cmd_json_drive_bus() -> None:
-    """Retail actuator: engaged → real drive payload; disengaged → idle stop; applied only on Lua ack."""
+    """Retail actuator: engaged → real drive payload; disengaged → idle stop; applied only on Lua ack.
+
+    On the fake clock: every freshness verdict here (ack age, lua_bus handshake, heartbeat
+    stamp) is judged at a time the test sets, so a slow runner cannot age a fresh file.
+    """
+    with fake_clock() as clock:
+        _cmd_json_drive_bus(clock)
+
+
+def _cmd_json_drive_bus(clock: _FakeClock) -> None:
+    from python.control.actuate import EGO_FRESH_S
+
     _touch_lua_bus()
     if ego_path().exists():
         ego_path().unlink()
@@ -266,7 +373,7 @@ def check_cmd_json_drive_bus() -> None:
         "steer": 0.3, "throttle": 0.4, "brake": 0.0, "seq": 7, "engaged": True,
         "heartbeat_mtime": payload["heartbeat_mtime"], "reason": "ok",
     }, payload
-    assert time.time() - payload["heartbeat_mtime"] < 5.0
+    assert payload["heartbeat_mtime"] == clock.now, (payload["heartbeat_mtime"], clock.now)
     assert out.applied is False and out.reason == "cmd_json_pending", out
 
     # Lua echoes a fresh ack for that seq → applied.
@@ -288,6 +395,14 @@ def check_cmd_json_drive_bus() -> None:
     act.note_ack(read_ego_feedback())
     out = act.apply(DriveCommand(steer=0.0, throttle=0.1, brake=0.0, seq=4, reason="ok"))
     assert out.applied is False and out.reason == "cmd_json_pending", out
+
+    # The ack window's edge, on the fake clock: EGO_FRESH_S old is still fresh, past it is not.
+    _write_ego(9)
+    clock.advance(EGO_FRESH_S)
+    assert read_ego_feedback().fresh is True
+    clock.advance(0.01)
+    assert read_ego_feedback().fresh is False
+    _touch_lua_bus()
 
     # Stale ack (Lua stopped echoing) → not applied.
     _write_ego(9, age_s=5.0)
@@ -351,12 +466,50 @@ def _run_supervisor(
     steer_echo: Callable[[int], float] | None = None,
     brake_bias: float = 0.0,
     expect_disengage: str | None = None,
+    stamp_echo: bool = True,
+    freeze_echo_after_s: float | None = None,
+    on_engage_drop: Callable[[float], None] | None = None,
+    wheel_by_echo: Callable[[int], float] | None = None,
+    cmd_blind: tuple[float, float] | None = None,
+    mod_version: str | None = None,
+    clock: dict | None = None,
+    engage_heartbeat: bool = True,
 ) -> dict | None:
     """Run run_vision.py headless for `seconds`; optionally play the mod's ack role meanwhile.
 
+    The run's clock starts at this supervisor's first tick (its first gvd_cmd.json and
+    gvd_state.json, `t_ready`), not at spawn: imports (torch through the trainer modules) and
+    model load are startup, not the work under test. `seconds`, `cmd_blind` and
+    `freeze_echo_after_s` count from `t_ready` on time.monotonic(); wall time is only used to
+    compare with the stamps inside the files.
+    `clock`, when given, gets `t_spawn` and `t_ready` (wall time), and with
+    `freeze_echo_after_s` also `t_frozen`: when the mod wrote its last advancing echo.
+
+    Files from an earlier run never count. gvd_cmd.json and gvd_state.json are removed before
+    spawn, the fake mod only takes a command stamped after spawn, and the latch only takes an
+    engage file stamped after spawn. The latch prefers the snapshot whose gvd_state.json still
+    names `expect_disengage` (the refusal tick); assert on the returned snapshot, not on a later
+    read_state().
+
+    The fake mod echoes at 10 Hz (`FAKE_ECHO_PERIOD_S`, gvd_main `EGO_POLL_S`), not per command.
+    Each echo reads the newest command, acks its seq as `applied_seq`, and stamps `echo_seq`
+    from the mod's own counter, +1 per echo. The two are separate: `echo_seq` moves on with the
+    wheel readings, `applied_seq` with the commands.
+
+    Wheel models (pick one): `steer_echo(cmd_seq)` reports a wheel position keyed on the command
+    seq being acked; `wheel_by_echo(echo_seq)` keys it on the echo itself (per-sample FFB
+    chatter). `stamp_echo=False` plays a mod from before echo_seq. `freeze_echo_after_s` keeps
+    rewriting the last echo (fresh mtime, same echo_seq) from that point, a mod whose electrics
+    echo stopped. `cmd_blind=(t0, t1)` (seconds after start): commands stop reaching the mod in
+    that window (it keeps the last command and its seq) while its echoes keep advancing.
+    `on_engage_drop(t)` is called with the wall time the engage file was first seen false.
+    `engage_heartbeat=False` plays a mod whose Alt+G heartbeat stopped: gvd_engage.json keeps
+    the stamp it had, so it goes stale `ENGAGE_FRESH_S` later.
+
     The fake mod echoes back what it was told to apply, exactly like `gvd_main` does, so the
-    override residual is zero unless a test deliberately plays a driver: `steer_echo(seq)`
-    reports a wheel position instead of the commanded one, `brake_bias` adds a pedal press.
+    override residual is zero unless a test deliberately plays a driver: `steer_echo` /
+    `wheel_by_echo` report a wheel position instead of the commanded one, `brake_bias` adds a
+    pedal press.
 
     `expect_disengage` is a `player_*` reason. When set, SIGKILL waits for that reason on
     `gvd_engage.json` / `gvd_state.json` — not stdout. `cmd_applied` is already true a few
@@ -366,6 +519,15 @@ def _run_supervisor(
     args = [sys.executable, "-u", str(ROOT / "python" / "run_vision.py"), "--backend", "stub", "--hz", "20", "--encode", "cpu", *extra]
     env = dict(os.environ, PYTHONPATH=str(ROOT))
     _touch_lua_bus()
+    # A previous run's command / state must not be read as this run's (the mod would hold and
+    # echo an old command; the latch would take an old refusal).
+    for stale in (cmd_path(), state_path()):
+        try:
+            stale.unlink()
+        except FileNotFoundError:
+            pass
+    t_spawn = time.time()  # wall: compared with the files' own stamps
+    m_spawn = time.monotonic()  # monotonic: every deadline and window below
     # Never PIPE. A full pipe freezes the supervisor (engaged, cmd_json_pending), and
     # Windows TerminateProcess discards the child's unflushed stdout anyway.
     proc = subprocess.Popen(
@@ -376,28 +538,76 @@ def _run_supervisor(
         stderr=subprocess.DEVNULL,
     )
     latched: dict | None = None
+    loose: dict | None = None  # a matching snapshot whose state no longer names the reason
+    t_start = t_spawn  # replaced by t_ready once this supervisor's first tick lands
+    m_start = m_spawn
+    ready = False
+    frozen: dict | None = None
+    dropped = False
+    next_echo = 0.0
+    held_cmd: dict | None = None  # the last command the mod received
 
     def _ack_once() -> None:
+        nonlocal frozen, dropped, next_echo, held_cmd, ready
+        if on_engage_drop is not None and not dropped:
+            if _read_json(engage_path()).get("engaged") is False:
+                dropped = True
+                on_engage_drop(time.time())
         if not ack:
             return
-        try:
-            cmd = json.loads(cmd_path().read_text(encoding="utf-8"))
-            seq = int(cmd.get("seq", -1))
-        except Exception:
+        now = time.time()
+        mnow = time.monotonic()
+        if frozen is not None:
+            # Electrics echo stopped: the file keeps a fresh mtime, echo_seq does not move.
+            _write_ego(**frozen)
             return
-        if seq < 0:
+        if mnow < next_echo:
             return
-        _write_ego(
-            seq,
+        blind = ready and cmd_blind is not None and cmd_blind[0] <= mnow - m_start < cmd_blind[1]
+        if not blind or held_cmd is None:
+            try:
+                got = json.loads(cmd_path().read_text(encoding="utf-8"))
+                if int(got.get("seq", -1)) >= 0 and float(got.get("heartbeat_mtime") or 0.0) >= t_spawn - 0.5:
+                    held_cmd = got
+            except Exception:
+                pass
+        next_echo = max(next_echo + FAKE_ECHO_PERIOD_S, mnow + FAKE_ECHO_PERIOD_S / 2)
+        if held_cmd is None:
+            # The mod echoes at 10 Hz whether or not a command has arrived yet: the car's
+            # speed with nothing applied (applied_seq 0, not applying). The old harness only
+            # echoed once *a* gvd_cmd.json existed, so a previous run's file started it.
+            _write_ego(0, applying=False, speed=5.5, stamp_echo=stamp_echo, echo_seq=_next_echo_seq(),
+                       mod_version=mod_version)
+            return
+        cmd = held_cmd
+        seq = int(cmd.get("seq", -1))
+        k = _next_echo_seq()
+        if wheel_by_echo is not None:
+            steer_in = wheel_by_echo(k)
+        elif steer_echo is not None:
+            steer_in = steer_echo(seq)
+        else:
+            steer_in = float(cmd.get("steer", 0.0))
+        kw = dict(
+            seq=seq,
             applying=True,
             speed=5.5,
-            steer_in=steer_echo(seq) if steer_echo else float(cmd.get("steer", 0.0)),
+            steer_in=steer_in,
             throttle_in=float(cmd.get("throttle", 0.0)),
             brake_in=min(1.0, float(cmd.get("brake", 0.0)) + brake_bias),
+            stamp_echo=stamp_echo,
+            echo_seq=k,
+            mod_version=mod_version,
         )
+        _write_ego(**kw)
+        if ready and freeze_echo_after_s is not None and mnow - m_start >= freeze_echo_after_s:
+            frozen = kw
+            if clock is not None:
+                clock["t_frozen"] = now
 
     def _try_latch() -> bool:
-        nonlocal latched
+        """True once a snapshot of this run names the expected disengage on every surface."""
+        nonlocal latched, loose
         if not expect_disengage:
             return False
         eng = _read_json(engage_path())
@@ -405,23 +615,37 @@ def _run_supervisor(
         st = _read_json(state_path())
         if eng.get("engaged") is not False or eng.get("disengage_reason") != expect_disengage:
             return False
+        try:
+            if float(eng.get("mtime") or 0.0) < t_spawn:
+                return False  # an engage file from before this run
+        except (TypeError, ValueError):
+            return False
+        if not st or not cmd:
+            return False  # removed before spawn: this run has not written them yet
         if st.get("engaged") is not False:
             return False
         if cmd.get("engaged") is not False:
             return False
-        # Latch even if a later tick already rewrote state.disengage_reason to
-        # not_engaged — the engage file is the sticky record. Prefer a snapshot
-        # that still names player_* when we catch the override tick.
-        latched = {"engage": eng, "cmd": cmd, "state": st}
-        return True
+        snap = {"engage": eng, "cmd": cmd, "state": st}
+        ovr = st.get("override") if isinstance(st.get("override"), dict) else {}
+        if st.get("disengage_reason") == expect_disengage or ovr.get("reason") == expect_disengage:
+            latched = snap
+            return True
+        # A later tick already rewrote state.disengage_reason to not_engaged. The engage file
+        # is the sticky record, so keep this one in case the naming tick is never caught.
+        if loose is None:
+            loose = snap
+        return False
 
-    last_engage_hb = 0.0
+    last_engage_hb = -1e9
 
     def _touch_engage_heartbeat() -> None:
         """Stand in for Lua's engage-file heartbeat so a multi-second run stays latched."""
         nonlocal last_engage_hb
+        if not engage_heartbeat:
+            return
         now = time.time()
-        if now - last_engage_hb < 1.0:
+        if time.monotonic() - last_engage_hb < 1.0:
             return
         try:
             data = json.loads(engage_path().read_text(encoding="utf-8"))
@@ -437,12 +661,29 @@ def _run_supervisor(
             return
         again["mtime"] = now
         engage_path().write_text(json.dumps(again), encoding="utf-8")
-        last_engage_hb = now
+        last_engage_hb = time.monotonic()
 
-    t_end = time.time() + seconds
     try:
         _touch_lua_bus()
-        while time.time() < t_end:
+        # Startup: wait for this supervisor's first tick (its gvd_cmd.json and gvd_state.json;
+        # both were removed before spawn). Not part of `seconds`.
+        startup_end = m_spawn + SUPERVISOR_STARTUP_S
+        while not (cmd_path().exists() and state_path().exists()):
+            if proc.poll() is not None:
+                raise AssertionError(f"run_vision exited during startup ({proc.returncode})")
+            if time.monotonic() > startup_end:
+                raise AssertionError(f"run_vision wrote no gvd_cmd.json / gvd_state.json within {SUPERVISOR_STARTUP_S:.0f}s of spawn")
+            _touch_lua_bus()
+            _touch_engage_heartbeat()
+            _ack_once()
+            time.sleep(0.01)
+        t_start = time.time()
+        m_start = time.monotonic()
+        ready = True
+        if clock is not None:
+            clock.update({"t_spawn": t_spawn, "t_ready": t_start})
+        m_end = m_start + seconds
+        while time.monotonic() < m_end:
             if proc.poll() is not None:
                 raise AssertionError(f"run_vision exited early ({proc.returncode})")
             _touch_lua_bus()
@@ -456,8 +697,8 @@ def _run_supervisor(
         # cmd_applied=False / cmd_json_pending for check_run_vision_e2e.
         # Override runs must not stop on cmd_applied: that flips true before the dwell.
         grace = 1.5 if expect_disengage and latched is None else (0.5 if ack and expect_disengage is None else 0.0)
-        until = time.time() + grace
-        while time.time() < until:
+        until = time.monotonic() + grace
+        while time.monotonic() < until:
             if proc.poll() is not None:
                 break
             _touch_lua_bus()
@@ -479,7 +720,7 @@ def _run_supervisor(
             proc.wait(timeout=5)
         except Exception:
             pass
-    return latched
+    return latched if latched is not None else loose
 
 
 def check_run_vision_e2e() -> None:
@@ -596,16 +837,40 @@ def check_synthetic_lanes_drive() -> None:
     assert held.should_disengage is False
 
 
+def _engage_live_on_last_tick() -> tuple[bool, dict]:
+    """Was the Alt+G latch live on the supervisor's last tick?
+
+    Freshness is judged on that tick's own clock: ``heartbeat_mtime`` of the last
+    gvd_cmd.json it wrote, not the wall time when the test gets here. SIGKILL, the
+    wait and a loaded runner all sit between the two, and none of it is GVD's doing.
+    Returns the verdict and what it was judged on.
+    """
+    cmd = _read_json(cmd_path())
+    eng = _read_json(engage_path())
+    tick = float(cmd.get("heartbeat_mtime") or 0.0)
+    live = tick > 0.0 and read_engage_flag(default=False, now=tick)
+    return live, {
+        "engage": eng,
+        "age_at_last_tick_s": round(tick - float(eng.get("mtime") or 0.0), 3) if tick else None,
+        "fresh_s": ENGAGE_FRESH_S,
+        "cmd": {k: cmd.get(k) for k in ("seq", "engaged", "reason")},
+    }
+
+
 def check_ffb_override_live() -> None:
     """Whole loop with a wheel on the echo: chatter keeps driving, a real driver gets the car."""
     _touch_lua_bus()
     if ego_path().exists():
         ego_path().unlink()
 
-    # Force-feedback chatter — alternating kicks keyed off the seq so the sign flips every tick.
+    # Force-feedback chatter — alternating kicks, the sign flipping on every 10 Hz echo.
     write_engage_flag(True)
-    _run_supervisor(["--allow-preview-drive"], seconds=3.0, ack=True, steer_echo=lambda seq: 0.9 if seq % 2 else -0.9)
-    assert read_engage_flag(default=False) is True, "force-feedback chatter disengaged GVD"
+    # Keyed on the echo (one FFB sample each), not on the command seq the echo acks.
+    _run_supervisor(
+        ["--allow-preview-drive"], seconds=3.0, ack=True, wheel_by_echo=lambda k: 0.9 if k % 2 else -0.9
+    )
+    live, why = _engage_live_on_last_tick()
+    assert live is True, ("force-feedback chatter disengaged GVD (or the latch was stale on its last tick)", why)
     assert _read_json(engage_path()).get("disengage_reason") == "none"
     cmd = json.loads(cmd_path().read_text(encoding="utf-8"))
     assert cmd["engaged"] is True and cmd["reason"] == "ok", cmd
@@ -672,6 +937,152 @@ def check_ffb_override_live() -> None:
     ego_path().unlink()
 
 
+def check_ffb_stale_engage_heartbeat() -> None:
+    """The chatter check's latch test is load-bearing: a stale Alt+G heartbeat fails it.
+
+    Same 3 s chatter run as check_ffb_override_live, but the mod's engage heartbeat
+    stops, so gvd_engage.json stays engaged:true with the stamp written before spawn.
+    Nothing writes engaged:false; only freshness tells it apart from a live latch. The
+    supervisor must stop driving on it, and `_engage_live_on_last_tick` must say not live.
+    """
+    _touch_lua_bus()
+    if ego_path().exists():
+        ego_path().unlink()
+
+    # The clock the verdict uses is the one passed in: a stamp inside the window is
+    # live, one past ENGAGE_FRESH_S is not, whatever the wall time is now.
+    write_engage_flag(True)
+    stamp = float(_read_json(engage_path())["mtime"])
+    assert read_engage_flag(default=False, now=stamp + ENGAGE_FRESH_S - 0.1) is True
+    assert read_engage_flag(default=True, now=stamp + ENGAGE_FRESH_S + 0.1) is False
+    assert read_engage_flag(default=True, now=stamp - 1.5) is False  # far-future stamp
+
+    write_engage_flag(True)
+    _run_supervisor(
+        ["--allow-preview-drive"],
+        seconds=3.0,
+        ack=True,
+        wheel_by_echo=lambda k: 0.9 if k % 2 else -0.9,
+        engage_heartbeat=False,
+    )
+    live, why = _engage_live_on_last_tick()
+    eng = why["engage"]
+    # Still engaged:true on disk, nobody disengaged: only the stamp is old.
+    assert eng.get("engaged") is True and eng.get("disengage_reason") == "none", eng
+    assert why["age_at_last_tick_s"] is not None and why["age_at_last_tick_s"] > ENGAGE_FRESH_S, why
+    assert live is False, ("a stale engage heartbeat read as a live latch", why)
+    # The supervisor judged it the same way on that tick: it stopped driving.
+    assert why["cmd"]["engaged"] is False and why["cmd"]["reason"] == "not_engaged", why
+    print(f"stale engage heartbeat: age {why['age_at_last_tick_s']:.2f}s > {ENGAGE_FRESH_S}s at the last tick -> not live, not driving OK")
+
+
+def check_echo_outdated_refuses_engage() -> None:
+    """A mod without echo_seq cannot tell a repeat from a new sample: engage is refused, by name."""
+    _touch_lua_bus()
+    if ego_path().exists():
+        ego_path().unlink()
+    write_engage_flag(True)
+    snap = _run_supervisor(
+        ["--allow-preview-drive"],
+        seconds=3.0,
+        ack=True,
+        stamp_echo=False,
+        expect_disengage="lua_echo_outdated",
+    )
+    assert snap is not None, "an echo without echo_seq never refused engage"
+    assert read_engage_flag(default=True) is False, "an old mod must not keep GVD engaged"
+    assert snap["engage"].get("disengage_reason") == "lua_echo_outdated", snap["engage"]
+    assert snap["cmd"].get("engaged") is False, snap["cmd"]
+    # No silent fallback: nothing was judged on the old filter path while it was refused.
+    assert snap["state"].get("disengage_reason") in ("lua_echo_outdated", "not_engaged"), snap["state"]
+    write_engage_flag(False)
+    ego_path().unlink()
+
+
+def check_echo_stale_disengages() -> None:
+    """A frozen echo while engaged is a link fault (echo_stale), never 'no override'."""
+    _touch_lua_bus()
+    if ego_path().exists():
+        ego_path().unlink()
+    drop: list[float] = []
+    write_engage_flag(True)
+    freeze_at = 1.2
+    clock: dict = {}
+    snap = _run_supervisor(
+        ["--allow-preview-drive"],
+        seconds=3.5,
+        ack=True,
+        freeze_echo_after_s=freeze_at,
+        expect_disengage="echo_stale",
+        on_engage_drop=drop.append,
+        clock=clock,
+    )
+    assert snap is not None, "a frozen echo never disengaged with echo_stale"
+    assert snap["engage"].get("disengage_reason") == "echo_stale", snap["engage"]
+    assert snap["cmd"].get("engaged") is False, snap["cmd"]
+    assert read_engage_flag(default=True) is False
+    # Latency on the two processes' own stamps: the mod's last advancing echo and the
+    # supervisor's disengage write (gvd_engage.json mtime). How late the test's loop
+    # noticed either one (a loaded runner) is not GVD's latency.
+    assert "t_frozen" in clock, clock
+    after = float(snap["engage"]["mtime"]) - clock["t_frozen"]
+    seen = f", the test saw it {(drop[0] - clock['t_frozen']) * 1000.0:.0f} ms after" if drop else ""
+    print(f"  echo_stale {after * 1000.0:.0f} ms after the last advancing echo{seen}")
+    assert 0.0 < after < 1.5, f"echo_stale took {after:.2f}s after the echo froze"
+    write_engage_flag(False)
+    ego_path().unlink()
+
+
+def check_echo_old_mod_version_refused() -> None:
+    """echo_seq present but mod_version below the minimum: refused, and the refusal names it."""
+    from python.control.echo_link import MIN_MOD_VERSION, parse_version
+
+    assert parse_version(_MOD_VERSION) >= parse_version(MIN_MOD_VERSION), (_MOD_VERSION, MIN_MOD_VERSION)
+    _touch_lua_bus()
+    if ego_path().exists():
+        ego_path().unlink()
+    write_engage_flag(True)
+    snap = _run_supervisor(
+        ["--allow-preview-drive"],
+        seconds=3.0,
+        ack=True,
+        mod_version="1.7.12",
+        expect_disengage="lua_echo_outdated",
+    )
+    assert snap is not None, "a 1.7.12 mod_version never refused engage"
+    assert snap["engage"].get("disengage_reason") == "lua_echo_outdated", snap["engage"]
+    # The refusal tick itself. A later tick is not engaged any more and drops the echo message.
+    st = snap["state"]
+    assert st.get("disengage_reason") == "lua_echo_outdated", {k: st.get(k) for k in ("disengage_reason", "echo")}
+    echo = st.get("echo") or {}
+    assert echo.get("min_mod_version") == MIN_MOD_VERSION, echo
+    msg = str(echo.get("message", ""))
+    assert "mod 1.7.12" in msg and f"mod {MIN_MOD_VERSION} or newer is required" in msg, msg
+    write_engage_flag(False)
+    ego_path().unlink()
+
+
+def check_echo_cmd_blind_not_stale() -> None:
+    """Commands stop reaching the mod while its echoes keep advancing: no echo_stale.
+
+    echo_seq is the mod's own counter. Keyed on the command seq it would freeze with the
+    commands, and a live wheel would read as a dead link.
+    """
+    _touch_lua_bus()
+    if ego_path().exists():
+        ego_path().unlink()
+    write_engage_flag(True)
+    _run_supervisor(["--allow-preview-drive"], seconds=3.0, ack=True, cmd_blind=(1.2, 2.4))
+    eng = _read_json(engage_path())
+    st = read_state() or {}
+    assert eng.get("disengage_reason") != "echo_stale", eng
+    assert st.get("disengage_reason") != "echo_stale", st.get("disengage_reason")
+    assert eng.get("engaged") is True, eng
+    assert (st.get("echo") or {}).get("status") in ("fresh", "repeat"), st.get("echo")
+    write_engage_flag(False)
+    ego_path().unlink()
+
+
 def check_lua_harness() -> None:
     """Drive the mod's Lua through the stub-GE harness when a Lua 5.1 interpreter is available."""
     for exe in ("lua5.1", "luajit", "lua"):
@@ -698,8 +1109,16 @@ def check_engage_path_contract() -> None:
     assert read_engage_flag(default=False) is False
     p.write_text('{"engaged":true}', encoding="utf-8")
     assert read_engage_flag(default=False) is False, "engaged:true without mtime must not latch"
-    p.write_text(json.dumps({"engaged": True, "mtime": time.time()}), encoding="utf-8")
-    assert read_engage_flag(default=False) is True
+    # A live latch on the fake clock: fresh through ENGAGE_FRESH_S, stale just past it.
+    with fake_clock() as clock:
+        p.write_text(json.dumps({"engaged": True, "mtime": clock.now}), encoding="utf-8")
+        assert read_engage_flag(default=False) is True
+        clock.advance(ENGAGE_FRESH_S)
+        assert read_engage_flag(default=False) is True
+        clock.advance(0.01)
+        assert read_engage_flag(default=True) is False
+        # The same file read at the stamp itself through the explicit clock argument.
+        assert read_engage_flag(default=False, now=clock.now - ENGAGE_FRESH_S - 0.01) is True
     # Supervisor disengage payload: engaged=false with float mtime + reason (what Lua adopts as OFF and logs).
     write_engage_flag(False, disengage_reason="player_steer")
     data = json.loads(p.read_text(encoding="utf-8"))
@@ -763,16 +1182,21 @@ def check_no_chrome() -> None:
 
 def check_player_docs() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "## Alpha 1.7.12" in readme
-    assert "This is **alpha** — may break / not work; improves with fixes." in readme
-    assert "**point** bumps" in readme and "fixes / small UI" in readme
-    assert "**main alpha** bump" in readme and "features / core / UI overhaul" in readme
-    assert "1.7.12-alpha-<sha>" in readme
+    version = (ROOT / "VERSION").read_text(encoding="utf-8").splitlines()[0].strip()
+    major, minor = version.split(".")[:2]
+    # The alpha warning and the pin open the README, ahead of the quick start.
+    assert f"This is an **alpha** (`VERSION` {version}). It may break." in readme
+    assert readme.index("This is an **alpha**") < readme.index("## Quick start")
+    assert f"Point bumps (`{major}.{minor}.x`) are fixes and small UI." in readme
+    assert f"A main alpha bump (`{major}.x.0`) is features, core, or a UI overhaul." in readme
+    assert "1.7.13-alpha-<sha>" in readme
     assert "docs/stitch-360.png" in readme
     assert "docs/soft-esc-highway.jpg" not in readme
     assert "Soft Esc parked" in readme
-    assert readme.index("docs/stitch-360.png") < readme.index("## Recent changes")
-    assert readme.index("## 1.7.7") > readme.index("## Recent changes")
+    # The 360 stitch stays in the player-facing part, ahead of the technical reference.
+    # The release history left the README for the git log; the README must say so.
+    assert readme.index("docs/stitch-360.png") < readme.index("## Technical details")
+    assert "The change history is the git log." in readme
     # Retail drives via the cmd JSON bus; the old "cannot drive" wording must be gone everywhere players look.
     assert "beamngpy if importable" not in readme.lower()
     for f in (ROOT / "README.md", ROOT / "play_gvd.bat", ROOT / "play_gvd_tech.bat", ROOT / "scripts" / "make_release_zip.py",
@@ -806,11 +1230,19 @@ def main() -> None:
         check_run_vision_e2e,
         check_synthetic_lanes_drive,
         check_ffb_override_live,
+        check_ffb_stale_engage_heartbeat,
+        check_echo_outdated_refuses_engage,
+        check_echo_stale_disengages,
+        check_echo_old_mod_version_refused,
+        check_echo_cmd_blind_not_stale,
     )
     failed: list[str] = []
     for fn in checks:
+        # Own HOME / AppData / bus folder per check: no gvd_state / gvd_cmd / gvd_engage /
+        # gvd_strip_record file from another check (or another suite on this PC) is visible.
         try:
-            fn()
+            with isolated_home(prefix=f"gvd-m6-{fn.__name__}-"):
+                fn()
         except Exception:
             failed.append(fn.__name__)
             traceback.print_exc()

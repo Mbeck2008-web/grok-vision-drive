@@ -110,6 +110,11 @@ class EgoFeedback:
     player_steering: float | None = None
     player_throttle: float | None = None
     player_brake: float | None = None
+    # Lua's own counter, one per electrics echo it wrote. None is a mod older than the echo
+    # contract (python/control/echo_link.py): that mod cannot tell a repeat from a new sample.
+    echo_seq: int | None = None
+    # gvd_main M.MOD_VERSION ("1.7.13"). None: a mod older than the field.
+    mod_version: str | None = None
 
     @property
     def fresh(self) -> bool:
@@ -124,6 +129,17 @@ def _num(v: Any) -> float | None:
     if f != f or f in (float("inf"), float("-inf")):
         return None
     return f
+
+
+def _echo_seq(v: Any) -> int | None:
+    """Lua's echo counter, or None when the field is missing or not a whole number."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float) and v == v and v.is_integer():
+        return int(v)
+    return None
 
 
 def read_ego_feedback(now: float | None = None) -> EgoFeedback | None:
@@ -175,11 +191,17 @@ def read_ego_feedback(now: float | None = None) -> EgoFeedback | None:
         player_steering=_num(data.get("player_steering")),
         player_throttle=_num(data.get("player_throttle")),
         player_brake=_num(data.get("player_brake")),
+        echo_seq=_echo_seq(data.get("echo_seq")),
+        mod_version=data.get("mod_version") if isinstance(data.get("mod_version"), str) else None,
     )
 
 
-def read_engage_flag(default: bool = False) -> bool:
+def read_engage_flag(default: bool = False, *, now: float | None = None) -> bool:
     """Mirror Lua Alt+G. ``engaged:true`` counts only while ``mtime`` is fresh.
+
+    ``now`` is the clock freshness is judged on (wall time when omitted). A test
+    passes the supervisor's own last-tick stamp to ask "was the latch live on
+    that tick", independent of how long the test took to get here.
 
     Lua rewrites the stamp while the in-game latch is on. A file left true after a
     crash is not a new human engage — Tech must not call ``vehicle.control`` from it.
@@ -195,7 +217,7 @@ def read_engage_flag(default: bool = False) -> bool:
     if not isinstance(data, dict) or not bool(data.get("engaged", False)):
         return False
     try:
-        age = time.time() - float(data["mtime"])
+        age = (time.time() if now is None else float(now)) - float(data["mtime"])
     except (KeyError, TypeError, ValueError):
         return False
     # os.time() is whole seconds, so a heartbeat can look ~1 s old. A stamp far
@@ -639,19 +661,22 @@ def soft_esc_state_write_skips() -> int:
 
 
 def soft_esc_state_write_due(
-    engaged: bool, *, rising: bool = False, now: float | None = None
+    engaged: bool, *, rising: bool = False, falling: bool = False, now: float | None = None
 ) -> bool:
     """True when the supervisor should call write_state on this tick.
 
-    Soft Esc (engaged false, not a rising edge): at most one True per
+    Soft Esc (engaged false, not an edge): at most one True per
     SOFT_ESC_FILE_PERIOD_S, measured from the last ``soft_esc_state_write_mark``.
     A False increments soft_esc_state_write_skips. Engage is True every tick.
     A rising edge flushes on that same tick when the Soft Esc window has not
-    elapsed. ``now`` is monotonic seconds for tests; the supervisor omits it.
+    elapsed. So does the falling edge (the tick that disengages): its
+    ``disengage_reason`` and echo refusal message are on that one tick only,
+    and the next Soft Esc tick already says ``not_engaged``. ``now`` is
+    monotonic seconds for tests; the supervisor omits it.
     """
     global _soft_esc_state_skips
     t = time.monotonic() if now is None else float(now)
-    if engaged or rising:
+    if engaged or rising or falling:
         return True
     last = _soft_esc_state_mono
     if last is None or (t - last) >= SOFT_ESC_FILE_PERIOD_S:

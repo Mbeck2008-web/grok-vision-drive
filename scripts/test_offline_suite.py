@@ -42,6 +42,18 @@ def check_skip_tally() -> None:
     print("skip tally: in-script skips are returned to the runner OK")
 
 
+def check_thread_env() -> None:
+    """Each test process gets one OpenMP / MKL thread unless the caller chose a count."""
+    from gvd_test_env import THREAD_ENV, isolated_env
+
+    with tempfile.TemporaryDirectory() as tmp:
+        env = isolated_env({"PATH": "/bin"}, Path(tmp) / "a")
+        assert all(env[name] == "1" for name in THREAD_ENV), env
+        env = isolated_env({"PATH": "/bin", "OMP_NUM_THREADS": "4"}, Path(tmp) / "b")
+        assert env["OMP_NUM_THREADS"] == "4" and env["MKL_NUM_THREADS"] == "1", env
+    print("thread env: one OpenMP / MKL thread per test unless set OK")
+
+
 def main() -> None:
     scripts = list((ROOT / "scripts").glob("test_*.py"))
     assert scripts, "expected scripts/test_*.py"
@@ -76,6 +88,7 @@ def main() -> None:
         fake_win.unlink(missing_ok=True)
         fake_bng.unlink(missing_ok=True)
     check_skip_tally()
+    check_thread_env()
     print("test_offline_suite: OK")
 
 

@@ -28,6 +28,8 @@ from typing import Iterator, Mapping
 
 # Env names a leftover shell value could point at a shared folder with.
 DROP = ("GVD_DOCS_DIR",)
+# Thread pools a test process starts with (see isolated_env).
+THREAD_ENV = ("OMP_NUM_THREADS", "MKL_NUM_THREADS")
 # Set by run_offline_suite per script: where skip_check records skipped checks.
 SKIP_LOG_ENV = "GVD_SKIP_LOG"
 SKIP_PREFIX = "SKIP-CHECK"
@@ -77,6 +79,13 @@ def isolated_env(base: Mapping[str, str], root: Path) -> dict[str, str]:
             "TORCH_HOME": str(home / ".cache" / "torch"),
         }
     )
+    # One OpenMP / MKL thread per test process unless the caller already chose. torch sizes
+    # its intra-op pool to every core; when the cores are shared (a CI neighbour, a parallel
+    # suite) each parallel op waits at a barrier for pool threads that are descheduled.
+    # test_train_options under 64 busy loops on 8 cores: sanity_overfit 1.6 s -> 451 s with 8
+    # threads, 16.7 s with one; idle the script goes from about 6 s to 11 s.
+    for name in THREAD_ENV:
+        env.setdefault(name, "1")
     return env
 
 

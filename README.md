@@ -433,7 +433,7 @@ Before the first step the trainer measures free VRAM and shrinks the batch until
 - `--lane-source gt`: drive on road-network lanes to test the controller alone.
 - `scripts/live_lane_test.py`: headless lane-keep check against a running BeamNG.tech.
 - Review capture (`R`), clips (`C`), `--foxglove` live view, `--tech-probe` and `--tech-hold` preflights.
-- `scripts/run_offline_suite.py`: the offline tests CI runs.
+- `scripts/run_offline_suite.py`: the offline tests CI runs. Each script gets its own temp home, AppData and torch cache, so no GVD bus file leaks between tests.
 
 ### Known limitations
 

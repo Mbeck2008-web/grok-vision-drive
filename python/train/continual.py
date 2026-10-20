@@ -900,11 +900,19 @@ def cell_of(xy: tuple[float, float], cell_m: float = HOLDOUT_CELL_M) -> tuple[in
     return int(math.floor(xy[0] / cell_m)), int(math.floor(xy[1] / cell_m))
 
 
+def segment_map(segment: Any) -> str:
+    """Map name from a ``segment`` (``<map>#<n>``). A combined folder prefixes
+    the recording id (``rec5b/<map>#<n>``); the map is the same road either way."""
+    if not segment:
+        return ""
+    return str(segment).split("#", 1)[0].rsplit("/", 1)[-1]
+
+
 def _map_name(rows: list[Mapping[str, Any]]) -> str:
     for row in rows:
         seg = row.get("segment")
         if seg:
-            return str(seg).split("#", 1)[0]
+            return segment_map(seg)
     return ""
 
 
@@ -994,7 +1002,7 @@ def row_maps(rows: list[Mapping[str, Any]]) -> list[str]:
         seg = row.get("segment")
         if not seg:
             continue
-        name = str(seg).split("#", 1)[0]
+        name = segment_map(seg)
         if name and name not in seen:
             seen.append(name)
     return seen

@@ -685,6 +685,12 @@ def check_road_area_holdout() -> None:
         combine_recordings([tmp / "rec5b", tmp / "rec5c"], out)
         rows = [json.loads(line) for line in (out / "state.jsonl").read_text().splitlines()]
         spec = choose_holdout_cells(rows, seed=3)
+        # The trainer's own checks: one map, though each recording prefixes its segments.
+        from python.train.continual import check_holdout_cells, row_maps, segment_map
+
+        assert row_maps(rows) == ["west_coast_usa"] and spec["map"] == "west_coast_usa", row_maps(rows)
+        assert segment_map("rec5b/west_coast_usa#3") == segment_map("west_coast_usa#3") == "west_coast_usa"
+        check_holdout_cells(spec, rows, source="chosen cells")
         labels = cell_holdout_labels(rows, spec)
         sides: dict[tuple[int, int], set[str]] = {}
         by_rec: dict[str, dict[str, set]] = {}

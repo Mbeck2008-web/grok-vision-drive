@@ -8,6 +8,12 @@ is drivable is a city street. The mix is about 40% city, 35% highway,
 With a painted-lane map, ``SpawnDeck`` can also skip a road whose next
 300 m carries little line paint (``min_paint_cov``). The labeler reads the
 paint, so a spawn on unpainted road records minutes of masked rows.
+
+The AI does not stay on those 300 m for a whole segment, so
+``coverage_from`` scores the same probe from wherever the car is now (the
+collector's ``--recheck-cov-min``). The deck also counts picks and recorded
+time per spawn road (``road_repeats``): a resumed run reshuffles with the
+same seed and starts over on the same roads.
 """
 
 from __future__ import annotations
@@ -48,6 +54,12 @@ PAINT_MAX_TRIES = 40
 # merges into the middle of a highway). A walk shorter than this counts its
 # missing probes as unpainted, so a 9 m stub with one lucky probe is not 1.00.
 PAINT_MIN_PROBE_M = 100.0
+# Recheck from the car's pose: the nearest navgraph road within this distance,
+# preferring one that runs along the heading (under 60 deg) at the car's height.
+RECHECK_NEAR_M = 12.0
+RECHECK_CELL_M = 25.0
+# A spawn road picked this many times is flagged in road_repeats.
+REPEAT_FLAG_PICKS = 3
 
 
 @dataclass(frozen=True)
@@ -121,7 +133,17 @@ def road_ahead(
     end, a sharp turn, or ``ahead_m``.
     """
     chain = _tail_from(road["pts"], fraction)
-    seen = {str(road["id"])}
+    return _walk_ahead(chain, {str(road["id"])}, roads_by_id, ends, ahead_m)
+
+
+def _walk_ahead(
+    chain: list[tuple[float, float, float]],
+    seen: set[str],
+    roads_by_id: dict[str, dict[str, Any]],
+    ends: dict[tuple[int, int], list[tuple[str, bool]]],
+    ahead_m: float = PAINT_AHEAD_M,
+) -> list[tuple[float, float, float]]:
+    """Continue ``chain`` into joining roads (the ``road_ahead`` rules) up to ``ahead_m``."""
     length = _polyline_m(chain)
     while length < float(ahead_m) and len(chain) >= 2 and len(seen) < 64:
         tail, prev = chain[-1], chain[-2]
@@ -160,6 +182,44 @@ def road_ahead(
         length += _polyline_m([chain[-1]] + added)
         chain.extend(added)
     return chain
+
+
+def chain_from_pose(
+    road: dict[str, Any],
+    pos: tuple[float, float, float] | list[float],
+    heading: tuple[float, float],
+    roads_by_id: dict[str, dict[str, Any]],
+    ends: dict[tuple[int, int], list[tuple[str, bool]]],
+    ahead_m: float = PAINT_AHEAD_M,
+) -> list[tuple[float, float, float]]:
+    """Centerline from the point of ``road`` nearest ``pos``, in the direction of travel.
+
+    The road is walked the way ``heading`` points along it (a two-way road
+    either way), then continued like ``road_ahead``.
+    """
+    pts = [tuple(float(v) for v in p[:3]) for p in road["pts"]]
+    if len(pts) < 2:
+        return list(pts)
+    qx, qy = float(pos[0]), float(pos[1])
+    best: tuple[float, int, float] | None = None
+    for k, (a, b) in enumerate(zip(pts, pts[1:])):
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        l2 = dx * dx + dy * dy
+        t = 0.0 if l2 < 1e-12 else min(1.0, max(0.0, ((qx - a[0]) * dx + (qy - a[1]) * dy) / l2))
+        d = math.hypot(a[0] + dx * t - qx, a[1] + dy * t - qy)
+        if best is None or d < best[0]:
+            best = (d, k, t)
+    assert best is not None
+    _d, k, t = best
+    a, b = pts[k], pts[k + 1]
+    here = tuple(a[i] + (b[i] - a[i]) * t for i in range(3))
+    forward = (b[0] - a[0]) * float(heading[0]) + (b[1] - a[1]) * float(heading[1]) >= 0.0
+    rest = pts[k + 1 :] if forward else pts[k::-1]
+    # Drop a vertex the car is standing on, so the first step has a heading.
+    chain = [here] + [p for p in rest if math.hypot(p[0] - here[0], p[1] - here[1]) > 1e-3]
+    if len(chain) < 2:
+        return chain
+    return _walk_ahead(chain, {str(road["id"])}, roads_by_id, ends, ahead_m)
 
 
 def sample_along(
@@ -374,6 +434,11 @@ class SpawnDeck:
         self.best_seen = 0
         self.last_ms = 0.0
         self.select_ms: list[float] = []
+        # Spawn picks and recorded seconds per road (road_repeats).
+        self.road_picks: dict[str, int] = {}
+        self.road_time_s: dict[str, float] = {}
+        self.road_kind: dict[str, str] = {}
+        self._seg_grid: dict[tuple[int, int], list[tuple[str, int]]] | None = None
         self._by_id: dict[str, dict[str, Any]] = {}
         self._ends: dict[tuple[int, int], list[tuple[str, bool]]] = defaultdict(list)
         for pool in self.pools.values():
@@ -411,6 +476,9 @@ class SpawnDeck:
 
     def _pick(self, kind: str, road: dict[str, Any], pose: Any, cov: float | None, wanted: str) -> SpawnPick:
         self.counts[kind] += 1
+        rid = str(road["id"])
+        self.road_picks[rid] = self.road_picks.get(rid, 0) + 1
+        self.road_kind[rid] = kind
         if kind != wanted:
             self.cross_kind += 1
         pos, rot = pose
@@ -452,6 +520,145 @@ class SpawnDeck:
             f"cross_kind={s['cross_kind_fallback']} best_seen={s['best_seen_fallback']} "
             f"select_ms mean={mean} max={peak}"
         )
+
+    # ------------------------------------------------------- road repeats
+    def note_time(self, road_id: str | None, dt_s: float) -> None:
+        """Credit ``dt_s`` recorded seconds to the spawn road the car came from."""
+        if not road_id:
+            return
+        rid = str(road_id)
+        self.road_time_s[rid] = self.road_time_s.get(rid, 0.0) + max(0.0, float(dt_s or 0.0))
+
+    def seed_repeats(self, prior: Any) -> int:
+        """Add picks and seconds from an earlier ``road_repeats`` (a resumed run). Returns roads read."""
+        rows = (prior or {}).get("by_road") if isinstance(prior, dict) else None
+        if not isinstance(rows, dict):
+            return 0
+        n = 0
+        for rid, item in rows.items():
+            if not isinstance(item, dict):
+                continue
+            rid = str(rid)
+            self.road_picks[rid] = self.road_picks.get(rid, 0) + int(_num(item.get("picks")))
+            self.road_time_s[rid] = self.road_time_s.get(rid, 0.0) + _num(item.get("time_s"))
+            if item.get("kind"):
+                self.road_kind.setdefault(rid, str(item["kind"]))
+            n += 1
+        return n
+
+    def road_repeats(self, flag_picks: int = REPEAT_FLAG_PICKS) -> dict[str, Any]:
+        """Picks and share of recorded time per spawn road; roads picked ``flag_picks``+ times are flagged."""
+        total_t = sum(self.road_time_s.values())
+        ids = set(self.road_picks) | set(self.road_time_s)
+        by_road: dict[str, Any] = {}
+        for rid in sorted(ids, key=lambda r: (-self.road_picks.get(r, 0), -self.road_time_s.get(r, 0.0), r)):
+            t = self.road_time_s.get(rid, 0.0)
+            by_road[rid] = {
+                "kind": self.road_kind.get(rid),
+                "picks": int(self.road_picks.get(rid, 0)),
+                "time_s": round(t, 1),
+                "time_share": round(t / total_t, 4) if total_t > 0 else 0.0,
+            }
+        flagged = [rid for rid, item in by_road.items() if item["picks"] >= int(flag_picks)]
+        flagged_t = sum(self.road_time_s.get(rid, 0.0) for rid in flagged)
+        return {
+            "flag_picks": int(flag_picks),
+            "roads": len(by_road),
+            "picks": int(sum(self.road_picks.values())),
+            "max_picks": max((item["picks"] for item in by_road.values()), default=0),
+            "time_s": round(total_t, 1),
+            "flagged": flagged,
+            "flagged_time_share": round(flagged_t / total_t, 4) if total_t > 0 else 0.0,
+            "by_road": by_road,
+        }
+
+    def repeat_lines(self) -> list[str]:
+        """End-of-run log: one summary line, then one line per flagged road."""
+        r = self.road_repeats()
+        out = [
+            f"spawn repeats roads={r['roads']} picks={r['picks']} max_picks={r['max_picks']} "
+            f"flagged={len(r['flagged'])} (>= {r['flag_picks']} picks) "
+            f"flagged_time={r['flagged_time_share']:.0%} of {r['time_s']:.0f}s"
+        ]
+        for rid in r["flagged"]:
+            item = r["by_road"][rid]
+            out.append(
+                f"spawn repeat flagged road={rid} kind={item['kind'] or '-'} picks={item['picks']} "
+                f"time={item['time_s']:.0f}s share={item['time_share']:.0%}"
+            )
+        return out
+
+    # ------------------------------------------------------------ recheck
+    def nearest_road(
+        self, pos: Any, heading: tuple[float, float] | None = None, near_m: float = RECHECK_NEAR_M
+    ) -> tuple[dict[str, Any], float] | None:
+        """Navgraph road nearest ``pos`` (x, y, z), or None past ``near_m``.
+
+        A road more than 4 m above or below, or crossing the heading by more
+        than 60 deg (the cross street at a junction), is ranked as farther.
+        """
+        if self._seg_grid is None:
+            grid: dict[tuple[int, int], list[tuple[str, int]]] = defaultdict(list)
+            for rid, road in self._by_id.items():
+                pts = road["pts"]
+                for k, (a, b) in enumerate(zip(pts, pts[1:])):
+                    x0, x1 = sorted((a[0], b[0]))
+                    y0, y1 = sorted((a[1], b[1]))
+                    for cx in range(int(x0 // RECHECK_CELL_M), int(x1 // RECHECK_CELL_M) + 1):
+                        for cy in range(int(y0 // RECHECK_CELL_M), int(y1 // RECHECK_CELL_M) + 1):
+                            grid[(cx, cy)].append((rid, k))
+            self._seg_grid = dict(grid)
+        qx, qy = float(pos[0]), float(pos[1])
+        qz = float(pos[2]) if len(pos) > 2 and pos[2] is not None else None
+        hx = hy = 0.0
+        if heading is not None:
+            n = math.hypot(float(heading[0]), float(heading[1]))
+            if n > 1e-6:
+                hx, hy = float(heading[0]) / n, float(heading[1]) / n
+        cx, cy = int(qx // RECHECK_CELL_M), int(qy // RECHECK_CELL_M)
+        best: tuple[float, float, str] | None = None
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for rid, k in self._seg_grid.get((cx + dx, cy + dy), ()):
+                    a, b = self._by_id[rid]["pts"][k], self._by_id[rid]["pts"][k + 1]
+                    ux, uy = b[0] - a[0], b[1] - a[1]
+                    l2 = ux * ux + uy * uy
+                    t = 0.0 if l2 < 1e-12 else min(1.0, max(0.0, ((qx - a[0]) * ux + (qy - a[1]) * uy) / l2))
+                    d = math.hypot(a[0] + ux * t - qx, a[1] + uy * t - qy)
+                    score = d
+                    if qz is not None and abs(a[2] + (b[2] - a[2]) * t - qz) > 4.0:
+                        score += 6.0
+                    if (hx or hy) and l2 > 1e-12 and abs(ux * hx + uy * hy) / math.sqrt(l2) < PAINT_JOIN_COS:
+                        score += 6.0
+                    if best is None or score < best[0]:
+                        best = (score, d, rid)
+        if best is None or best[1] > float(near_m):
+            return None
+        return self._by_id[best[2]], best[1]
+
+    def coverage_from(self, pos: Any, direction: Any) -> tuple[float | None, str | None]:
+        """The spawn coverage probe, from the car's pose: ``(cov, road_id)``.
+
+        ``(None, None)`` when filtering is off, the pose is missing, or no
+        road is within ``RECHECK_NEAR_M`` (a lot or a field: not scored).
+        """
+        if not self.filtering() or pos is None or direction is None:
+            return None, None
+        try:
+            fx, fy = float(direction[0]), float(direction[1])
+        except (TypeError, ValueError, IndexError):
+            return None, None
+        if math.hypot(fx, fy) < 1e-6:
+            return None, None
+        found = self.nearest_road(pos, (fx, fy))
+        if found is None:
+            return None, None
+        road, _dist = found
+        chain = chain_from_pose(road, pos, (fx, fy), self._by_id, self._ends, PAINT_AHEAD_M)
+        cov = paint_coverage(
+            self.painted, sample_along(chain), oneway=bool(road["oneway"]), min_samples=self.min_samples
+        )
+        return cov, str(road["id"])
 
     def _take(self) -> SpawnPick | None:
         first = self._next_kind()

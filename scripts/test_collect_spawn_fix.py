@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Collector fixes: paint-coverage spawns, impacts, settle rows, tip check, damage.
+"""Collector fixes: paint-coverage spawns, impacts, settle rows, tip check, damage,
+spawn-road repeat counts and the mid-spawn coverage recheck.
 
 Offline. ``lane_at`` and the speed trace are mocked; no BeamNG is needed.
 """
@@ -35,7 +36,9 @@ from python.collect.spawn_mix import (  # noqa: E402
     CITY,
     HIGHWAY,
     RAMP,
+    REPEAT_FLAG_PICKS,
     SpawnDeck,
+    chain_from_pose,
     paint_coverage,
     road_ahead,
     sample_along,
@@ -684,6 +687,165 @@ def check_yield_guard_runs() -> None:
     print(f"yield guard run: {len(lines)} cuts 60 s apart then paused, {len(rows)} rows kept, off by default")
 
 
+# ------------------------------------------------- (f) road repeats, recheck
+def check_road_repeats() -> None:
+    """Picks and recorded seconds per spawn road; a resumed run (same seed) re-picks
+    the same roads, and the third pick of a road is flagged."""
+    log: list[str] = []
+    deck = SpawnDeck(_pools(0, 4), painted=PAINT_SOUTH, min_paint_cov=0.5, log=log.append)
+    first = [deck.take() for _ in range(2)]
+    deck.note_time(first[0].road_id, 30.0)
+    deck.note_time(first[1].road_id, 10.0)
+    deck.note_time(None, 99.0)  # no spawn road: not credited
+    r = deck.road_repeats()
+    assert r["roads"] == 2 and r["picks"] == 2 and r["max_picks"] == 1 and r["flagged"] == [], r
+    assert r["by_road"][first[0].road_id] == {"kind": CITY, "picks": 1, "time_s": 30.0, "time_share": 0.75}, r
+    assert r["time_s"] == 40.0 and r["flagged_time_share"] == 0.0
+    # Two resumes from collect.json: each new deck has the same shuffle.
+    prior = r
+    for _ in range(2):
+        again = SpawnDeck(_pools(0, 4), painted=PAINT_SOUTH, min_paint_cov=0.5)
+        assert again.seed_repeats(prior) == len(prior["by_road"])
+        picks = [again.take() for _ in range(2)]
+        assert [p.road_id for p in picks] == [p.road_id for p in first]
+        again.note_time(picks[0].road_id, 30.0)
+        prior = again.road_repeats()
+    assert prior["max_picks"] == REPEAT_FLAG_PICKS == 3 and prior["picks"] == 6, prior
+    assert prior["flagged"] == [first[0].road_id, first[1].road_id], prior["flagged"]
+    assert prior["flagged_time_share"] == 1.0 and prior["by_road"][first[0].road_id]["time_s"] == 90.0
+    lines = again.repeat_lines()
+    assert lines[0] == "spawn repeats roads=2 picks=6 max_picks=3 flagged=2 (>= 3 picks) flagged_time=100% of 100s", lines
+    assert lines[1] == f"spawn repeat flagged road={first[0].road_id} kind=city picks=3 time=90s share=90%", lines
+    assert again.seed_repeats(None) == 0 and again.seed_repeats({"by_road": "x"}) == 0
+    import scripts.collect_scene_lanes as collect
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "collect.json"
+        collect.save_progress(path, 5.0, 60.0, {"road_repeats": prior})
+        back = json.loads(path.read_text(encoding="utf-8"))["road_repeats"]
+        assert back["flagged"] == prior["flagged"] and back["by_road"][first[0].road_id]["picks"] == 3
+    print(f"road repeats ok: {lines[0]}")
+
+
+def check_recheck_coverage_from_pose() -> None:
+    """The recheck scores the spawn probe from the car's pose, along its heading."""
+    a = _road("a", [(0, 0), (200, 0), (400, 0)])
+    cross = _road("cross", [(50, -200), (50, 200)])  # a cross street through the car
+    paint = _Paint(lambda x, y: x < 100.0 and abs(y) < 5.0)
+    deck = SpawnDeck({CITY: [a, cross], HIGHWAY: [], RAMP: []}, painted=paint, min_paint_cov=0.5)
+    # At (50, 0) heading +x: probes 50..340; a lane 10 m ahead for x < 90 -> 50..80 = 4 of 30.
+    cov, rid = deck.coverage_from((50.0, 0.5, 10.0), (1.0, 0.0, 0.0))
+    assert rid == "a" and abs(cov - 4 / 30) < 1e-9, (rid, cov)
+    chain = chain_from_pose(a, (50.0, 0.5, 10.0), (1.0, 0.0), deck._by_id, deck._ends)
+    assert abs(chain[0][0] - 50.0) < 1e-9 and abs(chain[0][1]) < 1e-9 and chain[-1][0] == 400.0
+    # Heading -x on the two-way road: 50 m back to its end, 6 probes (0..50 m) all
+    # painted, under 100 m -> 6/10.
+    cov, rid = deck.coverage_from((50.0, 0.5, 10.0), (-1.0, 0.0, 0.0))
+    assert rid == "a" and abs(cov - 0.6) < 1e-9, (rid, cov)
+    # Heading +y at the same spot: the cross street, which is unpainted off y = 0.
+    cov, rid = deck.coverage_from((50.0, 0.5, 10.0), (0.0, 1.0, 0.0))
+    assert rid == "cross" and cov < 0.1, (rid, cov)
+    # Off every road (a lot), the filter off, or no pose: not scored.
+    assert deck.coverage_from((150.0, 60.0, 10.0), (1.0, 0.0, 0.0)) == (None, None)
+    assert deck.coverage_from(None, (1.0, 0.0, 0.0)) == (None, None)
+    assert deck.coverage_from((50.0, 0.0, 10.0), (0.0, 0.0, 1.0)) == (None, None)
+    off = SpawnDeck({CITY: [a], HIGHWAY: [], RAMP: []}, painted=paint, min_paint_cov=0.0)
+    assert off.coverage_from((50.0, 0.0, 10.0), (1.0, 0.0, 0.0)) == (None, None)
+    # The recheck reads the same probe as the spawn: at the spawn pose it gives the spawn score.
+    long_road = _road("long", [(0, 0), (500, 0)])
+    every = SpawnDeck({CITY: [long_road], HIGHWAY: [], RAMP: []}, painted=_Paint(lambda x, y: x < 300.0), min_paint_cov=0.5)
+    assert abs(every.coverage_from((200.0, 0.0, 10.0), (1.0, 0.0, 0.0))[0] - every.coverage(long_road)) < 1e-9
+    import scripts.collect_scene_lanes as collect
+
+    assert collect.build_parser().parse_args([]).recheck_cov_min == 0.0
+    assert collect.build_parser().parse_args(["--recheck-cov-min", "3"]).recheck_cov_min == 3.0
+    assert not collect.recheck_due(0.0, 9999.0, 0.0)
+    assert not collect.recheck_due(180.0, 179.0, 0.0) and collect.recheck_due(180.0, 180.0, 0.0)
+    assert collect.recheck_due(180.0, 400.0, 220.0) and not collect.recheck_due(180.0, 399.0, 220.0)
+    assert collect.recheck_plan(0.2, 0.5) == "respawn" and collect.recheck_plan(0.5, 0.5) == "keep"
+    assert collect.recheck_plan(None, 0.5) == "keep"
+    rec = collect.recheck_record(t=1.0, i=7, segment="west_coast_usa#0", map_name="west_coast_usa", spawn_type=CITY,
+                                 spawn_road="s", road="a", pos=[1.0, 2.0, 3.0], cov=0.12345, min_cov=0.5,
+                                 recheck_min=3.0, action="respawn", done_s=180.0)
+    assert rec["reason"] == "recheck_cov" and rec["kind"] == "recheck" and rec["paint_cov"] == 0.1235, rec
+    print("recheck from pose ok: heading picks the road and direction, off-road and filter-off not scored")
+
+
+def _run_west_coast(paint, pools: dict, extra: list[str], stop_at: int) -> tuple[int, str, Path]:
+    """The mocked collector on a west_coast_usa map rotation with a mocked deck.
+
+    The car holds (0.4, 12, 0.5) heading +y at 10 m/s; a teleport does not move it.
+    """
+    import scripts.collect_scene_lanes as collect
+    import python.collect.spawn_mix as spawn_mix
+    from python.collect.level_session import OpenedLevel
+
+    def enter(bng, level, cfg, cams):
+        del level, cfg, cams
+        return OpenedLevel(vehicle=bng.vehicles.vehicle, roads=[RoadPoly("r", [(0.0, 0.0), (0.0, 80.0)], 7.0)],
+                           spawn=(0.4, 12.0, 0.5), cameras={"main": _Cam()})
+
+    previous = (collect.enter_map, collect.painted_for, spawn_mix.SpawnDeck.load)
+    collect.enter_map = enter  # type: ignore[assignment]
+    collect.painted_for = lambda level: paint  # type: ignore[assignment]
+    spawn_mix.SpawnDeck.load = classmethod(lambda cls, path, rng=None, **kw: cls(pools, rng, **kw))  # type: ignore[assignment]
+    try:
+        return _run_collector({"speed_at": lambda n: 10.0, "stop_at": stop_at},
+                              ["--maps", "west_coast_usa", "--no-vary-env", "--no-excursions"] + list(extra))
+    finally:
+        collect.enter_map, collect.painted_for, spawn_mix.SpawnDeck.load = previous  # type: ignore[assignment]
+
+
+def _west_pools() -> dict:
+    # The car's road is unpainted (x < 1000); every spawn road far east is painted.
+    here = _road("here", [(0.4, -300), (0.4, 600)])
+    east = [_road(f"east{j}", [(5000 + 50 * j, 0), (5000 + 50 * j, 500)]) for j in range(12)]
+    return {CITY: [here] + east, HIGHWAY: [], RAMP: []}
+
+
+def check_recheck_and_repeats_run() -> None:
+    """End to end: every 30 s the recheck scores the unpainted road under the car,
+    respawns, and logs reason=recheck_cov; no row is dropped. road_repeats lands in
+    collect.json and the end-of-run log. Off by default; on painted road it keeps."""
+    east_paint = _Paint(lambda x, y: x > 1000.0)
+    code, text, out = _run_west_coast(east_paint, _west_pools(), ["--recheck-cov-min", "0.5"], 1300)
+    assert code == 0, (code, text[-2500:])
+    assert "collect recheck_cov every 0.5 min on" in text, text[:3000]
+    lines = [line for line in text.splitlines() if line.startswith("collect recheck_cov west_coast_usa#")]
+    assert len(lines) >= 3, text[-3000:]
+    assert all("paint_cov=0.00 min=0.50 road=here" in line and line.endswith("-> respawn") for line in lines), lines
+    cuts = [json.loads(line) for line in (out / "cuts.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert len(cuts) == len(lines) and all(c["reason"] == "recheck_cov" and c["action"] == "respawn" for c in cuts), cuts
+    assert all(c["road"] == "here" and c["spawn_road"].startswith("east") and c["recheck_min"] == 0.5 for c in cuts), cuts
+    gaps = [b["done_s"] - a["done_s"] for a, b in zip(cuts, cuts[1:])]
+    assert all(29.0 <= g <= 34.5 for g in gaps), gaps  # 30 s, plus the 3 s settle when it lands on one
+    # A respawn per recheck: the spawn road changes each time.
+    assert len({c["spawn_road"] for c in cuts}) == len(cuts)
+    rows = _rows(out)
+    ids = [int(r["i"]) for r in rows]
+    assert ids == list(range(len(ids))), "rows were dropped"
+    status = json.loads((out / "collect.json").read_text(encoding="utf-8"))
+    rr = status["road_repeats"]
+    assert rr["picks"] == len(cuts) + 1 and rr["max_picks"] == 1 and rr["flagged"] == [], rr
+    assert "here" not in {k for k, v in rr["by_road"].items() if v["picks"]}, rr  # unpainted: skipped, never picked
+    assert abs(rr["time_s"] - 0.1 * len(rows)) < 2.0, (rr["time_s"], len(rows))
+    assert "collect spawn repeats roads=" in text and f"picks={rr['picks']} max_picks=1 flagged=0" in text, text[-1500:]
+    # Off by default: same rows, no rechecks, no cuts file.
+    code, text_off, out_off = _run_west_coast(east_paint, _west_pools(), [], 1300)
+    assert code == 0 and "recheck_cov" not in text_off and not (out_off / "cuts.jsonl").exists(), text_off[-1500:]
+    assert len(_rows(out_off)) == len(rows), (len(_rows(out_off)), len(rows))
+    assert json.loads((out_off / "collect.json").read_text(encoding="utf-8"))["road_repeats"]["picks"] == 1
+    # Painted everywhere: each recheck is logged and kept.
+    code, text_ok, out_ok = _run_west_coast(_Paint(lambda x, y: True), _west_pools(), ["--recheck-cov-min", "0.5"], 700)
+    assert code == 0, text_ok[-1500:]
+    kept = [json.loads(line) for line in (out_ok / "cuts.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert kept and all(c["action"] == "keep" and c["paint_cov"] == 1.0 for c in kept), kept
+    # The recheck needs the paint filter.
+    code, text_nf, out_nf = _run_west_coast(east_paint, _west_pools(), ["--recheck-cov-min", "0.5", "--min-paint-cov", "0"], 700)
+    assert code == 0 and "collect recheck_cov every 0.5 min off" in text_nf and not (out_nf / "cuts.jsonl").exists()
+    print(f"recheck run: {len(cuts)} rechecks -> respawn, {len(rows)} rows kept; off by default; painted keeps")
+
+
 def main() -> None:
     check_coverage_walks_ahead()
     check_short_probe_is_not_full_coverage()
@@ -703,6 +865,9 @@ def main() -> None:
     check_yield_guard()
     check_yield_guard_runs()
     check_weave_guard_runs()
+    check_road_repeats()
+    check_recheck_coverage_from_pose()
+    check_recheck_and_repeats_run()
     print("collect spawn fix ok")
 
 

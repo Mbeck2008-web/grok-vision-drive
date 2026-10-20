@@ -81,6 +81,19 @@ Trade-off: the guard keeps only roads the current painted labeler already
 handles (bridges whose edge line is not a decal, tunnels, dirt). It biases
 the data toward those roads, and a labeler fix later would have found
 labels on the stretches it cut.
+
+The deck also counts how often each spawn road is picked and its share of
+recorded seconds: ``road_repeats`` in both collect.json files (carried over
+when a run resumes from collect.json) and ``collect spawn repeats`` lines at
+the end of the run. A road picked 3 or more times is flagged.
+
+``--recheck-cov-min N`` (default 0, off; west coast with ``--min-paint-cov``
+above 0) reruns the spawn paint-coverage probe every N minutes of a spawn,
+from the nearest road to the car along its heading. The AI leaves the 300 m
+it was picked on within minutes. Under ``--min-paint-cov`` the car takes the
+next deck spawn. Rows are never dropped. Every recheck, kept or not, is a
+``collect recheck_cov`` line and a ``cuts.jsonl`` record with
+``reason=recheck_cov``.
 """
 from __future__ import annotations
 
@@ -344,7 +357,65 @@ def build_parser() -> argparse.ArgumentParser:
             "moving rows has a painted label 10 m ahead. 0 (default) is off. Frames are kept."
         ),
     )
+    parser.add_argument(
+        "--recheck-cov-min",
+        type=float,
+        default=0.0,
+        help=(
+            "West coast: every N minutes, rerun the spawn paint-coverage probe from the car's road and "
+            "heading, and respawn from the deck when it is under --min-paint-cov. 0 (default) is off. "
+            "Frames are kept."
+        ),
+    )
     return parser
+
+
+def recheck_due(recheck_s: float, done_s: float, mark_s: float) -> bool:
+    """True when ``recheck_s`` (> 0) seconds of driving passed since the spawn or the last recheck."""
+    return float(recheck_s) > 0.0 and float(done_s) - float(mark_s) >= float(recheck_s) - 1e-9
+
+
+def recheck_plan(cov: float | None, min_cov: float) -> str:
+    """``respawn`` when a scored recheck is under ``min_cov``, else ``keep`` (no road found keeps)."""
+    if cov is None:
+        return "keep"
+    return "respawn" if float(cov) < float(min_cov) else "keep"
+
+
+def recheck_record(
+    *,
+    t: float,
+    i: int | None,
+    segment: str,
+    map_name: str | None,
+    spawn_type: str | None,
+    spawn_road: str | None,
+    road: str | None,
+    pos: list[float] | None,
+    cov: float | None,
+    min_cov: float,
+    recheck_min: float,
+    action: str,
+    done_s: float,
+) -> dict[str, Any]:
+    """One ``cuts.jsonl`` line for a coverage recheck."""
+    return {
+        "kind": "recheck",
+        "reason": "recheck_cov",
+        "t": round(float(t), 6),
+        "i": i,
+        "segment": segment,
+        "map": map_name or None,
+        "spawn_type": spawn_type,
+        "spawn_road": spawn_road,
+        "road": road,
+        "pos": pos,
+        "paint_cov": None if cov is None else round(float(cov), 4),
+        "min_paint_cov": float(min_cov),
+        "recheck_min": float(recheck_min),
+        "action": action,
+        "done_s": round(float(done_s), 3),
+    }
 
 
 def paint_share(tech: dict[str, Any] | None) -> float:
@@ -1210,6 +1281,9 @@ def main(argv: list[str] | None = None) -> int:
         spawn_kind = ""
         spawn_mark = -1.0e9
         respawn_s = max(0.0, float(args.respawn_min)) * 60.0
+        recheck_min = max(0.0, float(getattr(args, "recheck_cov_min", 0.0) or 0.0))
+        recheck_s = recheck_min * 60.0
+        recheck_mark = 0.0
         tick_dt = 0.1
         last_cam: dict[str, float] = {}
         prev_dir: list[float] | None = None
@@ -1252,6 +1326,7 @@ def main(argv: list[str] | None = None) -> int:
             payload["until_disk"] = bool(until_disk)
             if spawn_deck is not None:
                 payload["spawn_mix"] = spawn_deck.summary()
+                payload["road_repeats"] = spawn_deck.road_repeats()
             if yield_guard.enabled:
                 payload["live_yield"] = yield_guard.summary()
             if target_s == float("inf"):
@@ -1371,7 +1446,7 @@ def main(argv: list[str] | None = None) -> int:
         def _apply_spawn(force: bool) -> None:
             """Teleport west coast to the next unused stratified spawn."""
             nonlocal spawn_deck, spawn_kind, spawn_mark, spawn_pos, last_ai, segment_open, speed, spawn_cov
-            nonlocal spawn_road
+            nonlocal spawn_road, recheck_mark
             if map_name != "west_coast_usa" or vehicle is None:
                 return
             if not force and (respawn_s <= 0.0 or done_s - spawn_mark < respawn_s):
@@ -1408,6 +1483,19 @@ def main(argv: list[str] | None = None) -> int:
                     f"load_ms={(time.perf_counter() - load_t0) * 1000.0:.0f}",
                     flush=True,
                 )
+                try:
+                    prior = json.loads(progress_path.read_text(encoding="utf-8")).get("road_repeats")
+                except Exception:
+                    prior = None
+                seeded = spawn_deck.seed_repeats(prior)
+                if seeded:
+                    print(f"collect spawn repeats resumed roads={seeded} from {progress_path.name}", flush=True)
+                if recheck_s > 0.0:
+                    print(
+                        f"collect recheck_cov every {recheck_min:g} min "
+                        f"{'on' if spawn_deck.filtering() else 'off (needs --min-paint-cov > 0 and painted lanes)'}",
+                        flush=True,
+                    )
             picked = spawn_deck.take()
             if picked is None:
                 print(f"collect spawn {segment_id} none left select_ms={spawn_deck.last_ms:.0f}", flush=True)
@@ -1423,6 +1511,7 @@ def main(argv: list[str] | None = None) -> int:
             spawn_cov = picked.paint_cov
             spawn_road = str(picked.road_id)
             spawn_mark = done_s
+            recheck_mark = done_s
             spawn_pos = picked.pos
             impact.reset()
             yield_guard.reset()
@@ -1450,12 +1539,18 @@ def main(argv: list[str] | None = None) -> int:
             extra: dict[str, Any] = {}
             if spawn_deck is not None:
                 extra["spawn_mix"] = spawn_deck.summary()
+                extra["road_repeats"] = spawn_deck.road_repeats()
             if yield_guard.enabled:
                 extra["live_yield"] = yield_guard.summary()
             return extra or None
 
         def _save_progress(done: float, target: float) -> None:
             save_progress(progress_path, done, target, _spawn_extra())
+
+        def _say_repeats() -> None:
+            if spawn_deck is not None:
+                for line in spawn_deck.repeat_lines():
+                    print(f"collect {line}", flush=True)
 
         def _impact_end(how: str, t_end: float) -> None:
             """Close an open impact in the sidecar so the trainer knows where the mask ends."""
@@ -1477,6 +1572,7 @@ def main(argv: list[str] | None = None) -> int:
             if stop_file(out).is_file():
                 _save_progress(done_s, target_s if target_s < float("inf") else done_s)
                 _publish(None, speed_at(done_s, speeds), waypoint_at(done_s, names))
+                _say_repeats()
                 print("collect stop requested", flush=True)
                 return 0
             elapsed = done_s
@@ -1956,6 +2052,8 @@ def main(argv: list[str] | None = None) -> int:
             if queued:
                 impact.note_row(now, row_i)
                 last_row_i = row_i
+                if spawn_deck is not None and spawn_road:
+                    spawn_deck.note_time(spawn_road, min(0.5, tick_dt))
                 yield_fire = yield_guard.update(
                     tick_dt, speed_mps_f, label_valid_at(tech, 10.0), settle.active(done_s)
                 )
@@ -2043,6 +2141,52 @@ def main(argv: list[str] | None = None) -> int:
                         f"{yield_guard.min_yield:.2f}",
                         flush=True,
                     )
+            elif (
+                queued
+                and recheck_due(recheck_s, done_s, recheck_mark)
+                and spawn_deck is not None
+                and spawn_deck.filtering()
+                and map_name == "west_coast_usa"
+                and vehicle is not None
+                and not settle.active(done_s)
+            ):
+                # Respawn when the road the AI wandered onto is unpainted. Never drops rows.
+                recheck_mark = done_s
+                here = None if pos is None else [round(float(v), 2) for v in list(pos)[:3]]
+                cov_now, road_now = spawn_deck.coverage_from(pos, direction)
+                kind_was, road_was = spawn_kind or None, spawn_road
+                plan = recheck_plan(cov_now, spawn_deck.min_paint_cov)
+                if plan == "respawn":
+                    mark = spawn_mark
+                    _apply_spawn(True)
+                    if spawn_mark == mark:
+                        plan = "keep"
+                where = "na" if here is None else f"({here[0]:.1f},{here[1]:.1f},{here[2]:.1f})"
+                print(
+                    f"collect recheck_cov {segment_id} {kind_was or '-'} "
+                    f"paint_cov={'na' if cov_now is None else format(cov_now, '.2f')} "
+                    f"min={spawn_deck.min_paint_cov:.2f} road={road_now or 'na'} "
+                    f"spawn_road={road_was or 'na'} pos={where} -> {plan}",
+                    flush=True,
+                )
+                append_jsonl(
+                    out / CUTS_FILE,
+                    recheck_record(
+                        t=now,
+                        i=last_row_i,
+                        segment=segment_id,
+                        map_name=map_name,
+                        spawn_type=kind_was,
+                        spawn_road=road_was,
+                        road=road_now,
+                        pos=here,
+                        cov=cov_now,
+                        min_cov=spawn_deck.min_paint_cov,
+                        recheck_min=recheck_min,
+                        action=plan,
+                        done_s=done_s,
+                    ),
+                )
             time.sleep(tick_sleep_s(time.monotonic() - tick_mark, 0.1))
             tick_dt = max(1e-3, time.monotonic() - tick_mark)
             done_s += tick_dt
@@ -2099,6 +2243,7 @@ def main(argv: list[str] | None = None) -> int:
         print(format_queue_line(writer.stats()), flush=True)
         if spawn_deck is not None:
             print(f"collect {spawn_deck.summary_line()}", flush=True)
+        _say_repeats()
         return 0
     finally:
         if writer is not None:

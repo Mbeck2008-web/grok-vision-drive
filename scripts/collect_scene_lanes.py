@@ -1562,6 +1562,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         return 2
     widen_socket_timeout(bng, 120.0)
     writer = None
+    # The weave in progress: (its clock, side, segment), until its one "weave end" line.
+    weave_open: tuple[Any, int, str] | None = None
     try:
         skipped_levels: list[str] = []
         if map_names:
@@ -1647,8 +1649,6 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         # recover, segment, respawn), so the weave side balance does too.
         weave_stats = WeaveStats()
         clock = ExcursionClock(weave_stats.weave_side)
-        # The weave in progress: (its clock, side, segment), until it ends.
-        weave_open: tuple[Any, int, str] | None = None
         from python.collect.liveness import (
             ImpactWatch,
             Liveness,
@@ -2663,7 +2663,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 else:
                     end_why = str(clock.reason or clock.phase)
                 weave_stats.weave_end(weave_open[1], end_why)
-                print(f"collect excursion {weave_open[2]} weave abort {end_why} "
+                print(f"collect excursion {weave_open[2]} weave end {end_why} "
                       f"side={'L' if weave_open[1] < 0 else 'R'}", flush=True)
                 weave_open = None
             if lane_change_run is not None and clock.phase != "lane_change":
@@ -3123,6 +3123,10 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         run.done_s = float(done_s)
         return 0
     finally:
+        if weave_open is not None:
+            # The run stopped inside a weave: its end line, so every started weave has one.
+            print(f"collect excursion {weave_open[2]} weave end stop side={'L' if weave_open[1] < 0 else 'R'}",
+                  flush=True)
         if writer is not None:
             writer.close()
         release_tech_beamngpy(bng)

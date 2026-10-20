@@ -1112,7 +1112,11 @@ def check_export_only_heads() -> None:
 
             onnx_out = tmp / "out" / "e2e_scene.onnx"
             msg = refused(["--export", str(onnx_out)])
-            assert "needs --checkpoint" in msg, msg
+            assert "needs --checkpoint" in msg and "Only a paused run" in msg and "deletes its pause file" in msg, msg
+            msg = refused(["--export", str(onnx_out), "--checkpoint", str(tmp / "finished.gvd-pause.npz")])
+            assert "does not exist" in msg and "deletes its pause file" in msg, msg
+            helps = {a.dest: a.help for a in ts.build_parser()._actions}
+            assert "paused run" in helps["export"] and "deletes its pause file" in helps["checkpoint"]
             msg = refused(["--export", str(onnx_out), "--checkpoint", str(checkpoint_path(tmp / "rec_old"))])
             assert "no run record" in msg, msg
             msg = refused(["--export", str(onnx_out), "--checkpoint", str(checkpoint_path(tmp / "rec_a")),

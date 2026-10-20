@@ -217,7 +217,11 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         const=str(default_onnx_path()),
         default=None,
-        help="Write models/e2e_scene.onnx (FP32 graph). Optional path.",
+        help=(
+            "Write models/e2e_scene.onnx (FP32 graph). Optional path. With --strips the trained net is "
+            "exported at the end of the run. Without --strips (export-only) it needs --checkpoint; only a "
+            "paused run can be re-exported that way, because a finished run deletes its pause file."
+        ),
     )
     parser.add_argument(
         "--checkpoint",
@@ -226,7 +230,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Export-only (--export without --strips): the pause file (*.gvd-pause.npz) whose weights are "
             "exported. gvd_heads and gvd_cams are taken from its run record; a file without one is "
-            "refused, and so is a --heads or --cams that disagrees with it."
+            "refused, and so is a --heads or --cams that disagrees with it. Only a paused run has one: "
+            "a run that finishes exports its ONNX itself and then deletes its pause file."
         ),
     )
     parser.add_argument(
@@ -2936,7 +2941,12 @@ def main(argv: list[str] | None = None) -> None:
             if not args.checkpoint:
                 raise ExportRefused(
                     "export-only needs --checkpoint <pause file>: an untrained net is never exported, "
-                    "and gvd_heads must come from the run that trained the weights"
+                    "and gvd_heads must come from the run that trained the weights. Only a paused run can be re-exported this way: a run that finishes exports its ONNX itself and then deletes its pause file."
+                )
+            if not Path(args.checkpoint).is_file():
+                raise ExportRefused(
+                    f"checkpoint {args.checkpoint} does not exist. Only a paused run can be re-exported this way: a run that finishes exports its ONNX itself and then deletes its pause file. "
+                    "Use that run's exported ONNX, or pause a run and export from its pause file."
                 )
             from python.train.checkpoint import load_checkpoint_file
 

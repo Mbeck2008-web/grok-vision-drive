@@ -8,11 +8,12 @@ This is an **alpha** (`VERSION` 1.7.12). It may break.
 
 Every feature in this README carries exactly one status label:
 
-- **Proven live on Desktop-IQU45**: a log or clip from that PC, under `E:\GVD_data` or in this repo, shows it working.
+- **Proven live on the dev PC**: a log or clip from the dev PC, under `E:\GVD_data` or in this repo, shows it working.
+- **Proven live: recording only**: a live run on the dev PC recorded data with it. Nothing about GVD driving the car is proven by that run.
 - **Offline smoke only**: an offline test in `scripts/` exercises it without BeamNG and without a GPU. GitHub Actions runs those tests (`.github/workflows/tests.yml`). It has not been confirmed in a live game.
 - **Unproven**: nothing on file shows it working yet.
 
-No feature in this README is labelled Proven live yet. Live BeamNG.tech behaviour (Alt+G, the in-game ribbon, the eight-camera drive, force feedback) is **Unproven**.
+One feature is proven live, and only for recording: the command-line collector, `scripts/collect_scene_lanes.py`. The rec2 and rec3 runs recorded on the dev PC on 2026-10-19 while BeamNG's AI drove. Evidence: `E:\GVD_data\logs\rec3_20261019.txt`, `E:\GVD_data\scene_lanes_rec3\collect.json`. rec3 used the collector from branch `collector-spawn-crash-fix` (6a07d65), which adds a paint-coverage spawn filter and a weave guard that this branch does not have. Everything about GVD driving, including Alt+G, the in-game ribbon, the eight-camera drive and force feedback, is **Unproven**.
 
 ## Quick start
 
@@ -135,7 +136,7 @@ Key `0` hides every layer and shows the clean stage only.
 
 #### AUTO tab: Automatic Mode
 
-Automatic Mode records while BeamNG's own AI drives. GVD does not steer. Every saved tick is labelled `driver=beamng_ai`. The tab and the command line start the same collector, `scripts/collect_scene_lanes.py`.
+Automatic Mode records while BeamNG's own AI drives. GVD does not steer. Every saved tick is labelled `driver=beamng_ai`. The tab and the command line start the same collector, `scripts/collect_scene_lanes.py`. The live runs so far (rec2, rec3) were started from the command line, not from this tab, so the tab itself is Offline smoke only. The collector it starts is Proven live: recording only (see the CLI table).
 
 | Control | Click does | Default | Status |
 | --- | --- | --- | --- |
@@ -246,7 +247,7 @@ The game bus lives in the running product's `Documents/GVD` folder (`%LOCALAPPDA
 | Command | Key flags (default) | Status |
 | --- | --- | --- |
 | `py -3 python\run_vision.py` (supervisor; the `.bat` launchers add `--viz`) | `--viz` (off), `--backend auto\|beamngpy\|window\|stub` (auto), `--hz` (15), `--policy modular\|e2e\|shadow` (modular, from `config/control.yaml`), `--lane-source hough\|scene\|gt` (hough), `--scene-onnx` (`models/e2e_scene.onnx`), `--detector` (auto), `--e2e-model` (auto), `--viz-screen auto\|1\|2` (auto), `--viz-fullscreen`, `--encode auto\|qsv\|cpu\|nvenc` (auto), `--gt-log` (off), `--foxglove` (off), `--tech-probe`, `--tech-hold`, `--smoke`, `--vision-only`, `--allow-preview-drive` (off), `--allow-synthetic-detect` (off), `--force-engage` (dev only, off) | Unproven |
-| `py -3 scripts\collect_scene_lanes.py` (collector) | `--minutes` (45), `--until-disk`, `--map`, `--maps`, `--map-weights`, `--segment-min` (12), `--route span\|waypoints\|random` (span), `--waypoints`, `--speed-min` (8), `--speed-max` (17), `--cameras` (all), `--rates`, `--traffic [N]`, `--respawn-min` (0), `--time-of-day`, `--weather`, `--no-excursions`, `--no-vary-env`, `--smoke-s` (60), `--out`, `--data-dir`, `--reload-level`, `--check-maps`, `--list-levels`, `--dump-roads`, `--host`, `--port` | Unproven |
+| `py -3 scripts\collect_scene_lanes.py` (collector) | `--minutes` (45), `--until-disk`, `--map`, `--maps`, `--map-weights`, `--segment-min` (12), `--route span\|waypoints\|random` (span), `--waypoints`, `--speed-min` (8), `--speed-max` (17), `--cameras` (all), `--rates`, `--traffic [N]`, `--respawn-min` (0), `--time-of-day`, `--weather`, `--no-excursions`, `--no-vary-env`, `--smoke-s` (60), `--out`, `--data-dir`, `--reload-level`, `--check-maps`, `--list-levels`, `--dump-roads`, `--host`, `--port` | Proven live: recording only (`E:\GVD_data\logs\rec3_20261019.txt`, `E:\GVD_data\scene_lanes_rec3\collect.json`) |
 | `py -3 -m python.train.train_scene` (trainer) | see Technical details | Offline smoke only |
 | `py -3 scripts\gvd_status.py` | none | Offline smoke only |
 | `py -3 scripts\bot_engage.py on\|off` | none | Offline smoke only |
@@ -341,7 +342,8 @@ Labels come from the painted line decals the camera actually sees: every `DecalR
 
 | Step | What happens | Status |
 | --- | --- | --- |
-| Collector | `scripts/collect_scene_lanes.py` attaches to a running BeamNG.tech on port 25252, never launches or closes it, and lets BeamNG's AI drive (`span` mode, lane keeping, speed limit changing every 3 minutes). Each tick writes one lossless file per camera (PNG for uint8), `state.jsonl` (timestamps, `dt_s`, camera pose and intrinsics) and `gt.jsonl` (lane targets). The first 60 s is a PNG decode smoke check. | Unproven |
+| Collector | `scripts/collect_scene_lanes.py` attaches to a running BeamNG.tech on port 25252, never launches or closes it, and lets BeamNG's AI drive (`span` mode, lane keeping, speed limit changing every 3 minutes). Each tick writes one lossless file per camera (PNG for uint8), `state.jsonl` (timestamps, `dt_s`, camera pose and intrinsics) and `gt.jsonl` (lane targets). The first 60 s is a PNG decode smoke check. | Proven live: recording only (`E:\GVD_data\logs\rec3_20261019.txt`, `E:\GVD_data\scene_lanes_rec3\collect.json`) |
+| Raw vs lossy | Training data comes only from the collector's lossless PNG files under `raw/`. The supervisor's Start recording JPEG strips and the review captures are for viewing, not training. The trainer and `eval_scene_lanes.py` can still read `strips/*.jpg` from a folder that has no `raw/`, so never point `--strips` at a Start recording folder. The frame cache reads `raw/` only. | Offline smoke only |
 | Spawn deck | On west_coast_usa, `--respawn-min N` teleports to a new stratified spawn every N minutes: about 40% city, 35% highway, 25% ramps, each road used once per run (`python/collect/spawn_mix.py`). | Offline smoke only |
 | Data disk | Data lives on `E:\GVD_data` (`GVD_DATA_DIR` overrides it). C: and D: are refused as the data root. Runs stop under 20 GB free. E: is FAT32, so no file may exceed 4 GB. | Offline smoke only |
 | Frame cache | `--build-cache <dir>` decodes the chosen cameras into `.npy` chunks under 3.5 GB each, then exits. `--cache <dir>` memory-maps them. The examples below use `C:\GVD_cache`. | Offline smoke only |
@@ -429,7 +431,7 @@ Before the first step the trainer measures free VRAM and shrinks the batch until
 - **Lane keeping only.** There is no intersection handling, no turns at junctions and no routing.
 - **Trained on west_coast_usa only.** Treat any model as a west_coast_usa model. The labelled data so far is mostly from that map, and the spawn deck covers only that map.
 - **Vision-only toy, not a driver aid.** LiDAR, radar and IMU extras are for display and are ignored by the planner.
-- **Not every collision is caught.** This branch has no `impacts.jsonl`. Crashes are inferred from vehicle damage jumps and stuck detection, which miss light contacts.
+- **Not every collision is caught.** The collector on this branch writes no `impacts.jsonl`; the collector fix branch (`collector-spawn-crash-fix`) adds one, and it does not catch every collision either. The supervisor infers crashes from vehicle damage jumps and stuck detection, which miss light contacts.
 - Retail BeamNG.drive is one window capture, not eight cameras.
 
 ## Credits

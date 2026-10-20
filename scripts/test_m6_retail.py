@@ -283,12 +283,33 @@ def _touch_lua_bus() -> Path:
     abs_pin = pin if pin.is_absolute() else pin.resolve()
     abs_pin.mkdir(parents=True, exist_ok=True)
     payload = json.dumps({"lua_bus": str(abs_pin)})
-    (pin / "gvd_link.json").write_text(payload, encoding="utf-8")
-    _stamp_file(pin / "gvd_link.json")
+    _write_link_atomic(pin, payload)
     if abs_pin != pin:
-        (abs_pin / "gvd_link.json").write_text(payload, encoding="utf-8")
-        _stamp_file(abs_pin / "gvd_link.json")
+        _write_link_atomic(abs_pin, payload)
     return abs_pin
+
+
+def _write_link_atomic(folder: Path, payload: str) -> None:
+    """Write gvd_link.json via a temp file + os.replace. The test rewrites it every ~10 ms;
+    an in-place write_text (truncate, then write) let run_vision read it empty and stop one
+    tick with bus_mismatch. This fixes the test's writer only, not main.lua's.
+
+    On Windows os.replace raises PermissionError while run_vision has the target open, so
+    retry that one error briefly (at most ~50 ms); anything else, or a longer hold, raises."""
+    tmp = folder / "gvd_link.json.tmp"
+    tmp.write_text(payload, encoding="utf-8")
+    _stamp_file(tmp)
+    for attempt in range(LINK_REPLACE_ATTEMPTS):
+        try:
+            os.replace(tmp, folder / "gvd_link.json")
+            return
+        except PermissionError:
+            if attempt + 1 >= LINK_REPLACE_ATTEMPTS:
+                raise
+            time.sleep(0.001)
+
+
+LINK_REPLACE_ATTEMPTS = 50
 
 
 # The fake mod plays gvd_main's meaning of echo_seq: its own counter, +1 per echo written
@@ -737,7 +758,7 @@ def check_run_vision_e2e() -> None:
     assert cmd["reason"] == "not_engaged"
     st = read_state()
     assert st and st["engaged"] is False and st["cmd_applied"] is False and st["actuator"] == "cmd_json"
-    assert st["cmd_reason"] == "not_engaged" and st["ego_source"] == "none"
+    assert st["cmd_reason"] == "not_engaged" and st["ego_source"] == "none", st
     # Loaded nets keep writing path / tracks / shadow while the car is still yours.
     assert isinstance(st.get("path_ego"), list) and len(st["path_ego"]) >= 2, st.get("path_ego")
     assert isinstance(st.get("tracks"), list)

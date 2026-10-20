@@ -4,7 +4,7 @@ Grok Vision Drive is a camera-only driving toy for BeamNG.drive and BeamNG.tech.
 
 ## Status
 
-This is an **alpha**. Only one thing has run for real in BeamNG: the scene-net data collector, recording while BeamNG's own AI drove. Live BeamNG.tech driving by a trained model is **not proven yet**. Force feedback and the steering-takeover fix are **not live-tested** either. GVD enters **beta** when a trained model drives the car in BeamNG.
+This is an **alpha**. Only one thing has run for real in BeamNG: the command-line scene-net collector, `scripts/collect_scene_lanes.py`, recording while BeamNG's own AI drove. It is on the scene-net branch. Live BeamNG.tech driving by a trained model is **not proven yet**. Force feedback and the steering-takeover fix are **not live-tested** either. GVD enters **beta** when a trained model drives the car in BeamNG.
 
 Known limits: no unpainted roads (lane labels need painted lines), the labelled data so far is mostly west_coast_usa, and Alt+G, Tech 8-cam and Quick Sync have no live proof.
 
@@ -44,7 +44,7 @@ GVD runs a dual viz: the **GVD VISION** window on the desktop, and a world drawi
 
 These are on `cursor/scene-net-collect-e194` (PR #94) and are not on main yet.
 
-- **Scene-net data collector** (`scripts/collect_scene_lanes.py`). **Automatic Mode** records while BeamNG's AI drives and GVD only records. It targets west_coast_usa. Small steering nudges (weaves, lane changes) add variety. They are planned at the higher of the measured and the target speed, are aborted on overspeed, and are capped by lateral acceleration. After a logged impact the car respawns at a new spot. Labels come from the painted lane lines. This is the one part that has run live, and only for recording.
+- **Scene-net data collector** (`scripts/collect_scene_lanes.py`). BeamNG's AI drives and GVD only records. It targets west_coast_usa. The command-line collector is the one part that has run live, and only for recording. The **Automatic Mode** buttons in GVD VISION start the same collector, but they have only passed offline tests. Small steering nudges (weaves, lane changes) add variety. They are planned at the higher of the measured and the target speed, are aborted on overspeed, and are capped by lateral acceleration. Their first live recording started on 2026-10-20 and has not been reviewed yet. After a logged impact the car respawns at a new spot. Labels come from the painted lane lines.
 - **Scene-net trainer.** Event masking (dropping impacts and aborted nudges from the loss) is pending in PR #87 and is **not merged**.
 - **Force-feedback takeover (mod 1.7.13).** The supervisor judges each fresh wheel echo from the mod once, so repeated force-feedback kicks no longer look like the driver taking over. A stale echo fails safe. Offline-tested only.
 

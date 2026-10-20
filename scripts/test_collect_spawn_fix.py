@@ -408,18 +408,9 @@ class _CrashVehicle:
         return True
 
 
-# Companion-car states the mocked bng.vehicles.get_states reports ({} = none).
-_TRAFFIC_STATES: dict = {}
-
-
 class _Api:
     def __init__(self, vehicle) -> None:
         self.vehicle = vehicle
-        self.state_calls: list[list[str]] = []
-
-    def get_states(self, names):
-        self.state_calls.append(list(names))
-        return {k: v for k, v in _TRAFFIC_STATES.items() if k in names}
 
     def get_current(self):
         return {"ego": self.vehicle}
@@ -989,25 +980,6 @@ def check_traffic_slots() -> None:
     print(f"traffic slots ok: ahead {la:.0f} m at ({pa[0]:.1f},{pa[1]:.1f}), behind {lb:.0f} m; fallback and skip noted")
 
 
-def check_nearest_traffic() -> None:
-    import scripts.collect_scene_lanes as collect
-    from python.collect.spawn_mix import nearest_traffic, traffic_names
-
-    assert traffic_names(2) == ["gvd_traffic_0", "gvd_traffic_1"] and traffic_names(0) == []
-    states = {"gvd_traffic_0": {"pos": [3.0, 4.0, 0.0], "vel": [0.0, 0.0, 0.0]},
-              "gvd_traffic_1": {"pos": [0.0, -30.0, 0.0], "vel": [0.0, 12.0, 0.0]}}
-    d, vid, rel = nearest_traffic([0.0, 0.0, 0.0], (6.0, 8.0), states)
-    assert abs(d - 5.0) < 1e-9 and vid == "gvd_traffic_0" and abs(rel - 10.0) < 1e-9, (d, vid, rel)
-    d, vid, rel = nearest_traffic([0.0, 0.0, 0.0], None, states)
-    assert vid == "gvd_traffic_0" and rel is None
-    assert nearest_traffic([0, 0, 0], (1.0, 0.0), {}) == (None, None, None)
-    assert nearest_traffic([0, 0, 0], (1.0, 0.0), {"x": {"pos": None}}) == (None, None, None)
-    assert collect.traffic_near_text(None, None, None) == "traffic=na"
-    assert collect.traffic_near_text(5.0, "gvd_traffic_0", 10.0) == "traffic=gvd_traffic_0 dist=5.0m rel=10.0m/s"
-    assert collect.traffic_near_text(5.0, "gvd_traffic_0", None) == "traffic=gvd_traffic_0 dist=5.0m rel=nam/s"
-    print("nearest traffic ok")
-
-
 def check_stall_respawn_helpers() -> None:
     import scripts.collect_scene_lanes as collect
 
@@ -1085,30 +1057,24 @@ def check_stall_respawn_run() -> None:
 
 
 def check_impact_traffic_run() -> None:
-    """End to end on the west coast: traffic is placed along the road and logged; the impact
-    line and impacts.jsonl carry the nearest car, its distance and the closing speed."""
-    global _TRAFFIC_STATES
+    """End to end on the west coast: traffic is placed along the road and logged; an impact
+    keeps its decel line and impacts.jsonl event, with no traffic attribution and no
+    BeamNG vehicle-state query (the mock has no get_states)."""
     paint = _Paint(lambda x, y: x > 1000.0)
     crash = lambda n: 10.0 if n <= 40 or n > 75 else 0.2  # noqa: E731
-    _TRAFFIC_STATES = {"gvd_traffic_0": {"pos": [0.4, 30.0, 0.5], "vel": [0.0, 2.0, 0.0]},
-                       "gvd_traffic_1": {"pos": [0.4, -40.0, 0.5], "vel": [0.0, 9.0, 0.0]}}
-    try:
-        code, text, out = _run_west_coast(paint, _west_pools(), [], 300, speed_at=crash)
-    finally:
-        _TRAFFIC_STATES = {}
+    assert not hasattr(_Api(None), "get_states")
+    code, text, out = _run_west_coast(paint, _west_pools(), [], 300, speed_at=crash)
     assert code == 0, text[-2500:]
     placed = [x for x in text.splitlines() if x.startswith("collect traffic west_coast_usa#")]
     assert placed and "placed ahead=60.0m behind=40.0m (want ahead=60m behind=40m along the road)" in placed[0], placed
     line = [x for x in text.splitlines() if x.startswith("collect impact west_coast_usa#") and " decel=" in x]
-    assert len(line) == 1 and line[0].endswith("traffic=gvd_traffic_0 dist=18.0m rel=-1.8m/s"), line
+    assert len(line) == 1 and line[0].endswith("decel=98.0 m/s2 v=10.0->0.2 excursion=cruise"), line
+    assert "traffic=" not in line[0] and "state unavailable" not in text
     ev = [json.loads(x) for x in (out / "impacts.jsonl").read_text(encoding="utf-8").splitlines()][0]
-    assert ev["traffic_id"] == "gvd_traffic_0" and ev["traffic_dist_m"] == 18.0 and ev["traffic_rel_speed_mps"] == -1.8, ev
-    # No traffic reported: the fields are null and the line says traffic=na.
-    code, text2, out2 = _run_west_coast(paint, _west_pools(), [], 300, speed_at=crash)
-    ev2 = [json.loads(x) for x in (out2 / "impacts.jsonl").read_text(encoding="utf-8").splitlines()][0]
-    assert ev2["traffic_dist_m"] is None and ev2["traffic_id"] is None and ev2["traffic_rel_speed_mps"] is None, ev2
-    assert [x for x in text2.splitlines() if x.startswith("collect impact west_coast_usa#") and " decel=" in x][0].endswith("traffic=na")
-    print(f"impact traffic run: {line[0].split(' excursion=')[1]}")
+    assert ev["kind"] == "impact" and ev["decel_mps2"] == 98.0, ev
+    assert not any(k.startswith("traffic") for k in ev), ev
+    assert "collect abort impact" in text and "respawning" in text
+    print(f"impact run: {line[0].split(' ', 3)[-1]}; no traffic attribution")
 
 
 def main() -> None:
@@ -1137,7 +1103,6 @@ def main() -> None:
     check_resume_skips_recorded()
     check_recheck_types_and_resume_run()
     check_traffic_slots()
-    check_nearest_traffic()
     check_stall_respawn_helpers()
     check_deck_exhausted_run()
     check_stall_respawn_run()

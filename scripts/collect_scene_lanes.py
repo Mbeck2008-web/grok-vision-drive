@@ -52,10 +52,7 @@ Row fields in ``state.jsonl`` written by this collector, besides the frame data:
 * ``ego.up``: the State sensor's up vector. ``ego.damage``: Damage sensor total.
 
 ``impacts.jsonl`` beside ``state.jsonl`` has one ``{"kind": "impact", "t",
-"i", "pre_t0", "pre_i0", ..., "traffic_dist_m", "traffic_id",
-"traffic_rel_speed_mps"}`` line per impact (the nearest companion car, its
-scene name and the closing speed, positive when the gap shrinks; null when
-there is no traffic or BeamNG does not report it) and one ``{"kind":
+"i", "pre_t0", "pre_i0", ...}`` line per impact and one ``{"kind":
 "impact_end", "t", "how"}`` line when it ends (``respawn``, ``drove_on``, or
 the abort reason). ``t`` matches the row ``t`` exactly; ``i`` is the row index
 the writer was expected to assign (``i_row`` ``impact``). When the impact
@@ -158,7 +155,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from python.data.raw_frames import controls_from_state
-from python.collect.spawn_mix import nearest_traffic, traffic_count, traffic_names
+from python.collect.spawn_mix import traffic_count
 
 SPEEDS_MPS = (8.0, 11.0, 14.0, 17.0, 10.0)
 SPEED_HOLD_S = 180.0
@@ -467,14 +464,6 @@ def defer_stationary(why: str, stall_respawn_s: float, slow_s: float, can_respaw
     if why == "stationary" and float(stall_respawn_s) > 0.0 and can_respawn and float(slow_s) < float(stall_respawn_s):
         return ""
     return why
-
-
-def traffic_near_text(dist_m: float | None, vid: str | None, closing: float | None) -> str:
-    """The impact line's traffic part."""
-    if dist_m is None:
-        return "traffic=na"
-    rel = "na" if closing is None else format(closing, ".1f")
-    return f"traffic={vid} dist={dist_m:.1f}m rel={rel}m/s"
 
 
 def recheck_plan(cov: float | None, min_cov: float) -> str:
@@ -2244,19 +2233,6 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             impact_event: dict[str, Any] | None = None
             if impact_decel is not None:
                 pre_t, pre_i = impact.pre_window()
-                t_dist = t_id = t_rel = None
-                n_traffic = traffic_count(args.traffic, map_name) if map_name == "west_coast_usa" and spawn_kind else 0
-                getter = getattr(getattr(bng, "vehicles", None), "get_states", None)
-                if n_traffic and callable(getter) and pos is not None:
-                    try:
-                        states = getter(traffic_names(n_traffic))
-                        ego_vel = None
-                        if direction is not None and speed_mps_f is not None:
-                            norm = math.hypot(float(direction[0]), float(direction[1])) or 1.0
-                            ego_vel = (float(direction[0]) / norm * speed_mps_f, float(direction[1]) / norm * speed_mps_f)
-                        t_dist, t_id, t_rel = nearest_traffic(pos, ego_vel, states if isinstance(states, dict) else None)
-                    except Exception as exc:
-                        print(f"collect impact traffic state unavailable: {type(exc).__name__}: {exc}", flush=True)
                 impact_event = {
                     "kind": "impact",
                     "t": round(float(now), 6),
@@ -2269,16 +2245,12 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     "segment": segment_id,
                     "excursion": clock.phase,
                     "pos": pos,
-                    "traffic_dist_m": None if t_dist is None else round(float(t_dist), 2),
-                    "traffic_id": t_id,
-                    "traffic_rel_speed_mps": None if t_rel is None else round(float(t_rel), 2),
                 }
                 before_txt = "na" if impact.speed_before is None else format(impact.speed_before, ".1f")
                 after_txt = "na" if speed_mps_f is None else format(speed_mps_f, ".1f")
                 print(
                     f"collect impact {segment_id} decel={impact_decel:.1f} m/s2 "
-                    f"v={before_txt}->{after_txt} excursion={clock.phase} "
-                    f"{traffic_near_text(t_dist, t_id, t_rel)}",
+                    f"v={before_txt}->{after_txt} excursion={clock.phase}",
                     flush=True,
                 )
                 if clock.phase in ACTIVE:

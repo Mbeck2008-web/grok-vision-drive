@@ -997,35 +997,3 @@ def traffic_lua(pick: SpawnPick, count: int, slots: list[Any] | None = None) -> 
         lines.append("end")
     return [" ".join(lines)]
 
-
-def traffic_names(count: int) -> list[str]:
-    """Scene names ``traffic_lua`` gives the companion cars."""
-    return [f"gvd_traffic_{slot}" for slot in range(max(0, int(count)))]
-
-
-def nearest_traffic(
-    ego_pos: Any, ego_vel: Any, states: dict[str, Any] | None
-) -> tuple[float | None, str | None, float | None]:
-    """``(dist_m, id, closing_mps)`` of the nearest car in ``states`` ({id: {pos, vel}}).
-
-    ``closing_mps`` is how fast the gap shrinks (positive: getting closer);
-    None without both velocities. All None when nothing has a position.
-    """
-    best: tuple[float, str, Any] | None = None
-    for vid, st in (states or {}).items():
-        p = (st or {}).get("pos") if isinstance(st, dict) else None
-        if not isinstance(p, (list, tuple)) or len(p) < 2 or ego_pos is None:
-            continue
-        d = math.dist([float(v) for v in p[:3]], [float(v) for v in list(ego_pos)[: len(p[:3])]])
-        if best is None or d < best[0]:
-            best = (d, str(vid), st)
-    if best is None:
-        return None, None, None
-    d, vid, st = best
-    vel = st.get("vel")
-    closing = None
-    if ego_vel is not None and isinstance(vel, (list, tuple)) and len(vel) >= 2 and d > 1e-6:
-        p = st["pos"]
-        ux, uy = (float(p[0]) - float(ego_pos[0])) / d, (float(p[1]) - float(ego_pos[1])) / d
-        closing = (float(ego_vel[0]) - float(vel[0])) * ux + (float(ego_vel[1]) - float(vel[1])) * uy
-    return d, vid, closing

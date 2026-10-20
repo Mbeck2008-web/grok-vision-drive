@@ -4,6 +4,10 @@ Highway is a wide or one-way multi-lane road. A ramp is a short one-way
 road that touches both a highway and a local road. Everything else that
 is drivable is a city street. The mix is about 40% city, 35% highway,
 25% ramps, and a road is used once per run.
+
+With a painted-lane map, ``SpawnDeck`` can also skip a road whose next
+300 m carries little line paint (``min_paint_cov``). The labeler reads the
+paint, so a spawn on unpainted road records minutes of masked rows.
 """
 
 from __future__ import annotations
@@ -15,7 +19,7 @@ import random
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 CITY = "city"
 HIGHWAY = "highway"
@@ -26,6 +30,19 @@ SPEED = {CITY: (8.0, 14.0), HIGHWAY: (20.0, 30.0), RAMP: (10.0, 18.0)}
 # A link counts when the ends sit about this close. The cell is only a search.
 LINK_M = 30.0
 CELL_M = 20.0
+# Paint coverage of the road ahead of a spawn: one probe every 10 m over the
+# next 300 m of the spawn road and the roads it continues into. A probe counts
+# when the painted labeler finds the ego lane 10 m ahead of it, on the road
+# centerline or half a lane to either side (a two-way road only looks right).
+PAINT_STEP_M = 10.0
+PAINT_AHEAD_M = 300.0
+PAINT_PROBE_Y_M = 10.0
+PAINT_LANE_M = 1.75
+# Road ends this close join the walk ahead. The turn there must be under 60 deg.
+PAINT_JOIN_M = 8.0
+PAINT_JOIN_COS = 0.5
+# Low-coverage candidates looked at per kind before falling back.
+PAINT_MAX_TRIES = 40
 
 
 @dataclass(frozen=True)
@@ -35,6 +52,8 @@ class SpawnPick:
     pos: tuple[float, float, float]
     rot: tuple[float, float, float, float]
     speed: tuple[float, float]
+    # Share of probes ahead with a painted ego lane. None: not measured.
+    paint_cov: float | None = None
 
 
 def _num(value: Any, default: float = 0.0) -> float:
@@ -58,6 +77,140 @@ def _middles(road: dict[str, Any]) -> list[tuple[float, float, float]]:
         if isinstance(middle, (list, tuple)) and len(middle) >= 3:
             points.append((float(middle[0]), float(middle[1]), float(middle[2])))
     return points
+
+
+def _tail_from(
+    points: list[tuple[float, float, float]], fraction: float = 0.4
+) -> list[tuple[float, float, float]]:
+    """The centerline from the ``_pose_at`` point to the road end, at road height."""
+    if len(points) < 2:
+        return list(points)
+    total = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(points, points[1:]))
+    target = min(total * float(fraction), max(0.0, total - 1.0))
+    walked = 0.0
+    for i, (a, b) in enumerate(zip(points, points[1:])):
+        step = math.hypot(b[0] - a[0], b[1] - a[1])
+        if step >= 1e-3 and walked + step >= target:
+            mix = min(1.0, max(0.0, (target - walked) / step))
+            start = tuple(a[k] + (b[k] - a[k]) * mix for k in range(3))
+            return [start] + [tuple(p) for p in points[i + 1 :]]
+        walked += step
+    return [tuple(p) for p in points[-2:]]
+
+
+def _polyline_m(points: list[tuple[float, float, float]]) -> float:
+    return sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(points, points[1:]))
+
+
+def road_ahead(
+    road: dict[str, Any],
+    roads_by_id: dict[str, dict[str, Any]],
+    ends: dict[tuple[int, int], list[tuple[str, bool]]],
+    ahead_m: float = PAINT_AHEAD_M,
+    fraction: float = 0.4,
+) -> list[tuple[float, float, float]]:
+    """Centerline from the spawn point forward, continued into joining roads.
+
+    At each road end the walk takes the joining road that turns least (under
+    60 deg). A one-way road is only entered at its start. It stops at a dead
+    end, a sharp turn, or ``ahead_m``.
+    """
+    chain = _tail_from(road["pts"], fraction)
+    seen = {str(road["id"])}
+    length = _polyline_m(chain)
+    while length < float(ahead_m) and len(chain) >= 2 and len(seen) < 64:
+        tail, prev = chain[-1], chain[-2]
+        hx, hy = tail[0] - prev[0], tail[1] - prev[1]
+        norm = math.hypot(hx, hy)
+        if norm < 1e-6:
+            break
+        hx, hy = hx / norm, hy / norm
+        cx, cy = int(tail[0] // PAINT_JOIN_M), int(tail[1] // PAINT_JOIN_M)
+        best: tuple[float, str, list[tuple[float, float, float]]] | None = None
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for rid, at_start in ends.get((cx + dx, cy + dy), ()):
+                    if rid in seen:
+                        continue
+                    other = roads_by_id.get(rid)
+                    if other is None or (not at_start and other["oneway"]):
+                        continue
+                    seq = list(other["pts"]) if at_start else list(other["pts"])[::-1]
+                    if math.hypot(seq[0][0] - tail[0], seq[0][1] - tail[1]) > PAINT_JOIN_M:
+                        continue
+                    k = 1
+                    while k < len(seq) - 1 and math.hypot(seq[k][0] - seq[0][0], seq[k][1] - seq[0][1]) < 1.0:
+                        k += 1
+                    ux, uy = seq[k][0] - seq[0][0], seq[k][1] - seq[0][1]
+                    un = math.hypot(ux, uy)
+                    if un < 1e-6:
+                        continue
+                    dot = (ux * hx + uy * hy) / un
+                    if dot >= PAINT_JOIN_COS and (best is None or dot > best[0]):
+                        best = (dot, rid, seq)
+        if best is None:
+            break
+        seen.add(best[1])
+        added = [tuple(p) for p in best[2][1:]]
+        length += _polyline_m([chain[-1]] + added)
+        chain.extend(added)
+    return chain
+
+
+def sample_along(
+    chain: list[tuple[float, float, float]],
+    step_m: float = PAINT_STEP_M,
+    ahead_m: float = PAINT_AHEAD_M,
+) -> list[tuple[float, float, float, float, float]]:
+    """``(x, y, z, fx, fy)`` every ``step_m`` from the chain start, below ``ahead_m``."""
+    out: list[tuple[float, float, float, float, float]] = []
+    step = max(1.0, float(step_m))
+    next_at = 0.0
+    walked = 0.0
+    for a, b in zip(chain, chain[1:]):
+        seg = math.hypot(b[0] - a[0], b[1] - a[1])
+        if seg < 1e-6:
+            continue
+        fx, fy = (b[0] - a[0]) / seg, (b[1] - a[1]) / seg
+        while next_at <= walked + seg + 1e-9 and next_at < float(ahead_m) - 1e-9:
+            mix = (next_at - walked) / seg
+            out.append(
+                (
+                    a[0] + (b[0] - a[0]) * mix,
+                    a[1] + (b[1] - a[1]) * mix,
+                    a[2] + (b[2] - a[2]) * mix,
+                    fx,
+                    fy,
+                )
+            )
+            next_at += step
+        walked += seg
+    return out
+
+
+def paint_coverage(
+    painted: Any,
+    samples: list[tuple[float, float, float, float, float]],
+    *,
+    oneway: bool = False,
+    probe_y_m: float = PAINT_PROBE_Y_M,
+) -> float:
+    """Share of ``samples`` where ``painted.lane_at`` finds the ego lane at ``probe_y_m``.
+
+    ``painted`` only needs ``lane_at(pos, direction, ys)``. No samples is 0.
+    """
+    if not samples:
+        return 0.0
+    offsets = (0.0, PAINT_LANE_M, -PAINT_LANE_M) if oneway else (0.0, PAINT_LANE_M)
+    good = 0
+    for x, y, z, fx, fy in samples:
+        rx, ry = fy, -fx
+        for off in offsets:
+            got = painted.lane_at((x + rx * off, y + ry * off, z), (fx, fy, 0.0), (float(probe_y_m),))
+            if got and got[0] is not None:
+                good += 1
+                break
+    return good / float(len(samples))
 
 
 def _pose_at(points: list[tuple[float, float, float]], fraction: float = 0.4) -> tuple[
@@ -173,36 +326,115 @@ def classify_roads(roads: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]
 
 
 class SpawnDeck:
-    """Hands out unused spawns in the 40/35/25 mix."""
+    """Hands out unused spawns in the 40/35/25 mix.
 
-    def __init__(self, pools: dict[str, list[dict[str, Any]]], rng: random.Random | None = None) -> None:
+    With ``painted`` and ``min_paint_cov`` > 0, a road whose paint coverage
+    ahead is below the threshold is skipped (and used up). After
+    ``max_tries`` skips in a kind the next kind is tried. When every kind is
+    out of tries, the best-covered skipped road is returned anyway, so a
+    respawn never fails because of paint. ``log`` gets one line per pick and
+    per skip.
+    """
+
+    def __init__(
+        self,
+        pools: dict[str, list[dict[str, Any]]],
+        rng: random.Random | None = None,
+        *,
+        painted: Any = None,
+        min_paint_cov: float = 0.0,
+        max_tries: int = PAINT_MAX_TRIES,
+        log: Callable[[str], None] | None = None,
+    ) -> None:
         self.pools = {kind: list(pools.get(kind) or []) for kind in KINDS}
         self.rng = rng or random.Random(0)
         for pool in self.pools.values():
             self.rng.shuffle(pool)
         self.used: set[str] = set()
         self.counts = {kind: 0 for kind in KINDS}
+        self.painted = painted
+        self.min_paint_cov = max(0.0, float(min_paint_cov or 0.0))
+        self.max_tries = max(1, int(max_tries))
+        self.log = log
+        self.skipped = 0
+        self._by_id: dict[str, dict[str, Any]] = {}
+        self._ends: dict[tuple[int, int], list[tuple[str, bool]]] = defaultdict(list)
+        for pool in self.pools.values():
+            for road in pool:
+                self._by_id[str(road["id"])] = road
+                for point, at_start in ((road["pts"][0], True), (road["pts"][-1], False)):
+                    key = (int(point[0] // PAINT_JOIN_M), int(point[1] // PAINT_JOIN_M))
+                    self._ends[key].append((str(road["id"]), at_start))
 
     @classmethod
-    def load(cls, path: Path | str, rng: random.Random | None = None) -> SpawnDeck:
-        return cls(classify_roads(load_nav_roads(path)), rng)
+    def load(
+        cls,
+        path: Path | str,
+        rng: random.Random | None = None,
+        **kwargs: Any,
+    ) -> SpawnDeck:
+        return cls(classify_roads(load_nav_roads(path)), rng, **kwargs)
 
-    def take(self) -> SpawnPick | None:
-        kind = self._next_kind()
-        if kind is None:
-            return None
-        pool = [road for road in self.pools[kind] if road["id"] not in self.used]
-        if not pool:
-            return None
-        road = pool[0]
-        pose = _pose_at(road["pts"])
-        if pose is None:
-            self.used.add(road["id"])
-            return self.take()
-        self.used.add(road["id"])
+    def filtering(self) -> bool:
+        return self.painted is not None and bool(self.painted) and self.min_paint_cov > 0.0
+
+    def coverage(self, road: dict[str, Any]) -> float:
+        """Paint coverage over the next ``PAINT_AHEAD_M`` from this road's spawn point."""
+        chain = road_ahead(road, self._by_id, self._ends, PAINT_AHEAD_M)
+        return paint_coverage(self.painted, sample_along(chain), oneway=bool(road["oneway"]))
+
+    def _say(self, text: str) -> None:
+        if self.log is not None:
+            self.log(text)
+
+    def _pick(self, kind: str, road: dict[str, Any], pose: Any, cov: float | None) -> SpawnPick:
         self.counts[kind] += 1
         pos, rot = pose
-        return SpawnPick(kind, road["id"], pos, rot, SPEED[kind])
+        return SpawnPick(kind, road["id"], pos, rot, SPEED[kind], cov)
+
+    def take(self) -> SpawnPick | None:
+        first = self._next_kind()
+        if first is None:
+            return None
+        order = [first] + [kind for kind in self._kinds_by_deficit() if kind != first]
+        filtering = self.filtering()
+        tried: list[tuple[float, str, dict[str, Any], Any]] = []
+        for kind in order:
+            budget = self.max_tries
+            for road in [item for item in self.pools[kind] if item["id"] not in self.used]:
+                pose = _pose_at(road["pts"])
+                self.used.add(road["id"])
+                if pose is None:
+                    continue
+                if not filtering:
+                    return self._pick(kind, road, pose, None)
+                cov = self.coverage(road)
+                if cov >= self.min_paint_cov:
+                    self._say(
+                        f"spawn pick {kind} road={road['id']} paint_cov={cov:.2f} "
+                        f"(>={self.min_paint_cov:.2f}, skipped {len(tried)})"
+                    )
+                    return self._pick(kind, road, pose, cov)
+                self.skipped += 1
+                tried.append((cov, kind, road, pose))
+                self._say(
+                    f"spawn skip {kind} road={road['id']} paint_cov={cov:.2f} (<{self.min_paint_cov:.2f})"
+                )
+                budget -= 1
+                if budget <= 0:
+                    break
+        if not tried:
+            return None
+        cov, kind, road, pose = max(tried, key=lambda item: item[0])
+        self._say(
+            f"spawn fallback {kind} road={road['id']} paint_cov={cov:.2f} "
+            f"(no road >= {self.min_paint_cov:.2f} in {len(tried)} tries)"
+        )
+        return self._pick(kind, road, pose, cov)
+
+    def _kinds_by_deficit(self) -> list[str]:
+        total = sum(self.counts.values()) + 1
+        return sorted(KINDS, key=lambda kind: -(TARGET[kind] * total - self.counts[kind]))
 
     def _next_kind(self) -> str | None:
         total = sum(self.counts.values()) + 1

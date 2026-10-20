@@ -573,7 +573,9 @@ def check_weave_guard_runs() -> None:
     assert "collect gate current#0 weave blocked no_paint" in text, text[-3000:]
     assert "excursion=weave" not in text and "line end" not in text
     # Painted everywhere: the guard lets the weave start, then ends it before
-    # the 60 m line runs out (5.5 s at 10 m/s) instead of after the 12 s weave.
+    # the line runs out instead of after the 12 s weave. The car does 10 m/s on
+    # an 8 m/s target, so the weave is planned at 10: a 50 m line, 4.5 s to the
+    # 5 m line-end margin (it was 60 m / 5.5 s when planned at the 8 m/s target).
     import scripts.collect_scene_lanes as collect
 
     previous = collect.painted_for
@@ -587,11 +589,12 @@ def check_weave_guard_runs() -> None:
     assert code == 0, (code, text)
     assert "collect gate current#0 weave open" in text, text[-3000:]
     assert "collect excursion current#0 weave line end, back to lane" in text, text[-3000:]
+    assert "collect weave current#0 v_plan=10.0 v_meas=10.0 v_target=8.0" in text, text[-3000:]
     after = text.split("line end, back to lane", 1)[1]
     assert "excursion=abort" in after, after[:400]
     rows = [json.loads(line) for line in (out / "state.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
     weave_rows = [row for row in rows if (row.get("excursion") or {}).get("phase") == "weave"]
-    assert weave_rows and 50 <= len(weave_rows) <= 58, len(weave_rows)
+    assert weave_rows and 41 <= len(weave_rows) <= 49, len(weave_rows)
     print(f"weave guard: unpainted weave blocked, off by default, line end after {len(weave_rows)} rows")
 
 
@@ -1180,7 +1183,10 @@ def check_lane_edge_straddle_run() -> None:
     reasons_in = {(r.get("excursion") or {}).get("reason") for r in _rows(out_in)}
     assert len(weave_in) > 20 and "lane_edge" not in reasons_in, (len(weave_in), reasons_in)
     sent = [x for x in text_in.splitlines() if x.startswith("collect weave current#0 ")]
-    assert sent and sent[0].startswith("collect weave current#0 v=8 amp=0.50m wave=40m line=60m ")  # 3.5/2 - 0.95 - 0.3, sent
+    # Planned at the measured 10 m/s, not the 8 m/s target: wave max(40, 5 * 10) = 50 m.
+    assert sent and sent[0].startswith(
+        "collect weave current#0 v_plan=10.0 v_meas=10.0 v_target=8.0 amp=0.50m wave=50m line=50m "
+    ), sent  # amp 3.5/2 - 0.95 - 0.3
     print(f"lane_edge run: x=0.4 straddling -> abort lane_edge after {len(weave)} weave row; x=1.75 -> {len(weave_in)} weave rows; {sent[0]}")
 
 

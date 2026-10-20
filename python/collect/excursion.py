@@ -62,6 +62,17 @@ PATH_STEP_M = 4.0
 MIN_PATH_M = 25.0
 # A lane change that never saw this much offset is still in progress.
 RECOVER_SEEN_M = 0.4
+# Every shaped move (weave, lane change, recover) is planned at
+# v_plan = max(measured, target): the AI target is not what the car does
+# (rec5: a weave planned at 11 m/s with the car at 7.8; rec4 highway at 30).
+# A lane change or recover with a planning speed eases in and out on a
+# cosine ramp long enough to keep the sent line's lateral acceleration
+# under MANEUVER_LAT_ACC_MPS2. A weave or lane change is aborted
+# ``overspeed`` once the measured speed is OVERSPEED_FRAC over v_plan.
+MANEUVER_LAT_ACC_MPS2 = WEAVE_LAT_ACC_MPS2
+OVERSPEED_FRAC = 0.15
+RAMP_MARGIN = 1.05
+SPEED_BANDS = ((12.0, "<12"), (18.0, "12-18"), (24.0, "18-24"), (float("inf"), ">=24"))
 
 
 @dataclass(frozen=True)
@@ -194,6 +205,107 @@ def weave_plan(speed_mps: float | None, room_m: float) -> tuple[float, float] | 
     if amp < WEAVE_AMP_LO_M - 1e-9:
         return None
     return amp, wave
+
+
+def plan_speed(measured_mps: float | None, target_mps: float | None) -> tuple[float | None, float | None, str]:
+    """``(v_plan, v_meas, source)``: max(measured, target) when the speed is measured.
+
+    ``source`` is ``measured`` or ``target`` (the larger one), or
+    ``target_fallback`` when there is no measured speed.
+    """
+    meas = _speed(measured_mps)
+    target = _speed(target_mps)
+    if meas is None:
+        return target, None, "target_fallback"
+    if target is None or meas >= target:
+        return meas, meas, "measured"
+    return target, meas, "target"
+
+
+def overspeed(measured_mps: float | None, v_plan_mps: float | None) -> bool:
+    """True when the measured speed is more than OVERSPEED_FRAC above the planning speed."""
+    meas, plan = _speed(measured_mps), _speed(v_plan_mps)
+    if meas is None or plan is None or plan <= 0.0:
+        return False
+    return meas > plan * (1.0 + OVERSPEED_FRAC) + 1e-9
+
+
+def speed_band(speed_mps: float | None) -> str:
+    """``<12``, ``12-18``, ``18-24`` or ``>=24`` m/s; ``na`` without a speed."""
+    v = _speed(speed_mps)
+    if v is None:
+        return "na"
+    for top, name in SPEED_BANDS:
+        if v < top:
+            return name
+    return SPEED_BANDS[-1][1]
+
+
+def ramp_length_m(delta_m: float, speed_mps: float | None) -> float | None:
+    """Cosine ramp length for a lane change / recover leg of ``delta_m``. None without a speed.
+
+    ``delta * (1 - cos(pi s / L)) / 2`` peaks at heading atan(delta pi / 2L)
+    and lateral acceleration delta (pi / L)^2 / 2 * v^2. L is the longer of
+    the length that keeps the peak heading at HEADING_TARGET_DEG and the
+    length that keeps the acceleration under MANEUVER_LAT_ACC_MPS2 (x RAMP_MARGIN).
+    """
+    v = _speed(speed_mps)
+    if v is None:
+        return None
+    d = abs(float(delta_m))
+    by_heading = max(8.0, d / max(math.tan(_deg(HEADING_TARGET_DEG)), 1e-3)) * math.pi / 2.0
+    by_acc = math.pi * v * math.sqrt(d / (2.0 * MANEUVER_LAT_ACC_MPS2)) * RAMP_MARGIN
+    return max(by_heading, by_acc)
+
+
+def maneuver_length_m(phase: str, delta_m: float, speed_mps: float | None) -> float:
+    """Road a lane change / recover line needs: WINDOW_M, or the ramps plus holds at this speed."""
+    ramp = ramp_length_m(delta_m, speed_mps)
+    if ramp is None:
+        return WINDOW_M
+    if phase == "lane_change":
+        return max(WINDOW_M, ramp + 16.0)
+    if phase == "recover":
+        return max(WINDOW_M, 2.0 * ramp + 16.0)
+    return WINDOW_M
+
+
+class WeaveStats:
+    """Counters for collect.json ``weave_stats``: starts, refusals, speed bands, one-sided sides."""
+
+    def __init__(self) -> None:
+        self.started: dict[str, int] = {}
+        self.refused: dict[str, int] = {}
+        self.bands: dict[str, dict[str, int]] = {name: {"started": 0, "refused": 0} for _top, name in SPEED_BANDS}
+        self.sides: dict[str, int] = {"left": 0, "right": 0}
+        self.overspeed_logged = 0
+
+    def start(self, phase: str, v_plan: float | None, *, direction: int = 1, one_sided: bool = False) -> None:
+        self.started[phase] = self.started.get(phase, 0) + 1
+        band = speed_band(v_plan)
+        if band in self.bands:
+            self.bands[band]["started"] += 1
+        if phase == "weave" and one_sided:
+            # Offset is positive to the right; the first half-wave goes to ``direction``.
+            self.sides["right" if int(direction) >= 0 else "left"] += 1
+
+    def refuse(self, reason: str, v_plan: float | None) -> None:
+        key = str(reason or "unknown")
+        self.refused[key] = self.refused.get(key, 0) + 1
+        band = speed_band(v_plan)
+        if band in self.bands:
+            self.bands[band]["refused"] += 1
+
+    def summary(self) -> dict[str, object]:
+        return {
+            "started": dict(self.started),
+            "started_total": sum(self.started.values()),
+            "refused": dict(self.refused),
+            "refused_total": sum(self.refused.values()),
+            "by_speed_band": {k: dict(v) for k, v in self.bands.items()},
+            "half_wave_sides": dict(self.sides),
+            "recover_overspeed_logged": int(self.overspeed_logged),
+        }
 
 
 def _speed(speed_mps: float | None) -> float | None:
@@ -741,6 +853,12 @@ def gate_reason(
     ):
         return "narrow"
     need = max(WINDOW_M, weave_length_m(speed_mps if speed_mps else None)) if phase == "weave" else WINDOW_M
+    if phase != "weave" and speed_mps:
+        for direction in directions:
+            spec = targets_for(phase, direction, None if lane_w is None else float(lane_w), lane_id=lane_id,
+                               road_width_m=float(road.width_m))
+            if spec is not None:
+                need = max(need, maneuver_length_m(phase, float(spec[0]), speed_mps))
     length, fork_at, span = _span(roads, road, x, y, heading, need)
     # Weaves stay in the lane, so a driveway does not block them.
     # A lane change does not start when a fork is inside 40 m.
@@ -874,11 +992,30 @@ def _road_of(roads: list[RoadPoly], hit: object) -> RoadPoly | None:
     return roads[0] if roads else None
 
 
-def _lateral(phase: str, s_m: float, base: float, delta: float, wave_m: float = WEAVE_WAVE_M) -> float:
-    """Road-center offset along the path. ``delta`` is the signed lane-center excursion."""
+def _lateral(
+    phase: str, s_m: float, base: float, delta: float, wave_m: float = WEAVE_WAVE_M, ramp_m: float | None = None,
+) -> float:
+    """Road-center offset along the path. ``delta`` is the signed lane-center excursion.
+
+    With ``ramp_m`` (a planning speed) a lane change / recover leg is a
+    cosine ramp of that length; without it, the old linear ramp.
+    """
     if phase == "weave":
         wave = max(float(wave_m), 1.0)
         return base + delta * math.sin(2.0 * math.pi * float(s_m) / wave)
+    if ramp_m is not None:
+        ramp = max(float(ramp_m), 1.0)
+        s = float(s_m)
+
+        def ease(u: float) -> float:
+            u = 0.0 if u <= 0.0 else 1.0 if u >= 1.0 else u
+            return 0.5 * (1.0 - math.cos(math.pi * u))
+
+        if phase == "lane_change":
+            return base + float(delta) * ease(s / ramp)
+        if s < ramp + 8.0:
+            return base + float(delta) * ease(s / ramp)
+        return base + float(delta) * (1.0 - ease((s - ramp - 8.0) / ramp))
     heading = math.tan(_deg(HEADING_TARGET_DEG))
     ramp = max(8.0, abs(float(delta)) / max(heading, 1e-3))
     if phase == "lane_change":
@@ -917,11 +1054,19 @@ def excursion_path(
     within WEAVE_LAT_ACC_MPS2; a line over it is rebuilt with the amplitude
     scaled down, and refused (None) once that is under WEAVE_AMP_LO_M.
     ``info`` gets amp_m, wave_m, length_m, lat_acc_mps2, total_lat_acc_mps2.
+    A lane change / recover with a speed is a cosine ramp sized by
+    ``ramp_length_m`` and checked the same way (lengthened, else refused);
+    ``info`` gets delta_m, ramp_m, length_m, heading_rad and the accelerations.
+    A refusal sets ``info["refused"]`` (no_path, narrow, road_edge, lat_acc).
     """
     if move.phase not in ACTIVE or hit is None or not roads:
+        if info is not None:
+            info.update(refused="no_path")
         return None, int(move.direction)
     road = _road_of(roads, hit)
     if road is None:
+        if info is not None:
+            info.update(refused="no_path")
         return None, int(move.direction)
     directions = [1 if int(move.direction) >= 0 else -1]
     if move.phase == "lane_change":
@@ -943,9 +1088,19 @@ def excursion_path(
     # different center, or refused the lane id and aborted no_path.
     n_lanes = int(getattr(road, "lanes", 0) or 0)
     lane_count = n_lanes if 1 <= n_lanes <= 8 else None
+    if move.phase != "weave" and speed is not None:
+        # The ramps are sized at the planning speed: a fast lane change needs more road.
+        for direction in directions:
+            spec = targets_for(move.phase, direction, None if lane_w is None else float(lane_w),
+                               lane_id=lane_id, road_width_m=float(road.width_m), lanes=lane_count)
+            if spec is not None:
+                need = max(need, maneuver_length_m(move.phase, float(spec[0]), speed))
     _length, _fork, _span_h, samples = _chain(roads, road, x, y, heading, need, PATH_STEP_M)
     if len(samples) < 2 or samples[-1][4] + 1e-3 < need * 0.85:
+        if info is not None:
+            info.update(refused="no_path", need_m=need, chain_m=samples[-1][4] if samples else 0.0)
         return None, int(move.direction)
+    refused = "narrow"
     for direction in directions:
         spec = targets_for(
             move.phase,
@@ -967,20 +1122,38 @@ def excursion_path(
         base = float(centers[lane_id]) if paint_base is None else paint_base
         limit = float(road.width_m) * 0.5 - EDGE_M
         centerline = [(cx, cy) for cx, cy, _fx, _fy, _s in samples]
+        ramp = None if move.phase == "weave" else ramp_length_m(delta, speed)
         for _try in range(4):
             points: list[tuple[float, float]] = []
             ok = True
             for cx, cy, fx, fy, s_m in samples:
-                lat = _lateral(move.phase, s_m, base, delta, wave)
+                lat = _lateral(move.phase, s_m, base, delta, wave, ramp)
                 if abs(lat) > limit + 1e-6:
                     ok = False
                     break
                 rx, ry = fy, -fx
                 points.append((cx + rx * lat, cy + ry * lat))
             if not ok or len(points) < 2:
+                refused = "road_edge"
                 break
-            if move.phase != "weave" or speed is None:
+            if speed is None:
                 return points, direction
+            if move.phase != "weave":
+                move_acc, total_acc = path_lat_acc(points, centerline, speed)
+                legs = 1.0 if move.phase == "lane_change" else 2.0
+                if move_acc <= MANEUVER_LAT_ACC_MPS2 + 1e-9:
+                    if info is not None:
+                        info.update(delta_m=delta, ramp_m=ramp, length_m=samples[-1][4],
+                                    heading_rad=math.atan(abs(delta) * math.pi / (2.0 * float(ramp))),
+                                    lat_acc_mps2=move_acc, total_lat_acc_mps2=total_acc, shrunk=_try)
+                    return points, direction
+                # Sampling slop over the analytic ramp: lengthen it, if the road allows.
+                ramp = float(ramp) * math.sqrt(move_acc / MANEUVER_LAT_ACC_MPS2) * 1.03
+                if legs * ramp + (0.0 if legs == 1.0 else 8.0) > samples[-1][4]:
+                    if info is not None:
+                        info.update(refused="lat_acc", lat_acc_mps2=move_acc)
+                    return None, int(move.direction)
+                continue
             weave_acc, total_acc = path_lat_acc(points, centerline, speed)
             if weave_acc <= WEAVE_LAT_ACC_MPS2 + 1e-9:
                 if info is not None:
@@ -992,4 +1165,9 @@ def excursion_path(
                 if info is not None:
                     info.update(refused="lat_acc", lat_acc_mps2=weave_acc)
                 return None, int(move.direction)
+        else:
+            if speed is not None:
+                refused = "lat_acc"
+    if info is not None:
+        info.setdefault("refused", refused)
     return None, int(move.direction)

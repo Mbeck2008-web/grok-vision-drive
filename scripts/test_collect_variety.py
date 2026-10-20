@@ -201,10 +201,11 @@ def check_paths_stay_on_the_road() -> None:
     assert points is not None and used == 1  # left of the left lane is off the road
     assert abs(points[-1][0] - centers[1]) < 0.15
     assert max(abs(p[0]) for p in points) <= limit + 1e-6
-    dx = points[1][0] - points[0][0]
-    dy = points[1][1] - points[0][1]
-    heading = math.degrees(math.atan2(-(dx), dy))
-    assert lo - 0.5 <= abs(heading) <= hi + 0.5
+    # A cosine ramp sized at the planning speed: the peak heading of the line, not its first step.
+    heading = max(
+        (abs(math.degrees(math.atan2(-(b[0] - a[0]), b[1] - a[1]))) for a, b in zip(points, points[1:])),
+    )
+    assert lo - 0.5 <= heading <= hi + 0.5, heading
     spec = targets_for("lane_change", used, hit.lane_width_m, lane_id=hit.lane_id, road_width_m=7.0)
     assert spec is not None
     assert abs(spec[0]) > off_hi

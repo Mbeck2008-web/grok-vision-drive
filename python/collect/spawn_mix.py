@@ -47,6 +47,34 @@ RAMP = "ramp"
 KINDS = (CITY, HIGHWAY, RAMP)
 TARGET = {CITY: 0.40, HIGHWAY: 0.35, RAMP: 0.25}
 SPEED = {CITY: (8.0, 14.0), HIGHWAY: (20.0, 30.0), RAMP: (10.0, 18.0)}
+
+
+def clamp_speed_range(
+    kind_range: tuple[float, float],
+    flag_min: float | None,
+    flag_max: float | None,
+) -> tuple[tuple[float, float], str, bool]:
+    """``((lo, hi), src, empty)``: the spawn-type range clamped to ``--speed-min/--speed-max``.
+
+    No flag: the spawn-type range stands (``src`` spawn_type). With a flag the
+    range is the intersection (``src`` flag when it narrowed the range). An
+    empty intersection uses the flag range itself (``empty`` True); a missing
+    bound there is the given one, so ``--speed-max 15`` on a 20-30 highway is 15-15.
+    """
+    lo, hi = float(min(kind_range)), float(max(kind_range))
+    if flag_min is None and flag_max is None:
+        return (lo, hi), "spawn_type", False
+    f_lo = None if flag_min is None else float(flag_min)
+    f_hi = None if flag_max is None else float(flag_max)
+    if f_lo is not None and f_hi is not None and f_lo > f_hi:
+        f_lo, f_hi = f_hi, f_lo
+    a = lo if f_lo is None else max(lo, f_lo)
+    b = hi if f_hi is None else min(hi, f_hi)
+    if a <= b:
+        return (a, b), ("spawn_type" if (a, b) == (lo, hi) else "flag"), False
+    a = f_lo if f_lo is not None else float(f_hi)
+    b = f_hi if f_hi is not None else float(f_lo)
+    return (a, b), "flag", True
 # A link counts when the ends sit about this close. The cell is only a search.
 LINK_M = 30.0
 CELL_M = 20.0

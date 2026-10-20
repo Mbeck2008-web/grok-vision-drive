@@ -159,7 +159,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from python.data.raw_frames import controls_from_state
-from python.collect.spawn_mix import traffic_count
+from python.collect.spawn_mix import clamp_speed_range, traffic_count
 
 SPEEDS_MPS = (8.0, 11.0, 14.0, 17.0, 10.0)
 SPEED_HOLD_S = 180.0
@@ -300,8 +300,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--until-disk", action="store_true", help="Ignore the clock. Stop only under 20 GB free.")
     parser.add_argument("--map", default="", help="Level to load. Empty keeps the current level.")
     parser.add_argument("--route", default="span", choices=["span", "waypoints", "random"])
-    parser.add_argument("--speed-min", type=float, default=8.0)
-    parser.add_argument("--speed-max", type=float, default=17.0)
+    parser.add_argument(
+        "--speed-min", type=float, default=None,
+        help="Clamp every spawn-type speed range to this floor. Unset: the spawn type's range (8 m/s off the deck).",
+    )
+    parser.add_argument(
+        "--speed-max", type=float, default=None,
+        help="Clamp every spawn-type speed range to this ceiling. Unset: the spawn type's range (17 m/s off the deck).",
+    )
     parser.add_argument("--cameras", default="", help="Comma list. Empty keeps every camera at its plan rate.")
     parser.add_argument("--rates", default="", help="Overrides, for example main=10,rear=1")
     parser.add_argument(
@@ -1452,7 +1458,10 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
     segment_s = max(60.0, float(args.segment_min) * 60.0)
     excursions_on = not bool(args.no_excursions)
     vary_env = bool(map_names) and not bool(args.no_vary_env)
-    speeds = speeds_for(args.speed_min, args.speed_max)
+    # Off the spawn deck (other maps) the range is 8-17, clamped to the flags like a spawn type.
+    flags_set = args.speed_min is not None or args.speed_max is not None
+    base_range, _src, _empty = clamp_speed_range((8.0, 17.0), args.speed_min, args.speed_max)
+    speeds = speeds_for(base_range[0], base_range[1])
     cam_rates = rates_table(args.rates, args.cameras)
     until_disk = bool(args.until_disk) or float(args.minutes) <= 0.0
     if args.map:
@@ -1584,10 +1593,13 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             Excursion,
             ExcursionClock,
             CRUISE_S,
+            WeaveStats,
             excursion_commands,
             excursion_path,
             gate_reason,
             near_junction,
+            overspeed,
+            plan_speed,
             targets_for,
         )
 
@@ -1648,6 +1660,14 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         loaded_map = ""
         loaded_index = -1
         speed_span = [speeds]
+        # Effective speed range per segment (collect.json speed_ranges) and the
+        # weave / lane change / recover counters (collect.json weave_stats).
+        speed_ranges: dict[str, list[dict[str, Any]]] = {}
+        weave_stats = WeaveStats()
+        # Planning speed and phase of the move in progress (None between moves).
+        plan_v: float | None = None
+        plan_phase = ""
+        plan_overspeed_noted = False
         spawn_deck = None
         spawn_kind = ""
         spawn_mark = -1.0e9
@@ -1848,6 +1868,23 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             run.stop("recover_failed", message)
             return 2
 
+        def _speed_range(kind: str, kind_range: tuple[float, float], default_src: str) -> tuple[float, ...]:
+            """Clamp a range to the flags, log it, record it for this segment, and return its speed cycle."""
+            (lo, hi), src, empty = clamp_speed_range(kind_range, args.speed_min, args.speed_max)
+            if src == "spawn_type":
+                src = default_src
+            if empty:
+                print(f"collect speed_clamp kind={kind} range={kind_range[0]:.0f}-{kind_range[1]:.0f} "
+                      f"flags={args.speed_min}-{args.speed_max} -> {lo:g}-{hi:g} (no overlap: flag range)", flush=True)
+            print(f"collect speed_range seg={segment_id} kind={kind} range={lo:g}-{hi:g} src={src}", flush=True)
+            entry = {"kind": kind, "range": [lo, hi], "src": src, "done_s": round(float(done_s), 3)}
+            rows = speed_ranges.setdefault(segment_id, [])
+            if not rows or {k: v for k, v in rows[-1].items() if k != "done_s"} != {
+                k: v for k, v in entry.items() if k != "done_s"
+            }:
+                rows.append(entry)
+            return speeds_for(lo, hi)
+
         def _apply_spawn(force: bool, source: str = "spawn") -> None:
             """Teleport west coast to the next unused stratified spawn."""
             nonlocal spawn_deck, spawn_kind, spawn_mark, spawn_pos, last_ai, segment_open, speed, spawn_cov
@@ -1948,7 +1985,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             yield_guard.reset()
             settle.start(done_s)
             since_spawn[0] = 0.0
-            speed_span[0] = speeds_for(picked.speed[0], picked.speed[1])
+            speed_span[0] = _speed_range(picked.kind, (float(picked.speed[0]), float(picked.speed[1])), "spawn_type")
             speed = speed_at(done_s, tuple(speed_span[0]))
             last_ai = None
             live.reset()
@@ -2075,6 +2112,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             if yield_guard.enabled:
                 extra["live_yield"] = yield_guard.summary()
             extra["impact_respawn"] = {"on": impact_respawn_on, **impact_respawns}
+            extra["speed_ranges"] = {k: list(v) for k, v in speed_ranges.items()}
+            extra["weave_stats"] = weave_stats.summary()
             if ego_width:
                 extra["ego_width"] = dict(ego_width)
             return extra or None
@@ -2130,6 +2169,10 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             )
             segment_id = f"{map_name}#{seg_index}" if map_name else "current#0"
             run.segment = segment_id
+            if not map_names and segment_id not in speed_ranges:
+                # A single-level run has no segment load: record its range once here.
+                speed_span[0] = _speed_range("level", (8.0, 17.0), "flag" if flags_set else "default")
+                speed = speed_at(elapsed, tuple(speed_span[0]))
             if map_name == loaded_map and seg_index == loaded_index:
                 _apply_spawn(False)
             if segment_changed(loaded_map, loaded_index, map_name, seg_index):
@@ -2173,6 +2216,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     sky_commands = environment_commands(tod, sky)
                 else:
                     sky_commands = environment_commands(args.time_of_day, args.weather)
+                # A new level starts on the off-deck range; a deck spawn below replaces it.
+                speed_span[0] = _speed_range("level", (8.0, 17.0), "flag" if flags_set else "default")
+                speed = speed_at(done_s, tuple(speed_span[0]))
                 _apply_spawn(True)
                 for command in sky_commands:
                     try:
@@ -2256,6 +2302,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 speed_mps_f = None if sample.get("speed_mps") is None else float(sample.get("speed_mps"))
             except (TypeError, ValueError):
                 speed_mps_f = None
+            # Every shaped move is planned at max(measured, target).
+            v_plan, v_meas, v_src = plan_speed(speed_mps_f, speed)
+            v_plan = speed if v_plan is None else v_plan
             try:
                 damage_f = None if sample.get("damage") is None else float(sample.get("damage"))
             except (TypeError, ValueError):
@@ -2399,6 +2448,24 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 impact_respawns["impacts"] += 1
             elif impact.drove_off():
                 _impact_end("drove_on", now)
+            if clock.phase not in ACTIVE:
+                plan_v, plan_phase, plan_overspeed_noted = None, "", False
+            elif plan_v is not None and clock.phase == plan_phase and overspeed(speed_mps_f, plan_v):
+                # Faster than the line was shaped for. A weave or lane change goes
+                # back to the lane now. A recover is already the way back: aborting
+                # it hands the return to the unshaped lane keeper, so it is logged.
+                if clock.phase in ("weave", "lane_change"):
+                    print(f"collect excursion {segment_id} {clock.phase} abort overspeed "
+                          f"v_meas={speed_mps_f:.1f} v_plan={plan_v:.1f}", flush=True)
+                    weave_stats.refuse("overspeed_abort", plan_v)
+                    clock.force_abort("overspeed")
+                    line_left_m = None
+                    plan_v, plan_phase = None, ""
+                elif not plan_overspeed_noted:
+                    print(f"collect excursion {segment_id} recover overspeed v_meas={speed_mps_f:.1f} "
+                          f"v_plan={plan_v:.1f} (logged; the recover continues)", flush=True)
+                    weave_stats.overspeed_logged += 1
+                    plan_overspeed_noted = True
             if line_left_m is not None:
                 if clock.phase not in ACTIVE:
                     line_left_m = None
@@ -2450,14 +2517,14 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             ):
                 kind = clock.peek_kind(lanes_here)
                 gate = gate_reason(
-                    roads, hit, float(pos[0]), float(pos[1]), heading, kind, speed,
+                    roads, hit, float(pos[0]), float(pos[1]), heading, kind, v_plan,
                     weave_lane_w=paint_w_now, half_width_m=ego_half_w,
                 )
                 if gate != "open" and kind != "weave":
                     # A lane change needs a second lane and a clear stretch.
                     # An in-lane weave does not.
                     weave = gate_reason(
-                        roads, hit, float(pos[0]), float(pos[1]), heading, "weave", speed,
+                        roads, hit, float(pos[0]), float(pos[1]), heading, "weave", v_plan,
                         weave_lane_w=paint_w_now, half_width_m=ego_half_w,
                     )
                     kind = "weave"
@@ -2473,10 +2540,12 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     )
                 start_kind = kind
                 window_ok = gate == "open"
+                if not window_ok and not clock.reason:
+                    weave_stats.refuse(gate, v_plan)  # one per start attempt (the clock retries in 2 s)
                 now_gate = time.monotonic()
                 if gate != gate_note or now_gate - gate_log_t >= 5.0:
                     word = "open" if gate == "open" else f"blocked {gate}"
-                    print(f"collect gate {segment_id} {kind} {word}", flush=True)
+                    print(f"collect gate {segment_id} {kind} {word} v_plan={v_plan:.1f}", flush=True)
                     gate_note = gate
                     gate_log_t = now_gate
             if excursions_on and not waypoint and driving:
@@ -2494,7 +2563,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     start_kind=start_kind,
                     road_offset_m=None if hit is None else hit.offset_m,
                     road_width_m=None if paved is None else paved.width_m,
-                    speed_mps=speed,
+                    speed_mps=v_plan,
                     # Weave abort (lane_edge): a body edge (vehicle-frame x =
                     # +/- ego_half_w around the state pos ref node) more than
                     # EDGE_M past the painted lane line at the car
@@ -2525,7 +2594,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     heading,
                     move,
                     hit,
-                    speed,
+                    v_plan,
                     paint_lane=paint_lane_now,
                     half_width_m=ego_half_w,
                     info=path_info,
@@ -2537,28 +2606,54 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     None if hit is None else hit.lane_width_m,
                     lane_id=0 if hit is None else int(getattr(hit, "lane_id", 0) or 0),
                     road_width_m=None if road is None else float(road.width_m),
-                    speed_mps=speed,
+                    speed_mps=v_plan,
                     weave_lane_w=paint_w_now,
                     half_width_m=ego_half_w,
                 )
                 if spec is not None and move.phase == "weave" and path_info.get("amp_m") is not None:
                     amp_sent = float(path_info["amp_m"])
                     spec = (int(used) * amp_sent, -int(used) * math.atan(amp_sent * 2.0 * math.pi / float(path_info["wave_m"])))
+                elif spec is not None and path_info.get("heading_rad") is not None:
+                    # Cosine ramp: the tag heading is the sent line's peak heading.
+                    spec = (float(spec[0]), math.copysign(float(path_info["heading_rad"]), float(spec[1])))
+                speeds_txt = (f"v_plan={v_plan:.1f} v_meas={'na' if v_meas is None else format(v_meas, '.1f')} "
+                              f"v_target={speed:.1f}")
+                if v_src == "target_fallback":
+                    print(f"collect {move.phase} {segment_id} no measured speed; v_plan=v_target={speed:.1f}", flush=True)
                 if path is not None and move.phase == "weave" and path_info:
                     print(
-                        f"collect weave {segment_id} v={speed:.0f} amp={path_info.get('amp_m', 0.0):.2f}m "
+                        f"collect weave {segment_id} {speeds_txt} amp={path_info.get('amp_m', 0.0):.2f}m "
                         f"wave={path_info.get('wave_m', 0.0):.0f}m line={path_info.get('length_m', 0.0):.0f}m "
                         f"lat_acc={path_info.get('lat_acc_mps2', 0.0):.2f} m/s2 "
                         f"(with road {path_info.get('total_lat_acc_mps2', 0.0):.2f}) shrunk={path_info.get('shrunk', 0)}",
                         flush=True,
                     )
-                elif path is None and path_info.get("refused"):
-                    print(f"collect weave {segment_id} refused {path_info['refused']} "
-                          f"lat_acc={path_info.get('lat_acc_mps2', 0.0):.2f} m/s2", flush=True)
+                elif path is not None and path_info:
+                    print(
+                        f"collect {move.phase} {segment_id} {speeds_txt} delta={path_info.get('delta_m', 0.0):.2f}m "
+                        f"ramp={path_info.get('ramp_m') or 0.0:.0f}m line={path_info.get('length_m', 0.0):.0f}m "
+                        f"lat_acc={path_info.get('lat_acc_mps2', 0.0):.2f} m/s2 "
+                        f"(with road {path_info.get('total_lat_acc_mps2', 0.0):.2f})",
+                        flush=True,
+                    )
                 if path is None or spec is None:
+                    why_refused = str(path_info.get("refused") or ("narrow" if path is not None else "no_path"))
+                    print(f"collect {move.phase} {segment_id} refused {why_refused} {speeds_txt} "
+                          f"lat_acc={path_info.get('lat_acc_mps2', 0.0):.2f} m/s2", flush=True)
+                    weave_stats.refuse(why_refused, v_plan)
                     resolved = clock.force_abort("no_path")
                     path = None
+                    plan_v, plan_phase = None, ""
                 else:
+                    if plan_v is None or plan_phase != move.phase:
+                        wave_sent = float(path_info.get("wave_m") or 0.0)
+                        weave_stats.start(
+                            move.phase, v_plan, direction=int(used),
+                            one_sided=move.phase == "weave" and wave_sent > 0.0
+                            and float(path_info.get("length_m") or 0.0) <= 0.5 * wave_sent + 1.0,
+                        )
+                        plan_overspeed_noted = False
+                    plan_v, plan_phase = v_plan, move.phase
                     clock.direction = int(used)
                     resolved = Excursion(move.phase, float(spec[0]), float(spec[1]), int(used), move.reason)
                 ai_key = (round(speed, 3), waypoint, resolved.phase, resolved.direction, map_name)

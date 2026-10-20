@@ -1041,14 +1041,52 @@ def check_labels_on_training_rows() -> None:
     loose = labelled_heads(training_rows(plan, min_valid=0.0), ("lane_gt", "lanes"))
     assert "lanes" in loose[0], "without --min-valid those windows would train it"
 
+    # The label count never touches the training RNG: epoch 1's window order is
+    # the same with and without it, and the RNG state is unchanged by it.
+    import numpy as np
+
     trainer = (Path(__file__).resolve().parents[1] / "python" / "train" / "train_scene.py").read_text(encoding="utf-8")
+    assert "    window_rng = np.random.RandomState(1)\n" in trainer, "the trainer's window RNG construction changed"
+    holdout_seed, train_seed = 0, 1  # --holdout-seed default; the trainer's fixed window_rng seed
+    rng_rows = loop_rows(800)
+    for row in rng_rows:
+        row["tech"] = tech(int(row["i"]) % 9 != 0, lanes=line) if int(row["i"]) % 5 == 0 else tech(True)
+    rng_spec = choose_holdout_cells(rng_rows, seed=holdout_seed)
+
+    def first_epoch(count_labels: bool, balance: bool) -> tuple[list, tuple]:
+        window_rng = np.random.RandomState(train_seed)  # as train_scene.py builds it
+        if count_labels:  # what the trainer does before epoch 1
+            before = window_rng.get_state()
+            label_rows = training_rows(pass_plan(rng_rows, 64, 32, blocks=1, cells=rng_spec), min_valid=0.3)
+            labelled_heads(label_rows, None)
+            after = window_rng.get_state()
+            assert before[0] == after[0] and np.array_equal(before[1], after[1]) and before[2:] == after[2:], \
+                "label count moved the training RNG"
+        steps = epoch_windows(pass_plan(rng_rows, 64, 32, blocks=1, cells=rng_spec), window_rng,
+                              min_valid=0.3, balance=balance)
+        order = [(item["kind"], int(item["rows"][0]["i"]), int(item["rows"][-1]["i"])) for item in steps]
+        state = window_rng.get_state()
+        return order, (state[0], state[1].tobytes(), state[2:])
+
+    for balance in (False, True):
+        plain, plain_state = first_epoch(False, balance)
+        counted, counted_state = first_epoch(True, balance)
+        assert plain == counted, f"epoch-1 window order changed by the label count (balance={balance})"
+        assert plain_state == counted_state, "RNG state after epoch 1 differs"
+        n_train = sum(1 for kind, _a, _b in plain if kind != "holdout")
+        assert n_train > 2 and any(k == "holdout" for k, _a, _b in plain), (balance, n_train)
+    shuffled = [w for w in plain if w[0] != "holdout"]
+    assert shuffled != sorted(shuffled, key=lambda w: w[1]), "epoch 1 was not shuffled: the check would be vacuous"
+
     call = trainer.index("label_rows = training_rows(")
     assert "pass_plan(rows, chunk_len, stride, blocks=int(holdout_blocks), cells=cell_spec), min_valid=float(min_valid)" \
         in trainer[call:call + 300]
     assert "labelled_heads(label_rows, train_heads)" in trainer and "labelled_heads(rows, train_heads)" not in trainer
     print(f"(p) curbs labelled on {held} held-out rows only: 0 in training rows, not stamped; lanes labelled only "
           f"where --min-valid drops the windows: {counts2['lanes']['labelled_rows']} training rows, not stamped; "
-          f"training_rows == epoch_windows' training rows (holdout, min_valid 0.3 and 0, balance on/off) OK")
+          f"training_rows == epoch_windows' training rows (holdout, min_valid 0.3 and 0, balance on/off); "
+          f"epoch-1 order of {len(plain)} windows and window_rng state identical with and without the label "
+          f"count (holdout seed {holdout_seed}, window_rng RandomState({train_seed}), balance on/off) OK")
 
 
 def check_export_only_heads() -> None:

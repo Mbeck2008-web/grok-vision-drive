@@ -1096,6 +1096,62 @@ def _lateral(
     return base + float(delta) * (1.0 - min(1.0, back / ramp))
 
 
+# Sent-line backstop. A line that survives every other check is still
+# refused when its points jump. Both caps were measured on 65 rec5b excursion
+# lines replayed over the west_coast_usa road dump (61 legitimate, 4 with a
+# wrong join: rows 3281, 13317, 24338, 27739).
+#
+# LINE_KINK_M caps the second difference at each sample: the perpendicular
+# distance from the line through its two neighbours, normalized to a 4 m step
+# by 16 / (a * b), with each neighbour spacing a, b clamped to 1..4 m. The
+# legitimate max was 0.367 m (all 61 lines), so 0.6 m is 1.6x that. The
+# smallest jump seen was 0.92 m (row 24338). That jump sits at the very end
+# of its line, where only the last segment shows it, so a future end-of-line
+# jump could read smaller than 0.6 m and pass. A clean sideways step of d at
+# 4 m spacing reads about d / 2 (d * 4 / sqrt(64 + d^2)), so steps under
+# about 1.2 m pass this cap too.
+LINE_KINK_M = 0.6
+# LINE_GAP_M caps the distance between adjacent sent points. It catches only
+# big jumps: the smallest jump seen was 5.65 m and the legitimate max gap was
+# 4.99 m (PATH_STEP_M is 4 m; a piece end adds up to ~1 m). It is NOT a check
+# for a second line laid beside the first: a parallel road 3.5 m over, joined
+# with ordinary 4 m steps, passes it. LINE_KINK_M is the check for that.
+LINE_GAP_M = 6.0
+KINK_SPACING_M = (1.0, 4.0)
+
+
+def line_kinks_m(points: list[tuple[float, float]]) -> list[float]:
+    """Normalized second difference at each interior point (see LINE_KINK_M)."""
+    lo, hi = KINK_SPACING_M
+    out: list[float] = []
+    for i in range(1, len(points) - 1):
+        ax, ay = points[i - 1]
+        bx, by = points[i]
+        cx, cy = points[i + 1]
+        ux, uy = cx - ax, cy - ay
+        chord = math.hypot(ux, uy)
+        a = math.hypot(bx - ax, by - ay)
+        b = math.hypot(cx - bx, cy - by)
+        if chord < 1e-9:
+            dev = a  # the line folds back on itself
+        else:
+            dev = abs((bx - ax) * uy - (by - ay) * ux) / chord
+        out.append(dev * hi * hi / (min(hi, max(lo, a)) * min(hi, max(lo, b))))
+    return out
+
+
+def sent_line_fault(points: list[tuple[float, float]]) -> tuple[str, float] | None:
+    """``("line_kink", m)`` or ``("line_gap", m)`` when the sent line jumps, else None."""
+    gaps = [math.hypot(points[i + 1][0] - points[i][0], points[i + 1][1] - points[i][1])
+            for i in range(len(points) - 1)]
+    if gaps and max(gaps) > LINE_GAP_M:
+        return "line_gap", max(gaps)
+    kinks = line_kinks_m(points)
+    if kinks and max(kinks) > LINE_KINK_M:
+        return "line_kink", max(kinks)
+    return None
+
+
 def excursion_path(
     roads: list[RoadPoly],
     x: float,
@@ -1125,7 +1181,10 @@ def excursion_path(
     A lane change / recover with a speed is a cosine ramp sized by
     ``ramp_length_m`` and checked the same way (lengthened, else refused);
     ``info`` gets delta_m, ramp_m, length_m, heading_rad and the accelerations.
-    A refusal sets ``info["refused"]`` (no_path, narrow, road_edge, lat_acc).
+    A refusal sets ``info["refused"]`` (no_path, narrow, road_edge, lat_acc,
+    line_gap, line_kink). The last two are the sent-line backstop
+    (``sent_line_fault``): a line that jumps between points is never sent;
+    ``info`` then also gets ``line_fault_m``.
     """
     if move.phase not in ACTIVE or hit is None or not roads:
         if info is not None:
@@ -1168,6 +1227,18 @@ def excursion_path(
         if info is not None:
             info.update(refused="no_path", need_m=need, chain_m=samples[-1][4] if samples else 0.0)
         return None, int(move.direction)
+
+    def _backstop(
+        points: list[tuple[float, float]], direction: int,
+    ) -> tuple[list[tuple[float, float]] | None, int]:
+        # The line that would be sent, after every other check: refuse it if it jumps.
+        fault = sent_line_fault(points)
+        if fault is None:
+            return points, direction
+        if info is not None:
+            info.update(refused=fault[0], line_fault_m=fault[1])
+        return None, int(move.direction)
+
     refused = "narrow"
     for direction in directions:
         spec = targets_for(
@@ -1205,7 +1276,7 @@ def excursion_path(
                 refused = "road_edge"
                 break
             if speed is None:
-                return points, direction
+                return _backstop(points, direction)
             if move.phase != "weave":
                 move_acc, total_acc = path_lat_acc(points, centerline, speed)
                 legs = 1.0 if move.phase == "lane_change" else 2.0
@@ -1214,7 +1285,7 @@ def excursion_path(
                         info.update(delta_m=delta, ramp_m=ramp, length_m=samples[-1][4],
                                     heading_rad=math.atan(abs(delta) * math.pi / (2.0 * float(ramp))),
                                     lat_acc_mps2=move_acc, total_lat_acc_mps2=total_acc, shrunk=_try)
-                    return points, direction
+                    return _backstop(points, direction)
                 # Sampling slop over the analytic ramp: lengthen it, if the road allows.
                 ramp = float(ramp) * math.sqrt(move_acc / MANEUVER_LAT_ACC_MPS2) * 1.03
                 if legs * ramp + (0.0 if legs == 1.0 else 8.0) > samples[-1][4]:
@@ -1227,7 +1298,7 @@ def excursion_path(
                 if info is not None:
                     info.update(amp_m=abs(delta), wave_m=wave, length_m=samples[-1][4],
                                 lat_acc_mps2=weave_acc, total_lat_acc_mps2=total_acc, shrunk=_try)
-                return points, direction
+                return _backstop(points, direction)
             delta *= 0.97 * WEAVE_LAT_ACC_MPS2 / weave_acc
             if abs(delta) < WEAVE_AMP_LO_M - 1e-9:
                 if info is not None:

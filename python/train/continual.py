@@ -595,19 +595,24 @@ def epoch_windows(
 
 
 def training_rows(plan: list[Mapping[str, Any]], *, min_valid: float = 0.3) -> list[Mapping[str, Any]]:
-    """Rows the net trains on: rows of train windows that pass ``min_valid``
-    (the same test ``epoch_windows`` applies), each once, in order. Holdout
-    and buffer rows never appear here."""
-    floor = float(min_valid)
+    """Rows the net trains on, each once, in plan order.
+
+    Derived from what ``epoch_windows`` itself yields as training windows
+    (everything it does not put in the holdout tail), with its ``min_valid``
+    test and without balance repeats or shuffling, so the two can never
+    disagree on which rows train. Holdout and buffer rows never appear.
+    """
+
+    class _KeepOrder:
+        def shuffle(self, _items: list) -> None:
+            return None
+
     seen: set[Any] = set()
     out: list[Mapping[str, Any]] = []
-    for item in plan:
-        if item.get("kind") != "train":
+    for item in epoch_windows(list(plan), _KeepOrder(), min_valid=float(min_valid), balance=False):
+        if item.get("kind") == "holdout":
             continue
-        rows = list(item.get("rows") or [])
-        if floor > 0.0 and valid_fraction(rows) < floor:
-            continue
-        for row in rows:
+        for row in item.get("rows") or []:
             key = id(row) if row.get("i") is None else int(row["i"])
             if key not in seen:
                 seen.add(key)

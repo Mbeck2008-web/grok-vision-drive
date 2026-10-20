@@ -975,9 +975,26 @@ def check_leakage_note() -> None:
 
 
 def check_labels_on_training_rows() -> None:
+    import random
+
     from python.debug.lane_targets import LANE_GT_DIM
-    from python.train.continual import cell_holdout_labels, choose_holdout_cells, pass_plan, training_rows
+    from python.train.continual import (
+        cell_holdout_labels,
+        choose_holdout_cells,
+        epoch_windows,
+        pass_plan,
+        training_rows,
+    )
     from python.train.scene_net import labelled_heads
+
+    def same_as_epoch_windows(plan: list, min_valid: float) -> int:
+        """training_rows and the rows epoch_windows trains on are one set (balance and shuffle too)."""
+        mine = {int(r["i"]) for r in training_rows(plan, min_valid=min_valid)}
+        for balance in (False, True):
+            yielded = epoch_windows(plan, random.Random(7), min_valid=min_valid, balance=balance)
+            trained = {int(r["i"]) for item in yielded if item.get("kind") != "holdout" for r in item["rows"]}
+            assert mine == trained, (min_valid, balance, sorted(mine ^ trained)[:5])
+        return len(mine)
 
     line = [[{"x": 0.0, "y": 5.0}, {"x": 0.0, "y": 30.0}]]
 
@@ -1000,7 +1017,9 @@ def check_labels_on_training_rows() -> None:
     held = marks.count("hold")
     everywhere = labelled_heads(rows, ("lane_gt", "curbs"))
     assert everywhere[0] == ("lane_gt", "curbs"), "on all rows curbs would clear the floor"
-    train = training_rows(pass_plan(rows, 64, 32, cells=spec), min_valid=0.3)
+    cell_plan = pass_plan(rows, 64, 32, cells=spec)
+    same_as_epoch_windows(cell_plan, 0.3)
+    train = training_rows(cell_plan, min_valid=0.3)
     stamped, below, counts = labelled_heads(train, ("lane_gt", "curbs"))
     assert stamped == ("lane_gt",) and below == ("curbs",) and counts["curbs"]["labelled_rows"] == 0, counts
     assert not {int(r["i"]) for r in train} & {int(r["i"]) for r, m in zip(rows, marks) if m != "train"}
@@ -1012,6 +1031,9 @@ def check_labels_on_training_rows() -> None:
         row["tech"] = tech(False, lanes=line) if bad else tech(True)
     assert labelled_heads(rows, ("lane_gt", "lanes"))[0] == ("lane_gt", "lanes")
     plan = pass_plan(rows, 64, 32)
+    n_kept = same_as_epoch_windows(plan, 0.3)
+    n_loose = same_as_epoch_windows(plan, 0.0)
+    assert n_kept < n_loose, "--min-valid dropped windows on the (p) data"
     kept = training_rows(plan, min_valid=0.3)
     stamped2, below2, counts2 = labelled_heads(kept, ("lane_gt", "lanes"))
     assert stamped2 == ("lane_gt",) and below2 == ("lanes",), counts2
@@ -1025,7 +1047,8 @@ def check_labels_on_training_rows() -> None:
         in trainer[call:call + 300]
     assert "labelled_heads(label_rows, train_heads)" in trainer and "labelled_heads(rows, train_heads)" not in trainer
     print(f"(p) curbs labelled on {held} held-out rows only: 0 in training rows, not stamped; lanes labelled only "
-          f"where --min-valid drops the windows: {counts2['lanes']['labelled_rows']} training rows, not stamped OK")
+          f"where --min-valid drops the windows: {counts2['lanes']['labelled_rows']} training rows, not stamped; "
+          f"training_rows == epoch_windows' training rows (holdout, min_valid 0.3 and 0, balance on/off) OK")
 
 
 def check_export_only_heads() -> None:

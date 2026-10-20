@@ -35,6 +35,10 @@
 (j) the holdout splits by road area (250 m map cells), the same cells for
     every recording, so no road has frames in both train and val; it is the
     default when more than one recording is trained.
+(k) trained-heads contract: gvd_heads lists only heads that had labels; the
+    live runtime reads no other output, so untrained objects/signs/curbs are
+    never drawn or fed to the planner; a live model with no gvd_heads is
+    refused like one with no gvd_cams.
 """
 from __future__ import annotations
 
@@ -440,7 +444,8 @@ def check_cache_on_c() -> None:
           "main() refuses --strips on C: with a C: cache OK")
 
 
-def _tiny_scene_onnx(path: Path, cams: tuple[str, ...] | None) -> bool:
+def _tiny_scene_onnx(path: Path, cams: tuple[str, ...] | None, *, heads: tuple[str, ...] | None = ("lane_gt",),
+                     extra: tuple[str, ...] = ()) -> bool:
     """A constant-output graph with the scene runtime's strip input. False without onnx."""
     try:
         import onnx
@@ -454,16 +459,23 @@ def _tiny_scene_onnx(path: Path, cams: tuple[str, ...] | None) -> bool:
     names = cams or ("main", "narrow", "wide", "pillarL", "pillarR", "repeatL", "repeatR", "rear")
     _sectors, _h, width = scaled_layout(tuple(names), 1.0)
     value = helper.make_tensor("v", TensorProto.FLOAT, [1, LANE_GT_DIM], [0.0] * LANE_GT_DIM)
-    node = helper.make_node("Constant", [], ["lane_gt"], value=value)
+    nodes = [helper.make_node("Constant", [], ["lane_gt"], value=value)]
+    outs = [helper.make_tensor_value_info("lane_gt", TensorProto.FLOAT, [1, LANE_GT_DIM])]
+    for name in extra:  # untrained heads: confident garbage
+        nodes.append(helper.make_node("Constant", [], [name],
+                                      value=helper.make_tensor(name + "_v", TensorProto.FLOAT, [1, 4], [9.0] * 4)))
+        outs.append(helper.make_tensor_value_info(name, TensorProto.FLOAT, [1, 4]))
     graph = helper.make_graph(
-        [node], "tiny",
+        nodes, "tiny",
         [helper.make_tensor_value_info("strip", TensorProto.FLOAT, [1, 3, CANVAS_H, int(width)])],
-        [helper.make_tensor_value_info("lane_gt", TensorProto.FLOAT, [1, LANE_GT_DIM])],
+        outs,
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
     if cams is not None:
-        for key, val in metadata_dict(tuple(cams), ("lane_gt",), height=CANVAS_H, width=int(width)).items():
+        for key, val in metadata_dict(tuple(cams), heads, height=CANVAS_H, width=int(width)).items():
+            if key == "gvd_heads" and heads is None:
+                continue
             entry = model.metadata_props.add()
             entry.key, entry.value = key, val
     onnx.save(model, str(path))
@@ -696,9 +708,100 @@ def check_road_area_holdout() -> None:
           f"in train and val, nearest train row {nearest:.0f} m from val; default on for 2 recordings OK")
 
 
+def check_heads_contract() -> None:
+    from python.debug.lane_targets import LANE_GT_DIM
+    from python.train.cam_strip import metadata_dict
+    from python.train.scene_lane_runtime import (
+        SceneHeadsContractError,
+        SceneInputShapeError,
+        SceneLaneGuard,
+        SceneLaneRuntime,
+        check_heads_contract,
+        trained_outputs,
+    )
+    from python.train.scene_net import OUTPUT_FIELDS, labelled_heads
+
+    assert issubclass(SceneHeadsContractError, SceneInputShapeError), "the guard must refuse Engage on it"
+    assert check_heads_contract({"gvd_heads": "lane_gt"}) == ("lane_gt",)
+    assert check_heads_contract({}, required=False) == ("lane_gt",), "off the live path: lane-only"
+    for meta in ({}, {"gvd_heads": ""}, {"gvd_heads": "objects,signs"}, {"gvd_heads": "lane_gt,bogus"}):
+        try:
+            check_heads_contract(meta)
+            raise AssertionError(f"accepted {meta}")
+        except SceneHeadsContractError:
+            pass
+    # Every graph output, untrained heads included: only lane_gt and the state survive.
+    everything = {name: [9.0] for name in OUTPUT_FIELDS + ("h", "tokens", "mask")}
+    kept = trained_outputs(everything, ("lane_gt",))
+    assert set(kept) == {"lane_gt", "h", "tokens", "mask"}, sorted(kept)
+    for head in ("objects", "signs", "curbs", "lanes"):
+        assert not any(name.startswith(head[:-1]) or name == head for name in kept if name != "lane_gt"), head
+    assert set(trained_outputs(everything, ("lane_gt", "lanes"))) == {"lane_gt", "lanes", "lane_valid", "h", "tokens", "mask"}
+
+    # The trainer stamps only heads that had a label (rec5b-like rows: lane_gt and lane polylines, nothing else).
+    row = {"tech": {"lane_gt": [0.1] * LANE_GT_DIM, "lane_gt_valid": [1] * LANE_GT_DIM,
+                    "lanes": [[{"x": 0.0, "y": 5.0}, {"x": 0.0, "y": 30.0}]]}}
+    stamped, unlabelled = labelled_heads([row] * 50, None)
+    assert "lane_gt" in stamped and {"objects", "signs", "curbs"} <= set(unlabelled), (stamped, unlabelled)
+    assert labelled_heads([row], ("lane_gt",)) == (("lane_gt",), ())
+    assert labelled_heads([{"tech": {}}], ("lane_gt",)) == ((), ("lane_gt",))
+    assert metadata_dict(("main",), (), height=1, width=1)["gvd_heads"] == "", "no labelled head stamps nothing"
+    assert metadata_dict(("main",), ("lane_gt",), height=1, width=1)["gvd_heads"] == "lane_gt"
+
+    # Nothing outside the runtime reads scene-net outputs: run_vision only takes lane_x/conf through the guard.
+    import re
+
+    root = Path(__file__).resolve().parents[1]
+    vision = (root / "python" / "run_vision.py").read_text(encoding="utf-8")
+    used = set(re.findall(r"scene_lane\.(\w+)", vision))
+    assert used <= {"path", "ready", "reason", "cams", "heads"}, used
+    for rel in ("python/run_vision.py", "python/viz", "python/planning", "python/perception", "python/control"):
+        target = root / rel
+        files = [target] if target.is_file() else sorted(target.rglob("*.py"))
+        for file in files:
+            text = file.read_text(encoding="utf-8")
+            assert "last_outputs" not in text and "SceneLaneRuntime(" not in text.replace(
+                "SceneLaneRuntime(path, live_cams=live_cams)", ""), file
+
+    note = "(onnx/onnxruntime not installed: runtime load not run)"
+    eight = ("narrow", "main", "wide", "pillarL", "pillarR", "repeatL", "repeatR", "rear")
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        extra = ("objects", "object_valid", "signs", "sign_valid", "curbs", "curb_valid")
+        if _tiny_scene_onnx(tmp / "lane.onnx", ("main", "narrow", "wide"), extra=extra):
+            try:
+                import onnxruntime  # noqa: F401
+            except ImportError:
+                pass
+            else:
+                import numpy as np
+                from python.data.strip_writer import CANVAS_H
+
+                _tiny_scene_onnx(tmp / "nohead.onnx", ("main", "narrow", "wide"), heads=None, extra=extra)
+                _tiny_scene_onnx(tmp / "objonly.onnx", ("main", "narrow", "wide"), heads=("objects",), extra=extra)
+                rt = SceneLaneRuntime(tmp / "lane.onnx", live_cams=eight)
+                assert rt.ready and rt.heads == ("lane_gt",), rt.reason
+                strip = np.zeros((CANVAS_H, rt.canvas_w, 3), np.uint8)
+                lane_x, _conf = rt.observe(strip, 0.1)
+                assert lane_x is not None and set(rt.last_outputs) == {"lane_gt"}, sorted(rt.last_outputs)
+                for name in ("nohead.onnx", "objonly.onnx"):
+                    guard = SceneLaneGuard()
+                    got = guard.load(lambda path: SceneLaneRuntime(path, live_cams=eight), tmp / name)
+                    assert got is None and guard.refused and "gvd_heads" in guard.refused, (name, guard.refused)
+                legacy = SceneLaneRuntime(tmp / "nohead.onnx")
+                assert legacy.ready and legacy.heads == ("lane_gt",), "off the live path: lane-only"
+                legacy.observe(strip, 0.1)
+                assert set(legacy.last_outputs) == {"lane_gt"}
+                note = ("live graph with objects/signs/curbs outputs: only lane_gt read; no gvd_heads / no lane_gt "
+                        "refused by SceneLaneGuard")
+    print(f"(k) gvd_heads contract: untrained objects/signs/curbs outputs dropped at the runtime, never reach "
+          f"run_vision/viz/planner; trainer stamps labelled heads only; {note} OK")
+
+
 def main() -> None:
     check_multi_recording()
     check_road_area_holdout()
+    check_heads_contract()
     check_camera_contract()
     check_cache_on_c()
     check_other_cams()

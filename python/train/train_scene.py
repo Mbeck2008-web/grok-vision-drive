@@ -2019,12 +2019,28 @@ def train_directory(
     from python.data.strip_writer import STRIP_ORDER as _ALL_CAMS
 
     run_cams = list(train_cams or _ALL_CAMS)
-    # Run metadata: the camera contract the export stamps as gvd_cams.
+    from python.train.scene_net import labelled_heads
+
+    # Trained-heads contract: a head with no label in these rows trains only
+    # toward "absent"; it is left off gvd_heads and the live runtime ignores it.
+    stamp_heads, unlabelled_heads = labelled_heads(rows, train_heads)
+    if unlabelled_heads:
+        print(
+            f"[GVD] heads without any label in these rows: {','.join(unlabelled_heads)}; trained toward absent "
+            f"only and NOT stamped in gvd_heads ("
+            + (f"pass --heads {','.join(stamp_heads)} to skip them)" if stamp_heads
+               else "no head has a label: the live runtime will refuse this model)"),
+            flush=True,
+        )
+    # Run metadata: the camera and head contracts the export stamps as gvd_cams / gvd_heads.
     append_metrics(debug_dir, {"kind": "run", "t": run_started, "cams": run_cams,
-                               "heads": list(train_heads or ()) or "all",
+                               "heads": list(stamp_heads),
+                               "heads_requested": list(train_heads or ()) or "all",
+                               "heads_unlabelled": list(unlabelled_heads),
                                "recordings": run_recordings,
                                "rows_by_recording": recording_counts(rows)})
-    print(f"[GVD] run cams={','.join(run_cams)} (written to metrics.jsonl and the ONNX gvd_cams)", flush=True)
+    print(f"[GVD] run cams={','.join(run_cams)} heads={','.join(stamp_heads)} "
+          "(written to metrics.jsonl and the ONNX gvd_cams / gvd_heads)", flush=True)
     write_heartbeat(
         debug_dir,
         {
@@ -2682,7 +2698,7 @@ def train_directory(
                     )
                 _train_passes()
         if not paused_exit and not dry_run and not sanity and export_path is not None:
-            export_scene_onnx(export_path, net, heads=train_heads)
+            export_scene_onnx(export_path, net, heads=tuple(stamp_heads))
         if not paused_exit and not dry_run and not sanity:
             clear_checkpoint(root)
     except Exception:

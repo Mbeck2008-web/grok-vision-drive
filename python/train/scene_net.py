@@ -741,6 +741,41 @@ def labels_from_tech(tech: Mapping[str, Any] | None) -> dict[str, np.ndarray]:
     }
 
 
+HEAD_VALID = {
+    "lanes": "lane_valid",
+    "curbs": "curb_valid",
+    "objects": "object_valid",
+    "signs": "sign_valid",
+    "lane_gt": "lane_gt_valid",
+}
+
+
+def labelled_heads(
+    rows: list[Mapping[str, Any]], heads: tuple[str, ...] | None, *, sample: int = 2000
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """(heads with any valid label, heads with none) over an even sample of rows.
+
+    A head with no label anywhere is trained only toward "absent"; it is
+    left off ``gvd_heads`` so the live runtime never reads it.
+    """
+    wanted = tuple(heads) if heads else HEAD_NAMES
+    if not rows:
+        return (), wanted
+    step = max(1, len(rows) // max(1, int(sample)))
+    seen: set[str] = set()
+    for row in rows[::step]:
+        labels = labels_for_row(row)
+        for head in wanted:
+            if head in seen:
+                continue
+            valid = labels.get(HEAD_VALID.get(head, ""))
+            if valid is not None and float(np.nansum(np.asarray(valid, dtype=np.float64))) > 0:
+                seen.add(head)
+        if len(seen) == len(wanted):
+            break
+    return tuple(h for h in wanted if h in seen), tuple(h for h in wanted if h not in seen)
+
+
 def labels_for_row(row: Mapping[str, Any] | None) -> dict[str, np.ndarray]:
     """Scene labels plus the ground-truth lane vector when the row has one.
 

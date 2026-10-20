@@ -46,6 +46,60 @@ class SceneCameraContractError(SceneInputShapeError):
     """
 
 
+class SceneHeadsContractError(SceneInputShapeError):
+    """The model's trained-heads list (``gvd_heads``) is absent on a live load,
+    unreadable, or does not hold ``lane_gt``. Refused at load like ``gvd_cams``.
+    """
+
+
+# ONNX outputs per head. Only the outputs of a head on the model's gvd_heads
+# list are ever read; the others are dropped the moment the graph returns.
+HEAD_OUTPUTS: dict[str, tuple[str, ...]] = {
+    "lanes": ("lanes", "lane_valid"),
+    "curbs": ("curbs", "curb_valid"),
+    "objects": ("objects", "object_class", "object_valid"),
+    "signs": ("signs", "sign_class", "sign_state", "sign_valid"),
+    "lane_gt": ("lane_gt",),
+}
+STATE_OUTPUTS = ("h", "tokens", "mask")
+
+
+def check_heads_contract(meta: Any, *, required: bool = True) -> tuple[str, ...]:
+    """The model's trained heads (``gvd_heads``).
+
+    Live (``required``), a model without the list is refused, the same as a
+    model without ``gvd_cams``. Off the live path a model without it is
+    treated as lane-only. A list without ``lane_gt`` is always refused: the
+    scene lane source drives on nothing else.
+    """
+    from python.train.cam_strip import parse_heads
+
+    raw = str((meta or {}).get("gvd_heads") or "").strip() if isinstance(meta, dict) else ""
+    if not raw:
+        if required:
+            raise SceneHeadsContractError(
+                "model has no gvd_heads metadata (trained heads); re-export it with this trainer"
+            )
+        return ("lane_gt",)
+    try:
+        heads = parse_heads(raw)
+    except ValueError as exc:
+        raise SceneHeadsContractError(f"model gvd_heads={raw!r} is not a head list: {exc}") from exc
+    if "lane_gt" not in heads:
+        raise SceneHeadsContractError(f"model gvd_heads={raw!r} has no lane_gt; the scene lane source needs it")
+    return heads
+
+
+def trained_outputs(by_name: Any, heads: Any) -> dict[str, Any]:
+    """Only the outputs of trained heads (plus the recurrent state). An
+    untrained head's output (e.g. objects/signs/curbs trained on no labels)
+    is never returned, so nothing downstream can draw or plan on it."""
+    keep = set(STATE_OUTPUTS)
+    for head in heads or ():
+        keep.update(HEAD_OUTPUTS.get(str(head), ()))
+    return {name: value for name, value in dict(by_name or {}).items() if name in keep}
+
+
 def live_cams_from_config(cfg: Any) -> tuple[str, ...]:
     """Camera ids the live supervisor attaches, from ``config/cameras.yaml``."""
     out: list[str] = []
@@ -187,6 +241,9 @@ class SceneLaneRuntime:
         self._input_names: list[str] = []
         self._output_names: list[str] = []
         self.cams: tuple[str, ...] = ()
+        self.heads: tuple[str, ...] = ()
+        # Last outputs of trained heads only (see trained_outputs).
+        self.last_outputs: dict[str, Any] = {}
         self.canvas_w = 0
         self.token_dim = TOKEN_DIM
         self.h = np.zeros((1, 1, GRU_HIDDEN), dtype=np.float32)
@@ -229,6 +286,11 @@ class SceneLaneRuntime:
             except SceneCameraContractError as exc:
                 self.session = None
                 raise SceneCameraContractError(f"{self.path}: {exc}") from exc
+        try:
+            self.heads = check_heads_contract(meta, required=self.live_cams is not None)
+        except SceneHeadsContractError as exc:
+            self.session = None
+            raise SceneHeadsContractError(f"{self.path}: {exc}") from exc
         self.cams = cams_from_metadata(meta)
         try:
             self.canvas_w = int(meta.get("gvd_canvas_w") or CANVAS_W)
@@ -287,7 +349,10 @@ class SceneLaneRuntime:
             outputs = self.session.run(None, feeds)
         except Exception:
             return None, 0.0
-        by_name = {_base_name(name): value for name, value in zip(self._output_names, outputs)}
+        by_name = trained_outputs(
+            {_base_name(name): value for name, value in zip(self._output_names, outputs)}, self.heads
+        )
+        self.last_outputs = {name: value for name, value in by_name.items() if name not in STATE_OUTPUTS}
         vector = np.asarray(by_name.get("lane_gt"), dtype=np.float32).reshape(-1)
         if vector.size < LANE_GT_DIM:
             return None, 0.0

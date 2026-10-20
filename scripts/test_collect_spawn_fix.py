@@ -61,7 +61,7 @@ class _Paint:
     def __bool__(self) -> bool:
         return True
 
-    def lane_at(self, pos, direction, ys=(5.0, 10.0, 20.0, 30.0)):
+    def lane_at(self, pos, direction, ys=(5.0, 10.0, 20.0, 30.0), tracker=None):
         self.calls += 1
         out = []
         for y in ys:

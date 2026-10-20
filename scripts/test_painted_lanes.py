@@ -96,8 +96,12 @@ def test_stop_line_across_the_lane_is_ignored() -> None:
     lanes = PaintedLanes([_straight(-HALF), _straight(HALF), bar])
     got = lanes.lane_at(*CAR)
     assert _close(got[1], (-HALF, HALF)), got
-    unfiltered = lanes.lane_at(*CAR, heading_max_deg=None)
-    assert unfiltered[1] is None or not _close(unfiltered[1], (-HALF, HALF)), unfiltered
+    # Unfiltered, the lookaheads still follow the two anchored lines past the
+    # bar; but a bar at the car itself splits the lane it is anchored in.
+    at_bar = ([0.0, 10.0, 0.0], [0.0, 1.0, 0.0])
+    assert all(_close(g, (-HALF, HALF)) for g in lanes.lane_at(*at_bar)), lanes.lane_at(*at_bar)
+    unfiltered = lanes.lane_at(*at_bar, heading_max_deg=None)
+    assert unfiltered[0] is None or not _close(unfiltered[0], (-HALF, HALF)), unfiltered
 
 
 def test_relabel_uses_each_rows_own_map() -> None:

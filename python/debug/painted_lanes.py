@@ -205,10 +205,11 @@ class PaintedLanes:
         The ego lane is the pair of adjacent painted lines that contains the
         car at y = 0 (the car's own position), ``LANE_MIN_M``-``LANE_MAX_M``
         wide. Each lookahead then follows those same two lines: each line is
-        found where its own position and slope at the previous crossing put it
-        (within ``FOLLOW_M``), so no lookahead re-picks a different pair. A
-        lookahead where either line is missing, or the two are out of the
-        width range, is None.
+        walked forward in ``FOLLOW_STEP_M`` steps, at each step the paint
+        nearest where its last crossing and slope put it (within
+        ``FOLLOW_M``), across gaps of up to ``CARRY_M``. No lookahead re-picks
+        a different pair. A lookahead where either line has no paint, or the
+        two are out of the width range, is None.
 
         ``tracker`` (a ``LaneTracker``, one per drive; reset it on a respawn or
         a new segment) keeps the previous tick's pair: it stays the ego lane
@@ -232,20 +233,17 @@ class PaintedLanes:
         if anchor is None:
             return [None] * len(ys)
         out: list[tuple[float, float] | None] = []
-        state = [_LineFollow(anchor[0]), _LineFollow(anchor[1])]
+        walk = (_LineWalk(anchor[0]), _LineWalk(anchor[1]))
+        width = anchor[1][0] - anchor[0][0]
+        y_at = 0.0
         for y in ys:
             y = float(y)
-            got: list[float | None] = []
-            for side in state:
-                guess = side.predict(y)
-                lines = self._lines_at(y, ax, ay, bx, by, guess, FOLLOW_M)
-                if not lines:
-                    got.append(None)
-                    continue
-                x, sl = min(lines, key=lambda v: abs(v[0] - guess))
-                side.update(y, x, sl)
-                got.append(x)
-            left, right = got
+            # Step both lines forward to y; each step sees the paint once for both.
+            while y_at < y - 1e-9:
+                y_at = min(y, y_at + FOLLOW_STEP_M)
+                lines = self._lines_at(y_at, ax, ay, bx, by, 0.0, math.inf)
+                width = _step_pair(walk, y_at, lines, width)
+            left, right = walk[0].here(y), walk[1].here(y)
             if left is None or right is None or not (LANE_MIN_M <= right - left <= LANE_MAX_M):
                 out.append(None)
             else:
@@ -266,11 +264,21 @@ SWITCH_MARGIN_M = 0.505
 # metres of travel). Well under half the narrowest lane (LANE_MIN_M / 2):
 # a neighbour line, a lane width away, can never match.
 MATCH_M = 0.6
-# Each line is followed from one lookahead to the next within this of its
-# predicted position (its last crossing, slope and slope change). Under half
-# the narrowest lane (LANE_MIN_M / 2 = 1.01 m), so the neighbour line cannot
-# be taken.
+# Each line is walked forward in steps of FOLLOW_STEP_M. At each step it is
+# the paint nearest the straight extension of its last crossing, within
+# FOLLOW_M. Paint the heading filter keeps runs at most HEADING_MAX_DEG
+# (45 deg) off the car, so it moves at most tan(45 deg) * 1 m = 1.0 m
+# sideways in one step; and 1.0 m is under half the narrowest lane
+# (LANE_MIN_M / 2 = 1.01 m), so the neighbour line is never taken. A step
+# with no paint there (a gap between decal pieces) carries the line straight
+# on; after more than CARRY_M without paint the line is lost.
+FOLLOW_STEP_M = 1.0
 FOLLOW_M = 1.0
+# A line that starts inside the lane splits it only when it runs with the
+# lane: no steeper against the lane's lines than a 10:1 taper (0.1 m/m, the
+# shortest lane-shift taper at city speed). Steeper paint crossing the lane
+# (junction guide lines, hatching) is not a lane line.
+SPLIT_SLOPE_MAX = 0.1
 # A line of the kept pair that is not seen at y = 0 (a gap between dashes, a
 # decal piece ending) is carried from where it was last seen for at most this
 # far behind the car: one 40 ft dash cycle (10 ft dash, 30 ft gap). Once both
@@ -288,22 +296,91 @@ def _containing_pair(lines: list[tuple[float, float]]) -> tuple[tuple[float, flo
     return None
 
 
-class _LineFollow:
-    """One painted line walked forward from y = 0: last crossing, slope, slope change."""
+class _LineWalk:
+    """One painted line walked forward from y = 0 (``lane_at``)."""
 
     def __init__(self, start: tuple[float, float]) -> None:
         self.y, self.x, self.slope = 0.0, float(start[0]), float(start[1])
-        self.curv = 0.0
+        self.seen_y = 0.0  # last y with paint on this line
+        self.lost = False
 
-    def predict(self, y: float) -> float:
-        dy = float(y) - self.y
-        return self.x + self.slope * dy + 0.5 * self.curv * dy * dy
+    def guess(self, y: float) -> float:
+        return self.x + self.slope * (float(y) - self.y)
 
-    def update(self, y: float, x: float, slope: float) -> None:
-        dy = float(y) - self.y
-        if dy > 1e-6:
-            self.curv = (float(slope) - self.slope) / dy
-        self.y, self.x, self.slope = float(y), float(x), float(slope)
+    def candidates(self, y: float, lines: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        if self.lost:
+            return []
+        g = self.guess(y)
+        return [v for v in lines if abs(v[0] - g) <= FOLLOW_M]
+
+    def take(self, y: float, line: tuple[float, float] | None) -> None:
+        if self.lost:
+            return
+        if line is not None:
+            self.x, self.slope = float(line[0]), float(line[1])
+            self.seen_y = float(y)
+        else:
+            self.x = self.guess(y)
+            if float(y) - self.seen_y > CARRY_M:
+                self.lost = True
+        self.y = float(y)
+
+    def here(self, y: float) -> float | None:
+        """x at ``y`` when the line has paint there (the walk is at ``y``)."""
+        if self.lost or abs(self.seen_y - float(y)) > 1e-9:
+            return None
+        return self.x
+
+
+def _step_pair(
+    walk: tuple[_LineWalk, _LineWalk], y: float, lines: list[tuple[float, float]], width: float,
+) -> float:
+    """Advance both lines of the lane to ``y``; returns the lane width there (or the last one).
+
+    Each line takes the paint within FOLLOW_M of its straight extension.
+    Where a line forks (a lane line and an exit or edge line leaving it,
+    merged as one line until they are DOUBLE_LINE_M apart) both branches
+    are candidates. A lane's two lines run parallel, so the lane's own line
+    is the branch that runs parallel to the other side: the pair of
+    candidates with the least slope difference is taken (nearest the
+    extension on a tie, slopes compared to 0.01).
+    """
+    left, right = walk
+    if not left.lost and not right.lost:
+        # A lane that splits: a new line starts between the two (a lane
+        # opening beside this one), runs with the lane (SPLIT_SLOPE_MAX), and
+        # both parts are lanes. The ego lane is the part its own centre runs
+        # into; the line on the other side moves to the new line.
+        gl, gr = left.guess(y), right.guess(y)
+        c = 0.5 * (gl + gr)
+        along = 0.5 * (left.slope + right.slope)
+        inner = [
+            v for v in lines
+            if gl + LANE_MIN_M <= v[0] <= gr - LANE_MIN_M and abs(v[1] - along) <= SPLIT_SLOPE_MAX
+        ]
+        if inner:
+            split = min(inner, key=lambda v: abs(v[0] - c))
+            if split[0] >= c:
+                right.x, right.y, right.slope = split[0], y, split[1]
+            else:
+                left.x, left.y, left.slope = split[0], y, split[1]
+    cl, cr = left.candidates(y, lines), right.candidates(y, lines)
+    if cl and cr:
+        gl, gr = left.guess(y), right.guess(y)
+        lb, rb = min(
+            ((a, b) for a in cl for b in cr if b[0] > a[0]),
+            key=lambda p: (round(abs(p[1][1] - p[0][1]), 2), abs(p[0][0] - gl) + abs(p[1][0] - gr)),
+            default=(None, None),
+        )
+        left.take(y, lb)
+        right.take(y, rb)
+        return width if lb is None or rb is None else rb[0] - lb[0]
+    # One side has no paint here: the other keeps nearest its extension; the
+    # width is kept from the last step where both were seen.
+    for side, cand in ((left, cl), (right, cr)):
+        g = side.guess(y)
+        side.take(y, min(cand, key=lambda v: abs(v[0] - g)) if cand else None)
+    return width
 
 
 class LaneTracker:
@@ -315,8 +392,9 @@ class LaneTracker:
 
     The kept pair is replaced by the pair that contains the car (or by none)
     only when the car centre is more than ``SWITCH_MARGIN_M`` past one of its
-    lines, or the pair is gone: both lines unseen, a line carried more than
-    ``CARRY_M`` behind the car, or the two out of the lane width range.
+    lines, or the pair is no longer a lane: both lines unseen, a line
+    carried more than ``CARRY_M`` behind the car, paint seen between the two
+    (they are not adjacent), or the two out of the lane width range.
     ``reset()`` forgets it (a respawn, a new segment, a new map).
     """
 
@@ -370,7 +448,11 @@ class LaneTracker:
                     break
             if len(sides) == 2 and seen >= 1:
                 (left, left_seen), (right, right_seen) = sides
-                if LANE_MIN_M <= right[0] - left[0] <= LANE_MAX_M:
+                # Still a lane: adjacent lines (no paint seen between them;
+                # e.g. a lane line that tapers across under the car), a lane
+                # wide.
+                between = any(left[0] < x < right[0] and (x, sl) != left and (x, sl) != right for x, sl in lines0)
+                if not between and LANE_MIN_M <= right[0] - left[0] <= LANE_MAX_M:
                     if left[0] <= SWITCH_MARGIN_M and right[0] >= -SWITCH_MARGIN_M:
                         kept = (left, left_seen), (right, right_seen)
         if kept is not None:

@@ -128,6 +128,26 @@ def test_gap_in_a_line_at_the_car_keeps_the_lane() -> None:
         assert g == (None if gp else 0), (y, g)
 
 
+def test_kept_pair_must_stay_adjacent() -> None:
+    """A line starting between the kept lines (a lane line tapering in): the kept pair is no lane any more.
+
+    The car drives the left lane (-3.5 .. 0) at x = -1.75. From y = 40 a line
+    starts 0.7 m inside the right line and runs left at 0.08 m/m. The ego
+    lane's right line is that taper line, not the line beyond it.
+    """
+    taper = {"material": "line_white", "nodes": [[-0.7 - 0.08 * (y - 40.0), y, 0.0, 0.15] for y in range(40, 80, 2)]}
+    paint = PaintedLanes([_solid(x) for x in LINES] + [taper])
+    t = LaneTracker()
+    for k in range(51):
+        y = 30.0 + k * 0.5
+        got = paint.lane_at((-1.75, y, 0.0), NORTH, tracker=t, ys=(0.0,))[0]
+        if y < 40.0:
+            assert got is not None and abs(got[0] + 1.75) < 0.05 and abs(got[1] - 1.75) < 0.05, (y, got)
+        elif 41.0 <= y <= 49.0:  # until the lane is narrower than the car
+            want = -0.7 - 0.08 * (y - 40.0) + 1.75
+            assert got is not None and abs(got[1] - want) < 0.05, (y, got, want)
+
+
 def test_collector_resets_the_tracker_on_every_respawn() -> None:
     """The collector labels with one tracker and resets it at each respawn, recover and new segment.
 
@@ -149,6 +169,7 @@ def main() -> None:
     test_real_lane_change_switches_once_past_the_margin()
     test_respawn_resets()
     test_gap_in_a_line_at_the_car_keeps_the_lane()
+    test_kept_pair_must_stay_adjacent()
     test_collector_resets_the_tracker_on_every_respawn()
     print("test_painted_lane_tracker: OK")
 

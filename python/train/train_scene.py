@@ -89,7 +89,8 @@ def _pin_optimizer_lr(opt: Any, rate: float) -> None:
     """Write ``rate`` onto every param group.
 
     Loading a pause restores the learning rate that was saved with it. A
-    1e-4 group must not replace the command-line rate.
+    1e-4 group must not replace the command-line rate. A group with an
+    ``lr_mult`` (``--backbone-lr-mult``, default 1.0) gets ``rate * lr_mult``.
     """
     groups = getattr(opt, "param_groups", None)
     if not isinstance(groups, list):
@@ -97,7 +98,7 @@ def _pin_optimizer_lr(opt: Any, rate: float) -> None:
     pinned = float(rate)
     for group in groups:
         if isinstance(group, dict):
-            group["lr"] = pinned
+            group["lr"] = pinned * float(group.get("lr_mult", 1.0))
 
 
 def resolve_scene_batch(requested: int, parallel_fit: int) -> int:
@@ -302,6 +303,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--backbone-lr-mult",
+        type=float,
+        default=1.0,
+        help=(
+            "With --backbone imagenet-*, the backbone trains at --lr times this. Default 1.0 "
+            "(one rate for every weight). Not used by the scratch net."
+        ),
+    )
+    parser.add_argument(
         "--freeze-backbone",
         action="store_true",
         help="With --backbone imagenet-*, keep the ImageNet weights fixed and train only the projection and heads.",
@@ -465,11 +475,34 @@ LANE_SLOT_NAMES = (
 BLANK_MAIN_SKIPS = 0
 
 
+# Near-black main sector: mean below 2% of full scale, or more than 98% of
+# pixels with every channel below 8/255. Exact zeros missed nearly-black
+# frames (a dark or failed capture with a few noisy pixels).
+NEAR_BLACK_MEAN = 0.02
+NEAR_BLACK_LEVEL = 8
+NEAR_BLACK_FRAC = 0.98
+
+
+def near_black(pixels: Any) -> bool:
+    """True for an HxWx3 (or HxW) uint8 / 0-1 float area that is (nearly) black."""
+    arr = np.asarray(pixels)
+    if arr.size == 0:
+        return True
+    if arr.dtype != np.uint8:
+        arr = arr.astype(np.float32)
+        if float(arr.max()) <= 1.5:
+            arr = arr * 255.0
+    if float(arr.mean()) < NEAR_BLACK_MEAN * 255.0:
+        return True
+    peak = arr.max(axis=-1) if arr.ndim == 3 else arr
+    return float((peak < NEAR_BLACK_LEVEL).mean()) > NEAR_BLACK_FRAC
+
+
 def main_area_blank(frame: Any, cams: tuple[str, ...] | None, scale: float = 1.0) -> bool:
-    """True when ``main`` is a trained camera and its area of ``frame`` is all zero.
+    """True when ``main`` is a trained camera and its area of ``frame`` is near-black.
 
     A missing front picture is stitched as a black sector, and that row still
-    carries a real lane label.
+    carries a real lane label. See ``near_black`` for the threshold.
     """
     from python.data.strip_writer import STRIP_ORDER
     from python.train.cam_strip import scaled_layout
@@ -483,8 +516,34 @@ def main_area_blank(frame: Any, cams: tuple[str, ...] | None, scale: float = 1.0
         return False
     for sec in sectors:
         if sec.cam_id == "main":
-            return not bool(np.any(arr[:, sec.x0 : sec.x1]))
+            return near_black(arr[:, sec.x0 : sec.x1])
     return False
+
+
+def count_near_black_main(
+    rows: list[Mapping[str, Any]], cache: Any, cams: tuple[str, ...] | None, scale: float = 1.0
+) -> tuple[int, int] | None:
+    """(near-black, checked) over the cached main canvases of ``rows``. None without a cache."""
+    if cache is None or (cams and "main" not in cams):
+        return None
+    from python.data.strip_writer import CANVAS_W, STRIP_ORDER
+    from python.train.cam_strip import extract_cams, scale_canvas
+
+    black = checked = 0
+    for row in rows:
+        index = int(row["i"])
+        if not cache.has(index):
+            continue
+        frame = cache.canvas(index)
+        if frame is None:
+            continue
+        if cams and tuple(cams) != tuple(STRIP_ORDER) and int(frame.shape[1]) == CANVAS_W:
+            frame = extract_cams(frame, tuple(cams))
+        if scale < 0.999:
+            frame = scale_canvas(frame, scale, cams)
+        checked += 1
+        black += int(main_area_blank(frame, cams, scale))
+    return black, checked
 
 
 def huber_slot_constants(
@@ -1482,6 +1541,7 @@ def train_directory(
     eval_chunk: int = CHUNK_MAX,
     backbone: str = "scratch",
     freeze_backbone: bool = False,
+    backbone_lr_mult: float = 1.0,
 ) -> dict[str, Any]:
     import torch
 
@@ -1520,6 +1580,18 @@ def train_directory(
         f"trained camera ({','.join(train_cams or ()) or 'all'}; main required when trained)",
         flush=True,
     )
+    blank_scan = count_near_black_main(rows, cache, train_cams, input_scale)
+    near_rule = (
+        f"mean<{NEAR_BLACK_MEAN} or >{NEAR_BLACK_FRAC:.0%} of px below {NEAR_BLACK_LEVEL}/255"
+    )
+    if blank_scan is None:
+        print(f"[GVD] scene index: near-black main ({near_rule}) is skipped as rows load; no cache to count it up front", flush=True)
+    else:
+        print(
+            f"[GVD] scene index: near-black main ({near_rule}): {blank_scan[0]} of {blank_scan[1]} cached rows; "
+            "skipped when loaded (blank_main_skipped in the val line)",
+            flush=True,
+        )
     print(
         f"[GVD] conf_weight={float(conf_weight)} (confidence BCE scale in the training loss; "
         f"model selection uses the 8 m center rms only) eval_chunk={int(eval_chunk)}",
@@ -1635,7 +1707,8 @@ def train_directory(
                 ).to(device)
                 print(
                     f"[GVD] backbone={backbone} single-frame (no GRU, no skip) "
-                    f"freeze={bool(freeze_backbone)} token_dim={holder['net'].token_dim} "
+                    f"freeze={bool(freeze_backbone)} backbone_lr_mult={float(backbone_lr_mult)} "
+                    f"token_dim={holder['net'].token_dim} "
                     f"params={sum(p.numel() for p in holder['net'].parameters())} "
                     "preprocess=BGR->RGB, /255, ImageNet mean/std inside the net",
                     flush=True,
@@ -1651,7 +1724,11 @@ def train_directory(
         holder["amp"] = amp
         holder["precision"] = "amp" if amp else "fp32"
         holder["lr"] = rate
-        holder["opt"] = torch.optim.AdamW(holder["net"].parameters(), lr=rate, weight_decay=WEIGHT_DECAY)
+        if hasattr(holder["net"], "param_groups") and float(backbone_lr_mult) != 1.0:
+            params: Any = holder["net"].param_groups(rate, float(backbone_lr_mult))
+        else:
+            params = holder["net"].parameters()
+        holder["opt"] = torch.optim.AdamW(params, lr=rate, weight_decay=WEIGHT_DECAY)
         holder["scaler"] = _scaler(amp)
 
     def probe(device_name: str, batch: int) -> bool:
@@ -2161,7 +2238,8 @@ def train_directory(
                     f"lane_loss={scored.get('lane_loss')} conf_bce={scored.get('conf_bce')} "
                     f"pred_mean={scored.get('pred_mean')} pred_std={scored.get('pred_std')} "
                     f"r_long={scored.get('r_long')} rms_long={scored.get('rms_long')} "
-                    f"bias_long={scored.get('bias_long')} eval_chunk={int(eval_chunk)}",
+                    f"bias_long={scored.get('bias_long')} eval_chunk={int(eval_chunk)} "
+                    f"blank_main_skipped={int(BLANK_MAIN_SKIPS)}",
                     flush=True,
                 )
                 for line in cell_lines:
@@ -2487,6 +2565,7 @@ def main(argv: list[str] | None = None) -> None:
             eval_chunk=int(args.eval_chunk),
             backbone=str(args.backbone),
             freeze_backbone=bool(args.freeze_backbone),
+            backbone_lr_mult=float(args.backbone_lr_mult),
         )
     except TrainFitError as exc:
         print(f"[GVD] scene train: {exc}")

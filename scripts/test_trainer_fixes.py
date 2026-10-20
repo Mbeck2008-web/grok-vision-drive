@@ -92,9 +92,11 @@ def check_black_rows() -> None:
         assert [r["i"] for r in new] == [0], new
         assert dropped == {"no_trained_cam": 2} and new_missing == 2, (dropped, new_missing)
     black = np.zeros((192, 256, 3), np.uint8)
-    lit = black.copy()
-    lit[100, 10] = 7
+    speck = black.copy()
+    speck[100, 10] = 7  # one lit pixel: near-black, dropped too
+    lit = np.random.RandomState(0).randint(20, 200, size=(192, 256, 3)).astype(np.uint8)
     assert train_scene.main_area_blank(black, ("main",))
+    assert train_scene.main_area_blank(speck, ("main",))
     assert not train_scene.main_area_blank(lit, ("main",))
     assert not train_scene.main_area_blank(black, ("pillarL",)), "main not trained: not this check"
     from python.data.strip_writer import CANVAS_W, compose_strip
@@ -348,6 +350,62 @@ def check_backbone() -> None:
     print("backbone: BGR->RGB + ImageNet norm in the net, BN frozen, no state carried, frames independent, own pause tag OK")
 
 
+def check_near_black() -> None:
+    """Near-black main: mean < 2% or > 98% of pixels below 8/255. A dim real frame stays."""
+    from python.train.train_scene import main_area_blank, near_black
+
+    rng = np.random.RandomState(3)
+    zero = np.zeros((192, 256, 3), np.uint8)
+    noisy = zero.copy()
+    noisy[rng.rand(192, 256) < 0.01] = 200  # 1% hot pixels, mean ~0.008
+    dim = np.full((192, 256, 3), 3, np.uint8)
+    dim[:2] = 255  # 1% bright rows: mean above 2%, but 99% of pixels below 8
+    dusk = rng.randint(10, 40, size=(192, 256, 3)).astype(np.uint8)  # a dark but real picture
+    assert near_black(zero) and near_black(noisy) and near_black(dim)
+    assert not near_black(dusk), float(dusk.mean())
+    assert near_black(zero.astype(np.float32)) and not near_black(dusk.astype(np.float32) / 255.0)
+    assert main_area_blank(noisy, ("main",)) and not main_area_blank(dusk, ("main",))
+    print(f"near-black: exact zeros, 1% hot pixels (mean {noisy.mean() / 255:.3f}) and 99%-dark frames dropped; a dim real frame (mean {dusk.mean() / 255:.3f}) kept OK")
+
+
+def check_backbone_pool_and_lr() -> None:
+    """4x8 pooling matches adaptive_avg_pool2d; --backbone-lr-mult groups survive LR pinning."""
+    import torch
+    import torch.nn.functional as functional
+
+    try:
+        import torchvision  # noqa: F401
+    except ImportError:
+        print("backbone pool/lr: torchvision not installed, skipped")
+        return
+    from python.train.pretrained_net import POOL_ROWS, PretrainedSceneNet, adaptive_pool
+    from python.train.train_scene import _pin_optimizer_lr
+
+    for shape in ((2, 8, 6, 8), (1, 4, 7, 13), (1, 2, 8, 16)):
+        x = torch.randn(*shape)
+        assert torch.allclose(adaptive_pool(x, 4, 8), functional.adaptive_avg_pool2d(x, (4, 8)), atol=1e-6), shape
+    net = PretrainedSceneNet(("main",), 1.0, "mobilenetv3", pretrained=False)
+    assert POOL_ROWS == 4 and net.token_dim == 64 * 4 * 8 and "pool4x8" in net.pause_arch
+    # Rows matter now: two maps that differ only top vs bottom give different features.
+    fm = torch.zeros(1, 576, 6, 8)
+    top, bottom = fm.clone(), fm.clone()
+    top[:, :, :3] = 1.0
+    bottom[:, :, 3:] = 1.0
+    with torch.no_grad():
+        f_top = adaptive_pool(net.conv_head(top), 4, 8)
+        f_bot = adaptive_pool(net.conv_head(bottom), 4, 8)
+    assert float((f_top - f_bot).abs().max()) > 1e-4 and tuple(f_top.shape) == (1, 64, 4, 8)
+    opt = torch.optim.AdamW(net.param_groups(1e-3, 1.0), lr=1e-3)
+    _pin_optimizer_lr(opt, 1e-3)
+    assert [g["lr"] for g in opt.param_groups] == [1e-3, 1e-3]
+    opt = torch.optim.AdamW(net.param_groups(1e-3, 0.5), lr=1e-3)
+    _pin_optimizer_lr(opt, 1e-3)
+    assert [g["lr"] for g in opt.param_groups] == [1e-3, 5e-4]
+    n_groups = sum(p.numel() for g in opt.param_groups for p in g["params"])
+    assert n_groups == sum(p.numel() for p in net.parameters())
+    print("backbone pool/lr: 4x8 pool == adaptive_avg_pool2d, vertical position survives, lr_mult 1.0 -> one rate, 0.5 kept through pinning OK")
+
+
 def check_real(root: Path) -> None:
     from python.data.raw_frames import load_scene_rows
     from python.train.scene_loader import select_training_rows
@@ -376,6 +434,8 @@ def main() -> None:
     check_map_mismatch()
     check_bootstrap()
     check_backbone()
+    check_near_black()
+    check_backbone_pool_and_lr()
     if args.real:
         check_real(Path(args.real))
     print("test_trainer_fixes: all OK")

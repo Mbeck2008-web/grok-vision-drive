@@ -32,6 +32,12 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 # The trainer's canvas is BGR. Index 2 (R), 1 (G), 0 (B) makes RGB.
 BGR_TO_RGB = (2, 1, 0)
+# Feature-map pooling. Rows keep the vertical axis, where the 5/10/20/30 m
+# lookaheads live (near rows at the bottom, far rows near the horizon);
+# HORIZ_BINS columns keep left/right. A one-row pool averaged the
+# lookaheads together.
+POOL_ROWS = 4
+CONV_HEAD = (128, 64)
 
 import torch
 from torch import nn
@@ -57,6 +63,29 @@ def _mobilenetv3(weights: bool) -> tuple[nn.Module, nn.Module | None, int]:
     return model.features, classifier, 576
 
 
+def adaptive_pool(x: Any, rows: int, cols: int) -> Any:
+    """``adaptive_avg_pool2d(x, (rows, cols))`` built from slices and means.
+
+    Same bins and values as PyTorch's adaptive pool, but it also exports to
+    ONNX when the map size is not a multiple of the output (a 6-row ResNet /
+    MobileNet map pooled to 4 rows), which the exporter refuses.
+    """
+    height, width = int(x.shape[-2]), int(x.shape[-1])
+    if height % rows == 0 and width % cols == 0:
+        import torch.nn.functional as functional
+
+        return functional.avg_pool2d(x, (height // rows, width // cols))
+
+    def _bins(size: int, n: int) -> list[tuple[int, int]]:
+        return [((i * size) // n, -((-(i + 1) * size) // n)) for i in range(n)]
+
+    out_rows = []
+    for r0, r1 in _bins(height, rows):
+        band = x[:, :, r0:r1, :].mean(dim=2, keepdim=True)
+        out_rows.append(torch.cat([band[:, :, :, c0:c1].mean(dim=3, keepdim=True) for c0, c1 in _bins(width, cols)], dim=3))
+    return torch.cat(out_rows, dim=2)
+
+
 def imagenet_categories(name: str) -> list[str]:
     from torchvision.models import MobileNet_V3_Small_Weights, ResNet18_Weights
 
@@ -80,10 +109,11 @@ class ImageNetPreprocess(nn.Module):
 class PretrainedSceneNet(nn.Module):
     """Same call surface as ``SceneNet`` (forward, forward_batch, initial_state).
 
-    Each sector goes through the shared backbone. Its last feature map is
-    pooled to ``HORIZ_BINS`` columns (left/right position survives, unlike a
-    global average), projected to ``GRU_HIDDEN`` and fed to the same linear
-    heads as ``SceneNet``. BatchNorm stays in eval mode (ImageNet statistics):
+    Each sector goes through the shared backbone. A small conv head (two 3x3
+    convs, ``CONV_HEAD`` channels) reads its last feature map, which is then
+    pooled to ``POOL_ROWS`` x ``HORIZ_BINS`` (both the lookahead rows and the
+    left/right columns survive), projected to ``GRU_HIDDEN`` and fed to the
+    same linear heads as ``SceneNet``. BatchNorm stays in eval mode (ImageNet statistics):
     the trainer's per-tick batch is a handful of windows, too few for batch
     statistics.
     """
@@ -116,7 +146,14 @@ class PretrainedSceneNet(nn.Module):
         # Kept out of the module tree so it is neither trained nor saved:
         # only the one-frame check script uses it for top-5 classes.
         self.__dict__["_classifier"] = classifier
-        self.token_dim = len(self.sectors) * channels * HORIZ_BINS
+        wide, narrow = CONV_HEAD
+        self.conv_head = nn.Sequential(
+            nn.Conv2d(channels, wide, kernel_size=3, padding=1),
+            nn.ReLU(inplace=False),
+            nn.Conv2d(wide, narrow, kernel_size=3, padding=1),
+            nn.ReLU(inplace=False),
+        )
+        self.token_dim = len(self.sectors) * narrow * POOL_ROWS * HORIZ_BINS
         self.proj = nn.Sequential(nn.Linear(self.token_dim, GRU_HIDDEN), nn.ReLU(inplace=False))
         for name, out in scene_head_sizes():
             setattr(self, name, nn.Linear(GRU_HIDDEN, out))
@@ -124,7 +161,20 @@ class PretrainedSceneNet(nn.Module):
             for p in self.backbone.parameters():
                 p.requires_grad_(False)
         # Pause files from this net must not load into SceneNet, or back.
-        self.pause_arch = f"{backbone}:{'frozen' if self.freeze else 'tuned'}:cams=" + ",".join(self.cams)
+        self.pause_arch = (
+            f"{backbone}:{'frozen' if self.freeze else 'tuned'}:pool{POOL_ROWS}x{HORIZ_BINS}:cams=" + ",".join(self.cams)
+        )
+
+    def param_groups(self, lr: float, backbone_lr_mult: float = 1.0) -> list[dict[str, Any]]:
+        """AdamW groups: the backbone at ``lr * backbone_lr_mult``, the rest at ``lr``."""
+        body = [p for p in self.backbone.parameters() if p.requires_grad]
+        body_ids = {id(p) for p in self.backbone.parameters()}
+        rest = [p for p in self.parameters() if id(p) not in body_ids]
+        groups = [{"params": rest, "lr": float(lr), "lr_mult": 1.0, "name": "head"}]
+        if body:
+            mult = float(backbone_lr_mult)
+            groups.append({"params": body, "lr": float(lr) * mult, "lr_mult": mult, "name": "backbone"})
+        return groups
 
     def train(self, mode: bool = True) -> "PretrainedSceneNet":
         super().train(mode)
@@ -153,9 +203,10 @@ class PretrainedSceneNet(nn.Module):
         return self._classifier.to(image.device)(self.sector_maps(image)[0])
 
     def features(self, image: Any) -> Any:
-        import torch.nn.functional as functional
-
-        parts = [functional.adaptive_avg_pool2d(fm, (1, HORIZ_BINS)).flatten(1) for fm in self.sector_maps(image)]
+        parts = [
+            adaptive_pool(self.conv_head(fm), POOL_ROWS, HORIZ_BINS).flatten(1)
+            for fm in self.sector_maps(image)
+        ]
         return self.proj(torch.cat(parts, dim=-1))
 
     def forward(self, strip: Any, dt: Any, state: SceneState) -> tuple[Any, SceneState]:

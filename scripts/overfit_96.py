@@ -77,6 +77,7 @@ def main(argv=None) -> int:
     ap.add_argument("--backbone", choices=("scratch", "imagenet-resnet18", "mobilenetv3"), default="scratch",
                     help="Single-frame ImageNet baseline instead of the GRU scene net (--mode must stay full)")
     ap.add_argument("--freeze-backbone", action="store_true")
+    ap.add_argument("--backbone-lr-mult", type=float, default=1.0, help="Backbone LR = lr x this (default 1.0)")
     ap.add_argument("--threads", type=int, default=4)
     args = ap.parse_args(argv)
 
@@ -136,7 +137,10 @@ def main(argv=None) -> int:
 
         net._forward_batched = types.MethodType(_fwd, net)
     net.train()
-    opt = torch.optim.AdamW(net.parameters(), lr=float(args.lr), weight_decay=WEIGHT_DECAY)
+    if args.backbone != "scratch" and float(args.backbone_lr_mult) != 1.0:
+        opt = torch.optim.AdamW(net.param_groups(float(args.lr), float(args.backbone_lr_mult)), lr=float(args.lr), weight_decay=WEIGHT_DECAY)
+    else:
+        opt = torch.optim.AdamW(net.parameters(), lr=float(args.lr), weight_decay=WEIGHT_DECAY)
     n_opt = sum(p.numel() for g in opt.param_groups for p in g["params"])
     n_all = sum(p.numel() for p in net.parameters())
     n_grad = sum(p.numel() for p in net.parameters() if p.requires_grad)

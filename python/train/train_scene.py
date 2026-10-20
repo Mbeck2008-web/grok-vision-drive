@@ -220,6 +220,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write models/e2e_scene.onnx (FP32 graph). Optional path.",
     )
     parser.add_argument(
+        "--checkpoint",
+        default="",
+        metavar="PAUSE_FILE",
+        help=(
+            "Export-only (--export without --strips): the pause file (*.gvd-pause.npz) whose weights are "
+            "exported. gvd_heads and gvd_cams are taken from its run record; a file without one is "
+            "refused, and so is a --heads or --cams that disagrees with it."
+        ),
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Load the pause checkpoint when it exists. This is also the default.",
@@ -1499,12 +1509,64 @@ def stamp_pause(
     return payload
 
 
-def _apply_checkpoint(net: Any, opt: Any, scaler: Any, fields: Mapping[str, Any], device: Any) -> None:
-    """Load the paused weights and optimizer. Does not touch the strip folder.
+class ExportRefused(ValueError):
+    """An export-only run cannot say which heads the weights were trained on."""
 
-    An older conv-relu file has no GroupNorm tag. It is refused before any
-    weight is copied, so those tensors are not applied to the new stem.
+
+def export_contract_from_checkpoint(
+    payload: Mapping[str, Any], *, heads_flag: str = "", cams_flag: str = ""
+) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, Any]]:
+    """(heads, cams, net) to stamp for an export-only run, from the checkpoint's run record.
+
+    Refused: no run record, no heads list, an empty heads list (nothing
+    cleared the label floor), or a ``--heads`` / ``--cams`` that is not the
+    recorded set.
     """
+    from python.train.cam_strip import parse_cams, parse_heads
+
+    run = payload.get("run") if isinstance(payload, Mapping) else None
+    if not isinstance(run, Mapping):
+        raise ExportRefused("checkpoint has no run record (written before the trained-heads contract); "
+                            "retrain or resume to write one")
+    raw = run.get("heads")
+    if not isinstance(raw, (list, tuple)):
+        raise ExportRefused("checkpoint run record has no heads list")
+    try:
+        heads = tuple(parse_heads(",".join(str(h) for h in raw))) if raw else ()
+    except ValueError as exc:
+        raise ExportRefused(f"checkpoint heads {list(raw)} unreadable: {exc}") from exc
+    if not heads:
+        raise ExportRefused("checkpoint run record lists no trained head (none cleared the label floor)")
+    if str(heads_flag or "").strip():
+        wanted = parse_heads(heads_flag)
+        if set(wanted) != set(heads):
+            raise ExportRefused(f"--heads {','.join(wanted)} disagrees with the checkpoint's trained heads "
+                                f"{','.join(heads)}; drop --heads or export the run that trained them")
+    cams = tuple(parse_cams(",".join(str(c) for c in (run.get("cams") or []))))
+    if str(cams_flag or "").strip() and set(parse_cams(cams_flag)) != set(cams):
+        raise ExportRefused(f"--cams {cams_flag} disagrees with the checkpoint's cams {','.join(cams)}")
+    net = dict(run.get("net") or {})
+    return heads, cams, net
+
+
+def build_export_net(cams: tuple[str, ...], net_info: Mapping[str, Any]) -> Any:
+    """The net a checkpoint was trained as (cams, input scale, backbone)."""
+    from python.data.strip_writer import STRIP_ORDER
+
+    backbone = str(net_info.get("backbone") or "")
+    scale = float(net_info.get("scale") or 1.0)
+    use_cams = None if tuple(cams) == tuple(STRIP_ORDER) else tuple(cams)
+    if backbone in ("", "scratch"):
+        from python.train.scene_net import SceneNet
+
+        return SceneNet(cams=use_cams, scale=scale)
+    from python.train.pretrained_net import build_scene_net
+
+    return build_scene_net(use_cams, scale, backbone, freeze=False)
+
+
+def load_pause_weights(net: Any, fields: Mapping[str, Any]) -> None:
+    """Copy a pause file's weights into ``net`` (arch checked first). No optimizer."""
     used_cams = tuple(getattr(net, "cams", ()) or ()) or None
     net_arch = getattr(net, "pause_arch", None)
     if not pause_matches_stem(fields, used_cams, net_arch):
@@ -1525,6 +1587,17 @@ def _apply_checkpoint(net: Any, opt: Any, scaler: Any, fields: Mapping[str, Any]
     if missing:
         raise KeyError(f"pause checkpoint is missing {missing[0]}")
     net.load_state_dict(mapped)
+
+
+def _apply_checkpoint(net: Any, opt: Any, scaler: Any, fields: Mapping[str, Any], device: Any) -> None:
+    """Load the paused weights and optimizer. Does not touch the strip folder.
+
+    An older conv-relu file has no GroupNorm tag. It is refused before any
+    weight is copied, so those tensors are not applied to the new stem.
+    """
+    load_pause_weights(net, fields)
+    import torch
+
     optimizer = fields.get("optimizer") or {}
     if optimizer:
         tree = _from_numpy_tree(optimizer)
@@ -1565,8 +1638,15 @@ def _save_pause(
     batch: int,
     device_name: str,
     recommended: bool,
+    run: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Save weights before the loop stops. Strip files are not rewritten."""
+    """Save weights before the loop stops. Strip files are not rewritten.
+
+    ``run`` (cams, trained heads with their label counts, net) travels with
+    the weights, so an export-only run stamps exactly what was trained.
+    """
+    import json
+
     used_cams = tuple(getattr(net, "cams", ()) or ()) or None
     payload = stamp_pause(
         {
@@ -1583,6 +1663,7 @@ def _save_pause(
             "weights": {key: value.detach().cpu().numpy() for key, value in net.state_dict().items()},
             "optimizer": _to_numpy_tree(opt.state_dict()),
             "scaler": None if scaler is None else _to_numpy_tree(scaler.state_dict()),
+            "run": None if run is None else json.loads(json.dumps(run)),
         },
         used_cams,
         getattr(net, "pause_arch", None),
@@ -1926,14 +2007,15 @@ def train_directory(
 
     def _empty(precision: str = "fp32") -> dict[str, Any]:
         if export_path is not None:
-            export_scene_onnx(export_path, cams=train_cams, heads=train_heads)
+            # Nothing trained: an untrained net is never exported (its heads would be a guess).
+            print(f"[GVD] no training rows: nothing trained, {export_path} not written", flush=True)
         return {
             "strips": len(rows),
             "windows": 0,
             "supervised": 0,
             "precision": precision,
             "capability": capability,
-            "export": None if export_path is None else str(export_path),
+            "export": None,
             "device": "cpu",
             "batch": 0,
             "recommended": False,
@@ -2088,15 +2170,20 @@ def train_directory(
             flush=True,
         )
     # Run metadata: the camera and head contracts the export stamps as gvd_cams / gvd_heads.
-    append_metrics(debug_dir, {"kind": "run", "t": run_started, "cams": run_cams,
-                               "heads": list(stamp_heads),
-                               "heads_requested": list(train_heads or ()) or "all",
-                               "heads_unlabelled": list(unlabelled_heads),
-                               "head_labels": head_labels,
-                               "label_floor": label_floor,
-                               "recordings": run_recordings,
-                               "rows_by_recording": recording_counts(rows),
-                               "holdout": holdout_meta})
+    run_record = {"kind": "run", "t": run_started, "cams": run_cams,
+                  "heads": list(stamp_heads),
+                  "heads_requested": list(train_heads or ()) or "all",
+                  "heads_unlabelled": list(unlabelled_heads),
+                  "head_labels": head_labels,
+                  "label_floor": label_floor,
+                  "net": {"backbone": str(backbone or ""), "scale": float(input_scale)},
+                  "recordings": run_recordings,
+                  "rows_by_recording": recording_counts(rows),
+                  "holdout": holdout_meta}
+    append_metrics(debug_dir, run_record)
+    # The pause checkpoint carries the contract (not the recordings/holdout detail).
+    checkpoint_run = {key: run_record[key] for key in
+                      ("cams", "heads", "heads_requested", "heads_unlabelled", "head_labels", "label_floor", "net")}
     print(f"[GVD] run cams={','.join(run_cams)} heads={','.join(stamp_heads)} "
           "(written to metrics.jsonl and the ONNX gvd_cams / gvd_heads)", flush=True)
     write_heartbeat(
@@ -2202,6 +2289,7 @@ def train_directory(
                 batch=batch,
                 device_name=device.type,
                 recommended=recommended,
+                run=checkpoint_run,
             )
             last_ckpt = now
             print(f"[GVD] checkpoint step={done}", flush=True)
@@ -2234,6 +2322,7 @@ def train_directory(
             batch=batch,
             device_name=device.type,
             recommended=recommended,
+            run=checkpoint_run,
         )
         view.mark_paused(payload)
         if not _wait_for_start(view):
@@ -2841,16 +2930,34 @@ def main(argv: list[str] | None = None) -> None:
     frame_cache = None
     export_path = None if args.export is None else Path(args.export)
     if export_path is not None and not args.strips:
+        # Export-only: the weights and the trained heads come from a checkpoint's run record.
         try:
             check_data_path(export_path)
+            if not args.checkpoint:
+                raise ExportRefused(
+                    "export-only needs --checkpoint <pause file>: an untrained net is never exported, "
+                    "and gvd_heads must come from the run that trained the weights"
+                )
+            from python.train.checkpoint import load_checkpoint_file
+
+            payload = load_checkpoint_file(args.checkpoint)
+            heads, ck_cams, ck_net = export_contract_from_checkpoint(
+                payload, heads_flag=args.heads, cams_flag=args.cams
+            )
         except DataDriveError as exc:
             print(f"[GVD] scene train: {exc}")
+            sys.exit(2)
+        except (ExportRefused, OSError, ValueError, KeyError) as exc:
+            print(f"[GVD] scene export refused: {exc}")
             sys.exit(2)
         if not torch_ready():
             print("[GVD] scene export needs PyTorch")
             sys.exit(2)
-        path = export_scene_onnx(export_path, cams=cam_names, heads=head_names)
-        print(f"[GVD] exported {path}")
+        net = build_export_net(ck_cams, ck_net)
+        load_pause_weights(net, payload)
+        path = export_scene_onnx(export_path, net, heads=heads)
+        print(f"[GVD] exported {path} from {args.checkpoint}: gvd_heads={','.join(heads)} "
+              f"gvd_cams={','.join(ck_cams)} (from the checkpoint's run record)")
         return
     from python.train.combine_recordings import CombineError, combine_recordings, parse_usable_until
 

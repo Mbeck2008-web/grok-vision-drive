@@ -53,6 +53,9 @@
 (p) the label count runs on the rows that train (after the holdout split and
     --min-valid), not all rows: a head labelled only in val rows, or only in
     windows --min-valid drops, is not stamped.
+(q) an export-only run stamps exactly the heads in the checkpoint's run
+    record (saved with the weights); a checkpoint without one, no
+    checkpoint, or a disagreeing --heads is refused.
 """
 from __future__ import annotations
 
@@ -1025,6 +1028,101 @@ def check_labels_on_training_rows() -> None:
           f"where --min-valid drops the windows: {counts2['lanes']['labelled_rows']} training rows, not stamped OK")
 
 
+def check_export_only_heads() -> None:
+    import contextlib
+    import io
+
+    import numpy as np
+
+    from python.data import data_root
+    from python.train import train_scene as ts
+    from python.train.checkpoint import checkpoint_path, load_checkpoint_file, save_checkpoint
+
+    run = {"cams": ["wide", "main", "narrow"], "heads": ["lane_gt"], "heads_requested": "all",
+           "heads_unlabelled": ["lanes", "curbs", "objects", "signs"],
+           "head_labels": {"lane_gt": {"labelled_rows": 900, "labelled_share": 0.9, "stamped": True},
+                           "objects": {"labelled_rows": 0, "labelled_share": 0.0, "stamped": False}},
+           "label_floor": {"share": 0.01, "rows": 100, "training_rows": 1000},
+           "net": {"backbone": "", "scale": 1.0}}
+    heads, cams, net = ts.export_contract_from_checkpoint({"run": run})
+    assert heads == ("lane_gt",) and cams == ("wide", "main", "narrow") and net["backbone"] == ""
+    assert ts.export_contract_from_checkpoint({"run": run}, heads_flag="lane-gt", cams_flag="main,narrow,wide")[0] == heads
+    refusals = (
+        ({}, "", "no run record"),
+        ({"run": {"cams": ["main"]}}, "", "no heads list"),
+        ({"run": dict(run, heads=[])}, "", "lists no trained head"),
+        ({"run": run}, "lane_gt,objects", "disagrees"),
+        ({"run": run}, "objects", "disagrees"),
+    )
+    for payload, flag, why in refusals:
+        try:
+            ts.export_contract_from_checkpoint(payload, heads_flag=flag)
+            raise AssertionError(f"export accepted: {why}")
+        except ts.ExportRefused as exc:
+            assert why in str(exc), (why, exc)
+    try:
+        ts.export_contract_from_checkpoint({"run": run}, cams_flag="main")
+        raise AssertionError("--cams disagreement accepted")
+    except ts.ExportRefused:
+        pass
+
+    gb = 1024 ** 3
+    real_free = data_root.free_bytes
+    data_root.free_bytes = lambda _path: 50 * gb
+    try:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            # The run record travels inside the pause file.
+            save_checkpoint(tmp / "rec_a", {"weights": {"w": np.zeros(2, np.float32)}, "run": run})
+            assert load_checkpoint_file(checkpoint_path(tmp / "rec_a"))["run"] == run
+            save_checkpoint(tmp / "rec_old", {"weights": {"w": np.zeros(2, np.float32)}})
+
+            def refused(argv: list[str]) -> str:
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    try:
+                        ts.main(argv)
+                        raise AssertionError(f"main accepted {argv}")
+                    except SystemExit as exc:
+                        assert exc.code == 2, exc.code
+                return out.getvalue()
+
+            onnx_out = tmp / "out" / "e2e_scene.onnx"
+            msg = refused(["--export", str(onnx_out)])
+            assert "needs --checkpoint" in msg, msg
+            msg = refused(["--export", str(onnx_out), "--checkpoint", str(checkpoint_path(tmp / "rec_old"))])
+            assert "no run record" in msg, msg
+            msg = refused(["--export", str(onnx_out), "--checkpoint", str(checkpoint_path(tmp / "rec_a")),
+                           "--heads", "lane_gt,objects"])
+            assert "disagrees" in msg, msg
+            assert not onnx_out.exists(), "a refused export wrote a file"
+            note = "(torch not installed: full export not run)"
+            if ts.torch_ready():
+                try:
+                    import onnx
+                except ImportError:
+                    onnx = None
+                net = ts.build_export_net(("wide", "main", "narrow"), {"backbone": "", "scale": 1.0})
+                payload = ts.stamp_pause(
+                    {"weights": {k: v.detach().cpu().numpy() for k, v in net.state_dict().items()}, "run": run},
+                    tuple(getattr(net, "cams", ()) or ()) or None,
+                    getattr(net, "pause_arch", None),
+                )
+                save_checkpoint(tmp / "rec_t", payload)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    ts.main(["--export", str(onnx_out), "--checkpoint", str(checkpoint_path(tmp / "rec_t"))])
+                assert onnx_out.is_file()
+                if onnx is not None:
+                    meta = {p.key: p.value for p in onnx.load(str(onnx_out)).metadata_props}
+                    assert meta["gvd_heads"] == "lane_gt", meta
+                    assert meta["gvd_cams"] == "wide,main,narrow", meta
+                    note = "torch export from the checkpoint stamped gvd_heads=lane_gt, gvd_cams=wide,main,narrow"
+    finally:
+        data_root.free_bytes = real_free
+    print(f"(q) export-only takes gvd_heads from the checkpoint's run record; no checkpoint, no record, no heads "
+          f"or a disagreeing --heads/--cams refused, nothing written; {note} OK")
+
+
 def main() -> None:
     check_multi_recording()
     check_road_area_holdout()
@@ -1033,6 +1131,7 @@ def main() -> None:
     check_val_composition()
     check_leakage_note()
     check_labels_on_training_rows()
+    check_export_only_heads()
     check_camera_contract()
     check_cache_on_c()
     check_other_cams()

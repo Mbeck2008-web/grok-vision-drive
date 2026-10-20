@@ -110,6 +110,11 @@ class EgoFeedback:
     player_steering: float | None = None
     player_throttle: float | None = None
     player_brake: float | None = None
+    # Lua's own counter, one per electrics echo it wrote. None is a mod older than the echo
+    # contract (python/control/echo_link.py): that mod cannot tell a repeat from a new sample.
+    echo_seq: int | None = None
+    # gvd_main M.MOD_VERSION ("1.7.13"). None: a mod older than the field.
+    mod_version: str | None = None
 
     @property
     def fresh(self) -> bool:
@@ -124,6 +129,17 @@ def _num(v: Any) -> float | None:
     if f != f or f in (float("inf"), float("-inf")):
         return None
     return f
+
+
+def _echo_seq(v: Any) -> int | None:
+    """Lua's echo counter, or None when the field is missing or not a whole number."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float) and v == v and v.is_integer():
+        return int(v)
+    return None
 
 
 def read_ego_feedback(now: float | None = None) -> EgoFeedback | None:
@@ -175,6 +191,8 @@ def read_ego_feedback(now: float | None = None) -> EgoFeedback | None:
         player_steering=_num(data.get("player_steering")),
         player_throttle=_num(data.get("player_throttle")),
         player_brake=_num(data.get("player_brake")),
+        echo_seq=_echo_seq(data.get("echo_seq")),
+        mod_version=data.get("mod_version") if isinstance(data.get("mod_version"), str) else None,
     )
 
 

@@ -2,7 +2,7 @@
 
 Grok Vision Drive is a camera-only drive-assist toy for BeamNG.drive and BeamNG.tech. It reads camera pictures, finds the lane, plans a short path, and is built to steer the car in the game (unproven). It is for entertainment. It is not a controller for a real car, it is not a driver aid, and it is not Tesla FSD. The license is MIT.
 
-This is an **alpha** (`VERSION` 1.7.12). It may break.
+This is an **alpha** (`VERSION` 1.7.13). It may break.
 
 ## What is proven
 
@@ -138,7 +138,7 @@ Key `0` hides every layer and shows the clean stage only.
 
 #### AUTO tab: Automatic Mode
 
-Automatic Mode records while BeamNG's own AI drives. The AI steers, not GVD. Every saved tick is labelled `driver=beamng_ai`. The tab and the command line start the same collector, `scripts/collect_scene_lanes.py`. The live runs so far (rec2, rec3) were started from the command line, not from this tab, so the tab itself is Offline smoke only. The collector it starts is Proven live: recording only (see the CLI table).
+Automatic Mode records while BeamNG's own AI drives. BeamNG's AI steers. Every saved tick is labelled `driver=beamng_ai`. The tab and the command line start the same collector, `scripts/collect_scene_lanes.py`. The live runs so far (rec2, rec3) were started from the command line, not from this tab, so the tab itself is Offline smoke only. The collector it starts is Proven live: recording only (see the CLI table).
 
 | Control | Click does | Default | Status |
 | --- | --- | --- | --- |
@@ -305,7 +305,7 @@ The settled game view. Soft Esc parked.
 
 ## Version
 
-Canonical pin **1.7.12** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Untagged retail zips use `1.7.12-alpha-<sha>`. Point bumps (`1.7.x`) are fixes and small UI. A main alpha bump (`1.x.0`) is features, core, or a UI overhaul. The change history is the git log.
+Canonical pin **1.7.13** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Untagged retail zips use `1.7.13-alpha-<sha>`. Point bumps (`1.7.x`) are fixes and small UI. A main alpha bump (`1.x.0`) is features, core, or a UI overhaul. The change history is the git log.
 
 ## Technical details
 

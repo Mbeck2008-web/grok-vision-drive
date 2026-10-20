@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline pin for GVD alpha 1.7.12 (no BeamNG). Canonical spots must stay in lockstep."""
+"""Offline pin for GVD alpha 1.7.13 (no BeamNG). Canonical spots must stay in lockstep."""
 from __future__ import annotations
 
 import json
@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import make_release_zip as rel  # noqa: E402
 import python as gvd  # noqa: E402
 
-PIN = "1.7.12"
+PIN = "1.7.13"
 CHANNEL = "alpha"
 
 
@@ -38,6 +38,16 @@ def main() -> None:
     )
     assert app["version"] == PIN, app["version"]
     assert strip["version"] == PIN, strip["version"]
+
+    # The mod stamps its version on gvd_ego.json; the supervisor refuses below its minimum.
+    import re
+
+    from python.control.echo_link import MIN_MOD_VERSION, parse_version
+
+    main_lua = (ROOT / "beamng_mod" / "lua" / "ge" / "extensions" / "gvd" / "main.lua").read_text(encoding="utf-8")
+    m = re.search(r"M\.MOD_VERSION\s*=\s*'([^']+)'", main_lua)
+    assert m and m.group(1) == PIN, m and m.group(1)
+    assert parse_version(MIN_MOD_VERSION) <= parse_version(PIN), (MIN_MOD_VERSION, PIN)
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     # The alpha warning and the pin open the README, ahead of the quick start.

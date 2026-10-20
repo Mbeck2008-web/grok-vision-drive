@@ -10,16 +10,27 @@ after ``CMD_STALE_S`` without a new seq and releases + disengages after
 A child process runs that loop with the real writers (``write_state``,
 ``CmdJsonActuator.apply``) and then blocks forever in ``stream_raw`` on its
 main thread. ``scripts/gvd_lua_sim.lua`` runs the real ``main.lua`` on the
-same folder in wall time. The mod's own constants are the bounds, plus two
-of its 20 Hz polls.
+same folder. The harness owns a sim clock: the mod gets ``onUpdate`` at a
+fixed frame dt (60, 20, 300, 2400 fps) or a random dt in 2..60 ms (seeds 101..120), the child ticks every ``TICK_S`` of sim
+time in lockstep, and every time below is sim time. A child write lands on a
+frame boundary right after that frame's ``onUpdate``, so the mod sees it one
+frame later (the worst phase).
 
-Tech (``BeamNGPyActuator``, ``vehicle.control``) does not go through this
-file and is not covered here.
+Limits are declared up front from main.lua's own constants:
+fixed rate: [thr, thr + CMD_POLL_S + dt); random dt: [thr, thr + 2 * (CMD_POLL_S + dt_max))
+(see ``limits``), thr = CMD_STALE_S for the hold and CMD_DEAD_S for the disengage. Random-dt
+runs are also checked against an independent model of the poll design (``model_hold_dis``).
+
+Tech (``BeamNGPyActuator``) is in ``test_tech_supervisor_deadman.py`` on the
+same harness.
 """
 from __future__ import annotations
 
 import json
+import math
 import os
+import queue
+import random
 import re
 import shutil
 import subprocess
@@ -27,6 +38,7 @@ import sys
 import tempfile
 import threading
 import time
+from fractions import Fraction
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,8 +49,12 @@ from gvd_test_env import isolated_env  # noqa: E402
 
 MAIN_LUA = ROOT / "beamng_mod" / "lua" / "ge" / "extensions" / "gvd" / "main.lua"
 SIM_LUA = ROOT / "scripts" / "gvd_lua_sim.lua"
-FREEZE_AT = 40  # ticks of live driving before the read that never returns
-TICK_S = 0.05
+FREEZE_AT = 40  # supervisor ticks of live driving before the freeze
+TICK_S = 0.05  # supervisor tick, sim time
+# Frame rates: a fixed fps, or ("rand", seed) = dt uniform in RAND_DT_S from that seed.
+RAND_DT_S = (0.002, 0.060)
+RAND_SEEDS = tuple(range(101, 121))  # declared before the first run; every seed must pass
+FPS = (60, 20, 300, 2400) + tuple(("rand", seed) for seed in RAND_SEEDS)
 STEER, THROTTLE = 0.1, 0.3
 
 
@@ -48,40 +64,75 @@ def _lua_const(name: str) -> float:
     return float(m.group(1))
 
 
-def _supervisor() -> int:
-    """Child: the grab -> state -> command loop, then a read that never returns."""
-    from python.control.actuate import CmdJsonActuator, DriveCommand
+def limits(rate, dt_max: float) -> dict[str, float]:
+    """Declared before any run: [lower, upper) from main.lua's constants and the largest frame dt sent.
+
+    Fixed rate (dt_max = that rate's dt): every poll spans exactly CMD_POLL_S, so the only slack
+    is up to one poll before the mod sees that writes stopped, plus one frame:
+    thr + CMD_POLL_S + dt.
+    Random dt: a poll fires on the first frame that brings the accumulated time to CMD_POLL_S,
+    so one poll spans up to CMD_POLL_S + dt_max. The slack is up to one poll span before the
+    mod sees the writes stopped (its counter starts at that poll), plus up to one poll span of
+    overshoot past the threshold (the compare runs only on polls): thr + 2 * (CMD_POLL_S + dt_max).
+    """
+    stale, dead, poll = _lua_const("CMD_STALE_S"), _lua_const("CMD_DEAD_S"), _lua_const("CMD_POLL_S")
+    slack = 2.0 * (poll + dt_max) if isinstance(rate, tuple) else poll + dt_max
+    return {"hold_lo": stale, "hold_hi": stale + slack, "dis_lo": dead, "dis_hi": dead + slack}
+
+
+def frame_dts(rate):
+    """Endless frame dts for a rate: 1/fps, or ("rand", seed) uniform in RAND_DT_S."""
+    if isinstance(rate, tuple):
+        rng = random.Random(rate[1])
+        while True:
+            yield rng.uniform(*RAND_DT_S)
+    dt = 1.0 / rate
+    while True:
+        yield dt
+
+
+def _wait_bus() -> bool:
     from python.runtime.paths import bus_identity
-    from python.runtime.state_io import write_state
 
-    class FrozenCam:
-        n = 0
-
-        def stream_raw(self):
-            FrozenCam.n += 1
-            if FrozenCam.n > FREEZE_AT:
-                threading.Event().wait()  # never returns; main thread
-            return {"colour": None}
-
-    deadline = time.monotonic() + 10.0
+    deadline = time.monotonic() + 20.0
     while not bus_identity().matched:
         if time.monotonic() > deadline:
             print("NO_BUS", flush=True)
-            return 3
-        time.sleep(0.02)
+            return False
+        time.sleep(0.01)
+    print("READY", flush=True)
+    return True
+
+
+def _supervisor() -> int:
+    """Child: one grab -> state -> command tick per stdin line; ``freeze`` = a read that never returns."""
+    from python.control.actuate import CmdJsonActuator, DriveCommand
+    from python.runtime.state_io import write_state
+
+    class FrozenCam:
+        frozen = False
+
+        def stream_raw(self):
+            if FrozenCam.frozen:
+                threading.Event().wait()  # never returns; main thread
+            return {"colour": None}
+
+    if not _wait_bus():
+        return 3
     cam = FrozenCam()
     act = CmdJsonActuator()
     act.note_engaged(True)
     seq = 0
-    while True:
-        t0 = time.monotonic()
-        if FrozenCam.n == FREEZE_AT:
-            print(f"FREEZE {seq}", flush=True)
+    for line in sys.stdin:
+        if line.strip() == "freeze":
+            print(f"FREEZE {seq} threads={threading.active_count()}", flush=True)
+            FrozenCam.frozen = True
         cam.stream_raw()
         seq += 1
         write_state({"engaged": True, "policy": "modular", "cmd_seq": seq, "disengage_reason": "none"})
         act.apply(DriveCommand(steer=STEER, throttle=THROTTLE, brake=0.0, seq=seq, reason="ok"))
-        time.sleep(max(0.0, TICK_S - (time.monotonic() - t0)))
+        print(f"TICK {seq}", flush=True)
+    return 0
 
 
 class _Sim:
@@ -126,89 +177,201 @@ class _Sim:
             self.p.kill()
 
 
-def check_frozen_read_brakes_then_disengages() -> None:
-    stale_s = _lua_const("CMD_STALE_S")
-    dead_s = _lua_const("CMD_DEAD_S")
-    poll_s = _lua_const("CMD_POLL_S")
-    lua = shutil.which("lua5.1") or shutil.which("lua")
-    assert lua, "lua5.1 is not on PATH (the mod harness needs it; not a skip)"
-    root = Path(tempfile.mkdtemp(prefix="gvd-deadman-"))
-    sup = sim = None
-    try:
-        env = isolated_env(os.environ, root)
+class Lockstep:
+    """Real main.lua at a fixed frame dt + a supervisor child ticking in the same sim time."""
+
+    def __init__(self, script: Path, rate) -> None:
+        self.dts = frame_dts(rate)
+        self.warm_dt = 0.05  # one mod poll per warm-up frame: every run starts at the same poll phase
+        lua = shutil.which("lua5.1") or shutil.which("lua")
+        assert lua, "lua5.1 is not on PATH (the mod harness needs it; not a skip)"
+        self.root = Path(tempfile.mkdtemp(prefix="gvd-deadman-"))
+        self.sim = self.sup = None
+        env = isolated_env(os.environ, self.root)
         env["GVD_PRODUCT"] = "drive"
         user = Path(env["LOCALAPPDATA"]) / "BeamNG" / "BeamNG.drive" / "current"
-        bus = user / "Documents" / "GVD"
-        bus.mkdir(parents=True, exist_ok=True)
-        sim = _Sim(lua, {**env, "GVD_SIM_USER": str(user)})
-        _, engaged = sim.send("engage")
+        self.bus = user / "Documents" / "GVD"
+        self.bus.mkdir(parents=True, exist_ok=True)
+        self.sim = _Sim(lua, {**env, "GVD_SIM_USER": str(user)})
+        _, engaged = self.sim.send("engage")
         assert engaged, "Alt+G in the sim did not engage"
-        sim.send("step 0.02")  # gvd_link.json carries lua_bus before the supervisor starts
-        sup = subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), "--supervisor"],
+        self.sup = subprocess.Popen(
+            [sys.executable, str(script), "--supervisor"],
             cwd=str(ROOT),
             env=env,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             text=True,
+            bufsize=1,
         )
-        out: list[str] = []
-        threading.Thread(target=lambda: out.extend(sup.stdout), daemon=True).start()
-
-        drove = False
-        frozen_seq: int | None = None
-        t_hold = t_dis = None
-        throttle_while_held = []
-        last = time.time()
-        end = last + 20.0
-        while time.time() < end:
-            time.sleep(1.0 / 60.0)
-            now = time.time()
-            events, engaged = sim.send(f"step {now - last:.5f}")
-            last = now
-            stamp = time.time()
-            if frozen_seq is None:
-                for line in list(out):
-                    if line.startswith("FREEZE"):
-                        frozen_seq = int(line.split()[1])
-                    assert not line.startswith("NO_BUS"), "supervisor never saw a live lua_bus"
-            got = dict(events)
-            if frozen_seq is None:
-                if abs(got.get("throttle", -1.0) - THROTTLE) < 1e-3 and abs(got.get("steering", -9.0) - STEER) < 1e-3:
-                    drove = True
-                continue
-            if t_hold is None and got.get("throttle") == 0.0 and got.get("steering") == 0.0 and got.get("parkingbrake") == 1.0:
-                t_hold = stamp
-            elif t_hold is not None and t_dis is None and got.get("throttle", 0.0) > 0.0:
-                throttle_while_held.append(got["throttle"])
-            if not engaged and t_dis is None:
-                t_dis = stamp
+        self.lines: queue.Queue[str] = queue.Queue()
+        self.out: list[str] = []
+        threading.Thread(target=self._pump, daemon=True).start()
+        # Warm-up (not timed): frames until the child sees the mod's lua_bus.
+        deadline = time.monotonic() + 20.0
+        while True:
+            self.sim.send(f"step {self.warm_dt!r}")
+            if any(x.startswith(("READY", "NO_BUS", "Traceback")) for x in self.out):
+                self._reply("READY")
                 break
+            assert time.monotonic() < deadline, f"supervisor never got READY: {self.out}"
+            time.sleep(0.005)
+
+    def _pump(self) -> None:
+        for line in self.sup.stdout:
+            self.out.append(line.rstrip())
+            self.lines.put(line.rstrip())
+
+    def _reply(self, want: str) -> str:
+        while True:  # the writers' own log lines ride on the same stdout
+            line = self.lines.get(timeout=20.0)
+            if line.split(" ", 1)[0] in ("READY", "TICK", "FREEZE", "NO_BUS") or line.startswith("Traceback"):
+                break
+        assert line.startswith(want), (want, line, self.out[-20:])
+        return line
+
+    def run(self, plan: list[str], tail_s: float) -> dict:
+        """Send ``plan`` one command per supervisor tick; after ``freeze``, run ``tail_s`` more sim time.
+
+        Returns per-frame (sim_t, events, engaged) and the sim time of the last child write.
+        A write at sim time t (between frames) is seen by the onUpdate that ends at t + dt.
+        """
+        frames: list[tuple[float, list[tuple[str, float]], bool]] = []
+        res: dict = {"frames": frames, "t_last": None, "t_freeze": None, "marks": {}, "freeze_line": None, "dt_max": 0.0,
+                     "dts": []}
+        cmds = iter(plan)
+        t = Fraction(0)  # exact sum of the float dts handed to the mod
+        next_tick = Fraction(0)
+        t_end = None
+        while t_end is None or t < t_end:
+            if t >= next_tick - Fraction(1, 10**9):
+                next_tick += Fraction(TICK_S)
+                c = next(cmds, None)
+                if c is not None:
+                    self.sup.stdin.write(c + "\n")
+                    self.sup.stdin.flush()
+                    if c == "freeze":
+                        res["freeze_line"] = self._reply("FREEZE")
+                        res["t_freeze"] = float(t)
+                        t_end = t + Fraction(tail_s)
+                    else:
+                        self._reply("TICK")
+                        res["t_last"] = float(t)
+                        res["k_last"] = len(res["dts"])
+                        res["marks"].setdefault(c, float(t))
+            dt = next(self.dts)
+            res["dt_max"] = max(res["dt_max"], dt)
+            res["dts"].append(dt)
+            events, engaged = self.sim.send(f"step {dt!r}")
+            t += Fraction(dt)
+            frames.append((float(t), events, engaged))
+        assert self.sup.poll() is None, "supervisor exited; it should be stuck"
+        return res
+
+    def close(self) -> None:
+        if self.sup is not None:
+            self.sup.kill()
+            self.sup.wait()
+        if self.sim is not None:
+            self.sim.close()
+        shutil.rmtree(self.root, ignore_errors=True)
+
+
+def hold_and_disengage(res: dict) -> tuple[float | None, float | None, list, list]:
+    """Sim time of the first brake hold and the disengage after the freeze, plus what came between."""
+    t_hold = t_dis = None
+    before_hold: list = []
+    throttle_while_held: list = []
+    for t, events, engaged in res["frames"]:
+        if t <= res["t_freeze"]:
+            continue
+        got = dict(events)
+        if t_hold is None and got.get("throttle") == 0.0 and got.get("steering") == 0.0 and got.get("parkingbrake") == 1.0:
+            t_hold = t
+        elif t_hold is None and got:
+            before_hold.append((t, events))
+        elif t_hold is not None and t_dis is None and got.get("throttle", 0.0) > 0.0:
+            throttle_while_held.append(got["throttle"])
+        if not engaged and t_dis is None:
+            t_dis = t
+            break
+    return t_hold, t_dis, before_hold, throttle_while_held
+
+
+def model_hold_dis(dts: list[float], k_last: int) -> tuple[float, float]:
+    """Independent model of the DESIGN (not a copy of main.lua): regression detector, not proof.
+
+    The mod polls whenever its accumulated frame time reaches CMD_POLL_S (the run starts on a
+    poll boundary: warm-up frames are each one poll). A write lands on the boundary before frame
+    ``k_last``, so the first poll at or after that frame's end sees it and starts the clock. Each
+    later poll compares the sim time elapsed since that poll, in whole microseconds, against
+    CMD_STALE_S then CMD_DEAD_S. Times are exact rationals of the dts sent. Returns (hold, dead)
+    in seconds after the write.
+    """
+    stale, dead, poll = (Fraction(_lua_const(n)) for n in ("CMD_STALE_S", "CMD_DEAD_S", "CMD_POLL_S"))
+    t = Fraction(0)
+    since_poll = Fraction(0)
+    t_write = sum((Fraction(d) for d in dts[:k_last]), Fraction(0))
+    seen = hold = None
+    for k, d in enumerate(dts):
+        t += Fraction(d)
+        since_poll += Fraction(d)
+        if since_poll < poll:
+            continue
+        since_poll = Fraction(0)
+        if k < k_last:
+            continue
+        if seen is None:
+            seen = t
+            continue
+        elapsed_us = math.floor((t - seen) * 10**6 + Fraction(1, 2))
+        if hold is None and elapsed_us >= stale * 10**6:
+            hold = t
+        if elapsed_us >= dead * 10**6:
+            return float(hold - t_write), float(t - t_write)
+    raise AssertionError("model: no disengage within the dts sent")
+
+
+def check_model(name: str, rate, res: dict, hold_s: float, dis_s: float) -> None:
+    if not isinstance(rate, tuple):
+        return  # exact-boundary fixed rates depend on float rounding of the poll gate; not modelled
+    m_hold, m_dis = model_hold_dis(res["dts"], res["k_last"])
+    print(f"{name} {rate}: model hold {m_hold:.6f} dis {m_dis:.6f}; measured {hold_s:.6f} {dis_s:.6f}", flush=True)
+    assert abs(m_hold - hold_s) <= 1e-6 and abs(m_dis - dis_s) <= 1e-6, (rate, m_hold, hold_s, m_dis, dis_s)
+
+
+def check_bounds(name: str, fps, hold_s: float, dis_s: float, dt_max: float) -> None:
+    lim = limits(fps, dt_max)
+    print(
+        f"{name} {fps} fps (dt_max {dt_max * 1000:.3f} ms): brake hold {hold_s:.4f} s in [{lim['hold_lo']:.4f}, {lim['hold_hi']:.4f}), "
+        f"disengage {dis_s:.4f} s in [{lim['dis_lo']:.4f}, {lim['dis_hi']:.4f}) (sim time after the last write)",
+        flush=True,
+    )
+    assert lim["hold_lo"] <= hold_s < lim["hold_hi"], (fps, "hold", hold_s, lim)
+    assert lim["dis_lo"] <= dis_s < lim["dis_hi"], (fps, "disengage", dis_s, lim)
+
+
+def check_frozen_read_brakes_then_disengages(fps) -> None:
+    ls = Lockstep(Path(__file__).resolve(), fps)
+    try:
+        res = ls.run(["tick"] * FREEZE_AT + ["freeze"], tail_s=2.0)
+        drove = any(
+            abs(dict(ev).get("throttle", -1.0) - THROTTLE) < 1e-3 and abs(dict(ev).get("steering", -9.0) - STEER) < 1e-3
+            for t, ev, _ in res["frames"] if t <= res["t_freeze"]
+        )
         assert drove, "the mod never applied the live command before the freeze"
-        assert frozen_seq is not None, out
-        assert sup.poll() is None, "supervisor exited; it should be stuck in the read"
-        cmd = json.loads((bus / "gvd_cmd.json").read_text(encoding="utf-8"))
-        assert cmd["seq"] == frozen_seq and cmd["engaged"] is True, cmd
-        t_last = float(cmd["heartbeat_mtime"])  # the last command before the read froze
+        cmd = json.loads((ls.bus / "gvd_cmd.json").read_text(encoding="utf-8"))
+        assert cmd["seq"] == FREEZE_AT and cmd["engaged"] is True, cmd
+        t_hold, t_dis, _, throttle_while_held = hold_and_disengage(res)
         assert t_hold is not None, "no brake hold after the supervisor froze"
         assert t_dis is not None, "no disengage after the supervisor froze"
-        hold_s = t_hold - t_last
-        dis_s = t_dis - t_last
-        print(
-            f"test_frozen_supervisor_deadman: brake hold {hold_s:.3f} s (CMD_STALE_S {stale_s:g}), "
-            f"disengage {dis_s:.3f} s (CMD_DEAD_S {dead_s:g}) after the last command"
-        )
-        assert stale_s - poll_s <= hold_s <= stale_s + 2 * poll_s, hold_s
-        assert dead_s - poll_s <= dis_s <= dead_s + 2 * poll_s, dis_s
         assert throttle_while_held == [], throttle_while_held
-        engage = json.loads((bus / "gvd_engage.json").read_text(encoding="utf-8"))
+        engage = json.loads((ls.bus / "gvd_engage.json").read_text(encoding="utf-8"))
         assert engage["engaged"] is False and engage["disengage_reason"] == "command_stream_dead", engage
+        check_bounds("test_frozen_supervisor_deadman", fps, t_hold - res["t_last"], t_dis - res["t_last"], res["dt_max"])
+        check_model("test_frozen_supervisor_deadman", fps, res, t_hold - res["t_last"], t_dis - res["t_last"])
     finally:
-        if sup is not None:
-            sup.kill()
-            sup.wait()
-        if sim is not None:
-            sim.close()
-        shutil.rmtree(root, ignore_errors=True)
+        ls.close()
 
 
 def check_supervisor_writes_cmd_on_grab_thread() -> None:
@@ -227,7 +390,8 @@ def main() -> None:
     if "--supervisor" in sys.argv:
         sys.exit(_supervisor())
     check_supervisor_writes_cmd_on_grab_thread()
-    check_frozen_read_brakes_then_disengages()
+    for fps in FPS:
+        check_frozen_read_brakes_then_disengages(fps)
     print("test_frozen_supervisor_deadman: OK")
 
 

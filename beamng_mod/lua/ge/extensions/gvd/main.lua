@@ -51,7 +51,7 @@ local applying = false       -- true while our secondary Direct Drive wheel+peda
 local holdLogged = false     -- one-shot log when we first claim the Direct Drive source
 local applyVeh = nil         -- vehicle object we last applied to (released on switch/disengage)
 local lastAppliedSeq = -1
-local cmdStaleAcc = 0
+local cmdStaleAcc = 0        -- seconds of frame dt since the last new seq (rounded to whole us at the compare)
 local cmdStaleLogged = false
 local arcadeQueued = false
 local egoAcc = 0
@@ -1581,9 +1581,11 @@ local function applyCmdJson(dt)
   else
     cmdStaleAcc = cmdStaleAcc + step
   end
+  -- Compare in whole microseconds: a float sum of exact 0.05 s polls lands just under 0.35.
+  local staleUs = math.floor(cmdStaleAcc * 1e6 + 0.5)
   -- A file left over from an old session has heartbeat_mtime far behind the wall clock.
   local ancient = hb ~= nil and (os.time() - hb) > CMD_DEAD_S
-  if cmdStaleAcc > CMD_DEAD_S or ancient then
+  if staleUs >= CMD_DEAD_S * 1e6 or ancient then
     if applying then
       -- Dead-man: the stream died while we held the car. Release it and disengage; Alt+G re-arms.
       releaseInputs('command stream dead')
@@ -1601,7 +1603,7 @@ local function applyCmdJson(dt)
     releaseInputs('supervisor not driving')
     return
   end
-  if cmd.heartbeat_only == true and cmdStaleAcc <= CMD_STALE_S then
+  if cmd.heartbeat_only == true and staleUs < CMD_STALE_S * 1e6 then
     -- Tech: BeamNGpy drives with vehicle.control; this file is its heartbeat only. Fresh: hands
     -- off (drop a stale hold). Stale and dead below act exactly as on retail.
     releaseInputs('tech heartbeat fresh')
@@ -1624,7 +1626,7 @@ local function applyCmdJson(dt)
       return
     end
   end
-  if cmdStaleAcc > CMD_STALE_S then
+  if staleUs >= CMD_STALE_S * 1e6 then
     -- Stream hiccup: straighten + brake, no throttle, until fresh commands resume.
     applying = true
     applyInputs(veh, 0, 0, 1)

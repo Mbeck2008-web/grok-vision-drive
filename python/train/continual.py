@@ -873,14 +873,18 @@ def holdout_stopped(
     *,
     tol: float = 0.0,
     window: int = 0,
+    min_points: int = 3,
 ) -> bool:
     """True once the latest holdout score is not strictly better than the best so far.
 
-    Lower is better. The first measurement cannot stop the run. There is no
-    epoch cap here. ``tol`` and ``window`` stop a plateau: the last ``window``
-    scores stay inside ``tol`` (metres, when the score is the lane-center rms).
+    Lower is better. Nothing stops the run before ``min_points`` (at least 2,
+    default 3) holdout scores exist: a two-point history whose first epoch was a
+    collapsed constant prediction used to stop the run after epoch 1. There is
+    no epoch cap here. ``tol`` and ``window`` stop a plateau: the last
+    ``window`` scores stay inside ``tol`` (metres, when the score is the
+    lane-center rms).
     """
-    if len(losses) < 2:
+    if len(losses) < max(2, int(min_points)):
         return False
     if float(tol) > 0.0 and int(window) >= 2 and len(losses) >= int(window):
         recent = [float(value) for value in losses[-int(window) :]]

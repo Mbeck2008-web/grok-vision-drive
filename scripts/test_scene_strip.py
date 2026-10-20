@@ -1586,9 +1586,10 @@ def check_continual_bptt_and_yaw() -> None:
     assert pick_learning_rate({1e-3: 0.4, 1e-4: 0.2}) == 1e-4
     assert pick_learning_rate({1e-3: 0.2, 1e-4: 0.4}) == 1e-3
     assert pick_learning_rate({1e-3: 0.2, 1e-4: 0.2}) == CANDIDATE_LRS[0]
-    # The live val pair (rms 1.139 then 1.142) is a holdout stop. The pause
-    # rate from the following 1e-4 pass is not the next schedule.
-    assert holdout_stopped([1.139, 1.142], tol=0.02, window=3) is True
+    # Two val points are never a holdout stop (min_points=3), even the live
+    # pair rms 1.139 then 1.142. The pause rate from the following 1e-4 pass
+    # is not the next schedule.
+    assert holdout_stopped([1.139, 1.142], tol=0.02, window=3) is False
     assert resume_learning_rate(1e-3, paused=1e-4) == 1e-3
     assert resume_learning_rate(1e-3, paused=1e-3) == 1e-3
     assert resume_learning_rate(1e-4, paused=1e-3) == 1e-4

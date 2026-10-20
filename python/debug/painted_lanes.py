@@ -34,7 +34,14 @@ from typing import Any, Iterable
 import numpy as np
 
 LOOKAHEADS_M = (5.0, 10.0, 20.0, 30.0)
-LANE_MIN_M = 2.4
+# The collector's car (etk800), bbox width as vehicle_half_width logs it.
+EGO_WIDTH_M = 2.02
+# A pair of lines is a lane when the car fits between them: narrower than
+# the car's own width it is not a lane the car can be in (a gore wedge, a
+# double line wider than DOUBLE_LINE_M, a taper's last metres). The old
+# fixed 2.4 m had no source and dropped real narrow lanes (2.34 m at a lane
+# end on west_coast_usa).
+LANE_MIN_M = EGO_WIDTH_M
 LANE_MAX_M = 5.0
 DOUBLE_LINE_M = 0.6
 SEARCH_M = 12.0
@@ -256,12 +263,13 @@ class PaintedLanes:
 SWITCH_MARGIN_M = 0.505
 # A line of the previous pair matches a line seen this tick when it is this
 # close to where the previous tick's crossing predicts it (one tick is a few
-# metres of travel). A quarter of the narrowest lane: a neighbour line, a
-# lane width away, can never match.
+# metres of travel). Well under half the narrowest lane (LANE_MIN_M / 2):
+# a neighbour line, a lane width away, can never match.
 MATCH_M = 0.6
 # Each line is followed from one lookahead to the next within this of its
 # predicted position (its last crossing, slope and slope change). Under half
-# the narrowest lane, so the neighbour line cannot be taken.
+# the narrowest lane (LANE_MIN_M / 2 = 1.01 m), so the neighbour line cannot
+# be taken.
 FOLLOW_M = 1.0
 # A line of the kept pair that is not seen at y = 0 (a gap between dashes, a
 # decal piece ending) is carried from where it was last seen for at most this

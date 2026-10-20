@@ -410,7 +410,14 @@ def check_stuck_car_aborts_without_weaving() -> None:
     assert "collect segment end" in text and "stationary" in text
     assert "recover lost" in text
     assert "collect recover" in text
-    assert "weave" not in text
+    # No weave was started or logged. Checked on the log with the checkout and temp paths taken
+    # out, so a path that happens to contain "weave" (a branch-named checkout) cannot fail it.
+    text_no_paths = text
+    paths = {str(ROOT), str(ROOT.resolve()), str(root), str(root.resolve()), sys.executable, sys.prefix, sys.base_prefix,
+             tempfile.gettempdir()}
+    for path_text in sorted((p for p in paths if p), key=len, reverse=True):
+        text_no_paths = text_no_paths.replace(path_text, "<path>")
+    assert "weave" not in text_no_paths, [ln for ln in text_no_paths.splitlines() if "weave" in ln][:5]
     assert any("0.90" in line for line in bng.commands), bng.commands
     assert not any("250.00" in line for line in bng.commands)
     assert not (out / "state.jsonl").is_file()

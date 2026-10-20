@@ -368,6 +368,16 @@ def check_damage_and_up_are_read() -> None:
 
 
 # ------------------------------------------------------ collector, end to end
+class _ReadyReadback:
+    """A readback whose reply is there on the first poll (python.collect.ai_line LineTracker)."""
+
+    def __init__(self, reply: str) -> None:
+        self.reply = reply
+
+    def poll(self) -> tuple[bool, str, str]:
+        return True, self.reply, ""
+
+
 class _CrashVehicle:
     """10 m/s, a crash to 0.2 m/s, stopped, then driving again, then the stop file."""
 
@@ -385,6 +395,8 @@ class _CrashVehicle:
         self.commands: list[str] = []
         self.state: dict = {}
         self._set(10.0)
+        self.lines: list[list[dict]] = []
+        self.ai = self  # beamngpy ``vehicle.ai.set_line`` stand-in (set_line below)
 
     def get_bbox(self) -> dict:
         """Vehicle.get_bbox stand-in: an axis-aligned box ``bbox_w`` wide; None raises like a BNGError."""
@@ -416,9 +428,21 @@ class _CrashVehicle:
         if self.polls >= self.stop_at:
             self.stop.write_text("stop", encoding="utf-8")
 
+    def set_line(self, line: list[dict], cling: bool = True) -> None:
+        del cling
+        self.lines.append(list(line))
+
     def queue_lua_command(self, command: str, *args: object) -> None:
-        del args
+        assert not (args and args[0] is True), "the collector never waits for a Lua reply"
         self.commands.append(str(command))
+
+    def send_lua_readback(self, chunk: str) -> "_ReadyReadback":
+        """The collector's non-blocking line readback: the AI follows the last line it was sent."""
+        del chunk
+        if not self.lines:
+            return _ReadyReadback("span|none|true|none|noupv|false")
+        x, y = self.lines[-1][-1]["pos"][:2]
+        return _ReadyReadback(f"manual|{float(x):.2f},{float(y):.2f}|true|wp_2|upv|true")
 
     def connect(self, bng: object) -> None:
         del bng

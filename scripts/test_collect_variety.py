@@ -237,7 +237,9 @@ def check_paths_stay_on_the_road() -> None:
     lined = excursion_commands(10.0, "weave", 1, path=points)
     assert any('setMode("manual")' in line for line in lined)
     assert any('driveInLane("off")' in line for line in lined)
-    assert any(line.startswith("ai.setLine(") and line.endswith(", true)") for line in lined)
+    # The line itself goes out with beamngpy's vehicle.ai.set_line (ai_line.send_and_ack):
+    # 0.39.4.0's ai has no setLine, and nothing that resets the route follows the line.
+    assert all("setLine" not in line and "setSpeed" not in line for line in lined)
     abort = excursion_commands(10.0, "abort", 1)
     assert any('driveInLane("on")' in line for line in abort)
     assert all("setLine" not in line for line in abort)

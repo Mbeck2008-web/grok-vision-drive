@@ -701,16 +701,21 @@ def excursion_commands(
     traffic: bool = False,
     path: list[tuple[float, float]] | None = None,
 ) -> list[str]:
-    """AI lines for this phase. A path leaves lane-keeping; cruise puts it back."""
+    """Vehicle-VM Lua for this phase. A path leaves lane-keeping; cruise puts it back.
+
+    With a path these are only the lines sent *before* the line itself
+    (``ai_line.pre_line_commands``). The line goes out with beamngpy's
+    ``vehicle.ai.set_line`` (``ai_line.send_and_ack``) and nothing is sent
+    after it: 0.39.4.0's ``ai`` has no ``setLine``, and a later
+    ``setMode``/``setState`` would drop the route the line installs.
+    Cruise and abort put lane-follow back: ``setMode`` span or traffic
+    (rebuilds the route from the navgraph), ``driveInLane("on")``, speed.
+    """
     speed = float(speed_mps)
     if phase in ACTIVE and path:
-        return [
-            'ai.setMode("manual")',
-            'ai.driveInLane("off")',
-            'ai.setSpeedMode("limit")',
-            f"ai.setSpeed({speed})",
-            lua_set_line(path, speed),
-        ]
+        from python.collect.ai_line import pre_line_commands
+
+        return pre_line_commands()
     mode = "traffic" if traffic else "span"
     lines = [
         f'ai.setMode("{mode}")',
@@ -721,15 +726,6 @@ def excursion_commands(
     if phase == "abort":
         lines.append("ai.setAggression(0.2)")
     return lines
-
-
-def lua_set_line(points: list[tuple[float, float]], speed_mps: float) -> str:
-    """One ``ai.setLine`` call. ``cling`` keeps the line on the road surface."""
-    speed = float(speed_mps)
-    body = ",".join(
-        f"{{pos={{{x:.2f},{y:.2f},0}},speed={speed:.2f}}}" for x, y in points
-    )
-    return f"ai.setLine({{{body}}}, true)"
 
 
 def near_junction(
@@ -1262,7 +1258,7 @@ def excursion_path(
     half_width_m: float | None = None,
     info: dict | None = None,
 ) -> tuple[list[tuple[float, float]] | None, int]:
-    """World points for ``ai.setLine``, and the direction that stays on the road.
+    """World points for the AI line (``vehicle.ai.set_line``), and the direction that stays on the road.
 
     The second value flips when the requested lane change would leave the
     pavement and the other side would not. ``(None, direction)`` means do

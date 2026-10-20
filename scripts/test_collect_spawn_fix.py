@@ -385,6 +385,8 @@ class _CrashVehicle:
         self.commands: list[str] = []
         self.state: dict = {}
         self._set(10.0)
+        self.lines: list[list[dict]] = []
+        self.ai = self  # beamngpy ``vehicle.ai.set_line`` stand-in (set_line below)
 
     def get_bbox(self) -> dict:
         """Vehicle.get_bbox stand-in: an axis-aligned box ``bbox_w`` wide; None raises like a BNGError."""
@@ -416,9 +418,19 @@ class _CrashVehicle:
         if self.polls >= self.stop_at:
             self.stop.write_text("stop", encoding="utf-8")
 
-    def queue_lua_command(self, command: str, *args: object) -> None:
-        del args
+    def set_line(self, line: list[dict], cling: bool = True) -> None:
+        del cling
+        self.lines.append(list(line))
+
+    def queue_lua_command(self, command: str, *args: object) -> str | None:
+        if args and args[0] is True:
+            # The collector's line readback: the AI follows the last line it was sent.
+            if not self.lines:
+                return "span|none|true"
+            x, y = self.lines[-1][-1]["pos"][:2]
+            return f"manual|{float(x):.2f},{float(y):.2f}|true"
         self.commands.append(str(command))
+        return None
 
     def connect(self, bng: object) -> None:
         del bng

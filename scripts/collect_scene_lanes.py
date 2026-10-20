@@ -36,7 +36,15 @@ is a smoke collect: if those PNGs do not decode, the process stops.
 West-coast spawns skip roads whose next 300 m has painted lanes on less than
 ``--min-paint-cov`` of the probes (default 0.5, 0 disables). ``--weave-guard``
 keeps weaves off unpainted stretches and junctions, and ends an excursion when
-its 60 m ``ai.setLine`` runs out.
+its 60 m AI line runs out.
+
+An excursion line goes out with beamngpy's ``vehicle.ai.set_line``
+(``python.collect.ai_line``) and is acked by reading the AI state back: the
+mode must be ``manual`` and the line's last node must be in the AI's map
+within LINE_ACK_TIMEOUT_S, else the move is aborted ``line_not_active``. While
+it runs it is read back every LINE_RECHECK_S; a route that is gone aborts it
+``line_lost``. Collectors before this sent ``ai.setLine``, which 0.39.4.0's
+``ai`` does not have (``scripts/excursion_validity.py`` marks those tags).
 
 Row fields in ``state.jsonl`` written by this collector, besides the frame data:
 
@@ -50,6 +58,9 @@ Row fields in ``state.jsonl`` written by this collector, besides the frame data:
 * ``spawn_type``, ``spawn_paint_cov``: the west-coast spawn kind and its
   measured paint coverage ahead (null when not measured).
 * ``ego.up``: the State sensor's up vector. ``ego.damage``: Damage sensor total.
+* ``excursion.line_ack``: on weave / lane_change / recover rows, the readback
+  ack of the line that move sent (``ok``, ``mode``, ``wait_s``, ``polls``).
+  Its absence on active rows marks a recording from before the ack.
 
 ``impacts.jsonl`` beside ``state.jsonl`` has one ``{"kind": "impact", "t",
 "i", "pre_t0", "pre_i0", ...}`` line per impact and one ``{"kind":
@@ -1641,6 +1652,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             ramp_heading_reached,
             targets_for,
         )
+        from python.collect.ai_line import LINE_LOST, LINE_RECHECK_S, recheck_line, send_and_ack
 
         clock = ExcursionClock()
         from python.collect.liveness import (
@@ -1660,6 +1672,10 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         yield_guard = YieldGuard(float(getattr(args, "min_live_yield", 0.0) or 0.0))
         last_row_i: int | None = None
         line_left_m: float | None = None
+        # The line the AI is following (acked), its row tag, and the last readback time.
+        line_points: list[tuple[float, float]] | None = None
+        line_ack_tag: dict[str, Any] | None = None
+        line_check_t = 0.0
         spawn_cov: float | None = None
         spawn_road: str | None = None
         damage_seen = False
@@ -2528,6 +2544,20 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     plan_overspeed_noted = True
             if lane_change_run is not None and clock.phase == "lane_change":
                 lane_change_run["covered_m"] += max(0.0, float(speed_mps_f or 0.0)) * tick_dt
+            if line_points is not None:
+                if clock.phase not in ACTIVE:
+                    line_points, line_ack_tag = None, None
+                elif time.monotonic() - line_check_t >= LINE_RECHECK_S:
+                    line_check_t = time.monotonic()
+                    again = recheck_line(vehicle, line_points)
+                    if not again.ok:
+                        # The route the line installed is gone: back to the lane, tagged.
+                        print(f"collect excursion {segment_id} {clock.phase} abort {LINE_LOST} {again.detail}", flush=True)
+                        weave_stats.abort(clock.phase, LINE_LOST, plan_v)
+                        clock.force_abort(LINE_LOST)
+                        line_left_m = None
+                        plan_v, plan_phase = None, ""
+                        line_points, line_ack_tag = None, None
             if line_left_m is not None:
                 if clock.phase not in ACTIVE:
                     line_left_m = None
@@ -2742,17 +2772,38 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             if not driving and not waypoint and last_ai is not None:
                 send_ai = False
             if send_ai:
-                commands = (
-                    excursion_commands(
-                        speed,
-                        resolved.phase,
-                        resolved.direction,
-                        traffic=False,
-                        path=path,
+                if excursions_on and not waypoint and resolved.phase in ACTIVE and path:
+                    # beamngpy set_line, then the readback ack. Nothing is sent after the line.
+                    ack = send_and_ack(vehicle, path, speed, queue=_queue)
+                    if ack.ok:
+                        commands = []
+                        line_points, line_ack_tag = list(path), ack.as_tag()
+                        line_check_t = time.monotonic()
+                    else:
+                        print(f"collect excursion {segment_id} {resolved.phase} abort {ack.reason} "
+                              f"{ack.detail} polls={ack.polls} wait={ack.wait_s:.2f}s", flush=True)
+                        weave_stats.abort(resolved.phase, ack.reason, plan_v)
+                        resolved = clock.force_abort(ack.reason)
+                        path = None
+                        plan_v, plan_phase = None, ""
+                        lane_change_run = None
+                        line_points, line_ack_tag = None, None
+                        ai_key = (round(speed, 3), waypoint, resolved.phase, resolved.direction, map_name)
+                        commands = excursion_commands(speed, resolved.phase, resolved.direction, traffic=False)
+                else:
+                    # No line goes out with these: no line to recheck, and no ack on the rows.
+                    line_points, line_ack_tag = None, None
+                    commands = (
+                        excursion_commands(
+                            speed,
+                            resolved.phase,
+                            resolved.direction,
+                            traffic=False,
+                            path=path,
+                        )
+                        if excursions_on and not waypoint
+                        else ai_commands(speed, waypoint, traffic=False)
                     )
-                    if excursions_on and not waypoint
-                    else ai_commands(speed, waypoint, traffic=False)
-                )
                 for command in commands:
                     try:
                         _queue(vehicle, command)
@@ -2848,6 +2899,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 "map": map_name or None,
                 "excursion": move.as_tag(),
             }
+            if line_ack_tag is not None and move.phase in ACTIVE:
+                tags["excursion"]["line_ack"] = dict(line_ack_tag)
             if spawn_kind:
                 tags["spawn_type"] = spawn_kind
                 tags["spawn_paint_cov"] = None if spawn_cov is None else round(float(spawn_cov), 3)

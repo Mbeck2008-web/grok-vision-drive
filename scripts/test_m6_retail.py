@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import json
 import os
 import re
@@ -205,6 +206,74 @@ def check_window_picker_prefers_drive() -> None:
     assert _pick_best_beamng_rect([tiny, drive]) == (10, 10, 1280, 720)
 
 
+class _FakeClock:
+    """A wall clock only the test moves. ``now`` is what ``time.time()`` returns in GVD's
+    actuate / paths / state_io modules while ``fake_clock`` is active."""
+
+    def __init__(self, start: float) -> None:
+        self.now = float(start)
+
+    def advance(self, seconds: float) -> float:
+        self.now += float(seconds)
+        return self.now
+
+
+class _TimeProxy:
+    """Stands in for the ``time`` module: ``time()`` reads the fake clock, the rest is real."""
+
+    def __init__(self, clock: _FakeClock) -> None:
+        self._clock = clock
+
+    def time(self) -> float:
+        return self._clock.now
+
+    def __getattr__(self, name: str):
+        return getattr(time, name)
+
+
+_CLOCK: _FakeClock | None = None
+FAKE_CLOCK_START = 1_800_000_000.0
+
+
+@contextlib.contextmanager
+def fake_clock(start: float = FAKE_CLOCK_START):
+    """In-process checks judge freshness on a clock the test owns, not on how fast it runs.
+
+    Patches ``time`` in the modules that stamp and judge (engage flag, cmd heartbeat, ego
+    ack, lua_bus handshake), and the fake mod's files get their mtimes on the same clock
+    (``_stamp_file``). Only for checks that call GVD in-process; a spawned supervisor runs
+    on the real clock and is judged on its own stamps instead.
+    """
+    global _CLOCK
+    from python.control import actuate as _actuate
+    from python.runtime import paths as _paths
+    from python.runtime import state_io as _state_io
+
+    clock = _FakeClock(start)
+    saved = [(mod, mod.time) for mod in (_actuate, _paths, _state_io)]
+    for mod, _ in saved:
+        mod.time = _TimeProxy(clock)
+    _CLOCK = clock
+    try:
+        yield clock
+    finally:
+        for mod, real in saved:
+            mod.time = real
+        _CLOCK = None
+
+
+def _now() -> float:
+    return time.time() if _CLOCK is None else _CLOCK.now
+
+
+def _stamp_file(path: Path, age_s: float = 0.0) -> None:
+    """Under a fake clock a file the fake mod writes is stamped `age_s` before its now."""
+    if _CLOCK is None and not age_s:
+        return
+    t = _now() - float(age_s)
+    os.utime(path, (t, t))
+
+
 def _touch_lua_bus() -> Path:
     """Keep a fresh lua_bus handshake at the predicted pin so cmd tests can actuate."""
     from python.runtime import paths as gvd_paths
@@ -215,8 +284,10 @@ def _touch_lua_bus() -> Path:
     abs_pin.mkdir(parents=True, exist_ok=True)
     payload = json.dumps({"lua_bus": str(abs_pin)})
     (pin / "gvd_link.json").write_text(payload, encoding="utf-8")
+    _stamp_file(pin / "gvd_link.json")
     if abs_pin != pin:
         (abs_pin / "gvd_link.json").write_text(payload, encoding="utf-8")
+        _stamp_file(abs_pin / "gvd_link.json")
     return abs_pin
 
 
@@ -264,20 +335,29 @@ def _write_ego(
         "brake_input": brake_in,
         "applied_seq": seq,
         "applying": applying,
-        "mtime": int(time.time()),
+        "mtime": int(_now()),
         "lua_bus": str(root),
     }
     if stamp_echo:
         payload["echo_seq"] = _next_echo_seq() if echo_seq is None else int(echo_seq)
         payload["mod_version"] = _MOD_VERSION if mod_version is None else mod_version
     ego_path().write_text(json.dumps(payload), encoding="utf-8")
-    if age_s:
-        old = time.time() - age_s
-        os.utime(ego_path(), (old, old))
+    _stamp_file(ego_path(), age_s)
 
 
 def check_cmd_json_drive_bus() -> None:
-    """Retail actuator: engaged → real drive payload; disengaged → idle stop; applied only on Lua ack."""
+    """Retail actuator: engaged → real drive payload; disengaged → idle stop; applied only on Lua ack.
+
+    On the fake clock: every freshness verdict here (ack age, lua_bus handshake, heartbeat
+    stamp) is judged at a time the test sets, so a slow runner cannot age a fresh file.
+    """
+    with fake_clock() as clock:
+        _cmd_json_drive_bus(clock)
+
+
+def _cmd_json_drive_bus(clock: _FakeClock) -> None:
+    from python.control.actuate import EGO_FRESH_S
+
     _touch_lua_bus()
     if ego_path().exists():
         ego_path().unlink()
@@ -293,7 +373,7 @@ def check_cmd_json_drive_bus() -> None:
         "steer": 0.3, "throttle": 0.4, "brake": 0.0, "seq": 7, "engaged": True,
         "heartbeat_mtime": payload["heartbeat_mtime"], "reason": "ok",
     }, payload
-    assert time.time() - payload["heartbeat_mtime"] < 5.0
+    assert payload["heartbeat_mtime"] == clock.now, (payload["heartbeat_mtime"], clock.now)
     assert out.applied is False and out.reason == "cmd_json_pending", out
 
     # Lua echoes a fresh ack for that seq → applied.
@@ -315,6 +395,14 @@ def check_cmd_json_drive_bus() -> None:
     act.note_ack(read_ego_feedback())
     out = act.apply(DriveCommand(steer=0.0, throttle=0.1, brake=0.0, seq=4, reason="ok"))
     assert out.applied is False and out.reason == "cmd_json_pending", out
+
+    # The ack window's edge, on the fake clock: EGO_FRESH_S old is still fresh, past it is not.
+    _write_ego(9)
+    clock.advance(EGO_FRESH_S)
+    assert read_ego_feedback().fresh is True
+    clock.advance(0.01)
+    assert read_ego_feedback().fresh is False
+    _touch_lua_bus()
 
     # Stale ack (Lua stopped echoing) → not applied.
     _write_ego(9, age_s=5.0)
@@ -1014,12 +1102,16 @@ def check_engage_path_contract() -> None:
     assert read_engage_flag(default=False) is False
     p.write_text('{"engaged":true}', encoding="utf-8")
     assert read_engage_flag(default=False) is False, "engaged:true without mtime must not latch"
-    stamp = time.time()
-    p.write_text(json.dumps({"engaged": True, "mtime": stamp}), encoding="utf-8")
-    # Judged at the stamp's own second and at the window's edges, not at whenever this line runs.
-    assert read_engage_flag(default=False, now=stamp) is True
-    assert read_engage_flag(default=False, now=stamp + ENGAGE_FRESH_S) is True
-    assert read_engage_flag(default=True, now=stamp + ENGAGE_FRESH_S + 0.01) is False
+    # A live latch on the fake clock: fresh through ENGAGE_FRESH_S, stale just past it.
+    with fake_clock() as clock:
+        p.write_text(json.dumps({"engaged": True, "mtime": clock.now}), encoding="utf-8")
+        assert read_engage_flag(default=False) is True
+        clock.advance(ENGAGE_FRESH_S)
+        assert read_engage_flag(default=False) is True
+        clock.advance(0.01)
+        assert read_engage_flag(default=True) is False
+        # The same file read at the stamp itself through the explicit clock argument.
+        assert read_engage_flag(default=False, now=clock.now - ENGAGE_FRESH_S - 0.01) is True
     # Supervisor disengage payload: engaged=false with float mtime + reason (what Lua adopts as OFF and logs).
     write_engage_flag(False, disengage_reason="player_steer")
     data = json.loads(p.read_text(encoding="utf-8"))

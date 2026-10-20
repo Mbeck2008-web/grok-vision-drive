@@ -85,10 +85,12 @@ def check_black_rows() -> None:
         assert not row_has_decodable_frame(root, rows[1], ("main",)), "main-only training needs main"
         assert not row_has_decodable_frame(root, rows[1], ("pillarL", "main")), "main is required when trained"
         assert row_has_decodable_frame(root, rows[1], ("pillarL",)), "a pillar-only net can use tick 1"
-        old, old_missing, _ = select_training_rows(root, rows)
+        all_dropped: dict = {}
+        old, old_missing, _ = select_training_rows(root, rows, dropped=all_dropped)
         dropped: dict = {}
         new, new_missing, _ = select_training_rows(root, rows, cams=("main",), dropped=dropped)
-        assert [r["i"] for r in old] == [0, 1, 2] and old_missing == 0
+        # All cameras (no --cams): a tick without main is dropped too (no_main).
+        assert [r["i"] for r in old] == [0] and old_missing == 2 and all_dropped == {"no_main": 2}, all_dropped
         assert [r["i"] for r in new] == [0], new
         assert dropped == {"no_trained_cam": 2} and new_missing == 2, (dropped, new_missing)
     black = np.zeros((192, 256, 3), np.uint8)

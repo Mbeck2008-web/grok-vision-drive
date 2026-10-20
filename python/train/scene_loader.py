@@ -69,7 +69,9 @@ def select_training_rows(
     ``cams`` is the trained camera list (see ``row_has_decodable_frame``):
     a row whose listed cameras, or whose ``main`` picture, did not decode is
     also left out. Those rows are counted in ``missing`` and, when
-    ``dropped`` is a dict, in ``dropped["no_trained_cam"]``.
+    ``dropped`` is a dict, in ``dropped["no_trained_cam"]``. With no
+    ``cams`` (all eight) a row without a decodable ``main`` picture is left
+    out too and counted in ``dropped["no_main"]``.
 
     Stationary, tipped, and damage spans are a third count and are not
     trained. ``dt_s`` is rewritten from the timestamps of the kept rows. A
@@ -102,6 +104,14 @@ def select_training_rows(
             missing += 1
             if dropped is not None:
                 dropped["no_trained_cam"] = int(dropped.get("no_trained_cam", 0)) + 1
+            continue
+        if not cams and not row_has_decodable_frame(root, row, ("main",)):
+            # Default (all cameras): a pillar/rear-only tick has no front
+            # picture. It would be stitched with a black main sector while
+            # still carrying a lane label, so it is not trained either.
+            missing += 1
+            if dropped is not None:
+                dropped["no_main"] = int(dropped.get("no_main", 0)) + 1
             continue
         item = dict(row)
         stamp = _stamp(item.get("t"))

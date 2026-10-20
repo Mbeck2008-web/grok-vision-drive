@@ -1593,7 +1593,8 @@ def train_directory(
     )
     print(
         f"[GVD] scene index: dropped {int(dropped.get('no_trained_cam', 0))} rows without a decodable "
-        f"trained camera ({','.join(train_cams or ()) or 'all'}; main required when trained)",
+        f"trained camera ({','.join(train_cams or ()) or 'all'}; main required when trained), "
+        f"{int(dropped.get('no_main', 0))} rows without a main frame (all cameras)",
         flush=True,
     )
     if mask_events:

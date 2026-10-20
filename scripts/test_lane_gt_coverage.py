@@ -4,8 +4,11 @@
 A mixed epoch only logs the share. An epoch where every batch is missing
 lane_gt, with the lane_gt head on, raises ``LaneGtMissingError``. Without
 torch, ``_lane_gt_loss`` hands ``zero`` back for a target-less batch.
-CPU only; the end-to-end runs need torch. They pass ``min_valid=0``: the
-default 0.3 already drops windows without lane centers before batching.
+CPU only; the end-to-end runs need torch. The coverage runs pass
+``min_valid=0`` so target-less windows reach the optimizer. With the default
+``min_valid`` (0.3) a recording without lane centers loses every window to
+the valid filter before batching; that is logged (windows, rows, recordings,
+why) and raises ``LaneGtMissingError`` instead of training zero steps.
 """
 from __future__ import annotations
 
@@ -105,9 +108,16 @@ def _fixture(root: Path, with_lane) -> None:
     (root / "gt.jsonl").write_text("\n".join(json.dumps(r) for r in gt_lines) + "\n", encoding="utf-8")
 
 
-def _train(root: Path, heads):
+_DEFAULT = object()
+
+
+def _train(root: Path, heads, min_valid=0.0):
     from python.train.train_scene import train_directory
 
+    # The default 0.3 drops windows without lane centers before they are
+    # batches; 0 lets target-less windows reach the optimizer. ``_DEFAULT``
+    # leaves the argument out so train_directory's own default applies.
+    extra = {} if min_valid is _DEFAULT else {"min_valid": float(min_valid)}
     return train_directory(
         root,
         epochs=1,
@@ -123,10 +133,8 @@ def _train(root: Path, heads):
         heads=heads,
         augment=False,
         workers=0,
-        # The default 0.3 drops windows without lane centers before they are
-        # batches; 0 lets target-less windows reach the optimizer.
-        min_valid=0.0,
         status_root=root / "_status",
+        **extra,
     )
 
 
@@ -164,6 +172,25 @@ def check_end_to_end() -> None:
         else:
             raise AssertionError("a lane_gt run with no lane_gt target in any batch finished")
 
+        # Default min_valid, a recording with no lane centers: the valid
+        # filter removes the whole recording before batching. That used to
+        # train zero steps silently; it must log the removal and raise.
+        log = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(log):
+                _train(bare, ("lane_gt",), min_valid=_DEFAULT)
+        except LaneGtMissingError as exc:
+            text = log.getvalue()
+            lines = [line for line in text.splitlines() if "min-valid filter" in line]
+            assert lines, text[-2000:]
+            assert "recordings=1/1" in lines[0] and "why: lane-center valid share < 0.3" in lines[0], lines
+            assert "1 recording(s) (bare)" in str(exc) and "--min-valid 0" in str(exc), exc
+            # Raised before any optimizer step: no epoch summary was logged.
+            assert "lane_gt missing epoch=" not in text, text[-2000:]
+            print(f"default min_valid: {lines[0].replace('[GVD] ', '')} -> raised OK")
+        else:
+            raise AssertionError("default min_valid on a recording without lane centers trained silently")
+
 
 def check_zero_without_target() -> None:
     from python.train.scene_net import ScenePrediction, _lane_gt_loss
@@ -178,8 +205,78 @@ def check_zero_without_target() -> None:
     print("zero: a target-less batch returns zero unweighted OK")
 
 
+def _row(index: int, segment: str, lane: bool) -> dict:
+    tech = _lane_tech() if lane else {"speed_mps": 10.0}
+    return {"i": index, "t": index * 0.1, "segment": segment, "tech": tech}
+
+
+def check_valid_filter() -> None:
+    """``epoch_windows`` counts what --min-valid removes; a lost recording raises."""
+    import random
+
+    from python.train.continual import epoch_windows, report_valid_filter
+
+    good = [_row(i, "a#0", True) for i in range(16)]
+    half = [_row(i, "a#0", i % 4 == 0) for i in range(16, 32)]  # valid share 0.25
+    bare = [_row(i, "b#0", False) for i in range(32, 64)]
+    plan = [
+        {"kind": "train", "rows": good[:8]},
+        {"kind": "train", "rows": good[8:]},
+        {"kind": "train", "rows": half},
+        {"kind": "train", "rows": bare[:16]},
+        {"kind": "train", "rows": bare[8:24]},
+        {"kind": "train", "rows": bare[16:]},
+        {"kind": "holdout", "rows": bare[24:]},
+    ]
+    stats: dict = {}
+    out = epoch_windows(plan, random.Random(0), min_valid=0.3, stats=stats)
+    assert sum(1 for item in out if item["kind"] == "train") == 2
+    assert stats["windows_in"] == 6 and stats["windows_dropped"] == 4, stats
+    assert stats["rows_dropped"] == 16 + 32, stats
+    assert stats["rows_dropped_no_center"] == 12 + 32, stats
+    assert stats["recordings"] == 2 and stats["recordings_removed"] == ["b#0"], stats
+    log = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(log):
+            report_valid_filter(stats, epoch=0)
+    except LaneGtMissingError as exc:
+        assert "b#0" in str(exc) and "1 recording" in str(exc), exc
+    else:
+        raise AssertionError("a recording the filter removed whole did not raise")
+    assert "removed windows=4/6 rows=48 recordings=1/2; why: lane-center valid share < 0.3" in log.getvalue(), log.getvalue()
+
+    # Only part of a recording removed: logged once, no raise; quiet after that.
+    stats = {}
+    epoch_windows(plan[:3], random.Random(0), min_valid=0.3, stats=stats)
+    assert stats["recordings_removed"] == [] and stats["windows_dropped"] == 1
+    with contextlib.redirect_stdout(io.StringIO()) as out_log:
+        report_valid_filter(stats, epoch=0)
+        report_valid_filter(stats, epoch=1, quiet=True)
+    assert out_log.getvalue().count("min-valid filter") == 1, out_log.getvalue()
+
+    # min_valid 0 removes nothing.
+    stats = {}
+    epoch_windows(plan, random.Random(0), min_valid=0.0, stats=stats)
+    assert stats["windows_dropped"] == 0 and stats["recordings_removed"] == []
+    with contextlib.redirect_stdout(io.StringIO()):
+        report_valid_filter(stats, epoch=0)
+
+    # Planned windows but zero counted lane_gt steps with the head on raises.
+    seen = LaneGtCoverage(enabled=True)
+    with contextlib.redirect_stdout(io.StringIO()):
+        try:
+            seen.close_epoch(2, planned=3)
+        except LaneGtMissingError as exc:
+            assert "zero lane_gt steps" in str(exc), exc
+        else:
+            raise AssertionError("an epoch with planned windows and zero lane_gt steps did not raise")
+        assert LaneGtCoverage(enabled=False).close_epoch(2, planned=3)["batches"] == 0
+    print("valid filter: windows 4/6, rows 48, recording b#0 removed -> raises; partial logs only OK")
+
+
 def main() -> None:
     check_counter()
+    check_valid_filter()
     check_zero_without_target()
     check_end_to_end()
     print("test_lane_gt_coverage: OK")

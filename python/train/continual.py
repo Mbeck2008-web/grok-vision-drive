@@ -556,28 +556,62 @@ def window_difficulty(rows: list[Mapping[str, Any]]) -> float:
     return total / float(len(rows))
 
 
+def _recording_key(rows: list[Mapping[str, Any]], fallback: str = "recording") -> str:
+    """Which recording a window comes from: its ``segment``, else its ``session``, else ``fallback``."""
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        for key in ("segment", "session"):
+            value = row.get(key)
+            if value not in (None, ""):
+                return str(value)
+    return str(fallback)
+
+
 def epoch_windows(
     plan: list[dict[str, Any]],
     rng: Any,
     *,
     min_valid: float = 0.3,
     balance: bool = False,
+    stats: dict[str, Any] | None = None,
+    recording: str = "recording",
 ) -> list[dict[str, Any]]:
     """Shuffle train windows. Holdout stays in time order, after them.
 
     Every training window starts from a fresh GRU state. Carrying a
     straight-road hidden state into the next curve was the loss spike.
+
+    A window whose lane-center valid share is under ``min_valid`` is dropped.
+    ``stats``, when given, is filled with what that filter removed (windows,
+    rows, and recordings left with no train window at all) so the trainer can
+    log it and refuse a recording that silently trains nothing; see
+    ``report_valid_filter``. ``recording`` names windows whose rows carry
+    neither ``segment`` nor ``session`` (the trainer passes the strips folder).
     """
     train: list[dict[str, Any]] = []
     hold: list[dict[str, Any]] = []
     floor = float(min_valid)
+    kept_by_rec: dict[str, int] = {}
+    dropped_by_rec: dict[str, int] = {}
+    kept_rows: set[int] = set()
+    dropped_rows: dict[int, Mapping[str, Any]] = {}
+    windows_in = 0
     for item in plan:
         if item.get("kind") == "holdout":
             hold.append(item)
             continue
         rows = list(item.get("rows") or [])
+        windows_in += 1
+        rec = _recording_key(rows, recording)
+        kept_by_rec.setdefault(rec, 0)
         if floor > 0.0 and valid_fraction(rows) < floor:
+            dropped_by_rec[rec] = dropped_by_rec.get(rec, 0) + 1
+            for row in rows:
+                dropped_rows[id(row)] = row
             continue
+        kept_by_rec[rec] += 1
+        kept_rows.update(id(row) for row in rows)
         fresh = dict(item)
         fresh["incoming"] = "reset"
         fresh["rows"] = rows
@@ -591,7 +625,60 @@ def epoch_windows(
         for _ in range(copies):
             train.append(dict(fresh))
     rng.shuffle(train)
+    if stats is not None:
+        removed_rows = [row for key, row in dropped_rows.items() if key not in kept_rows]
+        stats.clear()
+        stats.update(
+            {
+                "min_valid": floor,
+                "windows_in": windows_in,
+                "windows_dropped": sum(dropped_by_rec.values()),
+                "rows_dropped": len(removed_rows),
+                "rows_dropped_no_center": sum(1 for row in removed_rows if valid_fraction([row]) == 0.0),
+                "recordings": len(kept_by_rec),
+                "recordings_removed": sorted(rec for rec, kept in kept_by_rec.items() if kept == 0 and dropped_by_rec.get(rec)),
+                "dropped_by_recording": dict(dropped_by_rec),
+            }
+        )
     return train + hold
+
+
+def report_valid_filter(stats: Mapping[str, Any], *, epoch: int | None = None, quiet: bool = False) -> None:
+    """Log what the ``--min-valid`` filter removed. Raise when a recording lost every window.
+
+    A recording without lane_gt (no 5 m / 10 m lane centers) has a valid
+    share of 0, so the default ``min_valid`` 0.3 removes all its windows
+    before batching and it would train zero steps without a word. That
+    raises ``LaneGtMissingError`` naming the recording.
+    """
+    from python.train.scene_net import LaneGtMissingError
+
+    if not stats:
+        return
+    removed = list(stats.get("recordings_removed") or [])
+    dropped = int(stats.get("windows_dropped") or 0)
+    floor = float(stats.get("min_valid") or 0.0)
+    if not quiet or removed:
+        tag = "" if epoch is None else f" epoch={int(epoch)}"
+        why = (
+            f"lane-center valid share < {floor:g} "
+            f"({int(stats.get('rows_dropped_no_center') or 0)} of the removed rows have no lane center at all)"
+            if dropped
+            else "none below the floor"
+        )
+        print(
+            f"[GVD] min-valid filter{tag}: removed windows={dropped}/{int(stats.get('windows_in') or 0)} "
+            f"rows={int(stats.get('rows_dropped') or 0)} "
+            f"recordings={len(removed)}/{int(stats.get('recordings') or 0)}; why: {why}",
+            flush=True,
+        )
+    if removed:
+        shown = ", ".join(removed[:5]) + (" ..." if len(removed) > 5 else "")
+        raise LaneGtMissingError(
+            f"the --min-valid {floor:g} filter removed every training window of {len(removed)} "
+            f"recording(s) ({shown}): their rows have no lane_gt lane centers, so they would train "
+            "zero steps. Re-collect them with lane_gt, drop them from --strips, or pass --min-valid 0."
+        )
 
 
 def pass_plan(

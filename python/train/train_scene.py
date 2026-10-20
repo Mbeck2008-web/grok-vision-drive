@@ -1989,17 +1989,25 @@ def train_directory(
         best_value: float | None = None
         best_blob: dict[str, Any] | None = None
         lane_gt_seen = LaneGtCoverage("lane_gt" in head_names(train_heads))
+        filter_logged = False
         while not paused_exit:
             refit = False
             lane_gt_seen.reset()
-            from python.train.continual import epoch_windows
+            from python.train.continual import epoch_windows, report_valid_filter
 
+            filter_stats: dict[str, Any] = {}
             plan_steps = epoch_windows(
                 pass_plan(rows, chunk_len, stride, blocks=int(holdout_blocks), cells=cell_spec),
                 window_rng,
                 min_valid=float(min_valid),
                 balance=bool(balance),
+                stats=filter_stats,
+                recording=root.name or str(root),
             )
+            # Log what --min-valid removed (first epoch, or whenever a whole
+            # recording goes); a recording with no train window left raises.
+            report_valid_filter(filter_stats, epoch=int(epoch), quiet=filter_logged)
+            filter_logged = True
             windows = sum(1 for item in plan_steps if item["kind"] == "train")
             carry: SceneState | None = None
             end_state: SceneState | None = None
@@ -2223,7 +2231,8 @@ def train_directory(
                 break
             # Log the epoch's share of batches without a lane_gt target; all of
             # them missing with the lane_gt head on raises LaneGtMissingError.
-            lane_gt_seen.close_epoch(epoch)
+            # Windows planned but zero lane_gt steps taken raises as well.
+            lane_gt_seen.close_epoch(epoch, planned=windows)
             if hold_n <= 0:
                 break
             mean = hold_sum / hold_n

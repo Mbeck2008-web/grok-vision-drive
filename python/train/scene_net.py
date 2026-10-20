@@ -1081,7 +1081,13 @@ class LaneGtCoverage:
         if not has_target:
             self.missing += 1
 
-    def close_epoch(self, epoch: int) -> dict[str, Any]:
+    def close_epoch(self, epoch: int, planned: int = 0) -> dict[str, Any]:
+        """Log and reset. ``planned`` is the epoch's train window count.
+
+        Zero counted batches with ``planned`` windows and the head on means
+        no step carried a supervised lane_gt row at all: that raises too. A
+        paused or empty epoch passes ``planned=0`` and only resets.
+        """
         batches, missing = int(self.batches), int(self.missing)
         share = (missing / batches) if batches else None
         summary = {"epoch": int(epoch), "batches": batches, "missing": missing, "share": share}
@@ -1091,6 +1097,12 @@ class LaneGtCoverage:
                 f"[GVD] lane_gt missing epoch={int(epoch)} batches={missing}/{batches} "
                 f"share={share:.1%}" + ("" if self.enabled else " (lane_gt head off)"),
                 flush=True,
+            )
+        if self.enabled and not batches and int(planned) > 0:
+            print(f"[GVD] lane_gt missing epoch={int(epoch)} batches=0/0 planned={int(planned)}", flush=True)
+            raise LaneGtMissingError(
+                f"epoch {int(epoch)}: {int(planned)} training windows ran zero lane_gt steps, but the "
+                "lane_gt head is on. No window had a supervised row; check the recording's lane_gt fields."
             )
         if self.enabled and batches and missing == batches:
             raise LaneGtMissingError(

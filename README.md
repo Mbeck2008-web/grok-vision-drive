@@ -136,7 +136,7 @@ Key `0` hides every layer and shows the clean stage only.
 
 #### AUTO tab: Automatic Mode
 
-Automatic Mode records while BeamNG's own AI drives. GVD does not steer. Every saved tick is labelled `driver=beamng_ai`. The tab and the command line start the same collector, `scripts/collect_scene_lanes.py`. The live runs so far (rec2, rec3) were started from the command line, not from this tab, so the tab itself is Offline smoke only. The collector it starts is Proven live: recording only (see the CLI table).
+Automatic Mode records while BeamNG's own AI drives. The AI steers, not GVD. Every saved tick is labelled `driver=beamng_ai`. The tab and the command line start the same collector, `scripts/collect_scene_lanes.py`. The live runs so far (rec2, rec3) were started from the command line, not from this tab, so the tab itself is Offline smoke only. The collector it starts is Proven live: recording only (see the CLI table).
 
 | Control | Click does | Default | Status |
 | --- | --- | --- | --- |
@@ -399,6 +399,7 @@ Before the first step the trainer measures free VRAM and shrinks the batch until
 | Driver override | Steering against the command (on the residual, not the absolute angle), or a pedal press beyond what GVD asked for, disengages. Thresholds are in `config/control.yaml`. | Offline smoke only |
 | Heartbeat | Python stamps `gvd_state.json` every tick. Lua treats it as stale after 1.5 s: the ribbon fades and actuators stop. | Offline smoke only |
 | Command dead-man | No new command for 0.35 s: Lua holds the brake. No command for 1.0 s: Lua releases the car and disengages. | Offline smoke only |
+| Brake hold (Tech) | Tech drive is arcade. A hold, a stop, or AEB sets the parking brake and releases the service brake, so gear 0 plus a held brake is not reverse. | Offline smoke only |
 | AEB | When a tracked lead's time to collision drops under the AEB TTC (default 1.2 s) the target speed goes to 0 and the glance word is HOLD. A warning band sits 1.3 s above that. | Offline smoke only |
 | Vetoes | Low lane confidence (0.25) or path confidence (0.15) vetoes the drive. A preview path is blocked unless `--allow-preview-drive`. `--policy e2e` with no model holds the brake (`veto:e2e_stub`). | Offline smoke only |
 | Launch and crash guard | Caps throttle while launching and stops on a damage jump or a stuck car (`python/control/launch_guard.py`). | Offline smoke only |

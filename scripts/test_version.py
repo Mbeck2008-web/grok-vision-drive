@@ -40,12 +40,13 @@ def main() -> None:
     assert strip["version"] == PIN, strip["version"]
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert f"## Alpha {PIN}" in readme
-    assert "This is **alpha** — may break / not work; improves with fixes." in readme
-    assert "**point** bumps" in readme
-    assert "fixes / small UI" in readme
-    assert "**main alpha** bump" in readme
-    assert "features / core / UI overhaul" in readme
+    # The alpha warning and the pin open the README, ahead of the quick start.
+    assert f"This is an **alpha** (`VERSION` {PIN}). It may break." in readme
+    assert readme.index("This is an **alpha**") < readme.index("## Quick start")
+    assert f"Canonical pin **{PIN}**" in readme
+    major, minor = PIN.split(".")[:2]
+    assert f"Point bumps (`{major}.{minor}.x`) are fixes and small UI." in readme
+    assert f"A main alpha bump (`{major}.x.0`) is features, core, or a UI overhaul." in readme
     assert f"{PIN}-alpha-<sha>" in readme
     assert "Soft Esc parked" in readme
     assert "m6-<sha>" not in readme

@@ -763,16 +763,21 @@ def check_no_chrome() -> None:
 
 def check_player_docs() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "## Alpha 1.7.12" in readme
-    assert "This is **alpha** — may break / not work; improves with fixes." in readme
-    assert "**point** bumps" in readme and "fixes / small UI" in readme
-    assert "**main alpha** bump" in readme and "features / core / UI overhaul" in readme
+    version = (ROOT / "VERSION").read_text(encoding="utf-8").splitlines()[0].strip()
+    major, minor = version.split(".")[:2]
+    # The alpha warning and the pin open the README, ahead of the quick start.
+    assert f"This is an **alpha** (`VERSION` {version}). It may break." in readme
+    assert readme.index("This is an **alpha**") < readme.index("## Quick start")
+    assert f"Point bumps (`{major}.{minor}.x`) are fixes and small UI." in readme
+    assert f"A main alpha bump (`{major}.x.0`) is features, core, or a UI overhaul." in readme
     assert "1.7.12-alpha-<sha>" in readme
     assert "docs/stitch-360.png" in readme
     assert "docs/soft-esc-highway.jpg" not in readme
     assert "Soft Esc parked" in readme
-    assert readme.index("docs/stitch-360.png") < readme.index("## Recent changes")
-    assert readme.index("## 1.7.7") > readme.index("## Recent changes")
+    # The 360 stitch stays in the player-facing part, ahead of the technical reference.
+    # The release history left the README for the git log; the README must say so.
+    assert readme.index("docs/stitch-360.png") < readme.index("## Technical details")
+    assert "The change history is the git log." in readme
     # Retail drives via the cmd JSON bus; the old "cannot drive" wording must be gone everywhere players look.
     assert "beamngpy if importable" not in readme.lower()
     for f in (ROOT / "README.md", ROOT / "play_gvd.bat", ROOT / "play_gvd_tech.bat", ROOT / "scripts" / "make_release_zip.py",

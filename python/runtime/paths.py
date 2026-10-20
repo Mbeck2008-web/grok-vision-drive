@@ -263,15 +263,36 @@ def _probe_lua_bus_files() -> list[Path]:
     return files
 
 
+# Lua rewrites gvd_link.json / gvd_ego.json in place (truncate, then write), so
+# a read can land between the two and see an empty or cut-off file. That is a
+# torn write, not a missing handshake: read again a few times before giving up.
+# Without this, one torn read made bus_identity() MISMATCH for a tick, which sent
+# a full-brake stop and dropped engaged.
+LUA_BUS_READ_ATTEMPTS = 5
+LUA_BUS_READ_RETRY_S = 0.002
+
+
 def _read_lua_bus_field(path: Path, now: float) -> tuple[str | None, float | None]:
-    """Return ``(lua_bus or None, age_s)``. Missing file → ``(None, None)``."""
-    try:
-        if not path.is_file():
+    """Return ``(lua_bus or None, age_s)``. Missing file → ``(None, None)``.
+
+    A file that exists but does not parse yet (a torn in-place write) is read
+    again up to ``LUA_BUS_READ_ATTEMPTS`` times before it counts as missing.
+    """
+    data = None
+    age: float | None = None
+    for attempt in range(LUA_BUS_READ_ATTEMPTS):
+        try:
+            if not path.is_file():
+                return None, None
+            age = now - path.stat().st_mtime
+            data = json.loads(path.read_text(encoding="utf-8"))
+            break
+        except (json.JSONDecodeError, UnicodeError, ValueError):
+            if attempt + 1 >= LUA_BUS_READ_ATTEMPTS:
+                return None, None
+            time.sleep(LUA_BUS_READ_RETRY_S)
+        except (OSError, TypeError):
             return None, None
-        age = now - path.stat().st_mtime
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeError, TypeError, ValueError):
-        return None, None
     if not isinstance(data, dict):
         return None, age
     raw = data.get("lua_bus")

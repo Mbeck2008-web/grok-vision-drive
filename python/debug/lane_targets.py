@@ -160,6 +160,52 @@ def tech_from_hit(
     }
 
 
+def tech_from_painted(lanes: list[tuple[float, float] | None]) -> dict[str, Any]:
+    """Tech dict from painted lane edges at each lookahead (vehicle frame).
+
+    Each lookahead carries its own measured center/left/right, so a curve is
+    a curve. A lookahead without paint on both sides is NaN with mask 0.
+    The 5 m and 10 m slots gate ``lane_center_is_valid`` as before.
+    """
+    from python.debug.painted_lanes import heading_from_centers
+
+    values = np.full((LANE_GT_DIM,), np.nan, dtype=np.float32)
+    valid = np.zeros((LANE_GT_DIM,), dtype=np.float32)
+    values[-1] = 0.0
+    centers: list[float | None] = []
+    polys_l: list[dict[str, float]] = []
+    polys_r: list[dict[str, float]] = []
+    for k, y in enumerate(LOOKAHEADS_M):
+        got = lanes[k] if k < len(lanes) else None
+        if got is None:
+            centers.append(None)
+            continue
+        left, right = float(got[0]), float(got[1])
+        center = 0.5 * (left + right)
+        values[3 * k : 3 * k + 3] = (center, left, right)
+        valid[3 * k : 3 * k + 3] = 1.0
+        centers.append(center)
+        polys_l.append({"x": left, "y": float(y), "z": 0.0})
+        polys_r.append({"x": right, "y": float(y), "z": 0.0})
+    heading = heading_from_centers(centers[0], centers[1])
+    if heading is not None:
+        values[-2] = heading
+        valid[-2] = 1.0
+    ok = valid[0] > 0.5 and valid[3] > 0.5
+    values[-1] = 1.0 if ok else 0.0
+    valid[-1] = 1.0
+    return {
+        "lanes": [polys_l, polys_r] if polys_l else [],
+        "lane_gt": values.tolist(),
+        "lane_gt_valid": valid.tolist(),
+        "gt_lookahead_m": [float(y) for y in LOOKAHEADS_M],
+        "gt_source": "painted_decals",
+        "gt_origin": "state_pos_ref_node",
+        "heading_err_rad": heading,
+        "off_road": False if ok else None,
+    }
+
+
 def lane_gt_from_record(record: Mapping[str, Any] | None) -> tuple[np.ndarray, np.ndarray]:
     """Read a stored tech dict, or pack it from the scalar GT fields."""
     record = record or {}

@@ -549,6 +549,20 @@ def road_for(roads: list[Any], hit: object) -> Any:
     return None
 
 
+def painted_for(level: str) -> Any:
+    """Painted line decals for ``level`` (cached dump, else the level zip under BNG_HOME)."""
+    from python.data.data_root import roads_dir
+    from python.debug.painted_lanes import PaintedLanes, load_painted_decals
+
+    try:
+        lanes = PaintedLanes(load_painted_decals(str(level or ""), roads_dir()))
+    except Exception as exc:
+        print(f"collect painted lanes {level}: {type(exc).__name__}: {exc}", flush=True)
+        lanes = PaintedLanes([])
+    print(f"collect painted lanes {level} segments={len(lanes.segs)}", flush=True)
+    return lanes
+
+
 def road_lanes(roads: list[Any], hit: object) -> int | None:
     road = road_for(roads, hit)
     if road is None:
@@ -626,6 +640,14 @@ def enter_map(
             return opened
         raise
     print(f"collect cameras {len(opened.cameras)} ({', '.join(sorted(opened.cameras))})", flush=True)
+    # vehicle.state is the State sensor (pos/dir/vel). Steering and pedals live
+    # in Electrics, which this collector never attached, so wheel.steer was null.
+    try:
+        from beamngpy.sensors import Electrics  # type: ignore
+
+        opened.vehicle.sensors.attach("electrics", Electrics())
+    except Exception as exc:  # already attached, or an old BeamNGpy
+        print(f"collect electrics attach: {type(exc).__name__}: {exc}", flush=True)
     return opened
 
 
@@ -814,7 +836,8 @@ def main(argv: list[str] | None = None) -> int:
     from python.data.raw_queue import RawWriteQueue
     from python.debug.gt_geom import RoadFollow, follow_label, heading_from_dir
     from python.debug.gt_logger import load_road_polys
-    from python.debug.lane_targets import tech_from_hit
+    from python.debug.lane_targets import tech_from_hit, tech_from_painted
+    from python.debug.painted_lanes import PaintedLanes, load_painted_decals
     from python.sensors.cameras import load_camera_config
     from python.sensors.tech import (
         gvd_to_bng_vehicle,
@@ -955,11 +978,13 @@ def main(argv: list[str] | None = None) -> int:
         # writer exists. A single-level run keeps the scenario already started.
         vehicle = None
         roads: list[Any] = []
+        painted = PaintedLanes([])
         cams: dict[str, Any] = {}
         spawn_pos: tuple[float, float, float] | None = None
         if not map_names:
             opened = enter_map(bng, str(args.reload_level or ""), cam_cfg, {})
             vehicle, roads, cams, err = opened.vehicle, opened.roads, opened.cameras, opened.error
+            painted = painted_for(str(args.reload_level or ""))
             if err or vehicle is None or not roads:
                 message = err or "no vehicle after load"
                 record_session_failure(status_root, message)
@@ -1244,6 +1269,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"collect segment {segment_id}", flush=True)
                 opened = enter_map(bng, map_name, cam_cfg, cams)
                 vehicle, roads, cams, err = opened.vehicle, opened.roads, opened.cameras, opened.error
+                painted = painted_for(map_name)
                 if err or vehicle is None or not roads or not cams:
                     last_error = err or "no vehicle after load"
                     save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
@@ -1427,12 +1453,15 @@ def main(argv: list[str] | None = None) -> int:
                     time.sleep(tick_sleep_s(time.monotonic() - tick_mark, 0.1))
                     tick_dt = max(1e-3, time.monotonic() - tick_mark)
                     continue
-            tech = tech_from_hit(
-                None if hit is None else hit.lane_offset_m,
-                None if hit is None else hit.heading_err_rad,
-                None if hit is None else hit.lane_width_m,
-                None if hit is None else hit.off_road,
-            )
+            # Label from the painted lines the camera sees. The nav-spline hit
+            # still drives the excursion controller below, but it is not a label:
+            # road_invisible AI splines split into equal 1/1 lanes are not the paint.
+            if painted:
+                tech = tech_from_painted(
+                    painted.lane_at(pos, direction) if pos is not None and direction is not None else []
+                )
+            else:
+                tech = tech_from_hit(None, None, None, None)
             lanes_here = road_lanes(roads, hit)
             # A missing label is an ambiguous tick, not a junction. Aborting the
             # weave on it turned every masked sample into a failed excursion.
@@ -1826,7 +1855,16 @@ def _read_vehicle(vehicle: Any) -> dict[str, Any]:
             state = vehicle.sensors.poll() if hasattr(vehicle, "sensors") else None
         except Exception:
             state = None
-    sample = controls_from_state(state if isinstance(state, dict) else None)
+    state = dict(state) if isinstance(state, dict) else None
+    try:
+        sensors = getattr(vehicle, "sensors", None)
+        el = sensors["electrics"] if sensors is not None else None
+        data = getattr(el, "data", el)
+        if state is not None and data is not None:
+            state["electrics"] = {str(k): data[k] for k in data}
+    except Exception:
+        pass
+    sample = controls_from_state(state)
     if sample.get("pos") is None and isinstance(state, dict):
         pos = state.get("pos")
         if isinstance(pos, (list, tuple)) and len(pos) >= 3:

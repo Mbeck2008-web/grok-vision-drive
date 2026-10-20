@@ -20,6 +20,15 @@
   teleport, recover or level load) and ``stall`` (under 1 m/s while the AI
   should move).
 
+``--mask-files a.jsonl,b.jsonl`` masks the rows listed in offline mask
+sidecars next to the recording (one JSON object per line, row id in ``i``).
+A listed file that is missing, a line that is not JSON with an integer
+``i``, or an ``i`` the recording does not have raises ``MaskFileError``.
+``name@sha256prefix`` also refuses a file whose sha256 does not start with
+that prefix. ``mask_file_sources`` reads every file against the full
+recording rows; ``drop_masked`` removes the union before the holdout split,
+so a masked row is in neither the train chunks nor the holdout.
+
 Read-only: nothing is written next to the recording.
 """
 
@@ -33,6 +42,10 @@ from typing import Any, Iterable, Mapping
 IMPACTS_FILE = "impacts.jsonl"
 ROW_FLAGS = ("settle", "stall")
 PRE_IMPACT_S = 3.0
+
+
+class MaskFileError(ValueError):
+    """A ``--mask-files`` sidecar is missing, malformed, or names a row the recording does not have."""
 
 
 def _num(value: Any) -> float | None:
@@ -198,3 +211,163 @@ def describe(counts: Mapping[str, int], total: int) -> str:
         f"3 s / abort run / until-respawn extension), settle {counts.get('settle', 0)}, "
         f"stall {counts.get('stall', 0)}"
     )
+
+
+def parse_mask_files(value: str | Iterable[str] | None) -> tuple[str, ...]:
+    """``"a.jsonl,b.jsonl"`` or an iterable -> names in order, duplicates refused."""
+    if value is None:
+        return ()
+    items = value.split(",") if isinstance(value, str) else list(value)
+    names = tuple(str(item).strip() for item in items if str(item).strip())
+    if len(set(names)) != len(names):
+        raise MaskFileError(f"--mask-files lists a file twice: {','.join(names)}")
+    return names
+
+
+def read_mask_file(root: Path | str, name: str, known: set[int] | frozenset[int]) -> set[int]:
+    """Row ids listed in one sidecar (relative to ``root``). Every id must be in ``known``."""
+    path = Path(root) / name
+    if not path.is_file():
+        raise MaskFileError(f"mask file {name} not found in the recording folder")
+    ids: set[int] = set()
+    unknown: list[int] = []
+    with open(path, "r", encoding="utf-8") as handle:
+        for number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+                index = item["i"]
+                if isinstance(index, bool) or not isinstance(index, int):
+                    raise TypeError(index)
+            except (ValueError, KeyError, TypeError) as exc:
+                raise MaskFileError(f"mask file {name} line {number}: not a JSON object with an integer i ({exc!r})") from None
+            if index not in known:
+                unknown.append(index)
+            ids.add(index)
+    if unknown:
+        shown = ",".join(str(i) for i in unknown[:5]) + (" ..." if len(unknown) > 5 else "")
+        raise MaskFileError(f"mask file {name}: {len(unknown)} row id(s) not in the recording ({shown})")
+    return ids
+
+
+def _row_id(row: Mapping[str, Any]) -> int | None:
+    try:
+        return int(row.get("i"))
+    except (TypeError, ValueError):
+        return None
+
+
+SHA_PREFIX_MIN = 8
+
+
+def split_mask_spec(item: str) -> tuple[str, str | None]:
+    """``name`` -> (name, None); ``name@sha256prefix`` -> (name, prefix).
+
+    The prefix is 8 to 64 hex digits (case is ignored). Anything else after
+    ``@`` raises ``MaskFileError``.
+    """
+    text = str(item).strip()
+    if "@" not in text:
+        return text, None
+    name, _sep, want = text.rpartition("@")
+    want = want.strip().lower()
+    if not name.strip() or not (SHA_PREFIX_MIN <= len(want) <= 64) or any(c not in "0123456789abcdef" for c in want):
+        raise MaskFileError(
+            f"--mask-files entry {text}: expected name@sha256prefix with {SHA_PREFIX_MIN}-64 hex digits"
+        )
+    return name.strip(), want
+
+
+def file_sha256(path: Path | str) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def mask_file_sources(
+    root: Path | str, rows: list[Mapping[str, Any]], files: str | Iterable[str] | None
+) -> list[dict[str, Any]]:
+    """One entry per ``--mask-files`` item, in order: name, sha256, row ids.
+
+    ``rows`` are the full recording rows (before frame or camera filtering),
+    so every listed id is checked against the whole recording. A file named
+    twice (with or without ``@sha``), a sha256 that does not start with the
+    given prefix, and every ``read_mask_file`` failure raise ``MaskFileError``.
+    """
+    items = parse_mask_files(files)
+    if not items:
+        return []
+    specs = [split_mask_spec(item) for item in items]
+    names = [name for name, _want in specs]
+    if len(set(names)) != len(names):
+        raise MaskFileError(f"--mask-files lists a file twice: {','.join(names)}")
+    known = frozenset(i for i in (_row_id(row) for row in rows) if i is not None)
+    out: list[dict[str, Any]] = []
+    for name, want in specs:
+        path = Path(root) / name
+        if not path.is_file():
+            raise MaskFileError(f"mask file {name} not found in the recording folder")
+        sha = file_sha256(path)
+        if want is not None and not sha.startswith(want):
+            raise MaskFileError(f"mask file {name}: sha256 {sha} does not start with the expected {want}")
+        out.append({"name": name, "sha256": sha, "expected": want, "ids": read_mask_file(root, name, known)})
+    return out
+
+
+def _empty_tech(row: Mapping[str, Any]) -> bool:
+    tech = row.get("tech")
+    return isinstance(tech, Mapping) and not tech
+
+
+def selection_line(
+    state_rows: list[Mapping[str, Any]],
+    before: list[Mapping[str, Any]],
+    after: list[Mapping[str, Any]],
+    sources: list[dict[str, Any]],
+) -> tuple[str, dict[str, Any]]:
+    """The one ``[GVD] selection:`` log line and its counts.
+
+    Empty tech (``tech == {}``, a hop-masked label) has no loss and no
+    holdout score; those rows stay in the windows as GRU context, so they are
+    counted, not removed. Each mask file is counted on the full recording rows
+    and on ``before`` (rows with frames); ``after`` is what remains.
+    """
+    with_frames = {i for i in (_row_id(row) for row in before) if i is not None}
+    empty_state = sum(1 for row in state_rows if _empty_tech(row))
+    empty_frames = sum(1 for row in before if _empty_tech(row))
+    parts = [
+        f"empty tech (no loss, no score; kept as GRU context) {empty_state} of {len(state_rows)} state rows, "
+        f"{empty_frames} of {len(before)} rows with frames"
+    ]
+    files: list[dict[str, Any]] = []
+    union: set[int] = set()
+    for source in sources:
+        ids = set(source["ids"])
+        union |= ids
+        hit = len(ids & with_frames)
+        parts.append(f"file {source['name']} sha256 {source['sha256']} {len(ids)} rows ({hit} with frames)")
+        files.append({"name": source["name"], "sha256": source["sha256"], "rows": len(ids), "with_frames": hit})
+    if sources:
+        parts.append(f"files union {len(union)} rows")
+    else:
+        parts.append("no mask files")
+    parts.append(f"left out {len(before) - len(after)} of {len(before)} rows with frames; {len(after)} remain")
+    meta = {"empty_tech_state": empty_state, "empty_tech_frames": empty_frames, "files": files,
+            "files_union": len(union), "before": len(before), "after": len(after)}
+    return "[GVD] selection: " + "; ".join(parts), meta
+
+
+def drop_masked(rows: list[Mapping[str, Any]], masked: set[int] | frozenset[int]) -> list[dict[str, Any]]:
+    """``rows`` without the masked row ids, ``dt_s`` recomputed.
+
+    A masked run becomes one gap: past MEMORY_S it resets the GRU in
+    ``recording_spans``, the same as any other removal.
+    """
+    from python.train.scene_loader import recompute_dt
+
+    return recompute_dt([row for row in rows if _row_id(row) not in masked])

@@ -1449,7 +1449,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
     from python.debug.gt_geom import RoadFollow, follow_label, heading_from_dir
     from python.debug.gt_logger import load_road_polys
     from python.debug.lane_targets import tech_from_hit, tech_from_painted
-    from python.debug.painted_lanes import PaintedLanes, load_painted_decals
+    from python.debug.painted_lanes import LaneTracker, PaintedLanes, load_painted_decals
     from python.sensors.cameras import load_camera_config
     from python.sensors.tech import (
         gvd_to_bng_vehicle,
@@ -1676,6 +1676,10 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         cams_ready = False
         segment_open = False
         follow = RoadFollow()
+        # The labeled ego lane: the painted pair the car is in, kept with
+        # hysteresis from tick to tick. A respawn, a recover or a new segment
+        # starts it fresh (the car is somewhere else).
+        lane_track = LaneTracker()
         label_hit = None
         mark_recover = False
         gate_note = ""
@@ -1893,6 +1897,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     prev_dir = None
                     prev_dir_t = None
                     follow = RoadFollow()
+                    lane_track.reset()
                     label_hit = None
                     segment_open = False
                     spawn_pos = moved
@@ -2023,6 +2028,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             spawn_mark = done_s
             recheck_mark = done_s
             spawn_pos = picked.pos
+            lane_track.reset()
             impact.reset()
             yield_guard.reset()
             settle.start(done_s)
@@ -2248,6 +2254,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 cams_ready = False
                 segment_open = False
                 follow = RoadFollow()
+                lane_track.reset()
                 label_hit = None
                 gate_note = ""
                 warmup_since = None
@@ -2535,7 +2542,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             # road_invisible AI splines split into equal 1/1 lanes are not the paint.
             if painted:
                 tech = tech_from_painted(
-                    painted.lane_at(pos, direction) if pos is not None and direction is not None else []
+                    painted.lane_at(pos, direction, tracker=lane_track)
+                    if pos is not None and direction is not None
+                    else []
                 )
             else:
                 tech = tech_from_hit(None, None, None, None)

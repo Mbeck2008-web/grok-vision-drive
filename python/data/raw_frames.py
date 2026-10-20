@@ -170,7 +170,10 @@ def load_scene_rows(root: Path | str) -> list[dict[str, Any]]:
     """
     root = Path(root)
     rows = read_state_jsonl(root / "state.jsonl")
-    labels = read_state_jsonl(root / "gt.jsonl")
+    # GVD_GT_FILE=gt_painted.jsonl trains on the offline painted-lane relabel
+    # without touching the recorded gt.jsonl.
+    gt_name = os.environ.get("GVD_GT_FILE") or "gt.jsonl"
+    labels = read_state_jsonl(root / gt_name)
     by_index: dict[int, dict[str, Any]] = {}
     for label in labels:
         try:

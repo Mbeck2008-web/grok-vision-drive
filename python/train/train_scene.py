@@ -33,6 +33,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from python.data.raw_frames import LossyFramesError  # noqa: E402
+from python.train.event_mask import MaskFileError  # noqa: E402
 from python.data.strip_writer import CANVAS_H, CANVAS_W  # noqa: E402
 from python.train.continual import (  # noqa: E402
     CHUNK_MAX,
@@ -429,6 +430,32 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "With --mask-events, comma list of excursion.reason values whose abort rows are kept. "
             "Default empty: every abort row is masked whatever its reason."
+        ),
+    )
+    parser.add_argument(
+        "--mask-phases",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Leave out every row whose excursion.phase is weave, lane_change, abort or recover. "
+            "On by default with --mask-events (--no-mask-phases turns it off), off otherwise."
+        ),
+    )
+    parser.add_argument(
+        "--mask-files",
+        default="",
+        help=(
+            "Comma list of mask sidecars (JSON lines with a row id i), relative to the recording "
+            "folder. Every listed row is left out. A missing file or an i the recording does not "
+            "have stops the run."
+        ),
+    )
+    parser.add_argument(
+        "--mask-report",
+        action="store_true",
+        help=(
+            "Print the per-source mask lines and the union (rows, main frames, trainable main and "
+            "valid) and exit before any frame is read."
         ),
     )
     parser.add_argument(
@@ -1823,6 +1850,9 @@ def train_directory(
     backbone_lr_mult: float = 1.0,
     mask_events: bool = False,
     keep_abort_reasons: str = "",
+    mask_phases: bool | None = None,
+    mask_files: str = "",
+    mask_report_only: bool = False,
     usable_until: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     import torch
@@ -1866,6 +1896,28 @@ def train_directory(
     run_recordings = recordings_metadata(root, state_rows, usable_until)
     for item in run_recordings:
         print(f"[GVD] recording {describe_recording(item)}", flush=True)
+    use_phases = bool(mask_events) if mask_phases is None else bool(mask_phases)
+    masked_ids: set[int] | None = None
+    mask_meta: dict[str, Any] = {}
+    if mask_events or use_phases or mask_files:
+        from python.train.event_mask import describe, mask_report, row_masks
+
+        # Every source is computed on the full recording rows (before frame and
+        # camera filtering), so impact windows and settle runs see every tick.
+        mask_sources, masked_ids, event_counts = row_masks(
+            root, state_rows, events=bool(mask_events), phases=use_phases, files=mask_files,
+            keep_abort_reasons=keep_abort_reasons,
+        )
+        if mask_events:
+            print(f"[GVD] mask-events: {describe(event_counts, len(state_rows))}", flush=True)
+        mask_lines, mask_totals = mask_report(state_rows, mask_sources, masked_ids)
+        for line in mask_lines:
+            print(line, flush=True)
+        mask_meta = {"events": bool(mask_events), "phases": use_phases, "files": str(mask_files or ""),
+                     "keep_abort_reasons": str(keep_abort_reasons or ""),
+                     "sources": {name: len(ids) for name, ids in mask_sources}, **mask_totals}
+    if mask_report_only:
+        return {"mask_report": mask_meta}
     print("[GVD] scene index: measuring frames", flush=True)
 
     def _index_progress(n_frames: int, n_bytes: int) -> None:
@@ -1906,14 +1958,13 @@ def train_directory(
             "pass --cams with the 10 Hz cameras (e.g. main,narrow,wide) to keep those rows",
             flush=True,
         )
-    if mask_events:
-        from python.train.event_mask import describe, mask_event_rows
-
+    if masked_ids is not None:
         before = len(rows)
-        rows, event_counts = mask_event_rows(root, rows, keep_abort_reasons=keep_abort_reasons)
-        print(f"[GVD] mask-events: {describe(event_counts, before)}", flush=True)
+        from python.train.event_mask import drop_masked
+
         # A masked run is one gap; past MEMORY_S it resets the GRU.
-        rows = recompute_dt(rows)
+        rows = drop_masked(rows, masked_ids)
+        print(f"[GVD] masks: left out {before - len(rows)} of {before} rows with frames; {len(rows)} remain", flush=True)
     print(f"[GVD] scene index: training rows by recording {recording_counts(rows)}", flush=True)
     blank_scan = count_near_black_main(rows, cache, train_cams, input_scale)
     near_rule = (
@@ -2197,7 +2248,8 @@ def train_directory(
                   "net": {"backbone": str(backbone or ""), "scale": float(input_scale)},
                   "recordings": run_recordings,
                   "rows_by_recording": recording_counts(rows),
-                  "holdout": holdout_meta}
+                  "holdout": holdout_meta,
+                  "masks": mask_meta}
     append_metrics(debug_dir, run_record)
     # The pause checkpoint carries the contract (not the recordings/holdout detail).
     checkpoint_run = {key: run_record[key] for key in
@@ -3084,14 +3136,22 @@ def main(argv: list[str] | None = None) -> None:
             backbone_lr_mult=float(args.backbone_lr_mult),
             mask_events=bool(args.mask_events),
             keep_abort_reasons=str(args.keep_abort_reasons or ""),
+            mask_phases=args.mask_phases,
+            mask_files=str(args.mask_files or ""),
+            mask_report_only=bool(args.mask_report),
             usable_until=usable_flags,
         )
     except TrainFitError as exc:
         print(f"[GVD] scene train: {exc}")
         sys.exit(2)
+    except MaskFileError as exc:
+        print(f"[GVD] scene train: {exc}", flush=True)
+        sys.exit(2)
     except LossyFramesError as exc:
         print(f"[GVD] scene train: {exc}", flush=True)
         sys.exit(2)
+    if args.mask_report:
+        return
     if args.sanity and not args.dry_run and not stats.get("sanity_ok"):
         print("[GVD] sanity failed: lane_gt loss did not fall below 0.05", flush=True)
         sys.exit(1)

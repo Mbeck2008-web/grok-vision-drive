@@ -25,6 +25,15 @@
   teleport, recover or level load) and ``stall`` (under 1 m/s while the AI
   should move).
 
+``--mask-phases`` (on with ``--mask-events``) also masks every row whose
+``excursion.phase`` is ``weave``, ``lane_change``, ``abort`` or ``recover``.
+``--mask-files a.jsonl,b.jsonl`` masks the rows listed in offline mask
+sidecars next to the recording (one JSON object per line, row id in ``i``).
+A listed file that is missing, a line that is not JSON with an integer
+``i``, or an ``i`` the recording does not have raises ``MaskFileError``.
+``row_masks`` computes every source on the full recording rows and returns
+the masked row ids per source and their union.
+
 Read-only: nothing is written next to the recording.
 """
 
@@ -38,6 +47,11 @@ from typing import Any, Iterable, Mapping
 IMPACTS_FILE = "impacts.jsonl"
 ROW_FLAGS = ("settle", "stall")
 PRE_IMPACT_S = 3.0
+MASK_PHASES = ("weave", "lane_change", "abort", "recover")
+
+
+class MaskFileError(ValueError):
+    """A ``--mask-files`` sidecar is missing, malformed, or names a row the recording does not have."""
 
 
 def _num(value: Any) -> float | None:
@@ -239,3 +253,152 @@ def describe(counts: Mapping[str, Any], total: int) -> str:
         f"(by reason: {reasons}; {counts.get('abort_kept', 0)} kept by --keep-abort-reasons), "
         f"settle {counts.get('settle', 0)}, stall {counts.get('stall', 0)}"
     )
+
+def phase_mask(
+    rows: list[Mapping[str, Any]],
+    phases: Iterable[str] = MASK_PHASES,
+    *,
+    keep_abort_reasons: str | Iterable[str] | None = (),
+) -> list[bool]:
+    """Per-row True when ``excursion.phase`` is one of ``phases``.
+
+    An abort row whose reason is in ``keep_abort_reasons`` is left in, as in
+    ``event_mask``.
+    """
+    wanted = frozenset(phases)
+    keep = parse_reasons(keep_abort_reasons)
+    out: list[bool] = []
+    for row in rows:
+        phase = _phase(row)
+        out.append(phase in wanted and not (phase == "abort" and _abort_reason(row) in keep))
+    return out
+
+
+def parse_mask_files(value: str | Iterable[str] | None) -> tuple[str, ...]:
+    """``"a.jsonl,b.jsonl"`` or an iterable -> names in order, duplicates refused."""
+    if value is None:
+        return ()
+    items = value.split(",") if isinstance(value, str) else list(value)
+    names = tuple(str(item).strip() for item in items if str(item).strip())
+    if len(set(names)) != len(names):
+        raise MaskFileError(f"--mask-files lists a file twice: {','.join(names)}")
+    return names
+
+
+def read_mask_file(root: Path | str, name: str, known: set[int] | frozenset[int]) -> set[int]:
+    """Row ids listed in one sidecar (relative to ``root``). Every id must be in ``known``."""
+    path = Path(root) / name
+    if not path.is_file():
+        raise MaskFileError(f"mask file {name} not found in the recording folder")
+    ids: set[int] = set()
+    unknown: list[int] = []
+    with open(path, "r", encoding="utf-8") as handle:
+        for number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+                index = item["i"]
+                if isinstance(index, bool) or not isinstance(index, int):
+                    raise TypeError(index)
+            except (ValueError, KeyError, TypeError) as exc:
+                raise MaskFileError(f"mask file {name} line {number}: not a JSON object with an integer i ({exc!r})") from None
+            if index not in known:
+                unknown.append(index)
+            ids.add(index)
+    if unknown:
+        shown = ",".join(str(i) for i in unknown[:5]) + (" ..." if len(unknown) > 5 else "")
+        raise MaskFileError(f"mask file {name}: {len(unknown)} row id(s) not in the recording ({shown})")
+    return ids
+
+
+def _row_id(row: Mapping[str, Any]) -> int | None:
+    try:
+        return int(row.get("i"))
+    except (TypeError, ValueError):
+        return None
+
+
+def row_masks(
+    root: Path | str,
+    rows: list[Mapping[str, Any]],
+    *,
+    events: bool = False,
+    phases: bool = False,
+    files: Iterable[str] = (),
+    keep_abort_reasons: str | Iterable[str] | None = (),
+) -> tuple[list[tuple[str, set[int]]], set[int], dict[str, Any]]:
+    """(per-source masked row ids in order, their union, event counts).
+
+    ``rows`` are the full recording rows (before frame or camera filtering),
+    so impact windows and settle runs see every tick. Sources: ``events``
+    (``event_mask``), ``phases`` (``phase_mask``), then each mask file.
+    """
+    sources: list[tuple[str, set[int]]] = []
+    counts: dict[str, Any] = {}
+    ids = [_row_id(row) for row in rows]
+    if events:
+        mask, counts = event_mask(rows, read_impacts(root), keep_abort_reasons=keep_abort_reasons)
+        sources.append(("events", {i for i, drop in zip(ids, mask) if drop and i is not None}))
+    if phases:
+        mask = phase_mask(rows, keep_abort_reasons=keep_abort_reasons)
+        sources.append(("phases(" + ",".join(MASK_PHASES) + ")", {i for i, drop in zip(ids, mask) if drop and i is not None}))
+    names = parse_mask_files(files)
+    if names:
+        known = frozenset(i for i in ids if i is not None)
+        for name in names:
+            sources.append((f"file {name}", read_mask_file(root, name, known)))
+    union: set[int] = set()
+    for _name, masked in sources:
+        union |= masked
+    return sources, union, counts
+
+
+def _has_main(row: Mapping[str, Any]) -> bool:
+    cams = row.get("cams")
+    return isinstance(cams, Mapping) and bool(cams.get("main"))
+
+
+def _center_valid(row: Mapping[str, Any]) -> bool:
+    from python.debug.lane_targets import lane_center_is_valid
+
+    tech = row.get("tech")
+    return isinstance(tech, Mapping) and lane_center_is_valid(tech.get("lane_gt_valid"))
+
+
+def mask_report(
+    rows: list[Mapping[str, Any]], sources: list[tuple[str, set[int]]], union: set[int]
+) -> tuple[list[str], dict[str, int]]:
+    """One log line per source (rows and main frames it masks) and a union line.
+
+    A main frame is a row whose ``cams.main`` is set. Trainable valid counts
+    unmasked main frames whose 5 m and 10 m lane centres are valid.
+    """
+    main_ids = {i for i in (_row_id(r) for r in rows if _has_main(r)) if i is not None}
+    total = {"rows": len(rows), "main": len(main_ids)}
+    lines = []
+    for name, masked in sources:
+        lines.append(f"[GVD] mask source {name}: {len(masked)} rows, {len(masked & main_ids)} main frames")
+    masked_main = len(union & main_ids)
+    valid = sum(1 for r in rows if _has_main(r) and _row_id(r) not in union and _center_valid(r))
+    total.update(masked_rows=len(union), masked_main=masked_main, trainable_main=len(main_ids) - masked_main,
+                 trainable_valid=valid)
+    share = 100.0 * masked_main / max(1, len(main_ids))
+    lines.append(
+        f"[GVD] mask union: {len(union)} of {len(rows)} rows; {masked_main} of {len(main_ids)} main frames "
+        f"({share:.2f}%); trainable main {len(main_ids) - masked_main}, trainable valid "
+        f"(5 m + 10 m centre) {valid}"
+    )
+    return lines, total
+
+
+def drop_masked(rows: list[Mapping[str, Any]], masked: set[int] | frozenset[int]) -> list[dict[str, Any]]:
+    """``rows`` without the masked row ids, ``dt_s`` recomputed.
+
+    A masked run becomes one gap: past MEMORY_S it resets the GRU in
+    ``recording_spans`` and in the holdout forward (``eval_resets``), the same
+    as any other removal.
+    """
+    from python.train.scene_loader import recompute_dt
+
+    return recompute_dt([row for row in rows if _row_id(row) not in masked])

@@ -237,7 +237,44 @@ def build_parser() -> argparse.ArgumentParser:
         default=1.0,
         help="Downscale the canvas before the cache and the net. 1 keeps the recorded size.",
     )
+    parser.add_argument(
+        "--holdout-blocks",
+        type=int,
+        default=None,
+        help=(
+            "Hold out the last 20%% of each of K equal time blocks in a long segment, "
+            "with a 4 s gap on both sides of each slice. Default 1 (or GVD_HOLDOUT_BLOCKS) "
+            "is the single tail cut."
+        ),
+    )
+    parser.add_argument(
+        "--holdout-cells",
+        action="store_true",
+        help=(
+            "Spatial holdout: a seeded set of 250 m map cells with about 20%% of rows "
+            "(fast and slow cells in proportion) is scored, and train drops rows within "
+            "50 m of them. The list is saved and reused (see --holdout-cells-file)."
+        ),
+    )
+    parser.add_argument(
+        "--holdout-cells-file",
+        type=str,
+        default="",
+        help="Cell list JSON. Loaded when it exists, else chosen and written. Default: <status dir>/holdout_cells.json.",
+    )
+    parser.add_argument("--holdout-seed", type=int, default=0, help="Seed for choosing --holdout-cells.")
     return parser
+
+
+def resolve_holdout_blocks(value: int | None) -> int:
+    """CLI value, else ``GVD_HOLDOUT_BLOCKS``, else 1. Below 1 is an error."""
+    from python.train.continual import holdout_blocks_from_env
+
+    if value is None:
+        return holdout_blocks_from_env()
+    if int(value) < 1:
+        raise SystemExit("--holdout-blocks must be at least 1")
+    return int(value)
 
 
 def headless_requested() -> bool:
@@ -1203,6 +1240,10 @@ def train_directory(
     workers: int = 0,
     scale: float = 1.0,
     batch_size: int = 0,
+    holdout_blocks: int = 1,
+    holdout_cells: bool = False,
+    holdout_cells_file: Path | None = None,
+    holdout_seed: int = 0,
 ) -> dict[str, Any]:
     import torch
 
@@ -1235,6 +1276,35 @@ def train_directory(
         f"{excluded_rows} stationary or tipped",
         flush=True,
     )
+    cell_spec: dict[str, Any] | None = None
+    if holdout_cells:
+        from python.train.continual import (
+            cell_holdout_labels,
+            choose_holdout_cells,
+            load_holdout_cells,
+            save_holdout_cells,
+        )
+        from python.debug.remote_status import status_dir as _cells_status_dir
+
+        if int(holdout_blocks) > 1:
+            raise SystemExit("--holdout-cells and --holdout-blocks > 1 are separate modes; pick one")
+        cells_dir = _cells_status_dir(status_root) or root
+        cells_path = Path(holdout_cells_file) if holdout_cells_file else Path(cells_dir) / "holdout_cells.json"
+        if cells_path.is_file():
+            cell_spec = load_holdout_cells(cells_path)
+            print(f"[GVD] holdout cells: loaded {len(cell_spec['cells'])} cells from {cells_path}", flush=True)
+        else:
+            cell_spec = choose_holdout_cells(rows, seed=int(holdout_seed))
+            save_holdout_cells(cell_spec, cells_path)
+            print(f"[GVD] holdout cells: chose {len(cell_spec['cells'])} cells (seed {int(holdout_seed)}), saved {cells_path}", flush=True)
+        marks = cell_holdout_labels(rows, cell_spec)
+        print(
+            f"[GVD] holdout cells: train={marks.count('train')} holdout={marks.count('hold')} "
+            f"dropped={marks.count('gap')}",
+            flush=True,
+        )
+    elif int(holdout_blocks) > 1:
+        print(f"[GVD] holdout blocks: {int(holdout_blocks)}", flush=True)
     if free_vram_bytes is None:
         free_vram_bytes = read_free_vram_bytes()
     if free_ram_bytes is None:
@@ -1530,7 +1600,7 @@ def train_directory(
             from python.train.continual import epoch_windows
 
             plan_steps = epoch_windows(
-                pass_plan(rows, chunk_len, stride),
+                pass_plan(rows, chunk_len, stride, blocks=int(holdout_blocks), cells=cell_spec),
                 window_rng,
                 min_valid=float(min_valid),
                 balance=bool(balance),
@@ -2057,6 +2127,10 @@ def main(argv: list[str] | None = None) -> None:
             workers=default_num_workers() if args.workers is None else int(args.workers),
             scale=float(args.scale),
             batch_size=int(args.batch),
+            holdout_blocks=resolve_holdout_blocks(args.holdout_blocks),
+            holdout_cells=bool(args.holdout_cells),
+            holdout_cells_file=Path(args.holdout_cells_file) if args.holdout_cells_file else None,
+            holdout_seed=int(args.holdout_seed),
         )
     except TrainFitError as exc:
         print(f"[GVD] scene train: {exc}")

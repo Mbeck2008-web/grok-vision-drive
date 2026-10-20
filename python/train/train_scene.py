@@ -132,6 +132,15 @@ def effective_lrs(opt: Any) -> dict[str, float]:
     return out
 
 
+def recording_counts(rows: list[Mapping[str, Any]]) -> dict[str, int]:
+    """Rows per ``recording`` id (a plain folder's rows have none: ``-``)."""
+    out: dict[str, int] = {}
+    for row in rows:
+        key = str(row.get("recording") or "-")
+        out[key] = out.get(key, 0) + 1
+    return out
+
+
 def format_lrs(rates: Mapping[str, float]) -> str:
     return ",".join(f"{name}:{value:.3g}" for name, value in rates.items()) or "none"
 
@@ -161,6 +170,34 @@ def _maybe_jitter(frame: Any, augment: bool, rng: np.random.RandomState | None) 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train the GVD scene net from recorded strips")
     parser.add_argument("--strips", type=str, default="", help="Recording directory with state.jsonl and raw/<cam>/ frames. JPEG strips/ are refused.")
+    parser.add_argument(
+        "--recording",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help=(
+            "Train on several recordings: repeat once per recording folder (same rig). They are linked "
+            "(hard link, else byte copy; never re-encoded) into --combined-out, which is then trained like "
+            "--strips. Rows keep their recording id. Replaces --strips."
+        ),
+    )
+    parser.add_argument(
+        "--combined-out",
+        default="",
+        metavar="DIR",
+        help="New or empty folder for --recording (on the data disk; same volume for hard links).",
+    )
+    parser.add_argument(
+        "--usable-until",
+        action="append",
+        default=[],
+        metavar="NAME=ROW[:REASON]",
+        help=(
+            "Keep rows with i <= ROW of recording NAME (its folder name), e.g. "
+            "'rec5b=33661:stopped early (commit-thread failure), not finished'. Overrides that "
+            "recording's usable_until.json. Recorded in the run metadata."
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument(
@@ -1659,6 +1696,7 @@ def train_directory(
     backbone_lr_mult: float = 1.0,
     mask_events: bool = False,
     keep_abort_reasons: str = "",
+    usable_until: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     import torch
 
@@ -1682,6 +1720,25 @@ def train_directory(
     refuse_lossy(root)
     state_rows = load_scene_rows(root)
     print(f"[GVD] scene index: {len(state_rows)} state rows", flush=True)
+    from python.train.combine_recordings import (
+        COMBINED,
+        apply_cut,
+        describe_recording,
+        recordings_metadata,
+        resolve_cut,
+    )
+
+    if not (root / COMBINED).is_file():
+        # A plain folder honours its own cut; a combined folder was cut when it was linked.
+        own_cut = resolve_cut(root, usable_until)
+        if own_cut:
+            before_cut = len(state_rows)
+            state_rows = apply_cut(state_rows, own_cut)
+            print(f"[GVD] scene index: usable_until row {own_cut['max_i']} ({own_cut['reason']}): "
+                  f"kept {len(state_rows)} of {before_cut} rows", flush=True)
+    run_recordings = recordings_metadata(root, state_rows, usable_until)
+    for item in run_recordings:
+        print(f"[GVD] recording {describe_recording(item)}", flush=True)
     print("[GVD] scene index: measuring frames", flush=True)
 
     def _index_progress(n_frames: int, n_bytes: int) -> None:
@@ -1730,6 +1787,7 @@ def train_directory(
         print(f"[GVD] mask-events: {describe(event_counts, before)}", flush=True)
         # A masked run is one gap; past MEMORY_S it resets the GRU.
         rows = recompute_dt(rows)
+    print(f"[GVD] scene index: training rows by recording {recording_counts(rows)}", flush=True)
     blank_scan = count_near_black_main(rows, cache, train_cams, input_scale)
     near_rule = (
         f"mean<{NEAR_BLACK_MEAN} or >{NEAR_BLACK_FRAC:.0%} of px below {NEAR_BLACK_LEVEL}/255"
@@ -1943,7 +2001,9 @@ def train_directory(
     run_cams = list(train_cams or _ALL_CAMS)
     # Run metadata: the camera contract the export stamps as gvd_cams.
     append_metrics(debug_dir, {"kind": "run", "t": run_started, "cams": run_cams,
-                               "heads": list(train_heads or ()) or "all"})
+                               "heads": list(train_heads or ()) or "all",
+                               "recordings": run_recordings,
+                               "rows_by_recording": recording_counts(rows)})
     print(f"[GVD] run cams={','.join(run_cams)} (written to metrics.jsonl and the ONNX gvd_cams)", flush=True)
     write_heartbeat(
         debug_dir,
@@ -2698,6 +2758,31 @@ def main(argv: list[str] | None = None) -> None:
         path = export_scene_onnx(export_path, cams=cam_names, heads=head_names)
         print(f"[GVD] exported {path}")
         return
+    from python.train.combine_recordings import CombineError, combine_recordings, parse_usable_until
+
+    try:
+        usable_flags = parse_usable_until(args.usable_until)
+    except CombineError as exc:
+        print(f"[GVD] scene train: {exc}")
+        sys.exit(2)
+    if args.recording:
+        if args.strips or not args.combined_out:
+            print("[GVD] scene train: --recording needs --combined-out and replaces --strips")
+            sys.exit(2)
+        try:
+            for source in args.recording:
+                refuse_system_drive(source)
+            check_data_path(args.combined_out)
+            combined = combine_recordings(args.recording, args.combined_out, usable_until=usable_flags)
+        except (DataDriveError, CombineError) as exc:
+            print(f"[GVD] scene train: {exc}")
+            sys.exit(2)
+        print(
+            f"[GVD] combined {len(args.recording)} recordings into {args.combined_out}: rows={combined['rows']} "
+            f"files={combined.get('files')}",
+            flush=True,
+        )
+        args.strips = str(args.combined_out)
     if not args.strips:
         args.strips = str(scene_lanes_dir())
     try:
@@ -2753,6 +2838,7 @@ def main(argv: list[str] | None = None) -> None:
             backbone_lr_mult=float(args.backbone_lr_mult),
             mask_events=bool(args.mask_events),
             keep_abort_reasons=str(args.keep_abort_reasons or ""),
+            usable_until=usable_flags,
         )
     except TrainFitError as exc:
         print(f"[GVD] scene train: {exc}")

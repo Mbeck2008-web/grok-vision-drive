@@ -28,6 +28,10 @@
 (h) camera contract: the trained camera list goes into metrics.jsonl (run
     record) and the ONNX ``gvd_cams``; the live runtime refuses a model with
     no list or with a camera the supervisor does not feed.
+(i) several recordings train together through a combined folder of hard
+    links (byte copies across volumes; never re-encoded); each row keeps its
+    recording id, a per-recording usable_until cut is honoured, and the
+    metadata records the cut, its reason and whether the run finished.
 """
 from __future__ import annotations
 
@@ -528,7 +532,105 @@ def check_camera_contract() -> None:
           f"no gvd_cams refused; {live_note} OK")
 
 
+def _write_recording(root: Path, n: int, *, t0: float, pos=lambda i: (0.0, float(i)), value: int = 100,
+                     segment: str = "west_coast_usa#0") -> None:
+    import json
+
+    rows = []
+    for i in range(n):
+        for cam in ("main", "narrow", "wide"):
+            _png(root / "raw" / cam / f"{i:06d}.png", value)
+        x, y = pos(i)
+        rows.append({"i": i, "t": t0 + 0.1 * i, "segment": segment, "map": "west_coast_usa",
+                     "ego": {"speed_mps": 10.0, "damage": 0.0, "dir": [0.0, 1.0, 0.0], "pos": [x, y, 0.0]},
+                     "cams": {cam: {"file": f"raw/{cam}/{i:06d}.png"} for cam in ("main", "narrow", "wide")}})
+    (root / "state.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    (root / "gt.jsonl").write_text("".join(json.dumps({"i": r["i"], "t": r["t"], "tech": {"lane_gt": [0.0]}}) + "\n"
+                                           for r in rows), encoding="utf-8")
+    (root / "cameras.json").write_text(json.dumps({"cameras": [{"id": "main"}, {"id": "narrow"}, {"id": "wide"}]}),
+                                       encoding="utf-8")
+
+
+def check_multi_recording() -> None:
+    import json
+    import os
+
+    from python.train.combine_recordings import (
+        CombineError,
+        combine_recordings,
+        describe_recording,
+        parse_usable_until,
+        recordings_metadata,
+    )
+    from python.train.continual import recording_spans
+    from python.train.scene_loader import select_training_rows
+
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        a, b = tmp / "rec5b", tmp / "rec5c"
+        _write_recording(a, 12, t0=1000.0, value=90)
+        _write_recording(b, 8, t0=1000.5, value=200)  # overlapping clock: only the session splits them
+        (a / "collect.json").write_text(json.dumps({"state": "running", "done_s": 3605.0, "target_s": 14400.0}))
+        (b / "collect.json").write_text(json.dumps({"state": "done", "done_s": 14400.0, "target_s": 14400.0}))
+        (a / "impacts.jsonl").write_text(json.dumps({"kind": "impact", "t": 1000.3, "segment": "west_coast_usa#0"}) + "\n"
+                                         + json.dumps({"kind": "impact", "t": 1001.05, "segment": "west_coast_usa#0"}) + "\n")
+        (b / "usable_until.json").write_text(json.dumps({"max_i": 6, "reason": "sidecar cut"}))
+        flags = parse_usable_until(["rec5b=9:stopped early (commit-thread failure), not finished"])
+        out = tmp / "combined"
+        man = combine_recordings([a, b], out, usable_until=flags)
+        assert man["rows"] == 10 + 7, man["rows"]
+        recs = {r["id"]: r for r in man["recordings"]}
+        assert recs["rec5b"]["cut"] == {"max_i": 9, "reason": "stopped early (commit-thread failure), not finished",
+                                        "source": "flag"}
+        assert recs["rec5c"]["cut"]["max_i"] == 6 and recs["rec5c"]["cut"]["source"] == "usable_until.json"
+        assert recs["rec5b"]["finished"] is False and recs["rec5c"]["finished"] is True
+        line = describe_recording(recs["rec5b"])
+        assert line == ("rec5b: cut at row 9 (stopped early (commit-thread failure), not finished), "
+                        "not finished, 10 of 12 rows"), line
+        # Frames are links to the very same bytes: nothing decoded or re-encoded.
+        src = a / "raw" / "main" / "000003.png"
+        dst = out / "raw" / "main" / "000003.png"
+        assert dst.read_bytes() == src.read_bytes()
+        assert os.path.samefile(src, dst) and man["files"]["hardlink"] == 17 * 3 and man["files"]["copy"] == 0
+        assert (out / "raw" / "main" / "000010.png").read_bytes() == (b / "raw" / "main" / "000000.png").read_bytes()
+        rows = [json.loads(line) for line in (out / "state.jsonl").read_text().splitlines()]
+        assert [r["recording"] for r in rows] == ["rec5b"] * 10 + ["rec5c"] * 7
+        assert rows[10]["src_i"] == 0 and rows[10]["i"] == 10 and rows[10]["segment"] == "rec5c/west_coast_usa#0"
+        assert rows[10]["cams"]["main"]["file"] == "raw/main/000010.png"
+        gts = [json.loads(line) for line in (out / "gt.jsonl").read_text().splitlines()]
+        assert [g["i"] for g in gts] == list(range(17)) and gts[12]["recording"] == "rec5c"
+        imps = [json.loads(line) for line in (out / "impacts.jsonl").read_text().splitlines()]
+        assert [i["segment"] for i in imps] == ["rec5b/west_coast_usa#0"], "impact after the cut dropped"
+        kept, missing, _e = select_training_rows(out, rows)
+        assert missing == 0 and len(kept) == 17 and kept[10]["dt_s"] is None, kept[10]["dt_s"]
+        assert recording_spans(kept) == [(0, 10), (10, 17)]
+        assert recordings_metadata(out) == man["recordings"]
+        # Same sources and cuts: reused. Another cut into the same folder: refused, nothing overwritten.
+        assert combine_recordings([a, b], out, usable_until=flags) == man
+        try:
+            combine_recordings([a, b], out, usable_until={})
+            raise AssertionError("different combination written over the old one")
+        except CombineError as exc:
+            assert "different combination" in str(exc)
+        try:
+            combine_recordings([a, tmp / "x" / "rec5b"], tmp / "c2")
+            raise AssertionError("duplicate ids")
+        except CombineError:
+            pass
+        # A plain folder honours its own sidecar cut in the metadata too.
+        meta = recordings_metadata(b, rows=[{}] * 7)
+        assert meta[0]["cut"]["max_i"] == 6 and meta[0]["finished"] is True
+    from python.train.train_scene import build_parser
+
+    args = build_parser().parse_args(["--recording", "A", "--recording", "B", "--combined-out", "C",
+                                      "--usable-until", "rec5b=9:x", "--usable-until", "rec5c=6"])
+    assert args.recording == ["A", "B"] and args.combined_out == "C" and len(args.usable_until) == 2
+    print(f"(i) rec5b+rec5c combined by hard link (17x3 links, 0 re-encodes); ids kept per row; GRU resets "
+          f"between recordings; cut logged as '{line}' OK")
+
+
 def main() -> None:
+    check_multi_recording()
     check_camera_contract()
     check_cache_on_c()
     check_other_cams()

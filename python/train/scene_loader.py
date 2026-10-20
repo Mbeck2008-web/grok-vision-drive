@@ -72,15 +72,21 @@ def recompute_dt(rows: list) -> list:
     Run after every row removal (missing frames, no main picture, the event
     mask): a removed run becomes one gap, so a gap longer than the GRU
     memory resets the state in ``recording_spans`` and ``_eval_sequence``.
-    The first row, and a row after one without a timestamp, gets ``None``.
+    The first row, a row after one without a timestamp, and the first row of
+    another ``session`` (a combined folder's next recording) get ``None``.
     """
     out: list = []
     prev_t: float | None = None
-    for row in rows:
+    prev_session: object = None
+    for index, row in enumerate(rows):
         item = dict(row)
         stamp = _stamp(item.get("t"))
+        session = item.get("session")
+        if index and session != prev_session:
+            prev_t = None
         item["dt_s"] = None if prev_t is None or stamp is None else stamp - prev_t
         out.append(item)
+        prev_session = session
         if stamp is not None:
             prev_t = stamp
     return out

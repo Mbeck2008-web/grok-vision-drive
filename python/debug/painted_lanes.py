@@ -12,6 +12,10 @@ the car at each lookahead, in the vehicle frame (x right, y forward, origin
 at the state ``pos`` ref node). Each lookahead is intersected separately, so
 curves are modelled. No paint on one side means the slot is invalid (NaN,
 mask 0), never a synthetic 3.5 m guess.
+
+Paint more than ``Z_MAX_M`` above or below the car (a bridge deck, an
+underpass) and paint running more than ``HEADING_MAX_DEG`` off the car's
+heading (stop lines, crosswalk stripes) is ignored.
 """
 
 from __future__ import annotations
@@ -32,6 +36,12 @@ LANE_MIN_M = 2.4
 LANE_MAX_M = 5.0
 DOUBLE_LINE_M = 0.6
 SEARCH_M = 12.0
+# Paint on another deck: a bridge overhead or the road under an overpass.
+Z_MAX_M = 3.0
+# A lane line runs with the car. Stop lines and crosswalk bars run across it.
+HEADING_MAX_DEG = 45.0
+# The chosen lane's center must stay this close to the predicted center.
+TRACK_MAX_M = 2.5
 _CELL = 25.0
 
 
@@ -116,8 +126,23 @@ class PaintedLanes:
     def __bool__(self) -> bool:
         return len(self.segs) > 0
 
-    def lane_at(self, pos: Any, direction: Any, ys: tuple[float, ...] = LOOKAHEADS_M) -> list[tuple[float, float] | None]:
-        """``(left_x, right_x)`` of the painted ego lane at each ``y``, vehicle frame."""
+    def lane_at(
+        self,
+        pos: Any,
+        direction: Any,
+        ys: tuple[float, ...] = LOOKAHEADS_M,
+        *,
+        z_max_m: float | None = Z_MAX_M,
+        heading_max_deg: float | None = HEADING_MAX_DEG,
+    ) -> list[tuple[float, float] | None]:
+        """``(left_x, right_x)`` of the painted ego lane at each ``y``, vehicle frame.
+
+        The first lookahead takes the lane whose center is nearest the car.
+        Each later one takes the lane nearest the center extrapolated from
+        the previous two, so a curve that leaves the straight-ahead line is
+        still followed. ``z_max_m`` / ``heading_max_deg`` of None disable that
+        filter (diagnostics only). ``pos`` without a z skips the z filter.
+        """
         f = np.asarray([float(direction[0]), float(direction[1])])
         norm = float(np.hypot(*f))
         if norm < 1e-6:
@@ -129,32 +154,52 @@ class PaintedLanes:
         if not idx:
             return [None] * len(ys)
         s = self.segs[np.concatenate(idx)]
+        keep = np.ones(len(s), dtype=bool)
+        if z_max_m is not None and len(pos) >= 3 and pos[2] is not None:
+            zmid = 0.5 * (s[:, 2] + s[:, 5])
+            keep &= np.abs(zmid - float(pos[2])) <= float(z_max_m)
+        if heading_max_deg is not None:
+            d = s[:, 3:5] - s[:, :2]
+            dl = np.hypot(d[:, 0], d[:, 1])
+            cosang = np.abs(d @ f) / np.maximum(dl, 1e-9)
+            keep &= (dl > 1e-6) & (cosang >= math.cos(math.radians(float(heading_max_deg))))
+        s = s[keep]
+        if not len(s):
+            return [None] * len(ys)
         p0 = np.asarray([float(pos[0]), float(pos[1])])
         a, b = s[:, :2] - p0, s[:, 3:5] - p0
         ax, ay, bx, by = a @ r, a @ f, b @ r, b @ f
         out: list[tuple[float, float] | None] = []
-        track = 0.0
+        seen: list[tuple[float, float]] = []
         for y in ys:
+            if len(seen) >= 2:
+                (y0, c0), (y1, c1) = seen[-2], seen[-1]
+                pred = c1 + (c1 - c0) * (float(y) - y1) / (y1 - y0)
+            elif seen:
+                pred = seen[-1][1]
+            else:
+                pred = 0.0
             m = ((ay - y) * (by - y) <= 0.0) & (np.abs(by - ay) > 1e-6)
             hits = ax[m] + (y - ay[m]) * (bx[m] - ax[m]) / (by[m] - ay[m])
-            xs = np.sort(hits[np.abs(hits) < SEARCH_M])
+            xs = np.sort(hits[np.abs(hits - pred) < SEARCH_M])
             merged: list[float] = []
             for v in xs:
                 if merged and v - merged[-1] <= DOUBLE_LINE_M:
                     merged[-1] = 0.5 * (merged[-1] + float(v))
                 else:
                     merged.append(float(v))
-            left = [v for v in merged if v < track]
-            right = [v for v in merged if v >= track]
-            if not left or not right:
+            best: tuple[float, float, float] | None = None
+            for lx, rx in zip(merged, merged[1:]):
+                if not (LANE_MIN_M <= rx - lx <= LANE_MAX_M):
+                    continue
+                miss = abs(0.5 * (lx + rx) - pred)
+                if best is None or miss < best[0]:
+                    best = (miss, lx, rx)
+            if best is None or best[0] > TRACK_MAX_M:
                 out.append(None)
                 continue
-            lx, rx = max(left), min(right)
-            if not (LANE_MIN_M <= rx - lx <= LANE_MAX_M):
-                out.append(None)
-                continue
-            out.append((lx, rx))
-            track = 0.5 * (lx + rx)
+            out.append((best[1], best[2]))
+            seen.append((float(y), 0.5 * (best[1] + best[2])))
         return out
 
 

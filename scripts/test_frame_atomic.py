@@ -67,6 +67,11 @@ def check_temp_verify_rename_before_state() -> None:
         assert not list((root / "raw" / "main" / "000").glob("*.tmp")), "temp files left behind"
         rows = [json.loads(x) for x in (root / "state.jsonl").read_text(encoding="utf-8").splitlines()]
         assert [r["cams"]["main"]["file"] for r in rows] == ["raw/main/000/000000.png", "raw/main/000/000001.png"], rows
+    # raw_layout.json (the folder size) goes through the same temp/verify/rename first.
+    layout = [e for e in events if e[1].startswith("raw_layout.json")]
+    assert layout == [("atomic", "raw_layout.json", 0), ("verify", "raw_layout.json.tmp"), ("rename", "raw_layout.json.tmp", "raw_layout.json", False)], events
+    assert events[:3] == layout, events
+    events = events[3:]
     assert events[:3] == [("atomic", "000000.png", 0), ("verify", "000000.png.tmp"), ("rename", "000000.png.tmp", "000000.png", False)], events
     assert events[3] == ("atomic", "000001.png", 1), events  # frame 1 written while state holds only row 0
     print(f"atomic ok: {events[:3]}")

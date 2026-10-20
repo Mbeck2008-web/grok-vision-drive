@@ -22,6 +22,7 @@ from python.data import raw_frames  # noqa: E402
 from python.data.raw_frames import (  # noqa: E402
     RAW_FRAMES_PER_DIR,
     RawFrameWriter,
+    RawLayoutError,
     _used_indices,
     is_raw_frame_path,
     list_raw_images,
@@ -30,10 +31,13 @@ from python.data.raw_frames import (  # noqa: E402
     raw_camera_of,
     raw_frame_candidates,
     raw_image_counts,
+    raw_layout_path,
     raw_subdir_name,
+    read_raw_frames_per_dir,
     repaired_copies,
     row_has_decodable_frame,
     training_frame_bytes,
+    write_raw_layout,
 )
 from python.debug.dataset_check import validate_dataset  # noqa: E402
 from python.train.frame_cache import _read_cam  # noqa: E402
@@ -159,8 +163,8 @@ def check_nested_layout_reads() -> None:
         writer = RawFrameWriter(root, [], per_dir=2)
         for idx in range(5):
             writer.write({"main": _img(60 + idx), "narrow": _img(60 + idx)}, t=1.0 + 0.1 * idx)
-        # The loaders do not know per_dir=2. They search the numbered
-        # subfolders when the default subfolder and the flat name miss.
+        # The loaders read per_dir=2 from raw_layout.json; nothing is listed.
+        assert read_raw_frames_per_dir(root) == 2
         for idx in range(5):
             frames = load_raw_cameras(root, idx)
             assert sorted(frames) == ["main", "narrow"], (idx, sorted(frames))
@@ -202,11 +206,8 @@ def check_mixed_layout_after_upgrade() -> None:
 
 def check_paths_and_repair_mirror() -> None:
     raw = Path("rec") / "raw"
-    # No such folder on disk: only the two computed paths.
-    assert raw_frame_candidates(raw, "main", 12_345, ".png") == [
-        raw / "main" / raw_subdir_name(12_345) / "012345.png",
-        raw / "main" / "012345.png",
-    ]
+    # No recording on disk, no raw_layout.json: a flat recording, one path.
+    assert raw_frame_candidates(raw, "main", 12_345, ".png") == [raw / "main" / "012345.png"]
     flat = raw / "main" / "000001.png"
     nested = raw / "main" / "000" / "000001.png"
     assert raw_camera_of(flat) == "main" and raw_camera_of(nested) == "main"
@@ -247,6 +248,7 @@ def check_resume_across_folder_boundary() -> None:
         root = Path(tmp)
         shard = root / "raw" / "main" / "000"
         shard.mkdir(parents=True)
+        write_raw_layout(root, RAW_FRAMES_PER_DIR)  # what the stopped writer stored first
         blob = _png(70)
         lines = []
         for idx in range(last + 1):
@@ -345,7 +347,7 @@ def check_rec5c_size_flat_then_mixed() -> None:
         assert counts["raw_frames"] == n_flat and counts["per_cam"] == {"main": n_flat}
 
         # Loaders on the flat layout. A miss (no .npy, an index past the end)
-        # lists the 57,743-entry folder at most once, not on every lookup.
+        # costs a few stat calls: the 57,743-entry folder is never listed.
         listings = []
         real_scandir = os.scandir
 
@@ -365,7 +367,7 @@ def check_rec5c_size_flat_then_mixed() -> None:
                 assert _read_cam(root, "main", idx) is None, idx
         finally:
             raw_frames.os.scandir = real_scandir
-        assert listings.count(str(flat)) <= 1, len(listings)
+        assert listings.count(str(flat)) == 0, len(listings)
 
         # A new writer appends to it: mixed flat + raw/main/005/.
         writer = RawFrameWriter(root, [])
@@ -384,6 +386,157 @@ def check_rec5c_size_flat_then_mixed() -> None:
     print(f"flat {n_flat:,} frames: counts equal the old code; + 3 nested = {n_flat + 3:,}")
 
 
+def _count_listings():
+    """Patch os.scandir / os.listdir; returns (calls list, restore)."""
+    calls: list[str] = []
+    real_scandir, real_listdir = os.scandir, os.listdir
+
+    def scandir(path="."):
+        calls.append(str(path))
+        return real_scandir(path)
+
+    def listdir(path="."):
+        calls.append(str(path))
+        return real_listdir(path)
+
+    os.scandir, os.listdir = scandir, listdir
+
+    def restore() -> None:
+        os.scandir, os.listdir = real_scandir, real_listdir
+
+    return calls, restore
+
+
+def check_new_subfolder_found_with_frozen_mtime() -> None:
+    """A frame in a new 00N/ is found even when no folder mtime moved (FAT32: 2 s steps, dirs stale)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        writer = RawFrameWriter(root, [], per_dir=3)
+        for n in range(3):
+            writer.write({"main": _img(100 + n)}, t=1.0 + 0.1 * n)
+        old = 1_000_000_000
+        cam = root / "raw" / "main"
+        for path in (root, root / "raw", cam, cam / "000"):
+            os.utime(path, (old, old))
+        # A reader looks before the next folder exists: a miss.
+        assert load_raw_cameras(root, 3) == {}
+        assert _read_cam(root, "main", 3) is None
+        writer.write({"main": _img(103)}, t=1.3)
+        assert (cam / "001" / "000003.png").is_file()
+        for path in (root, root / "raw", cam, cam / "000", cam / "001"):
+            os.utime(path, (old, old))
+        assert cam.stat().st_mtime_ns == old * 10**9
+        calls, restore = _count_listings()
+        try:
+            assert int(load_raw_cameras(root, 3)["main"][5, 5, 0]) == 103
+            cam_img = _read_cam(root, "main", 3)
+            assert cam_img is not None and int(cam_img[5, 5, 0]) == 103
+            assert row_has_decodable_frame(root, {"i": 3, "cams": {"main": {}}})
+        finally:
+            restore()
+        assert str(cam) not in calls, calls
+    print("new 001/ found with every folder mtime frozen; camera folder not listed")
+
+
+def check_non_default_size_from_metadata() -> None:
+    """per_dir=7 is stored in raw_layout.json and every reader computes the path from it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        writer = RawFrameWriter(root, [], per_dir=7)
+        for n in range(16):
+            writer.write({"main": _img(n), "narrow": _img(n)}, t=1.0 + 0.1 * n)
+        layout = json.loads(raw_layout_path(root).read_text(encoding="utf-8"))
+        assert layout["raw_frames_per_dir"] == 7, layout
+        assert sorted(p.name for p in (root / "raw" / "main").iterdir()) == ["000", "001", "002"]
+        raw = root / "raw"
+        assert raw_frame_candidates(raw, "main", 15, ".png") == [raw / "main" / "002" / "000015.png", raw / "main" / "000015.png"]
+        assert raw_frame_candidates(raw, "main", 15, ".png") != raw_frame_candidates(raw, "main", 15, ".npy")
+        calls, restore = _count_listings()
+        try:
+            for idx in range(16):
+                assert int(load_raw_cameras(root, idx)["narrow"][5, 5, 0]) == idx, idx
+                cam = _read_cam(root, "main", idx)
+                assert cam is not None and int(cam[5, 5, 0]) == idx, idx
+        finally:
+            restore()
+        assert not [c for c in calls if c.startswith(str(raw / "main")) or c.startswith(str(raw / "narrow"))], calls
+        assert raw_image_counts(list_raw_images(root))["per_cam"] == {"main": 16, "narrow": 16}
+        # Resuming keeps the stored size; asking for another one is refused.
+        assert RawFrameWriter(root, [])._n == 16
+        assert RawFrameWriter(root, []).per_dir == 7
+        try:
+            RawFrameWriter(root, [], per_dir=10)
+        except ValueError as exc:
+            assert "raw_frames_per_dir=7" in str(exc), exc
+        else:
+            raise AssertionError("a different per_dir was accepted")
+    print("per_dir=7 read from raw_layout.json; no camera folder listed")
+
+
+def check_unsized_subfolders_refused() -> None:
+    """Numbered subfolders without raw_layout.json: every reader and the writer raise."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        writer = RawFrameWriter(root, [])
+        for n in range(3):
+            writer.write({"main": _img(n), "narrow": _img(n)}, t=1.0 + 0.1 * n)
+        raw_layout_path(root).unlink()
+        before = _snapshot(root / "raw")
+        attempts = {
+            "load_raw_cameras": lambda: load_raw_cameras(root, 1),
+            "load_raw_cameras(miss)": lambda: load_raw_cameras(root, 9),
+            "_read_cam": lambda: _read_cam(root, "main", 1),
+            "row_has_decodable_frame": lambda: row_has_decodable_frame(root, {"i": 1, "cams": {"main": {}}}),
+            "list_raw_images": lambda: list_raw_images(root),
+            "training_frame_bytes": lambda: training_frame_bytes(root),
+            "RawFrameWriter": lambda: RawFrameWriter(root, []),
+        }
+        for label, call in attempts.items():
+            try:
+                call()
+            except RawLayoutError as exc:
+                text = str(exc)
+                assert str(root) in text and "raw_layout.json" in text, (label, text)
+                assert "'main'" in text or "'narrow'" in text, (label, text)
+            else:
+                raise AssertionError(f"{label} read unsized subfolders without an error")
+        with tempfile.TemporaryDirectory() as out:
+            try:
+                validate_dataset(root, Path(out), montage_n=1)
+            except RawLayoutError:
+                pass
+            else:
+                raise AssertionError("validate_dataset read unsized subfolders without an error")
+        assert not raw_layout_path(root).exists(), "the refusing writer stored a guessed size"
+        assert _snapshot(root / "raw") == before
+    print("numbered subfolders + no raw_layout.json: loaders, counts, validator and writer refuse")
+
+
+def check_layout_written_before_frame_zero() -> None:
+    """raw_layout.json exists, complete, before the first frame byte is written."""
+    seen: list[tuple[str, int | None]] = []
+    real = raw_frames._write_bytes
+
+    def spy(path, payload):
+        root = Path(path).parents[3]
+        seen.append((Path(path).name, read_raw_frames_per_dir(root)))
+        return real(path, payload)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        writer = RawFrameWriter(root, [], per_dir=4)
+        assert read_raw_frames_per_dir(root) == 4
+        assert not list((root / "raw").rglob("*.png")), "a frame before any write"
+        assert not list(root.glob("*.tmp")), "layout temp file left behind"
+        raw_frames._write_bytes = spy
+        try:
+            writer.write({"main": _img(1)}, t=1.0)
+        finally:
+            raw_frames._write_bytes = real
+        assert seen == [("000000.png", 4)], seen
+    print("raw_layout.json is in place before frame 0 is written")
+
+
 def main() -> None:
     check_cap_fits_fat32()
     check_writer_rolls_over_and_file_is_real()
@@ -395,6 +548,10 @@ def main() -> None:
     check_resume_across_folder_boundary()
     check_writer_never_replaces_a_frame()
     check_rec5c_size_flat_then_mixed()
+    check_new_subfolder_found_with_frozen_mtime()
+    check_non_default_size_from_metadata()
+    check_unsized_subfolders_refused()
+    check_layout_written_before_frame_zero()
     print("test_raw_rollover OK")
 
 

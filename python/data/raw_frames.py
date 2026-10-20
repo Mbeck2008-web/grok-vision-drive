@@ -314,49 +314,107 @@ def raw_subdir_name(index: int, per_dir: int | None = None) -> str:
     return f"{int(index) // size:03d}"
 
 
-def raw_frame_candidates(raw: Path | str, cam: str, index: int, suffix: str) -> list[Path]:
-    """Where a frame can be: the subfolder layout first, then the old flat one.
+RAW_LAYOUT_FILE = "raw_layout.json"
 
-    Recordings made before the subfolders keep ``raw/<cam>/NNNNNN.png``.
-    Both layouts are read. The folder size is not stored in the recording,
-    so when neither path exists the numbered subfolders are searched: a
-    recording written with another ``RAW_FRAMES_PER_DIR`` still loads.
+
+class RawLayoutError(RuntimeError):
+    """A camera folder has numbered subfolders but the recording does not say their size."""
+
+
+def raw_layout_path(root: Path | str) -> Path:
+    return Path(root) / RAW_LAYOUT_FILE
+
+
+def read_raw_frames_per_dir(root: Path | str) -> int | None:
+    """Frames per subfolder stored in ``<root>/raw_layout.json``, or None.
+
+    The writer stores it before the first frame. None is a recording from
+    before the subfolders: every frame is flat in ``raw/<cam>/``. A file
+    that exists but does not hold a positive whole number is an error.
     """
-    folder = Path(raw) / str(cam)
-    name = f"{int(index):06d}{suffix}"
-    found = [folder / raw_subdir_name(index) / name, folder / name]
-    if any(path.is_file() for path in found) or not folder.is_dir():
-        return found
-    for sub in _numbered_subdirs(folder):
-        if (folder / sub / name).is_file():
-            found.append(folder / sub / name)
-    return found
-
-
-_SUBDIR_CACHE: dict[str, tuple[int, tuple[str, ...]]] = {}
-
-
-def _numbered_subdirs(folder: Path) -> tuple[str, ...]:
-    """Numbered subfolders of one camera folder, listed again only when it changes.
-
-    A flat camera folder of a long recording holds 57,743 frames. A slower
-    camera has no frame at many indices and a PNG recording has no ``.npy``,
-    so a miss is common. Listing the folder on every miss made one
-    ``load_raw_cameras`` call take hundreds of milliseconds on a flat
-    recording. The listing is kept until the folder's mtime changes.
-    """
+    path = raw_layout_path(root)
     try:
-        stamp = folder.stat().st_mtime_ns
-    except OSError:
-        return ()
-    key = str(folder)
-    hit = _SUBDIR_CACHE.get(key)
-    if hit is not None and hit[0] == stamp:
-        return hit[1]
-    with os.scandir(folder) as entries:
-        names = tuple(sorted(e.name for e in entries if e.name.isdigit() and e.is_dir()))
-    _SUBDIR_CACHE[key] = (stamp, names)
-    return names
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    try:
+        value = json.loads(text).get("raw_frames_per_dir")
+    except (ValueError, AttributeError) as exc:
+        raise RawLayoutError(f"{path}: unreadable raw layout ({exc})") from exc
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise RawLayoutError(f"{path}: raw_frames_per_dir must be a positive whole number, got {value!r}")
+    return int(value)
+
+
+def _is_numbered_dir(path: Path) -> bool:
+    return path.name.isdigit() and path.is_dir()
+
+
+def _refuse_unsized(root: Path, cam: str) -> RawLayoutError:
+    return RawLayoutError(
+        f"recording {root}: camera {cam!r} has numbered subfolders under raw/{cam}/ "
+        f"but {RAW_LAYOUT_FILE} is missing, so the frames per subfolder are unknown. "
+        "Refusing to guess a folder size or read it as a flat recording."
+    )
+
+
+def raw_frame_candidates(raw: Path | str, cam: str, index: int, suffix: str) -> list[Path]:
+    """Where a frame can be, computed from the recording's stored folder size.
+
+    With ``raw_layout.json``: ``raw/<cam>/<index // size>/<index>`` first, then
+    the flat name (frames a recording held before a new writer appended to
+    it). Without it the recording is flat, ``raw/<cam>/<index>``. No folder is
+    listed. When the flat frame is missing and the camera folder has a
+    ``000/`` or a default-size subfolder for this index, the recording is
+    nested with no stored size: that raises ``RawLayoutError``.
+    """
+    raw = Path(raw)
+    folder = raw / str(cam)
+    name = f"{int(index):06d}{suffix}"
+    flat = folder / name
+    per_dir = read_raw_frames_per_dir(raw.parent)
+    if per_dir is not None:
+        return [folder / raw_subdir_name(index, per_dir) / name, flat]
+    if not flat.is_file():
+        for sub in ("000", raw_subdir_name(index)):
+            if _is_numbered_dir(folder / sub):
+                raise _refuse_unsized(raw.parent, str(cam))
+    return [flat]
+
+
+def check_raw_layout(root: Path | str) -> int | None:
+    """Stored folder size, or None for a flat recording; raises for nested without a size.
+
+    Lists ``raw/`` and each camera folder once. For whole-recording walks
+    (counts, validation); per-frame lookups use ``raw_frame_candidates``.
+    """
+    root = Path(root)
+    per_dir = read_raw_frames_per_dir(root)
+    if per_dir is not None:
+        return per_dir
+    raw = root / "raw"
+    if not raw.is_dir():
+        return None
+    for cam in sorted(raw.iterdir()):
+        if not cam.is_dir():
+            continue
+        with os.scandir(cam) as entries:
+            if any(e.name.isdigit() and e.is_dir() for e in entries):
+                raise _refuse_unsized(root, cam.name)
+    return None
+
+
+def write_raw_layout(root: Path | str, per_dir: int) -> Path:
+    """Store the folder size once, atomically (temp file, verify, rename)."""
+    path = raw_layout_path(root)
+    payload = {
+        "kind": "gvd_raw_layout",
+        "raw_frames_per_dir": int(per_dir),
+        "path": "raw/<cam>/<index // raw_frames_per_dir as 3 digits>/<index>.<png|npy>",
+    }
+    # One line, no newline byte: nothing a text-mode write could expand.
+    write_atomic(path, json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    return path
 
 
 def raw_camera_of(path: Path | str) -> str | None:
@@ -518,11 +576,21 @@ class RawFrameWriter:
         per_dir: int | None = None,
     ) -> None:
         self.root = Path(root)
-        self.per_dir = int(per_dir or RAW_FRAMES_PER_DIR)
-        if self.per_dir < 1:
+        if per_dir is not None and int(per_dir) < 1:
             raise ValueError("per_dir must be at least 1")
+        # The folder size goes into raw_layout.json before any frame exists,
+        # so a reader never meets a subfolder without it. A recording that
+        # already has a size keeps it; one with unsized subfolders is refused.
+        stored = check_raw_layout(self.root)
+        if stored is not None and per_dir is not None and int(per_dir) != stored:
+            raise ValueError(
+                f"recording {self.root} stores raw_frames_per_dir={stored}; refusing per_dir={per_dir}"
+            )
+        self.per_dir = stored if stored is not None else int(per_dir or RAW_FRAMES_PER_DIR)
         self.raw = self.root / "raw"
         self.raw.mkdir(parents=True, exist_ok=True)
+        if stored is None:
+            write_raw_layout(self.root, self.per_dir)
         self.state_path = self.root / "state.jsonl"
         self.gt_path = self.root / "gt.jsonl"
         self.cameras = list(cameras or [])
@@ -801,6 +869,7 @@ def training_frame_bytes(
     root = Path(root)
     if not root.exists():
         return 0, 0
+    check_raw_layout(root)
     total = 0
     frames = 0
     for path in root.rglob("*"):
@@ -1010,6 +1079,7 @@ def list_raw_images(root: Path | str) -> list[Path]:
     raw = Path(root) / "raw"
     if not raw.is_dir():
         return []
+    check_raw_layout(root)
     found = []
     for path in raw.rglob("*"):
         if path.is_file() and path.suffix in {".png", ".npy"} and path.stem.isdigit():

@@ -36,10 +36,13 @@ Each camera is saved on its own, lossless, as BeamNG returned it:
 (any other dtype). `<NNN>` is the frame index divided by 10,000
 (`RAW_FRAMES_PER_DIR`), so frame 123456 is in `012\`. A FAT32 folder holds
 at most 65,536 entries, and a long name takes two, so no camera folder
-may grow to tens of thousands of files. Recordings made before the
-subfolders keep `raw\<cam>\NNNNNN.png`; every loader, the validator and
-the PNG repair read both layouts, and `cams.<cam>.file` in `state.jsonl`
-is the real relative path either way. No JPEG, resize, crop, colour change, overlay, or stitch
+may grow to tens of thousands of files. The writer stores the folder size
+in `raw_layout.json` (`raw_frames_per_dir`) before the first frame, and
+readers compute each path from it without listing a folder. Recordings
+made before the subfolders have no `raw_layout.json` and keep
+`raw\<cam>\NNNNNN.png`; a camera folder with numbered subfolders but no
+`raw_layout.json` is refused with an error, never guessed. `cams.<cam>.file`
+in `state.jsonl` is the real relative path either way. No JPEG, resize, crop, colour change, overlay, or stitch
 is written into those files. `state.jsonl` has the timestamps, `dt_s`,
 and the camera pose and intrinsics. Lane targets are `gt.jsonl`. The
 trainer stitches and resizes when it loads.

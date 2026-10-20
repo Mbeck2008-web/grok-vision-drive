@@ -32,6 +32,30 @@ is a smoke collect: if those PNGs do not decode, the process stops.
     py -3 scripts\\collect_scene_lanes.py --check-maps --list-levels
     py -3 scripts\\collect_scene_lanes.py --check-maps --maps west_coast_usa,italy,east_coast_usa,utah,jungle_rock_island
     py -3 scripts\\collect_scene_lanes.py --minutes 120 --maps west_coast_usa,italy,east_coast_usa,utah,jungle_rock_island --segment-min 12 --smoke-s 60 --speed-min 8 --speed-max 17
+
+West-coast spawns skip roads whose next 300 m has painted lanes on less than
+``--min-paint-cov`` of the probes (default 0.5, 0 disables). ``--weave-guard``
+keeps weaves off unpainted stretches and junctions, and ends an excursion when
+its 60 m ``ai.setLine`` runs out.
+
+Row fields in ``state.jsonl`` written by this collector, besides the frame data:
+
+* ``settle``: true for the first 3 s of recorded rows after a spawn, a
+  teleport, a recover, or a level load. Steering is still saturated there.
+* ``recover``: true on the first row after a recover teleport (one row).
+* ``stall``, ``stall_s``: the car is under 1 m/s while the AI should move,
+  and for how long so far. A stop at a sign is a short stall.
+* ``impact``, ``impact_decel_mps2``: the speed fell faster than 15 m/s^2
+  since the previous tick. The excursion is aborted; 2 s stopped respawns.
+* ``spawn_type``, ``spawn_paint_cov``: the west-coast spawn kind and its
+  measured paint coverage ahead (null when not measured).
+* ``ego.up``: the State sensor's up vector. ``ego.damage``: Damage sensor total.
+
+``impacts.jsonl`` beside ``state.jsonl`` has one ``{"kind": "impact", "t",
+"i", "pre_t0", "pre_i0", ...}`` line per impact and one ``{"kind":
+"impact_end", "t", "how"}`` line when it ends (``respawn``, ``drove_on``, or
+the abort reason). ``t`` matches the row ``t`` exactly; ``i`` is the row index
+the writer was expected to assign. A trainer masks rows in [pre_t0, end t].
 """
 from __future__ import annotations
 
@@ -269,7 +293,54 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="With --check-maps, print installed level names and which have a spawn table, then exit.",
     )
+    parser.add_argument(
+        "--min-paint-cov",
+        type=float,
+        default=0.5,
+        help=(
+            "West coast: skip a spawn whose next 300 m has a painted lane 10 m ahead on less than "
+            "this share of the 10 m probes. 0 disables."
+        ),
+    )
+    parser.add_argument(
+        "--weave-guard",
+        action="store_true",
+        help=(
+            "Start no weave with paint on under half the lookaheads or a side road within 40 m, "
+            "and end an excursion before its 60 m line runs out."
+        ),
+    )
     return parser
+
+
+def paint_share(tech: dict[str, Any] | None) -> float:
+    """Share of the painted lookaheads (5/10/20/30 m) with a valid lane center."""
+    valid = list((tech or {}).get("lane_gt_valid") or [])
+    slots = [valid[3 * k] for k in range(4) if 3 * k < len(valid)]
+    try:
+        return sum(1.0 for value in slots if float(value) > 0.5) / 4.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def weave_guard_reason(share: float, fork_m: float | None, min_share: float, junction_m: float) -> str:
+    """``open``, ``paint_ahead`` (too little paint ahead), or ``junction_ahead``."""
+    if float(share) < float(min_share):
+        return "paint_ahead"
+    if fork_m is not None and float(fork_m) < float(junction_m):
+        return "junction_ahead"
+    return "open"
+
+
+def polyline_length(points: list[tuple[float, float]] | None) -> float:
+    pts = list(points or [])
+    return sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(pts, pts[1:]))
+
+
+def append_jsonl(path: Path, record: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps(record, default=str) + "\n")
 
 
 def parse_map_weights(text: str) -> dict[str, float]:
@@ -315,7 +386,15 @@ def share_maps(maps: tuple[str, ...], weights: dict[str, float]) -> list[tuple[s
 # A second stall, tip, or damage hit ends the segment. The remainder of
 # that segment is reassigned, not lost. The same reason on three maps, or
 # real stall and settle seconds past this much of the plan, end the run.
-HARD_SEGMENT_REASONS = ("stationary", "tipped", "damage")
+HARD_SEGMENT_REASONS = ("stationary", "tipped", "damage", "impact")
+IMPACTS_FILE = "impacts.jsonl"
+# An excursion line is WINDOW_M (60 m) long. With --weave-guard the move ends
+# this far before the line runs out, instead of driving past its end.
+LINE_END_MARGIN_M = 5.0
+# A weave with --weave-guard needs this share of the painted lookaheads.
+WEAVE_GUARD_PAINT = 0.5
+# Rows recorded before saying the Damage sensor never reported.
+DAMAGE_WARN_ROWS = 300
 SEGMENT_FAIL_MAPS = 3
 RECOVER_LOST_FRACTION = 0.20
 
@@ -648,6 +727,14 @@ def enter_map(
         opened.vehicle.sensors.attach("electrics", Electrics())
     except Exception as exc:  # already attached, or an old BeamNGpy
         print(f"collect electrics attach: {type(exc).__name__}: {exc}", flush=True)
+    # Damage is its own sensor, not a State or Electrics field. Without it
+    # ego.damage was null on every row and the damage abort never fired.
+    try:
+        from beamngpy.sensors import Damage  # type: ignore
+
+        opened.vehicle.sensors.attach("damage", Damage())
+    except Exception as exc:  # already attached, or an old BeamNGpy
+        print(f"collect damage attach: {type(exc).__name__}: {exc}", flush=True)
     return opened
 
 
@@ -1014,9 +1101,25 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         clock = ExcursionClock()
-        from python.collect.liveness import Liveness, SETTLE_S, car_is_driving
+        from python.collect.liveness import (
+            ImpactWatch,
+            Liveness,
+            SETTLE_S,
+            SettleWindow,
+            TIP_DIR_Z_LIVE,
+            car_is_driving,
+        )
+        from python.collect.excursion import JUNCTION_AHEAD_M, fork_ahead_m
 
         live = Liveness()
+        impact = ImpactWatch()
+        settle = SettleWindow()
+        line_left_m: float | None = None
+        spawn_cov: float | None = None
+        damage_seen = False
+        damage_warned = False
+        row_base = getattr(getattr(writer, "writer", None), "_n", None)
+        weave_paint_min = float(args.min_paint_cov) if float(args.min_paint_cov) > 0.0 else WEAVE_GUARD_PAINT
         segment_aborts = 0
         recover_lost_s = 0.0
         schedule_cut = 0.0
@@ -1106,7 +1209,7 @@ def main(argv: list[str] | None = None) -> int:
             segment_aborts += 1
             print(f"collect abort {reason} segment={segment_id}", flush=True)
             last_error = f"{segment_id} {reason}"
-            stall_s = max(0.0, float(live.slow_s)) if reason == "stationary" else 0.0
+            stall_s = max(0.0, float(live.slow_s)) if reason in ("stationary", "impact") else 0.0
             if segment_aborts >= 2 and reason in HARD_SEGMENT_REASONS:
                 recover_lost_s += stall_s
                 action, schedule_cut, _skipped = continue_after_segment_end(
@@ -1182,6 +1285,8 @@ def main(argv: list[str] | None = None) -> int:
                     segment_open = False
                     spawn_pos = moved
                     mark_recover = True
+                    impact.reset()
+                    settle.start(done_s)
                     return None
             last_error = message
             save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
@@ -1192,7 +1297,7 @@ def main(argv: list[str] | None = None) -> int:
 
         def _apply_spawn(force: bool) -> None:
             """Teleport west coast to the next unused stratified spawn."""
-            nonlocal spawn_deck, spawn_kind, spawn_mark, spawn_pos, last_ai, segment_open, speed
+            nonlocal spawn_deck, spawn_kind, spawn_mark, spawn_pos, last_ai, segment_open, speed, spawn_cov
             if map_name != "west_coast_usa" or vehicle is None:
                 return
             if not force and (respawn_s <= 0.0 or done_s - spawn_mark < respawn_s):
@@ -1215,7 +1320,18 @@ def main(argv: list[str] | None = None) -> int:
                         dump = bundled
                 if dump is None:
                     return
-                spawn_deck = SpawnDeck.load(dump)
+                cov_min = max(0.0, float(args.min_paint_cov))
+                spawn_deck = SpawnDeck.load(
+                    dump,
+                    painted=painted if cov_min > 0.0 and painted else None,
+                    min_paint_cov=cov_min,
+                    log=lambda text: print(f"collect {text}", flush=True),
+                )
+                print(
+                    f"collect spawn deck paint filter "
+                    f"{'min_cov=' + format(cov_min, '.2f') if spawn_deck.filtering() else 'off'}",
+                    flush=True,
+                )
             picked = spawn_deck.take()
             if picked is None:
                 return
@@ -1227,8 +1343,11 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"collect spawn {segment_id} {picked.kind} failed {shift}", flush=True)
                 return
             spawn_kind = picked.kind
+            spawn_cov = picked.paint_cov
             spawn_mark = done_s
             spawn_pos = picked.pos
+            impact.reset()
+            settle.start(done_s)
             speed_span[0] = speeds_for(picked.speed[0], picked.speed[1])
             speed = speed_at(done_s, tuple(speed_span[0]))
             last_ai = None
@@ -1242,9 +1361,26 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"collect spawn {segment_id} {picked.kind} "
                 f"({picked.pos[0]:.1f},{picked.pos[1]:.1f},{picked.pos[2]:.1f}) "
-                f"speed={picked.speed[0]:.0f}-{picked.speed[1]:.0f} traffic={count}",
+                f"speed={picked.speed[0]:.0f}-{picked.speed[1]:.0f} traffic={count} "
+                f"paint_cov={'na' if picked.paint_cov is None else format(picked.paint_cov, '.2f')}",
                 flush=True,
             )
+
+        def _impact_end(how: str, t_end: float) -> None:
+            """Close an open impact in the sidecar so the trainer knows where the mask ends."""
+            if not impact.open:
+                return
+            append_jsonl(
+                out / IMPACTS_FILE,
+                {
+                    "kind": "impact_end",
+                    "t": round(float(t_end), 6),
+                    "how": str(how),
+                    "segment": segment_id,
+                    "since_impact_s": round(float(impact.since_impact or 0.0), 3),
+                },
+            )
+            impact.close()
 
         while done_s < target_s:
             if stop_file(out).is_file():
@@ -1295,6 +1431,9 @@ def main(argv: list[str] | None = None) -> int:
                 prev_dir = None
                 prev_dir_t = None
                 last_cam = {}
+                impact.reset()
+                settle.start(done_s)
+                line_left_m = None
                 if vary_env:
                     tod, sky = segment_env(seg_index)
                     sky_commands = environment_commands(tod, sky)
@@ -1355,6 +1494,13 @@ def main(argv: list[str] | None = None) -> int:
                     dir_z = float(direction[2])
                 except (TypeError, ValueError):
                     dir_z = None
+            up_vec = sample.get("up")
+            up_z = None
+            if isinstance(up_vec, (list, tuple)) and len(up_vec) >= 3:
+                try:
+                    up_z = float(up_vec[2])
+                except (TypeError, ValueError):
+                    up_z = None
             try:
                 speed_mps_f = None if sample.get("speed_mps") is None else float(sample.get("speed_mps"))
             except (TypeError, ValueError):
@@ -1414,7 +1560,7 @@ def main(argv: list[str] | None = None) -> int:
                     speed_mps_f or 0.0,
                     label_hit,
                 )
-            driving = car_is_driving(speed_mps_f, dir_z)
+            driving = car_is_driving(speed_mps_f, dir_z, up_z, TIP_DIR_Z_LIVE)
             if not segment_open:
                 if driving:
                     segment_open = True
@@ -1442,6 +1588,8 @@ def main(argv: list[str] | None = None) -> int:
                         dir_z,
                         damage_f,
                         ai_should_move=True,
+                        up_z=up_z,
+                        tip_z=TIP_DIR_Z_LIVE,
                     )
                     if why:
                         code = _abort(why)
@@ -1453,6 +1601,46 @@ def main(argv: list[str] | None = None) -> int:
                     time.sleep(tick_sleep_s(time.monotonic() - tick_mark, 0.1))
                     tick_dt = max(1e-3, time.monotonic() - tick_mark)
                     continue
+            # A crash shows as a speed drop between two ticks. Stop the move now
+            # and respawn if the car stays stopped, instead of the 10 s stall.
+            impact_decel = impact.update(tick_dt, speed_mps_f)
+            impact_event: dict[str, Any] | None = None
+            if impact_decel is not None:
+                pre_t, pre_i = impact.pre_window()
+                impact_event = {
+                    "kind": "impact",
+                    "t": round(float(now), 6),
+                    "i": None,
+                    "pre_t0": None if pre_t is None else round(float(pre_t), 6),
+                    "pre_i0": pre_i,
+                    "decel_mps2": round(float(impact_decel), 2),
+                    "speed_before_mps": impact.speed_before,
+                    "speed_after_mps": speed_mps_f,
+                    "segment": segment_id,
+                    "excursion": clock.phase,
+                    "pos": pos,
+                }
+                before_txt = "na" if impact.speed_before is None else format(impact.speed_before, ".1f")
+                after_txt = "na" if speed_mps_f is None else format(speed_mps_f, ".1f")
+                print(
+                    f"collect impact {segment_id} decel={impact_decel:.1f} m/s2 "
+                    f"v={before_txt}->{after_txt} excursion={clock.phase}",
+                    flush=True,
+                )
+                if clock.phase in ACTIVE:
+                    clock.force_abort("impact")
+                line_left_m = None
+            elif impact.drove_off():
+                _impact_end("drove_on", now)
+            if line_left_m is not None:
+                if clock.phase not in ACTIVE:
+                    line_left_m = None
+                else:
+                    line_left_m -= max(0.0, float(speed_mps_f or 0.0)) * tick_dt
+                    if line_left_m <= LINE_END_MARGIN_M:
+                        print(f"collect excursion {segment_id} {clock.phase} line end, back to lane", flush=True)
+                        clock.force_abort("line_end")
+                        line_left_m = None
             # Label from the painted lines the camera sees. The nav-spline hit
             # still drives the excursion controller below, but it is not a label:
             # road_invisible AI splines split into equal 1/1 lanes are not the paint.
@@ -1494,6 +1682,13 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     kind = "weave"
                     gate = weave
+                if args.weave_guard and gate == "open":
+                    gate = weave_guard_reason(
+                        paint_share(tech),
+                        fork_ahead_m(roads, hit, float(pos[0]), float(pos[1]), heading),
+                        weave_paint_min,
+                        JUNCTION_AHEAD_M,
+                    )
                 start_kind = kind
                 window_ok = gate == "open"
                 now_gate = time.monotonic()
@@ -1577,6 +1772,9 @@ def main(argv: list[str] | None = None) -> int:
                         last_error = f"{type(exc).__name__}: {exc}"
                 last_ai = ai_key
                 held_tag = resolved
+                if args.weave_guard:
+                    sent_line = path if excursions_on and not waypoint and resolved.phase in ACTIVE else None
+                    line_left_m = polyline_length(sent_line) if sent_line else None
                 print(
                     f"collect ai speed={speed:.0f} m/s route={waypoint or map_name or 'span'} "
                     f"excursion={resolved.phase}",
@@ -1589,8 +1787,20 @@ def main(argv: list[str] | None = None) -> int:
                 dir_z,
                 damage_f,
                 ai_should_move=not bool(waypoint),
+                up_z=up_z,
+                tip_z=TIP_DIR_Z_LIVE,
             )
+            if not why and impact.should_respawn():
+                print(
+                    f"collect impact {segment_id} stopped {impact.stall_s:.1f}s after the impact, respawning",
+                    flush=True,
+                )
+                why = "impact"
             if why:
+                if impact_event is not None:
+                    append_jsonl(out / IMPACTS_FILE, impact_event)
+                    impact_event = None
+                _impact_end("respawn" if why == "impact" else why, now)
                 for cid, prev in held:
                     if prev is None:
                         last_cam.pop(cid, None)
@@ -1609,9 +1819,19 @@ def main(argv: list[str] | None = None) -> int:
             }
             if spawn_kind:
                 tags["spawn_type"] = spawn_kind
+                tags["spawn_paint_cov"] = None if spawn_cov is None else round(float(spawn_cov), 3)
             if mark_recover:
                 tags["recover"] = True
                 mark_recover = False
+            if settle.active(done_s):
+                tags["settle"] = True
+            if live.slow_s > 0.0:
+                tags["stall"] = True
+                tags["stall_s"] = round(float(live.slow_s), 2)
+            if impact_decel is not None:
+                tags["impact"] = True
+                tags["impact_decel_mps2"] = round(float(impact_decel), 2)
+            row_i = None if row_base is None else int(row_base) + int(getattr(writer, "enqueued", 0) or 0)
             queued = writer.submit(
                 due,
                 t=now,
@@ -1622,6 +1842,7 @@ def main(argv: list[str] | None = None) -> int:
                     "damage": damage_f,
                     "pos": pos,
                     "dir": direction,
+                    "up": up_vec,
                     "x": None if pos is None else pos[0],
                     "y": None if pos is None else pos[1],
                 },
@@ -1631,6 +1852,19 @@ def main(argv: list[str] | None = None) -> int:
                 driver="beamng_ai",
                 tags=tags,
             )
+            if impact_event is not None:
+                impact_event["i"] = row_i if queued else None
+                append_jsonl(out / IMPACTS_FILE, impact_event)
+            if queued:
+                impact.note_row(now, row_i)
+            if damage_f is not None:
+                damage_seen = True
+            elif not damage_seen and not damage_warned and meter.frames >= DAMAGE_WARN_ROWS:
+                print(
+                    f"collect damage sensor not reporting after {meter.frames} rows; damage abort inactive",
+                    flush=True,
+                )
+                damage_warned = True
             if not queued:
                 for cid, prev in held:
                     if prev is None:
@@ -1864,7 +2098,23 @@ def _read_vehicle(vehicle: Any) -> dict[str, Any]:
             state["electrics"] = {str(k): data[k] for k in data}
     except Exception:
         pass
+    try:
+        sensors = getattr(vehicle, "sensors", None)
+        dmg = sensors["damage"] if sensors is not None else None
+        dmg_data = getattr(dmg, "data", dmg)
+        if state is not None and state.get("damage") is None and dmg_data is not None:
+            total = dmg_data.get("damage")
+            if total is not None:
+                state["damage"] = float(total)
+    except Exception:
+        pass
     sample = controls_from_state(state)
+    up = state.get("up") if isinstance(state, dict) else None
+    if isinstance(up, (list, tuple)) and len(up) >= 3:
+        try:
+            sample["up"] = [float(up[0]), float(up[1]), float(up[2])]
+        except (TypeError, ValueError):
+            pass
     if sample.get("pos") is None and isinstance(state, dict):
         pos = state.get("pos")
         if isinstance(pos, (list, tuple)) and len(pos) >= 3:

@@ -8,6 +8,9 @@ cannot run on this host is skipped, and the skip is printed:
 * ``# gvd-ci: requires beamng`` — skipped unless BeamNG.drive or BeamNG.tech
   is installed (a ``tech.key`` beside a Tech executable, or a Steam
   ``BeamNG.drive`` install). ``beamngpy`` on ``PYTHONPATH`` is not enough.
+* ``# gvd-ci: requires torch`` — skipped unless this interpreter can import
+  ``torch``. Only for a script with nothing to check without it; a script
+  with torch-free parts skips those parts itself and prints that.
 
 Lua scripts need ``lua5.1`` (then ``lua``). A missing interpreter fails the
 suite; it is not a skip.
@@ -35,6 +38,7 @@ sys.path.insert(0, str(SCRIPTS))
 from gvd_test_env import isolated_env, torch_hub_files  # noqa: E402
 MARKER_WINDOWS = "gvd-ci: requires windows"
 MARKER_BEAMNG = "gvd-ci: requires beamng"
+MARKER_TORCH = "gvd-ci: requires torch"
 TIMEOUT_S = 300
 
 
@@ -81,11 +85,19 @@ def _beamng_installed() -> bool:
     return False
 
 
+def _torch_installed() -> bool:
+    import importlib.util
+
+    return importlib.util.find_spec("torch") is not None
+
+
 def _skip_reason(path: Path) -> str | None:
     if _has_directive(path, MARKER_WINDOWS) and sys.platform != "win32":
         return "windows-only (marker); this host is not Windows"
     if _has_directive(path, MARKER_BEAMNG) and not _beamng_installed():
         return "BeamNG-dependent (marker); BeamNG is not installed"
+    if _has_directive(path, MARKER_TORCH) and not _torch_installed():
+        return "torch-dependent (marker); torch is not installed"
     return None
 
 

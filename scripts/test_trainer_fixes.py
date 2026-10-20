@@ -595,18 +595,31 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--real", default=os.environ.get("GVD_TEST_STRIPS", ""))
     args = ap.parse_args()
+    import importlib.util
+
+    # Without torch the trainer and net checks are skipped (printed); the rest still run.
+    has_torch = importlib.util.find_spec("torch") is not None
     check_black_rows()
-    summary = check_chunked_eval()
-    check_val_fields(summary)
-    check_bias_init()
+    if has_torch:
+        summary = check_chunked_eval()
+        check_val_fields(summary)
+        check_bias_init()
     check_map_mismatch()
     check_bootstrap()
-    check_backbone()
+    if has_torch:
+        check_backbone()
     check_near_black()
-    check_backbone_pool_and_lr()
+    if has_torch:
+        check_backbone_pool_and_lr()
     check_event_mask()
     check_event_mask_post_impact()
-    check_lossy_refused()
+    if has_torch:
+        check_lossy_refused()
+    else:
+        print(
+            "torch missing: skipped chunked_eval, val_fields, bias_init, backbone, "
+            "backbone_pool_and_lr, lossy_refused (they train or build a net)"
+        )
     if args.real:
         check_real(Path(args.real))
     print("test_trainer_fixes: all OK")

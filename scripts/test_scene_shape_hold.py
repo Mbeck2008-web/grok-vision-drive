@@ -187,10 +187,15 @@ def check_supervisor_wiring() -> None:
 
 
 def main() -> None:
+    import importlib.util
+
     check_mid_drive_hold()
     check_load_refuses_engage()
     check_supervisor_wiring()
-    check_real_graph_refused()
+    if importlib.util.find_spec("torch") is None:
+        print("real graph: skipped (torch missing; it builds and exports a net)")
+    else:
+        check_real_graph_refused()
     print("test_scene_shape_hold: OK")
 
 

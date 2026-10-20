@@ -13,6 +13,7 @@ them.
     py -3 scripts/test_pretrained_onnx.py
 """
 
+# gvd-ci: requires torch
 from __future__ import annotations
 
 import os

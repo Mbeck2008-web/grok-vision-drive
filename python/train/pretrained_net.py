@@ -235,10 +235,15 @@ def build_scene_net(
     backbone: str = "scratch",
     *,
     freeze: bool = False,
+    pretrained: bool = True,
 ) -> nn.Module:
-    """``SceneNet`` for ``scratch``, else the single-frame ImageNet baseline."""
+    """``SceneNet`` for ``scratch``, else the single-frame ImageNet baseline.
+
+    ``pretrained=False`` builds the same backbone with random weights and no
+    download; the offline tests use it.
+    """
     if backbone in (None, "", "scratch"):
         from python.train.scene_net import SceneNet
 
         return SceneNet(cams=cams, scale=scale)
-    return PretrainedSceneNet(cams=cams, scale=scale, backbone=backbone, freeze=freeze)
+    return PretrainedSceneNet(cams=cams, scale=scale, backbone=backbone, freeze=freeze, pretrained=pretrained)

@@ -4,7 +4,11 @@ Exports with the trainer's own exporter (``export_scene_onnx``, opset 17),
 runs ONNX Runtime on 2 frames and checks every output against torch within
 1e-4, and checks that the BGR->RGB swap and the ImageNet mean/std are inside
 the exported graph (so the runtime feeds the same BGR 0-1 canvas the trainer
-does). CPU only; writes only to a temp dir.
+does). CPU only; writes only to a temp dir. The backbones are built with
+``pretrained=False`` (random init, seeded, BatchNorm stats calibrated on
+random canvases): the export, the in-graph preprocessing and the shape
+checks do not depend on the ImageNet weights, so the test never downloads
+them.
 
     py -3 scripts/test_pretrained_onnx.py
 """
@@ -43,6 +47,31 @@ def _has_const(consts: list[np.ndarray], want: tuple[float, ...]) -> bool:
     return any(c.size == 3 and np.allclose(c.reshape(-1).astype(np.float32), w, atol=1e-6) for c in consts)
 
 
+def _calibrate_bn(net, seed: int = 0) -> None:
+    """Fill BatchNorm running stats from 8 seeded random canvases.
+
+    A random-init torchvision backbone keeps the default stats (mean 0,
+    var 1), and mobilenetv3's activations then shrink to ~1e-8 by the last
+    block, so every input gives the same output. One train-mode pass with a
+    cumulative average gives the stats a trained net would have. No grad,
+    no weight change, no download.
+    """
+    bns = [m for m in net.modules() if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)]
+    saved = [m.momentum for m in bns]
+    for m in bns:
+        m.reset_running_stats()
+        m.momentum = None
+    gen = torch.Generator().manual_seed(seed)
+    net.train()
+    for m in bns:
+        m.train()  # PretrainedSceneNet.train() keeps backbone BN in eval
+    with torch.no_grad():
+        net.features(torch.rand((8, 3, net.canvas_h, net.canvas_w), generator=gen))
+    for m, momentum in zip(bns, saved):
+        m.momentum = momentum
+    net.eval()
+
+
 def check(backbone: str, tmp: Path) -> None:
     import onnx
     import onnxruntime as ort
@@ -51,7 +80,8 @@ def check(backbone: str, tmp: Path) -> None:
     from python.train.scene_net import OUTPUT_FIELDS, export_scene_onnx
 
     torch.manual_seed(0)
-    net = build_scene_net(("main",), 1.0, backbone).eval()
+    net = build_scene_net(("main",), 1.0, backbone, pretrained=False)
+    _calibrate_bn(net)
     path = tmp / f"{backbone}.onnx"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -148,7 +178,7 @@ def check_wrong_size_graph(tmp: Path) -> None:
     from python.train.scene_lane_runtime import SceneInputShapeError, SceneLaneRuntime
     from python.train.scene_net import export_scene_onnx
 
-    net = build_scene_net(("main",), 0.5, "mobilenetv3").eval()
+    net = build_scene_net(("main",), 0.5, "mobilenetv3", pretrained=False).eval()
     path = tmp / "half.onnx"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")

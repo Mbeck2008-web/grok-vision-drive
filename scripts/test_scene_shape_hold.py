@@ -151,7 +151,7 @@ def check_real_graph_refused() -> None:
     from python.train.scene_net import export_scene_onnx
 
     with tempfile.TemporaryDirectory() as tmp:
-        net = build_scene_net(("main",), 0.5, "mobilenetv3").eval()
+        net = build_scene_net(("main",), 0.5, "mobilenetv3", pretrained=False).eval()
         path = Path(tmp) / "half.onnx"
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")

@@ -1037,8 +1037,68 @@ def _lane_gt_loss(
     conf_weight: float = 1.0,
 ) -> Any:
     """``conf_weight`` x confidence BCE plus the lookahead regression."""
+    if torch is None or pred.lane_gt is None or "lane_gt" not in target or "lane_gt_valid" not in target:
+        # No lane_gt term: hand ``zero`` back unchanged, unweighted.
+        return zero
     bce, reg = _lane_gt_parts(functional, pred, target, device, dtype, zero, lane_loss=lane_loss)
     return float(conf_weight) * bce + reg
+
+
+def has_lane_gt(labels: Mapping[str, Any] | None) -> bool:
+    """True when a row's labels carry at least one valid ``lane_gt`` slot."""
+    if not labels or "lane_gt_valid" not in labels:
+        return False
+    mask = labels["lane_gt_valid"]
+    if hasattr(mask, "detach"):
+        mask = mask.detach().cpu().numpy()
+    return bool(np.any(np.asarray(mask, dtype=np.float32) > 0.5))
+
+
+class LaneGtMissingError(RuntimeError):
+    """The ``lane_gt`` head is on, but no batch in an epoch had a lane_gt target."""
+
+
+class LaneGtCoverage:
+    """Count training batches without a ``lane_gt`` target, one epoch at a time.
+
+    A batch is missing lane_gt when none of its supervised rows has a valid
+    lane_gt slot; ``_lane_gt_loss`` returns ``zero`` for those rows. A mixed
+    epoch only logs the share. An epoch where every batch is missing it, with
+    the lane_gt head on, raises ``LaneGtMissingError``: that run would train
+    nothing on the head it reports.
+    """
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+        self.reset()
+
+    def reset(self) -> None:
+        self.batches = 0
+        self.missing = 0
+
+    def note(self, has_target: bool) -> None:
+        self.batches += 1
+        if not has_target:
+            self.missing += 1
+
+    def close_epoch(self, epoch: int) -> dict[str, Any]:
+        batches, missing = int(self.batches), int(self.missing)
+        share = (missing / batches) if batches else None
+        summary = {"epoch": int(epoch), "batches": batches, "missing": missing, "share": share}
+        self.reset()
+        if batches:
+            print(
+                f"[GVD] lane_gt missing epoch={int(epoch)} batches={missing}/{batches} "
+                f"share={share:.1%}" + ("" if self.enabled else " (lane_gt head off)"),
+                flush=True,
+            )
+        if self.enabled and batches and missing == batches:
+            raise LaneGtMissingError(
+                f"epoch {int(epoch)}: all {batches} training batches have no lane_gt target, but the "
+                "lane_gt head is on. The recording has no lane_gt / lane_offset_m fields; re-collect, "
+                "or pass --heads without lane_gt."
+            )
+        return summary
 
 
 def head_names(heads: tuple[str, ...] | list[str] | None) -> frozenset[str]:

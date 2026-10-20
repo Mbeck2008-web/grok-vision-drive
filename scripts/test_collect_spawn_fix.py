@@ -12,6 +12,7 @@ import io
 import json
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 import numpy as np
@@ -484,13 +485,10 @@ def _run_collector(vehicle_args: dict, extra: list[str], root: Path | None = Non
         tech.release_tech_beamngpy,
         gt_logger.load_road_polys,
         collect._attach_cameras,
-        collect.time.sleep,
-        collect.time.monotonic,
+        collect.time,
         collect.tick_sleep_s,
-        collect.code_pin,
     )
     clock = {"t": 0.0}
-    real_sleep, real_monotonic, real_pin = collect.time.sleep, collect.time.monotonic, collect.code_pin
 
     def sleep(seconds: float) -> None:
         clock["t"] += float(seconds or 0.0)
@@ -501,25 +499,19 @@ def _run_collector(vehicle_args: dict, extra: list[str], root: Path | None = Non
     level_roads = roads if roads is not None else [RoadPoly("r", [(0.0, 0.0), (0.0, 80.0)], 7.0)]
     gt_logger.load_road_polys = lambda session: (list(level_roads), "")  # type: ignore[assignment]
     collect._attach_cameras = lambda session, veh, cfg: (cams() if cams else {"main": _Cam()})  # type: ignore[assignment]
-    collect.time.sleep = sleep  # type: ignore[method-assign]
-    collect.time.monotonic = lambda: clock["t"]  # type: ignore[method-assign]
+    # The collector gets its own clock: a copy of the time module's public names with a fake sleep and
+    # monotonic. The real time module is left alone, so subprocess (code_pin's git calls), the writer
+    # threads and every other module keep the real clock. (Patching the shared module let
+    # subprocess.run's poll loop advance this fake clock while git ran, so a run started at a fake
+    # t anywhere from 0 to ~330 s and the float sums of 0.1 s ticks crossed CRUISE_S / ABORT_S a
+    # tick apart: the 1300-row nondeterminism.)
+    real_time = collect.time
+    collect.time = types.SimpleNamespace(  # type: ignore[assignment]
+        **{name: getattr(real_time, name) for name in dir(real_time) if not name.startswith("_")}
+    )
+    collect.time.sleep = sleep
+    collect.time.monotonic = lambda: clock["t"]
     collect.tick_sleep_s = lambda _elapsed, _period=0.1: 0.1  # type: ignore[method-assign]
-
-    def code_pin(*a, **k):
-        # The sleep / monotonic patches above are on the shared time module. code_pin's git calls
-        # (subprocess.run with a timeout) poll with time.sleep while git runs in real time
-        # (subprocess keeps its own real monotonic for the deadline), so each poll moved the fake
-        # clock by up to 0.05 s: a run started anywhere from 0 to ~330 s, depending on how long
-        # git took, and the float sums of 0.1 s ticks crossed CRUISE_S / ABORT_S a tick apart.
-        # Run it on the real clock.
-        fake = (collect.time.sleep, collect.time.monotonic)
-        collect.time.sleep, collect.time.monotonic = real_sleep, real_monotonic  # type: ignore[method-assign]
-        try:
-            return real_pin(*a, **k)
-        finally:
-            collect.time.sleep, collect.time.monotonic = fake  # type: ignore[method-assign]
-
-    collect.code_pin = code_pin  # type: ignore[assignment]
     raw_queue.RawWriteQueue = _DeepQueue  # type: ignore[misc]
     buf = io.StringIO()
     old = sys.stdout
@@ -537,10 +529,8 @@ def _run_collector(vehicle_args: dict, extra: list[str], root: Path | None = Non
             tech.release_tech_beamngpy,
             gt_logger.load_road_polys,
             collect._attach_cameras,
-            collect.time.sleep,
-            collect.time.monotonic,
+            collect.time,
             collect.tick_sleep_s,
-            collect.code_pin,
         ) = previous
         raw_queue.RawWriteQueue = base_queue  # type: ignore[misc]
     return code, buf.getvalue(), out

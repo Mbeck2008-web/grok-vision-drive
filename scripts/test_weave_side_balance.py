@@ -255,8 +255,11 @@ def _collector_run(stop_at: int, extra: list[str], raise_in_weave: int | None = 
     exception inside a weave (collect.main re-raises it; it is caught here). ``smoke``: the smoke check
     at --smoke-s fails and the run exits 5: "writer" (wait_empty gives False: the first exit) or
     "decode" (wait_empty gives True and decode_issues reports one: the second exit).
-    Every run also records, in PIN_CLOCKS, whether code_pin's git calls ran on the real clock."""
+    Every run also records, in PIN_CLOCKS, whether code_pin's git calls ran on the real clock, and in
+    TICK_CLOCKS, on every vehicle read, whether the shared time module still has the real sleep /
+    monotonic while the collector runs on the harness's fake clock."""
     import subprocess
+    import time
 
     import python.data.raw_queue as raw_queue
     import python.collect.excursion as excursion
@@ -287,15 +290,23 @@ def _collector_run(stop_at: int, extra: list[str], raise_in_weave: int | None = 
             caught.append(exc)
             return -1
 
-    real_sleep, real_run = collect.time.sleep, subprocess.run
+    real_sleep, real_monotonic, real_run, real_read = time.sleep, time.monotonic, subprocess.run, collect._read_vehicle
 
-    def _run(*a, **k):  # code_pin's git calls: the harness must give them the real clock
-        PIN_CLOCKS.append(collect.time.sleep is real_sleep)
+    def _real_clock() -> bool:
+        return time.sleep is real_sleep and time.monotonic is real_monotonic
+
+    def _run(*a, **k):  # code_pin's git calls: the real clock
+        PIN_CLOCKS.append(_real_clock())
         return real_run(*a, **k)
 
+    def _read(vehicle):  # every tick: the time module is untouched, the collector's own clock is fake
+        TICK_CLOCKS.append(_real_clock() and collect.time.sleep is not real_sleep
+                           and collect.time.monotonic is not real_monotonic)
+        return real_read(vehicle)
+
     previous = (collect.painted_for, excursion.WeaveStats, excursion.overspeed, collect.main, collect.decode_issues,
-                raw_queue.RawWriteQueue.wait_empty, subprocess.run)
-    subprocess.run = _run  # type: ignore[assignment]
+                raw_queue.RawWriteQueue.wait_empty, subprocess.run, collect._read_vehicle)
+    subprocess.run, collect._read_vehicle = _run, _read  # type: ignore[assignment]
     if smoke == "writer":
         raw_queue.RawWriteQueue.wait_empty = lambda self, timeout_s=30.0: False  # type: ignore[method-assign]
     elif smoke == "decode":
@@ -308,7 +319,8 @@ def _collector_run(stop_at: int, extra: list[str], raise_in_weave: int | None = 
                                              roads=[RoadPoly("r", [(0.0, 0.0), (0.0, 3000.0)], 7.0)])
     finally:
         (collect.painted_for, excursion.WeaveStats, excursion.overspeed, collect.main, collect.decode_issues,
-         raw_queue.RawWriteQueue.wait_empty, subprocess.run) = previous  # type: ignore[misc]
+         raw_queue.RawWriteQueue.wait_empty, subprocess.run, collect._read_vehicle) = previous  # type: ignore[misc]
+    assert _real_clock() and collect.time is time, "harness left the clock patched"
     if raise_in_weave is not None:
         assert code == -1 and len(caught) == 1, (code, caught, text[-3000:])
     else:
@@ -320,6 +332,7 @@ def _collector_run(stop_at: int, extra: list[str], raise_in_weave: int | None = 
 
 
 PIN_CLOCKS: list[bool] = []
+TICK_CLOCKS: list[bool] = []
 
 
 def _balanced(sides: dict) -> None:
@@ -350,8 +363,11 @@ def check_one_end_line_per_weave() -> list[str]:
             ("exception mid-weave", 260, [], 20, None, {"error"}))
     for label, stop_at, extra, raise_in_weave, smoke, reasons in runs:
         PIN_CLOCKS.clear()
+        TICK_CLOCKS.clear()
         text, sides, live, code = _collector_run(stop_at, extra, raise_in_weave, smoke)
         assert PIN_CLOCKS and all(PIN_CLOCKS), (label, PIN_CLOCKS)  # git ran on the real clock
+        # time.sleep / time.monotonic stayed real on every tick (only the collector's clock is fake)
+        assert len(TICK_CLOCKS) >= 100 and all(TICK_CLOCKS), (label, len(TICK_CLOCKS), TICK_CLOCKS.count(False))
         assert not re.search(r"weave abort (line_end|timeout)", text), text[-3000:]
         ends = re.findall(r"^collect excursion \S+ weave end (\S+) side=([LR])$", text, flags=re.M)
         starts = re.findall(r"^collect weave \S+ v_plan=.* side=([LR])$", text, flags=re.M)

@@ -62,11 +62,16 @@ def check_temp_verify_rename_before_state() -> None:
             writer.write({"main": _img()}, t=1.1)
         finally:
             raw_frames.write_atomic, binary_io.verify_written, binary_io.os.replace = real_atomic, real_verify, real_replace
-        png = root / "raw" / "main" / "000001.png"
+        png = root / "raw" / "main" / "000" / "000001.png"
         assert png.read_bytes().startswith(PNG_SIG)
-        assert not list((root / "raw" / "main").glob("*.tmp")), "temp files left behind"
+        assert not list((root / "raw" / "main" / "000").glob("*.tmp")), "temp files left behind"
         rows = [json.loads(x) for x in (root / "state.jsonl").read_text(encoding="utf-8").splitlines()]
-        assert [r["cams"]["main"]["file"] for r in rows] == ["raw/main/000000.png", "raw/main/000001.png"], rows
+        assert [r["cams"]["main"]["file"] for r in rows] == ["raw/main/000/000000.png", "raw/main/000/000001.png"], rows
+    # raw_layout.json (the folder size) goes through the same temp/verify/rename first.
+    layout = [e for e in events if e[1].startswith("raw_layout.json")]
+    assert layout == [("atomic", "raw_layout.json", 0), ("verify", "raw_layout.json.tmp"), ("rename", "raw_layout.json.tmp", "raw_layout.json", False)], events
+    assert events[:3] == layout, events
+    events = events[3:]
     assert events[:3] == [("atomic", "000000.png", 0), ("verify", "000000.png.tmp"), ("rename", "000000.png.tmp", "000000.png", False)], events
     assert events[3] == ("atomic", "000001.png", 1), events  # frame 1 written while state holds only row 0
     print(f"atomic ok: {events[:3]}")
@@ -92,7 +97,7 @@ def check_crash_mid_write_leaves_nothing() -> None:
             raise AssertionError("the write error must surface")
         finally:
             binary_io._write_all = real
-        folder = root / "raw" / "main"
+        folder = root / "raw" / "main" / "000"
         assert sorted(p.name for p in folder.iterdir()) == ["000000.png"], list(folder.iterdir())
         assert _state_lines(root) == 1
     print("crash mid-write: no torn frame, no temp, no state line")
@@ -116,7 +121,7 @@ def check_failed_verify_and_no_replace() -> None:
             raise AssertionError("a failed verify must surface")
         finally:
             binary_io.verify_written = real
-        folder = root / "raw" / "main"
+        folder = root / "raw" / "main" / "000"
         assert not folder.exists() or not list(folder.iterdir()), list(folder.iterdir())
         assert _state_lines(root) == 0
         # An existing frame is never replaced.

@@ -8,6 +8,7 @@ labels are a separate ``gt.jsonl``. Debug drawings never touch these files.
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Mapping
@@ -36,6 +37,19 @@ CAMERA_HZ = {
     "repeatR": 1.0,
     "rear": 1.0,
 }
+# Phase stagger, seconds after the schedule's anchor (the first tick of a
+# spawn). The 10 Hz cameras take every 0.1 s slot. The slow cameras sit on
+# different 0.1 s slots so their frames do not all land on one tick:
+# pillarL slots 1 and 6, pillarR 3 and 8, repeatL 0, repeatR 4, rear 7 (of
+# the ten slots in a second). A camera not listed starts on the anchor. A
+# phase longer than the camera's period wraps (``rates`` can change hz).
+CAMERA_PHASE_S = {
+    "pillarL": 0.1,
+    "pillarR": 0.3,
+    "repeatL": 0.0,
+    "repeatR": 0.4,
+    "rear": 0.7,
+}
 DRIVERS = ("beamng_ai", "gvd", "human")
 
 
@@ -52,16 +66,99 @@ def gb_per_hour(tick_bytes: int, hz: float) -> float:
     return float(tick_bytes) * float(hz) * 3600.0 / (1024.0 ** 3)
 
 
-def camera_due(cam_id: str, now_s: float, last_s: Mapping[str, float], rates: Mapping[str, float] | None = None) -> bool:
-    """True when this camera's period has elapsed. ``now_s`` is monotonic."""
-    table = CAMERA_HZ if rates is None else rates
-    hz = float(table.get(str(cam_id), 0.0))
-    if hz <= 0.0:
-        return False
-    prev = last_s.get(str(cam_id))
-    if prev is None:
-        return True
-    return (float(now_s) - float(prev)) + 1e-4 >= (1.0 / hz)
+# Float safety for the phase compares only: a few ulps of a monotonic clock
+# that has run for days. Not a slack.
+_PHASE_EPS_S = 1e-9
+
+
+class CameraSchedule:
+    """Phase-scheduled capture: each camera's frames sit on a fixed grid.
+
+    Camera ``c`` has phases ``anchor + CAMERA_PHASE_S[c] + n / hz``. The
+    anchor is the first tick after ``reset`` (a spawn or level load).
+
+    * A tick serves at most one phase per camera. After a frame the phase
+      moves by one period (``next_due += period``); a tick that is a little
+      early or late does not move the grid.
+    * A phase is served by the tick nearest to it: a tick takes it once the
+      phase is due, or when the phase is less than half a tick ahead (half
+      the last tick interval, never more than half the camera's period).
+      Without that rounding a tick 0.02 s before its phase skips and the
+      next tick serves the phase after: on rec5c's tick times that held
+      10 Hz cameras at 93.6% of the tick rate.
+    * Behind (a slow tick, a long gap): this tick's frame serves the oldest
+      owed phase, the other missed phases are dropped, and the next phase is
+      the first one after this tick. Missed phases are never made up. The
+      next grid phase can still fall on the following tick (a slow camera's
+      late frame after a gap, then its on-grid frame); that is one frame,
+      not a catch-up run.
+
+    The elapsed check this replaces (``now - last + 1e-4 >= 1/hz``)
+    restarted the period at every frame. The 0.1 s tick jitters, 44% of
+    rec5c's ticks came in under 0.1 s, and a 10 Hz camera skipped every
+    one of them: 5.85 Hz delivered at 8.94 Hz of state rows.
+    """
+
+    def __init__(
+        self,
+        rates: Mapping[str, float] | None = None,
+        phases: Mapping[str, float] | None = None,
+    ) -> None:
+        self.rates = {str(k): float(v) for k, v in (CAMERA_HZ if rates is None else rates).items()}
+        self.phases = {str(k): float(v) for k, v in (CAMERA_PHASE_S if phases is None else phases).items()}
+        self.reset()
+
+    def reset(self) -> None:
+        """Forget the grid. The next tick is the new anchor."""
+        self.anchor: float | None = None
+        self.next_due: dict[str, float] = {}
+        self.prev_tick: float | None = None
+        self._undo: dict[str, float | None] = {}
+
+    def _first_due(self, cid: str, period: float) -> float:
+        assert self.anchor is not None
+        return self.anchor + math.fmod(max(0.0, self.phases.get(cid, 0.0)), period)
+
+    def tick(self, now_s: float, cams: Any) -> list[str]:
+        """Cameras whose frame this tick takes. ``now_s`` is monotonic."""
+        now = float(now_s)
+        if self.anchor is None:
+            self.anchor = now
+        lead = 0.0 if self.prev_tick is None else max(0.0, now - self.prev_tick) / 2.0
+        self.prev_tick = now
+        self._undo = {}
+        taken: list[str] = []
+        for cam in cams:
+            cid = str(cam)
+            hz = self.rates.get(cid, 0.0)
+            if hz <= 0.0:
+                continue
+            period = 1.0 / hz
+            had = self.next_due.get(cid)
+            due_at = self._first_due(cid, period) if had is None else had
+            if now + min(lead, period / 2.0) + _PHASE_EPS_S < due_at:
+                continue
+            due_at += period
+            if due_at <= now + _PHASE_EPS_S:
+                # Behind by whole periods: drop the missed phases.
+                due_at += (math.floor((now + _PHASE_EPS_S - due_at) / period) + 1) * period
+                while due_at <= now + _PHASE_EPS_S:  # rounding in the floor above
+                    due_at += period
+            self._undo[cid] = had
+            self.next_due[cid] = due_at
+            taken.append(cid)
+        return taken
+
+    def undo(self, cams: Any = None) -> None:
+        """This tick was not written: its phases are still owed to the next tick."""
+        for cid, had in list(self._undo.items()):
+            if cams is not None and cid not in {str(c) for c in cams}:
+                continue
+            if had is None:
+                self.next_due.pop(cid, None)
+            else:
+                self.next_due[cid] = had
+            self._undo.pop(cid, None)
 
 
 def capture_plan(cfg: Mapping[str, Any] | None, ratio: float = PNG_RATIO_MAX) -> list[dict[str, Any]]:
@@ -195,6 +292,151 @@ def load_scene_rows(root: Path | str) -> list[dict[str, Any]]:
     return merged
 
 
+# Frames per camera subfolder: ``raw/<cam>/<NNN>/<index>.<ext>``.
+#
+# FAT32 caps one directory at 65,536 32-byte entries, and ``.`` and ``..``
+# take two of them. A name such as ``000123.png`` is a plain 8.3 name, so
+# Windows stores it in one entry (lower case is a flag bit), but a driver
+# that writes a long-name entry for every lower-case name uses two, which
+# caps a folder at 32,767 frames. The ``.tmp`` name of a frame in flight is
+# not 8.3 either and takes two entries until it is renamed. 10,000 frames
+# is at most 20,002 entries plus the files in flight on any driver, a third
+# of the limit. FAT also scans a directory front to back on every create
+# and lookup, so a folder of 10,000 is about six times shorter to scan than
+# the 57,743-frame camera folders of a long recording. The folder number is
+# ``index // RAW_FRAMES_PER_DIR``: frame 123456 is in ``012/``.
+RAW_FRAMES_PER_DIR = 10_000
+
+
+def raw_subdir_name(index: int, per_dir: int | None = None) -> str:
+    """Subfolder of one frame index under ``raw/<cam>/``."""
+    size = int(per_dir or RAW_FRAMES_PER_DIR)
+    return f"{int(index) // size:03d}"
+
+
+RAW_LAYOUT_FILE = "raw_layout.json"
+
+
+class RawLayoutError(RuntimeError):
+    """A camera folder has numbered subfolders but the recording does not say their size."""
+
+
+def raw_layout_path(root: Path | str) -> Path:
+    return Path(root) / RAW_LAYOUT_FILE
+
+
+def read_raw_frames_per_dir(root: Path | str) -> int | None:
+    """Frames per subfolder stored in ``<root>/raw_layout.json``, or None.
+
+    The writer stores it before the first frame. None is a recording from
+    before the subfolders: every frame is flat in ``raw/<cam>/``. A file
+    that exists but does not hold a positive whole number is an error.
+    """
+    path = raw_layout_path(root)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    try:
+        value = json.loads(text).get("raw_frames_per_dir")
+    except (ValueError, AttributeError) as exc:
+        raise RawLayoutError(f"{path}: unreadable raw layout ({exc})") from exc
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise RawLayoutError(f"{path}: raw_frames_per_dir must be a positive whole number, got {value!r}")
+    return int(value)
+
+
+def _is_numbered_dir(path: Path) -> bool:
+    return path.name.isdigit() and path.is_dir()
+
+
+def _refuse_unsized(root: Path, cam: str) -> RawLayoutError:
+    return RawLayoutError(
+        f"recording {root}: camera {cam!r} has numbered subfolders under raw/{cam}/ "
+        f"but {RAW_LAYOUT_FILE} is missing, so the frames per subfolder are unknown. "
+        "Refusing to guess a folder size or read it as a flat recording."
+    )
+
+
+def raw_frame_candidates(raw: Path | str, cam: str, index: int, suffix: str) -> list[Path]:
+    """Where a frame can be, computed from the recording's stored folder size.
+
+    With ``raw_layout.json``: ``raw/<cam>/<index // size>/<index>`` first, then
+    the flat name (frames a recording held before a new writer appended to
+    it). Without it the recording is flat, ``raw/<cam>/<index>``. No folder is
+    listed. When the flat frame is missing and the camera folder has a
+    ``000/`` or a default-size subfolder for this index, the recording is
+    nested with no stored size: that raises ``RawLayoutError``.
+    """
+    raw = Path(raw)
+    folder = raw / str(cam)
+    name = f"{int(index):06d}{suffix}"
+    flat = folder / name
+    per_dir = read_raw_frames_per_dir(raw.parent)
+    if per_dir is not None:
+        return [folder / raw_subdir_name(index, per_dir) / name, flat]
+    if not flat.is_file():
+        for sub in ("000", raw_subdir_name(index)):
+            if _is_numbered_dir(folder / sub):
+                raise _refuse_unsized(raw.parent, str(cam))
+    return [flat]
+
+
+def check_raw_layout(root: Path | str) -> int | None:
+    """Stored folder size, or None for a flat recording; raises for nested without a size.
+
+    Lists ``raw/`` and each camera folder once. For whole-recording walks
+    (counts, validation); per-frame lookups use ``raw_frame_candidates``.
+    """
+    root = Path(root)
+    per_dir = read_raw_frames_per_dir(root)
+    if per_dir is not None:
+        return per_dir
+    raw = root / "raw"
+    if not raw.is_dir():
+        return None
+    for cam in sorted(raw.iterdir()):
+        if not cam.is_dir():
+            continue
+        with os.scandir(cam) as entries:
+            if any(e.name.isdigit() and e.is_dir() for e in entries):
+                raise _refuse_unsized(root, cam.name)
+    return None
+
+
+def write_raw_layout(root: Path | str, per_dir: int) -> Path:
+    """Store the folder size once, atomically (temp file, verify, rename)."""
+    path = raw_layout_path(root)
+    payload = {
+        "kind": "gvd_raw_layout",
+        "raw_frames_per_dir": int(per_dir),
+        "path": "raw/<cam>/<index // raw_frames_per_dir as 3 digits>/<index>.<png|npy>",
+    }
+    # One line, no newline byte: nothing a text-mode write could expand.
+    write_atomic(path, json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    return path
+
+
+def raw_camera_of(path: Path | str) -> str | None:
+    """Camera id of a frame under ``raw/`` (or ``raw_repaired/``), either layout."""
+    file = Path(path)
+    parent = file.parent
+    if parent.parent.name in {"raw", "raw_repaired"}:
+        return parent.name
+    if parent.name.isdigit() and parent.parent.parent.name in {"raw", "raw_repaired"}:
+        return parent.parent.name
+    return None
+
+
+def is_raw_frame_path(path: Path | str) -> bool:
+    """True for ``raw/<cam>/N.ext`` and ``raw/<cam>/<NNN>/N.ext``."""
+    file = Path(path)
+    parent = file.parent
+    if parent.parent.name == "raw":
+        return True
+    return parent.name.isdigit() and parent.parent.parent.name == "raw"
+
+
 def _used_indices(root: Path) -> set[int]:
     used: set[int] = set()
     for row in read_state_jsonl(root / "state.jsonl"):
@@ -306,6 +548,19 @@ def _stamp_of(raw: Any) -> tuple[float | None, Any]:
     return None, None
 
 
+def _window_of(raw: Any) -> tuple[float | None, float | None]:
+    """Monotonic seconds right before and after the camera's BeamNG call."""
+    if not isinstance(raw, dict):
+        return None, None
+    out = []
+    for key in ("mono_before", "mono_after"):
+        try:
+            out.append(None if raw.get(key) is None else round(float(raw[key]), 6))
+        except (TypeError, ValueError):
+            out.append(None)
+    return out[0], out[1]
+
+
 class RawFrameWriter:
     """One directory of per-camera PNG or ``.npy`` files plus two JSONL logs.
 
@@ -313,10 +568,29 @@ class RawFrameWriter:
     ``gt.jsonl`` is the lane target. Pixels are not in either file.
     """
 
-    def __init__(self, root: Path | str, cameras: list[dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        root: Path | str,
+        cameras: list[dict[str, Any]] | None = None,
+        *,
+        per_dir: int | None = None,
+    ) -> None:
         self.root = Path(root)
+        if per_dir is not None and int(per_dir) < 1:
+            raise ValueError("per_dir must be at least 1")
+        # The folder size goes into raw_layout.json before any frame exists,
+        # so a reader never meets a subfolder without it. A recording that
+        # already has a size keeps it; one with unsized subfolders is refused.
+        stored = check_raw_layout(self.root)
+        if stored is not None and per_dir is not None and int(per_dir) != stored:
+            raise ValueError(
+                f"recording {self.root} stores raw_frames_per_dir={stored}; refusing per_dir={per_dir}"
+            )
+        self.per_dir = stored if stored is not None else int(per_dir or RAW_FRAMES_PER_DIR)
         self.raw = self.root / "raw"
         self.raw.mkdir(parents=True, exist_ok=True)
+        if stored is None:
+            write_raw_layout(self.root, self.per_dir)
         self.state_path = self.root / "state.jsonl"
         self.gt_path = self.root / "gt.jsonl"
         self.cameras = list(cameras or [])
@@ -396,11 +670,13 @@ class RawFrameWriter:
         dt_s = None if self._prev_t is None else round(t_store - self._prev_t, 6)
         cams: dict[str, Any] = {}
         for cam_id, payload, suffix, shape, dtype in encoded:
-            folder = self.raw / str(cam_id)
+            folder = self.raw / str(cam_id) / raw_subdir_name(idx, self.per_dir)
             final = folder / f"{idx:06d}{suffix}"
             _write_bytes(final, payload)
             self.stored_bytes += len(payload)
-            wall, sensor_t = _stamp_of(None if timestamps is None else timestamps.get(cam_id))
+            stamp = None if timestamps is None else timestamps.get(cam_id)
+            wall, sensor_t = _stamp_of(stamp)
+            mono_before, mono_after = _window_of(stamp)
             cam_dt = None
             prev = self._prev_cam_t.get(str(cam_id))
             if wall is not None and prev is not None:
@@ -412,6 +688,8 @@ class RawFrameWriter:
                 "file": str(final.relative_to(self.root)).replace("\\", "/"),
                 "t": wall,
                 "sensor_t": sensor_t,
+                "mono_before": mono_before,
+                "mono_after": mono_after,
                 "dt_s": cam_dt,
                 "shape": [int(v) for v in shape],
                 "dtype": str(dtype),
@@ -499,6 +777,10 @@ def repaired_copies(path: Path) -> list[Path]:
     if file.parent.parent.name == "raw":
         root = file.parent.parent.parent
         found.append(root / "raw_repaired" / file.parent.name / file.name)
+    elif is_raw_frame_path(file):
+        shard = file.parent
+        root = shard.parent.parent.parent
+        found.append(root / "raw_repaired" / shard.parent.name / shard.name / file.name)
     return found
 
 
@@ -572,10 +854,18 @@ def row_has_decodable_frame(
     except (TypeError, ValueError):
         return False
     raw = Path(root) / "raw"
-    stem = f"{index:06d}"
+    row_cams = row.get("cams") if isinstance(row.get("cams"), dict) else {}
 
     def _decodes(cam: str) -> bool:
-        return image_file_decodable(raw / cam / f"{stem}.png") or image_file_decodable(raw / cam / f"{stem}.npy")
+        meta = row_cams.get(cam) if isinstance(row_cams.get(cam), dict) else {}
+        rel = str(meta.get("file") or "")
+        if rel and image_file_decodable(Path(root) / rel):
+            return True
+        for suffix in (".png", ".npy"):
+            for path in raw_frame_candidates(raw, cam, index, suffix):
+                if image_file_decodable(path):
+                    return True
+        return False
 
     if cams:
         wanted = [str(cam) for cam in cams]
@@ -601,6 +891,7 @@ def training_frame_bytes(
     root = Path(root)
     if not root.exists():
         return 0, 0
+    check_raw_layout(root)
     total = 0
     frames = 0
     for path in root.rglob("*"):
@@ -608,7 +899,7 @@ def training_frame_bytes(
             continue
         if "raw_repaired" in path.parts:
             continue
-        if path.parent.parent.name == "raw" and path.suffix.lower() in {".png", ".npy"}:
+        if is_raw_frame_path(path) and path.suffix.lower() in {".png", ".npy"}:
             chosen = training_image_path(path)
             if chosen is None:
                 continue
@@ -675,15 +966,22 @@ def load_raw_cameras(root: Path | str, index: int) -> dict[str, np.ndarray]:
     for folder in raw.iterdir():
         if not folder.is_dir():
             continue
-        png = folder / f"{int(index):06d}.png"
-        npy = folder / f"{int(index):06d}.npy"
-        if png.is_file():
+        png = _first_file(raw_frame_candidates(raw, folder.name, index, ".png"))
+        npy = _first_file(raw_frame_candidates(raw, folder.name, index, ".npy"))
+        if png is not None:
             image = read_image_with_repair(png)
             if image is not None:
                 frames[folder.name] = image
-        elif npy.is_file():
+        elif npy is not None:
             frames[folder.name] = np.load(npy)
     return frames
+
+
+def _first_file(paths: list[Path]) -> Path | None:
+    for path in paths:
+        if path.is_file():
+            return path
+    return None
 
 
 class LossyFramesError(RuntimeError):
@@ -827,11 +1125,13 @@ def list_raw_images(root: Path | str) -> list[Path]:
     raw = Path(root) / "raw"
     if not raw.is_dir():
         return []
+    check_raw_layout(root)
     found = []
     for path in raw.rglob("*"):
         if path.is_file() and path.suffix in {".png", ".npy"} and path.stem.isdigit():
-            found.append(path)
-    return sorted(found)
+            if raw_camera_of(path) is not None:
+                found.append(path)
+    return sorted(found, key=lambda path: (raw_camera_of(path), int(path.stem), str(path)))
 
 
 def raw_image_counts(paths: list[Path]) -> dict[str, Any]:
@@ -842,7 +1142,7 @@ def raw_image_counts(paths: list[Path]) -> dict[str, Any]:
     """
     per_cam: dict[str, int] = {}
     for path in paths:
-        cam = path.parent.name
+        cam = raw_camera_of(path) or path.parent.name
         per_cam[cam] = per_cam.get(cam, 0) + 1
     if "main" in per_cam:
         ticks = int(per_cam["main"])
@@ -853,11 +1153,15 @@ def raw_image_counts(paths: list[Path]) -> dict[str, Any]:
     return {"raw_frames": ticks, "raw_files": int(sum(per_cam.values())), "per_cam": per_cam}
 
 
-def raw_count_issues(per_cam: Mapping[str, int]) -> list[str]:
+def raw_count_issues(per_cam: Mapping[str, int], schedules: int = 1) -> list[str]:
     """Cameras that share a planned rate should have the same file count.
 
     Pillars and the rear camera are slower on purpose, so they are not
-    compared with the 10 Hz cameras.
+    compared with the 10 Hz cameras. Cameras of one rate on the same phase
+    (``CAMERA_PHASE_S``) take the same ticks, so their counts match. Cameras
+    of one rate on staggered phases can differ by one frame per capture
+    schedule (``schedules``: the collector restarts the schedule at every
+    segment): the recording can stop between the two phases.
     """
     groups: dict[float, list[str]] = {}
     for cam in per_cam:
@@ -870,6 +1174,9 @@ def raw_count_issues(per_cam: Mapping[str, int]) -> list[str]:
             continue
         counts = {int(per_cam[cam]) for cam in cams}
         if len(counts) == 1:
+            continue
+        phases = {round(float(CAMERA_PHASE_S.get(cam, 0.0)) % (1.0 / hz), 9) for cam in cams}
+        if len(phases) > 1 and max(counts) - min(counts) <= max(1, int(schedules)):
             continue
         detail = ", ".join(f"{cam}={int(per_cam[cam])}" for cam in sorted(cams))
         issues.append(f"raw count mismatch at {hz:.0f} Hz ({detail})")

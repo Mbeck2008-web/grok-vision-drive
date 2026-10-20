@@ -125,23 +125,23 @@ def check_dataset_copies_do_not_touch_originals() -> None:
         root = Path(tmp)
         writer = RawFrameWriter(root, [])
         writer.write({"main": image}, t=1.0, tech=tech, driver="beamng_ai")
-        good = root / "raw" / "main" / "000000.png"
+        good = root / "raw" / "main" / "000" / "000000.png"
         original_good = good.read_bytes()
         assert original_good == encoded
-        bad = root / "raw" / "main" / "000001.png"
+        bad = root / "raw" / "main" / "000" / "000001.png"
         bad.write_bytes(_dumb(encoded))
-        junk = root / "raw" / "main" / "000002.png"
+        junk = root / "raw" / "main" / "000" / "000002.png"
         junk.write_bytes(b"not a png")
-        before = {path.name: path.read_bytes() for path in (root / "raw" / "main").glob("*.png")}
+        before = {path.name: path.read_bytes() for path in (root / "raw" / "main" / "000").glob("*.png")}
         code = repair_main([str(root)])
         assert code == 1
-        after = {path.name: path.read_bytes() for path in (root / "raw" / "main").glob("*.png")}
+        after = {path.name: path.read_bytes() for path in (root / "raw" / "main" / "000").glob("*.png")}
         assert after == before
-        assert not (root / "raw_repaired" / "main" / "000000.png").exists()
-        repaired = root / "raw_repaired" / "main" / "000001.png"
+        assert not (root / "raw_repaired" / "main" / "000" / "000000.png").exists()
+        repaired = root / "raw_repaired" / "main" / "000" / "000001.png"
         assert repaired.is_file()
         assert repaired.read_bytes() == encoded
-        assert not (root / "raw_repaired" / "main" / "000002.png").exists()
+        assert not (root / "raw_repaired" / "main" / "000" / "000002.png").exists()
         assert bad.read_bytes().startswith(b"\x89PNG\r\r\n\x1a")
         assert read_image_file(bad) is None
         loaded = read_image_with_repair(bad)
@@ -273,8 +273,8 @@ def check_windows_newline_regression() -> None:
             root = Path(tmp)
             writer = RawFrameWriter(root, [])
             writer.write({"main": colour, "wide": odd}, t=1.0)
-            png = (root / "raw" / "main" / "000000.png").read_bytes()
-            npy = (root / "raw" / "wide" / "000000.npy").read_bytes()
+            png = (root / "raw" / "main" / "000" / "000000.png").read_bytes()
+            npy = (root / "raw" / "wide" / "000" / "000000.npy").read_bytes()
             assert png == encoded
             assert png.startswith(PNG_SIG)
             import io
@@ -287,7 +287,7 @@ def check_windows_newline_regression() -> None:
             queue = RawWriteQueue(writer, max_depth=2, workers=1)
             assert queue.submit({"main": colour}, t=2.0)
             queue.close(timeout_s=10)
-            queued = (root / "raw" / "main" / "000001.png").read_bytes()
+            queued = (root / "raw" / "main" / "000" / "000001.png").read_bytes()
             assert queued == encoded
             strips = root / "strips_out"
             strip = StripWriter(strips)

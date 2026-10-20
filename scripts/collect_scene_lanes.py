@@ -916,6 +916,17 @@ def _line_args(
     )
 
 
+def _log_road_heights(level: str, roads: list[Any], logged: set[str]) -> None:
+    """``collect road heights <map> ...`` once per map (see ``road_heights_line``)."""
+    if not roads:
+        return
+    from python.debug.gt_geom import road_heights_line
+
+    line = road_heights_line(level, list(roads), logged)
+    if line is not None:
+        print(line, flush=True)
+
+
 def road_lanes(roads: list[Any], hit: object) -> int | None:
     road = road_for(roads, hit)
     if road is None:
@@ -1589,12 +1600,14 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         vehicle = None
         roads: list[Any] = []
         painted = PaintedLanes([])
+        heights_logged: set[str] = set()  # road_heights_line: once per map
         cams: dict[str, Any] = {}
         spawn_pos: tuple[float, float, float] | None = None
         if not map_names:
             opened = enter_map(bng, str(args.reload_level or ""), cam_cfg, {})
             vehicle, roads, cams, err = opened.vehicle, opened.roads, opened.cameras, opened.error
             painted = painted_for(str(args.reload_level or ""))
+            _log_road_heights(str(args.reload_level or ""), roads, heights_logged)
             if err or vehicle is None or not roads:
                 message = err or "no vehicle after load"
                 record_session_failure(status_root, message)
@@ -2216,6 +2229,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 opened = enter_map(bng, map_name, cam_cfg, cams)
                 vehicle, roads, cams, err = opened.vehicle, opened.roads, opened.cameras, opened.error
                 painted = painted_for(map_name)
+                _log_road_heights(map_name, roads, heights_logged)
                 if err or vehicle is None or not roads or not cams:
                     last_error = err or "no vehicle after load"
                     _save_progress(done_s, done_s if target_s == float("inf") else target_s)

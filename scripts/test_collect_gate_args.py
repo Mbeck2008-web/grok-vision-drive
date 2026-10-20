@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The excursion gate judges the line the start sends.
+"""The excursion gate judges the line the start sends, and road heights are per point.
 
 Pure Python: no BeamNG, no torch.
 
@@ -12,6 +12,9 @@ Pure Python: no BeamNG, no torch.
 * Inputs: the collector builds the gate's and the start's path inputs with
   one helper (``collect_scene_lanes._line_args``). For a weave and a lane
   change the two are equal field for field, the painted lane included.
+* Heights: ``parse_road_edges`` keeps a height per point, so one record
+  without a height costs that point, not the road. ``road_heights_line`` logs
+  once per map how many roads lack heights; on the west_coast_usa dump none do.
 """
 from __future__ import annotations
 
@@ -34,8 +37,18 @@ from python.collect.excursion import (  # noqa: E402
     gate_reason,
     sent_line_args,
 )
-from python.debug.gt_geom import RoadHit, RoadPoly  # noqa: E402
+from python.collect.road_dump import load_road_dump  # noqa: E402
+from python.debug.gt_geom import (  # noqa: E402
+    RoadHit,
+    RoadPoly,
+    height_coverage,
+    join_candidates,
+    parse_road_edges,
+    road_ahead_split,
+    road_heights_line,
+)
 
+ROADS_PATH = ROOT / "tests" / "fixtures" / "roads" / "west_coast_usa.json.gz"
 HALF_W = 0.9
 PAINT = (-1.75, 1.75)  # painted lane at the car, vehicle frame: 3.5 m wide
 V = 20.0  # m/s: wave 100 m, one half wave (50 m), so the weave goes to one side only
@@ -171,8 +184,84 @@ def check_same_args() -> list[str]:
     return out
 
 
+def _edge(x: float, y: float, z: float | None, with_edges_z: bool = True) -> dict:
+    mid = [x, y] if z is None else [x, y, z]
+    if not with_edges_z:
+        return {"middle": mid, "left": [x - 1.75, y], "right": [x + 1.75, y]}
+    ez = z if z is not None else None
+    left = [x - 1.75, y] if ez is None else [x - 1.75, y, ez]
+    right = [x + 1.75, y] if ez is None else [x + 1.75, y, ez]
+    return {"middle": mid, "left": left, "right": right}
+
+
+def check_heights() -> list[str]:
+    out = []
+    full = parse_road_edges("a", [_edge(0.0, 4.0 * k, 10.0 + k) for k in range(5)])
+    assert full is not None and full.z == [10.0, 11.0, 12.0, 13.0, 14.0], full
+    # One record without a height: only that point loses it.
+    edges = [_edge(0.0, 4.0 * k, 10.0 + k) for k in range(5)]
+    edges[2] = _edge(0.0, 8.0, None, with_edges_z=False)
+    part = parse_road_edges("b", edges)
+    assert part is not None and part.z == [10.0, 11.0, None, 13.0, 14.0], part.z
+    # A middle without a height takes the edges' mean height.
+    mid_only = [{"middle": [0.0, 4.0 * k], "left": [-1.75, 4.0 * k, 5.0], "right": [1.75, 4.0 * k, 7.0]}
+                for k in range(3)]
+    got = parse_road_edges("c", mid_only)
+    assert got is not None and got.z == [6.0, 6.0, 6.0], got.z
+    none = parse_road_edges("d", [_edge(0.0, 4.0 * k, None, with_edges_z=False) for k in range(3)])
+    assert none is not None and none.z is None
+    out.append("heights: one record without z costs one point ([10, 11, None, 13, 14]); "
+               "middle without z uses the edge mean; no z at all -> None")
+    cov = height_coverage([full, part, got, none])
+    assert (cov.roads, cov.roads_without, cov.roads_partial, cov.points, cov.points_without) == (4, 1, 1, 16, 4), cov
+    logged: set[str] = set()
+    line = road_heights_line("testmap", [full, part, got, none], logged)
+    assert line == ("collect road heights testmap roads=4 without=1 (25.0%) partial=1 (25.0%) "
+                    "points_without=4/16 (25.0%)"), line
+    assert road_heights_line("testmap", [full], logged) is None, "logged twice for one map"
+    assert road_heights_line("othermap", [full], logged) is not None
+    out.append(f"heights log once per map: {line}")
+    # The collector prints it through _log_road_heights, once per map.
+    seen: set[str] = set()
+    printed: list[str] = []
+    saved = collect.print if hasattr(collect, "print") else None
+    collect.print = lambda *a, **k: printed.append(" ".join(str(v) for v in a))  # type: ignore[attr-defined]
+    try:
+        collect._log_road_heights("testmap", [full, part], seen)
+        collect._log_road_heights("testmap", [full, part], seen)
+    finally:
+        if saved is None:
+            del collect.print  # type: ignore[attr-defined]
+        else:
+            collect.print = saved  # type: ignore[attr-defined]
+    assert printed == ["collect road heights testmap roads=2 without=0 (0.0%) partial=1 (50.0%) "
+                       "points_without=1/10 (10.0%)"], printed
+    # Real dump: every west_coast_usa road carries a height at every point.
+    roads, _payload = load_road_dump(ROADS_PATH)
+    wc = height_coverage(roads)
+    assert wc.roads > 1000 and wc.roads_without == 0 and wc.roads_partial == 0 and wc.points_without == 0, wc
+    out.append(f"heights, west_coast_usa dump: {road_heights_line('west_coast_usa', roads, set())}")
+    # Per point, not all-or-nothing: a road with a far point missing its
+    # height still refuses the stacked parking deck (890809 start, 890846
+    # one deck up). All-or-nothing dropped the whole road's z and took the deck.
+    byid = {r.road_id: r for r in roads}
+    road = byid["890809.0"]
+    (ax, ay), (bx, by) = road.xy[1], road.xy[0]
+    th = math.atan2(by - ay, bx - ax)
+    holed = replace(road, z=list(road.z[:-1]) + [None])
+    swapped = [holed if r.road_id == road.road_id else r for r in roads]
+    _t, cands = join_candidates(swapped, holed, bx, by, th)
+    upper = next(c for c in cands if c.road.road_id == "890846.0" and c.refused != "not_ahead")
+    assert upper.refused == "join_dz", upper
+    cont, _split = road_ahead_split(swapped, holed, bx, by, th)
+    assert cont is not None and cont.road_id == "890798.0", cont
+    out.append(f"heights, 890809 with its last point's z missing: 890846 still refused join_dz "
+               f"(dz {upper.dz_m:+.2f} m), walk takes 890798")
+    return out
+
+
 def main() -> None:
-    lines = check_direction() + check_same_args()
+    lines = check_direction() + check_same_args() + check_heights()
     for line in lines:
         print(line)
     print("collect gate args ok")

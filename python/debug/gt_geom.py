@@ -23,9 +23,11 @@ class RoadPoly:
     width_m: float
     # lanesLeft + lanesRight when the dump has them. 0 derives a count from width.
     lanes: int = 0
-    # Height of each ``xy`` point when every edge record carried one, else None.
-    # Only the join filter reads it (stacked garage floors share x, y).
-    z: list[float] | None = None
+    # Height of each ``xy`` point, per point: an entry is None where that edge
+    # record had no height. None when no record had one. Only the join filter
+    # reads it (stacked garage floors share x, y); a segment with a missing
+    # end height has no dz, so that one join is judged in plan only.
+    z: list[float | None] | None = None
 
 
 # A heading jump bigger than this in one tick is a different road, not a yaw.
@@ -242,6 +244,9 @@ def parse_road_edges(road_id: str, edges: object) -> RoadPoly | None:
         mid_z = _z3(mid_raw)
         if mid is None and left is not None and right is not None:
             mid = ((left[0] + right[0]) * 0.5, (left[1] + right[1]) * 0.5)
+            mid_z = None
+        if mid_z is None:
+            # A middle without a height still gets the edges' mean height.
             lz, rz = _z3(edge.get("left")), _z3(edge.get("right"))
             mid_z = None if lz is None or rz is None else 0.5 * (lz + rz)
         if mid is None:
@@ -263,8 +268,71 @@ def parse_road_edges(road_id: str, edges: object) -> RoadPoly | None:
         width = 2.0 * LANE_W_M
     if width < 2.0:
         width = LANE_W_M
-    z = None if any(value is None for value in zs) else [float(value) for value in zs]  # type: ignore[arg-type]
+    # Per point: one record without a height costs that point, not the road.
+    z = None if all(value is None for value in zs) else [None if v is None else float(v) for v in zs]
     return RoadPoly(road_id=str(road_id), xy=xy, width_m=float(width), z=z)
+
+
+@dataclass(frozen=True)
+class HeightCoverage:
+    """How much of a parsed road network carries heights (``RoadPoly.z``)."""
+
+    roads: int
+    roads_without: int  # no height at any point: no dz for any join on them
+    roads_partial: int  # some points without a height
+    points: int
+    points_without: int
+
+    @property
+    def roads_without_share(self) -> float:
+        return self.roads_without / self.roads if self.roads else 0.0
+
+    @property
+    def roads_partial_share(self) -> float:
+        return self.roads_partial / self.roads if self.roads else 0.0
+
+    @property
+    def points_without_share(self) -> float:
+        return self.points_without / self.points if self.points else 0.0
+
+
+def height_coverage(roads: list[RoadPoly]) -> HeightCoverage:
+    n = without = partial = points = points_without = 0
+    for road in roads:
+        n += 1
+        count = len(road.xy)
+        points += count
+        z = road.z
+        if z is None or len(z) != count:
+            without += 1
+            points_without += count
+            continue
+        missing = sum(1 for value in z if value is None)
+        points_without += missing
+        if missing == count:
+            without += 1
+        elif missing:
+            partial += 1
+    return HeightCoverage(n, without, partial, points, points_without)
+
+
+def road_heights_line(level: str, roads: list[RoadPoly], logged: set[str]) -> str | None:
+    """The once-per-map height log line, or None when ``level`` was logged already.
+
+    The join filter's dz check (JOIN_DZ_M) is skipped wherever a height is
+    missing, silently. This line says how often that is on this map.
+    """
+    key = str(level or "current")
+    if key in logged:
+        return None
+    logged.add(key)
+    cov = height_coverage(roads)
+    return (
+        f"collect road heights {key} roads={cov.roads} "
+        f"without={cov.roads_without} ({100.0 * cov.roads_without_share:.1f}%) "
+        f"partial={cov.roads_partial} ({100.0 * cov.roads_partial_share:.1f}%) "
+        f"points_without={cov.points_without}/{cov.points} ({100.0 * cov.points_without_share:.1f}%)"
+    )
 
 
 def lane_count(width_m: float) -> int:
@@ -553,7 +621,10 @@ def _z_on(road: RoadPoly, segment: int, t: float) -> float | None:
     z = road.z
     if z is None or len(z) != len(road.xy) or not 0 <= segment < len(z) - 1:
         return None
-    return float(z[segment]) + float(t) * (float(z[segment + 1]) - float(z[segment]))
+    za, zb = z[segment], z[segment + 1]
+    if za is None or zb is None:
+        return None
+    return float(za) + float(t) * (float(zb) - float(za))
 
 
 @dataclass
@@ -565,7 +636,7 @@ class JoinCandidate:
     end_m: float  # tip to that end point
     gap_m: float  # tip to its projection on the road: the jump the walk makes
     heading_rad: float  # |leave heading - tip heading|
-    dz_m: float | None  # projected point height - tip height; None without z
+    dz_m: float | None  # projected point height - tip height; None where either lacks z
     # None (a continuation), "join_gap", "join_heading", "join_dz", or
     # "not_ahead" (outside CONNECT_HEADING: a side road, never a continuation).
     refused: str | None

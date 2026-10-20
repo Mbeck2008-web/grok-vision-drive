@@ -10,18 +10,47 @@ the real home of the PC running the suite.
 ``TORCH_HOME`` points into the same folder, so a test that downloads
 pretrained weights is caught (``torch_hub_files``) instead of reusing a
 cache. Not a test itself: the suite only runs ``test_*`` files.
+
+``skip_check`` is how a script skips one check it cannot run on this host
+(torch missing, say): it prints the skip and appends it to the file named by
+``GVD_SKIP_LOG``, which the suite sets per script and counts in its tally, so
+a script that passes with checks skipped does not read as a plain pass.
 """
 from __future__ import annotations
 
 import contextlib
 import os
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 from typing import Iterator, Mapping
 
 # Env names a leftover shell value could point at a shared folder with.
 DROP = ("GVD_DOCS_DIR",)
+# Set by run_offline_suite per script: where skip_check records skipped checks.
+SKIP_LOG_ENV = "GVD_SKIP_LOG"
+SKIP_PREFIX = "SKIP-CHECK"
+
+
+def skip_check(name: str, reason: str) -> None:
+    """Skip one check, visibly: print it and record it for the suite tally."""
+    script = Path(sys.argv[0]).name if sys.argv and sys.argv[0] else "?"
+    line = f"{SKIP_PREFIX} {script} {name}: {reason}"
+    print(line, flush=True)
+    log = os.environ.get(SKIP_LOG_ENV)
+    if log:
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+
+
+def read_skips(log: Path) -> list[str]:
+    """The skip_check lines a script recorded (empty when it skipped nothing)."""
+    try:
+        text = Path(log).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    return [line for line in text.splitlines() if line.startswith(SKIP_PREFIX)]
 
 
 def isolated_env(base: Mapping[str, str], root: Path) -> dict[str, str]:

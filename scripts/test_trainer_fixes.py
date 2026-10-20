@@ -27,6 +27,7 @@ from pathlib import Path
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from gvd_test_env import skip_check  # noqa: E402
 
 import numpy as np  # noqa: E402
 
@@ -313,7 +314,7 @@ def check_backbone() -> None:
     try:
         import torchvision  # noqa: F401
     except ImportError:
-        print("backbone: torchvision not installed, skipped")
+        skip_check("backbone", "torchvision missing")
         return
     from python.train.pretrained_net import IMAGENET_MEAN, IMAGENET_STD, ImageNetPreprocess, PretrainedSceneNet
     from python.train.train_scene import pause_matches_stem, stamp_pause
@@ -376,7 +377,7 @@ def check_backbone_pool_and_lr() -> None:
     try:
         import torchvision  # noqa: F401
     except ImportError:
-        print("backbone pool/lr: torchvision not installed, skipped")
+        skip_check("backbone_pool_and_lr", "torchvision missing")
         return
     from python.train.pretrained_net import POOL_ROWS, PretrainedSceneNet, adaptive_pool
     from python.train.train_scene import _pin_optimizer_lr
@@ -616,10 +617,8 @@ def main() -> None:
     if has_torch:
         check_lossy_refused()
     else:
-        print(
-            "torch missing: skipped chunked_eval, val_fields, bias_init, backbone, "
-            "backbone_pool_and_lr, lossy_refused (they train or build a net)"
-        )
+        for name in ("chunked_eval", "val_fields", "bias_init", "backbone", "backbone_pool_and_lr", "lossy_refused"):
+            skip_check(name, "torch missing (it trains or builds a net)")
     if args.real:
         check_real(Path(args.real))
     print("test_trainer_fixes: all OK")

@@ -23,6 +23,7 @@ from pathlib import Path
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from gvd_test_env import skip_check  # noqa: E402
 
 import numpy as np  # noqa: E402
 
@@ -142,7 +143,7 @@ def check_end_to_end() -> None:
     from python.train.scene_net import torch_ready
 
     if not torch_ready():
-        print("end to end skipped (torch missing)")
+        skip_check("end_to_end", "torch missing")
         return
     import torch
 

@@ -23,6 +23,7 @@ from pathlib import Path
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from gvd_test_env import skip_check  # noqa: E402
 
 from python.control.actuate import DriveCommand, stop_command  # noqa: E402
 from python.train.scene_lane_runtime import (  # noqa: E402
@@ -193,7 +194,7 @@ def main() -> None:
     check_load_refuses_engage()
     check_supervisor_wiring()
     if importlib.util.find_spec("torch") is None:
-        print("real graph: skipped (torch missing; it builds and exports a net)")
+        skip_check("real_graph_refused", "torch missing (it builds and exports a net)")
     else:
         check_real_graph_refused()
     print("test_scene_shape_hold: OK")

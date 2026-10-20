@@ -11,6 +11,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from gvd_test_env import skip_check  # noqa: E402
 
 from python.data.strip_writer import CANVAS_H, CANVAS_W, SECTORS, STRIP_ORDER  # noqa: E402
 from python.train.cam_strip import (  # noqa: E402
@@ -182,7 +183,7 @@ def check_subset_forward_probe_and_export() -> None:
     from python.train.train_scene import _probe_cuda
 
     if not torch_ready():
-        print("subset forward skipped (torch missing)")
+        skip_check("subset_forward", "torch missing")
         return
     import torch
 
@@ -254,7 +255,7 @@ def check_spawn_loader_reads_cache() -> None:
     )
 
     if not torch_ready():
-        print("spawn loader skipped (torch missing)")
+        skip_check("spawn_loader", "torch missing")
         return
     import cv2
     from torch.utils.data import DataLoader
@@ -316,7 +317,7 @@ def check_sanity_overfits_cached_main() -> None:
     from python.train.train_scene import train_directory
 
     if not torch_ready():
-        print("sanity overfit skipped (torch missing)")
+        skip_check("sanity_overfit", "torch missing")
         return
     import cv2
 
@@ -426,7 +427,7 @@ def check_lane_position_learns() -> None:
     assert resolve_scene_batch(4, 8) == 4
     assert resolve_scene_batch(0, 0) == 1
     if not torch_ready():
-        print("lane position skipped (torch missing)")
+        skip_check("lane_position", "torch missing")
         return
     import torch
     import torch.nn.functional as functional

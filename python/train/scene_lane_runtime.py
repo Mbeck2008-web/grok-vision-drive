@@ -30,6 +30,27 @@ from python.train.scene_net import (
 SCENE_LANE_MIN_CONF = 0.40
 
 
+class SceneInputShapeError(ValueError):
+    """The ONNX graph's strip input and the live canvas disagree in size.
+
+    The exported graph has fixed input dims, and the ``--backbone`` net's
+    pooling bins are traced for the training canvas, so a different size can
+    never be fed or silently resized.
+    """
+
+
+def _base_name(name: str) -> str:
+    """``h.1`` -> ``h``: the tracer renames pass-through state inputs."""
+    return str(name).split(".", 1)[0]
+
+
+def _fixed_dims(shape: Any) -> tuple[int, ...] | None:
+    dims = tuple(shape or ())
+    if not dims or not all(isinstance(d, int) and d > 0 for d in dims):
+        return None
+    return tuple(int(d) for d in dims)
+
+
 def scene_lane_decision(
     lane_x: float | None,
     confidence: float | None,
@@ -100,7 +121,7 @@ class SceneLaneRuntime:
             self.session = None
             self.reason = "onnx has no lane_gt output; retrain and export"
             return
-        from python.data.strip_writer import CANVAS_W
+        from python.data.strip_writer import CANVAS_H, CANVAS_W
         from python.train.cam_strip import cams_from_metadata
 
         meta: dict[str, str] = {}
@@ -115,6 +136,26 @@ class SceneLaneRuntime:
             self.canvas_w = CANVAS_W
         self.token_dim = len(self.cams) * SECTOR_FEAT
         self.tokens = np.zeros((1, RESIDUAL_TOKENS, self.token_dim), dtype=np.float32)
+        inputs = {_base_name(item.name): item for item in self.session.get_inputs()}
+        strip_in = inputs.get("strip")
+        dims = None if strip_in is None else _fixed_dims(strip_in.shape)
+        want = (1, 3, int(CANVAS_H), int(self.canvas_w))
+        if dims is None or dims != want:
+            self.session = None
+            raise SceneInputShapeError(
+                f"{self.path}: strip input is {None if strip_in is None else list(strip_in.shape)}, "
+                f"the live canvas is {list(want)} (cams={','.join(self.cams)}, gvd_canvas_w={self.canvas_w}). "
+                "Re-export at the live canvas size; the graph has fixed dims and is never resized."
+            )
+        # State tensors take the graph's own shapes (the --backbone net carries a 1-wide token).
+        for key in ("h", "tokens", "mask"):
+            item = inputs.get(key)
+            shape = None if item is None else _fixed_dims(item.shape)
+            if shape is not None and shape != tuple(getattr(self, key).shape):
+                fill = float(RESIDUAL_S) + 1.0 if key == "mask" else 0.0
+                setattr(self, key, np.full(shape, fill, dtype=np.float32))
+        if "tokens" in inputs:
+            self.token_dim = int(self.tokens.shape[-1])
         self.ready = True
         self.reason = "ok"
 
@@ -127,7 +168,12 @@ class SceneLaneRuntime:
         prepared = prepare_model_strip(np.asarray(strip_bgr), self.cams, self.canvas_w)
         image = None if prepared is None else _strip_nchw(prepared, width=self.canvas_w)
         if image is None:
-            return None, 0.0
+            from python.data.strip_writer import CANVAS_H
+
+            raise SceneInputShapeError(
+                f"live strip {tuple(np.asarray(strip_bgr).shape)} does not give the model canvas "
+                f"{CANVAS_H}x{self.canvas_w}x3 (cams={','.join(self.cams)}); it is not resized to fit"
+            )
         dt = np.asarray([0.0 if dt_s is None else float(dt_s)], dtype=np.float32)
         feeds = {
             "strip": image,
@@ -136,12 +182,12 @@ class SceneLaneRuntime:
             "tokens": self.tokens,
             "mask": self.mask,
         }
-        feeds = {name: feeds[name] for name in self._input_names if name in feeds}
+        feeds = {name: feeds[_base_name(name)] for name in self._input_names if _base_name(name) in feeds}
         try:
             outputs = self.session.run(None, feeds)
         except Exception:
             return None, 0.0
-        by_name = {name: value for name, value in zip(self._output_names, outputs)}
+        by_name = {_base_name(name): value for name, value in zip(self._output_names, outputs)}
         vector = np.asarray(by_name.get("lane_gt"), dtype=np.float32).reshape(-1)
         if vector.size < LANE_GT_DIM:
             return None, 0.0

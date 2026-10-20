@@ -75,6 +75,8 @@ def check(backbone: str, tmp: Path) -> None:
 
     sess = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
     names = [i.name for i in sess.get_inputs()]
+    strip_dims = list(sess.get_inputs()[0].shape)
+    assert strip_dims == [1, 3, net.canvas_h, net.canvas_w], strip_dims  # fixed dims, no dynamic axes
     rng = np.random.default_rng(1)
     worst = 0.0
     lane_outs = []
@@ -107,18 +109,64 @@ def check(backbone: str, tmp: Path) -> None:
     moved = float(np.abs(sess.run(None, flipped)[OUTPUT_FIELDS.index("lane_gt")] - lane_outs[-1]).max())
     assert worst < TOL, f"{backbone}: ORT vs torch max abs diff {worst:.2e} >= {TOL}"
     assert moved > 1e-4, f"{backbone}: channel order does not change the output"
+    # Wrong-size input fails loudly in ONNX Runtime (fixed dims) ...
+    wrong = dict(feeds)
+    wrong["strip"] = np.zeros((1, 3, net.canvas_h, net.canvas_w + 64), dtype=np.float32)
+    try:
+        sess.run(None, wrong)
+    except Exception as exc:  # onnxruntime InvalidArgument
+        assert "dimension" in str(exc).lower() or "invalid" in str(exc).lower(), exc
+    else:
+        raise AssertionError("ORT accepted a wrong-size strip")
+    # ... and in the runtime loader / live path.
+    from python.data.strip_writer import compose_strip
+    from python.train.scene_lane_runtime import SceneInputShapeError, SceneLaneRuntime
+
+    runtime = SceneLaneRuntime(path)
+    assert runtime.ready, runtime.reason
+    live = {"main": (rng.random((480, 640, 3)) * 255).astype(np.uint8)}  # live_input_long_side 640
+    lane_x, conf = runtime.observe(compose_strip(live), 0.1)
+    assert lane_x is not None and np.isfinite(lane_x) and 0.0 <= conf <= 1.0
+    try:
+        runtime.observe(np.zeros((96, 128, 3), np.uint8), 0.1)
+    except SceneInputShapeError:
+        pass
+    else:
+        raise AssertionError("a wrong-size live strip was not refused")
     size = path.stat().st_size / 1e6
     print(
         f"{backbone}: opset {opset}, {size:.1f} MB, {len(model.graph.node)} nodes; "
         f"BGR->RGB Gather(axis=1, [2,1,0]) in graph=yes, ImageNet mean/std constants in graph=yes; "
-        f"ORT vs torch on 2 frames max abs diff {worst:.2e} (< {TOL}); B<->R swap moves lane_gt by {moved:.3f} OK"
+        f"ORT vs torch on 2 frames max abs diff {worst:.2e} (< {TOL}); B<->R swap moves lane_gt by {moved:.3f}; "
+        f"strip input fixed {strip_dims}, wrong size refused by ORT and by SceneLaneRuntime; live 640x480 main -> lane_x={lane_x:+.3f} OK"
     )
+
+
+def check_wrong_size_graph(tmp: Path) -> None:
+    """A graph exported at another canvas (--scale 0.5) is refused when it loads."""
+    from python.train.pretrained_net import build_scene_net
+    from python.train.scene_lane_runtime import SceneInputShapeError, SceneLaneRuntime
+    from python.train.scene_net import export_scene_onnx
+
+    net = build_scene_net(("main",), 0.5, "mobilenetv3").eval()
+    path = tmp / "half.onnx"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        export_scene_onnx(path, net, cams=("main",), heads=("lane_gt",))
+    try:
+        SceneLaneRuntime(path)
+    except SceneInputShapeError as exc:
+        assert "fixed dims" in str(exc) and "96" in str(exc), exc
+        print(f"wrong-size graph: refused at load: {str(exc)[:150]}... OK")
+    else:
+        raise AssertionError("a 96-row graph loaded for a 192-row live canvas")
 
 
 def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         for backbone in ("mobilenetv3", "imagenet-resnet18"):
             check(backbone, Path(tmp))
+        check_wrong_size_graph(Path(tmp))
     print("test_pretrained_onnx: OK")
 
 

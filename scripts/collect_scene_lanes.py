@@ -52,7 +52,10 @@ Row fields in ``state.jsonl`` written by this collector, besides the frame data:
 * ``ego.up``: the State sensor's up vector. ``ego.damage``: Damage sensor total.
 
 ``impacts.jsonl`` beside ``state.jsonl`` has one ``{"kind": "impact", "t",
-"i", "pre_t0", "pre_i0", ...}`` line per impact and one ``{"kind":
+"i", "pre_t0", "pre_i0", ..., "traffic_dist_m", "traffic_id",
+"traffic_rel_speed_mps"}`` line per impact (the nearest companion car, its
+scene name and the closing speed, positive when the gap shrinks; null when
+there is no traffic or BeamNG does not report it) and one ``{"kind":
 "impact_end", "t", "how"}`` line when it ends (``respawn``, ``drove_on``, or
 the abort reason). ``t`` matches the row ``t`` exactly; ``i`` is the row index
 the writer was expected to assign (``i_row`` ``impact``). When the impact
@@ -91,6 +94,38 @@ start over on them. ``collect spawn types`` lines at the end of the run (and
 ``spawn_types`` in collect.json) count picks as city/highway/ramp/bridge/
 tunnel, deck spawns and recheck respawns apart.
 
+Spawn safety (west coast):
+
+* When every deck road is used, a ``collect deck exhausted ...`` line is
+  printed once, ``deck_exhausted`` goes into both collect.json files, and the
+  car keeps driving its current spawn: no respawn, no stop. A stall then
+  falls back to the old stationary recover.
+* ``--traffic-ahead-m`` / ``--traffic-behind-m`` (60 / 40) place the two
+  companion cars that far ahead and behind along the road walk, facing the
+  direction of travel. A walk that cannot reach the distance uses the
+  farthest point it reached; under 8 m the car is not spawned. Each spawn
+  logs a ``collect traffic`` line, with any fallback.
+* ``--stall-respawn-s`` (20; 0 is the old 10 s stationary abort and recover)
+  respawns from the deck after that many seconds under 1 m/s (the
+  stationary detector), outside the first 3 s after a spawn. The 10 s
+  stationary abort waits for it. Each one is a ``collect stall_respawn`` line
+  and a ``cuts.jsonl`` record with ``reason=stall_respawn``. Three stall
+  respawns in a row with no recorded row fall back to the stationary abort.
+
+Stops: every run that started recording ends with exactly one ``collect stop
+reason=<reason> code=<exit> done_s=.. target_s=..`` line, ``stop_reason`` /
+``stop_detail`` / ``stop_code`` in both collect.json files, and a non-zero
+exit when it stops before ``target_s`` (the stop file, ``reason=requested``,
+keeps exit 0). A segment end never stops the run: a segment that never drove
+moves on to the next one, and a used-up schedule wraps the map rotation;
+only ``--no-progress-ends`` (5) segment ends in a row with no recorded row
+stop it, ``reason=no_progress``, exit 6.
+
+Heartbeat: ``<GVD status>/collect_heartbeat.json`` (E:/GVD_data/status on
+the driving PC), rewritten every 30 s and once at the stop: ``pid``, ``t``,
+``time``, ``done_s``, ``target_s``, ``segment``, ``last_line``, ``state``
+(running or stopped), ``reason``, ``code``, ``out``.
+
 ``--recheck-cov-min N`` (default 0, off; west coast with ``--min-paint-cov``
 above 0) reruns the spawn paint-coverage probe every N minutes of a spawn,
 from the nearest road to the car along its heading. The AI leaves the 300 m
@@ -102,6 +137,7 @@ next deck spawn. Rows are never dropped. Every recheck, kept or not, is a
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import math
 import os
@@ -115,6 +151,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from python.data.raw_frames import controls_from_state
+from python.collect.spawn_mix import nearest_traffic, traffic_count, traffic_names
 
 SPEEDS_MPS = (8.0, 11.0, 14.0, 17.0, 10.0)
 SPEED_HOLD_S = 180.0
@@ -362,6 +399,33 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--traffic-ahead-m",
+        type=float,
+        default=60.0,
+        help="Companion car ahead of the ego, in meters along the road. Unreachable: the farthest valid spot.",
+    )
+    parser.add_argument(
+        "--traffic-behind-m",
+        type=float,
+        default=40.0,
+        help="Companion car behind the ego, in meters along the road. Unreachable: the farthest valid spot.",
+    )
+    parser.add_argument(
+        "--stall-respawn-s",
+        type=float,
+        default=20.0,
+        help=(
+            "West coast: respawn from the deck after this many seconds stationary (under 1 m/s), "
+            "outside the 3 s settle. 0 keeps the 10 s stationary abort and recover."
+        ),
+    )
+    parser.add_argument(
+        "--no-progress-ends",
+        type=int,
+        default=5,
+        help="Stop (reason=no_progress, exit 6) after this many segment ends in a row with no recorded row. 0 never stops.",
+    )
+    parser.add_argument(
         "--recheck-cov-min",
         type=float,
         default=0.0,
@@ -377,6 +441,33 @@ def build_parser() -> argparse.ArgumentParser:
 def recheck_due(recheck_s: float, done_s: float, mark_s: float) -> bool:
     """True when ``recheck_s`` (> 0) seconds of driving passed since the spawn or the last recheck."""
     return float(recheck_s) > 0.0 and float(done_s) - float(mark_s) >= float(recheck_s) - 1e-9
+
+
+def stall_respawn_due(stall_respawn_s: float, slow_s: float, since_spawn_s: float, can_respawn: bool) -> bool:
+    """True when a stall respawn should fire: on, a deck to draw from, past the settle, stalled long enough."""
+    from python.collect.liveness import SETTLE_FLAG_S
+
+    return (
+        float(stall_respawn_s) > 0.0
+        and bool(can_respawn)
+        and float(since_spawn_s) >= SETTLE_FLAG_S
+        and float(slow_s) >= float(stall_respawn_s) - 1e-9
+    )
+
+
+def defer_stationary(why: str, stall_respawn_s: float, slow_s: float, can_respawn: bool) -> str:
+    """Hold the 10 s ``stationary`` abort while a later stall respawn can still handle it."""
+    if why == "stationary" and float(stall_respawn_s) > 0.0 and can_respawn and float(slow_s) < float(stall_respawn_s):
+        return ""
+    return why
+
+
+def traffic_near_text(dist_m: float | None, vid: str | None, closing: float | None) -> str:
+    """The impact line's traffic part."""
+    if dist_m is None:
+        return "traffic=na"
+    rel = "na" if closing is None else format(closing, ".1f")
+    return f"traffic={vid} dist={dist_m:.1f}m rel={rel}m/s"
 
 
 def recheck_plan(cov: float | None, min_cov: float) -> str:
@@ -1045,7 +1136,158 @@ def attached_frames_ready(cams: dict[str, Any], frames: dict[str, Any]) -> bool:
     return all(cid in frames for cid in expected)
 
 
+STOP_EXIT_EARLY = 6
+STALL_RESPAWN_STREAK = 3
+HEARTBEAT_FILE = "collect_heartbeat.json"
+HEARTBEAT_S = 30.0
+
+
+class _LastLine:
+    """stdout pass-through that keeps the last non-empty printed line."""
+
+    def __init__(self, inner: Any, run: "RunStop") -> None:
+        self._inner = inner
+        self._run = run
+        self._part = ""
+
+    def write(self, text: str) -> int:
+        self._part += str(text)
+        if "\n" in self._part:
+            lines = [x for x in self._part.split("\n")[:-1] if x.strip()]
+            if lines:
+                self._run.last_line = lines[-1][:500]
+            self._part = self._part.rsplit("\n", 1)[1]
+        return self._inner.write(text)
+
+    def flush(self) -> None:
+        self._inner.flush()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class RunStop:
+    """Why a recording run stopped, and the heartbeat a poller can read."""
+
+    def __init__(self) -> None:
+        self.reason: str | None = None
+        self.detail = ""
+        self.out: Path | None = None
+        self.progress_path: Path | None = None
+        self.target_s: float | None = None
+        self.status_root: Path | None = None
+        self.tool = False
+        self.last_line = ""
+        self.segment: str | None = None
+        self.done_s = 0.0
+        self._beat_m: float | None = None
+
+    def attach(self, out: Path, progress_path: Path, target_s: float, done_s: float) -> None:
+        self.out, self.progress_path, self.target_s, self.done_s = Path(out), Path(progress_path), float(target_s), float(done_s)
+        try:
+            from python.debug.remote_status import status_dir
+
+            self.status_root = status_dir()
+        except Exception:
+            self.status_root = None
+
+    def stop(self, reason: str, detail: str = "") -> None:
+        """The first reason sticks."""
+        if self.reason is None:
+            self.reason, self.detail = str(reason), str(detail or "")
+
+    def heartbeat_path(self) -> Path | None:
+        return None if self.status_root is None else Path(self.status_root) / HEARTBEAT_FILE
+
+    def beat(self, done_s: float, *, force: bool = False, state: str = "running", code: int | None = None) -> None:
+        self.done_s = float(done_s)
+        now = time.monotonic()
+        if not force and self._beat_m is not None and now - self._beat_m < HEARTBEAT_S:
+            return
+        self._beat_m = now
+        path = self.heartbeat_path()
+        if path is None:
+            return
+        target = self.target_s
+        payload = {
+            "kind": "collect_heartbeat",
+            "pid": os.getpid(),
+            "t": time.time(),
+            "time": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "done_s": round(float(done_s), 3),
+            "target_s": None if target is None or target == float("inf") else float(target),
+            "segment": self.segment,
+            "last_line": self.last_line,
+            "state": state,
+            "reason": self.reason if state == "stopped" else None,
+            "detail": self.detail if state == "stopped" else None,
+            "code": code,
+            "out": None if self.out is None else str(self.out),
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError as exc:
+            print(f"collect heartbeat write failed: {exc}", flush=True)
+
+    @staticmethod
+    def _merge(path: Path, extra: dict[str, Any]) -> None:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        except (OSError, json.JSONDecodeError):
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        raw.update(extra)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            print(f"collect stop_reason write failed for {path}: {exc}", flush=True)
+
+    def finish(self, code: int | None) -> int | None:
+        """Exactly one ``collect stop reason=`` line; stop_reason in collect.json; non-zero if early."""
+        if self.tool or self.progress_path is None or self.target_s is None:
+            return code
+        done = max(float(self.done_s), load_progress(self.progress_path))
+        early = done < float(self.target_s) - 1e-6
+        reason = self.reason or ("target_reached" if not early else "unknown")
+        if early and code == 0 and reason != "requested":
+            code = STOP_EXIT_EARLY
+        target_txt = "inf" if self.target_s == float("inf") else f"{self.target_s:.1f}"
+        tail = f" {self.detail}" if self.detail else ""
+        print(f"collect stop reason={reason} code={code} done_s={done:.1f} target_s={target_txt}{tail}", flush=True)
+        extra = {"stop_reason": reason, "stop_detail": self.detail or None, "stop_code": code, "stopped": time.time()}
+        if not self.progress_path.is_file():
+            extra = {"done_s": done, "target_s": float(self.target_s), **extra}
+        self._merge(self.progress_path, extra)
+        if self.status_root is not None and (Path(self.status_root) / "collect.json").is_file():
+            self._merge(Path(self.status_root) / "collect.json", extra)
+        self.reason = reason
+        self.beat(done, force=True, state="stopped", code=code)
+        return code
+
+
 def main(argv: list[str] | None = None) -> int:
+    """Run the collector; every recording stop is logged once, recorded, and early stops exit non-zero."""
+    run = RunStop()
+    old = sys.stdout
+    sys.stdout = _LastLine(old, run)
+    try:
+        try:
+            code = _main(argv, run)
+        except BaseException as exc:
+            run.stop("exception", f"{type(exc).__name__}: {exc}")
+            run.finish(None)
+            raise
+        return run.finish(code)  # type: ignore[return-value]
+    finally:
+        sys.stdout = old
+
+
+def _main(argv: list[str] | None, run: RunStop) -> int:
     args = build_parser().parse_args(argv)
     from python.data.data_root import (
         DataDriveError,
@@ -1130,8 +1372,10 @@ def main(argv: list[str] | None = None) -> int:
     flag = stop_file(out)
     if flag.is_file():
         flag.unlink()
+    run.attach(out, progress_path, target_s, done_s)
     if done_s >= target_s:
         print(f"collect already reached {done_s / 60.0:.1f} min in {out}")
+        run.stop("target_reached", "already reached before this run")
         return 0
     cam_cfg = load_camera_config()
     plan = capture_plan(cam_cfg, PNG_RATIO_MAX)
@@ -1173,6 +1417,7 @@ def main(argv: list[str] | None = None) -> int:
             raise
         record_session_failure(status_root, session_text(exc))
         print(f"collect stop {session_text(exc)}", flush=True)
+        run.stop("session_open_failed", session_text(exc))
         return 2
     widen_socket_timeout(bng, 120.0)
     writer = None
@@ -1191,9 +1436,12 @@ def main(argv: list[str] | None = None) -> int:
                     message = "none of the requested maps are in this Tech install"
                     record_session_failure(status_root, message)
                     print(f"collect stop {message}", flush=True)
+                    run.stop("no_maps", message)
                     return 2
         elif args.reload_level:
             print(f"collect reload level={args.reload_level}", flush=True)
+        if args.list_levels or args.dump_roads or args.check_maps:
+            run.tool = True
         if args.list_levels:
             return list_installed_levels(bng)
         if args.dump_roads:
@@ -1221,6 +1469,7 @@ def main(argv: list[str] | None = None) -> int:
                 message = err or "no vehicle after load"
                 record_session_failure(status_root, message)
                 print(f"collect stop {message}", flush=True)
+                run.stop("level_load_failed", message)
                 return 2
             if opened.spawn is not None:
                 spawn_pos = (float(opened.spawn[0]), float(opened.spawn[1]), float(opened.spawn[2]))
@@ -1273,6 +1522,8 @@ def main(argv: list[str] | None = None) -> int:
         recover_lost_s = 0.0
         schedule_cut = 0.0
         last_end_done = -1.0
+        stuck_ends = 0
+        no_progress_max = max(0, int(getattr(args, "no_progress_ends", 0) or 0))
         segment_fail_maps: dict[str, set[str]] = {}
         cams_ready = False
         segment_open = False
@@ -1294,6 +1545,13 @@ def main(argv: list[str] | None = None) -> int:
         recheck_min = max(0.0, float(getattr(args, "recheck_cov_min", 0.0) or 0.0))
         recheck_s = recheck_min * 60.0
         recheck_mark = 0.0
+        stall_respawn_s = max(0.0, float(getattr(args, "stall_respawn_s", 0.0) or 0.0))
+        # Loop seconds since the last spawn, recover or level load (the
+        # driving clock stops while the car stands, so settle cannot be used).
+        since_spawn = [0.0]
+        deck_exhausted: dict[str, Any] = {}
+        # Stall respawns in a row with no recorded row, and done_s at the last one.
+        stall_streak: list[float] = [0, -1.0]
         tick_dt = 0.1
         last_cam: dict[str, float] = {}
         prev_dir: list[float] | None = None
@@ -1338,6 +1596,8 @@ def main(argv: list[str] | None = None) -> int:
                 payload["spawn_mix"] = spawn_deck.summary()
                 payload["road_repeats"] = spawn_deck.road_repeats()
                 payload["spawn_types"] = spawn_deck.type_summary()
+            if deck_exhausted:
+                payload["deck_exhausted"] = dict(deck_exhausted)
             if yield_guard.enabled:
                 payload["live_yield"] = yield_guard.summary()
             if target_s == float("inf"):
@@ -1363,7 +1623,7 @@ def main(argv: list[str] | None = None) -> int:
             """Respawn once. A second hard abort ends the segment and continues."""
             nonlocal segment_aborts, last_error, clock, last_ai, held_tag, prev_dir, prev_dir_t, spawn_pos
             nonlocal segment_open, follow, label_hit, mark_recover, done_s, recover_lost_s
-            nonlocal schedule_cut, last_end_done
+            nonlocal schedule_cut, last_end_done, stuck_ends, loaded_index
             segment_aborts += 1
             print(f"collect abort {reason} segment={segment_id}", flush=True)
             last_error = f"{segment_id} {reason}"
@@ -1396,14 +1656,35 @@ def main(argv: list[str] | None = None) -> int:
                     _publish(None, speed, waypoint)
                     _write_collect_crash(status_root, last_error, {})
                     print(f"collect stop {last_error}", flush=True)
+                    run.stop("segment_fail", message)
                     return 2
-                # No map to rotate to, or the clock never moved, so another
-                # cut would spin on the same stuck pose.
-                if action == "stop" or (last_end_done >= 0.0 and done_s <= last_end_done + 1e-3):
-                    _save_progress(done_s, done_s if target_s == float("inf") else target_s)
-                    _publish(None, speed, waypoint)
-                    print(f"collect stop {segment_id} ended", flush=True)
-                    return 0
+                # A segment end never ends the run. rec3 (6a07d65) stopped here
+                # with exit 0: segment #11 never drove, so done_s still equalled
+                # #10's end and the old guard returned "ended".
+                no_progress = last_end_done >= 0.0 and done_s <= last_end_done + 1e-3
+                stuck_ends = stuck_ends + 1 if no_progress else 0
+                if no_progress:
+                    print(
+                        f"collect segment end {segment_id} {reason}: no recorded row since the last segment end "
+                        f"(done_s={done_s:.1f}, {stuck_ends} in a row); moving to the next segment",
+                        flush=True,
+                    )
+                    if no_progress_max > 0 and stuck_ends >= no_progress_max:
+                        message = f"{stuck_ends} segment ends in a row with no recorded row (last {segment_id} {reason})"
+                        last_error = message
+                        _save_progress(done_s, done_s if target_s == float("inf") else target_s)
+                        _publish(None, speed, waypoint)
+                        _write_collect_crash(status_root, message, {})
+                        run.stop("no_progress", message)
+                        return STOP_EXIT_EARLY
+                if action == "stop":
+                    print(
+                        f"collect schedule used up at done_s={done_s:.1f} < target; wrapping the map rotation "
+                        f"(cut {schedule_cut:.0f}s -> 0)",
+                        flush=True,
+                    )
+                    schedule_cut = 0.0
+                    loaded_index = -1  # reload: a fresh level and spawn, not the stuck pose
                 last_end_done = done_s
                 segment_aborts = 0
                 segment_open = False
@@ -1446,12 +1727,14 @@ def main(argv: list[str] | None = None) -> int:
                     impact.reset()
                     yield_guard.reset()
                     settle.start(done_s)
+                    since_spawn[0] = 0.0
                     return None
             last_error = message
             _save_progress(done_s, done_s if target_s == float("inf") else target_s)
             _publish(None, speed, waypoint)
             _write_collect_crash(status_root, message, {})
             print(f"collect stop {message}", flush=True)
+            run.stop("recover_failed", message)
             return 2
 
         def _apply_spawn(force: bool, source: str = "spawn") -> None:
@@ -1512,12 +1795,33 @@ def main(argv: list[str] | None = None) -> int:
                         f"{'on' if spawn_deck.filtering() else 'off (needs --min-paint-cov > 0 and painted lanes)'}",
                         flush=True,
                     )
+            if spawn_deck.exhausted:
+                return
             picked = spawn_deck.take(source)
             if picked is None:
-                print(f"collect spawn {segment_id} none left select_ms={spawn_deck.last_ms:.0f}", flush=True)
+                mix = spawn_deck.summary()
+                deck_exhausted.update(
+                    {
+                        "exhausted": True,
+                        "segment": segment_id,
+                        "source": source,
+                        "done_s": round(float(done_s), 3),
+                        "picks": mix["picks"],
+                        "used": mix["used"],
+                        "roads": mix["roads"],
+                        "spawn_road": spawn_road,
+                    }
+                )
+                print(
+                    f"collect deck exhausted {segment_id} source={source} picks={mix['picks']} "
+                    f"used={mix['used']}/{mix['roads']} roads; keeping the current spawn "
+                    f"road={spawn_road or 'na'} (no respawn)",
+                    flush=True,
+                )
+                _save_progress(done_s, done_s if target_s == float("inf") else target_s)
                 return
             from python.collect.level_session import place_vehicle
-            from python.collect.spawn_mix import traffic_count, traffic_lua
+            from python.collect.spawn_mix import traffic_lua
 
             shift = place_vehicle(bng, vehicle, picked.pos, picked.rot)
             if shift:
@@ -1532,6 +1836,7 @@ def main(argv: list[str] | None = None) -> int:
             impact.reset()
             yield_guard.reset()
             settle.start(done_s)
+            since_spawn[0] = 0.0
             speed_span[0] = speeds_for(picked.speed[0], picked.speed[1])
             speed = speed_at(done_s, tuple(speed_span[0]))
             last_ai = None
@@ -1540,7 +1845,18 @@ def main(argv: list[str] | None = None) -> int:
             count = traffic_count(args.traffic, map_name)
             ge = getattr(bng, "queue_lua_command", None)
             if count and callable(ge):
-                for command in traffic_lua(picked, count):
+                slots, notes = spawn_deck.traffic_slots(
+                    picked, count, float(args.traffic_ahead_m), float(args.traffic_behind_m)
+                )
+                for note in notes:
+                    print(f"collect {note}", flush=True)
+                placed = " ".join(f"{where}={along:.1f}m" for where, _p, _r, along in slots) or "none"
+                print(
+                    f"collect traffic {segment_id} placed {placed} "
+                    f"(want ahead={float(args.traffic_ahead_m):.0f}m behind={float(args.traffic_behind_m):.0f}m along the road)",
+                    flush=True,
+                )
+                for command in traffic_lua(picked, len(slots), slots):
                     ge(command)
             print(
                 f"collect spawn {segment_id} {picked.kind} "
@@ -1551,12 +1867,63 @@ def main(argv: list[str] | None = None) -> int:
                 flush=True,
             )
 
+        def _can_stall_respawn() -> bool:
+            return (
+                stall_respawn_s > 0.0
+                and not (stall_streak[0] >= STALL_RESPAWN_STREAK and done_s <= stall_streak[1] + 1e-3)
+                and map_name == "west_coast_usa"
+                and vehicle is not None
+                and spawn_deck is not None
+                and not spawn_deck.exhausted
+            )
+
+        def _stall_respawn(t_now: float) -> bool:
+            """Respawn a stalled car from the deck. False when no spawn was taken."""
+            stalled = float(live.slow_s)
+            kind_was, road_was = spawn_kind or None, spawn_road
+            here = None if pos is None else [round(float(v), 2) for v in list(pos)[:3]]
+            stall_streak[0] = stall_streak[0] + 1 if done_s <= stall_streak[1] + 1e-3 else 1
+            stall_streak[1] = float(done_s)
+            picks_before = spawn_deck.summary()["picks"]
+            _apply_spawn(True, "stall")
+            took = spawn_deck.summary()["picks"] > picks_before
+            where = "na" if here is None else f"({here[0]:.1f},{here[1]:.1f},{here[2]:.1f})"
+            print(
+                f"collect stall_respawn {segment_id} {kind_was or '-'} stalled={stalled:.1f}s "
+                f">= {stall_respawn_s:.0f}s pos={where} spawn_road={road_was or 'na'} -> "
+                f"{('respawn road=' + str(spawn_road) + ' type=' + str(spawn_deck.last_type)) if took else 'keep (deck exhausted)'}",
+                flush=True,
+            )
+            append_jsonl(
+                out / CUTS_FILE,
+                {
+                    "kind": "stall",
+                    "reason": "stall_respawn",
+                    "t": round(float(t_now), 6),
+                    "i": last_row_i,
+                    "segment": segment_id,
+                    "map": map_name or None,
+                    "spawn_type": kind_was,
+                    "spawn_road": road_was,
+                    "pos": here,
+                    "stalled_s": round(stalled, 2),
+                    "stall_respawn_s": stall_respawn_s,
+                    "action": "respawn" if took else "keep",
+                    "new_spawn_road": spawn_road if took else None,
+                    "new_road_type": spawn_deck.last_type if took else None,
+                    "done_s": round(float(done_s), 3),
+                },
+            )
+            return took
+
         def _spawn_extra() -> dict[str, Any] | None:
             extra: dict[str, Any] = {}
             if spawn_deck is not None:
                 extra["spawn_mix"] = spawn_deck.summary()
                 extra["road_repeats"] = spawn_deck.road_repeats()
                 extra["spawn_types"] = spawn_deck.type_summary()
+            if deck_exhausted:
+                extra["deck_exhausted"] = dict(deck_exhausted)
             if yield_guard.enabled:
                 extra["live_yield"] = yield_guard.summary()
             return extra or None
@@ -1568,6 +1935,12 @@ def main(argv: list[str] | None = None) -> int:
             if spawn_deck is not None:
                 for line in spawn_deck.repeat_lines() + spawn_deck.type_lines():
                     print(f"collect {line}", flush=True)
+                if deck_exhausted:
+                    print(
+                        f"collect deck exhausted at {deck_exhausted['done_s']:.0f}s ({deck_exhausted['segment']}, "
+                        f"{deck_exhausted['used']}/{deck_exhausted['roads']} roads used)",
+                        flush=True,
+                    )
 
         def _impact_end(how: str, t_end: float) -> None:
             """Close an open impact in the sidecar so the trainer knows where the mask ends."""
@@ -1586,11 +1959,13 @@ def main(argv: list[str] | None = None) -> int:
             impact.close()
 
         while done_s < target_s:
+            run.beat(done_s)
             if stop_file(out).is_file():
                 _save_progress(done_s, target_s if target_s < float("inf") else done_s)
                 _publish(None, speed_at(done_s, speeds), waypoint_at(done_s, names))
                 _say_repeats()
                 print("collect stop requested", flush=True)
+                run.stop("requested", f"stop file {stop_file(out)}")
                 return 0
             elapsed = done_s
             speed = speed_at(elapsed, tuple(speed_span[0]))
@@ -1603,6 +1978,7 @@ def main(argv: list[str] | None = None) -> int:
                 None if target_s == float("inf") else target_s,
             )
             segment_id = f"{map_name}#{seg_index}" if map_name else "current#0"
+            run.segment = segment_id
             if map_name == loaded_map and seg_index == loaded_index:
                 _apply_spawn(False)
             if segment_changed(loaded_map, loaded_index, map_name, seg_index):
@@ -1616,6 +1992,7 @@ def main(argv: list[str] | None = None) -> int:
                     _publish(None, speed, waypoint)
                     _write_collect_crash(status_root, last_error, {})
                     print(f"collect stop {last_error}", flush=True)
+                    run.stop("level_load_failed", last_error)
                     return 2
                 loaded_map = map_name
                 loaded_index = seg_index
@@ -1638,6 +2015,7 @@ def main(argv: list[str] | None = None) -> int:
                 impact.reset()
                 yield_guard.reset()
                 settle.start(done_s)
+                since_spawn[0] = 0.0
                 line_left_m = None
                 if vary_env:
                     tod, sky = segment_env(seg_index)
@@ -1664,6 +2042,7 @@ def main(argv: list[str] | None = None) -> int:
                 session_faults += 1
                 if session_faults >= 3:
                     _save_progress(done_s, done_s if target_s == float("inf") else target_s)
+                    run.stop("session_faults", f"3 camera polls in a row failed: {last_error}")
                     return 2
                 time.sleep(0.5)
                 continue
@@ -1681,6 +2060,7 @@ def main(argv: list[str] | None = None) -> int:
                 _publish(None, speed, waypoint)
                 _write_collect_crash(status_root, outage, cam_reasons)
                 print(f"collect stop {outage}", flush=True)
+                run.stop("camera_outage", outage)
                 return 4
             sample = _read_vehicle(vehicle)
             pos = sample.get("pos")
@@ -1730,6 +2110,7 @@ def main(argv: list[str] | None = None) -> int:
                         _publish(None, speed, waypoint)
                         _write_collect_crash(status_root, message, cam_reasons)
                         print(f"collect stop {message}", flush=True)
+                        run.stop("camera_warmup", message)
                         return 4
                     time.sleep(tick_sleep_s(time.monotonic() - tick_mark, 0.1))
                     tick_dt = max(1e-3, time.monotonic() - tick_mark)
@@ -1787,6 +2168,7 @@ def main(argv: list[str] | None = None) -> int:
                             f"excursion=cruise",
                             flush=True,
                         )
+                    since_spawn[0] += tick_dt
                     why = live.update(
                         tick_dt,
                         speed_mps_f,
@@ -1796,6 +2178,16 @@ def main(argv: list[str] | None = None) -> int:
                         up_z=up_z,
                         tip_z=TIP_DIR_Z_LIVE,
                     )
+                    why = defer_stationary(why, stall_respawn_s, live.slow_s, _can_stall_respawn())
+                    if why in ("", "stationary") and stall_respawn_due(
+                        stall_respawn_s, live.slow_s, since_spawn[0], _can_stall_respawn()
+                    ):
+                        if not _stall_respawn(now):
+                            why = "stationary"
+                        else:
+                            time.sleep(tick_sleep_s(time.monotonic() - tick_mark, 0.1))
+                            tick_dt = max(1e-3, time.monotonic() - tick_mark)
+                            continue
                     if why:
                         code = _abort(why)
                         if code is not None:
@@ -1812,6 +2204,19 @@ def main(argv: list[str] | None = None) -> int:
             impact_event: dict[str, Any] | None = None
             if impact_decel is not None:
                 pre_t, pre_i = impact.pre_window()
+                t_dist = t_id = t_rel = None
+                n_traffic = traffic_count(args.traffic, map_name) if map_name == "west_coast_usa" and spawn_kind else 0
+                getter = getattr(getattr(bng, "vehicles", None), "get_states", None)
+                if n_traffic and callable(getter) and pos is not None:
+                    try:
+                        states = getter(traffic_names(n_traffic))
+                        ego_vel = None
+                        if direction is not None and speed_mps_f is not None:
+                            norm = math.hypot(float(direction[0]), float(direction[1])) or 1.0
+                            ego_vel = (float(direction[0]) / norm * speed_mps_f, float(direction[1]) / norm * speed_mps_f)
+                        t_dist, t_id, t_rel = nearest_traffic(pos, ego_vel, states if isinstance(states, dict) else None)
+                    except Exception as exc:
+                        print(f"collect impact traffic state unavailable: {type(exc).__name__}: {exc}", flush=True)
                 impact_event = {
                     "kind": "impact",
                     "t": round(float(now), 6),
@@ -1824,12 +2229,16 @@ def main(argv: list[str] | None = None) -> int:
                     "segment": segment_id,
                     "excursion": clock.phase,
                     "pos": pos,
+                    "traffic_dist_m": None if t_dist is None else round(float(t_dist), 2),
+                    "traffic_id": t_id,
+                    "traffic_rel_speed_mps": None if t_rel is None else round(float(t_rel), 2),
                 }
                 before_txt = "na" if impact.speed_before is None else format(impact.speed_before, ".1f")
                 after_txt = "na" if speed_mps_f is None else format(speed_mps_f, ".1f")
                 print(
                     f"collect impact {segment_id} decel={impact_decel:.1f} m/s2 "
-                    f"v={before_txt}->{after_txt} excursion={clock.phase}",
+                    f"v={before_txt}->{after_txt} excursion={clock.phase} "
+                    f"{traffic_near_text(t_dist, t_id, t_rel)}",
                     flush=True,
                 )
                 if clock.phase in ACTIVE:
@@ -1986,6 +2395,7 @@ def main(argv: list[str] | None = None) -> int:
                     flush=True,
                 )
             move = resolved
+            since_spawn[0] += tick_dt
             why = live.update(
                 tick_dt,
                 speed_mps_f,
@@ -1995,6 +2405,18 @@ def main(argv: list[str] | None = None) -> int:
                 up_z=up_z,
                 tip_z=TIP_DIR_Z_LIVE,
             )
+            why = defer_stationary(why, stall_respawn_s, live.slow_s, _can_stall_respawn())
+            if (
+                why in ("", "stationary")
+                and not impact.should_respawn()
+                and stall_respawn_due(stall_respawn_s, live.slow_s, since_spawn[0], _can_stall_respawn())
+            ):
+                _impact_end("stall_respawn", now)
+                if _stall_respawn(now):
+                    time.sleep(tick_sleep_s(time.monotonic() - tick_mark, 0.1))
+                    tick_dt = max(1e-3, time.monotonic() - tick_mark)
+                    continue
+                why = "stationary"
             if not why and impact.should_respawn():
                 print(
                     f"collect impact {segment_id} stopped {impact.stall_s:.1f}s after the impact, respawning",
@@ -2218,10 +2640,12 @@ def main(argv: list[str] | None = None) -> int:
             if not smoke_ok and done_s >= float(args.smoke_s):
                 if not writer.wait_empty(30.0):
                     print("collect smoke failed ['writer did not finish']", flush=True)
+                    run.stop("smoke_failed", "writer did not finish")
                     return 5
                 issues = decode_issues(out)
                 if issues:
                     print(f"collect smoke failed {issues}", flush=True)
+                    run.stop("smoke_failed", str(issues))
                     return 5
                 hz_now = _hz()
                 print(
@@ -2243,6 +2667,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     print(format_queue_line(writer.stats()), flush=True)
                     print(f"collect stop {exc}", flush=True)
+                    run.stop("disk_low", str(exc))
                     return 3
                 last_disk = now_m
                 if now_m - last_print >= 60.0:
@@ -2269,6 +2694,8 @@ def main(argv: list[str] | None = None) -> int:
         if spawn_deck is not None:
             print(f"collect {spawn_deck.summary_line()}", flush=True)
         _say_repeats()
+        run.stop("target_reached")
+        run.done_s = float(done_s)
         return 0
     finally:
         if writer is not None:

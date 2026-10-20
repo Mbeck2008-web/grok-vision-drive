@@ -41,6 +41,7 @@ from python.collect.spawn_mix import (  # noqa: E402
     BRIDGE,
     TUNNEL,
     SpawnDeck,
+    SpawnPick,
     chain_from_pose,
     paint_coverage,
     road_ahead,
@@ -407,9 +408,18 @@ class _CrashVehicle:
         return True
 
 
+# Companion-car states the mocked bng.vehicles.get_states reports ({} = none).
+_TRAFFIC_STATES: dict = {}
+
+
 class _Api:
     def __init__(self, vehicle) -> None:
         self.vehicle = vehicle
+        self.state_calls: list[list[str]] = []
+
+    def get_states(self, names):
+        self.state_calls.append(list(names))
+        return {k: v for k, v in _TRAFFIC_STATES.items() if k in names}
 
     def get_current(self):
         return {"ego": self.vehicle}
@@ -774,7 +784,8 @@ def check_recheck_coverage_from_pose() -> None:
     print("recheck from pose ok: heading picks the road and direction, off-road and filter-off not scored")
 
 
-def _run_west_coast(paint, pools: dict, extra: list[str], stop_at: int, root: Path | None = None) -> tuple[int, str, Path]:
+def _run_west_coast(paint, pools: dict, extra: list[str], stop_at: int, root: Path | None = None,
+                    speed_at=None) -> tuple[int, str, Path]:
     """The mocked collector on a west_coast_usa map rotation with a mocked deck.
 
     The car holds (0.4, 12, 0.5) heading +y at 10 m/s; a teleport does not move it.
@@ -793,7 +804,7 @@ def _run_west_coast(paint, pools: dict, extra: list[str], stop_at: int, root: Pa
     collect.painted_for = lambda level: paint  # type: ignore[assignment]
     spawn_mix.SpawnDeck.load = classmethod(lambda cls, path, rng=None, **kw: cls(pools, rng, **kw))  # type: ignore[assignment]
     try:
-        return _run_collector({"speed_at": lambda n: 10.0, "stop_at": stop_at},
+        return _run_collector({"speed_at": speed_at or (lambda n: 10.0), "stop_at": stop_at},
                               ["--maps", "west_coast_usa", "--no-vary-env", "--no-excursions"] + list(extra), root)
     finally:
         collect.enter_map, collect.painted_for, spawn_mix.SpawnDeck.load = previous  # type: ignore[assignment]
@@ -926,6 +937,178 @@ def check_recheck_types_and_resume_run() -> None:
     assert picked2 and not set(picked2) & first, (picked2, first)
     print(f"recheck types run: {len(cuts)} recheck respawns typed; resume picked {len(picked2)} new roads, max_picks=1")
 
+# ------------------------------------------- (h) spawn safety
+def _pick(road_id: str, x: float, y: float, yaw_dx: float = 0.0, yaw_dy: float = 1.0) -> SpawnPick:
+    from python.collect.spawn_mix import _yaw_quat
+
+    return SpawnPick(CITY, road_id, (x, y, 0.4), _yaw_quat(yaw_dx, yaw_dy), (8.0, 12.0))
+
+
+def check_traffic_slots() -> None:
+    """Companion cars 60 m ahead / 40 m behind along the road; farthest spot or skip when short."""
+    import math
+
+    from python.collect.spawn_mix import TRAFFIC_AHEAD_M, TRAFFIC_BEHIND_M, traffic_lua
+
+    assert (TRAFFIC_AHEAD_M, TRAFFIC_BEHIND_M) == (60.0, 40.0)
+    # a: (0,0)->(0,50) joins b: (0,50)->(40,90)->(40,300). Ahead follows the bend, not the tangent.
+    a = _road("a", [(0, 0), (0, 50)])
+    b = _road("b", [(0, 50), (40, 90), (40, 300)])
+    c = _road("c", [(0, -200), (0, 0)], oneway=True)  # one-way into a's start: valid behind
+    deck = SpawnDeck({CITY: [a, b, c], HIGHWAY: [], RAMP: []})
+    slots, notes = deck.traffic_slots(_pick("a", 0.0, 30.0), 2)
+    assert notes == [] and [w for w, *_ in slots] == ["ahead", "behind"], (slots, notes)
+    (_, pa, ra, la), (_, pb, rb, lb) = slots
+    assert abs(la - 60.0) < 1e-6 and abs(lb - 40.0) < 1e-6
+    # 20 m to the end of a, then 40 m along the 45-degree leg of b.
+    assert abs(pa[0] - 40 / math.sqrt(2)) < 1e-6 and abs(pa[1] - (50 + 40 / math.sqrt(2))) < 1e-6 and pa[2] == b["pts"][0][2] + 0.5, pa  # road z + 0.5
+    assert abs(pb[0]) < 1e-9 and abs(pb[1] + 10.0) < 1e-6, pb  # 30 m on a, 10 m back along c
+    assert abs(rb[2] - _pick("a", 0, 0).rot[2]) < 1e-9 and abs(rb[3] - _pick("a", 0, 0).rot[3]) < 1e-9  # faces +y
+    # Behind cannot enter a one-way road at its start (that is against its flow).
+    d = _road("d", [(0, 0), (0, -200)], oneway=True)
+    deck2 = SpawnDeck({CITY: [a, b, d], HIGHWAY: [], RAMP: []})
+    slots2, notes2 = deck2.traffic_slots(_pick("a", 0.0, 30.0), 2)
+    assert [w for w, *_ in slots2] == ["ahead", "behind"] and abs(slots2[1][3] - 30.0) < 1e-6, slots2
+    assert notes2 == ["traffic behind fallback: farthest valid spot 30.0 m along the road (wanted 40 m)"], notes2
+    # A dead end 5 m ahead: no valid spot, the car is skipped.
+    lone = _road("lone", [(0, 0), (0, 100)])
+    deck3 = SpawnDeck({CITY: [lone], HIGHWAY: [], RAMP: []})
+    slots3, notes3 = deck3.traffic_slots(_pick("lone", 0.0, 95.0), 2)
+    assert [w for w, *_ in slots3] == ["behind"] and "traffic ahead skipped: road walk reaches 5.0 m < 8 m" in notes3[0], notes3
+    # Flags change the distances; count 1 is only the car ahead.
+    slots4, _ = deck3.traffic_slots(_pick("lone", 0.0, 10.0), 1, 30.0, 25.0)
+    assert len(slots4) == 1 and abs(slots4[0][1][1] - 40.0) < 1e-6
+    _, notes5 = deck3.traffic_slots(_pick("ghost", 0.0, 10.0), 2)
+    assert len(notes5) == 2 and "not in the deck" in notes5[0]
+    # The Lua uses the slot poses; without slots it keeps the old 28 m / 22 m tangent offsets.
+    lua = traffic_lua(_pick("a", 0.0, 30.0), 2, slots)[0]
+    assert "gvd_traffic_0" in lua and "gvd_traffic_1" in lua and f"vec3({pa[0]:.2f},{pa[1]:.2f}," in lua and "0.00,-10.00," in lua, lua[:600]
+    old = traffic_lua(_pick("a", 0.0, 30.0), 2)[0]
+    assert "0.00,58.00,0.40)" in old and "0.00,8.00,0.40)" in old, old[:600]
+    print(f"traffic slots ok: ahead {la:.0f} m at ({pa[0]:.1f},{pa[1]:.1f}), behind {lb:.0f} m; fallback and skip noted")
+
+
+def check_nearest_traffic() -> None:
+    import scripts.collect_scene_lanes as collect
+    from python.collect.spawn_mix import nearest_traffic, traffic_names
+
+    assert traffic_names(2) == ["gvd_traffic_0", "gvd_traffic_1"] and traffic_names(0) == []
+    states = {"gvd_traffic_0": {"pos": [3.0, 4.0, 0.0], "vel": [0.0, 0.0, 0.0]},
+              "gvd_traffic_1": {"pos": [0.0, -30.0, 0.0], "vel": [0.0, 12.0, 0.0]}}
+    d, vid, rel = nearest_traffic([0.0, 0.0, 0.0], (6.0, 8.0), states)
+    assert abs(d - 5.0) < 1e-9 and vid == "gvd_traffic_0" and abs(rel - 10.0) < 1e-9, (d, vid, rel)
+    d, vid, rel = nearest_traffic([0.0, 0.0, 0.0], None, states)
+    assert vid == "gvd_traffic_0" and rel is None
+    assert nearest_traffic([0, 0, 0], (1.0, 0.0), {}) == (None, None, None)
+    assert nearest_traffic([0, 0, 0], (1.0, 0.0), {"x": {"pos": None}}) == (None, None, None)
+    assert collect.traffic_near_text(None, None, None) == "traffic=na"
+    assert collect.traffic_near_text(5.0, "gvd_traffic_0", 10.0) == "traffic=gvd_traffic_0 dist=5.0m rel=10.0m/s"
+    assert collect.traffic_near_text(5.0, "gvd_traffic_0", None) == "traffic=gvd_traffic_0 dist=5.0m rel=nam/s"
+    print("nearest traffic ok")
+
+
+def check_stall_respawn_helpers() -> None:
+    import scripts.collect_scene_lanes as collect
+
+    a = collect.build_parser().parse_args([])
+    assert (a.stall_respawn_s, a.traffic_ahead_m, a.traffic_behind_m) == (20.0, 60.0, 40.0)
+    b = collect.build_parser().parse_args(["--stall-respawn-s", "0", "--traffic-ahead-m", "80", "--traffic-behind-m", "50"])
+    assert (b.stall_respawn_s, b.traffic_ahead_m, b.traffic_behind_m) == (0.0, 80.0, 50.0)
+    due = collect.stall_respawn_due
+    assert due(20.0, 20.0, 5.0, True) and not due(20.0, 19.9, 5.0, True)
+    assert not due(20.0, 25.0, SETTLE_FLAG_S - 0.1, True)  # inside the settle: skipped
+    assert not due(20.0, 25.0, 5.0, False) and not due(0.0, 99.0, 99.0, True)
+    hold = collect.defer_stationary
+    assert hold("stationary", 20.0, 10.0, True) == "" and hold("stationary", 20.0, 20.0, True) == "stationary"
+    assert hold("stationary", 0.0, 10.0, True) == "stationary" and hold("stationary", 20.0, 10.0, False) == "stationary"
+    assert hold("tipped", 20.0, 10.0, True) == "tipped" and hold("", 20.0, 10.0, True) == ""
+    print("stall respawn helpers ok")
+
+
+def _small_pools(n: int) -> dict:
+    here = _road("here", [(0.4, -300), (0.4, 600)])
+    east = [_road(f"east{j}", [(5000 + 50 * j, 0), (5000 + 50 * j, 500)]) for j in range(n)]
+    return {CITY: [here] + east, HIGHWAY: [], RAMP: []}
+
+
+def check_deck_exhausted_run() -> None:
+    """End to end: 3 painted roads, a recheck respawn every 30 s. The 4th pick finds the deck
+    empty: one 'collect deck exhausted' line, collect.json says so, the car keeps driving."""
+    east_paint = _Paint(lambda x, y: x > 1000.0)
+    code, text, out = _run_west_coast(east_paint, _small_pools(3), ["--recheck-cov-min", "0.5"], 1600)
+    assert code == 0, text[-2500:]
+    lines = [x for x in text.splitlines() if x.startswith("collect deck exhausted west_coast_usa#")]
+    assert len(lines) == 1, (lines, text[-3000:])
+    assert "source=recheck picks=3 used=4/4 roads; keeping the current spawn road=east" in lines[0] and lines[0].endswith("(no respawn)"), lines
+    assert "none left" not in text
+    picks = [x for x in text.splitlines() if x.startswith("collect spawn pick ")]
+    assert len(picks) == 3, picks
+    rows = _rows(out)
+    ids = [int(r["i"]) for r in rows]
+    assert ids == list(range(len(ids))) and len(rows) >= 1500, len(rows)  # no stop: every tick still recorded
+    status = json.loads((out / "collect.json").read_text(encoding="utf-8"))
+    ex = status["deck_exhausted"]
+    assert ex["exhausted"] and ex["source"] == "recheck" and ex["used"] == 4 and ex["roads"] == 4, ex
+    t_ex = ex["done_s"]
+    assert 0.1 * len(rows) > t_ex + 30.0, (t_ex, len(rows))  # well past the exhaustion
+    assert status["spawn_mix"]["exhausted"] is True
+    assert "collect deck exhausted at" in text
+    print(f"deck exhausted run: line once at {t_ex:.0f}s, {len(rows)} rows, kept driving")
+
+
+def check_stall_respawn_run() -> None:
+    """End to end: the car eases to 0 m/s and stays there. After 20 s stationary it respawns
+    from the deck (cuts.jsonl reason=stall_respawn), not the 10 s stationary abort."""
+    paint = _Paint(lambda x, y: x > 1000.0)
+
+    def speed(n: int) -> float:
+        if n <= 100 or n > 550:
+            return 10.0
+        return max(0.0, 10.0 - 0.1 * (n - 100))  # 1 m/s2: not an impact
+
+    code, text, out = _run_west_coast(paint, _west_pools(), [], 900, speed_at=speed)
+    assert code == 0, text[-2500:]
+    assert "collect abort stationary" not in text and "collect impact " not in text, text[-3000:]
+    lines = [x for x in text.splitlines() if x.startswith("collect stall_respawn west_coast_usa#")]
+    assert len(lines) == 1 and " stalled=20." in lines[0] and ">= 20s" in lines[0] and "-> respawn road=east" in lines[0], lines
+    cuts = [json.loads(x) for x in (out / "cuts.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert len(cuts) == 1 and cuts[0]["reason"] == "stall_respawn" and cuts[0]["action"] == "respawn", cuts
+    assert cuts[0]["stall_respawn_s"] == 20.0 and cuts[0]["new_spawn_road"].startswith("east") and cuts[0]["stalled_s"] >= 20.0
+    assert "collect spawn types stall n=1 city=1" in text, text[-1500:]
+    rows = _rows(out)
+    assert [int(r["i"]) for r in rows] == list(range(len(rows)))
+    # Off: the old 10 s stationary abort and recover.
+    code, text0, out0 = _run_west_coast(paint, _west_pools(), ["--stall-respawn-s", "0"], 900, speed_at=speed)
+    assert code == 0 and "collect abort stationary" in text0 and "stall_respawn" not in text0, text0[-2000:]
+    print(f"stall respawn run: {lines[0].split(' -> ')[0].split(' ', 3)[-1]}; off keeps the stationary abort")
+
+
+def check_impact_traffic_run() -> None:
+    """End to end on the west coast: traffic is placed along the road and logged; the impact
+    line and impacts.jsonl carry the nearest car, its distance and the closing speed."""
+    global _TRAFFIC_STATES
+    paint = _Paint(lambda x, y: x > 1000.0)
+    crash = lambda n: 10.0 if n <= 40 or n > 75 else 0.2  # noqa: E731
+    _TRAFFIC_STATES = {"gvd_traffic_0": {"pos": [0.4, 30.0, 0.5], "vel": [0.0, 2.0, 0.0]},
+                       "gvd_traffic_1": {"pos": [0.4, -40.0, 0.5], "vel": [0.0, 9.0, 0.0]}}
+    try:
+        code, text, out = _run_west_coast(paint, _west_pools(), [], 300, speed_at=crash)
+    finally:
+        _TRAFFIC_STATES = {}
+    assert code == 0, text[-2500:]
+    placed = [x for x in text.splitlines() if x.startswith("collect traffic west_coast_usa#")]
+    assert placed and "placed ahead=60.0m behind=40.0m (want ahead=60m behind=40m along the road)" in placed[0], placed
+    line = [x for x in text.splitlines() if x.startswith("collect impact west_coast_usa#") and " decel=" in x]
+    assert len(line) == 1 and line[0].endswith("traffic=gvd_traffic_0 dist=18.0m rel=-1.8m/s"), line
+    ev = [json.loads(x) for x in (out / "impacts.jsonl").read_text(encoding="utf-8").splitlines()][0]
+    assert ev["traffic_id"] == "gvd_traffic_0" and ev["traffic_dist_m"] == 18.0 and ev["traffic_rel_speed_mps"] == -1.8, ev
+    # No traffic reported: the fields are null and the line says traffic=na.
+    code, text2, out2 = _run_west_coast(paint, _west_pools(), [], 300, speed_at=crash)
+    ev2 = [json.loads(x) for x in (out2 / "impacts.jsonl").read_text(encoding="utf-8").splitlines()][0]
+    assert ev2["traffic_dist_m"] is None and ev2["traffic_id"] is None and ev2["traffic_rel_speed_mps"] is None, ev2
+    assert [x for x in text2.splitlines() if x.startswith("collect impact west_coast_usa#") and " decel=" in x][0].endswith("traffic=na")
+    print(f"impact traffic run: {line[0].split(' excursion=')[1]}")
+
 
 def main() -> None:
     check_coverage_walks_ahead()
@@ -952,6 +1135,12 @@ def main() -> None:
     check_road_types()
     check_resume_skips_recorded()
     check_recheck_types_and_resume_run()
+    check_traffic_slots()
+    check_nearest_traffic()
+    check_stall_respawn_helpers()
+    check_deck_exhausted_run()
+    check_stall_respawn_run()
+    check_impact_traffic_run()
     print("collect spawn fix ok")
 
 

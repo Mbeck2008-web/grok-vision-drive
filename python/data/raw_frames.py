@@ -14,7 +14,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from python.data.binary_io import PNG_SIG, os_binary, write_new_file
+from python.data.binary_io import PNG_SIG, os_binary, write_atomic
 from python.data.strip_writer import STRIP_ORDER, compose_strip, read_state_jsonl
 
 # The collector sleeps 0.1 s, so 10 Hz is the planning rate. A slower poll
@@ -218,12 +218,19 @@ def _next_index(used: set[int]) -> int:
 
 
 def _write_bytes(path: Path, payload: bytes) -> None:
-    """Exclusive binary create, then a signature and size check.
+    """Binary write to ``<name>.tmp``, a signature and size check, then a rename.
+
+    ``binary_io.write_atomic``: a crash mid-write leaves only the ``.tmp``
+    (no reader lists it: the suffix is not .png/.npy), never a torn frame
+    under the final name. A frame that already exists is never replaced:
+    the name is refused up front, as the old exclusive create did.
 
     ``O_BINARY`` is required. Without it Windows rewrites every ``\\n`` as
     ``\\r\\n`` and the PNG signature becomes ``\\x89PNG\\r\\r\\n\\x1a``.
     """
-    write_new_file(path, payload)
+    if path.exists():
+        raise FileExistsError(f"frame {path} already exists; refusing to replace it")
+    write_atomic(path, payload)
 
 
 def _append_line(path: Path, line: Mapping[str, Any]) -> None:

@@ -317,8 +317,8 @@ def check_soft_esc_heartbeat_coalesce() -> None:
 
     period = float(SOFT_ESC_FILE_PERIOD_S)
 
-    def _due(engaged: bool, now: float, *, rising: bool = False) -> bool:
-        ok = soft_esc_state_write_due(engaged, rising=rising, now=now)
+    def _due(engaged: bool, now: float, *, rising: bool = False, falling: bool = False) -> bool:
+        ok = soft_esc_state_write_due(engaged, rising=rising, falling=falling, now=now)
         if ok:
             soft_esc_state_write_mark(now)
         return ok
@@ -341,13 +341,20 @@ def check_soft_esc_heartbeat_coalesce() -> None:
         assert soft_esc_state_write_skips() == 3
         assert _due(False, stamped + period + 0.001) is True
         assert soft_esc_state_write_skips() == 3
+        # The disengage tick (falling edge) flushes inside the window too.
+        t = stamped + period + 0.001
+        assert _due(True, t + 0.01) is True
+        assert _due(False, t + 0.02, falling=True) is True
+        assert _due(False, t + 0.03) is False
+        assert soft_esc_state_write_skips() == 4
     finally:
         reset_soft_esc_state_writes()
 
     rv = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
     loop = rv.split("while True:", 1)[1]
     assert "rising_engage = bool(engaged) and not prev_engaged" in loop
-    assert "soft_esc_state_write_due(bool(engaged), rising=rising_engage)" in loop
+    assert "soft_esc_state_write_due(bool(engaged), rising=rising_engage" in loop
+    assert "falling_engage = prev_engaged and not bool(engaged)" in loop and "falling=falling_engage" in loop
     assert "state_write_skips=" in loop
     assert "release_cmd_skips=" in loop
     assert "if state_due:\n                write_state(st)\n                soft_esc_state_write_mark()" in loop

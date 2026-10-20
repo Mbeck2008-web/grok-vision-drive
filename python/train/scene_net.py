@@ -111,7 +111,9 @@ OUTPUT_FIELDS = (
 LOSS_TERMS = ("points", "class", "lamps", "valid", "lane_gt")
 HEAD_NAMES = ("lanes", "curbs", "objects", "signs", "lane_gt")
 
-_BAD_REASONS = frozenset({"player_steer", "player_brake", "player_throttle"})
+# Torch-free pieces the live supervisor needs live in scene_live (run_vision must
+# not import torch at startup); re-exported here for the trainer and the tests.
+from python.train.scene_live import _BAD_REASONS, _has_labels, live_strip_fields  # noqa: E402,F401
 
 SCENE_ONNX_NAME = "e2e_scene.onnx"
 
@@ -433,55 +435,6 @@ def loss_mask(row: Mapping[str, Any]) -> bool:
         return False
     tech = row.get("tech")
     return isinstance(tech, dict) and bool(tech)
-
-
-def _has_labels(value: Any) -> bool:
-    if value is None:
-        return False
-    try:
-        return len(value) > 0
-    except TypeError:
-        return True
-
-
-def live_strip_fields(
-    *,
-    lanes: Any = None,
-    tracks: Any = None,
-    signs: Any = None,
-    curbs: Any = None,
-    steer: float = 0.0,
-    throttle: float = 0.0,
-    brake: float = 0.0,
-    override_reason: Any = None,
-) -> dict[str, Any]:
-    """Scene labels and the wheel/pedal gate for one live strip.
-
-    ``tech`` is present only when this tick has lanes, tracks, signs, or curbs,
-    which is what ``loss_mask`` requires before a step is supervised. A player
-    override reason is stored on the wheel or the pedals so that moment is gated.
-    """
-    tech: dict[str, Any] = {}
-    if _has_labels(lanes):
-        tech["lanes"] = lanes
-    if _has_labels(tracks):
-        tech["tracks"] = tracks
-    if _has_labels(signs):
-        tech["signs"] = signs
-    if _has_labels(curbs):
-        tech["curbs"] = curbs
-    wheel: dict[str, Any] = {"steer": float(steer or 0.0)}
-    pedals: dict[str, Any] = {
-        "throttle": float(throttle or 0.0),
-        "brake": float(brake or 0.0),
-    }
-    reason = str(override_reason or "").strip().lower()
-    if reason in _BAD_REASONS:
-        if reason == "player_steer":
-            wheel["reason"] = reason
-        else:
-            pedals["reason"] = reason
-    return {"wheel": wheel, "pedals": pedals, "tech": tech or None}
 
 
 def _class_index(value: Any, table: tuple[str, ...]) -> int | None:

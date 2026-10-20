@@ -65,8 +65,9 @@ from python.debug.gt_geom import heading_from_dir
 from python.debug.gt_logger import GroundTruthLogger, gt_log_enabled
 from python.viz.review_log import ReviewCapture
 from python.viz.nerd import image_point_from_window_mouse
-from python.train.scene_net import live_strip_fields
-from python.train.scene_lane_runtime import SCENE_SHAPE_HOLD
+# scene_live, not scene_net / scene_lane_runtime: those import torch at load (~0.8 s), and
+# the supervisor only needs torch-free helpers here. The scene runtime is imported lazily below.
+from python.train.scene_live import SCENE_SHAPE_HOLD, live_strip_fields
 from python.viz.stage import drawn_lane_records
 from python.sensors.cameras import CAM_IDS, CamHealth, bundle_tick_frames
 from python.runtime.debug_opts import apply_to_command, apply_to_perception
@@ -1260,9 +1261,11 @@ def main() -> None:
             # Soft Esc: gvd_state.json at most once per Lua pollEvery (0.10).
             # Max rewrite rate. A loop already slower than 100 ms writes at
             # the loop rate, so heartbeat age tracks the loop.
-            # Engage writes every tick. The rising edge flushes this tick.
+            # Engage writes every tick. The rising edge flushes this tick, and so
+            # does the falling edge: the disengage reason is on that tick only.
             rising_engage = bool(engaged) and not prev_engaged
-            state_due = soft_esc_state_write_due(bool(engaged), rising=rising_engage)
+            falling_engage = prev_engaged and not bool(engaged)
+            state_due = soft_esc_state_write_due(bool(engaged), rising=rising_engage, falling=falling_engage)
             prev_engaged = bool(engaged)
             state_skips = soft_esc_state_write_skips()
             rel_skips = int(getattr(actuator, "release_cmd_skips", 0) or 0)

@@ -11,6 +11,13 @@ cannot run on this host is skipped, and the skip is printed:
 
 Lua scripts need ``lua5.1`` (then ``lua``). A missing interpreter fails the
 suite; it is not a skip.
+
+Each script runs with its own temp HOME / USERPROFILE / APPDATA /
+LOCALAPPDATA / TMPDIR / TORCH_HOME (``gvd_test_env``), removed afterwards,
+so GVD bus files (``gvd_state.json``, ``gvd_cmd.json``,
+``gvd_strip_record.json``, ...) cannot leak from one test into the next or
+into the real home. A script that leaves files in its torch hub folder
+(downloaded weights) fails.
 """
 from __future__ import annotations
 
@@ -18,10 +25,14 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+
+from gvd_test_env import isolated_env, torch_hub_files  # noqa: E402
 MARKER_WINDOWS = "gvd-ci: requires windows"
 MARKER_BEAMNG = "gvd-ci: requires beamng"
 TIMEOUT_S = 300
@@ -87,18 +98,26 @@ def _lua_exe() -> str | None:
 
 
 def _run(cmd: list[str], label: str) -> tuple[str, int]:
-    env = dict(os.environ)
-    env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
-    env.setdefault("PYTHONUNBUFFERED", "1")
+    scratch = Path(tempfile.mkdtemp(prefix="gvd-suite-"))
     try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(ROOT),
-            env=env,
-            timeout=TIMEOUT_S,
-        )
-    except subprocess.TimeoutExpired:
-        print(f"FAIL {label}: timed out after {TIMEOUT_S}s", flush=True)
+        env = isolated_env(os.environ, scratch)
+        env["PYTHONPATH"] = str(ROOT) + os.pathsep + os.environ.get("PYTHONPATH", "")
+        env.setdefault("PYTHONUNBUFFERED", "1")
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(ROOT),
+                env=env,
+                timeout=TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"FAIL {label}: timed out after {TIMEOUT_S}s", flush=True)
+            return "fail", 1
+        downloaded = torch_hub_files(env)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    if downloaded:
+        print(f"FAIL {label}: downloaded weights into the torch hub: {', '.join(downloaded[:5])}", flush=True)
         return "fail", 1
     if proc.returncode == 0:
         print(f"PASS {label}", flush=True)

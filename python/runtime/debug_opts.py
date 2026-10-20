@@ -21,6 +21,7 @@ NERD_TABS: tuple[tuple[str, str], ...] = (
     ("viz", "VIZ"),
     ("model", "MODEL"),
     ("cams", "CAMS"),
+    ("auto", "AUTO"),
     ("keys", "KEYS"),
 )
 NERD_TAB_IDS: tuple[str, ...] = tuple(tid for tid, _lbl in NERD_TABS)

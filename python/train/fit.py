@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -220,15 +221,26 @@ def fit_with_probe(
     return chosen
 
 
-def measure_driving_file(root: Path | str) -> int:
-    """Bytes on disk for the strip directory (meta, JPEGs, and state)."""
+def measure_driving_file(
+    root: Path | str,
+    *,
+    progress: Callable[[int, int], None] | None = None,
+) -> int:
+    """Bytes on disk for the strip directory (meta, JPEGs, raw frames, and state)."""
     root = Path(root)
     if not root.exists():
         return 0
     total = 0
+    n = 0
     for path in root.rglob("*"):
-        if path.is_file():
-            total += int(path.stat().st_size)
+        if not path.is_file():
+            continue
+        total += int(path.stat().st_size)
+        n += 1
+        if progress is not None and n % 5000 == 0:
+            progress(n, total)
+    if progress is not None:
+        progress(n, total)
     return total
 
 
@@ -246,19 +258,85 @@ def _meminfo_kb(name: str) -> int | None:
     return None
 
 
+def _windows_memory(kernel32: object | None = None) -> tuple[int, int] | None:
+    """Available and total physical bytes from ``GlobalMemoryStatusEx``.
+
+    ``/proc/meminfo`` does not exist on Windows, so a missing file used to
+    report free RAM as 0. Pass ``kernel32`` in tests; otherwise this calls
+    the real one only on Windows.
+    """
+    if kernel32 is None:
+        if sys.platform != "win32":
+            return None
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+        except (AttributeError, OSError):
+            return None
+    try:
+        import ctypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = MEMORYSTATUSEX()
+        status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        ok = kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+        if not ok:
+            return None
+        return max(0, int(status.ullAvailPhys)), max(0, int(status.ullTotalPhys))
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _psutil_memory() -> tuple[int, int] | None:
+    try:
+        import psutil
+    except ImportError:
+        return None
+    try:
+        mem = psutil.virtual_memory()
+        return max(0, int(mem.available)), max(0, int(mem.total))
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _ram_pair() -> tuple[int, int] | None:
+    """Available and total RAM. Linux meminfo, then Windows, then psutil."""
+    avail_kb = _meminfo_kb("MemAvailable")
+    total_kb = _meminfo_kb("MemTotal")
+    if avail_kb is not None and total_kb is not None:
+        return max(0, avail_kb) * 1024, max(0, total_kb) * 1024
+    win = _windows_memory()
+    if win is not None:
+        return win
+    return _psutil_memory()
+
+
 def read_free_ram_bytes() -> int:
-    kb = _meminfo_kb("MemAvailable")
-    if kb is None:
+    pair = _ram_pair()
+    if pair is None:
         return 0
-    return max(0, kb) * 1024
+    return int(pair[0])
 
 
 def read_used_ram_bytes() -> int:
-    total = _meminfo_kb("MemTotal")
-    free = _meminfo_kb("MemAvailable")
-    if total is None or free is None:
+    pair = _ram_pair()
+    if pair is None:
         return 0
-    return max(0, total - free) * 1024
+    avail, total = pair
+    return max(0, int(total) - int(avail))
 
 
 def _nvidia_mib(field: str) -> int:

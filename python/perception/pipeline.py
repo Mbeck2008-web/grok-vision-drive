@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
 
 from python.perception.cipv import select_cipv
 from python.perception.detect import STATIC_CLASSES
-from python.perception.lanes import lanes_from_view
+from python.perception.lanes import LaneResult, lanes_from_view
 from python.perception.track import IoUTracker
-from python.planning.path_predictor import predict_path
+from python.planning.path_predictor import (
+    LaneTrack,
+    predict_path,
+    reckon_ego_x,
+    reckon_path,
+)
 
 MAX_SIGNS = 8
 SIGN_KEEP = 8
@@ -36,6 +41,9 @@ class PerceptionOut:
     infer_ms: float = 0.0
     missing: list[str] = field(default_factory=list)
     detector_name: str = ""
+    lane_source: str = "none"
+    # Seconds since the windshield/pillar pixels last changed. 0 on a new frame.
+    frame_age_s: float = 0.0
 
 
 class ModularPerception:
@@ -46,6 +54,28 @@ class ModularPerception:
         self.tracker = IoUTracker()
         self._prior_lanes: list = []
         self._prior_signs: list[dict[str, Any]] = []
+        self._lane_track = LaneTrack()
+        self._lane_sig: bytes | None = None
+        self._lane_mono: float = 0.0
+        self._taken_mono: float = 0.0
+        self._last_plan: Any = None
+        self._last_lanes: LaneResult | None = None
+
+    def arm_lane_seed(self) -> None:
+        """Drop any center fit before engage. The next pair may seed it.
+
+        Pre-engage ticks still run the fitter. gt_run8 stored one_right at
+        +5.41 m while idle, then engaged on one_right/hold and steered that
+        value. Until a fresh pair is taken, the route stays at x=0.
+        """
+        self._lane_track.reset()
+        self._lane_track.awaiting_pair = True
+        self._prior_lanes = []
+        self._lane_sig = None
+        self._lane_mono = 0.0
+        self._taken_mono = 0.0
+        self._last_plan = None
+        self._last_lanes = None
 
     def set_detector(self, detector: Any, missing: list[str] | None = None) -> None:
         """Swap the live detector; reset tracks so CIPV ids do not stick to a dead net."""
@@ -54,6 +84,12 @@ class ModularPerception:
         self.tracker = IoUTracker()
         self._prior_lanes = []
         self._prior_signs = []
+        self._lane_track = LaneTrack()
+        self._lane_sig = None
+        self._lane_mono = 0.0
+        self._taken_mono = 0.0
+        self._last_plan = None
+        self._last_lanes = None
 
     def tick(
         self,
@@ -62,6 +98,8 @@ class ModularPerception:
         stitch_bgr: np.ndarray | None = None,
         ego_speed_mps: float = 0.0,
         steer_deg: float = 0.0,
+        yaw_rate: float = 0.0,
+        dt_s: float | None = None,
     ) -> PerceptionOut:
         # The wheel is for the override residual and the ego display. The route
         # is predicted from lanes, vehicles, and signs, then followed.
@@ -92,22 +130,64 @@ class ModularPerception:
         # if detector didn't set ego x/y (onnx path does), leave as-is
         tracks = self.tracker.update(moving, time.time())
         track_dicts = self.tracker.as_dicts()
-        lanes = lanes_from_view(main_bgr, stitch_bgr)
-        prior_lanes = None
-        if lanes.lanes_bev:
-            self._prior_lanes = lanes.lanes_bev
-        elif self._prior_lanes:
-            prior_lanes = self._prior_lanes
+        sig = _lane_view_signature(stitch_bgr, main_bgr)
+        now = time.monotonic()
+        fresh = sig is None or sig != self._lane_sig
+        if fresh:
+            self._lane_sig = sig
+            self._lane_mono = now
+        pixel_age = 0.0 if fresh else max(0.0, now - self._lane_mono)
+        dt = 0.05 if dt_s is None or dt_s <= 0.0 else float(dt_s)
+        if fresh or self._last_plan is None:
+            lanes = lanes_from_view(main_bgr, stitch_bgr)
+            self._last_lanes = lanes
+        else:
+            # Same windshield and pillar pixels. Do not treat the old fit as a
+            # new measurement. Move the remembered route with the car.
+            lanes = self._last_lanes or LaneResult(conf=0.0, lanes_bev=[], curvature=0.0)
+            if self._lane_track.center_x is not None:
+                self._lane_track.center_x = reckon_ego_x(
+                    self._lane_track.center_x, 8.0, yaw_rate=yaw_rate, dt=dt,
+                )
         cipv = select_cipv(track_dicts, path_width=2.0, ego_speed_mps=ego_speed_mps)
-        plan = predict_path(
-            lanes_bev=lanes.lanes_bev,
-            lane_conf=lanes.conf,
-            curvature=lanes.curvature,
-            tracks=track_dicts,
-            signs=signs,
-            ego_speed_mps=ego_speed_mps,
-            prior_lanes=prior_lanes,
-        )
+        if fresh or self._last_plan is None:
+            plan, self._prior_lanes = drive_plan_from_lanes(
+                lanes.lanes_bev,
+                self._prior_lanes,
+                lane_conf=lanes.conf,
+                curvature=lanes.curvature,
+                tracks=track_dicts,
+                signs=signs,
+                ego_speed_mps=ego_speed_mps,
+                lane_track=self._lane_track,
+            )
+            self._last_plan = plan
+        else:
+            path = reckon_path(
+                self._last_plan.path_ego,
+                speed_mps=ego_speed_mps,
+                yaw_rate=yaw_rate,
+                dt=dt,
+            )
+            plan = replace(
+                self._last_plan,
+                path_ego=path,
+                lane_source=_mark_stale(self._last_plan.lane_source),
+                drivable=len(path) >= 2,
+            )
+            self._last_plan = plan
+        src = str(plan.lane_source or "")
+        held = any(token in src for token in ("hold", "stale", "prior"))
+        if held or src in ("", "none"):
+            if self._taken_mono <= 0.0:
+                self._taken_mono = now
+            decision_age = max(0.0, now - self._taken_mono)
+        else:
+            self._taken_mono = now
+            decision_age = 0.0
+        # Pixel identity resets only when the bytes repeat. A hold on a new
+        # picture used to report age 0, because main's pixels change every tick.
+        frame_age_s = max(pixel_age, decision_age)
         cipv_id = plan.cipv_id
         if cipv_id is None and cipv.track is not None:
             cipv_id = cipv.track.get("id")
@@ -157,11 +237,109 @@ class ModularPerception:
                 "path_length_m": plan.path_length_m,
                 "pred_brake": plan.pred_brake,
                 "blinker": plan.blinker,
+                "lane_source": plan.lane_source,
             },
             infer_ms=infer_ms,
             missing=missing,
             detector_name=self.detector.name,
+            lane_source=plan.lane_source,
+            frame_age_s=frame_age_s,
         )
+
+
+def _mark_stale(source: str) -> str:
+    text = str(source or "none")
+    if "stale" in text:
+        return text
+    if text == "none":
+        return "stale"
+    return f"{text}/stale"
+
+
+def _lane_view_signature(
+    stitch_bgr: np.ndarray | None,
+    main_bgr: np.ndarray | None,
+) -> bytes | None:
+    """Bytes of the cameras that feed the lane fit, subsampled.
+
+    A new rear frame must not count as a new lane frame. Wide, main, narrow,
+    and both pillars do. ``None`` means there is no picture yet.
+    """
+    from python.perception.stitch360 import GAP_PX, SECTOR_H, SECTOR_W, STITCH_ORDER
+
+    parts: list[bytes] = []
+    if isinstance(stitch_bgr, np.ndarray) and stitch_bgr.ndim >= 2:
+        height, width = int(stitch_bgr.shape[0]), int(stitch_bgr.shape[1])
+        expect = len(STITCH_ORDER) * SECTOR_W + (len(STITCH_ORDER) - 1) * GAP_PX
+        if height == SECTOR_H and width == expect:
+            for cid in ("pillarL", "wide", "main", "narrow", "pillarR"):
+                index = STITCH_ORDER.index(cid)
+                x0 = index * (SECTOR_W + GAP_PX)
+                sector = stitch_bgr[:, x0 : x0 + SECTOR_W]
+                parts.append(np.ascontiguousarray(sector[::8, ::8]).tobytes())
+    if not parts and isinstance(main_bgr, np.ndarray) and main_bgr.size:
+        parts.append(np.ascontiguousarray(main_bgr[::8, ::8]).tobytes())
+    if not parts:
+        return None
+    return b"".join(parts)
+
+
+def drive_plan_from_lanes(
+    fresh: list,
+    prior: list,
+    *,
+    lane_conf: float,
+    curvature: float,
+    tracks: list,
+    signs: list,
+    ego_speed_mps: float,
+    lane_track: LaneTrack | None = None,
+) -> tuple[Any, list]:
+    """Route from the live lines, or from the last lines that actually routed.
+
+    A non-empty frame that does not make a route used to replace the memory.
+    The next tick then had nothing to follow (``lane_x=na`` and steer 0 on
+    the PR 82 run). Predict from the last drivable lines instead, and only
+    store a frame that produced a route.
+    """
+    stored = list(prior or [])
+    live = list(fresh or [])
+    prior_arg = stored if (not live and stored) else None
+    seeded = lane_track is not None and lane_track.center_x is not None
+    plan = predict_path(
+        lanes_bev=live,
+        lane_conf=lane_conf,
+        curvature=curvature,
+        tracks=tracks,
+        signs=signs,
+        ego_speed_mps=ego_speed_mps,
+        prior_lanes=prior_arg,
+        lane_track=lane_track,
+        remember=bool(live) or not seeded,
+    )
+    from_live = bool(plan.drivable and live)
+    used_prior = bool(plan.drivable and not live and prior_arg)
+    if not plan.drivable and live and stored:
+        plan = predict_path(
+            lanes_bev=[],
+            lane_conf=lane_conf,
+            curvature=curvature,
+            tracks=tracks,
+            signs=signs,
+            ego_speed_mps=ego_speed_mps,
+            prior_lanes=stored,
+            lane_track=lane_track,
+            remember=False,
+        )
+        used_prior = bool(plan.drivable)
+    if from_live:
+        stored = live
+    elif used_prior:
+        # The prior is in the ego frame of the tick it was seen. Keeping it
+        # while the car yaws freezes lane_x off to one side (the 47b430e run
+        # held +2.83 m and steered into a building).
+        stored = []
+    return plan, stored
 
 
 def _hold_signs(prior: list[dict[str, Any]], fresh: list[dict[str, Any]]) -> list[dict[str, Any]]:

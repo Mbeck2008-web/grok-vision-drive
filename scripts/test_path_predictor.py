@@ -839,11 +839,14 @@ def check_perception_ignores_wheel() -> None:
     img = np.zeros((480, 640, 3), dtype=np.uint8)
     cv2.line(img, (80, 470), (300, 280), (210, 210, 210), 3)
     cv2.line(img, (560, 470), (340, 280), (210, 210, 210), 3)
-    perc = ModularPerception(allow_synthetic=False, detector_id="empty")
-    perc.set_detector(EmptyDetector(), ["yolo_weights"])
-    right = perc.tick(img, ego_speed_mps=5.0, steer_deg=28.0)
-    perc.tracker = perc.tracker.__class__()
-    left = perc.tick(img, ego_speed_mps=5.0, steer_deg=-35.0)
+    # A second tick of the same pixels is a dead-reckon, not another fit.
+    # Two fresh perceptions show the wheel is not an input.
+    right_perc = ModularPerception(allow_synthetic=False, detector_id="empty")
+    right_perc.set_detector(EmptyDetector(), ["yolo_weights"])
+    left_perc = ModularPerception(allow_synthetic=False, detector_id="empty")
+    left_perc.set_detector(EmptyDetector(), ["yolo_weights"])
+    right = right_perc.tick(img, ego_speed_mps=5.0, steer_deg=28.0)
+    left = left_perc.tick(img, ego_speed_mps=5.0, steer_deg=-35.0)
     assert right.path_ego == left.path_ego
     assert right.planner["target_v"] == left.planner["target_v"]
     assert right.planner["aeb"] == left.planner["aeb"]

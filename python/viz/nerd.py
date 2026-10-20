@@ -309,6 +309,8 @@ def render_panel(
         )
     elif tab == "cams":
         y = _draw_cams_tab(img, state, y + 8, h, w, hits, cam_frames=cam_frames)
+    elif tab == "auto":
+        _draw_auto_tab(img, ui, y + 8, h, w, hits)
     else:
         y += 10
         for line in _lines(state):
@@ -318,7 +320,7 @@ def render_panel(
             if y > record_top - 4:
                 break
         _draw_record_block(img, ui, h, w, hits)
-    _put(img, _fit("D drive  G viz  M model  A cams  [ ] tab  V hide", w - 24, FS_DIM), (12, h - 16), FS_DIM, DIM)
+    _put(img, _fit("D drive  G viz  M model  A cams  U auto  [ ] tab", w - 24, FS_DIM), (12, h - 16), FS_DIM, DIM)
     if ui is not None:
         ui.nerd_hits = hits
         ui.nerd_tab = tab
@@ -542,7 +544,7 @@ def _hover_matches(item: dict[str, Any], hover: dict[str, Any]) -> bool:
         return int(item.get("i") or 0) == int(hover.get("i") or 0) and str(item.get("part") or "") == str(
             hover.get("part") or ""
         )
-    if kind == "record":
+    if kind in ("record", "auto"):
         return str(item.get("id") or "") == str(hover.get("id") or "")
     return False
 
@@ -576,7 +578,7 @@ def paint_hover(img: np.ndarray, hits: list[dict[str, Any]] | None, hover: dict[
         _tint_rect(img, rect, HOVER_TINT, 0.28)
         cv2.rectangle(img, (int(rect[0]), int(rect[1])), (int(rect[2]), int(rect[3])), HOVER_EDGE, 2)
         return
-    if kind == "record":
+    if kind in ("record", "auto"):
         item = next((h for h in hits if _hover_matches(h, hover)), None)
         if item is None or not item.get("rect"):
             return
@@ -665,6 +667,92 @@ def _record_button(
     _put(img, label, (x + 8, y), FS_DIM, fg)
     hits.append({"kind": "record", "id": ident, "rect": rect})
     return rect[2] + 8
+
+
+def _auto_button(
+    img: np.ndarray,
+    label: str,
+    x: int,
+    y: int,
+    hits: list[dict[str, Any]],
+    ident: str,
+    *,
+    on: bool,
+) -> int:
+    tw, _th = _text_size(label, FS_DIM)
+    rect = (x, y - 18, x + tw + 16, y + 6)
+    bg = ICE if on else (42, 38, 36)
+    fg = (16, 13, 12) if on else FG
+    cv2.rectangle(img, (rect[0], rect[1]), (rect[2], rect[3]), bg, -1)
+    _put(img, label, (x + 8, y), FS_DIM, fg)
+    hits.append({"kind": "auto", "id": ident, "rect": rect})
+    return rect[2] + 8
+
+
+def _draw_auto_tab(
+    img: np.ndarray,
+    ui: Any,
+    y: int,
+    h: int,
+    w: int,
+    hits: list[dict[str, Any]],
+) -> None:
+    """Automatic Mode. Start and Stop drive the same raw collector as the CLI."""
+    session = getattr(ui, "auto", None) if ui is not None else None
+    opts = getattr(session, "options", None)
+    running = bool(session.running()) if session is not None and hasattr(session, "running") else False
+    _put(img, "AUTOMATIC MODE", (PAD_X, y), FS_BODY, ICE)
+    y += ROW_H
+    _put(img, _fit("BeamNG AI  driver=beamng_ai  E: data disk", w - PAD_X * 2, FS_DIM), (PAD_X, y), FS_DIM, DIM)
+    y += ROW_H + 4
+    x = _auto_button(img, "Start", PAD_X, y, hits, "start", on=running)
+    _auto_button(img, "Stop", x, y, hits, "stop", on=not running)
+    y += ROW_H
+    map_name = str(getattr(opts, "map_name", "") or "current")
+    route = str(getattr(opts, "route", "span") or "span")
+    speed = f"{float(getattr(opts, 'speed_min', 8)):.0f}-{float(getattr(opts, 'speed_max', 17)):.0f}"
+    if bool(getattr(opts, "until_disk", False)):
+        duration = "until disk"
+    else:
+        duration = f"{float(getattr(opts, 'minutes', 45)):.0f} min"
+    cams = str(getattr(opts, "cameras", "") or "all")
+    traffic = "on" if bool(getattr(opts, "traffic", False)) else "off"
+    weather = str(getattr(opts, "weather", "") or "sky")
+    tod = str(getattr(opts, "time_of_day", "") or "sky")
+    excursion = "on" if bool(getattr(opts, "excursions", True)) else "off"
+    raw_maps = str(getattr(opts, "maps", "") or "")
+    parts = [part for part in raw_maps.split(",") if part.strip()]
+    maps = "current" if not parts else (parts[0] if len(parts) == 1 else f"{len(parts)} maps")
+    rows = (
+        ("map", f"map {map_name}"),
+        ("maps", f"maps {maps}"),
+        ("route", f"route {route}"),
+        ("excursion", f"excursion {excursion}"),
+        ("speed+", f"speed {speed} m/s"),
+        ("disk", f"time {duration}"),
+        ("cameras", f"cameras {cams}"),
+        ("traffic", f"traffic {traffic}"),
+        ("weather", f"weather {weather}"),
+        ("time", f"time of day {tod}"),
+    )
+    for ident, label in rows:
+        if y > h - ROW_H * 6:
+            break
+        _auto_button(img, label, PAD_X, y, hits, ident, on=False)
+        y += ROW_H
+    lines: list[str] = []
+    if session is not None and hasattr(session, "status_lines"):
+        try:
+            lines = list(session.status_lines())
+        except Exception:
+            lines = ["error status unreadable"]
+    else:
+        lines = ["Automatic Mode  stopped", "driver=beamng_ai", "error none"]
+    for line in lines:
+        if y > h - 28:
+            break
+        _put(img, _fit(line, w - PAD_X * 2, FS_DIM), (PAD_X, y), FS_DIM, FG)
+        y += ROW_H - 6
 
 
 def _draw_record_block(

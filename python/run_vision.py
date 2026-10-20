@@ -14,6 +14,11 @@ if str(ROOT) not in sys.path:
 
 from python.control.actuate import (
     attach_electrics,
+    curve_speed_mps,
+    curve_steer,
+    follow_lane_steer,
+    lane_sample_hold_reason,
+    LaneSteerState,
     last_electrics_ms,
     make_actuator,
     read_ego_feedback,
@@ -23,6 +28,7 @@ from python.control.actuate import (
     soft_esc_state_write_due,
     soft_esc_state_write_mark,
     soft_esc_state_write_skips,
+    steer_sample_point,
     stop_command,
     write_engage_flag,
 )
@@ -42,11 +48,21 @@ from python.control.override import (
     config_mirror,
     load_override_config,
 )
+from python.control.echo_link import MIN_MOD_VERSION, STATUS_OUTDATED, EchoGate, outdated_message
 from python.data.record import ClipRecorder, choose_encoder
 from python.perception.pipeline import ModularPerception
 from python.perception.stitch360 import stitch_frames
 from python.perception.road_model import lanes_ext_for_live, road_edges
 from python.viz.debug_draw import cabin_drive_word
+from python.control.launch_guard import (
+    LaunchGuard,
+    apply_lane_exit_brake,
+    longitudinal_mps,
+    moving_backward,
+    apply_stale_speed_cap,
+)
+from python.debug.gt_geom import heading_from_dir
+from python.debug.gt_logger import GroundTruthLogger, gt_log_enabled
 from python.viz.review_log import ReviewCapture
 from python.viz.nerd import image_point_from_window_mouse
 from python.train.scene_net import live_strip_fields
@@ -273,7 +289,33 @@ def main() -> None:
         action="store_true",
         help="Publish extras to a local Foxglove WebSocket (ws://127.0.0.1:8765). Planner stays vision-only.",
     )
+    ap.add_argument(
+        "--gt-log",
+        action="store_true",
+        help="Sim ground truth JSONL under logs/ (or set GVD_GT_LOG=1). Off in normal play.",
+    )
+    ap.add_argument(
+        "--lane-source",
+        default=os.environ.get("GVD_LANE_SOURCE", "hough"),
+        choices=["hough", "scene", "gt"],
+        help="hough keeps the pixel lane finder. scene reads lane_x from models/e2e_scene.onnx "
+        "and stops when that confidence is low. gt feeds the road-network center at 8 m "
+        "as lane_x (GVD_LANE_SOURCE=gt). A missing road hit stops.",
+    )
+    ap.add_argument(
+        "--scene-onnx",
+        default="",
+        help="Scene-net ONNX path. Empty uses models/e2e_scene.onnx.",
+    )
     args = ap.parse_args()
+
+    from python.data.data_root import DataDriveError, ensure_cache_dirs
+
+    try:
+        ensure_cache_dirs()
+    except DataDriveError as exc:
+        print(f"[GVD] {exc}", flush=True)
+        raise SystemExit(2)
 
     if args.vision_only:
         os.environ["GVD_VISION_ONLY"] = "1"
@@ -404,6 +446,10 @@ def main() -> None:
     shadow_cfg = load_shadow_config(_ctrl_yaml)
     override_cfg = load_override_config(_ctrl_yaml)
     override = OverrideDetector(override_cfg)
+    # Retail echo freshness: the filter only eats new echoes; a frozen or pre-contract echo
+    # disengages / refuses instead of reading as "no override".
+    echo_gate = EchoGate()
+    echo_fault_prev: str | None = None
 
     allow_nvenc = args.encode == "nvenc"
     if args.encode == "nvenc":
@@ -506,11 +552,30 @@ def main() -> None:
     prev_bot = False
     engage_arm_mono: float | None = None
     review_cap = ReviewCapture()
+    lane_steer = LaneSteerState()
+    launch_guard = LaunchGuard()
+    gt_log = None
+    if gt_log_enabled(bool(args.gt_log)) or args.lane_source == "gt":
+        gt_log = GroundTruthLogger.open()
+        print(f"[GVD] ground truth -> {gt_log.path}", flush=True)
     try:
+        scene_lane = None
+        if args.lane_source == "scene":
+            from python.train.scene_lane_runtime import SceneLaneRuntime
+
+            scene_lane = SceneLaneRuntime(args.scene_onnx or None)
+            print(
+                f"[GVD] lane source=scene onnx={scene_lane.path} ready={scene_lane.ready} ({scene_lane.reason})",
+                flush=True,
+            )
+        elif args.lane_source == "gt":
+            print("[GVD] lane source=gt road-network center at 8 m", flush=True)
         while True:
             loop_t0 = time.perf_counter()
+            tick_dt: float | None = None
             if frame_i > 0:
                 dt_loop = max(1e-6, loop_t0 - last_loop_t)
+                tick_dt = dt_loop
                 loop_hz_ema = ema_hz(loop_hz_ema, 1.0 / dt_loop)
             last_loop_t = loop_t0
 
@@ -617,6 +682,8 @@ def main() -> None:
                 stitch_bgr=rig_view.bgr,
                 ego_speed_mps=ego_v,
                 steer_deg=steer,
+                yaw_rate=yaw_rate,
+                dt_s=tick_dt,
             )
             pout = apply_to_perception(ui.debug, pout)
 
@@ -645,6 +712,19 @@ def main() -> None:
             if not ident.matched:
                 engaged = False
                 # Refuse actuation. Do not guess Drive vs Tech or honor a Python-only override.
+            if engaged and not prev_engaged:
+                # The tick above may have held a pre-engage one-side center.
+                # Refit with the seed gate so that value cannot steer.
+                perc.arm_lane_seed()
+                pout = perc.tick(
+                    main,
+                    stitch_bgr=rig_view.bgr,
+                    ego_speed_mps=ego_v,
+                    steer_deg=steer,
+                    yaw_rate=yaw_rate,
+                    dt_s=tick_dt,
+                )
+                pout = apply_to_perception(ui.debug, pout)
             disengage_reason = "none" if ident.matched else "bus_mismatch"
             heartbeat_ok = True
             allow_preview = bool(args.allow_preview_drive) or bool(ui.debug.allow_preview)
@@ -665,6 +745,59 @@ def main() -> None:
                 engage_hz_grace_floor=shadow_cfg.engage_hz_grace_floor,
             )
 
+            scene_stop = False
+            gt_stop = False
+            gt_preview = None
+            scene_lane_x = None
+            scene_conf = None
+            if args.lane_source == "gt":
+                from python.train.scene_lane_runtime import straight_lane_path
+
+                if gt_log is not None:
+                    gt_preview = gt_log.curve_preview(
+                        vdata,
+                        bng,
+                        socket_busy=bool(getattr(bundle, "grab_read_blocked", False)),
+                        dt_s=tick_dt,
+                    )
+                if gt_preview is None:
+                    gt_stop = True
+                    pout.path_ego = []
+                    pout.lane_conf = 0.0
+                    pout.path_conf = 0.0
+                    pout.lane_source = "gt/stop"
+                else:
+                    pout.path_ego = straight_lane_path(float(gt_preview.lane_x))
+                    pout.lane_conf = 1.0
+                    pout.path_conf = 1.0
+                    # Not "hold": the stale-speed cap treats that word as a frozen
+                    # camera lane and would parking-brake above 6 m/s.
+                    pout.lane_source = "gt"
+                    pout.path_debug_preview = False
+                    pout.frame_age_s = 0.0
+            elif scene_lane is not None:
+                from python.data.strip_writer import compose_strip
+                from python.train.scene_lane_runtime import (
+                    scene_lane_decision,
+                    straight_lane_path,
+                )
+
+                frames = getattr(bundle, "frames", None)
+                strip = compose_strip(frames if isinstance(frames, dict) else None)
+                lane_hat, conf = scene_lane.observe(strip, tick_dt)
+                scene_lane_x = lane_hat
+                scene_conf = conf
+                if scene_lane_decision(lane_hat, conf) != "lane":
+                    scene_stop = True
+                    pout.path_ego = []
+                    pout.lane_conf = float(conf)
+                    pout.lane_source = "scene/stop"
+                else:
+                    pout.path_ego = straight_lane_path(float(lane_hat))
+                    pout.lane_conf = float(conf)
+                    pout.path_conf = float(conf)
+                    pout.lane_source = "scene"
+                    pout.path_debug_preview = False
             cmd_seq += 1
             wide = None
             try:
@@ -694,6 +827,10 @@ def main() -> None:
                 engage_age_s=engage_age_s,
             )
             cmd = tick.applied
+            if scene_stop:
+                cmd = stop_command(seq=cmd_seq, reason="scene_lane_low")
+            elif gt_stop:
+                cmd = stop_command(seq=cmd_seq, reason="gt_lane_missing")
 
             if not ident.matched:
                 disengage_reason = "bus_mismatch"
@@ -722,6 +859,30 @@ def main() -> None:
             # we just sent. own_axes keeps the pedal residual, and the steer baseline follows
             # the resting wheel when the command changes, instead of the absolute player_* path.
             owns_axes = getattr(actuator, "name", "") == "beamngpy"
+            # Retail cmd_json bus: the wheel only reaches us through the mod's 10 Hz echo, so
+            # only a fresh echo is a new sample. BeamNGpy polls electrics itself every tick.
+            echo_bus = vehicle is None and not owns_axes
+            echo = echo_gate.observe(engaged=bool(engaged) and echo_bus, ego_fb=ego_fb, now=time.monotonic())
+            echo_fault = echo.fault if engaged else None
+            if echo_fault:
+                # Link fault (echo frozen while engaged) or a mod too old to stamp its echo.
+                # Same disengage path a player override takes; the brake hold is unchanged.
+                engaged = False
+                disengage_reason = echo_fault
+                bot_engage.clear()
+                write_engage_flag(False, disengage_reason=echo_fault)
+                cmd = stop_command(seq=cmd_seq, reason=echo_fault)
+                if echo_fault != echo_fault_prev:
+                    if echo.status == STATUS_OUTDATED:
+                        print(f"[GVD] REFUSE ENGAGE: {outdated_message(ego_fb)}", flush=True)
+                    else:
+                        why = (
+                            f"no new electrics echo for {echo.since_ms:.0f} ms"
+                            if echo.since_ms > 0.0
+                            else "every recent echo arrived after a gap"
+                        )
+                        print(f"[GVD] DISENGAGED: {echo_fault} ({why})", flush=True)
+            echo_fault_prev = echo_fault
             if owns_axes:
                 ovr_steer, ovr_thr, ovr_brk, ovr_dev = steer_in, throttle_in, brake_in, False
             elif ego_fb is not None and ego_fb.fresh and ego_fb.player_device:
@@ -740,6 +901,8 @@ def main() -> None:
                 applied_seq=None if owns_axes else (
                     ego_fb.applied_seq if ego_fb is not None and ego_fb.fresh else None
                 ),
+                fresh=echo.fresh if echo_bus else True,
+                gap=echo.gap if echo_bus else False,
             )
             if ovr.active and not ui.debug.ignore_override:
                 engaged = False
@@ -751,7 +914,146 @@ def main() -> None:
                 # the generic not_engaged the following ticks write.
                 cmd = stop_command(seq=cmd_seq, reason=ovr.reason)
 
+            # Lookahead the steer law reads. Logged every tick. The PR 75
+            # capture stored curvature and the clipped command, not this point.
+            sample = steer_sample_point(pout.path_ego) if pout.path_ego else None
+            lane_x = None if sample is None else float(sample.get("x", 0.0))
+            lane_y = None if sample is None else float(sample.get("y", 0.0))
+            frame_ts = None
+            for _stamp_key in ("main", "cam_main"):
+                _stamps = getattr(bundle, "timestamps", None) or {}
+                if _stamp_key in _stamps:
+                    try:
+                        frame_ts = float(_stamps[_stamp_key])
+                    except (TypeError, ValueError):
+                        frame_ts = None
+                    break
+            frame_cmd_ms = (time.time() - frame_ts) * 1000.0 if frame_ts is not None else -1.0
+            # A missing sample, a point closer than 4 m, or a heading past a
+            # lane, is not a command to center the wheel. Hold the last steer
+            # (creeping toward 0) and say why. preview_blocked still brakes;
+            # it no longer snaps steer to 0 while that hold is armed.
+            miss = None
+            if lane_x is None:
+                miss = "lane_hold"
+            elif lane_y is not None:
+                miss = lane_sample_hold_reason(lane_x, lane_y)
+            holding = False
+            # GT curvature is not in the straight 8 m center. Steer Stanley
+            # plus feedforward, and do not treat a large heading as lane_far:
+            # that decay is what parked gt_ctrl1 sideways after the projection
+            # jumped. A held sample keeps the last bend instead of centering.
+            if (
+                engaged
+                and args.lane_source == "gt"
+                and gt_preview is not None
+                and cmd.reason == "ok"
+            ):
+                geometric = curve_steer(
+                    gt_preview.offset_m,
+                    gt_preview.heading_err_rad,
+                    gt_preview.curvature,
+                    float(ego_v or 0.0),
+                )
+                cmd.steer = follow_lane_steer(geometric, gt_preview.lane_x, lane_steer, tick_dt)
+                lane_steer.reason = "curve_hold" if gt_preview.held else "curve"
+            elif engaged and cmd.reason == "ok" and miss is None:
+                cmd.steer = follow_lane_steer(cmd.steer, lane_x, lane_steer, tick_dt)
+            elif (
+                engaged
+                and cmd.reason in ("ok", "preview_blocked")
+                and miss is not None
+                and lane_steer.armed
+            ):
+                cmd.steer = follow_lane_steer(
+                    0.0, None, lane_steer, tick_dt, miss_reason=miss,
+                )
+                holding = True
+            else:
+                # A gate hold or a disengage sends steer 0. Do not resume the
+                # next path command from a value the car was not holding.
+                lane_steer.reset()
+            # Debug gain, invert, and the steer cap still have the last word
+            # before the launch cap. A crash after that brakes and disengages.
             cmd = apply_to_command(ui.debug, cmd)
+            hdg = None
+            dmg = None
+            pos_xy = None
+            spd_now = None
+            if vdata is not None:
+                dmg = getattr(vdata, "damage", None)
+                spd_now = getattr(vdata, "speed_mps", None)
+                direction = getattr(vdata, "dir", None)
+                if direction is not None and len(direction) >= 2:
+                    hdg = heading_from_dir(float(direction[0]), float(direction[1]))
+                pose = getattr(vdata, "pos", None)
+                if pose is not None and len(pose) >= 2:
+                    pos_xy = (float(pose[0]), float(pose[1]))
+            crash_reason = launch_guard.update(
+                cmd,
+                engaged=bool(engaged) and (cmd.reason == "ok" or holding),
+                dt_s=tick_dt,
+                heading_rad=hdg,
+                speed_mps=spd_now,
+                damage=dmg,
+                pos_xy=pos_xy,
+            )
+            lane_age_s = float(getattr(pout, "frame_age_s", 0.0) or 0.0)
+            if engaged and gt_preview is not None and (cmd.reason == "ok" or holding):
+                cap = curve_speed_mps(gt_preview.curvature)
+                spd_cap = spd_now if spd_now is not None else ego_v
+                if spd_cap is not None and float(spd_cap) > cap:
+                    cmd.throttle = 0.0
+                if gt_preview.lost:
+                    # Polyline end or a rejected jump. Brake now. The wheel
+                    # stays on the held curve; stop_command would zero it,
+                    # which is how gt_ctrl1 left the bend at 14 m/s.
+                    cmd.throttle = 0.0
+                    cmd.brake = max(float(cmd.brake), 1.0)
+            if engaged and (cmd.reason == "ok" or holding):
+                apply_stale_speed_cap(
+                    cmd,
+                    speed_mps=spd_now,
+                    lane_age_s=lane_age_s,
+                    lane_src=str(getattr(pout, "lane_source", "") or ""),
+                )
+                yaw_from_engage = None
+                if launch_guard.heading is not None and launch_guard.heading0 is not None:
+                    yaw_from_engage = float(launch_guard.heading) - float(launch_guard.heading0)
+                apply_lane_exit_brake(
+                    cmd, lane_x=lane_x, heading_err_rad=yaw_from_engage,
+                )
+            if crash_reason:
+                engaged = False
+                disengage_reason = crash_reason
+                holding = False
+                lane_steer.reset()
+                launch_guard.reset()
+                bot_engage.clear()
+                write_engage_flag(False, disengage_reason=crash_reason)
+                print(
+                    f"[GVD] DISENGAGED: {crash_reason} damage={dmg}",
+                    flush=True,
+                )
+                cmd = stop_command(seq=cmd_seq, reason=crash_reason)
+            long_v = None
+            if vdata is not None:
+                long_v = longitudinal_mps(getattr(vdata, "vel", None), direction)
+            if engaged and moving_backward(long_v):
+                engaged = False
+                disengage_reason = "reverse"
+                holding = False
+                lane_steer.reset()
+                launch_guard.reset()
+                bot_engage.clear()
+                write_engage_flag(False, disengage_reason="reverse")
+                print(
+                    f"[GVD] DISENGAGED: reverse long_mps={long_v:.2f}",
+                    flush=True,
+                )
+                cmd = stop_command(seq=cmd_seq, reason="reverse")
+                if hasattr(actuator, "note_park_hold"):
+                    actuator.note_park_hold()
 
             # Actuators only when engaged + command ok (path / tracks / shadow already on this tick).
             # cmd_json: Lua applies whatever we write only while `engaged` rides along in the payload.
@@ -760,7 +1062,7 @@ def main() -> None:
                 actuator.note_engaged(engaged)
             if hasattr(actuator, "note_ack"):
                 actuator.note_ack(ego_fb)
-            if engaged and cmd.reason == "ok":
+            if engaged and (cmd.reason == "ok" or holding):
                 applied = actuator.apply(cmd)
             else:
                 applied = actuator.stop(seq=cmd_seq, reason=cmd.reason)
@@ -855,6 +1157,14 @@ def main() -> None:
             st["cmd_seq"] = int(applied.seq)
             st["cmd_reason"] = applied.reason
             st["cmd_applied"] = bool(applied.applied)
+            st["lane_hold"] = {
+                "lateral_m": None if lane_x is None else float(lane_x),
+                "lookahead_y_m": None if lane_y is None else float(lane_y),
+                "steer": float(applied.steer),
+                "frame_cmd_ms": float(frame_cmd_ms),
+                "why": lane_steer.reason,
+                "source": getattr(pout, "lane_source", "none"),
+            }
             st["ego_source"] = ego_source
             st["cmd_ack_seq"] = int(ego_fb.applied_seq) if ego_fb is not None else -1
             st["lua_applying"] = bool(ego_fb.applying and ego_fb.fresh) if ego_fb is not None else False
@@ -872,7 +1182,12 @@ def main() -> None:
                 "opposition": ovr.opposition,
                 "ref_seq": ovr.ref_seq,
                 "armed": bool(ovr.armed),
+                "fresh": bool(ovr.fresh),
+                "gap_hold": bool(ovr.gap_hold),
             }
+            st["echo"] = {**echo.telemetry(), "min_mod_version": MIN_MOD_VERSION}
+            if echo.status == STATUS_OUTDATED:
+                st["echo"]["message"] = outdated_message(ego_fb)
             st["shadow"] = {
                 "steer": float(tick.shadow.get("steer", 0.0)),
                 "throttle": float(tick.shadow.get("throttle", 0.0)),
@@ -940,7 +1255,16 @@ def main() -> None:
                 f"electrics_ms={electrics_ms:.2f} "
                 f"state_write_skip={0 if state_due else 1} "
                 f"state_write_skips={state_skips} "
-                f"release_cmd_skips={rel_skips}",
+                f"release_cmd_skips={rel_skips} "
+                f"lane_x={'na' if lane_x is None else f'{lane_x:.4f}'} "
+                f"lane_y={'na' if lane_y is None else f'{lane_y:.2f}'} "
+                f"model_lane_x={'na' if scene_lane_x is None else f'{float(scene_lane_x):.4f}'} "
+                f"model_conf={'na' if scene_conf is None else f'{float(scene_conf):.3f}'} "
+                f"steer={float(applied.steer):+.4f} "
+                f"steer_why={lane_steer.reason} "
+                f"lane_src={getattr(pout, 'lane_source', 'none')} "
+                f"frame_age_s={float(getattr(pout, 'frame_age_s', 0.0) or 0.0):.3f} "
+                f"frame_cmd_ms={frame_cmd_ms:.1f}",
                 flush=True,
             )
 
@@ -988,6 +1312,24 @@ def main() -> None:
             if state_due:
                 write_state(st)
                 soft_esc_state_write_mark()
+
+            if gt_log is not None:
+                gt_log.write(
+                    bng=bng,
+                    vdata=vdata,
+                    engaged=bool(engaged),
+                    lane_x=lane_x,
+                    lane_src=str(getattr(pout, "lane_source", "none") or "none"),
+                    steer=float(applied.steer),
+                    steer_why=lane_steer.reason,
+                    frame_cmd_ms=float(frame_cmd_ms),
+                    frame_age_s=float(getattr(pout, "frame_age_s", 0.0) or 0.0),
+                    stitch=getattr(rig_view, "bgr", None),
+                    lanes_bev=getattr(pout, "lanes_bev", None),
+                    socket_busy=bool(getattr(bundle, "grab_read_blocked", False)),
+                    model_lane_x=None if scene_lane_x is None else float(scene_lane_x),
+                    model_conf=None if scene_conf is None else float(scene_conf),
+                )
 
             review_cap.write(
                 bool(ui.debug.review_record),

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 import math
 import sys
 import tempfile
@@ -59,6 +60,7 @@ from python.train.continual import (  # noqa: E402
     oversample_repeats,
     pass_plan,
     pick_learning_rate,
+    resume_learning_rate,
     should_reset_state,
     simulate_carry,
     strip_roll_is_yaw,
@@ -1214,6 +1216,7 @@ def check_parameter_count_hand_sum() -> None:
     """A tiny built net's trainable count matches a hand sum of its layers."""
     from python.train.scene_net import (
         GRU_HIDDEN,
+        HORIZ_BINS,
         STEM_CHANNELS,
         TOKEN_DIM,
         architecture_parameter_count,
@@ -1284,7 +1287,7 @@ def check_parameter_count_hand_sum() -> None:
     for width in STEM_CHANNELS:
         expected += conv2d_parameter_count(cin, int(width), 3, bias=True)
         cin = int(width)
-    expected += linear_parameter_count(STEM_CHANNELS[-1], SECTOR_FEAT, bias=True)
+    expected += linear_parameter_count(STEM_CHANNELS[-1] * HORIZ_BINS, SECTOR_FEAT, bias=True)
     expected += gru_parameter_count(TOKEN_DIM + 1, GRU_HIDDEN, num_layers=1, bias=True)
     for _name, out in scene_head_sizes():
         expected += linear_parameter_count(GRU_HIDDEN, out, bias=True)
@@ -1293,6 +1296,8 @@ def check_parameter_count_hand_sum() -> None:
     stem_body = stem_at[stem_at.index("class SharedStem") : stem_at.index("class SceneNet")]
     assert "nn.GroupNorm(" in stem_body
     assert "stem_spec()" in stem_body
+    assert "adaptive_avg_pool1d" in stem_body
+    assert "mean(dim=(2, 3))" not in stem_body
     assert "nn.BatchNorm" not in stem_body
     assert "not added" not in stem_body
     print(f"scene parameters: {shown}")
@@ -1571,9 +1576,19 @@ def check_continual_bptt_and_yaw() -> None:
     assert holdout_stopped([0.5]) is False
     assert holdout_stopped([0.5, 0.4]) is False
     assert holdout_stopped([0.5, 0.4, 0.45]) is True
+    flat = [2.333, 2.327, 2.290, 2.282, 2.280]
+    assert holdout_stopped(flat[:3], tol=0.02, window=3) is False
+    assert holdout_stopped(flat, tol=0.02, window=3) is True
     assert pick_learning_rate({1e-3: 0.4, 1e-4: 0.2}) == 1e-4
     assert pick_learning_rate({1e-3: 0.2, 1e-4: 0.4}) == 1e-3
     assert pick_learning_rate({1e-3: 0.2, 1e-4: 0.2}) == CANDIDATE_LRS[0]
+    # The live val pair (rms 1.139 then 1.142) is a holdout stop. The pause
+    # rate from the following 1e-4 pass is not the next schedule.
+    assert holdout_stopped([1.139, 1.142], tol=0.02, window=3) is True
+    assert resume_learning_rate(1e-3, paused=1e-4) == 1e-3
+    assert resume_learning_rate(1e-3, paused=1e-3) == 1e-3
+    assert resume_learning_rate(1e-4, paused=1e-3) == 1e-4
+    assert resume_learning_rate(float("nan"), paused=1e-4) == 1e-3
     assert WEIGHT_DECAY == 0.01
     assert GRAD_CLIP == 1.0
     assert choose_chunk_length(1, 10**9) == 16
@@ -1610,19 +1625,37 @@ def check_continual_bptt_and_yaw() -> None:
     assert "GRAD_CLIP" in body
     assert "pass_plan" in body
     assert "holdout_stopped" in body
+    assert "ordered_learning_rates" not in body
+    assert "pick_learning_rate" not in body
+    assert "for rate_index" not in body
+    assert "resume_learning_rate" in body
+    assert "rates_after=0" in body
     assert body.index("plan_fit") < body.index("_optimizer_step")
+    from python.train.train_scene import _pin_optimizer_lr
+
+    class _Groups:
+        def __init__(self) -> None:
+            self.param_groups = [{"lr": 1e-4, "params": []}]
+
+    pinned = _Groups()
+    _pin_optimizer_lr(pinned, 1e-3)
+    assert pinned.param_groups[0]["lr"] == 1e-3
 
 
 def _readme_offline_ok(text: str) -> bool:
-    """The trainer stays offline on this README and on a 1.7.9 README.
+    """The README documents an offline trainer, for any pinned version.
 
-    The 1.7.8 heading is not required. A pin of 1.7.9 is enough.
+    It names the rule that the trainer leaves BeamNG alone, the 2272 px strip,
+    the free-VRAM batch fit and the not-recommended CPU path, and it states a
+    `VERSION` pin. A version bump must not break this check.
     """
     if "Soft Esc parked" not in text:
         return False
     if "2272" not in text or "free VRAM" not in text or "not recommended" not in text:
         return False
-    return ("1.7.8" in text) or ("1.7.9" in text)
+    if "The trainer does not start or stop it." not in text:
+        return False
+    return re.search(r"\(`VERSION` \d+\.\d+\.\d+\)", text) is not None
 
 
 def check_live_strip_supervision() -> None:
@@ -1718,16 +1751,15 @@ def check_trainer_is_offline() -> None:
     ):
         assert bad not in text, bad
     body = inspect.getsource(train_directory)
-    assert body.index("measure_driving_file") < body.index("plan_fit")
+    assert body.index("training_frame_bytes") < body.index("plan_fit")
     assert body.index("read_free_vram_bytes") < body.index("plan_fit")
     assert body.index("plan_fit") < body.index("_optimizer_step")
     assert "step_dt" in text
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert _readme_offline_ok(readme)
-    # Main pins 1.7.9. That README has no 1.7.8 heading, and this check allows it.
-    later = readme.replace("## Alpha 1.7.8", "## Alpha 1.7.9").replace("1.7.8", "1.7.9")
-    assert "## Alpha 1.7.8" not in later
-    assert "1.7.9" in later
+    # A version bump keeps the check green.
+    later = re.sub(r"\(`VERSION` \d+\.\d+\.\d+\)", "(`VERSION` 9.9.9)", readme)
+    assert later != readme and "(`VERSION` 9.9.9)" in later
     assert _readme_offline_ok(later)
 
 

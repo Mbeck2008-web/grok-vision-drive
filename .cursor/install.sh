@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# GVD Cloud Agent install: idempotent setup for the Linux-runnable Python slice
-# (perception, planning, viz, and the offline smoke/test suite). BeamNG.drive
-# itself is Windows-only, so this prepares everything that runs headless here.
+# Linux offline suite only (perception, planning, viz, tests). BeamNG.tech is
+# Windows. The setup an agent follows on a user's PC is AGENTS.md, not this
+# script. Do not pip-install the CUDA wheel from here.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

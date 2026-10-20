@@ -57,7 +57,7 @@ Soft Esc reads the same tick from `gvd_state.json` and the `[GVD] seg` line. Pol
 ## M3 fields
 
 | `engaged` | bool | Mirrored from Alt+G via `gvd_engage.json` (Lua writes; Python reads) |
-| `disengage_reason` | string | `none` / `not_engaged` / `preview_blocked` / `heartbeat_stale` / `player_steer` / `player_brake` / `player_throttle` / … (sticky reasons live in `gvd_engage.json`) |
+| `disengage_reason` | string | `none` / `not_engaged` / `preview_blocked` / `heartbeat_stale` / `player_steer` / `player_brake` / `player_throttle` / `echo_stale` / `lua_echo_outdated` / … (sticky reasons live in `gvd_engage.json`) |
 | `actuator` | string | `beamngpy` (Tech) / `cmd_json` (retail: GELua applies) / `null` |
 | `cmd_seq` | int | Monotonic command sequence |
 | `cmd_applied` | bool | True when BeamNGpy `vehicle.control` ran, **or** the mod acked this seq via `gvd_ego.json` (fresh, `applying`, `applied_seq` equal to `cmd_seq` or up to 5 behind — a higher seq from a previous supervisor is not an ack) |
@@ -214,8 +214,15 @@ Python reads the file every tick. `engaged:false` is always off. `engaged:true` 
 | `override.opposition` | float | 0..1, how much the residual fights GVD's steer |
 | `override.ref_seq` | int | Command seq the residual was measured against |
 | `override.armed` | bool | False during the ~3 τ warm-up after engage |
+| `override.fresh` | bool | False on a tick that re-read an echo already judged: nothing moved |
+| `override.gap_hold` | bool | This echo came after missed ones: it re-seeds the spike test, the filter and dwell hold |
+| `echo.status` | string | Retail echo freshness (`python/control/echo_link.py`): `fresh` / `repeat` / `waiting` / `stale` / `outdated` / `off` |
+| `echo.seq` / `echo.skipped` / `echo.since_ms` | | Last `echo_seq` consumed, echoes missed before it, ms since `echo_seq` last moved on |
+| `echo.min_mod_version` / `echo.message` | string | Minimum mod version the supervisor accepts; on `outdated`, the refusal line naming it |
 
-On a trip both sides write `gvd_engage.json` `engaged=false` with the `player_*` reason and stay off until Alt+G; the override tick also puts that reason in `gvd_cmd.json`.
+Fresh echoes only (retail `cmd_json`). The mod echoes at 10 Hz and the loop runs at 15–20 Hz, so most ticks re-read the last echo. The steer filter and the dwell consume an echo once, keyed on `gvd_ego.json` `echo_seq`; the dwell clock spans the repeats, so `steer_hold_ms` stays wall time. Chatter rule, exactly: the spike test, the filter and the dwell skip one kind of sample only, the first fresh echo after a skipped or repeated `echo_seq` (it stepped by more than one, or stepped back on a mod reload). That sample re-seeds the spike test; if the next contiguous echo agrees with it (no spike), that echo also takes the gap sample's interval, capped at one nominal echo interval (100 ms, gvd_main `EGO_POLL_S`; `GAP_CREDIT_MAX_S`), and that confirming echo charges the dwell but cannot fire the takeover itself. Contiguous echoes are never discounted, spike after spike included, so a clean, sharp pull counts in full. While engaged, `echo_seq` not moving for ~300 ms (or three fresh echoes in a row each after a gap) is a link fault: `echo_stale`, on the same disengage path as `player_*`. A live `gvd_ego.json` without `echo_seq`, or with a `mod_version` missing or below `MIN_MOD_VERSION` (`python/control/echo_link.py`, 1.7.13), is a mod older than this contract: engage is refused with `lua_echo_outdated`, and the refusal (`[GVD] REFUSE ENGAGE:` and `echo.message`) names the minimum mod version required. GELua's own check also judges each echo once.
+
+On a trip both sides write `gvd_engage.json` `engaged=false` with the `player_*` reason (the supervisor also for `echo_stale` / `lua_echo_outdated`) and stay off until Alt+G; the override tick also puts that reason in `gvd_cmd.json`.
 
 ## M6 — retail drive bus (`gvd_cmd.json` → vehicle, `gvd_ego.json` ← vehicle)
 
@@ -241,6 +248,8 @@ Lua (`gvd_main.applyCmdJson`, 20 Hz): `input.event('steering', s, 2, 900, 0, nil
 | `player_device` | bool | True when vehicle Lua saw a non-`gvd` `input.lastInputs` source (physical wheel/pad/keys). Sources `adas` / `beamngpy` / `tech` are not a player device |
 | `player_steering` / `player_throttle` / `player_brake` | float | Strongest non-`gvd` lastInputs axis. Retail override uses these as an absolute axis when `player_device` is true (centered wheel is 0, not residual vs `cmd.steer`). Soft Esc beamngpy does not: it judges electrics against the command plus a baseline taken at engage |
 | `applied_seq` | int | Last cmd seq Lua applied. Python claims `cmd_applied` only when `0 <= cmd_seq - applied_seq <= 5` |
+| `echo_seq` | int | gvd_main's own counter, +1 per echo written (`onEgoFeedback`); never the command seq (that is `applied_seq`, which stops when commands stop while the wheel is still echoed). The override consumes each echo once; missing means an older mod, and engage is refused (`lua_echo_outdated`) |
+| `mod_version` | string | gvd_main `M.MOD_VERSION` (tracks `VERSION`). Missing or below the supervisor's `MIN_MOD_VERSION` refuses engage (`lua_echo_outdated`) |
 | `applying` | bool | Lua currently holds the inputs |
 | `mtime` | int | `os.time()`; Python uses the file mtime, fresh ≤ 1 s |
 | `gx` / `gy` / `gz` / `yaw_rate` | float? | Vehicle `sensors.gx2` + `obj:getYawAngularVelocity` (IMU extras; planner still vision-only) |

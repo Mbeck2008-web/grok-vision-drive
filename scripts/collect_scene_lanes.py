@@ -893,6 +893,29 @@ def painted_for(level: str) -> Any:
     return lanes
 
 
+def _line_args(
+    pos: Any,
+    heading: float | None,
+    move: Any,
+    hit: object,
+    v_plan: float | None,
+    paint_lane: tuple[float, float] | None,
+    half_width_m: float | None,
+) -> Any:
+    """Path inputs for the excursion gate and the start: one builder for both.
+
+    The gate passes ``clock.start_move(kind)``, the start the clock's move.
+    Everything else is the same tick's car state, painted lane at the car
+    (every phase) and ego half width.
+    """
+    from python.collect.excursion import sent_line_args
+
+    return sent_line_args(
+        float(pos[0]), float(pos[1]), heading, move, hit, v_plan,
+        paint_lane=paint_lane, half_width_m=half_width_m,
+    )
+
+
 def road_lanes(roads: list[Any], hit: object) -> int | None:
     road = road_for(roads, hit)
     if road is None:
@@ -1596,8 +1619,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             CRUISE_S,
             WEAVE_STATS_NOTES,
             WeaveStats,
+            build_sent_line,
             excursion_commands,
-            excursion_path,
             gate_reason,
             near_junction,
             overspeed,
@@ -2533,20 +2556,25 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 and clock.phase_t + tick_dt >= CRUISE_S
                 and pos is not None
             ):
-                kind = clock.peek_kind(lanes_here)
-                # The gate builds the line it would send (excursion_path, same
-                # inputs as the start below), so a refused line keeps cruising
-                # instead of opening the gate and aborting no_path.
+                # The gate builds the line the start below would send: the
+                # same sent_line_args, with the move the clock will start
+                # (start_move: its real direction). A refused line keeps
+                # cruising instead of opening the gate and aborting no_path.
+                start_move = clock.start_move(clock.peek_kind(lanes_here), lanes_here)
+                kind = start_move.phase
                 gate = gate_reason(
                     roads, hit, float(pos[0]), float(pos[1]), heading, kind, v_plan,
                     weave_lane_w=paint_w_now, half_width_m=ego_half_w, paint_lane=paint_lane_now,
+                    line=_line_args(pos, heading, start_move, hit, v_plan, paint_lane_now, ego_half_w),
                 )
                 if gate != "open" and kind != "weave":
                     # A lane change needs a second lane and a clear stretch.
                     # An in-lane weave does not.
+                    start_move = clock.start_move("weave", lanes_here)
                     weave = gate_reason(
                         roads, hit, float(pos[0]), float(pos[1]), heading, "weave", v_plan,
                         weave_lane_w=paint_w_now, half_width_m=ego_half_w, paint_lane=paint_lane_now,
+                        line=_line_args(pos, heading, start_move, hit, v_plan, paint_lane_now, ego_half_w),
                     )
                     kind = "weave"
                     gate = weave
@@ -2619,17 +2647,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 and pos is not None
             ):
                 path_info: dict[str, Any] = {}
-                path, used = excursion_path(
-                    roads,
-                    float(pos[0]),
-                    float(pos[1]),
-                    heading,
-                    move,
-                    hit,
-                    v_plan,
-                    paint_lane=paint_lane_now,
-                    half_width_m=ego_half_w,
-                    info=path_info,
+                path, used = build_sent_line(
+                    roads, _line_args(pos, heading, move, hit, v_plan, paint_lane_now, ego_half_w), path_info,
                 )
                 road = road_for(roads, hit)
                 spec = None if path is None else targets_for(

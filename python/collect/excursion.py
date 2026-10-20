@@ -584,16 +584,27 @@ class ExcursionClock:
             self.phase_t = 0.0
             self.reason = "traffic"
             return
-        kind = chosen if chosen in ("weave", "lane_change") else self.peek_kind(n_lanes)
+        start = self.start_move(chosen, n_lanes)
         self._kind += 1
-        if kind == "lane_change" and (n_lanes is None or int(n_lanes) < 2):
-            kind = "weave"
-        self.phase = kind
+        self.phase = start.phase
         self.phase_t = 0.0
         self.reason = ""
         self._saw_offset = False
-        if kind == "lane_change":
-            self.direction = -int(self.direction or 1)
+        self.direction = int(start.direction)
+
+    def start_move(self, chosen: str | None, n_lanes: int | None) -> Excursion:
+        """The phase and direction the next start takes, without starting it.
+
+        ``_start_next`` uses this, so the gate (``sent_line_args`` with this
+        move) judges the line the start will build: a lane change flips the
+        last direction, a weave keeps it (``clock.direction`` is the side the
+        last sent line used).
+        """
+        kind = chosen if chosen in ("weave", "lane_change") else self.peek_kind(n_lanes)
+        if kind == "lane_change" and (n_lanes is None or int(n_lanes) < 2):
+            kind = "weave"
+        direction = -int(self.direction or 1) if kind == "lane_change" else self.direction
+        return Excursion(kind, 0.0, 0.0, direction, "")
 
     def _to_cruise(self) -> None:
         self.phase = "cruise"
@@ -874,6 +885,63 @@ JUNCTION_AHEAD_M = 40.0
 CURVATURE_MAX = 0.01
 
 
+@dataclass(frozen=True)
+class SentLineArgs:
+    """Everything ``excursion_path`` reads to build a sent line, but the roads.
+
+    ``phase`` and ``direction`` are the only parts of the move it reads. The
+    collector builds one of these for the gate (with ``ExcursionClock.
+    start_move``) and one for the start (with the clock's move), both through
+    ``sent_line_args``, so the gate judges the line the start sends.
+    """
+
+    x: float
+    y: float
+    heading: float | None
+    phase: str
+    direction: int
+    hit: object
+    speed_mps: float | None
+    paint_lane: tuple[float, float] | None
+    half_width_m: float | None
+
+
+def sent_line_args(
+    x: float,
+    y: float,
+    heading: float | None,
+    move: Excursion,
+    hit: object,
+    speed_mps: float | None,
+    *,
+    paint_lane: tuple[float, float] | None,
+    half_width_m: float | None,
+) -> SentLineArgs:
+    """The one place the collector's gate and start build their path inputs."""
+    return SentLineArgs(
+        x=float(x),
+        y=float(y),
+        heading=None if heading is None else float(heading),
+        phase=str(move.phase),
+        direction=1 if int(move.direction) >= 0 else -1,
+        hit=hit,
+        speed_mps=None if speed_mps is None else float(speed_mps),
+        paint_lane=None if paint_lane is None else (float(paint_lane[0]), float(paint_lane[1])),
+        half_width_m=None if half_width_m is None else float(half_width_m),
+    )
+
+
+def build_sent_line(
+    roads: list[RoadPoly], args: SentLineArgs, info: dict | None = None,
+) -> tuple[list[tuple[float, float]] | None, int]:
+    """``excursion_path`` on ``args``: what the gate checks and the start sends."""
+    return excursion_path(
+        roads, args.x, args.y, args.heading, Excursion(args.phase, 0.0, 0.0, args.direction, ""),
+        args.hit, args.speed_mps,  # type: ignore[arg-type]
+        paint_lane=args.paint_lane, half_width_m=args.half_width_m, info=info,
+    )
+
+
 def gate_reason(
     roads: list[RoadPoly],
     hit: object,
@@ -886,6 +954,7 @@ def gate_reason(
     weave_lane_w: float | None = None,
     half_width_m: float | None = None,
     paint_lane: tuple[float, float] | None = None,
+    line: SentLineArgs | None = None,
 ) -> str:
     """Why ``phase`` cannot start, or ``open``.
 
@@ -904,7 +973,16 @@ def gate_reason(
     it). A line it refuses closes the gate with that reason (no_path,
     narrow, road_edge, lat_acc, line_kink, line_gap). ``_span`` (8 m) is only
     for ``near_junction`` and ``fork_ahead_m``.
+
+    ``line`` is the start's own path input (``sent_line_args`` with
+    ``ExcursionClock.start_move``): its direction is the side the start will
+    try first, which decides the line on an asymmetric bend. Without it
+    (library callers) the line is built for direction +1 from the arguments
+    here. The cheap checks (narrow, short, junction, curve) run first; the
+    full line is built only once they pass.
     """
+    if line is not None and line.phase != phase:
+        raise ValueError(f"gate_reason({phase!r}) given a {line.phase!r} line")
     if phase not in ACTIVE or hit is None or not roads:
         return "no_hit"
     if bool(getattr(hit, "off_road", False)) or bool(getattr(hit, "discontinuous", False)):
@@ -946,14 +1024,12 @@ def gate_reason(
         return "short"
     if span / max(length, 1.0) >= CURVATURE_MAX:
         return "curve"
+    if line is None:
+        line = sent_line_args(x, y, heading, Excursion(phase, 0.0, 0.0, 1, ""), hit,
+                              speed_mps if speed_mps else None,
+                              paint_lane=paint_lane, half_width_m=half_width_m)
     info: dict = {}
-    points, _used = excursion_path(
-        roads, x, y, heading, Excursion(phase, 0.0, 0.0, 1, ""), hit,
-        speed_mps if speed_mps else None,  # type: ignore[arg-type]
-        paint_lane=paint_lane if phase == "weave" else None,
-        half_width_m=half_width_m,
-        info=info,
-    )
+    points, _used = build_sent_line(roads, line, info)
     if points is None:
         return str(info.get("refused") or "no_path")
     return "open"

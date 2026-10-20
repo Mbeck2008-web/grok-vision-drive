@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 import math
 import sys
 import tempfile
@@ -1642,15 +1643,19 @@ def check_continual_bptt_and_yaw() -> None:
 
 
 def _readme_offline_ok(text: str) -> bool:
-    """The trainer stays offline on this README and on a 1.7.9 README.
+    """The README documents an offline trainer, for any pinned version.
 
-    The 1.7.8 heading is not required. A pin of 1.7.9 is enough.
+    It names the rule that the trainer leaves BeamNG alone, the 2272 px strip,
+    the free-VRAM batch fit and the not-recommended CPU path, and it states a
+    `VERSION` pin. A version bump must not break this check.
     """
     if "Soft Esc parked" not in text:
         return False
     if "2272" not in text or "free VRAM" not in text or "not recommended" not in text:
         return False
-    return ("1.7.8" in text) or ("1.7.9" in text)
+    if "The trainer does not start or stop it." not in text:
+        return False
+    return re.search(r"\(`VERSION` \d+\.\d+\.\d+\)", text) is not None
 
 
 def check_live_strip_supervision() -> None:
@@ -1752,10 +1757,9 @@ def check_trainer_is_offline() -> None:
     assert "step_dt" in text
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert _readme_offline_ok(readme)
-    # Main pins 1.7.9. That README has no 1.7.8 heading, and this check allows it.
-    later = readme.replace("## Alpha 1.7.8", "## Alpha 1.7.9").replace("1.7.8", "1.7.9")
-    assert "## Alpha 1.7.8" not in later
-    assert "1.7.9" in later
+    # A version bump keeps the check green.
+    later = re.sub(r"\(`VERSION` \d+\.\d+\.\d+\)", "(`VERSION` 9.9.9)", readme)
+    assert later != readme and "(`VERSION` 9.9.9)" in later
     assert _readme_offline_ok(later)
 
 

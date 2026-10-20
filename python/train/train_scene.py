@@ -332,11 +332,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--holdout-cells",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
-            "Spatial holdout: a seeded set of 250 m map cells with about 20%% of rows "
+            "Road-area holdout: a seeded set of 250 m map cells with about 20%% of rows "
             "(fast and slow cells in proportion) is scored, and train drops rows within "
-            "50 m of them. The list is saved and reused (see --holdout-cells-file)."
+            "50 m of them. Cells are map coordinates, so a road's frames from every recording "
+            "land on the same side. The list is saved and reused (see --holdout-cells-file). "
+            "Default: on when training several recordings (--recording, or a combined folder) "
+            "and --holdout-blocks is not set above 1; else off. --no-holdout-cells turns it off."
         ),
     )
     parser.add_argument(
@@ -415,6 +419,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="With --backbone imagenet-*, keep the ImageNet weights fixed and train only the projection and heads.",
     )
     return parser
+
+
+def resolve_holdout_cells(flag: bool | None, recordings: int, blocks: int) -> bool:
+    """``--holdout-cells`` as given; unset, on for several recordings unless time blocks are asked for."""
+    if flag is not None:
+        return bool(flag)
+    return int(recordings) > 1 and int(blocks) <= 1
+
+
+def count_recordings(root: Path | str) -> int:
+    """Recordings in a folder: a combined folder lists them, any other folder is one."""
+    from python.train.combine_recordings import recordings_metadata
+
+    try:
+        return len(recordings_metadata(root))
+    except Exception:
+        return 1
 
 
 def resolve_holdout_blocks(value: int | None) -> int:
@@ -2803,6 +2824,12 @@ def main(argv: list[str] | None = None) -> None:
     if not open_panel:
         print("[GVD] scene train: no panel", flush=True)
     try:
+        holdout_blocks = resolve_holdout_blocks(args.holdout_blocks)
+        n_recordings = len(args.recording) or count_recordings(args.strips)
+        holdout_cells = resolve_holdout_cells(args.holdout_cells, n_recordings, holdout_blocks)
+        if args.holdout_cells is None and holdout_cells:
+            print(f"[GVD] holdout: {n_recordings} recordings, road-area cells by default "
+                  "(--no-holdout-cells or --holdout-blocks N for the time split)", flush=True)
         stats = train_directory(
             Path(args.strips),
             epochs=args.epochs,
@@ -2826,8 +2853,8 @@ def main(argv: list[str] | None = None) -> None:
             workers=default_num_workers() if args.workers is None else int(args.workers),
             scale=float(args.scale),
             batch_size=int(args.batch),
-            holdout_blocks=resolve_holdout_blocks(args.holdout_blocks),
-            holdout_cells=bool(args.holdout_cells),
+            holdout_blocks=holdout_blocks,
+            holdout_cells=holdout_cells,
             holdout_cells_file=Path(args.holdout_cells_file) if args.holdout_cells_file else None,
             holdout_seed=int(args.holdout_seed),
             conf_weight=float(args.conf_weight),

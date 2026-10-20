@@ -1153,7 +1153,9 @@ def cell_holdout_labels(
     ``hold``: the row sits in a listed cell. ``gap``: no position, within
     ``buffer_m`` of a listed cell, or within ``gap_s`` seconds of a holdout
     row in the same recording order (so the GRU never trains on the frames
-    right before or after a scored stretch). Everything else is ``train``.
+    right before or after a scored stretch). Rows of a combined folder are
+    timed against their own recording only (clocks of two recordings
+    overlap). Everything else is ``train``.
     """
     cell_m = float(spec.get("cell_m", HOLDOUT_CELL_M))
     buffer_m = float(spec.get("buffer_m", HOLDOUT_BUFFER_M))
@@ -1183,13 +1185,20 @@ def cell_holdout_labels(
     gap = max(0.0, float(gap_s))
     if gap > 0:
         times = [_row_time(row) for row in rows]
-        hold_times = sorted(t for t, lab in zip(times, labels) if lab == "hold" and t is not None)
-        if hold_times:
+        sources = [row.get("recording") for row in rows]
+        by_source: dict[Any, list[float]] = {}
+        for t, lab, src in zip(times, labels, sources):
+            if lab == "hold" and t is not None:
+                by_source.setdefault(src, []).append(t)
+        if by_source:
             import bisect
 
+            for hold_list in by_source.values():
+                hold_list.sort()
             for index, (stamp, lab) in enumerate(zip(times, labels)):
                 if lab != "train" or stamp is None:
                     continue
+                hold_times = by_source.get(sources[index], [])
                 j = bisect.bisect_left(hold_times, stamp)
                 for k in (j - 1, j):
                     if 0 <= k < len(hold_times) and abs(hold_times[k] - stamp) < gap:

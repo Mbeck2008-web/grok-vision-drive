@@ -32,6 +32,9 @@
     links (byte copies across volumes; never re-encoded); each row keeps its
     recording id, a per-recording usable_until cut is honoured, and the
     metadata records the cut, its reason and whether the run finished.
+(j) the holdout splits by road area (250 m map cells), the same cells for
+    every recording, so no road has frames in both train and val; it is the
+    default when more than one recording is trained.
 """
 from __future__ import annotations
 
@@ -533,7 +536,7 @@ def check_camera_contract() -> None:
 
 
 def _write_recording(root: Path, n: int, *, t0: float, pos=lambda i: (0.0, float(i)), value: int = 100,
-                     segment: str = "west_coast_usa#0") -> None:
+                     segment: str = "west_coast_usa#0", dt: float = 0.1) -> None:
     import json
 
     rows = []
@@ -541,7 +544,7 @@ def _write_recording(root: Path, n: int, *, t0: float, pos=lambda i: (0.0, float
         for cam in ("main", "narrow", "wide"):
             _png(root / "raw" / cam / f"{i:06d}.png", value)
         x, y = pos(i)
-        rows.append({"i": i, "t": t0 + 0.1 * i, "segment": segment, "map": "west_coast_usa",
+        rows.append({"i": i, "t": t0 + dt * i, "segment": segment, "map": "west_coast_usa",
                      "ego": {"speed_mps": 10.0, "damage": 0.0, "dir": [0.0, 1.0, 0.0], "pos": [x, y, 0.0]},
                      "cams": {cam: {"file": f"raw/{cam}/{i:06d}.png"} for cam in ("main", "narrow", "wide")}})
     (root / "state.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
@@ -629,8 +632,73 @@ def check_multi_recording() -> None:
           f"between recordings; cut logged as '{line}' OK")
 
 
+def check_road_area_holdout() -> None:
+    import json
+    import math
+
+    from python.train.combine_recordings import combine_recordings
+    from python.train.continual import (
+        HOLDOUT_BUFFER_M,
+        HOLDOUT_CELL_M,
+        cell_holdout_labels,
+        cell_of,
+        choose_holdout_cells,
+    )
+    from python.train.train_scene import build_parser, count_recordings, resolve_holdout_cells
+
+    def loop(i: int, phase: float) -> tuple[float, float]:
+        # Both recordings drive the same 2 km x 1.2 km loop at about 26 m/s, from different points.
+        a = (i * 0.004 + phase) % 1.0
+        per = 2 * (2000 + 1200)
+        d = a * per
+        if d < 2000:
+            return d, 0.0
+        if d < 3200:
+            return 2000.0, d - 2000
+        if d < 5200:
+            return 2000 - (d - 3200), 1200.0
+        return 0.0, 1200 - (d - 5200)
+
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        _write_recording(tmp / "rec5b", 600, t0=1000.0, pos=lambda i: loop(i, 0.0), dt=1.0)
+        _write_recording(tmp / "rec5c", 500, t0=1010.0, pos=lambda i: loop(i, 0.37), dt=1.0)
+        out = tmp / "combined"
+        combine_recordings([tmp / "rec5b", tmp / "rec5c"], out)
+        rows = [json.loads(line) for line in (out / "state.jsonl").read_text().splitlines()]
+        spec = choose_holdout_cells(rows, seed=3)
+        labels = cell_holdout_labels(rows, spec)
+        sides: dict[tuple[int, int], set[str]] = {}
+        by_rec: dict[str, dict[str, set]] = {}
+        for row, lab in zip(rows, labels):
+            xy = (row["ego"]["pos"][0], row["ego"]["pos"][1])
+            sides.setdefault(cell_of(xy), set()).add(lab)
+            by_rec.setdefault(row["recording"], {}).setdefault(lab, set()).add(cell_of(xy))
+        assert all(not {"train", "hold"} <= s for s in sides.values()), "a road area on both sides"
+        assert by_rec["rec5b"]["hold"] & by_rec["rec5c"]["hold"], "the same road held out in both recordings"
+        assert not (by_rec["rec5b"]["train"] | by_rec["rec5c"]["train"]) & (
+            by_rec["rec5b"]["hold"] | by_rec["rec5c"]["hold"]), "a held cell trains in another recording"
+        trains = [r["ego"]["pos"][:2] for r, lab in zip(rows, labels) if lab == "train"]
+        holds = [r["ego"]["pos"][:2] for r, lab in zip(rows, labels) if lab == "hold"]
+        assert trains and holds
+        nearest = min(math.dist(a, b) for a in trains[::3] for b in holds[::3])
+        assert nearest >= HOLDOUT_BUFFER_M - 10.0, nearest  # sampled rows are about 8 m apart
+        n_cells = len({cell_of(tuple(h)) for h in holds})
+        n_shared = len(by_rec["rec5b"]["hold"] & by_rec["rec5c"]["hold"])
+        assert count_recordings(out) == 2 and count_recordings(tmp / "rec5b") == 1
+    assert resolve_holdout_cells(None, 2, 1) is True
+    assert resolve_holdout_cells(None, 1, 1) is False
+    assert resolve_holdout_cells(None, 2, 4) is False, "explicit time blocks win"
+    assert resolve_holdout_cells(False, 2, 1) is False and resolve_holdout_cells(True, 1, 1) is True
+    assert build_parser().parse_args([]).holdout_cells is None
+    assert build_parser().parse_args(["--no-holdout-cells"]).holdout_cells is False
+    print(f"(j) two recordings on one loop: {n_cells} held {int(HOLDOUT_CELL_M)} m cells ({n_shared} driven by both), no cell "
+          f"in train and val, nearest train row {nearest:.0f} m from val; default on for 2 recordings OK")
+
+
 def main() -> None:
     check_multi_recording()
+    check_road_area_holdout()
     check_camera_contract()
     check_cache_on_c()
     check_other_cams()

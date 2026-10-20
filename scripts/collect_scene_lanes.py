@@ -39,12 +39,18 @@ keeps weaves off unpainted stretches and junctions, and ends an excursion when
 its 60 m AI line runs out.
 
 An excursion line goes out with beamngpy's ``vehicle.ai.set_line``
-(``python.collect.ai_line``) and is acked by reading the AI state back: the
-mode must be ``manual`` and the line's last node must be in the AI's map
-within LINE_ACK_TIMEOUT_S, else the move is aborted ``line_not_active``. While
-it runs it is read back every LINE_RECHECK_S; a route that is gone aborts it
-``line_lost``. Collectors before this sent ``ai.setLine``, which 0.39.4.0's
-``ai`` does not have (``scripts/excursion_validity.py`` marks those tags).
+(``python.collect.ai_line``) and is acked by reading the AI's own route back:
+the last node of its route map on our last point, ``ai.isDriving()``, and its
+current target a ``wp_`` node, within LINE_ACK_TIMEOUT_S of the send, else the
+move is aborted ``line_not_active``. The readback never blocks the tick loop:
+the request goes out with the line and its reply is picked up on later ticks.
+Rows until the ack are tagged ``<phase>_pending`` (``weave_pending``), never
+the move itself. While the line runs it is read back every LINE_RECHECK_S; a
+route that is gone (or no reply in LINE_ACK_TIMEOUT_S) aborts it ``line_lost``.
+Collectors before this sent ``ai.setLine``, which 0.39.4.0's ``ai`` does not
+have (``scripts/excursion_validity.py`` marks those tags). ``collect smoke``
+log lines and ``weave_stats.line_smoke`` are the smoke-run instrumentation
+(``python.collect.line_smoke``).
 
 Row fields in ``state.jsonl`` written by this collector, besides the frame data:
 
@@ -60,7 +66,9 @@ Row fields in ``state.jsonl`` written by this collector, besides the frame data:
 * ``ego.up``: the State sensor's up vector. ``ego.damage``: Damage sensor total.
 * ``excursion.line_ack``: on weave / lane_change / recover rows, the readback
   ack of the line that move sent (``ok``, ``mode``, ``wait_s``, ``polls``).
-  Its absence on active rows marks a recording from before the ack.
+  Its absence on active rows marks a recording from before the ack. Rows
+  between the send and the ack have ``excursion.phase`` ``weave_pending`` /
+  ``lane_change_pending`` / ``recover_pending`` and ``line_ack.pending``.
 
 ``impacts.jsonl`` beside ``state.jsonl`` has one ``{"kind": "impact", "t",
 "i", "pre_t0", "pre_i0", ...}`` line per impact and one ``{"kind":
@@ -1652,7 +1660,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             ramp_heading_reached,
             targets_for,
         )
-        from python.collect.ai_line import LINE_LOST, LINE_RECHECK_S, recheck_line, send_and_ack
+        from python.collect.ai_line import LINE_LOST, LINE_NOT_ACTIVE, LineTracker, pending_phase
+        from python.collect.line_smoke import LineSmoke
 
         clock = ExcursionClock()
         from python.collect.liveness import (
@@ -1672,10 +1681,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         yield_guard = YieldGuard(float(getattr(args, "min_live_yield", 0.0) or 0.0))
         last_row_i: int | None = None
         line_left_m: float | None = None
-        # The line the AI is following (acked), its row tag, and the last readback time.
-        line_points: list[tuple[float, float]] | None = None
-        line_ack_tag: dict[str, Any] | None = None
-        line_check_t = 0.0
+        # The line in flight: pending until its readback ack, then rechecked. Never blocks a tick.
+        line = LineTracker()
         spawn_cov: float | None = None
         spawn_road: str | None = None
         damage_seen = False
@@ -1723,6 +1730,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         # weave / lane change / recover counters (collect.json weave_stats).
         speed_ranges: dict[str, list[dict[str, Any]]] = {}
         weave_stats = WeaveStats()
+        # Smoke-run instrumentation for the lines (weave_stats.line_smoke and "collect smoke" log lines).
+        smoke = LineSmoke()
         # Planning speed and phase of the move in progress (None between moves).
         plan_v: float | None = None
         plan_phase = ""
@@ -2178,6 +2187,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             extra["impact_respawn"] = {"on": impact_respawn_on, **impact_respawns}
             extra["speed_ranges"] = {k: list(v) for k, v in speed_ranges.items()}
             extra["weave_stats"] = weave_stats.summary()
+            extra["weave_stats"]["line_smoke"] = smoke.summary(weave_stats.aborted)
             # Lane-change rows carry the peak heading reached so far (older recordings: the full-ramp peak).
             extra["lane_change_tag"] = "peak_so_far"
             extra["notes"] = {
@@ -2442,6 +2452,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     clock = ExcursionClock()
                     # A new segment or a respawn: the next refusal is a new blocked stretch.
                     weave_stats.end_stretch()
+                    line.drop()
+                    for smoke_line in smoke.flush():
+                        print(smoke_line, flush=True)
                     lane_change_run = None
                     last_ai = None
                     held_tag = None
@@ -2544,20 +2557,27 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     plan_overspeed_noted = True
             if lane_change_run is not None and clock.phase == "lane_change":
                 lane_change_run["covered_m"] += max(0.0, float(speed_mps_f or 0.0)) * tick_dt
-            if line_points is not None:
-                if clock.phase not in ACTIVE:
-                    line_points, line_ack_tag = None, None
-                elif time.monotonic() - line_check_t >= LINE_RECHECK_S:
-                    line_check_t = time.monotonic()
-                    again = recheck_line(vehicle, line_points)
-                    if not again.ok:
-                        # The route the line installed is gone: back to the lane, tagged.
-                        print(f"collect excursion {segment_id} {clock.phase} abort {LINE_LOST} {again.detail}", flush=True)
-                        weave_stats.abort(clock.phase, LINE_LOST, plan_v)
-                        clock.force_abort(LINE_LOST)
+            if line.state != "idle":
+                if clock.phase not in ACTIVE or clock.phase != line.phase:
+                    line.drop()
+                else:
+                    # Non-blocking: look for the readback reply sent on an earlier tick, send the next one.
+                    line_t = time.monotonic()
+                    line_ev = line.tick(vehicle, line_t)
+                    if line_ev.kind == "acked":
+                        print(f"collect excursion {segment_id} {clock.phase} line acked {line_ev.detail}", flush=True)
+                        smoke.event("ack", line_t, segment_id, line_ev.detail)
+                    elif line_ev.kind in ("recheck_sent", "recheck_ok"):
+                        smoke.event(line_ev.kind, line_t, segment_id, line_ev.detail)
+                    elif line_ev.kind in (LINE_NOT_ACTIVE, LINE_LOST):
+                        # No ack in LINE_ACK_TIMEOUT_S, or the route the line installed is gone: back to the lane.
+                        print(f"collect excursion {segment_id} {clock.phase} abort {line_ev.kind} {line_ev.detail}", flush=True)
+                        smoke.event("ack_fail" if line_ev.kind == LINE_NOT_ACTIVE else "line_lost", line_t, segment_id,
+                                    line_ev.detail)
+                        weave_stats.abort(clock.phase, line_ev.kind, plan_v)
+                        clock.force_abort(line_ev.kind)
                         line_left_m = None
                         plan_v, plan_phase = None, ""
-                        line_points, line_ack_tag = None, None
             if line_left_m is not None:
                 if clock.phase not in ACTIVE:
                     line_left_m = None
@@ -2773,12 +2793,13 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 send_ai = False
             if send_ai:
                 if excursions_on and not waypoint and resolved.phase in ACTIVE and path:
-                    # beamngpy set_line, then the readback ack. Nothing is sent after the line.
-                    ack = send_and_ack(vehicle, path, speed, queue=_queue)
-                    if ack.ok:
+                    # beamngpy set_line and one readback request; the ack is read on later ticks
+                    # (LineTracker.tick above). Nothing is sent after the line.
+                    line_t = time.monotonic()
+                    ack = line.start(vehicle, path, speed, queue=_queue, now=line_t, phase=resolved.phase)
+                    if ack is None:
                         commands = []
-                        line_points, line_ack_tag = list(path), ack.as_tag()
-                        line_check_t = time.monotonic()
+                        smoke.line_start(line_t, pos, path, resolved.phase, segment_id)
                     else:
                         print(f"collect excursion {segment_id} {resolved.phase} abort {ack.reason} "
                               f"{ack.detail} polls={ack.polls} wait={ack.wait_s:.2f}s", flush=True)
@@ -2787,12 +2808,12 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                         path = None
                         plan_v, plan_phase = None, ""
                         lane_change_run = None
-                        line_points, line_ack_tag = None, None
+                        smoke.event("ack_fail", line_t, segment_id, ack.detail)
                         ai_key = (round(speed, 3), waypoint, resolved.phase, resolved.direction, map_name)
                         commands = excursion_commands(speed, resolved.phase, resolved.direction, traffic=False)
                 else:
                     # No line goes out with these: no line to recheck, and no ack on the rows.
-                    line_points, line_ack_tag = None, None
+                    line.drop()
                     commands = (
                         excursion_commands(
                             speed,
@@ -2899,8 +2920,14 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 "map": map_name or None,
                 "excursion": move.as_tag(),
             }
-            if line_ack_tag is not None and move.phase in ACTIVE:
-                tags["excursion"]["line_ack"] = dict(line_ack_tag)
+            if move.phase in ACTIVE and line.state != "idle" and line.phase == move.phase:
+                if line.pending:
+                    # Sent, not acked yet: the car may still be on held inputs. Never a weave row.
+                    tags["excursion"]["phase"] = pending_phase(move.phase)
+                tags["excursion"]["line_ack"] = line.tag()
+            for smoke_line in smoke.tick(mono, pos, direction, speed_mps_f, sample.get("yaw_rate"),
+                                         tags["excursion"]["phase"], segment_id):
+                print(smoke_line, flush=True)
             if spawn_kind:
                 tags["spawn_type"] = spawn_kind
                 tags["spawn_paint_cov"] = None if spawn_cov is None else round(float(spawn_cov), 3)

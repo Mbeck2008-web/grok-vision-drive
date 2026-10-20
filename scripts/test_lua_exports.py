@@ -39,7 +39,10 @@ SCOPE = [ROOT / "scripts" / "collect_scene_lanes.py"] + [
 CALL = re.compile(r"(?<![\w.:])([A-Za-z_]\w*)([.:])([A-Za-z_]\w*)\s*\(")
 READ = re.compile(r"(?<![\w.:])([A-Za-z_]\w*)\.([A-Za-z_]\w*)\b(?!\s*\()")
 
-LUA_STDLIB = {"string", "math", "table", "os", "io", "coroutine"}
+# ``debug``: the line readback reads the ai-local route with debug.getupvalue.
+# The vehicle VM has it (0.39.4.0 ai.lua 169, powertrain.lua 1207 call it);
+# only the game-engine techCore sets ``debug = nil``.
+LUA_STDLIB = {"string", "math", "table", "os", "io", "coroutine", "debug"}
 # ``x:y(`` receivers that are engine objects (C++ bindings, not Lua modules).
 ENGINE_RECEIVERS = {"be", "veh", "v", "obj", "FS"}
 # ``x.y(`` text in string literals that is not Lua sent to the game (log and

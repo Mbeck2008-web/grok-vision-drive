@@ -16,6 +16,13 @@ from python.debug.gt_geom import CURVATURE_AHEAD_M, RoadPoly, lane_center_offset
 
 PHASES = ("cruise", "weave", "lane_change", "recover", "abort")
 ACTIVE = ("weave", "lane_change", "recover")
+# Row tags only (the clock never is in these): a move whose line is sent but
+# not acked yet (python.collect.ai_line). Such a row is never tagged as the
+# move itself, and it is masked like one.
+PENDING = tuple(f"{p}_pending" for p in ACTIVE)
+# Rows a trainer leaves out as excursion rows: the moves, their pending
+# rows, and the abort back to the lane.
+EXCURSION_MASK_PHASES = ACTIVE + PENDING + ("abort",)
 CRUISE_S = 20.0
 WEAVE_S = 12.0
 LANE_CHANGE_S = 8.0
@@ -282,6 +289,9 @@ def ramp_heading_reached(delta_m: float, ramp_m: float, covered_m: float) -> flo
 
 
 WEAVE_STATS_NOTES = {
+    "line_smoke": "smoke-run instrumentation (python.collect.line_smoke): per weave start the distance to the first "
+                  "line point and per-tick position delta / unexplained jump / speed for +/- 1 s, the tick spacing "
+                  "+/- 1 s around every line ack and recheck, yaw rate vs commanded yaw rate per weave, and the pass bar",
     "started": "moves whose shaped line was sent, by phase (weave, lane_change, recover)",
     "refused": "blocked stretches, by the first refusal reason of the stretch: a run of consecutive "
                "refused start attempts, ended by an excursion start, the segment end or a respawn",
@@ -705,7 +715,7 @@ def excursion_commands(
 
     With a path these are only the lines sent *before* the line itself
     (``ai_line.pre_line_commands``). The line goes out with beamngpy's
-    ``vehicle.ai.set_line`` (``ai_line.send_and_ack``) and nothing is sent
+    ``vehicle.ai.set_line`` (``ai_line.LineTracker.start``) and nothing is sent
     after it: 0.39.4.0's ``ai`` has no ``setLine``, and a later
     ``setMode``/``setState`` would drop the route the line installs.
     Cruise and abort put lane-follow back: ``setMode`` span or traffic

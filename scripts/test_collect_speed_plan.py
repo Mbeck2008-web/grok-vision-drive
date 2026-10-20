@@ -311,8 +311,11 @@ def _lane_change_run(v_car: float, flags: list[str]):
         collect.painted_for, exc.ExcursionClock.peek_kind = previous  # type: ignore[assignment]
     assert code == 0, text[-2000:]
     rows = harness._rows(out)
-    heads = [abs(float(r["excursion"]["target_heading_rad"])) for r in rows
-             if (r.get("excursion") or {}).get("phase") == "lane_change"]
+    # The send tick's row is lane_change_pending (the readback ack is read on the next tick), then lane_change.
+    moves = [r for r in rows if (r.get("excursion") or {}).get("phase") in ("lane_change", "lane_change_pending")]
+    phases = [r["excursion"]["phase"] for r in moves]
+    assert phases[:1] == ["lane_change_pending"] and phases[1:] == ["lane_change"] * (len(phases) - 1), phases
+    heads = [abs(float(r["excursion"]["target_heading_rad"])) for r in moves]
     ws = json.loads((out / "collect.json").read_text(encoding="utf-8"))["weave_stats"]
     return text, heads, ws
 

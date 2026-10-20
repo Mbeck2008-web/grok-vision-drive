@@ -368,6 +368,16 @@ def check_damage_and_up_are_read() -> None:
 
 
 # ------------------------------------------------------ collector, end to end
+class _ReadyReadback:
+    """A readback whose reply is there on the first poll (python.collect.ai_line LineTracker)."""
+
+    def __init__(self, reply: str) -> None:
+        self.reply = reply
+
+    def poll(self) -> tuple[bool, str, str]:
+        return True, self.reply, ""
+
+
 class _CrashVehicle:
     """10 m/s, a crash to 0.2 m/s, stopped, then driving again, then the stop file."""
 
@@ -422,15 +432,17 @@ class _CrashVehicle:
         del cling
         self.lines.append(list(line))
 
-    def queue_lua_command(self, command: str, *args: object) -> str | None:
-        if args and args[0] is True:
-            # The collector's line readback: the AI follows the last line it was sent.
-            if not self.lines:
-                return "span|none|true"
-            x, y = self.lines[-1][-1]["pos"][:2]
-            return f"manual|{float(x):.2f},{float(y):.2f}|true"
+    def queue_lua_command(self, command: str, *args: object) -> None:
+        assert not (args and args[0] is True), "the collector never waits for a Lua reply"
         self.commands.append(str(command))
-        return None
+
+    def send_lua_readback(self, chunk: str) -> "_ReadyReadback":
+        """The collector's non-blocking line readback: the AI follows the last line it was sent."""
+        del chunk
+        if not self.lines:
+            return _ReadyReadback("span|none|true|none|noupv|false")
+        x, y = self.lines[-1][-1]["pos"][:2]
+        return _ReadyReadback(f"manual|{float(x):.2f},{float(y):.2f}|true|wp_2|upv|true")
 
     def connect(self, bng: object) -> None:
         del bng

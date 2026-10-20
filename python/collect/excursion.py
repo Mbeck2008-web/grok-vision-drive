@@ -837,6 +837,12 @@ def _chain(
         if not piece:
             break
         for px, py, fx, fy, s_m in piece:
+            if samples and s_m < 1e-6:
+                # A continuation's first sample is the previous tip again: same
+                # s, a few degrees of heading apart. Offset by the lane center,
+                # that pair is a lateral step over ~0 m, which path_lat_acc
+                # read as 13-38 m/s^2 and refused the weave.
+                continue
             samples.append((px, py, fx, fy, s_m + base))
             heading_now = math.atan2(fy, fx)
             if h0 is None:

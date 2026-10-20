@@ -20,8 +20,10 @@ is conditioned before anyone believes it:
 * **Spike reject.** A sample that jumps more than `steer_spike` from the previous one is
   mechanical, not muscular: the filter holds instead of following it. This is what kills the
   large alternating chatter an EMA alone would only attenuate. After a `gap` (echoes missed in
-  between) the previous sample is not this one's neighbour, so agreement with it proves
-  nothing: that sample only re-seeds the spike test and the next contiguous one decides.
+  between, or a counter that stepped back) the previous sample is not this one's neighbour, so
+  agreement with it proves nothing: that sample only re-seeds the spike test and the next
+  contiguous one decides. If that one agrees (no spike), it takes both intervals, so the
+  gap costs no dwell time.
 * **EMA on the residual only** — not on the inputs and not on the command. For a linear filter
   those are the same thing (`lpf(a) - lpf(b) == lpf(a - b)`), and one state is cheaper to reason
   about than three.
@@ -29,8 +31,10 @@ is conditioned before anyone believes it:
   than one going along with it, so it counts up to `OPPOSITION_GAIN` more — a nudge on the
   threshold, not a separate rule, and it fades to nothing when GVD is steering straight.
 * **Hysteresis + dwell.** Charge above `steer_enter`, discharge below `steer_exit`, and only
-  call it an override once the dwell reaches `steer_hold_ms`. A spike that follows a spike is
-  chatter: the filter holds and so does the dwell, so a frozen filter cannot run the clock out.
+  call it an override once the dwell reaches `steer_hold_ms`. The dwell is withheld on one kind
+  of sample only: the first fresh echo after a skipped or repeated `echo_seq` (`gap`; a counter
+  that steps back, a mod reload, counts as one). Two spikes in a row on contiguous echoes are
+  judged like any other pair, so a clean, sharp real pull is never discounted.
 
 Pedals are deliberately asymmetric and tight: no filter, no dwell, one-sided (only a press
 *beyond* what GVD asked for counts) and brake trips lower than throttle. There is no benign
@@ -269,8 +273,8 @@ class OverrideDetector:
         # Compared against the next raw residual so the first sample can be a spike too
         # (a kick off rest). None would let that kick into the filter and freeze it there.
         self._last_raw: float = 0.0
-        # Whether the last step between fresh samples agreed (no spike). Rest counts as steady.
-        self._last_steady = True
+        # Time a gap sample held back, credited to the next contiguous sample if that agrees.
+        self._gap_dt = 0.0
         self._steer_held = 0.0
         self._steer_sign = 0
         self._last_t: float | None = None
@@ -300,7 +304,7 @@ class OverrideDetector:
         self._cmds.clear()
         self._filt = 0.0
         self._last_raw = 0.0
-        self._last_steady = True
+        self._gap_dt = 0.0
         self._steer_held = 0.0
         self._steer_sign = 0
         self._armed_at = None
@@ -366,6 +370,7 @@ class OverrideDetector:
         self._last_t = t
         if not self.armed(t):
             self._steer_held = 0.0
+            self._gap_dt = 0.0
             self._steer_sign = 0
             self.verdict = OverrideVerdict(armed=False)
             return self.verdict
@@ -427,21 +432,25 @@ class OverrideDetector:
         # Sample-to-sample jump past steer_spike is mechanical: skip the EMA so a kick does
         # not drag the filter with it. last_raw still advances, so a hold after the kick is
         # a zero jump next tick and the filter is allowed to follow.
+        # Chatter rule, exactly: the only sample whose spike test is suppressed (and whose dwell
+        # is withheld) is the first fresh echo after a skipped or repeated echo_seq (`gap`).
         # Across a gap the previous sample is not this one's neighbour: a skipped kick between
-        # two same-sign kicks looks like a steady pull. A sample after a gap only re-seeds the
-        # spike test; the next contiguous sample decides. A real pull costs one sample.
-        # Spike after spike is the wheel chattering, not a hand on it. The filter is already
-        # holding; the dwell holds too, so a level the filter froze at cannot run the clock out.
-        spike = abs(raw - self._last_raw) > cfg.steer_spike
+        # two same-sign kicks looks like a steady pull. That sample only re-seeds the spike
+        # test; the next contiguous sample decides. Contiguous echoes are never discounted,
+        # spike after spike included, so a clean, sharp real pull costs nothing.
+        # The gap sample's time is not lost: if the next contiguous echo agrees with it (no
+        # spike), the two were one steady wheel and that echo takes both intervals.
         gap_hold = bool(gap)
-        chatter = spike and not self._last_steady
+        spike = (not gap_hold) and abs(raw - self._last_raw) > cfg.steer_spike
         self._last_raw = raw
-        # After a gap the step is unknown, not steady.
-        self._last_steady = not spike and not gap_hold
         if gap_hold:
-            spike = False
+            self._gap_dt = dt
+            step_dt = 0.0
+        else:
+            step_dt = min(1.0, dt + (0.0 if spike else self._gap_dt))
+            self._gap_dt = 0.0
         if not spike and not gap_hold:
-            self._filt += ema_alpha(dt, cfg.lpf_tau_s) * (raw - self._filt)
+            self._filt += ema_alpha(step_dt, cfg.lpf_tau_s) * (raw - self._filt)
         opp = opposition(ref.steer, self._filt)
         eff = self._filt * (1.0 + OPPOSITION_GAIN * opp)
 
@@ -452,8 +461,7 @@ class OverrideDetector:
             self._steer_held = 0.0
         if mag >= cfg.steer_enter:
             self._steer_sign = sign
-            if not chatter and not gap_hold:
-                self._steer_held += dt
+            self._steer_held += step_dt
         elif mag <= cfg.steer_exit:
             self._steer_held = 0.0
             self._steer_sign = 0

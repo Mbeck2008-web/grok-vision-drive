@@ -7,6 +7,10 @@
 -- Detector, path, planner and track ghosts keep running/drawing while the supervisor is live;
 -- Alt+G is the takeover latch (ice underglow + actuators), not the start of perception.
 local M = {}
+-- Mod / bus protocol version, written to gvd_ego.json as mod_version. Tracks VERSION. The
+-- supervisor refuses engage (lua_echo_outdated) below its MIN_MOD_VERSION
+-- (python/control/echo_link.py). A module field, not a local: the main chunk is at the limit.
+M.MOD_VERSION = '1.7.13'
 
 local engaged = false
 local showPath = true
@@ -1122,7 +1126,10 @@ local ovrCmdLast = nil       -- {s, th, b} we pushed to the car most recently
 local ovrCmdPrev = nil       -- the one before it
 local ovrRef = nil           -- command in force when the last electrics echo was sampled
 local ovrEchoStamp = nil     -- ovrClock when that echo landed
--- One per electrics echo, written to gvd_ego.json as echo_seq. The apply step runs at 20 Hz and
+-- One per electrics echo, written to gvd_ego.json as echo_seq. Lua's own counter, +1 in
+-- onEgoFeedback and nowhere else; never the last command seq (applied_seq is that). A command
+-- seq freezes whenever Python stalls, while fresh wheel readings keep arriving: the supervisor
+-- would call a live wheel stale. The apply step runs at 20 Hz and
 -- the echo at 10 Hz, so most checks see the echo the previous check already judged; only a new
 -- echo moves the filter and the dwell (the supervisor keys on the same counter).
 -- One table, not three locals: the main chunk is at Lua 5.1's 200-local limit.
@@ -1400,14 +1407,14 @@ local function writeEgoFile()
       .. '"applied_seq":%d,"echo_seq":%d,"applying":%s,"mtime":%d,'
       .. '"gx":%s,"gy":%s,"gz":%s,"yaw_rate":%s,"pos":%s,"dir":%s,'
       .. '"player_device":%s,"player_steering":%.4f,"player_throttle":%.4f,"player_brake":%.4f,'
-      .. '"lua_bus":"%s"}',
+      .. '"mod_version":"%s","lua_bus":"%s"}',
     egoFb.speed, egoFb.steer, egoFb.throttle, egoFb.brake,
     math.floor(tonumber(lastAppliedSeq) or -1), ovrEcho.seq, applying and 'true' or 'false', os.time(),
     jsonNum(egoFb.gx), jsonNum(egoFb.gy), jsonNum(egoFb.gz), jsonNum(egoFb.yawRate, '%.5f'),
     posJson, dirJson,
     np > 0 and 'true' or 'false',
     tonumber(egoFb.pSteer) or 0, tonumber(egoFb.pThr) or 0, tonumber(egoFb.pBrk) or 0,
-    bus)
+    M.MOD_VERSION, bus)
   writeText(gvdFile('gvd_ego.json'), payload)
 end
 

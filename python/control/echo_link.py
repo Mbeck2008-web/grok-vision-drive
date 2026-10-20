@@ -21,9 +21,16 @@ The mod now stamps each echo with `echo_seq`, its own counter, one per echo writ
   is a link fault, never "no override": the supervisor disengages with `echo_stale` on the
   same path a player override takes. One gap after a supervisor stall is not a fault; the
   override re-seeds on it and the next contiguous echo decides.
-* ``outdated`` — a live echo with no `echo_seq`. The mod predates this contract and cannot say
-  whether a read is new, so engage is refused with `lua_echo_outdated`. There is no fallback to
-  judging every read.
+* ``outdated`` — a live echo from a mod older than `MIN_MOD_VERSION`: no `echo_seq`, or a
+  `mod_version` missing or below the minimum. That mod cannot say whether a read is new (or
+  says it with an older meaning), so engage is refused with `lua_echo_outdated`, and the message
+  names the minimum mod version (`outdated_message`). There is no fallback to judging every
+  read.
+
+`echo_seq` is the mod's own counter (+1 per echo, `onEgoFeedback`), never the last command seq
+it received (`applied_seq`). A command seq stops moving whenever Python stalls or a cmd write is
+lost, while the wheel keeps being read and echoed; keyed on that, the gate would call a live
+wheel stale.
 * ``off``      — not engaged. The gate forgets everything, so a re-engage starts clean.
 """
 
@@ -36,6 +43,10 @@ ECHO_STALE_MS = 300.0
 # Fresh echoes in a row that each skipped some: the filter re-seeds on every one, so it is blind.
 GAP_RUN_MAX = 3
 
+# First mod that stamps echo_seq as its own per-echo counter and writes mod_version. Bump only
+# when the mod/bus contract the supervisor relies on changes, not on every release.
+MIN_MOD_VERSION = "1.7.13"
+
 REASON_ECHO_STALE = "echo_stale"
 REASON_ECHO_OUTDATED = "lua_echo_outdated"
 
@@ -47,6 +58,38 @@ STATUS_OUTDATED = "outdated"
 STATUS_OFF = "off"
 
 FAULT_REASONS = {STATUS_STALE: REASON_ECHO_STALE, STATUS_OUTDATED: REASON_ECHO_OUTDATED}
+
+
+def parse_version(v: Any) -> tuple[int, ...] | None:
+    """'1.7.13' (or '1.7.13-alpha-<sha>') -> (1, 7, 13). None when it is not a version."""
+    if not isinstance(v, str):
+        return None
+    head = v.strip().split("-", 1)[0]
+    parts = head.split(".")
+    if not parts or not all(p.isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
+
+
+def mod_outdated(ego_fb: Any, minimum: str = MIN_MOD_VERSION) -> bool:
+    """True for a live echo from a mod older than `minimum` (no echo_seq, or old/no mod_version)."""
+    if getattr(ego_fb, "echo_seq", None) is None:
+        return True
+    have = parse_version(getattr(ego_fb, "mod_version", None))
+    need = parse_version(minimum) or ()
+    return have is None or have < need
+
+
+def outdated_message(ego_fb: Any, minimum: str = MIN_MOD_VERSION) -> str:
+    """The refusal line: what the mod reported, and the minimum mod version required."""
+    have = getattr(ego_fb, "mod_version", None) if ego_fb is not None else None
+    found = f"mod {have}" if isinstance(have, str) and have else "a mod without mod_version"
+    if ego_fb is not None and getattr(ego_fb, "echo_seq", None) is None:
+        found += " and no echo_seq"
+    return (
+        f"{REASON_ECHO_OUTDATED}: gvd_ego.json is from {found}; "
+        f"Grok Vision Drive mod {minimum} or newer is required"
+    )
 
 
 @dataclass(frozen=True)
@@ -81,8 +124,9 @@ class EchoRead:
 class EchoGate:
     """Per-loop freshness of the mod's electrics echo, keyed on its `echo_seq`."""
 
-    def __init__(self, stale_ms: float = ECHO_STALE_MS) -> None:
+    def __init__(self, stale_ms: float = ECHO_STALE_MS, min_mod_version: str = MIN_MOD_VERSION) -> None:
         self.stale_s = max(0.05, float(stale_ms) / 1000.0)
+        self.min_mod_version = min_mod_version
         self.read = EchoRead()
         self.reset()
 
@@ -100,7 +144,7 @@ class EchoGate:
         t = float(now)
         live = ego_fb is not None and bool(getattr(ego_fb, "fresh", False))
         seq = getattr(ego_fb, "echo_seq", None) if live else None
-        if live and seq is None:
+        if live and mod_outdated(ego_fb, self.min_mod_version):
             self.read = EchoRead(status=STATUS_OUTDATED)
             return self.read
         if seq is not None and seq != self._last_seq:

@@ -48,7 +48,7 @@ from python.control.override import (
     config_mirror,
     load_override_config,
 )
-from python.control.echo_link import EchoGate
+from python.control.echo_link import MIN_MOD_VERSION, STATUS_OUTDATED, EchoGate, outdated_message
 from python.data.record import ClipRecorder, choose_encoder
 from python.perception.pipeline import ModularPerception
 from python.perception.stitch360 import stitch_frames
@@ -873,12 +873,8 @@ def main() -> None:
                 write_engage_flag(False, disengage_reason=echo_fault)
                 cmd = stop_command(seq=cmd_seq, reason=echo_fault)
                 if echo_fault != echo_fault_prev:
-                    if echo.status == "outdated":
-                        print(
-                            f"[GVD] REFUSE ENGAGE: {echo_fault} (gvd_ego.json has no echo_seq; "
-                            "update the Grok Vision Drive mod)",
-                            flush=True,
-                        )
+                    if echo.status == STATUS_OUTDATED:
+                        print(f"[GVD] REFUSE ENGAGE: {outdated_message(ego_fb)}", flush=True)
                     else:
                         why = (
                             f"no new electrics echo for {echo.since_ms:.0f} ms"
@@ -1189,7 +1185,9 @@ def main() -> None:
                 "fresh": bool(ovr.fresh),
                 "gap_hold": bool(ovr.gap_hold),
             }
-            st["echo"] = echo.telemetry()
+            st["echo"] = {**echo.telemetry(), "min_mod_version": MIN_MOD_VERSION}
+            if echo.status == STATUS_OUTDATED:
+                st["echo"]["message"] = outdated_message(ego_fb)
             st["shadow"] = {
                 "steer": float(tick.shadow.get("steer", 0.0)),
                 "throttle": float(tick.shadow.get("throttle", 0.0)),

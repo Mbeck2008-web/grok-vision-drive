@@ -22,6 +22,7 @@ import argparse
 import json
 import multiprocessing as mp
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -41,10 +42,25 @@ def _child_env(root: Path) -> dict:
     return dict(os.environ, PYTHONPATH=str(root))
 
 
-def run_override_live(root: Path) -> tuple[bool, str]:
+def run_override_live(root: Path) -> tuple[bool, str, list[str]]:
+    """One check_ffb_override_live in its own process. Returns (passed, why, phase reasons).
+
+    The reasons are gvd_engage.json's disengage_reason after each supervisor run of the check,
+    in order: chatter (must stay "none"), steer pull (player_steer), brake (player_brake).
+    """
     code = (
-        "import sys; sys.path.insert(0, 'scripts'); import test_m6_retail as t; "
-        "t.check_ffb_override_live(); print('PASS')"
+        "import sys, json; sys.path.insert(0, 'scripts'); import test_m6_retail as t\n"
+        "reasons = []\n"
+        "_run = t._run_supervisor\n"
+        "def _wrapped(*a, **kw):\n"
+        "    out = _run(*a, **kw)\n"
+        "    reasons.append(str(t._read_json(t.engage_path()).get('disengage_reason')))\n"
+        "    return out\n"
+        "t._run_supervisor = _wrapped\n"
+        "try:\n"
+        "    t.check_ffb_override_live(); print('PASS')\n"
+        "finally:\n"
+        "    print('REASONS ' + json.dumps(reasons))\n"
     )
     try:
         res = subprocess.run(
@@ -52,10 +68,14 @@ def run_override_live(root: Path) -> tuple[bool, str]:
             capture_output=True, text=True, timeout=180,
         )
     except subprocess.TimeoutExpired:
-        return False, "timeout"
+        return False, "timeout", []
+    reasons: list[str] = []
+    for line in res.stdout.splitlines():
+        if line.startswith("REASONS "):
+            reasons = json.loads(line[8:])
     ok = res.returncode == 0 and "PASS" in res.stdout
-    tail = (res.stdout + res.stderr).strip().splitlines()
-    return ok, "" if ok else (tail[-1] if tail else f"rc={res.returncode}")
+    tail = [ln for ln in (res.stdout + res.stderr).strip().splitlines() if not ln.startswith("REASONS ")]
+    return ok, "" if ok else (tail[-1] if tail else f"rc={res.returncode}"), reasons
 
 
 def worker_takeover(root: Path, pull: float, seconds: float) -> None:
@@ -81,6 +101,11 @@ def worker_takeover(root: Path, pull: float, seconds: float) -> None:
             return d if isinstance(d, dict) else {}
         except Exception:
             return {}
+
+    # What this checkout's mod stamps as mod_version (absent before the field existed).
+    main_lua = root / "beamng_mod" / "lua" / "ge" / "extensions" / "gvd" / "main.lua"
+    m = re.search(r"M\.MOD_VERSION\s*=\s*'([^']+)'", main_lua.read_text(encoding="utf-8")) if main_lua.is_file() else None
+    mod_version = m.group(1) if m else None
 
     touch_bus()
     if ego_path().exists():
@@ -119,7 +144,7 @@ def worker_takeover(root: Path, pull: float, seconds: float) -> None:
                     pulled = pull_at is not None and now >= pull_at
                     if pulled and first_pull is None:
                         first_pull = now
-                    ego_path().write_text(json.dumps({
+                    payload = {
                         "speed_mps": 5.5,
                         "steering_input": steer + pull if pulled else steer,
                         "throttle_input": float(cmd.get("throttle", 0.0)),
@@ -129,7 +154,10 @@ def worker_takeover(root: Path, pull: float, seconds: float) -> None:
                         "applying": True,
                         "mtime": int(now),
                         "lua_bus": str(root_bus),
-                    }), encoding="utf-8")
+                    }
+                    if mod_version is not None:
+                        payload["mod_version"] = mod_version
+                    ego_path().write_text(json.dumps(payload), encoding="utf-8")
                 next_echo = max(next_echo + 0.1, now + 0.05)
             if pull_at is None:
                 st = read_state() or {}
@@ -183,13 +211,26 @@ def main() -> None:
         if args.mode in ("override_live", "both"):
             ok = 0
             fails: list[str] = []
+            false_takeover = echo_stale = outdated = 0
             for i in range(args.runs):
-                passed, why = run_override_live(root)
+                passed, why, reasons = run_override_live(root)
                 ok += passed
                 if not passed:
                     fails.append(why)
-                print(f"  override_live {i + 1}/{args.runs}: {'PASS' if passed else 'FAIL ' + why}", flush=True)
+                # Phase 0 is the chatter run: any player_* there is a false takeover.
+                false_takeover += bool(reasons) and reasons[0].startswith("player_")
+                echo_stale += sum(r == "echo_stale" for r in reasons)
+                outdated += sum(r == "lua_echo_outdated" for r in reasons)
+                print(
+                    f"  override_live {i + 1}/{args.runs}: {'PASS' if passed else 'FAIL ' + why} {reasons}",
+                    flush=True,
+                )
             print(f"check_ffb_override_live: {ok}/{args.runs} passed, {args.runs - ok} failed", flush=True)
+            print(
+                f"counts over {args.runs} runs: false takeovers {false_takeover}, "
+                f"echo_stale {echo_stale}, lua_echo_outdated {outdated}",
+                flush=True,
+            )
         if args.mode in ("takeover", "both"):
             ms: list[float] = []
             other: list[str] = []

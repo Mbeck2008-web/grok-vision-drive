@@ -218,6 +218,22 @@ def _touch_lua_bus() -> Path:
     return abs_pin
 
 
+# The fake mod plays gvd_main's meaning of echo_seq: its own counter, +1 per echo written
+# (`onEgoFeedback`), never the command seq it last applied (that is `applied_seq`).
+_FAKE_ECHO = {"k": 0}
+# What the current mod stamps as mod_version (M.MOD_VERSION in gvd_main).
+_MOD_VERSION = re.search(
+    r"M\.MOD_VERSION\s*=\s*'([^']+)'",
+    (ROOT / "beamng_mod" / "lua" / "ge" / "extensions" / "gvd" / "main.lua").read_text(encoding="utf-8"),
+).group(1)
+FAKE_ECHO_PERIOD_S = 0.1  # gvd_main EGO_POLL_S: the mod echoes at 10 Hz, whatever the loop does
+
+
+def _next_echo_seq() -> int:
+    _FAKE_ECHO["k"] += 1
+    return _FAKE_ECHO["k"]
+
+
 def _write_ego(
     seq: int,
     *,
@@ -229,9 +245,12 @@ def _write_ego(
     age_s: float = 0.0,
     echo_seq: int | None = None,
     stamp_echo: bool = True,
+    mod_version: str | None = None,
 ) -> None:
-    """Play gvd_main's gvd_ego.json. `echo_seq` defaults to `seq`; `stamp_echo=False` is a
-    mod from before the echo_seq contract."""
+    """Play gvd_main's gvd_ego.json. `seq` is the command seq the mod last applied
+    (`applied_seq`). `echo_seq` is the mod's own echo counter: by default the next value of it,
+    one per call, whatever `seq` is. `stamp_echo=False` is a mod from before the echo_seq
+    contract (no echo_seq, no mod_version). `mod_version` defaults to the current mod's."""
     root = _touch_lua_bus()
     payload = {
         "speed_mps": speed,
@@ -244,7 +263,8 @@ def _write_ego(
         "lua_bus": str(root),
     }
     if stamp_echo:
-        payload["echo_seq"] = seq if echo_seq is None else echo_seq
+        payload["echo_seq"] = _next_echo_seq() if echo_seq is None else int(echo_seq)
+        payload["mod_version"] = _MOD_VERSION if mod_version is None else mod_version
     ego_path().write_text(json.dumps(payload), encoding="utf-8")
     if age_s:
         old = time.time() - age_s
@@ -356,19 +376,29 @@ def _run_supervisor(
     stamp_echo: bool = True,
     freeze_echo_after_s: float | None = None,
     on_engage_drop: Callable[[float], None] | None = None,
+    wheel_by_echo: Callable[[int], float] | None = None,
+    cmd_blind: tuple[float, float] | None = None,
+    mod_version: str | None = None,
 ) -> dict | None:
     """Run run_vision.py headless for `seconds`; optionally play the mod's ack role meanwhile.
 
-    One echo per command seq, stamped `echo_seq = seq`: this fake's wheel is a function of the
-    seq, so the seq is its sample index. A re-read of the same seq is the same sample, and a seq
-    the fake never echoed is a skipped one. `stamp_echo=False` plays a mod from before
-    echo_seq. `freeze_echo_after_s` keeps rewriting the last echo (fresh mtime, same echo_seq)
-    from that point, a mod whose electrics echo stopped. `on_engage_drop(t)` is called with the
-    wall time the engage file was first seen false.
+    The fake mod echoes at 10 Hz (`FAKE_ECHO_PERIOD_S`, gvd_main `EGO_POLL_S`), not per command.
+    Each echo reads the newest command, acks its seq as `applied_seq`, and stamps `echo_seq`
+    from the mod's own counter, +1 per echo. The two are separate: `echo_seq` moves on with the
+    wheel readings, `applied_seq` with the commands.
+
+    Wheel models (pick one): `steer_echo(cmd_seq)` reports a wheel position keyed on the command
+    seq being acked; `wheel_by_echo(echo_seq)` keys it on the echo itself (per-sample FFB
+    chatter). `stamp_echo=False` plays a mod from before echo_seq. `freeze_echo_after_s` keeps
+    rewriting the last echo (fresh mtime, same echo_seq) from that point, a mod whose electrics
+    echo stopped. `cmd_blind=(t0, t1)` (seconds after start): commands stop reaching the mod in
+    that window (it keeps the last command and its seq) while its echoes keep advancing.
+    `on_engage_drop(t)` is called with the wall time the engage file was first seen false.
 
     The fake mod echoes back what it was told to apply, exactly like `gvd_main` does, so the
-    override residual is zero unless a test deliberately plays a driver: `steer_echo(seq)`
-    reports a wheel position instead of the commanded one, `brake_bias` adds a pedal press.
+    override residual is zero unless a test deliberately plays a driver: `steer_echo` /
+    `wheel_by_echo` report a wheel position instead of the commanded one, `brake_bias` adds a
+    pedal press.
 
     `expect_disengage` is a `player_*` reason. When set, SIGKILL waits for that reason on
     `gvd_engage.json` / `gvd_state.json` — not stdout. `cmd_applied` is already true a few
@@ -391,36 +421,57 @@ def _run_supervisor(
     t_start = time.time()
     frozen: dict | None = None
     dropped = False
+    next_echo = 0.0
+    held_cmd: dict | None = None  # the last command the mod received
 
     def _ack_once() -> None:
-        nonlocal frozen, dropped
+        nonlocal frozen, dropped, next_echo, held_cmd
         if on_engage_drop is not None and not dropped:
             if _read_json(engage_path()).get("engaged") is False:
                 dropped = True
                 on_engage_drop(time.time())
         if not ack:
             return
+        now = time.time()
         if frozen is not None:
+            # Electrics echo stopped: the file keeps a fresh mtime, echo_seq does not move.
             _write_ego(**frozen)
             return
-        try:
-            cmd = json.loads(cmd_path().read_text(encoding="utf-8"))
-            seq = int(cmd.get("seq", -1))
-        except Exception:
+        if now < next_echo:
             return
-        if seq < 0:
+        blind = cmd_blind is not None and cmd_blind[0] <= now - t_start < cmd_blind[1]
+        if not blind or held_cmd is None:
+            try:
+                got = json.loads(cmd_path().read_text(encoding="utf-8"))
+                if int(got.get("seq", -1)) >= 0:
+                    held_cmd = got
+            except Exception:
+                pass
+        if held_cmd is None:
             return
+        cmd = held_cmd
+        seq = int(cmd.get("seq", -1))
+        next_echo = max(next_echo + FAKE_ECHO_PERIOD_S, now + FAKE_ECHO_PERIOD_S / 2)
+        k = _next_echo_seq()
+        if wheel_by_echo is not None:
+            steer_in = wheel_by_echo(k)
+        elif steer_echo is not None:
+            steer_in = steer_echo(seq)
+        else:
+            steer_in = float(cmd.get("steer", 0.0))
         kw = dict(
             seq=seq,
             applying=True,
             speed=5.5,
-            steer_in=steer_echo(seq) if steer_echo else float(cmd.get("steer", 0.0)),
+            steer_in=steer_in,
             throttle_in=float(cmd.get("throttle", 0.0)),
             brake_in=min(1.0, float(cmd.get("brake", 0.0)) + brake_bias),
             stamp_echo=stamp_echo,
+            echo_seq=k,
+            mod_version=mod_version,
         )
         _write_ego(**kw)
-        if freeze_echo_after_s is not None and time.time() - t_start >= freeze_echo_after_s:
+        if freeze_echo_after_s is not None and now - t_start >= freeze_echo_after_s:
             frozen = kw
 
     def _try_latch() -> bool:
@@ -629,9 +680,12 @@ def check_ffb_override_live() -> None:
     if ego_path().exists():
         ego_path().unlink()
 
-    # Force-feedback chatter — alternating kicks keyed off the seq so the sign flips every tick.
+    # Force-feedback chatter — alternating kicks, the sign flipping on every 10 Hz echo.
     write_engage_flag(True)
-    _run_supervisor(["--allow-preview-drive"], seconds=3.0, ack=True, steer_echo=lambda seq: 0.9 if seq % 2 else -0.9)
+    # Keyed on the echo (one FFB sample each), not on the command seq the echo acks.
+    _run_supervisor(
+        ["--allow-preview-drive"], seconds=3.0, ack=True, wheel_by_echo=lambda k: 0.9 if k % 2 else -0.9
+    )
     assert read_engage_flag(default=False) is True, "force-feedback chatter disengaged GVD"
     assert _read_json(engage_path()).get("disengage_reason") == "none"
     cmd = json.loads(cmd_path().read_text(encoding="utf-8"))
@@ -751,6 +805,54 @@ def check_echo_stale_disengages() -> None:
     ego_path().unlink()
 
 
+def check_echo_old_mod_version_refused() -> None:
+    """echo_seq present but mod_version below the minimum: refused, and the refusal names it."""
+    from python.control.echo_link import MIN_MOD_VERSION, parse_version
+
+    assert parse_version(_MOD_VERSION) >= parse_version(MIN_MOD_VERSION), (_MOD_VERSION, MIN_MOD_VERSION)
+    _touch_lua_bus()
+    if ego_path().exists():
+        ego_path().unlink()
+    write_engage_flag(True)
+    snap = _run_supervisor(
+        ["--allow-preview-drive"],
+        seconds=3.0,
+        ack=True,
+        mod_version="1.7.12",
+        expect_disengage="lua_echo_outdated",
+    )
+    assert snap is not None, "a 1.7.12 mod_version never refused engage"
+    assert snap["engage"].get("disengage_reason") == "lua_echo_outdated", snap["engage"]
+    st = read_state() or {}
+    echo = st.get("echo") or {}
+    assert echo.get("min_mod_version") == MIN_MOD_VERSION, echo
+    msg = str(echo.get("message", ""))
+    assert "mod 1.7.12" in msg and f"mod {MIN_MOD_VERSION} or newer is required" in msg, msg
+    write_engage_flag(False)
+    ego_path().unlink()
+
+
+def check_echo_cmd_blind_not_stale() -> None:
+    """Commands stop reaching the mod while its echoes keep advancing: no echo_stale.
+
+    echo_seq is the mod's own counter. Keyed on the command seq it would freeze with the
+    commands, and a live wheel would read as a dead link.
+    """
+    _touch_lua_bus()
+    if ego_path().exists():
+        ego_path().unlink()
+    write_engage_flag(True)
+    _run_supervisor(["--allow-preview-drive"], seconds=3.0, ack=True, cmd_blind=(1.2, 2.4))
+    eng = _read_json(engage_path())
+    st = read_state() or {}
+    assert eng.get("disengage_reason") != "echo_stale", eng
+    assert st.get("disengage_reason") != "echo_stale", st.get("disengage_reason")
+    assert eng.get("engaged") is True, eng
+    assert (st.get("echo") or {}).get("status") in ("fresh", "repeat"), st.get("echo")
+    write_engage_flag(False)
+    ego_path().unlink()
+
+
 def check_lua_harness() -> None:
     """Drive the mod's Lua through the stub-GE harness when a Lua 5.1 interpreter is available."""
     for exe in ("lua5.1", "luajit", "lua"):
@@ -849,7 +951,7 @@ def check_player_docs() -> None:
     assert readme.index("This is an **alpha**") < readme.index("## Quick start")
     assert f"Point bumps (`{major}.{minor}.x`) are fixes and small UI." in readme
     assert f"A main alpha bump (`{major}.x.0`) is features, core, or a UI overhaul." in readme
-    assert "1.7.12-alpha-<sha>" in readme
+    assert "1.7.13-alpha-<sha>" in readme
     assert "docs/stitch-360.png" in readme
     assert "docs/soft-esc-highway.jpg" not in readme
     assert "Soft Esc parked" in readme
@@ -892,6 +994,8 @@ def main() -> None:
         check_ffb_override_live,
         check_echo_outdated_refuses_engage,
         check_echo_stale_disengages,
+        check_echo_old_mod_version_refused,
+        check_echo_cmd_blind_not_stale,
     )
     failed: list[str] = []
     for fn in checks:

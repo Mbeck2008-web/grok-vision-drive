@@ -529,6 +529,28 @@ for i = 2, #echoSeqs do
   if echoSeqs[i] == nil or echoSeqs[i - 1] == nil or echoSeqs[i] ~= echoSeqs[i - 1] + 1 then stepOk = false end
 end
 check(stepOk, 'gvd_ego.json echo_seq moves on by one per echo (' .. table.concat(echoSeqs, ',', 1, math.min(4, #echoSeqs)) .. ',...)')
+do
+  -- echo_seq is gvd_main's own counter, not the command seq: commands stop arriving (no new
+  -- gvd_cmd.json seq) while electrics keep being echoed, and echo_seq still moves on.
+  echo(0, 0.3, 0)  -- the wheel back on the command: this gap is about the link, not a pull
+  local e0 = readFileAll(egoPath)
+  local seq0 = tonumber(e0 and e0:match('"echo_seq":(%d+)'))
+  local app0 = tonumber(e0 and e0:match('"applied_seq":(%-?%d+)'))
+  for _ = 1, 6 do
+    beatState(true, 'none', pin)
+    M.onUpdate(0.05)
+    drainGE()
+  end
+  local e1 = readFileAll(egoPath)
+  local seq1 = tonumber(e1 and e1:match('"echo_seq":(%d+)'))
+  local app1 = tonumber(e1 and e1:match('"applied_seq":(%-?%d+)'))
+  check(seq0 ~= nil and seq1 ~= nil and seq1 >= seq0 + 2,
+    'commands stopped, echoes continue: echo_seq still moves on (' .. tostring(seq0) .. ' -> ' .. tostring(seq1) .. ')')
+  check(app0 ~= nil and app1 == app0, 'applied_seq stays on the last command (' .. tostring(app0) .. ' -> ' .. tostring(app1) .. ')')
+  check(e1 and e1:find('"mod_version":"' .. M.MOD_VERSION .. '"', 1, true),
+    'gvd_ego.json carries mod_version ' .. tostring(M.MOD_VERSION))
+  check(M.isEngaged(), 'a short command gap with live echoes keeps the car')
+end
 echo(0, 0.3, 0)
 for _ = 1, 6 do halfTick(0, 0.3, 0, pin) end
 echo(0.25, 0.3, 0)

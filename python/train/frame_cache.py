@@ -106,11 +106,14 @@ def _fit_sector(image: np.ndarray, width: int) -> np.ndarray:
 
 
 def _read_cam(root: Path, cam: str, index: int) -> np.ndarray | None:
-    from python.data.raw_frames import read_image_with_repair
+    from python.data.raw_frames import raw_frame_candidates, read_image_with_repair
 
-    stem = f"{int(index):06d}"
-    for suffix in (".png", ".npy"):
-        path = root / "raw" / cam / f"{stem}{suffix}"
+    paths = [
+        (suffix, path)
+        for suffix in (".png", ".npy")
+        for path in raw_frame_candidates(root / "raw", cam, index, suffix)
+    ]
+    for suffix, path in paths:
         if suffix == ".npy" and path.is_file():
             array = np.load(path)
             if isinstance(array, np.ndarray) and array.ndim >= 2:

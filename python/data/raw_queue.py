@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from typing import Any
 
 import numpy as np
@@ -48,6 +49,11 @@ class RawWriteQueue:
         self._next = 1
         self._ready: dict[int, tuple[Any, dict[str, Any], int]] = {}
         self._stops = 0
+        # Seconds the last encode and the last commit took, and the slowest
+        # commit. The collector logs them per tick (ticks.jsonl).
+        self._encode_s_last = 0.0
+        self._commit_s_last = 0.0
+        self._commit_s_max = 0.0
         self._lock = threading.Lock()
         self._cv = threading.Condition(self._lock)
         nworkers = max(1, int(workers))
@@ -85,7 +91,7 @@ class RawWriteQueue:
         self._q.put((seq, copied, kwargs, nbytes))
         return True
 
-    def stats(self) -> dict[str, int]:
+    def stats(self) -> dict[str, Any]:
         with self._lock:
             return {
                 "queue_depth": self._inflight(),
@@ -97,12 +103,13 @@ class RawWriteQueue:
                 "enqueued": int(self.enqueued),
                 "written": int(self.written),
                 "bytes_written": int(getattr(self.writer, "stored_bytes", 0) or 0),
+                "encode_s_last": round(float(self._encode_s_last), 4),
+                "commit_s_last": round(float(self._commit_s_last), 4),
+                "commit_s_max": round(float(self._commit_s_max), 4),
             }
 
     def wait_empty(self, timeout_s: float = 30.0) -> bool:
         """Block until every submitted frame has been committed, or time runs out."""
-        import time
-
         deadline = time.monotonic() + max(0.0, float(timeout_s))
         while True:
             with self._lock:
@@ -134,12 +141,15 @@ class RawWriteQueue:
                 with self._lock:
                     self._queued -= 1
                     self._encoding += 1
+                began = time.monotonic()
                 try:
                     payload: Any = encode_cameras(frames) if self._encoded else frames
                 except Exception as exc:
                     print(f"collect encode failed: {type(exc).__name__}: {exc}", flush=True)
                     payload = [] if self._encoded else {}
+                spent = time.monotonic() - began
                 with self._cv:
+                    self._encode_s_last = spent
                     self._encoding -= 1
                     self._ready[int(seq)] = (payload, kwargs, int(nbytes))
                     self._ready_n += 1
@@ -158,6 +168,7 @@ class RawWriteQueue:
                 self._ready_n -= 1
                 self._committing += 1
                 self._next += 1
+            began = time.monotonic()
             try:
                 try:
                     if self._encoded:
@@ -168,7 +179,10 @@ class RawWriteQueue:
                     print(f"collect write failed: {exc}", flush=True)
                     raise
             finally:
+                spent = time.monotonic() - began
                 with self._lock:
+                    self._commit_s_last = spent
+                    self._commit_s_max = max(self._commit_s_max, spent)
                     self._committing -= 1
                     self._bytes = max(0, self._bytes - nbytes)
                     self.written += 1

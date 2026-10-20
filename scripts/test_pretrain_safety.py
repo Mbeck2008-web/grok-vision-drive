@@ -16,6 +16,9 @@
     epoch and in the val line and metrics record; on resume ``lr_mult`` is
     re-set from --backbone-lr-mult before the rate is pinned, so a paused
     0.1 multiplier cannot leave the backbone at 1e-4 under --lr 1e-3.
+(e) a frame cache records its strips path, row count and state.jsonl hash;
+    another recording, a grown state.jsonl or a manifest without a source is
+    refused; the cache drive is checked with its own free-space floor.
 """
 from __future__ import annotations
 
@@ -242,7 +245,59 @@ def check_lr_logging() -> None:
           f"lr logged per epoch, in the val line and metrics record{real} OK")
 
 
+def check_cache_manifest() -> None:
+    import json
+
+    from python.data.data_root import DataDriveError, check_data_path
+    from python.data.raw_frames import RawFrameWriter
+    from python.train.frame_cache import CacheMismatchError, FrameCache, build_frame_cache
+
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+
+        def rec(name: str, value: int, n: int = 3) -> Path:
+            writer = RawFrameWriter(tmp / name, [])
+            for _ in range(n):
+                writer.write({"main": np.full((48, 64, 3), value, np.uint8)}, t=1.0, tech={"lane_gt": [0]})
+            return tmp / name
+
+        a, b = rec("rec5", 10), rec("rec5b", 200)
+        man = build_frame_cache(a, tmp / "cache", ("main",))
+        assert set(man["source"]) == {"strips", "rows", "state_sha256"} and man["source"]["rows"] == 3, man
+        assert FrameCache(tmp / "cache", strips_root=a).has(1)  # same recording: accepted
+        refused = ""
+        try:
+            FrameCache(tmp / "cache", strips_root=b)  # r3: another recording, same row indexes
+        except CacheMismatchError as exc:
+            refused = str(exc)
+        assert "strips=" in refused, refused
+        with open(a / "state.jsonl", "ab") as handle:  # the recording grew after the cache was built
+            handle.write(b'{"i": 3, "t": 1.3}\n')
+        try:
+            FrameCache(tmp / "cache", strips_root=a)
+            raise AssertionError("grown state.jsonl accepted")
+        except CacheMismatchError as exc:
+            assert "rows=3" in str(exc), exc
+        payload = json.loads((tmp / "cache" / "manifest.json").read_text())
+        payload.pop("source")
+        (tmp / "cache" / "manifest.json").write_text(json.dumps(payload))
+        try:
+            FrameCache(tmp / "cache", strips_root=a)
+            raise AssertionError("old manifest accepted")
+        except CacheMismatchError as exc:
+            assert "no source" in str(exc), exc
+        assert FrameCache(tmp / "cache").has(1), "a worker reopening a checked cache is not re-hashed"
+        try:
+            check_data_path(tmp, minimum=1 << 62)
+            raise AssertionError("free-space floor not applied")
+        except DataDriveError as exc:
+            assert "free" in str(exc), exc
+    print(f"(e) cache from rec5 used for rec5b refused: {refused.split(': ', 1)[1][:60]}...; grown state.jsonl, "
+          "source-less manifest and a full cache drive refused OK")
+
+
 def main() -> None:
+    check_cache_manifest()
     check_lr_logging()
     check_eval_resets()
     check_abort_mask()

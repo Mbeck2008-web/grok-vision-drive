@@ -240,6 +240,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Decode --cams into this directory (chunks under 3.5 GB) and exit.",
     )
     parser.add_argument(
+        "--cache-min-free-gb",
+        type=float,
+        default=8.0,
+        help="--cache / --build-cache: refuse a cache drive with less free space than this (GB).",
+    )
+    parser.add_argument(
         "--clip",
         type=float,
         default=1.0,
@@ -2591,7 +2597,15 @@ def main(argv: list[str] | None = None) -> None:
     except ValueError as exc:
         print(f"[GVD] scene train: {exc}")
         sys.exit(2)
+    from python.train.frame_cache import CacheMismatchError
+
+    cache_floor = int(float(args.cache_min_free_gb) * 1024 ** 3)
     if args.build_cache:
+        try:
+            check_data_path(args.build_cache, minimum=cache_floor)
+        except DataDriveError as exc:
+            print(f"[GVD] scene train: cache {exc}")
+            sys.exit(2)
         manifest = build_frame_cache(
             args.strips or scene_lanes_dir(),
             args.build_cache,
@@ -2604,7 +2618,7 @@ def main(argv: list[str] | None = None) -> None:
             flush=True,
         )
         return
-    frame_cache = FrameCache(args.cache) if args.cache else None
+    frame_cache = None
     export_path = None if args.export is None else Path(args.export)
     if export_path is not None and not args.strips:
         try:
@@ -2624,7 +2638,11 @@ def main(argv: list[str] | None = None) -> None:
         check_data_path(args.strips)
         if export_path is not None:
             check_data_path(export_path)
-    except DataDriveError as exc:
+        if args.cache:
+            check_data_path(args.cache, minimum=cache_floor)
+            frame_cache = FrameCache(args.cache, strips_root=args.strips)
+            print(f"[GVD] cache {args.cache}: built from {args.strips} (rows and state.jsonl hash match)", flush=True)
+    except (DataDriveError, CacheMismatchError) as exc:
         print(f"[GVD] scene train: {exc}")
         sys.exit(2)
     if not torch_ready():

@@ -133,11 +133,11 @@ def space_failure(free: int, *, minimum: int = MIN_FREE_BYTES) -> str | None:
     return f"only {have:.1f} GB free, need {need:.0f} GB"
 
 
-def check_data_path(path: Path | str) -> int:
-    """Refuse C:/D: and a drive under 20 GB free. Returns free bytes."""
+def check_data_path(path: Path | str, *, minimum: int = MIN_FREE_BYTES) -> int:
+    """Refuse C:/D: and a drive under ``minimum`` (20 GB) free. Returns free bytes."""
     refuse_system_drive(path)
     free = free_bytes(path)
-    reason = space_failure(free)
+    reason = space_failure(free, minimum=minimum)
     if reason is not None:
         raise DataDriveError(f"{path}: {reason}")
     return free

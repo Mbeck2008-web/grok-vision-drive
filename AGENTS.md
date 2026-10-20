@@ -55,7 +55,7 @@ Read the spawn, edge count, and camera count. A level that fails this check does
 Automatic Mode records with `scripts\collect_scene_lanes.py`. Output is `E:\GVD_data\scene_lanes`. West coast at 60% is 12-minute chunks rotated with the other maps, not one long block. `--respawn-min 3` teleports west coast to a new city, highway, or ramp spawn about four times per chunk. `--traffic 2` is the west-coast default: two companion cars, ahead and behind, replaced on each respawn. The ego stays in span mode.
 
 ```
-py -3 scripts\collect_scene_lanes.py --minutes 120 --maps west_coast_usa,italy,east_coast_usa,hirochi_raceway,gridmap_v2,small_island --map-weights west_coast_usa=0.6 --segment-min 12 --respawn-min 3 --traffic 2 --smoke-s 60 --speed-min 8 --speed-max 17
+py -3 scripts\collect_scene_lanes.py --minutes 120 --maps west_coast_usa,italy,east_coast_usa,hirochi_raceway,gridmap_v2,small_island --map-weights west_coast_usa=0.6 --segment-min 12 --respawn-min 3 --traffic 2 --smoke-s 60
 ```
 
 City speed is 8–14 m/s, highway 20–30, ramps 10–18, when the spawn type is known. The log line is `collect spawn <segment> <city|highway|ramp>`.

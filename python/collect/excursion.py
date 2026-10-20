@@ -270,18 +270,49 @@ def maneuver_length_m(phase: str, delta_m: float, speed_mps: float | None) -> fl
     return WINDOW_M
 
 
+def ramp_heading_reached(delta_m: float, ramp_m: float, covered_m: float) -> float:
+    """Peak heading (rad, unsigned) of the cosine ramp ``delta (1 - cos(pi s / L)) / 2`` over s in [0, covered].
+
+    The slope peaks at s = L / 2, so from there on this is the full ramp's
+    peak, atan(delta pi / 2L). Before it, the heading the line has reached.
+    """
+    length = max(float(ramp_m), 1.0)
+    s = min(max(float(covered_m), 0.0), 0.5 * length)
+    return math.atan(abs(float(delta_m)) * math.pi / (2.0 * length) * math.sin(math.pi * s / length))
+
+
+WEAVE_STATS_NOTES = {
+    "started": "moves whose shaped line was sent, by phase (weave, lane_change, recover)",
+    "refused": "blocked stretches, by the first refusal reason of the stretch: a run of consecutive "
+               "refused start attempts, ended by an excursion start, the segment end or a respawn",
+    "refused_attempts": "every refused start attempt, by reason (the gate retries about every 2 s)",
+    "aborted": "moves that had started and were ended early, by phase then reason (overspeed)",
+    "lane_change_complete": "lane changes whose recover began after the car covered the planned ramp",
+    "lane_change_incomplete": "lane changes whose recover began (after LANE_CHANGE_S) before the car "
+                              "covered the planned ramp; their label heading is the peak the line reached",
+}
+
+
 class WeaveStats:
-    """Counters for collect.json ``weave_stats``: starts, refusals, speed bands, one-sided sides."""
+    """Counters for collect.json ``weave_stats``: starts, refusals, aborts, speed bands, one-sided sides."""
 
     def __init__(self) -> None:
         self.started: dict[str, int] = {}
         self.refused: dict[str, int] = {}
-        self.bands: dict[str, dict[str, int]] = {name: {"started": 0, "refused": 0} for _top, name in SPEED_BANDS}
+        self.refused_attempts: dict[str, int] = {}
+        self.aborted: dict[str, dict[str, int]] = {}
+        self.bands: dict[str, dict[str, int]] = {
+            name: {"started": 0, "refused": 0, "refused_attempts": 0, "aborted": 0} for _top, name in SPEED_BANDS
+        }
         self.sides: dict[str, int] = {"left": 0, "right": 0}
         self.overspeed_logged = 0
+        self.lane_change_complete = 0
+        self.lane_change_incomplete = 0
+        self._stretch = False
 
     def start(self, phase: str, v_plan: float | None, *, direction: int = 1, one_sided: bool = False) -> None:
         self.started[phase] = self.started.get(phase, 0) + 1
+        self._stretch = False
         band = speed_band(v_plan)
         if band in self.bands:
             self.bands[band]["started"] += 1
@@ -290,11 +321,36 @@ class WeaveStats:
             self.sides["right" if int(direction) >= 0 else "left"] += 1
 
     def refuse(self, reason: str, v_plan: float | None) -> None:
+        """One refused attempt. ``refused`` counts it only when it opens a blocked stretch."""
         key = str(reason or "unknown")
-        self.refused[key] = self.refused.get(key, 0) + 1
+        self.refused_attempts[key] = self.refused_attempts.get(key, 0) + 1
         band = speed_band(v_plan)
         if band in self.bands:
+            self.bands[band]["refused_attempts"] += 1
+        if self._stretch:
+            return
+        self._stretch = True
+        self.refused[key] = self.refused.get(key, 0) + 1
+        if band in self.bands:
             self.bands[band]["refused"] += 1
+
+    def end_stretch(self) -> None:
+        """Segment end or respawn: the next refusal opens a new stretch."""
+        self._stretch = False
+
+    def abort(self, phase: str, reason: str, v_plan: float | None) -> None:
+        per = self.aborted.setdefault(str(phase), {})
+        key = str(reason or "unknown")
+        per[key] = per.get(key, 0) + 1
+        band = speed_band(v_plan)
+        if band in self.bands:
+            self.bands[band]["aborted"] += 1
+
+    def lane_change_end(self, complete: bool) -> None:
+        if complete:
+            self.lane_change_complete += 1
+        else:
+            self.lane_change_incomplete += 1
 
     def summary(self) -> dict[str, object]:
         return {
@@ -302,6 +358,12 @@ class WeaveStats:
             "started_total": sum(self.started.values()),
             "refused": dict(self.refused),
             "refused_total": sum(self.refused.values()),
+            "refused_attempts": dict(self.refused_attempts),
+            "refused_attempts_total": sum(self.refused_attempts.values()),
+            "aborted": {k: dict(v) for k, v in self.aborted.items()},
+            "aborted_total": sum(sum(v.values()) for v in self.aborted.values()),
+            "lane_change_complete": int(self.lane_change_complete),
+            "lane_change_incomplete": int(self.lane_change_incomplete),
             "by_speed_band": {k: dict(v) for k, v in self.bands.items()},
             "half_wave_sides": dict(self.sides),
             "recover_overspeed_logged": int(self.overspeed_logged),

@@ -31,7 +31,7 @@ is a smoke collect: if those PNGs do not decode, the process stops.
 
     py -3 scripts\\collect_scene_lanes.py --check-maps --list-levels
     py -3 scripts\\collect_scene_lanes.py --check-maps --maps west_coast_usa,italy,east_coast_usa,utah,jungle_rock_island
-    py -3 scripts\\collect_scene_lanes.py --minutes 120 --maps west_coast_usa,italy,east_coast_usa,utah,jungle_rock_island --segment-min 12 --smoke-s 60 --speed-min 8 --speed-max 17
+    py -3 scripts\\collect_scene_lanes.py --minutes 120 --maps west_coast_usa,italy,east_coast_usa,utah,jungle_rock_island --segment-min 12 --smoke-s 60
 
 West-coast spawns skip roads whose next 300 m has painted lanes on less than
 ``--min-paint-cov`` of the probes (default 0.5, 0 disables). ``--weave-guard``
@@ -144,6 +144,7 @@ next deck spawn. Rows are never dropped. Every recheck, kept or not, is a
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import datetime
 import json
 import math
@@ -1593,6 +1594,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             Excursion,
             ExcursionClock,
             CRUISE_S,
+            WEAVE_STATS_NOTES,
             WeaveStats,
             excursion_commands,
             excursion_path,
@@ -1600,6 +1602,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             near_junction,
             overspeed,
             plan_speed,
+            ramp_heading_reached,
             targets_for,
         )
 
@@ -1668,6 +1671,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         plan_v: float | None = None
         plan_phase = ""
         plan_overspeed_noted = False
+        # The lane change in progress: road covered since its line was sent,
+        # against the planned ramp (None between lane changes).
+        lane_change_run: dict[str, float] | None = None
         spawn_deck = None
         spawn_kind = ""
         spawn_mark = -1.0e9
@@ -2114,6 +2120,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             extra["impact_respawn"] = {"on": impact_respawn_on, **impact_respawns}
             extra["speed_ranges"] = {k: list(v) for k, v in speed_ranges.items()}
             extra["weave_stats"] = weave_stats.summary()
+            extra["notes"] = {"weave_stats": dict(WEAVE_STATS_NOTES)}
             if ego_width:
                 extra["ego_width"] = dict(ego_width)
             return extra or None
@@ -2367,6 +2374,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     segment_open = True
                     live.reset()
                     clock = ExcursionClock()
+                    # A new segment or a respawn: the next refusal is a new blocked stretch.
+                    weave_stats.end_stretch()
+                    lane_change_run = None
                     last_ai = None
                     held_tag = None
                     print(f"collect driving {segment_id}", flush=True)
@@ -2457,7 +2467,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 if clock.phase in ("weave", "lane_change"):
                     print(f"collect excursion {segment_id} {clock.phase} abort overspeed "
                           f"v_meas={speed_mps_f:.1f} v_plan={plan_v:.1f}", flush=True)
-                    weave_stats.refuse("overspeed_abort", plan_v)
+                    weave_stats.abort(clock.phase, "overspeed", plan_v)
                     clock.force_abort("overspeed")
                     line_left_m = None
                     plan_v, plan_phase = None, ""
@@ -2466,6 +2476,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                           f"v_plan={plan_v:.1f} (logged; the recover continues)", flush=True)
                     weave_stats.overspeed_logged += 1
                     plan_overspeed_noted = True
+            if lane_change_run is not None and clock.phase == "lane_change":
+                lane_change_run["covered_m"] += max(0.0, float(speed_mps_f or 0.0)) * tick_dt
             if line_left_m is not None:
                 if clock.phase not in ACTIVE:
                     line_left_m = None
@@ -2541,7 +2553,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 start_kind = kind
                 window_ok = gate == "open"
                 if not window_ok and not clock.reason:
-                    weave_stats.refuse(gate, v_plan)  # one per start attempt (the clock retries in 2 s)
+                    weave_stats.refuse(gate, v_plan)  # one attempt; a blocked stretch counts once
                 now_gate = time.monotonic()
                 if gate != gate_note or now_gate - gate_log_t >= 5.0:
                     word = "open" if gate == "open" else f"blocked {gate}"
@@ -2575,6 +2587,17 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 )
             else:
                 move = Excursion("cruise", 0.0, 0.0, 1, "")
+            if lane_change_run is not None and clock.phase != "lane_change":
+                if clock.phase == "recover":
+                    # LANE_CHANGE_S is up. A slow car has not reached the end of the ramp.
+                    covered, ramp = lane_change_run["covered_m"], lane_change_run["ramp_m"]
+                    complete = covered + 1e-6 >= ramp
+                    if not complete:
+                        meas_txt = "na" if speed_mps_f is None else format(speed_mps_f, ".1f")
+                        print(f"collect excursion {segment_id} lane_change_incomplete covered={covered:.0f}m "
+                              f"ramp={ramp:.0f}m v_meas={meas_txt} v_plan={lane_change_run['v_plan']:.1f}", flush=True)
+                    weave_stats.lane_change_end(complete)
+                lane_change_run = None
             resolved = held_tag if held_tag is not None and held_tag.phase == move.phase else move
             path = None
             ai_key = (round(speed, 3), waypoint, resolved.phase, resolved.direction, map_name)
@@ -2653,6 +2676,13 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                             and float(path_info.get("length_m") or 0.0) <= 0.5 * wave_sent + 1.0,
                         )
                         plan_overspeed_noted = False
+                        if move.phase == "lane_change" and path_info.get("ramp_m") is not None:
+                            lane_change_run = {
+                                "covered_m": 0.0,
+                                "ramp_m": float(path_info["ramp_m"]),
+                                "delta_m": float(path_info.get("delta_m") or 0.0),
+                                "v_plan": float(v_plan),
+                            }
                     plan_v, plan_phase = v_plan, move.phase
                     clock.direction = int(used)
                     resolved = Excursion(move.phase, float(spec[0]), float(spec[1]), int(used), move.reason)
@@ -2688,6 +2718,14 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     flush=True,
                 )
             move = resolved
+            if lane_change_run is not None and move.phase == "lane_change":
+                # The label heading is the peak the sent line has reached so far:
+                # the full ramp peak from the ramp midpoint on, less for a car that
+                # is short of it (a lane change that ends incomplete).
+                reached = ramp_heading_reached(
+                    lane_change_run["delta_m"], lane_change_run["ramp_m"], lane_change_run["covered_m"]
+                )
+                move = dataclasses.replace(move, target_heading_rad=math.copysign(reached, move.target_heading_rad))
             if clock.phase == "abort":
                 if abort_t0 is None:
                     abort_t0 = now

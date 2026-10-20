@@ -21,7 +21,12 @@ the road passes 4 m or more over another drivable navgraph road) and
 ``tunnel`` (4 m or more under one: an underpass or a tunnel under another
 road; a tunnel under bare terrain is not in the navgraph and stays its pool
 kind). ``type_summary`` counts picks by that type, deck spawns and recheck
-respawns apart.
+respawns apart. The type is only logged; no pick is filtered on it.
+
+``take`` returning None sets ``exhausted``: every road is used. The
+collector then keeps the current spawn. ``traffic_slots`` places the
+companion cars along the road (``TRAFFIC_AHEAD_M`` ahead, ``TRAFFIC_BEHIND_M``
+behind), not on the straight spawn tangent.
 """
 
 from __future__ import annotations
@@ -42,6 +47,34 @@ RAMP = "ramp"
 KINDS = (CITY, HIGHWAY, RAMP)
 TARGET = {CITY: 0.40, HIGHWAY: 0.35, RAMP: 0.25}
 SPEED = {CITY: (8.0, 14.0), HIGHWAY: (20.0, 30.0), RAMP: (10.0, 18.0)}
+
+
+def clamp_speed_range(
+    kind_range: tuple[float, float],
+    flag_min: float | None,
+    flag_max: float | None,
+) -> tuple[tuple[float, float], str, bool]:
+    """``((lo, hi), src, empty)``: the spawn-type range clamped to ``--speed-min/--speed-max``.
+
+    No flag: the spawn-type range stands (``src`` spawn_type). With a flag the
+    range is the intersection (``src`` flag when it narrowed the range). An
+    empty intersection uses the flag range itself (``empty`` True); a missing
+    bound there is the given one, so ``--speed-max 15`` on a 20-30 highway is 15-15.
+    """
+    lo, hi = float(min(kind_range)), float(max(kind_range))
+    if flag_min is None and flag_max is None:
+        return (lo, hi), "spawn_type", False
+    f_lo = None if flag_min is None else float(flag_min)
+    f_hi = None if flag_max is None else float(flag_max)
+    if f_lo is not None and f_hi is not None and f_lo > f_hi:
+        f_lo, f_hi = f_hi, f_lo
+    a = lo if f_lo is None else max(lo, f_lo)
+    b = hi if f_hi is None else min(hi, f_hi)
+    if a <= b:
+        return (a, b), ("spawn_type" if (a, b) == (lo, hi) else "flag"), False
+    a = f_lo if f_lo is not None else float(f_hi)
+    b = f_hi if f_hi is not None else float(f_lo)
+    return (a, b), "flag", True
 # A link counts when the ends sit about this close. The cell is only a search.
 LINK_M = 30.0
 CELL_M = 20.0
@@ -78,6 +111,12 @@ DECK_NEAR_M = 25.0
 DECK_CELL_M = 50.0
 # Pick sources counted apart in type_summary.
 SOURCES = ("spawn", "recheck")
+# Companion cars, measured along the road from the ego spawn. A slot the road
+# walk cannot reach falls back to the farthest point it reached; under
+# TRAFFIC_MIN_M there is no valid spot and the car is not spawned.
+TRAFFIC_AHEAD_M = 60.0
+TRAFFIC_BEHIND_M = 40.0
+TRAFFIC_MIN_M = 8.0
 
 
 @dataclass(frozen=True)
@@ -160,8 +199,13 @@ def _walk_ahead(
     roads_by_id: dict[str, dict[str, Any]],
     ends: dict[tuple[int, int], list[tuple[str, bool]]],
     ahead_m: float = PAINT_AHEAD_M,
+    reverse: bool = False,
 ) -> list[tuple[float, float, float]]:
-    """Continue ``chain`` into joining roads (the ``road_ahead`` rules) up to ``ahead_m``."""
+    """Continue ``chain`` into joining roads (the ``road_ahead`` rules) up to ``ahead_m``.
+
+    ``reverse`` walks against the direction of travel (where a car behind
+    comes from): a one-way road is then only entered at its end.
+    """
     length = _polyline_m(chain)
     while length < float(ahead_m) and len(chain) >= 2 and len(seen) < 64:
         tail, prev = chain[-1], chain[-2]
@@ -178,7 +222,7 @@ def _walk_ahead(
                     if rid in seen:
                         continue
                     other = roads_by_id.get(rid)
-                    if other is None or (not at_start and other["oneway"]):
+                    if other is None or (other["oneway"] and (at_start if reverse else not at_start)):
                         continue
                     seq = list(other["pts"]) if at_start else list(other["pts"])[::-1]
                     if math.hypot(seq[0][0] - tail[0], seq[0][1] - tail[1]) > PAINT_JOIN_M:
@@ -209,8 +253,11 @@ def chain_from_pose(
     roads_by_id: dict[str, dict[str, Any]],
     ends: dict[tuple[int, int], list[tuple[str, bool]]],
     ahead_m: float = PAINT_AHEAD_M,
+    reverse: bool = False,
 ) -> list[tuple[float, float, float]]:
     """Centerline from the point of ``road`` nearest ``pos``, in the direction of travel.
+
+    ``reverse`` is the walk behind a car: pass the reversed heading.
 
     The road is walked the way ``heading`` points along it (a two-way road
     either way), then continued like ``road_ahead``.
@@ -237,7 +284,26 @@ def chain_from_pose(
     chain = [here] + [p for p in rest if math.hypot(p[0] - here[0], p[1] - here[1]) > 1e-3]
     if len(chain) < 2:
         return chain
-    return _walk_ahead(chain, {str(road["id"])}, roads_by_id, ends, ahead_m)
+    return _walk_ahead(chain, {str(road["id"])}, roads_by_id, ends, ahead_m, reverse)
+
+
+def point_along(
+    chain: list[tuple[float, float, float]], dist_m: float
+) -> tuple[tuple[float, float, float], tuple[float, float], float] | None:
+    """``(point, unit tangent, reached_m)`` at ``dist_m`` along ``chain``, or its far end if shorter."""
+    last: tuple[tuple[float, float, float], tuple[float, float], float] | None = None
+    walked = 0.0
+    for a, b in zip(chain, chain[1:]):
+        seg = math.hypot(b[0] - a[0], b[1] - a[1])
+        if seg < 1e-6:
+            continue
+        tangent = ((b[0] - a[0]) / seg, (b[1] - a[1]) / seg)
+        if walked + seg >= float(dist_m):
+            mix = (float(dist_m) - walked) / seg
+            return tuple(a[k] + (b[k] - a[k]) * mix for k in range(3)), tangent, float(dist_m)
+        walked += seg
+        last = (tuple(b), tangent, walked)
+    return last
 
 
 def sample_along(
@@ -462,6 +528,7 @@ class SpawnDeck:
         self.type_counts: dict[str, dict[str, int]] = {src: {t: 0 for t in ROAD_TYPES} for src in SOURCES}
         self.last_type: str | None = None
         self.resume_skipped = 0
+        self.exhausted = False
         self._by_id: dict[str, dict[str, Any]] = {}
         self._ends: dict[tuple[int, int], list[tuple[str, bool]]] = defaultdict(list)
         for pool_kind, pool in self.pools.items():
@@ -518,7 +585,9 @@ class SpawnDeck:
         try:
             pick = self._take()
             self.last_type = None
-            if pick is not None:
+            if pick is None:
+                self.exhausted = True
+            else:
                 self.last_type = self.road_type(pick.road_id, pick.pos)
                 column = self.type_counts.setdefault(str(source), {t: 0 for t in ROAD_TYPES})
                 column[self.last_type] = column.get(self.last_type, 0) + 1
@@ -540,6 +609,9 @@ class SpawnDeck:
             "cross_kind_fallback": self.cross_kind,
             "best_seen_fallback": self.best_seen,
             "min_paint_cov": self.min_paint_cov if self.filtering() else 0.0,
+            "exhausted": self.exhausted,
+            "used": len(self.used),
+            "roads": sum(len(pool) for pool in self.pools.values()),
             "select_ms_mean": (sum(times) / len(times)) if times else None,
             "select_ms_max": max(times) if times else None,
         }
@@ -719,6 +791,46 @@ class SpawnDeck:
             lines.append(f"spawn types {src} n={n} {mix}")
         return lines
 
+    # ------------------------------------------------------------ traffic
+    def traffic_slots(
+        self,
+        pick: SpawnPick,
+        count: int,
+        ahead_m: float = TRAFFIC_AHEAD_M,
+        behind_m: float = TRAFFIC_BEHIND_M,
+    ) -> tuple[list[tuple[str, tuple[float, float, float], tuple[float, float, float, float], float]], list[str]]:
+        """Companion-car poses along the road: slot 0 ``ahead_m`` ahead, slot 1 ``behind_m`` behind.
+
+        Returns ``([(where, pos, rot, along_m)], notes)``. A slot the walk
+        cannot reach uses the farthest point reached (a note says so); under
+        TRAFFIC_MIN_M, or with no road, the slot is dropped (also noted).
+        Both cars face the direction of travel.
+        """
+        road = self._by_id.get(str(pick.road_id))
+        _qx, _qy, qz, qw = pick.rot
+        yaw = math.atan2(2.0 * qw * qz, 1.0 - 2.0 * qz * qz)
+        hx, hy = math.cos(yaw), math.sin(yaw)
+        wants = [("ahead", float(ahead_m), False), ("behind", float(behind_m), True)][: max(0, int(count))]
+        slots: list[tuple[str, tuple[float, float, float], tuple[float, float, float, float], float]] = []
+        notes: list[str] = []
+        for where, want, back in wants:
+            if road is None:
+                notes.append(f"traffic {where} skipped: spawn road {pick.road_id} not in the deck")
+                continue
+            heading = (-hx, -hy) if back else (hx, hy)
+            chain = chain_from_pose(road, pick.pos, heading, self._by_id, self._ends, want + 1.0, reverse=back)
+            got = point_along(chain, want)
+            if got is None or got[2] < TRAFFIC_MIN_M:
+                reached = 0.0 if got is None else got[2]
+                notes.append(f"traffic {where} skipped: road walk reaches {reached:.1f} m < {TRAFFIC_MIN_M:.0f} m (wanted {want:.0f} m)")
+                continue
+            (x, y, z), (tx, ty), along = got
+            if along < want - 1e-6:
+                notes.append(f"traffic {where} fallback: farthest valid spot {along:.1f} m along the road (wanted {want:.0f} m)")
+            fx, fy = (-tx, -ty) if back else (tx, ty)
+            slots.append((where, (x, y, z + 0.5), _yaw_quat(fx, fy), along))
+        return slots, notes
+
     # ------------------------------------------------------------ recheck
     def nearest_road(
         self, pos: Any, heading: tuple[float, float] | None = None, near_m: float = RECHECK_NEAR_M
@@ -857,10 +969,13 @@ def traffic_count(requested: int | None, map_name: str) -> int:
     return max(0, int(requested))
 
 
-def traffic_lua(pick: SpawnPick, count: int) -> list[str]:
+def traffic_lua(pick: SpawnPick, count: int, slots: list[Any] | None = None) -> list[str]:
     """GE Lua that replaces the companion cars ahead of and behind the ego.
 
-    The player vehicle is not deleted and is not switched into traffic mode.
+    ``slots`` (from ``SpawnDeck.traffic_slots``) gives each car's pose along
+    the road; without it the cars go 28 m ahead and 22 m behind on the
+    spawn tangent. The player vehicle is not deleted and is not switched into
+    traffic mode.
     """
     if count <= 0:
         return []
@@ -886,12 +1001,14 @@ def traffic_lua(pick: SpawnPick, count: int) -> list[str]:
     ]
     speed = (float(pick.speed[0]) + float(pick.speed[1])) * 0.5
     x0, y0, z0 = pick.pos
-    for slot in range(min(int(count), len(offsets))):
-        dist = offsets[slot]
-        x = x0 + dx * dist
-        y = y0 + dy * dist
-        z = z0
-        qx, qy, qz, qw = pick.rot
+    poses = []
+    if slots is not None:
+        poses = [(tuple(item[1]), tuple(item[2])) for item in slots][: int(count)]
+    else:
+        for slot in range(min(int(count), len(offsets))):
+            dist = offsets[slot]
+            poses.append(((x0 + dx * dist, y0 + dy * dist, z0), tuple(pick.rot)))
+    for slot, ((x, y, z), (qx, qy, qz, qw)) in enumerate(poses):
         name = f"gvd_traffic_{slot}"
         lines.append(
             "local veh = core_vehicles.spawnNewVehicle(\"etk800\", "
@@ -907,3 +1024,4 @@ def traffic_lua(pick: SpawnPick, count: int) -> list[str]:
         lines.append(f"  veh:queueLuaCommand('ai.setSpeed({speed:.1f})')")
         lines.append("end")
     return [" ".join(lines)]
+

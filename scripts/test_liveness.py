@@ -135,6 +135,8 @@ def check_validator_drops_parked_span() -> None:
 
 
 class _Vehicle:
+    model = "etk800"  # no get_bbox: the collector logs the etk800 width
+
     def __init__(self, state: dict[str, object], stop: Path | None = None, stop_on: int = 0) -> None:
         self.state = state
         self.stop = stop
@@ -442,13 +444,17 @@ def check_tipped_car_exits() -> None:
         sys.stdout = old
         _restore(collect, previous, tech, None)
     text = buf.getvalue()
-    assert code == 0, (code, text)
-    assert text.count("collect abort tipped") == 2
+    # A segment end no longer ends the run with exit 0 ("ended"): the stuck
+    # pose is retried until a logged stop rule fires, here recover-lost.
+    assert code == 2, (code, text)
+    assert text.count("collect abort tipped") >= 4
     assert "collect segment end" in text and "tipped" in text
-    assert "ended" in text
-    assert "recover lost" not in text
+    assert "no recorded row since the last segment end" in text
+    stops = [line for line in text.splitlines() if line.startswith("collect stop reason=")]
+    assert stops == [stops[0]] and stops[0].startswith("collect stop reason=segment_fail code=2 "), stops
+    assert " ended" not in text
     assert not (out / "state.jsonl").is_file()
-    print("tipped abort wrote nothing")
+    print("tipped abort wrote nothing; stop logged with a reason")
 
 
 def check_second_stall_ends_the_segment() -> None:

@@ -31,7 +31,7 @@ IMPACT_DT_MIN_S = 0.02
 IMPACT_DT_MAX_S = 0.5
 IMPACT_DEBOUNCE_S = 2.0
 # Rows this long before an impact are the run-up the trainer should mask.
-PRE_IMPACT_S = 2.0
+PRE_IMPACT_S = 3.0
 # Stopped this long after an impact: respawn instead of waiting for STALL_S.
 IMPACT_STALL_S = 2.0
 # Moving again this long after an impact closes it without a respawn.

@@ -24,13 +24,20 @@ CAMERA_PRESETS = ("", LANE_CAMERAS)
 WEATHERS = ("", "clear", "rain", "fog")
 
 
+# Shown in the panel. The collector gets --speed-min/--speed-max only when
+# the user set a speed (``speed_set``); otherwise the spawn-type ranges apply
+# (city 8-14, highway 20-30, ramp 10-18).
+SPEED_MIN_DEFAULT = 8.0
+SPEED_MAX_DEFAULT = 17.0
+
+
 @dataclass
 class AutoOptions:
     map_name: str = ""
     route: str = "span"
     waypoints: str = ""
-    speed_min: float = 8.0
-    speed_max: float = 17.0
+    speed_min: float = SPEED_MIN_DEFAULT
+    speed_max: float = SPEED_MAX_DEFAULT
     minutes: float = 45.0
     until_disk: bool = False
     cameras: str = ""
@@ -44,6 +51,12 @@ class AutoOptions:
     segment_min: float = 12.0
     smoke_s: float = 60.0
     vary_env: bool = True
+    speed_set: bool = False
+
+    def __post_init__(self) -> None:
+        # A speed given here (not the defaults) is the user's: pass it on.
+        if float(self.speed_min) != SPEED_MIN_DEFAULT or float(self.speed_max) != SPEED_MAX_DEFAULT:
+            self.speed_set = True
 
     def cycle(self, ident: str) -> None:
         if ident == "map":
@@ -68,8 +81,10 @@ class AutoOptions:
             self.maps = "" if self.maps == joined else joined
         elif ident == "speed+":
             self.speed_max = min(30.0, float(self.speed_max) + 1.0)
+            self.speed_set = True
         elif ident == "speed-":
             self.speed_max = max(float(self.speed_min), float(self.speed_max) - 1.0)
+            self.speed_set = True
         elif ident == "minutes+":
             self.minutes = min(180.0, float(self.minutes) + 15.0)
         elif ident == "minutes-":
@@ -153,7 +168,9 @@ def collect_argv(opts: AutoOptions, script: Path | str, python: str | None = Non
     cmd += ["--route", str(opts.route or "span")]
     if opts.waypoints:
         cmd += ["--waypoints", str(opts.waypoints)]
-    cmd += ["--speed-min", str(float(opts.speed_min)), "--speed-max", str(float(opts.speed_max))]
+    if opts.speed_set:
+        # Only a speed the user set. Without one the spawn-type ranges apply.
+        cmd += ["--speed-min", str(float(opts.speed_min)), "--speed-max", str(float(opts.speed_max))]
     if opts.cameras:
         cmd += ["--cameras", str(opts.cameras)]
     if opts.rates:

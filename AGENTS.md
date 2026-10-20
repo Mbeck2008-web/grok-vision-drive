@@ -26,7 +26,7 @@ Match BeamNGpy to Tech: 0.39 uses beamngpy 1.36 (`config/tech.yaml` `beamngpy_pi
 
 ## 3. Data disk
 
-Set `GVD_DATA_DIR` to a large drive, for example `E:\GVD_data`. C: and D: are refused. The collector and the trainer stop when that drive has under **20 GB free**.
+Set `GVD_DATA_DIR` to `<data dir>` on a large drive. C: and D: are refused. The collector and the trainer stop when that drive has under **20 GB free**.
 
 **FAT32 stores at most 4 GB in one file.** Cache chunks are kept under 3.5 GB for that reason. If the data disk is FAT32, say so before a long collect.
 
@@ -50,12 +50,12 @@ Enable **Grok Vision Drive** in the Mod Manager. The supervisor is the GVD VISIO
 py -3 scripts\collect_scene_lanes.py --check-maps --maps west_coast_usa,italy,east_coast_usa,hirochi_raceway,gridmap_v2,small_island
 ```
 
-Read the spawn, edge count, and camera count. A level that fails this check does not go in the collect. `--dump-roads` writes `E:\GVD_data\roads\<map>.json.gz` and then exits. Do not collect until `--check-maps` has been run on this install.
+Read the spawn, edge count, and camera count. A level that fails this check does not go in the collect. `--dump-roads` writes `<data dir>\roads\<map>.json.gz` and then exits. Do not collect until `--check-maps` has been run on this install.
 
-Automatic Mode records with `scripts\collect_scene_lanes.py`. Output is `E:\GVD_data\scene_lanes`. West coast at 60% is 12-minute chunks rotated with the other maps, not one long block. `--respawn-min 3` teleports west coast to a new city, highway, or ramp spawn about four times per chunk. `--traffic 2` is the west-coast default: two companion cars, ahead and behind, replaced on each respawn. The ego stays in span mode.
+Automatic Mode records with `scripts\collect_scene_lanes.py`. Output is `<data dir>\scene_lanes`. West coast at 60% is 12-minute chunks rotated with the other maps, not one long block. `--respawn-min 3` teleports west coast to a new city, highway, or ramp spawn about four times per chunk. `--traffic 2` is the west-coast default: two companion cars, ahead and behind, replaced on each respawn. The ego stays in span mode.
 
 ```
-py -3 scripts\collect_scene_lanes.py --minutes 120 --maps west_coast_usa,italy,east_coast_usa,hirochi_raceway,gridmap_v2,small_island --map-weights west_coast_usa=0.6 --segment-min 12 --respawn-min 3 --traffic 2 --smoke-s 60 --speed-min 8 --speed-max 17
+py -3 scripts\collect_scene_lanes.py --minutes 120 --maps west_coast_usa,italy,east_coast_usa,hirochi_raceway,gridmap_v2,small_island --map-weights west_coast_usa=0.6 --segment-min 12 --respawn-min 3 --traffic 2 --smoke-s 60
 ```
 
 City speed is 8–14 m/s, highway 20–30, ramps 10–18, when the spawn type is known. The log line is `collect spawn <segment> <city|highway|ramp>`.
@@ -63,16 +63,16 @@ City speed is 8–14 m/s, highway 20–30, ramps 10–18, when the spawn type is
 ## 6. Validate, then train with BeamNG closed
 
 ```
-py -3 scripts\validate_scene_lanes.py --strips E:\GVD_data\scene_lanes
+py -3 scripts\validate_scene_lanes.py --strips <data dir>\scene_lanes
 ```
 
 Quit BeamNG before training so the GPU is not shared with the game. Order is dry-run, then sanity, then the full run. Learning rate stays **1e-3** for the whole run. Holdout stop ends the run. It does not start a second pass at `1e-4`. `--batch` does not change the learning rate. A pause file cannot resume a lower rate. After a failed 1e-4 pass, start the next run with `--no-resume` once that process has exited.
 
 ```
-py -3 -m python.train.train_scene --strips E:\GVD_data\scene_lanes --cams main --build-cache C:\GVD_cache
-py -3 -m python.train.train_scene --strips E:\GVD_data\scene_lanes --cams main --heads lane_gt --augment --cache C:\GVD_cache --dry-run
-py -3 -m python.train.train_scene --strips E:\GVD_data\scene_lanes --cams main --heads lane_gt --augment --cache C:\GVD_cache --sanity
-py -3 -m python.train.train_scene --strips E:\GVD_data\scene_lanes --cams main --heads lane_gt --augment --balance --cache C:\GVD_cache --epochs 30 --clip 1.0 --lane-loss huber --min-valid 0.3 --export E:\GVD_data\models\e2e_scene.onnx
+py -3 -m python.train.train_scene --strips <data dir>\scene_lanes --cams main --build-cache <cache dir>
+py -3 -m python.train.train_scene --strips <data dir>\scene_lanes --cams main --heads lane_gt --augment --cache <cache dir> --dry-run
+py -3 -m python.train.train_scene --strips <data dir>\scene_lanes --cams main --heads lane_gt --augment --cache <cache dir> --sanity
+py -3 -m python.train.train_scene --strips <data dir>\scene_lanes --cams main --heads lane_gt --augment --balance --cache <cache dir> --epochs 30 --clip 1.0 --lane-loss huber --min-valid 0.3 --export <data dir>\models\e2e_scene.onnx
 ```
 
 `--cams` is the camera subset (empty means all eight). The ONNX metadata key `gvd_cams` must match, and the live runtime reads it. `--heads lane_gt` zeros the points, valid, class, and lamps losses. The export still has every head. `--augment` is on by default for training and off for validation. It is photometric only (brightness, contrast, gamma). A sideways crop is not applied, because `lane_gt` is in metres. `--cache` reads the decoded chunks. `--scale 0.5` downscales before the cache and the net. `--workers` defaults to 4 on Windows (persistent workers, pinned memory on CUDA) and 0 elsewhere. Each epoch shuffles training windows and starts each one from a fresh GRU state. `--balance` repeats curves, weaves, and ramps. `--min-valid 0.3` drops windows whose lane centers are mostly missing. `--clip 1.0` is `clip_grad_norm`. `--lane-loss huber` is smooth-L1.
@@ -82,7 +82,7 @@ py -3 -m python.train.train_scene --strips E:\GVD_data\scene_lanes --cams main -
 After export:
 
 ```
-py -3 -m python.run_vision --backend beamngpy --lane-source scene --scene-onnx E:\GVD_data\models\e2e_scene.onnx --gt-log --hz 10
+py -3 -m python.run_vision --backend beamngpy --lane-source scene --scene-onnx <data dir>\models\e2e_scene.onnx --gt-log --hz 10
 ```
 
 The runtime refuses a graph with no `lane_gt` output. A low confidence stops. It does not fall back to the pixel lane finder.
@@ -91,21 +91,21 @@ The runtime refuses a graph with no `lane_gt` output. A low confidence stops. It
 
 | File | What it is |
 | --- | --- |
-| `E:\GVD_data\status\collect.json` | Collect heartbeat: frames, Hz, disk, speed |
-| `E:\GVD_data\status\collect_crash.txt` | Last collect failure |
-| `E:\GVD_data\status\validate\report.json` | Validator report |
-| `E:\GVD_data\status\metrics.jsonl` | Train loss, grad norm, val r / rms / bias |
-| `E:\GVD_data\status\train_heartbeat.json` | Train step and ETA, about every 30 s |
-| `E:\GVD_data\status\train_crash.txt` | Train exception and the last batch's row ids |
-| `E:\GVD_data\scene_lanes.gvd-pause.npz` | Pause checkpoint. A camera-subset run will not load an 8-camera pause |
-| `E:\GVD_data\status\live.json` | Live supervisor status |
+| `<data dir>\status\collect.json` | Collect heartbeat: frames, Hz, disk, speed |
+| `<data dir>\status\collect_crash.txt` | Last collect failure |
+| `<data dir>\status\validate\report.json` | Validator report |
+| `<data dir>\status\metrics.jsonl` | Train loss, grad norm, val r / rms / bias |
+| `<data dir>\status\train_heartbeat.json` | Train step and ETA, about every 30 s |
+| `<data dir>\status\train_crash.txt` | Train exception and the last batch's row ids |
+| `<data dir>\scene_lanes.gvd-pause.npz` | Pause checkpoint. A camera-subset run will not load an 8-camera pause |
+| `<data dir>\status\live.json` | Live supervisor status |
 
 ## 9. Failures
 
 - **Port 25252 closed:** Tech was started without `-tcom`, or a second copy is fighting the port. One process only.
 - **Hello timeout:** Not a missing vehicle. Widen `GVD_TECH_SOCKET_TIMEOUT`. Do not close the socket and retry in a loop.
 - **C: or D: refused / under 20 GB:** Point `GVD_DATA_DIR` at the data disk.
-- **Cache file over 4 GB:** The disk is FAT32. Rebuild with `--cams` limited to the cameras you train. Chunks are capped at 3.5 GB.
+- **Cache file over 4 GB:** The data drive is FAT32. Rebuild with `--cams` limited to the cameras you train. Chunks are capped at 3.5 GB.
 - **Train loss sits near zero then spikes:** The old loader walked the drive in order. Shuffle, `--balance`, and `--clip 1.0` are the fix. `--heads lane_gt` must show points, valid, class, and lamps at 0.
 - **Val rms worse than `rms_mean` after one pass:** The head is still a flat guess. Train and holdout use the same metre labels. There is no per-target normalization to turn on. Keep going with main-only, lane_gt-only, and the cache. Do not drop the learning rate below `1e-3`. Holdout stop ends the run.
 - **UnboundLocalError in `_lane_gt_loss`:** An inner `import torch` shadowed the module. That import is gone. Update to a commit that has the fix.

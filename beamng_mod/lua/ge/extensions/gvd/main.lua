@@ -7,6 +7,10 @@
 -- Detector, path, planner and track ghosts keep running/drawing while the supervisor is live;
 -- Alt+G is the takeover latch (ice underglow + actuators), not the start of perception.
 local M = {}
+-- Mod / bus protocol version, written to gvd_ego.json as mod_version. Tracks VERSION. The
+-- supervisor refuses engage (lua_echo_outdated) below its MIN_MOD_VERSION
+-- (python/control/echo_link.py). A module field, not a local: the main chunk is at the limit.
+M.MOD_VERSION = '1.7.13'
 
 local engaged = false
 local showPath = true
@@ -1122,6 +1126,17 @@ local ovrCmdLast = nil       -- {s, th, b} we pushed to the car most recently
 local ovrCmdPrev = nil       -- the one before it
 local ovrRef = nil           -- command in force when the last electrics echo was sampled
 local ovrEchoStamp = nil     -- ovrClock when that echo landed
+-- One per electrics echo, written to gvd_ego.json as echo_seq. Lua's own counter, +1 in
+-- onEgoFeedback and nowhere else; never the last command seq (applied_seq is that). A command
+-- seq freezes whenever Python stalls, while fresh wheel readings keep arriving: the supervisor
+-- would call a live wheel stale. The apply step runs at 20 Hz and
+-- the echo at 10 Hz, so most checks see the echo the previous check already judged; only a new
+-- echo moves the filter and the dwell (the supervisor keys on the same counter).
+-- One table, not three locals: the main chunk is at Lua 5.1's 200-local limit.
+--   seq       echo counter (gvd_ego.json echo_seq)
+--   judgedSeq seq of the echo ovrCheck last consumed
+--   judgedAt  ovrClock when it consumed it
+local ovrEcho = { seq = 0, judgedSeq = nil, judgedAt = nil }
 local ovrArmedAt = nil       -- ovrClock of the first command since we took the car
 local ovrFilt = 0            -- EMA of the steer residual
 local ovrLastRaw = 0        -- previous raw residual, for the spike test (0 = rest)
@@ -1134,6 +1149,8 @@ local function ovrReset()
   ovrCmdPrev = nil
   ovrRef = nil
   ovrEchoStamp = nil
+  ovrEcho.judgedSeq = nil
+  ovrEcho.judgedAt = nil
   ovrArmedAt = nil
   ovrFilt = 0
   ovrLastRaw = 0
@@ -1249,6 +1266,13 @@ end
 local function ovrCheck(dt)
   if not egoFb or ovrEchoStamp == nil or ovrRef == nil then return 'none' end
   if (ovrClock - ovrEchoStamp) > OVR_ECHO_MAX_S then return 'none' end
+  -- Fresh echoes only. A repeat says nothing new about the wheel, and judging it again is what
+  -- let two same-sign force-feedback kicks drag the filter up. dt spans every apply step since
+  -- the last consumed echo, so the dwell is still real time.
+  if ovrEcho.judgedSeq == ovrEcho.seq then return 'none' end
+  if ovrEcho.judgedAt ~= nil then dt = math.min(1, math.max(0, ovrClock - ovrEcho.judgedAt)) end
+  ovrEcho.judgedSeq = ovrEcho.seq
+  ovrEcho.judgedAt = ovrClock
   -- Warm-up: the EMA needs a few time constants, and until GVD has been commanding for a while
   -- the echo says nothing about our commands — a player resting on the brake as they press
   -- Alt+G would otherwise override themselves on the spot.
@@ -1380,17 +1404,17 @@ local function writeEgoFile()
   local bus = tostring(luaBusPath()):gsub('"', '')
   local payload = string.format(
     '{"speed_mps":%.3f,"steering_input":%.4f,"throttle_input":%.4f,"brake_input":%.4f,'
-      .. '"applied_seq":%d,"applying":%s,"mtime":%d,'
+      .. '"applied_seq":%d,"echo_seq":%d,"applying":%s,"mtime":%d,'
       .. '"gx":%s,"gy":%s,"gz":%s,"yaw_rate":%s,"pos":%s,"dir":%s,'
       .. '"player_device":%s,"player_steering":%.4f,"player_throttle":%.4f,"player_brake":%.4f,'
-      .. '"lua_bus":"%s"}',
+      .. '"mod_version":"%s","lua_bus":"%s"}',
     egoFb.speed, egoFb.steer, egoFb.throttle, egoFb.brake,
-    math.floor(tonumber(lastAppliedSeq) or -1), applying and 'true' or 'false', os.time(),
+    math.floor(tonumber(lastAppliedSeq) or -1), ovrEcho.seq, applying and 'true' or 'false', os.time(),
     jsonNum(egoFb.gx), jsonNum(egoFb.gy), jsonNum(egoFb.gz), jsonNum(egoFb.yawRate, '%.5f'),
     posJson, dirJson,
     np > 0 and 'true' or 'false',
     tonumber(egoFb.pSteer) or 0, tonumber(egoFb.pThr) or 0, tonumber(egoFb.pBrk) or 0,
-    bus)
+    M.MOD_VERSION, bus)
   writeText(gvdFile('gvd_ego.json'), payload)
 end
 
@@ -1416,6 +1440,7 @@ function M.onEgoFeedback(speed, steerIn, thrIn, brkIn, gx, gy, gz, yawRate, pSte
   -- force when these values were read is the one we most recently pushed.
   ovrRef = ovrCmdLast or ovrCmdPrev
   ovrEchoStamp = ovrClock
+  ovrEcho.seq = ovrEcho.seq + 1
   -- File bus is for the Python supervisor; the in-game HUD reads egoFb from gvdUi either way.
   -- Wheel/pedal bars ride this same echo via the single 10 Hz tickPush path (not a second pusher).
   if supervisorAlive() then writeEgoFile() end

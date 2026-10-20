@@ -532,8 +532,10 @@ LANE_SLOT_NAMES = (
 )
 # Frames whose main area was all zero and were skipped in this process.
 BLANK_MAIN_SKIPS = 0
-# Rows skipped in _frame_row because another trained camera's sector is near-black.
-BLANK_CAM_SKIPS = 0
+# Loaded frames with a near-black trained sector other than main. Logged only:
+# a dark picture is a picture (night, tunnel); only a camera the writer did not
+# save is missing, and select_training_rows drops those rows.
+DARK_SECTOR_COUNT = 0
 
 
 # Near-black main sector: mean below 2% of full scale, or more than 98% of
@@ -582,7 +584,7 @@ def main_area_blank(frame: Any, cams: tuple[str, ...] | None, scale: float = 1.0
 
 
 def blank_sectors(frame: Any, cams: tuple[str, ...] | None, scale: float = 1.0) -> tuple[str, ...]:
-    """Trained cameras whose sector of ``frame`` is near-black (missing or dead picture)."""
+    """Trained cameras whose sector of ``frame`` is near-black. For the log count only."""
     from python.data.strip_writer import STRIP_ORDER
     from python.train.cam_strip import scaled_layout
 
@@ -887,11 +889,10 @@ def _frame_row(
         BLANK_MAIN_SKIPS += 1
         return None
     if blank_sectors(frame, cams, scale):
-        # Another trained camera is black (missing file in the cache, or a dead
-        # picture). The net cannot tell, and the label is full: skip it.
-        global BLANK_CAM_SKIPS
-        BLANK_CAM_SKIPS += 1
-        return None
+        # Counted, never dropped: missing cameras are dropped by file in
+        # select_training_rows, not guessed from darkness here.
+        global DARK_SECTOR_COUNT
+        DARK_SECTOR_COUNT += 1
     if augment:
         frame = photometric_jitter(frame, rng)
     # The stitch is not a yaw roll, so this returns the frame and the row.
@@ -2358,7 +2359,7 @@ def train_directory(
                     "pred_std": json_num(scored.get("pred_std")),
                     "collapse": bool(scored.get("collapse")),
                     "blank_main_skipped": int(BLANK_MAIN_SKIPS),
-                    "blank_cam_skipped": int(BLANK_CAM_SKIPS),
+                    "dark_sector_count": int(DARK_SECTOR_COUNT),
                     "lr": lr_now,
                 }
                 cell_lines: list[str] = []
@@ -2389,7 +2390,7 @@ def train_directory(
                     f"pred_mean={scored.get('pred_mean')} pred_std={scored.get('pred_std')} "
                     f"r_long={scored.get('r_long')} rms_long={scored.get('rms_long')} "
                     f"bias_long={scored.get('bias_long')} eval_chunk={int(eval_chunk)} "
-                    f"blank_main_skipped={int(BLANK_MAIN_SKIPS)} blank_cam_skipped={int(BLANK_CAM_SKIPS)} "
+                    f"blank_main_skipped={int(BLANK_MAIN_SKIPS)} dark_sector_count={int(DARK_SECTOR_COUNT)} "
                     f"lr={format_lrs(lr_now)}",
                     flush=True,
                 )

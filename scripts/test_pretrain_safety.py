@@ -19,10 +19,10 @@
 (e) a frame cache records its strips path, row count and state.jsonl hash;
     another recording, a grown state.jsonl or a manifest without a source is
     refused; the cache drive is checked with its own free-space floor.
-(g) a row missing any other trained camera (wide, narrow, side, rear) is
-    dropped, and a trained sector that loads near-black is skipped in
-    ``_frame_row``; with no --cams a recording that lacks a camera is refused.
-    The net has no per-camera validity input, so a black sector never trains.
+(g) a row missing any other trained camera (wide, narrow, side, rear: no file
+    written) is dropped; with no --cams a recording that lacks a camera is
+    refused. A near-black sector that was written is only counted
+    (``dark_sector_count``) and still trains: darkness is not a missing flag.
 """
 from __future__ import annotations
 
@@ -342,11 +342,12 @@ def check_other_cams() -> None:
         def canvas(self, index):
             return self.frames[index]
 
-    before = ts.BLANK_CAM_SKIPS
+    before = ts.DARK_SECTOR_COUNT
     main_before = ts.BLANK_MAIN_SKIPS
-    assert ts._frame_row(Path("."), {"i": 1}, cams=None, cache=Cache({1: dead})) is None
+    assert ts._frame_row(Path("."), {"i": 1}, cams=None, cache=Cache({1: dead})) is not None, "dark is not dropped"
     assert ts._frame_row(Path("."), {"i": 2}, cams=None, cache=Cache({2: full})) is not None
-    assert ts.BLANK_CAM_SKIPS == before + 1 and ts.BLANK_MAIN_SKIPS == main_before
+    assert ts.DARK_SECTOR_COUNT == before + 1 and ts.BLANK_MAIN_SKIPS == main_before
+    assert not hasattr(ts, "BLANK_CAM_SKIPS")
     refused = "(torch not installed: train_directory refusal not run)"
     try:
         import torch  # noqa: F401
@@ -364,7 +365,7 @@ def check_other_cams() -> None:
                 assert "--cams main" in str(exc), exc
                 refused = "train_directory refuses no --cams on a main-only recording"
     print(f"(g) rows missing pillar/rear dropped (18 of 20 with all cameras, 0 with --cams main,narrow,wide); "
-          f"a black wide sector skipped by _frame_row; {refused} OK")
+          f"a dark wide sector is counted (dark_sector_count) and kept; {refused} OK")
 
 
 def main() -> None:

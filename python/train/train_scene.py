@@ -46,6 +46,7 @@ from python.train.continual import (  # noqa: E402
     pass_plan,
     remaining_until_holdout_can_stop,
     resume_learning_rate,
+    should_reset_state,
 )
 from python.train.fit import (  # noqa: E402
     TrainFitError,
@@ -1151,6 +1152,31 @@ def _optimizer_group(
     return float(loss.detach().item()), n_loss, end_state, end_state
 
 
+def eval_resets(
+    k: int,
+    row: Mapping[str, Any],
+    prev_row: Mapping[str, Any] | None,
+    *,
+    reset_every: int,
+    width: int,
+) -> tuple[int, ...]:
+    """Streams to clear before holdout row ``k``.
+
+    The chunked stream (0) clears every ``reset_every`` rows. Every stream
+    clears where ``should_reset_state`` is true (a null ``dt_s``, a gap
+    over MEMORY_S, a new session), the same boundaries ``recording_spans``
+    gives training. Row 0 keeps the incoming state for the long stream.
+    """
+    out: set[int] = set()
+    if int(reset_every) > 0 and k % int(reset_every) == 0:
+        out.add(0)
+    if k > 0 and prev_row is not None and should_reset_state(
+        prev_row.get("session"), row.get("session"), row.get("dt_s")
+    ):
+        out.update(range(int(width)))
+    return tuple(sorted(out))
+
+
 def _eval_sequence(
     net: Any,
     root: Path,
@@ -1176,7 +1202,9 @@ def _eval_sequence(
 
     The primary stream clears the GRU every ``reset_every`` rows, the same
     fresh-state 16-frame windows training sees. ``pairs_long`` gets the old
-    protocol: one stream through the whole slice from ``state``. Both run as
+    protocol: one stream through the whole slice from ``state``. Both
+    streams also clear wherever ``should_reset_state`` is true
+    (``eval_resets``), as the training spans do. Both run as
     one batch of two. ``reset_every`` <= 0 scores the single stream only.
     The loss, ``parts`` (``lane_reg``/``conf_bce`` sums and ``n``),
     ``pair_rows`` (the row behind each primary pair) and ``preds_out``
@@ -1195,9 +1223,11 @@ def _eval_sequence(
     n_loss = 0
     try:
         with torch.no_grad():
+            prev_row: Mapping[str, Any] | None = None
             for k, row in enumerate(rows):
-                if chunked and k % int(reset_every) == 0:
-                    state = _reset_stream(net, state, 0, device)
+                for b in eval_resets(k, row, prev_row, reset_every=int(reset_every) if chunked else 0, width=width):
+                    state = _reset_stream(net, state, b, device)
+                prev_row = row
                 loaded = _frame_row(root, row, cams=cams, cache=cache, augment=False, scale=scale)
                 if loaded is None:
                     continue

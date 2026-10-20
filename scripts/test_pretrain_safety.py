@@ -9,6 +9,9 @@
 (a) --mask-events masks every ``excursion.phase == "abort"`` row whatever its
     reason (a lane_edge abort with no impact included), unless the reason is
     on --keep-abort-reasons; counts are logged per reason.
+(c) the holdout forward (``_eval_sequence`` via ``eval_resets``) clears every
+    stream wherever ``should_reset_state`` is true, at the same rows
+    ``recording_spans`` starts a training span.
 """
 from __future__ import annotations
 
@@ -146,7 +149,44 @@ def check_abort_mask() -> None:
           f"--keep-abort-reasons no_path,line_end keeps 2 OK\n    {line}")
 
 
+def check_eval_resets() -> None:
+    from python.train.continual import recording_spans
+    from python.train.scene_loader import recompute_dt
+    from python.train.train_scene import eval_resets
+
+    # 40 rows at 10 Hz, a 20 s hole after row 9 and a 3 s hole after row 24.
+    stamps = []
+    t = 0.0
+    for k in range(40):
+        stamps.append(t)
+        t += 20.0 if k == 9 else (3.0 if k == 24 else 0.1)
+    rows = recompute_dt([{"i": k, "t": s_} for k, s_ in enumerate(stamps)])
+    span_starts = {start for start, _end in recording_spans(rows)} - {0}
+    for width in (1, 2):
+        for every in (0, 16):
+            all_reset = set()
+            chunk_only = set()
+            prev = None
+            for k, row in enumerate(rows):
+                streams = eval_resets(k, row, prev, reset_every=every, width=width)
+                if streams == tuple(range(width)) and k > 0 and (every == 0 or k % every or width > 1):
+                    all_reset.add(k)
+                if streams == (0,) and width == 2:
+                    chunk_only.add(k)
+                prev = row
+            assert all_reset == span_starts == {10}, (width, every, all_reset, span_starts)
+            if every and width == 2:
+                assert chunk_only == {0, 16, 32}, chunk_only
+    assert eval_resets(0, rows[0], None, reset_every=16, width=2) == (0,)
+    assert eval_resets(0, rows[0], None, reset_every=0, width=1) == ()
+    assert eval_resets(5, {"dt_s": None}, rows[4], reset_every=0, width=2) == (0, 1)
+    assert eval_resets(5, {"dt_s": 0.1, "session": "b"}, {"session": "a"}, reset_every=0, width=1) == (0,)
+    print("(c) eval resets both streams at the recording_spans boundary (row 10, 20 s gap), not at the 3 s gap; "
+          "chunk resets stay every 16 rows on stream 0 OK")
+
+
 def main() -> None:
+    check_eval_resets()
     check_abort_mask()
     check_no_main_dropped()
     check_dt_after_removals()

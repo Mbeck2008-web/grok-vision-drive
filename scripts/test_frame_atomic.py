@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Frame PNGs go through binary_io.write_atomic: temp file, verify, rename.
 
 The PNG is on disk under its final name before its state line; a crash or a

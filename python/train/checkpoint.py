@@ -106,6 +106,12 @@ def load_checkpoint(strip_root: Path | str) -> dict[str, Any] | None:
     path = checkpoint_path(strip_root)
     if not path.is_file():
         return None
+    return load_checkpoint_file(path)
+
+
+def load_checkpoint_file(path: Path | str) -> dict[str, Any]:
+    """Read a pause file by its own path (``--export --checkpoint``)."""
+    path = Path(path)
     with np.load(path) as blob:
         meta = json.loads(_as_text(blob["meta"]))
         arrays = {key: np.array(blob[key], copy=True) for key in blob.files if key != "meta"}

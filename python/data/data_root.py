@@ -133,11 +133,27 @@ def space_failure(free: int, *, minimum: int = MIN_FREE_BYTES) -> str | None:
     return f"only {have:.1f} GB free, need {need:.0f} GB"
 
 
-def check_data_path(path: Path | str) -> int:
-    """Refuse C:/D: and a drive under 20 GB free. Returns free bytes."""
+def check_cache_path(path: Path | str, *, minimum: int) -> int:
+    """The one exception to the C: rule: a training ``--cache`` folder may live on C:.
+
+    It is a decoded copy keyed to its recording (manifest source check), so
+    only the ``minimum`` free-space floor applies there. D: is still refused,
+    and recordings, strips, exports and logs keep ``check_data_path``.
+    """
+    if drive_letter(path) == "D":
+        refuse_system_drive(path)
+    free = free_bytes(path)
+    reason = space_failure(free, minimum=minimum)
+    if reason is not None:
+        raise DataDriveError(f"{path}: {reason}")
+    return free
+
+
+def check_data_path(path: Path | str, *, minimum: int = MIN_FREE_BYTES) -> int:
+    """Refuse C:/D: and a drive under ``minimum`` (20 GB) free. Returns free bytes."""
     refuse_system_drive(path)
     free = free_bytes(path)
-    reason = space_failure(free)
+    reason = space_failure(free, minimum=minimum)
     if reason is not None:
         raise DataDriveError(f"{path}: {reason}")
     return free

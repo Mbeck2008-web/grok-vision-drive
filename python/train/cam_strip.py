@@ -198,7 +198,10 @@ def metadata_dict(
     """String metadata stored on the ONNX model."""
     return {
         "gvd_cams": ",".join(cams),
-        "gvd_heads": ",".join(heads) if heads else ",".join(HEAD_NAMES),
+        # Trained heads: the live runtime reads no other output. None is every
+        # head; an empty tuple (no head had a label) stamps an empty list,
+        # which the live runtime refuses.
+        "gvd_heads": ",".join(heads) if heads is not None else ",".join(HEAD_NAMES),
         "gvd_canvas_h": str(int(height)),
         "gvd_canvas_w": str(int(width)),
     }

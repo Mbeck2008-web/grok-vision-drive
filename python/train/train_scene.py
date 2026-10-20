@@ -33,6 +33,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from python.data.raw_frames import LossyFramesError  # noqa: E402
+from python.train.event_mask import MaskFileError  # noqa: E402
 from python.data.strip_writer import CANVAS_H, CANVAS_W  # noqa: E402
 from python.train.continual import (  # noqa: E402
     CHUNK_MAX,
@@ -46,6 +47,7 @@ from python.train.continual import (  # noqa: E402
     pass_plan,
     remaining_until_holdout_can_stop,
     resume_learning_rate,
+    should_reset_state,
 )
 from python.train.fit import (  # noqa: E402
     TrainFitError,
@@ -107,6 +109,46 @@ def _pin_optimizer_lr(opt: Any, rate: float) -> None:
             group["lr"] = pinned * float(group.get("lr_mult", 1.0))
 
 
+def set_lr_mults(opt: Any, backbone_lr_mult: float) -> None:
+    """Re-set each group's ``lr_mult`` from the command line before pinning.
+
+    ``opt.load_state_dict`` brings back the paused groups, ``lr_mult``
+    included, so a resume would keep the old ``--backbone-lr-mult``. The
+    group named ``backbone`` takes ``backbone_lr_mult``; every other group 1.0.
+    """
+    groups = getattr(opt, "param_groups", None)
+    if not isinstance(groups, list):
+        return
+    for group in groups:
+        if isinstance(group, dict):
+            group["lr_mult"] = float(backbone_lr_mult) if group.get("name") == "backbone" else 1.0
+
+
+def effective_lrs(opt: Any) -> dict[str, float]:
+    """The rate each optimizer group really steps at, by group name."""
+    out: dict[str, float] = {}
+    groups = getattr(opt, "param_groups", None)
+    if not isinstance(groups, list):
+        return out
+    for index, group in enumerate(groups):
+        if isinstance(group, dict) and "lr" in group:
+            out[str(group.get("name") or f"group{index}")] = float(group["lr"])
+    return out
+
+
+def recording_counts(rows: list[Mapping[str, Any]]) -> dict[str, int]:
+    """Rows per ``recording`` id (a plain folder's rows have none: ``-``)."""
+    out: dict[str, int] = {}
+    for row in rows:
+        key = str(row.get("recording") or "-")
+        out[key] = out.get(key, 0) + 1
+    return out
+
+
+def format_lrs(rates: Mapping[str, float]) -> str:
+    return ",".join(f"{name}:{value:.3g}" for name, value in rates.items()) or "none"
+
+
 def resolve_scene_batch(requested: int, parallel_fit: int) -> int:
     """Windows in one optimizer step.
 
@@ -132,6 +174,34 @@ def _maybe_jitter(frame: Any, augment: bool, rng: np.random.RandomState | None) 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train the GVD scene net from recorded strips")
     parser.add_argument("--strips", type=str, default="", help="Recording directory with state.jsonl and raw/<cam>/ frames. JPEG strips/ are refused.")
+    parser.add_argument(
+        "--recording",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help=(
+            "Train on several recordings: repeat once per recording folder (same rig). They are linked "
+            "(hard link, else byte copy; never re-encoded) into --combined-out, which is then trained like "
+            "--strips. Rows keep their recording id. Replaces --strips."
+        ),
+    )
+    parser.add_argument(
+        "--combined-out",
+        default="",
+        metavar="DIR",
+        help="New or empty folder for --recording (on the data disk; same volume for hard links).",
+    )
+    parser.add_argument(
+        "--usable-until",
+        action="append",
+        default=[],
+        metavar="NAME=ROW[:REASON]",
+        help=(
+            "Keep rows with i <= ROW of recording NAME (its folder name), e.g. "
+            "'rec5b=33661:stopped early (commit-thread failure), not finished'. Overrides that "
+            "recording's usable_until.json. Recorded in the run metadata."
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument(
@@ -151,7 +221,22 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         const=str(default_onnx_path()),
         default=None,
-        help="Write models/e2e_scene.onnx (FP32 graph). Optional path.",
+        help=(
+            "Write models/e2e_scene.onnx (FP32 graph). Optional path. With --strips the trained net is "
+            "exported at the end of the run. Without --strips (export-only) it needs --checkpoint; only a "
+            "paused run can be re-exported that way, because a finished run deletes its pause file."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint",
+        default="",
+        metavar="PAUSE_FILE",
+        help=(
+            "Export-only (--export without --strips): the pause file (*.gvd-pause.npz) whose weights are "
+            "exported. gvd_heads and gvd_cams are taken from its run record; a file without one is "
+            "refused, and so is a --heads or --cams that disagrees with it. Only a paused run has one: "
+            "a run that finishes exports its ONNX itself and then deletes its pause file."
+        ),
     )
     parser.add_argument(
         "--resume",
@@ -211,6 +296,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Decode --cams into this directory (chunks under 3.5 GB) and exit.",
     )
     parser.add_argument(
+        "--cache-min-free-gb",
+        type=float,
+        default=8.0,
+        help=(
+            "--cache / --build-cache: refuse a cache drive with less free space than this (GB). "
+            "The cache folder may be on C: (recordings may not)."
+        ),
+    )
+    parser.add_argument(
         "--clip",
         type=float,
         default=1.0,
@@ -257,11 +351,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--holdout-cells",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
-            "Spatial holdout: a seeded set of 250 m map cells with about 20%% of rows "
+            "Road-area holdout: a seeded set of 250 m map cells with about 20%% of rows "
             "(fast and slow cells in proportion) is scored, and train drops rows within "
-            "50 m of them. The list is saved and reused (see --holdout-cells-file)."
+            "50 m of them. Cells are map coordinates, so a road's frames from every recording "
+            "land on the same side. The list is saved and reused (see --holdout-cells-file). "
+            "Default: on when training several recordings (--recording, or a combined folder) "
+            "and --holdout-blocks is not set above 1; else off. --no-holdout-cells turns it off."
         ),
     )
     parser.add_argument(
@@ -270,7 +368,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Cell list JSON. Loaded when it exists, else chosen and written. Default: <status dir>/holdout_cells.json.",
     )
-    parser.add_argument("--holdout-seed", type=int, default=0, help="Seed for choosing --holdout-cells.")
+    parser.add_argument(
+        "--holdout-seed",
+        type=int,
+        default=0,
+        help=(
+            "Seed for drawing --holdout-cells (default 0, fixed). The draw is saved and reused; the seed in "
+            "use is written to the run metadata. A re-draw means changing this once, on purpose, and that "
+            "new seed is recorded; never re-roll it until the val scores look good."
+        ),
+    )
     parser.add_argument(
         "--conf-weight",
         type=float,
@@ -312,8 +419,43 @@ def build_parser() -> argparse.ArgumentParser:
         "--mask-events",
         action="store_true",
         help=(
-            "Leave out rows inside an impacts.jsonl window [pre_t0, impact_end] (matched by time t) "
-            "and rows the collector flagged settle or stall. Off by default."
+            "Leave out rows inside an impacts.jsonl window [pre_t0, impact_end] (matched by time t), "
+            "every excursion.phase=abort row (see --keep-abort-reasons), and rows the collector "
+            "flagged settle or stall. Off by default."
+        ),
+    )
+    parser.add_argument(
+        "--keep-abort-reasons",
+        default="",
+        help=(
+            "With --mask-events, comma list of excursion.reason values whose abort rows are kept. "
+            "Default empty: every abort row is masked whatever its reason."
+        ),
+    )
+    parser.add_argument(
+        "--mask-phases",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Leave out every row whose excursion.phase is weave, lane_change, abort or recover. "
+            "On by default with --mask-events (--no-mask-phases turns it off), off otherwise."
+        ),
+    )
+    parser.add_argument(
+        "--mask-files",
+        default="",
+        help=(
+            "Comma list of mask sidecars (JSON lines with a row id i), relative to the recording "
+            "folder. Every listed row is left out. A missing file or an i the recording does not "
+            "have stops the run."
+        ),
+    )
+    parser.add_argument(
+        "--mask-report",
+        action="store_true",
+        help=(
+            "Print the per-source mask lines and the union (rows, main frames, trainable main and "
+            "valid) and exit before any frame is read."
         ),
     )
     parser.add_argument(
@@ -331,6 +473,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="With --backbone imagenet-*, keep the ImageNet weights fixed and train only the projection and heads.",
     )
     return parser
+
+
+def resolve_holdout_cells(flag: bool | None, recordings: int, blocks: int) -> bool:
+    """``--holdout-cells`` as given; unset, on for several recordings unless time blocks are asked for."""
+    if flag is not None:
+        return bool(flag)
+    return int(recordings) > 1 and int(blocks) <= 1
+
+
+def count_recordings(root: Path | str) -> int:
+    """Recordings in a folder: a combined folder lists them, any other folder is one."""
+    from python.train.combine_recordings import recordings_metadata
+
+    try:
+        return len(recordings_metadata(root))
+    except Exception:
+        return 1
 
 
 def resolve_holdout_blocks(value: int | None) -> int:
@@ -486,8 +645,12 @@ COLLAPSE_STD_M = 0.05
 LANE_SLOT_NAMES = (
     "c5", "l5", "r5", "c10", "l10", "r10", "c20", "l20", "r20", "c30", "l30", "r30", "heading", "conf_logit",
 )
-# Frames whose main area was all zero and were skipped in this process.
-BLANK_MAIN_SKIPS = 0
+# Loaded frames whose main area is near-black. Logged only, never dropped.
+DARK_MAIN_COUNT = 0
+# Loaded frames with a near-black trained sector other than main. Logged only:
+# a dark picture is a picture (night, tunnel); only a camera the writer did not
+# save is missing, and select_training_rows drops those rows.
+DARK_SECTOR_COUNT = 0
 
 
 # Near-black main sector: mean below 2% of full scale, or more than 98% of
@@ -533,6 +696,21 @@ def main_area_blank(frame: Any, cams: tuple[str, ...] | None, scale: float = 1.0
         if sec.cam_id == "main":
             return near_black(arr[:, sec.x0 : sec.x1])
     return False
+
+
+def blank_sectors(frame: Any, cams: tuple[str, ...] | None, scale: float = 1.0) -> tuple[str, ...]:
+    """Trained cameras whose sector of ``frame`` is near-black. For the log count only."""
+    from python.data.strip_writer import STRIP_ORDER
+    from python.train.cam_strip import scaled_layout
+
+    names = tuple(cams) if cams else tuple(STRIP_ORDER)
+    if frame is None:
+        return ()
+    sectors, _height, width = scaled_layout(names, scale if float(scale) < 0.999 else 1.0)
+    arr = np.asarray(frame)
+    if arr.ndim < 2 or int(arr.shape[1]) != int(width):
+        return ()
+    return tuple(sec.cam_id for sec in sectors if near_black(arr[:, sec.x0 : sec.x1]))
 
 
 def count_near_black_main(
@@ -820,11 +998,14 @@ def _frame_row(
         from python.train.cam_strip import scale_canvas
 
         frame = scale_canvas(frame, scale, cams)
+    # Darkness is counted, never dropped: a dark picture is a picture (night,
+    # tunnel). Missing cameras are dropped by file in select_training_rows.
     if main_area_blank(frame, cams, scale):
-        # No front picture: a black main sector with a real label. Skip it.
-        global BLANK_MAIN_SKIPS
-        BLANK_MAIN_SKIPS += 1
-        return None
+        global DARK_MAIN_COUNT
+        DARK_MAIN_COUNT += 1
+    if any(cam != "main" for cam in blank_sectors(frame, cams, scale)):
+        global DARK_SECTOR_COUNT
+        DARK_SECTOR_COUNT += 1
     if augment:
         frame = photometric_jitter(frame, rng)
     # The stitch is not a yaw roll, so this returns the frame and the row.
@@ -1155,6 +1336,31 @@ def _optimizer_group(
     return float(loss.detach().item()), n_loss, end_state, end_state
 
 
+def eval_resets(
+    k: int,
+    row: Mapping[str, Any],
+    prev_row: Mapping[str, Any] | None,
+    *,
+    reset_every: int,
+    width: int,
+) -> tuple[int, ...]:
+    """Streams to clear before holdout row ``k``.
+
+    The chunked stream (0) clears every ``reset_every`` rows. Every stream
+    clears where ``should_reset_state`` is true (a null ``dt_s``, a gap
+    over MEMORY_S, a new session), the same boundaries ``recording_spans``
+    gives training. Row 0 keeps the incoming state for the long stream.
+    """
+    out: set[int] = set()
+    if int(reset_every) > 0 and k % int(reset_every) == 0:
+        out.add(0)
+    if k > 0 and prev_row is not None and should_reset_state(
+        prev_row.get("session"), row.get("session"), row.get("dt_s")
+    ):
+        out.update(range(int(width)))
+    return tuple(sorted(out))
+
+
 def _eval_sequence(
     net: Any,
     root: Path,
@@ -1180,7 +1386,9 @@ def _eval_sequence(
 
     The primary stream clears the GRU every ``reset_every`` rows, the same
     fresh-state 16-frame windows training sees. ``pairs_long`` gets the old
-    protocol: one stream through the whole slice from ``state``. Both run as
+    protocol: one stream through the whole slice from ``state``. Both
+    streams also clear wherever ``should_reset_state`` is true
+    (``eval_resets``), as the training spans do. Both run as
     one batch of two. ``reset_every`` <= 0 scores the single stream only.
     The loss, ``parts`` (``lane_reg``/``conf_bce`` sums and ``n``),
     ``pair_rows`` (the row behind each primary pair) and ``preds_out``
@@ -1199,9 +1407,11 @@ def _eval_sequence(
     n_loss = 0
     try:
         with torch.no_grad():
+            prev_row: Mapping[str, Any] | None = None
             for k, row in enumerate(rows):
-                if chunked and k % int(reset_every) == 0:
-                    state = _reset_stream(net, state, 0, device)
+                for b in eval_resets(k, row, prev_row, reset_every=int(reset_every) if chunked else 0, width=width):
+                    state = _reset_stream(net, state, b, device)
+                prev_row = row
                 loaded = _frame_row(root, row, cams=cams, cache=cache, augment=False, scale=scale)
                 if loaded is None:
                     continue
@@ -1344,12 +1554,64 @@ def stamp_pause(
     return payload
 
 
-def _apply_checkpoint(net: Any, opt: Any, scaler: Any, fields: Mapping[str, Any], device: Any) -> None:
-    """Load the paused weights and optimizer. Does not touch the strip folder.
+class ExportRefused(ValueError):
+    """An export-only run cannot say which heads the weights were trained on."""
 
-    An older conv-relu file has no GroupNorm tag. It is refused before any
-    weight is copied, so those tensors are not applied to the new stem.
+
+def export_contract_from_checkpoint(
+    payload: Mapping[str, Any], *, heads_flag: str = "", cams_flag: str = ""
+) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, Any]]:
+    """(heads, cams, net) to stamp for an export-only run, from the checkpoint's run record.
+
+    Refused: no run record, no heads list, an empty heads list (nothing
+    cleared the label floor), or a ``--heads`` / ``--cams`` that is not the
+    recorded set.
     """
+    from python.train.cam_strip import parse_cams, parse_heads
+
+    run = payload.get("run") if isinstance(payload, Mapping) else None
+    if not isinstance(run, Mapping):
+        raise ExportRefused("checkpoint has no run record (written before the trained-heads contract); "
+                            "retrain or resume to write one")
+    raw = run.get("heads")
+    if not isinstance(raw, (list, tuple)):
+        raise ExportRefused("checkpoint run record has no heads list")
+    try:
+        heads = tuple(parse_heads(",".join(str(h) for h in raw))) if raw else ()
+    except ValueError as exc:
+        raise ExportRefused(f"checkpoint heads {list(raw)} unreadable: {exc}") from exc
+    if not heads:
+        raise ExportRefused("checkpoint run record lists no trained head (none cleared the label floor)")
+    if str(heads_flag or "").strip():
+        wanted = parse_heads(heads_flag)
+        if set(wanted) != set(heads):
+            raise ExportRefused(f"--heads {','.join(wanted)} disagrees with the checkpoint's trained heads "
+                                f"{','.join(heads)}; drop --heads or export the run that trained them")
+    cams = tuple(parse_cams(",".join(str(c) for c in (run.get("cams") or []))))
+    if str(cams_flag or "").strip() and set(parse_cams(cams_flag)) != set(cams):
+        raise ExportRefused(f"--cams {cams_flag} disagrees with the checkpoint's cams {','.join(cams)}")
+    net = dict(run.get("net") or {})
+    return heads, cams, net
+
+
+def build_export_net(cams: tuple[str, ...], net_info: Mapping[str, Any]) -> Any:
+    """The net a checkpoint was trained as (cams, input scale, backbone)."""
+    from python.data.strip_writer import STRIP_ORDER
+
+    backbone = str(net_info.get("backbone") or "")
+    scale = float(net_info.get("scale") or 1.0)
+    use_cams = None if tuple(cams) == tuple(STRIP_ORDER) else tuple(cams)
+    if backbone in ("", "scratch"):
+        from python.train.scene_net import SceneNet
+
+        return SceneNet(cams=use_cams, scale=scale)
+    from python.train.pretrained_net import build_scene_net
+
+    return build_scene_net(use_cams, scale, backbone, freeze=False)
+
+
+def load_pause_weights(net: Any, fields: Mapping[str, Any]) -> None:
+    """Copy a pause file's weights into ``net`` (arch checked first). No optimizer."""
     used_cams = tuple(getattr(net, "cams", ()) or ()) or None
     net_arch = getattr(net, "pause_arch", None)
     if not pause_matches_stem(fields, used_cams, net_arch):
@@ -1370,6 +1632,17 @@ def _apply_checkpoint(net: Any, opt: Any, scaler: Any, fields: Mapping[str, Any]
     if missing:
         raise KeyError(f"pause checkpoint is missing {missing[0]}")
     net.load_state_dict(mapped)
+
+
+def _apply_checkpoint(net: Any, opt: Any, scaler: Any, fields: Mapping[str, Any], device: Any) -> None:
+    """Load the paused weights and optimizer. Does not touch the strip folder.
+
+    An older conv-relu file has no GroupNorm tag. It is refused before any
+    weight is copied, so those tensors are not applied to the new stem.
+    """
+    load_pause_weights(net, fields)
+    import torch
+
     optimizer = fields.get("optimizer") or {}
     if optimizer:
         tree = _from_numpy_tree(optimizer)
@@ -1410,8 +1683,15 @@ def _save_pause(
     batch: int,
     device_name: str,
     recommended: bool,
+    run: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Save weights before the loop stops. Strip files are not rewritten."""
+    """Save weights before the loop stops. Strip files are not rewritten.
+
+    ``run`` (cams, trained heads with their label counts, net) travels with
+    the weights, so an export-only run stamps exactly what was trained.
+    """
+    import json
+
     used_cams = tuple(getattr(net, "cams", ()) or ()) or None
     payload = stamp_pause(
         {
@@ -1428,6 +1708,7 @@ def _save_pause(
             "weights": {key: value.detach().cpu().numpy() for key, value in net.state_dict().items()},
             "optimizer": _to_numpy_tree(opt.state_dict()),
             "scaler": None if scaler is None else _to_numpy_tree(scaler.state_dict()),
+            "run": None if run is None else json.loads(json.dumps(run)),
         },
         used_cams,
         getattr(net, "pause_arch", None),
@@ -1568,6 +1849,11 @@ def train_directory(
     freeze_backbone: bool = False,
     backbone_lr_mult: float = 1.0,
     mask_events: bool = False,
+    keep_abort_reasons: str = "",
+    mask_phases: bool | None = None,
+    mask_files: str = "",
+    mask_report_only: bool = False,
+    usable_until: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     import torch
 
@@ -1583,7 +1869,7 @@ def train_directory(
     lane_kind = str(lane_loss or "huber")
     input_scale = float(scale) if float(scale) > 0.0 else 1.0
     from python.data.raw_frames import load_scene_rows, training_frame_bytes
-    from python.train.scene_loader import default_num_workers, select_training_rows
+    from python.train.scene_loader import default_num_workers, recompute_dt, recorded_cams, select_training_rows
 
     print("[GVD] scene index: reading state.jsonl", flush=True)
     from python.data.raw_frames import refuse_lossy
@@ -1591,12 +1877,64 @@ def train_directory(
     refuse_lossy(root)
     state_rows = load_scene_rows(root)
     print(f"[GVD] scene index: {len(state_rows)} state rows", flush=True)
+    from python.train.combine_recordings import (
+        COMBINED,
+        apply_cut,
+        describe_recording,
+        recordings_metadata,
+        resolve_cut,
+    )
+
+    if not (root / COMBINED).is_file():
+        # A plain folder honours its own cut; a combined folder was cut when it was linked.
+        own_cut = resolve_cut(root, usable_until)
+        if own_cut:
+            before_cut = len(state_rows)
+            state_rows = apply_cut(state_rows, own_cut)
+            print(f"[GVD] scene index: usable_until row {own_cut['max_i']} ({own_cut['reason']}): "
+                  f"kept {len(state_rows)} of {before_cut} rows", flush=True)
+    run_recordings = recordings_metadata(root, state_rows, usable_until)
+    for item in run_recordings:
+        print(f"[GVD] recording {describe_recording(item)}", flush=True)
+    use_phases = bool(mask_events) if mask_phases is None else bool(mask_phases)
+    masked_ids: set[int] | None = None
+    mask_meta: dict[str, Any] = {}
+    if mask_events or use_phases or mask_files:
+        from python.train.event_mask import describe, mask_report, row_masks
+
+        # Every source is computed on the full recording rows (before frame and
+        # camera filtering), so impact windows and settle runs see every tick.
+        mask_sources, masked_ids, event_counts = row_masks(
+            root, state_rows, events=bool(mask_events), phases=use_phases, files=mask_files,
+            keep_abort_reasons=keep_abort_reasons,
+        )
+        if mask_events:
+            print(f"[GVD] mask-events: {describe(event_counts, len(state_rows))}", flush=True)
+        mask_lines, mask_totals = mask_report(state_rows, mask_sources, masked_ids)
+        for line in mask_lines:
+            print(line, flush=True)
+        mask_meta = {"events": bool(mask_events), "phases": use_phases, "files": str(mask_files or ""),
+                     "keep_abort_reasons": str(keep_abort_reasons or ""),
+                     "sources": {name: len(ids) for name, ids in mask_sources}, **mask_totals}
+    if mask_report_only:
+        return {"mask_report": mask_meta}
     print("[GVD] scene index: measuring frames", flush=True)
 
     def _index_progress(n_frames: int, n_bytes: int) -> None:
         print(f"[GVD] scene index: {n_frames} frames {n_bytes} bytes", flush=True)
 
     file_bytes, _n_image_files = training_frame_bytes(root, progress=_index_progress)
+    if train_cams is None and (root / "raw").is_dir():
+        from python.data.strip_writer import STRIP_ORDER
+
+        have = recorded_cams(root)
+        absent = [cam for cam in STRIP_ORDER if cam not in have]
+        if absent:
+            # The all-camera net would see these sectors black on every row.
+            raise SystemExit(
+                f"[GVD] scene train: no --cams and this recording has no {','.join(absent)} camera; "
+                f"the all-camera net would train on black sectors. Pass --cams {','.join(have) or 'main'}"
+            )
     dropped: dict[str, int] = {}
     rows, missing_rows, excluded_rows = select_training_rows(root, state_rows, cams=train_cams, dropped=dropped)
     print(
@@ -1606,25 +1944,39 @@ def train_directory(
     )
     print(
         f"[GVD] scene index: dropped {int(dropped.get('no_trained_cam', 0))} rows without a decodable "
-        f"trained camera ({','.join(train_cams or ()) or 'all'}; main required when trained)",
+        f"trained camera ({','.join(train_cams or ()) or 'all'}; main required when trained), "
+        f"{int(dropped.get('no_main', 0))} rows without a main frame (all cameras)",
         flush=True,
     )
-    if mask_events:
-        from python.train.event_mask import describe, mask_event_rows
-
+    if int(dropped.get("missing_cam", 0)):
+        per_cam = ",".join(
+            f"{key.split(':', 1)[1]}={value}" for key, value in sorted(dropped.items()) if key.startswith("missing_cam:")
+        )
+        print(
+            f"[GVD] scene index: dropped {int(dropped['missing_cam'])} rows missing another trained camera "
+            f"({per_cam}); a black sector never trains. Cameras below 10 Hz are absent on most ticks: "
+            "pass --cams with the 10 Hz cameras (e.g. main,narrow,wide) to keep those rows",
+            flush=True,
+        )
+    if masked_ids is not None:
         before = len(rows)
-        rows, event_counts = mask_event_rows(root, rows)
-        print(f"[GVD] mask-events: {describe(event_counts, before)}", flush=True)
+        from python.train.event_mask import drop_masked
+
+        # A masked run is one gap; past MEMORY_S it resets the GRU.
+        rows = drop_masked(rows, masked_ids)
+        print(f"[GVD] masks: left out {before - len(rows)} of {before} rows with frames; {len(rows)} remain", flush=True)
+    print(f"[GVD] scene index: training rows by recording {recording_counts(rows)}", flush=True)
     blank_scan = count_near_black_main(rows, cache, train_cams, input_scale)
     near_rule = (
         f"mean<{NEAR_BLACK_MEAN} or >{NEAR_BLACK_FRAC:.0%} of px below {NEAR_BLACK_LEVEL}/255"
     )
     if blank_scan is None:
-        print(f"[GVD] scene index: near-black main ({near_rule}) is skipped as rows load; no cache to count it up front", flush=True)
+        print(f"[GVD] scene index: near-black main ({near_rule}) is counted as rows load (dark_main_count), "
+              "never skipped; no cache to count it up front", flush=True)
     else:
         print(
             f"[GVD] scene index: near-black main ({near_rule}): {blank_scan[0]} of {blank_scan[1]} cached rows; "
-            "skipped when loaded (blank_main_skipped in the val line)",
+            "kept and counted when loaded (dark_main_count in the val line)",
             flush=True,
         )
     print(
@@ -1649,7 +2001,14 @@ def train_directory(
         cells_path = Path(holdout_cells_file) if holdout_cells_file else Path(cells_dir) / "holdout_cells.json"
         if cells_path.is_file():
             cell_spec = load_holdout_cells(cells_path, rows)
-            print(f"[GVD] holdout cells: loaded {len(cell_spec['cells'])} cells from {cells_path}", flush=True)
+            print(f"[GVD] holdout cells: loaded {len(cell_spec['cells'])} cells from {cells_path} "
+                  f"(drawn with seed {cell_spec.get('seed')})", flush=True)
+            if cell_spec.get("seed") is not None and int(cell_spec["seed"]) != int(holdout_seed):
+                print(
+                    f"[GVD] holdout cells: the saved draw (seed {cell_spec.get('seed')}) is reused; --holdout-seed "
+                    f"{int(holdout_seed)} does not re-draw it. A re-draw is a deliberate new cells file.",
+                    flush=True,
+                )
         else:
             cell_spec = choose_holdout_cells(rows, seed=int(holdout_seed))
             check_holdout_cells(cell_spec, rows, source="chosen cells")
@@ -1666,6 +2025,31 @@ def train_directory(
     from python.train.continual import HOLDOUT_FAST_MPS, holdout_mix
 
     startup_plan = pass_plan(rows, CHUNK_MAX, CHUNK_MAX // 2, blocks=int(holdout_blocks), cells=cell_spec)
+    from python.train.continual import format_composition, lopsided_warnings, split_composition
+
+    # Validation composition: what val scores are measured on, next to what trains.
+    composition = split_composition(
+        rows, startup_plan, buffer_rows=marks.count("gap") if cell_spec is not None else None
+    )
+    lopsided = lopsided_warnings(composition)
+    print(f"[GVD] holdout composition: {format_composition(composition)}", flush=True)
+    for warning in lopsided:
+        print(f"[GVD] holdout WARNING lopsided (>2x): {warning}; val scores over-weight or miss it", flush=True)
+    holdout_meta: dict[str, Any] = {
+        "mode": "cells" if cell_spec is not None else ("blocks" if int(holdout_blocks) > 1 else "segments"),
+        "seed": None if cell_spec is None else cell_spec.get("seed"),
+        "seed_flag": int(holdout_seed),
+        "cells_file": None if cell_spec is None else str(cells_path.name),
+        "cells": None if cell_spec is None else len(cell_spec.get("cells") or []),
+        "blocks": int(holdout_blocks),
+        "composition": composition,
+        "lopsided": lopsided,
+    }
+    if cell_spec is not None:
+        from python.train.continual import holdout_leakage_note
+
+        holdout_meta["limit"] = holdout_leakage_note(float(cell_spec.get("buffer_m", 50.0)))
+        print(f"[GVD] holdout limit: {holdout_meta['limit']}", flush=True)
     mix = holdout_mix(startup_plan)
     print(
         f"[GVD] holdout: rows={mix['rows']} slices={mix['slices']} fast={mix['fast']} slow={mix['slow']} "
@@ -1692,14 +2076,15 @@ def train_directory(
 
     def _empty(precision: str = "fp32") -> dict[str, Any]:
         if export_path is not None:
-            export_scene_onnx(export_path, cams=train_cams, heads=train_heads)
+            # Nothing trained: an untrained net is never exported (its heads would be a guess).
+            print(f"[GVD] no training rows: nothing trained, {export_path} not written", flush=True)
         return {
             "strips": len(rows),
             "windows": 0,
             "supervised": 0,
             "precision": precision,
             "capability": capability,
-            "export": None if export_path is None else str(export_path),
+            "export": None,
             "device": "cpu",
             "batch": 0,
             "recommended": False,
@@ -1823,6 +2208,54 @@ def train_directory(
 
     debug_dir = status_dir(status_root)
     run_started = time.time()
+    from python.data.strip_writer import STRIP_ORDER as _ALL_CAMS
+
+    run_cams = list(train_cams or _ALL_CAMS)
+    from python.train.continual import training_rows
+    from python.train.scene_net import LABEL_FLOOR_ROWS, LABEL_FLOOR_SHARE, labelled_heads
+
+    # Trained-heads contract: a head whose labels are under the floor trains
+    # mostly toward "absent"; it is left off gvd_heads and the live runtime ignores it.
+    # Counted on the rows that train (after the holdout split, its buffer and
+    # --min-valid), with the training loop's own chunking: a label seen only
+    # in val rows never makes a head "trained".
+    label_rows = training_rows(
+        pass_plan(rows, chunk_len, stride, blocks=int(holdout_blocks), cells=cell_spec), min_valid=float(min_valid)
+    )
+    stamp_heads, unlabelled_heads, head_labels = labelled_heads(label_rows, train_heads)
+    label_floor = {"share": LABEL_FLOOR_SHARE, "rows": LABEL_FLOOR_ROWS, "training_rows": len(label_rows)}
+    print(
+        "[GVD] head labels: "
+        + " ".join(f"{h}={c['labelled_rows']}({c['labelled_share']:.1%})" for h, c in head_labels.items())
+        + f" over {len(label_rows)} training rows; floor={LABEL_FLOOR_SHARE:.0%} and {LABEL_FLOOR_ROWS} rows",
+        flush=True,
+    )
+    if unlabelled_heads:
+        print(
+            f"[GVD] heads below the label floor: {','.join(unlabelled_heads)}; trained mostly toward absent "
+            f"and NOT stamped in gvd_heads ("
+            + (f"pass --heads {','.join(stamp_heads)} to skip them)" if stamp_heads
+               else "no head clears it: the live runtime will refuse this model)"),
+            flush=True,
+        )
+    # Run metadata: the camera and head contracts the export stamps as gvd_cams / gvd_heads.
+    run_record = {"kind": "run", "t": run_started, "cams": run_cams,
+                  "heads": list(stamp_heads),
+                  "heads_requested": list(train_heads or ()) or "all",
+                  "heads_unlabelled": list(unlabelled_heads),
+                  "head_labels": head_labels,
+                  "label_floor": label_floor,
+                  "net": {"backbone": str(backbone or ""), "scale": float(input_scale)},
+                  "recordings": run_recordings,
+                  "rows_by_recording": recording_counts(rows),
+                  "holdout": holdout_meta,
+                  "masks": mask_meta}
+    append_metrics(debug_dir, run_record)
+    # The pause checkpoint carries the contract (not the recordings/holdout detail).
+    checkpoint_run = {key: run_record[key] for key in
+                      ("cams", "heads", "heads_requested", "heads_unlabelled", "head_labels", "label_floor", "net")}
+    print(f"[GVD] run cams={','.join(run_cams)} heads={','.join(stamp_heads)} "
+          "(written to metrics.jsonl and the ONNX gvd_cams / gvd_heads)", flush=True)
     write_heartbeat(
         debug_dir,
         {
@@ -1926,6 +2359,7 @@ def train_directory(
                 batch=batch,
                 device_name=device.type,
                 recommended=recommended,
+                run=checkpoint_run,
             )
             last_ckpt = now
             print(f"[GVD] checkpoint step={done}", flush=True)
@@ -1958,6 +2392,7 @@ def train_directory(
             batch=batch,
             device_name=device.type,
             recommended=recommended,
+            run=checkpoint_run,
         )
         view.mark_paused(payload)
         if not _wait_for_start(view):
@@ -2236,6 +2671,8 @@ def train_directory(
             if hold_n <= 0:
                 break
             mean = hold_sum / hold_n
+            lr_now = effective_lrs(holder.get("opt"))
+            print(f"[GVD] epoch={int(epoch)} step={done} lr={format_lrs(lr_now)} (from opt.param_groups)", flush=True)
             scored: dict[str, Any] = {}
             if val_pairs:
                 scored = val_summary(val_pairs, val_pairs_long, val_parts)
@@ -2260,7 +2697,10 @@ def train_directory(
                     "pred_mean": json_num(scored.get("pred_mean")),
                     "pred_std": json_num(scored.get("pred_std")),
                     "collapse": bool(scored.get("collapse")),
-                    "blank_main_skipped": int(BLANK_MAIN_SKIPS),
+                    "dark_main_count": int(DARK_MAIN_COUNT),
+                    "dark_sector_count": int(DARK_SECTOR_COUNT),
+                    "cams": run_cams,
+                    "lr": lr_now,
                 }
                 cell_lines: list[str] = []
                 if cell_spec is not None:
@@ -2290,7 +2730,8 @@ def train_directory(
                     f"pred_mean={scored.get('pred_mean')} pred_std={scored.get('pred_std')} "
                     f"r_long={scored.get('r_long')} rms_long={scored.get('rms_long')} "
                     f"bias_long={scored.get('bias_long')} eval_chunk={int(eval_chunk)} "
-                    f"blank_main_skipped={int(BLANK_MAIN_SKIPS)}",
+                    f"dark_main_count={int(DARK_MAIN_COUNT)} dark_sector_count={int(DARK_SECTOR_COUNT)} "
+                    f"lr={format_lrs(lr_now)}",
                     flush=True,
                 )
                 for line in cell_lines:
@@ -2421,6 +2862,7 @@ def train_directory(
                 device = holder["device"]
                 net = holder["net"]
                 _apply_checkpoint(net, holder["opt"], holder["scaler"], fields, device)
+                set_lr_mults(holder["opt"], float(backbone_lr_mult))
                 _pin_optimizer_lr(holder["opt"], rate)
                 if init_head_bias:
                     print("[GVD] --init-head-bias ignored: resuming from a checkpoint", flush=True)
@@ -2489,7 +2931,7 @@ def train_directory(
                     )
                 _train_passes()
         if not paused_exit and not dry_run and not sanity and export_path is not None:
-            export_scene_onnx(export_path, net, heads=train_heads)
+            export_scene_onnx(export_path, net, heads=tuple(stamp_heads))
         if not paused_exit and not dry_run and not sanity:
             clear_checkpoint(root)
     except Exception:
@@ -2523,7 +2965,14 @@ def train_directory(
 
 
 def main(argv: list[str] | None = None) -> None:
-    from python.data.data_root import DataDriveError, check_data_path, ensure_cache_dirs, scene_lanes_dir
+    from python.data.data_root import (
+        DataDriveError,
+        check_cache_path,
+        check_data_path,
+        ensure_cache_dirs,
+        refuse_system_drive,
+        scene_lanes_dir,
+    )
 
     try:
         ensure_cache_dirs()
@@ -2541,7 +2990,17 @@ def main(argv: list[str] | None = None) -> None:
     except ValueError as exc:
         print(f"[GVD] scene train: {exc}")
         sys.exit(2)
+    from python.train.frame_cache import CacheMismatchError
+
+    cache_floor = int(float(args.cache_min_free_gb) * 1024 ** 3)
     if args.build_cache:
+        try:
+            # The recording read from stays off C:/D:; the cache may be on C:.
+            refuse_system_drive(args.strips or scene_lanes_dir())
+            check_cache_path(args.build_cache, minimum=cache_floor)
+        except DataDriveError as exc:
+            print(f"[GVD] scene train: cache {exc}")
+            sys.exit(2)
         manifest = build_frame_cache(
             args.strips or scene_lanes_dir(),
             args.build_cache,
@@ -2554,27 +3013,79 @@ def main(argv: list[str] | None = None) -> None:
             flush=True,
         )
         return
-    frame_cache = FrameCache(args.cache) if args.cache else None
+    frame_cache = None
     export_path = None if args.export is None else Path(args.export)
     if export_path is not None and not args.strips:
+        # Export-only: the weights and the trained heads come from a checkpoint's run record.
         try:
             check_data_path(export_path)
+            if not args.checkpoint:
+                raise ExportRefused(
+                    "export-only needs --checkpoint <pause file>: an untrained net is never exported, "
+                    "and gvd_heads must come from the run that trained the weights. Only a paused run can be re-exported this way: a run that finishes exports its ONNX itself and then deletes its pause file."
+                )
+            if not Path(args.checkpoint).is_file():
+                raise ExportRefused(
+                    f"checkpoint {args.checkpoint} does not exist. Only a paused run can be re-exported this way: a run that finishes exports its ONNX itself and then deletes its pause file. "
+                    "Use that run's exported ONNX, or pause a run and export from its pause file."
+                )
+            from python.train.checkpoint import load_checkpoint_file
+
+            payload = load_checkpoint_file(args.checkpoint)
+            heads, ck_cams, ck_net = export_contract_from_checkpoint(
+                payload, heads_flag=args.heads, cams_flag=args.cams
+            )
         except DataDriveError as exc:
             print(f"[GVD] scene train: {exc}")
+            sys.exit(2)
+        except (ExportRefused, OSError, ValueError, KeyError) as exc:
+            print(f"[GVD] scene export refused: {exc}")
             sys.exit(2)
         if not torch_ready():
             print("[GVD] scene export needs PyTorch")
             sys.exit(2)
-        path = export_scene_onnx(export_path, cams=cam_names, heads=head_names)
-        print(f"[GVD] exported {path}")
+        net = build_export_net(ck_cams, ck_net)
+        load_pause_weights(net, payload)
+        path = export_scene_onnx(export_path, net, heads=heads)
+        print(f"[GVD] exported {path} from {args.checkpoint}: gvd_heads={','.join(heads)} "
+              f"gvd_cams={','.join(ck_cams)} (from the checkpoint's run record)")
         return
+    from python.train.combine_recordings import CombineError, combine_recordings, parse_usable_until
+
+    try:
+        usable_flags = parse_usable_until(args.usable_until)
+    except CombineError as exc:
+        print(f"[GVD] scene train: {exc}")
+        sys.exit(2)
+    if args.recording:
+        if args.strips or not args.combined_out:
+            print("[GVD] scene train: --recording needs --combined-out and replaces --strips")
+            sys.exit(2)
+        try:
+            for source in args.recording:
+                refuse_system_drive(source)
+            check_data_path(args.combined_out)
+            combined = combine_recordings(args.recording, args.combined_out, usable_until=usable_flags)
+        except (DataDriveError, CombineError) as exc:
+            print(f"[GVD] scene train: {exc}")
+            sys.exit(2)
+        print(
+            f"[GVD] combined {len(args.recording)} recordings into {args.combined_out}: rows={combined['rows']} "
+            f"files={combined.get('files')}",
+            flush=True,
+        )
+        args.strips = str(args.combined_out)
     if not args.strips:
         args.strips = str(scene_lanes_dir())
     try:
         check_data_path(args.strips)
         if export_path is not None:
             check_data_path(export_path)
-    except DataDriveError as exc:
+        if args.cache:
+            check_cache_path(args.cache, minimum=cache_floor)
+            frame_cache = FrameCache(args.cache, strips_root=args.strips)
+            print(f"[GVD] cache {args.cache}: built from {args.strips} (rows and state.jsonl hash match)", flush=True)
+    except (DataDriveError, CacheMismatchError) as exc:
         print(f"[GVD] scene train: {exc}")
         sys.exit(2)
     if not torch_ready():
@@ -2584,6 +3095,12 @@ def main(argv: list[str] | None = None) -> None:
     if not open_panel:
         print("[GVD] scene train: no panel", flush=True)
     try:
+        holdout_blocks = resolve_holdout_blocks(args.holdout_blocks)
+        n_recordings = len(args.recording) or count_recordings(args.strips)
+        holdout_cells = resolve_holdout_cells(args.holdout_cells, n_recordings, holdout_blocks)
+        if args.holdout_cells is None and holdout_cells:
+            print(f"[GVD] holdout: {n_recordings} recordings, road-area cells by default "
+                  "(--no-holdout-cells or --holdout-blocks N for the time split)", flush=True)
         stats = train_directory(
             Path(args.strips),
             epochs=args.epochs,
@@ -2607,8 +3124,8 @@ def main(argv: list[str] | None = None) -> None:
             workers=default_num_workers() if args.workers is None else int(args.workers),
             scale=float(args.scale),
             batch_size=int(args.batch),
-            holdout_blocks=resolve_holdout_blocks(args.holdout_blocks),
-            holdout_cells=bool(args.holdout_cells),
+            holdout_blocks=holdout_blocks,
+            holdout_cells=holdout_cells,
             holdout_cells_file=Path(args.holdout_cells_file) if args.holdout_cells_file else None,
             holdout_seed=int(args.holdout_seed),
             conf_weight=float(args.conf_weight),
@@ -2618,13 +3135,23 @@ def main(argv: list[str] | None = None) -> None:
             freeze_backbone=bool(args.freeze_backbone),
             backbone_lr_mult=float(args.backbone_lr_mult),
             mask_events=bool(args.mask_events),
+            keep_abort_reasons=str(args.keep_abort_reasons or ""),
+            mask_phases=args.mask_phases,
+            mask_files=str(args.mask_files or ""),
+            mask_report_only=bool(args.mask_report),
+            usable_until=usable_flags,
         )
     except TrainFitError as exc:
         print(f"[GVD] scene train: {exc}")
         sys.exit(2)
+    except MaskFileError as exc:
+        print(f"[GVD] scene train: {exc}", flush=True)
+        sys.exit(2)
     except LossyFramesError as exc:
         print(f"[GVD] scene train: {exc}", flush=True)
         sys.exit(2)
+    if args.mask_report:
+        return
     if args.sanity and not args.dry_run and not stats.get("sanity_ok"):
         print("[GVD] sanity failed: lane_gt loss did not fall below 0.05", flush=True)
         sys.exit(1)

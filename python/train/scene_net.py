@@ -694,6 +694,70 @@ def labels_from_tech(tech: Mapping[str, Any] | None) -> dict[str, np.ndarray]:
     }
 
 
+HEAD_VALID = {
+    "lanes": "lane_valid",
+    "curbs": "curb_valid",
+    "objects": "object_valid",
+    "signs": "sign_valid",
+    "lane_gt": "lane_gt_valid",
+}
+
+
+# A head is stamped as trained (gvd_heads) only when its labels clear BOTH:
+# at least LABEL_FLOOR_SHARE of the rows it trains on (1%: below that the
+# head mostly learns "absent") and at least LABEL_FLOOR_ROWS such rows (100,
+# about 10 s of 10 Hz driving: too few examples to have learned a shape).
+LABEL_FLOOR_SHARE = 0.01
+LABEL_FLOOR_ROWS = 100
+
+
+def labelled_heads(
+    rows: list[Mapping[str, Any]],
+    heads: tuple[str, ...] | None,
+    *,
+    min_share: float = LABEL_FLOOR_SHARE,
+    min_rows: int = LABEL_FLOOR_ROWS,
+) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, dict[str, Any]]]:
+    """(stamped heads, heads below the floor, per-head label counts).
+
+    A row is labelled for ``lane_gt`` when ``lane_center_is_valid`` holds
+    (5 m and 10 m centres valid; the always-set confidence flag does not
+    count), and for the other heads when any slot's valid flag is set (each
+    flag marks one present lane, curb, object or sign). Every
+    requested head gets ``labelled_rows`` and ``labelled_share`` (of
+    ``rows``); it is stamped only when it clears ``min_share`` and
+    ``min_rows``. A head below the floor trains mostly toward "absent"; it
+    is left off ``gvd_heads`` so the live runtime never reads it.
+    """
+    from python.debug.lane_targets import lane_center_is_valid
+
+    wanted = tuple(heads) if heads else HEAD_NAMES
+    labelled = {head: 0 for head in wanted}
+    for row in rows:
+        labels = labels_for_row(row)
+        for head in wanted:
+            valid = labels.get(HEAD_VALID.get(head, ""))
+            if valid is None:
+                continue
+            if head == "lane_gt":
+                # The confidence slot is set on every painted label; only a
+                # usable 5 m + 10 m centre (the one --min-valid and scoring use) counts.
+                if lane_center_is_valid(valid):
+                    labelled[head] += 1
+            elif float(np.nansum(np.asarray(valid, dtype=np.float64))) > 0:
+                labelled[head] += 1
+    total = len(rows)
+    counts: dict[str, dict[str, Any]] = {}
+    stamped: list[str] = []
+    below: list[str] = []
+    for head in wanted:
+        share = (labelled[head] / float(total)) if total else 0.0
+        ok = labelled[head] >= int(min_rows) and share >= float(min_share)
+        counts[head] = {"labelled_rows": int(labelled[head]), "labelled_share": round(share, 6), "stamped": ok}
+        (stamped if ok else below).append(head)
+    return tuple(stamped), tuple(below), counts
+
+
 def labels_for_row(row: Mapping[str, Any] | None) -> dict[str, np.ndarray]:
     """Scene labels plus the ground-truth lane vector when the row has one.
 
@@ -1594,11 +1658,13 @@ def export_scene_onnx(
     trace(model, args, str(path))
     from python.train.cam_strip import metadata_dict, stamp_onnx_metadata
 
-    used = tuple(getattr(net, "cams", ()) or ())
+    used = tuple(getattr(net, "cams", ()) or ()) or tuple(cams or ()) or tuple(STRIP_ORDER)
     width = int(getattr(net, "canvas_w", CANVAS_W))
-    if used:
-        stamp_onnx_metadata(
-            str(path),
-            metadata_dict(used, heads, height=CANVAS_H, width=width),
+    # gvd_cams is the camera contract: the live runtime refuses a model without it.
+    if not stamp_onnx_metadata(str(path), metadata_dict(used, heads, height=CANVAS_H, width=width)):
+        print(
+            f"[GVD] export WARNING: gvd_cams={','.join(used)} not written to {path} (onnx package missing "
+            "or file unreadable); the live runtime will refuse this model",
+            flush=True,
         )
     return path

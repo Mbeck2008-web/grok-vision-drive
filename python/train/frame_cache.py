@@ -6,7 +6,9 @@ can hold it. The loader memory-maps the chunk and copies one frame out.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +20,56 @@ from python.train.cam_strip import canvas_width, parse_cams, scaled_layout, sect
 # Stay under the 4 GB FAT32 file limit with a little room for the header.
 CHUNK_BYTES = 3_500_000_000
 MANIFEST = "manifest.json"
+# Free space the cache drive must keep (``--cache-min-free-gb``).
+CACHE_MIN_FREE_GB = 8.0
+
+
+class CacheMismatchError(ValueError):
+    """The cache was not built from this strips folder's current state.jsonl."""
+
+
+def _norm_path(path: Path | str) -> str:
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def state_fingerprint(strip_root: Path | str) -> dict[str, Any]:
+    """Strips path, state.jsonl row count and SHA-256: what a cache is keyed to."""
+    state = Path(strip_root) / "state.jsonl"
+    digest = hashlib.sha256()
+    rows = 0
+    with open(state, "rb") as handle:
+        for line in handle:
+            digest.update(line)
+            if line.strip():
+                rows += 1
+    return {"strips": _norm_path(strip_root), "rows": rows, "state_sha256": digest.hexdigest()}
+
+
+def check_cache_source(cache_root: Path | str, strip_root: Path | str) -> dict[str, Any]:
+    """Refuse a cache built from another folder, or from an older or newer state.jsonl.
+
+    The cache is keyed by row index only, so a cache from another recording
+    would be read silently. A manifest without a ``source`` block (built
+    before this check) is refused too: rebuild it into a new folder.
+    """
+    manifest = Path(cache_root) / MANIFEST
+    if not manifest.is_file():
+        raise CacheMismatchError(f"{cache_root}: no {MANIFEST}; build it with --build-cache")
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    source = payload.get("source")
+    if not isinstance(source, dict):
+        raise CacheMismatchError(
+            f"{cache_root}: manifest has no source (strips path, rows, state.jsonl hash); "
+            "rebuild it into a new folder with --build-cache"
+        )
+    here = state_fingerprint(strip_root)
+    for key in ("strips", "rows", "state_sha256"):
+        if source.get(key) != here[key]:
+            raise CacheMismatchError(
+                f"{cache_root}: cache {key}={source.get(key)!r} but {strip_root} has {here[key]!r}; "
+                "rebuild the cache into a new folder"
+            )
+    return here
 
 
 def _sector_shape(cam_id: str) -> tuple[int, int, int]:
@@ -33,8 +85,11 @@ def frames_per_chunk(height: int, width: int) -> int:
 class FrameCache:
     """Read-only map of frame index to a packed camera canvas."""
 
-    def __init__(self, root: Path | str) -> None:
+    def __init__(self, root: Path | str, strips_root: Path | str | None = None) -> None:
+        """``strips_root`` set: refuse (``CacheMismatchError``) a cache from another recording."""
         self.root = Path(root)
+        if strips_root is not None:
+            check_cache_source(self.root, strips_root)
         self.cams: tuple[str, ...] = ()
         self.canvas_w = 0
         self._open: dict[str, np.ndarray] = {}
@@ -135,6 +190,7 @@ def build_frame_cache(
     from python.data.raw_frames import read_state_jsonl
 
     root = Path(strip_root)
+    source = state_fingerprint(root)
     out = Path(dest)
     out.mkdir(parents=True, exist_ok=True)
     names = parse_cams(cams if isinstance(cams, str) else ",".join(cams))
@@ -192,6 +248,7 @@ def build_frame_cache(
         "scale": factor,
         "chunks": chunks,
         "frames": written // max(1, len(names)),
+        "source": source,
     }
     (out / MANIFEST).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     return manifest

@@ -568,12 +568,20 @@ def main() -> None:
 
             # SceneInputShapeError at load refuses Engage; mid-drive it is a HOLD.
             scene_guard = SceneLaneGuard()
-            scene_lane = scene_guard.load(SceneLaneRuntime, args.scene_onnx or None)
+            from python.sensors.cameras import load_camera_config
+            from python.train.scene_lane_runtime import live_cams_from_config
+
+            # Camera contract: the model's gvd_cams must all be fed live, or Engage is refused.
+            live_cams = live_cams_from_config(load_camera_config())
+            scene_lane = scene_guard.load(
+                lambda path: SceneLaneRuntime(path, live_cams=live_cams), args.scene_onnx or None
+            )
             if scene_guard.refused is not None:
                 print(f"[GVD] REFUSE ENGAGE: lane source=scene {scene_guard.refused}", flush=True)
             else:
                 print(
-                    f"[GVD] lane source=scene onnx={scene_lane.path} ready={scene_lane.ready} ({scene_lane.reason})",
+                    f"[GVD] lane source=scene onnx={scene_lane.path} ready={scene_lane.ready} ({scene_lane.reason}) "
+                    f"model_cams={','.join(scene_lane.cams)} live_cams={','.join(live_cams)}",
                     flush=True,
                 )
         elif args.lane_source == "gt":

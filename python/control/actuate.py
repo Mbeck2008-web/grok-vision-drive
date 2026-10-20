@@ -196,8 +196,12 @@ def read_ego_feedback(now: float | None = None) -> EgoFeedback | None:
     )
 
 
-def read_engage_flag(default: bool = False) -> bool:
+def read_engage_flag(default: bool = False, *, now: float | None = None) -> bool:
     """Mirror Lua Alt+G. ``engaged:true`` counts only while ``mtime`` is fresh.
+
+    ``now`` is the clock freshness is judged on (wall time when omitted). A test
+    passes the supervisor's own last-tick stamp to ask "was the latch live on
+    that tick", independent of how long the test took to get here.
 
     Lua rewrites the stamp while the in-game latch is on. A file left true after a
     crash is not a new human engage — Tech must not call ``vehicle.control`` from it.
@@ -213,7 +217,7 @@ def read_engage_flag(default: bool = False) -> bool:
     if not isinstance(data, dict) or not bool(data.get("engaged", False)):
         return False
     try:
-        age = time.time() - float(data["mtime"])
+        age = (time.time() if now is None else float(now)) - float(data["mtime"])
     except (KeyError, TypeError, ValueError):
         return False
     # os.time() is whole seconds, so a heartbeat can look ~1 s old. A stamp far

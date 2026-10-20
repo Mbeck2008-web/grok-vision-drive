@@ -27,6 +27,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import make_release_zip as rel  # noqa: E402
 from gvd_test_env import isolated_home  # noqa: E402
 from python.control.actuate import (  # noqa: E402
+    ENGAGE_FRESH_S,
     CmdJsonActuator,
     DriveCommand,
     cmd_path,
@@ -384,6 +385,7 @@ def _run_supervisor(
     cmd_blind: tuple[float, float] | None = None,
     mod_version: str | None = None,
     clock: dict | None = None,
+    engage_heartbeat: bool = True,
 ) -> dict | None:
     """Run run_vision.py headless for `seconds`; optionally play the mod's ack role meanwhile.
 
@@ -410,6 +412,8 @@ def _run_supervisor(
     echo stopped. `cmd_blind=(t0, t1)` (seconds after start): commands stop reaching the mod in
     that window (it keeps the last command and its seq) while its echoes keep advancing.
     `on_engage_drop(t)` is called with the wall time the engage file was first seen false.
+    `engage_heartbeat=False` plays a mod whose Alt+G heartbeat stopped: gvd_engage.json keeps
+    the stamp it had, so it goes stale `ENGAGE_FRESH_S` later.
 
     The fake mod echoes back what it was told to apply, exactly like `gvd_main` does, so the
     override residual is zero unless a test deliberately plays a driver: `steer_echo` /
@@ -542,6 +546,8 @@ def _run_supervisor(
     def _touch_engage_heartbeat() -> None:
         """Stand in for Lua's engage-file heartbeat so a multi-second run stays latched."""
         nonlocal last_engage_hb
+        if not engage_heartbeat:
+            return
         now = time.time()
         if now - last_engage_hb < 1.0:
             return
@@ -733,6 +739,26 @@ def check_synthetic_lanes_drive() -> None:
     assert held.should_disengage is False
 
 
+def _engage_live_on_last_tick() -> tuple[bool, dict]:
+    """Was the Alt+G latch live on the supervisor's last tick?
+
+    Freshness is judged on that tick's own clock: ``heartbeat_mtime`` of the last
+    gvd_cmd.json it wrote, not the wall time when the test gets here. SIGKILL, the
+    wait and a loaded runner all sit between the two, and none of it is GVD's doing.
+    Returns the verdict and what it was judged on.
+    """
+    cmd = _read_json(cmd_path())
+    eng = _read_json(engage_path())
+    tick = float(cmd.get("heartbeat_mtime") or 0.0)
+    live = tick > 0.0 and read_engage_flag(default=False, now=tick)
+    return live, {
+        "engage": eng,
+        "age_at_last_tick_s": round(tick - float(eng.get("mtime") or 0.0), 3) if tick else None,
+        "fresh_s": ENGAGE_FRESH_S,
+        "cmd": {k: cmd.get(k) for k in ("seq", "engaged", "reason")},
+    }
+
+
 def check_ffb_override_live() -> None:
     """Whole loop with a wheel on the echo: chatter keeps driving, a real driver gets the car."""
     _touch_lua_bus()
@@ -745,7 +771,8 @@ def check_ffb_override_live() -> None:
     _run_supervisor(
         ["--allow-preview-drive"], seconds=3.0, ack=True, wheel_by_echo=lambda k: 0.9 if k % 2 else -0.9
     )
-    assert read_engage_flag(default=False) is True, "force-feedback chatter disengaged GVD"
+    live, why = _engage_live_on_last_tick()
+    assert live is True, ("force-feedback chatter disengaged GVD (or the latch was stale on its last tick)", why)
     assert _read_json(engage_path()).get("disengage_reason") == "none"
     cmd = json.loads(cmd_path().read_text(encoding="utf-8"))
     assert cmd["engaged"] is True and cmd["reason"] == "ok", cmd
@@ -810,6 +837,45 @@ def check_ffb_override_live() -> None:
 
     write_engage_flag(False)
     ego_path().unlink()
+
+
+def check_ffb_stale_engage_heartbeat() -> None:
+    """The chatter check's latch test is load-bearing: a stale Alt+G heartbeat fails it.
+
+    Same 3 s chatter run as check_ffb_override_live, but the mod's engage heartbeat
+    stops, so gvd_engage.json stays engaged:true with the stamp written before spawn.
+    Nothing writes engaged:false; only freshness tells it apart from a live latch. The
+    supervisor must stop driving on it, and `_engage_live_on_last_tick` must say not live.
+    """
+    _touch_lua_bus()
+    if ego_path().exists():
+        ego_path().unlink()
+
+    # The clock the verdict uses is the one passed in: a stamp inside the window is
+    # live, one past ENGAGE_FRESH_S is not, whatever the wall time is now.
+    write_engage_flag(True)
+    stamp = float(_read_json(engage_path())["mtime"])
+    assert read_engage_flag(default=False, now=stamp + ENGAGE_FRESH_S - 0.1) is True
+    assert read_engage_flag(default=True, now=stamp + ENGAGE_FRESH_S + 0.1) is False
+    assert read_engage_flag(default=True, now=stamp - 1.5) is False  # far-future stamp
+
+    write_engage_flag(True)
+    _run_supervisor(
+        ["--allow-preview-drive"],
+        seconds=3.0,
+        ack=True,
+        wheel_by_echo=lambda k: 0.9 if k % 2 else -0.9,
+        engage_heartbeat=False,
+    )
+    live, why = _engage_live_on_last_tick()
+    eng = why["engage"]
+    # Still engaged:true on disk, nobody disengaged: only the stamp is old.
+    assert eng.get("engaged") is True and eng.get("disengage_reason") == "none", eng
+    assert why["age_at_last_tick_s"] is not None and why["age_at_last_tick_s"] > ENGAGE_FRESH_S, why
+    assert live is False, ("a stale engage heartbeat read as a live latch", why)
+    # The supervisor judged it the same way on that tick: it stopped driving.
+    assert why["cmd"]["engaged"] is False and why["cmd"]["reason"] == "not_engaged", why
+    print(f"stale engage heartbeat: age {why['age_at_last_tick_s']:.2f}s > {ENGAGE_FRESH_S}s at the last tick -> not live, not driving OK")
 
 
 def check_echo_outdated_refuses_engage() -> None:
@@ -1055,6 +1121,7 @@ def main() -> None:
         check_run_vision_e2e,
         check_synthetic_lanes_drive,
         check_ffb_override_live,
+        check_ffb_stale_engage_heartbeat,
         check_echo_outdated_refuses_engage,
         check_echo_stale_disengages,
         check_echo_old_mod_version_refused,

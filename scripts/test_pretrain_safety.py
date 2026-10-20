@@ -48,6 +48,11 @@
 (n) the run metadata states the road-area split's limit: the 50 m buffer
     covers the 30 m labels, but cameras see held-out road past 50 m, so it is
     reduced leakage, not no leakage.
+(o) a head is stamped only when its labels clear LABEL_FLOOR_SHARE (1%) and
+    LABEL_FLOOR_ROWS (100); labelled_rows/share are recorded for every head.
+(p) the label count runs on the rows that train (after the holdout split and
+    --min-valid), not all rows: a head labelled only in val rows, or only in
+    windows --min-valid drops, is not stamped.
 """
 from __future__ import annotations
 
@@ -966,6 +971,60 @@ def check_leakage_note() -> None:
     print(f"(n) run metadata holdout.limit: {note!r} OK")
 
 
+def check_labels_on_training_rows() -> None:
+    from python.debug.lane_targets import LANE_GT_DIM
+    from python.train.continual import cell_holdout_labels, choose_holdout_cells, pass_plan, training_rows
+    from python.train.scene_net import labelled_heads
+
+    line = [[{"x": 0.0, "y": 5.0}, {"x": 0.0, "y": 30.0}]]
+
+    def tech(lane_ok: bool, **extra) -> dict:
+        out = {"lane_gt": [0.1] * LANE_GT_DIM, "lane_gt_valid": [1 if lane_ok else 0] * LANE_GT_DIM}
+        out.update(extra)
+        return out
+
+    def loop_rows(n: int) -> list[dict]:
+        return [{"i": i, "t": float(i), "map": "m", "segment": "s#0",
+                 "ego": {"speed_mps": 25.0, "pos": [float((i * 26) % 2000), float(((i * 26) // 2000) * 300)]}}
+                for i in range(n)]
+
+    # Holdout: curbs labelled only on held-out road.
+    rows = loop_rows(800)
+    spec = choose_holdout_cells(rows, seed=0)
+    marks = cell_holdout_labels(rows, spec)
+    for row, mark in zip(rows, marks):
+        row["tech"] = tech(True, curbs=line) if mark == "hold" else tech(True)
+    held = marks.count("hold")
+    everywhere = labelled_heads(rows, ("lane_gt", "curbs"))
+    assert everywhere[0] == ("lane_gt", "curbs"), "on all rows curbs would clear the floor"
+    train = training_rows(pass_plan(rows, 64, 32, cells=spec), min_valid=0.3)
+    stamped, below, counts = labelled_heads(train, ("lane_gt", "curbs"))
+    assert stamped == ("lane_gt",) and below == ("curbs",) and counts["curbs"]["labelled_rows"] == 0, counts
+    assert not {int(r["i"]) for r in train} & {int(r["i"]) for r, m in zip(rows, marks) if m != "train"}
+
+    # --min-valid: lane polylines only in a stretch whose lane centre is invalid.
+    rows = loop_rows(800)
+    for row in rows:
+        bad = 100 <= int(row["i"]) < 400
+        row["tech"] = tech(False, lanes=line) if bad else tech(True)
+    assert labelled_heads(rows, ("lane_gt", "lanes"))[0] == ("lane_gt", "lanes")
+    plan = pass_plan(rows, 64, 32)
+    kept = training_rows(plan, min_valid=0.3)
+    stamped2, below2, counts2 = labelled_heads(kept, ("lane_gt", "lanes"))
+    assert stamped2 == ("lane_gt",) and below2 == ("lanes",), counts2
+    assert counts2["lanes"]["labelled_rows"] < 100, counts2
+    loose = labelled_heads(training_rows(plan, min_valid=0.0), ("lane_gt", "lanes"))
+    assert "lanes" in loose[0], "without --min-valid those windows would train it"
+
+    trainer = (Path(__file__).resolve().parents[1] / "python" / "train" / "train_scene.py").read_text(encoding="utf-8")
+    call = trainer.index("label_rows = training_rows(")
+    assert "pass_plan(rows, chunk_len, stride, blocks=int(holdout_blocks), cells=cell_spec), min_valid=float(min_valid)" \
+        in trainer[call:call + 300]
+    assert "labelled_heads(label_rows, train_heads)" in trainer and "labelled_heads(rows, train_heads)" not in trainer
+    print(f"(p) curbs labelled on {held} held-out rows only: 0 in training rows, not stamped; lanes labelled only "
+          f"where --min-valid drops the windows: {counts2['lanes']['labelled_rows']} training rows, not stamped OK")
+
+
 def main() -> None:
     check_multi_recording()
     check_road_area_holdout()
@@ -973,6 +1032,7 @@ def main() -> None:
     check_links_read_only()
     check_val_composition()
     check_leakage_note()
+    check_labels_on_training_rows()
     check_camera_contract()
     check_cache_on_c()
     check_other_cams()

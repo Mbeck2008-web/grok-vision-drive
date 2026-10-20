@@ -594,6 +594,27 @@ def epoch_windows(
     return train + hold
 
 
+def training_rows(plan: list[Mapping[str, Any]], *, min_valid: float = 0.3) -> list[Mapping[str, Any]]:
+    """Rows the net trains on: rows of train windows that pass ``min_valid``
+    (the same test ``epoch_windows`` applies), each once, in order. Holdout
+    and buffer rows never appear here."""
+    floor = float(min_valid)
+    seen: set[Any] = set()
+    out: list[Mapping[str, Any]] = []
+    for item in plan:
+        if item.get("kind") != "train":
+            continue
+        rows = list(item.get("rows") or [])
+        if floor > 0.0 and valid_fraction(rows) < floor:
+            continue
+        for row in rows:
+            key = id(row) if row.get("i") is None else int(row["i"])
+            if key not in seen:
+                seen.add(key)
+                out.append(row)
+    return out
+
+
 def pass_plan(
     rows: list[Mapping[str, Any]],
     length: int,

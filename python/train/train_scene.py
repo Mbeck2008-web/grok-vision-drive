@@ -2060,16 +2060,23 @@ def train_directory(
     from python.data.strip_writer import STRIP_ORDER as _ALL_CAMS
 
     run_cams = list(train_cams or _ALL_CAMS)
+    from python.train.continual import training_rows
     from python.train.scene_net import LABEL_FLOOR_ROWS, LABEL_FLOOR_SHARE, labelled_heads
 
     # Trained-heads contract: a head whose labels are under the floor trains
     # mostly toward "absent"; it is left off gvd_heads and the live runtime ignores it.
-    stamp_heads, unlabelled_heads, head_labels = labelled_heads(rows, train_heads)
-    label_floor = {"share": LABEL_FLOOR_SHARE, "rows": LABEL_FLOOR_ROWS}
+    # Counted on the rows that train (after the holdout split, its buffer and
+    # --min-valid), with the training loop's own chunking: a label seen only
+    # in val rows never makes a head "trained".
+    label_rows = training_rows(
+        pass_plan(rows, chunk_len, stride, blocks=int(holdout_blocks), cells=cell_spec), min_valid=float(min_valid)
+    )
+    stamp_heads, unlabelled_heads, head_labels = labelled_heads(label_rows, train_heads)
+    label_floor = {"share": LABEL_FLOOR_SHARE, "rows": LABEL_FLOOR_ROWS, "training_rows": len(label_rows)}
     print(
         "[GVD] head labels: "
         + " ".join(f"{h}={c['labelled_rows']}({c['labelled_share']:.1%})" for h, c in head_labels.items())
-        + f" floor={LABEL_FLOOR_SHARE:.0%} and {LABEL_FLOOR_ROWS} rows",
+        + f" over {len(label_rows)} training rows; floor={LABEL_FLOOR_SHARE:.0%} and {LABEL_FLOOR_ROWS} rows",
         flush=True,
     )
     if unlabelled_heads:

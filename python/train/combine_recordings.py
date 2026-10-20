@@ -134,13 +134,26 @@ def _finished(root: Path) -> dict[str, Any]:
 
 
 def _link(src: Path, dst: Path, counts: dict[str, int]) -> None:
+    """Hard-link ``src`` at ``dst``, else byte-copy it into a new file.
+
+    ``dst`` must not exist: writing into an existing hard link would write
+    into the source recording's frame, so that is refused, never overwritten.
+    """
     dst.parent.mkdir(parents=True, exist_ok=True)
+    if os.path.lexists(dst):
+        raise CombineError(f"{dst} already exists; refusing to write over a possibly linked frame")
     try:
         os.link(src, dst)
         counts["hardlink"] += 1
+        return
+    except FileExistsError as exc:
+        raise CombineError(f"{dst} already exists; refusing to write over a possibly linked frame") from exc
     except OSError:
-        shutil.copyfile(src, dst)  # bytes as they are: never decoded or re-encoded
-        counts["copy"] += 1
+        pass
+    # Bytes as they are, into a new file only ("xb"): never decoded or re-encoded.
+    with open(src, "rb") as reader, open(dst, "xb") as writer:
+        shutil.copyfileobj(reader, writer)
+    counts["copy"] += 1
 
 
 def _cams_payload(root: Path) -> Any:
@@ -260,10 +273,12 @@ def combine_recordings(
             **_finished(root),
         })
     for name, lines in (("state.jsonl", state_out), ("gt.jsonl", gt_out), ("impacts.jsonl", impacts_out)):
-        (out / name).write_text("".join(line + "\n" for line in lines), encoding="utf-8")
+        with open(out / name, "x", encoding="utf-8", newline="\n") as handle:  # new file, never a link
+            handle.write("".join(line + "\n" for line in lines))
     first_cams = roots[0] / "cameras.json"
     if first_cams.is_file():
-        shutil.copyfile(first_cams, out / "cameras.json")
+        with open(first_cams, "rb") as reader, open(out / "cameras.json", "xb") as writer:
+            shutil.copyfileobj(reader, writer)
     manifest = {"kind": "combined", "version": COMBINED_VERSION, "rows": n, "files": counts, "recordings": recordings}
     (out / COMBINED).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     return manifest

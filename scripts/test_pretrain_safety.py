@@ -39,6 +39,9 @@
     live runtime reads no other output, so untrained objects/signs/curbs are
     never drawn or fed to the planner; a live model with no gvd_heads is
     refused like one with no gvd_cams.
+(l) hard links share the raw bytes: combining, building a frame cache over
+    the combined folder and reading it for training leave every source
+    file's sha256, size and mtime unchanged.
 """
 from __future__ import annotations
 
@@ -798,10 +801,74 @@ def check_heads_contract() -> None:
           f"run_vision/viz/planner; trainer stamps labelled heads only; {note} OK")
 
 
+def _snapshot(*roots: Path) -> dict[str, tuple[str, int, int]]:
+    import hashlib
+
+    out = {}
+    for root in roots:
+        for path in sorted(root.rglob("*")):
+            if path.is_file():
+                st = path.stat()
+                out[str(path)] = (hashlib.sha256(path.read_bytes()).hexdigest(), st.st_size, st.st_mtime_ns)
+    return out
+
+
+def check_links_read_only() -> None:
+    import json
+    import os
+    import time
+
+    import python.train.train_scene as ts
+    from python.data.raw_frames import load_raw_cameras, read_image_with_repair
+    from python.train.combine_recordings import CombineError, _link, combine_recordings
+    from python.train.frame_cache import FrameCache, build_frame_cache
+    from python.train.scene_loader import load_canvas, select_training_rows
+
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        a, b = tmp / "rec5b", tmp / "rec5c"
+        _write_recording(a, 6, t0=1000.0, value=60)
+        _write_recording(b, 5, t0=2000.0, value=180)
+        _png(a / "raw_repaired" / "main" / "000002.png", 61)
+        old = time.time() - 86400  # a day old, so any touch would show
+        for path in list(a.rglob("*")) + list(b.rglob("*")):
+            if path.is_file():
+                os.utime(path, (old, old))
+        before = _snapshot(a, b)
+        out = tmp / "combined"
+        man = combine_recordings([a, b], out)
+        assert man["files"]["hardlink"] == 11 * 3 + 1, man["files"]
+        assert os.path.samefile(a / "raw_repaired" / "main" / "000002.png", out / "raw_repaired" / "main" / "000002.png")
+        rows = [json.loads(line) for line in (out / "state.jsonl").read_text().splitlines()]
+        kept, _missing, _e = select_training_rows(out, rows, cams=("main", "narrow", "wide"))
+        assert len(kept) == 11
+        cache_dir = tmp / "cache"
+        build_frame_cache(out, cache_dir, "main,narrow,wide")
+        cache = FrameCache(cache_dir, strips_root=out)
+        for row in kept:
+            assert ts._frame_row(out, row, cams=("main", "narrow", "wide"), cache=cache) is not None
+            assert ts._frame_row(out, row, cams=("main", "narrow", "wide"), cache=None) is not None
+            assert load_raw_cameras(out, int(row["i"]))
+            load_canvas(out, int(row["i"]))
+        assert read_image_with_repair(out / "raw" / "main" / "000002.png") is not None
+        # A second write onto a linked frame is refused, never written through to the source.
+        try:
+            _link(b / "raw" / "main" / "000000.png", out / "raw" / "main" / "000000.png", {"hardlink": 0, "copy": 0})
+            raise AssertionError("wrote over a linked frame")
+        except CombineError:
+            pass
+        after = _snapshot(a, b)
+        assert after == before, [k for k in before if before[k] != after.get(k)][:3]
+        assert os.path.samefile(a / "raw" / "wide" / "000005.png", out / "raw" / "wide" / "000005.png")
+    print(f"(l) {len(before)} source files (frames, raw_repaired, jsonl) identical in sha256, size and mtime after "
+          "combine, cache build, cached + raw training reads and a refused re-link OK")
+
+
 def main() -> None:
     check_multi_recording()
     check_road_area_holdout()
     check_heads_contract()
+    check_links_read_only()
     check_camera_contract()
     check_cache_on_c()
     check_other_cams()

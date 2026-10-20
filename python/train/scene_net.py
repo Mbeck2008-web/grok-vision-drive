@@ -1549,11 +1549,13 @@ def export_scene_onnx(
     trace(model, args, str(path))
     from python.train.cam_strip import metadata_dict, stamp_onnx_metadata
 
-    used = tuple(getattr(net, "cams", ()) or ())
+    used = tuple(getattr(net, "cams", ()) or ()) or tuple(cams or ()) or tuple(STRIP_ORDER)
     width = int(getattr(net, "canvas_w", CANVAS_W))
-    if used:
-        stamp_onnx_metadata(
-            str(path),
-            metadata_dict(used, heads, height=CANVAS_H, width=width),
+    # gvd_cams is the camera contract: the live runtime refuses a model without it.
+    if not stamp_onnx_metadata(str(path), metadata_dict(used, heads, height=CANVAS_H, width=width)):
+        print(
+            f"[GVD] export WARNING: gvd_cams={','.join(used)} not written to {path} (onnx package missing "
+            "or file unreadable); the live runtime will refuse this model",
+            flush=True,
         )
     return path

@@ -165,7 +165,8 @@ def check_real_graph_refused() -> None:
 def check_supervisor_wiring() -> None:
     """run_vision.main uses the guard the way _tick does."""
     rv = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
-    assert "scene_lane = scene_guard.load(SceneLaneRuntime, args.scene_onnx or None)" in rv
+    # The guard wraps the runtime; the runtime also gets the live camera list (gvd_cams contract).
+    assert "scene_lane = scene_guard.load(\n                lambda path: SceneLaneRuntime(path, live_cams=live_cams), args.scene_onnx or None\n            )" in rv.replace("\r\n", "\n")
     assert "scene_lane.observe(" not in rv, "a bare observe call can raise out of the loop"
     assert "scene_guard.observe(scene_lane, strip, tick_dt, engaged=engaged)" in rv
     assert "cmd = stop_command(seq=cmd_seq, reason=SCENE_SHAPE_HOLD)" in rv

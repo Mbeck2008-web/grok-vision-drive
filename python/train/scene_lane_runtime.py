@@ -39,6 +39,51 @@ class SceneInputShapeError(ValueError):
     """
 
 
+class SceneCameraContractError(SceneInputShapeError):
+    """The model's trained camera list (``gvd_cams``) is absent, or names a
+    camera the live supervisor does not feed. Refused at load like a shape
+    mismatch: the net would otherwise see a black sector it never trained on.
+    """
+
+
+def live_cams_from_config(cfg: Any) -> tuple[str, ...]:
+    """Camera ids the live supervisor attaches, from ``config/cameras.yaml``."""
+    out: list[str] = []
+    items = cfg.get("cameras") if isinstance(cfg, dict) else None
+    for item in items or []:
+        cam = str(item.get("id") or "") if isinstance(item, dict) else ""
+        if cam and cam not in out:
+            out.append(cam)
+    return tuple(out)
+
+
+def check_camera_contract(meta: Any, live_cams: Any) -> tuple[str, ...]:
+    """The model's ``gvd_cams``; refuse a missing list or a camera not fed live.
+
+    Live feeds may include more cameras than the model (the runtime cuts the
+    model's sectors out of the live strip); every model camera must be fed.
+    """
+    from python.train.cam_strip import parse_cams
+
+    raw = str((meta or {}).get("gvd_cams") or "").strip() if isinstance(meta, dict) else ""
+    if not raw:
+        raise SceneCameraContractError(
+            "model has no gvd_cams metadata (trained camera list); re-export it with this trainer"
+        )
+    try:
+        model_cams = parse_cams(raw)
+    except ValueError as exc:
+        raise SceneCameraContractError(f"model gvd_cams={raw!r} is not a camera list: {exc}") from exc
+    live = tuple(str(cam) for cam in (live_cams or ()))
+    absent = [cam for cam in model_cams if cam not in live]
+    if absent:
+        raise SceneCameraContractError(
+            f"model trained on cams={','.join(model_cams)} but the live feed has {','.join(live) or 'none'} "
+            f"(missing {','.join(absent)}); refusing to drive on black sectors"
+        )
+    return model_cams
+
+
 def _base_name(name: str) -> str:
     """``h.1`` -> ``h``: the tracer renames pass-through state inputs."""
     return str(name).split(".", 1)[0]
@@ -131,8 +176,11 @@ class SceneLaneGuard:
 class SceneLaneRuntime:
     """One ONNX session and its GRU state. Not tied to a fixed frame rate."""
 
-    def __init__(self, path: Path | str | None = None) -> None:
+    def __init__(self, path: Path | str | None = None, *, live_cams: Any = None) -> None:
+        """``live_cams``: cameras the supervisor feeds. Set, the model's
+        ``gvd_cams`` must be present and fed (``check_camera_contract``)."""
         self.path = Path(path) if path is not None else default_onnx_path()
+        self.live_cams = None if live_cams is None else tuple(str(cam) for cam in live_cams)
         self.session: Any = None
         self.ready = False
         self.reason = "not loaded"
@@ -175,6 +223,12 @@ class SceneLaneRuntime:
             meta = dict(self.session.get_modelmeta().custom_metadata_map)
         except Exception:
             meta = {}
+        if self.live_cams is not None:
+            try:
+                check_camera_contract(meta, self.live_cams)
+            except SceneCameraContractError as exc:
+                self.session = None
+                raise SceneCameraContractError(f"{self.path}: {exc}") from exc
         self.cams = cams_from_metadata(meta)
         try:
             self.canvas_w = int(meta.get("gvd_canvas_w") or CANVAS_W)

@@ -25,6 +25,9 @@
     (``dark_sector_count``) and still trains: darkness is not a missing flag.
 (e2) only the --cache folder may be on C: (free-space floor still applies);
     a recording/strips path on C: or D:, and a cache on D:, stay refused.
+(h) camera contract: the trained camera list goes into metrics.jsonl (run
+    record) and the ONNX ``gvd_cams``; the live runtime refuses a model with
+    no list or with a camera the supervisor does not feed.
 """
 from __future__ import annotations
 
@@ -430,7 +433,103 @@ def check_cache_on_c() -> None:
           "main() refuses --strips on C: with a C: cache OK")
 
 
+def _tiny_scene_onnx(path: Path, cams: tuple[str, ...] | None) -> bool:
+    """A constant-output graph with the scene runtime's strip input. False without onnx."""
+    try:
+        import onnx
+        from onnx import TensorProto, helper
+    except ImportError:
+        return False
+    from python.data.strip_writer import CANVAS_H
+    from python.debug.lane_targets import LANE_GT_DIM
+    from python.train.cam_strip import metadata_dict, scaled_layout
+
+    names = cams or ("main", "narrow", "wide", "pillarL", "pillarR", "repeatL", "repeatR", "rear")
+    _sectors, _h, width = scaled_layout(tuple(names), 1.0)
+    value = helper.make_tensor("v", TensorProto.FLOAT, [1, LANE_GT_DIM], [0.0] * LANE_GT_DIM)
+    node = helper.make_node("Constant", [], ["lane_gt"], value=value)
+    graph = helper.make_graph(
+        [node], "tiny",
+        [helper.make_tensor_value_info("strip", TensorProto.FLOAT, [1, 3, CANVAS_H, int(width)])],
+        [helper.make_tensor_value_info("lane_gt", TensorProto.FLOAT, [1, LANE_GT_DIM])],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    if cams is not None:
+        for key, val in metadata_dict(tuple(cams), ("lane_gt",), height=CANVAS_H, width=int(width)).items():
+            entry = model.metadata_props.add()
+            entry.key, entry.value = key, val
+    onnx.save(model, str(path))
+    return True
+
+
+def check_camera_contract() -> None:
+    from python.train.scene_lane_runtime import (
+        SceneCameraContractError,
+        SceneInputShapeError,
+        SceneLaneGuard,
+        SceneLaneRuntime,
+        check_camera_contract,
+        live_cams_from_config,
+    )
+
+    eight = ("narrow", "main", "wide", "pillarL", "pillarR", "repeatL", "repeatR", "rear")
+    three = {"gvd_cams": "main,narrow,wide"}
+    assert check_camera_contract(three, eight) == ("wide", "main", "narrow")
+    assert check_camera_contract(three, ("main", "narrow", "wide")) == ("wide", "main", "narrow")
+    for meta, live, why in (({}, eight, "no gvd_cams"), (three, ("main", "wide"), "missing narrow"),
+                            ({"gvd_cams": "main,rear"}, ("main", "narrow", "wide"), "missing rear")):
+        try:
+            check_camera_contract(meta, live)
+            raise AssertionError(f"accepted {meta} with live {live}")
+        except SceneCameraContractError as exc:
+            assert why.split()[-1] in str(exc), exc
+    assert issubclass(SceneCameraContractError, SceneInputShapeError), "the guard must refuse Engage on it"
+    cfg = {"cameras": [{"id": "narrow"}, {"id": "main"}, {"id": "wide"}, {"id": "main"}, {"note": "x"}]}
+    assert live_cams_from_config(cfg) == ("narrow", "main", "wide")
+    try:
+        import yaml  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        from python.sensors.cameras import load_camera_config
+
+        assert set(live_cams_from_config(load_camera_config())) == set(eight)
+
+    root = Path(__file__).resolve().parents[1]
+    vision = (root / "python" / "run_vision.py").read_text(encoding="utf-8")
+    assert "SceneLaneRuntime(path, live_cams=live_cams)" in vision and "live_cams_from_config(load_camera_config())" in vision
+    trainer = (root / "python" / "train" / "train_scene.py").read_text(encoding="utf-8")
+    assert '{"kind": "run", "t": run_started, "cams": run_cams,' in trainer and '"cams": run_cams,' in trainer
+    exporter = (root / "python" / "train" / "scene_net.py").read_text(encoding="utf-8")
+    assert "or tuple(cams or ()) or tuple(STRIP_ORDER)" in exporter, "export always stamps gvd_cams"
+
+    live_note = "(onnx/onnxruntime not installed: runtime load not run)"
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        if _tiny_scene_onnx(tmp / "three.onnx", ("main", "narrow", "wide")):
+            try:
+                import onnxruntime  # noqa: F401
+            except ImportError:
+                pass
+            else:
+                _tiny_scene_onnx(tmp / "old.onnx", None)
+                _tiny_scene_onnx(tmp / "rear.onnx", ("main", "rear"))
+                ok = SceneLaneRuntime(tmp / "three.onnx", live_cams=eight)
+                assert ok.ready and ok.cams == ("wide", "main", "narrow"), ok.reason
+                for name, live in (("three.onnx", ("main", "wide")), ("old.onnx", eight), ("rear.onnx", ("main", "narrow", "wide"))):
+                    guard = SceneLaneGuard()
+                    got = guard.load(lambda path, live=live: SceneLaneRuntime(path, live_cams=live), tmp / name)
+                    assert got is None and guard.refused, (name, live)
+                legacy = SceneLaneRuntime(tmp / "old.onnx")
+                assert legacy.ready, "no live_cams given: old callers keep the old behaviour"
+                live_note = "runtime + SceneLaneGuard refuse Engage on a mismatched or unlabelled model"
+    print(f"(h) gvd_cams contract: main,narrow,wide accepted on the 8-camera live feed, refused without narrow; "
+          f"no gvd_cams refused; {live_note} OK")
+
+
 def main() -> None:
+    check_camera_contract()
     check_cache_on_c()
     check_other_cams()
     check_cache_manifest()

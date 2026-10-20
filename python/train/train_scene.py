@@ -1938,6 +1938,13 @@ def train_directory(
 
     debug_dir = status_dir(status_root)
     run_started = time.time()
+    from python.data.strip_writer import STRIP_ORDER as _ALL_CAMS
+
+    run_cams = list(train_cams or _ALL_CAMS)
+    # Run metadata: the camera contract the export stamps as gvd_cams.
+    append_metrics(debug_dir, {"kind": "run", "t": run_started, "cams": run_cams,
+                               "heads": list(train_heads or ()) or "all"})
+    print(f"[GVD] run cams={','.join(run_cams)} (written to metrics.jsonl and the ONNX gvd_cams)", flush=True)
     write_heartbeat(
         debug_dir,
         {
@@ -2363,6 +2370,7 @@ def train_directory(
                     "collapse": bool(scored.get("collapse")),
                     "blank_main_skipped": int(BLANK_MAIN_SKIPS),
                     "dark_sector_count": int(DARK_SECTOR_COUNT),
+                    "cams": run_cams,
                     "lr": lr_now,
                 }
                 cell_lines: list[str] = []

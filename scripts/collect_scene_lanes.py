@@ -58,8 +58,12 @@ the abort reason). ``t`` matches the row ``t`` exactly; ``i`` is the row index
 the writer was expected to assign (``i_row`` ``impact``). When the impact
 tick itself is not written (the same tick aborts on damage, or the writer
 queue is full), ``i`` is the last written row before it and ``i_row`` is
-``previous``; ``t`` is still the impact time. A trainer masks rows in
-[pre_t0, end t].
+``previous``; ``t`` is still the impact time. ``pre_t0`` is the first row
+of the 3 s run-up (PRE_IMPACT_S). ``abort_t0`` is the row t where the
+current abort phase began when the impact lands in an abort, else null.
+The trainer (``--mask-events``) masks from the earliest of those to the
+last row before the next respawn (recover / new settle run), past
+``impact_end``; rows are masked, never deleted.
 ``impacts.jsonl`` is not a complete crash list: it only sees a longitudinal
 speed drop, so a sideswipe or a scrape that keeps the speed is missed, and a
 gap between ticks over 0.5 s (a stalled loop, a teleport) is never scored.
@@ -1515,6 +1519,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             Excursion,
             ExcursionClock,
             CRUISE_S,
+            EGO_HALF_WIDTH_M,
             excursion_commands,
             excursion_path,
             gate_reason,
@@ -1563,6 +1568,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         warmup_since: float | None = None
         last_ai: tuple[Any, ...] | None = None
         held_tag: Excursion | None = None
+        # Wall time t of the first tick of the current abort phase. An impact
+        # inside an abort names it (abort_t0) so the whole abort is masked.
+        abort_t0: float | None = None
         loaded_map = ""
         loaded_index = -1
         speed_span = [speeds]
@@ -2244,6 +2252,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     "speed_after_mps": speed_mps_f,
                     "segment": segment_id,
                     "excursion": clock.phase,
+                    "abort_t0": (
+                        round(float(abort_t0), 6) if clock.phase == "abort" and abort_t0 is not None else None
+                    ),
                     "pos": pos,
                 }
                 before_txt = "na" if impact.speed_before is None else format(impact.speed_before, ".1f")
@@ -2338,6 +2349,11 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     start_kind=start_kind,
                     road_offset_m=None if hit is None else hit.offset_m,
                     road_width_m=None if paved is None else paved.width_m,
+                    speed_mps=speed,
+                    # Weave abort: body edge (lane_offset_m +/- EGO_HALF_WIDTH_M)
+                    # past the world-road lane edge (navgraph lane center +/-
+                    # lane_width_m / 2) by EDGE_M. Not the camera paint labels.
+                    half_width_m=EGO_HALF_WIDTH_M,
                 )
             else:
                 move = Excursion("cruise", 0.0, 0.0, 1, "")
@@ -2368,6 +2384,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     None if hit is None else hit.lane_width_m,
                     lane_id=0 if hit is None else int(getattr(hit, "lane_id", 0) or 0),
                     road_width_m=None if road is None else float(road.width_m),
+                    speed_mps=speed,
                 )
                 if path is None or spec is None:
                     resolved = clock.force_abort("no_path")
@@ -2407,6 +2424,11 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     flush=True,
                 )
             move = resolved
+            if clock.phase == "abort":
+                if abort_t0 is None:
+                    abort_t0 = now
+            else:
+                abort_t0 = None
             since_spawn[0] += tick_dt
             why = live.update(
                 tick_dt,

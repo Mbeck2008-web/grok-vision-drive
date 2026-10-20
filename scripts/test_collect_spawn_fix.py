@@ -205,7 +205,7 @@ def check_impact_watch() -> None:
     assert [h[0] for h in hits] == [41], hits
     assert hits[0][1] == 50.0
     pre_t, pre_i = hits[0][2]
-    assert pre_i == 41 - int(round(PRE_IMPACT_S / 0.1)), hits  # first row inside the 2 s run-up
+    assert pre_i == 41 - int(round(PRE_IMPACT_S / 0.1)), hits  # first row inside the 3 s run-up
     assert abs(pre_t - (pre_i + 1) * 0.1) < 1e-6
     assert watch.should_respawn() and watch.stall_s >= IMPACT_STALL_S
     # A long gap (teleport, a stall in the loop) is not a deceleration.
@@ -371,8 +371,9 @@ def check_damage_and_up_are_read() -> None:
 class _CrashVehicle:
     """10 m/s, a crash to 0.2 m/s, stopped, then driving again, then the stop file."""
 
-    def __init__(self, stop: Path, speed_at=None, stop_at: int = 120, damage_at=None) -> None:
+    def __init__(self, stop: Path, speed_at=None, stop_at: int = 120, damage_at=None, x: float = 0.4) -> None:
         self.stop = stop
+        self.x = float(x)
         self.speed_at = speed_at or (lambda n: 10.0 if n <= 40 or n > 75 else 0.2)
         self.damage_at = damage_at
         self.stop_at = int(stop_at)
@@ -383,7 +384,7 @@ class _CrashVehicle:
 
     def _set(self, speed: float) -> None:
         self.state = {
-            "pos": [0.4, 12.0, 0.5],
+            "pos": [self.x, 12.0, 0.5],
             "dir": [0.0, 1.0, 0.0],
             "up": [0.0, 0.0, 1.0],
             "electrics": {"wheelspeed": speed, "steering_input": 0.0, "throttle_input": 0.3, "brake_input": 0.0},
@@ -538,6 +539,7 @@ def check_collector_impact_rows() -> None:
     assert pre and abs(pre[0]["t"] - ev["pre_t0"]) < 1e-9
     assert i_hit - ev["pre_i0"] == int(round(PRE_IMPACT_S / 0.1)), ev
     assert end["how"] == "respawn" and end["t"] >= ev["t"]
+    assert "abort_t0" in ev and ev["abort_t0"] is None, ev  # no abort phase before this impact
     print(f"collector impact rows ok impact i={i_hit} pre_i0={ev['pre_i0']} recover i={i_rec} settle={len(settled)} rows")
 
 
@@ -558,7 +560,9 @@ def check_weave_guard_runs() -> None:
     previous = collect.painted_for
     collect.painted_for = lambda level: _Paint(lambda x, y: True)  # type: ignore[assignment]
     try:
-        code, text, out = _run_collector({"speed_at": lambda n: 10.0, "stop_at": 300}, ["--weave-guard"])
+        # In the right lane (center x=+1.75 on the 7 m road heading +y): at x=0.4 the body
+        # straddles the centerline and the body-edge rule aborts the weave at once.
+        code, text, out = _run_collector({"speed_at": lambda n: 10.0, "stop_at": 300, "x": 1.75}, ["--weave-guard"])
     finally:
         collect.painted_for = previous  # type: ignore[assignment]
     assert code == 0, (code, text)

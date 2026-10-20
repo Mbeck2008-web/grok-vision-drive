@@ -13,7 +13,7 @@ Every feature in this README carries exactly one status label:
 - **Offline smoke only**: an offline test in `scripts/` exercises it without BeamNG and without a GPU. GitHub Actions runs those tests (`.github/workflows/tests.yml`). It has not been confirmed in a live game.
 - **Unproven**: nothing on file shows it working yet.
 
-One feature is proven live, and only for recording: the command-line collector, `scripts/collect_scene_lanes.py`. The rec2 and rec3 runs recorded on the dev PC on 2026-10-19 while BeamNG's AI drove. Evidence: `E:\GVD_data\logs\rec3_20261019.txt`, `E:\GVD_data\scene_lanes_rec3\collect.json`. rec3 used the collector from branch `collector-spawn-crash-fix` (6a07d65), which adds a paint-coverage spawn filter and a weave guard that `cursor/scene-net-collect-e194` does not have. Everything about GVD driving, including Alt+G, the in-game ribbon, the eight-camera drive and force feedback, is **Unproven**.
+One feature is proven live, and only for recording: the command-line collector, `scripts/collect_scene_lanes.py`. The rec2 and rec3 runs recorded on the dev PC on 2026-10-19 while BeamNG's AI drove. Evidence: `E:\GVD_data\logs\rec3_20261019.txt`, `E:\GVD_data\scene_lanes_rec3\collect.json`. rec3 ran an earlier build of the collector, from branch `collector-spawn-crash-fix` (6a07d65). `cursor/scene-net-collect-e194` carries newer versions of that build's paint-coverage spawn filter (`SpawnDeck` `min_paint_cov`) and weave guard (`weave_paint_min`). Everything about GVD driving, including Alt+G, the in-game ribbon, the eight-camera drive and force feedback, is **Unproven**.
 
 Trainer collapse fixes are pending in PR #87 and are not merged yet.
 

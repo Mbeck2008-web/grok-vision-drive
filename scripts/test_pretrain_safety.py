@@ -23,6 +23,8 @@
     written) is dropped; with no --cams a recording that lacks a camera is
     refused. A near-black sector that was written is only counted
     (``dark_sector_count``) and still trains: darkness is not a missing flag.
+(e2) only the --cache folder may be on C: (free-space floor still applies);
+    a recording/strips path on C: or D:, and a cache on D:, stay refused.
 """
 from __future__ import annotations
 
@@ -368,7 +370,68 @@ def check_other_cams() -> None:
           f"a dark wide sector is counted (dark_sector_count) and kept; {refused} OK")
 
 
+def check_cache_on_c() -> None:
+    import contextlib
+    import io
+
+    from python.data import data_root
+    from python.data.data_root import DataDriveError, check_cache_path, check_data_path
+    from python.train import train_scene as ts
+
+    gb = 1024 ** 3
+    real_free = data_root.free_bytes
+    free = {"bytes": 50 * gb}
+    data_root.free_bytes = lambda _path: free["bytes"]
+    try:
+        assert check_cache_path(r"C:\GVD_cache\rec5b_7162fd559a6a", minimum=8 * gb) == 50 * gb
+        free["bytes"] = 5 * gb
+        try:
+            check_cache_path(r"C:\GVD_cache\rec5b_7162fd559a6a", minimum=8 * gb)
+            raise AssertionError("C: cache below the 8 GB floor accepted")
+        except DataDriveError as exc:
+            assert "need 8 GB" in str(exc), exc
+        free["bytes"] = 50 * gb
+        for bad in (r"C:\GVD_data\scene_lanes_rec5b", r"D:\GVD_data\scene_lanes_rec5b"):
+            try:
+                check_data_path(bad)
+                raise AssertionError(f"recording on {bad[:2]} accepted")
+            except DataDriveError as exc:
+                assert "C: and D:" in str(exc), exc
+        try:
+            check_cache_path(r"D:\GVD_cache\x", minimum=8 * gb)
+            raise AssertionError("D: cache accepted")
+        except DataDriveError:
+            pass
+
+        def run(argv: list[str]) -> str:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                try:
+                    ts.main(argv)
+                    raise AssertionError(f"main accepted {argv}")
+                except SystemExit as exc:
+                    assert exc.code == 2, exc.code
+            return out.getvalue()
+
+        msg = run(["--cache", r"C:\GVD_cache\rec5b", "--strips", r"C:\GVD_data\scene_lanes_rec5b"])
+        assert "C: and D:" in msg and r"C:\GVD_data" in msg, msg
+        msg = run(["--build-cache", r"C:\GVD_cache\rec5b", "--strips", r"C:\GVD_data\scene_lanes_rec5b"])
+        assert "C: and D:" in msg and r"C:\GVD_data" in msg, msg
+        with tempfile.TemporaryDirectory() as raw:
+            # Strips off C:, cache on C:: the drive checks pass and the manifest check decides.
+            msg = run(["--cache", r"C:\GVD_cache\rec5b_none", "--strips", raw])
+            assert "no manifest.json" in msg and "C: and D:" not in msg, msg
+            data_root.free_bytes = lambda path: 5 * gb if str(path).startswith("C:") else 50 * gb
+            msg = run(["--cache", r"C:\GVD_cache\rec5b_none", "--strips", raw, "--cache-min-free-gb", "8"])
+            assert "C:" in msg and "need 8 GB" in msg and "C: and D:" not in msg, msg
+    finally:
+        data_root.free_bytes = real_free
+    print("(e2) C: cache allowed at 50 GB free, refused under the 8 GB floor; C:/D: recording and D: cache refused; "
+          "main() refuses --strips on C: with a C: cache OK")
+
+
 def main() -> None:
+    check_cache_on_c()
     check_other_cams()
     check_cache_manifest()
     check_lr_logging()

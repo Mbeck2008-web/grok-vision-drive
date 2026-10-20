@@ -243,7 +243,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--cache-min-free-gb",
         type=float,
         default=8.0,
-        help="--cache / --build-cache: refuse a cache drive with less free space than this (GB).",
+        help=(
+            "--cache / --build-cache: refuse a cache drive with less free space than this (GB). "
+            "The cache folder may be on C: (recordings may not)."
+        ),
     )
     parser.add_argument(
         "--clip",
@@ -2625,7 +2628,14 @@ def train_directory(
 
 
 def main(argv: list[str] | None = None) -> None:
-    from python.data.data_root import DataDriveError, check_data_path, ensure_cache_dirs, scene_lanes_dir
+    from python.data.data_root import (
+        DataDriveError,
+        check_cache_path,
+        check_data_path,
+        ensure_cache_dirs,
+        refuse_system_drive,
+        scene_lanes_dir,
+    )
 
     try:
         ensure_cache_dirs()
@@ -2648,7 +2658,9 @@ def main(argv: list[str] | None = None) -> None:
     cache_floor = int(float(args.cache_min_free_gb) * 1024 ** 3)
     if args.build_cache:
         try:
-            check_data_path(args.build_cache, minimum=cache_floor)
+            # The recording read from stays off C:/D:; the cache may be on C:.
+            refuse_system_drive(args.strips or scene_lanes_dir())
+            check_cache_path(args.build_cache, minimum=cache_floor)
         except DataDriveError as exc:
             print(f"[GVD] scene train: cache {exc}")
             sys.exit(2)
@@ -2685,7 +2697,7 @@ def main(argv: list[str] | None = None) -> None:
         if export_path is not None:
             check_data_path(export_path)
         if args.cache:
-            check_data_path(args.cache, minimum=cache_floor)
+            check_cache_path(args.cache, minimum=cache_floor)
             frame_cache = FrameCache(args.cache, strips_root=args.strips)
             print(f"[GVD] cache {args.cache}: built from {args.strips} (rows and state.jsonl hash match)", flush=True)
     except (DataDriveError, CacheMismatchError) as exc:

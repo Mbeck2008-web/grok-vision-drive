@@ -95,7 +95,7 @@ angular.module('beamng.apps')
         if (!ui.engaged || ui.link === 'mismatch') return false;
         if (ui.link !== 'live') return true;
         var reason = String(ui.cmdReason || '');
-        if (reason === 'preview_blocked' || reason === 'heartbeat_stale' || reason.indexOf('veto:') === 0) return true;
+        if (reason === 'preview_blocked' || reason === 'heartbeat_stale' || reason.indexOf('veto:') === 0 || reason.indexOf('scene_hold:') === 0) return true;
         if (ui.aeb === 'brake' || ui.aeb === 'warn') return true;
         if (ui.vetoReason === 'e2e_stub') return true;
         return false;

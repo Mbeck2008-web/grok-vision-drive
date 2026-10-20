@@ -82,6 +82,52 @@ def straight_lane_path(lane_x: float, *, length_m: float = 36.0, step_m: float =
     return path
 
 
+SCENE_SHAPE_HOLD = "scene_hold:input_shape"
+
+
+class SceneLaneGuard:
+    """The supervisor's handler for :class:`SceneInputShapeError`.
+
+    A load-time error refuses Engage: ``refused`` holds the message and
+    ``load`` returns no runtime. A live error is a HOLD: ``observe`` returns
+    ``(None, 0.0)``, ``hold`` holds the message, and the caller sends
+    ``stop_command(reason=SCENE_SHAPE_HOLD)``. The HOLD stays latched (the
+    runtime is not asked again) until the car is disengaged, so a strip that
+    comes back the right size cannot resume steering on its own. The
+    exception never leaves this class.
+    """
+
+    def __init__(self) -> None:
+        self.refused: str | None = None
+        self.hold: str | None = None
+
+    def load(self, factory: Any, path: Any) -> Any:
+        try:
+            return factory(path)
+        except SceneInputShapeError as exc:
+            self.refused = str(exc)
+            return None
+
+    def observe(self, runtime: Any, strip_bgr: Any, dt_s: float | None, *, engaged: bool) -> tuple[float | None, float]:
+        if not engaged:
+            self.hold = None
+        if self.hold is not None:
+            return None, 0.0
+        try:
+            return runtime.observe(strip_bgr, dt_s)
+        except SceneInputShapeError as exc:
+            self.hold = str(exc)
+            return None, 0.0
+
+    def status(self) -> dict[str, Any]:
+        """``scene_lane`` block for gvd_state.json."""
+        if self.refused is not None:
+            return {"state": "refused", "reason": SCENE_SHAPE_HOLD, "detail": self.refused}
+        if self.hold is not None:
+            return {"state": "hold", "reason": SCENE_SHAPE_HOLD, "detail": self.hold}
+        return {"state": "ok", "reason": "none", "detail": ""}
+
+
 class SceneLaneRuntime:
     """One ONNX session and its GRU state. Not tied to a fixed frame rate."""
 

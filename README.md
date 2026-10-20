@@ -138,7 +138,7 @@ Key `0` hides every layer and shows the clean stage only.
 
 #### AUTO tab: Automatic Mode
 
-Automatic Mode records while BeamNG's own AI drives. The AI steers, not GVD. Every saved tick is labelled `driver=beamng_ai`. The tab and the command line start the same collector, `scripts/collect_scene_lanes.py`. The live runs so far (rec2, rec3) were started from the command line, not from this tab, so the tab itself is Offline smoke only. The collector it starts is Proven live: recording only (see the CLI table).
+Automatic Mode records while BeamNG's own AI drives. BeamNG's AI steers. Every saved tick is labelled `driver=beamng_ai`. The tab and the command line start the same collector, `scripts/collect_scene_lanes.py`. The live runs so far (rec2, rec3) were started from the command line, not from this tab, so the tab itself is Offline smoke only. The collector it starts is Proven live: recording only (see the CLI table).
 
 | Control | Click does | Default | Status |
 | --- | --- | --- | --- |

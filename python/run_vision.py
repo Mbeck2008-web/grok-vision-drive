@@ -48,6 +48,7 @@ from python.control.override import (
     config_mirror,
     load_override_config,
 )
+from python.control.echo_link import EchoGate
 from python.data.record import ClipRecorder, choose_encoder
 from python.perception.pipeline import ModularPerception
 from python.perception.stitch360 import stitch_frames
@@ -445,6 +446,10 @@ def main() -> None:
     shadow_cfg = load_shadow_config(_ctrl_yaml)
     override_cfg = load_override_config(_ctrl_yaml)
     override = OverrideDetector(override_cfg)
+    # Retail echo freshness: the filter only eats new echoes; a frozen or pre-contract echo
+    # disengages / refuses instead of reading as "no override".
+    echo_gate = EchoGate()
+    echo_fault_prev: str | None = None
 
     allow_nvenc = args.encode == "nvenc"
     if args.encode == "nvenc":
@@ -854,6 +859,34 @@ def main() -> None:
             # we just sent. own_axes keeps the pedal residual, and the steer baseline follows
             # the resting wheel when the command changes, instead of the absolute player_* path.
             owns_axes = getattr(actuator, "name", "") == "beamngpy"
+            # Retail cmd_json bus: the wheel only reaches us through the mod's 10 Hz echo, so
+            # only a fresh echo is a new sample. BeamNGpy polls electrics itself every tick.
+            echo_bus = vehicle is None and not owns_axes
+            echo = echo_gate.observe(engaged=bool(engaged) and echo_bus, ego_fb=ego_fb, now=time.monotonic())
+            echo_fault = echo.fault if engaged else None
+            if echo_fault:
+                # Link fault (echo frozen while engaged) or a mod too old to stamp its echo.
+                # Same disengage path a player override takes; the brake hold is unchanged.
+                engaged = False
+                disengage_reason = echo_fault
+                bot_engage.clear()
+                write_engage_flag(False, disengage_reason=echo_fault)
+                cmd = stop_command(seq=cmd_seq, reason=echo_fault)
+                if echo_fault != echo_fault_prev:
+                    if echo.status == "outdated":
+                        print(
+                            f"[GVD] REFUSE ENGAGE: {echo_fault} (gvd_ego.json has no echo_seq; "
+                            "update the Grok Vision Drive mod)",
+                            flush=True,
+                        )
+                    else:
+                        why = (
+                            f"no new electrics echo for {echo.since_ms:.0f} ms"
+                            if echo.since_ms > 0.0
+                            else "every recent echo arrived after a gap"
+                        )
+                        print(f"[GVD] DISENGAGED: {echo_fault} ({why})", flush=True)
+            echo_fault_prev = echo_fault
             if owns_axes:
                 ovr_steer, ovr_thr, ovr_brk, ovr_dev = steer_in, throttle_in, brake_in, False
             elif ego_fb is not None and ego_fb.fresh and ego_fb.player_device:
@@ -872,6 +905,8 @@ def main() -> None:
                 applied_seq=None if owns_axes else (
                     ego_fb.applied_seq if ego_fb is not None and ego_fb.fresh else None
                 ),
+                fresh=echo.fresh if echo_bus else True,
+                gap=echo.gap if echo_bus else False,
             )
             if ovr.active and not ui.debug.ignore_override:
                 engaged = False
@@ -1151,7 +1186,10 @@ def main() -> None:
                 "opposition": ovr.opposition,
                 "ref_seq": ovr.ref_seq,
                 "armed": bool(ovr.armed),
+                "fresh": bool(ovr.fresh),
+                "gap_hold": bool(ovr.gap_hold),
             }
+            st["echo"] = echo.telemetry()
             st["shadow"] = {
                 "steer": float(tick.shadow.get("steer", 0.0)),
                 "throttle": float(tick.shadow.get("throttle", 0.0)),

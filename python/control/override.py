@@ -13,9 +13,15 @@ is conditioned before anyone believes it:
 * **Aligned reference.** `cmd.steer` is the command that was in force when the echo was sampled,
   found by the `applied_seq` the mod acks in `gvd_ego.json`. Comparing a fresh echo against a
   fresh command would read GVD's own steer ramp as a driver, because the echo lags by a tick.
+* **Fresh samples only.** On the retail bus the mod echoes at 10 Hz and the loop runs at
+  15-20 Hz, so most reads repeat the last echo. `update(fresh=False)` leaves the filter, the
+  dwell and their clock alone; the next fresh sample's `dt` covers the whole interval, so the
+  dwell is still real time. `python/control/echo_link.py` decides what is fresh.
 * **Spike reject.** A sample that jumps more than `steer_spike` from the previous one is
   mechanical, not muscular: the filter holds instead of following it. This is what kills the
-  large alternating chatter an EMA alone would only attenuate.
+  large alternating chatter an EMA alone would only attenuate. After a `gap` (echoes missed in
+  between) the previous sample is not this one's neighbour, so agreement with it proves
+  nothing: that sample only re-seeds the spike test and the next contiguous one decides.
 * **EMA on the residual only** — not on the inputs and not on the command. For a linear filter
   those are the same thing (`lpf(a) - lpf(b) == lpf(a - b)`), and one state is cheaper to reason
   about than three.
@@ -23,7 +29,8 @@ is conditioned before anyone believes it:
   than one going along with it, so it counts up to `OPPOSITION_GAIN` more — a nudge on the
   threshold, not a separate rule, and it fades to nothing when GVD is steering straight.
 * **Hysteresis + dwell.** Charge above `steer_enter`, discharge below `steer_exit`, and only
-  call it an override once the dwell reaches `steer_hold_ms`.
+  call it an override once the dwell reaches `steer_hold_ms`. A spike that follows a spike is
+  chatter: the filter holds and so does the dwell, so a frozen filter cannot run the clock out.
 
 Pedals are deliberately asymmetric and tight: no filter, no dwell, one-sided (only a press
 *beyond* what GVD asked for counts) and brake trips lower than throttle. There is no benign
@@ -124,6 +131,8 @@ class OverrideVerdict:
     opposition: float = 0.0      # 0..1, how much the residual fights GVD's steer
     ref_seq: int = -1            # command seq the residual was measured against
     armed: bool = True           # false during the warm-up after engage
+    fresh: bool = True           # false: a repeated read, nothing judged this tick
+    gap_hold: bool = False       # this sample came after missed echoes and was not trusted
 
     @property
     def reason(self) -> str:
@@ -260,6 +269,8 @@ class OverrideDetector:
         # Compared against the next raw residual so the first sample can be a spike too
         # (a kick off rest). None would let that kick into the filter and freeze it there.
         self._last_raw: float = 0.0
+        # Whether the last step between fresh samples agreed (no spike). Rest counts as steady.
+        self._last_steady = True
         self._steer_held = 0.0
         self._steer_sign = 0
         self._last_t: float | None = None
@@ -289,6 +300,7 @@ class OverrideDetector:
         self._cmds.clear()
         self._filt = 0.0
         self._last_raw = 0.0
+        self._last_steady = True
         self._steer_held = 0.0
         self._steer_sign = 0
         self._armed_at = None
@@ -331,14 +343,27 @@ class OverrideDetector:
         now: float | None = None,
         player_device: bool = False,
         own_axes: bool = False,
+        fresh: bool = True,
+        gap: bool = False,
     ) -> OverrideVerdict:
+        """Judge one read. `fresh=False` is a repeat of the sample already judged.
+
+        A repeat changes nothing: not the filter, not the dwell, not the clock either, so the
+        next fresh sample's `dt` spans the repeats and the dwell stays wall time. `gap=True`
+        says echoes were missed since the last fresh sample.
+        """
         cfg = self.cfg
         t = time.monotonic() if now is None else float(now)
-        dt = 0.0 if self._last_t is None else min(1.0, max(0.0, t - self._last_t))
-        self._last_t = t
         if not engaged:
+            self._last_t = t
             self.reset()
             return self.verdict
+        if not fresh:
+            v = self.verdict
+            self.verdict = OverrideVerdict(**{**v.__dict__, "fresh": False, "spike": False, "gap_hold": False})
+            return self.verdict
+        dt = 0.0 if self._last_t is None else min(1.0, max(0.0, t - self._last_t))
+        self._last_t = t
         if not self.armed(t):
             self._steer_held = 0.0
             self._steer_sign = 0
@@ -402,9 +427,20 @@ class OverrideDetector:
         # Sample-to-sample jump past steer_spike is mechanical: skip the EMA so a kick does
         # not drag the filter with it. last_raw still advances, so a hold after the kick is
         # a zero jump next tick and the filter is allowed to follow.
+        # Across a gap the previous sample is not this one's neighbour: a skipped kick between
+        # two same-sign kicks looks like a steady pull. A sample after a gap only re-seeds the
+        # spike test; the next contiguous sample decides. A real pull costs one sample.
+        # Spike after spike is the wheel chattering, not a hand on it. The filter is already
+        # holding; the dwell holds too, so a level the filter froze at cannot run the clock out.
         spike = abs(raw - self._last_raw) > cfg.steer_spike
+        gap_hold = bool(gap)
+        chatter = spike and not self._last_steady
         self._last_raw = raw
-        if not spike:
+        # After a gap the step is unknown, not steady.
+        self._last_steady = not spike and not gap_hold
+        if gap_hold:
+            spike = False
+        if not spike and not gap_hold:
             self._filt += ema_alpha(dt, cfg.lpf_tau_s) * (raw - self._filt)
         opp = opposition(ref.steer, self._filt)
         eff = self._filt * (1.0 + OPPOSITION_GAIN * opp)
@@ -416,7 +452,8 @@ class OverrideDetector:
             self._steer_held = 0.0
         if mag >= cfg.steer_enter:
             self._steer_sign = sign
-            self._steer_held += dt
+            if not chatter and not gap_hold:
+                self._steer_held += dt
         elif mag <= cfg.steer_exit:
             self._steer_held = 0.0
             self._steer_sign = 0
@@ -441,5 +478,7 @@ class OverrideDetector:
             opposition=round(opp, 4),
             ref_seq=int(ref.seq),
             armed=True,
+            fresh=True,
+            gap_hold=gap_hold,
         )
         return self.verdict

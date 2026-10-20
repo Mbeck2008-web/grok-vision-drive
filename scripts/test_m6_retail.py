@@ -227,23 +227,25 @@ def _write_ego(
     throttle_in: float = 0.0,
     brake_in: float = 0.0,
     age_s: float = 0.0,
+    echo_seq: int | None = None,
+    stamp_echo: bool = True,
 ) -> None:
+    """Play gvd_main's gvd_ego.json. `echo_seq` defaults to `seq`; `stamp_echo=False` is a
+    mod from before the echo_seq contract."""
     root = _touch_lua_bus()
-    ego_path().write_text(
-        json.dumps(
-            {
-                "speed_mps": speed,
-                "steering_input": steer_in,
-                "throttle_input": throttle_in,
-                "brake_input": brake_in,
-                "applied_seq": seq,
-                "applying": applying,
-                "mtime": int(time.time()),
-                "lua_bus": str(root),
-            }
-        ),
-        encoding="utf-8",
-    )
+    payload = {
+        "speed_mps": speed,
+        "steering_input": steer_in,
+        "throttle_input": throttle_in,
+        "brake_input": brake_in,
+        "applied_seq": seq,
+        "applying": applying,
+        "mtime": int(time.time()),
+        "lua_bus": str(root),
+    }
+    if stamp_echo:
+        payload["echo_seq"] = seq if echo_seq is None else echo_seq
+    ego_path().write_text(json.dumps(payload), encoding="utf-8")
     if age_s:
         old = time.time() - age_s
         os.utime(ego_path(), (old, old))
@@ -351,8 +353,18 @@ def _run_supervisor(
     steer_echo: Callable[[int], float] | None = None,
     brake_bias: float = 0.0,
     expect_disengage: str | None = None,
+    stamp_echo: bool = True,
+    freeze_echo_after_s: float | None = None,
+    on_engage_drop: Callable[[float], None] | None = None,
 ) -> dict | None:
     """Run run_vision.py headless for `seconds`; optionally play the mod's ack role meanwhile.
+
+    One echo per command seq, stamped `echo_seq = seq`: this fake's wheel is a function of the
+    seq, so the seq is its sample index. A re-read of the same seq is the same sample, and a seq
+    the fake never echoed is a skipped one. `stamp_echo=False` plays a mod from before
+    echo_seq. `freeze_echo_after_s` keeps rewriting the last echo (fresh mtime, same echo_seq)
+    from that point, a mod whose electrics echo stopped. `on_engage_drop(t)` is called with the
+    wall time the engage file was first seen false.
 
     The fake mod echoes back what it was told to apply, exactly like `gvd_main` does, so the
     override residual is zero unless a test deliberately plays a driver: `steer_echo(seq)`
@@ -376,9 +388,20 @@ def _run_supervisor(
         stderr=subprocess.DEVNULL,
     )
     latched: dict | None = None
+    t_start = time.time()
+    frozen: dict | None = None
+    dropped = False
 
     def _ack_once() -> None:
+        nonlocal frozen, dropped
+        if on_engage_drop is not None and not dropped:
+            if _read_json(engage_path()).get("engaged") is False:
+                dropped = True
+                on_engage_drop(time.time())
         if not ack:
+            return
+        if frozen is not None:
+            _write_ego(**frozen)
             return
         try:
             cmd = json.loads(cmd_path().read_text(encoding="utf-8"))
@@ -387,14 +410,18 @@ def _run_supervisor(
             return
         if seq < 0:
             return
-        _write_ego(
-            seq,
+        kw = dict(
+            seq=seq,
             applying=True,
             speed=5.5,
             steer_in=steer_echo(seq) if steer_echo else float(cmd.get("steer", 0.0)),
             throttle_in=float(cmd.get("throttle", 0.0)),
             brake_in=min(1.0, float(cmd.get("brake", 0.0)) + brake_bias),
+            stamp_echo=stamp_echo,
         )
+        _write_ego(**kw)
+        if freeze_echo_after_s is not None and time.time() - t_start >= freeze_echo_after_s:
+            frozen = kw
 
     def _try_latch() -> bool:
         nonlocal latched
@@ -672,6 +699,58 @@ def check_ffb_override_live() -> None:
     ego_path().unlink()
 
 
+def check_echo_outdated_refuses_engage() -> None:
+    """A mod without echo_seq cannot tell a repeat from a new sample: engage is refused, by name."""
+    _touch_lua_bus()
+    if ego_path().exists():
+        ego_path().unlink()
+    write_engage_flag(True)
+    snap = _run_supervisor(
+        ["--allow-preview-drive"],
+        seconds=3.0,
+        ack=True,
+        stamp_echo=False,
+        expect_disengage="lua_echo_outdated",
+    )
+    assert snap is not None, "an echo without echo_seq never refused engage"
+    assert read_engage_flag(default=True) is False, "an old mod must not keep GVD engaged"
+    assert snap["engage"].get("disengage_reason") == "lua_echo_outdated", snap["engage"]
+    assert snap["cmd"].get("engaged") is False, snap["cmd"]
+    # No silent fallback: nothing was judged on the old filter path while it was refused.
+    assert snap["state"].get("disengage_reason") in ("lua_echo_outdated", "not_engaged"), snap["state"]
+    write_engage_flag(False)
+    ego_path().unlink()
+
+
+def check_echo_stale_disengages() -> None:
+    """A frozen echo while engaged is a link fault (echo_stale), never 'no override'."""
+    _touch_lua_bus()
+    if ego_path().exists():
+        ego_path().unlink()
+    drop: list[float] = []
+    write_engage_flag(True)
+    freeze_at = 1.2
+    t0 = time.time()
+    snap = _run_supervisor(
+        ["--allow-preview-drive"],
+        seconds=3.5,
+        ack=True,
+        freeze_echo_after_s=freeze_at,
+        expect_disengage="echo_stale",
+        on_engage_drop=drop.append,
+    )
+    assert snap is not None, "a frozen echo never disengaged with echo_stale"
+    assert snap["engage"].get("disengage_reason") == "echo_stale", snap["engage"]
+    assert snap["cmd"].get("engaged") is False, snap["cmd"]
+    assert read_engage_flag(default=True) is False
+    if drop:
+        after = drop[0] - (t0 + freeze_at)
+        print(f"  echo_stale {after * 1000.0:.0f} ms after the echo froze")
+        assert after < 1.5, f"echo_stale took {after:.2f}s after the echo froze"
+    write_engage_flag(False)
+    ego_path().unlink()
+
+
 def check_lua_harness() -> None:
     """Drive the mod's Lua through the stub-GE harness when a Lua 5.1 interpreter is available."""
     for exe in ("lua5.1", "luajit", "lua"):
@@ -811,6 +890,8 @@ def main() -> None:
         check_run_vision_e2e,
         check_synthetic_lanes_drive,
         check_ffb_override_live,
+        check_echo_outdated_refuses_engage,
+        check_echo_stale_disengages,
     )
     failed: list[str] = []
     for fn in checks:

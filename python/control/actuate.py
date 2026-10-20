@@ -1146,6 +1146,7 @@ class BeamNGPyActuator:
         *,
         release: bool = False,
         blinker: str = "off",
+        stamp: DriveCommand | None = None,
     ) -> str | None:
         if self.vehicle is None:
             return "no_vehicle"
@@ -1174,6 +1175,13 @@ class BeamNGPyActuator:
                 steer, throttle, brake, release=release, speed_mps=speed_mps
             )
             self._invoke_control(kwargs)
+            if stamp is not None:
+                # Dead-man heartbeat, on this thread right after this tick's vehicle.control.
+                # heartbeat_only: the mod keeps its hands off while this is fresh and runs
+                # its retail stale (brake hold) / dead (release + disengage) logic when it stops.
+                beat = cmd_json_payload(stamp, True)
+                beat["heartbeat_only"] = True
+                atomic_write_json(cmd_path(), beat)
             self._apply_blinker("off" if release else blinker)
             if not release and float(throttle) > 1e-6:
                 gear_echo = self._echo_gear()
@@ -1190,7 +1198,7 @@ class BeamNGPyActuator:
                 cmd.reason = "not_engaged"
             return cmd
         err = self._control(
-            cmd.steer, cmd.throttle, cmd.brake, blinker=getattr(cmd, "blinker", "off"),
+            cmd.steer, cmd.throttle, cmd.brake, blinker=getattr(cmd, "blinker", "off"), stamp=cmd,
         )
         if err:
             cmd.applied = False
@@ -1234,6 +1242,19 @@ class BeamNGPyActuator:
             cmd.applied = False
             return cmd
         return self.apply(stop_command(seq=seq, reason=reason))
+
+
+def cmd_json_payload(cmd: DriveCommand, engaged: bool) -> dict[str, Any]:
+    """gvd_cmd.json body: seq + heartbeat_mtime drive the mod's dead-man (CMD_STALE_S / CMD_DEAD_S)."""
+    return {
+        "steer": float(max(-1.0, min(1.0, cmd.steer))),
+        "throttle": float(max(0.0, min(1.0, cmd.throttle))),
+        "brake": float(max(0.0, min(1.0, cmd.brake))),
+        "seq": int(cmd.seq),
+        "engaged": engaged,
+        "heartbeat_mtime": time.time(),
+        "reason": cmd.reason,
+    }
 
 
 class CmdJsonActuator:
@@ -1290,15 +1311,7 @@ class CmdJsonActuator:
                 cmd.throttle = 0.0
                 cmd.brake = 1.0
             driving = False
-        payload = {
-            "steer": float(max(-1.0, min(1.0, cmd.steer))),
-            "throttle": float(max(0.0, min(1.0, cmd.throttle))),
-            "brake": float(max(0.0, min(1.0, cmd.brake))),
-            "seq": int(cmd.seq),
-            "engaged": driving,
-            "heartbeat_mtime": time.time(),
-            "reason": cmd.reason,
-        }
+        payload = cmd_json_payload(cmd, driving)
         if self._park_hold and not driving:
             payload["throttle"] = 0.0
             payload["brake"] = 1.0

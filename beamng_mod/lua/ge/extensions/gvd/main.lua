@@ -1601,6 +1601,12 @@ local function applyCmdJson(dt)
     releaseInputs('supervisor not driving')
     return
   end
+  if cmd.heartbeat_only == true and cmdStaleAcc <= CMD_STALE_S then
+    -- Tech: BeamNGpy drives with vehicle.control; this file is its heartbeat only. Fresh: hands
+    -- off (drop a stale hold). Stale and dead below act exactly as on retail.
+    releaseInputs('tech heartbeat fresh')
+    return
+  end
   if not arcadeQueued then arcadeQueued = queueVehicle(veh, VE_ARCADE) end
   -- Judged before we push the next command, and only while we actually hold the car:
   -- force-feedback noise must not disengage, a real pedal or a sustained wheel pull must.

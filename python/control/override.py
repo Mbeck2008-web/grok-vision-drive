@@ -22,8 +22,9 @@ is conditioned before anyone believes it:
   large alternating chatter an EMA alone would only attenuate. After a `gap` (echoes missed in
   between, or a counter that stepped back) the previous sample is not this one's neighbour, so
   agreement with it proves nothing: that sample only re-seeds the spike test and the next
-  contiguous one decides. If that one agrees (no spike), it takes both intervals, so the
-  gap costs no dwell time.
+  contiguous one decides. If that one agrees (no spike), it also takes the gap sample's
+  interval, capped at one nominal echo interval (`GAP_CREDIT_MAX_S`, 100 ms), and it cannot
+  fire the takeover itself: after a gap a pull needs as many fresh echoes as a contiguous one.
 * **EMA on the residual only** — not on the inputs and not on the command. For a linear filter
   those are the same thing (`lpf(a) - lpf(b) == lpf(a - b)`), and one state is cheaper to reason
   about than three.
@@ -83,6 +84,9 @@ _CHANNEL_REASON = {"steer": REASON_STEER, "brake": REASON_BRAKE, "throttle": REA
 # also keeps a player already resting on the brake as they press Alt+A from overriding
 # themselves on the spot. Derived from lpf_tau_ms, not a separate knob.
 _WARMUP_TAUS = 3.0
+# Most a gap sample can credit to the agreeing echo after it: one nominal echo interval, the
+# mod's fixed 10 Hz echo (gvd_main EGO_POLL_S = 0.10 s). A constant, not measured per run.
+GAP_CREDIT_MAX_S = 0.10
 _CMD_RING = 256
 
 
@@ -275,6 +279,7 @@ class OverrideDetector:
         self._last_raw: float = 0.0
         # Time a gap sample held back, credited to the next contiguous sample if that agrees.
         self._gap_dt = 0.0
+        self._gap_pending = False
         self._steer_held = 0.0
         self._steer_sign = 0
         self._last_t: float | None = None
@@ -305,6 +310,7 @@ class OverrideDetector:
         self._filt = 0.0
         self._last_raw = 0.0
         self._gap_dt = 0.0
+        self._gap_pending = False
         self._steer_held = 0.0
         self._steer_sign = 0
         self._armed_at = None
@@ -371,6 +377,7 @@ class OverrideDetector:
         if not self.armed(t):
             self._steer_held = 0.0
             self._gap_dt = 0.0
+            self._gap_pending = False
             self._steer_sign = 0
             self.verdict = OverrideVerdict(armed=False)
             return self.verdict
@@ -438,17 +445,24 @@ class OverrideDetector:
         # two same-sign kicks looks like a steady pull. That sample only re-seeds the spike
         # test; the next contiguous sample decides. Contiguous echoes are never discounted,
         # spike after spike included, so a clean, sharp real pull costs nothing.
-        # The gap sample's time is not lost: if the next contiguous echo agrees with it (no
-        # spike), the two were one steady wheel and that echo takes both intervals.
+        # The gap sample's time is not all lost. If the next contiguous echo agrees with it (no
+        # spike), that echo also takes the gap sample's interval, capped at one nominal echo
+        # interval (GAP_CREDIT_MAX_S): a long gap is unobserved time, not a held wheel. That
+        # confirming echo can charge the dwell but cannot fire the takeover itself: after a gap
+        # a pull needs as many fresh echoes as a contiguous one (spike, agree, agree).
         gap_hold = bool(gap)
         spike = (not gap_hold) and abs(raw - self._last_raw) > cfg.steer_spike
         self._last_raw = raw
+        confirming = False
         if gap_hold:
-            self._gap_dt = dt
+            self._gap_dt = min(dt, GAP_CREDIT_MAX_S)
+            self._gap_pending = True
             step_dt = 0.0
         else:
-            step_dt = min(1.0, dt + (0.0 if spike else self._gap_dt))
+            confirming = self._gap_pending and not spike
+            step_dt = min(1.0, dt + (self._gap_dt if confirming else 0.0))
             self._gap_dt = 0.0
+            self._gap_pending = False
         if not spike and not gap_hold:
             self._filt += ema_alpha(step_dt, cfg.lpf_tau_s) * (raw - self._filt)
         opp = opposition(ref.steer, self._filt)
@@ -466,7 +480,7 @@ class OverrideDetector:
             self._steer_held = 0.0
             self._steer_sign = 0
         # Between exit and enter the dwell is frozen — that band is the hysteresis.
-        steer_active = mag >= cfg.steer_enter and self._steer_held >= cfg.steer_hold_s
+        steer_active = mag >= cfg.steer_enter and self._steer_held >= cfg.steer_hold_s and not confirming
 
         if pedal_channel != "none":
             channel = pedal_channel

@@ -38,7 +38,7 @@ from python.control.echo_link import (  # noqa: E402
     outdated_message,
     parse_version,
 )
-from python.control.override import OverrideConfig, OverrideDetector  # noqa: E402
+from python.control.override import GAP_CREDIT_MAX_S, OverrideConfig, OverrideDetector  # noqa: E402
 
 ECHO_HZ = 10.0          # gvd_main EGO_POLL_S
 TAKEOVER_BUDGET_MS = 100.0
@@ -319,6 +319,80 @@ def check_chatter_rule_exact() -> None:
     assert not v4.spike and not v4.gap_hold, v4
 
 
+def _scripted(echoes: list[tuple[float, int, float]], *, cmd: float, t_end: float, read_hz: float = 20.0):
+    """Gate + detector over a fixed echo timeline [(t, echo_seq, steering_input)], read at
+    `read_hz`. Returns every non-repeat (t, EchoRead, verdict)."""
+    det = OverrideDetector(OverrideConfig())
+    gate = EchoGate()
+    out = []
+    t, i, n = 0.0, -1, 0
+    while t < t_end:
+        while i + 1 < len(echoes) and echoes[i + 1][0] <= t:
+            i += 1
+        fb = None
+        if i >= 0:
+            fb = SimpleNamespace(fresh=True, echo_seq=echoes[i][1], mod_version=MIN_MOD_VERSION, steering_input=echoes[i][2])
+        r = gate.observe(engaged=True, ego_fb=fb, now=t)
+        assert r.fault is None, (t, r)
+        v = det.update(engaged=True, steering_input=None if fb is None else fb.steering_input,
+                       throttle_input=0.0, brake_input=0.0, applied_seq=None if fb is None else n,
+                       now=t, fresh=r.fresh, gap=r.gap)
+        if r.fresh:
+            out.append((round(t, 3), r, v))
+        n += 1
+        det.note_command(seq=n, steer=cmd, throttle=0.0, brake=0.0, now=t)
+        t = round(t + 1.0 / read_hz, 6)
+    return out
+
+
+def check_gap_credit_capped() -> None:
+    """A long gap is unobserved time, not a held wheel.
+
+    The interval a gap sample held back goes to the next agreeing echo, capped at one nominal
+    echo interval (GAP_CREDIT_MAX_S = 0.10 s, gvd_main EGO_POLL_S), and that confirming echo
+    cannot fire the takeover itself.
+    """
+    import python.control.override as ov
+
+    assert GAP_CREDIT_MAX_S == 0.10, GAP_CREDIT_MAX_S
+    cfg = OverrideConfig()
+    cmd = 0.2
+    base = [(0.1 * j, j, cmd) for j in range(1, 11)]  # 1 s on the command: armed, residual 0
+    t0 = base[-1][0]
+    pulled = cmd - 0.25
+    # Reviewer case: a 290 ms gap (under the 300 ms stale limit; echoes 11 and 12 missed),
+    # the echo after it a spike (a 0.25 jump), then one agreeing echo 100 ms later. No
+    # takeover through that echo and the re-reads of it.
+    tl = base + [(t0 + 0.29, 13, pulled), (t0 + 0.39, 14, pulled)]
+
+    def run(timeline):
+        return _scripted(timeline, cmd=cmd, t_end=timeline[-1][0] + 0.08)
+
+    seen = run(tl)
+    assert all(not v.active for (_t, _r, v) in seen), [(t, v.steer_held_ms, v.active) for (t, _r, v) in seen]
+    after = [(t, r, v) for (t, r, v) in seen if t > t0 + 0.2]
+    (tg, rg, vg), (ta, _ra, va) = after[:2]
+    assert rg.gap and vg.gap_hold and not va.gap_hold and not va.spike, (rg, vg, va)
+    own = (ta - tg) * 1000.0
+    # The dwell after the confirming echo: its own interval plus at most one echo interval.
+    assert va.steer_held_ms <= own + GAP_CREDIT_MAX_S * 1000.0 + 1.0, (va.steer_held_ms, own)
+    print(f"  gap credit cap {GAP_CREDIT_MAX_S * 1000:.0f} ms: 290 ms gap + spike + 1 agreeing echo -> dwell {va.steer_held_ms:.0f} ms, no takeover")
+    # Uncapped (the b7b3213 behaviour) the same echo charged the whole gap.
+    keep = ov.GAP_CREDIT_MAX_S
+    try:
+        ov.GAP_CREDIT_MAX_S = 10.0
+        unc = [v for (t, _r, v) in run(tl) if t > t0 + 0.2][1]
+    finally:
+        ov.GAP_CREDIT_MAX_S = keep
+    assert unc.steer_held_ms >= own + 280.0, (unc.steer_held_ms, own)
+    # The confirming echo charges but never fires: held on, the next echo is the takeover,
+    # the same three fresh echoes a contiguous pull needs (spike, agree, agree).
+    tl3 = base + [(t0 + 0.29, 13, pulled), (t0 + 0.39, 14, pulled), (t0 + 0.49, 15, pulled)]
+    seen3 = [(t, v) for (t, _r, v) in run(tl3) if t > t0 + 0.2]
+    assert not seen3[0][1].active and not seen3[1][1].active and seen3[2][1].active, seen3
+    assert abs(cfg.steer_hold_ms - 200.0) < 1e-9
+
+
 def _inject_around_pull(t_pull: float):
     """Skipped and repeated echo_seq around a pull, two contiguous echoes between injections
     (three gaps in a row is echo_stale by design, not what this measures):
@@ -431,6 +505,7 @@ def main() -> None:
     check_mod_version_gate()
     check_ego_parse()
     check_chatter_rule_exact()
+    check_gap_credit_capped()
     check_cmd_stop_not_stale()
     check_repeat_skip_stress()
     check_takeover_time()

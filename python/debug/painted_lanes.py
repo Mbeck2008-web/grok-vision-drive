@@ -234,7 +234,6 @@ class PaintedLanes:
             return [None] * len(ys)
         out: list[tuple[float, float] | None] = []
         walk = (_LineWalk(anchor[0]), _LineWalk(anchor[1]))
-        width = anchor[1][0] - anchor[0][0]
         y_at = 0.0
         for y in ys:
             y = float(y)
@@ -242,7 +241,7 @@ class PaintedLanes:
             while y_at < y - 1e-9:
                 y_at = min(y, y_at + FOLLOW_STEP_M)
                 lines = self._lines_at(y_at, ax, ay, bx, by, 0.0, math.inf)
-                width = _step_pair(walk, y_at, lines, width)
+                _step_pair(walk, y_at, lines)
             left, right = walk[0].here(y), walk[1].here(y)
             if left is None or right is None or not (LANE_MIN_M <= right - left <= LANE_MAX_M):
                 out.append(None)
@@ -333,9 +332,9 @@ class _LineWalk:
 
 
 def _step_pair(
-    walk: tuple[_LineWalk, _LineWalk], y: float, lines: list[tuple[float, float]], width: float,
-) -> float:
-    """Advance both lines of the lane to ``y``; returns the lane width there (or the last one).
+    walk: tuple[_LineWalk, _LineWalk], y: float, lines: list[tuple[float, float]],
+) -> None:
+    """Advance both lines of the lane to ``y`` (updates ``walk`` in place).
 
     Each line takes the paint within FOLLOW_M of its straight extension.
     Where a line forks (a lane line and an exit or edge line leaving it,
@@ -374,13 +373,11 @@ def _step_pair(
         )
         left.take(y, lb)
         right.take(y, rb)
-        return width if lb is None or rb is None else rb[0] - lb[0]
-    # One side has no paint here: the other keeps nearest its extension; the
-    # width is kept from the last step where both were seen.
+        return
+    # One side has no paint here: the other keeps nearest its extension.
     for side, cand in ((left, cl), (right, cr)):
         g = side.guess(y)
         side.take(y, min(cand, key=lambda v: abs(v[0] - g)) if cand else None)
-    return width
 
 
 class LaneTracker:

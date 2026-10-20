@@ -591,8 +591,8 @@ COLLAPSE_STD_M = 0.05
 LANE_SLOT_NAMES = (
     "c5", "l5", "r5", "c10", "l10", "r10", "c20", "l20", "r20", "c30", "l30", "r30", "heading", "conf_logit",
 )
-# Frames whose main area was all zero and were skipped in this process.
-BLANK_MAIN_SKIPS = 0
+# Loaded frames whose main area is near-black. Logged only, never dropped.
+DARK_MAIN_COUNT = 0
 # Loaded frames with a near-black trained sector other than main. Logged only:
 # a dark picture is a picture (night, tunnel); only a camera the writer did not
 # save is missing, and select_training_rows drops those rows.
@@ -944,14 +944,12 @@ def _frame_row(
         from python.train.cam_strip import scale_canvas
 
         frame = scale_canvas(frame, scale, cams)
+    # Darkness is counted, never dropped: a dark picture is a picture (night,
+    # tunnel). Missing cameras are dropped by file in select_training_rows.
     if main_area_blank(frame, cams, scale):
-        # No front picture: a black main sector with a real label. Skip it.
-        global BLANK_MAIN_SKIPS
-        BLANK_MAIN_SKIPS += 1
-        return None
-    if blank_sectors(frame, cams, scale):
-        # Counted, never dropped: missing cameras are dropped by file in
-        # select_training_rows, not guessed from darkness here.
+        global DARK_MAIN_COUNT
+        DARK_MAIN_COUNT += 1
+    if any(cam != "main" for cam in blank_sectors(frame, cams, scale)):
         global DARK_SECTOR_COUNT
         DARK_SECTOR_COUNT += 1
     if augment:
@@ -1814,11 +1812,12 @@ def train_directory(
         f"mean<{NEAR_BLACK_MEAN} or >{NEAR_BLACK_FRAC:.0%} of px below {NEAR_BLACK_LEVEL}/255"
     )
     if blank_scan is None:
-        print(f"[GVD] scene index: near-black main ({near_rule}) is skipped as rows load; no cache to count it up front", flush=True)
+        print(f"[GVD] scene index: near-black main ({near_rule}) is counted as rows load (dark_main_count), "
+              "never skipped; no cache to count it up front", flush=True)
     else:
         print(
             f"[GVD] scene index: near-black main ({near_rule}): {blank_scan[0]} of {blank_scan[1]} cached rows; "
-            "skipped when loaded (blank_main_skipped in the val line)",
+            "kept and counted when loaded (dark_main_count in the val line)",
             flush=True,
         )
     print(
@@ -2449,7 +2448,7 @@ def train_directory(
                     "pred_mean": json_num(scored.get("pred_mean")),
                     "pred_std": json_num(scored.get("pred_std")),
                     "collapse": bool(scored.get("collapse")),
-                    "blank_main_skipped": int(BLANK_MAIN_SKIPS),
+                    "dark_main_count": int(DARK_MAIN_COUNT),
                     "dark_sector_count": int(DARK_SECTOR_COUNT),
                     "cams": run_cams,
                     "lr": lr_now,
@@ -2482,7 +2481,7 @@ def train_directory(
                     f"pred_mean={scored.get('pred_mean')} pred_std={scored.get('pred_std')} "
                     f"r_long={scored.get('r_long')} rms_long={scored.get('rms_long')} "
                     f"bias_long={scored.get('bias_long')} eval_chunk={int(eval_chunk)} "
-                    f"blank_main_skipped={int(BLANK_MAIN_SKIPS)} dark_sector_count={int(DARK_SECTOR_COUNT)} "
+                    f"dark_main_count={int(DARK_MAIN_COUNT)} dark_sector_count={int(DARK_SECTOR_COUNT)} "
                     f"lr={format_lrs(lr_now)}",
                     flush=True,
                 )

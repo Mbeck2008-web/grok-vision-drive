@@ -355,10 +355,10 @@ def check_other_cams() -> None:
             return self.frames[index]
 
     before = ts.DARK_SECTOR_COUNT
-    main_before = ts.BLANK_MAIN_SKIPS
+    main_before = ts.DARK_MAIN_COUNT
     assert ts._frame_row(Path("."), {"i": 1}, cams=None, cache=Cache({1: dead})) is not None, "dark is not dropped"
     assert ts._frame_row(Path("."), {"i": 2}, cams=None, cache=Cache({2: full})) is not None
-    assert ts.DARK_SECTOR_COUNT == before + 1 and ts.BLANK_MAIN_SKIPS == main_before
+    assert ts.DARK_SECTOR_COUNT == before + 1 and ts.DARK_MAIN_COUNT == main_before
     assert not hasattr(ts, "BLANK_CAM_SKIPS")
     refused = "(torch not installed: train_directory refusal not run)"
     try:

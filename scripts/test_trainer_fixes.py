@@ -97,7 +97,7 @@ def check_black_rows() -> None:
         assert dropped == {"no_trained_cam": 2} and new_missing == 2, (dropped, new_missing)
     black = np.zeros((192, 256, 3), np.uint8)
     speck = black.copy()
-    speck[100, 10] = 7  # one lit pixel: near-black, dropped too
+    speck[100, 10] = 7  # one lit pixel: near-black too
     lit = np.random.RandomState(0).randint(20, 200, size=(192, 256, 3)).astype(np.uint8)
     assert train_scene.main_area_blank(black, ("main",))
     assert train_scene.main_area_blank(speck, ("main",))
@@ -108,11 +108,16 @@ def check_black_rows() -> None:
     full = compose_strip({"pillarL": np.full((48, 64, 3), 90, np.uint8)})
     assert full.shape[1] == CANVAS_W and train_scene.main_area_blank(full, None), "full strip, black main sector"
     cache = FakeCache({5: black, 6: lit})
-    before = train_scene.BLANK_MAIN_SKIPS
-    assert train_scene._frame_row(Path("."), {"i": 5}, cams=("main",), cache=cache) is None
+    before = train_scene.DARK_MAIN_COUNT
+    kept = train_scene._frame_row(Path("."), {"i": 5}, cams=("main",), cache=cache)
+    assert kept is not None, "a dark main frame is kept (night, tunnel), only counted"
+    assert np.asarray(kept[0]).max() == 0, "the dark frame itself is what trains"
+    assert train_scene.DARK_MAIN_COUNT == before + 1
     assert train_scene._frame_row(Path("."), {"i": 6}, cams=("main",), cache=cache) is not None
-    assert train_scene.BLANK_MAIN_SKIPS == before + 1
-    print("black rows: no-main rows dropped by select_training_rows(cams), black main area skipped by _frame_row OK")
+    assert train_scene.DARK_MAIN_COUNT == before + 1, "a lit frame is not counted"
+    assert not hasattr(train_scene, "BLANK_MAIN_SKIPS")
+    print("black rows: no-main rows dropped by select_training_rows(cams), dark main area kept and counted "
+          "(dark_main_count) by _frame_row OK")
 
 
 def _synthetic_seq(n: int, seed: int = 0):

@@ -767,19 +767,31 @@ def labelled_heads(
 ) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, dict[str, Any]]]:
     """(stamped heads, heads below the floor, per-head label counts).
 
-    A row is labelled for a head when any of its valid flags is set. Every
+    A row is labelled for ``lane_gt`` when ``lane_center_is_valid`` holds
+    (5 m and 10 m centres valid; the always-set confidence flag does not
+    count), and for the other heads when any slot's valid flag is set (each
+    flag marks one present lane, curb, object or sign). Every
     requested head gets ``labelled_rows`` and ``labelled_share`` (of
     ``rows``); it is stamped only when it clears ``min_share`` and
     ``min_rows``. A head below the floor trains mostly toward "absent"; it
     is left off ``gvd_heads`` so the live runtime never reads it.
     """
+    from python.debug.lane_targets import lane_center_is_valid
+
     wanted = tuple(heads) if heads else HEAD_NAMES
     labelled = {head: 0 for head in wanted}
     for row in rows:
         labels = labels_for_row(row)
         for head in wanted:
             valid = labels.get(HEAD_VALID.get(head, ""))
-            if valid is not None and float(np.nansum(np.asarray(valid, dtype=np.float64))) > 0:
+            if valid is None:
+                continue
+            if head == "lane_gt":
+                # The confidence slot is set on every painted label; only a
+                # usable 5 m + 10 m centre (the one --min-valid and scoring use) counts.
+                if lane_center_is_valid(valid):
+                    labelled[head] += 1
+            elif float(np.nansum(np.asarray(valid, dtype=np.float64))) > 0:
                 labelled[head] += 1
     total = len(rows)
     counts: dict[str, dict[str, Any]] = {}

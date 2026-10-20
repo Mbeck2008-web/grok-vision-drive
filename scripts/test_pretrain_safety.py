@@ -50,6 +50,8 @@
     reduced leakage, not no leakage.
 (o) a head is stamped only when its labels clear LABEL_FLOOR_SHARE (1%) and
     LABEL_FLOOR_ROWS (100); labelled_rows/share are recorded for every head.
+    A lane_gt row counts only when its 5 m and 10 m centres are valid; the
+    always-set confidence flag alone does not.
 (p) the label count runs on the rows that train (after the holdout split and
     --min-valid), not all rows: a head labelled only in val rows, or only in
     windows --min-valid drops, is not stamped.
@@ -748,7 +750,25 @@ def check_label_floor(row: dict) -> None:
         stamped, below, counts = labelled_heads([row] * good + [blank] * bad, ("lane_gt",))
         assert (stamped == ("lane_gt",)) is want and (below == ("lane_gt",)) is not want, why
         assert counts["lane_gt"]["labelled_rows"] == good and counts["lane_gt"]["stamped"] is want, (why, counts)
+    # The confidence flag alone (set on every painted label) is not a lane_gt label: only a
+    # valid 5 m + 10 m centre (lane_center_is_valid) counts.
+    from python.debug.lane_targets import LANE_GT_DIM, lane_center_is_valid
+
+    conf_only = [0.0] * LANE_GT_DIM
+    conf_only[-1] = 1.0
+    far_only = list(conf_only)
+    far_only[6:12] = [1.0] * 6  # 20 m and 30 m valid, 5 m and 10 m not
+    no_near = list(conf_only)
+    no_near[0:3] = [1.0] * 3  # 5 m valid, 10 m not
+    for mask in (conf_only, far_only, no_near):
+        assert not lane_center_is_valid(mask)
+        fake = {"tech": {"lane_gt": [0.0] * LANE_GT_DIM, "lane_gt_valid": mask}}
+        stamped, below, counts = labelled_heads([fake] * 500, ("lane_gt",))
+        assert counts["lane_gt"]["labelled_rows"] == 0 and stamped == () and below == ("lane_gt",), (mask, counts)
+    mixed = [row] * 100 + [{"tech": {"lane_gt": [0.0] * LANE_GT_DIM, "lane_gt_valid": conf_only}}] * 400
+    assert labelled_heads(mixed, ("lane_gt",))[2]["lane_gt"]["labelled_rows"] == 100
     print(f"(o) label floor {LABEL_FLOOR_SHARE:.0%} and {LABEL_FLOOR_ROWS} rows: "
+          "confidence-flag-only / far-only / 5 m-only rows count 0 and 500 of them leave lane_gt off; "
           + "; ".join(f"{why} -> {'stamped' if want else 'left off'}" for _g, _b, want, why in cases) + " OK")
 
 

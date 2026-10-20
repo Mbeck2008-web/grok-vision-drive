@@ -36,6 +36,13 @@ PRE_IMPACT_S = 2.0
 IMPACT_STALL_S = 2.0
 # Moving again this long after an impact closes it without a respawn.
 IMPACT_WINDOW_S = 8.0
+# Live yield guard (``--min-live-yield``): seconds of moving, non-settle rows
+# in the rolling window, the speed that counts as moving, the longest tick
+# credited to the window, and cuts in a row before the guard pauses.
+LIVE_YIELD_WINDOW_S = 60.0
+LIVE_YIELD_MOVING_MPS = 1.0
+LIVE_YIELD_DT_MAX_S = 0.5
+LIVE_YIELD_MAX_CUTS = 3
 
 
 def is_tipped(dir_z: float | None, up_z: float | None = None, tip_z: float = TIP_Z) -> bool:
@@ -138,6 +145,95 @@ class ImpactWatch:
     def close(self) -> None:
         self.since_impact = None
         self.stall_s = 0.0
+
+
+class YieldGuard:
+    """Rolling share of moving rows with a painted lane 10 m ahead.
+
+    ``update`` takes one written row. Rows under LIVE_YIELD_MOVING_MPS and
+    ``settle`` rows are not counted. It returns True when the last
+    ``window_s`` seconds of counted rows are full and their time-weighted
+    valid share is under ``min_yield``. The caller then cuts the spawn or
+    segment (never its frames) and calls ``cut``.
+
+    A ``min_yield`` of 0 is off. After ``max_cuts`` cuts in a row the guard
+    pauses (``paused``): it keeps measuring but stops cutting until one full
+    window at or above ``min_yield``, so a map where every road reads low
+    cannot respawn forever. A healthy full window also resets the count.
+    """
+
+    def __init__(
+        self,
+        min_yield: float = 0.0,
+        window_s: float = LIVE_YIELD_WINDOW_S,
+        max_cuts: int = LIVE_YIELD_MAX_CUTS,
+    ) -> None:
+        self.min_yield = max(0.0, float(min_yield or 0.0))
+        self.window_s = max(1.0, float(window_s))
+        self.max_cuts = max(1, int(max_cuts))
+        self.in_a_row = 0
+        self.total_cuts = 0
+        self.paused = False
+        self.rows: deque[tuple[float, bool]] = deque()
+        self.reset()
+
+    @property
+    def enabled(self) -> bool:
+        return self.min_yield > 0.0
+
+    def reset(self) -> None:
+        """Empty the window. Call on every spawn, recover and level load."""
+        self.rows.clear()
+        self.moving_s = 0.0
+        self.valid_s = 0.0
+
+    @property
+    def rate(self) -> float | None:
+        return None if self.moving_s <= 0.0 else self.valid_s / self.moving_s
+
+    @property
+    def full(self) -> bool:
+        return self.moving_s >= self.window_s - 1e-6
+
+    def update(self, dt_s: float, speed_mps: float | None, valid: bool, settling: bool) -> bool:
+        if not self.enabled:
+            return False
+        if settling or speed_mps is None or float(speed_mps) < LIVE_YIELD_MOVING_MPS:
+            return False
+        dt = min(max(0.0, float(dt_s or 0.0)), LIVE_YIELD_DT_MAX_S)
+        ok = bool(valid)
+        self.rows.append((dt, ok))
+        self.moving_s += dt
+        self.valid_s += dt if ok else 0.0
+        while self.rows and self.moving_s - self.rows[0][0] >= self.window_s - 1e-6:
+            old_dt, old_ok = self.rows.popleft()
+            self.moving_s -= old_dt
+            self.valid_s -= old_dt if old_ok else 0.0
+        if not self.full:
+            return False
+        rate = self.rate or 0.0
+        if rate >= self.min_yield:
+            self.in_a_row = 0
+            self.paused = False
+            return False
+        return not self.paused
+
+    def cut(self) -> None:
+        """Count a cut and empty the window; pause after ``max_cuts`` in a row."""
+        self.in_a_row += 1
+        self.total_cuts += 1
+        if self.in_a_row >= self.max_cuts:
+            self.paused = True
+        self.reset()
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "min_live_yield": self.min_yield,
+            "window_s": self.window_s,
+            "cuts": self.total_cuts,
+            "cuts_in_a_row": self.in_a_row,
+            "paused": self.paused,
+        }
 
 
 class Liveness:

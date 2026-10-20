@@ -23,9 +23,11 @@ from python.collect.liveness import (  # noqa: E402
     SETTLE_FLAG_S,
     TIP_DIR_Z_LIVE,
     TIP_Z,
+    LIVE_YIELD_MAX_CUTS,
     ImpactWatch,
     Liveness,
     SettleWindow,
+    YieldGuard,
     car_is_driving,
     is_tipped,
 )
@@ -88,6 +90,24 @@ def check_coverage_walks_ahead() -> None:
     assert road_ahead(a, deck2._by_id, deck2._ends)[-1][0] == 60.0
     assert paint_coverage(_Paint(lambda x, y: True), []) == 0.0
     print(f"coverage ahead ok cov={cov:.3f}")
+
+
+def check_short_probe_is_not_full_coverage() -> None:
+    """rec3 #1/#3 ramps: the walk ahead stopped after 9-14 m (1-2 probes), so a
+    painted stub scored 1.00. Missing probes under 100 m now count as unpainted."""
+    stub = _road("stub", [(0, 0), (25, 0)])  # spawn at 10 m, walk 15 m, nothing joins
+    everywhere = _Paint(lambda x, y: True)
+    deck = SpawnDeck({CITY: [stub], HIGHWAY: [], RAMP: []}, painted=everywhere, min_paint_cov=0.5)
+    assert len(sample_along(road_ahead(stub, deck._by_id, deck._ends))) == 2
+    assert abs(deck.coverage(stub) - 0.2) < 1e-9, deck.coverage(stub)
+    old = SpawnDeck({CITY: [stub], HIGHWAY: [], RAMP: []}, painted=everywhere, min_paint_cov=0.5, min_probe_m=0.0)
+    assert old.coverage(stub) == 1.0
+    # A walk of 100 m or more is scored as before.
+    long_road = _road("long", [(0, 0), (500, 0)])
+    deck = SpawnDeck({CITY: [long_road], HIGHWAY: [], RAMP: []}, painted=everywhere, min_paint_cov=0.5)
+    assert deck.coverage(long_road) == 1.0
+    assert paint_coverage(everywhere, [(0.0, 0.0, 0.0, 1.0, 0.0)], min_samples=10) == 0.1
+    print("short probe: a 15 m walk scores 0.20, not 1.00; 100 m+ unchanged")
 
 
 def _pools(low: int, high: int, kind: str = CITY) -> dict:
@@ -344,9 +364,10 @@ def check_damage_and_up_are_read() -> None:
 class _CrashVehicle:
     """10 m/s, a crash to 0.2 m/s, stopped, then driving again, then the stop file."""
 
-    def __init__(self, stop: Path, speed_at=None, stop_at: int = 120) -> None:
+    def __init__(self, stop: Path, speed_at=None, stop_at: int = 120, damage_at=None) -> None:
         self.stop = stop
         self.speed_at = speed_at or (lambda n: 10.0 if n <= 40 or n > 75 else 0.2)
+        self.damage_at = damage_at
         self.stop_at = int(stop_at)
         self.polls = 0
         self.commands: list[str] = []
@@ -364,6 +385,8 @@ class _CrashVehicle:
     def poll_sensors(self) -> None:
         self.polls += 1
         self._set(float(self.speed_at(self.polls)))
+        if self.damage_at is not None:
+            self.state["damage"] = float(self.damage_at(self.polls))
         if self.polls >= self.stop_at:
             self.stop.write_text("stop", encoding="utf-8")
 
@@ -541,8 +564,129 @@ def check_weave_guard_runs() -> None:
     print(f"weave guard: unpainted weave blocked, off by default, line end after {len(weave_rows)} rows")
 
 
+def _rows(out: Path) -> list[dict]:
+    return [json.loads(line) for line in (out / "state.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def check_impact_on_an_abort_tick_names_a_row() -> None:
+    """The crash tick also aborts on damage, so it writes no row; the impact
+    still names the last written row (rec3 had two ``i: null`` events)."""
+    code, text, out = _run_collector({"damage_at": lambda n: 0.0 if n <= 40 else 1000.0}, ["--no-excursions"])
+    assert code == 0, (code, text)
+    assert "collect impact current#0 decel=98.0" in text and "collect abort damage" in text, text[-2000:]
+    rows = _rows(out)
+    events = [json.loads(line) for line in (out / "impacts.jsonl").read_text(encoding="utf-8").splitlines()]
+    hits = [e for e in events if e["kind"] == "impact"]
+    assert len(hits) == 1, events
+    ev = hits[0]
+    assert isinstance(ev["i"], int) and ev["i_row"] == "previous", ev
+    by_i = {int(r["i"]): r for r in rows}
+    assert ev["i"] in by_i, ev
+    # The mocked loop runs faster than the wall clock, so go by index: the
+    # named row is the one right before the recover row that follows the abort.
+    i_rec = min(int(r["i"]) for r in rows if r.get("recover"))
+    assert ev["i"] == i_rec - 1, (ev, i_rec)
+    assert not any(r.get("impact") for r in rows)  # the impact tick itself has no row
+    assert ev["pre_i0"] in by_i and ev["pre_i0"] < ev["i"]
+    # The normal path still names the impact row itself.
+    code, text, out = _run_collector({}, ["--no-excursions"])
+    ev2 = [json.loads(line) for line in (out / "impacts.jsonl").read_text(encoding="utf-8").splitlines()][0]
+    row = [r for r in _rows(out) if r.get("impact")][0]
+    assert ev2["i"] == row["i"] and ev2["i_row"] == "impact", (ev2, row["i"])
+    print(f"impact on an abort tick -> i={ev['i']} (previous row), normal impact -> its own row i={ev2['i']}")
+
+
+def check_yield_guard() -> None:
+    off = YieldGuard(0.0)
+    assert not off.enabled and not any(off.update(0.1, 10.0, False, False) for _ in range(2000))
+    g = YieldGuard(0.25)
+    fired = [n for n in range(1, 700) if g.update(0.1, 10.0, False, False)]
+    assert fired and fired[0] in (600, 601), fired[:3]  # a full 60 s of moving rows first
+    # Settle rows, stopped rows and a missing speed are not counted.
+    g = YieldGuard(0.25)
+    assert not any(g.update(0.1, 10.0, False, True) for _ in range(1000))
+    assert not any(g.update(0.1, 0.5, False, False) for _ in range(1000))
+    assert not any(g.update(0.1, None, False, False) for _ in range(1000))
+    assert g.moving_s == 0.0
+    # A long tick is credited at most 0.5 s.
+    g.update(5.0, 10.0, False, False)
+    assert abs(g.moving_s - 0.5) < 1e-9
+    # 30% valid stays; 20% valid cuts.
+    for share, cuts in ((3, False), (2, True)):
+        g = YieldGuard(0.25)
+        fire = [g.update(0.1, 10.0, (n % 10) < share, False) for n in range(800)]
+        assert any(fire) is cuts, (share, g.rate)
+    # Cut empties the window; three cuts in a row pause it until a healthy window.
+    g = YieldGuard(0.25)
+    for k in range(LIVE_YIELD_MAX_CUTS):
+        n = 0
+        while not g.update(0.1, 10.0, False, False):
+            n += 1
+            assert n < 700
+        assert n + 1 in (600, 601), n
+        g.cut()
+        assert g.moving_s == 0.0 and g.in_a_row == k + 1
+    assert g.paused and g.total_cuts == LIVE_YIELD_MAX_CUTS
+    assert not any(g.update(0.1, 10.0, False, False) for _ in range(2000))
+    assert not any(g.update(0.1, 10.0, True, False) for _ in range(600))
+    assert not g.paused and g.in_a_row == 0
+    assert any(g.update(0.1, 10.0, False, False) for _ in range(700))
+    # Reset (a spawn) empties the window without counting a cut.
+    g = YieldGuard(0.25)
+    for _ in range(590):
+        g.update(0.1, 10.0, False, False)
+    g.reset()
+    assert not any(g.update(0.1, 10.0, False, False) for _ in range(590)) and g.total_cuts == 0
+    import scripts.collect_scene_lanes as collect
+
+    assert collect.low_yield_plan(True, 500.0, 100.0, 0.0) == ("respawn", 0.0)
+    assert collect.low_yield_plan(False, None, 100.0, 0.0) == ("keep", 0.0)
+    assert collect.low_yield_plan(False, 720.0, 100.0, 20.0) == ("segment_end", 620.0)
+    tech = {"lane_gt_valid": [1.0, 1.0, 1.0, 0.0, 1.0, 1.0] + [1.0] * 8}
+    assert collect.label_valid_at(tech, 5.0) and not collect.label_valid_at(tech, 10.0)
+    assert not collect.label_valid_at({}, 10.0)
+    print("yield guard: off at 0, 60 s window, settle/stopped ignored, pauses after 3 cuts, re-arms")
+
+
+def check_yield_guard_runs() -> None:
+    """Unpainted mock level: the guard logs 3 cuts with position and roads, then
+    pauses. Every row is kept. Off by default; painted everywhere, no cut."""
+    args = {"speed_at": lambda n: 10.0, "stop_at": 2600}
+    code, text, out = _run_collector(args, ["--no-excursions", "--min-live-yield", "0.25"])
+    assert code == 0, (code, text[-2000:])
+    lines = [line for line in text.splitlines() if line.startswith("collect low_yield current#0")]
+    assert len(lines) == LIVE_YIELD_MAX_CUTS, lines
+    assert all("valid10=0.00 < 0.25 over 60s moving pos=(0.4,12.0,0.5) road=r spawn_road=na" in s for s in lines), lines
+    assert all(s.endswith("-> keep") for s in lines), lines  # no deck and no map rotation here
+    assert "collect low_yield paused after 3 cuts in a row" in text
+    cuts = [json.loads(line) for line in (out / "cuts.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [c["kind"] for c in cuts] == ["low_yield"] * LIVE_YIELD_MAX_CUTS
+    rows = _rows(out)
+    ids = [int(r["i"]) for r in rows]
+    assert ids == list(range(len(ids))), "rows were dropped"
+    assert all(c["i"] in ids and c["road"] == "r" and c["pos"] == [0.4, 12.0, 0.5] and c["action"] == "keep" for c in cuts), cuts
+    gaps = [b["done_s"] - a["done_s"] for a, b in zip(cuts, cuts[1:])]
+    assert all(59.0 <= g <= 61.5 for g in gaps), gaps
+    status = json.loads((out / "collect.json").read_text(encoding="utf-8"))
+    assert status.get("live_yield", {}).get("cuts") == LIVE_YIELD_MAX_CUTS, status
+    code, text_off, out_off = _run_collector(args, ["--no-excursions"])
+    assert code == 0 and "low_yield" not in text_off and not (out_off / "cuts.jsonl").exists()
+    assert len(_rows(out_off)) == len(rows), (len(_rows(out_off)), len(rows))
+    import scripts.collect_scene_lanes as collect
+
+    previous = collect.painted_for
+    collect.painted_for = lambda level: _Paint(lambda x, y: True)  # type: ignore[assignment]
+    try:
+        code, text_ok, out_ok = _run_collector(args, ["--no-excursions", "--min-live-yield", "0.25"])
+    finally:
+        collect.painted_for = previous  # type: ignore[assignment]
+    assert code == 0 and "low_yield" not in text_ok, text_ok[-1500:]
+    print(f"yield guard run: {len(lines)} cuts 60 s apart then paused, {len(rows)} rows kept, off by default")
+
+
 def main() -> None:
     check_coverage_walks_ahead()
+    check_short_probe_is_not_full_coverage()
     check_deck_skips_and_logs()
     check_deck_disabled_is_unchanged()
     check_deck_fallback_and_next_kind()
@@ -555,6 +699,9 @@ def main() -> None:
     check_spawn_mix_summary()
     check_damage_and_up_are_read()
     check_collector_impact_rows()
+    check_impact_on_an_abort_tick_names_a_row()
+    check_yield_guard()
+    check_yield_guard_runs()
     check_weave_guard_runs()
     print("collect spawn fix ok")
 

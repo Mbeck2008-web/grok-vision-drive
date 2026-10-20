@@ -55,7 +55,11 @@ Row fields in ``state.jsonl`` written by this collector, besides the frame data:
 "i", "pre_t0", "pre_i0", ...}`` line per impact and one ``{"kind":
 "impact_end", "t", "how"}`` line when it ends (``respawn``, ``drove_on``, or
 the abort reason). ``t`` matches the row ``t`` exactly; ``i`` is the row index
-the writer was expected to assign. A trainer masks rows in [pre_t0, end t].
+the writer was expected to assign (``i_row`` ``impact``). When the impact
+tick itself is not written (the same tick aborts on damage, or the writer
+queue is full), ``i`` is the last written row before it and ``i_row`` is
+``previous``; ``t`` is still the impact time. A trainer masks rows in
+[pre_t0, end t].
 ``impacts.jsonl`` is not a complete crash list: it only sees a longitudinal
 speed drop, so a sideswipe or a scrape that keeps the speed is missed, and a
 gap between ticks over 0.5 s (a stalled loop, a teleport) is never scored.
@@ -63,6 +67,20 @@ gap between ticks over 0.5 s (a stalled loop, a teleport) is never scored.
 The spawn deck logs ``select_ms`` on every spawn and a ``collect spawn mix``
 line with the per-kind counts, cross-kind and best-seen fallbacks each
 minute. The same summary is ``spawn_mix`` in both collect.json files.
+
+``--min-live-yield`` (default 0, off) watches the share of moving, non-settle
+rows whose painted label is valid 10 m ahead, over the last 60 s of them.
+Under the threshold it cuts: on west coast it takes the next deck spawn,
+elsewhere it skips to the next scheduled segment. Rows already written stay;
+the clock is not rolled back, so no recorded minute is lost and the cut does
+not count toward the 20% recover budget. Each cut is a ``collect low_yield``
+line and a ``cuts.jsonl`` record with the reason, position, the road the car
+is on and the spawn road. After 3 cuts in a row the guard pauses until a full
+window reads at or above the threshold, so it cannot respawn forever.
+Trade-off: the guard keeps only roads the current painted labeler already
+handles (bridges whose edge line is not a decal, tunnels, dirt). It biases
+the data toward those roads, and a labeler fix later would have found
+labels on the stretches it cut.
 """
 from __future__ import annotations
 
@@ -317,6 +335,15 @@ def build_parser() -> argparse.ArgumentParser:
             "and end an excursion before its 60 m line runs out."
         ),
     )
+    parser.add_argument(
+        "--min-live-yield",
+        type=float,
+        default=0.0,
+        help=(
+            "Cut the spawn (west coast) or the segment when under this share of the last 60 s of "
+            "moving rows has a painted label 10 m ahead. 0 (default) is off. Frames are kept."
+        ),
+    )
     return parser
 
 
@@ -340,6 +367,32 @@ def weave_guard_reason(share: float, fork_m: float | None, min_share: float, jun
     if fork_m is not None and float(fork_m) < float(junction_m):
         return "junction_ahead"
     return "open"
+
+
+def label_valid_at(tech: dict[str, Any] | None, ahead_m: float = 10.0) -> bool:
+    """True when the label's center slot at ``ahead_m`` is valid."""
+    from python.debug.lane_targets import LOOKAHEADS_M, SLOT_CENTER, lookahead_slot
+
+    try:
+        k = [float(v) for v in LOOKAHEADS_M].index(float(ahead_m))
+        return float(((tech or {}).get("lane_gt_valid") or [])[lookahead_slot(k, SLOT_CENTER)]) > 0.5
+    except (IndexError, TypeError, ValueError):
+        return False
+
+
+def low_yield_plan(can_respawn: bool, boundary: float | None, done_s: float, cut_s: float) -> tuple[str, float]:
+    """``(action, schedule_cut)`` for a low-yield cut.
+
+    ``respawn``: west coast, the next deck road. ``segment_end``: skip the
+    rest of this scheduled piece; like a hard segment end, ``done_s`` stays,
+    so the skipped minutes are recorded on later pieces. ``keep``: nothing to
+    cut to (no deck and no map rotation).
+    """
+    if can_respawn:
+        return "respawn", float(cut_s)
+    if boundary is None:
+        return "keep", float(cut_s)
+    return "segment_end", float(cut_s) + max(0.0, float(boundary) - (float(done_s) + float(cut_s)))
 
 
 def polyline_length(points: list[tuple[float, float]] | None) -> float:
@@ -398,6 +451,7 @@ def share_maps(maps: tuple[str, ...], weights: dict[str, float]) -> list[tuple[s
 # real stall and settle seconds past this much of the plan, end the run.
 HARD_SEGMENT_REASONS = ("stationary", "tipped", "damage", "impact")
 IMPACTS_FILE = "impacts.jsonl"
+CUTS_FILE = "cuts.jsonl"
 # An excursion line is WINDOW_M (60 m) long. With --weave-guard the move ends
 # this far before the line runs out, instead of driving past its end.
 LINE_END_MARGIN_M = 5.0
@@ -1117,6 +1171,7 @@ def main(argv: list[str] | None = None) -> int:
             SETTLE_S,
             SettleWindow,
             TIP_DIR_Z_LIVE,
+            YieldGuard,
             car_is_driving,
         )
         from python.collect.excursion import JUNCTION_AHEAD_M, fork_ahead_m
@@ -1124,8 +1179,11 @@ def main(argv: list[str] | None = None) -> int:
         live = Liveness()
         impact = ImpactWatch()
         settle = SettleWindow()
+        yield_guard = YieldGuard(float(getattr(args, "min_live_yield", 0.0) or 0.0))
+        last_row_i: int | None = None
         line_left_m: float | None = None
         spawn_cov: float | None = None
+        spawn_road: str | None = None
         damage_seen = False
         damage_warned = False
         row_base = getattr(getattr(writer, "writer", None), "_n", None)
@@ -1194,6 +1252,8 @@ def main(argv: list[str] | None = None) -> int:
             payload["until_disk"] = bool(until_disk)
             if spawn_deck is not None:
                 payload["spawn_mix"] = spawn_deck.summary()
+            if yield_guard.enabled:
+                payload["live_yield"] = yield_guard.summary()
             if target_s == float("inf"):
                 payload["target_s"] = None
             write_collect_status(status_root, payload)
@@ -1298,6 +1358,7 @@ def main(argv: list[str] | None = None) -> int:
                     spawn_pos = moved
                     mark_recover = True
                     impact.reset()
+                    yield_guard.reset()
                     settle.start(done_s)
                     return None
             last_error = message
@@ -1310,6 +1371,7 @@ def main(argv: list[str] | None = None) -> int:
         def _apply_spawn(force: bool) -> None:
             """Teleport west coast to the next unused stratified spawn."""
             nonlocal spawn_deck, spawn_kind, spawn_mark, spawn_pos, last_ai, segment_open, speed, spawn_cov
+            nonlocal spawn_road
             if map_name != "west_coast_usa" or vehicle is None:
                 return
             if not force and (respawn_s <= 0.0 or done_s - spawn_mark < respawn_s):
@@ -1359,9 +1421,11 @@ def main(argv: list[str] | None = None) -> int:
                 return
             spawn_kind = picked.kind
             spawn_cov = picked.paint_cov
+            spawn_road = str(picked.road_id)
             spawn_mark = done_s
             spawn_pos = picked.pos
             impact.reset()
+            yield_guard.reset()
             settle.start(done_s)
             speed_span[0] = speeds_for(picked.speed[0], picked.speed[1])
             speed = speed_at(done_s, tuple(speed_span[0]))
@@ -1383,7 +1447,12 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         def _spawn_extra() -> dict[str, Any] | None:
-            return None if spawn_deck is None else {"spawn_mix": spawn_deck.summary()}
+            extra: dict[str, Any] = {}
+            if spawn_deck is not None:
+                extra["spawn_mix"] = spawn_deck.summary()
+            if yield_guard.enabled:
+                extra["live_yield"] = yield_guard.summary()
+            return extra or None
 
         def _save_progress(done: float, target: float) -> None:
             save_progress(progress_path, done, target, _spawn_extra())
@@ -1454,6 +1523,7 @@ def main(argv: list[str] | None = None) -> int:
                 prev_dir_t = None
                 last_cam = {}
                 impact.reset()
+                yield_guard.reset()
                 settle.start(done_s)
                 line_left_m = None
                 if vary_env:
@@ -1820,6 +1890,10 @@ def main(argv: list[str] | None = None) -> int:
                 why = "impact"
             if why:
                 if impact_event is not None:
+                    # This tick aborts before its row is written: name the
+                    # last written row so every impact maps to a real row.
+                    impact_event["i"] = last_row_i
+                    impact_event["i_row"] = "previous"
                     append_jsonl(out / IMPACTS_FILE, impact_event)
                     impact_event = None
                 _impact_end("respawn" if why == "impact" else why, now)
@@ -1875,10 +1949,16 @@ def main(argv: list[str] | None = None) -> int:
                 tags=tags,
             )
             if impact_event is not None:
-                impact_event["i"] = row_i if queued else None
+                impact_event["i"] = row_i if queued else last_row_i
+                impact_event["i_row"] = "impact" if queued else "previous"
                 append_jsonl(out / IMPACTS_FILE, impact_event)
+            yield_fire = False
             if queued:
                 impact.note_row(now, row_i)
+                last_row_i = row_i
+                yield_fire = yield_guard.update(
+                    tick_dt, speed_mps_f, label_valid_at(tech, 10.0), settle.active(done_s)
+                )
             if damage_f is not None:
                 damage_seen = True
             elif not damage_seen and not damage_warned and meter.frames >= DAMAGE_WARN_ROWS:
@@ -1904,6 +1984,65 @@ def main(argv: list[str] | None = None) -> int:
             except TypeError:
                 gt_ok = False
             meter.note(set(frames), gt_ok)
+            if yield_fire:
+                # Cut the spawn or segment, never its rows. See --min-live-yield.
+                rate = yield_guard.rate or 0.0
+                yield_guard.cut()
+                here = None if pos is None else [round(float(v), 2) for v in list(pos)[:3]]
+                road_here = None if hit is None else (str(getattr(hit, "road_id", "") or "") or None)
+                kind_was, road_was = spawn_kind or None, spawn_road
+                can_respawn = map_name == "west_coast_usa" and vehicle is not None and spawn_deck is not None
+                boundary = None if can_respawn else segment_boundary(
+                    done_s + schedule_cut,
+                    map_names,
+                    segment_s,
+                    map_weights or None,
+                    None if target_s == float("inf") else target_s,
+                )
+                plan, new_cut = low_yield_plan(can_respawn, boundary, done_s, schedule_cut)
+                if plan == "respawn":
+                    mark = spawn_mark
+                    _apply_spawn(True)
+                    if spawn_mark == mark:
+                        plan = "keep"
+                elif plan == "segment_end":
+                    schedule_cut = new_cut
+                    segment_open = False
+                where = "na" if here is None else f"({here[0]:.1f},{here[1]:.1f},{here[2]:.1f})"
+                print(
+                    f"collect low_yield {segment_id} {kind_was or '-'} valid10={rate:.2f} "
+                    f"< {yield_guard.min_yield:.2f} over {yield_guard.window_s:.0f}s moving pos={where} "
+                    f"road={road_here or 'na'} spawn_road={road_was or 'na'} "
+                    f"cut {yield_guard.in_a_row}/{yield_guard.max_cuts} -> {plan}",
+                    flush=True,
+                )
+                append_jsonl(
+                    out / CUTS_FILE,
+                    {
+                        "kind": "low_yield",
+                        "t": round(float(now), 6),
+                        "i": last_row_i,
+                        "segment": segment_id,
+                        "map": map_name or None,
+                        "spawn_type": kind_was,
+                        "spawn_road": road_was,
+                        "road": road_here,
+                        "pos": here,
+                        "valid10": round(float(rate), 4),
+                        "min_live_yield": yield_guard.min_yield,
+                        "window_s": yield_guard.window_s,
+                        "cut_in_a_row": yield_guard.in_a_row,
+                        "action": plan,
+                        "done_s": round(float(done_s), 3),
+                    },
+                )
+                if yield_guard.paused:
+                    print(
+                        f"collect low_yield paused after {yield_guard.in_a_row} cuts in a row; "
+                        f"cuts again after a {yield_guard.window_s:.0f}s window at or above "
+                        f"{yield_guard.min_yield:.2f}",
+                        flush=True,
+                    )
             time.sleep(tick_sleep_s(time.monotonic() - tick_mark, 0.1))
             tick_dt = max(1e-3, time.monotonic() - tick_mark)
             done_s += tick_dt

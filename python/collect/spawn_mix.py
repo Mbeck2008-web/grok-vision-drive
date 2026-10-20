@@ -44,6 +44,10 @@ PAINT_JOIN_M = 8.0
 PAINT_JOIN_COS = 0.5
 # Low-coverage candidates looked at per kind before falling back.
 PAINT_MAX_TRIES = 40
+# The walk ahead stops at a dead end or where no road end joins (a ramp that
+# merges into the middle of a highway). A walk shorter than this counts its
+# missing probes as unpainted, so a 9 m stub with one lucky probe is not 1.00.
+PAINT_MIN_PROBE_M = 100.0
 
 
 @dataclass(frozen=True)
@@ -195,10 +199,13 @@ def paint_coverage(
     *,
     oneway: bool = False,
     probe_y_m: float = PAINT_PROBE_Y_M,
+    min_samples: int = 0,
 ) -> float:
     """Share of ``samples`` where ``painted.lane_at`` finds the ego lane at ``probe_y_m``.
 
     ``painted`` only needs ``lane_at(pos, direction, ys)``. No samples is 0.
+    Fewer than ``min_samples`` samples divide by ``min_samples``: the missing
+    ones count as unpainted.
     """
     if not samples:
         return 0.0
@@ -211,7 +218,7 @@ def paint_coverage(
             if got and got[0] is not None:
                 good += 1
                 break
-    return good / float(len(samples))
+    return good / float(max(len(samples), int(min_samples)))
 
 
 def _pose_at(points: list[tuple[float, float, float]], fraction: float = 0.4) -> tuple[
@@ -346,6 +353,7 @@ class SpawnDeck:
         min_paint_cov: float = 0.0,
         max_tries: int = PAINT_MAX_TRIES,
         log: Callable[[str], None] | None = None,
+        min_probe_m: float = PAINT_MIN_PROBE_M,
     ) -> None:
         self.pools = {kind: list(pools.get(kind) or []) for kind in KINDS}
         self.rng = rng or random.Random(0)
@@ -357,6 +365,7 @@ class SpawnDeck:
         self.min_paint_cov = max(0.0, float(min_paint_cov or 0.0))
         self.max_tries = max(1, int(max_tries))
         self.log = log
+        self.min_samples = max(0, int(round(float(min_probe_m or 0.0) / PAINT_STEP_M)))
         self.skipped = 0
         # Picks of a kind other than the one the mix asked for, and picks of
         # the best-covered skipped road because nothing passed. One pick can
@@ -387,9 +396,14 @@ class SpawnDeck:
         return self.painted is not None and bool(self.painted) and self.min_paint_cov > 0.0
 
     def coverage(self, road: dict[str, Any]) -> float:
-        """Paint coverage over the next ``PAINT_AHEAD_M`` from this road's spawn point."""
+        """Paint coverage over the next ``PAINT_AHEAD_M`` from this road's spawn point.
+
+        A walk under ``min_probe_m`` scores its missing probes as unpainted.
+        """
         chain = road_ahead(road, self._by_id, self._ends, PAINT_AHEAD_M)
-        return paint_coverage(self.painted, sample_along(chain), oneway=bool(road["oneway"]))
+        return paint_coverage(
+            self.painted, sample_along(chain), oneway=bool(road["oneway"]), min_samples=self.min_samples
+        )
 
     def _say(self, text: str) -> None:
         if self.log is not None:

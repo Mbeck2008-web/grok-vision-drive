@@ -885,6 +885,7 @@ def gate_reason(
     *,
     weave_lane_w: float | None = None,
     half_width_m: float | None = None,
+    paint_lane: tuple[float, float] | None = None,
 ) -> str:
     """Why ``phase`` cannot start, or ``open``.
 
@@ -894,6 +895,15 @@ def gate_reason(
     ``speed_mps`` sizes the weave (``weave_plan``); a weave needs
     ``max(WINDOW_M, weave_length_m(v))`` of road. ``weave_lane_w`` /
     ``half_width_m`` are the painted lane width and the ego half width.
+
+    The gate judges the line that would be sent, not a separate coarse one.
+    The window walk uses the sent-line builder (``_chain`` at PATH_STEP_M,
+    the walk ``excursion_path`` makes), and once that window is clear the
+    line itself is built with ``excursion_path`` from the same inputs
+    (``paint_lane`` is the painted lane at the car, as the collector passes
+    it). A line it refuses closes the gate with that reason (no_path,
+    narrow, road_edge, lat_acc, line_kink, line_gap). ``_span`` (8 m) is only
+    for ``near_junction`` and ``fork_ahead_m``.
     """
     if phase not in ACTIVE or hit is None or not roads:
         return "no_hit"
@@ -927,7 +937,7 @@ def gate_reason(
                                road_width_m=float(road.width_m))
             if spec is not None:
                 need = max(need, maneuver_length_m(phase, float(spec[0]), speed_mps))
-    length, fork_at, span = _span(roads, road, x, y, heading, need)
+    length, fork_at, span, _samples = _chain(roads, road, x, y, heading, need, PATH_STEP_M)
     # Weaves stay in the lane, so a driveway does not block them.
     # A lane change does not start when a fork is inside 40 m.
     if phase != "weave" and fork_at is not None and fork_at < JUNCTION_AHEAD_M:
@@ -936,6 +946,16 @@ def gate_reason(
         return "short"
     if span / max(length, 1.0) >= CURVATURE_MAX:
         return "curve"
+    info: dict = {}
+    points, _used = excursion_path(
+        roads, x, y, heading, Excursion(phase, 0.0, 0.0, 1, ""), hit,
+        speed_mps if speed_mps else None,  # type: ignore[arg-type]
+        paint_lane=paint_lane if phase == "weave" else None,
+        half_width_m=half_width_m,
+        info=info,
+    )
+    if points is None:
+        return str(info.get("refused") or "no_path")
     return "open"
 
 
@@ -949,8 +969,9 @@ def fork_ahead_m(
 ) -> float | None:
     """Distance to the first side road on this road's continuation, or None.
 
-    The same walk ``gate_reason`` uses. The weave gate ignores it; the
-    collector's ``--weave-guard`` does not.
+    The 8 m ``_span`` walk (the same roads and joins ``gate_reason`` walks,
+    coarser samples). The weave gate ignores it; the collector's
+    ``--weave-guard`` does not.
     """
     if hit is None or not roads:
         return None

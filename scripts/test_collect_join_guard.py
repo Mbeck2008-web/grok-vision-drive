@@ -20,7 +20,8 @@ than JOIN_DZ_M.
 
 Backstop (``sent_line_fault``): line_kink over LINE_KINK_M, line_gap over
 LINE_GAP_M, on synthetic lines and on rec5b row 27739 replayed with the old
-join rule.
+join rule. Gate: ``gate_reason`` builds that same line and closes on its
+refusal.
 """
 from __future__ import annotations
 
@@ -279,6 +280,34 @@ def check_rec5b(roads: list[RoadPoly]) -> list[str]:
     return out
 
 
+def check_gate(roads: list[RoadPoly]) -> str:
+    """The gate judges the line it would send (same inputs as the start)."""
+    c = REC5B_27739
+
+    def gate() -> str:
+        return exc.gate_reason(roads, c["hit"], c["x"], c["y"], c["heading"], "weave", c["v"],
+                               weave_lane_w=c["paint_lane"][1] - c["paint_lane"][0], half_width_m=1.01,
+                               paint_lane=c["paint_lane"])
+
+    assert gate() == "open", gate()
+    saved = exc.road_ahead_split
+    try:
+        exc.road_ahead_split = _old_road_ahead_split
+        # The window alone (length, curvature) is clear on the old join, at
+        # both steps: the 8 m _span walk the gate used to read, and the 4 m walk.
+        need = max(exc.WINDOW_M, exc.weave_length_m(c["v"]))
+        road = next(r for r in roads if r.road_id == c["hit"].road_id)
+        for length, _fork, span in (exc._span(roads, road, c["x"], c["y"], c["heading"], need),
+                                    exc._chain(roads, road, c["x"], c["y"], c["heading"], need, PATH_STEP_M)[:3]):
+            assert length + 1e-3 >= need and span / max(length, 1.0) < exc.CURVATURE_MAX, (length, span)
+        old_gate = gate()
+    finally:
+        exc.road_ahead_split = saved
+    # The sent line on that join jumps 10.55 m: the gate stays closed.
+    assert old_gate == "line_gap", old_gate
+    return "gate: rec5b 27739 open on the new join; on the old join the window is clear but the line is line_gap"
+
+
 def main() -> None:
     roads, _payload = load_road_dump(ROADS_PATH)
     assert roads and all(r.z is not None for r in roads), "fixture roads should carry z"
@@ -286,6 +315,7 @@ def main() -> None:
     lines = [check_constants(), check_fork(roads, byid), check_garage(roads, byid), check_sharp(roads, byid)]
     lines += check_backstop_synthetic()
     lines += check_rec5b(roads)
+    lines.append(check_gate(roads))
     for line in lines:
         print(line)
     print("collect join guard ok")

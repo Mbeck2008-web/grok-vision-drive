@@ -2534,16 +2534,19 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 and pos is not None
             ):
                 kind = clock.peek_kind(lanes_here)
+                # The gate builds the line it would send (excursion_path, same
+                # inputs as the start below), so a refused line keeps cruising
+                # instead of opening the gate and aborting no_path.
                 gate = gate_reason(
                     roads, hit, float(pos[0]), float(pos[1]), heading, kind, v_plan,
-                    weave_lane_w=paint_w_now, half_width_m=ego_half_w,
+                    weave_lane_w=paint_w_now, half_width_m=ego_half_w, paint_lane=paint_lane_now,
                 )
                 if gate != "open" and kind != "weave":
                     # A lane change needs a second lane and a clear stretch.
                     # An in-lane weave does not.
                     weave = gate_reason(
                         roads, hit, float(pos[0]), float(pos[1]), heading, "weave", v_plan,
-                        weave_lane_w=paint_w_now, half_width_m=ego_half_w,
+                        weave_lane_w=paint_w_now, half_width_m=ego_half_w, paint_lane=paint_lane_now,
                     )
                     kind = "weave"
                     gate = weave

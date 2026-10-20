@@ -12,6 +12,10 @@
 (c) the holdout forward (``_eval_sequence`` via ``eval_resets``) clears every
     stream wherever ``should_reset_state`` is true, at the same rows
     ``recording_spans`` starts a training span.
+(d) the effective LR per group (from ``opt.param_groups``) is logged every
+    epoch and in the val line and metrics record; on resume ``lr_mult`` is
+    re-set from --backbone-lr-mult before the rate is pinned, so a paused
+    0.1 multiplier cannot leave the backbone at 1e-4 under --lr 1e-3.
 """
 from __future__ import annotations
 
@@ -185,7 +189,61 @@ def check_eval_resets() -> None:
           "chunk resets stay every 16 rows on stream 0 OK")
 
 
+def check_lr_logging() -> None:
+    from python.train import train_scene as ts
+
+    class Opt:
+        def __init__(self) -> None:
+            # What load_state_dict restores from a pause made with --backbone-lr-mult 0.1.
+            self.param_groups = [
+                {"name": "head", "lr": 1e-3, "lr_mult": 1.0},
+                {"name": "backbone", "lr": 1e-4, "lr_mult": 0.1},
+            ]
+
+    stale = Opt()
+    ts._pin_optimizer_lr(stale, 1e-3)
+    assert ts.effective_lrs(stale) == {"head": 1e-3, "backbone": 1e-4}  # the old resume path
+    fixed = Opt()
+    ts.set_lr_mults(fixed, 1.0)
+    ts._pin_optimizer_lr(fixed, 1e-3)
+    rates = ts.effective_lrs(fixed)
+    assert rates == {"head": 1e-3, "backbone": 1e-3}, rates
+    assert ts.format_lrs(rates) == "head:0.001,backbone:0.001"
+    half = Opt()
+    ts.set_lr_mults(half, 0.5)
+    ts._pin_optimizer_lr(half, 1e-3)
+    assert ts.effective_lrs(half) == {"head": 1e-3, "backbone": 5e-4}
+    plain = type("O", (), {"param_groups": [{"lr": 1e-3}]})()
+    ts.set_lr_mults(plain, 0.1)
+    ts._pin_optimizer_lr(plain, 1e-3)
+    assert ts.effective_lrs(plain) == {"group0": 1e-3}, "scratch net: one group, never lowered"
+    source = Path(ts.__file__).read_text(encoding="utf-8")
+    assert '"lr": lr_now,' in source and "lr={format_lrs(lr_now)}" in source
+    assert source.count("set_lr_mults(holder[\"opt\"], float(backbone_lr_mult))") == 1
+    real = ""
+    try:
+        import torch
+    except ImportError:
+        real = " (torch not installed: AdamW round trip skipped)"
+    else:
+        a = torch.nn.Linear(2, 2)
+        b = torch.nn.Linear(2, 2)
+        saved = torch.optim.AdamW([{"params": a.parameters(), "name": "head", "lr": 1e-3, "lr_mult": 1.0},
+                                   {"params": b.parameters(), "name": "backbone", "lr": 1e-4, "lr_mult": 0.1}])
+        opt = torch.optim.AdamW([{"params": a.parameters(), "name": "head", "lr": 1e-3, "lr_mult": 1.0},
+                                 {"params": b.parameters(), "name": "backbone", "lr": 1e-3, "lr_mult": 1.0}])
+        opt.load_state_dict(saved.state_dict())
+        assert opt.param_groups[1]["lr_mult"] == 0.1, "load_state_dict restores the paused lr_mult"
+        ts.set_lr_mults(opt, 1.0)
+        ts._pin_optimizer_lr(opt, 1e-3)
+        assert ts.effective_lrs(opt) == {"head": 1e-3, "backbone": 1e-3}
+        real = "; real AdamW load_state_dict round trip"
+    print(f"(d) resume with a paused lr_mult 0.1: backbone 1e-4 before, {rates['backbone']:g} after; "
+          f"lr logged per epoch, in the val line and metrics record{real} OK")
+
+
 def main() -> None:
+    check_lr_logging()
     check_eval_resets()
     check_abort_mask()
     check_no_main_dropped()

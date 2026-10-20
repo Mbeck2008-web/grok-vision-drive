@@ -105,6 +105,37 @@ def _pin_optimizer_lr(opt: Any, rate: float) -> None:
             group["lr"] = pinned * float(group.get("lr_mult", 1.0))
 
 
+def set_lr_mults(opt: Any, backbone_lr_mult: float) -> None:
+    """Re-set each group's ``lr_mult`` from the command line before pinning.
+
+    ``opt.load_state_dict`` brings back the paused groups, ``lr_mult``
+    included, so a resume would keep the old ``--backbone-lr-mult``. The
+    group named ``backbone`` takes ``backbone_lr_mult``; every other group 1.0.
+    """
+    groups = getattr(opt, "param_groups", None)
+    if not isinstance(groups, list):
+        return
+    for group in groups:
+        if isinstance(group, dict):
+            group["lr_mult"] = float(backbone_lr_mult) if group.get("name") == "backbone" else 1.0
+
+
+def effective_lrs(opt: Any) -> dict[str, float]:
+    """The rate each optimizer group really steps at, by group name."""
+    out: dict[str, float] = {}
+    groups = getattr(opt, "param_groups", None)
+    if not isinstance(groups, list):
+        return out
+    for index, group in enumerate(groups):
+        if isinstance(group, dict) and "lr" in group:
+            out[str(group.get("name") or f"group{index}")] = float(group["lr"])
+    return out
+
+
+def format_lrs(rates: Mapping[str, float]) -> str:
+    return ",".join(f"{name}:{value:.3g}" for name, value in rates.items()) or "none"
+
+
 def resolve_scene_batch(requested: int, parallel_fit: int) -> int:
     """Windows in one optimizer step.
 
@@ -2250,6 +2281,8 @@ def train_directory(
             if hold_n <= 0:
                 break
             mean = hold_sum / hold_n
+            lr_now = effective_lrs(holder.get("opt"))
+            print(f"[GVD] epoch={int(epoch)} step={done} lr={format_lrs(lr_now)} (from opt.param_groups)", flush=True)
             scored: dict[str, Any] = {}
             if val_pairs:
                 scored = val_summary(val_pairs, val_pairs_long, val_parts)
@@ -2275,6 +2308,7 @@ def train_directory(
                     "pred_std": json_num(scored.get("pred_std")),
                     "collapse": bool(scored.get("collapse")),
                     "blank_main_skipped": int(BLANK_MAIN_SKIPS),
+                    "lr": lr_now,
                 }
                 cell_lines: list[str] = []
                 if cell_spec is not None:
@@ -2304,7 +2338,8 @@ def train_directory(
                     f"pred_mean={scored.get('pred_mean')} pred_std={scored.get('pred_std')} "
                     f"r_long={scored.get('r_long')} rms_long={scored.get('rms_long')} "
                     f"bias_long={scored.get('bias_long')} eval_chunk={int(eval_chunk)} "
-                    f"blank_main_skipped={int(BLANK_MAIN_SKIPS)}",
+                    f"blank_main_skipped={int(BLANK_MAIN_SKIPS)} "
+                    f"lr={format_lrs(lr_now)}",
                     flush=True,
                 )
                 for line in cell_lines:
@@ -2435,6 +2470,7 @@ def train_directory(
                 device = holder["device"]
                 net = holder["net"]
                 _apply_checkpoint(net, holder["opt"], holder["scaler"], fields, device)
+                set_lr_mults(holder["opt"], float(backbone_lr_mult))
                 _pin_optimizer_lr(holder["opt"], rate)
                 if init_head_bias:
                     print("[GVD] --init-head-bias ignored: resuming from a checkpoint", flush=True)

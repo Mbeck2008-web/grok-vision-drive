@@ -121,6 +121,12 @@ moves on to the next one, and a used-up schedule wraps the map rotation;
 only ``--no-progress-ends`` (5) segment ends in a row with no recorded row
 stop it, ``reason=no_progress``, exit 6.
 
+Code pin: the first log line is ``collect code_sha=<sha> code_dirty=<true|false|
+unknown> argv=<json list>`` (``git rev-parse HEAD`` and ``git status
+--porcelain`` in this checkout; ``unknown`` when git fails). The same
+``code_sha`` / ``code_dirty`` / ``argv`` go into both collect.json files and
+the heartbeat.
+
 Heartbeat: ``<GVD status>/collect_heartbeat.json`` (E:/GVD_data/status on
 the driving PC), rewritten every 30 s and once at the stop: ``pid``, ``t``,
 ``time``, ``done_s``, ``target_s``, ``segment``, ``last_line``, ``state``
@@ -141,6 +147,7 @@ import datetime
 import json
 import math
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -1137,6 +1144,34 @@ def attached_frames_ready(cams: dict[str, Any], frames: dict[str, Any]) -> bool:
 
 
 STOP_EXIT_EARLY = 6
+
+
+def code_pin(repo: Path | None = None, argv: list[str] | None = None) -> dict[str, Any]:
+    """``code_sha``, ``code_dirty`` (bool, or "unknown") and ``argv`` for this run."""
+    root = Path(repo) if repo is not None else Path(__file__).resolve().parents[1]
+    sha: str = "unknown"
+    dirty: Any = "unknown"
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=15
+        )
+        if head.returncode == 0 and head.stdout.strip():
+            sha = head.stdout.strip()
+            status = subprocess.run(
+                ["git", "-C", str(root), "status", "--porcelain"], capture_output=True, text=True, timeout=30
+            )
+            if status.returncode == 0:
+                dirty = bool(status.stdout.strip())
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    full = [sys.executable] + (list(sys.argv) if argv is None else [str(Path(__file__).resolve())] + [str(a) for a in argv])
+    return {"code_sha": sha, "code_dirty": dirty, "argv": full}
+
+
+def pin_line(pin: dict[str, Any]) -> str:
+    dirty = pin.get("code_dirty")
+    dirty_txt = "unknown" if not isinstance(dirty, bool) else ("true" if dirty else "false")
+    return f"collect code_sha={pin.get('code_sha')} code_dirty={dirty_txt} argv={json.dumps(pin.get('argv') or [])}"
 STALL_RESPAWN_STREAK = 3
 HEARTBEAT_FILE = "collect_heartbeat.json"
 HEARTBEAT_S = 30.0
@@ -1180,6 +1215,7 @@ class RunStop:
         self.last_line = ""
         self.segment: str | None = None
         self.done_s = 0.0
+        self.pin: dict[str, Any] = {}
         self._beat_m: float | None = None
 
     def attach(self, out: Path, progress_path: Path, target_s: float, done_s: float) -> None:
@@ -1223,6 +1259,7 @@ class RunStop:
             "detail": self.detail if state == "stopped" else None,
             "code": code,
             "out": None if self.out is None else str(self.out),
+            **self.pin,
         }
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -1259,7 +1296,7 @@ class RunStop:
         target_txt = "inf" if self.target_s == float("inf") else f"{self.target_s:.1f}"
         tail = f" {self.detail}" if self.detail else ""
         print(f"collect stop reason={reason} code={code} done_s={done:.1f} target_s={target_txt}{tail}", flush=True)
-        extra = {"stop_reason": reason, "stop_detail": self.detail or None, "stop_code": code, "stopped": time.time()}
+        extra = {"stop_reason": reason, "stop_detail": self.detail or None, "stop_code": code, "stopped": time.time(), **self.pin}
         if not self.progress_path.is_file():
             extra = {"done_s": done, "target_s": float(self.target_s), **extra}
         self._merge(self.progress_path, extra)
@@ -1276,6 +1313,8 @@ def main(argv: list[str] | None = None) -> int:
     old = sys.stdout
     sys.stdout = _LastLine(old, run)
     try:
+        run.pin = code_pin(argv=argv)
+        print(pin_line(run.pin), flush=True)
         try:
             code = _main(argv, run)
         except BaseException as exc:
@@ -1592,6 +1631,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             payload["error"] = last_error
             payload["cam_drop_reason"] = dict(cam_reasons)
             payload["until_disk"] = bool(until_disk)
+            payload.update(run.pin)
             if spawn_deck is not None:
                 payload["spawn_mix"] = spawn_deck.summary()
                 payload["road_repeats"] = spawn_deck.road_repeats()
@@ -1917,7 +1957,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             return took
 
         def _spawn_extra() -> dict[str, Any] | None:
-            extra: dict[str, Any] = {}
+            extra: dict[str, Any] = dict(run.pin)
             if spawn_deck is not None:
                 extra["spawn_mix"] = spawn_deck.summary()
                 extra["road_repeats"] = spawn_deck.road_repeats()

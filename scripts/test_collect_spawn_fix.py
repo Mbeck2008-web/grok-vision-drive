@@ -449,7 +449,8 @@ class _Cam:
         return {"colour": image}
 
 
-def _run_collector(vehicle_args: dict, extra: list[str], root: Path | None = None) -> tuple[int, str, Path]:
+def _run_collector(vehicle_args: dict, extra: list[str], root: Path | None = None,
+                   cams=None) -> tuple[int, str, Path]:
     import python.data.raw_queue as raw_queue
     import python.debug.gt_logger as gt_logger
     import python.sensors.tech as tech
@@ -486,7 +487,7 @@ def _run_collector(vehicle_args: dict, extra: list[str], root: Path | None = Non
     tech.widen_socket_timeout = lambda *a, **k: None  # type: ignore[assignment]
     tech.release_tech_beamngpy = lambda *a, **k: None  # type: ignore[assignment]
     gt_logger.load_road_polys = lambda session: ([RoadPoly("r", [(0.0, 0.0), (0.0, 80.0)], 7.0)], "")  # type: ignore[assignment]
-    collect._attach_cameras = lambda session, veh, cfg: {"main": _Cam()}  # type: ignore[assignment]
+    collect._attach_cameras = lambda session, veh, cfg: (cams() if cams else {"main": _Cam()})  # type: ignore[assignment]
     collect.time.sleep = sleep  # type: ignore[method-assign]
     collect.time.monotonic = lambda: clock["t"]  # type: ignore[method-assign]
     collect.tick_sleep_s = lambda _elapsed, _period=0.1: 0.1  # type: ignore[method-assign]

@@ -244,6 +244,93 @@ def check_heartbeat_interval() -> None:
     print(f"heartbeat ok: {sorted(first)}")
 
 
+def check_recover_failed() -> None:
+    """No road pose to recover onto: reason=recover_failed, exit 2."""
+    import python.collect.level_session as level_session
+
+    real = level_session.snap_to_road
+    level_session.snap_to_road = lambda bng, near: None
+    try:
+        code, text, out = sf._run_collector({"stop_at": 99999}, ["--no-excursions"])  # crash at poll 41
+    finally:
+        level_session.snap_to_road = real
+    assert "no road pose to respawn" in text, text[-2000:]
+    status = _check_stop(code, text, out, "recover_failed", 2)
+    assert "no road pose to respawn" in status["stop_detail"], status
+    print("recover_failed ok")
+
+
+class _DarkCam:
+    def poll(self):
+        return {}
+
+
+def check_camera_warmup() -> None:
+    """One camera never renders while another does: reason=camera_warmup, exit 4."""
+    code, text, out = sf._run_collector({"speed_at": lambda n: 10.0, "stop_at": 99999}, ["--no-excursions"],
+                                        cams=lambda: {"main": sf._Cam(), "wide": _DarkCam()})
+    status = _check_stop(code, text, out, "camera_warmup", 4)
+    assert "cameras did not all render" in status["stop_detail"] and "wide" in status["stop_detail"], status
+    print("camera_warmup ok")
+
+
+def check_session_faults() -> None:
+    """Three camera polls in a row raise a session error: reason=session_faults, exit 2."""
+    real = collect._poll_cameras
+    calls = {"n": 0}
+
+    def flaky(cams):
+        calls["n"] += 1
+        if calls["n"] > 20:
+            raise ConnectionResetError("BeamNG socket closed")
+        return real(cams)
+
+    collect._poll_cameras = flaky
+    try:
+        code, text, out = sf._run_collector({"speed_at": lambda n: 10.0, "stop_at": 99999}, ["--no-excursions"])
+    finally:
+        collect._poll_cameras = real
+    assert text.count("collect session ") == 3, text[-2000:]
+    status = _check_stop(code, text, out, "session_faults", 2)
+    assert "socket closed" in status["stop_detail"], status
+    print("session_faults ok")
+
+
+def check_code_pin() -> None:
+    """The first log line, both collect.json files and the heartbeat carry code_sha, code_dirty, argv."""
+    import subprocess
+
+    head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    dirty = bool(subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain"], capture_output=True, text=True).stdout.strip())
+    pin = collect.code_pin(argv=["--minutes", "1"])
+    assert pin["code_sha"] == head and len(head) == 40 and pin["code_dirty"] is dirty, (pin, head, dirty)
+    assert pin["argv"][-2:] == ["--minutes", "1"] and pin["argv"][1].endswith("collect_scene_lanes.py"), pin
+    line = collect.pin_line(pin)
+    assert line.startswith(f"collect code_sha={head} code_dirty={'true' if dirty else 'false'} argv=[") and line.endswith('"--minutes", "1"]'), line
+    # No git (or not a checkout): unknown, never a crash.
+    real = collect.subprocess.run
+    collect.subprocess.run = lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("git"))
+    try:
+        none = collect.code_pin(argv=[])
+    finally:
+        collect.subprocess.run = real
+    assert none["code_sha"] == "unknown" and none["code_dirty"] == "unknown"
+    assert "code_dirty=unknown" in collect.pin_line(none)
+    outside = collect.code_pin(Path(tempfile.mkdtemp()), argv=[])
+    assert outside["code_sha"] == "unknown" and outside["code_dirty"] == "unknown", outside
+    # End to end.
+    code, text, out = sf._run_collector({"speed_at": lambda n: 10.0, "stop_at": 120}, ["--no-excursions"])
+    first = text.splitlines()[0]
+    assert first.startswith(f"collect code_sha={head} code_dirty="), first
+    assert '"--no-excursions"' in first and '"--minutes"' in first, first
+    status = json.loads((out / "collect.json").read_text(encoding="utf-8"))
+    shared = json.loads((out.parent / "status" / "collect.json").read_text(encoding="utf-8"))
+    beat = json.loads((out.parent / "status" / collect.HEARTBEAT_FILE).read_text(encoding="utf-8"))
+    for d in (status, shared, beat):
+        assert d["code_sha"] == head and d["code_dirty"] is dirty and d["argv"][-1] == "--no-excursions", d
+    print(f"code pin ok: {head[:12]} dirty={dirty}")
+
+
 def main() -> None:
     check_heartbeat_interval()
     check_requested_and_target()
@@ -255,6 +342,10 @@ def main() -> None:
     check_smoke_failed()
     check_exception()
     check_session_open_failed()
+    check_recover_failed()
+    check_camera_warmup()
+    check_session_faults()
+    check_code_pin()
     print("collect stops ok")
 
 

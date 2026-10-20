@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -217,6 +218,172 @@ def check_paths_and_repair_mirror() -> None:
     print("paths: camera of either layout; raw_repaired mirrors the subfolder")
 
 
+def _png(value: int) -> bytes:
+    import cv2
+
+    ok, buf = cv2.imencode(".png", _img(value))
+    assert ok
+    return buf.tobytes()
+
+
+def _snapshot(folder: Path) -> dict[str, tuple[int, int, int]]:
+    """Name -> (size, mtime_ns, inode) of every file below ``folder``."""
+    out = {}
+    for path in folder.rglob("*"):
+        if path.is_file():
+            st = path.stat()
+            out[str(path.relative_to(folder))] = (st.st_size, st.st_mtime_ns, st.st_ino)
+    return out
+
+
+def check_resume_across_folder_boundary() -> None:
+    """A run that stopped at index 9,999 resumes in ``001/`` and keeps every frame.
+
+    The last state line is lost on purpose (frame 9,999 is on disk, its
+    state line is not), as after a crash between the two writes.
+    """
+    last = RAW_FRAMES_PER_DIR - 1
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        shard = root / "raw" / "main" / "000"
+        shard.mkdir(parents=True)
+        blob = _png(70)
+        lines = []
+        for idx in range(last + 1):
+            (shard / f"{idx:06d}.png").write_bytes(blob)
+            if idx < last:
+                cams = {"main": {"file": f"raw/main/000/{idx:06d}.png"}}
+                lines.append(json.dumps({"i": idx, "t": 1.0 + idx * 0.1, "cams": cams}))
+        (root / "state.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        before = _snapshot(root / "raw")
+        assert len(before) == RAW_FRAMES_PER_DIR
+
+        writer = RawFrameWriter(root, [])
+        assert writer._n == RAW_FRAMES_PER_DIR, writer._n
+        row = writer.write({"main": _img(71)}, t=9000.0)
+        assert row["i"] == RAW_FRAMES_PER_DIR
+        assert row["cams"]["main"]["file"] == "raw/main/001/010000.png", row["cams"]["main"]
+        assert (root / "raw" / "main" / "001" / "010000.png").is_file()
+        # A second resume continues in 001/.
+        row = RawFrameWriter(root, []).write({"main": _img(72)}, t=9000.1)
+        assert row["cams"]["main"]["file"] == "raw/main/001/010001.png", row["cams"]["main"]
+
+        after = _snapshot(root / "raw")
+        assert {k: after[k] for k in before} == before, "an existing frame changed"
+        assert sorted(set(after) - set(before)) == [
+            os.path.join("main", "001", "010000.png"),
+            os.path.join("main", "001", "010001.png"),
+        ]
+        assert len(list(shard.iterdir())) == RAW_FRAMES_PER_DIR
+        assert not list((root / "raw").rglob("*.tmp"))
+        assert int(load_raw_cameras(root, last)["main"][5, 5, 0]) == 70
+        assert int(load_raw_cameras(root, RAW_FRAMES_PER_DIR)["main"][5, 5, 0]) == 71
+    print("resume at 9,999 -> raw/main/001/010000.png; all 10,000 old frames unchanged")
+
+
+def check_writer_never_replaces_a_frame() -> None:
+    """A writer pointed at an index that is already on disk refuses; nothing changes."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        writer = RawFrameWriter(root, [], per_dir=3)
+        for n in range(4):
+            writer.write({"main": _img(80 + n)}, t=1.0 + 0.1 * n)
+        before = _snapshot(root / "raw")
+        state = (root / "state.jsonl").read_bytes()
+        for idx in (0, 2, 3):
+            writer._n = idx
+            try:
+                writer.write({"main": _img(99)}, t=5.0)
+            except FileExistsError:
+                pass
+            else:
+                raise AssertionError(f"writer replaced frame {idx}")
+        assert _snapshot(root / "raw") == before
+        assert (root / "state.jsonl").read_bytes() == state
+        assert not list((root / "raw").rglob("*.tmp"))
+    print("writer refuses an existing frame name: files and state.jsonl unchanged")
+
+
+def _old_flat_counts(root: Path) -> dict:
+    """``list_raw_images`` + ``raw_image_counts`` as they were before subfolders (fd48e2b)."""
+    found = sorted(
+        p
+        for p in (root / "raw").rglob("*")
+        if p.is_file() and p.suffix in {".png", ".npy"} and p.stem.isdigit()
+    )
+    per_cam: dict[str, int] = {}
+    for path in found:
+        per_cam[path.parent.name] = per_cam.get(path.parent.name, 0) + 1
+    if "main" in per_cam:
+        ticks = per_cam["main"]
+    else:
+        ticks = min(per_cam.values()) if per_cam else 0
+    return {"raw_frames": ticks, "raw_files": sum(per_cam.values()), "per_cam": per_cam, "paths": found}
+
+
+def check_rec5c_size_flat_then_mixed() -> None:
+    """57,743 flat frames (rec5c's main camera) count as before; appended frames add up."""
+    n_flat = 57_743
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        flat = root / "raw" / "main"
+        flat.mkdir(parents=True)
+        blob = _png(90)
+        for idx in range(n_flat):
+            (flat / f"{idx:06d}.png").write_bytes(blob)
+        lines = [
+            json.dumps({"i": idx, "t": 1.0 + idx * 0.1, "cams": {"main": {"file": f"raw/main/{idx:06d}.png"}}})
+            for idx in range(n_flat)
+        ]
+        (root / "state.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        old = _old_flat_counts(root)
+        images = list_raw_images(root)
+        counts = raw_image_counts(images)
+        assert sorted(images) == old["paths"]
+        assert counts == {k: old[k] for k in ("raw_frames", "raw_files", "per_cam")}, counts
+        assert counts["raw_frames"] == n_flat and counts["per_cam"] == {"main": n_flat}
+
+        # Loaders on the flat layout. A miss (no .npy, an index past the end)
+        # lists the 57,743-entry folder at most once, not on every lookup.
+        listings = []
+        real_scandir = os.scandir
+
+        def counting_scandir(path):
+            listings.append(str(path))
+            return real_scandir(path)
+
+        raw_frames.os.scandir = counting_scandir
+        try:
+            for idx in (0, 9_999, 10_000, 57_742):
+                assert int(load_raw_cameras(root, idx)["main"][5, 5, 0]) == 90, idx
+                cam = _read_cam(root, "main", idx)
+                assert cam is not None and int(cam[5, 5, 0]) == 90, idx
+                assert row_has_decodable_frame(root, {"i": idx, "cams": {"main": {}}}), idx
+            for idx in range(n_flat, n_flat + 50):
+                assert load_raw_cameras(root, idx) == {}, idx
+                assert _read_cam(root, "main", idx) is None, idx
+        finally:
+            raw_frames.os.scandir = real_scandir
+        assert listings.count(str(flat)) <= 1, len(listings)
+
+        # A new writer appends to it: mixed flat + raw/main/005/.
+        writer = RawFrameWriter(root, [])
+        assert writer._n == n_flat, writer._n
+        for k in range(3):
+            row = writer.write({"main": _img(91 + k)}, t=9000.0 + k)
+            assert row["cams"]["main"]["file"] == f"raw/main/005/{n_flat + k:06d}.png", row["cams"]["main"]
+        counts = raw_image_counts(list_raw_images(root))
+        assert counts["per_cam"] == {"main": n_flat + 3} and counts["raw_frames"] == n_flat + 3, counts
+        assert counts["raw_files"] == n_flat + 3, counts
+        assert len([p for p in flat.iterdir() if p.is_file()]) == n_flat
+        assert int(load_raw_cameras(root, n_flat - 1)["main"][5, 5, 0]) == 90
+        assert int(load_raw_cameras(root, n_flat)["main"][5, 5, 0]) == 91
+        cam = _read_cam(root, "main", n_flat + 2)
+        assert cam is not None and int(cam[5, 5, 0]) == 93
+    print(f"flat {n_flat:,} frames: counts equal the old code; + 3 nested = {n_flat + 3:,}")
+
+
 def main() -> None:
     check_cap_fits_fat32()
     check_writer_rolls_over_and_file_is_real()
@@ -225,6 +392,9 @@ def main() -> None:
     check_nested_layout_reads()
     check_mixed_layout_after_upgrade()
     check_paths_and_repair_mirror()
+    check_resume_across_folder_boundary()
+    check_writer_never_replaces_a_frame()
+    check_rec5c_size_flat_then_mixed()
     print("test_raw_rollover OK")
 
 

@@ -327,10 +327,36 @@ def raw_frame_candidates(raw: Path | str, cam: str, index: int, suffix: str) -> 
     found = [folder / raw_subdir_name(index) / name, folder / name]
     if any(path.is_file() for path in found) or not folder.is_dir():
         return found
-    for sub in sorted(folder.iterdir()):
-        if sub.is_dir() and sub.name.isdigit() and (sub / name).is_file():
-            found.append(sub / name)
+    for sub in _numbered_subdirs(folder):
+        if (folder / sub / name).is_file():
+            found.append(folder / sub / name)
     return found
+
+
+_SUBDIR_CACHE: dict[str, tuple[int, tuple[str, ...]]] = {}
+
+
+def _numbered_subdirs(folder: Path) -> tuple[str, ...]:
+    """Numbered subfolders of one camera folder, listed again only when it changes.
+
+    A flat camera folder of a long recording holds 57,743 frames. A slower
+    camera has no frame at many indices and a PNG recording has no ``.npy``,
+    so a miss is common. Listing the folder on every miss made one
+    ``load_raw_cameras`` call take hundreds of milliseconds on a flat
+    recording. The listing is kept until the folder's mtime changes.
+    """
+    try:
+        stamp = folder.stat().st_mtime_ns
+    except OSError:
+        return ()
+    key = str(folder)
+    hit = _SUBDIR_CACHE.get(key)
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
+    with os.scandir(folder) as entries:
+        names = tuple(sorted(e.name for e in entries if e.name.isdigit() and e.is_dir()))
+    _SUBDIR_CACHE[key] = (stamp, names)
+    return names
 
 
 def raw_camera_of(path: Path | str) -> str | None:

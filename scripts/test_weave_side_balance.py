@@ -247,14 +247,18 @@ def check_stats() -> list[str]:
 
 
 def _collector_run(stop_at: int, extra: list[str], raise_in_weave: int | None = None,
-                   smoke_issue: bool = False) -> tuple[str, dict | None, dict, int]:
+                   smoke: str | None = None) -> tuple[str, dict | None, dict, int]:
     """The mocked collector run of test_collect_spawn_fix, painted everywhere, on a 3 km straight.
 
     Gives the log, collect.json ``weave_stats.sides`` and the run's in-memory ``weave_stats.sides``.
     ``raise_in_weave=n``: the n-th overspeed check of a driving excursion raises, so the run exits on an
-    exception inside a weave (collect.main re-raises it; it is caught here). ``smoke_issue``: the smoke
-    check fails at --smoke-s and the run exits 5 (in this harness the writer is not drained in time;
-    decode_issues is also patched to report an issue)."""
+    exception inside a weave (collect.main re-raises it; it is caught here). ``smoke``: the smoke check
+    at --smoke-s fails and the run exits 5: "writer" (wait_empty gives False: the first exit) or
+    "decode" (wait_empty gives True and decode_issues reports one: the second exit).
+    Every run also records, in PIN_CLOCKS, whether code_pin's git calls ran on the real clock."""
+    import subprocess
+
+    import python.data.raw_queue as raw_queue
     import python.collect.excursion as excursion
     from scripts import test_collect_spawn_fix as fix
 
@@ -283,8 +287,19 @@ def _collector_run(stop_at: int, extra: list[str], raise_in_weave: int | None = 
             caught.append(exc)
             return -1
 
-    previous = (collect.painted_for, excursion.WeaveStats, excursion.overspeed, collect.main, collect.decode_issues)
-    if smoke_issue:
+    real_sleep, real_run = collect.time.sleep, subprocess.run
+
+    def _run(*a, **k):  # code_pin's git calls: the harness must give them the real clock
+        PIN_CLOCKS.append(collect.time.sleep is real_sleep)
+        return real_run(*a, **k)
+
+    previous = (collect.painted_for, excursion.WeaveStats, excursion.overspeed, collect.main, collect.decode_issues,
+                raw_queue.RawWriteQueue.wait_empty, subprocess.run)
+    subprocess.run = _run  # type: ignore[assignment]
+    if smoke == "writer":
+        raw_queue.RawWriteQueue.wait_empty = lambda self, timeout_s=30.0: False  # type: ignore[method-assign]
+    elif smoke == "decode":
+        raw_queue.RawWriteQueue.wait_empty = lambda self, timeout_s=30.0: True  # type: ignore[method-assign]
         collect.decode_issues = lambda root: ["mocked decode issue"]  # type: ignore[assignment]
     collect.painted_for = lambda level: fix._Paint(lambda x, y: True)  # type: ignore[assignment]
     excursion.WeaveStats, excursion.overspeed, collect.main = _Stats, _overspeed, _main  # type: ignore[misc]
@@ -292,16 +307,19 @@ def _collector_run(stop_at: int, extra: list[str], raise_in_weave: int | None = 
         code, text, out = fix._run_collector({"speed_at": lambda n: 10.0, "stop_at": stop_at, "x": 1.75}, extra,
                                              roads=[RoadPoly("r", [(0.0, 0.0), (0.0, 3000.0)], 7.0)])
     finally:
-        (collect.painted_for, excursion.WeaveStats, excursion.overspeed, collect.main,
-         collect.decode_issues) = previous  # type: ignore[misc]
+        (collect.painted_for, excursion.WeaveStats, excursion.overspeed, collect.main, collect.decode_issues,
+         raw_queue.RawWriteQueue.wait_empty, subprocess.run) = previous  # type: ignore[misc]
     if raise_in_weave is not None:
         assert code == -1 and len(caught) == 1, (code, caught, text[-3000:])
     else:
-        assert code == (5 if smoke_issue else 0) and not caught, (code, caught, text[-3000:])
+        assert code == (5 if smoke else 0) and not caught, (code, caught, text[-3000:])
     assert len(made) == 1, made
     saved = json.loads((out / "collect.json").read_text(encoding="utf-8"))
     sides = (saved.get("weave_stats") or {}).get("sides")  # none if the run never reached a save with stats
     return text, sides, made[0].summary()["sides"], code
+
+
+PIN_CLOCKS: list[bool] = []
 
 
 def _balanced(sides: dict) -> None:
@@ -316,18 +334,24 @@ def check_one_end_line_per_weave() -> list[str]:
     src = (ROOT / "scripts" / "collect_scene_lanes.py").read_text(encoding="utf-8")
     assert 'f"collect excursion {segment_id} {clock.phase} abort overspeed "' in src  # unchanged
     # Without --weave-guard the weaves run WEAVE_S (timeout) and the stop file lands inside the third:
-    # it ends as `stop` in the log and in collect.json. With --weave-guard each line ends (line_end) and
-    # the run stops in cruise. A smoke check that fails at 25 s (inside the first weave, 20-32 s) ends it
-    # as `smoke_failed`; a run that raises inside its first weave ends it as `error`. Neither exit saves
-    # collect.json, so for non-zero exits the end lines are checked from the log against the in-memory
-    # stats, and the per-side collect.json invariant only for code-0 runs.
-    runs = (("stop mid-weave", 900, [], None, False, {"timeout", "stop"}),
-            # 1250: the 4th weave ends near row 1100 and the 5th would start near 1300 (1300 was on the edge).
-            ("--weave-guard", 1250, ["--weave-guard"], None, False, {"line_end"}),
-            ("smoke check fails mid-weave", 900, ["--smoke-s", "25"], None, True, {"smoke_failed"}),
-            ("exception mid-weave", 260, [], 20, False, {"error"}))
-    for label, stop_at, extra, raise_in_weave, smoke_issue, reasons in runs:
-        text, sides, live, code = _collector_run(stop_at, extra, raise_in_weave, smoke_issue)
+    # it ends as `stop` in the log and in collect.json. With --weave-guard each line ends (line_end);
+    # 1300 rows is the boundary case: the 4th weave's cruise ends at row ~1103 and the 5th weave would
+    # start at row ~1303 (CRUISE_S = 201 ticks of 0.1 s in float), so the stop lands in cruise. It
+    # used to start that 5th weave at row 1299 now and then: the harness's fake clock leaked into
+    # code_pin's git subprocess (see test_collect_spawn_fix._run_collector). The smoke check fails at
+    # 25 s (inside the first weave, 20-32 s) on either smoke exit and ends it as `smoke_failed`; a run
+    # that raises inside its first weave ends it as `error`. These exits do not save collect.json, so for
+    # non-zero exits the end lines are checked from the log against the in-memory stats, and the
+    # per-side collect.json invariant only for code-0 runs.
+    runs = (("stop mid-weave", 900, [], None, None, {"timeout", "stop"}),
+            ("--weave-guard, 1300-row boundary", 1300, ["--weave-guard"], None, None, {"line_end"}),
+            ("smoke check fails mid-weave, writer exit", 900, ["--smoke-s", "25"], None, "writer", {"smoke_failed"}),
+            ("smoke check fails mid-weave, decode exit", 900, ["--smoke-s", "25"], None, "decode", {"smoke_failed"}),
+            ("exception mid-weave", 260, [], 20, None, {"error"}))
+    for label, stop_at, extra, raise_in_weave, smoke, reasons in runs:
+        PIN_CLOCKS.clear()
+        text, sides, live, code = _collector_run(stop_at, extra, raise_in_weave, smoke)
+        assert PIN_CLOCKS and all(PIN_CLOCKS), (label, PIN_CLOCKS)  # git ran on the real clock
         assert not re.search(r"weave abort (line_end|timeout)", text), text[-3000:]
         ends = re.findall(r"^collect excursion \S+ weave end (\S+) side=([LR])$", text, flags=re.M)
         starts = re.findall(r"^collect weave \S+ v_plan=.* side=([LR])$", text, flags=re.M)
@@ -352,9 +376,13 @@ def check_one_end_line_per_weave() -> list[str]:
             # The one weave open at the exit: exactly one end line, with the exit's reason, no `stop`.
             assert got == {"left": 0, "right": 1} and ends == [(next(iter(reasons)), "R")], (got, ends)
             assert "Traceback" not in text, text[-2000:]
-        if smoke_issue:
-            # Either smoke exit (writer not drained, or the mocked decode issue): both end the weave the same way.
-            assert re.search(r"^collect smoke failed \[", text, flags=re.M), text[-2000:]
+        if smoke == "writer":
+            assert "collect smoke failed ['writer did not finish']" in text, text[-2000:]
+        elif smoke == "decode":
+            assert "collect smoke failed ['mocked decode issue']" in text, text[-2000:]
+        if stop_at == 1300:
+            # The boundary case lands one way only: four weaves, L R L R, all line_end, the stop in cruise.
+            assert ends == [("line_end", "R"), ("line_end", "L"), ("line_end", "R"), ("line_end", "L")], ends
         out.append(f"end lines, {label} (code {code}): started L {got['left']} / R {got['right']}, one 'weave end' "
                    f"each ({', '.join(sorted(reasons))}), started == completed + aborted per side "
                    f"({'collect.json and in memory' if code == 0 else 'in memory; ends from the log'})")

@@ -487,8 +487,10 @@ def _run_collector(vehicle_args: dict, extra: list[str], root: Path | None = Non
         collect.time.sleep,
         collect.time.monotonic,
         collect.tick_sleep_s,
+        collect.code_pin,
     )
     clock = {"t": 0.0}
+    real_sleep, real_monotonic, real_pin = collect.time.sleep, collect.time.monotonic, collect.code_pin
 
     def sleep(seconds: float) -> None:
         clock["t"] += float(seconds or 0.0)
@@ -502,6 +504,22 @@ def _run_collector(vehicle_args: dict, extra: list[str], root: Path | None = Non
     collect.time.sleep = sleep  # type: ignore[method-assign]
     collect.time.monotonic = lambda: clock["t"]  # type: ignore[method-assign]
     collect.tick_sleep_s = lambda _elapsed, _period=0.1: 0.1  # type: ignore[method-assign]
+
+    def code_pin(*a, **k):
+        # The sleep / monotonic patches above are on the shared time module. code_pin's git calls
+        # (subprocess.run with a timeout) poll with time.sleep while git runs in real time
+        # (subprocess keeps its own real monotonic for the deadline), so each poll moved the fake
+        # clock by up to 0.05 s: a run started anywhere from 0 to ~330 s, depending on how long
+        # git took, and the float sums of 0.1 s ticks crossed CRUISE_S / ABORT_S a tick apart.
+        # Run it on the real clock.
+        fake = (collect.time.sleep, collect.time.monotonic)
+        collect.time.sleep, collect.time.monotonic = real_sleep, real_monotonic  # type: ignore[method-assign]
+        try:
+            return real_pin(*a, **k)
+        finally:
+            collect.time.sleep, collect.time.monotonic = fake  # type: ignore[method-assign]
+
+    collect.code_pin = code_pin  # type: ignore[assignment]
     raw_queue.RawWriteQueue = _DeepQueue  # type: ignore[misc]
     buf = io.StringIO()
     old = sys.stdout
@@ -522,6 +540,7 @@ def _run_collector(vehicle_args: dict, extra: list[str], root: Path | None = Non
             collect.time.sleep,
             collect.time.monotonic,
             collect.tick_sleep_s,
+            collect.code_pin,
         ) = previous
         raw_queue.RawWriteQueue = base_queue  # type: ignore[misc]
     return code, buf.getvalue(), out

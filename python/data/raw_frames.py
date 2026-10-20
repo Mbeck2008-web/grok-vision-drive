@@ -292,6 +292,67 @@ def load_scene_rows(root: Path | str) -> list[dict[str, Any]]:
     return merged
 
 
+# Frames per camera subfolder: ``raw/<cam>/<NNN>/<index>.<ext>``.
+#
+# FAT32 caps one directory at 65,536 32-byte entries, and ``.`` and ``..``
+# take two of them. A name such as ``000123.png`` is a plain 8.3 name, so
+# Windows stores it in one entry (lower case is a flag bit), but a driver
+# that writes a long-name entry for every lower-case name uses two, which
+# caps a folder at 32,767 frames. The ``.tmp`` name of a frame in flight is
+# not 8.3 either and takes two entries until it is renamed. 10,000 frames
+# is at most 20,002 entries plus the files in flight on any driver, a third
+# of the limit. FAT also scans a directory front to back on every create
+# and lookup, so a folder of 10,000 is about six times shorter to scan than
+# the 57,743-frame camera folders of a long recording. The folder number is
+# ``index // RAW_FRAMES_PER_DIR``: frame 123456 is in ``012/``.
+RAW_FRAMES_PER_DIR = 10_000
+
+
+def raw_subdir_name(index: int, per_dir: int | None = None) -> str:
+    """Subfolder of one frame index under ``raw/<cam>/``."""
+    size = int(per_dir or RAW_FRAMES_PER_DIR)
+    return f"{int(index) // size:03d}"
+
+
+def raw_frame_candidates(raw: Path | str, cam: str, index: int, suffix: str) -> list[Path]:
+    """Where a frame can be: the subfolder layout first, then the old flat one.
+
+    Recordings made before the subfolders keep ``raw/<cam>/NNNNNN.png``.
+    Both layouts are read. The folder size is not stored in the recording,
+    so when neither path exists the numbered subfolders are searched: a
+    recording written with another ``RAW_FRAMES_PER_DIR`` still loads.
+    """
+    folder = Path(raw) / str(cam)
+    name = f"{int(index):06d}{suffix}"
+    found = [folder / raw_subdir_name(index) / name, folder / name]
+    if any(path.is_file() for path in found) or not folder.is_dir():
+        return found
+    for sub in sorted(folder.iterdir()):
+        if sub.is_dir() and sub.name.isdigit() and (sub / name).is_file():
+            found.append(sub / name)
+    return found
+
+
+def raw_camera_of(path: Path | str) -> str | None:
+    """Camera id of a frame under ``raw/`` (or ``raw_repaired/``), either layout."""
+    file = Path(path)
+    parent = file.parent
+    if parent.parent.name in {"raw", "raw_repaired"}:
+        return parent.name
+    if parent.name.isdigit() and parent.parent.parent.name in {"raw", "raw_repaired"}:
+        return parent.parent.name
+    return None
+
+
+def is_raw_frame_path(path: Path | str) -> bool:
+    """True for ``raw/<cam>/N.ext`` and ``raw/<cam>/<NNN>/N.ext``."""
+    file = Path(path)
+    parent = file.parent
+    if parent.parent.name == "raw":
+        return True
+    return parent.name.isdigit() and parent.parent.parent.name == "raw"
+
+
 def _used_indices(root: Path) -> set[int]:
     used: set[int] = set()
     for row in read_state_jsonl(root / "state.jsonl"):
@@ -423,8 +484,17 @@ class RawFrameWriter:
     ``gt.jsonl`` is the lane target. Pixels are not in either file.
     """
 
-    def __init__(self, root: Path | str, cameras: list[dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        root: Path | str,
+        cameras: list[dict[str, Any]] | None = None,
+        *,
+        per_dir: int | None = None,
+    ) -> None:
         self.root = Path(root)
+        self.per_dir = int(per_dir or RAW_FRAMES_PER_DIR)
+        if self.per_dir < 1:
+            raise ValueError("per_dir must be at least 1")
         self.raw = self.root / "raw"
         self.raw.mkdir(parents=True, exist_ok=True)
         self.state_path = self.root / "state.jsonl"
@@ -506,7 +576,7 @@ class RawFrameWriter:
         dt_s = None if self._prev_t is None else round(t_store - self._prev_t, 6)
         cams: dict[str, Any] = {}
         for cam_id, payload, suffix, shape, dtype in encoded:
-            folder = self.raw / str(cam_id)
+            folder = self.raw / str(cam_id) / raw_subdir_name(idx, self.per_dir)
             final = folder / f"{idx:06d}{suffix}"
             _write_bytes(final, payload)
             self.stored_bytes += len(payload)
@@ -613,6 +683,10 @@ def repaired_copies(path: Path) -> list[Path]:
     if file.parent.parent.name == "raw":
         root = file.parent.parent.parent
         found.append(root / "raw_repaired" / file.parent.name / file.name)
+    elif is_raw_frame_path(file):
+        shard = file.parent
+        root = shard.parent.parent.parent
+        found.append(root / "raw_repaired" / shard.parent.name / shard.name / file.name)
     return found
 
 
@@ -675,12 +749,16 @@ def row_has_decodable_frame(root: Path | str, row: Mapping[str, Any]) -> bool:
     except (TypeError, ValueError):
         return False
     raw = Path(root) / "raw"
-    stem = f"{index:06d}"
+    cams = row.get("cams") if isinstance(row.get("cams"), dict) else {}
     for cam in cameras_for_row(row):
-        if image_file_decodable(raw / cam / f"{stem}.png"):
+        meta = cams.get(cam) if isinstance(cams.get(cam), dict) else {}
+        rel = str(meta.get("file") or "")
+        if rel and image_file_decodable(Path(root) / rel):
             return True
-        if image_file_decodable(raw / cam / f"{stem}.npy"):
-            return True
+        for suffix in (".png", ".npy"):
+            for path in raw_frame_candidates(raw, cam, index, suffix):
+                if image_file_decodable(path):
+                    return True
     return False
 
 
@@ -704,7 +782,7 @@ def training_frame_bytes(
             continue
         if "raw_repaired" in path.parts:
             continue
-        if path.parent.parent.name == "raw" and path.suffix.lower() in {".png", ".npy"}:
+        if is_raw_frame_path(path) and path.suffix.lower() in {".png", ".npy"}:
             chosen = training_image_path(path)
             if chosen is None:
                 continue
@@ -771,15 +849,22 @@ def load_raw_cameras(root: Path | str, index: int) -> dict[str, np.ndarray]:
     for folder in raw.iterdir():
         if not folder.is_dir():
             continue
-        png = folder / f"{int(index):06d}.png"
-        npy = folder / f"{int(index):06d}.npy"
-        if png.is_file():
+        png = _first_file(raw_frame_candidates(raw, folder.name, index, ".png"))
+        npy = _first_file(raw_frame_candidates(raw, folder.name, index, ".npy"))
+        if png is not None:
             image = read_image_with_repair(png)
             if image is not None:
                 frames[folder.name] = image
-        elif npy.is_file():
+        elif npy is not None:
             frames[folder.name] = np.load(npy)
     return frames
+
+
+def _first_file(paths: list[Path]) -> Path | None:
+    for path in paths:
+        if path.is_file():
+            return path
+    return None
 
 
 def load_training_bgr(root: Path | str, index: int) -> np.ndarray:
@@ -902,8 +987,9 @@ def list_raw_images(root: Path | str) -> list[Path]:
     found = []
     for path in raw.rglob("*"):
         if path.is_file() and path.suffix in {".png", ".npy"} and path.stem.isdigit():
-            found.append(path)
-    return sorted(found)
+            if raw_camera_of(path) is not None:
+                found.append(path)
+    return sorted(found, key=lambda path: (raw_camera_of(path), int(path.stem), str(path)))
 
 
 def raw_image_counts(paths: list[Path]) -> dict[str, Any]:
@@ -914,7 +1000,7 @@ def raw_image_counts(paths: list[Path]) -> dict[str, Any]:
     """
     per_cam: dict[str, int] = {}
     for path in paths:
-        cam = path.parent.name
+        cam = raw_camera_of(path) or path.parent.name
         per_cam[cam] = per_cam.get(cam, 0) + 1
     if "main" in per_cam:
         ticks = int(per_cam["main"])

@@ -19,6 +19,7 @@ from python.data.raw_frames import (
     list_raw_images,
     load_scene_rows,
     load_training_bgr,
+    raw_camera_of,
     raw_count_issues,
     raw_image_counts,
     read_image_with_repair,
@@ -216,7 +217,7 @@ def _validate_raw(
     issues: list[str] = []
     by_cam: dict[str, set[int]] = {}
     for path in raw_images:
-        cam_id = path.parent.name
+        cam_id = raw_camera_of(path) or path.parent.name
         by_cam.setdefault(cam_id, set()).add(int(path.stem))
     row_ids = []
     for row in rows:
@@ -267,7 +268,8 @@ def _validate_raw(
             continue
         seen_index.add(int(path.stem))
         if sector_is_blank(image):
-            blank[path.parent.name] = blank.get(path.parent.name, 0) + 1
+            cam_id = raw_camera_of(path) or path.parent.name
+            blank[cam_id] = blank.get(cam_id, 0) + 1
     checked = len(seen_index)
     if checked:
         for cam_id, n_blank in blank.items():

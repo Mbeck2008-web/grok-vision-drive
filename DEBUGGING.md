@@ -32,8 +32,14 @@ py -3 scripts\collect_scene_lanes.py --minutes 45
 ```
 
 Each camera is saved on its own, lossless, as BeamNG returned it:
-`<data dir>\scene_lanes\raw\<cam>\NNNNNN.png` (uint8) or `.npy` (any
-other dtype). No JPEG, resize, crop, colour change, overlay, or stitch
+`<data dir>\scene_lanes\raw\<cam>\<NNN>\NNNNNN.png` (uint8) or `.npy`
+(any other dtype). `<NNN>` is the frame index divided by 10,000
+(`RAW_FRAMES_PER_DIR`), so frame 123456 is in `012\`. A FAT32 folder holds
+at most 65,536 entries, and a long name takes two, so no camera folder
+may grow to tens of thousands of files. Recordings made before the
+subfolders keep `raw\<cam>\NNNNNN.png`; every loader, the validator and
+the PNG repair read both layouts, and `cams.<cam>.file` in `state.jsonl`
+is the real relative path either way. No JPEG, resize, crop, colour change, overlay, or stitch
 is written into those files. `state.jsonl` has the timestamps, `dt_s`,
 and the camera pose and intrinsics. Lane targets are `gt.jsonl`. The
 trainer stitches and resizes when it loads.

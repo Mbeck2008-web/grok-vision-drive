@@ -150,7 +150,7 @@ def check_pixels_roundtrip_and_load_time_stitch() -> None:
         third = again.write({"main": colour}, t=10.2, timestamps={"main": 10.2}, tech=tech)
         assert third["i"] == 2
         assert writer.stored_bytes > 0 and again.stored_bytes > 0
-        main_png = (root / "raw" / "main" / "000000.png").read_bytes()
+        main_png = (root / "raw" / "main" / "000" / "000000.png").read_bytes()
         loaded = load_raw_cameras(root, 0)
         assert np.array_equal(loaded["main"], colour)
         assert np.array_equal(loaded["wide"], alpha)
@@ -158,9 +158,9 @@ def check_pixels_roundtrip_and_load_time_stitch() -> None:
         loaded_odd = load_raw_cameras(root, 1)["wide"]
         assert loaded_odd.dtype == np.float32
         assert np.array_equal(loaded_odd, odd)
-        before = (root / "raw" / "main" / "000000.png").read_bytes()
+        before = (root / "raw" / "main" / "000" / "000000.png").read_bytes()
         canvas = load_training_bgr(root, 0)
-        after = (root / "raw" / "main" / "000000.png").read_bytes()
+        after = (root / "raw" / "main" / "000" / "000000.png").read_bytes()
         assert before == after == main_png
         assert canvas.shape == (CANVAS_H, CANVAS_W, 3)
         state = json.loads((root / "state.jsonl").read_text(encoding="utf-8").splitlines()[0])
@@ -175,7 +175,7 @@ def check_pixels_roundtrip_and_load_time_stitch() -> None:
         assert rows[0]["tech"]["lane_gt"] == label["tech"]["lane_gt"]
         assert abs(float(rows[1]["dt_s"]) - 0.1) < 1e-9
         report = validate_dataset(root, root / "validate_out", montage_n=1)
-        assert (root / "raw" / "main" / "000000.png").read_bytes() == main_png
+        assert (root / "raw" / "main" / "000" / "000000.png").read_bytes() == main_png
         assert report["format"] == "raw"
         assert report["montages"]
         assert Path(report["montages"][0]).is_file()

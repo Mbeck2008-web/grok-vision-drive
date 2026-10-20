@@ -3,7 +3,8 @@
 
     py -3 scripts\\repair_text_mode_png.py E:\\GVD_data\\scene_lanes
 
-Writes ``raw_repaired/<cam>/NNNNNN.png`` beside ``raw/``. Originals stay
+Writes ``raw_repaired/<cam>/[<NNN>/]NNNNNN.png`` beside ``raw/``, the same
+relative path as the original. Originals stay
 where they are and are never deleted. The last line is the rescued fraction.
 Exit 0 when every PNG decodes. Exit 1 when some do not. Exit 2 when no PNGs
 were found.

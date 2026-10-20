@@ -147,7 +147,7 @@ def check_one_tick() -> None:
     assert row.get("segment") == "current#0"
     wheel = row.get("wheel") or {}
     assert wheel.get("steer") == 0.15
-    pngs = list((out / "raw" / "main").glob("*.png"))
+    pngs = list((out / "raw" / "main").rglob("*.png"))
     assert pngs, sorted(p.name for p in out.rglob("*") if p.is_file())
     print(f"state steer={wheel.get('steer')} png={pngs[0].name}")
 

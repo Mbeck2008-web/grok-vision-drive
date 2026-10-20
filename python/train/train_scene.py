@@ -291,6 +291,21 @@ def build_parser() -> argparse.ArgumentParser:
             "0 scores the single sequence only."
         ),
     )
+    parser.add_argument(
+        "--backbone",
+        choices=("scratch", "imagenet-resnet18", "mobilenetv3"),
+        default="scratch",
+        help=(
+            "scratch is the GRU scene net. imagenet-resnet18 / mobilenetv3 is a single-frame "
+            "baseline: a torchvision ImageNet backbone per frame, no GRU, the heads read "
+            "per-frame features. BGR->RGB and ImageNet mean/std happen inside the net."
+        ),
+    )
+    parser.add_argument(
+        "--freeze-backbone",
+        action="store_true",
+        help="With --backbone imagenet-*, keep the ImageNet weights fixed and train only the projection and heads.",
+    )
     return parser
 
 
@@ -1226,14 +1241,22 @@ def _from_numpy_tree(obj: Any) -> Any:
     return obj
 
 
-def pause_matches_stem(fields: Mapping[str, Any], cams: tuple[str, ...] | None = None) -> bool:
-    """True when this pause file was written for the current GroupNorm stem."""
-    return fields.get("arch") == checkpoint_arch(cams)
+def pause_matches_stem(
+    fields: Mapping[str, Any], cams: tuple[str, ...] | None = None, arch: str | None = None
+) -> bool:
+    """True when this pause file was written for the current GroupNorm stem.
+
+    ``arch`` is a net's own ``pause_arch`` tag (the ``--backbone`` baseline);
+    ``None`` is the GroupNorm stem.
+    """
+    return fields.get("arch") == (arch or checkpoint_arch(cams))
 
 
-def stamp_pause(payload: dict[str, Any], cams: tuple[str, ...] | None = None) -> dict[str, Any]:
+def stamp_pause(
+    payload: dict[str, Any], cams: tuple[str, ...] | None = None, arch: str | None = None
+) -> dict[str, Any]:
     """Mark a pause file with the stem it may load into."""
-    payload["arch"] = checkpoint_arch(cams)
+    payload["arch"] = arch or checkpoint_arch(cams)
     return payload
 
 
@@ -1244,9 +1267,11 @@ def _apply_checkpoint(net: Any, opt: Any, scaler: Any, fields: Mapping[str, Any]
     weight is copied, so those tensors are not applied to the new stem.
     """
     used_cams = tuple(getattr(net, "cams", ()) or ()) or None
-    if not pause_matches_stem(fields, used_cams):
+    net_arch = getattr(net, "pause_arch", None)
+    if not pause_matches_stem(fields, used_cams, net_arch):
         raise ValueError(
-            f"pause checkpoint arch {fields.get('arch')!r} does not match the GroupNorm stem {checkpoint_arch(used_cams)}"
+            f"pause checkpoint arch {fields.get('arch')!r} does not match the "
+            f"{net_arch or 'GroupNorm stem ' + checkpoint_arch(used_cams)}"
         )
     import torch
 
@@ -1321,6 +1346,7 @@ def _save_pause(
             "scaler": None if scaler is None else _to_numpy_tree(scaler.state_dict()),
         },
         used_cams,
+        getattr(net, "pause_arch", None),
     )
     save_checkpoint(root, payload)
     return payload
@@ -1454,6 +1480,8 @@ def train_directory(
     conf_weight: float = DEFAULT_CONF_WEIGHT,
     init_head_bias: bool = False,
     eval_chunk: int = CHUNK_MAX,
+    backbone: str = "scratch",
+    freeze_backbone: bool = False,
 ) -> dict[str, Any]:
     import torch
 
@@ -1597,7 +1625,21 @@ def train_directory(
     def _arm(device_name: str, learning_rate: float | None = None) -> None:
         device = torch.device(device_name)
         if "net" not in holder:
-            holder["net"] = SceneNet(cams=train_cams, scale=input_scale).to(device)
+            if backbone in ("", "scratch"):
+                holder["net"] = SceneNet(cams=train_cams, scale=input_scale).to(device)
+            else:
+                from python.train.pretrained_net import build_scene_net
+
+                holder["net"] = build_scene_net(
+                    train_cams, input_scale, backbone, freeze=bool(freeze_backbone)
+                ).to(device)
+                print(
+                    f"[GVD] backbone={backbone} single-frame (no GRU, no skip) "
+                    f"freeze={bool(freeze_backbone)} token_dim={holder['net'].token_dim} "
+                    f"params={sum(p.numel() for p in holder['net'].parameters())} "
+                    "preprocess=BGR->RGB, /255, ImageNet mean/std inside the net",
+                    flush=True,
+                )
         elif holder["device"].type != device_name:
             holder["net"].to(device)
             _release_cuda()
@@ -2443,6 +2485,8 @@ def main(argv: list[str] | None = None) -> None:
             conf_weight=float(args.conf_weight),
             init_head_bias=bool(args.init_head_bias),
             eval_chunk=int(args.eval_chunk),
+            backbone=str(args.backbone),
+            freeze_backbone=bool(args.freeze_backbone),
         )
     except TrainFitError as exc:
         print(f"[GVD] scene train: {exc}")

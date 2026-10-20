@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Trainer fixes from the v5 collapse audit.
 
 (a) rows without the trained main picture are dropped, and a black main
@@ -304,6 +304,50 @@ def check_bootstrap() -> None:
     print(f"bootstrap: deterministic per seed, r={r_all:.3f} r_ci90={np.round(a['r_ci'], 3).tolist()} rms_ci90={np.round(a['rms_ci'], 3).tolist()} OK")
 
 
+def check_backbone() -> None:
+    """--backbone net: BGR->RGB + ImageNet norm inside, state passed through, own pause tag."""
+    import torch
+
+    try:
+        import torchvision  # noqa: F401
+    except ImportError:
+        print("backbone: torchvision not installed, skipped")
+        return
+    from python.train.pretrained_net import IMAGENET_MEAN, IMAGENET_STD, ImageNetPreprocess, PretrainedSceneNet
+    from python.train.train_scene import pause_matches_stem, stamp_pause
+
+    pre = ImageNetPreprocess()
+    bgr = torch.zeros(1, 3, 2, 2)
+    bgr[:, 0] = 0.9  # blue channel of a BGR canvas
+    out = pre(bgr)
+    want_r = (0.0 - IMAGENET_MEAN[0]) / IMAGENET_STD[0]
+    want_b = (0.9 - IMAGENET_MEAN[2]) / IMAGENET_STD[2]
+    assert abs(float(out[0, 0, 0, 0]) - want_r) < 1e-5 and abs(float(out[0, 2, 0, 0]) - want_b) < 1e-5, out[0, :, 0, 0]
+    net = PretrainedSceneNet(("main",), 1.0, "mobilenetv3", pretrained=False)
+    net.train()
+    assert all(not m.training for m in net.backbone.modules() if isinstance(m, torch.nn.BatchNorm2d))
+    state = net.initial_state(batch=2)
+    pred, after = net.forward_batch(torch.rand(2, 3, net.canvas_h, net.canvas_w), torch.tensor([0.1, 0.1]), state)
+    assert after is state and tuple(pred.lane_gt.shape) == (2, 14)
+    # Frames are independent: frame 0's output does not depend on frame 1.
+    net.eval()
+    x = torch.rand(2, 3, net.canvas_h, net.canvas_w)
+    with torch.no_grad():
+        a = net.forward_batch(x, torch.tensor([0.1, 0.1]), net.initial_state(batch=2))[0].lane_gt[0]
+        y = x.clone()
+        y[1] = torch.rand_like(y[1])
+        b = net.forward_batch(y, torch.tensor([0.1, 0.1]), net.initial_state(batch=2))[0].lane_gt[0]
+    assert torch.allclose(a, b, atol=1e-5)
+    payload = stamp_pause({}, ("main",), net.pause_arch)
+    assert pause_matches_stem(payload, ("main",), net.pause_arch)
+    assert not pause_matches_stem(payload, ("main",)), "a backbone pause must not load into SceneNet"
+    assert not pause_matches_stem(stamp_pause({}, ("main",)), ("main",), net.pause_arch)
+    frozen = PretrainedSceneNet(("main",), 1.0, "mobilenetv3", pretrained=False, freeze=True)
+    assert not any(p.requires_grad for p in frozen.backbone.parameters())
+    assert frozen.pause_arch != net.pause_arch
+    print("backbone: BGR->RGB + ImageNet norm in the net, BN frozen, no state carried, frames independent, own pause tag OK")
+
+
 def check_real(root: Path) -> None:
     from python.data.raw_frames import load_scene_rows
     from python.train.scene_loader import select_training_rows
@@ -331,6 +375,7 @@ def main() -> None:
     check_bias_init()
     check_map_mismatch()
     check_bootstrap()
+    check_backbone()
     if args.real:
         check_real(Path(args.real))
     print("test_trainer_fixes: all OK")

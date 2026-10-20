@@ -1,4 +1,4 @@
-﻿"""Overfit acceptance: can the scene net memorise 96 real front frames?
+"""Overfit acceptance: can the scene net memorise 96 real front frames?
 
 CPU only. Fixed LR 1e-3, clip 1.0, AdamW with the trainer's weight decay,
 the trainer's lane_gt loss with ``--conf-weight`` applied. Frames are main
@@ -74,6 +74,9 @@ def main(argv=None) -> int:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--mode", choices=("full", "nogru", "noskip"), default="full")
     ap.add_argument("--diag", action="store_true")
+    ap.add_argument("--backbone", choices=("scratch", "imagenet-resnet18", "mobilenetv3"), default="scratch",
+                    help="Single-frame ImageNet baseline instead of the GRU scene net (--mode must stay full)")
+    ap.add_argument("--freeze-backbone", action="store_true")
     ap.add_argument("--threads", type=int, default=4)
     args = ap.parse_args(argv)
 
@@ -99,7 +102,15 @@ def main(argv=None) -> int:
         flush=True,
     )
     torch.manual_seed(int(args.seed))
-    net = SceneNet(cams=("main",))
+    if args.backbone != "scratch":
+        if args.mode != "full":
+            raise SystemExit("--mode applies to the scratch net only")
+        from python.train.pretrained_net import build_scene_net
+
+        net = build_scene_net(("main",), 1.0, args.backbone, freeze=bool(args.freeze_backbone))
+        print(f"[overfit] backbone={args.backbone} freeze={bool(args.freeze_backbone)} single-frame, no GRU", flush=True)
+    else:
+        net = SceneNet(cams=("main",))
     if args.mode != "full":
         import types
 

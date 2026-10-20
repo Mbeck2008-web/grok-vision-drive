@@ -477,9 +477,11 @@ def _run_supervisor(
 ) -> dict | None:
     """Run run_vision.py headless for `seconds`; optionally play the mod's ack role meanwhile.
 
-    The run's clock starts when this supervisor writes its first gvd_cmd.json (`t_ready`), not
-    at spawn: imports (torch through the trainer modules) and model load are startup, not the
-    work under test. `seconds`, `cmd_blind` and `freeze_echo_after_s` count from `t_ready`.
+    The run's clock starts at this supervisor's first tick (its first gvd_cmd.json and
+    gvd_state.json, `t_ready`), not at spawn: imports (torch through the trainer modules) and
+    model load are startup, not the work under test. `seconds`, `cmd_blind` and
+    `freeze_echo_after_s` count from `t_ready` on time.monotonic(); wall time is only used to
+    compare with the stamps inside the files.
     `clock`, when given, gets `t_spawn` and `t_ready` (wall time), and with
     `freeze_echo_after_s` also `t_frozen`: when the mod wrote its last advancing echo.
 
@@ -524,7 +526,8 @@ def _run_supervisor(
             stale.unlink()
         except FileNotFoundError:
             pass
-    t_spawn = time.time()
+    t_spawn = time.time()  # wall: compared with the files' own stamps
+    m_spawn = time.monotonic()  # monotonic: every deadline and window below
     # Never PIPE. A full pipe freezes the supervisor (engaged, cmd_json_pending), and
     # Windows TerminateProcess discards the child's unflushed stdout anyway.
     proc = subprocess.Popen(
@@ -536,7 +539,8 @@ def _run_supervisor(
     )
     latched: dict | None = None
     loose: dict | None = None  # a matching snapshot whose state no longer names the reason
-    t_start = t_spawn  # replaced by t_ready once this supervisor's first command lands
+    t_start = t_spawn  # replaced by t_ready once this supervisor's first tick lands
+    m_start = m_spawn
     ready = False
     frozen: dict | None = None
     dropped = False
@@ -552,13 +556,14 @@ def _run_supervisor(
         if not ack:
             return
         now = time.time()
+        mnow = time.monotonic()
         if frozen is not None:
             # Electrics echo stopped: the file keeps a fresh mtime, echo_seq does not move.
             _write_ego(**frozen)
             return
-        if now < next_echo:
+        if mnow < next_echo:
             return
-        blind = ready and cmd_blind is not None and cmd_blind[0] <= now - t_start < cmd_blind[1]
+        blind = ready and cmd_blind is not None and cmd_blind[0] <= mnow - m_start < cmd_blind[1]
         if not blind or held_cmd is None:
             try:
                 got = json.loads(cmd_path().read_text(encoding="utf-8"))
@@ -566,7 +571,7 @@ def _run_supervisor(
                     held_cmd = got
             except Exception:
                 pass
-        next_echo = max(next_echo + FAKE_ECHO_PERIOD_S, now + FAKE_ECHO_PERIOD_S / 2)
+        next_echo = max(next_echo + FAKE_ECHO_PERIOD_S, mnow + FAKE_ECHO_PERIOD_S / 2)
         if held_cmd is None:
             # The mod echoes at 10 Hz whether or not a command has arrived yet: the car's
             # speed with nothing applied (applied_seq 0, not applying). The old harness only
@@ -595,7 +600,7 @@ def _run_supervisor(
             mod_version=mod_version,
         )
         _write_ego(**kw)
-        if ready and freeze_echo_after_s is not None and now - t_start >= freeze_echo_after_s:
+        if ready and freeze_echo_after_s is not None and mnow - m_start >= freeze_echo_after_s:
             frozen = kw
             if clock is not None:
                 clock["t_frozen"] = now
@@ -632,7 +637,7 @@ def _run_supervisor(
             loose = snap
         return False
 
-    last_engage_hb = 0.0
+    last_engage_hb = -1e9
 
     def _touch_engage_heartbeat() -> None:
         """Stand in for Lua's engage-file heartbeat so a multi-second run stays latched."""
@@ -640,7 +645,7 @@ def _run_supervisor(
         if not engage_heartbeat:
             return
         now = time.time()
-        if now - last_engage_hb < 1.0:
+        if time.monotonic() - last_engage_hb < 1.0:
             return
         try:
             data = json.loads(engage_path().read_text(encoding="utf-8"))
@@ -656,27 +661,29 @@ def _run_supervisor(
             return
         again["mtime"] = now
         engage_path().write_text(json.dumps(again), encoding="utf-8")
-        last_engage_hb = now
+        last_engage_hb = time.monotonic()
 
     try:
         _touch_lua_bus()
-        # Startup: wait for this supervisor's first command. Not part of `seconds`.
-        startup_end = t_spawn + SUPERVISOR_STARTUP_S
-        while not cmd_path().exists():
+        # Startup: wait for this supervisor's first tick (its gvd_cmd.json and gvd_state.json;
+        # both were removed before spawn). Not part of `seconds`.
+        startup_end = m_spawn + SUPERVISOR_STARTUP_S
+        while not (cmd_path().exists() and state_path().exists()):
             if proc.poll() is not None:
                 raise AssertionError(f"run_vision exited during startup ({proc.returncode})")
-            if time.time() > startup_end:
-                raise AssertionError(f"run_vision wrote no gvd_cmd.json within {SUPERVISOR_STARTUP_S:.0f}s of spawn")
+            if time.monotonic() > startup_end:
+                raise AssertionError(f"run_vision wrote no gvd_cmd.json / gvd_state.json within {SUPERVISOR_STARTUP_S:.0f}s of spawn")
             _touch_lua_bus()
             _touch_engage_heartbeat()
             _ack_once()
             time.sleep(0.01)
         t_start = time.time()
+        m_start = time.monotonic()
         ready = True
         if clock is not None:
             clock.update({"t_spawn": t_spawn, "t_ready": t_start})
-        t_end = t_start + seconds
-        while time.time() < t_end:
+        m_end = m_start + seconds
+        while time.monotonic() < m_end:
             if proc.poll() is not None:
                 raise AssertionError(f"run_vision exited early ({proc.returncode})")
             _touch_lua_bus()
@@ -690,8 +697,8 @@ def _run_supervisor(
         # cmd_applied=False / cmd_json_pending for check_run_vision_e2e.
         # Override runs must not stop on cmd_applied: that flips true before the dwell.
         grace = 1.5 if expect_disengage and latched is None else (0.5 if ack and expect_disengage is None else 0.0)
-        until = time.time() + grace
-        while time.time() < until:
+        until = time.monotonic() + grace
+        while time.monotonic() < until:
             if proc.poll() is not None:
                 break
             _touch_lua_bus()

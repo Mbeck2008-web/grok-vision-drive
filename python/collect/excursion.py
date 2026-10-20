@@ -584,16 +584,27 @@ class ExcursionClock:
             self.phase_t = 0.0
             self.reason = "traffic"
             return
-        kind = chosen if chosen in ("weave", "lane_change") else self.peek_kind(n_lanes)
+        start = self.start_move(chosen, n_lanes)
         self._kind += 1
-        if kind == "lane_change" and (n_lanes is None or int(n_lanes) < 2):
-            kind = "weave"
-        self.phase = kind
+        self.phase = start.phase
         self.phase_t = 0.0
         self.reason = ""
         self._saw_offset = False
-        if kind == "lane_change":
-            self.direction = -int(self.direction or 1)
+        self.direction = int(start.direction)
+
+    def start_move(self, chosen: str | None, n_lanes: int | None) -> Excursion:
+        """The phase and direction the next start takes, without starting it.
+
+        ``_start_next`` uses this, so the gate (``sent_line_args`` with this
+        move) judges the line the start will build: a lane change flips the
+        last direction, a weave keeps it (``clock.direction`` is the side the
+        last sent line used).
+        """
+        kind = chosen if chosen in ("weave", "lane_change") else self.peek_kind(n_lanes)
+        if kind == "lane_change" and (n_lanes is None or int(n_lanes) < 2):
+            kind = "weave"
+        direction = -int(self.direction or 1) if kind == "lane_change" else self.direction
+        return Excursion(kind, 0.0, 0.0, direction, "")
 
     def _to_cruise(self) -> None:
         self.phase = "cruise"
@@ -837,6 +848,12 @@ def _chain(
         if not piece:
             break
         for px, py, fx, fy, s_m in piece:
+            if samples and s_m < 1e-6:
+                # A continuation's first sample is the previous tip again: same
+                # s, a few degrees of heading apart. Offset by the lane center,
+                # that pair is a lateral step over ~0 m, which path_lat_acc
+                # read as 13-38 m/s^2 and refused the weave.
+                continue
             samples.append((px, py, fx, fy, s_m + base))
             heading_now = math.atan2(fy, fx)
             if h0 is None:
@@ -868,6 +885,63 @@ JUNCTION_AHEAD_M = 40.0
 CURVATURE_MAX = 0.01
 
 
+@dataclass(frozen=True)
+class SentLineArgs:
+    """Everything ``excursion_path`` reads to build a sent line, but the roads.
+
+    ``phase`` and ``direction`` are the only parts of the move it reads. The
+    collector builds one of these for the gate (with ``ExcursionClock.
+    start_move``) and one for the start (with the clock's move), both through
+    ``sent_line_args``, so the gate judges the line the start sends.
+    """
+
+    x: float
+    y: float
+    heading: float | None
+    phase: str
+    direction: int
+    hit: object
+    speed_mps: float | None
+    paint_lane: tuple[float, float] | None
+    half_width_m: float | None
+
+
+def sent_line_args(
+    x: float,
+    y: float,
+    heading: float | None,
+    move: Excursion,
+    hit: object,
+    speed_mps: float | None,
+    *,
+    paint_lane: tuple[float, float] | None,
+    half_width_m: float | None,
+) -> SentLineArgs:
+    """The one place the collector's gate and start build their path inputs."""
+    return SentLineArgs(
+        x=float(x),
+        y=float(y),
+        heading=None if heading is None else float(heading),
+        phase=str(move.phase),
+        direction=1 if int(move.direction) >= 0 else -1,
+        hit=hit,
+        speed_mps=None if speed_mps is None else float(speed_mps),
+        paint_lane=None if paint_lane is None else (float(paint_lane[0]), float(paint_lane[1])),
+        half_width_m=None if half_width_m is None else float(half_width_m),
+    )
+
+
+def build_sent_line(
+    roads: list[RoadPoly], args: SentLineArgs, info: dict | None = None,
+) -> tuple[list[tuple[float, float]] | None, int]:
+    """``excursion_path`` on ``args``: what the gate checks and the start sends."""
+    return excursion_path(
+        roads, args.x, args.y, args.heading, Excursion(args.phase, 0.0, 0.0, args.direction, ""),
+        args.hit, args.speed_mps,  # type: ignore[arg-type]
+        paint_lane=args.paint_lane, half_width_m=args.half_width_m, info=info,
+    )
+
+
 def gate_reason(
     roads: list[RoadPoly],
     hit: object,
@@ -879,6 +953,8 @@ def gate_reason(
     *,
     weave_lane_w: float | None = None,
     half_width_m: float | None = None,
+    paint_lane: tuple[float, float] | None = None,
+    line: SentLineArgs | None = None,
 ) -> str:
     """Why ``phase`` cannot start, or ``open``.
 
@@ -888,7 +964,25 @@ def gate_reason(
     ``speed_mps`` sizes the weave (``weave_plan``); a weave needs
     ``max(WINDOW_M, weave_length_m(v))`` of road. ``weave_lane_w`` /
     ``half_width_m`` are the painted lane width and the ego half width.
+
+    The gate judges the line that would be sent, not a separate coarse one.
+    The window walk uses the sent-line builder (``_chain`` at PATH_STEP_M,
+    the walk ``excursion_path`` makes), and once that window is clear the
+    line itself is built with ``excursion_path`` from the same inputs
+    (``paint_lane`` is the painted lane at the car, as the collector passes
+    it). A line it refuses closes the gate with that reason (no_path,
+    narrow, road_edge, lat_acc, line_kink, line_gap). ``_span`` (8 m) is only
+    for ``near_junction`` and ``fork_ahead_m``.
+
+    ``line`` is the start's own path input (``sent_line_args`` with
+    ``ExcursionClock.start_move``): its direction is the side the start will
+    try first, which decides the line on an asymmetric bend. Without it
+    (library callers) the line is built for direction +1 from the arguments
+    here. The cheap checks (narrow, short, junction, curve) run first; the
+    full line is built only once they pass.
     """
+    if line is not None and line.phase != phase:
+        raise ValueError(f"gate_reason({phase!r}) given a {line.phase!r} line")
     if phase not in ACTIVE or hit is None or not roads:
         return "no_hit"
     if bool(getattr(hit, "off_road", False)) or bool(getattr(hit, "discontinuous", False)):
@@ -921,7 +1015,7 @@ def gate_reason(
                                road_width_m=float(road.width_m))
             if spec is not None:
                 need = max(need, maneuver_length_m(phase, float(spec[0]), speed_mps))
-    length, fork_at, span = _span(roads, road, x, y, heading, need)
+    length, fork_at, span, _samples = _chain(roads, road, x, y, heading, need, PATH_STEP_M)
     # Weaves stay in the lane, so a driveway does not block them.
     # A lane change does not start when a fork is inside 40 m.
     if phase != "weave" and fork_at is not None and fork_at < JUNCTION_AHEAD_M:
@@ -930,6 +1024,14 @@ def gate_reason(
         return "short"
     if span / max(length, 1.0) >= CURVATURE_MAX:
         return "curve"
+    if line is None:
+        line = sent_line_args(x, y, heading, Excursion(phase, 0.0, 0.0, 1, ""), hit,
+                              speed_mps if speed_mps else None,
+                              paint_lane=paint_lane, half_width_m=half_width_m)
+    info: dict = {}
+    points, _used = build_sent_line(roads, line, info)
+    if points is None:
+        return str(info.get("refused") or "no_path")
     return "open"
 
 
@@ -943,8 +1045,9 @@ def fork_ahead_m(
 ) -> float | None:
     """Distance to the first side road on this road's continuation, or None.
 
-    The same walk ``gate_reason`` uses. The weave gate ignores it; the
-    collector's ``--weave-guard`` does not.
+    The 8 m ``_span`` walk (the same roads and joins ``gate_reason`` walks,
+    coarser samples). The weave gate ignores it; the collector's
+    ``--weave-guard`` does not.
     """
     if hit is None or not roads:
         return None
@@ -1090,6 +1193,62 @@ def _lateral(
     return base + float(delta) * (1.0 - min(1.0, back / ramp))
 
 
+# Sent-line backstop. A line that survives every other check is still
+# refused when its points jump. Both caps were measured on 65 rec5b excursion
+# lines replayed over the west_coast_usa road dump (61 legitimate, 4 with a
+# wrong join: rows 3281, 13317, 24338, 27739).
+#
+# LINE_KINK_M caps the second difference at each sample: the perpendicular
+# distance from the line through its two neighbours, normalized to a 4 m step
+# by 16 / (a * b), with each neighbour spacing a, b clamped to 1..4 m. The
+# legitimate max was 0.367 m (all 61 lines), so 0.6 m is 1.6x that. The
+# smallest jump seen was 0.92 m (row 24338). That jump sits at the very end
+# of its line, where only the last segment shows it, so a future end-of-line
+# jump could read smaller than 0.6 m and pass. A clean sideways step of d at
+# 4 m spacing reads about d / 2 (d * 4 / sqrt(64 + d^2)), so steps under
+# about 1.2 m pass this cap too.
+LINE_KINK_M = 0.6
+# LINE_GAP_M caps the distance between adjacent sent points. It catches only
+# big jumps: the smallest jump seen was 5.65 m and the legitimate max gap was
+# 4.99 m (PATH_STEP_M is 4 m; a piece end adds up to ~1 m). It is NOT a check
+# for a second line laid beside the first: a parallel road 3.5 m over, joined
+# with ordinary 4 m steps, passes it. LINE_KINK_M is the check for that.
+LINE_GAP_M = 6.0
+KINK_SPACING_M = (1.0, 4.0)
+
+
+def line_kinks_m(points: list[tuple[float, float]]) -> list[float]:
+    """Normalized second difference at each interior point (see LINE_KINK_M)."""
+    lo, hi = KINK_SPACING_M
+    out: list[float] = []
+    for i in range(1, len(points) - 1):
+        ax, ay = points[i - 1]
+        bx, by = points[i]
+        cx, cy = points[i + 1]
+        ux, uy = cx - ax, cy - ay
+        chord = math.hypot(ux, uy)
+        a = math.hypot(bx - ax, by - ay)
+        b = math.hypot(cx - bx, cy - by)
+        if chord < 1e-9:
+            dev = a  # the line folds back on itself
+        else:
+            dev = abs((bx - ax) * uy - (by - ay) * ux) / chord
+        out.append(dev * hi * hi / (min(hi, max(lo, a)) * min(hi, max(lo, b))))
+    return out
+
+
+def sent_line_fault(points: list[tuple[float, float]]) -> tuple[str, float] | None:
+    """``("line_kink", m)`` or ``("line_gap", m)`` when the sent line jumps, else None."""
+    gaps = [math.hypot(points[i + 1][0] - points[i][0], points[i + 1][1] - points[i][1])
+            for i in range(len(points) - 1)]
+    if gaps and max(gaps) > LINE_GAP_M:
+        return "line_gap", max(gaps)
+    kinks = line_kinks_m(points)
+    if kinks and max(kinks) > LINE_KINK_M:
+        return "line_kink", max(kinks)
+    return None
+
+
 def excursion_path(
     roads: list[RoadPoly],
     x: float,
@@ -1119,7 +1278,10 @@ def excursion_path(
     A lane change / recover with a speed is a cosine ramp sized by
     ``ramp_length_m`` and checked the same way (lengthened, else refused);
     ``info`` gets delta_m, ramp_m, length_m, heading_rad and the accelerations.
-    A refusal sets ``info["refused"]`` (no_path, narrow, road_edge, lat_acc).
+    A refusal sets ``info["refused"]`` (no_path, narrow, road_edge, lat_acc,
+    line_gap, line_kink). The last two are the sent-line backstop
+    (``sent_line_fault``): a line that jumps between points is never sent;
+    ``info`` then also gets ``line_fault_m``.
     """
     if move.phase not in ACTIVE or hit is None or not roads:
         if info is not None:
@@ -1162,6 +1324,18 @@ def excursion_path(
         if info is not None:
             info.update(refused="no_path", need_m=need, chain_m=samples[-1][4] if samples else 0.0)
         return None, int(move.direction)
+
+    def _backstop(
+        points: list[tuple[float, float]], direction: int,
+    ) -> tuple[list[tuple[float, float]] | None, int]:
+        # The line that would be sent, after every other check: refuse it if it jumps.
+        fault = sent_line_fault(points)
+        if fault is None:
+            return points, direction
+        if info is not None:
+            info.update(refused=fault[0], line_fault_m=fault[1])
+        return None, int(move.direction)
+
     refused = "narrow"
     for direction in directions:
         spec = targets_for(
@@ -1199,7 +1373,7 @@ def excursion_path(
                 refused = "road_edge"
                 break
             if speed is None:
-                return points, direction
+                return _backstop(points, direction)
             if move.phase != "weave":
                 move_acc, total_acc = path_lat_acc(points, centerline, speed)
                 legs = 1.0 if move.phase == "lane_change" else 2.0
@@ -1208,7 +1382,7 @@ def excursion_path(
                         info.update(delta_m=delta, ramp_m=ramp, length_m=samples[-1][4],
                                     heading_rad=math.atan(abs(delta) * math.pi / (2.0 * float(ramp))),
                                     lat_acc_mps2=move_acc, total_lat_acc_mps2=total_acc, shrunk=_try)
-                    return points, direction
+                    return _backstop(points, direction)
                 # Sampling slop over the analytic ramp: lengthen it, if the road allows.
                 ramp = float(ramp) * math.sqrt(move_acc / MANEUVER_LAT_ACC_MPS2) * 1.03
                 if legs * ramp + (0.0 if legs == 1.0 else 8.0) > samples[-1][4]:
@@ -1221,7 +1395,7 @@ def excursion_path(
                 if info is not None:
                     info.update(amp_m=abs(delta), wave_m=wave, length_m=samples[-1][4],
                                 lat_acc_mps2=weave_acc, total_lat_acc_mps2=total_acc, shrunk=_try)
-                return points, direction
+                return _backstop(points, direction)
             delta *= 0.97 * WEAVE_LAT_ACC_MPS2 / weave_acc
             if abs(delta) < WEAVE_AMP_LO_M - 1e-9:
                 if info is not None:

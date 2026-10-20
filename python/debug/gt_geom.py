@@ -23,6 +23,11 @@ class RoadPoly:
     width_m: float
     # lanesLeft + lanesRight when the dump has them. 0 derives a count from width.
     lanes: int = 0
+    # Height of each ``xy`` point, per point: an entry is None where that edge
+    # record had no height. None when no record had one. Only the join filter
+    # reads it (stacked garage floors share x, y); a segment with a missing
+    # end height has no dz, so that one join is judged in plan only.
+    z: list[float | None] | None = None
 
 
 # A heading jump bigger than this in one tick is a different road, not a yaw.
@@ -37,6 +42,24 @@ PREVIEW_LOST_S = 1.5
 # 8 m / 0.5 rad missed the join on gt_ctrl3 and the car parked in the lane.
 CONNECT_M = 18.0
 CONNECT_HEADING = 1.0
+# Gap-first join filter for the excursion walk (``road_ahead_split``). A
+# candidate whose end lies inside CONNECT_M / CONNECT_HEADING is dropped,
+# before the heading pick, when any of these fails:
+# * JOIN_GAP_M: distance from the tip to its projection on the candidate
+#   road, which is the jump the walk makes onto it. Picking by heading alone
+#   took 892630 (9.97 m away, 3.49 deg) over 892725 (0.18 m, 3.59 deg) at the
+#   end of west_coast_usa road 894247, and the sent weave jumped 5-10 m
+#   sideways (rec5b lines 3281 and 27739).
+# * JOIN_HEADING_RAD: leave heading against the tip heading. This also cuts
+#   some real junctions sharper than 30 deg. That is deliberate: a cut walk
+#   only shortens the line (refused short / no_path); a wrong join sends one.
+# * JOIN_DZ_M: height of that projected point against the tip, when both
+#   roads carry z. Parking levels of the same garage sit ~4 m apart.
+# Thresholds from replaying every west_coast_usa tip against a
+# re-implementation of map.lua's link rules (see the PR that added them).
+JOIN_GAP_M = 2.0
+JOIN_HEADING_RAD = math.radians(30.0)
+JOIN_DZ_M = 1.5
 AHEAD_MIN_M = 4.0
 # Metres past the polyline tip before a missing continuation is a dead end.
 # gt_ctrl3 set the brake while still on the lane, longitudinal miss ~0.
@@ -114,6 +137,16 @@ def heading_from_dir(dx: float, dy: float) -> float:
 
 def wrap_rad(angle: float) -> float:
     return (float(angle) + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _z3(raw: object) -> float | None:
+    if not isinstance(raw, (list, tuple)) or len(raw) < 3:
+        return None
+    try:
+        value = float(raw[2])
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
 
 
 def _xy3(raw: object) -> tuple[float, float] | None:
@@ -199,18 +232,27 @@ def parse_road_edges(road_id: str, edges: object) -> RoadPoly | None:
     if not isinstance(edges, list):
         return None
     xy: list[tuple[float, float]] = []
+    zs: list[float | None] = []
     widths: list[float] = []
     for edge in edges:
         if not isinstance(edge, dict):
             continue
         left = _xy3(edge.get("left"))
         right = _xy3(edge.get("right"))
-        mid = _xy3(edge.get("middle") or edge.get("mid") or edge.get("center"))
+        mid_raw = edge.get("middle") or edge.get("mid") or edge.get("center")
+        mid = _xy3(mid_raw)
+        mid_z = _z3(mid_raw)
         if mid is None and left is not None and right is not None:
             mid = ((left[0] + right[0]) * 0.5, (left[1] + right[1]) * 0.5)
+            mid_z = None
+        if mid_z is None:
+            # A middle without a height still gets the edges' mean height.
+            lz, rz = _z3(edge.get("left")), _z3(edge.get("right"))
+            mid_z = None if lz is None or rz is None else 0.5 * (lz + rz)
         if mid is None:
             continue
         xy.append(mid)
+        zs.append(mid_z)
         got = _edge_width(edge, left, right)
         if got is not None:
             widths.append(got)
@@ -226,7 +268,71 @@ def parse_road_edges(road_id: str, edges: object) -> RoadPoly | None:
         width = 2.0 * LANE_W_M
     if width < 2.0:
         width = LANE_W_M
-    return RoadPoly(road_id=str(road_id), xy=xy, width_m=float(width))
+    # Per point: one record without a height costs that point, not the road.
+    z = None if all(value is None for value in zs) else [None if v is None else float(v) for v in zs]
+    return RoadPoly(road_id=str(road_id), xy=xy, width_m=float(width), z=z)
+
+
+@dataclass(frozen=True)
+class HeightCoverage:
+    """How much of a parsed road network carries heights (``RoadPoly.z``)."""
+
+    roads: int
+    roads_without: int  # no height at any point: no dz for any join on them
+    roads_partial: int  # some points without a height
+    points: int
+    points_without: int
+
+    @property
+    def roads_without_share(self) -> float:
+        return self.roads_without / self.roads if self.roads else 0.0
+
+    @property
+    def roads_partial_share(self) -> float:
+        return self.roads_partial / self.roads if self.roads else 0.0
+
+    @property
+    def points_without_share(self) -> float:
+        return self.points_without / self.points if self.points else 0.0
+
+
+def height_coverage(roads: list[RoadPoly]) -> HeightCoverage:
+    n = without = partial = points = points_without = 0
+    for road in roads:
+        n += 1
+        count = len(road.xy)
+        points += count
+        z = road.z
+        if z is None or len(z) != count:
+            without += 1
+            points_without += count
+            continue
+        missing = sum(1 for value in z if value is None)
+        points_without += missing
+        if missing == count:
+            without += 1
+        elif missing:
+            partial += 1
+    return HeightCoverage(n, without, partial, points, points_without)
+
+
+def road_heights_line(level: str, roads: list[RoadPoly], logged: set[str]) -> str | None:
+    """The once-per-map height log line, or None when ``level`` was logged already.
+
+    The join filter's dz check (JOIN_DZ_M) is skipped wherever a height is
+    missing, silently. This line says how often that is on this map.
+    """
+    key = str(level or "current")
+    if key in logged:
+        return None
+    logged.add(key)
+    cov = height_coverage(roads)
+    return (
+        f"collect road heights {key} roads={cov.roads} "
+        f"without={cov.roads_without} ({100.0 * cov.roads_without_share:.1f}%) "
+        f"partial={cov.roads_partial} ({100.0 * cov.roads_partial_share:.1f}%) "
+        f"points_without={cov.points_without}/{cov.points} ({100.0 * cov.points_without_share:.1f}%)"
+    )
 
 
 def lane_count(width_m: float) -> int:
@@ -485,6 +591,105 @@ def _successor(
     return None if best is None else best[1]
 
 
+def _nearest_on(road: RoadPoly, x: float, y: float) -> tuple[float, int, float, float, float] | None:
+    """``(dist, segment, t, px, py)``: the nearest point of ``road`` to (x, y).
+
+    Same pick as ``excursion._locate`` (first segment wins a tie, segments
+    under 1 mm skipped), so ``dist`` is the jump the walk makes onto it.
+    """
+    pts = road.xy
+    best: tuple[float, int, float, float, float] | None = None
+    px, py = float(x), float(y)
+    for i in range(len(pts) - 1):
+        ax, ay = pts[i]
+        bx, by = pts[i + 1]
+        dx, dy = bx - ax, by - ay
+        length2 = dx * dx + dy * dy
+        if length2 < 1e-6:
+            continue
+        t = ((px - ax) * dx + (py - ay) * dy) / length2
+        t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else t
+        cx = ax + t * dx
+        cy = ay + t * dy
+        dist = math.hypot(px - cx, py - cy)
+        if best is None or dist < best[0]:
+            best = (dist, i, t, cx, cy)
+    return best
+
+
+def _z_on(road: RoadPoly, segment: int, t: float) -> float | None:
+    z = road.z
+    if z is None or len(z) != len(road.xy) or not 0 <= segment < len(z) - 1:
+        return None
+    za, zb = z[segment], z[segment + 1]
+    if za is None or zb is None:
+        return None
+    return float(za) + float(t) * (float(zb) - float(za))
+
+
+@dataclass
+class JoinCandidate:
+    """One end of another road near this tip, and why the walk would not take it."""
+
+    road: RoadPoly
+    end: int  # 0: first point, -1: last point
+    end_m: float  # tip to that end point
+    gap_m: float  # tip to its projection on the road: the jump the walk makes
+    heading_rad: float  # |leave heading - tip heading|
+    dz_m: float | None  # projected point height - tip height; None where either lacks z
+    # None (a continuation), "join_gap", "join_heading", "join_dz", or
+    # "not_ahead" (outside CONNECT_HEADING: a side road, never a continuation).
+    refused: str | None
+
+
+def join_candidates(
+    roads: list[RoadPoly],
+    road: RoadPoly,
+    x: float,
+    y: float,
+    heading_rad: float | None,
+) -> tuple[tuple[float, float, float] | None, list[JoinCandidate]]:
+    """The forward tip of ``road`` and every road end within CONNECT_M of it."""
+    tip = _forward_tip(road, x, y, heading_rad)
+    if tip is None:
+        return None, []
+    tip_x, tip_y, tip_h = tip
+    tip_near = _nearest_on(road, tip_x, tip_y)
+    tip_z = None if tip_near is None else _z_on(road, tip_near[1], tip_near[2])
+    out: list[JoinCandidate] = []
+    for other in roads:
+        if other.road_id == road.road_id or len(other.xy) < 2:
+            continue
+        ends = (
+            (0, other.xy[0], other.xy[1]),
+            (-1, other.xy[-1], other.xy[-2]),
+        )
+        near: tuple[float, int, float, float, float] | None = None
+        for which, end, nxt in ends:
+            end_m = math.hypot(end[0] - tip_x, end[1] - tip_y)
+            if end_m > CONNECT_M:
+                continue
+            leave = math.atan2(nxt[1] - end[1], nxt[0] - end[0])
+            delta = abs(wrap_rad(leave - tip_h))
+            if near is None:
+                near = _nearest_on(other, tip_x, tip_y)
+            gap = end_m if near is None else near[0]
+            other_z = None if near is None else _z_on(other, near[1], near[2])
+            dz = None if tip_z is None or other_z is None else other_z - tip_z
+            if delta > CONNECT_HEADING:
+                refused: str | None = "not_ahead"
+            elif gap > JOIN_GAP_M:
+                refused = "join_gap"
+            elif delta > JOIN_HEADING_RAD:
+                refused = "join_heading"
+            elif dz is not None and abs(dz) > JOIN_DZ_M:
+                refused = "join_dz"
+            else:
+                refused = None
+            out.append(JoinCandidate(other, which, end_m, gap, delta, dz, refused))
+    return tip, out
+
+
 def road_ahead_split(
     roads: list[RoadPoly],
     road: RoadPoly,
@@ -496,34 +701,28 @@ def road_ahead_split(
 
     A piece boundary with one continuation is the same road. A second
     leave-heading is a junction. The continuation itself is not counted.
+
+    Gap first: a candidate is dropped when the walk would jump more than
+    JOIN_GAP_M onto it, turn more than JOIN_HEADING_RAD, or change height by
+    more than JOIN_DZ_M. Only the survivors are picked by heading. The fork
+    count is unchanged: a road whose end meets this tip (4 m) leaving
+    between CONNECT_HEADING and 2.6 rad.
     """
-    tip = _forward_tip(road, x, y, heading_rad)
+    tip, cands = join_candidates(roads, road, x, y, heading_rad)
     if tip is None:
         return None, False
-    tip_x, tip_y, tip_h = tip
     cont: RoadPoly | None = None
     cont_delta: float | None = None
     others = 0
-    for other in roads:
-        if other.road_id == road.road_id or len(other.xy) < 2:
-            continue
-        ends = (
-            (other.xy[0], other.xy[1]),
-            (other.xy[-1], other.xy[-2]),
-        )
-        for end, nxt in ends:
-            if math.hypot(end[0] - tip_x, end[1] - tip_y) > CONNECT_M:
-                continue
-            leave = math.atan2(nxt[1] - end[1], nxt[0] - end[0])
-            delta = abs(wrap_rad(leave - tip_h))
-            if delta <= CONNECT_HEADING:
-                if cont_delta is None or delta < cont_delta:
-                    cont_delta = delta
-                    cont = other
-            elif delta < 2.6 and math.hypot(end[0] - tip_x, end[1] - tip_y) <= 4.0:
-                # A road that merely passes nearby is not a fork. The end has
-                # to meet this tip.
-                others += 1
+    for cand in cands:
+        if cand.refused is None:
+            if cont_delta is None or cand.heading_rad < cont_delta:
+                cont_delta = cand.heading_rad
+                cont = cand.road
+        elif cand.refused == "not_ahead" and cand.heading_rad < 2.6 and cand.end_m <= 4.0:
+            # A road that merely passes nearby is not a fork. The end has
+            # to meet this tip.
+            others += 1
     return cont, others > 0
 
 

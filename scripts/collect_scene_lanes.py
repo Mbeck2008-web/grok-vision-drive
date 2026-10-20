@@ -1640,9 +1640,15 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             plan_speed,
             ramp_heading_reached,
             targets_for,
+            weave_tag,
         )
 
-        clock = ExcursionClock()
+        # collect.json weave_stats. It outlives every ExcursionClock (startup,
+        # recover, segment, respawn), so the weave side balance does too.
+        weave_stats = WeaveStats()
+        clock = ExcursionClock(weave_stats.weave_side)
+        # The weave in progress: (its clock, side, segment), until it ends.
+        weave_open: tuple[Any, int, str] | None = None
         from python.collect.liveness import (
             ImpactWatch,
             Liveness,
@@ -1703,10 +1709,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         loaded_map = ""
         loaded_index = -1
         speed_span = [speeds]
-        # Effective speed range per segment (collect.json speed_ranges) and the
-        # weave / lane change / recover counters (collect.json weave_stats).
+        # Effective speed range per segment (collect.json speed_ranges). The
+        # weave / lane change / recover counters (weave_stats) are made with the first clock.
         speed_ranges: dict[str, list[dict[str, Any]]] = {}
-        weave_stats = WeaveStats()
         # Planning speed and phase of the move in progress (None between moves).
         plan_v: float | None = None
         plan_phase = ""
@@ -1891,7 +1896,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     time.sleep(SETTLE_S)
                     recover_lost_s += stall_s + float(SETTLE_S)
                     live.reset()
-                    clock = ExcursionClock()
+                    clock = ExcursionClock(weave_stats.weave_side)
                     last_ai = None
                     held_tag = None
                     prev_dir = None
@@ -2248,7 +2253,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 loaded_index = seg_index
                 last_ai = None
                 held_tag = None
-                clock = ExcursionClock()
+                clock = ExcursionClock(weave_stats.weave_side)
                 live.reset()
                 segment_aborts = 0
                 cams_ready = False
@@ -2423,7 +2428,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 if driving:
                     segment_open = True
                     live.reset()
-                    clock = ExcursionClock()
+                    clock = ExcursionClock(weave_stats.weave_side)
                     # A new segment or a respawn: the next refusal is a new blocked stretch.
                     weave_stats.end_stretch()
                     lane_change_run = None
@@ -2613,7 +2618,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 start_kind = kind
                 window_ok = gate == "open"
                 if not window_ok and not clock.reason:
-                    weave_stats.refuse(gate, v_plan)  # one attempt; a blocked stretch counts once
+                    # One attempt; a blocked stretch counts once. A weave attempt is
+                    # counted on its side and is not retried on the other side.
+                    weave_stats.refuse(gate, v_plan, direction=start_move.direction if kind == "weave" else None)
                 now_gate = time.monotonic()
                 if gate != gate_note or now_gate - gate_log_t >= 5.0:
                     word = "open" if gate == "open" else f"blocked {gate}"
@@ -2647,6 +2654,18 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 )
             else:
                 move = Excursion("cruise", 0.0, 0.0, 1, "")
+            if weave_open is not None and (weave_open[0] is not clock or clock.phase != "weave"):
+                # The started weave ended: line end / WEAVE_S (completed), an abort, or a new clock.
+                if weave_open[0] is not clock:
+                    end_why = "reset"
+                elif clock.phase == "cruise":
+                    end_why = "timeout"
+                else:
+                    end_why = str(clock.reason or clock.phase)
+                weave_stats.weave_end(weave_open[1], end_why)
+                print(f"collect excursion {weave_open[2]} weave abort {end_why} "
+                      f"side={'L' if weave_open[1] < 0 else 'R'}", flush=True)
+                weave_open = None
             if lane_change_run is not None and clock.phase != "lane_change":
                 if clock.phase == "recover":
                     # LANE_CHANGE_S is up. A slow car has not reached the end of the ramp.
@@ -2685,8 +2704,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     half_width_m=ego_half_w,
                 )
                 if spec is not None and move.phase == "weave" and path_info.get("amp_m") is not None:
-                    amp_sent = float(path_info["amp_m"])
-                    spec = (int(used) * amp_sent, -int(used) * math.atan(amp_sent * 2.0 * math.pi / float(path_info["wave_m"])))
+                    spec = weave_tag(int(used), float(path_info["amp_m"]), float(path_info["wave_m"]))
                 elif spec is not None and path_info.get("heading_rad") is not None:
                     # Cosine ramp: the tag heading is the sent line's peak heading.
                     spec = (float(spec[0]), math.copysign(float(path_info["heading_rad"]), float(spec[1])))
@@ -2699,7 +2717,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                         f"collect weave {segment_id} {speeds_txt} amp={path_info.get('amp_m', 0.0):.2f}m "
                         f"wave={path_info.get('wave_m', 0.0):.0f}m line={path_info.get('length_m', 0.0):.0f}m "
                         f"lat_acc={path_info.get('lat_acc_mps2', 0.0):.2f} m/s2 "
-                        f"(with road {path_info.get('total_lat_acc_mps2', 0.0):.2f}) shrunk={path_info.get('shrunk', 0)}",
+                        f"(with road {path_info.get('total_lat_acc_mps2', 0.0):.2f}) shrunk={path_info.get('shrunk', 0)} "
+                        f"side={'L' if int(used) < 0 else 'R'}",
                         flush=True,
                     )
                 elif path is not None and path_info:
@@ -2714,7 +2733,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     why_refused = str(path_info.get("refused") or ("narrow" if path is not None else "no_path"))
                     print(f"collect {move.phase} {segment_id} refused {why_refused} {speeds_txt} "
                           f"lat_acc={path_info.get('lat_acc_mps2', 0.0):.2f} m/s2", flush=True)
-                    weave_stats.refuse(why_refused, v_plan)
+                    new_weave = move.phase == "weave" and (plan_v is None or plan_phase != move.phase)
+                    weave_stats.refuse(why_refused, v_plan, direction=int(move.direction) if new_weave else None)
                     resolved = clock.force_abort("no_path")
                     path = None
                     plan_v, plan_phase = None, ""
@@ -2727,6 +2747,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                             and float(path_info.get("length_m") or 0.0) <= 0.5 * wave_sent + 1.0,
                         )
                         plan_overspeed_noted = False
+                        if move.phase == "weave":
+                            weave_open = (clock, int(used), segment_id)
                         if move.phase == "lane_change" and path_info.get("ramp_m") is not None:
                             lane_change_run = {
                                 "covered_m": 0.0,
@@ -2736,6 +2758,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                             }
                     plan_v, plan_phase = v_plan, move.phase
                     clock.direction = int(used)
+                    if move.phase == "lane_change":
+                        clock.lane_direction = int(used)
                     resolved = Excursion(move.phase, float(spec[0]), float(spec[1]), int(used), move.reason)
                 ai_key = (round(speed, 3), waypoint, resolved.phase, resolved.direction, map_name)
             send_ai = last_ai != ai_key

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Callable
 
 from python.debug.gt_geom import CURVATURE_AHEAD_M, RoadPoly, lane_center_offsets, road_ahead_split
 
@@ -290,7 +291,15 @@ WEAVE_STATS_NOTES = {
     "lane_change_complete": "lane changes whose recover began after the car covered the planned ramp",
     "lane_change_incomplete": "lane changes whose recover began (after LANE_CHANGE_S) before the car "
                               "covered the planned ramp; their label heading is the peak the line reached",
+    "sides": "weaves by the side of their first half-wave (left = direction -1, right = +1): started (line "
+             "sent), completed (line end or WEAVE_S reached), refused (every refused start attempt aimed at "
+             "that side, by reason) and aborted (ended early, by reason; reset = respawn, recover or new "
+             "segment). Each weave attempt aims at the side with fewer completed weaves, alternating on a tie",
 }
+
+WEAVE_SIDES = {1: "right", -1: "left"}
+# A weave that ends this way ran its whole line (or WEAVE_S): it counts as completed for the side balance.
+WEAVE_COMPLETE = ("line_end", "timeout")
 
 
 class WeaveStats:
@@ -309,6 +318,30 @@ class WeaveStats:
         self.lane_change_complete = 0
         self.lane_change_incomplete = 0
         self._stretch = False
+        # Per weave side. Lives on the collector, so the balance survives every ExcursionClock rebuild.
+        self.by_side: dict[str, dict[str, object]] = {
+            name: {"started": 0, "completed": 0, "refused": {}, "aborted": {}} for name in ("left", "right")
+        }
+        self._last_side = 0  # side of the last weave attempt (started or refused); 0 = none yet
+
+    def weave_side(self) -> int:
+        """Side of the next weave attempt: the side with fewer completed weaves; on a tie, the other
+        side from the last attempt (right first)."""
+        left = int(self.by_side["left"]["completed"])  # type: ignore[arg-type]
+        right = int(self.by_side["right"]["completed"])  # type: ignore[arg-type]
+        if left != right:
+            return -1 if left < right else 1
+        return -self._last_side if self._last_side else 1
+
+    def weave_end(self, direction: int, reason: str) -> None:
+        """A started weave ended: completed (WEAVE_COMPLETE) or aborted for ``reason``."""
+        side = self.by_side[WEAVE_SIDES[1 if int(direction) >= 0 else -1]]
+        key = str(reason or "unknown")
+        if key in WEAVE_COMPLETE:
+            side["completed"] = int(side["completed"]) + 1  # type: ignore[arg-type]
+        else:
+            per = side["aborted"]
+            per[key] = per.get(key, 0) + 1  # type: ignore[union-attr]
 
     def start(self, phase: str, v_plan: float | None, *, direction: int = 1, one_sided: bool = False) -> None:
         self.started[phase] = self.started.get(phase, 0) + 1
@@ -316,13 +349,26 @@ class WeaveStats:
         band = speed_band(v_plan)
         if band in self.bands:
             self.bands[band]["started"] += 1
+        if phase == "weave":
+            side = 1 if int(direction) >= 0 else -1
+            self._last_side = side
+            entry = self.by_side[WEAVE_SIDES[side]]
+            entry["started"] = int(entry["started"]) + 1  # type: ignore[arg-type]
         if phase == "weave" and one_sided:
             # Offset is positive to the right; the first half-wave goes to ``direction``.
             self.sides["right" if int(direction) >= 0 else "left"] += 1
 
-    def refuse(self, reason: str, v_plan: float | None) -> None:
-        """One refused attempt. ``refused`` counts it only when it opens a blocked stretch."""
+    def refuse(self, reason: str, v_plan: float | None, *, direction: int | None = None) -> None:
+        """One refused attempt. ``refused`` counts it only when it opens a blocked stretch.
+
+        ``direction`` is the side of a refused weave attempt (None for other phases): it is counted
+        per side and is the last side tried for the tie alternation."""
         key = str(reason or "unknown")
+        if direction is not None:
+            side = 1 if int(direction) >= 0 else -1
+            self._last_side = side
+            per = self.by_side[WEAVE_SIDES[side]]["refused"]
+            per[key] = per.get(key, 0) + 1  # type: ignore[union-attr]
         self.refused_attempts[key] = self.refused_attempts.get(key, 0) + 1
         band = speed_band(v_plan)
         if band in self.bands:
@@ -366,6 +412,11 @@ class WeaveStats:
             "lane_change_incomplete": int(self.lane_change_incomplete),
             "by_speed_band": {k: dict(v) for k, v in self.bands.items()},
             "half_wave_sides": dict(self.sides),
+            "sides": {
+                name: {"started": v["started"], "completed": v["completed"],
+                       "refused": dict(v["refused"]), "aborted": dict(v["aborted"])}  # type: ignore[call-overload]
+                for name, v in self.by_side.items()
+            },
             "recover_overspeed_logged": int(self.overspeed_logged),
         }
 
@@ -451,12 +502,20 @@ def unsafe_reason(
 
 
 class ExcursionClock:
-    """Cruise, then weave / lane-change / recover, then cruise again."""
+    """Cruise, then weave / lane-change / recover, then cruise again.
 
-    def __init__(self) -> None:
+    ``weave_side`` (the collector passes ``WeaveStats.weave_side``) picks each
+    weave's side, so the side balance outlives the clock. Without it (library
+    callers) a weave keeps ``direction``.
+    """
+
+    def __init__(self, weave_side: Callable[[], int] | None = None) -> None:
         self.phase = "cruise"
         self.phase_t = 0.0
         self.direction = 1
+        # The last lane change's side: the next lane change flips it, as before.
+        self.lane_direction = 1
+        self._weave_side = weave_side
         self._kind = 0
         self.reason = ""
         self._saw_offset = False
@@ -591,19 +650,27 @@ class ExcursionClock:
         self.reason = ""
         self._saw_offset = False
         self.direction = int(start.direction)
+        if start.phase == "lane_change":
+            self.lane_direction = int(start.direction)
 
     def start_move(self, chosen: str | None, n_lanes: int | None) -> Excursion:
         """The phase and direction the next start takes, without starting it.
 
         ``_start_next`` uses this, so the gate (``sent_line_args`` with this
         move) judges the line the start will build: a lane change flips the
-        last direction, a weave keeps it (``clock.direction`` is the side the
-        last sent line used).
+        last lane change's direction; a weave takes ``weave_side()`` when the
+        clock has one, else keeps ``direction`` (the side the last sent line used).
         """
         kind = chosen if chosen in ("weave", "lane_change") else self.peek_kind(n_lanes)
         if kind == "lane_change" and (n_lanes is None or int(n_lanes) < 2):
             kind = "weave"
-        direction = -int(self.direction or 1) if kind == "lane_change" else self.direction
+        if kind == "lane_change":
+            last = self.lane_direction if self._weave_side is not None else self.direction
+            direction = -int(last or 1)
+        elif self._weave_side is not None:
+            direction = 1 if int(self._weave_side()) >= 0 else -1
+        else:
+            direction = self.direction
         return Excursion(kind, 0.0, 0.0, direction, "")
 
     def _to_cruise(self) -> None:
@@ -691,6 +758,14 @@ def targets_for(
     if abs(base + direction * mag) > road_w * 0.5 - EDGE_M:
         return None
     return (direction * mag, _heading(direction))
+
+
+def weave_tag(direction: int, amp_m: float, wave_m: float) -> tuple[float, float]:
+    """The weave row tag for a sent line: ``target_offset_m`` (+ right, so -1 is negative) and
+    ``target_heading_rad`` (+ left of the road, so -1 is positive)."""
+    side = 1 if int(direction) >= 0 else -1
+    amp = abs(float(amp_m))
+    return (side * amp, -side * math.atan(amp * 2.0 * math.pi / float(wave_m)))
 
 
 def excursion_commands(
@@ -955,6 +1030,7 @@ def gate_reason(
     half_width_m: float | None = None,
     paint_lane: tuple[float, float] | None = None,
     line: SentLineArgs | None = None,
+    direction: int = 1,
 ) -> str:
     """Why ``phase`` cannot start, or ``open``.
 
@@ -977,8 +1053,9 @@ def gate_reason(
     ``line`` is the start's own path input (``sent_line_args`` with
     ``ExcursionClock.start_move``): its direction is the side the start will
     try first, which decides the line on an asymmetric bend. Without it
-    (library callers) the line is built for direction +1 from the arguments
-    here. The cheap checks (narrow, short, junction, curve) run first; the
+    (library callers) the line is built for ``direction`` (+1 right, -1
+    left) from the arguments here. A weave is checked on that one side
+    only. The cheap checks (narrow, short, junction, curve) run first; the
     full line is built only once they pass.
     """
     if line is not None and line.phase != phase:
@@ -992,7 +1069,8 @@ def gate_reason(
         return "no_hit"
     lane_w = getattr(hit, "lane_width_m", None)
     lane_id = int(getattr(hit, "lane_id", 0) or 0)
-    directions = [1, -1] if phase == "lane_change" else [1]
+    side = (1 if int(direction) >= 0 else -1) if line is None else int(line.direction)
+    directions = [1, -1] if phase == "lane_change" else [side]
     if not any(
         targets_for(
             phase,
@@ -1025,7 +1103,7 @@ def gate_reason(
     if span / max(length, 1.0) >= CURVATURE_MAX:
         return "curve"
     if line is None:
-        line = sent_line_args(x, y, heading, Excursion(phase, 0.0, 0.0, 1, ""), hit,
+        line = sent_line_args(x, y, heading, Excursion(phase, 0.0, 0.0, side, ""), hit,
                               speed_mps if speed_mps else None,
                               paint_lane=paint_lane, half_width_m=half_width_m)
     info: dict = {}
@@ -1292,6 +1370,7 @@ def excursion_path(
         if info is not None:
             info.update(refused="no_path")
         return None, int(move.direction)
+    # A weave is built on the side it was given only (no fallback to the other side).
     directions = [1 if int(move.direction) >= 0 else -1]
     if move.phase == "lane_change":
         directions.append(-directions[0])

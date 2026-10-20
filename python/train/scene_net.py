@@ -986,23 +986,35 @@ class SceneState:
     mask: Any
 
 
+def _lane_gt_present(pred: ScenePrediction, target: Mapping[str, Any]) -> bool:
+    """True when this batch has a lane_gt term at all: torch, a head output, and a target."""
+    return (
+        torch is not None
+        and getattr(pred, "lane_gt", None) is not None
+        and "lane_gt" in target
+        and "lane_gt_valid" in target
+    )
+
+
 def _lane_gt_parts(
     functional: Any,
     pred: ScenePrediction,
     target: Mapping[str, Any],
     device: Any,
     dtype: Any,
-    zero: Any,
+    zero: Any = None,
     *,
     lane_loss: str = "huber",
-) -> tuple[Any, Any]:
+) -> tuple[Any, Any] | None:
     """``(conf_bce, lane_reg)``: BCE on the confidence, smooth-L1 on the rest.
 
-    A recording without the vector contributes nothing. The confidence slot
-    is a probability already (sigmoid in the head).
+    ``None`` when there is no lane_gt term (torch missing, no head output, or
+    no target): the caller decides what "absent" is, so nobody multiplies a
+    placeholder ``zero`` by ``conf_weight``. ``zero`` is accepted and unused.
+    The confidence slot is a probability already (sigmoid in the head).
     """
-    if torch is None or pred.lane_gt is None or "lane_gt" not in target or "lane_gt_valid" not in target:
-        return zero, zero
+    if not _lane_gt_present(pred, target):
+        return None
     pred_v = pred.lane_gt.to(device=device, dtype=dtype).reshape(-1, LANE_GT_DIM)
     goal = target["lane_gt"].to(device=device, dtype=dtype).reshape(-1, LANE_GT_DIM)
     mask = target["lane_gt_valid"].to(device=device, dtype=dtype).reshape(-1, LANE_GT_DIM)
@@ -1036,11 +1048,15 @@ def _lane_gt_loss(
     lane_loss: str = "huber",
     conf_weight: float = 1.0,
 ) -> Any:
-    """``conf_weight`` x confidence BCE plus the lookahead regression."""
-    if torch is None or pred.lane_gt is None or "lane_gt" not in target or "lane_gt_valid" not in target:
-        # No lane_gt term: hand ``zero`` back unchanged, unweighted.
+    """``conf_weight`` x confidence BCE plus the lookahead regression.
+
+    No lane_gt term: ``zero`` comes back unchanged and unweighted. No
+    arithmetic touches it, so a placeholder (or a tensor) is returned as is.
+    """
+    parts = _lane_gt_parts(functional, pred, target, device, dtype, lane_loss=lane_loss)
+    if parts is None:
         return zero
-    bce, reg = _lane_gt_parts(functional, pred, target, device, dtype, zero, lane_loss=lane_loss)
+    bce, reg = parts
     return float(conf_weight) * bce + reg
 
 
@@ -1206,7 +1222,11 @@ def _scene_loss_body(
             lamps=lamps,
         )
     if "lane_gt" in wanted:
-        conf_bce, lane_reg = _lane_gt_parts(functional, pred, target, device, dtype, zero, lane_loss=lane_loss)
+        parts = _lane_gt_parts(functional, pred, target, device, dtype, lane_loss=lane_loss)
+    else:
+        parts = None
+    if parts is not None:
+        conf_bce, lane_reg = parts
         lane_gt_term = float(conf_weight) * conf_bce + lane_reg
     else:
         conf_bce, lane_reg = zero.clone(), zero.clone()

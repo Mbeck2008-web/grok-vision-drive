@@ -376,7 +376,13 @@ def check_lane_gt_loss_does_not_shadow_torch() -> None:
     )
     token = object()
     assert _lane_gt_loss(None, pred, {}, None, None, token) is token
-    print("lane gt loss reads the module torch")
+    # Weighted too: the absent term is never ``conf_weight * zero``.
+    assert _lane_gt_loss(None, pred, {}, None, None, token, conf_weight=0.1) is token
+    from python.train.scene_net import _lane_gt_parts
+
+    assert _lane_gt_parts(None, pred, {}, None, None, token) is None
+    assert _lane_gt_parts(None, pred, {"lane_gt": 0, "lane_gt_valid": 0}, None, None, token) is None
+    print("lane gt loss reads the module torch; absent term returns zero untouched")
 
 
 def check_smoke_rate_and_flags() -> None:

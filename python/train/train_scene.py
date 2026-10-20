@@ -349,7 +349,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Cell list JSON. Loaded when it exists, else chosen and written. Default: <status dir>/holdout_cells.json.",
     )
-    parser.add_argument("--holdout-seed", type=int, default=0, help="Seed for choosing --holdout-cells.")
+    parser.add_argument(
+        "--holdout-seed",
+        type=int,
+        default=0,
+        help=(
+            "Seed for drawing --holdout-cells (default 0, fixed). The draw is saved and reused; the seed in "
+            "use is written to the run metadata. A re-draw means changing this once, on purpose, and that "
+            "new seed is recorded; never re-roll it until the val scores look good."
+        ),
+    )
     parser.add_argument(
         "--conf-weight",
         type=float,
@@ -1842,7 +1851,14 @@ def train_directory(
         cells_path = Path(holdout_cells_file) if holdout_cells_file else Path(cells_dir) / "holdout_cells.json"
         if cells_path.is_file():
             cell_spec = load_holdout_cells(cells_path, rows)
-            print(f"[GVD] holdout cells: loaded {len(cell_spec['cells'])} cells from {cells_path}", flush=True)
+            print(f"[GVD] holdout cells: loaded {len(cell_spec['cells'])} cells from {cells_path} "
+                  f"(drawn with seed {cell_spec.get('seed')})", flush=True)
+            if cell_spec.get("seed") is not None and int(cell_spec["seed"]) != int(holdout_seed):
+                print(
+                    f"[GVD] holdout cells: the saved draw (seed {cell_spec.get('seed')}) is reused; --holdout-seed "
+                    f"{int(holdout_seed)} does not re-draw it. A re-draw is a deliberate new cells file.",
+                    flush=True,
+                )
         else:
             cell_spec = choose_holdout_cells(rows, seed=int(holdout_seed))
             check_holdout_cells(cell_spec, rows, source="chosen cells")
@@ -1859,6 +1875,26 @@ def train_directory(
     from python.train.continual import HOLDOUT_FAST_MPS, holdout_mix
 
     startup_plan = pass_plan(rows, CHUNK_MAX, CHUNK_MAX // 2, blocks=int(holdout_blocks), cells=cell_spec)
+    from python.train.continual import format_composition, lopsided_warnings, split_composition
+
+    # Validation composition: what val scores are measured on, next to what trains.
+    composition = split_composition(
+        rows, startup_plan, buffer_rows=marks.count("gap") if cell_spec is not None else None
+    )
+    lopsided = lopsided_warnings(composition)
+    print(f"[GVD] holdout composition: {format_composition(composition)}", flush=True)
+    for warning in lopsided:
+        print(f"[GVD] holdout WARNING lopsided (>2x): {warning}; val scores over-weight or miss it", flush=True)
+    holdout_meta: dict[str, Any] = {
+        "mode": "cells" if cell_spec is not None else ("blocks" if int(holdout_blocks) > 1 else "segments"),
+        "seed": None if cell_spec is None else cell_spec.get("seed"),
+        "seed_flag": int(holdout_seed),
+        "cells_file": None if cell_spec is None else str(cells_path.name),
+        "cells": None if cell_spec is None else len(cell_spec.get("cells") or []),
+        "blocks": int(holdout_blocks),
+        "composition": composition,
+        "lopsided": lopsided,
+    }
     mix = holdout_mix(startup_plan)
     print(
         f"[GVD] holdout: rows={mix['rows']} slices={mix['slices']} fast={mix['fast']} slow={mix['slow']} "
@@ -2038,7 +2074,8 @@ def train_directory(
                                "heads_requested": list(train_heads or ()) or "all",
                                "heads_unlabelled": list(unlabelled_heads),
                                "recordings": run_recordings,
-                               "rows_by_recording": recording_counts(rows)})
+                               "rows_by_recording": recording_counts(rows),
+                               "holdout": holdout_meta})
     print(f"[GVD] run cams={','.join(run_cams)} heads={','.join(stamp_heads)} "
           "(written to metrics.jsonl and the ONNX gvd_cams / gvd_heads)", flush=True)
     write_heartbeat(

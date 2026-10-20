@@ -1059,6 +1059,116 @@ def holdout_mix(plan: list[Mapping[str, Any]], fast_mps: float = HOLDOUT_FAST_MP
     return out
 
 
+# Speed bands (m/s) for the train/val composition: [low, high).
+SPEED_BANDS: tuple[tuple[str, float, float], ...] = (
+    ("0-5", 0.0, 5.0),
+    ("5-15", 5.0, 15.0),
+    ("15-25", 15.0, 25.0),
+    ("25+", 25.0, float("inf")),
+)
+LOPSIDED_RATIO = 2.0
+LOPSIDED_MIN_SHARE = 0.05
+
+
+def row_phase(row: Mapping[str, Any]) -> str:
+    """The collector's excursion phase (cruise, weave, lane_change, abort, ...); ``none`` when absent."""
+    exc = row.get("excursion")
+    phase = exc.get("phase") if isinstance(exc, Mapping) else exc
+    return str(phase) if phase not in (None, "") else "none"
+
+
+def speed_band(row: Mapping[str, Any]) -> str:
+    spd = _row_speed(row)
+    if spd is None:
+        return "no_speed"
+    for name, low, high in SPEED_BANDS:
+        if low <= abs(spd) < high:
+            return name
+    return SPEED_BANDS[-1][0]
+
+
+def _shares(rows: list[Mapping[str, Any]], key: Any) -> dict[str, float]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        name = key(row)
+        counts[name] = counts.get(name, 0) + 1
+    total = float(len(rows)) or 1.0
+    return {name: round(n / total, 4) for name, n in sorted(counts.items())}
+
+
+def split_composition(
+    rows: list[Mapping[str, Any]],
+    plan: list[Mapping[str, Any]],
+    *,
+    buffer_rows: int | None = None,
+) -> dict[str, Any]:
+    """Rows, phase shares and speed-band shares of train and val (holdout).
+
+    A row in any holdout slice is val; else in any train chunk, train
+    (overlapping chunks count it once); else it is dropped. ``buffer_rows``
+    (the cell split's gap rows: inside the buffer, near a held row in time,
+    or without a position) is recorded as given; ``dropped`` also holds
+    rows in spans too short for a chunk.
+    """
+    split: dict[int, str] = {}
+    for item in plan:
+        kind = item.get("kind")
+        for row in item.get("rows") or []:
+            idx = id(row) if row.get("i") is None else int(row["i"])
+            if kind == "holdout":
+                split[idx] = "val"
+            elif kind == "train" and split.get(idx) != "val":
+                split[idx] = "train"
+    groups: dict[str, list[Mapping[str, Any]]] = {"train": [], "val": [], "dropped": []}
+    for row in rows:
+        idx = id(row) if row.get("i") is None else int(row["i"])
+        groups[split.get(idx, "dropped")].append(row)
+    out: dict[str, Any] = {
+        "rows": {name: len(group) for name, group in groups.items()},
+        "buffer_rows": None if buffer_rows is None else int(buffer_rows),
+    }
+    for name in ("train", "val"):
+        out[name] = {"phase": _shares(groups[name], row_phase), "speed": _shares(groups[name], speed_band)}
+    return out
+
+
+def lopsided_warnings(
+    comp: Mapping[str, Any],
+    *,
+    ratio: float = LOPSIDED_RATIO,
+    min_share: float = LOPSIDED_MIN_SHARE,
+) -> list[str]:
+    """A phase or speed band whose val share is more than ``ratio`` x off train's.
+
+    Shares under ``min_share`` on both sides are ignored (a few rows are
+    noise). A category present on one side only counts as lopsided.
+    """
+    out: list[str] = []
+    for axis in ("phase", "speed"):
+        train = dict((comp.get("train") or {}).get(axis) or {})
+        val = dict((comp.get("val") or {}).get(axis) or {})
+        for name in sorted(set(train) | set(val)):
+            a, b = float(train.get(name, 0.0)), float(val.get(name, 0.0))
+            if max(a, b) < float(min_share):
+                continue
+            if min(a, b) <= 0.0 or max(a, b) / min(a, b) > float(ratio):
+                out.append(f"{axis} {name}: train {a:.1%} vs val {b:.1%}")
+    return out
+
+
+def format_composition(comp: Mapping[str, Any]) -> str:
+    rows = comp.get("rows") or {}
+    parts = [f"rows train={rows.get('train', 0)} val={rows.get('val', 0)} dropped={rows.get('dropped', 0)}"]
+    if comp.get("buffer_rows") is not None:
+        parts.append(f"buffer={comp['buffer_rows']}")
+    for name in ("train", "val"):
+        side = comp.get(name) or {}
+        phase = " ".join(f"{k}={v:.0%}" for k, v in (side.get("phase") or {}).items())
+        speed = " ".join(f"{k}={v:.0%}" for k, v in (side.get("speed") or {}).items())
+        parts.append(f"{name}: phase[{phase}] speed_mps[{speed}]")
+    return "; ".join(parts)
+
+
 def _pairs_score(preds: list[float], truth: list[float]) -> tuple[float | None, float | None]:
     p = np.asarray(preds, dtype=np.float64)
     t = np.asarray(truth, dtype=np.float64)

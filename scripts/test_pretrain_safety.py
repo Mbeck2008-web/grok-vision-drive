@@ -42,6 +42,9 @@
 (l) hard links share the raw bytes: combining, building a frame cache over
     the combined folder and reading it for training leave every source
     file's sha256, size and mtime unchanged.
+(m) the train/val composition (rows, buffer rows, phase and speed-band
+    shares) is computed per split, a >2x val/train share gap warns, and the
+    cell seed is a fixed-default flag recorded in the run metadata.
 """
 from __future__ import annotations
 
@@ -864,11 +867,67 @@ def check_links_read_only() -> None:
           "combine, cache build, cached + raw training reads and a refused re-link OK")
 
 
+def check_val_composition() -> None:
+    from python.train.continual import (
+        cell_holdout_labels,
+        choose_holdout_cells,
+        format_composition,
+        lopsided_warnings,
+        pass_plan,
+        speed_band,
+        split_composition,
+    )
+    from python.train.train_scene import build_parser
+
+    def row(i: int, phase: str | None, spd: float) -> dict:
+        out = {"i": i, "t": float(i), "ego": {"speed_mps": spd}}
+        if phase:
+            out["excursion"] = {"phase": phase}
+        return out
+
+    rows = [row(i, "cruise", 20.0) for i in range(60)] + [row(60 + i, "weave", 8.0) for i in range(20)]
+    rows += [row(80 + i, None, 2.0) for i in range(10)] + [row(90 + i, "cruise", 30.0) for i in range(10)]
+    plan = [
+        {"kind": "train", "rows": rows[0:40]},
+        {"kind": "train", "rows": rows[20:70]},  # overlap: counted once
+        {"kind": "holdout", "rows": rows[70:80] + rows[90:100]},
+    ]
+    comp = split_composition(rows, plan, buffer_rows=7)
+    assert comp["rows"] == {"train": 70, "val": 20, "dropped": 10} and comp["buffer_rows"] == 7, comp["rows"]
+    assert comp["train"]["phase"] == {"cruise": round(60 / 70, 4), "weave": round(10 / 70, 4)}
+    assert comp["val"]["phase"] == {"cruise": 0.5, "weave": 0.5}
+    assert comp["val"]["speed"] == {"25+": 0.5, "5-15": 0.5} and comp["train"]["speed"]["15-25"] == round(60 / 70, 4)
+    warns = lopsided_warnings(comp)
+    assert any(w.startswith("phase weave") for w in warns) and any(w.startswith("speed 25+") for w in warns), warns
+    assert any(w.startswith("phase cruise") for w in warns) is False, "0.86 vs 0.5 is within 2x"
+    even = split_composition(rows, [{"kind": "train", "rows": rows[::2]}, {"kind": "holdout", "rows": rows[1::2]}])
+    assert lopsided_warnings(even) == [], lopsided_warnings(even)
+    assert speed_band({"ego": {}}) == "no_speed" and "buffer=7" in format_composition(comp)
+
+    # On the real cell split: every row lands in exactly one of train / val / dropped.
+    loop_rows = [{"i": i, "t": float(i), "map": "m", "segment": "s#0", "excursion": {"phase": "cruise"},
+                  "ego": {"speed_mps": 25.0, "pos": [float((i * 26) % 2000), float(((i * 26) // 2000) * 300)]}}
+                 for i in range(800)]
+    spec = choose_holdout_cells(loop_rows, seed=0)
+    marks = cell_holdout_labels(loop_rows, spec)
+    cplan = pass_plan(loop_rows, 64, 32, cells=spec)
+    ccomp = split_composition(loop_rows, cplan, buffer_rows=marks.count("gap"))
+    assert sum(ccomp["rows"].values()) == 800 and ccomp["rows"]["val"] == marks.count("hold"), ccomp["rows"]
+    assert ccomp["rows"]["dropped"] >= marks.count("gap")
+    assert spec["seed"] == 0 and choose_holdout_cells(loop_rows, seed=0) == spec, "fixed seed, same draw"
+    assert build_parser().parse_args([]).holdout_seed == 0
+    trainer = (Path(__file__).resolve().parents[1] / "python" / "train" / "train_scene.py").read_text(encoding="utf-8")
+    assert '"holdout": holdout_meta' in trainer and '"seed": None if cell_spec is None else cell_spec.get("seed")' in trainer
+    print(f"(m) composition: {format_composition(comp)}; lopsided: {warns}; cell split {ccomp['rows']} "
+          f"buffer={ccomp['buffer_rows']}; seed fixed (default 0) and recorded OK")
+
+
 def main() -> None:
     check_multi_recording()
     check_road_area_holdout()
     check_heads_contract()
     check_links_read_only()
+    check_val_composition()
     check_camera_contract()
     check_cache_on_c()
     check_other_cams()

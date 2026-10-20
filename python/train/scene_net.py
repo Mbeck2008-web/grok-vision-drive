@@ -986,7 +986,7 @@ class SceneState:
     mask: Any
 
 
-def _lane_gt_loss(
+def _lane_gt_parts(
     functional: Any,
     pred: ScenePrediction,
     target: Mapping[str, Any],
@@ -995,14 +995,14 @@ def _lane_gt_loss(
     zero: Any,
     *,
     lane_loss: str = "huber",
-) -> Any:
-    """Smooth-L1 on the lookaheads and heading, BCE on the confidence.
+) -> tuple[Any, Any]:
+    """``(conf_bce, lane_reg)``: BCE on the confidence, smooth-L1 on the rest.
 
     A recording without the vector contributes nothing. The confidence slot
     is a probability already (sigmoid in the head).
     """
     if torch is None or pred.lane_gt is None or "lane_gt" not in target or "lane_gt_valid" not in target:
-        return zero
+        return zero, zero
     pred_v = pred.lane_gt.to(device=device, dtype=dtype).reshape(-1, LANE_GT_DIM)
     goal = target["lane_gt"].to(device=device, dtype=dtype).reshape(-1, LANE_GT_DIM)
     mask = target["lane_gt_valid"].to(device=device, dtype=dtype).reshape(-1, LANE_GT_DIM)
@@ -1022,7 +1022,23 @@ def _lane_gt_loss(
         residual = functional.smooth_l1_loss(values, goal_v, reduction="none")
     # Masked slots stay out of the mean. A stored NaN is not a real zero.
     residual = torch.where(value_mask > 0.5, residual, torch.zeros_like(residual))
-    return bce + residual.sum() / denom
+    return bce, residual.sum() / denom
+
+
+def _lane_gt_loss(
+    functional: Any,
+    pred: ScenePrediction,
+    target: Mapping[str, Any],
+    device: Any,
+    dtype: Any,
+    zero: Any,
+    *,
+    lane_loss: str = "huber",
+    conf_weight: float = 1.0,
+) -> Any:
+    """``conf_weight`` x confidence BCE plus the lookahead regression."""
+    bce, reg = _lane_gt_parts(functional, pred, target, device, dtype, zero, lane_loss=lane_loss)
+    return float(conf_weight) * bce + reg
 
 
 def head_names(heads: tuple[str, ...] | list[str] | None) -> frozenset[str]:
@@ -1040,6 +1056,7 @@ def _scene_loss_body(
     heads: tuple[str, ...] | list[str] | None = None,
     *,
     lane_loss: str = "huber",
+    conf_weight: float = 1.0,
 ) -> dict[str, Any]:
     if torch is None:
         raise ImportError("PyTorch is not installed")
@@ -1116,11 +1133,12 @@ def _scene_loss_body(
             gt_state=target["sign_state"].to(device=device, dtype=torch.long),
             lamps=lamps,
         )
-    lane_gt_term = (
-        _lane_gt_loss(functional, pred, target, device, dtype, zero, lane_loss=lane_loss)
-        if "lane_gt" in wanted
-        else zero.clone()
-    )
+    if "lane_gt" in wanted:
+        conf_bce, lane_reg = _lane_gt_parts(functional, pred, target, device, dtype, zero, lane_loss=lane_loss)
+        lane_gt_term = float(conf_weight) * conf_bce + lane_reg
+    else:
+        conf_bce, lane_reg = zero.clone(), zero.clone()
+        lane_gt_term = zero.clone()
     points = lane_points + curb_points + obj_points + sign_points
     valid = lane_valid + curb_valid + obj_valid + sign_valid
     # A lane-only run must not backprop the other heads. Those zeros are
@@ -1140,6 +1158,9 @@ def _scene_loss_body(
         "valid": valid,
         "lane_gt": lane_gt_term,
         "total": total,
+        # Unweighted parts of lane_gt, for the val line. Not in LOSS_TERMS.
+        "lane_reg": lane_reg,
+        "conf_bce": conf_bce,
     }
     if set(LOSS_TERMS) - set(out):
         raise RuntimeError("scene loss is missing a term")
@@ -1196,6 +1217,7 @@ def scene_loss(
     heads: tuple[str, ...] | list[str] | None = None,
     *,
     lane_loss: str = "huber",
+    conf_weight: float = 1.0,
 ) -> dict[str, Any]:
     """Smooth-L1 on points, cross-entropy on class and lamps, match on objects and signs.
 
@@ -1203,7 +1225,7 @@ def scene_loss(
     ``huber`` (smooth-L1, the default), ``l1``, or ``mse``. The forward pass
     and the export still carry every head. Wheel and pedals are not terms.
     """
-    return _scene_loss_body(pred, target, heads, lane_loss=lane_loss)
+    return _scene_loss_body(pred, target, heads, lane_loss=lane_loss, conf_weight=conf_weight)
 
 
 if torch is not None:

@@ -32,6 +32,7 @@ if str(ROOT) not in sys.path:
 
 from python.data.strip_writer import CANVAS_H, CANVAS_W  # noqa: E402
 from python.train.continual import (  # noqa: E402
+    CHUNK_MAX,
     GRAD_CLIP,
     WEIGHT_DECAY,
     chunk_stride,
@@ -263,6 +264,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Cell list JSON. Loaded when it exists, else chosen and written. Default: <status dir>/holdout_cells.json.",
     )
     parser.add_argument("--holdout-seed", type=int, default=0, help="Seed for choosing --holdout-cells.")
+    parser.add_argument(
+        "--conf-weight",
+        type=float,
+        default=DEFAULT_CONF_WEIGHT,
+        help=(
+            "Scale on the lane_gt confidence BCE in the training loss (default 0.1). "
+            "Model selection uses the 8 m center rms only."
+        ),
+    )
+    parser.add_argument(
+        "--init-head-bias",
+        action="store_true",
+        help=(
+            "On a fresh start only, set lane_gt_head.bias to per-slot Huber constants "
+            "of the train rows. Off by default; a diagnostic, not a fix."
+        ),
+    )
+    parser.add_argument(
+        "--eval-chunk",
+        type=int,
+        default=CHUNK_MAX,
+        help=(
+            "Holdout resets the GRU every N frames, like the 16-frame training windows "
+            "(default 16). The old single-sequence score is reported as r_long/rms_long/bias_long. "
+            "0 scores the single sequence only."
+        ),
+    )
     return parser
 
 
@@ -408,6 +436,119 @@ def _as_target(labels: dict[str, Any], device: Any) -> dict[str, Any]:
 
 def _prediction_at(pred: ScenePrediction, index: int) -> ScenePrediction:
     return ScenePrediction(**{name: getattr(pred, name)[index] for name in OUTPUT_FIELDS})
+
+
+# Confidence BCE scale in the training loss. 1.0 let the 0/1 paint-coverage
+# target dominate the lane loss; the val score never uses it.
+DEFAULT_CONF_WEIGHT = 0.1
+# A held-out 8 m center spread below this is a constant prediction.
+COLLAPSE_STD_M = 0.05
+LANE_SLOT_NAMES = (
+    "c5", "l5", "r5", "c10", "l10", "r10", "c20", "l20", "r20", "c30", "l30", "r30", "heading", "conf_logit",
+)
+# Frames whose main area was all zero and were skipped in this process.
+BLANK_MAIN_SKIPS = 0
+
+
+def main_area_blank(frame: Any, cams: tuple[str, ...] | None, scale: float = 1.0) -> bool:
+    """True when ``main`` is a trained camera and its area of ``frame`` is all zero.
+
+    A missing front picture is stitched as a black sector, and that row still
+    carries a real lane label.
+    """
+    from python.data.strip_writer import STRIP_ORDER
+    from python.train.cam_strip import scaled_layout
+
+    names = tuple(cams) if cams else tuple(STRIP_ORDER)
+    if frame is None or "main" not in names:
+        return False
+    sectors, _height, width = scaled_layout(names, scale if float(scale) < 0.999 else 1.0)
+    arr = np.asarray(frame)
+    if arr.ndim < 2 or int(arr.shape[1]) != int(width):
+        return False
+    for sec in sectors:
+        if sec.cam_id == "main":
+            return not bool(np.any(arr[:, sec.x0 : sec.x1]))
+    return False
+
+
+def huber_slot_constants(
+    rows: list[Mapping[str, Any]],
+    *,
+    delta: float = 1.0,
+    iters: int = 20,
+) -> np.ndarray:
+    """Per-slot Huber-optimal constant of the lane_gt targets over ``rows``.
+
+    Slots 0..12 start at the median of the valid values and take ``iters``
+    reweighted means (weight ``min(1, delta/|residual|)``), which is the
+    smooth-L1 minimiser the loss uses. Slot 13 is the head's pre-sigmoid
+    confidence: the logit of the mean target. An empty slot is 0.
+    """
+    from python.debug.lane_targets import LANE_GT_DIM, lane_gt_from_record
+
+    values: list[np.ndarray] = []
+    masks: list[np.ndarray] = []
+    for row in rows:
+        tech = row.get("tech") if isinstance(row.get("tech"), Mapping) else None
+        if not isinstance(tech, Mapping) or not tech:
+            continue
+        vec, mask = lane_gt_from_record(tech)
+        values.append(np.asarray(vec, dtype=np.float64))
+        masks.append(np.asarray(mask, dtype=np.float64))
+    out = np.zeros((LANE_GT_DIM,), dtype=np.float64)
+    if not values:
+        return out.astype(np.float32)
+    V = np.stack(values)
+    M = np.stack(masks)
+    for j in range(LANE_GT_DIM - 1):
+        col = V[M[:, j] > 0.5, j]
+        col = col[np.isfinite(col)]
+        if col.size == 0:
+            continue
+        c = float(np.median(col))
+        for _ in range(int(iters)):
+            res = np.abs(col - c)
+            w = np.minimum(1.0, float(delta) / np.maximum(res, 1e-12))
+            c = float(np.sum(w * col) / np.sum(w))
+        out[j] = c
+    conf = V[M[:, -1] > 0.5, -1]
+    conf = conf[np.isfinite(conf)]
+    if conf.size:
+        p = float(np.clip(conf.mean(), 1e-3, 1.0 - 1e-3))
+        out[-1] = math.log(p / (1.0 - p))
+    return out.astype(np.float32)
+
+
+def apply_head_bias(net: Any, constants: Any) -> None:
+    """Copy ``constants`` into ``net.lane_gt_head.bias``."""
+    import torch
+
+    with torch.no_grad():
+        bias = net.lane_gt_head.bias
+        bias.copy_(torch.as_tensor(np.asarray(constants, dtype=np.float32), device=bias.device, dtype=bias.dtype))
+
+
+def _stack_states(*states: SceneState) -> SceneState:
+    import torch
+
+    return SceneState(
+        h=torch.cat([s.h for s in states], dim=1),
+        tokens=torch.cat([s.tokens for s in states], dim=0),
+        mask=torch.cat([s.mask for s in states], dim=0),
+    )
+
+
+def _reset_stream(net: Any, state: SceneState, b: int, device: Any) -> SceneState:
+    """``state`` with stream ``b`` cleared to a fresh GRU state."""
+    fresh = net.initial_state(device=device, batch=1)
+    h = state.h.clone()
+    tokens = state.tokens.clone()
+    mask = state.mask.clone()
+    h[:, b] = fresh.h[:, 0].to(dtype=h.dtype)
+    tokens[b] = fresh.tokens[0].to(dtype=tokens.dtype)
+    mask[b] = fresh.mask[0].to(dtype=mask.dtype)
+    return SceneState(h=h, tokens=tokens, mask=mask)
 
 
 def _is_oom(exc: BaseException) -> bool:
@@ -590,6 +731,11 @@ def _frame_row(
         from python.train.cam_strip import scale_canvas
 
         frame = scale_canvas(frame, scale, cams)
+    if main_area_blank(frame, cams, scale):
+        # No front picture: a black main sector with a real label. Skip it.
+        global BLANK_MAIN_SKIPS
+        BLANK_MAIN_SKIPS += 1
+        return None
     if augment:
         frame = photometric_jitter(frame, rng)
     # The stitch is not a yaw roll, so this returns the frame and the row.
@@ -651,6 +797,7 @@ def _optimizer_step(
     heads: tuple[str, ...] | None = None,
     lane_loss: str = "huber",
     frames: list[Any] | None = None,
+    conf_weight: float = 1.0,
     scale: float = 1.0,
 ) -> tuple[float | None, int, SceneState, SceneState]:
     """Backprop through this chunk only.
@@ -697,7 +844,9 @@ def _optimizer_step(
             pred, state = net.forward_batch(image, dt, state)
         if loss_mask(row):
             one = _prediction_at(pred, 0)
-            step = scene_loss(one, _as_target(labels_for_row(row), device), heads, lane_loss=lane_loss)
+            step = scene_loss(
+                one, _as_target(labels_for_row(row), device), heads, lane_loss=lane_loss, conf_weight=conf_weight
+            )
             if trace is not None and trace.get("print_shapes") and not trace.get("shapes_printed"):
                 _print_step_shapes(image, one, step, state)
                 trace["shapes_printed"] = True
@@ -784,6 +933,7 @@ def _optimizer_group(
     heads: tuple[str, ...] | None = None,
     lane_loss: str = "huber",
     frame_sets: list[list[Any] | None] | None = None,
+    conf_weight: float = 1.0,
     scale: float = 1.0,
 ) -> tuple[float | None, int, SceneState, SceneState]:
     """One step on several windows that each start from a fresh GRU state.
@@ -842,7 +992,9 @@ def _optimizer_group(
             if row is None or not loss_mask(row):
                 continue
             one = _prediction_at(pred, b)
-            step = scene_loss(one, _as_target(labels_for_row(row), device), heads, lane_loss=lane_loss)
+            step = scene_loss(
+                one, _as_target(labels_for_row(row), device), heads, lane_loss=lane_loss, conf_weight=conf_weight
+            )
             value = step["total"]
             item_loss = float(value.detach().item())
             if math.isnan(item_loss):
@@ -918,50 +1070,78 @@ def _eval_sequence(
     cache: Any = None,
     heads: tuple[str, ...] | None = None,
     scale: float = 1.0,
+    reset_every: int = CHUNK_MAX,
+    pairs_long: list[tuple[float, float]] | None = None,
+    pair_rows: list[Mapping[str, Any]] | None = None,
+    parts: dict[str, float] | None = None,
+    conf_weight: float = 1.0,
+    preds_out: list[Any] | None = None,
 ) -> tuple[float | None, int]:
-    """Holdout forward. No optimizer step and no gradient through these frames."""
+    """Holdout forward. No optimizer step and no gradient through these frames.
+
+    The primary stream clears the GRU every ``reset_every`` rows, the same
+    fresh-state 16-frame windows training sees. ``pairs_long`` gets the old
+    protocol: one stream through the whole slice from ``state``. Both run as
+    one batch of two. ``reset_every`` <= 0 scores the single stream only.
+    The loss, ``parts`` (``lane_reg``/``conf_bce`` sums and ``n``),
+    ``pair_rows`` (the row behind each primary pair) and ``preds_out``
+    (``(row, vector)`` per scored frame) follow the primary stream.
+    """
     import torch
 
+    from python.debug.lane_targets import lane_center_is_valid, lane_gt_from_record, lane_x_from_vector
+
+    chunked = int(reset_every) > 0
+    width = 2 if chunked and pairs_long is not None else 1
+    if width == 2:
+        state = _stack_states(state, state)
     net.eval()
     total = None
     n_loss = 0
     try:
         with torch.no_grad():
-            for row in rows:
+            for k, row in enumerate(rows):
+                if chunked and k % int(reset_every) == 0:
+                    state = _reset_stream(net, state, 0, device)
                 loaded = _frame_row(root, row, cams=cams, cache=cache, augment=False, scale=scale)
                 if loaded is None:
                     continue
                 frame, row = loaded
-                image = torch.from_numpy(frame).to(device)
-                dt = torch.tensor([step_dt(row.get("dt_s"))], dtype=torch.float32, device=device)
+                stacked = np.stack([frame] * width) if width > 1 else frame
+                image = torch.from_numpy(np.ascontiguousarray(stacked)).to(device)
+                dt_value = step_dt(row.get("dt_s"))
+                dt = torch.tensor([dt_value] * width, dtype=torch.float32, device=device)
                 with _autocast(amp):
                     pred, state = net.forward_batch(image, dt, state)
                 one = _prediction_at(pred, 0)
-                if pairs is not None:
-                    from python.debug.lane_targets import (
-                        lane_center_is_valid,
-                        lane_gt_from_record,
-                        lane_x_from_vector,
-                    )
-
-                    lane = getattr(one, "lane_gt", None)
-                    vec = None if lane is None else lane.detach().float().cpu().numpy().reshape(-1)
-                    tech = row.get("tech") if isinstance(row.get("tech"), dict) else row
-                    gt_vec, gt_mask = lane_gt_from_record(tech if isinstance(tech, dict) else None)
-                    if lane_center_is_valid(gt_mask):
+                tech = row.get("tech") if isinstance(row.get("tech"), dict) else row
+                gt_vec, gt_mask = lane_gt_from_record(tech if isinstance(tech, dict) else None)
+                if preds_out is not None and getattr(one, "lane_gt", None) is not None:
+                    preds_out.append((row, one.lane_gt.detach().float().cpu().numpy().reshape(-1)))
+                if (pairs is not None or pairs_long is not None) and lane_center_is_valid(gt_mask):
+                    gt_x = lane_x_from_vector(gt_vec)
+                    gt_f = float("nan") if gt_x is None else float(gt_x)
+                    for b in range(width):
+                        lane = getattr(_prediction_at(pred, b), "lane_gt", None)
+                        vec = None if lane is None else lane.detach().float().cpu().numpy().reshape(-1)
                         pred_x = None if vec is None else lane_x_from_vector(vec)
-                        gt_x = lane_x_from_vector(gt_vec)
-                        pairs.append(
-                            (
-                                float("nan") if pred_x is None else float(pred_x),
-                                float("nan") if gt_x is None else float(gt_x),
-                            )
-                        )
+                        pair = (float("nan") if pred_x is None else float(pred_x), gt_f)
+                        if b == 0 and pairs is not None:
+                            pairs.append(pair)
+                            if pair_rows is not None:
+                                pair_rows.append(row)
+                        if pairs_long is not None and (b == 1 or width == 1):
+                            pairs_long.append(pair)
                 if not loss_mask(row):
                     continue
-                value = scene_loss(one, _as_target(labels_for_row(row), device), heads)["total"]
+                step = scene_loss(one, _as_target(labels_for_row(row), device), heads, conf_weight=conf_weight)
+                value = step["total"]
                 total = value if total is None else total + value
                 n_loss += 1
+                if parts is not None:
+                    parts["lane_reg"] = float(parts.get("lane_reg", 0.0)) + float(step["lane_reg"].detach().item())
+                    parts["conf_bce"] = float(parts.get("conf_bce", 0.0)) + float(step["conf_bce"].detach().item())
+                    parts["n"] = int(parts.get("n", 0)) + 1
                 if view is not None:
                     view.pump()
     finally:
@@ -969,6 +1149,33 @@ def _eval_sequence(
     if total is None or n_loss == 0:
         return None, 0
     return float((total / n_loss).detach().item()), n_loss
+
+
+def val_summary(
+    pairs: list[tuple[float, float]],
+    pairs_long: list[tuple[float, float]] | None,
+    parts: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Primary r/rms/bias, the single-sequence ``*_long`` fields, the split
+    lane/confidence losses, and the 8 m center prediction spread."""
+    from python.debug.lane_targets import score_centers
+
+    scored: dict[str, Any] = dict(score_centers([p[0] for p in pairs], [p[1] for p in pairs])) if pairs else {}
+    if pairs_long:
+        extra = score_centers([p[0] for p in pairs_long], [p[1] for p in pairs_long])
+        scored["r_long"] = extra["r"]
+        scored["rms_long"] = extra["rms"]
+        scored["bias_long"] = extra["bias"]
+        scored["n_long"] = extra["n"]
+    preds = np.asarray([p[0] for p in pairs], dtype=np.float64) if pairs else np.zeros((0,))
+    preds = preds[np.isfinite(preds)]
+    scored["pred_mean"] = float(preds.mean()) if preds.size else None
+    scored["pred_std"] = float(preds.std()) if preds.size else None
+    n = int((parts or {}).get("n", 0) or 0)
+    scored["lane_loss"] = float(parts["lane_reg"]) / n if n else None
+    scored["conf_bce"] = float(parts["conf_bce"]) / n if n else None
+    scored["collapse"] = bool(scored["pred_std"] is not None and scored["pred_std"] < COLLAPSE_STD_M)
+    return scored
 
 
 def _publish(view: TrainWindow, status: TrainStatus, *, record_loss: bool = True) -> None:
@@ -1244,6 +1451,9 @@ def train_directory(
     holdout_cells: bool = False,
     holdout_cells_file: Path | None = None,
     holdout_seed: int = 0,
+    conf_weight: float = DEFAULT_CONF_WEIGHT,
+    init_head_bias: bool = False,
+    eval_chunk: int = CHUNK_MAX,
 ) -> dict[str, Any]:
     import torch
 
@@ -1270,16 +1480,28 @@ def train_directory(
         print(f"[GVD] scene index: {n_frames} frames {n_bytes} bytes", flush=True)
 
     file_bytes, _n_image_files = training_frame_bytes(root, progress=_index_progress)
-    rows, missing_rows, excluded_rows = select_training_rows(root, state_rows)
+    dropped: dict[str, int] = {}
+    rows, missing_rows, excluded_rows = select_training_rows(root, state_rows, cams=train_cams, dropped=dropped)
     print(
         f"[GVD] scene index: {len(rows)} rows with frames, {missing_rows} missing, "
         f"{excluded_rows} stationary or tipped",
+        flush=True,
+    )
+    print(
+        f"[GVD] scene index: dropped {int(dropped.get('no_trained_cam', 0))} rows without a decodable "
+        f"trained camera ({','.join(train_cams or ()) or 'all'}; main required when trained)",
+        flush=True,
+    )
+    print(
+        f"[GVD] conf_weight={float(conf_weight)} (confidence BCE scale in the training loss; "
+        f"model selection uses the 8 m center rms only) eval_chunk={int(eval_chunk)}",
         flush=True,
     )
     cell_spec: dict[str, Any] | None = None
     if holdout_cells:
         from python.train.continual import (
             cell_holdout_labels,
+            check_holdout_cells,
             choose_holdout_cells,
             load_holdout_cells,
             save_holdout_cells,
@@ -1291,10 +1513,11 @@ def train_directory(
         cells_dir = _cells_status_dir(status_root) or root
         cells_path = Path(holdout_cells_file) if holdout_cells_file else Path(cells_dir) / "holdout_cells.json"
         if cells_path.is_file():
-            cell_spec = load_holdout_cells(cells_path)
+            cell_spec = load_holdout_cells(cells_path, rows)
             print(f"[GVD] holdout cells: loaded {len(cell_spec['cells'])} cells from {cells_path}", flush=True)
         else:
             cell_spec = choose_holdout_cells(rows, seed=int(holdout_seed))
+            check_holdout_cells(cell_spec, rows, source="chosen cells")
             save_holdout_cells(cell_spec, cells_path)
             print(f"[GVD] holdout cells: chose {len(cell_spec['cells'])} cells (seed {int(holdout_seed)}), saved {cells_path}", flush=True)
         marks = cell_holdout_labels(rows, cell_spec)
@@ -1305,6 +1528,22 @@ def train_directory(
         )
     elif int(holdout_blocks) > 1:
         print(f"[GVD] holdout blocks: {int(holdout_blocks)}", flush=True)
+    from python.train.continual import HOLDOUT_FAST_MPS, holdout_mix
+
+    startup_plan = pass_plan(rows, CHUNK_MAX, CHUNK_MAX // 2, blocks=int(holdout_blocks), cells=cell_spec)
+    mix = holdout_mix(startup_plan)
+    print(
+        f"[GVD] holdout: rows={mix['rows']} slices={mix['slices']} fast={mix['fast']} slow={mix['slow']} "
+        f"no_speed={mix['no_speed']} (fast is row speed >= {HOLDOUT_FAST_MPS} m/s)",
+        flush=True,
+    )
+    if cell_spec is not None:
+        held_cells = list(cell_spec.get("cells") or [])
+        n_fast = sum(1 for c in held_cells if c.get("class") == "fast")
+        print(
+            f"[GVD] holdout cells: fast={n_fast} slow={len(held_cells) - n_fast} of {len(held_cells)} cells",
+            flush=True,
+        )
     if free_vram_bytes is None:
         free_vram_bytes = read_free_vram_bytes()
     if free_ram_bytes is None:
@@ -1612,6 +1851,9 @@ def train_directory(
             hold_sum = 0.0
             hold_n = 0
             val_pairs: list[tuple[float, float]] = []
+            val_pairs_long: list[tuple[float, float]] = []
+            val_rows: list[Mapping[str, Any]] = []
+            val_parts: dict[str, float] = {"lane_reg": 0.0, "conf_bce": 0.0, "n": 0}
             index = 0
             prefetch = _prefetch_loader(
                 plan_steps,
@@ -1655,6 +1897,11 @@ def train_directory(
                         cache=cache,
                         heads=train_heads,
                         scale=input_scale,
+                        reset_every=int(eval_chunk),
+                        pairs_long=val_pairs_long,
+                        pair_rows=val_rows,
+                        parts=val_parts,
+                        conf_weight=float(conf_weight),
                     )
                     if held_loss is not None and held_count:
                         hold_sum += float(held_loss) * int(held_count)
@@ -1705,6 +1952,7 @@ def train_directory(
                             rng=augment_rng,
                             heads=train_heads,
                             lane_loss=lane_kind,
+                            conf_weight=float(conf_weight),
                             scale=input_scale,
                             frames=prefetched_frames,
                         )
@@ -1726,6 +1974,7 @@ def train_directory(
                             rng=augment_rng,
                             heads=train_heads,
                             lane_loss=lane_kind,
+                            conf_weight=float(conf_weight),
                             frame_sets=group_frames,
                             scale=input_scale,
                         )
@@ -1819,41 +2068,83 @@ def train_directory(
             mean = hold_sum / hold_n
             scored: dict[str, Any] = {}
             if val_pairs:
-                from python.debug.lane_targets import score_centers
+                scored = val_summary(val_pairs, val_pairs_long, val_parts)
+                record = {
+                    "kind": "val",
+                    "t": time.time(),
+                    "step": int(done),
+                    "epoch": int(epoch),
+                    "loss": json_num(mean),
+                    "n": scored["n"],
+                    "r": json_num(scored["r"]),
+                    "rms": json_num(scored["rms"]),
+                    "rms_mean": json_num(scored["rms_mean"]),
+                    "bias": json_num(scored["bias"]),
+                    "eval_chunk": int(eval_chunk),
+                    "r_long": json_num(scored.get("r_long")),
+                    "rms_long": json_num(scored.get("rms_long")),
+                    "bias_long": json_num(scored.get("bias_long")),
+                    "lane_loss": json_num(scored.get("lane_loss")),
+                    "conf_bce": json_num(scored.get("conf_bce")),
+                    "conf_weight": float(conf_weight),
+                    "pred_mean": json_num(scored.get("pred_mean")),
+                    "pred_std": json_num(scored.get("pred_std")),
+                    "collapse": bool(scored.get("collapse")),
+                    "blank_main_skipped": int(BLANK_MAIN_SKIPS),
+                }
+                cell_lines: list[str] = []
+                if cell_spec is not None:
+                    from python.train.continual import bootstrap_cells, cell_scores
 
-                scored = score_centers(
-                    [pair[0] for pair in val_pairs],
-                    [pair[1] for pair in val_pairs],
-                )
-                append_metrics(
-                    debug_dir,
-                    {
-                        "kind": "val",
-                        "t": time.time(),
-                        "step": int(done),
-                        "epoch": int(epoch),
-                        "loss": json_num(mean),
-                        "n": scored["n"],
-                        "r": json_num(scored["r"]),
-                        "rms": json_num(scored["rms"]),
-                        "rms_mean": json_num(scored["rms_mean"]),
-                        "bias": json_num(scored["bias"]),
-                    },
-                )
+                    per_cell = cell_scores(val_pairs, val_rows, cell_spec)
+                    boot = bootstrap_cells(per_cell, n_boot=1000, seed=0)
+                    record["cells"] = {
+                        key: {"n": c["n"], "r": json_num(c["r"]), "rms": json_num(c["rms"])}
+                        for key, c in per_cell.items()
+                    }
+                    record["r_ci90"] = boot["r_ci"]
+                    record["rms_ci90"] = boot["rms_ci"]
+                    record["n_cells"] = boot["n_cells"]
+                    for key, c in per_cell.items():
+                        cell_lines.append(f"[GVD] val cell {key} n={c['n']} r={c['r']} rms={c['rms']}")
+                    cell_lines.append(
+                        f"[GVD] val cells n_cells={boot['n_cells']} r_ci90={boot['r_ci']} "
+                        f"rms_ci90={boot['rms_ci']} (bootstrap over cells, 1000 resamples, seed 0)"
+                    )
+                append_metrics(debug_dir, record)
                 print(
                     f"[GVD] val step={done} n={scored['n']} r={scored['r']} "
                     f"rms={scored['rms']} rms_mean={scored['rms_mean']} "
-                    f"bias={scored['bias']} loss={mean}",
+                    f"bias={scored['bias']} loss={mean} "
+                    f"lane_loss={scored.get('lane_loss')} conf_bce={scored.get('conf_bce')} "
+                    f"pred_mean={scored.get('pred_mean')} pred_std={scored.get('pred_std')} "
+                    f"r_long={scored.get('r_long')} rms_long={scored.get('rms_long')} "
+                    f"bias_long={scored.get('bias_long')} eval_chunk={int(eval_chunk)}",
                     flush=True,
                 )
+                for line in cell_lines:
+                    print(line, flush=True)
+                if scored.get("collapse"):
+                    print(
+                        f"[GVD] val COLLAPSE? pred_std={scored.get('pred_std')} m < {COLLAPSE_STD_M} m: "
+                        "the 8 m center is a near-constant prediction; r is not meaningful",
+                        flush=True,
+                    )
             # Stop on the 8 m center rms, not the composite loss. A tiny drop in
             # the other heads was keeping the run alive after the lane had plateaued.
+            # Without a scored center, the lane regression alone decides; the
+            # confidence BCE never does.
+            fallback = scored.get("lane_loss") if scored.get("lane_loss") is not None else None
+            if fallback is None and int(val_parts.get("n", 0) or 0) > 0:
+                fallback = float(val_parts["lane_reg"]) / int(val_parts["n"])
+            if fallback is None:
+                fallback = mean
             if scored.get("rms") is not None:
                 history.append(float(scored["rms"]))
                 improved = best_value is None or float(scored["rms"]) < best_value
             else:
-                history.append(mean)
-                improved = best_value is None or mean < best_value
+                history.append(float(fallback))
+                improved = best_value is None or float(fallback) < best_value
             if improved:
                 best_value = history[-1]
                 best_blob = _clone_weights()
@@ -1915,6 +2206,7 @@ def train_directory(
                 augment=False,
                 heads=train_heads,
                 lane_loss=lane_kind,
+                conf_weight=float(conf_weight),
                 scale=input_scale,
             )
             done = step_i + 1
@@ -1959,6 +2251,8 @@ def train_directory(
                 net = holder["net"]
                 _apply_checkpoint(net, holder["opt"], holder["scaler"], fields, device)
                 _pin_optimizer_lr(holder["opt"], rate)
+                if init_head_bias:
+                    print("[GVD] --init-head-bias ignored: resuming from a checkpoint", flush=True)
                 paused_lr = fields.get("lr")
                 if paused_lr is None or not math.isclose(float(paused_lr), rate, rel_tol=0.0, abs_tol=1e-12):
                     print(
@@ -2007,6 +2301,21 @@ def train_directory(
                 last_loss = None
                 view.losses = []
                 print(f"[GVD] scene lr={float(holder['lr'])} fixed", flush=True)
+                if init_head_bias:
+                    seen: dict[Any, Mapping[str, Any]] = {}
+                    for item in startup_plan:
+                        if item.get("kind") != "train":
+                            continue
+                        for row in item.get("rows") or []:
+                            if loss_mask(row):
+                                seen.setdefault(row.get("i"), row)
+                    constants = huber_slot_constants(list(seen.values()))
+                    apply_head_bias(net, constants)
+                    print(
+                        f"[GVD] init lane_gt_head.bias from {len(seen)} train rows (Huber, delta 1): "
+                        + " ".join(f"{name}={float(v):+.3f}" for name, v in zip(LANE_SLOT_NAMES, constants)),
+                        flush=True,
+                    )
                 _train_passes()
         if not paused_exit and not dry_run and not sanity and export_path is not None:
             export_scene_onnx(export_path, net, heads=train_heads)
@@ -2131,6 +2440,9 @@ def main(argv: list[str] | None = None) -> None:
             holdout_cells=bool(args.holdout_cells),
             holdout_cells_file=Path(args.holdout_cells_file) if args.holdout_cells_file else None,
             holdout_seed=int(args.holdout_seed),
+            conf_weight=float(args.conf_weight),
+            init_head_bias=bool(args.init_head_bias),
+            eval_chunk=int(args.eval_chunk),
         )
     except TrainFitError as exc:
         print(f"[GVD] scene train: {exc}")

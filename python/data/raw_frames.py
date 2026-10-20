@@ -547,18 +547,36 @@ def cameras_for_row(row: Mapping[str, Any] | None) -> list[str]:
     return list(STRIP_ORDER)
 
 
-def row_has_decodable_frame(root: Path | str, row: Mapping[str, Any]) -> bool:
-    """True when at least one camera the strip uses has a decodable file."""
+def row_has_decodable_frame(
+    root: Path | str,
+    row: Mapping[str, Any],
+    cams: tuple[str, ...] | list[str] | None = None,
+) -> bool:
+    """True when the strip has a decodable file the net can train on.
+
+    ``cams`` is the trained camera list. With it, at least one of those
+    cameras must decode, and ``main`` must decode whenever it is listed: a
+    tick without the front picture would be stitched with a black main
+    sector and still carry a real lane label. ``None`` keeps the old rule
+    (any camera the strip uses).
+    """
     try:
         index = int(row.get("i"))
     except (TypeError, ValueError):
         return False
     raw = Path(root) / "raw"
     stem = f"{index:06d}"
+
+    def _decodes(cam: str) -> bool:
+        return image_file_decodable(raw / cam / f"{stem}.png") or image_file_decodable(raw / cam / f"{stem}.npy")
+
+    if cams:
+        wanted = [str(cam) for cam in cams]
+        if "main" in wanted and not _decodes("main"):
+            return False
+        return any(_decodes(cam) for cam in wanted)
     for cam in cameras_for_row(row):
-        if image_file_decodable(raw / cam / f"{stem}.png"):
-            return True
-        if image_file_decodable(raw / cam / f"{stem}.npy"):
+        if _decodes(cam):
             return True
     return False
 

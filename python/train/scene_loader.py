@@ -58,8 +58,15 @@ def _stamp(value: object) -> float | None:
 def select_training_rows(
     root: Path | str,
     rows: list,
+    cams: tuple[str, ...] | list[str] | None = None,
+    dropped: dict | None = None,
 ) -> tuple[list, int, int]:
     """Keep rows that have a decodable strip camera. Count the rest as missing.
+
+    ``cams`` is the trained camera list (see ``row_has_decodable_frame``):
+    a row whose listed cameras, or whose ``main`` picture, did not decode is
+    also left out. Those rows are counted in ``missing`` and, when
+    ``dropped`` is a dict, in ``dropped["no_trained_cam"]``.
 
     Stationary, tipped, and damage spans are a third count and are not
     trained. ``dt_s`` is rewritten from the timestamps of the kept rows. A
@@ -87,6 +94,11 @@ def select_training_rows(
             continue
         if not row_has_decodable_frame(root, row):
             missing += 1
+            continue
+        if cams and not row_has_decodable_frame(root, row, cams):
+            missing += 1
+            if dropped is not None:
+                dropped["no_trained_cam"] = int(dropped.get("no_trained_cam", 0)) + 1
             continue
         item = dict(row)
         stamp = _stamp(item.get("t"))

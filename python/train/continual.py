@@ -16,6 +16,8 @@ import random
 from pathlib import Path
 from typing import Any, Mapping
 
+import numpy as np
+
 from python.train.scene_net import MEMORY_S, step_dt
 
 # AdamW candidates. The run keeps the one with the better holdout loss.
@@ -985,11 +987,152 @@ def save_holdout_cells(spec: Mapping[str, Any], path: Path | str) -> Path:
     return out
 
 
-def load_holdout_cells(path: Path | str) -> dict[str, Any]:
+def row_maps(rows: list[Mapping[str, Any]]) -> list[str]:
+    """Map names the rows cover (the ``segment`` prefix), in first-seen order."""
+    seen: list[str] = []
+    for row in rows:
+        seg = row.get("segment")
+        if not seg:
+            continue
+        name = str(seg).split("#", 1)[0]
+        if name and name not in seen:
+            seen.append(name)
+    return seen
+
+
+def check_holdout_cells(spec: Mapping[str, Any], rows: list[Mapping[str, Any]], *, source: Any = "cells") -> None:
+    """Raise when a cell list cannot be applied to these rows.
+
+    Cell keys are plain map coordinates, so cells chosen on one map would
+    silently land on unrelated road on another. A list for map A refuses
+    rows from map B, and rows that span several maps need every cell to
+    carry its own ``map``.
+    """
+    maps = row_maps(rows)
+    if not maps:
+        return
+    cells = list(spec.get("cells") or [])
+    per_map = bool(cells) and all(isinstance(c, Mapping) and c.get("map") for c in cells)
+    if len(maps) > 1 and not per_map:
+        raise ValueError(
+            f"{source}: rows span {len(maps)} maps ({', '.join(maps)}) but the holdout cells "
+            "have no per-map 'map' field; choose cells per map"
+        )
+    saved = str(spec.get("map") or "")
+    if not per_map and saved and saved != maps[0]:
+        raise ValueError(
+            f"{source}: holdout cells were chosen on map '{saved}' but the rows are on '{maps[0]}'; "
+            "pass a cell list for this map with --holdout-cells-file"
+        )
+    if per_map:
+        cell_maps = sorted({str(c.get("map")) for c in cells})
+        if not set(maps) & set(cell_maps):
+            raise ValueError(f"{source}: holdout cells are for {cell_maps} but the rows are on {maps}")
+
+
+def load_holdout_cells(path: Path | str, rows: list[Mapping[str, Any]] | None = None) -> dict[str, Any]:
+    """Read a saved cell list. With ``rows``, refuse a list for another map."""
     spec = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(spec, dict) or not isinstance(spec.get("cells"), list):
         raise ValueError(f"{path}: not a holdout cell list")
+    if rows is not None:
+        check_holdout_cells(spec, rows, source=path)
     return spec
+
+
+def holdout_mix(plan: list[Mapping[str, Any]], fast_mps: float = HOLDOUT_FAST_MPS) -> dict[str, int]:
+    """Holdout row count split by row speed (fast at or above ``fast_mps``)."""
+    out = {"rows": 0, "fast": 0, "slow": 0, "no_speed": 0, "slices": 0}
+    for item in plan:
+        if item.get("kind") != "holdout":
+            continue
+        out["slices"] += 1
+        for row in item.get("rows") or []:
+            out["rows"] += 1
+            spd = _row_speed(row)
+            if spd is None:
+                out["no_speed"] += 1
+            elif spd >= float(fast_mps):
+                out["fast"] += 1
+            else:
+                out["slow"] += 1
+    return out
+
+
+def _pairs_score(preds: list[float], truth: list[float]) -> tuple[float | None, float | None]:
+    p = np.asarray(preds, dtype=np.float64)
+    t = np.asarray(truth, dtype=np.float64)
+    ok = np.isfinite(p) & np.isfinite(t)
+    p, t = p[ok], t[ok]
+    if p.size == 0:
+        return None, None
+    rms = float(np.sqrt(np.mean((p - t) ** 2)))
+    if p.size < 3 or float(p.std()) < 1e-12 or float(t.std()) < 1e-12:
+        return None, rms
+    return float(np.corrcoef(p, t)[0, 1]), rms
+
+
+def cell_scores(
+    pairs: list[tuple[float, float]],
+    rows: list[Mapping[str, Any]],
+    spec: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Per held-out cell: n, r, rms of the 8 m center. ``rows[k]`` made ``pairs[k]``."""
+    cell_m = float(spec.get("cell_m", HOLDOUT_CELL_M))
+    groups: dict[str, tuple[list[float], list[float]]] = {}
+    for (pred, truth), row in zip(pairs, rows):
+        xy = _row_xy(row)
+        key = "none" if xy is None else "{}_{}".format(*cell_of(xy, cell_m))
+        bucket = groups.setdefault(key, ([], []))
+        bucket[0].append(float(pred))
+        bucket[1].append(float(truth))
+    out: dict[str, dict[str, Any]] = {}
+    for key in sorted(groups):
+        p, t = groups[key]
+        r, rms = _pairs_score(p, t)
+        out[key] = {"n": len(p), "r": r, "rms": rms, "pred": p, "truth": t}
+    return out
+
+
+def bootstrap_cells(
+    cells: Mapping[str, Mapping[str, Any]],
+    *,
+    n_boot: int = 1000,
+    seed: int = 0,
+    level: float = 0.90,
+) -> dict[str, Any]:
+    """Resample whole cells with replacement and pool their pairs.
+
+    Rows inside one cell are strongly correlated, so the cell is the unit.
+    Returns the ``level`` percentile interval for r and rms. Seeded.
+    """
+    keys = sorted(cells)
+    if not keys:
+        return {"n_cells": 0, "r_ci": None, "rms_ci": None, "n_boot": int(n_boot), "seed": int(seed)}
+    rng = np.random.RandomState(int(seed))
+    rs: list[float] = []
+    rmss: list[float] = []
+    for _ in range(int(n_boot)):
+        pick = rng.randint(0, len(keys), size=len(keys))
+        p: list[float] = []
+        t: list[float] = []
+        for j in pick:
+            p.extend(cells[keys[j]]["pred"])
+            t.extend(cells[keys[j]]["truth"])
+        r, rms = _pairs_score(p, t)
+        if r is not None:
+            rs.append(r)
+        if rms is not None:
+            rmss.append(rms)
+    lo = (1.0 - float(level)) / 2.0 * 100.0
+    hi = 100.0 - lo
+
+    def _ci(vals: list[float]) -> list[float] | None:
+        if not vals:
+            return None
+        return [float(np.percentile(vals, lo)), float(np.percentile(vals, hi))]
+
+    return {"n_cells": len(keys), "r_ci": _ci(rs), "rms_ci": _ci(rmss), "n_boot": int(n_boot), "seed": int(seed)}
 
 
 def _cell_distance_m(xy: tuple[float, float], key: tuple[int, int], cell_m: float) -> float:

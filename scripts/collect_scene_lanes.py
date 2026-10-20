@@ -1437,14 +1437,15 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         CAMERA_HZ,
         PNG_RATIO_MAX,
         PNG_RATIO_MEAN,
+        CameraSchedule,
         RawFrameWriter,
-        camera_due,
         camera_sidecar,
         capture_plan,
         frame_nbytes,
         plan_totals,
         yaw_rate_from_dirs,
     )
+    from python.collect.tick_log import TICKS_FILE, TickLog
     from python.data.raw_queue import RawWriteQueue
     from python.debug.gt_geom import RoadFollow, follow_label, heading_from_dir
     from python.debug.gt_logger import load_road_polys
@@ -1562,6 +1563,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         return 2
     widen_socket_timeout(bng, 120.0)
     writer = None
+    ticks = TickLog(None)
     try:
         skipped_levels: list[str] = []
         if map_names:
@@ -1617,6 +1619,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             if opened.spawn is not None:
                 spawn_pos = (float(opened.spawn[0]), float(opened.spawn[1]), float(opened.spawn[2]))
         writer = RawWriteQueue(RawFrameWriter(out, camera_sidecar(cam_cfg)))
+        ticks = TickLog(out / TICKS_FILE, 0.1)
         from python.data.strip_writer import STRIP_ORDER
         from python.debug.remote_status import CollectMeter, status_dir, write_collect_status
 
@@ -1729,7 +1732,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         # Stall respawns in a row with no recorded row, and done_s at the last one.
         stall_streak: list[float] = [0, -1.0]
         tick_dt = 0.1
-        last_cam: dict[str, float] = {}
+        # Phase-scheduled capture (raw_frames.CameraSchedule). Reset on
+        # respawn and level load; the first tick after is the new anchor.
+        cam_sched = CameraSchedule(cam_rates)
         prev_dir: list[float] | None = None
         prev_dir_t: float | None = None
         last_error = ""
@@ -1780,6 +1785,14 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             if target_s == float("inf"):
                 payload["target_s"] = None
             write_collect_status(status_root, payload)
+
+        def _tick_sleep(mark: float) -> None:
+            """Sleep the rest of the 0.1 s period and log how long the sleep took."""
+            began = time.monotonic()
+            time.sleep(tick_sleep_s(began - mark, 0.1))
+            done = time.monotonic()
+            ticks.add("sleep_s", done - began)
+            ticks.end(done)
 
         def _hz() -> float:
             try:
@@ -2262,7 +2275,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     spawn_pos = (float(opened.spawn[0]), float(opened.spawn[1]), float(opened.spawn[2]))
                 prev_dir = None
                 prev_dir_t = None
-                last_cam = {}
+                cam_sched.reset()
                 impact.reset()
                 yield_guard.reset()
                 settle.start(done_s)
@@ -2299,8 +2312,10 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     run.stop("vehicle_width", width_note)
                     return 2
             tick_mark = time.monotonic()
+            ticks.start(tick_mark)
             try:
                 frames, stamps, cam_reasons = _poll_cameras(cams)
+                ticks.add("poll_s", time.monotonic() - tick_mark)
             except Exception as exc:
                 if not is_session_error(exc):
                     raise
@@ -2331,7 +2346,14 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 print(f"collect stop {outage}", flush=True)
                 run.stop("camera_outage", outage)
                 return 4
+            veh_mark = time.monotonic()
             sample = _read_vehicle(vehicle)
+            ticks.add("veh_s", time.monotonic() - veh_mark)
+            main_stamp = stamps.get("main") if isinstance(stamps, dict) else None
+            ticks.note(
+                sim_t=sample.get("sim_t"),
+                cam_t=main_stamp.get("sensor_t") if isinstance(main_stamp, dict) else None,
+            )
             pos = sample.get("pos")
             direction = sample.get("dir")
             now = time.time()
@@ -2384,19 +2406,14 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                         print(f"collect stop {message}", flush=True)
                         run.stop("camera_warmup", message)
                         return 4
-                    time.sleep(tick_sleep_s(time.monotonic() - tick_mark, 0.1))
+                    _tick_sleep(tick_mark)
                     tick_dt = max(1e-3, time.monotonic() - tick_mark)
                     continue
             mono = time.monotonic()
             due: dict[str, Any] = {}
             due_stamps: dict[str, Any] = {}
-            held: list[tuple[str, float | None]] = []
-            for cid, image in frames.items():
-                if not camera_due(cid, mono, last_cam, cam_rates):
-                    continue
-                held.append((cid, last_cam.get(cid)))
-                last_cam[cid] = mono
-                due[cid] = image
+            for cid in cam_sched.tick(mono, list(frames)):
+                due[cid] = frames[cid]
                 if cid in stamps:
                     due_stamps[cid] = stamps[cid]
             if meter.frames == 0 and due:
@@ -2460,17 +2477,17 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                         if not _stall_respawn(now):
                             why = "stationary"
                         else:
-                            time.sleep(tick_sleep_s(time.monotonic() - tick_mark, 0.1))
+                            _tick_sleep(tick_mark)
                             tick_dt = max(1e-3, time.monotonic() - tick_mark)
                             continue
                     if why:
                         code = _abort(why)
                         if code is not None:
                             return code
-                        time.sleep(tick_sleep_s(time.monotonic() - tick_mark, 0.1))
+                        _tick_sleep(tick_mark)
                         tick_dt = max(1e-3, time.monotonic() - tick_mark)
                         continue
-                    time.sleep(tick_sleep_s(time.monotonic() - tick_mark, 0.1))
+                    _tick_sleep(tick_mark)
                     tick_dt = max(1e-3, time.monotonic() - tick_mark)
                     continue
             # A crash shows as a speed drop between two ticks. Stop the move now
@@ -2800,7 +2817,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 if not why:
                     _impact_end("impact_respawn", now)
                     if _impact_respawn(now):
-                        time.sleep(tick_sleep_s(time.monotonic() - tick_mark, 0.1))
+                        _tick_sleep(tick_mark)
                         tick_dt = max(1e-3, time.monotonic() - tick_mark)
                         continue
                     why = "impact"
@@ -2811,7 +2828,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             ):
                 _impact_end("stall_respawn", now)
                 if _stall_respawn(now):
-                    time.sleep(tick_sleep_s(time.monotonic() - tick_mark, 0.1))
+                    _tick_sleep(tick_mark)
                     tick_dt = max(1e-3, time.monotonic() - tick_mark)
                     continue
                 why = "stationary"
@@ -2832,15 +2849,12 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     if impact_respawn_on:
                         impact_respawns["abort_same_tick"] += 1  # the abort below respawns it
                 _impact_end("respawn" if why == "impact" else why, now)
-                for cid, prev in held:
-                    if prev is None:
-                        last_cam.pop(cid, None)
-                    else:
-                        last_cam[cid] = prev
+                # A tick that is not written puts its phases back.
+                cam_sched.undo()
                 code = _abort(why)
                 if code is not None:
                     return code
-                time.sleep(tick_sleep_s(time.monotonic() - tick_mark, 0.1))
+                _tick_sleep(tick_mark)
                 tick_dt = max(1e-3, time.monotonic() - tick_mark)
                 continue
             tags = {
@@ -2863,6 +2877,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 tags["impact"] = True
                 tags["impact_decel_mps2"] = round(float(impact_decel), 2)
             row_i = None if row_base is None else int(row_base) + int(getattr(writer, "enqueued", 0) or 0)
+            q_before = writer.stats()
+            submit_mark = time.monotonic()
             queued = writer.submit(
                 due,
                 t=now,
@@ -2882,6 +2898,15 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 tech=tech,
                 driver="beamng_ai",
                 tags=tags,
+            )
+            ticks.add("submit_s", time.monotonic() - submit_mark)
+            ticks.note(
+                row=bool(queued),
+                cams=len(due),
+                q=int(q_before.get("queue_depth") or 0),
+                q_mb=round(float(q_before.get("queue_bytes") or 0) / (1024.0 ** 2), 1),
+                enc_s=q_before.get("encode_s_last"),
+                commit_s=q_before.get("commit_s_last"),
             )
             if impact_event is not None:
                 impact_event["i"] = row_i if queued else last_row_i
@@ -2906,11 +2931,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 )
                 damage_warned = True
             if not queued:
-                for cid, prev in held:
-                    if prev is None:
-                        last_cam.pop(cid, None)
-                    else:
-                        last_cam[cid] = prev
+                # A tick that is not written puts its phases back.
+                cam_sched.undo()
                 print(
                     f"collect drop writer queue full cams={sorted(due)} "
                     f"{format_queue_line(writer.stats())}",
@@ -3035,7 +3057,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                         new_road_type=new_type,
                     ),
                 )
-            time.sleep(tick_sleep_s(time.monotonic() - tick_mark, 0.1))
+            _tick_sleep(tick_mark)
             tick_dt = max(1e-3, time.monotonic() - tick_mark)
             done_s += tick_dt
             if not smoke_ok and done_s >= float(args.smoke_s):
@@ -3101,6 +3123,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
     finally:
         if writer is not None:
             writer.close()
+        ticks.close()
         release_tech_beamngpy(bng)
 
 
@@ -3166,7 +3189,7 @@ def _camera_resolution(cam: Any) -> tuple[int, int] | None:
     return width, height
 
 
-def _read_camera(cid: str, cam: Any) -> tuple[Any, str, Any]:
+def _read_camera(cid: str, cam: Any, window: dict[str, Any] | None = None) -> tuple[Any, str, Any]:
     """One picture, why it was dropped, and the raw reading for its timestamp.
 
     Live grab reads shared memory with ``stream_raw``. ``poll`` is a
@@ -3181,17 +3204,28 @@ def _read_camera(cid: str, cam: Any) -> tuple[Any, str, Any]:
     resolution = _camera_resolution(cam)
     raw: Any = None
     how = "poll"
+    # ``window``: time.monotonic() right before and right after the BeamNG
+    # call, and time.time() after it. The frame was captured inside it.
+    window = {} if window is None else window
     if callable(getattr(cam, "stream_raw", None)):
         how = "stream_raw"
+        window["mono_before"] = time.monotonic()
         try:
             raw = cam.stream_raw()
         except Exception as exc:
             return None, f"stream_raw {type(exc).__name__}: {exc}", None
+        finally:
+            window["mono_after"] = time.monotonic()
+            window["wall"] = time.time()
     elif callable(getattr(cam, "poll", None)):
+        window["mono_before"] = time.monotonic()
         try:
             raw = cam.poll()
         except Exception as exc:
             return None, f"poll {type(exc).__name__}: {exc}", None
+        finally:
+            window["mono_after"] = time.monotonic()
+            window["wall"] = time.time()
     else:
         return None, "no stream_raw or poll", None
     if raw is None:
@@ -3216,7 +3250,8 @@ def _poll_cameras(cams: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any],
     stamps: dict[str, Any] = {}
     reasons: dict[str, str] = {}
     for cid, cam in cams.items():
-        image, reason, raw = _read_camera(cid, cam)
+        window: dict[str, Any] = {}
+        image, reason, raw = _read_camera(cid, cam, window)
         if image is None:
             reasons[str(cid)] = reason or "missing"
             continue
@@ -3227,7 +3262,15 @@ def _poll_cameras(cams: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any],
                 if raw.get(key) is not None:
                     sensor_t = raw.get(key)
                     break
-        stamps[cid] = {"wall": time.time(), "sensor_t": sensor_t}
+        # Capture window per frame: monotonic before and after the BeamNG
+        # call, wall clock (time.time()) as its own field, and the sensor's
+        # own time when BeamNG returns one.
+        stamps[cid] = {
+            "wall": window.get("wall", time.time()),
+            "mono_before": window.get("mono_before"),
+            "mono_after": window.get("mono_after"),
+            "sensor_t": sensor_t,
+        }
     return frames, stamps, reasons
 
 
@@ -3282,6 +3325,13 @@ def _read_vehicle(vehicle: Any) -> dict[str, Any]:
         pos = state.get("pos")
         if isinstance(pos, (list, tuple)) and len(pos) >= 3:
             sample["pos"] = [float(pos[0]), float(pos[1]), float(pos[2])]
+    # BeamNGpy's State sensor carries the vehicle's sim clock (obj:getSimTime()).
+    # Logged per tick next to wall time; None when this BeamNG does not send it.
+    sim_t = state.get("time") if isinstance(state, dict) else None
+    try:
+        sample["sim_t"] = None if sim_t is None else float(sim_t)
+    except (TypeError, ValueError):
+        sample["sim_t"] = None
     return sample
 
 

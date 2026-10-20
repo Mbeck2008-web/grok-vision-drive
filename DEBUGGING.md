@@ -65,6 +65,25 @@ steer/throttle/brake that were applied, speed, yaw rate, pose, and who
 was driving (`beamng_ai`, `gvd`, or `human`). Lane targets for that same
 index are in `gt.jsonl`.
 
+Capture is phase-scheduled (`raw_frames.CameraSchedule`). Each camera has
+a fixed grid of capture times at its rate; a tick takes the camera's frame
+when its grid time is due, or less than half a tick ahead. Missed grid
+times after a slow tick or a gap are dropped, never made up. The slow
+cameras are staggered onto different 0.1 s slots (`CAMERA_PHASE_S`), so
+pillars, repeaters, and rear rarely land on one tick together. Each
+camera entry in `state.jsonl` carries `mono_before` / `mono_after`
+(`time.monotonic()` right before and after its BeamNG call), `t` (wall
+clock), and `sensor_t` when BeamNG sends one.
+
+`ticks.jsonl` has one line per loop tick: `dt` (start to next start),
+the time in the camera poll (`poll_s`), the vehicle poll (`veh_s`), the
+writer hand-off (`submit_s`), the planned sleep (`sleep_s`), the loop top
+(`top_s`), and the rest (`other_s`); the writer queue depth and MB at the
+hand-off; the writer's last encode and commit seconds; and BeamNG's sim
+clock (`sim_t`, `sim_dt`). A tick of two periods or more names its
+largest part in `cause`. It records where a slow tick's time went; it
+does not fix slow ticks.
+
 Every minute, and once at start and stop, this rewrites
 `<data dir>\status\collect.json`: frames, Hz, dropped cameras, cameras
 that have been missing for several ticks, the fraction of ticks with a

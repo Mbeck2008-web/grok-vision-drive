@@ -252,7 +252,11 @@ def _validate_raw(
         issues.extend(row_issues)
     issues.extend(motion_issue_lines(rows))
     counts = raw_image_counts(raw_images)
-    issues.extend(raw_count_issues(counts["per_cam"]))
+    # The collector restarts the capture schedule per segment and per run
+    # (a row with no dt_s is a writer's first row).
+    segments = {str(row.get("segment")) for row in rows if isinstance(row, dict) and row.get("segment") is not None}
+    starts = sum(1 for row in rows if isinstance(row, dict) and row.get("dt_s") is None)
+    issues.extend(raw_count_issues(counts["per_cam"], schedules=max(1, len(segments) + starts)))
     blank = {cam_id: 0 for cam_id in by_cam}
     checked = 0
     seen_index: set[int] = set()

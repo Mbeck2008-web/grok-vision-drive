@@ -8,6 +8,7 @@ labels are a separate ``gt.jsonl``. Debug drawings never touch these files.
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Mapping
@@ -36,6 +37,19 @@ CAMERA_HZ = {
     "repeatR": 1.0,
     "rear": 1.0,
 }
+# Phase stagger, seconds after the schedule's anchor (the first tick of a
+# spawn). The 10 Hz cameras take every 0.1 s slot. The slow cameras sit on
+# different 0.1 s slots so their frames do not all land on one tick:
+# pillarL slots 1 and 6, pillarR 3 and 8, repeatL 0, repeatR 4, rear 7 (of
+# the ten slots in a second). A camera not listed starts on the anchor. A
+# phase longer than the camera's period wraps (``rates`` can change hz).
+CAMERA_PHASE_S = {
+    "pillarL": 0.1,
+    "pillarR": 0.3,
+    "repeatL": 0.0,
+    "repeatR": 0.4,
+    "rear": 0.7,
+}
 DRIVERS = ("beamng_ai", "gvd", "human")
 
 
@@ -52,16 +66,99 @@ def gb_per_hour(tick_bytes: int, hz: float) -> float:
     return float(tick_bytes) * float(hz) * 3600.0 / (1024.0 ** 3)
 
 
-def camera_due(cam_id: str, now_s: float, last_s: Mapping[str, float], rates: Mapping[str, float] | None = None) -> bool:
-    """True when this camera's period has elapsed. ``now_s`` is monotonic."""
-    table = CAMERA_HZ if rates is None else rates
-    hz = float(table.get(str(cam_id), 0.0))
-    if hz <= 0.0:
-        return False
-    prev = last_s.get(str(cam_id))
-    if prev is None:
-        return True
-    return (float(now_s) - float(prev)) + 1e-4 >= (1.0 / hz)
+# Float safety for the phase compares only: a few ulps of a monotonic clock
+# that has run for days. Not a slack.
+_PHASE_EPS_S = 1e-9
+
+
+class CameraSchedule:
+    """Phase-scheduled capture: each camera's frames sit on a fixed grid.
+
+    Camera ``c`` has phases ``anchor + CAMERA_PHASE_S[c] + n / hz``. The
+    anchor is the first tick after ``reset`` (a spawn or level load).
+
+    * A tick serves at most one phase per camera. After a frame the phase
+      moves by one period (``next_due += period``); a tick that is a little
+      early or late does not move the grid.
+    * A phase is served by the tick nearest to it: a tick takes it once the
+      phase is due, or when the phase is less than half a tick ahead (half
+      the last tick interval, never more than half the camera's period).
+      Without that rounding a tick 0.02 s before its phase skips and the
+      next tick serves the phase after: on rec5c's tick times that held
+      10 Hz cameras at 93.6% of the tick rate.
+    * Behind (a slow tick, a long gap): this tick's frame serves the oldest
+      owed phase, the other missed phases are dropped, and the next phase is
+      the first one after this tick. Missed phases are never made up. The
+      next grid phase can still fall on the following tick (a slow camera's
+      late frame after a gap, then its on-grid frame); that is one frame,
+      not a catch-up run.
+
+    The elapsed check this replaces (``now - last + 1e-4 >= 1/hz``)
+    restarted the period at every frame. The 0.1 s tick jitters, 44% of
+    rec5c's ticks came in under 0.1 s, and a 10 Hz camera skipped every
+    one of them: 5.85 Hz delivered at 8.94 Hz of state rows.
+    """
+
+    def __init__(
+        self,
+        rates: Mapping[str, float] | None = None,
+        phases: Mapping[str, float] | None = None,
+    ) -> None:
+        self.rates = {str(k): float(v) for k, v in (CAMERA_HZ if rates is None else rates).items()}
+        self.phases = {str(k): float(v) for k, v in (CAMERA_PHASE_S if phases is None else phases).items()}
+        self.reset()
+
+    def reset(self) -> None:
+        """Forget the grid. The next tick is the new anchor."""
+        self.anchor: float | None = None
+        self.next_due: dict[str, float] = {}
+        self.prev_tick: float | None = None
+        self._undo: dict[str, float | None] = {}
+
+    def _first_due(self, cid: str, period: float) -> float:
+        assert self.anchor is not None
+        return self.anchor + math.fmod(max(0.0, self.phases.get(cid, 0.0)), period)
+
+    def tick(self, now_s: float, cams: Any) -> list[str]:
+        """Cameras whose frame this tick takes. ``now_s`` is monotonic."""
+        now = float(now_s)
+        if self.anchor is None:
+            self.anchor = now
+        lead = 0.0 if self.prev_tick is None else max(0.0, now - self.prev_tick) / 2.0
+        self.prev_tick = now
+        self._undo = {}
+        taken: list[str] = []
+        for cam in cams:
+            cid = str(cam)
+            hz = self.rates.get(cid, 0.0)
+            if hz <= 0.0:
+                continue
+            period = 1.0 / hz
+            had = self.next_due.get(cid)
+            due_at = self._first_due(cid, period) if had is None else had
+            if now + min(lead, period / 2.0) + _PHASE_EPS_S < due_at:
+                continue
+            due_at += period
+            if due_at <= now + _PHASE_EPS_S:
+                # Behind by whole periods: drop the missed phases.
+                due_at += (math.floor((now + _PHASE_EPS_S - due_at) / period) + 1) * period
+                while due_at <= now + _PHASE_EPS_S:  # rounding in the floor above
+                    due_at += period
+            self._undo[cid] = had
+            self.next_due[cid] = due_at
+            taken.append(cid)
+        return taken
+
+    def undo(self, cams: Any = None) -> None:
+        """This tick was not written: its phases are still owed to the next tick."""
+        for cid, had in list(self._undo.items()):
+            if cams is not None and cid not in {str(c) for c in cams}:
+                continue
+            if had is None:
+                self.next_due.pop(cid, None)
+            else:
+                self.next_due[cid] = had
+            self._undo.pop(cid, None)
 
 
 def capture_plan(cfg: Mapping[str, Any] | None, ratio: float = PNG_RATIO_MAX) -> list[dict[str, Any]]:
@@ -306,6 +403,19 @@ def _stamp_of(raw: Any) -> tuple[float | None, Any]:
     return None, None
 
 
+def _window_of(raw: Any) -> tuple[float | None, float | None]:
+    """Monotonic seconds right before and after the camera's BeamNG call."""
+    if not isinstance(raw, dict):
+        return None, None
+    out = []
+    for key in ("mono_before", "mono_after"):
+        try:
+            out.append(None if raw.get(key) is None else round(float(raw[key]), 6))
+        except (TypeError, ValueError):
+            out.append(None)
+    return out[0], out[1]
+
+
 class RawFrameWriter:
     """One directory of per-camera PNG or ``.npy`` files plus two JSONL logs.
 
@@ -400,7 +510,9 @@ class RawFrameWriter:
             final = folder / f"{idx:06d}{suffix}"
             _write_bytes(final, payload)
             self.stored_bytes += len(payload)
-            wall, sensor_t = _stamp_of(None if timestamps is None else timestamps.get(cam_id))
+            stamp = None if timestamps is None else timestamps.get(cam_id)
+            wall, sensor_t = _stamp_of(stamp)
+            mono_before, mono_after = _window_of(stamp)
             cam_dt = None
             prev = self._prev_cam_t.get(str(cam_id))
             if wall is not None and prev is not None:
@@ -412,6 +524,8 @@ class RawFrameWriter:
                 "file": str(final.relative_to(self.root)).replace("\\", "/"),
                 "t": wall,
                 "sensor_t": sensor_t,
+                "mono_before": mono_before,
+                "mono_after": mono_after,
                 "dt_s": cam_dt,
                 "shape": [int(v) for v in shape],
                 "dtype": str(dtype),
@@ -811,11 +925,15 @@ def raw_image_counts(paths: list[Path]) -> dict[str, Any]:
     return {"raw_frames": ticks, "raw_files": int(sum(per_cam.values())), "per_cam": per_cam}
 
 
-def raw_count_issues(per_cam: Mapping[str, int]) -> list[str]:
+def raw_count_issues(per_cam: Mapping[str, int], schedules: int = 1) -> list[str]:
     """Cameras that share a planned rate should have the same file count.
 
     Pillars and the rear camera are slower on purpose, so they are not
-    compared with the 10 Hz cameras.
+    compared with the 10 Hz cameras. Cameras of one rate on the same phase
+    (``CAMERA_PHASE_S``) take the same ticks, so their counts match. Cameras
+    of one rate on staggered phases can differ by one frame per capture
+    schedule (``schedules``: the collector restarts the schedule at every
+    segment): the recording can stop between the two phases.
     """
     groups: dict[float, list[str]] = {}
     for cam in per_cam:
@@ -828,6 +946,9 @@ def raw_count_issues(per_cam: Mapping[str, int]) -> list[str]:
             continue
         counts = {int(per_cam[cam]) for cam in cams}
         if len(counts) == 1:
+            continue
+        phases = {round(float(CAMERA_PHASE_S.get(cam, 0.0)) % (1.0 / hz), 9) for cam in cams}
+        if len(phases) > 1 and max(counts) - min(counts) <= max(1, int(schedules)):
             continue
         detail = ", ".join(f"{cam}={int(per_cam[cam])}" for cam in sorted(cams))
         issues.append(f"raw count mismatch at {hz:.0f} Hz ({detail})")

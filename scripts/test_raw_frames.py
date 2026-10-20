@@ -34,7 +34,7 @@ from scripts.collect_scene_lanes import DISK_CHECK_S  # noqa: E402
 
 
 def check_rates_and_controls() -> None:
-    from python.data.raw_frames import CAMERA_HZ, camera_due, controls_from_state, plan_totals, yaw_rate_from_dirs
+    from python.data.raw_frames import CameraSchedule, controls_from_state, plan_totals, yaw_rate_from_dirs
 
     cfg = load_camera_config()
     rows = capture_plan(cfg, 0.619)
@@ -48,11 +48,13 @@ def check_rates_and_controls() -> None:
     assert by_id["main"]["uncompressed_bytes"] == 640 * 480 * 3
     assert totals["png_gb_per_hour"] < 80.0
     assert totals["uncompressed_gb_per_hour"] < totals["png_gb_per_hour"] / 0.5
-    assert camera_due("main", 0.0, {})
-    assert not camera_due("main", 0.05, {"main": 0.0})
-    assert camera_due("main", 0.1, {"main": 0.0})
-    assert not camera_due("rear", 0.5, {"rear": 0.0})
-    assert camera_due("rear", 1.0, {"rear": 0.0})
+    # Phase schedule (scripts/test_camera_phase_schedule.py has the rest).
+    sched = CameraSchedule()
+    assert sched.tick(0.0, ["main", "rear"]) == ["main"]  # rear is staggered to 0.7 s
+    assert sched.tick(0.1, ["main", "rear"]) == ["main"]
+    assert sched.tick(0.15, ["main", "rear"]) == []
+    assert sched.tick(0.7, ["main", "rear"]) == ["main", "rear"]
+    assert sched.tick(1.0, ["main", "rear"]) == ["main"]
     sample = controls_from_state(
         {
             "pos": [1.0, 2.0, 3.0],

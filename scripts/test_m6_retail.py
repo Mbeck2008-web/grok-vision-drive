@@ -392,7 +392,8 @@ def _run_supervisor(
     The run's clock starts when this supervisor writes its first gvd_cmd.json (`t_ready`), not
     at spawn: imports (torch through the trainer modules) and model load are startup, not the
     work under test. `seconds`, `cmd_blind` and `freeze_echo_after_s` count from `t_ready`.
-    `clock`, when given, gets `t_spawn` and `t_ready` (wall time).
+    `clock`, when given, gets `t_spawn` and `t_ready` (wall time), and with
+    `freeze_echo_after_s` also `t_frozen`: when the mod wrote its last advancing echo.
 
     Files from an earlier run never count. gvd_cmd.json and gvd_state.json are removed before
     spawn, the fake mod only takes a command stamped after spawn, and the latch only takes an
@@ -508,6 +509,8 @@ def _run_supervisor(
         _write_ego(**kw)
         if ready and freeze_echo_after_s is not None and now - t_start >= freeze_echo_after_s:
             frozen = kw
+            if clock is not None:
+                clock["t_frozen"] = now
 
     def _try_latch() -> bool:
         """True once a snapshot of this run names the expected disengage on every surface."""
@@ -919,15 +922,18 @@ def check_echo_stale_disengages() -> None:
         on_engage_drop=drop.append,
         clock=clock,
     )
-    t0 = clock["t_ready"]
     assert snap is not None, "a frozen echo never disengaged with echo_stale"
     assert snap["engage"].get("disengage_reason") == "echo_stale", snap["engage"]
     assert snap["cmd"].get("engaged") is False, snap["cmd"]
     assert read_engage_flag(default=True) is False
-    if drop:
-        after = drop[0] - (t0 + freeze_at)
-        print(f"  echo_stale {after * 1000.0:.0f} ms after the echo froze")
-        assert after < 1.5, f"echo_stale took {after:.2f}s after the echo froze"
+    # Latency on the two processes' own stamps: the mod's last advancing echo and the
+    # supervisor's disengage write (gvd_engage.json mtime). How late the test's loop
+    # noticed either one (a loaded runner) is not GVD's latency.
+    assert "t_frozen" in clock, clock
+    after = float(snap["engage"]["mtime"]) - clock["t_frozen"]
+    seen = f", the test saw it {(drop[0] - clock['t_frozen']) * 1000.0:.0f} ms after" if drop else ""
+    print(f"  echo_stale {after * 1000.0:.0f} ms after the last advancing echo{seen}")
+    assert 0.0 < after < 1.5, f"echo_stale took {after:.2f}s after the echo froze"
     write_engage_flag(False)
     ego_path().unlink()
 
@@ -1008,8 +1014,12 @@ def check_engage_path_contract() -> None:
     assert read_engage_flag(default=False) is False
     p.write_text('{"engaged":true}', encoding="utf-8")
     assert read_engage_flag(default=False) is False, "engaged:true without mtime must not latch"
-    p.write_text(json.dumps({"engaged": True, "mtime": time.time()}), encoding="utf-8")
-    assert read_engage_flag(default=False) is True
+    stamp = time.time()
+    p.write_text(json.dumps({"engaged": True, "mtime": stamp}), encoding="utf-8")
+    # Judged at the stamp's own second and at the window's edges, not at whenever this line runs.
+    assert read_engage_flag(default=False, now=stamp) is True
+    assert read_engage_flag(default=False, now=stamp + ENGAGE_FRESH_S) is True
+    assert read_engage_flag(default=True, now=stamp + ENGAGE_FRESH_S + 0.01) is False
     # Supervisor disengage payload: engaged=false with float mtime + reason (what Lua adopts as OFF and logs).
     write_engage_flag(False, disengage_reason="player_steer")
     data = json.loads(p.read_text(encoding="utf-8"))

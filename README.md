@@ -15,6 +15,8 @@ Every feature in this README carries exactly one status label:
 
 One feature is proven live, and only for recording: the command-line collector, `scripts/collect_scene_lanes.py`. The rec2 and rec3 runs recorded on the dev PC on 2026-10-19 while BeamNG's AI drove. Evidence: `E:\GVD_data\logs\rec3_20261019.txt`, `E:\GVD_data\scene_lanes_rec3\collect.json`. rec3 used the collector from branch `collector-spawn-crash-fix` (6a07d65), which adds a paint-coverage spawn filter and a weave guard that `cursor/scene-net-collect-e194` does not have. Everything about GVD driving, including Alt+G, the in-game ribbon, the eight-camera drive and force feedback, is **Unproven**.
 
+Trainer collapse fixes are pending in PR #87 and are not merged yet.
+
 ## Quick start
 
 Windows. You do not need an administrator account. The full agent procedure (Tech launch flags, data disk, collect, validate, train) is [AGENTS.md](AGENTS.md). Shell debugging is [DEBUGGING.md](DEBUGGING.md).

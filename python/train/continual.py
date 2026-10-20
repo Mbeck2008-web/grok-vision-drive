@@ -1067,6 +1067,19 @@ def holdout_mix(plan: list[Mapping[str, Any]], fast_mps: float = HOLDOUT_FAST_MP
     return out
 
 
+def holdout_leakage_note(buffer_m: float = HOLDOUT_BUFFER_M) -> str:
+    """The known limit of the road-area split, written into every run's metadata."""
+    from python.debug.lane_targets import LOOKAHEADS_M
+
+    far = max(LOOKAHEADS_M)
+    return (
+        f"Reduced leakage, not no leakage: the {buffer_m:g} m buffer keeps every label (lookahead up to "
+        f"{far:g} m) of a train row off held-out road, but the cameras see far past {buffer_m:g} m, so "
+        "train frames can show held-out landmarks, junctions and road ahead. Val scores on held-out cells "
+        "are optimistic by that much."
+    )
+
+
 # Speed bands (m/s) for the train/val composition: [low, high).
 SPEED_BANDS: tuple[tuple[str, float, float], ...] = (
     ("0-5", 0.0, 5.0),

@@ -1895,6 +1895,11 @@ def train_directory(
         "composition": composition,
         "lopsided": lopsided,
     }
+    if cell_spec is not None:
+        from python.train.continual import holdout_leakage_note
+
+        holdout_meta["limit"] = holdout_leakage_note(float(cell_spec.get("buffer_m", 50.0)))
+        print(f"[GVD] holdout limit: {holdout_meta['limit']}", flush=True)
     mix = holdout_mix(startup_plan)
     print(
         f"[GVD] holdout: rows={mix['rows']} slices={mix['slices']} fast={mix['fast']} slow={mix['slow']} "

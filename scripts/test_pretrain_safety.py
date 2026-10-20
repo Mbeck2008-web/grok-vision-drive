@@ -45,6 +45,9 @@
 (m) the train/val composition (rows, buffer rows, phase and speed-band
     shares) is computed per split, a >2x val/train share gap warns, and the
     cell seed is a fixed-default flag recorded in the run metadata.
+(n) the run metadata states the road-area split's limit: the 50 m buffer
+    covers the 30 m labels, but cameras see held-out road past 50 m, so it is
+    reduced leakage, not no leakage.
 """
 from __future__ import annotations
 
@@ -928,12 +931,25 @@ def check_val_composition() -> None:
           f"buffer={ccomp['buffer_rows']}; seed fixed (default 0) and recorded OK")
 
 
+def check_leakage_note() -> None:
+    from python.debug.lane_targets import LOOKAHEADS_M
+    from python.train.continual import HOLDOUT_BUFFER_M, holdout_leakage_note
+
+    note = holdout_leakage_note()
+    assert max(LOOKAHEADS_M) < HOLDOUT_BUFFER_M, "the buffer must still cover the farthest label"
+    assert "50 m buffer" in note and "30 m" in note and "not no leakage" in note.lower(), note
+    trainer = (Path(__file__).resolve().parents[1] / "python" / "train" / "train_scene.py").read_text(encoding="utf-8")
+    assert 'holdout_meta["limit"] = holdout_leakage_note(' in trainer and '"holdout": holdout_meta' in trainer
+    print(f"(n) run metadata holdout.limit: {note!r} OK")
+
+
 def main() -> None:
     check_multi_recording()
     check_road_area_holdout()
     check_heads_contract()
     check_links_read_only()
     check_val_composition()
+    check_leakage_note()
     check_camera_contract()
     check_cache_on_c()
     check_other_cams()

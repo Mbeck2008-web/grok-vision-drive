@@ -97,11 +97,13 @@ def check_exit_brake_is_a_parking_hold() -> None:
     assert held["brake"] == 0.0
     assert held["parkingbrake"] == 1.0
     assert is_arcade_reverse_hold(held) is False
-    # The command this run actually sent. Service brake, throttle 0.
-    # Arcade drove that as reverse.
+    # The command this run actually sent was service brake 0.8 with throttle 0.
+    # That shape is arcade reverse, so the wire now parks instead.
+    assert is_arcade_reverse_hold({"throttle": 0.0, "brake": 0.8, "parkingbrake": 0.0})
     sent = tech_control_kwargs(0.4, 0.0, 0.8)
-    assert sent["brake"] == 0.8 and sent["parkingbrake"] == 0.0
+    assert sent["brake"] == 0.0 and sent["parkingbrake"] == 1.0
     assert sent["throttle"] == 0.0
+    assert is_arcade_reverse_hold(sent) is False
 
 
 def _line(x: float) -> list[dict[str, float]]:

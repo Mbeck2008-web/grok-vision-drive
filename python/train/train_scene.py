@@ -15,8 +15,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import faulthandler
+import math
+import os
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -26,7 +30,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from python.data.strip_writer import CANVAS_H, CANVAS_W, read_state_jsonl  # noqa: E402
+from python.data.strip_writer import CANVAS_H, CANVAS_W  # noqa: E402
 from python.train.continual import (  # noqa: E402
     GRAD_CLIP,
     WEIGHT_DECAY,
@@ -35,17 +39,17 @@ from python.train.continual import (  # noqa: E402
     choose_chunk_length,
     holdout_stopped,
     offcenter_view,
-    ordered_learning_rates,
     pass_plan,
-    pick_learning_rate,
+    remaining_until_holdout_can_stop,
+    resume_learning_rate,
 )
 from python.train.fit import (  # noqa: E402
     TrainFitError,
     bytes_per_strip,
     fit_with_probe,
     largest_batch,
-    measure_driving_file,
     plan_fit,
+    step_bytes,
     read_free_ram_bytes,
     read_free_vram_bytes,
     read_used_ram_bytes,
@@ -59,7 +63,7 @@ from python.train.scene_net import (  # noqa: E402
     checkpoint_arch,
     default_onnx_path,
     export_scene_onnx,
-    labels_from_tech,
+    labels_for_row,
     loss_mask,
     precision_for_capability,
     scene_loss,
@@ -80,11 +84,54 @@ from python.train.status_window import (  # noqa: E402
 )
 
 
+def _pin_optimizer_lr(opt: Any, rate: float) -> None:
+    """Write ``rate`` onto every param group.
+
+    Loading a pause restores the learning rate that was saved with it. A
+    1e-4 group must not replace the command-line rate.
+    """
+    groups = getattr(opt, "param_groups", None)
+    if not isinstance(groups, list):
+        return
+    pinned = float(rate)
+    for group in groups:
+        if isinstance(group, dict):
+            group["lr"] = pinned
+
+
+def resolve_scene_batch(requested: int, parallel_fit: int) -> int:
+    """Windows in one optimizer step.
+
+    ``requested`` 0 uses the batch that fits in free VRAM. A positive value
+    is that many windows. The floor is one window.
+    """
+    if int(requested) > 0:
+        return int(requested)
+    if int(parallel_fit) > 0:
+        return int(parallel_fit)
+    return 1
+
+
+def _maybe_jitter(frame: Any, augment: bool, rng: np.random.RandomState | None) -> Any:
+    """Photometric jitter on a decoded frame. The row's metres are not an input."""
+    if not augment or frame is None:
+        return frame
+    from python.train.cam_strip import photometric_jitter
+
+    return photometric_jitter(frame, rng)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train the GVD scene net from recorded strips")
     parser.add_argument("--strips", type=str, default="", help="Directory with meta.json, strips/, state.jsonl")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--batch",
+        type=int,
+        default=0,
+        help="Windows per optimizer step. 0 fits the largest batch in free VRAM.",
+    )
     parser.add_argument(
         "--capability",
         type=float,
@@ -98,19 +145,222 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Write models/e2e_scene.onnx (FP32 graph). Optional path.",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Load the pause checkpoint when it exists. This is also the default.",
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Start at step 0. A later checkpoint still replaces the pause file.",
+    )
+    parser.add_argument(
+        "--sanity",
+        action="store_true",
+        help="Overfit the first 8 strips. Exit 1 unless the lane loss falls below 0.05.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run two steps and print tensor shapes.",
+    )
+    parser.add_argument(
+        "--no-panel",
+        action="store_true",
+        help="Do not open the training window. The run starts on its own.",
+    )
+    parser.add_argument(
+        "--autostart",
+        action="store_true",
+        help="Start without the Start button. The window still opens when a display is attached.",
+    )
+    parser.add_argument("--metrics-every", type=int, default=10, help="Write metrics.jsonl every N steps.")
+    parser.add_argument(
+        "--cams",
+        default="",
+        help="Comma list of cameras to train and export. Empty uses all eight.",
+    )
+    parser.add_argument(
+        "--heads",
+        default="",
+        help="Comma list of heads that receive loss. Empty trains every head. The export still has every output.",
+    )
+    parser.add_argument(
+        "--augment",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Photometric jitter on training steps. Off for validation. --no-augment disables it.",
+    )
+    parser.add_argument(
+        "--cache",
+        default="",
+        help="Directory of pre-decoded camera chunks. The loader uses them when the index is present.",
+    )
+    parser.add_argument(
+        "--build-cache",
+        default="",
+        help="Decode --cams into this directory (chunks under 3.5 GB) and exit.",
+    )
+    parser.add_argument(
+        "--clip",
+        type=float,
+        default=1.0,
+        help="Max gradient norm. 1.0 clips the spikes from a curve after a straight.",
+    )
+    parser.add_argument(
+        "--lane-loss",
+        default="huber",
+        choices=("huber", "l1", "mse"),
+        help="lane_gt regression. huber is smooth-L1 and is the default.",
+    )
+    parser.add_argument(
+        "--balance",
+        action="store_true",
+        help="Repeat windows with curves, weaves, ramps, or large steer.",
+    )
+    parser.add_argument(
+        "--min-valid",
+        type=float,
+        default=0.3,
+        help="Drop a training window when fewer than this fraction of rows have a lane center.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="DataLoader workers. Default is 4 on Windows and 0 elsewhere.",
+    )
+    parser.add_argument(
+        "--scale",
+        type=float,
+        default=1.0,
+        help="Downscale the canvas before the cache and the net. 1 keeps the recorded size.",
+    )
+    parser.add_argument(
+        "--holdout-blocks",
+        type=int,
+        default=None,
+        help=(
+            "Hold out the last 20%% of each of K equal time blocks in a long segment, "
+            "with a 4 s gap on both sides of each slice. Default 1 (or GVD_HOLDOUT_BLOCKS) "
+            "is the single tail cut."
+        ),
+    )
+    parser.add_argument(
+        "--holdout-cells",
+        action="store_true",
+        help=(
+            "Spatial holdout: a seeded set of 250 m map cells with about 20%% of rows "
+            "(fast and slow cells in proportion) is scored, and train drops rows within "
+            "50 m of them. The list is saved and reused (see --holdout-cells-file)."
+        ),
+    )
+    parser.add_argument(
+        "--holdout-cells-file",
+        type=str,
+        default="",
+        help="Cell list JSON. Loaded when it exists, else chosen and written. Default: <status dir>/holdout_cells.json.",
+    )
+    parser.add_argument("--holdout-seed", type=int, default=0, help="Seed for choosing --holdout-cells.")
     return parser
 
 
-def _load_bgr(root: Path, index: int) -> Any:
-    import cv2
+def resolve_holdout_blocks(value: int | None) -> int:
+    """CLI value, else ``GVD_HOLDOUT_BLOCKS``, else 1. Below 1 is an error."""
+    from python.train.continual import holdout_blocks_from_env
 
-    path = root / "strips" / f"{index:06d}.jpg"
-    bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
-    if bgr is None:
-        raise FileNotFoundError(path)
-    if int(bgr.shape[0]) != CANVAS_H or int(bgr.shape[1]) != CANVAS_W:
-        raise ValueError(f"{path} is {bgr.shape[1]}x{bgr.shape[0]}, expected {CANVAS_W}x{CANVAS_H}")
-    return bgr
+    if value is None:
+        return holdout_blocks_from_env()
+    if int(value) < 1:
+        raise SystemExit("--holdout-blocks must be at least 1")
+    return int(value)
+
+
+def headless_requested() -> bool:
+    return os.environ.get("GVD_HEADLESS", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def interactive_display() -> bool:
+    """True when a desktop is attached. A service session and a headless Linux box are false."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            # SM_CMONITORS
+            return int(ctypes.windll.user32.GetSystemMetrics(80)) > 0
+        except (AttributeError, OSError):
+            return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def resolve_panel(*, no_panel: bool, autostart: bool) -> tuple[bool, bool]:
+    """Whether to open the window, and whether to start without the Start button.
+
+    No interactive display, ``GVD_HEADLESS=1``, and ``--no-panel`` all start
+    on their own. ``--autostart`` skips the button and can still show the panel.
+    """
+    headless = headless_requested() or not interactive_display()
+    open_panel = not bool(no_panel) and not headless
+    start_now = bool(autostart) or bool(no_panel) or headless
+    return open_panel, start_now
+
+
+# Two optimizer steps on a handful of frames. Longer than a slow disk read,
+# short enough that a stuck Start button or a decode wait does not sit for
+# a quarter hour with no stack.
+DRY_RUN_TIMEOUT_S = 300.0
+
+
+def _load_bgr(root: Path, index: int) -> Any:
+    """Training canvas. Raw cameras are stitched here, not in the recording.
+
+    A PNG that does not decode is read from ``raw_repaired`` when that copy
+    exists. The original file is left as it was written.
+    """
+    from python.train.scene_loader import load_canvas
+
+    return load_canvas(root, index)
+
+
+def arm_dry_run_watchdog(timeout_s: float = DRY_RUN_TIMEOUT_S) -> None:
+    """Dump every thread and exit if the dry run is still inside ``timeout_s``."""
+    faulthandler.enable(file=sys.stderr, all_threads=True)
+    print(
+        f"[GVD] dry-run watchdog {float(timeout_s):.0f}s; "
+        "a hang dumps every thread stack and exits",
+        flush=True,
+    )
+    faulthandler.dump_traceback_later(
+        float(timeout_s),
+        repeat=False,
+        file=sys.stderr,
+        exit=True,
+    )
+
+
+def disarm_dry_run_watchdog() -> None:
+    faulthandler.cancel_dump_traceback_later()
+
+
+def _confirm_start(
+    view: TrainWindow,
+    *,
+    dry_run: bool,
+    sanity: bool = False,
+    autostart: bool = False,
+) -> bool:
+    """Dry-run, sanity, and autostart begin immediately. A panel run waits for Start."""
+    if dry_run or sanity or autostart:
+        if dry_run:
+            why = "dry-run"
+        elif sanity:
+            why = "sanity"
+        else:
+            why = "autostart"
+        print(f"[GVD] {why}: starting without the Start button", flush=True)
+        return True
+    return _wait_for_start(view)
 
 
 def _autocast(enabled: bool) -> Any:
@@ -199,7 +449,9 @@ def _probe_cuda(net: Any, batch: int, window_strips: int, amp: bool, device: Any
         state = net.initial_state(device=device, batch=batch)
         total = None
         for _ in range(max(1, int(window_strips))):
-            strip = torch.zeros(int(batch), 3, CANVAS_H, CANVAS_W, device=device)
+            canvas_h = int(getattr(net, "canvas_h", CANVAS_H))
+            canvas_w = int(getattr(net, "canvas_w", CANVAS_W))
+            strip = torch.zeros(int(batch), 3, canvas_h, canvas_w, device=device)
             dt = torch.zeros(int(batch), device=device)
             with _autocast(amp):
                 pred, state = net.forward_batch(strip, dt, state)
@@ -227,6 +479,15 @@ def _detach_state(state: SceneState) -> SceneState:
         h=state.h.detach().clone(),
         tokens=state.tokens.detach().clone(),
         mask=state.mask.detach().clone(),
+    )
+
+
+def _state_first(state: SceneState) -> SceneState:
+    """One stream, for the next window that is not part of this stacked step."""
+    return SceneState(
+        h=state.h[:, :1].detach().clone(),
+        tokens=state.tokens[:1].detach().clone(),
+        mask=state.mask[:1].detach().clone(),
     )
 
 
@@ -293,11 +554,80 @@ def overlap_gradient_cut() -> dict[str, bool] | None:
     }
 
 
-def _frame_row(root: Path, row: Mapping[str, Any]) -> tuple[Any, Mapping[str, Any]]:
-    frame = np.ascontiguousarray(_load_bgr(root, int(row["i"])))
+def _frame_row(
+    root: Path,
+    row: Mapping[str, Any],
+    *,
+    cams: tuple[str, ...] | None = None,
+    cache: Any = None,
+    augment: bool = False,
+    rng: np.random.RandomState | None = None,
+    scale: float = 1.0,
+) -> tuple[Any, Mapping[str, Any]] | None:
+    """Stitch one tick. A missing frame is a gap, not a crash."""
+    from python.data.strip_writer import CANVAS_W, STRIP_ORDER
+    from python.train.cam_strip import extract_cams, photometric_jitter
+
+    index = int(row["i"])
+    frame = None
+    if cache is not None and cache.has(index):
+        frame = cache.canvas(index)
+    if frame is None:
+        try:
+            frame = np.ascontiguousarray(_load_bgr(root, index))
+        except FileNotFoundError as exc:
+            print(f"[GVD] scene load skip i={row.get('i')}: {exc}", flush=True)
+            return None
+    # An all-camera cache is the full strip. A main-only net needs that sector cut out.
+    if (
+        frame is not None
+        and cams
+        and tuple(cams) != tuple(STRIP_ORDER)
+        and int(frame.shape[1]) == CANVAS_W
+    ):
+        frame = extract_cams(frame, tuple(cams))
+    if scale < 0.999:
+        from python.train.cam_strip import scale_canvas
+
+        frame = scale_canvas(frame, scale, cams)
+    if augment:
+        frame = photometric_jitter(frame, rng)
     # The stitch is not a yaw roll, so this returns the frame and the row.
     frame, row = offcenter_view(frame, row)
     return frame, row
+
+
+def _print_step_shapes(image: Any, pred: Any, step: Mapping[str, Any], state: SceneState) -> None:
+    print(f"[GVD] dry image={tuple(image.shape)} dtype={getattr(image, 'dtype', None)}", flush=True)
+    fields = getattr(pred, "__dataclass_fields__", {})
+    names = list(fields) if fields else [name for name in dir(pred) if not name.startswith("_")]
+    for name in names:
+        value = getattr(pred, name, None)
+        if value is None:
+            print(f"[GVD] dry pred.{name}=None", flush=True)
+        elif hasattr(value, "shape"):
+            print(f"[GVD] dry pred.{name}={tuple(value.shape)} dtype={value.dtype}", flush=True)
+    hidden = getattr(state, "h", None)
+    if hidden is not None and hasattr(hidden, "shape"):
+        print(f"[GVD] dry state.h={tuple(hidden.shape)}", flush=True)
+    for key, value in step.items():
+        if hasattr(value, "shape"):
+            print(f"[GVD] dry loss.{key}={tuple(value.shape)}", flush=True)
+
+
+def _grad_bad_counts(net: Any) -> tuple[int, int]:
+    import torch
+
+    nan_n = 0
+    inf_n = 0
+    for param in net.parameters():
+        grad = param.grad
+        if grad is None:
+            continue
+        detached = grad.detach()
+        nan_n += int(torch.isnan(detached).sum().item())
+        inf_n += int(torch.isinf(detached).sum().item())
+    return nan_n, inf_n
 
 
 def _optimizer_step(
@@ -313,6 +643,15 @@ def _optimizer_step(
     view: TrainWindow | None,
     stride: int,
     clip: float,
+    trace: dict[str, Any] | None = None,
+    cams: tuple[str, ...] | None = None,
+    cache: Any = None,
+    augment: bool = False,
+    rng: np.random.RandomState | None = None,
+    heads: tuple[str, ...] | None = None,
+    lane_loss: str = "huber",
+    frames: list[Any] | None = None,
+    scale: float = 1.0,
 ) -> tuple[float | None, int, SceneState, SceneState]:
     """Backprop through this chunk only.
 
@@ -322,22 +661,54 @@ def _optimizer_step(
     """
     import torch
 
+    from python.train.scene_net import LOSS_TERMS
+
+    started = time.perf_counter()
     net.train()
     opt.zero_grad(set_to_none=True)
     state = _detach_state(state)
     total = None
     n_loss = 0
+    head_acc = {key: 0.0 for key in LOSS_TERMS}
+    nan_n = 0
+    inf_n = 0
     stride_mark: SceneState | None = None
     step_at = max(1, int(stride))
     for tick, row in enumerate(rows):
-        frame, row = _frame_row(root, row)
+        if trace is not None and trace.get("print_shapes"):
+            print(
+                f"[GVD] scene load {tick + 1}/{len(rows)} i={row.get('i')}",
+                flush=True,
+            )
+        if frames is not None:
+            if tick >= len(frames) or frames[tick] is None:
+                continue
+            frame = _maybe_jitter(frames[tick], augment, rng)
+        else:
+            loaded = _frame_row(
+                root, row, cams=cams, cache=cache, augment=augment, rng=rng, scale=scale,
+            )
+            if loaded is None:
+                continue
+            frame, row = loaded
         image = torch.from_numpy(frame).to(device)
         dt = torch.tensor([step_dt(row.get("dt_s"))], dtype=torch.float32, device=device)
         with _autocast(amp):
             pred, state = net.forward_batch(image, dt, state)
         if loss_mask(row):
-            step = scene_loss(_prediction_at(pred, 0), _as_target(labels_from_tech(row.get("tech")), device))
+            one = _prediction_at(pred, 0)
+            step = scene_loss(one, _as_target(labels_for_row(row), device), heads, lane_loss=lane_loss)
+            if trace is not None and trace.get("print_shapes") and not trace.get("shapes_printed"):
+                _print_step_shapes(image, one, step, state)
+                trace["shapes_printed"] = True
             value = step["total"]
+            item = float(value.detach().item())
+            if math.isnan(item):
+                nan_n += 1
+            elif not math.isfinite(item):
+                inf_n += 1
+            for key in LOSS_TERMS:
+                head_acc[key] += float(step[key].detach().item())
             total = value if total is None else total + value
             n_loss += 1
         if tick + 1 == step_at:
@@ -347,20 +718,190 @@ def _optimizer_step(
     end_state = _detach_state(state)
     carry = end_state if stride_mark is None else _detach_state(stride_mark)
     if total is None or n_loss == 0:
+        if trace is not None:
+            trace.update(
+                {
+                    "loss": None,
+                    "heads": {key: None for key in LOSS_TERMS},
+                    "n_loss": 0,
+                    "grad_norm": None,
+                    "nan": nan_n,
+                    "inf": inf_n,
+                    "step_s": time.perf_counter() - started,
+                    "lane_gt": None,
+                }
+            )
         return None, 0, carry, end_state
     loss = total / n_loss
+    grad_norm = None
     if scaler is not None:
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
-        torch.nn.utils.clip_grad_norm_(net.parameters(), float(clip))
+        grad_norm = float(torch.nn.utils.clip_grad_norm_(net.parameters(), float(clip)))
         scaler.step(opt)
         scaler.update()
     else:
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(net.parameters(), float(clip))
+        grad_norm = float(torch.nn.utils.clip_grad_norm_(net.parameters(), float(clip)))
         opt.step()
+    bad_nan, bad_inf = _grad_bad_counts(net)
+    nan_n += bad_nan
+    inf_n += bad_inf
     net.zero_grad(set_to_none=True)
+    heads = {key: head_acc[key] / n_loss for key in LOSS_TERMS}
+    if trace is not None:
+        trace.update(
+            {
+                "loss": float(loss.detach().item()),
+                "heads": heads,
+                "n_loss": n_loss,
+                "grad_norm": grad_norm,
+                "nan": nan_n,
+                "inf": inf_n,
+                "step_s": time.perf_counter() - started,
+                "lane_gt": heads.get("lane_gt"),
+            }
+        )
     return float(loss.detach().item()), n_loss, carry, end_state
+
+
+def _optimizer_group(
+    net: Any,
+    opt: Any,
+    scaler: Any,
+    root: Path,
+    sequences: list[list[Mapping[str, Any]]],
+    *,
+    device: Any,
+    amp: bool,
+    view: TrainWindow | None,
+    clip: float,
+    trace: dict[str, Any] | None = None,
+    cams: tuple[str, ...] | None = None,
+    cache: Any = None,
+    augment: bool = False,
+    rng: np.random.RandomState | None = None,
+    heads: tuple[str, ...] | None = None,
+    lane_loss: str = "huber",
+    frame_sets: list[list[Any] | None] | None = None,
+    scale: float = 1.0,
+) -> tuple[float | None, int, SceneState, SceneState]:
+    """One step on several windows that each start from a fresh GRU state.
+
+    Shorter windows are padded for the forward and left out of the loss.
+    """
+    import torch
+
+    from python.train.scene_net import LOSS_TERMS
+
+    started = time.perf_counter()
+    net.train()
+    opt.zero_grad(set_to_none=True)
+    width = len(sequences)
+    length = max((len(seq) for seq in sequences), default=0)
+    state = net.initial_state(device=device, batch=max(1, width))
+    total = None
+    n_loss = 0
+    head_acc = {key: 0.0 for key in LOSS_TERMS}
+    nan_n = 0
+    inf_n = 0
+    blank = None
+    presets = list(frame_sets) if frame_sets is not None else [None] * width
+    for tick in range(length):
+        chosen: list[Any] = []
+        alive: list[Mapping[str, Any] | None] = []
+        dts: list[float] = []
+        for b, seq in enumerate(sequences):
+            frame = None
+            row = None
+            if tick < len(seq):
+                preset = presets[b] if b < len(presets) else None
+                if preset is not None:
+                    if tick < len(preset) and preset[tick] is not None:
+                        frame = _maybe_jitter(preset[tick], augment, rng)
+                        row = seq[tick]
+                else:
+                    loaded = _frame_row(
+                        root, seq[tick], cams=cams, cache=cache, augment=augment, rng=rng, scale=scale,
+                    )
+                    if loaded is not None:
+                        frame, row = loaded
+            if frame is not None and blank is None:
+                blank = np.zeros_like(frame)
+            chosen.append(frame)
+            alive.append(row if frame is not None else None)
+            dts.append(step_dt(None if row is None else row.get("dt_s")))
+        if blank is None or not any(frame is not None for frame in chosen):
+            continue
+        stacked = [blank if frame is None else frame for frame in chosen]
+        image = torch.from_numpy(np.ascontiguousarray(np.stack(stacked))).to(device)
+        dt = torch.tensor(dts, dtype=torch.float32, device=device)
+        with _autocast(amp):
+            pred, state = net.forward_batch(image, dt, state)
+        for b, row in enumerate(alive):
+            if row is None or not loss_mask(row):
+                continue
+            one = _prediction_at(pred, b)
+            step = scene_loss(one, _as_target(labels_for_row(row), device), heads, lane_loss=lane_loss)
+            value = step["total"]
+            item_loss = float(value.detach().item())
+            if math.isnan(item_loss):
+                nan_n += 1
+            elif not math.isfinite(item_loss):
+                inf_n += 1
+            for key in LOSS_TERMS:
+                head_acc[key] += float(step[key].detach().item())
+            total = value if total is None else total + value
+            n_loss += 1
+        if view is not None:
+            view.pump()
+    end_state = _state_first(state)
+    if total is None or n_loss == 0:
+        if trace is not None:
+            trace.update(
+                {
+                    "loss": None,
+                    "heads": {key: None for key in LOSS_TERMS},
+                    "n_loss": 0,
+                    "grad_norm": None,
+                    "nan": nan_n,
+                    "inf": inf_n,
+                    "step_s": time.perf_counter() - started,
+                    "lane_gt": None,
+                }
+            )
+        return None, 0, end_state, end_state
+    loss = total / n_loss
+    grad_norm = None
+    if scaler is not None:
+        scaler.scale(loss).backward()
+        scaler.unscale_(opt)
+        grad_norm = float(torch.nn.utils.clip_grad_norm_(net.parameters(), float(clip)))
+        scaler.step(opt)
+        scaler.update()
+    else:
+        loss.backward()
+        grad_norm = float(torch.nn.utils.clip_grad_norm_(net.parameters(), float(clip)))
+        opt.step()
+    bad_nan, bad_inf = _grad_bad_counts(net)
+    nan_n += bad_nan
+    inf_n += bad_inf
+    net.zero_grad(set_to_none=True)
+    head_mean = {key: head_acc[key] / n_loss for key in LOSS_TERMS}
+    if trace is not None:
+        trace.update(
+            {
+                "loss": float(loss.detach().item()),
+                "heads": head_mean,
+                "n_loss": n_loss,
+                "grad_norm": grad_norm,
+                "nan": nan_n,
+                "inf": inf_n,
+                "step_s": time.perf_counter() - started,
+                "lane_gt": head_mean.get("lane_gt"),
+            }
+        )
+    return float(loss.detach().item()), n_loss, end_state, end_state
 
 
 def _eval_sequence(
@@ -372,6 +913,11 @@ def _eval_sequence(
     device: Any,
     amp: bool,
     view: TrainWindow | None,
+    pairs: list[tuple[float, float]] | None = None,
+    cams: tuple[str, ...] | None = None,
+    cache: Any = None,
+    heads: tuple[str, ...] | None = None,
+    scale: float = 1.0,
 ) -> tuple[float | None, int]:
     """Holdout forward. No optimizer step and no gradient through these frames."""
     import torch
@@ -382,14 +928,38 @@ def _eval_sequence(
     try:
         with torch.no_grad():
             for row in rows:
-                frame, row = _frame_row(root, row)
+                loaded = _frame_row(root, row, cams=cams, cache=cache, augment=False, scale=scale)
+                if loaded is None:
+                    continue
+                frame, row = loaded
                 image = torch.from_numpy(frame).to(device)
                 dt = torch.tensor([step_dt(row.get("dt_s"))], dtype=torch.float32, device=device)
                 with _autocast(amp):
                     pred, state = net.forward_batch(image, dt, state)
+                one = _prediction_at(pred, 0)
+                if pairs is not None:
+                    from python.debug.lane_targets import (
+                        lane_center_is_valid,
+                        lane_gt_from_record,
+                        lane_x_from_vector,
+                    )
+
+                    lane = getattr(one, "lane_gt", None)
+                    vec = None if lane is None else lane.detach().float().cpu().numpy().reshape(-1)
+                    tech = row.get("tech") if isinstance(row.get("tech"), dict) else row
+                    gt_vec, gt_mask = lane_gt_from_record(tech if isinstance(tech, dict) else None)
+                    if lane_center_is_valid(gt_mask):
+                        pred_x = None if vec is None else lane_x_from_vector(vec)
+                        gt_x = lane_x_from_vector(gt_vec)
+                        pairs.append(
+                            (
+                                float("nan") if pred_x is None else float(pred_x),
+                                float("nan") if gt_x is None else float(gt_x),
+                            )
+                        )
                 if not loss_mask(row):
                     continue
-                value = scene_loss(_prediction_at(pred, 0), _as_target(labels_from_tech(row.get("tech")), device))["total"]
+                value = scene_loss(one, _as_target(labels_for_row(row), device), heads)["total"]
                 total = value if total is None else total + value
                 n_loss += 1
                 if view is not None:
@@ -449,14 +1019,14 @@ def _from_numpy_tree(obj: Any) -> Any:
     return obj
 
 
-def pause_matches_stem(fields: Mapping[str, Any]) -> bool:
+def pause_matches_stem(fields: Mapping[str, Any], cams: tuple[str, ...] | None = None) -> bool:
     """True when this pause file was written for the current GroupNorm stem."""
-    return fields.get("arch") == checkpoint_arch()
+    return fields.get("arch") == checkpoint_arch(cams)
 
 
-def stamp_pause(payload: dict[str, Any]) -> dict[str, Any]:
+def stamp_pause(payload: dict[str, Any], cams: tuple[str, ...] | None = None) -> dict[str, Any]:
     """Mark a pause file with the stem it may load into."""
-    payload["arch"] = checkpoint_arch()
+    payload["arch"] = checkpoint_arch(cams)
     return payload
 
 
@@ -466,9 +1036,10 @@ def _apply_checkpoint(net: Any, opt: Any, scaler: Any, fields: Mapping[str, Any]
     An older conv-relu file has no GroupNorm tag. It is refused before any
     weight is copied, so those tensors are not applied to the new stem.
     """
-    if not pause_matches_stem(fields):
+    used_cams = tuple(getattr(net, "cams", ()) or ()) or None
+    if not pause_matches_stem(fields, used_cams):
         raise ValueError(
-            f"pause checkpoint arch {fields.get('arch')!r} does not match the GroupNorm stem {checkpoint_arch()}"
+            f"pause checkpoint arch {fields.get('arch')!r} does not match the GroupNorm stem {checkpoint_arch(used_cams)}"
         )
     import torch
 
@@ -525,6 +1096,7 @@ def _save_pause(
     recommended: bool,
 ) -> dict[str, Any]:
     """Save weights before the loop stops. Strip files are not rewritten."""
+    used_cams = tuple(getattr(net, "cams", ()) or ()) or None
     payload = stamp_pause(
         {
             "step": int(step),
@@ -540,10 +1112,104 @@ def _save_pause(
             "weights": {key: value.detach().cpu().numpy() for key, value in net.state_dict().items()},
             "optimizer": _to_numpy_tree(opt.state_dict()),
             "scaler": None if scaler is None else _to_numpy_tree(scaler.state_dict()),
-        }
+        },
+        used_cams,
     )
     save_checkpoint(root, payload)
     return payload
+
+
+def _first_item(batch: list[Any]) -> Any:
+    """Collate for a batch of one window. Must be a module function so spawn can pickle it."""
+    return batch[0]
+
+
+def _release_worker_handles(worker_id: int) -> None:
+    """Spawn starts from a pickle. Handles are opened on the first cache read."""
+    del worker_id
+
+
+class _EpochWindows:
+    """One training window per index. Workers decode; the step stays on the parent."""
+
+    def __init__(
+        self,
+        items: list[dict[str, Any]],
+        root: Path,
+        cams: tuple[str, ...] | None,
+        cache_dir: str,
+        scale: float,
+    ) -> None:
+        self.items = list(items)
+        self.root = str(root)
+        self.cams = None if cams is None else tuple(cams)
+        self.cache_dir = str(cache_dir or "")
+        self.scale = float(scale)
+        self._cache: Any = None
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = dict(self.__dict__)
+        state["_cache"] = None
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._cache = None
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def _reader(self) -> Any:
+        if self._cache is None and self.cache_dir:
+            from python.train.frame_cache import FrameCache
+
+            self._cache = FrameCache(self.cache_dir)
+        return self._cache
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        item = self.items[index]
+        frames: list[Any] = []
+        for row in item.get("rows") or []:
+            loaded = _frame_row(
+                Path(self.root),
+                row,
+                cams=self.cams,
+                cache=self._reader(),
+                augment=False,
+                scale=self.scale,
+            )
+            frames.append(None if loaded is None else loaded[0])
+        return {
+            "frames": frames,
+            "rows": list(item.get("rows") or []),
+            "stride": int(item.get("stride") or 1),
+            "kind": item.get("kind") or "train",
+            "incoming": "reset",
+        }
+
+
+def _prefetch_loader(items: list[dict[str, Any]], root: Path, cams, cache, scale: float, workers: int, cuda: bool):
+    """A DataLoader over train windows, or None when this process stays in-line."""
+    if int(workers) <= 0 or not items:
+        return None
+    import torch
+    from torch.utils.data import DataLoader
+
+    from python.train.scene_loader import loader_settings
+
+    cache_dir = str(getattr(cache, "root", "") or "")
+    dataset = _EpochWindows([item for item in items if item.get("kind") != "holdout"], root, cams, cache_dir, scale)
+    if len(dataset) == 0:
+        return None
+    settings = loader_settings(int(workers), cuda=bool(cuda) and torch.cuda.is_available())
+    return DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=False,
+        collate_fn=_first_item,
+        worker_init_fn=_release_worker_handles,
+        **settings,
+    )
 
 
 def train_directory(
@@ -556,14 +1222,89 @@ def train_directory(
     free_vram_bytes: int | None = None,
     free_ram_bytes: int | None = None,
     view: TrainWindow | None = None,
+    resume: bool = True,
+    sanity: bool = False,
+    dry_run: bool = False,
+    metrics_every: int = 10,
+    status_root: Path | None = None,
+    autostart: bool = False,
+    open_panel: bool = True,
+    cams: tuple[str, ...] | None = None,
+    heads: tuple[str, ...] | None = None,
+    cache: Any = None,
+    augment: bool = True,
+    clip: float = GRAD_CLIP,
+    lane_loss: str = "huber",
+    balance: bool = False,
+    min_valid: float = 0.3,
+    workers: int = 0,
+    scale: float = 1.0,
+    batch_size: int = 0,
+    holdout_blocks: int = 1,
+    holdout_cells: bool = False,
+    holdout_cells_file: Path | None = None,
+    holdout_seed: int = 0,
 ) -> dict[str, Any]:
     import torch
 
     from python.train.scene_net import SceneNet
 
     root = Path(root)
-    rows = read_state_jsonl(root / "state.jsonl")
-    file_bytes = measure_driving_file(root)
+    train_cams = tuple(cams) if cams else None
+    train_heads = tuple(heads) if heads else None
+    use_augment = bool(augment) and not bool(sanity) and not bool(dry_run)
+    augment_rng = np.random.RandomState(0)
+    window_rng = np.random.RandomState(1)
+    grad_clip = float(clip)
+    lane_kind = str(lane_loss or "huber")
+    input_scale = float(scale) if float(scale) > 0.0 else 1.0
+    from python.data.raw_frames import load_scene_rows, training_frame_bytes
+    from python.train.scene_loader import default_num_workers, select_training_rows
+
+    print("[GVD] scene index: reading state.jsonl", flush=True)
+    state_rows = load_scene_rows(root)
+    print(f"[GVD] scene index: {len(state_rows)} state rows", flush=True)
+    print("[GVD] scene index: measuring frames", flush=True)
+
+    def _index_progress(n_frames: int, n_bytes: int) -> None:
+        print(f"[GVD] scene index: {n_frames} frames {n_bytes} bytes", flush=True)
+
+    file_bytes, _n_image_files = training_frame_bytes(root, progress=_index_progress)
+    rows, missing_rows, excluded_rows = select_training_rows(root, state_rows)
+    print(
+        f"[GVD] scene index: {len(rows)} rows with frames, {missing_rows} missing, "
+        f"{excluded_rows} stationary or tipped",
+        flush=True,
+    )
+    cell_spec: dict[str, Any] | None = None
+    if holdout_cells:
+        from python.train.continual import (
+            cell_holdout_labels,
+            choose_holdout_cells,
+            load_holdout_cells,
+            save_holdout_cells,
+        )
+        from python.debug.remote_status import status_dir as _cells_status_dir
+
+        if int(holdout_blocks) > 1:
+            raise SystemExit("--holdout-cells and --holdout-blocks > 1 are separate modes; pick one")
+        cells_dir = _cells_status_dir(status_root) or root
+        cells_path = Path(holdout_cells_file) if holdout_cells_file else Path(cells_dir) / "holdout_cells.json"
+        if cells_path.is_file():
+            cell_spec = load_holdout_cells(cells_path)
+            print(f"[GVD] holdout cells: loaded {len(cell_spec['cells'])} cells from {cells_path}", flush=True)
+        else:
+            cell_spec = choose_holdout_cells(rows, seed=int(holdout_seed))
+            save_holdout_cells(cell_spec, cells_path)
+            print(f"[GVD] holdout cells: chose {len(cell_spec['cells'])} cells (seed {int(holdout_seed)}), saved {cells_path}", flush=True)
+        marks = cell_holdout_labels(rows, cell_spec)
+        print(
+            f"[GVD] holdout cells: train={marks.count('train')} holdout={marks.count('hold')} "
+            f"dropped={marks.count('gap')}",
+            flush=True,
+        )
+    elif int(holdout_blocks) > 1:
+        print(f"[GVD] holdout blocks: {int(holdout_blocks)}", flush=True)
     if free_vram_bytes is None:
         free_vram_bytes = read_free_vram_bytes()
     if free_ram_bytes is None:
@@ -577,7 +1318,7 @@ def train_directory(
 
     def _empty(precision: str = "fp32") -> dict[str, Any]:
         if export_path is not None:
-            export_scene_onnx(export_path)
+            export_scene_onnx(export_path, cams=train_cams, heads=train_heads)
         return {
             "strips": len(rows),
             "windows": 0,
@@ -595,7 +1336,10 @@ def train_directory(
         }
 
     if not rows:
-        return _empty()
+        stats = _empty()
+        stats["sanity_ok"] = False if sanity or dry_run else None
+        stats["dry_run"] = bool(dry_run)
+        return stats
 
     frame_bytes = bytes_per_strip(file_bytes, len(rows))
     chunk_len = choose_chunk_length(frame_bytes, chunk_vram_budget(int(free_vram_bytes)))
@@ -614,7 +1358,7 @@ def train_directory(
     def _arm(device_name: str, learning_rate: float | None = None) -> None:
         device = torch.device(device_name)
         if "net" not in holder:
-            holder["net"] = SceneNet().to(device)
+            holder["net"] = SceneNet(cams=train_cams, scale=input_scale).to(device)
         elif holder["device"].type != device_name:
             holder["net"].to(device)
             _release_cuda()
@@ -643,16 +1387,72 @@ def train_directory(
 
     device = holder["device"]
     net = holder["net"]
-    batch = 1
+    # Each shuffled window starts from a reset GRU, so several windows fit
+    # in one step. parallel_fit is how many this free VRAM can hold.
+    parallel_fit = 0
+    if int(free_vram_bytes) > 0 and len(rows) > 0:
+        parallel_fit = largest_batch(
+            usable_bytes(int(free_vram_bytes)),
+            file_bytes=file_bytes,
+            n_strips=len(rows),
+            window_strips=chunk_len,
+            limit=32,
+        )
+    batch = resolve_scene_batch(int(batch_size), parallel_fit)
+    est_step = step_bytes(
+        batch,
+        file_bytes=file_bytes,
+        n_strips=max(1, len(rows)),
+        window_strips=chunk_len,
+    )
     recommended = bool(plan.recommended) and device.type == "cuda"
     note = "recommended" if recommended else "not recommended"
     print(
         f"[GVD] scene fit file={file_bytes} free_vram={int(free_vram_bytes)} "
         f"free_ram={int(free_ram_bytes)} device={device.type} batch={batch} "
-        f"chunk={chunk_len} {note}",
+        f"chunk={chunk_len} step={est_step} parallel_fit={parallel_fit} "
+        f"workers={workers} {note}",
         flush=True,
     )
-    view.open()
+    from python.debug.remote_status import (
+        CHECKPOINT_S,
+        DRY_RUN_STEPS,
+        HEARTBEAT_S,
+        SANITY_STEPS,
+        append_metrics,
+        gpu_util_percent,
+        json_num,
+        sanity_reached,
+        status_dir,
+        write_crash,
+        write_heartbeat,
+    )
+
+    debug_dir = status_dir(status_root)
+    run_started = time.time()
+    write_heartbeat(
+        debug_dir,
+        {
+            "kind": "train",
+            "phase": "loading",
+            "started": run_started,
+            "updated": time.time(),
+            "step": 0,
+            "epoch": 0,
+            "loss": None,
+            "eta_s": None,
+            "lr": float(holder.get("lr", lr)),
+            "device": str(device.type),
+            "strips": str(root),
+            "free_ram_bytes": int(free_ram_bytes),
+            "free_vram_bytes": int(free_vram_bytes),
+            "workers": int(workers),
+            "dry_run": bool(dry_run),
+        },
+    )
+    print(f"[GVD] scene status: heartbeat {debug_dir}", flush=True)
+    if dry_run:
+        arm_dry_run_watchdog(DRY_RUN_TIMEOUT_S)
     supervised = 0
     paused_exit = False
     epoch = 0
@@ -661,6 +1461,81 @@ def train_directory(
     last_loss: float | None = None
     windows = 0
     started = time.perf_counter()
+    last_batch: dict[str, Any] = {"step": 0, "rows": []}
+    last_heart = time.monotonic()
+    last_ckpt = time.monotonic()
+    step_trace: dict[str, Any] = {}
+    sanity_ok: bool | None = None
+    every = max(1, int(metrics_every))
+    steps_per_epoch = 0
+    eta_pass: float | None = None
+    schedule_printed = False
+
+    def _log_step(kind: str, eta: float | None, mem_bytes: int, *, save: bool) -> None:
+        nonlocal last_heart, last_ckpt
+        heads = {
+            key: json_num(value)
+            for key, value in (step_trace.get("heads") or {}).items()
+        }
+        record = {
+            "kind": kind,
+            "t": time.time(),
+            "step": int(done),
+            "epoch": int(epoch),
+            "loss": json_num(step_trace.get("loss")),
+            "heads": heads,
+            "grad_norm": json_num(step_trace.get("grad_norm")),
+            "lr": json_num(holder.get("lr")),
+            "step_s": json_num(step_trace.get("step_s")),
+            "gpu_mem_bytes": int(mem_bytes) if device.type == "cuda" else None,
+            "gpu_util": gpu_util_percent() if device.type == "cuda" else None,
+            "nan": int(step_trace.get("nan") or 0),
+            "inf": int(step_trace.get("inf") or 0),
+        }
+        if int(done) == 1 or int(done) % every == 0:
+            append_metrics(debug_dir, record)
+        now = time.monotonic()
+        if int(done) == 1 or now - last_heart >= HEARTBEAT_S:
+            write_heartbeat(
+                debug_dir,
+                {
+                    "kind": "train",
+                    "started": run_started,
+                    "updated": time.time(),
+                    "step": int(done),
+                    "epoch": int(epoch),
+                    "epochs": int(requested_epochs),
+                    "loss": json_num(last_loss),
+                    "eta_s": json_num(eta),
+                    "eta_pass_s": json_num(eta_pass),
+                    "steps_per_epoch": int(steps_per_epoch),
+                    "supervised": int(supervised),
+                    "windows": int(done),
+                    "lr": json_num(holder.get("lr")),
+                    "device": str(device.type),
+                    "strips": str(root),
+                },
+            )
+            last_heart = now
+        if save and now - last_ckpt >= CHECKPOINT_S:
+            _save_pause(
+                root,
+                net,
+                holder["opt"],
+                holder["scaler"],
+                view,
+                step=done,
+                epoch=epoch,
+                cursor=cursor,
+                loss=last_loss,
+                lr=float(holder["lr"]),
+                epochs=requested_epochs,
+                batch=batch,
+                device_name=device.type,
+                recommended=recommended,
+            )
+            last_ckpt = now
+            print(f"[GVD] checkpoint step={done}", flush=True)
 
     def _clone_weights() -> dict[str, Any]:
         return {key: value.detach().cpu().clone() for key, value in net.state_dict().items()}
@@ -715,23 +1590,56 @@ def train_directory(
 
     def _train_passes() -> float | None:
         nonlocal paused_exit, epoch, cursor, done, last_loss, supervised
-        nonlocal device, net, batch, recommended, windows
+        nonlocal device, net, batch, recommended, windows, last_batch
+        nonlocal steps_per_epoch, eta_pass, schedule_printed
         history: list[float] = []
         best_value: float | None = None
         best_blob: dict[str, Any] | None = None
         while not paused_exit:
-            plan_steps = pass_plan(rows, chunk_len, stride)
+            refit = False
+            from python.train.continual import epoch_windows
+
+            plan_steps = epoch_windows(
+                pass_plan(rows, chunk_len, stride, blocks=int(holdout_blocks), cells=cell_spec),
+                window_rng,
+                min_valid=float(min_valid),
+                balance=bool(balance),
+            )
             windows = sum(1 for item in plan_steps if item["kind"] == "train")
             carry: SceneState | None = None
             end_state: SceneState | None = None
             chunk_in: SceneState | None = None
             hold_sum = 0.0
             hold_n = 0
+            val_pairs: list[tuple[float, float]] = []
             index = 0
+            prefetch = _prefetch_loader(
+                plan_steps,
+                root,
+                train_cams,
+                cache,
+                input_scale,
+                int(workers),
+                device.type == "cuda",
+            )
+            if prefetch is not None:
+                train_n = sum(1 for item in plan_steps if item.get("kind") != "holdout")
+                if len(prefetch.dataset) != train_n:
+                    raise RuntimeError(
+                        f"cache loader has {len(prefetch.dataset)} windows, the plan has {train_n}"
+                    )
+            prefetch_iter = iter(prefetch) if prefetch is not None else None
             while index < len(plan_steps) and not paused_exit:
                 if view.consume_pause() and _pause_now():
                     break
                 item = plan_steps[index]
+                prefetched_frames = None
+                if prefetch_iter is not None and item.get("kind") != "holdout":
+                    try:
+                        packed = next(prefetch_iter)
+                        prefetched_frames = packed.get("frames")
+                    except StopIteration:
+                        prefetched_frames = None
                 state_in = _state_for(str(item["incoming"]), carry, end_state, chunk_in)
                 if item["kind"] == "holdout":
                     held_loss, held_count = _eval_sequence(
@@ -742,33 +1650,95 @@ def train_directory(
                         device=device,
                         amp=bool(holder["amp"]),
                         view=view,
+                        pairs=val_pairs,
+                        cams=train_cams,
+                        cache=cache,
+                        heads=train_heads,
+                        scale=input_scale,
                     )
                     if held_loss is not None and held_count:
                         hold_sum += float(held_loss) * int(held_count)
                         hold_n += int(held_count)
                     index += 1
                     continue
+                group = [item]
+                group_frames: list[Any] = [prefetched_frames]
+                if int(batch) > 1 and str(item.get("incoming")) == "reset":
+                    while len(group) < int(batch) and index + len(group) < len(plan_steps):
+                        nxt = plan_steps[index + len(group)]
+                        if nxt.get("kind") == "holdout" or str(nxt.get("incoming")) != "reset":
+                            break
+                        nxt_frames = None
+                        if prefetch_iter is not None:
+                            try:
+                                packed = next(prefetch_iter)
+                                nxt_frames = packed.get("frames")
+                            except StopIteration:
+                                nxt_frames = None
+                        group.append(nxt)
+                        group_frames.append(nxt_frames)
                 if item["incoming"] != "chunk":
                     chunk_in = state_in
+                last_batch = {
+                    "step": int(done),
+                    "epoch": int(epoch),
+                    "rows": [row.get("i") for piece in group for row in piece["rows"]],
+                }
                 try:
-                    step_loss, n_sup, carry, end_state = _optimizer_step(
-                        net,
-                        holder["opt"],
-                        holder["scaler"],
-                        root,
-                        list(item["rows"]),
-                        state_in,
-                        device=device,
-                        amp=bool(holder["amp"]),
-                        view=view,
-                        stride=int(item["stride"]),
-                        clip=GRAD_CLIP,
-                    )
+                    if len(group) == 1:
+                        step_loss, n_sup, carry, end_state = _optimizer_step(
+                            net,
+                            holder["opt"],
+                            holder["scaler"],
+                            root,
+                            list(item["rows"]),
+                            state_in,
+                            device=device,
+                            amp=bool(holder["amp"]),
+                            view=view,
+                            stride=int(item["stride"]),
+                            clip=grad_clip,
+                            trace=step_trace,
+                            cams=train_cams,
+                            cache=cache,
+                            augment=use_augment,
+                            rng=augment_rng,
+                            heads=train_heads,
+                            lane_loss=lane_kind,
+                            scale=input_scale,
+                            frames=prefetched_frames,
+                        )
+                    else:
+                        step_loss, n_sup, carry, end_state = _optimizer_group(
+                            net,
+                            holder["opt"],
+                            holder["scaler"],
+                            root,
+                            [list(piece["rows"]) for piece in group],
+                            device=device,
+                            amp=bool(holder["amp"]),
+                            view=view,
+                            clip=grad_clip,
+                            trace=step_trace,
+                            cams=train_cams,
+                            cache=cache,
+                            augment=use_augment,
+                            rng=augment_rng,
+                            heads=train_heads,
+                            lane_loss=lane_kind,
+                            frame_sets=group_frames,
+                            scale=input_scale,
+                        )
                 except RuntimeError as exc:
                     if not _is_oom(exc):
                         raise
                     net.zero_grad(set_to_none=True)
                     _release_cuda()
+                    if device.type == "cuda" and int(batch) > 1:
+                        batch = max(1, int(batch) // 2)
+                        refit = True
+                        print(f"[GVD] scene fit oom, retry batch={batch}", flush=True)
+                        break
                     if device.type != "cuda" or not (int(free_ram_bytes) > int(free_vram_bytes)):
                         raise TrainFitError(
                             "the training step fits neither free VRAM nor a larger pool of CPU RAM"
@@ -790,6 +1760,7 @@ def train_directory(
                     batch = 1
                     recommended = False
                     index = 0
+                    prefetch_iter = None
                     carry = None
                     end_state = None
                     chunk_in = None
@@ -797,16 +1768,36 @@ def train_directory(
                 if step_loss is not None:
                     last_loss = step_loss
                 supervised += n_sup
-                cursor += 1
-                done += 1
-                index += 1
+                cursor += len(group)
+                done += len(group)
+                index += len(group)
                 elapsed = time.perf_counter() - started
                 remaining_steps = sum(1 for later in plan_steps[index:] if later["kind"] == "train")
+                steps_per_epoch = sum(1 for item in plan_steps if item["kind"] == "train")
+                has_holdout = any(item["kind"] == "holdout" for item in plan_steps)
+                if not schedule_printed:
+                    schedule_printed = True
+                    print(
+                        f"[GVD] scene schedule steps_per_epoch={steps_per_epoch} "
+                        f"epoch={epoch} lr={float(holder['lr'])} fixed "
+                        f"--epochs {requested_epochs} is recorded; holdout stop ends the run",
+                        flush=True,
+                    )
+                job_steps = remaining_until_holdout_can_stop(
+                    remaining_steps,
+                    steps_per_epoch,
+                    epoch=epoch,
+                    has_holdout=has_holdout,
+                    rates_after=0,
+                )
                 used, kind = _memory_reading(device.type)
+                eta_pass = predict_eta_s(done, elapsed, remaining_steps)
+                eta = predict_eta_s(done, elapsed, job_steps)
+                _log_step("train", eta, used, save=True)
                 _publish(
                     view,
                     TrainStatus(
-                        eta_s=predict_eta_s(done, elapsed, remaining_steps),
+                        eta_s=eta,
                         loss=last_loss,
                         lr=float(holder["lr"]),
                         steps_per_sec=steps_per_second(done, elapsed),
@@ -819,33 +1810,161 @@ def train_directory(
                         steps=done + remaining_steps,
                     ),
                 )
+            if refit:
+                continue
             if paused_exit:
                 break
             if hold_n <= 0:
                 break
             mean = hold_sum / hold_n
-            history.append(mean)
-            if best_value is None or mean < best_value:
-                best_value = mean
+            scored: dict[str, Any] = {}
+            if val_pairs:
+                from python.debug.lane_targets import score_centers
+
+                scored = score_centers(
+                    [pair[0] for pair in val_pairs],
+                    [pair[1] for pair in val_pairs],
+                )
+                append_metrics(
+                    debug_dir,
+                    {
+                        "kind": "val",
+                        "t": time.time(),
+                        "step": int(done),
+                        "epoch": int(epoch),
+                        "loss": json_num(mean),
+                        "n": scored["n"],
+                        "r": json_num(scored["r"]),
+                        "rms": json_num(scored["rms"]),
+                        "rms_mean": json_num(scored["rms_mean"]),
+                        "bias": json_num(scored["bias"]),
+                    },
+                )
+                print(
+                    f"[GVD] val step={done} n={scored['n']} r={scored['r']} "
+                    f"rms={scored['rms']} rms_mean={scored['rms_mean']} "
+                    f"bias={scored['bias']} loss={mean}",
+                    flush=True,
+                )
+            # Stop on the 8 m center rms, not the composite loss. A tiny drop in
+            # the other heads was keeping the run alive after the lane had plateaued.
+            if scored.get("rms") is not None:
+                history.append(float(scored["rms"]))
+                improved = best_value is None or float(scored["rms"]) < best_value
+            else:
+                history.append(mean)
+                improved = best_value is None or mean < best_value
+            if improved:
+                best_value = history[-1]
                 best_blob = _clone_weights()
-            if holdout_stopped(history):
+            plateau = holdout_stopped(history, tol=0.02, window=3) if scored.get("rms") is not None else holdout_stopped(history)
+            if plateau:
+                print(
+                    f"[GVD] holdout stopped at step={done} "
+                    f"rms={scored.get('rms')} rms_mean={scored.get('rms_mean')}",
+                    flush=True,
+                )
                 break
             epoch += 1
         if not paused_exit and best_blob is not None:
             _load_weights(best_blob)
         return best_value
 
+    def _limited(limit: int, subset: list[Mapping[str, Any]], shapes: bool) -> None:
+        """Repeat one fixed batch for the whole budget.
+
+        Dry-run and sanity used to walk the shuffled plan once. Eight frames
+        are a single window, so sanity exited at step 1. Augment stays off.
+        """
+        nonlocal last_loss, done, sanity_ok, last_batch, supervised, windows
+        step_trace["print_shapes"] = shapes
+        if not subset:
+            sanity_ok = False
+            print("[GVD] scene train: no strips for this mode", flush=True)
+            return
+        batch_rows = list(subset)
+        steps = max(1, int(limit))
+        print(
+            f"[GVD] {'dry' if shapes else 'sanity'} batch rows={len(batch_rows)} "
+            f"steps={steps} augment=off lr={float(holder.get('lr', lr))}",
+            flush=True,
+        )
+        lane_loss = None
+        for step_i in range(steps):
+            state = net.initial_state(device=device, batch=1)
+            last_batch = {
+                "step": step_i,
+                "epoch": 0,
+                "rows": [row.get("i") for row in batch_rows],
+            }
+            loss, n_sup, _carry, _state = _optimizer_step(
+                net,
+                holder["opt"],
+                holder["scaler"],
+                root,
+                batch_rows,
+                state,
+                device=device,
+                amp=bool(holder["amp"]),
+                view=view,
+                stride=max(1, len(batch_rows)),
+                clip=grad_clip,
+                trace=step_trace,
+                cams=train_cams,
+                cache=cache,
+                augment=False,
+                heads=train_heads,
+                lane_loss=lane_kind,
+                scale=input_scale,
+            )
+            done = step_i + 1
+            windows = done
+            supervised += int(n_sup)
+            if loss is not None:
+                last_loss = loss
+            lane_loss = step_trace.get("lane_gt")
+            used, _kind = _memory_reading(device.type)
+            _log_step("dry" if shapes else "sanity", None, used, save=False)
+            if shapes:
+                continue
+            if sanity_reached(lane_loss):
+                sanity_ok = True
+                print(f"[GVD] sanity lane_gt={lane_loss} step={done} ok=True", flush=True)
+                return
+        if not shapes:
+            sanity_ok = sanity_reached(lane_loss)
+            print(f"[GVD] sanity lane_gt={lane_loss} step={done} ok={sanity_ok}", flush=True)
+
     try:
-        if not _wait_for_start(view):
+        if open_panel:
+            view.open()
+        if not _confirm_start(
+            view,
+            dry_run=dry_run,
+            sanity=sanity,
+            autostart=autostart or not open_panel,
+        ):
             paused_exit = True
+        elif dry_run or sanity:
+            view.mark_running()
+            subset = list(rows[:4] if dry_run else rows[:8])
+            _limited(DRY_RUN_STEPS if dry_run else SANITY_STEPS, subset, bool(dry_run))
         else:
-            existing = load_checkpoint(root)
+            existing = load_checkpoint(root) if resume else None
             if existing is not None:
                 fields = resume_fields(existing)
-                _arm(device.type, float(fields["lr"]))
+                rate = resume_learning_rate(lr, fields.get("lr"))
+                _arm(device.type, rate)
                 device = holder["device"]
                 net = holder["net"]
                 _apply_checkpoint(net, holder["opt"], holder["scaler"], fields, device)
+                _pin_optimizer_lr(holder["opt"], rate)
+                paused_lr = fields.get("lr")
+                if paused_lr is None or not math.isclose(float(paused_lr), rate, rel_tol=0.0, abs_tol=1e-12):
+                    print(
+                        f"[GVD] scene lr={rate} fixed (pause had {paused_lr}; that rate does not continue)",
+                        flush=True,
+                    )
                 # Weights, step, and optimizer resume. The pass starts again so the
                 # GRU state is rebuilt; that activation is not stored in the pause file.
                 epoch = int(fields["epoch"])
@@ -875,45 +1994,37 @@ def train_directory(
                 started = time.perf_counter()
                 _train_passes()
             else:
-                # No pause file: a new run. Strip JPEGs and state lines stay.
-                init_blob = _clone_weights()
-                scores: dict[float, float] = {}
-                blobs: dict[float, dict[str, Any]] = {}
-                series: dict[float, list[float]] = {}
+                # One rate for the whole run. Holdout stop returns. It does not
+                # reload the initial weights and try 1e-4.
                 view.mark_running()
-                for rate in ordered_learning_rates(lr):
-                    _load_weights(init_blob)
-                    _arm(device.type, rate)
-                    started = time.perf_counter()
-                    device = holder["device"]
-                    net = holder["net"]
-                    epoch = 0
-                    cursor = 0
-                    done = 0
-                    last_loss = None
-                    view.losses = []
-                    score = _train_passes()
-                    if paused_exit:
-                        break
-                    scores[rate] = float("inf") if score is None else float(score)
-                    blobs[rate] = _clone_weights()
-                    series[rate] = [float(value) for value in view.losses]
-                if not paused_exit and scores:
-                    winner = pick_learning_rate(scores)
-                    _load_weights(blobs[winner])
-                    holder["lr"] = float(winner)
-                    view.restore_losses(series.get(winner, []))
-        if not paused_exit and export_path is not None:
-            export_scene_onnx(export_path, net)
-        if not paused_exit:
+                _arm(device.type, resume_learning_rate(lr))
+                started = time.perf_counter()
+                device = holder["device"]
+                net = holder["net"]
+                epoch = 0
+                cursor = 0
+                done = 0
+                last_loss = None
+                view.losses = []
+                print(f"[GVD] scene lr={float(holder['lr'])} fixed", flush=True)
+                _train_passes()
+        if not paused_exit and not dry_run and not sanity and export_path is not None:
+            export_scene_onnx(export_path, net, heads=train_heads)
+        if not paused_exit and not dry_run and not sanity:
             clear_checkpoint(root)
+    except Exception:
+        write_crash(debug_dir, traceback.format_exc(), last_batch)
+        raise
     finally:
+        if dry_run:
+            disarm_dry_run_watchdog()
         if own_view:
             view.close()
     return {
         "strips": len(rows),
-        "windows": windows,
-        "supervised": supervised,
+        "windows": int(done),
+        "supervised": int(supervised),
+        "steps_per_epoch": int(steps_per_epoch),
         "precision": holder.get("precision", "fp32"),
         "capability": holder.get("cap", capability),
         "export": None if export_path is None else str(export_path),
@@ -926,25 +2037,72 @@ def train_directory(
         "requested_epochs": requested_epochs,
         "chunk": chunk_len,
         "lr": float(holder.get("lr", lr)),
+        "sanity_ok": sanity_ok,
+        "dry_run": bool(dry_run),
     }
 
 
 def main(argv: list[str] | None = None) -> None:
+    from python.data.data_root import DataDriveError, check_data_path, ensure_cache_dirs, scene_lanes_dir
+
+    try:
+        ensure_cache_dirs()
+    except DataDriveError as exc:
+        print(f"[GVD] scene train: {exc}")
+        sys.exit(2)
     args = build_parser().parse_args(argv)
+    from python.train.cam_strip import parse_cams, parse_heads
+    from python.train.frame_cache import FrameCache, build_frame_cache
+    from python.train.scene_loader import default_num_workers
+
+    try:
+        cam_names = parse_cams(args.cams)
+        head_names = parse_heads(args.heads)
+    except ValueError as exc:
+        print(f"[GVD] scene train: {exc}")
+        sys.exit(2)
+    if args.build_cache:
+        manifest = build_frame_cache(
+            args.strips or scene_lanes_dir(),
+            args.build_cache,
+            cam_names,
+            scale=float(args.scale),
+        )
+        print(
+            f"[GVD] cache {args.build_cache} cams={','.join(cam_names)} "
+            f"chunks={len(manifest.get('chunks') or [])} frames={manifest.get('frames')}",
+            flush=True,
+        )
+        return
+    frame_cache = FrameCache(args.cache) if args.cache else None
     export_path = None if args.export is None else Path(args.export)
     if export_path is not None and not args.strips:
+        try:
+            check_data_path(export_path)
+        except DataDriveError as exc:
+            print(f"[GVD] scene train: {exc}")
+            sys.exit(2)
         if not torch_ready():
             print("[GVD] scene export needs PyTorch")
             sys.exit(2)
-        path = export_scene_onnx(export_path)
+        path = export_scene_onnx(export_path, cams=cam_names, heads=head_names)
         print(f"[GVD] exported {path}")
         return
     if not args.strips:
-        print("[GVD] scene train: pass --strips, or --export to write the ONNX graph")
-        return
+        args.strips = str(scene_lanes_dir())
+    try:
+        check_data_path(args.strips)
+        if export_path is not None:
+            check_data_path(export_path)
+    except DataDriveError as exc:
+        print(f"[GVD] scene train: {exc}")
+        sys.exit(2)
     if not torch_ready():
         print("[GVD] scene train needs PyTorch")
         sys.exit(2)
+    open_panel, start_now = resolve_panel(no_panel=bool(args.no_panel), autostart=bool(args.autostart))
+    if not open_panel:
+        print("[GVD] scene train: no panel", flush=True)
     try:
         stats = train_directory(
             Path(args.strips),
@@ -952,14 +2110,39 @@ def main(argv: list[str] | None = None) -> None:
             lr=args.lr,
             capability=args.capability,
             export_path=export_path,
+            resume=not bool(args.no_resume),
+            sanity=bool(args.sanity) and not bool(args.dry_run),
+            dry_run=bool(args.dry_run),
+            metrics_every=int(args.metrics_every),
+            autostart=start_now,
+            open_panel=open_panel,
+            cams=cam_names,
+            heads=head_names,
+            cache=frame_cache,
+            augment=bool(args.augment),
+            clip=float(args.clip),
+            lane_loss=str(args.lane_loss),
+            balance=bool(args.balance),
+            min_valid=float(args.min_valid),
+            workers=default_num_workers() if args.workers is None else int(args.workers),
+            scale=float(args.scale),
+            batch_size=int(args.batch),
+            holdout_blocks=resolve_holdout_blocks(args.holdout_blocks),
+            holdout_cells=bool(args.holdout_cells),
+            holdout_cells_file=Path(args.holdout_cells_file) if args.holdout_cells_file else None,
+            holdout_seed=int(args.holdout_seed),
         )
     except TrainFitError as exc:
         print(f"[GVD] scene train: {exc}")
         sys.exit(2)
+    if args.sanity and not args.dry_run and not stats.get("sanity_ok"):
+        print("[GVD] sanity failed: lane_gt loss did not fall below 0.05", flush=True)
+        sys.exit(1)
     note = "recommended" if stats["recommended"] else "not recommended"
     print(
-        f"[GVD] scene train strips={stats['strips']} windows={stats['windows']} "
-        f"supervised={stats['supervised']} precision={stats['precision']} "
+        f"[GVD] scene train strips={stats['strips']} steps={stats['windows']} "
+        f"supervised={stats['supervised']} steps_per_epoch={stats.get('steps_per_epoch', 0)} "
+        f"precision={stats['precision']} "
         f"device={stats['device']} batch={stats['batch']} {note}"
     )
     if stats["export"]:

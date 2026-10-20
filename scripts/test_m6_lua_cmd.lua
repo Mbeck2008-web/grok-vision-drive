@@ -293,7 +293,8 @@ check(ego and ego:find('"lua_bus":"' .. DRIVE_BUS, 1, true),
 clearEvents()
 writeCmd(true, 0.0, 0.5, 1.0)
 M.onUpdate(0.06)
-check(near(lastEvent('brake')[2], 1.0) and near(lastEvent('throttle')[2], 0.0), 'brake>0 → throttle forced 0')
+check(near(lastEvent('throttle')[2], 0.0) and near(lastEvent('brake')[2], 0.0) and near(lastEvent('parkingbrake')[2], 1.0),
+  'brake with no throttle is the parking brake, not arcade reverse')
 
 -- 5) stale stream (>0.35 s without a new seq) → brake hold, steering straight
 clearEvents()
@@ -303,7 +304,9 @@ check(near(lastEvent('steering')[2], 0.6), 'fresh cmd applied (steer 0.6)')
 clearEvents()
 M.onUpdate(0.2); M.onUpdate(0.2)
 local sh = lastEvent('steering'); local bh = lastEvent('brake'); local thh = lastEvent('throttle')
-check(sh and near(sh[2], 0) and bh and near(bh[2], 1) and thh and near(thh[2], 0), 'stale > 0.35 s → steer 0 / throttle 0 / brake 1 hold')
+local ph = lastEvent('parkingbrake')
+check(sh and near(sh[2], 0) and bh and near(bh[2], 0) and thh and near(thh[2], 0) and ph and near(ph[2], 1),
+  'stale > 0.35 s → steer 0 / throttle 0 / parking brake hold')
 check(M.isEngaged(), 'still engaged during short stall')
 
 -- 6) stream resumes → normal apply again
@@ -365,8 +368,8 @@ check(near(lastEvent('brake')[2], 0) and near(lastEvent('throttle')[2], 0), 'dea
 local ef = readFileAll(engagePath)
 check(ef and ef:find('"engaged":false') ~= nil, 'dead-man wrote gvd_engage.json engaged=false')
 local sawHold = false
-for _, e in ipairs(events) do if e[1] == 'brake' and near(e[2], 1) then sawHold = true end end
-check(sawHold, 'brake hold happened before the dead-man release')
+for _, e in ipairs(events) do if e[1] == 'parkingbrake' and near(e[2], 1) then sawHold = true end end
+check(sawHold, 'parking-brake hold happened before the dead-man release')
 
 -- 10) left-over file from an old session (heartbeat_mtime far in the past) is never applied
 M.toggleEngage()
@@ -500,6 +503,65 @@ check(M.isEngaged(), 'vehicle switch re-arms the override warm-up')
 for _ = 1, 8 do driveTick(0, 0.3, 0, pin) end
 check(not M.isEngaged(), 'once warm again a held residual is player_steer')
 currentVeh = fakeVeh
+
+-- 13a) 20 Hz apply on the 10 Hz echo: ovrCheck runs twice per echo, and only a new echo is a
+-- sample. Judging the repeat again let two same-sign kicks drag the filter up and freeze it.
+local function halfTick(steerCmd, thrCmd, brkCmd, overrideCfg)
+  writeCmd(true, steerCmd, thrCmd, brkCmd)
+  beatState(true, 'none', overrideCfg)
+  M.onUpdate(0.05)
+  drainGE()
+end
+echo(0, 0.3, 0)
+M.toggleEngage()
+warmDrive(0, 0.3, 0, pin)
+check(M.isEngaged(), '20 Hz apply: engaged before the chatter')
+local echoSeqs = {}
+for i = 1, 24 do
+  echo((i % 2 == 0) and 0.7 or -0.7, 0.3, 0)
+  halfTick(0, 0.3, 0, pin); halfTick(0, 0.3, 0, pin)
+  local e = readFileAll(egoPath)
+  echoSeqs[#echoSeqs + 1] = tonumber(e and e:match('"echo_seq":(%d+)'))
+end
+check(M.isEngaged(), 'chatter flipping per 10 Hz echo, judged at 20 Hz, does not disengage')
+local stepOk = #echoSeqs == 24
+for i = 2, #echoSeqs do
+  if echoSeqs[i] == nil or echoSeqs[i - 1] == nil or echoSeqs[i] ~= echoSeqs[i - 1] + 1 then stepOk = false end
+end
+check(stepOk, 'gvd_ego.json echo_seq moves on by one per echo (' .. table.concat(echoSeqs, ',', 1, math.min(4, #echoSeqs)) .. ',...)')
+do
+  -- echo_seq is gvd_main's own counter, not the command seq: commands stop arriving (no new
+  -- gvd_cmd.json seq) while electrics keep being echoed, and echo_seq still moves on.
+  echo(0, 0.3, 0)  -- the wheel back on the command: this gap is about the link, not a pull
+  local e0 = readFileAll(egoPath)
+  local seq0 = tonumber(e0 and e0:match('"echo_seq":(%d+)'))
+  local app0 = tonumber(e0 and e0:match('"applied_seq":(%-?%d+)'))
+  for _ = 1, 6 do
+    beatState(true, 'none', pin)
+    M.onUpdate(0.05)
+    drainGE()
+  end
+  local e1 = readFileAll(egoPath)
+  local seq1 = tonumber(e1 and e1:match('"echo_seq":(%d+)'))
+  local app1 = tonumber(e1 and e1:match('"applied_seq":(%-?%d+)'))
+  check(seq0 ~= nil and seq1 ~= nil and seq1 >= seq0 + 2,
+    'commands stopped, echoes continue: echo_seq still moves on (' .. tostring(seq0) .. ' -> ' .. tostring(seq1) .. ')')
+  check(app0 ~= nil and app1 == app0, 'applied_seq stays on the last command (' .. tostring(app0) .. ' -> ' .. tostring(app1) .. ')')
+  check(e1 and e1:find('"mod_version":"' .. M.MOD_VERSION .. '"', 1, true),
+    'gvd_ego.json carries mod_version ' .. tostring(M.MOD_VERSION))
+  check(M.isEngaged(), 'a short command gap with live echoes keeps the car')
+end
+echo(0, 0.3, 0)
+for _ = 1, 6 do halfTick(0, 0.3, 0, pin) end
+echo(0.25, 0.3, 0)
+local pullMs = 0
+while M.isEngaged() and pullMs < 2000 do
+  halfTick(0, 0.3, 0, pin)
+  pullMs = pullMs + 50
+end
+check(not M.isEngaged(), 'a held 0.25 pull at 20 Hz apply is still player_steer')
+print(string.format('  lua 20 Hz apply / 10 Hz echo: player_steer %d ms after the pull', pullMs))
+check(pullMs <= 600, 'player_steer within 600 ms of the pull at 20 Hz apply (' .. pullMs .. ' ms)')
 
 -- 13b) secondary Direct Drive lock: electrics match GVD, override is the physical wheel
 veEnv.input.lastInputs = {

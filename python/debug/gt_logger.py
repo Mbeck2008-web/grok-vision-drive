@@ -15,13 +15,22 @@ import time
 from pathlib import Path
 from typing import Any
 
+from python.debug.lane_targets import LOOKAHEADS_M, lookahead_xs
 from python.debug.gt_geom import (
+    CONNECT_HEADING,
+    CurvePreview,
+    PreviewMemory,
+    RoadFollow,
     RoadHit,
     RoadPoly,
     ego_center_x,
     heading_from_dir,
+    lane_still_beside,
     parse_road_edges,
+    project_follow,
+    road_width_floor,
     project_road,
+    update_curve_preview,
 )
 
 FRAME_EVERY_S = 4.0
@@ -36,7 +45,17 @@ def gt_log_enabled(flag: bool = False) -> bool:
 
 
 def logs_dir(root: Path | None = None) -> Path:
-    base = Path(root) if root is not None else Path(__file__).resolve().parents[2] / "logs"
+    """Live GT logs. Default is ``E:\\GVD_data\\logs`` (or ``GVD_DATA_DIR``)."""
+    if root is not None:
+        base = Path(root)
+    else:
+        from python.data.data_root import logs_dir as data_logs
+        from python.data.data_root import use_data_disk
+
+        if use_data_disk():
+            base = data_logs()
+        else:
+            base = Path(__file__).resolve().parents[2] / "logs"
     base.mkdir(parents=True, exist_ok=True)
     return base
 
@@ -113,8 +132,56 @@ def polys_from_network(spec: Any) -> list[RoadPoly]:
             edges = road
         poly = parse_road_edges(str(road_id), edges)
         if poly is not None:
-            polys.append(poly)
+            if isinstance(road, dict):
+                try:
+                    count = int(float(road.get("lanesLeft") or 0)) + int(float(road.get("lanesRight") or 0))
+                except (TypeError, ValueError):
+                    count = 0
+                if 1 <= count <= 8:
+                    poly.lanes = count
+            polys.append(road_width_floor(poly, road))
     return polys
+
+
+def raw_road_network(bng: Any) -> tuple[Any, Any, str]:
+    """``(road_network spec, get_roads dict or None, note)``.
+
+    The spec is whatever ``get_road_network`` returned, before it is parsed
+    into centerlines. ``get_roads`` is included when that call succeeds.
+    """
+    if bng is None:
+        return None, None, "no beamng"
+    notes: list[str] = []
+    spec = None
+    owners = []
+    scenario = getattr(bng, "scenario", None)
+    if scenario is not None:
+        owners.append(scenario)
+    owners.append(bng)
+    for owner in owners:
+        fn = getattr(owner, "get_road_network", None)
+        if not callable(fn):
+            continue
+        got, note = _call(fn, include_edges=True, drivable_only=True)
+        if note:
+            notes.append(f"get_road_network {note}")
+            got, note2 = _call(fn)
+            if note2:
+                notes.append(f"get_road_network() {note2}")
+        if got is not None:
+            spec = got
+            break
+    roads = None
+    get_roads = getattr(bng, "get_roads", None)
+    if callable(get_roads):
+        got, note = _call(get_roads)
+        if note:
+            notes.append(f"get_roads failed: {note}")
+        elif isinstance(got, dict):
+            roads = got
+    if spec is None and roads is None:
+        return None, None, "; ".join(notes) if notes else "no road network"
+    return spec, roads, ""
 
 
 def load_road_polys(bng: Any) -> tuple[list[RoadPoly], str]:
@@ -277,7 +344,13 @@ def _draw_bev(lanes_bev: list | None, lane_x: float | None) -> Any:
         if len(pts) >= 2:
             cv2.polylines(img, [np.array(pts, dtype=np.int32)], False, (40, 140, 60), 2, cv2.LINE_AA)
     if lane_x is not None:
-        cv2.circle(img, pix(float(lane_x), 8.0), 4, (40, 90, 200), -1, cv2.LINE_AA)
+        try:
+            x = float(lane_x)
+            y_px = 8.0
+        except (TypeError, ValueError):
+            x = None
+        if x is not None and x == x:
+            cv2.circle(img, pix(x, y_px), 4, (40, 90, 200), -1, cv2.LINE_AA)
     return img
 
 
@@ -344,6 +417,12 @@ class GroundTruthLogger:
         self._burst = 0
         self._was_out = False
         self._ticks = 0
+        self._preview = PreviewMemory()
+        self._follow = RoadFollow()
+        # Set by curve_preview. write() uses it so gt_center is the road
+        # the wheel accepted, not a crossing polyline chosen the same tick.
+        self._followed: RoadHit | None = None
+        self._last_good: RoadHit | None = None
 
     @classmethod
     def open(cls, root: Path | None = None) -> GroundTruthLogger:
@@ -373,6 +452,101 @@ class GroundTruthLogger:
             self._road_note = note
             print(f"[GVD] gt roads: {note}", flush=True)
 
+    def center_x(self, vdata: Any, bng: Any = None, socket_busy: bool = False) -> float | None:
+        """Road-network center at 8 m, the same number the log stores as ``gt_center_x``.
+
+        Off-road or a missing pose is None. The caller does not invent a lane.
+        """
+        self._ensure_roads(bng, socket_busy)
+        if not self._roads:
+            return None
+        pos, heading, _speed = _pose(vdata)
+        if pos is None:
+            return None
+        hit = project_road(self._roads, pos[0], pos[1], heading)
+        if hit is None or hit.off_road or hit.lane_offset_m is None:
+            return None
+        if hit.lane_width_m is None or float(hit.lane_width_m) <= 0.0:
+            return None
+        return float(ego_center_x(hit.lane_offset_m, hit.heading_err_rad, 8.0))
+
+    def curve_preview(
+        self,
+        vdata: Any,
+        bng: Any = None,
+        socket_busy: bool = False,
+        dt_s: float | None = None,
+    ) -> CurvePreview | None:
+        """Lane sample for the wheel, held on the road we are already on.
+
+        A crossing polyline does not replace that road. The end of the
+        mesh, with no continuation, is lost immediately: the caller brakes
+        and the last curve stays on the wheel. ``gt_center_x`` logged from
+        ``write`` uses this same hit, so it matches ``lane_x`` instead of
+        the rejected polyline.
+        """
+        self._ensure_roads(bng, socket_busy)
+        dt = 0.1 if dt_s is None else dt_s
+        self._followed = None
+        if not self._roads:
+            return None
+        pos, heading, speed_pose = _pose(vdata)
+        if pos is None or heading is None:
+            return update_curve_preview(
+                self._preview,
+                offset_m=None,
+                heading_err_rad=None,
+                curvature=0.0,
+                road_id="",
+                beside=False,
+                dt_s=dt,
+                discontinuous=True,
+            )
+        hit = project_follow(
+            self._roads, pos[0], pos[1], heading, self._follow, speed_mps=speed_pose or 0.0,
+        )
+        # A rejected crossing road still carries that road's offset. Log the
+        # last accepted polyline instead, which is what lane_x is held to.
+        bad_jump = (
+            hit is not None
+            and hit.discontinuous
+            and hit.heading_err_rad is not None
+            and abs(hit.heading_err_rad) > CONNECT_HEADING
+        )
+        if hit is not None and not bad_jump:
+            self._last_good = hit
+            self._followed = hit
+        else:
+            self._followed = self._last_good
+        if hit is None or hit.heading_err_rad is None or hit.lane_offset_m is None:
+            return update_curve_preview(
+                self._preview,
+                offset_m=None,
+                heading_err_rad=None,
+                curvature=0.0,
+                road_id="",
+                beside=False,
+                dt_s=dt,
+                discontinuous=True,
+            )
+        kappa = float(hit.curvature)
+        # The walk died at the end of the mesh. Keep the bend we already had
+        # instead of commanding a straight line off the end.
+        if hit.ahead_m < 4.0 and self._preview.offset_m is not None:
+            kappa = float(self._preview.curvature)
+        aligned = abs(hit.heading_err_rad) <= CONNECT_HEADING
+        beside = (not hit.discontinuous) and (lane_still_beside(hit) or aligned)
+        return update_curve_preview(
+            self._preview,
+            offset_m=hit.lane_offset_m,
+            heading_err_rad=hit.heading_err_rad,
+            curvature=kappa,
+            road_id=hit.road_id,
+            beside=beside,
+            dt_s=dt,
+            discontinuous=bool(hit.discontinuous),
+        )
+
     def write(
         self,
         *,
@@ -388,6 +562,8 @@ class GroundTruthLogger:
         stitch: Any = None,
         lanes_bev: list | None = None,
         socket_busy: bool = False,
+        model_lane_x: float | None = None,
+        model_conf: float | None = None,
     ) -> dict[str, Any]:
         self._ensure_roads(bng, socket_busy)
         pos, heading, speed = _pose(vdata)
@@ -399,8 +575,8 @@ class GroundTruthLogger:
             self._last_sim = sim
             t = sim
             t_source = "sim"
-        hit: RoadHit | None = None
-        if pos is not None and self._roads:
+        hit: RoadHit | None = self._followed
+        if hit is None and pos is not None and self._roads:
             hit = project_road(self._roads, pos[0], pos[1], heading)
         damage = _num(getattr(vdata, "damage", None)) if vdata is not None else None
         delta = None
@@ -413,11 +589,13 @@ class GroundTruthLogger:
         gt_center = None
         gt_left = None
         gt_right = None
+        ahead = None
         if hit is not None and lane_off is not None and width is not None:
             gt_center = ego_center_x(lane_off, hit.heading_err_rad, 8.0)
             half = float(width) * 0.5
             gt_left = gt_center - half
             gt_right = gt_center + half
+            ahead = lookahead_xs(lane_off, hit.heading_err_rad, width, ys=LOOKAHEADS_M)
         det_left, det_right, det_center = detected_lane_xs(lanes_bev, 8.0)
         in_lane = None
         if hit is not None and width is not None and width > 0.0:
@@ -446,9 +624,15 @@ class GroundTruthLogger:
             "damage": damage,
             "damage_delta": delta,
             "lane_x": None if lane_x is None else float(lane_x),
+            "model_lane_x": None if model_lane_x is None else float(model_lane_x),
+            "model_conf": None if model_conf is None else float(model_conf),
             "gt_center_x": gt_center,
             "gt_left_x": gt_left,
             "gt_right_x": gt_right,
+            "gt_lookahead_m": None if ahead is None else ahead["y_m"],
+            "gt_center_xs": None if ahead is None else ahead["center_x"],
+            "gt_left_xs": None if ahead is None else ahead["left_x"],
+            "gt_right_xs": None if ahead is None else ahead["right_x"],
             "det_left_x": det_left,
             "det_right_x": det_right,
             "det_center_x": det_center,
@@ -465,6 +649,20 @@ class GroundTruthLogger:
             handle.write(json.dumps(row, separators=(",", ":")) + "\n")
         self._ticks += 1
         self._maybe_frame(row, stitch, lanes_bev, lane_x, departed)
+        from python.debug.remote_status import note_live
+
+        note_live(
+            {
+                "lane_x": row.get("lane_x"),
+                "model_lane_x": row.get("model_lane_x"),
+                "model_conf": row.get("model_conf"),
+                "gt_center_x": row.get("gt_center_x"),
+                "lane_src": row.get("lane_src"),
+                "engaged": row.get("engaged"),
+                "speed_mps": row.get("speed_mps"),
+                "log": str(self.path),
+            }
+        )
         return row
 
     def _maybe_frame(
@@ -488,9 +686,17 @@ class GroundTruthLogger:
         name = f"{tag}_{self._ticks:06d}.jpg"
         off = row.get("lane_offset_m")
         off_s = "na" if off is None else f"{float(off):+.2f}"
+        model_x = row.get("model_lane_x")
+        model_c = row.get("model_conf")
+        gt_c = row.get("gt_center_x")
         hud = [
             f"t={float(row['t']):.2f} engaged={int(bool(row['engaged']))} in_lane={row.get('in_lane')}",
             f"offset={off_s} lane_x={row.get('lane_x')} src={row.get('lane_src')}",
+            (
+                f"model_x={'na' if model_x is None else f'{float(model_x):+.2f}'} "
+                f"conf={'na' if model_c is None else f'{float(model_c):.2f}'} "
+                f"gt={'na' if gt_c is None else f'{float(gt_c):+.2f}'}"
+            ),
             f"steer={float(row['steer']):+.3f} {row.get('steer_why')} off_road={row.get('off_road')}",
         ]
         save_debug_frame(self.frames / name, stitch=stitch, lanes_bev=lanes_bev, hud=hud, lane_x=lane_x)

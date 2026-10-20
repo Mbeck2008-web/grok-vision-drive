@@ -21,6 +21,15 @@ WEAVE_S = 12.0
 LANE_CHANGE_S = 8.0
 RECOVER_S = 12.0
 ABORT_S = 3.0
+# The abort drives back to the lane gently. ``ai.setAggression`` sets
+# ai.lua's ``M.extAggression`` (0.39.4.0 ai.lua 275-277), and nothing the
+# collector sends afterwards undoes it: ``setMode`` runs resetMapAndRoute ->
+# resetAggression (3787, 290-292), which resets to ``M.extAggression`` itself.
+# The collector never sets aggression at a segment start, so every segment's
+# vehicle starts at ai.lua's default ``M.extAggression = 0.3`` (ai.lua 12);
+# cruise (the end of the 3 s abort, and every segment start) puts that back.
+ABORT_AGGRESSION = 0.2
+AI_DEFAULT_AGGRESSION = 0.3
 # In-lane only. Large enough to see, small enough to stay off the next lane.
 WEAVE_AMP_M = 0.6
 WEAVE_AMP_LO_M = 0.3
@@ -719,7 +728,10 @@ def excursion_commands(
         f"ai.setSpeed({speed})",
     ]
     if phase == "abort":
-        lines.append("ai.setAggression(0.2)")
+        lines.append(f"ai.setAggression({ABORT_AGGRESSION})")
+    elif phase == "cruise":
+        # The abort's 0.2 stays until set again: back to the segment-start default when it ends.
+        lines.append(f"ai.setAggression({AI_DEFAULT_AGGRESSION})")
     return lines
 
 

@@ -1629,7 +1629,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         last_print = time.monotonic()
         last_disk = last_print
         from python.collect.excursion import (
+            ABORT_AGGRESSION,
             ACTIVE,
+            AI_DEFAULT_AGGRESSION,
             Excursion,
             ExcursionClock,
             CRUISE_S,
@@ -2175,6 +2177,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             extra["impact_respawn"] = {"on": impact_respawn_on, **impact_respawns}
             extra["speed_ranges"] = {k: list(v) for k, v in speed_ranges.items()}
             extra["weave_stats"] = weave_stats.summary()
+            # Cruise puts the AI aggression back after an abort (scripts/abort_aggression_tag.py reads this).
+            extra["ai_aggression"] = {"abort": ABORT_AGGRESSION, "reset_to": AI_DEFAULT_AGGRESSION, "reset_on": "cruise"}
             # Lane-change rows carry the peak heading reached so far (older recordings: the full-ramp peak).
             extra["lane_change_tag"] = "peak_so_far"
             extra["notes"] = {

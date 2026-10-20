@@ -894,7 +894,7 @@ local function uiPayload()
   local aeb = pl.aeb and tostring(pl.aeb) or ''
   -- preview / veto / AEB / stale link are holds. DRIVE only while a live command is applied.
   local hold = link ~= 'live' or reason == 'preview_blocked' or reason == 'heartbeat_stale'
-    or reason:sub(1, 5) == 'veto:' or aeb == 'brake' or aeb == 'warn'
+    or reason:sub(1, 5) == 'veto:' or reason:sub(1, 11) == 'scene_hold:' or aeb == 'brake' or aeb == 'warn'
   local actuator = st and tostring(st.actuator or '') or ''
   local applied = st and st.cmd_applied == true
   local modeTag = '|OFF'

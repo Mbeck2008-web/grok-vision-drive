@@ -111,7 +111,9 @@ OUTPUT_FIELDS = (
 LOSS_TERMS = ("points", "class", "lamps", "valid", "lane_gt")
 HEAD_NAMES = ("lanes", "curbs", "objects", "signs", "lane_gt")
 
-_BAD_REASONS = frozenset({"player_steer", "player_brake", "player_throttle"})
+# Torch-free pieces the live supervisor needs live in scene_live (run_vision must
+# not import torch at startup); re-exported here for the trainer and the tests.
+from python.train.scene_live import _BAD_REASONS, _has_labels, live_strip_fields  # noqa: E402,F401
 
 SCENE_ONNX_NAME = "e2e_scene.onnx"
 
@@ -433,55 +435,6 @@ def loss_mask(row: Mapping[str, Any]) -> bool:
         return False
     tech = row.get("tech")
     return isinstance(tech, dict) and bool(tech)
-
-
-def _has_labels(value: Any) -> bool:
-    if value is None:
-        return False
-    try:
-        return len(value) > 0
-    except TypeError:
-        return True
-
-
-def live_strip_fields(
-    *,
-    lanes: Any = None,
-    tracks: Any = None,
-    signs: Any = None,
-    curbs: Any = None,
-    steer: float = 0.0,
-    throttle: float = 0.0,
-    brake: float = 0.0,
-    override_reason: Any = None,
-) -> dict[str, Any]:
-    """Scene labels and the wheel/pedal gate for one live strip.
-
-    ``tech`` is present only when this tick has lanes, tracks, signs, or curbs,
-    which is what ``loss_mask`` requires before a step is supervised. A player
-    override reason is stored on the wheel or the pedals so that moment is gated.
-    """
-    tech: dict[str, Any] = {}
-    if _has_labels(lanes):
-        tech["lanes"] = lanes
-    if _has_labels(tracks):
-        tech["tracks"] = tracks
-    if _has_labels(signs):
-        tech["signs"] = signs
-    if _has_labels(curbs):
-        tech["curbs"] = curbs
-    wheel: dict[str, Any] = {"steer": float(steer or 0.0)}
-    pedals: dict[str, Any] = {
-        "throttle": float(throttle or 0.0),
-        "brake": float(brake or 0.0),
-    }
-    reason = str(override_reason or "").strip().lower()
-    if reason in _BAD_REASONS:
-        if reason == "player_steer":
-            wheel["reason"] = reason
-        else:
-            pedals["reason"] = reason
-    return {"wheel": wheel, "pedals": pedals, "tech": tech or None}
 
 
 def _class_index(value: Any, table: tuple[str, ...]) -> int | None:
@@ -986,23 +939,35 @@ class SceneState:
     mask: Any
 
 
-def _lane_gt_loss(
+def _lane_gt_present(pred: ScenePrediction, target: Mapping[str, Any]) -> bool:
+    """True when this batch has a lane_gt term at all: torch, a head output, and a target."""
+    return (
+        torch is not None
+        and getattr(pred, "lane_gt", None) is not None
+        and "lane_gt" in target
+        and "lane_gt_valid" in target
+    )
+
+
+def _lane_gt_parts(
     functional: Any,
     pred: ScenePrediction,
     target: Mapping[str, Any],
     device: Any,
     dtype: Any,
-    zero: Any,
+    zero: Any = None,
     *,
     lane_loss: str = "huber",
-) -> Any:
-    """Smooth-L1 on the lookaheads and heading, BCE on the confidence.
+) -> tuple[Any, Any] | None:
+    """``(conf_bce, lane_reg)``: BCE on the confidence, smooth-L1 on the rest.
 
-    A recording without the vector contributes nothing. The confidence slot
-    is a probability already (sigmoid in the head).
+    ``None`` when there is no lane_gt term (torch missing, no head output, or
+    no target): the caller decides what "absent" is, so nobody multiplies a
+    placeholder ``zero`` by ``conf_weight``. ``zero`` is accepted and unused.
+    The confidence slot is a probability already (sigmoid in the head).
     """
-    if torch is None or pred.lane_gt is None or "lane_gt" not in target or "lane_gt_valid" not in target:
-        return zero
+    if not _lane_gt_present(pred, target):
+        return None
     pred_v = pred.lane_gt.to(device=device, dtype=dtype).reshape(-1, LANE_GT_DIM)
     goal = target["lane_gt"].to(device=device, dtype=dtype).reshape(-1, LANE_GT_DIM)
     mask = target["lane_gt_valid"].to(device=device, dtype=dtype).reshape(-1, LANE_GT_DIM)
@@ -1022,7 +987,99 @@ def _lane_gt_loss(
         residual = functional.smooth_l1_loss(values, goal_v, reduction="none")
     # Masked slots stay out of the mean. A stored NaN is not a real zero.
     residual = torch.where(value_mask > 0.5, residual, torch.zeros_like(residual))
-    return bce + residual.sum() / denom
+    return bce, residual.sum() / denom
+
+
+def _lane_gt_loss(
+    functional: Any,
+    pred: ScenePrediction,
+    target: Mapping[str, Any],
+    device: Any,
+    dtype: Any,
+    zero: Any,
+    *,
+    lane_loss: str = "huber",
+    conf_weight: float = 1.0,
+) -> Any:
+    """``conf_weight`` x confidence BCE plus the lookahead regression.
+
+    No lane_gt term: ``zero`` comes back unchanged and unweighted. No
+    arithmetic touches it, so a placeholder (or a tensor) is returned as is.
+    """
+    parts = _lane_gt_parts(functional, pred, target, device, dtype, lane_loss=lane_loss)
+    if parts is None:
+        return zero
+    bce, reg = parts
+    return float(conf_weight) * bce + reg
+
+
+def has_lane_gt(labels: Mapping[str, Any] | None) -> bool:
+    """True when a row's labels carry at least one valid ``lane_gt`` slot."""
+    if not labels or "lane_gt_valid" not in labels:
+        return False
+    mask = labels["lane_gt_valid"]
+    if hasattr(mask, "detach"):
+        mask = mask.detach().cpu().numpy()
+    return bool(np.any(np.asarray(mask, dtype=np.float32) > 0.5))
+
+
+class LaneGtMissingError(RuntimeError):
+    """The ``lane_gt`` head is on, but no batch in an epoch had a lane_gt target."""
+
+
+class LaneGtCoverage:
+    """Count training batches without a ``lane_gt`` target, one epoch at a time.
+
+    A batch is missing lane_gt when none of its supervised rows has a valid
+    lane_gt slot; ``_lane_gt_loss`` returns ``zero`` for those rows. A mixed
+    epoch only logs the share. An epoch where every batch is missing it, with
+    the lane_gt head on, raises ``LaneGtMissingError``: that run would train
+    nothing on the head it reports.
+    """
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+        self.reset()
+
+    def reset(self) -> None:
+        self.batches = 0
+        self.missing = 0
+
+    def note(self, has_target: bool) -> None:
+        self.batches += 1
+        if not has_target:
+            self.missing += 1
+
+    def close_epoch(self, epoch: int, planned: int = 0) -> dict[str, Any]:
+        """Log and reset. ``planned`` is the epoch's train window count.
+
+        Zero counted batches with ``planned`` windows and the head on means
+        no step carried a supervised lane_gt row at all: that raises too. A
+        paused or empty epoch passes ``planned=0`` and only resets.
+        """
+        batches, missing = int(self.batches), int(self.missing)
+        share = (missing / batches) if batches else None
+        summary = {"epoch": int(epoch), "batches": batches, "missing": missing, "share": share}
+        self.reset()
+        if batches:
+            print(
+                f"[GVD] lane_gt missing epoch={int(epoch)} batches={missing}/{batches} "
+                f"share={share:.1%}" + ("" if self.enabled else " (lane_gt head off)"),
+                flush=True,
+            )
+        if self.enabled and not batches and int(planned) > 0:
+            print(f"[GVD] lane_gt missing epoch={int(epoch)} batches=0/0 planned={int(planned)}", flush=True)
+            raise LaneGtMissingError(
+                f"epoch {int(epoch)}: {int(planned)} training windows ran zero lane_gt steps, but the "
+                "lane_gt head is on. No window had a supervised row; check the recording's lane_gt fields."
+            )
+        if self.enabled and batches and missing == batches:
+            raise LaneGtMissingError(
+                f"epoch {int(epoch)}: all {batches} training batches have no lane_gt target, but the "
+                "lane_gt head is on. The recording has no lane_gt / lane_offset_m fields; re-collect, "
+                "or pass --heads without lane_gt."
+            )
+        return summary
 
 
 def head_names(heads: tuple[str, ...] | list[str] | None) -> frozenset[str]:
@@ -1040,6 +1097,7 @@ def _scene_loss_body(
     heads: tuple[str, ...] | list[str] | None = None,
     *,
     lane_loss: str = "huber",
+    conf_weight: float = 1.0,
 ) -> dict[str, Any]:
     if torch is None:
         raise ImportError("PyTorch is not installed")
@@ -1116,11 +1174,16 @@ def _scene_loss_body(
             gt_state=target["sign_state"].to(device=device, dtype=torch.long),
             lamps=lamps,
         )
-    lane_gt_term = (
-        _lane_gt_loss(functional, pred, target, device, dtype, zero, lane_loss=lane_loss)
-        if "lane_gt" in wanted
-        else zero.clone()
-    )
+    if "lane_gt" in wanted:
+        parts = _lane_gt_parts(functional, pred, target, device, dtype, lane_loss=lane_loss)
+    else:
+        parts = None
+    if parts is not None:
+        conf_bce, lane_reg = parts
+        lane_gt_term = float(conf_weight) * conf_bce + lane_reg
+    else:
+        conf_bce, lane_reg = zero.clone(), zero.clone()
+        lane_gt_term = zero.clone()
     points = lane_points + curb_points + obj_points + sign_points
     valid = lane_valid + curb_valid + obj_valid + sign_valid
     # A lane-only run must not backprop the other heads. Those zeros are
@@ -1140,6 +1203,9 @@ def _scene_loss_body(
         "valid": valid,
         "lane_gt": lane_gt_term,
         "total": total,
+        # Unweighted parts of lane_gt, for the val line. Not in LOSS_TERMS.
+        "lane_reg": lane_reg,
+        "conf_bce": conf_bce,
     }
     if set(LOSS_TERMS) - set(out):
         raise RuntimeError("scene loss is missing a term")
@@ -1196,6 +1262,7 @@ def scene_loss(
     heads: tuple[str, ...] | list[str] | None = None,
     *,
     lane_loss: str = "huber",
+    conf_weight: float = 1.0,
 ) -> dict[str, Any]:
     """Smooth-L1 on points, cross-entropy on class and lamps, match on objects and signs.
 
@@ -1203,7 +1270,7 @@ def scene_loss(
     ``huber`` (smooth-L1, the default), ``l1``, or ``mse``. The forward pass
     and the export still carry every head. Wheel and pedals are not terms.
     """
-    return _scene_loss_body(pred, target, heads, lane_loss=lane_loss)
+    return _scene_loss_body(pred, target, heads, lane_loss=lane_loss, conf_weight=conf_weight)
 
 
 if torch is not None:

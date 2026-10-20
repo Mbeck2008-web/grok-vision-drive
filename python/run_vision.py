@@ -65,7 +65,9 @@ from python.debug.gt_geom import heading_from_dir
 from python.debug.gt_logger import GroundTruthLogger, gt_log_enabled
 from python.viz.review_log import ReviewCapture
 from python.viz.nerd import image_point_from_window_mouse
-from python.train.scene_net import live_strip_fields
+# scene_live, not scene_net / scene_lane_runtime: those import torch at load (~0.8 s), and
+# the supervisor only needs torch-free helpers here. The scene runtime is imported lazily below.
+from python.train.scene_live import SCENE_SHAPE_HOLD, live_strip_fields
 from python.viz.stage import drawn_lane_records
 from python.sensors.cameras import CAM_IDS, CamHealth, bundle_tick_frames
 from python.runtime.debug_opts import apply_to_command, apply_to_perception
@@ -560,14 +562,20 @@ def main() -> None:
         print(f"[GVD] ground truth -> {gt_log.path}", flush=True)
     try:
         scene_lane = None
+        scene_guard = None
         if args.lane_source == "scene":
-            from python.train.scene_lane_runtime import SceneLaneRuntime
+            from python.train.scene_lane_runtime import SceneLaneGuard, SceneLaneRuntime
 
-            scene_lane = SceneLaneRuntime(args.scene_onnx or None)
-            print(
-                f"[GVD] lane source=scene onnx={scene_lane.path} ready={scene_lane.ready} ({scene_lane.reason})",
-                flush=True,
-            )
+            # SceneInputShapeError at load refuses Engage; mid-drive it is a HOLD.
+            scene_guard = SceneLaneGuard()
+            scene_lane = scene_guard.load(SceneLaneRuntime, args.scene_onnx or None)
+            if scene_guard.refused is not None:
+                print(f"[GVD] REFUSE ENGAGE: lane source=scene {scene_guard.refused}", flush=True)
+            else:
+                print(
+                    f"[GVD] lane source=scene onnx={scene_lane.path} ready={scene_lane.ready} ({scene_lane.reason})",
+                    flush=True,
+                )
         elif args.lane_source == "gt":
             print("[GVD] lane source=gt road-network center at 8 m", flush=True)
         while True:
@@ -712,6 +720,14 @@ def main() -> None:
             if not ident.matched:
                 engaged = False
                 # Refuse actuation. Do not guess Drive vs Tech or honor a Python-only override.
+            scene_refuse = scene_guard is not None and scene_guard.refused is not None and engaged
+            if scene_refuse:
+                # The scene graph is the wrong size. Never engage on it, and do not fall back
+                # to the pixel lane finder.
+                engaged = False
+                if read_engage_flag(default=False) or bot_on:
+                    bot_engage.clear()
+                    write_engage_flag(False, disengage_reason="scene_input_shape")
             if engaged and not prev_engaged:
                 # The tick above may have held a pre-engage one-side center.
                 # Refit with the seed gate so that value cannot steer.
@@ -746,6 +762,7 @@ def main() -> None:
             )
 
             scene_stop = False
+            scene_hold = False
             gt_stop = False
             gt_preview = None
             scene_lane_x = None
@@ -784,7 +801,11 @@ def main() -> None:
 
                 frames = getattr(bundle, "frames", None)
                 strip = compose_strip(frames if isinstance(frames, dict) else None)
-                lane_hat, conf = scene_lane.observe(strip, tick_dt)
+                was_hold = scene_guard.hold is not None
+                lane_hat, conf = scene_guard.observe(scene_lane, strip, tick_dt, engaged=engaged)
+                scene_hold = scene_guard.hold is not None
+                if scene_hold and not was_hold and engaged:
+                    print(f"[GVD] HOLD: scene_input_shape {scene_guard.hold}", flush=True)
                 scene_lane_x = lane_hat
                 scene_conf = conf
                 if scene_lane_decision(lane_hat, conf) != "lane":
@@ -827,7 +848,9 @@ def main() -> None:
                 engage_age_s=engage_age_s,
             )
             cmd = tick.applied
-            if scene_stop:
+            if scene_hold:
+                cmd = stop_command(seq=cmd_seq, reason=SCENE_SHAPE_HOLD)
+            elif scene_stop:
                 cmd = stop_command(seq=cmd_seq, reason="scene_lane_low")
             elif gt_stop:
                 cmd = stop_command(seq=cmd_seq, reason="gt_lane_missing")
@@ -836,7 +859,11 @@ def main() -> None:
                 disengage_reason = "bus_mismatch"
                 cmd = stop_command(seq=cmd_seq, reason="bus_mismatch")
             elif not engaged:
-                disengage_reason = "not_engaged"
+                disengage_reason = "scene_input_shape" if scene_refuse else "not_engaged"
+            elif scene_hold:
+                # Engaged HOLD: brake on, wheel and throttle at 0. A shadow/e2e
+                # low-confidence veto must not turn this into a release.
+                disengage_reason = "scene_input_shape"
             elif tick.should_disengage:
                 veto_name = str(tick.veto_reason or "veto")
                 if ui.debug.ignore_veto_disengage and veto_name != "heartbeat_stale":
@@ -1157,6 +1184,8 @@ def main() -> None:
             st["cmd_seq"] = int(applied.seq)
             st["cmd_reason"] = applied.reason
             st["cmd_applied"] = bool(applied.applied)
+            if scene_guard is not None:
+                st["scene_lane"] = scene_guard.status()
             st["lane_hold"] = {
                 "lateral_m": None if lane_x is None else float(lane_x),
                 "lookahead_y_m": None if lane_y is None else float(lane_y),
@@ -1232,9 +1261,11 @@ def main() -> None:
             # Soft Esc: gvd_state.json at most once per Lua pollEvery (0.10).
             # Max rewrite rate. A loop already slower than 100 ms writes at
             # the loop rate, so heartbeat age tracks the loop.
-            # Engage writes every tick. The rising edge flushes this tick.
+            # Engage writes every tick. The rising edge flushes this tick, and so
+            # does the falling edge: the disengage reason is on that tick only.
             rising_engage = bool(engaged) and not prev_engaged
-            state_due = soft_esc_state_write_due(bool(engaged), rising=rising_engage)
+            falling_engage = prev_engaged and not bool(engaged)
+            state_due = soft_esc_state_write_due(bool(engaged), rising=rising_engage, falling=falling_engage)
             prev_engaged = bool(engaged)
             state_skips = soft_esc_state_write_skips()
             rel_skips = int(getattr(actuator, "release_cmd_skips", 0) or 0)

@@ -554,18 +554,36 @@ def cameras_for_row(row: Mapping[str, Any] | None) -> list[str]:
     return list(STRIP_ORDER)
 
 
-def row_has_decodable_frame(root: Path | str, row: Mapping[str, Any]) -> bool:
-    """True when at least one camera the strip uses has a decodable file."""
+def row_has_decodable_frame(
+    root: Path | str,
+    row: Mapping[str, Any],
+    cams: tuple[str, ...] | list[str] | None = None,
+) -> bool:
+    """True when the strip has a decodable file the net can train on.
+
+    ``cams`` is the trained camera list. With it, at least one of those
+    cameras must decode, and ``main`` must decode whenever it is listed: a
+    tick without the front picture would be stitched with a black main
+    sector and still carry a real lane label. ``None`` keeps the old rule
+    (any camera the strip uses).
+    """
     try:
         index = int(row.get("i"))
     except (TypeError, ValueError):
         return False
     raw = Path(root) / "raw"
     stem = f"{index:06d}"
+
+    def _decodes(cam: str) -> bool:
+        return image_file_decodable(raw / cam / f"{stem}.png") or image_file_decodable(raw / cam / f"{stem}.npy")
+
+    if cams:
+        wanted = [str(cam) for cam in cams]
+        if "main" in wanted and not _decodes("main"):
+            return False
+        return any(_decodes(cam) for cam in wanted)
     for cam in cameras_for_row(row):
-        if image_file_decodable(raw / cam / f"{stem}.png"):
-            return True
-        if image_file_decodable(raw / cam / f"{stem}.npy"):
+        if _decodes(cam):
             return True
     return False
 
@@ -668,11 +686,33 @@ def load_raw_cameras(root: Path | str, index: int) -> dict[str, np.ndarray]:
     return frames
 
 
-def load_training_bgr(root: Path | str, index: int) -> np.ndarray:
+class LossyFramesError(RuntimeError):
+    """The folder has no ``raw/`` tree, only lossy ``strips/*.jpg``."""
+
+
+def lossy_only(root: Path | str) -> bool:
+    """True when ``root`` has ``strips/`` but no ``raw/``: frames would be JPEG."""
+    root = Path(root)
+    return not (root / "raw").is_dir() and (root / "strips").is_dir()
+
+
+def refuse_lossy(root: Path | str, *, what: str = "training") -> None:
+    """Raise ``LossyFramesError`` when ``root`` only has lossy JPEG strips."""
+    if lossy_only(root):
+        raise LossyFramesError(
+            f"{root} has no raw/ folder, only lossy strips/*.jpg. {what} reads lossless "
+            f"raw/<cam>/NNNNNN.png (or .npy) frames and refuses JPEG. "
+            f"Only eval_scene_lanes --allow-lossy-eval reads the JPEG strips, for an eval."
+        )
+
+
+def load_training_bgr(root: Path | str, index: int, *, allow_lossy: bool = False) -> np.ndarray:
     """Stitch and resize at load time. The files on disk stay as saved.
 
     A recording that has ``raw/`` never falls through to ``strips/*.jpg``.
-    Legacy strips are only for a folder that has no raw tree.
+    A folder with only legacy ``strips/*.jpg`` raises ``LossyFramesError``
+    unless ``allow_lossy`` (eval_scene_lanes ``--allow-lossy-eval``, or the
+    dataset checker) asks for the JPEG.
     """
     root = Path(root)
     raw = root / "raw"
@@ -686,6 +726,8 @@ def load_training_bgr(root: Path | str, index: int) -> np.ndarray:
     strips = root / "strips"
     if not strips.is_dir():
         raise FileNotFoundError(f"no raw frames and no strips under {root}")
+    if not allow_lossy:
+        refuse_lossy(root)
     import cv2
 
     from python.data.strip_writer import CANVAS_H, CANVAS_W

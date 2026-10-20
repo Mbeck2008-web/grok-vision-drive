@@ -13,7 +13,15 @@ The AI does not stay on those 300 m for a whole segment, so
 ``coverage_from`` scores the same probe from wherever the car is now (the
 collector's ``--recheck-cov-min``). The deck also counts picks and recorded
 time per spawn road (``road_repeats``): a resumed run reshuffles with the
-same seed and starts over on the same roads.
+same seed, so ``skip_recorded`` marks the roads already in collect.json as
+used and the resumed deck goes on to new ones.
+
+``road_type`` refines city/highway/ramp with ``bridge`` (within 25 m of where
+the road passes 4 m or more over another drivable navgraph road) and
+``tunnel`` (4 m or more under one: an underpass or a tunnel under another
+road; a tunnel under bare terrain is not in the navgraph and stays its pool
+kind). ``type_summary`` counts picks by that type, deck spawns and recheck
+respawns apart.
 """
 
 from __future__ import annotations
@@ -60,6 +68,16 @@ RECHECK_NEAR_M = 12.0
 RECHECK_CELL_M = 25.0
 # A spawn road picked this many times is flagged in road_repeats.
 REPEAT_FLAG_PICKS = 3
+# Bridge / tunnel: a drivable road crossing this far above or below, within
+# this distance of the pose.
+BRIDGE = "bridge"
+TUNNEL = "tunnel"
+ROAD_TYPES = (CITY, HIGHWAY, RAMP, BRIDGE, TUNNEL)
+DECK_DZ_M = 4.0
+DECK_NEAR_M = 25.0
+DECK_CELL_M = 50.0
+# Pick sources counted apart in type_summary.
+SOURCES = ("spawn", "recheck")
 
 
 @dataclass(frozen=True)
@@ -439,11 +457,17 @@ class SpawnDeck:
         self.road_time_s: dict[str, float] = {}
         self.road_kind: dict[str, str] = {}
         self._seg_grid: dict[tuple[int, int], list[tuple[str, int]]] | None = None
+        self._kind_of: dict[str, str] = {}
+        self._decks: dict[str, list[tuple[float, float, bool]]] | None = None
+        self.type_counts: dict[str, dict[str, int]] = {src: {t: 0 for t in ROAD_TYPES} for src in SOURCES}
+        self.last_type: str | None = None
+        self.resume_skipped = 0
         self._by_id: dict[str, dict[str, Any]] = {}
         self._ends: dict[tuple[int, int], list[tuple[str, bool]]] = defaultdict(list)
-        for pool in self.pools.values():
+        for pool_kind, pool in self.pools.items():
             for road in pool:
                 self._by_id[str(road["id"])] = road
+                self._kind_of[str(road["id"])] = pool_kind
                 for point, at_start in ((road["pts"][0], True), (road["pts"][-1], False)):
                     key = (int(point[0] // PAINT_JOIN_M), int(point[1] // PAINT_JOIN_M))
                     self._ends[key].append((str(road["id"]), at_start))
@@ -484,11 +508,21 @@ class SpawnDeck:
         pos, rot = pose
         return SpawnPick(kind, road["id"], pos, rot, SPEED[kind], cov)
 
-    def take(self) -> SpawnPick | None:
-        """Next spawn, or None. ``last_ms`` is this call's wall time."""
+    def take(self, source: str = "spawn") -> SpawnPick | None:
+        """Next spawn, or None. ``last_ms`` is this call's wall time.
+
+        ``source`` ("spawn" or "recheck") is the type_summary column the pick
+        counts in; ``last_type`` is its road type at the spawn pose.
+        """
         start = time.perf_counter()
         try:
-            return self._take()
+            pick = self._take()
+            self.last_type = None
+            if pick is not None:
+                self.last_type = self.road_type(pick.road_id, pick.pos)
+                column = self.type_counts.setdefault(str(source), {t: 0 for t in ROAD_TYPES})
+                column[self.last_type] = column.get(self.last_type, 0) + 1
+            return pick
         finally:
             self.last_ms = (time.perf_counter() - start) * 1000.0
             self.select_ms.append(self.last_ms)
@@ -587,6 +621,103 @@ class SpawnDeck:
                 f"time={item['time_s']:.0f}s share={item['time_share']:.0%}"
             )
         return out
+
+    def skip_recorded(self, prior: Any) -> int:
+        """Mark the roads an earlier ``road_repeats`` picked as used. Returns how many were new to ``used``.
+
+        A resumed run builds a fresh deck with the same seed, which would
+        start over on the same roads.
+        """
+        rows = (prior or {}).get("by_road") if isinstance(prior, dict) else None
+        if not isinstance(rows, dict):
+            return 0
+        n = 0
+        for rid, item in rows.items():
+            rid = str(rid)
+            if isinstance(item, dict) and int(_num(item.get("picks"))) > 0 and rid in self._by_id and rid not in self.used:
+                self.used.add(rid)
+                n += 1
+        self.resume_skipped += n
+        return n
+
+    # --------------------------------------------------------- road types
+    def _deck_crossings(self) -> dict[str, list[tuple[float, float, bool]]]:
+        """Per road, where it passes over (True) or under (False) another drivable road by DECK_DZ_M+."""
+        if self._decks is not None:
+            return self._decks
+        segs: list[tuple[str, Any, Any]] = []
+        grid: dict[tuple[int, int], list[int]] = defaultdict(list)
+        for rid, road in self._by_id.items():
+            pts = road["pts"]
+            for a, b in zip(pts, pts[1:]):
+                j = len(segs)
+                segs.append((rid, a, b))
+                for cx in range(int(min(a[0], b[0]) // DECK_CELL_M), int(max(a[0], b[0]) // DECK_CELL_M) + 1):
+                    for cy in range(int(min(a[1], b[1]) // DECK_CELL_M), int(max(a[1], b[1]) // DECK_CELL_M) + 1):
+                        grid[(cx, cy)].append(j)
+        found: dict[str, list[tuple[float, float, bool]]] = defaultdict(list)
+        seen: set[tuple[int, int]] = set()
+        for js in grid.values():
+            for x in range(len(js)):
+                for y in range(x + 1, len(js)):
+                    pair = (js[x], js[y])
+                    if pair in seen:
+                        continue
+                    seen.add(pair)
+                    r1, a1, b1 = segs[pair[0]]
+                    r2, a2, b2 = segs[pair[1]]
+                    if r1 == r2:
+                        continue
+                    dx1, dy1 = b1[0] - a1[0], b1[1] - a1[1]
+                    dx2, dy2 = b2[0] - a2[0], b2[1] - a2[1]
+                    den = dx1 * dy2 - dy1 * dx2
+                    if abs(den) < 1e-9:
+                        continue
+                    t = ((a2[0] - a1[0]) * dy2 - (a2[1] - a1[1]) * dx2) / den
+                    u = ((a2[0] - a1[0]) * dy1 - (a2[1] - a1[1]) * dx1) / den
+                    if not (0.0 <= t <= 1.0 and 0.0 <= u <= 1.0):
+                        continue
+                    z1 = a1[2] + (b1[2] - a1[2]) * t
+                    z2 = a2[2] + (b2[2] - a2[2]) * u
+                    if abs(z1 - z2) < DECK_DZ_M:
+                        continue
+                    px, py = a1[0] + dx1 * t, a1[1] + dy1 * t
+                    found[r1].append((px, py, z1 > z2))
+                    found[r2].append((px, py, z2 > z1))
+        self._decks = dict(found)
+        return self._decks
+
+    def road_type(self, road_id: str | None, pos: Any = None) -> str:
+        """city/highway/ramp, or bridge/tunnel within DECK_NEAR_M of a crossing on this road."""
+        rid = str(road_id) if road_id is not None else ""
+        kind = self._kind_of.get(rid, CITY)
+        if pos is None or not rid:
+            return kind
+        best: tuple[float, bool] | None = None
+        for px, py, over in self._deck_crossings().get(rid, ()):
+            d = math.hypot(px - float(pos[0]), py - float(pos[1]))
+            if d <= DECK_NEAR_M and (best is None or d < best[0]):
+                best = (d, over)
+        if best is None:
+            return kind
+        return BRIDGE if best[1] else TUNNEL
+
+    def type_summary(self) -> dict[str, Any]:
+        """Picks by road type, deck spawns and recheck respawns apart, for collect.json."""
+        out: dict[str, Any] = {src: dict(col) for src, col in self.type_counts.items()}
+        out["total"] = {t: sum(col.get(t, 0) for col in self.type_counts.values()) for t in ROAD_TYPES}
+        out["resume_skipped_roads"] = self.resume_skipped
+        return out
+
+    def type_lines(self) -> list[str]:
+        """End-of-run spawn mix by road type: one line per source."""
+        lines = []
+        for src in list(SOURCES) + [s for s in self.type_counts if s not in SOURCES]:
+            col = self.type_counts.get(src, {})
+            n = sum(col.values())
+            mix = " ".join(f"{t}={col.get(t, 0)}" for t in ROAD_TYPES)
+            lines.append(f"spawn types {src} n={n} {mix}")
+        return lines
 
     # ------------------------------------------------------------ recheck
     def nearest_road(

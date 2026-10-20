@@ -85,7 +85,11 @@ labels on the stretches it cut.
 The deck also counts how often each spawn road is picked and its share of
 recorded seconds: ``road_repeats`` in both collect.json files (carried over
 when a run resumes from collect.json) and ``collect spawn repeats`` lines at
-the end of the run. A road picked 3 or more times is flagged.
+the end of the run. A road picked 3 or more times is flagged. On resume the
+roads collect.json already lists are skipped, so the reseeded deck does not
+start over on them. ``collect spawn types`` lines at the end of the run (and
+``spawn_types`` in collect.json) count picks as city/highway/ramp/bridge/
+tunnel, deck spawns and recheck respawns apart.
 
 ``--recheck-cov-min N`` (default 0, off; west coast with ``--min-paint-cov``
 above 0) reruns the spawn paint-coverage probe every N minutes of a spawn,
@@ -397,8 +401,11 @@ def recheck_record(
     recheck_min: float,
     action: str,
     done_s: float,
+    road_type: str | None = None,
+    new_spawn_road: str | None = None,
+    new_road_type: str | None = None,
 ) -> dict[str, Any]:
-    """One ``cuts.jsonl`` line for a coverage recheck."""
+    """One ``cuts.jsonl`` line for a coverage recheck. ``new_*`` name the respawn, if any."""
     return {
         "kind": "recheck",
         "reason": "recheck_cov",
@@ -415,6 +422,9 @@ def recheck_record(
         "recheck_min": float(recheck_min),
         "action": action,
         "done_s": round(float(done_s), 3),
+        "road_type": road_type,
+        "new_spawn_road": new_spawn_road,
+        "new_road_type": new_road_type,
     }
 
 
@@ -1327,6 +1337,7 @@ def main(argv: list[str] | None = None) -> int:
             if spawn_deck is not None:
                 payload["spawn_mix"] = spawn_deck.summary()
                 payload["road_repeats"] = spawn_deck.road_repeats()
+                payload["spawn_types"] = spawn_deck.type_summary()
             if yield_guard.enabled:
                 payload["live_yield"] = yield_guard.summary()
             if target_s == float("inf"):
@@ -1443,7 +1454,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"collect stop {message}", flush=True)
             return 2
 
-        def _apply_spawn(force: bool) -> None:
+        def _apply_spawn(force: bool, source: str = "spawn") -> None:
             """Teleport west coast to the next unused stratified spawn."""
             nonlocal spawn_deck, spawn_kind, spawn_mark, spawn_pos, last_ai, segment_open, speed, spawn_cov
             nonlocal spawn_road, recheck_mark
@@ -1489,14 +1500,19 @@ def main(argv: list[str] | None = None) -> int:
                     prior = None
                 seeded = spawn_deck.seed_repeats(prior)
                 if seeded:
-                    print(f"collect spawn repeats resumed roads={seeded} from {progress_path.name}", flush=True)
+                    skipped_n = spawn_deck.skip_recorded(prior)
+                    print(
+                        f"collect spawn repeats resumed roads={seeded} from {progress_path.name}; "
+                        f"skipping {skipped_n} already-picked roads",
+                        flush=True,
+                    )
                 if recheck_s > 0.0:
                     print(
                         f"collect recheck_cov every {recheck_min:g} min "
                         f"{'on' if spawn_deck.filtering() else 'off (needs --min-paint-cov > 0 and painted lanes)'}",
                         flush=True,
                     )
-            picked = spawn_deck.take()
+            picked = spawn_deck.take(source)
             if picked is None:
                 print(f"collect spawn {segment_id} none left select_ms={spawn_deck.last_ms:.0f}", flush=True)
                 return
@@ -1540,6 +1556,7 @@ def main(argv: list[str] | None = None) -> int:
             if spawn_deck is not None:
                 extra["spawn_mix"] = spawn_deck.summary()
                 extra["road_repeats"] = spawn_deck.road_repeats()
+                extra["spawn_types"] = spawn_deck.type_summary()
             if yield_guard.enabled:
                 extra["live_yield"] = yield_guard.summary()
             return extra or None
@@ -1549,7 +1566,7 @@ def main(argv: list[str] | None = None) -> int:
 
         def _say_repeats() -> None:
             if spawn_deck is not None:
-                for line in spawn_deck.repeat_lines():
+                for line in spawn_deck.repeat_lines() + spawn_deck.type_lines():
                     print(f"collect {line}", flush=True)
 
         def _impact_end(how: str, t_end: float) -> None:
@@ -2155,18 +2172,23 @@ def main(argv: list[str] | None = None) -> int:
                 here = None if pos is None else [round(float(v), 2) for v in list(pos)[:3]]
                 cov_now, road_now = spawn_deck.coverage_from(pos, direction)
                 kind_was, road_was = spawn_kind or None, spawn_road
+                type_now = None if road_now is None else spawn_deck.road_type(road_now, pos)
                 plan = recheck_plan(cov_now, spawn_deck.min_paint_cov)
+                new_road = new_type = None
                 if plan == "respawn":
                     mark = spawn_mark
-                    _apply_spawn(True)
+                    _apply_spawn(True, "recheck")
                     if spawn_mark == mark:
                         plan = "keep"
+                    else:
+                        new_road, new_type = spawn_road, spawn_deck.last_type
                 where = "na" if here is None else f"({here[0]:.1f},{here[1]:.1f},{here[2]:.1f})"
+                respawned = "" if new_road is None else f" new_road={new_road} new_type={new_type}"
                 print(
                     f"collect recheck_cov {segment_id} {kind_was or '-'} "
                     f"paint_cov={'na' if cov_now is None else format(cov_now, '.2f')} "
-                    f"min={spawn_deck.min_paint_cov:.2f} road={road_now or 'na'} "
-                    f"spawn_road={road_was or 'na'} pos={where} -> {plan}",
+                    f"min={spawn_deck.min_paint_cov:.2f} road={road_now or 'na'} road_type={type_now or 'na'} "
+                    f"spawn_road={road_was or 'na'} pos={where}{respawned} -> {plan}",
                     flush=True,
                 )
                 append_jsonl(
@@ -2185,6 +2207,9 @@ def main(argv: list[str] | None = None) -> int:
                         recheck_min=recheck_min,
                         action=plan,
                         done_s=done_s,
+                        road_type=type_now,
+                        new_spawn_road=new_road,
+                        new_road_type=new_type,
                     ),
                 )
             time.sleep(tick_sleep_s(time.monotonic() - tick_mark, 0.1))

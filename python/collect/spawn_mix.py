@@ -16,6 +16,7 @@ import gzip
 import json
 import math
 import random
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -357,6 +358,13 @@ class SpawnDeck:
         self.max_tries = max(1, int(max_tries))
         self.log = log
         self.skipped = 0
+        # Picks of a kind other than the one the mix asked for, and picks of
+        # the best-covered skipped road because nothing passed. One pick can
+        # be both.
+        self.cross_kind = 0
+        self.best_seen = 0
+        self.last_ms = 0.0
+        self.select_ms: list[float] = []
         self._by_id: dict[str, dict[str, Any]] = {}
         self._ends: dict[tuple[int, int], list[tuple[str, bool]]] = defaultdict(list)
         for pool in self.pools.values():
@@ -387,12 +395,51 @@ class SpawnDeck:
         if self.log is not None:
             self.log(text)
 
-    def _pick(self, kind: str, road: dict[str, Any], pose: Any, cov: float | None) -> SpawnPick:
+    def _pick(self, kind: str, road: dict[str, Any], pose: Any, cov: float | None, wanted: str) -> SpawnPick:
         self.counts[kind] += 1
+        if kind != wanted:
+            self.cross_kind += 1
         pos, rot = pose
         return SpawnPick(kind, road["id"], pos, rot, SPEED[kind], cov)
 
     def take(self) -> SpawnPick | None:
+        """Next spawn, or None. ``last_ms`` is this call's wall time."""
+        start = time.perf_counter()
+        try:
+            return self._take()
+        finally:
+            self.last_ms = (time.perf_counter() - start) * 1000.0
+            self.select_ms.append(self.last_ms)
+
+    def summary(self) -> dict[str, Any]:
+        """Spawn mix so far, for the periodic log line and collect.json."""
+        picks = sum(self.counts.values())
+        times = self.select_ms
+        return {
+            "picks": picks,
+            "counts": dict(self.counts),
+            "share": {kind: (self.counts[kind] / picks if picks else 0.0) for kind in KINDS},
+            "target": dict(TARGET),
+            "skipped": self.skipped,
+            "cross_kind_fallback": self.cross_kind,
+            "best_seen_fallback": self.best_seen,
+            "min_paint_cov": self.min_paint_cov if self.filtering() else 0.0,
+            "select_ms_mean": (sum(times) / len(times)) if times else None,
+            "select_ms_max": max(times) if times else None,
+        }
+
+    def summary_line(self) -> str:
+        s = self.summary()
+        mix = " ".join(f"{kind}={s['counts'][kind]}" for kind in KINDS)
+        mean = "na" if s["select_ms_mean"] is None else format(s["select_ms_mean"], ".0f")
+        peak = "na" if s["select_ms_max"] is None else format(s["select_ms_max"], ".0f")
+        return (
+            f"spawn mix picks={s['picks']} {mix} skipped={s['skipped']} "
+            f"cross_kind={s['cross_kind_fallback']} best_seen={s['best_seen_fallback']} "
+            f"select_ms mean={mean} max={peak}"
+        )
+
+    def _take(self) -> SpawnPick | None:
         first = self._next_kind()
         if first is None:
             return None
@@ -407,14 +454,14 @@ class SpawnDeck:
                 if pose is None:
                     continue
                 if not filtering:
-                    return self._pick(kind, road, pose, None)
+                    return self._pick(kind, road, pose, None, first)
                 cov = self.coverage(road)
                 if cov >= self.min_paint_cov:
                     self._say(
                         f"spawn pick {kind} road={road['id']} paint_cov={cov:.2f} "
                         f"(>={self.min_paint_cov:.2f}, skipped {len(tried)})"
                     )
-                    return self._pick(kind, road, pose, cov)
+                    return self._pick(kind, road, pose, cov, first)
                 self.skipped += 1
                 tried.append((cov, kind, road, pose))
                 self._say(
@@ -430,7 +477,8 @@ class SpawnDeck:
             f"spawn fallback {kind} road={road['id']} paint_cov={cov:.2f} "
             f"(no road >= {self.min_paint_cov:.2f} in {len(tried)} tries)"
         )
-        return self._pick(kind, road, pose, cov)
+        self.best_seen += 1
+        return self._pick(kind, road, pose, cov, first)
 
     def _kinds_by_deficit(self) -> list[str]:
         total = sum(self.counts.values()) + 1

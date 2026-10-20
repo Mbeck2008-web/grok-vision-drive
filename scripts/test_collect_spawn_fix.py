@@ -247,6 +247,76 @@ def check_weave_guard_helpers() -> None:
     print("weave guard helpers ok")
 
 
+def check_paint_share_slot_order() -> None:
+    """paint_share must read the center slot of lane_gt_valid, as lane_targets writes it."""
+    import math
+
+    import scripts.collect_scene_lanes as collect
+    from python.debug.lane_targets import (
+        LOOKAHEADS_M,
+        SLOT_CENTER,
+        SLOT_LEFT,
+        SLOT_RIGHT,
+        lookahead_slot,
+        tech_from_painted,
+    )
+
+    # Distinct left/right/center at every lookahead, so each value has one home.
+    lanes = [(-1.0 - 0.3 * k, 2.0 + 0.7 * k) for k in range(len(LOOKAHEADS_M))]
+    tech = tech_from_painted(lanes)
+    values, valid = list(tech["lane_gt"]), list(tech["lane_gt_valid"])
+    triples = 3 * len(LOOKAHEADS_M)
+    for k, (left, right) in enumerate(lanes):
+        for part, want in ((SLOT_CENTER, 0.5 * (left + right)), (SLOT_LEFT, left), (SLOT_RIGHT, right)):
+            # Where the real writer put it, found by value, not by the helper.
+            home = [i for i in range(triples) if abs(values[i] - want) < 1e-5]
+            assert home == [lookahead_slot(k, part)], (k, part, home)
+            assert valid[home[0]] == 1.0  # the mask uses the same slot as the value
+    assert collect.paint_share(tech) == 1.0
+    # Lookahead 2: NaN center, left and right still valid. Not a usable lane.
+    centre = [i for i in range(triples) if abs(values[i] - 0.5 * sum(lanes[2])) < 1e-5][0]
+    values[centre] = float("nan")
+    valid[centre] = 0.0
+    side = [i for i in range(triples) if abs(values[i] - lanes[2][0]) < 1e-5 or abs(values[i] - lanes[2][1]) < 1e-5]
+    assert len(side) == 2 and all(valid[i] == 1.0 for i in side)
+    broken = dict(tech, lane_gt=values, lane_gt_valid=valid)
+    assert math.isnan(broken["lane_gt"][lookahead_slot(2, SLOT_CENTER)])
+    assert collect.paint_share(broken) == 0.75, collect.paint_share(broken)
+    # The writer's own "no paint at 20 m" vector agrees.
+    missing = tech_from_painted([lanes[0], lanes[1], None, lanes[3]])
+    assert collect.paint_share(missing) == 0.75
+    print("paint_share reads the center slot (NaN center with valid sides counts invalid)")
+
+
+def check_spawn_mix_summary() -> None:
+    import scripts.collect_scene_lanes as collect
+
+    pools = _pools(6, 0)
+    pools[HIGHWAY] = _pools(0, 2, HIGHWAY)[HIGHWAY]
+    deck = SpawnDeck(pools, painted=PAINT_SOUTH, min_paint_cov=0.5, max_tries=2)
+    first = deck.take()  # city wanted, unpainted: 2 skips, then a painted highway
+    assert first.kind == HIGHWAY and deck.cross_kind == 1 and deck.best_seen == 0
+    second = deck.take()  # city still behind its share: 2 more skips, then highway again
+    assert second.kind == HIGHWAY and deck.cross_kind == 2
+    third = deck.take()  # no highway left: the best-covered skipped city road
+    assert third.kind == CITY and third.paint_cov == 0.0 and deck.best_seen == 1 and deck.cross_kind == 2
+    s = deck.summary()
+    assert s["picks"] == 3 and s["counts"] == {CITY: 1, HIGHWAY: 2, RAMP: 0}, s
+    assert s["cross_kind_fallback"] == deck.cross_kind and s["skipped"] == deck.skipped
+    assert len(deck.select_ms) == 3 and deck.last_ms >= 0.0 and s["select_ms_max"] >= s["select_ms_mean"]
+    line = deck.summary_line()
+    assert line.startswith("spawn mix picks=3 city=1 highway=2 ramp=0 ") and "best_seen=1" in line, line
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "collect.json"
+        collect.save_progress(path, 12.5, 60.0, {"spawn_mix": s})
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        assert saved["spawn_mix"]["counts"] == s["counts"]
+        assert collect.load_progress(path) == 12.5
+        collect.save_progress(path, 3.0, 60.0)
+        assert set(json.loads(path.read_text(encoding="utf-8"))) == {"done_s", "target_s"}
+    print(f"spawn mix summary ok: {line}")
+
+
 # --------------------------------------------------------------------- (e)
 class _Sensors(dict):
     pass
@@ -481,6 +551,8 @@ def main() -> None:
     check_settle_window()
     check_tip_rules()
     check_weave_guard_helpers()
+    check_paint_share_slot_order()
+    check_spawn_mix_summary()
     check_damage_and_up_are_read()
     check_collector_impact_rows()
     check_weave_guard_runs()

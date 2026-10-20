@@ -71,6 +71,10 @@ class ImpactWatch:
     ``should_respawn`` is True once the car has sat under STALL_SPEED_MPS for
     IMPACT_STALL_S after an impact. ``note_row`` keeps the last rows so the
     collector can name the PRE_IMPACT_S run-up.
+
+    Not every crash is seen: only a longitudinal speed drop counts, so a
+    sideswipe that keeps the speed is missed, and a tick gap outside
+    [IMPACT_DT_MIN_S, IMPACT_DT_MAX_S] (over 0.5 s) is never scored.
     """
 
     def __init__(self) -> None:

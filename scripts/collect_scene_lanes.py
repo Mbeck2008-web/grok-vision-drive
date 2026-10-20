@@ -56,6 +56,13 @@ Row fields in ``state.jsonl`` written by this collector, besides the frame data:
 "impact_end", "t", "how"}`` line when it ends (``respawn``, ``drove_on``, or
 the abort reason). ``t`` matches the row ``t`` exactly; ``i`` is the row index
 the writer was expected to assign. A trainer masks rows in [pre_t0, end t].
+``impacts.jsonl`` is not a complete crash list: it only sees a longitudinal
+speed drop, so a sideswipe or a scrape that keeps the speed is missed, and a
+gap between ticks over 0.5 s (a stalled loop, a teleport) is never scored.
+
+The spawn deck logs ``select_ms`` on every spawn and a ``collect spawn mix``
+line with the per-kind counts, cross-kind and best-seen fallbacks each
+minute. The same summary is ``spawn_mix`` in both collect.json files.
 """
 from __future__ import annotations
 
@@ -199,12 +206,12 @@ def load_progress(path: Path) -> float:
         return 0.0
 
 
-def save_progress(path: Path, done_s: float, target_s: float) -> None:
+def save_progress(path: Path, done_s: float, target_s: float, extra: dict[str, Any] | None = None) -> None:
+    """``done_s``/``target_s`` (what a resume reads), plus ``extra`` keys for the record."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({"done_s": float(done_s), "target_s": float(target_s)}, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    payload: dict[str, Any] = {"done_s": float(done_s), "target_s": float(target_s)}
+    payload.update(dict(extra or {}))
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -315,10 +322,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def paint_share(tech: dict[str, Any] | None) -> float:
     """Share of the painted lookaheads (5/10/20/30 m) with a valid lane center."""
+    from python.debug.lane_targets import LOOKAHEADS_M, SLOT_CENTER, lookahead_slot
+
     valid = list((tech or {}).get("lane_gt_valid") or [])
-    slots = [valid[3 * k] for k in range(4) if 3 * k < len(valid)]
+    idx = [lookahead_slot(k, SLOT_CENTER) for k in range(len(LOOKAHEADS_M))]
+    slots = [valid[i] for i in idx if i < len(valid)]
     try:
-        return sum(1.0 for value in slots if float(value) > 0.5) / 4.0
+        return sum(1.0 for value in slots if float(value) > 0.5) / float(len(idx))
     except (TypeError, ValueError):
         return 0.0
 
@@ -1182,6 +1192,8 @@ def main(argv: list[str] | None = None) -> int:
             payload["error"] = last_error
             payload["cam_drop_reason"] = dict(cam_reasons)
             payload["until_disk"] = bool(until_disk)
+            if spawn_deck is not None:
+                payload["spawn_mix"] = spawn_deck.summary()
             if target_s == float("inf"):
                 payload["target_s"] = None
             write_collect_status(status_root, payload)
@@ -1234,7 +1246,7 @@ def main(argv: list[str] | None = None) -> int:
                         share = recover_lost_s / planned
                         message = f"recover lost {share:.0%} of the plan"
                     last_error = f"{segment_id} {message}"
-                    save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
+                    _save_progress(done_s, done_s if target_s == float("inf") else target_s)
                     _publish(None, speed, waypoint)
                     _write_collect_crash(status_root, last_error, {})
                     print(f"collect stop {last_error}", flush=True)
@@ -1242,7 +1254,7 @@ def main(argv: list[str] | None = None) -> int:
                 # No map to rotate to, or the clock never moved, so another
                 # cut would spin on the same stuck pose.
                 if action == "stop" or (last_end_done >= 0.0 and done_s <= last_end_done + 1e-3):
-                    save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
+                    _save_progress(done_s, done_s if target_s == float("inf") else target_s)
                     _publish(None, speed, waypoint)
                     print(f"collect stop {segment_id} ended", flush=True)
                     return 0
@@ -1289,7 +1301,7 @@ def main(argv: list[str] | None = None) -> int:
                     settle.start(done_s)
                     return None
             last_error = message
-            save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
+            _save_progress(done_s, done_s if target_s == float("inf") else target_s)
             _publish(None, speed, waypoint)
             _write_collect_crash(status_root, message, {})
             print(f"collect stop {message}", flush=True)
@@ -1320,6 +1332,7 @@ def main(argv: list[str] | None = None) -> int:
                         dump = bundled
                 if dump is None:
                     return
+                load_t0 = time.perf_counter()
                 cov_min = max(0.0, float(args.min_paint_cov))
                 spawn_deck = SpawnDeck.load(
                     dump,
@@ -1329,11 +1342,13 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 print(
                     f"collect spawn deck paint filter "
-                    f"{'min_cov=' + format(cov_min, '.2f') if spawn_deck.filtering() else 'off'}",
+                    f"{'min_cov=' + format(cov_min, '.2f') if spawn_deck.filtering() else 'off'} "
+                    f"load_ms={(time.perf_counter() - load_t0) * 1000.0:.0f}",
                     flush=True,
                 )
             picked = spawn_deck.take()
             if picked is None:
+                print(f"collect spawn {segment_id} none left select_ms={spawn_deck.last_ms:.0f}", flush=True)
                 return
             from python.collect.level_session import place_vehicle
             from python.collect.spawn_mix import traffic_count, traffic_lua
@@ -1362,9 +1377,16 @@ def main(argv: list[str] | None = None) -> int:
                 f"collect spawn {segment_id} {picked.kind} "
                 f"({picked.pos[0]:.1f},{picked.pos[1]:.1f},{picked.pos[2]:.1f}) "
                 f"speed={picked.speed[0]:.0f}-{picked.speed[1]:.0f} traffic={count} "
-                f"paint_cov={'na' if picked.paint_cov is None else format(picked.paint_cov, '.2f')}",
+                f"paint_cov={'na' if picked.paint_cov is None else format(picked.paint_cov, '.2f')} "
+                f"select_ms={spawn_deck.last_ms:.0f}",
                 flush=True,
             )
+
+        def _spawn_extra() -> dict[str, Any] | None:
+            return None if spawn_deck is None else {"spawn_mix": spawn_deck.summary()}
+
+        def _save_progress(done: float, target: float) -> None:
+            save_progress(progress_path, done, target, _spawn_extra())
 
         def _impact_end(how: str, t_end: float) -> None:
             """Close an open impact in the sidecar so the trainer knows where the mask ends."""
@@ -1384,7 +1406,7 @@ def main(argv: list[str] | None = None) -> int:
 
         while done_s < target_s:
             if stop_file(out).is_file():
-                save_progress(progress_path, done_s, target_s if target_s < float("inf") else done_s)
+                _save_progress(done_s, target_s if target_s < float("inf") else done_s)
                 _publish(None, speed_at(done_s, speeds), waypoint_at(done_s, names))
                 print("collect stop requested", flush=True)
                 return 0
@@ -1408,7 +1430,7 @@ def main(argv: list[str] | None = None) -> int:
                 painted = painted_for(map_name)
                 if err or vehicle is None or not roads or not cams:
                     last_error = err or "no vehicle after load"
-                    save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
+                    _save_progress(done_s, done_s if target_s == float("inf") else target_s)
                     _publish(None, speed, waypoint)
                     _write_collect_crash(status_root, last_error, {})
                     print(f"collect stop {last_error}", flush=True)
@@ -1458,7 +1480,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"collect session {last_error}", flush=True)
                 session_faults += 1
                 if session_faults >= 3:
-                    save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
+                    _save_progress(done_s, done_s if target_s == float("inf") else target_s)
                     return 2
                 time.sleep(0.5)
                 continue
@@ -1472,7 +1494,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             if outage:
                 last_error = outage
-                save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
+                _save_progress(done_s, done_s if target_s == float("inf") else target_s)
                 _publish(None, speed, waypoint)
                 _write_collect_crash(status_root, outage, cam_reasons)
                 print(f"collect stop {outage}", flush=True)
@@ -1521,7 +1543,7 @@ def main(argv: list[str] | None = None) -> int:
                         waiting = ", ".join(cid for cid in cams if cid not in frames) or "none"
                         message = f"cameras did not all render within {ALL_CAM_STALE_S:.0f}s ({waiting})"
                         last_error = message
-                        save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
+                        _save_progress(done_s, done_s if target_s == float("inf") else target_s)
                         _publish(None, speed, waypoint)
                         _write_collect_crash(status_root, message, cam_reasons)
                         print(f"collect stop {message}", flush=True)
@@ -1905,7 +1927,7 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     free = check_data_path(out)
                 except DataDriveError as exc:
-                    save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
+                    _save_progress(done_s, done_s if target_s == float("inf") else target_s)
                     _publish(None, speed, waypoint)
                     print(
                         format_disk_line(done_s, nbytes, ceiling_gb_per_hour=ceiling_gb, hz=_hz()),
@@ -1927,13 +1949,17 @@ def main(argv: list[str] | None = None) -> int:
                         flush=True,
                     )
                     print(format_queue_line(writer.stats()), flush=True)
-                    save_progress(progress_path, done_s, done_s if target_s == float("inf") else target_s)
+                    if spawn_deck is not None:
+                        print(f"collect {spawn_deck.summary_line()}", flush=True)
+                    _save_progress(done_s, done_s if target_s == float("inf") else target_s)
                     _publish(free, speed, waypoint)
                     last_print = now_m
-        save_progress(progress_path, done_s, target_s if target_s < float("inf") else done_s)
+        _save_progress(done_s, target_s if target_s < float("inf") else done_s)
         _publish(None, speed_at(done_s, speeds), waypoint_at(done_s, names))
         print(format_disk_line(done_s, _used_bytes(), ceiling_gb_per_hour=ceiling_gb, hz=_hz()), flush=True)
         print(format_queue_line(writer.stats()), flush=True)
+        if spawn_deck is not None:
+            print(f"collect {spawn_deck.summary_line()}", flush=True)
         return 0
     finally:
         if writer is not None:

@@ -414,9 +414,10 @@ def check_event_mask() -> None:
 
     rows = [{"i": k, "t": 100.0 + 0.1 * k, "segment": "wc#0"} for k in range(200)]
     rows += [{"i": 200 + k, "t": 200.0 + 0.1 * k, "segment": "wc#1"} for k in range(50)]
-    rows[30]["settle"] = True
-    rows[31]["stall"] = True
-    rows[31]["stall_s"] = 0.4
+    rows[20]["settle"] = True
+    rows[21]["stall"] = True
+    rows[21]["stall_s"] = 0.4
+    rows[80]["recover"] = True  # the respawn after the first impact (t=108.0)
     impacts = [
         # i_row="previous": i points at row 2, far before the window. Only t counts.
         {"kind": "impact", "t": 106.0, "i": 2, "i_row": "previous", "pre_t0": 105.0, "segment": "wc#0"},
@@ -427,10 +428,13 @@ def check_event_mask() -> None:
     mask, counts = event_mask(rows, impacts)
     masked_t = [r["t"] for r, m in zip(rows, mask) if m]
     assert not mask[2], "row i=2 is outside the window even though the impact names i=2"
-    assert all(mask[k] for k in range(50, 76)) and not mask[49] and not mask[76]
-    assert all(mask[k] for k in range(170, 200)) and not any(mask[200:])
-    assert mask[30] and mask[31] and not mask[29]
+    # 3 s before t=106 (row 30), through impact_end 107.5, up to the respawn row 80 (not masked).
+    assert all(mask[k] for k in range(30, 80)) and not mask[29] and not mask[80]
+    # Open impact: 3 s before t=118 (row 150) to the end of wc#0, not into wc#1.
+    assert all(mask[k] for k in range(150, 200)) and not mask[149] and not any(mask[200:])
+    assert mask[20] and mask[21] and not mask[19]
     assert counts["settle"] == 1 and counts["stall"] == 1 and counts["impact_spans"] == 2 and counts["impact_open"] == 1
+    assert counts["impact_extended"] == (20 + 4) + 20, counts
     assert counts["masked"] == len(masked_t) == counts["impact"] + 2
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -443,6 +447,74 @@ def check_event_mask() -> None:
         kept_none, none_counts = mask_event_rows(Path(tmp) / "missing", rows)
         assert none_counts["impact"] == 0 and len(kept_none) == len(rows) - 2
     print(f"event mask: impact window by t (i_row=previous / i=null ignored), open impact to segment end, settle+stall; masked {counts['masked']}/{len(rows)} OK")
+
+
+def check_event_mask_post_impact() -> None:
+    """--mask-events: 3 s run-up, the whole abort phase into an impact, and everything after
+    the impact until the next respawn, also after a drove_on end. Rows are masked, not deleted."""
+    import json as _json
+
+    from python.train.event_mask import PRE_IMPACT_S, event_mask, mask_event_rows
+
+    assert PRE_IMPACT_S == 3.0
+
+    def seg(name: str, t0: float, n: int, base: int) -> list[dict]:
+        return [{"i": base + k, "t": round(t0 + 0.1 * k, 3), "segment": name, "excursion": {"phase": "cruise"}}
+                for k in range(n)]
+
+    # wc#5: weave 10-20 s, abort 20-26 s, impact at 26.0 with pre_t0 25.0 (an old 1 s run-up), the
+    # car drives on (impact_end drove_on at 34.0), keeps driving, respawn timer at 60.0 (settle run).
+    rows = seg("wc#5", 0.0, 900, 0)
+    for k in range(100, 200):
+        rows[k]["excursion"] = {"phase": "weave"}
+    for k in range(200, 261):
+        rows[k]["excursion"] = {"phase": "abort"}
+    for k in range(600, 630):
+        rows[k]["settle"] = True
+    # wc#6: an impact inside an abort, but the abort rows were not written (writer queue full):
+    # the collector's abort_t0 still opens the window there. No respawn: the segment end closes it.
+    rows6 = seg("wc#6", 200.0, 100, 900)
+    rows += rows6
+    impacts = [
+        {"kind": "impact", "t": 26.0, "i": 260, "i_row": "impact", "pre_t0": 25.0, "segment": "wc#5",
+         "excursion": "abort", "abort_t0": None},
+        {"kind": "impact_end", "t": 34.0, "how": "drove_on", "segment": "wc#5"},
+        {"kind": "impact", "t": 208.0, "i": 980, "i_row": "impact", "pre_t0": 207.0, "segment": "wc#6",
+         "excursion": "abort", "abort_t0": 203.5},
+        {"kind": "impact_end", "t": 209.0, "how": "respawn", "segment": "wc#6"},
+    ]
+    before = [dict(r) for r in rows]
+    mask, counts = event_mask(rows, impacts)
+    assert rows == before, "event_mask must not change rows"
+    by_t = {r["t"]: m for r, m in zip(rows, mask)}
+    # The whole abort phase (from 20.0) ends in the impact: masked, and the weave before it is not.
+    assert by_t[20.0] and not by_t[19.9]
+    # After drove_on (34.0) the rows stay masked up to the respawn's settle run at 60.0.
+    assert by_t[34.1] and by_t[59.9]
+    assert by_t[60.0], "settle rows are masked by their own flag"
+    assert not by_t[63.0], "after the respawn's settle run the car is clean again"
+    assert not any(m for r, m in zip(rows, mask) if r["segment"] == "wc#5" and r["t"] >= 63.0)
+    # wc#6: abort_t0 203.5 opens it (3 s before 208.0 would be 205.0); no respawn -> segment end.
+    assert by_t[203.5] and not by_t[203.4] and by_t[209.9]
+    assert counts["impact_spans"] == 2 and counts["impact_open"] == 0
+    # 20.0..59.9 = 400 rows; 203.5..209.9 = 65 rows; old spans were 25.0..34.0 (91) and 207.0..209.0 (21).
+    assert counts["impact"] == 400 + 65, counts
+    assert counts["impact_extended"] == (400 - 91) + (65 - 21), counts
+    assert counts["settle"] == 30
+    # A row without a phase tag (pre-PR recordings) still gets the 3 s run-up.
+    plain = [{"i": k, "t": 0.1 * k, "segment": "s"} for k in range(100)]
+    pmask, _pc = event_mask(plain, [{"kind": "impact", "t": 5.0, "pre_t0": None, "segment": "s"}])
+    assert pmask[20] and not pmask[19] and all(pmask[20:])
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        path = root / "impacts.jsonl"
+        path.write_text("".join(_json.dumps(item) + "\n" for item in impacts), encoding="utf-8")
+        size = path.stat().st_size
+        kept, file_counts = mask_event_rows(root, rows)
+        assert file_counts == counts and len(kept) == len(rows) - counts["masked"]
+        assert path.stat().st_size == size and sorted(p.name for p in root.iterdir()) == ["impacts.jsonl"]
+    print(f"event mask post-impact: 3 s run-up, abort run / abort_t0, drove_on -> next respawn, segment end; "
+          f"masked {counts['masked']}/{len(rows)} ({counts['impact_extended']} from the extension) OK")
 
 
 def check_lossy_refused() -> None:
@@ -533,6 +605,7 @@ def main() -> None:
     check_near_black()
     check_backbone_pool_and_lr()
     check_event_mask()
+    check_event_mask_post_impact()
     check_lossy_refused()
     if args.real:
         check_real(Path(args.real))

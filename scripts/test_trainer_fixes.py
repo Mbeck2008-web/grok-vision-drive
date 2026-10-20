@@ -89,8 +89,10 @@ def check_black_rows() -> None:
         old, old_missing, _ = select_training_rows(root, rows, dropped=all_dropped)
         dropped: dict = {}
         new, new_missing, _ = select_training_rows(root, rows, cams=("main",), dropped=dropped)
-        # All cameras (no --cams): a tick without main is dropped too (no_main).
-        assert [r["i"] for r in old] == [0] and old_missing == 2 and all_dropped == {"no_main": 2}, all_dropped
+        # All cameras (no --cams): a tick without main is dropped too (no_main), and tick 0
+        # lacks the recording's rear camera, so it would train a black sector (missing_cam).
+        assert [r["i"] for r in old] == [] and old_missing == 3, all_dropped
+        assert all_dropped == {"no_main": 2, "missing_cam": 1, "missing_cam:rear": 1}, all_dropped
         assert [r["i"] for r in new] == [0], new
         assert dropped == {"no_trained_cam": 2} and new_missing == 2, (dropped, new_missing)
     black = np.zeros((192, 256, 3), np.uint8)

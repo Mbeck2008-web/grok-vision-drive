@@ -532,6 +532,8 @@ LANE_SLOT_NAMES = (
 )
 # Frames whose main area was all zero and were skipped in this process.
 BLANK_MAIN_SKIPS = 0
+# Rows skipped in _frame_row because another trained camera's sector is near-black.
+BLANK_CAM_SKIPS = 0
 
 
 # Near-black main sector: mean below 2% of full scale, or more than 98% of
@@ -577,6 +579,21 @@ def main_area_blank(frame: Any, cams: tuple[str, ...] | None, scale: float = 1.0
         if sec.cam_id == "main":
             return near_black(arr[:, sec.x0 : sec.x1])
     return False
+
+
+def blank_sectors(frame: Any, cams: tuple[str, ...] | None, scale: float = 1.0) -> tuple[str, ...]:
+    """Trained cameras whose sector of ``frame`` is near-black (missing or dead picture)."""
+    from python.data.strip_writer import STRIP_ORDER
+    from python.train.cam_strip import scaled_layout
+
+    names = tuple(cams) if cams else tuple(STRIP_ORDER)
+    if frame is None:
+        return ()
+    sectors, _height, width = scaled_layout(names, scale if float(scale) < 0.999 else 1.0)
+    arr = np.asarray(frame)
+    if arr.ndim < 2 or int(arr.shape[1]) != int(width):
+        return ()
+    return tuple(sec.cam_id for sec in sectors if near_black(arr[:, sec.x0 : sec.x1]))
 
 
 def count_near_black_main(
@@ -868,6 +885,12 @@ def _frame_row(
         # No front picture: a black main sector with a real label. Skip it.
         global BLANK_MAIN_SKIPS
         BLANK_MAIN_SKIPS += 1
+        return None
+    if blank_sectors(frame, cams, scale):
+        # Another trained camera is black (missing file in the cache, or a dead
+        # picture). The net cannot tell, and the label is full: skip it.
+        global BLANK_CAM_SKIPS
+        BLANK_CAM_SKIPS += 1
         return None
     if augment:
         frame = photometric_jitter(frame, rng)
@@ -1647,7 +1670,7 @@ def train_directory(
     lane_kind = str(lane_loss or "huber")
     input_scale = float(scale) if float(scale) > 0.0 else 1.0
     from python.data.raw_frames import load_scene_rows, training_frame_bytes
-    from python.train.scene_loader import default_num_workers, recompute_dt, select_training_rows
+    from python.train.scene_loader import default_num_workers, recompute_dt, recorded_cams, select_training_rows
 
     print("[GVD] scene index: reading state.jsonl", flush=True)
     from python.data.raw_frames import refuse_lossy
@@ -1661,6 +1684,17 @@ def train_directory(
         print(f"[GVD] scene index: {n_frames} frames {n_bytes} bytes", flush=True)
 
     file_bytes, _n_image_files = training_frame_bytes(root, progress=_index_progress)
+    if train_cams is None and (root / "raw").is_dir():
+        from python.data.strip_writer import STRIP_ORDER
+
+        have = recorded_cams(root)
+        absent = [cam for cam in STRIP_ORDER if cam not in have]
+        if absent:
+            # The all-camera net would see these sectors black on every row.
+            raise SystemExit(
+                f"[GVD] scene train: no --cams and this recording has no {','.join(absent)} camera; "
+                f"the all-camera net would train on black sectors. Pass --cams {','.join(have) or 'main'}"
+            )
     dropped: dict[str, int] = {}
     rows, missing_rows, excluded_rows = select_training_rows(root, state_rows, cams=train_cams, dropped=dropped)
     print(
@@ -1674,6 +1708,16 @@ def train_directory(
         f"{int(dropped.get('no_main', 0))} rows without a main frame (all cameras)",
         flush=True,
     )
+    if int(dropped.get("missing_cam", 0)):
+        per_cam = ",".join(
+            f"{key.split(':', 1)[1]}={value}" for key, value in sorted(dropped.items()) if key.startswith("missing_cam:")
+        )
+        print(
+            f"[GVD] scene index: dropped {int(dropped['missing_cam'])} rows missing another trained camera "
+            f"({per_cam}); a black sector never trains. Cameras below 10 Hz are absent on most ticks: "
+            "pass --cams with the 10 Hz cameras (e.g. main,narrow,wide) to keep those rows",
+            flush=True,
+        )
     if mask_events:
         from python.train.event_mask import describe, mask_event_rows
 
@@ -2314,6 +2358,7 @@ def train_directory(
                     "pred_std": json_num(scored.get("pred_std")),
                     "collapse": bool(scored.get("collapse")),
                     "blank_main_skipped": int(BLANK_MAIN_SKIPS),
+                    "blank_cam_skipped": int(BLANK_CAM_SKIPS),
                     "lr": lr_now,
                 }
                 cell_lines: list[str] = []
@@ -2344,7 +2389,7 @@ def train_directory(
                     f"pred_mean={scored.get('pred_mean')} pred_std={scored.get('pred_std')} "
                     f"r_long={scored.get('r_long')} rms_long={scored.get('rms_long')} "
                     f"bias_long={scored.get('bias_long')} eval_chunk={int(eval_chunk)} "
-                    f"blank_main_skipped={int(BLANK_MAIN_SKIPS)} "
+                    f"blank_main_skipped={int(BLANK_MAIN_SKIPS)} blank_cam_skipped={int(BLANK_CAM_SKIPS)} "
                     f"lr={format_lrs(lr_now)}",
                     flush=True,
                 )

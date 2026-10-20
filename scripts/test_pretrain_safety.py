@@ -19,6 +19,10 @@
 (e) a frame cache records its strips path, row count and state.jsonl hash;
     another recording, a grown state.jsonl or a manifest without a source is
     refused; the cache drive is checked with its own free-space floor.
+(g) a row missing any other trained camera (wide, narrow, side, rear) is
+    dropped, and a trained sector that loads near-black is skipped in
+    ``_frame_row``; with no --cams a recording that lacks a camera is refused.
+    The net has no per-camera validity input, so a black sector never trains.
 """
 from __future__ import annotations
 
@@ -67,7 +71,7 @@ def check_no_main_dropped() -> None:
 
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
-        main = ("main", "narrow", "wide")
+        main = ("main", "narrow", "wide", "pillarL", "pillarR")
         side = ("pillarL", "pillarR")
         rows = _recording(tmp, [main, side, main, side, main])
         dropped: dict = {}
@@ -76,7 +80,7 @@ def check_no_main_dropped() -> None:
         assert missing == 2 and dropped.get("no_main") == 2, (missing, dropped)
         # A camera list without main keeps the side-only rows.
         kept_side, _m, _e = select_training_rows(tmp, rows, cams=("pillarL",), dropped={})
-        assert [r["i"] for r in kept_side] == [1, 3], [r["i"] for r in kept_side]
+        assert [r["i"] for r in kept_side] == [0, 1, 2, 3, 4], [r["i"] for r in kept_side]
     print("(f) no-main rows dropped with all cameras: kept [0, 2, 4], dropped no_main=2 OK")
 
 
@@ -86,7 +90,7 @@ def check_dt_after_removals() -> None:
     from python.train.scene_loader import recompute_dt, select_training_rows
     from python.train.scene_net import MEMORY_S
 
-    main_cams = ("main",)
+    main_cams = ("main", "pillarL")
     side = ("pillarL",)
     # 10 Hz: rows 0-9 drive, row 5 has no main picture, rows 10-209 (20 s)
     # are a settle run the event mask removes, rows 210-219 drive on.
@@ -296,7 +300,75 @@ def check_cache_manifest() -> None:
           "source-less manifest and a full cache drive refused OK")
 
 
+def check_other_cams() -> None:
+    from python.data.strip_writer import compose_strip
+    from python.train import train_scene as ts
+    from python.train.scene_loader import recorded_cams, select_training_rows
+
+    fast = ("main", "narrow", "wide")
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        # rec5b-like: 10 Hz cameras every tick, pillars every 5th, rear every 10th.
+        layout = []
+        for i in range(20):
+            cams = fast + (("pillarL", "pillarR") if i % 5 == 0 else ()) + (("rear",) if i % 10 == 0 else ())
+            layout.append(cams)
+        rows = _recording(tmp, layout)
+        assert set(recorded_cams(tmp)) == {"main", "narrow", "wide", "pillarL", "pillarR", "rear"}, recorded_cams(tmp)
+        dropped: dict = {}
+        kept, missing, _e = select_training_rows(tmp, rows, cams=None, dropped=dropped)
+        assert [r["i"] for r in kept] == [0, 10] and missing == 18, ([r["i"] for r in kept], dropped)
+        assert dropped["missing_cam"] == 18 and dropped["missing_cam:pillarL"] == 16 and dropped["missing_cam:rear"] == 18
+        three, _m, _e = select_training_rows(tmp, rows, cams=fast, dropped={})
+        assert len(three) == 20, "the 10 Hz cameras keep every tick"
+        side, _m, _e = select_training_rows(tmp, rows, cams=("main", "pillarL"), dropped=(d := {}))
+        assert [r["i"] for r in side] == [0, 5, 10, 15] and d == {"missing_cam": 16, "missing_cam:pillarL": 16}, d
+
+    # A file that exists but is black (dead camera, or a cache with no chunk for it).
+    lit = np.random.RandomState(0).randint(30, 200, size=(48, 64, 3)).astype(np.uint8)
+    full = compose_strip({cam: lit for cam in ("main", "narrow", "wide", "pillarL", "pillarR", "rear", "repeatL", "repeatR")})
+    assert ts.blank_sectors(full, None) == ()
+    dead = compose_strip({cam: lit for cam in ("main", "narrow", "pillarL", "pillarR", "rear", "repeatL", "repeatR")}
+                         | {"wide": np.zeros((48, 64, 3), np.uint8)})
+    assert ts.blank_sectors(dead, None) == ("wide",), ts.blank_sectors(dead, None)
+
+    class Cache:
+        def __init__(self, frames):
+            self.frames = frames
+
+        def has(self, index):
+            return index in self.frames
+
+        def canvas(self, index):
+            return self.frames[index]
+
+    before = ts.BLANK_CAM_SKIPS
+    main_before = ts.BLANK_MAIN_SKIPS
+    assert ts._frame_row(Path("."), {"i": 1}, cams=None, cache=Cache({1: dead})) is None
+    assert ts._frame_row(Path("."), {"i": 2}, cams=None, cache=Cache({2: full})) is not None
+    assert ts.BLANK_CAM_SKIPS == before + 1 and ts.BLANK_MAIN_SKIPS == main_before
+    refused = "(torch not installed: train_directory refusal not run)"
+    try:
+        import torch  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            _recording(tmp, [("main",)] * 4)
+            try:
+                ts.train_directory(tmp, epochs=1, lr=1e-3, capability=None, export_path=None,
+                                   open_panel=False, autostart=True, dry_run=True)
+                raise AssertionError("main-only recording trained with all eight sectors")
+            except SystemExit as exc:
+                assert "--cams main" in str(exc), exc
+                refused = "train_directory refuses no --cams on a main-only recording"
+    print(f"(g) rows missing pillar/rear dropped (18 of 20 with all cameras, 0 with --cams main,narrow,wide); "
+          f"a black wide sector skipped by _frame_row; {refused} OK")
+
+
 def main() -> None:
+    check_other_cams()
     check_cache_manifest()
     check_lr_logging()
     check_eval_resets()

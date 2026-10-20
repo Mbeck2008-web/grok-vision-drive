@@ -58,6 +58,14 @@ def _stamp(value: object) -> float | None:
     return stamp
 
 
+def recorded_cams(root: Path | str) -> tuple[str, ...]:
+    """Strip cameras this recording has a ``raw/<cam>`` folder for, in strip order."""
+    from python.data.strip_writer import STRIP_ORDER
+
+    raw = Path(root) / "raw"
+    return tuple(cam for cam in STRIP_ORDER if (raw / cam).is_dir())
+
+
 def recompute_dt(rows: list) -> list:
     """Copies of ``rows`` with ``dt_s`` rewritten from the kept timestamps.
 
@@ -91,7 +99,10 @@ def select_training_rows(
     also left out. Those rows are counted in ``missing`` and, when
     ``dropped`` is a dict, in ``dropped["no_trained_cam"]``. With no
     ``cams`` (all eight) a row without a decodable ``main`` picture is left
-    out too and counted in ``dropped["no_main"]``.
+    out too and counted in ``dropped["no_main"]``. A row missing any other
+    trained camera (with no ``cams``: every camera the recording has) is left out and counted in
+    ``dropped["missing_cam"]`` and ``dropped["missing_cam:<cam>"]``: the net
+    has no per-camera validity input, so a black sector must not train.
 
     Stationary, tipped, and damage spans are a third count and are not
     trained. ``dt_s`` is rewritten from the timestamps of the kept rows. A
@@ -102,6 +113,7 @@ def select_training_rows(
     from python.collect.liveness import bad_row_reasons
 
     bad = bad_row_reasons([row for row in rows if isinstance(row, dict)])
+    wanted = [str(cam) for cam in (cams or recorded_cams(root))]
     kept: list = []
     missing = 0
     excluded = 0
@@ -131,6 +143,17 @@ def select_training_rows(
             missing += 1
             if dropped is not None:
                 dropped["no_main"] = int(dropped.get("no_main", 0)) + 1
+            continue
+        absent = [cam for cam in wanted if not row_has_decodable_frame(root, row, (cam,))]
+        if absent:
+            # Any other trained camera missing would be a black sector with a
+            # full label. The net has no per-camera validity input: drop the row.
+            missing += 1
+            if dropped is not None:
+                dropped["missing_cam"] = int(dropped.get("missing_cam", 0)) + 1
+                for cam in absent:
+                    key = f"missing_cam:{cam}"
+                    dropped[key] = int(dropped.get(key, 0)) + 1
             continue
         kept.append(row)
     return recompute_dt(kept), missing, excluded

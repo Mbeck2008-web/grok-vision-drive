@@ -1834,7 +1834,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                         share = recover_lost_s / planned
                         message = f"recover lost {share:.0%} of the plan"
                     last_error = f"{segment_id} {message}"
-                    _save_progress(done_s, done_s if target_s == float("inf") else target_s)
+                    _save_progress(done_s, done_s if target_s == float("inf") else target_s, final=True)
                     _publish(None, speed, waypoint)
                     _write_collect_crash(status_root, last_error, {})
                     print(f"collect stop {last_error}", flush=True)
@@ -1854,7 +1854,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     if no_progress_max > 0 and stuck_ends >= no_progress_max:
                         message = f"{stuck_ends} segment ends in a row with no recorded row (last {segment_id} {reason})"
                         last_error = message
-                        _save_progress(done_s, done_s if target_s == float("inf") else target_s)
+                        _save_progress(done_s, done_s if target_s == float("inf") else target_s, final=True)
                         _publish(None, speed, waypoint)
                         _write_collect_crash(status_root, message, {})
                         run.stop("no_progress", message)
@@ -1913,7 +1913,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     since_spawn[0] = 0.0
                     return None
             last_error = message
-            _save_progress(done_s, done_s if target_s == float("inf") else target_s)
+            _save_progress(done_s, done_s if target_s == float("inf") else target_s, final=True)
             _publish(None, speed, waypoint)
             _write_collect_crash(status_root, message, {})
             print(f"collect stop {message}", flush=True)
@@ -2178,7 +2178,18 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 extra["ego_width"] = dict(ego_width)
             return extra or None
 
-        def _save_progress(done: float, target: float) -> None:
+        def _end_open_weave(reason: str) -> None:
+            """The run is ending inside a weave: record its end and log its one end line."""
+            nonlocal weave_open
+            if weave_open is not None:
+                weave_stats.weave_end(weave_open[1], reason)
+                print(f"collect excursion {weave_open[2]} weave end {reason} "
+                      f"side={'L' if weave_open[1] < 0 else 'R'}", flush=True)
+                weave_open = None
+
+        def _save_progress(done: float, target: float, final: bool = False) -> None:
+            if final:  # the run's last save: an open weave ends here, so collect.json and the log agree
+                _end_open_weave("stop")
             save_progress(progress_path, done, target, _spawn_extra())
 
         def _say_repeats() -> None:
@@ -2211,7 +2222,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         while done_s < target_s:
             run.beat(done_s)
             if stop_file(out).is_file():
-                _save_progress(done_s, target_s if target_s < float("inf") else done_s)
+                _save_progress(done_s, target_s if target_s < float("inf") else done_s, final=True)
                 _publish(None, speed_at(done_s, speeds), waypoint_at(done_s, names))
                 _say_repeats()
                 print("collect stop requested", flush=True)
@@ -2243,7 +2254,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 _log_road_heights(map_name, roads, heights_logged)
                 if err or vehicle is None or not roads or not cams:
                     last_error = err or "no vehicle after load"
-                    _save_progress(done_s, done_s if target_s == float("inf") else target_s)
+                    _save_progress(done_s, done_s if target_s == float("inf") else target_s, final=True)
                     _publish(None, speed, waypoint)
                     _write_collect_crash(status_root, last_error, {})
                     print(f"collect stop {last_error}", flush=True)
@@ -2297,7 +2308,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 print(f"collect vehicle width {segment_id} {width_note}", flush=True)
                 if ego_half_w is None:
                     last_error = f"vehicle width unknown: {width_note}"
-                    _save_progress(done_s, done_s if target_s == float("inf") else target_s)
+                    _save_progress(done_s, done_s if target_s == float("inf") else target_s, final=True)
                     _publish(None, speed, waypoint)
                     _write_collect_crash(status_root, last_error, {})
                     print(f"collect stop {last_error}", flush=True)
@@ -2315,7 +2326,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 print(f"collect session {last_error}", flush=True)
                 session_faults += 1
                 if session_faults >= 3:
-                    _save_progress(done_s, done_s if target_s == float("inf") else target_s)
+                    _save_progress(done_s, done_s if target_s == float("inf") else target_s, final=True)
                     run.stop("session_faults", f"3 camera polls in a row failed: {last_error}")
                     return 2
                 time.sleep(0.5)
@@ -2330,7 +2341,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             )
             if outage:
                 last_error = outage
-                _save_progress(done_s, done_s if target_s == float("inf") else target_s)
+                _save_progress(done_s, done_s if target_s == float("inf") else target_s, final=True)
                 _publish(None, speed, waypoint)
                 _write_collect_crash(status_root, outage, cam_reasons)
                 print(f"collect stop {outage}", flush=True)
@@ -2383,7 +2394,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                         waiting = ", ".join(cid for cid in cams if cid not in frames) or "none"
                         message = f"cameras did not all render within {ALL_CAM_STALE_S:.0f}s ({waiting})"
                         last_error = message
-                        _save_progress(done_s, done_s if target_s == float("inf") else target_s)
+                        _save_progress(done_s, done_s if target_s == float("inf") else target_s, final=True)
                         _publish(None, speed, waypoint)
                         _write_collect_crash(status_root, message, cam_reasons)
                         print(f"collect stop {message}", flush=True)
@@ -3084,7 +3095,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 try:
                     free = check_data_path(out)
                 except DataDriveError as exc:
-                    _save_progress(done_s, done_s if target_s == float("inf") else target_s)
+                    _save_progress(done_s, done_s if target_s == float("inf") else target_s, final=True)
                     _publish(None, speed, waypoint)
                     print(
                         format_disk_line(done_s, nbytes, ceiling_gb_per_hour=ceiling_gb, hz=_hz()),
@@ -3112,7 +3123,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     _save_progress(done_s, done_s if target_s == float("inf") else target_s)
                     _publish(free, speed, waypoint)
                     last_print = now_m
-        _save_progress(done_s, target_s if target_s < float("inf") else done_s)
+        _save_progress(done_s, target_s if target_s < float("inf") else done_s, final=True)
         _publish(None, speed_at(done_s, speeds), waypoint_at(done_s, names))
         print(format_disk_line(done_s, _used_bytes(), ceiling_gb_per_hour=ceiling_gb, hz=_hz()), flush=True)
         print(format_queue_line(writer.stats()), flush=True)
@@ -3124,9 +3135,11 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         return 0
     finally:
         if weave_open is not None:
-            # The run stopped inside a weave: its end line, so every started weave has one.
-            print(f"collect excursion {weave_open[2]} weave end stop side={'L' if weave_open[1] < 0 else 'R'}",
-                  flush=True)
+            # Still open: an exception (no final save, as before) or an exit with no save.
+            end_why = "error" if sys.exc_info()[0] is not None else "stop"
+            weave_stats.weave_end(weave_open[1], end_why)
+            print(f"collect excursion {weave_open[2]} weave end {end_why} "
+                  f"side={'L' if weave_open[1] < 0 else 'R'}", flush=True)
         if writer is not None:
             writer.close()
         release_tech_beamngpy(bng)

@@ -20,8 +20,10 @@ startup, recover, segment and respawn (rec5b 46 R / 0 L, rec5c 109 R / 0 L).
   weave in the same attempt.
 * end lines: in a mocked collector run every started weave, on each side,
   logs exactly one ``collect excursion <seg> weave end <reason> side=L|R``
-  (timeout, line_end, or stop when the run ends inside a weave); no
-  ``weave abort line_end`` / ``weave abort timeout``.
+  (timeout, line_end; stop when the run stops inside a weave, error when it
+  exits on an exception inside one); no ``weave abort line_end`` /
+  ``weave abort timeout``; per side started == completed + sum(aborted), and
+  a stop is in collect.json.
 """
 from __future__ import annotations
 
@@ -243,43 +245,103 @@ def check_stats() -> list[str]:
     return ["weave_stats.sides: started / completed / refused / aborted per side"]
 
 
-def _collector_run(stop_at: int, extra: list[str]) -> tuple[str, dict]:
-    """The mocked collector run of test_collect_spawn_fix, painted everywhere, on a 3 km straight."""
+def _collector_run(stop_at: int, extra: list[str], raise_in_weave: int | None = None) -> tuple[str, dict | None, dict]:
+    """The mocked collector run of test_collect_spawn_fix, painted everywhere, on a 3 km straight.
+
+    Gives the log, collect.json ``weave_stats.sides`` and the run's in-memory ``weave_stats.sides``.
+    ``raise_in_weave=n``: the n-th overspeed check of a driving excursion raises, so the run exits on an
+    exception inside a weave (collect.main re-raises it; it is caught here)."""
+    import python.collect.excursion as excursion
     from scripts import test_collect_spawn_fix as fix
 
-    previous = collect.painted_for
+    made: list = []
+
+    class _Stats(excursion.WeaveStats):
+        def __init__(self, *a, **k) -> None:
+            super().__init__(*a, **k)
+            made.append(self)
+
+    calls = {"n": 0}
+    real_overspeed = excursion.overspeed
+
+    def _overspeed(*a, **k):
+        calls["n"] += 1
+        if raise_in_weave is not None and calls["n"] == raise_in_weave:
+            raise RuntimeError("mocked failure inside a weave")
+        return real_overspeed(*a, **k)
+
+    real_main, caught = collect.main, []
+
+    def _main(argv):
+        try:
+            return real_main(argv)
+        except RuntimeError as exc:
+            caught.append(exc)
+            return -1
+
+    previous = (collect.painted_for, excursion.WeaveStats, excursion.overspeed, collect.main)
     collect.painted_for = lambda level: fix._Paint(lambda x, y: True)  # type: ignore[assignment]
+    excursion.WeaveStats, excursion.overspeed, collect.main = _Stats, _overspeed, _main  # type: ignore[misc]
     try:
         code, text, out = fix._run_collector({"speed_at": lambda n: 10.0, "stop_at": stop_at, "x": 1.75}, extra,
                                              roads=[RoadPoly("r", [(0.0, 0.0), (0.0, 3000.0)], 7.0)])
     finally:
-        collect.painted_for = previous  # type: ignore[assignment]
-    assert code == 0, (code, text[-3000:])
-    sides = json.loads((out / "collect.json").read_text(encoding="utf-8"))["weave_stats"]["sides"]
-    return text, sides
+        collect.painted_for, excursion.WeaveStats, excursion.overspeed, collect.main = previous  # type: ignore[misc]
+    if raise_in_weave is None:
+        assert code == 0 and not caught, (code, caught, text[-3000:])
+    else:
+        assert code == -1 and len(caught) == 1, (code, caught, text[-3000:])
+    assert len(made) == 1, made
+    saved = json.loads((out / "collect.json").read_text(encoding="utf-8"))
+    sides = (saved.get("weave_stats") or {}).get("sides")  # none if the run never reached a save with stats
+    return text, sides, made[0].summary()["sides"]
+
+
+def _balanced(sides: dict) -> None:
+    """Every started weave ended once: started == completed + sum(aborted), per side."""
+    for name in ("left", "right"):
+        side = sides[name]
+        assert side["started"] == side["completed"] + sum(side["aborted"].values()), (name, sides)
 
 
 def check_one_end_line_per_weave() -> list[str]:
     out = []
     src = (ROOT / "scripts" / "collect_scene_lanes.py").read_text(encoding="utf-8")
     assert 'f"collect excursion {segment_id} {clock.phase} abort overspeed "' in src  # unchanged
-    # Without --weave-guard the weaves run WEAVE_S (timeout); the run stops inside the third.
-    # With it each line ends (line_end).
-    for stop_at, extra, reasons in ((900, [], {"timeout", "stop"}), (1300, ["--weave-guard"], {"line_end"})):
-        text, sides = _collector_run(stop_at, extra)
+    # Without --weave-guard the weaves run WEAVE_S (timeout) and the stop file lands inside the third:
+    # it ends as `stop` in the log and in collect.json. With --weave-guard each line ends (line_end) and
+    # the run stops in cruise. The last run raises inside its first weave: `error`, log and in-memory
+    # stats (an exception exit has no final collect.json save).
+    runs = (("stop mid-weave", 900, [], None, {"timeout", "stop"}),
+            ("--weave-guard", 1300, ["--weave-guard"], None, {"line_end"}),
+            ("exception mid-weave", 260, [], 20, {"error"}))
+    for label, stop_at, extra, raise_in_weave, reasons in runs:
+        text, sides, live = _collector_run(stop_at, extra, raise_in_weave)
         assert not re.search(r"weave abort (line_end|timeout)", text), text[-3000:]
         ends = re.findall(r"^collect excursion \S+ weave end (\S+) side=([LR])$", text, flags=re.M)
         starts = re.findall(r"^collect weave \S+ v_plan=.* side=([LR])$", text, flags=re.M)
+        assert {why for why, _s in ends} == reasons, ends
+        assert raise_in_weave is not None or sides is not None, label
+        _balanced(live)
+        stats = live if raise_in_weave is not None else sides
+        if raise_in_weave is None:
+            _balanced(sides)
+            assert sides == live, (sides, live)
         got = {}
         for name, letter in (("left", "L"), ("right", "R")):
             n_end = sum(1 for _why, s in ends if s == letter)
-            n_start = sides[name]["started"]
-            assert n_start >= 1, (name, sides)
+            n_start = stats[name]["started"]
             assert n_end == n_start == starts.count(letter), (name, n_end, n_start, starts, ends)
+            for why in ("stop", "error"):  # the log's stop / error ends are in the stats too
+                assert stats[name]["aborted"].get(why, 0) == sum(1 for w, s in ends if s == letter and w == why), \
+                    (name, why, stats, ends)
             got[name] = n_start
-        assert {why for why, _s in ends} == reasons, ends
-        out.append(f"end lines {' '.join(extra) or '(no guard)'}: started L {got['left']} / R {got['right']}, "
-                   f"one 'weave end' each ({', '.join(sorted(reasons))})")
+        if raise_in_weave is None:
+            assert got["left"] >= 1 and got["right"] >= 1, got
+        else:
+            assert got == {"left": 0, "right": 1} and "Traceback" not in text, (got, text[-2000:])
+        out.append(f"end lines, {label}: started L {got['left']} / R {got['right']}, one 'weave end' each "
+                   f"({', '.join(sorted(reasons))}), started == completed + aborted per side")
     return out
 
 

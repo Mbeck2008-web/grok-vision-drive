@@ -39,6 +39,9 @@ class PerceptionOut:
     signs: list[dict[str, Any]] = field(default_factory=list)
     dets: list[dict[str, Any]] = field(default_factory=list)
     infer_ms: float = 0.0
+    # Parts of infer_ms, every tick: the detector, and lanes + CIPV + planner (incl. AEB).
+    detect_ms: float = 0.0
+    plan_ms: float = 0.0
     missing: list[str] = field(default_factory=list)
     detector_name: str = ""
     lane_source: str = "none"
@@ -106,6 +109,7 @@ class ModularPerception:
         del steer_deg
         t0 = time.perf_counter()
         dets = self.detector.detect(main_bgr)
+        t_det = time.perf_counter()
         # Road furniture is detected but never tracked: tracks feed CIPV / AEB / ghosts,
         # and a stop sign is not a lead vehicle. It rides to the UI as `signs` instead.
         moving = [d for d in dets if d.cls not in STATIC_CLASSES]
@@ -205,7 +209,8 @@ class ModularPerception:
         # shrink missing when synthetic/weights work
         if self.detector.name != "empty" and "yolo_weights" in missing and self.detector.name == "synthetic":
             pass  # keep yolo_weights listed — honest
-        infer_ms = (time.perf_counter() - t0) * 1000.0
+        t_end = time.perf_counter()
+        infer_ms = (t_end - t0) * 1000.0
         return PerceptionOut(
             tracks=track_dicts,
             objects_n=len(dets),
@@ -240,6 +245,8 @@ class ModularPerception:
                 "lane_source": plan.lane_source,
             },
             infer_ms=infer_ms,
+            detect_ms=(t_det - t0) * 1000.0,
+            plan_ms=(t_end - t_det) * 1000.0,
             missing=missing,
             detector_name=self.detector.name,
             lane_source=plan.lane_source,

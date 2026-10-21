@@ -8,6 +8,7 @@ since the previous strip.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 
@@ -162,6 +163,7 @@ class SceneLaneRuntime:
         # Whether the caller feeds the 8 per-camera hold ages each tick.
         # run_vision does not (the BeamNG backend has no per-render id yet).
         self.feeds_cam_age = bool(feeds_cam_age)
+        self.last_timers: dict[str, float] = {}
         self.cam_age = False
         self.session: Any = None
         self.ready = False
@@ -277,6 +279,7 @@ class SceneLaneRuntime:
         """
         if not self.ready or self.session is None or strip_bgr is None:
             return None, 0.0
+        t0 = time.perf_counter()
         age_feed = None
         if self.cam_age:
             from python.data.cam_hold import CAM_AGE_N
@@ -307,10 +310,12 @@ class SceneLaneRuntime:
         if age_feed is not None:
             feeds["ages"] = age_feed
         feeds = {name: feeds[_base_name(name)] for name in self._input_names if _base_name(name) in feeds}
+        t_run = time.perf_counter()
         try:
             outputs = self.session.run(None, feeds)
         except Exception:
             return None, 0.0
+        t_post = time.perf_counter()
         by_name = {_base_name(name): value for name, value in zip(self._output_names, outputs)}
         self._last = by_name
         vector = np.asarray(by_name.get("lane_gt"), dtype=np.float32).reshape(-1)
@@ -322,7 +327,15 @@ class SceneLaneRuntime:
             self.tokens = np.asarray(by_name["tokens"], dtype=np.float32)
         if "mask" in by_name:
             self.mask = np.asarray(by_name["mask"], dtype=np.float32)
-        return lane_x_from_vector(vector), confidence_from_vector(vector)
+        out = lane_x_from_vector(vector), confidence_from_vector(vector)
+        t_end = time.perf_counter()
+        # This tick's split: strip prep + feeds, session.run, outputs and GRU state.
+        self.last_timers = {
+            "prep_ms": (t_run - t0) * 1000.0,
+            "scene_ms": (t_post - t_run) * 1000.0,
+            "post_ms": (t_end - t_post) * 1000.0,
+        }
+        return out
 
     def output(self, name: str) -> Any:
         """The last tick's value of one ONNX output.

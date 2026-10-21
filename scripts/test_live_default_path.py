@@ -2,7 +2,7 @@
 """run_vision's default path is unchanged by the cam-age live hold.
 
 A stub supervisor run with no cam-age scene model prints no ``[GVD] cam_age``
-line and never writes ``cam_ages`` / ``adhoc_timeouts`` into gvd_state.json.
+line and never writes ``cam_ages`` / ``stale_ego_n`` into gvd_state.json.
 ``--no-engage`` (or GVD_NO_ENGAGE=1) keeps engaged False even with
 ``--force-engage``; ``--run-seconds`` ends the loop on its own.
 """
@@ -22,7 +22,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from gvd_test_env import isolated_home  # noqa: E402
 
-CAM_AGE_KEYS = ("cam_ages", "adhoc_timeouts")
+CAM_AGE_KEYS = ("cam_ages", "stale_ego_n")
 
 
 def run_supervisor(extra: list[str], seconds: float = 2.0) -> tuple[str, list[dict]]:

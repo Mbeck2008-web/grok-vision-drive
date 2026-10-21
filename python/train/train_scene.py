@@ -336,6 +336,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--ckpt-dir",
+        default="",
+        help=(
+            "Folder for the per-epoch checkpoints (<strips>.run<UTC start>.ckpt_ep<N>_step<S>.npz, "
+            "the weights behind that epoch's val row). Default: the folder holding the strip folder."
+        ),
+    )
+    parser.add_argument(
+        "--ckpt-min-free-gb",
+        type=float,
+        default=None,
+        help="Skip (and log) an epoch checkpoint that would leave less than this many GB free. Default 8.",
+    )
+    parser.add_argument(
         "--freeze-backbone",
         action="store_true",
         help="With --backbone imagenet-*, keep the ImageNet weights fixed and train only the projection and heads.",
@@ -1581,6 +1595,8 @@ def train_directory(
     backbone_lr_mult: float = 1.0,
     mask_events: bool = False,
     mask_files: str = "",
+    ckpt_dir: Path | None = None,
+    ckpt_min_free_gb: float | None = None,
 ) -> dict[str, Any]:
     import torch
 
@@ -1848,6 +1864,11 @@ def train_directory(
 
     debug_dir = status_dir(status_root)
     run_started = time.time()
+    from python.train.epoch_ckpt import DEFAULT_MIN_FREE_GB, GB, default_ckpt_dir, run_id
+
+    epoch_run = run_id(run_started)
+    epoch_ckpt_dir = Path(ckpt_dir) if ckpt_dir else default_ckpt_dir(root)
+    epoch_ckpt_floor = int(float(DEFAULT_MIN_FREE_GB if ckpt_min_free_gb is None else ckpt_min_free_gb) * GB)
     write_heartbeat(
         debug_dir,
         {
@@ -1965,6 +1986,45 @@ def train_directory(
             for key, value in blob.items()
         }
         net.load_state_dict(mapped)
+
+    def _write_epoch_ckpt(scored: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Save the weights behind this val row (create-only). A refusal is logged; training goes on."""
+        from python.train.epoch_ckpt import EpochCkptRefused, epoch_ckpt_path, write_epoch_ckpt
+
+        path = epoch_ckpt_path(epoch_ckpt_dir, root, epoch_run, int(epoch), int(done))
+        meta = {
+            "run": epoch_run,
+            "epoch": int(epoch),
+            "step": int(done),
+            "strips": root.name,
+            "val": {key: json_num(scored.get(key)) for key in ("n", "r", "rms", "rms_mean", "bias", "pred_mean", "pred_std")},
+            "cams": list(train_cams or ()),
+            "heads": list(train_heads or ()),
+            "scale": float(input_scale),
+            "backbone": str(backbone),
+            "freeze_backbone": bool(freeze_backbone),
+            "arch": getattr(net, "pause_arch", None) or checkpoint_arch(train_cams),
+            "eval_chunk": int(eval_chunk),
+            "gt_file": os.environ.get("GVD_GT_FILE") or "gt.jsonl",
+            "mask_files": str(mask_files or ""),
+            "mask_events": bool(mask_events),
+            "holdout_blocks": int(holdout_blocks),
+            "holdout_cells": bool(holdout_cells),
+            "lr": float(holder.get("lr", lr)),
+            "batch": int(batch),
+        }
+        weights = {key: value.detach().cpu().numpy() for key, value in net.state_dict().items()}
+        try:
+            info = write_epoch_ckpt(path, weights, meta, min_free_bytes=epoch_ckpt_floor, strip_root=root)
+        except EpochCkptRefused as exc:
+            print(f"[GVD] epoch checkpoint REFUSED epoch={epoch} step={done}: {exc} -- training continues", flush=True)
+            return None
+        print(
+            f"[GVD] epoch checkpoint epoch={epoch} step={done} path={info['path']} "
+            f"sha256={info['sha256']} bytes={info['bytes']} free_after_gb={info['free_after'] / GB:.2f}",
+            flush=True,
+        )
+        return info
 
     def _pause_now() -> bool:
         nonlocal paused_exit, device, net
@@ -2306,6 +2366,10 @@ def train_directory(
                         f"[GVD] val cells n_cells={boot['n_cells']} r_ci90={boot['r_ci']} "
                         f"rms_ci90={boot['rms_ci']} (bootstrap over cells, 1000 resamples, seed 0)"
                     )
+                # The weights have not moved since the holdout pass: these are the val row's weights.
+                ckpt_info = _write_epoch_ckpt(scored)
+                record["ckpt"] = None if ckpt_info is None else Path(ckpt_info["path"]).name
+                record["ckpt_sha256"] = None if ckpt_info is None else ckpt_info["sha256"]
                 append_metrics(debug_dir, record)
                 print(
                     f"[GVD] val step={done} n={scored['n']} r={scored['r']} "
@@ -2644,6 +2708,8 @@ def main(argv: list[str] | None = None) -> None:
             backbone_lr_mult=float(args.backbone_lr_mult),
             mask_events=bool(args.mask_events),
             mask_files=str(args.mask_files or ""),
+            ckpt_dir=Path(args.ckpt_dir) if args.ckpt_dir else None,
+            ckpt_min_free_gb=args.ckpt_min_free_gb,
         )
     except TrainFitError as exc:
         print(f"[GVD] scene train: {exc}")

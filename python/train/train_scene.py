@@ -350,6 +350,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip (and log) an epoch checkpoint that would leave less than this many GB free. Default 8.",
     )
     parser.add_argument(
+        "--grad-ckpt",
+        action="store_true",
+        help=(
+            "Gradient checkpointing on the per-tick encoder (the shared stem over every sector): its "
+            "activations are recomputed in backward instead of stored. Less memory, more compute; the "
+            "gradients, checkpoints and ONNX are the same. Scratch net only. Off by default."
+        ),
+    )
+    parser.add_argument(
         "--cam-age",
         action="store_true",
         help=(
@@ -1693,6 +1702,7 @@ def train_directory(
     ckpt_dir: Path | None = None,
     ckpt_min_free_gb: float | None = None,
     cam_age: bool = False,
+    grad_ckpt: bool = False,
 ) -> dict[str, Any]:
     import torch
 
@@ -1707,6 +1717,8 @@ def train_directory(
     train_cams = canonical_cams(cams) if cams else None
     train_heads = tuple(heads) if heads else None
     use_cam_age = bool(cam_age)
+    if grad_ckpt and backbone not in ("", "scratch"):
+        raise SystemExit("--grad-ckpt checkpoints the scratch net's per-tick encoder; it is not wired into --backbone imagenet-*")
     if use_cam_age and backbone not in ("", "scratch"):
         raise SystemExit("--cam-age appends the ages to the scratch net's token; it is not wired into --backbone imagenet-*")
     if cache is not None and getattr(cache, "stale", False):
@@ -1893,6 +1905,13 @@ def train_directory(
         if "net" not in holder:
             if backbone in ("", "scratch"):
                 holder["net"] = SceneNet(cams=train_cams, scale=input_scale, cam_age=use_cam_age).to(device)
+                if grad_ckpt:
+                    holder["net"].grad_ckpt = True
+                    print(
+                        "[GVD] grad-ckpt: per-tick encoder (_token) recomputed in backward "
+                        "(torch.utils.checkpoint, use_reentrant=False); eval and export unchanged",
+                        flush=True,
+                    )
             else:
                 from python.train.pretrained_net import build_scene_net
 
@@ -2841,6 +2860,7 @@ def main(argv: list[str] | None = None) -> None:
             ckpt_dir=Path(args.ckpt_dir) if args.ckpt_dir else None,
             ckpt_min_free_gb=args.ckpt_min_free_gb,
             cam_age=bool(args.cam_age),
+            grad_ckpt=bool(args.grad_ckpt),
         )
     except TrainFitError as exc:
         print(f"[GVD] scene train: {exc}")

@@ -1323,6 +1323,10 @@ if torch is not None:
             # --cam-age: the 8 per-camera hold ages (cam_hold.CAM_AGE_ORDER) are
             # appended to the token. The stem is unchanged.
             self.cam_age = bool(cam_age)
+            # --grad-ckpt: recompute the per-tick encoder (``_token``) in backward
+            # instead of keeping its activations. Training only; eval, export and
+            # the weights are unchanged. Off by default.
+            self.grad_ckpt = False
             self.token_dim = sector_dim + (CAM_AGE_N if self.cam_age else 0)
             if self.cam_age:
                 self.pause_arch = checkpoint_arch(self.cams) + f":cam_age={CAM_AGE_N}"
@@ -1373,7 +1377,7 @@ if torch is not None:
             self, image: Any, dt: Any, state: SceneState, ages: Any = None
         ) -> tuple[ScenePrediction, SceneState]:
             state = _state_on(state, image)
-            token = self._token(image)
+            token = self._encode(image)
             if self.cam_age:
                 token = torch.cat([token, _ages_column(ages, image)], dim=-1)
             elif ages is not None:
@@ -1396,6 +1400,19 @@ if torch is not None:
                 residual = self.skip(residual)
             feat = gru_out[:, 0, :] + residual
             return _heads_batch(self, feat), SceneState(h=h_new, tokens=new_tokens, mask=new_mask)
+
+        def _encode(self, image: Any) -> Any:
+            """``_token``, under ``torch.utils.checkpoint`` when ``grad_ckpt`` is on and gradients flow.
+
+            The stem is Conv/GroupNorm/ReLU/Linear (no BatchNorm, no dropout), so
+            the recompute in backward gives the same activations and touches no
+            buffer.
+            """
+            if self.grad_ckpt and self.training and torch.is_grad_enabled():
+                from torch.utils.checkpoint import checkpoint
+
+                return checkpoint(self._token, image, use_reentrant=False)
+            return self._token(image)
 
         def _token(self, image: Any) -> Any:
             parts = []

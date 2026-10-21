@@ -40,10 +40,10 @@ COMPANION_OFFSCREEN_UPDATE_S = 1.0
 # kept handing back the same buffer.
 LANE_CAM_UPDATE_S = 0.1
 # That is the offscreen sensor update rate, not the recorder's capture rate.
-# The recorder stores pillars at 2 Hz, repeaters and rear at 1 Hz
-# (raw_frames.CAMERA_HZ / CameraSchedule). The scheduled ad-hoc hold
-# (``enable_scheduled_adhoc``, python.sensors.live_hold) renders on that
-# recorder schedule.
+# The recorder reads every camera with stream_raw each tick and STORES pillars
+# at 2 Hz, repeaters and rear at 1 Hz (raw_frames.CAMERA_HZ / CameraSchedule).
+# The live hold (``enable_live_hold``, python.sensors.live_hold) applies that
+# same storage filter to this grab's streamed frames.
 LANE_SENSOR_CAM_IDS = frozenset(("wide", "narrow", "pillarL", "pillarR"))
 SIDE_UPDATE_S = ON_DEMAND_UPDATE_S
 REAR_UPDATE_S = ON_DEMAND_UPDATE_S
@@ -155,13 +155,13 @@ class CameraFrameBundle:
     # True when a stream_raw / poll / ad-hoc call exceeded CAM_READ_BUDGET_S
     # or the previous read was still running, so this tick did not wait on it.
     grab_read_blocked: bool = False
-    # Hold-last side cameras (scheduled ad-hoc polls, ``enable_scheduled_adhoc``).
-    # ``cam_ages``: 8 ages in cam_hold.CAM_AGE_ORDER, None when this backend
-    # does not schedule them (window capture, the default BeamNG grab).
-    # ``held_frames``: main plus each held camera, for compose_strip.
+    # Hold-last side cameras (``enable_live_hold``: the recorder's storage
+    # filter on this grab's streamed frames). ``cam_ages``: 8 ages in
+    # cam_hold.CAM_AGE_ORDER, None when the hold is off (window capture, the
+    # default BeamNG grab). ``held_frames``: the fronts plus each held camera,
+    # for compose_strip.
     cam_ages: tuple[float, ...] | None = None
     held_frames: dict[str, np.ndarray] = field(default_factory=dict)
-    adhoc_timeouts: int = 0
 
     def tick_frames(self) -> dict[str, np.ndarray]:
         """Pictures whose timestamps are this grab. An older stamp is left out."""
@@ -1445,9 +1445,9 @@ class BeamNGPyBackend:
         self._io_job: tuple[str, str] | None = None
         self._read_blocked = False
         self._late_unique: list[str] = []
-        # Scheduled ad-hoc hold (live_hold.ScheduledAdHoc). None: the grab
-        # below is the default stream_raw grab, unchanged.
-        self._sched: Any = None
+        # Hold-last side cameras (live_hold.LiveStreamHold). None: the grab
+        # below is the default stream_raw grab and nothing is held.
+        self._live_hold: Any = None
         _camera_backends.add(self)
 
     def open(self) -> None:
@@ -1701,8 +1701,8 @@ class BeamNGPyBackend:
         self._adhoc_ready = False
         self._owed.clear()
         self._late_unique.clear()
-        if self._sched is not None:
-            self._sched.reset()
+        if self._live_hold is not None:
+            self._live_hold.reset()
         self._grab_i = 0
         self._unique_hz_ema = 0.0
         self._unique_n = 0
@@ -1900,10 +1900,6 @@ class BeamNGPyBackend:
         self._late_unique.clear()
 
     def _apply_late(self, cid: str, kind: str, value: Any) -> None:
-        if kind.startswith("sched_"):
-            if self._sched is not None:
-                self._sched.late(cid, kind, value, self._sched_prepare)
-            return
         if kind == "adhoc_send" and isinstance(value, int) and self._adhoc is None:
             self._adhoc = (cid, value)
             self._adhoc_ready = False
@@ -1930,7 +1926,7 @@ class BeamNGPyBackend:
         if late is not None:
             self._apply_late(*late)
 
-    def _io_call(self, cid: str, kind: str, fn: Any, budget: float | None = None) -> Any:
+    def _io_call(self, cid: str, kind: str, fn: Any) -> Any:
         """Run ``fn`` and return its value.
 
         A call that is still going after ``CAM_READ_BUDGET_S`` returns
@@ -1956,7 +1952,7 @@ class BeamNGPyBackend:
         self._io_box = box
         self._io_job = (cid, kind)
         thread.start()
-        thread.join(CAM_READ_BUDGET_S if budget is None else float(budget))
+        thread.join(CAM_READ_BUDGET_S)
         if thread.is_alive():
             self._read_blocked = True
             return _IO_TIMEOUT
@@ -2091,60 +2087,29 @@ class BeamNGPyBackend:
             return None
         return got
 
-    # ---- scheduled ad-hoc hold (opt-in) ----------------------------------
+    # ---- hold-last side cameras (opt-in) ------------------------------------
 
     can_feed_cam_age = True
 
-    def enable_scheduled_adhoc(self, sched: Any = None) -> Any:
-        """Render the companions with ad-hoc polls on the recorder's CameraSchedule.
+    def enable_live_hold(self, hold: Any = None) -> Any:
+        """Hold-last side cameras for a ``gvd_cam_age=1`` scene model.
 
-        Off by default. Turned on for a scene model with ``gvd_cam_age=1``;
-        the grab then reads main as before and the companions only through
-        ``live_hold.ScheduledAdHoc`` (bounded, non-blocking GE calls).
+        Off by default. The grab is unchanged (all 8 cameras streamed every
+        tick); the streamed frames then pass through the recorder's
+        CameraSchedule as a storage filter and ``cam_hold``
+        (``live_hold.LiveStreamHold``). No extra GE call.
         """
-        if sched is None:
-            from python.sensors.live_hold import ScheduledAdHoc
+        if hold is None:
+            from python.sensors.live_hold import LiveStreamHold
 
-            sched = ScheduledAdHoc([cid for cid in CAM_IDS if cid != "main"])
-        self._sched = sched
-        return sched
-
-    def live_hold_counts(self) -> tuple[dict[str, int], dict[str, int]] | None:
-        """(polls sent, polls timed out) per companion since the schedule started; None when off."""
-        if self._sched is None:
-            return None
-        return dict(self._sched.sent_by_cam), dict(self._sched.timeouts_by_cam)
+            hold = LiveStreamHold()
+        self._live_hold = hold
+        return hold
 
     def reset_live_hold(self) -> None:
-        """Respawn / level load: the schedule re-anchors and no frame is held."""
-        if self._sched is not None:
-            self._sched.reset()
-
-    def _sched_io_running(self) -> bool:
-        job = self._io_job
-        return self._io_busy() and job is not None and str(job[1]).startswith("sched_")
-
-    def _main_shmem_colour(self, cam: Any) -> np.ndarray | None:
-        if not hasattr(cam, "stream_raw"):
-            return None
-        try:
-            raw = cam.stream_raw()
-        except Exception:
-            return None
-        return _reading_colour(raw, self._resolution.get("main"))
-
-    def _sched_prepare(self, cid: str, images: Any) -> np.ndarray | None:
-        """A collect reply as the stored companion frame, same steps as ``_publish_read``."""
-        bgr = _reading_colour(images, self._resolution.get(cid)) if isinstance(images, dict) else None
-        if bgr is None or frame_is_unrendered(bgr):
-            return None
-        bgr = resize_long_side(bgr, self.long_side)
-        if companion_frame_is_flash(bgr, self._cache_frames.get(cid)):
-            return None
-        bgr = recover_viewport_tone(bgr)
-        self._cache_frames[cid] = bgr
-        self._cache_ts[cid] = time.time()
-        return bgr
+        """Respawn / reset / level load: the schedule re-anchors and no frame is held."""
+        if self._live_hold is not None:
+            self._live_hold.reset()
 
     def grab(self) -> CameraFrameBundle:
         from python.runtime.hw_probe import ema_hz, unique_frame_hz_inst
@@ -2183,29 +2148,18 @@ class BeamNGPyBackend:
         sensors = list(self._sensors.items())
         main_first = [item for item in sensors if item[0] == "main"]
         main_first.extend(item for item in sensors if item[0] != "main")
-        sched = self._sched
-        main_wall: float | None = None
+        live_hold = self._live_hold
+        # Wall time right after each read: the recorder's cams.<cam>.t.
+        walls: dict[str, float] = {}
         for cid, cam in main_first:
-            if sched is not None and cid != "main":
-                # Scheduled hold: companions are ad-hoc polls (below), not stream_raw.
-                self._omit_unread(cid, frames, timestamps, health)
-                continue
             if not self._grab_this_tick(cid, grab_i):
                 self._omit_unread(cid, frames, timestamps, health)
                 continue
             if cid != "main":
                 companion_polled = True
             try:
-                if cid == "main" and sched is not None and self._sched_io_running():
-                    # A scheduled ad-hoc call still holds the IO thread (and the GE
-                    # socket). Main is shared memory, not the socket: read it here
-                    # so a slow companion poll never drops main.
-                    bgr = self._main_shmem_colour(cam)
-                else:
-                    bgr = self._bounded_sensor_colour(cid, cam)
-                if cid == "main":
-                    # The recorder's cams.main.t: wall time right after the read.
-                    main_wall = time.time()
+                bgr = self._bounded_sensor_colour(cid, cam)
+                walls[cid] = time.time()
                 if bgr is _IO_BUSY or bgr is _IO_TIMEOUT:
                     self._omit_unread(cid, frames, timestamps, health)
                 else:
@@ -2218,18 +2172,11 @@ class BeamNGPyBackend:
                     frames.pop("cam_main", None)
         cam_ages: tuple[float, ...] | None = None
         held_frames: dict[str, np.ndarray] = {}
-        if sched is not None:
-            fresh = sched.step(
-                self._sensors,
-                lambda c, k, f, b: self._io_call(c, k, f, budget=b),
-                lambda v: v is _IO_BUSY or v is _IO_TIMEOUT,
-                self._sched_prepare,
-            )
-            for cid, bgr in fresh.items():
-                companion_polled = True
-                self._store_frame(cid, bgr, ts, frames, timestamps, health)
-            main_now = frames.get("main") if "main" in frames else None
-            held_frames, ages = sched.compose(main_wall if main_now is not None else None, main_now)
+        if live_hold is not None:
+            # The recorder's order: read every camera, then CameraSchedule.tick(monotonic)
+            # picks the stored ones (collect_scene_lanes ~2417-2422).
+            read = {cid: frames[cid] for cid in CAM_IDS if cid in frames}
+            held_frames, ages = live_hold.step(read, walls, time.monotonic())
             cam_ages = tuple(float(a) for a in ages)
         self._maybe_live_narrow_hitch()
         self._take_late_unique(unique_ids)
@@ -2267,11 +2214,10 @@ class BeamNGPyBackend:
             grab_poll_free=not companion_polled,
             unique_gpu_n=unique_n,
             unique_gpu_ids=tuple(unique_ids),
-            companion_inflight=self._inflight_n() if sched is None else sched.inflight(),
+            companion_inflight=self._inflight_n(),
             grab_read_blocked=bool(self._read_blocked),
             cam_ages=cam_ages,
             held_frames=held_frames,
-            adhoc_timeouts=0 if sched is None else int(sched.timeouts),
         )
 
 

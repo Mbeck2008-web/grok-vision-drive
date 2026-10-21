@@ -1,35 +1,43 @@
 #!/usr/bin/env python3
-"""Read-only: grade a live cam-age capture (polling ON) against a polling-OFF baseline.
+"""Read-only: grade a live cam-age capture (hold ON) against a cam-age-model-OFF baseline.
 
-Two ``run_vision`` logs of ~60 s each, both with the untrained capture model
-(``scripts/export_capture_age_model.py``) and engage hard-disabled
-(``--no-engage``):
+Two ``run_vision`` logs of ~60 s each, back to back from the same spawn, with
+engage hard-disabled (``--no-engage``):
 
-* ``--baseline-log``: ``--cam-age-baseline`` (companion polls OFF);
-* ``--log``: the same command without it (scheduled ad-hoc polls ON).
+* ``--baseline-log``: ``--cam-age-baseline`` (cam-age model off: the hold is
+  off; with the default main-only scene model that is the plain supervisor);
+* ``--log``: the untrained capture model (``scripts/export_capture_age_model.py``)
+  with the hold ON (all 8 cameras streamed, side cameras held through the
+  recorder's CameraSchedule).
 
-Every tick prints one ``[GVD] cam_age`` line (``tick_ms``, ``would_skip``,
-``main_luma`` / ``main_flash``, the 8 ``ages`` in ``cam_hold.CAM_AGE_ORDER``
-with -1 = black, cumulative ``polls`` / ``timeouts_by_cam``), and the start
-prints one ``[GVD] cam-age model`` line. Bars, each PASS / FAIL:
+Every tick prints one ``[GVD] cam_age`` line; the start prints
+``[GVD] cam-age model`` and ``[GVD] cam-age providers`` lines. Bars, each
+PASS / FAIL:
 
-* model: both logs ran a gvd_cam_age=1, 8-camera, capture_untrained=1 model
-  with engage hard-disabled; polling=on / off as labelled.
+* model: ON ran a gvd_cam_age=1, 8-camera, capture_untrained=1 model with the
+  hold on; the baseline ran with the hold off; both with engage hard-disabled.
 * engage_off: every tick in both logs has engaged=0, engage_disabled=1.
-* mode: ON ticks are scheduled=1 baseline=0; baseline ticks scheduled=0 baseline=1.
+* mode: ON ticks are hold=1 baseline=0; baseline ticks hold=0 baseline=1.
 * duration: each log spans >= 55 s of ticks.
+* compute: on every tick of both logs the detector, the planner (lanes,
+  CIPV, AEB) and the scene net ran (``detect_ms``, ``plan_ms``, ``scene_ms``
+  present and > 0, ``aeb`` present), and the detector is yolov8n. Engage
+  gates actuation only.
 * ages: per side camera, live median within 1 tick (1/15 s) and p95 within
   2 ticks of the training ages on the recording the model would train on.
-* tick_p95: ON-log ``tick_ms`` p95 <= 66.7 ms (one 15 Hz tick).
+* loop_dt: ON ``loop_dt_ms`` p50 <= ``--dt-p50`` and p95 <= ``--dt-p95``
+  (the training row-gap bars; pre-registered 162 / 215 ms).
+* scene_ms: ON ``scene_ms`` (onnxruntime session.run) p95 <= 185 ms.
 * would_skip: 0 ON ticks where actuate would skip vehicle.control because a
   camera GE call holds the socket (counted with engage off).
-* timeouts: per side camera, timeouts < 1 % of polls (counts reported).
+* stale_ego: 0 ticks past one consecutive stale (coalesced) poll_vehicle while
+  engaged; the stale count while disengaged is reported.
 * main_flash / main_luma_jump: the ON rate of flashed main frames and of
   tick-to-tick mean-luminance jumps (> ``--luma-jump``) is not above the
   baseline rate. Any rise fails.
 
-Training numbers come from ``--train-json`` (``cam_hold_report.py --json``)
-or from ``--strips`` plus the report's selection arguments, read-only.
+Training ages come from ``--train-json`` (``cam_hold_report.py --json``) or
+from ``--strips`` plus the report's selection arguments, read-only.
 
     py -3 scripts/live_age_capture.py --log <ON_LOG> --baseline-log <BASELINE_LOG> ^
         --strips <RECORDING> --holdout-blocks 1 --mask-files <MASK_JSONL>
@@ -53,46 +61,49 @@ import numpy as np  # noqa: E402
 from python.data.cam_hold import CAM_AGE_ORDER, HOLD_TICK_S, NEVER_HELD  # noqa: E402
 from python.sensors.live_hold import parse_ages_text  # noqa: E402
 
-TICK_P95_MAX_MS = 1000.0 * HOLD_TICK_S  # 66.7 ms: one 15 Hz supervisor tick
 MEDIAN_TOL_S = 1.0 * HOLD_TICK_S
 P95_TOL_S = 2.0 * HOLD_TICK_S
-TIMEOUT_MAX_FRAC = 0.01
+# Pre-registered training row-gap bars for loop_dt (ms).
+DT_P50_MAX_MS = 162.0
+DT_P95_MAX_MS = 215.0
+SCENE_P95_MAX_MS = 185.0
+STALE_EGO_MAX_RUN = 1
 MIN_SPAN_S = 55.0
 LUMA_JUMP = 0.05  # mean main luminance (0..1) change between consecutive ticks counted as a jump
 SIDE_CAMS = tuple(cam for cam in CAM_AGE_ORDER if cam not in NEVER_HELD)
+TIMERS = ("compose_ms", "prep_ms", "scene_ms", "post_ms", "detect_ms", "plan_ms", "infer_ms")
 _LINE = re.compile(r"\[GVD\] cam_age (?P<body>.*)$")
 _MODEL = re.compile(r"\[GVD\] cam-age model (?P<body>.*)$")
+_PROVIDERS = re.compile(r"\[GVD\] cam-age providers (?P<body>.*)$")
 _KV = re.compile(r"(\w+)=(\S+)")
-
-
-def _counts(text: str | None) -> dict[str, int] | None:
-    if not text or text == "na":
-        return None
-    out: dict[str, int] = {}
-    for part in text.split(","):
-        cam, _, value = part.partition(":")
-        if cam and value:
-            out[cam] = int(value)
-    return out
 
 
 def _num(text: str | None) -> float | None:
     if text is None or text == "na":
         return None
-    return float(text)
+    try:
+        return float(text)
+    except ValueError:
+        return None
 
 
 def parse_log(lines: Iterable[str]) -> dict[str, Any]:
     ticks: list[dict[str, Any]] = []
     model: dict[str, str] | None = None
+    providers: dict[str, str] = {}
     respawns = 0
     for line in lines:
         line = line.rstrip("\n")
         if "[GVD] cam-age: respawn" in line:
             respawns += 1
         got = _MODEL.search(line)
-        if got is not None and model is None:
-            model = dict(_KV.findall(got.group("body")))
+        if got is not None:
+            if model is None:
+                model = dict(_KV.findall(got.group("body")))
+            continue
+        got = _PROVIDERS.search(line)
+        if got is not None:
+            providers.update(dict(_KV.findall(got.group("body"))))
             continue
         got = _LINE.search(line)
         if got is None:
@@ -100,44 +111,36 @@ def parse_log(lines: Iterable[str]) -> dict[str, Any]:
         kv = dict(_KV.findall(got.group("body")))
         if "tick_ms" not in kv or "ages" not in kv:
             continue
-        ticks.append(
-            {
-                "t": _num(kv.get("t")),
-                "tick_ms": float(kv["tick_ms"]),
-                "scheduled": kv.get("scheduled") == "1",
-                "baseline": kv.get("baseline") == "1",
-                "engaged": kv.get("engaged"),
-                "engage_disabled": kv.get("engage_disabled"),
-                "would_skip": kv.get("would_skip"),
-                "main_luma": _num(kv.get("main_luma")),
-                "main_flash": kv.get("main_flash"),
-                "ages": parse_ages_text(kv["ages"]),
-                "polls": _counts(kv.get("polls")),
-                "timeouts": _counts(kv.get("timeouts_by_cam")),
-            }
-        )
+        tick = {
+            "t": _num(kv.get("t")),
+            "tick_ms": float(kv["tick_ms"]),
+            "loop_dt_ms": _num(kv.get("loop_dt_ms")),
+            "hold": kv.get("hold") == "1",
+            "baseline": kv.get("baseline") == "1",
+            "engaged": kv.get("engaged"),
+            "engage_disabled": kv.get("engage_disabled"),
+            "would_skip": kv.get("would_skip"),
+            "stale_ego": kv.get("stale_ego") == "1",
+            "main_luma": _num(kv.get("main_luma")),
+            "main_flash": kv.get("main_flash"),
+            "aeb": kv.get("aeb"),
+            "ages": parse_ages_text(kv["ages"]),
+        }
+        for key in TIMERS:
+            tick[key] = _num(kv.get(key))
+        ticks.append(tick)
     ages = {cam: [t["ages"][cam] for t in ticks if cam in t["ages"]] for cam in CAM_AGE_ORDER}
-    return {
-        "ticks": ticks,
-        "ticks_ms": [t["tick_ms"] for t in ticks],
-        "ages": ages,
-        "scheduled": sum(1 for t in ticks if t["scheduled"]),
-        "model": model,
-        "respawns": respawns,
-    }
+    return {"ticks": ticks, "ages": ages, "model": model, "providers": providers, "respawns": respawns}
 
 
 def _stat(values: list[float], q: float) -> float | None:
     return None if not values else float(np.percentile(np.asarray(values, dtype=np.float64), q))
 
 
-def compare(live: dict[str, Any], train_age_s: dict[str, Any]) -> dict[str, Any]:
-    """Ages per side camera vs training, and the tick p95 bar."""
-    out: dict[str, Any] = {"cams": {}, "ticks": len(live["ticks_ms"]), "scheduled_ticks": live["scheduled"]}
-    tick_p95 = _stat(live["ticks_ms"], 95)
-    out["tick_p95_ms"] = tick_p95
-    out["tick_pass"] = tick_p95 is not None and tick_p95 <= TICK_P95_MAX_MS
-    ages_pass = True
+def compare_ages(live: dict[str, Any], train_age_s: dict[str, Any]) -> dict[str, Any]:
+    """Per side camera: live held-age median / p95 vs training."""
+    out: dict[str, Any] = {}
+    all_ok = True
     for cam in SIDE_CAMS:
         values = live["ages"].get(cam) or []
         held = [v for v in values if v >= 0.0]
@@ -152,8 +155,8 @@ def compare(live: dict[str, Any], train_age_s: dict[str, Any]) -> dict[str, Any]
             and abs(live_med - float(tr_med)) <= MEDIAN_TOL_S + 1e-9
             and abs(live_p95 - float(tr_p95)) <= P95_TOL_S + 1e-9
         )
-        ages_pass = ages_pass and ok
-        out["cams"][cam] = {
+        all_ok = all_ok and ok
+        out[cam] = {
             "live_n": len(held),
             "live_black_pct": None if not values else round(100.0 * (len(values) - len(held)) / len(values), 2),
             "live_median": live_med,
@@ -162,24 +165,7 @@ def compare(live: dict[str, Any], train_age_s: dict[str, Any]) -> dict[str, Any]
             "train_p95": tr_p95,
             "pass": bool(ok),
         }
-    out["ages_pass"] = ages_pass
-    out["pass"] = bool(ages_pass and out["tick_pass"])
-    return out
-
-
-def _summed(ticks: list[dict[str, Any]], key: str) -> dict[str, int]:
-    """Total of a cumulative per-camera counter, robust to a reset (respawn) mid-log."""
-    total: dict[str, int] = {}
-    prev: dict[str, int] = {}
-    for tick in ticks:
-        now = tick.get(key)
-        if now is None:
-            continue
-        for cam, value in now.items():
-            before = prev.get(cam, 0)
-            total[cam] = total.get(cam, 0) + (value - before if value >= before else value)
-        prev = now
-    return total
+    return {"pass": all_ok, "cams": out}
 
 
 def exposure(ticks: list[dict[str, Any]], luma_jump: float = LUMA_JUMP) -> dict[str, Any]:
@@ -198,9 +184,52 @@ def exposure(ticks: list[dict[str, Any]], luma_jump: float = LUMA_JUMP) -> dict[
     }
 
 
+def stale_runs(ticks: list[dict[str, Any]]) -> dict[str, int]:
+    """Stale ticks while disengaged, and engaged ticks past ``STALE_EGO_MAX_RUN`` in a row."""
+    run = 0
+    engaged_over = 0
+    disengaged = 0
+    for t in ticks:
+        run = run + 1 if t["stale_ego"] else 0
+        if t["stale_ego"] and t["engaged"] != "1":
+            disengaged += 1
+        if t["engaged"] == "1" and run > STALE_EGO_MAX_RUN:
+            engaged_over += 1
+    return {"engaged_over": engaged_over, "disengaged": disengaged, "total": sum(1 for t in ticks if t["stale_ego"])}
+
+
+def compute_gaps(ticks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ticks where the detector, planner (+ AEB) or scene net did not run.
+
+    ``plan_ms``, ``scene_ms`` > 0 and ``aeb`` on every tick; ``detect_ms`` > 0 on
+    every tick with a main frame (no frame: the detector returns at once) and
+    present on the others.
+    """
+    out = []
+    for t in ticks:
+        ran = (t.get("plan_ms") or 0.0) > 0.0 and (t.get("scene_ms") or 0.0) > 0.0 and t.get("aeb") not in (None, "na")
+        det = t.get("detect_ms")
+        ran = ran and det is not None and (det > 0.0 or t["main_luma"] is None)
+        if not ran:
+            out.append(t)
+    return out
+
+
 def _span(ticks: list[dict[str, Any]]) -> float:
     ts = [t["t"] for t in ticks if t["t"] is not None]
     return 0.0 if len(ts) < 2 else float(max(ts) - min(ts))
+
+
+def _fmt(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.1f}"
+
+
+def timer_summary(ticks: list[dict[str, Any]]) -> dict[str, dict[str, float | None]]:
+    out = {}
+    for key in TIMERS + ("loop_dt_ms", "tick_ms"):
+        vals = [t[key] for t in ticks if t.get(key) is not None]
+        out[key] = {"p50": _stat(vals, 50), "p95": _stat(vals, 95), "n": len(vals)}
+    return out
 
 
 def grade(
@@ -208,24 +237,25 @@ def grade(
     base: dict[str, Any],
     train_age_s: dict[str, Any],
     *,
+    dt_p50_ms: float = DT_P50_MAX_MS,
+    dt_p95_ms: float = DT_P95_MAX_MS,
+    scene_p95_ms: float = SCENE_P95_MAX_MS,
     luma_jump: float = LUMA_JUMP,
     min_span_s: float = MIN_SPAN_S,
 ) -> dict[str, Any]:
     bars: dict[str, dict[str, Any]] = {}
-
-    def model_ok(log: dict[str, Any], polling: str) -> bool:
-        m = log.get("model") or {}
-        return (
-            m.get("gvd_cam_age") == "1"
-            and m.get("cams") == str(len(CAM_AGE_ORDER))
-            and m.get("capture_untrained") == "1"
-            and m.get("engage_disabled") == "1"
-            and m.get("polling") == polling
-        )
-
+    m_on, m_base = on.get("model") or {}, base.get("model") or {}
     bars["model"] = {
-        "pass": model_ok(on, "on") and model_ok(base, "off"),
-        "detail": f"on={on.get('model')} baseline={base.get('model')}",
+        "pass": (
+            m_on.get("gvd_cam_age") == "1"
+            and m_on.get("cams") == str(len(CAM_AGE_ORDER))
+            and m_on.get("capture_untrained") == "1"
+            and m_on.get("hold") == "on"
+            and m_on.get("engage_disabled") == "1"
+            and m_base.get("hold") == "off"
+            and m_base.get("engage_disabled") == "1"
+        ),
+        "detail": f"on={m_on or None} baseline={m_base or None}",
     }
     eng_bad = {
         name: sum(1 for t in log["ticks"] if t["engaged"] != "0" or t["engage_disabled"] != "1")
@@ -233,8 +263,8 @@ def grade(
     }
     bars["engage_off"] = {"pass": not any(eng_bad.values()), "detail": f"ticks not engaged=0/engage_disabled=1: {eng_bad}"}
     mode_bad = {
-        "on": sum(1 for t in on["ticks"] if not t["scheduled"] or t["baseline"]),
-        "baseline": sum(1 for t in base["ticks"] if t["scheduled"] or not t["baseline"]),
+        "on": sum(1 for t in on["ticks"] if not t["hold"] or t["baseline"]),
+        "baseline": sum(1 for t in base["ticks"] if t["hold"] or not t["baseline"]),
     }
     bars["mode"] = {
         "pass": bool(on["ticks"]) and bool(base["ticks"]) and not any(mode_bad.values()),
@@ -245,17 +275,32 @@ def grade(
         "pass": all(v >= min_span_s for v in spans.values()),
         "detail": f"span s on={spans['on']:.1f} baseline={spans['baseline']:.1f} (min {min_span_s:g})",
     }
-    ages = compare(on, train_age_s)
+    missing = {name: len(compute_gaps(log["ticks"])) for name, log in (("on", on), ("baseline", base))}
+    no_main = {name: sum(1 for t in log["ticks"] if t["main_luma"] is None) for name, log in (("on", on), ("baseline", base))}
+    detectors = {name: str((log.get("providers") or {}).get("detector", "")) for name, log in (("on", on), ("baseline", base))}
+    yolo = all(d.startswith("yolov8n") for d in detectors.values())
+    bars["compute"] = {
+        "pass": bool(on["ticks"]) and bool(base["ticks"]) and not any(missing.values()) and yolo,
+        "detail": f"ticks without detect/plan/scene timers or aeb: {missing}; ticks without a main frame {no_main}; "
+        f"detector {detectors}",
+    }
+    ages = compare_ages(on, train_age_s)
     bars["ages"] = {
-        "pass": ages["ages_pass"],
+        "pass": ages["pass"],
         "detail": f"median within {MEDIAN_TOL_S * 1000:.0f} ms, p95 within {P95_TOL_S * 1000:.0f} ms",
         "cams": ages["cams"],
     }
-    base_p95 = _stat(base["ticks_ms"], 95)
-    bars["tick_p95"] = {
-        "pass": ages["tick_pass"],
-        "detail": f"on p95 {ages['tick_p95_ms'] if ages['tick_p95_ms'] is not None else float('nan'):.2f} ms "
-        f"(max {TICK_P95_MAX_MS:.1f}); baseline p95 {base_p95 if base_p95 is not None else float('nan'):.2f} ms",
+    dts = [t["loop_dt_ms"] for t in on["ticks"] if t["loop_dt_ms"] is not None]
+    dt50, dt95 = _stat(dts, 50), _stat(dts, 95)
+    bars["loop_dt"] = {
+        "pass": dt50 is not None and dt95 is not None and dt50 <= dt_p50_ms and dt95 <= dt_p95_ms,
+        "detail": f"on p50 {_fmt(dt50)} ms (max {dt_p50_ms:g}), p95 {_fmt(dt95)} ms (max {dt_p95_ms:g})",
+    }
+    scene = [t["scene_ms"] for t in on["ticks"] if t["scene_ms"] is not None]
+    sc95 = _stat(scene, 95)
+    bars["scene_ms"] = {
+        "pass": sc95 is not None and sc95 <= scene_p95_ms,
+        "detail": f"on session.run p95 {_fmt(sc95)} ms (max {scene_p95_ms:g})",
     }
     skips_on = sum(1 for t in on["ticks"] if t["would_skip"] != "0")
     skips_base = sum(1 for t in base["ticks"] if t["would_skip"] != "0")
@@ -263,15 +308,12 @@ def grade(
         "pass": bool(on["ticks"]) and skips_on == 0,
         "detail": f"would-skip control ticks on={skips_on}/{len(on['ticks'])} baseline={skips_base}/{len(base['ticks'])}",
     }
-    polls, touts = _summed(on["ticks"], "polls"), _summed(on["ticks"], "timeouts")
-    per_cam = {}
-    t_ok = True
-    for cam in SIDE_CAMS:
-        n, k = int(polls.get(cam, 0)), int(touts.get(cam, 0))
-        ok = n > 0 and k < TIMEOUT_MAX_FRAC * n
-        t_ok = t_ok and ok
-        per_cam[cam] = {"polls": n, "timeouts": k, "pct": None if n == 0 else round(100.0 * k / n, 3), "pass": ok}
-    bars["timeouts"] = {"pass": t_ok, "detail": f"timeouts < {TIMEOUT_MAX_FRAC * 100:g}% of polls per cam", "cams": per_cam}
+    st_on, st_base = stale_runs(on["ticks"]), stale_runs(base["ticks"])
+    bars["stale_ego"] = {
+        "pass": st_on["engaged_over"] == 0 and st_base["engaged_over"] == 0,
+        "detail": f"engaged past {STALE_EGO_MAX_RUN} stale tick: on={st_on['engaged_over']} baseline={st_base['engaged_over']}; "
+        f"stale while disengaged: on={st_on['disengaged']}/{len(on['ticks'])} baseline={st_base['disengaged']}/{len(base['ticks'])}",
+    }
     ex_on, ex_base = exposure(on["ticks"], luma_jump), exposure(base["ticks"], luma_jump)
 
     def not_above(key: str) -> bool:
@@ -290,6 +332,8 @@ def grade(
         "bars": bars,
         "pass": all(bar["pass"] for bar in bars.values()),
         "respawns": {"on": on.get("respawns", 0), "baseline": base.get("respawns", 0)},
+        "providers": {"on": on.get("providers") or {}, "baseline": base.get("providers") or {}},
+        "timers": {"on": timer_summary(on["ticks"]), "baseline": timer_summary(base["ticks"])},
         "exposure": {"on": ex_on, "baseline": ex_base},
     }
 
@@ -309,19 +353,24 @@ def table(result: dict[str, Any]) -> str:
                     f"      {cam:<9}{f(row['live_median']):>10}{f(row['train_median']):>11}{f(row['live_p95']):>10}"
                     f"{f(row['train_p95']):>11}{black:>14}  {'PASS' if row['pass'] else 'FAIL'}"
                 )
-        if name == "timeouts":
-            for cam, row in bar["cams"].items():
-                pct = "n/a" if row["pct"] is None else f"{row['pct']:.3f}%"
-                lines.append(f"      {cam:<9} polls {row['polls']:>6} timeouts {row['timeouts']:>5} {pct:>9}  {'PASS' if row['pass'] else 'FAIL'}")
-    lines.append(f"respawns seen: {result['respawns']}")
+    for name in ("on", "baseline"):
+        tm = result["timers"][name]
+        lines.append(
+            f"timers {name}: " + " ".join(f"{k}={_fmt(v['p50'])}/{_fmt(v['p95'])}" for k, v in tm.items()) + " (p50/p95 ms)"
+        )
+    lines.append(f"providers: {result['providers']}")
+    lines.append(f"respawns / resets seen: {result['respawns']}")
     lines.append(f"OVERALL {'PASS' if result['pass'] else 'FAIL'}")
     return "\n".join(lines)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Live cam-age capture vs training ages (read-only)")
-    parser.add_argument("--log", type=Path, required=True, help="Polling-ON run_vision log ('[GVD] cam_age' lines).")
-    parser.add_argument("--baseline-log", type=Path, required=True, help="Polling-OFF (--cam-age-baseline) log.")
+    parser.add_argument("--log", type=Path, required=True, help="Hold-ON run_vision log ('[GVD] cam_age' lines).")
+    parser.add_argument("--baseline-log", type=Path, required=True, help="Cam-age-model-OFF (--cam-age-baseline) log.")
+    parser.add_argument("--dt-p50", type=float, default=DT_P50_MAX_MS, help="loop_dt p50 bar, ms (training row gap).")
+    parser.add_argument("--dt-p95", type=float, default=DT_P95_MAX_MS, help="loop_dt p95 bar, ms (training row gap).")
+    parser.add_argument("--scene-p95", type=float, default=SCENE_P95_MAX_MS, help="scene_ms p95 bar, ms.")
     parser.add_argument("--luma-jump", type=float, default=LUMA_JUMP, help="Mean-luminance jump threshold (0..1).")
     parser.add_argument("--train-json", type=Path, default=None, help="cam_hold_report.py --json output.")
     parser.add_argument("--strips", type=Path, default=None, help="Recording to compute the training ages from.")
@@ -360,7 +409,15 @@ def main(argv: list[str] | None = None) -> int:
             logs[name] = parse_log(handle)
         if not logs[name]["ticks"]:
             raise SystemExit(f"{path}: no '[GVD] cam_age' lines")
-    result = grade(logs["on"], logs["baseline"], train.get("train_age_s") or {}, luma_jump=float(args.luma_jump))
+    result = grade(
+        logs["on"],
+        logs["baseline"],
+        train.get("train_age_s") or {},
+        dt_p50_ms=float(args.dt_p50),
+        dt_p95_ms=float(args.dt_p95),
+        scene_p95_ms=float(args.scene_p95),
+        luma_jump=float(args.luma_jump),
+    )
     print(json.dumps(result, indent=1) if args.json else table(result), flush=True)
     return 0 if result["pass"] else 1
 

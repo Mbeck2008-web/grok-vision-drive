@@ -44,6 +44,8 @@ MARKER_WINDOWS = "gvd-ci: requires windows"
 MARKER_BEAMNG = "gvd-ci: requires beamng"
 MARKER_TORCH = "gvd-ci: requires torch"
 TIMEOUT_S = 300
+# Scripts that train several small models end to end need longer on CI runners.
+SCRIPT_TIMEOUT_S = {"test_epoch_ckpt.py": 600}
 
 
 def _head(path: Path) -> str:
@@ -117,6 +119,7 @@ def _run(cmd: list[str], label: str) -> tuple[str, int, list[str]]:
     """Run one script isolated. Returns status, exit code, and the checks it skipped."""
     scratch = Path(tempfile.mkdtemp(prefix="gvd-suite-"))
     skips: list[str] = []
+    timeout_s = SCRIPT_TIMEOUT_S.get(label, TIMEOUT_S)
     try:
         env = isolated_env(os.environ, scratch)
         skip_log = scratch / "skipped_checks.txt"
@@ -128,10 +131,10 @@ def _run(cmd: list[str], label: str) -> tuple[str, int, list[str]]:
                 cmd,
                 cwd=str(ROOT),
                 env=env,
-                timeout=TIMEOUT_S,
+                timeout=timeout_s,
             )
         except subprocess.TimeoutExpired:
-            print(f"FAIL {label}: timed out after {TIMEOUT_S}s", flush=True)
+            print(f"FAIL {label}: timed out after {timeout_s}s", flush=True)
             return "fail", 1, read_skips(skip_log)
         downloaded = torch_hub_files(env)
         skips = read_skips(skip_log)

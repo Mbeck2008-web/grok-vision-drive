@@ -2109,6 +2109,12 @@ class BeamNGPyBackend:
         self._sched = sched
         return sched
 
+    def live_hold_counts(self) -> tuple[dict[str, int], dict[str, int]] | None:
+        """(polls sent, polls timed out) per companion since the schedule started; None when off."""
+        if self._sched is None:
+            return None
+        return dict(self._sched.sent_by_cam), dict(self._sched.timeouts_by_cam)
+
     def reset_live_hold(self) -> None:
         """Respawn / level load: the schedule re-anchors and no frame is held."""
         if self._sched is not None:

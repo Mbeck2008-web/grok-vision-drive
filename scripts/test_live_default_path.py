@@ -3,6 +3,8 @@
 
 A stub supervisor run with no cam-age scene model prints no ``[GVD] cam_age``
 line and never writes ``cam_ages`` / ``adhoc_timeouts`` into gvd_state.json.
+``--no-engage`` (or GVD_NO_ENGAGE=1) keeps engaged False even with
+``--force-engage``; ``--run-seconds`` ends the loop on its own.
 """
 from __future__ import annotations
 
@@ -79,8 +81,36 @@ def check_default_emits_nothing() -> None:
     print(f"default run: {text.count('[GVD] seg ')} ticks, no '[GVD] cam_age' line, {len(states)} states without {CAM_AGE_KEYS} OK")
 
 
+def check_no_engage() -> None:
+    text, states = run_supervisor(["--force-engage"])
+    assert states and any(st.get("engaged") for st in states), "control: --force-engage never engaged"
+    for extra, env in ((["--force-engage", "--no-engage"], {}), (["--force-engage"], {"GVD_NO_ENGAGE": "1"})):
+        old = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        try:
+            text, states = run_supervisor(extra)
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        assert "engage HARD-disabled" in text, text[-1500:]
+        assert states and not any(st.get("engaged") for st in states), (extra, env)
+        assert "[GVD] seg " in text
+    print(f"--no-engage / GVD_NO_ENGAGE=1: {len(states)} states never engaged with --force-engage OK")
+
+
+def check_run_seconds() -> None:
+    text, _states = run_supervisor(["--run-seconds", "1.5"], seconds=20.0)
+    assert "--run-seconds 1.5 reached; stopping" in text, text[-1500:]
+    print("--run-seconds: the supervisor stops on its own OK")
+
+
 def main() -> None:
     check_default_emits_nothing()
+    check_no_engage()
+    check_run_seconds()
     print("test_live_default_path: all OK")
 
 

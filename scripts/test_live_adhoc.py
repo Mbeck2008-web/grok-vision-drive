@@ -389,28 +389,95 @@ def check_runtime_gate() -> None:
     print("runtime: gvd_cam_age=1 accepted on the BeamNG path, refused on window; window ages main-only OK")
 
 
+def _capture_lines(*, polling: bool, n: int = 900, flash_every: int = 0, jump_every: int = 0, skip_at: int = -1,
+                   timeout_cam: str = "", tick_hi: bool = False, engaged_at: int = -1, untrained: bool = True) -> list[str]:
+    rng = np.random.RandomState(0)
+    side = [cam for cam in CAM_AGE_ORDER if cam != "main"]
+    lines = [
+        f"[GVD] cam-age model gvd_cam_age=1 cams=8 capture_untrained={int(untrained)} "
+        f"polling={'on' if polling else 'off'} engage_disabled=1"
+    ]
+    for k in range(n):
+        ages = ",".join(
+            f"{cam}:0.000" if cam == "main" else (f"{cam}:{(k % 8) / 15.0:.3f}" if polling else f"{cam}:-1.000")
+            for cam in CAM_AGE_ORDER
+        )
+        polls = ",".join(f"{cam}:{k // 2 + 1}" for cam in side) if polling else "na"
+        touts = ",".join(f"{cam}:{k // 50 if cam == timeout_cam else 0}" for cam in side) if polling else "na"
+        luma = 0.4 + (0.2 if jump_every and k % jump_every == 0 else 0.0)
+        flash = int(bool(flash_every) and k % flash_every == 0)
+        tick = (90 if tick_hi else 20) + rng.rand() * 10
+        lines.append(
+            f"[GVD] cam_age t={1000 + k / 15.0:.3f} tick_ms={tick:.2f} loop_dt_ms=66.7 scheduled={int(polling)} "
+            f"baseline={int(not polling)} engaged={int(k == engaged_at)} engage_disabled=1 would_skip={int(k == skip_at)} "
+            f"main_luma={luma:.4f} main_flash={flash} timeouts=0 ages={ages} polls={polls} timeouts_by_cam={touts}"
+        )
+    return lines
+
+
 def check_capture_script() -> None:
-    from live_age_capture import compare, parse_log
+    from live_age_capture import grade, parse_log, table
 
     train = {cam: {"median": 0.2, "p95": 0.467} for cam in CAM_AGE_ORDER if cam != "main"}
-    lines = []
-    rng = np.random.RandomState(0)
-    for k in range(900):
-        ages = []
-        for cam in CAM_AGE_ORDER:
-            if cam == "main":
-                ages.append(f"{cam}:0.000")
-            else:
-                ages.append(f"{cam}:{(k % 8) / 15.0:.3f}")
-        lines.append(f"[GVD] cam_age t={k} tick_ms={20 + rng.rand() * 10:.2f} loop_dt_ms=66.7 scheduled=1 timeouts=0 ages={','.join(ages)}")
-    live = parse_log(lines)
-    result = compare(live, train)
-    assert result["pass"] and result["tick_pass"] and result["scheduled_ticks"] == 900, json.dumps(result)[:400]
-    late = compare(live, {cam: {"median": 0.6, "p95": 0.9} for cam in train})
-    assert not late["pass"]
-    slow = parse_log([line.replace("tick_ms=2", "tick_ms=9") for line in lines])
-    assert not compare(slow, train)["tick_pass"]
-    print("live_age_capture: PASS within 1 / 2 ticks and tick p95 <= 67 ms; FAIL otherwise OK")
+    base = parse_log(_capture_lines(polling=False, flash_every=100, jump_every=100))
+    on = parse_log(_capture_lines(polling=True, flash_every=100, jump_every=100))
+    result = grade(on, base, train)
+    assert result["pass"], table(result)
+    assert all(bar["pass"] for bar in result["bars"].values())
+    assert result["bars"]["timeouts"]["cams"]["pillarL"]["polls"] == 450
+    text = table(result)
+    assert "OVERALL PASS" in text and "PASS  would_skip" in text
+    failures = {
+        "ages": (dict(polling=True, flash_every=100, jump_every=100), {cam: {"median": 0.6, "p95": 0.9} for cam in train}),
+        "tick_p95": (dict(polling=True, flash_every=100, jump_every=100, tick_hi=True), train),
+        "would_skip": (dict(polling=True, flash_every=100, jump_every=100, skip_at=300), train),
+        "timeouts": (dict(polling=True, flash_every=100, jump_every=100, timeout_cam="rear"), train),
+        "main_flash": (dict(polling=True, flash_every=50, jump_every=100), train),
+        "main_luma_jump": (dict(polling=True, flash_every=100, jump_every=40), train),
+        "engage_off": (dict(polling=True, flash_every=100, jump_every=100, engaged_at=10), train),
+        "model": (dict(polling=True, flash_every=100, jump_every=100, untrained=False), train),
+    }
+    for bar, (kw, tr) in failures.items():
+        got = grade(parse_log(_capture_lines(**kw)), base, tr)
+        assert not got["pass"] and not got["bars"][bar]["pass"], (bar, table(got))
+        others = [name for name, b in got["bars"].items() if not b["pass"] and name != bar]
+        assert not others, (bar, others)
+    # Swapped logs: the baseline is not a polling-off run.
+    assert not grade(on, on, train)["bars"]["mode"]["pass"]
+    short = parse_log(_capture_lines(polling=True, n=300, flash_every=100, jump_every=100))
+    assert not grade(short, base, train)["bars"]["duration"]["pass"]
+    print(f"live_age_capture: {len(result['bars'])} bars PASS on a good pair; each bar FAILs alone on its fault OK")
+
+
+def check_telemetry_helpers() -> None:
+    from python.sensors.live_hold import counts_text, main_exposure
+
+    rng = np.random.RandomState(1)
+    dim = rng.randint(40, 90, (192, 256, 3)).astype(np.uint8)
+    luma, flash = main_exposure(dim, None)
+    want = (0.114 * dim[..., 0].mean() + 0.587 * dim[..., 1].mean() + 0.299 * dim[..., 2].mean()) / 255.0
+    assert abs(luma - want) < 1e-6 and not flash
+    blue = dim.astype(np.int32) + np.array([120, 50, 30])  # BGR: the bright-blue flash frame
+    luma2, flash2 = main_exposure(np.clip(blue, 0, 255).astype(np.uint8), dim)
+    assert luma2 > luma and flash2, (luma2, flash2)
+    grey = np.clip(dim.astype(np.int32) + 60, 0, 255).astype(np.uint8)  # brighter, not bluer: not a flash
+    assert main_exposure(grey, dim)[1] is False and main_exposure(dim, dim)[1] is False
+    assert main_exposure(None, dim) == (None, False)
+    assert counts_text({"pillarL": 3}, ["repeatL", "pillarL"]) == "repeatL:0,pillarL:3"
+    cams = {"main": FakeCam("main"), "pillarL": FakeCam("pillarL")}
+    be = _backend(cams)
+    assert be.live_hold_counts() is None
+    be.enable_scheduled_adhoc()
+    for _k in range(30):
+        be.grab()
+        time.sleep(1.0 / 15.0)
+    sent, touts = be.live_hold_counts()
+    assert sent.get("pillarL", 0) >= 1 and touts.get("pillarL", 0) == 0, (sent, touts)
+    be.close()
+    src = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
+    assert "would_skip_control = bool(cam_age_log) and camera_ge_socket_busy()\n            if engaged and (cmd.reason" in src
+    assert "if args.no_engage:\n                engaged = False" in src
+    print("telemetry: main luma / flash, per-cam poll and timeout counts, would-skip read before actuation OK")
 
 
 def main() -> None:
@@ -422,6 +489,7 @@ def main() -> None:
     check_default_unchanged()
     check_runtime_gate()
     check_capture_script()
+    check_telemetry_helpers()
     print("test_live_adhoc: all OK")
 
 

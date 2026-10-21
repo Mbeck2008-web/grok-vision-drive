@@ -85,8 +85,8 @@ from python.runtime.state_io import (
     write_state,
 )
 from python.runtime.paths import bus_identity
-from python.sensors.cameras import make_backend, resolve_backend_name
-from python.sensors.live_hold import RespawnWatch, ages_text, bundle_ages, scrub_after_respawn
+from python.sensors.cameras import camera_ge_socket_busy, make_backend, resolve_backend_name
+from python.sensors.live_hold import RespawnWatch, ages_text, bundle_ages, counts_text, main_exposure, scrub_after_respawn
 from python.data.cam_hold import CAM_AGE_ORDER
 from python.viz.monitors import place_opencv_window
 from python.viz.stage import STAGE_W, STAGE_H, VizUI, render_stage, smoke
@@ -311,6 +311,25 @@ def main() -> None:
         "--scene-onnx",
         default="",
         help="Scene-net ONNX path. Empty uses models/e2e_scene.onnx.",
+    )
+    ap.add_argument(
+        "--no-engage",
+        action="store_true",
+        default=os.environ.get("GVD_NO_ENGAGE", "").strip().lower() in ("1", "true", "yes"),
+        help="Hard engage disable (or GVD_NO_ENGAGE=1): engage is impossible whatever the keys, UI, "
+        "bot file or --force-engage say. For captures.",
+    )
+    ap.add_argument(
+        "--cam-age-baseline",
+        action="store_true",
+        help="With a gvd_cam_age=1 scene model: do not schedule companion polls, but log the same "
+        "per-tick cam_age telemetry (main luminance / flash) as a polling-off baseline.",
+    )
+    ap.add_argument(
+        "--run-seconds",
+        type=float,
+        default=0.0,
+        help="Stop the supervisor loop after this many seconds (0 = run until stopped). For captures.",
     )
     args = ap.parse_args()
 
@@ -568,7 +587,14 @@ def main() -> None:
         scene_guard = None
         # Scheduled hold-last companions (a gvd_cam_age=1 scene model on BeamNG).
         cam_age_live = False
+        # cam_age telemetry: the scheduled hold, or its --cam-age-baseline (polls off).
+        cam_age_log = False
         respawn_watch = RespawnWatch()
+        prev_main_frame = None
+        would_skip_control = False
+        if args.no_engage:
+            print("[GVD] engage HARD-disabled (--no-engage / GVD_NO_ENGAGE): no key, UI or file can engage", flush=True)
+        run_deadline = time.monotonic() + float(args.run_seconds) if float(args.run_seconds) > 0 else None
         if args.lane_source == "scene":
             from python.train.scene_lane_runtime import SceneLaneGuard, SceneLaneRuntime
 
@@ -582,11 +608,26 @@ def main() -> None:
                 functools.partial(SceneLaneRuntime, feeds_cam_age=feeds_cam_age), args.scene_onnx or None
             )
             if bool(getattr(scene_lane, "cam_age", False)) and scene_guard.refused is None:
-                backend.enable_scheduled_adhoc()
-                cam_age_live = True
+                cam_age_log = True
+                if args.cam_age_baseline:
+                    print("[GVD] cam-age: baseline, companion polls OFF (telemetry only)", flush=True)
+                else:
+                    backend.enable_scheduled_adhoc()
+                    cam_age_live = True
+                    print(
+                        "[GVD] cam-age: companions are scheduled ad-hoc polls on the recorder's CameraSchedule "
+                        "(ages logged per tick as '[GVD] cam_age')",
+                        flush=True,
+                    )
+                try:
+                    model_meta = dict(scene_lane.session.get_modelmeta().custom_metadata_map)
+                except Exception:
+                    model_meta = {}
                 print(
-                    "[GVD] cam-age: companions are scheduled ad-hoc polls on the recorder's CameraSchedule "
-                    "(ages logged per tick as '[GVD] cam_age')",
+                    f"[GVD] cam-age model gvd_cam_age={model_meta.get('gvd_cam_age', 'na')} "
+                    f"cams={len(getattr(scene_lane, 'cams', ()) or ())} "
+                    f"capture_untrained={model_meta.get('gvd_capture_untrained', '0')} "
+                    f"polling={'off' if args.cam_age_baseline else 'on'} engage_disabled={int(bool(args.no_engage))}",
                     flush=True,
                 )
             if scene_guard.refused is not None:
@@ -599,6 +640,9 @@ def main() -> None:
         elif args.lane_source == "gt":
             print("[GVD] lane source=gt road-network center at 8 m", flush=True)
         while True:
+            if run_deadline is not None and time.monotonic() >= run_deadline:
+                print(f"[GVD] --run-seconds {float(args.run_seconds):g} reached; stopping", flush=True)
+                break
             loop_t0 = time.perf_counter()
             tick_dt: float | None = None
             if frame_i > 0:
@@ -744,6 +788,8 @@ def main() -> None:
                 or read_engage_flag(default=False)
                 or bot_on
             )
+            if args.no_engage:
+                engaged = False  # hard disable: nothing above can engage
             ident = bus_identity()
             if not ident.matched:
                 engaged = False
@@ -1124,6 +1170,9 @@ def main() -> None:
                 actuator.note_engaged(engaged)
             if hasattr(actuator, "note_ack"):
                 actuator.note_ack(ego_fb)
+            # Capture telemetry (read only): would actuate skip vehicle.control this
+            # tick because a camera GE call holds the socket? Counted with engage off too.
+            would_skip_control = bool(cam_age_log) and camera_ge_socket_busy()
             if engaged and (cmd.reason == "ok" or holding):
                 applied = actuator.apply(cmd)
             else:
@@ -1293,18 +1342,31 @@ def main() -> None:
             st["poll_gps_sent"] = poll_gps_sent
             st["electrics_ms"] = electrics_ms
             st["heartbeat_ms"] = (time.perf_counter() - loop_t0) * 1000.0
-            if cam_age_live:
-                # Per-camera hold ages (cam_hold.CAM_AGE_ORDER; -1 = black) and this
-                # tick's duration, for scripts/live_age_capture.py. Only with a
+            if cam_age_log:
+                # Per-camera hold ages (cam_hold.CAM_AGE_ORDER; -1 = black), this
+                # tick's duration, would-skip-control, poll / timeout counts and
+                # main exposure, for scripts/live_age_capture.py. Only with a
                 # cam-age scene model: the default path logs and writes nothing new.
                 _held, live_ages = bundle_ages(bundle)
                 st["cam_ages"] = {cam: float(live_ages[k]) for k, cam in enumerate(CAM_AGE_ORDER)}
                 st["adhoc_timeouts"] = int(getattr(bundle, "adhoc_timeouts", 0) or 0)
+                main_now = bundle.main_bgr()
+                main_luma, main_flash = main_exposure(main_now, prev_main_frame)
+                if main_now is not None:
+                    prev_main_frame = main_now
+                counts = backend.live_hold_counts() if hasattr(backend, "live_hold_counts") else None
+                side_cams = [cam for cam in CAM_AGE_ORDER if cam != "main"]
+                polls_txt = "na" if counts is None else counts_text(counts[0], side_cams)
+                touts_txt = "na" if counts is None else counts_text(counts[1], side_cams)
                 print(
                     f"[GVD] cam_age t={time.time():.3f} tick_ms={st['heartbeat_ms']:.2f} "
                     f"loop_dt_ms={'na' if tick_dt is None else f'{tick_dt * 1000.0:.2f}'} "
                     f"scheduled={int(getattr(bundle, 'cam_ages', None) is not None)} "
-                    f"timeouts={st['adhoc_timeouts']} ages={ages_text(live_ages)}",
+                    f"baseline={int(bool(args.cam_age_baseline))} engaged={int(bool(engaged))} "
+                    f"engage_disabled={int(bool(args.no_engage))} would_skip={int(bool(would_skip_control))} "
+                    f"main_luma={'na' if main_luma is None else f'{main_luma:.4f}'} main_flash={int(bool(main_flash))} "
+                    f"timeouts={st['adhoc_timeouts']} ages={ages_text(live_ages)} "
+                    f"polls={polls_txt} timeouts_by_cam={touts_txt}",
                     flush=True,
                 )
             # Soft Esc: gvd_state.json at most once per Lua pollEvery (0.10).

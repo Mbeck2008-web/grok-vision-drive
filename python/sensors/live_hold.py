@@ -82,6 +82,7 @@ class ScheduledAdHoc:
         self.timeouts = 0
         self.timeouts_by_cam: dict[str, int] = {}
         self.sent = 0
+        self.sent_by_cam: dict[str, int] = {}
         self.collected = 0
         self.dropped_ids = 0
 
@@ -118,6 +119,7 @@ class ScheduledAdHoc:
             return
         self.pending[str(cid)] = {"rid": int(rid), "sent": float(sent_mono), "ready": False}
         self.sent += 1
+        self.sent_by_cam[str(cid)] = self.sent_by_cam.get(str(cid), 0) + 1
 
     def on_ready(self, cid: str, rid: Any, flag: Any) -> None:
         got = self.pending.get(str(cid))
@@ -298,6 +300,36 @@ class RespawnWatch:
         return reason
 
 
+# ---- main exposure -------------------------------------------------------------
+
+
+def main_exposure(main: Any, prev_main: Any) -> tuple[float | None, bool]:
+    """Main's mean luminance (0..1, BGR luma weights) and whether it is a flash frame.
+
+    The flash test is ``cameras.companion_frame_is_flash`` (brighter and bluer
+    than the previous frame together), applied to main for the capture only.
+    """
+    if main is None:
+        return None, False
+    arr = np.asarray(main)
+    if arr.ndim != 3 or arr.shape[-1] < 3 or arr.size == 0:
+        return None, False
+    luma = float((0.114 * arr[..., 0].mean() + 0.587 * arr[..., 1].mean() + 0.299 * arr[..., 2].mean()) / 255.0)
+    flash = False
+    if prev_main is not None:
+        from python.sensors.cameras import companion_frame_is_flash
+
+        try:
+            flash = bool(companion_frame_is_flash(arr, np.asarray(prev_main)))
+        except Exception:
+            flash = False
+    return luma, flash
+
+
+def counts_text(counts: Mapping[str, int], cams: Iterable[str]) -> str:
+    return ",".join(f"{cam}:{int(counts.get(cam, 0))}" for cam in cams)
+
+
 def scrub_after_respawn(bundle: Any) -> None:
     """This tick's grab ran before the respawn edge was seen: keep main only, every other camera -1."""
     if getattr(bundle, "cam_ages", None) is None:
@@ -356,6 +388,8 @@ __all__ = [
     "RespawnWatch",
     "scrub_after_respawn",
     "ScheduledAdHoc",
+    "counts_text",
+    "main_exposure",
     "ages_text",
     "bundle_ages",
     "main_only_ages",

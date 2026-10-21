@@ -87,7 +87,15 @@ from python.runtime.state_io import (
 )
 from python.runtime.paths import bus_identity
 from python.sensors.cameras import camera_ge_socket_busy, make_backend, resolve_backend_name
-from python.sensors.live_hold import RespawnWatch, StaleEgo, ages_text, bundle_ages, main_exposure, scrub_after_respawn
+from python.sensors.live_hold import (
+    RespawnWatch,
+    StaleEgo,
+    ages_text,
+    bundle_ages,
+    main_exposure,
+    reads_text,
+    scrub_after_respawn,
+)
 from python.data.cam_hold import CAM_AGE_ORDER
 from python.viz.monitors import place_opencv_window
 from python.viz.stage import STAGE_W, STAGE_H, VizUI, render_stage, smoke
@@ -643,6 +651,10 @@ def main() -> None:
             age_model = bool(getattr(scene_lane, "cam_age", False))
             if (age_model or args.cam_age_baseline) and scene_lane is not None and scene_guard.refused is None:
                 cam_age_log = True
+                # Per-camera read status / read ms and main_age_ms on the telemetry line.
+                enable_read_log = getattr(backend, "enable_read_log", None)
+                if callable(enable_read_log):
+                    enable_read_log()
                 if args.cam_age_baseline:
                     print("[GVD] cam-age: baseline, cam-age model OFF (hold off, telemetry only)", flush=True)
                 else:
@@ -1407,6 +1419,8 @@ def main() -> None:
                     prev_main_frame = main_now
                 timers = dict(getattr(scene_lane, "last_timers", None) or {})
                 planner_d = pout.planner if isinstance(pout.planner, dict) else {}
+                read_log = getattr(bundle, "read_log", None)
+                read_log = read_log if isinstance(read_log, dict) else {}
 
                 print(
                     f"[GVD] cam_age t={time.time():.3f} tick_ms={st['heartbeat_ms']:.2f} "
@@ -1420,7 +1434,9 @@ def main() -> None:
                     f"scene_ms={_ms_text(timers.get('scene_ms'))} post_ms={_ms_text(timers.get('post_ms'))} "
                     f"detect_ms={_ms_text(getattr(pout, 'detect_ms', None))} plan_ms={_ms_text(getattr(pout, 'plan_ms', None))} "
                     f"infer_ms={float(pout.infer_ms):.3f} aeb={planner_d.get('aeb', 'na')} "
-                    f"ages={ages_text(live_ages)}",
+                    f"grab_ms={_ms_text(getattr(bundle, 'grab_ms', None))} read_log_ms={_ms_text(read_log.get('log_ms'))} "
+                    f"main_age_ms={_ms_text(read_log.get('main_age_ms'))} "
+                    f"ages={ages_text(live_ages)} reads={reads_text(read_log or None)}",
                     flush=True,
                 )
             # Soft Esc: gvd_state.json at most once per Lua pollEvery (0.10).

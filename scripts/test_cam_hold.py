@@ -341,12 +341,23 @@ def check_report_helper() -> None:
         before = {p: p.stat().st_mtime_ns for p in root.rglob("*")}
         result = report(root, cams=tuple(STRIP_ORDER), holdout_blocks=1)
         assert sorted(result["black_pct"]) == ["holdout", "holdout_scored", "train"]
-        assert set(result["black_pct"]["train"]) == {"repeatL", "pillarL", "wide", "narrow", "pillarR", "repeatR", "rear"}
+        assert set(result["black_pct"]["train"]) == set(STRIP_ORDER)  # all 8, main included
+        assert result["black_pct"]["train"]["main"] == 0.0
         for name in ("train", "holdout"):
             assert result["black_pct"][name]["wide"] == 0.0 and result["black_pct"][name]["narrow"] == 0.0
         assert result["black_pct"]["train"]["pillarL"] > 0.0  # the 1.6 s pillarL gap
         assert result["train_age_s"]["repeatL"]["p95"] <= HOLD_CAP_S
         assert result["train_age_s"]["wide"]["median"] == 0.0
+        # Black counted at the cap (1.533 s): the pillarL gap pulls its capped p95 up to the cap;
+        # n is every train row, not only the held ones.
+        from python.data.cam_hold import BLACK_STAT_AGE_S, stat_age
+
+        assert abs(BLACK_STAT_AGE_S - 23 / 15) < 1e-12 and stat_age(-1.0) == BLACK_STAT_AGE_S and stat_age(None) == BLACK_STAT_AGE_S
+        assert stat_age(0.4) == 0.4
+        capped = result["train_age_capped_s"]
+        assert capped["pillarL"]["n"] == result["rows"]["train"] > result["train_age_s"]["pillarL"]["n"]
+        assert capped["pillarL"]["p95"] == round(BLACK_STAT_AGE_S, 4) > result["train_age_s"]["pillarL"]["p95"]
+        assert capped["wide"] == dict(result["train_age_s"]["wide"], n=result["rows"]["train"])
         assert result["rows"]["holdout"] > 0 and result["rows"]["train"] > 0
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -354,7 +365,8 @@ def check_report_helper() -> None:
         assert "train black %" in out.getvalue() and "repeatL" in out.getvalue()
         after = {p: p.stat().st_mtime_ns for p in root.rglob("*")}
         assert before == after, "the report wrote into the recording"
-    print("report: per-camera black % (train / holdout / scored) and train age median/p95, read-only OK")
+    print("report: per-camera black % (all 8; train / holdout / scored), train age median/p95 held-only and with "
+          "black at the 1.533 s cap, read-only OK")
 
 
 def _onnx_ready() -> bool:

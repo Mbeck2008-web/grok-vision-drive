@@ -7,8 +7,13 @@
   ticks (and on jittered ticks) gives the same ages within quantisation, and
   live's stored set and ages equal the recorder's storage decisions fed
   through the trainer's ``cam_hold.hold_plan``.
+* pass stamp: from fixed per-camera read offsets of 1 ms (recorder) vs 8 ms
+  (live), the hold decisions (stored frame or black per side camera per
+  tick) are identical; raw 8 ms stamps (capture v2) are not.
 * the BeamNG grab streams all 8 cameras every tick and never sends an ad-hoc
-  request; the default grab has no ages.
+  request; the default grab has no ages. With ``enable_read_log`` every
+  grab carries per-camera read status (ok / none / zero / flash_filtered /
+  reattach ...), read ms, main_age_ms and the log's own cost.
 * a respawn / reset drops every held side frame: side cameras are black / -1
   until a frame stored after it.
 * reset detection: a 0.8 g stop never fires; an in-place reset (11 -> 0.27
@@ -120,32 +125,115 @@ def _ticks(period: float, seconds: float, *, jitter: float = 0.0, seed: int = 0)
     return out
 
 
-def _run(tick_times: list[float], *, mono0: float = 5000.0, wall0: float = 1.7e9) -> dict:
+# The recorder's read order (config/cameras.yaml: narrow, main, wide, sides, rear)
+# and live's (main first).
+REC_ORDER = ("narrow", "main", "wide", "pillarL", "pillarR", "repeatL", "repeatR", "rear")
+LIVE_ORDER = ("main",) + tuple(c for c in REC_ORDER if c != "main")
+
+
+def _walls(base: float, order: tuple[str, ...], read_s: float) -> dict[str, float]:
+    """Wall stamp right after each read: ``read_s`` per camera, in ``order``."""
+    return {cam: base + read_s * (k + 1) for k, cam in enumerate(order)}
+
+
+def _run(
+    tick_times: list[float],
+    *,
+    mono0: float = 5000.0,
+    wall0: float = 1.7e9,
+    rec_read_s: float = 0.0005,
+    live_read_s: float = 0.0005,
+    raw_stamps: bool = False,
+) -> dict:
     """Live (LiveStreamHold) and the recorder (CameraSchedule -> stored rows -> cam_hold.hold_plan) on the same ticks.
 
-    Every camera's read on a tick has wall stamp ``wall0 + t + k * 0.5 ms`` (main first),
-    the monotonic clock is ``mono0 + t + 4 ms`` after the reads, like the recorder.
+    Recorder reads take ``rec_read_s`` per camera in the recorder's order, live
+    reads ``live_read_s`` in live's order (main first); the monotonic clock is
+    read after the last read, like the recorder. ``raw_stamps``: live without
+    ``pass_stamp`` (the capture v2 behaviour).
     """
     live = LiveStreamHold()
     rec = recorder_schedule()
-    rows, live_ages, live_taken, nows = [], [], [], []
-    for i, t in enumerate(tick_times):
-        walls = {cam: wall0 + t + 0.0005 * k for k, cam in enumerate(("main",) + tuple(c for c in ALL if c != "main"))}
-        frames = {cam: ("px", cam, i) for cam in ALL}
-        mono = mono0 + t + 0.004
-        held, ages = live.step(frames, walls, mono)
-        live_ages.append(np.asarray(ages, dtype=np.float64))
-        live_taken.append(set(live.last_taken))
-        nows.append(walls["main"])
-        # The recorder: read all 8, tick(mono, list(frames)), store the due ones with cams.<cam>.t = wall.
-        due = rec.tick(mono, list(frames))
-        rows.append({"i": i, "t": round(walls["main"], 6), "dt_s": None if i == 0 else 0.1, "segment": 0, "session": "s",
-                     "cams": {cam: {"t": walls[cam]} for cam in due}})
-        for cam in FRONT_CAMS:
-            assert held.get(cam) == frames[cam]  # fronts are this tick's read at age 0
+    saved = live_hold.pass_stamp
+    if raw_stamps:
+        live_hold.pass_stamp = lambda wall, now_t: wall
+    rows, live_ages, live_taken, live_src, nows = [], [], [], [], []
+    try:
+        for i, t in enumerate(tick_times):
+            walls = _walls(wall0 + t, LIVE_ORDER, live_read_s)
+            rec_walls = _walls(wall0 + t, REC_ORDER, rec_read_s)
+            frames = {cam: ("px", cam, i) for cam in ALL}
+            # Same clock reading for both (the schedule's decision is not under test here).
+            mono = mono0 + t + 8 * max(rec_read_s, live_read_s) + 0.001
+            held, ages = live.step(frames, walls, mono)
+            live_ages.append(np.asarray(ages, dtype=np.float64))
+            live_taken.append(set(live.last_taken))
+            live_src.append({cam: (held[cam][2] if cam in held else None) for cam in ALL})
+            nows.append(walls["main"])
+            # The recorder: read all 8, tick(mono, list(frames)), store the due ones with cams.<cam>.t = wall.
+            due = rec.tick(mono, list(frames))
+            rows.append({"i": i, "t": round(rec_walls["main"], 6), "dt_s": None if i == 0 else 0.1, "segment": 0,
+                         "session": "s", "cams": {cam: {"t": rec_walls[cam]} for cam in due}})
+            for cam in FRONT_CAMS:
+                assert held.get(cam) == frames[cam]  # fronts are this tick's read at age 0
+    finally:
+        live_hold.pass_stamp = saved
     plan = hold_plan(rows)
     train_ages = [np.asarray([plan[i][cam][1] for cam in ALL], dtype=np.float64) for i in range(len(rows))]
-    return {"live": live_ages, "train": train_ages, "taken": live_taken, "rows": rows, "now": nows, "wall0": wall0}
+    train_src = [{cam: plan[i][cam][0] for cam in ALL} for i in range(len(rows))]
+    return {"live": live_ages, "train": train_ages, "taken": live_taken, "rows": rows, "now": nows, "wall0": wall0,
+            "live_src": live_src, "train_src": train_src}
+
+
+def _decisions(got: dict, skip: int = 0) -> tuple[int, int, int, int]:
+    """(side sectors compared, frame-source mismatches, black mismatches, ages more than one tick apart)."""
+    n = src = black = far = 0
+    for i in range(skip, len(got["rows"])):
+        for cam in SIDE_CAMS:
+            k = ALL.index(cam)
+            n += 1
+            src += got["live_src"][i][cam] != got["train_src"][i][cam]
+            black += (got["live"][i][k] < 0) != (got["train"][i][k] < 0)
+            far += abs(got["live"][i][k] - got["train"][i][k]) > HOLD_TICK_S + 1e-6
+    return n, src, black, far
+
+
+def check_pass_stamp() -> None:
+    """Capture v2: live companions read ~8 ms each after main land 31-88 ms after ``now``.
+
+    The recorder (~1 ms each) lands inside held_sector's half-tick allowance;
+    ``pass_stamp`` makes the per-camera read time irrelevant: from fixed
+    offsets of 1 ms (recorder) vs 8 ms (live) per camera the hold decisions
+    (which stored frame or black, per side camera per tick) are identical.
+    """
+    assert live_hold.pass_stamp(10.05, 10.0) == 10.0 and live_hold.pass_stamp(9.9, 10.0) == 9.9
+    assert live_hold.pass_stamp(10.05, None) == 10.05 and live_hold.pass_stamp(None, 10.0) is None
+    out = {}
+    for name, ticks in (
+        ("185ms", _ticks(0.185, 60.0)),
+        ("jitter185", _ticks(0.185, 60.0, jitter=0.3, seed=5)),
+        ("310ms", _ticks(0.310, 60.0)),
+        ("66.7ms", _ticks(1.0 / 15.0, 30.0, jitter=0.1, seed=2)),
+    ):
+        got = _run(ticks, rec_read_s=0.001, live_read_s=0.008)
+        n, src, black, far = _decisions(got)
+        assert src == 0 and black == 0 and far == 0, (name, n, src, black, far)
+        diff = sum(
+            1 for i in range(len(got["rows"])) for cam in SIDE_CAMS
+            if abs(got["live"][i][ALL.index(cam)] - got["train"][i][ALL.index(cam)]) > 1e-6
+        )
+        same_live = _run(ticks, rec_read_s=0.001, live_read_s=0.001)
+        same_8 = _run(ticks, rec_read_s=0.001, live_read_s=0.008)
+        assert all(np.array_equal(a, b) for a, b in zip(same_live["live"], same_8["live"]))  # read time irrelevant live
+        assert same_live["live_src"] == same_8["live_src"]
+        raw = _run(ticks, rec_read_s=0.001, live_read_s=0.008, raw_stamps=True)
+        _n, raw_src, raw_black, _far = _decisions(raw)
+        assert raw_black > 0 and raw_src > 0, (name, raw_black)
+        out[name] = (n, diff, raw_black)
+    print("pass stamp: 1 ms (recorder) vs 8 ms (live) per-camera reads give identical hold decisions (stored frame / "
+          "black per side camera per tick), live ages identical for 1 vs 8 ms reads; ages within one 1/15 s tick of "
+          "the recorder's (sectors / age differs by one tick / raw-stamp black mismatches: "
+          + ", ".join(f"{k} {v[0]}/{v[1]}/{v[2]}" for k, v in out.items()) + ") OK")
 
 
 def _grid_age(cam: str, now_rel: float, lead: float) -> float:
@@ -172,7 +260,8 @@ def check_wall_time_ages() -> None:
         # 1) the recorder's storage decisions and the trainer's ages, exactly.
         for i, row in enumerate(got["rows"]):
             assert got["taken"][i] == set(row["cams"]), (name, i)
-            assert np.allclose(got["live"][i], got["train"][i]), (name, i, got["live"][i], got["train"][i])
+        _n, src, black, far = _decisions(got)
+        assert src == 0 and black == 0 and far == 0, (name, src, black, far)
         # 2) a function of wall time, not of the tick count: within half a tick + quantisation of the grid age.
         worst = 0.0
         for i, t in enumerate(ticks):
@@ -191,7 +280,8 @@ def check_wall_time_ages() -> None:
                 worst = max(worst, abs(age - want) - half)
                 assert abs(age - want) <= half + q, (name, cam, t, age, want)
         results[name] = got
-        print(f"wall time {name}: {len(ticks)} ticks, live stored set == recorder's, ages == trainer hold_plan, "
+        print(f"wall time {name}: {len(ticks)} ticks, live stored set == recorder's, hold decisions == trainer hold_plan "
+              f"(ages within a tick), "
               f"|age - grid age| <= half tick + 1/30 s (worst excess {max(0.0, worst) * 1000:.1f} ms) OK")
     # 3) Sampled distributions. Pointwise the age is the wall-time grid age within half
     # a tick (2); the recorder's nearest-tick rounding serves a phase up to half a tick
@@ -239,6 +329,77 @@ def check_backend_streams() -> None:
     assert all(c.streams == n + 5 for c in cams.values()), {k: c.streams for k, c in cams.items()}
     be.close()
     print(f"backend: all 8 cameras streamed on each of {n + 5} grabs, 0 ad-hoc calls; held sides carry ages OK")
+
+
+class SlowCam(FakeCam):
+    """A companion read that takes ``delay`` s (capture v2: ~8 ms per camera live)."""
+
+    def __init__(self, name: str, delay: float, mode: str = "ok") -> None:
+        super().__init__(name)
+        self.delay = delay
+        self.mode = mode
+
+    def stream_raw(self):
+        self.streams += 1
+        time.sleep(self.delay)
+        if self.mode == "none":
+            return None
+        if self.mode == "zero":
+            return {"colour": np.zeros_like(PIX)}
+        return {"colour": PIX.copy()}
+
+
+def check_backend_read_log() -> None:
+    from python.sensors.live_hold import parse_reads_text, reads_text
+
+    # Off by default: no read log on the bundle.
+    be = _backend({cid: FakeCam(cid) for cid in ALL})
+    assert be.grab().read_log is None
+    be.close()
+    # 8 ms per read: the companions land 8-56 ms after main's stamp. Side cameras are
+    # not black on the tick that stores them (pass_stamp), main_age_ms shows the spread.
+    cams = {cid: SlowCam(cid, 0.008) for cid in ALL}
+    cams["narrow"].mode = "zero"
+    cams["wide"].mode = "none"
+    be = _backend(cams)
+    be.enable_live_hold()
+    be.enable_read_log()
+    stored_black = 0
+    stored = 0
+    for _k in range(25):
+        bundle = be.grab()
+        log = bundle.read_log
+        assert log is not None and set(log["status"]) == set(ALL), log
+        assert log["status"]["main"] == "ok" and log["status"]["narrow"] == "zero" and log["status"]["wide"] == "none"
+        assert all(log["read_ms"][c] >= 7.0 for c in ALL), log["read_ms"]
+        assert log["main_age_ms"] >= 7 * 7.0 and log["log_ms"] >= 0.0
+        ages = dict(zip(ALL, bundle.cam_ages))
+        assert ages["narrow"] == -1.0 and ages["wide"] == -1.0 and ages["main"] == 0.0
+        for cam in be._live_hold.last_taken:
+            if cam in SIDE_CAMS:
+                stored += 1
+                stored_black += ages[cam] != 0.0
+        text = reads_text(log)
+        assert parse_reads_text(text)["narrow"][0] == "zero" and len(parse_reads_text(text)) == 8
+        time.sleep(0.05)
+    assert stored > 0 and stored_black == 0, (stored, stored_black)
+    # A reattached camera reports "reattach" on its first read.
+    be._reattached.add("pillarL")
+    log = be.grab().read_log
+    assert log["status"]["pillarL"] == "reattach" and "pillarL" not in be._reattached
+    # A flashed companion is filtered: brighter and blue in the shadows than its last frame.
+    from python.sensors import cameras as cam_mod
+
+    saved = cam_mod.companion_frame_is_flash
+    cam_mod.companion_frame_is_flash = lambda new, held: True
+    try:
+        log = be.grab().read_log
+    finally:
+        cam_mod.companion_frame_is_flash = saved
+    assert log["status"]["pillarR"] == "flash_filtered" and log["status"]["main"] == "ok"
+    be.close()
+    print(f"read log: per-camera ok / none / zero / flash_filtered / reattach and read ms behind enable_read_log; "
+          f"8 ms reads: {stored} stored side frames, 0 black on their storing tick; main_age_ms >= 49 ms OK")
 
 
 def check_respawn_reset() -> None:
@@ -408,7 +569,10 @@ def check_runtime_gate() -> None:
 
 def _capture_lines(*, hold: bool, n: int = 900, flash_every: int = 0, jump_every: int = 0, skip_at: int = -1,
                    dt_hi: bool = False, scene_hi: bool = False, engaged_at: int = -1, untrained: bool = True,
-                   stale_at: tuple[int, ...] = (), no_detect_at: int = -1, detector: str = "yolov8n-onnx") -> list[str]:
+                   stale_at: tuple[int, ...] = (), no_detect_at: int = -1, detector: str = "yolov8n-onnx",
+                   black: dict | None = None) -> list[str]:
+    """Synthetic run_vision cam-age log. ``black``: {cam: every} -> that camera is black (-1) on every n-th tick."""
+    black = dict(black or {})
     rng = np.random.RandomState(0)
     lines = [
         f"[GVD] cam-age model gvd_cam_age={1 if hold else 0} cams={8 if hold else 1} capture_untrained={int(untrained) if hold else 0} "
@@ -418,8 +582,12 @@ def _capture_lines(*, hold: bool, n: int = 900, flash_every: int = 0, jump_every
     ]
     for k in range(n):
         ages = ",".join(
-            f"{cam}:0.000" if cam in FRONT_CAMS else (f"{cam}:{(k % 8) / 15.0:.3f}" if hold else f"{cam}:-1")
+            f"{cam}:-1" if black.get(cam) and k % black[cam] == 0
+            else (f"{cam}:0.000" if cam in FRONT_CAMS else (f"{cam}:{(k % 8) / 15.0:.3f}" if hold else f"{cam}:-1"))
             for cam in CAM_AGE_ORDER
+        )
+        reads = ",".join(
+            f"{cam}:{'zero' if black.get(cam) and k % black[cam] == 0 else 'ok'}:{7 + rng.rand():.2f}" for cam in CAM_AGE_ORDER
         )
         luma = 0.4 + (0.2 if jump_every and k % jump_every == 0 else 0.0)
         flash = int(bool(flash_every) and k % flash_every == 0)
@@ -431,26 +599,54 @@ def _capture_lines(*, hold: bool, n: int = 900, flash_every: int = 0, jump_every
             f"baseline={int(not hold)} engaged={int(k >= engaged_at >= 0)} engage_disabled=1 would_skip={int(k == skip_at)} "
             f"stale_ego={int(k in stale_at)} stale_ego_n=0 reset_n=0 main_luma={luma:.4f} main_flash={flash} "
             f"compose_ms=1.200 prep_ms=2.000 scene_ms={scene:.3f} post_ms=0.300 detect_ms={det} plan_ms=1.500 "
-            f"infer_ms=12.000 aeb=off ages={ages}"
+            f"infer_ms=12.000 aeb=off grab_ms={60 + rng.rand():.3f} read_log_ms=0.020 main_age_ms={56 + rng.rand():.3f} "
+            f"ages={ages} reads={reads}"
         )
     return lines
 
 
 def check_capture_script() -> None:
-    from live_age_capture import DT_P50_MAX_MS, DT_P95_MAX_MS, grade, parse_log, table
+    from live_age_capture import DT_P50_MAX_MS, DT_P95_MAX_MS, grade as grade_raw, parse_log, table
 
     assert (DT_P50_MAX_MS, DT_P95_MAX_MS) == (162.0, 215.0)
     train = {cam: {"median": 0.2, "p95": 0.467} for cam in CAM_AGE_ORDER if cam != "main"}
     for cam in ("narrow", "wide"):
         train[cam] = {"median": 0.0, "p95": 0.067}
+    train_black = {cam: 0.0 for cam in CAM_AGE_ORDER}
     base = parse_log(_capture_lines(hold=False, flash_every=100, jump_every=100))
     on = parse_log(_capture_lines(hold=True, flash_every=100, jump_every=100))
+    grade = functools.partial(grade_raw, train_black=train_black, black_tol_pp=5.0)
     result = grade(on, base, train)
     assert result["pass"], table(result)
     names = set(result["bars"])
-    assert names == {"model", "engage_off", "mode", "duration", "compute", "ages", "loop_dt", "scene_ms",
+    assert names == {"model", "engage_off", "mode", "duration", "compute", "ages", "black_share", "loop_dt", "scene_ms",
                      "would_skip", "stale_ego", "main_flash", "main_luma_jump"}, names
     assert "OVERALL PASS" in table(result)
+    assert result["reads"]["on"]["narrow"]["status"] == {"ok": 900} and result["timers"]["on"]["main_age_ms"]["n"] == 900
+    assert result["timers"]["on"]["read_log_ms"]["p50"] == 0.02 and " main[ok:900 ms " in table(result)
+    # black_share UNSET without a tolerance: every other bar passes, the grade does not.
+    unset = grade_raw(on, base, train, train_black=train_black)
+    assert not unset["pass"] and unset["unset"] == ["black_share"] and not unset["bars"]["black_share"]["pass"]
+    assert [n for n, b in unset["bars"].items() if not b["pass"]] == ["black_share"]
+    assert "UNSET black_share" in table(unset) and "OVERALL FAIL (UNSET: black_share)" in table(unset)
+    # Black at the cap, both sides: pillarL black on 1 tick in 3 live; its held ages alone still match.
+    from python.data.cam_hold import BLACK_STAT_AGE_S
+
+    holes = parse_log(_capture_lines(hold=True, black={"pillarL": 3}, **dict(flash_every=100, jump_every=100)))
+    got = grade(holes, base, train, train_black=dict(train_black, pillarL=33.0))
+    row = got["bars"]["ages"]["cams"]["pillarL"]
+    held = [v for v in holes["ages"]["pillarL"] if v >= 0]
+    assert abs(float(np.median(held)) - 0.2) <= HOLD_TICK_S  # dropping black would have passed
+    assert row["live_p95"] == BLACK_STAT_AGE_S and not row["pass"] and not got["bars"]["ages"]["pass"], row
+    assert row["live_n"] == 900 and row["live_held_n"] == 600 and got["bars"]["black_share"]["pass"]
+    # The same holes on the train side (capped p95 at the cap) match.
+    train_holes = dict(train, pillarL={"median": 0.267, "p95": round(BLACK_STAT_AGE_S, 4)})
+    assert grade(holes, base, train_holes, train_black=dict(train_black, pillarL=33.0))["pass"]
+    # black_share: narrow black on 4 ticks in 5 live (capture v2's 80.5 %) vs 0 % in training.
+    v2 = parse_log(_capture_lines(hold=True, black={"narrow": 1, "main": 0}, **dict(flash_every=100, jump_every=100)))
+    v2b = grade(v2, base, train)
+    assert not v2b["bars"]["black_share"]["pass"] and v2b["bars"]["black_share"]["cams"]["narrow"]["diff_pp"] == 100.0
+    assert v2b["reads"]["on"]["narrow"]["status"] == {"zero": 900}
     good = dict(flash_every=100, jump_every=100)
     failures = {
         "ages": (dict(hold=True, **good), {cam: {"median": 0.6, "p95": 0.9} for cam in train}),
@@ -462,8 +658,10 @@ def check_capture_script() -> None:
         "model": (dict(hold=True, untrained=False, **good), train),
         "compute": (dict(hold=True, no_detect_at=17, **good), train),
     }
+    failures["black_share"] = (dict(hold=True, **good), train)
     for bar, (kw, tr) in failures.items():
-        got = grade(parse_log(_capture_lines(**kw)), base, tr)
+        extra = {"train_black": dict(train_black, rear=40.0)} if bar == "black_share" else {}
+        got = grade(parse_log(_capture_lines(**kw)), base, tr, **extra)
         assert not got["pass"] and not got["bars"][bar]["pass"], (bar, table(got))
         others = [name for name, b in got["bars"].items() if not b["pass"] and name != bar]
         assert not others, (bar, others)
@@ -477,7 +675,35 @@ def check_capture_script() -> None:
     assert not grade(on, on, train)["bars"]["mode"]["pass"]
     assert not grade(parse_log(_capture_lines(hold=True, n=300, **good)), base, train)["bars"]["duration"]["pass"]
     assert grade(parse_log(_capture_lines(hold=True, dt_hi=True, **good)), base, train, dt_p50_ms=300, dt_p95_ms=400)["pass"]
-    print(f"live_age_capture: {len(names)} bars PASS on a good pair; each FAILs alone on its fault; dt bars 162 / 215 ms OK")
+    check_capture_cli(train, train_black)
+    print(f"live_age_capture: {len(names)} bars PASS on a good pair; each FAILs alone on its fault; dt bars 162 / 215 ms; "
+          "black counted at the 1.533 s cap on both sides; black_share UNSET without --black-share-tol; reads reported OK")
+
+
+def check_capture_cli(train: dict, train_black: dict) -> None:
+    import json
+
+    from live_age_capture import main as capture_main
+
+    with tempfile.TemporaryDirectory() as tmp:
+        on_log, base_log, tj, old_tj = (Path(tmp) / n for n in ("on.log", "base.log", "train.json", "old.json"))
+        on_log.write_text("\n".join(_capture_lines(hold=True, flash_every=100, jump_every=100)), encoding="utf-8")
+        base_log.write_text("\n".join(_capture_lines(hold=False, flash_every=100, jump_every=100)), encoding="utf-8")
+        tj.write_text(json.dumps({"train_age_capped_s": train, "black_pct": {"train": train_black}}), encoding="utf-8")
+        old_tj.write_text(json.dumps({"train_age_s": train, "black_pct": {"train": train_black}}), encoding="utf-8")
+        args = ["--log", str(on_log), "--baseline-log", str(base_log), "--train-json"]
+        out = io.StringIO()
+        with redirect_stdout(out):
+            assert capture_main(args + [str(tj), "--black-share-tol", "5"]) == 0
+            assert capture_main(args + [str(tj)]) == 1  # UNSET
+            assert capture_main(args + [str(tj), "--black-share-tol", "5", "--train-black-pct", "rear=40"]) == 1
+        assert "OVERALL FAIL (UNSET: black_share)" in out.getvalue()
+        try:
+            capture_main(args + [str(old_tj), "--black-share-tol", "5"])
+        except SystemExit as exc:
+            assert "train_age_capped_s" in str(exc)
+        else:
+            raise AssertionError("an old train JSON (held-only ages) must be refused")
 
 
 def check_telemetry_helpers() -> None:
@@ -519,7 +745,9 @@ def check_perception_timers() -> None:
 def main() -> None:
     check_recorder_schedule()
     check_wall_time_ages()
+    check_pass_stamp()
     check_backend_streams()
+    check_backend_read_log()
     check_respawn_reset()
     check_reset_detection()
     check_stale_ego()

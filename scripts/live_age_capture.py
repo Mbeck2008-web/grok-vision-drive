@@ -25,6 +25,14 @@ PASS / FAIL:
   gates actuation only.
 * ages: per side camera, live median within 1 tick (1/15 s) and p95 within
   2 ticks of the training ages on the recording the model would train on.
+  Black sectors count at the cap, 1.533 s (``cam_hold.BLACK_STAT_AGE_S``), on
+  BOTH sides (live ``-1`` ages; training ``train_age_capped_s``): a black
+  tick is never dropped before the median / p95.
+* black_share: per camera (all 8), the ON log's black share (age -1) within
+  ``--black-share-tol`` percentage points of the training black share
+  (``black_pct.train`` of the train JSON, or ``--train-black-pct``). The
+  tolerance has no default: without it the bar is UNSET and the grade is not
+  a PASS.
 * loop_dt: ON ``loop_dt_ms`` p50 <= ``--dt-p50`` and p95 <= ``--dt-p95``
   (the training row-gap bars; pre-registered 162 / 215 ms).
 * scene_ms: ON ``scene_ms`` (onnxruntime session.run) p95 <= 185 ms.
@@ -39,8 +47,14 @@ PASS / FAIL:
 Training ages come from ``--train-json`` (``cam_hold_report.py --json``) or
 from ``--strips`` plus the report's selection arguments, read-only.
 
+Reported, not graded: per-camera read status counts (ok / none / zero /
+flash_filtered / reattach / busy / timeout / error / skip) and read ms,
+``main_age_ms`` (wall time after the pass's last read minus main's stamp),
+``grab_ms`` and the read-log cost ``read_log_ms``.
+
     py -3 scripts/live_age_capture.py --log <ON_LOG> --baseline-log <BASELINE_LOG> ^
-        --strips <RECORDING> --holdout-blocks 1 --mask-files <MASK_JSONL>
+        --strips <RECORDING> --holdout-blocks 1 --mask-files <MASK_JSONL> ^
+        --black-share-tol <PP>
 """
 from __future__ import annotations
 
@@ -58,8 +72,8 @@ for path in (str(ROOT), str(ROOT / "scripts")):
 
 import numpy as np  # noqa: E402
 
-from python.data.cam_hold import CAM_AGE_ORDER, HOLD_TICK_S, NEVER_HELD  # noqa: E402
-from python.sensors.live_hold import parse_ages_text  # noqa: E402
+from python.data.cam_hold import BLACK_STAT_AGE_S, CAM_AGE_ORDER, HOLD_TICK_S, NEVER_HELD, stat_age  # noqa: E402
+from python.sensors.live_hold import parse_ages_text, parse_reads_text  # noqa: E402
 
 MEDIAN_TOL_S = 1.0 * HOLD_TICK_S
 P95_TOL_S = 2.0 * HOLD_TICK_S
@@ -71,7 +85,10 @@ STALE_EGO_MAX_RUN = 1
 MIN_SPAN_S = 55.0
 LUMA_JUMP = 0.05  # mean main luminance (0..1) change between consecutive ticks counted as a jump
 SIDE_CAMS = tuple(cam for cam in CAM_AGE_ORDER if cam not in NEVER_HELD)
-TIMERS = ("compose_ms", "prep_ms", "scene_ms", "post_ms", "detect_ms", "plan_ms", "infer_ms")
+TIMERS = (
+    "compose_ms", "prep_ms", "scene_ms", "post_ms", "detect_ms", "plan_ms", "infer_ms",
+    "grab_ms", "read_log_ms", "main_age_ms",
+)
 _LINE = re.compile(r"\[GVD\] cam_age (?P<body>.*)$")
 _MODEL = re.compile(r"\[GVD\] cam-age model (?P<body>.*)$")
 _PROVIDERS = re.compile(r"\[GVD\] cam-age providers (?P<body>.*)$")
@@ -125,6 +142,7 @@ def parse_log(lines: Iterable[str]) -> dict[str, Any]:
             "main_flash": kv.get("main_flash"),
             "aeb": kv.get("aeb"),
             "ages": parse_ages_text(kv["ages"]),
+            "reads": parse_reads_text(kv.get("reads", "")),
         }
         for key in TIMERS:
             tick[key] = _num(kv.get(key))
@@ -138,14 +156,18 @@ def _stat(values: list[float], q: float) -> float | None:
 
 
 def compare_ages(live: dict[str, Any], train_age_s: dict[str, Any]) -> dict[str, Any]:
-    """Per side camera: live held-age median / p95 vs training."""
+    """Per side camera: live age median / p95 vs training, black counted at the cap on both sides.
+
+    ``train_age_s``: the report's ``train_age_capped_s`` (black at 1.533 s).
+    """
     out: dict[str, Any] = {}
     all_ok = True
     for cam in SIDE_CAMS:
         values = live["ages"].get(cam) or []
         held = [v for v in values if v >= 0.0]
+        capped = [stat_age(v) for v in values]
         train = train_age_s.get(cam) or {}
-        live_med, live_p95 = _stat(held, 50), _stat(held, 95)
+        live_med, live_p95 = _stat(capped, 50), _stat(capped, 95)
         tr_med, tr_p95 = train.get("median"), train.get("p95")
         ok = (
             live_med is not None
@@ -157,7 +179,8 @@ def compare_ages(live: dict[str, Any], train_age_s: dict[str, Any]) -> dict[str,
         )
         all_ok = all_ok and ok
         out[cam] = {
-            "live_n": len(held),
+            "live_n": len(values),
+            "live_held_n": len(held),
             "live_black_pct": None if not values else round(100.0 * (len(values) - len(held)) / len(values), 2),
             "live_median": live_med,
             "live_p95": live_p95,
@@ -166,6 +189,53 @@ def compare_ages(live: dict[str, Any], train_age_s: dict[str, Any]) -> dict[str,
             "pass": bool(ok),
         }
     return {"pass": all_ok, "cams": out}
+
+
+def black_shares(ticks: list[dict[str, Any]]) -> dict[str, float | None]:
+    """Per camera (all 8): percent of ticks whose age is black (-1 or missing)."""
+    out: dict[str, float | None] = {}
+    for cam in CAM_AGE_ORDER:
+        values = [t["ages"].get(cam) for t in ticks]
+        out[cam] = None if not values else round(100.0 * sum(1 for v in values if v is None or v < 0.0) / len(values), 2)
+    return out
+
+
+def black_share_bar(
+    live: dict[str, float | None], train_black: dict[str, Any], tol_pp: float | None
+) -> dict[str, Any]:
+    """|live - train| black share <= ``tol_pp`` per camera. ``tol_pp`` None: UNSET, never a PASS."""
+    cams: dict[str, Any] = {}
+    ok_all = True
+    for cam in CAM_AGE_ORDER:
+        lv, tv = live.get(cam), train_black.get(cam)
+        diff = None if lv is None or tv is None else round(float(lv) - float(tv), 2)
+        ok = tol_pp is not None and diff is not None and abs(diff) <= float(tol_pp) + 1e-9
+        ok_all = ok_all and ok
+        cams[cam] = {"live_pct": lv, "train_pct": tv, "diff_pp": diff, "pass": bool(ok)}
+    unset = tol_pp is None
+    detail = (
+        "UNSET: --black-share-tol not given (no pre-registered tolerance); live vs train black % per camera reported"
+        if unset
+        else f"|live - train| black share <= {float(tol_pp):g} pp per camera"
+    )
+    return {"pass": bool(ok_all and not unset), "unset": unset, "detail": detail, "cams": cams}
+
+
+def read_summary(ticks: list[dict[str, Any]]) -> dict[str, Any]:
+    """Per camera: read status counts and read-ms p50 / p95 (cam-age telemetry ``reads=``)."""
+    out: dict[str, Any] = {}
+    for cam in CAM_AGE_ORDER:
+        counts: dict[str, int] = {}
+        ms = []
+        for t in ticks:
+            got = (t.get("reads") or {}).get(cam)
+            if got is None:
+                continue
+            counts[got[0]] = counts.get(got[0], 0) + 1
+            if got[1] is not None:
+                ms.append(got[1])
+        out[cam] = {"status": counts, "read_ms_p50": _stat(ms, 50), "read_ms_p95": _stat(ms, 95)}
+    return out
 
 
 def exposure(ticks: list[dict[str, Any]], luma_jump: float = LUMA_JUMP) -> dict[str, Any]:
@@ -237,6 +307,8 @@ def grade(
     base: dict[str, Any],
     train_age_s: dict[str, Any],
     *,
+    train_black: dict[str, Any] | None = None,
+    black_tol_pp: float | None = None,
     dt_p50_ms: float = DT_P50_MAX_MS,
     dt_p95_ms: float = DT_P95_MAX_MS,
     scene_p95_ms: float = SCENE_P95_MAX_MS,
@@ -287,9 +359,11 @@ def grade(
     ages = compare_ages(on, train_age_s)
     bars["ages"] = {
         "pass": ages["pass"],
-        "detail": f"median within {MEDIAN_TOL_S * 1000:.0f} ms, p95 within {P95_TOL_S * 1000:.0f} ms",
+        "detail": f"median within {MEDIAN_TOL_S * 1000:.0f} ms, p95 within {P95_TOL_S * 1000:.0f} ms; "
+        f"black counted at {BLACK_STAT_AGE_S:.3f} s on both sides",
         "cams": ages["cams"],
     }
+    bars["black_share"] = black_share_bar(black_shares(on["ticks"]), dict(train_black or {}), black_tol_pp)
     dts = [t["loop_dt_ms"] for t in on["ticks"] if t["loop_dt_ms"] is not None]
     dt50, dt95 = _stat(dts, 50), _stat(dts, 95)
     bars["loop_dt"] = {
@@ -335,6 +409,8 @@ def grade(
         "providers": {"on": on.get("providers") or {}, "baseline": base.get("providers") or {}},
         "timers": {"on": timer_summary(on["ticks"]), "baseline": timer_summary(base["ticks"])},
         "exposure": {"on": ex_on, "baseline": ex_base},
+        "reads": {"on": read_summary(on["ticks"]), "baseline": read_summary(base["ticks"])},
+        "unset": [name for name, bar in bars.items() if bar.get("unset")],
     }
 
 
@@ -344,9 +420,18 @@ def table(result: dict[str, Any]) -> str:
 
     lines = []
     for name, bar in result["bars"].items():
-        lines.append(f"{'PASS' if bar['pass'] else 'FAIL'}  {name:<15} {bar['detail']}")
+        verdict = "UNSET" if bar.get("unset") else ("PASS" if bar["pass"] else "FAIL")
+        lines.append(f"{verdict:<5} {name:<15} {bar['detail']}")
+        if name == "black_share":
+            lines.append(f"      {'cam':<9}{'live black %':>14}{'train black %':>15}{'diff pp':>10}")
+            for cam, row in bar["cams"].items():
+                lines.append(
+                    f"      {cam:<9}{f(row['live_pct']):>14}{f(row['train_pct']):>15}{f(row['diff_pp']):>10}"
+                    + ("" if bar.get("unset") else f"  {'PASS' if row['pass'] else 'FAIL'}")
+                )
         if name == "ages":
-            lines.append(f"      {'cam':<9}{'live med':>10}{'train med':>11}{'live p95':>10}{'train p95':>11}{'live black %':>14}")
+            lines.append(f"      {'cam':<9}{'live med':>10}{'train med':>11}{'live p95':>10}{'train p95':>11}{'live black %':>14}"
+                         "  (black at the cap)")
             for cam, row in bar["cams"].items():
                 black = "n/a" if row["live_black_pct"] is None else f"{row['live_black_pct']:.2f}"
                 lines.append(
@@ -358,10 +443,31 @@ def table(result: dict[str, Any]) -> str:
         lines.append(
             f"timers {name}: " + " ".join(f"{k}={_fmt(v['p50'])}/{_fmt(v['p95'])}" for k, v in tm.items()) + " (p50/p95 ms)"
         )
+    for name in ("on", "baseline"):
+        parts = []
+        for cam, row in result["reads"][name].items():
+            if not row["status"]:
+                continue
+            st = "/".join(f"{k}:{v}" for k, v in sorted(row["status"].items()))
+            parts.append(f"{cam}[{st} ms {_fmt(row['read_ms_p50'])}/{_fmt(row['read_ms_p95'])}]")
+        lines.append(f"reads {name}: " + (" ".join(parts) if parts else "n/a"))
     lines.append(f"providers: {result['providers']}")
     lines.append(f"respawns / resets seen: {result['respawns']}")
-    lines.append(f"OVERALL {'PASS' if result['pass'] else 'FAIL'}")
+    unset = result.get("unset") or []
+    lines.append(f"OVERALL {'PASS' if result['pass'] else 'FAIL'}" + (f" (UNSET: {', '.join(unset)})" if unset else ""))
     return "\n".join(lines)
+
+
+def parse_black_pct(text: str) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for part in str(text or "").split(","):
+        if not part.strip():
+            continue
+        cam, _, raw = part.partition("=")
+        if cam.strip() not in CAM_AGE_ORDER:
+            raise SystemExit(f"--train-black-pct: unknown camera {cam.strip()!r}")
+        out[cam.strip()] = float(raw)
+    return out
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -372,6 +478,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dt-p95", type=float, default=DT_P95_MAX_MS, help="loop_dt p95 bar, ms (training row gap).")
     parser.add_argument("--scene-p95", type=float, default=SCENE_P95_MAX_MS, help="scene_ms p95 bar, ms.")
     parser.add_argument("--luma-jump", type=float, default=LUMA_JUMP, help="Mean-luminance jump threshold (0..1).")
+    parser.add_argument(
+        "--black-share-tol",
+        type=float,
+        default=None,
+        help="black_share bar: max |live - train| black share per camera, percentage points. No default: "
+        "without it the bar is UNSET and the grade is not a PASS.",
+    )
+    parser.add_argument(
+        "--train-black-pct",
+        default="",
+        help="Training black %% per camera, 'cam=pct,...' (e.g. from the rec5c report); overrides the train JSON's "
+        "black_pct.train for the cameras it names.",
+    )
     parser.add_argument("--train-json", type=Path, default=None, help="cam_hold_report.py --json output.")
     parser.add_argument("--strips", type=Path, default=None, help="Recording to compute the training ages from.")
     parser.add_argument("--cams", default="")
@@ -409,10 +528,19 @@ def main(argv: list[str] | None = None) -> int:
             logs[name] = parse_log(handle)
         if not logs[name]["ticks"]:
             raise SystemExit(f"{path}: no '[GVD] cam_age' lines")
+    capped = train.get("train_age_capped_s")
+    if not capped:
+        raise SystemExit(
+            "the train JSON has no train_age_capped_s (black at the cap): rerun scripts/cam_hold_report.py --json"
+        )
+    train_black = dict((train.get("black_pct") or {}).get("train") or {})
+    train_black.update(parse_black_pct(args.train_black_pct))
     result = grade(
         logs["on"],
         logs["baseline"],
-        train.get("train_age_s") or {},
+        capped,
+        train_black=train_black,
+        black_tol_pp=args.black_share_tol,
         dt_p50_ms=float(args.dt_p50),
         dt_p95_ms=float(args.dt_p95),
         scene_p95_ms=float(args.scene_p95),

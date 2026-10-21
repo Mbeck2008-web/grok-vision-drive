@@ -67,6 +67,18 @@ def quantise_age(age_s: float) -> float:
     return ticks / float(HOLD_TICK_HZ)
 
 
+# A black sector in age statistics: the first quantised age over the cap
+# (1.5 s is 22.5 ticks, rounds to 23 = 1.533 s). Live and train both count black
+# here, so a median / p95 never drops the black rows.
+BLACK_STAT_AGE_S = math.floor(HOLD_CAP_S * HOLD_TICK_HZ + 0.5) / float(HOLD_TICK_HZ)
+
+
+def stat_age(age: Any) -> float:
+    """An age for statistics: black (< 0, or None) counts as ``BLACK_STAT_AGE_S``."""
+    got = _finite(age)
+    return BLACK_STAT_AGE_S if got is None or got < 0.0 else got
+
+
 def held_sector(cam: str, frame_t: Any, frame: Any, now_t: Any) -> tuple[Any, float]:
     """``(sector frame or None, age)`` for one camera at ``now_t``.
 

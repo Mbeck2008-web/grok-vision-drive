@@ -39,6 +39,17 @@ class SceneInputShapeError(ValueError):
     """
 
 
+class SceneCamAgeError(SceneInputShapeError):
+    """The model's ``ages`` input and what this supervisor can feed disagree.
+
+    ``gvd_cam_age=1`` needs the 8 per-camera hold ages every tick. A runtime
+    that cannot feed them (``feeds_cam_age=False``, today's live path) refuses
+    the model at load, the same refusal as a strip-shape mismatch. A model
+    whose ``gvd_cam_age`` metadata disagrees with its graph inputs is refused
+    too. A model without the key (an older export) loads with no ages.
+    """
+
+
 def _base_name(name: str) -> str:
     """``h.1`` -> ``h``: the tracer renames pass-through state inputs."""
     return str(name).split(".", 1)[0]
@@ -111,12 +122,16 @@ class SceneLaneGuard:
             self.refused = str(exc)
             return None
 
-    def observe(self, runtime: Any, strip_bgr: Any, dt_s: float | None, *, engaged: bool) -> tuple[float | None, float]:
+    def observe(
+        self, runtime: Any, strip_bgr: Any, dt_s: float | None, *, engaged: bool, ages: Any = None
+    ) -> tuple[float | None, float]:
         if not engaged:
             self.hold = None
         if self.hold is not None:
             return None, 0.0
         try:
+            if ages is not None:
+                return runtime.observe(strip_bgr, dt_s, ages=ages)
             return runtime.observe(strip_bgr, dt_s)
         except SceneInputShapeError as exc:
             self.hold = str(exc)
@@ -142,8 +157,12 @@ class SceneLaneRuntime:
     # The only ONNX outputs this runtime reads. Each must be a trained head.
     READS = ("lane_gt",)
 
-    def __init__(self, path: Path | str | None = None) -> None:
+    def __init__(self, path: Path | str | None = None, *, feeds_cam_age: bool = False) -> None:
         self.path = Path(path) if path is not None else default_onnx_path()
+        # Whether the caller feeds the 8 per-camera hold ages each tick.
+        # run_vision does not (the BeamNG backend has no per-render id yet).
+        self.feeds_cam_age = bool(feeds_cam_age)
+        self.cam_age = False
         self.session: Any = None
         self.ready = False
         self.reason = "not loaded"
@@ -226,13 +245,46 @@ class SceneLaneRuntime:
                 setattr(self, key, np.full(shape, fill, dtype=np.float32))
         if "tokens" in inputs:
             self.token_dim = int(self.tokens.shape[-1])
+        from python.train.cam_strip import CamAgeFlagError, cam_age_flag
+
+        try:
+            wants_ages = cam_age_flag(meta)
+        except CamAgeFlagError as exc:
+            self.session = None
+            raise SceneCamAgeError(f"{self.path}: {exc}") from exc
+        has_ages = "ages" in inputs
+        if wants_ages != has_ages:
+            self.session = None
+            raise SceneCamAgeError(
+                f"{self.path}: gvd_cam_age={int(wants_ages)} but the graph "
+                f"{'has' if has_ages else 'has no'} 'ages' input; re-export"
+            )
+        if wants_ages and not self.feeds_cam_age:
+            self.session = None
+            raise SceneCamAgeError(
+                f"{self.path}: gvd_cam_age=1 (trained with --cam-age) needs the 8 per-camera hold ages; "
+                "this supervisor does not feed them. Use a model trained without --cam-age."
+            )
+        self.cam_age = wants_ages
         self.ready = True
         self.reason = "ok"
 
-    def observe(self, strip_bgr: Any, dt_s: float | None) -> tuple[float | None, float]:
-        """Return ``(lane_x at 8 m, confidence)``. A cold runtime is confidence 0."""
+    def observe(self, strip_bgr: Any, dt_s: float | None, ages: Any = None) -> tuple[float | None, float]:
+        """Return ``(lane_x at 8 m, confidence)``. A cold runtime is confidence 0.
+
+        ``ages``: 8 floats (``cam_hold.CAM_AGE_ORDER``) for a ``gvd_cam_age=1``
+        model; ignored by an older one.
+        """
         if not self.ready or self.session is None or strip_bgr is None:
             return None, 0.0
+        age_feed = None
+        if self.cam_age:
+            from python.data.cam_hold import CAM_AGE_N
+
+            arr = None if ages is None else np.asarray(ages, dtype=np.float32).reshape(-1)
+            if arr is None or arr.size != CAM_AGE_N:
+                raise SceneCamAgeError(f"this model needs {CAM_AGE_N} per-camera ages, got {None if arr is None else arr.size}")
+            age_feed = arr.reshape(1, CAM_AGE_N)
         from python.train.cam_strip import prepare_model_strip
 
         prepared = prepare_model_strip(np.asarray(strip_bgr), self.cams, self.canvas_w)
@@ -252,6 +304,8 @@ class SceneLaneRuntime:
             "tokens": self.tokens,
             "mask": self.mask,
         }
+        if age_feed is not None:
+            feeds["ages"] = age_feed
         feeds = {name: feeds[_base_name(name)] for name in self._input_names if _base_name(name) in feeds}
         try:
             outputs = self.session.run(None, feeds)

@@ -7,8 +7,12 @@
   written, and a training run with an impossible floor logs the refusal and still
   finishes every val.
 * round trip: a tiny CPU run writes one checkpoint per val row; each is exported
-  to ONNX and scored offline on the same holdout. rms must match the logged val
-  row within 1e-4 and n must be equal.
+  to ONNX and scored offline on the same holdout. rms, pred_std and r must match
+  the logged val row within 1e-4 and n must be equal.
+* the same round trip with ``--cam-age`` (main + a pillar that renders every
+  third tick): the export carries ``ages`` and ``gvd_cam_age=1``, the offline
+  eval feeds the same hold-last sectors and ages, and the holdout n equals the
+  run without ``--cam-age`` (row selection keys on main).
 """
 # gvd-ci: requires torch
 from __future__ import annotations
@@ -117,11 +121,14 @@ def _lane(index: int) -> list[float]:
     return values + [0.0, 1.0]
 
 
-def _fixture(root: Path) -> None:
+def _fixture(root: Path, side: bool = False) -> None:
     import cv2
 
     cam = root / "raw" / "main"
     cam.mkdir(parents=True)
+    pillar = root / "raw" / "pillarL"
+    if side:
+        pillar.mkdir(parents=True)
     rng = np.random.default_rng(0)
     state_lines, gt_lines = [], []
     for index in range(N_ROWS):
@@ -132,13 +139,20 @@ def _fixture(root: Path) -> None:
         ok, buf = cv2.imencode(".png", frame)
         assert ok
         (cam / f"{index:06d}.png").write_bytes(buf.tobytes())
+        cams = {"main": {"file": f"raw/main/{index:06d}.png", "t": float(index) * 0.1}}
+        if side and index % 3 == 0:
+            # A pillar that sees the same column, mirrored: hold-last matters on 2 of 3 ticks.
+            ok, buf = cv2.imencode(".png", np.ascontiguousarray(frame[:, ::-1]))
+            assert ok
+            (pillar / f"{index:06d}.png").write_bytes(buf.tobytes())
+            cams["pillarL"] = {"file": f"raw/pillarL/{index:06d}.png", "t": float(index) * 0.1 + 0.004}
         state_lines.append(
             {
                 "i": index,
                 "t": float(index) * 0.1,
                 "dt_s": None if index == 0 else 0.1,
                 "segment": "west_coast_usa#0",
-                "cams": {"main": {"file": f"raw/main/{index:06d}.png"}},
+                "cams": cams,
                 "wheel": {"steer": 0.1},
                 "pedals": {"throttle": 0.2, "brake": 0.0},
             }
@@ -152,6 +166,8 @@ def _fixture(root: Path) -> None:
 def _train(root: Path, **extra):
     from python.train.train_scene import train_directory
 
+    extra.setdefault("cams", ("main",))
+    extra.setdefault("status_root", root.parent / "_status")
     return train_directory(
         root,
         epochs=2,
@@ -163,13 +179,11 @@ def _train(root: Path, **extra):
         resume=False,
         open_panel=False,
         autostart=True,
-        cams=("main",),
         heads=("lane_gt",),
         augment=False,
         workers=0,
         min_valid=0.0,
         holdout_blocks=1,
-        status_root=root.parent / "_status",
         **extra,
     )
 
@@ -221,8 +235,9 @@ def check_round_trip() -> None:
             assert result["n"] == rec["n"], (result["n"], rec["n"])
             assert abs(float(result["rms"]) - float(rec["rms"])) < 1e-4, (result["rms"], rec["rms"])
             assert abs(float(result["pred_std"]) - float(rec["pred_std"])) < 1e-4, (result["pred_std"], rec["pred_std"])
-            if rec.get("r") is not None:
-                assert abs(float(result["r"]) - float(rec["r"])) < 1e-3, (result["r"], rec["r"])
+            # Skeptic nit: r too, at the same 1e-4 as rms.
+            assert rec.get("r") is not None and result.get("r") is not None, (rec.get("r"), result.get("r"))
+            assert abs(float(result["r"]) - float(rec["r"])) < 1e-4, (result["r"], rec["r"])
             print(
                 f"round trip epoch={rec['epoch']} step={rec['step']}: logged rms={rec['rms']:.6f} n={rec['n']} | "
                 f"onnx rms={result['rms']:.6f} n={result['n']} (|d|={abs(result['rms'] - rec['rms']):.2e})"
@@ -243,7 +258,62 @@ def check_round_trip() -> None:
         assert len(lines) == 1 and f"step={last['step']} epoch={last['epoch']} n={last['n']} " in lines[0], out.getvalue()
         assert abs(json.loads((Path(tmp) / "r.json").read_text())["rms"] - last["rms"]) < 1e-4
         print(f"cli: {lines[0]}")
-    print("round trip: every val row's checkpoint exports and scores within 1e-4 rms, same n OK")
+    print("round trip: every val row's checkpoint exports and scores within 1e-4 rms / pred_std / r, same n OK")
+
+
+def check_round_trip_cam_age() -> None:
+    import onnxruntime as ort
+    import torch
+
+    from eval_onnx_holdout import evaluate
+    from python.train.epoch_ckpt import export_epoch_onnx, load_epoch_ckpt
+
+    # STRIP_ORDER order, as the CLI's parse_cams gives it (the export records that order).
+    cams = ("pillarL", "main")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "rec"
+        _fixture(root, side=True)
+        torch.manual_seed(0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            _train(root, cams=cams, ckpt_dir=Path(tmp) / "plain", status_root=Path(tmp) / "_plain")
+        plain_n = [rec["n"] for rec in _val_records(Path(tmp) / "_plain")]
+        torch.manual_seed(0)
+        ckpts = Path(tmp) / "aged"
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log):
+            _train(root, cams=cams, ckpt_dir=ckpts, status_root=Path(tmp) / "_aged", cam_age=True)
+        text = log.getvalue()
+        import re
+
+        planned = re.search(r"\[GVD\] cam-age: hold-last plan on (\d+) of (\d+) rows", text)
+        assert planned is not None, text[:3000]
+        # Every train and holdout row has a plan; only the rows in the holdout gap have none.
+        assert 0 < int(planned.group(1)) < int(planned.group(2)) == N_ROWS, planned.group(0)
+        print(planned.group(0))
+        vals = _val_records(Path(tmp) / "_aged")
+        # The holdout stop may end the two runs at different epochs; every
+        # evaluation must still score the same rows (same n) as without --cam-age.
+        assert vals and plain_n and {rec["n"] for rec in vals} == set(plain_n) and len(set(plain_n)) == 1, (
+            [rec["n"] for rec in vals],
+            plain_n,
+        )
+        for rec in vals:
+            path = ckpts / rec["ckpt"]
+            assert load_epoch_ckpt(path)["meta"]["cam_age"] is True
+            out = Path(tmp) / f"aged_ep{rec['epoch']}.onnx"
+            export_epoch_onnx(path, out)
+            session = ort.InferenceSession(str(out), providers=["CPUExecutionProvider"])
+            assert "ages" in [item.name for item in session.get_inputs()]
+            assert dict(session.get_modelmeta().custom_metadata_map)["gvd_cam_age"] == "1"
+            result = evaluate(root, out, holdout_blocks=1, eval_chunk=16)
+            assert result["cam_age"] is True and result["n"] == rec["n"], (result, rec)
+            for key in ("rms", "pred_std", "r"):
+                assert abs(float(result[key]) - float(rec[key])) < 1e-4, (key, result[key], rec[key])
+            print(
+                f"cam-age round trip epoch={rec['epoch']} step={rec['step']}: logged rms={rec['rms']:.6f} "
+                f"r={rec['r']:.6f} n={rec['n']} | onnx rms={result['rms']:.6f} r={result['r']:.6f} n={result['n']}"
+            )
+    print("cam-age round trip: ages export, offline eval within 1e-4 rms/pred_std/r, same n as without --cam-age OK")
 
 
 def check_low_space_run() -> None:
@@ -288,6 +358,7 @@ def main() -> None:
     check_low_space()
     check_cli_flags()
     check_round_trip()
+    check_round_trip_cam_age()
     check_low_space_run()
     print("test_epoch_ckpt: all OK")
 

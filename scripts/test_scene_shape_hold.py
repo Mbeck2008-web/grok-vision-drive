@@ -166,9 +166,16 @@ def check_real_graph_refused() -> None:
 def check_supervisor_wiring() -> None:
     """run_vision.main uses the guard the way _tick does."""
     rv = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
-    assert "scene_lane = scene_guard.load(SceneLaneRuntime, args.scene_onnx or None)" in rv
+    # The runtime goes through the guard; feeds_cam_age says whether this backend
+    # can feed the 8 hold ages (scheduled BeamNG companions), else a cam-age model is refused.
+    assert re.search(
+        r"scene_lane = scene_guard\.load\(\s*functools\.partial\(SceneLaneRuntime, feeds_cam_age=feeds_cam_age\), "
+        r"args\.scene_onnx or None\s*\)",
+        rv,
+    )
+    assert 'feeds_cam_age = bool(getattr(backend, "can_feed_cam_age", False))' in rv
     assert "scene_lane.observe(" not in rv, "a bare observe call can raise out of the loop"
-    assert "scene_guard.observe(scene_lane, strip, tick_dt, engaged=engaged)" in rv
+    assert "scene_guard.observe(scene_lane, strip, tick_dt, engaged=engaged, ages=tick_ages)" in rv
     assert "cmd = stop_command(seq=cmd_seq, reason=SCENE_SHAPE_HOLD)" in rv
     assert 'st["scene_lane"] = scene_guard.status()' in rv
     assert "if engaged and (cmd.reason == \"ok\" or holding):\n                applied = actuator.apply(cmd)" in rv.replace("\r\n", "\n")

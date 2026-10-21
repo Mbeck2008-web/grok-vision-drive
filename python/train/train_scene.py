@@ -350,6 +350,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip (and log) an epoch checkpoint that would leave less than this many GB free. Default 8.",
     )
     parser.add_argument(
+        "--grad-ckpt",
+        action="store_true",
+        help=(
+            "Gradient checkpointing on the per-tick encoder (the shared stem over every sector): its "
+            "activations are recomputed in backward instead of stored. Less memory, more compute; the "
+            "gradients, checkpoints and ONNX are the same. Scratch net only. Off by default."
+        ),
+    )
+    parser.add_argument(
+        "--cam-age",
+        action="store_true",
+        help=(
+            "Hold-last side cameras: a camera that did not render this tick shows its most recent earlier "
+            "frame (same segment, no respawn or train/holdout boundary, at most 1.5 s old) and the net gets "
+            "8 per-camera ages (1/15 s ticks; -1 = black). The ONNX gets an 'ages' input and gvd_cam_age=1. "
+            "Off by default: the live BeamNG backend cannot feed the ages yet, and the runtime refuses such a model."
+        ),
+    )
+    parser.add_argument(
         "--freeze-backbone",
         action="store_true",
         help="With --backbone imagenet-*, keep the ImageNet weights fixed and train only the projection and heads.",
@@ -708,7 +727,7 @@ def _probe_cuda(net: Any, batch: int, window_strips: int, amp: bool, device: Any
             strip = torch.zeros(int(batch), 3, canvas_h, canvas_w, device=device)
             dt = torch.zeros(int(batch), device=device)
             with _autocast(amp):
-                pred, state = net.forward_batch(strip, dt, state)
+                pred, state = _forward(net, strip, dt, state, [None] * int(batch))
             term = pred.lanes.float().sum()
             total = term if total is None else total + term
         if total is None:
@@ -808,6 +827,57 @@ def overlap_gradient_cut() -> dict[str, bool] | None:
     }
 
 
+def held_canvas(root: Path, row: Mapping[str, Any], cache: Any = None) -> tuple[np.ndarray, np.ndarray]:
+    """Hold-last canvas (full 8-sector strip) and 8 ages for one planned row.
+
+    Raw path: ``raw_frames.load_held_bgr``. Cache path: the same per-camera
+    sources read from a format-2 cache (``frame_cache.FrameCache.sector``, a
+    sector already passed through ``place_sector``), a camera the cache lacks
+    read from raw, then the same ``compose_strip``.
+    """
+    from python.data.cam_hold import hold_sources
+    from python.data.raw_frames import held_frames, load_held_bgr, load_raw_camera
+    from python.data.strip_writer import compose_strip
+
+    sources = hold_sources(row)
+    if cache is None:
+        return load_held_bgr(root, sources)
+    if getattr(cache, "stale", False):
+        cache.require_fresh()
+    if float(getattr(cache, "scale", 1.0)) < 0.999:
+        raise ValueError("--cam-age reads a cache at scale 1 only")
+
+    def _read(cam: str, index: int) -> Any:
+        got = cache.sector(cam, index)
+        return got if got is not None else load_raw_camera(root, cam, index)
+
+    frames, ages = held_frames(root, sources, reader=_read)
+    if not frames:
+        raise FileNotFoundError(f"no decodable frame for row {row.get('i')}'s hold plan")
+    return compose_strip(frames), ages
+
+
+def row_ages(row: Mapping[str, Any] | None) -> np.ndarray:
+    """The 8 ages ``_frame_row`` put on a loaded row; all -1 for none (a padded stream)."""
+    from python.data.cam_hold import ROW_AGES_KEY, ages_vector, no_ages
+
+    got = None if row is None else row.get(ROW_AGES_KEY)
+    if got is None:
+        return no_ages()
+    arr = np.asarray(got, dtype=np.float32).reshape(-1)
+    return arr if arr.size == len(ages_vector({})) else no_ages()
+
+
+def _forward(net: Any, image: Any, dt: Any, state: SceneState, rows: list[Mapping[str, Any] | None]) -> Any:
+    """``net.forward_batch``, with the rows' ages when the net takes them."""
+    if not bool(getattr(net, "cam_age", False)):
+        return net.forward_batch(image, dt, state)
+    import torch
+
+    ages = torch.from_numpy(np.stack([row_ages(row) for row in rows])).to(image.device)
+    return net.forward_batch(image, dt, state, ages)
+
+
 def _frame_row(
     root: Path,
     row: Mapping[str, Any],
@@ -818,13 +888,27 @@ def _frame_row(
     rng: np.random.RandomState | None = None,
     scale: float = 1.0,
 ) -> tuple[Any, Mapping[str, Any]] | None:
-    """Stitch one tick. A missing frame is a gap, not a crash."""
+    """Stitch one tick. A missing frame is a gap, not a crash.
+
+    A row with a hold plan (``cam_hold.ROW_HOLD_KEY``, ``--cam-age``) is
+    stitched hold-last: each camera's sector is its plan's source frame, and
+    the returned row is a copy that carries the 8 ages (``ROW_AGES_KEY``).
+    """
+    from python.data.cam_hold import ROW_AGES_KEY, ROW_HOLD_KEY
     from python.data.strip_writer import CANVAS_W, STRIP_ORDER
     from python.train.cam_strip import extract_cams, photometric_jitter
 
     index = int(row["i"])
     frame = None
-    if cache is not None and cache.has(index):
+    if isinstance(row.get(ROW_HOLD_KEY), Mapping):
+        try:
+            frame, ages = held_canvas(root, row, cache)
+        except FileNotFoundError as exc:
+            print(f"[GVD] scene load skip i={row.get('i')}: {exc}", flush=True)
+            return None
+        row = dict(row)
+        row[ROW_AGES_KEY] = [float(value) for value in ages]
+    elif cache is not None and cache.has(index):
         frame = cache.canvas(index)
     if frame is None:
         try:
@@ -889,6 +973,17 @@ def _grad_bad_counts(net: Any) -> tuple[int, int]:
     return nan_n, inf_n
 
 
+def _with_ages(row: Mapping[str, Any], frame_ages: list[Any] | None, tick: int) -> Mapping[str, Any]:
+    """A prefetched frame's row with the ages the worker loaded alongside it."""
+    from python.data.cam_hold import ROW_AGES_KEY
+
+    if frame_ages is None or tick >= len(frame_ages) or frame_ages[tick] is None:
+        return row
+    out = dict(row)
+    out[ROW_AGES_KEY] = list(frame_ages[tick])
+    return out
+
+
 def _optimizer_step(
     net: Any,
     opt: Any,
@@ -912,6 +1007,7 @@ def _optimizer_step(
     frames: list[Any] | None = None,
     conf_weight: float = 1.0,
     scale: float = 1.0,
+    frame_ages: list[Any] | None = None,
 ) -> tuple[float | None, int, SceneState, SceneState]:
     """Backprop through this chunk only.
 
@@ -945,6 +1041,7 @@ def _optimizer_step(
             if tick >= len(frames) or frames[tick] is None:
                 continue
             frame = _maybe_jitter(frames[tick], augment, rng)
+            row = _with_ages(row, frame_ages, tick)
         else:
             loaded = _frame_row(
                 root, row, cams=cams, cache=cache, augment=augment, rng=rng, scale=scale,
@@ -955,7 +1052,7 @@ def _optimizer_step(
         image = torch.from_numpy(frame).to(device)
         dt = torch.tensor([step_dt(row.get("dt_s"))], dtype=torch.float32, device=device)
         with _autocast(amp):
-            pred, state = net.forward_batch(image, dt, state)
+            pred, state = _forward(net, image, dt, state, [row])
         if loss_mask(row):
             one = _prediction_at(pred, 0)
             labels = labels_for_row(row)
@@ -1053,6 +1150,7 @@ def _optimizer_group(
     frame_sets: list[list[Any] | None] | None = None,
     conf_weight: float = 1.0,
     scale: float = 1.0,
+    age_sets: list[list[Any] | None] | None = None,
 ) -> tuple[float | None, int, SceneState, SceneState]:
     """One step on several windows that each start from a fresh GRU state.
 
@@ -1088,7 +1186,8 @@ def _optimizer_group(
                 if preset is not None:
                     if tick < len(preset) and preset[tick] is not None:
                         frame = _maybe_jitter(preset[tick], augment, rng)
-                        row = seq[tick]
+                        sets = age_sets[b] if age_sets is not None and b < len(age_sets) else None
+                        row = _with_ages(seq[tick], sets, tick)
                 else:
                     loaded = _frame_row(
                         root, seq[tick], cams=cams, cache=cache, augment=augment, rng=rng, scale=scale,
@@ -1106,7 +1205,7 @@ def _optimizer_group(
         image = torch.from_numpy(np.ascontiguousarray(np.stack(stacked))).to(device)
         dt = torch.tensor(dts, dtype=torch.float32, device=device)
         with _autocast(amp):
-            pred, state = net.forward_batch(image, dt, state)
+            pred, state = _forward(net, image, dt, state, alive)
         for b, row in enumerate(alive):
             if row is None or not loss_mask(row):
                 continue
@@ -1237,7 +1336,7 @@ def _eval_sequence(
                 dt_value = step_dt(row.get("dt_s"))
                 dt = torch.tensor([dt_value] * width, dtype=torch.float32, device=device)
                 with _autocast(amp):
-                    pred, state = net.forward_batch(image, dt, state)
+                    pred, state = _forward(net, image, dt, state, [row] * width)
                 one = _prediction_at(pred, 0)
                 tech = row.get("tech") if isinstance(row.get("tech"), dict) else row
                 gt_vec, gt_mask = lane_gt_from_record(tech if isinstance(tech, dict) else None)
@@ -1512,6 +1611,9 @@ class _EpochWindows:
     def __getitem__(self, index: int) -> dict[str, Any]:
         item = self.items[index]
         frames: list[Any] = []
+        ages: list[Any] = []
+        from python.data.cam_hold import ROW_AGES_KEY
+
         for row in item.get("rows") or []:
             loaded = _frame_row(
                 Path(self.root),
@@ -1522,8 +1624,10 @@ class _EpochWindows:
                 scale=self.scale,
             )
             frames.append(None if loaded is None else loaded[0])
+            ages.append(None if loaded is None else loaded[1].get(ROW_AGES_KEY))
         return {
             "frames": frames,
+            "ages": ages,
             "rows": list(item.get("rows") or []),
             "stride": int(item.get("stride") or 1),
             "kind": item.get("kind") or "train",
@@ -1597,14 +1701,30 @@ def train_directory(
     mask_files: str = "",
     ckpt_dir: Path | None = None,
     ckpt_min_free_gb: float | None = None,
+    cam_age: bool = False,
+    grad_ckpt: bool = False,
 ) -> dict[str, Any]:
     import torch
 
     from python.train.scene_net import SceneNet
 
     root = Path(root)
-    train_cams = tuple(cams) if cams else None
+    # STRIP_ORDER, as the CLI's parse_cams gives it. The net, its export
+    # metadata and the offline eval all use that order; a caller's tuple in
+    # another order used to stitch the sectors swapped (r sign flip).
+    from python.train.cam_strip import canonical_cams
+
+    train_cams = canonical_cams(cams) if cams else None
     train_heads = tuple(heads) if heads else None
+    use_cam_age = bool(cam_age)
+    if grad_ckpt and backbone not in ("", "scratch"):
+        raise SystemExit("--grad-ckpt checkpoints the scratch net's per-tick encoder; it is not wired into --backbone imagenet-*")
+    if use_cam_age and backbone not in ("", "scratch"):
+        raise SystemExit("--cam-age appends the ages to the scratch net's token; it is not wired into --backbone imagenet-*")
+    if cache is not None and getattr(cache, "stale", False):
+        raise SystemExit(f"[GVD] cache refused: {cache.reason}")
+    if use_cam_age and cache is not None and float(getattr(cache, "scale", 1.0)) < 0.999:
+        raise SystemExit("--cam-age reads a cache at scale 1 only (sector parity with the live strip is proven there)")
     use_augment = bool(augment) and not bool(sanity) and not bool(dry_run)
     augment_rng = np.random.RandomState(0)
     window_rng = np.random.RandomState(1)
@@ -1708,6 +1828,16 @@ def train_directory(
 
     startup_plan = pass_plan(rows, CHUNK_MAX, CHUNK_MAX // 2, blocks=int(holdout_blocks), cells=cell_spec)
     mix = holdout_mix(startup_plan)
+    if use_cam_age:
+        from python.data.cam_hold import HOLD_CAP_S, HOLD_TICK_HZ, annotate_hold
+
+        planned = annotate_hold(state_rows, rows, startup_plan)
+        print(
+            f"[GVD] cam-age: hold-last plan on {planned} of {len(rows)} rows "
+            f"(cap {HOLD_CAP_S:g} s, ages on the {HOLD_TICK_HZ} Hz tick; no look-ahead; "
+            "reset at respawn, segment and train/holdout runs)",
+            flush=True,
+        )
     print(
         f"[GVD] holdout: rows={mix['rows']} slices={mix['slices']} fast={mix['fast']} slow={mix['slow']} "
         f"no_speed={mix['no_speed']} (fast is row speed >= {HOLDOUT_FAST_MPS} m/s)",
@@ -1733,7 +1863,7 @@ def train_directory(
 
     def _empty(precision: str = "fp32") -> dict[str, Any]:
         if export_path is not None:
-            export_scene_onnx(export_path, cams=train_cams, heads=train_heads)
+            export_scene_onnx(export_path, cams=train_cams, heads=train_heads, cam_age=use_cam_age)
         return {
             "strips": len(rows),
             "windows": 0,
@@ -1774,7 +1904,14 @@ def train_directory(
         device = torch.device(device_name)
         if "net" not in holder:
             if backbone in ("", "scratch"):
-                holder["net"] = SceneNet(cams=train_cams, scale=input_scale).to(device)
+                holder["net"] = SceneNet(cams=train_cams, scale=input_scale, cam_age=use_cam_age).to(device)
+                if grad_ckpt:
+                    holder["net"].grad_ckpt = True
+                    print(
+                        "[GVD] grad-ckpt: per-tick encoder (_token) recomputed in backward "
+                        "(torch.utils.checkpoint, use_reentrant=False); eval and export unchanged",
+                        flush=True,
+                    )
             else:
                 from python.train.pretrained_net import build_scene_net
 
@@ -1999,6 +2136,7 @@ def train_directory(
             "strips": root.name,
             "val": {key: json_num(scored.get(key)) for key in ("n", "r", "rms", "rms_mean", "bias", "pred_mean", "pred_std")},
             "cams": list(train_cams or ()),
+            "cam_age": bool(use_cam_age),
             "heads": list(train_heads or ()),
             "scale": float(input_scale),
             "backbone": str(backbone),
@@ -2125,10 +2263,12 @@ def train_directory(
                     break
                 item = plan_steps[index]
                 prefetched_frames = None
+                prefetched_ages = None
                 if prefetch_iter is not None and item.get("kind") != "holdout":
                     try:
                         packed = next(prefetch_iter)
                         prefetched_frames = packed.get("frames")
+                        prefetched_ages = packed.get("ages")
                     except StopIteration:
                         prefetched_frames = None
                 state_in = _state_for(str(item["incoming"]), carry, end_state, chunk_in)
@@ -2159,20 +2299,24 @@ def train_directory(
                     continue
                 group = [item]
                 group_frames: list[Any] = [prefetched_frames]
+                group_ages: list[Any] = [prefetched_ages]
                 if int(batch) > 1 and str(item.get("incoming")) == "reset":
                     while len(group) < int(batch) and index + len(group) < len(plan_steps):
                         nxt = plan_steps[index + len(group)]
                         if nxt.get("kind") == "holdout" or str(nxt.get("incoming")) != "reset":
                             break
                         nxt_frames = None
+                        nxt_ages = None
                         if prefetch_iter is not None:
                             try:
                                 packed = next(prefetch_iter)
                                 nxt_frames = packed.get("frames")
+                                nxt_ages = packed.get("ages")
                             except StopIteration:
                                 nxt_frames = None
                         group.append(nxt)
                         group_frames.append(nxt_frames)
+                        group_ages.append(nxt_ages)
                 if item["incoming"] != "chunk":
                     chunk_in = state_in
                 last_batch = {
@@ -2204,6 +2348,7 @@ def train_directory(
                             conf_weight=float(conf_weight),
                             scale=input_scale,
                             frames=prefetched_frames,
+                            frame_ages=prefetched_ages,
                         )
                     else:
                         step_loss, n_sup, carry, end_state = _optimizer_group(
@@ -2226,6 +2371,7 @@ def train_directory(
                             conf_weight=float(conf_weight),
                             frame_sets=group_frames,
                             scale=input_scale,
+                            age_sets=group_ages,
                         )
                 except RuntimeError as exc:
                     if not _is_oom(exc):
@@ -2644,6 +2790,9 @@ def main(argv: list[str] | None = None) -> None:
         )
         return
     frame_cache = FrameCache(args.cache) if args.cache else None
+    if frame_cache is not None and frame_cache.stale:
+        print(f"[GVD] scene train: cache refused: {frame_cache.reason}", flush=True)
+        sys.exit(2)
     export_path = None if args.export is None else Path(args.export)
     if export_path is not None and not args.strips:
         try:
@@ -2654,7 +2803,7 @@ def main(argv: list[str] | None = None) -> None:
         if not torch_ready():
             print("[GVD] scene export needs PyTorch")
             sys.exit(2)
-        path = export_scene_onnx(export_path, cams=cam_names, heads=head_names)
+        path = export_scene_onnx(export_path, cams=cam_names, heads=head_names, cam_age=bool(args.cam_age))
         print(f"[GVD] exported {path}")
         return
     if not args.strips:
@@ -2710,6 +2859,8 @@ def main(argv: list[str] | None = None) -> None:
             mask_files=str(args.mask_files or ""),
             ckpt_dir=Path(args.ckpt_dir) if args.ckpt_dir else None,
             ckpt_min_free_gb=args.ckpt_min_free_gb,
+            cam_age=bool(args.cam_age),
+            grad_ckpt=bool(args.grad_ckpt),
         )
     except TrainFitError as exc:
         print(f"[GVD] scene train: {exc}")

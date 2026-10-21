@@ -110,6 +110,10 @@ class CamHold:
             return
         self._last[str(cam)] = (stamp, frame)
 
+    def forget(self, cam: str) -> None:
+        """Drop ``cam``'s last frame (live: a poll timeout). It is black, age -1, until its next render."""
+        self._last.pop(str(cam), None)
+
     def last(self, cam: str) -> tuple[float, Any] | None:
         return self._last.get(str(cam))
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import os
 import sys
 import time
@@ -85,6 +86,8 @@ from python.runtime.state_io import (
 )
 from python.runtime.paths import bus_identity
 from python.sensors.cameras import make_backend, resolve_backend_name
+from python.sensors.live_hold import ages_text, bundle_ages
+from python.data.cam_hold import CAM_AGE_ORDER
 from python.viz.monitors import place_opencv_window
 from python.viz.stage import STAGE_W, STAGE_H, VizUI, render_stage, smoke
 
@@ -568,7 +571,20 @@ def main() -> None:
 
             # SceneInputShapeError at load refuses Engage; mid-drive it is a HOLD.
             scene_guard = SceneLaneGuard()
-            scene_lane = scene_guard.load(SceneLaneRuntime, args.scene_onnx or None)
+            # A gvd_cam_age=1 model needs the 8 per-camera hold ages. Only the
+            # BeamNG backend can feed them (scheduled ad-hoc polls on the
+            # recorder's CameraSchedule); anything else refuses such a model.
+            feeds_cam_age = bool(getattr(backend, "can_feed_cam_age", False))
+            scene_lane = scene_guard.load(
+                functools.partial(SceneLaneRuntime, feeds_cam_age=feeds_cam_age), args.scene_onnx or None
+            )
+            if bool(getattr(scene_lane, "cam_age", False)) and scene_guard.refused is None:
+                backend.enable_scheduled_adhoc()
+                print(
+                    "[GVD] cam-age: companions are scheduled ad-hoc polls on the recorder's CameraSchedule "
+                    "(ages logged per tick as '[GVD] cam_age')",
+                    flush=True,
+                )
             if scene_guard.refused is not None:
                 print(f"[GVD] REFUSE ENGAGE: lane source=scene {scene_guard.refused}", flush=True)
             else:
@@ -801,9 +817,13 @@ def main() -> None:
                 )
 
                 frames = getattr(bundle, "frames", None)
+                tick_ages = None
+                if bool(getattr(scene_lane, "cam_age", False)):
+                    # Hold-last strip and the 8 ages (python.sensors.live_hold).
+                    frames, tick_ages = bundle_ages(bundle)
                 strip = compose_strip(frames if isinstance(frames, dict) else None)
                 was_hold = scene_guard.hold is not None
-                lane_hat, conf = scene_guard.observe(scene_lane, strip, tick_dt, engaged=engaged)
+                lane_hat, conf = scene_guard.observe(scene_lane, strip, tick_dt, engaged=engaged, ages=tick_ages)
                 scene_hold = scene_guard.hold is not None
                 if scene_hold and not was_hold and engaged:
                     print(f"[GVD] HOLD: scene_input_shape {scene_guard.hold}", flush=True)
@@ -1261,6 +1281,18 @@ def main() -> None:
             st["poll_gps_sent"] = poll_gps_sent
             st["electrics_ms"] = electrics_ms
             st["heartbeat_ms"] = (time.perf_counter() - loop_t0) * 1000.0
+            # Per-camera hold ages (cam_hold.CAM_AGE_ORDER; -1 = black) and this
+            # tick's duration, for scripts/live_age_capture.py.
+            _held, live_ages = bundle_ages(bundle)
+            st["cam_ages"] = {cam: float(live_ages[k]) for k, cam in enumerate(CAM_AGE_ORDER)}
+            st["adhoc_timeouts"] = int(getattr(bundle, "adhoc_timeouts", 0) or 0)
+            print(
+                f"[GVD] cam_age t={time.time():.3f} tick_ms={st['heartbeat_ms']:.2f} "
+                f"loop_dt_ms={'na' if tick_dt is None else f'{tick_dt * 1000.0:.2f}'} "
+                f"scheduled={int(getattr(bundle, 'cam_ages', None) is not None)} "
+                f"timeouts={st['adhoc_timeouts']} ages={ages_text(live_ages)}",
+                flush=True,
+            )
             # Soft Esc: gvd_state.json at most once per Lua pollEvery (0.10).
             # Max rewrite rate. A loop already slower than 100 ms writes at
             # the loop rate, so heartbeat age tracks the loop.

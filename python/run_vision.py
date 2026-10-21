@@ -1293,18 +1293,20 @@ def main() -> None:
             st["poll_gps_sent"] = poll_gps_sent
             st["electrics_ms"] = electrics_ms
             st["heartbeat_ms"] = (time.perf_counter() - loop_t0) * 1000.0
-            # Per-camera hold ages (cam_hold.CAM_AGE_ORDER; -1 = black) and this
-            # tick's duration, for scripts/live_age_capture.py.
-            _held, live_ages = bundle_ages(bundle)
-            st["cam_ages"] = {cam: float(live_ages[k]) for k, cam in enumerate(CAM_AGE_ORDER)}
-            st["adhoc_timeouts"] = int(getattr(bundle, "adhoc_timeouts", 0) or 0)
-            print(
-                f"[GVD] cam_age t={time.time():.3f} tick_ms={st['heartbeat_ms']:.2f} "
-                f"loop_dt_ms={'na' if tick_dt is None else f'{tick_dt * 1000.0:.2f}'} "
-                f"scheduled={int(getattr(bundle, 'cam_ages', None) is not None)} "
-                f"timeouts={st['adhoc_timeouts']} ages={ages_text(live_ages)}",
-                flush=True,
-            )
+            if cam_age_live:
+                # Per-camera hold ages (cam_hold.CAM_AGE_ORDER; -1 = black) and this
+                # tick's duration, for scripts/live_age_capture.py. Only with a
+                # cam-age scene model: the default path logs and writes nothing new.
+                _held, live_ages = bundle_ages(bundle)
+                st["cam_ages"] = {cam: float(live_ages[k]) for k, cam in enumerate(CAM_AGE_ORDER)}
+                st["adhoc_timeouts"] = int(getattr(bundle, "adhoc_timeouts", 0) or 0)
+                print(
+                    f"[GVD] cam_age t={time.time():.3f} tick_ms={st['heartbeat_ms']:.2f} "
+                    f"loop_dt_ms={'na' if tick_dt is None else f'{tick_dt * 1000.0:.2f}'} "
+                    f"scheduled={int(getattr(bundle, 'cam_ages', None) is not None)} "
+                    f"timeouts={st['adhoc_timeouts']} ages={ages_text(live_ages)}",
+                    flush=True,
+                )
             # Soft Esc: gvd_state.json at most once per Lua pollEvery (0.10).
             # Max rewrite rate. A loop already slower than 100 ms writes at
             # the loop rate, so heartbeat age tracks the loop.

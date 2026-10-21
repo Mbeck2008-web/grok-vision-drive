@@ -9,6 +9,8 @@
   hash); a reply for another request id is dropped.
 * a poll that is not collected within the timeout is black with age -1,
   even inside the 1.5 s cap.
+* a respawn drops every held side frame and in-flight request: every side
+  camera is black / -1 until a poll sent after the respawn completes.
 * a slow poll never blocks the tick: grab() stays bounded and main is read
   every tick.
 * the default grab sends no ad-hoc request and has no ages.
@@ -198,6 +200,98 @@ def check_timeout_black() -> None:
     print(f"timeout: a request not collected in {live.timeout_s:g} s is black / -1 inside the cap OK")
 
 
+def check_respawn_reset() -> None:
+    from types import SimpleNamespace
+
+    from python.sensors.cameras import CameraFrameBundle
+    from python.sensors.live_hold import RespawnWatch, scrub_after_respawn
+
+    clock = Clock()
+    side = ("pillarL", "repeatL", "rear")
+    cams = {cid: FakeCam(cid) for cid in side}
+    live = ScheduledAdHoc(cams, clock=clock, wall=clock)
+    period = 1.0 / 15.0
+    main = _prepare("main", {"colour": PIX})
+    for _k in range(40):
+        live.step(cams, _sync_io, lambda v: False, _prepare)
+        clock.t += period
+    frames, ages = live.compose(clock.t, main)
+    assert set(side) <= set(frames), sorted(frames)
+    # One request is in flight at the respawn.
+    cams["pillarL"].ready = False
+    for _k in range(10):
+        live.step(cams, _sync_io, lambda v: False, _prepare)
+        clock.t += period
+        if "pillarL" in live.pending:
+            break
+    stale_rid = live.pending["pillarL"]["rid"]
+    before = {cid: max(cam.sent) for cid, cam in cams.items()}
+    live.reset()  # the respawn
+    frames, ages = live.compose(clock.t, main)
+    assert set(frames) == {"main"} and all(
+        float(ages[CAM_AGE_ORDER.index(c)]) == -1.0 for c in CAM_AGE_ORDER if c != "main"
+    ), (sorted(frames), ages)
+    # The pre-respawn request's reply is dropped, ready or not.
+    live.late("pillarL", "sched_collect", (stale_rid, {"colour": PIX}, clock.t), _prepare)
+    assert "pillarL" not in live.compose(clock.t, main)[0]
+    cams["pillarL"].ready = True
+    first_back: dict[str, int] = {}
+    for _k in range(40):
+        live.step(cams, _sync_io, lambda v: False, _prepare)
+        frames, ages = live.compose(clock.t, main)
+        for cid in side:
+            if cid in frames and cid not in first_back:
+                first_back[cid] = cams[cid].collected[-1]
+                assert first_back[cid] > before[cid], (cid, first_back[cid], before[cid])
+                assert float(ages[CAM_AGE_ORDER.index(cid)]) == 0.0
+            if cid not in first_back:
+                assert cid not in frames and float(ages[CAM_AGE_ORDER.index(cid)]) == -1.0
+        clock.t += period
+    assert set(first_back) == set(side), first_back
+
+    # Backend: reset_live_hold() then the next grab has every side camera -1.
+    be = _backend({"main": FakeCam("main"), **{cid: FakeCam(cid) for cid in side}})
+    be.enable_scheduled_adhoc()
+    for _k in range(30):
+        bundle = be.grab()
+        time.sleep(1.0 / 30.0)
+    assert any(a >= 0 for c, a in zip(CAM_AGE_ORDER, bundle.cam_ages) if c != "main")
+    be.reset_live_hold()
+    bundle = be.grab()
+    assert set(bundle.held_frames) == {"main"}
+    assert all(a == -1.0 for c, a in zip(CAM_AGE_ORDER, bundle.cam_ages) if c != "main"), bundle.cam_ages
+    be.close()
+
+    # The grab of the respawn tick ran before the edge was seen: scrubbed to main only.
+    img = PIX[..., :3].copy()
+    tick = CameraFrameBundle(frames={"main": img}, cam_ages=tuple([0.2] * 8), held_frames={"main": img, "pillarL": img})
+    scrub_after_respawn(tick)
+    assert set(tick.held_frames) == {"main"}
+    assert all(a == -1.0 for c, a in zip(CAM_AGE_ORDER, tick.cam_ages) if c != "main")
+
+    # Respawn edge: vehicle change, reconnect, a jump no car could drive; not a fast straight.
+    watch = RespawnWatch()
+    v = lambda **kw: SimpleNamespace(**{"connected": True, "vid": "ego", "pos": (0.0, 0.0, 0.0), "speed_mps": 0.0, **kw})  # noqa: E731
+    assert watch.observe(v(), 0.1) is None
+    x = 0.0
+    for _k in range(50):
+        x += 45.0 * 0.1
+        assert watch.observe(v(pos=(x, 0.0, 0.0), speed_mps=45.0), 0.1) is None
+    assert watch.observe(v(pos=(x + 400.0, 0.0, 0.0)), 0.1).startswith("jump")
+    assert watch.observe(v(pos=(x + 400.0, 0.0, 0.0), vid="other"), 0.1) == "vehicle"
+    assert watch.observe(v(connected=False, pos=None, vid="other"), 0.1) is None
+    assert watch.observe(v(pos=(x + 400.0, 0.0, 0.0), vid="other"), 0.1) == "reconnect"
+    assert watch.count == 3
+
+    # run_vision: the edge resets the backend hold and scrubs this tick's grab.
+    rv = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
+    i = rv.index("respawn = respawn_watch.observe(vdata, tick_dt)")
+    block = rv[i : i + 400]
+    assert "backend.reset_live_hold()" in block and "scrub_after_respawn(bundle)" in block
+    assert rv.index("bundle = backend.grab()") < i < rv.index("scene_guard.observe(scene_lane, strip")
+    print("respawn: no pre-respawn frame or request survives; side cams -1 until a post-respawn poll lands OK")
+
+
 def _backend(cams: dict):
     from python.sensors.cameras import BeamNGPyBackend
 
@@ -324,6 +418,7 @@ def main() -> None:
     check_request_id_ages()
     check_timeout_black()
     check_tick_not_blocked()
+    check_respawn_reset()
     check_default_unchanged()
     check_runtime_gate()
     check_capture_script()

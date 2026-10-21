@@ -86,7 +86,7 @@ from python.runtime.state_io import (
 )
 from python.runtime.paths import bus_identity
 from python.sensors.cameras import make_backend, resolve_backend_name
-from python.sensors.live_hold import ages_text, bundle_ages
+from python.sensors.live_hold import RespawnWatch, ages_text, bundle_ages, scrub_after_respawn
 from python.data.cam_hold import CAM_AGE_ORDER
 from python.viz.monitors import place_opencv_window
 from python.viz.stage import STAGE_W, STAGE_H, VizUI, render_stage, smoke
@@ -566,6 +566,9 @@ def main() -> None:
     try:
         scene_lane = None
         scene_guard = None
+        # Scheduled hold-last companions (a gvd_cam_age=1 scene model on BeamNG).
+        cam_age_live = False
+        respawn_watch = RespawnWatch()
         if args.lane_source == "scene":
             from python.train.scene_lane_runtime import SceneLaneGuard, SceneLaneRuntime
 
@@ -580,6 +583,7 @@ def main() -> None:
             )
             if bool(getattr(scene_lane, "cam_age", False)) and scene_guard.refused is None:
                 backend.enable_scheduled_adhoc()
+                cam_age_live = True
                 print(
                     "[GVD] cam-age: companions are scheduled ad-hoc polls on the recorder's CameraSchedule "
                     "(ages logged per tick as '[GVD] cam_age')",
@@ -642,6 +646,14 @@ def main() -> None:
                     vdata = backend.poll_vehicle()
                 except Exception:
                     vdata = None
+            if cam_age_live:
+                # A respawn drops every held side frame and every request in flight;
+                # this tick's grab (taken before the edge was seen) keeps main only.
+                respawn = respawn_watch.observe(vdata, tick_dt)
+                if respawn is not None:
+                    backend.reset_live_hold()
+                    scrub_after_respawn(bundle)
+                    print(f"[GVD] cam-age: respawn ({respawn}); hold reset, side cameras black until a new poll lands", flush=True)
             sensors_poll_ms = 0.0
             poll_gps_ms = 0.0
             poll_gps_sent = False

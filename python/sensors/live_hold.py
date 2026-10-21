@@ -238,6 +238,75 @@ class ScheduledAdHoc:
         return frames, ages_vector(picks)
 
 
+# ---- respawn ----------------------------------------------------------------
+
+# A move this far in one tick, beyond what the car could drive, is a respawn.
+RESPAWN_JUMP_M = 10.0
+RESPAWN_SPEED_MARGIN = 3.0
+
+
+class RespawnWatch:
+    """Live respawn edge for the hold: no frame from before it may survive.
+
+    The supervisor has no respawn event of its own (the recorder marks
+    ``recover`` because it issues the respawn itself). Live sees one of:
+
+    * the vehicle id changes (a new or replaced vehicle);
+    * the vehicle reconnects after a disconnect (a level load or re-attach);
+    * the position jumps further in one tick than the car could drive:
+      more than ``max(RESPAWN_JUMP_M, RESPAWN_SPEED_MARGIN * speed * dt + RESPAWN_JUMP_M / 2)``.
+
+    ``observe`` returns the reason on the tick of the edge, else None.
+    """
+
+    def __init__(self) -> None:
+        self.vid: Any = None
+        self.connected: bool | None = None
+        self.pos: tuple[float, float, float] | None = None
+        self.count = 0
+
+    def observe(self, vdata: Any, dt_s: float | None) -> str | None:
+        if vdata is None:
+            return None
+        reason = None
+        connected = bool(getattr(vdata, "connected", False))
+        vid = getattr(vdata, "vid", None)
+        pos = getattr(vdata, "pos", None)
+        if self.connected is False and connected:
+            reason = "reconnect"
+        elif vid is not None and self.vid is not None and vid != self.vid:
+            reason = "vehicle"
+        elif pos is not None and self.pos is not None:
+            try:
+                jump = float(np.linalg.norm(np.asarray(pos[:3], dtype=np.float64) - np.asarray(self.pos, dtype=np.float64)))
+                speed = abs(float(getattr(vdata, "speed_mps", 0.0) or 0.0))
+                dt = 0.0 if dt_s is None else max(0.0, float(dt_s))
+                if jump > max(RESPAWN_JUMP_M, RESPAWN_SPEED_MARGIN * speed * dt + RESPAWN_JUMP_M / 2.0):
+                    reason = f"jump {jump:.1f} m"
+            except (TypeError, ValueError):
+                pass
+        self.connected = connected
+        if vid is not None:
+            self.vid = vid
+        if pos is not None:
+            try:
+                self.pos = (float(pos[0]), float(pos[1]), float(pos[2]))
+            except (TypeError, ValueError, IndexError):
+                pass
+        if reason is not None:
+            self.count += 1
+        return reason
+
+
+def scrub_after_respawn(bundle: Any) -> None:
+    """This tick's grab ran before the respawn edge was seen: keep main only, every other camera -1."""
+    if getattr(bundle, "cam_ages", None) is None:
+        return
+    main = bundle.main_bgr() if hasattr(bundle, "main_bgr") else None
+    bundle.held_frames = {"main": main} if main is not None else {}
+    bundle.cam_ages = tuple(float(a) for a in main_only_ages(main is not None))
+
+
 def main_only_ages(main_present: bool) -> np.ndarray:
     """The window path and an unscheduled backend: main at age 0, every other camera -1."""
     out = no_ages()
@@ -284,6 +353,8 @@ __all__ = [
     "ADHOC_POLL_TIMEOUT_S",
     "ADHOC_TICK_BUDGET_S",
     "NO_FRAME_AGE",
+    "RespawnWatch",
+    "scrub_after_respawn",
     "ScheduledAdHoc",
     "ages_text",
     "bundle_ages",

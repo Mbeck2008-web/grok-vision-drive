@@ -31,6 +31,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from test_frozen_supervisor_deadman import (  # noqa: E402
     FPS,
     FREEZE_AT,
+    SLOW_RUNS,
     Lockstep,
     _wait_bus,
     check_bounds,
@@ -132,8 +133,8 @@ def check_stamp_follows_control_on_same_thread() -> None:
         A.atomic_write_json, A.cmd_path = real_write, real_path
 
 
-def check_frozen_tech_loop_brakes_then_disengages(fps) -> None:
-    ls = Lockstep(Path(__file__).resolve(), fps)
+def check_frozen_tech_loop_brakes_then_disengages(fps, step_sleep_s: float | None = None) -> None:
+    ls = Lockstep(Path(__file__).resolve(), fps, step_sleep_s)
     try:
         res = ls.run(["tick"] * FREEZE_AT + ["freeze"], tail_s=2.0)
         live = [ev for t, ev, _ in res["frames"] if t <= res["t_freeze"]]
@@ -197,6 +198,9 @@ def main() -> None:
     for fps in FPS:
         check_clean_disengage_then_silence(fps)
         check_frozen_tech_loop_brakes_then_disengages(fps)
+    for fps, sleep_s in SLOW_RUNS:
+        print(f"test_tech_supervisor_deadman slow runner: {fps} fps, {sleep_s * 1000:.1f} ms real sleep per frame", flush=True)
+        check_frozen_tech_loop_brakes_then_disengages(fps, sleep_s)
     print("test_tech_supervisor_deadman: OK")
 
 

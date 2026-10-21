@@ -56,6 +56,12 @@ RAND_DT_S = (0.002, 0.060)
 RAND_SEEDS = tuple(range(101, 121))  # declared before the first run; every seed must pass
 FPS = (60, 20, 300, 2400) + tuple(("rand", seed) for seed in RAND_SEEDS)
 STEER, THROTTLE = 0.1, 0.3
+# Test-only knob: a real sleep after every sim frame, to play a slow runner (wall time runs
+# ahead of sim time). GVD_TEST_STEP_SLEEP_S sets it for every rate; SLOW_RUNS always run with it.
+STEP_SLEEP_S = float(os.environ.get("GVD_TEST_STEP_SLEEP_S") or 0.0)
+# 2400 fps with 1.5 ms per frame: about 3 s of wall per 1 s of sim. Before the mod's wall clock
+# followed the sim, this disengaged before the 0.35 s hold (CI saw 0.55 s and 0.90 s).
+SLOW_RUNS = ((2400, 0.0015),)
 
 
 def _lua_const(name: str) -> float:
@@ -180,8 +186,9 @@ class _Sim:
 class Lockstep:
     """Real main.lua at a fixed frame dt + a supervisor child ticking in the same sim time."""
 
-    def __init__(self, script: Path, rate) -> None:
+    def __init__(self, script: Path, rate, step_sleep_s: float | None = None) -> None:
         self.dts = frame_dts(rate)
+        self.step_sleep_s = STEP_SLEEP_S if step_sleep_s is None else float(step_sleep_s)
         self.warm_dt = 0.05  # one mod poll per warm-up frame: every run starts at the same poll phase
         lua = shutil.which("lua5.1") or shutil.which("lua")
         assert lua, "lua5.1 is not on PATH (the mod harness needs it; not a skip)"
@@ -235,14 +242,19 @@ class Lockstep:
 
         Returns per-frame (sim_t, events, engaged) and the sim time of the last child write.
         A write at sim time t (between frames) is seen by the onUpdate that ends at t + dt.
+
+        The mod's wall clock runs on sim time too: each frame carries ``wall = hb + (t_end - t_w)``,
+        hb = the ``heartbeat_mtime`` of the last child write and t_w its sim time. The mod reads it
+        in whole seconds (os.time), so a slow host (real time ahead of sim time) changes nothing.
         """
         frames: list[tuple[float, list[tuple[str, float]], bool]] = []
         res: dict = {"frames": frames, "t_last": None, "t_freeze": None, "marks": {}, "freeze_line": None, "dt_max": 0.0,
-                     "dts": []}
+                     "dts": [], "hb_last": None}
         cmds = iter(plan)
         t = Fraction(0)  # exact sum of the float dts handed to the mod
         next_tick = Fraction(0)
         t_end = None
+        t_w = None
         while t_end is None or t < t_end:
             if t >= next_tick - Fraction(1, 10**9):
                 next_tick += Fraction(TICK_S)
@@ -257,12 +269,20 @@ class Lockstep:
                     else:
                         self._reply("TICK")
                         res["t_last"] = float(t)
+                        t_w = t
+                        res["hb_last"] = float(json.loads((self.bus / "gvd_cmd.json").read_text(encoding="utf-8"))["heartbeat_mtime"])
                         res["k_last"] = len(res["dts"])
                         res["marks"].setdefault(c, float(t))
             dt = next(self.dts)
             res["dt_max"] = max(res["dt_max"], dt)
             res["dts"].append(dt)
-            events, engaged = self.sim.send(f"step {dt!r}")
+            if t_w is None:
+                events, engaged = self.sim.send(f"step {dt!r}")
+            else:
+                wall = sim_wall(res["hb_last"], t + Fraction(dt) - t_w)
+                events, engaged = self.sim.send(f"step {dt!r} {wall!r}")
+            if self.step_sleep_s > 0.0:
+                time.sleep(self.step_sleep_s)
             t += Fraction(dt)
             frames.append((float(t), events, engaged))
         assert self.sup.poll() is None, "supervisor exited; it should be stuck"
@@ -275,6 +295,11 @@ class Lockstep:
         if self.sim is not None:
             self.sim.close()
         shutil.rmtree(self.root, ignore_errors=True)
+
+
+def sim_wall(hb: float, since_write: Fraction) -> float:
+    """Sim wall time (Unix s) ``since_write`` of sim time after the write stamped ``hb``."""
+    return hb + float(since_write)
 
 
 def hold_and_disengage(res: dict) -> tuple[float | None, float | None, list, list]:
@@ -298,7 +323,7 @@ def hold_and_disengage(res: dict) -> tuple[float | None, float | None, list, lis
     return t_hold, t_dis, before_hold, throttle_while_held
 
 
-def model_hold_dis(dts: list[float], k_last: int) -> tuple[float, float]:
+def model_hold_dis(dts: list[float], k_last: int, hb: float | None = None) -> tuple[float, float]:
     """Independent model of the DESIGN (not a copy of main.lua): regression detector, not proof.
 
     The mod polls whenever its accumulated frame time reaches CMD_POLL_S (the run starts on a
@@ -307,6 +332,8 @@ def model_hold_dis(dts: list[float], k_last: int) -> tuple[float, float]:
     later poll compares the sim time elapsed since that poll, in whole microseconds, against
     CMD_STALE_S then CMD_DEAD_S. Times are exact rationals of the dts sent. Returns (hold, dead)
     in seconds after the write.
+    With ``hb`` (the write's heartbeat_mtime), each poll also applies the leftover-file rule:
+    dead once whole sim-wall seconds minus hb exceed CMD_DEAD_S (``sim_wall``, floored like os.time).
     """
     stale, dead, poll = (Fraction(_lua_const(n)) for n in ("CMD_STALE_S", "CMD_DEAD_S", "CMD_POLL_S"))
     t = Fraction(0)
@@ -325,17 +352,19 @@ def model_hold_dis(dts: list[float], k_last: int) -> tuple[float, float]:
             seen = t
             continue
         elapsed_us = math.floor((t - seen) * 10**6 + Fraction(1, 2))
+        ancient = hb is not None and (math.floor(sim_wall(hb, t - t_write)) - hb) > float(dead)
+        if elapsed_us >= dead * 10**6 or ancient:
+            assert hold is not None, "model: dead before the hold"
+            return float(hold - t_write), float(t - t_write)
         if hold is None and elapsed_us >= stale * 10**6:
             hold = t
-        if elapsed_us >= dead * 10**6:
-            return float(hold - t_write), float(t - t_write)
     raise AssertionError("model: no disengage within the dts sent")
 
 
 def check_model(name: str, rate, res: dict, hold_s: float, dis_s: float) -> None:
     if not isinstance(rate, tuple):
         return  # exact-boundary fixed rates depend on float rounding of the poll gate; not modelled
-    m_hold, m_dis = model_hold_dis(res["dts"], res["k_last"])
+    m_hold, m_dis = model_hold_dis(res["dts"], res["k_last"], res.get("hb_last"))
     print(f"{name} {rate}: model hold {m_hold:.6f} dis {m_dis:.6f}; measured {hold_s:.6f} {dis_s:.6f}", flush=True)
     assert abs(m_hold - hold_s) <= 1e-6 and abs(m_dis - dis_s) <= 1e-6, (rate, m_hold, hold_s, m_dis, dis_s)
 
@@ -351,8 +380,8 @@ def check_bounds(name: str, fps, hold_s: float, dis_s: float, dt_max: float) -> 
     assert lim["dis_lo"] <= dis_s < lim["dis_hi"], (fps, "disengage", dis_s, lim)
 
 
-def check_frozen_read_brakes_then_disengages(fps) -> None:
-    ls = Lockstep(Path(__file__).resolve(), fps)
+def check_frozen_read_brakes_then_disengages(fps, step_sleep_s: float | None = None) -> None:
+    ls = Lockstep(Path(__file__).resolve(), fps, step_sleep_s)
     try:
         res = ls.run(["tick"] * FREEZE_AT + ["freeze"], tail_s=2.0)
         drove = any(
@@ -392,6 +421,9 @@ def main() -> None:
     check_supervisor_writes_cmd_on_grab_thread()
     for fps in FPS:
         check_frozen_read_brakes_then_disengages(fps)
+    for fps, sleep_s in SLOW_RUNS:
+        print(f"test_frozen_supervisor_deadman slow runner: {fps} fps, {sleep_s * 1000:.1f} ms real sleep per frame", flush=True)
+        check_frozen_read_brakes_then_disengages(fps, sleep_s)
     print("test_frozen_supervisor_deadman: OK")
 
 

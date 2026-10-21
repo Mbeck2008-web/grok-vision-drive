@@ -320,6 +320,10 @@ _MOD_VERSION = re.search(
     r"M\.MOD_VERSION\s*=\s*'([^']+)'",
     (ROOT / "beamng_mod" / "lua" / "ge" / "extensions" / "gvd" / "main.lua").read_text(encoding="utf-8"),
 ).group(1)
+# Test-only knob: a real sleep per _run_supervisor loop pass (plays a slow host).
+STEP_SLEEP_S = float(os.environ.get("GVD_TEST_STEP_SLEEP_S") or 0.0)
+# check_ffb_override_live_slow_host: the sleep CI's slow runner amounted to (echo_stale on main).
+SLOW_HOST_SLEEP_S = 0.35
 FAKE_ECHO_PERIOD_S = 0.1  # gvd_main EGO_POLL_S: the mod echoes at 10 Hz, whatever the loop does
 # Most run_vision may take to write its first gvd_cmd.json (imports, model load). Startup only:
 # the `seconds` a check asks for, and its timed windows, start when that first command lands.
@@ -495,6 +499,8 @@ def _run_supervisor(
     mod_version: str | None = None,
     clock: dict | None = None,
     engage_heartbeat: bool = True,
+    echo_clock: bool = False,
+    loop_sleep_s: float | None = None,
 ) -> dict | None:
     """Run run_vision.py headless for `seconds`; optionally play the mod's ack role meanwhile.
 
@@ -526,6 +532,12 @@ def _run_supervisor(
     `on_engage_drop(t)` is called with the wall time the engage file was first seen false.
     `engage_heartbeat=False` plays a mod whose Alt+G heartbeat stopped: gvd_engage.json keeps
     the stamp it had, so it goes stale `ENGAGE_FRESH_S` later.
+    `echo_clock=True` runs the supervisor through `scripts/gvd_echo_clock_child.py`: its echo
+    gate reads the fake mod's own clock (`FAKE_ECHO_PERIOD_S` per echo written) instead of
+    time.monotonic(), so a slow host that delays the fake mod's echoes is not an echo_stale the
+    mod would show. Not with `freeze_echo_after_s` (that run tests the stale timing itself).
+    `loop_sleep_s` (test-only, default GVD_TEST_STEP_SLEEP_S or 0) adds a real sleep per loop
+    pass to play a slow host.
 
     The fake mod echoes back what it was told to apply, exactly like `gvd_main` does, so the
     override residual is zero unless a test deliberately plays a driver: `steer_echo` /
@@ -537,8 +549,23 @@ def _run_supervisor(
     ticks after engage, before the dwell. Windows PIPE + TerminateProcess also drops
     `[GVD] DISENGAGED:` (Verify FAIL: only boot lines through the preview WARNING).
     """
-    args = [sys.executable, "-u", str(ROOT / "python" / "run_vision.py"), "--backend", "stub", "--hz", "20", "--encode", "cpu", *extra]
+    assert not (echo_clock and freeze_echo_after_s is not None), "echo_clock would hide the frozen echo"
+    step_sleep = STEP_SLEEP_S if loop_sleep_s is None else float(loop_sleep_s)
+    launcher = ROOT / "scripts" / "gvd_echo_clock_child.py" if echo_clock else ROOT / "python" / "run_vision.py"
+    args = [sys.executable, "-u", str(launcher), "--backend", "stub", "--hz", "20", "--encode", "cpu", *extra]
     env = dict(os.environ, PYTHONPATH=str(ROOT))
+    clock_dir = tempfile.mkdtemp(prefix="gvd-m6-echo-clock-") if echo_clock else None
+    clock_file = Path(clock_dir) / "echo_clock.json" if clock_dir else None
+    mod_t = 0.0
+
+    def _write_clock(t: float) -> None:
+        tmp = clock_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"t": t}), encoding="utf-8")
+        os.replace(tmp, clock_file)
+
+    if clock_file is not None:
+        _write_clock(mod_t)
+        env["GVD_TEST_ECHO_CLOCK_FILE"] = str(clock_file)
     _touch_lua_bus()
     # A previous run's command / state must not be read as this run's (the mod would hold and
     # echo an old command; the latch would take an old refusal).
@@ -569,7 +596,7 @@ def _run_supervisor(
     held_cmd: dict | None = None  # the last command the mod received
 
     def _ack_once() -> None:
-        nonlocal frozen, dropped, next_echo, held_cmd, ready
+        nonlocal frozen, dropped, next_echo, held_cmd, ready, mod_t
         if on_engage_drop is not None and not dropped:
             if _read_json(engage_path()).get("engaged") is False:
                 dropped = True
@@ -593,6 +620,9 @@ def _run_supervisor(
             except Exception:
                 pass
         next_echo = max(next_echo + FAKE_ECHO_PERIOD_S, mnow + FAKE_ECHO_PERIOD_S / 2)
+        if clock_file is not None:
+            mod_t += FAKE_ECHO_PERIOD_S  # one echo = one mod echo period, however late it is
+            _write_clock(mod_t)
         if held_cmd is None:
             # The mod echoes at 10 Hz whether or not a command has arrived yet: the car's
             # speed with nothing applied (applied_seq 0, not applying). The old harness only
@@ -714,6 +744,8 @@ def _run_supervisor(
                 break
             # Tighter than the 20 Hz supervisor loop so the echo always belongs to the newest seq.
             time.sleep(0.01)
+            if step_sleep > 0.0:
+                time.sleep(step_sleep)
         # Hold SIGKILL until write_state has seen the echo. Killing mid-tick left
         # cmd_applied=False / cmd_json_pending for check_run_vision_e2e.
         # Override runs must not stop on cmd_applied: that flips true before the dwell.
@@ -741,6 +773,8 @@ def _run_supervisor(
             proc.wait(timeout=5)
         except Exception:
             pass
+        if clock_dir is not None:
+            shutil.rmtree(clock_dir, ignore_errors=True)
     return latched if latched is not None else loose
 
 
@@ -878,8 +912,8 @@ def _engage_live_on_last_tick() -> tuple[bool, dict]:
     }
 
 
-def check_ffb_override_live() -> None:
-    """Whole loop with a wheel on the echo: chatter keeps driving, a real driver gets the car."""
+def _ffb_chatter_keeps_driving(loop_sleep_s: float | None = None) -> None:
+    """FFB chatter on the echo (echo gate on the fake mod's clock) must not disengage GVD."""
     _touch_lua_bus()
     if ego_path().exists():
         ego_path().unlink()
@@ -888,7 +922,8 @@ def check_ffb_override_live() -> None:
     write_engage_flag(True)
     # Keyed on the echo (one FFB sample each), not on the command seq the echo acks.
     _run_supervisor(
-        ["--allow-preview-drive"], seconds=3.0, ack=True, wheel_by_echo=lambda k: 0.9 if k % 2 else -0.9
+        ["--allow-preview-drive"], seconds=3.0, ack=True, wheel_by_echo=lambda k: 0.9 if k % 2 else -0.9,
+        echo_clock=True, loop_sleep_s=loop_sleep_s,
     )
     live, why = _engage_live_on_last_tick()
     assert live is True, ("force-feedback chatter disengaged GVD (or the latch was stale on its last tick)", why)
@@ -904,6 +939,11 @@ def check_ffb_override_live() -> None:
     # No sink regression: the mod's ack path still drives while the wheel chatters.
     assert st["cmd_applied"] is True and st["cmd_reason"] == "cmd_json_applied", st["cmd_reason"]
 
+
+def check_ffb_override_live() -> None:
+    """Whole loop with a wheel on the echo: chatter keeps driving, a real driver gets the car."""
+    _ffb_chatter_keeps_driving()
+
     # A driver actually holding the wheel over. Latch on gvd_engage.json / gvd_state.json,
     # not stdout — Windows PIPE + SIGKILL only kept boot lines through the preview WARNING.
     write_engage_flag(True)
@@ -913,6 +953,7 @@ def check_ffb_override_live() -> None:
         ack=True,
         steer_echo=lambda _seq: 0.25,
         expect_disengage="player_steer",
+        echo_clock=True,
     )
     assert snap is not None, "player_steer never appeared on gvd_engage.json / gvd_state.json"
     eng = snap["engage"]
@@ -935,6 +976,7 @@ def check_ffb_override_live() -> None:
         ack=True,
         brake_bias=0.4,
         expect_disengage="player_brake",
+        echo_clock=True,
     )
     assert snap is not None, "player_brake never appeared on gvd_engage.json / gvd_state.json"
     eng = snap["engage"]
@@ -956,6 +998,35 @@ def check_ffb_override_live() -> None:
 
     write_engage_flag(False)
     ego_path().unlink()
+
+
+def check_ffb_override_live_slow_host() -> None:
+    """A slow host (SLOW_HOST_SLEEP_S real sleep per loop pass) must not turn chatter into echo_stale.
+
+    On main before the echo clock this disengaged with echo_stale: the fake mod's echoes came
+    every ~0.36 s of real time, over ECHO_STALE_MS, although the mod echoes at 10 Hz of its time.
+    """
+    _ffb_chatter_keeps_driving(loop_sleep_s=SLOW_HOST_SLEEP_S)
+    print(f"  slow host ({SLOW_HOST_SLEEP_S:.2f} s real sleep per loop pass): FFB chatter still driving, no echo_stale")
+
+
+def check_echo_gate_clock_default() -> None:
+    """Production keeps the echo gate on time.monotonic() and ECHO_STALE_MS at 300; only tests swap the clock."""
+    from python.control import echo_link
+
+    src = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
+    call = "echo = echo_gate.observe(engaged=bool(engaged) and echo_bus, ego_fb=ego_fb, now=time.monotonic())"
+    assert src.count(call) == 1, "run_vision must feed the echo gate time.monotonic()"
+    assert src.count("echo_gate.observe(") == 1, "one echo gate call site"
+    assert src.count("import time\n") == 1 and "time.monotonic =" not in src, "run_vision's time is the stdlib clock"
+    assert echo_link.ECHO_STALE_MS == 300.0 and echo_link.GAP_RUN_MAX == 3
+    assert echo_link.EchoGate().stale_s == 0.3, echo_link.EchoGate().stale_s
+    # The swap lives only in the test launcher, and nothing in python/ patches the gate.
+    for path in (ROOT / "python").rglob("*.py"):
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        assert "EchoGate.observe =" not in text and "GVD_TEST_ECHO_CLOCK_FILE" not in text, path
+    child = (ROOT / "scripts" / "gvd_echo_clock_child.py").read_text(encoding="utf-8")
+    assert "echo_link.EchoGate.observe = _observe" in child
 
 
 def check_ffb_stale_engage_heartbeat() -> None:
@@ -1251,6 +1322,8 @@ def main() -> None:
         check_run_vision_e2e,
         check_synthetic_lanes_drive,
         check_ffb_override_live,
+        check_ffb_override_live_slow_host,
+        check_echo_gate_clock_default,
         check_ffb_stale_engage_heartbeat,
         check_echo_outdated_refuses_engage,
         check_echo_stale_disengages,

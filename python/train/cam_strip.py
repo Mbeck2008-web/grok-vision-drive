@@ -78,9 +78,29 @@ def parse_heads(text: str | None) -> tuple[str, ...]:
     return tuple(names)
 
 
+def canonical_cams(cams: Iterable[str] | None) -> tuple[str, ...]:
+    """``cams`` in ``STRIP_ORDER`` (duplicates dropped). Empty or None is all eight.
+
+    Every stitch and every layout goes through this, so a caller that passes
+    ``("main", "pillarL")`` gets the same canvas as ``parse_cams`` /
+    ``cams_from_metadata`` (``pillarL, main``). An unknown name is an error.
+    """
+    wanted = [str(name) for name in (cams or ())]
+    if not wanted:
+        return tuple(STRIP_ORDER)
+    unknown = [name for name in wanted if name not in STRIP_ORDER]
+    if unknown:
+        raise ValueError(f"unknown camera {unknown[0]}")
+    return tuple(name for name in STRIP_ORDER if name in set(wanted))
+
+
 def sectors_for(cams: tuple[str, ...] | list[str]) -> tuple[SectorGeom, ...]:
-    """Sectors for ``cams`` in strip order, packed from the left with the usual gaps."""
-    names = tuple(cams) if cams else tuple(STRIP_ORDER)
+    """Sectors for ``cams`` in strip order, packed from the left with the usual gaps.
+
+    The order is always ``STRIP_ORDER`` (``canonical_cams``), whatever order
+    ``cams`` arrives in.
+    """
+    names = canonical_cams(cams)
     x = 0
     out: list[SectorGeom] = []
     for index, cam_id in enumerate(names):
@@ -148,7 +168,7 @@ def full_sector(cam_id: str) -> SectorGeom | None:
 
 def extract_cams(full_bgr: np.ndarray, cams: tuple[str, ...]) -> np.ndarray:
     """Repack sectors out of a full 2272-wide strip. A full-width request is a copy."""
-    if tuple(cams) == tuple(STRIP_ORDER):
+    if canonical_cams(cams) == tuple(STRIP_ORDER):
         return np.ascontiguousarray(full_bgr)
     sectors = sectors_for(cams)
     canvas = np.zeros((CANVAS_H, canvas_width(cams), 3), dtype=np.uint8)

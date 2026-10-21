@@ -1699,7 +1699,12 @@ def train_directory(
     from python.train.scene_net import SceneNet
 
     root = Path(root)
-    train_cams = tuple(cams) if cams else None
+    # STRIP_ORDER, as the CLI's parse_cams gives it. The net, its export
+    # metadata and the offline eval all use that order; a caller's tuple in
+    # another order used to stitch the sectors swapped (r sign flip).
+    from python.train.cam_strip import canonical_cams
+
+    train_cams = canonical_cams(cams) if cams else None
     train_heads = tuple(heads) if heads else None
     use_cam_age = bool(cam_age)
     if use_cam_age and backbone not in ("", "scratch"):

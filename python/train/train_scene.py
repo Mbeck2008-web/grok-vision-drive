@@ -33,6 +33,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from python.data.raw_frames import LossyFramesError  # noqa: E402
+from python.train.event_mask import MaskFileError  # noqa: E402
 from python.data.strip_writer import CANVAS_H, CANVAS_W  # noqa: E402
 from python.train.continual import (  # noqa: E402
     CHUNK_MAX,
@@ -314,6 +315,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Leave out rows inside an impacts.jsonl window [pre_t0, impact_end] (matched by time t) "
             "and rows the collector flagged settle or stall. Off by default."
+        ),
+    )
+    parser.add_argument(
+        "--mask-files",
+        default="",
+        help=(
+            "Comma list of mask sidecars (JSON lines with a row id i), relative to the recording "
+            "folder. Every listed row is left out. A missing file or an i the recording does not "
+            "have stops the run. name@sha256prefix (8+ hex digits) also stops on a sha256 mismatch."
         ),
     )
     parser.add_argument(
@@ -1570,6 +1580,7 @@ def train_directory(
     freeze_backbone: bool = False,
     backbone_lr_mult: float = 1.0,
     mask_events: bool = False,
+    mask_files: str = "",
 ) -> dict[str, Any]:
     import torch
 
@@ -1593,6 +1604,11 @@ def train_directory(
     refuse_lossy(root)
     state_rows = load_scene_rows(root)
     print(f"[GVD] scene index: {len(state_rows)} state rows", flush=True)
+    from python.train.event_mask import drop_masked, mask_file_sources, selection_line
+
+    # Mask files are read on the full recording rows, before any frame is
+    # measured, so a bad file, an unknown id or a sha256 mismatch stops early.
+    mask_sources = mask_file_sources(root, state_rows, mask_files)
     print("[GVD] scene index: measuring frames", flush=True)
 
     def _index_progress(n_frames: int, n_bytes: int) -> None:
@@ -1617,6 +1633,13 @@ def train_directory(
         before = len(rows)
         rows, event_counts = mask_event_rows(root, rows)
         print(f"[GVD] mask-events: {describe(event_counts, before)}", flush=True)
+    # Dropped before the holdout split, so a masked row is in neither the train
+    # chunks nor the holdout. A masked run is one gap; past MEMORY_S it resets the GRU.
+    selection_before = rows
+    if mask_sources:
+        rows = drop_masked(rows, set().union(*(source["ids"] for source in mask_sources)))
+    selection_text, _selection_meta = selection_line(state_rows, selection_before, rows, mask_sources)
+    print(selection_text, flush=True)
     blank_scan = count_near_black_main(rows, cache, train_cams, input_scale)
     near_rule = (
         f"mean<{NEAR_BLACK_MEAN} or >{NEAR_BLACK_FRAC:.0%} of px below {NEAR_BLACK_LEVEL}/255"
@@ -2620,9 +2643,13 @@ def main(argv: list[str] | None = None) -> None:
             freeze_backbone=bool(args.freeze_backbone),
             backbone_lr_mult=float(args.backbone_lr_mult),
             mask_events=bool(args.mask_events),
+            mask_files=str(args.mask_files or ""),
         )
     except TrainFitError as exc:
         print(f"[GVD] scene train: {exc}")
+        sys.exit(2)
+    except MaskFileError as exc:
+        print(f"[GVD] scene train: {exc}", flush=True)
         sys.exit(2)
     except LossyFramesError as exc:
         print(f"[GVD] scene train: {exc}", flush=True)

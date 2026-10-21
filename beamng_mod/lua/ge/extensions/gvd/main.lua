@@ -45,6 +45,10 @@ local CMD_POLL_S = 0.05      -- 20 Hz apply
 -- grab hitch does not flash the link stale and paint HOLD.
 local CMD_STALE_S = 0.35     -- no new seq for this long → brake hold (dead-man)
 local CMD_DEAD_S = 1.0       -- stream dead this long while we hold the car → release + disengage
+-- Wall clock (whole seconds) for the leftover-file check in applyCmdJson. Always os.time in the
+-- game; only the offline sim (scripts/gvd_lua_sim.lua) swaps in its sim clock (setWallClockForTest).
+-- A field, not a local: the main chunk is at Lua 5.1's 200-local limit.
+M._cmdWallClock = os.time
 local EGO_POLL_S = 0.10      -- 10 Hz electrics echo whenever a player vehicle exists (HUD + gvd_ego.json)
 local UI_PUSH_S = EGO_POLL_S -- single 10 Hz gvdUi path (tickPush only; not 4 Hz strip + 10 Hz ego)
 local applying = false       -- true while our secondary Direct Drive wheel+pedals hold the player vehicle
@@ -1584,7 +1588,7 @@ local function applyCmdJson(dt)
   -- Compare in whole microseconds: a float sum of exact 0.05 s polls lands just under 0.35.
   local staleUs = math.floor(cmdStaleAcc * 1e6 + 0.5)
   -- A file left over from an old session has heartbeat_mtime far behind the wall clock.
-  local ancient = hb ~= nil and (os.time() - hb) > CMD_DEAD_S
+  local ancient = hb ~= nil and (M._cmdWallClock() - hb) > CMD_DEAD_S
   if staleUs >= CMD_DEAD_S * 1e6 or ancient then
     if applying then
       -- Dead-man: the stream died while we held the car. Release it and disengage; Alt+G re-arms.
@@ -2115,6 +2119,11 @@ end
 
 function M.disengage()
   if engaged then M.toggleEngage() end
+end
+
+-- Test seam for the offline sim: fn() returns whole wall seconds on the sim clock; nil = os.time.
+function M.setWallClockForTest(fn)
+  M._cmdWallClock = fn or os.time
 end
 
 function M.isEngaged()

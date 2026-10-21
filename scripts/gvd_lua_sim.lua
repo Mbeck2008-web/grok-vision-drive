@@ -5,7 +5,9 @@
 --
 --   GVD_SIM_USER=<userfolder> lua5.1 scripts/gvd_lua_sim.lua      (cwd = repo root)
 --
--- stdin, one command per line:  step <dt_s> | engage | quit
+-- stdin, one command per line:  step <dt_s> [<wall_s>] | engage | quit
+-- With <wall_s> (sim wall time at the end of that frame, Unix seconds) the mod's wall clock
+-- follows the sim (whole seconds, like os.time) instead of the host's os.time.
 -- stdout per command: "ev <input> <value>" for each new input.event, then
 -- "st <engaged 0|1>", then "ok".
 
@@ -147,14 +149,23 @@ local function reply()
   io.stdout:flush()
 end
 
+local simWall = nil
+local function simWallClock() return math.floor(simWall) end
+
 M.onExtensionLoaded()
 reply()
 for line in io.stdin:lines() do
-  local cmd, arg = line:match('^(%S+)%s*(%S*)')
+  local cmd, arg, arg2 = line:match('^(%S+)%s*(%S*)%s*(%S*)')
   if cmd == 'quit' then break end
   if cmd == 'engage' then
     M.toggleEngage()
   elseif cmd == 'step' then
+    local wall = tonumber(arg2)
+    if wall then
+      -- A mod without the seam keeps the host os.time (the slow-runner check then fails).
+      if simWall == nil and M.setWallClockForTest then M.setWallClockForTest(simWallClock) end
+      simWall = wall
+    end
     M.onUpdate(tonumber(arg) or 0)
     drainGE()
   end

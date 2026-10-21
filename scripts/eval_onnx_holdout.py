@@ -61,8 +61,14 @@ def holdout_rows(
     mask_events: bool = False,
     holdout_blocks: int = 1,
     holdout_cells_file: Path | None = None,
+    cam_age: bool = False,
 ) -> tuple[list[list[dict]], str]:
-    """The trainer's holdout slices, in order, and its selection line."""
+    """The trainer's holdout slices, in order, and its selection line.
+
+    ``cam_age``: each row also gets the trainer's hold-last plan
+    (``cam_hold.annotate_hold`` on the same plan), so the ONNX sees the same
+    sectors and ages the val row did.
+    """
     from python.data.raw_frames import load_scene_rows, refuse_lossy
     from python.train.continual import CHUNK_MAX, pass_plan
     from python.train.event_mask import drop_masked, mask_file_sources, selection_line
@@ -86,6 +92,10 @@ def holdout_rows(
 
         cells = load_holdout_cells(Path(holdout_cells_file), rows)
     plan = pass_plan(rows, CHUNK_MAX, CHUNK_MAX // 2, blocks=int(holdout_blocks), cells=cells)
+    if cam_age:
+        from python.data.cam_hold import annotate_hold
+
+        annotate_hold(state_rows, rows, plan)
     return [list(item["rows"]) for item in plan if item["kind"] == "holdout"], text
 
 
@@ -105,9 +115,9 @@ def evaluate(
     import onnxruntime as ort  # type: ignore
 
     from python.debug.lane_targets import lane_center_is_valid, lane_gt_from_record, lane_x_from_vector
-    from python.train.cam_strip import cams_from_metadata
+    from python.train.cam_strip import cam_age_flag, cams_from_metadata
     from python.train.scene_net import step_dt
-    from python.train.train_scene import _frame_row, val_summary
+    from python.train.train_scene import _frame_row, row_ages, val_summary
 
     if int(eval_chunk) <= 0:
         raise ValueError("--eval-chunk must be > 0 (the single-sequence score is not reproduced here)")
@@ -123,6 +133,10 @@ def evaluate(
     inputs = {_base_name(item.name): item for item in session.get_inputs()}
     outputs = [_base_name(item.name) for item in session.get_outputs()]
     state_keys = [key for key in ("h", "tokens", "mask") if key in inputs]
+    # gvd_cam_age=1: the graph takes ``ages``; an older export has neither.
+    cam_age = cam_age_flag(meta)
+    if cam_age != ("ages" in inputs):
+        raise ValueError(f"{onnx_path}: gvd_cam_age={int(cam_age)} disagrees with the graph inputs {sorted(inputs)}")
 
     def fresh() -> dict[str, np.ndarray]:
         # SceneNet.initial_state: zero h and tokens, every residual slot older than RESIDUAL_S.
@@ -140,7 +154,10 @@ def evaluate(
         mask_events=mask_events,
         holdout_blocks=holdout_blocks,
         holdout_cells_file=holdout_cells_file,
+        cam_age=cam_age,
     )
+    if cache is not None and getattr(cache, "stale", False):
+        cache.require_fresh()
     pairs: list[tuple[float, float]] = []
     for rows in slices:
         state = fresh()
@@ -159,6 +176,8 @@ def evaluate(
             image = np.ascontiguousarray(np.transpose(image, (2, 0, 1))[None, ...])
             dt = np.asarray([step_dt(row.get("dt_s"))], dtype=np.float32)
             feeds = {"strip": image, "dt": dt, **state}
+            if cam_age:
+                feeds["ages"] = row_ages(row).reshape(1, -1)
             out = session.run(None, {inputs[key].name: value for key, value in feeds.items() if key in inputs})
             by_name = dict(zip(outputs, out))
             state = {key: np.asarray(by_name[key], dtype=np.float32) for key in state_keys}
@@ -182,6 +201,7 @@ def evaluate(
         "pred_mean": scored.get("pred_mean"),
         "pred_std": scored.get("pred_std"),
         "eval_chunk": int(eval_chunk),
+        "cam_age": bool(cam_age),
         "slices": len(slices),
         "holdout_rows": sum(len(rows) for rows in slices),
         "selection": selection,

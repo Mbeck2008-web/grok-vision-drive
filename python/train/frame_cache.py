@@ -2,10 +2,21 @@
 
 Each chunk is one ``.npy`` under 3.5 GB so a FAT32 data disk (4 GB per file)
 can hold it. The loader memory-maps the chunk and copies one frame out.
+
+Format ``gvd-frame-cache-2``: every sector is ``strip_writer.place_sector``
+(fit, then the repeater ego-edge mask), the same call the live strip makes,
+so a cached sector is byte-equal to ``compose_strip``'s. Format 1 kept the
+real pixels in the repeater ego band that live writes as 0. A cache without
+the version (or with a different one, or whose ``manifest.sha256`` does not
+match) is stale: ``FrameCache.stale`` is True, it serves nothing, and the
+trainer refuses it. A build is create-only: it goes into a new (or empty)
+folder, every file is created exclusively, the manifest is written last and
+its sha256 beside it. An existing cache is never overwritten in place.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -18,6 +29,12 @@ from python.train.cam_strip import canvas_width, parse_cams, scaled_layout, sect
 # Stay under the 4 GB FAT32 file limit with a little room for the header.
 CHUNK_BYTES = 3_500_000_000
 MANIFEST = "manifest.json"
+MANIFEST_SHA = "manifest.sha256"
+CACHE_FORMAT = "gvd-frame-cache-2"
+
+
+class StaleCacheError(RuntimeError):
+    """The cache folder is not this format. Rebuild it into a new folder."""
 
 
 def _sector_shape(cam_id: str) -> tuple[int, int, int]:
@@ -30,6 +47,10 @@ def frames_per_chunk(height: int, width: int) -> int:
     return max(1, CHUNK_BYTES // frame)
 
 
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
 class FrameCache:
     """Read-only map of frame index to a packed camera canvas."""
 
@@ -37,12 +58,35 @@ class FrameCache:
         self.root = Path(root)
         self.cams: tuple[str, ...] = ()
         self.canvas_w = 0
+        self.scale = 1.0
+        self.sectors: tuple[Any, ...] = ()
+        self.stale = False
+        self.reason = ""
+        self.format: str | None = None
+        self.manifest_sha256: str | None = None
         self._open: dict[str, np.ndarray] = {}
         self._by_index: dict[int, list[tuple[str, str, int]]] = {}
         manifest = self.root / MANIFEST
         if not manifest.is_file():
             return
-        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        data = manifest.read_bytes()
+        self.manifest_sha256 = _sha256(data)
+        payload = json.loads(data.decode("utf-8"))
+        self.format = payload.get("format")
+        if self.format != CACHE_FORMAT:
+            self.stale = True
+            self.reason = (
+                f"{self.root} is cache format {self.format or '1 (unversioned)'}, not {CACHE_FORMAT}: "
+                "its repeater sectors keep the ego band live paints black. Rebuild it with "
+                "--build-cache into a NEW folder (an old cache is never rewritten in place)."
+            )
+            return
+        sha_file = self.root / MANIFEST_SHA
+        want = sha_file.read_text(encoding="utf-8").split()[0] if sha_file.is_file() else ""
+        if want != self.manifest_sha256:
+            self.stale = True
+            self.reason = f"{self.root}: {MANIFEST} sha256 does not match {MANIFEST_SHA}; rebuild into a new folder"
+            return
         self.cams = parse_cams(",".join(payload.get("cams") or []))
         self.scale = float(payload.get("scale") or 1.0)
         self.sectors, _height, self.canvas_w = scaled_layout(self.cams, self.scale)
@@ -56,6 +100,11 @@ class FrameCache:
                     continue
                 self._by_index.setdefault(index, []).append((name, cam, slot))
 
+    def require_fresh(self) -> None:
+        """Raise ``StaleCacheError`` for a stale cache."""
+        if self.stale:
+            raise StaleCacheError(self.reason)
+
     def __getstate__(self) -> dict[str, Any]:
         """Drop memory maps. A spawned worker reopens them on the first read."""
         state = dict(self.__dict__)
@@ -68,6 +117,17 @@ class FrameCache:
 
     def has(self, index: int) -> bool:
         return int(index) in self._by_index
+
+    def sector(self, cam: str, index: int) -> np.ndarray | None:
+        """One camera's cached sector for tick ``index``, or None."""
+        for name, part_cam, slot in self._by_index.get(int(index)) or ():
+            if part_cam != cam:
+                continue
+            pixels = self._pixels(name)
+            if pixels is None or slot >= int(pixels.shape[0]):
+                return None
+            return np.array(pixels[slot], copy=True)
+        return None
 
     def canvas(self, index: int) -> np.ndarray | None:
         parts = self._by_index.get(int(index))
@@ -99,31 +159,22 @@ class FrameCache:
         return array
 
 
-def _fit_sector(image: np.ndarray, width: int) -> np.ndarray:
-    from python.data.strip_writer import _fit
+def _fit_sector(image: np.ndarray, cam: str) -> np.ndarray:
+    from python.data.strip_writer import place_sector
 
-    return _fit(image, width, CANVAS_H)
+    return place_sector(cam, image)
 
 
 def _read_cam(root: Path, cam: str, index: int) -> np.ndarray | None:
-    from python.data.raw_frames import raw_frame_candidates, read_image_with_repair
+    """The file the raw training path reads for this camera and tick."""
+    from python.data.raw_frames import load_raw_camera
 
-    paths = [
-        (suffix, path)
-        for suffix in (".png", ".npy")
-        for path in raw_frame_candidates(root / "raw", cam, index, suffix)
-    ]
-    for suffix, path in paths:
-        if suffix == ".npy" and path.is_file():
-            array = np.load(path)
-            if isinstance(array, np.ndarray) and array.ndim >= 2:
-                return array
-            continue
-        if path.is_file():
-            image = read_image_with_repair(path)
-            if image is not None:
-                return image
-    return None
+    return load_raw_camera(root, cam, index)
+
+
+def _create(path: Path, data: bytes) -> None:
+    with open(path, "xb") as handle:
+        handle.write(data)
 
 
 def build_frame_cache(
@@ -134,11 +185,20 @@ def build_frame_cache(
     scale: float = 1.0,
     progress: Any = None,
 ) -> dict[str, Any]:
-    """Decode ``cams`` at sector size into chunked ``.npy`` files under ``dest``."""
+    """Decode ``cams`` at sector size into chunked ``.npy`` files under ``dest``.
+
+    ``dest`` must be new or empty. Raises ``FileExistsError`` otherwise.
+    """
+    import io
+
     from python.data.raw_frames import read_state_jsonl
 
     root = Path(strip_root)
     out = Path(dest)
+    if out.exists() and (not out.is_dir() or any(out.iterdir())):
+        raise FileExistsError(
+            f"{out} is not empty; a cache is built create-only into a new folder and never rewritten in place"
+        )
     out.mkdir(parents=True, exist_ok=True)
     names = parse_cams(cams if isinstance(cams, str) else ",".join(cams))
     factor = 1.0 if float(scale) >= 0.999 else float(scale)
@@ -166,7 +226,9 @@ def build_frame_cache(
                 return
             stack = np.stack(batch_px, axis=0)
             file_name = f"{cam}_{len(chunks):03d}.npy"
-            np.save(out / file_name, stack)
+            buffer = io.BytesIO()
+            np.save(buffer, stack)
+            _create(out / file_name, buffer.getvalue())
             chunks.append({"file": file_name, "cam": cam, "ids": list(batch_ids)})
             written += len(batch_ids)
             batch_ids.clear()
@@ -178,7 +240,7 @@ def build_frame_cache(
             image = _read_cam(root, cam, index)
             if image is None:
                 continue
-            fitted = _fit_sector(np.asarray(image), int(_sector_shape(cam)[1]))
+            fitted = _fit_sector(np.asarray(image), cam)
             if factor < 0.999:
                 import cv2
 
@@ -189,6 +251,8 @@ def build_frame_cache(
                 flush()
         flush()
     manifest = {
+        "format": CACHE_FORMAT,
+        "sector": "strip_writer.place_sector (fit, then the repeater ego-edge mask)",
         "cams": list(names),
         "canvas_h": CANVAS_H if factor >= 0.999 else max(1, int(round(CANVAS_H * factor))),
         "canvas_w": canvas_width(names) if factor >= 0.999 else max(1, int(round(canvas_width(names) * factor))),
@@ -196,5 +260,9 @@ def build_frame_cache(
         "chunks": chunks,
         "frames": written // max(1, len(names)),
     }
-    (out / MANIFEST).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    data = (json.dumps(manifest, indent=2) + "\n").encode("utf-8")
+    _create(out / MANIFEST, data)
+    digest = _sha256(data)
+    _create(out / MANIFEST_SHA, f"{digest}  {MANIFEST}\n".encode("utf-8"))
+    manifest["manifest_sha256"] = digest
     return manifest

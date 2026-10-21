@@ -133,6 +133,17 @@ def _clear_ego(cam_id: str, placed: np.ndarray) -> np.ndarray:
     return placed
 
 
+def place_sector(cam_id: str, img: np.ndarray) -> np.ndarray:
+    """One camera's sector pixels: fit to the sector, then the ego-edge mask.
+
+    The one function the live strip (``compose_strip``) and the training frame
+    cache (``frame_cache.build_frame_cache``) both call, so their sectors are
+    byte-equal.
+    """
+    width = sector_width(cam_id)
+    return _clear_ego(cam_id, _fit(img, width, CANVAS_H))
+
+
 def compose_strip(frames: Mapping[str, Any] | None) -> np.ndarray:
     """Paint this call's pictures onto a fresh canvas.
 
@@ -146,8 +157,7 @@ def compose_strip(frames: Mapping[str, Any] | None) -> np.ndarray:
             img = _picture(src.get("cam_main"))
         if img is None:
             continue
-        placed = _clear_ego(sec.cam_id, _fit(img, sec.width, CANVAS_H))
-        canvas[:, sec.x0 : sec.x1] = placed
+        canvas[:, sec.x0 : sec.x1] = place_sector(sec.cam_id, img)
     return canvas
 
 

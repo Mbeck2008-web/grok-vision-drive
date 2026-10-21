@@ -1309,16 +1309,23 @@ if torch is not None:
     class SceneNet(nn.Module):
         """Strip in, planner tensors out. Hidden size 512. No steer head."""
 
-        def __init__(self, cams: tuple[str, ...] | None = None, scale: float = 1.0) -> None:
+        def __init__(self, cams: tuple[str, ...] | None = None, scale: float = 1.0, cam_age: bool = False) -> None:
             super().__init__()
+            from python.data.cam_hold import CAM_AGE_N
             from python.train.cam_strip import parse_cams, scaled_layout
 
             self.cams = parse_cams(",".join(cams) if cams else "")
             self.scale = 1.0 if float(scale) >= 0.999 else float(scale)
             self.sectors, self.canvas_h, self.canvas_w = scaled_layout(self.cams, self.scale)
-            self.token_dim = len(self.sectors) * SECTOR_FEAT
-            if self.cams == tuple(STRIP_ORDER) and self.token_dim != TOKEN_DIM:
+            sector_dim = len(self.sectors) * SECTOR_FEAT
+            if self.cams == tuple(STRIP_ORDER) and sector_dim != TOKEN_DIM:
                 raise RuntimeError("8 sector features must concatenate to the 512-d token")
+            # --cam-age: the 8 per-camera hold ages (cam_hold.CAM_AGE_ORDER) are
+            # appended to the token. The stem is unchanged.
+            self.cam_age = bool(cam_age)
+            self.token_dim = sector_dim + (CAM_AGE_N if self.cam_age else 0)
+            if self.cam_age:
+                self.pause_arch = checkpoint_arch(self.cams) + f":cam_age={CAM_AGE_N}"
             self.stem = SharedStem()
             # The dropped tensor is the GRU input. ``state.h`` is not dropped.
             self.gru_in_drop = nn.Dropout(p=GRU_IN_DROPOUT)
@@ -1342,24 +1349,35 @@ if torch is not None:
                 mask=torch.full((width, RESIDUAL_TOKENS), empty_age, device=device, dtype=dtype),
             )
 
-        def forward(self, strip: Any, dt: Any, state: SceneState) -> tuple[ScenePrediction, SceneState]:
+        def forward(
+            self, strip: Any, dt: Any, state: SceneState, ages: Any = None
+        ) -> tuple[ScenePrediction, SceneState]:
             """One strip, seconds since the previous strip, and the GRU state.
 
             Planner tensors have no batch dimension. A training batch uses
-            ``forward_batch`` and keeps the leading dimension.
+            ``forward_batch`` and keeps the leading dimension. A ``cam_age``
+            net needs ``ages`` (8 floats, ``cam_hold.CAM_AGE_ORDER``).
             """
             image = _strip_nchw(strip, width=self.canvas_w, height=self.canvas_h)
-            pred, new_state = self._forward_batched(image, dt, state)
+            pred, new_state = self._forward_batched(image, dt, state, ages)
             return _prediction_at(pred, 0), new_state
 
-        def forward_batch(self, strip: Any, dt: Any, state: SceneState) -> tuple[ScenePrediction, SceneState]:
+        def forward_batch(
+            self, strip: Any, dt: Any, state: SceneState, ages: Any = None
+        ) -> tuple[ScenePrediction, SceneState]:
             """Several strips in one step. Outputs keep the batch dimension."""
             image = _strip_nchw(strip, allow_batch=True, width=self.canvas_w, height=self.canvas_h)
-            return self._forward_batched(image, dt, state)
+            return self._forward_batched(image, dt, state, ages)
 
-        def _forward_batched(self, image: Any, dt: Any, state: SceneState) -> tuple[ScenePrediction, SceneState]:
+        def _forward_batched(
+            self, image: Any, dt: Any, state: SceneState, ages: Any = None
+        ) -> tuple[ScenePrediction, SceneState]:
             state = _state_on(state, image)
             token = self._token(image)
+            if self.cam_age:
+                token = torch.cat([token, _ages_column(ages, image)], dim=-1)
+            elif ages is not None:
+                raise ValueError("this scene net has no cam-age input; ages were given")
             dt_col = _dt_column(dt, image)
             # The step time is the value that arrived. It is not rewritten to a fixed period.
             # Dropout is on the token. dt and the recurrent state are not dropped.
@@ -1455,6 +1473,22 @@ if torch is not None:
                 strip = strip / 255.0
         return strip
 
+    def _ages_column(ages: Any, image: Any) -> Any:
+        """``(B, 1, 8)`` ages on the image's device. Missing ages are an error."""
+        from python.data.cam_hold import CAM_AGE_N
+
+        width = int(image.shape[0])
+        if ages is None:
+            raise ValueError("this scene net was trained with --cam-age and needs the 8 per-camera ages")
+        if not torch.is_tensor(ages):
+            ages = torch.as_tensor(np.asarray(ages, dtype=np.float32))
+        ages = ages.to(device=image.device, dtype=image.dtype).reshape(-1, CAM_AGE_N)
+        if int(ages.shape[0]) == 1 and width != 1:
+            ages = ages.expand(width, CAM_AGE_N)
+        if int(ages.shape[0]) != width:
+            raise ValueError(f"ages batch {int(ages.shape[0])} does not match strips {width}")
+        return ages.reshape(width, 1, CAM_AGE_N)
+
     def _dt_column(dt: Any, image: Any) -> Any:
         width = int(image.shape[0])
         if not torch.is_tensor(dt):
@@ -1488,17 +1522,28 @@ if torch is not None:
             super().__init__()
             self.net = net
 
-        def forward(self, strip: Any, dt: Any, h: Any, tokens: Any, mask: Any) -> tuple[Any, ...]:
-            pred, state = self.net(strip, dt, SceneState(h=h, tokens=tokens, mask=mask))
+        def forward(self, strip: Any, dt: Any, h: Any, tokens: Any, mask: Any, ages: Any = None) -> tuple[Any, ...]:
+            state_in = SceneState(h=h, tokens=tokens, mask=mask)
+            # Only a cam_age net takes ages; other nets (the pretrained one) keep the 3-argument call.
+            if ages is None:
+                pred, state = self.net(strip, dt, state_in)
+            else:
+                pred, state = self.net(strip, dt, state_in, ages)
             fields = tuple(getattr(pred, name) for name in OUTPUT_FIELDS)
             return fields + (state.h, state.tokens, state.mask)
 
     def _trace_scene_onnx(model: Any, args: tuple[Any, ...], path_str: str) -> None:
-        """Trace the FP32 graph. The module and ``args`` are already on CPU."""
+        """Trace the FP32 graph. The module and ``args`` are already on CPU.
+
+        A ``cam_age`` net takes a sixth input, ``ages`` (1x8).
+        """
         wrapper = _OnnxScene(model).eval()
         output_names = list(OUTPUT_FIELDS) + ["h", "tokens", "mask"]
+        input_names = ["strip", "dt", "h", "tokens", "mask"]
+        if bool(getattr(model, "cam_age", False)):
+            input_names.append("ages")
         export_kwargs = dict(
-            input_names=["strip", "dt", "h", "tokens", "mask"],
+            input_names=input_names,
             output_names=output_names,
             opset_version=17,
         )
@@ -1561,6 +1606,10 @@ def cpu_export_inputs(net: Any, zeros: Any) -> tuple[Any, tuple[Any, ...]]:
     )
     dt = zeros(1, device="cpu")
     state = model.initial_state(device="cpu")
+    if bool(getattr(model, "cam_age", False)):
+        from python.data.cam_hold import CAM_AGE_N
+
+        return model, (strip, dt, state.h, state.tokens, state.mask, zeros(1, CAM_AGE_N, device="cpu"))
     return model, (strip, dt, state.h, state.tokens, state.mask)
 
 
@@ -1572,6 +1621,7 @@ def export_scene_onnx(
     trace: Any = None,
     cams: tuple[str, ...] | None = None,
     heads: tuple[str, ...] | None = None,
+    cam_age: bool = False,
 ) -> Path:
     """Write the FP32 graph. Mixed precision does not change this file.
 
@@ -1584,7 +1634,7 @@ def export_scene_onnx(
         if torch is None:
             raise ImportError("PyTorch is not installed")
     if net is None:
-        net = SceneNet(cams=cams) if cams else SceneNet()
+        net = SceneNet(cams=cams, cam_age=bool(cam_age)) if cams else SceneNet(cam_age=bool(cam_age))
     if zeros is None:
         zeros = torch.zeros
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1599,6 +1649,6 @@ def export_scene_onnx(
     if used:
         stamp_onnx_metadata(
             str(path),
-            metadata_dict(used, heads, height=CANVAS_H, width=width),
+            metadata_dict(used, heads, height=CANVAS_H, width=width, cam_age=bool(getattr(net, "cam_age", False))),
         )
     return path

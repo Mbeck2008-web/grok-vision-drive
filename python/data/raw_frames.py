@@ -966,15 +966,68 @@ def load_raw_cameras(root: Path | str, index: int) -> dict[str, np.ndarray]:
     for folder in raw.iterdir():
         if not folder.is_dir():
             continue
-        png = _first_file(raw_frame_candidates(raw, folder.name, index, ".png"))
-        npy = _first_file(raw_frame_candidates(raw, folder.name, index, ".npy"))
-        if png is not None:
-            image = read_image_with_repair(png)
-            if image is not None:
-                frames[folder.name] = image
-        elif npy is not None:
-            frames[folder.name] = np.load(npy)
+        image = load_raw_camera(root, folder.name, index)
+        if image is not None:
+            frames[folder.name] = image
     return frames
+
+
+def load_raw_camera(root: Path | str, cam: str, index: int) -> np.ndarray | None:
+    """One camera's file for tick ``index``, read as ``load_raw_cameras`` reads it.
+
+    The PNG wins when it exists (a repaired copy replaces one that does not
+    decode); the ``.npy`` is read only when there is no PNG. None when neither
+    gives a picture.
+    """
+    raw = Path(root) / "raw"
+    png = _first_file(raw_frame_candidates(raw, str(cam), int(index), ".png"))
+    if png is not None:
+        return read_image_with_repair(png)
+    npy = _first_file(raw_frame_candidates(raw, str(cam), int(index), ".npy"))
+    if npy is not None:
+        return np.load(npy)
+    return None
+
+
+def held_frames(
+    root: Path | str,
+    sources: Mapping[str, tuple[int | None, float]],
+    reader: Any = None,
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """Pictures and the 8 ages for one row's hold plan (``cam_hold.hold_sources``).
+
+    Each camera's picture is its source row's file (``reader(cam, index)``,
+    default ``load_raw_camera``). A source that does not decode is a black
+    sector with age -1, so the age always says what the net sees.
+    """
+    from python.data.cam_hold import CAM_AGE_ORDER, NO_FRAME_AGE, ages_vector
+
+    read = reader or (lambda cam, index: load_raw_camera(root, cam, index))
+    frames: dict[str, np.ndarray] = {}
+    ages: dict[str, float] = {}
+    for cam in CAM_AGE_ORDER:
+        src, age = sources.get(cam, (None, NO_FRAME_AGE))
+        image = None if src is None else read(cam, int(src))
+        if image is None:
+            ages[cam] = NO_FRAME_AGE
+            continue
+        frames[cam] = image
+        ages[cam] = float(age)
+    return frames, ages_vector(ages)
+
+
+def load_held_bgr(
+    root: Path | str,
+    sources: Mapping[str, tuple[int | None, float]],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Hold-last training canvas from raw files and its 8 ages (``--cam-age``).
+
+    Stitched by ``compose_strip``, the same call the live strip makes.
+    """
+    frames, ages = held_frames(root, sources)
+    if not frames:
+        raise FileNotFoundError(f"no decodable raw frame for this tick's hold plan under {Path(root) / 'raw'}")
+    return compose_strip(frames), ages
 
 
 def _first_file(paths: list[Path]) -> Path | None:

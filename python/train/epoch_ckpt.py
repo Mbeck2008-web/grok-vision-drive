@@ -205,14 +205,19 @@ def find_epoch_ckpt(ckpt_dir: Path | str, epoch: int, run: str | None = None) ->
 
 
 def build_net(meta: Mapping[str, Any]) -> Any:
-    """A CPU net of the checkpoint's architecture (cams, scale, backbone)."""
+    """A CPU net of the checkpoint's architecture (cams, scale, backbone, cam_age).
+
+    A checkpoint written before ``cam_age`` existed has no key: no ages.
+    """
     cams = tuple(meta.get("cams") or ()) or None
     scale = float(meta.get("scale") or 1.0)
     backbone = str(meta.get("backbone") or "scratch")
     if backbone in ("", "scratch"):
         from python.train.scene_net import SceneNet
 
-        return SceneNet(cams=cams, scale=scale)
+        return SceneNet(cams=cams, scale=scale, cam_age=bool(meta.get("cam_age")))
+    if meta.get("cam_age"):
+        raise ValueError("a --cam-age checkpoint is a scratch-net checkpoint; this one names a backbone")
     from python.train.pretrained_net import build_scene_net
 
     return build_scene_net(cams, scale, backbone, freeze=bool(meta.get("freeze_backbone")))

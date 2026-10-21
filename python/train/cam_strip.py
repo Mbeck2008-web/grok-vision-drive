@@ -204,8 +204,13 @@ def metadata_dict(
     *,
     height: int,
     width: int,
+    cam_age: bool = False,
 ) -> dict[str, str]:
     """String metadata stored on the ONNX model.
+
+    ``gvd_cam_age`` is ``1`` when the graph takes the ``ages`` input (8
+    per-camera hold ages, ``cam_hold.CAM_AGE_ORDER``), else ``0``. A model
+    without the key is an older export: no ages (``cam_age_flag``).
 
     ``gvd_heads_trained`` is the heads the run trained (``--heads``; empty =
     all). ``gvd_outputs_untrained`` lists every exported output of a head that
@@ -214,14 +219,71 @@ def metadata_dict(
     """
     trained = tuple(heads) if heads else HEAD_NAMES
     untrained = [out for head in HEAD_NAMES if head not in trained for out in HEAD_OUTPUTS[head]]
-    return {
+    from python.data.cam_hold import (
+        CAM_AGE_CAP_META,
+        CAM_AGE_HZ_META,
+        CAM_AGE_META,
+        CAM_AGE_ORDER,
+        CAM_AGE_ORDER_META,
+        HOLD_CAP_S,
+        HOLD_TICK_HZ,
+    )
+
+    props = {
         "gvd_cams": ",".join(cams),
         "gvd_heads": ",".join(trained),
         "gvd_heads_trained": ",".join(trained),
         "gvd_outputs_untrained": ",".join(untrained),
         "gvd_canvas_h": str(int(height)),
         "gvd_canvas_w": str(int(width)),
+        CAM_AGE_META: "1" if cam_age else "0",
     }
+    if cam_age:
+        props[CAM_AGE_ORDER_META] = ",".join(CAM_AGE_ORDER)
+        props[CAM_AGE_CAP_META] = repr(float(HOLD_CAP_S))
+        props[CAM_AGE_HZ_META] = str(int(HOLD_TICK_HZ))
+    return props
+
+
+class CamAgeFlagError(ValueError):
+    """The model's ``gvd_cam_age`` metadata cannot be read or disagrees with its inputs."""
+
+
+def cam_age_flag(meta: Mapping[str, str] | None) -> bool:
+    """True when the model takes ``ages``. Absent is an older export (False).
+
+    Anything other than ``0`` / ``1``, or a ``1`` whose order, cap or tick is
+    not this build's, raises ``CamAgeFlagError``.
+    """
+    from python.data.cam_hold import (
+        CAM_AGE_CAP_META,
+        CAM_AGE_HZ_META,
+        CAM_AGE_META,
+        CAM_AGE_ORDER,
+        CAM_AGE_ORDER_META,
+        HOLD_CAP_S,
+        HOLD_TICK_HZ,
+    )
+
+    meta = dict(meta or {})
+    raw = meta.get(CAM_AGE_META)
+    if raw is None or str(raw).strip() == "0":
+        return False
+    if str(raw).strip() != "1":
+        raise CamAgeFlagError(f"{CAM_AGE_META}={raw!r} is not 0 or 1")
+    order = str(meta.get(CAM_AGE_ORDER_META) or "")
+    if order != ",".join(CAM_AGE_ORDER):
+        raise CamAgeFlagError(f"{CAM_AGE_ORDER_META}={order!r}, this build feeds {','.join(CAM_AGE_ORDER)}")
+    try:
+        cap = float(meta.get(CAM_AGE_CAP_META))
+        hz = int(meta.get(CAM_AGE_HZ_META))
+    except (TypeError, ValueError) as exc:
+        raise CamAgeFlagError(f"{CAM_AGE_CAP_META}/{CAM_AGE_HZ_META} missing or unreadable") from exc
+    if cap != float(HOLD_CAP_S) or hz != int(HOLD_TICK_HZ):
+        raise CamAgeFlagError(
+            f"model ages are cap={cap} s at {hz} Hz; this build feeds cap={HOLD_CAP_S} s at {HOLD_TICK_HZ} Hz"
+        )
+    return True
 
 
 class UntrainedOutputError(RuntimeError):

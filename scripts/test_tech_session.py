@@ -1254,13 +1254,20 @@ def check_beamngpy_side_grab_half_rate() -> None:
         assert "main" in first.unique_gpu_ids
         assert "main" not in second.unique_gpu_ids
 
-        # live unique-Hz hitch 800→400 (warmup already elapsed)
+        # live unique-Hz hitch 800→400 (warmup already elapsed): off by default
+        # (the recorder never hitches), so narrow stays at the attach yaml's 800.
         import time as _time
 
         be._open_mono = _time.monotonic() - LIVE_NARROW_HITCH_AFTER_S - 0.1
         be._unique_n = 10
         be._unique_hz_ema = 4.0
         be._narrow_live_hitched = False
+        far_before = be._clip_planes["narrow"][1]
+        assert be._live_narrow_hitch is False
+        be._maybe_live_narrow_hitch()
+        assert not be._narrow_live_hitched and be._clip_planes["narrow"][1] == far_before
+        # The reattach mechanics, opted in.
+        be._live_narrow_hitch = True
         be._maybe_live_narrow_hitch()
         assert be._narrow_live_hitched
         assert abs(be._clip_planes["narrow"][1] - NARROW_FAR_LIVE_HITCH_M) < 1e-9
@@ -2794,6 +2801,7 @@ def check_narrow_reattach_and_cam_io_edges() -> None:
         be._adhoc = None
         be._adhoc_ready = False
         be._owed = ["wide"]
+        be._live_narrow_hitch = True
         be._open_mono = time.monotonic() - LIVE_NARROW_HITCH_AFTER_S - 0.2
         be._unique_n = 10
         be._unique_hz_ema = 4.0

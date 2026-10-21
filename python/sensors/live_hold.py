@@ -14,10 +14,20 @@ the recorder made it:
   cams_with_a_frame)``, the call the recorder makes before writing a row.
   Only a stored side frame enters the hold.
 * **Age**: a stored frame carries its wall stamp (``time.time()`` right after
-  its read, the recorder's ``cams.<cam>.t``). ``now`` is main's stamp (the
-  recorder's ``cams.main.t``, ``cam_hold.row_now``). ``cam_hold.held_sector``
-  quantises to 1/15 s and caps at 1.5 s. Both clocks are wall time, never a
-  tick count, so the ages do not depend on the loop rate.
+  its read, the recorder's ``cams.<cam>.t``). ``now`` is main's stamp, as in
+  the recorder: ``cam_hold.row_now`` is the row's ``cams.main.t``, the
+  ``time.time()`` taken right after main's ``stream_raw``
+  (``collect_scene_lanes._read_camera``). The recorder reads main second
+  (yaml order narrow, main, wide, sides, rear) at ~1 ms per camera, so its
+  companions land a few ms after ``now``, inside ``held_sector``'s half-tick
+  look-ahead allowance: same-pass companions are this row's frames at age 0.
+  Live reads take ~8 ms per camera, so a companion read after main would land
+  31-88 ms after ``now`` and ``held_sector`` would call it a later frame
+  (black). A frame read in this tick's pass is this tick's frame: its stamp is
+  ``min(read stamp, now)`` (``pass_stamp``), the recorder's decision whatever
+  the per-camera read time. ``cam_hold.held_sector`` quantises to 1/15 s and
+  caps at 1.5 s. Both clocks are wall time, never a tick count, so the ages
+  do not depend on the loop rate.
 * **Fronts** (main, narrow, wide) are this tick's read at age 0, or black / -1
   when the read is missing. main is never held.
 """
@@ -35,6 +45,19 @@ from python.data.raw_frames import CameraSchedule
 # Read every tick and shown at age 0 (never held).
 FRONT_CAMS = frozenset(("main", "narrow", "wide"))
 SIDE_CAMS: tuple[str, ...] = tuple(cam for cam in CAM_AGE_ORDER if cam not in FRONT_CAMS)
+
+
+def pass_stamp(wall: Any, now_t: Any) -> Any:
+    """A frame read in this tick's pass is this tick's frame: ``min(wall, now)``.
+
+    The recorder's same-pass companions are stamped within a few ms after main
+    (~1 ms reads), inside the half-tick allowance; live reads are slower, so the
+    raw stamp would trip ``held_sector``'s never-look-ahead rule. ``now_t``
+    None (no main this tick): the raw stamp.
+    """
+    if wall is None or now_t is None:
+        return wall
+    return min(float(wall), float(now_t))
 
 
 def recorder_schedule() -> CameraSchedule:
@@ -68,12 +91,12 @@ class LiveStreamHold:
         present = [cid for cid in frames if cid in CAM_AGE_ORDER and frames[cid] is not None]
         taken = self.schedule.tick(float(mono_now), present)
         self.last_taken = tuple(taken)
+        now_t = walls.get("main") if frames.get("main") is not None else None
         for cid in taken:
             if cid in FRONT_CAMS:
                 continue
-            self.hold.note(cid, walls.get(cid), frames[cid])
+            self.hold.note(cid, pass_stamp(walls.get(cid), now_t), frames[cid])
             self.stored_by_cam[cid] = self.stored_by_cam.get(cid, 0) + 1
-        now_t = walls.get("main") if frames.get("main") is not None else None
         if now_t is None:
             # No main read: no ``now``; a recorded row without main is never trained.
             return {}, no_ages()
@@ -323,3 +346,32 @@ __all__ = [
     "scrub_after_respawn",
     "vehicle_data_stale",
 ]
+
+
+def reads_text(read_log: Any) -> str:
+    """``main:ok:7.91,narrow:zero:8.03,...`` (status and read ms per camera, ``CAM_AGE_ORDER``); ``na`` without a log."""
+    if not isinstance(read_log, Mapping):
+        return "na"
+    status = read_log.get("status") or {}
+    read_ms = read_log.get("read_ms") or {}
+    parts = []
+    for cam in CAM_AGE_ORDER:
+        if cam not in status:
+            continue
+        ms = read_ms.get(cam)
+        parts.append(f"{cam}:{status[cam]}:{'na' if ms is None else f'{float(ms):.2f}'}")
+    return ",".join(parts) or "na"
+
+
+def parse_reads_text(text: str) -> dict[str, tuple[str, float | None]]:
+    out: dict[str, tuple[str, float | None]] = {}
+    for part in str(text or "").split(","):
+        bits = part.split(":")
+        if len(bits) != 3:
+            continue
+        try:
+            ms = None if bits[2] == "na" else float(bits[2])
+        except ValueError:
+            ms = None
+        out[bits[0].strip()] = (bits[1], ms)
+    return out

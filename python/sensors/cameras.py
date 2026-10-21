@@ -80,6 +80,13 @@ NARROW_FAR_LIVE_HITCH_M = 400.0  # live unique-frame Hz hitch (800→400 if stil
 CAMERA_HZ_TARGET = 10.0
 LIVE_NARROW_HITCH_AFTER_S = 2.0
 LIVE_NARROW_HITCH_MIN_UNIQUE = 4
+# The recorder (scripts/collect_scene_lanes._attach_cameras) attaches every
+# camera once at the attach yaml's far_m and never reattaches: no hitch. Every
+# rec5c row with a narrow frame has narrow far_m 800. Live drives the same
+# cameras, so the unique-Hz narrow hitch is off; narrow stays at 800 m.
+RECORDER_NARROW_HITCH = False
+# Per-camera read status in the cam-age telemetry (enable_read_log).
+READ_STATUSES = ("ok", "none", "zero", "flash_filtered", "reattach", "busy", "timeout", "error", "skip")
 DEFAULT_FAR_M = {
     "narrow": 800.0,
     "main": 300.0,
@@ -162,6 +169,9 @@ class CameraFrameBundle:
     # for compose_strip.
     cam_ages: tuple[float, ...] | None = None
     held_frames: dict[str, np.ndarray] = field(default_factory=dict)
+    # Per-camera read status / read ms, main's age at the end of the pass and the
+    # bookkeeping cost (cam-age telemetry, ``enable_read_log``); None otherwise.
+    read_log: dict[str, Any] | None = None
 
     def tick_frames(self) -> dict[str, np.ndarray]:
         """Pictures whose timestamps are this grab. An older stamp is left out."""
@@ -1435,7 +1445,12 @@ class BeamNGPyBackend:
         self._unique_n = 0
         self._open_mono = 0.0
         self._narrow_live_hitched = False
-        self._last_unique_tick_t = 0.0
+        # The 800->400 narrow hitch runs only when the recorder hitches too (it never does).
+        self._live_narrow_hitch = RECORDER_NARROW_HITCH
+        # Per-camera read status / read ms, cam-age telemetry only (enable_read_log).
+        self._read_log_on = False
+        self._reattached: set[str] = set()
+        self._last_status: str = ""
         # One ad-hoc companion render in flight: (cid, request_id).
         self._adhoc: tuple[str, int] | None = None
         self._adhoc_ready = False
@@ -1747,8 +1762,13 @@ class BeamNGPyBackend:
                     pass
 
     def _maybe_live_narrow_hitch(self) -> None:
-        """Runtime 800→400 when unique-frame Hz stays <10. Attach yaml stays 800."""
-        if self._narrow_live_hitched:
+        """Runtime 800→400 when unique-frame Hz stays <10. Attach yaml stays 800.
+
+        Off unless ``_live_narrow_hitch`` (``RECORDER_NARROW_HITCH``): the recorder
+        never hitches, and unique-frame Hz is capped by the loop rate, so it fired
+        at tick 4 of every live run.
+        """
+        if not self._live_narrow_hitch or self._narrow_live_hitched:
             return
         planes = self._clip_planes.get("narrow")
         if not planes:
@@ -1833,6 +1853,7 @@ class BeamNGPyBackend:
         self._clip_planes[cid] = (near, float(far_m))
         self._hitch_steps.append((cid, near, float(far_m), rate))
         self._frame_sig.pop(cid, None)
+        self._reattached.add(cid)
         return True
 
     def _io_busy(self) -> bool:
@@ -1980,14 +2001,17 @@ class BeamNGPyBackend:
         unique_ids: list[str],
     ) -> None:
         if bgr is None or frame_is_unrendered(bgr):
+            self._last_status = "none" if bgr is None else "zero"
             self._omit_unread(cid, frames, timestamps, health)
             return
         bgr = resize_long_side(bgr, self.long_side)
         if cid != "main" and companion_frame_is_flash(bgr, self._cache_frames.get(cid)):
             # Brighter and blue in the shadows. Not stored, and not replaced
             # by the previous tick. Judged before the tone curve.
+            self._last_status = "flash_filtered"
             self._omit_unread(cid, frames, timestamps, health)
             return
+        self._last_status = "ok"
         bgr = recover_viewport_tone(bgr)
         sig = frame_signature(bgr)
         unique = sig != self._frame_sig.get(cid)
@@ -2106,6 +2130,10 @@ class BeamNGPyBackend:
         self._live_hold = hold
         return hold
 
+    def enable_read_log(self) -> None:
+        """Per-camera read status and read ms on every grab (cam-age telemetry only)."""
+        self._read_log_on = True
+
     def reset_live_hold(self) -> None:
         """Respawn / reset / level load: the schedule re-anchors and no frame is held."""
         if self._live_hold is not None:
@@ -2151,25 +2179,45 @@ class BeamNGPyBackend:
         live_hold = self._live_hold
         # Wall time right after each read: the recorder's cams.<cam>.t.
         walls: dict[str, float] = {}
+        log_on = self._read_log_on
+        read_status: dict[str, str] = {}
+        read_ms: dict[str, float] = {}
+        log_cost = 0.0
         for cid, cam in main_first:
             if not self._grab_this_tick(cid, grab_i):
                 self._omit_unread(cid, frames, timestamps, health)
+                if log_on:
+                    read_status[cid] = "skip"
                 continue
             if cid != "main":
                 companion_polled = True
+            self._last_status = ""
+            r0 = time.perf_counter()
             try:
                 bgr = self._bounded_sensor_colour(cid, cam)
                 walls[cid] = time.time()
                 if bgr is _IO_BUSY or bgr is _IO_TIMEOUT:
+                    self._last_status = "busy" if bgr is _IO_BUSY else "timeout"
                     self._omit_unread(cid, frames, timestamps, health)
                 else:
                     self._publish_read(cid, bgr, ts, frames, timestamps, health, unique_ids)
             except Exception:
+                self._last_status = "error"
                 health[cid] = CamHealth.ERROR
                 frames.pop(cid, None)
                 timestamps.pop(cid, None)
                 if cid == "main":
                     frames.pop("cam_main", None)
+            if log_on:
+                c0 = time.perf_counter()
+                read_ms[cid] = (c0 - r0) * 1000.0
+                status = self._last_status or "none"
+                if cid in self._reattached:
+                    # The first read after a reattach (new Camera on the GE socket).
+                    status = "reattach" if status == "ok" else f"reattach_{status}"
+                read_status[cid] = status
+                log_cost += time.perf_counter() - c0
+            self._reattached.discard(cid)
         cam_ages: tuple[float, ...] | None = None
         held_frames: dict[str, np.ndarray] = {}
         if live_hold is not None:
@@ -2178,6 +2226,17 @@ class BeamNGPyBackend:
             read = {cid: frames[cid] for cid in CAM_IDS if cid in frames}
             held_frames, ages = live_hold.step(read, walls, time.monotonic())
             cam_ages = tuple(float(a) for a in ages)
+        read_log: dict[str, Any] | None = None
+        if log_on:
+            c0 = time.perf_counter()
+            # main's age at the end of this pass: the wall time after the last read
+            # minus main's own stamp (``now`` for the hold).
+            main_age_ms = None
+            if "main" in walls and walls:
+                main_age_ms = (max(walls.values()) - walls["main"]) * 1000.0
+            read_log = {"status": read_status, "read_ms": read_ms, "main_age_ms": main_age_ms}
+            log_cost += time.perf_counter() - c0
+            read_log["log_ms"] = log_cost * 1000.0
         self._maybe_live_narrow_hitch()
         self._take_late_unique(unique_ids)
         unique_n = len(unique_ids)
@@ -2218,6 +2277,7 @@ class BeamNGPyBackend:
             grab_read_blocked=bool(self._read_blocked),
             cam_ages=cam_ages,
             held_frames=held_frames,
+            read_log=read_log,
         )
 
 

@@ -6,7 +6,11 @@ arguments as ``train_scene`` / ``eval_onnx_holdout``), this prints, per side
 camera, the share of rows whose sector is still black under the 1.5 s cap
 (no earlier frame of that camera in the same run, or older than the cap), for
 the train rows and the holdout rows (all, and the lane-center-scored ones),
-plus the median and p95 age of the held (non-black) training sectors.
+plus the median and p95 age of the held (non-black) training sectors
+(``train_age_s``) and of every training sector with black counted at the cap,
+1.533 s (``train_age_capped_s``, what ``live_age_capture.py`` compares).
+``black_pct`` covers all 8 cameras (main is never held, so main is black only
+on a row without a main frame).
 
 Nothing is written: the recording, its mask files and the cache are only
 read. ``--json`` prints the numbers as JSON to stdout instead of the table.
@@ -61,7 +65,7 @@ def report(
 ) -> dict[str, Any]:
     from eval_onnx_holdout import holdout_rows
 
-    from python.data.cam_hold import CAM_AGE_ORDER, NEVER_HELD, ROW_HOLD_KEY, annotate_hold
+    from python.data.cam_hold import BLACK_STAT_AGE_S, CAM_AGE_ORDER, NEVER_HELD, ROW_HOLD_KEY, annotate_hold, stat_age
     from python.data.raw_frames import load_scene_rows, refuse_lossy
     from python.debug.lane_targets import lane_center_is_valid, lane_gt_from_record
     from python.train.continual import CHUNK_MAX, pass_plan
@@ -115,11 +119,13 @@ def report(
         "black_pct": {},
         "black_n": {},
         "train_age_s": {},
+        "train_age_capped_s": {},
+        "black_stat_age_s": BLACK_STAT_AGE_S,
     }
     for name, items in groups.items():
         out["black_pct"][name] = {}
         out["black_n"][name] = {}
-        for cam in side:
+        for cam in CAM_AGE_ORDER:
             black = sum(1 for row in items if (row[ROW_HOLD_KEY][cam][0] is None))
             out["black_n"][name][cam] = black
             out["black_pct"][name][cam] = _pct(black, len(items))
@@ -132,6 +138,15 @@ def report(
             "median": None if ages.size == 0 else round(float(np.median(ages)), 4),
             "p95": None if ages.size == 0 else round(float(np.percentile(ages, 95)), 4),
         }
+        capped = np.asarray(
+            [stat_age(row[ROW_HOLD_KEY][cam][1] if row[ROW_HOLD_KEY][cam][0] is not None else None) for row in train],
+            dtype=np.float64,
+        )
+        out["train_age_capped_s"][cam] = {
+            "n": int(capped.size),
+            "median": None if capped.size == 0 else round(float(np.median(capped)), 4),
+            "p95": None if capped.size == 0 else round(float(np.percentile(capped, 95)), 4),
+        }
     if held_ids & train_ids:
         raise RuntimeError("a holdout row is also a train row")
     return out
@@ -139,15 +154,22 @@ def report(
 
 def table(result: dict[str, Any]) -> str:
     lines = [result["selection"], f"rows: {json.dumps(result['rows'])}"]
-    lines.append(f"{'cam':<9}{'train black %':>15}{'holdout black %':>17}{'scored black %':>16}{'train age median':>18}{'p95':>8}")
-    for cam, age in result["train_age_s"].items():
+    lines.append(f"{'cam':<9}{'train black %':>15}{'holdout black %':>17}{'scored black %':>16}{'train age median':>18}{'p95':>8}{'capped median':>16}{'p95':>8}")
+    for cam in result["black_pct"]["train"]:
         def cell(name: str) -> str:
-            value = result["black_pct"][name][cam]
+            value = result["black_pct"][name].get(cam)
             return "n/a" if value is None else f"{value:.2f}"
 
-        median = "n/a" if age["median"] is None else f"{age['median']:.3f}"
-        p95 = "n/a" if age["p95"] is None else f"{age['p95']:.3f}"
-        lines.append(f"{cam:<9}{cell('train'):>15}{cell('holdout'):>17}{cell('holdout_scored'):>16}{median:>18}{p95:>8}")
+        age = result["train_age_s"].get(cam) or {}
+        capped = result["train_age_capped_s"].get(cam) or {}
+
+        def f(value: Any) -> str:
+            return "n/a" if value is None else f"{value:.3f}"
+
+        lines.append(
+            f"{cam:<9}{cell('train'):>15}{cell('holdout'):>17}{cell('holdout_scored'):>16}"
+            f"{f(age.get('median')):>18}{f(age.get('p95')):>8}{f(capped.get('median')):>16}{f(capped.get('p95')):>8}"
+        )
     return "\n".join(lines)
 
 

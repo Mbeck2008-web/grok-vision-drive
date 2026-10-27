@@ -59,14 +59,17 @@ def apply_stale_speed_cap(
     """Hold the car near 6 m/s when the lane picture is old or the center is held.
 
     Returns True when the cap changed the command. A fresh ``take`` is left
-    alone. The launch cap is tighter and still runs first.
+    alone. The launch cap is tighter and still runs first. An unknown speed
+    (None) is not slow: it cuts throttle to 0 and leaves the brake alone.
     """
     src = str(lane_src or "")
     held = "hold" in src
     stale = lane_age_s is not None and float(lane_age_s) > STALE_LANE_S
     if not held and not stale:
         return False
-    if speed_mps is not None and float(speed_mps) > STALE_SPEED_MPS:
+    if speed_mps is None:
+        cmd.throttle = 0.0
+    elif float(speed_mps) > STALE_SPEED_MPS:
         cmd.throttle = 0.0
         cmd.brake = max(float(cmd.brake), 0.3)
     else:
@@ -200,7 +203,10 @@ class LaunchGuard:
                 self.heading = _unwrap(self.heading, heading_rad)
         if self.age_s < LAUNCH_S:
             cmd.throttle = min(float(cmd.throttle), LAUNCH_THROTTLE)
-            if speed_mps is not None and float(speed_mps) > LAUNCH_SPEED_MPS:
+            if speed_mps is None:
+                # Unknown speed is not slow: no launch throttle. The brake is left alone.
+                cmd.throttle = 0.0
+            elif float(speed_mps) > LAUNCH_SPEED_MPS:
                 cmd.throttle = 0.0
                 cmd.brake = max(float(cmd.brake), 0.2)
             if (

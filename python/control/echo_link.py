@@ -167,3 +167,73 @@ class EchoGate:
         status = STATUS_STALE if since >= self.stale_s else STATUS_REPEAT
         self.read = EchoRead(status=status, seq=self._last_seq, since_ms=since * 1000.0)
         return self.read
+
+
+class SessionEcho:
+    """The echo read for the ego speed: every tick, engaged or not, keyed on this session.
+
+    The first read is only a baseline. An echo an old supervisor session left behind can still
+    be under 1 s old, so its seq says nothing about now. Until ``echo_seq`` moves on past that
+    baseline the read is ``waiting`` (speed unknown). After that an ``EchoGate`` judges every
+    read, so the 300 ms stale window, the gap run and the outdated check are the gate's own.
+    ``speed_mps`` is the speed in the last advanced echo, or None.
+    """
+
+    def __init__(self, stale_ms: float = ECHO_STALE_MS, min_mod_version: str = MIN_MOD_VERSION) -> None:
+        self.min_mod_version = min_mod_version
+        self._gate = EchoGate(stale_ms=stale_ms, min_mod_version=min_mod_version)
+        self._baselined = False
+        self._baseline_seq: int | None = None
+        self._advanced = False
+        self.speed_mps: float | None = None
+        self.read = EchoRead(status=STATUS_WAITING)
+
+    @property
+    def status(self) -> str:
+        return self.read.status
+
+    def baseline(self, ego_fb: Any) -> None:
+        """Take the session baseline (once). Any seq on disk now belongs to before this session."""
+        if self._baselined:
+            return
+        self._baselined = True
+        seq = getattr(ego_fb, "echo_seq", None) if ego_fb is not None else None
+        self._baseline_seq = int(seq) if seq is not None else None
+
+    def observe(self, *, ego_fb: Any, now: float) -> EchoRead:
+        """This tick's read. ``ego_fb`` is an EgoFeedback or None (missing / torn)."""
+        if not self._baselined:
+            self.baseline(ego_fb)
+            self.speed_mps = None
+            self.read = EchoRead(status=STATUS_WAITING)
+            return self.read
+        if not self._advanced:
+            live = ego_fb is not None and bool(getattr(ego_fb, "fresh", False))
+            if live and mod_outdated(ego_fb, self.min_mod_version):
+                self.speed_mps = None
+                self.read = EchoRead(status=STATUS_OUTDATED)
+                return self.read
+            seq = getattr(ego_fb, "echo_seq", None) if live else None
+            if seq is not None and self._baseline_seq is None:
+                # No echo at baseline: the first seq seen is the baseline, not an advance.
+                self._baseline_seq = int(seq)
+            if seq is None or seq == self._baseline_seq:
+                self.speed_mps = None
+                self.read = EchoRead(status=STATUS_WAITING)
+                return self.read
+            self._advanced = True
+            self._gate.reset()
+        read = self._gate.observe(engaged=True, ego_fb=ego_fb, now=now)
+        if read.status == STATUS_FRESH:
+            speed = getattr(ego_fb, "speed_mps", None)
+            self.speed_mps = float(speed) if speed is not None else None
+        elif read.status != STATUS_REPEAT:
+            self.speed_mps = None
+        self.read = read
+        return self.read
+
+    def telemetry(self) -> dict[str, Any]:
+        out = self.read.telemetry()
+        out["baseline_seq"] = self._baseline_seq
+        out["advanced"] = bool(self._advanced)
+        return out

@@ -225,8 +225,13 @@ class RespawnWatch:
         elif pos is not None and self.pos is not None:
             try:
                 jump = float(np.linalg.norm(np.asarray(pos[:3], dtype=np.float64) - np.asarray(self.pos, dtype=np.float64)))
-                v_ref = abs(float(getattr(vdata, "speed_mps", 0.0) or 0.0))
-                if jump > max(RESPAWN_JUMP_M, RESPAWN_SPEED_MARGIN * v_ref * dt + RESPAWN_JUMP_M / 2.0):
+                # Wheelspeed, else body speed (|vel|). With neither, the speed is
+                # unknown, not 0 m/s: the speed-scaled jump test is skipped.
+                wheel = getattr(vdata, "speed_mps", None)
+                v_ref = abs(float(wheel)) if wheel is not None else speed
+                if v_ref is not None and jump > max(
+                    RESPAWN_JUMP_M, RESPAWN_SPEED_MARGIN * v_ref * dt + RESPAWN_JUMP_M / 2.0
+                ):
                     reason = f"jump {jump:.1f} m"
                 elif speed is not None and self.speed is not None and dt > 0.0:
                     dv = abs(speed - self.speed)

@@ -545,9 +545,13 @@ def _run_supervisor(
     pedal press.
 
     `expect_disengage` is a `player_*` reason. When set, SIGKILL waits for that reason on
-    `gvd_engage.json` / `gvd_state.json` — not stdout. `cmd_applied` is already true a few
-    ticks after engage, before the dwell. Windows PIPE + TerminateProcess also drops
-    `[GVD] DISENGAGED:` (Verify FAIL: only boot lines through the preview WARNING).
+    `gvd_engage.json` plus `gvd_state.json` or this run's refusal line. `cmd_applied` is
+    already true a few ticks after engage, before the dwell. Windows PIPE + TerminateProcess
+    also drops `[GVD] DISENGAGED:` (Verify FAIL: only boot lines through the preview WARNING),
+    so stdout goes to a temp file, never a PIPE; the snapshot's `refusal` is the line from it.
+
+    A caller's `engage:true` written before the call is held off the bus until this
+    supervisor's first tick, then written fresh: Alt+G comes after start.
     """
     assert not (echo_clock and freeze_echo_after_s is not None), "echo_clock would hide the frozen echo"
     step_sleep = STEP_SLEEP_S if loop_sleep_s is None else float(loop_sleep_s)
@@ -574,15 +578,29 @@ def _run_supervisor(
             stale.unlink()
         except FileNotFoundError:
             pass
+    # Alt+G comes after this supervisor is up, never before it: a latch already on at spawn
+    # belongs to a previous session. A caller's engage:true is held off the bus until this
+    # supervisor's first tick, then written fresh (the player's press).
+    engage_after_start = _read_json(engage_path()).get("engaged") is True
+    if engage_after_start:
+        try:
+            engage_path().unlink()
+        except FileNotFoundError:
+            pass
     t_spawn = time.time()  # wall: compared with the files' own stamps
     m_spawn = time.monotonic()  # monotonic: every deadline and window below
     # Never PIPE. A full pipe freezes the supervisor (engaged, cmd_json_pending), and
-    # Windows TerminateProcess discards the child's unflushed stdout anyway.
+    # Windows TerminateProcess discards the child's unflushed stdout anyway. stdout goes to a
+    # temp file instead: run_vision prints its refusal / disengage lines with flush=True under
+    # -u, so each line is on disk before the tick goes on, and nothing later rewrites it.
+    out_dir = tempfile.mkdtemp(prefix="gvd-m6-stdout-")
+    out_file = Path(out_dir) / "run_vision.out"
+    out_fh = open(out_file, "wb")
     proc = subprocess.Popen(
         args,
         cwd=str(ROOT),
         env=env,
-        stdout=subprocess.DEVNULL,
+        stdout=out_fh,
         stderr=subprocess.DEVNULL,
     )
     latched: dict | None = None
@@ -656,8 +674,31 @@ def _run_supervisor(
             if clock is not None:
                 clock["t_frozen"] = now
 
+    def _refusal_line() -> dict | None:
+        """This run's stdout line naming `expect_disengage`: append-only, never overwritten.
+
+        gvd_state.json names the reason on the refusal tick only; the next tick rewrites it to
+        not_engaged. The supervisor's `[GVD] REFUSE ENGAGE:` / `[GVD] DISENGAGED:` line stays.
+        """
+        try:
+            text = out_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        for line in text.splitlines():
+            for tag in ("[GVD] REFUSE ENGAGE: ", "[GVD] DISENGAGED: "):
+                if not line.startswith(tag):
+                    continue
+                rest = line[len(tag):]
+                if rest == expect_disengage or rest.startswith((f"{expect_disengage}:", f"{expect_disengage} ")):
+                    return {"reason": expect_disengage, "line": line}
+        return None
+
     def _try_latch() -> bool:
-        """True once a snapshot of this run names the expected disengage on every surface."""
+        """True once a snapshot of this run names the expected disengage on every surface.
+
+        gvd_state.json counts when it still names the reason (the refusal tick), or when this
+        run's stdout has the refusal line for it (the tick after, state says not_engaged).
+        """
         nonlocal latched, loose
         if not expect_disengage:
             return False
@@ -677,9 +718,12 @@ def _run_supervisor(
             return False
         if cmd.get("engaged") is not False:
             return False
-        snap = {"engage": eng, "cmd": cmd, "state": st}
+        snap = {"engage": eng, "cmd": cmd, "state": st, "refusal": _refusal_line()}
         ovr = st.get("override") if isinstance(st.get("override"), dict) else {}
         if st.get("disengage_reason") == expect_disengage or ovr.get("reason") == expect_disengage:
+            latched = snap
+            return True
+        if snap["refusal"] is not None:
             latched = snap
             return True
         # A later tick already rewrote state.disengage_reason to not_engaged. The engage file
@@ -731,6 +775,8 @@ def _run_supervisor(
         t_start = time.time()
         m_start = time.monotonic()
         ready = True
+        if engage_after_start:
+            write_engage_flag(True)
         if clock is not None:
             clock.update({"t_spawn": t_spawn, "t_ready": t_start})
         m_end = m_start + seconds
@@ -775,6 +821,8 @@ def _run_supervisor(
             pass
         if clock_dir is not None:
             shutil.rmtree(clock_dir, ignore_errors=True)
+        out_fh.close()
+        shutil.rmtree(out_dir, ignore_errors=True)
     return latched if latched is not None else loose
 
 
@@ -1143,12 +1191,15 @@ def check_echo_old_mod_version_refused() -> None:
     )
     assert snap is not None, "a 1.7.12 mod_version never refused engage"
     assert snap["engage"].get("disengage_reason") == "lua_echo_outdated", snap["engage"]
-    # The refusal tick itself. A later tick is not engaged any more and drops the echo message.
+    # The refusal itself, from the supervisor's own refusal line (stdout, append-only). The
+    # refusal tick's gvd_state.json is rewritten to not_engaged one tick later, and the engage now
+    # comes after start, so that tick is not reliably caught.
     st = snap["state"]
-    assert st.get("disengage_reason") == "lua_echo_outdated", {k: st.get(k) for k in ("disengage_reason", "echo")}
+    refusal = snap.get("refusal") or {}
+    assert refusal.get("reason") == "lua_echo_outdated", {"refusal": refusal, "state": st.get("disengage_reason")}
     echo = st.get("echo") or {}
     assert echo.get("min_mod_version") == MIN_MOD_VERSION, echo
-    msg = str(echo.get("message", ""))
+    msg = str(refusal.get("line", ""))
     assert "mod 1.7.12" in msg and f"mod {MIN_MOD_VERSION} or newer is required" in msg, msg
     write_engage_flag(False)
     ego_path().unlink()

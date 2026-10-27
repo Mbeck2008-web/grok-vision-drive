@@ -14,6 +14,7 @@ from python.perception.lanes import LaneResult, lanes_from_view
 from python.perception.track import IoUTracker
 from python.planning.path_predictor import (
     LaneTrack,
+    _expose_pedals,
     predict_path,
     reckon_ego_x,
     reckon_path,
@@ -179,6 +180,10 @@ class ModularPerception:
                 lane_source=_mark_stale(self._last_plan.lane_source),
                 drivable=len(path) >= 2,
             )
+            # Pedals, path length and blinker from the moved path at this tick's
+            # speed, through the same call a fresh plan ends with. A copy kept the
+            # fresh tick's values: fitted at 0 m/s, pred_brake stayed 0 at 5.5 m/s.
+            plan = _expose_pedals(plan, ego_speed_mps)
             self._last_plan = plan
         src = str(plan.lane_source or "")
         held = any(token in src for token in ("hold", "stale", "prior"))

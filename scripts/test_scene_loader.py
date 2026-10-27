@@ -234,10 +234,10 @@ def check_frames_counted_once() -> None:
         (fixed / "000000.png").write_bytes(encoded)
         (raw / "000001.png").write_bytes(second)
         (fixed / "000001.png").write_bytes(encoded)
-        (root / "state.jsonl").write_text("{}\n", encoding="utf-8")
+        (root / "state.jsonl").write_bytes(b"{}\n")
         total, frames = training_frame_bytes(root)
         assert frames == 2
-        assert total == len(encoded) + len(second) + len("{}\n".encode("utf-8"))
+        assert total == len(encoded) + len(second) + len(b"{}\n")
     print(f"frames counted once bytes={total}")
 
 

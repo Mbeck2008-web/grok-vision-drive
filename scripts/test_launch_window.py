@@ -53,8 +53,8 @@ DROP_BAR_S = 0.6  # same bar as test_unknown_ego test 9
 class _Car(T._Mod):
     """The fake mod, plus a car: echoed speed follows the commanded pedals while engaged."""
 
-    def __init__(self) -> None:
-        super().__init__(speed=0.0)
+    def __init__(self, *, lockstep: bool = False) -> None:
+        super().__init__(speed=0.0, lockstep=lockstep)
         self.echoing = True
         self._last: float | None = None
 
@@ -93,11 +93,19 @@ def _speed(snap: dict) -> float | None:
     return None if v is None else float(v)
 
 
-def _drive(seconds: float, *, freeze_after_s: float | None = None) -> tuple[list[dict], dict]:
+def _drive(
+    seconds: float, *, freeze_after_s: float | None = None, lockstep: bool = False,
+) -> tuple[list[dict], dict]:
+    """`lockstep=True`: the fake mod echoes in step with the supervisor's reads (T._Mod.lockstep_hold).
+
+    For checks whose subject is not echo timing. Without it a runner that ticks the supervisor
+    slower than the 10 Hz echo sees GAP_RUN_MAX skipped reads in a row and disengages with
+    echo_stale (scripts/test_gap_run_disengage.py covers that rule on its own).
+    """
     mark: dict = {}
     with isolated_home(prefix="gvd-launch-"), _road_launcher():
         write_engage_flag(False)
-        car = _Car()
+        car = _Car(lockstep=lockstep)
 
         def step(t: float) -> None:
             if "engage" not in mark and t >= ENGAGE_AT_S:
@@ -115,7 +123,7 @@ def _drive(seconds: float, *, freeze_after_s: float | None = None) -> tuple[list
 
 
 def check_known_speed_pulls_away_and_launch_brake() -> None:
-    seen, mark = _drive(5.5)
+    seen, mark = _drive(5.5, lockstep=True)
     on = [s for s in seen if s["cmd"].get("engaged") is True]
     assert on, ("never engaged", sorted({str(s["cmd"].get("reason")) for s in seen}))
     t_on = on[0]["t"]
@@ -184,7 +192,7 @@ def check_stale_cap_numbers_unit() -> None:
 
 
 def check_stale_cap_after_window_holds_6mps() -> None:
-    seen, _mark = _drive(10.5)
+    seen, _mark = _drive(10.5, lockstep=True)
     on = [s for s in seen if s["cmd"].get("engaged") is True]
     assert on, "never engaged"
     t_on = on[0]["t"]

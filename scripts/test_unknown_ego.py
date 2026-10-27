@@ -206,8 +206,11 @@ def _read(path: Path) -> dict:
 class _Mod:
     """The fake gvd_main: 10 Hz echo with its own echo_seq, Alt+G engage heartbeat."""
 
-    def __init__(self, *, speed: float = 5.5, echo_seq0: int = 0, mod_version: str | None = None) -> None:
+    def __init__(
+        self, *, speed: float = 5.5, echo_seq0: int = 0, mod_version: str | None = None, lockstep: bool = False,
+    ) -> None:
         self.speed = speed
+        self.lockstep = lockstep  # opt-in, see lockstep_hold; off keeps the free-running 10 Hz echo
         self.mod_version = mod_version
         self.k = echo_seq0
         self.next_echo = 0.0
@@ -219,6 +222,8 @@ class _Mod:
         m6 = _m6()
         now = time.monotonic()
         if now < self.next_echo:
+            return
+        if self.lockstep_hold():
             return
         self.next_echo = now + m6.FAKE_ECHO_PERIOD_S
         if self.frozen is not None:
@@ -234,6 +239,30 @@ class _Mod:
             throttle_in=float(cmd.get("throttle", 0.0) or 0.0), brake_in=float(cmd.get("brake", 0.0) or 0.0),
             echo_seq=self.k, mod_version=self.mod_version,
         )
+
+    def lockstep_hold(self) -> bool:
+        """With lockstep on: True while the supervisor has not yet read the last echo written.
+
+        Test harness only, for checks whose subject is not echo timing. The next advancing
+        echo waits until gvd_state.ego_echo.seq (the session echo the supervisor read on its
+        last written tick) has reached this mod's echo_seq, so a supervisor that ticks slower
+        than 10 Hz never sees a skipped echo_seq. The 10 Hz period still applies on top.
+        Free-running (no hold) before the first gvd_state.json and while the session echo has
+        no seq yet (baseline / waiting). A state file that cannot be read this pass holds.
+        Frozen and silent mods are never held.
+        """
+        if not self.lockstep or self.frozen is not None or not self.echoing:
+            return False
+        if not state_path().exists():
+            return False
+        st = _read(state_path())
+        if not st:
+            return True
+        tele = st.get("ego_echo")
+        seq = tele.get("seq") if isinstance(tele, dict) else None
+        if seq is None:
+            return False
+        return int(seq) < self.k
 
     def freeze(self) -> None:
         m6 = _m6()

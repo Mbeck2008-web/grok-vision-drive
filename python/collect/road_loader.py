@@ -29,11 +29,17 @@ LEVEL_LUA = "return getCurrentLevelIdentifier() or ''"
 
 @dataclass
 class RoadSnapshot:
-    """One read of the network: the raw spec, parsed centerlines, and why it is empty."""
+    """One read of the network: the raw spec, parsed centerlines, and why it is empty.
+
+    ``error`` is the first exception ``get_road_network`` raised on a read
+    that found no roads (its text is also in ``note``). ``network()``
+    re-raises it unless it is a session error.
+    """
 
     spec: Any = None
     polys: list[RoadPoly] = field(default_factory=list)
     note: str = ""
+    error: BaseException | None = field(default=None, compare=False, repr=False)
 
 
 def _exc_text(exc: BaseException) -> str:
@@ -41,16 +47,21 @@ def _exc_text(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {detail}"
 
 
-def _call(fn: Any, *args: Any, **kwargs: Any) -> tuple[Any, str]:
+def _call_exc(fn: Any, *args: Any, **kwargs: Any) -> tuple[Any, str, BaseException | None]:
     try:
-        return fn(*args, **kwargs), ""
+        return fn(*args, **kwargs), "", None
     except TypeError:
         try:
-            return fn(*args), ""
+            return fn(*args), "", None
         except Exception as exc:
-            return None, _exc_text(exc)
+            return None, _exc_text(exc), exc
     except Exception as exc:
-        return None, _exc_text(exc)
+        return None, _exc_text(exc), exc
+
+
+def _call(fn: Any, *args: Any, **kwargs: Any) -> tuple[Any, str]:
+    got, note, _exc = _call_exc(fn, *args, **kwargs)
+    return got, note
 
 
 def polys_from_network(spec: Any) -> list[RoadPoly]:
@@ -98,6 +109,7 @@ def read_network(bng: Any) -> RoadSnapshot:
         return RoadSnapshot(None, [], "no beamng")
     notes: list[str] = []
     first_spec = None
+    first_error: BaseException | None = None
     owners = []
     scenario = getattr(bng, "scenario", None)
     if scenario is not None:
@@ -107,12 +119,14 @@ def read_network(bng: Any) -> RoadSnapshot:
         fn = getattr(owner, "get_road_network", None)
         if not callable(fn):
             continue
-        spec, note = _call(fn, include_edges=True, drivable_only=True)
+        spec, note, exc = _call_exc(fn, include_edges=True, drivable_only=True)
         if note:
             notes.append(f"get_road_network {note}")
-            spec, note2 = _call(fn)
+            first_error = first_error or exc
+            spec, note2, exc2 = _call_exc(fn)
             if note2:
                 notes.append(f"get_road_network() {note2}")
+                first_error = first_error or exc2
         if spec is not None and first_spec is None:
             first_spec = spec
         polys = polys_from_network(spec)
@@ -142,7 +156,7 @@ def read_network(bng: Any) -> RoadSnapshot:
             notes.append("get_roads returned no roads")
     elif not notes:
         notes.append("beamngpy has no get_road_network or get_roads")
-    return RoadSnapshot(first_spec, [], "; ".join(notes) if notes else "no road network")
+    return RoadSnapshot(first_spec, [], "; ".join(notes) if notes else "no road network", first_error)
 
 
 def read_legacy_roads(bng: Any) -> tuple[Any, str]:
@@ -264,8 +278,20 @@ class RoadLoader:
         return list(snap.polys), snap.note
 
     def network(self, bng: Any) -> Any:
-        """The raw network spec (for recovery snaps and road dumps)."""
-        return self.snapshot(bng).spec
+        """The raw network spec (for recovery snaps).
+
+        A session error from ``get_road_network`` gives None (no roads to
+        snap to). Any other exception is re-raised: a bad reply must not look
+        like "no road here". The snapshot's note keeps the text either way;
+        ``polys()`` and ``snapshot()`` stay note-only.
+        """
+        snap = self.snapshot(bng)
+        if snap.error is not None:
+            from python.collect.level_session import is_session_error
+
+            if not is_session_error(snap.error):
+                raise snap.error
+        return snap.spec
 
 
 _SHARED = RoadLoader()

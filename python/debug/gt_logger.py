@@ -49,7 +49,9 @@ LEVEL_JUMP_M = 100.0
 #    ``get_gamestate`` in 1.36 carries no level, and
 #    ``scenario.get_current`` sends GetCurrentScenario and parses a whole
 #    scenario dict, so the Lua query is the cheapest call. Not per tick:
-#    at 10 Hz that is one extra round trip per 100 ticks.
+#    at 10 Hz that is one extra round trip per 100 ticks. The poll only
+#    acts on a known level that differs from the cached one; an unknown
+#    answer ("") keeps the roads. Triggers 1 and 2 re-read on unknown.
 LEVEL_POLL_S = 10.0
 ROAD_RETRY_S = 2.0
 DEPART_BURST = 3
@@ -312,6 +314,7 @@ class GroundTruthLogger:
         self._roads_level: str | None = None
         self._level_pos: tuple[float, float] | None = None
         self._level_check = False
+        self._level_check_hard = False  # set by a pose jump or sim time going back
         self._level_poll_wall = 0.0
         self._prev_damage: float | None = None
         self._last_sim: float | None = None
@@ -347,8 +350,9 @@ class GroundTruthLogger:
         while it is empty). After that the level is asked again only on a
         trigger: a pose jump of ``LEVEL_JUMP_M``, sim time going backwards
         (flagged by ``write``), or the ``LEVEL_POLL_S`` poll. The same level
-        keeps the roads, a different level reads that level once, and an
-        unknown answer re-reads to be safe.
+        keeps the roads and a different known level reads that level once.
+        An unknown answer ("" or None) re-reads after a pose jump or a sim
+        clock reset, but after a poll alone it keeps the roads.
         """
         pos = _pose(vdata)[0] if vdata is not None else None
         if pos is not None:
@@ -360,6 +364,7 @@ class GroundTruthLogger:
                 and math.hypot(here[0] - last[0], here[1] - last[1]) > LEVEL_JUMP_M
             ):
                 self._level_check = True
+                self._level_check_hard = True
             self._level_pos = here
         now = time.time()
         if (
@@ -374,11 +379,15 @@ class GroundTruthLogger:
             return
         loader = self._loader if self._loader is not None else road_loader.shared()
         if self._roads is not None:
+            hard = self._level_check_hard
             self._level_check = False
+            self._level_check_hard = False
             self._level_poll_wall = now
             level = current_level(bng)
             if level and level == self._roads_level:
                 return
+            if not level and not hard:
+                return  # the poll could not tell: keep the roads
             print(f"[GVD] gt level {self._roads_level or '?'} -> {level or '?'}: reloading roads", flush=True)
             if not level:
                 loader.invalidate()
@@ -527,6 +536,7 @@ class GroundTruthLogger:
         else:
             if self._last_sim is not None and sim < self._last_sim:
                 self._level_check = True  # clock restarted: maybe a new level
+                self._level_check_hard = True
             self._last_sim = sim
             t = sim
             t_source = "sim"

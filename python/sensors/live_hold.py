@@ -363,13 +363,15 @@ def reads_text(read_log: Any) -> str:
     return ",".join(parts) or "na"
 
 
-def uniq_text(read_log: Any) -> str:
-    """``main:1,wide:0,...``: per camera with an ok read this tick (``CAM_AGE_ORDER``), 1 when
-    the frame differs from that camera's previous frame (``frame_signature``), 0 when identical;
-    ``na`` without a log or without an ok read."""
+def uniq_text(read_log: Any, key: str = "uniq") -> str:
+    """``main:1,wide:0,...`` in ``CAM_AGE_ORDER``; ``na`` without a log or without an entry.
+
+    ``key="uniq"``: per camera with an ok read this tick, 1 when the frame differs from that
+    camera's previous frame (``frame_signature``), 0 when identical. ``key="tuniq"``: per camera
+    whose frame the hold's schedule took this tick, against that camera's previous taken frame."""
     if not isinstance(read_log, Mapping):
         return "na"
-    uniq = read_log.get("uniq") or {}
+    uniq = read_log.get(key) or {}
     return ",".join(f"{cam}:{int(bool(uniq[cam]))}" for cam in CAM_AGE_ORDER if cam in uniq) or "na"
 
 

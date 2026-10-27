@@ -1517,9 +1517,7 @@ def main() -> None:
             # does the falling edge: the disengage reason is on that tick only.
             rising_engage = bool(engaged) and not prev_engaged
             falling_engage = prev_engaged and not bool(engaged)
-            state_due = soft_esc_state_write_due(
-                bool(engaged), rising=rising_engage, falling=falling_engage or refusal_new
-            )
+            state_due = soft_esc_state_write_due(bool(engaged), rising=rising_engage, falling=falling_engage or refusal_new)
             prev_engaged = bool(engaged)
             state_skips = soft_esc_state_write_skips()
             rel_skips = int(getattr(actuator, "release_cmd_skips", 0) or 0)

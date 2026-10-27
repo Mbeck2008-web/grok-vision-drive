@@ -848,9 +848,19 @@ def check_run_vision_e2e() -> None:
     assert st.get("detector")
 
     # Engaged with no lane path (stub) → preview gate holds the brake, still engaged for Lua.
-    _run_supervisor(["--force-engage"], seconds=2.0)
+    # The fake mod echoes (ack=True): engaging needs a fresh session echo (#125).
+    _run_supervisor(["--force-engage"], seconds=2.0, ack=True)
     cmd = json.loads(cmd_path().read_text(encoding="utf-8"))
     assert cmd["engaged"] is True and cmd["brake"] == 1.0 and cmd["throttle"] == 0.0 and cmd["reason"] == "preview_blocked", cmd
+
+    # No echo this session: --force-engage refuses with ego_unknown, thr 0 / brk 0 (#125).
+    if ego_path().exists():
+        ego_path().unlink()
+    _run_supervisor(["--force-engage"], seconds=2.0)
+    cmd = json.loads(cmd_path().read_text(encoding="utf-8"))
+    assert cmd["engaged"] is False and cmd["brake"] == 0.0 and cmd["throttle"] == 0.0 and cmd["reason"] == "ego_unknown", cmd
+    st = read_state()
+    assert st and st["engaged"] is False and st.get("disengage_reason") == "ego_unknown", st and st.get("disengage_reason")
 
     # Engaged + preview allowed, still no cameras. Since the lane-fit path
     # replaced the 36 m steer fallback, an empty view is a stop: target_v is 0,

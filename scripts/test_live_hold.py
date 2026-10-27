@@ -592,7 +592,9 @@ def check_stale_ego() -> None:
     tick = shadow_tick(policy="modular", engaged=True, heartbeat_ok=False, path_debug_preview=False, allow_preview_drive=False,
                        path_ego=path, planner={"target_v": 5.0, "aeb": "off"}, ego_speed_mps=5.0, lane_conf=1.0, path_conf=1.0,
                        seq=7, e2e_policy=_E2E())
-    assert tick.applied.reason == "heartbeat_stale" and tick.should_disengage and tick.applied.brake > 0
+    # Stale ego data: the speed is not known (#125). Released (applied False), thr 0 / brk 0, disengaged.
+    assert tick.applied.reason == "heartbeat_stale" and tick.should_disengage, tick
+    assert tick.applied.brake == 0.0 and tick.applied.throttle == 0.0 and tick.applied.applied is False, tick.applied
     # Wiring: the stale check sets heartbeat_ok before shadow_tick, and run_vision's heartbeat_stale branch disengages.
     src = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
     i_obs = src.index("ego_stale = stale_ego.observe(vdata)")

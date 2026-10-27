@@ -31,7 +31,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from gvd_test_env import skip_check  # noqa: E402
+from gvd_test_env import collect_root, skip_check  # noqa: E402
 
 
 def _write_jsonl(path: Path, items: list[dict]) -> None:
@@ -47,8 +47,7 @@ def _sha(path: Path) -> str:
 def check_loud_failures() -> None:
     from python.train.event_mask import MaskFileError, mask_file_sources
 
-    with tempfile.TemporaryDirectory() as raw:
-        tmp = Path(raw)
+    with collect_root("gvd-mask-") as tmp:
         rows = [{"i": i, "t": 0.1 * i, "segment": "s"} for i in range(50)]
         _write_jsonl(tmp / "ok.jsonl", [{"i": 3}, {"i": 4}])
         _write_jsonl(tmp / "unknown.jsonl", [{"i": 3}, {"i": 50}, {"i": 99}])

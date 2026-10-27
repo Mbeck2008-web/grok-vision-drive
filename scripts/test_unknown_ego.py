@@ -8,7 +8,7 @@ stand-in. A measured low speed (0.02 m/s, a stopped car) is still known.
 
 Tests 1-6 and 11-13 call the speed functions directly (the stub view from
 test_held_plan_pedals: two painted lines, a stopped vehicle track or a stop
-sign in the path). Tests 7-10 run run_vision.py headless (stub cameras) on the
+sign in the path). Tests 7-10 and 14 run run_vision.py headless (stub cameras) on the
 retail cmd_json bus with a fake mod, like test_m6_retail.
 
 Red first: on the code before the fix these checks fail on the post-fix value

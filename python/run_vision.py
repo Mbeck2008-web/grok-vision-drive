@@ -314,7 +314,7 @@ def main() -> None:
     ap.add_argument(
         "--viz-screen",
         default="auto",
-        help="GVD VISION monitor: auto|1|2 (or GVD_VIZ_MONITOR). auto→non-primary if present",
+        help="GVD VISION monitor: auto|1|2 (or GVD_VIZ_MONITOR). auto->non-primary if present",
     )
     ap.add_argument("--viz-fullscreen", action="store_true", help="Fullscreen GVD VISION on chosen monitor")
     ap.add_argument(

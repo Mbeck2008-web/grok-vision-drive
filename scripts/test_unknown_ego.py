@@ -214,10 +214,14 @@ class _Mod:
         self.next_hb = 0.0
         self.echoing = False
         self.frozen: dict | None = None  # rewrite this echo (fresh mtime, same echo_seq)
+        self.clock = None  # _session(clock=...) sets its SimClock; None is the real clock
+
+    def _mono(self) -> float:
+        return time.monotonic() if self.clock is None else self.clock.mono()
 
     def echo(self, t_spawn: float) -> None:
         m6 = _m6()
-        now = time.monotonic()
+        now = self._mono()
         if now < self.next_echo:
             return
         self.next_echo = now + m6.FAKE_ECHO_PERIOD_S
@@ -246,13 +250,13 @@ class _Mod:
 
     def heartbeat(self) -> None:
         """Lua refreshes gvd_engage.json while engaged; it never turns it on by itself."""
-        now = time.monotonic()
+        now = self._mono()
         if now < self.next_hb:
             return
         self.next_hb = now + 1.0
         eng = _read(engage_path())
         if eng.get("engaged") is True:
-            eng["mtime"] = time.time()
+            eng["mtime"] = time.time() if self.clock is None else self.clock.wall()
             engage_path().write_text(json.dumps(eng), encoding="utf-8")
 
 
@@ -263,6 +267,7 @@ def _session(
     *,
     extra: tuple[str, ...] = ("--allow-preview-drive",),
     until: Callable[[dict], bool] | None = None,
+    clock: Any = None,
 ) -> list[dict]:
     """Run run_vision headless; `step(t)` runs every pass with t = seconds since its first tick.
 
@@ -271,7 +276,12 @@ def _session(
 
     With `until`, the run ends on the first read where until(snap) is true (tick-driven), and
     `seconds` is only a hang guard: reaching it is a failure.
+
+    With `clock` (a scripts/gvd_sim_clock.SimClock), see _clock_session: the supervisor runs
+    one tick per step on that clock, and `seconds` and `t` are clock seconds.
     """
+    if clock is not None:
+        return _clock_session(seconds, mod, step, extra=extra, until=until, clock=clock)
     m6 = _m6()
     m6._touch_lua_bus()
     for stale in (cmd_path(), state_path()):
@@ -323,6 +333,128 @@ def _session(
         proc.kill()
         with contextlib.suppress(Exception):
             proc.wait(timeout=5)
+    return seen
+
+
+CLOCK_HZ = 20.0  # the --hz the supervisor runs at here
+CLOCK_STEP_TIMEOUT_S = 120.0  # real-time hang watchdog on one tick; it can only fail the check
+CLOCK_STARTUP_TICKS = 200
+
+
+def _clock_session(
+    seconds: float,
+    mod: _Mod,
+    step: Callable[[float], None] | None,
+    *,
+    extra: tuple[str, ...],
+    until: Callable[[dict], bool] | None,
+    clock: Any,
+) -> list[dict]:
+    """`_session` on the test's clock: run_vision through scripts/gvd_clock_child.py, one tick per step.
+
+    Per step: advance the clock one tick, run `step(t)` and the fake mod on it, refresh the
+    lua_bus handshake, write the clock to the echo-gate clock file, release one supervisor tick
+    and wait for it, then read the bus. Files the supervisor judges by mtime or a payload stamp
+    are stamped from `clock.wall()` (test_m6_retail.fake_clock). No sleep and no real clock
+    reading here feeds the supervisor; the only real-time use is the per-tick hang watchdog.
+    """
+    import queue  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+    import threading  # noqa: PLC0415
+
+    m6 = _m6()
+    mod.clock = clock
+    for stale in (cmd_path(), state_path()):
+        with contextlib.suppress(FileNotFoundError):
+            stale.unlink()
+    args = [sys.executable, "-u", str(ROOT / "scripts" / "gvd_clock_child.py"), "--backend", "stub",
+            "--hz", f"{CLOCK_HZ:g}", "--encode", "cpu", *extra]
+    t_spawn = time.time()
+    clock.w0 = t_spawn
+    seen: list[dict] = []
+    last_key = None
+    with tempfile.TemporaryDirectory(prefix="gvd-simclock-") as tmp, m6.fake_clock(clock.wall()) as fc:
+        echo_clock = Path(tmp) / "echo_clock.json"
+
+        def write_clock() -> None:
+            fc.now = clock.wall()
+            part = echo_clock.with_suffix(".tmp")
+            part.write_text(json.dumps({"t": clock.mono()}), encoding="utf-8")
+            os.replace(part, echo_clock)
+
+        def mod_step(t: float | None) -> None:
+            fc.now = clock.wall()
+            if step is not None and t is not None:
+                step(t)
+            mod.heartbeat()
+            mod.echo(t_spawn)
+            m6._touch_lua_bus()
+            write_clock()
+
+        mod_step(None)
+        env = dict(os.environ, PYTHONPATH=str(ROOT), GVD_TEST_ECHO_CLOCK_FILE=str(echo_clock),
+                   GVD_TEST_SIM_CLOCK=f"{clock.mono()!r} {clock.w0!r}")
+        proc = subprocess.Popen(args, cwd=str(ROOT), env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1)
+        lines: queue.Queue = queue.Queue()
+
+        def pump() -> None:
+            for line in proc.stdout:
+                lines.put(line)
+            lines.put(None)
+
+        threading.Thread(target=pump, daemon=True).start()
+
+        def tick_done(what: str) -> None:
+            try:
+                line = lines.get(timeout=CLOCK_STEP_TIMEOUT_S)
+            except queue.Empty:
+                raise AssertionError(f"run_vision did not finish a tick within {CLOCK_STEP_TIMEOUT_S:.0f}s ({what})")
+            if line is None or not line.startswith("done "):
+                raise AssertionError(f"run_vision exited ({proc.poll()}) or broke the step pipe ({what}): {line!r}")
+
+        def release() -> None:
+            proc.stdin.write(f"go {clock.mono()!r}\n")
+            proc.stdin.flush()
+
+        try:
+            tick_done("startup")
+            n = 0
+            while not (cmd_path().exists() and state_path().exists()):
+                n += 1
+                if n > CLOCK_STARTUP_TICKS:
+                    raise AssertionError("run_vision wrote no gvd_cmd.json / gvd_state.json in startup")
+                clock.advance(1.0 / CLOCK_HZ)
+                mod_step(None)
+                release()
+                tick_done("startup")
+            m0 = clock.mono()
+            while True:
+                clock.advance(1.0 / CLOCK_HZ)
+                t = clock.mono() - m0
+                if t >= seconds:
+                    if until is not None:
+                        raise AssertionError(f"hang guard: the `until` condition did not hold within {seconds:.0f}s")
+                    break
+                mod_step(t)
+                release()
+                tick_done(f"t={t:.2f}")
+                snap = {"t": t, "engage": _read(engage_path()), "cmd": _read(cmd_path()), "state": _read(state_path())}
+                key = json.dumps([snap["engage"], snap["cmd"], snap["state"].get("engaged"),
+                                  snap["state"].get("disengage_reason"), snap["state"].get("last_refusal_reason"),
+                                  snap["state"].get("cmd_seq")], sort_keys=True, default=str)
+                if key != last_key:
+                    seen.append(snap)
+                    last_key = key
+                if until is not None and until(snap):
+                    break
+        finally:
+            proc.kill()
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=5)
+            for pipe in (proc.stdin, proc.stdout):
+                with contextlib.suppress(Exception):
+                    pipe.close()
     return seen
 
 

@@ -1087,6 +1087,197 @@ def check_echo_gate_clock_default() -> None:
     assert "echo_link.EchoGate.observe = _observe" in child
 
 
+def _clock_branch(tree: ast.AST) -> dict[int, str | None]:
+    """id(node) -> "clock" / "default" when it sits under `clock is (not) None`, else None."""
+    out: dict[int, str | None] = {}
+
+    def side(test: ast.AST) -> str | None:
+        if (isinstance(test, ast.Compare) and isinstance(test.left, ast.Name) and test.left.id == "clock"
+                and len(test.ops) == 1 and isinstance(test.comparators[0], ast.Constant)
+                and test.comparators[0].value is None):
+            return "is" if isinstance(test.ops[0], ast.Is) else "isnot" if isinstance(test.ops[0], ast.IsNot) else None
+        return None
+
+    def walk(node: ast.AST, where: str | None) -> None:
+        out[id(node)] = where
+        if isinstance(node, (ast.If, ast.IfExp)) and side(node.test):
+            on_body = "default" if side(node.test) == "is" else "clock"
+            on_else = "clock" if on_body == "default" else "default"
+            walk(node.test, where)
+            body = node.body if isinstance(node.body, list) else [node.body]
+            orelse = node.orelse if isinstance(node.orelse, list) else [node.orelse]
+            for child in body:
+                walk(child, on_body)
+            for child in orelse:
+                walk(child, on_else)
+            return
+        for child in ast.iter_child_nodes(node):
+            walk(child, where)
+
+    walk(tree, None)
+    return out
+
+
+def _call_name(call: ast.Call) -> str:
+    fn = call.func
+    if isinstance(fn, ast.Attribute):
+        return fn.attr
+    return fn.id if isinstance(fn, ast.Name) else ""
+
+
+def check_supervisor_clock_default() -> None:
+    """With no clock, run_vision and the modules it threads keep every stdlib clock call.
+
+    The `clock` seam (main(clock=None), ModularPerception(clock=None)) is test-only; it
+    exists for scripts/gvd_clock_child.py. This pins each touched site and probes each
+    threaded `now=` default, so a default path cannot drift onto the test clock.
+    """
+    import inspect
+
+    from python import run_vision
+    from python.control import actuate, echo_link, launch_guard, override
+    from python.perception import pipeline
+    from python.runtime import paths
+
+    src = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    where = _clock_branch(tree)
+
+    # 1. The seam defaults to None and the entry point passes nothing.
+    assert inspect.signature(run_vision.main).parameters["clock"].default is None
+    assert src.endswith('\n\nif __name__ == "__main__":\n    main()\n'), src[-80:]
+
+    # 2. The real loop sleep is there once, after (not inside) the clock barrier.
+    sleep = "            time.sleep(max(0.0, dt - (time.perf_counter() - loop_t0)))\n"
+    assert src.count(sleep) == 1
+    barrier = (
+        "            if clock is not None:\n"
+        "                # Test step barrier: report this tick done, block until the test releases the next.\n"
+        "                clock.sleep(max(0.0, dt - (clock.perf() - loop_t0)))\n"
+        "                continue\n"
+    )
+    assert src.count(barrier + sleep) == 1, "clock barrier must sit just before the real sleep"
+
+    # 3. Loop timing seeds read time.perf_counter; the clock only overrides them after.
+    for pin in (
+        "    last_cam_t = time.perf_counter()\n    last_loop_t = time.perf_counter()\n"
+        "    if clock is not None:\n        last_cam_t = last_loop_t = clock.perf()\n",
+        "            loop_t0 = time.perf_counter()\n"
+        "            if clock is not None:\n                loop_t0 = clock.perf()\n",
+    ):
+        assert src.count(pin) == 1, pin
+
+    # 4. (R7) Both echo gates stay on time.monotonic, outside any clock branch.
+    for line in (
+        "session_echo.observe(ego_fb=ego_fb, now=time.monotonic())",
+        "echo = echo_gate.observe(engaged=bool(engaged) and echo_bus, ego_fb=ego_fb, now=time.monotonic())",
+    ):
+        assert src.count(line) == 1, line
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and _call_name(node) == "observe":
+            assert where[id(node)] is None, ast.get_source_segment(src, node)
+
+    # 5. Perception: clock defaults to None and frame_age_s follows pipeline's time.monotonic.
+    assert inspect.signature(pipeline.ModularPerception.__init__).parameters["clock"].default is None
+    ticks = iter((100.0, 100.0, 100.5))
+
+    class _Mono:
+        def monotonic(self) -> float:
+            return next(ticks)
+
+        def __getattr__(self, name: str):
+            return getattr(time, name)
+
+    perc = pipeline.ModularPerception(allow_synthetic=False, detector_id="empty")
+    frame = np.zeros((360, 640, 3), dtype=np.uint8)
+    real_time = pipeline.time
+    pipeline.time = _Mono()
+    try:
+        perc.tick(frame, ego_speed_mps=5.0)
+        perc.tick(frame, ego_speed_mps=5.0)
+        age = perc.tick(frame, ego_speed_mps=5.0).frame_age_s
+    finally:
+        pipeline.time = real_time
+    assert abs(age - 0.5) < 1e-9, age
+
+    # 6. Override: no clock passes now=None, so the warmup dwell follows override's time.monotonic.
+    for call in ("override.update(", "override.note_command("):
+        assert src.count(call) == 1, call
+    assert src.count("now=None if clock is None else clock.mono(),") == 2
+    mono = [50.0]
+
+    class _OvMono:
+        def monotonic(self) -> float:
+            return mono[0]
+
+        def __getattr__(self, name: str):
+            return getattr(time, name)
+
+    det = override.OverrideDetector(override.OverrideConfig())
+    real_ov = override.time
+    override.time = _OvMono()
+    try:
+        det.update(engaged=False, applied_seq=1)
+        last_t = det._last_t
+        det.note_command(seq=1, steer=0.0, throttle=0.0, brake=0.0)
+    finally:
+        override.time = real_ov
+    warm = override.OverrideConfig().warmup_s
+    assert det._armed_at == 50.0 and last_t == 50.0, (det._armed_at, last_t)
+    assert not det.armed(50.0 + warm - 0.01) and det.armed(50.0 + warm + 0.01), warm
+
+    # 7. Each threaded `now=` defaults to time.time(), and RV passes it only on the clock branch.
+    threaded = {"read_ego_feedback": 1, "read_engage_flag": 2, "poll": 1, "bus_identity": 2}
+    with_now = {name: 0 for name in threaded}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and _call_name(node) in threaded:
+            has_now = any(k.arg == "now" for k in node.keywords)
+            seg = ast.get_source_segment(src, node)
+            if has_now:
+                assert where[id(node)] == "clock", seg
+                with_now[_call_name(node)] += 1
+            else:
+                assert where[id(node)] != "clock", seg
+    assert with_now == threaded, with_now
+    with fake_clock() as fc:
+        t0 = fc.now
+        _touch_lua_bus()
+        _write_ego(1)
+        write_engage_flag(True)
+        actuate.write_bot_engage(True, mtime=t0)
+        assert read_ego_feedback() is not None and read_ego_feedback().fresh
+        assert read_engage_flag(default=False) is True
+        assert actuate.BotEngage().poll() is True
+        assert paths.bus_identity().note == "ok", paths.bus_identity().note
+        fc.advance(max(actuate.EGO_FRESH_S, ENGAGE_FRESH_S, paths.LUA_BUS_FRESH_S) + 0.5)
+        fb = read_ego_feedback()
+        assert fb is None or not fb.fresh, fb
+        assert read_engage_flag(default=False) is False
+        assert actuate.BotEngage().poll() is False
+        assert paths.bus_identity().note != "ok", paths.bus_identity().note
+        actuate.write_bot_engage(False, mtime=fc.now)
+        write_engage_flag(False)
+        ego_path().unlink()
+
+    # 8. Nothing in python/ reads a test-clock env var or patches `time`.
+    for path in (ROOT / "python").rglob("*.py"):
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        for bad in ("GVD_TEST_SIM_CLOCK", "GVD_TEST_ECHO_CLOCK_FILE",
+                    "time.monotonic =", "time.perf_counter =", "time.time =", "time.sleep ="):
+            assert bad not in text, (path, bad)
+
+    # 9. Rule constants are unchanged.
+    assert (launch_guard.LAUNCH_S, launch_guard.LAUNCH_SPEED_MPS, launch_guard.STUCK_S,
+            launch_guard.STALE_LANE_S, launch_guard.STALE_SPEED_MPS) == (6.0, 4.0, 1.5, 0.25, 6.0)
+    assert (echo_link.ECHO_STALE_MS, echo_link.GAP_RUN_MAX) == (300.0, 3)
+    assert (actuate.EGO_FRESH_S, actuate.ENGAGE_FRESH_S, actuate.HEARTBEAT_STALE_S,
+            actuate.SOFT_ESC_FILE_PERIOD_S, paths.LUA_BUS_FRESH_S) == (1.0, 2.5, 1.5, 0.10, 1.0)
+    assert override.OverrideConfig() == override.OverrideConfig(
+        steer_enter=0.08, steer_exit=0.04, steer_hold_ms=200.0, steer_spike=0.20,
+        brake_enter=0.06, throttle_enter=0.10, lpf_tau_ms=80.0)
+    print("  no clock: every seamed site keeps its stdlib clock; threaded now= defaults to time.time()")
+
+
 def check_ffb_stale_engage_heartbeat() -> None:
     """The chatter check's latch test is load-bearing: a stale Alt+G heartbeat fails it.
 
@@ -1385,6 +1576,7 @@ def main() -> None:
         check_ffb_override_live,
         check_ffb_override_live_slow_host,
         check_echo_gate_clock_default,
+        check_supervisor_clock_default,
         check_ffb_stale_engage_heartbeat,
         check_echo_outdated_refuses_engage,
         check_echo_stale_disengages,

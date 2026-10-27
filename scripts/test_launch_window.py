@@ -12,6 +12,10 @@ echoed speed.
    0.2 launch brake, and the car stays near that speed.
 3. Unknown speed inside the window: the echo freezes, and the supervisor disengages with
    echo_stale on every surface (thr 0 / brk 0). There is no silent throttle-0 hold.
+4. The stale-lane cap after the window (apply_stale_speed_cap), with a known speed: throttle
+   capped at 0.25 at or below STALE_SPEED_MPS (6.0 m/s, inclusive), throttle 0 and brake 0.3
+   above it. Unit level at 5.9 / 6.0 / 6.1 m/s, and on the supervisor: after the window the
+   car is held near 6 m/s with the 0.3 brake.
 """
 from __future__ import annotations
 
@@ -29,7 +33,15 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import test_unknown_ego as T  # noqa: E402
 from gvd_test_env import isolated_home  # noqa: E402
 from python.control.actuate import cmd_path, write_engage_flag  # noqa: E402
-from python.control.launch_guard import LAUNCH_S, LAUNCH_SPEED_MPS, LAUNCH_THROTTLE  # noqa: E402
+from python.control.actuate import DriveCommand  # noqa: E402
+from python.control.launch_guard import (  # noqa: E402
+    LAUNCH_S,
+    LAUNCH_SPEED_MPS,
+    LAUNCH_THROTTLE,
+    STALE_LANE_S,
+    STALE_SPEED_MPS,
+    apply_stale_speed_cap,
+)
 
 LAUNCHER = ROOT / "scripts" / "gvd_road_stub_child.py"
 ACCEL_PER_THROTTLE = 10.0  # m/s^2 at throttle 1.0 (fake car)
@@ -144,9 +156,60 @@ def check_unknown_speed_in_window_disengages() -> None:
     assert not held, ("still engaged after the echo froze: a silent hold", held[:5])
 
 
+STALE_THROTTLE = 0.25
+STALE_BRAKE = 0.3
+
+
+def _capped(speed: float, *, throttle: float = 0.5, brake: float = 0.0,
+            lane_age_s: float = 0.5, lane_src: str = "pair/stale") -> tuple[bool, float, float]:
+    cmd = DriveCommand(steer=0.0, throttle=throttle, brake=brake, seq=1, reason="ok")
+    changed = apply_stale_speed_cap(cmd, speed_mps=speed, lane_age_s=lane_age_s, lane_src=lane_src)
+    return changed, cmd.throttle, cmd.brake
+
+
+def check_stale_cap_numbers_unit() -> None:
+    assert STALE_SPEED_MPS == 6.0 and STALE_LANE_S == 0.25, (STALE_SPEED_MPS, STALE_LANE_S)
+    # At or below 6.0 m/s (the boundary is inclusive: the brake needs speed > 6.0): throttle 0.25.
+    assert _capped(5.9) == (True, STALE_THROTTLE, 0.0), _capped(5.9)
+    assert _capped(6.0) == (True, STALE_THROTTLE, 0.0), _capped(6.0)
+    # Above 6.0 m/s: throttle 0, brake 0.3.
+    assert _capped(6.1) == (True, 0.0, STALE_BRAKE), _capped(6.1)
+    # The cap only lowers throttle and only raises brake.
+    assert _capped(5.9, throttle=0.1) == (True, 0.1, 0.0), _capped(5.9, throttle=0.1)
+    assert _capped(6.1, brake=0.5) == (True, 0.0, 0.5), _capped(6.1, brake=0.5)
+    # A held center caps the same way; a fresh lane is left alone.
+    assert _capped(6.1, lane_age_s=0.0, lane_src="pair/hold") == (True, 0.0, STALE_BRAKE)
+    assert _capped(5.9, lane_age_s=0.0, lane_src="pair/hold") == (True, STALE_THROTTLE, 0.0)
+    assert _capped(6.1, lane_age_s=STALE_LANE_S, lane_src="pair") == (False, 0.5, 0.0)
+
+
+def check_stale_cap_after_window_holds_6mps() -> None:
+    seen, _mark = _drive(10.5)
+    on = [s for s in seen if s["cmd"].get("engaged") is True]
+    assert on, "never engaged"
+    t_on = on[0]["t"]
+    off = [s["state"].get("disengage_reason") for s in seen if s["t"] > t_on and s["cmd"].get("engaged") is not True]
+    assert not off, ("disengaged", off[:5])
+    after = [s for s in on if s["t"] - t_on > LAUNCH_S + 0.3]
+    assert len(after) >= 20, ("too few ticks after the launch window", len(after))
+    pedals = sorted({(float(s["cmd"].get("throttle") or 0.0), float(s["cmd"].get("brake") or 0.0)) for s in after})
+    assert set(pedals) <= {(STALE_THROTTLE, 0.0), (0.0, STALE_BRAKE)}, ("stale cap pedals", pedals)
+    braked = [s for s in after if float(s["cmd"].get("brake") or 0.0) > 0.0]
+    assert braked, ("the 0.3 stale-cap brake never applied", max(_speed(s) or 0.0 for s in after))
+    assert any(float(s["cmd"].get("throttle") or 0.0) == STALE_THROTTLE for s in after), pedals
+    first_brake = braked[0]["t"]
+    held = [_speed(s) for s in after if s["t"] >= first_brake and _speed(s) is not None]
+    assert held and min(held) >= STALE_SPEED_MPS - 1.0 and max(held) <= STALE_SPEED_MPS + 1.0, \
+        ("not held near 6 m/s after the window", min(held or [0.0]), max(held or [0.0]))
+    slow = [s for s in braked if _speed(s) is not None and _speed(s) < STALE_SPEED_MPS - 0.75]
+    assert not slow, ("stale-cap brake well below 6 m/s", [(_speed(s), s["cmd"].get("brake")) for s in slow[:5]])
+
+
 CHECKS = (
     check_known_speed_pulls_away_and_launch_brake,
     check_unknown_speed_in_window_disengages,
+    check_stale_cap_numbers_unit,
+    check_stale_cap_after_window_holds_6mps,
 )
 
 

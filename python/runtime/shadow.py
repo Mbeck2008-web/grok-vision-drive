@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from python.control.actuate import DriveCommand, plan_command, stop_command
+from python.control.actuate import DriveCommand, plan_command, release_command, stop_command
 from python.control.e2e import E2EIntent, E2EPolicy
 
 # Names a slow loop for logs and tests. shadow_tick does not use them to drop
@@ -99,7 +99,7 @@ def modular_intent(
     *,
     path_ego: list[dict[str, float]] | None,
     planner: dict[str, Any] | None,
-    ego_speed_mps: float,
+    ego_speed_mps: float | None,
     seq: int,
 ) -> DriveCommand:
     return plan_command(
@@ -166,7 +166,7 @@ def shadow_tick(
     allow_preview_drive: bool,
     path_ego: list[dict[str, float]] | None,
     planner: dict[str, Any] | None,
-    ego_speed_mps: float,
+    ego_speed_mps: float | None,
     lane_conf: float,
     path_conf: float,
     seq: int,
@@ -242,7 +242,8 @@ def shadow_tick(
         )
 
     if not heartbeat_ok:
-        applied = stop_command(seq=seq, reason="heartbeat_stale")
+        # Stale ego data: the speed is not known. Release (brake 0), not a held stop.
+        applied = release_command(seq=seq, reason="heartbeat_stale")
         return ShadowTick(
             modular=modular,
             e2e=e2e,
@@ -250,6 +251,22 @@ def shadow_tick(
             shadow=shadow,
             e2e_ok=False,
             veto_reason="heartbeat_stale",
+            should_disengage=True,
+            clip_trigger="disengage",
+            policy=policy,
+        )
+
+    if ego_speed_mps is None:
+        # Unknown ego speed: refuse and disengage with throttle 0, brake 0. Not a held
+        # stop: brake 1 at an unknown (possibly highway) speed is a phantom hard brake.
+        applied = release_command(seq=seq, reason="ego_unknown")
+        return ShadowTick(
+            modular=modular,
+            e2e=e2e,
+            applied=applied,
+            shadow=shadow,
+            e2e_ok=False,
+            veto_reason="ego_unknown",
             should_disengage=True,
             clip_trigger="disengage",
             policy=policy,

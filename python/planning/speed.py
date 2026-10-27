@@ -7,19 +7,22 @@ from dataclasses import dataclass
 
 @dataclass
 class SpeedPlan:
-    target_v: float
+    target_v: float | None  # None when the ego speed is unknown
     ttc_lead: float | None
-    aeb: str
+    aeb: str | None
 
 
 def plan_speed(
     *,
-    ego_speed_mps: float,
+    ego_speed_mps: float | None,
     curvature: float,
     ttc_lead: float | None,
     aeb: str,
     v_cap: float = 18.0,
 ) -> SpeedPlan:
+    if ego_speed_mps is None:
+        # The warn/TTC caps scale with the ego speed: unknown speed, no target at all.
+        return SpeedPlan(target_v=None, ttc_lead=None, aeb=None)
     # curvature speed limit
     v_curve = v_cap
     if abs(curvature) > 1e-4:

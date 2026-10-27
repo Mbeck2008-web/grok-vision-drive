@@ -135,7 +135,7 @@ def check_partial_lane_is_continued() -> None:
     assert _max_y(missing) >= 30.0
     for p in missing.path_ego:
         assert -1.75 < p["x"] < 1.75, p
-    assert predict_path(lanes_bev=[], lane_conf=0.0).drivable is False
+    assert predict_path(lanes_bev=[], lane_conf=0.0, ego_speed_mps=0.0).drivable is False
 
 
 def check_car_stop_sign_and_light() -> None:
@@ -616,6 +616,7 @@ def check_bend_not_roundabout_and_blinkers() -> None:
         cipv=None,
         steer_deg=25.0,
         path_width=2.4,
+        ego_speed_mps=0.0,
     )
     assert wrapped.path_width == 2.4
 

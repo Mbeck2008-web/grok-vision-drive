@@ -169,10 +169,10 @@ def main() -> None:
     assert np.allclose(cams[1], expected.transpose(2, 0, 1))
     main_view = _resized(main)
     assert not np.allclose(pol.last_view, main_view)
-    pol.forward(np.full_like(main, 9), wide, stitch_bgr=st.bgr)
+    pol.forward(np.full_like(main, 9), wide, stitch_bgr=st.bgr, speed_mps=0.0)
     assert pol.last_view is not None and np.allclose(pol.last_view, expected)
     other = np.full_like(st.bgr, (8, 16, 32))
-    pol.forward(main, wide, stitch_bgr=other)
+    pol.forward(main, wide, stitch_bgr=other, speed_mps=0.0)
     assert pol.last_view is not None and not np.allclose(pol.last_view, expected)
     assert np.allclose(pol.last_view, _resized(other))
 

@@ -10,14 +10,14 @@ from typing import Any
 class CipvResult:
     track: dict[str, Any] | None
     ttc_lead: float | None
-    aeb: str  # off | warn | brake
+    aeb: str | None  # off | warn | brake; None when the ego speed is unknown
 
 
 def select_cipv(
     tracks: list[dict[str, Any]],
     *,
     path_width: float = 2.0,
-    ego_speed_mps: float = 0.0,
+    ego_speed_mps: float | None,
     margin_m: float = 0.4,
     min_y: float = 4.0,
 ) -> CipvResult:
@@ -33,10 +33,13 @@ def select_cipv(
             continue
         candidates.append(tr)
     if not candidates:
-        return CipvResult(track=None, ttc_lead=None, aeb="off")
+        return CipvResult(track=None, ttc_lead=None, aeb=None if ego_speed_mps is None else "off")
     lead = min(candidates, key=lambda t: float(t.get("y", 1e9)))
     y = float(lead.get("y", 0))
-    # Relative closing only. Unknown ego_speed → no invented TTC/AEB.
+    # Unknown ego speed: no TTC and no AEB state at all (not the "off" a stopped car gets).
+    if ego_speed_mps is None:
+        return CipvResult(track=lead, ttc_lead=None, aeb=None)
+    # Relative closing only. A measured near-0 speed → no invented TTC/AEB.
     if ego_speed_mps <= 0.05:
         return CipvResult(track=lead, ttc_lead=None, aeb="off")
     v_lead_along = float(lead.get("speed_mps", 0.0))  # weak Δy hint, not absolute road speed

@@ -27,6 +27,7 @@ def build_path_ego(
     lane_conf: float,
     curvature: float,
     cipv: dict[str, Any] | None,
+    ego_speed_mps: float | None,
     steer_deg: float = 0.0,
     length_m: float = 36.0,
     step: float = 1.0,
@@ -43,6 +44,7 @@ def build_path_ego(
         lane_conf=lane_conf,
         curvature=curvature,
         tracks=tracks,
+        ego_speed_mps=ego_speed_mps,
         length_m=length_m,
         step_m=step,
     )

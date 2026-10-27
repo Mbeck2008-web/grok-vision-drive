@@ -367,8 +367,9 @@ def check_cache_close_contract() -> None:
             if isinstance(result, np.ndarray):
                 returns_array.add(name)
                 assert cache._open, name
-                for chunk, mapped in cache._open.items():
-                    assert not np.shares_memory(result, mapped), (name, chunk)
+                # No loop variable may outlive the check: a held map keeps the file mapped.
+                shared = [chunk for chunk, mapped in cache._open.items() if np.shares_memory(result, mapped)]
+                assert not shared, (name, shared)
         assert returns_array == {"sector", "canvas"}, returns_array
         s = cache.sector(cam, index)
         c = cache.canvas(index)

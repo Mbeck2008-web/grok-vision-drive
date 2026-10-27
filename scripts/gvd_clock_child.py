@@ -7,6 +7,8 @@ starts the supervisor through this file. It installs, unedited:
 * the painted-road stub camera (``gvd_road_stub_child._grab``), and
 * the echo-gate clock wrap (``gvd_echo_clock_child._observe``; the test writes the sim time
   to ``GVD_TEST_ECHO_CLOCK_FILE`` before each tick),
+* the bus_identity wrap on ``actuate`` / ``state_io`` (``gvd_sim_clock.install_bus_identity_wrap``),
+  so the actuator's lua_bus check reads the sim wall like run_vision's own,
 
 then calls ``run_vision.main(clock=PipeClock())``. ``PipeClock.sleep`` is the step barrier:
 it writes ``done N`` on the protocol pipe (the original stdout) and blocks on reading
@@ -30,7 +32,7 @@ os.dup2(2, 1)
 
 import gvd_echo_clock_child  # noqa: E402 - needs GVD_TEST_ECHO_CLOCK_FILE, set by the test
 import gvd_road_stub_child  # noqa: E402
-from gvd_sim_clock import C0  # noqa: E402
+from gvd_sim_clock import C0, install_bus_identity_wrap  # noqa: E402
 from python.control import echo_link  # noqa: E402
 from python.sensors import cameras  # noqa: E402
 
@@ -72,8 +74,10 @@ def main() -> None:
     echo_link.EchoGate.observe = gvd_echo_clock_child._observe
     script = ROOT / "python" / "run_vision.py"
     sys.argv = [str(script), *sys.argv[1:]]
+    clock = PipeClock(t0, w0)
+    install_bus_identity_wrap(clock)
     g = runpy.run_path(str(script), run_name="gvd_clock_child")
-    g["main"](clock=PipeClock(t0, w0))
+    g["main"](clock=clock)
 
 
 if __name__ == "__main__":

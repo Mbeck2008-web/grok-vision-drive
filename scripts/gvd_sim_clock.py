@@ -30,3 +30,23 @@ class SimClock:
 
     def wall(self) -> float:
         return self.w0 + (self.t - C0)
+
+
+def install_bus_identity_wrap(clock) -> None:
+    """Judge the supervisor's by-name ``bus_identity`` imports on ``clock.wall()``; clock=None: no-op.
+
+    ``actuate.py`` (CmdJsonActuator.apply's bus check) and ``state_io.py`` (attach_bus_identity
+    in write_state) import ``bus_identity`` by name and call it without ``now=``, so on a
+    loaded host real time runs ahead of the sim wall the lua_bus files are stamped to and the
+    actuator refuses with bus_mismatch. Patching ``paths.bus_identity`` would not reach them.
+    Every argument passes through; an explicit ``now=`` from a caller wins.
+    """
+    if clock is None:
+        return
+    from python.control import actuate
+    from python.runtime import paths, state_io
+
+    real_bi = paths.bus_identity
+    wrap = lambda *a, **k: real_bi(*a, **{"now": clock.wall(), **k})  # noqa: E731
+    actuate.bus_identity = wrap
+    state_io.bus_identity = wrap

@@ -1239,14 +1239,15 @@ def check_echo_cmd_blind_not_stale() -> None:
 def check_lua_harness() -> None:
     """Drive the mod's Lua through the stub-GE harness when a Lua 5.1 interpreter is available."""
     for exe in ("lua5.1", "luajit", "lua"):
-        if shutil.which(exe):
-            res = subprocess.run([exe, "scripts/test_m6_lua_cmd.lua"], cwd=str(ROOT), capture_output=True, text=True, timeout=60)
+        lua = shutil.which(exe)
+        if lua:
+            res = subprocess.run([lua, "scripts/test_m6_lua_cmd.lua"], cwd=str(ROOT), capture_output=True, text=True, timeout=60)
             assert res.returncode == 0 and "test_m6_lua_cmd: OK" in res.stdout, res.stdout + res.stderr
-            bind = subprocess.run([exe, "scripts/test_gvd_bind_reload.lua"], cwd=str(ROOT), capture_output=True, text=True, timeout=60)
+            bind = subprocess.run([lua, "scripts/test_gvd_bind_reload.lua"], cwd=str(ROOT), capture_output=True, text=True, timeout=60)
             assert bind.returncode == 0 and "test_gvd_bind_reload: OK" in bind.stdout, bind.stdout + bind.stderr
-            docs = subprocess.run([exe, "scripts/test_gvd_docs_dir.lua"], cwd=str(ROOT), capture_output=True, text=True, timeout=30)
+            docs = subprocess.run([lua, "scripts/test_gvd_docs_dir.lua"], cwd=str(ROOT), capture_output=True, text=True, timeout=30)
             assert docs.returncode == 0 and "test_gvd_docs_dir: OK" in docs.stdout, docs.stdout + docs.stderr
-            link = subprocess.run([exe, "scripts/test_gvd_state_link.lua"], cwd=str(ROOT), capture_output=True, text=True, timeout=30)
+            link = subprocess.run([lua, "scripts/test_gvd_state_link.lua"], cwd=str(ROOT), capture_output=True, text=True, timeout=30)
             assert link.returncode == 0 and "test_gvd_state_link: OK" in link.stdout, link.stdout + link.stderr
             return
     print("  (lua interpreter not found — scripts/test_m6_lua_cmd.lua skipped)")

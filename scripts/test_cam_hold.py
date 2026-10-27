@@ -251,20 +251,20 @@ def check_train_live_identical() -> None:
         live = _live(rows)
         plan = hold_plan(rows)
         build_frame_cache(root, Path(tmp) / "cache", ",".join(STRIP_ORDER))
-        cache = FrameCache(Path(tmp) / "cache")
-        assert not cache.stale, cache.reason
-        held = black = 0
-        for row in rows:
-            row = dict(row, cam_hold=plan[row["i"]])
-            sources = hold_sources(row)
-            canvas, ages = load_held_bgr(root, sources)
-            want_canvas, want_ages = live[row["i"]]
-            assert np.array_equal(ages, want_ages), (row["i"], ages, want_ages)
-            assert canvas.dtype == np.uint8 and np.array_equal(canvas, want_canvas), row["i"]
-            cached, cached_ages = held_canvas(root, row, cache)
-            assert np.array_equal(cached, want_canvas) and np.array_equal(cached_ages, want_ages), row["i"]
-            held += int(((ages > 0)).sum())
-            black += int((ages < 0).sum())
+        with FrameCache(Path(tmp) / "cache") as cache:
+            assert not cache.stale, cache.reason
+            held = black = 0
+            for row in rows:
+                row = dict(row, cam_hold=plan[row["i"]])
+                sources = hold_sources(row)
+                canvas, ages = load_held_bgr(root, sources)
+                want_canvas, want_ages = live[row["i"]]
+                assert np.array_equal(ages, want_ages), (row["i"], ages, want_ages)
+                assert canvas.dtype == np.uint8 and np.array_equal(canvas, want_canvas), row["i"]
+                cached, cached_ages = held_canvas(root, row, cache)
+                assert np.array_equal(cached, want_canvas) and np.array_equal(cached_ages, want_ages), row["i"]
+                held += int(((ages > 0)).sum())
+                black += int((ages < 0).sum())
         assert held > 100 and black >= 4, (held, black)
     print(f"train == live: raw path, cache path and a live tracker agree on {len(rows)} ticks "
           f"({held} held sectors, {black} black) OK")
@@ -291,14 +291,14 @@ def check_parity_compose_vs_cache() -> None:
         dest = Path(tmp) / "cache"
         manifest = build_frame_cache(root, dest, ",".join(STRIP_ORDER))
         assert manifest["format"] == CACHE_FORMAT
-        cache = FrameCache(dest)
-        cached = cache.canvas(0)
-        live = compose_strip(frames)
-        for sec in SECTORS:
-            a = live[:, sec.x0 : sec.x1]
-            b = cached[:, sec.x0 : sec.x1]
-            assert a.tobytes() == b.tobytes(), (sec.cam_id, int((a != b).any(axis=2).sum()))
-            assert np.array_equal(cache.sector(sec.cam_id, 0), a), sec.cam_id
+        with FrameCache(dest) as cache:
+            cached = cache.canvas(0)
+            live = compose_strip(frames)
+            for sec in SECTORS:
+                a = live[:, sec.x0 : sec.x1]
+                b = cached[:, sec.x0 : sec.x1]
+                assert a.tobytes() == b.tobytes(), (sec.cam_id, int((a != b).any(axis=2).sum()))
+                assert np.array_equal(cache.sector(sec.cam_id, 0), a), sec.cam_id
         # The repeater ego band is black in both (it was the format-1 difference).
         rl = [s for s in SECTORS if s.cam_id == "repeatL"][0]
         rr = [s for s in SECTORS if s.cam_id == "repeatR"][0]
@@ -320,16 +320,80 @@ def check_parity_compose_vs_cache() -> None:
         payload = json.loads(before)
         payload.pop("format")
         (old / MANIFEST).write_text(json.dumps(payload), encoding="utf-8")
-        stale = FrameCache(old)
-        assert stale.stale and not stale.has(0) and "NEW folder" in stale.reason, stale.reason
+        with FrameCache(old) as stale:
+            assert stale.stale and not stale.has(0) and "NEW folder" in stale.reason, stale.reason
         # A tampered manifest (sha mismatch) is stale too.
         bad = Path(tmp) / "bad"
         bad.mkdir()
         (bad / MANIFEST).write_bytes(before.replace(b'"frames": 1', b'"frames": 2'))
         (bad / "manifest.sha256").write_bytes((dest / "manifest.sha256").read_bytes())
-        assert FrameCache(bad).stale
+        with FrameCache(bad) as tampered:
+            assert tampered.stale
     print("parity: compose_strip and the frame cache are byte-equal on all 8 sectors (repeater ego band too); "
           "old caches stale; builds create-only OK")
+
+
+def check_cache_close_contract() -> None:
+    """Every array a FrameCache returns is a copy; after close() no map is held.
+
+    Windows refuses to rename or delete a file that is still memory-mapped (WinError 32),
+    so the rename/unlink after close() is the regression test there; on Linux it pins the
+    same contract.
+    """
+    import inspect
+
+    from python.train.frame_cache import FrameCache, build_frame_cache
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "rec"
+        rows = _write_recording(root)
+        dest = Path(tmp) / "cache"
+        build_frame_cache(root, dest, ",".join(STRIP_ORDER))
+        cam, index = "main", rows[0]["i"]
+        cache = FrameCache(dest)
+        assert not cache.stale, cache.reason
+        # Contract guard: call each public callable with a valid index; any ndarray it returns
+        # must not share memory with a chunk map. Only sector and canvas may return arrays.
+        valid = {"cam": cam, "index": index}
+        returns_array = set()
+        for name in sorted(n for n in dir(cache) if not n.startswith("_")):
+            member = getattr(cache, name)
+            if not callable(member) or name == "close":
+                continue
+            params = inspect.signature(member).parameters
+            unknown = [p for p in params if p not in valid]
+            assert not unknown, f"FrameCache.{name}{tuple(params)}: new public method; extend the contract guard"
+            result = member(**{p: valid[p] for p in params})
+            if isinstance(result, np.ndarray):
+                returns_array.add(name)
+                assert cache._open, name
+                for chunk, mapped in cache._open.items():
+                    assert not np.shares_memory(result, mapped), (name, chunk)
+        assert returns_array == {"sector", "canvas"}, returns_array
+        s = cache.sector(cam, index)
+        c = cache.canvas(index)
+        assert s is not None and c is not None
+        assert s.flags.owndata and c.flags.owndata, (s.flags.owndata, c.flags.owndata)
+        s_bytes, c_bytes = s.tobytes(), c.tobytes()
+        chunks = sorted(cache._open)
+        assert chunks, "no chunk was mapped"
+        cache.close()
+        cache.close()  # idempotent
+        assert cache._open == {}
+        for chunk in chunks:
+            moved = dest / (chunk + ".moved")
+            os.rename(dest / chunk, moved)
+            os.unlink(moved)
+        assert s.tobytes() == s_bytes and c.tobytes() == c_bytes
+        for read in (lambda: cache.sector(cam, index), lambda: cache.canvas(index)):
+            try:
+                read()
+            except ValueError as exc:
+                assert "closed" in str(exc), exc
+            else:
+                raise AssertionError("a closed FrameCache served a read")
+    print("cache contract: sector/canvas return copies (owndata, no shared memory with a map); close() drops "
+          "every map, the chunk renames and unlinks, held arrays keep their bytes, reads after close raise OK")
 
 
 def check_report_helper() -> None:
@@ -510,6 +574,7 @@ def main() -> None:
     check_boundaries()
     check_train_live_identical()
     check_parity_compose_vs_cache()
+    check_cache_close_contract()
     check_report_helper()
     check_onnx_round_trip_and_runtime()
     print("test_cam_hold: all OK")

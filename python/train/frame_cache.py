@@ -52,7 +52,14 @@ def _sha256(data: bytes) -> str:
 
 
 class FrameCache:
-    """Read-only map of frame index to a packed camera canvas."""
+    """Read-only map of frame index to a packed camera canvas.
+
+    Contract: every returned array is a copy; after close() no map is held.
+    ``sector()`` and ``canvas()`` copy out of the chunk memory maps, so a caller
+    may keep what they return after ``close()`` (or after the chunk is renamed or
+    deleted). ``close()`` drops the maps; a read after it raises ``ValueError``.
+    A pickled open cache (a spawned worker) reopens its maps on the first read.
+    """
 
     def __init__(self, root: Path | str) -> None:
         self.root = Path(root)
@@ -65,6 +72,7 @@ class FrameCache:
         self.format: str | None = None
         self.manifest_sha256: str | None = None
         self._open: dict[str, np.ndarray] = {}
+        self._closed = False
         self._by_index: dict[int, list[tuple[str, str, int]]] = {}
         manifest = self.root / MANIFEST
         if not manifest.is_file():
@@ -113,13 +121,30 @@ class FrameCache:
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         self.__dict__.update(state)
+        self.__dict__.setdefault("_closed", False)
         self._open = {}
+
+    def close(self) -> None:
+        """Drop every chunk memory map. Idempotent; reads after it raise ``ValueError``."""
+        self._open = {}
+        self._closed = True
+
+    def __enter__(self) -> "FrameCache":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.close()
+
+    def _check_open(self) -> None:
+        if self._closed:
+            raise ValueError("FrameCache is closed")
 
     def has(self, index: int) -> bool:
         return int(index) in self._by_index
 
     def sector(self, cam: str, index: int) -> np.ndarray | None:
-        """One camera's cached sector for tick ``index``, or None."""
+        """One camera's cached sector for tick ``index`` (a copy), or None."""
+        self._check_open()
         for name, part_cam, slot in self._by_index.get(int(index)) or ():
             if part_cam != cam:
                 continue
@@ -130,6 +155,8 @@ class FrameCache:
         return None
 
     def canvas(self, index: int) -> np.ndarray | None:
+        """The packed canvas for tick ``index`` (a new array), or None."""
+        self._check_open()
         parts = self._by_index.get(int(index))
         if not parts:
             return None

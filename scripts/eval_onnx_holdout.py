@@ -226,27 +226,31 @@ def main(argv: list[str] | None = None) -> int:
         from python.train.frame_cache import FrameCache
 
         cache = FrameCache(args.cache)
-    if args.json is not None and args.json.exists():
-        print(f"eval: {args.json} already exists (create-only)", file=sys.stderr)
-        return 2
-    result = evaluate(
-        args.strips,
-        args.onnx,
-        cams=parse_cams(args.cams) if args.cams else None,
-        mask_files=args.mask_files,
-        mask_events=bool(args.mask_events),
-        holdout_blocks=resolve_holdout_blocks(args.holdout_blocks),
-        holdout_cells_file=args.holdout_cells_file,
-        eval_chunk=int(args.eval_chunk),
-        cache=cache,
-    )
-    print(result["selection"], flush=True)
-    print(f"[GVD] holdout: rows={result['holdout_rows']} slices={result['slices']}", flush=True)
-    print(val_line(result), flush=True)
-    if args.json is not None:
-        with open(args.json, "x", encoding="utf-8") as handle:
-            json.dump(result, handle, indent=1)
-    return 0
+    try:
+        if args.json is not None and args.json.exists():
+            print(f"eval: {args.json} already exists (create-only)", file=sys.stderr)
+            return 2
+        result = evaluate(
+            args.strips,
+            args.onnx,
+            cams=parse_cams(args.cams) if args.cams else None,
+            mask_files=args.mask_files,
+            mask_events=bool(args.mask_events),
+            holdout_blocks=resolve_holdout_blocks(args.holdout_blocks),
+            holdout_cells_file=args.holdout_cells_file,
+            eval_chunk=int(args.eval_chunk),
+            cache=cache,
+        )
+        print(result["selection"], flush=True)
+        print(f"[GVD] holdout: rows={result['holdout_rows']} slices={result['slices']}", flush=True)
+        print(val_line(result), flush=True)
+        if args.json is not None:
+            with open(args.json, "x", encoding="utf-8") as handle:
+                json.dump(result, handle, indent=1)
+        return 0
+    finally:
+        if cache is not None:
+            cache.close()
 
 
 if __name__ == "__main__":

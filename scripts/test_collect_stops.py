@@ -15,7 +15,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "scripts"))
 
+from gvd_test_env import collect_root  # noqa: E402
 import scripts.collect_scene_lanes as collect  # noqa: E402
 import scripts.test_collect_spawn_fix as sf  # noqa: E402
 
@@ -176,23 +178,23 @@ def check_exception() -> None:
 
     collect._read_vehicle = boom
     buf_text = ""
-    root = Path(tempfile.mkdtemp())
-    try:
-        sf._run_collector({"speed_at": lambda n: 10.0, "stop_at": 99999}, ["--no-excursions"], root)
-    except RuntimeError as exc:
-        assert "sensor exploded" in str(exc)
-    else:
-        raise AssertionError("the exception must propagate")
-    finally:
-        collect._read_vehicle = real
-    out = root / "scene"
-    status = json.loads((out / "collect.json").read_text(encoding="utf-8"))
-    assert status["stop_reason"] == "exception" and "RuntimeError: sensor exploded" in status["stop_detail"], status
-    assert status["stop_code"] is None
-    beat = json.loads((root / "status" / collect.HEARTBEAT_FILE).read_text(encoding="utf-8"))
-    assert beat["state"] == "stopped" and beat["reason"] == "exception", beat
-    del buf_text
-    print("exception ok (re-raised, stop_reason recorded)")
+    with collect_root() as root:
+        try:
+            sf._run_collector({"speed_at": lambda n: 10.0, "stop_at": 99999}, ["--no-excursions"], root)
+        except RuntimeError as exc:
+            assert "sensor exploded" in str(exc)
+        else:
+            raise AssertionError("the exception must propagate")
+        finally:
+            collect._read_vehicle = real
+        out = root / "scene"
+        status = json.loads((out / "collect.json").read_text(encoding="utf-8"))
+        assert status["stop_reason"] == "exception" and "RuntimeError: sensor exploded" in status["stop_detail"], status
+        assert status["stop_code"] is None
+        beat = json.loads((root / "status" / collect.HEARTBEAT_FILE).read_text(encoding="utf-8"))
+        assert beat["state"] == "stopped" and beat["reason"] == "exception", beat
+        del buf_text
+        print("exception ok (re-raised, stop_reason recorded)")
 
 
 def check_session_open_failed() -> None:
@@ -201,22 +203,22 @@ def check_session_open_failed() -> None:
     import python.sensors.tech as tech
 
     real = tech.open_tech_beamngpy
-    root = Path(tempfile.mkdtemp())
+    with collect_root() as root:
 
-    def refuse(*a, **k):
-        raise ConnectionRefusedError("BeamNG not listening")
+        def refuse(*a, **k):
+            raise ConnectionRefusedError("BeamNG not listening")
 
-    tech.open_tech_beamngpy = refuse
-    buf, old = io.StringIO(), sys.stdout
-    sys.stdout = buf
-    try:
-        code = collect.main(["--minutes", "5", "--data-dir", str(root), "--out", str(root / "scene"),
-                             "--host", "127.0.0.1", "--port", "1"])
-    finally:
-        sys.stdout = old
-        tech.open_tech_beamngpy = real
-    _check_stop(code, buf.getvalue(), root / "scene", "session_open_failed", 2)
-    print("session_open_failed ok")
+        tech.open_tech_beamngpy = refuse
+        buf, old = io.StringIO(), sys.stdout
+        sys.stdout = buf
+        try:
+            code = collect.main(["--minutes", "5", "--data-dir", str(root), "--out", str(root / "scene"),
+                                 "--host", "127.0.0.1", "--port", "1"])
+        finally:
+            sys.stdout = old
+            tech.open_tech_beamngpy = real
+        _check_stop(code, buf.getvalue(), root / "scene", "session_open_failed", 2)
+        print("session_open_failed ok")
 
 
 def check_heartbeat_interval() -> None:

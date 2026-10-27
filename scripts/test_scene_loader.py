@@ -8,6 +8,7 @@ import multiprocessing
 import os
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -101,8 +102,17 @@ def check_windows_memory_status() -> None:
 
 
 def check_workers_and_dry_run_start() -> None:
-    assert default_num_workers() == 0
-    assert "win32" in inspect.getsource(default_num_workers)
+    import python.train.scene_loader as scene_loader
+
+    real_sys = scene_loader.sys
+    try:
+        scene_loader.sys = types.SimpleNamespace(platform="win32")
+        assert default_num_workers() == 4
+        scene_loader.sys = types.SimpleNamespace(platform="linux")
+        assert default_num_workers() == 0
+    finally:
+        scene_loader.sys = real_sys
+    assert default_num_workers() == (4 if sys.platform == "win32" else 0), (sys.platform, default_num_workers())
     assert _confirm_start(_HangWindow(), dry_run=True) is True
     body = inspect.getsource(train_directory)
     assert body.index("write_heartbeat(") < body.index("view.open()")

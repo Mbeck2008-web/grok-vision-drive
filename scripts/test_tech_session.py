@@ -8,6 +8,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+# The product joins home and exe with Path, so the separator is the host's.
+TECH_EXE_PATH = str(Path("/opt/techhome") / "BeamNG.tech.exe")
 
 from python.sensors.cameras import (  # noqa: E402
     CAM_IDS,
@@ -1582,7 +1584,7 @@ def _check_launch_fail_prints_argv(open_tech_beamngpy) -> None:
             seen["quit_on_close"] = self.quit_on_close
             if launch:
                 self.last_command_line = (
-                    "/opt/techhome/BeamNG.tech.exe -nosteam -tcom -tport 25252 "
+                    f"{TECH_EXE_PATH} -nosteam -tcom -tport 25252 "
                     "-console -tcom-listen-ip 127.0.0.1 -gfx dx11"
                 )
                 raise RuntimeError("crash")
@@ -1621,7 +1623,7 @@ def _check_launch_fail_prints_argv(open_tech_beamngpy) -> None:
         assert seen["gfx"] == "dx11"
         assert seen["quit_on_close"] is False
         assert (
-            "argv: /opt/techhome/BeamNG.tech.exe -nosteam -tcom -tport 25252 "
+            f"argv: {TECH_EXE_PATH} -nosteam -tcom -tport 25252 "
             "-console -tcom-listen-ip 127.0.0.1 -gfx dx11"
         ) in out
         assert "BeamNG.tech.x64.exe" not in out
@@ -1639,7 +1641,7 @@ def _check_launch_fail_prints_argv(open_tech_beamngpy) -> None:
         out = buf.getvalue()
         assert seen["early_binary"] == "BeamNG.tech.exe"
         assert seen["early_gfx"] == "dx11"
-        assert "/opt/techhome/BeamNG.tech.exe" in out
+        assert TECH_EXE_PATH in out, out
         assert "-tcom" in out and "-console" in out and "-gfx dx11" in out
         assert "BeamNG.tech.x64.exe" not in out
         assert "Bin64" not in out
@@ -2117,9 +2119,9 @@ def check_tech_hold_gate() -> None:
     assert TECH_GFX == "dx11"
     assert human_one_starter(None) == "BeamNG.tech.exe -tcom -console -gfx dx11"
     starter = human_one_starter("/opt/techhome")
-    assert starter == "/opt/techhome/BeamNG.tech.exe -tcom -console -gfx dx11"
+    assert starter == f"{TECH_EXE_PATH} -tcom -console -gfx dx11", starter
     argv = beamngpy_launch_argv("/opt/techhome", 25252, None)
-    assert argv[0] == "/opt/techhome/BeamNG.tech.exe"
+    assert argv[0] == TECH_EXE_PATH, argv[0]
     assert argv[1:6] == ["-nosteam", "-tcom", "-tport", "25252", "-console"]
     assert argv[argv.index("-gfx") + 1] == "dx11"
     assert "-userpath" not in argv

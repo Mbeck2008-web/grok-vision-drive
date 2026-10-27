@@ -561,6 +561,16 @@ def _window_of(raw: Any) -> tuple[float | None, float | None]:
     return out[0], out[1]
 
 
+def _call_s_of(raw: Any) -> float | None:
+    """perf_counter duration of the camera's BeamNG call, or None (absent in old recordings)."""
+    if not isinstance(raw, dict) or raw.get("call_s") is None:
+        return None
+    try:
+        return round(float(raw["call_s"]), 6)
+    except (TypeError, ValueError):
+        return None
+
+
 class RawFrameWriter:
     """One directory of per-camera PNG or ``.npy`` files plus two JSONL logs.
 
@@ -690,6 +700,7 @@ class RawFrameWriter:
                 "sensor_t": sensor_t,
                 "mono_before": mono_before,
                 "mono_after": mono_after,
+                "call_s": _call_s_of(stamp),
                 "dt_s": cam_dt,
                 "shape": [int(v) for v in shape],
                 "dtype": str(dtype),

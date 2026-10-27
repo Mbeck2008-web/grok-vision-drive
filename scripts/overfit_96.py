@@ -94,7 +94,10 @@ def main(argv=None) -> int:
     from python.train.train_scene import _as_target
 
     cache = FrameCache(args.cache)
-    rows, frames = pick_rows(Path(args.root), cache, int(args.n), int(args.seed))
+    try:
+        rows, frames = pick_rows(Path(args.root), cache, int(args.n), int(args.seed))
+    finally:
+        cache.close()
     labels = [labels_for_row(r) for r in rows]
     x8 = np.array([lane_x_from_vector(y["lane_gt"]) for y in labels])
     print(

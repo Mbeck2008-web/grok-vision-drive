@@ -11,6 +11,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "scripts"))
 
 from python.collect.auto_mode import DEFAULT_MAPS, AutoOptions, collect_argv  # noqa: E402
 from python.collect.excursion import (  # noqa: E402
@@ -35,6 +36,7 @@ from python.train.continual import (  # noqa: E402
 )
 from python.viz.nerd import render_panel  # noqa: E402
 from python.viz.stage import VizUI  # noqa: E402
+from gvd_test_env import collect_root  # noqa: E402
 from scripts.collect_scene_lanes import (  # noqa: E402
     achieved_hz,
     decode_issues,
@@ -578,15 +580,45 @@ class _Host:
         self.levels = levels
         self.vehicles = _Vehicles(self)
         self.scenario = _ScenarioApi(self)
+        self.messages: list[tuple[str, dict[str, object]]] = []
 
     def get_levels(self) -> dict[str, object]:
         return self.levels
+
+    def _message(self, req: str, **kw: object) -> object:
+        """Real beamngpy ``Scenario.make`` sends CreateScenario here (beamngpy installed)."""
+        self.messages.append((req, dict(kw)))
+        if req == "CreateScenario":
+            return f"levels/{kw['level']}/scenarios/{kw['name']}.json"
+        raise AssertionError(f"unexpected beamngpy request {req!r}")
 
     def queue_lua_command(self, command: str, *args: object) -> None:
         del args
         self.commands.append(str(command))
         if "startFreeroam" in command:
             self.ready = False
+
+
+def _beamngpy_imports() -> bool:
+    try:
+        import beamngpy  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _assert_scenarios_made(host: _Host, scenarios: list[object], levels: list[str]) -> None:
+    """Both branches of make_collect_scenario: real beamngpy Scenario, else ScriptScenario."""
+    from python.collect.level_session import ScriptScenario
+
+    assert [getattr(sc, "path", None) for sc in scenarios if not getattr(sc, "path", None)] == [], scenarios
+    created = [kw for req, kw in host.messages if req == "CreateScenario"]
+    if _beamngpy_imports():
+        assert created and [kw.get("level") for kw in created] == levels, created
+        assert all(not isinstance(sc, ScriptScenario) for sc in scenarios), scenarios
+    else:
+        assert created == [], created
+        assert all(isinstance(sc, ScriptScenario) and sc.made for sc in scenarios), scenarios
 
 
 def check_level_load_spawns_and_switches() -> None:
@@ -681,7 +713,7 @@ def check_level_load_spawns_and_switches() -> None:
         assert host.scenario.starts == 2
         assert host.road_reads >= 2
         assert host.early_road is False
-        assert host.scenario.loaded[0].made and host.scenario.loaded[1].made
+        _assert_scenarios_made(host, host.scenario.loaded[:2], ["west_coast_usa", "italy"])
         assert host.scenario.loaded[0].path
         places = [line for line in host.commands if "setPositionRotation" in line]
         assert len(places) == 1, places
@@ -722,7 +754,7 @@ def check_level_load_spawns_and_switches() -> None:
         retried = begin_level(flaky, "italy")
         assert retried.error == "", retried.error
         assert flaky.scenario.loads == 2
-        assert flaky.scenario.loaded[-1].made
+        _assert_scenarios_made(flaky, flaky.scenario.loaded[-1:], ["italy"] * len(flaky.messages))
     finally:
         collect._attach_cameras = previous_attach
         _restore_clock(level_session, previous)
@@ -736,8 +768,7 @@ def check_missing_level_and_bng_error_are_status() -> None:
 
     level_session, previous = _fast_clock()
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with collect_root() as root:
             skip_host = _Host(spawn_works=False, levels={"italy": {"levelName": "italy"}})
 
             def _open(*args: object, **kwargs: object) -> _Host:
@@ -766,8 +797,7 @@ def check_missing_level_and_bng_error_are_status() -> None:
             assert "none of the requested maps" in crash
             assert skip_host.player_calls == 0
 
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with collect_root() as root:
             dead = _Host(
                 spawn_works=False,
                 levels={"west_coast_usa": {"levelName": "west_coast_usa"}, "italy": {}},
@@ -811,8 +841,7 @@ def check_map_preflight() -> None:
 
     level_session, previous = _fast_clock()
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with collect_root() as root:
             host = _Host(
                 spawn_works=True,
                 levels={

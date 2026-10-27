@@ -82,7 +82,7 @@ cameras are staggered onto different 0.1 s slots (`CAMERA_PHASE_S`), so
 pillars, repeaters, and rear rarely land on one tick together. Each
 camera entry in `state.jsonl` carries `mono_before` / `mono_after`
 (`time.monotonic()` right before and after its BeamNG call), `t` (wall
-clock), and `sensor_t` when BeamNG sends one.
+clock), and `sensor_t` when BeamNG sends one. `call_s`: perf_counter duration of the call; the mono_* pair can read equal on Windows (15.6 ms clock).
 
 `ticks.jsonl` has one line per loop tick: `dt` (start to next start),
 the time in the camera poll (`poll_s`), the vehicle poll (`veh_s`), the

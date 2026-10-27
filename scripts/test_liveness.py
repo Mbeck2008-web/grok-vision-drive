@@ -12,7 +12,9 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "scripts"))
 
+from gvd_test_env import collect_root  # noqa: E402
 from python.collect.liveness import (  # noqa: E402
     Liveness,
     bad_row_reasons,
@@ -333,128 +335,128 @@ def check_warmup_skips_partial_cameras() -> None:
     import scripts.collect_scene_lanes as collect
     from python.collect.auto_mode import stop_file
 
-    root = Path(tempfile.mkdtemp())
-    out = root / "scene"
-    state = {
-        "pos": [0.4, 12.0, 0.5],
-        "dir": [0.0, 1.0, 0.0],
-        "electrics": {"wheelspeed": 8.0, "steering_input": 0.1, "throttle_input": 0.2, "brake_input": 0.0},
-    }
-    vehicle = _Vehicle(state, stop_file(out), stop_on=2)
-    bng = _Bng(vehicle)
-    cams = {"main": _Cam(1), "wide": _Cam(2)}
-    collect, previous, tech = _install_session(bng, cams)
-    collect.time.sleep = lambda _seconds: None  # type: ignore[method-assign]
-    buf = io.StringIO()
-    old = sys.stdout
-    sys.stdout = buf
-    try:
-        code = collect.main(
-            ["--minutes", "1", "--smoke-s", "0", "--data-dir", str(root), "--out", str(out), "--host", "127.0.0.1", "--port", "1"]
-        )
-    finally:
-        sys.stdout = old
-        _restore(collect, previous, tech, None)
-    assert code == 0, (code, buf.getvalue())
-    assert vehicle.polls == 2
-    rows = [json.loads(line) for line in (out / "state.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
-    assert len(rows) == 1, rows
-    assert set(rows[0]["cams"]) >= {"main", "wide"}
-    assert "collect cameras live" in buf.getvalue()
-    print("warmup skipped the partial tick")
+    with collect_root() as root:
+        out = root / "scene"
+        state = {
+            "pos": [0.4, 12.0, 0.5],
+            "dir": [0.0, 1.0, 0.0],
+            "electrics": {"wheelspeed": 8.0, "steering_input": 0.1, "throttle_input": 0.2, "brake_input": 0.0},
+        }
+        vehicle = _Vehicle(state, stop_file(out), stop_on=2)
+        bng = _Bng(vehicle)
+        cams = {"main": _Cam(1), "wide": _Cam(2)}
+        collect, previous, tech = _install_session(bng, cams)
+        collect.time.sleep = lambda _seconds: None  # type: ignore[method-assign]
+        buf = io.StringIO()
+        old = sys.stdout
+        sys.stdout = buf
+        try:
+            code = collect.main(
+                ["--minutes", "1", "--smoke-s", "0", "--data-dir", str(root), "--out", str(out), "--host", "127.0.0.1", "--port", "1"]
+            )
+        finally:
+            sys.stdout = old
+            _restore(collect, previous, tech, None)
+        assert code == 0, (code, buf.getvalue())
+        assert vehicle.polls == 2
+        rows = [json.loads(line) for line in (out / "state.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+        assert len(rows) == 1, rows
+        assert set(rows[0]["cams"]) >= {"main", "wide"}
+        assert "collect cameras live" in buf.getvalue()
+        print("warmup skipped the partial tick")
 
 
 def check_stuck_car_aborts_without_weaving() -> None:
     import scripts.collect_scene_lanes as collect
     import python.collect.liveness as liveness
 
-    root = Path(tempfile.mkdtemp())
-    out = root / "scene"
-    state = {
-        "pos": [0.4, 12.0, 0.5],
-        "dir": [0.0, 1.0, 0.0],
-        "damage": 0.0,
-        "electrics": {"wheelspeed": 0.0, "steering_input": 0.0, "throttle_input": 0.4, "brake_input": 0.0},
-    }
-    vehicle = _Vehicle(state)
-    bng = _Bng(vehicle)
-    cams = {"main": _Cam(1)}
-    collect, previous, tech = _install_session(bng, cams)
-    clock = {"t": 0.0}
+    with collect_root() as root:
+        out = root / "scene"
+        state = {
+            "pos": [0.4, 12.0, 0.5],
+            "dir": [0.0, 1.0, 0.0],
+            "damage": 0.0,
+            "electrics": {"wheelspeed": 0.0, "steering_input": 0.0, "throttle_input": 0.4, "brake_input": 0.0},
+        }
+        vehicle = _Vehicle(state)
+        bng = _Bng(vehicle)
+        cams = {"main": _Cam(1)}
+        collect, previous, tech = _install_session(bng, cams)
+        clock = {"t": 0.0}
 
-    def sleep(seconds: float) -> None:
-        clock["t"] += float(seconds or 0.0)
+        def sleep(seconds: float) -> None:
+            clock["t"] += float(seconds or 0.0)
 
-    def monotonic() -> float:
-        return clock["t"]
+        def monotonic() -> float:
+            return clock["t"]
 
-    collect.time.sleep = sleep  # type: ignore[method-assign]
-    collect.time.monotonic = monotonic  # type: ignore[method-assign]
-    collect.tick_sleep_s = lambda _elapsed, _period=0.1: 1.0  # type: ignore[method-assign]
-    old_stall = liveness.STALL_S
-    liveness.STALL_S = 21.0
-    buf = io.StringIO()
-    old = sys.stdout
-    sys.stdout = buf
-    try:
-        code = collect.main(
-            ["--minutes", "1", "--smoke-s", "0", "--data-dir", str(root), "--out", str(out), "--host", "127.0.0.1", "--port", "1"]
-        )
-    finally:
-        sys.stdout = old
-        liveness.STALL_S = old_stall
-        _restore(collect, previous, tech, None)
-    text = buf.getvalue()
-    assert code == 2, (code, text)
-    assert text.count("collect abort stationary") == 2
-    assert "collect segment end" in text and "stationary" in text
-    assert "recover lost" in text
-    assert "collect recover" in text
-    assert "weave" not in text
-    assert any("0.90" in line for line in bng.commands), bng.commands
-    assert not any("250.00" in line for line in bng.commands)
-    assert not (out / "state.jsonl").is_file()
-    assert any("ai.setSpeed" in line for line in vehicle.commands)
-    print("stuck abort wrote nothing")
+        collect.time.sleep = sleep  # type: ignore[method-assign]
+        collect.time.monotonic = monotonic  # type: ignore[method-assign]
+        collect.tick_sleep_s = lambda _elapsed, _period=0.1: 1.0  # type: ignore[method-assign]
+        old_stall = liveness.STALL_S
+        liveness.STALL_S = 21.0
+        buf = io.StringIO()
+        old = sys.stdout
+        sys.stdout = buf
+        try:
+            code = collect.main(
+                ["--minutes", "1", "--smoke-s", "0", "--data-dir", str(root), "--out", str(out), "--host", "127.0.0.1", "--port", "1"]
+            )
+        finally:
+            sys.stdout = old
+            liveness.STALL_S = old_stall
+            _restore(collect, previous, tech, None)
+        text = buf.getvalue()
+        assert code == 2, (code, text)
+        assert text.count("collect abort stationary") == 2
+        assert "collect segment end" in text and "stationary" in text
+        assert "recover lost" in text
+        assert "collect recover" in text
+        assert "weave" not in text
+        assert any("0.90" in line for line in bng.commands), bng.commands
+        assert not any("250.00" in line for line in bng.commands)
+        assert not (out / "state.jsonl").is_file()
+        assert any("ai.setSpeed" in line for line in vehicle.commands)
+        print("stuck abort wrote nothing")
 
 
 def check_tipped_car_exits() -> None:
     import scripts.collect_scene_lanes as collect
 
-    root = Path(tempfile.mkdtemp())
-    out = root / "scene"
-    state = {
-        "pos": [0.4, 12.0, 0.5],
-        "dir": [0.0, 0.1, 0.97],
-        "electrics": {"wheelspeed": 0.1},
-    }
-    vehicle = _Vehicle(state)
-    bng = _Bng(vehicle)
-    cams = {"main": _Cam(1)}
-    collect, previous, tech = _install_session(bng, cams)
-    collect.time.sleep = lambda _seconds: None  # type: ignore[method-assign]
-    buf = io.StringIO()
-    old = sys.stdout
-    sys.stdout = buf
-    try:
-        code = collect.main(
-            ["--minutes", "1", "--smoke-s", "0", "--data-dir", str(root), "--out", str(out), "--host", "127.0.0.1", "--port", "1"]
-        )
-    finally:
-        sys.stdout = old
-        _restore(collect, previous, tech, None)
-    text = buf.getvalue()
-    # A segment end no longer ends the run with exit 0 ("ended"): the stuck
-    # pose is retried until a logged stop rule fires, here recover-lost.
-    assert code == 2, (code, text)
-    assert text.count("collect abort tipped") >= 4
-    assert "collect segment end" in text and "tipped" in text
-    assert "no recorded row since the last segment end" in text
-    stops = [line for line in text.splitlines() if line.startswith("collect stop reason=")]
-    assert stops == [stops[0]] and stops[0].startswith("collect stop reason=segment_fail code=2 "), stops
-    assert " ended" not in text
-    assert not (out / "state.jsonl").is_file()
-    print("tipped abort wrote nothing; stop logged with a reason")
+    with collect_root() as root:
+        out = root / "scene"
+        state = {
+            "pos": [0.4, 12.0, 0.5],
+            "dir": [0.0, 0.1, 0.97],
+            "electrics": {"wheelspeed": 0.1},
+        }
+        vehicle = _Vehicle(state)
+        bng = _Bng(vehicle)
+        cams = {"main": _Cam(1)}
+        collect, previous, tech = _install_session(bng, cams)
+        collect.time.sleep = lambda _seconds: None  # type: ignore[method-assign]
+        buf = io.StringIO()
+        old = sys.stdout
+        sys.stdout = buf
+        try:
+            code = collect.main(
+                ["--minutes", "1", "--smoke-s", "0", "--data-dir", str(root), "--out", str(out), "--host", "127.0.0.1", "--port", "1"]
+            )
+        finally:
+            sys.stdout = old
+            _restore(collect, previous, tech, None)
+        text = buf.getvalue()
+        # A segment end no longer ends the run with exit 0 ("ended"): the stuck
+        # pose is retried until a logged stop rule fires, here recover-lost.
+        assert code == 2, (code, text)
+        assert text.count("collect abort tipped") >= 4
+        assert "collect segment end" in text and "tipped" in text
+        assert "no recorded row since the last segment end" in text
+        stops = [line for line in text.splitlines() if line.startswith("collect stop reason=")]
+        assert stops == [stops[0]] and stops[0].startswith("collect stop reason=segment_fail code=2 "), stops
+        assert " ended" not in text
+        assert not (out / "state.jsonl").is_file()
+        print("tipped abort wrote nothing; stop logged with a reason")
 
 
 def check_second_stall_ends_the_segment() -> None:

@@ -4,7 +4,9 @@
 ``_poll_cameras`` stamps every camera with ``time.monotonic()`` right before
 and right after its BeamNG call (``mono_before`` / ``mono_after``), keeps
 ``time.time()`` as its own ``wall`` field, and records ``sensor_t`` when
-BeamNG returns one. The writer stores all four per frame in state.jsonl.
+BeamNG returns one. ``call_s`` is the call's duration on ``time.perf_counter()``
+(the monotonic pair can read equal on Windows, whose monotonic clock ticks
+every 15.6 ms). The writer stores all five per frame in state.jsonl.
 
 ``TickLog`` (ticks.jsonl) splits a tick into its timed parts and keeps the
 sim clock next to wall time. These checks cover the bookkeeping only; they
@@ -53,6 +55,7 @@ class _PollCam(_Cam):
 
 
 def check_windows_ordered_and_monotonic() -> None:
+    res = time.get_clock_info("monotonic").resolution
     cams = {"main": _Cam(sensor_t=5.0), "wide": _PollCam(sensor_t=None), "rear": _Cam(sensor_t=None)}
     ticks = []
     for _ in range(6):
@@ -68,7 +71,12 @@ def check_windows_ordered_and_monotonic() -> None:
             before, after = st["mono_before"], st["mono_after"]
             assert isinstance(before, float) and isinstance(after, float), st
             assert before <= after, st
-            assert after - before >= cams[cid].delay_s * 0.5, st  # the call is inside the window
+            call_s = st["call_s"]
+            assert isinstance(call_s, float), st
+            assert call_s >= cams[cid].delay_s * 0.5, st  # the call's own duration, precise clock
+            # The perf window sits inside the monotonic one; a coarse monotonic clock can lose
+            # up to one resolution step of it.
+            assert after - before >= call_s - res - 1e-6, (st, res)
             if prev_after is not None:
                 assert prev_after <= before, (prev_after, st)  # monotonic across cameras and ticks
             prev_after = after
@@ -78,7 +86,8 @@ def check_windows_ordered_and_monotonic() -> None:
     main_t = [s["main"]["sensor_t"] for s in ticks]
     assert main_t == sorted(main_t), main_t
     print(f"capture windows: {len(ticks)} ticks x {len(cams)} cams, before<=after, monotonic, "
-          f"main window {ticks[0]['main']['mono_after'] - ticks[0]['main']['mono_before']:.4f} s")
+          f"main window {ticks[0]['main']['mono_after'] - ticks[0]['main']['mono_before']:.4f} s, "
+          f"main call_s {ticks[0]['main']['call_s']:.4f} s (monotonic resolution {res:g} s)")
 
 
 def check_failed_call_still_has_window() -> None:
@@ -92,6 +101,7 @@ def check_failed_call_still_has_window() -> None:
     image, reason, _raw = collect._read_camera("main", _Boom(), window)
     assert image is None and "RuntimeError" in reason
     assert window["mono_before"] <= window["mono_after"], window
+    assert window["perf_before"] <= window["perf_after"], window
 
 
 def check_writer_stores_windows() -> None:
@@ -114,12 +124,22 @@ def check_writer_stores_windows() -> None:
         for cid in ("main", "wide"):
             cam = row["cams"][cid]
             assert cam["mono_before"] <= cam["mono_after"], cam
+            assert isinstance(cam["call_s"], float) and cam["call_s"] >= cams[cid].delay_s * 0.5, cam
             assert isinstance(cam["t"], float)
             if last is not None:
                 assert cam["mono_before"] >= last
             last = cam["mono_after"]
         assert row["cams"]["main"]["sensor_t"] is not None and row["cams"]["wide"]["sensor_t"] is None
-    print("writer: mono_before/mono_after/t/sensor_t per frame in state.jsonl")
+    # A stamp without call_s (an older collector) stores None; the other keys are unchanged.
+    with tempfile.TemporaryDirectory() as tmp:
+        writer = RawFrameWriter(Path(tmp), pose)
+        frames, stamps, _reasons = collect._poll_cameras(cams)
+        old = {cid: {k: v for k, v in st.items() if k != "call_s"} for cid, st in stamps.items()}
+        writer.write(frames, t=time.time(), timestamps=old)
+        row = json.loads((Path(tmp) / "state.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert row["cams"]["main"]["call_s"] is None, row["cams"]["main"]
+    assert row["cams"]["main"]["mono_before"] == round(stamps["main"]["mono_before"], 6)
+    print("writer: mono_before/mono_after/call_s/t/sensor_t per frame in state.jsonl (call_s None when absent)")
 
 
 def check_tick_log() -> None:

@@ -222,6 +222,7 @@ def check_round_trip() -> None:
             assert sha256_file(path) == rec["ckpt_sha256"], rec
             out = Path(tmp) / f"ep{rec['epoch']}.onnx"
             info = export_epoch_onnx(path, out)
+            assert not list(out.parent.glob(f"{out.name}.partial-*")), "no partial left after export"
             try:
                 export_epoch_onnx(path, out)
             except FileExistsError:

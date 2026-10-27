@@ -912,7 +912,7 @@ def check_follow_lua_bus() -> None:
             USERPROFILE=str(td_path / "Users" / "Name"),
             HOME=None,
         ):
-            _plant_lua_bus(predicted, age_s=2.5)
+            _plant_lua_bus(predicted, age_s=paths.LUA_BUS_FRESH_S + 60)  # clear of FAT32 2 s mtime steps
             ident = paths.bus_identity()
             assert ident.matched is False, ident
             assert ident.link == "MISMATCH"

@@ -25,6 +25,11 @@ so GVD bus files (``gvd_state.json``, ``gvd_cmd.json``,
 ``gvd_strip_record.json``, ...) cannot leak from one test into the next or
 into the real home. A script that leaves files in its torch hub folder
 (downloaded weights) fails.
+
+Collector output goes under ``gvd_test_env.suite_data_root()``: each script
+gets its own subfolder there (``gvd_test_env.collect_root`` reads it), removed
+afterwards. The first lines print that folder and the temp root with their
+filesystem and free space.
 """
 from __future__ import annotations
 
@@ -39,7 +44,16 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from gvd_test_env import SKIP_LOG_ENV, isolated_env, read_skips, torch_hub_files  # noqa: E402
+from gvd_test_env import (  # noqa: E402
+    SKIP_LOG_ENV,
+    TEST_DATA_ENV,
+    describe_root,
+    isolated_env,
+    read_skips,
+    suite_data_root,
+    torch_hub_files,
+)
+
 MARKER_WINDOWS = "gvd-ci: requires windows"
 MARKER_BEAMNG = "gvd-ci: requires beamng"
 MARKER_TORCH = "gvd-ci: requires torch"
@@ -115,15 +129,18 @@ def _lua_exe() -> str | None:
     return None
 
 
-def _run(cmd: list[str], label: str) -> tuple[str, int, list[str]]:
+def _run(cmd: list[str], label: str, data_root: Path | None = None) -> tuple[str, int, list[str]]:
     """Run one script isolated. Returns status, exit code, and the checks it skipped."""
     scratch = Path(tempfile.mkdtemp(prefix="gvd-suite-"))
+    data_dir = Path(tempfile.mkdtemp(prefix="gvd-suite-", dir=str(data_root))) if data_root is not None else None
     skips: list[str] = []
     timeout_s = SCRIPT_TIMEOUT_S.get(label, TIMEOUT_S)
     try:
         env = isolated_env(os.environ, scratch)
         skip_log = scratch / "skipped_checks.txt"
         env[SKIP_LOG_ENV] = str(skip_log)
+        if data_dir is not None:
+            env[TEST_DATA_ENV] = str(data_dir)
         env["PYTHONPATH"] = str(ROOT) + os.pathsep + os.environ.get("PYTHONPATH", "")
         env.setdefault("PYTHONUNBUFFERED", "1")
         try:
@@ -140,6 +157,8 @@ def _run(cmd: list[str], label: str) -> tuple[str, int, list[str]]:
         skips = read_skips(skip_log)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+        if data_dir is not None:
+            shutil.rmtree(data_dir, ignore_errors=True)
     if downloaded:
         print(f"FAIL {label}: downloaded weights into the torch hub: {', '.join(downloaded[:5])}", flush=True)
         return "fail", 1, skips
@@ -156,6 +175,8 @@ def main() -> None:
     lua_tests = sorted(p for p in SCRIPTS.glob("test_*.lua") if p.is_file())
     if not py_tests and not lua_tests:
         raise SystemExit("run_offline_suite: no scripts/test_* found")
+    data_root = suite_data_root()
+    print(f"[suite] temp {describe_root(tempfile.gettempdir())}", flush=True)
 
     passed = 0
     failed = 0
@@ -169,7 +190,7 @@ def main() -> None:
             skipped += 1
             print(f"SKIP {path.name}: {reason}", flush=True)
             continue
-        status, _, skips = _run([sys.executable, str(path)], path.name)
+        status, _, skips = _run([sys.executable, str(path)], path.name, data_root)
         check_skips.extend(skips)
         if status == "pass":
             passed += 1
@@ -186,7 +207,7 @@ def main() -> None:
                 skipped += 1
                 print(f"SKIP {path.name}: {reason}", flush=True)
                 continue
-            status, _, skips = _run([lua, str(path)], path.name)
+            status, _, skips = _run([lua, str(path)], path.name, data_root)
             check_skips.extend(skips)
             if status == "pass":
                 passed += 1

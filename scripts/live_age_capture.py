@@ -50,7 +50,9 @@ from ``--strips`` plus the report's selection arguments, read-only.
 Reported, not graded: per-camera read status counts (ok / none / zero /
 flash_filtered / reattach / busy / timeout / error / skip) and read ms,
 ``main_age_ms`` (wall time after the pass's last read minus main's stamp),
-``grab_ms`` and the read-log cost ``read_log_ms``.
+``grab_ms`` and the read-log cost ``read_log_ms``. Also reported, not graded:
+per camera, the share of ok reads identical to that camera's previous frame
+(``uniq=`` field, ``0`` = identical); ``n/a`` for logs without the field.
 
     py -3 scripts/live_age_capture.py --log <ON_LOG> --baseline-log <BASELINE_LOG> ^
         --strips <RECORDING> --holdout-blocks 1 --mask-files <MASK_JSONL> ^
@@ -73,7 +75,7 @@ for path in (str(ROOT), str(ROOT / "scripts")):
 import numpy as np  # noqa: E402
 
 from python.data.cam_hold import BLACK_STAT_AGE_S, CAM_AGE_ORDER, HOLD_TICK_S, NEVER_HELD, stat_age  # noqa: E402
-from python.sensors.live_hold import parse_ages_text, parse_reads_text  # noqa: E402
+from python.sensors.live_hold import parse_ages_text, parse_reads_text, parse_uniq_text  # noqa: E402
 
 MEDIAN_TOL_S = 1.0 * HOLD_TICK_S
 P95_TOL_S = 2.0 * HOLD_TICK_S
@@ -143,6 +145,7 @@ def parse_log(lines: Iterable[str]) -> dict[str, Any]:
             "aeb": kv.get("aeb"),
             "ages": parse_ages_text(kv["ages"]),
             "reads": parse_reads_text(kv.get("reads", "")),
+            "uniq": parse_uniq_text(kv.get("uniq", "")),
         }
         for key in TIMERS:
             tick[key] = _num(kv.get(key))
@@ -219,6 +222,18 @@ def black_share_bar(
         else f"|live - train| black share <= {float(tol_pp):g} pp per camera"
     )
     return {"pass": bool(ok_all and not unset), "unset": unset, "detail": detail, "cams": cams}
+
+
+def identical_shares(ticks: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Per camera: percent of ok reads identical to the previous frame (``uniq=`` 0). Report only.
+
+    ``pct`` is None when no tick carries the camera (older logs without ``uniq=``)."""
+    out: dict[str, dict[str, Any]] = {}
+    for cam in CAM_AGE_ORDER:
+        flags = [t["uniq"][cam] for t in ticks if cam in (t.get("uniq") or {})]
+        same = sum(1 for f in flags if f == 0)
+        out[cam] = {"same": same, "n": len(flags), "pct": None if not flags else round(100.0 * same / len(flags), 2)}
+    return out
 
 
 def read_summary(ticks: list[dict[str, Any]]) -> dict[str, Any]:
@@ -410,6 +425,7 @@ def grade(
         "timers": {"on": timer_summary(on["ticks"]), "baseline": timer_summary(base["ticks"])},
         "exposure": {"on": ex_on, "baseline": ex_base},
         "reads": {"on": read_summary(on["ticks"]), "baseline": read_summary(base["ticks"])},
+        "identical": {"on": identical_shares(on["ticks"]), "baseline": identical_shares(base["ticks"])},
         "unset": [name for name, bar in bars.items() if bar.get("unset")],
     }
 
@@ -451,6 +467,13 @@ def table(result: dict[str, Any]) -> str:
             st = "/".join(f"{k}:{v}" for k, v in sorted(row["status"].items()))
             parts.append(f"{cam}[{st} ms {_fmt(row['read_ms_p50'])}/{_fmt(row['read_ms_p95'])}]")
         lines.append(f"reads {name}: " + (" ".join(parts) if parts else "n/a"))
+    for name in ("on", "baseline"):
+        shares = (result.get("identical") or {}).get(name) or {}
+        parts = [
+            f"{cam}=" + ("n/a" if row["pct"] is None else f"{row['pct']:.2f}%({row['same']}/{row['n']})")
+            for cam, row in shares.items()
+        ]
+        lines.append(f"identical-frame share {name} (report only): " + (" ".join(parts) if parts else "n/a"))
     lines.append(f"providers: {result['providers']}")
     lines.append(f"respawns / resets seen: {result['respawns']}")
     unset = result.get("unset") or []

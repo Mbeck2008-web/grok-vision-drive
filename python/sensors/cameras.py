@@ -169,8 +169,9 @@ class CameraFrameBundle:
     # for compose_strip.
     cam_ages: tuple[float, ...] | None = None
     held_frames: dict[str, np.ndarray] = field(default_factory=dict)
-    # Per-camera read status / read ms, main's age at the end of the pass and the
-    # bookkeeping cost (cam-age telemetry, ``enable_read_log``); None otherwise.
+    # Per-camera read status / read ms, main's age at the end of the pass, the
+    # bookkeeping cost and ``uniq`` (per ok read: 1 new frame, 0 identical to the
+    # camera's previous frame) (cam-age telemetry, ``enable_read_log``); None otherwise.
     read_log: dict[str, Any] | None = None
 
     def tick_frames(self) -> dict[str, np.ndarray]:
@@ -2182,6 +2183,9 @@ class BeamNGPyBackend:
         log_on = self._read_log_on
         read_status: dict[str, str] = {}
         read_ms: dict[str, float] = {}
+        # 1 = this tick's ok read differs from the camera's last published frame
+        # (the existing frame_signature / unique_ids test), 0 = identical.
+        read_uniq: dict[str, int] = {}
         log_cost = 0.0
         for cid, cam in main_first:
             if not self._grab_this_tick(cid, grab_i):
@@ -2216,6 +2220,8 @@ class BeamNGPyBackend:
                     # The first read after a reattach (new Camera on the GE socket).
                     status = "reattach" if status == "ok" else f"reattach_{status}"
                 read_status[cid] = status
+                if self._last_status == "ok":
+                    read_uniq[cid] = int(cid in unique_ids)
                 log_cost += time.perf_counter() - c0
             self._reattached.discard(cid)
         cam_ages: tuple[float, ...] | None = None
@@ -2234,7 +2240,7 @@ class BeamNGPyBackend:
             main_age_ms = None
             if "main" in walls and walls:
                 main_age_ms = (max(walls.values()) - walls["main"]) * 1000.0
-            read_log = {"status": read_status, "read_ms": read_ms, "main_age_ms": main_age_ms}
+            read_log = {"status": read_status, "read_ms": read_ms, "main_age_ms": main_age_ms, "uniq": read_uniq}
             log_cost += time.perf_counter() - c0
             read_log["log_ms"] = log_cost * 1000.0
         self._maybe_live_narrow_hitch()

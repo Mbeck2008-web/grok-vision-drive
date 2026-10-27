@@ -363,6 +363,26 @@ def reads_text(read_log: Any) -> str:
     return ",".join(parts) or "na"
 
 
+def uniq_text(read_log: Any) -> str:
+    """``main:1,wide:0,...``: per camera with an ok read this tick (``CAM_AGE_ORDER``), 1 when
+    the frame differs from that camera's previous frame (``frame_signature``), 0 when identical;
+    ``na`` without a log or without an ok read."""
+    if not isinstance(read_log, Mapping):
+        return "na"
+    uniq = read_log.get("uniq") or {}
+    return ",".join(f"{cam}:{int(bool(uniq[cam]))}" for cam in CAM_AGE_ORDER if cam in uniq) or "na"
+
+
+def parse_uniq_text(text: str) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for part in str(text or "").split(","):
+        bits = part.split(":")
+        if len(bits) != 2 or bits[1] not in ("0", "1"):
+            continue
+        out[bits[0].strip()] = int(bits[1])
+    return out
+
+
 def parse_reads_text(text: str) -> dict[str, tuple[str, float | None]]:
     out: dict[str, tuple[str, float | None]] = {}
     for part in str(text or "").split(","):

@@ -13,7 +13,9 @@
 * the BeamNG grab streams all 8 cameras every tick and never sends an ad-hoc
   request; the default grab has no ages. With ``enable_read_log`` every
   grab carries per-camera read status (ok / none / zero / flash_filtered /
-  reattach ...), read ms, main_age_ms and the log's own cost.
+  reattach ...), read ms, main_age_ms, the log's own cost and ``uniq`` (per
+  ok read: 1 new frame, 0 identical to the camera's previous frame; report
+  only, the published frames and unique ids are the same with the log off).
 * a respawn / reset drops every held side frame: side cameras are black / -1
   until a frame stored after it.
 * reset detection: a 0.8 g stop never fires; an in-place reset (11 -> 0.27
@@ -402,6 +404,72 @@ def check_backend_read_log() -> None:
           f"8 ms reads: {stored} stored side frames, 0 black on their storing tick; main_age_ms >= 49 ms OK")
 
 
+class FrameSeqCam(FakeCam):
+    """Returns ``frames`` in order (the last one repeats)."""
+
+    def __init__(self, name: str, frames: list) -> None:
+        super().__init__(name)
+        self.frames = list(frames)
+
+    def stream_raw(self):
+        self.streams += 1
+        pix = self.frames[min(self.streams - 1, len(self.frames) - 1)]
+        return {"colour": pix.copy()}
+
+
+def check_backend_uniq() -> None:
+    """uniq: per ok read, 1 = differs from the camera's previous frame, 0 = identical (report only)."""
+    from python.sensors.live_hold import parse_uniq_text, uniq_text
+
+    other = PIX.copy()
+    other[2:10, 2:10, :3] = 60  # a darker patch: not a flash
+    # main: A, A, B, B ; wide: A, B, A ; the rest always A; narrow unread (zero).
+    cams = {cid: FakeCam(cid) for cid in ALL}
+    cams["main"] = FrameSeqCam("main", [PIX, PIX, other, other])
+    cams["wide"] = FrameSeqCam("wide", [PIX, other, PIX])
+    cams["narrow"] = SlowCam("narrow", 0.0, mode="zero")
+    be = _backend(cams)
+    be.enable_live_hold()
+    be.enable_read_log()
+    got = []
+    for _k in range(4):
+        bundle = be.grab()
+        got.append(dict(bundle.read_log["uniq"]))
+        time.sleep(0.02)
+    assert [g["main"] for g in got] == [1, 0, 1, 0], got
+    assert [g["wide"] for g in got] == [1, 1, 1, 0], got
+    assert [g["rear"] for g in got] == [1, 0, 0, 0], got
+    assert all("narrow" not in g for g in got), got  # no ok read, no flag
+    text = uniq_text(bundle.read_log)
+    assert parse_uniq_text(text) == got[-1] and text.startswith(tuple(f"{c}:" for c in ALL)), text
+    assert uniq_text(None) == "na" and uniq_text({"status": {}}) == "na" and parse_uniq_text("na") == {}
+    be.close()
+    # Report only: the same frame sequence with the read log off gives the same
+    # published frames and unique ids.
+    def _cams() -> dict:
+        out = {cid: FakeCam(cid) for cid in ALL}
+        out["main"] = FrameSeqCam("main", [PIX, PIX, other, other])
+        out["wide"] = FrameSeqCam("wide", [PIX, other, PIX])
+        out["narrow"] = SlowCam("narrow", 0.0, mode="zero")
+        return out
+
+    be_off = _backend(_cams())
+    be_off.enable_live_hold()
+    be_on = _backend(_cams())
+    be_on.enable_live_hold()
+    be_on.enable_read_log()
+    for _k in range(4):
+        b_off, b_on = be_off.grab(), be_on.grab()
+        assert b_off.read_log is None and b_on.read_log is not None
+        assert b_off.unique_gpu_ids == b_on.unique_gpu_ids, (b_off.unique_gpu_ids, b_on.unique_gpu_ids)
+        assert set(b_off.frames) == set(b_on.frames)
+        assert all(np.array_equal(b_off.frames[c], b_on.frames[c]) for c in b_off.frames)
+    be_off.close()
+    be_on.close()
+    print("uniq: same frame twice -> 0, changed frame -> 1, unread camera omitted; read log on/off: same "
+          "frames and unique ids OK")
+
+
 def check_respawn_reset() -> None:
     cams = {cid: FakeCam(cid) for cid in ALL}
     be = _backend(cams)
@@ -570,8 +638,11 @@ def check_runtime_gate() -> None:
 def _capture_lines(*, hold: bool, n: int = 900, flash_every: int = 0, jump_every: int = 0, skip_at: int = -1,
                    dt_hi: bool = False, scene_hi: bool = False, engaged_at: int = -1, untrained: bool = True,
                    stale_at: tuple[int, ...] = (), no_detect_at: int = -1, detector: str = "yolov8n-onnx",
-                   black: dict | None = None) -> list[str]:
-    """Synthetic run_vision cam-age log. ``black``: {cam: every} -> that camera is black (-1) on every n-th tick."""
+                   black: dict | None = None, same: dict | None = None) -> list[str]:
+    """Synthetic run_vision cam-age log. ``black``: {cam: every} -> that camera is black (-1) on every n-th tick.
+
+    ``same``: None -> no ``uniq=`` field (older logs); {cam: every} -> that camera's read is identical
+    to its previous frame (``uniq`` 0) on every n-th tick, new (1) otherwise."""
     black = dict(black or {})
     rng = np.random.RandomState(0)
     lines = [
@@ -601,6 +672,8 @@ def _capture_lines(*, hold: bool, n: int = 900, flash_every: int = 0, jump_every
             f"compose_ms=1.200 prep_ms=2.000 scene_ms={scene:.3f} post_ms=0.300 detect_ms={det} plan_ms=1.500 "
             f"infer_ms=12.000 aeb=off grab_ms={60 + rng.rand():.3f} read_log_ms=0.020 main_age_ms={56 + rng.rand():.3f} "
             f"ages={ages} reads={reads}"
+            + ("" if same is None else " uniq=" + ",".join(
+                f"{cam}:{0 if same.get(cam) and k % same[cam] == 0 else 1}" for cam in CAM_AGE_ORDER))
         )
     return lines
 
@@ -675,9 +748,20 @@ def check_capture_script() -> None:
     assert not grade(on, on, train)["bars"]["mode"]["pass"]
     assert not grade(parse_log(_capture_lines(hold=True, n=300, **good)), base, train)["bars"]["duration"]["pass"]
     assert grade(parse_log(_capture_lines(hold=True, dt_hi=True, **good)), base, train, dt_p50_ms=300, dt_p95_ms=400)["pass"]
+    # Identical-frame share (uniq=), report only: older logs read n/a, the grade is unchanged.
+    assert all(row["pct"] is None and row["n"] == 0 for row in result["identical"]["on"].values())
+    assert "identical-frame share on (report only): repeatL=n/a" in table(result)
+    dup = parse_log(_capture_lines(hold=True, flash_every=100, jump_every=100, same={"wide": 50, "rear": 4}))
+    got = grade(dup, base, train)
+    assert got["pass"] and got["bars"].keys() == result["bars"].keys(), table(got)
+    ident = got["identical"]["on"]
+    assert ident["wide"] == {"same": 18, "n": 900, "pct": 2.0} and ident["rear"]["pct"] == 25.0, ident
+    assert ident["main"] == {"same": 0, "n": 900, "pct": 0.0} and got["identical"]["baseline"]["main"]["pct"] is None
+    assert " wide=2.00%(18/900) " in table(got) and "rear=25.00%(225/900)" in table(got)
     check_capture_cli(train, train_black)
     print(f"live_age_capture: {len(names)} bars PASS on a good pair; each FAILs alone on its fault; dt bars 162 / 215 ms; "
-          "black counted at the 1.533 s cap on both sides; black_share UNSET without --black-share-tol; reads reported OK")
+          "black counted at the 1.533 s cap on both sides; black_share UNSET without --black-share-tol; reads and "
+          "identical-frame share reported (n/a without uniq=) OK")
 
 
 def check_capture_cli(train: dict, train_black: dict) -> None:
@@ -719,7 +803,7 @@ def check_telemetry_helpers() -> None:
     src = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
     assert "would_skip_control = bool(cam_age_log) and camera_ge_socket_busy()\n            if engaged and (cmd.reason" in src
     assert "if args.no_engage:\n                engaged = False" in src
-    for key in ("compose_ms=", "prep_ms=", "scene_ms=", "post_ms=", "detect_ms=", "plan_ms=", "stale_ego=", "aeb="):
+    for key in ("compose_ms=", "prep_ms=", "scene_ms=", "post_ms=", "detect_ms=", "plan_ms=", "stale_ego=", "aeb=", "uniq="):
         assert key in src, key
     # Engage gates actuation only: perception (detector + planner + AEB) runs before and outside any engaged branch.
     i_perc = src.index("            pout = perc.tick(\n                main,")
@@ -748,6 +832,7 @@ def main() -> None:
     check_pass_stamp()
     check_backend_streams()
     check_backend_read_log()
+    check_backend_uniq()
     check_respawn_reset()
     check_reset_detection()
     check_stale_ego()

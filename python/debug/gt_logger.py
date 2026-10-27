@@ -32,12 +32,25 @@ from python.debug.gt_geom import (
     update_curve_preview,
 )
 from python.collect import road_loader
-from python.collect.road_loader import current_level, polys_from_network  # noqa: F401  (re-exported)
+from python.collect.road_loader import current_level, polys_from_network  # noqa: F401  re-exported for python/collect/road_dump.py and scripts/test_gt_crash_sign.py
 
 FRAME_EVERY_S = 4.0
-# A pose this far from the last tick is a respawn or a new level. Only then
-# is the level asked again; a different (or unknown) level reloads roads once.
+# Level-change triggers. Any of them makes the logger ask the game for the
+# level once; a different (or unknown) level reloads roads once.
+# 1. A pose this far from the last tick: a respawn or a new level.
 LEVEL_JUMP_M = 100.0
+# 2. Sim time going backwards (a new level or scenario restarts the clock).
+#    write() already reads sim time each tick, so this costs nothing extra.
+# 3. A level poll at most this often (wall clock), for a new level whose
+#    spawn is near the last pose and whose clock did not visibly restart.
+#    Cost: one ``current_level`` call per LEVEL_POLL_S, which is one
+#    QueueLuaCommandGE round trip (beamngpy 1.36 ``control.queue_lua_command``
+#    always waits for ExecutedLuaChunkGE) returning the level name string.
+#    ``get_gamestate`` in 1.36 carries no level, and
+#    ``scenario.get_current`` sends GetCurrentScenario and parses a whole
+#    scenario dict, so the Lua query is the cheapest call. Not per tick:
+#    at 10 Hz that is one extra round trip per 100 ticks.
+LEVEL_POLL_S = 10.0
 ROAD_RETRY_S = 2.0
 DEPART_BURST = 3
 
@@ -299,6 +312,7 @@ class GroundTruthLogger:
         self._roads_level: str | None = None
         self._level_pos: tuple[float, float] | None = None
         self._level_check = False
+        self._level_poll_wall = 0.0
         self._prev_damage: float | None = None
         self._last_sim: float | None = None
         self._wall0 = time.time()
@@ -330,10 +344,11 @@ class GroundTruthLogger:
 
         The first load asks the game which level is up and reads that level's
         network through the shared loader (retried every ``ROAD_RETRY_S``
-        while it is empty). After that the only trigger is a pose jump of
-        ``LEVEL_JUMP_M``: a respawn or a level change. Then the level is asked
-        once more; the same level keeps the roads, a different level reads
-        that level once, and an unknown answer re-reads to be safe.
+        while it is empty). After that the level is asked again only on a
+        trigger: a pose jump of ``LEVEL_JUMP_M``, sim time going backwards
+        (flagged by ``write``), or the ``LEVEL_POLL_S`` poll. The same level
+        keeps the roads, a different level reads that level once, and an
+        unknown answer re-reads to be safe.
         """
         pos = _pose(vdata)[0] if vdata is not None else None
         if pos is not None:
@@ -346,6 +361,13 @@ class GroundTruthLogger:
             ):
                 self._level_check = True
             self._level_pos = here
+        now = time.time()
+        if (
+            self._roads is not None
+            and not self._level_check
+            and (now - self._level_poll_wall) >= LEVEL_POLL_S
+        ):
+            self._level_check = True
         if self._roads is not None and not self._level_check:
             return
         if socket_busy or bng is None:
@@ -353,6 +375,7 @@ class GroundTruthLogger:
         loader = self._loader if self._loader is not None else road_loader.shared()
         if self._roads is not None:
             self._level_check = False
+            self._level_poll_wall = now
             level = current_level(bng)
             if level and level == self._roads_level:
                 return
@@ -366,7 +389,6 @@ class GroundTruthLogger:
             self._follow = RoadFollow()
             self._followed = None
             self._last_good = None
-        now = time.time()
         if self._road_try_wall and (now - self._road_try_wall) < ROAD_RETRY_S:
             return
         self._road_try_wall = now
@@ -376,6 +398,7 @@ class GroundTruthLogger:
         if polys:
             self._roads = polys
             self._roads_level = level
+            self._level_poll_wall = now
             self._road_note = ""
             print(f"[GVD] gt roads={len(polys)}", flush=True)
         else:
@@ -502,6 +525,8 @@ class GroundTruthLogger:
             t = time.time() - self._wall0
             t_source = "wall"
         else:
+            if self._last_sim is not None and sim < self._last_sim:
+                self._level_check = True  # clock restarted: maybe a new level
             self._last_sim = sim
             t = sim
             t_source = "sim"

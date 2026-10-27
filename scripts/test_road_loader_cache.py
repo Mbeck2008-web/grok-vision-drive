@@ -21,7 +21,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
 from python.collect import level_session, liveness, road_loader  # noqa: E402
-from python.debug.gt_logger import GroundTruthLogger  # noqa: E402
+from python.debug.gt_logger import LEVEL_POLL_S, GroundTruthLogger  # noqa: E402
 from synthetic_roads import FakeBng, FakeClock, drive, load_graph, patched_logger_env, track  # noqa: E402
 
 SPAWNS = {"synth_a": (0.0, -150.0, 0.0), "synth_b": (5000.0, 5000.0, 0.0)}
@@ -103,7 +103,11 @@ def check_session_read_counts() -> None:
         assert len(rows) == 1000 and sum(r["lane_x"] is not None for r in rows) > 900
         counts.append(("1000 GT ticks", bng.reads))
         assert bng.reads == 1, counts
-        assert bng.lua_calls - lua_before <= 1, f"level asked {bng.lua_calls - lua_before} times in 1000 ticks"
+        # One level query when roads load, then the LEVEL_POLL_S poll: at most
+        # one Lua round trip per 10 s of wall time (100 s here), never per tick.
+        asked = bng.lua_calls - lua_before
+        budget = 1 + int(1000 * 0.1 // LEVEL_POLL_S)
+        assert asked <= budget, f"level asked {asked} times in 1000 ticks (budget {budget})"
 
         stalls = [(10.0, -120.0, 0.3), (-150.0, 2.0, 0.3), (180.0, 30.0, 0.3), (420.0, 15.0, 0.3), (590.0, -95.0, 0.3)]
         snaps = 0

@@ -25,6 +25,7 @@ Windows. You do not need an administrator account. The full agent procedure (Tec
 
 1. Run `install.bat`, then enable **Grok Vision Drive** in the BeamNG Mod Manager.
 2. BeamNG.tech (eight cameras): start one game with `BeamNG.tech.exe -tcom -console -gfx dx11` (port 25252), then run `play_gvd_tech.bat`.
+   The Tech path requires beamngpy 1.36+ (BeamNG.tech 0.39); install `requirements-beamng.txt`.
    BeamNG.drive (one window capture): run `play_gvd.bat`.
 3. The **GVD VISION** window opens. Add the **GVD** app in BeamNG's UI Apps.
 4. Press **Alt+G** in the game (or **Ctrl+Alt+G**, or the app's ENGAGE button) to engage. Press Alt+G again, steer, or press a pedal to take over.

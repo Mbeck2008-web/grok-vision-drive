@@ -425,8 +425,8 @@ class TechHelloTimeout(TimeoutError):
     """Hello did not return before socket_timeout. Not a missing vehicle."""
 # Human one-starter and the BeamNGpy gfx switch. BeamNGpy also adds -nosteam/-tport.
 TECH_HUMAN_TAIL = ("-tcom", "-console", "-gfx", TECH_GFX)
-# BeamNGpy minor line for the Tech build in use. 0.38 → 1.35, 0.39 → 1.36.
-BEAMNGPY_FOR_TECH = {"1.35": "0.38", "1.36": "0.39"}
+# BeamNGpy minor line for the Tech build in use. 0.39 → 1.36.
+BEAMNGPY_FOR_TECH = {"1.36": "0.39"}
 
 
 def wants_tech_attach() -> bool:
@@ -636,8 +636,8 @@ def _async_raise(worker: threading.Thread, exc_type: type[BaseException]) -> Non
 def _abandon_hello(bng: Any, worker: threading.Thread) -> None:
     """Stop a daemon still inside ``bng.open()`` so it cannot reconnect forever.
 
-    BeamNGpy 1.35.1/1.36 treat a closed socket as ``socket.error`` and call
-    ``reconnect()``. 1.35.1 then sets the new socket to blocking. Patch
+    BeamNGpy 1.36 treats a closed socket as ``socket.error`` and calls
+    ``reconnect()``, which can open another blocking socket. Patch
     ``reconnect`` before closing so that follow-up raises out of ``open()``.
     """
     try:
@@ -757,9 +757,9 @@ def _hello_refuse_line(timeout: float) -> None:
 def _open_with_deadline(bng: Any, launch: bool, timeout: float, host: str, port: int) -> None:
     """Return when ``bng.open`` finishes, or REFUSE at ``timeout``.
 
-    BeamNGpy 1.35.1 has no ``socket_timeout`` argument, so a silent port blocks
-    inside ``open()``. 1.36 accepts the argument and may retry once. The join
-    is the cap for both pins. On expiry the helper logs one REFUSE, stops the
+    BeamNGpy 1.36 accepts ``socket_timeout`` but may retry once, and an older
+    build without the argument blocks inside ``open()`` on a silent port. The
+    join is the cap either way. On expiry the helper logs one REFUSE, stops the
     ``open()`` thread, and disconnects. Any other ``open()`` error disconnects
     too, so a Hello version mismatch cannot leave the socket up.
     """
@@ -804,7 +804,7 @@ def open_tech_beamngpy(
     """Connect with quit_on_close=False. Launch uses the root exe and ``-gfx dx11``.
 
     A listening research port forces ``launch=False``. ``bng.open()`` is joined
-    for ``socket_timeout`` seconds on BeamNGpy 1.35 and 1.36. Expiry is
+    for ``socket_timeout`` seconds on BeamNGpy 1.36. Expiry is
     ``TechHelloTimeout`` (one ``phase=Hello REFUSE``), not a missing vehicle.
     A launch failure prints the real argv. Attach failures do not print a launch line.
     """

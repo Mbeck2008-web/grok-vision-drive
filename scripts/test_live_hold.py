@@ -13,7 +13,11 @@
 * the BeamNG grab streams all 8 cameras every tick and never sends an ad-hoc
   request; the default grab has no ages. With ``enable_read_log`` every
   grab carries per-camera read status (ok / none / zero / flash_filtered /
-  reattach ...), read ms, main_age_ms and the log's own cost.
+  reattach ...), read ms, main_age_ms, the log's own cost and ``uniq`` (per
+  ok read: 1 new frame, 0 identical to the camera's previous frame) and
+  ``tuniq`` (per frame the schedule took, vs that camera's previous taken
+  frame); report only, the published and held frames, taken cameras and
+  unique ids are the same with the log off.
 * a respawn / reset drops every held side frame: side cameras are black / -1
   until a frame stored after it.
 * reset detection: a 0.8 g stop never fires; an in-place reset (11 -> 0.27
@@ -402,6 +406,72 @@ def check_backend_read_log() -> None:
           f"8 ms reads: {stored} stored side frames, 0 black on their storing tick; main_age_ms >= 49 ms OK")
 
 
+class FrameSeqCam(FakeCam):
+    """Returns ``frames`` in order (the last one repeats)."""
+
+    def __init__(self, name: str, frames: list) -> None:
+        super().__init__(name)
+        self.frames = list(frames)
+
+    def stream_raw(self):
+        self.streams += 1
+        pix = self.frames[min(self.streams - 1, len(self.frames) - 1)]
+        return {"colour": pix.copy()}
+
+
+def check_backend_uniq() -> None:
+    """uniq: per ok read, 1 = differs from the camera's previous frame, 0 = identical (report only)."""
+    from python.sensors.live_hold import parse_uniq_text, uniq_text
+
+    other = PIX.copy()
+    other[2:10, 2:10, :3] = 60  # a darker patch: not a flash
+    # main: A, A, B, B ; wide: A, B, A ; the rest always A; narrow unread (zero).
+    cams = {cid: FakeCam(cid) for cid in ALL}
+    cams["main"] = FrameSeqCam("main", [PIX, PIX, other, other])
+    cams["wide"] = FrameSeqCam("wide", [PIX, other, PIX])
+    cams["narrow"] = SlowCam("narrow", 0.0, mode="zero")
+    be = _backend(cams)
+    be.enable_live_hold()
+    be.enable_read_log()
+    got = []
+    for _k in range(4):
+        bundle = be.grab()
+        got.append(dict(bundle.read_log["uniq"]))
+        time.sleep(0.02)
+    assert [g["main"] for g in got] == [1, 0, 1, 0], got
+    assert [g["wide"] for g in got] == [1, 1, 1, 0], got
+    assert [g["rear"] for g in got] == [1, 0, 0, 0], got
+    assert all("narrow" not in g for g in got), got  # no ok read, no flag
+    text = uniq_text(bundle.read_log)
+    assert parse_uniq_text(text) == got[-1] and text.startswith(tuple(f"{c}:" for c in ALL)), text
+    assert uniq_text(None) == "na" and uniq_text({"status": {}}) == "na" and parse_uniq_text("na") == {}
+    be.close()
+    # Report only: the same frame sequence with the read log off gives the same
+    # published frames and unique ids.
+    def _cams() -> dict:
+        out = {cid: FakeCam(cid) for cid in ALL}
+        out["main"] = FrameSeqCam("main", [PIX, PIX, other, other])
+        out["wide"] = FrameSeqCam("wide", [PIX, other, PIX])
+        out["narrow"] = SlowCam("narrow", 0.0, mode="zero")
+        return out
+
+    be_off = _backend(_cams())
+    be_off.enable_live_hold()
+    be_on = _backend(_cams())
+    be_on.enable_live_hold()
+    be_on.enable_read_log()
+    for _k in range(4):
+        b_off, b_on = be_off.grab(), be_on.grab()
+        assert b_off.read_log is None and b_on.read_log is not None
+        assert b_off.unique_gpu_ids == b_on.unique_gpu_ids, (b_off.unique_gpu_ids, b_on.unique_gpu_ids)
+        assert set(b_off.frames) == set(b_on.frames)
+        assert all(np.array_equal(b_off.frames[c], b_on.frames[c]) for c in b_off.frames)
+    be_off.close()
+    be_on.close()
+    print("uniq: same frame twice -> 0, changed frame -> 1, unread camera omitted; read log on/off: same "
+          "frames and unique ids OK")
+
+
 def check_respawn_reset() -> None:
     cams = {cid: FakeCam(cid) for cid in ALL}
     be = _backend(cams)
@@ -567,11 +637,116 @@ def check_runtime_gate() -> None:
     print("runtime: gvd_cam_age=1 accepted on BeamNG, refused on window; window ages main-only; prep/scene/post timers OK")
 
 
+class ScriptedSchedule:
+    """A CameraSchedule stand-in: tick ``k`` takes ``plan[k]`` (cameras present this tick only)."""
+
+    def __init__(self, plan: list) -> None:
+        self.plan = [tuple(p) for p in plan]
+        self.k = 0
+
+    def reset(self) -> None:
+        pass
+
+    def tick(self, now_s: float, cams) -> list:
+        want = self.plan[self.k] if self.k < len(self.plan) else ()
+        self.k += 1
+        return [c for c in cams if c in want]
+
+
+def check_backend_tuniq() -> None:
+    """tuniq: per TAKEN frame vs the camera's previous TAKEN frame (the recorder's stored view)."""
+    from python.sensors.live_hold import LiveStreamHold, parse_uniq_text, uniq_text
+
+    other = PIX.copy()
+    other[2:10, 2:10, :3] = 60
+    # main reads A,A,A,B taken on ticks 1 and 3: 1 (first taken), 1 (B vs taken A).
+    # rear reads A,A,A,A taken on ticks 1 and 3: 1, 0 (uniq 1,0,0,0).
+    # repeatL reads A,B,A,A taken on ticks 0 and 2: 1, 0 although its read changed (uniq 1,1,1,0).
+    # wide reads A,B,B,B taken on ticks 0 and 3: 1, 1 although its read did not change (uniq 1,1,0,0).
+    # Tick 4 takes nothing: tuniq=na while uniq still lists every ok read.
+    plan = [("repeatL", "wide"), ("main", "rear"), ("repeatL",), ("main", "rear", "wide"), ()]
+
+    def _cams() -> dict:
+        out = {cid: FakeCam(cid) for cid in ALL}
+        out["main"] = FrameSeqCam("main", [PIX, PIX, PIX, other])
+        out["repeatL"] = FrameSeqCam("repeatL", [PIX, other, PIX, PIX])
+        out["wide"] = FrameSeqCam("wide", [PIX, other, other, other])
+        return out
+
+    be = _backend(_cams())
+    be.enable_live_hold(LiveStreamHold(ScriptedSchedule(plan)))
+    be.enable_read_log()
+    tu, un, texts = [], [], []
+    for _k in range(len(plan)):
+        log = be.grab().read_log
+        tu.append(dict(log["tuniq"]))
+        un.append(dict(log["uniq"]))
+        texts.append(uniq_text(log, "tuniq"))
+        assert set(tu[-1]) == set(be._live_hold.last_taken), (tu[-1], be._live_hold.last_taken)
+    assert tu == [
+        {"repeatL": 1, "wide": 1},
+        {"main": 1, "rear": 1},
+        {"repeatL": 0},
+        {"main": 1, "rear": 0, "wide": 1},
+        {},
+    ], tu
+    assert [u["main"] for u in un] == [1, 0, 0, 1, 0] and [u["repeatL"] for u in un] == [1, 1, 1, 0, 0], un
+    assert [u["wide"] for u in un] == [1, 1, 0, 0, 0] and [u["rear"] for u in un] == [1, 0, 0, 0, 0], un
+    assert texts[3] == "wide:1,main:1,rear:0" and parse_uniq_text(texts[3]) == tu[3], texts
+    assert texts[4] == "na" and uniq_text(log) != "na", texts
+    # Respawn: rear takes A before, reset_live_hold (the live loop's RespawnWatch path),
+    # rear takes the same A after -> tuniq 1 (fresh start), not 0.
+    be.close()
+    be = _backend(_cams())
+    be.enable_live_hold(LiveStreamHold(ScriptedSchedule([("rear",), ("rear",), ("rear",)])))
+    be.enable_read_log()
+    assert be.grab().read_log["tuniq"] == {"rear": 1}
+    assert be.grab().read_log["tuniq"] == {"rear": 0}  # same A, no respawn: identical
+    be.reset_live_hold()
+    assert be._taken_sig == {}
+    assert be.grab().read_log["tuniq"] == {"rear": 1}, "post-respawn take compared with a pre-respawn frame"
+    # Without a live hold nothing is taken: tuniq=na on every tick.
+    be.close()
+    be = _backend(_cams())
+    be.enable_read_log()
+    assert uniq_text(be.grab().read_log, "tuniq") == "na"
+    be.close()
+    # Report only: read log off vs on, same scripted schedule -> the same published
+    # frames, held frames, taken cameras, stored counts and unique ids.
+    be_off = _backend(_cams())
+    be_off.enable_live_hold(LiveStreamHold(ScriptedSchedule(plan)))
+    be_on = _backend(_cams())
+    be_on.enable_live_hold(LiveStreamHold(ScriptedSchedule(plan)))
+    be_on.enable_read_log()
+    for _k in range(len(plan)):
+        b_off, b_on = be_off.grab(), be_on.grab()
+        assert b_off.read_log is None and b_on.read_log is not None
+        assert b_off.unique_gpu_ids == b_on.unique_gpu_ids
+        assert set(b_off.frames) == set(b_on.frames)
+        assert all(np.array_equal(b_off.frames[c], b_on.frames[c]) for c in b_off.frames)
+        assert set(b_off.held_frames) == set(b_on.held_frames)
+        assert all(np.array_equal(b_off.held_frames[c], b_on.held_frames[c]) for c in b_off.held_frames)
+        assert be_off._live_hold.last_taken == be_on._live_hold.last_taken
+    assert be_off._live_hold.stored_by_cam == be_on._live_hold.stored_by_cam
+    be_off.close()
+    be_on.close()
+    print("tuniq: taken frames vs previous taken frame (A,A,A,B taken on ticks 1 and 3 -> 1,1; unchanged -> 0; "
+          "changed reads between identical takes -> 0), na when nothing taken; respawn -> same frame logs 1; read log on/off: same frames, "
+          "held frames, taken cams and stored counts OK")
+
+
 def _capture_lines(*, hold: bool, n: int = 900, flash_every: int = 0, jump_every: int = 0, skip_at: int = -1,
                    dt_hi: bool = False, scene_hi: bool = False, engaged_at: int = -1, untrained: bool = True,
                    stale_at: tuple[int, ...] = (), no_detect_at: int = -1, detector: str = "yolov8n-onnx",
-                   black: dict | None = None) -> list[str]:
-    """Synthetic run_vision cam-age log. ``black``: {cam: every} -> that camera is black (-1) on every n-th tick."""
+                   black: dict | None = None, same: dict | None = None,
+                   taken_same: dict | None = None) -> list[str]:
+    """Synthetic run_vision cam-age log. ``black``: {cam: every} -> that camera is black (-1) on every n-th tick.
+
+    ``same``: None -> no ``uniq=`` field (older logs); {cam: every} -> that camera's read is identical
+    to its previous frame (``uniq`` 0) on every n-th tick, new (1) otherwise.
+    ``taken_same``: None -> no ``tuniq=`` field; {cam: (take_every, same_every)} -> that camera is
+    taken on every take_every-th tick, identical to its previous taken frame on every same_every-th
+    take; ``tuniq=na`` on ticks with no take."""
     black = dict(black or {})
     rng = np.random.RandomState(0)
     lines = [
@@ -601,6 +776,12 @@ def _capture_lines(*, hold: bool, n: int = 900, flash_every: int = 0, jump_every
             f"compose_ms=1.200 prep_ms=2.000 scene_ms={scene:.3f} post_ms=0.300 detect_ms={det} plan_ms=1.500 "
             f"infer_ms=12.000 aeb=off grab_ms={60 + rng.rand():.3f} read_log_ms=0.020 main_age_ms={56 + rng.rand():.3f} "
             f"ages={ages} reads={reads}"
+            + ("" if same is None else " uniq=" + ",".join(
+                f"{cam}:{0 if same.get(cam) and k % same[cam] == 0 else 1}" for cam in CAM_AGE_ORDER))
+            + ("" if taken_same is None else " tuniq=" + (",".join(
+                f"{cam}:{0 if (k // taken_same[cam][0]) % taken_same[cam][1] == 0 else 1}"
+                for cam in CAM_AGE_ORDER
+                if cam in taken_same and k % taken_same[cam][0] == 0) or "na"))
         )
     return lines
 
@@ -675,9 +856,31 @@ def check_capture_script() -> None:
     assert not grade(on, on, train)["bars"]["mode"]["pass"]
     assert not grade(parse_log(_capture_lines(hold=True, n=300, **good)), base, train)["bars"]["duration"]["pass"]
     assert grade(parse_log(_capture_lines(hold=True, dt_hi=True, **good)), base, train, dt_p50_ms=300, dt_p95_ms=400)["pass"]
+    # Identical-frame share (uniq=), report only: older logs read n/a, the grade is unchanged.
+    assert all(row["pct"] is None and row["n"] == 0 for row in result["identical"]["on"].values())
+    assert all(row["pct"] is None for row in result["identical_taken"]["on"].values())
+    assert "identical-frame share, per read (NOT comparable to recorder): on repeatL=n/a" in table(result)
+    assert "identical-frame share, taken frames (compare to recorder): on repeatL=n/a" in table(result)
+    dup = parse_log(_capture_lines(hold=True, flash_every=100, jump_every=100, same={"wide": 50, "rear": 4},
+                                   taken_same={"rear": (10, 5), "main": (1, 1000)}))
+    got = grade(dup, base, train)
+    assert got["pass"] and got["bars"].keys() == result["bars"].keys(), table(got)
+    ident = got["identical"]["on"]
+    assert ident["wide"] == {"same": 18, "n": 900, "pct": 2.0} and ident["rear"]["pct"] == 25.0, ident
+    assert ident["main"] == {"same": 0, "n": 900, "pct": 0.0} and got["identical"]["baseline"]["main"]["pct"] is None
+    assert " wide=2.00%(18/900) " in table(got) and "rear=25.00%(225/900)" in table(got)
+    taken = got["identical_taken"]["on"]
+    # rear taken on 90 ticks (every 10th), identical on every 5th take -> 18/90; main every tick, 1/900.
+    assert taken["rear"] == {"same": 18, "n": 90, "pct": 20.0} and taken["main"] == {"same": 1, "n": 900, "pct": 0.11}, taken
+    assert taken["wide"]["pct"] is None and got["identical_taken"]["baseline"]["rear"]["pct"] is None, taken
+    lines = table(got).splitlines()
+    t_on = next(x for x in lines if x.startswith("identical-frame share, taken frames (compare to recorder): on "))
+    r_on = next(x for x in lines if x.startswith("identical-frame share, per read (NOT comparable to recorder): on "))
+    assert "rear=20.00%(18/90)" in t_on and "wide=n/a" in t_on and "rear=25.00%(225/900)" in r_on, (t_on, r_on)
     check_capture_cli(train, train_black)
     print(f"live_age_capture: {len(names)} bars PASS on a good pair; each FAILs alone on its fault; dt bars 162 / 215 ms; "
-          "black counted at the 1.533 s cap on both sides; black_share UNSET without --black-share-tol; reads reported OK")
+          "black counted at the 1.533 s cap on both sides; black_share UNSET without --black-share-tol; reads and "
+          "identical-frame shares reported, taken and per read (n/a without tuniq= / uniq=) OK")
 
 
 def check_capture_cli(train: dict, train_black: dict) -> None:
@@ -719,7 +922,8 @@ def check_telemetry_helpers() -> None:
     src = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
     assert "would_skip_control = bool(cam_age_log) and camera_ge_socket_busy()\n            if engaged and (cmd.reason" in src
     assert "if args.no_engage:\n                engaged = False" in src
-    for key in ("compose_ms=", "prep_ms=", "scene_ms=", "post_ms=", "detect_ms=", "plan_ms=", "stale_ego=", "aeb="):
+    for key in ("compose_ms=", "prep_ms=", "scene_ms=", "post_ms=", "detect_ms=", "plan_ms=", "stale_ego=", "aeb=",
+                "uniq=", "tuniq="):
         assert key in src, key
     # Engage gates actuation only: perception (detector + planner + AEB) runs before and outside any engaged branch.
     i_perc = src.index("            pout = perc.tick(\n                main,")
@@ -748,6 +952,8 @@ def main() -> None:
     check_pass_stamp()
     check_backend_streams()
     check_backend_read_log()
+    check_backend_uniq()
+    check_backend_tuniq()
     check_respawn_reset()
     check_reset_detection()
     check_stale_ego()

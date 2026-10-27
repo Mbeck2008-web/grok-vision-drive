@@ -95,6 +95,7 @@ from python.sensors.live_hold import (
     main_exposure,
     reads_text,
     scrub_after_respawn,
+    uniq_text,
 )
 from python.data.cam_hold import CAM_AGE_ORDER
 from python.viz.monitors import place_opencv_window
@@ -1409,7 +1410,10 @@ def main() -> None:
                 # tick's duration and timers, would-skip-control, stale ego and
                 # main exposure, for scripts/live_age_capture.py. Only with a
                 # cam-age scene model or --cam-age-baseline: the default path logs
-                # and writes nothing new.
+                # and writes nothing new. uniq=: per ok read, 1 = new frame,
+                # 0 = identical to that camera's previous frame. tuniq=: the same
+                # per frame the schedule took, against the previous taken frame
+                # (the recorder's stored-frame view). Report only.
                 _held, live_ages = bundle_ages(bundle)
                 st["cam_ages"] = {cam: float(live_ages[k]) for k, cam in enumerate(CAM_AGE_ORDER)}
                 st["stale_ego_n"] = int(stale_ego.total)
@@ -1436,7 +1440,8 @@ def main() -> None:
                     f"infer_ms={float(pout.infer_ms):.3f} aeb={planner_d.get('aeb', 'na')} "
                     f"grab_ms={_ms_text(getattr(bundle, 'grab_ms', None))} read_log_ms={_ms_text(read_log.get('log_ms'))} "
                     f"main_age_ms={_ms_text(read_log.get('main_age_ms'))} "
-                    f"ages={ages_text(live_ages)} reads={reads_text(read_log or None)}",
+                    f"ages={ages_text(live_ages)} reads={reads_text(read_log or None)} "
+                    f"uniq={uniq_text(read_log or None)} tuniq={uniq_text(read_log or None, 'tuniq')}",
                     flush=True,
                 )
             # Soft Esc: gvd_state.json at most once per Lua pollEvery (0.10).

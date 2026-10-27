@@ -10,6 +10,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Put /tmp on disk
+        # ubuntu-26.04 mounts /tmp as a RAM tmpfs (about 7.8 GB). The suite writes
+        # under /tmp and the collector refuses under 20 GB free, so unmount the
+        # tmpfs and let /tmp fall back to the root disk.
+        run: |
+          df -h /tmp
+          echo "before: /tmp fstype=$(findmnt -n -o FSTYPE /tmp || echo none)"
+          sudo systemctl mask tmp.mount && sudo umount -l /tmp
+          df -h /tmp
+          fstype=$(findmnt -n -o FSTYPE /tmp || true)
+          echo "after: /tmp fstype=${fstype:-none (on /)}"
+          if [ "$fstype" = "tmpfs" ]; then
+            echo "::error::/tmp is still tmpfs after unmount"
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -31,6 +47,17 @@ jobs:
           # Same torch / torchvision / scipy versions as the dev PC, without the +cu126 suffix.
           python -m pip install torch==2.14.1 torchvision==0.29.1 --index-url https://download.pytorch.org/whl/cpu
           python -m pip install scipy==1.18.1
+
+      - name: Disk guard (22 GB free on /tmp)
+        run: |
+          df -h /tmp
+          free_kb=$(df --output=avail -k /tmp | tail -1 | tr -d ' ')
+          free_gb=$((free_kb / 1024 / 1024))
+          if [ "$free_kb" -lt $((22 * 1024 * 1024)) ]; then
+            echo "::error::only ${free_gb} GB free on /tmp, need 22 GB (collector tests refuse under 20 GB)"
+            exit 1
+          fi
+          echo "disk guard ok: ${free_gb} GB free on /tmp"
 
       - name: Offline suite
         # opencv's Qt build only ships the xcb plugin. A headless runner aborts

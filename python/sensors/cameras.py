@@ -169,8 +169,11 @@ class CameraFrameBundle:
     # for compose_strip.
     cam_ages: tuple[float, ...] | None = None
     held_frames: dict[str, np.ndarray] = field(default_factory=dict)
-    # Per-camera read status / read ms, main's age at the end of the pass and the
-    # bookkeeping cost (cam-age telemetry, ``enable_read_log``); None otherwise.
+    # Per-camera read status / read ms, main's age at the end of the pass, the
+    # bookkeeping cost, ``uniq`` (per ok read: 1 new frame, 0 identical to the
+    # camera's previous frame) and ``tuniq`` (per frame the live hold's schedule
+    # took: 1 new, 0 identical to that camera's previous taken frame) (cam-age
+    # telemetry, ``enable_read_log``); None otherwise.
     read_log: dict[str, Any] | None = None
 
     def tick_frames(self) -> dict[str, np.ndarray]:
@@ -1441,6 +1444,10 @@ class BeamNGPyBackend:
         self._Camera: Any = None
         self._sensor_kwargs: dict[str, dict[str, Any]] = {}
         self._frame_sig: dict[str, tuple[Any, ...]] = {}
+        # Signature of each camera's last frame the live hold's schedule took
+        # (cam-age telemetry ``tuniq`` only; never read by the hold). Cleared on
+        # open / close and on reset_live_hold (respawn).
+        self._taken_sig: dict[str, tuple[Any, ...]] = {}
         self._unique_hz_ema = 0.0
         self._unique_n = 0
         self._open_mono = 0.0
@@ -1515,6 +1522,7 @@ class BeamNGPyBackend:
         self._hitch_steps = []
         self._sensor_kwargs = {}
         self._frame_sig = {}
+        self._taken_sig = {}
         self._unique_hz_ema = 0.0
         self._unique_n = 0
         self._open_mono = time.monotonic()
@@ -1710,6 +1718,7 @@ class BeamNGPyBackend:
         self._hitch_steps.clear()
         self._sensor_kwargs.clear()
         self._frame_sig.clear()
+        self._taken_sig.clear()
         self._cache_frames.clear()
         self._cache_ts.clear()
         self._adhoc = None
@@ -2135,7 +2144,12 @@ class BeamNGPyBackend:
         self._read_log_on = True
 
     def reset_live_hold(self) -> None:
-        """Respawn / reset / level load: the schedule re-anchors and no frame is held."""
+        """Respawn / reset / level load: the schedule re-anchors and no frame is held.
+
+        Also forgets every camera's previous taken signature (``tuniq`` telemetry
+        only), so the first frame taken after the respawn logs 1 and is never
+        compared with a pre-respawn frame."""
+        self._taken_sig.clear()
         if self._live_hold is not None:
             self._live_hold.reset()
 
@@ -2182,6 +2196,11 @@ class BeamNGPyBackend:
         log_on = self._read_log_on
         read_status: dict[str, str] = {}
         read_ms: dict[str, float] = {}
+        # 1 = this tick's ok read differs from the camera's last published frame
+        # (the existing frame_signature / unique_ids test), 0 = identical.
+        read_uniq: dict[str, int] = {}
+        # Each ok read's signature (``_frame_sig`` right after ``_publish_read``), for ``tuniq``.
+        read_sig: dict[str, tuple[Any, ...]] = {}
         log_cost = 0.0
         for cid, cam in main_first:
             if not self._grab_this_tick(cid, grab_i):
@@ -2216,6 +2235,11 @@ class BeamNGPyBackend:
                     # The first read after a reattach (new Camera on the GE socket).
                     status = "reattach" if status == "ok" else f"reattach_{status}"
                 read_status[cid] = status
+                if self._last_status == "ok":
+                    read_uniq[cid] = int(cid in unique_ids)
+                    sig = self._frame_sig.get(cid)
+                    if sig is not None:
+                        read_sig[cid] = sig
                 log_cost += time.perf_counter() - c0
             self._reattached.discard(cid)
         cam_ages: tuple[float, ...] | None = None
@@ -2234,7 +2258,24 @@ class BeamNGPyBackend:
             main_age_ms = None
             if "main" in walls and walls:
                 main_age_ms = (max(walls.values()) - walls["main"]) * 1000.0
-            read_log = {"status": read_status, "read_ms": read_ms, "main_age_ms": main_age_ms}
+            # tuniq: per camera the hold's schedule took this tick, 1 when its signature
+            # differs from that camera's previous TAKEN frame (the recorder's stored-frame
+            # view), 0 when identical. Reads last_taken only; the hold is not touched.
+            taken_uniq: dict[str, int] = {}
+            if live_hold is not None:
+                for cid in live_hold.last_taken:
+                    sig = read_sig.get(cid)
+                    if sig is None:
+                        continue
+                    taken_uniq[cid] = int(sig != self._taken_sig.get(cid))
+                    self._taken_sig[cid] = sig
+            read_log = {
+                "status": read_status,
+                "read_ms": read_ms,
+                "main_age_ms": main_age_ms,
+                "uniq": read_uniq,
+                "tuniq": taken_uniq,
+            }
             log_cost += time.perf_counter() - c0
             read_log["log_ms"] = log_cost * 1000.0
         self._maybe_live_narrow_hitch()

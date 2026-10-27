@@ -50,7 +50,12 @@ from ``--strips`` plus the report's selection arguments, read-only.
 Reported, not graded: per-camera read status counts (ok / none / zero /
 flash_filtered / reattach / busy / timeout / error / skip) and read ms,
 ``main_age_ms`` (wall time after the pass's last read minus main's stamp),
-``grab_ms`` and the read-log cost ``read_log_ms``.
+``grab_ms`` and the read-log cost ``read_log_ms``. Also reported, not graded:
+per camera, the share of frames the schedule took identical to that camera's
+previous taken frame (``tuniq=``; the recorder's stored-frame view, compare to its
+consecutive identical PNG share), and the share of every ok read identical to the
+previous read (``uniq=``; ~270 ms apart, NOT comparable to the recorder); ``n/a``
+for logs without the field.
 
     py -3 scripts/live_age_capture.py --log <ON_LOG> --baseline-log <BASELINE_LOG> ^
         --strips <RECORDING> --holdout-blocks 1 --mask-files <MASK_JSONL> ^
@@ -73,7 +78,7 @@ for path in (str(ROOT), str(ROOT / "scripts")):
 import numpy as np  # noqa: E402
 
 from python.data.cam_hold import BLACK_STAT_AGE_S, CAM_AGE_ORDER, HOLD_TICK_S, NEVER_HELD, stat_age  # noqa: E402
-from python.sensors.live_hold import parse_ages_text, parse_reads_text  # noqa: E402
+from python.sensors.live_hold import parse_ages_text, parse_reads_text, parse_uniq_text  # noqa: E402
 
 MEDIAN_TOL_S = 1.0 * HOLD_TICK_S
 P95_TOL_S = 2.0 * HOLD_TICK_S
@@ -143,6 +148,8 @@ def parse_log(lines: Iterable[str]) -> dict[str, Any]:
             "aeb": kv.get("aeb"),
             "ages": parse_ages_text(kv["ages"]),
             "reads": parse_reads_text(kv.get("reads", "")),
+            "uniq": parse_uniq_text(kv.get("uniq", "")),
+            "tuniq": parse_uniq_text(kv.get("tuniq", "")),
         }
         for key in TIMERS:
             tick[key] = _num(kv.get(key))
@@ -219,6 +226,20 @@ def black_share_bar(
         else f"|live - train| black share <= {float(tol_pp):g} pp per camera"
     )
     return {"pass": bool(ok_all and not unset), "unset": unset, "detail": detail, "cams": cams}
+
+
+def identical_shares(ticks: list[dict[str, Any]], key: str = "uniq") -> dict[str, dict[str, Any]]:
+    """Per camera: percent of flags that are 0 (identical). Report only.
+
+    ``key="uniq"``: every ok read vs the previous read. ``key="tuniq"``: frames the schedule
+    took vs that camera's previous taken frame. ``pct`` is None when no tick carries the
+    camera (older logs without the field)."""
+    out: dict[str, dict[str, Any]] = {}
+    for cam in CAM_AGE_ORDER:
+        flags = [t[key][cam] for t in ticks if cam in (t.get(key) or {})]
+        same = sum(1 for f in flags if f == 0)
+        out[cam] = {"same": same, "n": len(flags), "pct": None if not flags else round(100.0 * same / len(flags), 2)}
+    return out
 
 
 def read_summary(ticks: list[dict[str, Any]]) -> dict[str, Any]:
@@ -410,6 +431,11 @@ def grade(
         "timers": {"on": timer_summary(on["ticks"]), "baseline": timer_summary(base["ticks"])},
         "exposure": {"on": ex_on, "baseline": ex_base},
         "reads": {"on": read_summary(on["ticks"]), "baseline": read_summary(base["ticks"])},
+        "identical": {"on": identical_shares(on["ticks"]), "baseline": identical_shares(base["ticks"])},
+        "identical_taken": {
+            "on": identical_shares(on["ticks"], "tuniq"),
+            "baseline": identical_shares(base["ticks"], "tuniq"),
+        },
         "unset": [name for name, bar in bars.items() if bar.get("unset")],
     }
 
@@ -451,6 +477,17 @@ def table(result: dict[str, Any]) -> str:
             st = "/".join(f"{k}:{v}" for k, v in sorted(row["status"].items()))
             parts.append(f"{cam}[{st} ms {_fmt(row['read_ms_p50'])}/{_fmt(row['read_ms_p95'])}]")
         lines.append(f"reads {name}: " + (" ".join(parts) if parts else "n/a"))
+    for key, label in (
+        ("identical_taken", "identical-frame share, taken frames (compare to recorder)"),
+        ("identical", "identical-frame share, per read (NOT comparable to recorder)"),
+    ):
+        for name in ("on", "baseline"):
+            shares = (result.get(key) or {}).get(name) or {}
+            parts = [
+                f"{cam}=" + ("n/a" if row["pct"] is None else f"{row['pct']:.2f}%({row['same']}/{row['n']})")
+                for cam, row in shares.items()
+            ]
+            lines.append(f"{label}: {name} " + (" ".join(parts) if parts else "n/a"))
     lines.append(f"providers: {result['providers']}")
     lines.append(f"respawns / resets seen: {result['respawns']}")
     unset = result.get("unset") or []

@@ -10,6 +10,7 @@ data is a null offset, not a guessed lane.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -26,14 +27,33 @@ from python.debug.gt_geom import (
     ego_center_x,
     heading_from_dir,
     lane_still_beside,
-    parse_road_edges,
     project_follow,
-    road_width_floor,
     project_road,
     update_curve_preview,
 )
+from python.collect import road_loader
+from python.collect.road_loader import current_level, polys_from_network  # noqa: F401  re-exported for python/collect/road_dump.py and scripts/test_gt_crash_sign.py
 
 FRAME_EVERY_S = 4.0
+# Level-change triggers. Any of them makes the logger ask the game for the
+# level once; a different (or unknown) level reloads roads once.
+# 1. A pose this far from the last tick: a respawn or a new level.
+LEVEL_JUMP_M = 100.0
+# 2. Sim time going backwards (a new level or scenario restarts the clock).
+#    write() already reads sim time each tick, so this costs nothing extra.
+# 3. A level poll at most this often (wall clock), for a new level whose
+#    spawn is near the last pose and whose clock did not visibly restart.
+#    Cost: one ``current_level`` call per LEVEL_POLL_S, which is one
+#    QueueLuaCommandGE round trip (beamngpy 1.36 ``control.queue_lua_command``
+#    always waits for ExecutedLuaChunkGE) returning the level name string.
+#    ``get_gamestate`` in 1.36 carries no level, and
+#    ``scenario.get_current`` sends GetCurrentScenario and parses a whole
+#    scenario dict, so the Lua query is the cheapest call. Not per tick:
+#    at 10 Hz that is one extra round trip per 100 ticks. The poll only
+#    acts on a known level that differs from the cached one; an unknown
+#    answer ("") keeps the roads. Triggers 1 and 2 re-read on unknown.
+LEVEL_POLL_S = 10.0
+ROAD_RETRY_S = 2.0
 DEPART_BURST = 3
 
 
@@ -92,151 +112,31 @@ def read_sim_time(bng: Any) -> float | None:
     return None
 
 
-def _exc_text(exc: BaseException) -> str:
-    detail = str(exc).strip() or type(exc).__name__
-    return f"{type(exc).__name__}: {detail}"
-
-
-def _call(fn: Any, *args: Any, **kwargs: Any) -> tuple[Any, str]:
-    try:
-        return fn(*args, **kwargs), ""
-    except TypeError:
-        try:
-            return fn(*args), ""
-        except Exception as exc:
-            return None, _exc_text(exc)
-    except Exception as exc:
-        return None, _exc_text(exc)
-
-
-def polys_from_network(spec: Any) -> list[RoadPoly]:
-    """Roads from ``get_road_network(include_edges=True)``."""
-    if isinstance(spec, dict) and "roads" in spec and isinstance(spec["roads"], dict):
-        spec = spec["roads"]
-    elif isinstance(spec, dict) and "network" in spec and isinstance(spec["network"], dict):
-        spec = spec["network"]
-    if not isinstance(spec, dict):
-        return []
-    polys: list[RoadPoly] = []
-    for road_id, road in spec.items():
-        edges = None
-        if isinstance(road, dict):
-            driv = road.get("drivability", road.get("drivable", 1))
-            try:
-                if float(driv) <= 0.0:
-                    continue
-            except (TypeError, ValueError):
-                pass
-            edges = road.get("edges") or road.get("nodes")
-        elif isinstance(road, list):
-            edges = road
-        poly = parse_road_edges(str(road_id), edges)
-        if poly is not None:
-            if isinstance(road, dict):
-                try:
-                    count = int(float(road.get("lanesLeft") or 0)) + int(float(road.get("lanesRight") or 0))
-                except (TypeError, ValueError):
-                    count = 0
-                if 1 <= count <= 8:
-                    poly.lanes = count
-            polys.append(road_width_floor(poly, road))
-    return polys
-
-
 def raw_road_network(bng: Any) -> tuple[Any, Any, str]:
-    """``(road_network spec, get_roads dict or None, note)``.
+    """``(road_network spec, get_roads dict or None, note)`` for the offline road dumps.
 
-    The spec is whatever ``get_road_network`` returned, before it is parsed
-    into centerlines. ``get_roads`` is included when that call succeeds.
+    The spec is the shared loader's cached network for the current level,
+    before it is parsed into centerlines. ``get_roads`` is included when
+    that call succeeds.
     """
     if bng is None:
         return None, None, "no beamng"
-    notes: list[str] = []
-    spec = None
-    owners = []
-    scenario = getattr(bng, "scenario", None)
-    if scenario is not None:
-        owners.append(scenario)
-    owners.append(bng)
-    for owner in owners:
-        fn = getattr(owner, "get_road_network", None)
-        if not callable(fn):
-            continue
-        got, note = _call(fn, include_edges=True, drivable_only=True)
-        if note:
-            notes.append(f"get_road_network {note}")
-            got, note2 = _call(fn)
-            if note2:
-                notes.append(f"get_road_network() {note2}")
-        if got is not None:
-            spec = got
-            break
-    roads = None
-    get_roads = getattr(bng, "get_roads", None)
-    if callable(get_roads):
-        got, note = _call(get_roads)
-        if note:
-            notes.append(f"get_roads failed: {note}")
-        elif isinstance(got, dict):
-            roads = got
-    if spec is None and roads is None:
+    snap = road_loader.shared().snapshot(bng)
+    roads, roads_note = road_loader.read_legacy_roads(bng)
+    if snap.spec is None and roads is None:
+        notes = [n for n in (snap.note, roads_note) if n]
         return None, None, "; ".join(notes) if notes else "no road network"
-    return spec, roads, ""
+    return snap.spec, roads, ""
 
 
 def load_road_polys(bng: Any) -> tuple[list[RoadPoly], str]:
-    """One snapshot of the level's road network.
+    """Centerlines for the current level from the shared road loader.
 
-    BeamNGpy 1.36 deprecates ``get_roads``; Tech 0.39 raises ``BNGError``
-    from it. ``scenario.get_road_network(include_edges=True)`` is the call
-    that returns left/middle/right edges. The note keeps the exception text.
+    The loader reads the network once per level (left/middle/right edges of
+    drivable roads, with the legacy ``get_roads`` path as a fallback) and
+    keeps it until the level changes. The note keeps the exception text.
     """
-    if bng is None:
-        return [], "no beamng"
-    notes: list[str] = []
-    owners = []
-    scenario = getattr(bng, "scenario", None)
-    if scenario is not None:
-        owners.append(scenario)
-    owners.append(bng)
-    for owner in owners:
-        fn = getattr(owner, "get_road_network", None)
-        if not callable(fn):
-            continue
-        spec, note = _call(fn, include_edges=True, drivable_only=True)
-        if note:
-            notes.append(f"get_road_network {note}")
-            spec, note2 = _call(fn)
-            if note2:
-                notes.append(f"get_road_network() {note2}")
-        polys = polys_from_network(spec)
-        if polys:
-            return polys, ""
-        if spec is not None and not note:
-            notes.append("get_road_network returned no edges")
-    get_roads = getattr(bng, "get_roads", None)
-    get_edges = getattr(bng, "get_road_edges", None)
-    if callable(get_roads):
-        roads, note = _call(get_roads)
-        if note:
-            notes.append(f"get_roads failed: {note}")
-        elif isinstance(roads, dict) and roads and callable(get_edges):
-            polys = []
-            for road_id in roads:
-                edges, edge_note = _call(get_edges, road_id)
-                if edge_note or edges is None:
-                    continue
-                poly = parse_road_edges(str(road_id), edges)
-                if poly is not None:
-                    polys.append(poly)
-            if polys:
-                return polys, ""
-            notes.append("get_road_edges returned no centerlines")
-        elif not note:
-            notes.append("get_roads returned no roads")
-    elif not notes:
-        notes.append("beamngpy has no get_road_network or get_roads")
-    return [], "; ".join(notes) if notes else "no road network"
+    return road_loader.shared().polys(bng)
 
 
 def _x_at_y(poly: list, y_m: float) -> float | None:
@@ -402,7 +302,7 @@ def save_debug_frame(
 class GroundTruthLogger:
     """Append-only session. ``path`` is the JSONL file."""
 
-    def __init__(self, path: Path, frames: Path) -> None:
+    def __init__(self, path: Path, frames: Path, loader: road_loader.RoadLoader | None = None) -> None:
         self.path = Path(path)
         self.frames = Path(frames)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -410,6 +310,12 @@ class GroundTruthLogger:
         self._roads: list[RoadPoly] | None = None
         self._road_note = "road network pending"
         self._road_try_wall = 0.0
+        self._loader = loader
+        self._roads_level: str | None = None
+        self._level_pos: tuple[float, float] | None = None
+        self._level_check = False
+        self._level_check_hard = False  # set by a pose jump or sim time going back
+        self._level_poll_wall = 0.0
         self._prev_damage: float | None = None
         self._last_sim: float | None = None
         self._wall0 = time.time()
@@ -436,16 +342,72 @@ class GroundTruthLogger:
         frames = path.with_suffix("")
         return cls(path, frames)
 
-    def _ensure_roads(self, bng: Any, socket_busy: bool) -> None:
-        if self._roads is not None or socket_busy or bng is None:
-            return
+    def _ensure_roads(self, bng: Any, socket_busy: bool, vdata: Any = None) -> None:
+        """Roads for the level the car is on. One read per level, never per tick.
+
+        The first load asks the game which level is up and reads that level's
+        network through the shared loader (retried every ``ROAD_RETRY_S``
+        while it is empty). After that the level is asked again only on a
+        trigger: a pose jump of ``LEVEL_JUMP_M``, sim time going backwards
+        (flagged by ``write``), or the ``LEVEL_POLL_S`` poll. The same level
+        keeps the roads and a different known level reads that level once.
+        An unknown answer ("" or None) re-reads after a pose jump or a sim
+        clock reset, but after a poll alone it keeps the roads.
+        """
+        pos = _pose(vdata)[0] if vdata is not None else None
+        if pos is not None:
+            here = (float(pos[0]), float(pos[1]))
+            last = self._level_pos
+            if (
+                last is not None
+                and self._roads is not None
+                and math.hypot(here[0] - last[0], here[1] - last[1]) > LEVEL_JUMP_M
+            ):
+                self._level_check = True
+                self._level_check_hard = True
+            self._level_pos = here
         now = time.time()
-        if self._road_try_wall and (now - self._road_try_wall) < 2.0:
+        if (
+            self._roads is not None
+            and not self._level_check
+            and (now - self._level_poll_wall) >= LEVEL_POLL_S
+        ):
+            self._level_check = True
+        if self._roads is not None and not self._level_check:
+            return
+        if socket_busy or bng is None:
+            return
+        loader = self._loader if self._loader is not None else road_loader.shared()
+        if self._roads is not None:
+            hard = self._level_check_hard
+            self._level_check = False
+            self._level_check_hard = False
+            self._level_poll_wall = now
+            level = current_level(bng)
+            if level and level == self._roads_level:
+                return
+            if not level and not hard:
+                return  # the poll could not tell: keep the roads
+            print(f"[GVD] gt level {self._roads_level or '?'} -> {level or '?'}: reloading roads", flush=True)
+            if not level:
+                loader.invalidate()
+            self._roads = None
+            self._road_note = "road network pending"
+            self._road_try_wall = 0.0
+            self._preview = PreviewMemory()
+            self._follow = RoadFollow()
+            self._followed = None
+            self._last_good = None
+        if self._road_try_wall and (now - self._road_try_wall) < ROAD_RETRY_S:
             return
         self._road_try_wall = now
-        polys, note = load_road_polys(bng)
+        level = current_level(bng)
+        loader.enter(bng, level)
+        polys, note = loader.polys(bng)
         if polys:
             self._roads = polys
+            self._roads_level = level
+            self._level_poll_wall = now
             self._road_note = ""
             print(f"[GVD] gt roads={len(polys)}", flush=True)
         else:
@@ -457,7 +419,7 @@ class GroundTruthLogger:
 
         Off-road or a missing pose is None. The caller does not invent a lane.
         """
-        self._ensure_roads(bng, socket_busy)
+        self._ensure_roads(bng, socket_busy, vdata)
         if not self._roads:
             return None
         pos, heading, _speed = _pose(vdata)
@@ -485,7 +447,7 @@ class GroundTruthLogger:
         ``write`` uses this same hit, so it matches ``lane_x`` instead of
         the rejected polyline.
         """
-        self._ensure_roads(bng, socket_busy)
+        self._ensure_roads(bng, socket_busy, vdata)
         dt = 0.1 if dt_s is None else dt_s
         self._followed = None
         if not self._roads:
@@ -565,13 +527,16 @@ class GroundTruthLogger:
         model_lane_x: float | None = None,
         model_conf: float | None = None,
     ) -> dict[str, Any]:
-        self._ensure_roads(bng, socket_busy)
+        self._ensure_roads(bng, socket_busy, vdata)
         pos, heading, speed = _pose(vdata)
         sim = None if socket_busy else read_sim_time(bng)
         if sim is None:
             t = time.time() - self._wall0
             t_source = "wall"
         else:
+            if self._last_sim is not None and sim < self._last_sim:
+                self._level_check = True  # clock restarted: maybe a new level
+                self._level_check_hard = True
             self._last_sim = sim
             t = sim
             t_source = "sim"

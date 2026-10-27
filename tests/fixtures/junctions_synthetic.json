@@ -1,0 +1,57 @@
+{
+  "about": "Hand-built synthetic road graph for the PR1 tests. Not BeamNG map data. x is east, y is north, metres. Each edge is a straight two-lane road (one lane each way) between two nodes; oneway edges may only be driven from a to b.",
+  "lane_width_m": 3.5,
+  "sample_m": 5.0,
+  "levels": {
+    "synth_a": {
+      "nodes": {
+        "S": [0.0, -200.0],
+        "T": [0.0, 0.0],
+        "W": [-200.0, 0.0],
+        "X": [200.0, 0.0],
+        "XN": [200.0, 200.0],
+        "XS": [200.0, -200.0],
+        "Y": [400.0, 0.0],
+        "YL": [600.0, 100.0],
+        "YR": [600.0, -100.0],
+        "U1": [2000.0, 2000.0],
+        "U2": [2200.0, 2000.0]
+      },
+      "edges": [
+        {"a": "S", "b": "T"},
+        {"a": "W", "b": "T"},
+        {"a": "T", "b": "X"},
+        {"a": "X", "b": "XN", "oneway": true},
+        {"a": "XS", "b": "X"},
+        {"a": "X", "b": "Y"},
+        {"a": "Y", "b": "YL"},
+        {"a": "Y", "b": "YR"},
+        {"a": "U1", "b": "U2"}
+      ],
+      "junctions": {"T": "T", "X": "4-way", "Y": "Y"},
+      "oneway": {"edge": ["X", "XN"]},
+      "unreachable": "U1"
+    },
+    "synth_b": {
+      "nodes": {
+        "BW": [4800.0, 5000.0],
+        "BE": [5200.0, 5000.0]
+      },
+      "edges": [
+        {"a": "BW", "b": "BE"}
+      ]
+    }
+  },
+  "crossings": [
+    {"path": ["S", "T", "W"], "node": "T", "expect": "left"},
+    {"path": ["S", "T", "X"], "node": "T", "expect": "right"},
+    {"path": ["W", "T", "X"], "node": "T", "expect": "through"},
+    {"path": ["T", "X", "Y"], "node": "X", "expect": "through"},
+    {"path": ["T", "X", "XN"], "node": "X", "expect": "left"},
+    {"path": ["T", "X", "XS"], "node": "X", "expect": "right"},
+    {"path": ["X", "Y", "YL"], "node": "Y", "expect": "left"},
+    {"path": ["X", "Y", "YR"], "node": "Y", "expect": "right"}
+  ],
+  "frozen_track": {"level": "synth_a", "path": ["W", "T", "X", "Y", "YL"], "speed_mps": 10.0, "dt_s": 0.1},
+  "level_change": {"before": {"level": "synth_a", "path": ["S", "T", "X"]}, "after": {"level": "synth_b", "path": ["BW", "BE"]}}
+}

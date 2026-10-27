@@ -1888,7 +1888,13 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 here = (float(pos[0]), float(pos[1]), float(pos[2]))
             placed = None
             for near in recover_points(here, spawn_pos):
-                placed = snap_to_road(bng, near)
+                try:
+                    placed = snap_to_road(bng, near)
+                except Exception as exc:
+                    # Session errors come back as None; anything else is a bad
+                    # road read. Record why, then let it end the run.
+                    run.stop("road_read_error", f"{type(exc).__name__}: {exc}")
+                    raise
                 if placed is not None:
                     break
             if placed is None:

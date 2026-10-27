@@ -92,17 +92,18 @@ class PathPlan:
     path_conf: float = 0.0
     curvature: float = 0.0
     drivable: bool = False
-    target_v: float = 0.0
+    # The speed fields are None when the ego speed is unknown (see _expose_pedals).
+    target_v: float | None = 0.0
     ttc_lead: float | None = None
-    aeb: str = "off"
+    aeb: str | None = "off"
     cipv_id: int | None = None
-    stop_reason: str = "none"
+    stop_reason: str | None = "none"
     prediction: str = "none"
     occupied: list[dict[str, Any]] = field(default_factory=list)
     # Polyline length in meters. The supervisor graph plots this as predicted throttle.
     path_length_m: float = 0.0
     # Brake the path follower would command, in [0, 1]. Not a wheel reading.
-    pred_brake: float = 0.0
+    pred_brake: float | None = 0.0
     # Background turn signal from the route: off | left | right. Not a wheel reading.
     blinker: str = "off"
     # pair | one_left | one_right, plus /hold or /slew when the center memory
@@ -140,11 +141,16 @@ def reckon_ego_x(x_m: float, y_m: float, *, yaw_rate: float, dt: float) -> float
 def reckon_path(
     path: list[dict[str, float]] | None,
     *,
-    speed_mps: float,
+    speed_mps: float | None,
     yaw_rate: float,
     dt: float,
 ) -> list[dict[str, float]]:
-    """Rigid ego update of a remembered route. Points that fall behind drop out."""
+    """Rigid ego update of a remembered route. Points that fall behind drop out.
+
+    An unknown speed cannot move the route: nothing is returned, never a 0 m/s reckon.
+    """
+    if speed_mps is None:
+        return []
     theta = float(yaw_rate) * float(dt)
     c = math.cos(theta)
     s = math.sin(theta)
@@ -275,14 +281,14 @@ def follow_lane_center(
     return float(track.center_x), "slew"
 
 
-def follow_path(plan: PathPlan, *, ego_speed_mps: float, seq: int = 0) -> Any:
+def follow_path(plan: PathPlan, *, ego_speed_mps: float | None, seq: int = 0) -> Any:
     """Steer and pedals from the predicted route. The wheel is not an input."""
     from python.control.actuate import plan_command
 
     return plan_command(
         path_ego=plan.path_ego,
         planner=plan.planner_dict(),
-        ego_speed_mps=float(ego_speed_mps),
+        ego_speed_mps=None if ego_speed_mps is None else float(ego_speed_mps),
         seq=int(seq),
     )
 
@@ -294,7 +300,7 @@ def predict_path(
     curvature: float = 0.0,
     tracks: list | None = None,
     signs: list | None = None,
-    ego_speed_mps: float = 0.0,
+    ego_speed_mps: float | None,
     prior_lanes: list | None = None,
     length_m: float = LENGTH_M,
     step_m: float = STEP_M,
@@ -308,6 +314,7 @@ def predict_path(
     count toward a lane switch.
     """
     del curvature  # image-slope hint is not the route; the polyline is
+    ego = None if ego_speed_mps is None else float(ego_speed_mps)
     step = max(0.4, float(step_m))
     horizon = max(8.0, float(length_m))
     live = _lines_for_lane_x(lanes_bev, horizon, step)
@@ -362,7 +369,7 @@ def predict_path(
         occupants,
         signs or [],
         width,
-        ego_speed_mps=float(ego_speed_mps),
+        ego_speed_mps=ego,
     )
     aeb, target, ttc = _speed_flags(
         curv=curv,
@@ -370,7 +377,7 @@ def predict_path(
         ttc=ttc,
         stop_dist=stop_dist,
         closing_mps=closing,
-        ego_speed_mps=float(ego_speed_mps),
+        ego_speed_mps=ego,
         signs=signs or [],
         path=path,
     )
@@ -424,10 +431,21 @@ def path_length_m(path: list | None) -> float:
     return float(total)
 
 
-def _expose_pedals(plan: PathPlan, ego_speed_mps: float) -> PathPlan:
-    """Record path length, blinker, and the brake the follower would send."""
+def _expose_pedals(plan: PathPlan, ego_speed_mps: float | None) -> PathPlan:
+    """Record path length, blinker, and the brake the follower would send.
+
+    With an unknown ego speed there is no speed plan: target_v, ttc_lead, aeb,
+    stop_reason and pred_brake are None, never the values a 0 m/s fit would give.
+    """
     plan.path_length_m = path_length_m(plan.path_ego)
     plan.blinker = blinker_for_path(plan.path_ego, plan.prediction)
+    if ego_speed_mps is None:
+        plan.target_v = None
+        plan.ttc_lead = None
+        plan.aeb = None
+        plan.stop_reason = None
+        plan.pred_brake = None
+        return plan
     commanded = follow_path(plan, ego_speed_mps=float(ego_speed_mps))
     plan.pred_brake = float(commanded.brake)
     return plan
@@ -1148,8 +1166,11 @@ def _apply_scene(
     signs: list,
     width: float,
     *,
-    ego_speed_mps: float,
+    ego_speed_mps: float | None,
 ) -> tuple[list[dict[str, float]], str, int | None, float | None, list[dict[str, Any]], float | None, float | None]:
+    """Cut the route at the nearest stop. With an unknown ego speed every in-path
+    occupant is a cut (no closing speed to call it a match), and ttc/closing are None."""
+    ego = None if ego_speed_mps is None else float(ego_speed_mps)
     cuts: list[tuple[float, str, int | None, float | None, float]] = []
     occupied: list[dict[str, Any]] = []
     station = _along(path)
@@ -1164,14 +1185,14 @@ def _apply_scene(
         if float(occ["y"]) < -0.05:
             continue
         along = float(occ.get("speed_mps") or 0.0) * math.sin(float(occ.get("yaw") or (math.pi / 2.0)))
-        closing = float(ego_speed_mps) - along
+        closing = None if ego is None else ego - along
         # Matching speed is not a stop. Anything actually in front of the bumper is.
-        if closing <= 0.4 and float(occ["y"]) > 4.0:
+        if closing is not None and closing <= 0.4 and float(occ["y"]) > 4.0:
             continue
         back = float(occ["length"]) * 0.5 + STANDOFF_M
         cut_s = station[idx] - back
         occupied.append(dict(occ))
-        ttc = None if closing <= 0.05 else max(0.0, cut_s) / max(closing, 0.1)
+        ttc = None if closing is None or closing <= 0.05 else max(0.0, cut_s) / max(closing, 0.1)
         ident = occ.get("id")
         try:
             ident = None if ident is None else int(ident)
@@ -1197,14 +1218,14 @@ def _apply_scene(
                 continue
             cuts.append((
                 station[idx] - SIGN_STANDOFF_M, "stop_sign", None,
-                _sign_ttc(station[idx], ego_speed_mps), float(ego_speed_mps),
+                _sign_ttc(station[idx], ego), ego,
             ))
         elif kind in ("yield", "yield_sign"):
             if lateral > _sign_gate(SHOULDER_M, raw):
                 continue
             # Same reach as a stop sign on this route. Brake is scaled from the
             # remaining distance, not held at one value.
-            cuts.append((station[idx] - SIGN_STANDOFF_M, "yield", None, None, float(ego_speed_mps)))
+            cuts.append((station[idx] - SIGN_STANDOFF_M, "yield", None, None, ego))
         elif kind in ("traffic_light", "light"):
             if lateral > _sign_gate(LIGHT_GATE_M, raw):
                 continue
@@ -1212,12 +1233,12 @@ def _apply_scene(
             if state in ("red", "r"):
                 cuts.append((
                     station[idx] - SIGN_STANDOFF_M, "red_light", None,
-                    _sign_ttc(station[idx], ego_speed_mps), float(ego_speed_mps),
+                    _sign_ttc(station[idx], ego), ego,
                 ))
             elif state in ("yellow", "amber") and station[idx] < 22.0:
                 cuts.append((
                     station[idx] - SIGN_STANDOFF_M, "yellow_light", None,
-                    _sign_ttc(station[idx], ego_speed_mps), float(ego_speed_mps),
+                    _sign_ttc(station[idx], ego), ego,
                 ))
     if not cuts:
         return path, "none", None, None, occupied, None, None
@@ -1277,7 +1298,9 @@ def _sign_gate(base: float, raw: dict[str, Any]) -> float:
     return base + (_PARTIAL_GATE_M if _sign_partial(raw) else 0.0)
 
 
-def _sign_ttc(station: float, ego_speed_mps: float) -> float | None:
+def _sign_ttc(station: float, ego_speed_mps: float | None) -> float | None:
+    if ego_speed_mps is None:
+        return None
     if ego_speed_mps <= 0.05:
         return None
     return max(0.0, station - SIGN_STANDOFF_M) / ego_speed_mps
@@ -1290,11 +1313,16 @@ def _speed_flags(
     ttc: float | None,
     stop_dist: float | None,
     closing_mps: float | None,
-    ego_speed_mps: float,
+    ego_speed_mps: float | None,
     signs: list,
     path: list[dict[str, float]],
-) -> tuple[str, float, float | None]:
-    """Brake grows as the gap shrinks and as closing speed rises. Far stops do not slam to 1."""
+) -> tuple[str | None, float | None, float | None]:
+    """Brake grows as the gap shrinks and as closing speed rises. Far stops do not slam to 1.
+
+    An unknown ego speed has no flags: (None, None, None).
+    """
+    if ego_speed_mps is None:
+        return None, None, None
     dist = None if stop_dist is None else max(0.0, float(stop_dist))
     closing = None if closing_mps is None else float(closing_mps)
     if closing is None and dist is not None and ttc is not None and ttc > 0.05:

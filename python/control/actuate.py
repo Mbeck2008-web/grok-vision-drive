@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from python.control.ego_speed import UNKNOWN_EGO_REASONS
 from python.runtime.paths import bus_identity
 from python.runtime.state_io import atomic_write_json, gvd_docs_dir
 
@@ -520,16 +521,20 @@ def plan_command(
     *,
     path_ego: list[dict[str, float]] | None,
     planner: dict[str, Any] | None,
-    ego_speed_mps: float,
+    ego_speed_mps: float | None,
     seq: int,
 ) -> DriveCommand:
     """Map corridor + speed plan → DriveCommand pedals.
+
+    An unknown ego speed (None) refuses: throttle 0, brake 0, reason ``ego_unknown``.
 
     AEB / full stop still return brake=1, throttle=0 (retail JSON + override
     semantics). Tech remaps that pair in tech_control_kwargs: arcade stays the
     shift mode, and the hold is parkingbrake=1 with the service brake released
     so arcade does not select reverse. The Tech control message has no gear field.
     """
+    if ego_speed_mps is None:
+        return DriveCommand(steer=0.0, throttle=0.0, brake=0.0, seq=seq, applied=False, reason="ego_unknown")
     planner = planner or {}
     aeb = str(planner.get("aeb") or "off")
     target_v = float(planner.get("target_v") or 0.0)
@@ -575,7 +580,7 @@ def safe_command(
     allow_preview_drive: bool,
     path_ego: list[dict[str, float]] | None = None,
     planner: dict[str, Any] | None = None,
-    ego_speed_mps: float = 0.0,
+    ego_speed_mps: float | None,
     seq: int = 0,
     policy: str = "modular",
 ) -> DriveCommand:
@@ -589,7 +594,8 @@ def safe_command(
     if not ok:
         return stop_command(seq=seq, reason=reason)
     cmd = plan_command(path_ego=path_ego, planner=planner, ego_speed_mps=ego_speed_mps, seq=seq)
-    cmd.reason = "ok"
+    if cmd.reason != "ego_unknown":
+        cmd.reason = "ok"
     return cmd
 
 
@@ -868,6 +874,9 @@ class NullActuator:
         return cmd
 
     def stop(self, seq: int = 0, reason: str = "stop") -> DriveCommand:
+        if reason in UNKNOWN_EGO_REASONS:
+            # Unknown ego speed is a release, never a held stop.
+            return release_command(seq=seq, reason=reason)
         return stop_command(seq=seq, reason=reason)
 
 
@@ -1329,6 +1338,9 @@ class CmdJsonActuator:
         return cmd
 
     def stop(self, seq: int = 0, reason: str = "stop") -> DriveCommand:
+        if reason in UNKNOWN_EGO_REASONS:
+            # Unknown ego speed: the record and the file say brake 0 (Lua releases anyway).
+            return self.apply(release_command(seq=seq, reason=reason))
         cmd = stop_command(seq=seq, reason=reason)
         return self.apply(cmd)
 
@@ -1447,18 +1459,21 @@ def path_steer_from_ego(path_ego: list[dict[str, float]] | None) -> float:
 HEADING_STEER_GAIN = 0.6
 
 
-def steer_lookahead_m(speed_mps: float) -> float:
+def steer_lookahead_m(speed_mps: float | None) -> float | None:
     """Lookahead for the crosstrack term. Longer as speed rises, never under 6 m.
 
     The 8 m pure-pursuit gain needs about 0.7 m of offset to hold a 50 m
     bend. Curvature feedforward carries that bend. This distance only
-    sets how hard the residual is pulled back.
+    sets how hard the residual is pulled back. An unknown speed (None, not a
+    number, NaN) has no lookahead: None.
     """
     try:
-        speed = float(speed_mps)
+        speed = float(speed_mps)  # type: ignore[arg-type]
     except (TypeError, ValueError):
-        speed = 0.0
-    if speed != speed or speed < 0.0:
+        return None
+    if speed != speed:
+        return None
+    if speed < 0.0:
         speed = 0.0
     return max(6.0, min(14.0, 4.0 + 0.55 * speed))
 
@@ -1467,9 +1482,11 @@ def curve_steer(
     offset_m: float,
     heading_err_rad: float | None,
     curvature: float,
-    speed_mps: float,
-) -> float:
+    speed_mps: float | None,
+) -> float | None:
     """Stanley plus curvature feedforward, normalized to the steering input.
+
+    None when the speed is unknown: the crosstrack lookahead needs it.
 
     ``offset_m`` is positive when the car is right of the lane center.
     ``heading_err_rad`` is positive when the nose points left of the road.
@@ -1483,10 +1500,12 @@ def curve_steer(
         offset = float(offset_m)
         heading = 0.0 if heading_err_rad is None else float(heading_err_rad)
         kappa = float(curvature)
-        speed = float(speed_mps)
     except (TypeError, ValueError):
         return 0.0
-    if offset != offset or heading != heading or kappa != kappa or speed != speed:
+    lookahead = steer_lookahead_m(speed_mps)
+    if lookahead is None:
+        return None
+    if offset != offset or heading != heading or kappa != kappa:
         return 0.0
     if abs(offset) == float("inf") or abs(heading) == float("inf") or abs(kappa) == float("inf"):
         return 0.0
@@ -1494,7 +1513,6 @@ def curve_steer(
     feedforward = -math.atan(WHEELBASE_M * kappa) / (STEER_LOCK_RAD * ACTUATOR_YAW_GAIN)
     # Same sign as steer_for_heading_error: a nose left of the road needs +steer.
     heading_term = HEADING_STEER_GAIN * heading
-    lookahead = steer_lookahead_m(speed)
     cross = math.atan2(2.0 * WHEELBASE_M * (-offset), lookahead * lookahead) / STEER_LOCK_RAD
     return max(-1.0, min(1.0, feedforward + heading_term + cross))
 

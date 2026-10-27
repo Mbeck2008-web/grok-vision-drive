@@ -31,9 +31,11 @@ from python.control.actuate import (
     soft_esc_state_write_mark,
     soft_esc_state_write_skips,
     steer_sample_point,
+    release_command,
     stop_command,
     write_engage_flag,
 )
+from python.control.ego_speed import UNKNOWN_EGO_REASONS, engage_gate, resolve_ego
 from python.sensors.tech import (
     VehicleData,
     apply_nav_missing,
@@ -50,7 +52,7 @@ from python.control.override import (
     config_mirror,
     load_override_config,
 )
-from python.control.echo_link import MIN_MOD_VERSION, STATUS_OUTDATED, EchoGate, outdated_message
+from python.control.echo_link import MIN_MOD_VERSION, STATUS_OUTDATED, EchoGate, SessionEcho, outdated_message
 from python.data.record import ClipRecorder, choose_encoder
 from python.perception.pipeline import ModularPerception
 from python.perception.stitch360 import stitch_frames
@@ -416,8 +418,8 @@ def main() -> None:
             path_debug_preview=True,
             allow_preview_drive=False,
             path_ego=None,
-            planner={"aeb": "off", "target_v": 0.0},
-            ego_speed_mps=0.0,
+            planner={"aeb": "off", "target_v": None},
+            ego_speed_mps=None,
             lane_conf=0.0,
             path_conf=0.0,
             seq=0,
@@ -445,6 +447,11 @@ def main() -> None:
         print(f"[GVD] clip dry-run -> {path} trigger={rec.last_clip_trigger} enc={rec.encoder}")
         print(f"[GVD] M5 policy={args.policy} e2e={e2e.name} shadow={st['shadow']} veto={st['veto_reason']}")
         return
+
+    # Ego speed is known only from an echo that advanced in THIS session. Take the baseline
+    # seq now, before backend and model init: whatever the mod echoes after this is new.
+    session_echo = SessionEcho()
+    session_echo.baseline(read_ego_feedback())
 
     backend_name = resolve_backend_name(None if args.backend == "auto" else args.backend)
     hw = probe(backend=backend_name)
@@ -605,7 +612,13 @@ def main() -> None:
     loop_hz_ema = 0.0
     last_cam_t = time.perf_counter()
     last_loop_t = time.perf_counter()
-    last_ego_v = 0.0
+    # Engage ON counts only on an off->on edge seen this session: a latch or bot file that is
+    # already on at start belongs to an earlier session and is refused (latched_before_start).
+    latch_seen_off = False
+    bot_seen_off = False
+    prev_requested = False
+    ego_refusal_prev = None
+    last_refusal_reason = "none"
     prev_force = bool(args.force_engage)
     prev_preview = bool(args.allow_preview_drive)
     prev_engaged = False
@@ -733,7 +746,6 @@ def main() -> None:
             last_cam_t = now
 
             steer = 0.0
-            ego_v = last_ego_v
             ego_source = "none"
             ego_fb = None
             vdata = None
@@ -795,9 +807,23 @@ def main() -> None:
             fox.publish(extras_bundle, frames=getattr(bundle, "frames", None))
             write_sensors_snapshot(extras_bundle)
 
-            if spd is not None:
-                ego_v = max(0.0, float(spd))
-                last_ego_v = ego_v
+            # The one rule: ego speed is this session's fresh measurement, or None.
+            if vehicle is None:
+                session_echo.observe(ego_fb=ego_fb, now=time.monotonic())
+                ego = resolve_ego(
+                    echo_status=session_echo.status,
+                    echo_speed_mps=session_echo.speed_mps,
+                    tech_speed_mps=None,
+                    tech_stale=None,
+                )
+            else:
+                ego = resolve_ego(
+                    echo_status=None,
+                    echo_speed_mps=None,
+                    tech_speed_mps=spd,
+                    tech_stale=stale_ego.blocks_drive(True),
+                )
+            ego_v = ego.mps
             if steer_in is not None:
                 steer = float(steer_in) * 30.0
 
@@ -838,18 +864,50 @@ def main() -> None:
             elif prev_bot and not bot_on:
                 print("[GVD] bot engage off", flush=True)
             prev_bot = bot_on
-            engaged = (
+            latch_on = read_engage_flag(default=False)
+            if not latch_on:
+                latch_seen_off = True
+            if not bot_on:
+                bot_seen_off = True
+            # --force-engage and the debug panel bit are this session's own requests.
+            fresh_request = (
                 bool(args.force_engage)
                 or bool(ui.debug.force_engage)
-                or read_engage_flag(default=False)
-                or bot_on
+                or (latch_on and latch_seen_off)
+                or (bot_on and bot_seen_off)
             )
+            requested = bool(args.force_engage) or bool(ui.debug.force_engage) or latch_on or bot_on
+            if requested and not prev_requested:
+                last_refusal_reason = "none"  # a new engage attempt clears the sticky reason
+            prev_requested = requested
+            engaged = requested
             if args.no_engage:
                 engaged = False  # hard disable: nothing above can engage
             ident = bus_identity()
             if not ident.matched:
                 engaged = False
                 # Refuse actuation. Do not guess Drive vs Tech or honor a Python-only override.
+            # One unknown-ego handler: no fresh speed this session (or an old latch) refuses
+            # or disengages by name and releases the car (throttle 0, brake 0).
+            ego_refusal = None
+            if engaged:
+                allow, why = engage_gate(True, fresh_request, ego)
+                if not allow:
+                    ego_refusal = why
+                    if latch_on or bot_on or why != ego_refusal_prev:
+                        bot_engage.clear()
+                        write_engage_flag(False, disengage_reason=why)
+                    if why != ego_refusal_prev:
+                        if why == "lua_echo_outdated":
+                            print(f"[GVD] REFUSE ENGAGE: {outdated_message(ego_fb)}", flush=True)
+                        elif prev_engaged:
+                            print(f"[GVD] DISENGAGED: {why} (ego speed unknown: {ego.why})", flush=True)
+                        else:
+                            print(f"[GVD] REFUSE ENGAGE: {why} (ego speed unknown: {ego.why})", flush=True)
+                    engaged = False
+            # A new refusal is flushed to gvd_state on its own tick, like a falling edge.
+            refusal_new = ego_refusal is not None and ego_refusal != ego_refusal_prev
+            ego_refusal_prev = ego_refusal
             scene_refuse = scene_guard is not None and scene_guard.refused is not None and engaged
             if scene_refuse:
                 # The scene graph is the wrong size. Never engage on it, and do not fall back
@@ -1002,6 +1060,9 @@ def main() -> None:
             if not ident.matched:
                 disengage_reason = "bus_mismatch"
                 cmd = stop_command(seq=cmd_seq, reason="bus_mismatch")
+            elif ego_refusal:
+                disengage_reason = ego_refusal
+                cmd = release_command(seq=cmd_seq, reason=ego_refusal)
             elif not engaged:
                 disengage_reason = "scene_input_shape" if scene_refuse else "not_engaged"
             elif scene_hold:
@@ -1037,12 +1098,12 @@ def main() -> None:
             echo_fault = echo.fault if engaged else None
             if echo_fault:
                 # Link fault (echo frozen while engaged) or a mod too old to stamp its echo.
-                # Same disengage path a player override takes; the brake hold is unchanged.
+                # Same disengage path a player override takes. Speed is unknown: release, no brake.
                 engaged = False
                 disengage_reason = echo_fault
                 bot_engage.clear()
                 write_engage_flag(False, disengage_reason=echo_fault)
-                cmd = stop_command(seq=cmd_seq, reason=echo_fault)
+                cmd = release_command(seq=cmd_seq, reason=echo_fault)
                 if echo_fault != echo_fault_prev:
                     if echo.status == STATUS_OUTDATED:
                         print(f"[GVD] REFUSE ENGAGE: {outdated_message(ego_fb)}", flush=True)
@@ -1119,12 +1180,13 @@ def main() -> None:
                 and args.lane_source == "gt"
                 and gt_preview is not None
                 and cmd.reason == "ok"
+                and ego_v is not None
             ):
                 geometric = curve_steer(
                     gt_preview.offset_m,
                     gt_preview.heading_err_rad,
                     gt_preview.curvature,
-                    float(ego_v or 0.0),
+                    ego_v,
                 )
                 cmd.steer = follow_lane_steer(geometric, gt_preview.lane_x, lane_steer, tick_dt)
                 lane_steer.reason = "curve_hold" if gt_preview.held else "curve"
@@ -1150,10 +1212,8 @@ def main() -> None:
             hdg = None
             dmg = None
             pos_xy = None
-            spd_now = None
             if vdata is not None:
                 dmg = getattr(vdata, "damage", None)
-                spd_now = getattr(vdata, "speed_mps", None)
                 direction = getattr(vdata, "dir", None)
                 if direction is not None and len(direction) >= 2:
                     hdg = heading_from_dir(float(direction[0]), float(direction[1]))
@@ -1165,14 +1225,14 @@ def main() -> None:
                 engaged=bool(engaged) and (cmd.reason == "ok" or holding),
                 dt_s=tick_dt,
                 heading_rad=hdg,
-                speed_mps=spd_now,
+                speed_mps=ego_v,
                 damage=dmg,
                 pos_xy=pos_xy,
             )
             lane_age_s = float(getattr(pout, "frame_age_s", 0.0) or 0.0)
             if engaged and gt_preview is not None and (cmd.reason == "ok" or holding):
                 cap = curve_speed_mps(gt_preview.curvature)
-                spd_cap = spd_now if spd_now is not None else ego_v
+                spd_cap = ego_v
                 if spd_cap is not None and float(spd_cap) > cap:
                     cmd.throttle = 0.0
                 if gt_preview.lost:
@@ -1184,7 +1244,7 @@ def main() -> None:
             if engaged and (cmd.reason == "ok" or holding):
                 apply_stale_speed_cap(
                     cmd,
-                    speed_mps=spd_now,
+                    speed_mps=ego_v,
                     lane_age_s=lane_age_s,
                     lane_src=str(getattr(pout, "lane_source", "") or ""),
                 )
@@ -1267,6 +1327,12 @@ def main() -> None:
                 gpu_vram_used_gb=gpu_vram_used_gb(),
             )
             st["ego"]["speed_mps"] = ego_v
+            if not engaged and disengage_reason not in ("none", "not_engaged"):
+                last_refusal_reason = disengage_reason  # sticky; not_engaged never overwrites it
+            elif engaged and not prev_engaged:
+                last_refusal_reason = "none"
+            st["last_refusal_reason"] = last_refusal_reason
+            st["ego_echo"] = session_echo.telemetry()
             st["ego"]["steer_deg"] = steer
             st["ego"]["throttle"] = float(applied.throttle)
             st["ego"]["brake"] = float(applied.brake)
@@ -1451,7 +1517,7 @@ def main() -> None:
             # does the falling edge: the disengage reason is on that tick only.
             rising_engage = bool(engaged) and not prev_engaged
             falling_engage = prev_engaged and not bool(engaged)
-            state_due = soft_esc_state_write_due(bool(engaged), rising=rising_engage, falling=falling_engage)
+            state_due = soft_esc_state_write_due(bool(engaged), rising=rising_engage, falling=falling_engage or refusal_new)
             prev_engaged = bool(engaged)
             state_skips = soft_esc_state_write_skips()
             rel_skips = int(getattr(actuator, "release_cmd_skips", 0) or 0)
@@ -1500,7 +1566,7 @@ def main() -> None:
                 timestamps=getattr(bundle, "timestamps", None),
                 t=time.time(),
                 engaged=bool(engaged),
-                ego={"speed_mps": float(ego_v or 0.0)},
+                ego={"speed_mps": ego_v},
                 wheel=fields["wheel"],
                 pedals=fields["pedals"],
                 tech=fields["tech"],

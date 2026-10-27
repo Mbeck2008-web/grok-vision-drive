@@ -80,7 +80,7 @@ def main() -> None:
 
     perc = ModularPerception(allow_synthetic=False, detector_id="empty")
     perc.set_detector(EmptyDetector(), ["yolo_weights"])
-    pout = perc.tick(haze)
+    pout = perc.tick(haze, ego_speed_mps=0.0)
     assert pout.lane_conf >= gate, pout.lane_conf
     assert "lanes" not in pout.missing
     assert pout.path_debug_preview is False

@@ -13,6 +13,7 @@ from typing import Any
 import cv2
 import numpy as np
 
+from python.control.ego_speed import UNKNOWN_EGO_REASONS
 from python.sensors.cameras import CAM_IDS, frame_is_unrendered
 
 # Windshield cluster — Tech attach can blow these white; side/rear stay as-is.
@@ -59,6 +60,9 @@ def cabin_drive_word(state: dict[str, Any]) -> tuple[str, tuple[int, int, int]]:
     if link == "mismatch" or bus == "MISMATCH":
         return "MISMATCH", MISMATCH_RED
     if not state.get("engaged"):
+        # Refused or dropped for an unknown ego speed: the driver is the only brake, so say so.
+        if str(state.get("last_refusal_reason") or "none") in UNKNOWN_EGO_REASONS:
+            return "NO SPEED", AMBER
         return "OFF", HUD_DIM
     reason = str(state.get("cmd_reason") or "")
     planner = state.get("planner") if isinstance(state.get("planner"), dict) else {}
@@ -534,10 +538,12 @@ def draw_dense_hud(
     ego = state.get("ego") or {}
     pl = state.get("planner") or {}
     try:
-        v = float(ego.get("speed_mps") or 0.0)
+        v = float(ego["speed_mps"]) if ego.get("speed_mps") is not None else None
     except (TypeError, ValueError):
-        v = 0.0
-    mph = v * 2.23694
+        v = None
+    # Unknown ego speed is shown as "na", never as 0.
+    mph_s = f"{v * 2.23694:.0f}" if v is not None else "na"
+    v_s = f"{v:.1f} m/s" if v is not None else "na m/s"
     policy = str(state.get("policy") or "?")
     aeb = str(pl.get("aeb") or "off")
     ttc = pl.get("ttc_lead")
@@ -545,9 +551,9 @@ def draw_dense_hud(
     cmd = f"s{float(ego.get('steer_deg') or 0):+.0f} t{float(ego.get('throttle') or 0):.1f} b{float(ego.get('brake') or 0):.1f}"
     base = stage_h - bottom_pad
     # Speed stack, lower-left.
-    cv2.putText(img, f"{mph:.0f}", (18, base - 44), cv2.FONT_HERSHEY_SIMPLEX, 0.9, ICE_HI, 2, cv2.LINE_AA)
+    cv2.putText(img, mph_s, (18, base - 44), cv2.FONT_HERSHEY_SIMPLEX, 0.9, ICE_HI, 2, cv2.LINE_AA)
     cv2.putText(img, "mph", (18, base - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.38, HUD_DIM, 1, cv2.LINE_AA)
-    cv2.putText(img, f"{v:.1f} m/s", (18, base - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.36, HUD, 1, cv2.LINE_AA)
+    cv2.putText(img, v_s, (18, base - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.36, HUD, 1, cv2.LINE_AA)
     # Right cluster.
     drive, drive_col = cabin_drive_word(state)
     cv2.putText(

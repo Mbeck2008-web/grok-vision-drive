@@ -1,7 +1,7 @@
 """Lane targets from the painted line decals the camera actually sees.
 
-The old label (gt_geom.follow_label) projects the car onto
-``get_road_network(drivable_only=True)`` edges. On west_coast_usa 1294 of
+The old label (gt_geom.follow_label) projects the car onto the drivable
+road network's edges (``get_road_network`` with ``drivable_only=True``). On west_coast_usa 1294 of
 those 1467 roads are ``road_invisible`` AI splines whose width is the nav
 corridor, and whose lanesLeft/lanesRight default to 1/1. Splitting that
 width into equal lanes gave 1.75-7.5 m lanes that do not sit on the paint.

@@ -66,6 +66,9 @@ def default_state(**overrides: Any) -> dict[str, Any]:
         "policy": "modular",
         "engaged": False,
         "disengage_reason": "none",
+        # Sticky: the last refusal or disengage reason. not_engaged never overwrites it; the
+        # next engage attempt (off->on edge) or a successful engage clears it to "none".
+        "last_refusal_reason": "none",
         "loop_hz": 0.0,
         "camera_hz": 0.0,
         "infer_ms": 0.0,
@@ -106,7 +109,7 @@ def default_state(**overrides: Any) -> dict[str, Any]:
         "objects_n": 0,
         "tracks_n": 0,
         "ego": {
-            "speed_mps": 0.0,
+            "speed_mps": None,  # unknown until measured this session (shown as "na")
             "steer_deg": steer,
             "throttle": 0.0,
             "brake": 0.0,

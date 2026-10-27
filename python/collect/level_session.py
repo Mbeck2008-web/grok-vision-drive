@@ -645,27 +645,10 @@ def polylines_xyz(spec: Any) -> list[list[tuple[float, float, float]]]:
 
 
 def _network_spec(bng: Any) -> Any:
-    owners = (getattr(bng, "scenario", None), bng)
-    for owner in owners:
-        if owner is None:
-            continue
-        fn = getattr(owner, "get_road_network", None)
-        if not callable(fn):
-            continue
-        try:
-            return fn(include_edges=True, drivable_only=True)
-        except TypeError:
-            try:
-                return fn()
-            except Exception as exc:
-                if is_session_error(exc):
-                    return None
-                raise
-        except Exception as exc:
-            if is_session_error(exc):
-                return None
-            raise
-    return None
+    """The current level's road network from the shared loader (read once per level)."""
+    from python.collect.road_loader import shared
+
+    return shared().network(bng)
 
 
 def recover_points(
@@ -763,13 +746,18 @@ def place_vehicle(
 def begin_level(bng: Any, level: str) -> OpenedLevel:
     """Open ``level`` as a started scenario. Empty keeps the session already running.
 
-    Roads are read only after ``start_scenario``. An empty level is the
-    45-minute path: the vehicle and ``get_road_network`` that are already there.
+    Roads are read only after ``start_scenario``, through the shared road
+    loader: once per level, reused for the same level and for recovery snaps.
+    An empty level is the 45-minute path: the vehicle and road network that
+    are already there.
     """
+    from python.collect.road_loader import current_level, shared
+
     clean = level_token(level)
     try:
         if not clean:
             vehicle, player_note = player_vehicle(bng)
+            shared().enter(bng, current_level(bng))
             roads, note = _roads(bng)
             if vehicle is not None and roads:
                 return OpenedLevel(vehicle, list(roads), "", None, "current")
@@ -797,6 +785,9 @@ def begin_level(bng: Any, level: str) -> OpenedLevel:
                     vehicle, player_note = player_vehicle(bng)
         if vehicle is None:
             return OpenedLevel(None, [], f"no vehicle after load ({player_note or 'There is no vehicle.'})", pos, source)
+        # One network read per level: the same level keeps the cached roads,
+        # a new level drops them and the first _roads call reads once.
+        shared().enter(bng, clean)
         roads, note = _roads(bng)
         if not roads:
             found = _wait(lambda: _roads(bng)[0] or None, ROAD_WAIT_S)

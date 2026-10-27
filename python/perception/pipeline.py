@@ -14,6 +14,7 @@ from python.perception.lanes import LaneResult, lanes_from_view
 from python.perception.track import IoUTracker
 from python.planning.path_predictor import (
     LaneTrack,
+    _expose_pedals,
     predict_path,
     reckon_ego_x,
     reckon_path,
@@ -99,7 +100,7 @@ class ModularPerception:
         main_bgr: np.ndarray | None,
         *,
         stitch_bgr: np.ndarray | None = None,
-        ego_speed_mps: float = 0.0,
+        ego_speed_mps: float | None,
         steer_deg: float = 0.0,
         yaw_rate: float = 0.0,
         dt_s: float | None = None,
@@ -165,7 +166,9 @@ class ModularPerception:
                 ego_speed_mps=ego_speed_mps,
                 lane_track=self._lane_track,
             )
-            self._last_plan = plan
+            # A plan at an unknown speed has no speed fields: never hold it. The next
+            # tick with a known speed fits fresh, even on the same pixels.
+            self._last_plan = None if ego_speed_mps is None else plan
         else:
             path = reckon_path(
                 self._last_plan.path_ego,
@@ -179,7 +182,11 @@ class ModularPerception:
                 lane_source=_mark_stale(self._last_plan.lane_source),
                 drivable=len(path) >= 2,
             )
-            self._last_plan = plan
+            # Pedals, path length and blinker from the moved path at this tick's
+            # speed, through the same call a fresh plan ends with. A copy kept the
+            # fresh tick's values: fitted at 0 m/s, pred_brake stayed 0 at 5.5 m/s.
+            plan = _expose_pedals(plan, ego_speed_mps)
+            self._last_plan = None if ego_speed_mps is None else plan
         src = str(plan.lane_source or "")
         held = any(token in src for token in ("hold", "stale", "prior"))
         if held or src in ("", "none"):
@@ -299,7 +306,7 @@ def drive_plan_from_lanes(
     curvature: float,
     tracks: list,
     signs: list,
-    ego_speed_mps: float,
+    ego_speed_mps: float | None,
     lane_track: LaneTrack | None = None,
 ) -> tuple[Any, list]:
     """Route from the live lines, or from the last lines that actually routed.

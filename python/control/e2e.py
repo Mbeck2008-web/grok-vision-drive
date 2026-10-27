@@ -157,7 +157,7 @@ class E2EPolicy:
         wide_bgr: np.ndarray | None,
         *,
         stitch_bgr: np.ndarray | None = None,
-        speed_mps: float = 0.0,
+        speed_mps: float | None,
         steer_deg: float = 0.0,
     ) -> dict[str, Any]:
         """Build the tensors the forward pass reads.
@@ -165,8 +165,9 @@ class E2EPolicy:
         A stitch is one 360° picture. Both image slots of the old two-cam
         stack carry that picture, so a main/wide ONNX still sees the strip
         and not the main crop. With no stitch, the slots stay main and wide.
+        An unknown speed (None) has no kinematics row: ``kin`` and ``ego`` are None.
         """
-        kin = np.array(
+        kin = None if speed_mps is None else np.array(
             [[float(speed_mps) / 30.0, float(steer_deg) / 30.0]],
             dtype=np.float32,
         )  # 1,2
@@ -180,7 +181,7 @@ class E2EPolicy:
                 "stitch": view_nchw,
                 "kin": kin,
                 "cams": cams,
-                "ego": kin.reshape(2),
+                "ego": None if kin is None else kin.reshape(2),
                 "source": "stitch",
                 "view": view,
             }
@@ -195,7 +196,7 @@ class E2EPolicy:
             "stitch": None,
             "kin": kin,
             "cams": cams,
-            "ego": kin.reshape(2),
+            "ego": None if kin is None else kin.reshape(2),
             "source": "main_wide",
             "view": main,
         }
@@ -206,9 +207,12 @@ class E2EPolicy:
         wide_bgr: np.ndarray | None = None,
         *,
         stitch_bgr: np.ndarray | None = None,
-        speed_mps: float = 0.0,
+        speed_mps: float | None,
         steer_deg: float = 0.0,
     ) -> E2EIntent:
+        if speed_mps is None:
+            # The policy takes speed as an input: unknown speed, no forward pass.
+            return E2EIntent(ok=False, backend=self.backend, reason="ego_unknown")
         feats = self.preprocess(
             main_bgr,
             wide_bgr,

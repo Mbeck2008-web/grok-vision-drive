@@ -25,8 +25,12 @@ from gvd_test_env import isolated_home  # noqa: E402
 CAM_AGE_KEYS = ("cam_ages", "stale_ego_n")
 
 
-def run_supervisor(extra: list[str], seconds: float = 2.0) -> tuple[str, list[dict]]:
-    """Run the stub supervisor for ``seconds`` after its first command; stdout and sampled states."""
+def run_supervisor(extra: list[str], seconds: float = 2.0, echo: bool = False) -> tuple[str, list[dict]]:
+    """Run the stub supervisor for ``seconds`` after its first command; stdout and sampled states.
+
+    ``echo=True`` plays the mod's 10 Hz gvd_ego.json echo (a stopped car, echo_seq advancing):
+    engaging needs a fresh session echo (#125).
+    """
     from python.control.actuate import cmd_path
     from python.runtime import paths as gvd_paths
     from python.runtime.state_io import state_path
@@ -40,6 +44,8 @@ def run_supervisor(extra: list[str], seconds: float = 2.0) -> tuple[str, list[di
             (pin / "gvd_link.json").write_text(json.dumps({"lua_bus": str(pin.resolve())}), encoding="utf-8")
 
         touch_bus()
+        m6 = _m6() if echo else None
+        next_echo, echo_seq = 0.0, 0
         out_path = Path(home) / "stdout.txt"
         env = dict(os.environ, PYTHONPATH=str(ROOT))
         args = [sys.executable, "-u", str(ROOT / "python" / "run_vision.py"), "--backend", "stub", "--hz", "20", "--encode", "cpu", *extra]
@@ -52,6 +58,10 @@ def run_supervisor(extra: list[str], seconds: float = 2.0) -> tuple[str, list[di
                     if proc.poll() is not None:
                         break
                     touch_bus()
+                    if m6 is not None and time.monotonic() >= next_echo:
+                        next_echo = time.monotonic() + m6.FAKE_ECHO_PERIOD_S
+                        echo_seq += 1
+                        m6._write_ego(_cmd_seq(cmd_path()), speed=0.0, echo_seq=echo_seq)
                     if first is None and cmd_path().exists():
                         first = time.time()
                         end = first + float(seconds)
@@ -70,6 +80,19 @@ def run_supervisor(extra: list[str], seconds: float = 2.0) -> tuple[str, list[di
     return text, states
 
 
+def _m6():
+    import test_m6_retail
+
+    return test_m6_retail
+
+
+def _cmd_seq(path: Path) -> int:
+    try:
+        return int(json.loads(path.read_text(encoding="utf-8")).get("seq", 0) or 0)
+    except (OSError, ValueError, AttributeError):
+        return 0
+
+
 def check_default_emits_nothing() -> None:
     text, states = run_supervisor([])
     assert "[GVD] seg " in text, text[-1500:]  # the loop ran
@@ -82,8 +105,12 @@ def check_default_emits_nothing() -> None:
 
 
 def check_no_engage() -> None:
-    text, states = run_supervisor(["--force-engage"])
+    text, states = run_supervisor(["--force-engage"], echo=True)
     assert states and any(st.get("engaged") for st in states), "control: --force-engage never engaged"
+    # No echo this session: --force-engage refuses with ego_unknown (#125).
+    text, states = run_supervisor(["--force-engage"])
+    assert states and not any(st.get("engaged") for st in states), "no echo: --force-engage engaged"
+    assert states[-1].get("disengage_reason") == "ego_unknown", states[-1].get("disengage_reason")
     for extra, env in ((["--force-engage", "--no-engage"], {}), (["--force-engage"], {"GVD_NO_ENGAGE": "1"})):
         old = {k: os.environ.get(k) for k in env}
         os.environ.update(env)

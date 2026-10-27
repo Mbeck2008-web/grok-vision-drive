@@ -2138,8 +2138,8 @@ def check_tech_hold_gate() -> None:
     assert resolve_tech_launch({"launch": True}, port_listening=False)[0] is True
     assert resolve_tech_launch({"launch": False}, port_listening=False)[0] is False
     assert beamngpy_pin_ok("1.36.2", "1.36")
-    assert beamngpy_pin_ok("1.35.4", "1.35")
-    assert not beamngpy_pin_ok("1.35.0", "1.36")
+    assert beamngpy_pin_ok("1.36.0", "1.36")
+    assert not beamngpy_pin_ok("1.35.4", "1.36")
     assert not beamngpy_pin_ok("1.26.0", "1.36")
     assert not beamngpy_pin_ok(None, "1.36")
 
@@ -2207,7 +2207,8 @@ def check_tech_hold_gate() -> None:
     assert "--tech-hold" in bat
     assert "quit BeamNG" not in bat
     req = (ROOT / "requirements-beamng.txt").read_text(encoding="utf-8")
-    assert "beamngpy>=1.35,<1.37" in req
+    assert "beamngpy>=1.36,<1.37" in req
+    assert "beamngpy>=1.35" not in req
     assert "beamngpy>=1.26" not in req
     rv = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
     assert rv.find("tech_hold_gate(") < rv.find("make_backend(")

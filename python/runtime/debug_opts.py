@@ -499,15 +499,18 @@ def apply_to_perception(opts: DebugOpts, pout: Any) -> Any:
                 pl["aeb"] = "warn"
             else:
                 pl["aeb"] = "off"
+    # target_v None means the ego speed is unknown: there is no target to set or cap.
+    tv_known = pl.get("target_v") is not None
     if pl.get("aeb") == "brake" and opts.aeb_on:
         pl["target_v"] = 0.0
-    elif opts.cruise_mps is not None:
+    elif opts.cruise_mps is not None and tv_known:
         pl["target_v"] = float(opts.cruise_mps)
-    try:
-        tv = float(pl.get("target_v") or 0.0)
-    except (TypeError, ValueError):
-        tv = 0.0
-    pl["target_v"] = min(tv, float(opts.speed_cap))
+    if pl.get("target_v") is not None:
+        try:
+            tv = float(pl["target_v"])
+        except (TypeError, ValueError):
+            tv = 0.0
+        pl["target_v"] = min(tv, float(opts.speed_cap))
     pl["corridor_width"] = float(opts.corridor_width)
     pout.path_width = float(opts.corridor_width)
     pout.planner = pl

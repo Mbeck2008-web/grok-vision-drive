@@ -866,8 +866,11 @@ def _lines(s: dict[str, Any]) -> list[str]:
     cam_s = " ".join(f"{k}:{str(v)[:1]}" for k, v in cams.items())
     cap = s.get("capture_backend") or "?"
     cap_note = s.get("capture_note") or ""
-    v = float(ego.get("speed_mps") or 0)
-    mph = v * 2.23694
+    v = ego.get("speed_mps")
+    # Unknown ego speed is "na", never 0.
+    ego_s = f"{float(v):.1f} m/s ({float(v) * 2.23694:.0f} mph)" if v is not None else "na m/s (na mph)"
+    vt = pl.get("target_v")
+    vt_s = f"{float(vt):.1f}" if vt is not None else "na"
     miss = s.get("missing_state_keys") or []
     lead = None
     for tr in s.get("tracks") or []:
@@ -887,6 +890,7 @@ def _lines(s: dict[str, Any]) -> list[str]:
     return [
         f"policy: {s.get('policy', '?')}   engage: {s.get('engaged')}",
         f"disengage: {s.get('disengage_reason', 'none')}",
+        f"refusal: {s.get('last_refusal_reason', 'none')}",
         f"loop {s.get('loop_hz', 0):.1f}Hz  cam {s.get('camera_hz', 0):.1f}Hz",
         f"infer {s.get('infer_ms', 0):.1f}ms  grab {s.get('grab_ms', 0):.1f}ms  viz {s.get('viz_ms', 0):.1f}ms  hb {s.get('heartbeat_ms', 0):.0f}ms",
         f"VRAM {s.get('gpu_vram_used_gb', 0):.1f}/{s.get('gpu_vram_total_gb', 11):.0f} GB  {s.get('gpu_name', '')}",
@@ -894,9 +898,9 @@ def _lines(s: dict[str, Any]) -> list[str]:
         f"capture {cap} {cap_note}".rstrip(),
         f"rss {float(s.get('rss_mb') or 0):.0f} MB",
         f"lane {s.get('lane_conf', 0):.2f}  bev {s.get('bev_coverage', 0):.0%}  obj {s.get('objects_n', 0)}  trk {s.get('tracks_n', 0)}",
-        f"ego {v:.1f} m/s ({mph:.0f} mph)  steer {ego.get('steer_deg', 0):.1f}",
+        f"ego {ego_s}  steer {ego.get('steer_deg', 0):.1f}",
         f"thr {ego.get('throttle', 0):.2f}  brk {ego.get('brake', 0):.2f}  yawr {ego.get('yaw_rate', 0):.2f}",
-        f"planner w={pl.get('corridor_width', 0):.2f}  curv={pl.get('curvature', 0):.4f}  vt={pl.get('target_v', 0):.1f}",
+        f"planner w={pl.get('corridor_width', 0):.2f}  curv={pl.get('curvature', 0):.4f}  vt={vt_s}",
         f"TTC {pl.get('ttc_lead')}   AEB {pl.get('aeb')}",
         f"path_conf {s.get('path_conf', 0):.2f}  width {s.get('path_width', 0):.2f}  preview={s.get('path_debug_preview')}",
         f"scene {s.get('viz_scene_note') or scene_note(s)}",

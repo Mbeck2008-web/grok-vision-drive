@@ -694,6 +694,17 @@ def check_backend_tuniq() -> None:
     assert [u["wide"] for u in un] == [1, 1, 0, 0, 0] and [u["rear"] for u in un] == [1, 0, 0, 0, 0], un
     assert texts[3] == "wide:1,main:1,rear:0" and parse_uniq_text(texts[3]) == tu[3], texts
     assert texts[4] == "na" and uniq_text(log) != "na", texts
+    # Respawn: rear takes A before, reset_live_hold (the live loop's RespawnWatch path),
+    # rear takes the same A after -> tuniq 1 (fresh start), not 0.
+    be.close()
+    be = _backend(_cams())
+    be.enable_live_hold(LiveStreamHold(ScriptedSchedule([("rear",), ("rear",), ("rear",)])))
+    be.enable_read_log()
+    assert be.grab().read_log["tuniq"] == {"rear": 1}
+    assert be.grab().read_log["tuniq"] == {"rear": 0}  # same A, no respawn: identical
+    be.reset_live_hold()
+    assert be._taken_sig == {}
+    assert be.grab().read_log["tuniq"] == {"rear": 1}, "post-respawn take compared with a pre-respawn frame"
     # Without a live hold nothing is taken: tuniq=na on every tick.
     be.close()
     be = _backend(_cams())
@@ -720,7 +731,7 @@ def check_backend_tuniq() -> None:
     be_off.close()
     be_on.close()
     print("tuniq: taken frames vs previous taken frame (A,A,A,B taken on ticks 1 and 3 -> 1,1; unchanged -> 0; "
-          "changed reads between identical takes -> 0), na when nothing taken; read log on/off: same frames, "
+          "changed reads between identical takes -> 0), na when nothing taken; respawn -> same frame logs 1; read log on/off: same frames, "
           "held frames, taken cams and stored counts OK")
 
 

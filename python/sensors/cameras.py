@@ -1445,7 +1445,8 @@ class BeamNGPyBackend:
         self._sensor_kwargs: dict[str, dict[str, Any]] = {}
         self._frame_sig: dict[str, tuple[Any, ...]] = {}
         # Signature of each camera's last frame the live hold's schedule took
-        # (cam-age telemetry ``tuniq`` only; never read by the hold).
+        # (cam-age telemetry ``tuniq`` only; never read by the hold). Cleared on
+        # open / close and on reset_live_hold (respawn).
         self._taken_sig: dict[str, tuple[Any, ...]] = {}
         self._unique_hz_ema = 0.0
         self._unique_n = 0
@@ -2143,7 +2144,12 @@ class BeamNGPyBackend:
         self._read_log_on = True
 
     def reset_live_hold(self) -> None:
-        """Respawn / reset / level load: the schedule re-anchors and no frame is held."""
+        """Respawn / reset / level load: the schedule re-anchors and no frame is held.
+
+        Also forgets every camera's previous taken signature (``tuniq`` telemetry
+        only), so the first frame taken after the respawn logs 1 and is never
+        compared with a pre-respawn frame."""
+        self._taken_sig.clear()
         if self._live_hold is not None:
             self._live_hold.reset()
 

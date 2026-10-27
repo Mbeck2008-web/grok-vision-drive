@@ -172,8 +172,30 @@ def check_near_spawn_level_poll() -> None:
           f"reload {k * 0.1:.1f} s after the change, reads 1 -> {reads[-1]}")
 
 
+def check_unknown_level_poll_keeps_roads() -> None:
+    """The 10 s poll gets "" (level unknown) for 60 s: keep the roads, never re-read."""
+    import python.debug.gt_logger as gt_logger_mod
+
+    graph = load_graph()
+    poses = track(graph, "synth_a", ["W", "T", "X"], speed_mps=6.0)[:600]  # 60 s at 10 Hz, no jump
+    bng = FakeBng(graph, "synth_a")
+    clock = FakeClock()
+    real = gt_logger_mod.current_level
+    gt_logger_mod.current_level = lambda _bng: ""
+    try:
+        with tempfile.TemporaryDirectory() as tmp, patched_logger_env(clock):
+            logger = GroundTruthLogger(Path(tmp) / "gt.jsonl", Path(tmp) / "gt")
+            rows = drive(logger, bng, poses, clock)
+    finally:
+        gt_logger_mod.current_level = real
+    assert len(rows) == 600 and sum(row["lane_x"] is not None for row in rows) > 540, len(rows)
+    assert bng.reads == 1, f"level poll answered \"\" for 60 s and the network was read {bng.reads} times"
+    print(f"unknown level from the poll: 60 s of ticks, {bng.reads} network read, roads kept")
+
+
 def main() -> None:
     check_level_change_reads_new_roads()
+    check_unknown_level_poll_keeps_roads()
     check_near_spawn_sim_time_back()
     check_near_spawn_level_poll()
     print("test_gt_level_change: OK")

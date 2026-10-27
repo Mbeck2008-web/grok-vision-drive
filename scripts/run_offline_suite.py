@@ -30,10 +30,18 @@ Collector output goes under ``gvd_test_env.suite_data_root()``: each script
 gets its own subfolder there (``gvd_test_env.collect_root`` reads it), removed
 afterwards. The first lines print that folder and the temp root with their
 filesystem and free space.
+
+The first line logs the torch and torchvision versions the test scripts see
+(read in a child with the same isolated environment). On Windows, the dev PC
+target, the suite stops before running anything unless they are exactly the
+pins below (a local suffix such as ``+cu126`` is allowed). Elsewhere (Linux
+CI) the line is logged only.
 """
 from __future__ import annotations
 
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -60,6 +68,65 @@ MARKER_TORCH = "gvd-ci: requires torch"
 TIMEOUT_S = 300
 # Scripts that train several small models end to end need longer on CI runners.
 SCRIPT_TIMEOUT_S = {"test_epoch_ckpt.py": 600}
+
+
+# The dev PC's torch / torchvision (the CI workflow installs the same versions).
+TORCH_PINS = {"torch": "2.14.1", "torchvision": "0.29.1"}
+_VERSIONS_CHILD = (
+    "import importlib.metadata as m, json\n"
+    "out = {}\n"
+    "for name in %r:\n"
+    "    try:\n"
+    "        out[name] = m.version(name)\n"
+    "    except m.PackageNotFoundError:\n"
+    "        out[name] = None\n"
+    "print(json.dumps(out))\n"
+)
+
+
+def pin_matches(version: str | None, pin: str) -> bool:
+    """``version`` is exactly ``pin``, optionally with a local suffix (``2.14.1+cu126``)."""
+    if version is None:
+        return False
+    return re.fullmatch(re.escape(pin) + r"(\+[0-9A-Za-z.]+)?", version) is not None
+
+
+def torch_version_line(versions: dict[str, str | None]) -> str:
+    parts = [f"{name} {versions.get(name) or 'not installed'}" for name in TORCH_PINS]
+    return "[suite] " + ", ".join(parts)
+
+
+def torch_pin_problems(versions: dict[str, str | None]) -> list[str]:
+    return [
+        f"{name} is {versions.get(name) or 'not installed'}, need {pin}"
+        for name, pin in TORCH_PINS.items()
+        if not pin_matches(versions.get(name), pin)
+    ]
+
+
+def torch_pins_fatal(versions: dict[str, str | None], platform: str) -> bool:
+    """Only the Windows (dev PC) target enforces the pins; other hosts log the line."""
+    return platform == "win32" and bool(torch_pin_problems(versions))
+
+
+def _torch_versions() -> dict[str, str | None]:
+    """Versions as the test scripts see them: a child with the same isolated env."""
+    scratch = Path(tempfile.mkdtemp(prefix="gvd-suite-"))
+    try:
+        env = isolated_env(os.environ, scratch)
+        proc = subprocess.run(
+            [sys.executable, "-c", _VERSIONS_CHILD % (tuple(TORCH_PINS),)],
+            cwd=str(ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    if proc.returncode != 0:
+        raise SystemExit(f"run_offline_suite: could not read torch versions: {proc.stderr.strip()}")
+    return json.loads(proc.stdout.strip().splitlines()[-1])
 
 
 def _head(path: Path) -> str:
@@ -175,6 +242,12 @@ def main() -> None:
     lua_tests = sorted(p for p in SCRIPTS.glob("test_*.lua") if p.is_file())
     if not py_tests and not lua_tests:
         raise SystemExit("run_offline_suite: no scripts/test_* found")
+    versions = _torch_versions()
+    print(torch_version_line(versions), flush=True)
+    if torch_pins_fatal(versions, sys.platform):
+        problems = "; ".join(torch_pin_problems(versions))
+        print(f"FAIL torch pins: {problems} (Windows dev PC target)", flush=True)
+        raise SystemExit(f"run_offline_suite: torch pins not met on Windows: {problems}")
     data_root = suite_data_root()
     print(f"[suite] temp {describe_root(tempfile.gettempdir())}", flush=True)
 

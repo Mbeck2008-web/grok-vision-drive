@@ -10,6 +10,7 @@ data is a null offset, not a guessed lane.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -26,14 +27,18 @@ from python.debug.gt_geom import (
     ego_center_x,
     heading_from_dir,
     lane_still_beside,
-    parse_road_edges,
     project_follow,
-    road_width_floor,
     project_road,
     update_curve_preview,
 )
+from python.collect import road_loader
+from python.collect.road_loader import current_level, polys_from_network  # noqa: F401  (re-exported)
 
 FRAME_EVERY_S = 4.0
+# A pose this far from the last tick is a respawn or a new level. Only then
+# is the level asked again; a different (or unknown) level reloads roads once.
+LEVEL_JUMP_M = 100.0
+ROAD_RETRY_S = 2.0
 DEPART_BURST = 3
 
 
@@ -92,151 +97,31 @@ def read_sim_time(bng: Any) -> float | None:
     return None
 
 
-def _exc_text(exc: BaseException) -> str:
-    detail = str(exc).strip() or type(exc).__name__
-    return f"{type(exc).__name__}: {detail}"
-
-
-def _call(fn: Any, *args: Any, **kwargs: Any) -> tuple[Any, str]:
-    try:
-        return fn(*args, **kwargs), ""
-    except TypeError:
-        try:
-            return fn(*args), ""
-        except Exception as exc:
-            return None, _exc_text(exc)
-    except Exception as exc:
-        return None, _exc_text(exc)
-
-
-def polys_from_network(spec: Any) -> list[RoadPoly]:
-    """Roads from ``get_road_network(include_edges=True)``."""
-    if isinstance(spec, dict) and "roads" in spec and isinstance(spec["roads"], dict):
-        spec = spec["roads"]
-    elif isinstance(spec, dict) and "network" in spec and isinstance(spec["network"], dict):
-        spec = spec["network"]
-    if not isinstance(spec, dict):
-        return []
-    polys: list[RoadPoly] = []
-    for road_id, road in spec.items():
-        edges = None
-        if isinstance(road, dict):
-            driv = road.get("drivability", road.get("drivable", 1))
-            try:
-                if float(driv) <= 0.0:
-                    continue
-            except (TypeError, ValueError):
-                pass
-            edges = road.get("edges") or road.get("nodes")
-        elif isinstance(road, list):
-            edges = road
-        poly = parse_road_edges(str(road_id), edges)
-        if poly is not None:
-            if isinstance(road, dict):
-                try:
-                    count = int(float(road.get("lanesLeft") or 0)) + int(float(road.get("lanesRight") or 0))
-                except (TypeError, ValueError):
-                    count = 0
-                if 1 <= count <= 8:
-                    poly.lanes = count
-            polys.append(road_width_floor(poly, road))
-    return polys
-
-
 def raw_road_network(bng: Any) -> tuple[Any, Any, str]:
-    """``(road_network spec, get_roads dict or None, note)``.
+    """``(road_network spec, get_roads dict or None, note)`` for the offline road dumps.
 
-    The spec is whatever ``get_road_network`` returned, before it is parsed
-    into centerlines. ``get_roads`` is included when that call succeeds.
+    The spec is the shared loader's cached network for the current level,
+    before it is parsed into centerlines. ``get_roads`` is included when
+    that call succeeds.
     """
     if bng is None:
         return None, None, "no beamng"
-    notes: list[str] = []
-    spec = None
-    owners = []
-    scenario = getattr(bng, "scenario", None)
-    if scenario is not None:
-        owners.append(scenario)
-    owners.append(bng)
-    for owner in owners:
-        fn = getattr(owner, "get_road_network", None)
-        if not callable(fn):
-            continue
-        got, note = _call(fn, include_edges=True, drivable_only=True)
-        if note:
-            notes.append(f"get_road_network {note}")
-            got, note2 = _call(fn)
-            if note2:
-                notes.append(f"get_road_network() {note2}")
-        if got is not None:
-            spec = got
-            break
-    roads = None
-    get_roads = getattr(bng, "get_roads", None)
-    if callable(get_roads):
-        got, note = _call(get_roads)
-        if note:
-            notes.append(f"get_roads failed: {note}")
-        elif isinstance(got, dict):
-            roads = got
-    if spec is None and roads is None:
+    snap = road_loader.shared().snapshot(bng)
+    roads, roads_note = road_loader.read_legacy_roads(bng)
+    if snap.spec is None and roads is None:
+        notes = [n for n in (snap.note, roads_note) if n]
         return None, None, "; ".join(notes) if notes else "no road network"
-    return spec, roads, ""
+    return snap.spec, roads, ""
 
 
 def load_road_polys(bng: Any) -> tuple[list[RoadPoly], str]:
-    """One snapshot of the level's road network.
+    """Centerlines for the current level from the shared road loader.
 
-    BeamNGpy 1.36 deprecates ``get_roads``; Tech 0.39 raises ``BNGError``
-    from it. ``scenario.get_road_network(include_edges=True)`` is the call
-    that returns left/middle/right edges. The note keeps the exception text.
+    The loader reads the network once per level (left/middle/right edges of
+    drivable roads, with the legacy ``get_roads`` path as a fallback) and
+    keeps it until the level changes. The note keeps the exception text.
     """
-    if bng is None:
-        return [], "no beamng"
-    notes: list[str] = []
-    owners = []
-    scenario = getattr(bng, "scenario", None)
-    if scenario is not None:
-        owners.append(scenario)
-    owners.append(bng)
-    for owner in owners:
-        fn = getattr(owner, "get_road_network", None)
-        if not callable(fn):
-            continue
-        spec, note = _call(fn, include_edges=True, drivable_only=True)
-        if note:
-            notes.append(f"get_road_network {note}")
-            spec, note2 = _call(fn)
-            if note2:
-                notes.append(f"get_road_network() {note2}")
-        polys = polys_from_network(spec)
-        if polys:
-            return polys, ""
-        if spec is not None and not note:
-            notes.append("get_road_network returned no edges")
-    get_roads = getattr(bng, "get_roads", None)
-    get_edges = getattr(bng, "get_road_edges", None)
-    if callable(get_roads):
-        roads, note = _call(get_roads)
-        if note:
-            notes.append(f"get_roads failed: {note}")
-        elif isinstance(roads, dict) and roads and callable(get_edges):
-            polys = []
-            for road_id in roads:
-                edges, edge_note = _call(get_edges, road_id)
-                if edge_note or edges is None:
-                    continue
-                poly = parse_road_edges(str(road_id), edges)
-                if poly is not None:
-                    polys.append(poly)
-            if polys:
-                return polys, ""
-            notes.append("get_road_edges returned no centerlines")
-        elif not note:
-            notes.append("get_roads returned no roads")
-    elif not notes:
-        notes.append("beamngpy has no get_road_network or get_roads")
-    return [], "; ".join(notes) if notes else "no road network"
+    return road_loader.shared().polys(bng)
 
 
 def _x_at_y(poly: list, y_m: float) -> float | None:
@@ -402,7 +287,7 @@ def save_debug_frame(
 class GroundTruthLogger:
     """Append-only session. ``path`` is the JSONL file."""
 
-    def __init__(self, path: Path, frames: Path) -> None:
+    def __init__(self, path: Path, frames: Path, loader: road_loader.RoadLoader | None = None) -> None:
         self.path = Path(path)
         self.frames = Path(frames)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -410,6 +295,10 @@ class GroundTruthLogger:
         self._roads: list[RoadPoly] | None = None
         self._road_note = "road network pending"
         self._road_try_wall = 0.0
+        self._loader = loader
+        self._roads_level: str | None = None
+        self._level_pos: tuple[float, float] | None = None
+        self._level_check = False
         self._prev_damage: float | None = None
         self._last_sim: float | None = None
         self._wall0 = time.time()
@@ -436,16 +325,57 @@ class GroundTruthLogger:
         frames = path.with_suffix("")
         return cls(path, frames)
 
-    def _ensure_roads(self, bng: Any, socket_busy: bool) -> None:
-        if self._roads is not None or socket_busy or bng is None:
+    def _ensure_roads(self, bng: Any, socket_busy: bool, vdata: Any = None) -> None:
+        """Roads for the level the car is on. One read per level, never per tick.
+
+        The first load asks the game which level is up and reads that level's
+        network through the shared loader (retried every ``ROAD_RETRY_S``
+        while it is empty). After that the only trigger is a pose jump of
+        ``LEVEL_JUMP_M``: a respawn or a level change. Then the level is asked
+        once more; the same level keeps the roads, a different level reads
+        that level once, and an unknown answer re-reads to be safe.
+        """
+        pos = _pose(vdata)[0] if vdata is not None else None
+        if pos is not None:
+            here = (float(pos[0]), float(pos[1]))
+            last = self._level_pos
+            if (
+                last is not None
+                and self._roads is not None
+                and math.hypot(here[0] - last[0], here[1] - last[1]) > LEVEL_JUMP_M
+            ):
+                self._level_check = True
+            self._level_pos = here
+        if self._roads is not None and not self._level_check:
             return
+        if socket_busy or bng is None:
+            return
+        loader = self._loader if self._loader is not None else road_loader.shared()
+        if self._roads is not None:
+            self._level_check = False
+            level = current_level(bng)
+            if level and level == self._roads_level:
+                return
+            print(f"[GVD] gt level {self._roads_level or '?'} -> {level or '?'}: reloading roads", flush=True)
+            if not level:
+                loader.invalidate()
+            self._roads = None
+            self._road_note = "road network pending"
+            self._road_try_wall = 0.0
+            self._preview = PreviewMemory()
+            self._follow = RoadFollow()
+            self._followed = None
+            self._last_good = None
         now = time.time()
-        if self._road_try_wall and (now - self._road_try_wall) < 2.0:
+        if self._road_try_wall and (now - self._road_try_wall) < ROAD_RETRY_S:
             return
         self._road_try_wall = now
-        polys, note = load_road_polys(bng)
+        level = current_level(bng)
+        loader.enter(bng, level)
+        polys, note = loader.polys(bng)
         if polys:
             self._roads = polys
+            self._roads_level = level
             self._road_note = ""
             print(f"[GVD] gt roads={len(polys)}", flush=True)
         else:
@@ -457,7 +387,7 @@ class GroundTruthLogger:
 
         Off-road or a missing pose is None. The caller does not invent a lane.
         """
-        self._ensure_roads(bng, socket_busy)
+        self._ensure_roads(bng, socket_busy, vdata)
         if not self._roads:
             return None
         pos, heading, _speed = _pose(vdata)
@@ -485,7 +415,7 @@ class GroundTruthLogger:
         ``write`` uses this same hit, so it matches ``lane_x`` instead of
         the rejected polyline.
         """
-        self._ensure_roads(bng, socket_busy)
+        self._ensure_roads(bng, socket_busy, vdata)
         dt = 0.1 if dt_s is None else dt_s
         self._followed = None
         if not self._roads:
@@ -565,7 +495,7 @@ class GroundTruthLogger:
         model_lane_x: float | None = None,
         model_conf: float | None = None,
     ) -> dict[str, Any]:
-        self._ensure_roads(bng, socket_busy)
+        self._ensure_roads(bng, socket_busy, vdata)
         pos, heading, speed = _pose(vdata)
         sim = None if socket_busy else read_sim_time(bng)
         if sim is None:

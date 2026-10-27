@@ -1,8 +1,8 @@
 """Fake BeamNG session over the hand-built roads in ``tests/fixtures/junctions_synthetic.json``.
 
-Shared by ``test_lane_gt_frozen.py``, ``test_gt_level_change.py``,
+Shared by ``scripts/test_lane_gt_frozen.py``, ``test_gt_level_change.py``,
 ``test_road_loader_cache.py`` and ``test_junction_grade.py``. Not a test
-itself: the offline suite only runs ``test_*`` files.
+itself; it lives under ``tests/`` so the offline suite does not run it.
 
 Everything here is synthetic. No BeamNG map data is read or stored.
 """

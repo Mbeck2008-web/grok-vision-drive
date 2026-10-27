@@ -44,7 +44,7 @@ from python.control.actuate import (  # noqa: E402
 from python.perception import pipeline  # noqa: E402
 from python.perception.pipeline import ModularPerception  # noqa: E402
 from python.runtime.shadow import E2EPolicy, shadow_tick  # noqa: E402
-from python.runtime.state_io import state_path  # noqa: E402
+from python.runtime.state_io import atomic_write_json, state_path  # noqa: E402
 
 DT = 0.05
 UNKNOWN = "ego_unknown"
@@ -253,7 +253,7 @@ class _Mod:
         eng = _read(engage_path())
         if eng.get("engaged") is True:
             eng["mtime"] = time.time()
-            engage_path().write_text(json.dumps(eng), encoding="utf-8")
+            atomic_write_json(engage_path(), eng, indent=None)  # tmp + replace: the supervisor never reads it torn
 
 
 def _session(

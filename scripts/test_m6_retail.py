@@ -1276,15 +1276,19 @@ def check_supervisor_clock_default() -> None:
         steer_enter=0.08, steer_exit=0.04, steer_hold_ms=200.0, steer_spike=0.20,
         brake_enter=0.06, throttle_enter=0.10, lpf_tau_ms=80.0)
 
-    # 10. The launcher's bus_identity wrap is clock-only: unwrapped by default and with no clock.
+    # 10. The launcher's bus_identity wrap and actuate.time shim are clock-only: stdlib by default
+    # and with no clock.
     from python.runtime import state_io
-    from gvd_sim_clock import install_bus_identity_wrap
+    from gvd_sim_clock import install_actuate_time_shim, install_bus_identity_wrap
 
     assert actuate.bus_identity is paths.bus_identity
     assert state_io.bus_identity is paths.bus_identity
+    assert actuate.time is time
     install_bus_identity_wrap(None)
+    install_actuate_time_shim(None)
     assert actuate.bus_identity is paths.bus_identity
     assert state_io.bus_identity is paths.bus_identity
+    assert actuate.time is time
     print("  no clock: every seamed site keeps its stdlib clock; threaded now= defaults to time.time()")
 
 

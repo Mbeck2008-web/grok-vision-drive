@@ -570,6 +570,13 @@ def check_08_restart_with_latch_on() -> None:
 
 def check_09_stale_echo_mid_run() -> None:
     """Echo freezes while engaged: unknown at 300 ms (monotonic), thr 0 / brk 0, echo_stale named."""
+    # On the SimClock step barrier (#131): the bus is read once after every supervisor tick, so the
+    # one tick whose gvd_cmd.json carries reason echo_stale is always seen; real-clock polling can
+    # miss it when the reader is descheduled for more than a tick. The echo_stale gvd_engage.json
+    # mtime is stamped by the supervisor on the sim wall (actuate.write_engage_flag via the clock
+    # child's actuate.time shim), so mark["frozen"] is the sim wall too: like compares with like.
+    from gvd_sim_clock import SimClock  # noqa: PLC0415
+
     write_engage_flag(False)
     mod = _Mod()
     mod.echoing = True
@@ -581,9 +588,9 @@ def check_09_stale_echo_mid_run() -> None:
             _engage_now()
         if "frozen" not in mark and t >= 1.7:
             mod.freeze()
-            mark["frozen"] = time.time()
+            mark["frozen"] = mod.clock.wall()
 
-    seen = _session(3.5, mod, step)
+    seen = _session(3.5, mod, step, clock=SimClock())
     assert _engaged_snaps(seen), "never engaged before the freeze"
     _refusal(seen, "echo_stale", "stale echo mid-run")
     drops = [float(s["engage"].get("mtime") or 0.0) for s in seen

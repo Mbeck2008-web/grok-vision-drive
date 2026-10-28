@@ -50,3 +50,39 @@ def install_bus_identity_wrap(clock) -> None:
     wrap = lambda *a, **k: real_bi(*a, **{"now": clock.wall(), **k})  # noqa: E731
     actuate.bus_identity = wrap
     state_io.bus_identity = wrap
+
+
+class ActuateTime:
+    """``actuate.time`` on the test clock: exactly time/monotonic/perf_counter, nothing else.
+
+    time -> clock.wall, monotonic -> clock.mono, perf_counter -> clock.perf. Any other
+    attribute (sleep, strftime, ...) raises AttributeError, so a new time use in actuate.py
+    fails loudly in the clock child instead of silently reading the real clock.
+    """
+
+    __slots__ = ("_clock",)
+
+    def __init__(self, clock) -> None:
+        self._clock = clock
+
+    def time(self) -> float:
+        return self._clock.wall()
+
+    def monotonic(self) -> float:
+        return self._clock.mono()
+
+    def perf_counter(self) -> float:
+        return self._clock.perf()
+
+
+def install_actuate_time_shim(clock) -> None:
+    """Point ``actuate.time`` at ``ActuateTime(clock)``; clock=None: no-op (stdlib ``time`` stays).
+
+    Stamps actuate writes (gvd_cmd.json heartbeat_mtime, gvd_engage.json mtime, ...) on the
+    sim wall, so they compare against sim-wall stamps on a loaded host. state_io is not patched.
+    """
+    if clock is None:
+        return
+    from python.control import actuate
+
+    actuate.time = ActuateTime(clock)

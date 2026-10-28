@@ -40,6 +40,8 @@ from python.viz.nerd import THR_PRED_COLOR as AMBER
 
 RAM_LABEL = "system RAM used"
 RSS_LABEL = "trainer RSS"
+# Shown for a series the live trainer cannot measure (RSS on Windows without psutil).
+NA = "n/a"
 VAL_LABEL = "val since this launch"
 GRAPH_FILL = (28, 24, 22)
 GRAPH_EDGE = (70, 64, 58)
@@ -351,6 +353,11 @@ def _fmt_bytes(value: float) -> str:
     return format_bytes(int(value))
 
 
+def format_rss(value: int | None) -> str:
+    """Caption value for the trainer RSS: ``n/a`` when it cannot be measured, never 0."""
+    return NA if value is None else format_bytes(int(value))
+
+
 Color = tuple[int, int, int]
 Fmt = Callable[[float], str]
 # (graph, title, ((series key, caption label, color, formatter), ...), shared y scale)
@@ -405,28 +412,34 @@ def _paint_series(
     series: Sequence[tuple[str, Sequence[float], Color, Fmt]],
     *,
     shared: bool,
+    unavailable: Sequence[str] = (),
 ) -> None:
     """One painter for every graph. No data keeps the plot area ``GRAPH_FILL``.
 
     ``series`` is ``(caption label, values, color, formatter)``. With ``shared``
-    every line uses one y scale (train vs val, VRAM vs RAM).
+    every line uses one y scale (train vs val, VRAM vs RAM). ``unavailable``
+    holds caption labels that cannot be measured; each is written as ``n/a``.
     """
     x0, y0, x1, y1 = box
     cv2.rectangle(img, (x0, y0), (x1, y1), GRAPH_FILL, -1)
     cv2.rectangle(img, (x0, y0), (x1, y1), GRAPH_EDGE, 1)
     drawn = [(label, clean_series(values), color, fmt) for label, values, color, fmt in series]
     drawn = [row for row in drawn if row[1]]
-    if not drawn:
+    if not drawn and not unavailable:
         _put(img, _fit(f"{title}  --", x1 - x0 - 16, FS_DIM), (x0 + 8, y0 + 22), FS_DIM, DIM)
         return
     # The caption is the legend: each value is written in its line's color.
     x = x0 + 8
     right = x1 - 8
-    if len(drawn) < 3:
+    if len(drawn) + len(unavailable) < 3:
         # Three labelled values fill a full-width caption; the labels name the graph.
         x = _put_part(img, title, x, y0 + 22, right, FG)
     for label, values, color, fmt in drawn:
         x = _put_part(img, f"{label} {fmt(values[-1])}".strip(), x, y0 + 22, right, color if len(drawn) > 1 else FG)
+    for label in unavailable:
+        x = _put_part(img, f"{label} {NA}".strip(), x, y0 + 22, right, DIM)
+    if not drawn:
+        return
     ymax = max(max(values) for _label, values, _color, _fmt in drawn) if shared else None
     plot = loss_plot_box(box)
     for index, (_label, values, color, _fmt) in enumerate(drawn):
@@ -470,10 +483,12 @@ def render_train_panel(
     phase: str = "idle",
     hits: list[dict[str, Any]] | None = None,
     series: Mapping[str, Sequence[float]] | None = None,
+    unavailable: Iterable[str] = (),
 ) -> np.ndarray:
     """Dark panel. ``losses`` is the train loss; ``series`` holds the other graphs' values.
 
-    Every series is plotted as given; an empty one stays idle.
+    Every series is plotted as given; an empty one stays idle. A key in
+    ``unavailable`` with no values is captioned ``n/a`` (not 0, not left out).
     """
     text_lines = [str(line) for line in lines]
     if hits is not None:
@@ -502,10 +517,12 @@ def render_train_panel(
     _button(img, "Pause", x, baseline, hits, "pause", on=running)
     values: dict[str, Sequence[float]] = dict(series or {})
     values["train"] = list(losses or [])
+    missing = set(unavailable)
     boxes = graph_boxes(height, PANEL_W)
     for name, title, keys, shared in GRAPHS:
         rows = [(label, values.get(key) or [], color, fmt) for key, label, color, fmt in keys]
-        _paint_series(img, boxes[name], title, rows, shared=shared)
+        na = [label for key, label, _color, _fmt in keys if key in missing and not values.get(key)]
+        _paint_series(img, boxes[name], title, rows, shared=shared, unavailable=na)
     return img
 
 
@@ -526,6 +543,8 @@ class TrainWindow:
         # Host RAM and RSS are sampled only for a live trainer. A replay has no
         # host samples to draw, and this machine's numbers would be wrong there.
         self.live_host = bool(live_host)
+        # True once a live sample found no RSS source (no psutil, no /proc/self/statm).
+        self.rss_unavailable = False
         self.lines = ""
         self.recorded_s = 0.0
         self.recorded_frames = 0
@@ -766,7 +785,9 @@ class TrainWindow:
         else:
             self._sample("ram", status.memory_bytes)
         if self.live_host:
-            self._sample("rss", self.sample_rss())
+            rss = self.sample_rss()
+            self.rss_unavailable = rss is None
+            self._sample("rss", rss)
         self._sample("hours", self.recorded_s / 3600.0)
         self._sample("frames", self.recorded_frames)
         self._tail_val()
@@ -790,7 +811,12 @@ class TrainWindow:
 
     def _paint(self) -> None:
         self.panel = render_train_panel(
-            self.lines.splitlines(), self.losses, phase=self.phase, hits=self.hits, series=self.series
+            self.lines.splitlines(),
+            self.losses,
+            phase=self.phase,
+            hits=self.hits,
+            series=self.series,
+            unavailable=("rss",) if self.rss_unavailable else (),
         )
         if not self._shown:
             return

@@ -14,6 +14,8 @@
   a half-written line waits, a truncated file starts over.
 * labels: memory reads "system RAM used" and "trainer RSS", val reads
   "val since this launch"; a replay samples no host RAM or RSS.
+* RSS unknown: with psutil and ``/proc/self/statm`` both missing, the trainer
+  RSS caption reads "n/a" (not 0, not blank, not left out).
 * driving: two flat lines on separate scales stay visible (offset by the drawn line height).
 * read-only: fixture hashes and mtimes are unchanged, and the module has no
   file writes outside the replay PNG and no training-control writes.
@@ -191,6 +193,65 @@ def check_labels_and_driving_offset() -> None:
     seen = {name: int(np.all(crop == np.array(color, dtype=np.uint8), axis=1).sum()) for name, color in (("hours", sw.ICE), ("frames", sw.AMBER))}
     assert seen["hours"] > 0 and seen["frames"] > 0, seen
     print(f"labels: system RAM used / trainer RSS / val since this launch; flat driving lines both visible {seen} OK")
+
+
+@contextlib.contextmanager
+def _no_rss_sources():
+    """Make ``import psutil`` fail and ``/proc/self/statm`` unreadable."""
+    import pathlib
+
+    saved_psutil = sys.modules.get("psutil", "absent")
+    real_read_text = pathlib.Path.read_text
+
+    def read_text(self, *args, **kwargs):
+        if str(self).replace("\\", "/") == "/proc/self/statm":
+            raise FileNotFoundError(str(self))
+        return real_read_text(self, *args, **kwargs)
+
+    sys.modules["psutil"] = None  # type: ignore[assignment]  # import now raises ImportError
+    pathlib.Path.read_text = read_text  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        pathlib.Path.read_text = real_read_text  # type: ignore[method-assign]
+        if saved_psutil == "absent":
+            sys.modules.pop("psutil", None)
+        else:
+            sys.modules["psutil"] = saved_psutil
+
+
+def check_rss_unavailable_shows_na() -> None:
+    from python.train import status_window as sw
+
+    captions: list[str] = []
+    real_put_part = sw._put_part
+
+    def record(img, text, *args, **kwargs):
+        captions.append(text)
+        return real_put_part(img, text, *args, **kwargs)
+
+    with _no_rss_sources():
+        assert sw.trainer_rss_bytes() is None
+        assert sw.TrainWindow.sample_rss() is None
+        assert sw.format_rss(sw.trainer_rss_bytes()) == "n/a"
+        window = sw.TrainWindow()
+        sw._put_part = record
+        try:
+            for status in sw.replay_statuses(FIXTURE):
+                window.update(status)
+        finally:
+            sw._put_part = real_put_part
+    assert window.rss_unavailable is True and window.series["rss"] == [], window.series["rss"]
+    last = captions[-40:]
+    rss = [text for text in last if text.startswith("trainer RSS")]
+    assert rss and all(text == "trainer RSS n/a" for text in rss), rss
+    assert not any(re.fullmatch(r"trainer RSS\s*0.*", text) for text in captions), captions
+    assert sw.format_rss(0) != "n/a" and sw.format_rss(None) == "n/a"
+
+    # With a source back, the caption is a measured size again.
+    window.update(next(iter(sw.replay_statuses(FIXTURE))))
+    assert window.rss_unavailable is False and len(window.series["rss"]) == 1 and window.series["rss"][0] > 0
+    print(f"rss: no psutil and no /proc/self/statm -> caption {rss[-1]!r}, no 0 OK")
 
 
 def check_replay_out() -> None:
@@ -409,6 +470,7 @@ def main() -> None:
     check_theme_imported()
     check_replay()
     check_labels_and_driving_offset()
+    check_rss_unavailable_shows_na()
     check_replay_out()
     check_pause_path()
     check_val_tail()

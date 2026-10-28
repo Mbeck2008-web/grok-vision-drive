@@ -67,7 +67,7 @@ MARKER_BEAMNG = "gvd-ci: requires beamng"
 MARKER_TORCH = "gvd-ci: requires torch"
 TIMEOUT_S = 300
 # Scripts that train several small models end to end need longer on CI runners.
-SCRIPT_TIMEOUT_S = {"test_epoch_ckpt.py": 600}
+SCRIPT_TIMEOUT_S = {"test_epoch_ckpt.py": 600, "test_seed.py": 600}
 
 
 # The dev PC's torch / torchvision (the CI workflow installs the same versions).

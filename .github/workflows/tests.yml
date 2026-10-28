@@ -17,7 +17,7 @@ jobs:
         run: |
           df -h /tmp
           echo "before: /tmp fstype=$(findmnt -n -o FSTYPE /tmp || echo none)"
-          sudo systemctl mask tmp.mount && sudo umount -l /tmp
+          fstype=$(findmnt -n -o FSTYPE /tmp || true); if [ "$fstype" = "tmpfs" ]; then sudo systemctl mask tmp.mount && sudo umount -l /tmp; else echo "/tmp is ${fstype:-none}, not tmpfs; skipping unmount"; fi
           df -h /tmp
           fstype=$(findmnt -n -o FSTYPE /tmp || true)
           echo "after: /tmp fstype=${fstype:-none (on /)}"

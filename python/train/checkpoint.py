@@ -18,13 +18,43 @@ import numpy as np
 PAUSE_SUFFIX = ".gvd-pause.npz"
 
 
-def checkpoint_path(strip_root: Path | str) -> Path:
-    """Sibling of the strip folder: ``<parent>/<name>.gvd-pause.npz``."""
+def checkpoint_path(strip_root: Path | str, pause_dir: Path | str | None = None) -> Path:
+    """Sibling of the strip folder: ``<parent>/<name>.gvd-pause.npz``.
+
+    With ``pause_dir`` the same file name lives in that folder instead.
+    """
     root = Path(strip_root)
+    base = root.parent if pause_dir is None else Path(pause_dir)
     name = root.name
     if name in ("", ".", ".."):
-        return root.parent / f"gvd-train{PAUSE_SUFFIX}"
-    return root.parent / f"{name}{PAUSE_SUFFIX}"
+        return base / f"gvd-train{PAUSE_SUFFIX}"
+    return base / f"{name}{PAUSE_SUFFIX}"
+
+
+class PauseDirRefused(ValueError):
+    """``--pause-dir`` points somewhere a run must not write its pause file."""
+
+
+def check_pause_dir(
+    strip_root: Path | str, pause_dir: Path | str, *, no_resume: bool
+) -> Path:
+    """Return the pause file a ``--pause-dir`` run will use, or refuse.
+
+    Refuses a folder that is the strips parent, under it, or one of its
+    ancestors (the data root holding the dataset). With ``no_resume`` also
+    refuses when the pause file already exists, so a fresh run cannot
+    replace another run's pause.
+    """
+    data = Path(strip_root).resolve().parent
+    target = Path(pause_dir).resolve()
+    if target == data or data in target.parents:
+        raise PauseDirRefused(f"{target} is under the data root {data}")
+    if target in data.parents:
+        raise PauseDirRefused(f"{target} contains the data root {data}")
+    path = checkpoint_path(strip_root, target)
+    if no_resume and path.exists():
+        raise PauseDirRefused(f"{path} already exists and --no-resume is set")
+    return path
 
 
 def _outside_strip_folder(strip_root: Path, path: Path) -> None:
@@ -81,7 +111,12 @@ def _as_text(value: Any) -> str:
     return str(value)
 
 
-def save_checkpoint(strip_root: Path | str, payload: Mapping[str, Any]) -> Path:
+def save_checkpoint(
+    strip_root: Path | str,
+    payload: Mapping[str, Any],
+    *,
+    pause_dir: Path | str | None = None,
+) -> Path:
     """Write optimizer, step, epoch, and weights next to ``strip_root``.
 
     Does not create, rewrite, or delete files inside the strip folder.
@@ -90,7 +125,7 @@ def save_checkpoint(strip_root: Path | str, payload: Mapping[str, Any]) -> Path:
     weights = payload.get("weights")
     if not isinstance(weights, dict) or not weights:
         raise ValueError("pause needs model weights")
-    path = checkpoint_path(strip_root)
+    path = checkpoint_path(strip_root, pause_dir)
     _outside_strip_folder(Path(strip_root), path)
     path.parent.mkdir(parents=True, exist_ok=True)
     arrays: dict[str, np.ndarray] = {}
@@ -101,9 +136,11 @@ def save_checkpoint(strip_root: Path | str, payload: Mapping[str, Any]) -> Path:
     return path
 
 
-def load_checkpoint(strip_root: Path | str) -> dict[str, Any] | None:
+def load_checkpoint(
+    strip_root: Path | str, *, pause_dir: Path | str | None = None
+) -> dict[str, Any] | None:
     """Read a pause file. ``None`` when this run has not been paused."""
-    path = checkpoint_path(strip_root)
+    path = checkpoint_path(strip_root, pause_dir)
     if not path.is_file():
         return None
     with np.load(path) as blob:
@@ -115,9 +152,9 @@ def load_checkpoint(strip_root: Path | str) -> dict[str, Any] | None:
     return loaded
 
 
-def clear_checkpoint(strip_root: Path | str) -> None:
+def clear_checkpoint(strip_root: Path | str, *, pause_dir: Path | str | None = None) -> None:
     """Remove the pause file after a finished run. Strip files stay."""
-    path = checkpoint_path(strip_root)
+    path = checkpoint_path(strip_root, pause_dir)
     _outside_strip_folder(Path(strip_root), path)
     try:
         if path.is_file() and not path.is_symlink():

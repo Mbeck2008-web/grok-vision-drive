@@ -1668,16 +1668,7 @@ class _EpochWindows:
         }
 
 
-def _prefetch_loader(
-    items: list[dict[str, Any]],
-    root: Path,
-    cams,
-    cache,
-    scale: float,
-    workers: int,
-    cuda: bool,
-    seed: int = 0,
-):
+def _prefetch_loader(items: list[dict[str, Any]], root: Path, cams, cache, scale: float, workers: int, cuda: bool):
     """A DataLoader over train windows, or None when this process stays in-line."""
     if int(workers) <= 0 or not items:
         return None
@@ -1697,7 +1688,6 @@ def _prefetch_loader(
         shuffle=False,
         collate_fn=_first_item,
         worker_init_fn=_init_worker,
-        generator=torch.Generator().manual_seed(int(seed)),
         **settings,
     )
 
@@ -2297,7 +2287,6 @@ def train_directory(
                 input_scale,
                 int(workers),
                 device.type == "cuda",
-                seed=int(seed),
             )
             if prefetch is not None:
                 train_n = sum(1 for item in plan_steps if item.get("kind") != "holdout")

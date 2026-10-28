@@ -51,7 +51,7 @@ class PerceptionOut:
 
 
 class ModularPerception:
-    def __init__(self, *, allow_synthetic: bool = True, detector_id: str = "auto") -> None:
+    def __init__(self, *, allow_synthetic: bool = True, detector_id: str = "auto", clock=None) -> None:
         from python.runtime.models import load_detector
 
         self.detector, self.missing = load_detector(detector_id, allow_synthetic=allow_synthetic)
@@ -64,6 +64,7 @@ class ModularPerception:
         self._taken_mono: float = 0.0
         self._last_plan: Any = None
         self._last_lanes: LaneResult | None = None
+        self._clock = clock  # test-only (scripts/gvd_clock_child.py); None is time.monotonic
 
     def arm_lane_seed(self) -> None:
         """Drop any center fit before engage. The next pair may seed it.
@@ -137,6 +138,8 @@ class ModularPerception:
         track_dicts = self.tracker.as_dicts()
         sig = _lane_view_signature(stitch_bgr, main_bgr)
         now = time.monotonic()
+        if self._clock is not None:
+            now = self._clock.mono()
         fresh = sig is None or sig != self._lane_sig
         if fresh:
             self._lane_sig = sig

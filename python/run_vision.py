@@ -261,7 +261,8 @@ def detector_runtime(detector: Any) -> str:
     return name
 
 
-def main() -> None:
+def main(clock=None) -> None:
+    """`clock` is test-only (scripts/gvd_clock_child.py). None keeps every stdlib clock call."""
     ap = argparse.ArgumentParser(description="GVD supervisor + M2/M3/M4/M5")
     ap.add_argument("--viz", action="store_true")
     ap.add_argument("--smoke", action="store_true")
@@ -488,7 +489,7 @@ def main() -> None:
     from python.sensors.tech import exit_if_tech_connect_failed
 
     exit_if_tech_connect_failed(backend, backend_name)
-    perc = ModularPerception(allow_synthetic=args.allow_synthetic_detect)
+    perc = ModularPerception(allow_synthetic=args.allow_synthetic_detect, clock=clock)
     e2e_policy = make_e2e()
     ui = VizUI()
     ui.record_browser = _ask_strip_folder
@@ -534,7 +535,7 @@ def main() -> None:
     )
 
     print(f"[GVD] camera backend={backend.name} detector={perc.detector.name} actuator={actuator.name}")
-    ident0 = bus_identity()
+    ident0 = bus_identity() if clock is None else bus_identity(now=clock.wall())
     print_py_bus(state_path(), force=True)
     if not ident0.matched:
         print(f"[GVD] link=MISMATCH {ident0.note} — refuse actuation. Steam GELua does not inherit GVD_DOCS_DIR.")
@@ -612,6 +613,8 @@ def main() -> None:
     loop_hz_ema = 0.0
     last_cam_t = time.perf_counter()
     last_loop_t = time.perf_counter()
+    if clock is not None:
+        last_cam_t = last_loop_t = clock.perf()
     # Engage ON counts only on an off->on edge seen this session: a latch or bot file that is
     # already on at start belongs to an earlier session and is refused (latched_before_start).
     latch_seen_off = False
@@ -709,6 +712,8 @@ def main() -> None:
                 print(f"[GVD] --run-seconds {float(args.run_seconds):g} reached; stopping", flush=True)
                 break
             loop_t0 = time.perf_counter()
+            if clock is not None:
+                loop_t0 = clock.perf()
             tick_dt: float | None = None
             if frame_i > 0:
                 dt_loop = max(1e-6, loop_t0 - last_loop_t)
@@ -793,7 +798,7 @@ def main() -> None:
                 ego_source = "beamngpy"
             if vehicle is None:
                 # Retail: the mod echoes electrics (wheelspeed, inputs) through gvd_ego.json.
-                ego_fb = read_ego_feedback()
+                ego_fb = read_ego_feedback() if clock is None else read_ego_feedback(now=clock.wall())
                 if ego_fb is not None and ego_fb.fresh:
                     spd, steer_in = ego_fb.speed_mps, ego_fb.steering_input
                     throttle_in, brake_in = ego_fb.throttle_input, ego_fb.brake_input
@@ -858,13 +863,14 @@ def main() -> None:
             prev_force = bool(ui.debug.force_engage)
             prev_preview = bool(ui.debug.allow_preview)
 
-            bot_on = bot_engage.poll()
+            bot_on = bot_engage.poll() if clock is None else bot_engage.poll(now=clock.wall())
             if bot_on and not prev_bot:
                 print("[GVD] bot engage ON (gvd_bot_engage.json)", flush=True)
             elif prev_bot and not bot_on:
                 print("[GVD] bot engage off", flush=True)
             prev_bot = bot_on
-            latch_on = read_engage_flag(default=False)
+            latch_on = (read_engage_flag(default=False) if clock is None
+                        else read_engage_flag(default=False, now=clock.wall()))
             if not latch_on:
                 latch_seen_off = True
             if not bot_on:
@@ -883,7 +889,7 @@ def main() -> None:
             engaged = requested
             if args.no_engage:
                 engaged = False  # hard disable: nothing above can engage
-            ident = bus_identity()
+            ident = bus_identity() if clock is None else bus_identity(now=clock.wall())
             if not ident.matched:
                 engaged = False
                 # Refuse actuation. Do not guess Drive vs Tech or honor a Python-only override.
@@ -913,7 +919,8 @@ def main() -> None:
                 # The scene graph is the wrong size. Never engage on it, and do not fall back
                 # to the pixel lane finder.
                 engaged = False
-                if read_engage_flag(default=False) or bot_on:
+                if (read_engage_flag(default=False) if clock is None
+                        else read_engage_flag(default=False, now=clock.wall())) or bot_on:
                     bot_engage.clear()
                     write_engage_flag(False, disengage_reason="scene_input_shape")
             if engaged and not prev_engaged:
@@ -1135,6 +1142,7 @@ def main() -> None:
                 ),
                 fresh=echo.fresh if echo_bus else True,
                 gap=echo.gap if echo_bus else False,
+                now=None if clock is None else clock.mono(),
             )
             if ovr.active and not ui.debug.ignore_override:
                 engaged = False
@@ -1304,7 +1312,8 @@ def main() -> None:
             # command its echo belongs to. Gate holds ride along as brake=1 and the car echoes
             # those back just like a real command, so they have to be in here too.
             override.note_command(
-                seq=applied.seq, steer=applied.steer, throttle=applied.throttle, brake=applied.brake
+                seq=applied.seq, steer=applied.steer, throttle=applied.throttle, brake=applied.brake,
+                now=None if clock is None else clock.mono(),
             )
 
             st = default_state(
@@ -1666,6 +1675,10 @@ def main() -> None:
 
             frame_i += 1
             dt = 1.0 / max(args.hz, 1.0)
+            if clock is not None:
+                # Test step barrier: report this tick done, block until the test releases the next.
+                clock.sleep(max(0.0, dt - (clock.perf() - loop_t0)))
+                continue
             time.sleep(max(0.0, dt - (time.perf_counter() - loop_t0)))
     except KeyboardInterrupt:
         print("[GVD] stopped.")

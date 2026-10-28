@@ -412,7 +412,7 @@ class BusIdentity:
         return "ok" if self.matched else "MISMATCH"
 
 
-def bus_identity() -> BusIdentity:
+def bus_identity(*, now: float | None = None) -> BusIdentity:
     """Python write root vs Lua's live ``getUserPath()`` folder.
 
     ``lua_bus`` from a fresh ego/link file is source of truth. The LOCALAPPDATA
@@ -423,7 +423,7 @@ def bus_identity() -> BusIdentity:
     product = gvd_product()
     leftover = tuple(leftover_gvd_json(product))
     other = other_product_state_path(product)
-    live, live_note = read_live_lua_bus()
+    live, live_note = read_live_lua_bus(now=now)
     if live is not None:
         return BusIdentity(
             python_bus=live,

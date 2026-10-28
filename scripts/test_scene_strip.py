@@ -1378,7 +1378,7 @@ def check_pause_checkpoint_roundtrip() -> None:
         assert fields["optimizer"]["param_groups"][0]["lr"] == 0.001
 
         first = TrainWindow()
-        first.load_folder(folder)
+        first.load_folder(folder, checkpoint_path(folder))
         assert first.phase == "paused"
         assert "paused" in first.lines
         assert "step 4" in first.lines
@@ -1394,7 +1394,7 @@ def check_pause_checkpoint_roundtrip() -> None:
         first.close()
 
         again = TrainWindow()
-        again.load_folder(folder)
+        again.load_folder(folder, checkpoint_path(folder))
         assert again.phase == "paused"
         assert "paused" in again.lines
         assert "step 4" in again.lines

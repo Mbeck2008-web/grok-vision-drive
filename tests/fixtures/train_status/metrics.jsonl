@@ -1,0 +1,14 @@
+{"kind": "train", "t": 1790000005.0, "step": 10, "epoch": 0, "loss": 0.8169, "heads": {"lane_gt": 0.8169}, "grad_norm": 1.2, "lr": 0.0009667, "step_s": 0.49, "gpu_mem_bytes": 3382286745, "gpu_util": 90, "nan": 0, "inf": 0}
+{"kind": "train", "t": 1790000010.0, "step": 20, "epoch": 0, "loss": 0.6833, "heads": {"lane_gt": 0.6833}, "grad_norm": 1.2, "lr": 0.0009333, "step_s": 0.48, "gpu_mem_bytes": 3435973836, "gpu_util": 90, "nan": 0, "inf": 0}
+{"kind": "train", "t": 1790000015.0, "step": 30, "epoch": 0, "loss": 0.5739, "heads": {"lane_gt": 0.5739}, "grad_norm": 1.2, "lr": 0.0009, "step_s": 0.47, "gpu_mem_bytes": 3489660928, "gpu_util": 90, "nan": 0, "inf": 0}
+{"kind": "train", "t": 1790000020.0, "step": 40, "epoch": 0, "loss": 0.4844, "heads": {"lane_gt": 0.4844}, "grad_norm": 1.2, "lr": 0.0008667, "step_s": 0.46, "gpu_mem_bytes": 3543348019, "gpu_util": 90, "nan": 0, "inf": 0}
+{"kind": "train", "t": 1790000025.0, "step": 50, "epoch": 0, "loss": 0.4111, "heads": {"lane_gt": 0.4111}, "grad_norm": 1.2, "lr": 0.0008333, "step_s": 0.45, "gpu_mem_bytes": 3597035110, "gpu_util": 90, "nan": 0, "inf": 0}
+{"kind": "train", "t": 1790000030.0, "step": 60, "epoch": 0, "loss": 0.3511, "heads": {"lane_gt": 0.3511}, "grad_norm": 1.2, "lr": 0.0008, "step_s": 0.44, "gpu_mem_bytes": 3650722201, "gpu_util": 90, "nan": 0, "inf": 0}
+{"kind": "val", "t": 1790000031.0, "step": 60, "epoch": 0, "loss": 0.4038, "n": 40, "r": 0.8, "rms": 0.2, "rms_mean": 0.2, "bias": 0.01}
+{"kind": "train", "t": 1790000035.0, "step": 70, "epoch": 1, "loss": 0.3019, "heads": {"lane_gt": 0.3019}, "grad_norm": 1.2, "lr": 0.0007667, "step_s": 0.43, "gpu_mem_bytes": 3704409292, "gpu_util": 90, "nan": 0, "inf": 0}
+{"kind": "train", "t": 1790000040.0, "step": 80, "epoch": 1, "loss": 0.2617, "heads": {"lane_gt": 0.2617}, "grad_norm": 1.2, "lr": 0.0007333, "step_s": 0.42, "gpu_mem_bytes": 3758096384, "gpu_util": 90, "nan": 0, "inf": 0}
+{"kind": "train", "t": 1790000045.0, "step": 90, "epoch": 1, "loss": 0.2288, "heads": {"lane_gt": 0.2288}, "grad_norm": 1.2, "lr": 0.0007, "step_s": 0.41, "gpu_mem_bytes": 3811783475, "gpu_util": 90, "nan": 0, "inf": 0}
+{"kind": "train", "t": 1790000050.0, "step": 100, "epoch": 1, "loss": 0.2018, "heads": {"lane_gt": 0.2018}, "grad_norm": 1.2, "lr": 0.0006667, "step_s": 0.4, "gpu_mem_bytes": 3865470566, "gpu_util": 90, "nan": 0, "inf": 0}
+{"kind": "train", "t": 1790000055.0, "step": 110, "epoch": 1, "loss": 0.1797, "heads": {"lane_gt": 0.1797}, "grad_norm": 1.2, "lr": 0.0006333, "step_s": 0.39, "gpu_mem_bytes": 3919157657, "gpu_util": 90, "nan": 0, "inf": 0}
+{"kind": "train", "t": 1790000060.0, "step": 120, "epoch": 1, "loss": 0.1616, "heads": {"lane_gt": 0.1616}, "grad_norm": 1.2, "lr": 0.0006, "step_s": 0.38, "gpu_mem_bytes": 3972844748, "gpu_util": 90, "nan": 0, "inf": 0}
+{"kind": "val", "t": 1790000061.0, "step": 120, "epoch": 1, "loss": 0.1858, "n": 40, "r": 0.8, "rms": 0.2, "rms_mean": 0.2, "bias": 0.01}

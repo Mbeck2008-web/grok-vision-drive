@@ -1880,7 +1880,7 @@ def train_directory(
         view = TrainWindow()
     if pause_dir is not None:
         print(f"[GVD] pause file: {checkpoint_path(root, pause_dir)}", flush=True)
-    view.load_folder(root, pause_dir=pause_dir)
+    view.load_folder(root, checkpoint_path(root, pause_dir))
     # The CLI epoch count is not the stop. The holdout decides.
     requested_epochs = int(epochs)
 
@@ -1981,6 +1981,7 @@ def train_directory(
 
     device = holder["device"]
     net = holder["net"]
+    view.set_net(net)
     # Each shuffled window starts from a reset GRU, so several windows fit
     # in one step. parallel_fit is how many this free VRAM can hold.
     parallel_fit = 0
@@ -2024,6 +2025,7 @@ def train_directory(
 
     debug_dir = status_dir(status_root)
     run_started = time.time()
+    view.load_status_dir(debug_dir, since=run_started)
     from python.train.epoch_ckpt import DEFAULT_MIN_FREE_GB, GB, default_ckpt_dir, run_id
 
     epoch_run = run_id(run_started)

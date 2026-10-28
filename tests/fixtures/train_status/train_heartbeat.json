@@ -1,0 +1,17 @@
+{
+ "kind": "train",
+ "started": 1790000000.0,
+ "updated": 1790000061.0,
+ "step": 120,
+ "epoch": 1,
+ "epochs": 4,
+ "loss": 0.1616,
+ "eta_s": 120.0,
+ "eta_pass_s": null,
+ "steps_per_epoch": 60,
+ "supervised": 120,
+ "windows": 120,
+ "lr": 0.0006,
+ "device": "cuda",
+ "strips": "scene_demo"
+}

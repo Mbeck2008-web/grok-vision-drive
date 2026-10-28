@@ -129,6 +129,7 @@ def check_scoped_io() -> None:
 
 
 def check_window() -> None:
+    from python.train.checkpoint import checkpoint_path
     from python.train.status_window import TrainWindow
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -136,7 +137,7 @@ def check_window() -> None:
         before = _sha(original)
         window = TrainWindow()
         # The original is not an npz: reading it would raise.
-        window.load_folder(strips, pause_dir=Path(tmp) / "scratch" / "pause")
+        window.load_folder(strips, checkpoint_path(strips, Path(tmp) / "scratch" / "pause"))
         assert window.phase == "idle"
         assert _sha(original) == before
     print("panel: load_folder reads only --pause-dir OK")

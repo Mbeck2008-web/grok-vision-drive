@@ -20,6 +20,7 @@ import contextlib
 import faulthandler
 import math
 import os
+import random
 import sys
 import time
 import traceback
@@ -285,6 +286,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Cell list JSON. Loaded when it exists, else chosen and written. Default: <status dir>/holdout_cells.json.",
     )
     parser.add_argument("--holdout-seed", type=int, default=0, help="Seed for choosing --holdout-cells.")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help=(
+            "Training seed: torch init, the augment / window-order numpy streams, Python random, and "
+            "the DataLoader workers. Default 0 is the old fixed seeding. The holdout does not use it "
+            "(--holdout-seed). Not bit-reproducible: cudnn stays non-deterministic on GPU."
+        ),
+    )
     parser.add_argument(
         "--conf-weight",
         type=float,
@@ -1585,6 +1596,22 @@ def _release_worker_handles(worker_id: int) -> None:
     del worker_id
 
 
+def _init_worker(worker_id: int) -> None:
+    """Seed a loader worker's numpy and Python RNGs from its torch seed."""
+    import torch
+
+    _release_worker_handles(worker_id)
+    worker_seed = int(torch.initial_seed()) % (2**32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def run_rng_seeds(seed: int) -> tuple[int, int]:
+    """(augment, window-order) numpy seeds for ``--seed``. Seed 0 gives (0, 1), as before."""
+    base = (2 * int(seed)) % (2**32)
+    return base, (base + 1) % (2**32)
+
+
 class _EpochWindows:
     """One training window per index. Workers decode; the step stays on the parent."""
 
@@ -1674,7 +1701,7 @@ def _prefetch_loader(items: list[dict[str, Any]], root: Path, cams, cache, scale
         batch_size=1,
         shuffle=False,
         collate_fn=_first_item,
-        worker_init_fn=_release_worker_handles,
+        worker_init_fn=_init_worker,
         **settings,
     )
 
@@ -1711,6 +1738,7 @@ def train_directory(
     holdout_cells: bool = False,
     holdout_cells_file: Path | None = None,
     holdout_seed: int = 0,
+    seed: int = 0,
     conf_weight: float = DEFAULT_CONF_WEIGHT,
     init_head_bias: bool = False,
     eval_chunk: int = CHUNK_MAX,
@@ -1747,8 +1775,11 @@ def train_directory(
     if use_cam_age and cache is not None and float(getattr(cache, "scale", 1.0)) < 0.999:
         raise SystemExit("--cam-age reads a cache at scale 1 only (sector parity with the live strip is proven there)")
     use_augment = bool(augment) and not bool(sanity) and not bool(dry_run)
-    augment_rng = np.random.RandomState(0)
-    window_rng = np.random.RandomState(1)
+    augment_seed, window_seed = run_rng_seeds(int(seed))
+    augment_rng = np.random.RandomState(augment_seed)
+    window_rng = np.random.RandomState(window_seed)
+    random.seed(int(seed))
+    print(f"[GVD] seed={int(seed)}", flush=True)
     grad_clip = float(clip)
     lane_kind = str(lane_loss or "huber")
     input_scale = float(scale) if float(scale) > 0.0 else 1.0
@@ -1920,7 +1951,7 @@ def train_directory(
         n_windows=1,
         window_strips=chunk_len,
     )
-    torch.manual_seed(0)
+    torch.manual_seed(int(seed))
     holder: dict[str, Any] = {}
 
     def _arm(device_name: str, learning_rate: float | None = None) -> None:
@@ -2885,6 +2916,7 @@ def main(argv: list[str] | None = None) -> None:
                 holdout_cells=bool(args.holdout_cells),
                 holdout_cells_file=Path(args.holdout_cells_file) if args.holdout_cells_file else None,
                 holdout_seed=int(args.holdout_seed),
+                seed=int(args.seed),
                 conf_weight=float(args.conf_weight),
                 init_head_bias=bool(args.init_head_bias),
                 eval_chunk=int(args.eval_chunk),

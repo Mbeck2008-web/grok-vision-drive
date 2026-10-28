@@ -391,7 +391,7 @@ class TrainWindow:
         self._shown = True
         self._paint()
 
-    def load_folder(self, root: Path | str) -> None:
+    def load_folder(self, root: Path | str, *, pause_dir: Path | str | None = None) -> None:
         """Read recorded time from ``root`` and show it. Does not write the folder.
 
         A pause file beside the folder shows paused, with that run's loss curve.
@@ -399,7 +399,7 @@ class TrainWindow:
         from python.train.checkpoint import load_checkpoint
 
         self._folder = Path(root)
-        loaded = load_checkpoint(self._folder)
+        loaded = load_checkpoint(self._folder, pause_dir=pause_dir)
         if loaded is not None:
             self._remember_pause(loaded)
         else:

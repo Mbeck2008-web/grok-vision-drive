@@ -12,8 +12,13 @@
   is ignored and the panel is idle.
 * val tail: only whole ``kind == "val"`` rows, only this run's (``since``),
   a half-written line waits, a truncated file starts over.
+* labels: memory reads "system RAM used" and "trainer RSS", val reads
+  "val since this launch"; a replay samples no host RAM or RSS.
+* driving: two flat lines on separate scales stay visible (offset by the drawn line height).
 * read-only: fixture hashes and mtimes are unchanged, and the module has no
   file writes outside the replay PNG and no training-control writes.
+* replay PNG: create-only, reachable only from ``main`` (``--replay``), refuses
+  an existing ``--out`` and any ``--out`` under the data root.
 * headless: ``GVD_HEADLESS=1`` and no-``DISPLAY`` dry runs pass with
   ``cv2.namedWindow`` patched to raise.
 """
@@ -158,8 +163,91 @@ def check_replay() -> None:
     assert len(want_val) == 2 and window.series["val"] == want_val, window.series["val"]
     assert len(window.losses) == 12 and len(window.series["vram"]) == 12
     assert len(window.series["ram"]) == 12 and all(v > 0 for v in window.series["ram"])
+    assert len(window.series["rss"]) == 12 and all(v > 0 for v in window.series["rss"])
     assert "frames 0" in window.lines
+
+    replayed = sw.TrainWindow(live_host=False)
+    for status in sw.replay_statuses(FIXTURE):
+        replayed.update(status)
+    assert replayed.series["ram"] == [] and replayed.series["rss"] == [] and len(replayed.series["vram"]) == 12
     print(f"replay: six graphs drawn {drawn}; empty dir all idle; no window OK")
+
+
+def check_labels_and_driving_offset() -> None:
+    from python.train import status_window as sw
+
+    labels = {key: label for _name, _title, keys, _shared in sw.GRAPHS for key, label, _color, _fmt in keys}
+    assert labels["ram"] == "system RAM used" and labels["rss"] == "trainer RSS", labels
+    assert labels["val"] == "val since this launch", labels
+    status = sw.TrainStatus(
+        eta_s=None, loss=None, lr=0.0, steps_per_sec=0.0, memory_bytes=2**30, memory_kind="ram",
+        device="cpu", batch=1, recommended=False, step=0, steps=1,
+    )
+    assert "\nsystem RAM 1.00 GB used\n" in sw.format_status(status), sw.format_status(status)
+
+    panel = sw.render_train_panel([], [], series={"hours": [2.0, 2.0, 2.0], "frames": [900.0, 900.0, 900.0]})
+    x0, y0, x1, y1 = sw.loss_plot_box(sw.graph_boxes(panel.shape[0], panel.shape[1])["driving"])
+    crop = panel[y0 - sw.LINE_W : y1 + 1, x0 : x1 + 1].reshape(-1, 3)  # a line at the top sits on y0
+    seen = {name: int(np.all(crop == np.array(color, dtype=np.uint8), axis=1).sum()) for name, color in (("hours", sw.ICE), ("frames", sw.AMBER))}
+    assert seen["hours"] > 0 and seen["frames"] > 0, seen
+    print(f"labels: system RAM used / trainer RSS / val since this launch; flat driving lines both visible {seen} OK")
+
+
+def check_replay_out() -> None:
+    from python.train import status_window as sw
+
+    text = (ROOT / "python" / "train" / "status_window.py").read_text(encoding="utf-8")
+    assert "cv2.imwrite" not in text
+    assert len(re.findall(r"open\([^)]*[\"']xb[\"']", text)) == 1
+    calls = [m.start() for m in re.finditer(r"_write_png_create_only\(", text)]
+    defs = [m.start() for m in re.finditer(r"def _write_png_create_only\(", text)]
+    main_at = text.index("def main(")
+    assert len(defs) == 1 and len(calls) == 2 and [c for c in calls if c not in [d + 4 for d in defs]][0] > main_at
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            sw.main(["--out", "x.png"])
+        raise AssertionError("main without --replay must exit")
+    except SystemExit as exc:
+        assert exc.code == 2
+
+    saved = os.environ.get("GVD_DATA_DIR")
+    with _no_window(), tempfile.TemporaryDirectory() as tmp:
+        try:
+            data = Path(tmp) / "data"
+            (data / "status").mkdir(parents=True)
+            os.environ["GVD_DATA_DIR"] = str(data)
+            existing = Path(tmp) / "keep.png"
+            existing.write_bytes(b"not a png")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = sw.main(["--replay", str(FIXTURE), "--out", str(existing)])
+            assert code == 2 and existing.read_bytes() == b"not a png", (code, out.getvalue())
+            assert "already exists" in out.getvalue()
+
+            for target in (data / "status" / "panel.png", data / "panel.png", data / ".." / "data" / "x.png"):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    code = sw.main(["--replay", str(FIXTURE), "--out", str(target)])
+                assert code == 2 and not target.exists(), (target, code, out.getvalue())
+                assert "under the data root" in out.getvalue(), out.getvalue()
+            link = Path(tmp) / "into_data"
+            link.symlink_to(data / "status")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = sw.main(["--replay", str(FIXTURE), "--out", str(link / "via_link.png")])
+            assert code == 2 and not (data / "status" / "via_link.png").exists(), out.getvalue()
+
+            fresh = Path(tmp) / "fresh.png"
+            with contextlib.redirect_stdout(io.StringIO()):
+                assert sw.main(["--replay", str(FIXTURE), "--out", str(fresh)]) == 0
+            assert fresh.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+            assert sorted(p.name for p in data.rglob("*")) == ["status"]
+        finally:
+            if saved is None:
+                os.environ.pop("GVD_DATA_DIR", None)
+            else:
+                os.environ["GVD_DATA_DIR"] = saved
+    print("replay --out: create-only; refuses an existing file and the data root (incl. via symlink) OK")
 
 
 def check_pause_path() -> None:
@@ -265,7 +353,7 @@ def check_read_only() -> None:
         text,
     )
     assert writes == [], writes
-    assert text.count("cv2.imwrite(") == 1  # only the --replay --out PNG
+    assert "cv2.imwrite" not in text  # the replay PNG goes through the create-only writer
     control = re.findall(
         r"(?:\blr|batch|seed|loss)\w*\s*\[[^]]*\]\s*=(?!=)|param_groups|manual_seed|\.step\(\)|backward\(",
         text,
@@ -320,6 +408,8 @@ def main() -> None:
     check_params_live_net()
     check_theme_imported()
     check_replay()
+    check_labels_and_driving_offset()
+    check_replay_out()
     check_pause_path()
     check_val_tail()
     check_read_only()

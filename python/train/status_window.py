@@ -6,12 +6,15 @@ time left, loss, learning rate, steps per second, the memory in use, and the
 parameter count of the net it was handed. Start begins a run. Pause writes the
 pause file at the path the trainer passed in and the panel says paused.
 
-Six graphs share one painter: time left, steps/s, lr, memory (VRAM and this
-process's RAM sample), driving (hours and frames) and loss (train, plus val
-rows tailed read-only from the run's ``metrics.jsonl``). There is no server.
+Six graphs share one painter: time left, steps/s, lr, memory (VRAM, system
+RAM used and the trainer's own RSS, sampled in this process), driving (hours
+and frames) and loss (train, plus val rows since this launch, tailed read-only
+from the run's ``metrics.jsonl``). There is no server.
 
 ``python -m python.train.status_window --replay <status dir> --out <png>``
-renders the panel from a finished run's files without opening a window.
+renders the panel from a finished run's files without opening a window. The
+PNG is the only file this module writes: create-only, never over an existing
+file, never under the data root.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,9 +34,13 @@ import numpy as np
 # Same ground, type, and rhythm as the supervisor nerd panel: imported, not copied.
 from python.viz.nerd import BG, DIM, FG, FONT, FS_BODY, FS_DIM, FS_TITLE, ICE, PAD_X, ROW_H, TH
 from python.viz.nerd import BRK_COLOR as WARN
+from python.viz.nerd import BRK_PRED_COLOR as VIOLET
 from python.viz.nerd import NERD_WIDTH as PANEL_W
 from python.viz.nerd import THR_PRED_COLOR as AMBER
 
+RAM_LABEL = "system RAM used"
+RSS_LABEL = "trainer RSS"
+VAL_LABEL = "val since this launch"
 GRAPH_FILL = (28, 24, 22)
 GRAPH_EDGE = (70, 64, 58)
 PANEL_H = 520
@@ -40,6 +48,7 @@ GRAPH_H = 168
 SMALL_H = 84
 GAP = 8
 HISTORY_N = 2000
+LINE_W = 2
 WIN_NAME = "GVD TRAIN"
 
 
@@ -223,7 +232,9 @@ def parameter_fact(net: Any = None) -> str:
 
 def format_status(status: TrainStatus, *, params: str | None = None) -> str:
     loss = "--" if status.loss is None else f"{status.loss:.4f}"
-    kind = "VRAM" if status.memory_kind == "vram" else "RAM"
+    memory = format_bytes(status.memory_bytes)
+    # Same words as the memory graph's caption, with the amount inside.
+    memory_row = f"VRAM {memory}" if status.memory_kind == "vram" else f"system RAM {memory} used"
     note = "recommended" if status.recommended else "not recommended"
     return "\n".join(
         (
@@ -234,7 +245,7 @@ def format_status(status: TrainStatus, *, params: str | None = None) -> str:
             f"loss {loss}",
             f"lr {status.lr:.6g}",
             f"steps/s {status.steps_per_sec:.2f}",
-            f"{kind} {format_bytes(status.memory_bytes)}",
+            memory_row,
             f"{status.device}  batch {int(status.batch)}  {note}",
             parameter_fact() if params is None else params,
         )
@@ -301,6 +312,15 @@ def _put(img: np.ndarray, text: str, xy: tuple[int, int], scale: float, color: t
     cv2.putText(img, text, xy, FONT, scale, color, TH, cv2.LINE_AA)
 
 
+def _put_part(img: np.ndarray, text: str, x: int, baseline: int, right: int, color: Color) -> int:
+    """One caption part at ``x``, cut to fit before ``right``. Returns the next ``x``."""
+    if x >= right:
+        return x
+    text = _fit(text, right - x, FS_DIM)
+    _put(img, text, (x, baseline), FS_DIM, color)
+    return x + _text_size(text + "  ", FS_DIM)[0]
+
+
 def _fmt_rate(value: float) -> str:
     return f"{value:.2f}"
 
@@ -339,8 +359,13 @@ GRAPHS: tuple[tuple[str, str, tuple[tuple[str, str, Color, Fmt], ...], bool], ..
     ("sps", "steps/s", (("sps", "", ICE, _fmt_rate),), False),
     ("lr", "lr", (("lr", "", ICE, _fmt_lr),), False),
     ("driving", "driving", (("hours", "", ICE, _fmt_hours), ("frames", "", AMBER, _fmt_frames)), False),
-    ("memory", "memory", (("vram", "VRAM", ICE, _fmt_bytes), ("ram", "RAM", AMBER, _fmt_bytes)), True),
-    ("loss", "loss", (("train", "", ICE, _fmt_loss), ("val", "val", AMBER, _fmt_loss)), True),
+    (
+        "memory",
+        "memory",
+        (("vram", "VRAM", ICE, _fmt_bytes), ("ram", RAM_LABEL, AMBER, _fmt_bytes), ("rss", RSS_LABEL, VIOLET, _fmt_bytes)),
+        True,
+    ),
+    ("loss", "loss", (("train", "", ICE, _fmt_loss), ("val", VAL_LABEL, AMBER, _fmt_loss)), True),
 )
 SERIES_KEYS: tuple[str, ...] = tuple(series[0] for graph in GRAPHS for series in graph[2])
 
@@ -394,16 +419,27 @@ def _paint_series(
     if not drawn:
         _put(img, _fit(f"{title}  --", x1 - x0 - 16, FS_DIM), (x0 + 8, y0 + 22), FS_DIM, DIM)
         return
-    parts = [title] + [f"{label} {fmt(values[-1])}".strip() for label, values, _color, fmt in drawn]
-    _put(img, _fit("  ".join(parts), x1 - x0 - 16, FS_DIM), (x0 + 8, y0 + 22), FS_DIM, FG)
+    # The caption is the legend: each value is written in its line's color.
+    x = x0 + 8
+    right = x1 - 8
+    if len(drawn) < 3:
+        # Three labelled values fill a full-width caption; the labels name the graph.
+        x = _put_part(img, title, x, y0 + 22, right, FG)
+    for label, values, color, fmt in drawn:
+        x = _put_part(img, f"{label} {fmt(values[-1])}".strip(), x, y0 + 22, right, color if len(drawn) > 1 else FG)
     ymax = max(max(values) for _label, values, _color, _fmt in drawn) if shared else None
     plot = loss_plot_box(box)
-    for _label, values, color, _fmt in drawn:
+    for index, (_label, values, color, _fmt) in enumerate(drawn):
         points = loss_polyline(values, plot, ymax)
+        if not shared and index:
+            # Separate scales can land on the same pixels (two flat lines). Nudge each
+            # later line by the drawn line height so the one under it stays visible.
+            nudge = index * (LINE_W + 1)  # an anti-aliased line covers LINE_W + 1 rows
+            points = [(px, py - nudge if py - nudge >= plot[1] else py + nudge) for px, py in points]
         if len(points) == 1:
             cv2.circle(img, points[0], 3, color, -1, cv2.LINE_AA)
         elif points:
-            cv2.polylines(img, [np.array(points, dtype=np.int32)], False, color, 2, cv2.LINE_AA)
+            cv2.polylines(img, [np.array(points, dtype=np.int32)], False, color, LINE_W, cv2.LINE_AA)
 
 
 def _button(
@@ -486,7 +522,10 @@ def read_pause_file(path: Path | str) -> dict[str, Any] | None:
 class TrainWindow:
     """OpenCV panel in the supervisor's type. ``open`` does nothing without a display."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, live_host: bool = True) -> None:
+        # Host RAM and RSS are sampled only for a live trainer. A replay has no
+        # host samples to draw, and this machine's numbers would be wrong there.
+        self.live_host = bool(live_host)
         self.lines = ""
         self.recorded_s = 0.0
         self.recorded_frames = 0
@@ -722,9 +761,12 @@ class TrainWindow:
         self._sample("lr", status.lr)
         if status.memory_kind == "vram":
             self._sample("vram", status.memory_bytes)
-            self._sample("ram", self.sample_ram())
+            if self.live_host:
+                self._sample("ram", self.sample_ram())
         else:
             self._sample("ram", status.memory_bytes)
+        if self.live_host:
+            self._sample("rss", self.sample_rss())
         self._sample("hours", self.recorded_s / 3600.0)
         self._sample("frames", self.recorded_frames)
         self._tail_val()
@@ -740,6 +782,11 @@ class TrainWindow:
             return int(read_used_ram_bytes())
         except Exception:
             return None
+
+    @staticmethod
+    def sample_rss() -> int | None:
+        """This process's resident set (the trainer's own RSS). ``None`` when unknown."""
+        return trainer_rss_bytes()
 
     def _paint(self) -> None:
         self.panel = render_train_panel(
@@ -798,6 +845,21 @@ class TrainWindow:
             cv2.destroyWindow(WIN_NAME)
         except Exception:
             pass
+
+
+def trainer_rss_bytes() -> int | None:
+    """Resident set size of this process: psutil, else Linux ``/proc/self/statm``."""
+    try:
+        import psutil  # type: ignore[import-not-found]
+
+        return int(psutil.Process().memory_info().rss)
+    except Exception:
+        pass
+    try:
+        pages = int(Path("/proc/self/statm").read_text(encoding="ascii").split()[1])
+        return pages * int(os.sysconf("SC_PAGE_SIZE"))
+    except (OSError, ValueError, IndexError, AttributeError):
+        return None
 
 
 def _read_json_lines(path: Path) -> list[dict[str, Any]]:
@@ -860,7 +922,7 @@ def render_replay(
     status_dir: Path | str, *, strips: Path | str | None = None, pause: Path | str | None = None
 ) -> np.ndarray:
     """Panel image from a run's files. No window is opened and nothing is written."""
-    window = TrainWindow()
+    window = TrainWindow(live_host=False)
     window._apply_lines()
     if strips is not None:
         window.load_folder(strips)
@@ -875,6 +937,48 @@ def render_replay(
     return window.panel
 
 
+def _data_root_path() -> Path:
+    """``data_root()``; when it refuses the drive, the configured path itself."""
+    from python.data.data_root import DEFAULT_DATA_DIR, data_root
+
+    try:
+        return data_root()
+    except Exception:
+        raw = os.environ.get("GVD_DATA_DIR", "").strip()
+        return Path(raw) if raw else DEFAULT_DATA_DIR
+
+
+def _under(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def replay_out_refusal(out: Path | str) -> str | None:
+    """Why ``--out`` may not be written, or ``None``. Checked before rendering."""
+    path = Path(out)
+    if path.exists() or path.is_symlink():
+        return "it already exists"
+    root = _data_root_path()
+    for candidate, base in ((path.absolute(), root.absolute()), (path.resolve(), root.resolve())):
+        if _under(candidate, base):
+            return f"it is under the data root {root}"
+    if not path.parent.is_dir():
+        return "its folder does not exist"
+    return None
+
+
+def _write_png_create_only(out: Path, panel: np.ndarray) -> None:
+    """The module's one file write. Exclusive create: an existing file is never replaced."""
+    ok, png = cv2.imencode(".png", panel)
+    if not ok:
+        raise ValueError("PNG encode failed")
+    with open(out, "xb") as handle:
+        handle.write(png.tobytes())
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Render the GVD TRAIN panel from a run's files (no window).")
     parser.add_argument("--replay", required=True, help="the run's status folder (metrics.jsonl, heartbeat)")
@@ -882,11 +986,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--pause", default="", help="pause file to show as paused")
     parser.add_argument("--out", required=True, help="PNG to write")
     args = parser.parse_args(argv)
-    panel = render_replay(args.replay, strips=args.strips or None, pause=args.pause or None)
     out = Path(args.out)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    if not cv2.imwrite(str(out), panel):
-        print(f"[GVD] replay: could not write {out}", flush=True)
+    refusal = replay_out_refusal(out)
+    if refusal:
+        print(f"[GVD] replay: refused --out {out}: {refusal}", flush=True)
+        return 2
+    panel = render_replay(args.replay, strips=args.strips or None, pause=args.pause or None)
+    try:
+        _write_png_create_only(out, panel)
+    except FileExistsError:
+        print(f"[GVD] replay: refused --out {out}: it already exists", flush=True)
+        return 2
+    except (OSError, ValueError) as exc:
+        print(f"[GVD] replay: could not write {out}: {exc}", flush=True)
         return 1
     print(f"[GVD] replay panel {panel.shape[1]}x{panel.shape[0]} -> {out}", flush=True)
     return 0

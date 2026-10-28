@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
+from typing import BinaryIO
 
 PNG_SIG = b"\x89PNG\r\n\x1a\n"
+# Read size for the copy fallback of ``link_or_copy_new``.
+COPY_CHUNK = 1 << 20
 
 
 def os_binary() -> int:
@@ -119,3 +123,53 @@ def _temp_name(path: Path) -> Path:
         if not cand.exists():
             return cand
     raise OSError(f"no temp name next to {path}")
+
+
+def _write_chunk(handle: BinaryIO, data: bytes) -> None:
+    """One copy write of ``link_or_copy_new`` (a test seam)."""
+    handle.write(data)
+
+
+def link_or_copy_new(src: Path | str, dst: Path | str) -> None:
+    """Move ``src`` to the new name ``dst``, create-only. Never renames.
+
+    A hard link is tried first. A filesystem without hard links (FAT32, exFAT,
+    some network mounts) gets a copy into ``dst`` opened with ``"xb"`` (O_EXCL),
+    so an existing ``dst`` is refused at the final step and never replaced.
+    ``FileExistsError`` is raised as is. A failed copy removes only the ``dst``
+    it created and leaves ``src`` intact; ``src`` is removed only after ``dst``
+    is complete and fsynced.
+    """
+    src = Path(src)
+    dst = Path(dst)
+    try:
+        os.link(src, dst)
+    except FileExistsError:
+        raise
+    except OSError:
+        pass
+    else:
+        src.unlink()
+        return
+    handle = open(dst, "xb")
+    created = True
+    try:
+        with open(src, "rb") as source:
+            while True:
+                data = source.read(COPY_CHUNK)
+                if not data:
+                    break
+                _write_chunk(handle, data)
+        handle.flush()
+        os.fsync(handle.fileno())
+        handle.close()
+        want = os.stat(src).st_size
+        got = os.stat(dst).st_size
+        if got != want:
+            raise OSError(errno.EIO, f"copy size mismatch for {dst}: {got} bytes, source {want}")
+    except BaseException:
+        handle.close()
+        if created:
+            _unlink_quiet(dst)
+        raise
+    src.unlink()

@@ -912,7 +912,7 @@ def check_follow_lua_bus() -> None:
             USERPROFILE=str(td_path / "Users" / "Name"),
             HOME=None,
         ):
-            _plant_lua_bus(predicted, age_s=2.5)
+            _plant_lua_bus(predicted, age_s=paths.LUA_BUS_FRESH_S + 60)  # clear of FAT32 2 s mtime steps
             ident = paths.bus_identity()
             assert ident.matched is False, ident
             assert ident.link == "MISMATCH"
@@ -950,9 +950,10 @@ def check_follow_lua_bus() -> None:
 
 def check_lua_harness() -> None:
     for exe in ("lua5.1", "luajit", "lua"):
-        if shutil.which(exe):
+        lua = shutil.which(exe)
+        if lua:
             res = subprocess.run(
-                [exe, "scripts/test_gvd_docs_dir.lua"],
+                [lua, "scripts/test_gvd_docs_dir.lua"],
                 cwd=str(ROOT),
                 capture_output=True,
                 text=True,
@@ -962,7 +963,7 @@ def check_lua_harness() -> None:
                 res.stdout + res.stderr
             )
             link = subprocess.run(
-                [exe, "scripts/test_gvd_state_link.lua"],
+                [lua, "scripts/test_gvd_state_link.lua"],
                 cwd=str(ROOT),
                 capture_output=True,
                 text=True,

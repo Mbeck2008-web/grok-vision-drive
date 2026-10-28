@@ -1601,6 +1601,12 @@ class _EpochWindows:
     def __len__(self) -> int:
         return len(self.items)
 
+    def close(self) -> None:
+        """Close and drop this process's cache maps (a later read reopens a fresh cache)."""
+        cache, self._cache = self._cache, None
+        if cache is not None:
+            cache.close()
+
     def _reader(self) -> Any:
         if self._cache is None and self.cache_dir:
             from python.train.frame_cache import FrameCache
@@ -2790,99 +2796,103 @@ def main(argv: list[str] | None = None) -> None:
         )
         return
     frame_cache = FrameCache(args.cache) if args.cache else None
-    if frame_cache is not None and frame_cache.stale:
-        print(f"[GVD] scene train: cache refused: {frame_cache.reason}", flush=True)
-        sys.exit(2)
-    export_path = None if args.export is None else Path(args.export)
-    if export_path is not None and not args.strips:
+    try:
+        if frame_cache is not None and frame_cache.stale:
+            print(f"[GVD] scene train: cache refused: {frame_cache.reason}", flush=True)
+            sys.exit(2)
+        export_path = None if args.export is None else Path(args.export)
+        if export_path is not None and not args.strips:
+            try:
+                check_data_path(export_path)
+            except DataDriveError as exc:
+                print(f"[GVD] scene train: {exc}")
+                sys.exit(2)
+            if not torch_ready():
+                print("[GVD] scene export needs PyTorch")
+                sys.exit(2)
+            path = export_scene_onnx(export_path, cams=cam_names, heads=head_names, cam_age=bool(args.cam_age))
+            print(f"[GVD] exported {path}")
+            return
+        if not args.strips:
+            args.strips = str(scene_lanes_dir())
         try:
-            check_data_path(export_path)
+            check_data_path(args.strips)
+            if export_path is not None:
+                check_data_path(export_path)
         except DataDriveError as exc:
             print(f"[GVD] scene train: {exc}")
             sys.exit(2)
         if not torch_ready():
-            print("[GVD] scene export needs PyTorch")
+            print("[GVD] scene train needs PyTorch")
             sys.exit(2)
-        path = export_scene_onnx(export_path, cams=cam_names, heads=head_names, cam_age=bool(args.cam_age))
-        print(f"[GVD] exported {path}")
-        return
-    if not args.strips:
-        args.strips = str(scene_lanes_dir())
-    try:
-        check_data_path(args.strips)
-        if export_path is not None:
-            check_data_path(export_path)
-    except DataDriveError as exc:
-        print(f"[GVD] scene train: {exc}")
-        sys.exit(2)
-    if not torch_ready():
-        print("[GVD] scene train needs PyTorch")
-        sys.exit(2)
-    open_panel, start_now = resolve_panel(no_panel=bool(args.no_panel), autostart=bool(args.autostart))
-    if not open_panel:
-        print("[GVD] scene train: no panel", flush=True)
-    try:
-        stats = train_directory(
-            Path(args.strips),
-            epochs=args.epochs,
-            lr=args.lr,
-            capability=args.capability,
-            export_path=export_path,
-            resume=not bool(args.no_resume),
-            sanity=bool(args.sanity) and not bool(args.dry_run),
-            dry_run=bool(args.dry_run),
-            metrics_every=int(args.metrics_every),
-            autostart=start_now,
-            open_panel=open_panel,
-            cams=cam_names,
-            heads=head_names,
-            cache=frame_cache,
-            augment=bool(args.augment),
-            clip=float(args.clip),
-            lane_loss=str(args.lane_loss),
-            balance=bool(args.balance),
-            min_valid=float(args.min_valid),
-            workers=default_num_workers() if args.workers is None else int(args.workers),
-            scale=float(args.scale),
-            batch_size=int(args.batch),
-            holdout_blocks=resolve_holdout_blocks(args.holdout_blocks),
-            holdout_cells=bool(args.holdout_cells),
-            holdout_cells_file=Path(args.holdout_cells_file) if args.holdout_cells_file else None,
-            holdout_seed=int(args.holdout_seed),
-            conf_weight=float(args.conf_weight),
-            init_head_bias=bool(args.init_head_bias),
-            eval_chunk=int(args.eval_chunk),
-            backbone=str(args.backbone),
-            freeze_backbone=bool(args.freeze_backbone),
-            backbone_lr_mult=float(args.backbone_lr_mult),
-            mask_events=bool(args.mask_events),
-            mask_files=str(args.mask_files or ""),
-            ckpt_dir=Path(args.ckpt_dir) if args.ckpt_dir else None,
-            ckpt_min_free_gb=args.ckpt_min_free_gb,
-            cam_age=bool(args.cam_age),
-            grad_ckpt=bool(args.grad_ckpt),
+        open_panel, start_now = resolve_panel(no_panel=bool(args.no_panel), autostart=bool(args.autostart))
+        if not open_panel:
+            print("[GVD] scene train: no panel", flush=True)
+        try:
+            stats = train_directory(
+                Path(args.strips),
+                epochs=args.epochs,
+                lr=args.lr,
+                capability=args.capability,
+                export_path=export_path,
+                resume=not bool(args.no_resume),
+                sanity=bool(args.sanity) and not bool(args.dry_run),
+                dry_run=bool(args.dry_run),
+                metrics_every=int(args.metrics_every),
+                autostart=start_now,
+                open_panel=open_panel,
+                cams=cam_names,
+                heads=head_names,
+                cache=frame_cache,
+                augment=bool(args.augment),
+                clip=float(args.clip),
+                lane_loss=str(args.lane_loss),
+                balance=bool(args.balance),
+                min_valid=float(args.min_valid),
+                workers=default_num_workers() if args.workers is None else int(args.workers),
+                scale=float(args.scale),
+                batch_size=int(args.batch),
+                holdout_blocks=resolve_holdout_blocks(args.holdout_blocks),
+                holdout_cells=bool(args.holdout_cells),
+                holdout_cells_file=Path(args.holdout_cells_file) if args.holdout_cells_file else None,
+                holdout_seed=int(args.holdout_seed),
+                conf_weight=float(args.conf_weight),
+                init_head_bias=bool(args.init_head_bias),
+                eval_chunk=int(args.eval_chunk),
+                backbone=str(args.backbone),
+                freeze_backbone=bool(args.freeze_backbone),
+                backbone_lr_mult=float(args.backbone_lr_mult),
+                mask_events=bool(args.mask_events),
+                mask_files=str(args.mask_files or ""),
+                ckpt_dir=Path(args.ckpt_dir) if args.ckpt_dir else None,
+                ckpt_min_free_gb=args.ckpt_min_free_gb,
+                cam_age=bool(args.cam_age),
+                grad_ckpt=bool(args.grad_ckpt),
+            )
+        except TrainFitError as exc:
+            print(f"[GVD] scene train: {exc}")
+            sys.exit(2)
+        except MaskFileError as exc:
+            print(f"[GVD] scene train: {exc}", flush=True)
+            sys.exit(2)
+        except LossyFramesError as exc:
+            print(f"[GVD] scene train: {exc}", flush=True)
+            sys.exit(2)
+        if args.sanity and not args.dry_run and not stats.get("sanity_ok"):
+            print("[GVD] sanity failed: lane_gt loss did not fall below 0.05", flush=True)
+            sys.exit(1)
+        note = "recommended" if stats["recommended"] else "not recommended"
+        print(
+            f"[GVD] scene train strips={stats['strips']} steps={stats['windows']} "
+            f"supervised={stats['supervised']} steps_per_epoch={stats.get('steps_per_epoch', 0)} "
+            f"precision={stats['precision']} "
+            f"device={stats['device']} batch={stats['batch']} {note}"
         )
-    except TrainFitError as exc:
-        print(f"[GVD] scene train: {exc}")
-        sys.exit(2)
-    except MaskFileError as exc:
-        print(f"[GVD] scene train: {exc}", flush=True)
-        sys.exit(2)
-    except LossyFramesError as exc:
-        print(f"[GVD] scene train: {exc}", flush=True)
-        sys.exit(2)
-    if args.sanity and not args.dry_run and not stats.get("sanity_ok"):
-        print("[GVD] sanity failed: lane_gt loss did not fall below 0.05", flush=True)
-        sys.exit(1)
-    note = "recommended" if stats["recommended"] else "not recommended"
-    print(
-        f"[GVD] scene train strips={stats['strips']} steps={stats['windows']} "
-        f"supervised={stats['supervised']} steps_per_epoch={stats.get('steps_per_epoch', 0)} "
-        f"precision={stats['precision']} "
-        f"device={stats['device']} batch={stats['batch']} {note}"
-    )
-    if stats["export"]:
-        print(f"[GVD] exported {stats['export']}")
+        if stats["export"]:
+            print(f"[GVD] exported {stats['export']}")
+    finally:
+        if frame_cache is not None:
+            frame_cache.close()
 
 
 if __name__ == "__main__":

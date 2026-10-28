@@ -35,6 +35,8 @@ from typing import Any, Callable, Mapping
 
 import numpy as np
 
+from python.data.binary_io import link_or_copy_new
+
 FORMAT = "gvd-epoch-ckpt-1"
 DEFAULT_MIN_FREE_GB = 8.0
 GB = 1_000_000_000
@@ -270,14 +272,7 @@ def export_epoch_onnx(ckpt: Path | str, out: Path | str, *, trace: Any = None) -
                 "gvd_scale": str(float(meta.get("scale") or 1.0)),
             },
         )
-        try:
-            os.link(partial, out)
-        except FileExistsError:
-            raise
-        except OSError:
-            if out.exists():
-                raise FileExistsError(f"{out} already exists (create-only)")
-            os.rename(partial, out)
+        link_or_copy_new(partial, out)
     finally:
         if partial.exists():
             partial.unlink()

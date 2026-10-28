@@ -1649,7 +1649,7 @@ class BeamNGPyBackend:
                     f"rear={self._rear_grab_div}; "
                     f"stream_raw offscreen lane_update_s={LANE_CAM_UPDATE_S:g} "
                     f"companion_update_s={COMPANION_OFFSCREEN_UPDATE_S:g}; "
-                    f"GVD→BeamNG vehicle-space convert; depth/semantic OFF)."
+                    f"GVD->BeamNG vehicle-space convert; depth/semantic OFF)."
                 )
             else:
                 print("[GVD] beamngpy: zero Cameras attached; cam_health=missing.")

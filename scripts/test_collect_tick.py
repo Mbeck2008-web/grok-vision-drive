@@ -17,7 +17,9 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "scripts"))
 
+from gvd_test_env import collect_root  # noqa: E402
 import scripts.collect_scene_lanes as collect  # noqa: E402
 from python.collect.auto_mode import stop_file  # noqa: E402
 from python.debug.gt_geom import RoadPoly  # noqa: E402
@@ -95,61 +97,61 @@ def check_read_vehicle() -> None:
 
 
 def check_one_tick() -> None:
-    root = Path(tempfile.mkdtemp())
-    out = root / "scene"
-    vehicle = _Vehicle(stop_file(out))
-    bng = _Bng(vehicle)
+    with collect_root() as root:
+        out = root / "scene"
+        vehicle = _Vehicle(stop_file(out))
+        bng = _Bng(vehicle)
 
-    def _open(*args: object, **kwargs: object) -> _Bng:
-        del args, kwargs
-        return bng
+        def _open(*args: object, **kwargs: object) -> _Bng:
+            del args, kwargs
+            return bng
 
-    def _roads(session: object) -> tuple[list[RoadPoly], str]:
-        del session
-        return [RoadPoly("r", [(0.0, 0.0), (0.0, 80.0)], 7.0)], ""
+        def _roads(session: object) -> tuple[list[RoadPoly], str]:
+            del session
+            return [RoadPoly("r", [(0.0, 0.0), (0.0, 80.0)], 7.0)], ""
 
-    def _cams(session: object, veh: object, cfg: object) -> dict[str, _Cam]:
-        del session, veh, cfg
-        return {"main": _Cam()}
+        def _cams(session: object, veh: object, cfg: object) -> dict[str, _Cam]:
+            del session, veh, cfg
+            return {"main": _Cam()}
 
-    collect.time.sleep = lambda _seconds: None
-    import python.debug.gt_logger as gt_logger
-    import python.sensors.tech as tech
+        collect.time.sleep = lambda _seconds: None
+        import python.debug.gt_logger as gt_logger
+        import python.sensors.tech as tech
 
-    tech.open_tech_beamngpy = _open  # type: ignore[assignment]
-    tech.widen_socket_timeout = lambda *args, **kwargs: None  # type: ignore[assignment]
-    tech.release_tech_beamngpy = lambda *args, **kwargs: None  # type: ignore[assignment]
-    gt_logger.load_road_polys = _roads  # type: ignore[assignment]
-    collect._attach_cameras = _cams  # type: ignore[assignment]
-    code = collect.main(
-        [
-            "--minutes",
-            "1",
-            "--data-dir",
-            str(root),
-            "--out",
-            str(out),
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "1",
-        ]
-    )
-    print(f"tick exit={code} polls={vehicle.polls} commands={len(vehicle.commands)}")
-    assert code == 0, code
-    assert vehicle.polls >= 1
-    assert any("ai.setSpeed" in line for line in vehicle.commands)
-    state = out / "state.jsonl"
-    assert state.is_file(), sorted(p.name for p in out.iterdir())
-    row = json.loads(state.read_text(encoding="utf-8").splitlines()[0])
-    assert row.get("driver") == "beamng_ai"
-    assert (row.get("excursion") or {}).get("phase") == "cruise"
-    assert row.get("segment") == "current#0"
-    wheel = row.get("wheel") or {}
-    assert wheel.get("steer") == 0.15
-    pngs = list((out / "raw" / "main").rglob("*.png"))
-    assert pngs, sorted(p.name for p in out.rglob("*") if p.is_file())
-    print(f"state steer={wheel.get('steer')} png={pngs[0].name}")
+        tech.open_tech_beamngpy = _open  # type: ignore[assignment]
+        tech.widen_socket_timeout = lambda *args, **kwargs: None  # type: ignore[assignment]
+        tech.release_tech_beamngpy = lambda *args, **kwargs: None  # type: ignore[assignment]
+        gt_logger.load_road_polys = _roads  # type: ignore[assignment]
+        collect._attach_cameras = _cams  # type: ignore[assignment]
+        code = collect.main(
+            [
+                "--minutes",
+                "1",
+                "--data-dir",
+                str(root),
+                "--out",
+                str(out),
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "1",
+            ]
+        )
+        print(f"tick exit={code} polls={vehicle.polls} commands={len(vehicle.commands)}")
+        assert code == 0, code
+        assert vehicle.polls >= 1
+        assert any("ai.setSpeed" in line for line in vehicle.commands)
+        state = out / "state.jsonl"
+        assert state.is_file(), sorted(p.name for p in out.iterdir())
+        row = json.loads(state.read_text(encoding="utf-8").splitlines()[0])
+        assert row.get("driver") == "beamng_ai"
+        assert (row.get("excursion") or {}).get("phase") == "cruise"
+        assert row.get("segment") == "current#0"
+        wheel = row.get("wheel") or {}
+        assert wheel.get("steer") == 0.15
+        pngs = list((out / "raw" / "main").rglob("*.png"))
+        assert pngs, sorted(p.name for p in out.rglob("*") if p.is_file())
+        print(f"state steer={wheel.get('steer')} png={pngs[0].name}")
 
 
 class _StreamCam:

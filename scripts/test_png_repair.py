@@ -200,9 +200,35 @@ def check_validator_without_strips() -> None:
         print(text)
 
 
+# The host's real O_BINARY (0x8000 on Windows, absent elsewhere), read before any patching.
+REAL_O_BINARY = int(getattr(os, "O_BINARY", 0))
+
+
+def _free_flag_bit() -> int:
+    """Lowest bit >= 15 that no integer ``os.O_*`` uses on this host.
+
+    A fixed ``1 << 15`` is the real ``O_BINARY`` on Windows, so stripping it
+    would put the real open in text mode.
+    """
+    used = 0
+    for name in dir(os):
+        value = getattr(os, name)
+        if name.startswith("O_") and isinstance(value, int):
+            used |= value
+    bit = 15
+    while (used >> bit) & 1:
+        bit += 1
+    return 1 << bit
+
+
 @contextlib.contextmanager
 def _windows_text_writes(binary_value: int):
-    """Translate ``\\n`` to ``\\r\\n`` on writes whose flags omit ``O_BINARY``."""
+    """Translate ``\\n`` to ``\\r\\n`` on writes whose flags omit ``O_BINARY``.
+
+    ``binary_value`` stands in for ``O_BINARY``. It is stripped before the real
+    open and the host's real ``O_BINARY`` is always added, so the simulated text
+    mode comes from ``write2`` only and never from the real CRT.
+    """
     real_open = os.open
     real_write = os.write
     real_close = os.close
@@ -217,6 +243,9 @@ def _windows_text_writes(binary_value: int):
         real_flags = int(flags)
         if binary_value:
             real_flags &= ~int(binary_value)
+        real_flags |= REAL_O_BINARY
+        if binary_value and real_flags & int(binary_value):
+            raise AssertionError(f"sentinel {binary_value:#x} reached the real os.open ({real_flags:#x})")
         kwargs = {}
         if dir_fd is not None:
             kwargs["dir_fd"] = dir_fd
@@ -267,7 +296,8 @@ def check_windows_newline_regression() -> None:
     odd = np.arange(12, dtype=np.float32).reshape(3, 4)
     encoded = _png_bytes(colour)
     assert encoded is not None
-    sentinel = 1 << 15
+    sentinel = _free_flag_bit()
+    assert sentinel != REAL_O_BINARY and sentinel >= 1 << 15, (sentinel, REAL_O_BINARY)
     with tempfile.TemporaryDirectory() as tmp:
         with _windows_text_writes(sentinel) as opened:
             root = Path(tmp)

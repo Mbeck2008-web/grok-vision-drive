@@ -3221,24 +3221,31 @@ def _read_camera(cid: str, cam: Any, window: dict[str, Any] | None = None) -> tu
     how = "poll"
     # ``window``: time.monotonic() right before and right after the BeamNG
     # call, and time.time() after it. The frame was captured inside it.
+    # ``perf_before``/``perf_after`` (time.perf_counter(), inside the
+    # monotonic pair) only time the call: on Windows the monotonic pair can
+    # read equal (15.6 ms clock).
     window = {} if window is None else window
     if callable(getattr(cam, "stream_raw", None)):
         how = "stream_raw"
         window["mono_before"] = time.monotonic()
+        window["perf_before"] = time.perf_counter()
         try:
             raw = cam.stream_raw()
         except Exception as exc:
             return None, f"stream_raw {type(exc).__name__}: {exc}", None
         finally:
+            window["perf_after"] = time.perf_counter()
             window["mono_after"] = time.monotonic()
             window["wall"] = time.time()
     elif callable(getattr(cam, "poll", None)):
         window["mono_before"] = time.monotonic()
+        window["perf_before"] = time.perf_counter()
         try:
             raw = cam.poll()
         except Exception as exc:
             return None, f"poll {type(exc).__name__}: {exc}", None
         finally:
+            window["perf_after"] = time.perf_counter()
             window["mono_after"] = time.monotonic()
             window["wall"] = time.time()
     else:
@@ -3279,11 +3286,14 @@ def _poll_cameras(cams: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any],
                     break
         # Capture window per frame: monotonic before and after the BeamNG
         # call, wall clock (time.time()) as its own field, and the sensor's
-        # own time when BeamNG returns one.
+        # own time when BeamNG returns one. ``call_s`` is the perf_counter
+        # duration of the call (a duration only, not a timestamp).
+        perf0, perf1 = window.get("perf_before"), window.get("perf_after")
         stamps[cid] = {
             "wall": window.get("wall", time.time()),
             "mono_before": window.get("mono_before"),
             "mono_after": window.get("mono_after"),
+            "call_s": None if perf0 is None or perf1 is None else round(perf1 - perf0, 6),
             "sensor_t": sensor_t,
         }
     return frames, stamps, reasons

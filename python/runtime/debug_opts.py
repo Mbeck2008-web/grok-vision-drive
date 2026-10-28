@@ -147,14 +147,14 @@ DEBUG_ROWS: tuple[dict[str, Any], ...] = (
         "kind": "bool",
         "label": "use lane paint",
         "attr": "lanes_on",
-        "hint": "off → preview path (needs drive-on-preview to move)",
+        "hint": "off -> preview path (needs drive-on-preview to move)",
     },
     {
         "id": "detector_on",
         "kind": "bool",
         "label": "use detector tracks",
         "attr": "detector_on",
-        "hint": "off → no CIPV/AEB from YOLO",
+        "hint": "off -> no CIPV/AEB from YOLO",
     },
 )
 

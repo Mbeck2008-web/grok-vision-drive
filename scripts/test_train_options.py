@@ -169,9 +169,9 @@ def check_cache_chunks() -> None:
         assert manifest["canvas_w"] == 256
         chunk = dest / manifest["chunks"][0]["file"]
         assert chunk.stat().st_size < 4 * 1024 ** 3
-        cache = FrameCache(dest)
-        assert cache.has(0) and cache.has(1) and not cache.has(2)
-        image = cache.canvas(0)
+        with FrameCache(dest) as cache:
+            assert cache.has(0) and cache.has(1) and not cache.has(2)
+            image = cache.canvas(0)
         assert image is not None and image.shape == (CANVAS_H, 256, 3)
         assert int(image[CANVAS_H // 2, 128, 0]) > 0
     print("cache chunks")
@@ -275,38 +275,40 @@ def check_spawn_loader_reads_cache() -> None:
         (root / "state.jsonl").write_text("\n".join(json.dumps(row) for row in lines) + "\n", encoding="utf-8")
         cache_dir = Path(tmp) / "cache"
         build_frame_cache(root, cache_dir, ("main",))
-        cache = FrameCache(cache_dir)
-        items = [
-            {"kind": "train", "rows": [lines[0], lines[1]], "stride": 2, "incoming": "carry"},
-            {"kind": "train", "rows": [lines[2], lines[3]], "stride": 2, "incoming": "carry"},
-            {"kind": "holdout", "rows": [lines[0]], "stride": 0},
-        ]
-        dataset = _EpochWindows(items[:2], root, ("main",), str(cache_dir), 1.0)
-        pickle.dumps(_first_item)
-        pickle.dumps(dataset)
-        pickle.dumps(cache)
-        loader = DataLoader(
-            dataset,
-            batch_size=1,
-            shuffle=False,
-            num_workers=2,
-            persistent_workers=True,
-            collate_fn=_first_item,
-            worker_init_fn=_release_worker_handles,
-            multiprocessing_context=mp.get_context("spawn"),
-        )
-        seen = []
-        for batch in loader:
-            assert batch["incoming"] == "reset"
-            assert len(batch["frames"]) == 2
-            assert batch["frames"][0].shape == (192, 256, 3)
-            seen.append(batch["rows"][0]["i"])
-        assert sorted(seen) == [0, 2]
-        del loader
-        wrapped = _prefetch_loader(items, root, ("main",), cache, 1.0, workers=2, cuda=False)
-        assert wrapped is not None and wrapped.collate_fn is _first_item
-        assert len(wrapped.dataset) == 2
-        del wrapped
+        with FrameCache(cache_dir) as cache:
+            items = [
+                {"kind": "train", "rows": [lines[0], lines[1]], "stride": 2, "incoming": "carry"},
+                {"kind": "train", "rows": [lines[2], lines[3]], "stride": 2, "incoming": "carry"},
+                {"kind": "holdout", "rows": [lines[0]], "stride": 0},
+            ]
+            dataset = _EpochWindows(items[:2], root, ("main",), str(cache_dir), 1.0)
+            pickle.dumps(_first_item)
+            pickle.dumps(dataset)
+            pickle.dumps(cache)
+            loader = DataLoader(
+                dataset,
+                batch_size=1,
+                shuffle=False,
+                num_workers=2,
+                persistent_workers=True,
+                collate_fn=_first_item,
+                worker_init_fn=_release_worker_handles,
+                multiprocessing_context=mp.get_context("spawn"),
+            )
+            seen = []
+            for batch in loader:
+                assert batch["incoming"] == "reset"
+                assert len(batch["frames"]) == 2
+                assert batch["frames"][0].shape == (192, 256, 3)
+                seen.append(batch["rows"][0]["i"])
+            assert sorted(seen) == [0, 2]
+            del loader
+            dataset.close()
+            wrapped = _prefetch_loader(items, root, ("main",), cache, 1.0, workers=2, cuda=False)
+            assert wrapped is not None and wrapped.collate_fn is _first_item
+            assert len(wrapped.dataset) == 2
+            wrapped.dataset.close()
+            del wrapped
     print("spawn loader")
 
 
@@ -361,30 +363,30 @@ def check_sanity_overfits_cached_main() -> None:
         )
         cache_dir = Path(tmp) / "cache"
         build_frame_cache(root, cache_dir, ("main",))
-        cache = FrameCache(cache_dir)
-        assert cache.has(0)
-        image = cache.canvas(0)
-        assert image is not None and image.shape == (192, 256, 3)
-        stats = train_directory(
-            root,
-            epochs=1,
-            lr=1e-3,
-            capability=None,
-            export_path=None,
-            free_vram_bytes=0,
-            free_ram_bytes=8_000_000_000,
-            resume=False,
-            sanity=True,
-            dry_run=False,
-            open_panel=False,
-            autostart=True,
-            cams=("main",),
-            heads=("lane_gt",),
-            cache=cache,
-            augment=True,
-            workers=0,
-        )
-        assert stats.get("sanity_ok") is True, stats
+        with FrameCache(cache_dir) as cache:
+            assert cache.has(0)
+            image = cache.canvas(0)
+            assert image is not None and image.shape == (192, 256, 3)
+            stats = train_directory(
+                root,
+                epochs=1,
+                lr=1e-3,
+                capability=None,
+                export_path=None,
+                free_vram_bytes=0,
+                free_ram_bytes=8_000_000_000,
+                resume=False,
+                sanity=True,
+                dry_run=False,
+                open_panel=False,
+                autostart=True,
+                cams=("main",),
+                heads=("lane_gt",),
+                cache=cache,
+                augment=True,
+                workers=0,
+            )
+            assert stats.get("sanity_ok") is True, stats
     print("sanity overfit")
 
 

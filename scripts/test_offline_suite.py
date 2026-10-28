@@ -3,9 +3,13 @@
 
 A check skipped inside a passing script (``gvd_test_env.skip_check``) is
 returned to the runner and counted, not folded into a plain pass.
+
+The test-only collector root variable (``GVD_TEST_DATA_DIR``) is named only
+in gvd_test_env.py, this file, and docs (*.md): no product file reads it.
 """
 from __future__ import annotations
 
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -15,6 +19,56 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import run_offline_suite as suite  # noqa: E402
+
+TEST_DATA_LITERAL = "GVD_TEST_DATA_DIR"
+TEST_DATA_ALLOWED = {"scripts/gvd_test_env.py", "scripts/test_offline_suite.py"}
+
+
+def _tracked_files() -> list[str]:
+    """Repo-relative tracked paths (``git ls-files``), else a walk of the source folders."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(ROOT), "ls-files", "-z"],
+            capture_output=True,
+            check=True,
+            timeout=60,
+        ).stdout
+        names = [name for name in out.decode("utf-8", errors="replace").split("\0") if name]
+        if names:
+            return names
+    except (OSError, subprocess.SubprocessError):
+        pass
+    names = []
+    for folder in ("python", "scripts", "beamng_mod"):
+        for path in (ROOT / folder).rglob("*"):
+            if path.is_file():
+                names.append(path.relative_to(ROOT).as_posix())
+    for pattern in ("*.bat", "*.py"):
+        names.extend(path.name for path in ROOT.glob(pattern) if path.is_file())
+    return names
+
+
+def check_test_data_env_only_in_tests() -> None:
+    import gvd_test_env
+
+    assert gvd_test_env.TEST_DATA_ENV == TEST_DATA_LITERAL
+    assert suite.TEST_DATA_ENV == TEST_DATA_LITERAL
+    names = _tracked_files()
+    assert "scripts/run_offline_suite.py" in names and "scripts/gvd_test_env.py" in names, len(names)
+    needle = TEST_DATA_LITERAL.encode("ascii")
+    found = []
+    for name in names:
+        try:
+            data = (ROOT / name).read_bytes()
+        except OSError:
+            continue
+        if needle in data:
+            found.append(name)
+    bad = [name for name in found if name not in TEST_DATA_ALLOWED and not name.lower().endswith(".md")]
+    assert not bad, f"{TEST_DATA_LITERAL} named outside the test allow-list: {bad}"
+    assert not [name for name in found if name.startswith("python/")], found
+    assert "scripts/gvd_test_env.py" in found, found
+    print(f"{TEST_DATA_LITERAL}: named only in {sorted(found)} ({len(names)} tracked files checked)")
 
 
 def check_skip_tally() -> None:
@@ -69,11 +123,11 @@ def main() -> None:
     # This file mentions the marker inside a string. That is not a directive.
     assert suite._skip_reason(Path(__file__)) is None
 
-    fake_win = Path("/tmp/gvd_ci_windows_marker.py")
-    fake_bng = Path("/tmp/gvd_ci_beamng_marker.py")
-    fake_win.write_text("# gvd-ci: requires windows\n", encoding="utf-8")
-    fake_bng.write_text("# gvd-ci: requires beamng\n", encoding="utf-8")
-    try:
+    with tempfile.TemporaryDirectory() as tmp:
+        fake_win = Path(tmp) / "gvd_ci_windows_marker.py"
+        fake_bng = Path(tmp) / "gvd_ci_beamng_marker.py"
+        fake_win.write_text("# gvd-ci: requires windows\n", encoding="utf-8")
+        fake_bng.write_text("# gvd-ci: requires beamng\n", encoding="utf-8")
         if sys.platform == "win32":
             assert suite._skip_reason(fake_win) is None
         else:
@@ -84,11 +138,9 @@ def main() -> None:
         else:
             reason = suite._skip_reason(fake_bng)
             assert reason and reason.startswith("BeamNG-dependent"), reason
-    finally:
-        fake_win.unlink(missing_ok=True)
-        fake_bng.unlink(missing_ok=True)
     check_skip_tally()
     check_thread_env()
+    check_test_data_env_only_in_tests()
     print("test_offline_suite: OK")
 
 

@@ -3,11 +3,16 @@
 
 The PNG is on disk under its final name before its state line; a crash or a
 failed verify mid-write leaves no torn frame and no state line; an existing
-frame is never replaced. Offline.
+frame is never replaced. ``link_or_copy_new`` (ONNX exports) links, else
+copies into an O_EXCL-created name: an existing name is refused, a failed
+copy removes only the name it created, and the source goes only after a
+complete copy. Offline.
 """
 from __future__ import annotations
 
+import errno
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -16,11 +21,43 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "scripts"))
 
 import python.data.binary_io as binary_io  # noqa: E402
 import python.data.raw_frames as raw_frames  # noqa: E402
 from python.data.binary_io import PNG_SIG  # noqa: E402
 from python.data.raw_frames import RawFrameWriter  # noqa: E402
+from gvd_test_env import collect_root  # noqa: E402
+
+SRC_BYTES = bytes(range(256)) * 3 + b"\r\n\n\r"
+
+
+def _no_link(src, dst, *args, **kwargs):
+    raise OSError(errno.EPERM, "hard links not supported (forced)")
+
+
+class _ForcedFallback:
+    """``os.link`` raises EPERM inside the block, as on FAT32/exFAT."""
+
+    def __enter__(self):
+        self.real = os.link
+        os.link = _no_link
+        return self
+
+    def __exit__(self, *exc):
+        os.link = self.real
+        return False
+
+
+class _RealLink:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+VARIANTS = (("link", _RealLink), ("copy fallback", _ForcedFallback))
 
 
 def _img() -> np.ndarray:
@@ -141,10 +178,90 @@ def check_failed_verify_and_no_replace() -> None:
     print("failed verify: final name never created; existing frame kept")
 
 
+def check_link_or_copy_refuses_existing() -> None:
+    for name, variant in VARIANTS:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "model.onnx.partial"
+            dst = Path(tmp) / "model.onnx"
+            src.write_bytes(SRC_BYTES)
+            dst.write_bytes(b"OLD")
+            with variant():
+                try:
+                    binary_io.link_or_copy_new(src, dst)
+                except FileExistsError:
+                    pass
+                else:
+                    raise AssertionError(f"{name}: an existing dst must be refused")
+            assert dst.read_bytes() == b"OLD", name
+            assert src.read_bytes() == SRC_BYTES, name
+    print("link_or_copy_new: existing dst refused (link and copy), dst and src unchanged")
+
+
+def check_link_or_copy_success() -> None:
+    for name, variant in VARIANTS:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "model.onnx.partial"
+            dst = Path(tmp) / "model.onnx"
+            src.write_bytes(SRC_BYTES)
+            with variant():
+                binary_io.link_or_copy_new(src, dst)
+            assert dst.read_bytes() == SRC_BYTES, name
+            assert not src.exists(), name
+            assert os.stat(dst).st_nlink == 1, (name, os.stat(dst).st_nlink)
+    print("link_or_copy_new: dst holds the bytes and src is gone (link and copy)")
+
+
+def check_link_or_copy_mid_copy_failure() -> None:
+    real_chunk, real_write = binary_io.COPY_CHUNK, binary_io._write_chunk
+    calls = {"n": 0}
+
+    def failing_write(handle, data):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError(errno.ENOSPC, "no space left (forced)")
+        real_write(handle, data)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / "model.onnx.partial"
+        dst = Path(tmp) / "model.onnx"
+        src.write_bytes(SRC_BYTES)
+        binary_io.COPY_CHUNK = 16
+        binary_io._write_chunk = failing_write
+        try:
+            with _ForcedFallback():
+                binary_io.link_or_copy_new(src, dst)
+        except OSError as exc:
+            assert exc.errno == errno.ENOSPC, exc
+        else:
+            raise AssertionError("a failed copy must raise")
+        finally:
+            binary_io.COPY_CHUNK, binary_io._write_chunk = real_chunk, real_write
+        assert calls["n"] == 2, calls
+        assert not dst.exists(), "a failed copy must remove the dst it created"
+        assert src.read_bytes() == SRC_BYTES
+    print("link_or_copy_new: mid-copy ENOSPC propagates, dst removed, src intact")
+
+
+def check_link_or_copy_on_collect_root() -> None:
+    with collect_root(prefix="gvd-link-") as root:
+        src = root / "model.onnx.partial"
+        dst = root / "model.onnx"
+        src.write_bytes(SRC_BYTES)
+        binary_io.link_or_copy_new(src, dst)
+        assert dst.read_bytes() == SRC_BYTES
+        assert not src.exists()
+        assert os.stat(dst).st_nlink == 1, os.stat(dst).st_nlink
+    print("link_or_copy_new: unforced run on the collector data root ok")
+
+
 def main() -> None:
     check_temp_verify_rename_before_state()
     check_crash_mid_write_leaves_nothing()
     check_failed_verify_and_no_replace()
+    check_link_or_copy_refuses_existing()
+    check_link_or_copy_success()
+    check_link_or_copy_mid_copy_failure()
+    check_link_or_copy_on_collect_root()
     print("frame atomic ok")
 
 

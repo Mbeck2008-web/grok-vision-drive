@@ -7,6 +7,8 @@ Offline. ``lane_at`` and the speed trace are mocked; no BeamNG is needed.
 """
 from __future__ import annotations
 
+import atexit
+import contextlib
 import gzip
 import io
 import json
@@ -18,7 +20,9 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "scripts"))
 
+from gvd_test_env import collect_root  # noqa: E402
 from python.collect.liveness import (  # noqa: E402
     IMPACT_STALL_S,
     PRE_IMPACT_S,
@@ -459,6 +463,12 @@ class _Cam:
         return {"colour": image}
 
 
+# Default collector roots: callers read ``out`` after _run_collector returns,
+# so each collect_root() stays open until the process exits.
+_COLLECT_ROOTS = contextlib.ExitStack()
+atexit.register(_COLLECT_ROOTS.close)
+
+
 def _run_collector(vehicle_args: dict, extra: list[str], root: Path | None = None,
                    cams=None, roads=None) -> tuple[int, str, Path]:
     import python.data.raw_queue as raw_queue
@@ -474,7 +484,7 @@ def _run_collector(vehicle_args: dict, extra: list[str], root: Path | None = Non
             del max_depth
             super().__init__(writer, 100000, **kwargs)
 
-    root = Path(root) if root is not None else Path(tempfile.mkdtemp())
+    root = Path(root) if root is not None else _COLLECT_ROOTS.enter_context(collect_root())
     out = root / "scene"
     vehicle = _CrashVehicle(stop_file(out), **vehicle_args)
     bng = _Bng(vehicle)

@@ -42,6 +42,7 @@ def export(out: Path | str, *, seed: int = 0) -> Path:
         raise SystemExit("refused: --out must end in .onnx")
     import torch
 
+    from python.data.binary_io import link_or_copy_new
     from python.data.strip_writer import STRIP_ORDER
     from python.train.cam_strip import stamp_onnx_metadata
     from python.train.scene_net import SceneNet, export_scene_onnx
@@ -53,7 +54,7 @@ def export(out: Path | str, *, seed: int = 0) -> Path:
     try:
         export_scene_onnx(partial, net, cams=tuple(STRIP_ORDER), heads=("lane_gt",), cam_age=True)
         stamp_onnx_metadata(str(partial), {"gvd_capture_untrained": "1", "gvd_capture_seed": str(int(seed))})
-        os.link(partial, out)
+        link_or_copy_new(partial, out)
     finally:
         if partial.exists():
             partial.unlink()

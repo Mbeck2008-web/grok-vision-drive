@@ -79,6 +79,9 @@ from python.train.scene_net import (  # noqa: E402
     torch_ready,
 )
 from python.train.checkpoint import (  # noqa: E402
+    PauseDirRefused,
+    check_pause_dir,
+    checkpoint_path,
     clear_checkpoint,
     load_checkpoint,
     resume_fields,
@@ -163,6 +166,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-resume",
         action="store_true",
         help="Start at step 0. A later checkpoint still replaces the pause file.",
+    )
+    parser.add_argument(
+        "--pause-dir",
+        default="",
+        help=(
+            "Folder for this run's pause file (<strips name>.gvd-pause.npz): every pause write, "
+            "the start-up read, resume, and the delete after a finished run use it. Refused when it "
+            "is the folder holding the strip folder, under it, or above it, and (with --no-resume) "
+            "when the pause file already exists. Default: the folder holding the strip folder."
+        ),
     )
     parser.add_argument(
         "--sanity",
@@ -1535,6 +1548,7 @@ def _save_pause(
     batch: int,
     device_name: str,
     recommended: bool,
+    pause_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Save weights before the loop stops. Strip files are not rewritten."""
     used_cams = tuple(getattr(net, "cams", ()) or ()) or None
@@ -1557,7 +1571,7 @@ def _save_pause(
         used_cams,
         getattr(net, "pause_arch", None),
     )
-    save_checkpoint(root, payload)
+    save_checkpoint(root, payload, pause_dir=pause_dir)
     return payload
 
 
@@ -1709,6 +1723,7 @@ def train_directory(
     ckpt_min_free_gb: float | None = None,
     cam_age: bool = False,
     grad_ckpt: bool = False,
+    pause_dir: Path | None = None,
 ) -> dict[str, Any]:
     import torch
 
@@ -1863,7 +1878,9 @@ def train_directory(
     own_view = view is None
     if view is None:
         view = TrainWindow()
-    view.load_folder(root)
+    if pause_dir is not None:
+        print(f"[GVD] pause file: {checkpoint_path(root, pause_dir)}", flush=True)
+    view.load_folder(root, pause_dir=pause_dir)
     # The CLI epoch count is not the stop. The holdout decides.
     requested_epochs = int(epochs)
 
@@ -2115,6 +2132,7 @@ def train_directory(
                 batch=batch,
                 device_name=device.type,
                 recommended=recommended,
+                pause_dir=pause_dir,
             )
             last_ckpt = now
             print(f"[GVD] checkpoint step={done}", flush=True)
@@ -2187,6 +2205,7 @@ def train_directory(
             batch=batch,
             device_name=device.type,
             recommended=recommended,
+            pause_dir=pause_dir,
         )
         view.mark_paused(payload)
         if not _wait_for_start(view):
@@ -2654,7 +2673,7 @@ def train_directory(
             subset = list(rows[:4] if dry_run else rows[:8])
             _limited(DRY_RUN_STEPS if dry_run else SANITY_STEPS, subset, bool(dry_run))
         else:
-            existing = load_checkpoint(root) if resume else None
+            existing = load_checkpoint(root, pause_dir=pause_dir) if resume else None
             if existing is not None:
                 fields = resume_fields(existing)
                 rate = resume_learning_rate(lr, fields.get("lr"))
@@ -2732,7 +2751,7 @@ def train_directory(
         if not paused_exit and not dry_run and not sanity and export_path is not None:
             export_scene_onnx(export_path, net, heads=train_heads)
         if not paused_exit and not dry_run and not sanity:
-            clear_checkpoint(root)
+            clear_checkpoint(root, pause_dir=pause_dir)
     except Exception:
         write_crash(debug_dir, traceback.format_exc(), last_batch)
         raise
@@ -2822,6 +2841,14 @@ def main(argv: list[str] | None = None) -> None:
         except DataDriveError as exc:
             print(f"[GVD] scene train: {exc}")
             sys.exit(2)
+        pause_dir: Path | None = None
+        if args.pause_dir:
+            try:
+                check_pause_dir(args.strips, args.pause_dir, no_resume=bool(args.no_resume))
+            except PauseDirRefused as exc:
+                print(f"[GVD] scene train: pause-dir refused: {exc}", flush=True)
+                sys.exit(2)
+            pause_dir = Path(args.pause_dir).resolve()
         if not torch_ready():
             print("[GVD] scene train needs PyTorch")
             sys.exit(2)
@@ -2868,6 +2895,7 @@ def main(argv: list[str] | None = None) -> None:
                 ckpt_min_free_gb=args.ckpt_min_free_gb,
                 cam_age=bool(args.cam_age),
                 grad_ckpt=bool(args.grad_ckpt),
+                pause_dir=pause_dir,
             )
         except TrainFitError as exc:
             print(f"[GVD] scene train: {exc}")

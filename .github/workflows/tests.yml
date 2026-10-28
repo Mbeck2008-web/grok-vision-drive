@@ -15,10 +15,9 @@ jobs:
         # under /tmp and the collector refuses under 20 GB free, so unmount the
         # tmpfs and let /tmp fall back to the root disk.
         run: |
-          echo "runner image: ${ImageOS:-unknown} ${ImageVersion:-$(. /etc/os-release && echo "$PRETTY_NAME")}"
           df -h /tmp
           echo "before: /tmp fstype=$(findmnt -n -o FSTYPE /tmp || echo none)"
-          fstype=$(findmnt -n -o FSTYPE /tmp || true); if [ "$fstype" = "tmpfs" ]; then sudo systemctl mask tmp.mount && sudo umount -l /tmp; else echo "/tmp is $fstype, not tmpfs; skipping unmount"; fi
+          fstype=$(findmnt -n -o FSTYPE /tmp || true); if [ "$fstype" = "tmpfs" ]; then sudo systemctl mask tmp.mount && sudo umount -l /tmp; else echo "/tmp is ${fstype:-none}, not tmpfs; skipping unmount"; fi
           df -h /tmp
           fstype=$(findmnt -n -o FSTYPE /tmp || true)
           echo "after: /tmp fstype=${fstype:-none (on /)}"

@@ -2,9 +2,11 @@
 """The 6 s launch window on retail, run headless with a painted road (#125, option 2).
 
 The retail LaunchGuard now gets the session-echo speed. These checks run run_vision.py on the
-retail cmd_json bus through scripts/gvd_road_stub_child.py (stub cameras that return a painted
+retail cmd_json bus through scripts/gvd_clock_child.py (stub cameras that return a painted
 road, so the planner has a path) with a fake mod that integrates the commanded pedals into its
-echoed speed.
+echoed speed. The supervisor, the fake mod and the car all run on one test-owned clock
+(scripts/gvd_sim_clock.py), one supervisor tick per step, so a loaded host cannot change what
+the checks see.
 
 1. Known speed: a fresh echo at 0 m/s pulls away inside the window. Throttle goes above 0 and
    the echoed speed rises.
@@ -19,10 +21,7 @@ echoed speed.
 """
 from __future__ import annotations
 
-import contextlib
-import subprocess
 import sys
-import time
 import traceback
 from pathlib import Path
 
@@ -31,6 +30,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import test_unknown_ego as T  # noqa: E402
+from gvd_sim_clock import SimClock  # noqa: E402
 from gvd_test_env import isolated_home  # noqa: E402
 from python.control.actuate import cmd_path, write_engage_flag  # noqa: E402
 from python.control.actuate import DriveCommand  # noqa: E402
@@ -43,7 +43,6 @@ from python.control.launch_guard import (  # noqa: E402
     apply_stale_speed_cap,
 )
 
-LAUNCHER = ROOT / "scripts" / "gvd_road_stub_child.py"
 ACCEL_PER_THROTTLE = 10.0  # m/s^2 at throttle 1.0 (fake car)
 DECEL_PER_BRAKE = 8.0  # m/s^2 at brake 1.0
 ENGAGE_AT_S = 0.5
@@ -59,7 +58,7 @@ class _Car(T._Mod):
         self._last: float | None = None
 
     def echo(self, t_spawn: float) -> None:
-        now = time.monotonic()
+        now = self._mono()
         if now >= self.next_echo and self.echoing and self.frozen is None:
             cmd = T._read(cmd_path())
             if self._last is not None and cmd.get("engaged") is True:
@@ -70,24 +69,6 @@ class _Car(T._Mod):
         super().echo(t_spawn)
 
 
-@contextlib.contextmanager
-def _road_launcher():
-    """T._session spawns run_vision.py; run it through the painted-road launcher instead."""
-    real = subprocess.Popen
-
-    def popen(args, *a, **k):
-        if len(args) > 2 and str(args[2]).endswith("run_vision.py"):
-            args = list(args)
-            args[2] = str(LAUNCHER)
-        return real(args, *a, **k)
-
-    subprocess.Popen = popen
-    try:
-        yield
-    finally:
-        subprocess.Popen = real
-
-
 def _speed(snap: dict) -> float | None:
     v = (snap["state"].get("ego") or {}).get("speed_mps")
     return None if v is None else float(v)
@@ -95,7 +76,7 @@ def _speed(snap: dict) -> float | None:
 
 def _drive(seconds: float, *, freeze_after_s: float | None = None) -> tuple[list[dict], dict]:
     mark: dict = {}
-    with isolated_home(prefix="gvd-launch-"), _road_launcher():
+    with isolated_home(prefix="gvd-launch-"):
         write_engage_flag(False)
         car = _Car()
 
@@ -110,7 +91,7 @@ def _drive(seconds: float, *, freeze_after_s: float | None = None) -> tuple[list
                     mark["freeze"] = t
                     car.freeze()
 
-        seen = T._session(seconds, car, step)
+        seen = T._session(seconds, car, step, clock=SimClock())
     return seen, mark
 
 

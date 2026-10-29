@@ -50,6 +50,17 @@ Row fields in ``state.jsonl`` written by this collector, besides the frame data:
 * ``spawn_type``, ``spawn_paint_cov``: the west-coast spawn kind and its
   measured paint coverage ahead (null when not measured).
 * ``ego.up``: the State sensor's up vector. ``ego.damage``: Damage sensor total.
+* Control inputs (``python/collect/control_log.py``), after the keys above:
+  ``ego.vel``, ``ego.sim_t``; ``wheel.steer_angle_deg`` and
+  ``pedals.throttle_applied``/``brake_applied``/``parkingbrake``/``clutch``
+  (electrics, every tick); ``wheel.steer_ai`` and ``pedals.*_ai``, ``imu``,
+  ``ai_in_src`` (one vehicle-Lua probe every ``--ctl-probe-every`` ticks, null
+  on the others). ``*_ai`` is the AI controller's command, and that controller
+  uses information the cameras do not see. ``veh`` (electrics whitelist),
+  ``ai_cmd`` (the AI commands this collector sent), ``road`` (fields already
+  computed for ``gt``), ``traffic`` (2 Hz, null on other rows), and
+  ``veh_meta`` on the first row after each spawn. A failed read is null; it
+  never stops collection. ``--max-file-gb`` stops with exit 7 (``file_cap``).
 
 ``impacts.jsonl`` beside ``state.jsonl`` has one ``{"kind": "impact", "t",
 "i", "pre_t0", "pre_i0", ...}`` line per impact and one ``{"kind":
@@ -161,6 +172,7 @@ if str(ROOT) not in sys.path:
 
 from python.data.raw_frames import controls_from_state
 from python.collect.spawn_mix import clamp_speed_range, traffic_count
+from python.collect import control_log
 
 SPEEDS_MPS = (8.0, 11.0, 14.0, 17.0, 10.0)
 SPEED_HOLD_S = 180.0
@@ -372,6 +384,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-excursions", action="store_true", help="Stay centered. Default weaves and lane changes.")
     parser.add_argument("--smoke-s", type=float, default=60.0, help="Collect this many seconds, check PNG decode, then continue. 0 skips the check.")
     parser.add_argument("--no-vary-env", action="store_true", help="Do not change weather or time of day on each segment.")
+    parser.add_argument(
+        "--max-file-gb", type=float, default=3.5,
+        help="Stop with exit 7 (file_cap) when a top-level file in --out reaches this size. Nothing is deleted.",
+    )
+    parser.add_argument(
+        "--ctl-probe-every", type=int, default=1, choices=[1, 2],
+        help="Read the AI command, IMU, and input sources every Nth tick. Other rows hold nulls.",
+    )
     parser.add_argument(
         "--check-maps",
         action="store_true",
@@ -951,6 +971,28 @@ def _queue(vehicle: Any, command: str) -> None:
     raise RuntimeError("vehicle has no queue_lua_command")
 
 
+def _largest_file(out: Path) -> tuple[str, int] | None:
+    """Name and size of the biggest top-level file in ``out`` (jsonl logs; PNGs live in subfolders)."""
+    best: tuple[str, int] | None = None
+    try:
+        for entry in os.scandir(out):
+            if entry.is_file(follow_symlinks=False):
+                size = entry.stat(follow_symlinks=False).st_size
+                if best is None or size > best[1]:
+                    best = (entry.name, int(size))
+    except OSError:
+        return None
+    return best
+
+
+def _ask_vehicle(vehicle: Any, chunk: str) -> Any:
+    """Vehicle Lua with a reply. Any failure is ``None``; it never stops collection."""
+    try:
+        return vehicle.queue_lua_command(chunk, True)
+    except Exception:
+        return None
+
+
 def _player_vehicle(bng: Any) -> Any:
     """Player vehicle, or ``RuntimeError`` carrying the BeamNGpy text.
 
@@ -1186,6 +1228,7 @@ def attached_frames_ready(cams: dict[str, Any], frames: dict[str, Any]) -> bool:
 
 
 STOP_EXIT_EARLY = 6
+STOP_EXIT_FILE_CAP = 7
 ETK800 = "etk800"
 from python.collect.excursion import ETK800_HALF_WIDTH_M  # noqa: E402
 EGO_WIDTH_RANGE_M = (1.2, 3.0)
@@ -2226,6 +2269,12 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             )
             impact.close()
 
+        # Control-input fields (python/collect/control_log.py): probe count, last traffic
+        # read, the spawn veh_meta was sent for, and the AI commands sent so far.
+        ctl_ticks = 0
+        ctl_traffic_at: float | None = None
+        ctl_meta_for: Any = None
+        ai_cmd = control_log.ai_cmd_state()
         while done_s < target_s:
             run.beat(done_s)
             if stop_file(out).is_file():
@@ -2358,6 +2407,19 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 return 4
             veh_mark = time.monotonic()
             sample = _read_vehicle(vehicle)
+            probe = control_log.probe_nulls()
+            if ctl_ticks % int(args.ctl_probe_every) == 0:
+                probe = control_log.parse_ve_probe(_ask_vehicle(vehicle, control_log.VE_PROBE))
+            ctl_ticks += 1
+            traffic_now = None
+            if ctl_traffic_at is None or veh_mark - ctl_traffic_at >= control_log.TRAFFIC_EVERY_S:
+                ctl_traffic_at = veh_mark
+                try:
+                    from python.collect.level_session import lua_call
+
+                    traffic_now = control_log.parse_traffic(lua_call(bng, control_log.TRAFFIC_CHUNK))
+                except Exception:
+                    traffic_now = None
             ticks.add("veh_s", time.monotonic() - veh_mark)
             main_stamp = stamps.get("main") if isinstance(stamps, dict) else None
             ticks.note(
@@ -2462,6 +2524,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                         for command in ai_commands(speed, waypoint, traffic=False):
                             try:
                                 _queue(vehicle, command)
+                                ai_cmd = control_log.ai_cmd_state(ai_cmd, command)
                             except Exception as exc:
                                 last_error = f"{type(exc).__name__}: {exc}"
                         last_ai = (round(speed, 3), waypoint, "cruise", 1, map_name)
@@ -2788,6 +2851,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 for command in commands:
                     try:
                         _queue(vehicle, command)
+                        ai_cmd = control_log.ai_cmd_state(ai_cmd, command)
                     except Exception as exc:
                         last_error = f"{type(exc).__name__}: {exc}"
                 last_ai = ai_key
@@ -2891,6 +2955,15 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             if impact_decel is not None:
                 tags["impact"] = True
                 tags["impact_decel_mps2"] = round(float(impact_decel), 2)
+            tags["veh"] = sample.get("veh") or {}
+            tags["imu"] = probe["imu"]
+            tags["ai_in_src"] = probe["ai_in_src"]
+            tags["ai_cmd"] = dict(ai_cmd)
+            tags["road"] = control_log.road_tag(hit, lanes_here)
+            tags["traffic"] = traffic_now
+            if ctl_meta_for != (id(vehicle), id(spawn_pos)):
+                meta = control_log.parse_ve_meta(_ask_vehicle(vehicle, control_log.VE_META_PROBE))
+                tags["veh_meta"] = {"model": vehicle_model(vehicle), **meta}
             row_i = None if row_base is None else int(row_base) + int(getattr(writer, "enqueued", 0) or 0)
             q_before = writer.stats()
             submit_mark = time.monotonic()
@@ -2907,9 +2980,26 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     "up": up_vec,
                     "x": None if pos is None else pos[0],
                     "y": None if pos is None else pos[1],
+                    "vel": sample.get("vel"),
+                    "sim_t": sample.get("sim_t"),
                 },
-                wheel={"steer": sample.get("steer")},
-                pedals={"throttle": sample.get("throttle"), "brake": sample.get("brake")},
+                wheel={
+                    "steer": sample.get("steer"),
+                    "steer_angle_deg": sample.get("steer_angle_deg"),
+                    "steer_ai": probe["steer_ai"],
+                },
+                pedals={
+                    "throttle": sample.get("throttle"),
+                    "brake": sample.get("brake"),
+                    "throttle_ai": probe["throttle_ai"],
+                    "brake_ai": probe["brake_ai"],
+                    "throttle_applied": sample.get("throttle_applied"),
+                    "brake_applied": sample.get("brake_applied"),
+                    "parkingbrake": sample.get("parkingbrake"),
+                    "parkingbrake_ai": probe["parkingbrake_ai"],
+                    "clutch": sample.get("clutch"),
+                    "clutch_ai": probe["clutch_ai"],
+                },
                 tech=tech,
                 driver="beamng_ai",
                 tags=tags,
@@ -2930,6 +3020,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 impact_respawn_due = impact_respawn_on
             yield_fire = False
             if queued:
+                if "veh_meta" in tags:
+                    ctl_meta_for = (id(vehicle), id(spawn_pos))
                 impact.note_row(now, row_i)
                 last_row_i = row_i
                 if spawn_deck is not None and spawn_road:
@@ -3107,6 +3199,14 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     print(f"collect stop {exc}", flush=True)
                     run.stop("disk_low", str(exc))
                     return 3
+                big = _largest_file(out)
+                if big is not None and big[1] >= float(args.max_file_gb) * 1024.0 ** 3:
+                    _save_progress(done_s, done_s if target_s == float("inf") else target_s)
+                    _publish(None, speed, waypoint)
+                    detail = f"{big[0]} {big[1]} B >= {float(args.max_file_gb):g} GB cap"
+                    print(f"collect stop file_cap {detail}", flush=True)
+                    run.stop("file_cap", detail)
+                    return STOP_EXIT_FILE_CAP
                 last_disk = now_m
                 if now_m - last_print >= 60.0:
                     print(
@@ -3340,6 +3440,7 @@ def _read_vehicle(vehicle: Any) -> dict[str, Any]:
     except Exception:
         pass
     sample = controls_from_state(state)
+    sample.update(control_log.vehicle_fields(state))
     up = state.get("up") if isinstance(state, dict) else None
     if isinstance(up, (list, tuple)) and len(up) >= 3:
         try:

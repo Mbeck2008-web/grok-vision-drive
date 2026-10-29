@@ -103,7 +103,8 @@ def _e2e_files() -> list[tuple[str, Path]]:
     if not MODELS_DIR.is_dir():
         files: list[Path] = []
     else:
-        files = sorted(p for p in MODELS_DIR.glob("e2e*.onnx") if p.is_file())
+        # e2e_scene*.onnx is a scene net (lane_gt), not a PilotNet e2e policy.
+        files = sorted(p for p in MODELS_DIR.glob("e2e*.onnx") if p.is_file() and not p.name.startswith("e2e_scene"))
     yaml_p = _e2e_yaml_path()
     out: list[tuple[str, Path]] = []
     seen: set[Path] = set()
@@ -172,9 +173,25 @@ def e2e_choices() -> list[ModelChoice]:
     return rows
 
 
+# The view-only scene viewer's ids: "off" + the --scene-view stems (no glob).
+_SCENE_VIEW_IDS: list[str] = []
+
+
+def set_scene_view_ids(stems: Any) -> None:
+    _SCENE_VIEW_IDS[:] = [str(s) for s in stems]
+
+
+def scene_view_choices() -> list[ModelChoice]:
+    rows = [ModelChoice("off", "scene_view", "off", "off", hint="view-only same-map experiment off")]
+    rows += [ModelChoice(s, "scene_view", s, "scene-onnx", hint="view-only same-map experiment") for s in _SCENE_VIEW_IDS]
+    return rows
+
+
 def choices_for(role: str) -> list[ModelChoice]:
     if role == "e2e":
         return e2e_choices()
+    if role == "scene_view":
+        return scene_view_choices()
     return detector_choices()
 
 

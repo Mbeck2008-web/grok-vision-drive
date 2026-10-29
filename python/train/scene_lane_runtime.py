@@ -158,8 +158,16 @@ class SceneLaneRuntime:
     # The only ONNX outputs this runtime reads. Each must be a trained head.
     READS = ("lane_gt",)
 
-    def __init__(self, path: Path | str | None = None, *, feeds_cam_age: bool = False) -> None:
+    def __init__(
+        self,
+        path: Path | str | None = None,
+        *,
+        feeds_cam_age: bool = False,
+        intra_op_threads: int | None = None,
+    ) -> None:
         self.path = Path(path) if path is not None else default_onnx_path()
+        # ORT intra-op threads; None keeps ORT's default (the lane source).
+        self.intra_op_threads = intra_op_threads
         # Whether the caller feeds the 8 per-camera hold ages each tick.
         # run_vision does not (the BeamNG backend has no per-render id yet).
         self.feeds_cam_age = bool(feeds_cam_age)
@@ -190,7 +198,14 @@ class SceneLaneRuntime:
             self.reason = f"onnxruntime missing ({type(exc).__name__})"
             return
         try:
-            self.session = ort.InferenceSession(str(self.path), providers=["CPUExecutionProvider"])
+            if self.intra_op_threads is None:
+                self.session = ort.InferenceSession(str(self.path), providers=["CPUExecutionProvider"])
+            else:
+                opts = ort.SessionOptions()
+                opts.intra_op_num_threads = int(self.intra_op_threads)
+                self.session = ort.InferenceSession(
+                    str(self.path), sess_options=opts, providers=["CPUExecutionProvider"]
+                )
             self._input_names = [item.name for item in self.session.get_inputs()]
             self._output_names = [item.name for item in self.session.get_outputs()]
         except Exception as exc:
@@ -336,6 +351,12 @@ class SceneLaneRuntime:
             "post_ms": (t_end - t_post) * 1000.0,
         }
         return out
+
+    def reset_state(self) -> None:
+        """Zero the recurrent state (GRU h, residual tokens, mask) as a fresh load has it."""
+        self.h = np.zeros_like(self.h)
+        self.tokens = np.zeros_like(self.tokens)
+        self.mask = np.full_like(self.mask, float(RESIDUAL_S) + 1.0)
 
     def output(self, name: str) -> Any:
         """The last tick's value of one ONNX output.

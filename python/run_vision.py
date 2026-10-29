@@ -73,10 +73,11 @@ from python.viz.nerd import image_point_from_window_mouse
 # the supervisor only needs torch-free helpers here. The scene runtime is imported lazily below.
 from python.train.scene_live import SCENE_SHAPE_HOLD, live_strip_fields
 from python.viz.stage import drawn_lane_records
+from python.viz.scene_view import SceneNetViewer, parse_scene_view_arg, view_respawn, view_state, view_tick
 from python.sensors.cameras import CAM_IDS, CamHealth, bundle_tick_frames
 from python.runtime.debug_opts import apply_to_command, apply_to_perception
 from python.runtime.hw_probe import ema_hz, gpu_vram_used_gb, probe, refuse_live_start, unique_frame_hz_inst
-from python.runtime.models import ModelRuntime
+from python.runtime.models import ModelRuntime, set_scene_view_ids
 from python.runtime.shadow import ShadowConfig, load_shadow_config, shadow_tick
 from python.runtime.state_io import (
     default_state,
@@ -350,6 +351,12 @@ def main(clock=None) -> None:
         "--scene-onnx",
         default="",
         help="Scene-net ONNX path. Empty uses models/e2e_scene.onnx.",
+    )
+    ap.add_argument(
+        "--scene-view",
+        default="",
+        help="PATH[,PATH] scene-net ONNX drawn on the stage, view-only (a view-only same-map "
+        "experiment; never a lane source). Relative paths are under the data root.",
     )
     ap.add_argument(
         "--no-engage",
@@ -707,6 +714,24 @@ def main(clock=None) -> None:
                 )
         elif args.lane_source == "gt":
             print("[GVD] lane source=gt road-network center at 8 m", flush=True)
+        # View-only scene viewer: display only, after cmd is sent; never a lane source.
+        scene_viewer = None
+        scene_view_sel = "off"
+        view_ms, view_prev_hb_ms = 0.0, 0.0
+        scene_view_models = parse_scene_view_arg(args.scene_view)
+        if scene_view_models and args.lane_source == "scene":
+            print("[GVD] scene view refused: --scene-view with --lane-source scene (one scene net at a time)", flush=True)
+        elif scene_view_models:
+            try:
+                set_scene_view_ids(list(scene_view_models))
+                scene_viewer = SceneNetViewer(
+                    scene_view_models, hz=args.hz, can_feed_cam_age=bool(getattr(backend, "can_feed_cam_age", False))
+                )
+                ui.debug.scene_view_id = next(iter(scene_view_models))
+                print(f"[GVD] scene view (view-only): {','.join(scene_view_models)}", flush=True)
+            except Exception as exc:
+                scene_viewer = None
+                print(f"[GVD] scene view off ({type(exc).__name__}: {exc})", flush=True)
         while True:
             if run_deadline is not None and time.monotonic() >= run_deadline:
                 print(f"[GVD] --run-seconds {float(args.run_seconds):g} reached; stopping", flush=True)
@@ -768,6 +793,8 @@ def main(clock=None) -> None:
                     backend.reset_live_hold()
                     scrub_after_respawn(bundle)
                     print(f"[GVD] cam-age: respawn ({respawn}); hold reset, side cameras black until a new frame is stored", flush=True)
+            elif scene_viewer is not None:
+                view_respawn(scene_viewer, vdata, tick_dt, bundle, backend)
             sensors_poll_ms = 0.0
             poll_gps_ms = 0.0
             poll_gps_sent = False
@@ -1308,6 +1335,17 @@ def main(clock=None) -> None:
                 applied = actuator.apply(cmd)
             else:
                 applied = actuator.stop(seq=cmd_seq, reason=cmd.reason)
+            # View-only scene viewer, after cmd is sent: frames and timing in, nothing out but display.
+            if scene_viewer is not None:
+                try:
+                    if str(ui.debug.scene_view_id) != scene_view_sel:
+                        scene_view_sel = str(ui.debug.scene_view_id)
+                        scene_viewer.select(scene_view_sel)
+                except Exception:
+                    pass
+                view_ms = view_tick(
+                    scene_viewer, bundle, backend=backend, prev_heartbeat_ms=view_prev_hb_ms, loop_gap_s=tick_dt or 0.0
+                )
             # Reference for the override residual, keyed by seq so the mod's ack can find the
             # command its echo belongs to. Gate holds ride along as brake=1 and the car echoes
             # those back just like a real command, so they have to be in here too.
@@ -1480,6 +1518,9 @@ def main(clock=None) -> None:
             st["poll_gps_sent"] = poll_gps_sent
             st["electrics_ms"] = electrics_ms
             st["heartbeat_ms"] = (time.perf_counter() - loop_t0) * 1000.0
+            view_prev_hb_ms = float(st["heartbeat_ms"])
+            if scene_viewer is not None:
+                st["scene_view"] = view_state(scene_viewer)
             if cam_age_log:
                 # Per-camera hold ages (cam_hold.CAM_AGE_ORDER; -1 = black), this
                 # tick's duration and timers, would-skip-control, stale ego and
@@ -1556,7 +1597,9 @@ def main(clock=None) -> None:
                 f"steer_why={lane_steer.reason} "
                 f"lane_src={getattr(pout, 'lane_source', 'none')} "
                 f"frame_age_s={float(getattr(pout, 'frame_age_s', 0.0) or 0.0):.3f} "
-                f"frame_cmd_ms={frame_cmd_ms:.1f}",
+                f"frame_cmd_ms={frame_cmd_ms:.1f} "
+                f"view_ms={view_ms:.3f} view={(st.get('scene_view') or {}).get('status', 'off')} "
+                f"view_dropped={(st.get('scene_view') or {}).get('dropped', 0)}",
                 flush=True,
             )
 
@@ -1683,6 +1726,11 @@ def main(clock=None) -> None:
     except KeyboardInterrupt:
         print("[GVD] stopped.")
     finally:
+        try:
+            if scene_viewer is not None:
+                scene_viewer.close()
+        except Exception:
+            pass
         try:
             if hasattr(actuator, "note_engaged"):
                 actuator.note_engaged(False)  # cmd_json: Lua releases the car at once

@@ -1839,6 +1839,11 @@ def render_stage(
             max_dist=RIBBON_FLARE_M + 0.45,
             mark_origin=True,
         )
+    if state.get("scene_view"):
+        # View-only scene net (a view-only same-map experiment): amber lane_gt lines + label.
+        from python.viz.scene_view import draw_scene_view
+
+        draw_scene_view(img, cam, state.get("scene_view"))
 
     if main_frame is not None and getattr(main_frame, "size", 0) and not drop_heavy and dbg.viz_pip:
         pip = np.full((180, 320, 3), (28, 28, 28), dtype=np.uint8)

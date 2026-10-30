@@ -116,6 +116,167 @@ class _Bng:
         return None
 
 
+class _Game:
+    """BeamNG as BeamNGpy 1.36 sees it, for counting round-trips.
+
+    ``Connection.send`` only writes a request; ``Response.recv`` blocks until the
+    reply arrives, and replies are matched by request id (out-of-order replies are
+    buffered). The game answers on its next frame, and one frame answers every
+    request already sent on any socket (vehicle and engine). A ``recv`` whose reply
+    is not there yet waits for that frame: one wait is one round-trip.
+    """
+
+    def __init__(self) -> None:
+        self.pending: list[tuple["_Conn", int, dict]] = []
+        self.frames: list[list[dict]] = []  # the requests each wait answered
+
+    def wait(self) -> None:
+        batch, self.pending = self.pending, []
+        for conn, rid, data in batch:
+            conn.replies[rid] = conn.answer(data)
+        self.frames.append([data for _conn, _rid, data in batch])
+
+
+class _Conn:
+    def __init__(self, game: _Game, answer) -> None:
+        self.game, self.answer = game, answer
+        self.req_id = 0
+        self.replies: dict[int, dict] = {}
+
+    def send(self, data: dict) -> "_Resp":
+        self.req_id += 1
+        self.game.pending.append((self, self.req_id, dict(data)))
+        return _Resp(self, self.req_id)
+
+    def recv(self, rid: int) -> dict:
+        if rid not in self.replies:
+            self.game.wait()
+        return self.replies.pop(rid)
+
+
+class _Resp:
+    def __init__(self, conn: _Conn, rid: int) -> None:
+        self.conn, self.rid = conn, rid
+
+    def recv(self, type: str | None = None) -> dict:  # noqa: A002 - BeamNGpy's name
+        msg = self.conn.recv(self.rid)
+        if isinstance(msg, Exception):  # BeamNGpy turns a bngError reply into a raise
+            raise msg
+        if type and msg["type"] != type:
+            raise ValueError(f"got {msg['type']} expected {type}")
+        return msg
+
+
+class _WireVehicle(_Vehicle):
+    """``_Vehicle`` behind a fake BeamNGpy vehicle socket: every call is a request."""
+
+    def __init__(self, stop: Path, game: _Game, stop_after: int = 1, fail_lua: bool = False) -> None:
+        super().__init__(stop, stop_after)
+        self.connection = _Conn(game, self._answer)
+        self.fail_lua = fail_lua
+
+    def _answer(self, data: dict) -> object:
+        if self.fail_lua and "lastInputs" in str(data.get("chunk")):
+            self.probes += 1
+            return RuntimeError("bngError: lua")
+        if data["type"] == "SensorRequest":
+            _Vehicle.poll_sensors(self)
+            return {"type": "SensorData", "data": {}}
+        if data["type"] == "QueueLuaCommandVE":
+            resp = _Vehicle.queue_lua_command(self, data["chunk"], data["resp"])
+            return {"type": "ExecutedLuaChunkVE", "resp": resp}
+        raise AssertionError(data)
+
+    def _send(self, data: dict) -> _Resp:
+        return self.connection.send(data)
+
+    def poll_sensors(self) -> None:  # Sensors.poll: State, Electrics, Damage in one SensorRequest
+        self._send({"type": "SensorRequest", "sensors": {"state": {"type": "State"}}}).recv("SensorData")
+
+    def queue_lua_command(self, command: str, response: bool = False) -> object:
+        data = {"type": "QueueLuaCommandVE", "chunk": command, "resp": response}
+        return self._send(data).recv("ExecutedLuaChunkVE").get("resp", None)
+
+
+class _WireBng(_Bng):
+    """``_Bng`` behind a fake BeamNGpy engine socket on the same game."""
+
+    def __init__(self, vehicle: _Vehicle, game: _Game) -> None:
+        super().__init__(vehicle)
+        self.connection = _Conn(game, self._answer)
+
+    fail_lua = False
+
+    def _answer(self, data: dict) -> object:
+        assert data["type"] == "QueueLuaCommandGE", data
+        if self.fail_lua and "gvd_traffic_" in str(data.get("chunk")):
+            self.traffic_calls += 1
+            return RuntimeError("bngError: lua")
+        return {"type": "ExecutedLuaChunkGE", "resp": _Bng.queue_lua_command(self, data["chunk"], data["resp"])}
+
+    def _send(self, data: dict) -> _Resp:
+        return self.connection.send(data)
+
+    def queue_lua_command(self, command: str, response: bool = False) -> object:
+        data = {"type": "QueueLuaCommandGE", "chunk": command, "resp": response}
+        return self._send(data).recv("ExecutedLuaChunkGE").get("resp", None)
+
+
+def _kind(data: dict) -> str:
+    chunk = str(data.get("chunk") or "")
+    if data["type"] == "SensorRequest":
+        return "poll"
+    if "lastInputs" in chunk:
+        return "probe"
+    if "gvd_traffic_" in chunk:
+        return "traffic"
+    return "other"
+
+
+def check_probe_round_trips() -> None:
+    """The control probe and the traffic read ride the sensor poll's round-trip.
+
+    Per tick the collector polls the sensors once (one round-trip). The probe
+    and the 2 Hz traffic read must not add a wait of their own: each is
+    answered in the same frame as that tick's poll. Every recorded field stays
+    what the separate calls gave.
+    """
+    for every, fail in ((1, False), (2, False), (1, True)):
+        with collect_root() as root:
+            out = root / "scene"
+            game = _Game()
+            vehicle = _WireVehicle(stop_file(out), game, stop_after=4, fail_lua=fail)
+            bng = _WireBng(vehicle, game)
+            bng.fail_lua = fail
+            code = _collect(root, out, bng, ["--ctl-probe-every", str(every)])
+            assert code == 0, code
+            lines = (out / "state.jsonl").read_text(encoding="utf-8").splitlines()
+            rows = [json.loads(x) for x in lines]
+            assert len(rows) >= 3, len(rows)
+            for k, (row, line) in enumerate(zip(rows, lines)):
+                _check_control_row(row, line, probed=not fail and k % every == 0)
+            if fail:  # a failed probe or traffic read is null, never 0, and the row is still written
+                assert all(r["traffic"] is None for r in rows), [r["traffic"] for r in rows]
+            else:
+                assert rows[0]["traffic"] == [TRAFFIC_CAR]
+            assert all(r["traffic"] is None for r in rows[1:])
+            assert rows[0]["veh_meta"] == {"model": "etk800", "steer_lock_deg": 450.0, "wheelbase_m": 2.91}
+            kinds = [[_kind(d) for d in frame] for frame in game.frames]
+            ticks = sum(k.count("poll") for k in kinds)
+            probes = sum(k.count("probe") for k in kinds)
+            traffic = sum(k.count("traffic") for k in kinds)
+            counts = (ticks, vehicle.polls, probes, vehicle.probes, traffic, bng.traffic_calls)
+            assert ticks == vehicle.polls and probes == vehicle.probes and traffic == bng.traffic_calls == 1, counts
+            assert probes == (ticks + every - 1) // every, (probes, ticks)
+            tick_frames = [k for k in kinds if {"poll", "probe", "traffic"} & set(k)]
+            own_waits = sum(1 for k in tick_frames if "poll" not in k)
+            print(f"round-trips every={every} fail={fail} ticks={ticks} probes={probes} traffic={traffic} "
+                  f"tick_waits={len(tick_frames)} probe_or_traffic_own_waits={own_waits}")
+            # One wait per tick: the sensor poll. The probe adds 0 round-trips.
+            assert own_waits == 0, kinds
+            assert len(tick_frames) == ticks, kinds
+
+
 class _Cam:
     def poll(self) -> dict[str, object]:
         image = np.zeros((8, 8, 3), dtype=np.uint8)
@@ -318,6 +479,7 @@ def main() -> None:
     check_all_cameras_dead()
     check_one_tick()
     check_probe_every_2_and_traffic_rate()
+    check_probe_round_trips()
     print("collect tick ok")
 
 

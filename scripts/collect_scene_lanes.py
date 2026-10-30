@@ -59,7 +59,9 @@ Row fields in ``state.jsonl`` written by this collector, besides the frame data:
   uses information the cameras do not see. ``veh`` (electrics whitelist),
   ``ai_cmd`` (the AI commands this collector sent), ``road`` (fields already
   computed for ``gt``), ``traffic`` (2 Hz, null on other rows), and
-  ``veh_meta`` on the first row after each spawn. A failed read is null; it
+  ``veh_meta`` on the first row after each spawn. The probe and the traffic
+  read are sent before the sensor poll and answered in the same game frame,
+  so they add no round-trip of their own. A failed read is null; it
   never stops collection. ``--max-file-gib`` stops with exit 7 (``file_cap``).
 
 ``impacts.jsonl`` beside ``state.jsonl`` has one ``{"kind": "impact", "t",
@@ -160,6 +162,7 @@ import datetime
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -972,7 +975,7 @@ def _queue(vehicle: Any, command: str) -> None:
 
 
 def _largest_file(out: Path) -> tuple[str, int] | None:
-    """Name and size of the biggest top-level file in ``out`` (jsonl logs; PNGs live in subfolders)."""
+    """Name and size of the biggest top-level file in ``out`` (logs, cameras.json; PNGs live in subfolders)."""
     best: tuple[str, int] | None = None
     try:
         for entry in os.scandir(out):
@@ -1288,24 +1291,88 @@ def vehicle_half_width(vehicle: Any) -> tuple[float | None, str]:
     return None, f"{note}; model={model or 'unknown'} is not {ETK800}, no known width"
 
 
+_SHA_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+
+
+def _git_dir(root: Path) -> Path | None:
+    """``root/.git``, or where a ``.git`` file (``gitdir: <path>``) points."""
+    dot = root / ".git"
+    if dot.is_dir():
+        return dot
+    if dot.is_file():
+        text = dot.read_text(encoding="utf-8", errors="replace").strip()
+        if text.startswith("gitdir:"):
+            return (root / text[len("gitdir:"):].strip()).resolve()
+    return None
+
+
+def _head_from_files(root: Path) -> str | None:
+    """HEAD's commit read from ``.git`` directly: HEAD, then a loose ref, then packed-refs.
+
+    For a checkout git will not open (its ownership check fails on a drive
+    with no file owners, such as FAT32). Read-only: nothing is written.
+    """
+    git = _git_dir(root)
+    if git is None:
+        return None
+    head = (git / "HEAD").read_text(encoding="utf-8", errors="replace").strip()
+    if _SHA_RE.fullmatch(head):
+        return head  # detached
+    if not head.startswith("ref:"):
+        return None
+    ref = head[len("ref:"):].strip()
+    common = git
+    if (git / "commondir").is_file():  # a linked worktree keeps refs in the main .git
+        common = (git / (git / "commondir").read_text(encoding="utf-8").strip()).resolve()
+    for base in (git, common):
+        loose = base / ref
+        if loose.is_file():
+            sha = loose.read_text(encoding="utf-8", errors="replace").strip()
+            if _SHA_RE.fullmatch(sha):
+                return sha
+    packed = common / "packed-refs"
+    if packed.is_file():
+        for line in packed.read_text(encoding="utf-8", errors="replace").splitlines():
+            parts = line.strip().split(" ", 1)
+            if len(parts) == 2 and parts[1] == ref and _SHA_RE.fullmatch(parts[0]):
+                return parts[0]
+    return None
+
+
 def code_pin(repo: Path | None = None, argv: list[str] | None = None) -> dict[str, Any]:
-    """``code_sha``, ``code_dirty`` (bool, or "unknown") and ``argv`` for this run."""
+    """``code_sha``, ``code_dirty`` (bool, or "unknown") and ``argv`` for this run.
+
+    ``git rev-parse HEAD`` first. If git refuses the checkout (its
+    safe.directory ownership check), again with ``-c safe.directory=<repo>``
+    for this one command; no git config is written. If git still gives
+    nothing, HEAD is read from ``.git`` (loose ref or packed-refs) and
+    ``code_dirty`` stays "unknown".
+    """
     root = Path(repo) if repo is not None else Path(__file__).resolve().parents[1]
     sha: str = "unknown"
     dirty: Any = "unknown"
-    try:
-        head = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=15
-        )
-        if head.returncode == 0 and head.stdout.strip():
+    safe = ["-c", f"safe.directory={root.resolve().as_posix()}"]
+    for extra in ([], safe):
+        try:
+            head = subprocess.run(
+                ["git", *extra, "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=15
+            )
+            if head.returncode != 0 or not _SHA_RE.fullmatch(head.stdout.strip()):
+                continue
             sha = head.stdout.strip()
             status = subprocess.run(
-                ["git", "-C", str(root), "status", "--porcelain"], capture_output=True, text=True, timeout=30
+                ["git", *extra, "-C", str(root), "status", "--porcelain"], capture_output=True, text=True, timeout=30
             )
             if status.returncode == 0:
                 dirty = bool(status.stdout.strip())
-    except (OSError, subprocess.SubprocessError, ValueError):
-        pass
+            break
+        except (OSError, subprocess.SubprocessError, ValueError):
+            continue
+    if sha == "unknown":
+        try:
+            sha = _head_from_files(root) or "unknown"
+        except (OSError, ValueError):
+            sha = "unknown"
     full = [sys.executable] + (list(sys.argv) if argv is None else [str(Path(__file__).resolve())] + [str(a) for a in argv])
     return {"code_sha": sha, "code_dirty": dirty, "argv": full}
 
@@ -2412,18 +2479,23 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 run.stop("camera_outage", outage)
                 return 4
             veh_mark = time.monotonic()
-            sample = _read_vehicle(vehicle)
-            probe = control_log.probe_nulls()
-            if ctl_ticks % int(args.ctl_probe_every) == 0:
-                probe = control_log.parse_ve_probe(_ask_vehicle(vehicle, control_log.VE_PROBE))
+            want_probe = ctl_ticks % int(args.ctl_probe_every) == 0
             ctl_ticks += 1
-            traffic_now = None
-            if ctl_traffic_at is None or veh_mark - ctl_traffic_at >= control_log.TRAFFIC_EVERY_S:
+            want_traffic = ctl_traffic_at is None or veh_mark - ctl_traffic_at >= control_log.TRAFFIC_EVERY_S
+            if want_traffic:
                 ctl_traffic_at = veh_mark
+            # The probe and the traffic read share the sensor poll's round-trip.
+            sample, probe_reply, traffic_reply = _read_vehicle_ctl(
+                vehicle,
+                bng,
+                control_log.VE_PROBE if want_probe else None,
+                control_log.TRAFFIC_CHUNK if want_traffic else None,
+            )
+            probe = control_log.parse_ve_probe(probe_reply) if want_probe else control_log.probe_nulls()
+            traffic_now = None
+            if want_traffic:
                 try:
-                    from python.collect.level_session import lua_call
-
-                    traffic_now = control_log.parse_traffic(lua_call(bng, control_log.TRAFFIC_CHUNK))
+                    traffic_now = control_log.parse_traffic(traffic_reply)
                 except Exception:
                     traffic_now = None
             ticks.add("veh_s", time.monotonic() - veh_mark)
@@ -3411,6 +3483,60 @@ def _write_collect_crash(directory: Any, message: str, reasons: dict[str, str]) 
     path = Path(directory) / "collect_crash.txt"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(message.rstrip() + "\n" + json.dumps(reasons, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _send_ahead(owner: Any, msg_type: str, chunk: str | None) -> Any:
+    """Write one BeamNGpy Lua request without waiting for its reply (``None`` if it cannot)."""
+    send = getattr(owner, "_send", None)
+    if chunk is None or not callable(send):
+        return None
+    try:
+        return send({"type": msg_type, "chunk": chunk, "resp": True})
+    except Exception:
+        return None
+
+
+def _reply_of(pending: Any, reply_type: str) -> Any:
+    """The Lua reply of a request sent by ``_send_ahead``. Any failure is ``None``."""
+    try:
+        return pending.recv(reply_type).get("resp", None)
+    except Exception:
+        return None
+
+
+def _read_vehicle_ctl(
+    vehicle: Any, bng: Any, probe_chunk: str | None, traffic_chunk: str | None
+) -> tuple[dict[str, Any], Any, Any]:
+    """``_read_vehicle`` plus the control probe (vehicle Lua) and the traffic read (GE Lua).
+
+    Each BeamNGpy call waits for the game to answer, and the game answers on
+    its next frame, so a separate probe and traffic call each cost a frame on
+    top of the sensor poll. Here both requests are written first (BeamNGpy's
+    ``_send``, which does not wait), then the sensor poll waits once, and the
+    game answers all three on that frame. Replies are matched by request id, so
+    the probe's reply is buffered while the poll waits. Same Lua chunks, same
+    replies. When this BeamNGpy has no ``_send`` the calls run one after
+    another, as before. Returns ``(sample, probe reply, traffic reply)``;
+    a reply is ``None`` when not asked or when it failed.
+    """
+    ve = _send_ahead(vehicle, "QueueLuaCommandVE", probe_chunk)
+    ge = _send_ahead(bng, "QueueLuaCommandGE", traffic_chunk)
+    sample = _read_vehicle(vehicle)
+    probe = None
+    if probe_chunk is not None:
+        probe = _reply_of(ve, "ExecutedLuaChunkVE") if ve is not None else _ask_vehicle(vehicle, probe_chunk)
+    traffic = None
+    if traffic_chunk is not None:
+        if ge is not None:
+            traffic = _reply_of(ge, "ExecutedLuaChunkGE")
+        else:
+            try:
+                from python.collect.level_session import lua_call
+
+                traffic = lua_call(bng, traffic_chunk)
+            except Exception:
+                traffic = None
+    return sample, probe, traffic
 
 
 def _read_vehicle(vehicle: Any) -> dict[str, Any]:

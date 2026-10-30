@@ -3160,9 +3160,11 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             tags["traffic"] = traffic_now
             if ctl_meta_for != spawn_seq:
                 meta = control_log.parse_ve_meta(_ask_vehicle(vehicle, control_log.VE_META_PROBE))
-                model_now = vehicle_model(vehicle) or (str(args.ego_model) if ego_spawned else None)
+                # A spawned ego is the model the spawn asked for; the live object (maybe None)
+                # only names the car a single-level run found already there.
+                model_now = (str(args.ego_model) if ego_spawned else None) or vehicle_model(vehicle)
                 spec = {"part_config": str(args.ego_config)} if ego_spawned else {}
-                tags["veh_meta"] = {"model": vehicle_model(vehicle), **spec, **meta}
+                tags["veh_meta"] = {"model": model_now, **spec, **meta}
                 if model_now and model_now != camera_rig and model_now not in rig_warned:
                     rig_warned.add(model_now)
                     print(f"collect WARNING camera rig calibrated on {camera_rig}, ego model is {model_now}: "

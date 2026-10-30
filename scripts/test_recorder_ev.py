@@ -312,6 +312,27 @@ def check_veh_meta_and_rig_warning() -> None:
     print("veh_meta: model=sbr part_config recorded per spawn; collect.json ego; sbr rig, warning only off-rig OK")
 
 
+def check_ego_model_reaches_spawn() -> None:
+    """--ego-model sbr2 (neither the default nor the mock's etk800): the spawn is asked for sbr2,
+    and veh_meta / collect.json carry the spawned model, not the live vehicle object's."""
+    import python.collect.level_session as ls
+
+    asked: list[dict] = []
+    try:
+        code, text, out = _west(lambda n: "", ["--ego-model", "sbr2", "--ego-config", "vehicles/sbr2/x.pc"], 60,
+                                enter_hook=lambda level: asked.append(ls.ego_spec()))
+    finally:
+        ls.set_ego(ls.EGO_MODEL_DEFAULT, ls.EGO_CONFIG_DEFAULT)
+    assert code == 0, text[-2000:]
+    assert asked and all(a == {"model": "sbr2", "part_config": "vehicles/sbr2/x.pc"} for a in asked), asked
+    metas = [r["veh_meta"] for r in _rows(out) if "veh_meta" in r]
+    assert metas and metas[0]["model"] == "sbr2" and metas[0]["part_config"] == "vehicles/sbr2/x.pc", metas
+    ego = json.loads((out / "collect.json").read_text(encoding="utf-8"))["ego"]
+    assert ego["model"] == "sbr2" and ego["camera_rig_model"] == "etk800", ego
+    assert text.count("collect WARNING camera rig calibrated on etk800, ego model is sbr2") == 1, text[:3000]
+    print("ego model: --ego-model sbr2 reaches the spawn; veh_meta model is the spawned sbr2 OK")
+
+
 def _respawn_rows(rows: list[dict]) -> list[float]:
     """done_s (0.1 s per row) where a settle run starts: one per spawn."""
     out, prev = [], False
@@ -323,7 +344,7 @@ def _respawn_rows(rows: list[dict]) -> list[float]:
     return out
 
 
-def _west(pattern, extra: list[str], stop_at: int):
+def _west(pattern, extra: list[str], stop_at: int, enter_hook=None):
     import scripts.collect_scene_lanes as collect
     import scripts.test_collect_spawn_fix as sf
     from python.collect.spawn_mix import CITY
@@ -340,7 +361,8 @@ def _west(pattern, extra: list[str], stop_at: int):
         here = sf._road("here", [(0.4, -300), (0.4, 600)])
         east = [sf._road(f"east{j}", [(5000 + 50 * j, 0), (5000 + 50 * j, 500)]) for j in range(40)]
         paint = sf._Paint(lambda x, y: True)
-        return sf._run_west_coast(paint, {CITY: [here] + east, "highway": [], "ramp": []}, extra, stop_at)
+        return sf._run_west_coast(paint, {CITY: [here] + east, "highway": [], "ramp": []}, extra, stop_at,
+                                  enter_hook=enter_hook)
     finally:
         collect.boundary_wait_reason = real  # type: ignore[assignment]
 
@@ -431,6 +453,7 @@ def main() -> None:
     check_defaults()
     check_boundary_defer_unit()
     check_veh_meta_and_rig_warning()
+    check_ego_model_reaches_spawn()
     check_respawn_deferred_run()
     check_segment_deferred_run()
     check_segment_cap_run()

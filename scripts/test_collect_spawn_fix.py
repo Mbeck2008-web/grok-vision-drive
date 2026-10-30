@@ -817,17 +817,20 @@ def check_recheck_coverage_from_pose() -> None:
 
 
 def _run_west_coast(paint, pools: dict, extra: list[str], stop_at: int, root: Path | None = None,
-                    speed_at=None) -> tuple[int, str, Path]:
+                    speed_at=None, enter_hook=None) -> tuple[int, str, Path]:
     """The mocked collector on a west_coast_usa map rotation with a mocked deck.
 
     The car holds (0.4, 12, 0.5) heading +y at 10 m/s; a teleport does not move it.
+    ``enter_hook(level)`` runs at each mocked level load (where the real spawn happens).
     """
     import scripts.collect_scene_lanes as collect
     import python.collect.spawn_mix as spawn_mix
     from python.collect.level_session import OpenedLevel
 
     def enter(bng, level, cfg, cams):
-        del level, cfg, cams
+        del cfg, cams
+        if enter_hook is not None:
+            enter_hook(level)
         return OpenedLevel(vehicle=bng.vehicles.vehicle, roads=[RoadPoly("r", [(0.0, 0.0), (0.0, 80.0)], 7.0)],
                            spawn=(0.4, 12.0, 0.5), cameras={"main": _Cam()})
 

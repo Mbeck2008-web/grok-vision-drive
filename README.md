@@ -24,7 +24,7 @@ Trainer collapse fixes and event masking (`--mask-events`) are pending in PR #87
 Windows. You do not need an administrator account. The full agent procedure (Tech launch flags, data disk, collect, validate, train) is [AGENTS.md](AGENTS.md). Shell debugging is [DEBUGGING.md](DEBUGGING.md).
 
 1. Run `install.bat`, then enable **Grok Vision Drive** in the BeamNG Mod Manager.
-2. BeamNG.tech (eight cameras): start one game with `BeamNG.tech.exe -tcom -console -gfx dx11` (port 25252), then run `play_gvd_tech.bat`.
+2. BeamNG.tech (eight cameras): start one game with `BeamNG.tech.exe -tcom -console -gfx vk` (Vulkan, port 25252; see [Renderer](#renderer-vulkan--gfx-vk)), then run `play_gvd_tech.bat`.
    The Tech path requires beamngpy 1.36+ (BeamNG.tech 0.39); install `requirements-beamng.txt`.
    BeamNG.drive (one window capture): run `play_gvd.bat`.
 3. The **GVD VISION** window opens. Add the **GVD** app in BeamNG's UI Apps.
@@ -309,6 +309,52 @@ The settled game view. Soft Esc parked.
 ### rear
 
 ![rear](docs/cams/rear.jpg)
+
+## Renderer: Vulkan (`-gfx vk`)
+
+Start BeamNG.tech with Vulkan: `BeamNG.tech.exe -tcom -console -gfx vk`. GVD's BeamNGpy launch path and `play_gvd_tech.bat` use the same flag. **Proven live: recording only** for a 60 s collector smoke on the dev PC on 2026-10-30. Nothing about GVD driving the car is proven by it.
+
+DX11 vs Vulkan A/B on the dev PC: each run was a 60 s collector smoke on west_coast_usa, 2 traffic cars, `--no-vary-env`, the same spawn (road 897170), eight cameras. A CPU screen recorder (libx264) ran during every run, so these Hz figures are lower than an unrecorded run.
+
+| Metric | DX11 | Vulkan (warm shader cache) |
+| --- | --- | --- |
+| Collector ticks (Hz) | 8.93 | 9.20 |
+| State rows (Hz) | 8.97 | 9.28 |
+| `veh_s` p50 / p95 / mean (ms) | 16 / 47 / 20.5 | 15 / 31 / 11.6 |
+| `poll_s` mean / p95 (ms), camera poll | 11.1 / 16 | 11.1 / 16 |
+| 10 Hz camera rate (unique frames/s) | 8.96 | 9.23 |
+| 2 Hz camera rate | 2.00 | 1.95 |
+| 1 Hz camera rate | 1.00 | 0.98–1.00 |
+| VRAM mean / max (MiB) | 4976 / 5559 | 4265 / 4389 (about 14% lower) |
+| GPU utilization mean | 54% | 86% |
+| Render FPS instantaneous / average | 29.4 / 30.3 | 55.4 / 62.8 |
+| Window clip fps | 31.4 | 39 |
+| Dark / missing / unreadable frames | 0 / 0 / 0 | 0 / 0 / 0 |
+| New `beamng.log` errors vs DX11 | — | none |
+| Crash or device lost | none | none |
+
+Cold start: the first Vulkan launch with an empty shader cache took about 3.5 min to bring the cameras up (DX11 46 s, warm Vulkan 44 s). The level load was slow enough that the collector retried the scenario, and repeatR had 1 dark frame at startup.
+
+How each number was measured:
+
+- Collector ticks Hz: tick count over the time span in `ticks.jsonl`.
+- State rows Hz: row count over the time span in `state.jsonl`.
+- `veh_s`: per-tick vehicle-sensor time from `ticks.jsonl`.
+- `poll_s`: per-tick camera shared-memory poll time from `ticks.jsonl`; the timer granularity is about 15.6 ms.
+- Camera rates: unique frames over the time span, per camera rate group.
+- Dark / missing / unreadable: a saved PNG is dark when its mean luma is below 10; identical repeats were checked with md5 on every saved PNG.
+- VRAM and GPU utilization: `nvidia-smi` sampled at 1 Hz over the driving window.
+- Render FPS: BeamNG's `$fps::instantaneous` / `$fps::avg` registry values sampled at 1 Hz.
+- Window clip fps: frame rate of the screen recording of the game window.
+- Renderer: confirmed by the window title, `Engine.Render.getAdapterType()` and `beamng.log`.
+- New errors: diff of normalized error and warning signatures in `beamng.log` against the DX11 run.
+
+Caveats:
+
+- A 2 h run on Vulkan is untested. Only the 60 s smokes above are on file.
+- BeamNG's documentation warns that Vulkan in BeamNG.tech may crash with annotated cameras or multi-sensor setups. GVD runs eight cameras. If Tech crashes or loses the device, fall back to `-gfx dx11`.
+- GPU utilization is higher on Vulkan (86% vs 54%) because the render frame rate is uncapped.
+- The first launch after a BeamNG update or a shader cache clear is slow while shaders compile. Wait for the cameras before judging Hz.
 
 ## Version
 

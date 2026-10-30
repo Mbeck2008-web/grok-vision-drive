@@ -1599,7 +1599,8 @@ def main(clock=None) -> None:
                 f"frame_age_s={float(getattr(pout, 'frame_age_s', 0.0) or 0.0):.3f} "
                 f"frame_cmd_ms={frame_cmd_ms:.1f} "
                 f"view_ms={view_ms:.3f} view={(st.get('scene_view') or {}).get('status', 'off')} "
-                f"view_dropped={(st.get('scene_view') or {}).get('dropped', 0)}",
+                f"view_dropped={(st.get('scene_view') or {}).get('dropped', 0)} "
+                f"view_rss_mb={(st.get('scene_view') or {}).get('child_rss_mb', 0.0):.0f}",
                 flush=True,
             )
 

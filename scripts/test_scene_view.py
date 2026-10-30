@@ -22,8 +22,17 @@ Checks (spec "live scene viewer" rev 3, tests 1-7):
 6. Failure + catalog: missing file, wrong strip width, lane71 without cam ages -> badge, no
    exception; e2e_choices() lists e2e_current.onnx and not e2e_scene.onnx.
 7. Model file untouched: sha256 and mtime unchanged after load, switch, reset.
+8. The child process never blocks the tick: a slow fake forward never blocks submit; drops while
+   busy; badge "slow"; close() <= 0.6 s and the shared memory is gone.
+9. The main process never imports torch or onnxruntime for the viewer: a fresh interpreter
+   selects, steps and switches between two real exported models; sys.modules checked each time.
+10. No orphans: SIGKILL the parent of a live viewer child; the child is gone within 3 s.
+11. A switch shows badge "loading" and no lane lines until the new model's first result.
+
+Rev 4: the forward runs in a child process (spawn); see the module docstring.
 
     py -3 scripts/test_scene_view.py
+    py -3 scripts/test_scene_view.py --ratio   # report-only: on/off heartbeat p99 ratio, 5 pairs
 """
 from __future__ import annotations
 
@@ -139,7 +148,7 @@ def check_1_forward_both_contracts() -> None:
             fresh = _fresh_state(path, cam_age)
             clock = FakeClock()
             viewer = SV.SceneNetViewer({path.stem: path}, hz=HZ, can_feed_cam_age=cam_age,
-                                       threaded=False, clock=clock)
+                                       inline=True, clock=clock)
             viewer.select(path.stem)
             backend = SimpleNamespace(enable_live_hold=lambda: None, reset_live_hold=lambda: None)
             rt = viewer.runtime
@@ -304,7 +313,7 @@ def check_3_cannot_actuate() -> None:
 
     rng = np.random.default_rng(3)
     clock = FakeClock()
-    on = SV.SceneNetViewer({}, hz=HZ, can_feed_cam_age=False, threaded=False, clock=clock)
+    on = SV.SceneNetViewer({}, hz=HZ, can_feed_cam_age=False, inline=True, clock=clock)
     results = {}
     for label, viewer in (("off", None), ("on", on), ("raising", Raising())):
         act = Rec()
@@ -526,7 +535,7 @@ def check_6_failure_and_catalog() -> None:
     rng = np.random.default_rng(5)
     with tempfile.TemporaryDirectory() as tmp:
         missing = Path(tmp) / "nope.onnx"
-        viewer = SV.SceneNetViewer({"nope": missing}, hz=HZ, can_feed_cam_age=False, threaded=False, clock=clock)
+        viewer = SV.SceneNetViewer({"nope": missing}, hz=HZ, can_feed_cam_age=False, inline=True, clock=clock)
         viewer.select("nope")
         clock.tick()
         viewer.submit(_bundle(_frames(rng, ("main",)), clock()), backend=None, prev_heartbeat_ms=5.0, loop_gap_s=0.066)
@@ -539,7 +548,7 @@ def check_6_failure_and_catalog() -> None:
             lane71 = _export(Path(tmp) / "lane71.onnx", cam_age=True)
             v1 = _export(Path(tmp) / "v1.onnx", cams=("main",))
             viewer = SV.SceneNetViewer({"lane71": lane71, "v1": v1}, hz=HZ, can_feed_cam_age=False,
-                                       threaded=False, clock=clock)
+                                       inline=True, clock=clock)
             viewer.select("lane71")
             v = viewer.latest()
             assert v.status == "refused" and v.badge == SV.LANE71_BADGE, v
@@ -556,7 +565,7 @@ def check_6_failure_and_catalog() -> None:
             wrong = Path(tmp) / "wrong.onnx"
             onnx.save(model, str(wrong))
             viewer = SV.SceneNetViewer({"wrong": wrong, "v1": v1}, hz=HZ, can_feed_cam_age=False,
-                                       threaded=False, clock=clock)
+                                       inline=True, clock=clock)
             viewer.select("wrong")
             v = viewer.latest()
             assert v.status == "refused" and "width" in v.badge, v
@@ -578,7 +587,7 @@ def check_6_failure_and_catalog() -> None:
             pass
 
     viewer = SV.SceneNetViewer({"boom": Path("boom.onnx")}, hz=HZ, can_feed_cam_age=False,
-                               runtime_factory=Boom, threaded=False, clock=clock)
+                               runtime_factory=Boom, inline=True, clock=clock)
     viewer.select("boom")
     for n in range(1, 5):
         clock.tick()
@@ -635,7 +644,7 @@ def check_7_model_untouched() -> None:
         before = {p: _fingerprint(p) for p in (a, b)}
         listing = sorted(os.listdir(tmp))
         clock = FakeClock()
-        viewer = SV.SceneNetViewer({"a": a, "b": b}, hz=HZ, can_feed_cam_age=False, threaded=False, clock=clock)
+        viewer = SV.SceneNetViewer({"a": a, "b": b}, hz=HZ, can_feed_cam_age=False, inline=True, clock=clock)
         for stem in ("a", "b", "a"):
             viewer.select(stem)
             for _ in range(3):
@@ -651,36 +660,35 @@ def check_7_model_untouched() -> None:
     print("model files: sha256, mtime and folder listing unchanged after load, switch, reset OK")
 
 
-# ---- threaded viewer: never blocks, never raises ----------------------------------------
+# ---- 8. the child process never blocks the tick ------------------------------------------
 
 
-def check_8_threaded_never_blocks() -> None:
-    """The real worker thread: a slow fake forward never blocks submit; close() joins in 0.5 s."""
+SLOW_FACTORY = "gvd_slow_view_child:SlowRuntime"
 
-    class Slow:
-        cams = ("main",)
-        canvas_w = canvas_width(("main",))
-        cam_age = False
-        ready = True
-        reason = "ok"
 
-        def __init__(self, *_a, **_k) -> None:
-            self.last_timers = {}
+def _wait_status(viewer, ok, timeout_s: float = 30.0, *, rng=None, seen=None):
+    """Submit frames at HZ until ``ok(view)``; returns the view. Records every view in ``seen``."""
+    rng = rng if rng is not None else np.random.default_rng(0)
+    t_end = time.monotonic() + timeout_s
+    while time.monotonic() < t_end:
+        viewer.submit(_bundle(_frames(rng, ("main",)), time.time()), backend=None,
+                      prev_heartbeat_ms=5.0, loop_gap_s=1.0 / HZ)
+        v = viewer.latest()
+        if seen is not None:
+            seen.append(v)
+        if ok(v):
+            return v
+        time.sleep(1.0 / HZ)
+    raise AssertionError(f"timed out after {timeout_s} s: {viewer.latest()}")
 
-        def observe(self, strip, dt_s, ages=None):
-            time.sleep(0.2)
-            self.last_timers = {"scene_ms": 200.0}
-            return 0.0, 0.9
 
-        def output(self, name):
-            return np.zeros(14, np.float32) + 0.5
-
-        def reset_state(self) -> None:
-            pass
-
+def check_8_child_never_blocks() -> None:
+    """The real child process: a slow fake forward never blocks submit; close() <= 0.6 s."""
     rng = np.random.default_rng(11)
-    viewer = SV.SceneNetViewer({"slow": Path("slow.onnx")}, hz=HZ, can_feed_cam_age=False, runtime_factory=Slow)
+    viewer = SV.SceneNetViewer({"slow": Path("slow.onnx")}, hz=HZ, can_feed_cam_age=False,
+                               runtime_factory=(SLOW_FACTORY, {"forward_s": 0.2, "mode": "sleep"}))
     viewer.select("slow")
+    _wait_status(viewer, lambda v: v.status not in ("loading",), rng=rng)
     worst = 0.0
     t_end = time.monotonic() + 1.5
     while time.monotonic() < t_end:
@@ -689,13 +697,234 @@ def check_8_threaded_never_blocks() -> None:
         worst = max(worst, ms)
         time.sleep(1.0 / HZ)
     v = viewer.latest()
+    proc, shm_name = viewer.child, viewer.shm_name
+    assert proc is not None and proc.is_alive() and shm_name, (proc, shm_name)
     t0 = time.monotonic()
     viewer.close()
     joined = time.monotonic() - t0
     assert worst <= 0.10 * P_MS, worst
     assert v.dropped > 0 and v.status == "slow" and v.badge == "slow", v
+    assert v.child_rss_mb > 0.0, v
     assert joined <= 0.6, joined
-    print(f"threaded: worst submit {worst:.3f} ms, dropped={v.dropped}, badge {v.badge!r}, close {joined:.2f} s OK")
+    assert not proc.is_alive() and proc.exitcode is not None, proc
+    if sys.platform.startswith("linux"):
+        assert not Path("/dev/shm", shm_name.lstrip("/")).exists(), shm_name
+    print(f"child: worst submit {worst:.3f} ms, dropped={v.dropped}, badge {v.badge!r}, "
+          f"child rss {v.child_rss_mb:.0f} MB, close {joined:.2f} s (exit {proc.exitcode}, shm gone) OK")
+
+
+# ---- 9. the main process never imports torch / onnxruntime --------------------------------
+
+_NO_TORCH_CHILD = r"""
+import json, sys, time
+from pathlib import Path
+sys.path[:0] = [sys.argv[1], sys.argv[1] + "/scripts"]
+import numpy as np
+from types import SimpleNamespace
+from python.viz import scene_view as SV
+
+HEAVY = ("torch", "onnxruntime")
+def heavy():
+    return sorted(m for m in sys.modules if m.split(".")[0] in HEAVY)
+a, b = Path(sys.argv[2]), Path(sys.argv[3])
+rng = np.random.default_rng(3)
+viewer = SV.SceneNetViewer({"a": a, "b": b}, hz=15.0, can_feed_cam_age=False)
+out = {"after_import": heavy()}
+def bundle():
+    return SimpleNamespace(frames={"main": rng.integers(0, 255, (120, 160, 3), dtype=np.uint8)},
+                           timestamps={"main": time.time()}, main_bgr=None)
+def run_until_ok(stem):
+    seen = []
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 60.0:
+        viewer.submit(bundle(), backend=None, prev_heartbeat_ms=5.0, loop_gap_s=1 / 15)
+        v = viewer.latest()
+        seen.append([v.stem, v.status, v.badge, len(v.lane_gt)])
+        if v.status == "ok" and v.stem == stem:
+            return time.monotonic() - t0, seen
+        time.sleep(1 / 15)
+    raise SystemExit(f"timeout {stem}: {viewer.latest()}")
+viewer.select("a"); out["after_select"] = heavy()
+out["load_a_s"], _ = run_until_ok("a"); out["after_step"] = heavy()
+for _ in range(10):
+    viewer.submit(bundle(), backend=None, prev_heartbeat_ms=5.0, loop_gap_s=1 / 15); time.sleep(1 / 15)
+viewer.select("b"); out["after_switch"] = heavy()
+out["load_b_s"], out["seen_b"] = run_until_ok("b"); out["after_switch_step"] = heavy()
+v = viewer.latest()
+out["rss_mb"] = v.child_rss_mb
+out["child_heavy"] = viewer.child_modules(HEAVY)
+viewer.close()
+print("RESULT " + json.dumps(out))
+"""
+
+
+def check_9_main_never_imports_torch() -> None:
+    if torch is None:
+        skip_check("main_never_imports_torch", "torch is not installed (tiny SceneNet export)")
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        a = _export(Path(tmp) / "a.onnx", cams=("main",))
+        b = _export(Path(tmp) / "b.onnx", cams=("main",))
+        script = Path(tmp) / "no_torch_child.py"
+        script.write_text(_NO_TORCH_CHILD, encoding="utf-8")
+        proc = subprocess.run([sys.executable, str(script), str(ROOT), str(a), str(b)], cwd=str(ROOT),
+                              capture_output=True, text=True, timeout=180)
+    lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")]
+    assert proc.returncode == 0 and lines, (proc.returncode, proc.stdout[-2000:], proc.stderr[-2000:])
+    out = json.loads(lines[-1][len("RESULT "):])
+    for key in ("after_import", "after_select", "after_step", "after_switch", "after_switch_step"):
+        assert out[key] == [], (key, out[key])
+    assert "torch" in out["child_heavy"] and "onnxruntime" in out["child_heavy"], out["child_heavy"]
+    # The switch: "loading", no lane lines, until b's first result.
+    for stem, status, badge, n in out["seen_b"]:
+        assert stem == "b", (stem, status)
+        if status != "ok":
+            assert status == "loading" and badge == "loading" and n == 0, (stem, status, badge, n)
+    assert out["rss_mb"] > 0.0, out["rss_mb"]
+    print(f"main process: no torch / onnxruntime after import, select, step, switch, step "
+          f"(child has {out['child_heavy']}); load a {out['load_a_s']:.2f} s, switch to b "
+          f"{out['load_b_s']:.2f} s shown as 'loading'; child rss {out['rss_mb']:.0f} MB OK")
+
+
+# ---- 10. no orphans ---------------------------------------------------------------------
+
+_ORPHAN_PARENT = r"""
+import sys, time
+from pathlib import Path
+sys.path[:0] = [sys.argv[1], sys.argv[1] + "/scripts"]
+import numpy as np
+from types import SimpleNamespace
+from python.viz import scene_view as SV
+viewer = SV.SceneNetViewer({"slow": Path("slow.onnx")}, hz=15.0, can_feed_cam_age=False,
+                           runtime_factory=("gvd_slow_view_child:SlowRuntime", {"forward_s": 0.4, "mode": "sleep"}))
+viewer.select("slow")
+rng = np.random.default_rng(1)
+t0 = time.monotonic()
+while time.monotonic() - t0 < 60.0:
+    viewer.submit(SimpleNamespace(frames={"main": rng.integers(0, 255, (120, 160, 3), dtype=np.uint8)},
+                                  timestamps={"main": time.time()}, main_bgr=None),
+                  backend=None, prev_heartbeat_ms=5.0, loop_gap_s=1 / 15)
+    if viewer.latest().status != "loading":
+        print(f"CHILD {viewer.child.pid}", flush=True)
+        break
+    time.sleep(1 / 15)
+time.sleep(60.0)
+"""
+
+ORPHAN_BOUND_S = 3.0
+
+
+def _pid_gone(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    stat = Path(f"/proc/{pid}/stat")
+    with contextlib.suppress(OSError):
+        return stat.read_text().split(") ", 1)[1].startswith("Z")  # a zombie has exited
+    return False
+
+
+def check_10_no_orphans() -> None:
+    if os.name != "posix":
+        skip_check("no_orphans_sigkill", "SIGKILL test is POSIX; Windows relies on the parent-pid watchdog + daemon")
+        return
+    import signal
+
+    with tempfile.TemporaryDirectory() as tmp:
+        script = Path(tmp) / "orphan_parent.py"
+        script.write_text(_ORPHAN_PARENT, encoding="utf-8")
+        parent = subprocess.Popen([sys.executable, "-u", str(script), str(ROOT)], cwd=str(ROOT),
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        child_pid = None
+        try:
+            t_end = time.monotonic() + 60.0
+            while time.monotonic() < t_end and child_pid is None:
+                line = parent.stdout.readline()
+                if not line:
+                    break
+                if line.startswith("CHILD "):
+                    child_pid = int(line.split()[1])
+            assert child_pid is not None, "the viewer child never came up"
+            assert not _pid_gone(child_pid), child_pid
+            parent.send_signal(signal.SIGKILL)
+            parent.wait(timeout=5)
+            t0 = time.monotonic()
+            while not _pid_gone(child_pid) and time.monotonic() - t0 < ORPHAN_BOUND_S:
+                time.sleep(0.02)
+            gone_s = time.monotonic() - t0
+        finally:
+            with contextlib.suppress(Exception):
+                parent.kill()
+            if child_pid is not None and not _pid_gone(child_pid):
+                with contextlib.suppress(Exception):
+                    os.kill(child_pid, signal.SIGKILL)
+    assert _pid_gone(child_pid), f"child {child_pid} outlived a SIGKILLed parent by {ORPHAN_BOUND_S} s"
+    print(f"no orphans: parent SIGKILLed, viewer child gone in {gone_s:.2f} s (bound {ORPHAN_BOUND_S} s) OK")
+
+
+# ---- 11. a switch shows "loading", never a stale overlay ---------------------------------
+
+
+def check_11_switch_shows_loading() -> None:
+    rng = np.random.default_rng(12)
+    viewer = SV.SceneNetViewer(
+        {"a": Path("a.onnx"), "b": Path("b.onnx")}, hz=HZ, can_feed_cam_age=False,
+        runtime_factory=(SLOW_FACTORY, {"forward_s": 0.01, "load_s": 1.0, "mode": "sleep", "fill": "stem"}))
+    try:
+        viewer.select("a")
+        first = viewer.latest()
+        assert first.status == "loading" and first.badge == "loading" and first.lane_gt == (), first
+        va = _wait_status(viewer, lambda v: v.status == "ok", rng=rng)
+        assert va.stem == "a" and va.lane_gt[0] == 1.0, va  # the fake fills lane_gt with 1.0 for "a"
+        viewer.select("b")
+        seen: list = []
+        t0 = time.monotonic()
+        vb = _wait_status(viewer, lambda v: v.status == "ok", rng=rng, seen=seen)
+        waited = time.monotonic() - t0
+        state = SV.view_state(viewer)
+    finally:
+        viewer.close()
+    assert waited >= 0.9, waited  # the fake's 1 s load really was on screen
+    loading = [v for v in seen if v.status != "ok"]
+    assert loading, seen
+    for v in loading:
+        assert v.stem == "b" and v.status == "loading" and v.badge == "loading" and v.lane_gt == (), v
+    assert vb.stem == "b" and vb.lane_gt[0] == 2.0, vb
+    assert state["status"] == "ok" and state["stem"] == "b"
+    # The stage draws no lines while loading.
+    import cv2  # noqa: F401
+
+    img = np.zeros((240, 320, 3), np.uint8)
+    cam = SimpleNamespace(project=lambda x, y, z: (160 + int(x * 10), 200 - int(y * 5)))
+    SV.draw_scene_view(img, cam, dataclasses.asdict(loading[0]) | {"lane_gt": list(va.lane_gt)}, origin=(0, 300))
+    assert int(img.sum()) == 0, "lane lines drawn while loading"
+    print(f"switch: {len(loading)} ticks of 'loading' with no lane lines over {waited:.2f} s, "
+          f"then b's own result OK")
+
+
+# ---- report-only ratio metric --------------------------------------------------------------
+
+
+def ratio_report(pairs: int = 5) -> None:
+    """Median over ``pairs`` alternating on/off runs of on p99 / off p99 (report only, <= 1.5)."""
+    import statistics
+
+    with isolated_home("gvd-view-ratio-"):
+        for mode in ("sleep", "spin"):
+            ratios = []
+            for i in range(pairs):
+                off = _budget_stats(_budget_run("off"), "off")
+                on = _budget_stats(_budget_run(mode), mode)
+                r = on["hb_p99"] / max(1e-6, off["hb_p99"])
+                ratios.append(r)
+                print(f"ratio {mode} pair {i + 1}: on p99 {on['hb_p99']:.2f} / off p99 {off['hb_p99']:.2f} "
+                      f"= {r:.2f}", flush=True)
+            med = statistics.median(ratios)
+            print(f"ratio {mode}: median {med:.2f} over {pairs} pairs "
+                  f"({'<=' if med <= 1.5 else '>'} 1.5, report only)", flush=True)
 
 
 CHECKS = [
@@ -705,7 +934,10 @@ CHECKS = [
     check_5_live_hold_invisible,
     check_6_failure_and_catalog,
     check_7_model_untouched,
-    check_8_threaded_never_blocks,
+    check_8_child_never_blocks,
+    check_9_main_never_imports_torch,
+    check_10_no_orphans,
+    check_11_switch_shows_loading,
     check_4_budget,
 ]
 
@@ -724,4 +956,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if "--ratio" in sys.argv[1:]:
+        ratio_report()
+        raise SystemExit(0)
     raise SystemExit(main())

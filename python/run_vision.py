@@ -477,7 +477,7 @@ def main(clock=None) -> None:
             print(f"[GVD] REFUSE: {hold.note}")
             print(
                 "[GVD] Tech hold failed before vision. Unique-frame Hz is not measured. "
-                "One starter: install-root BeamNG.tech.exe -tcom -console -gfx dx11 already up, "
+                "One starter: install-root BeamNG.tech.exe -tcom -console -gfx vk already up, "
                 "mod loaded, vehicle spawned. Attach only (GVD_TECH_LAUNCH=0). "
                 "Hello timeout is REFUSE and is not a missing vehicle. "
                 "Do not kill BeamNG.tech or CrashSender."

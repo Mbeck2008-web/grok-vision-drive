@@ -11,6 +11,7 @@ inside the call and come back as text.
 from __future__ import annotations
 
 import math
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -64,10 +65,21 @@ EGO_PAINTS: dict[str, dict[str, Any]] = {
 }
 
 
+# Both values are written into the Lua spawn string: no quotes, spaces or backslashes.
+EGO_VALUE_RE = re.compile(r"^[\w/.-]+$")
+
+
 def set_ego(model: str, part_config: str = "") -> None:
-    """The model and part config (.pc path, or empty) every later spawn uses."""
-    _EGO["model"] = str(model or EGO_MODEL_DEFAULT)
-    _EGO["part_config"] = str(part_config or "")
+    """The model and part config (.pc path, or empty) every later spawn uses.
+
+    ValueError (and nothing changes) unless each non-empty value matches EGO_VALUE_RE.
+    """
+    m, pc = str(model or EGO_MODEL_DEFAULT), str(part_config or "")
+    for flag, value in (("--ego-model", m), ("--ego-config", pc)):
+        if value and not EGO_VALUE_RE.fullmatch(value):
+            raise ValueError(f"{flag} {value!r}: only letters, digits, _ / . - are allowed")
+    _EGO["model"] = m
+    _EGO["part_config"] = pc
 
 
 def ego_spec() -> dict[str, str]:

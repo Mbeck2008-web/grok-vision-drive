@@ -1586,10 +1586,14 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _main(argv: list[str] | None, run: RunStop) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     from python.collect.level_session import set_ego
 
-    set_ego(args.ego_model, args.ego_config)
+    try:
+        set_ego(args.ego_model, args.ego_config)
+    except ValueError as exc:
+        parser.error(str(exc))
     from python.data.data_root import (
         DataDriveError,
         check_data_path,

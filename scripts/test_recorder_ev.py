@@ -123,6 +123,42 @@ def check_lua_fallback_has_config() -> None:
     print(f"lua fallback: {cmd} OK")
 
 
+def check_ego_values_validated() -> None:
+    """--ego-model / --ego-config reach a Lua string: only [\\w/.-] is accepted."""
+    import contextlib
+    import io
+
+    import python.collect.level_session as ls
+    import scripts.collect_scene_lanes as collect
+
+    bad = [("sbr", 'vehicles/sbr/x.pc", color="1'), ("sbr", "vehicles\\sbr\\electric_800.pc"),
+           ('sb"r', ""), ("sbr; rm", ""), ("sbr", "vehicles/sbr/electric 800.pc")]
+    for model, config in bad:
+        try:
+            ls.set_ego(model, config)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError((model, config))
+        assert ls.ego_spec() == {"model": ls.EGO_MODEL_DEFAULT, "part_config": ls.EGO_CONFIG_DEFAULT}
+    for model, config in [("sbr", "vehicles/sbr/electric_800.pc"), ("etk800", ""), ("sbr2", "a-b/c_d.pc")]:
+        ls.set_ego(model, config)
+    ls.set_ego(ls.EGO_MODEL_DEFAULT, ls.EGO_CONFIG_DEFAULT)
+    for argv in (["--ego-config", 'vehicles/sbr/x".pc'], ["--ego-config", "vehicles\\sbr\\x.pc"],
+                 ["--ego-model", "sb'r"]):
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                collect._main(argv, collect.RunStop())
+        except SystemExit as exc:
+            assert exc.code == 2, exc.code
+        else:
+            raise AssertionError(argv)
+        assert "--ego-" in err.getvalue(), err.getvalue()
+    assert ls.ego_spec() == {"model": ls.EGO_MODEL_DEFAULT, "part_config": ls.EGO_CONFIG_DEFAULT}
+    print("ego values: quote, backslash path, space refused (set_ego and the collector, exit 2) OK")
+
+
 def check_paint_lime() -> None:
     """electric_800 spawns in its stock Lime (sbr info.json paints.Lime), on every spawn site."""
     import python.collect.level_session as ls
@@ -391,6 +427,7 @@ def main() -> None:
     check_spawn_passes_model_and_config()
     check_lua_fallback_has_config()
     check_paint_lime()
+    check_ego_values_validated()
     check_defaults()
     check_boundary_defer_unit()
     check_veh_meta_and_rig_warning()

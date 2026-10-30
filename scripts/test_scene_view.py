@@ -57,7 +57,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import numpy as np  # noqa: E402
 
-from gvd_test_env import isolated_home, skip_check  # noqa: E402
+from gvd_test_env import _fs_type, isolated_home, skip_check  # noqa: E402
 from python.data.strip_writer import CANVAS_W, STRIP_ORDER, compose_strip  # noqa: E402
 from python.train.cam_strip import canvas_width, extract_cams  # noqa: E402
 from python.viz import scene_view as SV  # noqa: E402
@@ -337,6 +337,22 @@ def check_3_cannot_actuate() -> None:
 # ---- 4. budget ------------------------------------------------------------------------
 
 
+# A RAM folder for the budget runs' files (None: not on this OS, use the default temp folder).
+_RAM_DIR = "/dev/shm" if sys.platform.startswith("linux") and os.access("/dev/shm", os.W_OK) else None
+
+
+@contextlib.contextmanager
+def _ram_home(prefix: str):
+    """isolated_home() made under _RAM_DIR: the same files and writes, minus disk journal stalls."""
+    saved = tempfile.tempdir
+    tempfile.tempdir = _RAM_DIR or saved
+    try:
+        with isolated_home(prefix) as home:
+            yield home
+    finally:
+        tempfile.tempdir = saved
+
+
 def _pct(xs: list[float], q: float) -> float:
     return float(np.percentile(np.asarray(xs, dtype=np.float64), q)) if xs else float("nan")
 
@@ -433,7 +449,12 @@ def _budget_stats(run: dict, mode: str) -> dict:
 
 def check_4_budget() -> None:
     stats = {}
-    with isolated_home("gvd-view-budget-"):
+    with _ram_home("gvd-view-budget-") as home:
+        # Every tick writes gvd_sensors.json / gvd_cmd.json / gvd_state.json into this home. On a
+        # shared disk (ext4 /tmp) about one open() a second stalled 13-81 ms, in every mode, off
+        # included: disk noise, not the loop or the viewer. Same files and writes, in RAM.
+        fs = _fs_type(home)
+        assert fs == "tmpfs" or not _RAM_DIR, f"budget home on {fs} (disk), not tmpfs {_RAM_DIR}"
         for mode in ("off", "sleep", "spin"):
             stats[mode] = _budget_stats(_budget_run(mode), mode)
             s = stats[mode]
@@ -935,7 +956,7 @@ def ratio_report(pairs: int = 5) -> None:
     """Median over ``pairs`` alternating on/off runs of on p99 / off p99 (report only, <= 1.5)."""
     import statistics
 
-    with isolated_home("gvd-view-ratio-"):
+    with _ram_home("gvd-view-ratio-"):
         for mode in ("sleep", "spin"):
             ratios = []
             for i in range(pairs):

@@ -16,7 +16,7 @@ from python.debug.gt_geom import CURVATURE_AHEAD_M, RoadPoly, lane_center_offset
 
 PHASES = ("cruise", "weave", "lane_change", "recover", "abort")
 ACTIVE = ("weave", "lane_change", "recover")
-CRUISE_S = 20.0
+CRUISE_S = 60.0
 WEAVE_S = 12.0
 LANE_CHANGE_S = 8.0
 RECOVER_S = 12.0

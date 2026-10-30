@@ -34,9 +34,19 @@ is a smoke collect: if those PNGs do not decode, the process stops.
     py -3 scripts\\collect_scene_lanes.py --minutes 120 --maps west_coast_usa,italy,east_coast_usa,utah,jungle_rock_island --segment-min 12 --smoke-s 60
 
 West-coast spawns skip roads whose next 300 m has painted lanes on less than
-``--min-paint-cov`` of the probes (default 0.5, 0 disables). ``--weave-guard``
-keeps weaves off unpainted stretches and junctions, and ends an excursion when
-its 60 m ``ai.setLine`` runs out.
+``--min-paint-cov`` of the probes (default 0.5, 0 disables). The weave guard
+(on; ``--no-weave-guard`` turns it off) keeps weaves off unpainted stretches
+and junctions, and ends an excursion when its 60 m ``ai.setLine`` runs out.
+Excursions start after 60 s of cruise (``CRUISE_S``); every 4th is a lane
+change on a road with two or more lanes.
+
+The ego car is ``--ego-model`` (default ``sbr``, the Hirochi eSBR electric)
+with ``--ego-config`` (default ``EGO_CONFIG_DEFAULT``, a .pc path; empty is the
+model's default config). The camera rig in ``config/cameras.yaml`` was
+calibrated on the etk800; another ego model logs a warning, its mounts are
+unproven. A ``--segment-min`` chunk switch or a ``--respawn-min`` teleport
+waits for cruise and the end of the settle window, at most 30 s
+(``collect boundary_defer``).
 
 Row fields in ``state.jsonl`` written by this collector, besides the frame data:
 
@@ -176,6 +186,8 @@ if str(ROOT) not in sys.path:
 from python.data.raw_frames import controls_from_state
 from python.collect.spawn_mix import clamp_speed_range, traffic_count
 from python.collect import control_log
+from python.collect.boundary import BoundaryDefer, boundary_wait_reason
+from python.collect.level_session import EGO_CONFIG_DEFAULT, EGO_MODEL_DEFAULT
 
 SPEEDS_MPS = (8.0, 11.0, 14.0, 17.0, 10.0)
 SPEED_HOLD_S = 180.0
@@ -421,11 +433,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--weave-guard",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "Start no weave with paint on under half the lookaheads or a side road within 40 m, "
-            "and end an excursion before its 60 m line runs out."
+            "and end an excursion before its 60 m line runs out. On by default; --no-weave-guard turns it off."
         ),
+    )
+    parser.add_argument(
+        "--ego-model",
+        default=EGO_MODEL_DEFAULT,
+        help=f"Ego vehicle model for every spawn (default {EGO_MODEL_DEFAULT}, the Hirochi eSBR electric).",
+    )
+    parser.add_argument(
+        "--ego-config",
+        default=EGO_CONFIG_DEFAULT,
+        help=f"Ego part config (.pc path) for every spawn; empty uses the model's default (default {EGO_CONFIG_DEFAULT}).",
     )
     parser.add_argument(
         "--min-live-yield",
@@ -1233,6 +1256,8 @@ def attached_frames_ready(cams: dict[str, Any], frames: dict[str, Any]) -> bool:
 STOP_EXIT_EARLY = 6
 STOP_EXIT_FILE_CAP = 7
 ETK800 = "etk800"
+# config/cameras.yaml mounts were drafted and calibrated on this model.
+CAMERA_RIG_MODEL = ETK800
 from python.collect.excursion import ETK800_HALF_WIDTH_M  # noqa: E402
 EGO_WIDTH_RANGE_M = (1.2, 3.0)
 
@@ -1545,6 +1570,9 @@ def main(argv: list[str] | None = None) -> int:
 
 def _main(argv: list[str] | None, run: RunStop) -> int:
     args = build_parser().parse_args(argv)
+    from python.collect.level_session import set_ego
+
+    set_ego(args.ego_model, args.ego_config)
     from python.data.data_root import (
         DataDriveError,
         check_data_path,
@@ -1725,6 +1753,12 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         spawn_pos: tuple[float, float, float] | None = None
         # Bumped on every spawn, respawn, and level load; veh_meta is keyed on it.
         spawn_seq = 0
+        # Only a level load spawns the ego car; a single-level run without
+        # --reload-level drives whatever car is already there.
+        ego_spawned = bool(map_names) or bool(args.reload_level)
+        rig_warned: set[str] = set()
+        segment_defer = BoundaryDefer("segment")
+        respawn_defer = BoundaryDefer("respawn")
         if not map_names:
             opened = enter_map(bng, str(args.reload_level or ""), cam_cfg, {})
             vehicle, roads, cams, err = opened.vehicle, opened.roads, opened.cameras, opened.error
@@ -1795,6 +1829,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         segment_aborts = 0
         recover_lost_s = 0.0
         schedule_cut = 0.0
+        cut_at_load = 0.0
         last_end_done = -1.0
         stuck_ends = 0
         no_progress_max = max(0, int(getattr(args, "no_progress_ends", 0) or 0))
@@ -2317,6 +2352,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             }
             if ego_width:
                 extra["ego_width"] = dict(ego_width)
+            extra["ego"] = {"model": str(args.ego_model), "part_config": str(args.ego_config),
+                            "camera_rig_model": CAMERA_RIG_MODEL, "spawned": ego_spawned}
             return extra or None
 
         def _save_progress(done: float, target: float) -> None:
@@ -2380,6 +2417,17 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 map_weights or None,
                 None if target_s == float("inf") else target_s,
             )
+            # A clock-driven chunk switch (no abort or yield cut since the load)
+            # waits for cruise and the end of the settle window, at most 30 s.
+            if (
+                loaded_index >= 0
+                and schedule_cut == cut_at_load
+                and segment_changed(loaded_map, loaded_index, map_name, seg_index)
+            ):
+                if segment_defer.hold(done_s, boundary_wait_reason(clock.phase, settle.active(done_s))):
+                    map_name, seg_index = loaded_map, loaded_index
+            else:
+                segment_defer.clear()
             segment_id = f"{map_name}#{seg_index}" if map_name else "current#0"
             run.segment = segment_id
             if not map_names and segment_id not in speed_ranges:
@@ -2387,7 +2435,16 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 speed_span[0] = _speed_range("level", (8.0, 17.0), "flag" if flags_set else "default")
                 speed = speed_at(elapsed, tuple(speed_span[0]))
             if map_name == loaded_map and seg_index == loaded_index:
-                _apply_spawn(False)
+                respawn_due = (
+                    map_name == "west_coast_usa" and vehicle is not None
+                    and respawn_s > 0.0 and done_s - spawn_mark >= respawn_s
+                    and not (spawn_deck is not None and spawn_deck.exhausted)
+                )
+                if not respawn_due:
+                    respawn_defer.clear()
+                if not (respawn_due and respawn_defer.hold(done_s, boundary_wait_reason(clock.phase,
+                                                                                        settle.active(done_s)))):
+                    _apply_spawn(False)
             if segment_changed(loaded_map, loaded_index, map_name, seg_index):
                 print(f"collect segment {segment_id}", flush=True)
                 opened = enter_map(bng, map_name, cam_cfg, cams)
@@ -2404,6 +2461,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     return 2
                 loaded_map = map_name
                 loaded_index = seg_index
+                cut_at_load = schedule_cut
                 last_ai = None
                 held_tag = None
                 clock = ExcursionClock()
@@ -3062,7 +3120,13 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             tags["traffic"] = traffic_now
             if ctl_meta_for != spawn_seq:
                 meta = control_log.parse_ve_meta(_ask_vehicle(vehicle, control_log.VE_META_PROBE))
-                tags["veh_meta"] = {"model": vehicle_model(vehicle), **meta}
+                model_now = vehicle_model(vehicle) or (str(args.ego_model) if ego_spawned else None)
+                spec = {"part_config": str(args.ego_config)} if ego_spawned else {}
+                tags["veh_meta"] = {"model": vehicle_model(vehicle), **spec, **meta}
+                if model_now and model_now != CAMERA_RIG_MODEL and model_now not in rig_warned:
+                    rig_warned.add(model_now)
+                    print(f"collect WARNING camera rig calibrated on {CAMERA_RIG_MODEL}, ego model is {model_now}: "
+                          "config/cameras.yaml mounts are unproven on this car", flush=True)
             row_i = None if row_base is None else int(row_base) + int(getattr(writer, "enqueued", 0) or 0)
             q_before = writer.stats()
             submit_mark = time.monotonic()

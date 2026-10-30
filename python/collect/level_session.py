@@ -3,7 +3,7 @@
 The 45-minute capture read ``scenario.get_road_network`` on a scenario that
 was already started. Freeroam is not that: Tech answers ``Need to be in a
 started scenario to get its DecalRoad data.`` Each named level is therefore
-``Scenario`` + ``etk800``, ``make``, ``load_scenario``, ``start_scenario``,
+``Scenario`` + the ego car (``EGO_MODEL_DEFAULT``), ``make``, ``load_scenario``, ``start_scenario``,
 and only then the road network. Session errors (including ``BNGError``) stay
 inside the call and come back as text.
 """
@@ -37,6 +37,33 @@ PLAYER_WAIT_S = 8.0
 POLL_S = 0.5
 SPAWN_Z_M = 250.0
 SCENARIO_TIMEOUT_S = 120.0
+# The ego car every spawn site uses: the Hirochi eSBR (electric), for smooth
+# power and instant torque under the AI. The .pc path is TO CONFIRM on a
+# BeamNG.tech 0.39 install: the name follows the stock eSBR 300 config
+# (electric_300/500/800) and BeamNG's tech forum example
+# Vehicle(model='sbr', part_config='vehicles/sbr/electric_300.pc'); it has not
+# been loaded here. An empty config spawns the model's default config.
+EGO_MODEL_DEFAULT = "sbr"
+EGO_CONFIG_DEFAULT = "vehicles/sbr/electric_300.pc"
+_EGO = {"model": EGO_MODEL_DEFAULT, "part_config": EGO_CONFIG_DEFAULT}
+
+
+def set_ego(model: str, part_config: str = "") -> None:
+    """The model and part config (.pc path, or empty) every later spawn uses."""
+    _EGO["model"] = str(model or EGO_MODEL_DEFAULT)
+    _EGO["part_config"] = str(part_config or "")
+
+
+def ego_spec() -> dict[str, str]:
+    """The ego model and part config the spawn sites ask for."""
+    return dict(_EGO)
+
+
+def _ego_vehicle(Vehicle: Any) -> Any:
+    """beamngpy 1.36 ``Vehicle(vid, model, part_config=...)``; no part_config when empty."""
+    if _EGO["part_config"]:
+        return Vehicle("gvd_ego", model=_EGO["model"], part_config=_EGO["part_config"])
+    return Vehicle("gvd_ego", model=_EGO["model"])
 
 
 @dataclass
@@ -281,7 +308,7 @@ def make_collect_scenario(
     except Exception:
         return ScriptScenario(level, name, pos, rot)
     scenario = Scenario(level, name, description="GVD scene collect")
-    vehicle = Vehicle("gvd_ego", model="etk800")
+    vehicle = _ego_vehicle(Vehicle)
     _add_vehicle(scenario, vehicle, pos, rot)
     return scenario
 
@@ -401,7 +428,7 @@ def spawn_direct(bng: Any, pos: tuple[float, float, float], rot: tuple[float, fl
     except Exception:
         Vehicle = None  # type: ignore
     if Vehicle is not None:
-        vehicle = Vehicle("gvd_ego", model="etk800")
+        vehicle = _ego_vehicle(Vehicle)
         fn = getattr(bng, "spawn_vehicle", None)
         if not callable(fn):
             fn = getattr(getattr(bng, "vehicles", None), "spawn", None)
@@ -421,10 +448,11 @@ def spawn_direct(bng: Any, pos: tuple[float, float, float], rot: tuple[float, fl
                 if is_session_error(exc):
                     return session_text(exc)
                 raise
+    config = f'config="{_EGO["part_config"]}", ' if _EGO["part_config"] else ""
     return _send(
         bng,
-        "core_vehicles.spawnNewVehicle(\"etk800\", "
-        f"{{pos=vec3({x:.2f},{y:.2f},{z:.2f}), rot=quat({qx:.5f},{qy:.5f},{qz:.5f},{qw:.5f})}})",
+        f'core_vehicles.spawnNewVehicle("{_EGO["model"]}", '
+        f"{{{config}pos=vec3({x:.2f},{y:.2f},{z:.2f}), rot=quat({qx:.5f},{qy:.5f},{qz:.5f},{qw:.5f})}})",
     )
 
 

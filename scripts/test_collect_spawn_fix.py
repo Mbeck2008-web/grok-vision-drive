@@ -271,7 +271,7 @@ def check_weave_guard_helpers() -> None:
     assert collect.weave_guard_reason(1.0, 48.0, 0.5, 40.0) == "open"
     assert abs(collect.polyline_length([(0, 0), (3, 4), (3, 10)]) - 11.0) < 1e-9
     args = collect.build_parser().parse_args([])
-    assert args.min_paint_cov == 0.5 and args.weave_guard is False
+    assert args.min_paint_cov == 0.5 and args.weave_guard is True  # on by default; --no-weave-guard opts out
     args = collect.build_parser().parse_args(["--min-paint-cov", "0", "--weave-guard"])
     assert args.min_paint_cov == 0.0 and args.weave_guard is True
     assert "impact" in collect.HARD_SEGMENT_REASONS
@@ -574,12 +574,15 @@ def check_collector_impact_rows() -> None:
 
 def check_weave_guard_runs() -> None:
     """No paint on this mocked level: no painted lane at the car, so no lane edge to weave inside.
-    The weave is blocked (no_paint) with or without --weave-guard."""
-    code, text, out = _run_collector({"speed_at": lambda n: 10.0, "stop_at": 260}, ["--weave-guard"])
+    The weave is blocked (no_paint) with or without the weave guard (on by default)."""
+    from python.collect.excursion import CRUISE_S
+
+    w0 = int(round(CRUISE_S / 0.1))  # 0.1 s ticks of cruise before the first weave
+    code, text, out = _run_collector({"speed_at": lambda n: 10.0, "stop_at": w0 + 60}, ["--weave-guard"])
     assert code == 0, (code, text)
     assert "collect gate current#0 weave blocked no_paint" in text, text[-3000:]
     assert "excursion=weave" not in text
-    code, text, out = _run_collector({"speed_at": lambda n: 10.0, "stop_at": 260}, [])
+    code, text, out = _run_collector({"speed_at": lambda n: 10.0, "stop_at": w0 + 60}, ["--no-weave-guard"])
     assert code == 0, (code, text)
     assert "collect gate current#0 weave blocked no_paint" in text, text[-3000:]
     assert "excursion=weave" not in text and "line end" not in text
@@ -594,7 +597,7 @@ def check_weave_guard_runs() -> None:
     try:
         # In the right lane (center x=+1.75 on the 7 m road heading +y): at x=0.4 the body
         # straddles the centerline and the body-edge rule aborts the weave at once.
-        code, text, out = _run_collector({"speed_at": lambda n: 10.0, "stop_at": 300, "x": 1.75}, ["--weave-guard"])
+        code, text, out = _run_collector({"speed_at": lambda n: 10.0, "stop_at": w0 + 100, "x": 1.75}, [])
     finally:
         collect.painted_for = previous  # type: ignore[assignment]
     assert code == 0, (code, text)
@@ -606,7 +609,7 @@ def check_weave_guard_runs() -> None:
     rows = [json.loads(line) for line in (out / "state.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
     weave_rows = [row for row in rows if (row.get("excursion") or {}).get("phase") == "weave"]
     assert weave_rows and 41 <= len(weave_rows) <= 49, len(weave_rows)
-    print(f"weave guard: unpainted weave blocked, off by default, line end after {len(weave_rows)} rows")
+    print(f"weave guard: unpainted weave blocked, on by default, line end after {len(weave_rows)} rows")
 
 
 def _rows(out: Path) -> list[dict]:
@@ -1177,11 +1180,14 @@ def check_lane_edge_straddle_run() -> None:
     centerline, so its weave aborts with lane_edge at once; in its lane (x=1.75) it weaves."""
     import scripts.collect_scene_lanes as collect
 
+    from python.collect.excursion import CRUISE_S
+
+    w0 = int(round(CRUISE_S / 0.1))  # 0.1 s ticks of cruise before the first weave
     previous = collect.painted_for
     collect.painted_for = lambda level: _line_paint([-3.5, 0.0, 3.5])  # type: ignore[assignment]
     try:
-        code, text, out = _run_collector({"speed_at": lambda n: 10.0, "stop_at": 300, "x": 0.4}, [])
-        code_in, text_in, out_in = _run_collector({"speed_at": lambda n: 10.0, "stop_at": 300, "x": 1.75}, [])
+        code, text, out = _run_collector({"speed_at": lambda n: 10.0, "stop_at": w0 + 100, "x": 0.4}, [])
+        code_in, text_in, out_in = _run_collector({"speed_at": lambda n: 10.0, "stop_at": w0 + 100, "x": 1.75}, [])
     finally:
         collect.painted_for = previous  # type: ignore[assignment]
     assert code == 0 and code_in == 0, (text[-1500:], text_in[-1500:])

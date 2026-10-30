@@ -67,8 +67,9 @@ def check_collector_resets_after_abort() -> None:
     collect.painted_for = lambda level: harness._Paint(lambda x, y: True)  # type: ignore[assignment]
     try:
         # Same run as test_collect_speed_plan: planned at 10 m/s, the car speeds to 12 -> overspeed abort.
+        w0 = int(round(exc.CRUISE_S / 0.1))  # 0.1 s ticks of cruise before the first weave
         code, text, out = harness._run_collector(
-            {"speed_at": lambda n: 10.0 if n <= 215 else 12.0, "stop_at": 300, "x": 1.75},
+            {"speed_at": lambda n: 10.0 if n <= w0 + 15 else 12.0, "stop_at": w0 + 100, "x": 1.75},
             ["--speed-min", "8", "--speed-max", "17"],
         )
     finally:

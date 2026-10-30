@@ -198,11 +198,12 @@ def check_collector_run() -> None:
     import scripts.collect_scene_lanes as collect
     import scripts.test_collect_spawn_fix as harness
 
+    w0 = int(round(exc.CRUISE_S / 0.1))  # 0.1 s ticks of cruise before the first weave
     previous = collect.painted_for
     collect.painted_for = lambda level: harness._Paint(lambda x, y: True)  # type: ignore[assignment]
     try:
         code, text, out = harness._run_collector(
-            {"speed_at": lambda n: 10.0 if n <= 215 else 12.0, "stop_at": 300, "x": 1.75},
+            {"speed_at": lambda n: 10.0 if n <= w0 + 15 else 12.0, "stop_at": w0 + 100, "x": 1.75},
             ["--speed-min", "8", "--speed-max", "17"],
         )
     finally:
@@ -228,7 +229,7 @@ def check_collector_run() -> None:
     collect.painted_for = lambda level: harness._Paint(lambda x, y: True)  # type: ignore[assignment]
     try:
         code, text, out = harness._run_collector(
-            {"speed_at": lambda n: 10.0 if n <= 215 else 11.4, "stop_at": 300, "x": 1.75}, [])
+            {"speed_at": lambda n: 10.0 if n <= w0 + 15 else 11.4, "stop_at": w0 + 100, "x": 1.75}, [])
     finally:
         collect.painted_for = previous  # type: ignore[assignment]
     assert code == 0 and "overspeed" not in text, text[-2000:]
@@ -281,8 +282,10 @@ def check_refused_stretches_run() -> None:
     the impact respawn starts a second one. Every retry stays in refused_attempts."""
     import scripts.test_collect_spawn_fix as harness
 
+    w0 = int(round(exc.CRUISE_S / 0.1))  # 0.1 s ticks of cruise before the first weave
     code, text, out = harness._run_collector(
-        {"speed_at": lambda n: 0.2 if 300 < n <= 340 else 10.0, "stop_at": 700}, ["--no-impact-respawn"])
+        {"speed_at": lambda n: 0.2 if w0 + 100 < n <= w0 + 140 else 10.0, "stop_at": 2 * w0 + 300},
+        ["--no-impact-respawn"])
     assert code == 0, text[-2000:]
     assert "collect recover current#0" in text, text[-3000:]
     before, after = text.split("collect recover current#0", 1)
@@ -304,9 +307,11 @@ def _lane_change_run(v_car: float, flags: list[str]):
     previous = (collect.painted_for, exc.ExcursionClock.peek_kind)
     collect.painted_for = lambda level: harness._Paint(lambda x, y: True)  # type: ignore[assignment]
     exc.ExcursionClock.peek_kind = lambda self, n: "lane_change" if n is not None and int(n) >= 2 else "weave"
+    w0 = int(round(exc.CRUISE_S / 0.1))  # 0.1 s ticks of cruise before the first weave
     try:
         code, text, out = harness._run_collector(
-            {"speed_at": lambda n: v_car, "stop_at": 400, "x": 1.75}, flags, roads=roads)
+            {"speed_at": lambda n: v_car, "stop_at": w0 + 200, "x": 1.75},
+            [*flags, "--no-weave-guard"], roads=roads)  # the guard's line end would cut the ramp short
     finally:
         collect.painted_for, exc.ExcursionClock.peek_kind = previous  # type: ignore[assignment]
     assert code == 0, text[-2000:]
@@ -333,14 +338,15 @@ def check_lane_change_incomplete() -> None:
     assert ws["started"].get("lane_change") == 1, ws
     full = math.atan(3.5 * math.pi / (2.0 * ramp_length_m(3.5, 17.0)))
     covered = 2.0 * 0.1 * (len(heads) - 1)
-    assert len(heads) == 80 and heads == sorted(heads), heads
+    # 8 s at 0.1 s ticks; the mocked clock's 0.1 s differences round down after a 60 s cruise, so allow +1.
+    assert len(heads) in (80, 81) and heads == sorted(heads), heads
     assert abs(heads[-1] - ramp_heading_reached(3.5, ramp_length_m(3.5, 17.0), covered)) < 2e-3, (heads[-1], covered)
     assert heads[-1] < 0.7 * full, (heads[-1], full)
     slow_peak = heads[-1]
     text, heads, ws = _lane_change_run(17.0, flags)
     assert "lane_change_incomplete" not in text, text[-3000:]
     assert ws["lane_change_complete"] == 1 and ws["lane_change_incomplete"] == 0, ws
-    assert len(heads) == 80 and heads == sorted(heads) and abs(heads[-1] - full) < 2e-3, (heads[-1], full)
+    assert len(heads) in (80, 81) and heads == sorted(heads) and abs(heads[-1] - full) < 2e-3, (heads[-1], full)
     print(f"lane change: 2 m/s on a 17 m/s plan incomplete, label peak {math.degrees(slow_peak):.1f} deg "
           f"(ramp peak {math.degrees(full):.1f}); 17 m/s complete at the ramp peak OK")
 

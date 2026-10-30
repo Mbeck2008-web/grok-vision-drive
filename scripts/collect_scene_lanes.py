@@ -1588,12 +1588,15 @@ def main(argv: list[str] | None = None) -> int:
 def _main(argv: list[str] | None, run: RunStop) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    from python.collect.level_session import set_ego
+    from python.collect.level_session import ego_spec, set_ego
 
     try:
         set_ego(args.ego_model, args.ego_config)
     except ValueError as exc:
         parser.error(str(exc))
+    # What the spawns use (set_ego maps an empty --ego-model to the default): the rig,
+    # veh_meta and collect.json read this, never the raw flags, so they cannot desync.
+    ego = ego_spec()
     from python.data.data_root import (
         DataDriveError,
         check_data_path,
@@ -1688,9 +1691,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         return 0
     from python.sensors.rig_overrides import rig_for_model, rig_model, rig_overrides
 
-    # Only a level load spawns args.ego_model (see ego_spawned below); a single-level
+    # Only a level load spawns the ego model (see ego_spawned below); a single-level
     # run drives the car already there and keeps the base rig.
-    rig_for = str(args.ego_model) if (map_names or args.reload_level) else None
+    rig_for = ego["model"] if (map_names or args.reload_level) else None
     base_cam_cfg = load_camera_config()
     cam_cfg = rig_for_model(base_cam_cfg, rig_for)
     camera_rig = rig_model(base_cam_cfg, rig_for)
@@ -2386,7 +2389,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 extra["ego_width"] = dict(ego_width)
             from python.collect.level_session import ego_paint
 
-            extra["ego"] = {"model": str(args.ego_model), "part_config": str(args.ego_config),
+            extra["ego"] = {"model": ego["model"], "part_config": ego["part_config"],
                             "camera_rig_model": camera_rig, "camera_overrides": camera_overrides,
                             "spawned": ego_spawned,
                             "paint": ego_paint() if ego_spawned else None}
@@ -3177,8 +3180,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 meta = control_log.parse_ve_meta(_ask_vehicle(vehicle, control_log.VE_META_PROBE))
                 # A spawned ego is the model the spawn asked for; the live object (maybe None)
                 # only names the car a single-level run found already there.
-                model_now = (str(args.ego_model) if ego_spawned else None) or vehicle_model(vehicle)
-                spec = {"part_config": str(args.ego_config)} if ego_spawned else {}
+                model_now = (ego["model"] if ego_spawned else None) or vehicle_model(vehicle)
+                spec = {"part_config": ego["part_config"]} if ego_spawned else {}
                 tags["veh_meta"] = {"model": model_now, **spec, **meta}
                 if model_now and model_now != camera_rig and model_now not in rig_warned:
                     rig_warned.add(model_now)

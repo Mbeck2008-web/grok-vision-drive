@@ -339,6 +339,29 @@ def check_ego_model_reaches_spawn() -> None:
     print("ego model: --ego-model sbr2 reaches the spawn; veh_meta model is the spawned sbr2 OK")
 
 
+def check_empty_ego_model_stays_in_sync() -> None:
+    """--ego-model "" spawns the default (set_ego falls back to EGO_MODEL_DEFAULT): the camera
+    rig, veh_meta and collect.json name that same model, not "" or the mock's etk800."""
+    import python.collect.level_session as ls
+
+    asked: list[dict] = []
+    try:
+        code, text, out = _west(lambda n: "", ["--ego-model", "", "--ego-config", ""], 60,
+                                enter_hook=lambda level: asked.append(ls.ego_spec()))
+    finally:
+        ls.set_ego(ls.EGO_MODEL_DEFAULT, ls.EGO_CONFIG_DEFAULT)
+    assert code == 0, text[-2000:]
+    want = {"model": ls.EGO_MODEL_DEFAULT, "part_config": ""}
+    assert asked and all(a == want for a in asked), asked
+    metas = [r["veh_meta"] for r in _rows(out) if "veh_meta" in r]
+    assert metas and all(m["model"] == want["model"] and m["part_config"] == "" for m in metas), metas
+    ego = json.loads((out / "collect.json").read_text(encoding="utf-8"))["ego"]
+    assert ego["model"] == want["model"] and ego["part_config"] == "", ego
+    assert ego["camera_rig_model"] == want["model"], ego
+    assert "camera rig calibrated" not in text, text[:3000]
+    print(f"ego model: --ego-model '' spawns {want['model']}; rig, veh_meta and collect.json agree OK")
+
+
 def check_sbr_without_bbox_stops() -> None:
     """The eSBR has no fallback width (only the etk800 has one): no bbox stops the run with
     vehicle_width, code 2, before a row is written. (The mocked level-load harness runs
@@ -528,6 +551,7 @@ def main() -> None:
     check_boundary_defer_unit()
     check_veh_meta_and_rig_warning()
     check_ego_model_reaches_spawn()
+    check_empty_ego_model_stays_in_sync()
     check_sbr_without_bbox_stops()
     check_respawn_deferred_run()
     check_respawn_failed_logs_once()

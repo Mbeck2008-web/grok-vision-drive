@@ -298,6 +298,83 @@ def check_session_faults() -> None:
     print("session_faults ok")
 
 
+def check_code_pin_unsafe_owner() -> None:
+    """A checkout git refuses (safe.directory; e.g. FAT32 has no owners) still pins the sha.
+
+    First ``git -c safe.directory=<repo>`` for the one command, then .git read
+    directly (loose ref, packed-refs, detached HEAD). No git config is written.
+    """
+    import subprocess
+
+    base = Path(tempfile.mkdtemp())
+    repo, home = base / "repo", base / "home"
+    home.mkdir()
+    env_keys = ("GIT_TEST_ASSUME_DIFFERENT_OWNER", "HOME", "GIT_CONFIG_GLOBAL", "XDG_CONFIG_HOME", "GIT_CONFIG_NOSYSTEM")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    # A private global config and no system config: CI images trust every directory there.
+    git_env = {"GIT_CONFIG_GLOBAL": str(home / ".gitconfig"), "HOME": str(home), "XDG_CONFIG_HOME": str(home),
+               "GIT_CONFIG_NOSYSTEM": "1"}
+    os.environ.update(git_env)
+
+    def git(*args: str) -> str:
+        return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=True).stdout.strip()
+
+    real = collect.subprocess.run
+    try:
+        subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+        (repo / "a.txt").write_text("a\n", encoding="utf-8")
+        git("add", "a.txt")
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-m", "a")
+        sha = git("rev-parse", "HEAD")
+        config_before = (repo / ".git" / "config").read_bytes()
+        os.environ["GIT_TEST_ASSUME_DIFFERENT_OWNER"] = "1"  # git's own switch for "owned by someone else"
+        plain = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True)
+        # Real git refuses here; where it still does not (an old git, or a trust-all config
+        # this test cannot switch off) the refusal is simulated for commands without -c safe.directory.
+        real_refusal = plain.returncode != 0 and "dubious ownership" in plain.stderr
+        calls: list[list[str]] = []
+
+        def spy(cmd, *a, **k):
+            calls.append(list(cmd))
+            if not real_refusal and not any(str(c).startswith("safe.directory=") for c in cmd):
+                return subprocess.CompletedProcess(cmd, 128, "", "fatal: detected dubious ownership in repository\n")
+            return real(cmd, *a, **k)
+
+        collect.subprocess.run = spy
+        pin = collect.code_pin(repo, argv=[])
+        assert pin["code_sha"] == sha and pin["code_dirty"] is False, pin
+        assert any(f"safe.directory={repo.resolve().as_posix()}" in c for c in calls), calls
+        assert all(c[-2:] in (["rev-parse", "HEAD"], ["status", "--porcelain"]) for c in calls), calls
+        (repo / "b.txt").write_text("b\n", encoding="utf-8")
+        assert collect.code_pin(repo, argv=[])["code_dirty"] is True
+        # No git that will answer: read .git directly.
+        collect.subprocess.run = lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("git"))
+        loose = collect.code_pin(repo, argv=[])
+        assert loose == {**loose, "code_sha": sha, "code_dirty": "unknown"}, loose
+        collect.subprocess.run = real
+        os.environ.pop("GIT_TEST_ASSUME_DIFFERENT_OWNER")
+        git("pack-refs", "--all")
+        assert not (repo / ".git" / "refs" / "heads" / "main").exists()
+        os.environ["GIT_TEST_ASSUME_DIFFERENT_OWNER"] = "1"
+        collect.subprocess.run = lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("git"))
+        assert collect.code_pin(repo, argv=[])["code_sha"] == sha, "packed-refs"
+        (repo / ".git" / "HEAD").write_text(sha + "\n", encoding="utf-8")
+        assert collect.code_pin(repo, argv=[])["code_sha"] == sha, "detached"
+        (repo / ".git" / "HEAD").write_text("ref: refs/heads/unborn\n", encoding="utf-8")
+        assert collect.code_pin(repo, argv=[])["code_sha"] == "unknown", "unborn branch"
+        # Nothing written to git config: the repo's, the global one, or a new one.
+        assert (repo / ".git" / "config").read_bytes() == config_before
+        assert not (home / ".gitconfig").exists() and not (home / "git").exists(), list(home.iterdir())
+    finally:
+        collect.subprocess.run = real
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    print(f"code pin unsafe owner ok: {sha[:12]} real_refusal={real_refusal}")
+
+
 def check_code_pin() -> None:
     """The first log line, both collect.json files and the heartbeat carry code_sha, code_dirty, argv."""
     import subprocess
@@ -316,7 +393,8 @@ def check_code_pin() -> None:
         none = collect.code_pin(argv=[])
     finally:
         collect.subprocess.run = real
-    assert none["code_sha"] == "unknown" and none["code_dirty"] == "unknown"
+    # The sha still comes from .git itself; dirty cannot be told without git.
+    assert none["code_sha"] == head and none["code_dirty"] == "unknown", none
     assert "code_dirty=unknown" in collect.pin_line(none)
     outside = collect.code_pin(Path(tempfile.mkdtemp()), argv=[])
     assert outside["code_sha"] == "unknown" and outside["code_dirty"] == "unknown", outside
@@ -361,6 +439,7 @@ def main() -> None:
     check_camera_warmup()
     check_session_faults()
     check_code_pin()
+    check_code_pin_unsafe_owner()
     check_vehicle_width()
     print("collect stops ok")
 

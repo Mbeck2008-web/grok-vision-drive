@@ -1425,6 +1425,7 @@ class RunStop:
         self.segment: str | None = None
         self.done_s = 0.0
         self.pin: dict[str, Any] = {}
+        self.ctl_reads: dict[str, Any] | None = None  # control probe / traffic reply counts
         self._beat_m: float | None = None
 
     def attach(self, out: Path, progress_path: Path, target_s: float, done_s: float) -> None:
@@ -1504,8 +1505,15 @@ class RunStop:
             code = STOP_EXIT_EARLY
         target_txt = "inf" if self.target_s == float("inf") else f"{self.target_s:.1f}"
         tail = f" {self.detail}" if self.detail else ""
+        if self.ctl_reads is not None:  # an all-null probe or traffic run shows here
+            c = self.ctl_reads
+            print(f"collect ctl_reads pipelined={'true' if c['pipelined'] else 'false'} probes={c['probes']} "
+                  f"probe_null={c['probe_null']} traffic_reads={c['traffic_reads']} traffic_null={c['traffic_null']}",
+                  flush=True)
         print(f"collect stop reason={reason} code={code} done_s={done:.1f} target_s={target_txt}{tail}", flush=True)
         extra = {"stop_reason": reason, "stop_detail": self.detail or None, "stop_code": code, "stopped": time.time(), **self.pin}
+        if self.ctl_reads is not None:
+            extra["ctl_reads"] = dict(self.ctl_reads)
         if not self.progress_path.is_file():
             extra = {"done_s": done, "target_s": float(self.target_s), **extra}
         self._merge(self.progress_path, extra)
@@ -2345,6 +2353,12 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         # read, the spawn_seq veh_meta was sent for, and the AI commands sent so far.
         ctl_ticks = 0
         ctl_traffic_at: float | None = None
+        bngpy_version = _beamngpy_version()
+        ctl_pipelined = _beamngpy_pipeline_ok(bngpy_version)
+        if not ctl_pipelined:
+            print(f"collect ctl pipeline off: beamngpy __version__={bngpy_version!r} is not 1.36.x; "
+                  "probe and traffic reads use separate round-trips", flush=True)
+        run.ctl_reads = {"pipelined": ctl_pipelined, "probes": 0, "probe_null": 0, "traffic_reads": 0, "traffic_null": 0}
         ctl_meta_for: int | None = None
         ai_cmd = control_log.ai_cmd_state()
         while done_s < target_s:
@@ -2490,7 +2504,14 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 bng,
                 control_log.VE_PROBE if want_probe else None,
                 control_log.TRAFFIC_CHUNK if want_traffic else None,
+                pipelined=ctl_pipelined,
             )
+            if want_probe:
+                run.ctl_reads["probes"] += 1
+                run.ctl_reads["probe_null"] += probe_reply is None
+            if want_traffic:
+                run.ctl_reads["traffic_reads"] += 1
+                run.ctl_reads["traffic_null"] += traffic_reply is None
             probe = control_log.parse_ve_probe(probe_reply) if want_probe else control_log.probe_nulls()
             traffic_now = None
             if want_traffic:
@@ -3504,8 +3525,23 @@ def _reply_of(pending: Any, reply_type: str) -> Any:
         return None
 
 
+def _beamngpy_version() -> Any:
+    """``beamngpy.__version__``, or ``None`` when it cannot be read."""
+    try:
+        import beamngpy
+
+        return getattr(beamngpy, "__version__", None)
+    except Exception:
+        return None
+
+
+def _beamngpy_pipeline_ok(version: Any) -> bool:
+    """Send-ahead is only used on BeamNGpy 1.36.x ("1.36" or "1.36.N"): the wire it was built and tested for."""
+    return isinstance(version, str) and re.fullmatch(r"1\.36(?:\.\d+)?", version.strip()) is not None
+
+
 def _read_vehicle_ctl(
-    vehicle: Any, bng: Any, probe_chunk: str | None, traffic_chunk: str | None
+    vehicle: Any, bng: Any, probe_chunk: str | None, traffic_chunk: str | None, *, pipelined: bool = True
 ) -> tuple[dict[str, Any], Any, Any]:
     """``_read_vehicle`` plus the control probe (vehicle Lua) and the traffic read (GE Lua).
 
@@ -3515,12 +3551,12 @@ def _read_vehicle_ctl(
     ``_send``, which does not wait), then the sensor poll waits once, and the
     game answers all three on that frame. Replies are matched by request id, so
     the probe's reply is buffered while the poll waits. Same Lua chunks, same
-    replies. When this BeamNGpy has no ``_send`` the calls run one after
-    another, as before. Returns ``(sample, probe reply, traffic reply)``;
+    replies. With ``pipelined=False`` (BeamNGpy other than 1.36.x), or when
+    this BeamNGpy has no ``_send``, the calls run one after another, as before. Returns ``(sample, probe reply, traffic reply)``;
     a reply is ``None`` when not asked or when it failed.
     """
-    ve = _send_ahead(vehicle, "QueueLuaCommandVE", probe_chunk)
-    ge = _send_ahead(bng, "QueueLuaCommandGE", traffic_chunk)
+    ve = _send_ahead(vehicle, "QueueLuaCommandVE", probe_chunk) if pipelined else None
+    ge = _send_ahead(bng, "QueueLuaCommandGE", traffic_chunk) if pipelined else None
     sample = _read_vehicle(vehicle)
     probe = None
     if probe_chunk is not None:

@@ -27,6 +27,11 @@ def _overrides(cfg: Mapping[str, Any] | None, model: str | None) -> dict[str, An
     return dict(entry) if isinstance(entry, Mapping) else {}
 
 
+def rig_overrides(cfg: Mapping[str, Any] | None, model: str | None) -> dict[str, Any]:
+    """The per-camera patches applied for ``model`` ({} for the base rig), for the run record."""
+    return {str(cid): dict(p) for cid, p in _overrides(cfg, model).items() if isinstance(p, Mapping)}
+
+
 def rig_model(cfg: Mapping[str, Any] | None, model: str | None) -> str:
     """The model whose mounts ``rig_for_model(cfg, model)`` uses."""
     return str(model).strip().lower() if _overrides(cfg, model) else BASE_RIG_MODEL

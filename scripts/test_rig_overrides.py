@@ -21,7 +21,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from python.data.raw_frames import RawFrameWriter, camera_sidecar  # noqa: E402
 from python.sensors.cameras import BeamNGPyBackend, load_camera_config  # noqa: E402
-from python.sensors.rig_overrides import OVERRIDES_KEY, rig_for_model, rig_model  # noqa: E402
+from python.sensors.rig_overrides import OVERRIDES_KEY, rig_for_model, rig_model, rig_overrides  # noqa: E402
 
 REPEATERS = {"repeatL", "repeatR"}
 
@@ -82,7 +82,12 @@ def check_collector() -> None:
         sf._CrashVehicle = base  # type: ignore[misc]
     assert code == 0, text[-2000:]
     assert "camera rig calibrated" not in text, text[:3000]
-    assert json.loads((out / "collect.json").read_text(encoding="utf-8"))["ego"]["camera_rig_model"] == "sbr"
+    ego = json.loads((out / "collect.json").read_text(encoding="utf-8"))["ego"]
+    assert ego["camera_rig_model"] == "sbr", ego
+    # The tuned mounts are recorded, as applied: only repeatL/R pos_m.
+    want_over = load_camera_config()[OVERRIDES_KEY]["sbr"]
+    assert ego["camera_overrides"] == json.loads(json.dumps(want_over)), ego
+    assert set(ego["camera_overrides"]) == REPEATERS and rig_overrides(load_camera_config(), "sbr") == want_over
     cams = {c["id"]: c for c in json.loads((out / "cameras.json").read_text(encoding="utf-8"))["cameras"]}
     want = {c["id"]: c for c in camera_sidecar(rig_for_model(load_camera_config(), "sbr"))}
     assert cams == json.loads(json.dumps(want)), "sbr cameras.json is the sbr rig"
@@ -93,7 +98,8 @@ def check_collector() -> None:
         RawFrameWriter(tmp, camera_sidecar(_base(load_camera_config())))
         ref = (Path(tmp) / "cameras.json").read_bytes()
     assert (out / "cameras.json").read_bytes() == ref, "etk800 cameras.json byte-identical to the base rig"
-    assert json.loads((out / "collect.json").read_text(encoding="utf-8"))["ego"]["camera_rig_model"] == "etk800"
+    ego = json.loads((out / "collect.json").read_text(encoding="utf-8"))["ego"]
+    assert ego["camera_rig_model"] == "etk800" and ego["camera_overrides"] == {}, ego
     print("collector: sbr gets the sbr rig without the rig warning; etk800 cameras.json byte-identical OK")
 
 

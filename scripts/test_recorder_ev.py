@@ -249,6 +249,7 @@ def check_veh_meta_and_rig_warning() -> None:
     assert all(m["model"] == "sbr" and m["part_config"] == EGO_CONFIG_DEFAULT for m in metas), metas
     status = json.loads((out / "collect.json").read_text(encoding="utf-8"))
     assert status["ego"] == {"model": "sbr", "part_config": EGO_CONFIG_DEFAULT, "camera_rig_model": "sbr",
+                             "camera_overrides": status["ego"]["camera_overrides"],
                              "spawned": True, "paint": ls.EGO_PAINTS[EGO_CONFIG_DEFAULT]}, status.get("ego")
     # cameras.yaml has sbr mounts (vehicle_overrides): no rig warning for the spawned eSBR.
     assert "camera rig calibrated" not in text, text[:3000]
@@ -271,6 +272,7 @@ def check_veh_meta_and_rig_warning() -> None:
     assert code == 0 and metas and "part_config" not in metas[0], metas
     ego = json.loads((out / "collect.json").read_text(encoding="utf-8"))["ego"]
     assert ego["spawned"] is False and ego["paint"] is None, ego
+    assert ego["camera_rig_model"] == "etk800" and ego["camera_overrides"] == {}, ego
     print("veh_meta: model=sbr part_config recorded per spawn; collect.json ego; sbr rig, warning only off-rig OK")
 
 

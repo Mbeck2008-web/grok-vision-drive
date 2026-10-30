@@ -1665,7 +1665,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         print(f"collect already reached {done_s / 60.0:.1f} min in {out}")
         run.stop("target_reached", "already reached before this run")
         return 0
-    from python.sensors.rig_overrides import rig_for_model, rig_model
+    from python.sensors.rig_overrides import rig_for_model, rig_model, rig_overrides
 
     # Only a level load spawns args.ego_model (see ego_spawned below); a single-level
     # run drives the car already there and keeps the base rig.
@@ -1673,6 +1673,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
     base_cam_cfg = load_camera_config()
     cam_cfg = rig_for_model(base_cam_cfg, rig_for)
     camera_rig = rig_model(base_cam_cfg, rig_for)
+    camera_overrides = rig_overrides(base_cam_cfg, rig_for)
     plan = capture_plan(cam_cfg, PNG_RATIO_MAX)
     totals = plan_totals(plan)
     ceiling_gb = float(totals["png_gb_per_hour"])
@@ -2362,7 +2363,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             from python.collect.level_session import ego_paint
 
             extra["ego"] = {"model": str(args.ego_model), "part_config": str(args.ego_config),
-                            "camera_rig_model": camera_rig, "spawned": ego_spawned,
+                            "camera_rig_model": camera_rig, "camera_overrides": camera_overrides,
+                            "spawned": ego_spawned,
                             "paint": ego_paint() if ego_spawned else None}
             return extra or None
 

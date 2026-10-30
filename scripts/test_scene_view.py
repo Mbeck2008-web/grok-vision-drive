@@ -664,6 +664,7 @@ def check_7_model_untouched() -> None:
 
 
 SLOW_FACTORY = "gvd_slow_view_child:SlowRuntime"
+SETUP_COST_S = 0.030  # > 0.10 P: a one-time first-step cost must not seed the throttle
 
 
 def _wait_status(viewer, ok, timeout_s: float = 30.0, *, rng=None, seen=None):
@@ -687,16 +688,38 @@ def check_8_child_never_blocks() -> None:
     rng = np.random.default_rng(11)
     viewer = SV.SceneNetViewer({"slow": Path("slow.onnx")}, hz=HZ, can_feed_cam_age=False,
                                runtime_factory=(SLOW_FACTORY, {"forward_s": 0.2, "mode": "sleep"}))
+    real_shm_for = viewer._shm_for
+
+    def costly_first_shm(nbytes):  # one-time setup (first segment, lazy imports) as on a busy CI runner
+        if viewer._shm is None:
+            time.sleep(SETUP_COST_S)
+        return real_shm_for(nbytes)
+
+    viewer._shm_for = costly_first_shm
     viewer.select("slow")
-    _wait_status(viewer, lambda v: v.status not in ("loading",), rng=rng)
+    seen: list = []
+    _wait_status(viewer, lambda v: v.status not in ("loading",), rng=rng, seen=seen)
     worst = 0.0
     t_end = time.monotonic() + 1.5
     while time.monotonic() < t_end:
         ms = viewer.submit(_bundle(_frames(rng, ("main",)), time.time()), backend=None,
                            prev_heartbeat_ms=5.0, loop_gap_s=0.066)
         worst = max(worst, ms)
+        seen.append(viewer.latest())
         time.sleep(1.0 / HZ)
     v = viewer.latest()
+    assert "throttled" not in {s.status for s in seen}, [s.status for s in seen]
+    real_submit = viewer._submit
+
+    def costly_submit(*a, **kw):  # a sustained main-thread cost still throttles
+        time.sleep(0.010)
+        return real_submit(*a, **kw)
+
+    viewer._submit = costly_submit
+    for _ in range(8):
+        viewer.submit(_bundle(_frames(rng, ("main",)), time.time()), backend=None,
+                      prev_heartbeat_ms=5.0, loop_gap_s=0.066)
+    assert viewer.latest().status == "throttled", viewer.latest()
     proc, shm_name = viewer.child, viewer.shm_name
     assert proc is not None and proc.is_alive() and shm_name, (proc, shm_name)
     t0 = time.monotonic()

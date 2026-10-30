@@ -33,6 +33,7 @@ import sys
 import threading
 import time
 from dataclasses import asdict, dataclass
+from multiprocessing import shared_memory
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -409,6 +410,7 @@ class SceneNetViewer:
         self._last_step_t: float | None = None
         self._reset_pending = True
         self._slice_ema: float | None = None
+        self._setup_slice = False
         self._fwd_ema: float | None = None
         self._pause_until = 0.0
         self._pause_status = ""
@@ -470,7 +472,8 @@ class SceneNetViewer:
         except Exception as exc:
             self._error_name(type(exc).__name__)
         ms = max(0.0, (self.clock() - t0) * 1000.0)
-        if self._info is not None:
+        setup, self._setup_slice = self._setup_slice, False
+        if self._info is not None and not setup:  # a segment allocation is one-time setup, not tick cost
             self._slice_ema = ms if self._slice_ema is None else (1 - EMA_ALPHA) * self._slice_ema + EMA_ALPHA * ms
             if self._slice_ema > 0.10 * self.period_s * 1000.0:
                 self._pause(t0, "throttled")
@@ -670,9 +673,8 @@ class SceneNetViewer:
     def _shm_for(self, nbytes: int) -> Any:
         if self._shm is not None and self._shm.size >= nbytes:
             return self._shm
-        from multiprocessing import shared_memory
-
         self._free_shm()
+        self._setup_slice = True
         self._shm = shared_memory.SharedMemory(create=True, size=max(1, int(nbytes)))
         return self._shm
 

@@ -219,6 +219,42 @@ def _lime_frac(bgr) -> float:
     return float(((g > 150) & (g > r + 30) & (g > b + 80)).mean())
 
 
+# repeatL | repeatR of the before smoke (same spawn and t=+30 s, etk800 mounts on the eSBR, white
+# car), each 160x120: the front tyre and wheel arch fill the inboard lower corner.
+ESBR_BEFORE_FIXTURE = ROOT / "tests" / "fixtures" / "esbr_before_repeaters_t30.jpg"
+
+
+def _dark_low_frac(bgr) -> float:
+    """Near-black share of the lower half: tyres and wheel arches (max channel < 45)."""
+    low = bgr[bgr.shape[0] // 2 :]
+    return float((low.max(axis=2) < 45).mean())
+
+
+# Measured: after-smoke repeaters 0.010 / 0.000, before-smoke (tyre in frame) 0.43 / 0.42.
+DARK_LOW_MAX = 0.05
+
+
+def _body_free(bgr) -> bool:
+    """No ego body in a repeater frame: no Lime paint, and no dark tyre or arch in the lower half."""
+    return _lime_frac(bgr) == 0.0 and _dark_low_frac(bgr) < DARK_LOW_MAX
+
+
+def check_body_check_sees_tyres() -> None:
+    """The body check must refuse a tyre or wheel arch in frame, not just Lime paint."""
+    import cv2
+
+    before = cv2.imread(str(ESBR_BEFORE_FIXTURE))
+    assert before is not None and before.shape == (120, 320, 3), ESBR_BEFORE_FIXTURE
+    for name, frame in (("repeatL", before[:, :160]), ("repeatR", before[:, 160:])):
+        assert not _body_free(frame), f"before-smoke {name} shows the tyre: must not pass as body-free"
+    after = cv2.imread(str(ESBR_FIXTURE))
+    blob = after[:, :160].copy()
+    assert _body_free(blob)
+    cv2.ellipse(blob, (20, 110), (45, 30), 0, 0, 360, (18, 18, 20), -1)  # a dark tyre, inboard low
+    assert not _body_free(blob), "a synthetic dark tyre must not pass as body-free"
+    print("body check: before-smoke tyres and a synthetic dark tyre are refused OK")
+
+
 def check_ego_edge_per_model() -> None:
     """sbr repeaters see no ego body, so the live stitch keeps their inboard columns."""
     import cv2
@@ -234,7 +270,7 @@ def check_ego_edge_per_model() -> None:
     assert strip is not None and strip.shape == (120, 480, 3), ESBR_FIXTURE
     frames = {"repeatL": strip[:, :160], "repeatR": strip[:, 160:320], "wide": strip[:, 320:]}
     assert _lime_frac(frames["wide"][60:]) > 0.1, "Lime hood visible on wide: the detector sees the body"
-    assert _lime_frac(frames["repeatL"]) == 0.0 and _lime_frac(frames["repeatR"]) == 0.0
+    assert _body_free(frames["repeatL"]) and _body_free(frames["repeatR"]), "after-smoke repeaters show body"
 
     try:
         for model in (None, "etk800"):
@@ -270,6 +306,7 @@ def main() -> None:
     check_collector()
     check_supervisor()
     check_lanes_poses()
+    check_body_check_sees_tyres()
     check_ego_edge_per_model()
     print("rig overrides ok")
 

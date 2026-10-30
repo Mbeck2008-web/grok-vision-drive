@@ -1568,6 +1568,8 @@ def _check_launch_fail_prints_argv(open_tech_beamngpy) -> None:
     import types
     from contextlib import redirect_stdout
 
+    from python.sensors.tech import TECH_GFX, beamngpy_launch_argv
+
     seen: dict = {}
 
     class FakeBNG:
@@ -1583,10 +1585,11 @@ def _check_launch_fail_prints_argv(open_tech_beamngpy) -> None:
             seen["gfx"] = self.gfx
             seen["quit_on_close"] = self.quit_on_close
             if launch:
-                self.last_command_line = (
-                    f"{TECH_EXE_PATH} -nosteam -tcom -tport 25252 "
-                    "-console -tcom-listen-ip 127.0.0.1 -gfx vk"
-                )
+                # Build the argv the way BeamNGpy does: from the binary and gfx
+                # set on this object, so the printed line proves the forced gfx.
+                argv = beamngpy_launch_argv("/opt/techhome", 25252, None)
+                argv[argv.index("-gfx") + 1] = str(self.gfx)
+                self.last_command_line = argv
                 raise RuntimeError("crash")
 
         def disconnect(self) -> None:
@@ -1622,10 +1625,9 @@ def _check_launch_fail_prints_argv(open_tech_beamngpy) -> None:
         assert seen["binary"] == "BeamNG.tech.exe"
         assert seen["gfx"] == "vk"
         assert seen["quit_on_close"] is False
-        assert (
-            f"argv: {TECH_EXE_PATH} -nosteam -tcom -tport 25252 "
-            "-console -tcom-listen-ip 127.0.0.1 -gfx vk"
-        ) in out
+        expected = " ".join(beamngpy_launch_argv("/opt/techhome", 25252, None))
+        assert expected.endswith(f"-gfx {TECH_GFX}"), expected
+        assert f"argv: {expected}" in out, out
         assert "BeamNG.tech.x64.exe" not in out
         assert "Bin64" not in out
 

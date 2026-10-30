@@ -71,7 +71,7 @@ echo [GVD] link=MISMATCH means Drive vs Tech, a stale lua_bus, or leftover GVD_D
 echo [GVD] Match BeamNGpy to the Tech build in use (0.38 -^> 1.35.x, 0.39 -^> 1.36). config\tech.yaml beamngpy_pin.
 echo [GVD] GVD_TECH_LAUNCH=0 attach. This bat does not start BeamNG.tech.
 echo [GVD] One starter only. Already running: "%BNG_HOME%\BeamNG.tech.exe" -tcom -console -gfx vk
-echo [GVD] -gfx vk is the Vulkan renderer. Do not start without -gfx: the default is not this starter. A bare Bin64 start is not this starter.
+echo [GVD] Always pass -gfx vk. Without -gfx, Tech picks its own renderer, and that start hit the D3D12 Basic Render crash. A bare Bin64 start is not this starter either.
 echo [GVD] Do not combine a bat start with GVD_TECH_LAUNCH=1. That double-starts Tech.
 echo [GVD] tech.key status: non-empty "%BNG_HOME%\tech.key". Missing or empty does not block the wait gate.
 echo [GVD] User path is optional. An empty user path does not block the wait gate.

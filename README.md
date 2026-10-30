@@ -333,7 +333,7 @@ DX11 vs Vulkan A/B on the dev PC: each run was a 60 s collector smoke on west_co
 | New `beamng.log` errors vs DX11 | — | none |
 | Crash or device lost | none | none |
 
-Cold start: the first Vulkan launch with an empty shader cache took about 3.5 min to bring the cameras up (DX11 46 s, warm Vulkan 44 s). The level load was slow enough that the collector retried the scenario, and repeatR had 1 dark frame at startup.
+Cold start: the first Vulkan launch with an empty shader cache took about 3.5 min (212 s) from collector start to live cameras (DX11 about 46 s, warm Vulkan about 45 s). The level load was slow enough that the collector retried the scenario, and repeatR had 1 dark frame at startup.
 
 How each number was measured:
 
@@ -345,15 +345,17 @@ How each number was measured:
 - Dark / missing / unreadable: a saved PNG is dark when its mean luma is below 10; identical repeats were checked with md5 on every saved PNG.
 - VRAM and GPU utilization: `nvidia-smi` sampled at 1 Hz over the driving window.
 - Render FPS: BeamNG's `$fps::instantaneous` / `$fps::avg` registry values sampled at 1 Hz.
-- Window clip fps: frame rate of the screen recording of the game window.
+- Window clip fps: `ffprobe` average frame rate of the 15 s screen recording of the game window.
+- Cold start: cameras-live time minus collector start time (1 s resolution).
+- Scenario retry: `beamng.log` of the cold run loads the `gvd_collect_west_coast_usa_retry` scenario.
 - Renderer: confirmed by the window title, `Engine.Render.getAdapterType()` and `beamng.log`.
 - New errors: diff of normalized error and warning signatures in `beamng.log` against the DX11 run.
 
 Caveats:
 
 - A 2 h run on Vulkan is untested. Only the 60 s smokes above are on file.
-- BeamNG's documentation warns that Vulkan in BeamNG.tech may crash with annotated cameras or multi-sensor setups. GVD runs eight cameras. If Tech crashes or loses the device, fall back to `-gfx dx11`.
-- GPU utilization is higher on Vulkan (86% vs 54%) because the render frame rate is uncapped.
+- BeamNG's documentation warns that Vulkan in BeamNG.tech may crash with annotated cameras or multi-sensor setups. GVD runs eight cameras. The renderer is the constant `TECH_GFX` in `python/sensors/tech.py`; there is no config or env override. To fall back to DX11, either start Tech by hand with `BeamNG.tech.exe -tcom -console -gfx dx11` and attach (`play_gvd_tech.bat`, `GVD_TECH_LAUNCH=0`), or edit `TECH_GFX` to `"dx11"`.
+- GPU utilization was higher on Vulkan: 54% mean on DX11 vs 86% on Vulkan. The cause was not measured.
 - The first launch after a BeamNG update or a shader cache clear is slow while shaders compile. Wait for the cameras before judging Hz.
 
 ## Version

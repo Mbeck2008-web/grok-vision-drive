@@ -504,8 +504,8 @@ def _run_collector(vehicle_args: dict, extra: list[str], root: Path | None = Non
 
     def sleep(seconds: float) -> None:
         # Only the collector's own waits on the main thread move the fake clock. Other threads
-        # (raw_queue polls) and the stdlib subprocess wait loop (code_pin's git calls, timed on
-        # the real clock) really sleep, so CPU load cannot shift the simulated time.
+        # (none today) and the stdlib subprocess wait loop (code_pin's git calls, timed on the
+        # real clock) really sleep, so CPU load cannot shift the simulated time.
         if threading.current_thread() is not main_thread or sys._getframe(1).f_globals.get("__name__") == "subprocess":
             real_sleep(min(float(seconds or 0.0), 0.05))
             return

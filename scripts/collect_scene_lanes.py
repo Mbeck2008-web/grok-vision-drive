@@ -2463,7 +2463,15 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 was_held = segment_defer.pending()
                 if segment_defer.hold(done_s, boundary_wait_reason(clock.phase, settle.active(done_s))):
                     map_name, seg_index = loaded_map, loaded_index
-                elif was_held and seg_index > loaded_index + 1:
+                elif was_held:
+                    # Carry the wait over: the next chunk starts where the switch first fell
+                    # due and keeps its full length, not just what is left of its slot.
+                    schedule_cut -= segment_defer.waited_s
+                    map_name, seg_index = segment_at(
+                        elapsed + schedule_cut, map_names, segment_s, map_weights or None,
+                        None if target_s == float("inf") else target_s,
+                    )
+                if was_held and seg_index > loaded_index + 1:
                     # The hold outlasted a short chunk: load the next chunk, not the one after it.
                     map_name, seg_index = segment_piece(
                         loaded_index + 1, map_names, segment_s, map_weights or None,

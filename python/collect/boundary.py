@@ -7,6 +7,11 @@ in the recording, so a due boundary is held until the excursion clock is back
 in ``cruise`` and the settle window is over, for at most
 ``BOUNDARY_DEFER_CAP_S`` of driving time; then it switches anyway.
 
+A held segment switch carries its wait over: the collector moves the
+schedule back by ``waited_s``, so the next chunk starts where the switch
+first fell due and keeps its full length (a 30 s hold no longer leaves a
+20 s chunk only its settle window).
+
 Forced boundaries (aborts, stalls, impacts, a cut schedule) are not held.
 Logs: ``collect boundary_defer <kind>:<phase> 0.0`` when the hold starts,
 ``collect boundary_defer <kind>:cruise <s>`` or ``<kind>:cap <s>`` when it is
@@ -34,6 +39,7 @@ class BoundaryDefer:
         self.kind = str(kind)
         self.cap_s = float(cap_s)
         self.since: float | None = None
+        self.waited_s = 0.0  # driving seconds the last released hold waited
 
     def pending(self) -> bool:
         return self.since is not None
@@ -56,4 +62,5 @@ class BoundaryDefer:
             return True
         print(f"collect boundary_defer {self.kind}:{'cap' if why else 'cruise'} {waited:.1f}", flush=True)
         self.since = None
+        self.waited_s = max(0.0, waited)
         return False

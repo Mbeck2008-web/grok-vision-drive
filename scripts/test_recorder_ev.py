@@ -485,6 +485,34 @@ def check_segment_hold_one_step() -> None:
     print(f"segment hold: one index per release {order} OK")
 
 
+def _seg_spans(rows: list[dict]) -> dict[str, tuple[float, float]]:
+    """segment -> (first, last) done_s of its rows."""
+    out: dict[str, tuple[float, float]] = {}
+    for r in rows:
+        seg, t = str(r.get("segment") or ""), 0.1 * int(r["i"])
+        out[seg] = (out[seg][0], t) if seg in out else (t, t)
+    return out
+
+
+def check_segment_hold_carries_over() -> None:
+    """A held switch shifts the schedule by its wait: the next chunk keeps its full length.
+
+    Same plan as check_segment_hold_one_step (west 60, italy 20, west 60, west 60). The switch
+    due at 60 s is held 30 s (cap: 300 busy ticks, the 301st releases). italy#1 then drives its
+    20 s (90-110 s), not just what is left of its slot (10 s here, 3.1 s in the italy probe)."""
+    flags = ["--maps", "west_coast_usa,italy", "--map-weights", "west_coast_usa=0.9", "--segment-min", "1",
+             "--minutes", str(200.0 / 60.0)]
+    code, text, out = _west(lambda n: "lane_change" if n <= 301 else "", flags, 2100)
+    assert code == 0, text[-2000:]
+    spans = _seg_spans(_rows(out))
+    first, last = spans["italy#1"]
+    assert abs(first - 90.0) <= 0.3 and abs(last - first - 20.0) <= 0.5, spans
+    assert abs(spans["west_coast_usa#2"][0] - 110.0) <= 0.3, spans
+    holds = [ln for ln in text.splitlines() if ln.startswith("collect boundary_defer segment:")]
+    assert holds == ["collect boundary_defer segment:lane_change 0.0", "collect boundary_defer segment:cap 30.0"], holds
+    print(f"segment hold: italy#1 keeps its 20 s after a 30 s hold ({first:.1f}-{last:.1f} s) OK")
+
+
 def main() -> None:
     check_spawn_passes_model_and_config()
     check_lua_fallback_has_config()
@@ -500,6 +528,7 @@ def main() -> None:
     check_segment_deferred_run()
     check_segment_cap_run()
     check_segment_hold_one_step()
+    check_segment_hold_carries_over()
     print("recorder ev ok")
 
 

@@ -501,6 +501,7 @@ def _run_supervisor(
     engage_heartbeat: bool = True,
     echo_clock: bool = False,
     loop_sleep_s: float | None = None,
+    report: dict | None = None,
 ) -> dict | None:
     """Run run_vision.py headless for `seconds`; optionally play the mod's ack role meanwhile.
 
@@ -538,6 +539,9 @@ def _run_supervisor(
     mod would show. Not with `freeze_echo_after_s` (that run tests the stale timing itself).
     `loop_sleep_s` (test-only, default GVD_TEST_STEP_SLEEP_S or 0) adds a real sleep per loop
     pass to play a slow host.
+    `report`, when given, gets `hb_age_s` (each loop pass: real wall time minus gvd_cmd.json
+    heartbeat_mtime, after the first tick) and `stdout` (the supervisor's stdout text). Timing
+    observations only; nothing in this function judges them.
 
     The fake mod echoes back what it was told to apply, exactly like `gvd_main` does, so the
     override residual is zero unless a test deliberately plays a driver: `steer_echo` /
@@ -786,6 +790,10 @@ def _run_supervisor(
             _touch_lua_bus()
             _touch_engage_heartbeat()
             _ack_once()
+            if report is not None:
+                hb = _read_json(cmd_path()).get("heartbeat_mtime")
+                if isinstance(hb, (int, float)):
+                    report.setdefault("hb_age_s", []).append(time.time() - float(hb))
             if _try_latch():
                 break
             # Tighter than the 20 Hz supervisor loop so the echo always belongs to the newest seq.
@@ -822,6 +830,8 @@ def _run_supervisor(
         if clock_dir is not None:
             shutil.rmtree(clock_dir, ignore_errors=True)
         out_fh.close()
+        if report is not None:
+            report["stdout"] = out_file.read_text(encoding="utf-8", errors="replace") if out_file.exists() else ""
         shutil.rmtree(out_dir, ignore_errors=True)
     return latched if latched is not None else loose
 
@@ -1420,25 +1430,111 @@ def check_echo_old_mod_version_refused() -> None:
     ego_path().unlink()
 
 
+CMD_BLIND_S = (1.2, 2.4)  # commands stop reaching the mod in this window (seconds after start)
+CMD_BLIND_RUN_S = 3.0
+CMD_BLIND_ENGAGE_S = 0.5  # Alt+G on the SimClock run, once the echo gate has seen the mod (as check_09)
+
+
 def check_echo_cmd_blind_not_stale() -> None:
     """Commands stop reaching the mod while its echoes keep advancing: no echo_stale.
 
     echo_seq is the mod's own counter. Keyed on the command seq it would freeze with the
     commands, and a live wheel would read as a dead link.
+
+    Pass/fail runs on the SimClock step barrier (test_unknown_ego._session(clock=SimClock()),
+    #155): one supervisor tick per 50 ms of clock time, the fake mod's 10 Hz echo and Alt+G
+    heartbeat on the same clock. The cmd-blind window, the run length and ECHO_STALE_MS are
+    unchanged; a loaded runner that descheduled the fake mod for over 300 ms of real time can
+    no longer read as echo_stale. Real-clock timing is check_supervisor_tick_latency_report.
     """
+    import test_unknown_ego as ue  # noqa: PLC0415 - the SimClock supervisor session and fake mod
+    from gvd_sim_clock import SimClock  # noqa: PLC0415
+
     _touch_lua_bus()
     if ego_path().exists():
         ego_path().unlink()
-    write_engage_flag(True)
-    _run_supervisor(["--allow-preview-drive"], seconds=3.0, ack=True, cmd_blind=(1.2, 2.4))
+    write_engage_flag(False)
+    mod = ue._Mod()
+    mod.echoing = True
+    seqs: dict[str, list[int]] = {"cmd": [], "held": []}
+    started = {"on": False}
+
+    def step(t: float) -> None:
+        # Alt+G after this supervisor is up. The real-clock harness presses on the first tick,
+        # after seconds of startup echoes; on the clock startup is a few ticks, so the press
+        # waits for the gate to see the mod, still well before the cmd-blind window.
+        if not started["on"] and t >= CMD_BLIND_ENGAGE_S:
+            started["on"] = True
+            write_engage_flag(True)
+        mod.blind = CMD_BLIND_S[0] <= t < CMD_BLIND_S[1]
+        if mod.blind:
+            seqs["cmd"].append(int(_read_json(cmd_path()).get("seq", 0) or 0))
+            seqs["held"].append(int((mod.held or {}).get("seq", 0) or 0))
+
+    seen = ue._session(CMD_BLIND_RUN_S, mod, step, clock=SimClock())
+    # Load-bearing: the supervisor kept commanding while the mod held one command.
+    cmd, held = seqs["cmd"], seqs["held"]
+    assert cmd and cmd[-1] > cmd[0], ("no new commands in the blind window", cmd)
+    assert len(set(held)) == 1 and held[0] > 0, ("the mod took a command while blind", held)
+    assert ue._engaged_snaps(seen), "never engaged"
     eng = _read_json(engage_path())
     st = read_state() or {}
+    assert not [s["state"].get("disengage_reason") for s in seen
+                if "echo_stale" in (s["state"].get("disengage_reason"), s["engage"].get("disengage_reason"))], \
+        "echo_stale while commands were blind"
     assert eng.get("disengage_reason") != "echo_stale", eng
     assert st.get("disengage_reason") != "echo_stale", st.get("disengage_reason")
     assert eng.get("engaged") is True, eng
     assert (st.get("echo") or {}).get("status") in ("fresh", "repeat"), st.get("echo")
     write_engage_flag(False)
     ego_path().unlink()
+
+
+def _pct(values: list[float], q: float) -> float | None:
+    if not values:
+        return None
+    v = sorted(values)
+    return v[min(len(v) - 1, max(0, int(round(q * (len(v) - 1)))))]
+
+
+def check_supervisor_tick_latency_report() -> None:
+    """REPORT ONLY, never fails: real-clock supervisor tick time and command heartbeat age.
+
+    The same cmd-blind run as check_echo_cmd_blind_not_stale, on the real clock (stdlib time,
+    plain run_vision.py). Prints p50/p99 of the supervisor's own per-tick `heartbeat_ms` (its
+    `[GVD] seg` line) and of the gvd_cmd.json heartbeat age the test saw, plus whether this
+    host produced echo_stale. Under CI load these numbers move; that is what they are for. Pass
+    or fail of the safety behaviour is the SimClock check, not this one.
+    """
+    rep: dict = {}
+    try:
+        _touch_lua_bus()
+        if ego_path().exists():
+            ego_path().unlink()
+        write_engage_flag(True)
+        _run_supervisor(["--allow-preview-drive"], seconds=CMD_BLIND_RUN_S, ack=True, cmd_blind=CMD_BLIND_S,
+                        report=rep)
+        tick_ms = [float(m) for m in re.findall(r"^\[GVD\] seg .*?\bheartbeat_ms=([0-9.]+)",
+                                                rep.get("stdout", ""), re.M)]
+        hb_ms = [a * 1000.0 for a in rep.get("hb_age_s", [])]
+        stale = "echo_stale" in (str(_read_json(engage_path()).get("disengage_reason")),
+                                 str((read_state() or {}).get("disengage_reason")))
+
+        def ms(v: float | None) -> str:
+            return "na" if v is None else f"{v:.1f}"
+
+        print(f"  tick-latency report (real clock, report-only): ticks={len(tick_ms)} "
+              f"tick_ms p50={ms(_pct(tick_ms, 0.50))} p99={ms(_pct(tick_ms, 0.99))} "
+              f"heartbeat_age_ms p50={ms(_pct(hb_ms, 0.50))} p99={ms(_pct(hb_ms, 0.99))} "
+              f"samples={len(hb_ms)} echo_stale={'yes' if stale else 'no'}", flush=True)
+    except Exception as exc:  # noqa: BLE001 - report-only: a broken measurement is printed, never a failure
+        print(f"  tick-latency report (real clock, report-only): unavailable ({type(exc).__name__}: {exc})"[:400],
+              flush=True)
+    finally:
+        with contextlib.suppress(Exception):
+            write_engage_flag(False)
+        with contextlib.suppress(FileNotFoundError):
+            ego_path().unlink()
 
 
 def check_lua_harness() -> None:
@@ -1597,6 +1693,7 @@ def main() -> None:
         check_echo_stale_disengages,
         check_echo_old_mod_version_refused,
         check_echo_cmd_blind_not_stale,
+        check_supervisor_tick_latency_report,
     )
     failed: list[str] = []
     for fn in checks:

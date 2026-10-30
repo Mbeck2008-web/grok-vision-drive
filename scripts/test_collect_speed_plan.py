@@ -105,6 +105,42 @@ def check_refusals_carry_reason() -> None:
     print("refusals: no_path (short chain, also a fast lane change), narrow; gate short at 30 m/s OK")
 
 
+def _old_maneuver_length_m(phase: str, delta_m: float, speed_mps: float | None) -> float:
+    """The lane change line before v * LANE_CHANGE_S + slack: max(WINDOW_M, ramp + 16)."""
+    ramp = ramp_length_m(delta_m, speed_mps)
+    if phase == "lane_change" and ramp is not None:
+        return max(exc.WINDOW_M, ramp + 16.0)
+    return _NEW_MANEUVER_LENGTH(phase, delta_m, speed_mps)
+
+
+_NEW_MANEUVER_LENGTH = exc.maneuver_length_m
+
+
+def check_lane_change_speed_term_refusal() -> None:
+    """130 m of road at 17 m/s: max(60, ramp + 16) = 90 m fits, v * LANE_CHANGE_S + 10 = 146 m does not."""
+    v = 17.0
+    ramp = ramp_length_m(3.5, v)
+    assert ramp is not None and max(exc.WINDOW_M, ramp + 16.0) < 100.0
+    assert exc.maneuver_length_m("lane_change", 3.5, v) == v * exc.LANE_CHANGE_S + exc.LANE_CHANGE_LINE_SLACK_M == 146.0
+    road = [RoadPoly("m", [(0.0, 0.0), (0.0, 130.0)], 14.0, 4)]
+    hit = project_road(road, 1.75, 20.0, math.pi / 2.0)
+
+    def run() -> tuple:
+        pts, _u, info = _plan("lane_change", v, road, 1.75)
+        return pts, info, exc.gate_reason(road, hit, 1.75, 20.0, math.pi / 2.0, "lane_change", v)
+
+    pts, info, gate = run()
+    assert pts is None and info.get("refused") == "no_path" and gate == "short", (info, gate)
+    exc.maneuver_length_m = _old_maneuver_length_m  # type: ignore[assignment]
+    try:
+        old_pts, old_info, old_gate = run()
+    finally:
+        exc.maneuver_length_m = _NEW_MANEUVER_LENGTH  # type: ignore[assignment]
+    assert old_pts is not None and old_gate == "open", (old_info, old_gate)
+    print("lane change 17 m/s on 130 m: old max(60, ramp+16) line plans and gates open; "
+          "new v*LANE_CHANGE_S+10 = 146 m refuses no_path / gate short OK")
+
+
 def check_overspeed_rule() -> None:
     assert exc.OVERSPEED_FRAC == 0.15
     assert not overspeed(11.5, 10.0) and overspeed(11.51, 10.0) and not overspeed(None, 10.0)
@@ -412,6 +448,7 @@ def check_lane_change_guard_on_complete() -> None:
 def main() -> None:
     check_plan_speed()
     check_refusals_carry_reason()
+    check_lane_change_speed_term_refusal()
     check_overspeed_rule()
     check_flag_clamp()
     check_weave_stats()

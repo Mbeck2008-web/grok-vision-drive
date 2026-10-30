@@ -10,6 +10,10 @@ model only:
 
 ``rig_for_model`` drops the block in every case, so a model without an entry
 (the etk800, or an unknown car) gets exactly the base rig.
+
+Readers that load cameras.yaml on their own (lanes.py side/rear poses, the
+debug-draw frustums) use ``active_rig()``: the base rig until a camera backend
+attaches to a car and calls ``set_active_model``.
 """
 from __future__ import annotations
 
@@ -17,6 +21,8 @@ from typing import Any, Mapping
 
 BASE_RIG_MODEL = "etk800"
 OVERRIDES_KEY = "vehicle_overrides"
+
+_ACTIVE_MODEL: str | None = None
 
 
 def _overrides(cfg: Mapping[str, Any] | None, model: str | None) -> dict[str, Any]:
@@ -49,3 +55,22 @@ def rig_for_model(cfg: Mapping[str, Any] | None, model: str | None) -> dict[str,
         cams.append({**spec, **patch} if isinstance(patch, Mapping) else spec)
     out["cameras"] = cams
     return out
+
+
+def set_active_model(model: str | None) -> None:
+    """The ego model the attached cameras use; pose readers follow it."""
+    global _ACTIVE_MODEL
+    _ACTIVE_MODEL = str(model).strip().lower() if model else None
+
+
+def active_model() -> str | None:
+    return _ACTIVE_MODEL
+
+
+def active_rig(cfg: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """cameras.yaml (or ``cfg``) resolved for the active model; the base rig when none is set."""
+    if cfg is None:
+        from python.sensors.cameras import load_camera_config
+
+        cfg = load_camera_config()
+    return rig_for_model(cfg, _ACTIVE_MODEL)

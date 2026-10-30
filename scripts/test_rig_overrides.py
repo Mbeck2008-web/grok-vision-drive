@@ -164,11 +164,56 @@ def check_supervisor() -> None:
     print(f"supervisor: sbr moves {sorted(moved)} only; etk800 mounts unchanged OK")
 
 
+def _pose_rows() -> dict:
+    from python.perception import lanes
+
+    return {cid: (p.x, p.y, p.z, p.yaw_deg, p.pitch_deg, p.fov_v_deg, p.width, p.height)
+            for cid, p in lanes.camera_poses().items()}
+
+
+def check_lanes_poses() -> None:
+    """lanes.py side/rear poses (posed_lanes_from_image, lanes_bev) follow the attached car's rig."""
+    from python.perception import lanes
+    from python.viz import debug_draw
+
+    from python.sensors.rig_overrides import set_active_model
+
+    set_active_model(None)  # check_supervisor left the sbr attached
+    cfg = load_camera_config()
+    base_rows = {c["id"]: tuple(c["pos_m"]) for c in _base(cfg)["cameras"]}
+    sbr_rows = {c["id"]: tuple(c["pos_m"]) for c in rig_for_model(cfg, "sbr")["cameras"]}
+    before = _pose_rows()  # nothing attached yet: the base (etk800) rig
+    assert {k: v[:3] for k, v in before.items()} == {k: base_rows[k] for k in before}, before
+    etk_frustums = json.dumps(debug_draw.load_frustums())
+
+    _supervisor_positions("sbr")
+    got = _pose_rows()
+    for cid in got:
+        assert got[cid][:3] == sbr_rows[cid], (cid, got[cid], sbr_rows[cid])
+    assert {k for k in got if got[k] != before[k]} == REPEATERS, (got, before)
+    assert lanes.camera_pose("repeatL").x == -1.10 and lanes.camera_pose("repeatL").y == 0.0
+    sbr_fr = {f["id"]: (f["x"], f["y"], f["z"]) for f in debug_draw.load_frustums()}
+    assert sbr_fr["repeatR"] == sbr_rows["repeatR"] and sbr_fr["main"] == base_rows["main"], sbr_fr
+    # The same repeater pixel lands somewhere else on the ground once the sbr mount is in.
+    rep = lanes.camera_pose("repeatR")
+    hit_sbr = lanes.project_pose_pixel(rep, rep.width * 0.5, rep.height * 0.9)
+
+    _supervisor_positions("etk800")
+    assert _pose_rows() == before, "etk800 poses byte-identical to the base rig"
+    assert json.dumps(debug_draw.load_frustums()) == etk_frustums
+    rep = lanes.camera_pose("repeatR")
+    hit_etk = lanes.project_pose_pixel(rep, rep.width * 0.5, rep.height * 0.9)
+    assert hit_sbr and hit_etk and abs(hit_sbr["y"] - hit_etk["y"]) > 0.5, (hit_sbr, hit_etk)
+    print(f"lanes: sbr repeater poses reach camera_pose/project_pose_pixel (y {hit_etk['y']:.2f} -> "
+          f"{hit_sbr['y']:.2f} m); etk800 poses and frustums unchanged OK")
+
+
 def main() -> None:
     check_etk800_identical()
     check_sbr_moves_only_repeaters()
     check_collector()
     check_supervisor()
+    check_lanes_poses()
     print("rig overrides ok")
 
 

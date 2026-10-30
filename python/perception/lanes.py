@@ -329,6 +329,7 @@ class CameraPose:
 SIDE_REAR_CAM_IDS = ("pillarL", "pillarR", "repeatL", "repeatR", "rear")
 
 _POSES: dict[str, CameraPose] | None = None
+_POSES_MODEL: str | None = None
 _POSE_MISSING: tuple[str, ...] = ()
 
 
@@ -361,13 +362,16 @@ def _pose_from_spec(cid: str, spec: dict[str, Any]) -> CameraPose | None:
 
 
 def camera_poses() -> dict[str, CameraPose]:
-    """Poses from ``config/cameras.yaml``. A camera with no pose is named and skipped."""
-    global _POSES, _POSE_MISSING
-    if _POSES is not None:
-        return _POSES
-    from python.sensors.cameras import CAM_IDS, load_camera_config
+    """Poses from ``config/cameras.yaml`` for the attached car's rig. A camera with no pose is named and skipped."""
+    global _POSES, _POSES_MODEL, _POSE_MISSING
+    from python.sensors.rig_overrides import active_model, active_rig
 
-    cfg = load_camera_config()
+    model = active_model()
+    if _POSES is not None and _POSES_MODEL == model:
+        return _POSES
+    from python.sensors.cameras import CAM_IDS
+
+    cfg = active_rig()
     by_id: dict[str, dict[str, Any]] = {}
     for spec in cfg.get("cameras") or []:
         if isinstance(spec, dict) and spec.get("id"):
@@ -381,6 +385,7 @@ def camera_poses() -> dict[str, CameraPose]:
             continue
         found[cid] = pose
     _POSES = found
+    _POSES_MODEL = model
     _POSE_MISSING = tuple(missing)
     return found
 

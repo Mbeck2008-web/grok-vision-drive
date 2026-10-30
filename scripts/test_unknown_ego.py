@@ -214,6 +214,8 @@ class _Mod:
         self.next_hb = 0.0
         self.echoing = False
         self.frozen: dict | None = None  # rewrite this echo (fresh mtime, same echo_seq)
+        self.blind = False  # commands stop reaching the mod: it keeps the last one, echoes still advance
+        self.held: dict | None = None  # the last command the mod received
         self.clock = None  # _session(clock=...) sets its SimClock; None is the real clock
 
     def _mono(self) -> float:
@@ -230,7 +232,9 @@ class _Mod:
             return
         if not self.echoing:
             return
-        cmd = _read(cmd_path())
+        if not self.blind or self.held is None:
+            self.held = _read(cmd_path())
+        cmd = self.held
         seq = int(cmd.get("seq", 0) or 0) if float(cmd.get("heartbeat_mtime") or 0.0) >= t_spawn - 0.5 else 0
         self.k += 1
         m6._write_ego(
@@ -429,6 +433,13 @@ def _clock_session(
                 release()
                 tick_done("startup")
             m0 = clock.mono()
+            # The tick that first wrote the bus is read at t=0, as _session's first real-clock read
+            # (a latch ON at start is refused on that tick).
+            snap = {"t": 0.0, "engage": _read(engage_path()), "cmd": _read(cmd_path()), "state": _read(state_path())}
+            seen.append(snap)
+            last_key = json.dumps([snap["engage"], snap["cmd"], snap["state"].get("engaged"),
+                                   snap["state"].get("disengage_reason"), snap["state"].get("last_refusal_reason"),
+                                   snap["state"].get("cmd_seq")], sort_keys=True, default=str)
             while True:
                 clock.advance(1.0 / CLOCK_HZ)
                 t = clock.mono() - m0
@@ -486,7 +497,13 @@ def check_07_engage_before_first_echo() -> None:
 
     Unit: the clear road at the placeholder gave thr 0.55; at None it refuses.
     Supervisor: never engaged, ego_unknown on every surface, thr 0 / brk 0.
+
+    On the SimClock step barrier (#148): Alt+G at 0.5 s and the 3.0 s window are clock seconds,
+    and the bus is read once after every supervisor tick, so a loaded runner cannot end the
+    window before the refusal tick lands. Same 0.5 s / 3.0 s as on the real clock.
     """
+    from gvd_sim_clock import SimClock  # noqa: PLC0415
+
     problems: list[str] = []
     frame = _road()
     perc = _perc(None)
@@ -508,7 +525,7 @@ def check_07_engage_before_first_echo() -> None:
             fired["on"] = True
             _engage_now()
 
-    seen = _session(3.0, mod, step)
+    seen = _session(3.0, mod, step, clock=SimClock())
     try:
         live = _engaged_snaps(seen)
         assert not live, ("engaged with no echo this session",
@@ -526,7 +543,13 @@ def check_08_restart_with_latch_on() -> None:
     Main case: the echo on disk is stale (an old session's). Variant: the old session's
     echo is under 1 s old (the mod keeps rewriting it, same echo_seq). Then a new off->on
     edge after a seq advance engages.
+
+    On the SimClock step barrier (#148): the 2.0 s latched phase, the edge + 0.6 s re-press and
+    the 4.5 s session are clock seconds (the same numbers as on the real clock), one supervisor
+    tick per 50 ms step, so how fast the host runs cannot move a snapshot across 2.0 s.
     """
+    from gvd_sim_clock import SimClock  # noqa: PLC0415
+
     m6 = _m6()
     problems: list[str] = []
     for variant in ("echo_stale", "old_echo_under_1s"):
@@ -551,7 +574,7 @@ def check_08_restart_with_latch_on() -> None:
                 if t < phase["edge"] + 0.7:
                     _engage_now()
 
-        seen = _session(4.5, mod, step)
+        seen = _session(4.5, mod, step, clock=SimClock())
         before = [s for s in seen if s["t"] < 2.0]
         try:
             live = _engaged_snaps(before)

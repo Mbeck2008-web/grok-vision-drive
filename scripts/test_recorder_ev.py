@@ -63,7 +63,7 @@ def check_spawn_passes_model_and_config() -> None:
     import python.collect.level_session as ls
 
     assert ls.EGO_MODEL_DEFAULT == "sbr", ls.EGO_MODEL_DEFAULT
-    assert ls.EGO_CONFIG_DEFAULT.startswith("vehicles/sbr/") and ls.EGO_CONFIG_DEFAULT.endswith(".pc")
+    assert ls.EGO_CONFIG_DEFAULT == "vehicles/sbr/electric_800.pc", ls.EGO_CONFIG_DEFAULT
 
     class _Bng:
         def __init__(self) -> None:

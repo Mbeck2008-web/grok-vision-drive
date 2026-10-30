@@ -38,13 +38,12 @@ POLL_S = 0.5
 SPAWN_Z_M = 250.0
 SCENARIO_TIMEOUT_S = 120.0
 # The ego car every spawn site uses: the Hirochi eSBR (electric), for smooth
-# power and instant torque under the AI. The .pc path is TO CONFIRM on a
-# BeamNG.tech 0.39 install: the name follows the stock eSBR 300 config
-# (electric_300/500/800) and BeamNG's tech forum example
-# Vehicle(model='sbr', part_config='vehicles/sbr/electric_300.pc'); it has not
-# been loaded here. An empty config spawns the model's default config.
+# power and instant torque under the AI. electric_800 is the stock eSBR 800
+# config (vehicles/sbr/electric_800.pc in the 0.39.4 sbr content); it spawned
+# and drove a 60 s smoke on BeamNG.tech 0.39.4. An empty config spawns the
+# model's default config.
 EGO_MODEL_DEFAULT = "sbr"
-EGO_CONFIG_DEFAULT = "vehicles/sbr/electric_300.pc"
+EGO_CONFIG_DEFAULT = "vehicles/sbr/electric_800.pc"
 _EGO = {"model": EGO_MODEL_DEFAULT, "part_config": EGO_CONFIG_DEFAULT}
 
 

@@ -1186,8 +1186,11 @@ def check_lane_edge_straddle_run() -> None:
     previous = collect.painted_for
     collect.painted_for = lambda level: _line_paint([-3.5, 0.0, 3.5])  # type: ignore[assignment]
     try:
-        code, text, out = _run_collector({"speed_at": lambda n: 10.0, "stop_at": w0 + 100, "x": 0.4}, [])
-        code_in, text_in, out_in = _run_collector({"speed_at": lambda n: 10.0, "stop_at": w0 + 100, "x": 1.75}, [])
+        # Guard off, as before the guard became the default: this covers the unguarded lane_edge path.
+        code, text, out = _run_collector(
+            {"speed_at": lambda n: 10.0, "stop_at": w0 + 100, "x": 0.4}, ["--no-weave-guard"])
+        code_in, text_in, out_in = _run_collector(
+            {"speed_at": lambda n: 10.0, "stop_at": w0 + 100, "x": 1.75}, ["--no-weave-guard"])
     finally:
         collect.painted_for = previous  # type: ignore[assignment]
     assert code == 0 and code_in == 0, (text[-1500:], text_in[-1500:])

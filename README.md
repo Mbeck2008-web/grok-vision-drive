@@ -322,7 +322,7 @@ Every number in this section is a code default or a code constant on this branch
 
 | Part | What it is | Status |
 | --- | --- | --- |
-| Cameras | Eight BeamNG.tech cameras (`config/cameras.yaml`): main, narrow and wide on the windshield, pillarL/R aimed 78 degrees off the lane, repeatL/R on the fenders at yaw ±150, rear. Retail BeamNG.drive captures one window only. | Unproven |
+| Cameras | Eight BeamNG.tech cameras (`config/cameras.yaml`): main, narrow and wide on the windshield, pillarL/R aimed 78 degrees off the lane, repeatL/R on the fenders at yaw ±150, rear. `vehicle_overrides` holds per-model mounts (the eSBR's repeaters sit mirror-like, behind the front tyre and outboard of the body). Retail BeamNG.drive captures one window only. | Unproven |
 | Capture | One supervisor tick reads all eight cameras from shared memory. A camera not read this tick is missing; an older frame is not reused. Companions update offscreen; a bright-blue flash frame is not stored. | Offline smoke only |
 | Stitch | 2272x192 canvas: six 256x192 sectors (repeatL, pillarL, main, narrow, pillarR, repeatR), two 340x192 sectors (wide, rear), seven 8 px gaps. No pose warp. A missing camera is an empty sector. Repeater ego-body columns are cleared. | Offline smoke only |
 | Supervisor | `python/run_vision.py`: capture, perception (Hough lanes by default, YOLOv8n detector), path planner, safety vetoes, actuator, viz, clips. | Unproven |

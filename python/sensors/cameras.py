@@ -1499,6 +1499,9 @@ class BeamNGPyBackend:
             print(f"[GVD] tech vehicle sensors: {e}")
 
         vehicle = self.session.vehicle
+        from python.sensors.rig_overrides import rig_for_model
+
+        self.config = rig_for_model(self.config, self.session._model(vehicle))
         bng = self.session.bng
         cam_cfg = self.session.config.get("cameras") if isinstance(self.session.config.get("cameras"), dict) else {}
         if cam_cfg.get("attach", True) is False:

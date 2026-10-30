@@ -248,10 +248,18 @@ def check_veh_meta_and_rig_warning() -> None:
     assert len(metas) >= 2, metas  # one per spawn
     assert all(m["model"] == "sbr" and m["part_config"] == EGO_CONFIG_DEFAULT for m in metas), metas
     status = json.loads((out / "collect.json").read_text(encoding="utf-8"))
-    assert status["ego"] == {"model": "sbr", "part_config": EGO_CONFIG_DEFAULT, "camera_rig_model": "etk800",
+    assert status["ego"] == {"model": "sbr", "part_config": EGO_CONFIG_DEFAULT, "camera_rig_model": "sbr",
                              "spawned": True, "paint": ls.EGO_PAINTS[EGO_CONFIG_DEFAULT]}, status.get("ego")
+    # cameras.yaml has sbr mounts (vehicle_overrides): no rig warning for the spawned eSBR.
+    assert "camera rig calibrated" not in text, text[:3000]
+    # An sbr already in a single-level run keeps the etk800 rig, and is warned once.
+    sf._CrashVehicle = _Sbr  # type: ignore[misc]
+    try:
+        code, text, out = sf._run_collector({"stop_at": 60}, ["--no-excursions"])
+    finally:
+        sf._CrashVehicle = base  # type: ignore[misc]
     warn = "collect WARNING camera rig calibrated on etk800, ego model is sbr"
-    assert text.count(warn) == 1, text[:3000]
+    assert code == 0 and text.count(warn) == 1, text[:3000]
     # The etk800 opt-back: no rig warning.
     code, text, out = _west(lambda n: "", ["--ego-model", "etk800", "--ego-config", ""], 60)
     assert code == 0 and "camera rig calibrated" not in text, text[:2000]
@@ -263,7 +271,7 @@ def check_veh_meta_and_rig_warning() -> None:
     assert code == 0 and metas and "part_config" not in metas[0], metas
     ego = json.loads((out / "collect.json").read_text(encoding="utf-8"))["ego"]
     assert ego["spawned"] is False and ego["paint"] is None, ego
-    print("veh_meta: model=sbr part_config recorded per spawn; collect.json ego; rig warning once OK")
+    print("veh_meta: model=sbr part_config recorded per spawn; collect.json ego; sbr rig, warning only off-rig OK")
 
 
 def _respawn_rows(rows: list[dict]) -> list[float]:

@@ -298,8 +298,10 @@ def check_refused_stretches_run() -> None:
     print(f"refused stretches: 2 (one per spawn) from {tries} no_paint attempts OK")
 
 
-def _lane_change_run(v_car: float, flags: list[str]):
-    """A 4-lane 14 m road, painted, the car in a lane at a fixed ``v_car``; every start is a lane change."""
+def _lane_change_run(v_car: float, flags: list[str], guard: bool = False):
+    """A 4-lane 14 m road, painted, the car in a lane at a fixed ``v_car``; every start is a lane change.
+
+    ``guard=False`` passes --no-weave-guard (the incomplete case needs the car past the line's end)."""
     import scripts.collect_scene_lanes as collect
     import scripts.test_collect_spawn_fix as harness
 
@@ -311,7 +313,7 @@ def _lane_change_run(v_car: float, flags: list[str]):
     try:
         code, text, out = harness._run_collector(
             {"speed_at": lambda n: v_car, "stop_at": w0 + 200, "x": 1.75},
-            [*flags, "--no-weave-guard"], roads=roads)  # the guard's line end would cut the ramp short
+            [*flags] + ([] if guard else ["--no-weave-guard"]), roads=roads)
     finally:
         collect.painted_for, exc.ExcursionClock.peek_kind = previous  # type: ignore[assignment]
     assert code == 0, text[-2000:]
@@ -392,6 +394,21 @@ def check_auto_mode_speed_flags() -> None:
           f"set speeds pass through OK")
 
 
+def check_lane_change_guard_on_complete() -> None:
+    """Guard on (the default), 17 m/s: the sent line covers the whole LANE_CHANGE_S, so the
+    lane change is not cut at the line end and counts as complete."""
+    flags = ["--speed-min", "17", "--speed-max", "17"]
+    text, heads, ws = _lane_change_run(17.0, flags, guard=True)
+    assert "lane_change line end" not in text, [x for x in text.splitlines() if "line end" in x]
+    assert ws["started"].get("lane_change") == 1, ws
+    assert ws["lane_change_complete"] == 1 and ws["lane_change_incomplete"] == 0, ws
+    full = math.atan(3.5 * math.pi / (2.0 * ramp_length_m(3.5, 17.0)))
+    assert len(heads) in (80, 81) and abs(heads[-1] - full) < 2e-3, (len(heads), heads[-1:], full)
+    need = exc.maneuver_length_m("lane_change", 3.5, 17.0)
+    assert need >= 17.0 * exc.LANE_CHANGE_S, need
+    print(f"lane change, guard on, 17 m/s: line {need:.0f} m, {len(heads)} rows, complete OK")
+
+
 def main() -> None:
     check_plan_speed()
     check_refusals_carry_reason()
@@ -402,6 +419,7 @@ def main() -> None:
     check_collector_run()
     check_refused_stretches_run()
     check_lane_change_incomplete()
+    check_lane_change_guard_on_complete()
     check_west_coast_spawn_ranges()
     check_auto_mode_speed_flags()
     print("collect speed plan ok")

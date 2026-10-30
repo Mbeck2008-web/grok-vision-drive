@@ -333,6 +333,22 @@ def check_ego_model_reaches_spawn() -> None:
     print("ego model: --ego-model sbr2 reaches the spawn; veh_meta model is the spawned sbr2 OK")
 
 
+def check_sbr_without_bbox_stops() -> None:
+    """The eSBR has no fallback width (only the etk800 has one): no bbox stops the run with
+    vehicle_width, code 2, before a row is written. (The mocked level-load harness runs
+    --no-excursions, which needs no width, so this drives the sbr already in the level.)"""
+    import scripts.test_collect_spawn_fix as sf
+
+    code, text, out = sf._run_collector({"speed_at": lambda n: 10.0, "stop_at": 120, "bbox_w": None, "model": "sbr"}, [])
+    assert code == 2, (code, text[-2000:])
+    status = json.loads((out / "collect.json").read_text(encoding="utf-8"))
+    assert status["stop_reason"] == "vehicle_width", status.get("stop_reason")
+    assert "bbox failed: RuntimeError" in status["stop_detail"] and "model=sbr is not etk800" in status["stop_detail"], status
+    assert "collect stop vehicle width unknown:" in text, text[-2000:]
+    assert not (out / "state.jsonl").is_file() or not (out / "state.jsonl").read_text(encoding="utf-8").strip()
+    print("vehicle width: an sbr without a bbox stops with vehicle_width, code 2 OK")
+
+
 def _respawn_rows(rows: list[dict]) -> list[float]:
     """done_s (0.1 s per row) where a settle run starts: one per spawn."""
     out, prev = [], False
@@ -454,6 +470,7 @@ def main() -> None:
     check_boundary_defer_unit()
     check_veh_meta_and_rig_warning()
     check_ego_model_reaches_spawn()
+    check_sbr_without_bbox_stops()
     check_respawn_deferred_run()
     check_segment_deferred_run()
     check_segment_cap_run()

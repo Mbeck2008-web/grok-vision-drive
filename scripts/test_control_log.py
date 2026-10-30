@@ -113,7 +113,7 @@ def _files(out: Path) -> set[str]:
 def check_file_cap_exit_7() -> None:
     assert collect.STOP_EXIT_FILE_CAP == 7 and collect.STOP_EXIT_EARLY == 6
     code, text, out = sf._run_collector({"speed_at": lambda n: 10.0, "stop_at": 99999},
-                                        ["--no-excursions", "--max-file-gb", "0.000001"])
+                                        ["--no-excursions", "--max-file-gib", "0.000001"])
     # collect.main -> the real RunStop.finish(): 7 survives, it does not become 6.
     status = stops._check_stop(code, text, out, "file_cap", 7)
     assert status["done_s"] < status["target_s"], status
@@ -132,7 +132,7 @@ def check_file_cap_exit_7() -> None:
     assert code2 == 0, text2[-1500:]
     assert before <= _files(out), sorted(before - _files(out))
     # Default cap 3.5 GiB never trips on a short run.
-    assert collect.build_parser().parse_args([]).max_file_gb == 3.5
+    assert collect.build_parser().parse_args([]).max_file_gib == 3.5
     print(f"file_cap ok exit={code} rows={len(rows)} done_s={status['done_s']:.1f}")
 
 
@@ -219,7 +219,7 @@ def _west_env_run(extra: list[str], vary: bool) -> tuple[int, str, list[list[str
 def check_launch_argv_no_env() -> None:
     args = collect.build_parser().parse_args(LAUNCH + ["--out", "x"])
     assert args.no_vary_env and not str(args.time_of_day or "").strip() and not str(args.weather or "").strip()
-    assert args.ctl_probe_every == 1 and args.traffic == 2 and args.max_file_gb == 3.5
+    assert args.ctl_probe_every == 1 and args.traffic == 2 and args.max_file_gib == 3.5
     code, text, made, queued = _west_env_run(LAUNCH, vary=False)
     assert code == 0, text[-2000:]
     assert made and all(m == [] for m in made), made
@@ -232,11 +232,66 @@ def check_launch_argv_no_env() -> None:
     print(f"env ok: launch argv calls={len(made)} commands=0; control commands={sum(len(m) for m in made_v)}")
 
 
+def _respawn_run(same_object: bool) -> tuple[int, str, list[dict], int]:
+    """Recheck respawns every 30 s; every pick lands on the same coordinates.
+
+    same_object=False: each pick carries a new tuple with equal content.
+    same_object=True: each pick carries the one tuple object, so id(spawn_pos) never
+    changes (what a reused address would look like).
+    """
+    import dataclasses
+
+    import python.collect.level_session as level_session
+    import python.collect.spawn_mix as spawn_mix
+
+    shared = (5000.0, 100.0, 0.5)
+    places = {"n": 0}
+    real_take, real_place = spawn_mix.SpawnDeck.take, level_session.place_vehicle
+
+    def take(self, *a, **k):
+        pick = real_take(self, *a, **k)
+        if pick is None:
+            return None
+        pos = shared if same_object else tuple(float(v) for v in list(shared))
+        return dataclasses.replace(pick, pos=pos)
+
+    def place(bng, vehicle, pos, rot):
+        got = real_place(bng, vehicle, pos, rot)
+        if not got:
+            places["n"] += 1
+        return got
+
+    spawn_mix.SpawnDeck.take = take  # type: ignore[assignment]
+    level_session.place_vehicle = place  # type: ignore[assignment]
+    try:
+        paint = sf._Paint(lambda x, y: x > 1000.0)
+        code, text, out = sf._run_west_coast(paint, sf._west_pools(), ["--recheck-cov-min", "0.5"], 1300)
+    finally:
+        spawn_mix.SpawnDeck.take, level_session.place_vehicle = real_take, real_place  # type: ignore[assignment]
+    return code, text, _rows(out), places["n"]
+
+
+def check_veh_meta_every_spawn() -> None:
+    """veh_meta is keyed on a spawn counter, not on id(): it fires once per spawn even
+    when a respawn reuses equal coordinates or the very same tuple object."""
+    for same_object in (False, True):
+        code, text, rows, places = _respawn_run(same_object)
+        assert code == 0, text[-2500:]
+        assert places >= 3, (places, text[-2500:])
+        metas = [r for r in rows if "veh_meta" in r]
+        # The level load and the first placement both land before row 0 (one veh_meta);
+        # then one per recheck respawn.
+        assert len(metas) == places, (same_object, len(metas), places)
+        assert "veh_meta" in rows[0], rows[0].keys()
+        print(f"veh_meta ok same_object={same_object} respawns={places} veh_meta_rows={len(metas)}")
+
+
 def main() -> None:
     check_schema()
     check_file_cap_exit_7()
     check_auto_stops_delete_nothing()
     check_launch_argv_no_env()
+    check_veh_meta_every_spawn()
     print("control log ok")
 
 

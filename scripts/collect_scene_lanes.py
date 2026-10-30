@@ -60,7 +60,7 @@ Row fields in ``state.jsonl`` written by this collector, besides the frame data:
   ``ai_cmd`` (the AI commands this collector sent), ``road`` (fields already
   computed for ``gt``), ``traffic`` (2 Hz, null on other rows), and
   ``veh_meta`` on the first row after each spawn. A failed read is null; it
-  never stops collection. ``--max-file-gb`` stops with exit 7 (``file_cap``).
+  never stops collection. ``--max-file-gib`` stops with exit 7 (``file_cap``).
 
 ``impacts.jsonl`` beside ``state.jsonl`` has one ``{"kind": "impact", "t",
 "i", "pre_t0", "pre_i0", ...}`` line per impact and one ``{"kind":
@@ -385,8 +385,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--smoke-s", type=float, default=60.0, help="Collect this many seconds, check PNG decode, then continue. 0 skips the check.")
     parser.add_argument("--no-vary-env", action="store_true", help="Do not change weather or time of day on each segment.")
     parser.add_argument(
-        "--max-file-gb", type=float, default=3.5,
-        help="Stop with exit 7 (file_cap) when a top-level file in --out reaches this size. Nothing is deleted.",
+        "--max-file-gib", type=float, default=3.5,
+        help="Stop with exit 7 (file_cap) when a top-level file in --out reaches this many GiB (1024**3 bytes). Nothing is deleted.",
     )
     parser.add_argument(
         "--ctl-probe-every", type=int, default=1, choices=[1, 2],
@@ -1648,6 +1648,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         heights_logged: set[str] = set()  # road_heights_line: once per map
         cams: dict[str, Any] = {}
         spawn_pos: tuple[float, float, float] | None = None
+        # Bumped on every spawn, respawn, and level load; veh_meta is keyed on it.
+        spawn_seq = 0
         if not map_names:
             opened = enter_map(bng, str(args.reload_level or ""), cam_cfg, {})
             vehicle, roads, cams, err = opened.vehicle, opened.roads, opened.cameras, opened.error
@@ -1661,6 +1663,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 return 2
             if opened.spawn is not None:
                 spawn_pos = (float(opened.spawn[0]), float(opened.spawn[1]), float(opened.spawn[2]))
+            spawn_seq += 1
         writer = RawWriteQueue(RawFrameWriter(out, camera_sidecar(cam_cfg)))
         ticks = TickLog(out / TICKS_FILE, 0.1)
         from python.data.strip_writer import STRIP_ORDER
@@ -1856,7 +1859,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
 
         def _abort(reason: str) -> int | None:
             """Respawn once. A second hard abort ends the segment and continues."""
-            nonlocal segment_aborts, last_error, clock, last_ai, held_tag, prev_dir, prev_dir_t, spawn_pos
+            nonlocal segment_aborts, last_error, clock, last_ai, held_tag, prev_dir, prev_dir_t, spawn_pos, spawn_seq
             nonlocal segment_open, follow, label_hit, mark_recover, done_s, recover_lost_s
             nonlocal schedule_cut, last_end_done, stuck_ends, loaded_index
             segment_aborts += 1
@@ -1965,6 +1968,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     label_hit = None
                     segment_open = False
                     spawn_pos = moved
+                    spawn_seq += 1
                     mark_recover = True
                     impact.reset()
                     yield_guard.reset()
@@ -1998,7 +2002,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
 
         def _apply_spawn(force: bool, source: str = "spawn") -> None:
             """Teleport west coast to the next unused stratified spawn."""
-            nonlocal spawn_deck, spawn_kind, spawn_mark, spawn_pos, last_ai, segment_open, speed, spawn_cov
+            nonlocal spawn_deck, spawn_kind, spawn_mark, spawn_pos, spawn_seq, last_ai, segment_open, speed, spawn_cov
             nonlocal spawn_road, recheck_mark
             if map_name != "west_coast_usa" or vehicle is None:
                 return
@@ -2092,6 +2096,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             spawn_mark = done_s
             recheck_mark = done_s
             spawn_pos = picked.pos
+            spawn_seq += 1
             lane_track.reset()
             impact.reset()
             yield_guard.reset()
@@ -2270,10 +2275,10 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             impact.close()
 
         # Control-input fields (python/collect/control_log.py): probe count, last traffic
-        # read, the spawn veh_meta was sent for, and the AI commands sent so far.
+        # read, the spawn_seq veh_meta was sent for, and the AI commands sent so far.
         ctl_ticks = 0
         ctl_traffic_at: float | None = None
-        ctl_meta_for: Any = None
+        ctl_meta_for: int | None = None
         ai_cmd = control_log.ai_cmd_state()
         while done_s < target_s:
             run.beat(done_s)
@@ -2332,6 +2337,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 warmup_since = None
                 if opened.spawn is not None:
                     spawn_pos = (float(opened.spawn[0]), float(opened.spawn[1]), float(opened.spawn[2]))
+                spawn_seq += 1
                 prev_dir = None
                 prev_dir_t = None
                 cam_sched.reset()
@@ -2961,7 +2967,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             tags["ai_cmd"] = dict(ai_cmd)
             tags["road"] = control_log.road_tag(hit, lanes_here)
             tags["traffic"] = traffic_now
-            if ctl_meta_for != (id(vehicle), id(spawn_pos)):
+            if ctl_meta_for != spawn_seq:
                 meta = control_log.parse_ve_meta(_ask_vehicle(vehicle, control_log.VE_META_PROBE))
                 tags["veh_meta"] = {"model": vehicle_model(vehicle), **meta}
             row_i = None if row_base is None else int(row_base) + int(getattr(writer, "enqueued", 0) or 0)
@@ -3021,7 +3027,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             yield_fire = False
             if queued:
                 if "veh_meta" in tags:
-                    ctl_meta_for = (id(vehicle), id(spawn_pos))
+                    ctl_meta_for = spawn_seq
                 impact.note_row(now, row_i)
                 last_row_i = row_i
                 if spawn_deck is not None and spawn_road:
@@ -3200,10 +3206,10 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     run.stop("disk_low", str(exc))
                     return 3
                 big = _largest_file(out)
-                if big is not None and big[1] >= float(args.max_file_gb) * 1024.0 ** 3:
+                if big is not None and big[1] >= float(args.max_file_gib) * 1024.0 ** 3:
                     _save_progress(done_s, done_s if target_s == float("inf") else target_s)
                     _publish(None, speed, waypoint)
-                    detail = f"{big[0]} {big[1]} B >= {float(args.max_file_gb):g} GB cap"
+                    detail = f"{big[0]} {big[1]} B >= {float(args.max_file_gib):g} GiB cap"
                     print(f"collect stop file_cap {detail}", flush=True)
                     run.stop("file_cap", detail)
                     return STOP_EXIT_FILE_CAP

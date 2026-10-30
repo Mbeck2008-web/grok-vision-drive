@@ -769,9 +769,14 @@ def _cam_resolution(cam: Any) -> tuple[int, int] | None:
 # A daylight colour buffer can sit in the top of the 8-bit range. Pavement
 # and a thin lane stripe are then both white paint, so the stripe is not a
 # separate region. The viewport picture keeps that road near mid gray.
-# Correct it once, here, on the frame that is stored. The lane fit, the
-# model, the CAMS tiles, and the PIP all read that frame. A display dim
-# never reaches the fit. Mid-gray, dark, and all-zero frames stay put.
+# recover_viewport_tone is that curve. The live grab does NOT apply it by
+# default: the recorder stores the raw buffer (tone=False) and the scene net
+# is trained on it, so the live frames the lane fit, the model, the CAMS
+# tiles, and the PIP read are that same raw buffer. The curve is also a hard
+# gate (sample 187 unchanged, 188 about 50 levels darker), so a camera that
+# sits near it flickered frame to frame. GVD_LIVE_TONE=1 opts back in for
+# the pixel lane finder on a washed-out picture (see live_tone).
+# Mid-gray, dark, and all-zero frames stay put.
 _TONE_P40_MIN = 188.0
 _TONE_SPREAD_MAX = 70.0
 _TONE_ANCHOR_PCT = 78.0
@@ -914,6 +919,25 @@ def recover_viewport_tone(bgr: np.ndarray) -> np.ndarray:
     return lut[bgr]
 
 
+LIVE_TONE_ENV = "GVD_LIVE_TONE"
+
+
+def live_tone_enabled() -> bool:
+    """True only when ``GVD_LIVE_TONE`` is ``1`` / ``true`` / ``yes``. Off by default."""
+    return os.environ.get(LIVE_TONE_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
+def live_tone(bgr: np.ndarray) -> np.ndarray:
+    """The frame a live reader gets: the raw buffer, unless ``GVD_LIVE_TONE`` opts in.
+
+    Off, this is the same object that came in, so live frames match what the
+    recorder saves for the same buffer. On, it is ``recover_viewport_tone``.
+    """
+    if not live_tone_enabled():
+        return bgr
+    return recover_viewport_tone(bgr)
+
+
 def colour_to_bgr(
     colour: Any,
     resolution: tuple[int, int] | None = None,
@@ -923,9 +947,7 @@ def colour_to_bgr(
     """RGB(A) / BGRA bytes / array / PIL → BGR uint8. Empty → None.
 
     ``tone=True`` matches a sun-blown buffer to the viewport picture on the
-    returned frame. The live store path passes ``tone=False`` so the companion
-    flash check sees the buffer before that curve, then tones only the frame
-    it keeps.
+    returned frame. The live grab and the recorder both pass ``tone=False``.
     """
     if colour is None:
         return None
@@ -1000,7 +1022,7 @@ def _reading_colour(images: Any, resolution: tuple[int, int] | None) -> np.ndarr
     if not isinstance(images, dict):
         return None
     colour = images.get("colour") if images.get("colour") is not None else images.get("color")
-    # Flash is judged on this buffer. Tone runs later, on the frame that is stored.
+    # Flash is judged on this buffer. The recorder reads the same tone=False frame.
     return colour_to_bgr(colour, resolution, tone=False)
 
 
@@ -1389,7 +1411,7 @@ class WindowBackend:
             img = img.astype(np.uint8)
         img = resize_long_side(img, self.long_side)
         if getattr(img, "ndim", 0) == 3 and img.shape[2] == 3 and img.dtype == np.uint8:
-            img = recover_viewport_tone(img)
+            img = live_tone(img)
         ts = time.time()
         frames["main"] = img
         frames["cam_main"] = img
@@ -1913,7 +1935,7 @@ class BeamNGPyBackend:
         bgr = resize_long_side(bgr, self.long_side)
         if cid != "main" and companion_frame_is_flash(bgr, self._cache_frames.get(cid)):
             return
-        bgr = recover_viewport_tone(bgr)
+        # Raw: this is the flash reference, compared raw against raw.
         self._cache_frames[cid] = bgr
         self._cache_ts[cid] = time.time()
         sig = frame_signature(bgr)
@@ -2016,15 +2038,16 @@ class BeamNGPyBackend:
         bgr = resize_long_side(bgr, self.long_side)
         if cid != "main" and companion_frame_is_flash(bgr, self._cache_frames.get(cid)):
             # Brighter and blue in the shadows. Not stored, and not replaced
-            # by the previous tick. Judged before the tone curve.
+            # by the previous tick. Judged raw against the previous raw buffer.
             self._last_status = "flash_filtered"
             self._omit_unread(cid, frames, timestamps, health)
             return
         self._last_status = "ok"
-        bgr = recover_viewport_tone(bgr)
         sig = frame_signature(bgr)
         unique = sig != self._frame_sig.get(cid)
-        self._store_frame(cid, bgr, ts, frames, timestamps, health)
+        self._store_frame(cid, live_tone(bgr), ts, frames, timestamps, health)
+        # The flash reference stays raw even when GVD_LIVE_TONE tones the stored frame.
+        self._cache_frames[cid] = bgr
         if unique:
             self._frame_sig[cid] = sig
             unique_ids.append(cid)

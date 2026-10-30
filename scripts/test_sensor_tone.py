@@ -118,8 +118,8 @@ def main() -> None:
     again = recover_viewport_tone(corrected)
     assert np.array_equal(again, corrected)
     # A bright gray hood is not the road. Mid-gray asphalt stays, and the
-    # lane fit does not drop a lane or grow two more. colour_to_bgr is the
-    # store path for sensor frames; recover_viewport_tone is the window grab.
+    # lane fit does not drop a lane or grow two more. This is the opt-in
+    # curve (colour_to_bgr tone=True / GVD_LIVE_TONE=1); live frames default raw.
     _assert_midgray_hood_stays((128, 118, 108), (236, 236, 236))
     _assert_midgray_hood_stays((140, 132, 124), (220, 220, 220))
     # Sky (190, 200, 210) sits a few levels over the gate. The 42%–93% band

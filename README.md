@@ -432,6 +432,7 @@ Before the first step the trainer measures free VRAM and shrinks the batch until
 - `scripts/eval_scene_lanes.py`: score lane centers on the time holdout.
 - `--gt-log` or `GVD_GT_LOG=1`: per-tick ground truth under `logs/gt_<stamp>.jsonl`; `scripts/gt_report.py` summarizes it.
 - `--lane-source gt`: drive on road-network lanes to test the controller alone.
+- Live camera frames are the raw buffers the recorder saves (no tone curve). `GVD_LIVE_TONE=1` (off by default) puts the old washed-road curve back on the live frames for the pixel lane finder; the scene net was not trained on that picture.
 - `scripts/live_lane_test.py`: headless lane-keep check against a running BeamNG.tech.
 - Review capture (`R`), clips (`C`), `--foxglove` live view, `--tech-probe` and `--tech-hold` preflights.
 - `scripts/run_offline_suite.py`: the offline tests CI runs. Each script gets its own temp home, AppData and torch cache, so no GVD bus file leaks between tests.

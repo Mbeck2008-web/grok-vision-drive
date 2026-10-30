@@ -208,12 +208,69 @@ def check_lanes_poses() -> None:
           f"{hit_sbr['y']:.2f} m); etk800 poses and frustums unchanged OK")
 
 
+# repeatL | repeatR | wide from the 8-camera grid of the after smoke (BeamNG.tech 0.39.4,
+# west_coast_usa, eSBR electric_800 in Lime, t=+30 s), each 160x120.
+ESBR_FIXTURE = ROOT / "tests" / "fixtures" / "esbr_repeaters_wide_t30.jpg"
+ESBR_FIXTURE_REPEATERS = {"repeatL": [-1.10, 0.00, 0.90], "repeatR": [1.10, 0.00, 0.90]}
+
+
+def _lime_frac(bgr) -> float:
+    b, g, r = (bgr[..., i].astype(int) for i in range(3))
+    return float(((g > 150) & (g > r + 30) & (g > b + 80)).mean())
+
+
+def check_ego_edge_per_model() -> None:
+    """sbr repeaters see no ego body, so the live stitch keeps their inboard columns."""
+    import cv2
+
+    from python.data import strip_writer
+    from python.perception import stitch360
+    from python.sensors.rig_overrides import set_active_model
+
+    cfg = load_camera_config()
+    sbr = {c["id"]: c["pos_m"] for c in rig_for_model(cfg, "sbr")["cameras"] if c["id"] in REPEATERS}
+    assert sbr == ESBR_FIXTURE_REPEATERS, ("fixture was shot at other mounts; re-shoot it", sbr)
+    strip = cv2.imread(str(ESBR_FIXTURE))
+    assert strip is not None and strip.shape == (120, 480, 3), ESBR_FIXTURE
+    frames = {"repeatL": strip[:, :160], "repeatR": strip[:, 160:320], "wide": strip[:, 320:]}
+    assert _lime_frac(frames["wide"][60:]) > 0.1, "Lime hood visible on wide: the detector sees the body"
+    assert _lime_frac(frames["repeatL"]) == 0.0 and _lime_frac(frames["repeatR"]) == 0.0
+
+    try:
+        for model in (None, "etk800"):
+            set_active_model(model)
+            assert stitch360.ego_columns("repeatL", stitch360.SECTOR_W) == (0, 40), model
+            assert stitch360.ego_columns("repeatR", stitch360.SECTOR_W) == (120, 160), model
+            assert int(stitch360.stitch_frames(frames).ego_body.sum()) == 2 * 40 * stitch360.SECTOR_H
+        etk_place = {cid: strip_writer.place_sector(cid, img) for cid, img in frames.items()}
+
+        set_active_model("sbr")
+        assert stitch360.ego_columns("repeatL", stitch360.SECTOR_W) is None
+        assert stitch360.ego_columns("repeatR", stitch360.SECTOR_W) is None
+        st = stitch360.stitch_frames(frames)
+        assert int(st.ego_body.sum()) == 0
+        for sec in st.sectors:
+            if sec.cam_id in REPEATERS:
+                assert sec.ego_x0 is None and sec.ego_x1 is None
+                edge = st.bgr[:, sec.x0 : sec.x0 + 40] if sec.cam_id == "repeatL" else st.bgr[:, sec.x1 - 40 : sec.x1]
+                assert int(edge.max()) > 0, sec.cam_id  # inboard road kept
+                assert st.allows_vehicle(sec.x0 + 1 if sec.cam_id == "repeatL" else sec.x1 - 2, 48)
+        # The training strip keeps one model-independent mask (live strip == frame cache).
+        for cid, img in frames.items():
+            assert strip_writer.place_sector(cid, img).tobytes() == etk_place[cid].tobytes(), cid
+    finally:
+        set_active_model(None)
+    print("ego edge: sbr fixture repeaters 0 body px (wide hood lime); live stitch keeps sbr inboard columns, "
+          "etk800 25% unchanged; training strip mask model-independent OK")
+
+
 def main() -> None:
     check_etk800_identical()
     check_sbr_moves_only_repeaters()
     check_collector()
     check_supervisor()
     check_lanes_poses()
+    check_ego_edge_per_model()
     print("rig overrides ok")
 
 

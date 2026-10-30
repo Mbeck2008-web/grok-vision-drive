@@ -18,14 +18,16 @@ The horizontal spans already add up to more than a circle, because narrow,
 main, and wide share yaw 0 and the rear plate covers both repeater aims.
 A small field-of-view or yaw nudge would not turn those seams into one
 viewpoint, so this strip does not retune the rig. Pillar yaw stays ±78°
-and repeater yaw stays ±150, mounted at Y 1.25.
+and repeater yaw stays ±150. The repeaters sit at Y 1.25 on the etk800 and
+at Y 0.00 on the eSBR (``vehicle_overrides`` in config/cameras.yaml).
 
 A missing or unrendered camera leaves that sector empty. It is not filled
 from another camera.
 
-Repeater inboard edges show the ego body (image left on repeatL, image right
-on repeatR). Those columns are cleared and marked. They are not another
-vehicle.
+On the etk800 the repeater inboard edges show the ego body (image left on
+repeatL, image right on repeatR). Those columns are cleared and marked. They
+are not another vehicle. The eSBR repeaters are outboard of the body and see
+none of it, so their columns are kept (``EGO_EDGE_FRAC_BY_MODEL``).
 """
 
 from __future__ import annotations
@@ -53,10 +55,14 @@ SECTOR_W = 160
 SECTOR_H = 96
 GAP_PX = 8
 
-# Inboard edge of a repeater frame. A body-volume projection into the
-# ±150° repeater (fov_v 55.4, 4:3) stays inside this fraction. It is the
-# frame edge, not a measured mesh.
+# Inboard edge of a repeater frame on the etk800 mounts. A body-volume
+# projection into the ±150° repeater (fov_v 55.4, 4:3) stays inside this
+# fraction. It is the frame edge, not a measured mesh.
 EGO_EDGE_FRAC = 0.25
+# Per attached ego model (rig_overrides.active_model). The sbr repeaters sit
+# 0.1 m outboard of the body behind the front tyre: no body pixel in either
+# frame on the live grid (tests/fixtures/esbr_repeaters_wide_t30.jpg).
+EGO_EDGE_FRAC_BY_MODEL: dict[str, float] = {"sbr": 0.0}
 EGO_EDGE: dict[str, str] = {"repeatL": "left", "repeatR": "right"}
 
 STITCH_NOTE = (
@@ -106,10 +112,15 @@ class Stitch360:
 
 def ego_columns(cam_id: str, width: int) -> tuple[int, int] | None:
     """Inboard column range ``[x0, x1)`` for a repeater, else None."""
+    from python.sensors.rig_overrides import active_model
+
     edge = EGO_EDGE.get(cam_id)
     if edge is None or width <= 0:
         return None
-    n = max(1, int(round(float(width) * EGO_EDGE_FRAC)))
+    frac = EGO_EDGE_FRAC_BY_MODEL.get(active_model() or "", EGO_EDGE_FRAC)
+    if frac <= 0.0:
+        return None
+    n = max(1, int(round(float(width) * frac)))
     n = min(n, int(width))
     if edge == "left":
         return (0, n)

@@ -1788,6 +1788,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         rig_warned: set[str] = set()
         segment_defer = BoundaryDefer("segment")
         respawn_defer = BoundaryDefer("respawn")
+        # spawn_mark of a due respawn the hold already released once; a failed placement then
+        # retries without re-arming the hold (and its log) every cap.
+        respawn_released_for: float | None = None
         if not map_names:
             opened = enter_map(bng, str(args.reload_level or ""), cam_cfg, {})
             vehicle, roads, cams, err = opened.vehicle, opened.roads, opened.cameras, opened.error
@@ -2482,9 +2485,13 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 )
                 if not respawn_due:
                     respawn_defer.clear()
-                if not (respawn_due and respawn_defer.hold(done_s, boundary_wait_reason(clock.phase,
-                                                                                        settle.active(done_s)))):
+                held = (respawn_due and respawn_released_for != spawn_mark
+                        and respawn_defer.hold(done_s, boundary_wait_reason(clock.phase, settle.active(done_s))))
+                if not held:
+                    mark_before = spawn_mark
                     _apply_spawn(False)
+                    if respawn_due and spawn_mark == mark_before:
+                        respawn_released_for = spawn_mark
             if segment_changed(loaded_map, loaded_index, map_name, seg_index):
                 print(f"collect segment {segment_id}", flush=True)
                 opened = enter_map(bng, map_name, cam_cfg, cams)

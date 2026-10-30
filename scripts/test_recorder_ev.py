@@ -400,6 +400,30 @@ def check_respawn_deferred_run() -> None:
     print(f"respawn-min: teleport waits for cruise (35 s) or the cap (60 s) OK")
 
 
+def check_respawn_failed_logs_once() -> None:
+    """A due respawn the cap releases but _apply_spawn cannot place (here place_vehicle fails
+    after the first spawn) must not re-arm the hold and log again every 30 s."""
+    import python.collect.level_session as ls
+
+    real = ls.place_vehicle
+    calls = {"n": 0}
+
+    def place(*a, **k):
+        calls["n"] += 1
+        return real(*a, **k) if calls["n"] == 1 else "shift 9.9 m"
+
+    ls.place_vehicle = place  # type: ignore[assignment]
+    try:
+        code, text, out = _west(lambda n: "weave", ["--respawn-min", "0.5"], 1500)
+    finally:
+        ls.place_vehicle = real  # type: ignore[assignment]
+    assert code == 0, text[-2000:]
+    holds = [ln for ln in text.splitlines() if ln.startswith("collect boundary_defer respawn:")]
+    assert holds == ["collect boundary_defer respawn:weave 0.0", "collect boundary_defer respawn:cap 30.0"], holds
+    assert calls["n"] >= 3 and "failed shift 9.9 m" in text, (calls, text[-2000:])
+    print(f"respawn: a failed due respawn holds and logs once over 150 s (holds={len(holds)}, tries={calls['n']}) OK")
+
+
 def check_segment_deferred_run() -> None:
     code, text, out = _west(lambda n: "lane_change" if n <= 40 else "", ["--segment-min", "1"], 760)
     assert code == 0, text[-2000:]
@@ -472,6 +496,7 @@ def main() -> None:
     check_ego_model_reaches_spawn()
     check_sbr_without_bbox_stops()
     check_respawn_deferred_run()
+    check_respawn_failed_logs_once()
     check_segment_deferred_run()
     check_segment_cap_run()
     check_segment_hold_one_step()

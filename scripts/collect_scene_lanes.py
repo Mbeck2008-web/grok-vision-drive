@@ -186,7 +186,7 @@ if str(ROOT) not in sys.path:
 from python.data.raw_frames import controls_from_state
 from python.collect.spawn_mix import clamp_speed_range, traffic_count
 from python.collect import control_log
-from python.collect.boundary import BoundaryDefer, boundary_wait_reason
+from python.collect.boundary import BoundaryDefer, CarryOver, boundary_wait_reason
 from python.collect.level_session import EGO_CONFIG_DEFAULT, EGO_MODEL_DEFAULT
 
 SPEEDS_MPS = (8.0, 11.0, 14.0, 17.0, 10.0)
@@ -1790,6 +1790,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         ego_spawned = bool(map_names) or bool(args.reload_level)
         rig_warned: set[str] = set()
         segment_defer = BoundaryDefer("segment")
+        segment_carry = CarryOver()
         respawn_defer = BoundaryDefer("respawn")
         # spawn_mark of a due respawn the hold already released once; a failed placement then
         # retries without re-arming the hold (and its log) every cap.
@@ -2067,6 +2068,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                         flush=True,
                     )
                     schedule_cut = 0.0
+                    segment_carry.forgive()
                     loaded_index = -1  # reload: a fresh level and spawn, not the stuck pose
                 last_end_done = done_s
                 segment_aborts = 0
@@ -2376,6 +2378,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             extra["impact_respawn"] = {"on": impact_respawn_on, **impact_respawns}
             extra["speed_ranges"] = {k: list(v) for k, v in speed_ranges.items()}
             extra["weave_stats"] = weave_stats.summary()
+            # Held segment-switch seconds carried over, and how many are not yet repaid.
+            extra["segment_carry"] = segment_carry.summary()
             # Cruise puts the AI aggression back after an abort (scripts/abort_aggression_tag.py reads this).
             extra["ai_aggression"] = {"abort": ABORT_AGGRESSION, "reset_to": AI_DEFAULT_AGGRESSION, "reset_on": "cruise"}
             # Lane-change rows carry the peak heading reached so far (older recordings: the full-ramp peak).
@@ -2447,6 +2451,11 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 run.stop("requested", f"stop file {stop_file(out)}")
                 return 0
             elapsed = done_s
+            # Pay carried hold time back to the schedule, evenly until target_s (both cuts move,
+            # so this is not mistaken for an abort or yield cut).
+            repaid = segment_carry.repay(done_s)
+            schedule_cut += repaid
+            cut_at_load += repaid
             speed = speed_at(elapsed, tuple(speed_span[0]))
             waypoint = waypoint_at(elapsed, names)
             map_name, seg_index = segment_at(
@@ -2468,8 +2477,10 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     map_name, seg_index = loaded_map, loaded_index
                 elif was_held:
                     # Carry the wait over: the next chunk starts where the switch first fell
-                    # due and keeps its full length, not just what is left of its slot.
+                    # due, not with what is left of its slot. CarryOver repays it evenly over
+                    # the rest of the run, so it does not all come out of the last chunk.
                     schedule_cut -= segment_defer.waited_s
+                    segment_carry.add(segment_defer.waited_s, done_s, target_s)
                     map_name, seg_index = segment_at(
                         elapsed + schedule_cut, map_names, segment_s, map_weights or None,
                         None if target_s == float("inf") else target_s,

@@ -232,6 +232,28 @@ def check_defaults() -> None:
     print("defaults: weave guard on, CRUISE_S 60, ego sbr OK")
 
 
+def check_carry_over_unit() -> None:
+    """CarryOver: a held switch's wait is owed back evenly over the rest of the run."""
+    from python.collect.boundary import CarryOver
+
+    c = CarryOver()
+    c.add(30.0, 90.0, 200.0)
+    assert c.total_s == 30.0 and c.owed_s == 30.0
+    assert c.repay(90.0) == 0.0
+    assert abs(c.repay(145.0) - 15.0) < 1e-9 and abs(c.owed_s - 15.0) < 1e-9  # 30 s over 110 s
+    c.add(5.0, 145.0, 200.0)  # a second hold: 20 s owed over the 55 s left
+    assert c.total_s == 35.0 and abs(c.owed_s - 20.0) < 1e-9
+    assert abs(c.repay(172.5) - 10.0) < 1e-9
+    assert abs(c.repay(250.0) - 10.0) < 1e-9 and c.owed_s == 0.0  # never more than owed
+    assert c.repay(260.0) == 0.0
+    # An open-ended run (no total): nothing to keep inside, nothing repaid.
+    o = CarryOver()
+    o.add(10.0, 0.0, float("inf"))
+    assert o.repay(1e6) == 0.0 and o.owed_s == 10.0 and o.total_s == 10.0
+    assert c.summary() == {"carried_s": 35.0, "owed_s": 0.0}
+    print("carry-over: owed back evenly over the rest of the run, never past the total OK")
+
+
 def check_boundary_defer_unit() -> None:
     from python.collect.boundary import BOUNDARY_DEFER_CAP_S, BoundaryDefer, boundary_wait_reason
 
@@ -524,22 +546,49 @@ def _seg_spans(rows: list[dict]) -> dict[str, tuple[float, float]]:
 
 
 def check_segment_hold_carries_over() -> None:
-    """A held switch shifts the schedule by its wait: the next chunk keeps its full length.
+    """A held switch's wait is carried over, then owed back evenly over the rest of the run.
 
-    Same plan as check_segment_hold_one_step (west 60, italy 20, west 60, west 60). The switch
-    due at 60 s is held 30 s (cap: 300 busy ticks, the 301st releases). italy#1 then drives its
-    20 s (90-110 s), not just what is left of its slot (10 s here, 3.1 s in the italy probe)."""
+    Same plan as check_segment_hold_one_step (west 60, italy 20, west 60, west 60, 200 s). The
+    switch due at 60 s is held 30 s (cap: 300 busy ticks, the 301st releases). italy#1 starts at
+    90 s from its own start, not with 10 s left of its slot (3.1 s in the italy probe). The 30 s
+    is then repaid over the last 110 s, so every later chunk runs 110/140 of its slot (about
+    15.7, 47.1 and 47.1 s): the tail no longer pays it all (west#3 was 29.9 s of 60)."""
     flags = ["--maps", "west_coast_usa,italy", "--map-weights", "west_coast_usa=0.9", "--segment-min", "1",
              "--minutes", str(200.0 / 60.0)]
     code, text, out = _west(lambda n: "lane_change" if n <= 301 else "", flags, 2100)
     assert code == 0, text[-2000:]
     spans = _seg_spans(_rows(out))
-    first, last = spans["italy#1"]
-    assert abs(first - 90.0) <= 0.3 and abs(last - first - 20.0) <= 0.5, spans
-    assert abs(spans["west_coast_usa#2"][0] - 110.0) <= 0.3, spans
+    lengths = {seg: round(b - a + 0.1, 1) for seg, (a, b) in spans.items()}
+    first, _last = spans["italy#1"]
+    assert abs(first - 90.0) <= 0.3, spans
+    share = 110.0 / 140.0
+    for seg, slot in (("italy#1", 20.0), ("west_coast_usa#2", 60.0), ("west_coast_usa#3", 60.0)):
+        assert abs(lengths[seg] - share * slot) <= 0.5, (seg, lengths)
+    # The tail chunk keeps at least 3/4 of its slot.
+    assert lengths["west_coast_usa#3"] >= 45.0, lengths
     holds = [ln for ln in text.splitlines() if ln.startswith("collect boundary_defer segment:")]
     assert holds == ["collect boundary_defer segment:lane_change 0.0", "collect boundary_defer segment:cap 30.0"], holds
-    print(f"segment hold: italy#1 keeps its 20 s after a 30 s hold ({first:.1f}-{last:.1f} s) OK")
+    carry = json.loads((out / "collect.json").read_text(encoding="utf-8"))["segment_carry"]
+    assert carry["carried_s"] == 30.0 and carry["owed_s"] <= 0.2, carry
+    print(f"segment hold: carried 30 s, repaid over the rest; chunk lengths {lengths} OK")
+
+
+def check_segment_carry_always_busy() -> None:
+    """Worst case: every switch hits the 30 s cap (always in a lane change), 6 min of 1 min chunks.
+    120 s is carried in total and repaid by the end; no chunk, the tail included, drops under
+    3/4 of its 60 s slot. collect.json records the carried seconds."""
+    flags = ["--maps", "west_coast_usa,italy", "--segment-min", "1", "--minutes", "6"]
+    code, text, out = _west(lambda n: "lane_change", flags, 3700)
+    assert code == 0, text[-2000:]
+    order = _segments_in_order(_rows(out))
+    spans = _seg_spans(_rows(out))
+    lengths = {seg: round(b - a + 0.1, 1) for seg, (a, b) in spans.items()}
+    assert all(v >= 45.0 for v in lengths.values()), lengths
+    assert lengths[order[-1]] >= 45.0, (order, lengths)
+    carry = json.loads((out / "collect.json").read_text(encoding="utf-8"))["segment_carry"]
+    assert carry["carried_s"] == 120.0 and carry["owed_s"] <= 0.2, carry
+    print(f"segment carry: 4 capped holds, {carry['carried_s']:.0f} s carried and repaid; "
+          f"shortest chunk {min(lengths.values()):.1f} s (tail {lengths[order[-1]]:.1f} s) OK")
 
 
 def main() -> None:
@@ -549,6 +598,7 @@ def main() -> None:
     check_ego_values_validated()
     check_defaults()
     check_boundary_defer_unit()
+    check_carry_over_unit()
     check_veh_meta_and_rig_warning()
     check_ego_model_reaches_spawn()
     check_empty_ego_model_stays_in_sync()
@@ -559,6 +609,7 @@ def main() -> None:
     check_segment_cap_run()
     check_segment_hold_one_step()
     check_segment_hold_carries_over()
+    check_segment_carry_always_busy()
     print("recorder ev ok")
 
 

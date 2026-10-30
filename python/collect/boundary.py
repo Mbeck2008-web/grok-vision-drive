@@ -9,8 +9,10 @@ in ``cruise`` and the settle window is over, for at most
 
 A held segment switch carries its wait over: the collector moves the
 schedule back by ``waited_s``, so the next chunk starts where the switch
-first fell due and keeps its full length (a 30 s hold no longer leaves a
-20 s chunk only its settle window).
+first fell due (a 30 s hold no longer leaves a 20 s chunk only its settle
+window). ``CarryOver`` then owes that time back evenly over the rest of the
+run, so the carried seconds do not pile up and all come out of the last
+chunk: every later chunk runs ``rest / (rest + owed)`` of its slot instead.
 
 Forced boundaries (aborts, stalls, impacts, a cut schedule) are not held.
 Logs: ``collect boundary_defer <kind>:<phase> 0.0`` when the hold starts,
@@ -64,3 +66,39 @@ class BoundaryDefer:
         self.since = None
         self.waited_s = max(0.0, waited)
         return False
+
+
+class CarryOver:
+    """Seconds a held segment switch moved the schedule back, owed back evenly by the run's end."""
+
+    def __init__(self) -> None:
+        self.total_s = 0.0  # every carried second this run
+        self.owed_s = 0.0  # carried and not yet repaid
+        self._rate = 0.0  # owed seconds repaid per driving second
+        self._at = 0.0
+
+    def add(self, waited_s: float, now_s: float, end_s: float) -> None:
+        """A hold released at ``now_s`` carried ``waited_s``; repay all that is owed by ``end_s``."""
+        self.repay(now_s)
+        w = max(0.0, float(waited_s))
+        self.total_s += w
+        self.owed_s += w
+        left = float(end_s) - float(now_s)
+        self._rate = self.owed_s / left if left > 0.0 and left != float("inf") else 0.0
+
+    def repay(self, now_s: float) -> float:
+        """Seconds to give back to the schedule since the last call (never more than owed)."""
+        now = float(now_s)
+        pay = min(self.owed_s, self._rate * max(0.0, now - self._at))
+        self._at = max(self._at, now)
+        self.owed_s -= pay
+        if self.owed_s <= 1e-9:
+            self.owed_s, self._rate = 0.0, 0.0
+        return pay
+
+    def forgive(self) -> None:
+        """The schedule restarted (wrapped to 0): nothing is owed any more."""
+        self.owed_s, self._rate = 0.0, 0.0
+
+    def summary(self) -> dict[str, float]:
+        return {"carried_s": round(self.total_s, 1), "owed_s": round(self.owed_s, 1)}

@@ -226,6 +226,14 @@ MODEL_ROWS: tuple[dict[str, Any], ...] = (
         "role": "e2e",
         "hint": "PilotNet-scale ONNX or numpy stub",
     },
+    {
+        "id": "scene_view_id",
+        "kind": "model",
+        "label": "scene view",
+        "attr": "scene_view_id",
+        "role": "scene_view",
+        "hint": "view-only same-map experiment",
+    },
 )
 
 CONTROL_ROWS = tuple(r for r in DEBUG_ROWS if r.get("kind") != "header")
@@ -269,6 +277,7 @@ class DebugOpts:
     detector_on: bool = True
     detector_id: str = "auto"
     e2e_id: str = "auto"
+    scene_view_id: str = "off"
     viz_dense: bool = False
     viz_path: bool = True
     viz_lanes: bool = True
@@ -319,6 +328,7 @@ class DebugOpts:
             "detector_on": bool(self.detector_on),
             "detector_id": str(self.detector_id),
             "e2e_id": str(self.e2e_id),
+            "scene_view_id": str(self.scene_view_id),
             "viz_dense": bool(self.viz_dense),
             "viz_path": bool(self.viz_path),
             "viz_lanes": bool(self.viz_lanes),

@@ -26,7 +26,7 @@ Lua: `gvd_main.drawPath` on `onPreRender` / `onDebugDraw`. Runs whenever the sup
 
 | `capture_backend` | string | `beamngpy` / `window` / `stub` |
 | `capture_note` | string | e.g. `retail: 1 window` |
-| `rss_mb` | float | supervisor RSS; >12 GB is a bug |
+| `rss_mb` | float | supervisor RSS; >12 GB is a bug. With `--scene-view`, `scene_view.child_rss_mb` (the viewer's child process) counts toward the same 12 GB |
 | `cam_health.narrow` | enum | added in M1 8-cam set |
 | `loop_hz` | float | honest supervisor loop EMA (never clamped to a fake ≥10) |
 | `camera_hz` | float | unique GPU-frame EMA — new frames only, not cache re-shows / `main is not None` |

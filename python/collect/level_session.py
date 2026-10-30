@@ -45,6 +45,23 @@ SCENARIO_TIMEOUT_S = 120.0
 EGO_MODEL_DEFAULT = "sbr"
 EGO_CONFIG_DEFAULT = "vehicles/sbr/electric_800.pc"
 _EGO = {"model": EGO_MODEL_DEFAULT, "part_config": EGO_CONFIG_DEFAULT}
+# Stock paint per part config, so the ego spawns in the colour the config ships
+# with rather than the spawn API's white. Values copied from the BeamNG.tech
+# 0.39.4 sbr content: info_electric_800.json sets "defaultPaintName1": "Lime",
+# and info.json paints.Lime is {"baseColor": [0.42, 0.62, 0.05, 1.0],
+# "metallic": 0, "roughness": 0.9, "clearcoat": 1, "clearcoatRoughness": 0.05}.
+# beamngpy's Vehicle(color=) and the Lua spawn's color= carry base_color only.
+EGO_PAINTS: dict[str, dict[str, Any]] = {
+    "vehicles/sbr/electric_800.pc": {
+        "name": "Lime",
+        "base_color": [0.42, 0.62, 0.05, 1.0],
+        "metallic": 0.0,
+        "roughness": 0.9,
+        "clearcoat": 1.0,
+        "clearcoat_roughness": 0.05,
+        "source": "vehicles/sbr/info.json paints.Lime (info_electric_800.json defaultPaintName1)",
+    },
+}
 
 
 def set_ego(model: str, part_config: str = "") -> None:
@@ -58,11 +75,21 @@ def ego_spec() -> dict[str, str]:
     return dict(_EGO)
 
 
+def ego_paint() -> dict[str, Any] | None:
+    """The stock paint of the current ego config, or None (spawn API default)."""
+    paint = EGO_PAINTS.get(_EGO["part_config"])
+    return dict(paint) if paint else None
+
+
 def _ego_vehicle(Vehicle: Any) -> Any:
-    """beamngpy 1.36 ``Vehicle(vid, model, part_config=...)``; no part_config when empty."""
+    """beamngpy 1.36 ``Vehicle(vid, model, part_config=..., color=...)``; each only when set."""
+    kwargs: dict[str, Any] = {}
     if _EGO["part_config"]:
-        return Vehicle("gvd_ego", model=_EGO["model"], part_config=_EGO["part_config"])
-    return Vehicle("gvd_ego", model=_EGO["model"])
+        kwargs["part_config"] = _EGO["part_config"]
+    paint = ego_paint()
+    if paint:
+        kwargs["color"] = tuple(paint["base_color"])
+    return Vehicle("gvd_ego", model=_EGO["model"], **kwargs)
 
 
 @dataclass
@@ -448,6 +475,9 @@ def spawn_direct(bng: Any, pos: tuple[float, float, float], rot: tuple[float, fl
                     return session_text(exc)
                 raise
     config = f'config="{_EGO["part_config"]}", ' if _EGO["part_config"] else ""
+    paint = ego_paint()
+    if paint:  # the same "R G B A" string beamngpy's spawn sends as options.color
+        config += f'color="{" ".join(str(float(c)) for c in paint["base_color"])}", '
     return _send(
         bng,
         f'core_vehicles.spawnNewVehicle("{_EGO["model"]}", '

@@ -123,6 +123,57 @@ def check_lua_fallback_has_config() -> None:
     print(f"lua fallback: {cmd} OK")
 
 
+def check_paint_lime() -> None:
+    """electric_800 spawns in its stock Lime (sbr info.json paints.Lime), on every spawn site."""
+    import python.collect.level_session as ls
+
+    lime = (0.42, 0.62, 0.05, 1.0)
+    paint = ls.ego_paint()
+    assert paint and paint["name"] == "Lime" and tuple(paint["base_color"]) == lime, paint
+    assert (paint["metallic"], paint["roughness"], paint["clearcoat"], paint["clearcoat_roughness"]) == (
+        0.0, 0.9, 1.0, 0.05), paint
+    assert "info.json" in paint["source"], paint
+
+    class _Bng:
+        def spawn_vehicle(self, vehicle, pos, rot_quat=None, safe_spawn=True):
+            del vehicle, pos, rot_quat, safe_spawn
+
+    def run():
+        ls.make_collect_scenario("west_coast_usa", POS, ROT, name="t")
+        ls.spawn_direct(_Bng(), POS, ROT)
+
+    _with_beamngpy(run)
+    assert len(_FakeVehicle.made) == 2 and all(e["color"] == lime for e in _FakeVehicle.made), _FakeVehicle.made
+
+    class _LuaBng:
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+
+        def queue_lua_command(self, command: str) -> None:
+            self.commands.append(command)
+
+    old = sys.modules.get("beamngpy", None)
+    sys.modules["beamngpy"] = None  # type: ignore[assignment]
+    try:
+        bng = _LuaBng()
+        ls.spawn_direct(bng, POS, ROT)
+    finally:
+        if old is None:
+            sys.modules.pop("beamngpy", None)
+        else:
+            sys.modules["beamngpy"] = old
+    assert 'color="0.42 0.62 0.05 1.0"' in bng.commands[0], bng.commands
+    # A config with no known paint keeps the spawn API default: no color passed.
+    ls.set_ego("sbr", "vehicles/sbr/electric_300.pc")
+    try:
+        assert ls.ego_paint() is None
+        _with_beamngpy(run)
+        assert all("color" not in e for e in _FakeVehicle.made), _FakeVehicle.made
+    finally:
+        ls.set_ego(ls.EGO_MODEL_DEFAULT, ls.EGO_CONFIG_DEFAULT)
+    print(f"paint: electric_800 spawns Lime {lime} (scenario, direct, Lua) OK")
+
+
 def check_defaults() -> None:
     import scripts.collect_scene_lanes as collect
     from python.collect.excursion import CRUISE_S
@@ -176,6 +227,7 @@ def _rows(out: Path) -> list[dict]:
 
 
 def check_veh_meta_and_rig_warning() -> None:
+    import python.collect.level_session as ls
     import scripts.test_collect_spawn_fix as sf
     from python.collect.level_session import EGO_CONFIG_DEFAULT
 
@@ -197,7 +249,7 @@ def check_veh_meta_and_rig_warning() -> None:
     assert all(m["model"] == "sbr" and m["part_config"] == EGO_CONFIG_DEFAULT for m in metas), metas
     status = json.loads((out / "collect.json").read_text(encoding="utf-8"))
     assert status["ego"] == {"model": "sbr", "part_config": EGO_CONFIG_DEFAULT, "camera_rig_model": "etk800",
-                             "spawned": True}, status.get("ego")
+                             "spawned": True, "paint": ls.EGO_PAINTS[EGO_CONFIG_DEFAULT]}, status.get("ego")
     warn = "collect WARNING camera rig calibrated on etk800, ego model is sbr"
     assert text.count(warn) == 1, text[:3000]
     # The etk800 opt-back: no rig warning.
@@ -209,7 +261,8 @@ def check_veh_meta_and_rig_warning() -> None:
     code, text, out = sf._run_collector({"stop_at": 60}, ["--no-excursions"])
     metas = [r["veh_meta"] for r in _rows(out) if "veh_meta" in r]
     assert code == 0 and metas and "part_config" not in metas[0], metas
-    assert json.loads((out / "collect.json").read_text(encoding="utf-8"))["ego"]["spawned"] is False
+    ego = json.loads((out / "collect.json").read_text(encoding="utf-8"))["ego"]
+    assert ego["spawned"] is False and ego["paint"] is None, ego
     print("veh_meta: model=sbr part_config recorded per spawn; collect.json ego; rig warning once OK")
 
 
@@ -282,6 +335,7 @@ def check_segment_deferred_run() -> None:
 def main() -> None:
     check_spawn_passes_model_and_config()
     check_lua_fallback_has_config()
+    check_paint_lime()
     check_defaults()
     check_boundary_defer_unit()
     check_veh_meta_and_rig_warning()

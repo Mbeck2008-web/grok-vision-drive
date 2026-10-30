@@ -2352,8 +2352,11 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             }
             if ego_width:
                 extra["ego_width"] = dict(ego_width)
+            from python.collect.level_session import ego_paint
+
             extra["ego"] = {"model": str(args.ego_model), "part_config": str(args.ego_config),
-                            "camera_rig_model": CAMERA_RIG_MODEL, "spawned": ego_spawned}
+                            "camera_rig_model": CAMERA_RIG_MODEL, "spawned": ego_spawned,
+                            "paint": ego_paint() if ego_spawned else None}
             return extra or None
 
         def _save_progress(done: float, target: float) -> None:

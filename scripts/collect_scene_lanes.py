@@ -810,6 +810,23 @@ def segment_at(
     return pieces[-1][0], which * len(pieces) + len(pieces) - 1
 
 
+def segment_piece(
+    index: int,
+    maps: tuple[str, ...],
+    segment_s: float,
+    weights: dict[str, float] | None = None,
+    total_s: float | None = None,
+) -> tuple[str, int]:
+    """Map name of segment ``index`` (the inverse of ``segment_at``'s index)."""
+    if not maps:
+        return "", 0
+    i = max(0, int(index))
+    if not weights:
+        return maps[i % len(maps)], i
+    pieces = weighted_pieces(maps, segment_s, weights, total_s)
+    return pieces[i % len(pieces)][0], i
+
+
 def segment_boundary(
     elapsed_s: float,
     maps: tuple[str, ...],
@@ -2436,8 +2453,15 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 and schedule_cut == cut_at_load
                 and segment_changed(loaded_map, loaded_index, map_name, seg_index)
             ):
+                was_held = segment_defer.pending()
                 if segment_defer.hold(done_s, boundary_wait_reason(clock.phase, settle.active(done_s))):
                     map_name, seg_index = loaded_map, loaded_index
+                elif was_held and seg_index > loaded_index + 1:
+                    # The hold outlasted a short chunk: load the next chunk, not the one after it.
+                    map_name, seg_index = segment_piece(
+                        loaded_index + 1, map_names, segment_s, map_weights or None,
+                        None if target_s == float("inf") else target_s,
+                    )
             else:
                 segment_defer.clear()
             segment_id = f"{map_name}#{seg_index}" if map_name else "current#0"

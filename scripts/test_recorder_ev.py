@@ -342,6 +342,51 @@ def check_segment_deferred_run() -> None:
     print("segment-min: chunk switch waits for cruise (64 s vs 60 s) OK")
 
 
+def _segments_in_order(rows: list[dict]) -> list[str]:
+    seen: list[str] = []
+    for r in rows:
+        seg = str(r.get("segment") or "")
+        if seg and (not seen or seen[-1] != seg):
+            seen.append(seg)
+    return seen
+
+
+def check_segment_cap_run() -> None:
+    # Always in a lane change: the 30 s cap switches the chunk anyway, at 90 s instead of 60 s.
+    code, text, out = _west(lambda n: "lane_change", ["--segment-min", "1"], 1000)
+    assert code == 0, text[-2000:]
+    assert "collect boundary_defer segment:lane_change 0.0" in text, text[-3000:]
+    assert "collect boundary_defer segment:cap 30.0" in text, text[-3000:]
+    first = next(r for r in _rows(out) if r.get("segment") == "west_coast_usa#1")
+    assert abs(0.1 * int(first["i"]) - 90.0) <= 0.3, first["i"]
+    print("segment-min: an always-busy chunk switch hits the 30 s cap (90 s) OK")
+
+
+def check_segment_hold_one_step() -> None:
+    """A hold that outlasts a short weighted chunk advances one index, not two.
+
+    200 s at west_coast_usa=0.9: pieces west 60, italy 20, west 60, west 60. The switch due at
+    60 s waits 30 s (cap) to 90 s, past italy#1's end at 80 s; it still loads italy#1 next."""
+    import scripts.collect_scene_lanes as collect
+
+    maps = ("west_coast_usa", "italy")
+    weights = {"west_coast_usa": 0.9}
+    assert [round(d) for _n, d in collect.weighted_pieces(maps, 60.0, weights, 200.0)] == [60, 20, 60, 60]
+    assert collect.segment_at(90.0, maps, 60.0, weights, 200.0) == ("west_coast_usa", 2)
+    flags = ["--maps", "west_coast_usa,italy", "--map-weights", "west_coast_usa=0.9", "--segment-min", "1",
+             "--minutes", str(200.0 / 60.0)]
+    code, text, out = _west(lambda n: "lane_change" if n <= 400 else "", flags, 2100)
+    assert code == 0, text[-2000:]
+    assert "collect boundary_defer segment:cap 30.0" in text, text[-3000:]
+    order = _segments_in_order(_rows(out))
+    assert order[:3] == ["west_coast_usa#0", "italy#1", "west_coast_usa#2"], order
+    idx = [int(s.split("#")[1]) for s in order]
+    assert all(b - a == 1 for a, b in zip(idx, idx[1:])), order
+    first = next(r for r in _rows(out) if r.get("segment") == "italy#1")
+    assert abs(0.1 * int(first["i"]) - 90.0) <= 0.3, first["i"]
+    print(f"segment hold: one index per release {order} OK")
+
+
 def main() -> None:
     check_spawn_passes_model_and_config()
     check_lua_fallback_has_config()
@@ -351,6 +396,8 @@ def main() -> None:
     check_veh_meta_and_rig_warning()
     check_respawn_deferred_run()
     check_segment_deferred_run()
+    check_segment_cap_run()
+    check_segment_hold_one_step()
     print("recorder ev ok")
 
 

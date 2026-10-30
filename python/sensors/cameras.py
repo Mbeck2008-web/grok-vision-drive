@@ -942,12 +942,13 @@ def colour_to_bgr(
     colour: Any,
     resolution: tuple[int, int] | None = None,
     *,
-    tone: bool = True,
+    tone: bool = False,
 ) -> np.ndarray | None:
     """RGB(A) / BGRA bytes / array / PIL → BGR uint8. Empty → None.
 
-    ``tone=True`` matches a sun-blown buffer to the viewport picture on the
-    returned frame. The live grab and the recorder both pass ``tone=False``.
+    ``tone`` is keyword-only and off by default, so the frame is the raw buffer
+    the recorder saves. ``tone=True`` applies ``recover_viewport_tone`` (the
+    opt-in washed-road curve).
     """
     if colour is None:
         return None

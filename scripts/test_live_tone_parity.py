@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT))
 from python.data.strip_writer import compose_strip  # noqa: E402
 from python.sensors.cameras import (  # noqa: E402
     BeamNGPyBackend,
+    WindowBackend,
     _reading_colour,
     colour_to_bgr,
     companion_frame_is_flash,
@@ -169,6 +170,75 @@ def check_flash_still_filtered_raw_vs_raw() -> None:
     print("  bright-blue companion flash still filtered (raw vs raw)")
 
 
+def check_late_colour_keeps_raw_flash_reference() -> None:
+    """Late async reads (_cache_late_colour) hold the raw buffer as the flash reference."""
+    _clear_flag()
+    try:
+        for flag in (None, "1"):
+            if flag is not None:
+                os.environ[TONE_ENV] = flag
+            be = _backend()
+            washed = _road_bgr(188)
+            assert not np.array_equal(recover_viewport_tone(washed), washed)
+            be._cache_late_colour("repeatR", washed.copy())
+            assert np.array_equal(be._cache_frames["repeatR"], washed), flag
+            assert be._late_unique == ["repeatR"], be._late_unique
+            # Warm washed road: the next late read of the same road is not a flash.
+            warm = np.full((H, W, 3), (196, 210, 220), dtype=np.uint8)
+            for _ in range(3):
+                be._cache_late_colour("rear", warm.copy())
+            assert np.array_equal(be._cache_frames["rear"], warm), flag
+            # A late read and a live read of the same buffer agree on the reference.
+            live_be = _backend()
+            _live(live_be, "repeatR", _rgba(washed))
+            assert np.array_equal(live_be._cache_frames["repeatR"], be._cache_frames["repeatR"])
+    finally:
+        _clear_flag()
+    print("  _cache_late_colour: flash reference raw (flag off and on)")
+
+
+class _FakeGrab:
+    def __init__(self, img: np.ndarray) -> None:
+        self.img = img
+
+    def grab(self) -> np.ndarray:
+        return self.img.copy()
+
+
+def _window_grab(img: np.ndarray) -> np.ndarray:
+    import python.sensors.cameras as cams
+
+    be = WindowBackend(long_side=640)
+    be._cam = _FakeGrab(img)
+    be._impl = "bettercam"
+    saved = cams._find_beamng_window_rect
+    cams._find_beamng_window_rect = lambda: None
+    try:
+        bundle = be.grab()
+    finally:
+        cams._find_beamng_window_rect = saved
+    assert "main" in bundle.frames, bundle.note
+    assert bundle.frames["cam_main"] is bundle.frames["main"]
+    return bundle.frames["main"]
+
+
+def check_window_backend_follows_flag() -> None:
+    """Retail window capture: raw with the flag off, the old curve with GVD_LIVE_TONE=1."""
+    _clear_flag()
+    raw_bgr = _road_bgr(188)
+    toned = recover_viewport_tone(raw_bgr)
+    assert not np.array_equal(toned, raw_bgr)
+    off = _window_grab(raw_bgr)
+    assert off.dtype == raw_bgr.dtype and np.array_equal(off, raw_bgr), float(off.mean())
+    try:
+        os.environ[TONE_ENV] = "1"
+        on = _window_grab(raw_bgr)
+        assert np.array_equal(on, toned), float(on.mean())
+    finally:
+        _clear_flag()
+    print("  WindowBackend: flag off -> byte-equal raw; GVD_LIVE_TONE=1 -> toned")
+
+
 def check_tone_flag_off_by_default() -> None:
     """GVD_LIVE_TONE is opt-in: unset / 0 -> raw; 1 -> old curve on the stored frame."""
     from python.sensors.cameras import live_tone, live_tone_enabled
@@ -178,6 +248,15 @@ def check_tone_flag_off_by_default() -> None:
     assert not np.array_equal(toned, raw_bgr)
     _clear_flag()
     assert live_tone_enabled() is False
+    # colour_to_bgr defaults to raw too; tone is keyword-only.
+    assert np.array_equal(colour_to_bgr(_rgba(raw_bgr), (W, H)), raw_bgr)
+    assert np.array_equal(colour_to_bgr(_rgba(raw_bgr), (W, H), tone=True), toned)
+    try:
+        colour_to_bgr(_rgba(raw_bgr), (W, H), True)  # type: ignore[misc]
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("colour_to_bgr tone must be keyword-only")
     assert live_tone(raw_bgr) is raw_bgr
     for off in ("", "0", "false", "no"):
         os.environ[TONE_ENV] = off
@@ -203,6 +282,8 @@ def main() -> None:
     check_straddle_sequence_is_raw_and_kept()
     check_warm_washed_companion_keeps_landing()
     check_flash_still_filtered_raw_vs_raw()
+    check_late_colour_keeps_raw_flash_reference()
+    check_window_backend_follows_flag()
     check_tone_flag_off_by_default()
     print("test_live_tone_parity: OK")
 

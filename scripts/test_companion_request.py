@@ -55,7 +55,7 @@ def _check_flash_frame_does_not_land() -> None:
     assert companion_frame_is_flash(flash, settled) is True
     # A channel swap of the settled road is not that frame. Gray stays gray.
     gray = np.full((48, 64, 3), 140, dtype=np.uint8)
-    swapped = colour_to_bgr(gray)
+    swapped = colour_to_bgr(gray, tone=True)
     assert swapped is not None
     assert abs(int(swapped[20, 20, 0]) - int(swapped[20, 20, 2])) <= 1
     assert companion_frame_is_flash(settled[:, :, ::-1].copy(), settled) is False

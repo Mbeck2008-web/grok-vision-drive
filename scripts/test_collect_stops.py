@@ -309,9 +309,11 @@ def check_code_pin_unsafe_owner() -> None:
     base = Path(tempfile.mkdtemp())
     repo, home = base / "repo", base / "home"
     home.mkdir()
-    env_keys = ("GIT_TEST_ASSUME_DIFFERENT_OWNER", "HOME", "GIT_CONFIG_GLOBAL", "XDG_CONFIG_HOME")
+    env_keys = ("GIT_TEST_ASSUME_DIFFERENT_OWNER", "HOME", "GIT_CONFIG_GLOBAL", "XDG_CONFIG_HOME", "GIT_CONFIG_NOSYSTEM")
     saved = {k: os.environ.get(k) for k in env_keys}
-    git_env = {"GIT_CONFIG_GLOBAL": str(home / ".gitconfig"), "HOME": str(home), "XDG_CONFIG_HOME": str(home)}
+    # A private global config and no system config: CI images trust every directory there.
+    git_env = {"GIT_CONFIG_GLOBAL": str(home / ".gitconfig"), "HOME": str(home), "XDG_CONFIG_HOME": str(home),
+               "GIT_CONFIG_NOSYSTEM": "1"}
     os.environ.update(git_env)
 
     def git(*args: str) -> str:
@@ -327,11 +329,15 @@ def check_code_pin_unsafe_owner() -> None:
         config_before = (repo / ".git" / "config").read_bytes()
         os.environ["GIT_TEST_ASSUME_DIFFERENT_OWNER"] = "1"  # git's own switch for "owned by someone else"
         plain = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True)
-        assert plain.returncode != 0 and "dubious ownership" in plain.stderr, (plain.returncode, plain.stderr)
+        # Real git refuses here; where it still does not (an old git, or a trust-all config
+        # this test cannot switch off) the refusal is simulated for commands without -c safe.directory.
+        real_refusal = plain.returncode != 0 and "dubious ownership" in plain.stderr
         calls: list[list[str]] = []
 
         def spy(cmd, *a, **k):
             calls.append(list(cmd))
+            if not real_refusal and not any(str(c).startswith("safe.directory=") for c in cmd):
+                return subprocess.CompletedProcess(cmd, 128, "", "fatal: detected dubious ownership in repository\n")
             return real(cmd, *a, **k)
 
         collect.subprocess.run = spy
@@ -366,7 +372,7 @@ def check_code_pin_unsafe_owner() -> None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-    print(f"code pin unsafe owner ok: {sha[:12]}")
+    print(f"code pin unsafe owner ok: {sha[:12]} real_refusal={real_refusal}")
 
 
 def check_code_pin() -> None:

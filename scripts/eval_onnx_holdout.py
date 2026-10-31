@@ -62,12 +62,16 @@ def holdout_rows(
     holdout_blocks: int = 1,
     holdout_cells_file: Path | None = None,
     cam_age: bool = False,
+    ctl_info: dict | None = None,
 ) -> tuple[list[list[dict]], str]:
     """The trainer's holdout slices, in order, and its selection line.
 
     ``cam_age``: each row also gets the trainer's hold-last plan
     (``cam_hold.annotate_hold`` on the same plan), so the ONNX sees the same
     sectors and ages the val row did.
+    ``ctl_info`` (a dict): the rows also get the trainer's ctl targets
+    (``ctl_targets.attach_ctl`` on the same plan) and the dict gets the
+    train-split B1 constants (``b1``) and the steer lock (``lock_deg``).
     """
     from python.data.raw_frames import load_scene_rows, refuse_lossy
     from python.train.continual import CHUNK_MAX, pass_plan
@@ -96,6 +100,16 @@ def holdout_rows(
         from python.data.cam_hold import annotate_hold
 
         annotate_hold(state_rows, rows, plan)
+    if ctl_info is not None:
+        from python.data.cam_hold import plan_labels
+        from python.train.ctl_targets import attach_ctl, b1_constants
+        from python.train.event_mask import read_impacts
+
+        counts = attach_ctl(state_rows, rows, plan=plan, impacts=read_impacts(root))
+        train_ids = {i for i, label in plan_labels(plan).items() if label == "train"}
+        ctl_info["b1"] = b1_constants([row for row in rows if row.get("i") in train_ids])
+        ctl_info["lock_deg"] = counts.get("lock_deg")
+        ctl_info["counts"] = counts
     return [list(item["rows"]) for item in plan if item["kind"] == "holdout"], text
 
 
@@ -137,6 +151,14 @@ def evaluate(
     cam_age = cam_age_flag(meta)
     if cam_age != ("ages" in inputs):
         raise ValueError(f"{onnx_path}: gvd_cam_age={int(cam_age)} disagrees with the graph inputs {sorted(inputs)}")
+    # gvd_ctl=1: the graph has the three (1, K) control outputs.
+    from python.train.ctl_targets import CTL_OUTPUT_FIELDS
+
+    has_ctl = str(meta.get("gvd_ctl", "0")) == "1"
+    if has_ctl != all(name in outputs for name in CTL_OUTPUT_FIELDS):
+        raise ValueError(f"{onnx_path}: gvd_ctl={meta.get('gvd_ctl', '0')} disagrees with the graph outputs {sorted(outputs)}")
+    ctl_info: dict | None = {} if has_ctl else None
+    ctl_records: list = []
 
     def fresh() -> dict[str, np.ndarray]:
         # SceneNet.initial_state: zero h and tokens, every residual slot older than RESIDUAL_S.
@@ -155,6 +177,7 @@ def evaluate(
         holdout_blocks=holdout_blocks,
         holdout_cells_file=holdout_cells_file,
         cam_age=cam_age,
+        ctl_info=ctl_info,
     )
     if cache is not None and getattr(cache, "stale", False):
         cache.require_fresh()
@@ -181,6 +204,10 @@ def evaluate(
             out = session.run(None, {inputs[key].name: value for key, value in feeds.items() if key in inputs})
             by_name = dict(zip(outputs, out))
             state = {key: np.asarray(by_name[key], dtype=np.float32) for key in state_keys}
+            if has_ctl and "ctl_valid" in row:
+                ctl_records.append(
+                    (row, np.stack([np.asarray(by_name[name], dtype=np.float32).reshape(-1) for name in CTL_OUTPUT_FIELDS]))
+                )
             tech = row.get("tech") if isinstance(row.get("tech"), dict) else row
             gt_vec, gt_mask = lane_gt_from_record(tech if isinstance(tech, dict) else None)
             if not lane_center_is_valid(gt_mask):
@@ -189,6 +216,11 @@ def evaluate(
             pred_x = lane_x_from_vector(np.asarray(by_name["lane_gt"], dtype=np.float32).reshape(-1))
             pairs.append((float("nan") if pred_x is None else float(pred_x), float("nan") if gt_x is None else float(gt_x)))
     scored = val_summary(pairs, None, {"n": 0})
+    ctl = None
+    if ctl_info is not None:
+        from python.train.ctl_targets import ctl_record, score_ctl
+
+        ctl = ctl_record(score_ctl(ctl_records, ctl_info["b1"], lock_deg=ctl_info.get("lock_deg")))
     return {
         "step": int(meta["gvd_ckpt_step"]) if "gvd_ckpt_step" in meta else None,
         "epoch": int(meta["gvd_ckpt_epoch"]) if "gvd_ckpt_epoch" in meta else None,
@@ -205,6 +237,7 @@ def evaluate(
         "slices": len(slices),
         "holdout_rows": sum(len(rows) for rows in slices),
         "selection": selection,
+        **({} if ctl is None else {"ctl": ctl}),
     }
 
 
@@ -244,6 +277,11 @@ def main(argv: list[str] | None = None) -> int:
         print(result["selection"], flush=True)
         print(f"[GVD] holdout: rows={result['holdout_rows']} slices={result['slices']}", flush=True)
         print(val_line(result), flush=True)
+        if "ctl" in result:
+            from python.train.ctl_targets import val_lines
+
+            for line in val_lines(result["ctl"]):
+                print(line.replace("[GVD] val ctl", "[GVD] val (onnx) ctl", 1), flush=True)
         if args.json is not None:
             with open(args.json, "x", encoding="utf-8") as handle:
                 json.dump(result, handle, indent=1)

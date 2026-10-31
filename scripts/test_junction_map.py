@@ -10,9 +10,13 @@ Spec tests (``python/collect/junction_map.py``):
  7 create-only ``jct.jsonl`` (offline half; the live half is in test_jct_live_parity.py)
  8 isolation (AST): runtime files never import junction_map; labels reach only the sidecar
  9 cost, report only: ``step()`` p50 / p99 over 20k fixture poses (no assert on time)
-11 navgraph node classification (major / minor / unmapped, 2.9 m maps, 3.1 m does not)
+1b ``oneWay`` strings: ``"0"`` is a two-way ``Edge``, ``"1"`` one-way (map graph and grader route too)
+11 navgraph node classification (major / minor / unmapped, unmapped before minor, 2.9 m maps,
+   3.1 m does not)
+11b navgraph verdict: VOID above the golden UNMAPPED_MAX (checked first), else PASS on the
+   golden major recall / precision bars, else FAIL; the overlay CLI prints it
 12 type threshold boundaries
-13 overpass: decks more than JOIN_DZ_M apart give no junction
+13 overpass: decks more than JOIN_DZ_M apart give no junction (all three cases must run)
 Test 10 is ``scripts/test_junction_grade.py`` (its own suite script); test 4 and 5 are in
 ``scripts/test_jct_live_parity.py``.
 """
@@ -139,6 +143,10 @@ def check_golden_freeze() -> None:
         assert golden["params"][key] == value, (key, golden["params"][key], value)
     assert golden["params"]["MATCH_M"] == 25.0 and golden["params"]["ARM_MAP_M"] == 3.0
     assert golden["params"]["UNMAPPED_MAX"] == 0.05
+    # The navgraph-check constants are not in jm.PARAMS (so not in the map sha): the golden
+    # values must equal the module constants the check actually runs with.
+    for key in ("ARM_MAP_M", "ARM_POINT_M", "MATCH_M", "UNMAPPED_MAX"):
+        assert golden["params"][key] == getattr(jm, key), (key, golden["params"][key], getattr(jm, key))
     assert golden["bars"] == {"major_recall_min": 0.95, "major_precision_min": 0.90}, golden["bars"]
     # The committed map is the same build, and dump_navgraph's freeze check agrees.
     committed = jm.load_map(COMMITTED_MAP)
@@ -476,7 +484,9 @@ def check_navgraph_classes() -> None:
     got = jm.classify_navgraph_nodes(fx["navgraph"], fx["road_network"])
     by = {n["id"]: kind for kind in ("major", "minor", "unmapped") for n in got[kind]}
     assert by == fx["expect"], (by, fx["expect"])
-    assert got["candidates"] == 4
+    assert got["candidates"] == 5
+    # E0 has a gated (minor) arm and an unmapped arm: unmapped is checked first.
+    assert by["E0"] == "unmapped", by
     assert all(len(n["pos"]) >= 2 for kind in ("major", "minor", "unmapped") for n in got[kind])
     # Site A's north road is 2.9 m off its link (maps). Moved to 3.1 m it no longer maps.
     moved = copy.deepcopy(fx["road_network"])
@@ -484,8 +494,100 @@ def check_navgraph_classes() -> None:
         for k in ("left", "middle", "right"):
             pt[k][0] = round(pt[k][0] + 0.2, 4)
     got2 = jm.classify_navgraph_nodes(fx["navgraph"], moved)
-    assert [n["id"] for n in got2["unmapped"]] == ["A0", "D0"], got2
-    print("  11 navgraph: major / gated minor / drivability-0.2 minor / unmapped; 2.9 m maps, 3.1 m does not")
+    assert [n["id"] for n in got2["unmapped"]] == ["A0", "D0", "E0"], got2
+    print("  11 navgraph: major / gated minor / drivability-0.2 minor / unmapped / minor+unmapped -> unmapped; "
+          "2.9 m maps, 3.1 m does not")
+
+
+def check_navgraph_verdict() -> None:
+    import render_junction_overlay as rjo
+
+    fx = json.loads((FIXTURES / "navgraph_synthetic.json").read_text(encoding="utf-8"))
+    golden = json.loads(GOLDEN.read_text(encoding="utf-8"))
+    nav, net = fx["navgraph"], fx["road_network"]
+
+    def sites(keep: str) -> tuple[dict, dict]:
+        """The fixture cut down to the sites in ``keep`` (A..E)."""
+        g = {k: {m: {} for m in v if m[0] in keep} for k, v in nav["graph"].items() if k[0] in keep}
+        c = {k: v for k, v in nav["coords"].items() if k[0] in keep}
+        return {"graph": g, "coords": c}, {k: v for k, v in net.items() if k[0] in keep}
+
+    def verdict(keep: str) -> tuple[str, dict]:
+        nv, rn = sites(keep)
+        doc = jm.build_junction_map(rn, "synthetic", "synthetic")
+        report, _cls = rjo.navgraph_report(doc, nv, rn, golden)
+        return report["verdict"], report["metric"]
+
+    # Full fixture: 2 of 5 candidates unmapped (40% > UNMAPPED_MAX), so VOID before any bar.
+    v, m = verdict("ABCDE")
+    assert v == "VOID" and m["unmapped_share"] > golden["params"]["UNMAPPED_MAX"], (v, m)
+    # A, B, C: nothing unmapped, our one major junction (A) matches navgraph A0: PASS.
+    v, m = verdict("ABC")
+    assert v == "PASS" and m["unmapped_share"] == 0.0 and m["major"]["recall"] == 1.0, (v, m)
+    assert m["major"]["precision"] == 1.0, m
+    # A, B, C plus D's roads with D's navgraph node dropped: our extra major junction at D
+    # has no navgraph match, precision 0.5 < 0.90: FAIL.
+    nv, _ = sites("ABC")
+    _, rn = sites("ABCD")
+    doc = jm.build_junction_map(rn, "synthetic", "synthetic")
+    report, _ = rjo.navgraph_report(doc, nv, rn, golden)
+    assert report["verdict"] == "FAIL" and report["metric"]["major"]["precision"] == 0.5, report
+    # The boundaries come from the golden file: share exactly UNMAPPED_MAX is not VOID,
+    # recall exactly at the bar passes, just under it fails.
+    bars = golden["bars"]
+    at = {"unmapped_share": golden["params"]["UNMAPPED_MAX"],
+          "major": {"recall": bars["major_recall_min"], "precision": bars["major_precision_min"]}}
+    assert jm.navgraph_verdict(at, golden) == "PASS"
+    assert jm.navgraph_verdict(dict(at, unmapped_share=at["unmapped_share"] + 1e-9), golden) == "VOID"
+    low = dict(at, major={"recall": bars["major_recall_min"] - 1e-9, "precision": 1.0})
+    assert jm.navgraph_verdict(low, golden) == "FAIL"
+    # VOID wins over a failing bar.
+    assert jm.navgraph_verdict(dict(low, unmapped_share=1.0), golden) == "VOID"
+    # The CLI prints the verdict with the metric.
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_p = Path(tmp)
+        nv, rn = sites("ABCDE")
+        doc = jm.build_junction_map(rn, "synthetic", "synthetic")
+        jm.write_map(doc, tmp_p)
+        (tmp_p / "nav.json").write_text(json.dumps(nv), encoding="utf-8")
+        (tmp_p / "roads.json").write_text(json.dumps({"road_network": rn}), encoding="utf-8")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = rjo.main([str(tmp_p / "synthetic.json.gz"), "--out", str(tmp_p / "o.png"), "--navgraph",
+                             str(tmp_p / "nav.json"), "--roads", str(tmp_p / "roads.json"), "--golden", str(GOLDEN)])
+        first = json.loads(buf.getvalue().splitlines()[0])
+        assert code == 0 and first["verdict"] == "VOID" and "metric" in first, buf.getvalue()
+    print("  11b navgraph verdict: full fixture VOID (40% unmapped), A-C PASS, extra major FAIL; "
+          "golden bars and UNMAPPED_MAX boundaries; CLI prints the verdict")
+
+
+def check_edge_oneway_strings() -> None:
+    """Road dumps carry ``oneWay`` as a string: ``"0"`` is two-way, ``"1"`` one-way."""
+    import junction_grade
+
+    roads = network_spec(load_graph(), "synth_a")
+    for road in roads.values():
+        road["oneWay"] = "1" if road["oneWay"] else "0"
+    assert sorted({r["oneWay"] for r in roads.values()}) == ["0", "1"]
+    graph = jm.graph_from_network(roads)
+    ow = {e.road_id: e.oneway for e in graph.edges}
+    assert ow["X-XN"] is True, ow
+    assert all(v is False for rid, v in ow.items() if rid != "X-XN"), ow
+    # The map's graph edges carry the same flag.
+    doc = jm.build_junction_map(roads, "synth_a", "synthetic")
+    assert [e["road_id"] for e in doc["graph"]["edges"] if e["oneway"]] == ["X-XN"], doc["graph"]["edges"]
+    # The grader shares Edge.oneway: a "0" road routes both ways, a "1" road only a -> b.
+    assert junction_grade.Graph is jm.Graph
+    rev = [e for e in graph.edges if e.road_id == "S-T"][0]
+    assert junction_grade.route(graph, rev.b, rev.a).get("status") != "no_route"
+    one = [e for e in graph.edges if e.road_id == "X-XN"][0]
+    assert junction_grade.route(graph, one.b, one.a).get("status") == "no_route"
+    # The committed west_coast_usa graph is not all one-way.
+    committed = jm.load_map(COMMITTED_MAP)["graph"]["edges"]
+    n_one = sum(1 for e in committed if e["oneway"])
+    assert 0 < n_one < len(committed), (n_one, len(committed))
+    print(f"  1b oneWay strings: '0' two-way, '1' one-way (Edge.oneway, map graph, grader route); "
+          f"west_coast_usa {n_one}/{len(committed)} edges one-way")
 
 
 # ---------------------------------------------------------------- 12 / 13
@@ -504,9 +606,12 @@ def check_type_boundaries() -> None:
 
 def check_overpass() -> None:
     fx = json.loads((FIXTURES / "junctions_overpass.json").read_text(encoding="utf-8"))
+    ran = {}
     for name, case in fx["cases"].items():
         doc = jm.build_junction_map(case["roads"], name, "synthetic")
         assert len(doc["junctions"]) == case["expect"], (name, doc["junctions"])
+        ran[name] = len(doc["junctions"])
+    assert ran == {"dz_1.6": 0, "dz_6": 0, "dz_1.4": 1}, ran
     print("  13 overpass: dz 1.6 m and 6 m give 0 junctions, dz 1.4 m gives 1")
 
 
@@ -515,6 +620,8 @@ def main() -> None:
     check_type_boundaries()
     check_overpass()
     check_navgraph_classes()
+    check_navgraph_verdict()
+    check_edge_oneway_strings()
     check_labels_on_track()
     check_never_read_while_running()
     check_create_only_offline()

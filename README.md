@@ -267,7 +267,7 @@ The game bus lives in the running product's `Documents/GVD` folder (`%LOCALAPPDA
 | `py -3 scripts\gt_report.py <log>` | `--png` | Offline smoke only |
 | `py -3 scripts\build_junction_map.py <road dump>` | `--out` (`junctions/`), `--map` | Offline smoke only |
 | `py -3 scripts\label_junctions.py <run> [<run> ...]` | `--junctions` (`junctions/`), `--status-dir` | Offline smoke only |
-| `py -3 scripts\render_junction_overlay.py <map.json.gz>` | `--out` (required), `--navgraph`, `--roads`, `--crop`, `--px-per-m` (1), `--force` | Offline smoke only |
+| `py -3 scripts\render_junction_overlay.py <map.json.gz>` | `--out` (required), `--navgraph` (prints metric 1(a) and a PASS / FAIL / VOID verdict), `--roads`, `--golden`, `--crop`, `--px-per-m` (1), `--force` | Offline smoke only |
 | `py -3 scripts\dump_navgraph.py` | `--level` (required), `--out` (required), `--host`, `--port` | Unproven |
 | `py -3 scripts\run_offline_suite.py` | none | Offline smoke only |
 | `install.bat`, `uninstall.bat`, `play_gvd.bat`, `play_gvd_tech.bat` | extra args pass through to the supervisor | Unproven |

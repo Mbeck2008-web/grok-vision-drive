@@ -181,7 +181,7 @@ def graph_from_network(spec: Any, dz_max: float | None = None) -> Graph:
         poly = parse_road_edges(str(road_id), edges)
         if poly is None or len(poly.xy) < 2:
             continue
-        oneway = bool(isinstance(road, dict) and (road.get("oneWay") or road.get("oneway")))
+        oneway = _flag(road, "oneWay") or _flag(road, "oneway")  # "0" is two-way
         zs = list(poly.z) if poly.z is not None and dz_max is not None else [None] * len(poly.xy)
         lines.append((str(road_id), [(float(x), float(y)) for x, y in poly.xy], oneway, zs))
         graph.road_width[str(road_id)] = float(poly.width_m)
@@ -946,6 +946,9 @@ def map_arm_point(index, xy: tuple[float, float]) -> dict | None:
 def classify_navgraph_nodes(navgraph: dict[str, Any], network: Any) -> dict[str, Any]:
     """Major / minor / unmapped navgraph junction nodes (the frozen metric-1(a) rule).
 
+    A node with any arm that maps to no road is unmapped (checked first);
+    otherwise it is minor when any arm maps to a minor road, else major.
+
     ``navgraph`` is the ``NavigraphData`` shape: ``graph`` (node -> linked
     nodes) and ``coords`` (node -> xyz). A candidate has more than 2 links.
     Each link's arm point is ``ARM_POINT_M`` along it (or the far node) and maps
@@ -978,12 +981,13 @@ def classify_navgraph_nodes(navgraph: dict[str, Any], network: Any) -> dict[str,
             f = 1.0 if length <= ARM_POINT_M else ARM_POINT_M / length
             mapped.append(map_arm_point(index, (px + (ox - px) * f, py + (oy - py) * f)))
         entry = {"id": node, "pos": [round(px, 2), round(py, 2)]}
-        if any(road is not None and road_minor(road) for road in mapped):
-            out["minor"].append(entry)
-        elif all(road is not None for road in mapped):
-            out["major"].append(entry)
-        else:
+        # Unmapped first: a node with any unmapped arm is unmapped, even when another arm is minor.
+        if any(road is None for road in mapped):
             out["unmapped"].append(entry)
+        elif any(road_minor(road) for road in mapped):
+            out["minor"].append(entry)
+        else:
+            out["major"].append(entry)
     return out
 
 
@@ -1011,6 +1015,26 @@ def navgraph_metric(doc: dict[str, Any], classified: dict[str, Any], match_m: fl
     share = None if not cand else len(classified["unmapped"]) / cand
     return {"major": major, "minor": minor, "unmapped": len(classified["unmapped"]), "unmapped_share": share,
             "void": share is not None and share > UNMAPPED_MAX}
+
+
+def navgraph_verdict(metric: dict[str, Any], golden: dict[str, Any]) -> str:
+    """``PASS``, ``FAIL`` or ``VOID`` for metric 1(a), from the frozen golden values only.
+
+    VOID first: an unmapped share above the golden ``UNMAPPED_MAX`` means the
+    navgraph comparison does not count. Otherwise PASS needs major recall and
+    major precision at or above the golden bars.
+    """
+    share = metric.get("unmapped_share")
+    if share is None or share > float(golden["params"]["UNMAPPED_MAX"]):
+        return "VOID"
+    major = metric.get("major") or {}
+    recall, precision = major.get("recall"), major.get("precision")
+    bars = golden["bars"]
+    if recall is None or precision is None:
+        return "FAIL"
+    if recall >= float(bars["major_recall_min"]) and precision >= float(bars["major_precision_min"]):
+        return "PASS"
+    return "FAIL"
 
 
 def file_sha256(path: Path | str) -> str:

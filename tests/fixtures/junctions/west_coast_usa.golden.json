@@ -38,7 +38,7 @@
     "UNMAPPED_MAX": 0.05,
     "filter": "keep drivability>0; drop hiddenInNavi=1; keep gatedRoad=1 as minor"
   },
-  "sha256": "839c4108ccf4ea5b79e634b33f0b0c50d50754af7bab717515b2b9da76a93597",
+  "sha256": "331ed20edf326c7be7deb2477fb3d84f1621fe782e1529940a5eb46388dc6c5a",
   "src_sha256": "416f754322ff25eeb60b36429a64196c2abf8f262d723c78813ac180d0d89389",
   "version": 1
 }

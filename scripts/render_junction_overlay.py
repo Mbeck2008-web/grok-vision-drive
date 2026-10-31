@@ -10,7 +10,11 @@ circle, coloured by ``type`` (T orange, Y magenta, 4way blue, multi red,
 merge cyan); a minor junction is drawn thin. ``--navgraph`` adds the
 navgraph's candidate nodes (major green, minor yellow, unmapped white crosses)
 by ``junction_map.classify_navgraph_nodes`` against ``--roads`` (default
-``tests/fixtures/roads/<map>.json.gz``) and prints metric 1(a) as JSON.
+``tests/fixtures/roads/<map>.json.gz``) and prints metric 1(a) as JSON with a
+``verdict`` (``PASS``, ``FAIL`` or ``VOID``) from the frozen golden values
+(``--golden``, default ``tests/fixtures/junctions/<map>.golden.json``): VOID
+when the unmapped share is above ``UNMAPPED_MAX``, else PASS when major recall
+and precision meet the golden bars.
 ``--crop x0,y0,x1,y1`` (world metres) renders one area. The PNG is not
 overwritten unless ``--force``.
 """
@@ -83,12 +87,22 @@ def render(doc: dict, *, px_per_m: float = 1.0, crop: tuple[float, float, float,
     return img
 
 
+def navgraph_report(doc: dict, nav: dict, network: dict, golden: dict) -> tuple[dict, dict]:
+    """The printed metric-1(a) report (metric, verdict, unmapped positions) and the node classes."""
+    classified = jm.classify_navgraph_nodes(nav, network)
+    metric = jm.navgraph_metric(doc, classified, match_m=float(golden["params"]["MATCH_M"]))
+    report = {"metric": metric, "verdict": jm.navgraph_verdict(metric, golden),
+              "unmapped_pos": [n["pos"] for n in classified["unmapped"]]}
+    return report, classified
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("map", type=Path, help="junctions/<map>.json.gz")
     parser.add_argument("--out", type=Path, required=True, help="PNG path.")
     parser.add_argument("--navgraph", type=Path, default=None, help="Saved navgraph (dump_navgraph.py output).")
     parser.add_argument("--roads", type=Path, default=None, help="Road dump for --navgraph arm mapping.")
+    parser.add_argument("--golden", type=Path, default=None, help="Golden file for the --navgraph verdict.")
     parser.add_argument("--px-per-m", type=float, default=1.0)
     parser.add_argument("--crop", default=None, help="x0,y0,x1,y1 in world metres.")
     parser.add_argument("--force", action="store_true", help="Overwrite an existing PNG.")
@@ -98,11 +112,10 @@ def main(argv: list[str] | None = None) -> int:
     classified = None
     if args.navgraph is not None:
         roads = args.roads or ROOT / "tests" / "fixtures" / "roads" / f"{doc['map']}.json.gz"
-        nav = _load_json(args.navgraph)
-        classified = jm.classify_navgraph_nodes(nav, _load_json(roads)["road_network"])
-        metric = jm.navgraph_metric(doc, classified)
-        print(json.dumps({"metric": metric, "unmapped_pos": [n["pos"] for n in classified["unmapped"]]},
-                         sort_keys=True), flush=True)
+        golden_path = args.golden or ROOT / "tests" / "fixtures" / "junctions" / f"{doc['map']}.golden.json"
+        golden = json.loads(golden_path.read_text(encoding="utf-8"))
+        report, classified = navgraph_report(doc, _load_json(args.navgraph), _load_json(roads)["road_network"], golden)
+        print(json.dumps(report, sort_keys=True), flush=True)
     if args.out.exists() and not args.force:
         print(f"overlay {args.out.name} exists; not written (use --force)", flush=True)
         return 1

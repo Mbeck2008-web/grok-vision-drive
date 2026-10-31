@@ -4,8 +4,10 @@
 Spec tests (``python/collect/junction_map.py``):
  4 live = offline parity: the mocked collector drives a scripted track over the synthetic
    roads (3 junctions and a respawn jump) and writes ``state.jsonl`` and ``jct.jsonl``;
-   ``label_junctions.py`` on that ``state.jsonl`` gives identical bytes. A wall-clock
-   mutant and a lookahead mutant of the labeler both break the match.
+   ``label_junctions.py`` on that ``state.jsonl`` gives identical bytes. Three mutants of
+   the labeler each break the match: wall-clock (its only change is a fake wall-clock
+   reading added to ``next_jct_m``; a clock at a whole second leaves it equal), one-row lag
+   (row i gets row i-1's label) and lookahead (row i gets row i+1's label).
  5 schema unchanged: the same run with ``--no-jct`` gives byte-identical ``state.jsonl``
    and ``gt.jsonl``, and no ``jct.jsonl``.
  7 create-only (live half): an existing ``jct.jsonl`` in the out folder is kept.
@@ -166,27 +168,50 @@ def main() -> None:
         real_step = jm.JunctionLabeler.step
 
         def wall_clock(self, row):
+            # The only change is the wall-clock reading (fractional second) added to next_jct_m.
             got = real_step(self, row)
             if got.get("next_jct_m") is not None:
-                got["next_jct_m"] = round(got["next_jct_m"] + (time.time() % 1.0) * 1e-3 + 0.01, 2)
+                got["next_jct_m"] = round(got["next_jct_m"] + time.time() % 1.0, 2)
             return got
 
         pending: list = []
 
-        def lookahead(self, row):
-            # Labels each row with the next row's answer (needs a future pose).
+        def one_row_lag(self, row):
+            # Row i gets row i-1's label (row 0 keeps its own).
             pending.append(real_step(self, row))
             prev = pending.pop(0) if len(pending) > 1 else pending[0]
             return dict(prev, t=row.get("t"))
 
-        for name, mutant in (("wall_clock", wall_clock), ("lookahead", lookahead)):
+        by_t = {r["t"]: i for i, r in enumerate(rows)}
+        assert len(by_t) == len(rows), "row t values are not unique"
+
+        def lookahead(self, row):
+            # Row i gets row i+1's label: the labeler steps on the next (future) row's pose.
+            i = by_t[row.get("t")]
+            nxt = rows[i + 1] if i + 1 < len(rows) else row
+            return dict(real_step(self, nxt), t=row.get("t"))
+
+        def mutant_bytes(name, mutant, clock: float) -> bytes:
+            # A fake, fixed wall clock: the mutant's output depends on its value, not on when it runs.
+            real_clock = time.time
             jm.JunctionLabeler.step = mutant  # type: ignore[assignment]
+            time.time = lambda: clock  # type: ignore[assignment]
             try:
-                got = _offline(out, maps, tmp, f"mutant_{name}")
+                return _offline(out, maps, tmp, f"mutant_{name}_{clock!r}")
             finally:
                 jm.JunctionLabeler.step = real_step  # type: ignore[assignment]
+                time.time = real_clock  # type: ignore[assignment]
+
+        clock_whole, clock_frac = WALL0 + 7200.0, WALL0 + 7200.25
+        # Control: with the clock on a whole second the wall-clock mutant adds 0 and matches live,
+        # so its failure below comes from the clock reading alone.
+        assert mutant_bytes("wall_clock", wall_clock, clock_whole) == live, "wall_clock control differs"
+        for name, mutant in (("wall_clock", wall_clock), ("one_row_lag", one_row_lag), ("lookahead", lookahead)):
+            pending.clear()
+            got = mutant_bytes(name, mutant, clock_frac)
             assert got != live, f"the parity check did not catch the {name} mutant"
-        print("  4 mutants: wall-clock and lookahead labelers both differ from live")
+        print("  4 mutants: wall-clock (clock-only; whole-second control matches), one-row lag and "
+              "lookahead labelers all differ from live")
 
         # ---- 5 schema unchanged
         code, text_off, out_off = _run(["--no-jct"], maps, poses)

@@ -87,17 +87,19 @@ def cabin_drive_word(state: dict[str, Any]) -> tuple[str, tuple[int, int, int]]:
     return "ON", (212, 196, 158)
 
 _FRUSTUMS: list[dict[str, Any]] | None = None
+_FRUSTUMS_MODEL: str | None = None
 
 
 def load_frustums() -> list[dict[str, Any]]:
-    global _FRUSTUMS
-    if _FRUSTUMS is not None:
+    global _FRUSTUMS, _FRUSTUMS_MODEL
+    from python.sensors.rig_overrides import active_model, active_rig
+
+    model = active_model()
+    if _FRUSTUMS is not None and _FRUSTUMS_MODEL == model:
         return _FRUSTUMS
     out: list[dict[str, Any]] = []
     try:
-        from python.sensors.cameras import load_camera_config
-
-        cfg = load_camera_config()
+        cfg = active_rig()
         for cam in cfg.get("cameras") or []:
             pos = cam.get("pos_m") or [0.0, 0.0, 1.0]
             fov_v = float(cam.get("fov_v") or 40.0)
@@ -115,6 +117,7 @@ def load_frustums() -> list[dict[str, Any]]:
     except Exception:
         out = []
     _FRUSTUMS = out
+    _FRUSTUMS_MODEL = model
     return out
 
 

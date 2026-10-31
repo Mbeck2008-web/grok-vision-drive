@@ -41,7 +41,11 @@ CANVAS_H = 192
 GAP_PX = 8
 SECTOR_W_43 = 256
 SECTOR_W_169 = 340
-# Inboard repeater columns are the ego body, same fraction as the live strip.
+# Inboard repeater columns are the ego body on the etk800 mounts. The run's
+# model is recorded (collect.json ego.model), but this 25% inboard mask is kept
+# the same for every ego model on purpose: frame caches stay consistent across
+# models, and the live strip stays byte-equal to the cache (live/cache parity).
+# On the eSBR (sbr) these columns show no ego body, so the mask blanks only road.
 EGO_EDGE_FRAC = 0.25
 EGO_EDGE = {"repeatL": "left", "repeatR": "right"}
 JPEG_QUALITY = 95

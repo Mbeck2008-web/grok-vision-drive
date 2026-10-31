@@ -16,7 +16,7 @@ from python.debug.gt_geom import CURVATURE_AHEAD_M, RoadPoly, lane_center_offset
 
 PHASES = ("cruise", "weave", "lane_change", "recover", "abort")
 ACTIVE = ("weave", "lane_change", "recover")
-CRUISE_S = 20.0
+CRUISE_S = 60.0
 WEAVE_S = 12.0
 LANE_CHANGE_S = 8.0
 RECOVER_S = 12.0
@@ -269,13 +269,23 @@ def ramp_length_m(delta_m: float, speed_mps: float | None) -> float | None:
     return max(by_heading, by_acc)
 
 
+# Road past the LANE_CHANGE_S distance: the collector's guard ends a move
+# LINE_END_MARGIN_M (5 m) before its line runs out, plus sampling slop.
+LANE_CHANGE_LINE_SLACK_M = 10.0
+
+
 def maneuver_length_m(phase: str, delta_m: float, speed_mps: float | None) -> float:
-    """Road a lane change / recover line needs: WINDOW_M, or the ramps plus holds at this speed."""
+    """Road a lane change / recover line needs: WINDOW_M, or the ramps plus holds at this speed.
+
+    A lane change line also covers LANE_CHANGE_S at the planning speed, so the
+    weave guard's line end does not cut it before recover starts.
+    """
     ramp = ramp_length_m(delta_m, speed_mps)
     if ramp is None:
         return WINDOW_M
     if phase == "lane_change":
-        return max(WINDOW_M, ramp + 16.0)
+        v = float(_speed(speed_mps) or 0.0)
+        return max(WINDOW_M, ramp + 16.0, v * LANE_CHANGE_S + LANE_CHANGE_LINE_SLACK_M)
     if phase == "recover":
         return max(WINDOW_M, 2.0 * ramp + 16.0)
     return WINDOW_M

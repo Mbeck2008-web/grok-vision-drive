@@ -105,6 +105,42 @@ def check_refusals_carry_reason() -> None:
     print("refusals: no_path (short chain, also a fast lane change), narrow; gate short at 30 m/s OK")
 
 
+def _old_maneuver_length_m(phase: str, delta_m: float, speed_mps: float | None) -> float:
+    """The lane change line before v * LANE_CHANGE_S + slack: max(WINDOW_M, ramp + 16)."""
+    ramp = ramp_length_m(delta_m, speed_mps)
+    if phase == "lane_change" and ramp is not None:
+        return max(exc.WINDOW_M, ramp + 16.0)
+    return _NEW_MANEUVER_LENGTH(phase, delta_m, speed_mps)
+
+
+_NEW_MANEUVER_LENGTH = exc.maneuver_length_m
+
+
+def check_lane_change_speed_term_refusal() -> None:
+    """130 m of road at 17 m/s: max(60, ramp + 16) = 90 m fits, v * LANE_CHANGE_S + 10 = 146 m does not."""
+    v = 17.0
+    ramp = ramp_length_m(3.5, v)
+    assert ramp is not None and max(exc.WINDOW_M, ramp + 16.0) < 100.0
+    assert exc.maneuver_length_m("lane_change", 3.5, v) == v * exc.LANE_CHANGE_S + exc.LANE_CHANGE_LINE_SLACK_M == 146.0
+    road = [RoadPoly("m", [(0.0, 0.0), (0.0, 130.0)], 14.0, 4)]
+    hit = project_road(road, 1.75, 20.0, math.pi / 2.0)
+
+    def run() -> tuple:
+        pts, _u, info = _plan("lane_change", v, road, 1.75)
+        return pts, info, exc.gate_reason(road, hit, 1.75, 20.0, math.pi / 2.0, "lane_change", v)
+
+    pts, info, gate = run()
+    assert pts is None and info.get("refused") == "no_path" and gate == "short", (info, gate)
+    exc.maneuver_length_m = _old_maneuver_length_m  # type: ignore[assignment]
+    try:
+        old_pts, old_info, old_gate = run()
+    finally:
+        exc.maneuver_length_m = _NEW_MANEUVER_LENGTH  # type: ignore[assignment]
+    assert old_pts is not None and old_gate == "open", (old_info, old_gate)
+    print("lane change 17 m/s on 130 m: old max(60, ramp+16) line plans and gates open; "
+          "new v*LANE_CHANGE_S+10 = 146 m refuses no_path / gate short OK")
+
+
 def check_overspeed_rule() -> None:
     assert exc.OVERSPEED_FRAC == 0.15
     assert not overspeed(11.5, 10.0) and overspeed(11.51, 10.0) and not overspeed(None, 10.0)
@@ -198,11 +234,12 @@ def check_collector_run() -> None:
     import scripts.collect_scene_lanes as collect
     import scripts.test_collect_spawn_fix as harness
 
+    w0 = int(round(exc.CRUISE_S / 0.1))  # 0.1 s ticks of cruise before the first weave
     previous = collect.painted_for
     collect.painted_for = lambda level: harness._Paint(lambda x, y: True)  # type: ignore[assignment]
     try:
         code, text, out = harness._run_collector(
-            {"speed_at": lambda n: 10.0 if n <= 215 else 12.0, "stop_at": 300, "x": 1.75},
+            {"speed_at": lambda n: 10.0 if n <= w0 + 15 else 12.0, "stop_at": w0 + 100, "x": 1.75},
             ["--speed-min", "8", "--speed-max", "17"],
         )
     finally:
@@ -228,7 +265,7 @@ def check_collector_run() -> None:
     collect.painted_for = lambda level: harness._Paint(lambda x, y: True)  # type: ignore[assignment]
     try:
         code, text, out = harness._run_collector(
-            {"speed_at": lambda n: 10.0 if n <= 215 else 11.4, "stop_at": 300, "x": 1.75}, [])
+            {"speed_at": lambda n: 10.0 if n <= w0 + 15 else 11.4, "stop_at": w0 + 100, "x": 1.75}, [])
     finally:
         collect.painted_for = previous  # type: ignore[assignment]
     assert code == 0 and "overspeed" not in text, text[-2000:]
@@ -281,8 +318,10 @@ def check_refused_stretches_run() -> None:
     the impact respawn starts a second one. Every retry stays in refused_attempts."""
     import scripts.test_collect_spawn_fix as harness
 
+    w0 = int(round(exc.CRUISE_S / 0.1))  # 0.1 s ticks of cruise before the first weave
     code, text, out = harness._run_collector(
-        {"speed_at": lambda n: 0.2 if 300 < n <= 340 else 10.0, "stop_at": 700}, ["--no-impact-respawn"])
+        {"speed_at": lambda n: 0.2 if w0 + 100 < n <= w0 + 140 else 10.0, "stop_at": 2 * w0 + 300},
+        ["--no-impact-respawn"])
     assert code == 0, text[-2000:]
     assert "collect recover current#0" in text, text[-3000:]
     before, after = text.split("collect recover current#0", 1)
@@ -295,8 +334,10 @@ def check_refused_stretches_run() -> None:
     print(f"refused stretches: 2 (one per spawn) from {tries} no_paint attempts OK")
 
 
-def _lane_change_run(v_car: float, flags: list[str]):
-    """A 4-lane 14 m road, painted, the car in a lane at a fixed ``v_car``; every start is a lane change."""
+def _lane_change_run(v_car: float, flags: list[str], guard: bool = False):
+    """A 4-lane 14 m road, painted, the car in a lane at a fixed ``v_car``; every start is a lane change.
+
+    ``guard=False`` passes --no-weave-guard (the incomplete case needs the car past the line's end)."""
     import scripts.collect_scene_lanes as collect
     import scripts.test_collect_spawn_fix as harness
 
@@ -304,9 +345,11 @@ def _lane_change_run(v_car: float, flags: list[str]):
     previous = (collect.painted_for, exc.ExcursionClock.peek_kind)
     collect.painted_for = lambda level: harness._Paint(lambda x, y: True)  # type: ignore[assignment]
     exc.ExcursionClock.peek_kind = lambda self, n: "lane_change" if n is not None and int(n) >= 2 else "weave"
+    w0 = int(round(exc.CRUISE_S / 0.1))  # 0.1 s ticks of cruise before the first weave
     try:
         code, text, out = harness._run_collector(
-            {"speed_at": lambda n: v_car, "stop_at": 400, "x": 1.75}, flags, roads=roads)
+            {"speed_at": lambda n: v_car, "stop_at": w0 + 200, "x": 1.75},
+            [*flags] + ([] if guard else ["--no-weave-guard"]), roads=roads)
     finally:
         collect.painted_for, exc.ExcursionClock.peek_kind = previous  # type: ignore[assignment]
     assert code == 0, text[-2000:]
@@ -333,14 +376,15 @@ def check_lane_change_incomplete() -> None:
     assert ws["started"].get("lane_change") == 1, ws
     full = math.atan(3.5 * math.pi / (2.0 * ramp_length_m(3.5, 17.0)))
     covered = 2.0 * 0.1 * (len(heads) - 1)
-    assert len(heads) == 80 and heads == sorted(heads), heads
+    # 8 s at 0.1 s ticks; the mocked clock's 0.1 s differences round down after a 60 s cruise, so allow +1.
+    assert len(heads) in (80, 81) and heads == sorted(heads), heads
     assert abs(heads[-1] - ramp_heading_reached(3.5, ramp_length_m(3.5, 17.0), covered)) < 2e-3, (heads[-1], covered)
     assert heads[-1] < 0.7 * full, (heads[-1], full)
     slow_peak = heads[-1]
     text, heads, ws = _lane_change_run(17.0, flags)
     assert "lane_change_incomplete" not in text, text[-3000:]
     assert ws["lane_change_complete"] == 1 and ws["lane_change_incomplete"] == 0, ws
-    assert len(heads) == 80 and heads == sorted(heads) and abs(heads[-1] - full) < 2e-3, (heads[-1], full)
+    assert len(heads) in (80, 81) and heads == sorted(heads) and abs(heads[-1] - full) < 2e-3, (heads[-1], full)
     print(f"lane change: 2 m/s on a 17 m/s plan incomplete, label peak {math.degrees(slow_peak):.1f} deg "
           f"(ramp peak {math.degrees(full):.1f}); 17 m/s complete at the ramp peak OK")
 
@@ -386,9 +430,25 @@ def check_auto_mode_speed_flags() -> None:
           f"set speeds pass through OK")
 
 
+def check_lane_change_guard_on_complete() -> None:
+    """Guard on (the default), 17 m/s: the sent line covers the whole LANE_CHANGE_S, so the
+    lane change is not cut at the line end and counts as complete."""
+    flags = ["--speed-min", "17", "--speed-max", "17"]
+    text, heads, ws = _lane_change_run(17.0, flags, guard=True)
+    assert "lane_change line end" not in text, [x for x in text.splitlines() if "line end" in x]
+    assert ws["started"].get("lane_change") == 1, ws
+    assert ws["lane_change_complete"] == 1 and ws["lane_change_incomplete"] == 0, ws
+    full = math.atan(3.5 * math.pi / (2.0 * ramp_length_m(3.5, 17.0)))
+    assert len(heads) in (80, 81) and abs(heads[-1] - full) < 2e-3, (len(heads), heads[-1:], full)
+    need = exc.maneuver_length_m("lane_change", 3.5, 17.0)
+    assert need >= 17.0 * exc.LANE_CHANGE_S, need
+    print(f"lane change, guard on, 17 m/s: line {need:.0f} m, {len(heads)} rows, complete OK")
+
+
 def main() -> None:
     check_plan_speed()
     check_refusals_carry_reason()
+    check_lane_change_speed_term_refusal()
     check_overspeed_rule()
     check_flag_clamp()
     check_weave_stats()
@@ -396,6 +456,7 @@ def main() -> None:
     check_collector_run()
     check_refused_stretches_run()
     check_lane_change_incomplete()
+    check_lane_change_guard_on_complete()
     check_west_coast_spawn_ranges()
     check_auto_mode_speed_flags()
     print("collect speed plan ok")

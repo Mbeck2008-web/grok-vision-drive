@@ -14,6 +14,7 @@ import io
 import json
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -499,8 +500,15 @@ def _run_collector(vehicle_args: dict, extra: list[str], root: Path | None = Non
         collect.tick_sleep_s,
     )
     clock = {"t": 0.0}
+    real_sleep, main_thread = collect.time.sleep, threading.main_thread()
 
     def sleep(seconds: float) -> None:
+        # Only the collector's own waits on the main thread move the fake clock. Other threads
+        # (none today) and the stdlib subprocess wait loop (code_pin's git calls, timed on the
+        # real clock) really sleep, so CPU load cannot shift the simulated time.
+        if threading.current_thread() is not main_thread or sys._getframe(1).f_globals.get("__name__") == "subprocess":
+            real_sleep(min(float(seconds or 0.0), 0.05))
+            return
         clock["t"] += float(seconds or 0.0)
 
     tech.open_tech_beamngpy = lambda *a, **k: bng  # type: ignore[assignment]

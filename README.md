@@ -256,7 +256,7 @@ The game bus lives in the running product's `Documents/GVD` folder (`%LOCALAPPDA
 | Command | Key flags (default) | Status |
 | --- | --- | --- |
 | `py -3 python\run_vision.py` (supervisor; the `.bat` launchers add `--viz`) | `--viz` (off), `--backend auto\|beamngpy\|window\|stub` (auto), `--hz` (15), `--policy modular\|e2e\|shadow` (modular, from `config/control.yaml`), `--lane-source hough\|scene\|gt` (hough), `--scene-onnx` (`models/e2e_scene.onnx`), `--detector` (auto), `--e2e-model` (auto), `--viz-screen auto\|1\|2` (auto), `--viz-fullscreen`, `--encode auto\|qsv\|cpu\|nvenc` (auto), `--gt-log` (off), `--foxglove` (off), `--tech-probe`, `--tech-hold`, `--smoke`, `--vision-only`, `--allow-preview-drive` (off), `--allow-synthetic-detect` (off), `--force-engage` (dev only, off), `--no-engage` / `GVD_NO_ENGAGE=1` (hard engage disable, off), `--cam-age-baseline` (cam-age capture baseline: cam-age model / hold off), `--run-seconds` (0 = until stopped) | Unproven |
-| `py -3 scripts\collect_scene_lanes.py` (collector) | `--minutes` (45), `--until-disk`, `--map`, `--maps`, `--map-weights`, `--segment-min` (12), `--route span\|waypoints\|random` (span), `--waypoints`, `--speed-min` (unset), `--speed-max` (unset; when set, each clamps every spawn type's range: city 8-14, highway 20-30, ramp 10-18 m/s; off the deck 8-17), `--cameras` (all), `--rates`, `--traffic [N]`, `--respawn-min` (0), `--no-impact-respawn` (impact respawn is on by default), `--time-of-day`, `--weather`, `--no-excursions`, `--weave-guard` (on; `--no-weave-guard` turns it off), `--ego-model` (sbr, the Hirochi eSBR electric), `--ego-config` (`vehicles/sbr/electric_800.pc`, the stock eSBR 800), `--no-vary-env`, `--smoke-s` (60), `--out`, `--data-dir`, `--reload-level`, `--check-maps`, `--list-levels`, `--dump-roads`, `--host`, `--port` | Proven live: recording only (`GVD_data\logs\rec3_20261019.txt`, `GVD_data\scene_lanes_rec3\collect.json`) |
+| `py -3 scripts\collect_scene_lanes.py` (collector) | `--minutes` (45), `--until-disk`, `--map`, `--maps`, `--map-weights`, `--segment-min` (12), `--route span\|waypoints\|random` (span), `--waypoints`, `--speed-min` (unset), `--speed-max` (unset; when set, each clamps every spawn type's range: city 8-14, highway 20-30, ramp 10-18 m/s; off the deck 8-17), `--cameras` (all), `--rates`, `--traffic [N]`, `--respawn-min` (0), `--no-impact-respawn` (impact respawn is on by default), `--time-of-day`, `--weather`, `--no-excursions`, `--weave-guard` (on; `--no-weave-guard` turns it off), `--no-jct` (junction labels on), `--ego-model` (sbr, the Hirochi eSBR electric), `--ego-config` (`vehicles/sbr/electric_800.pc`, the stock eSBR 800), `--no-vary-env`, `--smoke-s` (60), `--out`, `--data-dir`, `--reload-level`, `--check-maps`, `--list-levels`, `--dump-roads`, `--host`, `--port` | Proven live: recording only (`GVD_data\logs\rec3_20261019.txt`, `GVD_data\scene_lanes_rec3\collect.json`) |
 | `py -3 -m python.train.train_scene` (trainer) | see Technical details | Offline smoke only |
 | `py -3 scripts\gvd_status.py` | none | Offline smoke only |
 | `py -3 scripts\bot_engage.py on\|off` | none | Offline smoke only |
@@ -265,6 +265,10 @@ The game bus lives in the running product's `Documents/GVD` folder (`%LOCALAPPDA
 | `py -3 scripts\relabel_painted.py <root>` | `--zip MAP=PATH`, `--out` (`gt_painted.jsonl`) | Offline smoke only |
 | `py -3 scripts\live_lane_test.py` | `--seconds` (30), `--min-in-lane` (80), `--host`, `--port` | Unproven |
 | `py -3 scripts\gt_report.py <log>` | `--png` | Offline smoke only |
+| `py -3 scripts\build_junction_map.py <road dump>` | `--out` (`junctions/`), `--map` | Offline smoke only |
+| `py -3 scripts\label_junctions.py <run> [<run> ...]` | `--junctions` (`junctions/`), `--status-dir` | Offline smoke only |
+| `py -3 scripts\render_junction_overlay.py <map.json.gz>` | `--out` (required), `--navgraph` (prints metric 1(a) and a PASS / FAIL / VOID verdict), `--roads`, `--golden`, `--crop`, `--px-per-m` (1), `--force` | Offline smoke only |
+| `py -3 scripts\dump_navgraph.py` | `--level` (required), `--out` (required), `--host`, `--port` | Unproven |
 | `py -3 scripts\run_offline_suite.py` | none | Offline smoke only |
 | `install.bat`, `uninstall.bat`, `play_gvd.bat`, `play_gvd_tech.bat` | extra args pass through to the supervisor | Unproven |
 
@@ -394,6 +398,15 @@ Labels come from the painted line decals the camera actually sees: every `DecalR
 - `BNG_HOME` (or `BEAMNG_HOME`) must point at the BeamNG install so `content/levels/<map>.zip` can be read.
 - The first read writes a paint cache, `<roads dir>/<map>_lines.json.gz`. Later reads use the cache first.
 - `scripts/relabel_painted.py` relabels an existing recording offline and writes `gt_painted.jsonl` beside `state.jsonl`.
+
+### Junction labels
+
+Junctions come from the road dump, not from the cameras. They are used for labels and grading only and never reach steering, pedals or the AI commands.
+
+- `scripts/build_junction_map.py` builds `junctions/<map>.json.gz` offline from a road dump (`junctions/west_coast_usa.json.gz` is committed). Road filter: drivability above 0, not hidden in the navigation graph. Gated roads (driveways, parking connectors) stay and are flagged minor, as are roads with drivability under 0.5. Nodes with 3 or more arms within 20 m (and 1.5 m in height) are one junction, typed `T`, `Y`, `4way`, `multi` or `merge`. A junction with fewer than 3 non-minor arms is `minor`.
+- The collector writes `jct.jsonl` beside `state.jsonl`, one line per row, joined on `t`: `in_jct`, `jct_id`, `next_jct_m` (distance ahead along the road to the next junction circle, capped at 150 m), `jct_type`, `minor` and `src` (the map's sha256). It is create-only and never stops a recording; a map without a junction map writes no file. `--no-jct` turns it off. `state.jsonl` and `gt.jsonl` are the same bytes either way.
+- `scripts/label_junctions.py` relabels finished runs with the same code, so its `jct.jsonl` matches the live one byte for byte, and also writes `jct_exit.jsonl` (the turn taken at each junction). It exits 3 without opening any `state.jsonl` while a collector is running (a fresh `running` heartbeat, or a `state.jsonl` changed under 120 s ago).
+- A `jct_id` is stable only for one `src`. A new road dump or changed parameters renumber the junctions.
 
 ### Data pipeline
 

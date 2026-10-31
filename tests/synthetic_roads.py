@@ -79,11 +79,13 @@ def track(
     speed_mps: float = 10.0,
     dt_s: float = 0.1,
     lane_side: float = 1.0,
+    smooth_half: int = 12,
 ) -> list[tuple[float, float, float]]:
     """Scripted ``(x, y, heading_rad)`` poses along ``path`` in the right-hand lane.
 
     The node polyline is cut into ``speed * dt`` steps, corners are rounded
-    with a moving average, and each point moves half a lane to the right.
+    with a moving average (``smooth_half`` points each side, three passes), and each
+    point moves half a lane to the right.
     Values are rounded to 0.1 mm so the poses do not depend on libm.
     """
     nodes = graph["levels"][level]["nodes"]
@@ -97,7 +99,7 @@ def track(
             f = i / n
             dense.append((ax + (bx - ax) * f, ay + (by - ay) * f))
     dense.append(pts[-1])
-    half = 12
+    half = int(smooth_half)
     for _ in range(3):
         smooth = []
         for i in range(len(dense)):

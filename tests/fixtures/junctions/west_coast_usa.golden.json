@@ -1,0 +1,44 @@
+{
+  "bars": {
+    "major_precision_min": 0.9,
+    "major_recall_min": 0.95
+  },
+  "counts": {
+    "junctions": 638,
+    "major": 253,
+    "minor": 385,
+    "types": {
+      "4way": 100,
+      "T": 225,
+      "Y": 43,
+      "merge": 202,
+      "multi": 68
+    },
+    "types_major": {
+      "4way": 32,
+      "T": 54,
+      "Y": 9,
+      "merge": 140,
+      "multi": 18
+    }
+  },
+  "map": "west_coast_usa",
+  "note": "Frozen before any navgraph read. Built by scripts/build_junction_map.py from tests/fixtures/roads/west_coast_usa.json.gz. sha256 is the canonical uncompressed map JSON (the labels' src). Not retuned against the navgraph.",
+  "params": {
+    "ARM_MAP_M": 3.0,
+    "ARM_POINT_M": 10.0,
+    "CLUSTER_M": 20.0,
+    "JOIN_DZ_M": 1.5,
+    "LEAD_M": 25.0,
+    "MATCH_M": 25.0,
+    "MERGE_DEG": 30.0,
+    "MERGE_M": 4.0,
+    "MINOR_DRIVABILITY": 0.5,
+    "THROUGH_DEG": 25.0,
+    "UNMAPPED_MAX": 0.05,
+    "filter": "keep drivability>0; drop hiddenInNavi=1; keep gatedRoad=1 as minor"
+  },
+  "sha256": "331ed20edf326c7be7deb2477fb3d84f1621fe782e1529940a5eb46388dc6c5a",
+  "src_sha256": "416f754322ff25eeb60b36429a64196c2abf8f262d723c78813ac180d0d89389",
+  "version": 1
+}

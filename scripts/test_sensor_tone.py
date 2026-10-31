@@ -48,7 +48,7 @@ def main() -> None:
     held = blown.copy()
     corrected = recover_viewport_tone(blown)
     assert np.array_equal(blown, held), "tone must not rewrite the caller's buffer"
-    via = colour_to_bgr(np.ascontiguousarray(blown[:, :, ::-1]))
+    via = colour_to_bgr(np.ascontiguousarray(blown[:, :, ::-1]), tone=True)
     assert via is not None and np.array_equal(via, corrected)
     _assert_game_road(corrected, blown, gate)
 
@@ -59,7 +59,7 @@ def main() -> None:
         sky=(246, 240, 232),
         width=3,
     )
-    close_out = colour_to_bgr(np.ascontiguousarray(close[:, :, ::-1]))
+    close_out = colour_to_bgr(np.ascontiguousarray(close[:, :, ::-1]), tone=True)
     assert close_out is not None
     _assert_game_road(close_out, close, gate, white=(248, 248, 248))
 
@@ -106,7 +106,7 @@ def main() -> None:
     zeros = np.zeros((16, 16, 3), dtype=np.uint8)
     assert np.array_equal(recover_viewport_tone(zeros), zeros)
     assert int(zeros.max()) == 0
-    empty = colour_to_bgr(np.zeros((8, 8, 4), dtype=np.uint8).tobytes(), (8, 8))
+    empty = colour_to_bgr(np.zeros((8, 8, 4), dtype=np.uint8).tobytes(), (8, 8), tone=True)
     assert empty is not None and int(empty.max()) == 0
 
     # Same corrected frame for the lane fit and the CAMS tile. The preview
@@ -118,8 +118,8 @@ def main() -> None:
     again = recover_viewport_tone(corrected)
     assert np.array_equal(again, corrected)
     # A bright gray hood is not the road. Mid-gray asphalt stays, and the
-    # lane fit does not drop a lane or grow two more. colour_to_bgr is the
-    # store path for sensor frames; recover_viewport_tone is the window grab.
+    # lane fit does not drop a lane or grow two more. This is the opt-in
+    # curve (colour_to_bgr tone=True / GVD_LIVE_TONE=1); live frames default raw.
     _assert_midgray_hood_stays((128, 118, 108), (236, 236, 236))
     _assert_midgray_hood_stays((140, 132, 124), (220, 220, 220))
     # Sky (190, 200, 210) sits a few levels over the gate. The 42%–93% band
@@ -228,7 +228,7 @@ def _assert_midgray_hood_stays(
     )
     before = estimate_lanes(raw)
     assert before.conf >= 0.9 and len(before.lanes_bev) == 2, before
-    via = colour_to_bgr(np.ascontiguousarray(raw[:, :, ::-1]))
+    via = colour_to_bgr(np.ascontiguousarray(raw[:, :, ::-1]), tone=True)
     window = recover_viewport_tone(raw)
     assert via is not None
     assert np.array_equal(via, raw), tuple(int(v) for v in via[360, 320])
@@ -249,7 +249,7 @@ def _assert_midgray_under_bright_sky() -> None:
     )
     before = estimate_lanes(raw)
     assert before.conf >= 0.9 and len(before.lanes_bev) == 2, before
-    via = colour_to_bgr(np.ascontiguousarray(raw[:, :, ::-1]))
+    via = colour_to_bgr(np.ascontiguousarray(raw[:, :, ::-1]), tone=True)
     window = recover_viewport_tone(raw)
     assert via is not None
     road = tuple(int(v) for v in via[360, 320])

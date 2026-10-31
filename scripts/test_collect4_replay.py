@@ -143,7 +143,8 @@ def check_west_coast_still_weaves_with_stubs() -> None:
             started.append(move.phase)
         previous = move.phase
     print(f"west coast with side roads starts={started}")
-    assert len(started) >= 4, started
+    # The 60 s cruise (was 20 s) leaves room for 2 starts in this recording (was >= 4).
+    assert len(started) >= 2, started
     assert set(started) == {"weave"}
 
 

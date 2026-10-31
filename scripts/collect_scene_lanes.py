@@ -34,9 +34,19 @@ is a smoke collect: if those PNGs do not decode, the process stops.
     py -3 scripts\\collect_scene_lanes.py --minutes 120 --maps west_coast_usa,italy,east_coast_usa,utah,jungle_rock_island --segment-min 12 --smoke-s 60
 
 West-coast spawns skip roads whose next 300 m has painted lanes on less than
-``--min-paint-cov`` of the probes (default 0.5, 0 disables). ``--weave-guard``
-keeps weaves off unpainted stretches and junctions, and ends an excursion when
-its 60 m ``ai.setLine`` runs out.
+``--min-paint-cov`` of the probes (default 0.5, 0 disables). The weave guard
+(on; ``--no-weave-guard`` turns it off) keeps weaves off unpainted stretches
+and junctions, and ends an excursion when its 60 m ``ai.setLine`` runs out.
+Excursions start after 60 s of cruise (``CRUISE_S``); every 4th is a lane
+change on a road with two or more lanes.
+
+The ego car is ``--ego-model`` (default ``sbr``, the Hirochi eSBR electric)
+with ``--ego-config`` (default ``EGO_CONFIG_DEFAULT``, a .pc path; empty is the
+model's default config). The camera rig in ``config/cameras.yaml`` was
+calibrated on the etk800; another ego model logs a warning, its mounts are
+unproven. A ``--segment-min`` chunk switch or a ``--respawn-min`` teleport
+waits for cruise and the end of the settle window, at most 30 s
+(``collect boundary_defer``).
 
 Row fields in ``state.jsonl`` written by this collector, besides the frame data:
 
@@ -59,7 +69,9 @@ Row fields in ``state.jsonl`` written by this collector, besides the frame data:
   uses information the cameras do not see. ``veh`` (electrics whitelist),
   ``ai_cmd`` (the AI commands this collector sent), ``road`` (fields already
   computed for ``gt``), ``traffic`` (2 Hz, null on other rows), and
-  ``veh_meta`` on the first row after each spawn. A failed read is null; it
+  ``veh_meta`` on the first row after each spawn. The probe and the traffic
+  read are sent before the sensor poll and answered in the same game frame,
+  so they add no round-trip of their own. A failed read is null; it
   never stops collection. ``--max-file-gib`` stops with exit 7 (``file_cap``).
 
 ``impacts.jsonl`` beside ``state.jsonl`` has one ``{"kind": "impact", "t",
@@ -160,6 +172,7 @@ import datetime
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -173,6 +186,8 @@ if str(ROOT) not in sys.path:
 from python.data.raw_frames import controls_from_state
 from python.collect.spawn_mix import clamp_speed_range, traffic_count
 from python.collect import control_log
+from python.collect.boundary import BoundaryDefer, CarryOver, boundary_wait_reason
+from python.collect.level_session import EGO_CONFIG_DEFAULT, EGO_MODEL_DEFAULT
 
 SPEEDS_MPS = (8.0, 11.0, 14.0, 17.0, 10.0)
 SPEED_HOLD_S = 180.0
@@ -418,11 +433,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--weave-guard",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "Start no weave with paint on under half the lookaheads or a side road within 40 m, "
-            "and end an excursion before its 60 m line runs out."
+            "and end an excursion before its 60 m line runs out. On by default; --no-weave-guard turns it off."
         ),
+    )
+    parser.add_argument(
+        "--ego-model",
+        default=EGO_MODEL_DEFAULT,
+        help=f"Ego vehicle model for every spawn (default {EGO_MODEL_DEFAULT}, the Hirochi eSBR electric).",
+    )
+    parser.add_argument(
+        "--ego-config",
+        default=EGO_CONFIG_DEFAULT,
+        help=f"Ego part config (.pc path) for every spawn; empty uses the model's default (default {EGO_CONFIG_DEFAULT}).",
     )
     parser.add_argument(
         "--min-live-yield",
@@ -784,6 +810,23 @@ def segment_at(
     return pieces[-1][0], which * len(pieces) + len(pieces) - 1
 
 
+def segment_piece(
+    index: int,
+    maps: tuple[str, ...],
+    segment_s: float,
+    weights: dict[str, float] | None = None,
+    total_s: float | None = None,
+) -> tuple[str, int]:
+    """Map name of segment ``index`` (the inverse of ``segment_at``'s index)."""
+    if not maps:
+        return "", 0
+    i = max(0, int(index))
+    if not weights:
+        return maps[i % len(maps)], i
+    pieces = weighted_pieces(maps, segment_s, weights, total_s)
+    return pieces[i % len(pieces)][0], i
+
+
 def segment_boundary(
     elapsed_s: float,
     maps: tuple[str, ...],
@@ -972,7 +1015,7 @@ def _queue(vehicle: Any, command: str) -> None:
 
 
 def _largest_file(out: Path) -> tuple[str, int] | None:
-    """Name and size of the biggest top-level file in ``out`` (jsonl logs; PNGs live in subfolders)."""
+    """Name and size of the biggest top-level file in ``out`` (logs, cameras.json; PNGs live in subfolders)."""
     best: tuple[str, int] | None = None
     try:
         for entry in os.scandir(out):
@@ -1230,6 +1273,8 @@ def attached_frames_ready(cams: dict[str, Any], frames: dict[str, Any]) -> bool:
 STOP_EXIT_EARLY = 6
 STOP_EXIT_FILE_CAP = 7
 ETK800 = "etk800"
+# config/cameras.yaml mounts were drafted and calibrated on this model.
+CAMERA_RIG_MODEL = ETK800
 from python.collect.excursion import ETK800_HALF_WIDTH_M  # noqa: E402
 EGO_WIDTH_RANGE_M = (1.2, 3.0)
 
@@ -1288,24 +1333,88 @@ def vehicle_half_width(vehicle: Any) -> tuple[float | None, str]:
     return None, f"{note}; model={model or 'unknown'} is not {ETK800}, no known width"
 
 
+_SHA_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+
+
+def _git_dir(root: Path) -> Path | None:
+    """``root/.git``, or where a ``.git`` file (``gitdir: <path>``) points."""
+    dot = root / ".git"
+    if dot.is_dir():
+        return dot
+    if dot.is_file():
+        text = dot.read_text(encoding="utf-8", errors="replace").strip()
+        if text.startswith("gitdir:"):
+            return (root / text[len("gitdir:"):].strip()).resolve()
+    return None
+
+
+def _head_from_files(root: Path) -> str | None:
+    """HEAD's commit read from ``.git`` directly: HEAD, then a loose ref, then packed-refs.
+
+    For a checkout git will not open (its ownership check fails on a drive
+    with no file owners, such as FAT32). Read-only: nothing is written.
+    """
+    git = _git_dir(root)
+    if git is None:
+        return None
+    head = (git / "HEAD").read_text(encoding="utf-8", errors="replace").strip()
+    if _SHA_RE.fullmatch(head):
+        return head  # detached
+    if not head.startswith("ref:"):
+        return None
+    ref = head[len("ref:"):].strip()
+    common = git
+    if (git / "commondir").is_file():  # a linked worktree keeps refs in the main .git
+        common = (git / (git / "commondir").read_text(encoding="utf-8").strip()).resolve()
+    for base in (git, common):
+        loose = base / ref
+        if loose.is_file():
+            sha = loose.read_text(encoding="utf-8", errors="replace").strip()
+            if _SHA_RE.fullmatch(sha):
+                return sha
+    packed = common / "packed-refs"
+    if packed.is_file():
+        for line in packed.read_text(encoding="utf-8", errors="replace").splitlines():
+            parts = line.strip().split(" ", 1)
+            if len(parts) == 2 and parts[1] == ref and _SHA_RE.fullmatch(parts[0]):
+                return parts[0]
+    return None
+
+
 def code_pin(repo: Path | None = None, argv: list[str] | None = None) -> dict[str, Any]:
-    """``code_sha``, ``code_dirty`` (bool, or "unknown") and ``argv`` for this run."""
+    """``code_sha``, ``code_dirty`` (bool, or "unknown") and ``argv`` for this run.
+
+    ``git rev-parse HEAD`` first. If git refuses the checkout (its
+    safe.directory ownership check), again with ``-c safe.directory=<repo>``
+    for this one command; no git config is written. If git still gives
+    nothing, HEAD is read from ``.git`` (loose ref or packed-refs) and
+    ``code_dirty`` stays "unknown".
+    """
     root = Path(repo) if repo is not None else Path(__file__).resolve().parents[1]
     sha: str = "unknown"
     dirty: Any = "unknown"
-    try:
-        head = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=15
-        )
-        if head.returncode == 0 and head.stdout.strip():
+    safe = ["-c", f"safe.directory={root.resolve().as_posix()}"]
+    for extra in ([], safe):
+        try:
+            head = subprocess.run(
+                ["git", *extra, "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=15
+            )
+            if head.returncode != 0 or not _SHA_RE.fullmatch(head.stdout.strip()):
+                continue
             sha = head.stdout.strip()
             status = subprocess.run(
-                ["git", "-C", str(root), "status", "--porcelain"], capture_output=True, text=True, timeout=30
+                ["git", *extra, "-C", str(root), "status", "--porcelain"], capture_output=True, text=True, timeout=30
             )
             if status.returncode == 0:
                 dirty = bool(status.stdout.strip())
-    except (OSError, subprocess.SubprocessError, ValueError):
-        pass
+            break
+        except (OSError, subprocess.SubprocessError, ValueError):
+            continue
+    if sha == "unknown":
+        try:
+            sha = _head_from_files(root) or "unknown"
+        except (OSError, ValueError):
+            sha = "unknown"
     full = [sys.executable] + (list(sys.argv) if argv is None else [str(Path(__file__).resolve())] + [str(a) for a in argv])
     return {"code_sha": sha, "code_dirty": dirty, "argv": full}
 
@@ -1358,6 +1467,7 @@ class RunStop:
         self.segment: str | None = None
         self.done_s = 0.0
         self.pin: dict[str, Any] = {}
+        self.ctl_reads: dict[str, Any] | None = None  # control probe / traffic reply counts
         self._beat_m: float | None = None
 
     def attach(self, out: Path, progress_path: Path, target_s: float, done_s: float) -> None:
@@ -1437,8 +1547,15 @@ class RunStop:
             code = STOP_EXIT_EARLY
         target_txt = "inf" if self.target_s == float("inf") else f"{self.target_s:.1f}"
         tail = f" {self.detail}" if self.detail else ""
+        if self.ctl_reads is not None:  # an all-null probe or traffic run shows here
+            c = self.ctl_reads
+            print(f"collect ctl_reads pipelined={'true' if c['pipelined'] else 'false'} probes={c['probes']} "
+                  f"probe_null={c['probe_null']} traffic_reads={c['traffic_reads']} traffic_null={c['traffic_null']}",
+                  flush=True)
         print(f"collect stop reason={reason} code={code} done_s={done:.1f} target_s={target_txt}{tail}", flush=True)
         extra = {"stop_reason": reason, "stop_detail": self.detail or None, "stop_code": code, "stopped": time.time(), **self.pin}
+        if self.ctl_reads is not None:
+            extra["ctl_reads"] = dict(self.ctl_reads)
         if not self.progress_path.is_file():
             extra = {"done_s": done, "target_s": float(self.target_s), **extra}
         self._merge(self.progress_path, extra)
@@ -1469,7 +1586,17 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _main(argv: list[str] | None, run: RunStop) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    from python.collect.level_session import ego_spec, set_ego
+
+    try:
+        set_ego(args.ego_model, args.ego_config)
+    except ValueError as exc:
+        parser.error(str(exc))
+    # What the spawns use (set_ego maps an empty --ego-model to the default): the rig,
+    # veh_meta and collect.json read this, never the raw flags, so they cannot desync.
+    ego = ego_spec()
     from python.data.data_root import (
         DataDriveError,
         check_data_path,
@@ -1562,7 +1689,15 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         print(f"collect already reached {done_s / 60.0:.1f} min in {out}")
         run.stop("target_reached", "already reached before this run")
         return 0
-    cam_cfg = load_camera_config()
+    from python.sensors.rig_overrides import rig_for_model, rig_model, rig_overrides
+
+    # Only a level load spawns the ego model (see ego_spawned below); a single-level
+    # run drives the car already there and keeps the base rig.
+    rig_for = ego["model"] if (map_names or args.reload_level) else None
+    base_cam_cfg = load_camera_config()
+    cam_cfg = rig_for_model(base_cam_cfg, rig_for)
+    camera_rig = rig_model(base_cam_cfg, rig_for)
+    camera_overrides = rig_overrides(base_cam_cfg, rig_for)
     plan = capture_plan(cam_cfg, PNG_RATIO_MAX)
     totals = plan_totals(plan)
     ceiling_gb = float(totals["png_gb_per_hour"])
@@ -1650,6 +1785,16 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         spawn_pos: tuple[float, float, float] | None = None
         # Bumped on every spawn, respawn, and level load; veh_meta is keyed on it.
         spawn_seq = 0
+        # Only a level load spawns the ego car; a single-level run without
+        # --reload-level drives whatever car is already there.
+        ego_spawned = bool(map_names) or bool(args.reload_level)
+        rig_warned: set[str] = set()
+        segment_defer = BoundaryDefer("segment")
+        segment_carry = CarryOver()
+        respawn_defer = BoundaryDefer("respawn")
+        # spawn_mark of a due respawn the hold already released once; a failed placement then
+        # retries without re-arming the hold (and its log) every cap.
+        respawn_released_for: float | None = None
         if not map_names:
             opened = enter_map(bng, str(args.reload_level or ""), cam_cfg, {})
             vehicle, roads, cams, err = opened.vehicle, opened.roads, opened.cameras, opened.error
@@ -1720,6 +1865,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         segment_aborts = 0
         recover_lost_s = 0.0
         schedule_cut = 0.0
+        cut_at_load = 0.0
         last_end_done = -1.0
         stuck_ends = 0
         no_progress_max = max(0, int(getattr(args, "no_progress_ends", 0) or 0))
@@ -1922,6 +2068,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                         flush=True,
                     )
                     schedule_cut = 0.0
+                    segment_carry.forgive()
                     loaded_index = -1  # reload: a fresh level and spawn, not the stuck pose
                 last_end_done = done_s
                 segment_aborts = 0
@@ -2231,6 +2378,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             extra["impact_respawn"] = {"on": impact_respawn_on, **impact_respawns}
             extra["speed_ranges"] = {k: list(v) for k, v in speed_ranges.items()}
             extra["weave_stats"] = weave_stats.summary()
+            # Held segment-switch seconds carried over, and how many are not yet repaid.
+            extra["segment_carry"] = segment_carry.summary()
             # Cruise puts the AI aggression back after an abort (scripts/abort_aggression_tag.py reads this).
             extra["ai_aggression"] = {"abort": ABORT_AGGRESSION, "reset_to": AI_DEFAULT_AGGRESSION, "reset_on": "cruise"}
             # Lane-change rows carry the peak heading reached so far (older recordings: the full-ramp peak).
@@ -2242,6 +2391,12 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             }
             if ego_width:
                 extra["ego_width"] = dict(ego_width)
+            from python.collect.level_session import ego_paint
+
+            extra["ego"] = {"model": ego["model"], "part_config": ego["part_config"],
+                            "camera_rig_model": camera_rig, "camera_overrides": camera_overrides,
+                            "spawned": ego_spawned,
+                            "paint": ego_paint() if ego_spawned else None}
             return extra or None
 
         def _save_progress(done: float, target: float) -> None:
@@ -2278,6 +2433,12 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         # read, the spawn_seq veh_meta was sent for, and the AI commands sent so far.
         ctl_ticks = 0
         ctl_traffic_at: float | None = None
+        bngpy_version = _beamngpy_version()
+        ctl_pipelined = _beamngpy_pipeline_ok(bngpy_version)
+        if not ctl_pipelined:
+            print(f"collect ctl pipeline off: beamngpy __version__={bngpy_version!r} is not 1.36.x; "
+                  "probe and traffic reads use separate round-trips", flush=True)
+        run.ctl_reads = {"pipelined": ctl_pipelined, "probes": 0, "probe_null": 0, "traffic_reads": 0, "traffic_null": 0}
         ctl_meta_for: int | None = None
         ai_cmd = control_log.ai_cmd_state()
         while done_s < target_s:
@@ -2290,6 +2451,11 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 run.stop("requested", f"stop file {stop_file(out)}")
                 return 0
             elapsed = done_s
+            # Pay carried hold time back to the schedule, evenly until target_s (both cuts move,
+            # so this is not mistaken for an abort or yield cut).
+            repaid = segment_carry.repay(done_s)
+            schedule_cut += repaid
+            cut_at_load += repaid
             speed = speed_at(elapsed, tuple(speed_span[0]))
             waypoint = waypoint_at(elapsed, names)
             map_name, seg_index = segment_at(
@@ -2299,6 +2465,36 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 map_weights or None,
                 None if target_s == float("inf") else target_s,
             )
+            # A clock-driven chunk switch (no abort or yield cut since the load)
+            # waits for cruise and the end of the settle window, at most 30 s.
+            if (
+                loaded_index >= 0
+                and schedule_cut == cut_at_load
+                and segment_changed(loaded_map, loaded_index, map_name, seg_index)
+            ):
+                was_held = segment_defer.pending()
+                if segment_defer.hold(done_s, boundary_wait_reason(clock.phase, settle.active(done_s))):
+                    map_name, seg_index = loaded_map, loaded_index
+                elif was_held:
+                    # Carry the wait over: the next chunk starts where the switch first fell
+                    # due, not with what is left of its slot. CarryOver repays it evenly over
+                    # the rest of the run, so it does not all come out of the last chunk.
+                    # add() returns what fell due since repay(done_s) above: 0.0 here.
+                    settled = segment_carry.add(segment_defer.waited_s, done_s, target_s)
+                    schedule_cut += settled - segment_defer.waited_s
+                    cut_at_load += settled
+                    map_name, seg_index = segment_at(
+                        elapsed + schedule_cut, map_names, segment_s, map_weights or None,
+                        None if target_s == float("inf") else target_s,
+                    )
+                if was_held and seg_index > loaded_index + 1:
+                    # The hold outlasted a short chunk: load the next chunk, not the one after it.
+                    map_name, seg_index = segment_piece(
+                        loaded_index + 1, map_names, segment_s, map_weights or None,
+                        None if target_s == float("inf") else target_s,
+                    )
+            else:
+                segment_defer.clear()
             segment_id = f"{map_name}#{seg_index}" if map_name else "current#0"
             run.segment = segment_id
             if not map_names and segment_id not in speed_ranges:
@@ -2306,7 +2502,20 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 speed_span[0] = _speed_range("level", (8.0, 17.0), "flag" if flags_set else "default")
                 speed = speed_at(elapsed, tuple(speed_span[0]))
             if map_name == loaded_map and seg_index == loaded_index:
-                _apply_spawn(False)
+                respawn_due = (
+                    map_name == "west_coast_usa" and vehicle is not None
+                    and respawn_s > 0.0 and done_s - spawn_mark >= respawn_s
+                    and not (spawn_deck is not None and spawn_deck.exhausted)
+                )
+                if not respawn_due:
+                    respawn_defer.clear()
+                held = (respawn_due and respawn_released_for != spawn_mark
+                        and respawn_defer.hold(done_s, boundary_wait_reason(clock.phase, settle.active(done_s))))
+                if not held:
+                    mark_before = spawn_mark
+                    _apply_spawn(False)
+                    if respawn_due and spawn_mark == mark_before:
+                        respawn_released_for = spawn_mark
             if segment_changed(loaded_map, loaded_index, map_name, seg_index):
                 print(f"collect segment {segment_id}", flush=True)
                 opened = enter_map(bng, map_name, cam_cfg, cams)
@@ -2323,6 +2532,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     return 2
                 loaded_map = map_name
                 loaded_index = seg_index
+                cut_at_load = schedule_cut
                 last_ai = None
                 held_tag = None
                 clock = ExcursionClock()
@@ -2412,18 +2622,30 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 run.stop("camera_outage", outage)
                 return 4
             veh_mark = time.monotonic()
-            sample = _read_vehicle(vehicle)
-            probe = control_log.probe_nulls()
-            if ctl_ticks % int(args.ctl_probe_every) == 0:
-                probe = control_log.parse_ve_probe(_ask_vehicle(vehicle, control_log.VE_PROBE))
+            want_probe = ctl_ticks % int(args.ctl_probe_every) == 0
             ctl_ticks += 1
-            traffic_now = None
-            if ctl_traffic_at is None or veh_mark - ctl_traffic_at >= control_log.TRAFFIC_EVERY_S:
+            want_traffic = ctl_traffic_at is None or veh_mark - ctl_traffic_at >= control_log.TRAFFIC_EVERY_S
+            if want_traffic:
                 ctl_traffic_at = veh_mark
+            # The probe and the traffic read share the sensor poll's round-trip.
+            sample, probe_reply, traffic_reply = _read_vehicle_ctl(
+                vehicle,
+                bng,
+                control_log.VE_PROBE if want_probe else None,
+                control_log.TRAFFIC_CHUNK if want_traffic else None,
+                pipelined=ctl_pipelined,
+            )
+            if want_probe:
+                run.ctl_reads["probes"] += 1
+                run.ctl_reads["probe_null"] += probe_reply is None
+            if want_traffic:
+                run.ctl_reads["traffic_reads"] += 1
+                run.ctl_reads["traffic_null"] += traffic_reply is None
+            probe = control_log.parse_ve_probe(probe_reply) if want_probe else control_log.probe_nulls()
+            traffic_now = None
+            if want_traffic:
                 try:
-                    from python.collect.level_session import lua_call
-
-                    traffic_now = control_log.parse_traffic(lua_call(bng, control_log.TRAFFIC_CHUNK))
+                    traffic_now = control_log.parse_traffic(traffic_reply)
                 except Exception:
                     traffic_now = None
             ticks.add("veh_s", time.monotonic() - veh_mark)
@@ -2969,7 +3191,15 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             tags["traffic"] = traffic_now
             if ctl_meta_for != spawn_seq:
                 meta = control_log.parse_ve_meta(_ask_vehicle(vehicle, control_log.VE_META_PROBE))
-                tags["veh_meta"] = {"model": vehicle_model(vehicle), **meta}
+                # A spawned ego is the model the spawn asked for; the live object (maybe None)
+                # only names the car a single-level run found already there.
+                model_now = (ego["model"] if ego_spawned else None) or vehicle_model(vehicle)
+                spec = {"part_config": ego["part_config"]} if ego_spawned else {}
+                tags["veh_meta"] = {"model": model_now, **spec, **meta}
+                if model_now and model_now != camera_rig and model_now not in rig_warned:
+                    rig_warned.add(model_now)
+                    print(f"collect WARNING camera rig calibrated on {camera_rig}, ego model is {model_now}: "
+                          "config/cameras.yaml mounts are unproven on this car", flush=True)
             row_i = None if row_base is None else int(row_base) + int(getattr(writer, "enqueued", 0) or 0)
             q_before = writer.stats()
             submit_mark = time.monotonic()
@@ -3411,6 +3641,75 @@ def _write_collect_crash(directory: Any, message: str, reasons: dict[str, str]) 
     path = Path(directory) / "collect_crash.txt"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(message.rstrip() + "\n" + json.dumps(reasons, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _send_ahead(owner: Any, msg_type: str, chunk: str | None) -> Any:
+    """Write one BeamNGpy Lua request without waiting for its reply (``None`` if it cannot)."""
+    send = getattr(owner, "_send", None)
+    if chunk is None or not callable(send):
+        return None
+    try:
+        return send({"type": msg_type, "chunk": chunk, "resp": True})
+    except Exception:
+        return None
+
+
+def _reply_of(pending: Any, reply_type: str) -> Any:
+    """The Lua reply of a request sent by ``_send_ahead``. Any failure is ``None``."""
+    try:
+        return pending.recv(reply_type).get("resp", None)
+    except Exception:
+        return None
+
+
+def _beamngpy_version() -> Any:
+    """``beamngpy.__version__``, or ``None`` when it cannot be read."""
+    try:
+        import beamngpy
+
+        return getattr(beamngpy, "__version__", None)
+    except Exception:
+        return None
+
+
+def _beamngpy_pipeline_ok(version: Any) -> bool:
+    """Send-ahead is only used on BeamNGpy 1.36.x ("1.36" or "1.36.N"): the wire it was built and tested for."""
+    return isinstance(version, str) and re.fullmatch(r"1\.36(?:\.\d+)?", version.strip()) is not None
+
+
+def _read_vehicle_ctl(
+    vehicle: Any, bng: Any, probe_chunk: str | None, traffic_chunk: str | None, *, pipelined: bool = True
+) -> tuple[dict[str, Any], Any, Any]:
+    """``_read_vehicle`` plus the control probe (vehicle Lua) and the traffic read (GE Lua).
+
+    Each BeamNGpy call waits for the game to answer, and the game answers on
+    its next frame, so a separate probe and traffic call each cost a frame on
+    top of the sensor poll. Here both requests are written first (BeamNGpy's
+    ``_send``, which does not wait), then the sensor poll waits once, and the
+    game answers all three on that frame. Replies are matched by request id, so
+    the probe's reply is buffered while the poll waits. Same Lua chunks, same
+    replies. With ``pipelined=False`` (BeamNGpy other than 1.36.x), or when
+    this BeamNGpy has no ``_send``, the calls run one after another, as before. Returns ``(sample, probe reply, traffic reply)``;
+    a reply is ``None`` when not asked or when it failed.
+    """
+    ve = _send_ahead(vehicle, "QueueLuaCommandVE", probe_chunk) if pipelined else None
+    ge = _send_ahead(bng, "QueueLuaCommandGE", traffic_chunk) if pipelined else None
+    sample = _read_vehicle(vehicle)
+    probe = None
+    if probe_chunk is not None:
+        probe = _reply_of(ve, "ExecutedLuaChunkVE") if ve is not None else _ask_vehicle(vehicle, probe_chunk)
+    traffic = None
+    if traffic_chunk is not None:
+        if ge is not None:
+            traffic = _reply_of(ge, "ExecutedLuaChunkGE")
+        else:
+            try:
+                from python.collect.level_session import lua_call
+
+                traffic = lua_call(bng, traffic_chunk)
+            except Exception:
+                traffic = None
+    return sample, probe, traffic
 
 
 def _read_vehicle(vehicle: Any) -> dict[str, Any]:

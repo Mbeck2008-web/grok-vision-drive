@@ -35,7 +35,7 @@ Set `GVD_DATA_DIR` to `<data dir>` on a large drive. C: and D: are refused. The 
 Launch **one** BeamNG.tech 0.39 process:
 
 ```
-BeamNG.tech.exe -tcom -console -gfx dx11
+BeamNG.tech.exe -tcom -console -gfx vk
 ```
 
 The research port is **25252**. Env overrides, when set: `GVD_BEAMNG_HOST`, `GVD_BEAMNG_PORT`, `BNG_HOME` / `BEAMNG_HOME`, `GVD_BEAMNG_USER`, `GVD_TECH_LAUNCH` (`0` attach, `1` only if nothing is already listening), `GVD_TECH_SOCKET_TIMEOUT`, `GVD_BEAMNGPY_PIN`. `GVD_BACKEND=beamngpy`, `GVD_PRODUCT=tech`, `GVD_DOCS_DIR` points at the Tech userfolder `Documents\GVD`, not the Drive folder.

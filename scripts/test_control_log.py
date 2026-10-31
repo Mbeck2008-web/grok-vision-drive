@@ -117,9 +117,15 @@ def check_file_cap_exit_7() -> None:
     # collect.main -> the real RunStop.finish(): 7 survives, it does not become 6.
     status = stops._check_stop(code, text, out, "file_cap", 7)
     assert status["done_s"] < status["target_s"], status
-    # The detail names the top-level file that hit the cap (whichever log is biggest then).
-    capped = str(status["stop_detail"]).split(" ")[0]
-    assert (out / capped).is_file() and capped.endswith(".jsonl"), status["stop_detail"]
+    # The detail names the top-level file that hit the cap and its size. Which file
+    # is biggest first depends on the run (a log, or cameras.json), so the type is not asserted.
+    detail = str(status["stop_detail"])
+    parts = detail.rsplit(" ", 6)  # "<name> <bytes> B >= <cap> GiB cap"
+    assert len(parts) == 7 and parts[2:4] == ["B", ">="] and parts[5:] == ["GiB", "cap"], detail
+    capped, size, cap_gib = parts[0], int(parts[1]), float(parts[4])
+    assert cap_gib == 0.000001 and size >= cap_gib * 1024**3, detail
+    assert "/" not in capped and "\\" not in capped and (out / capped).is_file(), detail
+    assert f"collect stop file_cap {detail}" in text, text[-1500:]
     rows = _rows(out)
     ids = [int(r["i"]) for r in rows]
     assert ids and ids == list(range(len(ids))), "rows were dropped"

@@ -140,3 +140,16 @@ cameras:
     far_m: 100
     requested_update_time: -1
     update_priority: 1.0
+# Per-ego-model mounts (python/sensors/rig_overrides.py). Keys here replace the
+# camera's keys above for that model only; a model without an entry (the
+# etk800 the rig was calibrated on) gets the cameras above unchanged.
+vehicle_overrides:
+  sbr:
+    # The eSBR's front fender and tyre fill about half of the etk800 repeater
+    # frames. Mirror-like mounts instead: behind the front tyre, 0.1 m outboard
+    # of the 2.0 m body, same yaw/pitch/fov/res. Tuned live on BeamNG.tech 0.39.4
+    # (the tyre and body leave the frame from y 0.0 rearward).
+    repeatL:
+      pos_m: [-1.10, 0.00, 0.90]
+    repeatR:
+      pos_m: [1.10, 0.00, 0.90]

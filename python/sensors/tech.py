@@ -416,7 +416,7 @@ def apply_env_overrides(cfg: dict[str, Any]) -> dict[str, Any]:
 # Research socket. Official binary is the install-root exe, not Bin64.
 TECH_RESEARCH_PORT = 25252
 TECH_ROOT_EXE = "BeamNG.tech.exe"
-TECH_GFX = "dx11"
+TECH_GFX = "vk"  # Vulkan. Faster than dx11 in the 60 s A/B; see README.
 # BeamNGpy Hello recv. None blocks past the prove window; this cap REFUSEs.
 TECH_SOCKET_TIMEOUT_S = 10.0
 
@@ -655,7 +655,7 @@ def _abandon_hello(bng: Any, worker: threading.Thread) -> None:
 
 
 def human_one_starter(home: str | None) -> str:
-    """Install-root ``BeamNG.tech.exe -tcom -console -gfx dx11``."""
+    """Install-root ``BeamNG.tech.exe -tcom -console -gfx vk``."""
     exe = TECH_ROOT_EXE
     if home and str(home).strip():
         exe = str(Path(home) / TECH_ROOT_EXE)
@@ -663,7 +663,7 @@ def human_one_starter(home: str | None) -> str:
 
 
 def beamngpy_launch_argv(home: str | None, port: int, user: str | None = None) -> list[str]:
-    """Argv BeamNGpy 1.36 builds for the root exe with ``gfx=dx11``.
+    """Argv BeamNGpy 1.36 builds for the root exe with ``gfx=vk``.
 
     Matches ``_prepare_call`` plus ``open()``'s default ``-tcom-listen-ip``.
     Used when a launch fails before ``last_command_line`` is set. Not a Bin64 path.
@@ -731,8 +731,8 @@ def resolve_socket_timeout(cfg: dict[str, Any] | None = None) -> float:
     return val
 
 
-def _force_root_dx11(bng: Any, socket_timeout: float) -> None:
-    """Root exe, dx11, and a finite Hello socket timeout. No Bin64 default."""
+def _force_root_gfx(bng: Any, socket_timeout: float) -> None:
+    """Root exe, TECH_GFX (vk), and a finite Hello socket timeout. No Bin64 default."""
     try:
         bng.binary = TECH_ROOT_EXE
     except Exception:
@@ -801,7 +801,7 @@ def open_tech_beamngpy(
     launch: bool,
     socket_timeout: float | None = None,
 ) -> Any:
-    """Connect with quit_on_close=False. Launch uses the root exe and ``-gfx dx11``.
+    """Connect with quit_on_close=False. Launch uses the root exe and ``-gfx vk``.
 
     A listening research port forces ``launch=False``. ``bng.open()`` is joined
     for ``socket_timeout`` seconds on BeamNGpy 1.36. Expiry is
@@ -849,13 +849,13 @@ def open_tech_beamngpy(
                 bng = BeamNGpy(host, int(port), quit_on_close=False, **slim)
             except TypeError:
                 bng = BeamNGpy(host, int(port), **slim) if slim else BeamNGpy(host, int(port))
-        _force_root_dx11(bng, timeout)
+        _force_root_gfx(bng, timeout)
         hold_tech_process(bng)
         print("[GVD] phase=Hello", flush=True)
         _open_with_deadline(bng, bool(launch), timeout, host, int(port))
         print("[GVD] phase=Hello ok", flush=True)
         hold_tech_process(bng)
-        _force_root_dx11(bng, timeout)
+        _force_root_gfx(bng, timeout)
         return bng
     except TechHelloTimeout:
         raise

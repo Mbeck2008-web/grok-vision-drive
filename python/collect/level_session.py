@@ -3,7 +3,7 @@
 The 45-minute capture read ``scenario.get_road_network`` on a scenario that
 was already started. Freeroam is not that: Tech answers ``Need to be in a
 started scenario to get its DecalRoad data.`` Each named level is therefore
-``Scenario`` + ``etk800``, ``make``, ``load_scenario``, ``start_scenario``,
+``Scenario`` + the ego car (``EGO_MODEL_DEFAULT``), ``make``, ``load_scenario``, ``start_scenario``,
 and only then the road network. Session errors (including ``BNGError``) stay
 inside the call and come back as text.
 """
@@ -11,6 +11,7 @@ inside the call and come back as text.
 from __future__ import annotations
 
 import math
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -37,6 +38,70 @@ PLAYER_WAIT_S = 8.0
 POLL_S = 0.5
 SPAWN_Z_M = 250.0
 SCENARIO_TIMEOUT_S = 120.0
+# The ego car every spawn site uses: the Hirochi eSBR (electric), for smooth
+# power and instant torque under the AI. electric_800 is the stock eSBR 800
+# config (vehicles/sbr/electric_800.pc in the 0.39.4 sbr content); it spawned
+# and drove a 60 s smoke on BeamNG.tech 0.39.4. An empty config spawns the
+# model's default config.
+EGO_MODEL_DEFAULT = "sbr"
+EGO_CONFIG_DEFAULT = "vehicles/sbr/electric_800.pc"
+_EGO = {"model": EGO_MODEL_DEFAULT, "part_config": EGO_CONFIG_DEFAULT}
+# Stock paint per part config, so the ego spawns in the colour the config ships
+# with rather than the spawn API's white. Values copied from the BeamNG.tech
+# 0.39.4 sbr content: info_electric_800.json sets "defaultPaintName1": "Lime",
+# and info.json paints.Lime is {"baseColor": [0.42, 0.62, 0.05, 1.0],
+# "metallic": 0, "roughness": 0.9, "clearcoat": 1, "clearcoatRoughness": 0.05}.
+# beamngpy's Vehicle(color=) and the Lua spawn's color= carry base_color only.
+EGO_PAINTS: dict[str, dict[str, Any]] = {
+    "vehicles/sbr/electric_800.pc": {
+        "name": "Lime",
+        "base_color": [0.42, 0.62, 0.05, 1.0],
+        "metallic": 0.0,
+        "roughness": 0.9,
+        "clearcoat": 1.0,
+        "clearcoat_roughness": 0.05,
+        "source": "vehicles/sbr/info.json paints.Lime (info_electric_800.json defaultPaintName1)",
+    },
+}
+
+
+# Both values are written into the Lua spawn string: no quotes, spaces or backslashes.
+EGO_VALUE_RE = re.compile(r"^[\w/.-]+$")
+
+
+def set_ego(model: str, part_config: str = "") -> None:
+    """The model and part config (.pc path, or empty) every later spawn uses.
+
+    ValueError (and nothing changes) unless each non-empty value matches EGO_VALUE_RE.
+    """
+    m, pc = str(model or EGO_MODEL_DEFAULT), str(part_config or "")
+    for flag, value in (("--ego-model", m), ("--ego-config", pc)):
+        if value and not EGO_VALUE_RE.fullmatch(value):
+            raise ValueError(f"{flag} {value!r}: only letters, digits, _ / . - are allowed")
+    _EGO["model"] = m
+    _EGO["part_config"] = pc
+
+
+def ego_spec() -> dict[str, str]:
+    """The ego model and part config the spawn sites ask for."""
+    return dict(_EGO)
+
+
+def ego_paint() -> dict[str, Any] | None:
+    """The stock paint of the current ego config, or None (spawn API default)."""
+    paint = EGO_PAINTS.get(_EGO["part_config"])
+    return dict(paint) if paint else None
+
+
+def _ego_vehicle(Vehicle: Any) -> Any:
+    """beamngpy 1.36 ``Vehicle(vid, model, part_config=..., color=...)``; each only when set."""
+    kwargs: dict[str, Any] = {}
+    if _EGO["part_config"]:
+        kwargs["part_config"] = _EGO["part_config"]
+    paint = ego_paint()
+    if paint:
+        kwargs["color"] = tuple(paint["base_color"])
+    return Vehicle("gvd_ego", model=_EGO["model"], **kwargs)
 
 
 @dataclass
@@ -281,7 +346,7 @@ def make_collect_scenario(
     except Exception:
         return ScriptScenario(level, name, pos, rot)
     scenario = Scenario(level, name, description="GVD scene collect")
-    vehicle = Vehicle("gvd_ego", model="etk800")
+    vehicle = _ego_vehicle(Vehicle)
     _add_vehicle(scenario, vehicle, pos, rot)
     return scenario
 
@@ -401,7 +466,7 @@ def spawn_direct(bng: Any, pos: tuple[float, float, float], rot: tuple[float, fl
     except Exception:
         Vehicle = None  # type: ignore
     if Vehicle is not None:
-        vehicle = Vehicle("gvd_ego", model="etk800")
+        vehicle = _ego_vehicle(Vehicle)
         fn = getattr(bng, "spawn_vehicle", None)
         if not callable(fn):
             fn = getattr(getattr(bng, "vehicles", None), "spawn", None)
@@ -421,10 +486,14 @@ def spawn_direct(bng: Any, pos: tuple[float, float, float], rot: tuple[float, fl
                 if is_session_error(exc):
                     return session_text(exc)
                 raise
+    config = f'config="{_EGO["part_config"]}", ' if _EGO["part_config"] else ""
+    paint = ego_paint()
+    if paint:  # the same "R G B A" string beamngpy's spawn sends as options.color
+        config += f'color="{" ".join(str(float(c)) for c in paint["base_color"])}", '
     return _send(
         bng,
-        "core_vehicles.spawnNewVehicle(\"etk800\", "
-        f"{{pos=vec3({x:.2f},{y:.2f},{z:.2f}), rot=quat({qx:.5f},{qy:.5f},{qz:.5f},{qw:.5f})}})",
+        f'core_vehicles.spawnNewVehicle("{_EGO["model"]}", '
+        f"{{{config}pos=vec3({x:.2f},{y:.2f},{z:.2f}), rot=quat({qx:.5f},{qy:.5f},{qz:.5f},{qw:.5f})}})",
     )
 
 

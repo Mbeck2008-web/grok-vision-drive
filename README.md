@@ -24,7 +24,7 @@ Trainer collapse fixes and event masking (`--mask-events`) are pending in PR #87
 Windows. You do not need an administrator account. The full agent procedure (Tech launch flags, data disk, collect, validate, train) is [AGENTS.md](AGENTS.md). Shell debugging is [DEBUGGING.md](DEBUGGING.md).
 
 1. Run `install.bat`, then enable **Grok Vision Drive** in the BeamNG Mod Manager.
-2. BeamNG.tech (eight cameras): start one game with `BeamNG.tech.exe -tcom -console -gfx dx11` (port 25252), then run `play_gvd_tech.bat`.
+2. BeamNG.tech (eight cameras): start one game with `BeamNG.tech.exe -tcom -console -gfx vk` (Vulkan, port 25252; see [Renderer](#renderer-vulkan--gfx-vk)), then run `play_gvd_tech.bat`.
    The Tech path requires beamngpy 1.36+ (BeamNG.tech 0.39); install `requirements-beamng.txt`.
    BeamNG.drive (one window capture): run `play_gvd.bat`.
 3. The **GVD VISION** window opens. Add the **GVD** app in BeamNG's UI Apps.
@@ -256,7 +256,7 @@ The game bus lives in the running product's `Documents/GVD` folder (`%LOCALAPPDA
 | Command | Key flags (default) | Status |
 | --- | --- | --- |
 | `py -3 python\run_vision.py` (supervisor; the `.bat` launchers add `--viz`) | `--viz` (off), `--backend auto\|beamngpy\|window\|stub` (auto), `--hz` (15), `--policy modular\|e2e\|shadow` (modular, from `config/control.yaml`), `--lane-source hough\|scene\|gt` (hough), `--scene-onnx` (`models/e2e_scene.onnx`), `--detector` (auto), `--e2e-model` (auto), `--viz-screen auto\|1\|2` (auto), `--viz-fullscreen`, `--encode auto\|qsv\|cpu\|nvenc` (auto), `--gt-log` (off), `--foxglove` (off), `--tech-probe`, `--tech-hold`, `--smoke`, `--vision-only`, `--allow-preview-drive` (off), `--allow-synthetic-detect` (off), `--force-engage` (dev only, off), `--no-engage` / `GVD_NO_ENGAGE=1` (hard engage disable, off), `--cam-age-baseline` (cam-age capture baseline: cam-age model / hold off), `--run-seconds` (0 = until stopped) | Unproven |
-| `py -3 scripts\collect_scene_lanes.py` (collector) | `--minutes` (45), `--until-disk`, `--map`, `--maps`, `--map-weights`, `--segment-min` (12), `--route span\|waypoints\|random` (span), `--waypoints`, `--speed-min` (unset), `--speed-max` (unset; when set, each clamps every spawn type's range: city 8-14, highway 20-30, ramp 10-18 m/s; off the deck 8-17), `--cameras` (all), `--rates`, `--traffic [N]`, `--respawn-min` (0), `--no-impact-respawn` (impact respawn is on by default), `--time-of-day`, `--weather`, `--no-excursions`, `--no-vary-env`, `--smoke-s` (60), `--out`, `--data-dir`, `--reload-level`, `--check-maps`, `--list-levels`, `--dump-roads`, `--host`, `--port` | Proven live: recording only (`GVD_data\logs\rec3_20261019.txt`, `GVD_data\scene_lanes_rec3\collect.json`) |
+| `py -3 scripts\collect_scene_lanes.py` (collector) | `--minutes` (45), `--until-disk`, `--map`, `--maps`, `--map-weights`, `--segment-min` (12), `--route span\|waypoints\|random` (span), `--waypoints`, `--speed-min` (unset), `--speed-max` (unset; when set, each clamps every spawn type's range: city 8-14, highway 20-30, ramp 10-18 m/s; off the deck 8-17), `--cameras` (all), `--rates`, `--traffic [N]`, `--respawn-min` (0), `--no-impact-respawn` (impact respawn is on by default), `--time-of-day`, `--weather`, `--no-excursions`, `--weave-guard` (on; `--no-weave-guard` turns it off), `--ego-model` (sbr, the Hirochi eSBR electric), `--ego-config` (`vehicles/sbr/electric_800.pc`, the stock eSBR 800), `--no-vary-env`, `--smoke-s` (60), `--out`, `--data-dir`, `--reload-level`, `--check-maps`, `--list-levels`, `--dump-roads`, `--host`, `--port` | Proven live: recording only (`GVD_data\logs\rec3_20261019.txt`, `GVD_data\scene_lanes_rec3\collect.json`) |
 | `py -3 -m python.train.train_scene` (trainer) | see Technical details | Offline smoke only |
 | `py -3 scripts\gvd_status.py` | none | Offline smoke only |
 | `py -3 scripts\bot_engage.py on\|off` | none | Offline smoke only |
@@ -310,6 +310,54 @@ The settled game view. Soft Esc parked.
 
 ![rear](docs/cams/rear.jpg)
 
+## Renderer: Vulkan (`-gfx vk`)
+
+Start BeamNG.tech with Vulkan: `BeamNG.tech.exe -tcom -console -gfx vk`. GVD's BeamNGpy launch path and `play_gvd_tech.bat` use the same flag. **Proven live: recording only** for a 60 s collector smoke on the dev PC on 2026-10-30. Nothing about GVD driving the car is proven by it.
+
+DX11 vs Vulkan A/B on the dev PC: each run was a 60 s collector smoke on west_coast_usa, 2 traffic cars, `--no-vary-env`, the same spawn (road 897170), eight cameras. A CPU screen recorder (libx264) ran during every run, so these Hz figures are lower than an unrecorded run.
+
+| Metric | DX11 | Vulkan (warm shader cache) |
+| --- | --- | --- |
+| Collector ticks (Hz) | 8.93 | 9.20 |
+| State rows (Hz) | 8.97 | 9.28 |
+| `veh_s` p50 / p95 / mean (ms) | 16 / 47 / 20.5 | 15 / 31 / 11.6 |
+| `poll_s` mean / p95 (ms), camera poll | 11.1 / 16 | 11.1 / 16 |
+| 10 Hz camera rate (unique frames/s) | 8.96 | 9.23 |
+| 2 Hz camera rate | 2.00 | 1.95 |
+| 1 Hz camera rate | 1.00 | 0.98–1.00 |
+| VRAM mean / max (MiB) | 4976 / 5559 | 4265 / 4389 (about 14% lower) |
+| GPU utilization mean | 54% | 86% |
+| Render FPS instantaneous / average | 29.4 / 30.3 | 55.4 / 62.8 |
+| Window clip fps | 31.4 | 39 |
+| Dark / missing / unreadable frames | 0 / 0 / 0 | 0 / 0 / 0 |
+| New `beamng.log` errors vs DX11 | — | none |
+| Crash or device lost | none | none |
+
+Cold start: the first Vulkan launch with an empty shader cache took about 3.5 min (212 s) from collector start to live cameras (DX11 about 46 s, warm Vulkan about 45 s). The level load was slow enough that the collector retried the scenario, and repeatR had 1 dark frame at startup.
+
+How each number was measured:
+
+- Collector ticks Hz: tick count over the time span in `ticks.jsonl`.
+- State rows Hz: row count over the time span in `state.jsonl`.
+- `veh_s`: per-tick vehicle-sensor time from `ticks.jsonl`.
+- `poll_s`: per-tick camera shared-memory poll time from `ticks.jsonl`; the timer granularity is about 15.6 ms.
+- Camera rates: unique frames over the time span, per camera rate group.
+- Dark / missing / unreadable: a saved PNG is dark when its mean luma is below 10; identical repeats were checked with md5 on every saved PNG.
+- VRAM and GPU utilization: `nvidia-smi` sampled at 1 Hz over the driving window.
+- Render FPS: BeamNG's `$fps::instantaneous` / `$fps::avg` registry values sampled at 1 Hz.
+- Window clip fps: `ffprobe` average frame rate of the 15 s screen recording of the game window.
+- Cold start: cameras-live time minus collector start time (1 s resolution).
+- Scenario retry: `beamng.log` of the cold run loads the `gvd_collect_west_coast_usa_retry` scenario.
+- Renderer: confirmed by the window title, `Engine.Render.getAdapterType()` and `beamng.log`.
+- New errors: diff of normalized error and warning signatures in `beamng.log` against the DX11 run.
+
+Caveats:
+
+- A 2 h run on Vulkan is untested. Only the 60 s smokes above are on file.
+- BeamNG's documentation warns that Vulkan in BeamNG.tech may crash with annotated cameras or multi-sensor setups. GVD runs eight cameras. The renderer is the constant `TECH_GFX` in `python/sensors/tech.py`; there is no config or env override. To fall back to DX11, either start Tech by hand with `BeamNG.tech.exe -tcom -console -gfx dx11` and attach (`play_gvd_tech.bat`, `GVD_TECH_LAUNCH=0`), or edit `TECH_GFX` to `"dx11"`.
+- GPU utilization was higher on Vulkan: 54% mean on DX11 vs 86% on Vulkan. The cause was not measured.
+- The first launch after a BeamNG update or a shader cache clear is slow while shaders compile. Wait for the cameras before judging Hz.
+
 ## Version
 
 Canonical pin **1.7.13** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Untagged retail zips use `1.7.13-alpha-<sha>`. Point bumps (`1.7.x`) are fixes and small UI. A main alpha bump (`1.x.0`) is features, core, or a UI overhaul. The change history is the git log.
@@ -322,7 +370,7 @@ Every number in this section is a code default or a code constant on this branch
 
 | Part | What it is | Status |
 | --- | --- | --- |
-| Cameras | Eight BeamNG.tech cameras (`config/cameras.yaml`): main, narrow and wide on the windshield, pillarL/R aimed 78 degrees off the lane, repeatL/R on the fenders at yaw ±150, rear. Retail BeamNG.drive captures one window only. | Unproven |
+| Cameras | Eight BeamNG.tech cameras (`config/cameras.yaml`): main, narrow and wide on the windshield, pillarL/R aimed 78 degrees off the lane, repeatL/R on the fenders at yaw ±150, rear. `vehicle_overrides` holds per-model mounts (the eSBR's repeaters sit mirror-like, behind the front tyre and outboard of the body). Retail BeamNG.drive captures one window only. | Unproven |
 | Capture | One supervisor tick reads all eight cameras from shared memory. A camera not read this tick is missing; an older frame is not reused. Companions update offscreen; a bright-blue flash frame is not stored. | Offline smoke only |
 | Stitch | 2272x192 canvas: six 256x192 sectors (repeatL, pillarL, main, narrow, pillarR, repeatR), two 340x192 sectors (wide, rear), seven 8 px gaps. No pose warp. A missing camera is an empty sector. Repeater ego-body columns are cleared. | Offline smoke only |
 | Supervisor | `python/run_vision.py`: capture, perception (Hough lanes by default, YOLOv8n detector), path planner, safety vetoes, actuator, viz, clips. | Unproven |

@@ -15,7 +15,7 @@
 host: localhost
 port: 25252
 home: ""          # BeamNG.tech install dir. Empty → BNG_HOME.
-                  # One starter: install-root BeamNG.tech.exe -tcom -console -gfx dx11.
+                  # One starter: install-root BeamNG.tech.exe -tcom -console -gfx vk.
                   # Do not also launch from the bat. A missing tech.key does not fail the hold.
 user: ""          # Optional Tech userfolder. Empty is not a hold failure.
 launch: false     # false = attach to already-running Tech. true = BeamNGpy is the only starter (port was down).

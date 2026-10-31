@@ -84,14 +84,20 @@ class CarryOver:
         self._rate = 0.0  # owed seconds repaid per driving second
         self._at = 0.0
 
-    def add(self, waited_s: float, now_s: float, end_s: float) -> None:
-        """A hold released at ``now_s`` carried ``waited_s``; repay all that is owed by ``end_s``."""
-        self.repay(now_s)
+    def add(self, waited_s: float, now_s: float, end_s: float) -> float:
+        """A hold released at ``now_s`` carried ``waited_s``; repay all that is owed by ``end_s``.
+
+        Before the new rate is set, whatever fell due on the old rate since the last ``repay()``
+        is settled and RETURNED: the caller must give it back to the schedule like a ``repay()``
+        result. It is 0.0 when the caller already called ``repay(now_s)`` this tick (the
+        collector does)."""
+        paid = self.repay(now_s)
         w = max(0.0, float(waited_s))
         self.total_s += w
         self.owed_s += w
         left = float(end_s) - float(now_s)
         self._rate = self.owed_s / left if left > 0.0 and left != float("inf") else 0.0
+        return paid
 
     def repay(self, now_s: float) -> float:
         """Seconds to give back to the schedule since the last call (never more than owed)."""

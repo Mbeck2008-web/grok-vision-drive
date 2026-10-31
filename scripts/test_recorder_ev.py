@@ -237,15 +237,21 @@ def check_carry_over_unit() -> None:
     from python.collect.boundary import CarryOver
 
     c = CarryOver()
-    c.add(30.0, 90.0, 200.0)
+    assert c.add(30.0, 90.0, 200.0) == 0.0  # nothing was owed before: add pays nothing out
     assert c.total_s == 30.0 and c.owed_s == 30.0
     assert c.repay(90.0) == 0.0
     assert abs(c.repay(145.0) - 15.0) < 1e-9 and abs(c.owed_s - 15.0) < 1e-9  # 30 s over 110 s
-    c.add(5.0, 145.0, 200.0)  # a second hold: 20 s owed over the 55 s left
+    assert c.add(5.0, 145.0, 200.0) == 0.0  # a second hold: 20 s owed over the 55 s left
     assert c.total_s == 35.0 and abs(c.owed_s - 20.0) < 1e-9
     assert abs(c.repay(172.5) - 10.0) < 1e-9
     assert abs(c.repay(250.0) - 10.0) < 1e-9 and c.owed_s == 0.0  # never more than owed
     assert c.repay(260.0) == 0.0
+    # add() first settles what fell due since the last repay() and returns it, so a caller that
+    # did not repay this tick does not lose it: the collector adds it to the schedule.
+    d = CarryOver()
+    d.add(30.0, 90.0, 200.0)
+    got = d.add(5.0, 145.0, 200.0)  # no repay() since 90 s: 15 s fell due on the old rate
+    assert abs(got - 15.0) < 1e-9 and abs(d.owed_s - 20.0) < 1e-9 and d.total_s == 35.0, (got, d.owed_s)
     # An open-ended run (no total): nothing to keep inside, nothing repaid.
     o = CarryOver()
     o.add(10.0, 0.0, float("inf"))

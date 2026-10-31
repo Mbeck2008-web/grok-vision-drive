@@ -2479,8 +2479,10 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     # Carry the wait over: the next chunk starts where the switch first fell
                     # due, not with what is left of its slot. CarryOver repays it evenly over
                     # the rest of the run, so it does not all come out of the last chunk.
-                    schedule_cut -= segment_defer.waited_s
-                    segment_carry.add(segment_defer.waited_s, done_s, target_s)
+                    # add() returns what fell due since repay(done_s) above: 0.0 here.
+                    settled = segment_carry.add(segment_defer.waited_s, done_s, target_s)
+                    schedule_cut += settled - segment_defer.waited_s
+                    cut_at_load += settled
                     map_name, seg_index = segment_at(
                         elapsed + schedule_cut, map_names, segment_s, map_weights or None,
                         None if target_s == float("inf") else target_s,

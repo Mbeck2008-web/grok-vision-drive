@@ -354,6 +354,22 @@ class SlowCam(FakeCam):
 
 
 def check_backend_read_log() -> None:
+    from python.sensors import cameras as cam_mod
+
+    # Every read here must finish: the statuses below are the read outcomes under test.
+    # The 50 ms CAM_READ_BUDGET_S is a real-time thread.join race with SlowCam's 8 ms
+    # sleep; on a loaded CPU the reader thread can be descheduled past it, and one
+    # timeout leaves the rest of that grab and the next grab "timeout" / "busy".
+    # The budget path is covered in test_tech_session.py. None = join until done.
+    saved_budget = cam_mod.CAM_READ_BUDGET_S
+    cam_mod.CAM_READ_BUDGET_S = None
+    try:
+        _check_backend_read_log(cam_mod)
+    finally:
+        cam_mod.CAM_READ_BUDGET_S = saved_budget
+
+
+def _check_backend_read_log(cam_mod) -> None:
     from python.sensors.live_hold import parse_reads_text, reads_text
 
     # Off by default: no read log on the bundle.
@@ -392,8 +408,6 @@ def check_backend_read_log() -> None:
     log = be.grab().read_log
     assert log["status"]["pillarL"] == "reattach" and "pillarL" not in be._reattached
     # A flashed companion is filtered: brighter and blue in the shadows than its last frame.
-    from python.sensors import cameras as cam_mod
-
     saved = cam_mod.companion_frame_is_flash
     cam_mod.companion_frame_is_flash = lambda new, held: True
     try:

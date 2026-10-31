@@ -611,6 +611,8 @@ def check_segment_carry_always_busy() -> None:
     order = _segments_in_order(_rows(out))
     spans = _seg_spans(_rows(out))
     lengths = {seg: round(b - a + 0.1, 1) for seg, (a, b) in spans.items()}
+    # All 5 chunks that fit run, in order: without the repayment the 4 holds push west#4 out.
+    assert order == ["west_coast_usa#0", "italy#1", "west_coast_usa#2", "italy#3", "west_coast_usa#4"], order
     assert all(v >= 45.0 for v in lengths.values()), lengths
     assert lengths[order[-1]] >= 45.0, (order, lengths)
     carry = json.loads((out / "collect.json").read_text(encoding="utf-8"))["segment_carry"]

@@ -1,6 +1,6 @@
 """One scene net for the 2272×192 strip.
 
-The net predicts lanes, curbs, cars, signs, and lights. It has no steer head.
+The net predicts lanes, curbs, cars, signs, and lights. It has an optional ctl head (offline only).
 ``predict_path`` turns the scene into the path. The same weights take whatever
 step time the recorder stored: each forward consumes the real seconds since
 the previous strip. FP32 on compute capability older than 7.0 (Pascal 6.1).
@@ -110,6 +110,13 @@ OUTPUT_FIELDS = (
 
 LOSS_TERMS = ("points", "class", "lamps", "valid", "lane_gt")
 HEAD_NAMES = ("lanes", "curbs", "objects", "signs", "lane_gt")
+# Optional control head (``--heads lane_gt,ctl``, offline only). Not in
+# OUTPUT_FIELDS / LOSS_TERMS / HEAD_NAMES, so a default net, its export and
+# its loss are unchanged.
+from python.train.ctl_targets import CTL_FIELDS, CTL_HORIZONS_S, CTL_OUTPUT_FIELDS  # noqa: E402,F401
+
+CTL_K = len(CTL_HORIZONS_S)
+CTL_BETA = 0.1
 
 # Torch-free pieces the live supervisor needs live in scene_live (run_vision must
 # not import torch at startup); re-exported here for the trainer and the tests.
@@ -706,6 +713,10 @@ def labels_for_row(row: Mapping[str, Any] | None) -> dict[str, np.ndarray]:
     values, mask = lane_gt_from_record(tech if isinstance(tech, Mapping) else None)
     labels["lane_gt"] = values
     labels["lane_gt_valid"] = mask
+    # ctl targets exist only on rows the trainer attached them to (--heads ...,ctl).
+    if "ctl" in row and "ctl_valid" in row:
+        labels["ctl"] = np.asarray(row["ctl"], dtype=np.float32).reshape(3, CTL_K)
+        labels["ctl_valid"] = np.asarray(row["ctl_valid"], dtype=np.float32).reshape(3, CTL_K)
     return labels
 
 
@@ -920,6 +931,10 @@ class ScenePrediction:
     sign_state: Any
     sign_valid: Any
     lane_gt: Any = None
+    # Only a ctl net fills these: (K,) per channel, (B, K) in a batch.
+    ctl_steer: Any = None
+    ctl_throttle: Any = None
+    ctl_brake: Any = None
 
     def as_dict(self) -> dict[str, Any]:
         return {name: getattr(self, name) for name in OUTPUT_FIELDS}
@@ -1091,6 +1106,33 @@ def head_names(heads: tuple[str, ...] | list[str] | None) -> frozenset[str]:
     return frozenset(parse_heads(",".join(str(name) for name in heads)))
 
 
+def _ctl_loss(pred: Any, goal: Any, valid: Any) -> Any:
+    """Sum over steer / throttle / brake of the masked-mean smooth-L1 (beta 0.1).
+
+    ``pred``, ``goal`` and ``valid`` are ``(..., 3, K)``. A masked slot does
+    not pull (its goal may be anything, NaN included); a channel with no
+    valid slot adds 0.
+    """
+    import torch.nn.functional as functional
+
+    goal = goal.to(device=pred.device, dtype=pred.dtype).reshape(pred.shape)
+    on = valid.to(device=pred.device).reshape(pred.shape) > 0.5
+    safe = torch.where(on, goal, pred.detach())
+    per = functional.smooth_l1_loss(pred, safe, reduction="none", beta=CTL_BETA)
+    per = torch.where(on, per, torch.zeros_like(per))
+    chan = per.transpose(0, -2).reshape(3, -1).sum(dim=1) if per.dim() > 2 else per.sum(dim=-1)
+    count = on.transpose(0, -2).reshape(3, -1).sum(dim=1) if on.dim() > 2 else on.sum(dim=-1)
+    return (chan / count.clamp(min=1).to(per.dtype)).sum()
+
+
+def _ctl_stack(pred: ScenePrediction) -> Any:
+    """``(..., 3, K)`` from the three ctl outputs, or None for a net without the head."""
+    parts = [getattr(pred, name, None) for name in CTL_OUTPUT_FIELDS]
+    if any(part is None for part in parts):
+        return None
+    return torch.stack(parts, dim=-2)
+
+
 def _scene_loss_body(
     pred: ScenePrediction,
     target: Mapping[str, Any],
@@ -1098,6 +1140,7 @@ def _scene_loss_body(
     *,
     lane_loss: str = "huber",
     conf_weight: float = 1.0,
+    ctl_weight: float = 1.0,
 ) -> dict[str, Any]:
     if torch is None:
         raise ImportError("PyTorch is not installed")
@@ -1186,9 +1229,14 @@ def _scene_loss_body(
         lane_gt_term = zero.clone()
     points = lane_points + curb_points + obj_points + sign_points
     valid = lane_valid + curb_valid + obj_valid + sign_valid
-    # A lane-only run must not backprop the other heads. Those zeros are
-    # fresh tensors, not a slice of the polyline or the match loss.
-    if wanted == frozenset({"lane_gt"}):
+    ctl_stack = _ctl_stack(pred) if "ctl" in wanted else None
+    if ctl_stack is not None and "ctl" in target and "ctl_valid" in target:
+        ctl_term = _ctl_loss(ctl_stack, target["ctl"], target["ctl_valid"])
+    else:
+        ctl_term = zero.clone()
+    # A lane-only run (with or without ctl) must not backprop the other heads.
+    # Those zeros are fresh tensors, not a slice of the polyline or the match loss.
+    if wanted - {"ctl"} == frozenset({"lane_gt"}):
         points = zero.detach().clone()
         classes = zero.detach().clone()
         lamps = zero.detach().clone()
@@ -1196,12 +1244,16 @@ def _scene_loss_body(
         total = lane_gt_term
     else:
         total = points + classes + lamps + valid + lane_gt_term
+    if "ctl" in wanted:
+        total = total + float(ctl_weight) * ctl_term
     out = {
         "points": points,
         "class": classes,
         "lamps": lamps,
         "valid": valid,
         "lane_gt": lane_gt_term,
+        # Always present; 0 unless the ctl head is on. Not in LOSS_TERMS.
+        "ctl": ctl_term,
         "total": total,
         # Unweighted parts of lane_gt, for the val line. Not in LOSS_TERMS.
         "lane_reg": lane_reg,
@@ -1263,14 +1315,18 @@ def scene_loss(
     *,
     lane_loss: str = "huber",
     conf_weight: float = 1.0,
+    ctl_weight: float = 1.0,
 ) -> dict[str, Any]:
     """Smooth-L1 on points, cross-entropy on class and lamps, match on objects and signs.
 
     ``heads`` limits which of those terms are non-zero. ``lane_loss`` is
     ``huber`` (smooth-L1, the default), ``l1``, or ``mse``. The forward pass
-    and the export still carry every head. Wheel and pedals are not terms.
+    and the export still carry every head. Wheel and pedals are terms only
+    for the opt-in ``ctl`` head: ``total = ... + ctl_weight * ctl``.
     """
-    return _scene_loss_body(pred, target, heads, lane_loss=lane_loss, conf_weight=conf_weight)
+    return _scene_loss_body(
+        pred, target, heads, lane_loss=lane_loss, conf_weight=conf_weight, ctl_weight=ctl_weight
+    )
 
 
 if torch is not None:
@@ -1307,9 +1363,16 @@ if torch is not None:
             return self.fc(pooled.flatten(1))
 
     class SceneNet(nn.Module):
-        """Strip in, planner tensors out. Hidden size 512. No steer head."""
+        """Strip in, planner tensors out. Hidden size 512. Optional ctl head (offline only)."""
 
-        def __init__(self, cams: tuple[str, ...] | None = None, scale: float = 1.0, cam_age: bool = False) -> None:
+        def __init__(
+            self,
+            cams: tuple[str, ...] | None = None,
+            scale: float = 1.0,
+            cam_age: bool = False,
+            ctl: bool = False,
+            cond_dim: int = 0,
+        ) -> None:
             super().__init__()
             from python.data.cam_hold import CAM_AGE_N
             from python.train.cam_strip import parse_cams, scaled_layout
@@ -1330,6 +1393,13 @@ if torch is not None:
             self.token_dim = sector_dim + (CAM_AGE_N if self.cam_age else 0)
             if self.cam_age:
                 self.pause_arch = checkpoint_arch(self.cams) + f":cam_age={CAM_AGE_N}"
+            # ctl: Linear(512 + cond_dim, 3 * K) on the fused feature, viewed (B, 3, K).
+            # cond_dim is reserved (zeros until a conditioning input exists).
+            self.ctl = bool(ctl)
+            self.cond_dim = int(cond_dim) if self.ctl else 0
+            if self.ctl:
+                arch = getattr(self, "pause_arch", checkpoint_arch(self.cams)) + f":ctl=3x{CTL_K}"
+                self.pause_arch = arch + (f":cond={self.cond_dim}" if self.cond_dim else "")
             self.stem = SharedStem()
             # The dropped tensor is the GRU input. ``state.h`` is not dropped.
             self.gru_in_drop = nn.Dropout(p=GRU_IN_DROPOUT)
@@ -1341,6 +1411,8 @@ if torch is not None:
             hidden = GRU_HIDDEN
             for name, out in scene_head_sizes():
                 setattr(self, name, nn.Linear(hidden, out))
+            if self.ctl:
+                self.ctl_head = nn.Linear(hidden + self.cond_dim, 3 * CTL_K)
 
         def initial_state(self, device: Any = None, dtype: Any = None, batch: int = 1) -> SceneState:
             device = device or torch.device("cpu")
@@ -1444,10 +1516,26 @@ if torch is not None:
             sign_state=net.sign_state_head(feat).view(width, N_SIGNS, len(LAMP_STATES)),
             sign_valid=torch.sigmoid(net.sign_valid_head(feat)).view(width, N_SIGNS),
             lane_gt=_lane_gt_output(net, feat),
+            **_ctl_outputs(net, feat),
         )
 
+    def _ctl_outputs(net: SceneNet, feat: Any) -> dict[str, Any]:
+        """tanh steer, sigmoid throttle and brake, each ``(B, K)``. Empty for a net without the head."""
+        if not bool(getattr(net, "ctl", False)):
+            return {}
+        width = int(feat.shape[0])
+        if net.cond_dim:
+            feat = torch.cat([feat, feat.new_zeros(width, net.cond_dim)], dim=-1)
+        raw = net.ctl_head(feat).view(width, 3, CTL_K)
+        return {
+            "ctl_steer": torch.tanh(raw[:, 0]),
+            "ctl_throttle": torch.sigmoid(raw[:, 1]),
+            "ctl_brake": torch.sigmoid(raw[:, 2]),
+        }
+
     def _prediction_at(pred: ScenePrediction, index: int) -> ScenePrediction:
-        return ScenePrediction(**{name: getattr(pred, name)[index] for name in OUTPUT_FIELDS})
+        extra = {name: getattr(pred, name)[index] for name in CTL_OUTPUT_FIELDS if getattr(pred, name) is not None}
+        return ScenePrediction(**{name: getattr(pred, name)[index] for name in OUTPUT_FIELDS}, **extra)
 
     def _letterbox_wide(crop: Any, out_h: int = CANVAS_H, out_w: int = 256) -> Any:
         import torch.nn.functional as functional
@@ -1547,6 +1635,8 @@ if torch is not None:
             else:
                 pred, state = self.net(strip, dt, state_in, ages)
             fields = tuple(getattr(pred, name) for name in OUTPUT_FIELDS)
+            if bool(getattr(self.net, "ctl", False)):
+                fields = fields + tuple(getattr(pred, name).reshape(1, CTL_K) for name in CTL_OUTPUT_FIELDS)
             return fields + (state.h, state.tokens, state.mask)
 
     def _trace_scene_onnx(model: Any, args: tuple[Any, ...], path_str: str) -> None:
@@ -1555,7 +1645,8 @@ if torch is not None:
         A ``cam_age`` net takes a sixth input, ``ages`` (1x8).
         """
         wrapper = _OnnxScene(model).eval()
-        output_names = list(OUTPUT_FIELDS) + ["h", "tokens", "mask"]
+        ctl_names = list(CTL_OUTPUT_FIELDS) if bool(getattr(model, "ctl", False)) else []
+        output_names = list(OUTPUT_FIELDS) + ctl_names + ["h", "tokens", "mask"]
         input_names = ["strip", "dt", "h", "tokens", "mask"]
         if bool(getattr(model, "cam_age", False)):
             input_names.append("ages")
@@ -1654,6 +1745,9 @@ def export_scene_onnx(
         net = SceneNet(cams=cams, cam_age=bool(cam_age)) if cams else SceneNet(cam_age=bool(cam_age))
     if zeros is None:
         zeros = torch.zeros
+    if bool(getattr(net, "ctl", False)) and path.exists():
+        # A ctl export is create-only: it never replaces a file.
+        raise FileExistsError(f"ctl export refuses to replace {path.name}")
     path.parent.mkdir(parents=True, exist_ok=True)
     model, args = cpu_export_inputs(net, zeros)
     if trace is None:

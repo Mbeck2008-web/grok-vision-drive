@@ -53,5 +53,16 @@
     {"path": ["X", "Y", "YR"], "node": "Y", "expect": "right"}
   ],
   "frozen_track": {"level": "synth_a", "path": ["W", "T", "X", "Y", "YL"], "speed_mps": 10.0, "dt_s": 0.1},
-  "level_change": {"before": {"level": "synth_a", "path": ["S", "T", "X"]}, "after": {"level": "synth_b", "path": ["BW", "BE"]}}
+  "level_change": {"before": {"level": "synth_a", "path": ["S", "T", "X"]}, "after": {"level": "synth_b", "path": ["BW", "BE"]}},
+  "boundaries": {
+    "about": "Type threshold cases for test_junction_map.py: one centre node C, straight 200 m arms at the given leave headings; expect is the junction type.",
+    "opp_156": {"nodes": {"C": [0.0, 0.0], "A0": [200.0, 0.0], "A1": [-182.7091, 81.3473], "A2": [-34.7296, -196.9616]}, "edges": [{"a": "C", "b": "A0"}, {"a": "C", "b": "A1"}, {"a": "C", "b": "A2"}], "expect": "T"},
+    "opp_204": {"nodes": {"C": [0.0, 0.0], "A0": [200.0, 0.0], "A1": [-182.7091, -81.3473], "A2": [-34.7296, 196.9616]}, "edges": [{"a": "C", "b": "A0"}, {"a": "C", "b": "A1"}, {"a": "C", "b": "A2"}], "expect": "T"},
+    "opp_154": {"nodes": {"C": [0.0, 0.0], "A0": [200.0, 0.0], "A1": [-179.7588, 87.6742], "A2": [-34.7296, -196.9616]}, "edges": [{"a": "C", "b": "A0"}, {"a": "C", "b": "A1"}, {"a": "C", "b": "A2"}], "expect": "Y"},
+    "opp_206": {"nodes": {"C": [0.0, 0.0], "A0": [200.0, 0.0], "A1": [-179.7588, -87.6742], "A2": [-34.7296, 196.9616]}, "edges": [{"a": "C", "b": "A0"}, {"a": "C", "b": "A1"}, {"a": "C", "b": "A2"}], "expect": "Y"},
+    "oneway_29": {"nodes": {"C": [0.0, 0.0], "A0": [200.0, 0.0], "A1": [174.9239, 96.9619], "A2": [-200.0, 0.0]}, "edges": [{"a": "C", "b": "A0", "oneway": true}, {"a": "C", "b": "A1", "oneway": true}, {"a": "C", "b": "A2"}], "expect": "merge"},
+    "oneway_31": {"nodes": {"C": [0.0, 0.0], "A0": [200.0, 0.0], "A1": [171.4335, 103.0076], "A2": [-200.0, 0.0]}, "edges": [{"a": "C", "b": "A0", "oneway": true}, {"a": "C", "b": "A1", "oneway": true}, {"a": "C", "b": "A2"}], "expect": "T"},
+    "twoway_29": {"nodes": {"C": [0.0, 0.0], "A0": [200.0, 0.0], "A1": [174.9239, 96.9619], "A2": [-200.0, 0.0]}, "edges": [{"a": "C", "b": "A0"}, {"a": "C", "b": "A1"}, {"a": "C", "b": "A2"}], "expect": "T"},
+    "merge_one_pair": {"nodes": {"C": [0.0, 0.0], "A0": [200.0, 0.0], "A1": [174.9239, 96.9619], "A2": [-100.0, 173.2051], "A3": [-100.0, -173.2051]}, "edges": [{"a": "C", "b": "A0", "oneway": true}, {"a": "C", "b": "A1", "oneway": true}, {"a": "C", "b": "A2"}, {"a": "C", "b": "A3"}], "expect": "merge"}
+  }
 }

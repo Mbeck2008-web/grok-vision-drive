@@ -74,6 +74,15 @@ Row fields in ``state.jsonl`` written by this collector, besides the frame data:
   so they add no round-trip of their own. A failed read is null; it
   never stops collection. ``--max-file-gib`` stops with exit 7 (``file_cap``).
 
+``jct.jsonl`` beside ``state.jsonl`` has one junction label line per row
+(``python/collect/junction_map.py``): ``t``, ``in_jct``, ``jct_id``,
+``next_jct_m``, ``jct_type``, ``minor``, ``src`` (the junction map's sha256).
+It comes from ``junctions/<map>.json.gz``; a map without one logs ``collect
+jct off map=...`` and writes no file. The file is create-only and labels
+never stop collection. ``--no-jct`` turns it off; ``state.jsonl`` is the same
+bytes either way. ``scripts/label_junctions.py`` relabels a finished run with
+the same code.
+
 ``impacts.jsonl`` beside ``state.jsonl`` has one ``{"kind": "impact", "t",
 "i", "pre_t0", "pre_i0", ...}`` line per impact and one ``{"kind":
 "impact_end", "t", "how"}`` line when it ends (``respawn``, ``drove_on``, or
@@ -184,6 +193,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from python.data.raw_frames import controls_from_state
+from python.collect.junction_map import JctSidecar
 from python.collect.spawn_mix import clamp_speed_range, traffic_count
 from python.collect import control_log
 from python.collect.boundary import BoundaryDefer, CarryOver, boundary_wait_reason
@@ -397,6 +407,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--no-excursions", action="store_true", help="Stay centered. Default weaves and lane changes.")
+    parser.add_argument("--no-jct", action="store_true", help="Do not write jct.jsonl junction labels.")
     parser.add_argument("--smoke-s", type=float, default=60.0, help="Collect this many seconds, check PNG decode, then continue. 0 skips the check.")
     parser.add_argument("--no-vary-env", action="store_true", help="Do not change weather or time of day on each segment.")
     parser.add_argument(
@@ -684,6 +695,8 @@ def share_maps(maps: tuple[str, ...], weights: dict[str, float]) -> list[tuple[s
 # real stall and settle seconds past this much of the plan, end the run.
 HARD_SEGMENT_REASONS = ("stationary", "tipped", "damage", "impact")
 IMPACTS_FILE = "impacts.jsonl"
+JCT_FILE = "jct.jsonl"
+JUNCTIONS_DIR = ROOT / "junctions"  # junctions/<map>.json.gz, built by scripts/build_junction_map.py
 CUTS_FILE = "cuts.jsonl"
 # An excursion line is WINDOW_M (60 m) long. With --weave-guard the move ends
 # this far before the line runs out, instead of driving past its end.
@@ -1741,6 +1754,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         return 2
     widen_socket_timeout(bng, 120.0)
     writer = None
+    jct = None
     ticks = TickLog(None)
     try:
         skipped_levels: list[str] = []
@@ -1811,6 +1825,10 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             spawn_seq += 1
         writer = RawWriteQueue(RawFrameWriter(out, camera_sidecar(cam_cfg)))
         ticks = TickLog(out / TICKS_FILE, 0.1)
+        if not args.no_jct:
+            jct = JctSidecar(out / JCT_FILE, JUNCTIONS_DIR, log=lambda text: print(text, flush=True))
+            if not map_names:
+                jct.prepare(None)  # single level: rows carry no map name, so no labels
         from python.data.strip_writer import STRIP_ORDER
         from python.debug.remote_status import CollectMeter, status_dir, write_collect_status
 
@@ -2533,6 +2551,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 loaded_map = map_name
                 loaded_index = seg_index
                 cut_at_load = schedule_cut
+                if jct is not None:
+                    jct.flush()
+                    jct.prepare(map_name)
                 last_ai = None
                 held_tag = None
                 clock = ExcursionClock()
@@ -3200,6 +3221,11 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     rig_warned.add(model_now)
                     print(f"collect WARNING camera rig calibrated on {camera_rig}, ego model is {model_now}: "
                           "config/cameras.yaml mounts are unproven on this car", flush=True)
+            jct_mark = time.monotonic()
+            jct_line = None if jct is None else jct.step(
+                {"t": round(float(now), 6), "map": tags.get("map"), "ego": {"pos": pos, "dir": direction}}
+            )
+            ticks.add("jct_s", time.monotonic() - jct_mark)
             row_i = None if row_base is None else int(row_base) + int(getattr(writer, "enqueued", 0) or 0)
             q_before = writer.stats()
             submit_mark = time.monotonic()
@@ -3241,6 +3267,11 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 tags=tags,
             )
             ticks.add("submit_s", time.monotonic() - submit_mark)
+            if jct is not None:
+                if queued:
+                    jct.commit(jct_line)
+                else:
+                    jct.undo()
             ticks.note(
                 row=bool(queued),
                 cams=len(due),
@@ -3474,6 +3505,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
     finally:
         if writer is not None:
             writer.close()
+        if jct is not None:
+            jct.close()
         ticks.close()
         release_tech_beamngpy(bng)
 

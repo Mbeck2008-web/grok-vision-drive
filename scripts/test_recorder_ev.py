@@ -552,7 +552,9 @@ def check_segment_hold_carries_over() -> None:
     switch due at 60 s is held 30 s (cap: 300 busy ticks, the 301st releases). italy#1 starts at
     90 s from its own start, not with 10 s left of its slot (3.1 s in the italy probe). The 30 s
     is then repaid over the last 110 s, so every later chunk runs 110/140 of its slot (about
-    15.7, 47.1 and 47.1 s): the tail no longer pays it all (west#3 was 29.9 s of 60)."""
+    15.7, 47.1 and 47.1 s): the tail no longer pays it all (west#3 was 29.9 s of 60). This holds
+    because the hold is EARLY (110 s of the run left to spread over); a late hold is pinned by
+    check_segment_hold_final_slot (tail >= slot - 30 s)."""
     flags = ["--maps", "west_coast_usa,italy", "--map-weights", "west_coast_usa=0.9", "--segment-min", "1",
              "--minutes", str(200.0 / 60.0)]
     code, text, out = _west(lambda n: "lane_change" if n <= 301 else "", flags, 2100)
@@ -564,7 +566,7 @@ def check_segment_hold_carries_over() -> None:
     share = 110.0 / 140.0
     for seg, slot in (("italy#1", 20.0), ("west_coast_usa#2", 60.0), ("west_coast_usa#3", 60.0)):
         assert abs(lengths[seg] - share * slot) <= 0.5, (seg, lengths)
-    # The tail chunk keeps at least 3/4 of its slot.
+    # With this early hold the tail keeps at least 3/4 of its slot (not true of a late hold).
     assert lengths["west_coast_usa#3"] >= 45.0, lengths
     holds = [ln for ln in text.splitlines() if ln.startswith("collect boundary_defer segment:")]
     assert holds == ["collect boundary_defer segment:lane_change 0.0", "collect boundary_defer segment:cap 30.0"], holds
@@ -573,10 +575,36 @@ def check_segment_hold_carries_over() -> None:
     print(f"segment hold: carried 30 s, repaid over the rest; chunk lengths {lengths} OK")
 
 
+def check_segment_hold_final_slot() -> None:
+    """A hold at the last boundary has no rest of the run to spread over, so the tail pays it.
+
+    Same 200 s plan; the switches at 60 and 80 s go at once and the one into the last chunk is
+    held the full 30 s (cap). The carry is then owed over the 30 s left, a repay rate of 1, so
+    west#3 runs 30 of its 60 s. That is the floor: a chunk loses at most the 30 s cap per hold,
+    so the tail keeps at least its slot - 30 s."""
+    flags = ["--maps", "west_coast_usa,italy", "--map-weights", "west_coast_usa=0.9", "--segment-min", "1",
+             "--minutes", str(200.0 / 60.0)]
+    code, text, out = _west(lambda n: "lane_change" if n >= 3 else "", flags, 2100)
+    assert code == 0, text[-2000:]
+    rows = _rows(out)
+    order = _segments_in_order(rows)
+    assert order == ["west_coast_usa#0", "italy#1", "west_coast_usa#2", "west_coast_usa#3"], order
+    lengths = {seg: round(b - a + 0.1, 1) for seg, (a, b) in _seg_spans(rows).items()}
+    assert lengths["west_coast_usa#3"] >= 60.0 - 30.0 - 0.2, lengths  # tail >= slot - 30 s (the cap)
+    assert lengths["west_coast_usa#2"] >= 89.7, lengths  # held 30 s past its 60 s slot
+    holds = [ln for ln in text.splitlines() if ln.startswith("collect boundary_defer segment:")]
+    assert holds == ["collect boundary_defer segment:lane_change 0.0", "collect boundary_defer segment:cap 30.0"], holds
+    carry = json.loads((out / "collect.json").read_text(encoding="utf-8"))["segment_carry"]
+    assert carry["carried_s"] == 30.0 and carry["owed_s"] <= 0.2, carry
+    print(f"segment hold at the last boundary: tail {lengths['west_coast_usa#3']:.1f} s of 60 (>= slot - 30 s) OK")
+
+
 def check_segment_carry_always_busy() -> None:
     """Worst case: every switch hits the 30 s cap (always in a lane change), 6 min of 1 min chunks.
-    120 s is carried in total and repaid by the end; no chunk, the tail included, drops under
-    3/4 of its 60 s slot. collect.json records the carried seconds."""
+    120 s is carried in total and repaid by the end. Each hold here still has at least 2 chunks
+    of run left to spread over, so no chunk, the tail included, drops under 3/4 of its 60 s
+    slot; a hold at the last boundary only keeps slot - 30 s (check_segment_hold_final_slot).
+    collect.json records the carried seconds."""
     flags = ["--maps", "west_coast_usa,italy", "--segment-min", "1", "--minutes", "6"]
     code, text, out = _west(lambda n: "lane_change", flags, 3700)
     assert code == 0, text[-2000:]
@@ -609,6 +637,7 @@ def main() -> None:
     check_segment_cap_run()
     check_segment_hold_one_step()
     check_segment_hold_carries_over()
+    check_segment_hold_final_slot()
     check_segment_carry_always_busy()
     print("recorder ev ok")
 

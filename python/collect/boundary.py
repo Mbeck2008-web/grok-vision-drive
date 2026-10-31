@@ -11,8 +11,15 @@ A held segment switch carries its wait over: the collector moves the
 schedule back by ``waited_s``, so the next chunk starts where the switch
 first fell due (a 30 s hold no longer leaves a 20 s chunk only its settle
 window). ``CarryOver`` then owes that time back evenly over the rest of the
-run, so the carried seconds do not pile up and all come out of the last
-chunk: every later chunk runs ``rest / (rest + owed)`` of its slot instead.
+run (until the run total), so the carried seconds do not pile up and all come
+out of the last chunk: every later chunk runs ``rest / (rest + owed)`` of its
+slot instead. That keeps chunks near their slot only for EARLY holds, with a
+long rest to spread over. A late hold has little rest left, so the repay rate
+can reach or pass 1 and the next chunk(s) pay most of it: a 30 s hold at the
+last boundary of a 200 s run leaves the tail 30 of 60 s, and a 115 s run held
+at 60 s leaves italy#1 5.3 of 20 s. The floor is the cap: a chunk loses at
+most ``BOUNDARY_DEFER_CAP_S`` (30 s) per hold, so the tail keeps at least its
+slot - 30 s per hold it pays for.
 
 Forced boundaries (aborts, stalls, impacts, a cut schedule) are not held.
 Logs: ``collect boundary_defer <kind>:<phase> 0.0`` when the hold starts,

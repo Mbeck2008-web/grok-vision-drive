@@ -211,7 +211,7 @@ def build_net(meta: Mapping[str, Any]) -> Any:
     """A CPU net of the checkpoint's architecture (cams, scale, backbone, cam_age).
 
     A checkpoint written before ``cam_age`` existed has no key: no ages.
-    The same holds for ``ctl``: no key, no ctl head.
+    The same holds for ``ctl``: no key, no ctl head; and ``ctl_cond_dim``: no key, no cond input.
     """
     cams = tuple(meta.get("cams") or ()) or None
     scale = float(meta.get("scale") or 1.0)
@@ -219,7 +219,8 @@ def build_net(meta: Mapping[str, Any]) -> Any:
     if backbone in ("", "scratch"):
         from python.train.scene_net import SceneNet
 
-        return SceneNet(cams=cams, scale=scale, cam_age=bool(meta.get("cam_age")), ctl=bool(meta.get("ctl")))
+        return SceneNet(cams=cams, scale=scale, cam_age=bool(meta.get("cam_age")), ctl=bool(meta.get("ctl")),
+                        cond_dim=int(meta.get("ctl_cond_dim") or 0))
     if meta.get("cam_age") or meta.get("ctl"):
         raise ValueError("a --cam-age or ctl checkpoint is a scratch-net checkpoint; this one names a backbone")
     from python.train.pretrained_net import build_scene_net

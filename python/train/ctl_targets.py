@@ -41,6 +41,13 @@ WARMUP_GAP_S = 1.0
 PBRAKE_ON = 0.5
 
 GRADED = (0, 3, 4, 5)
+# Rev 5 (B' series on): h0 is report-only; only h3-h5 are graded.
+GRADED_REV5 = (3, 4, 5)
+REV4 = "rev4"
+REV5 = "rev5"
+BARS = (REV4, REV5)
+# Rev 5 bars on ref = min(B3, B1 median): (steer, throttle) multipliers per graded horizon.
+REV5_BARS = {3: (0.85, 0.85), 4: (0.95, 0.85), 5: (0.95, 0.85)}
 B4_GRADED = (3, 4, 5)
 MIN_N = 300
 MIN_BRAKE_EVENTS = 30
@@ -52,6 +59,14 @@ GATED_SLICES = (("city", "city"), ("highway", "hwy"), ("ramp", "ramp"))
 REPORT_SLICES = ("bridge",)
 
 REASONS = ("null", "range", "reverse", "pbrake")
+
+# B'1 cond input: the controls of the t-dt row (the previous full-recording row), never row t.
+COND_FIELDS = ("speed", "steer_ai", "throttle_ai", "brake_ai", "yaw_rate")
+COND_DIM = len(COND_FIELDS)
+COND_SPEED_NORM_MPS = 30.0
+COND_MAX_DT_S = 0.25
+COND_FIELDS_TEXT = "speed_mps/30,steer_ai,throttle_ai,brake_ai,yaw_rate"
+COND_SOURCE = "t-dt"
 
 
 class CtlDataError(RuntimeError):
@@ -99,6 +114,62 @@ def row_controls(row: Mapping[str, Any]) -> tuple[np.ndarray | None, str | None]
     if _pbrake(row):
         return None, "pbrake"
     return np.asarray(values, dtype=np.float32), None
+
+
+def cond_from_row(prev: Mapping[str, Any]) -> np.ndarray | None:
+    """The cond vector a row gives to the NEXT row: (speed_mps / 30, steer_ai, throttle_ai, brake_ai, yaw_rate).
+
+    ``yaw_rate`` is ``ego.yaw_rate`` as recorded (rad/s, CCW positive); ``imu.yaw_rate`` is never
+    read. None when any field is missing, non-finite, or out of range (steer [-1, 1], pedals [0, 1],
+    speed >= 0).
+    """
+    speed = _num(_get(prev, "ego", "speed_mps"))
+    yaw = _num(_get(prev, "ego", "yaw_rate"))
+    controls = [_num(_get(prev, group, key)) for group, key in _PATHS]
+    if speed is None or yaw is None or speed < 0.0 or any(value is None for value in controls):
+        return None
+    if any(not (lo <= value <= hi) for value, (lo, hi) in zip(controls, CTL_RANGES)):
+        return None
+    return np.asarray([speed / COND_SPEED_NORM_MPS, *controls, yaw], dtype=np.float32)
+
+
+def build_cond(
+    full_rows: list[Mapping[str, Any]], kept_rows: list[Mapping[str, Any]]
+) -> dict[int, tuple[np.ndarray, float]]:
+    """Row id -> (cond (5,), ok) for every kept row.
+
+    The source is the previous row of the FULL recording (t-dt), in the same segment, with
+    0 < sim_t step <= 0.25 s. Row t's own controls (its h=0 label) are never read. No usable
+    t-dt row (segment start or change, a longer step, a bad field): zeros and ok 0.
+    """
+    pos = {}
+    for k, row in enumerate(full_rows):
+        rid = _row_id(row)
+        if rid is not None:
+            pos[rid] = k
+    out: dict[int, tuple[np.ndarray, float]] = {}
+    for row in kept_rows:
+        rid = _row_id(row)
+        if rid is None:
+            continue
+        k = pos.get(rid)
+        vec = None
+        if k is not None and k > 0:
+            cur = full_rows[k]
+            prev = full_rows[k - 1]
+            st, pst = row_sim_t(cur), row_sim_t(prev)
+            if (prev.get("segment") == cur.get("segment") and st is not None and pst is not None
+                    and 0.0 < st - pst <= COND_MAX_DT_S + 1e-9):
+                vec = cond_from_row(prev)
+        if vec is None:
+            out[rid] = (np.zeros(COND_DIM, dtype=np.float32), 0.0)
+        else:
+            out[rid] = (vec, 1.0)
+    return out
+
+
+def cond_line() -> str:
+    return f"[GVD] ctl cond: dim={COND_DIM} fields={COND_FIELDS_TEXT} source={COND_SOURCE}"
 
 
 def lag_stats(rows: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
@@ -312,13 +383,29 @@ def attach_ctl(
     *,
     plan: Iterable[Mapping[str, Any]] | None = None,
     impacts: Iterable[Mapping[str, Any]] = (),
+    cond: bool = False,
 ) -> dict[str, Any]:
-    """Write ``ctl`` and ``ctl_valid`` on every kept row (in place); return the counts."""
+    """Write ``ctl`` and ``ctl_valid`` on every kept row (in place); return the counts.
+
+    ``cond=True`` (B'1) also writes ``ctl_cond`` (5,) and ``ctl_cond_ok`` from :func:`build_cond`.
+    A row with no usable t-dt row gets zeros, ``ctl_cond_ok`` 0 and an all-zero ``ctl_valid``
+    (no ctl loss or score); it is counted as ``nocond``. Off: nothing changes.
+    """
     targets, counts = build_ctl(full_rows, kept_rows, plan=plan, impacts=impacts)
+    conds = build_cond(full_rows, kept_rows) if cond else {}
+    if cond:
+        counts["nocond"] = 0
     for row in kept_rows:
         rid = _row_id(row)
         if rid is not None and rid in targets:
             row["ctl"], row["ctl_valid"] = targets[rid]
+        if cond and rid is not None and rid in conds:
+            vec, ok = conds[rid]
+            row["ctl_cond"], row["ctl_cond_ok"] = vec, ok
+            if ok < 0.5:
+                counts["nocond"] += 1
+                if "ctl_valid" in row:
+                    row["ctl_valid"] = np.zeros_like(np.asarray(row["ctl_valid"], dtype=np.float32))
     return counts
 
 
@@ -332,6 +419,9 @@ def mask_line(counts: Mapping[str, Any]) -> str:
     if int(counts.get("events", 0) or 0):
         # Only without --mask-events: event rows are kept but carry no ctl target.
         text += f" events={int(counts['events'])}"
+    if "nocond" in counts:
+        # Only with --ctl-cond: rows with no t-dt row carry no ctl target.
+        text += f" nocond={int(counts['nocond'])}"
     return text
 
 
@@ -461,8 +551,34 @@ def _metrics(y: np.ndarray, p: np.ndarray, b3: np.ndarray, b4: np.ndarray, b2y: 
     return out
 
 
-def slice_verdict(m: Mapping[str, Any], h: int) -> str:
-    """PASS / FAIL / UNPROVEN for one slice at one horizon. n < 300 is UNPROVEN, never PASS."""
+def _ref(m: Mapping[str, Any], name: str) -> float | None:
+    vals = [m.get(f"b3_{name}"), m.get(f"b1med_{name}")]
+    vals = [float(v) for v in vals if v is not None]
+    return min(vals) if vals else None
+
+
+def _slice_rev5(m: Mapping[str, Any], h: int) -> str:
+    """Rev 5: ref = min(B3, B1 med); B4 and h0 report-only; brake graded only at >= 30 events."""
+    if h not in REV5_BARS:
+        return "REPORT"
+    if int(m.get("n") or 0) < MIN_N:
+        return "UNPROVEN"
+    k_steer, k_thr = REV5_BARS[h]
+    fail = m["steer_mae"] > k_steer * _ref(m, "steer") or m["thr_mae"] > k_thr * _ref(m, "thr")
+    if int(m.get("brk_events") or 0) >= MIN_BRAKE_EVENTS:
+        fail = fail or m["brk_f1"] < 0.5 or not (m["brk_mae"] < m["b1med_brk"])
+    return "FAIL" if fail else "PASS"
+
+
+def slice_verdict(m: Mapping[str, Any], h: int, *, bar: str = REV4) -> str:
+    """PASS / FAIL / UNPROVEN for one slice at one horizon. n < 300 is UNPROVEN, never PASS.
+
+    ``bar`` "rev4" (default; reproduces runs before B') or "rev5" (B' series; "REPORT" off h3-h5).
+    """
+    if bar == REV5:
+        return _slice_rev5(m, h)
+    if bar != REV4:
+        raise ValueError(f"unknown ctl bar {bar!r}")
     if int(m.get("n") or 0) < MIN_N:
         return "UNPROVEN"
     fail = m["steer_mae"] > 0.85 * m["b1med_steer"] or m["thr_mae"] > 0.85 * m["b1med_thr"]
@@ -485,13 +601,13 @@ def horizon_verdict(verdicts: Iterable[str]) -> str:
     return "PASS" if seen and all(v == "PASS" for v in seen) else "UNPROVEN"
 
 
-def run_verdict(by_h: Mapping[int, str], lane: str) -> str:
+def run_verdict(by_h: Mapping[int, str], lane: str, *, bar: str = REV4) -> str:
     """FAIL if any graded horizon or the lane bar fails.
 
-    PASS only if all four graded horizons pass AND the lane bar passes; an
-    unproven lane bar (no usable run-A data) caps the run at UNPROVEN.
+    PASS only if all graded horizons (Rev 4: h0, h3-h5; Rev 5: h3-h5) pass AND the lane bar
+    passes; an unproven lane bar (no usable run-A data) caps the run at UNPROVEN.
     """
-    graded = [by_h.get(h, "UNPROVEN") for h in GRADED]
+    graded = [by_h.get(h, "UNPROVEN") for h in (GRADED_REV5 if bar == REV5 else GRADED)]
     if "FAIL" in graded or lane == "FAIL":
         return "FAIL"
     return "PASS" if all(v == "PASS" for v in graded) and lane == "PASS" else "UNPROVEN"
@@ -594,8 +710,12 @@ def score_ctl(
     *,
     lock_deg: float | None = None,
     lane: str = "UNPROVEN",
+    bar: str = REV4,
 ) -> dict[str, Any]:
     """Per-horizon scores on ``records`` = ``[(row, pred (3, K)), ...]`` in eval order.
+
+    ``bar``: "rev4" (default) or "rev5" (B' series). Rev 5 adds ``ref_steer`` / ``ref_thr`` /
+    ``brk_graded`` and marks h0-h2 "REPORT".
 
     The model and every baseline use the same valid (row, h) set; B2 (report
     only) skips a row without a previous row within 0.25 s.
@@ -605,7 +725,18 @@ def score_ctl(
     rows = [row for row, _pred in records]
     preds = [np.asarray(pred, dtype=np.float64).reshape(3, K) for _row, pred in records]
     prev = b2_pairs(rows)
+    if bar not in BARS:
+        raise ValueError(f"unknown ctl bar {bar!r}")
     out: dict[str, Any] = {"h": {}, "lane": lane}
+    if bar == REV5:
+        out["bar"] = REV5
+
+    def extra(m: dict[str, Any]) -> dict[str, Any]:
+        if bar == REV5:
+            m["ref_steer"], m["ref_thr"] = _ref(m, "steer"), _ref(m, "thr")
+            m["brk_graded"] = int(int(m.get("brk_events") or 0) >= MIN_BRAKE_EVENTS)
+        return m
+
     for h in CTL_HORIZONS_S:
         picked = [k for k, row in enumerate(rows)
                   if "ctl_valid" in row and bool(np.all(np.asarray(row["ctl_valid"])[:, h] > 0.5))]
@@ -624,21 +755,21 @@ def score_ctl(
                 b2p.append(np.asarray(rows[j]["ctl"], dtype=np.float64)[:, h])
             return y, p, b3, b4, np.asarray(b2y).reshape(-1, 3), np.asarray(b2p).reshape(-1, 3)
 
-        overall = _metrics(*arrays(picked), b1, h, lock_deg)
-        overall["verdict_all"] = slice_verdict(overall, h)
+        overall = extra(_metrics(*arrays(picked), b1, h, lock_deg))
+        overall["verdict_all"] = slice_verdict(overall, h, bar=bar)
         slices: dict[str, Any] = {}
         verdicts = [overall["verdict_all"]]
         for spawn, key in GATED_SLICES + tuple((name, name) for name in REPORT_SLICES):
             sel = [k for k in picked if rows[k].get("spawn_type") == spawn]
-            m = _metrics(*arrays(sel), b1, h, lock_deg)
-            m["verdict"] = slice_verdict(m, h)
+            m = extra(_metrics(*arrays(sel), b1, h, lock_deg))
+            m["verdict"] = slice_verdict(m, h, bar=bar)
             slices[key] = m
             if spawn not in REPORT_SLICES:
                 verdicts.append(m["verdict"])
         overall["slices"] = slices
-        overall["verdict"] = horizon_verdict(verdicts)
+        overall["verdict"] = "REPORT" if bar == REV5 and h not in GRADED_REV5 else horizon_verdict(verdicts)
         out["h"][h] = overall
-    out["run"] = run_verdict({h: out["h"][h]["verdict"] for h in GRADED}, lane)
+    out["run"] = run_verdict({h: out["h"][h]["verdict"] for h in CTL_HORIZONS_S}, lane, bar=bar)
     return out
 
 
@@ -651,10 +782,13 @@ def _fmt(value: Any) -> str:
 
 
 def val_lines(result: Mapping[str, Any]) -> list[str]:
+    rev5 = result.get("bar") == REV5
     lines = []
     for h in CTL_HORIZONS_S:
         m = result["h"][h] if h in result["h"] else result["h"][str(h)]
         sl = m["slices"]
+        ref = (f"ref_steer={_fmt(m.get('ref_steer'))} ref_thr={_fmt(m.get('ref_thr'))} "
+               f"brk_events={int(m.get('brk_events') or 0)} brk_graded={int(m.get('brk_graded') or 0)} ") if rev5 else ""
         lines.append(
             f"[GVD] val ctl h={h} n={int(m['n'])} steer_mae={_fmt(m['steer_mae'])} steer_r={_fmt(m['steer_r'])} "
             f"thr_mae={_fmt(m['thr_mae'])} brk_mae={_fmt(m['brk_mae'])} brk_f1={_fmt(m['brk_f1'])} "
@@ -663,11 +797,13 @@ def val_lines(result: Mapping[str, Any]) -> list[str]:
             f"b3_brk_f1={_fmt(m['b3_brk_f1'])} b4_steer={_fmt(m['b4_steer'])} b4_thr={_fmt(m['b4_thr'])} "
             f"b4_brk_f1={_fmt(m['b4_brk_f1'])} city_steer={_fmt(sl['city']['steer_mae'])} "
             f"hwy_steer={_fmt(sl['hwy']['steer_mae'])} ramp_steer={_fmt(sl['ramp']['steer_mae'])} "
-            f"verdict={m['verdict']}"
+            f"{ref}verdict={m['verdict']}"
         )
     hv = {h: (result["h"][h] if h in result["h"] else result["h"][str(h)])["verdict"] for h in GRADED}
+    tag = f" bar={REV5}" if rev5 else ""
     lines.append(
-        f"[GVD] val ctl run verdict={result['run']} h0={hv[0]} h3={hv[3]} h4={hv[4]} h5={hv[5]} lane={result['lane']}"
+        f"[GVD] val ctl run verdict={result['run']}{tag} h0={hv[0]} h3={hv[3]} h4={hv[4]} h5={hv[5]} "
+        f"lane={result['lane']}"
     )
     return lines
 

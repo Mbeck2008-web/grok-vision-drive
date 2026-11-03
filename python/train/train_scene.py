@@ -322,6 +322,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Scale on the ctl loss (default 1.0). Only with --heads lane_gt,ctl; must be > 0.",
     )
     parser.add_argument(
+        "--ctl-cond",
+        action="store_true",
+        help=(
+            "B'1: feed the ctl head 5 floats from the t-dt row (speed_mps/30, steer_ai, throttle_ai, "
+            "brake_ai, ego.yaw_rate), never row t's own label. Rows with no t-dt row get no ctl target. "
+            "Scored on the Rev 5 bar. Off by default. Only with --heads lane_gt,ctl."
+        ),
+    )
+    parser.add_argument(
         "--init-head-bias",
         action="store_true",
         help=(
@@ -930,13 +939,22 @@ def row_ages(row: Mapping[str, Any] | None) -> np.ndarray:
 
 
 def _forward(net: Any, image: Any, dt: Any, state: SceneState, rows: list[Mapping[str, Any] | None]) -> Any:
-    """``net.forward_batch``, with the rows' ages when the net takes them."""
-    if not bool(getattr(net, "cam_age", False)):
-        return net.forward_batch(image, dt, state)
+    """``net.forward_batch``, with the rows' ages and ctl cond when the net takes them."""
     import torch
 
-    ages = torch.from_numpy(np.stack([row_ages(row) for row in rows])).to(image.device)
-    return net.forward_batch(image, dt, state, ages)
+    ages = None
+    if bool(getattr(net, "cam_age", False)):
+        ages = torch.from_numpy(np.stack([row_ages(row) for row in rows])).to(image.device)
+    cond_dim = int(getattr(net, "cond_dim", 0) or 0)
+    if not cond_dim:
+        if ages is None:
+            return net.forward_batch(image, dt, state)
+        return net.forward_batch(image, dt, state, ages)
+    # --ctl-cond: the t-dt controls attach_ctl wrote (ctl_targets.build_cond). A padded slot or a
+    # row without them gets zeros; such a row has an all-zero ctl_valid, so no ctl loss.
+    zero = np.zeros(cond_dim, dtype=np.float32)
+    cond = np.stack([np.asarray(row.get("ctl_cond", zero), dtype=np.float32) if row else zero for row in rows])
+    return net.forward_batch(image, dt, state, ages, torch.from_numpy(cond).to(image.device))
 
 
 def _frame_row(
@@ -1808,6 +1826,7 @@ def train_directory(
     pause_dir: Path | None = None,
     ctl_weight: float = 1.0,
     exact_epochs: int | None = None,
+    ctl_cond: bool = False,
 ) -> dict[str, Any]:
     import torch
 
@@ -1825,6 +1844,12 @@ def train_directory(
     use_ctl = bool(train_heads) and "ctl" in train_heads
     if use_ctl and backbone not in ("", "scratch"):
         raise SystemExit("ctl is wired into the scratch net only (--backbone scratch)")
+    if ctl_cond and not use_ctl:
+        raise SystemExit("--ctl-cond needs --heads lane_gt,ctl")
+    from python.train.ctl_targets import COND_DIM, REV4, REV5
+
+    ctl_cond_dim = COND_DIM if ctl_cond else 0
+    ctl_bar = REV5 if ctl_cond else REV4
     if grad_ckpt and backbone not in ("", "scratch"):
         raise SystemExit("--grad-ckpt checkpoints the scratch net's per-tick encoder; it is not wired into --backbone imagenet-*")
     if use_cam_age and backbone not in ("", "scratch"):
@@ -1961,8 +1986,12 @@ def train_directory(
         if not lag["ok"]:
             raise CtlDataError("ctl lag gate failed (median_ms <= 50 and p99_ms < 100 at shift 0 are required)")
         # Labels from the full recording, inputs from the kept rows; per piece of the plan.
-        ctl_counts = attach_ctl(state_rows, rows, plan=startup_plan, impacts=read_impacts(root))
+        ctl_counts = attach_ctl(state_rows, rows, plan=startup_plan, impacts=read_impacts(root), cond=bool(ctl_cond))
         print(mask_line(ctl_counts), flush=True)
+        if ctl_cond:
+            from python.train.ctl_targets import cond_line
+
+            print(cond_line(), flush=True)
         ctl_lock = ctl_counts.get("lock_deg")
         train_ids = {i for i, label in plan_labels(startup_plan).items() if label == "train"}
         # b1_constants keeps only loss_mask rows, as the training loss does.
@@ -2040,7 +2069,9 @@ def train_directory(
         device = torch.device(device_name)
         if "net" not in holder:
             if backbone in ("", "scratch"):
-                holder["net"] = SceneNet(cams=train_cams, scale=input_scale, cam_age=use_cam_age, ctl=use_ctl).to(device)
+                holder["net"] = SceneNet(
+                    cams=train_cams, scale=input_scale, cam_age=use_cam_age, ctl=use_ctl, cond_dim=ctl_cond_dim
+                ).to(device)
                 if grad_ckpt:
                     holder["net"].grad_ckpt = True
                     print(
@@ -2278,6 +2309,7 @@ def train_directory(
             "cams": list(train_cams or ()),
             "cam_age": bool(use_cam_age),
             "ctl": bool(use_ctl),
+            **({"ctl_cond_dim": int(ctl_cond_dim)} if ctl_cond_dim else {}),
             "heads": list(train_heads or ()),
             "scale": float(input_scale),
             "backbone": str(backbone),
@@ -2685,7 +2717,7 @@ def train_directory(
                     # No paired lane_gt-only run inside one run: the lane bar is UNPROVEN here, so this
                     # in-run verdict is at best UNPROVEN. The lane bar is scored offline:
                     # eval_onnx_holdout.py --lane-ref <run A eval JSON>.
-                    ctl_scored = score_ctl(val_ctl, ctl_b1, lock_deg=ctl_lock)
+                    ctl_scored = score_ctl(val_ctl, ctl_b1, lock_deg=ctl_lock, bar=ctl_bar)
                     record["ctl"] = ctl_record(ctl_scored)
                     ctl_lines = val_lines(ctl_scored)
                 ckpt_info = _write_epoch_ckpt(scored)
@@ -2955,6 +2987,8 @@ def ctl_refusal(args: argparse.Namespace, heads: tuple[str, ...]) -> str | None:
     on = "ctl" in heads
     if on and "lane_gt" not in heads:
         return "ctl needs lane_gt (--heads lane_gt,ctl)"
+    if bool(getattr(args, "ctl_cond", False)) and not on:
+        return "--ctl-cond needs --heads lane_gt,ctl"
     if args.ctl_weight is not None:
         if not on:
             return "--ctl-weight needs --heads lane_gt,ctl"
@@ -3107,6 +3141,7 @@ def main(argv: list[str] | None = None) -> None:
                 seed=int(args.seed),
                 conf_weight=float(args.conf_weight),
                 ctl_weight=1.0 if args.ctl_weight is None else float(args.ctl_weight),
+                ctl_cond=bool(args.ctl_cond),
                 init_head_bias=bool(args.init_head_bias),
                 eval_chunk=int(args.eval_chunk),
                 backbone=str(args.backbone),

@@ -228,6 +228,7 @@ def metadata_dict(
     height: int,
     width: int,
     cam_age: bool = False,
+    cond_dim: int = 0,
 ) -> dict[str, str]:
     """String metadata stored on the ONNX model.
 
@@ -274,6 +275,13 @@ def metadata_dict(
         props["gvd_ctl_horizons_s"] = ",".join(str(h) for h in CTL_HORIZONS_S)
         props["gvd_ctl_time_base"] = "sim_t"
         props["gvd_ctl_units"] = "norm_-1_1,0_1,0_1"
+        if int(cond_dim):
+            # B'1: the graph takes ``cond`` (1 x cond_dim), the t-dt row's controls.
+            from python.train.ctl_targets import COND_FIELDS_TEXT, COND_SOURCE
+
+            props["gvd_ctl_cond"] = str(int(cond_dim))
+            props["gvd_ctl_cond_fields"] = COND_FIELDS_TEXT
+            props["gvd_ctl_cond_source"] = COND_SOURCE
     return props
 
 

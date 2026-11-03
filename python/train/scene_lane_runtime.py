@@ -219,6 +219,17 @@ class SceneLaneRuntime:
             self.session = None
             self.reason = str(exc)
             return
+        # B'1 ctl cond models are offline only: the live loop does not feed the t-dt controls,
+        # and a zero cond would be a different model. Refused, never run. No trained model
+        # engages live until reset detection is proven.
+        cond_inputs = [name for name in self._input_names if _base_name(name) == "cond"]
+        if cond_inputs or meta.get("gvd_ctl_cond"):
+            self.session = None
+            self.reason = (
+                "ctl cond model (gvd_ctl_cond) needs the t-dt controls; the live runtime does not feed them. "
+                "Offline eval only; no trained model engages live until reset detection is proven"
+            )
+            return
         self.untrained = untrained_outputs(meta)
         self.cams = cams_from_metadata(meta)
         try:

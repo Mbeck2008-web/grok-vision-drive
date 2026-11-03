@@ -1394,7 +1394,7 @@ if torch is not None:
             if self.cam_age:
                 self.pause_arch = checkpoint_arch(self.cams) + f":cam_age={CAM_AGE_N}"
             # ctl: Linear(512 + cond_dim, 3 * K) on the fused feature, viewed (B, 3, K).
-            # cond_dim is reserved (zeros until a conditioning input exists).
+            # cond_dim > 0 (B'1, --ctl-cond): the t-dt row's controls, see ctl_targets.build_cond.
             self.ctl = bool(ctl)
             self.cond_dim = int(cond_dim) if self.ctl else 0
             if self.ctl:
@@ -1426,28 +1426,30 @@ if torch is not None:
             )
 
         def forward(
-            self, strip: Any, dt: Any, state: SceneState, ages: Any = None
+            self, strip: Any, dt: Any, state: SceneState, ages: Any = None, cond: Any = None
         ) -> tuple[ScenePrediction, SceneState]:
             """One strip, seconds since the previous strip, and the GRU state.
 
             Planner tensors have no batch dimension. A training batch uses
             ``forward_batch`` and keeps the leading dimension. A ``cam_age``
-            net needs ``ages`` (8 floats, ``cam_hold.CAM_AGE_ORDER``).
+            net needs ``ages`` (8 floats, ``cam_hold.CAM_AGE_ORDER``). A
+            ``cond_dim`` net needs ``cond`` (``ctl_targets.COND_FIELDS``).
             """
             image = _strip_nchw(strip, width=self.canvas_w, height=self.canvas_h)
-            pred, new_state = self._forward_batched(image, dt, state, ages)
+            pred, new_state = self._forward_batched(image, dt, state, ages, cond)
             return _prediction_at(pred, 0), new_state
 
         def forward_batch(
-            self, strip: Any, dt: Any, state: SceneState, ages: Any = None
+            self, strip: Any, dt: Any, state: SceneState, ages: Any = None, cond: Any = None
         ) -> tuple[ScenePrediction, SceneState]:
             """Several strips in one step. Outputs keep the batch dimension."""
             image = _strip_nchw(strip, allow_batch=True, width=self.canvas_w, height=self.canvas_h)
-            return self._forward_batched(image, dt, state, ages)
+            return self._forward_batched(image, dt, state, ages, cond)
 
         def _forward_batched(
-            self, image: Any, dt: Any, state: SceneState, ages: Any = None
+            self, image: Any, dt: Any, state: SceneState, ages: Any = None, cond: Any = None
         ) -> tuple[ScenePrediction, SceneState]:
+            cond = _cond_rows(self, cond, image)
             state = _state_on(state, image)
             token = self._encode(image)
             if self.cam_age:
@@ -1471,7 +1473,7 @@ if torch is not None:
             if self.skip is not None:
                 residual = self.skip(residual)
             feat = gru_out[:, 0, :] + residual
-            return _heads_batch(self, feat), SceneState(h=h_new, tokens=new_tokens, mask=new_mask)
+            return _heads_batch(self, feat, cond), SceneState(h=h_new, tokens=new_tokens, mask=new_mask)
 
         def _encode(self, image: Any) -> Any:
             """``_token``, under ``torch.utils.checkpoint`` when ``grad_ckpt`` is on and gradients flow.
@@ -1501,7 +1503,24 @@ if torch is not None:
         conf = torch.sigmoid(raw[:, -1:])
         return torch.cat([raw[:, :-1], conf], dim=-1)
 
-    def _heads_batch(net: SceneNet, feat: Any) -> ScenePrediction:
+    def _cond_rows(net: SceneNet, cond: Any, image: Any) -> Any:
+        """``(B, cond_dim)`` on the image's device, or None for a net without cond. Missing cond is an error."""
+        dim = int(getattr(net, "cond_dim", 0) or 0)
+        if not dim:
+            if cond is not None:
+                raise ValueError("this scene net has no ctl cond input; cond was given")
+            return None
+        if cond is None:
+            raise ValueError(f"this scene net was trained with --ctl-cond and needs cond ({dim} floats from t-dt)")
+        width = int(image.shape[0])
+        if not torch.is_tensor(cond):
+            cond = torch.as_tensor(np.asarray(cond, dtype=np.float32))
+        cond = cond.to(device=image.device, dtype=image.dtype).reshape(-1, dim)
+        if int(cond.shape[0]) != width:
+            raise ValueError(f"cond batch {int(cond.shape[0])} does not match strips {width}")
+        return cond
+
+    def _heads_batch(net: SceneNet, feat: Any, cond: Any = None) -> ScenePrediction:
         width = int(feat.shape[0])
         return ScenePrediction(
             lanes=net.lane_head(feat).view(width, N_LANES, LANE_POINTS, 2),
@@ -1516,16 +1535,19 @@ if torch is not None:
             sign_state=net.sign_state_head(feat).view(width, N_SIGNS, len(LAMP_STATES)),
             sign_valid=torch.sigmoid(net.sign_valid_head(feat)).view(width, N_SIGNS),
             lane_gt=_lane_gt_output(net, feat),
-            **_ctl_outputs(net, feat),
+            **_ctl_outputs(net, feat, cond),
         )
 
-    def _ctl_outputs(net: SceneNet, feat: Any) -> dict[str, Any]:
-        """tanh steer, sigmoid throttle and brake, each ``(B, K)``. Empty for a net without the head."""
+    def _ctl_outputs(net: SceneNet, feat: Any, cond: Any = None) -> dict[str, Any]:
+        """tanh steer, sigmoid throttle and brake, each ``(B, K)``. Empty for a net without the head.
+
+        Only the ctl head sees ``cond`` (the other heads read ``feat`` alone).
+        """
         if not bool(getattr(net, "ctl", False)):
             return {}
         width = int(feat.shape[0])
         if net.cond_dim:
-            feat = torch.cat([feat, feat.new_zeros(width, net.cond_dim)], dim=-1)
+            feat = torch.cat([feat, cond], dim=-1)
         raw = net.ctl_head(feat).view(width, 3, CTL_K)
         return {
             "ctl_steer": torch.tanh(raw[:, 0]),
@@ -1627,13 +1649,19 @@ if torch is not None:
             super().__init__()
             self.net = net
 
-        def forward(self, strip: Any, dt: Any, h: Any, tokens: Any, mask: Any, ages: Any = None) -> tuple[Any, ...]:
+        def forward(self, strip: Any, dt: Any, h: Any, tokens: Any, mask: Any, *extra: Any) -> tuple[Any, ...]:
             state_in = SceneState(h=h, tokens=tokens, mask=mask)
-            # Only a cam_age net takes ages; other nets (the pretrained one) keep the 3-argument call.
-            if ages is None:
+            # Extra inputs in order: ages (cam_age net), then cond (cond_dim net).
+            # Other nets (the pretrained one) keep the 3-argument call.
+            extra = list(extra)
+            ages = extra.pop(0) if bool(getattr(self.net, "cam_age", False)) else None
+            cond = extra.pop(0) if int(getattr(self.net, "cond_dim", 0) or 0) else None
+            if extra:
+                raise ValueError(f"unexpected extra ONNX inputs: {len(extra)}")
+            if ages is None and cond is None:
                 pred, state = self.net(strip, dt, state_in)
             else:
-                pred, state = self.net(strip, dt, state_in, ages)
+                pred, state = self.net(strip, dt, state_in, ages, cond)
             fields = tuple(getattr(pred, name) for name in OUTPUT_FIELDS)
             if bool(getattr(self.net, "ctl", False)):
                 fields = fields + tuple(getattr(pred, name).reshape(1, CTL_K) for name in CTL_OUTPUT_FIELDS)
@@ -1642,7 +1670,8 @@ if torch is not None:
     def _trace_scene_onnx(model: Any, args: tuple[Any, ...], path_str: str) -> None:
         """Trace the FP32 graph. The module and ``args`` are already on CPU.
 
-        A ``cam_age`` net takes a sixth input, ``ages`` (1x8).
+        A ``cam_age`` net takes a sixth input, ``ages`` (1x8). A ``cond_dim`` net then
+        takes ``cond`` (1 x cond_dim).
         """
         wrapper = _OnnxScene(model).eval()
         ctl_names = list(CTL_OUTPUT_FIELDS) if bool(getattr(model, "ctl", False)) else []
@@ -1650,6 +1679,8 @@ if torch is not None:
         input_names = ["strip", "dt", "h", "tokens", "mask"]
         if bool(getattr(model, "cam_age", False)):
             input_names.append("ages")
+        if int(getattr(model, "cond_dim", 0) or 0):
+            input_names.append("cond")
         export_kwargs = dict(
             input_names=input_names,
             output_names=output_names,
@@ -1714,11 +1745,15 @@ def cpu_export_inputs(net: Any, zeros: Any) -> tuple[Any, tuple[Any, ...]]:
     )
     dt = zeros(1, device="cpu")
     state = model.initial_state(device="cpu")
+    args: tuple[Any, ...] = (strip, dt, state.h, state.tokens, state.mask)
     if bool(getattr(model, "cam_age", False)):
         from python.data.cam_hold import CAM_AGE_N
 
-        return model, (strip, dt, state.h, state.tokens, state.mask, zeros(1, CAM_AGE_N, device="cpu"))
-    return model, (strip, dt, state.h, state.tokens, state.mask)
+        args = args + (zeros(1, CAM_AGE_N, device="cpu"),)
+    cond_dim = int(getattr(model, "cond_dim", 0) or 0)
+    if cond_dim:
+        args = args + (zeros(1, cond_dim, device="cpu"),)
+    return model, args
 
 
 def export_scene_onnx(
@@ -1760,6 +1795,7 @@ def export_scene_onnx(
     if used:
         stamp_onnx_metadata(
             str(path),
-            metadata_dict(used, heads, height=CANVAS_H, width=width, cam_age=bool(getattr(net, "cam_age", False))),
+            metadata_dict(used, heads, height=CANVAS_H, width=width, cam_age=bool(getattr(net, "cam_age", False)),
+                          cond_dim=int(getattr(net, "cond_dim", 0) or 0)),
         )
     return path

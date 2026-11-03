@@ -118,7 +118,7 @@ def holdout_rows(
         from python.train.ctl_targets import attach_ctl, b1_constants
         from python.train.event_mask import read_impacts
 
-        counts = attach_ctl(state_rows, rows, plan=plan, impacts=read_impacts(root))
+        counts = attach_ctl(state_rows, rows, plan=plan, impacts=read_impacts(root), cond=bool(ctl_info.get("cond")))
         train_ids = {i for i, label in plan_labels(plan).items() if label == "train"}
         ctl_info["b1"] = b1_constants([row for row in rows if row.get("i") in train_ids])
         ctl_info["lock_deg"] = counts.get("lock_deg")
@@ -181,7 +181,14 @@ def evaluate(
         raise ValueError(f"{onnx_path}: gvd_ctl={meta.get('gvd_ctl', '0')} disagrees with the graph outputs {sorted(outputs)}")
     from python.train.ctl_targets import ctl_scored
 
-    ctl_info: dict | None = {} if has_ctl else None
+    # gvd_ctl_cond=N (B'1, --ctl-cond): the graph takes ``cond`` (1 x N), the t-dt row's controls.
+    cond_dim = int(meta.get("gvd_ctl_cond") or 0)
+    has_cond = "cond" in inputs
+    if has_cond != bool(cond_dim) or (has_cond and [int(d) for d in inputs["cond"].shape] != [1, cond_dim]):
+        raise ValueError(f"{onnx_path}: gvd_ctl_cond={cond_dim} disagrees with the graph inputs {sorted(inputs)}")
+    if has_cond and not has_ctl:
+        raise ValueError(f"{onnx_path}: a cond input needs the ctl outputs (gvd_ctl=1)")
+    ctl_info: dict | None = {"cond": has_cond} if has_ctl else None
     ctl_records: list = []
 
     def fresh() -> dict[str, np.ndarray]:
@@ -225,6 +232,9 @@ def evaluate(
             feeds = {"strip": image, "dt": dt, **state}
             if cam_age:
                 feeds["ages"] = row_ages(row).reshape(1, -1)
+            if has_cond:
+                # Zeros (and no ctl score: ctl_valid is all zero) when the row has no t-dt row.
+                feeds["cond"] = np.asarray(row.get("ctl_cond", np.zeros(cond_dim)), dtype=np.float32).reshape(1, cond_dim)
             out = session.run(None, {inputs[key].name: value for key, value in feeds.items() if key in inputs})
             by_name = dict(zip(outputs, out))
             state = {key: np.asarray(by_name[key], dtype=np.float32) for key in state_keys}
@@ -254,7 +264,11 @@ def evaluate(
         if epoch_ok is False:
             bar = dict(bar, verdict="UNPROVEN", ratio=None,
                        reason=f"--expect-epoch {int(expect_epoch)}: ONNX gvd_ckpt_epoch={epoch}")
-        ctl = ctl_record(score_ctl(ctl_records, ctl_info["b1"], lock_deg=ctl_info.get("lock_deg"), lane=bar["verdict"]))
+        from python.train.ctl_targets import REV4, REV5
+
+        # The B' series (cond on) is scored on the Rev 5 bar; older graphs keep Rev 4.
+        ctl = ctl_record(score_ctl(ctl_records, ctl_info["b1"], lock_deg=ctl_info.get("lock_deg"), lane=bar["verdict"],
+                                   bar=REV5 if has_cond else REV4))
         if epoch_ok is False:
             ctl["run"] = "UNPROVEN"
     return {

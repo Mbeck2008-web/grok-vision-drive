@@ -141,12 +141,15 @@ def build_cond(
     The source is the previous row of the FULL recording (t-dt), in the same segment, with
     0 < sim_t step <= 0.25 s. Row t's own controls (its h=0 label) are never read. No usable
     t-dt row (segment start or change, a longer step, a bad field): zeros and ok 0.
+    Same row copy as ``build_ctl``: non-mapping entries are dropped first, and a repeated
+    row id keeps its first copy.
     """
-    pos = {}
-    for k, row in enumerate(full_rows):
+    full = [row for row in full_rows if isinstance(row, Mapping)]
+    pos: dict[int, int] = {}
+    for k, row in enumerate(full):
         rid = _row_id(row)
         if rid is not None:
-            pos[rid] = k
+            pos.setdefault(rid, k)
     out: dict[int, tuple[np.ndarray, float]] = {}
     for row in kept_rows:
         rid = _row_id(row)
@@ -155,8 +158,8 @@ def build_cond(
         k = pos.get(rid)
         vec = None
         if k is not None and k > 0:
-            cur = full_rows[k]
-            prev = full_rows[k - 1]
+            cur = full[k]
+            prev = full[k - 1]
             st, pst = row_sim_t(cur), row_sim_t(prev)
             if (prev.get("segment") == cur.get("segment") and st is not None and pst is not None
                     and 0.0 < st - pst <= COND_MAX_DT_S + 1e-9):
@@ -558,16 +561,23 @@ def _ref(m: Mapping[str, Any], name: str) -> float | None:
 
 
 def _slice_rev5(m: Mapping[str, Any], h: int) -> str:
-    """Rev 5: ref = min(B3, B1 med); B4 and h0 report-only; brake graded only at >= 30 events."""
+    """Rev 5: ref = min(B3, B1 med); B4 and h0 report-only; brake graded at >= 30 events.
+
+    Under 30 brake events the slice is UNPROVEN, never PASS (Rev 4's rule kept); a steer or
+    throttle miss still FAILs it.
+    """
     if h not in REV5_BARS:
         return "REPORT"
     if int(m.get("n") or 0) < MIN_N:
         return "UNPROVEN"
     k_steer, k_thr = REV5_BARS[h]
     fail = m["steer_mae"] > k_steer * _ref(m, "steer") or m["thr_mae"] > k_thr * _ref(m, "thr")
-    if int(m.get("brk_events") or 0) >= MIN_BRAKE_EVENTS:
+    brake_open = int(m.get("brk_events") or 0) < MIN_BRAKE_EVENTS
+    if not brake_open:
         fail = fail or m["brk_f1"] < 0.5 or not (m["brk_mae"] < m["b1med_brk"])
-    return "FAIL" if fail else "PASS"
+    if fail:
+        return "FAIL"
+    return "UNPROVEN" if brake_open else "PASS"
 
 
 def slice_verdict(m: Mapping[str, Any], h: int, *, bar: str = REV4) -> str:

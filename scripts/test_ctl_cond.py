@@ -12,7 +12,8 @@
   line); the default call writes no cond key and the same targets.
 * C3 Rev 5 bars: ref = min(B3, B1 median); h3 steer and throttle <= 0.85 x ref;
   h4-h5 steer <= 0.95 x ref, throttle <= 0.85 x ref; B4 (hold own h0) and h0
-  report-only; brake graded only with >= 30 events. Rev 4 stays the default.
+  report-only; brake graded at >= 30 events, a slice under 30 is UNPROVEN (as in Rev 4).
+  Rev 4 stays the default.
 * C4 net / ONNX / runtime (torch): the cond input moves the ctl outputs and
   only them; a cond net refuses a forward without cond; the ONNX has a
   ``cond`` [1, 5] input and ``gvd_ctl_cond`` metadata and tracks torch; the
@@ -134,8 +135,20 @@ def check_c1_cond() -> None:
         broken[9][group][key] = bad
         got = build_cond(broken, broken)
         assert got[10][1] == 0.0 and not got[10][0].any(), (group, key, got[10])
+    # Same row copy and malformed-row filter as build_ctl: a repeated row id keeps its FIRST copy
+    # (setdefault), and a non-mapping entry is dropped before t-dt is looked up.
+    dup = [dict(row) for row in full] + [_row(30, round(0.1 * 60, 4), steer=-0.7, thr=0.9, brk=0.0, speed=1.0)]
+    got = build_cond(dup, full)
+    assert got[30][1] == 1.0 and np.array_equal(got[30][0], cond[30][0]), ("dup id: first copy", got[30], cond[30])
+    junk = [dict(row) for row in full]
+    junk.insert(10, None)
+    junk.insert(5, "not a row")
+    got = build_cond(junk, full)
+    for k in range(1, len(full)):
+        assert got[k][1] == 1.0 and np.array_equal(got[k][0], cond[k][0]), ("malformed filtered", k, got[k])
     print("C1 cond: t-dt row only (h0 perturbation inert), speed/30, ego.yaw_rate sign, "
-          "segment start/change, >0.25 s step and bad fields -> zeros + ok=0 OK")
+          "segment start/change, >0.25 s step and bad fields -> zeros + ok=0, dup id keeps first copy, "
+          "malformed rows filtered OK")
 
 
 def check_c2_attach() -> None:
@@ -201,11 +214,18 @@ def check_c3_rev5_bars() -> None:
         assert slice_verdict(dict(good, steer_mae=0.0951), h, bar=REV5) == "FAIL", h
         assert slice_verdict(dict(good, thr_mae=0.0851), h, bar=REV5) == "FAIL", h
     assert slice_verdict(dict(good, thr_mae=0.0851), 3, bar=REV5) == "FAIL"
-    # Brake: graded at >= 30 events (F1 >= 0.5 and brk_mae < B1 med, no B4 term); below 30 ungraded.
+    # Brake: graded at >= 30 events (F1 >= 0.5 and brk_mae < B1 med, no B4 term); below 30 events the
+    # slice is UNPROVEN, never PASS (Rev 4's rule kept); a steer/throttle miss still FAILs it.
     assert slice_verdict(dict(good, brk_f1=0.49), 3, bar=REV5) == "FAIL"
     assert slice_verdict(dict(good, brk_mae=0.06), 3, bar=REV5) == "FAIL"
     assert slice_verdict(dict(good, brk_f1=0.5, b4_brk_f1=0.99), 3, bar=REV5) == "PASS"
-    assert slice_verdict(dict(good, brk_events=29, brk_f1=0.0, brk_mae=1.0), 3, bar=REV5) == "PASS"
+    for h in (3, 4, 5):
+        # Skeptic's case: 29 events, F1 0, brake MAE 2.0 -> UNPROVEN on rev5 exactly as on rev4.
+        few = dict(good, brk_events=29, brk_f1=0.0, brk_mae=2.0, b4_steer=1.0, b4_thr=1.0, b4_brk_f1=0.0)
+        assert slice_verdict(few, h, bar=REV5) == "UNPROVEN", h
+        assert slice_verdict(few, h, bar=REV4) == "UNPROVEN", h
+        assert slice_verdict(dict(good, brk_events=0), h, bar=REV5) == "UNPROVEN", h
+        assert slice_verdict(dict(few, brk_events=30), h, bar=REV5) == "FAIL", h
     assert slice_verdict(dict(good, brk_events=29, steer_mae=0.09), 3, bar=REV5) == "FAIL"
     # Run: h3-h5 only; h0 is report-only.
     assert run_verdict({0: "FAIL", 3: "PASS", 4: "PASS", 5: "PASS"}, "PASS", bar=REV5) == "PASS"
@@ -216,7 +236,8 @@ def check_c3_rev5_bars() -> None:
     assert run_verdict({3: "PASS", 4: "PASS", 5: "FAIL"}, "PASS", bar=REV5) == "FAIL"
 
     # score_ctl: a model that holds the GT h0 label equals B3, so it FAILs Rev 5 at h3-h5;
-    # one that is clearly better than both baselines PASSes, with brake ungraded (no events).
+    # one that is clearly better than both baselines PASSes when brake is graded (>= 30 events), and is
+    # UNPROVEN (not PASS) with no brake events.
     rng = np.random.default_rng(73)
 
     def fixture(better: bool, brake: bool) -> list:
@@ -244,33 +265,37 @@ def check_c3_rev5_bars() -> None:
         assert abs(m["steer_mae"] - m["b3_steer"]) < 1e-12 and m["verdict"] == "FAIL", (h, m["verdict"])
         assert m["ref_steer"] == min(m["b3_steer"], m["b1med_steer"]), m
     assert hold["h"][0]["verdict"] == "REPORT" and hold["run"] == "FAIL"
-    good_run = score_ctl(fixture(True, False), b1, lane="PASS", bar=REV5)
+    no_brake = score_ctl(fixture(True, False), b1, lane="PASS", bar=REV5)
     for h in (3, 4, 5):
-        assert good_run["h"][h]["brk_events"] == 0 and good_run["h"][h]["verdict_all"] == "PASS", h
+        assert no_brake["h"][h]["brk_events"] == 0 and no_brake["h"][h]["verdict_all"] == "UNPROVEN", h
+    good_run = score_ctl(fixture(True, True), b1, lane="PASS", bar=REV5)
+    for h in (3, 4, 5):
+        assert good_run["h"][h]["brk_events"] >= 30 and good_run["h"][h]["verdict_all"] == "PASS", h
     # The highway slice has 1 row: UNPROVEN caps the horizon, so the run is UNPROVEN, not PASS.
     assert good_run["run"] == "UNPROVEN", good_run["run"]
     lines = val_lines(good_run)
     assert lines[-1] == ("[GVD] val ctl run verdict=UNPROVEN bar=rev5 h0=REPORT h3=UNPROVEN h4=UNPROVEN "
                          "h5=UNPROVEN lane=PASS"), lines[-1]
-    assert " ref_steer=" in lines[3] and " ref_thr=" in lines[3] and " brk_graded=0 " in lines[3], lines[3]
+    assert " ref_steer=" in lines[3] and " ref_thr=" in lines[3] and " brk_graded=1 " in lines[3], lines[3]
     from python.train.ctl_targets import ctl_record
 
     assert val_lines(ctl_record(good_run)) == lines
     # Rev 4 default: the same records give the Rev 4 lines, byte for byte without the Rev 5 fields.
+    assert " brk_graded=0 " in val_lines(no_brake)[3]
     rev4 = val_lines(score_ctl(fixture(True, False), b1, lane="PASS"))
     assert re.fullmatch(r"\[GVD\] val ctl run verdict=\S+ h0=\S+ h3=\S+ h4=\S+ h5=\S+ lane=PASS", rev4[-1]), rev4[-1]
     assert " ref_steer=" not in rev4[3]
     print("C3 Rev 5 bars: ref=min(B3,B1med), h3 0.85/0.85, h4-h5 0.95/0.85, B4 and h0 report-only, "
-          "brake ungraded under 30 events, GT-h0 hold FAILs, Rev 4 default unchanged OK")
+          "brake under 30 events UNPROVEN (29 ev, F1 0, MAE 2.0), GT-h0 hold FAILs, Rev 4 default unchanged OK")
 
 
-def check_c4_net_onnx_runtime() -> None:
+def check_c4_net_onnx_runtime() -> bool:
     try:
         import onnxruntime as ort
         import torch
     except ImportError:
         skip_check("c4_net_onnx_runtime", "torch / onnxruntime not installed")
-        return
+        return False
     from python.train.ctl_targets import COND_DIM, CTL_OUTPUT_FIELDS
     from python.train.epoch_ckpt import build_net
     from python.train.scene_lane_runtime import SceneLaneRuntime, _base_name
@@ -334,15 +359,16 @@ def check_c4_net_onnx_runtime() -> None:
     assert build_net({"cams": list(cams), "ctl": True}).cond_dim == 0
     print("C4 net/ONNX/runtime: arch :cond=5, cond moves ctl only, forward needs cond, ONNX cond [1,5] + "
           "gvd_ctl_cond metadata tracks torch, live runtime refuses a cond model, build_net from meta OK")
+    return True
 
 
-def check_c5_cli_and_tiny_run() -> None:
+def check_c5_cli_and_tiny_run() -> bool:
     try:
         import onnxruntime  # noqa: F401
         import torch
     except ImportError:
         skip_check("c5_cli_and_tiny_run", "torch / onnxruntime not installed")
-        return
+        return False
     import export_epoch_onnx
     from eval_onnx_holdout import evaluate
     from python.train import train_scene
@@ -407,15 +433,19 @@ def check_c5_cli_and_tiny_run() -> None:
         print(run_lines[0])
         print(f"C5 CLI/tiny run: --ctl-cond default off, refused without ctl, cond ckpt + ONNX eval "
               f"h0 steer_mae={result['ctl']['h']['0']['steer_mae']:.5f} logged={logged['0']['steer_mae']} OK")
+        return True
 
 
 def main() -> None:
     check_c1_cond()
     check_c2_attach()
     check_c3_rev5_bars()
-    check_c4_net_onnx_runtime()
-    check_c5_cli_and_tiny_run()
-    print("ctl cond / Rev 5: C1-C5 OK")
+    ran = ["C1", "C2", "C3"]
+    skipped = []
+    for name, check in (("C4", check_c4_net_onnx_runtime), ("C5", check_c5_cli_and_tiny_run)):
+        (ran if check() else skipped).append(name)
+    note = f"; skipped {', '.join(skipped)} (torch / onnxruntime not installed)" if skipped else "; skipped none"
+    print(f"ctl cond / Rev 5: ran {', '.join(ran)} OK{note}")
 
 
 if __name__ == "__main__":

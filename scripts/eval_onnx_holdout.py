@@ -43,6 +43,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-chunk", type=int, default=16, help="GRU reset period, as train_scene --eval-chunk (> 0).")
     parser.add_argument("--cache", default="", help="Frame cache folder, as train_scene --cache.")
     parser.add_argument("--json", type=Path, default=None, help="Also write the result as JSON (create-only).")
+    parser.add_argument(
+        "--lane-ref",
+        type=Path,
+        default=None,
+        help="ctl runs: run A's --json from this script (paired lane_gt-only run, same holdout and epoch). "
+        "Lane bar: this rms <= 1.05 x A's. Missing or unreadable: lane UNPROVEN, run at best UNPROVEN.",
+    )
+    parser.add_argument(
+        "--expect-epoch",
+        type=int,
+        default=None,
+        help="The ONNX gvd_ckpt_epoch must equal this. Another value or none: ctl run and lane bar UNPROVEN.",
+    )
     return parser
 
 
@@ -124,8 +137,17 @@ def evaluate(
     holdout_cells_file: Path | None = None,
     eval_chunk: int = 16,
     cache: Any = None,
+    lane_ref: Path | str | None = None,
+    expect_epoch: int | None = None,
 ) -> dict[str, Any]:
-    """Score ``onnx_path`` on the holdout. Returns the val fields plus step/epoch from the metadata."""
+    """Score ``onnx_path`` on the holdout. Returns the val fields plus step/epoch from the metadata.
+
+    A ctl graph also gets ``ctl`` and ``lane_bar``: the lane bar compares this
+    rms with run A's eval JSON at ``lane_ref`` (:func:`ctl_targets.lane_bar`).
+    ``rows_sha`` fingerprints the ordered holdout rows. With ``expect_epoch``,
+    ``epoch_ok`` is whether the ONNX ``gvd_ckpt_epoch`` equals it (a missing
+    tag is not ok); not ok makes the ctl run and the lane bar UNPROVEN.
+    """
     import onnxruntime as ort  # type: ignore
 
     from python.debug.lane_targets import lane_center_is_valid, lane_gt_from_record, lane_x_from_vector
@@ -157,6 +179,8 @@ def evaluate(
     has_ctl = str(meta.get("gvd_ctl", "0")) == "1"
     if has_ctl != all(name in outputs for name in CTL_OUTPUT_FIELDS):
         raise ValueError(f"{onnx_path}: gvd_ctl={meta.get('gvd_ctl', '0')} disagrees with the graph outputs {sorted(outputs)}")
+    from python.train.ctl_targets import ctl_scored
+
     ctl_info: dict | None = {} if has_ctl else None
     ctl_records: list = []
 
@@ -204,7 +228,7 @@ def evaluate(
             out = session.run(None, {inputs[key].name: value for key, value in feeds.items() if key in inputs})
             by_name = dict(zip(outputs, out))
             state = {key: np.asarray(by_name[key], dtype=np.float32) for key in state_keys}
-            if has_ctl and "ctl_valid" in row:
+            if has_ctl and ctl_scored(row):
                 ctl_records.append(
                     (row, np.stack([np.asarray(by_name[name], dtype=np.float32).reshape(-1) for name in CTL_OUTPUT_FIELDS]))
                 )
@@ -216,14 +240,29 @@ def evaluate(
             pred_x = lane_x_from_vector(np.asarray(by_name["lane_gt"], dtype=np.float32).reshape(-1))
             pairs.append((float("nan") if pred_x is None else float(pred_x), float("nan") if gt_x is None else float(gt_x)))
     scored = val_summary(pairs, None, {"n": 0})
-    ctl = None
-    if ctl_info is not None:
-        from python.train.ctl_targets import ctl_record, score_ctl
+    from python.train.ctl_targets import holdout_rows_sha
 
-        ctl = ctl_record(score_ctl(ctl_records, ctl_info["b1"], lock_deg=ctl_info.get("lock_deg")))
+    rows_sha = holdout_rows_sha(row for rows in slices for row in rows)
+    epoch = int(meta["gvd_ckpt_epoch"]) if "gvd_ckpt_epoch" in meta else None
+    epoch_ok = None if expect_epoch is None else (epoch is not None and epoch == int(expect_epoch))
+    ctl = None
+    bar = None
+    if ctl_info is not None:
+        from python.train.ctl_targets import ctl_record, lane_bar, score_ctl
+
+        bar = lane_bar({"rms": scored.get("rms"), "rows_sha": rows_sha, "epoch": epoch}, lane_ref)
+        if epoch_ok is False:
+            bar = dict(bar, verdict="UNPROVEN", ratio=None,
+                       reason=f"--expect-epoch {int(expect_epoch)}: ONNX gvd_ckpt_epoch={epoch}")
+        ctl = ctl_record(score_ctl(ctl_records, ctl_info["b1"], lock_deg=ctl_info.get("lock_deg"), lane=bar["verdict"]))
+        if epoch_ok is False:
+            ctl["run"] = "UNPROVEN"
     return {
         "step": int(meta["gvd_ckpt_step"]) if "gvd_ckpt_step" in meta else None,
-        "epoch": int(meta["gvd_ckpt_epoch"]) if "gvd_ckpt_epoch" in meta else None,
+        "epoch": epoch,
+        "expect_epoch": None if expect_epoch is None else int(expect_epoch),
+        "epoch_ok": epoch_ok,
+        "rows_sha": rows_sha,
         "ckpt_sha256": meta.get("gvd_ckpt_sha256"),
         "n": scored.get("n"),
         "r": scored.get("r"),
@@ -237,7 +276,7 @@ def evaluate(
         "slices": len(slices),
         "holdout_rows": sum(len(rows) for rows in slices),
         "selection": selection,
-        **({} if ctl is None else {"ctl": ctl}),
+        **({} if ctl is None else {"ctl": ctl, "lane_bar": bar}),
     }
 
 
@@ -273,13 +312,25 @@ def main(argv: list[str] | None = None) -> int:
             holdout_cells_file=args.holdout_cells_file,
             eval_chunk=int(args.eval_chunk),
             cache=cache,
+            lane_ref=args.lane_ref,
+            expect_epoch=args.expect_epoch,
         )
         print(result["selection"], flush=True)
-        print(f"[GVD] holdout: rows={result['holdout_rows']} slices={result['slices']}", flush=True)
+        print(f"[GVD] holdout: rows={result['holdout_rows']} slices={result['slices']} rows_sha={result['rows_sha']}",
+              flush=True)
+        if result.get("expect_epoch") is not None:
+            print(f"[GVD] val (onnx) epoch check: expect={result['expect_epoch']} onnx={result['epoch']} "
+                  f"ok={result['epoch_ok']}", flush=True)
         print(val_line(result), flush=True)
         if "ctl" in result:
             from python.train.ctl_targets import val_lines
 
+            bar = result["lane_bar"]
+            print(
+                f"[GVD] val (onnx) lane bar verdict={bar['verdict']} rms={bar['rms']} ref_rms={bar['ref_rms']} "
+                f"ratio={bar['ratio']} bar={bar['bar']} ({bar['reason']})",
+                flush=True,
+            )
             for line in val_lines(result["ctl"]):
                 print(line.replace("[GVD] val ctl", "[GVD] val (onnx) ctl", 1), flush=True)
         if args.json is not None:

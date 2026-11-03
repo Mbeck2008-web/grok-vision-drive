@@ -1410,7 +1410,8 @@ def _eval_sequence(
                 gt_vec, gt_mask = lane_gt_from_record(tech if isinstance(tech, dict) else None)
                 if preds_out is not None and getattr(one, "lane_gt", None) is not None:
                     preds_out.append((row, one.lane_gt.detach().float().cpu().numpy().reshape(-1)))
-                if ctl_out is not None and getattr(one, "ctl_steer", None) is not None and "ctl_valid" in row:
+                # Scored rows match the loss rows: loss_mask gates ctl scoring like the loss below.
+                if ctl_out is not None and getattr(one, "ctl_steer", None) is not None and "ctl_valid" in row and loss_mask(row):
                     ctl_out.append((row, np.stack([
                         getattr(one, name).detach().float().cpu().numpy().reshape(-1)
                         for name in ("ctl_steer", "ctl_throttle", "ctl_brake")
@@ -1964,6 +1965,7 @@ def train_directory(
         print(mask_line(ctl_counts), flush=True)
         ctl_lock = ctl_counts.get("lock_deg")
         train_ids = {i for i, label in plan_labels(startup_plan).items() if label == "train"}
+        # b1_constants keeps only loss_mask rows, as the training loss does.
         ctl_b1 = b1_constants([row for row in rows if row.get("i") in train_ids])
     print(
         f"[GVD] holdout: rows={mix['rows']} slices={mix['slices']} fast={mix['fast']} slow={mix['slow']} "
@@ -2680,7 +2682,9 @@ def train_directory(
                 if use_ctl:
                     from python.train.ctl_targets import ctl_record, score_ctl, val_lines
 
-                    # No paired lane_gt-only run inside one run: the lane bar is UNPROVEN here.
+                    # No paired lane_gt-only run inside one run: the lane bar is UNPROVEN here, so this
+                    # in-run verdict is at best UNPROVEN. The lane bar is scored offline:
+                    # eval_onnx_holdout.py --lane-ref <run A eval JSON>.
                     ctl_scored = score_ctl(val_ctl, ctl_b1, lock_deg=ctl_lock)
                     record["ctl"] = ctl_record(ctl_scored)
                     ctl_lines = val_lines(ctl_scored)

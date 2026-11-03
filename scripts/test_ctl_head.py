@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import math
@@ -60,6 +61,7 @@ def _row(i: int, sim_t: float, *, t: float | None = None, seg: str = SEG, steer:
         "pedals": {"throttle_ai": thr, "brake_ai": brk, "clutch_ai": None, "parkingbrake_ai": 0.0},
         "veh": {"reverse": 0},
         "cams": {"main": {"file": f"raw/main/{i:06d}.png", "t": t}},
+        "tech": {"speed_mps": 10.0},
     }
     row.update(tags)
     return row
@@ -260,12 +262,33 @@ def check_t4_loss() -> None:
     # Lane-only branch still taken with ctl on (scene_net fix): the polyline terms stay detached zeros.
     for key in ("points", "class", "lamps", "valid"):
         assert float(on1[key]) == 0.0 and not on1[key].requires_grad, key
+    # Backward with --heads lane_gt,ctl: the polyline / curb / object / sign heads get no gradient
+    # (None or all zero); lane_gt and ctl do. The same pass with every head shows the check can fail.
+    def grads(heads):
+        net.zero_grad(set_to_none=True)
+        net.train()
+        pred, _ = net.forward(strip, 0.1, net.initial_state())
+        scene_loss(pred, target, heads)["total"].backward()
+        net.eval()
+        return {name: p.grad for name, p in net.named_parameters()}
+
+    frozen = ("lane_head", "lane_valid_head", "curb_head", "curb_valid_head", "object_head", "object_class_head",
+              "object_valid_head", "sign_head", "sign_class_head", "sign_state_head", "sign_valid_head")
+    got_g = grads(("lane_gt", "ctl"))
+    for name, g in got_g.items():
+        if name.split(".")[0] in frozen:
+            assert g is None or float(g.abs().max()) == 0.0, name
+    assert any(g is not None and float(g.abs().max()) > 0 for n, g in got_g.items() if n.startswith("ctl_head."))
+    all_g = grads(None)
+    assert any(g is not None and float(g.abs().max()) > 0 for n, g in all_g.items() if n.split(".")[0] in frozen)
+    net.zero_grad(set_to_none=True)
     # Default run: no ctl target, "ctl" present and 0, the total is the old sum.
     default = scene_loss(p_base, target)
     assert float(default["ctl"]) == 0.0
     old = sum(float(default[k]) for k in ("points", "class", "lamps", "valid", "lane_gt"))
     assert abs(float(default["total"]) - old) < 1e-5
-    print("T4 loss: masked-mean smooth-L1 per channel, masked slots inert, ctl_weight, default total unchanged OK")
+    print("T4 loss: masked-mean smooth-L1 per channel, masked slots inert, ctl_weight, lane_gt,ctl backward leaves "
+          "polyline/object/sign grads None or 0, default total unchanged OK")
 
 
 def check_t5_eval() -> None:
@@ -311,7 +334,9 @@ def check_t5_eval() -> None:
     assert slice_verdict(dict(good, brk_f1=0.49), 3) == "FAIL"
     assert slice_verdict(dict(good, brk_mae=0.06), 3) == "FAIL"
     assert slice_verdict(dict(good, brk_f1=0.5, b4_brk_f1=0.5), 3) == "FAIL"  # must beat B4
-    assert run_verdict({0: "PASS", 3: "PASS", 4: "PASS", 5: "PASS"}, "UNPROVEN") == "PASS"
+    # PASS needs the lane bar PASS too: no paired lane run (UNPROVEN) caps the run at UNPROVEN.
+    assert run_verdict({0: "PASS", 3: "PASS", 4: "PASS", 5: "PASS"}, "PASS") == "PASS"
+    assert run_verdict({0: "PASS", 3: "PASS", 4: "PASS", 5: "PASS"}, "UNPROVEN") == "UNPROVEN"
     assert run_verdict({0: "PASS", 3: "PASS", 4: "UNPROVEN", 5: "PASS"}, "PASS") == "UNPROVEN"
     assert run_verdict({0: "PASS", 3: "PASS", 4: "PASS", 5: "PASS"}, "FAIL") == "FAIL"
     assert run_verdict({0: "FAIL", 3: "UNPROVEN", 4: "UNPROVEN", 5: "UNPROVEN"}, "PASS") == "FAIL"
@@ -339,30 +364,136 @@ def check_t5_eval() -> None:
         assert line.endswith("verdict=UNPROVEN"), line
     assert lines[-1] == "[GVD] val ctl run verdict=UNPROVEN h0=UNPROVEN h3=UNPROVEN h4=UNPROVEN h5=UNPROVEN lane=UNPROVEN", lines[-1]
     assert abs(result["h"][0]["steer_mae_deg"] - 0.01 * 450.0) < 1e-3, result["h"][0]
-    # B4 fixture: every horizon column repeats the h=0 output. It clears the B1 bars but not the
-    # B4 bars at h=3,4,5, so those horizons and the run FAIL; h=0 has no B4 bar and PASSes.
-    rng = np.random.default_rng(7)
-    recs = []
-    for k in range(320):
-        row = _row(k, 0.1 * k, spawn_type="city")
-        x = rng.uniform(-0.8, 0.8)
-        thr = rng.uniform(0.0, 1.0)
-        brk = 0.6 if k % 5 == 0 else 0.0
-        row["ctl"] = np.tile(np.array([[x], [thr], [brk]], np.float32), (1, 6))
-        row["ctl_valid"] = np.ones((3, 6), np.float32)
-        recs.append((row, row["ctl"].copy()))
-    for k in range(3):  # ramp / highway slices exist in the record but are short (UNPROVEN)
-        recs[k][0]["spawn_type"] = "highway"
+    # B4 fixture: the labels move with h, and every horizon column repeats the model's h=0 output.
+    # It clears the B1 bars but not the B4 bars at h=3,4,5, so those horizons and the run FAIL;
+    # h=0 has no B4 bar and PASSes. The steer and throttle 0.95 x B4 bars trip on their own.
+    def hold_fixture(brake: bool) -> list:
+        rng = np.random.default_rng(7)
+        out = []
+        for k in range(320):
+            row = _row(k, 0.1 * k, spawn_type="city")
+            x = rng.uniform(-0.6, 0.6)
+            thr = rng.uniform(0.2, 0.8)
+            brk = 0.6 if brake and k % 5 == 0 else 0.0
+            drift = rng.uniform(-0.15, 0.15, size=(2, 6))
+            drift[:, 0] = 0.0
+            row["ctl"] = np.stack([x + drift[0], thr + drift[1], np.full(6, brk)]).astype(np.float32)
+            row["ctl_valid"] = np.ones((3, 6), np.float32)
+            out.append((row, np.repeat(row["ctl"][:, :1], 6, axis=1)))
+        for k in range(3):  # ramp / highway slices exist in the record but are short (UNPROVEN)
+            out[k][0]["spawn_type"] = "highway"
+        return out
+
     b1 = {"median": np.tile(np.array([[0.0], [0.5], [0.0]], np.float32), (1, 6)),
           "mean": np.tile(np.array([[0.0], [0.5], [0.1]], np.float32), (1, 6))}
-    result = score_ctl(recs, b1)
+    result = score_ctl(hold_fixture(True), b1, lane="PASS")
     assert result["h"][0]["verdict_all"] == "PASS", result["h"][0]
     for h in (3, 4, 5):
-        assert result["h"][h]["verdict"] == "FAIL", (h, result["h"][h]["verdict"])
+        m = result["h"][h]
+        assert m["verdict"] == "FAIL", (h, m["verdict"])
+        assert m["steer_mae"] <= 0.85 * m["b1med_steer"] and m["thr_mae"] <= 0.85 * m["b1med_thr"], m
+        assert m["steer_mae"] > 0.95 * m["b4_steer"] and m["thr_mae"] > 0.95 * m["b4_thr"], m
+        # Each B4 bar alone: brake neutral (fewer than 30 events), the other channel well clear.
+        quiet = dict(m, brk_events=0)
+        assert slice_verdict(dict(quiet, thr_mae=0.0), h) == "FAIL", "steer 0.95 x B4 alone"
+        assert slice_verdict(dict(quiet, steer_mae=0.0), h) == "FAIL", "throttle 0.95 x B4 alone"
+        assert slice_verdict(dict(quiet, steer_mae=0.0, thr_mae=0.0), h) == "UNPROVEN"
     assert result["run"] == "FAIL"
+    # No brake events at all: brake is open (UNPROVEN), yet h=3,4,5 still FAIL on steer/throttle vs B4.
+    quiet_result = score_ctl(hold_fixture(False), b1, lane="PASS")
+    assert quiet_result["h"][0]["verdict_all"] == "UNPROVEN", quiet_result["h"][0]["verdict_all"]
+    for h in (3, 4, 5):
+        assert quiet_result["h"][h]["brk_events"] == 0
+        assert quiet_result["h"][h]["verdict_all"] == "FAIL", (h, quiet_result["h"][h]["verdict_all"])
+    assert quiet_result["run"] == "FAIL"
     # B0 (all-zero brake) is rejected by the brake bar.
     assert result["h"][0]["b0_brk_f1"] == 0.0 < 0.5
-    print("T5 eval: lag, F1=0 without positives, n/brake-event floors, B2 skip, verdicts, val lines OK")
+
+    # loss_mask: a row the trainer gives no loss (bad wheel/pedals, no tech) is not scored, and
+    # B1 ignores it too. Wild predictions on those rows change nothing.
+    from python.train.ctl_targets import b1_constants
+
+    base = hold_fixture(True)
+    dirty = [(dict(row), pred) for row, pred in base]
+    for k in range(0, 320, 7):
+        row, pred = dirty[k]
+        if k % 2:
+            row["wheel"] = dict(row["wheel"], steer=3.0)
+        else:
+            row["tech"] = {}
+        dirty[k] = (row, pred + 0.7)
+    clean = [(row, pred) for k, (row, pred) in enumerate(base) if k % 7]
+    got_d, got_c = score_ctl(dirty, b1, lane="PASS"), score_ctl(clean, b1, lane="PASS")
+    for h in range(6):
+        for key in ("n", "steer_mae", "thr_mae", "brk_mae", "brk_f1", "b2_steer", "b3_steer", "b4_steer", "b2_n"):
+            assert got_d["h"][h][key] == got_c["h"][h][key], (h, key, got_d["h"][h][key], got_c["h"][h][key])
+    assert got_d["h"][0]["n"] == 320 - len(range(0, 320, 7))
+    train_rows = [row for row, _p in dirty]
+    for row in train_rows[::7]:
+        row["ctl"] = np.full((3, 6), 0.9, np.float32)
+    want_b1 = b1_constants([row for k, (row, _p) in enumerate(dirty) if k % 7])
+    got_b1 = b1_constants(train_rows)
+    assert np.array_equal(got_b1["median"], want_b1["median"]) and np.array_equal(got_b1["mean"], want_b1["mean"])
+
+    # Lane bar from run A's eval JSON: rms <= 1.05 x A; anything missing or unreadable is UNPROVEN.
+    from python.train.ctl_targets import lane_bar
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+
+        def ref(name: str, body) -> Path:
+            path = tmp / name
+            path.write_text(body if isinstance(body, str) else json.dumps(body), encoding="utf-8")
+            return path
+
+        from python.train.ctl_targets import holdout_rows_sha
+
+        rows = [{"segment": "west_coast_usa#0", "i": 7}, {"segment": "west_coast_usa#0", "i": 8}, {"segment": "b", "i": 0}]
+        want_sha = hashlib.sha256(b"west_coast_usa#0:7\nwest_coast_usa#0:8\nb:0\n").hexdigest()
+        assert holdout_rows_sha(rows) == want_sha, holdout_rows_sha(rows)
+        assert holdout_rows_sha(rows[::-1]) != want_sha  # ordered
+        sha = want_sha
+        a = {"rms": 0.40, "n": 500, "holdout_rows": 600, "epoch": 3, "rows_sha": sha}
+        mine = {"rms": 0.40 * 1.04, "n": 500, "holdout_rows": 600, "epoch": 3, "rows_sha": sha}
+        assert lane_bar(mine, ref("a.json", a))["verdict"] == "PASS"  # 1.04x
+        assert lane_bar(dict(mine, rms=0.40 * 1.05), ref("a0.json", a))["verdict"] == "PASS"  # at the bar
+        assert lane_bar(dict(mine, rms=0.40 * 1.06), ref("a1.json", a))["verdict"] == "FAIL"  # 1.06x
+        bar = lane_bar(dict(mine, rms=0.43), ref("a2.json", a))
+        assert bar["verdict"] == "FAIL" and abs(bar["ratio"] - 0.43 / 0.40) < 1e-9, bar
+        # rows_sha decides the holdout match: n / holdout_rows alone are not compared.
+        assert lane_bar(dict(mine, n=499), ref("a4.json", a))["verdict"] == "PASS"
+        no_sha = {k: v for k, v in a.items() if k != "rows_sha"}
+        no_epoch = {k: v for k, v in a.items() if k != "epoch"}
+        for label, b_side in (("rows_sha", {k: v for k, v in mine.items() if k != "rows_sha"}),
+                              ("epoch", {k: v for k, v in mine.items() if k != "epoch"}),
+                              ("epoch", dict(mine, epoch=None))):
+            got = lane_bar(b_side, ref(f"b_{label}.json", a))
+            assert got["verdict"] == "UNPROVEN" and label in got["reason"], (label, got)
+        for body, why in (
+            (None, "no --lane-ref"),
+            ("missing", "missing"),
+            ("{not json", "unreadable"),
+            ({"n": 500}, "no rms"),
+            (dict(a, rms=None), "no rms"),
+            (dict(a, rms="nan"), "no rms"),
+            (dict(a, rows_sha="0" * 64), "rows_sha"),
+            (no_sha, "rows_sha"),
+            (dict(a, epoch=2), "epoch"),
+            (no_epoch, "epoch"),
+            (dict(a, epoch_ok=False), "expect-epoch"),
+            (dict(a, ctl={"run": "PASS"}), "lane_gt-only"),
+        ):
+            if body is None:
+                path = None
+            elif body == "missing":
+                path = tmp / "nope.json"
+            else:
+                path = ref(f"r{abs(hash(str(body)))}.json", body)
+            got = lane_bar(mine, path)
+            assert got["verdict"] == "UNPROVEN" and why in got["reason"], (body, got)
+        assert lane_bar(dict(mine, rms=None), ref("a3.json", a))["verdict"] == "UNPROVEN"
+    print("T5 eval: lag, F1=0 without positives, n/brake-event floors, B2 skip, verdicts (PASS needs lane PASS), "
+          "h0-hold trips the steer/throttle B4 bars alone, loss_mask on scores and B1, lane bar vs run A OK")
 
 
 def check_t6_contract() -> None:
@@ -437,30 +568,71 @@ def check_t6_contract() -> None:
             raise AssertionError("a ctl export replaced an existing file")
         assert ctl_path.read_bytes() == before
 
-    # Causality: outputs at t do not change when the frames after t change.
-    torch.manual_seed(1)
-    frames = torch.rand(30, 1, 3, with_ctl.canvas_h, with_ctl.canvas_w)
-    with_ctl.eval()
+    # Causality on a --cam-age ctl net (8 cameras): replace the frames, the rows (dt) and the ages
+    # after t; the ctl outputs at every step <= t are bit-identical, in torch and in ONNX.
+    from python.data.cam_hold import CAM_AGE_N
 
-    def run(seq: torch.Tensor) -> list[torch.Tensor]:
-        state = with_ctl.initial_state()
+    torch.manual_seed(1)
+    net8 = SceneNet(cams=ALL8, ctl=True, cam_age=True)
+    net8.eval()
+    steps, t_cut = 24, 12
+    frames = torch.rand(steps, 1, 3, net8.canvas_h, net8.canvas_w)
+    dts = (0.05 + 0.1 * torch.rand(steps)).tolist()
+    ages = torch.rand(steps, 1, CAM_AGE_N) * 0.3
+    changed_frames = frames.clone()
+    changed_frames[t_cut + 1:] = torch.rand_like(changed_frames[t_cut + 1:])
+    changed_dts = dts[: t_cut + 1] + [0.3] * (steps - t_cut - 1)
+    changed_ages = ages.clone()
+    changed_ages[t_cut + 1:] = 0.9
+
+    def run_torch(seq: torch.Tensor, dt_seq: list, age_seq: torch.Tensor) -> list[torch.Tensor]:
+        state = net8.initial_state()
         outs = []
         with torch.no_grad():
-            for frame in seq:
-                pred, state = with_ctl.forward(frame, 0.1, state)
+            for frame, dt, age in zip(seq, dt_seq, age_seq):
+                pred, state = net8.forward(frame, dt, state, age)
                 outs.append(torch.stack([pred.ctl_steer, pred.ctl_throttle, pred.ctl_brake]))
         return outs
 
-    first = run(frames)
-    changed = frames.clone()
-    changed[16:] = torch.rand_like(changed[16:])
-    second = run(changed)
-    for t in range(16):
+    first = run_torch(frames, dts, ages)
+    second = run_torch(changed_frames, changed_dts, changed_ages)
+    for t in range(t_cut + 1):
         assert torch.equal(first[t], second[t]), t
-    assert not torch.equal(first[20], second[20])
+    assert not torch.equal(first[t_cut + 4], second[t_cut + 4])
+
+    from python.train.scene_lane_runtime import _base_name
+    from python.train.scene_net import RESIDUAL_S
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path8 = export_scene_onnx(Path(tmp) / "age_ctl.onnx", net8, heads=("lane_gt", "ctl"))
+        sess = ort.InferenceSession(str(path8), providers=["CPUExecutionProvider"])
+    ins = {_base_name(item.name): item for item in sess.get_inputs()}
+    outs_names = [_base_name(item.name) for item in sess.get_outputs()]
+    assert "ages" in ins, sorted(ins)
+    keys = [key for key in ("h", "tokens", "mask") if key in ins]
+
+    def run_onnx(seq: torch.Tensor, dt_seq: list, age_seq: torch.Tensor) -> list[np.ndarray]:
+        state = {key: np.full([int(d) for d in ins[key].shape], float(RESIDUAL_S) + 1.0 if key == "mask" else 0.0,
+                              dtype=np.float32) for key in keys}
+        got = []
+        for frame, dt, age in zip(seq, dt_seq, age_seq):
+            feeds = {"strip": frame.numpy(), "dt": np.asarray([dt], np.float32), "ages": age.numpy(), **state}
+            out = dict(zip(outs_names, sess.run(None, {ins[k].name: v for k, v in feeds.items()})))
+            state = {key: out[key] for key in keys}
+            got.append(np.stack([out[name].reshape(-1) for name in CTL_OUTPUT_FIELDS]))
+        return got
+
+    o_first = run_onnx(frames, dts, ages)
+    o_second = run_onnx(changed_frames, changed_dts, changed_ages)
+    for t in range(t_cut + 1):
+        assert np.array_equal(o_first[t], o_second[t]), t
+    assert not np.array_equal(o_first[t_cut + 4], o_second[t_cut + 4])
+    # Same net, same inputs: ONNX tracks torch (not bit-equal across runtimes).
+    assert max(float(np.abs(o_first[t] - first[t].numpy().reshape(3, -1)).max()) for t in range(steps)) < 1e-3
 
     _check_cli_refusals()
-    print("T6 contract: arch tag, outputs/metadata only when on, default unchanged, refusals exit 2 OK")
+    print("T6 contract: arch tag, outputs/metadata only when on, default unchanged, cam-age causality bit-identical "
+          "in torch and ONNX, refusals exit 2 and write nothing OK")
 
 
 def _main_code(argv: list[str]) -> tuple[int | None, str]:
@@ -475,6 +647,17 @@ def _main_code(argv: list[str]) -> tuple[int | None, str]:
         except SystemExit as exc:
             code = exc.code
     return code, out.getvalue()
+
+
+def _listing(root: Path) -> dict[str, tuple[int, str]]:
+    """Every dir and file under ``root``: relative path -> (size, sha256); dirs are (-1, "")."""
+    import hashlib
+
+    out = {}
+    for path in sorted(Path(root).rglob("*")):
+        rel = path.relative_to(root).as_posix()
+        out[rel] = (-1, "") if path.is_dir() else (path.stat().st_size, hashlib.sha256(path.read_bytes()).hexdigest())
+    return out
 
 
 def _check_cli_refusals() -> None:
@@ -499,16 +682,18 @@ def _check_cli_refusals() -> None:
         (pfull / "scene.gvd-pause.npz").write_bytes(b"x")
         cases.append((["--heads", "lane_gt,ctl", "--ckpt-dir", str(full)], "create-only"))
         cases.append((["--heads", "lane_gt,ctl", "--pause-dir", str(pfull)], "create-only"))
-        for extra, needle in cases:
-            code, text = _main_code(base + extra)
-            assert code == 2, (extra, code, text[-2000:])
-            assert needle in text, (needle, text[-2000:])
-            assert not (tmp / "x.onnx").exists()
         cache = tmp / "cache"
         cache.mkdir()
         (cache / "keep.txt").write_text("keep", encoding="utf-8")
-        code, text = _main_code(["--strips", str(strips), "--build-cache", str(cache)])
-        assert code == 2 and "create-only" in text, (code, text[-2000:])
+        cases.append((["--build-cache", str(cache)], "create-only"))
+        for extra, needle in cases:
+            before = _listing(tmp)
+            argv = ["--strips", str(strips)] + extra if extra[0] == "--build-cache" else base + extra
+            code, text = _main_code(argv)
+            assert code == 2, (extra, code, text[-2000:])
+            assert needle in text, (needle, text[-2000:])
+            after = _listing(tmp)
+            assert after == before, (extra, sorted(set(after) ^ set(before)))
         assert (cache / "keep.txt").read_text(encoding="utf-8") == "keep"
 
 
@@ -569,83 +754,149 @@ def _fixture(root: Path) -> None:
     (root / "gt.jsonl").write_text("\n".join(json.dumps(r) for r in gt_lines) + "\n", encoding="utf-8")
 
 
+def _first_val_block(text: str) -> tuple[dict, dict]:
+    """The epoch-0 holdout lines from stdout: the ``val step=`` line and its ``val ctl`` lines.
+
+    Under ``main(argv)`` there is no status dir on a box without the data disk, so stdout is the record.
+    """
+    lines = text.splitlines()
+    start = next(k for k, line in enumerate(lines) if line.startswith("[GVD] val step="))
+    val = {key: value for key, value in re.findall(r"(\w+)=(\S+)", lines[start])}
+    ctl: dict = {}
+    for line in lines[start + 1:]:
+        got = re.match(r"^\[GVD\] val ctl h=(\d) (.*)$", line)
+        if got:
+            ctl[got.group(1)] = dict(re.findall(r"(\w+)=(\S+)", got.group(2)))
+            continue
+        if line.startswith("[GVD] val ctl run "):
+            ctl["run"] = dict(re.findall(r"(\w+)=(\S+)", line))
+            break
+    return val, ctl
+
+
 def check_t7_tiny_run() -> None:
     import onnxruntime as ort
     import torch
 
+    import export_epoch_onnx
     from eval_onnx_holdout import evaluate
-    from python.train.epoch_ckpt import export_epoch_onnx, load_epoch_ckpt
-    from python.train.train_scene import train_directory
+    from eval_onnx_holdout import main as eval_main
+    from python.train.epoch_ckpt import load_epoch_ckpt
 
     torch.manual_seed(0)
     with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp) / "rec"
+        tmp = Path(tmp)
+        root = tmp / "data" / "rec"
         _fixture(root)
-        ckpts = Path(tmp) / "ckpts"
-        log = io.StringIO()
-        with contextlib.redirect_stdout(log):
-            train_directory(
-                root,
-                epochs=1,
-                lr=1e-3,
-                capability=None,
-                export_path=None,
-                free_vram_bytes=0,
-                free_ram_bytes=8_000_000_000,
-                resume=False,
-                open_panel=False,
-                autostart=True,
-                cams=ALL8,
-                heads=("lane_gt", "ctl"),
-                augment=False,
-                workers=0,
-                min_valid=0.0,
-                holdout_blocks=1,
-                cam_age=True,
-                ckpt_dir=ckpts,
-                status_root=Path(tmp) / "_status",
-            )
-        text = log.getvalue()
+        run = tmp / "run"
+        ckpts, pause = run / "ckpts", run / "pause"
+        assert not run.exists()
+        # The real entry point, clean dirs. --exact-epochs 1: epoch 0 only, then stop
+        # (plain --epochs is logged, not a cap).
+        code, text = _main_code([
+            "--strips", str(root), "--cams", ",".join(ALL8), "--cam-age", "--heads", "lane_gt,ctl",
+            "--exact-epochs", "1", "--no-panel", "--autostart", "--workers", "0", "--min-valid", "0",
+            "--holdout-blocks", "1", "--ckpt-dir", str(ckpts), "--pause-dir", str(pause),
+        ])
+        assert code == 0, (code, text[-3000:])
+        assert "[GVD] exact epochs: stopped after epoch=0 (early stop off)" in text, text[-3000:]
+        assert "[GVD] holdout stopped" not in text
         mask = [line for line in text.splitlines() if line.startswith("[GVD] ctl mask:")]
         assert len(mask) == 1, text[-3000:]
         assert "[GVD] ctl lag: median_ms=" in text, text[-3000:]
         assert re.search(r"\[GVD\] ctl/lane_gt epoch=0 step=0 ", text), text[-3000:]
-        for h in (0, 1, 2, 3, 4, 5):
-            assert re.search(rf"^\[GVD\] val ctl h={h} n=\d+ steer_mae=", text, re.M), (h, text[-3000:])
         run_lines = re.findall(r"^\[GVD\] val ctl run verdict=\S+ h0=\S+ h3=\S+ h4=\S+ h5=\S+ lane=\S+$", text, re.M)
-        assert run_lines, text[-3000:]
+        assert run_lines and all(line.endswith("lane=UNPROVEN") for line in run_lines), run_lines
+        assert not any("verdict=PASS" in line for line in run_lines), run_lines
         print(mask[0])
-        print(run_lines[-1])
+        print(run_lines[0])
+        val, logged = _first_val_block(text)
+        assert {"0", "1", "2", "3", "4", "5"} <= set(logged), sorted(logged)
+        assert int(logged["0"]["n"]) > 0, logged.get("0")  # h4/h5 can be n=0 on this short holdout
         ep0 = sorted(ckpts.glob("*.ckpt_ep0_step*.npz"))
-        assert len(ep0) == 1, sorted(p.name for p in ckpts.glob("*"))
+        assert len(ep0) == 1 and len(list(ckpts.glob("*.npz"))) == 1, sorted(p.name for p in ckpts.glob("*"))
         meta = load_epoch_ckpt(ep0[0])["meta"]
-        assert meta["ctl"] is True and "ctl" in meta["heads"], meta
-        status = Path(tmp) / "_status" / "metrics.jsonl"
-        vals = [json.loads(line) for line in status.read_text(encoding="utf-8").splitlines() if line.strip()]
-        vals = [rec for rec in vals if rec.get("kind") == "val"]
-        rec = next(r for r in vals if r["epoch"] == 0)
-        assert rec.get("ctl") and rec["ctl"]["h"]["0"]["n"] > 0, rec.get("ctl")
-        out = Path(tmp) / "ep0.onnx"
-        export_epoch_onnx(ep0[0], out)
+        assert meta["ctl"] is True and "ctl" in meta["heads"] and meta.get("cam_age") is True, meta
+        out = tmp / "ep0.onnx"
+        # Missing epoch: export refuses --epoch 1 (only ckpt_ep0 exists), nothing written.
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                missing = export_epoch_onnx.main(["--ckpt-dir", str(ckpts), "--epoch", "1", "--out", str(tmp / "ep1.onnx")])
+            except SystemExit as exc:
+                missing = exc.code
+        assert missing not in (0, None) and not (tmp / "ep1.onnx").exists(), missing
+        assert export_epoch_onnx.main(["--ckpt-dir", str(ckpts), "--epoch", "0", "--out", str(out)]) == 0
         session = ort.InferenceSession(str(out), providers=["CPUExecutionProvider"])
         shapes = {o.name: list(o.shape) for o in session.get_outputs()}
         for name in ("ctl_steer", "ctl_throttle", "ctl_brake"):
             assert shapes.get(name) == [1, 6], (name, shapes)
-        assert dict(session.get_modelmeta().custom_metadata_map)["gvd_ctl"] == "1"
-        result = evaluate(root, out, holdout_blocks=1, eval_chunk=16)
+        meta_map = dict(session.get_modelmeta().custom_metadata_map)
+        assert meta_map["gvd_ctl"] == "1" and meta_map.get("gvd_cam_age") == "1", meta_map
+
+        # Lane bar, no usable run-A file: UNPROVEN, so the run is at best UNPROVEN.
+        result = evaluate(root, out, holdout_blocks=1, eval_chunk=16, lane_ref=tmp / "no_run_a.json", expect_epoch=0)
         assert result.get("ctl"), sorted(result)
+        assert re.fullmatch(r"[0-9a-f]{64}", str(result.get("rows_sha"))), result.get("rows_sha")
+        assert result["epoch"] == 0 and result["epoch_ok"] is True, (result["epoch"], result.get("epoch_ok"))
+        assert result["lane_bar"]["verdict"] == "UNPROVEN" and result["ctl"]["lane"] == "UNPROVEN", result["lane_bar"]
+        assert result["ctl"]["run"] != "PASS"
         for h in ("0", "3", "4", "5"):
-            got, want = result["ctl"]["h"][h], rec["ctl"]["h"][h]
-            assert got["n"] == want["n"], (h, got["n"], want["n"])
+            got, want = result["ctl"]["h"][h], logged[h]
+            assert got["n"] == int(want["n"]), (h, got["n"], want["n"])
             for key in ("steer_mae", "thr_mae", "brk_mae", "b4_steer"):
-                if want[key] is None:
+                if want[key] == "na":
                     assert got[key] is None, (h, key)
                     continue
                 assert abs(float(got[key]) - float(want[key])) < 1e-3, (h, key, got[key], want[key])
-        assert abs(float(result["rms"]) - float(rec["rms"])) < 1e-3
+        assert abs(float(result["rms"]) - float(val["rms"])) < 1e-3, (result["rms"], val["rms"])
+        assert result["n"] == int(val["n"])
+
+        # Run A's eval JSON (lane_gt-only: no ctl block) on the same holdout and epoch.
+        run_a = {key: result[key] for key in ("rms", "n", "holdout_rows", "epoch", "step", "rows_sha")}
+        a_pass = tmp / "a_pass.json"
+        a_pass.write_text(json.dumps(run_a), encoding="utf-8")
+        b_json = tmp / "b_eval.json"
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log):
+            assert eval_main(["--strips", str(root), "--onnx", str(out), "--holdout-blocks", "1",
+                              "--expect-epoch", "0", "--lane-ref", str(a_pass), "--json", str(b_json)]) == 0
+        printed = log.getvalue()
+        assert re.search(r"^\[GVD\] val \(onnx\) lane bar verdict=PASS ", printed, re.M), printed[-2000:]
+        saved = json.loads(b_json.read_text(encoding="utf-8"))
+        assert saved["rows_sha"] == result["rows_sha"] and saved["epoch_ok"] is True, saved.get("rows_sha")
+        assert saved["lane_bar"]["verdict"] == "PASS" and saved["ctl"]["lane"] == "PASS", saved["lane_bar"]
+        assert re.search(r"^\[GVD\] val \(onnx\) ctl run verdict=\S+ .* lane=PASS$", printed, re.M), printed[-2000:]
+        # A twice as good as B: lane FAIL, and the run FAILs with it.
+        a_fail = tmp / "a_fail.json"
+        a_fail.write_text(json.dumps(dict(run_a, rms=float(result["rms"]) / 2.0)), encoding="utf-8")
+        failed = evaluate(root, out, holdout_blocks=1, eval_chunk=16, lane_ref=a_fail)
+        assert failed["lane_bar"]["verdict"] == "FAIL" and failed["ctl"]["run"] == "FAIL", failed["lane_bar"]
+        # --expect-epoch: a different epoch, or an ONNX with no gvd_ckpt_epoch, makes the
+        # ctl run and the lane bar UNPROVEN (even against a lane ref that would FAIL or PASS).
+        import onnx
+
+        for lane_file in (a_pass, a_fail):
+            wrong = evaluate(root, out, holdout_blocks=1, eval_chunk=16, lane_ref=lane_file, expect_epoch=3)
+            assert wrong["epoch_ok"] is False, wrong.get("epoch_ok")
+            assert wrong["lane_bar"]["verdict"] == "UNPROVEN" and wrong["ctl"]["run"] == "UNPROVEN", wrong["lane_bar"]
+            assert "expect-epoch" in wrong["lane_bar"]["reason"], wrong["lane_bar"]
+        model = onnx.load(str(out))
+        kept = [p for p in model.metadata_props if p.key != "gvd_ckpt_epoch"]
+        del model.metadata_props[:]
+        model.metadata_props.extend(kept)
+        no_epoch = tmp / "ep0_no_epoch.onnx"
+        onnx.save(model, str(no_epoch))
+        bare = evaluate(root, no_epoch, holdout_blocks=1, eval_chunk=16, lane_ref=a_pass, expect_epoch=0)
+        assert bare["epoch"] is None and bare["epoch_ok"] is False, (bare["epoch"], bare.get("epoch_ok"))
+        assert bare["lane_bar"]["verdict"] == "UNPROVEN" and bare["ctl"]["run"] == "UNPROVEN", bare["lane_bar"]
+        # Without --expect-epoch that ONNX still has no epoch: the lane bar is UNPROVEN (epoch missing).
+        loose = evaluate(root, no_epoch, holdout_blocks=1, eval_chunk=16, lane_ref=a_pass)
+        assert loose["epoch_ok"] is None and loose["lane_bar"]["verdict"] == "UNPROVEN", loose["lane_bar"]
         print(
-            f"T7 tiny run: ckpt_ep0 + ONNX ctl [1,6]; onnx h0 steer_mae={result['ctl']['h']['0']['steer_mae']:.5f} "
-            f"logged={rec['ctl']['h']['0']['steer_mae']:.5f} n={rec['ctl']['h']['0']['n']}"
+            f"T7 tiny run (main argv, 8 cams, --cam-age): ckpt_ep0 + ONNX ctl [1,6]; "
+            f"onnx h0 steer_mae={result['ctl']['h']['0']['steer_mae']:.5f} logged={logged['0']['steer_mae']} "
+            f"n={logged['0']['n']}; lane bar missing->UNPROVEN, equal->PASS, A/2->FAIL; "
+            f"--expect-epoch 3 / no gvd_ckpt_epoch -> UNPROVEN; export --epoch 1 refused"
         )
 
 

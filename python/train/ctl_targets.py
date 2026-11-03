@@ -21,6 +21,7 @@ verdicts; ``val_lines`` prints them.
 """
 from __future__ import annotations
 
+import json
 import math
 from typing import Any, Iterable, Mapping
 
@@ -346,11 +347,26 @@ def _unique_rows(rows: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
     return out
 
 
+def ctl_scored(row: Mapping[str, Any] | None) -> bool:
+    """True when a row counts for ctl scoring and B1: it has targets and passes ``loss_mask``.
+
+    Same gate as training (rows that fail ``scene_net.loss_mask`` get no loss).
+    """
+    if not row or "ctl" not in row or "ctl_valid" not in row:
+        return False
+    from python.train.scene_net import loss_mask
+
+    return bool(loss_mask(row))
+
+
 def b1_constants(train_rows: Iterable[Mapping[str, Any]]) -> dict[str, np.ndarray]:
-    """Per (channel, horizon) median and mean of the valid train-split targets (B1)."""
+    """Per (channel, horizon) median and mean of the valid train-split targets (B1).
+
+    Only rows that pass ``loss_mask`` (:func:`ctl_scored`), as in training.
+    """
     median = np.zeros((3, K), dtype=np.float32)
     mean = np.zeros((3, K), dtype=np.float32)
-    rows = [row for row in _unique_rows(train_rows) if "ctl" in row and "ctl_valid" in row]
+    rows = [row for row in _unique_rows(train_rows) if ctl_scored(row)]
     if not rows:
         return {"median": median, "mean": mean, "n": np.zeros((3, K), dtype=np.int64)}
     ctl = np.stack([np.asarray(row["ctl"], dtype=np.float32) for row in rows])
@@ -470,11 +486,15 @@ def horizon_verdict(verdicts: Iterable[str]) -> str:
 
 
 def run_verdict(by_h: Mapping[int, str], lane: str) -> str:
-    """FAIL if any graded horizon or the lane bar fails; PASS only if all four graded horizons pass."""
+    """FAIL if any graded horizon or the lane bar fails.
+
+    PASS only if all four graded horizons pass AND the lane bar passes; an
+    unproven lane bar (no usable run-A data) caps the run at UNPROVEN.
+    """
     graded = [by_h.get(h, "UNPROVEN") for h in GRADED]
     if "FAIL" in graded or lane == "FAIL":
         return "FAIL"
-    return "PASS" if all(v == "PASS" for v in graded) else "UNPROVEN"
+    return "PASS" if all(v == "PASS" for v in graded) and lane == "PASS" else "UNPROVEN"
 
 
 def lane_verdict(rms: float | None, paired_rms: float | None) -> str:
@@ -482,6 +502,90 @@ def lane_verdict(rms: float | None, paired_rms: float | None) -> str:
     if rms is None or paired_rms is None:
         return "UNPROVEN"
     return "PASS" if float(rms) <= 1.05 * float(paired_rms) + 1e-12 else "FAIL"
+
+
+LANE_BAR = 1.05
+
+
+def holdout_rows_sha(rows: Any) -> str:
+    """sha256 of the ordered holdout row keys ``segment:i``, one per line (the eval JSON ``rows_sha``)."""
+    import hashlib
+
+    text = "".join(f"{row.get('segment')}:{row.get('i')}\n" for row in rows)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def lane_bar(result: Mapping[str, Any], ref_path: Any) -> dict[str, Any]:
+    """Lane bar from run A's holdout eval JSON (``eval_onnx_holdout --json``, lane_gt-only run).
+
+    PASS when B's holdout lane rms <= 1.05 x A's; FAIL above. UNPROVEN when
+    there is no path, the file is missing or unreadable, either rms is not a
+    finite number, A has a ctl block (not a lane_gt-only run), A failed its
+    ``--expect-epoch`` check, or ``rows_sha`` (the holdout rows) or ``epoch``
+    is missing on either side or differs.
+    """
+    out: dict[str, Any] = {"verdict": "UNPROVEN", "rms": None, "ref_rms": None, "ratio": None, "bar": LANE_BAR,
+                           "ref": None if ref_path is None else str(ref_path), "reason": ""}
+
+    def finite(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return None
+        return num if math.isfinite(num) else None
+
+    rms = finite(result.get("rms"))
+    out["rms"] = rms
+    if ref_path is None:
+        out["reason"] = "no --lane-ref (run A eval JSON)"
+        return out
+    try:
+        with open(ref_path, encoding="utf-8") as handle:
+            ref = json.load(handle)
+    except FileNotFoundError:
+        out["reason"] = "run A eval JSON missing"
+        return out
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        out["reason"] = f"run A eval JSON unreadable ({type(exc).__name__})"
+        return out
+    if not isinstance(ref, Mapping):
+        out["reason"] = "run A eval JSON unreadable (not an object)"
+        return out
+    ref_rms = finite(ref.get("rms"))
+    out["ref_rms"] = ref_rms
+    if ref_rms is None or ref_rms <= 0.0 or rms is None:
+        out["reason"] = "no rms (run A or this run)"
+        return out
+    if "ctl" in ref:
+        out["reason"] = "run A is not a lane_gt-only run (it has a ctl block)"
+        return out
+    if ref.get("epoch_ok") is False:
+        out["reason"] = "run A failed its --expect-epoch check"
+        return out
+    a_sha, b_sha = ref.get("rows_sha"), result.get("rows_sha")
+    if not a_sha or not b_sha:
+        out["reason"] = f"rows_sha missing (A={a_sha} B={b_sha})"
+        return out
+    if str(a_sha) != str(b_sha):
+        out["reason"] = f"holdout differs (rows_sha: A={str(a_sha)[:12]} B={str(b_sha)[:12]})"
+        return out
+    a_ep, b_ep = ref.get("epoch"), result.get("epoch")
+    if a_ep is None or b_ep is None or isinstance(a_ep, bool) or isinstance(b_ep, bool):
+        out["reason"] = f"epoch missing (A={a_ep} B={b_ep})"
+        return out
+    try:
+        same_epoch = int(a_ep) == int(b_ep)
+    except (TypeError, ValueError):
+        same_epoch = False
+    if not same_epoch:
+        out["reason"] = f"epoch differs (A={a_ep} B={b_ep})"
+        return out
+    out["ratio"] = rms / ref_rms
+    out["verdict"] = "PASS" if rms <= LANE_BAR * ref_rms + 1e-12 else "FAIL"
+    out["reason"] = f"rms {rms:.6g} vs {LANE_BAR} x A {ref_rms:.6g}"
+    return out
 
 
 def score_ctl(
@@ -496,6 +600,8 @@ def score_ctl(
     The model and every baseline use the same valid (row, h) set; B2 (report
     only) skips a row without a previous row within 0.25 s.
     """
+    # Same gate as the training loss: a row that fails loss_mask is not scored (model or baseline).
+    records = [(row, pred) for row, pred in records if ctl_scored(row)]
     rows = [row for row, _pred in records]
     preds = [np.asarray(pred, dtype=np.float64).reshape(3, K) for _row, pred in records]
     prev = b2_pairs(rows)

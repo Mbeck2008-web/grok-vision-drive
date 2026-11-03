@@ -35,6 +35,7 @@ if str(ROOT) not in sys.path:
 
 from python.data.raw_frames import LossyFramesError  # noqa: E402
 from python.train.event_mask import MaskFileError  # noqa: E402
+from python.train.ctl_targets import CtlDataError  # noqa: E402
 from python.data.strip_writer import CANVAS_H, CANVAS_W  # noqa: E402
 from python.train.continual import (  # noqa: E402
     CHUNK_MAX,
@@ -46,6 +47,7 @@ from python.train.continual import (  # noqa: E402
     holdout_stopped,
     offcenter_view,
     pass_plan,
+    remaining_until_exact_end,
     remaining_until_holdout_can_stop,
     resume_learning_rate,
 )
@@ -80,10 +82,12 @@ from python.train.scene_net import (  # noqa: E402
     torch_ready,
 )
 from python.train.checkpoint import (  # noqa: E402
+    ExactEpochsMismatch,
     PauseDirRefused,
     check_pause_dir,
     checkpoint_path,
     clear_checkpoint,
+    exact_epochs_resume_refusal,
     load_checkpoint,
     resume_fields,
     save_checkpoint,
@@ -138,6 +142,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train the GVD scene net from recorded strips")
     parser.add_argument("--strips", type=str, default="", help="Recording directory with state.jsonl and raw/<cam>/ frames. JPEG strips/ are refused.")
     parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument(
+        "--exact-epochs",
+        type=int,
+        default=None,
+        help="Train exactly N epochs (ckpt_ep0..ckpt_ep{N-1}); the holdout early stop and best-epoch reload are off.",
+    )
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument(
         "--batch",
@@ -304,6 +314,12 @@ def build_parser() -> argparse.ArgumentParser:
             "Scale on the lane_gt confidence BCE in the training loss (default 0.1). "
             "Model selection uses the 8 m center rms only."
         ),
+    )
+    parser.add_argument(
+        "--ctl-weight",
+        type=float,
+        default=None,
+        help="Scale on the ctl loss (default 1.0). Only with --heads lane_gt,ctl; must be > 0.",
     )
     parser.add_argument(
         "--init-head-bias",
@@ -542,7 +558,17 @@ def _as_target(labels: dict[str, Any], device: Any) -> dict[str, Any]:
 
 
 def _prediction_at(pred: ScenePrediction, index: int) -> ScenePrediction:
-    return ScenePrediction(**{name: getattr(pred, name)[index] for name in OUTPUT_FIELDS})
+    from python.train.scene_net import CTL_OUTPUT_FIELDS
+
+    extra = {name: getattr(pred, name)[index] for name in CTL_OUTPUT_FIELDS if getattr(pred, name, None) is not None}
+    return ScenePrediction(**{name: getattr(pred, name)[index] for name in OUTPUT_FIELDS}, **extra)
+
+
+def _loss_terms(net: Any) -> tuple[str, ...]:
+    """LOSS_TERMS, plus ``ctl`` for a ctl net (the trace and step logs show it)."""
+    from python.train.scene_net import LOSS_TERMS
+
+    return tuple(LOSS_TERMS) + (("ctl",) if bool(getattr(net, "ctl", False)) else ())
 
 
 # Confidence BCE scale in the training loss. 1.0 let the 0/1 paint-coverage
@@ -683,6 +709,17 @@ def apply_head_bias(net: Any, constants: Any) -> None:
     with torch.no_grad():
         bias = net.lane_gt_head.bias
         bias.copy_(torch.as_tensor(np.asarray(constants, dtype=np.float32), device=bias.device, dtype=bias.dtype))
+
+
+def ctl_ratio_line(epoch: int, step: int, heads: Mapping[str, Any]) -> str:
+    ctl = heads.get("ctl")
+    lane = heads.get("lane_gt")
+    ratio = None
+    if ctl is not None and lane is not None and float(lane) > 0.0:
+        ratio = float(ctl) / float(lane)
+    flag = "na" if ratio is None else ("ok" if 0.1 <= ratio <= 10.0 else "OUTSIDE_0.1_10")
+    fmt = lambda v: "na" if v is None else f"{float(v):.6g}"  # noqa: E731
+    return f"[GVD] ctl/lane_gt epoch={int(epoch)} step={int(step)} ratio={fmt(ratio)} ctl={fmt(ctl)} lane_gt={fmt(lane)} {flag}"
 
 
 def _stack_states(*states: SceneState) -> SceneState:
@@ -1032,6 +1069,7 @@ def _optimizer_step(
     conf_weight: float = 1.0,
     scale: float = 1.0,
     frame_ages: list[Any] | None = None,
+    ctl_weight: float = 1.0,
 ) -> tuple[float | None, int, SceneState, SceneState]:
     """Backprop through this chunk only.
 
@@ -1041,7 +1079,7 @@ def _optimizer_step(
     """
     import torch
 
-    from python.train.scene_net import LOSS_TERMS
+    LOSS_TERMS = _loss_terms(net)
 
     started = time.perf_counter()
     net.train()
@@ -1082,7 +1120,8 @@ def _optimizer_step(
             labels = labels_for_row(row)
             lane_gt_rows += int(has_lane_gt(labels))
             step = scene_loss(
-                one, _as_target(labels, device), heads, lane_loss=lane_loss, conf_weight=conf_weight
+                one, _as_target(labels, device), heads, lane_loss=lane_loss, conf_weight=conf_weight,
+                ctl_weight=ctl_weight,
             )
             if trace is not None and trace.get("print_shapes") and not trace.get("shapes_printed"):
                 _print_step_shapes(image, one, step, state)
@@ -1175,6 +1214,7 @@ def _optimizer_group(
     conf_weight: float = 1.0,
     scale: float = 1.0,
     age_sets: list[list[Any] | None] | None = None,
+    ctl_weight: float = 1.0,
 ) -> tuple[float | None, int, SceneState, SceneState]:
     """One step on several windows that each start from a fresh GRU state.
 
@@ -1182,7 +1222,7 @@ def _optimizer_group(
     """
     import torch
 
-    from python.train.scene_net import LOSS_TERMS
+    LOSS_TERMS = _loss_terms(net)
 
     started = time.perf_counter()
     net.train()
@@ -1237,7 +1277,8 @@ def _optimizer_group(
             labels = labels_for_row(row)
             lane_gt_rows += int(has_lane_gt(labels))
             step = scene_loss(
-                one, _as_target(labels, device), heads, lane_loss=lane_loss, conf_weight=conf_weight
+                one, _as_target(labels, device), heads, lane_loss=lane_loss, conf_weight=conf_weight,
+                ctl_weight=ctl_weight,
             )
             value = step["total"]
             item_loss = float(value.detach().item())
@@ -1322,6 +1363,8 @@ def _eval_sequence(
     parts: dict[str, float] | None = None,
     conf_weight: float = 1.0,
     preds_out: list[Any] | None = None,
+    ctl_weight: float = 1.0,
+    ctl_out: list[Any] | None = None,
 ) -> tuple[float | None, int]:
     """Holdout forward. No optimizer step and no gradient through these frames.
 
@@ -1332,6 +1375,7 @@ def _eval_sequence(
     The loss, ``parts`` (``lane_reg``/``conf_bce`` sums and ``n``),
     ``pair_rows`` (the row behind each primary pair) and ``preds_out``
     (``(row, vector)`` per scored frame) follow the primary stream.
+    ``ctl_out`` gets ``(row, ctl (3, K))`` per frame of a ctl net, primary stream.
     """
     import torch
 
@@ -1366,6 +1410,12 @@ def _eval_sequence(
                 gt_vec, gt_mask = lane_gt_from_record(tech if isinstance(tech, dict) else None)
                 if preds_out is not None and getattr(one, "lane_gt", None) is not None:
                     preds_out.append((row, one.lane_gt.detach().float().cpu().numpy().reshape(-1)))
+                # Scored rows match the loss rows: loss_mask gates ctl scoring like the loss below.
+                if ctl_out is not None and getattr(one, "ctl_steer", None) is not None and "ctl_valid" in row and loss_mask(row):
+                    ctl_out.append((row, np.stack([
+                        getattr(one, name).detach().float().cpu().numpy().reshape(-1)
+                        for name in ("ctl_steer", "ctl_throttle", "ctl_brake")
+                    ])))
                 if (pairs is not None or pairs_long is not None) and lane_center_is_valid(gt_mask):
                     gt_x = lane_x_from_vector(gt_vec)
                     gt_f = float("nan") if gt_x is None else float(gt_x)
@@ -1382,7 +1432,9 @@ def _eval_sequence(
                             pairs_long.append(pair)
                 if not loss_mask(row):
                     continue
-                step = scene_loss(one, _as_target(labels_for_row(row), device), heads, conf_weight=conf_weight)
+                step = scene_loss(
+                    one, _as_target(labels_for_row(row), device), heads, conf_weight=conf_weight, ctl_weight=ctl_weight
+                )
                 value = step["total"]
                 total = value if total is None else total + value
                 n_loss += 1
@@ -1560,6 +1612,7 @@ def _save_pause(
     device_name: str,
     recommended: bool,
     pause_dir: Path | None = None,
+    exact_epochs: int | None = None,
 ) -> dict[str, Any]:
     """Save weights before the loop stops. Strip files are not rewritten."""
     used_cams = tuple(getattr(net, "cams", ()) or ()) or None
@@ -1578,6 +1631,7 @@ def _save_pause(
             "weights": {key: value.detach().cpu().numpy() for key, value in net.state_dict().items()},
             "optimizer": _to_numpy_tree(opt.state_dict()),
             "scaler": None if scaler is None else _to_numpy_tree(scaler.state_dict()),
+            "exact_epochs": None if exact_epochs is None else int(exact_epochs),
         },
         used_cams,
         getattr(net, "pause_arch", None),
@@ -1752,6 +1806,8 @@ def train_directory(
     cam_age: bool = False,
     grad_ckpt: bool = False,
     pause_dir: Path | None = None,
+    ctl_weight: float = 1.0,
+    exact_epochs: int | None = None,
 ) -> dict[str, Any]:
     import torch
 
@@ -1766,6 +1822,9 @@ def train_directory(
     train_cams = canonical_cams(cams) if cams else None
     train_heads = tuple(heads) if heads else None
     use_cam_age = bool(cam_age)
+    use_ctl = bool(train_heads) and "ctl" in train_heads
+    if use_ctl and backbone not in ("", "scratch"):
+        raise SystemExit("ctl is wired into the scratch net only (--backbone scratch)")
     if grad_ckpt and backbone not in ("", "scratch"):
         raise SystemExit("--grad-ckpt checkpoints the scratch net's per-tick encoder; it is not wired into --backbone imagenet-*")
     if use_cam_age and backbone not in ("", "scratch"):
@@ -1890,6 +1949,24 @@ def train_directory(
             "reset at respawn, segment and train/holdout runs)",
             flush=True,
         )
+    ctl_b1: dict[str, Any] = {}
+    ctl_lock: float | None = None
+    if use_ctl:
+        from python.data.cam_hold import plan_labels
+        from python.train.ctl_targets import CtlDataError, attach_ctl, b1_constants, lag_line, lag_stats, mask_line
+        from python.train.event_mask import read_impacts
+
+        lag = lag_stats(state_rows)
+        print(lag_line(lag), flush=True)
+        if not lag["ok"]:
+            raise CtlDataError("ctl lag gate failed (median_ms <= 50 and p99_ms < 100 at shift 0 are required)")
+        # Labels from the full recording, inputs from the kept rows; per piece of the plan.
+        ctl_counts = attach_ctl(state_rows, rows, plan=startup_plan, impacts=read_impacts(root))
+        print(mask_line(ctl_counts), flush=True)
+        ctl_lock = ctl_counts.get("lock_deg")
+        train_ids = {i for i, label in plan_labels(startup_plan).items() if label == "train"}
+        # b1_constants keeps only loss_mask rows, as the training loss does.
+        ctl_b1 = b1_constants([row for row in rows if row.get("i") in train_ids])
     print(
         f"[GVD] holdout: rows={mix['rows']} slices={mix['slices']} fast={mix['fast']} slow={mix['slow']} "
         f"no_speed={mix['no_speed']} (fast is row speed >= {HOLDOUT_FAST_MPS} m/s)",
@@ -1914,6 +1991,10 @@ def train_directory(
     view.load_folder(root, checkpoint_path(root, pause_dir))
     # The CLI epoch count is not the stop. The holdout decides.
     requested_epochs = int(epochs)
+    # --exact-epochs N: epochs 0..N-1, then stop; no holdout stop, no best-epoch reload.
+    exact_n = None if exact_epochs is None else int(exact_epochs)
+    if exact_n is not None and (exact_n < 1 or sanity or dry_run):
+        raise SystemExit("--exact-epochs needs N >= 1 and refuses --dry-run / --sanity")
 
     def _empty(precision: str = "fp32") -> dict[str, Any]:
         if export_path is not None:
@@ -1932,6 +2013,7 @@ def train_directory(
             "free_vram_bytes": int(free_vram_bytes),
             "free_ram_bytes": int(free_ram_bytes),
             "requested_epochs": requested_epochs,
+            "exact_epochs": exact_n,
         }
 
     if not rows:
@@ -1958,7 +2040,7 @@ def train_directory(
         device = torch.device(device_name)
         if "net" not in holder:
             if backbone in ("", "scratch"):
-                holder["net"] = SceneNet(cams=train_cams, scale=input_scale, cam_age=use_cam_age).to(device)
+                holder["net"] = SceneNet(cams=train_cams, scale=input_scale, cam_age=use_cam_age, ctl=use_ctl).to(device)
                 if grad_ckpt:
                     holder["net"].grad_ckpt = True
                     print(
@@ -2166,6 +2248,7 @@ def train_directory(
                 device_name=device.type,
                 recommended=recommended,
                 pause_dir=pause_dir,
+                exact_epochs=exact_n,
             )
             last_ckpt = now
             print(f"[GVD] checkpoint step={done}", flush=True)
@@ -2194,6 +2277,7 @@ def train_directory(
             "val": {key: json_num(scored.get(key)) for key in ("n", "r", "rms", "rms_mean", "bias", "pred_mean", "pred_std")},
             "cams": list(train_cams or ()),
             "cam_age": bool(use_cam_age),
+            "ctl": bool(use_ctl),
             "heads": list(train_heads or ()),
             "scale": float(input_scale),
             "backbone": str(backbone),
@@ -2207,6 +2291,7 @@ def train_directory(
             "holdout_cells": bool(holdout_cells),
             "lr": float(holder.get("lr", lr)),
             "batch": int(batch),
+            "exact_epochs": exact_n,
         }
         weights = {key: value.detach().cpu().numpy() for key, value in net.state_dict().items()}
         try:
@@ -2239,6 +2324,7 @@ def train_directory(
             device_name=device.type,
             recommended=recommended,
             pause_dir=pause_dir,
+            exact_epochs=exact_n,
         )
         view.mark_paused(payload)
         if not _wait_for_start(view):
@@ -2267,6 +2353,7 @@ def train_directory(
         nonlocal device, net, batch, recommended, windows, last_batch
         nonlocal steps_per_epoch, eta_pass, schedule_printed
         history: list[float] = []
+        ctl_ratio_done: set[int] = set()
         best_value: float | None = None
         best_blob: dict[str, Any] | None = None
         lane_gt_seen = LaneGtCoverage("lane_gt" in head_names(train_heads))
@@ -2299,6 +2386,7 @@ def train_directory(
             val_pairs_long: list[tuple[float, float]] = []
             val_rows: list[Mapping[str, Any]] = []
             val_parts: dict[str, float] = {"lane_reg": 0.0, "conf_bce": 0.0, "n": 0}
+            val_ctl: list[Any] = []
             index = 0
             prefetch = _prefetch_loader(
                 plan_steps,
@@ -2349,6 +2437,8 @@ def train_directory(
                         pair_rows=val_rows,
                         parts=val_parts,
                         conf_weight=float(conf_weight),
+                        ctl_weight=float(ctl_weight),
+                        ctl_out=val_ctl if use_ctl else None,
                     )
                     if held_loss is not None and held_count:
                         hold_sum += float(held_loss) * int(held_count)
@@ -2404,6 +2494,7 @@ def train_directory(
                             heads=train_heads,
                             lane_loss=lane_kind,
                             conf_weight=float(conf_weight),
+                            ctl_weight=float(ctl_weight),
                             scale=input_scale,
                             frames=prefetched_frames,
                             frame_ages=prefetched_ages,
@@ -2427,6 +2518,7 @@ def train_directory(
                             heads=train_heads,
                             lane_loss=lane_kind,
                             conf_weight=float(conf_weight),
+                            ctl_weight=float(ctl_weight),
                             frame_sets=group_frames,
                             scale=input_scale,
                             age_sets=group_ages,
@@ -2469,6 +2561,11 @@ def train_directory(
                     continue
                 if step_loss is not None:
                     last_loss = step_loss
+                if use_ctl and int(epoch) in (0, 1) and int(epoch) not in ctl_ratio_done and n_sup:
+                    # The ctl/lane_gt ratio at the first step of epochs 0 and 1. Outside [0.1, 10]
+                    # is a flag for the owner, not an auto-fix.
+                    ctl_ratio_done.add(int(epoch))
+                    print(ctl_ratio_line(int(epoch), int(done), step_trace.get("heads") or {}), flush=True)
                 if n_sup:
                     lane_gt_seen.note(int(step_trace.get("lane_gt_rows") or 0) > 0)
                 supervised += n_sup
@@ -2484,16 +2581,25 @@ def train_directory(
                     print(
                         f"[GVD] scene schedule steps_per_epoch={steps_per_epoch} "
                         f"epoch={epoch} lr={float(holder['lr'])} fixed "
-                        f"--epochs {requested_epochs} is recorded; holdout stop ends the run",
+                        + (
+                            f"--exact-epochs {exact_n} ends the run"
+                            if exact_n is not None
+                            else f"--epochs {requested_epochs} is recorded; holdout stop ends the run"
+                        ),
                         flush=True,
                     )
-                job_steps = remaining_until_holdout_can_stop(
-                    remaining_steps,
-                    steps_per_epoch,
-                    epoch=epoch,
-                    has_holdout=has_holdout,
-                    rates_after=0,
-                )
+                if exact_n is not None:
+                    job_steps = remaining_until_exact_end(
+                        remaining_steps, steps_per_epoch, epoch=epoch, exact_epochs=exact_n
+                    )
+                else:
+                    job_steps = remaining_until_holdout_can_stop(
+                        remaining_steps,
+                        steps_per_epoch,
+                        epoch=epoch,
+                        has_holdout=has_holdout,
+                        rates_after=0,
+                    )
                 used, kind = _memory_reading(device.type)
                 eta_pass = predict_eta_s(done, elapsed, remaining_steps)
                 eta = predict_eta_s(done, elapsed, job_steps)
@@ -2550,6 +2656,7 @@ def train_directory(
                     "pred_std": json_num(scored.get("pred_std")),
                     "collapse": bool(scored.get("collapse")),
                     "blank_main_skipped": int(BLANK_MAIN_SKIPS),
+                    "exact_epochs": exact_n,
                 }
                 cell_lines: list[str] = []
                 if cell_spec is not None:
@@ -2571,6 +2678,16 @@ def train_directory(
                         f"rms_ci90={boot['rms_ci']} (bootstrap over cells, 1000 resamples, seed 0)"
                     )
                 # The weights have not moved since the holdout pass: these are the val row's weights.
+                ctl_lines: list[str] = []
+                if use_ctl:
+                    from python.train.ctl_targets import ctl_record, score_ctl, val_lines
+
+                    # No paired lane_gt-only run inside one run: the lane bar is UNPROVEN here, so this
+                    # in-run verdict is at best UNPROVEN. The lane bar is scored offline:
+                    # eval_onnx_holdout.py --lane-ref <run A eval JSON>.
+                    ctl_scored = score_ctl(val_ctl, ctl_b1, lock_deg=ctl_lock)
+                    record["ctl"] = ctl_record(ctl_scored)
+                    ctl_lines = val_lines(ctl_scored)
                 ckpt_info = _write_epoch_ckpt(scored)
                 record["ckpt"] = None if ckpt_info is None else Path(ckpt_info["path"]).name
                 record["ckpt_sha256"] = None if ckpt_info is None else ckpt_info["sha256"]
@@ -2586,7 +2703,7 @@ def train_directory(
                     f"blank_main_skipped={int(BLANK_MAIN_SKIPS)}",
                     flush=True,
                 )
-                for line in cell_lines:
+                for line in cell_lines + ctl_lines:
                     print(line, flush=True)
                 if scored.get("collapse"):
                     print(
@@ -2611,7 +2728,13 @@ def train_directory(
                 improved = best_value is None or float(fallback) < best_value
             if improved:
                 best_value = history[-1]
-                best_blob = _clone_weights()
+                best_blob = None if exact_n is not None else _clone_weights()
+            if exact_n is not None:
+                if int(epoch) >= exact_n - 1:
+                    print(f"[GVD] exact epochs: stopped after epoch={int(epoch)} (early stop off)", flush=True)
+                    break
+                epoch += 1
+                continue
             plateau = holdout_stopped(history, tol=0.02, window=3) if scored.get("rms") is not None else holdout_stopped(history)
             if plateau:
                 print(
@@ -2621,7 +2744,7 @@ def train_directory(
                 )
                 break
             epoch += 1
-        if not paused_exit and best_blob is not None:
+        if not paused_exit and best_blob is not None and exact_n is None:
             _load_weights(best_blob)
         return best_value
 
@@ -2671,6 +2794,7 @@ def train_directory(
                 heads=train_heads,
                 lane_loss=lane_kind,
                 conf_weight=float(conf_weight),
+                ctl_weight=float(ctl_weight),
                 scale=input_scale,
             )
             done = step_i + 1
@@ -2707,6 +2831,9 @@ def train_directory(
             _limited(DRY_RUN_STEPS if dry_run else SANITY_STEPS, subset, bool(dry_run))
         else:
             existing = load_checkpoint(root, pause_dir=pause_dir) if resume else None
+            refused = exact_epochs_resume_refusal(existing, exact_n)
+            if refused:
+                raise ExactEpochsMismatch(refused)
             if existing is not None:
                 fields = resume_fields(existing)
                 rate = resume_learning_rate(lr, fields.get("lr"))
@@ -2780,6 +2907,13 @@ def train_directory(
                         + " ".join(f"{name}={float(v):+.3f}" for name, v in zip(LANE_SLOT_NAMES, constants)),
                         flush=True,
                     )
+                if use_ctl:
+                    from python.train.ctl_targets import ctl_bias
+
+                    with torch.no_grad():
+                        bias = net.ctl_head.bias
+                        bias.copy_(torch.as_tensor(ctl_bias(ctl_b1["mean"]), device=bias.device, dtype=bias.dtype))
+                    print("[GVD] init ctl_head.bias from the train-split means (atanh steer, logit throttle/brake)", flush=True)
                 _train_passes()
         if not paused_exit and not dry_run and not sanity and export_path is not None:
             export_scene_onnx(export_path, net, heads=train_heads)
@@ -2808,11 +2942,42 @@ def train_directory(
         "free_vram_bytes": int(free_vram_bytes),
         "free_ram_bytes": int(free_ram_bytes),
         "requested_epochs": requested_epochs,
+        "exact_epochs": exact_n,
         "chunk": chunk_len,
         "lr": float(holder.get("lr", lr)),
         "sanity_ok": sanity_ok,
         "dry_run": bool(dry_run),
     }
+
+
+def ctl_refusal(args: argparse.Namespace, heads: tuple[str, ...]) -> str | None:
+    """Why the ctl options cannot run together, or None."""
+    on = "ctl" in heads
+    if on and "lane_gt" not in heads:
+        return "ctl needs lane_gt (--heads lane_gt,ctl)"
+    if args.ctl_weight is not None:
+        if not on:
+            return "--ctl-weight needs --heads lane_gt,ctl"
+        if not (float(args.ctl_weight) > 0.0):
+            return "--ctl-weight must be > 0"
+    if on and str(args.backbone) != "scratch":
+        return "ctl needs --backbone scratch"
+    if on and args.export is not None:
+        return "ctl refuses --export; use scripts/export_epoch_onnx.py --out (create-only)"
+    return None
+
+
+def exact_epochs_refusal(args: argparse.Namespace) -> str | None:
+    """Why ``--exact-epochs`` cannot run with these options, or None."""
+    if args.exact_epochs is None:
+        return None
+    if int(args.exact_epochs) < 1:
+        return f"--exact-epochs must be >= 1 (got {int(args.exact_epochs)})"
+    if args.dry_run:
+        return "--exact-epochs refuses --dry-run"
+    if args.sanity:
+        return "--exact-epochs refuses --sanity"
+    return None
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -2834,7 +2999,14 @@ def main(argv: list[str] | None = None) -> None:
     except ValueError as exc:
         print(f"[GVD] scene train: {exc}")
         sys.exit(2)
+    refusal = ctl_refusal(args, head_names) or exact_epochs_refusal(args)
+    if refusal:
+        print(f"[GVD] scene train: {refusal}", flush=True)
+        sys.exit(2)
     if args.build_cache:
+        if Path(args.build_cache).exists():
+            print(f"[GVD] scene train: --build-cache is create-only; {Path(args.build_cache).name} already exists", flush=True)
+            sys.exit(2)
         manifest = build_frame_cache(
             args.strips or scene_lanes_dir(),
             args.build_cache,
@@ -2875,6 +3047,12 @@ def main(argv: list[str] | None = None) -> None:
             print(f"[GVD] scene train: {exc}")
             sys.exit(2)
         pause_dir: Path | None = None
+        if "ctl" in head_names:
+            # Create-only for ctl runs: a paused ctl run restarts in a fresh dir.
+            for flag, value in (("--ckpt-dir", args.ckpt_dir), ("--pause-dir", args.pause_dir)):
+                if value and Path(value).is_dir() and any(p.is_file() for p in Path(value).rglob("*")):
+                    print(f"[GVD] scene train: ctl run is create-only; {flag} already holds files", flush=True)
+                    sys.exit(2)
         if args.pause_dir:
             try:
                 check_pause_dir(args.strips, args.pause_dir, no_resume=bool(args.no_resume))
@@ -2882,6 +3060,16 @@ def main(argv: list[str] | None = None) -> None:
                 print(f"[GVD] scene train: pause-dir refused: {exc}", flush=True)
                 sys.exit(2)
             pause_dir = Path(args.pause_dir).resolve()
+        if not args.no_resume and not args.build_cache:
+            # Before any write: a pause file from another --exact-epochs setting is refused.
+            try:
+                saved = load_checkpoint(Path(args.strips), pause_dir=pause_dir)
+            except (OSError, ValueError, KeyError):
+                saved = None
+            refused = exact_epochs_resume_refusal(saved, args.exact_epochs)
+            if refused:
+                print(f"[GVD] scene train: {refused}", flush=True)
+                sys.exit(2)
         if not torch_ready():
             print("[GVD] scene train needs PyTorch")
             sys.exit(2)
@@ -2918,6 +3106,7 @@ def main(argv: list[str] | None = None) -> None:
                 holdout_seed=int(args.holdout_seed),
                 seed=int(args.seed),
                 conf_weight=float(args.conf_weight),
+                ctl_weight=1.0 if args.ctl_weight is None else float(args.ctl_weight),
                 init_head_bias=bool(args.init_head_bias),
                 eval_chunk=int(args.eval_chunk),
                 backbone=str(args.backbone),
@@ -2930,7 +3119,11 @@ def main(argv: list[str] | None = None) -> None:
                 cam_age=bool(args.cam_age),
                 grad_ckpt=bool(args.grad_ckpt),
                 pause_dir=pause_dir,
+                exact_epochs=args.exact_epochs,
             )
+        except ExactEpochsMismatch as exc:
+            print(f"[GVD] scene train: {exc}", flush=True)
+            sys.exit(2)
         except TrainFitError as exc:
             print(f"[GVD] scene train: {exc}")
             sys.exit(2)
@@ -2938,6 +3131,9 @@ def main(argv: list[str] | None = None) -> None:
             print(f"[GVD] scene train: {exc}", flush=True)
             sys.exit(2)
         except LossyFramesError as exc:
+            print(f"[GVD] scene train: {exc}", flush=True)
+            sys.exit(2)
+        except CtlDataError as exc:
             print(f"[GVD] scene train: {exc}", flush=True)
             sys.exit(2)
         if args.sanity and not args.dry_run and not stats.get("sanity_ok"):

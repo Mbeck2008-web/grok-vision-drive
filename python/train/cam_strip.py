@@ -24,6 +24,9 @@ from python.data.strip_writer import (
 )
 
 HEAD_NAMES = ("lanes", "curbs", "objects", "signs", "lane_gt")
+# Opt-in control head (``--heads lane_gt,ctl``, offline only). Not in
+# HEAD_NAMES: an empty --heads never turns it on.
+CTL_HEAD = "ctl"
 # ONNX outputs each head writes (scene_net.OUTPUT_FIELDS, split by head). An
 # export carries every output; the ones whose head was not in --heads are
 # random-init and are listed in ``gvd_outputs_untrained``.
@@ -64,14 +67,14 @@ def parse_cams(text: str | None) -> tuple[str, ...]:
 
 
 def parse_heads(text: str | None) -> tuple[str, ...]:
-    """Head names. Empty trains every head."""
+    """Head names. Empty trains every head (``ctl`` only when named)."""
     parts = [part.strip() for part in str(text or "").split(",") if part.strip()]
     if not parts:
         return HEAD_NAMES
     names: list[str] = []
     for part in parts:
         key = _HEAD_ALIASES.get(part.lower(), part.lower())
-        if key not in HEAD_NAMES:
+        if key not in HEAD_NAMES and key != CTL_HEAD:
             raise ValueError(f"unknown head {part}")
         if key not in names:
             names.append(key)
@@ -262,6 +265,15 @@ def metadata_dict(
         props[CAM_AGE_ORDER_META] = ",".join(CAM_AGE_ORDER)
         props[CAM_AGE_CAP_META] = repr(float(HOLD_CAP_S))
         props[CAM_AGE_HZ_META] = str(int(HOLD_TICK_HZ))
+    if CTL_HEAD in trained:
+        from python.train.ctl_targets import CTL_FIELDS, CTL_HORIZONS_S, CTL_OUTPUT_FIELDS
+
+        props["gvd_ctl"] = "1"
+        props["gvd_ctl_fields"] = ",".join(CTL_FIELDS)
+        props["gvd_ctl_outputs"] = ",".join(CTL_OUTPUT_FIELDS)
+        props["gvd_ctl_horizons_s"] = ",".join(str(h) for h in CTL_HORIZONS_S)
+        props["gvd_ctl_time_base"] = "sim_t"
+        props["gvd_ctl_units"] = "norm_-1_1,0_1,0_1"
     return props
 
 

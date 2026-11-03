@@ -869,6 +869,22 @@ def remaining_until_holdout_can_stop(
     return remaining
 
 
+def remaining_until_exact_end(
+    remaining_this_pass: int,
+    steps_per_pass: int,
+    *,
+    epoch: int,
+    exact_epochs: int,
+) -> int:
+    """Steps from here to the end of epoch ``exact_epochs - 1`` (``--exact-epochs``).
+
+    The holdout state is ignored by design: with the flag the run never stops early.
+    """
+    remaining = max(0, int(remaining_this_pass))
+    per = max(0, int(steps_per_pass))
+    return remaining + max(0, int(exact_epochs) - 1 - int(epoch)) * per
+
+
 def holdout_stopped(
     losses: list[float],
     *,

@@ -376,7 +376,7 @@ Every number in this section is a code default or a code constant on this branch
 | Supervisor | `python/run_vision.py`: capture, perception (Hough lanes by default, YOLOv8n detector), path planner, safety vetoes, actuator, viz, clips. | Unproven |
 | Scene net | `python/train/scene_net.py`, trained from scratch: a per-sector conv stem (GroupNorm), a 512-wide token, a one-layer GRU (hidden 512) stepped with the real seconds since the previous strip, 15 s of memory, and a short residual skip. | Offline smoke only |
 | Backbones | A backbone choice (scratch / mobilenetv3 / imagenet-resnet18) is **pending**. It is not on this branch; the stem is always trained from scratch. | Unproven |
-| Heads | Linear heads on the GRU output: lanes (6 x 16 points), lane valid, curbs (2 x 16), curb valid, objects (16 x 8 with class and valid), signs (8 x 4 with class, lamp state and valid), and `lane_gt` (14 values). There is no steer head. The path planner turns the scene into the path. | Offline smoke only |
+| Heads | Linear heads on the GRU output: lanes (6 x 16 points), lane valid, curbs (2 x 16), curb valid, objects (16 x 8 with class and valid), signs (8 x 4 with class, lamp state and valid), and `lane_gt` (14 values). Optional ctl head (offline only): `--heads lane_gt,ctl` adds steer, throttle and brake targets at 0-5 s horizons for offline evaluation; nothing drives from it. The path planner turns the scene into the path. | Offline smoke only |
 | Export | `--export` writes an FP32 ONNX graph, `models/e2e_scene.onnx`. | Offline smoke only |
 
 **Label vector (`lane_gt`, 14 values)**, from `python/debug/lane_targets.py`:

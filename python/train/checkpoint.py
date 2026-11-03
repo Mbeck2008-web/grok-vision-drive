@@ -163,6 +163,34 @@ def clear_checkpoint(strip_root: Path | str, *, pause_dir: Path | str | None = N
         return
 
 
+class ExactEpochsMismatch(ValueError):
+    """A resume whose ``--exact-epochs`` does not match the pause file."""
+
+
+def exact_epochs_resume_refusal(saved: Mapping[str, Any] | None, exact_epochs: int | None) -> str | None:
+    """Why a resume with ``--exact-epochs`` (or without it) cannot continue this pause file, or None.
+
+    With the flag the pause file must hold the same N. Without it a numeric
+    ``exact_epochs`` is refused; a missing key or null resumes as before.
+    """
+    if saved is None:
+        return None
+    value = saved.get("exact_epochs")
+    if value is not None:
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            value = str(value)
+    if exact_epochs is None:
+        if value is None:
+            return None
+        return f"no --exact-epochs does not match the paused run (saved: exact_epochs={value})"
+    if "exact_epochs" in saved and value == int(exact_epochs):
+        return None
+    shown = "no exact_epochs key" if "exact_epochs" not in saved else f"exact_epochs={value}"
+    return f"--exact-epochs {int(exact_epochs)} does not match the paused run (saved: {shown})"
+
+
 def resume_fields(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Step, loss, and weights a Start continues from.
 
@@ -199,4 +227,5 @@ def resume_fields(payload: Mapping[str, Any]) -> dict[str, Any]:
         "optimizer": optimizer,
         "scaler": payload.get("scaler"),
         "arch": None if payload.get("arch") is None else str(payload.get("arch")),
+        "exact_epochs": None if payload.get("exact_epochs") is None else int(payload.get("exact_epochs")),
     }

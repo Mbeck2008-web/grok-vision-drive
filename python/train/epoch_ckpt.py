@@ -178,6 +178,7 @@ def load_epoch_ckpt(path: Path | str) -> dict[str, Any]:
         meta = json.loads(str(blob["meta"].item() if blob["meta"].shape == () else blob["meta"]))
         if meta.get("format") != FORMAT:
             raise ValueError(f"{path.name}: not a {FORMAT} file")
+        meta.setdefault("exact_epochs", None)  # written by --exact-epochs runs; older files read as null
         names = list(meta.get("weight_names") or [])
         weights = {name: np.array(blob[f"w{index}"], copy=True) for index, name in enumerate(names)}
     parsed = parse_ckpt_name(path)
@@ -210,6 +211,7 @@ def build_net(meta: Mapping[str, Any]) -> Any:
     """A CPU net of the checkpoint's architecture (cams, scale, backbone, cam_age).
 
     A checkpoint written before ``cam_age`` existed has no key: no ages.
+    The same holds for ``ctl``: no key, no ctl head.
     """
     cams = tuple(meta.get("cams") or ()) or None
     scale = float(meta.get("scale") or 1.0)
@@ -217,9 +219,9 @@ def build_net(meta: Mapping[str, Any]) -> Any:
     if backbone in ("", "scratch"):
         from python.train.scene_net import SceneNet
 
-        return SceneNet(cams=cams, scale=scale, cam_age=bool(meta.get("cam_age")))
-    if meta.get("cam_age"):
-        raise ValueError("a --cam-age checkpoint is a scratch-net checkpoint; this one names a backbone")
+        return SceneNet(cams=cams, scale=scale, cam_age=bool(meta.get("cam_age")), ctl=bool(meta.get("ctl")))
+    if meta.get("cam_age") or meta.get("ctl"):
+        raise ValueError("a --cam-age or ctl checkpoint is a scratch-net checkpoint; this one names a backbone")
     from python.train.pretrained_net import build_scene_net
 
     return build_scene_net(cams, scale, backbone, freeze=bool(meta.get("freeze_backbone")))

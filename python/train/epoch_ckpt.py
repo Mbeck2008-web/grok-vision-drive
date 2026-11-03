@@ -178,6 +178,7 @@ def load_epoch_ckpt(path: Path | str) -> dict[str, Any]:
         meta = json.loads(str(blob["meta"].item() if blob["meta"].shape == () else blob["meta"]))
         if meta.get("format") != FORMAT:
             raise ValueError(f"{path.name}: not a {FORMAT} file")
+        meta.setdefault("exact_epochs", None)  # written by --exact-epochs runs; older files read as null
         names = list(meta.get("weight_names") or [])
         weights = {name: np.array(blob[f"w{index}"], copy=True) for index, name in enumerate(names)}
     parsed = parse_ckpt_name(path)

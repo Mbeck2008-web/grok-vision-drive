@@ -47,6 +47,7 @@ from python.train.continual import (  # noqa: E402
     holdout_stopped,
     offcenter_view,
     pass_plan,
+    remaining_until_exact_end,
     remaining_until_holdout_can_stop,
     resume_learning_rate,
 )
@@ -81,10 +82,12 @@ from python.train.scene_net import (  # noqa: E402
     torch_ready,
 )
 from python.train.checkpoint import (  # noqa: E402
+    ExactEpochsMismatch,
     PauseDirRefused,
     check_pause_dir,
     checkpoint_path,
     clear_checkpoint,
+    exact_epochs_resume_refusal,
     load_checkpoint,
     resume_fields,
     save_checkpoint,
@@ -139,6 +142,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train the GVD scene net from recorded strips")
     parser.add_argument("--strips", type=str, default="", help="Recording directory with state.jsonl and raw/<cam>/ frames. JPEG strips/ are refused.")
     parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument(
+        "--exact-epochs",
+        type=int,
+        default=None,
+        help="Train exactly N epochs (ckpt_ep0..ckpt_ep{N-1}); the holdout early stop and best-epoch reload are off.",
+    )
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument(
         "--batch",
@@ -1602,6 +1611,7 @@ def _save_pause(
     device_name: str,
     recommended: bool,
     pause_dir: Path | None = None,
+    exact_epochs: int | None = None,
 ) -> dict[str, Any]:
     """Save weights before the loop stops. Strip files are not rewritten."""
     used_cams = tuple(getattr(net, "cams", ()) or ()) or None
@@ -1620,6 +1630,7 @@ def _save_pause(
             "weights": {key: value.detach().cpu().numpy() for key, value in net.state_dict().items()},
             "optimizer": _to_numpy_tree(opt.state_dict()),
             "scaler": None if scaler is None else _to_numpy_tree(scaler.state_dict()),
+            "exact_epochs": None if exact_epochs is None else int(exact_epochs),
         },
         used_cams,
         getattr(net, "pause_arch", None),
@@ -1795,6 +1806,7 @@ def train_directory(
     grad_ckpt: bool = False,
     pause_dir: Path | None = None,
     ctl_weight: float = 1.0,
+    exact_epochs: int | None = None,
 ) -> dict[str, Any]:
     import torch
 
@@ -1977,6 +1989,10 @@ def train_directory(
     view.load_folder(root, checkpoint_path(root, pause_dir))
     # The CLI epoch count is not the stop. The holdout decides.
     requested_epochs = int(epochs)
+    # --exact-epochs N: epochs 0..N-1, then stop; no holdout stop, no best-epoch reload.
+    exact_n = None if exact_epochs is None else int(exact_epochs)
+    if exact_n is not None and (exact_n < 1 or sanity or dry_run):
+        raise SystemExit("--exact-epochs needs N >= 1 and refuses --dry-run / --sanity")
 
     def _empty(precision: str = "fp32") -> dict[str, Any]:
         if export_path is not None:
@@ -1995,6 +2011,7 @@ def train_directory(
             "free_vram_bytes": int(free_vram_bytes),
             "free_ram_bytes": int(free_ram_bytes),
             "requested_epochs": requested_epochs,
+            "exact_epochs": exact_n,
         }
 
     if not rows:
@@ -2229,6 +2246,7 @@ def train_directory(
                 device_name=device.type,
                 recommended=recommended,
                 pause_dir=pause_dir,
+                exact_epochs=exact_n,
             )
             last_ckpt = now
             print(f"[GVD] checkpoint step={done}", flush=True)
@@ -2271,6 +2289,7 @@ def train_directory(
             "holdout_cells": bool(holdout_cells),
             "lr": float(holder.get("lr", lr)),
             "batch": int(batch),
+            "exact_epochs": exact_n,
         }
         weights = {key: value.detach().cpu().numpy() for key, value in net.state_dict().items()}
         try:
@@ -2303,6 +2322,7 @@ def train_directory(
             device_name=device.type,
             recommended=recommended,
             pause_dir=pause_dir,
+            exact_epochs=exact_n,
         )
         view.mark_paused(payload)
         if not _wait_for_start(view):
@@ -2559,16 +2579,25 @@ def train_directory(
                     print(
                         f"[GVD] scene schedule steps_per_epoch={steps_per_epoch} "
                         f"epoch={epoch} lr={float(holder['lr'])} fixed "
-                        f"--epochs {requested_epochs} is recorded; holdout stop ends the run",
+                        + (
+                            f"--exact-epochs {exact_n} ends the run"
+                            if exact_n is not None
+                            else f"--epochs {requested_epochs} is recorded; holdout stop ends the run"
+                        ),
                         flush=True,
                     )
-                job_steps = remaining_until_holdout_can_stop(
-                    remaining_steps,
-                    steps_per_epoch,
-                    epoch=epoch,
-                    has_holdout=has_holdout,
-                    rates_after=0,
-                )
+                if exact_n is not None:
+                    job_steps = remaining_until_exact_end(
+                        remaining_steps, steps_per_epoch, epoch=epoch, exact_epochs=exact_n
+                    )
+                else:
+                    job_steps = remaining_until_holdout_can_stop(
+                        remaining_steps,
+                        steps_per_epoch,
+                        epoch=epoch,
+                        has_holdout=has_holdout,
+                        rates_after=0,
+                    )
                 used, kind = _memory_reading(device.type)
                 eta_pass = predict_eta_s(done, elapsed, remaining_steps)
                 eta = predict_eta_s(done, elapsed, job_steps)
@@ -2625,6 +2654,7 @@ def train_directory(
                     "pred_std": json_num(scored.get("pred_std")),
                     "collapse": bool(scored.get("collapse")),
                     "blank_main_skipped": int(BLANK_MAIN_SKIPS),
+                    "exact_epochs": exact_n,
                 }
                 cell_lines: list[str] = []
                 if cell_spec is not None:
@@ -2694,7 +2724,13 @@ def train_directory(
                 improved = best_value is None or float(fallback) < best_value
             if improved:
                 best_value = history[-1]
-                best_blob = _clone_weights()
+                best_blob = None if exact_n is not None else _clone_weights()
+            if exact_n is not None:
+                if int(epoch) >= exact_n - 1:
+                    print(f"[GVD] exact epochs: stopped after epoch={int(epoch)} (early stop off)", flush=True)
+                    break
+                epoch += 1
+                continue
             plateau = holdout_stopped(history, tol=0.02, window=3) if scored.get("rms") is not None else holdout_stopped(history)
             if plateau:
                 print(
@@ -2704,7 +2740,7 @@ def train_directory(
                 )
                 break
             epoch += 1
-        if not paused_exit and best_blob is not None:
+        if not paused_exit and best_blob is not None and exact_n is None:
             _load_weights(best_blob)
         return best_value
 
@@ -2791,6 +2827,9 @@ def train_directory(
             _limited(DRY_RUN_STEPS if dry_run else SANITY_STEPS, subset, bool(dry_run))
         else:
             existing = load_checkpoint(root, pause_dir=pause_dir) if resume else None
+            refused = exact_epochs_resume_refusal(existing, exact_n)
+            if refused:
+                raise ExactEpochsMismatch(refused)
             if existing is not None:
                 fields = resume_fields(existing)
                 rate = resume_learning_rate(lr, fields.get("lr"))
@@ -2899,6 +2938,7 @@ def train_directory(
         "free_vram_bytes": int(free_vram_bytes),
         "free_ram_bytes": int(free_ram_bytes),
         "requested_epochs": requested_epochs,
+        "exact_epochs": exact_n,
         "chunk": chunk_len,
         "lr": float(holder.get("lr", lr)),
         "sanity_ok": sanity_ok,
@@ -2923,6 +2963,19 @@ def ctl_refusal(args: argparse.Namespace, heads: tuple[str, ...]) -> str | None:
     return None
 
 
+def exact_epochs_refusal(args: argparse.Namespace) -> str | None:
+    """Why ``--exact-epochs`` cannot run with these options, or None."""
+    if args.exact_epochs is None:
+        return None
+    if int(args.exact_epochs) < 1:
+        return f"--exact-epochs must be >= 1 (got {int(args.exact_epochs)})"
+    if args.dry_run:
+        return "--exact-epochs refuses --dry-run"
+    if args.sanity:
+        return "--exact-epochs refuses --sanity"
+    return None
+
+
 def main(argv: list[str] | None = None) -> None:
     from python.data.data_root import DataDriveError, check_data_path, ensure_cache_dirs, scene_lanes_dir
 
@@ -2942,7 +2995,7 @@ def main(argv: list[str] | None = None) -> None:
     except ValueError as exc:
         print(f"[GVD] scene train: {exc}")
         sys.exit(2)
-    refusal = ctl_refusal(args, head_names)
+    refusal = ctl_refusal(args, head_names) or exact_epochs_refusal(args)
     if refusal:
         print(f"[GVD] scene train: {refusal}", flush=True)
         sys.exit(2)
@@ -3003,6 +3056,16 @@ def main(argv: list[str] | None = None) -> None:
                 print(f"[GVD] scene train: pause-dir refused: {exc}", flush=True)
                 sys.exit(2)
             pause_dir = Path(args.pause_dir).resolve()
+        if not args.no_resume and not args.build_cache:
+            # Before any write: a pause file from another --exact-epochs setting is refused.
+            try:
+                saved = load_checkpoint(Path(args.strips), pause_dir=pause_dir)
+            except (OSError, ValueError, KeyError):
+                saved = None
+            refused = exact_epochs_resume_refusal(saved, args.exact_epochs)
+            if refused:
+                print(f"[GVD] scene train: {refused}", flush=True)
+                sys.exit(2)
         if not torch_ready():
             print("[GVD] scene train needs PyTorch")
             sys.exit(2)
@@ -3052,7 +3115,11 @@ def main(argv: list[str] | None = None) -> None:
                 cam_age=bool(args.cam_age),
                 grad_ckpt=bool(args.grad_ckpt),
                 pause_dir=pause_dir,
+                exact_epochs=args.exact_epochs,
             )
+        except ExactEpochsMismatch as exc:
+            print(f"[GVD] scene train: {exc}", flush=True)
+            sys.exit(2)
         except TrainFitError as exc:
             print(f"[GVD] scene train: {exc}")
             sys.exit(2)

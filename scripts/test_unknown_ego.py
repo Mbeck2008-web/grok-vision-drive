@@ -624,7 +624,14 @@ def check_09_stale_echo_mid_run() -> None:
 
 
 def check_10_waiting_while_latched() -> None:
-    """Latched while the echo gate is WAITING (an echo on disk, never a fresh one): refuse, ego_unknown."""
+    """Latched while the echo gate is WAITING (an echo on disk, never a fresh one): refuse, ego_unknown.
+
+    On the SimClock step barrier, as check_07/08 (#148): the gvd_cmd.json with reason ego_unknown
+    lives for one supervisor tick. On the real clock a tick that overruns 50 ms is followed at once
+    by the next, which overwrites it within a few ms, and the poller can miss it.
+    """
+    from gvd_sim_clock import SimClock  # noqa: PLC0415
+
     m6 = _m6()
     write_engage_flag(False)
     m6._write_ego(0, applying=False, speed=15.0, echo_seq=9, age_s=5.0)
@@ -637,7 +644,7 @@ def check_10_waiting_while_latched() -> None:
             fired["on"] = True
             _engage_now()
 
-    seen = _session(3.0, mod, step)
+    seen = _session(3.0, mod, step, clock=SimClock())
     live = _engaged_snaps(seen)
     assert not live, ("drove while the echo gate was WAITING", [(round(s["t"], 2), s["cmd"].get("reason"),
                                                                 s["cmd"].get("throttle"), s["cmd"].get("brake"))

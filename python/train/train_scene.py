@@ -327,7 +327,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("huber", "l1"),
         help=(
             "ctl steer / throttle regression. huber is smooth-L1 (beta 0.1) and is the default; "
-            "l1 (B'2) is the eval's MAE. Brake stays smooth-L1. l1 only with --heads lane_gt,ctl."
+            "l1 (B'2) is L1, the same error the eval's MAE measures; per-row masked mean over horizons. "
+            "Brake stays smooth-L1. l1 only with --heads lane_gt,ctl."
         ),
     )
     parser.add_argument(

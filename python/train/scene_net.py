@@ -118,7 +118,8 @@ from python.train.ctl_targets import CTL_FIELDS, CTL_HORIZONS_S, CTL_OUTPUT_FIEL
 CTL_K = len(CTL_HORIZONS_S)
 CTL_BETA = 0.1
 # --ctl-loss: huber is the smooth-L1 above on all three channels (the default);
-# l1 (B'2) puts steer and throttle on plain L1, the eval's MAE; brake stays smooth-L1.
+# l1 (B'2) puts steer and throttle on L1, the same error the eval's MAE measures; per-row
+# masked mean over horizons. Brake stays smooth-L1.
 CTL_LOSSES = ("huber", "l1")
 
 # Torch-free pieces the live supervisor needs live in scene_live (run_vision must

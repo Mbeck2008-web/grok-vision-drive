@@ -2,9 +2,10 @@
 """B'2 control-head loss (``--ctl-loss``). Offline only.
 
 * L1 loss: ``l1`` is the masked mean |pred - target| per channel on steer and
-  throttle (the eval's MAE), summed; brake keeps the masked-mean smooth-L1
-  (beta 0.1). Masked slots do not pull (99 or NaN goals), an all-void mask is 0,
-  an unknown kind raises.
+  throttle (L1, the same error the eval's MAE measures; per-row masked mean
+  over horizons), summed; brake keeps the masked-mean smooth-L1 (beta 0.1).
+  Masked slots do not pull (99 or NaN goals), an all-void mask is 0, an unknown
+  kind raises.
 * L2 default: ``huber`` (the default) is the old smooth-L1 on all three
   channels, and ``scene_loss`` without ``ctl_loss`` gives the same total as before.
 * L3 CLI: ``--ctl-loss`` defaults to ``huber``, ``l1`` is refused without the

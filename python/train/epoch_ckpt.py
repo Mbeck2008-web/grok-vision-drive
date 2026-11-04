@@ -273,6 +273,8 @@ def export_epoch_onnx(ckpt: Path | str, out: Path | str, *, trace: Any = None) -
                 "gvd_ckpt_step": str(int(meta["step"])),
                 "gvd_ckpt_run": str(meta.get("run") or ""),
                 "gvd_scale": str(float(meta.get("scale") or 1.0)),
+                # B'2 (--ctl-loss l1); absent is the default huber.
+                **({"gvd_ctl_loss": str(meta["ctl_loss"])} if meta.get("ctl_loss") else {}),
             },
         )
         link_or_copy_new(partial, out)

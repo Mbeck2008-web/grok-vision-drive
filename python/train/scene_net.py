@@ -117,6 +117,9 @@ from python.train.ctl_targets import CTL_FIELDS, CTL_HORIZONS_S, CTL_OUTPUT_FIEL
 
 CTL_K = len(CTL_HORIZONS_S)
 CTL_BETA = 0.1
+# --ctl-loss: huber is the smooth-L1 above on all three channels (the default);
+# l1 (B'2) puts steer and throttle on plain L1, the eval's MAE; brake stays smooth-L1.
+CTL_LOSSES = ("huber", "l1")
 
 # Torch-free pieces the live supervisor needs live in scene_live (run_vision must
 # not import torch at startup); re-exported here for the trainer and the tests.
@@ -1106,8 +1109,11 @@ def head_names(heads: tuple[str, ...] | list[str] | None) -> frozenset[str]:
     return frozenset(parse_heads(",".join(str(name) for name in heads)))
 
 
-def _ctl_loss(pred: Any, goal: Any, valid: Any) -> Any:
+def _ctl_loss(pred: Any, goal: Any, valid: Any, kind: str = "huber") -> Any:
     """Sum over steer / throttle / brake of the masked-mean smooth-L1 (beta 0.1).
+
+    ``kind="l1"`` (B'2) uses the masked-mean |pred - goal| on steer and throttle
+    instead; brake keeps smooth-L1.
 
     ``pred``, ``goal`` and ``valid`` are ``(..., 3, K)``. A masked slot does
     not pull (its goal may be anything, NaN included); a channel with no
@@ -1118,7 +1124,11 @@ def _ctl_loss(pred: Any, goal: Any, valid: Any) -> Any:
     goal = goal.to(device=pred.device, dtype=pred.dtype).reshape(pred.shape)
     on = valid.to(device=pred.device).reshape(pred.shape) > 0.5
     safe = torch.where(on, goal, pred.detach())
+    if kind not in CTL_LOSSES:
+        raise ValueError(f"ctl loss {kind!r} is not one of {CTL_LOSSES}")
     per = functional.smooth_l1_loss(pred, safe, reduction="none", beta=CTL_BETA)
+    if kind == "l1":
+        per = torch.cat([(pred - safe).abs()[..., :2, :], per[..., 2:, :]], dim=-2)
     per = torch.where(on, per, torch.zeros_like(per))
     chan = per.transpose(0, -2).reshape(3, -1).sum(dim=1) if per.dim() > 2 else per.sum(dim=-1)
     count = on.transpose(0, -2).reshape(3, -1).sum(dim=1) if on.dim() > 2 else on.sum(dim=-1)
@@ -1141,6 +1151,7 @@ def _scene_loss_body(
     lane_loss: str = "huber",
     conf_weight: float = 1.0,
     ctl_weight: float = 1.0,
+    ctl_loss: str = "huber",
 ) -> dict[str, Any]:
     if torch is None:
         raise ImportError("PyTorch is not installed")
@@ -1231,7 +1242,7 @@ def _scene_loss_body(
     valid = lane_valid + curb_valid + obj_valid + sign_valid
     ctl_stack = _ctl_stack(pred) if "ctl" in wanted else None
     if ctl_stack is not None and "ctl" in target and "ctl_valid" in target:
-        ctl_term = _ctl_loss(ctl_stack, target["ctl"], target["ctl_valid"])
+        ctl_term = _ctl_loss(ctl_stack, target["ctl"], target["ctl_valid"], ctl_loss)
     else:
         ctl_term = zero.clone()
     # A lane-only run (with or without ctl) must not backprop the other heads.
@@ -1316,16 +1327,18 @@ def scene_loss(
     lane_loss: str = "huber",
     conf_weight: float = 1.0,
     ctl_weight: float = 1.0,
+    ctl_loss: str = "huber",
 ) -> dict[str, Any]:
     """Smooth-L1 on points, cross-entropy on class and lamps, match on objects and signs.
 
     ``heads`` limits which of those terms are non-zero. ``lane_loss`` is
     ``huber`` (smooth-L1, the default), ``l1``, or ``mse``. The forward pass
     and the export still carry every head. Wheel and pedals are terms only
-    for the opt-in ``ctl`` head: ``total = ... + ctl_weight * ctl``.
+    for the opt-in ``ctl`` head: ``total = ... + ctl_weight * ctl``; ``ctl_loss`` is
+    ``huber`` (the default) or ``l1`` (steer and throttle only, see ``_ctl_loss``).
     """
     return _scene_loss_body(
-        pred, target, heads, lane_loss=lane_loss, conf_weight=conf_weight, ctl_weight=ctl_weight
+        pred, target, heads, lane_loss=lane_loss, conf_weight=conf_weight, ctl_weight=ctl_weight, ctl_loss=ctl_loss
     )
 
 

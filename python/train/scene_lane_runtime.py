@@ -370,9 +370,11 @@ def _strip_nchw(strip_bgr: Any, width: int | None = None) -> np.ndarray | None:
     expect_w = CANVAS_W if width is None else int(width)
     if arr.shape[0] != CANVAS_H or arr.shape[1] != expect_w:
         return None
-    if arr.dtype != np.float32:
-        arr = arr.astype(np.float32)
-    if float(arr.max()) > 1.5:
-        arr = arr / 255.0
+    if arr.dtype == np.uint8:
+        arr = arr.astype(np.float32) / 255.0
+    else:
+        arr = arr.astype(np.float32, copy=False)
+        if float(arr.max()) > 1.5:
+            arr = arr / 255.0
     chw = np.transpose(arr, (2, 0, 1))
     return np.ascontiguousarray(chw[None, ...])

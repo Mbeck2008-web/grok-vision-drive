@@ -15,9 +15,9 @@ Every feature in this README carries exactly one status label:
 
 One feature is proven live, and only for recording: the command-line collector, `scripts/collect_scene_lanes.py`. The rec2 and rec3 runs recorded on the dev PC on 2026-10-19 while BeamNG's AI drove. Evidence: `GVD_data\logs\rec3_20261019.txt` and `GVD_data\scene_lanes_rec3\collect.json` on the dev PC's data drive. rec3 ran an earlier build of the collector, from branch `collector-spawn-crash-fix` (6a07d65). `cursor/scene-net-collect-e194` carries newer versions of that build's paint-coverage spawn filter (`SpawnDeck` `min_paint_cov`) and weave guard (`weave_paint_min`). Everything about GVD driving, including Alt+G, the in-game ribbon, the eight-camera drive and force feedback, is **Unproven**. Live BeamNG.tech driving by a trained model is not proven yet. Force feedback and the steering-takeover fix are not live-tested.
 
-GVD enters **beta** when a trained model drives the car in BeamNG.
+GVD enters **beta** when a trained model drives the car in BeamNG. The next proof before that, and what it leaves out, is written down in [docs/SHADOW_GATE.md](docs/SHADOW_GATE.md).
 
-Trainer collapse fixes and event masking (`--mask-events`) are pending in PR #87 and are not merged yet.
+Trainer collapse fixes and event masking (`--mask-events`, `python/train/event_mask.py`) merged to main in PR #87 on 2026-10-20. That is trainer code; it is not evidence that a model drives.
 
 ## Quick start
 
@@ -375,7 +375,7 @@ Every number in this section is a code default or a code constant on this branch
 | Stitch | 2272x192 canvas: six 256x192 sectors (repeatL, pillarL, main, narrow, pillarR, repeatR), two 340x192 sectors (wide, rear), seven 8 px gaps. No pose warp. A missing camera is an empty sector. Repeater ego-body columns are cleared. | Offline smoke only |
 | Supervisor | `python/run_vision.py`: capture, perception (Hough lanes by default, YOLOv8n detector), path planner, safety vetoes, actuator, viz, clips. | Unproven |
 | Scene net | `python/train/scene_net.py`, trained from scratch: a per-sector conv stem (GroupNorm), a 512-wide token, a one-layer GRU (hidden 512) stepped with the real seconds since the previous strip, 15 s of memory, and a short residual skip. | Offline smoke only |
-| Backbones | A backbone choice (scratch / mobilenetv3 / imagenet-resnet18) is **pending**. It is not on this branch; the stem is always trained from scratch. | Unproven |
+| Backbones | `--backbone scratch\|imagenet-resnet18\|mobilenetv3` (default `scratch`, merged in PR #87). `scratch` is the GRU scene net above. The two ImageNet choices are a single-frame baseline (`python/train/pretrained_net.py`): a torchvision backbone per frame, no GRU. | Unproven |
 | Heads | Linear heads on the GRU output: lanes (6 x 16 points), lane valid, curbs (2 x 16), curb valid, objects (16 x 8 with class and valid), signs (8 x 4 with class, lamp state and valid), and `lane_gt` (14 values). Optional ctl head (offline only): `--heads lane_gt,ctl` adds steer, throttle and brake targets at 0-5 s horizons for offline evaluation; nothing drives from it. `--ctl-cond` (off by default) also feeds that head the previous row's speed, controls and yaw rate; the live runtime refuses such a model. `--ctl-loss l1` (default `huber`) trains its steer and throttle on L1 instead of smooth-L1. The path planner turns the scene into the path. | Offline smoke only |
 | Export | `--export` writes an FP32 ONNX graph, `models/e2e_scene.onnx`. | Offline smoke only |
 

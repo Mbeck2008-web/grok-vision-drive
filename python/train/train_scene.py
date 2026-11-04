@@ -322,6 +322,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Scale on the ctl loss (default 1.0). Only with --heads lane_gt,ctl; must be > 0.",
     )
     parser.add_argument(
+        "--ctl-loss",
+        default="huber",
+        choices=("huber", "l1"),
+        help=(
+            "ctl steer / throttle regression. huber is smooth-L1 (beta 0.1) and is the default; "
+            "l1 (B'2) is L1, the same error the eval's MAE measures; per-row masked mean over horizons. "
+            "Brake stays smooth-L1. l1 only with --heads lane_gt,ctl."
+        ),
+    )
+    parser.add_argument(
         "--ctl-cond",
         action="store_true",
         help=(
@@ -1088,6 +1098,7 @@ def _optimizer_step(
     scale: float = 1.0,
     frame_ages: list[Any] | None = None,
     ctl_weight: float = 1.0,
+    ctl_loss: str = "huber",
 ) -> tuple[float | None, int, SceneState, SceneState]:
     """Backprop through this chunk only.
 
@@ -1139,7 +1150,7 @@ def _optimizer_step(
             lane_gt_rows += int(has_lane_gt(labels))
             step = scene_loss(
                 one, _as_target(labels, device), heads, lane_loss=lane_loss, conf_weight=conf_weight,
-                ctl_weight=ctl_weight,
+                ctl_weight=ctl_weight, ctl_loss=ctl_loss,
             )
             if trace is not None and trace.get("print_shapes") and not trace.get("shapes_printed"):
                 _print_step_shapes(image, one, step, state)
@@ -1233,6 +1244,7 @@ def _optimizer_group(
     scale: float = 1.0,
     age_sets: list[list[Any] | None] | None = None,
     ctl_weight: float = 1.0,
+    ctl_loss: str = "huber",
 ) -> tuple[float | None, int, SceneState, SceneState]:
     """One step on several windows that each start from a fresh GRU state.
 
@@ -1296,7 +1308,7 @@ def _optimizer_group(
             lane_gt_rows += int(has_lane_gt(labels))
             step = scene_loss(
                 one, _as_target(labels, device), heads, lane_loss=lane_loss, conf_weight=conf_weight,
-                ctl_weight=ctl_weight,
+                ctl_weight=ctl_weight, ctl_loss=ctl_loss,
             )
             value = step["total"]
             item_loss = float(value.detach().item())
@@ -1382,6 +1394,7 @@ def _eval_sequence(
     conf_weight: float = 1.0,
     preds_out: list[Any] | None = None,
     ctl_weight: float = 1.0,
+    ctl_loss: str = "huber",
     ctl_out: list[Any] | None = None,
 ) -> tuple[float | None, int]:
     """Holdout forward. No optimizer step and no gradient through these frames.
@@ -1451,7 +1464,8 @@ def _eval_sequence(
                 if not loss_mask(row):
                     continue
                 step = scene_loss(
-                    one, _as_target(labels_for_row(row), device), heads, conf_weight=conf_weight, ctl_weight=ctl_weight
+                    one, _as_target(labels_for_row(row), device), heads, conf_weight=conf_weight, ctl_weight=ctl_weight,
+                    ctl_loss=ctl_loss,
                 )
                 value = step["total"]
                 total = value if total is None else total + value
@@ -1827,6 +1841,7 @@ def train_directory(
     ctl_weight: float = 1.0,
     exact_epochs: int | None = None,
     ctl_cond: bool = False,
+    ctl_loss: str = "huber",
 ) -> dict[str, Any]:
     import torch
 
@@ -1846,6 +1861,11 @@ def train_directory(
         raise SystemExit("ctl is wired into the scratch net only (--backbone scratch)")
     if ctl_cond and not use_ctl:
         raise SystemExit("--ctl-cond needs --heads lane_gt,ctl")
+    ctl_kind = str(ctl_loss or "huber")
+    if ctl_kind != "huber" and not use_ctl:
+        raise SystemExit(f"--ctl-loss {ctl_kind} needs --heads lane_gt,ctl")
+    if use_ctl:
+        print(f"[GVD] ctl loss: steer/throttle={ctl_kind} brake=huber", flush=True)
     from python.train.ctl_targets import COND_DIM, REV4, REV5
 
     ctl_cond_dim = COND_DIM if ctl_cond else 0
@@ -2310,6 +2330,7 @@ def train_directory(
             "cam_age": bool(use_cam_age),
             "ctl": bool(use_ctl),
             **({"ctl_cond_dim": int(ctl_cond_dim)} if ctl_cond_dim else {}),
+            **({"ctl_loss": ctl_kind} if ctl_kind != "huber" else {}),
             "heads": list(train_heads or ()),
             "scale": float(input_scale),
             "backbone": str(backbone),
@@ -2470,6 +2491,7 @@ def train_directory(
                         parts=val_parts,
                         conf_weight=float(conf_weight),
                         ctl_weight=float(ctl_weight),
+                        ctl_loss=ctl_kind,
                         ctl_out=val_ctl if use_ctl else None,
                     )
                     if held_loss is not None and held_count:
@@ -2527,6 +2549,7 @@ def train_directory(
                             lane_loss=lane_kind,
                             conf_weight=float(conf_weight),
                             ctl_weight=float(ctl_weight),
+                            ctl_loss=ctl_kind,
                             scale=input_scale,
                             frames=prefetched_frames,
                             frame_ages=prefetched_ages,
@@ -2551,6 +2574,7 @@ def train_directory(
                             lane_loss=lane_kind,
                             conf_weight=float(conf_weight),
                             ctl_weight=float(ctl_weight),
+                            ctl_loss=ctl_kind,
                             frame_sets=group_frames,
                             scale=input_scale,
                             age_sets=group_ages,
@@ -2827,6 +2851,7 @@ def train_directory(
                 lane_loss=lane_kind,
                 conf_weight=float(conf_weight),
                 ctl_weight=float(ctl_weight),
+                ctl_loss=ctl_kind,
                 scale=input_scale,
             )
             done = step_i + 1
@@ -2989,6 +3014,8 @@ def ctl_refusal(args: argparse.Namespace, heads: tuple[str, ...]) -> str | None:
         return "ctl needs lane_gt (--heads lane_gt,ctl)"
     if bool(getattr(args, "ctl_cond", False)) and not on:
         return "--ctl-cond needs --heads lane_gt,ctl"
+    if str(getattr(args, "ctl_loss", "huber")) != "huber" and not on:
+        return f"--ctl-loss {args.ctl_loss} needs --heads lane_gt,ctl"
     if args.ctl_weight is not None:
         if not on:
             return "--ctl-weight needs --heads lane_gt,ctl"
@@ -3142,6 +3169,7 @@ def main(argv: list[str] | None = None) -> None:
                 conf_weight=float(args.conf_weight),
                 ctl_weight=1.0 if args.ctl_weight is None else float(args.ctl_weight),
                 ctl_cond=bool(args.ctl_cond),
+                ctl_loss=str(args.ctl_loss),
                 init_head_bias=bool(args.init_head_bias),
                 eval_chunk=int(args.eval_chunk),
                 backbone=str(args.backbone),

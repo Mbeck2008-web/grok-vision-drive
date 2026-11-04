@@ -416,6 +416,7 @@ def check_c5_cli_and_tiny_run() -> bool:
         assert len(ep0) == 1
         meta = load_epoch_ckpt(ep0[0])["meta"]
         assert meta["ctl"] is True and meta["ctl_cond_dim"] == 5 and meta["arch"].endswith(":ctl=3x6:cond=5"), meta
+        assert "ctl_loss" not in meta, "the default --ctl-loss huber writes no ctl_loss key"
         out = tmp / "ep0.onnx"
         assert export_epoch_onnx.main(["--ckpt-dir", str(ckpts), "--epoch", "0", "--out", str(out)]) == 0
         result = evaluate(root, out, holdout_blocks=1, eval_chunk=16, expect_epoch=0)

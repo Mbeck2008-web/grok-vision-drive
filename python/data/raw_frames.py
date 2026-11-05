@@ -539,7 +539,7 @@ def _png_bytes(arr: np.ndarray) -> bytes | None:
 # ``train_gt: true`` in cameras.yaml. Folders are ``raw/<cam>_depth`` and
 # ``raw/<cam>_sem``. Driving, inference, and camera listings never read them.
 TRAIN_ONLY_SUFFIXES: tuple[str, ...] = ("_depth", "_sem")
-DEPTH_MM_MAX = 65535
+DEPTH_CM_MAX = 65535
 
 
 def is_train_only_cam(cam_id: Any) -> bool:
@@ -548,7 +548,7 @@ def is_train_only_cam(cam_id: Any) -> bool:
 
 
 def _gt_png_bytes(arr: np.ndarray) -> bytes | None:
-    """Lossless PNG for a 2-D uint8 (class id) or uint16 (depth mm) array."""
+    """Lossless PNG for a 2-D uint8 (class id) or uint16 (depth cm) array."""
     if arr.ndim != 2 or arr.dtype not in (np.uint8, np.uint16):
         return None
     import cv2
@@ -587,10 +587,11 @@ def sem_class_ids(palette: Mapping[str, Any] | None) -> dict[str, int]:
 
 
 def train_gt_from_raw(cam_id: str, cam: Any, raw: Any) -> dict[str, np.ndarray]:
-    """``<cam>_depth`` uint16 mm and ``<cam>_sem`` uint8 class id from one reading.
+    """``<cam>_depth`` uint16 cm and ``<cam>_sem`` uint8 class id from one reading.
 
     Depth is BeamNG's float32 buffer in [0, 1], scaled by the camera far
-    plane and clamped at 65535 mm. Annotation RGB is looked up in the
+    plane (assumed linear; unverified until the live spot-check) and
+    clamped at 65535 cm (655.35 m). Annotation RGB is looked up in the
     palette from ``get_annotations()``; an unknown colour is class 0.
     """
     if not isinstance(raw, Mapping):
@@ -605,8 +606,8 @@ def train_gt_from_raw(cam_id: str, cam: Any, raw: Any) -> dict[str, np.ndarray]:
         depth = _plane(raw.get("depth"), np.float32, (h, w))
         if depth is not None:
             far = float((getattr(cam, "near_far_planes", None) or (0.0, 0.0))[1])
-            mm = np.nan_to_num(depth.astype(np.float64) * far * 1000.0, nan=DEPTH_MM_MAX, posinf=DEPTH_MM_MAX)
-            out[f"{cam_id}_depth"] = np.clip(np.rint(mm), 0, DEPTH_MM_MAX).astype(np.uint16)
+            cm = np.nan_to_num(depth.astype(np.float64) * far * 100.0, nan=DEPTH_CM_MAX, posinf=DEPTH_CM_MAX)
+            out[f"{cam_id}_depth"] = np.clip(np.rint(cm), 0, DEPTH_CM_MAX).astype(np.uint16)
     if getattr(cam, "is_render_annotations", False):
         ann = raw.get("annotation")
         arr = None

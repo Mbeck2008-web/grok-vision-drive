@@ -3496,6 +3496,7 @@ def _attach_cameras(bng: Any, vehicle: Any, cfg: dict[str, Any]) -> dict[str, An
 
     from python.sensors.cameras import (
         CAM_IDS,
+        _attach_sem_palette,
         beamng_camera_sensor_kwargs,
         camera_clip_planes,
         camera_update_priority,
@@ -3533,8 +3534,11 @@ def _attach_cameras(bng: Any, vehicle: Any, cfg: dict[str, Any]) -> dict[str, An
             rgb_only=True,
             update_priority=camera_update_priority(spec, cid=cid),
             cid=cid,
+            train_gt=bool(spec.get("train_gt")),
         )
         attached[cid] = Camera(f"gvd_collect_{cid}", bng, vehicle, **kwargs)
+        if spec.get("train_gt"):
+            _attach_sem_palette(attached[cid], bng)
     if "main" not in attached:
         raise RuntimeError("main camera did not attach")
     return attached
@@ -3616,6 +3620,12 @@ def _read_camera(cid: str, cam: Any, window: dict[str, Any] | None = None) -> tu
 
 
 _TRAIN_GT: dict[str, Any] = {}
+_TRAIN_GT_FAIL: dict[str, int] = {"n": 0}
+
+
+def train_gt_failures() -> int:
+    """Ticks whose training-only GT decode raised (first one is logged)."""
+    return int(_TRAIN_GT_FAIL["n"])
 
 
 def take_train_gt() -> dict[str, Any]:
@@ -3642,9 +3652,20 @@ def _poll_cameras(cams: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any],
             continue
         frames[cid] = image
         if getattr(cam, "is_render_depth", False) is True or getattr(cam, "is_render_annotations", False) is True:
-            from python.data.raw_frames import train_gt_from_raw
+            from python.data import raw_frames
 
-            _TRAIN_GT.update(train_gt_from_raw(str(cid), cam, raw))
+            try:
+                _TRAIN_GT.update(raw_frames.train_gt_from_raw(str(cid), cam, raw))
+            except Exception as exc:
+                # Training-only GT never stops collection; colour frames still go out.
+                _TRAIN_GT_FAIL["n"] += 1
+                if _TRAIN_GT_FAIL["n"] == 1:
+                    print(
+                        f"collect WARNING train_gt decode failed for {cid} "
+                        f"({type(exc).__name__}: {exc}); GT skipped, colour kept "
+                        "(count in train_gt_failures)",
+                        flush=True,
+                    )
         sensor_t = None
         if isinstance(raw, dict):
             for key in ("timestamp", "time", "t"):

@@ -3,7 +3,7 @@
 
 Opt-in per camera (``train_gt: true`` in cameras.yaml). Off by default, so a
 recording without it is unchanged. The files land in ``raw/main_depth``
-(uint16 mm PNG) and ``raw/main_sem`` (uint8 class-id PNG), tagged
+(uint16 cm PNG) and ``raw/main_sem`` (uint8 class-id PNG), tagged
 ``train_only`` in state.jsonl, and no driving / frame-cache camera list
 ever returns them.
 """
@@ -74,7 +74,7 @@ class _StubCam:
 def _arrays() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     depth = np.full((H, W), 0.2, dtype=np.float32)  # 0.2 * 50 m = 10 m
     depth[0, 0] = 1.0  # 50 m
-    depth[1, 1] = 2.0  # 100 m clamps to 65535 mm
+    depth[1, 1] = 14.0  # 700 m clamps to 65535 cm
     ann = np.zeros((H, W, 4), dtype=np.uint8)
     ann[..., :3] = PALETTE["ROAD"]
     ann[0, :, :3] = PALETTE["SKY"]
@@ -88,7 +88,7 @@ def _expect(gt: dict) -> None:
     assert set(gt) == {"main_depth", "main_sem"}, sorted(gt)
     d = gt["main_depth"]
     assert d.dtype == np.uint16 and d.shape == (H, W)
-    assert int(d[3, 3]) == 10000 and int(d[0, 0]) == 50000 and int(d[1, 1]) == 65535
+    assert int(d[3, 3]) == 1000 and int(d[0, 0]) == 5000 and int(d[1, 1]) == 65535
     s = gt["main_sem"]
     assert s.dtype == np.uint8 and s.shape == (H, W)
     ids = {name: i + 1 for i, name in enumerate(sorted(PALETTE))}
@@ -171,11 +171,86 @@ def check_writer_and_exclusions() -> None:
     print("writer tags train_only; listings exclude gt folders")
 
 
+def check_collect_attach_flips_with_yaml() -> None:
+    """collect's own ``_attach_cameras`` honours ``train_gt`` and attaches the palette."""
+    import types
+
+    made: dict[str, dict] = {}
+
+    class _Cam:
+        def __init__(self, name, bng, vehicle, **kwargs):
+            made[name] = kwargs
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+    fake = types.ModuleType("beamngpy.sensors")
+    fake.Camera = _Cam
+    saved = {k: sys.modules.get(k) for k in ("beamngpy", "beamngpy.sensors")}
+    sys.modules.setdefault("beamngpy", types.ModuleType("beamngpy"))
+    sys.modules["beamngpy.sensors"] = fake
+
+    class _Api:
+        def get_annotations(self):
+            return dict(PALETTE)
+
+    bng = types.SimpleNamespace(camera=_Api())
+    spec = {"id": "main", "pos_m": [0, 1.2, 1.26], "fov_v": 34.0, "live_res": [W, H], "far_m": 300}
+    try:
+        off = collect._attach_cameras(bng, object(), {"cameras": [dict(spec)]})
+        on = collect._attach_cameras(bng, object(), {"cameras": [dict(spec, train_gt=True)]})
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+    assert off["main"].is_render_depth is False and off["main"].is_render_annotations is False
+    assert not getattr(off["main"], "gvd_sem_palette", None)
+    assert on["main"].is_render_depth is True and on["main"].is_render_annotations is True
+    assert on["main"].integer_depth is False
+    assert on["main"].gvd_sem_palette == PALETTE
+    print("collect attach flips with train_gt yaml")
+
+
+def check_gt_failure_is_soft() -> None:
+    """A broken GT decode logs once with a count; the colour frame still comes back."""
+    import contextlib
+    import io
+
+    _d, _a, colour = _arrays()
+    cam = _StubCam({"colour": colour, "depth": "garbage", "annotation": object()})
+    cam.resolution = "bad"  # makes train_gt_from_raw raise inside
+    real = collect.train_gt_from_raw if hasattr(collect, "train_gt_from_raw") else None
+    import python.data.raw_frames as rf
+
+    def boom(*a, **k):
+        raise ValueError("decode broke")
+
+    orig = rf.train_gt_from_raw
+    rf.train_gt_from_raw = boom
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            for _ in range(3):
+                frames, _s, reasons = collect._poll_cameras({"main": cam})
+                assert set(frames) == {"main"} and reasons == {}
+                assert collect.take_train_gt() == {}
+    finally:
+        rf.train_gt_from_raw = orig
+    text = buf.getvalue()
+    assert text.count("train_gt decode failed") == 1, text
+    assert collect.train_gt_failures() >= 3
+    _ = real
+    print("gt decode failure is soft, one warning, counted")
+
+
 def main() -> None:
     check_kwargs_default_off()
     check_gt_from_arrays_and_bytes()
     check_poll_keeps_gt_out_of_frames()
     check_writer_and_exclusions()
+    check_collect_attach_flips_with_yaml()
+    check_gt_failure_is_soft()
     print("sensor gt ok")
 
 

@@ -2469,7 +2469,8 @@ def train_directory(
             val_rows: list[Mapping[str, Any]] = []
             val_parts: dict[str, float] = {"lane_reg": 0.0, "conf_bce": 0.0, "n": 0}
             val_ctl: list[Any] = []
-            worst = WorstFrames(int(val_worst)) if int(val_worst) > 0 else None
+            # No status dir (status_root=None), nowhere to write: no heap either.
+            worst = WorstFrames(int(val_worst)) if int(val_worst) > 0 and debug_dir is not None else None
             index = 0
             prefetch = _prefetch_loader(
                 plan_steps,

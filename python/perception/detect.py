@@ -106,12 +106,14 @@ class SyntheticDetector(Detector):
 class OnnxYoloDetector(Detector):
     name = "yolov8n-onnx"
 
-    def __init__(self, onnx_path: Path = DEFAULT_ONNX, conf: float = 0.35) -> None:
+    def __init__(self, onnx_path: Path = DEFAULT_ONNX, conf: float = 0.35, nms_thr: float = 0.45) -> None:
         import onnxruntime as ort  # type: ignore
 
         self.path = Path(onnx_path)
         self.name = f"{self.path.stem}-onnx"
         self.conf = conf
+        # Class-wise NMS after the cutoff (#150); 0.45 is the YOLOX path's constant.
+        self.nms_thr = nms_thr
         want = ["CUDAExecutionProvider", "CPUExecutionProvider"]
         avail = set(ort.get_available_providers())
         providers = [p for p in want if p in avail] or ["CPUExecutionProvider"]
@@ -139,6 +141,7 @@ class OnnxYoloDetector(Detector):
         if arr.ndim != 3:
             return dets
         rows = arr[0]
+        cls_ids: list[int] = []
         for row in rows:
             if row.shape[0] < 6:
                 continue
@@ -161,7 +164,16 @@ class OnnxYoloDetector(Detector):
             y2 = (cy + bh / 2) * sy
             ex, ey, yaw = project_box_to_ego((x1, y1, x2, y2), w0, h0)
             dets.append(Detection(cls=cls, conf=score, xyxy=(x1, y1, x2, y2), x=ex, y=ey, yaw=yaw))
-        return dets
+            cls_ids.append(cls_id)
+        # The raw head fires several anchors per object: keep the best per COCO class.
+        keep: list[int] = []
+        ids = np.array(cls_ids, dtype=np.int64)
+        for cid in np.unique(ids):
+            idx = np.where(ids == cid)[0]
+            boxes = np.array([dets[k].xyxy for k in idx], dtype=np.float64)
+            confs = np.array([dets[k].conf for k in idx], dtype=np.float64)
+            keep.extend(int(idx[k]) for k in _nms_xyxy(boxes, confs, self.nms_thr))
+        return [dets[k] for k in sorted(keep)]
 
 
 def _yolox_letterbox(bgr: np.ndarray, in_h: int, in_w: int) -> tuple[np.ndarray, float]:

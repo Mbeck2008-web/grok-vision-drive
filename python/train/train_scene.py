@@ -36,6 +36,7 @@ if str(ROOT) not in sys.path:
 from python.data.raw_frames import LossyFramesError  # noqa: E402
 from python.train.event_mask import MaskFileError  # noqa: E402
 from python.train.ctl_targets import CtlDataError  # noqa: E402
+from python.train.val_worst import DEFAULT_N as VAL_WORST_N, WorstFrames  # noqa: E402
 from python.data.strip_writer import CANVAS_H, CANVAS_W  # noqa: E402
 from python.train.continual import (  # noqa: E402
     CHUNK_MAX,
@@ -147,6 +148,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Train exactly N epochs (ckpt_ep0..ckpt_ep{N-1}); the holdout early stop and best-epoch reload are off.",
+    )
+    parser.add_argument(
+        "--val-worst",
+        type=int,
+        default=VAL_WORST_N,
+        help="Write the N highest-loss holdout frames of each val to val_worst.run<id>.ep<E>.json "
+        "in the status dir (max 256). 0 turns it off.",
+    )
+    parser.add_argument(
+        "--val-worst-png",
+        action="store_true",
+        help="Also draw a top-down thumbnail per worst frame (GT green, prediction red).",
     )
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument(
@@ -1396,6 +1409,7 @@ def _eval_sequence(
     ctl_weight: float = 1.0,
     ctl_loss: str = "huber",
     ctl_out: list[Any] | None = None,
+    worst: Any = None,
 ) -> tuple[float | None, int]:
     """Holdout forward. No optimizer step and no gradient through these frames.
 
@@ -1407,6 +1421,7 @@ def _eval_sequence(
     ``pair_rows`` (the row behind each primary pair) and ``preds_out``
     (``(row, vector)`` per scored frame) follow the primary stream.
     ``ctl_out`` gets ``(row, ctl (3, K))`` per frame of a ctl net, primary stream.
+    ``worst`` (a ``val_worst.WorstFrames``) sees each loss row's total, primary stream.
     """
     import torch
 
@@ -1474,6 +1489,15 @@ def _eval_sequence(
                     parts["lane_reg"] = float(parts.get("lane_reg", 0.0)) + float(step["lane_reg"].detach().item())
                     parts["conf_bce"] = float(parts.get("conf_bce", 0.0)) + float(step["conf_bce"].detach().item())
                     parts["n"] = int(parts.get("n", 0)) + 1
+                if worst is not None:
+                    lane = getattr(one, "lane_gt", None)
+                    worst.note(
+                        float(value.detach().item()),
+                        row,
+                        None if lane is None else lane.detach().float().cpu().numpy().reshape(-1),
+                        gt_vec,
+                        gt_mask,
+                    )
                 if view is not None:
                     view.pump()
     finally:
@@ -1842,6 +1866,8 @@ def train_directory(
     exact_epochs: int | None = None,
     ctl_cond: bool = False,
     ctl_loss: str = "huber",
+    val_worst: int = VAL_WORST_N,
+    val_worst_png: bool = False,
 ) -> dict[str, Any]:
     import torch
 
@@ -2443,6 +2469,7 @@ def train_directory(
             val_rows: list[Mapping[str, Any]] = []
             val_parts: dict[str, float] = {"lane_reg": 0.0, "conf_bce": 0.0, "n": 0}
             val_ctl: list[Any] = []
+            worst = WorstFrames(int(val_worst)) if int(val_worst) > 0 else None
             index = 0
             prefetch = _prefetch_loader(
                 plan_steps,
@@ -2496,6 +2523,7 @@ def train_directory(
                         ctl_weight=float(ctl_weight),
                         ctl_loss=ctl_kind,
                         ctl_out=val_ctl if use_ctl else None,
+                        worst=worst,
                     )
                     if held_loss is not None and held_count:
                         hold_sum += float(held_loss) * int(held_count)
@@ -2750,6 +2778,12 @@ def train_directory(
                 ckpt_info = _write_epoch_ckpt(scored)
                 record["ckpt"] = None if ckpt_info is None else Path(ckpt_info["path"]).name
                 record["ckpt_sha256"] = None if ckpt_info is None else ckpt_info["sha256"]
+                if worst is not None:
+                    worst_path = worst.write(
+                        debug_dir, run=epoch_run, epoch=int(epoch), step=int(done),
+                        recording=root.name, cams=train_cams, png=bool(val_worst_png),
+                    )
+                    record["val_worst"] = None if worst_path is None else worst_path.name
                 append_metrics(debug_dir, record)
                 print(
                     f"[GVD] val step={done} n={scored['n']} r={scored['r']} "
@@ -3186,6 +3220,8 @@ def main(argv: list[str] | None = None) -> None:
                 grad_ckpt=bool(args.grad_ckpt),
                 pause_dir=pause_dir,
                 exact_epochs=args.exact_epochs,
+                val_worst=int(args.val_worst),
+                val_worst_png=bool(args.val_worst_png),
             )
         except ExactEpochsMismatch as exc:
             print(f"[GVD] scene train: {exc}", flush=True)

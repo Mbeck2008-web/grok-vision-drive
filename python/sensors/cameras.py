@@ -769,13 +769,12 @@ def _cam_resolution(cam: Any) -> tuple[int, int] | None:
 # A daylight colour buffer can sit in the top of the 8-bit range. Pavement
 # and a thin lane stripe are then both white paint, so the stripe is not a
 # separate region. The viewport picture keeps that road near mid gray.
-# recover_viewport_tone is that curve. The live grab does NOT apply it by
-# default: the recorder stores the raw buffer (tone=False) and the scene net
+# recover_viewport_tone is that curve. The live grab never applies it:
+# the recorder stores the raw buffer (tone=False) and the scene net
 # is trained on it, so the live frames the lane fit, the model, the CAMS
 # tiles, and the PIP read are that same raw buffer. The curve is also a hard
 # gate (sample 187 unchanged, 188 about 50 levels darker), so a camera that
-# sits near it flickered frame to frame. GVD_LIVE_TONE=1 opts back in for
-# the pixel lane finder on a washed-out picture (see live_tone).
+# sits near it flickered frame to frame.
 # Mid-gray, dark, and all-zero frames stay put.
 _TONE_P40_MIN = 188.0
 _TONE_SPREAD_MAX = 70.0
@@ -917,25 +916,6 @@ def recover_viewport_tone(bgr: np.ndarray) -> np.ndarray:
     levels = np.arange(256, dtype=np.float32) / 255.0
     lut = np.clip(np.rint(np.power(levels, gamma) * 255.0), 0, 255).astype(np.uint8)
     return lut[bgr]
-
-
-LIVE_TONE_ENV = "GVD_LIVE_TONE"
-
-
-def live_tone_enabled() -> bool:
-    """True only when ``GVD_LIVE_TONE`` is ``1`` / ``true`` / ``yes``. Off by default."""
-    return os.environ.get(LIVE_TONE_ENV, "").strip().lower() in ("1", "true", "yes")
-
-
-def live_tone(bgr: np.ndarray) -> np.ndarray:
-    """The frame a live reader gets: the raw buffer, unless ``GVD_LIVE_TONE`` opts in.
-
-    Off, this is the same object that came in, so live frames match what the
-    recorder saves for the same buffer. On, it is ``recover_viewport_tone``.
-    """
-    if not live_tone_enabled():
-        return bgr
-    return recover_viewport_tone(bgr)
 
 
 def colour_to_bgr(
@@ -1411,8 +1391,6 @@ class WindowBackend:
         if img.dtype != np.uint8:
             img = img.astype(np.uint8)
         img = resize_long_side(img, self.long_side)
-        if getattr(img, "ndim", 0) == 3 and img.shape[2] == 3 and img.dtype == np.uint8:
-            img = live_tone(img)
         ts = time.time()
         frames["main"] = img
         frames["cam_main"] = img
@@ -2050,8 +2028,7 @@ class BeamNGPyBackend:
         self._last_status = "ok"
         sig = frame_signature(bgr)
         unique = sig != self._frame_sig.get(cid)
-        self._store_frame(cid, live_tone(bgr), ts, frames, timestamps, health)
-        # The flash reference stays raw even when GVD_LIVE_TONE tones the stored frame.
+        self._store_frame(cid, bgr, ts, frames, timestamps, health)
         self._cache_frames[cid] = bgr
         if unique:
             self._frame_sig[cid] = sig

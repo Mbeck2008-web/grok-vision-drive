@@ -1020,6 +1020,8 @@ def training_frame_bytes(
         if "raw_repaired" in path.parts:
             continue
         if is_raw_frame_path(path) and path.suffix.lower() in {".png", ".npy"}:
+            if is_train_only_cam(raw_camera_of(path) or ""):
+                continue  # depth / semantic GT: the trainer never reads it
             chosen = training_image_path(path)
             if chosen is None:
                 continue

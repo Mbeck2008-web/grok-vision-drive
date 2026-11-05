@@ -7,7 +7,6 @@ Companions are read with stream_raw, on the same tick as main.
 """
 from __future__ import annotations
 
-import os
 import sys
 import types
 from pathlib import Path
@@ -22,7 +21,6 @@ from python.sensors.cameras import (  # noqa: E402
     CAM_IDS,
     COMPANION_OFFSCREEN_UPDATE_S,
     LANE_CAM_UPDATE_S,
-    LIVE_TONE_ENV,
     LANE_SENSOR_CAM_IDS,
     ON_DEMAND_UPDATE_S,
     BeamNGPyBackend,
@@ -86,7 +84,7 @@ def _check_washed_companion_is_stored_raw() -> None:
     Asphalt (228, 220, 210) against a settled road is under the blue bar.
     After the old curve the blue excess cleared the bar, so a curved frame
     must never be the flash input. The live frame is the raw buffer, the
-    same picture the recorder saves; GVD_LIVE_TONE=1 is the opt-in curve.
+    same picture the recorder saves.
     """
     settled = _road((108, 102, 98))
     washed = _road((228, 220, 210))
@@ -100,7 +98,6 @@ def _check_washed_companion_is_stored_raw() -> None:
     assert companion_frame_is_flash(toned, settled) is True
     read = _reading_colour({"colour": rgb}, None)
     assert read is not None and np.array_equal(read, raw)
-    os.environ.pop(LIVE_TONE_ENV, None)
     be = BeamNGPyBackend.__new__(BeamNGPyBackend)
     be.long_side = 640
     be._cache_frames = {"wide": settled.copy(), "main": settled.copy()}
@@ -111,15 +108,6 @@ def _check_washed_companion_is_stored_raw() -> None:
     assert np.array_equal(be._cache_frames["wide"], raw)
     main = _publish(be, "main", read)
     assert np.array_equal(main["main"], raw)
-    # Opted in: the stored frame is curved, the flash reference stays raw.
-    os.environ[LIVE_TONE_ENV] = "1"
-    try:
-        be._cache_frames = {"wide": settled.copy()}
-        wide = _publish(be, "wide", read)
-        assert np.array_equal(wide["wide"], toned)
-        assert np.array_equal(be._cache_frames["wide"], raw)
-    finally:
-        os.environ.pop(LIVE_TONE_ENV, None)
 
 
 def main() -> None:

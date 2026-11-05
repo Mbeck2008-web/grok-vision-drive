@@ -8,8 +8,8 @@ the CAMS tiles, and the inset the same bytes. A road sample on either side
 of the old washed-road gate (188) must not flip frames between a raw and a
 darkened picture, and the companion flash check compares raw with raw.
 
-``GVD_LIVE_TONE=1`` is the only way to get the old washed-road curve on
-the live frames. It is off by default.
+The old ``GVD_LIVE_TONE=1`` opt-in is gone: setting it changes nothing,
+so live frames always match the frames the scene net trained on.
 """
 from __future__ import annotations
 
@@ -222,32 +222,26 @@ def _window_grab(img: np.ndarray) -> np.ndarray:
     return bundle.frames["main"]
 
 
-def check_window_backend_follows_flag() -> None:
-    """Retail window capture: raw with the flag off, the old curve with GVD_LIVE_TONE=1."""
+def check_window_backend_ignores_flag() -> None:
+    """Retail window capture: byte-equal raw, even with GVD_LIVE_TONE=1 set."""
     _clear_flag()
     raw_bgr = _road_bgr(188)
-    toned = recover_viewport_tone(raw_bgr)
-    assert not np.array_equal(toned, raw_bgr)
     off = _window_grab(raw_bgr)
     assert off.dtype == raw_bgr.dtype and np.array_equal(off, raw_bgr), float(off.mean())
     try:
         os.environ[TONE_ENV] = "1"
         on = _window_grab(raw_bgr)
-        assert np.array_equal(on, toned), float(on.mean())
+        assert np.array_equal(on, raw_bgr), float(on.mean())
     finally:
         _clear_flag()
-    print("  WindowBackend: flag off -> byte-equal raw; GVD_LIVE_TONE=1 -> toned")
+    print("  WindowBackend: byte-equal raw with or without GVD_LIVE_TONE=1")
 
 
-def check_tone_flag_off_by_default() -> None:
-    """GVD_LIVE_TONE is opt-in: unset / 0 -> raw; 1 -> old curve on the stored frame."""
-    from python.sensors.cameras import live_tone, live_tone_enabled
-
+def check_tone_flag_is_gone() -> None:
+    """GVD_LIVE_TONE no longer exists: with it set to 1 the stored frame is raw."""
     raw_bgr = _road_bgr(188)
     toned = recover_viewport_tone(raw_bgr)
     assert not np.array_equal(toned, raw_bgr)
-    _clear_flag()
-    assert live_tone_enabled() is False
     # colour_to_bgr defaults to raw too; tone is keyword-only.
     assert np.array_equal(colour_to_bgr(_rgba(raw_bgr), (W, H)), raw_bgr)
     assert np.array_equal(colour_to_bgr(_rgba(raw_bgr), (W, H), tone=True), toned)
@@ -257,24 +251,17 @@ def check_tone_flag_off_by_default() -> None:
         pass
     else:
         raise AssertionError("colour_to_bgr tone must be keyword-only")
-    assert live_tone(raw_bgr) is raw_bgr
-    for off in ("", "0", "false", "no"):
-        os.environ[TONE_ENV] = off
-        assert live_tone_enabled() is False, off
     try:
         os.environ[TONE_ENV] = "1"
-        assert live_tone_enabled() is True
-        assert np.array_equal(live_tone(raw_bgr), toned)
         be = _backend()
         frames, status = _live(be, "repeatL", _rgba(raw_bgr))
-        assert status == "ok" and np.array_equal(frames["repeatL"], toned)
-        # Opted in, the flash check still holds the raw buffer.
+        assert status == "ok" and np.array_equal(frames["repeatL"], raw_bgr)
         assert np.array_equal(be._cache_frames["repeatL"], raw_bgr)
         frames, status = _live(be, "repeatL", _rgba(raw_bgr))
         assert status == "ok", status
     finally:
         _clear_flag()
-    print("  GVD_LIVE_TONE off by default; =1 tones the stored frame, flash ref stays raw")
+    print("  GVD_LIVE_TONE=1 is ignored: stored frame and flash ref are raw")
 
 
 def main() -> None:
@@ -283,8 +270,8 @@ def main() -> None:
     check_warm_washed_companion_keeps_landing()
     check_flash_still_filtered_raw_vs_raw()
     check_late_colour_keeps_raw_flash_reference()
-    check_window_backend_follows_flag()
-    check_tone_flag_off_by_default()
+    check_window_backend_ignores_flag()
+    check_tone_flag_is_gone()
     print("test_live_tone_parity: OK")
 
 

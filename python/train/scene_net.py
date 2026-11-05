@@ -705,12 +705,24 @@ def labels_from_tech(tech: Mapping[str, Any] | None) -> dict[str, np.ndarray]:
     }
 
 
-def labels_for_row(row: Mapping[str, Any] | None) -> dict[str, np.ndarray]:
+def labels_for_row(
+    row: Mapping[str, Any] | None,
+    *,
+    root: Path | str | None = None,
+    aux_depth: bool = False,
+    aux_sem: bool = False,
+) -> dict[str, np.ndarray]:
     """Scene labels plus the ground-truth lane vector when the row has one.
 
     Old strips without ``lane_gt`` still train the polyline heads. Invalid
     geometry is NaN and its mask is clear, so that term does not pull.
+    ``road_edge`` is attached as a separate vector (never copied into paint).
+    Depth/sem aux load only when ``root`` is set and the matching flag is on.
     """
+    from pathlib import Path as _Path
+
+    from python.train.sensor_aux import attach_aux_to_labels, road_edge_from_record
+
     row = row or {}
     tech = row.get("tech") if isinstance(row.get("tech"), Mapping) else row
     labels = labels_from_tech(tech if isinstance(tech, Mapping) else None)
@@ -721,6 +733,24 @@ def labels_for_row(row: Mapping[str, Any] | None) -> dict[str, np.ndarray]:
     if "ctl" in row and "ctl_valid" in row:
         labels["ctl"] = np.asarray(row["ctl"], dtype=np.float32).reshape(3, CTL_K)
         labels["ctl_valid"] = np.asarray(row["ctl_valid"], dtype=np.float32).reshape(3, CTL_K)
+    # Separate road-edge capability (masked when absent). Not paint.
+    record: dict[str, Any] = {}
+    if isinstance(tech, Mapping):
+        record.update(tech)
+    record.update(row)
+    re_v, re_m = road_edge_from_record(record)
+    labels["road_edge"] = re_v
+    labels["road_edge_valid"] = re_m
+    if root is not None and (aux_depth or aux_sem) and row.get("i") is not None:
+        labels = attach_aux_to_labels(
+            labels,
+            root=_Path(root),
+            index=int(row["i"]),
+            row=row,
+            want_depth=bool(aux_depth),
+            want_sem=bool(aux_sem),
+            want_road_edge=False,
+        )
     return labels
 
 
@@ -939,6 +969,10 @@ class ScenePrediction:
     ctl_steer: Any = None
     ctl_throttle: Any = None
     ctl_brake: Any = None
+    # Training-only aux / road_edge (never default ONNX outputs).
+    aux_depth: Any = None
+    aux_sem_logits: Any = None
+    road_edge: Any = None
 
     def as_dict(self) -> dict[str, Any]:
         return {name: getattr(self, name) for name in OUTPUT_FIELDS}
@@ -1153,6 +1187,9 @@ def _scene_loss_body(
     conf_weight: float = 1.0,
     ctl_weight: float = 1.0,
     ctl_loss: str = "huber",
+    aux_depth_weight: float = 0.0,
+    aux_sem_weight: float = 0.0,
+    road_edge_weight: float = 1.0,
 ) -> dict[str, Any]:
     if torch is None:
         raise ImportError("PyTorch is not installed")
@@ -1248,7 +1285,7 @@ def _scene_loss_body(
         ctl_term = zero.clone()
     # A lane-only run (with or without ctl) must not backprop the other heads.
     # Those zeros are fresh tensors, not a slice of the polyline or the match loss.
-    if wanted - {"ctl"} == frozenset({"lane_gt"}):
+    if wanted - {"ctl", "road_edge"} == frozenset({"lane_gt"}):
         points = zero.detach().clone()
         classes = zero.detach().clone()
         lamps = zero.detach().clone()
@@ -1258,6 +1295,41 @@ def _scene_loss_body(
         total = points + classes + lamps + valid + lane_gt_term
     if "ctl" in wanted:
         total = total + float(ctl_weight) * ctl_term
+    # road_edge: separate from paint; masked smooth-L1; opt-in via heads.
+    road_edge_term = zero.clone()
+    if "road_edge" in wanted and getattr(pred, "road_edge", None) is not None and "road_edge" in target and "road_edge_valid" in target:
+        pred_re = pred.road_edge.to(device=device, dtype=dtype).reshape(-1, pred.road_edge.shape[-1])
+        goal_re = target["road_edge"].to(device=device, dtype=dtype).reshape(-1, pred_re.shape[-1])
+        mask_re = target["road_edge_valid"].to(device=device, dtype=dtype).reshape(-1, pred_re.shape[-1])
+        if bool((mask_re > 0.5).any()):
+            diff = functional.smooth_l1_loss(pred_re, torch.nan_to_num(goal_re, nan=0.0), reduction="none")
+            road_edge_term = (diff * mask_re).sum() / mask_re.sum().clamp(min=1.0)
+        total = total + float(road_edge_weight) * road_edge_term
+    # Dense aux (depth/sem): weight 0 keeps default totals identical.
+    aux_depth_term = zero.clone()
+    aux_sem_term = zero.clone()
+    if float(aux_depth_weight) > 0.0 and getattr(pred, "aux_depth", None) is not None and "aux_depth" in target and "aux_depth_valid" in target:
+        pd = pred.aux_depth.to(device=device, dtype=dtype)
+        gd = target["aux_depth"].to(device=device, dtype=dtype)
+        md = target["aux_depth_valid"].to(device=device, dtype=dtype)
+        if pd.shape != gd.shape:
+            gd = functional.interpolate(gd.reshape(pd.shape[0], 1, gd.shape[-2], gd.shape[-1]), size=pd.shape[-2:], mode="area").reshape_as(pd)
+            md = functional.interpolate(md.reshape(pd.shape[0], 1, md.shape[-2], md.shape[-1]), size=pd.shape[-2:], mode="area").reshape_as(pd)
+        if bool((md > 0.5).any()):
+            aux_depth_term = (functional.smooth_l1_loss(pd, gd, reduction="none") * md).sum() / md.sum().clamp(min=1.0)
+        total = total + float(aux_depth_weight) * aux_depth_term
+    if float(aux_sem_weight) > 0.0 and getattr(pred, "aux_sem_logits", None) is not None and "aux_sem" in target and "aux_sem_valid" in target:
+        logits = pred.aux_sem_logits.to(device=device)
+        goal = target["aux_sem"].to(device=device, dtype=torch.long)
+        mv = target["aux_sem_valid"].to(device=device, dtype=dtype)
+        if logits.shape[-2:] != goal.shape[-2:]:
+            goal = functional.interpolate(goal.reshape(logits.shape[0], 1, goal.shape[-2], goal.shape[-1]).float(), size=logits.shape[-2:], mode="nearest").reshape(logits.shape[0], *logits.shape[-2:]).long()
+            mv = functional.interpolate(mv.reshape(logits.shape[0], 1, mv.shape[-2], mv.shape[-1]), size=logits.shape[-2:], mode="nearest").reshape(logits.shape[0], *logits.shape[-2:])
+        on = mv.reshape(-1) > 0.5
+        if bool(on.any()):
+            ce = functional.cross_entropy(logits.permute(0, 2, 3, 1).reshape(-1, logits.shape[1])[on], goal.reshape(-1)[on], reduction="mean")
+            aux_sem_term = ce
+        total = total + float(aux_sem_weight) * aux_sem_term
     out = {
         "points": points,
         "class": classes,
@@ -1266,6 +1338,9 @@ def _scene_loss_body(
         "lane_gt": lane_gt_term,
         # Always present; 0 unless the ctl head is on. Not in LOSS_TERMS.
         "ctl": ctl_term,
+        "road_edge": road_edge_term,
+        "aux_depth": aux_depth_term,
+        "aux_sem": aux_sem_term,
         "total": total,
         # Unweighted parts of lane_gt, for the val line. Not in LOSS_TERMS.
         "lane_reg": lane_reg,
@@ -1329,6 +1404,9 @@ def scene_loss(
     conf_weight: float = 1.0,
     ctl_weight: float = 1.0,
     ctl_loss: str = "huber",
+    aux_depth_weight: float = 0.0,
+    aux_sem_weight: float = 0.0,
+    road_edge_weight: float = 1.0,
 ) -> dict[str, Any]:
     """Smooth-L1 on points, cross-entropy on class and lamps, match on objects and signs.
 
@@ -1337,9 +1415,20 @@ def scene_loss(
     and the export still carry every head. Wheel and pedals are terms only
     for the opt-in ``ctl`` head: ``total = ... + ctl_weight * ctl``; ``ctl_loss`` is
     ``huber`` (the default) or ``l1`` (steer and throttle only, see ``_ctl_loss``).
+    Opt-in ``road_edge`` is a separate masked regression (not paint). Dense
+    ``aux_depth`` / ``aux_sem`` pull only when their weights are > 0.
     """
     return _scene_loss_body(
-        pred, target, heads, lane_loss=lane_loss, conf_weight=conf_weight, ctl_weight=ctl_weight, ctl_loss=ctl_loss
+        pred,
+        target,
+        heads,
+        lane_loss=lane_loss,
+        conf_weight=conf_weight,
+        ctl_weight=ctl_weight,
+        ctl_loss=ctl_loss,
+        aux_depth_weight=aux_depth_weight,
+        aux_sem_weight=aux_sem_weight,
+        road_edge_weight=road_edge_weight,
     )
 
 
@@ -1368,13 +1457,19 @@ if torch is not None:
             self.conv = nn.Sequential(*layers)
             self.fc = nn.Linear(STEM_CHANNELS[-1] * HORIZ_BINS, SECTOR_FEAT)
 
-        def forward(self, x: Any) -> Any:
+        def features(self, x: Any) -> Any:
+            """Spatial stem map (C x H x W) before the sector token pool."""
+            return self.conv(x)
+
+        def embed(self, feat: Any) -> Any:
             import torch.nn.functional as functional
 
-            feat = self.conv(x)
             horiz = feat.mean(dim=2)
             pooled = functional.adaptive_avg_pool1d(horiz, HORIZ_BINS)
             return self.fc(pooled.flatten(1))
+
+        def forward(self, x: Any) -> Any:
+            return self.embed(self.features(x))
 
     class SceneNet(nn.Module):
         """Strip in, planner tensors out. Hidden size 512. Optional ctl head (offline only)."""
@@ -1386,6 +1481,8 @@ if torch is not None:
             cam_age: bool = False,
             ctl: bool = False,
             cond_dim: int = 0,
+            aux_sensors: bool = False,
+            road_edge: bool = False,
         ) -> None:
             super().__init__()
             from python.data.cam_hold import CAM_AGE_N
@@ -1427,6 +1524,24 @@ if torch is not None:
                 setattr(self, name, nn.Linear(hidden, out))
             if self.ctl:
                 self.ctl_head = nn.Linear(hidden + self.cond_dim, 3 * CTL_K)
+            # Training-only dense aux on the main-sector stem map (not exported).
+            from python.train.sensor_aux import AUX_H, AUX_W, ROAD_EDGE_DIM, SEM_CLASS_MAX
+
+            self.aux_sensors = bool(aux_sensors)
+            self.road_edge = bool(road_edge)
+            self.aux_h = int(AUX_H)
+            self.aux_w = int(AUX_W)
+            self.sem_class_max = int(SEM_CLASS_MAX)
+            if self.aux_sensors:
+                cin = int(STEM_CHANNELS[-1])
+                self.aux_depth_head = nn.Conv2d(cin, 1, kernel_size=1, bias=True)
+                self.aux_sem_head = nn.Conv2d(cin, self.sem_class_max, kernel_size=1, bias=True)
+                arch = getattr(self, "pause_arch", checkpoint_arch(self.cams))
+                self.pause_arch = arch + f":aux={self.aux_h}x{self.aux_w}"
+            if self.road_edge:
+                self.road_edge_head = nn.Linear(hidden, int(ROAD_EDGE_DIM))
+                arch = getattr(self, "pause_arch", checkpoint_arch(self.cams))
+                self.pause_arch = arch + f":road_edge={int(ROAD_EDGE_DIM)}"
 
         def initial_state(self, device: Any = None, dtype: Any = None, batch: int = 1) -> SceneState:
             device = device or torch.device("cpu")
@@ -1465,7 +1580,7 @@ if torch is not None:
         ) -> tuple[ScenePrediction, SceneState]:
             cond = _cond_rows(self, cond, image)
             state = _state_on(state, image)
-            token = self._encode(image)
+            token, main_feat = self._encode(image)
             if self.cam_age:
                 token = torch.cat([token, _ages_column(ages, image)], dim=-1)
             elif ages is not None:
@@ -1487,7 +1602,17 @@ if torch is not None:
             if self.skip is not None:
                 residual = self.skip(residual)
             feat = gru_out[:, 0, :] + residual
-            return _heads_batch(self, feat, cond), SceneState(h=h_new, tokens=new_tokens, mask=new_mask)
+            pred = _heads_batch(self, feat, cond)
+            if bool(getattr(self, "aux_sensors", False)) and main_feat is not None:
+                import torch.nn.functional as functional
+
+                depth = self.aux_depth_head(main_feat)
+                sem = self.aux_sem_head(main_feat)
+                depth = functional.adaptive_avg_pool2d(depth, (self.aux_h, self.aux_w))
+                sem = functional.adaptive_avg_pool2d(sem, (self.aux_h, self.aux_w))
+                pred.aux_depth = depth
+                pred.aux_sem_logits = sem
+            return pred, SceneState(h=h_new, tokens=new_tokens, mask=new_mask)
 
         def _encode(self, image: Any) -> Any:
             """``_token``, under ``torch.utils.checkpoint`` when ``grad_ckpt`` is on and gradients flow.
@@ -1502,20 +1627,31 @@ if torch is not None:
                 return checkpoint(self._token, image, use_reentrant=False)
             return self._token(image)
 
-        def _token(self, image: Any) -> Any:
+        def _token(self, image: Any) -> tuple[Any, Any]:
             parts = []
+            main_feat = None
             for sec in self.sectors:
                 crop = image[:, :, :, sec.x0 : sec.x1]
                 if sec.wide:
                     narrow = 256 if self.scale >= 0.999 else max(1, int(round(256 * self.scale)))
                     crop = _letterbox_wide(crop, self.canvas_h, narrow)
-                parts.append(self.stem(crop))
-            return torch.cat(parts, dim=-1).unsqueeze(1)
+                if bool(getattr(self, "aux_sensors", False)) and str(sec.cam_id) == "main":
+                    feat_map = self.stem.features(crop)
+                    parts.append(self.stem.embed(feat_map))
+                    main_feat = feat_map
+                else:
+                    parts.append(self.stem(crop))
+            return torch.cat(parts, dim=-1).unsqueeze(1), main_feat
 
     def _lane_gt_output(net: SceneNet, feat: Any) -> Any:
         raw = net.lane_gt_head(feat)
         conf = torch.sigmoid(raw[:, -1:])
         return torch.cat([raw[:, :-1], conf], dim=-1)
+
+    def _road_edge_output(net: SceneNet, feat: Any) -> Any:
+        if not bool(getattr(net, "road_edge", False)):
+            return None
+        return net.road_edge_head(feat)
 
     def _cond_rows(net: SceneNet, cond: Any, image: Any) -> Any:
         """``(B, cond_dim)`` on the image's device, or None for a net without cond. Missing cond is an error."""
@@ -1549,6 +1685,7 @@ if torch is not None:
             sign_state=net.sign_state_head(feat).view(width, N_SIGNS, len(LAMP_STATES)),
             sign_valid=torch.sigmoid(net.sign_valid_head(feat)).view(width, N_SIGNS),
             lane_gt=_lane_gt_output(net, feat),
+            road_edge=_road_edge_output(net, feat),
             **_ctl_outputs(net, feat, cond),
         )
 
@@ -1571,6 +1708,10 @@ if torch is not None:
 
     def _prediction_at(pred: ScenePrediction, index: int) -> ScenePrediction:
         extra = {name: getattr(pred, name)[index] for name in CTL_OUTPUT_FIELDS if getattr(pred, name) is not None}
+        for name in ("aux_depth", "aux_sem_logits", "road_edge"):
+            value = getattr(pred, name, None)
+            if value is not None:
+                extra[name] = value[index]
         return ScenePrediction(**{name: getattr(pred, name)[index] for name in OUTPUT_FIELDS}, **extra)
 
     def _letterbox_wide(crop: Any, out_h: int = CANVAS_H, out_w: int = 256) -> Any:

@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 from python.perception.detect import OnnxYoloDetector  # noqa: E402
 
-CAR, PERSON = 2, 0  # COCO ids
+CAR, TRUCK, PERSON = 2, 7, 0  # COCO ids
 
 
 class _Input:
@@ -63,6 +63,9 @@ def main() -> None:
     mixed = _detect([(320, 320, 100, 80, CAR, 0.9), (320, 320, 100, 80, PERSON, 0.8)])
     assert sorted(d.cls for d in mixed) == ["pedestrian", "vehicle"], mixed
     print("different classes on the same box are not suppressed OK")
+    car_truck = _detect([(320, 320, 100, 80, CAR, 0.9), (320, 320, 100, 80, TRUCK, 0.8)])
+    assert len(car_truck) == 2 and [d.cls for d in car_truck] == ["vehicle", "vehicle"], car_truck
+    print("car and truck (both 'vehicle') on the same box: NMS by COCO id keeps 2 OK")
     assert OnnxYoloDetector.__init__.__defaults__[-1] == 0.45
     print("test_yolo_nms: OK")
 

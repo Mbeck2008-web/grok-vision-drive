@@ -7,7 +7,6 @@ Companions are read with stream_raw, on the same tick as main.
 """
 from __future__ import annotations
 
-import os
 import sys
 import types
 from pathlib import Path

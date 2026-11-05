@@ -66,8 +66,8 @@ No pass number is set here. A threshold has to come from a measured run, not fro
 
 A shadow log does not count while these are open:
 
-- #140: the scene runtime's `/255` rule (`max <= 1.5`) differs from the trainer for near-black uint8 strips.
-- The live tone curve is still opt-in (`GVD_LIVE_TONE=1`) rather than gone. With it on, live frames are not the raw frames the scene net trained on.
+- #140 (done, A1, #166 merged): the scene runtime's `/255` rule (`max <= 1.5`) no longer differs from the trainer for near-black uint8 strips.
+- Live tone opt-in (done, A2, #169): the `GVD_LIVE_TONE=1` opt-in is removed, so live frames are always the raw frames the scene net trained on.
 - #150: the detector has no NMS after the 0.35 cutoff on the YOLOv8 ONNX path (overlapping boxes, blink near the threshold).
 - #151: the tracker copies the detection position each tick, so box-height range wobble becomes metres and fake speed.
 

@@ -63,6 +63,51 @@ def _reference_speed_2s() -> float:
     return out[int(2 * HZ)]
 
 
+def _closing_track(speed: float) -> dict:
+    return {"id": 1, "class": "vehicle", "x": 0.0, "y": 20.0, "yaw": 1.5708, "speed_mps": speed,
+            "yaw_rate": 0.0, "hits": 5, "misses": 0, "age": 5, "conf": 0.9}
+
+
+def check_consumers_keep_magnitude() -> None:
+    """Signed speed must not change any consumer: -v behaves exactly like the old +v."""
+    from python.perception.cipv import select_cipv
+    from python.planning.path_predictor import _predict_occupants
+    from python.run_vision import _forecast_agents
+    from python.train.scene_live import live_strip_fields
+    from python.viz.forecast import predict_modes
+    from python.viz.nerd import _lines
+    from python.viz.stage import Cam, _draw_tracks
+
+    neg, pos = _closing_track(-5.0), _closing_track(5.0)
+    fan_neg, fan_pos = _forecast_agents([neg]), _forecast_agents([pos])
+    assert fan_neg, "closing track got no forecast fan (parked-car check read signed speed)"
+    assert fan_neg == fan_pos, (fan_neg, fan_pos)
+    print("run_vision forecast: closing track keeps its fan OK")
+    assert predict_modes(neg) == predict_modes(pos)
+    print("forecast.predict_modes: magnitude OK")
+    a = select_cipv([neg], ego_speed_mps=10.0)
+    b = select_cipv([pos], ego_speed_mps=10.0)
+    assert (a.ttc_lead, a.aeb) == (b.ttc_lead, b.aeb), (a, b)
+    print("cipv: magnitude OK")
+    assert _predict_occupants([dict(neg, unseen_s=1.0)]) == _predict_occupants([dict(pos, unseen_s=1.0)])
+    print("path_predictor occupants: magnitude OK")
+    sn = [line for line in _lines({"tracks": [neg]}) if "miss@" in line]
+    sp = [line for line in _lines({"tracks": [pos]}) if "miss@" in line]
+    assert sn == sp, (sn, sp)
+    print("nerd lead line: magnitude OK")
+    imgs = []
+    for tr in (neg, pos):
+        img = np.zeros((720, 1280, 3), dtype=np.uint8)
+        _draw_tracks(img, [tr], Cam(), path=[], path_width=2.0, state={}, cipv_id=None, show_vel=True)
+        imgs.append(img)
+    assert np.array_equal(imgs[0], imgs[1])
+    print("stage velocity arrow: magnitude OK")
+    fn, fp = live_strip_fields(tracks=[neg]), live_strip_fields(tracks=[pos])
+    assert fn == fp, (fn, fp)
+    assert neg["speed_mps"] == -5.0  # the caller's dict is not changed
+    print("scene_live strip labels: magnitude OK")
+
+
 def main() -> None:
     raw, ys, speeds = _run(_noisy(), IoUTracker())
     skip = int(HZ)  # let the filter settle for 1 s
@@ -82,6 +127,7 @@ def main() -> None:
     print(f"closing: speed at end={speeds[-1]:.4f}")
     assert speeds[-1] < 0.0, speeds[-1]
 
+    check_consumers_keep_magnitude()
     keys = set(tracker.as_dicts()[0])
     assert keys == {"id", "class", "x", "y", "yaw", "speed_mps", "yaw_rate", "hits", "misses", "age", "conf"}, keys
     print("test_track_smoothing: OK")

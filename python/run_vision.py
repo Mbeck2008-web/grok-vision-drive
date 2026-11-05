@@ -209,7 +209,7 @@ def _forecast_agents(tracks: list, max_agents: int = 6, stride: int = 3) -> list
     out: list[dict] = []
     for tr in tracks[:max_agents]:
         try:
-            if float(tr.get("speed_mps", 0.0)) < 0.5:
+            if abs(float(tr.get("speed_mps", 0.0))) < 0.5:
                 continue  # a parked car's fan is just noise on screen
             modes = predict_modes(tr, max_modes=1)
             if not modes:

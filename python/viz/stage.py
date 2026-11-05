@@ -1581,7 +1581,7 @@ def _draw_tracks(
             )
         if show_vel:
             try:
-                spd = float(t.get("speed_mps") or 0.0)
+                spd = abs(float(t.get("speed_mps") or 0.0))
             except (TypeError, ValueError):
                 spd = 0.0
             reach = 0.6 + 0.18 * spd

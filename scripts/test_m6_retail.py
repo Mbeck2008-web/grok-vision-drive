@@ -320,7 +320,9 @@ _MOD_VERSION = re.search(
     r"M\.MOD_VERSION\s*=\s*'([^']+)'",
     (ROOT / "beamng_mod" / "lua" / "ge" / "extensions" / "gvd" / "main.lua").read_text(encoding="utf-8"),
 ).group(1)
-# Test-only knob: a real sleep per _run_supervisor loop pass (plays a slow host).
+# Test-only knob: a real sleep per _run_supervisor loop pass (plays a slow host). It only
+# reaches the real-clock _run_supervisor runs; the FFB chatter run steps on SimClock
+# (_ffb_chatter_keeps_driving), so this knob no longer affects it.
 STEP_SLEEP_S = float(os.environ.get("GVD_TEST_STEP_SLEEP_S") or 0.0)
 # check_ffb_override_live_slow_host: the sleep CI's slow runner amounted to (echo_stale on main).
 SLOW_HOST_SLEEP_S = 0.35
@@ -500,7 +502,6 @@ def _run_supervisor(
     clock: dict | None = None,
     engage_heartbeat: bool = True,
     echo_clock: bool = False,
-    loop_sleep_s: float | None = None,
     report: dict | None = None,
 ) -> dict | None:
     """Run run_vision.py headless for `seconds`; optionally play the mod's ack role meanwhile.
@@ -537,7 +538,7 @@ def _run_supervisor(
     gate reads the fake mod's own clock (`FAKE_ECHO_PERIOD_S` per echo written) instead of
     time.monotonic(), so a slow host that delays the fake mod's echoes is not an echo_stale the
     mod would show. Not with `freeze_echo_after_s` (that run tests the stale timing itself).
-    `loop_sleep_s` (test-only, default GVD_TEST_STEP_SLEEP_S or 0) adds a real sleep per loop
+    GVD_TEST_STEP_SLEEP_S (`STEP_SLEEP_S`, test-only, default 0) adds a real sleep per loop
     pass to play a slow host.
     `report`, when given, gets `hb_age_s` (each loop pass: real wall time minus gvd_cmd.json
     heartbeat_mtime, after the first tick) and `stdout` (the supervisor's stdout text). Timing
@@ -558,7 +559,7 @@ def _run_supervisor(
     supervisor's first tick, then written fresh: Alt+G comes after start.
     """
     assert not (echo_clock and freeze_echo_after_s is not None), "echo_clock would hide the frozen echo"
-    step_sleep = STEP_SLEEP_S if loop_sleep_s is None else float(loop_sleep_s)
+    step_sleep = STEP_SLEEP_S
     launcher = ROOT / "scripts" / "gvd_echo_clock_child.py" if echo_clock else ROOT / "python" / "run_vision.py"
     args = [sys.executable, "-u", str(launcher), "--backend", "stub", "--hz", "20", "--encode", "cpu", *extra]
     env = dict(os.environ, PYTHONPATH=str(ROOT))
@@ -980,19 +981,47 @@ def _engage_live_on_last_tick() -> tuple[bool, dict]:
     }
 
 
-def _ffb_chatter_keeps_driving(loop_sleep_s: float | None = None) -> None:
-    """FFB chatter on the echo (echo gate on the fake mod's clock) must not disengage GVD."""
+FFB_CHATTER_RUN_S = 3.0
+FFB_CHATTER_ENGAGE_S = 0.5  # Alt+G on the SimClock run, once the echo gate has seen the mod (as check_09)
+
+
+def _ffb_chatter_keeps_driving(step_sleep_s: float = 0.0) -> None:
+    """FFB chatter on the echo must not disengage GVD.
+
+    Runs on the SimClock step barrier (test_unknown_ego._session(clock=SimClock()), as
+    check_echo_cmd_blind_not_stale, #155 and #165): one supervisor tick per 50 ms of clock time,
+    the fake mod's 10 Hz echo, its Alt+G heartbeat and the lua_bus handshake on the same clock.
+    On the real clock a loaded runner that descheduled the test process for over
+    LUA_BUS_FRESH_S let the supervisor drop one tick on bus_mismatch (override reset, no
+    disengage_reason written); the next tick re-engaged, and the post-run wait that stops on
+    cmd_applied caught it inside the override warm-up: armed False, ref_seq -1. The wheel model,
+    the run length and the assertions are unchanged.
+    `step_sleep_s` is a real sleep before every supervisor tick (a slow host); it must not
+    change the outcome.
+    """
+    import test_unknown_ego as ue  # noqa: PLC0415 - the SimClock supervisor session and fake mod
+    from gvd_sim_clock import SimClock  # noqa: PLC0415
+
     _touch_lua_bus()
     if ego_path().exists():
         ego_path().unlink()
-
+    write_engage_flag(False)
+    mod = ue._Mod()
+    mod.echoing = True
     # Force-feedback chatter — alternating kicks, the sign flipping on every 10 Hz echo.
-    write_engage_flag(True)
     # Keyed on the echo (one FFB sample each), not on the command seq the echo acks.
-    _run_supervisor(
-        ["--allow-preview-drive"], seconds=3.0, ack=True, wheel_by_echo=lambda k: 0.9 if k % 2 else -0.9,
-        echo_clock=True, loop_sleep_s=loop_sleep_s,
-    )
+    mod.wheel_by_echo = lambda k: 0.9 if k % 2 else -0.9
+    started = {"on": False}
+
+    def step(t: float) -> None:
+        if not started["on"] and t >= FFB_CHATTER_ENGAGE_S:
+            started["on"] = True
+            write_engage_flag(True)
+        if step_sleep_s > 0.0:
+            time.sleep(step_sleep_s)
+
+    seen = ue._session(FFB_CHATTER_RUN_S, mod, step, clock=SimClock())
+    assert ue._engaged_snaps(seen), "never engaged"
     live, why = _engage_live_on_last_tick()
     assert live is True, ("force-feedback chatter disengaged GVD (or the latch was stale on its last tick)", why)
     assert _read_json(engage_path()).get("disengage_reason") == "none"
@@ -1069,13 +1098,21 @@ def check_ffb_override_live() -> None:
 
 
 def check_ffb_override_live_slow_host() -> None:
-    """A slow host (SLOW_HOST_SLEEP_S real sleep per loop pass) must not turn chatter into echo_stale.
+    """A slow host (SLOW_HOST_SLEEP_S real sleep per supervisor tick) must not turn chatter into echo_stale.
 
     On main before the echo clock this disengaged with echo_stale: the fake mod's echoes came
     every ~0.36 s of real time, over ECHO_STALE_MS, although the mod echoes at 10 Hz of its time.
+
+    This now runs on the SimClock step barrier (with the chatter run it shares), so nothing
+    exercises the real-clock _run_supervisor slow-host path any more. The echo-gate regression
+    is still caught: run_vision feeds EchoGate.observe time.monotonic() (real time), and each
+    tick here waits SLOW_HOST_SLEEP_S of real time, so the fake mod's 10 Hz-of-sim-time echoes
+    arrive 0.7 s or more of real time apart, over ECHO_STALE_MS. Only the echo-clock wrap
+    (gvd_clock_child installs gvd_echo_clock_child._observe) keeps that from tripping
+    echo_stale; without the wrap this check fails.
     """
-    _ffb_chatter_keeps_driving(loop_sleep_s=SLOW_HOST_SLEEP_S)
-    print(f"  slow host ({SLOW_HOST_SLEEP_S:.2f} s real sleep per loop pass): FFB chatter still driving, no echo_stale")
+    _ffb_chatter_keeps_driving(step_sleep_s=SLOW_HOST_SLEEP_S)
+    print(f"  slow host ({SLOW_HOST_SLEEP_S:.2f} s real sleep per supervisor tick): FFB chatter still driving, no echo_stale")
 
 
 def check_echo_gate_clock_default() -> None:

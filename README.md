@@ -310,6 +310,17 @@ The settled game view. Soft Esc parked.
 
 ![rear](docs/cams/rear.jpg)
 
+## Training-only depth and semantic ground truth
+
+Optional, off by default. Driving and inference stay vision-only (colour cameras); nothing here feeds the planner or the live net.
+
+- **Opt-in per camera:** add `train_gt: true` to a camera in `config/cameras.yaml` (intended for `main`). Without the key the camera attaches exactly as before.
+- **Outputs** (next to `raw/main/`, one file per tick):
+  - `raw/main_depth/NNNNNN.png`: uint16 depth in **centimetres**, saturating at 65535 (655.35 m).
+  - `raw/main_sem/NNNNNN.png`: uint8 semantic class id (0 = unknown); `sem_classes.json` maps id to the simulator's annotation class name and colour.
+- **Tagging and isolation:** these entries carry `"train_only": true` in `state.jsonl`. Raw-image listings, per-row camera lists and the frame cache's camera list exclude `*_depth` / `*_sem`, so the driving cameras and training strips are unchanged.
+- **Depth scale is an assumption:** distance is taken as raw depth (0..1) x the camera far plane. This is unverified until a short live smoke run spot-checks a known distance; treat depth values as provisional until then.
+
 ## Renderer: Vulkan (`-gfx vk`)
 
 Start BeamNG.tech with Vulkan: `BeamNG.tech.exe -tcom -console -gfx vk`. GVD's BeamNGpy launch path and `play_gvd_tech.bat` use the same flag. **Proven live: recording only** for a 60 s collector smoke on the dev PC on 2026-10-30. Nothing about GVD driving the car is proven by it.

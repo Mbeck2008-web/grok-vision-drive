@@ -722,6 +722,7 @@ def beamng_camera_sensor_kwargs(
     rgb_only: bool,
     update_priority: float = 0.0,
     cid: str | None = None,
+    train_gt: bool = False,
 ) -> dict[str, Any]:
     """Kwargs for beamngpy.sensors.Camera (name, bng, vehicle stay positional).
 
@@ -733,7 +734,8 @@ def beamng_camera_sensor_kwargs(
     # That request renders through the game view and flashes exposure for one
     # frame. The sensor still updates offscreen; GVD only reads it on the hitch.
     rate = sensor_requested_update_s(update_s, cid)
-    return {
+    gt = bool(train_gt)
+    kwargs = {
         "requested_update_time": rate,
         "update_priority": float(min(1.0, max(0.0, update_priority))),
         "pos": pos,
@@ -745,12 +747,28 @@ def beamng_camera_sensor_kwargs(
         "is_using_shared_memory": bool(shmem),
         "is_streaming": True,
         "is_render_colours": True,
-        "is_render_annotations": not bool(rgb_only),
+        "is_render_annotations": gt or not bool(rgb_only),
         "is_render_instance": False,
-        "is_render_depth": not bool(rgb_only),
+        "is_render_depth": gt or not bool(rgb_only),
         "is_snapping_desired": False,
         "is_visualised": False,
     }
+    if gt:
+        # Training-only depth in metres needs the float32 buffer, not 0-255.
+        kwargs["integer_depth"] = False
+    return kwargs
+
+
+def _attach_sem_palette(cam: Any, bng: Any) -> None:
+    """Annotation name -> RGB for training-only semantic ids (train_gt cameras)."""
+    try:
+        cam.gvd_sem_palette = dict(bng.camera.get_annotations())
+    except Exception as e:
+        print(f"[GVD] train_gt annotation palette unavailable ({e}); sem ids stay 0")
+        try:
+            cam.gvd_sem_palette = {}
+        except Exception:
+            pass
 
 
 def _cam_resolution(cam: Any) -> tuple[int, int] | None:
@@ -1599,6 +1617,7 @@ class BeamNGPyBackend:
                         rgb_only=rgb_only,
                         update_priority=want_prio,
                         cid=cid,
+                        train_gt=bool(spec.get("train_gt", False)),
                     )
                     try:
                         cam = Camera(f"gvd_{cid}", bng, vehicle, **kwargs)
@@ -1647,6 +1666,8 @@ class BeamNGPyBackend:
                 self._sensors[cid] = cam
                 if cid != "main":
                     cap_companion_pending(cam)
+                if spec.get("train_gt"):
+                    _attach_sem_palette(cam, bng)
                 self._clip_planes[cid] = (used_near, used_far)
                 self._update_s[cid] = float(used_rate)
                 self._update_priority[cid] = float(used_prio)
@@ -1884,6 +1905,8 @@ class BeamNGPyBackend:
         self._sensors[cid] = fresh
         if cid != "main":
             cap_companion_pending(fresh)
+        if new_kwargs.get("integer_depth") is False:
+            _attach_sem_palette(fresh, self.session.bng)
         self._sensor_kwargs[cid] = new_kwargs
         rate = float(self._update_s.get(cid, FORWARD_UPDATE_S))
         self._clip_planes[cid] = (near, float(far_m))

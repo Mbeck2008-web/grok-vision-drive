@@ -68,6 +68,7 @@ cameras:
     requested_update_time: 0.067
     update_priority: 0.0
     aliases: [cam_main]
+    # train_gt: true  # opt-in, training-only depth (raw/main_depth, uint16 cm PNG) + semantic ids (raw/main_sem); off by default
   - id: wide
     role: urban_intersection
     note: "toy analogue of a wide forward windshield cam"

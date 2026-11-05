@@ -453,6 +453,42 @@ def project_pose_pixel(
     }
 
 
+def pose_pixel_of_ground(
+    pose: CameraPose,
+    x: float,
+    y: float,
+    *,
+    width: int | None = None,
+    height: int | None = None,
+) -> tuple[float, float] | None:
+    """Ego ground point (x right, y forward, z 0) to a pixel on this camera.
+
+    The inverse of :func:`project_pose_pixel`, same basis and fov. A point at
+    or behind the lens plane is omitted; a pixel off the image is returned.
+    """
+    from python.sensors.cameras import yaw_pitch_to_dir_up
+
+    w = float(width or pose.width)
+    h = float(height or pose.height)
+    fov_v = math.radians(float(pose.fov_v_deg))
+    if w < 2.0 or h < 2.0 or fov_v <= 1e-3 or fov_v >= math.pi - 1e-3:
+        return None
+    fov_h = 2.0 * math.atan(math.tan(fov_v * 0.5) * (w / h))
+    forward, up = yaw_pitch_to_dir_up(pose.yaw_deg, pose.pitch_deg)
+    fx, fy, fz = forward
+    ux, uy, uz = up
+    right = (fy * uz - fz * uy, fz * ux - fx * uz, fx * uy - fy * ux)
+    d = (float(x) - pose.x, float(y) - pose.y, -float(pose.z))
+    depth = d[0] * fx + d[1] * fy + d[2] * fz
+    if depth <= 1e-3:
+        return None
+    rx = (d[0] * right[0] + d[1] * right[1] + d[2] * right[2]) / depth
+    ry = -(d[0] * ux + d[1] * uy + d[2] * uz) / depth
+    u = rx / math.tan(fov_h * 0.5) * (w * 0.5) + (w - 1.0) * 0.5
+    v = ry / math.tan(fov_v * 0.5) * (h * 0.5) + (h - 1.0) * 0.5
+    return float(u), float(v)
+
+
 def _full_stitch(bgr: np.ndarray) -> bool:
     from python.perception.stitch360 import GAP_PX, SECTOR_H, SECTOR_W, STITCH_ORDER
 

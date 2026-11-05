@@ -19,7 +19,7 @@ def predict_modes(track: dict[str, Any], max_modes: int = MAX_MODES) -> list[dic
     """
     x = float(track.get("x", 0.0))
     y = float(track.get("y", 0.0))
-    speed = float(track.get("speed_mps", track.get("speed", 0.0)))
+    speed = abs(float(track.get("speed_mps", track.get("speed", 0.0))))
     yaw = float(track.get("yaw", track.get("heading", 0.0)))
     yaw_rate = float(track.get("yaw_rate", 0.0))
     steps = int(HORIZON_S / DT)

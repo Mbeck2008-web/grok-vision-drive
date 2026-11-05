@@ -742,7 +742,7 @@ local function uiTracks(st)
       x = r2(tr.x or 0),
       y = r2(tr.y or 0),
       yaw = r2(tr.yaw or tr.heading or 1.57),
-      v = r2(tr.speed_mps or 0),
+      v = r2(math.abs(tr.speed_mps or 0)),
       lead = (cipv ~= nil and id ~= nil and id == cipv) or false,
     }
   end

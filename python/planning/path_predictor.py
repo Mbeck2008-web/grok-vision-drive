@@ -1113,7 +1113,7 @@ def _predict_occupants(tracks: list) -> list[dict[str, Any]]:
         if kind not in _OCCUPANTS:
             continue
         yaw = _f(raw, "yaw", "heading", default=math.pi / 2.0)
-        speed = max(0.0, _f(raw, "speed_mps", "speed"))
+        speed = abs(_f(raw, "speed_mps", "speed"))
         unseen = _unseen_s(raw)
         x = _f(raw, "x") + math.cos(yaw) * speed * unseen
         y = _f(raw, "y") + math.sin(yaw) * speed * unseen

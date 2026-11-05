@@ -881,7 +881,7 @@ def _lines(s: dict[str, Any]) -> list[str]:
     if lead:
         # miss distance stub at 1/2/3s along ego x=0 corridor
         for t in (1, 2, 3):
-            pred_y = float(lead.get("y", 0)) + float(lead.get("speed_mps", 0)) * t
+            pred_y = float(lead.get("y", 0)) + abs(float(lead.get("speed_mps", 0))) * t
             miss_m = abs(float(lead.get("x", 0)))
             sel.append(f"miss@{t}s={miss_m:.1f}m (lead y~{pred_y:.0f})")
     veh_line = _vehicle_line(s)

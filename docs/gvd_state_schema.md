@@ -48,7 +48,7 @@ Soft Esc reads the same tick from `gvd_state.json` and the `[GVD] seg` line. Pol
 ## M2 fields
 
 | `detector` | string | `empty` / `synthetic` / `yolov8n-onnx` / `yolov8n-ultra` |
-| `tracks[]` | list | id, class, x,y,yaw,speed_mps (weak Δy hint),… ego frame |
+| `tracks[]` | list | id, class, x,y,yaw,speed_mps (filtered Δy velocity, signed: negative = closing; consumers use its magnitude),… ego frame |
 | `planner.cipv_id` | int? | lead track id in path tube |
 | `planner.ttc_lead` | float? | seconds; null if ego_speed unknown |
 | `planner.aeb` | off/warn/brake | state flag only (M2); needs ego_speed > 0 |

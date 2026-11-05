@@ -47,7 +47,7 @@ def live_strip_fields(
     if _has_labels(lanes):
         tech["lanes"] = lanes
     if _has_labels(tracks):
-        tech["tracks"] = tracks
+        tech["tracks"] = [dict(t, speed_mps=abs(float(t["speed_mps"]))) if isinstance(t, dict) and "speed_mps" in t else t for t in tracks]
     if _has_labels(signs):
         tech["signs"] = signs
     if _has_labels(curbs):

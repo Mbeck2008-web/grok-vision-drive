@@ -217,6 +217,9 @@ class _Mod:
         self.blind = False  # commands stop reaching the mod: it keeps the last one, echoes still advance
         self.held: dict | None = None  # the last command the mod received
         self.clock = None  # _session(clock=...) sets its SimClock; None is the real clock
+        # wheel_by_echo(echo_seq): the wheel position this echo reports instead of the commanded
+        # steer (per-sample FFB chatter, as test_m6_retail._run_supervisor). None echoes the command.
+        self.wheel_by_echo: Callable[[int], float] | None = None
 
     def _mono(self) -> float:
         return time.monotonic() if self.clock is None else self.clock.mono()
@@ -237,8 +240,9 @@ class _Mod:
         cmd = self.held
         seq = int(cmd.get("seq", 0) or 0) if float(cmd.get("heartbeat_mtime") or 0.0) >= t_spawn - 0.5 else 0
         self.k += 1
+        steer_in = float(cmd.get("steer", 0.0) or 0.0) if self.wheel_by_echo is None else self.wheel_by_echo(self.k)
         m6._write_ego(
-            seq, applying=bool(seq), speed=self.speed, steer_in=float(cmd.get("steer", 0.0) or 0.0),
+            seq, applying=bool(seq), speed=self.speed, steer_in=steer_in,
             throttle_in=float(cmd.get("throttle", 0.0) or 0.0), brake_in=float(cmd.get("brake", 0.0) or 0.0),
             echo_seq=self.k, mod_version=self.mod_version,
         )

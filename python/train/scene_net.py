@@ -1779,6 +1779,7 @@ def export_scene_onnx(
     cams: tuple[str, ...] | None = None,
     heads: tuple[str, ...] | None = None,
     cam_age: bool = False,
+    gt_frame: Mapping[str, str] | None = None,
 ) -> Path:
     """Write the FP32 graph. Mixed precision does not change this file.
 
@@ -1802,14 +1803,17 @@ def export_scene_onnx(
     if trace is None:
         trace = _trace_scene_onnx
     trace(model, args, str(path))
-    from python.train.cam_strip import metadata_dict, stamp_onnx_metadata
+    from python.train.cam_strip import gt_frame_props, metadata_dict, stamp_onnx_metadata
 
     used = tuple(getattr(net, "cams", ()) or ())
     width = int(getattr(net, "canvas_w", CANVAS_W))
-    if used:
-        stamp_onnx_metadata(
-            str(path),
-            metadata_dict(used, heads, height=CANVAS_H, width=width, cam_age=bool(getattr(net, "cam_age", False)),
-                          cond_dim=int(getattr(net, "cond_dim", 0) or 0)),
-        )
+    props = (
+        metadata_dict(used, heads, height=CANVAS_H, width=width, cam_age=bool(getattr(net, "cam_age", False)),
+                      cond_dim=int(getattr(net, "cond_dim", 0) or 0))
+        if used
+        else {}
+    )
+    # E0: every export records its label frame; no rows given is ``unknown``.
+    props.update(gt_frame if gt_frame is not None else gt_frame_props(()))
+    stamp_onnx_metadata(str(path), props)
     return path

@@ -262,7 +262,11 @@ def export_epoch_onnx(ckpt: Path | str, out: Path | str, *, trace: Any = None) -
     out.parent.mkdir(parents=True, exist_ok=True)
     partial = out.with_name(f"{out.name}.partial-{os.getpid()}.onnx")
     try:
-        export_scene_onnx(partial, net, heads=heads, trace=trace)
+        from python.train.cam_strip import GT_LABELER_META, GT_ORIGIN_META
+
+        # E0: the checkpoint's label frame; a checkpoint written before E0 has none (unknown).
+        gt_frame = {key: str(meta.get(key) or "unknown") for key in (GT_ORIGIN_META, GT_LABELER_META)}
+        export_scene_onnx(partial, net, heads=heads, trace=trace, gt_frame=gt_frame)
         ckpt_sha = sha256_file(ckpt)
         stamp_onnx_metadata(
             str(partial),

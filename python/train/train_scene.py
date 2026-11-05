@@ -1851,7 +1851,7 @@ def train_directory(
     # STRIP_ORDER, as the CLI's parse_cams gives it. The net, its export
     # metadata and the offline eval all use that order; a caller's tuple in
     # another order used to stitch the sectors swapped (r sign flip).
-    from python.train.cam_strip import canonical_cams
+    from python.train.cam_strip import canonical_cams, gt_frame_props
 
     train_cams = canonical_cams(cams) if cams else None
     train_heads = tuple(heads) if heads else None
@@ -1930,6 +1930,8 @@ def train_directory(
     selection_before = rows
     if mask_sources:
         rows = drop_masked(rows, set().union(*(source["ids"] for source in mask_sources)))
+    # E0: the label frame of the rows this run trains on, stamped on every export.
+    gt_frame = gt_frame_props(rows)
     selection_text, _selection_meta = selection_line(state_rows, selection_before, rows, mask_sources)
     print(selection_text, flush=True)
     blank_scan = count_near_black_main(rows, cache, train_cams, input_scale)
@@ -2047,7 +2049,7 @@ def train_directory(
 
     def _empty(precision: str = "fp32") -> dict[str, Any]:
         if export_path is not None:
-            export_scene_onnx(export_path, cams=train_cams, heads=train_heads, cam_age=use_cam_age)
+            export_scene_onnx(export_path, cams=train_cams, heads=train_heads, cam_age=use_cam_age, gt_frame=gt_frame)
         return {
             "strips": len(rows),
             "windows": 0,
@@ -2338,6 +2340,7 @@ def train_directory(
             "arch": getattr(net, "pause_arch", None) or checkpoint_arch(train_cams),
             "eval_chunk": int(eval_chunk),
             "gt_file": os.environ.get("GVD_GT_FILE") or "gt.jsonl",
+            **gt_frame,
             "mask_files": str(mask_files or ""),
             "mask_events": bool(mask_events),
             "holdout_blocks": int(holdout_blocks),
@@ -2973,7 +2976,7 @@ def train_directory(
                     print("[GVD] init ctl_head.bias from the train-split means (atanh steer, logit throttle/brake)", flush=True)
                 _train_passes()
         if not paused_exit and not dry_run and not sanity and export_path is not None:
-            export_scene_onnx(export_path, net, heads=train_heads)
+            export_scene_onnx(export_path, net, heads=train_heads, gt_frame=gt_frame)
         if not paused_exit and not dry_run and not sanity:
             clear_checkpoint(root, pause_dir=pause_dir)
     except Exception:

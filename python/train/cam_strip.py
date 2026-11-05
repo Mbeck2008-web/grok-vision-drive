@@ -8,7 +8,7 @@ is in metres, and a crop does not move those metres by a known amount.
 
 from __future__ import annotations
 
-from typing import Iterable, Mapping
+from typing import Any, Iterable, Mapping
 
 import numpy as np
 
@@ -283,6 +283,29 @@ def metadata_dict(
             props["gvd_ctl_cond_fields"] = COND_FIELDS_TEXT
             props["gvd_ctl_cond_source"] = COND_SOURCE
     return props
+
+
+# E0: the label frame the model was trained in, from the rows' own tech.gt_origin /
+# tech.gt_labeler. Sorted and comma-joined when the rows mix frames; ``unknown`` for a
+# labelled row that does not say, or for an export with no training rows.
+GT_ORIGIN_META = "gvd_gt_origin"
+GT_LABELER_META = "gvd_gt_labeler"
+
+
+def gt_frame_props(rows: Iterable[Mapping[str, Any]] | None) -> dict[str, str]:
+    """``{gvd_gt_origin, gvd_gt_labeler}`` over the labelled rows (rows with ``tech.lane_gt``)."""
+    origins: set[str] = set()
+    labelers: set[str] = set()
+    for row in rows or ():
+        tech = row.get("tech") if isinstance(row, Mapping) else None
+        if not isinstance(tech, Mapping) or tech.get("lane_gt") is None:
+            continue
+        origins.add(str(tech.get("gt_origin") or "unknown"))
+        labelers.add(str(tech.get("gt_labeler") or "unknown"))
+    return {
+        GT_ORIGIN_META: ",".join(sorted(origins)) or "unknown",
+        GT_LABELER_META: ",".join(sorted(labelers)) or "unknown",
+    }
 
 
 class CamAgeFlagError(ValueError):

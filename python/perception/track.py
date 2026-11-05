@@ -20,6 +20,12 @@ class Track:
     misses: int = 0
     age: int = 1
     conf: float = 0.0
+    vx: float = 0.0  # filtered lateral velocity; speed_mps is the along-track one
+
+
+# Alpha-beta gains: position and velocity share of each innovation.
+ALPHA = 0.3
+BETA = 0.05
 
 
 class IoUTracker:
@@ -35,8 +41,9 @@ class IoUTracker:
         self._last_t = now
         # predict
         for tr in self.tracks:
-            tr.x += 0.0  # lateral hold
-            tr.y += tr.speed_mps * dt * 0.15  # weak along-track if speed known
+            # constant-velocity predict (#151)
+            tr.x += tr.vx * dt
+            tr.y += tr.speed_mps * dt
             tr.age += 1
             tr.misses += 1
 
@@ -54,10 +61,14 @@ class IoUTracker:
                 continue
             d = dets[best_i]
             unmatched.discard(best_i)
-            # Weak relative Δy/dt hint only — NOT absolute road speed (CIPV uses ego_speed for closing).
-            vy = (d.y - tr.y) / dt
-            tr.speed_mps = float(max(0.0, min(40.0, 0.8 * tr.speed_mps + 0.2 * abs(vy))))
-            tr.x, tr.y, tr.yaw = d.x, d.y, d.yaw
+            # Alpha-beta filter on (x, y) (#151). speed_mps is the signed filtered
+            # along-track (y) velocity relative to ego, negative when closing; not road speed.
+            rx, ry = d.x - tr.x, d.y - tr.y
+            tr.x += ALPHA * rx
+            tr.y += ALPHA * ry
+            tr.vx = float(max(-40.0, min(40.0, tr.vx + BETA * rx / dt)))
+            tr.speed_mps = float(max(-40.0, min(40.0, tr.speed_mps + BETA * ry / dt)))
+            tr.yaw = d.yaw
             tr.conf = d.conf
             tr.hits += 1
             tr.misses = 0

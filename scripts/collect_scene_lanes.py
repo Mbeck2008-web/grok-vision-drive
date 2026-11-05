@@ -1810,6 +1810,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 spawn_pos = (float(opened.spawn[0]), float(opened.spawn[1]), float(opened.spawn[2]))
             spawn_seq += 1
         writer = RawWriteQueue(RawFrameWriter(out, camera_sidecar(cam_cfg)))
+        sem_classes_written = False
         ticks = TickLog(out / TICKS_FILE, 0.1)
         from python.data.strip_writer import STRIP_ORDER
         from python.debug.remote_status import CollectMeter, status_dir, write_collect_status
@@ -2716,6 +2717,18 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 due[cid] = frames[cid]
                 if cid in stamps:
                     due_stamps[cid] = stamps[cid]
+            train_gt = take_train_gt()
+            for gid, garr in train_gt.items():
+                base = gid.rsplit("_", 1)[0]
+                if base in due:
+                    due[gid] = garr
+                    if base in due_stamps:
+                        due_stamps[gid] = due_stamps[base]
+                    if not sem_classes_written and gid.endswith("_sem"):
+                        from python.data.raw_frames import write_sem_classes
+
+                        write_sem_classes(out, getattr(cams.get(base), "gvd_sem_palette", None))
+                        sem_classes_written = True
             if meter.frames == 0 and due:
                 print(
                     f"collect first tick cams={sorted(due)} bytes={frame_nbytes(due)}",
@@ -3602,11 +3615,25 @@ def _read_camera(cid: str, cam: Any, window: dict[str, Any] | None = None) -> tu
     return image, "", raw
 
 
+_TRAIN_GT: dict[str, Any] = {}
+
+
+def take_train_gt() -> dict[str, Any]:
+    """Training-only depth / semantic arrays from the last ``_poll_cameras``.
+
+    Kept out of ``frames`` so nothing on the driving side ever sees them.
+    """
+    out = dict(_TRAIN_GT)
+    _TRAIN_GT.clear()
+    return out
+
+
 def _poll_cameras(cams: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
     """Pictures as the sensor returned them, plus why each camera was dropped."""
     frames: dict[str, Any] = {}
     stamps: dict[str, Any] = {}
     reasons: dict[str, str] = {}
+    _TRAIN_GT.clear()
     for cid, cam in cams.items():
         window: dict[str, Any] = {}
         image, reason, raw = _read_camera(cid, cam, window)
@@ -3614,6 +3641,10 @@ def _poll_cameras(cams: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any],
             reasons[str(cid)] = reason or "missing"
             continue
         frames[cid] = image
+        if getattr(cam, "is_render_depth", False) is True or getattr(cam, "is_render_annotations", False) is True:
+            from python.data.raw_frames import train_gt_from_raw
+
+            _TRAIN_GT.update(train_gt_from_raw(str(cid), cam, raw))
         sensor_t = None
         if isinstance(raw, dict):
             for key in ("timestamp", "time", "t"):

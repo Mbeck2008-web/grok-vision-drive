@@ -503,7 +503,7 @@ def encode_cameras(
         if not isinstance(image, np.ndarray) or image.size == 0 or image.ndim < 2:
             continue
         arr = np.ascontiguousarray(image)
-        png = _png_bytes(arr)
+        png = _gt_png_bytes(arr) if is_train_only_cam(cam_id) else _png_bytes(arr)
         shape = tuple(int(v) for v in arr.shape)
         if png is not None:
             encoded.append((str(cam_id), png, ".png", shape, str(arr.dtype)))
@@ -533,6 +533,112 @@ def _png_bytes(arr: np.ndarray) -> bytes | None:
     if not ok:
         return None
     return buf.tobytes()
+
+
+# Training-only ground truth (depth / semantic) from a camera with
+# ``train_gt: true`` in cameras.yaml. Folders are ``raw/<cam>_depth`` and
+# ``raw/<cam>_sem``. Driving, inference, and camera listings never read them.
+TRAIN_ONLY_SUFFIXES: tuple[str, ...] = ("_depth", "_sem")
+DEPTH_MM_MAX = 65535
+
+
+def is_train_only_cam(cam_id: Any) -> bool:
+    name = str(cam_id or "")
+    return any(name.endswith(sfx) and name[: -len(sfx)] for sfx in TRAIN_ONLY_SUFFIXES)
+
+
+def _gt_png_bytes(arr: np.ndarray) -> bytes | None:
+    """Lossless PNG for a 2-D uint8 (class id) or uint16 (depth mm) array."""
+    if arr.ndim != 2 or arr.dtype not in (np.uint8, np.uint16):
+        return None
+    import cv2
+
+    ok, buf = cv2.imencode(".png", np.ascontiguousarray(arr), [int(cv2.IMWRITE_PNG_COMPRESSION), 1])
+    return buf.tobytes() if ok else None
+
+
+def _plane(value: Any, dtype: Any, shape: tuple[int, ...]) -> np.ndarray | None:
+    if value is None:
+        return None
+    if isinstance(value, np.ndarray):
+        arr = value
+    else:
+        try:
+            arr = np.asarray(value)
+        except Exception:
+            return None
+        if arr.dtype == object or arr.ndim == 0:
+            try:
+                arr = np.frombuffer(bytes(value), dtype=dtype)
+            except Exception:
+                return None
+    if arr.dtype != np.dtype(dtype) and arr.ndim == 1 and arr.dtype == np.uint8 and dtype != np.uint8:
+        arr = arr.view(dtype)
+    n = int(np.prod(shape))
+    flat = arr.reshape(-1)
+    if flat.size < n:
+        return None
+    return flat[:n].reshape(shape)
+
+
+def sem_class_ids(palette: Mapping[str, Any] | None) -> dict[str, int]:
+    """Class id per annotation name: sorted names from 1, 0 is unknown."""
+    return {name: i + 1 for i, name in enumerate(sorted(str(k) for k in dict(palette or {})))}
+
+
+def train_gt_from_raw(cam_id: str, cam: Any, raw: Any) -> dict[str, np.ndarray]:
+    """``<cam>_depth`` uint16 mm and ``<cam>_sem`` uint8 class id from one reading.
+
+    Depth is BeamNG's float32 buffer in [0, 1], scaled by the camera far
+    plane and clamped at 65535 mm. Annotation RGB is looked up in the
+    palette from ``get_annotations()``; an unknown colour is class 0.
+    """
+    if not isinstance(raw, Mapping):
+        return {}
+    res = getattr(cam, "resolution", None)
+    try:
+        w, h = int(res[0]), int(res[1])
+    except Exception:
+        return {}
+    out: dict[str, np.ndarray] = {}
+    if getattr(cam, "is_render_depth", False):
+        depth = _plane(raw.get("depth"), np.float32, (h, w))
+        if depth is not None:
+            far = float((getattr(cam, "near_far_planes", None) or (0.0, 0.0))[1])
+            mm = np.nan_to_num(depth.astype(np.float64) * far * 1000.0, nan=DEPTH_MM_MAX, posinf=DEPTH_MM_MAX)
+            out[f"{cam_id}_depth"] = np.clip(np.rint(mm), 0, DEPTH_MM_MAX).astype(np.uint16)
+    if getattr(cam, "is_render_annotations", False):
+        ann = raw.get("annotation")
+        arr = None
+        if isinstance(ann, np.ndarray) and ann.ndim == 3:
+            arr = ann
+        elif ann is not None:
+            arr = _plane(ann, np.uint8, (h, w, 4))
+        if arr is not None:
+            rgb = arr[..., :3].astype(np.int32)
+            key = (rgb[..., 0] << 16) | (rgb[..., 1] << 8) | rgb[..., 2]
+            sem = np.zeros(key.shape, dtype=np.uint8)
+            palette = dict(getattr(cam, "gvd_sem_palette", None) or {})
+            for name, cid in sem_class_ids(palette).items():
+                r, g, b = (int(v) for v in list(palette[name])[:3])
+                sem[key == ((r << 16) | (g << 8) | b)] = min(cid, 255)
+            out[f"{cam_id}_sem"] = sem
+    return out
+
+
+def write_sem_classes(root: Path | str, palette: Mapping[str, Any] | None) -> Path:
+    """``sem_classes.json``: id -> annotation name and its colour."""
+    ids = sem_class_ids(palette)
+    pal = dict(palette or {})
+    payload = {
+        "kind": "gvd_sem_classes",
+        "train_only": True,
+        "classes": {"0": "unknown", **{str(i): n for n, i in ids.items()}},
+        "colours": {n: [int(v) for v in list(pal[n])[:3]] for n in ids},
+    }
+    path = Path(root) / "sem_classes.json"
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return path
 
 
 def _stamp_of(raw: Any) -> tuple[float | None, Any]:
@@ -712,6 +818,8 @@ class RawFrameWriter:
                 "far_m": pose.get("far_m"),
                 "resolution": pose.get("resolution"),
             }
+            if is_train_only_cam(cam_id):
+                cams[str(cam_id)]["train_only"] = True
         ego_d = {str(k): _jsonable(v) for k, v in dict(ego or {}).items()}
         wheel_d = {str(k): _jsonable(v) for k, v in dict(wheel or {}).items()}
         pedals_d = {str(k): _jsonable(v) for k, v in dict(pedals or {}).items()}
@@ -1193,7 +1301,8 @@ def list_raw_images(root: Path | str) -> list[Path]:
     found = []
     for path in raw.rglob("*"):
         if path.is_file() and path.suffix in {".png", ".npy"} and path.stem.isdigit():
-            if raw_camera_of(path) is not None:
+            cam = raw_camera_of(path)
+            if cam is not None and not is_train_only_cam(cam):
                 found.append(path)
     return sorted(found, key=lambda path: (raw_camera_of(path), int(path.stem), str(path)))
 

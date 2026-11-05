@@ -17,6 +17,9 @@ import numpy as np
 
 DEFAULT_N = 16
 MAX_N = 256  # keeps one epoch's JSON in the tens of KB
+# Lane colours (BGR) for every GT-vs-prediction picture: the thumbnails here and the contact sheet.
+GT_BGR = (80, 220, 80)
+PRED_BGR = (60, 60, 240)
 
 
 def _num(value: Any) -> float | None:
@@ -139,6 +142,6 @@ def write_thumbnail(path: Path, pred: Any, gt: Any, gt_valid: Any, size: tuple[i
             for a, b in zip(pts, pts[1:]):
                 cv2.line(img, a, b, color, 1, cv2.LINE_AA)
 
-    draw(gt, (80, 220, 80), gt_valid)
-    draw(pred, (60, 60, 240))
+    draw(gt, GT_BGR, gt_valid)
+    draw(pred, PRED_BGR)
     return bool(cv2.imwrite(str(path), img))

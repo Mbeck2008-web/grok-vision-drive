@@ -66,6 +66,66 @@ def _meta(session: Any) -> dict[str, str]:
         return {}
 
 
+class OnnxRows:
+    """One exported scene ONNX, fed row by row the way the trainer's val stream is."""
+
+    def __init__(self, onnx_path: Path | str) -> None:
+        import onnxruntime as ort  # type: ignore
+
+        from python.train.cam_strip import cam_age_flag
+        from python.train.scene_lane_runtime import _base_name
+
+        self.session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+        self.meta = _meta(self.session)
+        self.scale = float(self.meta.get("gvd_scale") or 1.0)
+        # The tracer may rename pass-through state inputs (``h.1``); match on the base name.
+        self.inputs = {_base_name(item.name): item for item in self.session.get_inputs()}
+        self.outputs = [_base_name(item.name) for item in self.session.get_outputs()]
+        self.state_keys = [key for key in ("h", "tokens", "mask") if key in self.inputs]
+        # gvd_cam_age=1: the graph takes ``ages``; an older export has neither.
+        self.cam_age = cam_age_flag(self.meta)
+        if self.cam_age != ("ages" in self.inputs):
+            raise ValueError(f"{onnx_path}: gvd_cam_age={int(self.cam_age)} disagrees with the graph inputs {sorted(self.inputs)}")
+        # gvd_ctl_cond=N (B'1, --ctl-cond): the graph takes ``cond`` (1 x N), the t-dt row's controls.
+        self.cond_dim = int(self.meta.get("gvd_ctl_cond") or 0)
+        has_cond = "cond" in self.inputs
+        if has_cond != bool(self.cond_dim) or (has_cond and [int(d) for d in self.inputs["cond"].shape] != [1, self.cond_dim]):
+            raise ValueError(f"{onnx_path}: gvd_ctl_cond={self.cond_dim} disagrees with the graph inputs {sorted(self.inputs)}")
+
+    def fresh(self) -> dict[str, np.ndarray]:
+        from python.train.scene_net import RESIDUAL_S
+
+        # SceneNet.initial_state: zero h and tokens, every residual slot older than RESIDUAL_S.
+        state = {}
+        for key in self.state_keys:
+            shape = [int(d) for d in self.inputs[key].shape]
+            value = float(RESIDUAL_S) + 1.0 if key == "mask" else 0.0
+            state[key] = np.full(shape, value, dtype=np.float32)
+        return state
+
+    def step(self, frame: Any, row: dict, state: dict[str, np.ndarray]) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
+        """One row through the graph: the outputs by base name and the next state."""
+        from python.train.scene_net import step_dt
+        from python.train.train_scene import row_ages
+
+        arr = np.ascontiguousarray(frame)
+        # Same conversion as SceneNet._strip_nchw: uint8 / 255, else /255 only above 1.5.
+        image = arr.astype(np.float32)
+        if arr.dtype == np.uint8 or float(image.max()) > 1.5:
+            image = image / 255.0
+        image = np.ascontiguousarray(np.transpose(image, (2, 0, 1))[None, ...])
+        dt = np.asarray([step_dt(row.get("dt_s"))], dtype=np.float32)
+        feeds = {"strip": image, "dt": dt, **state}
+        if self.cam_age:
+            feeds["ages"] = row_ages(row).reshape(1, -1)
+        if self.cond_dim:
+            # Zeros (and no ctl score: ctl_valid is all zero) when the row has no t-dt row.
+            feeds["cond"] = np.asarray(row.get("ctl_cond", np.zeros(self.cond_dim)), dtype=np.float32).reshape(1, self.cond_dim)
+        out = self.session.run(None, {self.inputs[key].name: value for key, value in feeds.items() if key in self.inputs})
+        by_name = dict(zip(self.outputs, out))
+        return by_name, {key: np.asarray(by_name[key], dtype=np.float32) for key in self.state_keys}
+
+
 def holdout_rows(
     root: Path,
     *,
@@ -148,31 +208,18 @@ def evaluate(
     ``epoch_ok`` is whether the ONNX ``gvd_ckpt_epoch`` equals it (a missing
     tag is not ok); not ok makes the ctl run and the lane bar UNPROVEN.
     """
-    import onnxruntime as ort  # type: ignore
-
     from python.debug.lane_targets import lane_center_is_valid, lane_gt_from_record, lane_x_from_vector
-    from python.train.cam_strip import cam_age_flag, cams_from_metadata
-    from python.train.scene_net import step_dt
-    from python.train.train_scene import _frame_row, row_ages, val_summary
+    from python.train.cam_strip import cams_from_metadata
+    from python.train.train_scene import _frame_row, val_summary
 
     if int(eval_chunk) <= 0:
         raise ValueError("--eval-chunk must be > 0 (the single-sequence score is not reproduced here)")
     root = Path(root)
-    session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
-    meta = _meta(session)
+    runner = OnnxRows(onnx_path)
+    meta, inputs, outputs = runner.meta, runner.inputs, runner.outputs
     used = tuple(cams) if cams else (cams_from_metadata(meta) or None)
-    scale = float(meta.get("gvd_scale") or 1.0)
-    from python.train.scene_lane_runtime import _base_name
-    from python.train.scene_net import RESIDUAL_S
-
-    # The tracer may rename pass-through state inputs (``h.1``); match on the base name.
-    inputs = {_base_name(item.name): item for item in session.get_inputs()}
-    outputs = [_base_name(item.name) for item in session.get_outputs()]
-    state_keys = [key for key in ("h", "tokens", "mask") if key in inputs]
-    # gvd_cam_age=1: the graph takes ``ages``; an older export has neither.
-    cam_age = cam_age_flag(meta)
-    if cam_age != ("ages" in inputs):
-        raise ValueError(f"{onnx_path}: gvd_cam_age={int(cam_age)} disagrees with the graph inputs {sorted(inputs)}")
+    scale = runner.scale
+    cam_age = runner.cam_age
     # gvd_ctl=1: the graph has the three (1, K) control outputs.
     from python.train.ctl_targets import CTL_OUTPUT_FIELDS
 
@@ -181,25 +228,13 @@ def evaluate(
         raise ValueError(f"{onnx_path}: gvd_ctl={meta.get('gvd_ctl', '0')} disagrees with the graph outputs {sorted(outputs)}")
     from python.train.ctl_targets import ctl_scored
 
-    # gvd_ctl_cond=N (B'1, --ctl-cond): the graph takes ``cond`` (1 x N), the t-dt row's controls.
-    cond_dim = int(meta.get("gvd_ctl_cond") or 0)
-    has_cond = "cond" in inputs
-    if has_cond != bool(cond_dim) or (has_cond and [int(d) for d in inputs["cond"].shape] != [1, cond_dim]):
-        raise ValueError(f"{onnx_path}: gvd_ctl_cond={cond_dim} disagrees with the graph inputs {sorted(inputs)}")
+    has_cond = runner.cond_dim > 0
     if has_cond and not has_ctl:
         raise ValueError(f"{onnx_path}: a cond input needs the ctl outputs (gvd_ctl=1)")
     ctl_info: dict | None = {"cond": has_cond} if has_ctl else None
     ctl_records: list = []
 
-    def fresh() -> dict[str, np.ndarray]:
-        # SceneNet.initial_state: zero h and tokens, every residual slot older than RESIDUAL_S.
-        state = {}
-        for key in state_keys:
-            shape = [int(d) for d in inputs[key].shape]
-            value = float(RESIDUAL_S) + 1.0 if key == "mask" else 0.0
-            state[key] = np.full(shape, value, dtype=np.float32)
-        return state
-
+    fresh = runner.fresh
     slices, selection = holdout_rows(
         root,
         cams=used,
@@ -222,22 +257,7 @@ def evaluate(
             if loaded is None:
                 continue
             frame, row = loaded
-            arr = np.ascontiguousarray(frame)
-            # Same conversion as SceneNet._strip_nchw: uint8 / 255, else /255 only above 1.5.
-            image = arr.astype(np.float32)
-            if arr.dtype == np.uint8 or float(image.max()) > 1.5:
-                image = image / 255.0
-            image = np.ascontiguousarray(np.transpose(image, (2, 0, 1))[None, ...])
-            dt = np.asarray([step_dt(row.get("dt_s"))], dtype=np.float32)
-            feeds = {"strip": image, "dt": dt, **state}
-            if cam_age:
-                feeds["ages"] = row_ages(row).reshape(1, -1)
-            if has_cond:
-                # Zeros (and no ctl score: ctl_valid is all zero) when the row has no t-dt row.
-                feeds["cond"] = np.asarray(row.get("ctl_cond", np.zeros(cond_dim)), dtype=np.float32).reshape(1, cond_dim)
-            out = session.run(None, {inputs[key].name: value for key, value in feeds.items() if key in inputs})
-            by_name = dict(zip(outputs, out))
-            state = {key: np.asarray(by_name[key], dtype=np.float32) for key in state_keys}
+            by_name, state = runner.step(frame, row, state)
             if has_ctl and ctl_scored(row):
                 ctl_records.append(
                     (row, np.stack([np.asarray(by_name[name], dtype=np.float32).reshape(-1) for name in CTL_OUTPUT_FIELDS]))

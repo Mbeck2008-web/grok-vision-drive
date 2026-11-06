@@ -222,6 +222,131 @@ def check_single_root_session_untouched() -> None:
     print("single_root_session_untouched")
 
 
+
+def check_refuse_format2_on_multi_root() -> None:
+    """MAJOR D.4: multi-root must refuse format-2 cache (silent source= ignore)."""
+    import numpy as np
+    from python.train.frame_cache import CACHE_FORMAT, FrameCache, build_frame_cache
+    from python.train.strip_sources import source_key_for
+    from python.train.train_scene import require_cache_matches_strips
+
+    with tempfile.TemporaryDirectory() as tmp:
+        prior = Path(tmp) / "p" / "ctl_20261105_p01"
+        new = Path(tmp) / "n" / "ctl_20261105_p01"
+        _write_recording(prior, n=3, session="s", colour=(20, 0, 0))
+        _write_recording(new, n=3, session="s", colour=(0, 20, 0))
+        dest = Path(tmp) / "fmt2"
+        build_frame_cache(prior, dest, ("main",))
+        pk, nk = source_key_for(prior), source_key_for(new)
+        with FrameCache(dest) as cache:
+            assert cache.format == CACHE_FORMAT
+            # format-2 must not silently accept source= as decoration
+            try:
+                cache.canvas(0, source=nk)
+            except ValueError as exc:
+                assert "format-2" in str(exc).lower() or "source" in str(exc).lower()
+            else:
+                # If canvas does not raise, has+pixels must not claim a new-source hit
+                assert cache.has(0, source=nk) is False
+            try:
+                require_cache_matches_strips(cache, strip_count=2)
+            except SystemExit as exc:
+                msg = str(exc)
+                assert "format" in msg.lower() or "multi" in msg.lower()
+            else:
+                raise AssertionError("multi-root must refuse format-2 cache")
+    print("refuse_format2_on_multi_root")
+
+
+def check_mask_files_scoped_per_source() -> None:
+    """MINOR C.5: mask ids apply only within the source_root that holds the file."""
+    from python.train.event_mask import drop_masked, mask_file_sources
+    from python.train.strip_sources import apply_mask_files_multi, load_multi_source_rows, source_key_for
+
+    with tempfile.TemporaryDirectory() as tmp:
+        prior = Path(tmp) / "p" / "ctl_20261105_p01"
+        new = Path(tmp) / "n" / "ctl_20261105_p01"
+        _write_recording(prior, n=4, session="s")
+        _write_recording(new, n=4, session="s")
+        (prior / "drop.jsonl").write_text(json.dumps({"i": 0}) + "\n", encoding="utf-8")
+        rows, meta = load_multi_source_rows((prior, new), holdout_source=prior)
+        pk, nk = meta["holdout_key"], meta["train_only_keys"][0]
+        kept, _sources = apply_mask_files_multi((prior, new), rows, "drop.jsonl")
+        assert not any(r["source"] == pk and int(r["i"]) == 0 for r in kept)
+        assert any(r["source"] == nk and int(r["i"]) == 0 for r in kept), "new i=0 must survive prior-only mask"
+    print("mask_files_scoped_per_source")
+
+
+def check_held_canvas_passes_source() -> None:
+    """MINOR: --cam-age held_canvas must pass source= on format-3."""
+    from python.data.cam_hold import ROW_HOLD_KEY
+    from python.train.frame_cache import FrameCache, build_multi_frame_cache
+    from python.train.strip_sources import load_multi_source_rows
+    from python.train.train_scene import held_canvas
+
+    with tempfile.TemporaryDirectory() as tmp:
+        prior = Path(tmp) / "p" / "ctl_20261105_p01"
+        new = Path(tmp) / "n" / "ctl_20261105_p01"
+        _write_recording(prior, n=2, session="s", colour=(30, 0, 0))
+        _write_recording(new, n=2, session="s", colour=(0, 30, 0))
+        dest = Path(tmp) / "c3"
+        build_multi_frame_cache((prior, new), dest, ("main",))
+        rows, _meta = load_multi_source_rows((prior, new), holdout_source=prior)
+        row = dict(next(r for r in rows if Path(r["source_root"]).resolve() == prior.resolve()))
+        # cam -> [source_index, age]
+        row[ROW_HOLD_KEY] = {"main": [int(row["i"]), 0.0]}
+        with FrameCache(dest) as cache:
+            calls: list = []
+            real = cache.sector
+
+            def wrap(cam, index, source=None):
+                calls.append(source)
+                return real(cam, index, source=source)
+
+            cache.sector = wrap  # type: ignore[method-assign]
+            held_canvas(Path(row["source_root"]), row, cache)
+            assert row["source"] in calls, calls
+    print("held_canvas_passes_source")
+
+
+
+def check_count_near_black_main_source() -> None:
+    """NIT: count_near_black_main must pass source= on format-3 (not 0 of 0)."""
+    from python.train.frame_cache import FrameCache, build_multi_frame_cache
+    from python.train.strip_sources import load_multi_source_rows
+    from python.train.train_scene import count_near_black_main
+
+    with tempfile.TemporaryDirectory() as tmp:
+        prior = Path(tmp) / "p" / "ctl_20261105_p01"
+        new = Path(tmp) / "n" / "ctl_20261105_p01"
+        _write_recording(prior, n=3, session="s", colour=(40, 40, 40))
+        _write_recording(new, n=3, session="s", colour=(50, 50, 50))
+        dest = Path(tmp) / "c3"
+        build_multi_frame_cache((prior, new), dest, ("main",))
+        rows, _meta = load_multi_source_rows((prior, new), holdout_source=prior)
+        with FrameCache(dest) as cache:
+            scanned = count_near_black_main(rows, cache, ("main",))
+            assert scanned is not None
+            black, checked = scanned
+            assert checked == len(rows), (black, checked, len(rows))
+    print("count_near_black_main_source")
+
+
+def check_reject_holdout_cells_multi() -> None:
+    """Combined --holdout-cells would bypass train-only; refuse explicitly."""
+    from python.train.train_scene import refuse_holdout_cells_multi
+
+    try:
+        refuse_holdout_cells_multi(multi=True, holdout_cells=True)
+    except SystemExit as exc:
+        assert "holdout-cells" in str(exc).lower()
+    else:
+        raise AssertionError("expected SystemExit")
+    refuse_holdout_cells_multi(multi=False, holdout_cells=True)  # no-op
+    refuse_holdout_cells_multi(multi=True, holdout_cells=False)
+    print("reject_holdout_cells_multi")
+
+
 def main() -> None:
     check_parse_strips_arg()
     check_argparse_two_strips_tokens()
@@ -230,6 +355,11 @@ def main() -> None:
     check_holdout_baseline_identical()
     check_no_leakage_new_train_only()
     check_cache_multi_source_and_size_guard()
+    check_refuse_format2_on_multi_root()
+    check_mask_files_scoped_per_source()
+    check_held_canvas_passes_source()
+    check_count_near_black_main_source()
+    check_reject_holdout_cells_multi()
     print("test_combined_recording_training: OK")
 
 

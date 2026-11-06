@@ -147,3 +147,11 @@ def combined_pass_plan(
         )
     plan.extend(prior_hold)
     return plan
+
+
+
+def apply_mask_files_multi(roots, rows, files):
+    """Re-export: mask files scoped per source_root (spec C.5)."""
+    from python.train.event_mask import apply_mask_files_multi as _apply
+
+    return _apply(roots, rows, files)

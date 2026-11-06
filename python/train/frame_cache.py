@@ -177,6 +177,13 @@ class FrameCache:
             if not key:
                 raise ValueError("multi-source cache requires source=")
             return (str(key), int(index))
+        # Format-2 is single-root only. Passing source= is how multi-root trains
+        # address a frame; ignoring it would silently serve the wrong RGB (spec D.4).
+        if source is not None:
+            raise ValueError(
+                f"format-2 cache refuses source= (got {source!r}); "
+                "rebuild with build_multi_frame_cache into a format-3 folder for multi-root training"
+            )
         return int(index)
 
     def has(self, index: int, source: str | None = None) -> bool:

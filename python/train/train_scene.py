@@ -719,6 +719,34 @@ def main_area_blank(frame: Any, cams: tuple[str, ...] | None, scale: float = 1.0
     return False
 
 
+
+def require_cache_matches_strips(cache: Any, *, strip_count: int) -> None:
+    """Refuse a format-2 cache when training multiple strip roots (spec D.4).
+
+    Format-2 indexes by bare ``i`` and would silently serve the first recording's
+    RGB for a colliding new-source frame id.
+    """
+    if cache is None or int(strip_count) <= 1:
+        return
+    from python.train.frame_cache import CACHE_FORMAT_MULTI
+
+    fmt = getattr(cache, "format", None)
+    if fmt != CACHE_FORMAT_MULTI:
+        raise SystemExit(
+            f"[GVD] multi-root --strips requires a format-3 cache (got {fmt or 'missing/unversioned'}); "
+            "rebuild with --build-cache on the combined --strips list into a NEW folder "
+            "(do not reuse a prior-only format-2 cache)"
+        )
+
+
+def refuse_holdout_cells_multi(*, multi: bool, holdout_cells: bool) -> None:
+    """``--holdout-cells`` bypasses combined_pass_plan and can put new-source rows in holdout."""
+    if multi and holdout_cells:
+        raise SystemExit(
+            "[GVD] --holdout-cells is not supported with multiple --strips "
+            "(it bypasses prior-only holdout). Use --holdout-blocks instead."
+        )
+
 def count_near_black_main(
     rows: list[Mapping[str, Any]], cache: Any, cams: tuple[str, ...] | None, scale: float = 1.0
 ) -> tuple[int, int] | None:
@@ -731,9 +759,11 @@ def count_near_black_main(
     black = checked = 0
     for row in rows:
         index = int(row["i"])
-        if not cache.has(index):
+        source = row.get("source")
+        cache_kw = {"source": source} if source is not None else {}
+        if not cache.has(index, **cache_kw):
             continue
-        frame = cache.canvas(index)
+        frame = cache.canvas(index, **cache_kw)
         if frame is None:
             continue
         if cams and tuple(cams) != tuple(STRIP_ORDER) and int(frame.shape[1]) == CANVAS_W:
@@ -999,8 +1029,11 @@ def held_canvas(root: Path, row: Mapping[str, Any], cache: Any = None) -> tuple[
     if float(getattr(cache, "scale", 1.0)) < 0.999:
         raise ValueError("--cam-age reads a cache at scale 1 only")
 
+    source_key = row.get("source")
+    sector_kw = {"source": source_key} if source_key is not None else {}
+
     def _read(cam: str, index: int) -> Any:
-        got = cache.sector(cam, index)
+        got = cache.sector(cam, index, **sector_kw)
         return got if got is not None else load_raw_camera(root, cam, index)
 
     frames, ages = held_frames(root, sources, reader=_read)
@@ -2015,12 +2048,17 @@ def train_directory(
     for one in strip_roots:
         refuse_lossy(one)
     state_rows, source_meta = load_multi_source_rows(strip_roots, holdout_source=holdout_source or strip_roots[0])
+    require_cache_matches_strips(cache, strip_count=len(strip_roots))
+    refuse_holdout_cells_multi(multi=bool(source_meta.get("multi")), holdout_cells=bool(holdout_cells))
     print(f"[GVD] scene index: {len(state_rows)} state rows roots={len(strip_roots)}", flush=True)
     from python.train.event_mask import drop_masked, mask_file_sources, selection_line
 
     # Mask files are read on the full recording rows, before any frame is
     # measured, so a bad file, an unknown id or a sha256 mismatch stops early.
-    mask_sources = mask_file_sources(root, state_rows, mask_files)
+    if not source_meta.get("multi"):
+        mask_sources = mask_file_sources(root, state_rows, mask_files)
+    else:
+        mask_sources = []  # applied after select_training_rows (per source_root)
     print("[GVD] scene index: measuring frames", flush=True)
 
     def _index_progress(n_frames: int, n_bytes: int) -> None:
@@ -2060,7 +2098,11 @@ def train_directory(
     # Dropped before the holdout split, so a masked row is in neither the train
     # chunks nor the holdout. A masked run is one gap; past MEMORY_S it resets the GRU.
     selection_before = rows
-    if mask_sources:
+    if source_meta.get("multi"):
+        from python.train.event_mask import apply_mask_files_multi
+
+        rows, mask_sources = apply_mask_files_multi(strip_roots, rows, mask_files)
+    elif mask_sources:
         rows = drop_masked(rows, set().union(*(source["ids"] for source in mask_sources)))
     # E0: the label frame of the rows this run trains on, stamped on every export.
     gt_frame = gt_frame_props(rows)
@@ -3271,6 +3313,12 @@ def main(argv: list[str] | None = None) -> None:
         if frame_cache is not None and frame_cache.stale:
             print(f"[GVD] scene train: cache refused: {frame_cache.reason}", flush=True)
             sys.exit(2)
+        try:
+            require_cache_matches_strips(frame_cache, strip_count=len(strip_roots))
+            refuse_holdout_cells_multi(multi=len(strip_roots) > 1, holdout_cells=bool(args.holdout_cells))
+        except SystemExit as exc:
+            print(str(exc), flush=True)
+            raise
         export_path = None if args.export is None else Path(args.export)
         if export_path is not None and args.strips is None:
             try:

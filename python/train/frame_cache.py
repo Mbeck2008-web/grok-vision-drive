@@ -19,7 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -31,6 +31,8 @@ CHUNK_BYTES = 3_500_000_000
 MANIFEST = "manifest.json"
 MANIFEST_SHA = "manifest.sha256"
 CACHE_FORMAT = "gvd-frame-cache-2"
+CACHE_FORMAT_MULTI = "gvd-frame-cache-3"
+FAT32_MAX_BYTES = 4 * 1024 ** 3
 
 
 class StaleCacheError(RuntimeError):
@@ -73,7 +75,9 @@ class FrameCache:
         self.manifest_sha256: str | None = None
         self._open: dict[str, np.ndarray] = {}
         self._closed = False
-        self._by_index: dict[int, list[tuple[str, str, int]]] = {}
+        self.sources: list[Any] = []
+        self._default_source: str | None = None
+        self._by_index: dict[Any, list[tuple[str, str, int]]] = {}
         manifest = self.root / MANIFEST
         if not manifest.is_file():
             return
@@ -81,10 +85,10 @@ class FrameCache:
         self.manifest_sha256 = _sha256(data)
         payload = json.loads(data.decode("utf-8"))
         self.format = payload.get("format")
-        if self.format != CACHE_FORMAT:
+        if self.format not in (CACHE_FORMAT, CACHE_FORMAT_MULTI):
             self.stale = True
             self.reason = (
-                f"{self.root} is cache format {self.format or '1 (unversioned)'}, not {CACHE_FORMAT}: "
+                f"{self.root} is cache format {self.format or '1 (unversioned)'}, not {CACHE_FORMAT}/{CACHE_FORMAT_MULTI}: "
                 "its repeater sectors keep the ego band live paints black. Rebuild it with "
                 "--build-cache into a NEW folder (an old cache is never rewritten in place)."
             )
@@ -98,15 +102,43 @@ class FrameCache:
         self.cams = parse_cams(",".join(payload.get("cams") or []))
         self.scale = float(payload.get("scale") or 1.0)
         self.sectors, _height, self.canvas_w = scaled_layout(self.cams, self.scale)
+        self.sources = list(payload.get("sources") or [])
+        self._default_source = None
+        if self.format == CACHE_FORMAT_MULTI:
+            # Refuse when a recorded source root no longer resolves to the same path.
+            for src in self.sources:
+                root_s = str(src.get("root") or "")
+                key = str(src.get("key") or "")
+                if not root_s or not key:
+                    self.stale = True
+                    self.reason = f"{self.root}: multi-source cache missing source key/root"
+                    return
+                if not Path(root_s).exists():
+                    self.stale = True
+                    self.reason = f"{self.root}: source root missing for key {key}: {root_s}"
+                    return
+                from python.train.strip_sources import source_key_for
+
+                if source_key_for(root_s) != key:
+                    self.stale = True
+                    self.reason = f"{self.root}: source key mismatch for {root_s}"
+                    return
+            if len(self.sources) == 1:
+                self._default_source = str(self.sources[0].get("key") or "") or None
         for chunk in payload.get("chunks") or []:
             name = str(chunk.get("file") or "")
             cam = str(chunk.get("cam") or "")
+            source = chunk.get("source")
             for slot, raw in enumerate(chunk.get("ids") or []):
                 try:
                     index = int(raw)
                 except (TypeError, ValueError):
                     continue
-                self._by_index.setdefault(index, []).append((name, cam, slot))
+                if self.format == CACHE_FORMAT_MULTI:
+                    key = str(source or "")
+                    self._by_index.setdefault((key, index), []).append((name, cam, slot))
+                else:
+                    self._by_index.setdefault(index, []).append((name, cam, slot))
 
     def require_fresh(self) -> None:
         """Raise ``StaleCacheError`` for a stale cache."""
@@ -139,13 +171,31 @@ class FrameCache:
         if self._closed:
             raise ValueError("FrameCache is closed")
 
-    def has(self, index: int) -> bool:
-        return int(index) in self._by_index
+    def _index_key(self, index: int, source: str | None = None) -> Any:
+        if self.format == CACHE_FORMAT_MULTI:
+            key = source if source is not None else self._default_source
+            if not key:
+                raise ValueError("multi-source cache requires source=")
+            return (str(key), int(index))
+        # Format-2 is single-root only. Passing source= is how multi-root trains
+        # address a frame; ignoring it would silently serve the wrong RGB (spec D.4).
+        if source is not None:
+            raise ValueError(
+                f"format-2 cache refuses source= (got {source!r}); "
+                "rebuild with build_multi_frame_cache into a format-3 folder for multi-root training"
+            )
+        return int(index)
 
-    def sector(self, cam: str, index: int) -> np.ndarray | None:
+    def has(self, index: int, source: str | None = None) -> bool:
+        try:
+            return self._index_key(index, source) in self._by_index
+        except ValueError:
+            return False
+
+    def sector(self, cam: str, index: int, source: str | None = None) -> np.ndarray | None:
         """One camera's cached sector for tick ``index`` (a copy), or None."""
         self._check_open()
-        for name, part_cam, slot in self._by_index.get(int(index)) or ():
+        for name, part_cam, slot in self._by_index.get(self._index_key(index, source)) or ():
             if part_cam != cam:
                 continue
             pixels = self._pixels(name)
@@ -154,10 +204,10 @@ class FrameCache:
             return np.array(pixels[slot], copy=True)
         return None
 
-    def canvas(self, index: int) -> np.ndarray | None:
+    def canvas(self, index: int, source: str | None = None) -> np.ndarray | None:
         """The packed canvas for tick ``index`` (a new array), or None."""
         self._check_open()
-        parts = self._by_index.get(int(index))
+        parts = self._by_index.get(self._index_key(index, source))
         if not parts:
             return None
         by_cam = {cam: (name, slot) for name, cam, slot in parts}
@@ -200,6 +250,8 @@ def _read_cam(root: Path, cam: str, index: int) -> np.ndarray | None:
 
 
 def _create(path: Path, data: bytes) -> None:
+    if len(data) >= FAT32_MAX_BYTES:
+        raise OSError(f"{path.name} would be {len(data)} bytes (>= 4 GiB FAT32 limit); refuse")
     with open(path, "xb") as handle:
         handle.write(data)
 
@@ -291,5 +343,109 @@ def build_frame_cache(
     _create(out / MANIFEST, data)
     digest = _sha256(data)
     _create(out / MANIFEST_SHA, f"{digest}  {MANIFEST}\n".encode("utf-8"))
+    manifest["manifest_sha256"] = digest
+    return manifest
+
+
+
+
+def build_multi_frame_cache(
+    strip_roots: Sequence[Path | str],
+    dest: Path | str,
+    cams: tuple[str, ...] | str,
+    *,
+    scale: float = 1.0,
+    progress: Any = None,
+) -> dict[str, Any]:
+    """Decode cams from multiple recording roots into format-3 chunks under ``dest``.
+
+    ``dest`` must be new or empty. Frame indexes are namespaced by ``source`` key.
+    """
+    import io
+
+    from python.data.raw_frames import read_state_jsonl
+    from python.train.strip_sources import source_key_for
+
+    roots = [Path(r).resolve() for r in strip_roots]
+    if len(roots) < 2:
+        raise ValueError("build_multi_frame_cache needs at least two roots; use build_frame_cache for one")
+    if len(set(roots)) != len(roots):
+        raise ValueError("duplicate strip roots")
+    out = Path(dest)
+    if out.exists() and (not out.is_dir() or any(out.iterdir())):
+        raise FileExistsError(
+            f"{out} is not empty; a cache is built create-only into a new folder and never rewritten in place"
+        )
+    out.mkdir(parents=True, exist_ok=True)
+    names = parse_cams(cams if isinstance(cams, str) else ",".join(cams))
+    factor = 1.0 if float(scale) >= 0.999 else float(scale)
+    chunks: list[dict[str, Any]] = []
+    sources_meta: list[dict[str, Any]] = []
+    written = 0
+    for root in roots:
+        key = source_key_for(root)
+        rows = read_state_jsonl(root / "state.jsonl")
+        indexes: list[int] = []
+        for row in rows:
+            try:
+                indexes.append(int(row.get("i")))
+            except (TypeError, ValueError):
+                continue
+        sources_meta.append({"key": key, "root": str(root), "name": root.name, "frames": len(indexes)})
+        for cam in names:
+            height, width, _channels = _sector_shape(cam)
+            if factor < 0.999:
+                height = max(1, int(round(height * factor)))
+                width = max(1, int(round(width * factor)))
+            limit = frames_per_chunk(height, width)
+            batch_ids: list[int] = []
+            batch_px: list[np.ndarray] = []
+
+            def flush(cam_id: str = cam, source_key: str = key) -> None:
+                nonlocal written
+                if not batch_ids:
+                    return
+                stack = np.stack(batch_px, axis=0)
+                file_name = f"{source_key}_{cam_id}_{len(chunks):03d}.npy"
+                buffer = io.BytesIO()
+                np.save(buffer, stack)
+                _create(out / file_name, buffer.getvalue())
+                chunks.append({"file": file_name, "cam": cam_id, "source": source_key, "ids": list(batch_ids)})
+                written += len(batch_ids)
+                batch_ids.clear()
+                batch_px.clear()
+                if progress is not None:
+                    progress(written)
+
+            for index in indexes:
+                image = _read_cam(root, cam, index)
+                if image is None:
+                    continue
+                fitted = _fit_sector(np.asarray(image), cam)
+                if factor < 0.999:
+                    import cv2
+
+                    fitted = cv2.resize(fitted, (width, height), interpolation=cv2.INTER_AREA)
+                batch_ids.append(index)
+                batch_px.append(np.ascontiguousarray(fitted[:, :, :3]))
+                if len(batch_ids) >= limit:
+                    flush()
+            flush()
+    newline = "\n"
+    manifest = {
+        "format": CACHE_FORMAT_MULTI,
+        "sector": "strip_writer.place_sector (fit, then the repeater ego-edge mask)",
+        "cams": list(names),
+        "canvas_h": CANVAS_H if factor >= 0.999 else max(1, int(round(CANVAS_H * factor))),
+        "canvas_w": canvas_width(names) if factor >= 0.999 else max(1, int(round(canvas_width(names) * factor))),
+        "scale": factor,
+        "sources": sources_meta,
+        "chunks": chunks,
+        "frames": written // max(1, len(names)),
+    }
+    data = (json.dumps(manifest, indent=2) + newline).encode("utf-8")
+    _create(out / MANIFEST, data)
+    digest = _sha256(data)
+    _create(out / MANIFEST_SHA, f"{digest}  {MANIFEST}{newline}".encode("utf-8"))
     manifest["manifest_sha256"] = digest
     return manifest

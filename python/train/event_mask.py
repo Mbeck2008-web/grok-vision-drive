@@ -371,3 +371,61 @@ def drop_masked(rows: list[Mapping[str, Any]], masked: set[int] | frozenset[int]
     from python.train.scene_loader import recompute_dt
 
     return recompute_dt([row for row in rows if _row_id(row) not in masked])
+
+
+
+def apply_mask_files_multi(
+    roots: list | tuple,
+    rows: list[Mapping[str, Any]],
+    files: str | Iterable[str] | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Apply ``--mask-files`` per ``source_root`` (spec C.5).
+
+    Each listed mask file is resolved under each root that has it. Ids from a
+    root's file only drop rows whose ``source_root`` is that root. A missing
+    file on one root skips that root (other roots still apply). Bare ``i`` is
+    never applied across sources.
+    """
+    from pathlib import Path as _Path
+
+    from python.train.scene_loader import recompute_dt
+
+    items = parse_mask_files(files)
+    if not items:
+        return [dict(r) for r in rows], []
+    by_root: dict[str, list[Mapping[str, Any]]] = {}
+    order: list[str] = []
+    for row in rows:
+        key = str(_Path(str(row.get("source_root") or "")).resolve()) if row.get("source_root") else ""
+        if key not in by_root:
+            by_root[key] = []
+            order.append(key)
+        by_root[key].append(row)
+    # Also cover roots that have no rows yet (should not happen).
+    for root in roots:
+        key = str(_Path(root).resolve())
+        if key not in by_root:
+            by_root[key] = []
+            order.append(key)
+    kept: list[dict[str, Any]] = []
+    all_sources: list[dict[str, Any]] = []
+    for key in order:
+        subset = by_root[key]
+        if not key:
+            kept.extend(dict(r) for r in subset)
+            continue
+        root = _Path(key)
+        present: list[str] = []
+        for raw in items:
+            name, _want = split_mask_spec(raw)
+            if (root / name).is_file():
+                present.append(raw)
+        if not present:
+            kept.extend(dict(r) for r in subset)
+            continue
+        sources = mask_file_sources(root, subset, present)
+        for src in sources:
+            all_sources.append({**src, "source_root": key})
+        masked = set().union(*(set(s["ids"]) for s in sources)) if sources else set()
+        kept.extend(dict(r) for r in subset if _row_id(r) not in masked)
+    return recompute_dt(kept), all_sources

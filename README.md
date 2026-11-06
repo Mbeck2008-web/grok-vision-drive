@@ -418,7 +418,8 @@ Labels come from the painted line decals the camera actually sees: every `DecalR
 | Impact respawn | After a logged impact the car respawns from the spawn deck (`--no-impact-respawn` keeps driving). | Offline smoke only |
 | Spawn deck | On west_coast_usa, `--respawn-min N` teleports to a new stratified spawn every N minutes: about 40% city, 35% highway, 25% ramps, each road used once per run (`python/collect/spawn_mix.py`). | Offline smoke only |
 | Data disk | Data lives in `GVD_data` on a data drive (`GVD_DATA_DIR` overrides it). The C and D drives are refused as the data root. Runs stop under 20 GB free. The dev PC's data drive is FAT32, so no file may exceed 4 GB. | Offline smoke only |
-| Frame cache | `--build-cache <dir>` decodes the chosen cameras into `.npy` chunks under 3.5 GB each, then exits. `--cache <dir>` memory-maps them. The examples below use `<cache dir>`, a folder on a fast local drive. | Offline smoke only |
+| Frame cache | `--build-cache <dir>` decodes the chosen cameras into `.npy` chunks under 3.5 GB each (FAT32-safe), then exits. Single-root writes format `gvd-frame-cache-2`; multi-root writes `gvd-frame-cache-3` with namespaced source keys. `--cache <dir>` memory-maps them. Aggregate size may be many GiB; each file stays under 4 GB. | Offline smoke only |
+| Combined recordings | Pass multiple `--strips` roots (same basename OK). Frame/`session` ids are namespaced by source. Holdout stays on `--holdout-source` (default: first root); other roots are train-only. No physical merge folder. | Offline smoke only |
 | Validate | `scripts/validate_scene_lanes.py` checks a recording and writes a report and montage PNGs. | Offline smoke only |
 | Time holdout | By default the last 20% of each long segment is held out, with a 4 s gap on both sides. `--holdout-blocks K` (or `GVD_HOLDOUT_BLOCKS`) spreads that over K equal time blocks. Default 1. | Offline smoke only |
 | Spatial holdout | `--holdout-cells` scores a seeded set of 250 m map cells holding about 20% of rows, and drops training rows within 50 m of them. `--holdout-cells-file` (default `<status dir>/holdout_cells.json`) saves and reuses the list. `--holdout-seed` (default 0). | Offline smoke only |
@@ -432,13 +433,24 @@ py -3 -m python.train.train_scene --strips <data drive>\GVD_data\scene_lanes --c
 py -3 -m python.train.train_scene --strips <data drive>\GVD_data\scene_lanes --cams main --heads lane_gt --balance --cache <cache dir> --epochs 30 --export <data drive>\GVD_data\models\e2e_scene.onnx
 ```
 
+Combined prior+new (prior = fixed holdout, new = train-only; cache on E:; lane_gt only — do not add aux/road_edge on this baseline):
+
+```
+py -3 -m python.train.train_scene --strips E:\GVD_data\sgt_2h_20261105\scene_lanes\ctl_20261105_p01 --strips E:\GVD_data\sgt_2h_20261105_r2\scene_lanes\ctl_20261105_p01 --holdout-source E:\GVD_data\sgt_2h_20261105\scene_lanes\ctl_20261105_p01 --cams main --build-cache E:\GVD_cache\sgt_combined_main_20261105
+
+py -3 -m python.train.train_scene --strips E:\GVD_data\sgt_2h_20261105\scene_lanes\ctl_20261105_p01 --strips E:\GVD_data\sgt_2h_20261105_r2\scene_lanes\ctl_20261105_p01 --holdout-source E:\GVD_data\sgt_2h_20261105\scene_lanes\ctl_20261105_p01 --cams main --heads lane_gt --epochs 12 --exact-epochs 12 --lr 1e-3 --backbone-lr-mult 1 --seed 73 --no-augment --holdout-blocks 5 --cache E:\GVD_cache\sgt_combined_main_20261105 --ckpt-dir E:\GVD_runs\sgt_combined_lane_20261105
+```
+
+Combined main-only cache estimate ≈ 19.15 GiB aggregate on E: (many ≤ 3.5 GB shards). C: cache is not required. Do not delete existing recordings.
+
 ### Training flags
 
 `py -3 -m python.train.train_scene --strips <dir> ...`
 
 | Flag | Default | Does |
 | --- | --- | --- |
-| `--strips` | (required in practice) | Recording folder |
+| `--strips` | (required in practice) | Recording folder (repeatable). One path = single-root (unchanged). Two or more = multi-root; first is the default holdout source. A comma-joined single token also works. |
+| `--holdout-source` | first `--strips` | Which listed root provides the validation holdout; other roots are train-only |
 | `--epochs` | 1 | Passes over the data |
 | `--lr` | 1e-3 | Learning rate. It is pinned for the whole run; keep it at 1e-3. |
 | `--batch` | 0 | 0 fits the largest batch in free VRAM |

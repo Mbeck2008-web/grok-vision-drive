@@ -355,15 +355,17 @@ def check_cache_close_contract() -> None:
         # Contract guard: call each public callable with a valid index; any ndarray it returns
         # must not share memory with a chunk map. Only sector and canvas may return arrays.
         valid = {"cam": cam, "index": index}
+        # Optional kwargs (multi-source cache); omit so single-root defaults apply.
+        optional = {"source"}
         returns_array = set()
         for name in sorted(n for n in dir(cache) if not n.startswith("_")):
             member = getattr(cache, name)
             if not callable(member) or name == "close":
                 continue
             params = inspect.signature(member).parameters
-            unknown = [p for p in params if p not in valid]
+            unknown = [p for p in params if p not in valid and p not in optional]
             assert not unknown, f"FrameCache.{name}{tuple(params)}: new public method; extend the contract guard"
-            result = member(**{p: valid[p] for p in params})
+            result = member(**{p: valid[p] for p in params if p in valid})
             if isinstance(result, np.ndarray):
                 returns_array.add(name)
                 assert cache._open, name

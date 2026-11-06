@@ -621,14 +621,26 @@ def _prediction_at(pred: ScenePrediction, index: int) -> ScenePrediction:
     from python.train.scene_net import CTL_OUTPUT_FIELDS
 
     extra = {name: getattr(pred, name)[index] for name in CTL_OUTPUT_FIELDS if getattr(pred, name, None) is not None}
+    # Training-only aux / road_edge: must travel with the slice or scene_loss skips them.
+    for name in ("aux_depth", "aux_sem_logits", "road_edge"):
+        value = getattr(pred, name, None)
+        if value is not None:
+            extra[name] = value[index]
     return ScenePrediction(**{name: getattr(pred, name)[index] for name in OUTPUT_FIELDS}, **extra)
 
 
 def _loss_terms(net: Any) -> tuple[str, ...]:
-    """LOSS_TERMS, plus ``ctl`` for a ctl net (the trace and step logs show it)."""
+    """LOSS_TERMS, plus opt-in ``ctl`` / ``road_edge`` / aux terms when those flags are on."""
     from python.train.scene_net import LOSS_TERMS
 
-    return tuple(LOSS_TERMS) + (("ctl",) if bool(getattr(net, "ctl", False)) else ())
+    extra: list[str] = []
+    if bool(getattr(net, "ctl", False)):
+        extra.append("ctl")
+    if bool(getattr(net, "road_edge", False)):
+        extra.append("road_edge")
+    if bool(getattr(net, "aux_sensors", False)):
+        extra.extend(("aux_depth", "aux_sem"))
+    return tuple(LOSS_TERMS) + tuple(extra)
 
 
 # Confidence BCE scale in the training loss. 1.0 let the 0/1 paint-coverage
@@ -1190,7 +1202,7 @@ def _optimizer_step(
             pred, state = _forward(net, image, dt, state, [row])
         if loss_mask(row):
             one = _prediction_at(pred, 0)
-            labels = labels_for_row(row, root=root, aux_depth=bool(aux_depth_w), aux_sem=bool(aux_sem_w))
+            labels = labels_for_row(row, root=root, aux_depth=bool(aux_depth_w), aux_sem=bool(aux_sem_w), road_edge=("road_edge" in (heads or ())))
             lane_gt_rows += int(has_lane_gt(labels))
             step = scene_loss(
                 one, _as_target(labels, device), heads, lane_loss=lane_loss, conf_weight=conf_weight,
@@ -1351,7 +1363,7 @@ def _optimizer_group(
             if row is None or not loss_mask(row):
                 continue
             one = _prediction_at(pred, b)
-            labels = labels_for_row(row, root=root, aux_depth=bool(aux_depth_w), aux_sem=bool(aux_sem_w))
+            labels = labels_for_row(row, root=root, aux_depth=bool(aux_depth_w), aux_sem=bool(aux_sem_w), road_edge=("road_edge" in (heads or ())))
             lane_gt_rows += int(has_lane_gt(labels))
             step = scene_loss(
                 one, _as_target(labels, device), heads, lane_loss=lane_loss, conf_weight=conf_weight,
@@ -1516,7 +1528,7 @@ def _eval_sequence(
                 if not loss_mask(row):
                     continue
                 step = scene_loss(
-                    one, _as_target(labels_for_row(row, root=root, aux_depth=bool(aux_depth_w), aux_sem=bool(aux_sem_w)), device), heads, conf_weight=conf_weight, ctl_weight=ctl_weight, aux_depth_weight=aux_depth_w, aux_sem_weight=aux_sem_w, road_edge_weight=float(road_edge_weight),
+                    one, _as_target(labels_for_row(row, root=root, aux_depth=bool(aux_depth_w), aux_sem=bool(aux_sem_w), road_edge=("road_edge" in (heads or ()))), device), heads, conf_weight=conf_weight, ctl_weight=ctl_weight, aux_depth_weight=aux_depth_w, aux_sem_weight=aux_sem_w, road_edge_weight=float(road_edge_weight),
                     ctl_loss=ctl_loss,
                 )
                 value = step["total"]

@@ -67,17 +67,22 @@ def read_sem_classes(root: Path | str) -> dict[str, Any]:
 
 
 def _downsample_u16_depth_m(depth_cm: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Average depth to AUX_H x AUX_W metres; zero-cm samples are invalid."""
+    """Average depth to AUX_H x AUX_W metres; zero-cm samples are invalid.
+
+    ``INTER_AREA`` averages zero-filled invalids with valids. Divide by the
+    valid fraction so a half-valid bin keeps the mean of the valid metres,
+    not a biased-low blend with zeros.
+    """
     import cv2
 
     valid = (depth_cm > 0).astype(np.float32)
-    metres = depth_cm.astype(np.float32) / 100.0
-    metres = np.where(valid > 0.5, metres, 0.0)
-    # Area average; validity is the fraction of valid source pixels in the bin.
+    metres = np.where(valid > 0.5, depth_cm.astype(np.float32) / 100.0, 0.0)
     d = cv2.resize(metres, (AUX_W, AUX_H), interpolation=cv2.INTER_AREA)
     v = cv2.resize(valid, (AUX_W, AUX_H), interpolation=cv2.INTER_AREA)
+    safe = np.maximum(v, 1e-6)
+    corrected = np.where(v > 1e-6, d / safe, 0.0)
     mask = (v >= 0.5).astype(np.float32)
-    return d.astype(np.float32), mask
+    return corrected.astype(np.float32), mask
 
 
 def _downsample_sem(sem: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -134,6 +139,21 @@ def load_sensor_aux_targets(
 
     if depth is not None and sem is not None and depth.shape != sem.shape:
         raise AuxTargetError(f"depth/sem alignment shape mismatch: {depth.shape} vs {sem.shape}")
+
+    # Spec A.2: when RGB main exists, depth/sem HxW must match it (no silent stretch).
+    rgb = load_raw_camera(root, str(cam), int(index))
+    if rgb is not None:
+        if rgb.ndim != 3 or int(rgb.shape[-1]) not in (3, 4):
+            raise AuxTargetError(f"rgb main must be HxWx3/4, got {getattr(rgb, 'shape', None)}")
+        rgb_hw = (int(rgb.shape[0]), int(rgb.shape[1]))
+        for name, plane in (("depth", depth), ("sem", sem)):
+            if plane is None:
+                continue
+            plane_hw = (int(plane.shape[0]), int(plane.shape[1]))
+            if plane_hw != rgb_hw:
+                raise AuxTargetError(
+                    f"{name}/rgb alignment shape mismatch: {plane_hw} vs rgb {rgb_hw}"
+                )
 
     # Validate schema whenever either plane is present (recording claimed train_gt).
     classes = read_sem_classes(root)
@@ -199,6 +219,7 @@ def road_edge_from_record(record: Mapping[str, Any] | None) -> tuple[np.ndarray,
         values[:n] = src[:n]
         valid[:n] = msrc[:n]
         return values, valid
+    # Full mapped-road width only. Never alias lane_width_m (paint/lane split) to road width.
     return pack_road_edge(
         offset_m=_finite(record.get("road_offset_m", record.get("offset_m"))),
         heading_err_rad=_finite(record.get("heading_err_rad", record.get("road_heading_err_rad"))),

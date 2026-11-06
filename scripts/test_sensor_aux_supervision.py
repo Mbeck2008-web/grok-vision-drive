@@ -244,8 +244,6 @@ def check_default_onnx_and_no_input_leak() -> None:
     t_base["sign_state"] = torch.zeros(base_pred.sign_state.shape[:-1], dtype=torch.int64)
     t_base["sign_valid"] = torch.zeros_like(base_pred.sign_valid)
     loss_default = scene_loss(base_pred, t_base, heads=("lane_gt",))
-    loss_with_poison_targets = scene_loss(base_pred, t_base, heads=("lane_gt",))
-    assert float(loss_default["total"]) == float(loss_with_poison_targets["total"])
     # Opt-in road_edge + aux change total when heads/flags request them.
     loss_re = scene_loss(
         pred,
@@ -293,6 +291,230 @@ def check_parse_heads_road_edge() -> None:
     print("parse_heads_road_edge")
 
 
+
+def check_trainer_slice_aux_losses() -> None:
+    """BLOCKER: train_scene._prediction_at must keep aux/road_edge so losses fire."""
+    import torch
+    from python.train import train_scene as ts
+    from python.train.scene_net import SceneNet, scene_loss
+
+    net = SceneNet(cams=("main",), aux_sensors=True, road_edge=True).eval()
+    pred, _ = net.forward_batch(torch.zeros(1, 3, net.canvas_h, net.canvas_w), torch.zeros(1), net.initial_state())
+    one = ts._prediction_at(pred, 0)
+    assert one.road_edge is not None and one.aux_depth is not None and one.aux_sem_logits is not None
+    target = {
+        "lane_gt": torch.zeros_like(one.lane_gt),
+        "lane_gt_valid": torch.zeros_like(one.lane_gt),
+        "lanes": torch.zeros_like(one.lanes),
+        "lane_valid": torch.zeros_like(one.lane_valid),
+        "curbs": torch.zeros_like(one.curbs),
+        "curb_valid": torch.zeros_like(one.curb_valid),
+        "objects": torch.zeros_like(one.objects),
+        "object_class": torch.zeros(one.object_class.shape[:-1], dtype=torch.int64),
+        "object_valid": torch.zeros_like(one.object_valid),
+        "signs": torch.zeros_like(one.signs),
+        "sign_class": torch.zeros(one.sign_class.shape[:-1], dtype=torch.int64),
+        "sign_state": torch.zeros(one.sign_state.shape[:-1], dtype=torch.int64),
+        "sign_valid": torch.zeros_like(one.sign_valid),
+        "aux_depth": torch.ones_like(one.aux_depth) * 99.0,
+        "aux_depth_valid": torch.ones_like(one.aux_depth),
+        "aux_sem": torch.zeros(one.aux_sem_logits.shape[-2], one.aux_sem_logits.shape[-1], dtype=torch.int64),
+        "aux_sem_valid": torch.ones(one.aux_sem_logits.shape[-2], one.aux_sem_logits.shape[-1]),
+        "road_edge": torch.ones_like(one.road_edge) * 7.0,
+        "road_edge_valid": torch.ones_like(one.road_edge),
+    }
+    loss = scene_loss(
+        one, target, heads=("lane_gt", "road_edge"),
+        aux_depth_weight=1.0, aux_sem_weight=1.0, road_edge_weight=1.0,
+    )
+    assert float(loss["road_edge"].detach()) > 0.0, loss
+    assert float(loss["aux_depth"].detach()) > 0.0, loss
+    assert float(loss["aux_sem"].detach()) > 0.0, loss
+    assert float(loss["total"].detach()) > 10.0, float(loss["total"].detach())
+    print("trainer_slice_aux_losses")
+
+
+def check_rgb_alignment_hard_fail() -> None:
+    """MAJOR: depth/sem HxW must match RGB main when main exists."""
+    from python.train.sensor_aux import AuxTargetError, load_sensor_aux_targets
+
+    depth = np.full((H, W), 100, np.uint16)
+    sem = np.zeros((H, W), np.uint8)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "rec"
+        _write_rec(root, depth=depth, sem=sem, rgb=True)
+        # overwrite RGB with different size
+        import cv2
+        from python.data.raw_frames import raw_frame_candidates
+        rgb_path = next((root / "raw" / "main").rglob("*.png"))
+        cv2.imwrite(str(rgb_path), np.full((H + 4, W + 4, 3), 40, np.uint8))
+        try:
+            load_sensor_aux_targets(root, 0, cam="main")
+        except AuxTargetError as exc:
+            assert "rgb" in str(exc).lower() or "align" in str(exc).lower(), exc
+        else:
+            raise AssertionError("expected AuxTargetError when RGB HxW disagrees")
+    print("rgb_alignment_hard_fail")
+
+
+def check_depth_downsample_zero_bias() -> None:
+    """MAJOR: zero-cm invalids must not bias INTER_AREA metre means."""
+    from python.train.sensor_aux import _downsample_u16_depth_m
+
+    d = np.full((48, 64), 2000, np.uint16)  # 20 m
+    d[0::2, :] = 0
+    metres, mask = _downsample_u16_depth_m(d)
+    assert float(mask.mean()) >= 0.5
+    got = float(metres[mask > 0.5].mean())
+    assert abs(got - 20.0) < 0.05, f"biased depth mean {got}"
+    print("depth_downsample_zero_bias")
+
+
+def check_lane_width_not_road_width() -> None:
+    """MAJOR: lane_width_m alone must not invent road_edge; need road_width_m or explicit."""
+    from python.train.sensor_aux import road_edge_from_record
+
+    masked_v, masked_m = road_edge_from_record(
+        {"road_offset_m": 0.5, "lane_width_m": 3.5, "heading_err_rad": 0.0, "off_road": False}
+    )
+    assert float(masked_m.sum()) == 0.0, "lane_width_m must not pack road_edge"
+    ok_v, ok_m = road_edge_from_record(
+        {"road_offset_m": 0.5, "road_width_m": 8.0, "heading_err_rad": 0.0, "off_road": False}
+    )
+    assert float(ok_m.sum()) > 0.0
+    print("lane_width_not_road_width")
+
+
+def check_meaningful_no_leak() -> None:
+    """MINOR: aux/road_edge targets affect scene_loss only — never strip / forward inputs."""
+    import inspect
+    import torch
+    from python.train.scene_net import SceneNet, scene_loss
+
+    net = SceneNet(cams=("main",), aux_sensors=True, road_edge=True).eval()
+    # forward_batch must not accept label / aux / road_edge kwargs (no concat path).
+    params = set(inspect.signature(net.forward_batch).parameters)
+    for banned in ("aux_depth", "aux_sem", "road_edge", "labels", "target", "depth", "sem"):
+        assert banned not in params, banned
+    strip = torch.linspace(0.0, 1.0, 1 * 3 * net.canvas_h * net.canvas_w).reshape(
+        1, 3, net.canvas_h, net.canvas_w
+    )
+    strip_before = strip.clone()
+    dt = torch.zeros(1)
+    state = net.initial_state()
+    pred_a, _ = net.forward_batch(strip, dt, state)
+    pred_b, _ = net.forward_batch(strip, dt, net.initial_state())
+    assert torch.equal(strip, strip_before), "forward must not mutate strip"
+    # Predictions are RGB-determined: identical strip → identical aux_depth (no label channel).
+    assert torch.allclose(pred_a.aux_depth, pred_b.aux_depth)
+    poison_depth = torch.full_like(pred_a.aux_depth, 123.0)
+    poison_re = torch.full_like(pred_a.road_edge, 45.0)
+    base_target = {
+        "lane_gt": torch.zeros_like(pred_a.lane_gt),
+        "lane_gt_valid": torch.zeros_like(pred_a.lane_gt),
+        "lanes": torch.zeros_like(pred_a.lanes),
+        "lane_valid": torch.zeros_like(pred_a.lane_valid),
+        "curbs": torch.zeros_like(pred_a.curbs),
+        "curb_valid": torch.zeros_like(pred_a.curb_valid),
+        "objects": torch.zeros_like(pred_a.objects),
+        "object_class": torch.zeros(pred_a.object_class.shape[:-1], dtype=torch.int64),
+        "object_valid": torch.zeros_like(pred_a.object_valid),
+        "signs": torch.zeros_like(pred_a.signs),
+        "sign_class": torch.zeros(pred_a.sign_class.shape[:-1], dtype=torch.int64),
+        "sign_state": torch.zeros(pred_a.sign_state.shape[:-1], dtype=torch.int64),
+        "sign_valid": torch.zeros_like(pred_a.sign_valid),
+        "aux_depth": torch.zeros_like(pred_a.aux_depth),
+        "aux_depth_valid": torch.ones_like(pred_a.aux_depth),
+        "road_edge": torch.zeros_like(pred_a.road_edge),
+        "road_edge_valid": torch.ones_like(pred_a.road_edge),
+    }
+    loss_clean = scene_loss(
+        pred_a, base_target, heads=("lane_gt", "road_edge"),
+        aux_depth_weight=1.0, road_edge_weight=1.0,
+    )
+    poisoned = dict(base_target)
+    poisoned["aux_depth"] = poison_depth
+    poisoned["road_edge"] = poison_re
+    loss_poison = scene_loss(
+        pred_a, poisoned, heads=("lane_gt", "road_edge"),
+        aux_depth_weight=1.0, road_edge_weight=1.0,
+    )
+    # Poison changes the *loss*, proving targets are loss-side only.
+    assert float(loss_poison["total"]) != float(loss_clean["total"])
+    assert float(loss_poison["aux_depth"]) > float(loss_clean["aux_depth"])
+    # Strip still untouched after scoring.
+    assert torch.equal(strip, strip_before)
+    print("meaningful_no_leak")
+
+
+def check_scene_loss_rejects_aux_shape_mismatch() -> None:
+    """MINOR: scene_loss must raise on aux spatial mismatch, not interpolate."""
+    import torch
+    from python.train.scene_net import SceneNet, scene_loss
+    from python.train.sensor_aux import AuxTargetError
+
+    net = SceneNet(cams=("main",), aux_sensors=True).eval()
+    pred, _ = net.forward_batch(torch.zeros(1, 3, net.canvas_h, net.canvas_w), torch.zeros(1), net.initial_state())
+    target = {
+        "lane_gt": torch.zeros_like(pred.lane_gt),
+        "lane_gt_valid": torch.zeros_like(pred.lane_gt),
+        "lanes": torch.zeros_like(pred.lanes),
+        "lane_valid": torch.zeros_like(pred.lane_valid),
+        "curbs": torch.zeros_like(pred.curbs),
+        "curb_valid": torch.zeros_like(pred.curb_valid),
+        "objects": torch.zeros_like(pred.objects),
+        "object_class": torch.zeros(pred.object_class.shape[:-1], dtype=torch.int64),
+        "object_valid": torch.zeros_like(pred.object_valid),
+        "signs": torch.zeros_like(pred.signs),
+        "sign_class": torch.zeros(pred.sign_class.shape[:-1], dtype=torch.int64),
+        "sign_state": torch.zeros(pred.sign_state.shape[:-1], dtype=torch.int64),
+        "sign_valid": torch.zeros_like(pred.sign_valid),
+        "aux_depth": torch.ones(1, 1, 3, 3) * 5.0,
+        "aux_depth_valid": torch.ones(1, 1, 3, 3),
+    }
+    try:
+        scene_loss(pred, target, heads=("lane_gt",), aux_depth_weight=1.0)
+    except AuxTargetError:
+        pass
+    else:
+        raise AssertionError("expected AuxTargetError on aux depth shape mismatch")
+    print("scene_loss_rejects_aux_shape_mismatch")
+
+
+def check_road_edge_labels_opt_in() -> None:
+    """NIT: labels_for_row attaches road_edge only when requested."""
+    from python.train.scene_net import labels_for_row
+
+    row = {
+        "i": 0,
+        "tech": {
+            "lane_gt": [0.0] * 14,
+            "lane_gt_valid": [0.0] * 14,
+            "road_offset_m": 0.5,
+            "road_width_m": 8.0,
+            "heading_err_rad": 0.0,
+            "off_road": False,
+        },
+    }
+    plain = labels_for_row(row)
+    assert "road_edge" not in plain and "road_edge_valid" not in plain
+    with_re = labels_for_row(row, road_edge=True)
+    assert "road_edge" in with_re and float(with_re["road_edge_valid"].sum()) > 0
+    print("road_edge_labels_opt_in")
+
+
+def check_loss_terms_opt_in() -> None:
+    """NIT: _loss_terms lists aux/road_edge when those flags are on."""
+    from python.train.scene_net import SceneNet
+    from python.train.train_scene import _loss_terms
+
+    plain = _loss_terms(SceneNet(cams=("main",)))
+    assert "road_edge" not in plain and "aux_depth" not in plain and "aux_sem" not in plain
+    both = _loss_terms(SceneNet(cams=("main",), aux_sensors=True, road_edge=True))
+    assert "road_edge" in both and "aux_depth" in both and "aux_sem" in both
+    print("loss_terms_opt_in")
+
+
 def main() -> None:
     check_load_ok_and_downsample()
     check_missing_masked()
@@ -302,6 +524,14 @@ def main() -> None:
     check_parse_heads_road_edge()
     check_aux_grid_bounded()
     check_default_onnx_and_no_input_leak()
+    check_trainer_slice_aux_losses()
+    check_rgb_alignment_hard_fail()
+    check_depth_downsample_zero_bias()
+    check_lane_width_not_road_width()
+    check_meaningful_no_leak()
+    check_scene_loss_rejects_aux_shape_mismatch()
+    check_road_edge_labels_opt_in()
+    check_loss_terms_opt_in()
     print("test_sensor_aux_supervision: OK")
 
 

@@ -711,6 +711,7 @@ def labels_for_row(
     root: Path | str | None = None,
     aux_depth: bool = False,
     aux_sem: bool = False,
+    road_edge: bool = False,
 ) -> dict[str, np.ndarray]:
     """Scene labels plus the ground-truth lane vector when the row has one.
 
@@ -733,14 +734,15 @@ def labels_for_row(
     if "ctl" in row and "ctl_valid" in row:
         labels["ctl"] = np.asarray(row["ctl"], dtype=np.float32).reshape(3, CTL_K)
         labels["ctl_valid"] = np.asarray(row["ctl_valid"], dtype=np.float32).reshape(3, CTL_K)
-    # Separate road-edge capability (masked when absent). Not paint.
-    record: dict[str, Any] = {}
-    if isinstance(tech, Mapping):
-        record.update(tech)
-    record.update(row)
-    re_v, re_m = road_edge_from_record(record)
-    labels["road_edge"] = re_v
-    labels["road_edge_valid"] = re_m
+    # Separate road-edge capability only when the head is requested. Not paint.
+    if road_edge:
+        record: dict[str, Any] = {}
+        if isinstance(tech, Mapping):
+            record.update(tech)
+        record.update(row)
+        re_v, re_m = road_edge_from_record(record)
+        labels["road_edge"] = re_v
+        labels["road_edge_valid"] = re_m
     if root is not None and (aux_depth or aux_sem) and row.get("i") is not None:
         labels = attach_aux_to_labels(
             labels,
@@ -1309,25 +1311,42 @@ def _scene_loss_body(
     aux_depth_term = zero.clone()
     aux_sem_term = zero.clone()
     if float(aux_depth_weight) > 0.0 and getattr(pred, "aux_depth", None) is not None and "aux_depth" in target and "aux_depth_valid" in target:
+        from python.train.sensor_aux import AuxTargetError
+
         pd = pred.aux_depth.to(device=device, dtype=dtype)
         gd = target["aux_depth"].to(device=device, dtype=dtype)
         md = target["aux_depth_valid"].to(device=device, dtype=dtype)
-        if pd.shape != gd.shape:
-            gd = functional.interpolate(gd.reshape(pd.shape[0], 1, gd.shape[-2], gd.shape[-1]), size=pd.shape[-2:], mode="area").reshape_as(pd)
-            md = functional.interpolate(md.reshape(pd.shape[0], 1, md.shape[-2], md.shape[-1]), size=pd.shape[-2:], mode="area").reshape_as(pd)
+        if tuple(pd.shape[-2:]) != tuple(gd.shape[-2:]) or tuple(pd.shape[-2:]) != tuple(md.shape[-2:]):
+            raise AuxTargetError(
+                f"aux_depth shape mismatch pred={tuple(pd.shape)} goal={tuple(gd.shape)} mask={tuple(md.shape)}"
+            )
         if bool((md > 0.5).any()):
             aux_depth_term = (functional.smooth_l1_loss(pd, gd, reduction="none") * md).sum() / md.sum().clamp(min=1.0)
         total = total + float(aux_depth_weight) * aux_depth_term
     if float(aux_sem_weight) > 0.0 and getattr(pred, "aux_sem_logits", None) is not None and "aux_sem" in target and "aux_sem_valid" in target:
+        from python.train.sensor_aux import AuxTargetError
+
         logits = pred.aux_sem_logits.to(device=device)
         goal = target["aux_sem"].to(device=device, dtype=torch.long)
         mv = target["aux_sem_valid"].to(device=device, dtype=dtype)
-        if logits.shape[-2:] != goal.shape[-2:]:
-            goal = functional.interpolate(goal.reshape(logits.shape[0], 1, goal.shape[-2], goal.shape[-1]).float(), size=logits.shape[-2:], mode="nearest").reshape(logits.shape[0], *logits.shape[-2:]).long()
-            mv = functional.interpolate(mv.reshape(logits.shape[0], 1, mv.shape[-2], mv.shape[-1]), size=logits.shape[-2:], mode="nearest").reshape(logits.shape[0], *logits.shape[-2:])
+        # Trainer _prediction_at drops the batch axis; restore NCHW / NHW for CE.
+        if logits.dim() == 3:
+            logits = logits.unsqueeze(0)
+        if goal.dim() == 2:
+            goal = goal.unsqueeze(0)
+        if mv.dim() == 2:
+            mv = mv.unsqueeze(0)
+        if tuple(logits.shape[-2:]) != tuple(goal.shape[-2:]) or tuple(logits.shape[-2:]) != tuple(mv.shape[-2:]):
+            raise AuxTargetError(
+                f"aux_sem shape mismatch logits={tuple(logits.shape)} goal={tuple(goal.shape)} mask={tuple(mv.shape)}"
+            )
         on = mv.reshape(-1) > 0.5
         if bool(on.any()):
-            ce = functional.cross_entropy(logits.permute(0, 2, 3, 1).reshape(-1, logits.shape[1])[on], goal.reshape(-1)[on], reduction="mean")
+            ce = functional.cross_entropy(
+                logits.permute(0, 2, 3, 1).reshape(-1, logits.shape[1])[on],
+                goal.reshape(-1)[on],
+                reduction="mean",
+            )
             aux_sem_term = ce
         total = total + float(aux_sem_weight) * aux_sem_term
     out = {

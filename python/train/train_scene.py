@@ -141,7 +141,26 @@ def _maybe_jitter(frame: Any, augment: bool, rng: np.random.RandomState | None) 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train the GVD scene net from recorded strips")
-    parser.add_argument("--strips", type=str, default="", help="Recording directory with state.jsonl and raw/<cam>/ frames. JPEG strips/ are refused.")
+    parser.add_argument(
+        "--strips",
+        action="append",
+        default=None,
+        help=(
+            "Recording directory with state.jsonl and raw/<cam>/ frames (repeatable). "
+            "One path keeps single-root behavior. Two or more: multi-root (first is the "
+            "default holdout source; others are train-only). A single token may also be a "
+            "comma-separated list. JPEG strips/ are refused."
+        ),
+    )
+    parser.add_argument(
+        "--holdout-source",
+        type=str,
+        default="",
+        help=(
+            "Which --strips root provides the validation holdout (default: the first). "
+            "Must match one of the listed strip roots. Other roots are train-only."
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument(
         "--exact-epochs",
@@ -1041,20 +1060,23 @@ def _frame_row(
     from python.train.cam_strip import extract_cams, photometric_jitter
 
     index = int(row["i"])
+    row_root = Path(row["source_root"]) if row.get("source_root") else root
+    source_key = row.get("source")
+    cache_kwargs = {"source": source_key} if source_key is not None else {}
     frame = None
     if isinstance(row.get(ROW_HOLD_KEY), Mapping):
         try:
-            frame, ages = held_canvas(root, row, cache)
+            frame, ages = held_canvas(row_root, row, cache)
         except FileNotFoundError as exc:
             print(f"[GVD] scene load skip i={row.get('i')}: {exc}", flush=True)
             return None
         row = dict(row)
         row[ROW_AGES_KEY] = [float(value) for value in ages]
-    elif cache is not None and cache.has(index):
-        frame = cache.canvas(index)
+    elif cache is not None and cache.has(index, **cache_kwargs):
+        frame = cache.canvas(index, **cache_kwargs)
     if frame is None:
         try:
-            frame = np.ascontiguousarray(_load_bgr(root, index))
+            frame = np.ascontiguousarray(_load_bgr(row_root, index))
         except FileNotFoundError as exc:
             print(f"[GVD] scene load skip i={row.get('i')}: {exc}", flush=True)
             return None
@@ -1202,7 +1224,7 @@ def _optimizer_step(
             pred, state = _forward(net, image, dt, state, [row])
         if loss_mask(row):
             one = _prediction_at(pred, 0)
-            labels = labels_for_row(row, root=root, aux_depth=bool(aux_depth_w), aux_sem=bool(aux_sem_w), road_edge=("road_edge" in (heads or ())))
+            labels = labels_for_row(row, root=(Path(row["source_root"]) if row.get("source_root") else root), aux_depth=bool(aux_depth_w), aux_sem=bool(aux_sem_w), road_edge=("road_edge" in (heads or ())))
             lane_gt_rows += int(has_lane_gt(labels))
             step = scene_loss(
                 one, _as_target(labels, device), heads, lane_loss=lane_loss, conf_weight=conf_weight,
@@ -1363,7 +1385,7 @@ def _optimizer_group(
             if row is None or not loss_mask(row):
                 continue
             one = _prediction_at(pred, b)
-            labels = labels_for_row(row, root=root, aux_depth=bool(aux_depth_w), aux_sem=bool(aux_sem_w), road_edge=("road_edge" in (heads or ())))
+            labels = labels_for_row(row, root=(Path(row["source_root"]) if row.get("source_root") else root), aux_depth=bool(aux_depth_w), aux_sem=bool(aux_sem_w), road_edge=("road_edge" in (heads or ())))
             lane_gt_rows += int(has_lane_gt(labels))
             step = scene_loss(
                 one, _as_target(labels, device), heads, lane_loss=lane_loss, conf_weight=conf_weight,
@@ -1528,7 +1550,7 @@ def _eval_sequence(
                 if not loss_mask(row):
                     continue
                 step = scene_loss(
-                    one, _as_target(labels_for_row(row, root=root, aux_depth=bool(aux_depth_w), aux_sem=bool(aux_sem_w), road_edge=("road_edge" in (heads or ()))), device), heads, conf_weight=conf_weight, ctl_weight=ctl_weight, aux_depth_weight=aux_depth_w, aux_sem_weight=aux_sem_w, road_edge_weight=float(road_edge_weight),
+                    one, _as_target(labels_for_row(row, root=(Path(row["source_root"]) if row.get("source_root") else root), aux_depth=bool(aux_depth_w), aux_sem=bool(aux_sem_w), road_edge=("road_edge" in (heads or ()))), device), heads, conf_weight=conf_weight, ctl_weight=ctl_weight, aux_depth_weight=aux_depth_w, aux_sem_weight=aux_sem_w, road_edge_weight=float(road_edge_weight),
                     ctl_loss=ctl_loss,
                 )
                 value = step["total"]
@@ -1868,6 +1890,8 @@ def _prefetch_loader(items: list[dict[str, Any]], root: Path, cams, cache, scale
 def train_directory(
     root: Path,
     *,
+    roots: tuple[Path, ...] | list[Path] | None = None,
+    holdout_source: Path | None = None,
     epochs: int,
     lr: float,
     capability: float | None,
@@ -1980,10 +2004,18 @@ def train_directory(
 
     print("[GVD] scene index: reading state.jsonl", flush=True)
     from python.data.raw_frames import refuse_lossy
+    from python.train.strip_sources import combined_pass_plan, load_multi_source_rows, source_key_for
 
-    refuse_lossy(root)
-    state_rows = load_scene_rows(root)
-    print(f"[GVD] scene index: {len(state_rows)} state rows", flush=True)
+    strip_roots: tuple[Path, ...]
+    if roots:
+        strip_roots = tuple(Path(p).resolve() for p in roots)
+    else:
+        strip_roots = (Path(root).resolve(),)
+    root = Path(strip_roots[0] if holdout_source is None else Path(holdout_source).resolve())
+    for one in strip_roots:
+        refuse_lossy(one)
+    state_rows, source_meta = load_multi_source_rows(strip_roots, holdout_source=holdout_source or strip_roots[0])
+    print(f"[GVD] scene index: {len(state_rows)} state rows roots={len(strip_roots)}", flush=True)
     from python.train.event_mask import drop_masked, mask_file_sources, selection_line
 
     # Mask files are read on the full recording rows, before any frame is
@@ -1996,7 +2028,19 @@ def train_directory(
 
     file_bytes, _n_image_files = training_frame_bytes(root, progress=_index_progress)
     dropped: dict[str, int] = {}
-    rows, missing_rows, excluded_rows = select_training_rows(root, state_rows, cams=train_cams, dropped=dropped)
+    if len(strip_roots) == 1:
+        rows, missing_rows, excluded_rows = select_training_rows(root, state_rows, cams=train_cams, dropped=dropped)
+    else:
+        rows = []
+        missing_rows = 0
+        excluded_rows = 0
+        for one in strip_roots:
+            subset = [r for r in state_rows if Path(str(r.get("source_root") or one)).resolve() == one.resolve()]
+            kept, miss, excl = select_training_rows(one, subset, cams=train_cams, dropped=dropped)
+            # restore multi tags select_training_rows may have dropped via dict() copy — they copy all keys
+            rows.extend(kept)
+            missing_rows += miss
+            excluded_rows += excl
     print(
         f"[GVD] scene index: {len(rows)} rows with frames, {missing_rows} missing, "
         f"{excluded_rows} stationary or tipped",
@@ -2072,7 +2116,18 @@ def train_directory(
         print(f"[GVD] holdout blocks: {int(holdout_blocks)}", flush=True)
     from python.train.continual import HOLDOUT_FAST_MPS, holdout_mix
 
-    startup_plan = pass_plan(rows, CHUNK_MAX, CHUNK_MAX // 2, blocks=int(holdout_blocks), cells=cell_spec)
+    if cell_spec is not None:
+        startup_plan = pass_plan(rows, CHUNK_MAX, CHUNK_MAX // 2, blocks=int(holdout_blocks), cells=cell_spec)
+    elif source_meta.get("multi"):
+        startup_plan = combined_pass_plan(
+            rows,
+            length=CHUNK_MAX,
+            stride=CHUNK_MAX // 2,
+            blocks=int(holdout_blocks),
+            holdout_key=source_meta.get("holdout_key"),
+        )
+    else:
+        startup_plan = pass_plan(rows, CHUNK_MAX, CHUNK_MAX // 2, blocks=int(holdout_blocks), cells=cell_spec)
     mix = holdout_mix(startup_plan)
     if use_cam_age:
         from python.data.cam_hold import HOLD_CAP_S, HOLD_TICK_HZ, annotate_hold
@@ -2515,7 +2570,11 @@ def train_directory(
 
             filter_stats: dict[str, Any] = {}
             plan_steps = epoch_windows(
-                pass_plan(rows, chunk_len, stride, blocks=int(holdout_blocks), cells=cell_spec),
+                (
+                    pass_plan(rows, chunk_len, stride, blocks=int(holdout_blocks), cells=cell_spec)
+                    if (cell_spec is not None or not source_meta.get("multi"))
+                    else combined_pass_plan(rows, length=chunk_len, stride=stride, blocks=int(holdout_blocks), holdout_key=source_meta.get("holdout_key"))
+                ),
                 window_rng,
                 min_valid=float(min_valid),
                 balance=bool(balance),
@@ -3170,19 +3229,40 @@ def main(argv: list[str] | None = None) -> None:
     if refusal:
         print(f"[GVD] scene train: {refusal}", flush=True)
         sys.exit(2)
+    from python.train.strip_sources import parse_strips_arg, resolve_holdout_source
+    from python.train.frame_cache import build_multi_frame_cache
+
+    if not args.strips:
+        strip_roots = (Path(scene_lanes_dir()).resolve(),)
+    else:
+        try:
+            strip_roots = parse_strips_arg(args.strips)
+        except ValueError as exc:
+            print(f"[GVD] scene train: {exc}")
+            sys.exit(2)
+    try:
+        holdout_root = resolve_holdout_source(strip_roots, args.holdout_source or None)
+    except ValueError as exc:
+        print(f"[GVD] scene train: {exc}")
+        sys.exit(2)
     if args.build_cache:
         if Path(args.build_cache).exists():
             print(f"[GVD] scene train: --build-cache is create-only; {Path(args.build_cache).name} already exists", flush=True)
             sys.exit(2)
-        manifest = build_frame_cache(
-            args.strips or scene_lanes_dir(),
-            args.build_cache,
-            cam_names,
-            scale=float(args.scale),
-        )
+        try:
+            for root in strip_roots:
+                check_data_path(root)
+        except DataDriveError as exc:
+            print(f"[GVD] scene train: {exc}")
+            sys.exit(2)
+        if len(strip_roots) == 1:
+            manifest = build_frame_cache(strip_roots[0], args.build_cache, cam_names, scale=float(args.scale))
+        else:
+            manifest = build_multi_frame_cache(strip_roots, args.build_cache, cam_names, scale=float(args.scale))
         print(
             f"[GVD] cache {args.build_cache} cams={','.join(cam_names)} "
-            f"chunks={len(manifest.get('chunks') or [])} frames={manifest.get('frames')}",
+            f"chunks={len(manifest.get('chunks') or [])} frames={manifest.get('frames')} "
+            f"format={manifest.get('format')}",
             flush=True,
         )
         return
@@ -3192,7 +3272,7 @@ def main(argv: list[str] | None = None) -> None:
             print(f"[GVD] scene train: cache refused: {frame_cache.reason}", flush=True)
             sys.exit(2)
         export_path = None if args.export is None else Path(args.export)
-        if export_path is not None and not args.strips:
+        if export_path is not None and args.strips is None:
             try:
                 check_data_path(export_path)
             except DataDriveError as exc:
@@ -3204,10 +3284,9 @@ def main(argv: list[str] | None = None) -> None:
             path = export_scene_onnx(export_path, cams=cam_names, heads=head_names, cam_age=bool(args.cam_age))
             print(f"[GVD] exported {path}")
             return
-        if not args.strips:
-            args.strips = str(scene_lanes_dir())
         try:
-            check_data_path(args.strips)
+            for root in strip_roots:
+                check_data_path(root)
             if export_path is not None:
                 check_data_path(export_path)
         except DataDriveError as exc:
@@ -3222,7 +3301,7 @@ def main(argv: list[str] | None = None) -> None:
                     sys.exit(2)
         if args.pause_dir:
             try:
-                check_pause_dir(args.strips, args.pause_dir, no_resume=bool(args.no_resume))
+                check_pause_dir(holdout_root, args.pause_dir, no_resume=bool(args.no_resume))
             except PauseDirRefused as exc:
                 print(f"[GVD] scene train: pause-dir refused: {exc}", flush=True)
                 sys.exit(2)
@@ -3230,7 +3309,7 @@ def main(argv: list[str] | None = None) -> None:
         if not args.no_resume and not args.build_cache:
             # Before any write: a pause file from another --exact-epochs setting is refused.
             try:
-                saved = load_checkpoint(Path(args.strips), pause_dir=pause_dir)
+                saved = load_checkpoint(holdout_root, pause_dir=pause_dir)
             except (OSError, ValueError, KeyError):
                 saved = None
             refused = exact_epochs_resume_refusal(saved, args.exact_epochs)
@@ -3245,7 +3324,9 @@ def main(argv: list[str] | None = None) -> None:
             print("[GVD] scene train: no panel", flush=True)
         try:
             stats = train_directory(
-                Path(args.strips),
+                holdout_root,
+                roots=strip_roots,
+                holdout_source=holdout_root,
                 epochs=args.epochs,
                 lr=args.lr,
                 capability=args.capability,

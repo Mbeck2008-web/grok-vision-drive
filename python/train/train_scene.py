@@ -354,6 +354,34 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--aux-depth",
+        action="store_true",
+        help="Training-only depth aux from raw/<cam>_depth (uint16 cm PNG). Not an inference input.",
+    )
+    parser.add_argument(
+        "--aux-sem",
+        action="store_true",
+        help="Training-only semantic aux from raw/<cam>_sem + sem_classes.json. Not an inference input.",
+    )
+    parser.add_argument(
+        "--aux-depth-weight",
+        type=float,
+        default=0.1,
+        help="Experimental weight on aux depth loss when --aux-depth is set (default 0.1).",
+    )
+    parser.add_argument(
+        "--aux-sem-weight",
+        type=float,
+        default=0.1,
+        help="Experimental weight on aux semantic CE when --aux-sem is set (default 0.1).",
+    )
+    parser.add_argument(
+        "--road-edge-weight",
+        type=float,
+        default=1.0,
+        help="Experimental weight on road_edge when --heads includes road_edge (default 1.0).",
+    )
+    parser.add_argument(
         "--init-head-bias",
         action="store_true",
         help=(
@@ -593,14 +621,26 @@ def _prediction_at(pred: ScenePrediction, index: int) -> ScenePrediction:
     from python.train.scene_net import CTL_OUTPUT_FIELDS
 
     extra = {name: getattr(pred, name)[index] for name in CTL_OUTPUT_FIELDS if getattr(pred, name, None) is not None}
+    # Training-only aux / road_edge: must travel with the slice or scene_loss skips them.
+    for name in ("aux_depth", "aux_sem_logits", "road_edge"):
+        value = getattr(pred, name, None)
+        if value is not None:
+            extra[name] = value[index]
     return ScenePrediction(**{name: getattr(pred, name)[index] for name in OUTPUT_FIELDS}, **extra)
 
 
 def _loss_terms(net: Any) -> tuple[str, ...]:
-    """LOSS_TERMS, plus ``ctl`` for a ctl net (the trace and step logs show it)."""
+    """LOSS_TERMS, plus opt-in ``ctl`` / ``road_edge`` / aux terms when those flags are on."""
     from python.train.scene_net import LOSS_TERMS
 
-    return tuple(LOSS_TERMS) + (("ctl",) if bool(getattr(net, "ctl", False)) else ())
+    extra: list[str] = []
+    if bool(getattr(net, "ctl", False)):
+        extra.append("ctl")
+    if bool(getattr(net, "road_edge", False)):
+        extra.append("road_edge")
+    if bool(getattr(net, "aux_sensors", False)):
+        extra.extend(("aux_depth", "aux_sem"))
+    return tuple(LOSS_TERMS) + tuple(extra)
 
 
 # Confidence BCE scale in the training loss. 1.0 let the 0/1 paint-coverage
@@ -1112,6 +1152,9 @@ def _optimizer_step(
     frame_ages: list[Any] | None = None,
     ctl_weight: float = 1.0,
     ctl_loss: str = "huber",
+    aux_depth_w: float = 0.0,
+    aux_sem_w: float = 0.0,
+    road_edge_weight: float = 1.0,
 ) -> tuple[float | None, int, SceneState, SceneState]:
     """Backprop through this chunk only.
 
@@ -1159,11 +1202,11 @@ def _optimizer_step(
             pred, state = _forward(net, image, dt, state, [row])
         if loss_mask(row):
             one = _prediction_at(pred, 0)
-            labels = labels_for_row(row)
+            labels = labels_for_row(row, root=root, aux_depth=bool(aux_depth_w), aux_sem=bool(aux_sem_w), road_edge=("road_edge" in (heads or ())))
             lane_gt_rows += int(has_lane_gt(labels))
             step = scene_loss(
                 one, _as_target(labels, device), heads, lane_loss=lane_loss, conf_weight=conf_weight,
-                ctl_weight=ctl_weight, ctl_loss=ctl_loss,
+                ctl_weight=ctl_weight, ctl_loss=ctl_loss, aux_depth_weight=aux_depth_w, aux_sem_weight=aux_sem_w, road_edge_weight=float(road_edge_weight),
             )
             if trace is not None and trace.get("print_shapes") and not trace.get("shapes_printed"):
                 _print_step_shapes(image, one, step, state)
@@ -1258,6 +1301,9 @@ def _optimizer_group(
     age_sets: list[list[Any] | None] | None = None,
     ctl_weight: float = 1.0,
     ctl_loss: str = "huber",
+    aux_depth_w: float = 0.0,
+    aux_sem_w: float = 0.0,
+    road_edge_weight: float = 1.0,
 ) -> tuple[float | None, int, SceneState, SceneState]:
     """One step on several windows that each start from a fresh GRU state.
 
@@ -1317,11 +1363,11 @@ def _optimizer_group(
             if row is None or not loss_mask(row):
                 continue
             one = _prediction_at(pred, b)
-            labels = labels_for_row(row)
+            labels = labels_for_row(row, root=root, aux_depth=bool(aux_depth_w), aux_sem=bool(aux_sem_w), road_edge=("road_edge" in (heads or ())))
             lane_gt_rows += int(has_lane_gt(labels))
             step = scene_loss(
                 one, _as_target(labels, device), heads, lane_loss=lane_loss, conf_weight=conf_weight,
-                ctl_weight=ctl_weight, ctl_loss=ctl_loss,
+                ctl_weight=ctl_weight, ctl_loss=ctl_loss, aux_depth_weight=aux_depth_w, aux_sem_weight=aux_sem_w, road_edge_weight=float(road_edge_weight),
             )
             value = step["total"]
             item_loss = float(value.detach().item())
@@ -1410,6 +1456,9 @@ def _eval_sequence(
     ctl_loss: str = "huber",
     ctl_out: list[Any] | None = None,
     worst: Any = None,
+    aux_depth_w: float = 0.0,
+    aux_sem_w: float = 0.0,
+    road_edge_weight: float = 1.0,
 ) -> tuple[float | None, int]:
     """Holdout forward. No optimizer step and no gradient through these frames.
 
@@ -1479,7 +1528,7 @@ def _eval_sequence(
                 if not loss_mask(row):
                     continue
                 step = scene_loss(
-                    one, _as_target(labels_for_row(row), device), heads, conf_weight=conf_weight, ctl_weight=ctl_weight,
+                    one, _as_target(labels_for_row(row, root=root, aux_depth=bool(aux_depth_w), aux_sem=bool(aux_sem_w), road_edge=("road_edge" in (heads or ()))), device), heads, conf_weight=conf_weight, ctl_weight=ctl_weight, aux_depth_weight=aux_depth_w, aux_sem_weight=aux_sem_w, road_edge_weight=float(road_edge_weight),
                     ctl_loss=ctl_loss,
                 )
                 value = step["total"]
@@ -1868,6 +1917,11 @@ def train_directory(
     ctl_loss: str = "huber",
     val_worst: int = VAL_WORST_N,
     val_worst_png: bool = False,
+    aux_depth: bool = False,
+    aux_sem: bool = False,
+    aux_depth_weight: float = 0.1,
+    aux_sem_weight: float = 0.1,
+    road_edge_weight: float = 1.0,
 ) -> dict[str, Any]:
     import torch
 
@@ -1883,6 +1937,14 @@ def train_directory(
     train_heads = tuple(heads) if heads else None
     use_cam_age = bool(cam_age)
     use_ctl = bool(train_heads) and "ctl" in train_heads
+    use_road_edge = bool(train_heads) and "road_edge" in train_heads
+    use_aux_sensors = bool(aux_depth) or bool(aux_sem)
+    aux_depth_w = float(aux_depth_weight) if aux_depth else 0.0
+    aux_sem_w = float(aux_sem_weight) if aux_sem else 0.0
+    if use_aux_sensors and backbone not in ("", "scratch"):
+        raise SystemExit("sensor aux is wired into the scratch net only (--backbone scratch)")
+    if use_road_edge and backbone not in ("", "scratch"):
+        raise SystemExit("road_edge is wired into the scratch net only (--backbone scratch)")
     if use_ctl and backbone not in ("", "scratch"):
         raise SystemExit("ctl is wired into the scratch net only (--backbone scratch)")
     if ctl_cond and not use_ctl:
@@ -2118,7 +2180,13 @@ def train_directory(
         if "net" not in holder:
             if backbone in ("", "scratch"):
                 holder["net"] = SceneNet(
-                    cams=train_cams, scale=input_scale, cam_age=use_cam_age, ctl=use_ctl, cond_dim=ctl_cond_dim
+                    cams=train_cams,
+                    scale=input_scale,
+                    cam_age=use_cam_age,
+                    ctl=use_ctl,
+                    cond_dim=ctl_cond_dim,
+                    aux_sensors=use_aux_sensors,
+                    road_edge=use_road_edge,
                 ).to(device)
                 if grad_ckpt:
                     holder["net"].grad_ckpt = True
@@ -2521,7 +2589,7 @@ def train_directory(
                         pair_rows=val_rows,
                         parts=val_parts,
                         conf_weight=float(conf_weight),
-                        ctl_weight=float(ctl_weight),
+                        ctl_weight=float(ctl_weight), aux_depth_w=aux_depth_w, aux_sem_w=aux_sem_w, road_edge_weight=float(road_edge_weight),
                         ctl_loss=ctl_kind,
                         ctl_out=val_ctl if use_ctl else None,
                         worst=worst,
@@ -2580,7 +2648,7 @@ def train_directory(
                             heads=train_heads,
                             lane_loss=lane_kind,
                             conf_weight=float(conf_weight),
-                            ctl_weight=float(ctl_weight),
+                            ctl_weight=float(ctl_weight), aux_depth_w=aux_depth_w, aux_sem_w=aux_sem_w, road_edge_weight=float(road_edge_weight),
                             ctl_loss=ctl_kind,
                             scale=input_scale,
                             frames=prefetched_frames,
@@ -2605,7 +2673,7 @@ def train_directory(
                             heads=train_heads,
                             lane_loss=lane_kind,
                             conf_weight=float(conf_weight),
-                            ctl_weight=float(ctl_weight),
+                            ctl_weight=float(ctl_weight), aux_depth_w=aux_depth_w, aux_sem_w=aux_sem_w, road_edge_weight=float(road_edge_weight),
                             ctl_loss=ctl_kind,
                             frame_sets=group_frames,
                             scale=input_scale,
@@ -2888,7 +2956,7 @@ def train_directory(
                 heads=train_heads,
                 lane_loss=lane_kind,
                 conf_weight=float(conf_weight),
-                ctl_weight=float(ctl_weight),
+                ctl_weight=float(ctl_weight), aux_depth_w=aux_depth_w, aux_sem_w=aux_sem_w, road_edge_weight=float(road_edge_weight),
                 ctl_loss=ctl_kind,
                 scale=input_scale,
             )
@@ -3223,6 +3291,11 @@ def main(argv: list[str] | None = None) -> None:
                 exact_epochs=args.exact_epochs,
                 val_worst=int(args.val_worst),
                 val_worst_png=bool(args.val_worst_png),
+                aux_depth=bool(getattr(args, "aux_depth", False)),
+                aux_sem=bool(getattr(args, "aux_sem", False)),
+                aux_depth_weight=float(getattr(args, "aux_depth_weight", 0.1)),
+                aux_sem_weight=float(getattr(args, "aux_sem_weight", 0.1)),
+                road_edge_weight=float(getattr(args, "road_edge_weight", 1.0)),
             )
         except ExactEpochsMismatch as exc:
             print(f"[GVD] scene train: {exc}", flush=True)

@@ -320,6 +320,8 @@ Optional, off by default. Driving and inference stay vision-only (colour cameras
   - `raw/main_sem/NNNNNN.png`: uint8 semantic class id (0 = unknown); `sem_classes.json` maps id to the simulator's annotation class name and colour.
 - **Tagging and isolation:** these entries carry `"train_only": true` in `state.jsonl`. Raw-image listings, per-row camera lists and the frame cache's camera list exclude `*_depth` / `*_sem`, so the driving cameras and training strips are unchanged.
 - **Depth scale is an assumption:** distance is taken as raw depth (0..1) x the camera far plane. This is unverified until a short live smoke run spot-checks a known distance; treat depth values as provisional until then.
+- **Training aux (opt-in):** `--aux-depth` / `--aux-sem` add masked losses from those PNGs onto the main-camera stem features (fixed `12×16` grid). They are never ONNX inputs or default export outputs. Weights (`--aux-depth-weight`, `--aux-sem-weight`) are experimental.
+- **Road-edge (opt-in, separate from paint):** `--heads lane_gt,road_edge` trains a separately named `road_edge` vector (mapped-road left/right at the paint lookaheads). It does **not** fill painted `lane_gt` slots. Absent paint stays masked. Default ONNX stays RGB-only without `road_edge` outputs (training-only in this change). Dirt-road generalization is UNPROVEN.
 
 ## Renderer: Vulkan (`-gfx vk`)
 

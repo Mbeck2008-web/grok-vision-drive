@@ -355,8 +355,42 @@ def main(clock=None) -> None:
     ap.add_argument(
         "--scene-ckpt",
         default="",
-        help="Shadow-only: load a train_scene epoch .npz, run SceneNet on the main camera "
-        "(CPU), and draw lane_gt. Engage is blocked. The prediction never actuates.",
+        help="Load a train_scene epoch .npz and run SceneNet on the main camera (CPU). "
+        "Default is shadow: draw lane_gt, block engage, never actuate. "
+        "Pass --scene-ckpt-drive to let lane_x steer through the modular controller.",
+    )
+    ap.add_argument(
+        "--scene-ckpt-drive",
+        action="store_true",
+        help="Opt-in: feed --scene-ckpt lane_x into the modular lateral controller. "
+        "Heartbeat, AEB/CIPV, and the confidence veto stay live. Shadow remains the default. "
+        "Never feeds ctl-cond.",
+    )
+    ap.add_argument(
+        "--scene-ckpt-drive-speed",
+        type=float,
+        default=15.0,
+        help="Conservative speed cap in m/s while --scene-ckpt-drive is on (default 15).",
+    )
+    ap.add_argument(
+        "--live-long-side",
+        type=int,
+        default=0,
+        help="Override hardware.yaml live_input_long_side (pixels). 0 keeps the yaml value. "
+        "320-480 lowers camera resolution to raise loop Hz.",
+    )
+    ap.add_argument(
+        "--clip-pre-s",
+        type=float,
+        default=0.0,
+        help="Seconds of ring buffer kept before a clip trigger (0 = default 4). "
+        "Use ~90 to capture a continuous minute-plus drive.",
+    )
+    ap.add_argument(
+        "--clip-post-s",
+        type=float,
+        default=0.0,
+        help="Seconds after a clip trigger before flush (0 = default 2).",
     )
     ap.add_argument(
         "--no-engage",
@@ -379,7 +413,11 @@ def main(clock=None) -> None:
         help="Stop the supervisor loop after this many seconds (0 = run until stopped). For captures.",
     )
     args = ap.parse_args()
-    if str(getattr(args, "scene_ckpt", "") or "").strip():
+    scene_ckpt_path = str(getattr(args, "scene_ckpt", "") or "").strip()
+    if bool(getattr(args, "scene_ckpt_drive", False)) and not scene_ckpt_path:
+        print("[GVD] --scene-ckpt-drive requires --scene-ckpt <epoch.npz>", flush=True)
+        raise SystemExit(2)
+    if scene_ckpt_path and not bool(getattr(args, "scene_ckpt_drive", False)):
         args.no_engage = True
 
     from python.data.data_root import DataDriveError, ensure_cache_dirs
@@ -399,11 +437,20 @@ def main(clock=None) -> None:
         except (OSError, ValueError, KeyError) as exc:
             print(f"[GVD] scene-ckpt: {exc}", flush=True)
             raise SystemExit(2)
-        print(
-            f"[GVD] scene-ckpt shadow: {scene_ckpt.path} CPU; "
-            "engage blocked; prediction never actuates",
-            flush=True,
-        )
+        if bool(getattr(args, "scene_ckpt_drive", False)):
+            print(
+                f"[GVD] scene-ckpt DRIVE: {scene_ckpt.path} CPU; "
+                "lane_x steers via the modular controller; "
+                f"speed cap {float(args.scene_ckpt_drive_speed):.1f} m/s; "
+                "engage allowed; AEB/veto/heartbeat live",
+                flush=True,
+            )
+        else:
+            print(
+                f"[GVD] scene-ckpt shadow: {scene_ckpt.path} CPU; "
+                "engage blocked; prediction never actuates",
+                flush=True,
+            )
 
     if args.vision_only:
         os.environ["GVD_VISION_ONLY"] = "1"
@@ -508,7 +555,14 @@ def main(clock=None) -> None:
             )
             raise SystemExit(1)
 
-    backend = make_backend(backend_name if args.backend != "auto" else backend_name)
+    long_side = None
+    if int(getattr(args, "live_long_side", 0) or 0) > 0:
+        long_side = int(args.live_long_side)
+        if long_side < 160 or long_side > 1920:
+            print(f"[GVD] --live-long-side {long_side} is out of range (160-1920)", flush=True)
+            raise SystemExit(2)
+        print(f"[GVD] live_input_long_side={long_side} (--live-long-side)", flush=True)
+    backend = make_backend(backend_name if args.backend != "auto" else backend_name, long_side=long_side)
     backend.open()
     from python.sensors.tech import exit_if_tech_connect_failed
 
@@ -551,12 +605,21 @@ def main(clock=None) -> None:
         prefer = "cpu"
     else:
         prefer = "qsv"
+    rec_pre = float(getattr(args, "clip_pre_s", 0.0) or 0.0)
+    rec_post = float(getattr(args, "clip_post_s", 0.0) or 0.0)
     recorder = ClipRecorder(
         encode_prefer=prefer,
         allow_nvenc=allow_nvenc,
         hz=args.hz,
         dry_run=False,
+        **({"pre_s": rec_pre} if rec_pre > 0 else {}),
+        **({"post_s": rec_post} if rec_post > 0 else {}),
     )
+    if rec_pre > 0 or rec_post > 0:
+        print(
+            f"[GVD] clip ring pre_s={recorder.pre_s:.1f} post_s={recorder.post_s:.1f}",
+            flush=True,
+        )
 
     print(f"[GVD] camera backend={backend.name} detector={perc.detector.name} actuator={actuator.name}")
     ident0 = bus_identity() if clock is None else bus_identity(now=clock.wall())
@@ -1052,6 +1115,25 @@ def main(clock=None) -> None:
                     pout.path_conf = float(conf)
                     pout.lane_source = "scene"
                     pout.path_debug_preview = False
+            ckpt_pred = None
+            ckpt_stop = False
+            if scene_ckpt is not None:
+                from python.train.scene_ckpt_runtime import (
+                    SceneCkptInputError,
+                    apply_scene_ckpt_lane,
+                    cap_drive_speed,
+                )
+
+                try:
+                    ckpt_pred = scene_ckpt.observe(main, tick_dt)
+                except SceneCkptInputError as exc:
+                    print(f"[GVD] scene-ckpt input: {exc}", flush=True)
+                    ckpt_pred = None
+                if bool(getattr(args, "scene_ckpt_drive", False)):
+                    if apply_scene_ckpt_lane(pout, ckpt_pred, drive=True) == "stop":
+                        ckpt_stop = True
+                    else:
+                        cap_drive_speed(pout, float(args.scene_ckpt_drive_speed))
             cmd_seq += 1
             wide = None
             try:
@@ -1085,6 +1167,8 @@ def main(clock=None) -> None:
                 cmd = stop_command(seq=cmd_seq, reason=SCENE_SHAPE_HOLD)
             elif scene_stop:
                 cmd = stop_command(seq=cmd_seq, reason="scene_lane_low")
+            elif ckpt_stop:
+                cmd = stop_command(seq=cmd_seq, reason="scene_ckpt_low")
             elif gt_stop:
                 cmd = stop_command(seq=cmd_seq, reason="gt_lane_missing")
 
@@ -1433,26 +1517,23 @@ def main(clock=None) -> None:
             st["cmd_applied"] = bool(applied.applied)
             if scene_guard is not None:
                 st["scene_lane"] = scene_guard.status()
-            shadow_pred = None
             if scene_ckpt is not None:
                 from python.train.scene_ckpt_runtime import (
-                    SceneCkptInputError,
                     apply_scene_ckpt_to_command,
                     draw_scene_ckpt_overlay,
+                    scene_ckpt_as_state,
                 )
 
-                try:
-                    shadow_pred = scene_ckpt.observe(main, tick_dt)
-                except SceneCkptInputError as exc:
-                    print(f"[GVD] scene-ckpt shadow input: {exc}", flush=True)
-                    shadow_pred = None
-                applied = apply_scene_ckpt_to_command(applied, shadow_pred)
-                st["scene_ckpt"] = (
-                    shadow_pred.as_state()
-                    if shadow_pred is not None
-                    else {"shadow": True, "source": "scene_ckpt", "lane_x": None, "confidence": 0.0}
+                applied = apply_scene_ckpt_to_command(applied, ckpt_pred)
+                st["scene_ckpt"] = scene_ckpt_as_state(
+                    ckpt_pred,
+                    drive=bool(getattr(args, "scene_ckpt_drive", False)),
+                    engaged=bool(engaged),
+                    steer=float(applied.steer),
                 )
-                main = draw_scene_ckpt_overlay(main, shadow_pred)
+                main = draw_scene_ckpt_overlay(
+                    main, ckpt_pred, drive=bool(getattr(args, "scene_ckpt_drive", False))
+                )
             st["lane_hold"] = {
                 "lateral_m": None if lane_x is None else float(lane_x),
                 "lookahead_y_m": None if lane_y is None else float(lane_y),

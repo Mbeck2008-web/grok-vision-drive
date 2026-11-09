@@ -1,8 +1,11 @@
-"""Load a train_scene epoch checkpoint and run it live as shadow-only.
+"""Load a train_scene epoch checkpoint and run it live.
 
-``python.run_vision --scene-ckpt`` is the only caller. The prediction is for
-the overlay and ``gvd_state.json``; it must not reach the wheel or pedals.
-Inference is CPU so BeamNG keeps the GPU.
+``python.run_vision --scene-ckpt`` is the only caller. Shadow (the default)
+draws the overlay and writes state; the prediction must not reach the wheel
+or pedals. ``--scene-ckpt-drive`` is an explicit opt-in: ``lane_x`` is fed
+to the existing modular lateral controller. It never writes ctl-cond, never
+bypasses heartbeat / AEB / the confidence veto, and inference stays on CPU
+so BeamNG keeps the GPU.
 """
 from __future__ import annotations
 
@@ -37,13 +40,21 @@ def overlay_bgr(kind: str) -> tuple[int, int, int]:
     raise KeyError(kind)
 
 
-def shadow_engage_allowed() -> bool:
-    """Engage is never allowed while a scene-ckpt shadow runtime is the point of the run."""
-    return False
+DRIVE_SPEED_MPS = 15.0
+
+
+def shadow_engage_allowed(*, drive: bool = False) -> bool:
+    """Engage is blocked in shadow. ``--scene-ckpt-drive`` is the only opt-in."""
+    return bool(drive)
 
 
 def apply_scene_ckpt_to_command(cmd: Any, _pred: Any) -> Any:
-    """Return ``cmd`` unchanged. A scene-ckpt prediction never edits actuation."""
+    """Return ``cmd`` unchanged.
+
+    Drive mode does not rewrite pedals here. ``lane_x`` is injected into the
+    modular path before ``shadow_tick``, so AEB, the veto, and the speed
+    controller still have the last word.
+    """
     if cmd is None:
         return cmd
     try:
@@ -52,11 +63,80 @@ def apply_scene_ckpt_to_command(cmd: Any, _pred: Any) -> Any:
         return cmd
 
 
+def apply_scene_ckpt_lane(pout: Any, pred: Any, *, drive: bool, min_conf: float = 0.40) -> str:
+    """Optionally replace ``pout``'s lane with the checkpoint prediction.
+
+    Returns ``shadow`` when drive is off (``pout`` unchanged), ``lane`` when
+    the prediction is usable, or ``stop`` when it is missing or low-confidence.
+    """
+    if not drive:
+        return "shadow"
+    from python.train.scene_lane_runtime import scene_lane_decision, straight_lane_path
+
+    lane_x = None if pred is None else getattr(pred, "lane_x", None)
+    try:
+        conf = 0.0 if pred is None else float(getattr(pred, "confidence", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        conf = 0.0
+    if scene_lane_decision(lane_x, conf, min_conf=min_conf) != "lane":
+        pout.path_ego = []
+        pout.lane_conf = float(conf)
+        try:
+            pout.path_conf = min(float(getattr(pout, "path_conf", 0.0) or 0.0), float(conf))
+        except (TypeError, ValueError):
+            pout.path_conf = float(conf)
+        pout.lane_source = "scene_ckpt/stop"
+        pout.path_debug_preview = False
+        return "stop"
+    pout.path_ego = straight_lane_path(float(lane_x))
+    pout.lane_conf = float(conf)
+    pout.path_conf = float(conf)
+    pout.lane_source = "scene_ckpt"
+    pout.path_debug_preview = False
+    return "lane"
+
+
+def cap_drive_speed(pout: Any, speed_mps: float) -> None:
+    """Conservative longitudinal cap. Does not raise an existing slower target."""
+    cap = float(speed_mps)
+    pl = dict(getattr(pout, "planner", None) or {})
+    raw = pl.get("target_v")
+    if raw is None:
+        pl["target_v"] = cap
+    else:
+        try:
+            pl["target_v"] = min(float(raw), cap)
+        except (TypeError, ValueError):
+            pl["target_v"] = cap
+    pout.planner = pl
+
+
+def scene_ckpt_as_state(
+    pred: Any,
+    *,
+    drive: bool,
+    engaged: bool,
+    steer: float | None,
+) -> dict[str, Any]:
+    """Fields written to ``gvd_state.json`` and clip ``state.jsonl``."""
+    if pred is not None and hasattr(pred, "as_state"):
+        out = dict(pred.as_state())
+    else:
+        out = {"lane_x": None, "confidence": 0.0, "canvas": None}
+    out["source"] = "scene_ckpt"
+    out["shadow"] = not bool(drive)
+    out["drive"] = bool(drive)
+    out["engaged"] = bool(engaged)
+    out["steer"] = None if steer is None else float(steer)
+    return out
+
+
 @dataclass
 class SceneCkptPred:
     lane_gt: np.ndarray | None = None
     lane_x: float | None = None
     confidence: float = 0.0
+    heading_err_rad: float | None = None
     canvas_shape: tuple[int, ...] | None = None
 
     @classmethod
@@ -64,16 +144,24 @@ class SceneCkptPred:
         return cls()
 
     def as_state(self) -> dict[str, Any]:
-        return {
+        out = {
             "shadow": True,
             "source": "scene_ckpt",
             "lane_x": None if self.lane_x is None else float(self.lane_x),
             "confidence": float(self.confidence),
             "canvas": list(self.canvas_shape) if self.canvas_shape else None,
         }
+        if self.heading_err_rad is not None:
+            out["heading_err_rad"] = float(self.heading_err_rad)
+        return out
 
 
-def draw_scene_ckpt_overlay(frame: np.ndarray | None, pred: SceneCkptPred | None) -> np.ndarray | None:
+def draw_scene_ckpt_overlay(
+    frame: np.ndarray | None,
+    pred: SceneCkptPred | None,
+    *,
+    drive: bool = False,
+) -> np.ndarray | None:
     """Paint the predicted lane-center path on a camera frame. Does not modify ``frame``.
 
     No picture: return ``frame`` unchanged (including None). Callers can always
@@ -88,9 +176,10 @@ def draw_scene_ckpt_overlay(frame: np.ndarray | None, pred: SceneCkptPred | None
         return out
     color = overlay_bgr("shadow")
     h, w = int(out.shape[0]), int(out.shape[1])
-    caption = "SHADOW"
+    kind = "DRIVE" if drive else "SHADOW"
+    caption = kind
     if pred is not None and pred.lane_x is not None:
-        caption = f"SHADOW lane_x={float(pred.lane_x):+.2f}m conf={float(pred.confidence):.2f}"
+        caption = f"{kind} lane_x={float(pred.lane_x):+.2f}m conf={float(pred.confidence):.2f}"
     cv2.putText(out, caption, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
     # Solid swatch so tests (and a clip) can see the mark without anti-alias blending.
     cv2.rectangle(out, (12, 36), (40, 56), color, -1)
@@ -194,10 +283,16 @@ class SceneCkptRuntime:
         if raw is None:
             return SceneCkptPred(canvas_shape=tuple(int(x) for x in canvas.shape))
         vec = raw.detach().float().cpu().numpy().reshape(-1).astype(np.float32)
+        heading = None
+        if vec.size >= 2:
+            raw_h = float(vec[-2])
+            if raw_h == raw_h:
+                heading = raw_h
         return SceneCkptPred(
             lane_gt=vec,
             lane_x=lane_x_from_vector(vec),
             confidence=confidence_from_vector(vec),
+            heading_err_rad=heading,
             canvas_shape=tuple(int(x) for x in canvas.shape),
         )
 

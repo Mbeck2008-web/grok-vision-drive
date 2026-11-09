@@ -1,9 +1,11 @@
 """Load one training canvas. The scene net steps frames in order.
 
-Windows starts extra processes with spawn. A spawned worker re-imports the
-trainer while the parent already owns the CUDA context and the OpenCV
-window, and that combination stalls. The default worker count stays 0 on
-every OS for that reason, and on Windows in particular.
+Windows starts extra processes with spawn. A spawned worker that re-imports
+the trainer while the parent already owns the CUDA context and the OpenCV
+window can stall. ``default_num_workers`` therefore returns 4 on Windows
+(so PNG decode is not on the GPU thread) and 0 elsewhere. ``--workers``
+overrides it. Combined with ``--no-panel``, the spawn stall is avoided; if
+a run hangs at the first batch, pass ``--workers 0``.
 """
 
 from __future__ import annotations

@@ -49,19 +49,47 @@ class FitPlan:
     reason: str
 
 
-def canvas_bytes() -> int:
-    return int(CANVAS_H) * int(CANVAS_W) * 3
+def canvas_bytes(height: int | None = None, width: int | None = None) -> int:
+    """RGB bytes of one canvas. Defaults are the full 192x2272 strip."""
+    h = int(CANVAS_H if height is None else height)
+    w = int(CANVAS_W if width is None else width)
+    return h * w * 3
 
 
-def bytes_per_strip(file_bytes: int, n_strips: int) -> int:
-    measured = max(0, int(file_bytes)) // max(1, int(n_strips))
-    return max(measured, canvas_bytes()) * STRIP_LIVE_COPIES
+def bytes_per_strip(
+    file_bytes: int,
+    n_strips: int,
+    *,
+    canvas_h: int | None = None,
+    canvas_w: int | None = None,
+) -> int:
+    """Working-set estimate for one strip.
+
+    When ``canvas_h`` / ``canvas_w`` are set, the estimate is the trained
+    canvas (the cameras actually fed to the net), not the recording's PNG
+    byte size or the full 2272-wide stitch.
+    """
+    live = canvas_bytes(canvas_h, canvas_w)
+    if canvas_h is None and canvas_w is None:
+        measured = max(0, int(file_bytes)) // max(1, int(n_strips))
+        return max(measured, live) * STRIP_LIVE_COPIES
+    return live * STRIP_LIVE_COPIES
 
 
-def step_bytes(batch: int, *, file_bytes: int, n_strips: int, window_strips: int) -> int:
+def step_bytes(
+    batch: int,
+    *,
+    file_bytes: int,
+    n_strips: int,
+    window_strips: int,
+    canvas_h: int | None = None,
+    canvas_w: int | None = None,
+) -> int:
     """Bytes one optimizer step is predicted to hold."""
     strips = max(1, int(batch)) * max(1, int(window_strips))
-    return MODEL_OVERHEAD_BYTES + strips * bytes_per_strip(file_bytes, n_strips)
+    return MODEL_OVERHEAD_BYTES + strips * bytes_per_strip(
+        file_bytes, n_strips, canvas_h=canvas_h, canvas_w=canvas_w
+    )
 
 
 def usable_bytes(free_bytes: int) -> int:
@@ -75,12 +103,16 @@ def largest_batch(
     n_strips: int,
     window_strips: int,
     limit: int,
+    canvas_h: int | None = None,
+    canvas_w: int | None = None,
 ) -> int:
     """Largest batch at least 1 whose step fits in ``budget``, or 0."""
     limit = max(0, int(limit))
     if limit < 1 or int(budget) <= 0:
         return 0
-    per = max(1, int(window_strips)) * bytes_per_strip(file_bytes, n_strips)
+    per = max(1, int(window_strips)) * bytes_per_strip(
+        file_bytes, n_strips, canvas_h=canvas_h, canvas_w=canvas_w
+    )
     if MODEL_OVERHEAD_BYTES + per > int(budget):
         return 0
     room = (int(budget) - MODEL_OVERHEAD_BYTES) // per
@@ -103,6 +135,8 @@ def plan_fit(
     free_ram_bytes: int,
     n_windows: int,
     window_strips: int,
+    canvas_h: int | None = None,
+    canvas_w: int | None = None,
 ) -> FitPlan:
     """Choose device and batch from the driving file and free memory.
 
@@ -127,13 +161,22 @@ def plan_fit(
             n_strips=common["n_strips"],
             window_strips=strips,
             limit=limit,
+            canvas_h=canvas_h,
+            canvas_w=canvas_w,
         )
     if gpu_batch >= 1:
         return FitPlan(
             device="cuda",
             batch=gpu_batch,
             recommended=True,
-            step_bytes=step_bytes(gpu_batch, file_bytes=common["file_bytes"], n_strips=common["n_strips"], window_strips=strips),
+            step_bytes=step_bytes(
+                gpu_batch,
+                file_bytes=common["file_bytes"],
+                n_strips=common["n_strips"],
+                window_strips=strips,
+                canvas_h=canvas_h,
+                canvas_w=canvas_w,
+            ),
             reason="gpu",
             **common,
         )
@@ -144,13 +187,22 @@ def plan_fit(
             n_strips=common["n_strips"],
             window_strips=strips,
             limit=limit,
+            canvas_h=canvas_h,
+            canvas_w=canvas_w,
         )
         if cpu_batch >= 1:
             return FitPlan(
                 device="cpu",
                 batch=cpu_batch,
                 recommended=False,
-                step_bytes=step_bytes(cpu_batch, file_bytes=common["file_bytes"], n_strips=common["n_strips"], window_strips=strips),
+                step_bytes=step_bytes(
+                    cpu_batch,
+                    file_bytes=common["file_bytes"],
+                    n_strips=common["n_strips"],
+                    window_strips=strips,
+                    canvas_h=canvas_h,
+                    canvas_w=canvas_w,
+                ),
                 reason="cpu-not-recommended",
                 **common,
             )

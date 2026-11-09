@@ -24,7 +24,6 @@ from python.control.actuate import (  # noqa: E402
     steer_sample_point,
 )
 from python.planning.path_predictor import (  # noqa: E402
-    LANE_W_DEFAULT,
     LaneTrack,
     follow_lane_center,
     lane_point_plausible,
@@ -140,30 +139,44 @@ def check_log_flips_and_tracker_does_not(played: list[dict]) -> None:
 
 
 def check_one_line_is_half_a_lane_and_does_not_flip() -> None:
+    """One boundary is not a lane: do not invent a 3.5 m twin (PR #186)."""
     def line(x: float) -> list[dict[str, float]]:
         return [{"x": x, "y": float(y)} for y in range(2, 18, 2)]
 
     alone = predict_path(lanes_bev=[line(1.2)], lane_conf=0.8, ego_speed_mps=5.0)
-    sample = steer_sample_point(alone.path_ego)
-    assert sample is not None
-    expect = 1.2 - LANE_W_DEFAULT * 0.5
-    assert abs(sample["x"] - expect) < 0.05, sample
-    assert alone.lane_source == "one_right", alone.lane_source
-    # The line itself is not the target.
-    assert abs(sample["x"] - 1.2) > 1.0
+    sample = steer_sample_point(alone.path_ego or [])
+    assert sample is None, sample
+    assert alone.drivable is False, alone
+    assert alone.lane_source == "none", alone.lane_source
+    assert "one_" not in alone.lane_source
 
+    # Seed straight at x=0 before the first painted pair — not an invented parallel.
+    seeded_track = LaneTrack()
+    seeded_track.awaiting_pair = True
+    seeded = predict_path(
+        lanes_bev=[line(1.2)], lane_conf=0.8, ego_speed_mps=5.0, lane_track=seeded_track,
+    )
+    seed_pt = steer_sample_point(seeded.path_ego or [])
+    assert seeded.lane_source == "seed", seeded.lane_source
+    assert seed_pt is not None and abs(float(seed_pt["x"])) < 0.05, seed_pt
+
+    # A real straddling pair still centers; flipping one-sided noise does not steer.
     track = LaneTrack()
+    pair = predict_path(
+        lanes_bev=[line(-1.75), line(1.75)], lane_conf=0.8, ego_speed_mps=5.0, lane_track=track,
+    )
+    paired = steer_sample_point(pair.path_ego or [])
+    assert pair.drivable and paired is not None and abs(float(paired["x"])) < 0.4, (pair.lane_source, paired)
     first = predict_path(
         lanes_bev=[line(0.15)], lane_conf=0.8, ego_speed_mps=5.0, lane_track=track,
     )
     second = predict_path(
         lanes_bev=[line(-0.15)], lane_conf=0.8, ego_speed_mps=5.0, lane_track=track,
     )
-    a = steer_sample_point(first.path_ego)
-    b = steer_sample_point(second.path_ego)
-    assert a is not None and b is not None
-    assert abs(b["x"] - a["x"]) < 2.0, (a, b, first.lane_source, second.lane_source)
-    assert a["x"] * b["x"] > 0.0, (a, b)
+    # One-sided after a pair: no invented twin, no sign flip into a steered path.
+    assert first.drivable is False and second.drivable is False, (first, second)
+    assert steer_sample_point(first.path_ego or []) is None
+    assert steer_sample_point(second.path_ego or []) is None
 
 
 def check_outlier_never_enters_the_fit() -> None:

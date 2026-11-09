@@ -79,7 +79,8 @@ def _replay(folder: Path) -> tuple[float, float, float, int]:
         if sample is None:
             continue
         pairs.append((float(sample["x"]), float(row["gt_center_x"])))
-    assert len(pairs) >= 3, (folder.name, len(pairs))
+    # gt_run5 often has only a couple of real pairs once inventing is gone.
+    assert len(pairs) >= 1, (folder.name, len(pairs))
     xs = [a for a, _b in pairs]
     ys = [b for _a, b in pairs]
     bias = sum(a - b for a, b in pairs) / len(pairs)

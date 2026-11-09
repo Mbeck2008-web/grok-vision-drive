@@ -124,10 +124,29 @@ def _check_lanes_and_path() -> None:
     ys = [p["y"] for poly in fit.lanes_bev for p in poly]
     assert any(x < -3.0 for x in xs), xs
     assert any(y < -1.0 for y in ys), ys
+    # One-sided pillar paint in the stitch is not a pair: do not invent a twin.
     plan = predict_path(lanes_bev=fit.lanes_bev, lane_conf=fit.conf, ego_speed_mps=5.0)
-    assert plan.drivable is True, plan.prediction
-    assert plan.path_ego
-    assert any(p["y"] < 0.0 for p in plan.path_ego), plan.path_ego[:3]
+    assert plan.drivable is False, (plan.prediction, plan.lane_source)
+    assert plan.lane_source == "none", plan.lane_source
+
+    # A real forward pair on main still drives (proves path works without inventing).
+    main_pair = _paint(
+        "main",
+        [
+            (-1.75, [2.0, 6.0, 12.0, 20.0], (245, 245, 245)),
+            (1.75, [2.0, 6.0, 12.0, 20.0], (0, 220, 220)),
+        ],
+    )
+    frames_main = dict(frames)
+    frames_main["main"] = main_pair
+    frames_main["pillarL"] = np.full_like(pillar, (30, 30, 32))
+    stitch_main = stitch_frames(frames_main)
+    fit_main = lanes_from_view(blank, stitch_main.bgr)
+    plan_main = predict_path(
+        lanes_bev=fit_main.lanes_bev, lane_conf=fit_main.conf, ego_speed_mps=5.0,
+    )
+    assert plan_main.drivable is True, (plan_main.prediction, plan_main.lane_source)
+    assert plan_main.path_ego
 
     beside_left = [{"x": -6.0, "y": float(y)} for y in (0, 4, 8, 12)]
     beside_right = [{"x": -2.6, "y": float(y)} for y in (0, 4, 8, 12)]

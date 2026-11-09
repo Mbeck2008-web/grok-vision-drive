@@ -713,6 +713,7 @@ def labels_for_row(
     aux_sem: bool = False,
     road_edge: bool = False,
     aux_cache: Any = None,
+    detect: bool = False,
 ) -> dict[str, np.ndarray]:
     """Scene labels plus the ground-truth lane vector when the row has one.
 
@@ -744,6 +745,11 @@ def labels_for_row(
         re_v, re_m = road_edge_from_record(record)
         labels["road_edge"] = re_v
         labels["road_edge_valid"] = re_m
+    # edge / obj / brakelight labels. Training only. Never copied into lane_gt.
+    if detect:
+        from python.train.detect_targets import training_arrays
+
+        labels.update(training_arrays(row, root=root))
     if root is not None and (aux_depth or aux_sem) and row.get("i") is not None:
         labels = attach_aux_to_labels(
             labels,
@@ -977,6 +983,14 @@ class ScenePrediction:
     aux_depth: Any = None
     aux_sem_logits: Any = None
     road_edge: Any = None
+    # Opt-in detect heads. Absent unless --heads names them.
+    edge: Any = None
+    edge_conf: Any = None
+    obj_box: Any = None
+    obj_conf: Any = None
+    obj_class: Any = None
+    brake: Any = None
+    brake_conf: Any = None
 
     def as_dict(self) -> dict[str, Any]:
         return {name: getattr(self, name) for name in OUTPUT_FIELDS}
@@ -1289,7 +1303,7 @@ def _scene_loss_body(
         ctl_term = zero.clone()
     # A lane-only run (with or without ctl) must not backprop the other heads.
     # Those zeros are fresh tensors, not a slice of the polyline or the match loss.
-    if wanted - {"ctl", "road_edge"} == frozenset({"lane_gt"}):
+    if wanted - {"ctl", "road_edge", "edge", "obj", "brakelight"} == frozenset({"lane_gt"}):
         points = zero.detach().clone()
         classes = zero.detach().clone()
         lamps = zero.detach().clone()
@@ -1365,6 +1379,18 @@ def _scene_loss_body(
             )
             aux_sem_term = ce
         total = total + float(aux_sem_weight) * aux_sem_term
+    detect_extra: dict[str, Any] = {}
+    if any(name in wanted for name in ("edge", "obj", "brakelight")):
+        from python.train.detect_heads import detect_terms
+
+        terms = detect_terms(pred, target, device, dtype)
+        for name in ("edge", "obj", "brakelight"):
+            if name not in wanted:
+                continue
+            total = total + terms[name]
+            detect_extra[name] = terms[name]
+            detect_extra[name + "_geom"] = terms[name + "_geom"]
+            detect_extra[name + "_n"] = terms[name + "_n"]
     out = {
         "points": points,
         "class": classes,
@@ -1381,6 +1407,7 @@ def _scene_loss_body(
         "lane_reg": lane_reg,
         "conf_bce": conf_bce,
     }
+    out.update(detect_extra)
     if set(LOSS_TERMS) - set(out):
         raise RuntimeError("scene loss is missing a term")
     return out
@@ -1518,6 +1545,9 @@ if torch is not None:
             cond_dim: int = 0,
             aux_sensors: bool = False,
             road_edge: bool = False,
+            edge: bool = False,
+            detect_obj: bool = False,
+            brakelight: bool = False,
         ) -> None:
             super().__init__()
             from python.data.cam_hold import CAM_AGE_N
@@ -1577,6 +1607,27 @@ if torch is not None:
                 self.road_edge_head = nn.Linear(hidden, int(ROAD_EDGE_DIM))
                 arch = getattr(self, "pause_arch", checkpoint_arch(self.cams))
                 self.pause_arch = arch + f":road_edge={int(ROAD_EDGE_DIM)}"
+            # Detect heads are opt-in. Leaving them off adds no parameters.
+            self.edge = bool(edge)
+            self.detect_obj = bool(detect_obj)
+            self.brakelight = bool(brakelight)
+            if self.edge or self.detect_obj or self.brakelight:
+                from python.train.detect_heads import DetectHeads
+
+                self.detect = DetectHeads(
+                    edge=self.edge,
+                    obj=self.detect_obj,
+                    brakelight=self.brakelight,
+                    hidden=hidden,
+                )
+                arch = getattr(self, "pause_arch", checkpoint_arch(self.cams))
+                if self.edge:
+                    arch += ":edge=1"
+                if self.detect_obj:
+                    arch += ":obj=1"
+                if self.brakelight:
+                    arch += ":brake=1"
+                self.pause_arch = arch
 
         def initial_state(self, device: Any = None, dtype: Any = None, batch: int = 1) -> SceneState:
             device = device or torch.device("cpu")
@@ -1790,7 +1841,7 @@ if torch is not None:
 
     def _heads_batch(net: SceneNet, feat: Any, cond: Any = None) -> ScenePrediction:
         width = int(feat.shape[0])
-        return ScenePrediction(
+        pred = ScenePrediction(
             lanes=net.lane_head(feat).view(width, N_LANES, LANE_POINTS, 2),
             lane_valid=torch.sigmoid(net.lane_valid_head(feat)).view(width, N_LANES),
             curbs=net.curb_head(feat).view(width, N_CURBS, LANE_POINTS, 2),
@@ -1806,6 +1857,11 @@ if torch is not None:
             road_edge=_road_edge_output(net, feat),
             **_ctl_outputs(net, feat, cond),
         )
+        module = getattr(net, "detect", None)
+        if module is not None:
+            for key, value in module(feat).items():
+                setattr(pred, key, value)
+        return pred
 
     def _ctl_outputs(net: SceneNet, feat: Any, cond: Any = None) -> dict[str, Any]:
         """tanh steer, sigmoid throttle and brake, each ``(B, K)``. Empty for a net without the head.
@@ -1826,7 +1882,7 @@ if torch is not None:
 
     def _prediction_at(pred: ScenePrediction, index: int) -> ScenePrediction:
         extra = {name: getattr(pred, name)[index] for name in CTL_OUTPUT_FIELDS if getattr(pred, name) is not None}
-        for name in ("aux_depth", "aux_sem_logits", "road_edge"):
+        for name in ("aux_depth", "aux_sem_logits", "road_edge", "edge", "edge_conf", "obj_box", "obj_conf", "obj_class", "brake", "brake_conf"):
             value = getattr(pred, name, None)
             if value is not None:
                 extra[name] = value[index]

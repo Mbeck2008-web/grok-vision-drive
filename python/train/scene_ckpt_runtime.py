@@ -62,6 +62,8 @@ class SceneCkptPred:
     lane_x: float | None = None
     confidence: float = 0.0
     canvas_shape: tuple[int, ...] | None = None
+    ckpt: str = ""
+    detect: dict[str, Any] | None = None
 
     @classmethod
     def empty(cls) -> "SceneCkptPred":
@@ -69,7 +71,7 @@ class SceneCkptPred:
 
     def as_state(self) -> dict[str, Any]:
         centers = scene_ckpt_centers(self.lane_gt)
-        return {
+        body: dict[str, Any] = {
             "shadow": True,
             "source": "scene_ckpt",
             "lane_x": None if self.lane_x is None else float(self.lane_x),
@@ -78,6 +80,13 @@ class SceneCkptPred:
             "caption": scene_ckpt_caption(self.confidence),
             "canvas": list(self.canvas_shape) if self.canvas_shape else None,
         }
+        if self.ckpt:
+            from python.train.viz_contract import package_lane
+
+            body["lane"] = package_lane(ckpt=self.ckpt, lane_x=self.lane_x, confidence=self.confidence)
+            if self.detect:
+                body["detect"] = self.detect
+        return body
 
 
 def draw_scene_ckpt_overlay(frame: np.ndarray | None, pred: SceneCkptPred | None) -> np.ndarray | None:
@@ -214,15 +223,46 @@ class SceneCkptRuntime:
         with torch.inference_mode():
             pred, self.state = self.net.forward(canvas, 0.0 if dt_s is None else float(dt_s), self.state)
         raw = getattr(pred, "lane_gt", None)
+        detect = _detect_package(self.path.name, pred)
+        shape = tuple(int(x) for x in canvas.shape)
         if raw is None:
-            return SceneCkptPred(canvas_shape=tuple(int(x) for x in canvas.shape))
+            return SceneCkptPred(canvas_shape=shape, ckpt=self.path.name, detect=detect)
         vec = raw.detach().float().cpu().numpy().reshape(-1).astype(np.float32)
         return SceneCkptPred(
             lane_gt=vec,
             lane_x=lane_x_from_vector(vec),
             confidence=confidence_from_vector(vec),
-            canvas_shape=tuple(int(x) for x in canvas.shape),
+            canvas_shape=shape,
+            ckpt=self.path.name,
+            detect=detect,
         )
+
+
+def _numpy_head(value: Any) -> np.ndarray | None:
+    if value is None:
+        return None
+    detach = getattr(value, "detach", None)
+    if detach is None:
+        return None
+    return detach().float().cpu().numpy()
+
+
+def _detect_package(ckpt: str, pred: Any) -> dict[str, Any] | None:
+    """Model-head package. Missing heads stay omitted. Never reads ground truth."""
+    if getattr(pred, "edge", None) is None and getattr(pred, "obj_box", None) is None and getattr(pred, "brake", None) is None:
+        return None
+    from python.train.viz_contract import package_detect
+
+    return package_detect(
+        ckpt=ckpt,
+        edge=_numpy_head(getattr(pred, "edge", None)),
+        edge_conf=_numpy_head(getattr(pred, "edge_conf", None)),
+        obj_box=_numpy_head(getattr(pred, "obj_box", None)),
+        obj_conf=_numpy_head(getattr(pred, "obj_conf", None)),
+        obj_class=_numpy_head(getattr(pred, "obj_class", None)),
+        brake=_numpy_head(getattr(pred, "brake", None)),
+        brake_conf=_numpy_head(getattr(pred, "brake_conf", None)),
+    )
 
 
 def _require_main(frame: Any) -> np.ndarray | None:

@@ -1298,6 +1298,7 @@ def _row_labels(
         aux_sem=bool(aux_sem_w),
         road_edge=("road_edge" in (heads or ())),
         aux_cache=aux_cache,
+        detect=any(name in (heads or ()) for name in ("edge", "obj", "brakelight")),
     )
 
 
@@ -1869,6 +1870,11 @@ def _eval_sequence(
                     parts_lane = step["lane_reg"] if parts_lane is None else parts_lane + step["lane_reg"]
                     parts_conf = step["conf_bce"] if parts_conf is None else parts_conf + step["conf_bce"]
                     parts["n"] = int(parts.get("n", 0)) + 1
+                    for key in ("edge", "obj", "brakelight"):
+                        if key not in step:
+                            continue
+                        parts[key + "_geom"] = float(parts.get(key + "_geom", 0.0)) + float(step[key + "_geom"].detach().item())
+                        parts[key + "_labeled"] = float(parts.get(key + "_labeled", 0.0)) + float(step[key + "_n"].detach().item())
                 if worst is not None:
                     lane = getattr(one, "lane_gt", None)
                     worst.note(
@@ -2284,6 +2290,10 @@ def train_directory(
     use_cam_age = bool(cam_age)
     use_ctl = bool(train_heads) and "ctl" in train_heads
     use_road_edge = bool(train_heads) and "road_edge" in train_heads
+    use_edge = bool(train_heads) and "edge" in train_heads
+    use_obj = bool(train_heads) and "obj" in train_heads
+    use_brake = bool(train_heads) and "brakelight" in train_heads
+    use_detect = use_edge or use_obj or use_brake
     use_aux_sensors = bool(aux_depth) or bool(aux_sem)
     aux_depth_w = float(aux_depth_weight) if aux_depth else 0.0
     aux_sem_w = float(aux_sem_weight) if aux_sem else 0.0
@@ -2291,6 +2301,14 @@ def train_directory(
         raise SystemExit("sensor aux is wired into the scratch net only (--backbone scratch)")
     if use_road_edge and backbone not in ("", "scratch"):
         raise SystemExit("road_edge is wired into the scratch net only (--backbone scratch)")
+    if use_detect and backbone not in ("", "scratch"):
+        raise SystemExit("edge, obj, and brakelight are wired into the scratch net only (--backbone scratch)")
+    if use_detect:
+        print(
+            "[GVD] detect heads: edge/obj/brakelight. Labels are BeamNG GT for training only. "
+            "Missing labels stay masked. The live viz draws these only from this checkpoint.",
+            flush=True,
+        )
     if use_ctl and backbone not in ("", "scratch"):
         raise SystemExit("ctl is wired into the scratch net only (--backbone scratch)")
     if ctl_cond and not use_ctl:
@@ -2594,6 +2612,9 @@ def train_directory(
                     cond_dim=ctl_cond_dim,
                     aux_sensors=use_aux_sensors,
                     road_edge=use_road_edge,
+                    edge=use_edge,
+                    detect_obj=use_obj,
+                    brakelight=use_brake,
                 ).to(device)
                 if grad_ckpt:
                     holder["net"].grad_ckpt = True
@@ -2854,6 +2875,9 @@ def train_directory(
             **({"ctl_cond_dim": int(ctl_cond_dim)} if ctl_cond_dim else {}),
             **({"ctl_loss": ctl_kind} if ctl_kind != "huber" else {}),
             "heads": list(train_heads or ()),
+            **({"edge": True} if use_edge else {}),
+            **({"obj": True} if use_obj else {}),
+            **({"brakelight": True} if use_brake else {}),
             "scale": float(input_scale),
             "backbone": str(backbone),
             "freeze_backbone": bool(freeze_backbone),
@@ -3341,6 +3365,25 @@ def train_directory(
                     ctl_scored = score_ctl(val_ctl, ctl_b1, lock_deg=ctl_lock, bar=ctl_bar)
                     record["ctl"] = ctl_record(ctl_scored)
                     ctl_lines = val_lines(ctl_scored)
+                detect_lines: list[str] = []
+                detect_record: dict[str, Any] = {}
+                for key, title in (("edge", "edge"), ("obj", "obj"), ("brakelight", "brake")):
+                    labeled = float(val_parts.get(key + "_labeled", 0.0) or 0.0)
+                    if key + "_geom" not in val_parts and labeled <= 0.0:
+                        continue
+                    if key + "_geom" not in val_parts:
+                        continue
+                    if labeled <= 0.0:
+                        detect_record[title] = {"mae": None, "labeled": 0}
+                        detect_lines.append(f"[GVD] val detect {title}=masked labeled=0 (holdout, not the lane stop)")
+                        continue
+                    mae = float(val_parts[key + "_geom"]) / labeled
+                    detect_record[title] = {"mae": mae, "labeled": labeled}
+                    detect_lines.append(
+                        f"[GVD] val detect {title}_mae={mae:.4f} labeled={labeled:.0f} (holdout, not the lane stop)"
+                    )
+                if detect_record:
+                    record["detect"] = detect_record
                 ckpt_info = _write_epoch_ckpt(scored)
                 record["ckpt"] = None if ckpt_info is None else Path(ckpt_info["path"]).name
                 record["ckpt_sha256"] = None if ckpt_info is None else ckpt_info["sha256"]
@@ -3362,7 +3405,7 @@ def train_directory(
                     f"blank_main_skipped={int(BLANK_MAIN_SKIPS)}",
                     flush=True,
                 )
-                for line in cell_lines + ctl_lines:
+                for line in cell_lines + ctl_lines + detect_lines:
                     print(line, flush=True)
                 if scored.get("collapse"):
                     print(

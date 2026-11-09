@@ -131,16 +131,24 @@ class E2EPolicy:
         try:
             import onnxruntime as ort  # type: ignore
 
+            from python.perception.detect import (
+                load_max_inference_vram_gb,
+                onnx_providers,
+                weight_file_exceeds_vram_cap,
+            )
+
+            cap = load_max_inference_vram_gb()
+            if weight_file_exceeds_vram_cap(self.model_path, cap_gb=cap):
+                raise RuntimeError(
+                    f"{self.model_path} is larger than max_inference_vram_gb={cap}"
+                )
             opts = ort.SessionOptions()
             opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
             # Prefer CUDA when available; never default TensorRT.
-            want = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            avail = set(ort.get_available_providers())
-            providers = [p for p in want if p in avail] or ["CPUExecutionProvider"]
             self._session = ort.InferenceSession(
                 str(self.model_path),
                 sess_options=opts,
-                providers=providers,
+                providers=onnx_providers(cap_gb=cap),
             )
             self.backend = "onnx"
         except Exception:

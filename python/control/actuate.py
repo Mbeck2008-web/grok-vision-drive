@@ -43,6 +43,10 @@ TECH_SHIFT_MODE = "arcade"
 # Player arrows/pedals expect arcade. Restored only on the Disengage handoff.
 TECH_PLAYER_SHIFT_MODE = "arcade"
 TECH_HOLD_BRAKE = 0.99
+# Below this ego speed a no-throttle service pedal is arcade reverse
+# (run 8). Partials coast instead of sending that pedal. Above it they
+# are a real proportional service brake.
+SERVICE_BRAKE_MIN_SPEED_MPS = 0.5
 # Electrics neutral / first forward index. Read from the echo. Not sent.
 TECH_HOLD_GEAR = 0
 TECH_DRIVE_GEAR = 1
@@ -455,12 +459,11 @@ def tech_control_kwargs(
     is switchToRealisticBehavior, so every control tick was leaving arcade.
     Throttle>0 releases the parking brake and the clutch. A real hold
     (brake >= TECH_HOLD_BRAKE: stop, AEB, parked) is parkingbrake=1 and
-    service brake 0. A smaller brake request coasts: throttle 0, service
-    brake 0, parking brake 0. Sending that service pedal is arcade reverse
-    (run 8 reversed on 0.8), and treating every brake as park slams the
-    parking brake on a 2 m/s speed error.
+    service brake 0. A smaller brake while moving is a proportional service
+    brake. At rest (or at/under SERVICE_BRAKE_MIN_SPEED_MPS) that same pedal
+    is arcade reverse (run 8), so the wire coasts instead. Treating every
+    brake as park used to slam the handbrake on a 2 m/s speed error.
     """
-    del speed_mps  # moving or stopped, the reverse pedal stays off
     if release:
         return {
             "steering": 0.0,
@@ -471,8 +474,6 @@ def tech_control_kwargs(
     steer_v = _clip_steer(steer)
     throttle_v = _clip01(throttle)
     brake_v = _clip01(brake)
-    # A service brake is never sent. With or without throttle, arcade can
-    # treat that pedal as reverse. Only a real hold uses the parking brake.
     if brake_v >= TECH_HOLD_BRAKE:
         return {
             "steering": steer_v,
@@ -481,6 +482,22 @@ def tech_control_kwargs(
             "parkingbrake": 1.0,
         }
     if brake_v > 0.01:
+        # Moving: proportional service brake. Near-stopped / known-slow: coast
+        # so arcade does not treat the pedal as reverse. Unknown speed: still
+        # send the service request (live Tech always supplies electrics speed).
+        moving = True
+        if speed_mps is not None:
+            try:
+                moving = float(speed_mps) > float(SERVICE_BRAKE_MIN_SPEED_MPS)
+            except (TypeError, ValueError):
+                moving = True
+        if moving:
+            return {
+                "steering": steer_v,
+                "throttle": 0.0,
+                "brake": brake_v,
+                "parkingbrake": 0.0,
+            }
         return {
             "steering": steer_v,
             "throttle": 0.0,
@@ -1111,7 +1128,10 @@ class BeamNGPyActuator:
         kw = dict(kwargs)
         last_err: Exception | None = None
         for _ in range(6):
-            if is_reverse_control(kw) or is_arcade_reverse_hold(kw):
+            # Explicit reverse gear is never sent. A no-throttle service brake
+            # from tech_control_kwargs is intentional while moving; the speed
+            # gate there is what keeps arcade from reversing at rest.
+            if is_reverse_control(kw):
                 break
             try:
                 self.vehicle.control(**kw)
@@ -1187,8 +1207,10 @@ class BeamNGPyActuator:
             if (
                 not release
                 and float(throttle) <= 1e-6
-                and float(brake) >= TECH_HOLD_BRAKE
+                and float(brake) > 0.01
             ):
+                # Partials need ego speed so the mapper can service-brake while
+                # moving and coast at rest (arcade reverse guard).
                 speed_mps = read_electrics_inputs(self.vehicle).speed_mps
             kwargs = tech_control_kwargs(
                 steer, throttle, brake, release=release, speed_mps=speed_mps

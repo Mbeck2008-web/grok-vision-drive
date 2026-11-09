@@ -29,12 +29,17 @@ from python.control.launch_guard import (  # noqa: E402
 
 def _assert_forward(kw: dict) -> None:
     assert not is_reverse_control(kw), kw
-    assert not is_arcade_reverse_hold(kw), kw
+    # Intentional service-brake kwargs from tech_control_kwargs (moving) are
+    # forward deceleration, not arcade reverse. The raw shape detector still
+    # flags bare {throttle:0, brake:>0} for documentation of the BeamNG quirk.
     assert "gear" not in kw
-    throttle = float(kw.get("throttle") or 0.0)
-    brake = float(kw.get("brake") or 0.0)
-    if throttle <= 1e-6:
-        assert brake == 0.0, kw
+    if float(kw.get("parkingbrake") or 0.0) >= 0.99:
+        assert float(kw.get("brake") or 0.0) == 0.0, kw
+    elif float(kw.get("brake") or 0.0) > 0.01:
+        assert float(kw.get("throttle") or 0.0) == 0.0, kw
+        assert float(kw.get("parkingbrake") or 0.0) == 0.0, kw
+    else:
+        assert not is_arcade_reverse_hold(kw), kw
 
 
 def check_wire_never_sends_the_reverse_pedal() -> None:
@@ -51,11 +56,17 @@ def check_wire_never_sends_the_reverse_pedal() -> None:
     for steer, throttle, brake in samples:
         kw = tech_control_kwargs(steer, throttle, brake, speed_mps=8.0)
         _assert_forward(kw)
-        assert float(kw.get("brake") or 0.0) == 0.0, kw
-        if throttle <= 1e-6 and brake >= TECH_HOLD_BRAKE:
+        # Brake wins over throttle (never both pedals). Full hold parks;
+        # partials while moving are proportional service brake.
+        if brake >= TECH_HOLD_BRAKE:
             assert kw["parkingbrake"] == 1.0 and kw["brake"] == 0.0, kw
-        elif throttle <= 1e-6 and brake > 0.01:
-            assert kw["parkingbrake"] == 0.0 and kw["brake"] == 0.0, kw
+            assert kw["throttle"] == 0.0, kw
+        elif brake > 0.01:
+            assert kw["parkingbrake"] == 0.0, kw
+            assert abs(float(kw["brake"]) - float(brake)) < 1e-9, kw
+            assert kw["throttle"] == 0.0, kw
+        else:
+            assert float(kw.get("brake") or 0.0) == 0.0, kw
     from python.control.actuate import gear_is_reverse
 
     assert gear_is_reverse(-1) and gear_is_reverse("R") and gear_is_reverse("reverse")
@@ -69,7 +80,9 @@ def check_wire_never_sends_the_reverse_pedal() -> None:
         ego_speed_mps=12.0,
         seq=1,
     )
-    _assert_forward(tech_control_kwargs(planned.steer, planned.throttle, planned.brake))
+    _assert_forward(
+        tech_control_kwargs(planned.steer, planned.throttle, planned.brake, speed_mps=12.0)
+    )
     stopped = stop_command(reason="reverse")
     _assert_forward(tech_control_kwargs(stopped.steer, stopped.throttle, stopped.brake))
 

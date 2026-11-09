@@ -97,14 +97,17 @@ def check_exit_brake_is_a_parking_hold() -> None:
     assert held["brake"] == 0.0
     assert held["parkingbrake"] == 1.0
     assert is_arcade_reverse_hold(held) is False
-    # The command this run actually sent was service brake 0.8 with throttle 0.
-    # That shape is arcade reverse. It is not a full hold, so the wire coasts
-    # (no service pedal, no parking brake) instead of slamming park.
+    # The command this run actually sent was service brake 0.8 with throttle 0
+    # near rest. That raw shape is arcade reverse. At rest the mapper coasts;
+    # while moving the same request is a proportional service brake (not park).
     assert is_arcade_reverse_hold({"throttle": 0.0, "brake": 0.8, "parkingbrake": 0.0})
-    sent = tech_control_kwargs(0.4, 0.0, 0.8)
-    assert sent["brake"] == 0.0 and sent["parkingbrake"] == 0.0
-    assert sent["throttle"] == 0.0
-    assert is_arcade_reverse_hold(sent) is False
+    at_rest = tech_control_kwargs(0.4, 0.0, 0.8, speed_mps=0.0)
+    assert at_rest["brake"] == 0.0 and at_rest["parkingbrake"] == 0.0
+    assert at_rest["throttle"] == 0.0
+    assert is_arcade_reverse_hold(at_rest) is False
+    moving = tech_control_kwargs(0.4, 0.0, 0.8, speed_mps=8.0)
+    assert abs(moving["brake"] - 0.8) < 1e-9 and moving["parkingbrake"] == 0.0
+    assert moving["throttle"] == 0.0
 
 
 def _line(x: float) -> list[dict[str, float]]:

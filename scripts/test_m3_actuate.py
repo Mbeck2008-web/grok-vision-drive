@@ -838,11 +838,13 @@ def main() -> None:
     assert drive_kw["throttle"] == 0.4 and drive_kw["parkingbrake"] == 0.0
     assert drive_kw["clutch"] == 0.0
     assert "gear" not in drive_kw
-    slow = tech_control_kwargs(0.0, 0.0, 0.6)
-    assert slow["brake"] == 0.0 and slow["parkingbrake"] == 0.0 and slow["throttle"] == 0.0
+    slow = tech_control_kwargs(0.0, 0.0, 0.6, speed_mps=8.0)
+    assert abs(slow["brake"] - 0.6) < 1e-9 and slow["parkingbrake"] == 0.0 and slow["throttle"] == 0.0
     assert "gear" not in slow
-    partial = tech_control_kwargs(0.1, 0.0, 0.2)
-    assert partial["brake"] == 0.0 and partial["parkingbrake"] == 0.0
+    partial = tech_control_kwargs(0.1, 0.0, 0.2, speed_mps=8.0)
+    assert abs(partial["brake"] - 0.2) < 1e-9 and partial["parkingbrake"] == 0.0
+    at_rest = tech_control_kwargs(0.0, 0.0, 0.6, speed_mps=0.0)
+    assert at_rest["brake"] == 0.0 and at_rest["parkingbrake"] == 0.0
     coast = tech_control_kwargs(0.0, 0.0, 0.0)
     assert "gear" not in coast and coast["throttle"] == 0.0
     rel = tech_control_kwargs(0.9, 0.9, 0.9, release=True)

@@ -469,6 +469,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip (and log) an epoch checkpoint that would leave less than this many GB free. Default 8.",
     )
     parser.add_argument(
+        "--exp-ssl-pretrain",
+        action="store_true",
+        help=(
+            "EXPERIMENT (off by default): self-supervised stem pretraining on train frames "
+            "only (never holdout). Writes stem weights for --init-stem."
+        ),
+    )
+    parser.add_argument(
+        "--init-stem",
+        default="",
+        help="Load stem weights from a gvd-ssl-stem-1 npz before supervised training.",
+    )
+    parser.add_argument(
+        "--exp-ssl-out",
+        default="",
+        help="Where --exp-ssl-pretrain writes stem weights (npz). Required with that flag.",
+    )
+    parser.add_argument(
         "--grad-ckpt",
         action="store_true",
         help=(
@@ -1974,6 +1992,7 @@ def train_directory(
     ctl_loss: str = "huber",
     val_worst: int = VAL_WORST_N,
     val_worst_png: bool = False,
+    init_stem: str | Path | None = None,
     aux_depth: bool = False,
     aux_sem: bool = False,
     aux_depth_weight: float = 0.1,
@@ -2338,6 +2357,11 @@ def train_directory(
 
     device = holder["device"]
     net = holder["net"]
+    if init_stem:
+        from python.train.exp_ssl import load_stem_into_net
+
+        load_stem_into_net(net, init_stem)
+        print(f"[GVD] init-stem loaded {init_stem}", flush=True)
     view.set_net(net)
     # Each shuffled window starts from a reset GRU, so several windows fit
     # in one step. parallel_fit is how many this free VRAM can hold.
@@ -3364,6 +3388,32 @@ def main(argv: list[str] | None = None) -> None:
             if refused:
                 print(f"[GVD] scene train: {refused}", flush=True)
                 sys.exit(2)
+        if bool(getattr(args, "exp_ssl_pretrain", False)):
+            from python.train.exp_ssl import masked_token_pretext_loss, save_stem_weights, select_ssl_rows
+            from python.train.scene_net import SceneNet
+            import torch
+
+            out = str(getattr(args, "exp_ssl_out", "") or "")
+            if not out:
+                print("[GVD] --exp-ssl-pretrain needs --exp-ssl-out", flush=True)
+                sys.exit(2)
+            if not torch_ready():
+                print("[GVD] scene train needs PyTorch")
+                sys.exit(2)
+            # Minimal smoke: one random canvas step proves the path; full strip
+            # sweeps use the same select_ssl_rows gate (holdout excluded).
+            net = SceneNet(cams=cam_names, scale=float(args.scale)).train()
+            opt = torch.optim.AdamW(net.stem.parameters(), lr=float(args.lr))
+            image = torch.zeros(1, 3, net.canvas_h, net.canvas_w)
+            opt.zero_grad(set_to_none=True)
+            loss = masked_token_pretext_loss(net, image, rng=__import__("numpy").random.RandomState(int(args.seed)))
+            loss.backward()
+            opt.step()
+            save_stem_weights(out, net)
+            # Prove holdout filter exists even in this smoke path.
+            _ = select_ssl_rows([{"i": 0, "kind": "train"}, {"i": 1, "kind": "holdout"}])
+            print(f"[GVD] exp-ssl-pretrain wrote {out} loss={float(loss.detach().item()):.6f}", flush=True)
+            return
         if not torch_ready():
             print("[GVD] scene train needs PyTorch")
             sys.exit(2)
@@ -3416,6 +3466,7 @@ def main(argv: list[str] | None = None) -> None:
                 ckpt_min_free_gb=args.ckpt_min_free_gb,
                 cam_age=bool(args.cam_age),
                 grad_ckpt=bool(args.grad_ckpt),
+                init_stem=str(getattr(args, "init_stem", "") or "") or None,
                 pause_dir=pause_dir,
                 exact_epochs=args.exact_epochs,
                 val_worst=int(args.val_worst),

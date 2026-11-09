@@ -93,8 +93,14 @@ def check_consumers_keep_magnitude() -> None:
     assert a.ttc_lead != b.ttc_lead, (a, b)
     assert b.ttc_lead is None and b.aeb == "off", b
     print("cipv: opening is not closing OK")
-    assert _predict_occupants([dict(neg, unseen_s=1.0)]) == _predict_occupants([dict(pos, unseen_s=1.0)])
-    print("path_predictor occupants: magnitude OK")
+    # Occupants keep signed relative speed: closing coasts the gap shut,
+    # opening coasts it open. abs() here was the planner's phantom-AEB bug.
+    occ_n = _predict_occupants([dict(neg, unseen_s=1.0)])
+    occ_p = _predict_occupants([dict(pos, unseen_s=1.0)])
+    assert occ_n and occ_p
+    assert occ_n[0]["speed_mps"] == -5.0 and occ_p[0]["speed_mps"] == 5.0, (occ_n, occ_p)
+    assert occ_n[0]["y"] < neg["y"] < occ_p[0]["y"], (occ_n[0]["y"], neg["y"], occ_p[0]["y"])
+    print("path_predictor occupants: signed coast OK")
     sn = [line for line in _lines({"tracks": [neg]}) if "miss@" in line]
     sp = [line for line in _lines({"tracks": [pos]}) if "miss@" in line]
     assert sn == sp, (sn, sp)

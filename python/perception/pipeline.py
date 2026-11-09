@@ -33,21 +33,24 @@ def fuse_planner_cipv(
     plan_stop_reason: str | None,
     cipv: Any,
 ) -> tuple[str | None, float | None, float | None]:
-    """Merge CIPV into the planner's AEB without overturning a refused hard stop.
+    """Merge CIPV into the planner's AEB.
 
-    The planner nulls a short TTC when it will not full-brake (close < 3 m/s,
-    or a bumper gap to a still-moving lead). CIPV must not put that TTC back
-    and force aeb=brake. It may still fill in a lead when the planner had no
-    scene stop (stop_reason none/yield/missing).
+    CIPV aeb=brake always wins. A soft planner scene stop (stop_reason set,
+    aeb!=brake) must not silence a signed-closing CIPV hard brake — that was
+    the PR #184 Safety failure when the planner still used abs(speed_mps).
+
+    When the planner has no scene stop (none/yield/missing), CIPV may still
+    fill in a missing lead TTC. plan_stop_reason is kept for callers/tests.
     """
-    reason = None if plan_stop_reason is None else str(plan_stop_reason)
-    refused = reason not in (None, "", "none", "yield") and plan_aeb != "brake"
-    ttc = plan_ttc if plan_ttc is not None else (None if refused else getattr(cipv, "ttc_lead", None))
+    _ = plan_stop_reason  # documented; fuse no longer gates on it
+    ttc = plan_ttc if plan_ttc is not None else getattr(cipv, "ttc_lead", None)
     aeb = plan_aeb
     target_v = plan_target_v
-    if (not refused) and getattr(cipv, "aeb", None) == "brake" and aeb != "brake":
+    if getattr(cipv, "aeb", None) == "brake" and aeb != "brake":
         aeb = "brake"
         target_v = 0.0
+        if plan_ttc is None:
+            ttc = getattr(cipv, "ttc_lead", None)
     return aeb, ttc, target_v
 
 

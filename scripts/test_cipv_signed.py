@@ -7,6 +7,9 @@ negative when the gap is closing. Taking abs() made a matched-speed lead
 ahead at the same speed forced aeb=brake. Opening and closing at the same
 magnitude were identical.
 
+Fused-output probes (predict_path + fuse_planner_cipv) are the suite of
+record for the Skeptic Safety gate on PR #184.
+
     py -3 scripts/test_cipv_signed.py
 """
 from __future__ import annotations
@@ -17,9 +20,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from python.perception.cipv import select_cipv  # noqa: E402
+from python.perception.cipv import CipvResult, select_cipv  # noqa: E402
 from python.perception.pipeline import fuse_planner_cipv  # noqa: E402
-from python.perception.cipv import CipvResult  # noqa: E402
 
 
 def _lead(y: float, speed: float) -> dict:
@@ -36,6 +38,23 @@ def _lead(y: float, speed: float) -> dict:
         "age": 5,
         "conf": 0.9,
     }
+
+
+def _lanes():
+    left = [{"x": -1.75, "y": float(y), "z": 0.0} for y in range(0, 42, 2)]
+    right = [{"x": 1.75, "y": float(y), "z": 0.0} for y in range(0, 42, 2)]
+    return [left, right]
+
+
+def _fuse_from_plan(plan, tracks, ego: float):
+    cipv = select_cipv(tracks, ego_speed_mps=ego)
+    return fuse_planner_cipv(
+        plan_aeb=plan.aeb,
+        plan_ttc=plan.ttc_lead,
+        plan_target_v=plan.target_v,
+        plan_stop_reason=plan.stop_reason,
+        cipv=cipv,
+    ), cipv
 
 
 def check_matched_speed_is_not_a_stopped_car() -> None:
@@ -61,36 +80,120 @@ def check_opening_is_not_closing() -> None:
     print("signed relative speed: opening != closing OK")
 
 
-def check_planner_refused_hard_stop_is_not_overridden() -> None:
-    # Planner saw a lead, nulled a short TTC, and refused aeb=brake.
+def check_cipv_brake_not_silenced_on_scene_stop() -> None:
+    """CIPV aeb=brake must win even when planner reports a soft scene stop."""
     cipv = CipvResult(track=_lead(8.0, -8.0), ttc_lead=1.0, aeb="brake")
     aeb, ttc, target = fuse_planner_cipv(
         plan_aeb="off",
         plan_ttc=None,
         plan_target_v=6.0,
-        plan_stop_reason="lead",
+        plan_stop_reason="vehicle",
         cipv=cipv,
     )
-    assert aeb == "off", aeb
-    assert ttc is None, ttc
-    assert target == 6.0, target
-    # No scene stop: CIPV may still fill in a missing lead.
-    aeb2, ttc2, target2 = fuse_planner_cipv(
-        plan_aeb="off",
-        plan_ttc=None,
-        plan_target_v=10.0,
-        plan_stop_reason="none",
-        cipv=cipv,
+    assert aeb == "brake" and target == 0.0, (aeb, target)
+    assert ttc == 1.0, ttc
+    print("CIPV brake not silenced on scene stop OK")
+
+
+def check_fused_fill_in_when_no_scene_stop() -> None:
+    """stop_reason none/yield/missing: CIPV brake may still fill in."""
+    cipv = CipvResult(track=_lead(5.0, -5.0), ttc_lead=1.0, aeb="brake")
+    for reason in ("none", "yield", None, ""):
+        aeb, ttc, target = fuse_planner_cipv(
+            plan_aeb="off",
+            plan_ttc=None,
+            plan_target_v=12.0,
+            plan_stop_reason=reason,
+            cipv=cipv,
+        )
+        assert aeb == "brake" and target == 0.0, (reason, aeb, target)
+        assert ttc == 1.0, (reason, ttc)
+    print("fused fill-in none/yield/missing OK")
+
+
+def check_fused_catching_slower_lead_still_brakes() -> None:
+    """Skeptic blocker: ego=10, y=8, rel=-8 must publish fused aeb=brake.
+
+    True closing is 8 m/s (TTC 1.0 on CIPV). Planner abs(speed) used to undercount
+    closing as ego-|rel|=2 and refuse hard stop; fuse then silenced CIPV.
+    """
+    from python.planning.path_predictor import predict_path
+
+    tracks = [_lead(8.0, -8.0)]
+    plan = predict_path(
+        lanes_bev=_lanes(), lane_conf=0.9, ego_speed_mps=10.0, tracks=tracks,
     )
-    assert aeb2 == "brake" and target2 == 0.0, (aeb2, target2)
-    assert ttc2 == 1.0, ttc2
-    print("planner-refused hard stop is not overridden OK")
+    (aeb, ttc, target), cipv = _fuse_from_plan(plan, tracks, 10.0)
+    assert cipv.aeb == "brake" and cipv.ttc_lead is not None
+    assert abs(cipv.ttc_lead - 1.0) < 1e-6, cipv
+    assert plan.aeb == "brake", (
+        f"planner must hard-stop on signed closing 8 m/s, got aeb={plan.aeb} "
+        f"ttc={plan.ttc_lead} reason={plan.stop_reason} target={plan.target_v}"
+    )
+    assert aeb == "brake", f"fused aeb={aeb} ttc={ttc} target={target}"
+    assert target == 0.0, target
+    print("fused catching-slower-lead: brake OK")
+
+
+def check_fused_matched_speed_is_not_brake() -> None:
+    """Skeptic major: y=8, ego=8, rel=0 must NOT publish fused aeb=brake.
+
+    CIPV already returns off; predict_path used to phantom-brake (~0.219 TTC).
+    """
+    from python.planning.path_predictor import predict_path
+
+    tracks = [_lead(8.0, 0.0)]
+    plan = predict_path(
+        lanes_bev=_lanes(), lane_conf=0.9, ego_speed_mps=8.0, tracks=tracks,
+    )
+    (aeb, ttc, _target), cipv = _fuse_from_plan(plan, tracks, 8.0)
+    assert cipv.aeb == "off" and cipv.ttc_lead is None, cipv
+    assert plan.aeb != "brake", (
+        f"planner phantom brake on matched speed: aeb={plan.aeb} ttc={plan.ttc_lead} "
+        f"reason={plan.stop_reason}"
+    )
+    assert aeb != "brake", f"fused aeb={aeb} ttc={ttc}"
+    print("fused matched-speed: not brake OK")
+
+
+def check_fused_hard_close_still_brakes() -> None:
+    from python.planning.path_predictor import predict_path
+
+    tracks = [_lead(5.0, -5.0)]
+    plan = predict_path(
+        lanes_bev=_lanes(), lane_conf=0.9, ego_speed_mps=10.0, tracks=tracks,
+    )
+    (aeb, ttc, target), cipv = _fuse_from_plan(plan, tracks, 10.0)
+    assert cipv.aeb == "brake" and abs((cipv.ttc_lead or 0) - 1.0) < 1e-6, cipv
+    assert aeb == "brake" and target == 0.0, (aeb, ttc, target)
+    print("fused hard-close y=5 rel=-5: brake OK")
+
+
+def check_fused_opening_has_no_ttc() -> None:
+    from python.planning.path_predictor import predict_path
+
+    tracks = [_lead(20.0, 5.0)]
+    plan = predict_path(
+        lanes_bev=_lanes(), lane_conf=0.9, ego_speed_mps=10.0, tracks=tracks,
+    )
+    (aeb, ttc, _target), cipv = _fuse_from_plan(plan, tracks, 10.0)
+    assert cipv.ttc_lead is None and cipv.aeb == "off", cipv
+    assert plan.aeb != "brake", plan
+    assert aeb != "brake"
+    # Opening must not invent a TTC on CIPV; fused TTC may only come from planner.
+    assert cipv.ttc_lead is None
+    print("fused opening: no TTC / no brake OK")
 
 
 def main() -> None:
     check_matched_speed_is_not_a_stopped_car()
     check_opening_is_not_closing()
-    check_planner_refused_hard_stop_is_not_overridden()
+    check_cipv_brake_not_silenced_on_scene_stop()
+    check_fused_fill_in_when_no_scene_stop()
+    check_fused_catching_slower_lead_still_brakes()
+    check_fused_matched_speed_is_not_brake()
+    check_fused_hard_close_still_brakes()
+    check_fused_opening_has_no_ttc()
     print("test_cipv_signed: OK")
 
 

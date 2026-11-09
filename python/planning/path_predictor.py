@@ -1113,7 +1113,10 @@ def _predict_occupants(tracks: list) -> list[dict[str, Any]]:
         if kind not in _OCCUPANTS:
             continue
         yaw = _f(raw, "yaw", "heading", default=math.pi / 2.0)
-        speed = abs(_f(raw, "speed_mps", "speed"))
+        # Tracker speed_mps is signed along-track (y) relative velocity,
+        # negative when closing — not road speed. Keep the sign so coasting
+        # moves the gap the right way and _apply_scene can use -rel as closing.
+        speed = _f(raw, "speed_mps", "speed")
         unseen = _unseen_s(raw)
         x = _f(raw, "x") + math.cos(yaw) * speed * unseen
         y = _f(raw, "y") + math.sin(yaw) * speed * unseen
@@ -1184,9 +1187,13 @@ def _apply_scene(
         # must not hide it.
         if float(occ["y"]) < -0.05:
             continue
-        along = float(occ.get("speed_mps") or 0.0) * math.sin(float(occ.get("yaw") or (math.pi / 2.0)))
-        closing = None if ego is None else ego - along
-        # Matching speed is not a stop. Anything actually in front of the bumper is.
+        # speed_mps on occupants is signed along-track relative velocity
+        # (tracker): negative when closing. Closing rate is -rel, matching
+        # select_cipv. Do NOT treat it as road speed (ego - |v| undercounted
+        # a catching lead and invented a matched-speed hard stop).
+        rel = float(occ.get("speed_mps") or 0.0)
+        closing = None if ego is None else -rel
+        # Matching / opening / soft-close is not a stop.
         if closing is not None and closing <= 0.4 and float(occ["y"]) > 4.0:
             continue
         back = float(occ["length"]) * 0.5 + STANDOFF_M

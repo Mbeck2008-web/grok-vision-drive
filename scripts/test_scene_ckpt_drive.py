@@ -405,6 +405,37 @@ def check_modular_low_conf_and_stale_no_ckpt_steer() -> None:
     print("modular drive: low-conf and stale yield no ckpt steer; evaluate_veto called OK")
 
 
+def check_overlay_caption_drive_kind() -> None:
+    """Caption kind must track confidence AND drive; must kill drive-only mutation.
+
+    Skeptic mutation: kind = "DRIVE" if drive else cap shows DRIVE at conf<0.40
+    even though apply_scene_ckpt_lane already returned stop. The helper must
+    keep LOW when scene_ckpt_caption returns LOW.
+    """
+    import inspect
+
+    from python.train.scene_ckpt_runtime import (
+        apply_scene_ckpt_lane,
+        scene_ckpt_overlay_caption,
+    )
+    from python.viz.scene_ribbon import SCENE_RIBBON_MIN_CONF
+
+    default_min = inspect.signature(apply_scene_ckpt_lane).parameters["min_conf"].default
+    assert default_min == SCENE_RIBBON_MIN_CONF, (default_min, SCENE_RIBBON_MIN_CONF)
+    assert float(default_min) == 0.40
+
+    low = scene_ckpt_overlay_caption(_pred(lane_x=-0.8, confidence=0.10), drive=True)
+    assert low.startswith("LOW"), low
+    assert not low.startswith("DRIVE"), low
+
+    drive_hi = scene_ckpt_overlay_caption(_pred(lane_x=-0.8, confidence=0.91), drive=True)
+    assert drive_hi.startswith("DRIVE lane_x="), drive_hi
+
+    shadow_hi = scene_ckpt_overlay_caption(_pred(lane_x=-0.8, confidence=0.91), drive=False)
+    assert shadow_hi.startswith("SHADOW"), shadow_hi
+    print("overlay caption: LOW/DRIVE/SHADOW kinds + min_conf==SCENE_RIBBON_MIN_CONF OK")
+
+
 def check_same_tick_observe_documented() -> None:
     """Pred is computed on this tick's main frame (no cached / aged pred).
 
@@ -431,6 +462,7 @@ def main() -> None:
     check_nonfinite_lane_x_stops()
     check_steer_sign_locked_to_lane_x()
     check_modular_low_conf_and_stale_no_ckpt_steer()
+    check_overlay_caption_drive_kind()
     check_same_tick_observe_documented()
     check_supervisor_shadow_default_and_drive_opt_in()
     print("test_scene_ckpt_drive: all OK")

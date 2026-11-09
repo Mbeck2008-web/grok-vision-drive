@@ -67,7 +67,7 @@ def apply_scene_ckpt_to_command(cmd: Any, _pred: Any) -> Any:
         return cmd
 
 
-def apply_scene_ckpt_lane(pout: Any, pred: Any, *, drive: bool, min_conf: float = 0.40) -> str:
+def apply_scene_ckpt_lane(pout: Any, pred: Any, *, drive: bool, min_conf: float = SCENE_RIBBON_MIN_CONF) -> str:
     """Optionally replace ``pout``'s lane with the checkpoint prediction.
 
     Returns ``shadow`` when drive is off (``pout`` unchanged), ``lane`` when
@@ -163,6 +163,22 @@ class SceneCkptPred:
         return out
 
 
+def scene_ckpt_overlay_caption(pred: SceneCkptPred | None, *, drive: bool = False) -> str:
+    """Caption drawn by ``draw_scene_ckpt_overlay``. Pure so tests can lock the kind.
+
+    Low confidence is always ``LOW``, even when drive is on: the drive path has
+    already returned stop below SCENE_RIBBON_MIN_CONF. High confidence is
+    ``DRIVE`` only when drive is on; otherwise ``SHADOW``.
+    """
+    if pred is None:
+        return "SHADOW"
+    cap = scene_ckpt_caption(pred.confidence)  # SHADOW or LOW
+    kind = "DRIVE" if (drive and cap == "SHADOW") else cap
+    if pred.lane_x is not None and kind in ("SHADOW", "DRIVE"):
+        return f"{kind} lane_x={float(pred.lane_x):+.2f}m conf={float(pred.confidence):.2f}"
+    return f"{kind} conf={float(pred.confidence):.2f}"
+
+
 def draw_scene_ckpt_overlay(
     frame: np.ndarray | None,
     pred: SceneCkptPred | None,
@@ -183,14 +199,7 @@ def draw_scene_ckpt_overlay(
         return out
     color = overlay_bgr("shadow")
     h, w = int(out.shape[0]), int(out.shape[1])
-    caption = "SHADOW"
-    if pred is not None:
-        cap = scene_ckpt_caption(pred.confidence)  # SHADOW or LOW
-        kind = "DRIVE" if (drive and cap == "SHADOW") else cap
-        if pred.lane_x is not None and kind in ("SHADOW", "DRIVE"):
-            caption = f"{kind} lane_x={float(pred.lane_x):+.2f}m conf={float(pred.confidence):.2f}"
-        else:
-            caption = f"{kind} conf={float(pred.confidence):.2f}"
+    caption = scene_ckpt_overlay_caption(pred, drive=drive)
     cv2.putText(out, caption, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
     # Solid swatch so tests (and a clip) can see the mark without anti-alias blending.
     cv2.rectangle(out, (12, 36), (40, 56), color, -1)

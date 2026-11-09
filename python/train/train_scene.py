@@ -529,8 +529,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "EXPERIMENT (off by default): capture a CUDA graph of the fixed-shape fused train "
-            "window. Falls back to eager on CPU or when the window shape changes. Does not "
-            "change the loss or the published 8 m holdout metric."
+            "window when --heads is exactly lane_gt. Falls back to eager on CPU, when heads "
+            "are anything else (including default/empty --heads), or when the window shape "
+            "changes. Does not change the published 8 m holdout metric."
         ),
     )
     parser.add_argument(
@@ -2627,13 +2628,14 @@ def train_directory(
         torch.backends.cudnn.benchmark = True
     cuda_graph_runner = None
     if exp_cuda_graph:
-        from python.train.exp_cuda_graph import CudaGraphRunner, graph_eligible
+        from python.train.exp_cuda_graph import CudaGraphRunner, graph_eligible, heads_allow_graph
 
-        cuda_graph_runner = CudaGraphRunner(enabled=True, device=device)
+        cuda_graph_runner = CudaGraphRunner(enabled=True, device=device, heads=train_heads)
         print(
             "[GVD] exp-cuda-graph: on; "
             f"eligible_now={graph_eligible(enabled=True, device=device, shape=(1,))} "
-            "(falls back to eager on CPU or shape change)",
+            f"heads_ok={heads_allow_graph(train_heads)} "
+            "(eager fallback on CPU, non-lane_gt heads, or shape change)",
             flush=True,
         )
     view.set_net(net)

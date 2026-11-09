@@ -10,6 +10,22 @@ from __future__ import annotations
 from typing import Any, Callable, Hashable
 
 
+def heads_allow_graph(heads: Any) -> bool:
+    """Capture is only safe when the trained loss uses exactly ``lane_gt``.
+
+    Default / empty ``--heads`` trains every default head. A successful graph
+    that rebuilt only ``lane_gt`` would zero or crash those other terms, so
+    those runs stay on eager.
+    """
+    if heads is None:
+        return False
+    try:
+        names = {str(name) for name in heads}
+    except TypeError:
+        return False
+    return names == {"lane_gt"}
+
+
 def graph_eligible(*, enabled: bool, device: Any, shape: Hashable | None) -> bool:
     """True only when the flag is on, the device is CUDA, and a shape is known."""
     if not enabled:
@@ -35,14 +51,16 @@ class CudaGraphRunner:
     fall back to eager on any failure or when ages/cond/aux need the full pred.
     """
 
-    def __init__(self, *, enabled: bool, device: Any) -> None:
+    def __init__(self, *, enabled: bool, device: Any, heads: Any = None) -> None:
         self.enabled = bool(enabled)
         self.device = device
+        self.heads = heads
         self.last_shape: Hashable | None = None
         self.mode = "idle"
         self.fallback_count = 0
         self.recapture_count = 0
         self.replay_count = 0
+        self._heads_note = False
         self._graph: Any = None
         self._static_in: Any = None
         self._static_out: Any = None
@@ -114,6 +132,18 @@ class CudaGraphRunner:
         """Trainer hook: graphed fused forward when eligible, else eager."""
         shape = tuple(strips.shape) if hasattr(strips, "shape") else None
         self.last_shape = shape
+        if not heads_allow_graph(self.heads):
+            if not self._heads_note:
+                got = "default/all" if self.heads is None else ",".join(str(h) for h in self.heads) or "empty"
+                print(
+                    "[GVD] exp-cuda-graph: refuse graph unless --heads is exactly "
+                    f"lane_gt (got {got}); using eager fallback",
+                    flush=True,
+                )
+                self._heads_note = True
+            self.mode = "eager_fallback"
+            self.fallback_count += 1
+            return net.forward_window(strips, dts, state, ages, cond)
         needs_side = (
             ages is not None
             or cond is not None
@@ -140,7 +170,7 @@ class CudaGraphRunner:
                     self.scene = scene
 
                 def forward(self, window: Any, step_dts: Any, hidden: Any) -> Any:
-                    from python.train.scene_net import SceneState
+                    from python.train.scene_net import RESIDUAL_S, SceneState
 
                     batch = int(window.shape[0])
                     tokens = torch.zeros(
@@ -152,7 +182,7 @@ class CudaGraphRunner:
                     )
                     mask = torch.full(
                         (batch, int(state.mask.shape[1])),
-                        float(2.0),
+                        float(RESIDUAL_S) + 1.0,
                         device=window.device,
                         dtype=window.dtype,
                     )

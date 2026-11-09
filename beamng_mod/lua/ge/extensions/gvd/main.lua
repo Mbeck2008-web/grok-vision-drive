@@ -1603,6 +1603,17 @@ local function applyCmdJson(dt)
     return
   end
   if not cmd or cmd.engaged ~= true then
+    -- An AEB/reverse park hold is written with engaged=false and hold_park=true.
+    -- Apply that hold even if this tick still thinks we are engaged.
+    if type(cmd) == 'table' and cmd.hold_park == true then
+      local vehHold = veh or getPlayerVeh()
+      if vehHold then
+        applying = true
+        applyVeh = vehHold
+        applyInputs(vehHold, 0, 0, 1)
+      end
+      return
+    end
     -- Supervisor is not driving (has not read Alt+G yet / vetoed / shutting down): hands off.
     releaseInputs('supervisor not driving')
     return

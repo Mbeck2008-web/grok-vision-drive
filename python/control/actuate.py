@@ -440,6 +440,18 @@ def _unexpected_kw(err: BaseException) -> str | None:
     return None
 
 
+def is_aeb_hold_reason(reason: str | None) -> bool:
+    """True when this stop is an AEB brake that must survive a disengage."""
+    name = str(reason or "")
+    return name == "aeb_brake" or name.endswith(":aeb_brake")
+
+
+def latch_aeb_park_hold(actuator: Any, reason: str | None) -> None:
+    """Pin the parking-brake hold so a following Engage-off stop() does not release."""
+    if is_aeb_hold_reason(reason) and hasattr(actuator, "note_park_hold"):
+        actuator.note_park_hold()
+
+
 def tech_control_kwargs(
     steer: float,
     throttle: float,
@@ -1220,7 +1232,7 @@ class BeamNGPyActuator:
     def stop(
         self, seq: int = 0, reason: str = "stop", *, now: float | None = None
     ) -> DriveCommand:
-        if not self.engaged and (self._park_hold or reason == "reverse"):
+        if not self.engaged and (self._park_hold or reason == "reverse" or is_aeb_hold_reason(reason)):
             self._park_hold = True
             try:
                 self._invoke_control(tech_control_kwargs(0.0, 0.0, 1.0))
@@ -1341,6 +1353,10 @@ class CmdJsonActuator:
         if reason in UNKNOWN_EGO_REASONS:
             # Unknown ego speed: the record and the file say brake 0 (Lua releases anyway).
             return self.apply(release_command(seq=seq, reason=reason))
+        if is_aeb_hold_reason(reason):
+            # Match BeamNGPyActuator: an AEB stop reason latches park hold even
+            # when note_park_hold was not called first.
+            self._park_hold = True
         cmd = stop_command(seq=seq, reason=reason)
         return self.apply(cmd)
 

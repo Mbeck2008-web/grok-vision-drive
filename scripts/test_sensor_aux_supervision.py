@@ -334,6 +334,118 @@ def check_trainer_slice_aux_losses() -> None:
     print("trainer_slice_aux_losses")
 
 
+def _lane_target(pred) -> dict:
+    import torch
+
+    return {
+        "lane_gt": torch.zeros_like(pred.lane_gt),
+        "lane_gt_valid": torch.zeros_like(pred.lane_gt),
+        "lanes": torch.zeros_like(pred.lanes),
+        "lane_valid": torch.zeros_like(pred.lane_valid),
+        "curbs": torch.zeros_like(pred.curbs),
+        "curb_valid": torch.zeros_like(pred.curb_valid),
+        "objects": torch.zeros_like(pred.objects),
+        "object_class": torch.zeros(pred.object_class.shape[:-1], dtype=torch.int64),
+        "object_valid": torch.zeros_like(pred.object_valid),
+        "signs": torch.zeros_like(pred.signs),
+        "sign_class": torch.zeros(pred.sign_class.shape[:-1], dtype=torch.int64),
+        "sign_state": torch.zeros(pred.sign_state.shape[:-1], dtype=torch.int64),
+        "sign_valid": torch.zeros_like(pred.sign_valid),
+    }
+
+
+def _nhw(t):
+    """Map a depth pred or labeler target onto (N, H, W) without broadcasting."""
+    if t.dim() >= 3 and t.shape[-3] == 1:
+        t = t.squeeze(-3)
+    if t.dim() == 2:
+        t = t.unsqueeze(0)
+    return t
+
+
+def _matched_depth_term(pd, gd, md):
+    import torch.nn.functional as functional
+
+    pd, gd, md = _nhw(pd), _nhw(gd), _nhw(md)
+    per = functional.smooth_l1_loss(pd, gd, reduction="none")
+    return (per * md).sum() / md.sum().clamp(min=1.0)
+
+
+def _no_broadcast_warnings(caught) -> None:
+    msgs = [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
+    bad = [m for m in msgs if "broadcast" in m.lower() or "target size" in m.lower()]
+    assert not bad, bad
+
+
+def check_aux_depth_loss_no_broadcast() -> None:
+    """Labeler HW targets must match the depth head without a broadcast warning.
+
+    After train_scene._prediction_at the head is (1, H, W); labels_for_row
+    supplies (H, W). A stacked batch is (N, 1, H, W) vs (N, H, W). Both
+    layouts must equal the elementwise loss on those matched (N, H, W)
+    tensors. aux_sem already unsqueezes; lock that it stays warning-free.
+    """
+    import warnings
+
+    import torch
+    from python.train import train_scene as ts
+    from python.train.scene_net import SceneNet, scene_loss
+
+    def _score(pred, target, *, aux_sem_weight=0.0):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            loss = scene_loss(
+                pred, target, heads=("lane_gt",),
+                aux_depth_weight=1.0, aux_sem_weight=aux_sem_weight,
+            )
+        _no_broadcast_warnings(caught)
+        return loss
+
+    net = SceneNet(cams=("main",), aux_sensors=True).eval()
+    # Batch 1, trainer slice: pred (1, H, W), labeler target (H, W).
+    pred1, _ = net.forward_batch(
+        torch.zeros(1, 3, net.canvas_h, net.canvas_w), torch.zeros(1), net.initial_state()
+    )
+    one = ts._prediction_at(pred1, 0)
+    hw = tuple(one.aux_depth.shape[-2:])
+    assert tuple(one.aux_depth.shape) == (1,) + hw, one.aux_depth.shape
+    target1 = _lane_target(one)
+    target1["aux_depth"] = torch.full(hw, 99.0)
+    target1["aux_depth_valid"] = torch.ones(hw)
+    target1["aux_sem"] = torch.zeros(hw, dtype=torch.int64)
+    target1["aux_sem_valid"] = torch.ones(hw)
+    loss1 = _score(one, target1, aux_sem_weight=1.0)
+    expected1 = _matched_depth_term(one.aux_depth, target1["aux_depth"], target1["aux_depth_valid"])
+    assert torch.allclose(loss1["aux_depth"], expected1), (float(loss1["aux_depth"]), float(expected1))
+
+    # Batch >1, unsliced: pred (N, 1, H, W), stacked labeler targets (N, H, W).
+    n = 2
+    predn, _ = net.forward_batch(
+        torch.zeros(n, 3, net.canvas_h, net.canvas_w),
+        torch.zeros(n),
+        net.initial_state(batch=n),
+    )
+    assert tuple(predn.aux_depth.shape) == (n, 1) + hw, predn.aux_depth.shape
+    targetn = _lane_target(predn)
+    targetn["aux_depth"] = torch.full((n,) + hw, 99.0)
+    targetn["aux_depth_valid"] = torch.ones((n,) + hw)
+    targetn["aux_sem"] = torch.zeros((n,) + hw, dtype=torch.int64)
+    targetn["aux_sem_valid"] = torch.ones((n,) + hw)
+    lossn = _score(predn, targetn, aux_sem_weight=1.0)
+    expectedn = _matched_depth_term(predn.aux_depth, targetn["aux_depth"], targetn["aux_depth_valid"])
+    assert torch.allclose(lossn["aux_depth"], expectedn), (float(lossn["aux_depth"]), float(expectedn))
+
+    # Same layouts through the trainer slice of a wider batch.
+    sliced = ts._prediction_at(predn, 1)
+    targets = _lane_target(sliced)
+    targets["aux_depth"] = torch.full(hw, 42.0)
+    targets["aux_depth_valid"] = torch.ones(hw)
+    losss = _score(sliced, targets)
+    expecteds = _matched_depth_term(sliced.aux_depth, targets["aux_depth"], targets["aux_depth_valid"])
+    assert torch.allclose(losss["aux_depth"], expecteds), (float(losss["aux_depth"]), float(expecteds))
+    print("aux_depth_loss_no_broadcast")
+
+
 def check_rgb_alignment_hard_fail() -> None:
     """MAJOR: depth/sem HxW must match RGB main when main exists."""
     from python.train.sensor_aux import AuxTargetError, load_sensor_aux_targets
@@ -525,6 +637,7 @@ def main() -> None:
     check_aux_grid_bounded()
     check_default_onnx_and_no_input_leak()
     check_trainer_slice_aux_losses()
+    check_aux_depth_loss_no_broadcast()
     check_rgb_alignment_hard_fail()
     check_depth_downsample_zero_bias()
     check_lane_width_not_road_width()

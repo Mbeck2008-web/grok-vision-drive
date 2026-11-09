@@ -1316,7 +1316,21 @@ def _scene_loss_body(
         pd = pred.aux_depth.to(device=device, dtype=dtype)
         gd = target["aux_depth"].to(device=device, dtype=dtype)
         md = target["aux_depth_valid"].to(device=device, dtype=dtype)
-        if tuple(pd.shape[-2:]) != tuple(gd.shape[-2:]) or tuple(pd.shape[-2:]) != tuple(md.shape[-2:]):
+        # Depth head is N1HW. _prediction_at drops N, leaving 1HW.
+        # Labeler targets are HW (or NHW when stacked). Align all three to NHW.
+        if pd.dim() >= 3 and pd.shape[-3] == 1:
+            pd = pd.squeeze(-3)
+        if gd.dim() >= 3 and gd.shape[-3] == 1:
+            gd = gd.squeeze(-3)
+        if md.dim() >= 3 and md.shape[-3] == 1:
+            md = md.squeeze(-3)
+        if pd.dim() == 2:
+            pd = pd.unsqueeze(0)
+        if gd.dim() == 2:
+            gd = gd.unsqueeze(0)
+        if md.dim() == 2:
+            md = md.unsqueeze(0)
+        if tuple(pd.shape) != tuple(gd.shape) or tuple(pd.shape) != tuple(md.shape):
             raise AuxTargetError(
                 f"aux_depth shape mismatch pred={tuple(pd.shape)} goal={tuple(gd.shape)} mask={tuple(md.shape)}"
             )

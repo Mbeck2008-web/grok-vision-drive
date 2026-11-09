@@ -712,6 +712,7 @@ def labels_for_row(
     aux_depth: bool = False,
     aux_sem: bool = False,
     road_edge: bool = False,
+    aux_cache: Any = None,
 ) -> dict[str, np.ndarray]:
     """Scene labels plus the ground-truth lane vector when the row has one.
 
@@ -752,6 +753,7 @@ def labels_for_row(
             want_depth=bool(aux_depth),
             want_sem=bool(aux_sem),
             want_road_edge=False,
+            aux_cache=aux_cache,
         )
     return labels
 
@@ -1608,6 +1610,89 @@ if torch is not None:
             image = _strip_nchw(strip, allow_batch=True, width=self.canvas_w, height=self.canvas_h)
             return self._forward_batched(image, dt, state, ages, cond)
 
+        def forward_window(
+            self,
+            strips: Any,
+            dts: Any,
+            state: SceneState,
+            ages: Any = None,
+            cond: Any = None,
+        ) -> tuple[ScenePrediction, SceneState, SceneState]:
+            """One stem launch and one GRU over T ticks.
+
+            ``strips`` is (B, T, H, W, 3) or (B, T, 3, H, W). Predictions are
+            flattened to batch ``B*T`` in row-major order (tick t of window b
+            is index ``b * T + t``). Returns ``(pred, end_state, end_state)``
+            so callers that used to keep a mid-window stride mark can take the
+            final state when every train window starts from a reset.
+
+            Dropout uses a fresh train-mode mask per tick (``GRU_IN_DROPOUT``),
+            matching T separate ``forward_batch`` calls. A single (B, T, D)
+            dropout would be a different regularizer. Eval and
+            ``gru_in_drop.p = 0`` match the loop as well.
+            """
+            if not torch.is_tensor(strips):
+                strips = torch.from_numpy(np.ascontiguousarray(strips))
+            if strips.dim() != 5:
+                raise ValueError(f"window strips must be B,T,H,W,C or B,T,C,H,W, got {tuple(strips.shape)}")
+            if int(strips.shape[-1]) == 3:
+                batch, ticks = int(strips.shape[0]), int(strips.shape[1])
+                flat = strips.reshape(batch * ticks, *strips.shape[2:])
+            elif int(strips.shape[2]) == 3:
+                batch, ticks = int(strips.shape[0]), int(strips.shape[1])
+                flat = strips.reshape(batch * ticks, *strips.shape[2:])
+            else:
+                raise ValueError(f"window strips must have 3 channels, got {tuple(strips.shape)}")
+            image = _strip_nchw(flat, allow_batch=True, width=self.canvas_w, height=self.canvas_h)
+            if ticks < 1:
+                raise ValueError("forward_window needs T >= 1")
+            cond = _window_cond(self, cond, image, batch, ticks)
+            ages_col = _window_ages(self, ages, image, batch, ticks)
+            state = _state_on(state, image[:batch] if batch > 0 else image)
+            token, main_feat = self._encode(image)
+            token = token.reshape(batch, ticks, 1, token.shape[-1]).squeeze(2)
+            if self.cam_age:
+                token = torch.cat([token, ages_col], dim=-1)
+            elif ages is not None:
+                raise ValueError("this scene net has no cam-age input; ages were given")
+            if not torch.is_tensor(dts):
+                dts = torch.as_tensor(np.asarray(dts, dtype=np.float32))
+            dts = dts.to(device=image.device, dtype=image.dtype).reshape(batch, ticks)
+            dropped = torch.stack(
+                [self.gru_in_drop(token[:, tick]) for tick in range(ticks)],
+                dim=1,
+            )
+            gru_in = torch.cat([dropped, dts.unsqueeze(-1)], dim=-1)
+            gru_out, h_new = self.gru(gru_in, state.h)
+            tokens_ring = state.tokens
+            mask_ring = state.mask
+            feats = []
+            zeros = torch.zeros(batch, 1, device=image.device, dtype=image.dtype)
+            for tick in range(ticks):
+                dt_col = dts[:, tick].reshape(batch, 1)
+                aged = mask_ring + dt_col
+                mask_ring = torch.cat([aged[:, 1:], zeros], dim=1)
+                tokens_ring = torch.cat([tokens_ring[:, 1:], token[:, tick : tick + 1]], dim=1)
+                in_span = (mask_ring <= float(RESIDUAL_S)).to(dtype=image.dtype)
+                denom = in_span.sum(dim=1, keepdim=True).clamp(min=1.0)
+                residual = (tokens_ring * in_span.unsqueeze(-1)).sum(dim=1) / denom
+                if self.skip is not None:
+                    residual = self.skip(residual)
+                feats.append(gru_out[:, tick, :] + residual)
+            feat = torch.stack(feats, dim=1).reshape(batch * ticks, -1)
+            pred = _heads_batch(self, feat, cond)
+            if bool(getattr(self, "aux_sensors", False)) and main_feat is not None:
+                import torch.nn.functional as functional
+
+                depth = self.aux_depth_head(main_feat)
+                sem = self.aux_sem_head(main_feat)
+                depth = functional.adaptive_avg_pool2d(depth, (self.aux_h, self.aux_w))
+                sem = functional.adaptive_avg_pool2d(sem, (self.aux_h, self.aux_w))
+                pred.aux_depth = depth
+                pred.aux_sem_logits = sem
+            end_state = SceneState(h=h_new, tokens=tokens_ring, mask=mask_ring)
+            return pred, end_state, end_state
+
         def _forward_batched(
             self, image: Any, dt: Any, state: SceneState, ages: Any = None, cond: Any = None
         ) -> tuple[ScenePrediction, SceneState]:
@@ -1787,6 +1872,35 @@ if torch is not None:
             if float(strip.detach().max()) > 1.5:
                 strip = strip / 255.0
         return strip
+
+    def _window_ages(net: SceneNet, ages: Any, image: Any, batch: int, ticks: int) -> Any:
+        """``(B, T, 8)`` ages, or None when the net has no cam-age input."""
+        if not net.cam_age:
+            if ages is not None:
+                raise ValueError("this scene net has no cam-age input; ages were given")
+            return None
+        from python.data.cam_hold import CAM_AGE_N
+
+        if ages is None:
+            raise ValueError("this scene net was trained with --cam-age and needs the 8 per-camera ages")
+        if not torch.is_tensor(ages):
+            ages = torch.as_tensor(np.asarray(ages, dtype=np.float32))
+        ages = ages.to(device=image.device, dtype=image.dtype).reshape(batch, ticks, CAM_AGE_N)
+        return ages
+
+    def _window_cond(net: SceneNet, cond: Any, image: Any, batch: int, ticks: int) -> Any:
+        """``(B*T, cond_dim)`` matching flattened window predictions."""
+        dim = int(getattr(net, "cond_dim", 0) or 0)
+        if not dim:
+            if cond is not None:
+                raise ValueError("this scene net has no ctl cond input; cond was given")
+            return None
+        if cond is None:
+            raise ValueError(f"this scene net was trained with --ctl-cond and needs cond ({dim} floats from t-dt)")
+        if not torch.is_tensor(cond):
+            cond = torch.as_tensor(np.asarray(cond, dtype=np.float32))
+        cond = cond.to(device=image.device, dtype=image.dtype).reshape(batch, ticks, dim)
+        return cond.reshape(batch * ticks, dim)
 
     def _ages_column(ages: Any, image: Any) -> Any:
         """``(B, 1, 8)`` ages on the image's device. Missing ages are an error."""

@@ -469,6 +469,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip (and log) an epoch checkpoint that would leave less than this many GB free. Default 8.",
     )
     parser.add_argument(
+        "--exp-distill-feats",
+        action="store_true",
+        help=(
+            "EXPERIMENT (off by default): train a tiny student on cached frozen teacher "
+            "tokens from --exp-distill-cache. Training only; not exported. Holdout rows "
+            "are never written into the cache."
+        ),
+    )
+    parser.add_argument(
+        "--exp-distill-cache",
+        default="",
+        help="Folder of a gvd-distill-feats-1 cache (tokens.npy + meta.json). Used with --exp-distill-feats.",
+    )
+    parser.add_argument(
+        "--exp-distill-teacher",
+        default="",
+        help="Optional teacher epoch ckpt used to build --exp-distill-cache (train rows only).",
+    )
+    parser.add_argument(
         "--grad-ckpt",
         action="store_true",
         help=(

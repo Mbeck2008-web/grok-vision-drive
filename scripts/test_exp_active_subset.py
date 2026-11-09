@@ -60,6 +60,56 @@ class ExpActiveSubsetTests(unittest.TestCase):
         # With missing -> +inf hard rank, top 40% of 5 = 2 ids from the missing/high
         self.assertEqual(len(chosen), 2)
 
+    def test_two_strips_keep_twenty_distinct_ids(self) -> None:
+        from python.train.exp_active_subset import (
+            row_frame_key,
+            select_active_subset,
+            unique_rows_by_frame_key,
+        )
+
+        rows = [
+            {"i": i, "kind": "train", "source": src}
+            for src in ("prior", "second")
+            for i in range(10)
+        ]
+        self.assertEqual(len(rows), 20)
+        unique = unique_rows_by_frame_key(rows)
+        self.assertEqual(len(unique), 20)
+        keys = [row_frame_key(r) for r in unique]
+        self.assertEqual(len(set(keys)), 20)
+        losses = {row_frame_key(r): float(r["i"]) for r in unique}
+        chosen = select_active_subset(
+            unique, losses, hard_frac=1.0, random_floor=0.0, rng=np.random.RandomState(0)
+        )
+        chosen_keys = [row_frame_key(unique[p]) for p in chosen]
+        self.assertEqual(len(chosen_keys), 20)
+        self.assertEqual(len(set(chosen_keys)), 20)
+        # A colliding bare-i dedupe would have collapsed this to 10 ids and
+        # slaved the second strip to the first strip's {7,8,9} under hard_frac=0.3.
+        hard = select_active_subset(
+            unique, losses, hard_frac=0.3, random_floor=0.0, rng=np.random.RandomState(0)
+        )
+        hard_keys = [row_frame_key(unique[p]) for p in hard]
+        self.assertEqual(len(hard_keys), 6)
+        self.assertEqual(len(set(hard_keys)), 6)
+        self.assertEqual({src for src, _i in hard_keys}, {"prior", "second"})
+
+    def test_select_whole_windows(self) -> None:
+        from python.train.exp_active_subset import filter_plan_whole_windows
+
+        window = {
+            "kind": "train",
+            "rows": [{"i": i, "source": "a", "kind": "train"} for i in range(10, 15)],
+        }
+        hold = {"kind": "holdout", "rows": [{"i": 99, "source": "a", "kind": "holdout"}]}
+        allowed = {("a", 11), ("a", 14)}
+        filtered = filter_plan_whole_windows([window, hold], allowed)
+        self.assertEqual(len(filtered), 2)
+        self.assertEqual([r["i"] for r in filtered[0]["rows"]], [10, 11, 12, 13, 14])
+        self.assertEqual(filtered[1]["kind"], "holdout")
+        empty = filter_plan_whole_windows([window], {("b", 11)})
+        self.assertEqual(empty, [])
+
 
 if __name__ == "__main__":
     unittest.main()

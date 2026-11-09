@@ -2623,7 +2623,7 @@ def train_directory(
         nonlocal paused_exit, epoch, cursor, done, last_loss, supervised
         nonlocal device, net, batch, recommended, windows, last_batch
         nonlocal steps_per_epoch, eta_pass, schedule_printed
-        active_train_losses: dict[int, float] = {}
+        active_train_losses: dict[tuple[str, int], float] = {}
         history: list[float] = []
         ctl_ratio_done: set[int] = set()
         best_value: float | None = None
@@ -2660,15 +2660,13 @@ def train_directory(
                     if item.get("kind") == "holdout":
                         continue
                     train_rows.extend(list(item.get("rows") or []))
-                # Dedupe by row i, keep first occurrence for stable ranking.
-                seen: set[int] = set()
-                unique_rows: list[Any] = []
-                for row in train_rows:
-                    key = int(row.get("i"))
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    unique_rows.append(row)
+                from python.train.exp_active_subset import (
+                    filter_plan_whole_windows,
+                    row_frame_key,
+                    unique_rows_by_frame_key,
+                )
+
+                unique_rows = unique_rows_by_frame_key(train_rows)
                 chosen = select_active_subset(
                     unique_rows,
                     active_train_losses,
@@ -2676,19 +2674,8 @@ def train_directory(
                     random_floor=float(exp_active_random_floor),
                     rng=window_rng if hasattr(window_rng, "choice") else __import__("numpy").random.RandomState(int(seed)),
                 )
-                allowed = {int(unique_rows[pos]["i"]) for pos in chosen}
-                filtered: list[Any] = []
-                for item in plan_steps:
-                    if item.get("kind") == "holdout":
-                        filtered.append(item)
-                        continue
-                    kept_rows = [row for row in list(item.get("rows") or []) if int(row.get("i")) in allowed]
-                    if not kept_rows:
-                        continue
-                    clone = dict(item)
-                    clone["rows"] = kept_rows
-                    filtered.append(clone)
-                plan_steps = filtered
+                allowed = {row_frame_key(unique_rows[pos]) for pos in chosen}
+                plan_steps = filter_plan_whole_windows(plan_steps, allowed)
                 print(
                     f"[GVD] exp-active-subset epoch={int(epoch)} train_ids={len(allowed)} "
                     f"windows={sum(1 for it in plan_steps if it.get('kind')=='train')} "
@@ -2891,7 +2878,9 @@ def train_directory(
                             if piece.get("kind") == "holdout":
                                 continue
                             for row in list(piece.get("rows") or []):
-                                active_train_losses[int(row.get("i"))] = float(step_loss)
+                                from python.train.exp_active_subset import row_frame_key as _active_key
+
+                                active_train_losses[_active_key(row)] = float(step_loss)
                 if use_ctl and int(epoch) in (0, 1) and int(epoch) not in ctl_ratio_done and n_sup:
                     # The ctl/lane_gt ratio at the first step of epochs 0 and 1. Outside [0.1, 10]
                     # is a flag for the owner, not an auto-fix.

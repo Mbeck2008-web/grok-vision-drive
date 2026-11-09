@@ -352,6 +352,12 @@ def main(clock=None) -> None:
         help="Scene-net ONNX path. Empty uses models/e2e_scene.onnx.",
     )
     ap.add_argument(
+        "--scene-ckpt",
+        default="",
+        help="Shadow-only: load a train_scene epoch .npz, run SceneNet on the main camera "
+        "(CPU), and draw lane_gt. Engage is blocked. The prediction never actuates.",
+    )
+    ap.add_argument(
         "--no-engage",
         action="store_true",
         default=os.environ.get("GVD_NO_ENGAGE", "").strip().lower() in ("1", "true", "yes"),
@@ -372,6 +378,8 @@ def main(clock=None) -> None:
         help="Stop the supervisor loop after this many seconds (0 = run until stopped). For captures.",
     )
     args = ap.parse_args()
+    if str(getattr(args, "scene_ckpt", "") or "").strip():
+        args.no_engage = True
 
     from python.data.data_root import DataDriveError, ensure_cache_dirs
 
@@ -380,6 +388,21 @@ def main(clock=None) -> None:
     except DataDriveError as exc:
         print(f"[GVD] {exc}", flush=True)
         raise SystemExit(2)
+
+    scene_ckpt = None
+    if str(getattr(args, "scene_ckpt", "") or "").strip():
+        from python.train.scene_ckpt_runtime import SceneCkptRuntime
+
+        try:
+            scene_ckpt = SceneCkptRuntime(args.scene_ckpt)
+        except (OSError, ValueError, KeyError) as exc:
+            print(f"[GVD] scene-ckpt: {exc}", flush=True)
+            raise SystemExit(2)
+        print(
+            f"[GVD] scene-ckpt shadow: {scene_ckpt.path} CPU; "
+            "engage blocked; prediction never actuates",
+            flush=True,
+        )
 
     if args.vision_only:
         os.environ["GVD_VISION_ONLY"] = "1"
@@ -1408,6 +1431,26 @@ def main(clock=None) -> None:
             st["cmd_applied"] = bool(applied.applied)
             if scene_guard is not None:
                 st["scene_lane"] = scene_guard.status()
+            shadow_pred = None
+            if scene_ckpt is not None:
+                from python.train.scene_ckpt_runtime import (
+                    SceneCkptInputError,
+                    apply_scene_ckpt_to_command,
+                    draw_scene_ckpt_overlay,
+                )
+
+                try:
+                    shadow_pred = scene_ckpt.observe(main, tick_dt)
+                except SceneCkptInputError as exc:
+                    print(f"[GVD] scene-ckpt shadow input: {exc}", flush=True)
+                    shadow_pred = None
+                applied = apply_scene_ckpt_to_command(applied, shadow_pred)
+                st["scene_ckpt"] = (
+                    shadow_pred.as_state()
+                    if shadow_pred is not None
+                    else {"shadow": True, "source": "scene_ckpt", "lane_x": None, "confidence": 0.0}
+                )
+                main = draw_scene_ckpt_overlay(main, shadow_pred)
             st["lane_hold"] = {
                 "lateral_m": None if lane_x is None else float(lane_x),
                 "lookahead_y_m": None if lane_y is None else float(lane_y),

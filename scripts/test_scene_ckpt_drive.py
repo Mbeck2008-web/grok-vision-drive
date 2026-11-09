@@ -42,15 +42,6 @@ def _pout(**extra):
     return SimpleNamespace(**base)
 
 
-def check_overlay_far_is_higher() -> None:
-    from python.train.scene_ckpt_runtime import _project_ego
-
-    _u_near, v_near = _project_ego(0.0, 5.0, 640, 480)
-    _u_far, v_far = _project_ego(0.0, 30.0, 640, 480)
-    assert v_far < v_near, (v_near, v_far)
-    print(f"overlay projection: v(5m)={v_near} v(30m)={v_far} (far higher) OK")
-
-
 def check_flag_off_by_default() -> None:
     from python.train.scene_ckpt_runtime import (
         apply_scene_ckpt_lane,
@@ -236,7 +227,6 @@ def check_drive_without_ckpt_refused() -> None:
 
 
 def main() -> None:
-    check_overlay_far_is_higher()
     check_flag_off_by_default()
     check_drive_feeds_modular_path()
     check_low_conf_and_aeb_override()

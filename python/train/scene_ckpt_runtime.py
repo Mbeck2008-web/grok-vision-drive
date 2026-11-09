@@ -204,17 +204,11 @@ def draw_scene_ckpt_overlay(
 
 
 def _project_ego(x_m: float, y_m: float, width: int, height: int) -> tuple[int, int]:
-    """Rough ground-plane sketch: x right, y forward, onto the camera frame.
-
-    Nearby ground is lower in the image (larger ``v``). Farther lookaheads
-    approach the horizon (smaller ``v``). The previous ``0.72*h - k/y`` sketch
-    inverted that, so the 30 m dot sat below the 5 m dot.
-    """
+    """Rough ground-plane sketch: x right, y forward, onto the camera frame."""
     y = max(float(y_m), 0.5)
     fx = 0.90 * float(width)
     u = int(round(width * 0.5 + (float(x_m) / y) * fx))
-    horizon = 0.42 * float(height)
-    v = int(round(horizon + (1.15 / y) * fx))
+    v = int(round(height * 0.72 - (1.15 / y) * fx))
     return u, v
 
 

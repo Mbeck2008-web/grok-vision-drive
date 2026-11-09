@@ -808,7 +808,16 @@ def _pass_plan_segments(
     few = len(groups) < 2
     plan: list[dict[str, Any]] = []
     for seg, block in groups:
-        if (few or segment_span_s(block) > LONG_SEGMENT_S) and int(blocks) > 1:
+        # README: fraction=0 means train-only (combined extra roots).
+        if float(fraction) <= 0.0:
+            plain = [dict(row) for row in block]
+            for row in plain:
+                row.pop("segment", None)
+            plan.extend(_train_only_plan(plain, length, stride, memory_s=memory_s))
+            continue
+        # README: --holdout-blocks K spreads the time holdout over K blocks
+        # for every segment, including the collector's 12-minute chunks.
+        if int(blocks) > 1:
             plan.extend(_block_plan(block, length, stride, memory_s=memory_s, fraction=fraction, blocks=int(blocks)))
             continue
         if few or segment_span_s(block) > LONG_SEGMENT_S:

@@ -65,10 +65,15 @@ def _road() -> np.ndarray:
 
 
 class _Tracker:
-    """A stopped vehicle track in the path at y (or no track)."""
+    """A stopped vehicle track in the path at y (or no track).
+
+    Tracker speed_mps is signed relative velocity. A stopped lead closes at
+    -ego; set ego_for_rel before the echo tick so as_dicts can emit -ego.
+    """
 
     def __init__(self, y: float | None) -> None:
         self.y = y
+        self.ego_for_rel: float | None = None
 
     def update(self, dets: Any, t: Any) -> list:
         return []
@@ -76,8 +81,10 @@ class _Tracker:
     def as_dicts(self) -> list[dict[str, Any]]:
         if self.y is None:
             return []
+        # Stopped lead: relative closing = -ego when ego is known; else 0.
+        rel = 0.0 if self.ego_for_rel is None else -float(self.ego_for_rel)
         return [{"id": 7, "class": "vehicle", "x": 0.0, "y": float(self.y), "yaw": 1.5707963,
-                 "speed_mps": 0.0, "yaw_rate": 0.0, "hits": 5, "misses": 0, "age": 5, "conf": 0.9}]
+                 "speed_mps": rel, "yaw_rate": 0.0, "hits": 5, "misses": 0, "age": 5, "conf": 0.9}]
 
 
 @contextlib.contextmanager
@@ -143,7 +150,8 @@ def _unknown_then_echo(
         assert not unset, ("no echo: speed fields must be None, not a 0 m/s fit", unset)
         _refused(_call("shadow_tick(ego_speed_mps=None)", lambda: _shadow(pout, None)), "no echo")
         # The echo arrives on the next tick, same camera bytes: a fresh fit at the echo speed,
-        # not a held fit from the unknown tick.
+        # not a held fit from the unknown tick. Stopped lead → relative speed -echo.
+        perc.tracker.ego_for_rel = float(echo)
         pout = perc.tick(frame, stitch_bgr=frame, ego_speed_mps=echo, dt_s=DT)
         cmd = _shadow(pout, echo).applied
     got = {"throttle": cmd.throttle, "brake": cmd.brake, "reason": cmd.reason,

@@ -170,6 +170,12 @@ class SceneCkptRuntime:
             if param.device.type != "cpu":
                 raise SceneCkptInputError("scene-ckpt shadow must stay on CPU")
         self.cams = tuple(getattr(self.net, "cams", ()) or ())
+        names = self.cams or ("main",)
+        if names != ("main",):
+            raise SceneCkptInputError(
+                f"{self.path.name}: this shadow runtime only has the main camera; "
+                f"refusing cams={list(names)} (missing sectors would be black)"
+            )
         self.canvas_h = int(getattr(self.net, "canvas_h", 192))
         self.canvas_w = int(getattr(self.net, "canvas_w", 256))
         self.aux_sensors = bool(getattr(self.net, "aux_sensors", False))

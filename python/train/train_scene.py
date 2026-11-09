@@ -3383,6 +3383,29 @@ def main(argv: list[str] | None = None) -> None:
             if refused:
                 print(f"[GVD] scene train: {refused}", flush=True)
                 sys.exit(2)
+        if bool(getattr(args, "exp_distill_feats", False)):
+            from python.train.exp_distill import load_feat_cache, run_student_epochs
+
+            cache_dir = str(getattr(args, "exp_distill_cache", "") or "")
+            if not cache_dir:
+                print("[GVD] --exp-distill-feats needs --exp-distill-cache", flush=True)
+                sys.exit(2)
+            if not torch_ready():
+                print("[GVD] scene train needs PyTorch")
+                sys.exit(2)
+            cache = load_feat_cache(cache_dir)
+            stats = run_student_epochs(
+                cache,
+                epochs=int(args.epochs),
+                lr=float(args.lr),
+                seed=int(args.seed),
+            )
+            print(
+                f"[GVD] exp-distill-feats n={int(stats['n'])} epochs={int(stats['epochs'])} "
+                f"last_loss={stats['last_loss']:.6f} (holdout never in cache)",
+                flush=True,
+            )
+            return
         if not torch_ready():
             print("[GVD] scene train needs PyTorch")
             sys.exit(2)

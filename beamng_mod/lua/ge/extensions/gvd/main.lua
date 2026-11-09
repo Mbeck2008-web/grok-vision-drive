@@ -1351,9 +1351,26 @@ local function applyInputs(veh, steer, throttle, brake)
     holdLogged = true
     log('I', 'GVD', '[GVD] retail drive: secondary Direct Drive wheel+pedals (source=gvd, filter=direct) so the software can hold the sim car')
   end
-  -- No throttle and any brake is arcade reverse. Pin the parking brake instead.
-  if throttle <= 0.01 and brake > 0.01 then
+  -- No throttle and a real hold (AEB / stop / dead-man) is arcade reverse if
+  -- sent as a service brake. Pin the parking brake instead. A smaller brake
+  -- while moving is a proportional service pedal (speed error, AEB warn).
+  -- At/under SERVICE_MIN_SPEED that same pedal is arcade reverse (run 8),
+  -- so we coast. Treating every brake as park slammed the handbrake at
+  -- 2 m/s of overspeed.
+  local HOLD_BRAKE = 0.99
+  local SERVICE_MIN_SPEED = 0.5
+  if throttle <= 0.01 and brake >= HOLD_BRAKE then
     return queueVehicle(veh, string.format(VE_PARK_FMT, steer))
+  end
+  if throttle <= 0.01 and brake > 0.01 then
+    local spd = egoFb and tonumber(egoFb.speed) or nil
+    if spd ~= nil and spd <= SERVICE_MIN_SPEED then
+      throttle = 0
+      brake = 0
+    else
+      -- Moving or unknown speed: proportional service brake.
+      throttle = 0
+    end
   end
   return queueVehicle(veh, string.format(VE_APPLY_FMT, steer, throttle, brake))
 end

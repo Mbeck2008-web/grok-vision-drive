@@ -52,21 +52,18 @@ def check_log_does_not_track() -> None:
 
 
 def check_same_side_pair_tracks_the_center() -> None:
-    """Right curb plus a wall. Several true offsets. r(detected, truth) > 0.8."""
+    """Right curb plus a wall is not the ego lane: do not invent a center (PR #186)."""
     offsets = [-1.2, -0.6, 0.0, 0.6, 1.2, 1.6]
-    detected: list[float] = []
-    truth: list[float] = []
     for offset in offsets:
         right = -offset + 1.75
         wall = right + 1.8
-        got = _center([_line(right), _line(wall)])
-        detected.append(got)
-        truth.append(-offset)
-        # The center stays on the same side of the car as the true center.
-        if abs(offset) > 0.4:
-            assert got * (-offset) > 0.0, (offset, got, right, wall)
-    corr = pearson(detected, truth)
-    assert corr is not None and corr > 0.8, (corr, list(zip(offsets, detected, truth)))
+        plan = predict_path(
+            lanes_bev=[_line(right), _line(wall)], lane_conf=0.8, ego_speed_mps=4.0,
+        )
+        sample = steer_sample_point(plan.path_ego or [])
+        assert sample is None, (offset, plan.lane_source, sample)
+        assert plan.drivable is False, (offset, plan.lane_source)
+        assert plan.lane_source == "none", plan.lane_source
 
 
 def check_straddling_pair_is_unchanged() -> None:

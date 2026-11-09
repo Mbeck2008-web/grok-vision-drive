@@ -68,26 +68,36 @@ def main() -> None:
     # same index in the periodic saves: tick 1, 20, 40, 59.
     by_tick = {i + 1: row for i, row in enumerate(rows)}
     wanted = (1, 20, 40)
+    # No invented twin: frames without a real painted pair yield no steer sample.
     got_x: list[float] = []
     got_gt: list[float] = []
+    one_sided = 0
     for name, tick in zip(FRAMES, (1, 20, 40, 59)):
         image = _clean(FIXTURE / name)
         fit = lanes_from_view(None, image)
         plan = predict_path(lanes_bev=fit.lanes_bev, lane_conf=fit.conf, ego_speed_mps=8.0)
         sample = steer_sample_point(plan.path_ego or [])
         row = by_tick[tick]
-        assert sample is not None, (name, plan.lane_source)
-        lane_x = float(sample["x"])
         gt = row.get("gt_center_x")
         assert gt is not None, row["t"]
+        if sample is None:
+            assert plan.lane_source in ("none", ""), (name, plan.lane_source)
+            assert "one_" not in plan.lane_source, plan.lane_source
+            one_sided += 1
+            continue
+        lane_x = float(sample["x"])
         if tick in wanted and row.get("in_lane") is not False:
             got_x.append(lane_x)
             got_gt.append(float(gt))
             if abs(float(gt)) > 0.4:
                 assert lane_x * float(gt) > 0.0, (name, lane_x, gt, plan.lane_source)
-    assert len(got_x) >= 3, (got_x, got_gt)
-    corr = _pearson(got_x, got_gt)
-    assert corr > 0.6, (corr, list(zip(got_x, got_gt)))
+    assert one_sided >= 1, "expected at least one frame to refuse inventing a twin"
+    assert len(got_x) >= 1, (got_x, got_gt)
+    if len(got_x) >= 3:
+        corr = _pearson(got_x, got_gt)
+        assert corr > 0.6, (corr, list(zip(got_x, got_gt)))
+    else:
+        corr = float("nan") if len(got_x) < 2 else _pearson(got_x, got_gt)
 
     # The hit: last engaged steer was left while the center was to the right,
     # then the car left the road on the left into the fence.
@@ -107,13 +117,14 @@ def main() -> None:
 
     _check_hold_age()
     print(
-        f"test_gt_run5_replay: OK r={corr:.3f} "
+        f"test_gt_run5_replay: OK r={corr} one_sided={one_sided} "
         f"pairs={list(zip([round(x, 2) for x in got_x], [round(g, 2) for g in got_gt]))}"
     )
 
 
 def _check_hold_age() -> None:
-    image = _clean(FIXTURE / "frame_000020.jpg")
+    # frame_000040 has a real painted pair; frame_000020 no longer invents one.
+    image = _clean(FIXTURE / "frame_000040.jpg")
     perc = ModularPerception(allow_synthetic=False, detector_id="empty")
     first = perc.tick(None, stitch_bgr=image, ego_speed_mps=6.0, dt_s=0.2)
     assert perc._lane_track.center_x is not None, first.lane_source

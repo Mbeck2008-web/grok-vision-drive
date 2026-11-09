@@ -4,10 +4,10 @@ Geometry and rules only. No network, no checkpoint, no wheel angle.
 
 What is in frame is a sample, not the whole road:
 
-* A lane line that stops early, or only one side of it, is continued in the
-  direction it was already going. A missing side is the last measured width,
-  or a default width, off the side we do have. A frame with no lines can
-  still continue a prior lane the caller still remembers.
+* A pair of painted lines that stops early is continued in the direction
+  it was already going. A missing side is not invented at a default 3.5 m
+  width; that frame is not drivable. A frame with no lines can still
+  continue a prior painted pair the caller still remembers.
 * A car that is only partly in frame is given a full footprint. A car that
   just dropped out is coasted with its last yaw and speed, and the path
   stops short of that predicted footprint.
@@ -771,31 +771,9 @@ def _one_close_line(
     polys: list[list[tuple[float, float]]],
     track: LaneTrack | None,
 ) -> tuple[list[tuple[float, float]], list[tuple[float, float]], float, str] | None:
-    """One boundary within 2.5 m, when no pair has a real lane width."""
-    nearest: list[tuple[float, float]] | None = None
-    nearest_abs: float | None = None
-    for poly in polys:
-        ordered = _sort_y(poly)
-        if len(ordered) < 2:
-            continue
-        dist = abs(_near_x(ordered))
-        if nearest is None or nearest_abs is None or dist < nearest_abs:
-            nearest = ordered
-            nearest_abs = dist
-    # One lane width. The curb-and-wall case sits near 3 m; a 10 m pair's
-    # nearer line is past this and is not a boundary.
-    if nearest is None or nearest_abs is None or nearest_abs > LANE_W_DEFAULT:
-        return None
-    side = _one_side(_near_x(nearest), track)
-    if side == "left":
-        left = nearest
-        right = [(x + LANE_W_DEFAULT, y) for x, y in nearest]
-    else:
-        right = nearest
-        left = [(x - LANE_W_DEFAULT, y) for x, y in nearest]
-    if track is not None:
-        track.side = side
-    return left, right, LANE_W_DEFAULT, f"one_{side}"
+    """One boundary is not a lane. Do not invent the missing side at 3.5 m."""
+    del polys, track
+    return None
 
 
 def _pair(
@@ -805,21 +783,7 @@ def _pair(
     if not polys:
         return None
     if len(polys) == 1:
-        only = _sort_y(polys[0])
-        if len(only) < 2:
-            return None
-        side = _one_side(_near_x(only), track)
-        # Half a lane toward the center. The other boundary is the full
-        # width away, so the midpoint is not the paint line itself.
-        if side == "left":
-            left = only
-            right = [(x + LANE_W_DEFAULT, y) for x, y in only]
-        else:
-            right = only
-            left = [(x - LANE_W_DEFAULT, y) for x, y in only]
-        if track is not None:
-            track.side = side
-        return left, right, LANE_W_DEFAULT, f"one_{side}"
+        return None
 
     best: tuple[tuple, list, list, float] | None = None
     for i, a in enumerate(polys):
@@ -863,19 +827,10 @@ def _pair(
     # lane toward the car, when that line is close enough to be our boundary.
     same_side = near_l > 0.35 or near_r < -0.35
     bad_width = width < LANE_W_MIN or width > LANE_W_MAX
-    nearer = left if abs(near_l) <= abs(near_r) else right
     if (same_side or bad_width) and min(abs(near_l), abs(near_r)) < 2.5:
-        only = _sort_y(nearer)
-        side = _one_side(_near_x(only), track)
-        if side == "left":
-            left = only
-            right = [(x + LANE_W_DEFAULT, y) for x, y in only]
-        else:
-            right = only
-            left = [(x - LANE_W_DEFAULT, y) for x, y in only]
-        if track is not None:
-            track.side = side
-        return left, right, LANE_W_DEFAULT, f"one_{side}"
+        # Same-side curb-and-wall, or a bad width, is not a painted pair.
+        # Do not invent the other boundary 3.5 m away.
+        return None
     if bad_width:
         width = LANE_W_DEFAULT
     return left, right, float(width), "pair"
@@ -925,11 +880,19 @@ def _lane_route(
     prev_side = None if lane_track is None else lane_track.side
     paired = _pair(polys, lane_track)
     if paired is None:
-        return None
-    left, right, width, base = paired
+        # Do not invent the missing boundary. Before the first painted pair,
+        # still seed a straight path at x=0 so we do not steer a guess.
+        if lane_track is not None and lane_track.awaiting_pair:
+            base = "none"
+            remember_pair = False
+        else:
+            return None
+    else:
+        left, right, width, base = paired
+        remember_pair = base == "pair" and remember
     # Before the first fresh pair, a one-sided line or a hold is not the
     # center. Drive straight at x=0. A pair with remember set is the seed.
-    if lane_track is not None and lane_track.awaiting_pair and not (base == "pair" and remember):
+    if paired is None or (lane_track is not None and lane_track.awaiting_pair and not remember_pair):
         lane_track.side = prev_side
         straight: list[tuple[float, float]] = []
         y_hold = 0.0
@@ -1078,11 +1041,12 @@ def _path_curvature(path: list[dict[str, float]]) -> float:
 
 
 def _confidence(prediction: str, lane_conf: float, *, extended: bool) -> float:
+    lane = max(0.0, min(1.0, float(lane_conf)))
     if prediction == "roundabout":
         return 0.62
     if prediction == "context" or extended:
-        return max(0.5, min(0.8, 0.5 + 0.25 * lane_conf))
-    return max(0.5, min(1.0, 0.45 + 0.5 * max(0.0, lane_conf)))
+        return max(0.0, min(0.8, lane))
+    return lane
 
 
 def _unseen_s(track: dict[str, Any]) -> float:

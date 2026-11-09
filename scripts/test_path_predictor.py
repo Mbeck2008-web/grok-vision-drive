@@ -99,30 +99,17 @@ def check_full_lane_and_commands() -> None:
 
 
 def check_partial_lane_is_continued() -> None:
-    # Only the left line, and only the first 10 m. Context is that line's heading
-    # and a default lane width. The route continues past what was in frame.
+    # Only the left line is not a painted pair. The old planner copied it
+    # 3.5 m to the right and steered that center. That invents a lane line.
     left = [{"x": -1.75, "y": float(y), "z": 0.0} for y in range(2, 12, 2)]
     plan = predict_path(lanes_bev=[left], lane_conf=0.4, ego_speed_mps=5.0)
-    assert plan.drivable and plan.prediction == "extended", plan.prediction
-    assert _max_y(plan) >= 30.0, _max_y(plan)
-    for p in plan.path_ego:
-        assert -1.75 < p["x"] < 1.75, p
-    far = _near(plan, 28.0)
-    assert abs(far["x"]) < 0.35, far
+    assert plan.drivable is False, (plan.drivable, plan.prediction, plan.lane_source)
+    assert "one_left" not in str(plan.lane_source)
 
-    # The visible piece is already turning. Continuation keeps that heading,
-    # it does not snap back to a straight-ahead guess.
     slope = 0.08
     curved = [{"x": -1.75 + slope * y, "y": float(y)} for y in (2, 4, 6, 8, 10)]
     bent = predict_path(lanes_bev=[curved], lane_conf=0.45, ego_speed_mps=4.0)
-    assert bent.prediction == "extended"
-    assert _max_y(bent) > 20.0
-    sample = _near(bent, 30.0)
-    # Centerline sits half a width to the right of the left line, same slope.
-    expect = slope * sample["y"]
-    assert abs(sample["x"] - expect) < 0.4, (sample, expect)
-    left_x = -1.75 + slope * sample["y"]
-    assert left_x < sample["x"] < left_x + 3.5
+    assert bent.drivable is False, (bent.drivable, bent.prediction, bent.lane_source)
 
     # Nothing in this frame. The prior lane is the context, and we still drive it.
     missing = predict_path(
@@ -500,13 +487,11 @@ def check_bend_not_roundabout_and_blinkers() -> None:
             center = 20.0 - math.sqrt(max(0.0, 400.0 - p["y"] * p["y"]))
             assert abs(p["x"] - center) < 1.2, (p, center)
 
-    # Near samples are still left of the car even after the line crosses x=0.
+    # A single bowed line used to invent a 3.5 m twin and steer that center.
     bowed = [{"x": -1.75 + 0.2 * y, "y": float(y)} for y in range(0, 32, 2)]
     assert sum(p["x"] for p in bowed) / len(bowed) > 0.0
     sided = predict_path(lanes_bev=[bowed], lane_conf=0.7, ego_speed_mps=5.0)
-    assert sided.path_ego[0]["x"] > -1.2, sided.path_ego[0]
-    side_cmd = follow_path(sided, ego_speed_mps=5.0)
-    assert side_cmd.steer > -0.5, side_cmd
+    assert sided.drivable is False, (sided.prediction, sided.lane_source, sided.path_ego[:2])
 
     lanes = _lane(-1.75, 1.75)
     paced = predict_path(
@@ -717,10 +702,8 @@ def check_noise_yield_gap_and_short_arc() -> None:
     for y in (2.0, 2.5, 3.0, 3.5, 4.0):
         glimpse.append({"x": radius - math.sqrt(radius * radius - y * y), "y": y, "z": 0.0})
     tight = predict_path(lanes_bev=[glimpse], lane_conf=0.6, ego_speed_mps=5.0)
-    tight_cmd = follow_path(tight, ego_speed_mps=5.0)
-    assert abs(tight.curvature) > 0.04, tight.curvature
-    assert tight.target_v < 12.0, tight.target_v
-    assert not (tight_cmd.throttle > 0.4 and tight.target_v > 16.0 and tight.blinker == "off")
+    # A single-arc glimpse is not a painted pair; do not invent the other rail.
+    assert tight.drivable is False, (tight.prediction, tight.lane_source, tight.curvature)
 
 
 def check_slow_close_bumper_and_far_yield() -> None:

@@ -282,8 +282,15 @@ def shadow_tick(
     # Modular attach does not copy that stub's brake. A preview hold (no lane
     # fit) is stop_command from this branch, not veto:e2e_stub.
     if policy == "modular":
+        modular_veto = "none"
         if path_debug_preview and not allow_preview_drive:
             applied = stop_command(seq=seq, reason="preview_blocked")
+        elif float(lane_conf) < float(cfg.lane_conf_min):
+            modular_veto = "low_lane_conf"
+            applied = stop_command(seq=seq, reason="veto:low_lane_conf")
+        elif float(path_conf) < float(cfg.path_conf_min):
+            modular_veto = "low_path_conf"
+            applied = stop_command(seq=seq, reason="veto:low_path_conf")
         else:
             applied = DriveCommand(
                 steer=modular.steer,
@@ -298,7 +305,7 @@ def shadow_tick(
             applied=applied,
             shadow=shadow,
             e2e_ok=e2e_ok,
-            veto_reason="none",
+            veto_reason=modular_veto,
             should_disengage=False,
             clip_trigger=None,
             policy=policy,

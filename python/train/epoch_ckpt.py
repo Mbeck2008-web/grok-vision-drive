@@ -207,22 +207,47 @@ def find_epoch_ckpt(ckpt_dir: Path | str, epoch: int, run: str | None = None) ->
     return hits[0]
 
 
-def build_net(meta: Mapping[str, Any]) -> Any:
+def _arch_flag(meta: Mapping[str, Any], weights: Mapping[str, Any] | None, key: str, prefixes: tuple[str, ...], token: str) -> bool:
+    """True when meta says so, or (for older files) the weights / arch string carry the head."""
+    if meta.get(key) is True:
+        return True
+    if weights:
+        for name in weights:
+            text = str(name)
+            if any(text.startswith(prefix) for prefix in prefixes):
+                return True
+    arch = str(meta.get("arch") or "")
+    return bool(token) and token in arch
+
+
+def build_net(meta: Mapping[str, Any], weights: Mapping[str, Any] | None = None) -> Any:
     """A CPU net of the checkpoint's architecture (cams, scale, backbone, cam_age).
 
     A checkpoint written before ``cam_age`` existed has no key: no ages.
     The same holds for ``ctl``: no key, no ctl head; and ``ctl_cond_dim``: no key, no cond input.
+    Aux depth/sem (``aux_sensors``) and ``road_edge`` were added the same way:
+    older files may omit the meta key but still store the heads in ``weights`` or
+    ``arch`` (``:aux=`` / ``:road_edge=``). Pass ``weights`` so those files load.
     """
     cams = tuple(meta.get("cams") or ()) or None
     scale = float(meta.get("scale") or 1.0)
     backbone = str(meta.get("backbone") or "scratch")
+    aux = _arch_flag(meta, weights, "aux_sensors", ("aux_depth_head.", "aux_sem_head."), ":aux=")
+    road = _arch_flag(meta, weights, "road_edge", ("road_edge_head.",), ":road_edge=")
     if backbone in ("", "scratch"):
         from python.train.scene_net import SceneNet
 
-        return SceneNet(cams=cams, scale=scale, cam_age=bool(meta.get("cam_age")), ctl=bool(meta.get("ctl")),
-                        cond_dim=int(meta.get("ctl_cond_dim") or 0))
-    if meta.get("cam_age") or meta.get("ctl"):
-        raise ValueError("a --cam-age or ctl checkpoint is a scratch-net checkpoint; this one names a backbone")
+        return SceneNet(
+            cams=cams,
+            scale=scale,
+            cam_age=bool(meta.get("cam_age")),
+            ctl=bool(meta.get("ctl")),
+            cond_dim=int(meta.get("ctl_cond_dim") or 0),
+            aux_sensors=aux,
+            road_edge=road,
+        )
+    if meta.get("cam_age") or meta.get("ctl") or aux or road:
+        raise ValueError("a --cam-age, ctl, aux, or road_edge checkpoint is a scratch-net checkpoint; this one names a backbone")
     from python.train.pretrained_net import build_scene_net
 
     return build_scene_net(cams, scale, backbone, freeze=bool(meta.get("freeze_backbone")))
@@ -255,7 +280,7 @@ def export_epoch_onnx(ckpt: Path | str, out: Path | str, *, trace: Any = None) -
         raise FileExistsError(f"{out} already exists (create-only)")
     loaded = load_epoch_ckpt(ckpt)
     meta = loaded["meta"]
-    net = build_net(meta)
+    net = build_net(meta, loaded["weights"])
     load_into_net(net, loaded["weights"])
     net = net.cpu().eval()
     heads = tuple(meta.get("heads") or ()) or None

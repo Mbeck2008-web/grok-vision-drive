@@ -228,8 +228,11 @@ def main():
     multi = synthetic_rows(1500, segment="a") + [dict(r, i=r["i"] + 10000, t=r["t"] + 5000, segment="b") for r in synthetic_rows(1500, segment="b")]
     k1m = pass_plan(multi, CHUNK, chunk_stride(CHUNK))
     k5m = pass_plan(multi, CHUNK, chunk_stride(CHUNK), blocks=5)
-    assert plan_key(k1m) == plan_key(k5m), "short segments must keep whole-segment holdout"
-    print("synthetic short segments: K=5 keeps the whole-segment holdout OK")
+    # The old assertion required K=5 == K=1 (whole-segment / every-fifth holdout).
+    # That locked in ignoring --holdout-blocks on collector-length segments.
+    # README: K spreads the last 20% over K equal time blocks in each segment.
+    assert plan_key(k1m) != plan_key(k5m), "short segments must honor --holdout-blocks"
+    print("synthetic short segments: K=5 time-splits instead of whole-segment holdout OK")
     grid = grid_rows()
     spec, *_ = check_cells(grid, "synthetic grid")
     assert {c["class"] for c in spec["cells"]} == {"fast", "slow"}, "both speed classes must be held out"

@@ -1450,8 +1450,7 @@ def main(clock=None) -> None:
                     if shadow_pred is not None
                     else {"shadow": True, "source": "scene_ckpt", "lane_x": None, "confidence": 0.0}
                 )
-                if main is not None:
-                    main = draw_scene_ckpt_overlay(main, shadow_pred)
+                main = draw_scene_ckpt_overlay(main, shadow_pred)
             st["lane_hold"] = {
                 "lateral_m": None if lane_x is None else float(lane_x),
                 "lookahead_y_m": None if lane_y is None else float(lane_y),

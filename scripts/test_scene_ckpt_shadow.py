@@ -226,6 +226,29 @@ def check_overlay_on_stub() -> None:
     low = painted.mean(axis=2)
     assert float((low > 0).mean()) > 0
     print("overlay: stub 480x640 frame marked SHADOW in a non-ice color OK")
+    assert draw_scene_ckpt_overlay(None, pred) is None
+
+
+def check_ctl_cond_refused_at_load() -> None:
+    import tempfile
+
+    import torch
+
+    from python.train.scene_ckpt_runtime import SceneCkptInputError, SceneCkptRuntime
+    from python.train.scene_net import SceneNet
+
+    torch.manual_seed(4)
+    net = SceneNet(cams=("main",), ctl=True, cond_dim=5).cpu().eval()
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write_ckpt(Path(tmp), net, meta_extra={"ctl": True, "ctl_cond_dim": 5})
+        try:
+            SceneCkptRuntime(path)
+        except SceneCkptInputError as exc:
+            msg = str(exc).lower()
+            assert "cond" in msg, exc
+        else:
+            raise AssertionError("a ctl+cond_dim checkpoint loaded; it must be refused at load")
+    print("ctl+cond_dim checkpoint refused at load with SceneCkptInputError OK")
 
 
 def main() -> None:
@@ -234,6 +257,7 @@ def main() -> None:
     check_main_cam_shape()
     check_shadow_cannot_actuate()
     check_overlay_on_stub()
+    check_ctl_cond_refused_at_load()
     print("test_scene_ckpt_shadow: all OK")
 
 

@@ -73,8 +73,14 @@ class SceneCkptPred:
         }
 
 
-def draw_scene_ckpt_overlay(frame: np.ndarray, pred: SceneCkptPred | None) -> np.ndarray:
-    """Paint the predicted lane-center path on a camera frame. Does not modify ``frame``."""
+def draw_scene_ckpt_overlay(frame: np.ndarray | None, pred: SceneCkptPred | None) -> np.ndarray | None:
+    """Paint the predicted lane-center path on a camera frame. Does not modify ``frame``.
+
+    No picture: return ``frame`` unchanged (including None). Callers can always
+    assign the result back without a None-check at the call site.
+    """
+    if frame is None:
+        return frame
     import cv2
 
     out = np.array(frame, copy=True)
@@ -144,10 +150,22 @@ class SceneCkptRuntime:
                 f"{self.path.name}: cam-age checkpoints need per-camera hold ages; "
                 "this shadow runtime does not feed them"
             )
+        cond_dim = int(meta.get("ctl_cond_dim") or 0)
+        if cond_dim:
+            raise SceneCkptInputError(
+                f"{self.path.name}: ctl cond model (ctl_cond_dim={cond_dim}, gvd_ctl_cond) "
+                "needs the t-dt controls; this shadow runtime does not feed them"
+            )
         self.meta = meta
         self.net = build_net(meta, weights)
         load_into_net(self.net, weights)
         self.net = self.net.cpu().eval()
+        net_cond = int(getattr(self.net, "cond_dim", 0) or 0)
+        if net_cond:
+            raise SceneCkptInputError(
+                f"{self.path.name}: ctl cond model (cond_dim={net_cond}, gvd_ctl_cond) "
+                "needs the t-dt controls; this shadow runtime does not feed them"
+            )
         for param in self.net.parameters():
             if param.device.type != "cpu":
                 raise SceneCkptInputError("scene-ckpt shadow must stay on CPU")

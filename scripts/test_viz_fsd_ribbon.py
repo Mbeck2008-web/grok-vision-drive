@@ -88,6 +88,38 @@ def check_spline_through_knots() -> None:
     )
 
 
+def check_no_overshoot() -> None:
+    """Polyline samples stay inside each successive knot pair's x-span (PCHIP).
+
+    Catmull-Rom overshoots the plateau [0,0,1,1] to about [-0.074, 1.074] and
+    must fail this check. Fritsch-Carlson PCHIP must pass both fixtures.
+    """
+    from python.viz.scene_ribbon import scene_ckpt_centers, scene_ckpt_ribbon_polyline
+
+    fixtures = (
+        [0.0, 0.0, 1.0, 1.0],
+        [0.0, 2.0, -1.0, 3.0],
+    )
+    for xs in fixtures:
+        centers = scene_ckpt_centers(_lane_gt(xs, 0.9))
+        assert [c["y"] for c in centers] == [5.0, 10.0, 20.0, 30.0], centers
+        assert [c["x"] for c in centers] == xs, centers
+        poly = scene_ckpt_ribbon_polyline(centers, 0.9)
+        assert poly, xs
+        for a, b in zip(centers, centers[1:]):
+            lo = min(a["x"], b["x"]) - 1e-6
+            hi = max(a["x"], b["x"]) + 1e-6
+            y0, y1 = a["y"], b["y"]
+            mid = [p for p in poly if y0 - 1e-9 <= p["y"] <= y1 + 1e-9]
+            assert mid, (xs, a, b)
+            for p in mid:
+                assert lo <= p["x"] <= hi, (
+                    f"overshoot on {xs}: sample {p} outside knot span "
+                    f"[{a['x']}, {b['x']}] at y in [{y0}, {y1}]"
+                )
+    print("no-overshoot: plateau [0,0,1,1] and zigzag [0,2,-1,3] stay in-span OK")
+
+
 def check_ribbon_honesty() -> None:
     from python.train.scene_ckpt_runtime import SceneCkptPred
     from python.viz.scene_ribbon import scene_ckpt_centers, scene_ckpt_ribbon_polyline
@@ -384,6 +416,7 @@ def _once_blend_ms(shape: tuple[int, ...], nseg: int = 36) -> float:
 def main() -> None:
     check_projection_monotonic()
     check_spline_through_knots()
+    check_no_overshoot()
     check_ribbon_honesty()
     check_overlay_and_command()
     check_stage_ribbon_and_no_gt()

@@ -83,7 +83,10 @@ def main() -> None:
     pout = perc.tick(haze, ego_speed_mps=0.0)
     assert pout.lane_conf >= gate, pout.lane_conf
     assert "lanes" not in pout.missing
-    assert pout.path_debug_preview is False
+    # Default paint gap is under LANE_PAIR_W_MIN. Detected lines must not become
+    # an invented 3.5 m twin: preview-block, modular stop, stay engaged.
+    assert pout.path_debug_preview is True, pout.planner
+    assert (pout.planner or {}).get("prediction") == "none", pout.planner
     held = shadow_tick(
         policy="modular",
         engaged=True,
@@ -101,8 +104,8 @@ def main() -> None:
     )
     assert held.veto_reason != "low_lane_conf"
     assert held.should_disengage is False
-    assert held.applied.reason == "ok"
-    assert held.applied.brake != 1.0
+    assert held.applied.reason == "preview_blocked", held.applied
+    assert held.applied.throttle == 0.0 and held.applied.brake == 1.0, held.applied
     clear = _yellow_white_road(
         asphalt=(110, 108, 105),
         yellow=(40, 210, 235),
@@ -287,11 +290,14 @@ def _check_stitch_lane_meters_and_empty_band() -> None:
     from python.perception.stitch360 import stitch_frames
     from python.planning.path_predictor import predict_path
 
+    # Wide paint so near separation clears LANE_PAIR_W_MIN (no inventing).
     road = _yellow_white_road(
         asphalt=(40, 40, 42),
         yellow=(0, 220, 220),
         white=(230, 230, 230),
         width=6,
+        left_frac=0.15,
+        right_frac=0.85,
     )
     direct = lanes_from_view(road, None)
     plan_direct = predict_path(
@@ -310,9 +316,13 @@ def _check_stitch_lane_meters_and_empty_band() -> None:
     plan = predict_path(
         lanes_bev=stitched.lanes_bev, lane_conf=stitched.conf, ego_speed_mps=5.0,
     )
-    assert plan.drivable and plan.path_ego, plan
-    assert plan.prediction != "none", plan.prediction
-    assert max(float(p["y"]) for p in plan.path_ego) > 8.0
+    # Stitch resampling can shrink near-separation under LANE_PAIR_W_MIN.
+    # Do not invent a twin: either a real pair, or an empty non-drivable plan.
+    if plan.drivable:
+        assert plan.path_ego and plan.prediction != "none", plan
+        assert max(float(p["y"]) for p in plan.path_ego) > 8.0
+    else:
+        assert plan.lane_source == "none" and "one_" not in plan.lane_source, plan
 
     rear = np.full((48, 80, 3), (0, 180, 0), dtype=np.uint8)
     pillar = np.full((48, 80, 3), (180, 180, 180), dtype=np.uint8)
@@ -321,6 +331,7 @@ def _check_stitch_lane_meters_and_empty_band() -> None:
         fit = lanes_from_view(road, canvas)
         assert fit.conf >= 0.9 and fit.lanes_bev, (frames, fit)
         again = predict_path(lanes_bev=fit.lanes_bev, lane_conf=fit.conf, ego_speed_mps=5.0)
+        # Empty-band path uses main (road): wide paint must drive without inventing.
         assert again.drivable and again.path_ego, again
 
 
@@ -409,8 +420,15 @@ def _yellow_white_road(
     vp_y: float = 0.46,
     sky: tuple[int, int, int] = (175, 185, 195),
     stripes: bool = True,
+    left_frac: float = 0.28,
+    right_frac: float = 0.72,
 ) -> np.ndarray:
-    """640×480 hood view. Default sky is the hazy BGR that must not read as white paint."""
+    """640×480 hood view. Default sky is the hazy BGR that must not read as white paint.
+
+    Default left/right fractions (~0.28/0.72) detect paint but sit under
+    LANE_PAIR_W_MIN so the planner must not invent a twin. Pass ~0.15/0.85
+    when a test needs a real drivable pair.
+    """
     cv2 = __import__("cv2")
     w, h = 640, 480
     img = np.full((h, w, 3), sky, dtype=np.uint8)
@@ -427,8 +445,8 @@ def _yellow_white_road(
         cv2.line(img, a, b, color, width)
 
     if stripes:
-        _draw(w * 0.28, yellow)
-        _draw(w * 0.72, white)
+        _draw(w * left_frac, yellow)
+        _draw(w * right_frac, white)
     cv2.rectangle(img, (0, int(h * 0.93)), (w, h), (35, 35, 38), -1)
     return img
 

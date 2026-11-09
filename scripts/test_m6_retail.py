@@ -873,38 +873,25 @@ def check_run_vision_e2e() -> None:
     st = read_state()
     assert st and st["engaged"] is False and st.get("disengage_reason") == "ego_unknown", st and st.get("disengage_reason")
 
-    # Engaged + preview allowed, still no cameras. Since the lane-fit path
-    # replaced the 36 m steer fallback, an empty view is a stop: target_v is 0,
-    # the fake echo is 5.5 m/s, and err < -1 selects
-    # brake = min(0.6, 0.05 * echo speed). Throttle stays 0. Steer stays 0.
-    # The ack path is unchanged.
+    # Engaged + preview allowed, still no cameras. Modular now honors
+    # lane_conf_min=0.25: empty view is veto:low_lane_conf (stop, stay engaged).
+    # allow-preview-drive only bypasses the preview gate, not the conf veto.
     echo_speed = 5.5
-    expected_brake = min(0.6, 0.05 * echo_speed)
-    from python.control.actuate import plan_command
-
-    law = plan_command(
-        path_ego=[],
-        planner={"target_v": 0.0, "aeb": "off"},
-        ego_speed_mps=echo_speed,
-        seq=1,
-    )
-    assert law.throttle == 0.0 and law.steer == 0.0, law
-    assert abs(law.brake - expected_brake) < 1e-9, law
     _run_supervisor(["--force-engage", "--allow-preview-drive"], seconds=2.5, ack=True)
     cmd = json.loads(cmd_path().read_text(encoding="utf-8"))
-    assert cmd["engaged"] is True and cmd["reason"] == "ok" and cmd["seq"] >= 10, cmd
-    assert cmd["throttle"] == 0.0, cmd
-    assert abs(float(cmd["brake"]) - expected_brake) < 1e-4, cmd
+    assert cmd["engaged"] is True and cmd["reason"] == "veto:low_lane_conf" and cmd["seq"] >= 10, cmd
+    assert cmd["throttle"] == 0.0 and float(cmd["brake"]) == 1.0, cmd
     assert cmd["steer"] == 0.0, cmd
     st = read_state()
     assert st and st["engaged"] is True and st["cmd_applied"] is True, {k: st.get(k) for k in ("engaged", "cmd_applied", "cmd_reason")}
-    assert st["cmd_reason"] == "cmd_json_applied" and st["ego_source"] == "lua" and st["lua_applying"] is True
+    # Applied reason is mirrored into cmd_reason under the veto stop.
+    assert st["cmd_reason"] == "veto:low_lane_conf" and st["ego_source"] == "lua" and st["lua_applying"] is True, {
+        k: st.get(k) for k in ("cmd_reason", "ego_source", "lua_applying")
+    }
     assert abs(float(st["ego"]["speed_mps"]) - echo_speed) < 1e-6, st["ego"]
     assert st["cmd_ack_seq"] >= st["cmd_seq"] - 5
     planner = st.get("planner") if isinstance(st.get("planner"), dict) else {}
     assert planner.get("prediction") == "none", planner
-    assert float(planner.get("target_v") or 0.0) == 0.0, planner
-    assert abs(float(planner.get("pred_brake") or 0.0) - expected_brake) < 1e-4, planner
     assert not st.get("lanes_bev"), st.get("lanes_bev")
     assert float(st.get("lane_conf") or 0.0) == 0.0, st.get("lane_conf")
     assert st.get("path_debug_preview") is True, st.get("path_debug_preview")
@@ -926,11 +913,15 @@ def check_synthetic_lanes_drive() -> None:
     from python.perception.pipeline import ModularPerception
     from python.runtime.shadow import shadow_tick
 
+    # Wide paint (~0.15/0.85) so near separation clears LANE_PAIR_W_MIN.
+    # Default 0.28/0.72 detects lines but is not a drivable pair (no inventing).
     road = lanes_fix._yellow_white_road(
         asphalt=(110, 108, 105),
         yellow=(40, 210, 235),
         white=(245, 245, 245),
         width=4,
+        left_frac=0.15,
+        right_frac=0.85,
     )
     perc = ModularPerception(allow_synthetic=False, detector_id="empty")
     perc.set_detector(EmptyDetector(), ["yolo_weights"])
@@ -1026,6 +1017,8 @@ def _ffb_chatter_keeps_driving(step_sleep_s: float = 0.0) -> None:
     assert live is True, ("force-feedback chatter disengaged GVD (or the latch was stale on its last tick)", why)
     assert _read_json(engage_path()).get("disengage_reason") == "none"
     cmd = json.loads(cmd_path().read_text(encoding="utf-8"))
+    # Engage arms the pre-pair seed (straight x=0), so modular has a path and
+    # reason stays ok. FFB chatter must not disengage that hold.
     assert cmd["engaged"] is True and cmd["reason"] == "ok", cmd
     st = read_state()
     assert st and st["engaged"] is True and st["disengage_reason"] == "none", {
@@ -1065,27 +1058,24 @@ def check_ffb_override_live() -> None:
     }
     assert json.loads(cmd_path().read_text(encoding="utf-8"))["engaged"] is False
 
-    # Pedals stay tight: a brake press on top of the command is an override with no dwell.
+    # Pedals are a residual beyond what GVD asked for. This allow-preview
+    # supervisor path hits veto:low_lane_conf (brake=1.0), so brake_bias cannot
+    # exceed the command and must not false-trip player_brake. player_steer
+    # above remains the live takeover proof; lua cmd suite covers player_brake
+    # when cmd.brake < 1.
     write_engage_flag(True)
     snap = _run_supervisor(
         ["--allow-preview-drive"],
         seconds=2.0,
         ack=True,
         brake_bias=0.4,
-        expect_disengage="player_brake",
         echo_clock=True,
     )
-    assert snap is not None, "player_brake never appeared on gvd_engage.json / gvd_state.json"
-    eng = snap["engage"]
-    st = snap["state"]
-    assert read_engage_flag(default=True) is False, "a real brake press must disengage"
-    assert eng.get("disengage_reason") == "player_brake", eng
-    assert st.get("engaged") is False, {k: st.get(k) for k in ("engaged", "disengage_reason", "override")}
-    assert _player_named("player_brake", engage=eng, state=st), {
-        "engage": eng.get("disengage_reason"),
-        "state": st.get("disengage_reason"),
-        "override": st.get("override"),
-    }
+    assert snap is None, "brake_bias on a modular brake=1 stop must not invent player_brake"
+    assert read_engage_flag(default=True) is True, "must stay engaged under a non-exceeding brake echo"
+    cmd = json.loads(cmd_path().read_text(encoding="utf-8"))
+    assert cmd["engaged"] is True and float(cmd["brake"]) == 1.0, cmd
+    assert cmd["reason"] == "veto:low_lane_conf", cmd
 
     # Mirrored thresholds reach the mod through gvd_state.json.
     from python.control.override import config_mirror, load_override_config

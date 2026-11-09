@@ -340,6 +340,13 @@ def main(clock=None) -> None:
         help="Sim ground truth JSONL under logs/ (or set GVD_GT_LOG=1). Off in normal play.",
     )
     ap.add_argument(
+        "--debug-gt",
+        action="store_true",
+        help="DEBUG ONLY, off by default: draw sim/map overlays that use BeamNG ground "
+        "truth, the game vehicle pose, or the AI/map path (for example path_world). "
+        "Clips and the default viz never show them. This is not a driving signal.",
+    )
+    ap.add_argument(
         "--lane-source",
         default=os.environ.get("GVD_LANE_SOURCE", "hough"),
         choices=["hough", "scene", "gt"],
@@ -1426,6 +1433,7 @@ def main(clock=None) -> None:
             st["viz_window"] = win is not None
             st["viz_screen"] = viz_screen_active
             st["viz_note"] = viz_note
+            st["debug_gt"] = bool(getattr(args, "debug_gt", False))
             st["detector"] = pout.detector_name
             st["actuator"] = actuator.name
             st["cmd_seq"] = int(applied.seq)

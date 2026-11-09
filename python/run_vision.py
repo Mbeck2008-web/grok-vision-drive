@@ -34,6 +34,7 @@ from python.control.actuate import (
     release_command,
     stop_command,
     write_engage_flag,
+    latch_aeb_park_hold,
 )
 from python.control.ego_speed import UNKNOWN_EGO_REASONS, engage_gate, resolve_ego
 from python.sensors.tech import (
@@ -1078,6 +1079,7 @@ def main(clock=None) -> None:
                 disengage_reason = "scene_input_shape"
             elif tick.should_disengage:
                 veto_name = str(tick.veto_reason or "veto")
+                latch_aeb_park_hold(actuator, veto_name)
                 if ui.debug.ignore_veto_disengage and veto_name != "heartbeat_stale":
                     disengage_reason = veto_name if veto_name != "none" else "veto"
                 else:

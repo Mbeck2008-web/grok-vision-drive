@@ -20,6 +20,7 @@ from python.control.actuate import (  # noqa: E402
     BeamNGPyActuator,
     CmdJsonActuator,
     DriveCommand,
+    is_aeb_hold_reason,
     latch_aeb_park_hold,
 )
 from python.control.e2e import E2EIntent  # noqa: E402
@@ -124,10 +125,55 @@ def check_cmd_json_aeb_sets_hold_park() -> None:
     print("cmd_json: AEB handoff writes hold_park with brake 1 OK")
 
 
+def check_cmd_json_stop_reason_latches_hold_park() -> None:
+    """CmdJsonActuator.stop(aeb reason) must emit hold_park even without note_park_hold."""
+    act = CmdJsonActuator()
+    act.note_engaged(False)
+    assert is_aeb_hold_reason("veto:aeb_brake")
+    act.stop(seq=7, reason="veto:aeb_brake")
+    path = __import__("python.control.actuate", fromlist=["cmd_path"]).cmd_path()
+    payload = __import__("json").loads(Path(path).read_text(encoding="utf-8"))
+    assert payload.get("hold_park") is True, payload
+    assert float(payload.get("brake") or 0.0) == 1.0, payload
+    assert payload.get("engaged") is False, payload
+    # Non-AEB stop without a prior latch must not invent hold_park.
+    act2 = CmdJsonActuator()
+    act2.note_engaged(False)
+    act2.stop(seq=8, reason="not_engaged")
+    payload2 = __import__("json").loads(Path(path).read_text(encoding="utf-8"))
+    assert payload2.get("hold_park") is not True, payload2
+    print("cmd_json: stop(veto:aeb_brake) latches hold_park without note_park_hold OK")
+
+
+def check_lua_honors_hold_park_when_cmd_disengaged() -> None:
+    """Retail applyCmdJson must keep hold_park even when cmd.engaged is false.
+
+    The early `if not engaged` path already honors hold_park. The gap Skeptic
+    found is the later `cmd.engaged ~= true` branch, which used to call
+    releaseInputs and drop the AEB hold while Lua's local engaged was still
+    true. lua5.1 is not on this host; assert the source hunk is present.
+    """
+    lua = (ROOT / "beamng_mod" / "lua" / "ge" / "extensions" / "gvd" / "main.lua").read_text(
+        encoding="utf-8"
+    )
+    # The engaged~=true branch must check hold_park before releaseInputs.
+    marker = "if not cmd or cmd.engaged ~= true then"
+    idx = lua.find(marker)
+    assert idx >= 0, "applyCmdJson engaged check missing"
+    window = lua[idx : idx + 600]
+    assert "hold_park" in window, window
+    assert "releaseInputs('supervisor not driving')" in window
+    # hold_park branch must appear before that release.
+    assert window.find("hold_park") < window.find("releaseInputs('supervisor not driving')"), window
+    print("lua: cmd.engaged~=true honors hold_park before release OK")
+
+
 def main() -> None:
     check_shadow_e2e_command_is_a_hold()
     check_tech_stop_after_aeb_disengage_holds()
     check_cmd_json_aeb_sets_hold_park()
+    check_cmd_json_stop_reason_latches_hold_park()
+    check_lua_honors_hold_park_when_cmd_disengaged()
     print("test_aeb_hold_shadow: OK")
 
 

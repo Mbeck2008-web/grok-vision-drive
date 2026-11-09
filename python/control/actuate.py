@@ -886,8 +886,6 @@ class NullActuator:
         return cmd
 
     def stop(self, seq: int = 0, reason: str = "stop") -> DriveCommand:
-        if is_aeb_hold_reason(reason):
-            self._park_hold = True
         if reason in UNKNOWN_EGO_REASONS:
             # Unknown ego speed is a release, never a held stop.
             return release_command(seq=seq, reason=reason)
@@ -1355,6 +1353,10 @@ class CmdJsonActuator:
         if reason in UNKNOWN_EGO_REASONS:
             # Unknown ego speed: the record and the file say brake 0 (Lua releases anyway).
             return self.apply(release_command(seq=seq, reason=reason))
+        if is_aeb_hold_reason(reason):
+            # Match BeamNGPyActuator: an AEB stop reason latches park hold even
+            # when note_park_hold was not called first.
+            self._park_hold = True
         cmd = stop_command(seq=seq, reason=reason)
         return self.apply(cmd)
 

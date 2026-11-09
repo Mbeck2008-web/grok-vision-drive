@@ -52,6 +52,7 @@ from python.viz.lane_roles import classify_lane_roles
 from python.runtime.state_io import steer_preview_path_ego
 from python.viz.forecast import predict_modes
 from python.viz.nerd import NERD_WIDTH, hit_test, render_panel, scene_note
+from python.viz.scene_ribbon import scene_ckpt_caption, scene_ckpt_ribbon_polyline
 
 VOID = (10, 8, 7)  # #07080a
 PAPER = (225, 230, 232)
@@ -59,6 +60,7 @@ ICE = (212, 196, 158)  # #9ec4d4
 ICE_HI = (248, 238, 214)  # #dbeef8
 IN_PATH = (226, 190, 120)  # #78bee2
 CORRIDOR = (199, 167, 90)  # #5aa7c7
+PATH_BLUE = (234, 126, 61)  # #3d7eea perceived-lane ribbon
 GHOST = (188, 178, 168)
 HAZARD = (92, 92, 196)
 KERB = (124, 131, 168)  # warm grey-red, not lane paint
@@ -501,6 +503,9 @@ class Cam:
     ahead_m: float = -1.0
     behind_m: float = -1.0
     fade_frac: float = -1.0
+    width: int = STAGE_W
+    height: int = STAGE_H
+    _basis: tuple | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.ahead_m < 0 or self.behind_m < 0 or self.fade_frac < 0:
@@ -511,6 +516,18 @@ class Cam:
                 self.behind_m = draw.behind_m
             if self.fade_frac < 0:
                 self.fade_frac = draw.fade_frac
+        if not self.top_down:
+            cam = np.array(self.eye, dtype=np.float64)
+            target = np.array([0.0, 16.0, -0.8], dtype=np.float64)
+            forward = target - cam
+            forward = forward / (np.linalg.norm(forward) + 1e-9)
+            world_up = np.array([0.0, 0.0, 1.0])
+            right = np.cross(forward, world_up)
+            right = right / (np.linalg.norm(right) + 1e-9)
+            up = np.cross(right, forward)
+            fov = math.radians(42.0)
+            f = (float(self.height) * 0.5) / math.tan(fov * 0.5)
+            self._basis = (cam, forward, right, up, float(f))
 
     @property
     def eye(self) -> tuple[float, float, float]:
@@ -520,27 +537,19 @@ class Cam:
         return (1.6, -16.5, 5.4)
 
     def project(self, x: float, y: float, z: float = 0.0) -> tuple[int, int]:
+        w, h = int(self.width), int(self.height)
         if self.top_down:
-            cx, cy = STAGE_W // 2, STAGE_H - 90
+            cx, cy = w // 2, h - 90
             return int(cx + x * self.ppm), int(cy - y * self.ppm)
-        cam = np.array(self.eye, dtype=np.float64)
-        target = np.array([0.0, 16.0, -0.8], dtype=np.float64)
+        cam, forward, right, up, f = self._basis  # type: ignore[misc]
         eye = np.array([x, y, z], dtype=np.float64) - cam
-        forward = target - cam
-        forward = forward / (np.linalg.norm(forward) + 1e-9)
-        world_up = np.array([0.0, 0.0, 1.0])
-        right = np.cross(forward, world_up)
-        right = right / (np.linalg.norm(right) + 1e-9)
-        up = np.cross(right, forward)
         cx = float(np.dot(eye, right))
         cy = float(np.dot(eye, up))
         cz = float(np.dot(eye, forward))
         if cz < 0.6:
             cz = 0.6
-        fov = math.radians(42.0)
-        f = (STAGE_H * 0.5) / math.tan(fov * 0.5)
-        u = STAGE_W * 0.5 + f * cx / cz
-        v = STAGE_H * 0.5 - f * cy / cz
+        u = w * 0.5 + f * cx / cz
+        v = h * 0.5 - f * cy / cz
         return int(u), int(v)
 
     def scale_at(self, y: float) -> float:
@@ -908,26 +917,22 @@ def _draw_ground(img: np.ndarray, cam: Cam) -> None:
     y0, y1 = _draw_y_lo(cam), cam.ahead_m
     far_l, far_r = cam.project(-16, y1, 0), cam.project(16, y1, 0)
     near_l, near_r = cam.project(-16, y0, 0), cam.project(16, y0, 0)
-    overlay = img.copy()
-    cv2.fillPoly(overlay, [np.array([far_l, far_r, near_r, near_l], dtype=np.int32)], (22, 18, 15))
-    cv2.addWeighted(overlay, 0.40, img, 0.60, 0, img)
-    tick = _mix(ICE, 0.08)
-    y = math.ceil((y0 - 1e-6) / 20.0) * 20.0
-    while y <= y1 + 1e-6:
-        a, b = cam.project(-7, y, 0), cam.project(7, y, 0)
-        cv2.line(img, a, b, tick, 1, cv2.LINE_AA)
-        y += 20.0
+    # Pre-mixed 0.40 of (22,18,15) over VOID — no full-frame copy, no grid.
+    cv2.fillPoly(img, [np.array([far_l, far_r, near_r, near_l], dtype=np.int32)], (15, 12, 10))
 
 
 def _draw_fog(img: np.ndarray, cam: Cam) -> None:
     """Void the sky plus a thin horizon fade — horizon is the draw-ahead range."""
-    horizon = max(0, min(STAGE_H - 1, cam.project(0, cam.ahead_m, 0)[1]))
-    sky = img.copy()
-    cv2.rectangle(sky, (0, 0), (STAGE_W, max(1, horizon)), VOID, -1)
-    cv2.addWeighted(sky, 0.55, img, 0.45, 0, img)
-    fade = img.copy()
-    cv2.rectangle(fade, (0, max(0, horizon)), (STAGE_W, min(STAGE_H, horizon + 28)), VOID, -1)
-    cv2.addWeighted(fade, 0.22, img, 0.78, 0, img)
+    h, w = img.shape[:2]
+    horizon = max(0, min(h - 1, cam.project(0, cam.ahead_m, 0)[1]))
+    if horizon > 0:
+        cv2.rectangle(img, (0, 0), (w, horizon), VOID, -1)
+    y0 = max(0, horizon)
+    y1 = min(h, horizon + 28)
+    if y1 > y0:
+        band = img[y0:y1]
+        fade = np.full_like(band, VOID)
+        cv2.addWeighted(fade, 0.22, band, 0.78, 0, band)
 
 
 def _lane_color(mode: str, fade: float) -> tuple[tuple[int, int, int], int, bool]:
@@ -1283,19 +1288,21 @@ def paint_half_m(half_w: float) -> float:
     return min(max(0.0, float(half_w)), EGO_WIDTH_M * 0.5)
 
 
-def _ribbon_centerline(path: list[dict]) -> list[tuple[float, float, float]]:
-    """Drawing centerline. Starts at the vehicle center, then the planned route.
+def _ribbon_centerline(path: list[dict], *, connect_origin: bool = True) -> list[tuple[float, float, float]]:
+    """Drawing centerline. Planner ribbons start at the vehicle center.
 
     The planner polyline is not rewritten. A route that begins on a ring gets
     a straight run from the origin to that first point, outside the island.
     The first few meters are sampled finely so the flare reads as a wedge.
+    Perceived scene-ckpt ribbons pass ``connect_origin=False`` so they start
+    at the first finite lookahead instead of inventing 0–5 m.
     """
     pts: list[tuple[float, float]] = []
     for p in path or []:
         pts.append((float(p.get("x") or 0.0), float(p.get("y") or 0.0)))
     if len(pts) < 2:
         return []
-    if math.hypot(pts[0][0], pts[0][1]) > 0.05:
+    if connect_origin and math.hypot(pts[0][0], pts[0][1]) > 0.05:
         gap = math.hypot(pts[0][0], pts[0][1])
         steps = max(1, int(math.ceil(gap / 0.4)))
         x1, y1 = pts[0]
@@ -1358,10 +1365,12 @@ def _draw_filled_corridor(
     gain: float = 1.0,
     max_dist: float | None = None,
     mark_origin: bool = False,
+    fill: tuple[int, int, int] | None = None,
+    connect_origin: bool = True,
 ) -> None:
     if len(path) < 2 or half_w <= 0.0:
         return
-    samples = _ribbon_centerline(path)
+    samples = _ribbon_centerline(path, connect_origin=connect_origin)
     if len(samples) < 2:
         return
     total = samples[-1][2]
@@ -1400,6 +1409,10 @@ def _draw_filled_corridor(
         dists.append(d)
 
     nseg = len(left) - 1
+    overlay = np.zeros_like(img)
+    fill = CORRIDOR if fill is None else fill
+    painted = False
+    a_use = 0.0
     for i in range(nseg):
         # Arc length, not vertex index: the flare is sampled finer than the route.
         near = 1.0 - min(1.0, dists[i] / max(total, 1e-3))
@@ -1407,9 +1420,16 @@ def _draw_filled_corridor(
         if a < 0.02:
             continue
         quad = np.array([left[i], left[i + 1], right[i + 1], right[i]], dtype=np.int32)
-        overlay = img.copy()
-        cv2.fillPoly(overlay, [quad], CORRIDOR)
-        cv2.addWeighted(overlay, min(0.62, a), img, 1 - min(0.62, a), 0, img)
+        cv2.fillPoly(overlay, [quad], fill)
+        painted = True
+        a_use = max(a_use, min(0.62, a))
+    if painted and a_use > 0.0:
+        blended = img.copy()
+        cv2.addWeighted(overlay, a_use, img, 1.0 - a_use, 0, blended)
+        # Overlay is otherwise black; only replace painted pixels so the
+        # rest of the frame is not faded toward zero.
+        painted_px = np.any(overlay != 0, axis=2)
+        img[painted_px] = blended[painted_px]
 
     for i in range(nseg):
         edge = _mix(ICE_HI, 0.8 * alphas[i])
@@ -1423,8 +1443,20 @@ def _draw_filled_corridor(
         cv2.circle(img, center[0], rad, ICE_HI, 1, cv2.LINE_AA)
 
 
-def _draw_path_world_overlay(img: np.ndarray, path_world: list, cam: Cam) -> None:
-    """BEV sanity: project path_world when T (top_down) so game==viz is visible."""
+def debug_gt_enabled(state: dict[str, Any] | None) -> bool:
+    """Sim/map overlays stay off unless --debug-gt set ``state['debug_gt']``."""
+    if not isinstance(state, dict):
+        return False
+    return bool(state.get("debug_gt"))
+
+
+def _draw_path_world_overlay(img: np.ndarray, path_world: list, cam: Cam, state: dict[str, Any] | None = None) -> None:
+    """BEV sanity: project path_world when T (top_down) so game==viz is visible.
+
+    This uses the game vehicle pose. It is debug-gt only and stays out of clips.
+    """
+    if not debug_gt_enabled(state):
+        return
     if not cam.top_down or not path_world or len(path_world) < 2:
         return
     x0 = float(path_world[0].get("x", 0))
@@ -1673,25 +1705,58 @@ def _draw_state_fans(img: np.ndarray, agents: list, cam: Cam) -> None:
         _stroke_poly(img, screen, _mix(ICE, 0.30), 1)
 
 
+
+def _draw_scene_ckpt_ribbon(img: np.ndarray, state: dict[str, Any], cam: Cam) -> None:
+    """Perceived lane centers from --scene-ckpt. Never writes path_ego."""
+    raw = state.get("scene_ckpt")
+    if not isinstance(raw, dict):
+        return
+    try:
+        conf = float(raw.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        return
+    centers = raw.get("centers")
+    if not isinstance(centers, list):
+        return
+    poly = scene_ckpt_ribbon_polyline(centers, conf)
+    if len(poly) < 2:
+        return
+    _draw_filled_corridor(
+        img, poly, max(conf, 0.25), cam,
+        half_w=0.55,
+        intent=1.0,
+        preview=False,
+        gain=1.0,
+        fill=PATH_BLUE,
+        connect_origin=False,
+    )
+
+
 def render_stage(
     state: dict[str, Any],
     ui: VizUI | None = None,
     main_frame: np.ndarray | None = None,
     cam_frames: dict[str, Any] | None = None,
     dets: list[dict[str, Any]] | None = None,
+    width: int | None = None,
+    height: int | None = None,
 ) -> np.ndarray:
     t0 = time.perf_counter()
     ui = ui or VizUI()
     dbg = ui.debug
     clean = 0 in ui.layers
     draw = resolve_draw_range(state)
+    stage_w = int(width or STAGE_W)
+    stage_h = int(height or STAGE_H)
     cam = Cam(
         top_down=ui.top_down,
         ahead_m=draw.ahead_m,
         behind_m=draw.behind_m,
         fade_frac=draw.fade_frac,
+        width=stage_w,
+        height=stage_h,
     )
-    img = np.full((STAGE_H, STAGE_W, 3), VOID, dtype=np.uint8)
+    img = np.full((stage_h, stage_w, 3), VOID, dtype=np.uint8)
 
     if is_bus_mismatch(state):
         _draw_mismatch(img, state)
@@ -1793,8 +1858,9 @@ def render_stage(
             gain=0.62 if preview else 1.0,
         )
         _draw_stop_bar(img, path, half_w, all_tracks, cipv_id, cam, is_halted(state))
-        _draw_path_world_overlay(img, state.get("path_world") or [], cam)
+        _draw_path_world_overlay(img, state.get("path_world") or [], cam, state)
         ribbon_on_ego = (path, path_conf, body_half, intent, preview)
+    _draw_scene_ckpt_ribbon(img, state, cam)
 
     if (not clean) and dbg.viz_cost:
         draw_planner_cost(img, cam, path, path_width, all_tracks)
@@ -1840,7 +1906,7 @@ def render_stage(
             mark_origin=True,
         )
 
-    if main_frame is not None and getattr(main_frame, "size", 0) and not drop_heavy and dbg.viz_pip:
+    if main_frame is not None and getattr(main_frame, "size", 0) and dbg.viz_pip:
         pip = np.full((180, 320, 3), (28, 28, 28), dtype=np.uint8)
         pip_src = clamp_front_overexpose(main_frame, "main")
         try:
@@ -1874,10 +1940,26 @@ def render_stage(
     word, word_col = cabin_drive_word(state)
     cv2.putText(img, word, (118, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, word_col, 1, cv2.LINE_AA)
     cam_lbl = "BEV debug" if ui.top_down else "chase 3/4"
-    cv2.putText(img, cam_lbl, (STAGE_W - 120, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
+    cv2.putText(img, cam_lbl, (stage_w - 120, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
     note = scene_note(state)
+    ck = state.get("scene_ckpt") if isinstance(state.get("scene_ckpt"), dict) else None
+    if ck is not None:
+        try:
+            ck_conf = float(ck.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            ck_conf = 0.0
+        cv2.putText(
+            img,
+            scene_ckpt_caption(ck_conf),
+            (190, 16),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            PATH_BLUE,
+            1,
+            cv2.LINE_AA,
+        )
     if note and not ((not clean) and dbg.viz_hud):
-        cv2.putText(img, note[:72], (12, STAGE_H - 10 - hud_pad), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (134, 124, 114), 1, cv2.LINE_AA)
+        cv2.putText(img, note[:72], (12, stage_h - 10 - hud_pad), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (134, 124, 114), 1, cv2.LINE_AA)
     if (not clean) and dbg.viz_hud:
         draw_dense_hud(img, state, stage_w=STAGE_W, stage_h=STAGE_H, bottom_pad=hud_pad)
 

@@ -99,14 +99,22 @@ def load_sensor_aux_targets(
     index: int,
     *,
     cam: str = "main",
+    aux_cache: Any = None,
+    source: str | None = None,
 ) -> dict[str, Any]:
     """Load train-only depth/sem for one tick into fixed AUX_H x AUX_W targets.
 
     Missing files yield all-masked targets (no fabricated labels). Present
     files with bad dtype/shape or a bad ``sem_classes.json`` raise
-    ``AuxTargetError``.
+    ``AuxTargetError``. When ``aux_cache`` holds this tick, the stored 12x16
+    tensors are returned and the raw PNGs are not read.
     """
     from python.data.raw_frames import is_train_only_cam, load_raw_camera
+
+    if aux_cache is not None:
+        cached = aux_cache.get(int(index), source=source, cam=cam)
+        if cached is not None:
+            return cached
 
     root = Path(root)
     depth_cam = f"{cam}_depth"
@@ -256,11 +264,18 @@ def attach_aux_to_labels(
     want_depth: bool = False,
     want_sem: bool = False,
     want_road_edge: bool = False,
+    aux_cache: Any = None,
 ) -> dict[str, np.ndarray]:
     """Optionally attach aux / road_edge tensors onto a labels dict (copy)."""
     out = dict(labels)
     if (want_depth or want_sem) and root is not None and index is not None:
-        aux = load_sensor_aux_targets(root, int(index), cam=cam)
+        source = None
+        if isinstance(row, Mapping):
+            raw_source = row.get("source")
+            source = str(raw_source) if raw_source is not None else None
+        aux = load_sensor_aux_targets(
+            root, int(index), cam=cam, aux_cache=aux_cache, source=source
+        )
         if want_depth:
             out["aux_depth"] = aux["depth_m"]
             out["aux_depth_valid"] = aux["depth_valid"]

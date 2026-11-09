@@ -201,7 +201,111 @@ class ExpDistillFeatsTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(loss))
         loss.backward()
 
+    def test_feat_cache_keys_by_source_i(self) -> None:
+        """Combined strips: lookup by (source, i), not bare i (same bug #196 fixed)."""
+        from python.debug.lane_targets import LANE_GT_DIM
+        from python.train.exp_distill import DistillError, build_feat_cache, load_feat_cache
+
+        rows = [
+            {"i": i, "kind": "train", "source": src}
+            for src in ("prior", "second")
+            for i in (0, 1, 2)
+        ]
+        self.assertEqual(len(rows), 6)
+
+        def encode(row):
+            base = 10.0 if row["source"] == "prior" else 20.0
+            return np.full(64, base + float(row["i"]), dtype=np.float32)
+
+        def target_fn(row):
+            base = 100.0 if row["source"] == "prior" else 200.0
+            return np.full(int(LANE_GT_DIM), base + float(row["i"]), dtype=np.float32)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "feats"
+            written = build_feat_cache(path, rows, encode=encode, target_fn=target_fn)
+            self.assertEqual(len(written), 6)
+            cache = load_feat_cache(path)
+            self.assertEqual(len(cache.keys), 6)
+            self.assertEqual(len(set(cache.keys)), 6)
+            for src, base_tok, base_tgt in (("prior", 10.0, 100.0), ("second", 20.0, 200.0)):
+                for i in (0, 1, 2):
+                    row = {"i": i, "source": src, "kind": "train"}
+                    np.testing.assert_array_equal(
+                        cache.token(row), np.full(64, base_tok + float(i), dtype=np.float32)
+                    )
+                    np.testing.assert_array_equal(
+                        cache.target(row),
+                        np.full(int(LANE_GT_DIM), base_tgt + float(i), dtype=np.float32),
+                    )
+                    np.testing.assert_array_equal(
+                        cache.token((src, i)), cache.token(row)
+                    )
+                    np.testing.assert_array_equal(
+                        cache.target((src, i)), cache.target(row)
+                    )
+            # Bare i with two sources is ambiguous; must not silently return the last source.
+            with self.assertRaises(DistillError) as ctx:
+                cache.token(0)
+            self.assertIn("ambiguous", str(ctx.exception).lower())
+            with self.assertRaises(DistillError):
+                cache.target(1)
+            # A bare-i index map would have collapsed every lookup to source=second
+            # (mean 20+i). Prove prior stays at 10+i.
+            self.assertAlmostEqual(float(cache.token(("prior", 0)).mean()), 10.0)
+            self.assertAlmostEqual(float(cache.token(("second", 0)).mean()), 20.0)
+
+    def test_student_targets_equal_teacher_not_constant(self) -> None:
+        """Lock raw_tgt to cache teacher targets; zeroing after target_fn fails."""
+        from python.debug.lane_targets import LANE_GT_DIM
+        from python.train.exp_distill import (
+            DistillError,
+            build_feat_cache,
+            load_feat_cache,
+            run_student_epochs,
+        )
+
+        rows = [
+            {"i": 0, "kind": "train", "source": "a"},
+            {"i": 1, "kind": "train", "source": "a"},
+            {"i": 2, "kind": "train", "source": "a"},
+        ]
+
+        def encode(row):
+            return np.full(64, float(row["i"]) + 1.0, dtype=np.float32)
+
+        def teacher_target(row):
+            # Distinct non-constant teacher targets per row.
+            return np.full(int(LANE_GT_DIM), float(row["i"]) * 10.0 + 3.0, dtype=np.float32)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_dir = Path(tmp) / "feats"
+            build_feat_cache(cache_dir, rows, encode=encode, target_fn=teacher_target)
+            cache = load_feat_cache(cache_dir)
+            known = {"i": 1, "source": "a", "kind": "train"}
+            np.testing.assert_array_equal(cache.target(known), teacher_target(known))
+            targets = [cache.target(r) for r in rows]
+            self.assertFalse(np.allclose(targets[0], targets[1]))
+            self.assertFalse(np.allclose(targets[1], targets[2]))
+            self.assertFalse(all(np.allclose(t, targets[0]) for t in targets))
+
+            def good_fn(key, feat_cache):
+                return feat_cache.target(key)
+
+            stats = run_student_epochs(cache, target_fn=good_fn, epochs=1, seed=7, hidden=32)
+            self.assertEqual(int(stats["n"]), 3)
+
+            def zero_after_target_fn(key, feat_cache):
+                _ = feat_cache.target(key)
+                # Mutation: ignore teacher target and fit zeros.
+                return np.zeros(int(LANE_GT_DIM), dtype=np.float32)
+
+            with self.assertRaises(DistillError) as ctx:
+                run_student_epochs(cache, target_fn=zero_after_target_fn, epochs=1, seed=7, hidden=32)
+            self.assertIn("must equal cache teacher target", str(ctx.exception))
+
     def test_run_student_epochs_refuses_missing_target_fn(self) -> None:
+
         from python.train.exp_distill import DistillError, FeatCache, run_student_epochs
 
         tokens = np.ones((1, 64), dtype=np.float32)

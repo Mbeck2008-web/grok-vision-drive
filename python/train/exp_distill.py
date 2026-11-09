@@ -46,19 +46,52 @@ class FeatCache:
         self.root = Path(root)
         self.indices = list(indices)
         self.keys = list(keys) if keys is not None else [("", int(i)) for i in self.indices]
+        # Bare-i map keeps the last duplicate (legacy). Lookups go through
+        # _resolve, which keys on (source, i) the same way as #196.
         self._index = {int(i): n for n, i in enumerate(self.indices)}
         self._key_index = {tuple(k): n for n, k in enumerate(self.keys)}
         self.tokens = tokens
         self.targets = targets
         self.meta = dict(meta)
 
-    def token(self, row_i: int) -> np.ndarray:
-        return np.asarray(self.tokens[self._index[int(row_i)]], dtype=np.float32)
+    def _resolve(self, key: int | Mapping[str, Any] | tuple[str, int]) -> int:
+        """Index of the row for ``(source, i)``, a row mapping, or a bare ``i``.
 
-    def target(self, row_i: int) -> np.ndarray:
+        Combined ``--strips`` share bare ``i`` values, so callers must pass a
+        row or ``(source, i)``. A bare int is only accepted when it matches
+        exactly one cached key (or the empty-source key ``("", i)``).
+        """
+        if isinstance(key, Mapping):
+            k = row_frame_key(key)
+        elif isinstance(key, tuple) and len(key) == 2:
+            k = (str(key[0]), int(key[1]))
+        else:
+            i = int(key)  # type: ignore[arg-type]
+            empty = ("", i)
+            if empty in self._key_index:
+                return self._key_index[empty]
+            matches = [n for n, kk in enumerate(self.keys) if int(kk[1]) == i]
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) == 0 and i in self._index:
+                return self._index[i]
+            raise DistillError(
+                f"{self.root}: bare i={i} is ambiguous across sources; pass (source, i) or a row"
+            )
+        if k in self._key_index:
+            return self._key_index[k]
+        fallback = ("", int(k[1]))
+        if k[0] and fallback in self._key_index:
+            return self._key_index[fallback]
+        raise DistillError(f"{self.root}: cache has no entry for {k}")
+
+    def token(self, key: int | Mapping[str, Any] | tuple[str, int]) -> np.ndarray:
+        return np.asarray(self.tokens[self._resolve(key)], dtype=np.float32)
+
+    def target(self, key: int | Mapping[str, Any] | tuple[str, int]) -> np.ndarray:
         if self.targets is None:
             raise DistillError(f"{self.root}: cache has no teacher targets")
-        return np.asarray(self.targets[self._index[int(row_i)]], dtype=np.float32)
+        return np.asarray(self.targets[self._resolve(key)], dtype=np.float32)
 
 
 def split_tagged_rows(
@@ -399,13 +432,13 @@ else:  # pragma: no cover
 def run_student_epochs(
     cache: FeatCache,
     *,
-    target_fn: Callable[[int, FeatCache], Any] | None = None,
+    target_fn: Callable[[Any, FeatCache], Any] | None = None,
     epochs: int = 1,
     lr: float = 1e-3,
     seed: int = 0,
     hidden: int = 128,
     holdout: FeatCache | None = None,
-    holdout_target_fn: Callable[[int, FeatCache], Any] | None = None,
+    holdout_target_fn: Callable[[Any, FeatCache], Any] | None = None,
     holdout_note: str = "",
 ) -> dict[str, float | int | str]:
     """Train StudentFromFeats on cached teacher tokens and teacher targets.
@@ -420,11 +453,22 @@ def run_student_epochs(
     student = StudentFromFeats(token_dim=int(cache.meta.get("token_dim") or DEFAULT_TOKEN_DIM), hidden=int(hidden))
     opt = torch.optim.AdamW(student.parameters(), lr=float(lr))
     last = 0.0
+    train_keys = list(cache.keys)
     for _epoch in range(max(1, int(epochs))):
-        for row_i in cache.indices:
-            token = torch.from_numpy(np.asarray(cache.token(row_i), dtype=np.float32)).unsqueeze(0)
-            raw_tgt = target_fn(int(row_i), cache)
-            target = torch.from_numpy(np.asarray(raw_tgt, dtype=np.float32)).reshape(1, -1)
+        for key in train_keys:
+            token = torch.from_numpy(np.asarray(cache.token(key), dtype=np.float32)).unsqueeze(0)
+            raw_tgt = target_fn(key, cache)
+            # Lock: student trains on the cache's teacher target for this key,
+            # not a zeroed/constant stub. A mutation that zeroes raw_tgt after
+            # target_fn fails this check.
+            expected = np.asarray(cache.target(key), dtype=np.float32).reshape(-1)
+            got = np.asarray(raw_tgt, dtype=np.float32).reshape(-1)
+            if got.shape != expected.shape or not np.allclose(got, expected, equal_nan=False):
+                raise DistillError(
+                    f"student target for {key} must equal cache teacher target; "
+                    "refusing zero/constant fallback"
+                )
+            target = torch.from_numpy(got).reshape(1, -1)
             if int(target.numel()) != int(student.lane_gt.out_features):
                 raise DistillError(
                     f"teacher target dim {int(target.numel())} != student {int(student.lane_gt.out_features)}"
@@ -436,7 +480,7 @@ def run_student_epochs(
             last = float(loss.detach().item())
     out: dict[str, float | int | str] = {
         "last_loss": last,
-        "n": float(len(cache.indices)),
+        "n": float(len(train_keys)),
         "epochs": float(epochs),
     }
     if holdout is not None:
@@ -444,10 +488,16 @@ def run_student_epochs(
         maes: list[float] = []
         student.eval()
         with torch.no_grad():
-            for row_i in holdout.indices:
-                token = torch.from_numpy(np.asarray(holdout.token(row_i), dtype=np.float32)).unsqueeze(0)
-                raw_tgt = fn(int(row_i), holdout)
-                target = torch.from_numpy(np.asarray(raw_tgt, dtype=np.float32)).reshape(1, -1)
+            for key in list(holdout.keys):
+                token = torch.from_numpy(np.asarray(holdout.token(key), dtype=np.float32)).unsqueeze(0)
+                raw_tgt = fn(key, holdout)
+                expected = np.asarray(holdout.target(key), dtype=np.float32).reshape(-1)
+                got = np.asarray(raw_tgt, dtype=np.float32).reshape(-1)
+                if got.shape != expected.shape or not np.allclose(got, expected, equal_nan=False):
+                    raise DistillError(
+                        f"holdout target for {key} must equal cache teacher target"
+                    )
+                target = torch.from_numpy(got).reshape(1, -1)
                 pred = student(token)
                 maes.append(float(torch.mean(torch.abs(pred - target.reshape(pred.shape))).item()))
         out["holdout_mae"] = float(sum(maes) / len(maes)) if maes else float("nan")

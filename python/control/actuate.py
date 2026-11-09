@@ -453,9 +453,12 @@ def tech_control_kwargs(
     Shift mode stays the arcade set at engage. The kwargs omit gear. BeamNG
     routes a gear field through shiftToGearIndex, and in arcade that function
     is switchToRealisticBehavior, so every control tick was leaving arcade.
-    Throttle>0 releases the parking brake and the clutch. Any brake with
-    throttle ~0 is parkingbrake=1 and service brake 0. Run 8 reversed on a
-    partial service brake (0.8), not only a full pedal. Coast is brake 0.
+    Throttle>0 releases the parking brake and the clutch. A real hold
+    (brake >= TECH_HOLD_BRAKE: stop, AEB, parked) is parkingbrake=1 and
+    service brake 0. A smaller brake request coasts: throttle 0, service
+    brake 0, parking brake 0. Sending that service pedal is arcade reverse
+    (run 8 reversed on 0.8), and treating every brake as park slams the
+    parking brake on a 2 m/s speed error.
     """
     del speed_mps  # moving or stopped, the reverse pedal stays off
     if release:
@@ -469,13 +472,20 @@ def tech_control_kwargs(
     throttle_v = _clip01(throttle)
     brake_v = _clip01(brake)
     # A service brake is never sent. With or without throttle, arcade can
-    # treat that pedal as reverse. A requested brake is the parking brake.
-    if brake_v > 0.01:
+    # treat that pedal as reverse. Only a real hold uses the parking brake.
+    if brake_v >= TECH_HOLD_BRAKE:
         return {
             "steering": steer_v,
             "throttle": 0.0,
             "brake": 0.0,
             "parkingbrake": 1.0,
+        }
+    if brake_v > 0.01:
+        return {
+            "steering": steer_v,
+            "throttle": 0.0,
+            "brake": 0.0,
+            "parkingbrake": 0.0,
         }
     if throttle_v > 1e-6:
         return {

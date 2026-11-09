@@ -17,6 +17,7 @@ from python.control.actuate import (  # noqa: E402
     is_reverse_control,
     plan_command,
     stop_command,
+    TECH_HOLD_BRAKE,
     tech_control_kwargs,
 )
 from python.control.launch_guard import (  # noqa: E402
@@ -51,8 +52,10 @@ def check_wire_never_sends_the_reverse_pedal() -> None:
         kw = tech_control_kwargs(steer, throttle, brake, speed_mps=8.0)
         _assert_forward(kw)
         assert float(kw.get("brake") or 0.0) == 0.0, kw
-        if throttle <= 1e-6 and brake > 0.01:
+        if throttle <= 1e-6 and brake >= TECH_HOLD_BRAKE:
             assert kw["parkingbrake"] == 1.0 and kw["brake"] == 0.0, kw
+        elif throttle <= 1e-6 and brake > 0.01:
+            assert kw["parkingbrake"] == 0.0 and kw["brake"] == 0.0, kw
     from python.control.actuate import gear_is_reverse
 
     assert gear_is_reverse(-1) and gear_is_reverse("R") and gear_is_reverse("reverse")

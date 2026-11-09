@@ -25,6 +25,35 @@ SIGN_KEEP = 8
 SIGN_MATCH_M = 3.0
 
 
+def fuse_planner_cipv(
+    *,
+    plan_aeb: str | None,
+    plan_ttc: float | None,
+    plan_target_v: float | None,
+    plan_stop_reason: str | None,
+    cipv: Any,
+) -> tuple[str | None, float | None, float | None]:
+    """Merge CIPV into the planner's AEB.
+
+    CIPV aeb=brake always wins. A soft planner scene stop (stop_reason set,
+    aeb!=brake) must not silence a signed-closing CIPV hard brake — that was
+    the PR #184 Safety failure when the planner still used abs(speed_mps).
+
+    When the planner has no scene stop (none/yield/missing), CIPV may still
+    fill in a missing lead TTC. plan_stop_reason is kept for callers/tests.
+    """
+    _ = plan_stop_reason  # documented; fuse no longer gates on it
+    ttc = plan_ttc if plan_ttc is not None else getattr(cipv, "ttc_lead", None)
+    aeb = plan_aeb
+    target_v = plan_target_v
+    if getattr(cipv, "aeb", None) == "brake" and aeb != "brake":
+        aeb = "brake"
+        target_v = 0.0
+        if plan_ttc is None:
+            ttc = getattr(cipv, "ttc_lead", None)
+    return aeb, ttc, target_v
+
+
 @dataclass
 class PerceptionOut:
     tracks: list[dict[str, Any]] = field(default_factory=list)
@@ -205,12 +234,13 @@ class ModularPerception:
         cipv_id = plan.cipv_id
         if cipv_id is None and cipv.track is not None:
             cipv_id = cipv.track.get("id")
-        ttc = plan.ttc_lead if plan.ttc_lead is not None else cipv.ttc_lead
-        aeb = plan.aeb
-        target_v = plan.target_v
-        if cipv.aeb == "brake" and aeb != "brake":
-            aeb = "brake"
-            target_v = 0.0
+        aeb, ttc, target_v = fuse_planner_cipv(
+            plan_aeb=plan.aeb,
+            plan_ttc=plan.ttc_lead,
+            plan_target_v=plan.target_v,
+            plan_stop_reason=plan.stop_reason,
+            cipv=cipv,
+        )
         missing = list(self.missing)
         if main_bgr is None:
             missing.append("cam_main_frame")

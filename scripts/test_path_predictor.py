@@ -145,7 +145,8 @@ def check_car_stop_sign_and_light() -> None:
         lanes_bev=lanes,
         lane_conf=0.9,
         ego_speed_mps=8.0,
-        tracks=[{"id": 7, "class": "vehicle", "x": 0.1, "y": 18.0, "yaw": YAW_AHEAD, "speed_mps": 0.0}],
+        # Signed relative: stopped lead closes at -ego (8 m/s).
+        tracks=[{"id": 7, "class": "vehicle", "x": 0.1, "y": 18.0, "yaw": YAW_AHEAD, "speed_mps": -8.0}],
     )
     assert car.stop_reason == "vehicle" and car.cipv_id == 7
     assert _max_y(car) < 18.0 - 1.5
@@ -161,7 +162,7 @@ def check_car_stop_sign_and_light() -> None:
         lanes_bev=lanes,
         lane_conf=0.9,
         ego_speed_mps=8.0,
-        tracks=[{"class": "vehicle", "x": 5.5, "y": 18.0, "yaw": YAW_AHEAD, "speed_mps": 0.0}],
+        tracks=[{"class": "vehicle", "x": 5.5, "y": 18.0, "yaw": YAW_AHEAD, "speed_mps": -8.0}],
     )
     assert beside.stop_reason == "none"
     assert _max_y(beside) > 30.0
@@ -225,6 +226,7 @@ def check_car_stop_sign_and_light() -> None:
 
 def check_unseen_and_partial_car() -> None:
     lanes = _lane(-1.75, 1.75)
+    # speed_mps is signed relative. Stopped lead closes at -ego; no unseen → y stays.
     still = predict_path(
         lanes_bev=lanes,
         lane_conf=0.9,
@@ -235,11 +237,11 @@ def check_unseen_and_partial_car() -> None:
             "x": 0.0,
             "y": 16.0,
             "yaw": YAW_AHEAD,
-            "speed_mps": 0.0,
-            "unseen_s": 0.4,
+            "speed_mps": -8.0,
+            "unseen_s": 0.0,
         }],
     )
-    # Slower than us, unseen for 0.4 s: the footprint is the coasted point, and the path stops short of it.
+    # Closing at 6 m/s (rel=-6), unseen 0.4 s: footprint coasts the gap shut.
     moved = predict_path(
         lanes_bev=lanes,
         lane_conf=0.9,
@@ -250,17 +252,17 @@ def check_unseen_and_partial_car() -> None:
             "x": 0.0,
             "y": 16.0,
             "yaw": YAW_AHEAD,
-            "speed_mps": 2.0,
+            "speed_mps": -6.0,
             "misses": 4,
             "tick_s": 0.1,
         }],
     )
     assert still.occupied and moved.occupied
     assert abs(still.occupied[0]["y"] - 16.0) < 0.2
-    # 4 misses * 0.1 s * 2 m/s along the last heading. Not the stale point.
-    assert moved.occupied[0]["y"] > still.occupied[0]["y"] + 0.5
+    # 4 misses * 0.1 s * (-6 m/s) along +y: gap closes. Not the stale point.
+    assert moved.occupied[0]["y"] < still.occupied[0]["y"] - 0.5, moved.occupied[0]
     assert _max_y(still) < 16.0
-    assert _max_y(moved) > _max_y(still) + 0.4
+    assert _max_y(moved) < _max_y(still)
     assert _max_y(moved) < moved.occupied[0]["y"] - 1.5
 
     sliver = predict_path(
@@ -511,7 +513,7 @@ def check_bend_not_roundabout_and_blinkers() -> None:
         lanes_bev=lanes,
         lane_conf=0.9,
         ego_speed_mps=8.0,
-        tracks=[{"class": "vehicle", "x": 0.0, "y": 30.0, "yaw": YAW_AHEAD, "speed_mps": 8.0}],
+        tracks=[{"class": "vehicle", "x": 0.0, "y": 30.0, "yaw": YAW_AHEAD, "speed_mps": 0.0}],  # matched relative
     )
     paced_cmd = follow_path(paced, ego_speed_mps=8.0)
     assert paced.path_length_m > 28.0
@@ -532,7 +534,7 @@ def check_bend_not_roundabout_and_blinkers() -> None:
         lanes_bev=lanes,
         lane_conf=0.9,
         ego_speed_mps=8.0,
-        tracks=[{"class": "vehicle", "x": 0.0, "y": 1.2, "yaw": YAW_AHEAD, "speed_mps": 0.0}],
+        tracks=[{"class": "vehicle", "x": 0.0, "y": 1.2, "yaw": YAW_AHEAD, "speed_mps": -8.0}],
     )
     assert close.stop_reason == "vehicle"
     close_cmd = follow_path(close, ego_speed_mps=8.0)
@@ -542,13 +544,13 @@ def check_bend_not_roundabout_and_blinkers() -> None:
         lanes_bev=lanes,
         lane_conf=0.9,
         ego_speed_mps=6.0,
-        tracks=[{"class": "pedestrian", "x": 0.0, "y": 10.0, "yaw": YAW_AHEAD, "speed_mps": 0.0}],
+        tracks=[{"class": "pedestrian", "x": 0.0, "y": 10.0, "yaw": YAW_AHEAD, "speed_mps": -8.0}],
     )
     rider = predict_path(
         lanes_bev=lanes,
         lane_conf=0.9,
         ego_speed_mps=6.0,
-        tracks=[{"class": "bike", "x": 0.2, "y": 11.0, "yaw": YAW_AHEAD, "speed_mps": 0.0}],
+        tracks=[{"class": "bike", "x": 0.2, "y": 11.0, "yaw": YAW_AHEAD, "speed_mps": -8.0}],
     )
     assert person.stop_reason == "pedestrian", person.stop_reason
     assert rider.stop_reason == "bike", rider.stop_reason
@@ -676,7 +678,7 @@ def check_noise_yield_gap_and_short_arc() -> None:
         lanes_bev=lanes,
         lane_conf=0.9,
         ego_speed_mps=8.0,
-        tracks=[{"class": "vehicle", "x": 0.0, "y": 0.5, "yaw": YAW_AHEAD, "speed_mps": 0.0}],
+        tracks=[{"class": "vehicle", "x": 0.0, "y": 0.5, "yaw": YAW_AHEAD, "speed_mps": -8.0}],
     )
     bumper_cmd = follow_path(bumper, ego_speed_mps=8.0)
     assert bumper.stop_reason == "vehicle", bumper.stop_reason
@@ -704,7 +706,7 @@ def check_noise_yield_gap_and_short_arc() -> None:
         lanes_bev=lanes,
         lane_conf=0.9,
         ego_speed_mps=10.0,
-        tracks=[{"class": "vehicle", "x": 0.0, "y": 10.0, "yaw": YAW_AHEAD, "speed_mps": 9.0}],
+        tracks=[{"class": "vehicle", "x": 0.0, "y": 10.0, "yaw": YAW_AHEAD, "speed_mps": -1.0}],
     )
     creep_cmd = follow_path(creep, ego_speed_mps=10.0)
     assert creep.aeb != "brake"
@@ -730,7 +732,7 @@ def check_slow_close_bumper_and_far_yield() -> None:
         lanes_bev=lanes,
         lane_conf=0.9,
         ego_speed_mps=10.0,
-        tracks=[{"class": "vehicle", "x": 0.0, "y": 7.5, "yaw": YAW_AHEAD, "speed_mps": 9.0}],
+        tracks=[{"class": "vehicle", "x": 0.0, "y": 7.5, "yaw": YAW_AHEAD, "speed_mps": -1.0}],
     )
     slow_cmd = follow_path(slow, ego_speed_mps=10.0)
     assert slow.stop_reason == "vehicle", slow.stop_reason
@@ -743,7 +745,7 @@ def check_slow_close_bumper_and_far_yield() -> None:
             lanes_bev=lanes,
             lane_conf=0.9,
             ego_speed_mps=8.0,
-            tracks=[{"class": "vehicle", "x": 0.0, "y": y, "yaw": YAW_AHEAD, "speed_mps": 0.0}],
+            tracks=[{"class": "vehicle", "x": 0.0, "y": y, "yaw": YAW_AHEAD, "speed_mps": -8.0}],
         )
         cmd = follow_path(hit, ego_speed_mps=8.0)
         assert hit.stop_reason == "vehicle", (y, hit.stop_reason)

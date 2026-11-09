@@ -151,7 +151,9 @@ def _replay_gate_on_gt(rows: list[dict]) -> tuple[float, list[float], list[float
 def main() -> None:
     rows = _rows()
     pairs, max_step = _replay_frames(rows)
-    assert len(pairs) >= 35, len(pairs)
+    # One-sided frames no longer invent a steer sample, so the old >=35
+    # count (which counted invented twins) drops. Require a real pair count.
+    assert len(pairs) >= 15, len(pairs)
     # A fresh LaneTrack per frame can jump by a full lane. The shared gate
     # cannot: a take blends at most half of 0.40 m, a slew steps 0.35 m and
     # may then absorb a remainder inside 0.40 m.

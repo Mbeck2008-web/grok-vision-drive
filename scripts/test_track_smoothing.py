@@ -87,10 +87,20 @@ def check_consumers_keep_magnitude() -> None:
     print("forecast.predict_modes: magnitude OK")
     a = select_cipv([neg], ego_speed_mps=10.0)
     b = select_cipv([pos], ego_speed_mps=10.0)
-    assert (a.ttc_lead, a.aeb) == (b.ttc_lead, b.aeb), (a, b)
-    print("cipv: magnitude OK")
-    assert _predict_occupants([dict(neg, unseen_s=1.0)]) == _predict_occupants([dict(pos, unseen_s=1.0)])
-    print("path_predictor occupants: magnitude OK")
+    # The old assertion required -v and +v to produce the same TTC/AEB. That
+    # locked in abs(speed_mps), so a lead pulling away looked like one we were
+    # catching, and a matched-speed car looked stopped (TTC = gap / ego).
+    assert a.ttc_lead != b.ttc_lead, (a, b)
+    assert b.ttc_lead is None and b.aeb == "off", b
+    print("cipv: opening is not closing OK")
+    # Occupants keep signed relative speed: closing coasts the gap shut,
+    # opening coasts it open. abs() here was the planner's phantom-AEB bug.
+    occ_n = _predict_occupants([dict(neg, unseen_s=1.0)])
+    occ_p = _predict_occupants([dict(pos, unseen_s=1.0)])
+    assert occ_n and occ_p
+    assert occ_n[0]["speed_mps"] == -5.0 and occ_p[0]["speed_mps"] == 5.0, (occ_n, occ_p)
+    assert occ_n[0]["y"] < neg["y"] < occ_p[0]["y"], (occ_n[0]["y"], neg["y"], occ_p[0]["y"])
+    print("path_predictor occupants: signed coast OK")
     sn = [line for line in _lines({"tracks": [neg]}) if "miss@" in line]
     sp = [line for line in _lines({"tracks": [pos]}) if "miss@" in line]
     assert sn == sp, (sn, sp)

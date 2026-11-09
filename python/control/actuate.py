@@ -43,6 +43,10 @@ TECH_SHIFT_MODE = "arcade"
 # Player arrows/pedals expect arcade. Restored only on the Disengage handoff.
 TECH_PLAYER_SHIFT_MODE = "arcade"
 TECH_HOLD_BRAKE = 0.99
+# Below this ego speed a no-throttle service pedal is arcade reverse
+# (run 8). Partials coast instead of sending that pedal. Above it they
+# are a real proportional service brake.
+SERVICE_BRAKE_MIN_SPEED_MPS = 0.5
 # Electrics neutral / first forward index. Read from the echo. Not sent.
 TECH_HOLD_GEAR = 0
 TECH_DRIVE_GEAR = 1
@@ -440,6 +444,18 @@ def _unexpected_kw(err: BaseException) -> str | None:
     return None
 
 
+def is_aeb_hold_reason(reason: str | None) -> bool:
+    """True when this stop is an AEB brake that must survive a disengage."""
+    name = str(reason or "")
+    return name == "aeb_brake" or name.endswith(":aeb_brake")
+
+
+def latch_aeb_park_hold(actuator: Any, reason: str | None) -> None:
+    """Pin the parking-brake hold so a following Engage-off stop() does not release."""
+    if is_aeb_hold_reason(reason) and hasattr(actuator, "note_park_hold"):
+        actuator.note_park_hold()
+
+
 def tech_control_kwargs(
     steer: float,
     throttle: float,
@@ -453,11 +469,13 @@ def tech_control_kwargs(
     Shift mode stays the arcade set at engage. The kwargs omit gear. BeamNG
     routes a gear field through shiftToGearIndex, and in arcade that function
     is switchToRealisticBehavior, so every control tick was leaving arcade.
-    Throttle>0 releases the parking brake and the clutch. Any brake with
-    throttle ~0 is parkingbrake=1 and service brake 0. Run 8 reversed on a
-    partial service brake (0.8), not only a full pedal. Coast is brake 0.
+    Throttle>0 releases the parking brake and the clutch. A real hold
+    (brake >= TECH_HOLD_BRAKE: stop, AEB, parked) is parkingbrake=1 and
+    service brake 0. A smaller brake while moving is a proportional service
+    brake. At rest (or at/under SERVICE_BRAKE_MIN_SPEED_MPS) that same pedal
+    is arcade reverse (run 8), so the wire coasts instead. Treating every
+    brake as park used to slam the handbrake on a 2 m/s speed error.
     """
-    del speed_mps  # moving or stopped, the reverse pedal stays off
     if release:
         return {
             "steering": 0.0,
@@ -468,14 +486,35 @@ def tech_control_kwargs(
     steer_v = _clip_steer(steer)
     throttle_v = _clip01(throttle)
     brake_v = _clip01(brake)
-    # A service brake is never sent. With or without throttle, arcade can
-    # treat that pedal as reverse. A requested brake is the parking brake.
-    if brake_v > 0.01:
+    if brake_v >= TECH_HOLD_BRAKE:
         return {
             "steering": steer_v,
             "throttle": 0.0,
             "brake": 0.0,
             "parkingbrake": 1.0,
+        }
+    if brake_v > 0.01:
+        # Moving: proportional service brake. Near-stopped / known-slow: coast
+        # so arcade does not treat the pedal as reverse. Unknown speed: still
+        # send the service request (live Tech always supplies electrics speed).
+        moving = True
+        if speed_mps is not None:
+            try:
+                moving = float(speed_mps) > float(SERVICE_BRAKE_MIN_SPEED_MPS)
+            except (TypeError, ValueError):
+                moving = True
+        if moving:
+            return {
+                "steering": steer_v,
+                "throttle": 0.0,
+                "brake": brake_v,
+                "parkingbrake": 0.0,
+            }
+        return {
+            "steering": steer_v,
+            "throttle": 0.0,
+            "brake": 0.0,
+            "parkingbrake": 0.0,
         }
     if throttle_v > 1e-6:
         return {
@@ -1101,7 +1140,10 @@ class BeamNGPyActuator:
         kw = dict(kwargs)
         last_err: Exception | None = None
         for _ in range(6):
-            if is_reverse_control(kw) or is_arcade_reverse_hold(kw):
+            # Explicit reverse gear is never sent. A no-throttle service brake
+            # from tech_control_kwargs is intentional while moving; the speed
+            # gate there is what keeps arcade from reversing at rest.
+            if is_reverse_control(kw):
                 break
             try:
                 self.vehicle.control(**kw)
@@ -1177,8 +1219,10 @@ class BeamNGPyActuator:
             if (
                 not release
                 and float(throttle) <= 1e-6
-                and float(brake) >= TECH_HOLD_BRAKE
+                and float(brake) > 0.01
             ):
+                # Partials need ego speed so the mapper can service-brake while
+                # moving and coast at rest (arcade reverse guard).
                 speed_mps = read_electrics_inputs(self.vehicle).speed_mps
             kwargs = tech_control_kwargs(
                 steer, throttle, brake, release=release, speed_mps=speed_mps
@@ -1220,7 +1264,7 @@ class BeamNGPyActuator:
     def stop(
         self, seq: int = 0, reason: str = "stop", *, now: float | None = None
     ) -> DriveCommand:
-        if not self.engaged and (self._park_hold or reason == "reverse"):
+        if not self.engaged and (self._park_hold or reason == "reverse" or is_aeb_hold_reason(reason)):
             self._park_hold = True
             try:
                 self._invoke_control(tech_control_kwargs(0.0, 0.0, 1.0))
@@ -1341,6 +1385,10 @@ class CmdJsonActuator:
         if reason in UNKNOWN_EGO_REASONS:
             # Unknown ego speed: the record and the file say brake 0 (Lua releases anyway).
             return self.apply(release_command(seq=seq, reason=reason))
+        if is_aeb_hold_reason(reason):
+            # Match BeamNGPyActuator: an AEB stop reason latches park hold even
+            # when note_park_hold was not called first.
+            self._park_hold = True
         cmd = stop_command(seq=seq, reason=reason)
         return self.apply(cmd)
 

@@ -469,6 +469,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip (and log) an epoch checkpoint that would leave less than this many GB free. Default 8.",
     )
     parser.add_argument(
+        "--exp-active-subset",
+        action="store_true",
+        help=(
+            "EXPERIMENT (off by default): each epoch keep the hardest train fraction "
+            "(--exp-active-hard-frac) plus a random floor (--exp-active-random-floor) "
+            "by previous-epoch train loss. Holdout is never subsetted."
+        ),
+    )
+    parser.add_argument(
+        "--exp-active-hard-frac",
+        type=float,
+        default=0.3,
+        help="With --exp-active-subset, fraction of train rows kept as hardest (default 0.3).",
+    )
+    parser.add_argument(
+        "--exp-active-random-floor",
+        type=float,
+        default=0.1,
+        help="With --exp-active-subset, extra random fraction of remaining train rows (default 0.1).",
+    )
+    parser.add_argument(
         "--grad-ckpt",
         action="store_true",
         help=(
@@ -1974,6 +1995,9 @@ def train_directory(
     ctl_loss: str = "huber",
     val_worst: int = VAL_WORST_N,
     val_worst_png: bool = False,
+    exp_active_subset: bool = False,
+    exp_active_hard_frac: float = 0.3,
+    exp_active_random_floor: float = 0.1,
     aux_depth: bool = False,
     aux_sem: bool = False,
     aux_depth_weight: float = 0.1,
@@ -2599,6 +2623,7 @@ def train_directory(
         nonlocal paused_exit, epoch, cursor, done, last_loss, supervised
         nonlocal device, net, batch, recommended, windows, last_batch
         nonlocal steps_per_epoch, eta_pass, schedule_printed
+        active_train_losses: dict[int, float] = {}
         history: list[float] = []
         ctl_ratio_done: set[int] = set()
         best_value: float | None = None
@@ -2627,6 +2652,49 @@ def train_directory(
             # recording goes); a recording with no train window left raises.
             report_valid_filter(filter_stats, epoch=int(epoch), quiet=filter_logged)
             filter_logged = True
+            if exp_active_subset:
+                from python.train.exp_active_subset import select_active_subset
+
+                train_rows: list[Any] = []
+                for item in plan_steps:
+                    if item.get("kind") == "holdout":
+                        continue
+                    train_rows.extend(list(item.get("rows") or []))
+                # Dedupe by row i, keep first occurrence for stable ranking.
+                seen: set[int] = set()
+                unique_rows: list[Any] = []
+                for row in train_rows:
+                    key = int(row.get("i"))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    unique_rows.append(row)
+                chosen = select_active_subset(
+                    unique_rows,
+                    active_train_losses,
+                    hard_frac=float(exp_active_hard_frac),
+                    random_floor=float(exp_active_random_floor),
+                    rng=window_rng if hasattr(window_rng, "choice") else __import__("numpy").random.RandomState(int(seed)),
+                )
+                allowed = {int(unique_rows[pos]["i"]) for pos in chosen}
+                filtered: list[Any] = []
+                for item in plan_steps:
+                    if item.get("kind") == "holdout":
+                        filtered.append(item)
+                        continue
+                    kept_rows = [row for row in list(item.get("rows") or []) if int(row.get("i")) in allowed]
+                    if not kept_rows:
+                        continue
+                    clone = dict(item)
+                    clone["rows"] = kept_rows
+                    filtered.append(clone)
+                plan_steps = filtered
+                print(
+                    f"[GVD] exp-active-subset epoch={int(epoch)} train_ids={len(allowed)} "
+                    f"windows={sum(1 for it in plan_steps if it.get('kind')=='train')} "
+                    f"(holdout untouched)",
+                    flush=True,
+                )
             windows = sum(1 for item in plan_steps if item["kind"] == "train")
             carry: SceneState | None = None
             end_state: SceneState | None = None
@@ -2818,6 +2886,12 @@ def train_directory(
                     continue
                 if step_loss is not None:
                     last_loss = step_loss
+                    if exp_active_subset:
+                        for piece in group:
+                            if piece.get("kind") == "holdout":
+                                continue
+                            for row in list(piece.get("rows") or []):
+                                active_train_losses[int(row.get("i"))] = float(step_loss)
                 if use_ctl and int(epoch) in (0, 1) and int(epoch) not in ctl_ratio_done and n_sup:
                     # The ctl/lane_gt ratio at the first step of epochs 0 and 1. Outside [0.1, 10]
                     # is a flag for the owner, not an auto-fix.
@@ -3415,6 +3489,9 @@ def main(argv: list[str] | None = None) -> None:
                 ckpt_dir=Path(args.ckpt_dir) if args.ckpt_dir else None,
                 ckpt_min_free_gb=args.ckpt_min_free_gb,
                 cam_age=bool(args.cam_age),
+                exp_active_subset=bool(getattr(args, "exp_active_subset", False)),
+                exp_active_hard_frac=float(getattr(args, "exp_active_hard_frac", 0.3)),
+                exp_active_random_floor=float(getattr(args, "exp_active_random_floor", 0.1)),
                 grad_ckpt=bool(args.grad_ckpt),
                 pause_dir=pause_dir,
                 exact_epochs=args.exact_epochs,

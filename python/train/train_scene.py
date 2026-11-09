@@ -3389,9 +3389,10 @@ def main(argv: list[str] | None = None) -> None:
                 print(f"[GVD] scene train: {refused}", flush=True)
                 sys.exit(2)
         if bool(getattr(args, "exp_ssl_pretrain", False)):
-            from python.train.exp_ssl import masked_token_pretext_loss, save_stem_weights, select_ssl_rows
+            from python.data.raw_frames import refuse_lossy
+            from python.train.exp_ssl import SslError, run_ssl_pretrain, ssl_rows_from_split
             from python.train.scene_net import SceneNet
-            import torch
+            from python.train.strip_sources import load_multi_source_rows
 
             out = str(getattr(args, "exp_ssl_out", "") or "")
             if not out:
@@ -3400,19 +3401,46 @@ def main(argv: list[str] | None = None) -> None:
             if not torch_ready():
                 print("[GVD] scene train needs PyTorch")
                 sys.exit(2)
-            # Minimal smoke: one random canvas step proves the path; full strip
-            # sweeps use the same select_ssl_rows gate (holdout excluded).
-            net = SceneNet(cams=cam_names, scale=float(args.scale)).train()
-            opt = torch.optim.AdamW(net.stem.parameters(), lr=float(args.lr))
-            image = torch.zeros(1, 3, net.canvas_h, net.canvas_w)
-            opt.zero_grad(set_to_none=True)
-            loss = masked_token_pretext_loss(net, image, rng=__import__("numpy").random.RandomState(int(args.seed)))
-            loss.backward()
-            opt.step()
-            save_stem_weights(out, net)
-            # Prove holdout filter exists even in this smoke path.
-            _ = select_ssl_rows([{"i": 0, "kind": "train"}, {"i": 1, "kind": "holdout"}])
-            print(f"[GVD] exp-ssl-pretrain wrote {out} loss={float(loss.detach().item()):.6f}", flush=True)
+            try:
+                for one in strip_roots:
+                    refuse_lossy(one)
+                state_rows, source_meta = load_multi_source_rows(strip_roots, holdout_source=holdout_root)
+                train_rows = ssl_rows_from_split(
+                    state_rows,
+                    source_meta,
+                    holdout_blocks=resolve_holdout_blocks(args.holdout_blocks),
+                )
+                net = SceneNet(cams=cam_names, scale=float(args.scale)).train()
+
+                def _ssl_image(row):
+                    loaded = _frame_row(
+                        Path(row["source_root"]) if row.get("source_root") else holdout_root,
+                        row,
+                        cams=tuple(cam_names),
+                        scale=float(args.scale),
+                    )
+                    if loaded is None:
+                        return None
+                    frame, _meta = loaded
+                    return frame
+
+                stats = run_ssl_pretrain(
+                    net,
+                    train_rows,
+                    image_fn=_ssl_image,
+                    out_path=out,
+                    lr=float(args.lr),
+                    seed=int(args.seed),
+                    epochs=int(args.epochs),
+                )
+            except SslError as exc:
+                print(f"[GVD] exp-ssl-pretrain: {exc}", flush=True)
+                sys.exit(2)
+            print(
+                f"[GVD] exp-ssl-pretrain wrote {out} n={int(stats['n'])} "
+                f"loss={float(stats['last_loss']):.6f}",
+                flush=True,
+            )
             return
         if not torch_ready():
             print("[GVD] scene train needs PyTorch")

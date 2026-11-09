@@ -525,6 +525,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--exp-cuda-graph",
+        action="store_true",
+        help=(
+            "EXPERIMENT (off by default): capture a CUDA graph of the fixed-shape fused train "
+            "window. Falls back to eager on CPU or when the window shape changes. Does not "
+            "change the loss or the published 8 m holdout metric."
+        ),
+    )
+    parser.add_argument(
         "--ckpt-min-free-gb",
         type=float,
         default=None,
@@ -1357,6 +1366,7 @@ def _optimizer_step(
     road_edge_weight: float = 1.0,
     aux_cache: Any = None,
     fuse_window: bool = True,
+    cuda_graph_runner: Any = None,
 ) -> tuple[float | None, int, SceneState, SceneState]:
     """Backprop through this chunk only.
 
@@ -1408,7 +1418,12 @@ def _optimizer_step(
         ages, cond = _window_side_inputs(net, [[item[1] for item in packed]], device)
         image = torch.from_numpy(stacked).to(device)
         with _autocast(amp):
-            fused_pred, state, _extra = net.forward_window(image, dts, state, ages, cond)
+            if cuda_graph_runner is not None:
+                fused_pred, state, _extra = cuda_graph_runner.forward_window(
+                    net, image, dts, state, ages, cond
+                )
+            else:
+                fused_pred, state, _extra = net.forward_window(image, dts, state, ages, cond)
         tick_iter = [(tick, item[0], item[1]) for tick, item in enumerate(packed)]
         if view is not None:
             view.pump()
@@ -1545,6 +1560,7 @@ def _optimizer_group(
     road_edge_weight: float = 1.0,
     aux_cache: Any = None,
     fuse_window: bool = True,
+    cuda_graph_runner: Any = None,
 ) -> tuple[float | None, int, SceneState, SceneState]:
     """One step on several windows that each start from a fresh GRU state.
 
@@ -1613,7 +1629,12 @@ def _optimizer_group(
         image = torch.from_numpy(stacked).to(device)
         dts_t = torch.as_tensor(dts, dtype=torch.float32, device=device)
         with _autocast(amp):
-            fused_pred, state, _extra = net.forward_window(image, dts_t, state, ages, cond)
+            if cuda_graph_runner is not None:
+                fused_pred, state, _extra = cuda_graph_runner.forward_window(
+                    net, image, dts_t, state, ages, cond
+                )
+            else:
+                fused_pred, state, _extra = net.forward_window(image, dts_t, state, ages, cond)
         if view is not None:
             view.pump()
     for tick, alive in enumerate(kept_rows):
@@ -2221,6 +2242,7 @@ def train_directory(
     fuse_window: bool = True,
     aux_cache: Any = None,
     fit_trained_canvas: bool = False,
+    exp_cuda_graph: bool = False,
 ) -> dict[str, Any]:
     import torch
 
@@ -2603,6 +2625,17 @@ def train_directory(
     net = holder["net"]
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
+    cuda_graph_runner = None
+    if exp_cuda_graph:
+        from python.train.exp_cuda_graph import CudaGraphRunner, graph_eligible
+
+        cuda_graph_runner = CudaGraphRunner(enabled=True, device=device)
+        print(
+            "[GVD] exp-cuda-graph: on; "
+            f"eligible_now={graph_eligible(enabled=True, device=device, shape=(1,))} "
+            "(falls back to eager on CPU or shape change)",
+            flush=True,
+        )
     view.set_net(net)
     # Each shuffled window starts from a reset GRU, so several windows fit
     # in one step. parallel_fit is how many this free VRAM can hold.
@@ -3035,6 +3068,7 @@ def train_directory(
                             frame_ages=prefetched_ages,
                             aux_cache=aux_cache,
                             fuse_window=bool(fuse_window),
+                            cuda_graph_runner=cuda_graph_runner,
                         )
                     else:
                         step_loss, n_sup, carry, end_state = _optimizer_group(
@@ -3062,6 +3096,7 @@ def train_directory(
                             age_sets=group_ages,
                             aux_cache=aux_cache,
                             fuse_window=bool(fuse_window),
+                            cuda_graph_runner=cuda_graph_runner,
                         )
                 except RuntimeError as exc:
                     if not _is_oom(exc):
@@ -3746,6 +3781,7 @@ def main(argv: list[str] | None = None) -> None:
                 fuse_window=not bool(getattr(args, "no_fuse_window", False)),
                 aux_cache=aux_cache,
                 fit_trained_canvas=bool(getattr(args, "fit_trained_canvas", False)),
+                exp_cuda_graph=bool(getattr(args, "exp_cuda_graph", False)),
             )
         except ExactEpochsMismatch as exc:
             print(f"[GVD] scene train: {exc}", flush=True)

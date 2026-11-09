@@ -130,6 +130,17 @@ def resolve_scene_batch(requested: int, parallel_fit: int) -> int:
     return 1
 
 
+def trained_canvas_fit_kwargs(fit_trained_canvas: bool, trained_h: int, trained_w: int) -> dict[str, int]:
+    """Optional trained-canvas sizes for the ``--batch 0`` estimate.
+
+    Off by default so auto-fit matches the previous file-bytes estimate
+    (the new canvas-priced estimate is unmeasured on IQU45).
+    """
+    if not fit_trained_canvas:
+        return {}
+    return {"canvas_h": int(trained_h), "canvas_w": int(trained_w)}
+
+
 def _maybe_jitter(frame: Any, augment: bool, rng: np.random.RandomState | None) -> Any:
     """Photometric jitter on a decoded frame. The row's metres are not an input."""
     if not augment or frame is None:
@@ -185,7 +196,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--batch",
         type=int,
         default=0,
-        help="Windows per optimizer step. 0 fits the largest batch in free VRAM.",
+        help=(
+            "Windows per optimizer step. 0 fits the largest batch in free VRAM "
+            "using the previous file-bytes estimate. Pass --fit-trained-canvas "
+            "to price that estimate from the trained canvas instead (unmeasured "
+            "on IQU45: peak VRAM and the epoch result are not known)."
+        ),
     )
     parser.add_argument(
         "--capability",
@@ -335,7 +351,9 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Training seed: torch init, the augment / window-order numpy streams, Python random, and "
             "the DataLoader workers. Default 0 is the old fixed seeding. The holdout does not use it "
-            "(--holdout-seed). Not bit-reproducible: cudnn stays non-deterministic on GPU."
+            "(--holdout-seed). Not bit-reproducible: cudnn stays non-deterministic on GPU. "
+            "On CUDA this trainer also sets cudnn.benchmark=True, which may change GPU "
+            "numerics versus a run without it."
         ),
     )
     parser.add_argument(
@@ -492,7 +510,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Use the per-tick stem/GRU loop instead of one stem launch and one GRU over the window. "
-            "The loop is the reference path; default fused math matches it with dropout off."
+            "The loop is the reference path; default fused math matches it with dropout off. "
+            "The fused path applies a fresh train-mode GRU_IN_DROPOUT mask per tick."
+        ),
+    )
+    parser.add_argument(
+        "--fit-trained-canvas",
+        action="store_true",
+        help=(
+            "When --batch 0, estimate the free-VRAM batch from the trained canvas "
+            "(the cameras actually fed to the net) instead of source-file bytes per "
+            "strip. Off by default so auto-fit matches the previous trainer. The new "
+            "estimate is unmeasured on IQU45 (peak VRAM and epoch result unknown)."
         ),
     )
     parser.add_argument(
@@ -2191,6 +2220,7 @@ def train_directory(
     chunk_stride_frames: int = 0,
     fuse_window: bool = True,
     aux_cache: Any = None,
+    fit_trained_canvas: bool = False,
 ) -> dict[str, Any]:
     import torch
 
@@ -2486,9 +2516,8 @@ def train_directory(
     _trained_secs, trained_h, trained_w = scaled_layout(
         trained_names, input_scale if input_scale < 0.999 else 1.0
     )
-    frame_bytes = bytes_per_strip(
-        file_bytes, len(rows), canvas_h=int(trained_h), canvas_w=int(trained_w)
-    )
+    fit_kw = trained_canvas_fit_kwargs(bool(fit_trained_canvas), int(trained_h), int(trained_w))
+    frame_bytes = bytes_per_strip(file_bytes, len(rows), **fit_kw)
     chunk_len = choose_chunk_length(frame_bytes, chunk_vram_budget(int(free_vram_bytes)))
     if int(chunk_stride_frames) > 0:
         stride = max(1, min(int(chunk_len), int(chunk_stride_frames)))
@@ -2501,8 +2530,7 @@ def train_directory(
         free_ram_bytes=int(free_ram_bytes),
         n_windows=1,
         window_strips=chunk_len,
-        canvas_h=int(trained_h),
-        canvas_w=int(trained_w),
+        **fit_kw,
     )
     torch.manual_seed(int(seed))
     holder: dict[str, Any] = {}
@@ -2586,8 +2614,7 @@ def train_directory(
             n_strips=len(rows),
             window_strips=chunk_len,
             limit=32,
-            canvas_h=int(trained_h),
-            canvas_w=int(trained_w),
+            **fit_kw,
         )
     batch = resolve_scene_batch(int(batch_size), parallel_fit)
     est_step = step_bytes(
@@ -2595,8 +2622,7 @@ def train_directory(
         file_bytes=file_bytes,
         n_strips=max(1, len(rows)),
         window_strips=chunk_len,
-        canvas_h=int(trained_h),
-        canvas_w=int(trained_w),
+        **fit_kw,
     )
     recommended = bool(plan.recommended) and device.type == "cuda"
     note = "recommended" if recommended else "not recommended"
@@ -3057,8 +3083,7 @@ def train_directory(
                         n_strips=len(rows),
                         window_strips=chunk_len,
                         limit=1,
-                        canvas_h=int(trained_h),
-                        canvas_w=int(trained_w),
+                        **fit_kw,
                     )
                     if cpu_batch < 1:
                         raise TrainFitError(
@@ -3720,6 +3745,7 @@ def main(argv: list[str] | None = None) -> None:
                 chunk_stride_frames=int(getattr(args, "chunk_stride", 0) or 0),
                 fuse_window=not bool(getattr(args, "no_fuse_window", False)),
                 aux_cache=aux_cache,
+                fit_trained_canvas=bool(getattr(args, "fit_trained_canvas", False)),
             )
         except ExactEpochsMismatch as exc:
             print(f"[GVD] scene train: {exc}", flush=True)

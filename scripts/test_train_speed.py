@@ -130,11 +130,17 @@ def check_parser_flags() -> None:
     assert args.chunk_stride == 16
     assert args.no_fuse_window is True
     assert args.ckpt_dir.endswith("speed")
+    default = parser.parse_args(["--strips", "x"])
+    assert default.fit_trained_canvas is False
+    assert default.batch == 0
+    opted = parser.parse_args(["--strips", "x", "--fit-trained-canvas"])
+    assert opted.fit_trained_canvas is True
     print("parser_flags")
 
 
 def check_batch_uses_trained_canvas() -> None:
     from python.train.fit import bytes_per_strip, largest_batch, usable_bytes
+    from python.train.train_scene import trained_canvas_fit_kwargs
 
     file_bytes = 8_500_000_000
     n_strips = 4726
@@ -142,8 +148,15 @@ def check_batch_uses_trained_canvas() -> None:
     old = bytes_per_strip(file_bytes, n_strips)
     trained = bytes_per_strip(file_bytes, n_strips, canvas_h=192, canvas_w=256)
     assert trained < old
+    assert trained_canvas_fit_kwargs(False, 192, 256) == {}
+    assert trained_canvas_fit_kwargs(True, 192, 256) == {"canvas_h": 192, "canvas_w": 256}
     old_fit = largest_batch(
-        usable_bytes(free), file_bytes=file_bytes, n_strips=n_strips, window_strips=16, limit=32
+        usable_bytes(free),
+        file_bytes=file_bytes,
+        n_strips=n_strips,
+        window_strips=16,
+        limit=32,
+        **trained_canvas_fit_kwargs(False, 192, 256),
     )
     new_fit = largest_batch(
         usable_bytes(free),
@@ -151,10 +164,12 @@ def check_batch_uses_trained_canvas() -> None:
         n_strips=n_strips,
         window_strips=16,
         limit=32,
-        canvas_h=192,
-        canvas_w=256,
+        **trained_canvas_fit_kwargs(True, 192, 256),
     )
-    assert new_fit >= old_fit
+    # Default --batch 0 must keep the previous estimate (this fixture: 10).
+    assert old_fit == 10, old_fit
+    assert new_fit == 32, new_fit
+    assert new_fit > old_fit
     print(f"batch_uses_trained_canvas old_per={old} trained_per={trained} old_fit={old_fit} new_fit={new_fit}")
 
 
@@ -267,6 +282,86 @@ def check_fused_window_matches_loop() -> None:
     print(f"fused_window_matches_loop loss_delta={delta:.2e} grad_delta={max_grad:.2e} (CPU)")
 
 
+def check_fused_dropout_fresh_per_tick() -> None:
+    import torch
+
+    from python.train.scene_net import GRU_IN_DROPOUT, SceneNet
+
+    assert GRU_IN_DROPOUT == 0.1
+    torch.manual_seed(73)
+    net = SceneNet(cams=("main",))
+    net.train()
+    device = torch.device("cpu")
+    net.to(device)
+    ticks = 4
+    rng = np.random.RandomState(73)
+    frames = [rng.randint(0, 255, (192, 256, 3), dtype=np.uint8) for _ in range(ticks)]
+    stacked = np.ascontiguousarray(np.stack(frames)[None, ...])
+    shapes: list[tuple[int, ...]] = []
+    orig = net.gru_in_drop.forward
+
+    def hooked(token_tick):
+        shapes.append(tuple(token_tick.shape))
+        return orig(token_tick)
+
+    net.gru_in_drop.forward = hooked
+    state = net.initial_state(device=device, batch=1)
+    net.forward_window(
+        torch.from_numpy(stacked),
+        torch.tensor([[0.1] * ticks], dtype=torch.float32),
+        state,
+    )
+    assert len(shapes) == ticks, shapes
+    assert all(len(shape) == 2 and shape[0] == 1 for shape in shapes), shapes
+    dims = {shape[1] for shape in shapes}
+    assert len(dims) == 1
+    print(f"fused_dropout_fresh_per_tick calls={len(shapes)} shape={shapes[0]} (CPU)")
+
+
+def _reference_eval_pairs(net, frames, rows, device, reset_every: int):
+    """Per-tick pairing copied from main's original ``_eval_sequence`` body.
+
+    Independent of the prefetch ``frames=`` helper so a mutation that drops one
+    scored pair inside ``_eval_sequence`` fails the comparison.
+    """
+    import torch
+
+    from python.debug.lane_targets import lane_center_is_valid, lane_gt_from_record, lane_x_from_vector
+    from python.train.train_scene import _forward, _prediction_at, _reset_stream, _stack_states, step_dt
+
+    state = net.initial_state(device=device, batch=1)
+    state = _stack_states(state, state)
+    pairs: list = []
+    pairs_long: list = []
+    net.eval()
+    with torch.no_grad():
+        for k, row in enumerate(rows):
+            if k % int(reset_every) == 0:
+                state = _reset_stream(net, state, 0, device)
+            frame = frames[k]
+            stacked = np.stack([frame, frame])
+            image = torch.from_numpy(np.ascontiguousarray(stacked)).to(device)
+            dt_value = step_dt(row.get("dt_s"))
+            dt = torch.tensor([dt_value, dt_value], dtype=torch.float32, device=device)
+            pred, state = _forward(net, image, dt, state, [row, row])
+            tech = row.get("tech") if isinstance(row.get("tech"), dict) else row
+            gt_vec, gt_mask = lane_gt_from_record(tech if isinstance(tech, dict) else None)
+            if not lane_center_is_valid(gt_mask):
+                continue
+            gt_x = lane_x_from_vector(gt_vec)
+            gt_f = float("nan") if gt_x is None else float(gt_x)
+            for b in range(2):
+                lane = getattr(_prediction_at(pred, b), "lane_gt", None)
+                vec = None if lane is None else lane.detach().float().cpu().numpy().reshape(-1)
+                pred_x = None if vec is None else lane_x_from_vector(vec)
+                pair = (float("nan") if pred_x is None else float(pred_x), gt_f)
+                if b == 0:
+                    pairs.append(pair)
+                else:
+                    pairs_long.append(pair)
+    return pairs, pairs_long
+
+
 def check_val_rms_identical() -> None:
     import torch
 
@@ -281,51 +376,35 @@ def check_val_rms_identical() -> None:
     rng = np.random.RandomState(7)
     frames = [rng.randint(0, 255, (192, 256, 3), dtype=np.uint8) for _ in range(8)]
     rows = [_lane_row(i, 0.2 + 0.05 * i) for i in range(8)]
-    state_a = net.initial_state(device=device, batch=1)
-    state_b = net.initial_state(device=device, batch=1)
-    pairs_a: list = []
-    pairs_long_a: list = []
-    parts_a: dict = {}
-    loss_a, n_a = _eval_sequence(
+    ref_pairs, ref_long = _reference_eval_pairs(net, frames, rows, device, reset_every=4)
+    state = net.initial_state(device=device, batch=1)
+    pairs: list = []
+    pairs_long: list = []
+    parts: dict = {}
+    _loss, n_loss = _eval_sequence(
         net,
         Path("."),
         rows,
-        state_a,
+        state,
         device=device,
         amp=False,
         view=None,
-        pairs=pairs_a,
-        pairs_long=pairs_long_a,
-        parts=parts_a,
+        pairs=pairs,
+        pairs_long=pairs_long,
+        parts=parts,
         frames=frames,
         reset_every=4,
         heads=("lane_gt",),
     )
-    pairs_b: list = []
-    pairs_long_b: list = []
-    parts_b: dict = {}
-    loss_b, n_b = _eval_sequence(
-        net,
-        Path("."),
-        rows,
-        state_b,
-        device=device,
-        amp=False,
-        view=None,
-        pairs=pairs_b,
-        pairs_long=pairs_long_b,
-        parts=parts_b,
-        frames=list(frames),
-        reset_every=4,
-        heads=("lane_gt",),
-    )
-    scored_a = val_summary(pairs_a, pairs_long_a, parts_a)
-    scored_b = val_summary(pairs_b, pairs_long_b, parts_b)
-    assert n_a == n_b and n_a > 0
-    assert scored_a["n"] == scored_b["n"]
-    assert scored_a["rms"] == scored_b["rms"]
-    assert scored_a["rms_long"] == scored_b["rms_long"]
-    print(f"val_rms_identical rms={scored_a['rms']} n={scored_a['n']} (CPU)")
+    scored = val_summary(pairs, pairs_long, parts)
+    scored_ref = val_summary(ref_pairs, ref_long, None)
+    assert n_loss > 0
+    assert scored["n"] == scored_ref["n"]
+    assert scored["n"] == 8, scored["n"]
+    assert scored_ref["n"] == 8, scored_ref["n"]
+    assert scored["rms"] == scored_ref["rms"]
+    assert scored["rms_long"] == scored_ref["rms_long"]
+    print(f"val_rms_identical rms={scored['rms']} n={scored['n']} (CPU)")
 
 
 def check_memory_reading_skips_smi_when_torch_has_bytes() -> None:
@@ -362,6 +441,7 @@ def main() -> None:
     check_aux_cache_matches_png()
     check_memory_reading_skips_smi_when_torch_has_bytes()
     check_fused_window_matches_loop()
+    check_fused_dropout_fresh_per_tick()
     check_val_rms_identical()
     print("train speed ok")
 

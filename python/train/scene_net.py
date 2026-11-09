@@ -1626,9 +1626,10 @@ if torch is not None:
             so callers that used to keep a mid-window stride mark can take the
             final state when every train window starts from a reset.
 
-            Dropout is applied to the whole (B, T, D) token block in one call.
-            With dropout on, the mask differs from T separate ``forward_batch``
-            calls; eval and ``gru_in_drop.p = 0`` match the loop.
+            Dropout uses a fresh train-mode mask per tick (``GRU_IN_DROPOUT``),
+            matching T separate ``forward_batch`` calls. A single (B, T, D)
+            dropout would be a different regularizer. Eval and
+            ``gru_in_drop.p = 0`` match the loop as well.
             """
             if not torch.is_tensor(strips):
                 strips = torch.from_numpy(np.ascontiguousarray(strips))
@@ -1657,7 +1658,10 @@ if torch is not None:
             if not torch.is_tensor(dts):
                 dts = torch.as_tensor(np.asarray(dts, dtype=np.float32))
             dts = dts.to(device=image.device, dtype=image.dtype).reshape(batch, ticks)
-            dropped = self.gru_in_drop(token)
+            dropped = torch.stack(
+                [self.gru_in_drop(token[:, tick]) for tick in range(ticks)],
+                dim=1,
+            )
             gru_in = torch.cat([dropped, dts.unsqueeze(-1)], dim=-1)
             gru_out, h_new = self.gru(gru_in, state.h)
             tokens_ring = state.tokens

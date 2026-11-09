@@ -103,6 +103,62 @@ class SyntheticDetector(Detector):
         ]
 
 
+
+def load_max_inference_vram_gb(default: float = 4.0) -> float:
+    """Read config/hardware.yaml ``max_inference_vram_gb`` (default 4)."""
+    root = Path(__file__).resolve().parents[2]
+    hw = root / "config" / "hardware.yaml"
+    try:
+        for line in hw.read_text(encoding="utf-8").splitlines():
+            if line.strip().startswith("max_inference_vram_gb:"):
+                return float(line.split(":", 1)[1].strip().split()[0])
+    except (OSError, TypeError, ValueError):
+        pass
+    return float(default)
+
+
+def weight_file_exceeds_vram_cap(
+    path: Path | None = None,
+    *,
+    size_bytes: int | None = None,
+    cap_gb: float | None = None,
+) -> bool:
+    cap = float(load_max_inference_vram_gb() if cap_gb is None else cap_gb)
+    if size_bytes is None:
+        if path is None:
+            raise TypeError("weight_file_exceeds_vram_cap needs path or size_bytes")
+        size_bytes = int(Path(path).stat().st_size)
+    return int(size_bytes) > cap * (1024 ** 3)
+
+
+def onnx_providers(
+    *,
+    available: list[str] | set[str] | None = None,
+    cap_gb: float | None = None,
+) -> list:
+    """CUDA first, with the hardware.yaml arena cap, then CPU."""
+    import onnxruntime as ort  # type: ignore
+
+    avail = set(available if available is not None else ort.get_available_providers())
+    cap = float(load_max_inference_vram_gb() if cap_gb is None else cap_gb)
+    limit = int(cap * (1024 ** 3))
+    providers: list = []
+    if "CUDAExecutionProvider" in avail:
+        providers.append(("CUDAExecutionProvider", {"gpu_mem_limit": limit}))
+    if "CPUExecutionProvider" in avail or not providers:
+        providers.append("CPUExecutionProvider")
+    return providers
+
+
+def _session_from_onnx(ort, onnx_path: Path):
+    cap = load_max_inference_vram_gb()
+    if weight_file_exceeds_vram_cap(onnx_path, cap_gb=cap):
+        raise RuntimeError(
+            f"{onnx_path} is larger than max_inference_vram_gb={cap}"
+        )
+    return ort.InferenceSession(str(onnx_path), providers=onnx_providers(cap_gb=cap))
+
+
 class OnnxYoloDetector(Detector):
     name = "yolov8n-onnx"
 
@@ -114,10 +170,7 @@ class OnnxYoloDetector(Detector):
         self.conf = conf
         # Class-wise NMS after the cutoff (#150); 0.45 is the YOLOX path's constant.
         self.nms_thr = nms_thr
-        want = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        avail = set(ort.get_available_providers())
-        providers = [p for p in want if p in avail] or ["CPUExecutionProvider"]
-        self.session = ort.InferenceSession(str(self.path), providers=providers)
+        self.session = _session_from_onnx(ort, self.path)
         self.input_name = self.session.get_inputs()[0].name
         shape = self.session.get_inputs()[0].shape
         self.in_h = int(shape[2]) if isinstance(shape[2], int) else 640
@@ -265,10 +318,7 @@ class OnnxYoloxDetector(Detector):
         self.name = stem if stem.endswith("-onnx") else f"{stem}-onnx"
         self.conf = conf
         self.nms_thr = nms_thr
-        want = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        avail = set(ort.get_available_providers())
-        providers = [p for p in want if p in avail] or ["CPUExecutionProvider"]
-        self.session = ort.InferenceSession(str(self.path), providers=providers)
+        self.session = _session_from_onnx(ort, self.path)
         self.input_name = self.session.get_inputs()[0].name
         shape = self.session.get_inputs()[0].shape
         self.in_h = int(shape[2]) if len(shape) > 2 and isinstance(shape[2], int) else 640

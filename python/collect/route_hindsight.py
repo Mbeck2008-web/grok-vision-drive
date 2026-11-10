@@ -16,12 +16,12 @@ from python.sensors.route_intent import (
     Graph,
     LOOKAHEAD_M,
     SNAP_M,
+    UTURN_DEG,
     classify_turn,
 )
 
 EXIT_M = 15.0
 NEAR_M = 25.0
-UTURN_DEG = 135.0
 ROUNDABOUT_DEG = 270.0
 CMDS = ("follow", "left", "right", "straight", "mask")
 

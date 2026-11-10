@@ -33,9 +33,12 @@ def check_encoding_is_not_ctl_cond() -> None:
     nav_left = vec_from_nav({"turn": "left", "next_jct_m": 12.0})
     assert nav_left.tolist()[:4] == [0.0, 1.0, 0.0, 0.0]
     none = vec_from_nav({"turn": "none", "next_jct_m": None})
-    assert none.tolist()[:4] == [1.0, 0.0, 0.0, 0.0]
+    assert none.tolist() == [1.0, 0.0, 0.0, 0.0, 1.0], "no junction is follow+1.0"
+    for metres in (5.0, 25.0, 59.0):
+        masked = vec_from_nav({"turn": "none", "next_jct_m": metres})
+        assert masked.tolist() == [1.0, 0.0, 0.0, 0.0, 0.0], (metres, masked)
     missing = vec_from_nav(None)
-    assert missing.tolist()[:4] == [1.0, 0.0, 0.0, 0.0]
+    assert missing.tolist() == [1.0, 0.0, 0.0, 0.0, 1.0]
     src = (ROOT / "python/train/route_cond.py").read_text(encoding="utf-8")
     for needle in ("steer_ai", "throttle_ai", "brake_ai", "speed_mps", "ctl_cond"):
         assert needle not in src, needle
@@ -84,7 +87,29 @@ def check_train_runtime_encoding_contract() -> None:
     assert runtime_route_vec({}, {"turn": "left", "next_jct_m": 190.0}).tolist()[:4] == [
         1.0, 0.0, 0.0, 0.0
     ]
-    print("  encoding: turn cmds only <=60 m; >80 m follow+missing; shared thresholds")
+
+    # Mask-class / none inside 60 m is follow+0 (same as encode_route("mask", metres)),
+    # not follow+near_dist. follow+1.0 is only for a missing junction.
+    import math
+    from python.sensors.route_intent import UTURN_DEG, classify_turn
+
+    assert classify_turn(math.pi) == "none"
+    assert classify_turn(-math.pi) == "none"
+    assert classify_turn(math.radians(179.0)) == "none"
+    assert classify_turn(math.radians(-179.0)) == "none"
+    assert classify_turn(math.radians(UTURN_DEG)) == "none"
+    assert classify_turn(math.radians(18.0)) == "none"
+    assert classify_turn(math.radians(22.0)) == "none"
+    assert classify_turn(math.radians(90.0)) == "left"
+    assert classify_turn(math.radians(-90.0)) == "right"
+    for metres in (5.0, 25.0, 59.0):
+        live = runtime_route_vec({}, {"turn": "none", "next_jct_m": metres})
+        train = encode_route("mask", metres)
+        assert train.tolist() == [1.0, 0.0, 0.0, 0.0, 0.0]
+        assert live.tolist() == train.tolist(), (metres, live)
+    far_none = runtime_route_vec({}, {"turn": "none", "next_jct_m": None})
+    assert far_none.tolist() == [1.0, 0.0, 0.0, 0.0, 1.0]
+    print("  encoding: turn cmds only <=60 m; >80 m follow+missing; mask/none/U-turn in-range follow+0")
 
 
 def check_left_25m_reaches_model_tensor() -> None:
@@ -106,6 +131,64 @@ def check_left_25m_reaches_model_tensor() -> None:
     print("  live left at 25 m encodes as left with dist 25/150")
 
 
+def _pose_rows(poses: list[tuple[float, float, float]]) -> list[dict]:
+    import math
+
+    rows = []
+    for i, (x, y, heading) in enumerate(poses):
+        rows.append(
+            {
+                "t": round(i * 0.1, 4),
+                "pos": [float(x), float(y), 0.0],
+                "dir": [math.cos(heading), math.sin(heading), 0.0],
+            }
+        )
+    return rows
+
+
+def _assert_labeler_runtime_match(
+    graph, poses, goal: str, *, include_mask: bool, compare_n: int | None = None
+) -> tuple[int, int]:
+    """Hindsight encode_route must equal runtime_route_vec(intent_from_pose).
+
+    The full ``poses`` sequence is labeled so the hindsight labeler can see
+    the exit. ``compare_n`` limits the assertion to the approach (the exit
+    arm is only there for labeling).
+    """
+    from python.collect.route_hindsight import label_sequence
+    from python.sensors.route_intent import intent_from_pose
+    from python.train.route_cond import encode_route, runtime_route_vec
+
+    rows = _pose_rows(poses)
+    labels = label_sequence(graph, rows)
+    assert len(labels) == len(poses)
+    mismatches = []
+    compared = 0
+    mask_compared = 0
+    for i, (row, lab, pose) in enumerate(zip(rows, labels, poses)):
+        if compare_n is not None and i >= compare_n:
+            continue
+        result = intent_from_pose(graph, (pose[0], pose[1]), goal=goal, heading=pose[2])
+        if lab["cmd"] == "mask":
+            if not include_mask:
+                continue
+            # Post-junction SNAP_M masks: runtime has no junction ahead
+            # (none+None -> follow+1.0). The contract under test is an
+            # in-range mask-class approach, where runtime still reports
+            # next_jct_m and must emit follow+0, not follow+near_dist.
+            if result.get("next_jct_m") is None:
+                continue
+        train_vec = encode_route(lab["cmd"], lab["next_jct_m"])
+        live_vec = runtime_route_vec({}, result)
+        compared += 1
+        if lab["cmd"] == "mask":
+            mask_compared += 1
+        if not np.allclose(train_vec, live_vec, atol=5e-3):
+            mismatches.append((row["t"], lab, result, train_vec.tolist(), live_vec.tolist()))
+    assert not mismatches, mismatches[:5]
+    return compared, mask_compared
+
+
 def check_labeler_runtime_vectors_match() -> None:
     """Same pose sequence: hindsight encode_route == runtime_route_vec(intent_from_pose)."""
     import math
@@ -125,33 +208,84 @@ def check_labeler_runtime_vectors_match() -> None:
         poses.append((0.0, float(y), math.pi / 2.0))
     for x in range(-1, -201, -1):
         poses.append((float(x), 0.0, math.pi))
-    rows = []
-    for i, (x, y, heading) in enumerate(poses):
-        rows.append(
-            {
-                "t": round(i * 0.1, 4),
-                "pos": [float(x), float(y), 0.0],
-                "dir": [math.cos(heading), math.sin(heading), 0.0],
-            }
-        )
-    labels = label_sequence(graph, rows)
-    assert len(labels) == len(poses)
-    mismatches = []
-    compared = 0
-    for row, lab, pose in zip(rows, labels, poses):
-        # Masked hindsight rows are follow+0; runtime missing/none is follow+1.0.
-        if lab["cmd"] == "mask":
-            continue
-        train_vec = encode_route(lab["cmd"], lab["next_jct_m"])
-        result = intent_from_pose(graph, (pose[0], pose[1]), goal="W", heading=pose[2])
-        live_vec = runtime_route_vec({}, result)
-        compared += 1
-        if not np.allclose(train_vec, live_vec, atol=5e-3):
-            mismatches.append((row["t"], lab, result, train_vec.tolist(), live_vec.tolist()))
+    # Non-mask rows on S->T->W stay identical. Post-junction SNAP_M "uturn"
+    # masks (already past T, runtime none+None -> follow+1.0) are a different
+    # residual than the in-range mask-class approach contract below.
+    compared, _ = _assert_labeler_runtime_match(graph, poses, "W", include_mask=False)
     assert compared >= 200, compared
+    labels = label_sequence(graph, _pose_rows(poses))
     assert any(lab["cmd"] == "left" for lab in labels)
-    assert not mismatches, mismatches[:5]
-    print(f"  labeler vs runtime: {compared} identical non-mask vectors on S->T->W")
+
+    # 18° / 22° approaches at 5 / 25 / 59 m, and a ~180° hairpin U-turn:
+    # labeler mask rows must match runtime follow+0 (not follow+near_dist,
+    # and not RIGHT from classify_turn wrapping π to −π).
+    mask_hits = 0
+    for deg in (18.0, 22.0):
+        ang = math.radians(deg)
+        angled = Graph(
+            nodes={
+                "A": (0.0, 0.0),
+                "J": (80.0, 0.0),
+                "B": (80.0 + 80.0 * math.cos(ang), 80.0 * math.sin(ang)),
+                "C": (80.0, 80.0),
+            },
+            edges=(("A", "J", False), ("J", "B", False), ("J", "C", False)),
+        )
+        angled_poses = [(float(x), 0.0, 0.0) for x in range(0, 81, 1)]
+        for i in range(1, 81):
+            angled_poses.append((80.0 + i * math.cos(ang), i * math.sin(ang), ang))
+        n, nmask = _assert_labeler_runtime_match(
+            angled, angled_poses, "B", include_mask=True, compare_n=81
+        )
+        assert nmask > 0, deg
+        mask_hits += nmask
+        # Exact 5 / 25 / 59 m approach samples must be follow+0 on both sides.
+        for metres in (5.0, 25.0, 59.0):
+            pose = (80.0 - metres, 0.0, 0.0)
+            lab = label_sequence(angled, _pose_rows([pose] + angled_poses[int(80.0 - metres) + 1 :]))[0]
+            result = intent_from_pose(angled, (pose[0], pose[1]), goal="B", heading=0.0)
+            train_vec = encode_route(lab["cmd"], lab["next_jct_m"])
+            live_vec = runtime_route_vec({}, result)
+            assert lab["cmd"] == "mask", (deg, metres, lab)
+            assert train_vec.tolist() == [1.0, 0.0, 0.0, 0.0, 0.0]
+            assert np.allclose(train_vec, live_vec, atol=5e-3), (deg, metres, result, live_vec.tolist())
+            assert result["turn"] == "none"
+
+    # Start 1 m in from node A so the snap is an interior projection on A-J
+    # (an endpoint snap at A can lose to the nearby return arm).
+    hairpin = Graph(
+        nodes={"A": (0.0, -80.0), "J": (0.0, 0.0), "B": (2.0, -80.0), "C": (80.0, 0.0)},
+        edges=(("A", "J", False), ("J", "B", False), ("J", "C", False)),
+    )
+    uturn_poses = [(0.0, float(y), math.pi / 2.0) for y in range(-79, 1, 1)]
+    # Walk the return arm far enough for the labeler EXIT_M ring.
+    for i in range(1, 81):
+        x = 2.0 * i / 80.0
+        y = -i
+        heading = math.atan2(-80.0 - 0.0, 2.0 - 0.0)
+        uturn_poses.append((x, y, heading))
+    n, nmask = _assert_labeler_runtime_match(
+        hairpin, uturn_poses, "B", include_mask=True, compare_n=80
+    )
+    assert nmask > 0
+    mask_hits += nmask
+    for metres in (5.0, 25.0, 59.0):
+        pose = (0.0, -metres, math.pi / 2.0)
+        # Include future samples past J so the labeler can score the U-turn.
+        idx = 79 - int(metres)
+        lab = label_sequence(hairpin, _pose_rows(uturn_poses[idx:]))[0]
+        result = intent_from_pose(hairpin, (pose[0], pose[1]), goal="B", heading=math.pi / 2.0)
+        train_vec = encode_route(lab["cmd"], lab["next_jct_m"])
+        live_vec = runtime_route_vec({}, result)
+        assert lab["cmd"] == "mask", (metres, lab)
+        assert result["turn"] == "none", result
+        assert train_vec.tolist() == [1.0, 0.0, 0.0, 0.0, 0.0]
+        assert np.allclose(train_vec, live_vec, atol=5e-3), (metres, result, live_vec.tolist())
+
+    print(
+        f"  labeler vs runtime: {compared} identical non-mask vectors on S->T->W; "
+        f"{mask_hits} identical mask rows on 18/22 deg and U-turn approaches"
+    )
 
 
 def check_balance_and_sidecar() -> None:
@@ -219,6 +353,43 @@ def _call_passes_literal_none(tree: ast.AST, func_name: str, arg_index: int = 1)
                 if kw.value.value is None:
                     return True
     return False
+
+
+def check_load_route_graph_unreadable() -> None:
+    """A missing path or bad JSON must not kill the supervisor: None + one warning."""
+    import io
+    import tempfile
+    from contextlib import redirect_stdout
+    from python.run_vision import load_route_graph
+
+    assert load_route_graph("") is None
+    assert load_route_graph(None) is None
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        missing = load_route_graph("/no/such/gvd-route-graph-207.json")
+    assert missing is None
+    warn = buf.getvalue()
+    assert warn.count("[GVD] WARNING:") == 1, warn
+    assert "unreadable" in warn
+
+    with tempfile.TemporaryDirectory() as tmp:
+        bad = Path(tmp) / "bad.json"
+        bad.write_text("{not json", encoding="utf-8")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            got = load_route_graph(str(bad))
+        assert got is None
+        assert buf.getvalue().count("[GVD] WARNING:") == 1, buf.getvalue()
+
+        good = Path(tmp) / "ok.json"
+        good.write_text(
+            '{"nodes": {"A": [0, 0], "B": [10, 0]}, "edges": [{"a": "A", "b": "B"}]}',
+            encoding="utf-8",
+        )
+        graph = load_route_graph(str(good))
+        assert graph is not None and "A" in graph.nodes and "B" in graph.nodes
+    print("  load_route_graph: missing path or bad JSON returns None and logs one warning")
 
 
 def check_run_vision_wires_under_flag() -> None:
@@ -297,6 +468,7 @@ def main() -> int:
     check_labeler_runtime_vectors_match()
     check_balance_and_sidecar()
     check_trainer_flag()
+    check_load_route_graph_unreadable()
     check_run_vision_wires_under_flag()
     check_model_flag_shapes_ckpt_and_flip()
     print("test_route_cond: ok")

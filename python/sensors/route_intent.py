@@ -22,6 +22,7 @@ APPROACH_M = 60.0
 SNAP_M = 16.0
 AMBIGUOUS_LO = 16.0
 AMBIGUOUS_HI = 24.0
+UTURN_DEG = 135.0
 
 
 def result_message(turn: str, next_jct_m: float | None) -> dict[str, Any]:
@@ -50,13 +51,15 @@ def classify_turn(delta_rad: float) -> str:
     """left / straight / right from a heading change (CCW positive).
 
     The 16–24° band is ambiguous: training masks it and the model encodes
-    ``none`` as follow. Shared with ``route_hindsight.AMBIGUOUS_LO/HI``.
+    ``none`` as follow. Heading changes at or above ``UTURN_DEG`` are also
+    ``none`` so a wrapped π → −π U-turn is not classified as ``right``.
+    Shared with ``route_hindsight``.
     """
     deg = math.degrees(_wrap(delta_rad))
     ad = abs(deg)
     if ad < AMBIGUOUS_LO:
         return "straight"
-    if ad < AMBIGUOUS_HI:
+    if ad < AMBIGUOUS_HI or ad >= UTURN_DEG:
         return "none"
     return "left" if deg > 0.0 else "right"
 

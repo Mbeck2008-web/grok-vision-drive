@@ -259,13 +259,17 @@ def load_route_graph(path: str | None, level: str | None = None) -> Graph | None
     raw = str(path or "").strip()
     if not raw:
         return None
-    data = json.loads(Path(raw).read_text(encoding="utf-8"))
-    if isinstance(data, dict) and "levels" in data:
-        name = (level or "").strip() or next(iter(data["levels"]))
-        return Graph.from_fixture(data, name)
-    nodes = {str(k): (float(v[0]), float(v[1])) for k, v in data["nodes"].items()}
-    edges = tuple((str(e["a"]), str(e["b"]), bool(e.get("oneway", False))) for e in data["edges"])
-    return Graph(nodes=nodes, edges=edges)
+    try:
+        data = json.loads(Path(raw).read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "levels" in data:
+            name = (level or "").strip() or next(iter(data["levels"]))
+            return Graph.from_fixture(data, name)
+        nodes = {str(k): (float(v[0]), float(v[1])) for k, v in data["nodes"].items()}
+        edges = tuple((str(e["a"]), str(e["b"]), bool(e.get("oneway", False))) for e in data["edges"])
+        return Graph(nodes=nodes, edges=edges)
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        print(f"[GVD] WARNING: route graph unreadable ({raw}): {exc}", flush=True)
+        return None
 
 
 def ego_xy_for_intent(vdata: Any, extras_bundle: Any, nav: dict[str, Any] | None) -> tuple[float, float] | None:

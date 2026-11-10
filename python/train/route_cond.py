@@ -55,9 +55,8 @@ def cmd_from_nav(nav: Mapping[str, Any] | None) -> tuple[str, float | None]:
 
     if not isinstance(nav, Mapping):
         return "follow", None
-    turn = str(nav.get("turn") or "").strip().lower()
-    if turn not in ("left", "right", "straight"):
-        turn = "follow"
+    raw_turn = str(nav.get("turn") or "").strip().lower()
+    turn = raw_turn if raw_turn in ("left", "right", "straight") else "follow"
     dist = nav.get("next_jct_m")
     try:
         metres = None if dist is None else float(dist)
@@ -71,6 +70,11 @@ def cmd_from_nav(nav: Mapping[str, Any] | None) -> tuple[str, float | None]:
         return "follow", None
     if metres > APPROACH_M:
         return "follow", metres
+    # Mask-class approaches (turn none/mask, including U-turns that classify
+    # as none) must match training: follow+0, not follow+near_dist. That
+    # residual is not follow+1.0; 1.0 is only the missing-junction code.
+    if raw_turn not in ("left", "right", "straight"):
+        return "mask", metres
     return turn, metres
 
 

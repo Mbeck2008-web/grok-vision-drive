@@ -26,6 +26,7 @@ def _pred(lane_x: float = -0.8, confidence: float = 0.9) -> object:
         lane_x=lane_x,
         confidence=confidence,
         canvas_shape=(192, 256, 3),
+        ckpt="drive.ckpt_ep1.npz",
     )
 
 
@@ -80,9 +81,46 @@ def check_drive_feeds_modular_path() -> None:
     assert float(pout.planner["target_v"]) == 15.0
     st = scene_ckpt_as_state(pred, drive=True, engaged=True, steer=0.22)
     assert st["shadow"] is False and st["drive"] is True
-    assert st["lane_x"] == -1.25 and abs(st["confidence"] - 0.88) < 1e-6
+    published = st["lane_x"]
+    if isinstance(published, dict):
+        assert published.get("src") == "model"
+        published = published.get("lane_x")
+    assert published == -1.25 and abs(st["confidence"] - 0.88) < 1e-6
+    assert st.get("centers"), "a confident drive state still publishes centers"
     assert st["engaged"] is True and abs(float(st["steer"]) - 0.22) < 1e-6
     print("drive feeds modular path from lane_x and caps target_v OK")
+
+
+def check_low_conf_drive_uses_filtered_state() -> None:
+    """conf 0.20: no steer from suppressed centers, no exception, LOW caption."""
+    from python.train.scene_ckpt_runtime import (
+        apply_scene_ckpt_lane,
+        draw_scene_ckpt_overlay,
+        scene_ckpt_overlay_caption,
+    )
+    from python.viz.scene_ribbon import scene_ckpt_ribbon_polyline
+
+    pred = _pred(lane_x=-0.4, confidence=0.20)
+    state = pred.as_state()
+    assert not state.get("centers")
+    assert state.get("lane_x") is None
+    pout = _pout()
+    decision = apply_scene_ckpt_lane(pout, pred, drive=True)
+    assert decision == "stop", decision
+    assert pout.path_ego == []
+    assert pout.lane_source == "scene_ckpt/stop"
+    assert scene_ckpt_overlay_caption(pred, drive=True).startswith("LOW")
+    frame = np.zeros((120, 160, 3), dtype=np.uint8)
+    drawn = draw_scene_ckpt_overlay(frame, pred, drive=True)
+    assert drawn is not None and drawn.shape == frame.shape
+    high = _pred(lane_x=-1.25, confidence=0.9)
+    high_state = high.as_state()
+    assert high_state.get("centers")
+    lx = high_state["lane_x"]
+    assert (lx["lane_x"] if isinstance(lx, dict) else lx) == -1.25
+    poly = scene_ckpt_ribbon_polyline(high_state["centers"], high_state["confidence"])
+    assert len(poly) >= 2
+    print("drive at 0.20 does not steer from suppressed centers; 0.90 still has centers OK")
 
 
 def check_low_conf_and_aeb_override() -> None:
@@ -497,6 +535,7 @@ def check_same_tick_observe_documented() -> None:
 def main() -> None:
     check_flag_off_by_default()
     check_drive_feeds_modular_path()
+    check_low_conf_drive_uses_filtered_state()
     check_low_conf_and_aeb_override()
     check_drive_without_ckpt_refused()
     check_multicam_ckpt_refuses_drive()

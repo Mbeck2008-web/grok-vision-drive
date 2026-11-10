@@ -30,6 +30,9 @@ CTL_HEAD = "ctl"
 # Opt-in road-edge head (``--heads lane_gt,road_edge``), training-only by default.
 # Separate from paint ``lane_gt``; never an alias for painted lines.
 ROAD_EDGE_HEAD = "road_edge"
+# Opt-in detect heads (``--heads lane_gt,edge,obj,brakelight``). Empty
+# ``--heads`` does not turn them on. ``obj`` is not the default ``objects`` head.
+DETECT_HEADS = ("edge", "obj", "brakelight")
 # ONNX outputs each head writes (scene_net.OUTPUT_FIELDS, split by head). An
 # export carries every output; the ones whose head was not in --heads are
 # random-init and are listed in ``gvd_outputs_untrained``.
@@ -70,14 +73,15 @@ def parse_cams(text: str | None) -> tuple[str, ...]:
 
 
 def parse_heads(text: str | None) -> tuple[str, ...]:
-    """Head names. Empty trains every head (``ctl`` / ``road_edge`` only when named)."""
+    """Head names. Empty trains every head (``ctl`` / ``road_edge`` / detect heads only when named)."""
     parts = [part.strip() for part in str(text or "").split(",") if part.strip()]
     if not parts:
         return HEAD_NAMES
     names: list[str] = []
+    allowed = set(HEAD_NAMES) | {CTL_HEAD, ROAD_EDGE_HEAD} | set(DETECT_HEADS)
     for part in parts:
         key = _HEAD_ALIASES.get(part.lower(), part.lower())
-        if key not in HEAD_NAMES and key != CTL_HEAD and key != ROAD_EDGE_HEAD:
+        if key not in allowed:
             raise ValueError(f"unknown head {part}")
         if key not in names:
             names.append(key)

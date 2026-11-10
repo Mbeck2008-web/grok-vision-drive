@@ -79,11 +79,7 @@ def apply_scene_ckpt_lane(pout: Any, pred: Any, *, drive: bool, min_conf: float 
         return "shadow"
     from python.train.scene_lane_runtime import scene_lane_decision, straight_lane_path
 
-    lane_x = None if pred is None else getattr(pred, "lane_x", None)
-    try:
-        conf = 0.0 if pred is None else float(getattr(pred, "confidence", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        conf = 0.0
+    lane_x, conf = _lane_from_filtered_state(pred)
     if scene_lane_decision(lane_x, conf, min_conf=min_conf) != "lane":
         pout.path_ego = []
         pout.lane_conf = float(conf)
@@ -117,6 +113,40 @@ def cap_drive_speed(pout: Any, speed_mps: float) -> None:
     pout.planner = pl
 
 
+def _lane_from_filtered_state(pred: Any) -> tuple[float | None, float]:
+    """Read the metre the filtered state still publishes.
+
+    ``as_state`` drops centers and nulls ``lane_x`` below 0.40. This does not
+    fall back to the raw prediction, so a suppressed center cannot steer.
+    Missing centers or ``lane_x is None`` return no metre and do not raise.
+    """
+    if pred is None or not hasattr(pred, "as_state"):
+        return None, 0.0
+    try:
+        state = pred.as_state()
+    except Exception:
+        return None, 0.0
+    if not isinstance(state, dict):
+        return None, 0.0
+    try:
+        conf = float(state.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        conf = 0.0
+    centers = state.get("centers")
+    if not isinstance(centers, list) or not centers:
+        return None, conf
+    raw = state.get("lane_x")
+    if isinstance(raw, dict):
+        raw = raw.get("lane_x")
+    if raw is None:
+        return None, conf
+    try:
+        lane_x = float(raw)
+    except (TypeError, ValueError):
+        return None, conf
+    return lane_x, conf
+
+
 def scene_ckpt_as_state(
     pred: Any,
     *,
@@ -129,6 +159,13 @@ def scene_ckpt_as_state(
         out = dict(pred.as_state())
     else:
         out = {"lane_x": None, "confidence": 0.0, "canvas": None}
+    # The drive log stores the filtered metre, or null when the filter
+    # suppressed it. It does not copy the raw prediction back in.
+    published = out.get("lane_x")
+    if isinstance(published, dict):
+        out["lane_x"] = published.get("lane_x")
+    elif "lane_x" not in out:
+        out["lane_x"] = None
     out["source"] = "scene_ckpt"
     out["shadow"] = not bool(drive)
     out["drive"] = bool(drive)
@@ -144,25 +181,60 @@ class SceneCkptPred:
     confidence: float = 0.0
     heading_err_rad: float | None = None
     canvas_shape: tuple[int, ...] | None = None
+    ckpt: str = ""
+    detect: dict[str, Any] | None = None
 
     @classmethod
     def empty(cls) -> "SceneCkptPred":
         return cls()
 
     def as_state(self) -> dict[str, Any]:
-        centers = scene_ckpt_centers(self.lane_gt)
-        out = {
+        from python.train.viz_contract import MIN_CONF, MODEL_SRC, package_lane, renderable_state
+
+        conf = float(self.confidence)
+        ckpt = str(self.ckpt or "")
+        body: dict[str, Any] = {
             "shadow": True,
             "source": "scene_ckpt",
-            "lane_x": None if self.lane_x is None else float(self.lane_x),
-            "confidence": float(self.confidence),
-            "centers": centers,
-            "caption": scene_ckpt_caption(self.confidence),
+            "confidence": conf,
+            "caption": scene_ckpt_caption(conf),
             "canvas": list(self.canvas_shape) if self.canvas_shape else None,
         }
+        # Only records that pass is_model_drawable survive renderable_state.
+        # Below 0.40, package_lane nulls the metre and the record is omitted,
+        # and centers are not published at all.
+        if ckpt and conf >= float(MIN_CONF):
+            body["centers"] = [
+                {
+                    "src": MODEL_SRC,
+                    "head": "lane_gt",
+                    "ckpt": ckpt,
+                    "confidence": conf,
+                    "x": float(center["x"]),
+                    "y": float(center["y"]),
+                }
+                for center in scene_ckpt_centers(self.lane_gt)
+            ]
+            tagged = package_lane(ckpt=ckpt, lane_x=self.lane_x, confidence=conf)
+            body["lane"] = tagged
+            body["lane_x"] = tagged
+        if self.detect:
+            body["detect"] = self.detect
+        filtered = renderable_state(body)
+        filtered["shadow"] = True
+        filtered["source"] = "scene_ckpt"
+        filtered["confidence"] = conf
+        filtered["caption"] = scene_ckpt_caption(conf)
+        filtered["canvas"] = body["canvas"]
+        # #191 heading is metadata, not a drawable. It is not a steering source.
         if self.heading_err_rad is not None:
-            out["heading_err_rad"] = float(self.heading_err_rad)
-        return out
+            try:
+                heading = float(self.heading_err_rad)
+            except (TypeError, ValueError):
+                heading = None
+            if heading is not None and heading == heading:
+                filtered["heading_err_rad"] = heading
+        return filtered
 
 
 def scene_ckpt_overlay_caption(pred: SceneCkptPred | None, *, drive: bool = False) -> str:
@@ -311,8 +383,10 @@ class SceneCkptRuntime:
         with torch.inference_mode():
             pred, self.state = self.net.forward(canvas, 0.0 if dt_s is None else float(dt_s), self.state)
         raw = getattr(pred, "lane_gt", None)
+        detect = _detect_package(self.path.name, pred)
+        shape = tuple(int(x) for x in canvas.shape)
         if raw is None:
-            return SceneCkptPred(canvas_shape=tuple(int(x) for x in canvas.shape))
+            return SceneCkptPred(canvas_shape=shape, ckpt=self.path.name, detect=detect)
         vec = raw.detach().float().cpu().numpy().reshape(-1).astype(np.float32)
         heading = None
         if vec.size >= 2:
@@ -324,8 +398,37 @@ class SceneCkptRuntime:
             lane_x=lane_x_from_vector(vec),
             confidence=confidence_from_vector(vec),
             heading_err_rad=heading,
-            canvas_shape=tuple(int(x) for x in canvas.shape),
+            canvas_shape=shape,
+            ckpt=self.path.name,
+            detect=detect,
         )
+
+
+def _numpy_head(value: Any) -> np.ndarray | None:
+    if value is None:
+        return None
+    detach = getattr(value, "detach", None)
+    if detach is None:
+        return None
+    return detach().float().cpu().numpy()
+
+
+def _detect_package(ckpt: str, pred: Any) -> dict[str, Any] | None:
+    """Model-head package. Missing heads stay omitted. Never reads ground truth."""
+    if getattr(pred, "edge", None) is None and getattr(pred, "obj_box", None) is None and getattr(pred, "brake", None) is None:
+        return None
+    from python.train.viz_contract import package_detect
+
+    return package_detect(
+        ckpt=ckpt,
+        edge=_numpy_head(getattr(pred, "edge", None)),
+        edge_conf=_numpy_head(getattr(pred, "edge_conf", None)),
+        obj_box=_numpy_head(getattr(pred, "obj_box", None)),
+        obj_conf=_numpy_head(getattr(pred, "obj_conf", None)),
+        obj_class=_numpy_head(getattr(pred, "obj_class", None)),
+        brake=_numpy_head(getattr(pred, "brake", None)),
+        brake_conf=_numpy_head(getattr(pred, "brake_conf", None)),
+    )
 
 
 def _require_main(frame: Any) -> np.ndarray | None:

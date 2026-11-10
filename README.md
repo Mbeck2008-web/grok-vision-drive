@@ -19,6 +19,10 @@ GVD enters **beta** when a trained model drives the car in BeamNG. The next proo
 
 Trainer collapse fixes and event masking (`--mask-events`, `python/train/event_mask.py`) merged to main in PR #87 on 2026-10-20. That is trainer code; it is not evidence that a model drives.
 
+## What the visualizer may draw
+
+Everything the visualizer draws comes from the cameras and the live model that is currently driving the car. That means the outputs of the deployed model at runtime. BeamNG ground truth, game poses, sensors, the map, the road data, and the AI path are not drawn at runtime, including as a debug fallback. BeamNG ground truth is only for training labels. Each drawable field is tagged with its model head and checkpoint id. If that output is missing or its confidence is low, the visualizer draws nothing. The check and the field list are in [docs/VIZ_CONTRACT.md](docs/VIZ_CONTRACT.md). This rule is **Offline smoke only** until a live clip shows it.
+
 ## Quick start
 
 Windows. You do not need an administrator account. The full agent procedure (Tech launch flags, data disk, collect, validate, train) is [AGENTS.md](AGENTS.md). Shell debugging is [DEBUGGING.md](DEBUGGING.md).

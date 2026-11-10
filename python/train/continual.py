@@ -1259,6 +1259,40 @@ def _cell_distance_m(xy: tuple[float, float], key: tuple[int, int], cell_m: floa
     return math.hypot(dx, dy)
 
 
+def apply_holdout_time_gap(
+    labels: list[str],
+    times: list[float | None],
+    *,
+    gap_s: float = HOLDOUT_GAP_S,
+    hold_label: str = "hold",
+    train_label: str = "train",
+    gap_label: str = "gap",
+) -> list[str]:
+    """Mark train labels within ``gap_s`` of a hold timestamp as gap.
+
+    This is the #187 4 s purge used by ``cell_holdout_labels``. Extracted so
+    experiment helpers reuse the same rule instead of copying it.
+    """
+    out = list(labels)
+    gap = max(0.0, float(gap_s))
+    if gap <= 0:
+        return out
+    hold_times = sorted(t for t, lab in zip(times, out) if lab == hold_label and t is not None)
+    if not hold_times:
+        return out
+    import bisect
+
+    for index, (stamp, lab) in enumerate(zip(times, out)):
+        if lab != train_label or stamp is None:
+            continue
+        j = bisect.bisect_left(hold_times, stamp)
+        for k in (j - 1, j):
+            if 0 <= k < len(hold_times) and abs(hold_times[k] - stamp) < gap:
+                out[index] = gap_label
+                break
+    return out
+
+
 def cell_holdout_labels(
     rows: list[Mapping[str, Any]],
     spec: Mapping[str, Any],
@@ -1297,22 +1331,7 @@ def cell_holdout_labels(
                 if near:
                     break
         labels.append("gap" if near else "train")
-    gap = max(0.0, float(gap_s))
-    if gap > 0:
-        times = [_row_time(row) for row in rows]
-        hold_times = sorted(t for t, lab in zip(times, labels) if lab == "hold" and t is not None)
-        if hold_times:
-            import bisect
-
-            for index, (stamp, lab) in enumerate(zip(times, labels)):
-                if lab != "train" or stamp is None:
-                    continue
-                j = bisect.bisect_left(hold_times, stamp)
-                for k in (j - 1, j):
-                    if 0 <= k < len(hold_times) and abs(hold_times[k] - stamp) < gap:
-                        labels[index] = "gap"
-                        break
-    return labels
+    return apply_holdout_time_gap(labels, [_row_time(row) for row in rows], gap_s=gap_s)
 
 
 def _cell_plan(

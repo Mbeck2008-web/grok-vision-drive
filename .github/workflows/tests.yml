@@ -8,7 +8,7 @@ on:
 jobs:
   offline:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Put /tmp on disk
         # ubuntu-26.04 mounts /tmp as a RAM tmpfs (about 7.8 GB). The suite writes

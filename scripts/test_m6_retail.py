@@ -1336,6 +1336,11 @@ def check_ffb_stale_engage_heartbeat() -> None:
     stops, so gvd_engage.json stays engaged:true with the stamp written before spawn.
     Nothing writes engaged:false; only freshness tells it apart from a live latch. The
     supervisor must stop driving on it, and `_engage_live_on_last_tick` must say not live.
+
+    The supervisor runs with `echo_clock=True` so a lagged echo pump on a slow host
+    cannot write echo_stale and fail this heartbeat-staleness check. The echo gate
+    then follows the fake mod's clock, not host time.monotonic(); ECHO_STALE_MS and
+    production run_vision stay unchanged.
     """
     _touch_lua_bus()
     if ego_path().exists():
@@ -1356,6 +1361,7 @@ def check_ffb_stale_engage_heartbeat() -> None:
         ack=True,
         wheel_by_echo=lambda k: 0.9 if k % 2 else -0.9,
         engage_heartbeat=False,
+        echo_clock=True,
     )
     live, why = _engage_live_on_last_tick()
     eng = why["engage"]

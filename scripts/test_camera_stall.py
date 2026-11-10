@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Camera stall: duplicate buffers age out, and a 20 Hz camera stays visible.
+"""Untaken unique frames stay on the bundle the supervisor takes.
 
-The capture pump reads shared memory much faster than the sensor's
-requested_update_time. Each re-show is a new bundle with unique_gpu_n 0.
-LatestFrameSlot keeps only the newest bundle, so the supervisor's 15 Hz
-take usually observes unique=0 and camera_hz collapses, while the content
-stamp on that duplicate is still the fresh unique frame. An identical
-buffer must not move that stamp, so a camera that truly stops ages out
-and the frame-age gate refuses to drive.
+The capture pump reads shared memory faster than a 15 Hz take. Each
+re-show is a new bundle with unique_gpu_n 0. LatestFrameSlot used to keep
+only that newest bundle, so the take saw unique=0 and camera_hz (1/dt per
+take) collapsed even after a unique grab. This file checks that the
+untaken unique count is still visible.
+
+Stamping is not this carry. grab / note_content_time own captured_at.
+A frozen colour buffer ages, and the frame-age gate refuses past 300 ms.
+The 20 Hz stub below is polled at 15 Hz, so camera_hz can read >= 10 only
+because this loop's take rate is 15 Hz. A ~4 Hz live loop cannot report
+>= 10 Hz. That feed rate is not what these checks fix.
 """
 from __future__ import annotations
 
@@ -117,11 +121,14 @@ def check_identical_buffer_ages_out() -> None:
     stopped, replaced = gate_drive_command(drive, engaged=True, stale=stale)
     assert replaced is True and stopped.reason == "frame_stale"
     assert stopped.steer == 0.0 and stopped.throttle == 0.0 and stopped.brake == 1.0
-    print(f"identical buffer keeps its stamp; age_s={age:.3f} refuses drive")
+    print(f"grab stamp unchanged; age_s={age:.3f} refuses drive")
 
 
-def check_supervisor_sees_20hz() -> None:
-    """Pump the way run_vision does, take at the default 15 Hz loop."""
+def check_unique_metric_follows_takes() -> None:
+    """15 Hz takes of a 20 Hz stub. camera_hz is 1/dt of those takes.
+
+    The >= 10 check is this loop's take rate. It is not a live feed-rate fix.
+    """
     cam = _HzCamera(20.0)
     be = _ready_backend(cam)
     slot = LatestFrameSlot()
@@ -157,7 +164,7 @@ def check_supervisor_sees_20hz() -> None:
     assert unique_takes > 0, unique_takes
     assert cam_hz >= 10.0, (cam_hz, unique_takes, takes, cam.reads, slot.dropped)
     print(
-        f"20 Hz camera via supervisor poll: camera_hz={cam_hz:.2f} "
+        f"unique metric at 15 Hz takes: camera_hz={cam_hz:.2f} "
         f"unique_takes={unique_takes}/{takes} reads={cam.reads} dropped={slot.dropped}"
     )
 
@@ -165,7 +172,7 @@ def check_supervisor_sees_20hz() -> None:
 def main() -> None:
     check_untaken_unique_survives_duplicate()
     check_identical_buffer_ages_out()
-    check_supervisor_sees_20hz()
+    check_unique_metric_follows_takes()
     print("test_camera_stall: OK")
 
 

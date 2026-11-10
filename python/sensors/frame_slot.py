@@ -23,11 +23,12 @@ The camera path makes the pixels themselves old:
 ``LatestFrameSlot`` keeps one bundle. A put that replaces a frame the
 consumer has not taken increments ``dropped``. A shared-memory re-show is
 a new bundle with ``unique_gpu_n`` 0. That put used to erase the unique
-grab the supervisor had not taken, so ``camera_hz`` fell to 0. The untaken
-unique count is carried onto the newer bundle. The content stamp is not:
-a repeated buffer keeps the time it was first seen, and a camera that
-stops still ages out. BeamNGpy itself is unchanged: ``stream_raw`` is
-already the latest shared-memory read. The pin stays 1.36.
+grab the supervisor had not taken, so the unique label and ``camera_hz``
+(one tick per take) fell to 0. The untaken unique count is carried onto
+the newer bundle. The carry does not copy or refresh ``captured_at`` or
+timestamps; ``grab`` / ``note_content_time`` own stamping. BeamNGpy itself
+is unchanged: ``stream_raw`` is already the latest shared-memory read.
+The pin stays 1.36.
 """
 
 from __future__ import annotations
@@ -228,8 +229,9 @@ def carry_untaken_unique(previous: Any, new: Any) -> Any:
 
     The capture pump replaces the slot on every grab. A shared-memory
     re-show has ``unique_gpu_n`` 0 and would hide the unique grab. The
-    count moves onto ``new``. ``captured_at`` stays on ``new``, so a
-    repeated buffer is not stamped again.
+    count moves onto ``new``. This function never copies or refreshes
+    ``captured_at`` or timestamps. ``grab`` / ``note_content_time`` own
+    stamping.
     """
     if new is None or previous is None:
         return new
@@ -270,7 +272,7 @@ class LatestFrameSlot:
     """One slot. A newer put drops an untaken frame instead of queueing it.
 
     An untaken unique observation is copied onto the replacement. The
-    replacement's content stamp is left as the producer set it.
+    carry does not copy or refresh ``captured_at`` or timestamps.
     """
 
     def __init__(self) -> None:

@@ -419,7 +419,41 @@ def main(clock=None) -> None:
         default=0.0,
         help="Stop the supervisor loop after this many seconds (0 = run until stopped). For captures.",
     )
+    from python.train.model_size import add_model_size_args
+
+    add_model_size_args(ap)
     args = ap.parse_args()
+    from python.train.model_size import plan_from_namespace
+
+    try:
+        size_plan = plan_from_namespace(args, detect=None)
+    except Exception as exc:
+        print(f"[GVD] model-size: {exc}; staying on small", flush=True)
+        size_plan = None
+    else:
+        from python.train.model_size import _sizing_requested
+
+        if _sizing_requested(args):
+            print(size_plan.line, flush=True)
+            for warning in size_plan.warnings:
+                print(f"[GVD] model-size warning: {warning}", flush=True)
+        else:
+            print("[GVD] model-size small (default; today's net)", flush=True)
+        if str(getattr(args, "model_size", "small")) == "auto":
+            from python.train.model_size import apply_runtime_knobs, detect_gpu
+
+            seen = detect_gpu()
+            for note in apply_runtime_knobs(seen.capability, seen.name, enabled=True):
+                print(f"[GVD] model-size {note}", flush=True)
+        asked = int(getattr(args, "live_input_long_side", 0) or 0)
+        if asked > 0 and int(getattr(args, "live_long_side", 0) or 0) <= 0:
+            args.live_long_side = asked
+        elif (
+            str(getattr(args, "model_size", "small")) == "auto"
+            and int(getattr(args, "live_long_side", 0) or 0) <= 0
+            and asked <= 0
+        ):
+            args.live_long_side = int(size_plan.long_side)
     scene_ckpt_path = str(getattr(args, "scene_ckpt", "") or "").strip()
     if bool(getattr(args, "scene_ckpt_drive", False)) and not scene_ckpt_path:
         print("[GVD] --scene-ckpt-drive requires --scene-ckpt <epoch.npz>", flush=True)
@@ -440,7 +474,17 @@ def main(clock=None) -> None:
         from python.train.scene_ckpt_runtime import SceneCkptRuntime
 
         try:
-            scene_ckpt = SceneCkptRuntime(args.scene_ckpt)
+            pinned = None if size_plan is None else size_plan.preset
+            scene_ckpt = SceneCkptRuntime(args.scene_ckpt, requested_preset=pinned)
+            if str(getattr(args, "model_size", "small")) == "auto" and size_plan is not None:
+                from python.train.model_size import prepare_backend
+
+                wrapped, used, notes = prepare_backend(scene_ckpt.net, size_plan.backend)
+                scene_ckpt.net = wrapped
+                for note in notes:
+                    print(f"[GVD] model-size backend: {note}", flush=True)
+                if used != "eager":
+                    print(f"[GVD] model-size backend {used}", flush=True)
         except (OSError, ValueError, KeyError) as exc:
             print(f"[GVD] scene-ckpt: {exc}", flush=True)
             raise SystemExit(2)
@@ -801,6 +845,13 @@ def main(clock=None) -> None:
                 )
         elif args.lane_source == "gt":
             print("[GVD] lane source=gt road-network center at 8 m", flush=True)
+        active_preset = "small" if size_plan is None else size_plan.preset
+        last_pressure = 0.0
+        last_infer_ms = None
+        pressure_target = float(getattr(args, "target_hz", 10.0) or 10.0)
+        pressure_limit = None if size_plan is None else size_plan.limit_ms
+        if getattr(args, "max_infer_ms", None):
+            pressure_limit = float(args.max_infer_ms)
         while True:
             if run_deadline is not None and time.monotonic() >= run_deadline:
                 print(f"[GVD] --run-seconds {float(args.run_seconds):g} reached; stopping", flush=True)
@@ -854,6 +905,30 @@ def main(clock=None) -> None:
                 except Exception:
                     vdata = None
             ego_stale = stale_ego.observe(vdata)
+            if time.perf_counter() - last_pressure >= 5.0:
+                last_pressure = time.perf_counter()
+                try:
+                    from python.train.model_size import read_free_vram_gb, step_down_for_pressure
+
+                    game_fps = getattr(vdata, "fps", None) if vdata is not None else None
+                    nxt, stepped, why = step_down_for_pressure(
+                        active_preset,
+                        free_vram_gb=read_free_vram_gb(),
+                        game_fps=game_fps,
+                        infer_ms=last_infer_ms,
+                        loop_hz=loop_hz_ema if frame_i > 0 else None,
+                        max_infer_ms=pressure_limit,
+                        target_hz=pressure_target,
+                    )
+                    if stepped and nxt != active_preset:
+                        print(
+                            f"[GVD] model-size step-down {active_preset} -> {nxt}: {why}. "
+                            "The loaded net stays up; the next launch uses the smaller size.",
+                            flush=True,
+                        )
+                        active_preset = nxt
+                except Exception as exc:
+                    print(f"[GVD] model-size step-down skipped: {exc}", flush=True)
             if cam_age_live:
                 # A respawn or reset drops every held side frame; this tick's grab
                 # (taken before the edge was seen) keeps main only.
@@ -1451,6 +1526,10 @@ def main(clock=None) -> None:
                 gpu_vram_total_gb=float(hw.dgpu_vram_gb or 11.0),
                 gpu_vram_used_gb=gpu_vram_used_gb(),
             )
+            try:
+                last_infer_ms = float(pout.infer_ms)
+            except (TypeError, ValueError):
+                last_infer_ms = None
             st["ego"]["speed_mps"] = ego_v
             if not engaged and disengage_reason not in ("none", "not_engaged"):
                 last_refusal_reason = disengage_reason  # sticky; not_engaged never overwrites it

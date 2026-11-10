@@ -258,7 +258,7 @@ def _infer_flag(meta: Any, weights: Any, key: str, prefixes: tuple[str, ...], ar
 class SceneCkptRuntime:
     """One CPU SceneNet loaded from an epoch ``.npz``, GRU state kept across ticks."""
 
-    def __init__(self, path: Path | str) -> None:
+    def __init__(self, path: Path | str, requested_preset: str | None = None) -> None:
         from python.train.epoch_ckpt import build_net, load_epoch_ckpt, load_into_net
 
         self.path = Path(path)
@@ -277,6 +277,10 @@ class SceneCkptRuntime:
                 "needs the t-dt controls; this shadow runtime does not feed them"
             )
         self.meta = meta
+        if requested_preset not in (None, "", "auto"):
+            from python.train.model_size import refuse_preset_mismatch
+
+            refuse_preset_mismatch(requested_preset, meta)
         self.net = build_net(meta, weights)
         load_into_net(self.net, weights)
         self.net = self.net.cpu().eval()

@@ -46,6 +46,7 @@ from python.sensors.tech import (
     run_probe,
 )
 from python.sensors.extras import ExtraSensors, load_sensors_config, nav_hint_from_bundle, write_sensors_snapshot
+from python.sensors.route_intent import merge_nav_intent
 from python.viz.foxglove_bridge import FoxgloveBridge
 from python.control.e2e import make_e2e
 from python.control.override import (
@@ -74,7 +75,7 @@ from python.viz.nerd import image_point_from_window_mouse
 # the supervisor only needs torch-free helpers here. The scene runtime is imported lazily below.
 from python.train.scene_live import SCENE_SHAPE_HOLD, live_strip_fields
 from python.viz.stage import drawn_lane_records
-from python.sensors.cameras import CAM_IDS, CamHealth, bundle_tick_frames
+from python.sensors.cameras import CAM_IDS, CamHealth, CameraFrameBundle, bundle_tick_frames
 from python.runtime.debug_opts import apply_to_command, apply_to_perception
 from python.runtime.hw_probe import ema_hz, gpu_vram_used_gb, probe, refuse_live_start, unique_frame_hz_inst
 from python.runtime.models import ModelRuntime
@@ -90,6 +91,20 @@ from python.runtime.state_io import (
 )
 from python.runtime.paths import bus_identity
 from python.sensors.cameras import camera_ge_socket_busy, make_backend, resolve_backend_name
+from python.sensors.frame_slot import (
+    AgeWindow,
+    CapturePump,
+    LatestFrameSlot,
+    bundle_frame_age_s,
+    format_latency_line,
+    process_rss_mb,
+)
+from python.runtime.frame_gate import (
+    DEFAULT_MAX_FRAME_AGE_MS,
+    frame_is_stale,
+    gate_drive_command,
+    require_max_frame_age_ms,
+)
 from python.sensors.live_hold import (
     RespawnWatch,
     StaleEgo,
@@ -119,17 +134,8 @@ def _load_control_yaml() -> dict:
 
 
 def _rss_mb() -> float:
-    try:
-        import resource
-
-        return float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) / 1024.0
-    except Exception:
-        try:
-            import psutil  # type: ignore
-
-            return psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
-        except Exception:
-            return 0.0
+    """Current supervisor RSS in MiB. Linux statm, Windows working set, then psutil."""
+    return process_rss_mb()
 
 
 
@@ -419,10 +425,18 @@ def main(clock=None) -> None:
         default=0.0,
         help="Stop the supervisor loop after this many seconds (0 = run until stopped). For captures.",
     )
+    ap.add_argument(
+        "--max-frame-age-ms",
+        type=float,
+        default=DEFAULT_MAX_FRAME_AGE_MS,
+        help="Do not drive on a camera frame older than this (default 300). "
+        "The tick is captioned LOW/STALE and logged. Heartbeat, AEB, and engage are unchanged.",
+    )
     from python.train.model_size import add_model_size_args
 
     add_model_size_args(ap)
     args = ap.parse_args()
+    args.max_frame_age_ms = require_max_frame_age_ms(args.max_frame_age_ms)
     from python.train.model_size import plan_from_namespace
 
     try:
@@ -614,6 +628,13 @@ def main(clock=None) -> None:
             raise SystemExit(2)
         print(f"[GVD] live_input_long_side={long_side} (--live-long-side)", flush=True)
     backend = make_backend(backend_name if args.backend != "auto" else backend_name, long_side=long_side)
+    if scene_ckpt is not None and hasattr(backend, "set_needed_cameras"):
+        needed = tuple(getattr(scene_ckpt, "cams", ()) or ("main",))
+        backend.set_needed_cameras(needed)
+        print(
+            f"[GVD] capture cameras={','.join(needed)} (active model; other rig cameras stay off)",
+            flush=True,
+        )
     backend.open()
     from python.sensors.tech import exit_if_tech_connect_failed
 
@@ -773,6 +794,9 @@ def main(clock=None) -> None:
     if gt_log_enabled(bool(args.gt_log)) or args.lane_source == "gt":
         gt_log = GroundTruthLogger.open()
         print(f"[GVD] ground truth -> {gt_log.path}", flush=True)
+    capture_slot = LatestFrameSlot()
+    capture_pump: CapturePump | None = None
+    age_window = AgeWindow()
     try:
         scene_lane = None
         scene_guard = None
@@ -852,6 +876,12 @@ def main(clock=None) -> None:
         pressure_limit = None if size_plan is None else size_plan.limit_ms
         if getattr(args, "max_infer_ms", None):
             pressure_limit = float(args.max_infer_ms)
+        if clock is None:
+            # Capture stays off the control thread. The slot keeps one frame;
+            # a slower infer loop drops the ones it did not take. The step
+            # clock used by tests stays synchronous so a tick is one grab.
+            capture_pump = CapturePump(capture_slot, backend.grab, idle_s=0.002)
+            capture_pump.start()
         while True:
             if run_deadline is not None and time.monotonic() >= run_deadline:
                 print(f"[GVD] --run-seconds {float(args.run_seconds):g} reached; stopping", flush=True)
@@ -881,10 +911,26 @@ def main(clock=None) -> None:
                     )
 
             t_grab = time.perf_counter()
-            bundle = backend.grab()
+            if capture_pump is not None:
+                held = capture_slot.take()
+                if held is None and capture_slot.wait(0.05):
+                    held = capture_slot.take()
+                if held is None:
+                    bundle = CameraFrameBundle(
+                        backend=getattr(backend, "name", "stub"),
+                        note="capture: waiting",
+                    )
+                else:
+                    bundle = held.payload
+            else:
+                bundle = backend.grab()
             grab_ms = float(getattr(bundle, "grab_ms", 0.0) or 0.0)
             if grab_ms <= 0:
                 grab_ms = (time.perf_counter() - t_grab) * 1000.0
+            # Take-time age feeds the speed cap. The drive decision is recomputed
+            # immediately before gate_drive_command, after AEB has already run
+            # on this same bundle.
+            frame_age_s_cap = bundle_frame_age_s(bundle)
             grab_phase = int(getattr(bundle, "grab_phase", -1))
             grab_poll_free = bool(getattr(bundle, "grab_poll_free", True))
             main = bundle.main_bgr()
@@ -1216,6 +1262,12 @@ def main(clock=None) -> None:
                         ckpt_stop = True
                     else:
                         cap_drive_speed(pout, float(args.scene_ckpt_drive_speed))
+                # frame_age_s from the pixel fitter is how long the hough lane
+                # has been a non-take. This checkpoint is the lane, so the
+                # stale-speed cap must see the camera content age instead.
+                # A fresh main frame stays near 0. A repeated buffer climbs
+                # and the cap still holds speed. Heartbeat and AEB are untouched.
+                pout.frame_age_s = frame_age_s_cap
             cmd_seq += 1
             wide = None
             try:
@@ -1359,7 +1411,15 @@ def main(clock=None) -> None:
                     except (TypeError, ValueError):
                         frame_ts = None
                     break
-            frame_cmd_ms = (time.time() - frame_ts) * 1000.0 if frame_ts is not None else -1.0
+            if (
+                frame_ts is None
+                or frame_ts != frame_ts
+                or frame_ts <= 0.0
+                or frame_ts == float("inf")
+            ):
+                frame_cmd_ms = -1.0
+            else:
+                frame_cmd_ms = (time.monotonic() - frame_ts) * 1000.0
             # A missing sample, a point closer than 4 m, or a heading past a
             # lane, is not a command to center the wheel. Hold the last steer
             # (creeping toward 0) and say why. preview_blocked still brakes;
@@ -1488,6 +1548,22 @@ def main(clock=None) -> None:
             # Actuators only when engaged + command ok (path / tracks / shadow already on this tick).
             # cmd_json: Lua applies whatever we write only while `engaged` rides along in the payload.
             # beamngpy: note_engaged(False) makes stop() release once, then not call vehicle.control.
+            # Decision-time age, not the sample taken at grab. A missing stamp is inf.
+            frame_age_s_cap = bundle_frame_age_s(bundle)
+            frame_age_ms = frame_age_s_cap * 1000.0
+            frame_stale = frame_is_stale(frame_age_s_cap, float(args.max_frame_age_ms))
+            if scene_ckpt is not None:
+                pout.frame_age_s = frame_age_s_cap
+            cmd, frame_gated = gate_drive_command(
+                cmd, engaged=bool(engaged), stale=bool(frame_stale), holding=bool(holding),
+            )
+            if frame_gated:
+                holding = False
+                print(
+                    f"[GVD] frame stale age_ms={frame_age_ms:.0f} "
+                    f"max_ms={float(args.max_frame_age_ms):.0f} caption=LOW/STALE",
+                    flush=True,
+                )
             if hasattr(actuator, "note_engaged"):
                 actuator.note_engaged(engaged)
             if hasattr(actuator, "note_ack"):
@@ -1559,6 +1635,7 @@ def main(clock=None) -> None:
                 # Tech attach has no gvd_ego.json; ego_fb stays None until Lua retail echo.
                 heading = nav_heading_from_sources(vdata, ego_fb)
                 st["nav"] = nav_hint_from_bundle(extras_bundle, heading_deg=heading)
+            st["nav"] = merge_nav_intent(st.get("nav") if isinstance(st.get("nav"), dict) else {}, None)
             st["sensors"] = extras_bundle.health()
             # Real planner path wins. The 36 m steer preview is only the empty-path stand-in.
             st["path_ego"] = list(pout.path_ego) if pout.path_ego else steer_preview_path_ego(steer, length_m=36.0)
@@ -1619,7 +1696,10 @@ def main(clock=None) -> None:
                     steer=float(applied.steer),
                 )
                 main = draw_scene_ckpt_overlay(
-                    main, ckpt_pred, drive=bool(getattr(args, "scene_ckpt_drive", False))
+                    main,
+                    ckpt_pred,
+                    drive=bool(getattr(args, "scene_ckpt_drive", False)),
+                    frame_stale=bool(frame_stale),
                 )
             st["lane_hold"] = {
                 "lateral_m": None if lane_x is None else float(lane_x),
@@ -1783,10 +1863,24 @@ def main(clock=None) -> None:
                 brake=float(brake_in or 0.0),
                 override_reason=ovr.reason,
             )
+            strip_t = time.time()
+            _strip_stamps = getattr(bundle, "timestamps", None) or {}
+            _main_stamp = _strip_stamps.get("main", _strip_stamps.get("cam_main"))
+            try:
+                _main_stamp_f = float(_main_stamp)
+            except (TypeError, ValueError):
+                _main_stamp_f = None
+            if (
+                _main_stamp_f is not None
+                and _main_stamp_f == _main_stamp_f
+                and _main_stamp_f > 0.0
+                and _main_stamp_f != float("inf")
+            ):
+                strip_t = _main_stamp_f
             ui.feed_strip(
                 getattr(bundle, "frames", None),
                 timestamps=getattr(bundle, "timestamps", None),
-                t=time.time(),
+                t=strip_t,
                 engaged=bool(engaged),
                 ego={"speed_mps": ego_v},
                 wheel=fields["wheel"],
@@ -1814,6 +1908,35 @@ def main(clock=None) -> None:
 
             # Call-site coalesce only. write_state itself still stamps the beat.
             # Mark after the write so the 100 ms cap is on the file, not the check.
+            stage_frame = None
+            if win is not None:
+                # Reuse this tick's bus check. A second bus_identity() would
+                # move the clock seam the retail tests count.
+                paint = st if ident.matched else load_paint_state()
+                stage_frame = render_stage(
+                    paint,
+                    ui=ui,
+                    main_frame=main,
+                    cam_frames=getattr(bundle, "frames", None),
+                    dets=getattr(pout, "dets", None),
+                )
+                st["viz_ms"] = float(paint.get("viz_ms") or 0.0)
+            age_window.add(frame_age_ms)
+            tick_now = clock.perf() if clock is not None else time.perf_counter()
+            print(
+                format_latency_line(
+                    capture_ms=grab_ms,
+                    infer_ms=float(pout.infer_ms),
+                    viz_ms=float(st.get("viz_ms") or 0.0),
+                    total_ms=(tick_now - loop_t0) * 1000.0,
+                    frame_age_ms=frame_age_ms,
+                    frame_age_p50_ms=age_window.p50(),
+                    frame_age_p90_ms=age_window.p90(),
+                    rss_mb=float(st.get("rss_mb") or 0.0),
+                    dropped=int(capture_slot.dropped),
+                ),
+                flush=True,
+            )
             if state_due:
                 write_state(st)
                 soft_esc_state_write_mark()
@@ -1850,18 +1973,10 @@ def main(clock=None) -> None:
                 cmd_reason=str(st.get("cmd_reason") or ""),
             )
 
-            if win is not None:
+            if win is not None and stage_frame is not None:
                 import cv2
 
-                paint = load_paint_state()
-                frame = render_stage(
-                    paint,
-                    ui=ui,
-                    main_frame=main,
-                    cam_frames=getattr(bundle, "frames", None),
-                    dets=getattr(pout, "dets", None),
-                )
-                cv2.imshow(win, frame)
+                cv2.imshow(win, stage_frame)
                 # Full key code. waitKey() & 0xFF folds Qt Up (65362) into 82,
                 # which is also ASCII R, so Up toggled review capture.
                 raw_key = cv2.waitKeyEx(1)
@@ -1907,6 +2022,8 @@ def main(clock=None) -> None:
             write_engage_flag(False, disengage_reason="shutdown")
         except Exception:
             pass
+        if capture_pump is not None:
+            capture_pump.stop()
         backend.close()
         try:
             fox.close()

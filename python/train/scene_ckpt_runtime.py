@@ -13,10 +13,14 @@ from typing import Any
 import numpy as np
 
 from python.debug.lane_targets import (
-    LIVE_LANE_Y_M,
-    LOOKAHEADS_M,
     confidence_from_vector,
     lane_x_from_vector,
+)
+from python.viz.scene_ribbon import (
+    SCENE_RIBBON_MIN_CONF,
+    scene_ckpt_caption,
+    scene_ckpt_centers,
+    scene_ckpt_ribbon_polyline,
 )
 
 # Distinct from the existing ice-blue corridor (python.viz.stage.ICE).
@@ -64,11 +68,14 @@ class SceneCkptPred:
         return cls()
 
     def as_state(self) -> dict[str, Any]:
+        centers = scene_ckpt_centers(self.lane_gt)
         return {
             "shadow": True,
             "source": "scene_ckpt",
             "lane_x": None if self.lane_x is None else float(self.lane_x),
             "confidence": float(self.confidence),
+            "centers": centers,
+            "caption": scene_ckpt_caption(self.confidence),
             "canvas": list(self.canvas_shape) if self.canvas_shape else None,
         }
 
@@ -89,38 +96,54 @@ def draw_scene_ckpt_overlay(frame: np.ndarray | None, pred: SceneCkptPred | None
     color = overlay_bgr("shadow")
     h, w = int(out.shape[0]), int(out.shape[1])
     caption = "SHADOW"
-    if pred is not None and pred.lane_x is not None:
-        caption = f"SHADOW lane_x={float(pred.lane_x):+.2f}m conf={float(pred.confidence):.2f}"
+    if pred is not None:
+        cap = scene_ckpt_caption(pred.confidence)
+        if pred.lane_x is not None and cap == "SHADOW":
+            caption = f"SHADOW lane_x={float(pred.lane_x):+.2f}m conf={float(pred.confidence):.2f}"
+        else:
+            caption = f"{cap} conf={float(pred.confidence):.2f}"
     cv2.putText(out, caption, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
     # Solid swatch so tests (and a clip) can see the mark without anti-alias blending.
     cv2.rectangle(out, (12, 36), (40, 56), color, -1)
     if pred is None or pred.lane_gt is None:
         return out
-    vec = np.asarray(pred.lane_gt, dtype=np.float64).reshape(-1)
+    if float(pred.confidence) < SCENE_RIBBON_MIN_CONF:
+        return out
+    centers = scene_ckpt_centers(pred.lane_gt)
+    poly = scene_ckpt_ribbon_polyline(centers, pred.confidence)
+    ribbon = (234, 126, 61)  # #3d7eea on the windshield overlay
     pts: list[tuple[int, int]] = []
-    for i, y_m in enumerate(LOOKAHEADS_M):
-        if vec.size < i * 3 + 1:
-            break
-        pts.append(_project_ego(float(vec[i * 3]), float(y_m), w, h))
-    extra = lane_x_from_vector(vec, LIVE_LANE_Y_M)
-    if extra is not None:
-        pts.append(_project_ego(float(extra), float(LIVE_LANE_Y_M), w, h))
-        pts = sorted(set(pts), key=lambda p: p[1], reverse=True)
-    drawn = [(x, y) for x, y in pts if 0 <= x < w and 0 <= y < h]
-    if len(drawn) >= 2:
-        cv2.polylines(out, [np.array(drawn, dtype=np.int32)], False, color, 2, cv2.LINE_AA)
-    for x, y in drawn:
-        cv2.circle(out, (x, y), 4, color, -1, cv2.LINE_AA)
+    for p in poly:
+        uv = project_main_ground(float(p["x"]), float(p["y"]), w, h)
+        if uv is not None:
+            pts.append(uv)
+    if len(pts) >= 2:
+        cv2.polylines(out, [np.array(pts, dtype=np.int32)], False, ribbon, 3, cv2.LINE_AA)
     return out
 
 
+def project_main_ground(x_m: float, y_m: float, width: int, height: int) -> tuple[int, int] | None:
+    """Ego ground (x right, y forward) onto the main camera using cameras.yaml.
+
+    Uses the recorded mount (pos, yaw, pitch) and vertical fov, scaled to the
+    actual frame size. OpenCV ``v`` grows downward, so a farther point has a
+    smaller ``v`` than a near point (it sits higher in the image).
+    """
+    from python.perception.lanes import camera_pose, pose_pixel_of_ground
+
+    pose = camera_pose("main")
+    if pose is None:
+        return None
+    uv = pose_pixel_of_ground(pose, float(x_m), float(y_m), width=int(width), height=int(height))
+    if uv is None:
+        return None
+    return int(round(uv[0])), int(round(uv[1]))
+
+
 def _project_ego(x_m: float, y_m: float, width: int, height: int) -> tuple[int, int]:
-    """Rough ground-plane sketch: x right, y forward, onto the camera frame."""
-    y = max(float(y_m), 0.5)
-    fx = 0.90 * float(width)
-    u = int(round(width * 0.5 + (float(x_m) / y) * fx))
-    v = int(round(height * 0.72 - (1.15 / y) * fx))
-    return u, v
+    """Back-compat wrapper: the windshield model, or (0, 0) if the point is behind the lens."""
+    uv = project_main_ground(x_m, y_m, width, height)
+    return (0, 0) if uv is None else uv
 
 
 def _infer_flag(meta: Any, weights: Any, key: str, prefixes: tuple[str, ...], arch_token: str) -> bool:

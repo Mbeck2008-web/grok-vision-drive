@@ -328,6 +328,10 @@ def check_gate_is_wired() -> None:
     src = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
     tree = ast.parse(src)
     main_fn = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+    parser_fn = next(
+        (node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "build_parser"),
+        main_fn,
+    )
     calls = [node for node in ast.walk(main_fn) if isinstance(node, ast.Call)]
     calls.sort(key=lambda node: (node.lineno, node.col_offset))
     gate_at: list[int] = []
@@ -346,7 +350,8 @@ def check_gate_is_wired() -> None:
     assert min(gate_at) < min(apply_at), (gate_at, apply_at)
     assert min(gate_at) < min(stop_at), (gate_at, stop_at)
     found_default = False
-    for call in calls:
+    parser_calls = [node for node in ast.walk(parser_fn) if isinstance(node, ast.Call)]
+    for call in calls + parser_calls:
         base, name = _call_name(call)
         if name != "add_argument":
             continue

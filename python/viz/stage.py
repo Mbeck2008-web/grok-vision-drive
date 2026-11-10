@@ -1728,6 +1728,17 @@ def _draw_scene_ckpt_ribbon(img: np.ndarray, state: dict[str, Any], cam: Cam) ->
     paint_tapered_ribbon(img, poly, _project, RIBBON_BGR)
 
 
+
+def _draw_conf_gate_tag(img: np.ndarray, state: dict[str, Any], *, x: int, y: int = 16) -> None:
+    """Top-bar HUD tag when --no-conf-gate is active. Does not touch the ribbon."""
+    from python.runtime.conf_gate import hud_tag
+
+    tag = hud_tag(bool(state.get("no_conf_gate")))
+    if not tag:
+        return
+    cv2.putText(img, tag, (int(x), int(y)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (80, 180, 220), 1, cv2.LINE_AA)
+
+
 def render_stage(
     state: dict[str, Any],
     ui: VizUI | None = None,
@@ -1789,6 +1800,7 @@ def render_stage(
         cv2.putText(img, "VISION", (52, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1, cv2.LINE_AA)
         word, word_col = cabin_drive_word(state)
         cv2.putText(img, word, (118, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, word_col, 1, cv2.LINE_AA)
+        _draw_conf_gate_tag(img, state, x=260)
         cam_lbl = "CAMS dropped" if drop_heavy else "CAMS 3x3"
         cv2.putText(img, cam_lbl, (STAGE_W - 150, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
         note = scene_note(state)
@@ -1935,6 +1947,7 @@ def render_stage(
     cv2.putText(img, "VISION", (52, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1, cv2.LINE_AA)
     word, word_col = cabin_drive_word(state)
     cv2.putText(img, word, (118, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, word_col, 1, cv2.LINE_AA)
+    _draw_conf_gate_tag(img, state, x=max(260, int(stage_w) - 280))
     cam_lbl = "BEV debug" if ui.top_down else "chase 3/4"
     cv2.putText(img, cam_lbl, (stage_w - 120, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
     note = scene_note(state)

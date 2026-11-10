@@ -16,6 +16,7 @@ from typing import Any
 
 from python.control.actuate import DriveCommand, plan_command, release_command, stop_command
 from python.control.e2e import E2EIntent, E2EPolicy
+from python.runtime.conf_gate import conf_veto_blocks
 
 # Names a slow loop for logs and tests. shadow_tick does not use them to drop
 # Engage or to replace the plan. CAMS blit drop remains 8 Hz. Narrow-far hitch
@@ -33,6 +34,7 @@ class ShadowConfig:
     min_accept_hz: float = MIN_ACCEPT_HZ
     engage_hz_grace_s: float = ENGAGE_HZ_GRACE_S
     engage_hz_grace_floor: float = ENGAGE_HZ_GRACE_FLOOR
+    no_conf_gate: bool = False
 
 
 @dataclass
@@ -132,9 +134,9 @@ def evaluate_veto(
         return "aeb_brake"
     if aeb == "warn":
         return "aeb_warn"
-    if lane_conf < cfg.lane_conf_min:
+    if conf_veto_blocks(no_conf_gate=bool(cfg.no_conf_gate), triggered=lane_conf < cfg.lane_conf_min):
         return "low_lane_conf"
-    if path_conf < cfg.path_conf_min:
+    if conf_veto_blocks(no_conf_gate=bool(cfg.no_conf_gate), triggered=path_conf < cfg.path_conf_min):
         return "low_path_conf"
     if path_debug_preview and not allow_preview_drive and policy in ("e2e", "shadow"):
         # E2E may still propose; modular preview block applies when applying modular path.
@@ -285,10 +287,16 @@ def shadow_tick(
         modular_veto = "none"
         if path_debug_preview and not allow_preview_drive:
             applied = stop_command(seq=seq, reason="preview_blocked")
-        elif float(lane_conf) < float(cfg.lane_conf_min):
+        elif conf_veto_blocks(
+            no_conf_gate=bool(cfg.no_conf_gate),
+            triggered=float(lane_conf) < float(cfg.lane_conf_min),
+        ):
             modular_veto = "low_lane_conf"
             applied = stop_command(seq=seq, reason="veto:low_lane_conf")
-        elif float(path_conf) < float(cfg.path_conf_min):
+        elif conf_veto_blocks(
+            no_conf_gate=bool(cfg.no_conf_gate),
+            triggered=float(path_conf) < float(cfg.path_conf_min),
+        ):
             modular_veto = "low_path_conf"
             applied = stop_command(seq=seq, reason="veto:low_path_conf")
         else:

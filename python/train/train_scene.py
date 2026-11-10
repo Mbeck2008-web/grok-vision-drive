@@ -464,6 +464,33 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--drop-wrong-way",
+        action="store_true",
+        help=(
+            "Leave out frames where the recorded car is going against a one-way / divided "
+            "carriageway or in the opposing lane of a two-way road (see docs/SPEC_frame_quality_filter.md). "
+            "Uses state.jsonl poses plus a road dump (honors flipDirection). Off by default. "
+            "Deploy stays camera-only. Filtered-run metrics are not comparable to an unfiltered run."
+        ),
+    )
+    parser.add_argument(
+        "--road-dump",
+        default="",
+        help=(
+            "Road-network dump for --drop-wrong-way (the collect road_dump json/json.gz). "
+            "Default: <data>/roads/<map>.json.gz from the recording's map field."
+        ),
+    )
+    parser.add_argument(
+        "--max-road-clip",
+        type=float,
+        default=-1.0,
+        help=(
+            "Drop frames whose lower-half any-channel clip (RGB>=250) exceeds this fraction "
+            "(0.20 is the suggested cut). Default -1 disables the check."
+        ),
+    )
+    parser.add_argument(
         "--backbone-lr-mult",
         type=float,
         default=1.0,
@@ -2279,6 +2306,9 @@ def train_directory(
     backbone_lr_mult: float = 1.0,
     mask_events: bool = False,
     mask_files: str = "",
+    drop_wrong_way: bool = False,
+    road_dump: str = "",
+    max_road_clip: float = -1.0,
     ckpt_dir: Path | None = None,
     ckpt_min_free_gb: float | None = None,
     cam_age: bool = False,
@@ -2440,6 +2470,22 @@ def train_directory(
         rows, mask_sources = apply_mask_files_multi(strip_roots, rows, mask_files)
     elif mask_sources:
         rows = drop_masked(rows, set().union(*(source["ids"] for source in mask_sources)))
+    if drop_wrong_way or float(max_road_clip) >= 0.0:
+        from python.train.frame_quality import FrameQualityError, apply_frame_quality, describe_quality
+        from python.train.scene_loader import recompute_dt
+
+        before_q = len(rows)
+        try:
+            rows, quality_stats = apply_frame_quality(
+                rows,
+                drop_wrong_way=bool(drop_wrong_way),
+                max_road_clip=float(max_road_clip),
+                road_dump=road_dump or None,
+            )
+        except FrameQualityError as exc:
+            raise SystemExit(str(exc)) from exc
+        rows = recompute_dt(rows)
+        print(f"[GVD] frame-quality: {describe_quality(quality_stats, before_q)}", flush=True)
     # E0: the label frame of the rows this run trains on, stamped on every export.
     gt_frame = gt_frame_props(rows)
     selection_text, _selection_meta = selection_line(state_rows, selection_before, rows, mask_sources)
@@ -4001,6 +4047,9 @@ def main(argv: list[str] | None = None) -> None:
                 backbone_lr_mult=float(args.backbone_lr_mult),
                 mask_events=bool(args.mask_events),
                 mask_files=str(args.mask_files or ""),
+                drop_wrong_way=bool(args.drop_wrong_way),
+                road_dump=str(args.road_dump or ""),
+                max_road_clip=float(args.max_road_clip),
                 ckpt_dir=Path(args.ckpt_dir) if args.ckpt_dir else None,
                 ckpt_min_free_gb=args.ckpt_min_free_gb,
                 cam_age=bool(args.cam_age),

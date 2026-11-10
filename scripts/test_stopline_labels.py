@@ -140,23 +140,29 @@ def _corner_90(radius: float = 8.0, straight_end: float = 15.0, n_arc: int = 20)
     return [side(-HALF, radius - HALF), side(HALF, radius + HALF)]
 
 
-def _main_painted_lanes_cls():
-    """PaintedLanes from origin/main (72b5854), for a bit-for-bit lane_at check."""
-    import importlib.util
-    import subprocess
-
-    sha = "72b58543941b4e3b68406fc9e12fcb0936594f2f"
-    src = subprocess.check_output(
-        ["git", "show", f"{sha}:python/debug/painted_lanes.py"],
-        cwd=str(ROOT),
-    )
-    path = Path(tempfile.mkdtemp()) / "painted_lanes_main.py"
-    path.write_bytes(src)
-    spec = importlib.util.spec_from_file_location("gvd_main_painted_lanes", path)
-    assert spec is not None and spec.loader is not None
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod.PaintedLanes
+# lane_at hex recorded from origin/main 72b5854 and rechecked on 73790a1
+# (painted_lanes.lane_at is unchanged on those tips). CI checkouts are
+# shallow and cannot git-show those SHAs.
+_MAIN_LANE_AT_HEX = {
+    "r=20 m arc to 1.5 rad": [
+        ("-0x1.39734df99203ap+1", "0x1.2aa419a31d997p+0"),
+        ("-0x1.2ef7e3f648440p+2", "-0x1.5f5df0b06b6fap-1"),
+        None,
+        None,
+    ],
+    "r=12 m through ~100 deg": [
+        ("-0x1.86b040be6519dp+1", "0x1.9d9f3972fedf0p-1"),
+        None,
+        None,
+        None,
+    ],
+    "90 deg 8 m corner": [
+        ("-0x1.c000000000000p+0", "0x1.c000000000000p+0"),
+        ("-0x1.c000000000000p+0", "0x1.c000000000000p+0"),
+        None,
+        None,
+    ],
+}
 
 
 def _lane_at_hex(lanes) -> list:
@@ -169,12 +175,6 @@ def _lane_at_hex(lanes) -> list:
     return out
 
 
-def _assert_lane_at_matches_main(decals: list[dict]) -> None:
-    ours = PaintedLanes(decals).lane_at(*CAR)
-    theirs = _main_painted_lanes_cls()(decals).lane_at(*CAR)
-    assert _lane_at_hex(ours) == _lane_at_hex(theirs), (ours, theirs)
-
-
 def check_tight_curves_and_corner_are_not_stop_lines() -> None:
     cases = [
         ("r=20 m arc to 1.5 rad", _left_curve(20.0, 1.5)),
@@ -184,7 +184,8 @@ def check_tight_curves_and_corner_are_not_stop_lines() -> None:
     for name, decals in cases:
         bars = PaintedLanes(decals).stop_lines_ahead(*CAR)
         assert bars == [], (name, bars)
-        _assert_lane_at_matches_main(decals)
+        got = _lane_at_hex(PaintedLanes(decals).lane_at(*CAR))
+        assert got == _MAIN_LANE_AT_HEX[name], (name, got, _MAIN_LANE_AT_HEX[name])
         print(f"  {name}: no stop_line, lane_at matches main bit-for-bit")
 
 

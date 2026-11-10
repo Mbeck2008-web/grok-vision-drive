@@ -1104,7 +1104,14 @@ def main(clock=None) -> None:
                 strip = compose_strip(frames if isinstance(frames, dict) else None)
                 compose_ms = (time.perf_counter() - t_compose) * 1000.0
                 was_hold = scene_guard.hold is not None
-                lane_hat, conf = scene_guard.observe(scene_lane, strip, tick_dt, engaged=engaged, ages=tick_ages)
+                route_vec = None
+                if getattr(scene_lane, "wants_route", False):
+                    from python.train.route_cond import runtime_route_vec
+
+                    route_vec = runtime_route_vec(st.get("nav") if isinstance(st.get("nav"), dict) else {}, None)
+                lane_hat, conf = scene_guard.observe(
+                    scene_lane, strip, tick_dt, engaged=engaged, ages=tick_ages, route=route_vec
+                )
                 scene_hold = scene_guard.hold is not None
                 if scene_hold and not was_hold and engaged:
                     print(f"[GVD] HOLD: scene_input_shape {scene_guard.hold}", flush=True)
@@ -1133,7 +1140,12 @@ def main(clock=None) -> None:
                 )
 
                 try:
-                    ckpt_pred = scene_ckpt.observe(main, tick_dt)
+                    route_vec = None
+                    if getattr(scene_ckpt, "wants_route", False):
+                        from python.train.route_cond import runtime_route_vec
+
+                        route_vec = runtime_route_vec(st.get("nav") if isinstance(st.get("nav"), dict) else {}, None)
+                    ckpt_pred = scene_ckpt.observe(main, tick_dt, route=route_vec)
                 except SceneCkptInputError as exc:
                     print(f"[GVD] scene-ckpt input: {exc}", flush=True)
                     ckpt_pred = None

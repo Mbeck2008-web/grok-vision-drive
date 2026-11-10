@@ -295,6 +295,9 @@ def _lamp_name(sign: Mapping[str, Any]) -> str:
 
 def is_rare_row(row: Mapping[str, Any]) -> bool:
     """Unprotected turn, stop sign, or red light. Other rows are ordinary."""
+    cmd = str(row.get("route_cmd") or "").strip().lower()
+    if cmd in ("left", "right", "straight"):
+        return True
     tech = row.get("tech")
     if not isinstance(tech, dict):
         tech = {}

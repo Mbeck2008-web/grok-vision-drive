@@ -1122,11 +1122,11 @@ def note_content_time(
     content_ts: dict[str, float],
     frame_sig: dict[str, tuple[Any, ...]],
 ) -> float:
-    """Wall time these pixels were first seen.
+    """Monotonic time these pixels were first seen.
 
     Call before ``frame_sig`` is updated. An unchanged shared-memory buffer
     keeps its previous stamp so the supervisor can age it. A new signature
-    stamps ``now``.
+    stamps ``now``. Callers pass ``time.monotonic()``.
     """
     prev = frame_sig.get(cid)
     if prev != signature or cid not in content_ts:
@@ -1157,6 +1157,9 @@ class StubBackend:
 
     def grab(self) -> CameraFrameBundle:
         health = {cid: CamHealth.MISSING for cid in CAM_IDS}
+        # This look happened now. A bundle that was never grabbed stays at
+        # captured_at 0, and the gate treats that as stale.
+        seen = time.monotonic()
         return CameraFrameBundle(
             frames={},
             timestamps={},
@@ -1164,6 +1167,7 @@ class StubBackend:
             backend=self.name,
             note="stub: no cameras",
             unique_gpu_n=0,
+            captured_at=seen,
         )
 
 
@@ -1431,7 +1435,7 @@ class WindowBackend:
         if img.dtype != np.uint8:
             img = img.astype(np.uint8)
         img = resize_long_side(img, self.long_side)
-        ts = time.time()
+        ts = time.monotonic()
         frames["main"] = img
         frames["cam_main"] = img
         timestamps["main"] = ts
@@ -1998,7 +2002,7 @@ class BeamNGPyBackend:
         sig = frame_signature(bgr)
         if sig == self._frame_sig.get(cid):
             return
-        note_content_time(cid, sig, time.time(), self._content_clock(), self._frame_sig)
+        note_content_time(cid, sig, time.monotonic(), self._content_clock(), self._frame_sig)
         self._frame_sig[cid] = sig
         if cid not in self._late_unique:
             self._late_unique.append(cid)
@@ -2102,9 +2106,9 @@ class BeamNGPyBackend:
             return
         self._last_status = "ok"
         sig = frame_signature(bgr)
-        note_content_time(cid, sig, time.time(), self._content_clock(), self._frame_sig)
+        seen = note_content_time(cid, sig, float(ts), self._content_clock(), self._frame_sig)
         unique = sig != self._frame_sig.get(cid)
-        self._store_frame(cid, bgr, ts, frames, timestamps, health)
+        self._store_frame(cid, bgr, seen, frames, timestamps, health)
         self._cache_frames[cid] = bgr
         if unique:
             self._frame_sig[cid] = sig
@@ -2251,7 +2255,10 @@ class BeamNGPyBackend:
             )
         frames: dict[str, np.ndarray] = {}
         timestamps: dict[str, float] = {}
-        ts = time.time()
+        # One monotonic sample for every new buffer in this grab. A repeated
+        # buffer keeps the stamp note_content_time already stored, and that
+        # stamp is what timestamps[cid] and captured_at publish.
+        content_now = time.monotonic()
         grab_i = self._grab_i
         self._grab_i = grab_i + 1
         phase = grab_phase_of(grab_i, self._hitch)
@@ -2305,7 +2312,7 @@ class BeamNGPyBackend:
                     self._last_status = "busy" if bgr is _IO_BUSY else "timeout"
                     self._omit_unread(cid, frames, timestamps, health)
                 else:
-                    self._publish_read(cid, bgr, ts, frames, timestamps, health, unique_ids)
+                    self._publish_read(cid, bgr, content_now, frames, timestamps, health, unique_ids)
             except Exception:
                 self._last_status = "error"
                 health[cid] = CamHealth.ERROR

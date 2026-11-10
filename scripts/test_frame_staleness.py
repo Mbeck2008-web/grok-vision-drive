@@ -8,6 +8,9 @@ rest, so steady-state frame_age p90 stays under 250 ms.
 """
 from __future__ import annotations
 
+import ast
+import math
+import subprocess
 import sys
 import threading
 import time
@@ -21,11 +24,18 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from python.control.actuate import DriveCommand, release_command, stop_command  # noqa: E402
-from python.runtime.frame_gate import STALE_CAPTION, gate_drive_command  # noqa: E402
+from python.runtime.frame_gate import (  # noqa: E402
+    DEFAULT_MAX_FRAME_AGE_MS,
+    STALE_CAPTION,
+    frame_is_stale,
+    gate_drive_command,
+    require_max_frame_age_ms,
+)
 from python.sensors.cameras import (  # noqa: E402
     CAM_IDS,
     BeamNGPyBackend,
     CamHealth,
+    CameraFrameBundle,
     load_camera_config,
     note_content_time,
 )
@@ -85,7 +95,7 @@ def _fifo_ages() -> tuple[list[float], int]:
             bundle = queued.popleft() if queued else None
         if bundle is None:
             return None
-        return time.time() - float(bundle.captured_at)
+        return bundle_frame_age_s(bundle)
 
     try:
         ages = _consume_ages(consume, seconds=1.8, hz=TARGET_HZ, warmup_s=0.4)
@@ -167,6 +177,16 @@ def check_gate() -> None:
     held.steer = 0.2
     out, replaced = gate_drive_command(held, engaged=True, stale=True, holding=True)
     assert replaced is True and out.reason == "frame_stale" and out.steer == 0.0
+
+    waiting = CameraFrameBundle(note="capture: waiting")
+    age = bundle_frame_age_s(waiting, now=100.0)
+    assert math.isinf(age), age
+    drive = DriveCommand(steer=0.2, throttle=0.4, brake=0.0, seq=9, reason="ok")
+    stopped, replaced = gate_drive_command(
+        drive, engaged=True, stale=frame_is_stale(age, DEFAULT_MAX_FRAME_AGE_MS),
+    )
+    assert replaced is True and stopped.reason == "frame_stale"
+    assert stopped.steer == 0.0 and stopped.throttle == 0.0 and stopped.brake == 1.0
     print("gate: stale drive -> frame_stale; heartbeat/AEB veto/disengage unchanged")
 
 
@@ -195,8 +215,11 @@ def check_content_stamp() -> None:
     assert first == 10.0 and second == 10.0 and third == 18.5, (first, second, third)
     age = bundle_frame_age_s(types.SimpleNamespace(captured_at=10.0), now=10.2)
     assert abs(age - 0.2) < 1e-9, age
-    assert bundle_frame_age_s(types.SimpleNamespace(captured_at=0.0), now=50.0) == 0.0
-    print("content stamp: repeated buffer keeps its first wall time")
+    missing = bundle_frame_age_s(types.SimpleNamespace(captured_at=0.0), now=50.0)
+    assert math.isinf(missing), missing
+    assert math.isinf(bundle_frame_age_s(types.SimpleNamespace(), now=50.0))
+    assert frame_is_stale(missing, DEFAULT_MAX_FRAME_AGE_MS)
+    print("content stamp: repeated buffer keeps its first monotonic time")
 
 
 def check_needed_main_only() -> None:
@@ -265,7 +288,8 @@ def check_needed_main_only() -> None:
         time.sleep(0.05)
         second = be.grab()
         assert abs(second.captured_at - first.captured_at) < 1e-6, (first.captured_at, second.captured_at)
-        assert time.time() - second.captured_at >= 0.04
+        assert abs(float(second.timestamps["main"]) - second.captured_at) < 1e-9
+        assert time.monotonic() - second.captured_at >= 0.04
         pixels[0, 0, 0] = 90
         third = be.grab()
         assert third.captured_at > second.captured_at
@@ -282,6 +306,104 @@ def check_needed_main_only() -> None:
             else:
                 sys.modules[key] = value
     print("beamng grab: main-only attach; repeated shmem keeps captured_at")
+
+
+def _call_name(node: ast.AST) -> tuple[str, str]:
+    if not isinstance(node, ast.Call):
+        return "", ""
+    func = node.func
+    if isinstance(func, ast.Name):
+        return "", func.id
+    if isinstance(func, ast.Attribute):
+        base = func.value.id if isinstance(func.value, ast.Name) else ""
+        return base, func.attr
+    return "", ""
+
+
+def check_gate_is_wired() -> None:
+    """main() must gate before it applies or stops, and the cap default stays 300."""
+    import python.run_vision as run_vision
+
+    assert DEFAULT_MAX_FRAME_AGE_MS == 300.0
+    src = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    main_fn = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+    calls = [node for node in ast.walk(main_fn) if isinstance(node, ast.Call)]
+    calls.sort(key=lambda node: (node.lineno, node.col_offset))
+    gate_at: list[int] = []
+    apply_at: list[int] = []
+    stop_at: list[int] = []
+    for call in calls:
+        base, name = _call_name(call)
+        if name == "gate_drive_command":
+            gate_at.append(call.lineno)
+        elif base == "actuator" and name == "apply":
+            apply_at.append(call.lineno)
+        elif base == "actuator" and name == "stop":
+            stop_at.append(call.lineno)
+    assert gate_at, "main stopped calling gate_drive_command"
+    assert apply_at and stop_at
+    assert min(gate_at) < min(apply_at), (gate_at, apply_at)
+    assert min(gate_at) < min(stop_at), (gate_at, stop_at)
+    found_default = False
+    for call in calls:
+        base, name = _call_name(call)
+        if name != "add_argument":
+            continue
+        if not call.args or not isinstance(call.args[0], ast.Constant):
+            continue
+        if call.args[0].value != "--max-frame-age-ms":
+            continue
+        for keyword in call.keywords:
+            if keyword.arg == "default":
+                assert isinstance(keyword.value, ast.Name)
+                assert keyword.value.id == "DEFAULT_MAX_FRAME_AGE_MS"
+                found_default = True
+    assert found_default
+    assert any(_call_name(call)[1] == "require_max_frame_age_ms" for call in calls)
+    assert run_vision.DEFAULT_MAX_FRAME_AGE_MS == 300.0
+    print("run_vision: gate_drive_command precedes actuator.apply/stop; cap default is 300")
+
+
+def check_bad_max_age() -> None:
+    assert require_max_frame_age_ms(300) == 300.0
+    for bad in (0, -1, float("nan"), float("inf"), float("-inf")):
+        try:
+            require_max_frame_age_ms(bad)
+        except SystemExit as exc:
+            assert exc.code == 2, (bad, exc.code)
+        else:
+            raise AssertionError(bad)
+    for bad in ("nan", "inf", "-inf", "0", "-5"):
+        proc = subprocess.run(
+            [sys.executable, "-m", "python.run_vision", "--backend", "stub", "--max-frame-age-ms", bad],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert proc.returncode != 0, (bad, proc.returncode, proc.stdout[-400:], proc.stderr[-400:])
+    print("max-frame-age-ms: non-finite and non-positive values are refused")
+
+
+def check_mocked_clock() -> None:
+    import python.sensors.frame_slot as slot
+
+    def frozen() -> float:
+        return 20.0
+
+    real = slot.time.monotonic
+    slot.time.monotonic = frozen
+    try:
+        fresh = slot.bundle_frame_age_s(types.SimpleNamespace(captured_at=19.5))
+        assert abs(fresh - 0.5) < 1e-9, fresh
+        ahead = slot.bundle_frame_age_s(types.SimpleNamespace(captured_at=25.0))
+        assert ahead < 0.0, ahead
+        assert frame_is_stale(ahead, DEFAULT_MAX_FRAME_AGE_MS)
+        assert frame_is_stale(slot.bundle_frame_age_s(types.SimpleNamespace(captured_at=0.0)), 300)
+    finally:
+        slot.time.monotonic = real
+    print("monotonic clock: negative age is stale; a mocked clock supplies now")
 
 
 def check_latency_line(p50: float, p90: float, dropped: int) -> None:
@@ -316,6 +438,9 @@ def check_latency_line(p50: float, p90: float, dropped: int) -> None:
 def main() -> None:
     check_content_stamp()
     check_gate()
+    check_mocked_clock()
+    check_bad_max_age()
+    check_gate_is_wired()
     check_caption()
     check_needed_main_only()
     p50, p90, _fifo_p90, dropped = check_queue_versus_latest()

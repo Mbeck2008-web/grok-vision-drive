@@ -98,7 +98,12 @@ from python.sensors.frame_slot import (
     format_latency_line,
     process_rss_mb,
 )
-from python.runtime.frame_gate import gate_drive_command
+from python.runtime.frame_gate import (
+    DEFAULT_MAX_FRAME_AGE_MS,
+    frame_is_stale,
+    gate_drive_command,
+    require_max_frame_age_ms,
+)
 from python.sensors.live_hold import (
     RespawnWatch,
     StaleEgo,
@@ -422,11 +427,12 @@ def main(clock=None) -> None:
     ap.add_argument(
         "--max-frame-age-ms",
         type=float,
-        default=300.0,
+        default=DEFAULT_MAX_FRAME_AGE_MS,
         help="Do not drive on a camera frame older than this (default 300). "
         "The tick is captioned LOW/STALE and logged. Heartbeat, AEB, and engage are unchanged.",
     )
     args = ap.parse_args()
+    args.max_frame_age_ms = require_max_frame_age_ms(args.max_frame_age_ms)
     scene_ckpt_path = str(getattr(args, "scene_ckpt", "") or "").strip()
     if bool(getattr(args, "scene_ckpt_drive", False)) and not scene_ckpt_path:
         print("[GVD] --scene-ckpt-drive requires --scene-ckpt <epoch.npz>", flush=True)
@@ -869,9 +875,10 @@ def main(clock=None) -> None:
             grab_ms = float(getattr(bundle, "grab_ms", 0.0) or 0.0)
             if grab_ms <= 0:
                 grab_ms = (time.perf_counter() - t_grab) * 1000.0
+            # Take-time age feeds the speed cap. The drive decision is recomputed
+            # immediately before gate_drive_command, after AEB has already run
+            # on this same bundle.
             frame_age_s_cap = bundle_frame_age_s(bundle)
-            frame_age_ms = frame_age_s_cap * 1000.0
-            frame_stale = frame_age_ms > float(args.max_frame_age_ms)
             grab_phase = int(getattr(bundle, "grab_phase", -1))
             grab_poll_free = bool(getattr(bundle, "grab_poll_free", True))
             main = bundle.main_bgr()
@@ -1328,7 +1335,15 @@ def main(clock=None) -> None:
                     except (TypeError, ValueError):
                         frame_ts = None
                     break
-            frame_cmd_ms = (time.time() - frame_ts) * 1000.0 if frame_ts is not None else -1.0
+            if (
+                frame_ts is None
+                or frame_ts != frame_ts
+                or frame_ts <= 0.0
+                or frame_ts == float("inf")
+            ):
+                frame_cmd_ms = -1.0
+            else:
+                frame_cmd_ms = (time.monotonic() - frame_ts) * 1000.0
             # A missing sample, a point closer than 4 m, or a heading past a
             # lane, is not a command to center the wheel. Hold the last steer
             # (creeping toward 0) and say why. preview_blocked still brakes;
@@ -1457,6 +1472,12 @@ def main(clock=None) -> None:
             # Actuators only when engaged + command ok (path / tracks / shadow already on this tick).
             # cmd_json: Lua applies whatever we write only while `engaged` rides along in the payload.
             # beamngpy: note_engaged(False) makes stop() release once, then not call vehicle.control.
+            # Decision-time age, not the sample taken at grab. A missing stamp is inf.
+            frame_age_s_cap = bundle_frame_age_s(bundle)
+            frame_age_ms = frame_age_s_cap * 1000.0
+            frame_stale = frame_is_stale(frame_age_s_cap, float(args.max_frame_age_ms))
+            if scene_ckpt is not None:
+                pout.frame_age_s = frame_age_s_cap
             cmd, frame_gated = gate_drive_command(
                 cmd, engaged=bool(engaged), stale=bool(frame_stale), holding=bool(holding),
             )
@@ -1761,10 +1782,24 @@ def main(clock=None) -> None:
                 brake=float(brake_in or 0.0),
                 override_reason=ovr.reason,
             )
+            strip_t = time.time()
+            _strip_stamps = getattr(bundle, "timestamps", None) or {}
+            _main_stamp = _strip_stamps.get("main", _strip_stamps.get("cam_main"))
+            try:
+                _main_stamp_f = float(_main_stamp)
+            except (TypeError, ValueError):
+                _main_stamp_f = None
+            if (
+                _main_stamp_f is not None
+                and _main_stamp_f == _main_stamp_f
+                and _main_stamp_f > 0.0
+                and _main_stamp_f != float("inf")
+            ):
+                strip_t = _main_stamp_f
             ui.feed_strip(
                 getattr(bundle, "frames", None),
                 timestamps=getattr(bundle, "timestamps", None),
-                t=time.time(),
+                t=strip_t,
                 engaged=bool(engaged),
                 ego={"speed_mps": ego_v},
                 wheel=fields["wheel"],

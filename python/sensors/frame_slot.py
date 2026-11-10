@@ -76,16 +76,30 @@ class AgeWindow:
 
 
 def bundle_frame_age_s(bundle: Any, now: float | None = None) -> float:
-    """Seconds since the main pixels were first seen. 0 when the stamp is unknown.
+    """Seconds from the content stamp to the decision clock.
 
-    ``captured_at`` of 0 means the backend has no content clock (the empty
-    stub). That is not a fresh ``time.time()`` and it is not treated as stale.
+    ``captured_at`` is ``time.monotonic()`` when the pixels were first seen.
+    A missing, non-finite, or non-positive stamp is infinitely old: a waiting
+    bundle and a grab with no main picture must not count as fresh. A stamp
+    ahead of ``now`` returns a negative age, which the gate treats as stale.
     """
-    captured = float(getattr(bundle, "captured_at", 0.0) or 0.0)
-    if captured <= 0.0:
-        return 0.0
-    clock = time.time() if now is None else float(now)
-    return max(0.0, clock - captured)
+    raw = getattr(bundle, "captured_at", None)
+    try:
+        captured = float(raw)
+    except (TypeError, ValueError):
+        return math.inf
+    if not math.isfinite(captured) or captured <= 0.0:
+        return math.inf
+    if now is None:
+        clock = time.monotonic()
+    else:
+        try:
+            clock = float(now)
+        except (TypeError, ValueError):
+            return math.inf
+    if not math.isfinite(clock):
+        return math.inf
+    return clock - captured
 
 
 def format_latency_line(
@@ -298,7 +312,7 @@ class LatencyStubBackend:
         from python.sensors.cameras import CamHealth, CameraFrameBundle
 
         started = time.perf_counter()
-        wall = time.time()
+        stamp = time.monotonic()
         if self.latency_s > 0.0:
             time.sleep(self.latency_s)
         self.grabs += 1
@@ -310,12 +324,12 @@ class LatencyStubBackend:
         health = {cid: CamHealth.OK for cid in self.cams}
         return CameraFrameBundle(
             frames=frames,
-            timestamps={cid: wall for cid in self.cams},
+            timestamps={cid: stamp for cid in self.cams},
             health=health,
             backend=self.name,
             note="latency-stub",
             grab_ms=(time.perf_counter() - started) * 1000.0,
-            captured_at=wall,
+            captured_at=stamp,
             unique_gpu_n=1,
             unique_gpu_ids=tuple(self.cams),
         )

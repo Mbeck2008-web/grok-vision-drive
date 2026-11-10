@@ -7,6 +7,7 @@ still steering). An existing safety stop keeps its reason.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from python.control.actuate import stop_command
@@ -15,8 +16,38 @@ DEFAULT_MAX_FRAME_AGE_MS = 300.0
 STALE_CAPTION = "LOW/STALE"
 
 
+def require_max_frame_age_ms(value: float) -> float:
+    """Accept a finite cap above 0. ``nan`` and ``inf`` would disable the gate."""
+    try:
+        age = float(value)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(2) from exc
+    if not math.isfinite(age) or age <= 0.0:
+        print(
+            f"[GVD] --max-frame-age-ms must be a finite number greater than 0, got {value}",
+            flush=True,
+        )
+        raise SystemExit(2)
+    return age
+
+
 def frame_is_stale(age_s: float, max_age_ms: float) -> bool:
-    return float(age_s) * 1000.0 > float(max_age_ms)
+    """True when the frame must not drive.
+
+    A missing stamp is ``inf``. A negative age means the stamp is ahead of the
+    decision clock. Both are stale. A non-finite cap is stale too, so a bad
+    limit cannot leave the gate open.
+    """
+    try:
+        age = float(age_s)
+        cap = float(max_age_ms)
+    except (TypeError, ValueError):
+        return True
+    if not math.isfinite(age) or age < 0.0:
+        return True
+    if not math.isfinite(cap) or cap <= 0.0:
+        return True
+    return age * 1000.0 > cap
 
 
 def gate_drive_command(

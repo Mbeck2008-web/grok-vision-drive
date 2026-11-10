@@ -69,7 +69,7 @@ def apply_scene_ckpt_to_command(cmd: Any, _pred: Any) -> Any:
         return cmd
 
 
-def apply_scene_ckpt_lane(pout: Any, pred: Any, *, drive: bool, min_conf: float = SCENE_RIBBON_MIN_CONF) -> str:
+def apply_scene_ckpt_lane(pout: Any, pred: Any, *, drive: bool, min_conf: float = SCENE_RIBBON_MIN_CONF, no_conf_gate: bool = False) -> str:
     """Optionally replace ``pout``'s lane with the checkpoint prediction.
 
     Returns ``shadow`` when drive is off (``pout`` unchanged), ``lane`` when
@@ -84,7 +84,7 @@ def apply_scene_ckpt_lane(pout: Any, pred: Any, *, drive: bool, min_conf: float 
         conf = 0.0 if pred is None else float(getattr(pred, "confidence", 0.0) or 0.0)
     except (TypeError, ValueError):
         conf = 0.0
-    if scene_lane_decision(lane_x, conf, min_conf=min_conf) != "lane":
+    if scene_lane_decision(lane_x, conf, min_conf=min_conf, no_conf_gate=no_conf_gate) != "lane":
         pout.path_ego = []
         pout.lane_conf = float(conf)
         try:

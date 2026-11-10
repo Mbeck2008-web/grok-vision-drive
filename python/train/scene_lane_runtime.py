@@ -69,17 +69,37 @@ def scene_lane_decision(
     confidence: float | None,
     *,
     min_conf: float = SCENE_LANE_MIN_CONF,
+    no_conf_gate: bool = False,
 ) -> str:
-    """``lane`` when the net is sure, otherwise ``stop``."""
-    if lane_x is None or confidence is None:
+    """``lane`` when the net is sure, otherwise ``stop``.
+
+    ``no_conf_gate`` bypasses only the confidence floor (None / unreadable /
+    non-finite / below ``min_conf``). A missing or non-finite ``lane_x``
+    still stops: that is geometry, not a confidence veto.
+    """
+    from python.runtime.conf_gate import conf_veto_blocks
+
+    if lane_x is None:
         return "stop"
     try:
-        conf = float(confidence)
         x = float(lane_x)
     except (TypeError, ValueError):
         return "stop"
     # NaN and ±inf are not usable: ±inf would full-lock through path_steer_from_ego.
-    if not math.isfinite(conf) or not math.isfinite(x) or conf < float(min_conf):
+    if not math.isfinite(x):
+        return "stop"
+    bad_conf = False
+    if confidence is None:
+        bad_conf = True
+    else:
+        try:
+            conf = float(confidence)
+        except (TypeError, ValueError):
+            bad_conf = True
+        else:
+            if not math.isfinite(conf) or conf < float(min_conf):
+                bad_conf = True
+    if conf_veto_blocks(no_conf_gate=no_conf_gate, triggered=bad_conf):
         return "stop"
     return "lane"
 

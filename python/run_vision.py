@@ -375,8 +375,8 @@ def detector_runtime(detector: Any) -> str:
     return name
 
 
-def main(clock=None) -> None:
-    """`clock` is test-only (scripts/gvd_clock_child.py). None keeps every stdlib clock call."""
+def build_parser() -> argparse.ArgumentParser:
+    """CLI for ``python.run_vision``. Default ``--no-conf-gate`` is off."""
     ap = argparse.ArgumentParser(description="GVD supervisor + M2/M3/M4/M5")
     ap.add_argument("--viz", action="store_true")
     ap.add_argument("--smoke", action="store_true")
@@ -533,6 +533,15 @@ def main(clock=None) -> None:
         help="Stop the supervisor loop after this many seconds (0 = run until stopped). For captures.",
     )
     ap.add_argument(
+        "--no-conf-gate",
+        action="store_true",
+        default=False,
+        help="Opt-in: do not let low perception/lane/path confidence block Engage "
+        "or force a hold/stop. The model keeps steering so you can watch what it "
+        "does (sim toy). AEB, heartbeat, frame-staleness, missing-frame stops, "
+        "user disengage, and Soft Esc stay on. Default off (today's vetoes).",
+    )
+    ap.add_argument(
         "--max-frame-age-ms",
         type=float,
         default=DEFAULT_MAX_FRAME_AGE_MS,
@@ -553,8 +562,17 @@ def main(clock=None) -> None:
         default=os.environ.get("GVD_ROUTE_LEVEL", ""),
         help="Level key when --route-graph has multiple levels (or GVD_ROUTE_LEVEL).",
     )
-    args = ap.parse_args()
+    return ap
+
+
+def main(clock=None) -> None:
+    """`clock` is test-only (scripts/gvd_clock_child.py). None keeps every stdlib clock call."""
+    args = build_parser().parse_args()
     args.max_frame_age_ms = require_max_frame_age_ms(args.max_frame_age_ms)
+    if bool(getattr(args, "no_conf_gate", False)):
+        from python.runtime.conf_gate import STARTUP_WARNING
+
+        print(STARTUP_WARNING, flush=True)
     route_graph = load_route_graph(getattr(args, "route_graph", None), getattr(args, "route_level", None))
     from python.train.model_size import plan_from_namespace
 
@@ -781,6 +799,7 @@ def main(clock=None) -> None:
             "[GVD] Tech did not yield a vehicle.control handle; falling back to cmd_json "
             "(mod Lua). Cameras may still be missing until a vehicle is spawned."
         )
+    _ctrl_yaml = _load_control_yaml()
     shadow_cfg = load_shadow_config(_ctrl_yaml)
     override_cfg = load_override_config(_ctrl_yaml)
     override = OverrideDetector(override_cfg)
@@ -1305,6 +1324,7 @@ def main(clock=None) -> None:
                 min_accept_hz=shadow_cfg.min_accept_hz,
                 engage_hz_grace_s=shadow_cfg.engage_hz_grace_s,
                 engage_hz_grace_floor=shadow_cfg.engage_hz_grace_floor,
+                no_conf_gate=bool(getattr(args, "no_conf_gate", False)),
             )
 
             scene_stop = False
@@ -1368,7 +1388,7 @@ def main(clock=None) -> None:
                     print(f"[GVD] HOLD: scene_input_shape {scene_guard.hold}", flush=True)
                 scene_lane_x = lane_hat
                 scene_conf = conf
-                if scene_lane_decision(lane_hat, conf) != "lane":
+                if scene_lane_decision(lane_hat, conf, no_conf_gate=bool(getattr(args, "no_conf_gate", False))) != "lane":
                     scene_stop = True
                     pout.path_ego = []
                     pout.lane_conf = float(conf)
@@ -1403,7 +1423,8 @@ def main(clock=None) -> None:
                     print(f"[GVD] scene-ckpt input: {exc}", flush=True)
                     ckpt_pred = None
                 if bool(getattr(args, "scene_ckpt_drive", False)):
-                    if apply_scene_ckpt_lane(pout, ckpt_pred, drive=True) == "stop":
+                    # same-tick observe then apply_scene_ckpt_lane(pout, ckpt_pred, drive=True)
+                    if apply_scene_ckpt_lane(pout, ckpt_pred, drive=True, no_conf_gate=bool(getattr(args, "no_conf_gate", False))) == "stop":
                         ckpt_stop = True
                     else:
                         cap_drive_speed(pout, float(args.scene_ckpt_drive_speed))
@@ -1887,6 +1908,7 @@ def main(clock=None) -> None:
             }
             st["e2e_ok"] = bool(tick.e2e_ok)
             st["veto_reason"] = str(tick.veto_reason or "none")
+            st["no_conf_gate"] = bool(getattr(args, "no_conf_gate", False))
             st["e2e_backend"] = e2e_policy.backend
             st["debug"] = ui.debug.as_dict()
             st["encode_backend"] = recorder.encoder

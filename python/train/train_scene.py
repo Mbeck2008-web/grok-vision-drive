@@ -2541,10 +2541,19 @@ def train_directory(
     elif mask_sources:
         rows = drop_masked(rows, set().union(*(source["ids"] for source in mask_sources)))
     if drop_wrong_way or float(max_road_clip) >= 0.0:
-        from python.train.frame_quality import FrameQualityError, apply_frame_quality, describe_quality
+        from python.train.frame_quality import (
+            ROAD_CLIP_SIDECAR,
+            FrameQualityError,
+            apply_frame_quality,
+            describe_quality,
+        )
         from python.train.scene_loader import recompute_dt
 
         before_q = len(rows)
+        sidecar = None
+        cache_root = getattr(cache, "root", None) if cache is not None else None
+        if cache_root:
+            sidecar = Path(cache_root) / ROAD_CLIP_SIDECAR
         try:
             rows, quality_stats = apply_frame_quality(
                 rows,
@@ -2552,6 +2561,9 @@ def train_directory(
                 max_road_clip=float(max_road_clip),
                 road_dump=road_dump or None,
                 require_road_dump=bool(require_road_dump),
+                cams=train_cams,
+                cache=cache,
+                clip_sidecar=sidecar,
             )
         except FrameQualityError as exc:
             raise SystemExit(str(exc)) from exc

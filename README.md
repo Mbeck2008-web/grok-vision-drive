@@ -461,9 +461,9 @@ Combined main-only cache estimate ≈ 19.15 GiB aggregate on E: (many ≤ 3.5 GB
 | `--augment` / `--no-augment` | on | Photometric jitter on training steps, off for validation |
 | `--balance` | off | Repeat windows with curves, weaves, ramps or large steer |
 | `--min-valid` | 0.3 | Drop a window when fewer rows than this have a lane center |
-| `--keep-wrong-way` | drop on | Opt out of the default drop of wrong-way recorded frames (see `docs/SPEC_frame_quality_filter.md`). `--drop-wrong-way` is still accepted; it fails if the road dump is missing. A missing dump otherwise logs one warning and keeps frames. |
+| `--keep-wrong-way` | drop on | Opt out of the default drop of wrong-way recorded frames (see `docs/SPEC_frame_quality_filter.md`). `--drop-wrong-way` is still accepted; it fails if the road dump is missing. A missing dump otherwise logs one warning and keeps wrong-way frames (clip still runs at the default T). |
 | `--road-dump` | `<data>/roads/<map>.json.gz` | Road network for the wrong-way filter |
-| `--max-road-clip` | 0.20 | Drop frames whose lower-half clip (RGB>=250) exceeds this fraction. `-1` disables |
+| `--max-road-clip` | 0.20 | Drop when the max per-cam lower-half clip (RGB>=250) of the selected `--cams` exceeds this fraction. `--cams main` uses the 256×192 main sector. `-1` disables. With `--cache`, fractions are read from cache sectors and persisted in `road_clip_v1.jsonl`. |
 | `--clip` | 1.0 | Max gradient norm |
 | `--scale` | 1.0 | Downscale the canvas before the cache and the net |
 | `--workers` | 4 on Windows, 0 elsewhere | DataLoader workers |

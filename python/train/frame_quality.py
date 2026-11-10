@@ -3,14 +3,18 @@
 Wrong-way uses recorded ego pose plus a saved road dump. The legal
 tangent follows node order, reversed when ``flipDirection`` is true; it
 is never flipped just to match the car. Overexposure uses the lower half
-of the training image (any RGB channel >= 250). Neither signal is a model
-input; deploy stays camera-only. See ``docs/SPEC_frame_quality_filter.md``.
+of each selected training-camera sector (any RGB channel >= 250). A row
+is dropped when the maximum of those per-cam fractions exceeds T. Missing
+cameras are omitted, so black pads on the full 2272×192 canvas do not
+dilute the fraction. Neither signal is a model input; deploy stays
+camera-only. See ``docs/SPEC_frame_quality_filter.md``.
 """
 from __future__ import annotations
 
 import gzip
 import json
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
@@ -27,6 +31,10 @@ MAX_DZ_M = 3.0
 CLIP_VALUE = 250
 # Parser default for --max-road-clip. Pass -1 to disable.
 DEFAULT_MAX_ROAD_CLIP = 0.20
+# Per-cam lower-half clip of the selected training cameras; drop on the max.
+CLIP_AGGREGATE = "max"
+ROAD_CLIP_METRIC = "road_clip_v1"
+ROAD_CLIP_SIDECAR = "road_clip_v1.jsonl"
 
 
 class FrameQualityError(ValueError):
@@ -433,15 +441,156 @@ def road_clip_fraction(bgr: Any, clip_value: int = CLIP_VALUE) -> float:
     return float(np.any(lower >= int(clip_value), axis=-1).mean())
 
 
+def driving_clip_cams(cams: tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
+    """Selected cameras that the clip metric may use (STRIP_ORDER only)."""
+    from python.data.strip_writer import STRIP_ORDER
+
+    if not cams:
+        return tuple(STRIP_ORDER)
+    wanted = {str(name) for name in cams}
+    return tuple(name for name in STRIP_ORDER if name in wanted)
+
+
+def row_clip_source(row: Mapping[str, Any]) -> str:
+    """Cache / sidecar key: multi-root ``source``, else resolved ``source_root``."""
+    if row.get("source") not in (None, ""):
+        return str(row["source"])
+    root = row.get("source_root")
+    if root in (None, ""):
+        return ""
+    return str(Path(root).resolve())
+
+
+def _finite_frac(value: Any) -> bool:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return number == number and number not in (float("inf"), float("-inf"))
+
+
+def load_clip_sidecar(path: Path | str) -> dict[tuple[str, int], dict[str, float]]:
+    """Load per-cam fractions keyed by (source, i). Wrong-version lines are skipped."""
+    file = Path(path)
+    out: dict[tuple[str, int], dict[str, float]] = {}
+    if not file.is_file():
+        return out
+    with file.open("rt", encoding="utf-8") as handle:
+        for line in handle:
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict) or str(payload.get("v") or "") != ROAD_CLIP_METRIC:
+                continue
+            try:
+                index = int(payload.get("i"))
+            except (TypeError, ValueError):
+                continue
+            fracs = payload.get("frac")
+            if not isinstance(fracs, dict):
+                continue
+            clean = {str(cam): float(val) for cam, val in fracs.items() if _finite_frac(val)}
+            if not clean:
+                continue
+            key = (str(payload.get("source") or ""), index)
+            cur = dict(out.get(key) or {})
+            cur.update(clean)
+            out[key] = cur
+    return out
+
+
+def save_clip_sidecar(path: Path | str, store: Mapping[tuple[str, int], Mapping[str, float]]) -> None:
+    """Rewrite a sidecar atomically. Keys are (source, i)."""
+    file = Path(path)
+    file.parent.mkdir(parents=True, exist_ok=True)
+    tmp = file.with_name(file.name + ".tmp")
+    with tmp.open("wt", encoding="utf-8") as handle:
+        for (source, index), fracs in sorted(store.items(), key=lambda item: (item[0][0], item[0][1])):
+            payload = {
+                "v": ROAD_CLIP_METRIC,
+                "source": source,
+                "i": int(index),
+                "frac": {str(cam): float(val) for cam, val in fracs.items()},
+            }
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+    os.replace(tmp, file)
+
+
+def _cache_sector(cache: Any, cam: str, index: int, row: Mapping[str, Any]) -> Any:
+    if cache is None or not hasattr(cache, "sector"):
+        return None
+    source_key = row.get("source")
+    kwargs = {"source": source_key} if source_key is not None else {}
+    try:
+        return cache.sector(cam, int(index), **kwargs)
+    except TypeError:
+        return cache.sector(cam, int(index))
+    except Exception:
+        return None
+
+
+def _measure_cam_clip(
+    row: Mapping[str, Any],
+    cam: str,
+    index: int,
+    *,
+    cache: Any = None,
+    cam_loader: Callable[[Any, int, str], Any] | None = None,
+) -> tuple[float | None, str]:
+    """Return (fraction, origin) for one driving camera. origin is cache/raw/miss."""
+    image = _cache_sector(cache, cam, index, row)
+    origin = "cache"
+    if image is None:
+        origin = "raw"
+        root = row.get("source_root")
+        if cam_loader is not None:
+            try:
+                image = cam_loader(root, index, cam)
+            except Exception:
+                image = None
+        else:
+            if root in (None, ""):
+                return None, "miss"
+            from python.data.raw_frames import load_raw_camera
+
+            try:
+                image = load_raw_camera(root, cam, index)
+            except Exception:
+                image = None
+    if image is None:
+        return None, "miss"
+    return road_clip_fraction(image), origin
+
+
 def drop_overexposed_rows(
     rows: list[Mapping[str, Any]],
     max_road_clip: float,
-    image_loader: Callable[[Any, int], Any],
+    *,
+    cams: tuple[str, ...] | list[str] | None = None,
+    cache: Any = None,
+    cam_loader: Callable[[Any, int, str], Any] | None = None,
+    clip_store: dict[tuple[str, int], dict[str, float]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Drop rows whose lower-half clip fraction exceeds ``max_road_clip``."""
+    """Drop rows whose max per-cam lower-half clip (selected cams) exceeds T.
+
+    Only cameras in ``STRIP_ORDER`` that were selected (``--cams``) and actually
+    present are measured. Absent cameras are omitted, so a washed main sector
+    still trips T=0.20 when the other sectors are black or missing. The
+    aggregate is the maximum of those per-cam fractions (not a canvas-wide
+    mean, and not main-only unless ``--cams main``).
+    """
+    selected = driving_clip_cams(cams)
     kept: list[dict[str, Any]] = []
     over = 0
     skipped = 0
+    decoded = 0
+    cache_hits = 0
+    sidecar_hits = 0
+    store = clip_store if clip_store is not None else {}
     for row in rows:
         try:
             index = int(row.get("i"))
@@ -449,19 +598,43 @@ def drop_overexposed_rows(
             skipped += 1
             kept.append(dict(row))
             continue
-        root = row.get("source_root")
-        try:
-            image = image_loader(root, index)
-            frac = road_clip_fraction(image)
-        except Exception:
+        source = row_clip_source(row)
+        key = (source, index)
+        known = dict(store.get(key) or {})
+        need = [cam for cam in selected if cam not in known]
+        if selected and not need:
+            sidecar_hits += 1
+        new_fracs: dict[str, float] = {}
+        for cam in need:
+            frac, origin = _measure_cam_clip(
+                row, cam, index, cache=cache, cam_loader=cam_loader
+            )
+            if frac is None:
+                continue
+            new_fracs[cam] = float(frac)
+            if origin == "raw":
+                decoded += 1
+            elif origin == "cache":
+                cache_hits += 1
+        if new_fracs:
+            known.update(new_fracs)
+            store[key] = known
+        values = [known[cam] for cam in selected if cam in known]
+        if not values:
             skipped += 1
             kept.append(dict(row))
             continue
-        if frac > float(max_road_clip):
+        if max(values) > float(max_road_clip):
             over += 1
             continue
         kept.append(dict(row))
-    return kept, {"overexposed": over, "clip_skipped": skipped}
+    return kept, {
+        "overexposed": over,
+        "clip_skipped": skipped,
+        "clip_decoded": decoded,
+        "clip_cache_hits": cache_hits,
+        "clip_sidecar_hits": sidecar_hits,
+    }
 
 
 def resolve_road_dump(
@@ -510,13 +683,23 @@ def apply_frame_quality(
     image_loader: Callable[[Any, int], Any] | None = None,
     require_road_dump: bool = False,
     warn: Callable[[str], None] | None = None,
+    cams: tuple[str, ...] | list[str] | None = None,
+    cache: Any = None,
+    cam_loader: Callable[[Any, int, str], Any] | None = None,
+    clip_sidecar: Path | str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Apply the enabled filters. Both off returns copies of the same rows.
 
     When ``drop_wrong_way`` is set and no road dump can be loaded, raise
     ``FrameQualityError`` if ``require_road_dump`` is true (the user passed
-    ``--drop-wrong-way``). Otherwise log one warning and keep every row
-    (unknown is kept).
+    ``--drop-wrong-way``). Otherwise log one warning and keep wrong-way
+    frames as unknown; the road-clip filter still runs when T >= 0.
+
+    Clip is measured per selected training camera (never ``main_depth`` /
+    ``main_sem``, never the full compose_strip canvas). Values are persisted
+    in ``clip_sidecar`` (``road_clip_v1``, keyed by source+id) so a later
+    build does not re-decode. When a frame cache is passed, sectors are
+    read from it instead of raw PNG files.
     """
     stats = {
         "wrong_way": 0,
@@ -525,6 +708,9 @@ def apply_frame_quality(
         "overexposed": 0,
         "clip_skipped": 0,
         "dump_missing": 0,
+        "clip_decoded": 0,
+        "clip_cache_hits": 0,
+        "clip_sidecar_hits": 0,
     }
     out = [dict(row) for row in rows]
     if drop_wrong_way:
@@ -540,35 +726,56 @@ def apply_frame_quality(
                 stats["dump_missing"] = 1
                 stats["unknown"] = len(out)
                 err = exc if isinstance(exc, FrameQualityError) else f"road dump unreadable: {exc}"
-                _warn_quality(
-                    f"no road dump for this map; keeping all {len(out)} frames "
-                    f"(unknown). Pass --drop-wrong-way to fail, or --road-dump PATH. ({err})",
-                    warn,
-                )
+                if float(max_road_clip) >= 0.0:
+                    msg = (
+                        f"no road dump for this map; keeping wrong-way frames as unknown. "
+                        f"The road-clip filter still runs (T={float(max_road_clip):g}). "
+                        f"Pass --drop-wrong-way to fail, or --road-dump PATH. ({err})"
+                    )
+                else:
+                    msg = (
+                        f"no road dump for this map; keeping wrong-way frames as unknown. "
+                        f"Pass --drop-wrong-way to fail, or --road-dump PATH. ({err})"
+                    )
+                _warn_quality(msg, warn)
                 use = None
         if use is not None:
             out, ww = drop_wrong_way_rows(out, use)
             stats.update(ww)
     if float(max_road_clip) >= 0.0:
-        if image_loader is None:
-            from python.train.scene_loader import load_canvas
-
-            def image_loader(root: Any, index: int) -> Any:
-                if root in (None, ""):
-                    raise FrameQualityError("overexposure drop needs a recording root on the row")
-                return load_canvas(root, index)
-
-        out, clip_stats = drop_overexposed_rows(out, float(max_road_clip), image_loader)
+        store: dict[tuple[str, int], dict[str, float]] = {}
+        side = Path(clip_sidecar) if clip_sidecar else None
+        if side is not None:
+            store.update(load_clip_sidecar(side))
+        # image_loader (the old compose_strip canvas path) is ignored. Clip is
+        # per selected camera via cam_loader, the frame cache, or load_raw_camera.
+        out, clip_stats = drop_overexposed_rows(
+            out,
+            float(max_road_clip),
+            cams=cams,
+            cache=cache,
+            cam_loader=cam_loader,
+            clip_store=store,
+        )
         stats.update(clip_stats)
+        if side is not None:
+            save_clip_sidecar(side, store)
     return out, stats
 
 
 def describe_quality(stats: Mapping[str, int], before: int) -> str:
     after = before - int(stats.get("wrong_way", 0)) - int(stats.get("overexposed", 0))
     missing = " dump_missing=1 (wrong-way kept)" if int(stats.get("dump_missing", 0)) else ""
+    decoded = ""
+    if any(int(stats.get(key, 0)) for key in ("clip_decoded", "clip_cache_hits", "clip_sidecar_hits")):
+        decoded = (
+            f" clip_decoded={int(stats.get('clip_decoded', 0))}"
+            f" clip_cache={int(stats.get('clip_cache_hits', 0))}"
+            f" clip_sidecar={int(stats.get('clip_sidecar_hits', 0))}"
+        )
     return (
         f"before={int(before)} wrong_way={int(stats.get('wrong_way', 0))} "
         f"overexposed={int(stats.get('overexposed', 0))} kept={after} "
-        f"ok={int(stats.get('ok', 0))} unknown={int(stats.get('unknown', 0))}{missing} "
+        f"ok={int(stats.get('ok', 0))} unknown={int(stats.get('unknown', 0))}{missing}{decoded} "
         f"(filtered-run metrics are not comparable to an unfiltered run)"
     )

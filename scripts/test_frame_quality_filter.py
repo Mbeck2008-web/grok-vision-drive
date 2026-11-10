@@ -12,8 +12,14 @@
 (4) ``road_clip_fraction`` uses the lower half only (any RGB channel >= 250).
 (5) ``apply_frame_quality`` with both filters off keeps every row; with the
     flags on it drops only wrong-way and over-clipped frames.
-(6) A missing road dump warns once and keeps frames unless the user passed
-    ``--drop-wrong-way`` (``require_road_dump``), which fails loudly.
+(6) A missing road dump warns once and keeps wrong-way frames unless the
+    user passed ``--drop-wrong-way`` (``require_road_dump``), which fails
+    loudly. The warning does not claim every frame was kept when clip still
+    runs at the default T=0.20.
+(7) Clip is the max of per-cam lower-half fractions on the selected training
+    cameras. A fully washed main sector is dropped at T=0.20 even when the
+    other cameras are black or absent (the old full-canvas fraction cannot
+    trip T). A second build with a sidecar does not re-decode.
 """
 from __future__ import annotations
 
@@ -206,6 +212,10 @@ def check_apply_frame_quality_defaults() -> None:
     assert params["road_dump"].default is None
     assert params["roads"].default is None
     assert params["image_loader"].default is None
+    assert params["cams"].default is None
+    assert params["cache"].default is None
+    assert params["cam_loader"].default is None
+    assert params["clip_sidecar"].default is None
     rows = [{"i": 1}, {"i": 2}]
     kept, stats = apply_frame_quality(rows)
     assert [row["i"] for row in kept] == [1, 2]
@@ -258,20 +268,22 @@ def check_road_clip_fraction() -> None:
     assert frac > 0.20
 
     rows = [
-        {"i": 0, "source_root": "a"},
-        {"i": 1, "source_root": "a"},
-        {"i": 2, "source_root": "a"},
+        {"i": 0, "source_root": "a", "source": "s"},
+        {"i": 1, "source_root": "a", "source": "s"},
+        {"i": 2, "source_root": "a", "source": "s"},
     ]
     frames = {0: clean, 1: upper, 2: lower}
 
-    def loader(root, index):
+    def cam_loader(root, index, cam):
+        assert cam == "main"
         return frames[int(index)]
 
     kept, stats = apply_frame_quality(
         rows,
         drop_wrong_way=False,
         max_road_clip=0.20,
-        image_loader=loader,
+        cams=("main",),
+        cam_loader=cam_loader,
         roads=[],
     )
     assert [r["i"] for r in kept] == [0, 1], (kept, stats)
@@ -281,7 +293,8 @@ def check_road_clip_fraction() -> None:
         rows,
         drop_wrong_way=False,
         max_road_clip=-1.0,
-        image_loader=loader,
+        cams=("main",),
+        cam_loader=cam_loader,
         roads=[],
     )
     assert [r["i"] for r in same] == [0, 1, 2]
@@ -307,7 +320,8 @@ def check_combined_drop() -> None:
             rows,
             drop_wrong_way=True,
             max_road_clip=0.20,
-            image_loader=lambda root, index: frames[int(index)],
+            cams=("main",),
+            cam_loader=lambda root, index, cam: frames[int(index)],
             roads=roads,
         )
         assert [r["i"] for r in kept] == [10], (kept, stats)
@@ -315,10 +329,191 @@ def check_combined_drop() -> None:
         assert stats["overexposed"] == 1
 
 
-def check_missing_dump_warn_and_keep() -> None:
-    """Default drop (no explicit --drop-wrong-way) keeps frames if the dump is missing."""
-    from python.train.frame_quality import apply_frame_quality, describe_quality
+def check_washed_main_drops_when_other_cams_black() -> None:
+    """A fully washed main sector trips T=0.20 even when other cams are black.
 
+    This test must die on the old compose_strip canvas path: a 100% clipped
+    main sector is only 256/2272 ≈ 0.113 of that canvas, below T=0.20.
+    """
+    from python.data.strip_writer import CANVAS_W, SECTOR_W_169, STRIP_ORDER, compose_strip
+    from python.train.frame_quality import DEFAULT_MAX_ROAD_CLIP, apply_frame_quality, road_clip_fraction
+
+    main = np.full((192, 256, 3), 255, dtype=np.uint8)
+    black_43 = np.zeros((192, 256, 3), dtype=np.uint8)
+    black_169 = np.zeros((192, SECTOR_W_169, 3), dtype=np.uint8)
+    frames = {}
+    for cam in STRIP_ORDER:
+        if cam == "main":
+            frames[cam] = main
+        elif cam in ("wide", "rear"):
+            frames[cam] = black_169
+        else:
+            frames[cam] = black_43
+    canvas = compose_strip(frames)
+    assert canvas.shape[1] == CANVAS_W
+    canvas_frac = road_clip_fraction(canvas)
+    assert canvas_frac < 0.20, canvas_frac  # old filter would keep
+    assert road_clip_fraction(main) > 0.20
+
+    def cam_loader(root, index, cam):
+        return frames[cam]
+
+    rows = [{"i": 0, "source_root": "a", "source": "s"}]
+    kept, stats = apply_frame_quality(
+        rows,
+        drop_wrong_way=False,
+        max_road_clip=DEFAULT_MAX_ROAD_CLIP,
+        cams=("main",),
+        cam_loader=cam_loader,
+    )
+    assert [r["i"] for r in kept] == [], (kept, stats)
+    assert stats["overexposed"] == 1
+
+    # All eight selected, others black (frac 0): max still follows the washed main.
+    kept_all, stats_all = apply_frame_quality(
+        rows,
+        drop_wrong_way=False,
+        max_road_clip=DEFAULT_MAX_ROAD_CLIP,
+        cams=None,
+        cam_loader=cam_loader,
+    )
+    assert [r["i"] for r in kept_all] == []
+    assert stats_all["overexposed"] == 1
+
+
+def check_multicam_drop_uses_max() -> None:
+    """Multi-cam selections drop on the max per-cam fraction, not main-only."""
+    from python.train.frame_quality import CLIP_AGGREGATE, apply_frame_quality
+
+    assert CLIP_AGGREGATE == "max"
+    clean = np.full((192, 256, 3), 40, dtype=np.uint8)
+    washed_wide = np.full((192, 340, 3), 255, dtype=np.uint8)
+
+    def cam_loader(root, index, cam):
+        if cam == "wide":
+            return washed_wide
+        return clean
+
+    rows = [{"i": 0, "source_root": "a", "source": "s"}]
+    keep_main, stats_main = apply_frame_quality(
+        rows, drop_wrong_way=False, max_road_clip=0.20, cams=("main",), cam_loader=cam_loader
+    )
+    assert [r["i"] for r in keep_main] == [0], stats_main
+    assert stats_main["overexposed"] == 0
+
+    drop_both, stats_both = apply_frame_quality(
+        rows,
+        drop_wrong_way=False,
+        max_road_clip=0.20,
+        cams=("main", "wide"),
+        cam_loader=cam_loader,
+    )
+    assert [r["i"] for r in drop_both] == [], stats_both
+    assert stats_both["overexposed"] == 1
+
+
+def check_clip_skips_depth_sem() -> None:
+    from python.data.strip_writer import STRIP_ORDER
+    from python.train.frame_quality import apply_frame_quality
+
+    seen: list[str] = []
+    clean = np.full((192, 256, 3), 40, dtype=np.uint8)
+
+    def cam_loader(root, index, cam):
+        seen.append(cam)
+        return clean
+
+    apply_frame_quality(
+        [{"i": 0, "source_root": "a", "source": "s"}],
+        drop_wrong_way=False,
+        max_road_clip=0.20,
+        cams=None,
+        cam_loader=cam_loader,
+    )
+    assert "main_depth" not in seen and "main_sem" not in seen, seen
+    assert set(seen) == set(STRIP_ORDER), seen
+
+
+def check_clip_sidecar_skips_second_decode() -> None:
+    from python.train.frame_quality import apply_frame_quality
+
+    with collect_root("gvd-fq-clip-") as tmp:
+        calls = {"n": 0}
+        clean = np.full((192, 256, 3), 40, dtype=np.uint8)
+
+        def cam_loader(root, index, cam):
+            calls["n"] += 1
+            return clean
+
+        sidecar = tmp / "road_clip_v1.jsonl"
+        rows = [{"i": 7, "source_root": str(tmp), "source": "rec"}]
+        first, stats1 = apply_frame_quality(
+            rows,
+            drop_wrong_way=False,
+            max_road_clip=0.20,
+            cams=("main",),
+            cam_loader=cam_loader,
+            clip_sidecar=sidecar,
+        )
+        assert [r["i"] for r in first] == [7]
+        assert stats1["clip_decoded"] == 1
+        assert calls["n"] == 1
+        assert sidecar.is_file()
+
+        second, stats2 = apply_frame_quality(
+            rows,
+            drop_wrong_way=False,
+            max_road_clip=0.20,
+            cams=("main",),
+            cam_loader=cam_loader,
+            clip_sidecar=sidecar,
+        )
+        assert [r["i"] for r in second] == [7]
+        assert stats2["clip_decoded"] == 0
+        assert stats2["clip_sidecar_hits"] == 1
+        assert calls["n"] == 1, f"second build re-decoded: {calls['n']}"
+
+
+def check_clip_uses_cache_not_raw() -> None:
+    from python.train.frame_quality import apply_frame_quality
+
+    class FakeCache:
+        def __init__(self) -> None:
+            self.hits = 0
+            self.root = Path("/tmp/fake-cache")
+
+        def sector(self, cam, index, source=None):
+            self.hits += 1
+            assert cam == "main"
+            assert int(index) == 3
+            assert source == "rec"
+            return np.full((192, 256, 3), 40, dtype=np.uint8)
+
+    def cam_loader(root, index, cam):
+        raise AssertionError("must not decode raw when the cache has the sector")
+
+    cache = FakeCache()
+    kept, stats = apply_frame_quality(
+        [{"i": 3, "source_root": "a", "source": "rec"}],
+        drop_wrong_way=False,
+        max_road_clip=0.20,
+        cams=("main",),
+        cache=cache,
+        cam_loader=cam_loader,
+    )
+    assert [r["i"] for r in kept] == [3]
+    assert cache.hits == 1
+    assert stats["clip_cache_hits"] == 1
+    assert stats["clip_decoded"] == 0
+
+
+def check_missing_dump_warn_and_keep() -> None:
+    """Missing dump keeps wrong-way frames; default clip still runs."""
+    from python.train.frame_quality import DEFAULT_MAX_ROAD_CLIP, apply_frame_quality, describe_quality
+
+    clean = np.full((10, 10, 3), 40, dtype=np.uint8)
+    blown = np.full((10, 10, 3), 255, dtype=np.uint8)
+    frames = {0: clean, 1: blown}
     rows = [
         {"i": 0, "map": "no_such_map", "ego": {"pos": [20.0, -0.8, 0.0], "dir": [1.0, 0.0, 0.0]}},
         {"i": 1, "map": "no_such_map", "ego": {"pos": [20.0, -0.8, 0.0], "dir": [-1.0, 0.0, 0.0]}},
@@ -329,21 +524,28 @@ def check_missing_dump_warn_and_keep() -> None:
         drop_wrong_way=True,
         require_road_dump=False,
         road_dump="/no/such/road_dump.json",
-        max_road_clip=-1.0,
+        max_road_clip=DEFAULT_MAX_ROAD_CLIP,
+        cams=("main",),
+        cam_loader=lambda root, index, cam: frames[int(index)],
         warn=warnings.append,
     )
-    assert [r["i"] for r in kept] == [0, 1], (kept, stats)
+    assert [r["i"] for r in kept] == [0], (kept, stats)
     assert stats["wrong_way"] == 0
+    assert stats["overexposed"] == 1
     assert stats["dump_missing"] == 1
     assert stats["unknown"] == 2
     assert len(warnings) == 1, warnings
-    assert "keeping all 2 frames" in warnings[0]
-    assert "unknown" in warnings[0]
+    assert "keeping all" not in warnings[0]
+    assert "keeping all 2 frames" not in warnings[0]
+    assert "wrong-way" in warnings[0] and "unknown" in warnings[0]
+    assert "road-clip filter still runs" in warnings[0]
+    assert "T=0.2" in warnings[0]
     assert "Pass --drop-wrong-way to fail" in warnings[0]
     line = describe_quality(stats, 2)
     assert "wrong_way=0" in line
+    assert "overexposed=1" in line
     assert "dump_missing=1" in line
-    assert "kept=2" in line
+    assert "kept=1" in line
 
 
 def check_missing_dump_explicit_flag_fails() -> None:
@@ -377,6 +579,11 @@ def main() -> None:
     check_wrong_way_twoway()
     check_road_clip_fraction()
     check_combined_drop()
+    check_washed_main_drops_when_other_cams_black()
+    check_multicam_drop_uses_max()
+    check_clip_skips_depth_sem()
+    check_clip_sidecar_skips_second_decode()
+    check_clip_uses_cache_not_raw()
     check_missing_dump_warn_and_keep()
     check_missing_dump_explicit_flag_fails()
     print("test_frame_quality_filter: OK")

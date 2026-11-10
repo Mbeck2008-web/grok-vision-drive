@@ -126,15 +126,20 @@ class SceneLaneGuard:
             return None
 
     def observe(
-        self, runtime: Any, strip_bgr: Any, dt_s: float | None, *, engaged: bool, ages: Any = None
+        self, runtime: Any, strip_bgr: Any, dt_s: float | None, *, engaged: bool, ages: Any = None, route: Any = None
     ) -> tuple[float | None, float]:
         if not engaged:
             self.hold = None
         if self.hold is not None:
             return None, 0.0
         try:
+            kwargs: dict[str, Any] = {}
             if ages is not None:
-                return runtime.observe(strip_bgr, dt_s, ages=ages)
+                kwargs["ages"] = ages
+            if route is not None:
+                kwargs["route"] = route
+            if kwargs:
+                return runtime.observe(strip_bgr, dt_s, **kwargs)
             return runtime.observe(strip_bgr, dt_s)
         except SceneInputShapeError as exc:
             self.hold = str(exc)
@@ -281,10 +286,11 @@ class SceneLaneRuntime:
                 "this supervisor does not feed them. Use a model trained without --cam-age."
             )
         self.cam_age = wants_ages
+        self.wants_route = any(_base_name(name) == "route" for name in self._input_names)
         self.ready = True
         self.reason = "ok"
 
-    def observe(self, strip_bgr: Any, dt_s: float | None, ages: Any = None) -> tuple[float | None, float]:
+    def observe(self, strip_bgr: Any, dt_s: float | None, ages: Any = None, route: Any = None) -> tuple[float | None, float]:
         """Return ``(lane_x at 8 m, confidence)``. A cold runtime is confidence 0.
 
         ``ages``: 8 floats (``cam_hold.CAM_AGE_ORDER``) for a ``gvd_cam_age=1``
@@ -322,6 +328,16 @@ class SceneLaneRuntime:
         }
         if age_feed is not None:
             feeds["ages"] = age_feed
+        if getattr(self, "wants_route", False) or any(_base_name(name) == "route" for name in self._input_names):
+            from python.train.route_cond import ROUTE_COND_DIM, encode_route
+
+            if route is None:
+                vec = encode_route("follow", None)
+            else:
+                vec = np.asarray(route, dtype=np.float32).reshape(-1)
+                if int(vec.size) != int(ROUTE_COND_DIM):
+                    vec = encode_route("follow", None)
+            feeds["route"] = vec.reshape(1, int(ROUTE_COND_DIM))
         feeds = {name: feeds[_base_name(name)] for name in self._input_names if _base_name(name) in feeds}
         t_run = time.perf_counter()
         try:

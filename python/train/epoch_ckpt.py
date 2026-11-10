@@ -234,6 +234,7 @@ def build_net(meta: Mapping[str, Any], weights: Mapping[str, Any] | None = None)
     backbone = str(meta.get("backbone") or "scratch")
     aux = _arch_flag(meta, weights, "aux_sensors", ("aux_depth_head.", "aux_sem_head."), ":aux=")
     road = _arch_flag(meta, weights, "road_edge", ("road_edge_head.",), ":road_edge=")
+    route = _arch_flag(meta, weights, "route_cond", ("route_proj.",), ":route_cond=")
     if backbone in ("", "scratch"):
         from python.train.scene_net import SceneNet
 
@@ -245,9 +246,10 @@ def build_net(meta: Mapping[str, Any], weights: Mapping[str, Any] | None = None)
             cond_dim=int(meta.get("ctl_cond_dim") or 0),
             aux_sensors=aux,
             road_edge=road,
+            route_cond=route,
         )
-    if meta.get("cam_age") or meta.get("ctl") or aux or road:
-        raise ValueError("a --cam-age, ctl, aux, or road_edge checkpoint is a scratch-net checkpoint; this one names a backbone")
+    if meta.get("cam_age") or meta.get("ctl") or aux or road or route:
+        raise ValueError("a --cam-age, ctl, aux, road_edge, or route_cond checkpoint is a scratch-net checkpoint; this one names a backbone")
     from python.train.pretrained_net import build_scene_net
 
     return build_scene_net(cams, scale, backbone, freeze=bool(meta.get("freeze_backbone")))

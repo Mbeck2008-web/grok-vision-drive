@@ -485,7 +485,7 @@ def check_same_tick_observe_documented() -> None:
     is required while observe always uses the current frame.
     """
     src = (ROOT / "python" / "run_vision.py").read_text()
-    assert "ckpt_pred = scene_ckpt.observe(main, tick_dt)" in src
+    assert "ckpt_pred = scene_ckpt.observe(main, tick_dt, route=route_vec)" in src
     assert "apply_scene_ckpt_lane(pout, ckpt_pred, drive=True)" in src
     # No last-pred reuse cache in the runtime.
     rt = (ROOT / "python" / "train" / "scene_ckpt_runtime.py").read_text()

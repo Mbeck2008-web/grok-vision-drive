@@ -77,7 +77,6 @@ from python.train.scene_net import (  # noqa: E402
     head_names,
     labels_for_row,
     loss_mask,
-    precision_for_capability,
     scene_loss,
     step_dt,
     torch_ready,
@@ -209,6 +208,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Compute capability override. 6.1 stays FP32. 7.0 and newer select mixed precision.",
     )
+    from python.train.model_size import add_model_size_args
+
+    add_model_size_args(parser)
     parser.add_argument(
         "--export",
         nargs="?",
@@ -2331,6 +2333,36 @@ def _prefetch_loader(items: list[dict[str, Any]], root: Path, cams, cache, scale
     )
 
 
+def train_amp_enabled(
+    train_precision: str,
+    plan_precision: str | None,
+    *,
+    device_type: str = "cuda",
+    capability: Any = None,
+    gpu_name: str = "",
+) -> bool:
+    """Whether the trainer should enable fp16 AMP.
+
+    ``plan_precision`` (``SizePlan.precision`` from ``resolve_precision``) is
+    the authority. ``precision_for_capability`` is name-blind: a GTX 16-series
+    card at compute 7.5 would otherwise train with fp16 AMP under
+    ``--precision auto``.
+    """
+    if str(device_type) != "cuda":
+        return False
+    requested = str(train_precision or "auto").lower()
+    if requested == "fp32":
+        return False
+    applied = str(plan_precision or "").strip().lower()
+    if not applied:
+        from python.train.model_size import resolve_precision
+        from python.train.scene_net import split_capability
+
+        applied, _notes = resolve_precision(requested, split_capability(capability), gpu_name)
+        applied = str(applied).lower()
+    return applied in ("fp16", "bf16")
+
+
 def train_directory(
     root: Path,
     *,
@@ -2406,6 +2438,11 @@ def train_directory(
     aux_cache: Any = None,
     fit_trained_canvas: bool = False,
     exp_cuda_graph: bool = False,
+    model_net_kwargs: dict | None = None,
+    model_preset: str = "small",
+    train_precision: str = "auto",
+    plan_precision: str | None = None,
+    gpu_name: str = "",
 ) -> dict[str, Any]:
     import torch
 
@@ -2766,6 +2803,7 @@ def train_directory(
                     aux_sensors=use_aux_sensors,
                     road_edge=use_road_edge,
                     route_cond=bool(route_cond),
+                    **dict(model_net_kwargs or {}),
                 ).to(device)
                 if grad_ckpt:
                     holder["net"].grad_ckpt = True
@@ -2792,7 +2830,13 @@ def train_directory(
             holder["net"].to(device)
             _release_cuda()
         cap = _capability(device, capability)
-        amp = precision_for_capability(cap) == "amp" and device.type == "cuda"
+        amp = train_amp_enabled(
+            train_precision,
+            plan_precision,
+            device_type=device.type,
+            capability=cap,
+            gpu_name=gpu_name,
+        )
         rate = float(holder.get("lr", lr) if learning_rate is None else learning_rate)
         holder["device"] = device
         holder["cap"] = cap
@@ -3046,6 +3090,7 @@ def train_directory(
             "lr": float(holder.get("lr", lr)),
             "batch": int(batch),
             "exact_epochs": exact_n,
+            "preset": str(model_preset or "small"),
         }
         weights = {key: value.detach().cpu().numpy() for key, value in net.state_dict().items()}
         try:
@@ -3831,6 +3876,34 @@ def main(argv: list[str] | None = None) -> None:
         print(f"[GVD] scene train: {exc}")
         sys.exit(2)
     args = build_parser().parse_args(argv)
+    from python.train.model_size import plan_from_namespace
+
+    try:
+        size_plan = plan_from_namespace(args)
+    except Exception as exc:
+        print(f"[GVD] model-size: {exc}; staying on small", flush=True)
+        size_plan = None
+    else:
+        from python.train.model_size import _sizing_requested
+
+        if _sizing_requested(args):
+            print(size_plan.line, flush=True)
+            for warning in size_plan.warnings:
+                print(f"[GVD] model-size warning: {warning}", flush=True)
+        else:
+            print("[GVD] model-size small (default; today's net)", flush=True)
+        if str(getattr(args, "model_size", "small")) == "auto":
+            from python.train.model_size import apply_runtime_knobs, detect_gpu
+
+            seen = detect_gpu()
+            for note in apply_runtime_knobs(seen.capability, seen.name, enabled=True):
+                print(f"[GVD] model-size {note}", flush=True)
+    net_kw = {} if size_plan is None else dict(size_plan.net_kwargs)
+    preset_name = "small" if size_plan is None else size_plan.preset
+    train_precision = str(getattr(args, "precision", "auto") or "auto")
+    plan_precision = None if size_plan is None else str(size_plan.precision)
+    if size_plan is not None and train_precision in ("fp16", "int8") and size_plan.precision == "fp32":
+        train_precision = "fp32"
     from python.train.cam_strip import parse_cams, parse_heads
     from python.train.frame_cache import FrameCache, build_frame_cache
     from python.train.scene_loader import default_num_workers
@@ -4056,7 +4129,7 @@ def main(argv: list[str] | None = None) -> None:
                     source_meta,
                     holdout_blocks=resolve_holdout_blocks(args.holdout_blocks),
                 )
-                net = SceneNet(cams=cam_names, scale=float(args.scale)).train()
+                net = SceneNet(cams=cam_names, scale=float(args.scale), **net_kw).train()
 
                 def _ssl_image(row):
                     loaded = _frame_row(
@@ -4166,6 +4239,10 @@ def main(argv: list[str] | None = None) -> None:
                 aux_cache=aux_cache,
                 fit_trained_canvas=bool(getattr(args, "fit_trained_canvas", False)),
                 exp_cuda_graph=bool(getattr(args, "exp_cuda_graph", False)),
+                model_net_kwargs=net_kw,
+                model_preset=preset_name,
+                train_precision=train_precision,
+                plan_precision=plan_precision,
             )
         except ExactEpochsMismatch as exc:
             print(f"[GVD] scene train: {exc}", flush=True)

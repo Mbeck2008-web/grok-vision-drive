@@ -200,14 +200,16 @@ def groupnorm_parameter_count(num_channels: int) -> int:
     return 2 * int(num_channels)
 
 
-def stem_spec() -> tuple[tuple[str, int, int], ...]:
+def stem_spec(channels: tuple[int, ...] | None = None) -> tuple[tuple[str, int, int], ...]:
     """Shared stem as Conv, GroupNorm, ReLU for each width.
 
     BatchNorm is not in this stack. A batch of one strip is a legal step.
+    ``channels`` defaults to ``STEM_CHANNELS``, which is the exported net.
     """
     rows: list[tuple[str, int, int]] = []
     cin = 3
-    for cout in STEM_CHANNELS:
+    widths = STEM_CHANNELS if channels is None else tuple(int(width) for width in channels)
+    for cout in widths:
         width = int(cout)
         if width % STEM_GROUPS != 0:
             raise ValueError(f"stem width {width} is not divisible by {STEM_GROUPS} groups")
@@ -1477,10 +1479,11 @@ if torch is not None:
         still changes the vector.
         """
 
-        def __init__(self) -> None:
+        def __init__(self, channels: tuple[int, ...] | None = None) -> None:
             super().__init__()
             layers: list[nn.Module] = []
-            for kind, left, right in stem_spec():
+            spec = stem_spec() if channels is None else stem_spec(channels)
+            for kind, left, right in spec:
                 if kind == "conv":
                     layers.append(nn.Conv2d(left, right, kernel_size=3, stride=2, padding=1, bias=True))
                 elif kind == "groupnorm":
@@ -1490,7 +1493,8 @@ if torch is not None:
                 else:
                     raise RuntimeError(f"stem has no {kind} layer")
             self.conv = nn.Sequential(*layers)
-            self.fc = nn.Linear(STEM_CHANNELS[-1] * HORIZ_BINS, SECTOR_FEAT)
+            self.out_channels = STEM_CHANNELS[-1] if channels is None else int(tuple(channels)[-1])
+            self.fc = nn.Linear(self.out_channels * HORIZ_BINS, SECTOR_FEAT)
 
         def features(self, x: Any) -> Any:
             """Spatial stem map (C x H x W) before the sector token pool."""
@@ -1519,6 +1523,10 @@ if torch is not None:
             aux_sensors: bool = False,
             road_edge: bool = False,
             route_cond: bool = False,
+            *,
+            stem_channels: tuple[int, ...] | None = None,
+            gru_hidden: int | None = None,
+            preset: str = "small",
         ) -> None:
             super().__init__()
             from python.data.cam_hold import CAM_AGE_N
@@ -1547,15 +1555,17 @@ if torch is not None:
             if self.ctl:
                 arch = getattr(self, "pause_arch", checkpoint_arch(self.cams)) + f":ctl=3x{CTL_K}"
                 self.pause_arch = arch + (f":cond={self.cond_dim}" if self.cond_dim else "")
-            self.stem = SharedStem()
+            self.preset = str(preset or "small")
+            self.gru_hidden = GRU_HIDDEN if gru_hidden is None else int(gru_hidden)
+            self.stem = SharedStem() if stem_channels is None else SharedStem(tuple(int(c) for c in stem_channels))
             # The dropped tensor is the GRU input. ``state.h`` is not dropped.
             self.gru_in_drop = nn.Dropout(p=GRU_IN_DROPOUT)
-            self.gru = nn.GRU(self.token_dim + 1, GRU_HIDDEN, num_layers=1, batch_first=True)
+            self.gru = nn.GRU(self.token_dim + 1, self.gru_hidden, num_layers=1, batch_first=True)
             # Eight cameras make a 512-d token, the same width as the GRU.
             # A subset is narrower. The skip has to land in hidden space or
             # ``gru_out + residual`` raises before the first step.
-            self.skip = None if self.token_dim == GRU_HIDDEN else nn.Linear(self.token_dim, GRU_HIDDEN)
-            hidden = GRU_HIDDEN
+            self.skip = None if self.token_dim == self.gru_hidden else nn.Linear(self.token_dim, self.gru_hidden)
+            hidden = self.gru_hidden
             for name, out in scene_head_sizes():
                 setattr(self, name, nn.Linear(hidden, out))
             if self.ctl:
@@ -1569,7 +1579,7 @@ if torch is not None:
             self.aux_w = int(AUX_W)
             self.sem_class_max = int(SEM_CLASS_MAX)
             if self.aux_sensors:
-                cin = int(STEM_CHANNELS[-1])
+                cin = int(getattr(self.stem, "out_channels", STEM_CHANNELS[-1]))
                 self.aux_depth_head = nn.Conv2d(cin, 1, kernel_size=1, bias=True)
                 self.aux_sem_head = nn.Conv2d(cin, self.sem_class_max, kernel_size=1, bias=True)
                 arch = getattr(self, "pause_arch", checkpoint_arch(self.cams))
@@ -1587,6 +1597,9 @@ if torch is not None:
                 self.route_proj = nn.Linear(int(ROUTE_COND_DIM), hidden)
                 arch = getattr(self, "pause_arch", checkpoint_arch(self.cams))
                 self.pause_arch = arch + f":route_cond={int(ROUTE_COND_DIM)}"
+            if self.preset not in ("", "small"):
+                arch = getattr(self, "pause_arch", checkpoint_arch(self.cams))
+                self.pause_arch = arch + f":preset={self.preset}"
 
         def initial_state(self, device: Any = None, dtype: Any = None, batch: int = 1) -> SceneState:
             device = device or torch.device("cpu")
@@ -1594,7 +1607,7 @@ if torch is not None:
             width = max(1, int(batch))
             empty_age = float(RESIDUAL_S) + 1.0
             return SceneState(
-                h=torch.zeros(1, width, GRU_HIDDEN, device=device, dtype=dtype),
+                h=torch.zeros(1, width, self.gru_hidden, device=device, dtype=dtype),
                 tokens=torch.zeros(width, RESIDUAL_TOKENS, self.token_dim, device=device, dtype=dtype),
                 mask=torch.full((width, RESIDUAL_TOKENS), empty_age, device=device, dtype=dtype),
             )

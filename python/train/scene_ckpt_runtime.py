@@ -1,8 +1,11 @@
-"""Load a train_scene epoch checkpoint and run it live as shadow-only.
+"""Load a train_scene epoch checkpoint and run it live.
 
-``python.run_vision --scene-ckpt`` is the only caller. The prediction is for
-the overlay and ``gvd_state.json``; it must not reach the wheel or pedals.
-Inference is CPU so BeamNG keeps the GPU.
+``python.run_vision --scene-ckpt`` is the only caller. Shadow (the default)
+draws the overlay and writes state; the prediction must not reach the wheel
+or pedals. ``--scene-ckpt-drive`` is an explicit opt-in: ``lane_x`` is fed
+to the existing modular lateral controller. It never writes ctl-cond, never
+bypasses heartbeat / AEB / the confidence veto, and inference stays on CPU
+so BeamNG keeps the GPU.
 """
 from __future__ import annotations
 
@@ -43,13 +46,21 @@ def overlay_bgr(kind: str) -> tuple[int, int, int]:
     raise KeyError(kind)
 
 
-def shadow_engage_allowed() -> bool:
-    """Engage is never allowed while a scene-ckpt shadow runtime is the point of the run."""
-    return False
+DRIVE_SPEED_MPS = 15.0
+
+
+def shadow_engage_allowed(*, drive: bool = False) -> bool:
+    """Engage is blocked in shadow. ``--scene-ckpt-drive`` is the only opt-in."""
+    return bool(drive)
 
 
 def apply_scene_ckpt_to_command(cmd: Any, _pred: Any) -> Any:
-    """Return ``cmd`` unchanged. A scene-ckpt prediction never edits actuation."""
+    """Return ``cmd`` unchanged.
+
+    Drive mode does not rewrite pedals here. ``lane_x`` is injected into the
+    modular path before ``shadow_tick``, so AEB, the veto, and the speed
+    controller still have the last word.
+    """
     if cmd is None:
         return cmd
     try:
@@ -58,11 +69,117 @@ def apply_scene_ckpt_to_command(cmd: Any, _pred: Any) -> Any:
         return cmd
 
 
+def apply_scene_ckpt_lane(pout: Any, pred: Any, *, drive: bool, min_conf: float = SCENE_RIBBON_MIN_CONF) -> str:
+    """Optionally replace ``pout``'s lane with the checkpoint prediction.
+
+    Returns ``shadow`` when drive is off (``pout`` unchanged), ``lane`` when
+    the prediction is usable, or ``stop`` when it is missing or low-confidence.
+    """
+    if not drive:
+        return "shadow"
+    from python.train.scene_lane_runtime import scene_lane_decision, straight_lane_path
+
+    lane_x, conf = _lane_from_filtered_state(pred)
+    if scene_lane_decision(lane_x, conf, min_conf=min_conf) != "lane":
+        pout.path_ego = []
+        pout.lane_conf = float(conf)
+        try:
+            pout.path_conf = min(float(getattr(pout, "path_conf", 0.0) or 0.0), float(conf))
+        except (TypeError, ValueError):
+            pout.path_conf = float(conf)
+        pout.lane_source = "scene_ckpt/stop"
+        pout.path_debug_preview = False
+        return "stop"
+    pout.path_ego = straight_lane_path(float(lane_x))
+    pout.lane_conf = float(conf)
+    pout.path_conf = float(conf)
+    pout.lane_source = "scene_ckpt"
+    pout.path_debug_preview = False
+    return "lane"
+
+
+def cap_drive_speed(pout: Any, speed_mps: float) -> None:
+    """Conservative longitudinal cap. Does not raise an existing slower target."""
+    cap = float(speed_mps)
+    pl = dict(getattr(pout, "planner", None) or {})
+    raw = pl.get("target_v")
+    if raw is None:
+        pl["target_v"] = cap
+    else:
+        try:
+            pl["target_v"] = min(float(raw), cap)
+        except (TypeError, ValueError):
+            pl["target_v"] = cap
+    pout.planner = pl
+
+
+def _lane_from_filtered_state(pred: Any) -> tuple[float | None, float]:
+    """Read the metre the filtered state still publishes.
+
+    ``as_state`` drops centers and nulls ``lane_x`` below 0.40. This does not
+    fall back to the raw prediction, so a suppressed center cannot steer.
+    Missing centers or ``lane_x is None`` return no metre and do not raise.
+    """
+    if pred is None or not hasattr(pred, "as_state"):
+        return None, 0.0
+    try:
+        state = pred.as_state()
+    except Exception:
+        return None, 0.0
+    if not isinstance(state, dict):
+        return None, 0.0
+    try:
+        conf = float(state.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        conf = 0.0
+    centers = state.get("centers")
+    if not isinstance(centers, list) or not centers:
+        return None, conf
+    raw = state.get("lane_x")
+    if isinstance(raw, dict):
+        raw = raw.get("lane_x")
+    if raw is None:
+        return None, conf
+    try:
+        lane_x = float(raw)
+    except (TypeError, ValueError):
+        return None, conf
+    return lane_x, conf
+
+
+def scene_ckpt_as_state(
+    pred: Any,
+    *,
+    drive: bool,
+    engaged: bool,
+    steer: float | None,
+) -> dict[str, Any]:
+    """Fields written to ``gvd_state.json`` and clip ``state.jsonl``."""
+    if pred is not None and hasattr(pred, "as_state"):
+        out = dict(pred.as_state())
+    else:
+        out = {"lane_x": None, "confidence": 0.0, "canvas": None}
+    # The drive log stores the filtered metre, or null when the filter
+    # suppressed it. It does not copy the raw prediction back in.
+    published = out.get("lane_x")
+    if isinstance(published, dict):
+        out["lane_x"] = published.get("lane_x")
+    elif "lane_x" not in out:
+        out["lane_x"] = None
+    out["source"] = "scene_ckpt"
+    out["shadow"] = not bool(drive)
+    out["drive"] = bool(drive)
+    out["engaged"] = bool(engaged)
+    out["steer"] = None if steer is None else float(steer)
+    return out
+
+
 @dataclass
 class SceneCkptPred:
     lane_gt: np.ndarray | None = None
     lane_x: float | None = None
     confidence: float = 0.0
+    heading_err_rad: float | None = None
     canvas_shape: tuple[int, ...] | None = None
     ckpt: str = ""
     detect: dict[str, Any] | None = None
@@ -109,10 +226,39 @@ class SceneCkptPred:
         filtered["confidence"] = conf
         filtered["caption"] = scene_ckpt_caption(conf)
         filtered["canvas"] = body["canvas"]
+        # #191 heading is metadata, not a drawable. It is not a steering source.
+        if self.heading_err_rad is not None:
+            try:
+                heading = float(self.heading_err_rad)
+            except (TypeError, ValueError):
+                heading = None
+            if heading is not None and heading == heading:
+                filtered["heading_err_rad"] = heading
         return filtered
 
 
-def draw_scene_ckpt_overlay(frame: np.ndarray | None, pred: SceneCkptPred | None) -> np.ndarray | None:
+def scene_ckpt_overlay_caption(pred: SceneCkptPred | None, *, drive: bool = False) -> str:
+    """Caption drawn by ``draw_scene_ckpt_overlay``. Pure so tests can lock the kind.
+
+    Low confidence is always ``LOW``, even when drive is on: the drive path has
+    already returned stop below SCENE_RIBBON_MIN_CONF. High confidence is
+    ``DRIVE`` only when drive is on; otherwise ``SHADOW``.
+    """
+    if pred is None:
+        return "SHADOW"
+    cap = scene_ckpt_caption(pred.confidence)  # SHADOW or LOW
+    kind = "DRIVE" if (drive and cap == "SHADOW") else cap
+    if pred.lane_x is not None and kind in ("SHADOW", "DRIVE"):
+        return f"{kind} lane_x={float(pred.lane_x):+.2f}m conf={float(pred.confidence):.2f}"
+    return f"{kind} conf={float(pred.confidence):.2f}"
+
+
+def draw_scene_ckpt_overlay(
+    frame: np.ndarray | None,
+    pred: SceneCkptPred | None,
+    *,
+    drive: bool = False,
+) -> np.ndarray | None:
     """Paint the predicted lane-center path on a camera frame. Does not modify ``frame``.
 
     No picture: return ``frame`` unchanged (including None). Callers can always
@@ -127,13 +273,7 @@ def draw_scene_ckpt_overlay(frame: np.ndarray | None, pred: SceneCkptPred | None
         return out
     color = overlay_bgr("shadow")
     h, w = int(out.shape[0]), int(out.shape[1])
-    caption = "SHADOW"
-    if pred is not None:
-        cap = scene_ckpt_caption(pred.confidence)
-        if pred.lane_x is not None and cap == "SHADOW":
-            caption = f"SHADOW lane_x={float(pred.lane_x):+.2f}m conf={float(pred.confidence):.2f}"
-        else:
-            caption = f"{cap} conf={float(pred.confidence):.2f}"
+    caption = scene_ckpt_overlay_caption(pred, drive=drive)
     cv2.putText(out, caption, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
     # Solid swatch so tests (and a clip) can see the mark without anti-alias blending.
     cv2.rectangle(out, (12, 36), (40, 56), color, -1)
@@ -248,10 +388,16 @@ class SceneCkptRuntime:
         if raw is None:
             return SceneCkptPred(canvas_shape=shape, ckpt=self.path.name, detect=detect)
         vec = raw.detach().float().cpu().numpy().reshape(-1).astype(np.float32)
+        heading = None
+        if vec.size >= 2:
+            raw_h = float(vec[-2])
+            if raw_h == raw_h:
+                heading = raw_h
         return SceneCkptPred(
             lane_gt=vec,
             lane_x=lane_x_from_vector(vec),
             confidence=confidence_from_vector(vec),
+            heading_err_rad=heading,
             canvas_shape=shape,
             ckpt=self.path.name,
             detect=detect,

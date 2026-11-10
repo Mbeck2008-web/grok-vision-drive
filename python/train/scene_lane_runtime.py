@@ -8,6 +8,7 @@ since the previous strip.
 
 from __future__ import annotations
 
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -77,7 +78,8 @@ def scene_lane_decision(
         x = float(lane_x)
     except (TypeError, ValueError):
         return "stop"
-    if conf != conf or x != x or conf < float(min_conf):
+    # NaN and ±inf are not usable: ±inf would full-lock through path_steer_from_ego.
+    if not math.isfinite(conf) or not math.isfinite(x) or conf < float(min_conf):
         return "stop"
     return "lane"
 

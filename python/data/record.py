@@ -174,6 +174,8 @@ class ClipRecorder:
             "detector": state.get("detector"),
             "cmd_reason": state.get("cmd_reason"),
         }
+        if state.get("scene_ckpt") is not None:
+            slim["scene_ckpt"] = state.get("scene_ckpt")
         fr = RingFrame(t=t, jpeg=jpeg, state=slim)
         self._buf.append(fr)
         self._bytes += fr.nbytes

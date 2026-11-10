@@ -2371,10 +2371,10 @@ def resolve_backend_name(requested: str | None = None) -> str:
     return "stub"
 
 
-def make_backend(name: str | None = None) -> CameraBackend:
+def make_backend(name: str | None = None, long_side: int | None = None) -> CameraBackend:
     resolved = resolve_backend_name(name)
     if resolved == "beamngpy":
-        return BeamNGPyBackend()
+        return BeamNGPyBackend(long_side=long_side)
     if resolved == "window":
-        return WindowBackend()
-    return StubBackend()
+        return WindowBackend(long_side=long_side)
+    return StubBackend(long_side=long_side)

@@ -541,6 +541,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip (and log) an epoch checkpoint that would leave less than this many GB free. Default 8.",
     )
     parser.add_argument(
+        "--exp-ssl-pretrain",
+        action="store_true",
+        help=(
+            "EXPERIMENT (off by default): self-supervised stem pretraining on train frames "
+            "only (never holdout). Writes stem weights for --init-stem."
+        ),
+    )
+    parser.add_argument(
+        "--init-stem",
+        default="",
+        help="Load stem weights from a gvd-ssl-stem-1 npz before supervised training.",
+    )
+    parser.add_argument(
+        "--exp-ssl-out",
+        default="",
+        help="Where --exp-ssl-pretrain writes stem weights (npz). Required with that flag.",
+    )
+    parser.add_argument(
         "--exp-active-subset",
         action="store_true",
         help=(
@@ -2259,6 +2277,7 @@ def train_directory(
     ctl_loss: str = "huber",
     val_worst: int = VAL_WORST_N,
     val_worst_png: bool = False,
+    init_stem: str | Path | None = None,
     exp_active_subset: bool = False,
     exp_active_hard_frac: float = 0.3,
     exp_active_random_floor: float = 0.1,
@@ -2669,6 +2688,11 @@ def train_directory(
 
     device = holder["device"]
     net = holder["net"]
+    if init_stem:
+        from python.train.exp_ssl import load_stem_into_net
+
+        load_stem_into_net(net, init_stem)
+        print(f"[GVD] init-stem loaded {init_stem}", flush=True)
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
     cuda_graph_runner = None
@@ -3822,6 +3846,60 @@ def main(argv: list[str] | None = None) -> None:
             if refused:
                 print(f"[GVD] scene train: {refused}", flush=True)
                 sys.exit(2)
+        if bool(getattr(args, "exp_ssl_pretrain", False)):
+            from python.data.raw_frames import refuse_lossy
+            from python.train.exp_ssl import SslError, run_ssl_pretrain, ssl_rows_from_split
+            from python.train.scene_net import SceneNet
+            from python.train.strip_sources import load_multi_source_rows
+
+            out = str(getattr(args, "exp_ssl_out", "") or "")
+            if not out:
+                print("[GVD] --exp-ssl-pretrain needs --exp-ssl-out", flush=True)
+                sys.exit(2)
+            if not torch_ready():
+                print("[GVD] scene train needs PyTorch")
+                sys.exit(2)
+            try:
+                for one in strip_roots:
+                    refuse_lossy(one)
+                state_rows, source_meta = load_multi_source_rows(strip_roots, holdout_source=holdout_root)
+                train_rows = ssl_rows_from_split(
+                    state_rows,
+                    source_meta,
+                    holdout_blocks=resolve_holdout_blocks(args.holdout_blocks),
+                )
+                net = SceneNet(cams=cam_names, scale=float(args.scale)).train()
+
+                def _ssl_image(row):
+                    loaded = _frame_row(
+                        Path(row["source_root"]) if row.get("source_root") else holdout_root,
+                        row,
+                        cams=tuple(cam_names),
+                        scale=float(args.scale),
+                    )
+                    if loaded is None:
+                        return None
+                    frame, _meta = loaded
+                    return frame
+
+                stats = run_ssl_pretrain(
+                    net,
+                    train_rows,
+                    image_fn=_ssl_image,
+                    out_path=out,
+                    lr=float(args.lr),
+                    seed=int(args.seed),
+                    epochs=int(args.epochs),
+                )
+            except SslError as exc:
+                print(f"[GVD] exp-ssl-pretrain: {exc}", flush=True)
+                sys.exit(2)
+            print(
+                f"[GVD] exp-ssl-pretrain wrote {out} n={int(stats['n'])} "
+                f"loss={float(stats['last_loss']):.6f}",
+                flush=True,
+            )
+            return
         if not torch_ready():
             print("[GVD] scene train needs PyTorch")
             sys.exit(2)
@@ -3877,6 +3955,7 @@ def main(argv: list[str] | None = None) -> None:
                 exp_active_hard_frac=float(getattr(args, "exp_active_hard_frac", 0.3)),
                 exp_active_random_floor=float(getattr(args, "exp_active_random_floor", 0.1)),
                 grad_ckpt=bool(args.grad_ckpt),
+                init_stem=str(getattr(args, "init_stem", "") or "") or None,
                 pause_dir=pause_dir,
                 exact_epochs=args.exact_epochs,
                 val_worst=int(args.val_worst),

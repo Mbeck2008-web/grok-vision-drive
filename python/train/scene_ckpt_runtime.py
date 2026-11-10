@@ -17,7 +17,9 @@ from python.debug.lane_targets import (
     lane_x_from_vector,
 )
 from python.viz.scene_ribbon import (
+    RIBBON_BGR,
     SCENE_RIBBON_MIN_CONF,
+    paint_tapered_ribbon,
     scene_ckpt_caption,
     scene_ckpt_centers,
     scene_ckpt_ribbon_polyline,
@@ -179,14 +181,11 @@ def draw_scene_ckpt_overlay(frame: np.ndarray | None, pred: SceneCkptPred | None
         return out
     centers = scene_ckpt_centers(pred.lane_gt)
     poly = scene_ckpt_ribbon_polyline(centers, pred.confidence)
-    ribbon = (234, 126, 61)  # #3d7eea on the windshield overlay
-    pts: list[tuple[int, int]] = []
-    for p in poly:
-        uv = project_main_ground(float(p["x"]), float(p["y"]), w, h)
-        if uv is not None:
-            pts.append(uv)
-    if len(pts) >= 2:
-        cv2.polylines(out, [np.array(pts, dtype=np.int32)], False, ribbon, 3, cv2.LINE_AA)
+
+    def _project(x: float, y: float) -> tuple[int, int] | None:
+        return project_main_ground(x, y, w, h)
+
+    paint_tapered_ribbon(out, poly, _project, RIBBON_BGR)
     return out
 
 

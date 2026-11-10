@@ -48,6 +48,78 @@ def check_projection_monotonic() -> None:
     print("projection: 5/10/20/30 m farther=higher and right bend moves right OK")
 
 
+def check_spline_through_knots() -> None:
+    """The curve hits every finite center and stops at the last one."""
+    from python.viz.scene_ribbon import SCENE_RIBBON_STEP_M, scene_ckpt_centers, scene_ckpt_ribbon_polyline
+
+    centers = scene_ckpt_centers(_lane_gt([0.0, 0.15, 1.1, 2.6], 0.92))
+    poly = scene_ckpt_ribbon_polyline(centers, 0.92)
+    assert len(poly) >= 2
+    for knot in centers:
+        assert any(abs(p["y"] - knot["y"]) <= 1e-6 and abs(p["x"] - knot["x"]) <= 1e-5 for p in poly), knot
+    last_y = centers[-1]["y"]
+    assert max(p["y"] for p in poly) <= last_y + 1e-6
+    assert abs(poly[-1]["y"] - last_y) <= 1e-6
+    assert abs(poly[0]["y"] - centers[0]["y"]) <= 1e-6
+    ys = [p["y"] for p in poly]
+    gaps = [b - a for a, b in zip(ys, ys[1:])]
+    assert gaps and max(gaps) <= SCENE_RIBBON_STEP_M + 1e-6, max(gaps)
+    assert all(g > 1e-9 for g in gaps)
+
+    # 30 m missing: the stroke ends at 20 m. No sample is invented out to 30.
+    short = scene_ckpt_centers(_lane_gt([0.0, 0.4, 1.2, float("nan")], 0.9))
+    short_poly = scene_ckpt_ribbon_polyline(short, 0.9)
+    assert short_poly
+    assert abs(short_poly[-1]["y"] - 20.0) <= 1e-6
+    assert all(p["y"] <= 20.0 + 1e-6 for p in short_poly)
+    for knot in short:
+        assert any(abs(p["y"] - knot["y"]) <= 1e-6 and abs(p["x"] - knot["x"]) <= 1e-5 for p in short_poly)
+
+    # A hole at 10 m is two separate runs. Nothing is drawn across 5 m to 20 m.
+    hole = scene_ckpt_centers(_lane_gt([0.2, float("nan"), 1.5, 2.2], 0.9))
+    hole_poly = scene_ckpt_ribbon_polyline(hole, 0.9)
+    hole_ys = [p["y"] for p in hole_poly]
+    assert hole_ys
+    assert all(y <= 5.0 + 1e-3 or y >= 20.0 - 1e-3 for y in hole_ys), hole_ys
+    assert max(hole_ys) <= 30.0 + 1e-6
+    print(
+        f"spline: {len(poly)} samples, step<={SCENE_RIBBON_STEP_M} m, "
+        "through every knot, stop at last finite OK"
+    )
+
+
+def check_no_overshoot() -> None:
+    """Polyline samples stay inside each successive knot pair's x-span (PCHIP).
+
+    Catmull-Rom overshoots the plateau [0,0,1,1] to about [-0.074, 1.074] and
+    must fail this check. Fritsch-Carlson PCHIP must pass both fixtures.
+    """
+    from python.viz.scene_ribbon import scene_ckpt_centers, scene_ckpt_ribbon_polyline
+
+    fixtures = (
+        [0.0, 0.0, 1.0, 1.0],
+        [0.0, 2.0, -1.0, 3.0],
+    )
+    for xs in fixtures:
+        centers = scene_ckpt_centers(_lane_gt(xs, 0.9))
+        assert [c["y"] for c in centers] == [5.0, 10.0, 20.0, 30.0], centers
+        assert [c["x"] for c in centers] == xs, centers
+        poly = scene_ckpt_ribbon_polyline(centers, 0.9)
+        assert poly, xs
+        for a, b in zip(centers, centers[1:]):
+            lo = min(a["x"], b["x"]) - 1e-6
+            hi = max(a["x"], b["x"]) + 1e-6
+            y0, y1 = a["y"], b["y"]
+            mid = [p for p in poly if y0 - 1e-9 <= p["y"] <= y1 + 1e-9]
+            assert mid, (xs, a, b)
+            for p in mid:
+                assert lo <= p["x"] <= hi, (
+                    f"overshoot on {xs}: sample {p} outside knot span "
+                    f"[{a['x']}, {b['x']}] at y in [{y0}, {y1}]"
+                )
+    print("no-overshoot: plateau [0,0,1,1] and zigzag [0,2,-1,3] stay in-span OK")
+
+
 def check_ribbon_honesty() -> None:
     from python.train.scene_ckpt_runtime import SceneCkptPred
     from python.viz.scene_ribbon import scene_ckpt_centers, scene_ckpt_ribbon_polyline
@@ -343,6 +415,8 @@ def _once_blend_ms(shape: tuple[int, ...], nseg: int = 36) -> float:
 
 def main() -> None:
     check_projection_monotonic()
+    check_spline_through_knots()
+    check_no_overshoot()
     check_ribbon_honesty()
     check_overlay_and_command()
     check_stage_ribbon_and_no_gt()

@@ -52,7 +52,7 @@ from python.viz.lane_roles import classify_lane_roles
 from python.runtime.state_io import steer_preview_path_ego
 from python.viz.forecast import predict_modes
 from python.viz.nerd import NERD_WIDTH, hit_test, render_panel, scene_note
-from python.viz.scene_ribbon import scene_ckpt_caption, scene_ckpt_ribbon_polyline
+from python.viz.scene_ribbon import RIBBON_BGR, paint_tapered_ribbon, scene_ckpt_caption, scene_ckpt_ribbon_polyline
 
 VOID = (10, 8, 7)  # #07080a
 PAPER = (225, 230, 232)
@@ -1721,15 +1721,11 @@ def _draw_scene_ckpt_ribbon(img: np.ndarray, state: dict[str, Any], cam: Cam) ->
     poly = scene_ckpt_ribbon_polyline(centers, conf)
     if len(poly) < 2:
         return
-    _draw_filled_corridor(
-        img, poly, max(conf, 0.25), cam,
-        half_w=0.55,
-        intent=1.0,
-        preview=False,
-        gain=1.0,
-        fill=PATH_BLUE,
-        connect_origin=False,
-    )
+
+    def _project(x: float, y: float) -> tuple[int, int]:
+        return cam.project(x, y, 0.0)
+
+    paint_tapered_ribbon(img, poly, _project, RIBBON_BGR)
 
 
 def render_stage(

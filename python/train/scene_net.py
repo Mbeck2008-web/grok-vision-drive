@@ -1522,6 +1522,7 @@ if torch is not None:
             cond_dim: int = 0,
             aux_sensors: bool = False,
             road_edge: bool = False,
+            route_cond: bool = False,
             *,
             stem_channels: tuple[int, ...] | None = None,
             gru_hidden: int | None = None,
@@ -1587,6 +1588,15 @@ if torch is not None:
                 self.road_edge_head = nn.Linear(hidden, int(ROAD_EDGE_DIM))
                 arch = getattr(self, "pause_arch", checkpoint_arch(self.cams))
                 self.pause_arch = arch + f":road_edge={int(ROAD_EDGE_DIM)}"
+            # --route-cond: additive nav-command embedding. Off by default so
+            # old checkpoints load unchanged. This is not --ctl-cond.
+            self.route_cond = bool(route_cond)
+            if self.route_cond:
+                from python.train.route_cond import ROUTE_COND_DIM
+
+                self.route_proj = nn.Linear(int(ROUTE_COND_DIM), hidden)
+                arch = getattr(self, "pause_arch", checkpoint_arch(self.cams))
+                self.pause_arch = arch + f":route_cond={int(ROUTE_COND_DIM)}"
             if self.preset not in ("", "small"):
                 arch = getattr(self, "pause_arch", checkpoint_arch(self.cams))
                 self.pause_arch = arch + f":preset={self.preset}"
@@ -1603,7 +1613,7 @@ if torch is not None:
             )
 
         def forward(
-            self, strip: Any, dt: Any, state: SceneState, ages: Any = None, cond: Any = None
+            self, strip: Any, dt: Any, state: SceneState, ages: Any = None, cond: Any = None, route: Any = None
         ) -> tuple[ScenePrediction, SceneState]:
             """One strip, seconds since the previous strip, and the GRU state.
 
@@ -1613,15 +1623,15 @@ if torch is not None:
             ``cond_dim`` net needs ``cond`` (``ctl_targets.COND_FIELDS``).
             """
             image = _strip_nchw(strip, width=self.canvas_w, height=self.canvas_h)
-            pred, new_state = self._forward_batched(image, dt, state, ages, cond)
+            pred, new_state = self._forward_batched(image, dt, state, ages, cond, route)
             return _prediction_at(pred, 0), new_state
 
         def forward_batch(
-            self, strip: Any, dt: Any, state: SceneState, ages: Any = None, cond: Any = None
+            self, strip: Any, dt: Any, state: SceneState, ages: Any = None, cond: Any = None, route: Any = None
         ) -> tuple[ScenePrediction, SceneState]:
             """Several strips in one step. Outputs keep the batch dimension."""
             image = _strip_nchw(strip, allow_batch=True, width=self.canvas_w, height=self.canvas_h)
-            return self._forward_batched(image, dt, state, ages, cond)
+            return self._forward_batched(image, dt, state, ages, cond, route)
 
         def forward_window(
             self,
@@ -1630,6 +1640,7 @@ if torch is not None:
             state: SceneState,
             ages: Any = None,
             cond: Any = None,
+            route: Any = None,
         ) -> tuple[ScenePrediction, SceneState, SceneState]:
             """One stem launch and one GRU over T ticks.
 
@@ -1661,6 +1672,7 @@ if torch is not None:
                 raise ValueError("forward_window needs T >= 1")
             cond = _window_cond(self, cond, image, batch, ticks)
             ages_col = _window_ages(self, ages, image, batch, ticks)
+            route = _window_route(self, route, image, batch, ticks)
             state = _state_on(state, image[:batch] if batch > 0 else image)
             token, main_feat = self._encode(image)
             token = token.reshape(batch, ticks, 1, token.shape[-1]).squeeze(2)
@@ -1693,6 +1705,7 @@ if torch is not None:
                     residual = self.skip(residual)
                 feats.append(gru_out[:, tick, :] + residual)
             feat = torch.stack(feats, dim=1).reshape(batch * ticks, -1)
+            feat = _apply_route(self, feat, route)
             pred = _heads_batch(self, feat, cond)
             if bool(getattr(self, "aux_sensors", False)) and main_feat is not None:
                 import torch.nn.functional as functional
@@ -1707,9 +1720,10 @@ if torch is not None:
             return pred, end_state, end_state
 
         def _forward_batched(
-            self, image: Any, dt: Any, state: SceneState, ages: Any = None, cond: Any = None
+            self, image: Any, dt: Any, state: SceneState, ages: Any = None, cond: Any = None, route: Any = None
         ) -> tuple[ScenePrediction, SceneState]:
             cond = _cond_rows(self, cond, image)
+            route = _route_rows(self, route, image)
             state = _state_on(state, image)
             token, main_feat = self._encode(image)
             if self.cam_age:
@@ -1733,6 +1747,7 @@ if torch is not None:
             if self.skip is not None:
                 residual = self.skip(residual)
             feat = gru_out[:, 0, :] + residual
+            feat = _apply_route(self, feat, route)
             pred = _heads_batch(self, feat, cond)
             if bool(getattr(self, "aux_sensors", False)) and main_feat is not None:
                 import torch.nn.functional as functional
@@ -1783,6 +1798,51 @@ if torch is not None:
         if not bool(getattr(net, "road_edge", False)):
             return None
         return net.road_edge_head(feat)
+
+    def _apply_route(net: SceneNet, feat: Any, route: Any) -> Any:
+        if not bool(getattr(net, "route_cond", False)):
+            return feat
+        return feat + net.route_proj(route)
+
+    def _route_rows(net: SceneNet, route: Any, image: Any) -> Any:
+        """``(B, 5)`` nav command, or None when the net has no route input. Missing route is follow."""
+        if not bool(getattr(net, "route_cond", False)):
+            if route is not None:
+                raise ValueError("this scene net has no route-cond input; route was given")
+            return None
+        from python.train.route_cond import ROUTE_COND_DIM, encode_route
+
+        dim = int(ROUTE_COND_DIM)
+        width = int(image.shape[0])
+        if route is None:
+            follow = encode_route("follow", None)
+            route = torch.as_tensor(follow, device=image.device, dtype=image.dtype).reshape(1, dim)
+            return route.expand(width, dim).contiguous()
+        if not torch.is_tensor(route):
+            route = torch.as_tensor(np.asarray(route, dtype=np.float32))
+        route = route.to(device=image.device, dtype=image.dtype).reshape(-1, dim)
+        if int(route.shape[0]) == 1 and width != 1:
+            route = route.expand(width, dim)
+        if int(route.shape[0]) != width:
+            raise ValueError(f"route batch {int(route.shape[0])} does not match strips {width}")
+        return route
+
+    def _window_route(net: SceneNet, route: Any, image: Any, batch: int, ticks: int) -> Any:
+        if not bool(getattr(net, "route_cond", False)):
+            if route is not None:
+                raise ValueError("this scene net has no route-cond input; route was given")
+            return None
+        from python.train.route_cond import ROUTE_COND_DIM, encode_route
+
+        dim = int(ROUTE_COND_DIM)
+        if route is None:
+            follow = encode_route("follow", None)
+            route = torch.as_tensor(follow, device=image.device, dtype=image.dtype).reshape(1, 1, dim)
+            return route.expand(batch, ticks, dim).reshape(batch * ticks, dim).contiguous()
+        if not torch.is_tensor(route):
+            route = torch.as_tensor(np.asarray(route, dtype=np.float32))
+        route = route.to(device=image.device, dtype=image.dtype).reshape(batch, ticks, dim)
+        return route.reshape(batch * ticks, dim)
 
     def _cond_rows(net: SceneNet, cond: Any, image: Any) -> Any:
         """``(B, cond_dim)`` on the image's device, or None for a net without cond. Missing cond is an error."""
@@ -1971,12 +2031,13 @@ if torch is not None:
             extra = list(extra)
             ages = extra.pop(0) if bool(getattr(self.net, "cam_age", False)) else None
             cond = extra.pop(0) if int(getattr(self.net, "cond_dim", 0) or 0) else None
+            route = extra.pop(0) if bool(getattr(self.net, "route_cond", False)) else None
             if extra:
                 raise ValueError(f"unexpected extra ONNX inputs: {len(extra)}")
-            if ages is None and cond is None:
+            if ages is None and cond is None and route is None:
                 pred, state = self.net(strip, dt, state_in)
             else:
-                pred, state = self.net(strip, dt, state_in, ages, cond)
+                pred, state = self.net(strip, dt, state_in, ages, cond, route)
             fields = tuple(getattr(pred, name) for name in OUTPUT_FIELDS)
             if bool(getattr(self.net, "ctl", False)):
                 fields = fields + tuple(getattr(pred, name).reshape(1, CTL_K) for name in CTL_OUTPUT_FIELDS)
@@ -1996,6 +2057,8 @@ if torch is not None:
             input_names.append("ages")
         if int(getattr(model, "cond_dim", 0) or 0):
             input_names.append("cond")
+        if bool(getattr(model, "route_cond", False)):
+            input_names.append("route")
         export_kwargs = dict(
             input_names=input_names,
             output_names=output_names,
@@ -2068,6 +2131,10 @@ def cpu_export_inputs(net: Any, zeros: Any) -> tuple[Any, tuple[Any, ...]]:
     cond_dim = int(getattr(model, "cond_dim", 0) or 0)
     if cond_dim:
         args = args + (zeros(1, cond_dim, device="cpu"),)
+    if bool(getattr(model, "route_cond", False)):
+        from python.train.route_cond import ROUTE_COND_DIM
+
+        args = args + (zeros(1, int(ROUTE_COND_DIM), device="cpu"),)
     return model, args
 
 

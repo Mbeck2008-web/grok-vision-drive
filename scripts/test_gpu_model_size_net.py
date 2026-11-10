@@ -40,6 +40,43 @@ def check_default_path_parity() -> None:
     assert sum(p.numel() for p in full.parameters()) == architecture_parameter_count()
 
 
+
+def check_ckpt_meta_matrix() -> None:
+    """Old / preset-only / route-cond-only / both must all rebuild correctly."""
+    old = build_net({"cams": ["main"], "scale": 1.0})
+    assert old.preset == "small"
+    assert old.gru_hidden == 512
+    assert not bool(getattr(old, "route_cond", False))
+    assert not hasattr(old, "route_proj")
+    assert ":preset=" not in str(getattr(old, "pause_arch", ""))
+    assert ":route_cond=" not in str(getattr(old, "pause_arch", ""))
+
+    preset_only = build_net({"preset": "tiny", "cams": ["main"], "scale": 1.0, "backbone": "scratch"})
+    assert preset_only.preset == "tiny"
+    assert preset_only.gru_hidden == 256
+    assert not bool(preset_only.route_cond)
+    assert str(preset_only.pause_arch).endswith(":preset=tiny")
+    assert ":route_cond=" not in str(preset_only.pause_arch)
+
+    route_only = build_net({"cams": ["main"], "scale": 1.0, "route_cond": True})
+    assert route_only.preset == "small"
+    assert route_only.gru_hidden == 512
+    assert bool(route_only.route_cond)
+    assert hasattr(route_only, "route_proj")
+    assert ":route_cond=" in str(route_only.pause_arch)
+    assert ":preset=" not in str(route_only.pause_arch)
+
+    both = build_net(
+        {"preset": "tiny", "cams": ["main"], "scale": 1.0, "backbone": "scratch", "route_cond": True}
+    )
+    assert both.preset == "tiny"
+    assert both.gru_hidden == 256
+    assert bool(both.route_cond)
+    assert hasattr(both, "route_proj")
+    assert ":route_cond=" in str(both.pause_arch)
+    assert str(both.pause_arch).endswith(":preset=tiny")
+
+
 def check_preset_roundtrip_and_mismatch(tmp: Path) -> None:
     torch.manual_seed(1)
     tiny = SceneNet(cams=("main",), **scene_net_kwargs("tiny"))
@@ -80,6 +117,7 @@ def main() -> None:
     import tempfile
 
     check_default_path_parity()
+    check_ckpt_meta_matrix()
     with tempfile.TemporaryDirectory() as tmp:
         check_preset_roundtrip_and_mismatch(Path(tmp))
     print("test_gpu_model_size_net: ok")

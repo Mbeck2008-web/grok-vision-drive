@@ -12,7 +12,7 @@ HUD_TAG = "CONF GATE OFF"
 STARTUP_WARNING = (
     "[GVD] WARNING: --no-conf-gate: confidence vetoes are OFF; "
     "low lane/path/scene confidence will not block Engage or force a hold/stop. "
-    "AEB, heartbeat, missing-frame stops, user disengage, and Soft Esc stay on."
+    "AEB, heartbeat, frame-staleness, missing-frame stops, user disengage, and Soft Esc stay on."
 )
 
 

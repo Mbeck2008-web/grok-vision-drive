@@ -11,7 +11,7 @@ Add `--no-conf-gate` to `python.run_vision`. When set, low perception / lane / p
 - Do not change visualizer ribbon styling, dimming, or scene-ckpt overlay captions (another branch owns that).
 - Do not disable AEB, heartbeat / watchdog, missing-frame / no-main stops, user disengage, or Soft Esc.
 - Do not add a yaml/env silent on-switch. The only enable path is the CLI flag (default `store_true` off).
-- Frame-staleness (`--max-frame-age-ms` from PR #201) is **not on this base**. If that gate lands later, it must stay ON regardless of this flag. This PR does not invent a frame-age gate.
+- Frame-staleness (`--max-frame-age-ms` / `gate_drive_command` from PR #201, now on `main` @ `7ad9457`) must stay ON regardless of this flag. `--no-conf-gate` must not call, wrap, or parameterize `gate_drive_command`.
 
 ## Helper
 
@@ -53,6 +53,8 @@ Bypassing the helper reasons also means `should_disengage` is not set for `low_l
 - Flag: each conf veto is bypassed (steer / `reason==ok` / decision `lane` as appropriate; Engage not dropped).
 - Flag: AEB and heartbeat still stop / release.
 - Flag: missing `lane_x` still stops.
+- Flag: a stale or missing `captured_at` still becomes `frame_stale` with brake 1 and no steer.
+- AST: `gate_drive_command` and `python/runtime/frame_gate.py` do not mention `no_conf_gate`.
 - `build_parser().parse_args([])` has `no_conf_gate is False`; `parse_args(["--no-conf-gate"])` is True; neither raises.
 - AST: `evaluate_veto`, the modular `shadow_tick` branch, and `scene_lane_decision` call `conf_veto_blocks`.
 

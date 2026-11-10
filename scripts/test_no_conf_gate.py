@@ -253,6 +253,81 @@ def check_flag_parse() -> None:
     print("parser: default off; --no-conf-gate accepted without error OK")
 
 
+def check_frame_age_gate_still_fires() -> None:
+    """Low confidence may steer under the flag; a stale or missing stamp still stops."""
+    import math
+
+    from python.sensors.frame_slot import bundle_frame_age_s
+    from python.runtime.frame_gate import (
+        DEFAULT_MAX_FRAME_AGE_MS,
+        frame_is_stale,
+        gate_drive_command,
+    )
+    from python.sensors.cameras import CameraFrameBundle
+
+    tick = _tick(policy="shadow", lane_conf=0.05, path_conf=0.8, no_conf_gate=True)
+    assert tick.applied.reason == "ok", tick.applied
+    assert float(tick.applied.brake) < 0.5
+
+    missing = CameraFrameBundle(note="capture: waiting")
+    missing_age = bundle_frame_age_s(missing, now=100.0)
+    assert math.isinf(missing_age), missing_age
+    stopped, replaced = gate_drive_command(
+        tick.applied,
+        engaged=True,
+        stale=frame_is_stale(missing_age, DEFAULT_MAX_FRAME_AGE_MS),
+    )
+    assert replaced is True
+    assert stopped.reason == "frame_stale", stopped
+    assert float(stopped.steer) == 0.0 and float(stopped.throttle) == 0.0
+    assert float(stopped.brake) == 1.0
+
+    old_age = 1.0  # 1000 ms > 300 ms cap
+    assert frame_is_stale(old_age, DEFAULT_MAX_FRAME_AGE_MS) is True
+    stopped_old, replaced_old = gate_drive_command(
+        tick.applied,
+        engaged=True,
+        stale=frame_is_stale(old_age, DEFAULT_MAX_FRAME_AGE_MS),
+    )
+    assert replaced_old is True
+    assert stopped_old.reason == "frame_stale"
+    assert float(stopped_old.steer) == 0.0 and float(stopped_old.brake) == 1.0
+    print("flag on: missing/stale captured_at still yields frame_stale brake 1 no steer OK")
+
+
+def check_no_conf_gate_does_not_touch_frame_gate() -> None:
+    """--no-conf-gate must not wrap, parameterize, or edit gate_drive_command."""
+    import ast
+
+    frame_src = (ROOT / "python" / "runtime" / "frame_gate.py").read_text(encoding="utf-8")
+    assert "no_conf_gate" not in frame_src
+    assert "conf_veto" not in frame_src
+    assert "conf_gate" not in frame_src
+
+    helper_src = (ROOT / "python" / "runtime" / "conf_gate.py").read_text(encoding="utf-8")
+    assert "gate_drive_command" not in helper_src
+
+    run_src = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
+    tree = ast.parse(run_src)
+    seen = 0
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = ""
+        if isinstance(func, ast.Name):
+            name = func.id
+        elif isinstance(func, ast.Attribute):
+            name = func.attr
+        if name != "gate_drive_command":
+            continue
+        seen += 1
+        for keyword in node.keywords:
+            assert keyword.arg != "no_conf_gate", "gate_drive_command must not take no_conf_gate"
+    assert seen >= 1, "run_vision must still call gate_drive_command"
+    print("AST: --no-conf-gate does not touch gate_drive_command OK")
+
+
 def check_paths_call_helper() -> None:
     """The named veto functions must call conf_veto_blocks (mutation lock)."""
 
@@ -287,6 +362,8 @@ def main() -> None:
     check_aeb_and_heartbeat_still_stop()
     check_missing_lane_x_still_stops()
     check_flag_parse()
+    check_frame_age_gate_still_fires()
+    check_no_conf_gate_does_not_touch_frame_gate()
     check_paths_call_helper()
     print("test_no_conf_gate: all OK")
 

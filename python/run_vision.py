@@ -46,6 +46,7 @@ from python.sensors.tech import (
     run_probe,
 )
 from python.sensors.extras import ExtraSensors, load_sensors_config, nav_hint_from_bundle, write_sensors_snapshot
+from python.sensors.route_intent import merge_nav_intent
 from python.viz.foxglove_bridge import FoxgloveBridge
 from python.control.e2e import make_e2e
 from python.control.override import (
@@ -1480,6 +1481,7 @@ def main(clock=None) -> None:
                 # Tech attach has no gvd_ego.json; ego_fb stays None until Lua retail echo.
                 heading = nav_heading_from_sources(vdata, ego_fb)
                 st["nav"] = nav_hint_from_bundle(extras_bundle, heading_deg=heading)
+            st["nav"] = merge_nav_intent(st.get("nav") if isinstance(st.get("nav"), dict) else {}, None)
             st["sensors"] = extras_bundle.health()
             # Real planner path wins. The 36 m steer preview is only the empty-path stand-in.
             st["path_ego"] = list(pout.path_ego) if pout.path_ego else steer_preview_path_ego(steer, length_m=36.0)

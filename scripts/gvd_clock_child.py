@@ -11,6 +11,10 @@ starts the supervisor through this file. It installs, unedited:
   so the actuator's lua_bus check reads the sim wall like run_vision's own,
 * the ``actuate.time`` shim (``gvd_sim_clock.install_actuate_time_shim``): time/monotonic/
   perf_counter only, so actuate's stamps (gvd_cmd.json heartbeat_mtime, ...) are on the sim wall,
+* the frame-age ``time`` shim (``gvd_sim_clock.install_frame_age_time_shim``) on ``frame_slot``,
+  ``cameras`` and ``gvd_road_stub_child``, so frame stamps and ``bundle_frame_age_s`` read the
+  same sim clock (same-tick age is ~0; launch_window is NOT frame_stale coverage, see
+  test_frame_age_decision / test_frame_staleness),
 
 then calls ``run_vision.main(clock=PipeClock())``. ``PipeClock.sleep`` is the step barrier:
 it writes ``done N`` on the protocol pipe (the original stdout) and blocks on reading

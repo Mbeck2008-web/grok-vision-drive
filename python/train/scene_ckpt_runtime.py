@@ -132,15 +132,19 @@ def _can_fill_empty_plan(
     hitch: bool,
     frame_fresh: bool,
 ) -> bool:
-    """Install cruise only on a fresh unique colour frame, not a hitch replay."""
+    """Install cruise only on a fresh unique colour frame.
+
+    The repeated-buffer / stall guard is ``unique_gpu_n``: it must be a
+    positive ``int``. ``None`` and non-ints (``'x'``, ``1.5``) fail closed.
+    ``hitch`` is the Soft Esc / not-engaged grab note
+    (``soft_esc_colour=hitch``); that note only labels the grab and does
+    not mean a held frame.
+    """
     if hitch or not frame_fresh:
         return False
-    if unique_gpu_n is None:
+    if type(unique_gpu_n) is not int:
         return False
-    try:
-        return int(unique_gpu_n) > 0
-    except (TypeError, ValueError):
-        return False
+    return unique_gpu_n > 0
 
 
 def _cipv_id_of(track: Any) -> int | None:
@@ -294,27 +298,24 @@ def cap_drive_speed(
     """Conservative longitudinal cap. Does not raise an existing slower target.
 
     ``None`` means there is no speed plan. A literal ``0.0`` is a placeholder
-    only when AEB is not braking, no scene cut is recorded, and nothing was
-    seen (no ``cipv_id``, TTC, objects, tracks, or signs). A negative target
-    is a hold at 0, not a cruise. The placeholder is filled only on a fresh
-    unique colour frame (``unique_gpu_n > 0``, not a soft-esc hitch).
+    only when nothing was seen (no ``cipv_id``, TTC, AEB brake, scene cut,
+    objects, tracks, or signs). A negative target is a hold at 0, not a
+    cruise. The placeholder is filled only on a fresh unique colour frame
+    (``unique_gpu_n`` is a positive int). ``hitch`` is the Soft Esc /
+    not-engaged grab note, not a stall flag; a repeated buffer is refused
+    by ``unique_gpu_n``.
     """
     cap = float(speed_mps)
     pl = dict(getattr(pout, "planner", None) or {})
     raw = pl.get("target_v")
-    aeb = str(pl.get("aeb") or "off")
-    stop = str(pl.get("stop_reason") or "none")
     seen = _scene_seen(pout, pl)
-    can_fill = (
-        (not seen)
-        and aeb != "brake"
-        and stop in ("none", "", "None")
-        and _can_fill_empty_plan(unique_gpu_n=unique_gpu_n, hitch=hitch, frame_fresh=frame_fresh)
+    can_fill = (not seen) and _can_fill_empty_plan(
+        unique_gpu_n=unique_gpu_n, hitch=hitch, frame_fresh=frame_fresh
     )
     if raw is None:
         if can_fill:
             pl["target_v"] = cap
-        elif seen or aeb == "brake" or stop not in ("none", "", "None"):
+        elif seen:
             pl["target_v"] = 0.0
         pout.planner = pl
         return

@@ -163,9 +163,20 @@ def check_empty_modular_plan_gets_drive_cap() -> None:
     _lane_then_prepare(neg)
     assert float(neg.planner["target_v"]) == 0.0, neg.planner
 
+    # unique_gpu_n is the repeated-buffer / stall guard (fail-closed).
     repeated = _pout(planner={"aeb": "off", "target_v": 0.0, "ttc_lead": None, "stop_reason": "none"})
     _lane_then_prepare(repeated, unique_gpu_n=0)
     assert float(repeated.planner["target_v"]) == 0.0, repeated.planner
+    missing_unique = _pout(planner={"aeb": "off", "target_v": 0.0, "ttc_lead": None, "stop_reason": "none"})
+    _lane_then_prepare(missing_unique, unique_gpu_n=None)
+    assert float(missing_unique.planner["target_v"]) == 0.0, missing_unique.planner
+    nonint = _pout(planner={"aeb": "off", "target_v": 0.0, "ttc_lead": None, "stop_reason": "none"})
+    _lane_then_prepare(nonint, unique_gpu_n="x")
+    assert float(nonint.planner["target_v"]) == 0.0, nonint.planner
+    fractional = _pout(planner={"aeb": "off", "target_v": 0.0, "ttc_lead": None, "stop_reason": "none"})
+    _lane_then_prepare(fractional, unique_gpu_n=1.5)
+    assert float(fractional.planner["target_v"]) == 0.0, fractional.planner
+    # hitch=True is the Soft Esc / not-engaged grab note, not a stall flag.
     hitch = _pout(planner={"aeb": "off", "target_v": 0.0, "ttc_lead": None, "stop_reason": "none"})
     _lane_then_prepare(hitch, hitch=True)
     assert float(hitch.planner["target_v"]) == 0.0, hitch.planner

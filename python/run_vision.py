@@ -1428,6 +1428,9 @@ def main(clock=None) -> None:
                     if apply_scene_ckpt_lane(pout, ckpt_pred, drive=True, no_conf_gate=bool(getattr(args, "no_conf_gate", False))) == "stop":
                         ckpt_stop = True
                     else:
+                        # Soft Esc / not-engaged grab note, not a stall
+                        # flag (cameras.soft_esc_colour_main_only). The
+                        # repeated-buffer / stall guard is unique_gpu_n.
                         hitch = "soft_esc_colour=hitch" in str(getattr(bundle, "note", "") or "")
                         prepare_scene_ckpt_drive_speed(
                             pout,

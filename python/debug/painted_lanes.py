@@ -595,10 +595,11 @@ def _bars_from_frame(
     out: list[dict[str, Any]] = []
     for x0, y0, x1, y1 in zip(ax.tolist(), ay.tolist(), bx.tolist(), by.tolist()):
         x0, y0, x1, y1 = float(x0), float(y0), float(x1), float(y1)
+        # Keep only strokes that cross the ego centerline (x=0). Same-side
+        # curved or corner lane paint is not a stop bar, even when the local
+        # stroke is >= STOP_LINE_MIN_DEG off the current heading.
         if (x0 > 0.0) == (x1 > 0.0) and abs(x0) > 1e-6 and abs(x1) > 1e-6:
-            if min(abs(x0), abs(x1)) > SEARCH_M:
-                continue
-            y = y0 if abs(x0) < abs(x1) else y1
+            continue
         elif abs(x1 - x0) < 1e-9:
             y = 0.5 * (y0 + y1)
         else:

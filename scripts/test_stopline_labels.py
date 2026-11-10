@@ -115,15 +115,112 @@ def check_diagonal_guide_is_masked() -> None:
     print("  ~50 deg crossing paint is mask, not a lane and not a stop_line")
 
 
+def _left_curve(radius: float, ang1: float, n: int = 25, ang0: float = -0.3) -> list[dict]:
+    """Left-hand painted lane: centerline radius ``radius``, arc to ``ang1`` rad."""
+    def arc(r: float) -> dict:
+        pts = [
+            ((-radius + r * math.cos(ang)), r * math.sin(ang))
+            for ang in np.linspace(ang0, ang1, n)
+        ]
+        return _line(pts)
+    return [arc(radius - HALF), arc(radius + HALF)]
+
+
+def _corner_90(radius: float = 8.0, straight_end: float = 15.0, n_arc: int = 20) -> list[dict]:
+    """Straight painted lane, then a 90° left corner of the given radius."""
+    ys = list(np.arange(-10.0, straight_end + 0.01, 2.0))
+
+    def side(xoff: float, r_side: float) -> dict:
+        pts = [(xoff, y) for y in ys]
+        cx, cy = -radius, straight_end
+        for ang in np.linspace(0.0, math.pi / 2, n_arc)[1:]:
+            pts.append((cx + r_side * math.cos(ang), cy + r_side * math.sin(ang)))
+        return _line(pts)
+
+    return [side(-HALF, radius - HALF), side(HALF, radius + HALF)]
+
+
+def _main_painted_lanes_cls():
+    """PaintedLanes from origin/main (72b5854), for a bit-for-bit lane_at check."""
+    import importlib.util
+    import subprocess
+
+    sha = "72b58543941b4e3b68406fc9e12fcb0936594f2f"
+    src = subprocess.check_output(
+        ["git", "show", f"{sha}:python/debug/painted_lanes.py"],
+        cwd=str(ROOT),
+    )
+    path = Path(tempfile.mkdtemp()) / "painted_lanes_main.py"
+    path.write_bytes(src)
+    spec = importlib.util.spec_from_file_location("gvd_main_painted_lanes", path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.PaintedLanes
+
+
+def _lane_at_hex(lanes) -> list:
+    out = []
+    for item in lanes:
+        if item is None:
+            out.append(None)
+        else:
+            out.append(tuple(float(x).hex() for x in item))
+    return out
+
+
+def _assert_lane_at_matches_main(decals: list[dict]) -> None:
+    ours = PaintedLanes(decals).lane_at(*CAR)
+    theirs = _main_painted_lanes_cls()(decals).lane_at(*CAR)
+    assert _lane_at_hex(ours) == _lane_at_hex(theirs), (ours, theirs)
+
+
+def check_tight_curves_and_corner_are_not_stop_lines() -> None:
+    cases = [
+        ("r=20 m arc to 1.5 rad", _left_curve(20.0, 1.5)),
+        ("r=12 m through ~100 deg", _left_curve(12.0, math.radians(100.0))),
+        ("90 deg 8 m corner", _corner_90()),
+    ]
+    for name, decals in cases:
+        bars = PaintedLanes(decals).stop_lines_ahead(*CAR)
+        assert bars == [], (name, bars)
+        _assert_lane_at_matches_main(decals)
+        print(f"  {name}: no stop_line, lane_at matches main bit-for-bit")
+
+
 def check_writer_refuses_gt_jsonl() -> None:
+    import io
+    from contextlib import redirect_stdout
     import label_stoplines as ls
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         (root / "state.jsonl").write_text("{}\n", encoding="utf-8")
-        code = ls.main([str(root), "--out", "gt.jsonl"])
-        assert code == 2
-    print("  writer refuses to overwrite gt.jsonl")
+        decals = _through_road() + [_line([(-2.0, 15.0), (2.0, 15.0)])]
+        decal_path = root / "decals.json"
+        decal_path.write_text(json.dumps(decals), encoding="utf-8")
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = ls.main([str(root), "--decals", str(decal_path), "--out", "gt.jsonl"])
+        text = buf.getvalue()
+        assert code == 2, (code, text)
+        assert not (root / "gt.jsonl").exists(), "writer must not create gt.jsonl"
+        assert "refusing to overwrite" in text, text
+        assert "--decals is required" not in text, text
+
+        keep = b"KEEPME\n"
+        existing = root / "gt.jsonl"
+        existing.write_bytes(keep)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = ls.main([str(root), "--decals", str(decal_path), "--out", "gt.jsonl"])
+        text = buf.getvalue()
+        assert code == 2, (code, text)
+        assert existing.read_bytes() == keep
+        assert "refusing to overwrite" in text, text
+        assert "--decals is required" not in text, text
+    print("  writer refuses to overwrite gt.jsonl (with --decals; bytes unchanged)")
 
 
 def check_cli_sidecar() -> None:
@@ -157,6 +254,7 @@ def main() -> None:
     check_through_road_lane_gt_unchanged()
     check_stop_bar_is_labelled_not_a_lane()
     check_diagonal_guide_is_masked()
+    check_tight_curves_and_corner_are_not_stop_lines()
     check_writer_refuses_gt_jsonl()
     check_cli_sidecar()
     print("test_stopline_labels: OK")

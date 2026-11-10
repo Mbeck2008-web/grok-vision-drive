@@ -541,6 +541,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip (and log) an epoch checkpoint that would leave less than this many GB free. Default 8.",
     )
     parser.add_argument(
+        "--exp-distill-feats",
+        action="store_true",
+        help=(
+            "EXPERIMENT (off by default): train a tiny student on cached frozen teacher "
+            "tokens from --exp-distill-cache. Training only; not exported. Holdout rows "
+            "are never written into the cache."
+        ),
+    )
+    parser.add_argument(
+        "--exp-distill-cache",
+        default="",
+        help="Folder of a gvd-distill-feats-1 cache (tokens.npy + meta.json). Used with --exp-distill-feats.",
+    )
+    parser.add_argument(
+        "--exp-distill-teacher",
+        default="",
+        help="Required with --exp-distill-feats: teacher features file (gvd-distill-teacher-1 json/npz) or checkpoint. Missing teacher fails; never zeros.",
+    )
+    parser.add_argument(
         "--exp-ssl-pretrain",
         action="store_true",
         help=(
@@ -3803,6 +3822,83 @@ def main(argv: list[str] | None = None) -> None:
             if refused:
                 print(f"[GVD] scene train: {refused}", flush=True)
                 sys.exit(2)
+        if bool(getattr(args, "exp_distill_feats", False)):
+            from python.train.exp_distill import (
+                DistillError,
+                build_feat_cache,
+                encode_rows_to_cache,
+                load_feat_cache,
+                load_teacher,
+                run_student_epochs,
+                split_tagged_rows,
+            )
+            from python.data.raw_frames import refuse_lossy
+            from python.train.strip_sources import load_multi_source_rows
+
+            cache_dir = str(getattr(args, "exp_distill_cache", "") or "")
+            teacher_path = str(getattr(args, "exp_distill_teacher", "") or "")
+            if not cache_dir:
+                print("[GVD] --exp-distill-feats needs --exp-distill-cache", flush=True)
+                sys.exit(2)
+            if not teacher_path:
+                print(
+                    "[GVD] --exp-distill-feats needs --exp-distill-teacher "
+                    "(features file or checkpoint); refusing zero targets",
+                    flush=True,
+                )
+                sys.exit(2)
+            if not torch_ready():
+                print("[GVD] scene train needs PyTorch")
+                sys.exit(2)
+            try:
+                teacher = load_teacher(teacher_path)
+                for one in strip_roots:
+                    refuse_lossy(one)
+                state_rows, source_meta = load_multi_source_rows(strip_roots, holdout_source=holdout_root)
+                train_rows, holdout_rows = split_tagged_rows(
+                    state_rows,
+                    source_meta,
+                    holdout_blocks=resolve_holdout_blocks(args.holdout_blocks),
+                )
+                written = build_feat_cache(
+                    cache_dir,
+                    train_rows,
+                    encode=teacher.encode,
+                    target_fn=teacher.target,
+                    token_dim=int(getattr(teacher, "token_dim", 64) or 64),
+                )
+                cache = load_feat_cache(cache_dir)
+                holdout = None
+                if holdout_rows:
+                    holdout = encode_rows_to_cache(
+                        holdout_rows,
+                        encode=teacher.encode,
+                        target_fn=teacher.target,
+                        token_dim=int(cache.meta.get("token_dim") or 64),
+                    )
+                stats = run_student_epochs(
+                    cache,
+                    target_fn=lambda row_i, feat_cache: feat_cache.target(row_i),
+                    epochs=int(args.epochs),
+                    lr=float(args.lr),
+                    seed=int(args.seed),
+                    holdout=holdout,
+                )
+            except DistillError as exc:
+                print(f"[GVD] exp-distill-feats: {exc}", flush=True)
+                sys.exit(2)
+            hold_txt = ""
+            if "holdout_mae" in stats:
+                hold_txt = f" holdout_mae={float(stats['holdout_mae']):.6f} holdout_n={int(stats['holdout_n'])}"
+                if stats.get("holdout_note"):
+                    hold_txt += f" holdout_note={stats['holdout_note']}"
+            print(
+                f"[GVD] exp-distill-feats n={int(stats['n'])} written={len(written)} "
+                f"epochs={int(stats['epochs'])} last_loss={stats['last_loss']:.6f}"
+                f"{hold_txt} (holdout never in train cache)",
+                flush=True,
+            )
+            return
         if bool(getattr(args, "exp_ssl_pretrain", False)):
             from python.data.raw_frames import refuse_lossy
             from python.train.exp_ssl import SslError, run_ssl_pretrain, ssl_rows_from_split

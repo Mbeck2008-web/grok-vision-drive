@@ -77,7 +77,6 @@ from python.train.scene_net import (  # noqa: E402
     head_names,
     labels_for_row,
     loss_mask,
-    precision_for_capability,
     scene_loss,
     step_dt,
     torch_ready,
@@ -2266,6 +2265,36 @@ def _prefetch_loader(items: list[dict[str, Any]], root: Path, cams, cache, scale
     )
 
 
+def train_amp_enabled(
+    train_precision: str,
+    plan_precision: str | None,
+    *,
+    device_type: str = "cuda",
+    capability: Any = None,
+    gpu_name: str = "",
+) -> bool:
+    """Whether the trainer should enable fp16 AMP.
+
+    ``plan_precision`` (``SizePlan.precision`` from ``resolve_precision``) is
+    the authority. ``precision_for_capability`` is name-blind: a GTX 16-series
+    card at compute 7.5 would otherwise train with fp16 AMP under
+    ``--precision auto``.
+    """
+    if str(device_type) != "cuda":
+        return False
+    requested = str(train_precision or "auto").lower()
+    if requested == "fp32":
+        return False
+    applied = str(plan_precision or "").strip().lower()
+    if not applied:
+        from python.train.model_size import resolve_precision
+        from python.train.scene_net import split_capability
+
+        applied, _notes = resolve_precision(requested, split_capability(capability), gpu_name)
+        applied = str(applied).lower()
+    return applied in ("fp16", "bf16")
+
+
 def train_directory(
     root: Path,
     *,
@@ -2342,6 +2371,8 @@ def train_directory(
     model_net_kwargs: dict | None = None,
     model_preset: str = "small",
     train_precision: str = "auto",
+    plan_precision: str | None = None,
+    gpu_name: str = "",
 ) -> dict[str, Any]:
     import torch
 
@@ -2711,9 +2742,13 @@ def train_directory(
             holder["net"].to(device)
             _release_cuda()
         cap = _capability(device, capability)
-        amp = precision_for_capability(cap) == "amp" and device.type == "cuda"
-        if str(train_precision) == "fp32":
-            amp = False
+        amp = train_amp_enabled(
+            train_precision,
+            plan_precision,
+            device_type=device.type,
+            capability=cap,
+            gpu_name=gpu_name,
+        )
         rate = float(holder.get("lr", lr) if learning_rate is None else learning_rate)
         holder["device"] = device
         holder["cap"] = cap
@@ -3777,6 +3812,7 @@ def main(argv: list[str] | None = None) -> None:
     net_kw = {} if size_plan is None else dict(size_plan.net_kwargs)
     preset_name = "small" if size_plan is None else size_plan.preset
     train_precision = str(getattr(args, "precision", "auto") or "auto")
+    plan_precision = None if size_plan is None else str(size_plan.precision)
     if size_plan is not None and train_precision in ("fp16", "int8") and size_plan.precision == "fp32":
         train_precision = "fp32"
     from python.train.cam_strip import parse_cams, parse_heads
@@ -4114,6 +4150,7 @@ def main(argv: list[str] | None = None) -> None:
                 model_net_kwargs=net_kw,
                 model_preset=preset_name,
                 train_precision=train_precision,
+                plan_precision=plan_precision,
             )
         except ExactEpochsMismatch as exc:
             print(f"[GVD] scene train: {exc}", flush=True)

@@ -17,6 +17,7 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -756,6 +757,77 @@ def read_free_vram_gb() -> float | None:
         return float(line) / 1024.0
     except Exception:
         return None
+
+
+
+class GpuPressureMonitor:
+    """Background nvidia-smi (or injected probe) with a cached free-VRAM reading.
+
+    The drive loop must only call :meth:`cached_free_vram_gb`. The probe never
+    runs on that thread, including tick 0. A missing or failed probe is
+    fail-closed: the cache stays ``None``, so VRAM pressure is not claimed.
+    """
+
+    def __init__(self, interval_s: float = 5.0, probe=None) -> None:
+        self.interval_s = float(interval_s)
+        self._probe = read_free_vram_gb if probe is None else probe
+        self._lock = threading.Lock()
+        self._cached: float | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run, name="gvd-gpu-pressure", daemon=True
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                value = self._probe()
+            except Exception:
+                value = None
+            with self._lock:
+                self._cached = value
+            if self._stop.wait(self.interval_s):
+                break
+
+    def cached_free_vram_gb(self) -> float | None:
+        with self._lock:
+            return self._cached
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+        self._thread = None
+
+
+def drive_loop_pressure_tick(
+    monitor: GpuPressureMonitor | None,
+    preset: str,
+    *,
+    game_fps: float | None = None,
+    infer_ms: float | None = None,
+    loop_hz: float | None = None,
+    max_infer_ms: float | None = None,
+    target_hz: float | None = None,
+) -> tuple[str, bool, str]:
+    """Step-down decision for one supervisor tick. Never calls the VRAM probe."""
+    free = None if monitor is None else monitor.cached_free_vram_gb()
+    return step_down_for_pressure(
+        preset,
+        free_vram_gb=free,
+        game_fps=game_fps,
+        infer_ms=infer_ms,
+        loop_hz=loop_hz,
+        max_infer_ms=max_infer_ms,
+        target_hz=target_hz,
+    )
 
 
 def _system_ram_gb() -> float | None:

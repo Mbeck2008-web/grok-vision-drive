@@ -798,6 +798,7 @@ def main(clock=None) -> None:
     capture_pump: CapturePump | None = None
     age_window = AgeWindow()
     try:
+        pressure_mon = None
         scene_lane = None
         scene_guard = None
         # Hold-last side cameras (a gvd_cam_age=1 scene model on BeamNG).
@@ -870,12 +871,20 @@ def main(clock=None) -> None:
         elif args.lane_source == "gt":
             print("[GVD] lane source=gt road-network center at 8 m", flush=True)
         active_preset = "small" if size_plan is None else size_plan.preset
-        last_pressure = 0.0
+        last_pressure = time.perf_counter()
         last_infer_ms = None
         pressure_target = float(getattr(args, "target_hz", 10.0) or 10.0)
         pressure_limit = None if size_plan is None else size_plan.limit_ms
         if getattr(args, "max_infer_ms", None):
             pressure_limit = float(args.max_infer_ms)
+        pressure_mon = None
+        try:
+            from python.train.model_size import GpuPressureMonitor
+
+            pressure_mon = GpuPressureMonitor(interval_s=5.0)
+            pressure_mon.start()
+        except Exception as exc:
+            print(f"[GVD] model-size pressure monitor skipped: {exc}", flush=True)
         if clock is None:
             # Capture stays off the control thread. The slot keeps one frame;
             # a slower infer loop drops the ones it did not take. The step
@@ -954,12 +963,12 @@ def main(clock=None) -> None:
             if time.perf_counter() - last_pressure >= 5.0:
                 last_pressure = time.perf_counter()
                 try:
-                    from python.train.model_size import read_free_vram_gb, step_down_for_pressure
+                    from python.train.model_size import drive_loop_pressure_tick
 
                     game_fps = getattr(vdata, "fps", None) if vdata is not None else None
-                    nxt, stepped, why = step_down_for_pressure(
+                    nxt, stepped, why = drive_loop_pressure_tick(
+                        pressure_mon,
                         active_preset,
-                        free_vram_gb=read_free_vram_gb(),
                         game_fps=game_fps,
                         infer_ms=last_infer_ms,
                         loop_hz=loop_hz_ema if frame_i > 0 else None,
@@ -2022,6 +2031,11 @@ def main(clock=None) -> None:
             write_engage_flag(False, disengage_reason="shutdown")
         except Exception:
             pass
+        if pressure_mon is not None:
+            try:
+                pressure_mon.stop()
+            except Exception:
+                pass
         if capture_pump is not None:
             capture_pump.stop()
         backend.close()

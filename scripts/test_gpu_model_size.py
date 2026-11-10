@@ -12,8 +12,10 @@ if str(ROOT) not in sys.path:
 from python.train.model_size import (  # noqa: E402
     PRESET_ORDER,
     GpuFacts,
+    GpuPressureMonitor,
     PresetMismatch,
     checkpoint_preset,
+    drive_loop_pressure_tick,
     pick_accel,
     prepare_backend,
     refuse_preset_mismatch,
@@ -177,6 +179,92 @@ def check_step_down_never_raises() -> None:
     assert nxt == "medium" and not stepped and why == "headroom ok"
 
 
+
+def _old_train_amp(train_precision: str, capability) -> bool:
+    """The pre-fix _arm path: capability only, no GPU name."""
+    from python.train.scene_net import precision_for_capability
+
+    amp = precision_for_capability(capability) == "amp"
+    if str(train_precision) == "fp32":
+        amp = False
+    return amp
+
+
+def check_train_amp_follows_size_plan() -> None:
+    from python.train.train_scene import train_amp_enabled
+
+    sixteen, _ = resolve_precision("auto", (7, 5), "GeForce GTX 1660 Ti")
+    assert sixteen == "fp32"
+    rtx, _ = resolve_precision("auto", (7, 5), "GeForce RTX 2080 Ti")
+    assert rtx == "fp16"
+    pascal, _ = resolve_precision("auto", (6, 1), "GeForce GTX 1080 Ti")
+    assert pascal == "fp32"
+
+    # Old wiring (recorded): a 1660-class name at cc 7.5 trains with AMP under auto.
+    assert _old_train_amp("auto", (7, 5)) is True
+    assert _old_train_amp("auto", (6, 1)) is False
+
+    assert train_amp_enabled(
+        "auto", sixteen, device_type="cuda", capability=(7, 5), gpu_name="GeForce GTX 1660 Ti"
+    ) is False
+    assert train_amp_enabled(
+        "auto", None, device_type="cuda", capability=(7, 5), gpu_name="GeForce GTX 1660"
+    ) is False
+    assert train_amp_enabled(
+        "auto", rtx, device_type="cuda", capability=(7, 5), gpu_name="GeForce RTX 2080 Ti"
+    ) is True
+    assert train_amp_enabled(
+        "auto", None, device_type="cuda", capability=(7, 5), gpu_name="GeForce RTX 2080 Ti"
+    ) is True
+    assert train_amp_enabled(
+        "auto", pascal, device_type="cuda", capability=(6, 1), gpu_name="GeForce GTX 1080 Ti"
+    ) is False
+    assert train_amp_enabled(
+        "auto", None, device_type="cuda", capability=(6, 1), gpu_name="GeForce GTX 1080 Ti"
+    ) is False
+    assert train_amp_enabled("fp32", "fp16", device_type="cuda") is False
+    assert train_amp_enabled("auto", "fp16", device_type="cpu") is False
+
+
+
+def check_drive_loop_never_calls_vram_probe() -> None:
+    import threading
+    import time
+
+    calls = {"n": 0, "threads": set()}
+
+    def probe() -> float:
+        calls["n"] += 1
+        calls["threads"].add(threading.get_ident())
+        return 4.0
+
+    mon = GpuPressureMonitor(interval_s=60.0, probe=probe)
+    # Tick 0, before the background thread starts: cache is None (fail-closed).
+    nxt, stepped, why = drive_loop_pressure_tick(mon, "small")
+    assert calls["n"] == 0, calls
+    assert nxt == "small" and not stepped
+    drive_loop_pressure_tick(mon, "small", infer_ms=5.0, max_infer_ms=20.0)
+    assert calls["n"] == 0, calls
+    mon.start()
+    deadline = time.time() + 2.0
+    while calls["n"] == 0 and time.time() < deadline:
+        time.sleep(0.01)
+    assert calls["n"] >= 1, calls
+    assert threading.get_ident() not in calls["threads"]
+    n = calls["n"]
+    for _ in range(5):
+        drive_loop_pressure_tick(mon, "large", infer_ms=10.0, max_infer_ms=20.0, loop_hz=12.0, target_hz=10.0)
+    assert calls["n"] == n, (calls, n)
+    mon.stop()
+
+
+def check_run_vision_loop_has_no_sync_probe() -> None:
+    src = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
+    assert "read_free_vram_gb" not in src
+    assert "GpuPressureMonitor" in src
+    assert "drive_loop_pressure_tick" in src
+
+
 def check_old_checkpoint_is_small() -> None:
     assert checkpoint_preset({}) == "small"
     assert checkpoint_preset({"preset": None}) == "small"
@@ -205,6 +293,9 @@ def main() -> None:
     check_latency_step_down()
     check_step_down_never_raises()
     check_old_checkpoint_is_small()
+    check_train_amp_follows_size_plan()
+    check_drive_loop_never_calls_vram_probe()
+    check_run_vision_loop_has_no_sync_probe()
     print("test_gpu_model_size: ok")
 
 

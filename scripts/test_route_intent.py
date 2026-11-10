@@ -33,10 +33,15 @@ CONTROL_CALL_OWNERS = {
 }
 # Functions in run_vision that may mention nav/turn/next_jct_m/route_src in arguments.
 # Display-only (#203): merge_nav_intent and apply_nav_missing.
-# The only sanctioned addition is the SceneNet --route-cond command encoder
-# ("runtime_route_vec"). Planner, actuation, and engage can never be listed here.
+# The only sanctioned model-input edge: runtime_route_vec encodes GPS intent
+# as the SceneNet --route-cond command. Planner, actuation, and engage can
+# never be listed here.
 DISPLAY_NAV_ARG_ALLOWLIST = frozenset({"merge_nav_intent", "apply_nav_missing"})
-MODEL_ROUTE_INPUT_ALLOWLIST = frozenset()
+MODEL_ROUTE_INPUT_ALLOWLIST = frozenset({"runtime_route_vec"})
+# The only file that may import route_intent outside run_vision / this test:
+# it encodes {turn, next_jct_m} for SceneNet. Still forbidden: navgraph, Navigraph,
+# junction_grade. Planner, actuation, and engage stay off this list.
+ROUTE_INTENT_IMPORT_ALLOWLIST = frozenset({"python/train/route_cond.py"})
 HARMLESS_NAV_READS = frozenset({"str", "len", "bool", "isinstance", "print", "repr", "type"})
 
 
@@ -170,7 +175,11 @@ def check_isolation() -> None:
     visited = _walk_python_imports(roots)
     for path in visited:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        _iso_banned_names(_collect_imported_modules(path, tree), path, banned)
+        rel = path.relative_to(ROOT).as_posix()
+        needles = banned
+        if rel in ROUTE_INTENT_IMPORT_ALLOWLIST:
+            needles = tuple(item for item in banned if item != "route_intent")
+        _iso_banned_names(_collect_imported_modules(path, tree), path, needles)
     viz_files = sorted((ROOT / "python" / "viz").glob("*.py"))
     for path in viz_files:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -179,6 +188,7 @@ def check_isolation() -> None:
     allow = DISPLAY_NAV_ARG_ALLOWLIST | MODEL_ROUTE_INPUT_ALLOWLIST | HARMLESS_NAV_READS
     assert MODEL_ROUTE_INPUT_ALLOWLIST.isdisjoint(CONTROL_CALL_NAMES)
     assert MODEL_ROUTE_INPUT_ALLOWLIST.isdisjoint(DISPLAY_NAV_ARG_ALLOWLIST)
+    assert DISPLAY_NAV_ARG_ALLOWLIST.isdisjoint(CONTROL_CALL_NAMES)
     vision = ROOT / "python" / "run_vision.py"
     tree = ast.parse(vision.read_text(encoding="utf-8"), filename=str(vision))
     for node in ast.walk(tree):

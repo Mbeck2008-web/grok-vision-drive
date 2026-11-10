@@ -391,6 +391,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--route-cond",
+        action="store_true",
+        help=(
+            "Feed the scene net a 5-float navigation command (one-hot follow/left/right/straight plus "
+            "next_jct_m/150) from intent.jsonl. This is not --ctl-cond: no ego speed or control GT "
+            "is used. Off by default. Old checkpoints load unchanged."
+        ),
+    )
+    parser.add_argument(
         "--aux-depth",
         action="store_true",
         help="Training-only depth aux from raw/<cam>_depth (uint16 cm PNG). Not an inference input.",
@@ -461,6 +470,33 @@ def build_parser() -> argparse.ArgumentParser:
             "Comma list of mask sidecars (JSON lines with a row id i), relative to the recording "
             "folder. Every listed row is left out. A missing file or an i the recording does not "
             "have stops the run. name@sha256prefix (8+ hex digits) also stops on a sha256 mismatch."
+        ),
+    )
+    parser.add_argument(
+        "--drop-wrong-way",
+        action="store_true",
+        help=(
+            "Leave out frames where the recorded car is going against a one-way / divided "
+            "carriageway or in the opposing lane of a two-way road (see docs/SPEC_frame_quality_filter.md). "
+            "Uses state.jsonl poses plus a road dump (honors flipDirection). Off by default. "
+            "Deploy stays camera-only. Filtered-run metrics are not comparable to an unfiltered run."
+        ),
+    )
+    parser.add_argument(
+        "--road-dump",
+        default="",
+        help=(
+            "Road-network dump for --drop-wrong-way (the collect road_dump json/json.gz). "
+            "Default: <data>/roads/<map>.json.gz from the recording's map field."
+        ),
+    )
+    parser.add_argument(
+        "--max-road-clip",
+        type=float,
+        default=-1.0,
+        help=(
+            "Drop frames whose lower-half any-channel clip (RGB>=250) exceeds this fraction "
+            "(0.20 is the suggested cut). Default -1 disables the check."
         ),
     )
     parser.add_argument(
@@ -1189,23 +1225,35 @@ def row_ages(row: Mapping[str, Any] | None) -> np.ndarray:
     return arr if arr.size == len(ages_vector({})) else no_ages()
 
 
+def row_route(row: Mapping[str, Any] | None) -> Any:
+    """The 5-float nav command for ``--route-cond``. Missing rows are follow."""
+    from python.train.route_cond import encode_route
+
+    if not row:
+        return encode_route("follow", None)
+    return encode_route(str(row.get("route_cmd") or "follow"), row.get("next_jct_m"))
+
+
 def _forward(net: Any, image: Any, dt: Any, state: SceneState, rows: list[Mapping[str, Any] | None]) -> Any:
-    """``net.forward_batch``, with the rows' ages and ctl cond when the net takes them."""
+    """``net.forward_batch``, with the rows' ages, ctl cond, and route command when the net takes them."""
     import torch
 
     ages = None
     if bool(getattr(net, "cam_age", False)):
         ages = torch.from_numpy(np.stack([row_ages(row) for row in rows])).to(image.device)
+    cond = None
     cond_dim = int(getattr(net, "cond_dim", 0) or 0)
-    if not cond_dim:
-        if ages is None:
-            return net.forward_batch(image, dt, state)
-        return net.forward_batch(image, dt, state, ages)
-    # --ctl-cond: the t-dt controls attach_ctl wrote (ctl_targets.build_cond). A padded slot or a
-    # row without them gets zeros; such a row has an all-zero ctl_valid, so no ctl loss.
-    zero = np.zeros(cond_dim, dtype=np.float32)
-    cond = np.stack([np.asarray(row.get("ctl_cond", zero), dtype=np.float32) if row else zero for row in rows])
-    return net.forward_batch(image, dt, state, ages, torch.from_numpy(cond).to(image.device))
+    if cond_dim:
+        # --ctl-cond: the t-dt controls attach_ctl wrote (ctl_targets.build_cond). A padded slot or a
+        # row without them gets zeros; such a row has an all-zero ctl_valid, so no ctl loss.
+        zero = np.zeros(cond_dim, dtype=np.float32)
+        cond = torch.from_numpy(
+            np.stack([np.asarray(row.get("ctl_cond", zero), dtype=np.float32) if row else zero for row in rows])
+        ).to(image.device)
+    route = None
+    if bool(getattr(net, "route_cond", False)):
+        route = torch.from_numpy(np.stack([row_route(row) for row in rows])).to(image.device)
+    return net.forward_batch(image, dt, state, ages, cond, route)
 
 
 def _frame_row(
@@ -1383,6 +1431,28 @@ def _window_side_inputs(net: Any, rows_bt: list[list[Mapping[str, Any] | None]],
     return ages, cond
 
 
+def _window_route(net: Any, rows_bt: list[list[Mapping[str, Any] | None]], device: Any) -> Any:
+    """Route-command grid shaped (B, T, 5) when the net was trained with --route-cond."""
+    import torch
+
+    if not bool(getattr(net, "route_cond", False)):
+        return None
+    width = len(rows_bt)
+    ticks = max((len(seq) for seq in rows_bt), default=0)
+    grid = np.stack(
+        [
+            np.stack(
+                [
+                    row_route(seq[tick] if tick < len(seq) else None)
+                    for tick in range(ticks)
+                ]
+            )
+            for seq in rows_bt
+        ]
+    )
+    return torch.from_numpy(np.ascontiguousarray(grid)).to(device)
+
+
 def _finite_counts(loss_value: Any) -> tuple[int, int]:
     import math
 
@@ -1475,14 +1545,15 @@ def _optimizer_step(
         stacked = np.ascontiguousarray(np.stack([item[0] for item in packed])[None, ...])
         dts = [[step_dt(item[1].get("dt_s")) for item in packed]]
         ages, cond = _window_side_inputs(net, [[item[1] for item in packed]], device)
+        route = _window_route(net, [[item[1] for item in packed]], device)
         image = torch.from_numpy(stacked).to(device)
         with _autocast(amp):
             if cuda_graph_runner is not None:
                 fused_pred, state, _extra = cuda_graph_runner.forward_window(
-                    net, image, dts, state, ages, cond
+                    net, image, dts, state, ages, cond, route
                 )
             else:
-                fused_pred, state, _extra = net.forward_window(image, dts, state, ages, cond)
+                fused_pred, state, _extra = net.forward_window(image, dts, state, ages, cond, route)
         tick_iter = [(tick, item[0], item[1]) for tick, item in enumerate(packed)]
         if view is not None:
             view.pump()
@@ -1685,15 +1756,16 @@ def _optimizer_group(
         dts = np.asarray(kept_dts, dtype=np.float32).T
         rows_bt = [[kept_rows[tick][b] for tick in range(ticks_kept)] for b in range(width)]
         ages, cond = _window_side_inputs(net, rows_bt, device)
+        route = _window_route(net, rows_bt, device)
         image = torch.from_numpy(stacked).to(device)
         dts_t = torch.as_tensor(dts, dtype=torch.float32, device=device)
         with _autocast(amp):
             if cuda_graph_runner is not None:
                 fused_pred, state, _extra = cuda_graph_runner.forward_window(
-                    net, image, dts_t, state, ages, cond
+                    net, image, dts_t, state, ages, cond, route
                 )
             else:
-                fused_pred, state, _extra = net.forward_window(image, dts_t, state, ages, cond)
+                fused_pred, state, _extra = net.forward_window(image, dts_t, state, ages, cond, route)
         if view is not None:
             view.pump()
     for tick, alive in enumerate(kept_rows):
@@ -2279,6 +2351,9 @@ def train_directory(
     backbone_lr_mult: float = 1.0,
     mask_events: bool = False,
     mask_files: str = "",
+    drop_wrong_way: bool = False,
+    road_dump: str = "",
+    max_road_clip: float = -1.0,
     ckpt_dir: Path | None = None,
     ckpt_min_free_gb: float | None = None,
     cam_age: bool = False,
@@ -2287,6 +2362,7 @@ def train_directory(
     ctl_weight: float = 1.0,
     exact_epochs: int | None = None,
     ctl_cond: bool = False,
+    route_cond: bool = False,
     ctl_loss: str = "huber",
     val_worst: int = VAL_WORST_N,
     val_worst_png: bool = False,
@@ -2440,6 +2516,22 @@ def train_directory(
         rows, mask_sources = apply_mask_files_multi(strip_roots, rows, mask_files)
     elif mask_sources:
         rows = drop_masked(rows, set().union(*(source["ids"] for source in mask_sources)))
+    if drop_wrong_way or float(max_road_clip) >= 0.0:
+        from python.train.frame_quality import FrameQualityError, apply_frame_quality, describe_quality
+        from python.train.scene_loader import recompute_dt
+
+        before_q = len(rows)
+        try:
+            rows, quality_stats = apply_frame_quality(
+                rows,
+                drop_wrong_way=bool(drop_wrong_way),
+                max_road_clip=float(max_road_clip),
+                road_dump=road_dump or None,
+            )
+        except FrameQualityError as exc:
+            raise SystemExit(str(exc)) from exc
+        rows = recompute_dt(rows)
+        print(f"[GVD] frame-quality: {describe_quality(quality_stats, before_q)}", flush=True)
     # E0: the label frame of the rows this run trains on, stamped on every export.
     gt_frame = gt_frame_props(rows)
     selection_text, _selection_meta = selection_line(state_rows, selection_before, rows, mask_sources)
@@ -2539,6 +2631,10 @@ def train_directory(
         train_ids = {i for i, label in plan_labels(startup_plan).items() if label == "train"}
         # b1_constants keeps only loss_mask rows, as the training loss does.
         ctl_b1 = b1_constants([row for row in rows if row.get("i") in train_ids])
+    if route_cond:
+        from python.train.route_cond import attach_route_cmds, route_counts_line
+
+        print(route_counts_line(attach_route_cmds(rows)), flush=True)
     print(
         f"[GVD] holdout: rows={mix['rows']} slices={mix['slices']} fast={mix['fast']} slow={mix['slow']} "
         f"no_speed={mix['no_speed']} (fast is row speed >= {HOLDOUT_FAST_MPS} m/s)",
@@ -2632,6 +2728,7 @@ def train_directory(
                     cond_dim=ctl_cond_dim,
                     aux_sensors=use_aux_sensors,
                     road_edge=use_road_edge,
+                    route_cond=bool(route_cond),
                 ).to(device)
                 if grad_ckpt:
                     holder["net"].grad_ckpt = True
@@ -2896,6 +2993,7 @@ def train_directory(
             "ctl": bool(use_ctl),
             **({"ctl_cond_dim": int(ctl_cond_dim)} if ctl_cond_dim else {}),
             **({"ctl_loss": ctl_kind} if ctl_kind != "huber" else {}),
+            **({"route_cond": True} if route_cond else {}),
             "heads": list(train_heads or ()),
             "scale": float(input_scale),
             "backbone": str(backbone),
@@ -3993,6 +4091,7 @@ def main(argv: list[str] | None = None) -> None:
                 conf_weight=float(args.conf_weight),
                 ctl_weight=1.0 if args.ctl_weight is None else float(args.ctl_weight),
                 ctl_cond=bool(args.ctl_cond),
+                route_cond=bool(args.route_cond),
                 ctl_loss=str(args.ctl_loss),
                 init_head_bias=bool(args.init_head_bias),
                 eval_chunk=int(args.eval_chunk),
@@ -4001,6 +4100,9 @@ def main(argv: list[str] | None = None) -> None:
                 backbone_lr_mult=float(args.backbone_lr_mult),
                 mask_events=bool(args.mask_events),
                 mask_files=str(args.mask_files or ""),
+                drop_wrong_way=bool(args.drop_wrong_way),
+                road_dump=str(args.road_dump or ""),
+                max_road_clip=float(args.max_road_clip),
                 ckpt_dir=Path(args.ckpt_dir) if args.ckpt_dir else None,
                 ckpt_min_free_gb=args.ckpt_min_free_gb,
                 cam_age=bool(args.cam_age),

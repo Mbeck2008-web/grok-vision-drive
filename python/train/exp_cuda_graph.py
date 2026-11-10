@@ -128,6 +128,7 @@ class CudaGraphRunner:
         state: Any,
         ages: Any = None,
         cond: Any = None,
+        route: Any = None,
     ) -> Any:
         """Trainer hook: graphed fused forward when eligible, else eager."""
         shape = tuple(strips.shape) if hasattr(strips, "shape") else None
@@ -143,18 +144,20 @@ class CudaGraphRunner:
                 self._heads_note = True
             self.mode = "eager_fallback"
             self.fallback_count += 1
-            return net.forward_window(strips, dts, state, ages, cond)
+            return net.forward_window(strips, dts, state, ages, cond, route)
         needs_side = (
             ages is not None
             or cond is not None
+            or route is not None
             or bool(getattr(net, "cam_age", False))
             or int(getattr(net, "cond_dim", 0) or 0)
             or bool(getattr(net, "aux_sensors", False))
+            or bool(getattr(net, "route_cond", False))
         )
         if needs_side or not graph_eligible(enabled=self.enabled, device=self.device, shape=shape):
             self.mode = "eager_fallback"
             self.fallback_count += 1
-            return net.forward_window(strips, dts, state, ages, cond)
+            return net.forward_window(strips, dts, state, ages, cond, route)
 
         import torch
 
@@ -211,7 +214,7 @@ class CudaGraphRunner:
             except (RuntimeError, TypeError, ValueError):
                 self.mode = "eager_fallback"
                 self.fallback_count += 1
-                return net.forward_window(strips, dts, state, ages, cond)
+                return net.forward_window(strips, dts, state, ages, cond, route)
 
         dts_t = dts if torch.is_tensor(dts) else torch.as_tensor(dts, device=strips.device, dtype=strips.dtype)
         try:
@@ -223,7 +226,7 @@ class CudaGraphRunner:
             self.fallback_count += 1
             self._graphed = None
             self._graphed_shape = None
-            return net.forward_window(strips, dts, state, ages, cond)
+            return net.forward_window(strips, dts, state, ages, cond, route)
 
         # Rebuild a full prediction with eager so every head stays populated the
         # same way; the graphed call still warms/replays the heavy stem+GRU path

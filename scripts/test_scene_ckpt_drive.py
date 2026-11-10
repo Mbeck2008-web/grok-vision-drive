@@ -85,6 +85,37 @@ def check_drive_feeds_modular_path() -> None:
     print("drive feeds modular path from lane_x and caps target_v OK")
 
 
+def check_empty_modular_plan_gets_drive_cap() -> None:
+    """Empty modular route leaks target_v=0.0 (PathPlan default), not None.
+
+    Live IQU45 2026-11-10 --scene-ckpt-drive: bev 0%, AEB off, TTC none,
+    cmd_reason=ok, lane_src=scene_ckpt, vt=0.0, applied throttle 0. cap_drive_speed
+    used to keep that placeholder 0 via min(0, cap), so the car never left N.
+    AEB brake and a real scene stop must still stay at 0.
+    """
+    from python.control.actuate import plan_command
+    from python.train.scene_ckpt_runtime import apply_scene_ckpt_lane, cap_drive_speed
+
+    pout = _pout(planner={"aeb": "off", "target_v": 0.0, "ttc_lead": None, "stop_reason": "none"})
+    decision = apply_scene_ckpt_lane(pout, _pred(lane_x=-0.32, confidence=0.85), drive=True)
+    assert decision == "lane", decision
+    cap_drive_speed(pout, 15.0)
+    assert float(pout.planner["target_v"]) == 15.0, pout.planner
+    cmd = plan_command(path_ego=pout.path_ego, planner=pout.planner, ego_speed_mps=0.0, seq=1)
+    assert cmd.throttle > 0.0 and cmd.brake == 0.0, cmd
+
+    hold = _pout(planner={"aeb": "brake", "target_v": 0.0, "ttc_lead": 0.8, "stop_reason": "none"})
+    apply_scene_ckpt_lane(hold, _pred(lane_x=-0.32, confidence=0.85), drive=True)
+    cap_drive_speed(hold, 15.0)
+    assert float(hold.planner["target_v"]) == 0.0, hold.planner
+
+    sign = _pout(planner={"aeb": "off", "target_v": 0.0, "ttc_lead": None, "stop_reason": "stop_sign"})
+    apply_scene_ckpt_lane(sign, _pred(lane_x=-0.32, confidence=0.85), drive=True)
+    cap_drive_speed(sign, 15.0)
+    assert float(sign.planner["target_v"]) == 0.0, sign.planner
+    print("empty modular plan gets drive cap; AEB/stop stay at 0 OK")
+
+
 def check_low_conf_and_aeb_override() -> None:
     from python.control.actuate import plan_command
     from python.runtime.shadow import ShadowConfig, evaluate_veto
@@ -504,6 +535,7 @@ def check_same_tick_observe_documented() -> None:
 def main() -> None:
     check_flag_off_by_default()
     check_drive_feeds_modular_path()
+    check_empty_modular_plan_gets_drive_cap()
     check_low_conf_and_aeb_override()
     check_drive_without_ckpt_refused()
     check_multicam_ckpt_refuses_drive()

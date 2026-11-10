@@ -105,17 +105,37 @@ def apply_scene_ckpt_lane(pout: Any, pred: Any, *, drive: bool, min_conf: float 
 
 
 def cap_drive_speed(pout: Any, speed_mps: float) -> None:
-    """Conservative longitudinal cap. Does not raise an existing slower target."""
+    """Conservative longitudinal cap. Does not raise an existing slower target.
+
+    ``None`` means there is no speed plan. A literal ``0.0`` with AEB off and
+    ``stop_reason`` none/missing is the empty-route PathPlan default, not a
+    commanded stop — treat it as missing so drive mode can install the cap.
+    AEB ``brake`` and a real scene stop (stop_sign, red_light, occupied, …)
+    keep their slower target.
+    """
     cap = float(speed_mps)
     pl = dict(getattr(pout, "planner", None) or {})
     raw = pl.get("target_v")
+    aeb = str(pl.get("aeb") or "off")
+    stop = str(pl.get("stop_reason") or "none")
+    placeholder = False
     if raw is None:
-        pl["target_v"] = cap
+        placeholder = True
+        tv = cap
     else:
         try:
-            pl["target_v"] = min(float(raw), cap)
+            tv = float(raw)
         except (TypeError, ValueError):
-            pl["target_v"] = cap
+            placeholder = True
+            tv = cap
+        else:
+            if tv <= 0.0 and aeb != "brake" and stop in ("none", "", "None"):
+                placeholder = True
+                tv = cap
+    if placeholder:
+        pl["target_v"] = cap
+    else:
+        pl["target_v"] = min(tv, cap)
     pout.planner = pl
 
 

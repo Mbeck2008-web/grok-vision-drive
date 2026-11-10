@@ -86,3 +86,28 @@ def install_actuate_time_shim(clock) -> None:
     from python.control import actuate
 
     actuate.time = ActuateTime(clock)
+
+
+def install_frame_age_time_shim(clock) -> None:
+    """Point stamp and age sites at ``ActuateTime(clock)``; clock=None: no-op.
+
+    ``bundle_frame_age_s`` reads ``frame_slot.time.monotonic()`` when ``now`` is
+    omitted. The painted-road stub (and ``StubBackend.grab``) stamp ``captured_at``
+    with their own ``time.monotonic()``. ``install_actuate_time_shim`` does not
+    reach those, so on a loaded host a same-tick grab can age past 300 ms and
+    fire ``frame_stale`` (brake 1.0) inside a test that thinks it owns the clock.
+    Patch stamp and measure together: mixing a real stamp with a sim ``now``
+    (or the reverse) would invent huge or negative ages.
+    """
+    if clock is None:
+        return
+    from python.sensors import cameras, frame_slot
+
+    shim = ActuateTime(clock)
+    frame_slot.time = shim
+    cameras.time = shim
+    try:
+        import gvd_road_stub_child
+    except ImportError:
+        return
+    gvd_road_stub_child.time = shim

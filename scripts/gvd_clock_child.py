@@ -34,7 +34,7 @@ os.dup2(2, 1)
 
 import gvd_echo_clock_child  # noqa: E402 - needs GVD_TEST_ECHO_CLOCK_FILE, set by the test
 import gvd_road_stub_child  # noqa: E402
-from gvd_sim_clock import C0, install_actuate_time_shim, install_bus_identity_wrap  # noqa: E402
+from gvd_sim_clock import C0, install_actuate_time_shim, install_bus_identity_wrap, install_frame_age_time_shim  # noqa: E402
 from python.control import echo_link  # noqa: E402
 from python.sensors import cameras  # noqa: E402
 
@@ -79,6 +79,7 @@ def main() -> None:
     clock = PipeClock(t0, w0)
     install_bus_identity_wrap(clock)
     install_actuate_time_shim(clock)
+    install_frame_age_time_shim(clock)
     g = runpy.run_path(str(script), run_name="gvd_clock_child")
     g["main"](clock=clock)
 

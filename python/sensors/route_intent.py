@@ -126,31 +126,113 @@ def _project(
     return (qx, qy), t, math.hypot(px - qx, py - qy)
 
 
-def intent_from_pose(graph: Graph, ego_xy: tuple[float, float], *, goal: str) -> dict[str, Any]:
-    """Nearest-edge snap, then the next junction on the shortest path to ``goal``."""
-    if goal not in graph.nodes:
-        return result_message("none", None)
-    px, py = float(ego_xy[0]), float(ego_xy[1])
-    scored: list[tuple[float, float, str, float, float, list[str]]] = []
+def _finite_xy(ego_xy: Any) -> tuple[float, float] | None:
+    """Two finite metre coords, or None (never raise on NaN / inf / junk)."""
+    try:
+        px = float(ego_xy[0])
+        py = float(ego_xy[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if not (math.isfinite(px) and math.isfinite(py)):
+        return None
+    return px, py
+
+
+def _heading_err(a: float, b: float) -> float:
+    return abs(_wrap(a - b))
+
+
+def _snap_edge(
+    graph: Graph,
+    px: float,
+    py: float,
+    *,
+    heading: float | None = None,
+    sticky: tuple[str, str] | None = None,
+) -> tuple[str, str, bool, float, float, float, float] | None:
+    """The edge ego is actually on.
+
+    Interior projections (``0 < t < 1``) win over endpoint clamps, so a side
+    street that only shares the upcoming junction vertex cannot steal the snap
+    in the last metre. When several edges still tie (exactly at a node), the
+    last snapped edge stays selected (hysteresis) and a travel heading, if
+    given, picks the aligned edge.
+    """
+    scored: list[tuple[float, bool, str, str, bool, float, float, float]] = []
     for a, b, oneway in graph.edges:
         ax, ay = graph.nodes[a]
         bx, by = graph.nodes[b]
-        (qx, qy), _t, off = _project(px, py, ax, ay, bx, by)
-        candidates: list[tuple[str, float, float]] = [(b, bx, by)]
-        if not oneway:
-            candidates.append((a, ax, ay))
-        for via, vx, vy in candidates:
-            path = _shortest_path(graph, via, goal)
-            if path is None:
-                continue
-            remain = math.hypot(vx - qx, vy - qy)
-            incoming = math.atan2(vy - (ay if via == b else by), vx - (ax if via == b else bx))
-            scored.append((off, remain + _path_length(graph, path), via, remain, incoming, path))
+        (qx, qy), t, off = _project(px, py, ax, ay, bx, by)
+        interior = 0.0 < t < 1.0
+        scored.append((off, interior, a, b, oneway, t, qx, qy))
+    if not scored:
+        return None
+    interiors = [item for item in scored if item[1]]
+    pool = interiors if interiors else scored
+    nearest = min(item[0] for item in pool)
+    # Float slack only — never the old 1.0 m window that admitted side streets.
+    tight = [item for item in pool if item[0] <= nearest + 1e-3]
+    if sticky is not None:
+        want = {sticky[0], sticky[1]}
+        held = [item for item in tight if {item[2], item[3]} == want]
+        if held:
+            tight = held
+    if heading is not None:
+        try:
+            travel = float(heading)
+        except (TypeError, ValueError):
+            travel = None
+        else:
+            if not math.isfinite(travel):
+                travel = None
+        if travel is not None:
+            def _align(item: tuple[float, bool, str, str, bool, float, float, float]) -> tuple[float, float]:
+                ax, ay = graph.nodes[item[2]]
+                bx, by = graph.nodes[item[3]]
+                edge_h = math.atan2(by - ay, bx - ax)
+                return (min(_heading_err(travel, edge_h), _heading_err(travel, edge_h + math.pi)), item[0])
+
+            picked = min(tight, key=_align)
+            return picked[2], picked[3], picked[4], picked[5], picked[6], picked[7], picked[0]
+    picked = min(tight, key=lambda item: item[0])
+    return picked[2], picked[3], picked[4], picked[5], picked[6], picked[7], picked[0]
+
+
+def intent_from_pose(
+    graph: Graph,
+    ego_xy: tuple[float, float],
+    *,
+    goal: str,
+    heading: float | None = None,
+    sticky: tuple[str, str] | None = None,
+) -> dict[str, Any]:
+    """Snap to the edge ego is on, then the next junction on the path to ``goal``."""
+    if goal not in graph.nodes:
+        return result_message("none", None)
+    xy = _finite_xy(ego_xy)
+    if xy is None:
+        return result_message("none", None)
+    px, py = xy
+    snapped = _snap_edge(graph, px, py, heading=heading, sticky=sticky)
+    if snapped is None:
+        return result_message("none", None)
+    a, b, oneway, _t, qx, qy, _off = snapped
+    ax, ay = graph.nodes[a]
+    bx, by = graph.nodes[b]
+    scored: list[tuple[float, str, float, float, list[str]]] = []
+    candidates: list[tuple[str, float, float]] = [(b, bx, by)]
+    if not oneway:
+        candidates.append((a, ax, ay))
+    for via, vx, vy in candidates:
+        path = _shortest_path(graph, via, goal)
+        if path is None:
+            continue
+        remain = math.hypot(vx - qx, vy - qy)
+        incoming = math.atan2(vy - (ay if via == b else by), vx - (ax if via == b else bx))
+        scored.append((remain + _path_length(graph, path), via, remain, incoming, path))
     if not scored:
         return result_message("none", None)
-    nearest = min(item[0] for item in scored)
-    on_road = [item for item in scored if item[0] <= nearest + 1.0]
-    _off, _rest, via, remain, incoming, path = min(on_road, key=lambda item: item[1])
+    _rest, via, remain, incoming, path = min(scored, key=lambda item: item[0])
     junctions = graph.junctions()
     dist = float(remain)
     jct: str | None = None

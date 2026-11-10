@@ -16,35 +16,198 @@ sys.path.insert(0, str(ROOT / "tests"))
 from synthetic_roads import load_graph, track  # noqa: E402
 
 
-def _iso_banned(path: Path, banned: tuple[str, ...]) -> None:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+BANNED_IMPORT_NEEDLES = ("route_intent", "junction_grade", "navgraph", "navigraph", "beamngpy.tools")
+NAV_ARG_KEYS = frozenset({"nav", "turn", "next_jct_m", "route_src"})
+# Control / engage calls in run_vision that must never see those keys (args or kwargs).
+CONTROL_CALL_NAMES = frozenset({
+    "tick",
+    "shadow_tick",
+    "plan_command",
+    "predict_path",
+    "apply",
+    "engage_gate",
+})
+CONTROL_CALL_OWNERS = {
+    "tick": frozenset({"perc"}),
+    "apply": frozenset({"actuator"}),
+}
+# Functions in run_vision that may mention nav/turn/next_jct_m/route_src in arguments.
+# Display-only (#203): merge_nav_intent and apply_nav_missing.
+# The only sanctioned addition is the SceneNet --route-cond command encoder
+# ("runtime_route_vec"). Planner, actuation, and engage can never be listed here.
+DISPLAY_NAV_ARG_ALLOWLIST = frozenset({"merge_nav_intent", "apply_nav_missing"})
+MODEL_ROUTE_INPUT_ALLOWLIST = frozenset()
+HARMLESS_NAV_READS = frozenset({"str", "len", "bool", "isinstance", "print", "repr", "type"})
+
+
+def _iso_banned_names(names: list[str], path: Path, banned: tuple[str, ...]) -> None:
+    for name in names:
+        low = name.lower()
+        assert not any(b in low for b in banned), f"{path.relative_to(ROOT)} imports {name}"
+
+
+def _call_func_parts(func: ast.AST) -> tuple[str | None, str | None]:
+    """Return (owner, name) for perc.tick -> ('perc', 'tick') or (None, 'shadow_tick')."""
+    if isinstance(func, ast.Name):
+        return None, func.id
+    if isinstance(func, ast.Attribute):
+        owner = func.value.id if isinstance(func.value, ast.Name) else None
+        return owner, func.attr
+    return None, None
+
+
+def _dyn_import_module(node: ast.Call) -> str | None:
+    owner, name = _call_func_parts(node.func)
+    dotted = f"{owner}.{name}" if owner else name
+    if name not in {"import_module", "__import__"} and dotted not in {"importlib.import_module"}:
+        return None
+    if not node.args:
+        return None
+    arg0 = node.args[0]
+    if isinstance(arg0, ast.Constant) and isinstance(arg0.value, str):
+        return arg0.value
+    return None
+
+
+def _collect_imported_modules(path: Path, tree: ast.AST) -> list[str]:
+    names: list[str] = []
     for node in ast.walk(tree):
-        names: list[str] = []
         if isinstance(node, ast.Import):
-            names = [alias.name for alias in node.names]
+            names.extend(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
-            names = [node.module or ""] + [alias.name for alias in node.names]
-        for name in names:
-            low = name.lower()
-            assert not any(b in low for b in banned), f"{path.relative_to(ROOT)} imports {name}"
+            if node.level:
+                pkg = path.parent
+                for _ in range(node.level - 1):
+                    pkg = pkg.parent
+                try:
+                    prefix = ".".join(pkg.relative_to(ROOT).parts)
+                except ValueError:
+                    prefix = ""
+                if node.module:
+                    names.append(f"{prefix}.{node.module}" if prefix else node.module)
+                elif prefix:
+                    names.append(prefix)
+            if node.module:
+                names.append(node.module)
+            names.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.Call):
+            dyn = _dyn_import_module(node)
+            if dyn:
+                names.append(dyn)
+    return names
+
+
+def _py_module_path(mod: str) -> Path | None:
+    if not mod.startswith("python.") and mod != "python":
+        return None
+    base = ROOT.joinpath(*mod.split("."))
+    file = base.with_suffix(".py")
+    if file.is_file():
+        return file
+    init = base / "__init__.py"
+    return init if init.is_file() else None
+
+
+def _walk_python_imports(roots: list[Path]) -> list[Path]:
+    seen: set[Path] = set()
+    stack = list(roots)
+    while stack:
+        path = stack.pop()
+        path = path.resolve()
+        if path in seen or not path.is_file():
+            continue
+        seen.add(path)
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for name in _collect_imported_modules(path, tree):
+            target = _py_module_path(name)
+            if target is not None and target.resolve() not in seen:
+                stack.append(target)
+    return sorted(seen)
+
+
+def _expr_mentions_nav(node: ast.AST) -> bool:
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name) and child.id in NAV_ARG_KEYS:
+            return True
+        if isinstance(child, ast.Attribute) and child.attr in NAV_ARG_KEYS:
+            return True
+        if isinstance(child, ast.Constant) and isinstance(child.value, str) and child.value in NAV_ARG_KEYS:
+            return True
+    return False
+
+
+def _is_control_call(owner: str | None, name: str | None) -> bool:
+    if name not in CONTROL_CALL_NAMES:
+        return False
+    allowed_owners = CONTROL_CALL_OWNERS.get(name)
+    if allowed_owners is None:
+        return True
+    return owner in allowed_owners
 
 
 def check_isolation() -> None:
-    """Planner, actuation, and perception never import route intent or navgraph."""
-    banned = ("route_intent", "junction_grade", "navgraph", "navigraph", "beamngpy.tools")
-    targets = [
+    """Planner, actuation, and perception never import route intent — transitively.
+
+    The walk follows ``python.*`` imports from the banned roots, including
+    intermediate modules such as ``python.planning.speed``. ``importlib.import_module``
+    and ``__import__`` string literals are treated as imports too.
+
+    ``run_vision.py`` may merge display intent and, later, encode it as the
+    SceneNet ``--route-cond`` command (see ``MODEL_ROUTE_INPUT_ALLOWLIST``).
+    ``perc.tick``, ``shadow_tick``, ``plan_command``, ``predict_path``,
+    ``actuator.apply``, and ``engage_gate`` must never receive ``nav`` / ``turn``
+    / ``next_jct_m`` / ``route_src``.
+    """
+    banned = BANNED_IMPORT_NEEDLES
+    roots = [
         ROOT / "python" / "control" / "actuate.py",
         ROOT / "python" / "planning" / "path_predictor.py",
         ROOT / "python" / "train" / "scene_lane_runtime.py",
     ]
-    targets.extend(sorted((ROOT / "python" / "perception").glob("*.py")))
-    for path in targets:
+    roots.extend(sorted((ROOT / "python" / "perception").glob("*.py")))
+    for path in roots:
         assert path.is_file(), path
-        _iso_banned(path, banned)
-    viz_banned = ("route_intent", "junction_grade", "navgraph", "navigraph", "beamngpy.tools")
-    for path in (ROOT / "python" / "viz").glob("*.py"):
-        _iso_banned(path, viz_banned)
-    print(f"  isolation: {len(targets)} control files + viz import no route intent or navgraph")
+    visited = _walk_python_imports(roots)
+    for path in visited:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        _iso_banned_names(_collect_imported_modules(path, tree), path, banned)
+    viz_files = sorted((ROOT / "python" / "viz").glob("*.py"))
+    for path in viz_files:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        _iso_banned_names(_collect_imported_modules(path, tree), path, banned)
+
+    allow = DISPLAY_NAV_ARG_ALLOWLIST | MODEL_ROUTE_INPUT_ALLOWLIST | HARMLESS_NAV_READS
+    assert MODEL_ROUTE_INPUT_ALLOWLIST.isdisjoint(CONTROL_CALL_NAMES)
+    assert MODEL_ROUTE_INPUT_ALLOWLIST.isdisjoint(DISPLAY_NAV_ARG_ALLOWLIST)
+    vision = ROOT / "python" / "run_vision.py"
+    tree = ast.parse(vision.read_text(encoding="utf-8"), filename=str(vision))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        owner, name = _call_func_parts(node.func)
+        if name is None:
+            continue
+        mentions = any(_expr_mentions_nav(arg) for arg in node.args)
+        mentions = mentions or any(
+            (kw.arg in NAV_ARG_KEYS) or (kw.value is not None and _expr_mentions_nav(kw.value))
+            for kw in node.keywords
+        )
+        if not mentions:
+            continue
+        if name in allow:
+            continue
+        if _is_control_call(owner, name):
+            label = f"{owner}.{name}" if owner else name
+            raise AssertionError(f"run_vision {label} must not take nav/turn/next_jct_m/route_src")
+        # Any other call that uses a nav= / turn= keyword is also a leak unless allowlisted.
+        if any(kw.arg in NAV_ARG_KEYS for kw in node.keywords):
+            label = f"{owner}.{name}" if owner else name
+            raise AssertionError(f"run_vision {label} must not take nav/turn/next_jct_m/route_src")
+    print(
+        f"  isolation: {len(visited)} transitive control modules + viz; "
+        f"run_vision control calls have no nav args "
+        f"(model allowlist={sorted(MODEL_ROUTE_INPUT_ALLOWLIST) or 'empty'})"
+    )
 
 
 def check_result_schema() -> None:
@@ -240,11 +403,45 @@ def check_run_vision_imports_but_planner_does_not() -> None:
     print("  run_vision merges display intent")
 
 
+def check_last_metre_snap() -> None:
+    """1 m and 0.5 m before T and Y keep the same turn as the 8 m pose.
+
+    The old nearest+1.0 m / remain=0 tie-break flipped S->YL to straight,
+    S->W from left to right, and dropped X->YL to none.
+    """
+    from python.sensors.route_intent import Graph, intent_from_pose, result_message
+
+    data = load_graph()
+    graph = Graph.from_fixture(data, "synth_a")
+    for dist in (1.0, 0.5):
+        right = intent_from_pose(graph, (0.0, -dist), goal="YL")
+        assert right["turn"] == "right", (dist, right)
+        assert right["next_jct_m"] is not None and 0.0 < float(right["next_jct_m"]) <= 2.0, (dist, right)
+        left = intent_from_pose(graph, (0.0, -dist), goal="W")
+        assert left["turn"] == "left", (dist, left)
+        assert left["next_jct_m"] is not None and 0.0 < float(left["next_jct_m"]) <= 2.0, (dist, left)
+    for east in (399.0, 399.5):
+        toward = intent_from_pose(graph, (east, 0.0), goal="YL")
+        assert toward["turn"] == "left", (east, toward)
+        assert toward["next_jct_m"] is not None and 0.0 < float(toward["next_jct_m"]) <= 2.0, (east, toward)
+    # Non-finite ego must not raise.
+    for xy in (
+        (float("nan"), 0.0),
+        (0.0, float("nan")),
+        (float("inf"), 0.0),
+        (0.0, float("-inf")),
+        (float("nan"), float("inf")),
+    ):
+        assert intent_from_pose(graph, xy, goal="YL") == result_message("none", None), xy
+    print("  last metre: S->YL stays right, S->W stays left, X->YL stays left; NaN/inf -> none")
+
+
 def main() -> None:
     check_isolation()
     check_result_schema()
     check_queue_put_ast()
     check_synthetic_turns()
+    check_last_metre_snap()
     check_no_route_and_missing()
     check_reuse_on_empty_get()
     check_inbox_rejects_extra_keys()

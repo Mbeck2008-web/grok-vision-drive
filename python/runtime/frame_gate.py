@@ -13,7 +13,7 @@ from typing import Any
 from python.control.actuate import stop_command
 
 DEFAULT_MAX_FRAME_AGE_MS = 300.0
-STALE_CAPTION = "LOW/STALE"
+STALE_CAPTION = "STALE"
 
 
 def require_max_frame_age_ms(value: float) -> float:

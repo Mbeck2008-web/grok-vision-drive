@@ -52,7 +52,8 @@ from python.viz.lane_roles import classify_lane_roles
 from python.runtime.state_io import steer_preview_path_ego
 from python.viz.forecast import predict_modes
 from python.viz.nerd import NERD_WIDTH, hit_test, render_panel, scene_note
-from python.viz.scene_ribbon import scene_ckpt_caption, scene_ckpt_display_gain, scene_ckpt_ribbon_polyline
+from python.runtime.frame_gate import STALE_CAPTION
+from python.viz.scene_ribbon import scene_ckpt_display_gain, scene_ckpt_ribbon_polyline
 
 VOID = (10, 8, 7)  # #07080a
 PAPER = (225, 230, 232)
@@ -1708,6 +1709,24 @@ def _draw_state_fans(img: np.ndarray, agents: list, cam: Cam) -> None:
 
 
 
+def _scene_ckpt_is_stale(state: dict[str, Any]) -> bool:
+    """True when the camera frame is past the capture cap (fail-closed)."""
+    if bool(state.get("frame_stale")):
+        return True
+    raw = state.get("scene_ckpt")
+    return isinstance(raw, dict) and bool(raw.get("frame_stale"))
+
+
+def scene_ckpt_mode_tag(state: dict[str, Any]) -> str | None:
+    """SHADOW / DRIVE / STALE for the stage HUD. Never LOW or conf text."""
+    raw = state.get("scene_ckpt") if isinstance(state.get("scene_ckpt"), dict) else None
+    if _scene_ckpt_is_stale(state):
+        return STALE_CAPTION
+    if raw is None:
+        return None
+    return "DRIVE" if raw.get("drive") else "SHADOW"
+
+
 def _ribbon_display_gain(state: dict[str, Any], path_conf: float) -> float:
     """Display-only opacity. Scene-ckpt confidence wins when present (same LOW floor)."""
     raw = state.get("scene_ckpt")
@@ -1891,10 +1910,17 @@ def render_stage(
             gain=(0.62 if preview else 1.0) * disp,
         )
         ribbon_on_ego = (path, path_conf, body_half, intent, preview)
+    if not _scene_ckpt_is_stale(state):
+        _draw_scene_ckpt_ribbon(img, state, cam)
     if show_path:
-        _draw_stop_bar(img, path, half_w, all_tracks, cipv_id, cam, is_halted(state))
+        if scene_ribbon is not None:
+            bar_path, _bar_conf = scene_ribbon
+            bar_half = EGO_WIDTH_M * 0.5
+        else:
+            bar_path, bar_half = path, half_w
+        # After the visible band so the bar is not covered by the ribbon fill.
+        _draw_stop_bar(img, bar_path, bar_half, all_tracks, cipv_id, cam, is_halted(state))
         _draw_path_world_overlay(img, state.get("path_world") or [], cam, state)
-    _draw_scene_ckpt_ribbon(img, state, cam)
 
     if (not clean) and dbg.viz_cost:
         draw_planner_cost(img, cam, path, path_width, all_tracks)
@@ -1976,24 +2002,18 @@ def render_stage(
     cam_lbl = "BEV debug" if ui.top_down else "chase 3/4"
     cv2.putText(img, cam_lbl, (stage_w - 120, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (90, 90, 90), 1, cv2.LINE_AA)
     note = scene_note(state)
-    ck = state.get("scene_ckpt") if isinstance(state.get("scene_ckpt"), dict) else None
-    if ck is not None:
-        try:
-            ck_conf = float(ck.get("confidence") or 0.0)
-        except (TypeError, ValueError):
-            ck_conf = 0.0
-        cap = scene_ckpt_caption(ck_conf)
-        if cap != "LOW":
-            cv2.putText(
-                img,
-                cap,
-                (190, 16),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.4,
-                PATH_BLUE,
-                1,
-                cv2.LINE_AA,
-            )
+    tag = scene_ckpt_mode_tag(state)
+    if tag:
+        cv2.putText(
+            img,
+            tag,
+            (190, 16),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            PATH_BLUE,
+            1,
+            cv2.LINE_AA,
+        )
     if note and not ((not clean) and dbg.viz_hud):
         cv2.putText(img, note[:72], (12, stage_h - 10 - hud_pad), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (134, 124, 114), 1, cv2.LINE_AA)
     if (not clean) and dbg.viz_hud:

@@ -257,9 +257,10 @@ def check_stage_ribbon_and_no_gt() -> None:
     below_low = int(low_delta[30:, :, :].sum())
     assert below_low > 0, "LOW confidence must still paint a dimmed ribbon on the stage"
     assert below_high > below_low, (below_high, below_low)
-    # Title bar must not spell LOW (dimming replaced the caption).
+    # Title bar must not spell LOW; the mode tag is tested in check_mode_tags_always_drawn.
     src = (ROOT / "python" / "viz" / "stage.py").read_text(encoding="utf-8")
-    assert 'if cap != "LOW"' in src
+    assert "scene_ckpt_mode_tag" in src
+    assert 'if cap != "LOW"' not in src
 
     # PIP stays up when the loop is under 8 Hz.
     main = np.full((180, 320, 3), (20, 220, 20), dtype=np.uint8)
@@ -618,8 +619,10 @@ def check_low_conf_dims_ribbon_no_text() -> None:
     for text in drawn:
         assert "conf=" not in text, text
         assert not str(text).startswith("LOW"), text
-    # The caption helper still names the kind (for logs); it must not be painted.
-    assert "conf=" in scene_ckpt_overlay_caption(low_pred)
+        assert "SHADOW" in text or "DRIVE" in text or "STALE" in text
+    # Helper is mode-only too: no numeric or LOW confidence text.
+    assert scene_ckpt_overlay_caption(low_pred) == "SHADOW"
+    assert "conf=" not in scene_ckpt_overlay_caption(low_pred)
     assert high is not None and low is not None
     blue = np.array(RIBBON_BGR, dtype=np.int16)
     high_full = int(np.any(np.all(np.abs(high.astype(np.int16) - blue) <= 8, axis=-1)))
@@ -694,6 +697,153 @@ def check_scene_ribbon_is_sole_blue_band() -> None:
     )
 
 
+
+def _is_conf_text(text: str) -> bool:
+    t = str(text)
+    return "conf=" in t or t.startswith("LOW") or t.startswith("LOW/")
+
+
+def check_mode_tags_always_drawn() -> None:
+    """SHADOW at conf 0.12 and 0.88; STALE when stale. A drop-SHADOW mutation dies."""
+    import cv2
+
+    from python.runtime.frame_gate import STALE_CAPTION
+    from python.train.scene_ckpt_runtime import (
+        SceneCkptPred,
+        draw_scene_ckpt_overlay,
+        scene_ckpt_overlay_caption,
+    )
+    from python.viz.stage import render_stage
+
+    high_pred = SceneCkptPred(lane_gt=_lane_gt([0.0, 0.0, 0.0, 0.0], 0.88), lane_x=0.0, confidence=0.88)
+    low_pred = SceneCkptPred(lane_gt=_lane_gt([0.0, 0.0, 0.0, 0.0], 0.12), lane_x=0.0, confidence=0.12)
+
+    assert scene_ckpt_overlay_caption(high_pred) == "SHADOW"
+    assert scene_ckpt_overlay_caption(low_pred) == "SHADOW"
+    assert scene_ckpt_overlay_caption(high_pred, drive=True, frame_stale=True) == STALE_CAPTION
+    assert scene_ckpt_overlay_caption(None, frame_stale=True) == STALE_CAPTION
+
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    drawn: list[str] = []
+    real_put = cv2.putText
+
+    def rec_put(img, text, *args, **kwargs):
+        drawn.append(str(text))
+        return real_put(img, text, *args, **kwargs)
+
+    cv2.putText = rec_put  # type: ignore[assignment]
+    try:
+        drawn.clear()
+        high = draw_scene_ckpt_overlay(frame, high_pred)
+        assert drawn == ["SHADOW"], drawn
+        drawn.clear()
+        low = draw_scene_ckpt_overlay(frame, low_pred)
+        assert drawn == ["SHADOW"], drawn
+        drawn.clear()
+        stale = draw_scene_ckpt_overlay(frame, high_pred, frame_stale=True)
+        assert drawn == [STALE_CAPTION], drawn
+        assert high is not None and low is not None and stale is not None
+        # Fail-closed: a stale frame must not paint the ribbon body.
+        high_body = high.copy(); high_body[:70, :200] = frame[:70, :200]
+        stale_body = stale.copy(); stale_body[:70, :200] = frame[:70, :200]
+        assert int(np.abs(high_body.astype(np.int16) - frame.astype(np.int16)).sum()) > 0
+        assert int(np.abs(stale_body.astype(np.int16) - frame.astype(np.int16)).sum()) == 0
+
+        ui = _stage_ui()
+        path = [{"x": 0.0, "y": float(i)} for i in range(0, 31)]
+        for pred, conf in ((high_pred, 0.88), (low_pred, 0.12)):
+            st = _corridor_state(path)
+            st["path_ego"] = [{"x": 2.0, "y": float(i)} for i in range(0, 31)]
+            st["scene_ckpt"] = pred.as_state()
+            drawn.clear()
+            render_stage(st, ui=ui)
+            assert "SHADOW" in drawn, (conf, drawn)
+            assert STALE_CAPTION not in drawn, (conf, drawn)
+            assert not any(_is_conf_text(t) for t in drawn), drawn
+
+        stale_st = _corridor_state(path)
+        stale_st["path_ego"] = [{"x": 2.0, "y": float(i)} for i in range(0, 31)]
+        stale_st["scene_ckpt"] = high_pred.as_state()
+        stale_st["scene_ckpt"]["frame_stale"] = True
+        drawn.clear()
+        stale_img = render_stage(stale_st, ui=ui)
+        assert STALE_CAPTION in drawn, drawn
+        assert "SHADOW" not in drawn, drawn
+        assert not any(_is_conf_text(t) for t in drawn), drawn
+
+        # Stage fail-closed: no ribbon body when stale (HUD tag still present).
+        # Bare has no scene_ckpt and no path_ego, so no corridor either.
+        fresh_st = dict(stale_st)
+        fresh_st["scene_ckpt"] = high_pred.as_state()
+        fresh_img = render_stage(fresh_st, ui=ui)
+        bare = dict(stale_st)
+        bare.pop("scene_ckpt", None)
+        bare["path_ego"] = []
+        missing = render_stage(bare, ui=ui)
+        assert stale_img is not None and fresh_img is not None
+        assert int(np.abs(fresh_img[30:].astype(np.int16) - missing[30:].astype(np.int16)).sum()) > 0
+        assert int(np.abs(stale_img[30:].astype(np.int16) - missing[30:].astype(np.int16)).sum()) == 0
+    finally:
+        cv2.putText = real_put  # type: ignore[assignment]
+    print("mode tags: SHADOW at 0.12 and 0.88, STALE when stale, no conf text OK")
+
+
+def check_stop_bar_anchors_to_visible_ribbon() -> None:
+    """When the scene ribbon is the only band, the AEB stop bar follows it, not hidden path_ego."""
+    import cv2
+
+    from python.train.scene_ckpt_runtime import SceneCkptPred
+    from python.viz.stage import Cam, EGO_WIDTH_M, render_stage
+
+    pred = SceneCkptPred(lane_gt=_lane_gt([0.0, 0.0, 0.0, 0.0], 0.9), lane_x=0.0, confidence=0.9)
+    st = _corridor_state([{"x": 2.0, "y": float(i)} for i in range(0, 31)], path_width=3.5)
+    st["scene_ckpt"] = pred.as_state()
+    st["engaged"] = True
+    st["ego"] = {"speed_mps": 0.0, "brake": 1.0}
+    st["planner"] = {
+        **st["planner"],
+        "aeb": "brake",
+        "target_v": 0.0,
+        "cipv_id": 1,
+        "ttc_lead": 0.8,
+    }
+    st["tracks"] = [{"id": 1, "x": 0.1, "y": 14.0, "class": "vehicle", "lead": True}]
+
+    ui = _stage_ui()
+    ui.top_down = True
+    ui.debug.viz_pip = False
+    # Hide the lead box so it cannot cover the bar we are measuring.
+    ui.debug.viz_ghosts = False
+    painted = render_stage(st, ui=ui)
+    no_lead = dict(st)
+    no_lead["tracks"] = []
+    no_lead["planner"] = {**st["planner"], "cipv_id": None}
+    empty = render_stage(no_lead, ui=ui)
+    delta = cv2.absdiff(painted, empty)
+    cam = Cam(top_down=True)
+    y_bar = 14.0 - 2.2
+    white = np.array([252, 248, 244], dtype=np.int16)
+    xs: list[float] = []
+    for x in np.linspace(-4.0, 4.0, 801):
+        px, py = cam.project(float(x), y_bar, 0.05)
+        if not (0 <= px < painted.shape[1] and 0 <= py < painted.shape[0]):
+            continue
+        if int(delta[py, px].sum()) <= 8:
+            continue
+        if int(np.abs(painted[py, px].astype(np.int16) - white).sum()) <= 24:
+            xs.append(float(x))
+    assert xs, "expected a white AEB stop bar at the lead's y-2.2 m"
+    mid = 0.5 * (min(xs) + max(xs))
+    half = EGO_WIDTH_M * 0.5
+    assert abs(mid) <= 0.35, f"bar mid x={mid:.3f} should sit on the ribbon at x=0, not path_ego at x=2"
+    assert max(xs) < 1.25, xs[-3:]
+    assert min(xs) > -1.25, xs[:3]
+    width = max(xs) - min(xs)
+    assert abs(width - EGO_WIDTH_M) / EGO_WIDTH_M <= 0.45, (width, EGO_WIDTH_M, mid)
+    assert mid < 1.0
+    print(f"stop-bar: mid x={mid:.3f} m width={width:.2f} m (ego half={half:.3f}) OK")
+
+
 def main() -> None:
     check_projection_monotonic()
     check_spline_through_knots()
@@ -708,6 +858,8 @@ def main() -> None:
     check_ribbon_width_matches_ego()
     check_low_conf_dims_ribbon_no_text()
     check_scene_ribbon_is_sole_blue_band()
+    check_mode_tags_always_drawn()
+    check_stop_bar_anchors_to_visible_ribbon()
     print("test_viz_fsd_ribbon: all OK")
 
 

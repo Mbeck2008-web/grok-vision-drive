@@ -172,15 +172,16 @@ def check_overlay_and_command() -> None:
     low = draw_scene_ckpt_overlay(frame, SceneCkptPred(lane_gt=pred.lane_gt, lane_x=0.5, confidence=0.2))
     none = draw_scene_ckpt_overlay(frame, None)
     assert none is not None and none.shape == frame.shape
-    # High-confidence overlay paints a blue ribbon; low-confidence does not.
+    # High-confidence overlay paints a full ribbon; low-confidence dims it (display only).
     blue = np.array([234, 126, 61], dtype=np.int16)
     high_blue = int(np.any(np.all(np.abs(high.astype(np.int16) - blue) <= 4, axis=-1)))
-    low_blue = int(np.any(np.all(np.abs(low.astype(np.int16) - blue) <= 4, axis=-1)))
+    low_full = int(np.any(np.all(np.abs(low.astype(np.int16) - blue) <= 4, axis=-1)))
     none_blue = int(np.any(np.all(np.abs(none.astype(np.int16) - blue) <= 4, axis=-1)))
     assert high_blue, "windshield overlay should paint the perceived ribbon"
-    assert not low_blue, "confidence 0.2 must not paint a ribbon"
+    assert not low_full, "confidence 0.2 must dim the ribbon, not paint it full-strength"
+    assert int(np.abs(low.astype(np.int16) - frame.astype(np.int16)).sum()) > 0
     assert not none_blue, "no scene-ckpt output must not paint a ribbon"
-    print("overlay + command: ribbon gated on confidence, command unchanged OK")
+    print("overlay + command: ribbon dims on low confidence, command unchanged OK")
 
 
 def _stage_ui():
@@ -249,11 +250,16 @@ def check_stage_ribbon_and_no_gt() -> None:
     low_st = dict(base)
     low_st["scene_ckpt"] = SceneCkptPred(lane_gt=pred.lane_gt, lane_x=0.5, confidence=0.2).as_state()
     low = render_stage(low_st, ui=ui2)
-    # LOW may add a caption but must not add a long ribbon; allow caption pixels.
-    delta = np.abs(low.astype(np.int16) - missing.astype(np.int16))
-    # Caption sits on the 22 px bar.
-    below = delta[30:, :, :]
-    assert int(below.sum()) == 0, "LOW confidence must not paint a ribbon on the stage"
+    # Low confidence still draws, but dimmer than the confident ribbon. No LOW text.
+    high_delta = np.abs(painted.astype(np.int16) - missing.astype(np.int16))
+    low_delta = np.abs(low.astype(np.int16) - missing.astype(np.int16))
+    below_high = int(high_delta[30:, :, :].sum())
+    below_low = int(low_delta[30:, :, :].sum())
+    assert below_low > 0, "LOW confidence must still paint a dimmed ribbon on the stage"
+    assert below_high > below_low, (below_high, below_low)
+    # Title bar must not spell LOW (dimming replaced the caption).
+    src = (ROOT / "python" / "viz" / "stage.py").read_text(encoding="utf-8")
+    assert 'if cap != "LOW"' in src
 
     # PIP stays up when the loop is under 8 Hz.
     main = np.full((180, 320, 3), (20, 220, 20), dtype=np.uint8)
@@ -413,6 +419,223 @@ def _once_blend_ms(shape: tuple[int, ...], nseg: int = 36) -> float:
     return float(np.median(times))
 
 
+
+def _heading_from_plus_y_deg(x0: float, y0: float, x1: float, y1: float) -> float:
+    import math
+
+    return math.degrees(math.atan2(x1 - x0, y1 - y0))
+
+
+def _screen_heading_deg(p0: tuple[int, int], p1: tuple[int, int]) -> float:
+    import math
+
+    return math.degrees(math.atan2(p1[0] - p0[0], -(p1[1] - p0[1])))
+
+
+def _corridor_state(path: list[dict], *, path_width: float = 2.0) -> dict:
+    return {
+        "engaged": False,
+        "loop_hz": 12.0,
+        "policy": "modular",
+        "e2e_backend": "stub",
+        "veto_reason": "none",
+        "path_conf": 0.95,
+        "path_width": float(path_width),
+        "path_debug_preview": False,
+        "viz_smoke": False,
+        "ego": {"speed_mps": 8.0, "brake": 0.0},
+        "planner": {"aeb": "off", "target_v": 8.0, "ttc_lead": 4.0, "corridor_width": float(path_width)},
+        "path_ego": path,
+        "tracks": [],
+        "lanes_ext": [],
+        "road_edges": [],
+        "signs": [],
+        "debug_gt": False,
+    }
+
+
+def _painted_xs(delta, cam, y_m: float, thresh: int = 8) -> list[float]:
+    xs: list[float] = []
+    for x in np.linspace(-3.0, 3.0, 601):
+        px, py = cam.project(float(x), y_m, 0.03)
+        if 0 <= px < delta.shape[1] and 0 <= py < delta.shape[0] and int(delta[py, px].sum()) > thresh:
+            xs.append(float(x))
+    return xs
+
+
+def check_no_dashed_ribbon_center() -> None:
+    """Fill and edge outline stay; nothing strokes a dashed line down the middle."""
+    import cv2
+
+    from python.viz.stage import Cam, render_stage
+
+    src = (ROOT / "python" / "viz" / "stage.py").read_text(encoding="utf-8")
+    func = src.split("def _draw_filled_corridor", 1)[1].split("\ndef ", 1)[0]
+    assert "_stroke_poly(img, center" not in func, "filled corridor must not stroke a center dashed line"
+
+    path = [{"x": 0.0, "y": float(i)} for i in range(0, 31)]
+    ui = _stage_ui()
+    ui.top_down = True
+    ui.debug.viz_pip = False
+    cam = Cam(top_down=True)
+    img = render_stage(_corridor_state(path), ui=ui)
+    cx, cy = cam.project(0.0, 12.0, 0.03)
+    ox, oy = cam.project(0.35, 12.0, 0.03)
+    center_c = img[cy, cx].astype(np.int16)
+    inner_c = img[oy, ox].astype(np.int16)
+    dist = int(np.abs(center_c - inner_c).sum())
+    assert dist <= 30, f"center should match ribbon fill, not a dash ({center_c} vs {inner_c}, dist={dist})"
+    print("no-dash: center matches fill, no center stroke OK")
+
+
+def check_straight_ribbon_aligned_with_ego() -> None:
+    """Straight model centers stay on ego +Y; left/right curves bend the correct way."""
+    from python.viz.stage import EGO_LENGTH_M, Cam, _ribbon_centerline
+
+    straight = [{"x": 0.0, "y": float(i)} for i in range(0, 31)]
+    samples = _ribbon_centerline(straight)
+    assert samples, "straight path must produce a ribbon centerline"
+    assert all(abs(p[0]) <= 1e-9 for p in samples), samples[:3]
+    headings = [
+        _heading_from_plus_y_deg(a[0], a[1], b[0], b[1])
+        for a, b in zip(samples, samples[1:])
+    ]
+    assert headings and max(abs(h) for h in headings) < 1.0, headings
+
+    cam = Cam()
+    rear = cam.project(0.0, -EGO_LENGTH_M * 0.5, 0.0)
+    front = cam.project(0.0, EGO_LENGTH_M * 0.5, 0.0)
+    box_h = _screen_heading_deg(rear, front)
+    rib_a = cam.project(0.0, 5.0, 0.03)
+    rib_b = cam.project(0.0, 25.0, 0.03)
+    rib_h = _screen_heading_deg(rib_a, rib_b)
+    assert abs(rib_h - box_h) < 1.0, (rib_h, box_h)
+
+    left = [{"x": -0.15 * float(i), "y": float(i)} for i in range(0, 21)]
+    right = [{"x": 0.15 * float(i), "y": float(i)} for i in range(0, 21)]
+    ls = _ribbon_centerline(left)
+    rs = _ribbon_centerline(right)
+    assert ls[-1][0] < -1.0 and rs[-1][0] > 1.0, (ls[-1], rs[-1])
+    h_left = _heading_from_plus_y_deg(0.0, 0.0, ls[-1][0], ls[-1][1])
+    h_right = _heading_from_plus_y_deg(0.0, 0.0, rs[-1][0], rs[-1][1])
+    assert h_left < -1.0, h_left
+    assert h_right > 1.0, h_right
+    print(
+        f"align: straight max|heading|={max(abs(h) for h in headings):.3f} deg, "
+        f"screen vs box {rib_h - box_h:.3f} deg, left {h_left:.2f} right {h_right:.2f} OK"
+    )
+
+
+def check_ribbon_width_matches_ego() -> None:
+    """Painted ribbon width is the ego box width, not the planner corridor."""
+    import cv2
+
+    from python.viz.stage import EGO_WIDTH_M, Cam, paint_half_m, render_stage
+
+    car_half = EGO_WIDTH_M * 0.5
+    for raw in (0.4, 1.0, 1.75):
+        got = paint_half_m(raw)
+        assert abs(got - car_half) <= 0.02 * car_half, (raw, got, car_half)
+
+    ui = _stage_ui()
+    ui.top_down = True
+    ui.debug.viz_pip = False
+    cam = Cam(top_down=True)
+    path = [{"x": 0.0, "y": float(i)} for i in range(0, 31)]
+    widths = {}
+    for pw in (0.8, 2.0, 3.5):
+        st = _corridor_state(path, path_width=pw)
+        painted = render_stage(st, ui=ui)
+        bare = dict(st)
+        bare["path_ego"] = []
+        empty = render_stage(bare, ui=ui)
+        delta = cv2.absdiff(painted, empty)
+        xs = _painted_xs(delta, cam, 12.0)
+        assert xs, pw
+        widths[pw] = max(xs) - min(xs)
+    ref = widths[2.0]
+    for pw, w in widths.items():
+        rel = abs(w - ref) / ref
+        assert rel <= 0.02, f"pw={pw} width={w:.3f} vs car-cap {ref:.3f} rel={rel:.3f}"
+    # A corridor narrower than the car must still paint about the ego width,
+    # not shrink to the lane/corridor number (0.8 m would be a clear miss).
+    assert widths[0.8] > 1.5, widths
+    print(f"width: paint_half_m always {car_half:.3f} m; rendered {widths} OK")
+
+
+def check_low_conf_dims_ribbon_no_text() -> None:
+    """Low confidence dims the ribbon; high stays full; no conf text either way.
+
+    Display only: apply_scene_ckpt_lane still returns stop below the live floor.
+    """
+    import cv2
+    from types import SimpleNamespace
+
+    from python.train.scene_ckpt_runtime import (
+        SceneCkptPred,
+        apply_scene_ckpt_lane,
+        draw_scene_ckpt_overlay,
+        scene_ckpt_overlay_caption,
+    )
+    from python.viz.scene_ribbon import RIBBON_BGR, SCENE_RIBBON_MIN_CONF
+
+    high_pred = SceneCkptPred(lane_gt=_lane_gt([0.0, 0.0, 0.0, 0.0], 0.88), lane_x=0.0, confidence=0.88)
+    low_pred = SceneCkptPred(lane_gt=_lane_gt([0.0, 0.0, 0.0, 0.0], 0.12), lane_x=0.0, confidence=0.12)
+    assert float(low_pred.confidence) < SCENE_RIBBON_MIN_CONF <= float(high_pred.confidence)
+
+    pout = SimpleNamespace(
+        path_ego=[{"x": 0.0, "y": 1.0}],
+        lane_conf=0.9,
+        path_conf=0.9,
+        lane_source="hough",
+        path_debug_preview=False,
+        planner={"target_v": 10.0},
+    )
+    assert apply_scene_ckpt_lane(pout, low_pred, drive=True) == "stop"
+    assert apply_scene_ckpt_lane(
+        SimpleNamespace(
+            path_ego=[], lane_conf=0.0, path_conf=0.0, lane_source="", path_debug_preview=False, planner={},
+        ),
+        high_pred,
+        drive=True,
+    ) == "lane"
+
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    drawn: list[str] = []
+    real_put = cv2.putText
+
+    def rec_put(img, text, *args, **kwargs):
+        drawn.append(str(text))
+        return real_put(img, text, *args, **kwargs)
+
+    cv2.putText = rec_put  # type: ignore[assignment]
+    try:
+        high = draw_scene_ckpt_overlay(frame, high_pred)
+        low = draw_scene_ckpt_overlay(frame, low_pred)
+    finally:
+        cv2.putText = real_put  # type: ignore[assignment]
+
+    for text in drawn:
+        assert "conf=" not in text, text
+        assert not str(text).startswith("LOW"), text
+    # The caption helper still names the kind (for logs); it must not be painted.
+    assert "conf=" in scene_ckpt_overlay_caption(low_pred)
+    assert high is not None and low is not None
+    blue = np.array(RIBBON_BGR, dtype=np.int16)
+    high_full = int(np.any(np.all(np.abs(high.astype(np.int16) - blue) <= 8, axis=-1)))
+    low_full = int(np.any(np.all(np.abs(low.astype(np.int16) - blue) <= 8, axis=-1)))
+    assert high_full, "normal confidence should paint a full-strength ribbon"
+    assert not low_full, "low confidence should not paint a full-strength ribbon"
+    # Ignore the top-left swatch so a color chip alone cannot pass as a ribbon.
+    high_body = high.copy(); high_body[:70, :60] = frame[:70, :60]
+    low_body = low.copy(); low_body[:70, :60] = frame[:70, :60]
+    low_delta = int(np.abs(low_body.astype(np.int16) - frame.astype(np.int16)).sum())
+    high_delta = int(np.abs(high_body.astype(np.int16) - frame.astype(np.int16)).sum())
+    assert low_delta > 0, "low confidence must still draw a dimmed ribbon"
+    assert high_delta > low_delta, (high_delta, low_delta)
+    print("low-conf display: dimmed ribbon, full at 0.88, no conf text, gate still stops OK")
+
+
 def main() -> None:
     check_projection_monotonic()
     check_spline_through_knots()
@@ -422,6 +645,10 @@ def main() -> None:
     check_stage_ribbon_and_no_gt()
     check_clip_hold()
     check_bench_reports_cpu_ms()
+    check_no_dashed_ribbon_center()
+    check_straight_ribbon_aligned_with_ego()
+    check_ribbon_width_matches_ego()
+    check_low_conf_dims_ribbon_no_text()
     print("test_viz_fsd_ribbon: all OK")
 
 

@@ -52,7 +52,7 @@ from python.viz.lane_roles import classify_lane_roles
 from python.runtime.state_io import steer_preview_path_ego
 from python.viz.forecast import predict_modes
 from python.viz.nerd import NERD_WIDTH, hit_test, render_panel, scene_note
-from python.viz.scene_ribbon import RIBBON_BGR, paint_tapered_ribbon, scene_ckpt_caption, scene_ckpt_ribbon_polyline
+from python.viz.scene_ribbon import RIBBON_BGR, paint_tapered_ribbon, scene_ckpt_caption, scene_ckpt_display_gain, scene_ckpt_ribbon_polyline
 
 VOID = (10, 8, 7)  # #07080a
 PAPER = (225, 230, 232)
@@ -1284,8 +1284,10 @@ def ribbon_half_m(dist_m: float, steady_half: float) -> float:
 
 
 def paint_half_m(half_w: float) -> float:
-    """Steady ribbon half-width. A lane-wide corridor still paints about the car."""
-    return min(max(0.0, float(half_w)), EGO_WIDTH_M * 0.5)
+    """Steady ribbon half-width: the ego box, not a planner or lane width."""
+    # half_w is the corridor/path half; the painted ribbon follows the body.
+    del half_w
+    return EGO_WIDTH_M * 0.5
 
 
 def _ribbon_centerline(path: list[dict], *, connect_origin: bool = True) -> list[tuple[float, float, float]]:
@@ -1435,7 +1437,6 @@ def _draw_filled_corridor(
         edge = _mix(ICE_HI, 0.8 * alphas[i])
         _stroke_poly(img, [left[i], left[i + 1]], edge, 2, dashed=preview, dash=5, gap=4)
         _stroke_poly(img, [right[i], right[i + 1]], edge, 2, dashed=preview, dash=5, gap=4)
-    _stroke_poly(img, center, _mix(ICE, 0.30), 1, dashed=True, dash=4, gap=5)
     if mark_origin and dists[0] <= 0.02:
         sc = cam.scale_at(samples[0][1])
         rad = max(2, min(4, int(round(0.08 * sc))))
@@ -1706,6 +1707,17 @@ def _draw_state_fans(img: np.ndarray, agents: list, cam: Cam) -> None:
 
 
 
+def _ribbon_display_gain(state: dict[str, Any], path_conf: float) -> float:
+    """Display-only opacity. Scene-ckpt confidence wins when present (same LOW floor)."""
+    raw = state.get("scene_ckpt")
+    if isinstance(raw, dict):
+        try:
+            return scene_ckpt_display_gain(float(raw.get("confidence") or 0.0))
+        except (TypeError, ValueError):
+            return scene_ckpt_display_gain(0.0)
+    return scene_ckpt_display_gain(path_conf)
+
+
 def _draw_scene_ckpt_ribbon(img: np.ndarray, state: dict[str, Any], cam: Cam) -> None:
     """Perceived lane centers from --scene-ckpt. Never writes path_ego."""
     raw = state.get("scene_ckpt")
@@ -1718,14 +1730,16 @@ def _draw_scene_ckpt_ribbon(img: np.ndarray, state: dict[str, Any], cam: Cam) ->
     centers = raw.get("centers")
     if not isinstance(centers, list):
         return
-    poly = scene_ckpt_ribbon_polyline(centers, conf)
+    poly = scene_ckpt_ribbon_polyline(centers, conf, min_conf=0.0)
     if len(poly) < 2:
         return
 
     def _project(x: float, y: float) -> tuple[int, int]:
         return cam.project(x, y, 0.0)
 
-    paint_tapered_ribbon(img, poly, _project, RIBBON_BGR)
+    paint_tapered_ribbon(
+        img, poly, _project, RIBBON_BGR, gain=scene_ckpt_display_gain(conf),
+    )
 
 
 def render_stage(
@@ -1837,6 +1851,7 @@ def render_stage(
     if show_path:
         intent = pace_scale(state)
         body_half = paint_half_m(half_w)
+        disp = _ribbon_display_gain(state, path_conf)
         # Preview stays dimmer. A shadow ghost is thinner and only off the clean cabin.
         if ghost and not clean:
             _draw_filled_corridor(
@@ -1844,14 +1859,14 @@ def render_stage(
                 half_w=paint_half_m(half_w) * 0.62,
                 intent=intent * 0.40,
                 preview=False,
-                gain=0.55 if preview else 1.0,
+                gain=(0.55 if preview else 1.0) * disp,
             )
         _draw_filled_corridor(
             img, path, path_conf, cam,
             half_w=body_half,
             intent=intent,
             preview=preview,
-            gain=0.62 if preview else 1.0,
+            gain=(0.62 if preview else 1.0) * disp,
         )
         _draw_stop_bar(img, path, half_w, all_tracks, cipv_id, cam, is_halted(state))
         _draw_path_world_overlay(img, state.get("path_world") or [], cam, state)
@@ -1897,7 +1912,7 @@ def render_stage(
             half_w=body_half,
             intent=intent_r,
             preview=preview_r,
-            gain=0.62 if preview_r else 1.0,
+            gain=(0.62 if preview_r else 1.0) * _ribbon_display_gain(state, conf_r),
             max_dist=RIBBON_FLARE_M + 0.45,
             mark_origin=True,
         )
@@ -1944,16 +1959,18 @@ def render_stage(
             ck_conf = float(ck.get("confidence") or 0.0)
         except (TypeError, ValueError):
             ck_conf = 0.0
-        cv2.putText(
-            img,
-            scene_ckpt_caption(ck_conf),
-            (190, 16),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.4,
-            PATH_BLUE,
-            1,
-            cv2.LINE_AA,
-        )
+        cap = scene_ckpt_caption(ck_conf)
+        if cap != "LOW":
+            cv2.putText(
+                img,
+                cap,
+                (190, 16),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.4,
+                PATH_BLUE,
+                1,
+                cv2.LINE_AA,
+            )
     if note and not ((not clean) and dbg.viz_hud):
         cv2.putText(img, note[:72], (12, stage_h - 10 - hud_pad), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (134, 124, 114), 1, cv2.LINE_AA)
     if (not clean) and dbg.viz_hud:

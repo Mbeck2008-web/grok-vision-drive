@@ -25,6 +25,7 @@ from python.viz.scene_ribbon import (
     paint_tapered_ribbon,
     scene_ckpt_caption,
     scene_ckpt_centers,
+    scene_ckpt_display_gain,
     scene_ckpt_ribbon_polyline,
 )
 
@@ -201,21 +202,21 @@ def draw_scene_ckpt_overlay(
         return out
     color = overlay_bgr("shadow")
     h, w = int(out.shape[0]), int(out.shape[1])
-    caption = scene_ckpt_overlay_caption(pred, drive=drive)
-    cv2.putText(out, caption, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
     # Solid swatch so tests (and a clip) can see the mark without anti-alias blending.
+    # Confidence is shown by ribbon opacity, not text.
     cv2.rectangle(out, (12, 36), (40, 56), color, -1)
     if pred is None or pred.lane_gt is None:
         return out
-    if float(pred.confidence) < SCENE_RIBBON_MIN_CONF:
-        return out
     centers = scene_ckpt_centers(pred.lane_gt)
-    poly = scene_ckpt_ribbon_polyline(centers, pred.confidence)
+    # min_conf=0: low confidence still strokes, at display gain ~0.40.
+    poly = scene_ckpt_ribbon_polyline(centers, pred.confidence, min_conf=0.0)
 
     def _project(x: float, y: float) -> tuple[int, int] | None:
         return project_main_ground(x, y, w, h)
 
-    paint_tapered_ribbon(out, poly, _project, RIBBON_BGR)
+    paint_tapered_ribbon(
+        out, poly, _project, RIBBON_BGR, gain=scene_ckpt_display_gain(pred.confidence),
+    )
     return out
 
 

@@ -39,9 +39,9 @@ Windows. You do not need an administrator account. The full agent procedure (Tec
 
 `python/run_vision.py --viz` opens one OpenCV window named **GVD VISION**. The left part is the stage (the 3D view of what GVD sees). The right part is the nerd panel with tabs.
 
-![GVD VISION cabin, synthetic render](docs/media/gvd_cabin_synthetic.png)
+![GVD VISION supervisor ribbon, offline render](docs/img/viz-ribbon.png)
 
-*Synthetic render from `scripts/render_readme_media.py`, not a live capture. See [docs/media/SOURCE.md](docs/media/SOURCE.md).*
+*Offline render of the GVD VISION stage (chase 3/4). The blue ribbon is as wide as the ego box and has no dashed center line. It shows camera and model detections only, not BeamNG ground truth. This frame is shadow mode: the model is watching. Low confidence dims the ribbon instead of printing overlay text such as `LOW conf=0.12`; gating, engage, and AEB are unchanged. Live driving is unproven. Not a live capture.*
 
 ![GVD VISION at an intersection, offline render](docs/media/gvd_viz_intersection_stage.png)
 
@@ -52,7 +52,7 @@ Windows. You do not need an administrator account. The full agent procedure (Tec
 | Element | What it shows | Default | Status |
 | --- | --- | --- | --- |
 | Glance word | `OFF` / `ON` / `HOLD` / `DRIVE` / `MISMATCH`. HOLD covers preview, veto, AEB and a stale heartbeat. DRIVE needs a live apply. The in-game app and strip use the same word. | shown | Offline smoke only |
-| Ice-blue ego ribbon | The planned path. It starts as a point at the car center, opens to the car width by the nose, then follows the path and stops where the path ends. | on (VIZ `corridor ribbon`) | Offline smoke only |
+| Perceived-lane ribbon | A solid blue band as wide as the ego vehicle. It starts as a point at the car center, opens to the vehicle width by the nose, and follows the lane the cameras or model see. No dashed line down the middle. Confidence below 0.40 dims the ribbon to about 40% opacity instead of drawing confidence text on the camera, clip, or stage. Shadow mode shows a SHADOW tag (BeamNG AI driving, model watching). Live driving is unproven. | on (VIZ `corridor ribbon`) | Offline smoke only |
 | Lane overlays | Seen and predicted lane lines, yellow and white. A line stops where the lane cannot be seen or predicted. Merges, exits and through lanes are drawn by role. | on (VIZ `lane paint`) | Offline smoke only |
 | Curbs | Warm grey-red line 0.4 m outside the outermost real line. Predicted, not detected. | on with lanes | Offline smoke only |
 | Agent boxes | Empty solid boxes for tracked cars. `LEAD` on the closest in-path vehicle, `BRAKE` when it is a hazard. | on (VIZ `track boxes`) | Offline smoke only |

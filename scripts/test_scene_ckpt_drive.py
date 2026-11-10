@@ -437,11 +437,10 @@ def check_overlay_caption_drive_kind() -> None:
 
 
 def check_overlay_caption_drawn_through_draw() -> None:
-    """Lock caption wiring through draw_scene_ckpt_overlay itself (not just the helper).
+    """Display-only: the camera/clip overlay must not print confidence text.
 
-    Skeptic M2: draw_scene_ckpt_overlay calling scene_ckpt_overlay_caption(pred,
-    drive=False) shows SHADOW on screen while the car is driving. Recording
-    cv2.putText must catch that. Also keeps M1 (DRIVE at conf 0.10) dead.
+    The helper still names LOW/DRIVE/SHADOW for logs and tests. The draw path
+    dims the ribbon instead of painting those words.
     """
     import cv2
 
@@ -457,24 +456,13 @@ def check_overlay_caption_drawn_through_draw() -> None:
     frame = np.zeros((120, 320, 3), dtype=np.uint8)
     cv2.putText = recording_put_text  # type: ignore[assignment]
     try:
-        drawn.clear()
         draw_scene_ckpt_overlay(frame, _pred(lane_x=-0.8, confidence=0.91), drive=True)
-        assert drawn, "draw_scene_ckpt_overlay never called putText"
-        assert drawn[0].startswith("DRIVE lane_x="), drawn[0]
-
-        drawn.clear()
         draw_scene_ckpt_overlay(frame, _pred(lane_x=-0.8, confidence=0.91), drive=False)
-        assert drawn, "draw_scene_ckpt_overlay never called putText"
-        assert drawn[0].startswith("SHADOW"), drawn[0]
-
-        drawn.clear()
         draw_scene_ckpt_overlay(frame, _pred(lane_x=-0.8, confidence=0.10), drive=True)
-        assert drawn, "draw_scene_ckpt_overlay never called putText"
-        assert drawn[0].startswith("LOW"), drawn[0]
-        assert not drawn[0].startswith("DRIVE"), drawn[0]
     finally:
         cv2.putText = real_put_text  # type: ignore[assignment]
-    print("overlay caption via draw_scene_ckpt_overlay putText: DRIVE/SHADOW/LOW OK")
+    assert drawn == [], drawn
+    print("overlay caption via draw_scene_ckpt_overlay: no confidence text OK")
 
 
 def check_same_tick_observe_documented() -> None:

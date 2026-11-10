@@ -636,6 +636,64 @@ def check_low_conf_dims_ribbon_no_text() -> None:
     print("low-conf display: dimmed ribbon, full at 0.88, no conf text, gate still stops OK")
 
 
+def check_scene_ribbon_is_sole_blue_band() -> None:
+    """When the perceived ribbon is shown: one ego-width blue band, no cyan corridor, nothing behind the bumper."""
+    import cv2
+
+    from python.train.scene_ckpt_runtime import SceneCkptPred
+    from python.viz.stage import (
+        CORRIDOR,
+        EGO_LENGTH_M,
+        EGO_WIDTH_M,
+        PATH_BLUE,
+        Cam,
+        render_stage,
+    )
+
+    bumper = EGO_LENGTH_M * 0.5
+    pred = SceneCkptPred(lane_gt=_lane_gt([0.0, 0.0, 0.0, 0.0], 0.9), lane_x=0.0, confidence=0.9)
+    st = _corridor_state([{"x": 2.0, "y": float(i)} for i in range(0, 31)], path_width=3.5)
+    st["scene_ckpt"] = pred.as_state()
+    ui = _stage_ui()
+    ui.top_down = True
+    ui.debug.viz_pip = False
+    painted = render_stage(st, ui=ui)
+    bare = dict(st)
+    bare["path_ego"] = []
+    bare.pop("scene_ckpt", None)
+    empty = render_stage(bare, ui=ui)
+    delta = cv2.absdiff(painted, empty)
+    cam = Cam(top_down=True)
+
+    def painted_at(x: float, y: float, thresh: int = 12) -> bool:
+        px, py = cam.project(float(x), float(y), 0.03)
+        return int(delta[py, px].sum()) > thresh
+
+    assert not painted_at(0.0, 0.0), "ribbon/corridor must not draw at the vehicle center"
+    assert not painted_at(0.0, 1.0), "nothing should be drawn behind the ego front bumper"
+    assert not painted_at(2.0, 12.0), "path_ego corridor layer must not draw when the scene ribbon is shown"
+    assert painted_at(0.0, 12.0), "the perceived ribbon should paint ahead of the car"
+
+    # Colour: PATH_BLUE, not the ice-cyan corridor fill.
+    px, py = cam.project(0.0, 12.0, 0.03)
+    pix = painted[py, px].astype(np.int16)
+    d_blue = int(np.abs(pix - np.array(PATH_BLUE, dtype=np.int16)).sum())
+    d_cyan = int(np.abs(pix - np.array(CORRIDOR, dtype=np.int16)).sum())
+    assert d_blue < d_cyan, (tuple(pix), d_blue, d_cyan)
+
+    xs = _painted_xs(delta, cam, 12.0)
+    assert xs, "expected a ribbon cross-section past the nose"
+    width = max(xs) - min(xs)
+    assert abs(width - EGO_WIDTH_M) / EGO_WIDTH_M <= 0.35, (width, EGO_WIDTH_M)
+    assert min(xs) > -1.5 and max(xs) < 1.5, xs[:3]
+    # Starts at the bumper, not at the cabin origin.
+    assert not painted_at(0.0, bumper - 0.6)
+    assert painted_at(0.0, bumper + 0.8)
+    print(
+        f"sole-ribbon: no cabin wedge, no offset corridor, blue@12m width={width:.2f} m OK"
+    )
+
+
 def main() -> None:
     check_projection_monotonic()
     check_spline_through_knots()
@@ -649,6 +707,7 @@ def main() -> None:
     check_straight_ribbon_aligned_with_ego()
     check_ribbon_width_matches_ego()
     check_low_conf_dims_ribbon_no_text()
+    check_scene_ribbon_is_sole_blue_band()
     print("test_viz_fsd_ribbon: all OK")
 
 

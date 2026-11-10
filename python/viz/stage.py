@@ -52,7 +52,7 @@ from python.viz.lane_roles import classify_lane_roles
 from python.runtime.state_io import steer_preview_path_ego
 from python.viz.forecast import predict_modes
 from python.viz.nerd import NERD_WIDTH, hit_test, render_panel, scene_note
-from python.viz.scene_ribbon import RIBBON_BGR, paint_tapered_ribbon, scene_ckpt_caption, scene_ckpt_display_gain, scene_ckpt_ribbon_polyline
+from python.viz.scene_ribbon import scene_ckpt_caption, scene_ckpt_display_gain, scene_ckpt_ribbon_polyline
 
 VOID = (10, 8, 7)  # #07080a
 PAPER = (225, 230, 232)
@@ -1369,6 +1369,7 @@ def _draw_filled_corridor(
     mark_origin: bool = False,
     fill: tuple[int, int, int] | None = None,
     connect_origin: bool = True,
+    flare: bool = True,
 ) -> None:
     if len(path) < 2 or half_w <= 0.0:
         return
@@ -1391,7 +1392,7 @@ def _draw_filled_corridor(
             nx, ny = x - (nx - x), y - (ny - y)
         tx, ty = nx - x, ny - y
         norm = math.hypot(tx, ty) + 1e-6
-        local = ribbon_half_m(d, half_w)
+        local = ribbon_half_m(d, half_w) if flare else half_w
         ox, oy = (ty / norm) * local, (-tx / norm) * local
         if total <= 1e-3 or d <= fade_from:
             fade = 1.0
@@ -1718,27 +1719,47 @@ def _ribbon_display_gain(state: dict[str, Any], path_conf: float) -> float:
     return scene_ckpt_display_gain(path_conf)
 
 
-def _draw_scene_ckpt_ribbon(img: np.ndarray, state: dict[str, Any], cam: Cam) -> None:
-    """Perceived lane centers from --scene-ckpt. Never writes path_ego."""
+def _scene_ckpt_ribbon_path(state: dict[str, Any]) -> tuple[list[dict[str, float]], float] | None:
+    """Finite model centers as a draw path, starting at the front bumper.
+
+    Does not invent a 0–bumper run through the cabin. The first published
+    lateral offset is held back to ``EGO_LENGTH_M / 2`` so the band meets
+    the nose at full ego width.
+    """
     raw = state.get("scene_ckpt")
     if not isinstance(raw, dict):
-        return
+        return None
     try:
         conf = float(raw.get("confidence") or 0.0)
     except (TypeError, ValueError):
-        return
+        return None
     centers = raw.get("centers")
     if not isinstance(centers, list):
-        return
+        return None
     poly = scene_ckpt_ribbon_polyline(centers, conf, min_conf=0.0)
     if len(poly) < 2:
+        return None
+    bumper_y = EGO_LENGTH_M * 0.5
+    if float(poly[0]["y"]) > bumper_y + 1e-6:
+        poly = [{"x": float(poly[0]["x"]), "y": bumper_y}] + list(poly)
+    return poly, conf
+
+
+def _draw_scene_ckpt_ribbon(img: np.ndarray, state: dict[str, Any], cam: Cam) -> None:
+    """Perceived lane centers from --scene-ckpt. Never writes path_ego."""
+    got = _scene_ckpt_ribbon_path(state)
+    if got is None:
         return
-
-    def _project(x: float, y: float) -> tuple[int, int]:
-        return cam.project(x, y, 0.0)
-
-    paint_tapered_ribbon(
-        img, poly, _project, RIBBON_BGR, gain=scene_ckpt_display_gain(conf),
+    poly, conf = got
+    _draw_filled_corridor(
+        img, poly, 1.0, cam,
+        half_w=EGO_WIDTH_M * 0.5,
+        intent=1.0,
+        preview=False,
+        gain=scene_ckpt_display_gain(conf),
+        fill=PATH_BLUE,
+        connect_origin=False,
+        flare=False,
     )
 
 
@@ -1848,7 +1869,8 @@ def render_stage(
     tracks = all_tracks if show_ghosts else []
 
     ribbon_on_ego = None
-    if show_path:
+    scene_ribbon = _scene_ckpt_ribbon_path(state)
+    if show_path and scene_ribbon is None:
         intent = pace_scale(state)
         body_half = paint_half_m(half_w)
         disp = _ribbon_display_gain(state, path_conf)
@@ -1868,9 +1890,10 @@ def render_stage(
             preview=preview,
             gain=(0.62 if preview else 1.0) * disp,
         )
+        ribbon_on_ego = (path, path_conf, body_half, intent, preview)
+    if show_path:
         _draw_stop_bar(img, path, half_w, all_tracks, cipv_id, cam, is_halted(state))
         _draw_path_world_overlay(img, state.get("path_world") or [], cam, state)
-        ribbon_on_ego = (path, path_conf, body_half, intent, preview)
     _draw_scene_ckpt_ribbon(img, state, cam)
 
     if (not clean) and dbg.viz_cost:

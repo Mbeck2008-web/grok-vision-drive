@@ -841,6 +841,16 @@ def _nav_line(s: dict[str, Any]) -> str:
                 bits.append(f"brg {float(rel):+.0f}deg")
             except (TypeError, ValueError):
                 pass
+    turn = str(nav.get("turn") or "none")
+    nxt = nav.get("next_jct_m")
+    if turn in ("left", "right", "straight"):
+        bits.append(f"intent {turn}")
+        if nxt is not None:
+            try:
+                bits.append(f"{float(nxt):.0f}m")
+            except (TypeError, ValueError):
+                pass
+    elif pin:
         bits.append("not routing")
     return " ".join(bits)
 

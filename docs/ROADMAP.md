@@ -324,24 +324,37 @@ Follow `docs/SPEC_intersections.md` rather than inventing a second intersection 
 - Deps: #199 viz contract; never draw GT even as a debug default in shipped builds.
 - Effort: M. Owner: local.
 
-Pedestrians stay out of scope. Parking-as-a-mode stays out of scope. When this phase's live gates are mostly green, GVD is ready for Phase F.
+Pedestrians stay out of scope. Parking-as-a-mode stays out of scope. When this phase's live gates are mostly green — especially intersections and stoplight handling, tested offline and live with Michael present — GVD is ready for Phase Collect, then Phase F.
+
+### Phase Collect — 8–10+ hour diverse recording
+
+Trigger (Michael): intersections and stoplight handling work and have been tested (Phase E, at least E1 vision stops / M3a and E2 live junction prove / M4). Then record one long, diverse run before any rented-GPU baseline training.
+
+**Collect1. One 8–10+ hour mixed session**
+- Goal: a single planned collection of **at least 8 hours**, preferably 10 or more, after the intersection and signal stack is proven enough to label what is recorded. Cover highway speeds, junctions, traffic signals (where the map actually has them), night and weather if the AUTO / collector cycles are available, and more than one map from the existing list (west_coast_usa plus at least one of italy, east_coast_usa, utah, jungle_rock_island).
+- Why: today's ~4 h, mostly WCUSA paint-following, is too narrow to train the ship baselines. Phase F trains every preset on this run (plus earlier data if it stays in the mix), not on the short development set alone.
+- Deps: Phase E intersection and stoplight gates; collector hooks from Phase C (junction crossings, sign/lamp sidecar, stop-line labels) so the hours can actually be labelled. Do not invent paint, lamps, or map contents. No deletion of existing recordings without Michael's OK on an exact list.
+- Files: `scripts/collect_scene_lanes.py` flags already on main (maps rotation, weather, time of day, speed range, spawn mix); status in `collect.json`. No new actuation.
+- Labels: painted lanes, stop-lines, junction sidecars, and sign/lamp GT where the APIs and maps provide them. Training-only sensors stay training-only.
+- Accept: `collect.json` (or the run log) shows elapsed time ≥ 8 h. A short written mix report lists hours (or frame counts) by map, day vs night, weather, highway vs city, and `in_jct` / signal-row counts — using the real numbers, and marking a category unavailable if a map has no signals or night/weather was not run. Valid-label share and the damage sensor are checked the same way as earlier recordings. UNPROVEN until that log exists.
+- Effort: L (machine time; BeamNG AI may drive). Owner: IQU45 run. Live model drive is not part of this recording.
 
 ### Phase F — Rent a GPU and ship baseline models
 
-Trigger (Michael): intersections and the other in-game features are at mostly-works (no pedestrians). Then rent a GPU and train the full size set to ship with GVD.
+Trigger (Michael): intersections and the other in-game features are at mostly-works (no pedestrians), **and** the Phase Collect 8–10+ hour diverse run is on disk. Then rent a GPU and train the full size set to ship with GVD.
 
 **F1. Cloud trainer bring-up**
 - Goal: one RunPod (or equal) 3090 job that reproduces the IQU45 `train_scene` invocation: same `--holdout-blocks`, `--mask-events`, `--holdout-source`, LR `1e-3`, no `--ctl-cond`, mixed precision allowed on the 3090 (compute ≥ 7.0), FP32 export.
 - Why: one 1080 Ti cannot train five sizes in a reasonable time; a 3090 at about $0.22/hr is the recorded first choice.
-- Deps: Phase E mostly-works; A4 presets merged; cache-friendly dataset pack (no deletion of raw IQU45 data).
+- Deps: Phase E mostly-works; Phase Collect pack (the 8–10+ hour diverse run, plus earlier recordings if they remain in the mix); A4 presets merged; cache-friendly dataset pack (no deletion of raw IQU45 data).
 - Files: a `docs/CLOUD_TRAIN.md` (or a section in the README) with the exact commands, image, and data layout.
 - Accept: a smoke epoch on the rented box that matches the local dry-run shapes; dollars and hours logged, not guessed after the fact.
 - Effort: M. Owner: IQU45 data export + cloud run. Needs Michael's yes to spend.
 
 **F2. Train every preset on the same data and the same holdout**
-- Goal: tiny / small / medium / large / xl (or the preset names A4 ships), one checkpoint family per tier.
+- Goal: tiny / small / medium / large / xl (or the preset names A4 ships), one checkpoint family per tier, trained on the Phase Collect diverse run (and any earlier roots kept in that combined set).
 - Why: users try a stock model that fits their card, then compare their own training.
-- Deps: F1, A4.
+- Deps: F1, A4, Phase Collect.
 - Accept: each size writes `metrics.json`, the ONNX (FP32 graph), and the epoch npz. Score all of them with `scripts/eval_onnx_holdout.py` on the **same** holdout rows (`rows_sha` must match). Publish the table; do not invent cells.
 - Effort: L (mostly GPU hours). Owner: cloud run.
 
@@ -374,7 +387,7 @@ C2 stop-line labels ────────────────────
 C3 M1 GPS intent ────────────────────────────► E3 M5 pin ───────► E2
 C4 sign/lamp GT ─────────────────────────────► E1 / E6
 C6 cone + lead lamp ─► #199 heads become real ─► D2/D3 extras
-D* + E* mostly works ─► F1–F5 cloud baselines
+D* + E* mostly works ─► Collect 8–10+ h diverse run ─► F1–F5 cloud baselines
 B2 NMS, B3 file bus can proceed in parallel as soon as A1 is not conflicting
 ```
 

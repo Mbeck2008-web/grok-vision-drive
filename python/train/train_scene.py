@@ -472,31 +472,42 @@ def build_parser() -> argparse.ArgumentParser:
             "have stops the run. name@sha256prefix (8+ hex digits) also stops on a sha256 mismatch."
         ),
     )
-    parser.add_argument(
+    ww = parser.add_mutually_exclusive_group()
+    ww.add_argument(
         "--drop-wrong-way",
         action="store_true",
         help=(
-            "Leave out frames where the recorded car is going against a one-way / divided "
-            "carriageway or in the opposing lane of a two-way road (see docs/SPEC_frame_quality_filter.md). "
-            "Uses state.jsonl poses plus a road dump (honors flipDirection). Off by default. "
-            "Deploy stays camera-only. Filtered-run metrics are not comparable to an unfiltered run."
+            "Accepted for compatibility: wrong-way frames are already dropped by default "
+            "(see docs/SPEC_frame_quality_filter.md). If the road dump is missing, fail "
+            "instead of keeping those frames. Deploy stays camera-only. Filtered-run "
+            "metrics are not comparable to an unfiltered run."
+        ),
+    )
+    ww.add_argument(
+        "--keep-wrong-way",
+        action="store_true",
+        help=(
+            "Keep wrong-way frames (opt out of the default drop). Uses state.jsonl poses "
+            "plus a road dump when the drop is on (honors flipDirection)."
         ),
     )
     parser.add_argument(
         "--road-dump",
         default="",
         help=(
-            "Road-network dump for --drop-wrong-way (the collect road_dump json/json.gz). "
+            "Road-network dump for the wrong-way filter (the collect road_dump json/json.gz). "
             "Default: <data>/roads/<map>.json.gz from the recording's map field."
         ),
     )
+    from python.train.frame_quality import DEFAULT_MAX_ROAD_CLIP
+
     parser.add_argument(
         "--max-road-clip",
         type=float,
-        default=-1.0,
+        default=DEFAULT_MAX_ROAD_CLIP,
         help=(
-            "Drop frames whose lower-half any-channel clip (RGB>=250) exceeds this fraction "
-            "(0.20 is the suggested cut). Default -1 disables the check."
+            "Drop frames whose lower-half any-channel clip (RGB>=250) exceeds this fraction. "
+            f"Default {DEFAULT_MAX_ROAD_CLIP}. Pass -1 to disable."
         ),
     )
     parser.add_argument(
@@ -659,6 +670,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="With --backbone imagenet-*, keep the ImageNet weights fixed and train only the projection and heads.",
     )
     return parser
+
+
+def frame_quality_from_args(args: argparse.Namespace) -> tuple[bool, bool, float, str]:
+    """Map CLI flags to ``(drop_wrong_way, require_road_dump, max_road_clip, road_dump)``.
+
+    Wrong-way drop and a 0.20 road-clip cut are on by default. ``--keep-wrong-way``
+    and ``--max-road-clip -1`` opt out. ``--drop-wrong-way`` is accepted for
+    compatibility and makes a missing road dump a hard error.
+    """
+    drop = not bool(getattr(args, "keep_wrong_way", False))
+    require = bool(getattr(args, "drop_wrong_way", False))
+    return drop, require, float(args.max_road_clip), str(args.road_dump or "")
 
 
 def resolve_holdout_blocks(value: int | None) -> int:
@@ -2354,6 +2377,7 @@ def train_directory(
     drop_wrong_way: bool = False,
     road_dump: str = "",
     max_road_clip: float = -1.0,
+    require_road_dump: bool = False,
     ckpt_dir: Path | None = None,
     ckpt_min_free_gb: float | None = None,
     cam_age: bool = False,
@@ -2517,16 +2541,29 @@ def train_directory(
     elif mask_sources:
         rows = drop_masked(rows, set().union(*(source["ids"] for source in mask_sources)))
     if drop_wrong_way or float(max_road_clip) >= 0.0:
-        from python.train.frame_quality import FrameQualityError, apply_frame_quality, describe_quality
+        from python.train.frame_quality import (
+            ROAD_CLIP_SIDECAR,
+            FrameQualityError,
+            apply_frame_quality,
+            describe_quality,
+        )
         from python.train.scene_loader import recompute_dt
 
         before_q = len(rows)
+        sidecar = None
+        cache_root = getattr(cache, "root", None) if cache is not None else None
+        if cache_root:
+            sidecar = Path(cache_root) / ROAD_CLIP_SIDECAR
         try:
             rows, quality_stats = apply_frame_quality(
                 rows,
                 drop_wrong_way=bool(drop_wrong_way),
                 max_road_clip=float(max_road_clip),
                 road_dump=road_dump or None,
+                require_road_dump=bool(require_road_dump),
+                cams=train_cams,
+                cache=cache,
+                clip_sidecar=sidecar,
             )
         except FrameQualityError as exc:
             raise SystemExit(str(exc)) from exc
@@ -4057,6 +4094,7 @@ def main(argv: list[str] | None = None) -> None:
         open_panel, start_now = resolve_panel(no_panel=bool(args.no_panel), autostart=bool(args.autostart))
         if not open_panel:
             print("[GVD] scene train: no panel", flush=True)
+        drop_wrong_way, require_road_dump, max_road_clip, road_dump = frame_quality_from_args(args)
         try:
             stats = train_directory(
                 holdout_root,
@@ -4100,9 +4138,10 @@ def main(argv: list[str] | None = None) -> None:
                 backbone_lr_mult=float(args.backbone_lr_mult),
                 mask_events=bool(args.mask_events),
                 mask_files=str(args.mask_files or ""),
-                drop_wrong_way=bool(args.drop_wrong_way),
-                road_dump=str(args.road_dump or ""),
-                max_road_clip=float(args.max_road_clip),
+                drop_wrong_way=drop_wrong_way,
+                road_dump=road_dump,
+                max_road_clip=max_road_clip,
+                require_road_dump=require_road_dump,
                 ckpt_dir=Path(args.ckpt_dir) if args.ckpt_dir else None,
                 ckpt_min_free_gb=args.ckpt_min_free_gb,
                 cam_age=bool(args.cam_age),

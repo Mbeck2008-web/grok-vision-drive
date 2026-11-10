@@ -1,9 +1,10 @@
 """Offline training-time frame quality: wrong-way and overexposed-road drops.
 
-Wrong-way uses recorded ego pose plus a saved road dump (stored tangent,
-never flipped). Overexposure uses the lower half of the training image
-(any RGB channel >= 250). Neither signal is a model input; deploy stays
-camera-only. See ``docs/SPEC_frame_quality_filter.md``.
+Wrong-way uses recorded ego pose plus a saved road dump. The legal
+tangent follows node order, reversed when ``flipDirection`` is true; it
+is never flipped just to match the car. Overexposure uses the lower half
+of the training image (any RGB channel >= 250). Neither signal is a model
+input; deploy stays camera-only. See ``docs/SPEC_frame_quality_filter.md``.
 """
 from __future__ import annotations
 
@@ -21,6 +22,8 @@ CENTER_DEADZONE_M = 0.75
 ALONG_DEG = 60.0
 ALONG_COS = math.cos(math.radians(ALONG_DEG))
 CELL_M = 40.0
+# Discard a snap onto another deck (bridge / overpass). About one storey.
+MAX_DZ_M = 3.0
 CLIP_VALUE = 250
 # Suggested cut when the flag is turned on. Parser default stays -1 (off).
 DEFAULT_MAX_ROAD_CLIP = 0.20
@@ -40,6 +43,8 @@ class QualityRoad:
     lanes_right: int
     lanes: int
     drivability: float
+    flip: bool = False
+    z: list[float | None] | None = None
 
 
 def _num(value: Any, default: float = 0.0) -> float:
@@ -56,20 +61,42 @@ def _int(value: Any) -> int:
         return 0
 
 
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _oneway(road: Mapping[str, Any]) -> bool:
     raw = road.get("oneWay")
     if raw is None:
         raw = road.get("oneway")
-    if isinstance(raw, bool):
-        return raw
-    return str(raw or "0").strip().lower() in {"1", "true", "yes", "on"}
+    return _truthy(raw)
 
 
-def _middles_from_edges(edges: Any) -> tuple[list[tuple[float, float]], list[float]]:
+def _flip_direction(road: Mapping[str, Any]) -> bool:
+    raw = road.get("flipDirection")
+    if raw is None:
+        raw = road.get("flip_direction")
+    return _truthy(raw)
+
+
+def _mid_z(raw: Any) -> float | None:
+    if not (isinstance(raw, (list, tuple)) and len(raw) >= 3):
+        return None
+    try:
+        value = float(raw[2])
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _middles_from_edges(edges: Any) -> tuple[list[tuple[float, float]], list[float], list[float | None]]:
     xy: list[tuple[float, float]] = []
     widths: list[float] = []
+    zs: list[float | None] = []
     if not isinstance(edges, list):
-        return xy, widths
+        return xy, widths, zs
     for edge in edges:
         if not isinstance(edge, dict):
             continue
@@ -77,6 +104,7 @@ def _middles_from_edges(edges: Any) -> tuple[list[tuple[float, float]], list[flo
         left = edge.get("left")
         right = edge.get("right")
         mx = my = None
+        mz = _mid_z(mid)
         if isinstance(mid, (list, tuple)) and len(mid) >= 2:
             mx, my = float(mid[0]), float(mid[1])
         elif (
@@ -87,9 +115,13 @@ def _middles_from_edges(edges: Any) -> tuple[list[tuple[float, float]], list[flo
         ):
             mx = 0.5 * (float(left[0]) + float(right[0]))
             my = 0.5 * (float(left[1]) + float(right[1]))
+            lz, rz = _mid_z(left), _mid_z(right)
+            if mz is None and lz is not None and rz is not None:
+                mz = 0.5 * (lz + rz)
         if mx is None or my is None:
             continue
         xy.append((mx, my))
+        zs.append(mz)
         if (
             isinstance(left, (list, tuple))
             and isinstance(right, (list, tuple))
@@ -99,7 +131,7 @@ def _middles_from_edges(edges: Any) -> tuple[list[tuple[float, float]], list[flo
             span = math.hypot(float(right[0]) - float(left[0]), float(right[1]) - float(left[1]))
             if span >= 0.5:
                 widths.append(span)
-    return xy, widths
+    return xy, widths, zs
 
 
 def load_quality_roads(path: Path | str) -> list[QualityRoad]:
@@ -126,7 +158,7 @@ def load_quality_roads(path: Path | str) -> list[QualityRoad]:
         driv = _num(road.get("drivability", road.get("drivable", 1)), 1.0)
         if driv <= 0.0:
             continue
-        xy, widths = _middles_from_edges(road.get("edges") or road.get("nodes"))
+        xy, widths, zs = _middles_from_edges(road.get("edges") or road.get("nodes"))
         if len(xy) < 2:
             continue
         if widths:
@@ -148,6 +180,8 @@ def load_quality_roads(path: Path | str) -> list[QualityRoad]:
                 lanes_right=right,
                 lanes=left + right,
                 drivability=driv,
+                flip=_flip_direction(road),
+                z=None if all(value is None for value in zs) else zs,
             )
         )
     return out
@@ -181,8 +215,13 @@ def build_road_grid(roads: Iterable[QualityRoad]) -> dict[tuple[int, int], list[
     return grid
 
 
-def _project_stored(road: QualityRoad, x: float, y: float) -> dict[str, Any] | None:
-    best: tuple[float, int, float, float, float, float, float] | None = None
+def _project_stored(
+    road: QualityRoad,
+    x: float,
+    y: float,
+    z: float | None = None,
+) -> dict[str, Any] | None:
+    best: tuple[float, int, float, float, float, float, float, float] | None = None
     pts = road.xy
     for i in range(len(pts) - 1):
         ax, ay = pts[i]
@@ -196,19 +235,47 @@ def _project_stored(road: QualityRoad, x: float, y: float) -> dict[str, Any] | N
         cx, cy = ax + t * dx, ay + t * dy
         dist = math.hypot(x - cx, y - cy)
         if best is None or dist < best[0]:
-            best = (dist, i, cx, cy, dx, dy, length2)
+            best = (dist, i, t, cx, cy, dx, dy, length2)
     if best is None:
         return None
-    dist, _i, cx, cy, dx, dy, length2 = best
+    dist, i, t, cx, cy, dx, dy, length2 = best
+    road_z = None
+    if road.z is not None and i < len(road.z):
+        z0 = road.z[i]
+        z1 = road.z[i + 1] if i + 1 < len(road.z) else None
+        if z0 is not None and z1 is not None:
+            road_z = z0 + t * (z1 - z0)
+        elif z0 is not None:
+            road_z = z0
+        elif z1 is not None:
+            road_z = z1
+    dz = None
+    if z is not None and road_z is not None:
+        dz = float(z) - float(road_z)
+        if abs(dz) > MAX_DZ_M:
+            return None
     flen = math.sqrt(length2) or 1.0
     fx, fy = dx / flen, dy / flen
+    # Node order is the geometric tangent. flipDirection reverses legal travel
+    # without rewriting the stored edges.
+    if road.flip:
+        fx, fy = -fx, -fy
     rx, ry = fy, -fx
     offset = (x - cx) * rx + (y - cy) * ry
-    return {"dist_m": dist, "offset_m": offset, "tx": fx, "ty": fy, "road": road}
+    dist3 = dist if dz is None else math.hypot(dist, dz)
+    return {
+        "dist_m": dist,
+        "dist3_m": dist3,
+        "offset_m": offset,
+        "tx": fx,
+        "ty": fy,
+        "dz_m": dz,
+        "road": road,
+    }
 
 
-def pose_from_row(row: Mapping[str, Any]) -> tuple[float, float, float] | None:
-    """World ``(x, y, heading_rad)`` from a ``state.jsonl`` row. None if missing."""
+def pose_from_row(row: Mapping[str, Any]) -> tuple[float, float, float, float | None] | None:
+    """World ``(x, y, heading_rad, z_or_none)`` from a ``state.jsonl`` row."""
     ego = row.get("ego") if isinstance(row.get("ego"), Mapping) else {}
     pos = ego.get("pos") if isinstance(ego, Mapping) else None
     if pos is None:
@@ -240,9 +307,17 @@ def pose_from_row(row: Mapping[str, Any]) -> tuple[float, float, float] | None:
         heading = float(heading)
     except (TypeError, ValueError):
         return None
+    z = None
+    if isinstance(pos, (list, tuple)) and len(pos) >= 3:
+        try:
+            z_val = float(pos[2])
+        except (TypeError, ValueError):
+            z_val = None
+        else:
+            z = z_val if math.isfinite(z_val) else None
     if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(heading)):
         return None
-    return x, y, heading
+    return x, y, heading, z
 
 
 def classify_wrong_way(
@@ -251,6 +326,7 @@ def classify_wrong_way(
     heading_rad: float,
     roads: list[QualityRoad],
     grid: dict[tuple[int, int], list[QualityRoad]] | None = None,
+    z: float | None = None,
 ) -> dict[str, Any]:
     """``verdict`` is ``wrong_way``, ``ok``, or ``unknown`` (see the spec)."""
     if not roads:
@@ -261,7 +337,7 @@ def classify_wrong_way(
     key = (int(math.floor(x / CELL_M)), int(math.floor(y / CELL_M)))
     hits: list[dict[str, Any]] = []
     for road in grid.get(key, ()):
-        hit = _project_stored(road, x, y)
+        hit = _project_stored(road, x, y, z)
         if hit is None:
             continue
         if hit["dist_m"] > road.width_m * 0.5 + SHOULDER_M:
@@ -273,7 +349,7 @@ def classify_wrong_way(
         hits.append(hit)
     if not hits:
         return {"verdict": "unknown", "reason": "off_network"}
-    hits.sort(key=lambda item: (item["dist_m"], -item["along_abs"]))
+    hits.sort(key=lambda item: (item["dist3_m"], -item["along_abs"]))
     best = hits[0]
     road = best["road"]
     align = float(best["align"])
@@ -289,6 +365,8 @@ def classify_wrong_way(
         "align": align,
         "dist_m": best["dist_m"],
         "width_m": road.width_m,
+        "flip": road.flip,
+        "dz_m": best.get("dz_m"),
     }
     if effective_oneway:
         if align < -ALONG_COS:
@@ -323,7 +401,7 @@ def classify_row(
     pose = pose_from_row(row)
     if pose is None:
         return {"verdict": "unknown", "reason": "no_pose"}
-    return classify_wrong_way(pose[0], pose[1], pose[2], roads, grid)
+    return classify_wrong_way(pose[0], pose[1], pose[2], roads, grid, z=pose[3])
 
 
 def drop_wrong_way_rows(
@@ -452,5 +530,6 @@ def describe_quality(stats: Mapping[str, int], before: int) -> str:
     return (
         f"before={int(before)} wrong_way={int(stats.get('wrong_way', 0))} "
         f"overexposed={int(stats.get('overexposed', 0))} kept={after} "
-        f"ok={int(stats.get('ok', 0))} unknown={int(stats.get('unknown', 0))}"
+        f"ok={int(stats.get('ok', 0))} unknown={int(stats.get('unknown', 0))} "
+        f"(filtered-run metrics are not comparable to an unfiltered run)"
     )

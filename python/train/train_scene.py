@@ -469,7 +469,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Leave out frames where the recorded car is going against a one-way / divided "
             "carriageway or in the opposing lane of a two-way road (see docs/SPEC_frame_quality_filter.md). "
-            "Uses state.jsonl poses plus a road dump. Off by default. Deploy stays camera-only."
+            "Uses state.jsonl poses plus a road dump (honors flipDirection). Off by default. "
+            "Deploy stays camera-only. Filtered-run metrics are not comparable to an unfiltered run."
         ),
     )
     parser.add_argument(

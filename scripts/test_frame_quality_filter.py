@@ -34,22 +34,37 @@ def _write_dump(path: Path, roads: dict) -> Path:
     return path
 
 
-def _edge(x: float, y: float, half: float = 3.5) -> dict:
+def _edge(x: float, y: float, half: float = 3.5, z: float = 0.0) -> dict:
     return {
-        "middle": [x, y, 0.0],
-        "left": [x, y + half, 0.0],
-        "right": [x, y - half, 0.0],
+        "middle": [x, y, z],
+        "left": [x, y + half, z],
+        "right": [x, y - half, z],
     }
 
 
-def _along_x(road_id: str, *, oneway: bool, half: float = 3.5, lanes_left: int = 1, lanes_right: int = 1) -> dict:
+def _along_x(
+    road_id: str,
+    *,
+    oneway: bool,
+    half: float = 3.5,
+    lanes_left: int = 1,
+    lanes_right: int = 1,
+    flip: bool = False,
+    y: float = 0.0,
+    z: float = 0.0,
+    reverse_nodes: bool = False,
+) -> dict:
+    left, right = _edge(0.0, y, half, z), _edge(40.0, y, half, z)
+    if reverse_nodes:
+        left, right = right, left
     return {
         road_id: {
             "oneWay": "1" if oneway else "0",
             "lanesLeft": lanes_left,
             "lanesRight": lanes_right,
             "drivability": 1,
-            "edges": [_edge(0.0, 0.0, half), _edge(40.0, 0.0, half)],
+            "flipDirection": "1" if flip else "0",
+            "edges": [left, right],
         }
     }
 
@@ -80,6 +95,75 @@ def check_wrong_way_oneway() -> None:
         along = classify_wrong_way(20.0, -0.8, 0.0, roads)
         assert along["verdict"] == "ok", along
         assert along["reason"] == "oneway_with", along
+
+
+def check_wrong_way_oneway_flip_direction() -> None:
+    """Legal travel is opposite node order when flipDirection is true.
+
+    Edges still run +X. Heading 0 (with the stored nodes) is against legal
+    traffic; heading pi is with it. Current code that ignores flipDirection
+    calls heading 0 ``ok`` and must fail this test.
+    """
+    from python.train.frame_quality import classify_wrong_way, load_quality_roads
+
+    with collect_root("gvd-fq-") as tmp:
+        dump = _write_dump(
+            tmp / "roads.json",
+            _along_x("ow_flip", oneway=True, half=2.0, lanes_left=0, lanes_right=1, flip=True),
+        )
+        roads = load_quality_roads(dump)
+        against_legal = classify_wrong_way(20.0, -0.8, 0.0, roads)
+        assert against_legal["verdict"] == "wrong_way", against_legal
+        assert against_legal["reason"] == "oneway_against", against_legal
+        with_legal = classify_wrong_way(20.0, -0.8, math.pi, roads)
+        assert with_legal["verdict"] == "ok", with_legal
+        assert with_legal["reason"] == "oneway_with", with_legal
+
+
+def check_overpass_does_not_steal_lower_road() -> None:
+    """A higher one-way with opposite legal heading must not snap in 2D."""
+    from python.train.frame_quality import classify_wrong_way, load_quality_roads
+
+    with collect_root("gvd-fq-") as tmp:
+        roads_spec = {}
+        roads_spec.update(_along_x("lower", oneway=True, half=2.0, lanes_left=0, lanes_right=1, y=0.0, z=0.0))
+        # Closer in XY than the lower road, 8 m above, stored tangent -X.
+        roads_spec.update(
+            _along_x(
+                "upper",
+                oneway=True,
+                half=2.0,
+                lanes_left=0,
+                lanes_right=1,
+                y=-0.2,
+                z=8.0,
+                reverse_nodes=True,
+            )
+        )
+        dump = _write_dump(tmp / "roads.json", roads_spec)
+        roads = load_quality_roads(dump)
+        got = classify_wrong_way(20.0, -0.3, 0.0, roads, z=0.0)
+        assert got["verdict"] == "ok", got
+        assert got["reason"] == "oneway_with", got
+        assert got["road_id"] == "lower", got
+
+
+def check_apply_frame_quality_defaults() -> None:
+    import inspect
+
+    from python.train.frame_quality import apply_frame_quality
+
+    params = inspect.signature(apply_frame_quality).parameters
+    assert params["drop_wrong_way"].default is False
+    assert params["max_road_clip"].default == -1.0
+    assert params["road_dump"].default is None
+    assert params["roads"].default is None
+    assert params["image_loader"].default is None
+    rows = [{"i": 1}, {"i": 2}]
+    kept, stats = apply_frame_quality(rows)
+    assert [row["i"] for row in kept] == [1, 2]
+    assert stats["wrong_way"] == 0
+    assert stats["overexposed"] == 0
 
 
 def check_wrong_way_twoway() -> None:
@@ -186,7 +270,10 @@ def check_combined_drop() -> None:
 
 def main() -> None:
     check_parser_defaults()
+    check_apply_frame_quality_defaults()
     check_wrong_way_oneway()
+    check_wrong_way_oneway_flip_direction()
+    check_overpass_does_not_steal_lower_road()
     check_wrong_way_twoway()
     check_road_clip_fraction()
     check_combined_drop()

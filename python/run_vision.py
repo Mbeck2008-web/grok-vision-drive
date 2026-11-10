@@ -74,7 +74,7 @@ from python.viz.nerd import image_point_from_window_mouse
 # the supervisor only needs torch-free helpers here. The scene runtime is imported lazily below.
 from python.train.scene_live import SCENE_SHAPE_HOLD, live_strip_fields
 from python.viz.stage import drawn_lane_records
-from python.sensors.cameras import CAM_IDS, CamHealth, bundle_tick_frames
+from python.sensors.cameras import CAM_IDS, CamHealth, CameraFrameBundle, bundle_tick_frames
 from python.runtime.debug_opts import apply_to_command, apply_to_perception
 from python.runtime.hw_probe import ema_hz, gpu_vram_used_gb, probe, refuse_live_start, unique_frame_hz_inst
 from python.runtime.models import ModelRuntime
@@ -90,6 +90,15 @@ from python.runtime.state_io import (
 )
 from python.runtime.paths import bus_identity
 from python.sensors.cameras import camera_ge_socket_busy, make_backend, resolve_backend_name
+from python.sensors.frame_slot import (
+    AgeWindow,
+    CapturePump,
+    LatestFrameSlot,
+    bundle_frame_age_s,
+    format_latency_line,
+    process_rss_mb,
+)
+from python.runtime.frame_gate import gate_drive_command
 from python.sensors.live_hold import (
     RespawnWatch,
     StaleEgo,
@@ -119,17 +128,8 @@ def _load_control_yaml() -> dict:
 
 
 def _rss_mb() -> float:
-    try:
-        import resource
-
-        return float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) / 1024.0
-    except Exception:
-        try:
-            import psutil  # type: ignore
-
-            return psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
-        except Exception:
-            return 0.0
+    """Current supervisor RSS in MiB. Linux statm, Windows working set, then psutil."""
+    return process_rss_mb()
 
 
 
@@ -419,6 +419,13 @@ def main(clock=None) -> None:
         default=0.0,
         help="Stop the supervisor loop after this many seconds (0 = run until stopped). For captures.",
     )
+    ap.add_argument(
+        "--max-frame-age-ms",
+        type=float,
+        default=300.0,
+        help="Do not drive on a camera frame older than this (default 300). "
+        "The tick is captioned LOW/STALE and logged. Heartbeat, AEB, and engage are unchanged.",
+    )
     args = ap.parse_args()
     scene_ckpt_path = str(getattr(args, "scene_ckpt", "") or "").strip()
     if bool(getattr(args, "scene_ckpt_drive", False)) and not scene_ckpt_path:
@@ -570,6 +577,13 @@ def main(clock=None) -> None:
             raise SystemExit(2)
         print(f"[GVD] live_input_long_side={long_side} (--live-long-side)", flush=True)
     backend = make_backend(backend_name if args.backend != "auto" else backend_name, long_side=long_side)
+    if scene_ckpt is not None and hasattr(backend, "set_needed_cameras"):
+        needed = tuple(getattr(scene_ckpt, "cams", ()) or ("main",))
+        backend.set_needed_cameras(needed)
+        print(
+            f"[GVD] capture cameras={','.join(needed)} (active model; other rig cameras stay off)",
+            flush=True,
+        )
     backend.open()
     from python.sensors.tech import exit_if_tech_connect_failed
 
@@ -729,6 +743,9 @@ def main(clock=None) -> None:
     if gt_log_enabled(bool(args.gt_log)) or args.lane_source == "gt":
         gt_log = GroundTruthLogger.open()
         print(f"[GVD] ground truth -> {gt_log.path}", flush=True)
+    capture_slot = LatestFrameSlot()
+    capture_pump: CapturePump | None = None
+    age_window = AgeWindow()
     try:
         scene_lane = None
         scene_guard = None
@@ -801,6 +818,12 @@ def main(clock=None) -> None:
                 )
         elif args.lane_source == "gt":
             print("[GVD] lane source=gt road-network center at 8 m", flush=True)
+        if clock is None:
+            # Capture stays off the control thread. The slot keeps one frame;
+            # a slower infer loop drops the ones it did not take. The step
+            # clock used by tests stays synchronous so a tick is one grab.
+            capture_pump = CapturePump(capture_slot, backend.grab, idle_s=0.002)
+            capture_pump.start()
         while True:
             if run_deadline is not None and time.monotonic() >= run_deadline:
                 print(f"[GVD] --run-seconds {float(args.run_seconds):g} reached; stopping", flush=True)
@@ -830,10 +853,25 @@ def main(clock=None) -> None:
                     )
 
             t_grab = time.perf_counter()
-            bundle = backend.grab()
+            if capture_pump is not None:
+                held = capture_slot.take()
+                if held is None and capture_slot.wait(0.05):
+                    held = capture_slot.take()
+                if held is None:
+                    bundle = CameraFrameBundle(
+                        backend=getattr(backend, "name", "stub"),
+                        note="capture: waiting",
+                    )
+                else:
+                    bundle = held.payload
+            else:
+                bundle = backend.grab()
             grab_ms = float(getattr(bundle, "grab_ms", 0.0) or 0.0)
             if grab_ms <= 0:
                 grab_ms = (time.perf_counter() - t_grab) * 1000.0
+            frame_age_s_cap = bundle_frame_age_s(bundle)
+            frame_age_ms = frame_age_s_cap * 1000.0
+            frame_stale = frame_age_ms > float(args.max_frame_age_ms)
             grab_phase = int(getattr(bundle, "grab_phase", -1))
             grab_poll_free = bool(getattr(bundle, "grab_poll_free", True))
             main = bundle.main_bgr()
@@ -1141,6 +1179,12 @@ def main(clock=None) -> None:
                         ckpt_stop = True
                     else:
                         cap_drive_speed(pout, float(args.scene_ckpt_drive_speed))
+                # frame_age_s from the pixel fitter is how long the hough lane
+                # has been a non-take. This checkpoint is the lane, so the
+                # stale-speed cap must see the camera content age instead.
+                # A fresh main frame stays near 0. A repeated buffer climbs
+                # and the cap still holds speed. Heartbeat and AEB are untouched.
+                pout.frame_age_s = frame_age_s_cap
             cmd_seq += 1
             wide = None
             try:
@@ -1413,6 +1457,16 @@ def main(clock=None) -> None:
             # Actuators only when engaged + command ok (path / tracks / shadow already on this tick).
             # cmd_json: Lua applies whatever we write only while `engaged` rides along in the payload.
             # beamngpy: note_engaged(False) makes stop() release once, then not call vehicle.control.
+            cmd, frame_gated = gate_drive_command(
+                cmd, engaged=bool(engaged), stale=bool(frame_stale), holding=bool(holding),
+            )
+            if frame_gated:
+                holding = False
+                print(
+                    f"[GVD] frame stale age_ms={frame_age_ms:.0f} "
+                    f"max_ms={float(args.max_frame_age_ms):.0f} caption=LOW/STALE",
+                    flush=True,
+                )
             if hasattr(actuator, "note_engaged"):
                 actuator.note_engaged(engaged)
             if hasattr(actuator, "note_ack"):
@@ -1540,7 +1594,10 @@ def main(clock=None) -> None:
                     steer=float(applied.steer),
                 )
                 main = draw_scene_ckpt_overlay(
-                    main, ckpt_pred, drive=bool(getattr(args, "scene_ckpt_drive", False))
+                    main,
+                    ckpt_pred,
+                    drive=bool(getattr(args, "scene_ckpt_drive", False)),
+                    frame_stale=bool(frame_stale),
                 )
             st["lane_hold"] = {
                 "lateral_m": None if lane_x is None else float(lane_x),
@@ -1735,6 +1792,35 @@ def main(clock=None) -> None:
 
             # Call-site coalesce only. write_state itself still stamps the beat.
             # Mark after the write so the 100 ms cap is on the file, not the check.
+            stage_frame = None
+            if win is not None:
+                # Reuse this tick's bus check. A second bus_identity() would
+                # move the clock seam the retail tests count.
+                paint = st if ident.matched else load_paint_state()
+                stage_frame = render_stage(
+                    paint,
+                    ui=ui,
+                    main_frame=main,
+                    cam_frames=getattr(bundle, "frames", None),
+                    dets=getattr(pout, "dets", None),
+                )
+                st["viz_ms"] = float(paint.get("viz_ms") or 0.0)
+            age_window.add(frame_age_ms)
+            tick_now = clock.perf() if clock is not None else time.perf_counter()
+            print(
+                format_latency_line(
+                    capture_ms=grab_ms,
+                    infer_ms=float(pout.infer_ms),
+                    viz_ms=float(st.get("viz_ms") or 0.0),
+                    total_ms=(tick_now - loop_t0) * 1000.0,
+                    frame_age_ms=frame_age_ms,
+                    frame_age_p50_ms=age_window.p50(),
+                    frame_age_p90_ms=age_window.p90(),
+                    rss_mb=float(st.get("rss_mb") or 0.0),
+                    dropped=int(capture_slot.dropped),
+                ),
+                flush=True,
+            )
             if state_due:
                 write_state(st)
                 soft_esc_state_write_mark()
@@ -1771,18 +1857,10 @@ def main(clock=None) -> None:
                 cmd_reason=str(st.get("cmd_reason") or ""),
             )
 
-            if win is not None:
+            if win is not None and stage_frame is not None:
                 import cv2
 
-                paint = load_paint_state()
-                frame = render_stage(
-                    paint,
-                    ui=ui,
-                    main_frame=main,
-                    cam_frames=getattr(bundle, "frames", None),
-                    dets=getattr(pout, "dets", None),
-                )
-                cv2.imshow(win, frame)
+                cv2.imshow(win, stage_frame)
                 # Full key code. waitKey() & 0xFF folds Qt Up (65362) into 82,
                 # which is also ASCII R, so Up toggled review capture.
                 raw_key = cv2.waitKeyEx(1)
@@ -1828,6 +1906,8 @@ def main(clock=None) -> None:
             write_engage_flag(False, disengage_reason="shutdown")
         except Exception:
             pass
+        if capture_pump is not None:
+            capture_pump.stop()
         backend.close()
         try:
             fox.close()

@@ -8,12 +8,12 @@ Grok Vision Drive is a camera-only drive-assist toy for BeamNG.drive / BeamNG.te
 
 ## Goal
 
-Get every in-game driving feature to a **mostly works** level. That includes intersections. Pedestrians are out of scope because stock BeamNG traffic on the maps GVD uses is treated as vehicle-only (no pedestrian objects to learn from). After features mostly work, rent a cloud GPU (first choice: a RunPod 3090 at about $0.22/hr) and train every model-size preset (tiny / small / medium / large / xl, one per GPU tier). Ship those checkpoints with GVD as baselines so people can try the stock models and then compare models they train on their own data. The visual target is a stage that feels close to Tesla FSD Beta, drawn only from cameras and the model.
+Get every in-game driving feature to a **mostly works** level. That includes intersections. Pedestrians are out of scope because stock BeamNG traffic on the maps GVD uses is treated as vehicle-only (no pedestrian objects to learn from). After features mostly work, rent a cloud GPU (a suggested option: a RunPod 3090 at about $0.22/hr) and train every model-size preset (tiny / small / medium / large / xl, one per GPU tier). Ship those checkpoints with GVD as baselines so people can try the stock models and then compare models they train on their own data. The visual target is a stage that feels close to Tesla FSD Beta, drawn only from cameras and the model.
 
 ## Hard rules
 
 - Deploy is camera-only. BeamNG ground truth and sensors (depth, semantic, radar, LiDAR, map geometry, `traffic_signals`, navgraph) are for **training labels, grading, and debug** only.
-- The visualizer draws only what the cameras or the model detected. Never GT, map, or sensor overlays on the live stage.
+- The visualizer draws only what the cameras or the model detected. Never GT, map, or sensor overlays on the live stage, except `--debug-gt`, which stays off by default.
 - GPS is allowed only for turn-by-turn route directions (`turn`, `next_jct_m`). It is not localization and not a path.
 - Never use `--ctl-cond`. Never use fp16 on Pascal (the GTX 1080 Ti, compute 6.1).
 - Host is IQU45: i9-9900K, 1080 Ti 11 GB shared with BeamNG, vision inference ≤ 4 GB VRAM, supervisor RSS < 12 GB. One GPU job at a time. Never kill a live BeamNG session.
@@ -45,10 +45,10 @@ Do not start a second copy of these. Slot new work behind them.
 | --- | --- | --- |
 | Detect heads: curbs / road edges, oriented vehicles, lead brake lamp | PR #199 (`cursor/train-detect-heads-dcc6`, head `ce14621` after merge of `origin/main` at `72b5854`) | Perception for edges, other cars, brake lamps. Cone boxes and lead-lamp GT stay masked until the collector records them. Awaits merge with `main` and Skeptic. |
 | Live frame lag | PR #201 (`gvd/frame-staleness`, head `b289212`). Shadow run: `frame_age` p90 11.5 s at 3.1 Hz. | Blocks any honest live drive. Merge and prove on IQU45 before engage gates. BeamNGpy may be patched inside this repo only if evidence shows it is part of the lag. |
-| GPU-aware model-size presets | Cloud agent on `gvd/gpu-aware-model-size` (branch not on `origin` as of this audit). Research note `realtime_bigger_model.md`. | Size by card speed and AI hardware (INT8 / DP4A on the 1080 Ti; tensor cores on 20-series+; never fp16 on Pascal), not by VRAM first. Reserve game GPU/CPU/RAM, then fit the model in what is left; step down one size if the game's frame rate or free VRAM drops. |
-| A/B train suite | IQU45, running through about 5:00 AM America/Chicago on 10 November 2026 | baseline / W1 `--exp-cuda-graph` / W5 `--exp-active-subset`. Do not start another GPU job. |
+| GPU-aware model-size presets | Cloud agent on `gvd/gpu-aware-model-size` (branch not on `origin` as of this audit). Research note pending (Cloud research task, not yet in repo). | Size by card speed and AI hardware (INT8 / DP4A on the 1080 Ti; tensor cores on 20-series+; never fp16 on Pascal), not by VRAM first. Reserve game GPU/CPU/RAM, then fit the model in what is left; step down one size if the game's frame rate or free VRAM drops. |
+| A/B train suite | IQU45, estimated to run through about 5:00 AM America/Chicago on 10 November 2026 (unverified estimate; no job log cited in this audit) | baseline / W1 `--exp-cuda-graph` / W5 `--exp-active-subset`. Do not start another GPU job. |
 | ep11 re-score on the #187 holdout | Queued after the A/B suite | Same holdout (`--holdout-blocks 5 --mask-events`). Do not invent a number before the log exists. |
-| Cache copy to C: SSD | Queued after A/B and the re-score | Raw data (~74 GB) does not fit on C:; only the frame cache moves. |
+| Cache copy to C: SSD | Queued after A/B and the re-score | Raw data (an unverified estimate of ~74 GB from project notes, not a dir listing in this audit) does not fit on C:; only the frame cache moves. |
 | License | PR #192 | Awaits Michael. Not a feature blocker. |
 | Known small bugs | IQU45 environment | `rss_mb` / `viz_ms` log 0; ffmpeg not on PATH; no torch in the `.venv`. Fix when a local pass is free; not a roadmap phase of their own. |
 
@@ -91,15 +91,40 @@ The shipped detector is YOLOv8n (`models/yolov8n.onnx`) with a COCO map: vehicle
 
 ### Status counts (22 rows above)
 
-These are plan labels, not a scoreboard of live drives.
+These are plan labels, not a scoreboard of live drives. Each of the 22 inventory rows has exactly one primary status. Split rows are footnoted, not double-counted. The five buckets partition the table: **1 + 7 + 7 + 6 + 1 = 22**.
 
-- live-proven: **1** (CLI recording / collector)
-- offline-tested and live UNPROVEN: **10** (lane keeping stack, curves, lead follow, AEB, 8-cam plumbing, visualizer, eval/holdout, speed control without limit reading, stopping/safety, vehicles-with-pose partial)
-- partial (code yes, labels or policy incomplete): **5** (road edges, traffic lights, stop signs, merges/ramps data, vehicles/brake related)
-- missing: **5** (intersections as a skill, lane-change policy, speed-limit reading, model presets on main, baseline release)
-- out of scope: **1** (parking mode; pedestrians also out of scope and not a row)
+- live-proven: **1**
+- offline-tested and live UNPROVEN: **7**
+- partial (code yes, labels or policy incomplete): **7**
+- missing: **6**
+- out of scope: **1** (parking mode; pedestrians are also out of scope and are not a row)
 
-Several rows are both partial and in flight (#199, presets, frame lag). Do not double-count them as done.
+| # | Feature | Primary status | Note |
+| --- | --- | --- | --- |
+| 1 | Lane keeping | offline-tested / live UNPROVEN | |
+| 2 | Road edges / unpainted roads | partial | Unpainted drive is still missing; counted once as partial. |
+| 3 | Curves | offline-tested / live UNPROVEN | |
+| 4 | Lead follow / ACC | offline-tested / live UNPROVEN | |
+| 5 | AEB | offline-tested / live UNPROVEN | |
+| 6 | Cones / obstacles | missing | Head in flight; labels missing. |
+| 7 | Vehicles with pose | partial | Also offline-tested / live UNPROVEN; primary is partial. |
+| 8 | Brake lights | missing | Labels missing; head in flight. |
+| 9 | Traffic lights | partial | Labels missing; map contents unverified. |
+| 10 | Stop signs | partial | |
+| 11 | Intersections | missing | Specced M1–M5; #160 open. |
+| 12 | Lane changes | partial | Data partial; policy missing. Counted once as partial. |
+| 13 | Merges / highway on-ramps | partial | Data partial; policy missing. |
+| 14 | Speed limits / speed control | partial | Control is offline-tested / UNPROVEN; limit reading is missing. Counted once as partial. |
+| 15 | Parking / stopping | out of scope | Parking mode is out of scope. Stopping is already covered under AEB (row 5) and is not counted again. |
+| 16 | Night / weather / dirt | missing | Mostly missing / unverified data. |
+| 17 | Multi-cam (8-cam) | offline-tested / live UNPROVEN | Plumbing offline-tested; live 8-cam drive UNPROVEN. |
+| 18 | Visualizer | offline-tested / live UNPROVEN | |
+| 19 | Recording / data diversity | live-proven | Recording is live-proven (rec2/rec3). Diversity is still insufficient; counted once as live-proven. |
+| 20 | Eval / holdout | offline-tested / live UNPROVEN | |
+| 21 | Model-size presets | missing | In flight on Cloud; missing on `main`. |
+| 22 | Packaging / release | missing | Baseline checkpoints not shipped. |
+
+Several rows are also in flight (#199, presets, frame lag). In-flight is a work-ownership label, not a sixth status bucket, so it does not change the counts.
 
 ## Bottlenecks (in order)
 
@@ -137,7 +162,7 @@ Each item lists goal, why, dependencies, likely files, labels (train-only where 
 **A3. IQU45 A/B + ep11 re-score + cache to C:**
 - Goal: pick a trainer setting from the A/B suite; score ep11 on the #187 holdout; move the frame cache to C:.
 - Why: later feature training should use the faster disk and a known holdout.
-- Deps: GPU free after ~5:00 AM America/Chicago on 10 November 2026. One job at a time.
+- Deps: GPU free after the A/B suite ends (estimated about 5:00 AM America/Chicago on 10 November 2026; unverified estimate, no job log cited in this audit). One job at a time.
 - Files: none on the repo required.
 - Accept: write the actual numbers from the logs; never invent them. Cache copy leaves raw data on the data drive.
 - Effort: S once the jobs finish. Owner: IQU45 run (already queued).
@@ -145,7 +170,7 @@ Each item lists goal, why, dependencies, likely files, labels (train-only where 
 **A4. GPU-aware presets (Cloud)**
 - Goal: tiny / small / medium / large / xl (names may match the Cloud design) chosen by a short startup benchmark, then a VRAM check; tensor cores or INT8 as available; never fp16 on Pascal; reserve BeamNG's share first; step down one size if the game lags.
 - Why: shipping many sizes in Phase F, and running the biggest net the 1080 Ti can hold at target Hz.
-- Deps: research doc; hardware.yaml budgets (`max_inference_vram_gb: 4`, `live_input_long_side: 640`).
+- Deps: research doc pending (Cloud research task, not yet in repo); hardware.yaml budgets (`max_inference_vram_gb: 4`, `live_input_long_side: 640`).
 - Files (expected): `python/train/scene_net.py`, `python/train/train_scene.py`, `python/runtime/hw_probe.py`, `config/hardware.yaml`, README.
 - Accept: offline — each preset builds, exports, and reports parameter count and a dummy-step latency hook; Pascal path stays FP32 train / INT8 or FP32 infer. Live UNPROVEN until IQU45.
 - Effort: L (in flight). Owner: Cursor Cloud, then IQU45 probe.
@@ -161,12 +186,12 @@ Each item lists goal, why, dependencies, likely files, labels (train-only where 
 - Accept: a real shadow log on disk; grader prints counts by mask reason. No pass number until a measured run exists.
 - Effort: M. Owner: local code, then IQU45 run with Michael present (no engage).
 
-**B2. Detector NMS (#150) and remaining tracker wobble (#151)**
-- Goal: one box per object on the YOLOv8 ONNX path after the 0.35 cutoff; tracker speed from filtered motion, not box-height jitter.
-- Why: CIPV, AEB, and the stage boxes are not trustworthy without this. #174 already filtered tracker position; the issue is still open.
-- Deps: none.
-- Files: `python/perception/detect.py`, `python/perception/track.py`, tests.
-- Accept: offline unit tests with overlapping anchors; no live claim.
+**B2. Remaining #150 detector work and tracker wobble (#151)**
+- Goal: finish the #150 work that is still open after class-wise NMS. NMS already landed in #172 (`17c2afa`, 5 November 2026): `_nms_xyxy` at IoU 0.45 after the 0.35 cutoff on the YOLOv8 ONNX path in `python/perception/detect.py`. Remaining #150 work is the score enter/exit band, a check on a recorded frame, and a tick-time measurement. Tracker speed should come from filtered motion, not box-height jitter (#151; #174 already filtered tracker position; the issue is still open).
+- Why: CIPV, AEB, and the stage boxes still need the enter/exit band and a recorded-frame check. NMS itself is already on `main`. `docs/SHADOW_GATE.md` line 71 still says the detector has no NMS; update that stale line in a follow-up (out of scope for this docs PR).
+- Deps: none. B1's citation that #150 is still listed as a precondition in `docs/SHADOW_GATE.md` is an accurate description of that stale doc, not of `main`.
+- Files: `python/perception/detect.py`, `python/perception/track.py`, tests; a recorded-frame check and tick-time measurement script or log.
+- Accept: enter/exit band covered by offline tests; a recorded-frame check exists; tick-time is measured and written down. No live claim.
 - Effort: S. Owner: local.
 
 **B3. File-bus honesty (#123, #143, #130)**
@@ -333,9 +358,10 @@ Trigger (Michael): intersections and stoplight handling work and have been teste
 **Collect1. One 8–10+ hour mixed session**
 - Goal: a single planned collection of **at least 8 hours**, preferably 10 or more, after the intersection and signal stack is proven enough to label what is recorded. Cover highway speeds, junctions, traffic signals (where the map actually has them), night and weather if the AUTO / collector cycles are available, and more than one map from the existing list (west_coast_usa plus at least one of italy, east_coast_usa, utah, jungle_rock_island).
 - Why: today's ~4 h, mostly WCUSA paint-following, is too narrow to train the ship baselines. Phase F trains every preset on this run (plus earlier data if it stays in the mix), not on the short development set alone.
-- Deps: Phase E intersection and stoplight gates; collector hooks from Phase C (junction crossings, sign/lamp sidecar, stop-line labels) so the hours can actually be labelled. Do not invent paint, lamps, or map contents. No deletion of existing recordings without Michael's OK on an exact list.
-- Files: `scripts/collect_scene_lanes.py` flags already on main (maps rotation, weather, time of day, speed range, spawn mix); status in `collect.json`. No new actuation.
+- Deps: Phase E intersection and stoplight gates; collector hooks from Phase C (junction crossings, sign/lamp sidecar, stop-line labels) so the hours can actually be labelled. Do not invent paint, lamps, or map contents. Recordings are deleted only with Michael's OK on an exact list. Model and checkpoint files (npz, ONNX, trainer weight snapshots) are never deleted.
+- Files: `scripts/collect_scene_lanes.py` flags already on main (maps rotation, weather, time of day, speed range, spawn mix, `--minutes`, `--until-disk`, `--max-file-gib`); status in `collect.json`. No new actuation.
 - Labels: painted lanes, stop-lines, junction sidecars, and sign/lamp GT where the APIs and maps provide them. Training-only sensors stay training-only.
+- Disk plan: Record to the data drive (`GVD_data` / `GVD_DATA_DIR`), never C: or D: (the collector already refuses those as the data root; README Data disk). Before the first chunk, check free space on that drive and keep at least the 20 GB stop floor plus room for the planned chunk. The collector stops if the data disk drops under 20 GB free (`scripts/collect_scene_lanes.py`). The uncompressed ceiling for the yaml rig at 10 Hz is about 231.7 GB/h (collector docstring; that is the documented ceiling, not a measured rate from this run). An 8–10 h lossless 8-cam session at that ceiling is on the order of 1.9–2.3 TB, on top of the existing raw set (an unverified estimate of ~74 GB from project notes) which stays on disk. Do not use the default `--minutes 45`. Either set `--minutes` ≥ 480 (8 h) or, preferably, run documented resume chunks (the output directory is resumable and a second start appends until `--minutes` is reached) so each piece can finish, be checked, and if needed be moved or rotated off the FAT32 data drive before the next chunk. Do not use `--until-disk` as a substitute for the ≥ 8 h bar: that flag ignores the clock and stops only at the 20 GB floor, so it cannot prove the hours exit. The data drive is FAT32, so no file may exceed 4 GB; `--max-file-gib` (default 3.5) exits 7 (`file_cap`) if a file would pass the cap. Between chunks: confirm free space again, and if the drive cannot hold the next piece, move completed chunks to a larger volume (or compress / record fewer cameras / a lower `--rates` than 10 Hz, with the chosen rate written in the mix report) — then resume. Record a measured GB/h from that run's `collect.json` rate line and use it for later chunks rather than inventing a new number. Existing recordings are deleted only with Michael's OK on an exact list. Model and checkpoint files are never deleted.
 - Accept: `collect.json` (or the run log) shows elapsed time ≥ 8 h. A short written mix report lists hours (or frame counts) by map, day vs night, weather, highway vs city, and `in_jct` / signal-row counts — using the real numbers, and marking a category unavailable if a map has no signals or night/weather was not run. Valid-label share and the damage sensor are checked the same way as earlier recordings. UNPROVEN until that log exists.
 - Effort: L (machine time; BeamNG AI may drive). Owner: IQU45 run. Live model drive is not part of this recording.
 
@@ -345,7 +371,7 @@ Trigger (Michael): intersections and the other in-game features are at mostly-wo
 
 **F1. Cloud trainer bring-up**
 - Goal: one RunPod (or equal) 3090 job that reproduces the IQU45 `train_scene` invocation: same `--holdout-blocks`, `--mask-events`, `--holdout-source`, LR `1e-3`, no `--ctl-cond`, mixed precision allowed on the 3090 (compute ≥ 7.0), FP32 export.
-- Why: one 1080 Ti cannot train five sizes in a reasonable time; a 3090 at about $0.22/hr is the recorded first choice.
+- Why: one 1080 Ti cannot train five sizes in a reasonable time; a 3090 at about $0.22/hr is a suggested option.
 - Deps: Phase E mostly-works; Phase Collect pack (the 8–10+ hour diverse run, plus earlier recordings if they remain in the mix); A4 presets merged; cache-friendly dataset pack (no deletion of raw IQU45 data).
 - Files: a `docs/CLOUD_TRAIN.md` (or a section in the README) with the exact commands, image, and data layout.
 - Accept: a smoke epoch on the rented box that matches the local dry-run shapes; dollars and hours logged, not guessed after the fact.
@@ -388,7 +414,7 @@ C3 M1 GPS intent ─────────────────────
 C4 sign/lamp GT ─────────────────────────────► E1 / E6
 C6 cone + lead lamp ─► #199 heads become real ─► D2/D3 extras
 D* + E* mostly works ─► Collect 8–10+ h diverse run ─► F1–F5 cloud baselines
-B2 NMS, B3 file bus can proceed in parallel as soon as A1 is not conflicting
+B2 remaining #150 (enter/exit band, recorded-frame check, tick-time), B3 file bus can proceed in parallel as soon as A1 is not conflicting
 ```
 
 IQU45 GPU stays single-job: A3 first (already running), then no new train until Michael opens the queue.
@@ -402,6 +428,7 @@ IQU45 GPU stays single-job: A3 first (already running), then no new train until 
 - fp16 on the 1080 Ti.
 - Unattended live model drive.
 - Deleting recordings without Michael's OK on an exact list.
+- Deleting model or checkpoint files (npz, ONNX, or trainer weight snapshots).
 - A CPU mini-PC training cluster.
 - Inventing holdout scores, live Hz, or "mostly works" claims before the logs exist.
 
@@ -410,4 +437,4 @@ IQU45 GPU stays single-job: A3 first (already running), then no new train until 
 - Repo tip `72b5854` on `origin/main`
 - `README.md`, `docs/SHADOW_GATE.md`, `docs/SPEC_intersections.md`, `docs/gvd_state_schema.md`
 - Issue #154 (intersections), #150, #151, #123, #143, #130
-- PRs #199, #201, #192, #191, #187, #179, #160
+- PRs #199, #201, #192, #191, #187, #179, #172, #160

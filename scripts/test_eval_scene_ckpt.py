@@ -2,9 +2,12 @@
 """Eval-only scene checkpoint scoring on the trainer's own holdout.
 
 * A tiny synthetic pair of recordings (holdout source + a train-only root) and
-  one epoch of the trainer write a .npz. The eval script's n/r/rms/rms_mean
-  match that val row within 1e-6 (same --holdout-blocks, train-only roots,
-  --mask-events, and the default #211 wrong-way / road-clip filters).
+  one epoch of the trainer write a .npz. The holdout-source fixture plants a
+  settle row and an overexposed (road-clip) frame in the scored tail so
+  --mask-events and the default #211 filters drop rows. The eval script's
+  n/r/rms/rms_mean match that val row within 1e-6 (same --holdout-blocks,
+  train-only roots, --mask-events, and the default #211 filters), and n is
+  below the unfiltered count.
 * A missing path or an invalid file is refused (non-zero exit, no score).
 """
 # gvd-ci: requires torch
@@ -31,6 +34,9 @@ from python.train.frame_quality import DEFAULT_MAX_ROAD_CLIP  # noqa: E402
 
 N_HOLD = 80
 N_TRAIN_ONLY = 24
+# Last 20% of an 8 s / 0.1 s recording starts at t=6.32 (indices 64-79).
+SETTLE_I = 70
+CLIP_I = 75
 
 
 def _lane(index: int) -> list[float]:
@@ -41,7 +47,15 @@ def _lane(index: int) -> list[float]:
     return values + [0.0, 1.0]
 
 
-def _write_recording(root: Path, n: int, *, segment: str, seed: int) -> None:
+def _write_recording(
+    root: Path,
+    n: int,
+    *,
+    segment: str,
+    seed: int,
+    settle_i: int | None = None,
+    clip_i: int | None = None,
+) -> None:
     import cv2
 
     cam = root / "raw" / "main"
@@ -52,21 +66,25 @@ def _write_recording(root: Path, n: int, *, segment: str, seed: int) -> None:
         frame = (rng.random((48, 64, 3)) * 160 + 40).astype(np.uint8)
         col = int(32 + 20 * math.sin(index / 9.0))
         frame[:, max(0, col - 2): col + 2, :] = 250
+        if clip_i is not None and index == int(clip_i):
+            # Lower-half any-channel clip of 1.0, above DEFAULT_MAX_ROAD_CLIP 0.20.
+            frame[frame.shape[0] // 2 :, :, :] = 255
         ok, buf = cv2.imencode(".png", frame)
         assert ok
         (cam / f"{index:06d}.png").write_bytes(buf.tobytes())
-        state_lines.append(
-            {
-                "i": index,
-                "t": float(index) * 0.1,
-                "dt_s": None if index == 0 else 0.1,
-                "segment": segment,
-                "cams": {"main": {"file": f"raw/main/{index:06d}.png", "t": float(index) * 0.1}},
-                "wheel": {"steer": 0.1},
-                "pedals": {"throttle": 0.2, "brake": 0.0},
-                "speed_mps": 10.0,
-            }
-        )
+        row = {
+            "i": index,
+            "t": float(index) * 0.1,
+            "dt_s": None if index == 0 else 0.1,
+            "segment": segment,
+            "cams": {"main": {"file": f"raw/main/{index:06d}.png", "t": float(index) * 0.1}},
+            "wheel": {"steer": 0.1},
+            "pedals": {"throttle": 0.2, "brake": 0.0},
+            "speed_mps": 10.0,
+        }
+        if settle_i is not None and index == int(settle_i):
+            row["settle"] = True
+        state_lines.append(row)
         tech = {"lane_gt": _lane(index), "lane_gt_valid": [1.0] * LANE_GT_DIM, "speed_mps": 10.0}
         gt_lines.append({"i": index, "t": float(index) * 0.1, "tech": tech})
     (root / "state.jsonl").write_text("\n".join(json.dumps(r) for r in state_lines) + "\n", encoding="utf-8")
@@ -90,6 +108,28 @@ def _json_line(text: str) -> dict:
             if isinstance(payload, dict) and {"n", "r", "rms", "rms_mean"} <= set(payload):
                 return payload
     raise AssertionError(f"no JSON score line in:\n{text[-3000:]}")
+
+
+def _eval_argv(ckpt: Path, prior: Path, extra: Path, *, filtered: bool) -> list[str]:
+    argv = [
+        "--ckpt",
+        str(ckpt),
+        "--strips",
+        str(prior),
+        "--strips",
+        str(extra),
+        "--holdout-source",
+        str(prior),
+        "--holdout-blocks",
+        "1",
+        "--seed",
+        "73",
+    ]
+    if filtered:
+        argv.append("--mask-events")
+    else:
+        argv.extend(["--keep-wrong-way", "--max-road-clip", "-1"])
+    return argv
 
 
 def check_refuse_missing_and_invalid() -> None:
@@ -141,7 +181,14 @@ def check_matches_trainer_val() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         prior = Path(tmp) / "prior" / "ctl_synth"
         extra = Path(tmp) / "extra" / "ctl_synth"
-        _write_recording(prior, N_HOLD, segment="west_coast_usa#0", seed=0)
+        _write_recording(
+            prior,
+            N_HOLD,
+            segment="west_coast_usa#0",
+            seed=0,
+            settle_i=SETTLE_I,
+            clip_i=CLIP_I,
+        )
         _write_recording(extra, N_TRAIN_ONLY, segment="italy#0", seed=1)
         ckpts = Path(tmp) / "ckpts"
         status = Path(tmp) / "_status"
@@ -187,23 +234,7 @@ def check_matches_trainer_val() -> None:
         out = io.StringIO()
         err = io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            code = eval_main(
-                [
-                    "--ckpt",
-                    str(ckpt),
-                    "--strips",
-                    str(prior),
-                    "--strips",
-                    str(extra),
-                    "--holdout-source",
-                    str(prior),
-                    "--holdout-blocks",
-                    "1",
-                    "--mask-events",
-                    "--seed",
-                    "73",
-                ]
-            )
+            code = eval_main(_eval_argv(ckpt, prior, extra, filtered=True))
         scored_text = out.getvalue() + err.getvalue()
         assert code in (0, None), scored_text[-4000:]
         scored = _json_line(scored_text)
@@ -213,10 +244,21 @@ def check_matches_trainer_val() -> None:
             assert left is not None and right is not None, (key, scored, rec)
             delta = abs(float(left) - float(right))
             assert delta < 1e-6, (key, left, right, delta)
+        out = io.StringIO()
+        err = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            raw_code = eval_main(_eval_argv(ckpt, prior, extra, filtered=False))
+        raw_text = out.getvalue() + err.getvalue()
+        assert raw_code in (0, None), raw_text[-4000:]
+        raw = _json_line(raw_text)
+        assert int(scored["n"]) < int(raw["n"]), (
+            f"filtered n={scored['n']} was not below unfiltered n={raw['n']}"
+        )
         print(
             f"match trainer val: n={rec['n']} r={rec['r']} rms={rec['rms']} "
             f"rms_mean={rec['rms_mean']} | eval n={scored['n']} r={scored['r']} "
-            f"rms={scored['rms']} rms_mean={scored['rms_mean']} OK"
+            f"rms={scored['rms']} rms_mean={scored['rms_mean']} "
+            f"unfiltered n={raw['n']} OK"
         )
 
 

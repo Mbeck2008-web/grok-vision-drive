@@ -12,6 +12,12 @@ Prints the usual holdout log lines, then one JSON object with ``n``, ``r``,
 ``rms``, and the constant-predictor ``rms_mean``. The checkpoint is never
 written. Inference is fp32 (including Pascal).
 
+An ep11 re-score on this path is the *current* holdout (#187 time-block
+split plus #211 default wrong-way / road-clip filters), not comparable
+like-for-like to the original 0.6338 m number: that checkpoint predates
+#187, so today's holdout rows may have been training frames then, and
+#211 drops frames the old val set may have included.
+
     py -3 scripts/eval_scene_ckpt.py --ckpt <file.npz> --strips <prior> --strips <r2> ^
         --holdout-source <prior> --holdout-blocks 5 --mask-events --seed 73
 """
@@ -29,7 +35,7 @@ if str(ROOT) not in sys.path:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Eval-only scene checkpoint score on the trainer holdout")
+    parser = argparse.ArgumentParser(description="Eval-only scene checkpoint score on the current trainer holdout (#187 + #211; not like-for-like to pre-#187 numbers such as 0.6338)")
     parser.add_argument("--ckpt", type=Path, required=True, help="Scene-net epoch checkpoint (.npz). Read only.")
     parser.add_argument("--strips", action="append", required=True, help="Recording folder. Repeat; extras are train-only.")
     parser.add_argument("--holdout-source", default="", help="Which --strips root is the holdout. Default: the first.")

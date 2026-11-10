@@ -71,7 +71,7 @@ def apply_scene_ckpt_to_command(cmd: Any, _pred: Any) -> Any:
         return cmd
 
 
-def apply_scene_ckpt_lane(pout: Any, pred: Any, *, drive: bool, min_conf: float = SCENE_RIBBON_MIN_CONF) -> str:
+def apply_scene_ckpt_lane(pout: Any, pred: Any, *, drive: bool, min_conf: float = SCENE_RIBBON_MIN_CONF, no_conf_gate: bool = False) -> str:
     """Optionally replace ``pout``'s lane with the checkpoint prediction.
 
     Returns ``shadow`` when drive is off (``pout`` unchanged), ``lane`` when
@@ -86,7 +86,7 @@ def apply_scene_ckpt_lane(pout: Any, pred: Any, *, drive: bool, min_conf: float 
         conf = 0.0 if pred is None else float(getattr(pred, "confidence", 0.0) or 0.0)
     except (TypeError, ValueError):
         conf = 0.0
-    if scene_lane_decision(lane_x, conf, min_conf=min_conf) != "lane":
+    if scene_lane_decision(lane_x, conf, min_conf=min_conf, no_conf_gate=no_conf_gate) != "lane":
         pout.path_ego = []
         pout.lane_conf = float(conf)
         try:
@@ -311,7 +311,11 @@ class SceneCkptRuntime:
         self.aux_sensors = bool(getattr(self.net, "aux_sensors", False))
         self.state = self.net.initial_state(device="cpu")
 
-    def observe(self, frame: Any, dt_s: float | None) -> SceneCkptPred:
+    @property
+    def wants_route(self) -> bool:
+        return bool(getattr(self.net, "route_cond", False))
+
+    def observe(self, frame: Any, dt_s: float | None, route: Any = None) -> SceneCkptPred:
         arr = _require_main(frame)
         if arr is None:
             return SceneCkptPred.empty()
@@ -319,7 +323,12 @@ class SceneCkptRuntime:
         import torch
 
         with torch.inference_mode():
-            pred, self.state = self.net.forward(canvas, 0.0 if dt_s is None else float(dt_s), self.state)
+            if self.wants_route:
+                pred, self.state = self.net.forward(
+                    canvas, 0.0 if dt_s is None else float(dt_s), self.state, route=route
+                )
+            else:
+                pred, self.state = self.net.forward(canvas, 0.0 if dt_s is None else float(dt_s), self.state)
         raw = getattr(pred, "lane_gt", None)
         if raw is None:
             return SceneCkptPred(canvas_shape=tuple(int(x) for x in canvas.shape))

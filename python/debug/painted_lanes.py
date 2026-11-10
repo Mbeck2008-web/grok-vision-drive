@@ -54,6 +54,8 @@ SEARCH_M = 12.0
 Z_MAX_M = 3.0
 # A lane line runs with the car. Stop lines and crosswalk bars run across it.
 HEADING_MAX_DEG = 45.0
+# Near-perpendicular paint is a stop line / crosswalk, not a lane.
+STOP_LINE_MIN_DEG = 60.0
 _CELL = 25.0
 
 
@@ -170,6 +172,7 @@ class PaintedLanes:
         direction: Any,
         z_max_m: float | None,
         heading_max_deg: float | None,
+        heading_min_deg: float | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
         """Nearby paint segments in the vehicle frame: ``(p0, f, r, ax, ay, bx, by)``."""
         f = np.asarray([float(direction[0]), float(direction[1])])
@@ -187,11 +190,15 @@ class PaintedLanes:
         if z_max_m is not None and len(pos) >= 3 and pos[2] is not None:
             zmid = 0.5 * (s[:, 2] + s[:, 5])
             keep &= np.abs(zmid - float(pos[2])) <= float(z_max_m)
-        if heading_max_deg is not None:
+        if heading_max_deg is not None or heading_min_deg is not None:
             d = s[:, 3:5] - s[:, :2]
             dl = np.hypot(d[:, 0], d[:, 1])
             cosang = np.abs(d @ f) / np.maximum(dl, 1e-9)
-            keep &= (dl > 1e-6) & (cosang >= math.cos(math.radians(float(heading_max_deg))))
+            keep &= dl > 1e-6
+            if heading_max_deg is not None:
+                keep &= cosang >= math.cos(math.radians(float(heading_max_deg)))
+            if heading_min_deg is not None:
+                keep &= cosang <= math.cos(math.radians(float(heading_min_deg)))
         s = s[keep]
         if not len(s):
             return None
@@ -293,6 +300,40 @@ class PaintedLanes:
             else:
                 out.append((left, right))
         return out
+
+    def stop_lines_ahead(
+        self,
+        pos: Any,
+        direction: Any,
+        *,
+        z_max_m: float | None = Z_MAX_M,
+    ) -> list[dict[str, Any]]:
+        """Near-perpendicular paint in the ego corridor, labelled ``src=stop_line``.
+
+        Parallel lane paint is unchanged: this uses a complementary heading
+        window and never writes ``lane_gt``.
+        """
+        frame = self._frame(
+            pos, direction, z_max_m, heading_max_deg=None, heading_min_deg=STOP_LINE_MIN_DEG,
+        )
+        return _bars_from_frame(frame, src="stop_line", valid=True)
+
+    def masked_cross_paint(
+        self,
+        pos: Any,
+        direction: Any,
+        *,
+        z_max_m: float | None = Z_MAX_M,
+    ) -> list[dict[str, Any]]:
+        """Paint steeper than a lane line but shallower than a stop bar."""
+        frame = self._frame(
+            pos,
+            direction,
+            z_max_m,
+            heading_max_deg=STOP_LINE_MIN_DEG - 1e-3,
+            heading_min_deg=HEADING_MAX_DEG + 1e-3,
+        )
+        return _bars_from_frame(frame, src="mask", valid=False)
 
 
 # SWITCH_MARGIN_M is a lateral lane-switch hysteresis margin, not a forward
@@ -520,6 +561,71 @@ class LaneTracker:
         # A carried line keeps the point where it was last seen.
         self.left = world(left) if left_seen or self.left is None else self.left
         self.right = world(right) if right_seen or self.right is None else self.right
+
+
+
+def paint_heading_role(angle_deg: float) -> str:
+    """Classify paint by the unsigned angle between the stroke and the car heading.
+
+    0 deg runs with the car (a lane line). 90 deg runs across it (a stop bar).
+    The unused band between ``HEADING_MAX_DEG`` and ``STOP_LINE_MIN_DEG`` is
+    ``mask``: too steep to be a lane, too shallow to call a stop line.
+    """
+    ang = abs(float(angle_deg)) % 180.0
+    if ang > 90.0:
+        ang = 180.0 - ang
+    if ang <= HEADING_MAX_DEG:
+        return "lane"
+    if ang >= STOP_LINE_MIN_DEG:
+        return "stop_line"
+    return "mask"
+
+
+def _bars_from_frame(
+    frame: tuple | None,
+    *,
+    src: str,
+    valid: bool,
+    y_min: float = -1.0,
+    y_max: float = 80.0,
+) -> list[dict[str, Any]]:
+    if frame is None:
+        return []
+    _p0, _f, _r, ax, ay, bx, by = frame
+    out: list[dict[str, Any]] = []
+    for x0, y0, x1, y1 in zip(ax.tolist(), ay.tolist(), bx.tolist(), by.tolist()):
+        x0, y0, x1, y1 = float(x0), float(y0), float(x1), float(y1)
+        # Keep only strokes that cross the ego centerline (x=0). Same-side
+        # curved or corner lane paint is not a stop bar, even when the local
+        # stroke is >= STOP_LINE_MIN_DEG off the current heading.
+        if (x0 > 0.0) == (x1 > 0.0) and abs(x0) > 1e-6 and abs(x1) > 1e-6:
+            continue
+        elif abs(x1 - x0) < 1e-9:
+            y = 0.5 * (y0 + y1)
+        else:
+            t = (0.0 - x0) / (x1 - x0)
+            y = y0 + t * (y1 - y0)
+        if y < y_min or y > y_max:
+            continue
+        out.append(
+            {
+                "src": src,
+                "y_m": float(y),
+                "x0": float(min(x0, x1)),
+                "x1": float(max(x0, x1)),
+                "valid": bool(valid),
+            }
+        )
+    merged: list[dict[str, Any]] = []
+    for row in sorted(out, key=lambda r: r["y_m"]):
+        if merged and abs(row["y_m"] - merged[-1]["y_m"]) <= 0.5:
+            prev = merged[-1]
+            prev["x0"] = min(prev["x0"], row["x0"])
+            prev["x1"] = max(prev["x1"], row["x1"])
+            prev["y_m"] = 0.5 * (prev["y_m"] + row["y_m"])
+            continue
+        merged.append(dict(row))
+    return merged
 
 
 def heading_from_centers(c5: float | None, c10: float | None) -> float | None:

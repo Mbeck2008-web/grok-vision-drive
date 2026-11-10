@@ -1408,7 +1408,7 @@ def main(clock=None) -> None:
                 from python.train.scene_ckpt_runtime import (
                     SceneCkptInputError,
                     apply_scene_ckpt_lane,
-                    cap_drive_speed,
+                    prepare_scene_ckpt_drive_speed,
                 )
 
                 try:
@@ -1428,7 +1428,17 @@ def main(clock=None) -> None:
                     if apply_scene_ckpt_lane(pout, ckpt_pred, drive=True, no_conf_gate=bool(getattr(args, "no_conf_gate", False))) == "stop":
                         ckpt_stop = True
                     else:
-                        cap_drive_speed(pout, float(args.scene_ckpt_drive_speed))
+                        hitch = "soft_esc_colour=hitch" in str(getattr(bundle, "note", "") or "")
+                        prepare_scene_ckpt_drive_speed(
+                            pout,
+                            float(args.scene_ckpt_drive_speed),
+                            ego_speed_mps=ego_v,
+                            unique_gpu_n=unique_gpu_n,
+                            hitch=hitch,
+                            frame_fresh=not frame_is_stale(
+                                frame_age_s_cap, float(args.max_frame_age_ms)
+                            ),
+                        )
                 # frame_age_s from the pixel fitter is how long the hough lane
                 # has been a non-take. This checkpoint is the lane, so the
                 # stale-speed cap must see the camera content age instead.

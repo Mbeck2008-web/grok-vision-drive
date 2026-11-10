@@ -85,35 +85,91 @@ def check_drive_feeds_modular_path() -> None:
     print("drive feeds modular path from lane_x and caps target_v OK")
 
 
+def _fresh_cap_kwargs() -> dict:
+    return {"unique_gpu_n": 1, "hitch": False, "frame_fresh": True}
+
+
+def _lane_then_prepare(pout, pred=None, **cap_kw):
+    from python.train.scene_ckpt_runtime import (
+        apply_scene_ckpt_lane,
+        prepare_scene_ckpt_drive_speed,
+    )
+
+    pred = pred or _pred(lane_x=-0.32, confidence=0.85)
+    decision = apply_scene_ckpt_lane(pout, pred, drive=True)
+    assert decision == "lane", decision
+    kw = _fresh_cap_kwargs()
+    kw.update(cap_kw)
+    prepare_scene_ckpt_drive_speed(pout, 15.0, ego_speed_mps=0.0, **kw)
+    return pout
+
+
 def check_empty_modular_plan_gets_drive_cap() -> None:
     """Empty modular route leaks target_v=0.0 (PathPlan default), not None.
 
-    Live IQU45 2026-11-10 --scene-ckpt-drive: bev 0%, AEB off, TTC none,
-    cmd_reason=ok, lane_src=scene_ckpt, vt=0.0, applied throttle 0. cap_drive_speed
-    used to keep that placeholder 0 via min(0, cap), so the car never left N.
-    AEB brake and a real scene stop must still stay at 0.
+    Install the drive cap only on a still-empty plan after re-running scene
+    cuts on the scene-ckpt path, and only on a fresh unique frame.
     """
     from python.control.actuate import plan_command
-    from python.train.scene_ckpt_runtime import apply_scene_ckpt_lane, cap_drive_speed
 
     pout = _pout(planner={"aeb": "off", "target_v": 0.0, "ttc_lead": None, "stop_reason": "none"})
-    decision = apply_scene_ckpt_lane(pout, _pred(lane_x=-0.32, confidence=0.85), drive=True)
-    assert decision == "lane", decision
-    cap_drive_speed(pout, 15.0)
+    _lane_then_prepare(pout)
     assert float(pout.planner["target_v"]) == 15.0, pout.planner
     cmd = plan_command(path_ego=pout.path_ego, planner=pout.planner, ego_speed_mps=0.0, seq=1)
     assert cmd.throttle > 0.0 and cmd.brake == 0.0, cmd
 
     hold = _pout(planner={"aeb": "brake", "target_v": 0.0, "ttc_lead": 0.8, "stop_reason": "none"})
-    apply_scene_ckpt_lane(hold, _pred(lane_x=-0.32, confidence=0.85), drive=True)
-    cap_drive_speed(hold, 15.0)
+    _lane_then_prepare(hold)
     assert float(hold.planner["target_v"]) == 0.0, hold.planner
+    assert str(hold.planner.get("aeb")) == "brake", hold.planner
+
+    hold_nottc = _pout(planner={"aeb": "brake", "target_v": 0.0, "ttc_lead": None, "stop_reason": "none"})
+    _lane_then_prepare(hold_nottc)
+    assert float(hold_nottc.planner["target_v"]) == 0.0, hold_nottc.planner
+    assert str(hold_nottc.planner.get("aeb")) == "brake", hold_nottc.planner
 
     sign = _pout(planner={"aeb": "off", "target_v": 0.0, "ttc_lead": None, "stop_reason": "stop_sign"})
-    apply_scene_ckpt_lane(sign, _pred(lane_x=-0.32, confidence=0.85), drive=True)
-    cap_drive_speed(sign, 15.0)
+    _lane_then_prepare(sign)
     assert float(sign.planner["target_v"]) == 0.0, sign.planner
-    print("empty modular plan gets drive cap; AEB/stop stay at 0 OK")
+
+    lead = _pout(planner={"aeb": "off", "target_v": 0.0, "ttc_lead": None, "stop_reason": "none", "cipv_id": 7})
+    _lane_then_prepare(lead)
+    assert float(lead.planner["target_v"]) == 0.0, lead.planner
+    lead_cmd = plan_command(path_ego=lead.path_ego, planner=lead.planner, ego_speed_mps=0.0, seq=2)
+    assert lead_cmd.throttle == 0.0, lead_cmd
+
+    follow = _pout(planner={"aeb": "off", "target_v": 6.25, "ttc_lead": None, "stop_reason": "vehicle", "cipv_id": 3})
+    _lane_then_prepare(follow)
+    assert float(follow.planner["target_v"]) == 6.25, follow.planner
+
+    light = _pout(
+        planner={"aeb": "off", "target_v": 0.0, "ttc_lead": None, "stop_reason": "none"},
+        signs=[{"cls": "traffic_light", "state": "red", "x": -0.32, "y": 8.0}],
+    )
+    _lane_then_prepare(light)
+    assert float(light.planner["target_v"]) == 0.0, light.planner
+    assert str(light.planner.get("stop_reason")) == "red_light", light.planner
+    light_cmd = plan_command(path_ego=light.path_ego, planner=light.planner, ego_speed_mps=0.0, seq=3)
+    assert light_cmd.throttle == 0.0, light_cmd
+
+    posted = _pout(
+        planner={"aeb": "off", "target_v": 0.0, "ttc_lead": None, "stop_reason": "none"},
+        signs=[{"cls": "speed_limit", "limit_mps": 0.0, "x": -0.32, "y": 8.0}],
+    )
+    _lane_then_prepare(posted)
+    assert float(posted.planner["target_v"]) == 0.0, posted.planner
+
+    neg = _pout(planner={"aeb": "off", "target_v": -2.0, "ttc_lead": None, "stop_reason": "none"})
+    _lane_then_prepare(neg)
+    assert float(neg.planner["target_v"]) == 0.0, neg.planner
+
+    repeated = _pout(planner={"aeb": "off", "target_v": 0.0, "ttc_lead": None, "stop_reason": "none"})
+    _lane_then_prepare(repeated, unique_gpu_n=0)
+    assert float(repeated.planner["target_v"]) == 0.0, repeated.planner
+    hitch = _pout(planner={"aeb": "off", "target_v": 0.0, "ttc_lead": None, "stop_reason": "none"})
+    _lane_then_prepare(hitch, hitch=True)
+    assert float(hitch.planner["target_v"]) == 0.0, hitch.planner
+    print("empty modular plan gets drive cap; AEB/stop/lead/sign/unique stay safe OK")
 
 
 def check_low_conf_and_aeb_override() -> None:

@@ -104,39 +104,256 @@ def apply_scene_ckpt_lane(pout: Any, pred: Any, *, drive: bool, min_conf: float 
     return "lane"
 
 
-def cap_drive_speed(pout: Any, speed_mps: float) -> None:
+def _scene_seen(pout: Any, pl: dict[str, Any]) -> bool:
+    """True when modular already tracked a lead, a cut, or any detection/sign."""
+    if pl.get("cipv_id") is not None:
+        return True
+    if pl.get("ttc_lead") is not None:
+        return True
+    if str(pl.get("aeb") or "off") == "brake":
+        return True
+    if str(pl.get("stop_reason") or "none") not in ("none", "", "None"):
+        return True
+    for attr in ("signs", "tracks", "dets"):
+        if getattr(pout, attr, None):
+            return True
+    for attr in ("objects_n", "tracks_n"):
+        try:
+            if int(getattr(pout, attr, 0) or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _can_fill_empty_plan(
+    *,
+    unique_gpu_n: int | None,
+    hitch: bool,
+    frame_fresh: bool,
+) -> bool:
+    """Install cruise only on a fresh unique colour frame, not a hitch replay."""
+    if hitch or not frame_fresh:
+        return False
+    if unique_gpu_n is None:
+        return False
+    try:
+        return int(unique_gpu_n) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _cipv_id_of(track: Any) -> int | None:
+    if track is None:
+        return None
+    ident = track.get("id") if isinstance(track, dict) else getattr(track, "id", None)
+    try:
+        return None if ident is None else int(ident)
+    except (TypeError, ValueError):
+        return None
+
+
+def replan_scene_ckpt_path(pout: Any, *, ego_speed_mps: float | None) -> None:
+    """Re-run scene cuts and CIPV against the installed scene-ckpt path.
+
+    ``predict_path`` returns ``_empty()`` before ``_apply_scene`` when there
+    are no BEV lanes, so a leaked ``target_v=0`` / ``stop_reason=none`` can
+    hide a lead or a stop/red that modular already saw. This attaches those
+    cuts to ``path_ego`` after ``apply_scene_ckpt_lane``. It never writes a
+    cruise target when a lead, sign, object, or cut is present.
+    """
+    path = list(getattr(pout, "path_ego", None) or [])
+    if len(path) < 2:
+        return
+    from python.perception.cipv import select_cipv
+    from python.perception.pipeline import fuse_planner_cipv
+    from python.planning.path_predictor import (
+        _apply_scene,
+        _limit_mps,
+        _predict_occupants,
+        _speed_flags,
+    )
+
+    pl = dict(getattr(pout, "planner", None) or {})
+    tracks = list(getattr(pout, "tracks", None) or [])
+    signs = list(getattr(pout, "signs", None) or [])
+    try:
+        width = float(getattr(pout, "path_width", None) or pl.get("corridor_width") or 2.0)
+    except (TypeError, ValueError):
+        width = 2.0
+    try:
+        curv = float(pl.get("curvature") or 0.0)
+    except (TypeError, ValueError):
+        curv = 0.0
+    occupants = _predict_occupants(tracks)
+    path, stop_reason, cut_id, ttc, _occupied, stop_dist, closing = _apply_scene(
+        path, occupants, signs, width, ego_speed_mps=ego_speed_mps,
+    )
+    aeb, target, ttc = _speed_flags(
+        curv=curv,
+        stop_reason=stop_reason,
+        ttc=ttc,
+        stop_dist=stop_dist,
+        closing_mps=closing,
+        ego_speed_mps=ego_speed_mps,
+        signs=signs,
+        path=path,
+    )
+    cipv = select_cipv(tracks, path_width=width, ego_speed_mps=ego_speed_mps)
+    aeb, ttc, target = fuse_planner_cipv(
+        plan_aeb=aeb,
+        plan_ttc=ttc,
+        plan_target_v=target,
+        plan_stop_reason=stop_reason,
+        cipv=cipv,
+    )
+    # Standing at a stop/red/yield is a hold. Comfort sqrt(2*a*s) is for
+    # approaching while moving; at ego ~= 0 it would invent a creep target.
+    try:
+        standing = ego_speed_mps is None or float(ego_speed_mps) <= 0.05
+    except (TypeError, ValueError):
+        standing = True
+    if standing and stop_reason in ("stop_sign", "red_light", "yellow_light", "yield"):
+        target = 0.0
+    limit = _limit_mps(signs, path)
+    if limit is not None:
+        try:
+            lim = max(0.0, float(limit))
+        except (TypeError, ValueError):
+            lim = None
+        else:
+            if target is None:
+                target = lim
+            else:
+                try:
+                    target = min(float(target), lim)
+                except (TypeError, ValueError):
+                    target = lim
+    pout.path_ego = path
+    if stop_reason not in ("none", "", "None", None):
+        pl["stop_reason"] = stop_reason
+    cipv_id = cut_id if cut_id is not None else _cipv_id_of(getattr(cipv, "track", None))
+    if cipv_id is None:
+        cipv_id = pl.get("cipv_id")
+    if cipv_id is not None:
+        pl["cipv_id"] = cipv_id
+    # Never downgrade an upstream AEB brake when this tick has no tracks
+    # (select_cipv at standstill returns aeb=off; _empty skipped _apply_scene).
+    if aeb == "brake":
+        pl["aeb"] = "brake"
+    elif aeb is not None and str(pl.get("aeb") or "off") != "brake":
+        pl["aeb"] = aeb
+    if ttc is not None:
+        pl["ttc_lead"] = ttc
+    seen = _scene_seen(pout, pl)
+    if seen:
+        # Do not invent cruise toward something already seen. A real cut / AEB
+        # / posted limit may write a slower target; a standstill CIPV stays 0.
+        prev = pl.get("target_v")
+        try:
+            prev_f = None if prev is None else float(prev)
+        except (TypeError, ValueError):
+            prev_f = None
+        kept_stop = str(pl.get("stop_reason") or "none")
+        new_cut = stop_reason not in ("none", "", "None", None)
+        if str(pl.get("aeb") or "off") == "brake" or kept_stop not in ("none", "", "None"):
+            if not new_cut:
+                # Existing cut/stop, no new geometry this tick: do not
+                # replace a hold with the empty-path cruise from _speed_flags.
+                if prev_f is None or prev_f <= 0.0:
+                    pl["target_v"] = 0.0
+            elif target is None:
+                pl["target_v"] = 0.0 if prev_f is None or prev_f <= 0.0 else prev_f
+            else:
+                try:
+                    tv = float(target)
+                except (TypeError, ValueError):
+                    tv = 0.0
+                if prev_f is None or prev_f <= 0.0:
+                    pl["target_v"] = tv
+                else:
+                    pl["target_v"] = min(prev_f, tv)
+        elif limit is not None:
+            try:
+                pl["target_v"] = min(0.0 if prev_f is None or prev_f <= 0.0 else prev_f, max(0.0, float(limit)))
+            except (TypeError, ValueError):
+                pl["target_v"] = 0.0 if prev_f is None or prev_f <= 0.0 else prev_f
+        elif prev_f is None or prev_f <= 0.0:
+            pl["target_v"] = 0.0
+    pout.planner = pl
+
+
+def cap_drive_speed(
+    pout: Any,
+    speed_mps: float,
+    *,
+    unique_gpu_n: int | None = None,
+    hitch: bool = False,
+    frame_fresh: bool = True,
+) -> None:
     """Conservative longitudinal cap. Does not raise an existing slower target.
 
-    ``None`` means there is no speed plan. A literal ``0.0`` with AEB off and
-    ``stop_reason`` none/missing is the empty-route PathPlan default, not a
-    commanded stop — treat it as missing so drive mode can install the cap.
-    AEB ``brake`` and a real scene stop (stop_sign, red_light, occupied, …)
-    keep their slower target.
+    ``None`` means there is no speed plan. A literal ``0.0`` is a placeholder
+    only when AEB is not braking, no scene cut is recorded, and nothing was
+    seen (no ``cipv_id``, TTC, objects, tracks, or signs). A negative target
+    is a hold at 0, not a cruise. The placeholder is filled only on a fresh
+    unique colour frame (``unique_gpu_n > 0``, not a soft-esc hitch).
     """
     cap = float(speed_mps)
     pl = dict(getattr(pout, "planner", None) or {})
     raw = pl.get("target_v")
     aeb = str(pl.get("aeb") or "off")
     stop = str(pl.get("stop_reason") or "none")
-    placeholder = False
+    seen = _scene_seen(pout, pl)
+    can_fill = (
+        (not seen)
+        and aeb != "brake"
+        and stop in ("none", "", "None")
+        and _can_fill_empty_plan(unique_gpu_n=unique_gpu_n, hitch=hitch, frame_fresh=frame_fresh)
+    )
     if raw is None:
-        placeholder = True
-        tv = cap
-    else:
-        try:
-            tv = float(raw)
-        except (TypeError, ValueError):
-            placeholder = True
-            tv = cap
+        if can_fill:
+            pl["target_v"] = cap
+        elif seen or aeb == "brake" or stop not in ("none", "", "None"):
+            pl["target_v"] = 0.0
+        pout.planner = pl
+        return
+    try:
+        tv = float(raw)
+    except (TypeError, ValueError):
+        if can_fill:
+            pl["target_v"] = cap
         else:
-            if tv <= 0.0 and aeb != "brake" and stop in ("none", "", "None"):
-                placeholder = True
-                tv = cap
-    if placeholder:
+            pl["target_v"] = 0.0
+        pout.planner = pl
+        return
+    if tv < 0.0:
+        pl["target_v"] = 0.0
+    elif tv == 0.0 and can_fill:
         pl["target_v"] = cap
     else:
         pl["target_v"] = min(tv, cap)
     pout.planner = pl
+
+
+def prepare_scene_ckpt_drive_speed(
+    pout: Any,
+    speed_mps: float,
+    *,
+    ego_speed_mps: float | None,
+    unique_gpu_n: int | None = None,
+    hitch: bool = False,
+    frame_fresh: bool = True,
+) -> None:
+    """Re-run scene cuts on the ckpt path, then cap only a still-empty plan."""
+    replan_scene_ckpt_path(pout, ego_speed_mps=ego_speed_mps)
+    cap_drive_speed(
+        pout,
+        speed_mps,
+        unique_gpu_n=unique_gpu_n,
+        hitch=hitch,
+        frame_fresh=frame_fresh,
+    )
 
 
 def scene_ckpt_as_state(

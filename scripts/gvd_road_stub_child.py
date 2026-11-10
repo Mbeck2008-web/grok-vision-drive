@@ -33,16 +33,17 @@ def road() -> np.ndarray:
 
 
 def _grab(self) -> cameras.CameraFrameBundle:  # noqa: ARG001 - replaces StubBackend.grab
-    now = time.time()
+    seen = time.monotonic()
     health = {cid: cameras.CamHealth.MISSING for cid in cameras.CAM_IDS}
     health["main"] = cameras.CamHealth.OK
     return cameras.CameraFrameBundle(
         frames={"main": road()},
-        timestamps={"main": now},
+        timestamps={"main": seen},
         health=health,
         backend=self.name,
         note="stub: painted road (test launcher)",
         unique_gpu_n=1,
+        captured_at=seen,
     )
 
 

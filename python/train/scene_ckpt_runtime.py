@@ -19,6 +19,7 @@ from python.debug.lane_targets import (
     confidence_from_vector,
     lane_x_from_vector,
 )
+from python.runtime.frame_gate import STALE_CAPTION
 from python.viz.scene_ribbon import (
     RIBBON_BGR,
     SCENE_RIBBON_MIN_CONF,
@@ -124,6 +125,7 @@ def scene_ckpt_as_state(
     drive: bool,
     engaged: bool,
     steer: float | None,
+    frame_stale: bool = False,
 ) -> dict[str, Any]:
     """Fields written to ``gvd_state.json`` and clip ``state.jsonl``."""
     if pred is not None and hasattr(pred, "as_state"):
@@ -135,6 +137,8 @@ def scene_ckpt_as_state(
     out["drive"] = bool(drive)
     out["engaged"] = bool(engaged)
     out["steer"] = None if steer is None else float(steer)
+    out["frame_stale"] = bool(frame_stale)
+    out["caption"] = STALE_CAPTION if frame_stale else ("DRIVE" if drive else "SHADOW")
     return out
 
 
@@ -166,20 +170,21 @@ class SceneCkptPred:
         return out
 
 
-def scene_ckpt_overlay_caption(pred: SceneCkptPred | None, *, drive: bool = False) -> str:
-    """Caption drawn by ``draw_scene_ckpt_overlay``. Pure so tests can lock the kind.
+def scene_ckpt_overlay_caption(
+    pred: SceneCkptPred | None,
+    *,
+    drive: bool = False,
+    frame_stale: bool = False,
+) -> str:
+    """Mode/safety tag drawn by ``draw_scene_ckpt_overlay``.
 
-    Low confidence is always ``LOW``, even when drive is on: the drive path has
-    already returned stop below SCENE_RIBBON_MIN_CONF. High confidence is
-    ``DRIVE`` only when drive is on; otherwise ``SHADOW``.
+    Confidence is shown by ribbon opacity, not text. This returns only
+    ``STALE``, ``DRIVE``, or ``SHADOW``. A stale frame is fail-closed
+    (no ribbon) and is not a drive caption.
     """
-    if pred is None:
-        return "SHADOW"
-    cap = scene_ckpt_caption(pred.confidence)  # SHADOW or LOW
-    kind = "DRIVE" if (drive and cap == "SHADOW") else cap
-    if pred.lane_x is not None and kind in ("SHADOW", "DRIVE"):
-        return f"{kind} lane_x={float(pred.lane_x):+.2f}m conf={float(pred.confidence):.2f}"
-    return f"{kind} conf={float(pred.confidence):.2f}"
+    if frame_stale:
+        return STALE_CAPTION
+    return "DRIVE" if drive else "SHADOW"
 
 
 def draw_scene_ckpt_overlay(
@@ -187,6 +192,7 @@ def draw_scene_ckpt_overlay(
     pred: SceneCkptPred | None,
     *,
     drive: bool = False,
+    frame_stale: bool = False,
 ) -> np.ndarray | None:
     """Paint the predicted lane-center path on a camera frame. Does not modify ``frame``.
 
@@ -202,10 +208,13 @@ def draw_scene_ckpt_overlay(
         return out
     color = overlay_bgr("shadow")
     h, w = int(out.shape[0]), int(out.shape[1])
+    # Mode/safety tag only (SHADOW / DRIVE / STALE). Confidence is ribbon opacity, not text.
+    caption = scene_ckpt_overlay_caption(pred, drive=drive, frame_stale=frame_stale)
+    cv2.putText(out, caption, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
     # Solid swatch so tests (and a clip) can see the mark without anti-alias blending.
     # Confidence is shown by ribbon opacity, not text.
     cv2.rectangle(out, (12, 36), (40, 56), color, -1)
-    if pred is None or pred.lane_gt is None:
+    if frame_stale or pred is None or pred.lane_gt is None:
         return out
     centers = scene_ckpt_centers(pred.lane_gt)
     # min_conf=0: low confidence still strokes, at display gain ~0.40.

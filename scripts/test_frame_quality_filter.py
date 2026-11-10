@@ -19,7 +19,9 @@
 (7) Clip is the max of per-cam lower-half fractions on the selected training
     cameras. A fully washed main sector is dropped at T=0.20 even when the
     other cameras are black or absent (the old full-canvas fraction cannot
-    trip T). A second build with a sidecar does not re-decode.
+    trip T). A second build with a sidecar does not re-decode. Sidecar
+    lines tagged with another metric version (``road_clip_v0``,
+    ``road_clip_v2``) are ignored and the frame is re-measured.
 """
 from __future__ import annotations
 
@@ -474,6 +476,57 @@ def check_clip_sidecar_skips_second_decode() -> None:
         assert calls["n"] == 1, f"second build re-decoded: {calls['n']}"
 
 
+def check_clip_sidecar_ignores_other_metric_versions() -> None:
+    """Wrong-version sidecar lines are ignored; the frame is re-measured.
+
+    A stale frac of 0.99 would drop the row at T=0.20 if reused. The fresh
+    measure is a clean sector (frac 0), so the row is kept and
+    ``clip_decoded`` increments. This test dies if ``load_clip_sidecar``
+    accepts any ``v``.
+    """
+    from python.train.frame_quality import ROAD_CLIP_METRIC, apply_frame_quality
+
+    assert ROAD_CLIP_METRIC == "road_clip_v1"
+    with collect_root("gvd-fq-clipver-") as tmp:
+        sidecar = tmp / "road_clip_v1.jsonl"
+        stale = {"main": 0.99}
+        lines = [
+            json.dumps({"v": "road_clip_v0", "source": "rec", "i": 1, "frac": stale}, sort_keys=True),
+            json.dumps({"v": "road_clip_v2", "source": "rec", "i": 2, "frac": stale}, sort_keys=True),
+            # A current-version line on another frame must still be reused.
+            json.dumps({"v": "road_clip_v1", "source": "rec", "i": 3, "frac": {"main": 0.01}}, sort_keys=True),
+        ]
+        sidecar.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        calls = {"n": 0, "seen": []}
+        clean = np.full((192, 256, 3), 40, dtype=np.uint8)
+
+        def cam_loader(root, index, cam):
+            calls["n"] += 1
+            calls["seen"].append(int(index))
+            return clean
+
+        rows = [
+            {"i": 1, "source_root": str(tmp), "source": "rec"},
+            {"i": 2, "source_root": str(tmp), "source": "rec"},
+            {"i": 3, "source_root": str(tmp), "source": "rec"},
+        ]
+        kept, stats = apply_frame_quality(
+            rows,
+            drop_wrong_way=False,
+            max_road_clip=0.20,
+            cams=("main",),
+            cam_loader=cam_loader,
+            clip_sidecar=sidecar,
+        )
+        assert [r["i"] for r in kept] == [1, 2, 3], (kept, stats)
+        assert stats["overexposed"] == 0, stats
+        assert stats["clip_decoded"] == 2, stats
+        assert stats["clip_sidecar_hits"] == 1, stats
+        assert calls["n"] == 2, calls
+        assert sorted(calls["seen"]) == [1, 2], calls
+
+
 def check_clip_uses_cache_not_raw() -> None:
     from python.train.frame_quality import apply_frame_quality
 
@@ -583,6 +636,7 @@ def main() -> None:
     check_multicam_drop_uses_max()
     check_clip_skips_depth_sem()
     check_clip_sidecar_skips_second_decode()
+    check_clip_sidecar_ignores_other_metric_versions()
     check_clip_uses_cache_not_raw()
     check_missing_dump_warn_and_keep()
     check_missing_dump_explicit_flag_fails()

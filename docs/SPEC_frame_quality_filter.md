@@ -182,6 +182,8 @@ The live A/B recipe uses `--no-resume`.
 - A second dataset build with a `road_clip_v1` sidecar does not re-decode
   (`check_clip_sidecar_skips_second_decode`). Clip uses `--cache` sectors
   when present and never walks `main_depth` / `main_sem`.
+- A sidecar line tagged `road_clip_v0` or `road_clip_v2` is ignored and
+  the frame is re-measured (`check_clip_sidecar_ignores_other_metric_versions`).
 - Synthetic one-way against-traffic pose is `wrong_way`; with-traffic is `ok`.
 - One-way edges along +X with `flipDirection: true`: heading `0` is
   `wrong_way` / `oneway_against`; heading `π` is `ok` / `oneway_with`.

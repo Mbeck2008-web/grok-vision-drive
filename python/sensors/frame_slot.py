@@ -21,8 +21,14 @@ The camera path makes the pixels themselves old:
   a stale frame in favour of a newer one; the control thread just waited.
 
 ``LatestFrameSlot`` keeps one bundle. A put that replaces a frame the
-consumer has not taken increments ``dropped``. BeamNGpy itself is unchanged:
-``stream_raw`` is already the latest shared-memory read. The pin stays 1.36.
+consumer has not taken increments ``dropped``. A shared-memory re-show is
+a new bundle with ``unique_gpu_n`` 0. That put used to erase the unique
+grab the supervisor had not taken, so the unique label and ``camera_hz``
+(one tick per take) fell to 0. The untaken unique count is carried onto
+the newer bundle. The carry does not copy or refresh ``captured_at`` or
+timestamps; ``grab`` / ``note_content_time`` own stamping. BeamNGpy itself
+is unchanged: ``stream_raw`` is already the latest shared-memory read.
+The pin stays 1.36.
 """
 
 from __future__ import annotations
@@ -200,6 +206,62 @@ def process_rss_mb() -> float:
         return 0.0
 
 
+def _unique_n(payload: Any) -> int:
+    try:
+        return int(getattr(payload, "unique_gpu_n", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _rewrite_unique_note(note: str, n: int) -> str:
+    key = "unique="
+    i = note.find(key)
+    if i < 0:
+        return note
+    j = i + len(key)
+    while j < len(note) and note[j].isdigit():
+        j += 1
+    return note[:i] + f"unique={int(n)}" + note[j:]
+
+
+def carry_untaken_unique(previous: Any, new: Any) -> Any:
+    """Keep a unique frame the consumer has not taken.
+
+    The capture pump replaces the slot on every grab. A shared-memory
+    re-show has ``unique_gpu_n`` 0 and would hide the unique grab. The
+    count moves onto ``new``. This function never copies or refreshes
+    ``captured_at`` or timestamps. ``grab`` / ``note_content_time`` own
+    stamping.
+    """
+    if new is None or previous is None:
+        return new
+    prev_n = _unique_n(previous)
+    if prev_n <= 0 or _unique_n(new) > 0:
+        return new
+    ids: list[str] = []
+    for src in (
+        getattr(previous, "unique_gpu_ids", ()) or (),
+        getattr(new, "unique_gpu_ids", ()) or (),
+    ):
+        for cid in src:
+            text = str(cid)
+            if text not in ids:
+                ids.append(text)
+    carried = max(prev_n, len(ids), 1)
+    try:
+        new.unique_gpu_n = carried
+        new.unique_gpu_ids = tuple(ids)
+    except Exception:
+        return new
+    note = getattr(new, "note", None)
+    if isinstance(note, str):
+        try:
+            new.note = _rewrite_unique_note(note, carried)
+        except Exception:
+            pass
+    return new
+
+
 @dataclass
 class HeldFrame:
     seq: int
@@ -207,7 +269,11 @@ class HeldFrame:
 
 
 class LatestFrameSlot:
-    """One slot. A newer put drops an untaken frame instead of queueing it."""
+    """One slot. A newer put drops an untaken frame instead of queueing it.
+
+    An untaken unique observation is copied onto the replacement. The
+    carry does not copy or refresh ``captured_at`` or timestamps.
+    """
 
     def __init__(self) -> None:
         self._cond = threading.Condition()
@@ -220,6 +286,7 @@ class LatestFrameSlot:
         with self._cond:
             if self._item is not None and self._item.seq != self._taken_seq:
                 self.dropped += 1
+                payload = carry_untaken_unique(self._item.payload, payload)
             self.published += 1
             self._item = HeldFrame(seq=self.published, payload=payload)
             self._cond.notify_all()

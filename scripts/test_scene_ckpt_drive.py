@@ -436,6 +436,47 @@ def check_overlay_caption_drive_kind() -> None:
     print("overlay caption: LOW/DRIVE/SHADOW kinds + min_conf==SCENE_RIBBON_MIN_CONF OK")
 
 
+def check_overlay_caption_drawn_through_draw() -> None:
+    """Lock caption wiring through draw_scene_ckpt_overlay itself (not just the helper).
+
+    Skeptic M2: draw_scene_ckpt_overlay calling scene_ckpt_overlay_caption(pred,
+    drive=False) shows SHADOW on screen while the car is driving. Recording
+    cv2.putText must catch that. Also keeps M1 (DRIVE at conf 0.10) dead.
+    """
+    import cv2
+
+    from python.train.scene_ckpt_runtime import draw_scene_ckpt_overlay
+
+    drawn: list[str] = []
+    real_put_text = cv2.putText
+
+    def recording_put_text(img, text, *args, **kwargs):
+        drawn.append(str(text))
+        return real_put_text(img, text, *args, **kwargs)
+
+    frame = np.zeros((120, 320, 3), dtype=np.uint8)
+    cv2.putText = recording_put_text  # type: ignore[assignment]
+    try:
+        drawn.clear()
+        draw_scene_ckpt_overlay(frame, _pred(lane_x=-0.8, confidence=0.91), drive=True)
+        assert drawn, "draw_scene_ckpt_overlay never called putText"
+        assert drawn[0].startswith("DRIVE lane_x="), drawn[0]
+
+        drawn.clear()
+        draw_scene_ckpt_overlay(frame, _pred(lane_x=-0.8, confidence=0.91), drive=False)
+        assert drawn, "draw_scene_ckpt_overlay never called putText"
+        assert drawn[0].startswith("SHADOW"), drawn[0]
+
+        drawn.clear()
+        draw_scene_ckpt_overlay(frame, _pred(lane_x=-0.8, confidence=0.10), drive=True)
+        assert drawn, "draw_scene_ckpt_overlay never called putText"
+        assert drawn[0].startswith("LOW"), drawn[0]
+        assert not drawn[0].startswith("DRIVE"), drawn[0]
+    finally:
+        cv2.putText = real_put_text  # type: ignore[assignment]
+    print("overlay caption via draw_scene_ckpt_overlay putText: DRIVE/SHADOW/LOW OK")
+
+
 def check_same_tick_observe_documented() -> None:
     """Pred is computed on this tick's main frame (no cached / aged pred).
 
@@ -463,6 +504,7 @@ def main() -> None:
     check_steer_sign_locked_to_lane_x()
     check_modular_low_conf_and_stale_no_ckpt_steer()
     check_overlay_caption_drive_kind()
+    check_overlay_caption_drawn_through_draw()
     check_same_tick_observe_documented()
     check_supervisor_shadow_default_and_drive_opt_in()
     print("test_scene_ckpt_drive: all OK")

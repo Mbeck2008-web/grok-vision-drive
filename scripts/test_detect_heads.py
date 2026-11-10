@@ -177,7 +177,6 @@ def check_runtime_tags_the_checkpoint() -> None:
     from python.train.epoch_ckpt import epoch_ckpt_path, write_epoch_ckpt
     from python.train.scene_ckpt_runtime import SceneCkptRuntime
     from python.train.scene_net import SceneNet
-    from python.train.viz_contract import renderable_state
 
     torch.manual_seed(2)
     net = SceneNet(cams=("main",), edge=True, detect_obj=True, brakelight=True).cpu().eval()
@@ -201,25 +200,21 @@ def check_runtime_tags_the_checkpoint() -> None:
         runtime = SceneCkptRuntime(path)
         pred = runtime.observe(frame, 0.1)
         state = pred.as_state()
-        assert state["lane"]["src"] == "model"
-        assert state["lane"]["head"] == "lane_gt"
-        assert state["lane"]["ckpt"] == path.name
-        edge = state["detect"]["edge"]
-        assert edge["src"] == "model" and edge["head"] == "edge" and edge["ckpt"] == path.name
-        poisoned = dict(state)
-        poisoned["map_road"] = {
-            "src": "map",
-            "head": "edge",
-            "ckpt": path.name,
-            "confidence": 0.99,
-            "points": [{"x": 0.0, "y": 5.0}],
-        }
-        kept = renderable_state(poisoned)
-        assert "map_road" not in kept
-        flat = json_sources(kept)
-        assert flat
-        assert set(flat) <= {"model"}
-    print("runtime: drawable fields are tagged head + ckpt, map roads are dropped OK")
+        assert "map_road" not in state
+        assert "beamng_gt" not in json_sources(state)
+        if float(pred.confidence) >= 0.40:
+            assert state["lane"]["src"] == "model"
+            assert state["lane"]["ckpt"] == path.name
+            assert state.get("centers")
+        else:
+            assert not state.get("centers")
+            assert state.get("lane_x") is None
+        edge = (state.get("detect") or {}).get("edge")
+        if edge is not None:
+            assert edge["src"] == "model" and edge["head"] == "edge" and edge["ckpt"] == path.name
+            assert float(edge["confidence"]) >= 0.40
+            assert "label_src" not in edge
+    print("runtime: as_state keeps only drawable model fields OK")
 
 
 def json_sources(node) -> list[str]:

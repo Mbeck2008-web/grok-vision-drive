@@ -98,12 +98,26 @@ def check_rejects_foreign_and_low_conf() -> None:
     print("viz contract: foreign, untagged, and low-confidence fields draw nothing OK")
 
 
-def check_as_state_strips_and_tags() -> None:
+def _sources(node) -> list[str]:
+    found: list[str] = []
+    if isinstance(node, dict):
+        for key in ("src", "label_src"):
+            if isinstance(node.get(key), str):
+                found.append(node[key])
+        for value in node.values():
+            found.extend(_sources(value))
+    elif isinstance(node, list):
+        for value in node:
+            found.extend(_sources(value))
+    return found
+
+
+def check_as_state_live_output() -> None:
+    """The dict as_state returns. No second renderable_state call."""
     import numpy as np
 
     from python.debug.lane_targets import LANE_GT_DIM, LOOKAHEADS_M
     from python.train.scene_ckpt_runtime import SceneCkptPred
-    from python.train.viz_contract import renderable_state
     from python.viz.scene_ribbon import scene_ckpt_ribbon_polyline
 
     values = np.full((LANE_GT_DIM,), np.nan, dtype=np.float32)
@@ -123,6 +137,21 @@ def check_as_state_strips_and_tags() -> None:
             "gt_poly": {"src": "gt", "points": [{"x": 9.0, "y": 5.0}]},
             "path_world": [{"x": 1.0, "y": 10.0}],
         },
+        "spoof": {
+            "src": "model",
+            "label_src": "beamng_gt",
+            "head": "edge",
+            "ckpt": ckpt,
+            "confidence": 0.95,
+            "points": [{"side": "left", "x": 4.0, "y": 5.0}],
+        },
+        "dim": {
+            "src": "model",
+            "head": "edge",
+            "ckpt": ckpt,
+            "confidence": 0.20,
+            "points": [{"side": "left", "x": 3.0, "y": 5.0}],
+        },
         "map_road": {
             "src": "map",
             "head": "edge",
@@ -133,28 +162,50 @@ def check_as_state_strips_and_tags() -> None:
     }
     state = pred.as_state()
     assert state["confidence"] == 0.9
-    assert state["centers"][0]["y"] == 5.0
-    assert state["centers"][0]["src"] == "model"
-    assert state["centers"][0]["head"] == "lane_gt"
-    assert state["centers"][0]["ckpt"] == ckpt
-    assert state["lane_x"]["src"] == "model"
-    assert state["lane_x"]["head"] == "lane_gt"
-    assert state["lane_x"]["ckpt"] == ckpt
+    assert state["shadow"] is True and state["source"] == "scene_ckpt"
+    got_xy = [(c["x"], c["y"]) for c in state["centers"]]
+    want_xy = [(0.0, 5.0), (0.4, 10.0), (1.2, 20.0), (2.0, 30.0)]
+    assert len(got_xy) == len(want_xy)
+    for got, want in zip(got_xy, want_xy):
+        assert abs(got[0] - want[0]) < 1e-5 and abs(got[1] - want[1]) < 1e-5, (got, want)
+    assert all(c["src"] == "model" and c["head"] == "lane_gt" and c["ckpt"] == ckpt for c in state["centers"])
     assert state["lane_x"]["lane_x"] == 0.4
+    assert state["lane_x"]["src"] == "model"
     assert "gt_poly" not in state["detect"]["edge"]
     assert "path_world" not in state["detect"]["edge"]
+    assert "spoof" not in state["detect"]
+    assert "dim" not in state["detect"]
     assert "map_road" not in state["detect"]
-    again = renderable_state(state)
-    blob = repr(again)
-    assert "gt_poly" not in blob and "path_world" not in blob and "src': 'map'" not in blob and 'src": "map"' not in blob
+    assert "map_road" not in state
+    assert "beamng_gt" not in _sources(state)
+    assert "map" not in _sources(state)
+    assert "gt" not in _sources(state)
     poly = scene_ckpt_ribbon_polyline(state["centers"], state["confidence"])
-    assert len(poly) >= 2, "tagged centers must still feed the ribbon"
-    print("as_state: lane_x and centers tagged, gt/map/path_world stripped, ribbon still fed OK")
+    assert len(poly) >= 2
+
+    low = SceneCkptPred(lane_gt=values, lane_x=0.4, confidence=0.20, ckpt=ckpt)
+    low.detect = {
+        "edge": {
+            "src": "model",
+            "head": "edge",
+            "ckpt": ckpt,
+            "confidence": 0.20,
+            "points": [{"side": "right", "x": 1.0, "y": 5.0}],
+        }
+    }
+    low_state = low.as_state()
+    assert low_state["caption"] == "LOW"
+    assert low_state["confidence"] == 0.20
+    assert not low_state.get("centers")
+    assert low_state.get("lane_x") is None
+    assert "lane" not in low_state
+    assert not low_state.get("detect")
+    print("as_state live: gt and map dropped, low conf emits no centers or lane_x, ribbon still fed OK")
 
 
 def main() -> None:
     check_rejects_foreign_and_low_conf()
-    check_as_state_strips_and_tags()
+    check_as_state_live_output()
     print("test_viz_contract: all OK")
 
 

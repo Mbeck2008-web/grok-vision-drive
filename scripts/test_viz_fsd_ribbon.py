@@ -148,9 +148,11 @@ def check_ribbon_honesty() -> None:
 
     assert scene_ckpt_ribbon_polyline(centers, 0.2) == []
     assert scene_ckpt_ribbon_polyline(centers, 0.39999) == []
-    pred = SceneCkptPred(lane_gt=nan_vec, lane_x=0.2, confidence=0.2)
-    assert pred.as_state()["caption"] == "LOW"
-    assert pred.as_state()["centers"][0]["y"] == 5.0
+    pred = SceneCkptPred(lane_gt=nan_vec, lane_x=0.2, confidence=0.2, ckpt="ribbon.ckpt_ep1.npz")
+    low_state = pred.as_state()
+    assert low_state["caption"] == "LOW"
+    assert not low_state.get("centers")
+    assert low_state.get("lane_x") is None
     print("ribbon: no stroke past 30 m, no interpolate across NaN, fade under 0.40 OK")
 
 
@@ -201,7 +203,12 @@ def check_stage_ribbon_and_no_gt() -> None:
     from python.viz.scene_ribbon import scene_ckpt_centers
     from python.viz.stage import Cam, render_stage, debug_gt_enabled
 
-    pred = SceneCkptPred(lane_gt=_lane_gt([0.0, 0.4, 1.2, 2.0], 0.9), lane_x=0.5, confidence=0.9)
+    pred = SceneCkptPred(
+        lane_gt=_lane_gt([0.0, 0.4, 1.2, 2.0], 0.9),
+        lane_x=0.5,
+        confidence=0.9,
+        ckpt="ribbon.ckpt_ep1.npz",
+    )
     base = {
         "engaged": False,
         "loop_hz": 3.0,
@@ -242,7 +249,10 @@ def check_stage_ribbon_and_no_gt() -> None:
     ui2 = _stage_ui()
     with_ck = dict(base)
     with_ck["scene_ckpt"] = pred.as_state()
-    assert with_ck["scene_ckpt"]["centers"] == scene_ckpt_centers(pred.lane_gt)
+    got = with_ck["scene_ckpt"]["centers"]
+    want = scene_ckpt_centers(pred.lane_gt)
+    assert [(c["x"], c["y"]) for c in got] == [(c["x"], c["y"]) for c in want]
+    assert all(c.get("src") == "model" and c.get("head") == "lane_gt" for c in got)
     painted = render_stage(with_ck, ui=ui2)
     missing = render_stage(dict(base), ui=ui2)
     assert int(np.abs(painted.astype(np.int16) - missing.astype(np.int16)).sum()) > 0

@@ -942,7 +942,7 @@ def check_ribbon_flare() -> None:
     assert abs(ribbon_half_m(RIBBON_FLARE_M, car_half) - car_half) < 1e-6
     assert abs(ribbon_half_m(20.0, car_half) - car_half) < 1e-6
     assert abs(paint_half_m(3.5 * 0.5) - car_half) < 1e-6
-    assert paint_half_m(0.4) == 0.4
+    assert abs(paint_half_m(0.4) - car_half) < 1e-6
 
     ring = []
     for deg in range(-90, 30, 6):

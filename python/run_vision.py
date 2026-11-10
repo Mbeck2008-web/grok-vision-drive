@@ -103,6 +103,7 @@ from python.sensors.frame_slot import (
 )
 from python.runtime.frame_gate import (
     DEFAULT_MAX_FRAME_AGE_MS,
+    STALE_CAPTION,
     frame_is_stale,
     gate_drive_command,
     require_max_frame_age_ms,
@@ -546,7 +547,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_MAX_FRAME_AGE_MS,
         help="Do not drive on a camera frame older than this (default 300). "
-        "The tick is captioned LOW/STALE and logged. Heartbeat, AEB, and engage are unchanged.",
+        "The tick is captioned STALE and logged. Heartbeat, AEB, and engage are unchanged.",
     )
     ap.add_argument(
         "--route-graph",
@@ -1643,7 +1644,7 @@ def main(clock=None) -> None:
                 holding = False
                 print(
                     f"[GVD] frame stale age_ms={frame_age_ms:.0f} "
-                    f"max_ms={float(args.max_frame_age_ms):.0f} caption=LOW/STALE",
+                    f"max_ms={float(args.max_frame_age_ms):.0f} caption={STALE_CAPTION}",
                     flush=True,
                 )
             if hasattr(actuator, "note_engaged"):
@@ -1775,7 +1776,9 @@ def main(clock=None) -> None:
                     drive=bool(getattr(args, "scene_ckpt_drive", False)),
                     engaged=bool(engaged),
                     steer=float(applied.steer),
+                    frame_stale=bool(frame_stale),
                 )
+                st["frame_stale"] = bool(frame_stale)
                 main = draw_scene_ckpt_overlay(
                     main,
                     ckpt_pred,

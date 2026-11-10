@@ -18,6 +18,8 @@ from python.debug.lane_targets import LOOKAHEADS_M
 SCENE_RIBBON_MIN_CONF = 0.40
 SCENE_RIBBON_MAX_Y_M = 30.0
 SCENE_RIBBON_STEP_M = 0.5
+# Display-only: below SCENE_RIBBON_MIN_CONF the ribbon stays visible at this gain.
+SCENE_RIBBON_LOW_DISPLAY_GAIN = 0.40
 # Perceived ribbon on the chase view and the windshield. BGR #3d7eea.
 RIBBON_BGR = (234, 126, 61)
 
@@ -172,16 +174,32 @@ def _spline_run(run: list[dict[str, float]]) -> list[dict[str, float]]:
     return out
 
 
+def scene_ckpt_display_gain(
+    confidence: float,
+    min_conf: float = SCENE_RIBBON_MIN_CONF,
+) -> float:
+    """Display opacity for the perceived ribbon. Does not change gating."""
+    try:
+        conf = float(confidence)
+    except (TypeError, ValueError):
+        return SCENE_RIBBON_LOW_DISPLAY_GAIN
+    if not math.isfinite(conf) or conf < float(min_conf):
+        return SCENE_RIBBON_LOW_DISPLAY_GAIN
+    return 1.0
+
+
 def paint_tapered_ribbon(
     img: Any,
     points: list[dict[str, float]],
     project: Callable[[float, float], tuple[int, int] | None],
     color: tuple[int, int, int] = RIBBON_BGR,
+    gain: float = 1.0,
 ) -> None:
     """Anti-aliased centerline. Width tapers with forward distance. One glow blend.
 
     ``project`` is the existing camera map. This function does not move the math.
     A gap in ``points`` is already a break in y; a rejected projection breaks the stroke.
+    ``gain`` scales display opacity only (1.0 = full, ~0.40 = low-confidence dim).
     """
     if img is None or len(points) < 2:
         return
@@ -211,18 +229,34 @@ def paint_tapered_ribbon(
             px += 6.0
         return max(1, int(round(px)))
 
+    try:
+        g = max(0.0, min(1.0, float(gain)))
+    except (TypeError, ValueError):
+        g = 1.0
     for run in runs:
         for a, b in zip(run, run[1:]):
             y_m = 0.5 * (a[2] + b[2])
             cv2.line(glow, (a[0], a[1]), (b[0], b[1]), color, _width(y_m, False), cv2.LINE_AA)
     blended = img.copy()
-    cv2.addWeighted(glow, 0.35, img, 0.65, 0, blended)
+    glow_a = 0.35 * g
+    cv2.addWeighted(glow, glow_a, img, 1.0 - glow_a, 0, blended)
     painted = np.any(glow != 0, axis=2)
     img[painted] = blended[painted]
+    if g >= 0.999:
+        for run in runs:
+            for a, b in zip(run, run[1:]):
+                y_m = 0.5 * (a[2] + b[2])
+                cv2.line(img, (a[0], a[1]), (b[0], b[1]), color, _width(y_m, True), cv2.LINE_AA)
+        return
+    core = np.zeros_like(img)
     for run in runs:
         for a, b in zip(run, run[1:]):
             y_m = 0.5 * (a[2] + b[2])
-            cv2.line(img, (a[0], a[1]), (b[0], b[1]), color, _width(y_m, True), cv2.LINE_AA)
+            cv2.line(core, (a[0], a[1]), (b[0], b[1]), color, _width(y_m, True), cv2.LINE_AA)
+    blended_core = img.copy()
+    cv2.addWeighted(core, g, img, 1.0 - g, 0, blended_core)
+    painted_core = np.any(core != 0, axis=2)
+    img[painted_core] = blended_core[painted_core]
 
 
 def scene_ckpt_ribbon_polyline(

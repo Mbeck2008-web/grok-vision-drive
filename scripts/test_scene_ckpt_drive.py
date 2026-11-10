@@ -406,14 +406,14 @@ def check_modular_low_conf_and_stale_no_ckpt_steer() -> None:
 
 
 def check_overlay_caption_drive_kind() -> None:
-    """Caption kind must track confidence AND drive; must kill drive-only mutation.
+    """Mode tags are independent of confidence; numeric/LOW text is gone.
 
-    Skeptic mutation: kind = "DRIVE" if drive else cap shows DRIVE at conf<0.40
-    even though apply_scene_ckpt_lane already returned stop. The helper must
-    keep LOW when scene_ckpt_caption returns LOW.
+    apply_scene_ckpt_lane still stops below SCENE_RIBBON_MIN_CONF. The
+    overlay names the mode (DRIVE / SHADOW) or the STALE safety mark.
     """
     import inspect
 
+    from python.runtime.frame_gate import STALE_CAPTION
     from python.train.scene_ckpt_runtime import (
         apply_scene_ckpt_lane,
         scene_ckpt_overlay_caption,
@@ -424,27 +424,28 @@ def check_overlay_caption_drive_kind() -> None:
     assert default_min == SCENE_RIBBON_MIN_CONF, (default_min, SCENE_RIBBON_MIN_CONF)
     assert float(default_min) == 0.40
 
-    low = scene_ckpt_overlay_caption(_pred(lane_x=-0.8, confidence=0.10), drive=True)
-    assert low.startswith("LOW"), low
-    assert not low.startswith("DRIVE"), low
-
+    low_drive = scene_ckpt_overlay_caption(_pred(lane_x=-0.8, confidence=0.10), drive=True)
+    assert low_drive == "DRIVE", low_drive
+    low_shadow = scene_ckpt_overlay_caption(_pred(lane_x=-0.8, confidence=0.10), drive=False)
+    assert low_shadow == "SHADOW", low_shadow
     drive_hi = scene_ckpt_overlay_caption(_pred(lane_x=-0.8, confidence=0.91), drive=True)
-    assert drive_hi.startswith("DRIVE lane_x="), drive_hi
-
+    assert drive_hi == "DRIVE", drive_hi
     shadow_hi = scene_ckpt_overlay_caption(_pred(lane_x=-0.8, confidence=0.91), drive=False)
-    assert shadow_hi.startswith("SHADOW"), shadow_hi
-    print("overlay caption: LOW/DRIVE/SHADOW kinds + min_conf==SCENE_RIBBON_MIN_CONF OK")
+    assert shadow_hi == "SHADOW", shadow_hi
+    stale = scene_ckpt_overlay_caption(_pred(lane_x=-0.8, confidence=0.91), drive=True, frame_stale=True)
+    assert stale == STALE_CAPTION, stale
+    for cap in (low_drive, low_shadow, drive_hi, shadow_hi, stale):
+        assert "conf=" not in cap, cap
+        assert not cap.startswith("LOW"), cap
+        assert "lane_x=" not in cap, cap
+    print("overlay caption: STALE/DRIVE/SHADOW mode tags, no conf text, min_conf OK")
 
 
 def check_overlay_caption_drawn_through_draw() -> None:
-    """Lock caption wiring through draw_scene_ckpt_overlay itself (not just the helper).
-
-    Skeptic M2: draw_scene_ckpt_overlay calling scene_ckpt_overlay_caption(pred,
-    drive=False) shows SHADOW on screen while the car is driving. Recording
-    cv2.putText must catch that. Also keeps M1 (DRIVE at conf 0.10) dead.
-    """
+    """The camera/clip overlay paints the mode tag, never confidence text."""
     import cv2
 
+    from python.runtime.frame_gate import STALE_CAPTION
     from python.train.scene_ckpt_runtime import draw_scene_ckpt_overlay
 
     drawn: list[str] = []
@@ -459,22 +460,28 @@ def check_overlay_caption_drawn_through_draw() -> None:
     try:
         drawn.clear()
         draw_scene_ckpt_overlay(frame, _pred(lane_x=-0.8, confidence=0.91), drive=True)
-        assert drawn, "draw_scene_ckpt_overlay never called putText"
-        assert drawn[0].startswith("DRIVE lane_x="), drawn[0]
+        assert drawn == ["DRIVE"], drawn
 
         drawn.clear()
         draw_scene_ckpt_overlay(frame, _pred(lane_x=-0.8, confidence=0.91), drive=False)
-        assert drawn, "draw_scene_ckpt_overlay never called putText"
-        assert drawn[0].startswith("SHADOW"), drawn[0]
+        assert drawn == ["SHADOW"], drawn
 
         drawn.clear()
         draw_scene_ckpt_overlay(frame, _pred(lane_x=-0.8, confidence=0.10), drive=True)
-        assert drawn, "draw_scene_ckpt_overlay never called putText"
-        assert drawn[0].startswith("LOW"), drawn[0]
-        assert not drawn[0].startswith("DRIVE"), drawn[0]
+        assert drawn == ["DRIVE"], drawn
+
+        drawn.clear()
+        draw_scene_ckpt_overlay(frame, _pred(lane_x=-0.8, confidence=0.10), drive=False)
+        assert drawn == ["SHADOW"], drawn
+
+        drawn.clear()
+        draw_scene_ckpt_overlay(
+            frame, _pred(lane_x=-0.8, confidence=0.91), drive=True, frame_stale=True,
+        )
+        assert drawn == [STALE_CAPTION], drawn
     finally:
         cv2.putText = real_put_text  # type: ignore[assignment]
-    print("overlay caption via draw_scene_ckpt_overlay putText: DRIVE/SHADOW/LOW OK")
+    print("overlay caption via draw_scene_ckpt_overlay: mode tags, no conf text OK")
 
 
 def check_same_tick_observe_documented() -> None:

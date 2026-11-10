@@ -1,6 +1,6 @@
 # SPEC: training-time frame quality filter
 
-Rev 2. Offline labels and training only. Deploy stays camera-only.
+Rev 3. Offline labels and training only. Deploy stays camera-only.
 
 **Goal.** Stop the scene net from treating two kinds of bad recorded frames
 as normal driving:
@@ -59,8 +59,10 @@ two rules.
 - Off the network (farther than `width/2 + 1.5 m` from every road) →
   `unknown` / `off_network`.
 
-`--drop-wrong-way` removes only `verdict == wrong_way`. `ok` and `unknown`
-are kept.
+The default wrong-way drop (opt out with `--keep-wrong-way`) removes only
+`verdict == wrong_way`. `ok` and `unknown` are kept. `--drop-wrong-way` is
+kept as a compatibility alias for the default drop; it also makes a missing
+road dump a hard error (see Flags).
 
 Validated on IQU45 `sgt_2h_20261105` frame `i=28392` (turn arrow toward the
 camera, yellow line on the right): classified `wrong_way` / `oneway_against`
@@ -71,8 +73,8 @@ carriageway `893963.0` is ~8.8 m across the median.
 ## Method (overexposure)
 
 `road_clip_fraction` is the share of **lower-half** pixels whose any RGB
-channel is `>= 250`. `--max-road-clip T` (suggested `0.20`) drops a frame
-when that fraction **exceeds** `T`. Default `T = -1` disables the check.
+channel is `>= 250`. `--max-road-clip T` drops a frame when that fraction
+**exceeds** `T`. Default `T = 0.20`. Pass `T = -1` to disable the check.
 Computed from the training image at index time (or a test-injected loader),
 never at deploy.
 
@@ -84,11 +86,23 @@ worst sampled frame 92.1% (sgt).
 
 | Flag | Default | Effect |
 | --- | --- | --- |
-| `--drop-wrong-way` | off | Drop `wrong_way` rows before the holdout split |
+| (wrong-way drop) | on | Drop `wrong_way` rows before the holdout split |
+| `--keep-wrong-way` | off | Opt out of the default wrong-way drop |
+| `--drop-wrong-way` | off (compat alias) | Same drop as the default; fail if the road dump is missing |
 | `--road-dump PATH` | empty → `roads_dir() / <map>.json.gz` | Road network used by the detector |
-| `--max-road-clip T` | `-1` (disabled) | Drop frames with lower-half clip `> T` |
+| `--max-road-clip T` | `0.20` | Drop frames with lower-half clip `> T`. `-1` disables |
 
-Old behavior is unchanged when both filters are left off.
+Michael asked to "just drop the wrong way and clipping", so both filters are
+on by default. Opt out with `--keep-wrong-way` and `--max-road-clip -1` to
+recover the earlier unfiltered row set.
+
+If no road dump exists for the map (and `--road-dump` was not given), the
+wrong-way filter **does not crash training**: it logs one warning and keeps
+every frame (`unknown` is kept). If the user explicitly passed
+`--drop-wrong-way`, a missing or unreadable dump fails the run.
+
+At dataset build the trainer prints one line with the dropped count for
+each filter (`wrong_way=… overexposed=… kept=…`).
 
 The filter runs before the holdout split, so train and holdout both lose
 the dropped rows. Metrics from a filtered run are **not comparable** to
@@ -107,8 +121,14 @@ only to other runs that used the same flags.
 
 - `python scripts/test_frame_quality_filter.py` (also collected by
   `scripts/run_offline_suite.py`).
-- Parser defaults keep both filters off.
-- Parser and `apply_frame_quality` function defaults keep both filters off.
+- Parser defaults turn both filters on (`--max-road-clip` is `0.20`;
+  wrong-way drop is on unless `--keep-wrong-way`). `--drop-wrong-way` remains
+  accepted. `--keep-wrong-way` and `--max-road-clip -1` opt out.
+- `apply_frame_quality` function defaults stay off so library callers must
+  opt in. The trainer maps parser flags through `frame_quality_from_args`.
+- A missing road dump with the default drop on logs one warning and keeps
+  frames; the same case with explicit `--drop-wrong-way` (`require_road_dump`)
+  raises `FrameQualityError`.
 - Synthetic one-way against-traffic pose is `wrong_way`; with-traffic is `ok`.
 - One-way edges along +X with `flipDirection: true`: heading `0` is
   `wrong_way` / `oneway_against`; heading `π` is `ok` / `oneway_with`.

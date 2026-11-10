@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Training-time frame quality filter: wrong-way drop and road-clip drop.
 
-(1) ``--drop-wrong-way`` and ``--max-road-clip`` default off / -1.
+(1) Parser defaults turn both filters on (wrong-way drop, ``--max-road-clip``
+    0.20). ``--keep-wrong-way`` and ``--max-road-clip -1`` opt out.
+    ``--drop-wrong-way`` stays accepted as a compatibility alias.
 (2) A car pointing against a one-way stored tangent is ``wrong_way``;
     the same pose pointing with the road is ``ok``.
 (3) On a two-way road, the opposing lane is ``wrong_way`` and the correct
@@ -10,6 +12,8 @@
 (4) ``road_clip_fraction`` uses the lower half only (any RGB channel >= 250).
 (5) ``apply_frame_quality`` with both filters off keeps every row; with the
     flags on it drops only wrong-way and over-clipped frames.
+(6) A missing road dump warns once and keeps frames unless the user passed
+    ``--drop-wrong-way`` (``require_road_dump``), which fails loudly.
 """
 from __future__ import annotations
 
@@ -69,17 +73,60 @@ def _along_x(
     }
 
 
-def check_parser_defaults() -> None:
-    from python.train.train_scene import build_parser
+def _flag(parser, option: str):
+    for action in parser._actions:
+        if option in action.option_strings:
+            return action
+    raise AssertionError(f"missing flag {option}")
 
-    args = build_parser().parse_args([])
+
+def check_parser_defaults() -> None:
+    from python.train.frame_quality import DEFAULT_MAX_ROAD_CLIP
+    from python.train.train_scene import build_parser, frame_quality_from_args
+
+    parser = build_parser()
+    # Mutation of these defaults must die: filters are on unless opted out.
+    assert DEFAULT_MAX_ROAD_CLIP == 0.20
+    assert _flag(parser, "--max-road-clip").default == DEFAULT_MAX_ROAD_CLIP
+    assert _flag(parser, "--keep-wrong-way").default is False
+    assert _flag(parser, "--drop-wrong-way").default is False
+
+    args = parser.parse_args([])
+    assert args.keep_wrong_way is False
     assert args.drop_wrong_way is False
-    assert args.max_road_clip == -1.0
+    assert args.max_road_clip == DEFAULT_MAX_ROAD_CLIP
     assert args.road_dump == ""
-    args = build_parser().parse_args(["--drop-wrong-way", "--max-road-clip", "0.20", "--road-dump", "x.json"])
+    drop, require, clip, dump = frame_quality_from_args(args)
+    assert drop is True, "wrong-way drop must be on by default"
+    assert require is False
+    assert clip == 0.20
+    assert dump == ""
+
+    args = parser.parse_args(["--keep-wrong-way", "--max-road-clip", "-1"])
+    drop, require, clip, dump = frame_quality_from_args(args)
+    assert args.keep_wrong_way is True
+    assert drop is False
+    assert require is False
+    assert clip == -1.0
+
+    args = parser.parse_args(["--drop-wrong-way", "--road-dump", "x.json"])
+    drop, require, clip, dump = frame_quality_from_args(args)
     assert args.drop_wrong_way is True
-    assert args.max_road_clip == 0.20
-    assert args.road_dump == "x.json"
+    assert drop is True
+    assert require is True
+    assert clip == 0.20
+    assert dump == "x.json"
+
+    import io
+    from contextlib import redirect_stderr
+
+    with redirect_stderr(io.StringIO()):
+        try:
+            parser.parse_args(["--drop-wrong-way", "--keep-wrong-way"])
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("expected --drop-wrong-way and --keep-wrong-way to conflict")
 
 
 def check_wrong_way_oneway() -> None:
@@ -268,6 +315,59 @@ def check_combined_drop() -> None:
         assert stats["overexposed"] == 1
 
 
+def check_missing_dump_warn_and_keep() -> None:
+    """Default drop (no explicit --drop-wrong-way) keeps frames if the dump is missing."""
+    from python.train.frame_quality import apply_frame_quality, describe_quality
+
+    rows = [
+        {"i": 0, "map": "no_such_map", "ego": {"pos": [20.0, -0.8, 0.0], "dir": [1.0, 0.0, 0.0]}},
+        {"i": 1, "map": "no_such_map", "ego": {"pos": [20.0, -0.8, 0.0], "dir": [-1.0, 0.0, 0.0]}},
+    ]
+    warnings: list[str] = []
+    kept, stats = apply_frame_quality(
+        rows,
+        drop_wrong_way=True,
+        require_road_dump=False,
+        road_dump="/no/such/road_dump.json",
+        max_road_clip=-1.0,
+        warn=warnings.append,
+    )
+    assert [r["i"] for r in kept] == [0, 1], (kept, stats)
+    assert stats["wrong_way"] == 0
+    assert stats["dump_missing"] == 1
+    assert stats["unknown"] == 2
+    assert len(warnings) == 1, warnings
+    assert "keeping all 2 frames" in warnings[0]
+    assert "unknown" in warnings[0]
+    assert "Pass --drop-wrong-way to fail" in warnings[0]
+    line = describe_quality(stats, 2)
+    assert "wrong_way=0" in line
+    assert "dump_missing=1" in line
+    assert "kept=2" in line
+
+
+def check_missing_dump_explicit_flag_fails() -> None:
+    """Explicit --drop-wrong-way (require_road_dump) fails loudly when the dump is missing."""
+    from python.train.frame_quality import FrameQualityError, apply_frame_quality
+
+    rows = [{"i": 0, "map": "no_such_map", "ego": {"pos": [20.0, -0.8, 0.0], "dir": [1.0, 0.0, 0.0]}}]
+    warnings: list[str] = []
+    try:
+        apply_frame_quality(
+            rows,
+            drop_wrong_way=True,
+            require_road_dump=True,
+            road_dump="/no/such/road_dump.json",
+            max_road_clip=-1.0,
+            warn=warnings.append,
+        )
+    except FrameQualityError as exc:
+        assert "not found" in str(exc).lower() or "road dump" in str(exc).lower(), exc
+    else:
+        raise AssertionError("expected FrameQualityError when --drop-wrong-way and the dump is missing")
+    assert warnings == []
+
+
 def main() -> None:
     check_parser_defaults()
     check_apply_frame_quality_defaults()
@@ -277,6 +377,8 @@ def main() -> None:
     check_wrong_way_twoway()
     check_road_clip_fraction()
     check_combined_drop()
+    check_missing_dump_warn_and_keep()
+    check_missing_dump_explicit_flag_fails()
     print("test_frame_quality_filter: OK")
 
 

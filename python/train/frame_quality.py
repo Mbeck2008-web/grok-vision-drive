@@ -25,12 +25,12 @@ CELL_M = 40.0
 # Discard a snap onto another deck (bridge / overpass). About one storey.
 MAX_DZ_M = 3.0
 CLIP_VALUE = 250
-# Suggested cut when the flag is turned on. Parser default stays -1 (off).
+# Parser default for --max-road-clip. Pass -1 to disable.
 DEFAULT_MAX_ROAD_CLIP = 0.20
 
 
 class FrameQualityError(ValueError):
-    """A road dump needed by ``--drop-wrong-way`` is missing or unreadable."""
+    """A road dump needed by the wrong-way filter is missing or unreadable."""
 
 
 @dataclass
@@ -493,6 +493,13 @@ def resolve_road_dump(
     return path
 
 
+def _warn_quality(message: str, warn: Callable[[str], None] | None = None) -> None:
+    if warn is not None:
+        warn(message)
+        return
+    print(f"[GVD] frame-quality: {message}", flush=True)
+
+
 def apply_frame_quality(
     rows: list[Mapping[str, Any]],
     *,
@@ -501,16 +508,47 @@ def apply_frame_quality(
     road_dump: Path | str | None = None,
     roads: list[QualityRoad] | None = None,
     image_loader: Callable[[Any, int], Any] | None = None,
+    require_road_dump: bool = False,
+    warn: Callable[[str], None] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Apply the enabled filters. Both off returns copies of the same rows."""
-    stats = {"wrong_way": 0, "ok": 0, "unknown": 0, "overexposed": 0, "clip_skipped": 0}
+    """Apply the enabled filters. Both off returns copies of the same rows.
+
+    When ``drop_wrong_way`` is set and no road dump can be loaded, raise
+    ``FrameQualityError`` if ``require_road_dump`` is true (the user passed
+    ``--drop-wrong-way``). Otherwise log one warning and keep every row
+    (unknown is kept).
+    """
+    stats = {
+        "wrong_way": 0,
+        "ok": 0,
+        "unknown": 0,
+        "overexposed": 0,
+        "clip_skipped": 0,
+        "dump_missing": 0,
+    }
     out = [dict(row) for row in rows]
     if drop_wrong_way:
         use = roads
         if use is None:
-            use = load_quality_roads(resolve_road_dump(out, road_dump))
-        out, ww = drop_wrong_way_rows(out, use)
-        stats.update(ww)
+            try:
+                use = load_quality_roads(resolve_road_dump(out, road_dump))
+            except (FrameQualityError, OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                if require_road_dump:
+                    if isinstance(exc, FrameQualityError):
+                        raise
+                    raise FrameQualityError(f"road dump unreadable: {exc}") from exc
+                stats["dump_missing"] = 1
+                stats["unknown"] = len(out)
+                err = exc if isinstance(exc, FrameQualityError) else f"road dump unreadable: {exc}"
+                _warn_quality(
+                    f"no road dump for this map; keeping all {len(out)} frames "
+                    f"(unknown). Pass --drop-wrong-way to fail, or --road-dump PATH. ({err})",
+                    warn,
+                )
+                use = None
+        if use is not None:
+            out, ww = drop_wrong_way_rows(out, use)
+            stats.update(ww)
     if float(max_road_clip) >= 0.0:
         if image_loader is None:
             from python.train.scene_loader import load_canvas
@@ -527,9 +565,10 @@ def apply_frame_quality(
 
 def describe_quality(stats: Mapping[str, int], before: int) -> str:
     after = before - int(stats.get("wrong_way", 0)) - int(stats.get("overexposed", 0))
+    missing = " dump_missing=1 (wrong-way kept)" if int(stats.get("dump_missing", 0)) else ""
     return (
         f"before={int(before)} wrong_way={int(stats.get('wrong_way', 0))} "
         f"overexposed={int(stats.get('overexposed', 0))} kept={after} "
-        f"ok={int(stats.get('ok', 0))} unknown={int(stats.get('unknown', 0))} "
+        f"ok={int(stats.get('ok', 0))} unknown={int(stats.get('unknown', 0))}{missing} "
         f"(filtered-run metrics are not comparable to an unfiltered run)"
     )

@@ -175,6 +175,9 @@ class CameraFrameBundle:
     # took: 1 new, 0 identical to that camera's previous taken frame) (cam-age
     # telemetry, ``enable_read_log``); None otherwise.
     read_log: dict[str, Any] | None = None
+    # Wall time the main pixels were first seen. 0 when this grab has no main
+    # picture. A repeated shared-memory buffer keeps the previous stamp.
+    captured_at: float = 0.0
 
     def tick_frames(self) -> dict[str, np.ndarray]:
         """Pictures whose timestamps are this grab. An older stamp is left out."""
@@ -1112,6 +1115,25 @@ def frame_signature(bgr: np.ndarray) -> tuple[Any, ...]:
     return (arr.shape, arr.dtype.str, hash(arr.tobytes()))
 
 
+def note_content_time(
+    cid: str,
+    signature: tuple[Any, ...],
+    now: float,
+    content_ts: dict[str, float],
+    frame_sig: dict[str, tuple[Any, ...]],
+) -> float:
+    """Monotonic time these pixels were first seen.
+
+    Call before ``frame_sig`` is updated. An unchanged shared-memory buffer
+    keeps its previous stamp so the supervisor can age it. A new signature
+    stamps ``now``. Callers pass ``time.monotonic()``.
+    """
+    prev = frame_sig.get(cid)
+    if prev != signature or cid not in content_ts:
+        content_ts[cid] = float(now)
+    return float(content_ts[cid])
+
+
 @runtime_checkable
 class CameraBackend(Protocol):
     name: str
@@ -1135,6 +1157,9 @@ class StubBackend:
 
     def grab(self) -> CameraFrameBundle:
         health = {cid: CamHealth.MISSING for cid in CAM_IDS}
+        # This look happened now. A bundle that was never grabbed stays at
+        # captured_at 0, and the gate treats that as stale.
+        seen = time.monotonic()
         return CameraFrameBundle(
             frames={},
             timestamps={},
@@ -1142,6 +1167,7 @@ class StubBackend:
             backend=self.name,
             note="stub: no cameras",
             unique_gpu_n=0,
+            captured_at=seen,
         )
 
 
@@ -1409,7 +1435,7 @@ class WindowBackend:
         if img.dtype != np.uint8:
             img = img.astype(np.uint8)
         img = resize_long_side(img, self.long_side)
-        ts = time.time()
+        ts = time.monotonic()
         frames["main"] = img
         frames["cam_main"] = img
         timestamps["main"] = ts
@@ -1423,6 +1449,7 @@ class WindowBackend:
             note=self._note,
             unique_gpu_n=1,
             unique_gpu_ids=("main",),
+            captured_at=ts,
         )
 
 
@@ -1463,6 +1490,9 @@ class BeamNGPyBackend:
         self._Camera: Any = None
         self._sensor_kwargs: dict[str, dict[str, Any]] = {}
         self._frame_sig: dict[str, tuple[Any, ...]] = {}
+        self._content_ts: dict[str, float] = {}
+        # None reads the whole rig. A subset is the cameras the live model uses.
+        self._needed: frozenset[str] | None = None
         # Signature of each camera's last frame the live hold's schedule took
         # (cam-age telemetry ``tuniq`` only; never read by the hold). Cleared on
         # open / close and on reset_live_hold (respawn).
@@ -1490,6 +1520,26 @@ class BeamNGPyBackend:
         # below is the default stream_raw grab and nothing is held.
         self._live_hold: Any = None
         _camera_backends.add(self)
+
+    def _content_clock(self) -> dict[str, float]:
+        """Per-camera first-seen wall time. Tests build a backend with ``__new__``."""
+        content = getattr(self, "_content_ts", None)
+        if content is None:
+            content = {}
+            self._content_ts = content
+        return content
+
+    def set_needed_cameras(self, cams: Any) -> None:
+        """Attach and read only these rig ids. ``None`` keeps the full eight.
+
+        Call before ``open`` so unused sensors are never scheduled in Tech.
+        Scene-ckpt's main-only net uses this. The default supervisor does not.
+        """
+        if cams is None:
+            self._needed = None
+            return
+        ids = frozenset(str(c) for c in cams if str(c) in CAM_IDS)
+        self._needed = ids or frozenset(("main",))
 
     def open(self) -> None:
         self.connect_failed = False
@@ -1545,6 +1595,7 @@ class BeamNGPyBackend:
         self._hitch_steps = []
         self._sensor_kwargs = {}
         self._frame_sig = {}
+        self._content_ts = {}
         self._taken_sig = {}
         self._unique_hz_ema = 0.0
         self._unique_n = 0
@@ -1553,6 +1604,8 @@ class BeamNGPyBackend:
         for spec in cams:
             cid = str(spec.get("id") or "")
             if not cid or cid not in CAM_IDS:
+                continue
+            if self._needed is not None and cid not in self._needed:
                 continue
             try:
                 pos = list(spec.get("pos_m") or [0.0, 1.2, 1.2])
@@ -1744,6 +1797,7 @@ class BeamNGPyBackend:
         self._hitch_steps.clear()
         self._sensor_kwargs.clear()
         self._frame_sig.clear()
+        self._content_ts.clear()
         self._taken_sig.clear()
         self._cache_frames.clear()
         self._cache_ts.clear()
@@ -1890,6 +1944,7 @@ class BeamNGPyBackend:
         self._clip_planes[cid] = (near, float(far_m))
         self._hitch_steps.append((cid, near, float(far_m), rate))
         self._frame_sig.pop(cid, None)
+        self._content_ts.pop(cid, None)
         self._reattached.add(cid)
         return True
 
@@ -1947,6 +2002,7 @@ class BeamNGPyBackend:
         sig = frame_signature(bgr)
         if sig == self._frame_sig.get(cid):
             return
+        note_content_time(cid, sig, time.monotonic(), self._content_clock(), self._frame_sig)
         self._frame_sig[cid] = sig
         if cid not in self._late_unique:
             self._late_unique.append(cid)
@@ -2050,8 +2106,9 @@ class BeamNGPyBackend:
             return
         self._last_status = "ok"
         sig = frame_signature(bgr)
+        seen = note_content_time(cid, sig, float(ts), self._content_clock(), self._frame_sig)
         unique = sig != self._frame_sig.get(cid)
-        self._store_frame(cid, bgr, ts, frames, timestamps, health)
+        self._store_frame(cid, bgr, seen, frames, timestamps, health)
         self._cache_frames[cid] = bgr
         if unique:
             self._frame_sig[cid] = sig
@@ -2198,7 +2255,10 @@ class BeamNGPyBackend:
             )
         frames: dict[str, np.ndarray] = {}
         timestamps: dict[str, float] = {}
-        ts = time.time()
+        # One monotonic sample for every new buffer in this grab. A repeated
+        # buffer keeps the stamp note_content_time already stored, and that
+        # stamp is what timestamps[cid] and captured_at publish.
+        content_now = time.monotonic()
         grab_i = self._grab_i
         self._grab_i = grab_i + 1
         phase = grab_phase_of(grab_i, self._hitch)
@@ -2231,6 +2291,11 @@ class BeamNGPyBackend:
         read_sig: dict[str, tuple[Any, ...]] = {}
         log_cost = 0.0
         for cid, cam in main_first:
+            if self._needed is not None and cid not in self._needed:
+                self._omit_unread(cid, frames, timestamps, health)
+                if log_on:
+                    read_status[cid] = "skip"
+                continue
             if not self._grab_this_tick(cid, grab_i):
                 self._omit_unread(cid, frames, timestamps, health)
                 if log_on:
@@ -2247,7 +2312,7 @@ class BeamNGPyBackend:
                     self._last_status = "busy" if bgr is _IO_BUSY else "timeout"
                     self._omit_unread(cid, frames, timestamps, health)
                 else:
-                    self._publish_read(cid, bgr, ts, frames, timestamps, health, unique_ids)
+                    self._publish_read(cid, bgr, content_now, frames, timestamps, health, unique_ids)
             except Exception:
                 self._last_status = "error"
                 health[cid] = CamHealth.ERROR
@@ -2318,6 +2383,9 @@ class BeamNGPyBackend:
             self._unique_n += 1
         n_ok = sum(1 for c in CAM_IDS if health.get(c) == CamHealth.OK)
         grab_ms = (time.perf_counter() - t0) * 1000.0
+        captured_at = 0.0
+        if "main" in frames or "cam_main" in frames:
+            captured_at = float(self._content_ts.get("main") or 0.0)
         note = (
             f"beamngpy: {n_ok} colour frame(s) grab={grab_i} unique={unique_n} "
             f"main_div={self._grab_div.get('main', MAIN_GRAB_DIV)} "
@@ -2327,8 +2395,12 @@ class BeamNGPyBackend:
             f"repeat_div={self._grab_div.get('repeatL', REPEAT_GRAB_DIV)} "
             f"rear_div={self._rear_grab_div}"
         )
-        # All eight cameras, this tick. Not one companion and not a cached frame.
-        note += " same_tick=8"
+        # All eight cameras, this tick, unless the live model asked for a subset.
+        # Not one companion and not a cached frame.
+        if self._needed is None:
+            note += " same_tick=8"
+        else:
+            note += " needed=" + ",".join(sorted(self._needed))
         if soft_esc_main:
             note += " soft_esc_colour=hitch"
         return CameraFrameBundle(
@@ -2347,6 +2419,7 @@ class BeamNGPyBackend:
             cam_ages=cam_ages,
             held_frames=held_frames,
             read_log=read_log,
+            captured_at=captured_at,
         )
 
 

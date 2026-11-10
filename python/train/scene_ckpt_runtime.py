@@ -165,13 +165,21 @@ class SceneCkptPred:
         return out
 
 
-def scene_ckpt_overlay_caption(pred: SceneCkptPred | None, *, drive: bool = False) -> str:
+def scene_ckpt_overlay_caption(
+    pred: SceneCkptPred | None,
+    *,
+    drive: bool = False,
+    frame_stale: bool = False,
+) -> str:
     """Caption drawn by ``draw_scene_ckpt_overlay``. Pure so tests can lock the kind.
 
     Low confidence is always ``LOW``, even when drive is on: the drive path has
     already returned stop below SCENE_RIBBON_MIN_CONF. High confidence is
-    ``DRIVE`` only when drive is on; otherwise ``SHADOW``.
+    ``DRIVE`` only when drive is on; otherwise ``SHADOW``. A frame older than
+    the capture cap is ``LOW/STALE`` and is not a drive caption.
     """
+    if frame_stale:
+        return "LOW/STALE"
     if pred is None:
         return "SHADOW"
     cap = scene_ckpt_caption(pred.confidence)  # SHADOW or LOW
@@ -186,6 +194,7 @@ def draw_scene_ckpt_overlay(
     pred: SceneCkptPred | None,
     *,
     drive: bool = False,
+    frame_stale: bool = False,
 ) -> np.ndarray | None:
     """Paint the predicted lane-center path on a camera frame. Does not modify ``frame``.
 
@@ -201,11 +210,11 @@ def draw_scene_ckpt_overlay(
         return out
     color = overlay_bgr("shadow")
     h, w = int(out.shape[0]), int(out.shape[1])
-    caption = scene_ckpt_overlay_caption(pred, drive=drive)
+    caption = scene_ckpt_overlay_caption(pred, drive=drive, frame_stale=frame_stale)
     cv2.putText(out, caption, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
     # Solid swatch so tests (and a clip) can see the mark without anti-alias blending.
     cv2.rectangle(out, (12, 36), (40, 56), color, -1)
-    if pred is None or pred.lane_gt is None:
+    if frame_stale or pred is None or pred.lane_gt is None:
         return out
     if float(pred.confidence) < SCENE_RIBBON_MIN_CONF:
         return out

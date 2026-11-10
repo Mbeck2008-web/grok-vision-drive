@@ -6,6 +6,7 @@ lamps stay masked; they are never filled in.
 from __future__ import annotations
 
 import math
+import re
 from typing import Any
 
 SIGN_CLASSES = ("stop_sign", "yield", "traffic_light", "speed_limit")
@@ -36,8 +37,13 @@ _LAMP_ALIASES = {
 
 
 def _norm_cls(raw: Any) -> str | None:
-    key = str(raw or "").strip().lower().replace(" ", "_")
-    return _CLASS_ALIASES.get(key)
+    key = str(raw or "").strip().lower().replace("-", "_").replace(" ", "_")
+    direct = _CLASS_ALIASES.get(key)
+    if direct is not None:
+        return direct
+    # Instance names like "trafficLight 1", "trafficLight1", "stop 2".
+    stripped = re.sub(r"[\s_]*\d+$", "", key).strip("_")
+    return _CLASS_ALIASES.get(stripped)
 
 
 def _norm_lamp(raw: Any, *, cls: str) -> str:
@@ -91,6 +97,34 @@ def world_to_ego(
     return dx * rx + dy * ry, dx * fx + dy * fy
 
 
+def _looks_like_entry(item: Any) -> bool:
+    return isinstance(item, dict) and any(
+        key in item
+        for key in ("instance", "name", "cls", "class", "type", "pos", "position", "state", "action")
+    )
+
+
+def _recognized_item(item: Any) -> bool:
+    if _looks_like_entry(item):
+        return True
+    if isinstance(item, dict):
+        return all(_recognized_item(value) for value in item.values())
+    if isinstance(item, (list, tuple)):
+        return all(_recognized_item(value) for value in item)
+    return False
+
+
+def recognized_payload(raw: Any) -> bool:
+    """True for an empty or documented traffic_signals dump, else False."""
+    if raw is None:
+        return True
+    if isinstance(raw, (list, tuple)):
+        return len(raw) == 0 or all(_recognized_item(item) for item in raw)
+    if isinstance(raw, dict):
+        return len(raw) == 0 or _recognized_item(raw)
+    return False
+
+
 def _as_signal_list(raw: Any) -> list[Any]:
     if raw is None:
         return []
@@ -115,7 +149,13 @@ def labels_from_signals(raw: Any, ego_pos: Any, ego_dir: Any) -> list[dict[str, 
     for item in _as_signal_list(raw):
         if not isinstance(item, dict):
             continue
-        cls = _norm_cls(item.get("cls") or item.get("class") or item.get("name") or item.get("type"))
+        cls = _norm_cls(
+            item.get("cls")
+            or item.get("class")
+            or item.get("instance")
+            or item.get("name")
+            or item.get("type")
+        )
         if cls is None or cls not in SIGN_CLASSES:
             continue
         pos = _xy(item.get("pos") or item.get("position") or item.get("xyz"))
@@ -147,4 +187,6 @@ def sidecar_row(
 ) -> dict[str, Any]:
     if err:
         return {"err": str(err), "t": t}
+    if not recognized_payload(raw):
+        return {"err": "unrecognized traffic_signals payload", "t": t}
     return {"t": t, "signs": labels_from_signals(raw, ego_pos, ego_dir)}

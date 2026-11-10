@@ -89,6 +89,82 @@ def check_empty_network() -> None:
     print("  empty network -> empty signs, no exception")
 
 
+DOCUMENTED_MAP_NODE_SIGNALS = {
+    "node_a": {
+        "node_b": [
+            {
+                "instance": "trafficLight 1",
+                "pos": {"x": 2.0, "y": 10.0, "z": 0.0},
+                "state": "red",
+                "action": "stop",
+            },
+            {
+                "instance": "stop 2",
+                "pos": [0.0, 20.0, 0.0],
+            },
+        ]
+    }
+}
+
+
+def check_documented_map_node_signals_shape() -> None:
+    from python.collect.signal_labels import labels_from_signals, sidecar_row
+
+    row = sidecar_row(
+        t=1.0,
+        raw=DOCUMENTED_MAP_NODE_SIGNALS,
+        err=None,
+        ego_pos=(0.0, 0.0, 0.0),
+        ego_dir=(0.0, 1.0, 0.0),
+    )
+    assert "err" not in row, row
+    signs = {s["cls"]: s for s in row["signs"]}
+    light = signs["traffic_light"]
+    assert light["state"] == "red"
+    assert light["src"] == "traffic_signals"
+    assert abs(float(light["x"]) - 2.0) < 0.2, light
+    assert abs(float(light["y"]) - 10.0) < 0.2, light
+    assert signs["stop_sign"]["state"] == "unknown"
+    compact = {
+        "n1": {
+            "n2": [
+                {
+                    "instance": "trafficLight1",
+                    "pos": {"x": 2.0, "y": 10.0, "z": 0.0},
+                    "state": "red",
+                }
+            ]
+        }
+    }
+    labels = labels_from_signals(compact, (0.0, 0.0, 0.0), (0.0, 1.0, 0.0))
+    assert labels and labels[0]["cls"] == "traffic_light" and labels[0]["state"] == "red", labels
+    print("  documented get_map_node_signals shape: red light at x~2 y~10, stop state unknown")
+
+
+def check_list_instances_trafficLight_1() -> None:
+    from python.collect.signal_labels import labels_from_signals
+
+    raw = [
+        {"name": "trafficLight 1", "pos": {"x": 2.0, "y": 10.0, "z": 0.0}, "state": "red"},
+    ]
+    labels = labels_from_signals(raw, (0.0, 0.0, 0.0), (0.0, 1.0, 0.0))
+    assert labels and labels[0]["cls"] == "traffic_light", labels
+    assert labels[0]["state"] == "red" and abs(float(labels[0]["x"]) - 2.0) < 0.2
+    print("  list_instances-like trafficLight 1 is classified as a red light")
+
+
+def check_unrecognized_payload_is_err_row() -> None:
+    from python.collect.signal_labels import sidecar_row
+
+    for raw in ("not-a-dump", 42):
+        row = sidecar_row(
+            t=1.0, raw=raw, err=None, ego_pos=(0.0, 0.0, 0.0), ego_dir=(0.0, 1.0, 0.0)
+        )
+        assert "err" in row and row["t"] == 1.0, (raw, row)
+        assert "signs" not in row, row
+    print("  unrecognized payload -> err row, not a silent empty signs list")
+
+
 def check_export_cli() -> None:
     import export_signal_labels as ex
 
@@ -120,6 +196,9 @@ def main() -> None:
     check_missing_api_is_masked()
     check_labels_from_fake_signals()
     check_empty_network()
+    check_documented_map_node_signals_shape()
+    check_list_instances_trafficLight_1()
+    check_unrecognized_payload_is_err_row()
     check_export_cli()
     print("test_signal_labels: OK")
 

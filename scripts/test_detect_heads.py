@@ -95,7 +95,80 @@ def check_learns_and_mask_is_zero() -> None:
     )
     assert float(step["edge_geom"]) == 0.0
     assert float(step["edge_n"]) == 0.0
+    assert float(step["edge"]) == 0.0
+    assert step["edge"].grad_fn is None
     print(f"detect heads: loss {losses[0]:.3f} -> {losses[-1]:.3f}, masked geometry is 0 OK")
+
+
+def check_masked_term_has_no_grad() -> None:
+    """A fully masked batch does not train confidence as 'absent'."""
+    import torch
+    import torch.nn.functional as functional
+
+    from python.train.detect_heads import CONF_WEIGHT, DetectHeads, detect_terms
+    from python.train.detect_targets import EDGE_DIM, OBJ_FEAT, OBJ_SLOTS
+    from python.train.scene_net import scene_loss
+
+    assert CONF_WEIGHT == 0.1, CONF_WEIGHT
+    torch.manual_seed(1)
+    feat = torch.randn(1, 16, requires_grad=True)
+    head = DetectHeads(edge=True, obj=True, brakelight=True, hidden=16)
+    pred = SimpleNamespace(**head(feat))
+    target = {
+        "edge": torch.zeros(EDGE_DIM),
+        "edge_valid": torch.zeros(EDGE_DIM),
+        "obj_box": torch.zeros(OBJ_SLOTS, OBJ_FEAT),
+        "obj_valid": torch.zeros(OBJ_SLOTS, OBJ_FEAT),
+        "obj_class": torch.zeros(OBJ_SLOTS, dtype=torch.long),
+        "obj_listed": torch.zeros(()),
+        "brake": torch.zeros(()),
+        "brake_valid": torch.zeros(()),
+    }
+    terms = detect_terms(pred, target, feat.device, torch.float32)
+    loss = terms["edge"] + terms["obj"] + terms["brakelight"]
+    for name in ("edge", "obj", "brakelight"):
+        assert float(terms[name]) == 0.0, (name, float(terms[name]))
+        assert terms[name].grad_fn is None, name
+    assert loss.grad_fn is None
+    if loss.requires_grad:
+        loss.backward()
+    for param in head.parameters():
+        assert param.grad is None or int(torch.count_nonzero(param.grad)) == 0
+    assert feat.grad is None or int(torch.count_nonzero(feat.grad)) == 0
+
+    # Empty object slots are negatives only when the recorder sent the list.
+    listed = dict(target)
+    listed["obj_listed"] = torch.ones(())
+    listed_terms = detect_terms(pred, listed, feat.device, torch.float32)
+    assert listed_terms["obj"].requires_grad
+    assert listed_terms["edge"].grad_fn is None
+
+    # Partial mask: one valid metre is not averaged with the seven zeros.
+    raw = torch.zeros(1, EDGE_DIM)
+    raw[0, 0] = 1.0
+    mask = torch.zeros(EDGE_DIM)
+    mask[0] = 1.0
+    from python.train.detect_heads import geometry_smooth
+
+    geom, _n = geometry_smooth(raw, torch.zeros(EDGE_DIM), mask)
+    assert abs(float(geom) - 0.5) < 1e-5, float(geom)
+
+    edge = torch.zeros(EDGE_DIM, requires_grad=True)
+    edge_conf = torch.zeros((), requires_grad=True)
+    step = scene_loss(
+        SimpleNamespace(lanes=torch.zeros(1), edge=edge, edge_conf=edge_conf),
+        {"edge": torch.zeros(EDGE_DIM), "edge_valid": mask},
+        heads=("edge",),
+    )
+    bare = functional.binary_cross_entropy_with_logits(edge_conf, torch.ones((), device=edge_conf.device))
+    # scene_loss must add the whole term. Adding only *_geom drops this 0.1 * BCE.
+    assert torch.allclose(step["total"], step["edge"]), (float(step["total"]), float(step["edge"]))
+    assert not torch.allclose(step["total"], step["edge_geom"])
+    assert torch.allclose(step["edge"] - step["edge_geom"], 0.1 * bare), (
+        float(step["edge"] - step["edge_geom"]),
+        float(0.1 * bare),
+    )
+    print("masked batch: whole detect term is detached 0; scene_loss trains the 0.1 conf term OK")
 
 
 def check_runtime_tags_the_checkpoint() -> None:
@@ -165,6 +238,7 @@ def json_sources(node) -> list[str]:
 def main() -> None:
     check_default_net_unchanged()
     check_learns_and_mask_is_zero()
+    check_masked_term_has_no_grad()
     check_runtime_tags_the_checkpoint()
     print("test_detect_heads: all OK")
 

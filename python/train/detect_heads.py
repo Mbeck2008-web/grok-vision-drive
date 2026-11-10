@@ -63,13 +63,6 @@ def _zero(device: Any, dtype: Any) -> Any:
     return torch.zeros((), device=device, dtype=dtype)
 
 
-def _batch_rows(pred: Any, tail: int) -> Any:
-    """(tail,) or (B, tail) → (B, tail)."""
-    if pred.dim() == tail:
-        return pred.unsqueeze(0)
-    return pred
-
-
 def _target(value: Any, device: Any, dtype: Any) -> Any | None:
     if value is None:
         return None
@@ -105,75 +98,123 @@ def _conf_bce(logit: Any, present: Any) -> Any:
     return functional.binary_cross_entropy_with_logits(logit.float(), present.float())
 
 
+def _dead(device: Any, dtype: Any) -> Any:
+    """A constant 0 that is not part of the autograd graph."""
+    return torch.zeros((), device=device, dtype=dtype).detach()
+
+
+def _row_flag(value: Any, rows: int, device: Any) -> Any:
+    """Broadcast a 0/1 recorder flag to ``(rows,)`` bool. Missing means false."""
+    if value is None:
+        return torch.zeros(rows, device=device, dtype=torch.bool)
+    flag = torch.as_tensor(value, device=device).reshape(-1) > 0.5
+    if int(flag.numel()) == 1 and rows != 1:
+        flag = flag.expand(rows)
+    if int(flag.numel()) != rows:
+        flag = flag[:rows]
+    return flag
+
+
 def detect_terms(pred: Any, target: Mapping[str, Any], device: Any, dtype: Any) -> dict[str, Any]:
-    """Per-head training terms. ``*_geom`` ignores unlabeled rows. ``*_n`` counts them."""
-    zero = _zero(device, dtype)
+    """Per-head terms. A head with no provided label is a detached 0, conf included.
+
+    Presence BCE and class CE run only on rows or slots the recorder actually
+    labeled. Empty object slots are negatives only when that frame's traffic
+    or static list was present (``obj_listed``). Geometry stays a mean over
+    the valid elements, so a partial mask is not diluted by the zeros.
+    """
+    dead = _dead(device, dtype)
     out: dict[str, Any] = {}
     edge = getattr(pred, "edge", None)
     if edge is None:
-        out["edge"] = zero
-        out["edge_geom"] = zero
-        out["edge_n"] = zero
+        out["edge"] = dead
+        out["edge_geom"] = dead
+        out["edge_n"] = dead
     else:
-        pred_e = _batch_rows(edge.to(device=device, dtype=dtype), 1)
+        pred_e = edge.to(device=device, dtype=dtype)
         if pred_e.dim() == 1:
             pred_e = pred_e.unsqueeze(0)
-        geom, n = geometry_smooth(pred_e, target.get("edge"), target.get("edge_valid"))
-        conf_logit = getattr(pred, "edge_conf", None)
-        conf = zero
-        if conf_logit is not None and target.get("edge_valid") is not None:
-            valid = _target(target.get("edge_valid"), device, dtype)
-            assert valid is not None
-            present = (valid.reshape(pred_e.shape[0], -1) > 0.5).any(dim=1).to(dtype)
-            conf = _conf_bce(conf_logit.reshape(-1).to(device=device, dtype=dtype), present)
-        out["edge_geom"] = geom
-        out["edge_n"] = n
-        out["edge"] = geom + CONF_WEIGHT * conf
+        valid = _target(target.get("edge_valid"), device, dtype)
+        labeled = False if valid is None else bool((valid.reshape(pred_e.shape[0], -1) > 0.5).any())
+        if not labeled:
+            out["edge"] = dead
+            out["edge_geom"] = dead
+            out["edge_n"] = dead
+        else:
+            geom, n = geometry_smooth(pred_e, target.get("edge"), valid)
+            present = (valid.reshape(pred_e.shape[0], -1) > 0.5).any(dim=1)
+            conf_logit = getattr(pred, "edge_conf", None)
+            conf = dead
+            if conf_logit is not None and bool(present.any()):
+                conf = _conf_bce(
+                    conf_logit.reshape(-1).to(device=device, dtype=dtype)[present],
+                    torch.ones(int(present.sum()), device=device, dtype=dtype),
+                )
+            out["edge_geom"] = geom
+            out["edge_n"] = n
+            out["edge"] = geom + float(CONF_WEIGHT) * conf
     box = getattr(pred, "obj_box", None)
     if box is None:
-        out["obj"] = zero
-        out["obj_geom"] = zero
-        out["obj_n"] = zero
+        out["obj"] = dead
+        out["obj_geom"] = dead
+        out["obj_n"] = dead
     else:
         pred_b = box.to(device=device, dtype=dtype)
         if pred_b.dim() == 2:
             pred_b = pred_b.unsqueeze(0)
-        geom, n = geometry_smooth(pred_b, target.get("obj_box"), target.get("obj_valid"))
-        cls = zero
-        logits = getattr(pred, "obj_class", None)
-        goal_cls = _long(target.get("obj_class"), device)
         valid = _target(target.get("obj_valid"), device, dtype)
-        if logits is not None and goal_cls is not None and valid is not None:
-            logit_b = logits.to(device=device)
-            if logit_b.dim() == 2:
-                logit_b = logit_b.unsqueeze(0)
-            slot = (valid.reshape(pred_b.shape[0], pred_b.shape[1], -1) > 0.5).any(dim=-1)
-            if bool(slot.any()):
-                cls = functional.cross_entropy(
-                    logit_b.reshape(-1, logit_b.shape[-1])[slot.reshape(-1)],
-                    goal_cls.reshape(-1)[slot.reshape(-1)],
-                )
-        conf = zero
-        conf_logit = getattr(pred, "obj_conf", None)
-        if conf_logit is not None and valid is not None:
-            present = (valid.reshape(pred_b.shape[0], pred_b.shape[1], -1) > 0.5).any(dim=-1).to(dtype)
-            conf = _conf_bce(conf_logit.reshape_as(present).to(dtype), present)
-        out["obj_geom"] = geom + cls
-        out["obj_n"] = n
-        out["obj"] = out["obj_geom"] + CONF_WEIGHT * conf
+        if valid is None:
+            out["obj"] = dead
+            out["obj_geom"] = dead
+            out["obj_n"] = dead
+        else:
+            valid_b = valid.reshape(pred_b.shape[0], pred_b.shape[1], -1)
+            slot = (valid_b > 0.5).any(dim=-1)
+            listed = _row_flag(target.get("obj_listed"), int(pred_b.shape[0]), device)
+            if not bool(slot.any()) and not bool(listed.any()):
+                out["obj"] = dead
+                out["obj_geom"] = dead
+                out["obj_n"] = dead
+            else:
+                geom, n = geometry_smooth(pred_b, target.get("obj_box"), valid)
+                if not bool(slot.any()):
+                    geom = dead
+                cls = dead
+                logits = getattr(pred, "obj_class", None)
+                goal_cls = _long(target.get("obj_class"), device)
+                if logits is not None and goal_cls is not None and bool(slot.any()):
+                    logit_b = logits.to(device=device)
+                    if logit_b.dim() == 2:
+                        logit_b = logit_b.unsqueeze(0)
+                    cls = functional.cross_entropy(
+                        logit_b.reshape(-1, logit_b.shape[-1])[slot.reshape(-1)],
+                        goal_cls.reshape(-1)[slot.reshape(-1)],
+                    )
+                conf = dead
+                conf_logit = getattr(pred, "obj_conf", None)
+                if conf_logit is not None:
+                    supervise = listed.unsqueeze(1).expand_as(slot) | slot
+                    if bool(supervise.any()):
+                        conf = _conf_bce(
+                            conf_logit.to(device=device, dtype=dtype).reshape_as(slot)[supervise],
+                            slot.to(dtype)[supervise],
+                        )
+                out["obj_geom"] = geom
+                out["obj_n"] = n
+                out["obj"] = geom + cls + float(CONF_WEIGHT) * conf
     brake = getattr(pred, "brake", None)
     if brake is None:
-        out["brakelight"] = zero
-        out["brakelight_geom"] = zero
-        out["brakelight_n"] = zero
+        out["brakelight"] = dead
+        out["brakelight_geom"] = dead
+        out["brakelight_n"] = dead
     else:
         logit = brake.to(device=device, dtype=dtype).reshape(-1)
         goal = _target(target.get("brake"), device, dtype)
         valid = _target(target.get("brake_valid"), device, dtype)
-        if goal is None or valid is None:
-            geom = zero
-            n = zero
-            conf = zero
+        if goal is None or valid is None or not bool((valid.reshape(-1) > 0.5).any()):
+            out["brakelight"] = dead
+            out["brakelight_geom"] = dead
+            out["brakelight_n"] = dead
         else:
             goal_b = goal.reshape(-1)
             valid_b = valid.reshape(-1)
@@ -181,14 +222,15 @@ def detect_terms(pred: Any, target: Mapping[str, Any], device: Any, dtype: Any) 
                 goal_b = goal_b[:1]
                 valid_b = valid_b[:1]
             on = valid_b > 0.5
-            n = on.to(dtype).sum()
-            if bool(on.any()):
-                geom = functional.binary_cross_entropy_with_logits(logit[on], goal_b[on])
-            else:
-                geom = zero
+            geom = functional.binary_cross_entropy_with_logits(logit[on], goal_b[on])
             conf_logit = getattr(pred, "brake_conf", None)
-            conf = zero if conf_logit is None else _conf_bce(conf_logit.reshape(-1).to(dtype), on.to(dtype))
-        out["brakelight_geom"] = geom
-        out["brakelight_n"] = n
-        out["brakelight"] = geom + CONF_WEIGHT * conf
+            conf = dead
+            if conf_logit is not None:
+                conf = _conf_bce(
+                    conf_logit.reshape(-1).to(device=device, dtype=dtype)[on],
+                    torch.ones(int(on.sum()), device=device, dtype=dtype),
+                )
+            out["brakelight_geom"] = geom
+            out["brakelight_n"] = on.to(dtype).sum()
+            out["brakelight"] = geom + float(CONF_WEIGHT) * conf
     return out

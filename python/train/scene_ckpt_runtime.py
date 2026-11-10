@@ -70,23 +70,82 @@ class SceneCkptPred:
         return cls()
 
     def as_state(self) -> dict[str, Any]:
+        from python.train.viz_contract import (
+            MODEL_SRC,
+            _clean_drawable,
+            package_lane,
+            renderable_state,
+        )
+
         centers = scene_ckpt_centers(self.lane_gt)
+        conf = float(self.confidence)
+        ckpt = str(self.ckpt or "")
+        tagged_centers: list[dict[str, Any]] = []
+        for center in centers:
+            item = {"x": float(center["x"]), "y": float(center["y"])}
+            if ckpt:
+                item.update(
+                    {
+                        "src": MODEL_SRC,
+                        "head": "lane_gt",
+                        "ckpt": ckpt,
+                        "confidence": conf,
+                    }
+                )
+            tagged_centers.append(item)
+        lane_x_num = None if self.lane_x is None else float(self.lane_x)
         body: dict[str, Any] = {
             "shadow": True,
             "source": "scene_ckpt",
-            "lane_x": None if self.lane_x is None else float(self.lane_x),
-            "confidence": float(self.confidence),
-            "centers": centers,
-            "caption": scene_ckpt_caption(self.confidence),
+            "confidence": conf,
+            "centers": tagged_centers,
+            "caption": scene_ckpt_caption(conf),
             "canvas": list(self.canvas_shape) if self.canvas_shape else None,
         }
-        if self.ckpt:
-            from python.train.viz_contract import package_lane
-
-            body["lane"] = package_lane(ckpt=self.ckpt, lane_x=self.lane_x, confidence=self.confidence)
+        if ckpt:
+            body["lane_x"] = {
+                "src": MODEL_SRC,
+                "head": "lane_gt",
+                "ckpt": ckpt,
+                "confidence": conf,
+                "lane_x": lane_x_num,
+            }
+            body["lane"] = package_lane(ckpt=ckpt, lane_x=self.lane_x, confidence=self.confidence)
             if self.detect:
                 body["detect"] = self.detect
-        return body
+        else:
+            body["lane_x"] = lane_x_num
+        # Drop ground truth, map, and path_world nests. Then put the model's
+        # own lane samples back so the ribbon still has centers and confidence.
+        filtered = renderable_state(body)
+        filtered["shadow"] = True
+        filtered["source"] = "scene_ckpt"
+        filtered["confidence"] = conf
+        filtered["caption"] = scene_ckpt_caption(conf)
+        filtered["canvas"] = body["canvas"]
+        filtered["centers"] = tagged_centers
+        if ckpt:
+            filtered["lane_x"] = _clean_drawable(body["lane_x"])
+            filtered["lane"] = _clean_drawable(body["lane"])
+            detect = body.get("detect")
+            if isinstance(detect, dict):
+                kept: dict[str, Any] = {}
+                for key, value in detect.items():
+                    if isinstance(value, list):
+                        items = [
+                            _clean_drawable(item)
+                            for item in value
+                            if isinstance(item, dict) and item.get("src") == MODEL_SRC and item.get("head") and item.get("ckpt")
+                        ]
+                        if items:
+                            kept[str(key)] = items
+                    elif isinstance(value, dict) and value.get("src") == MODEL_SRC and value.get("head") and value.get("ckpt"):
+                        kept[str(key)] = _clean_drawable(value)
+                if kept:
+                    filtered["detect"] = kept
+        else:
+            filtered["lane_x"] = lane_x_num
+        return filtered
 
 
 def draw_scene_ckpt_overlay(frame: np.ndarray | None, pred: SceneCkptPred | None) -> np.ndarray | None:

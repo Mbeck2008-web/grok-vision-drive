@@ -84,11 +84,77 @@ def check_rejects_foreign_and_low_conf() -> None:
     lane = package_lane(ckpt="run.npz", lane_x=0.3, confidence=0.1)
     assert lane["lane_x"] is None
     assert renderable_state({"lane": lane}) == {}
+    nested = _model(
+        "edge",
+        0.91,
+        points=[{"side": "left", "x": -1.5, "y": 5.0}],
+        gt_poly={"src": "gt", "points": [{"x": 0.0, "y": 5.0}]},
+        path_world=[{"x": 1.0, "y": 10.0}],
+    )
+    cleaned = renderable_state({"edge": nested})["edge"]
+    assert cleaned["points"][0]["x"] == -1.5
+    assert "gt_poly" not in cleaned
+    assert "path_world" not in cleaned
     print("viz contract: foreign, untagged, and low-confidence fields draw nothing OK")
+
+
+def check_as_state_strips_and_tags() -> None:
+    import numpy as np
+
+    from python.debug.lane_targets import LANE_GT_DIM, LOOKAHEADS_M
+    from python.train.scene_ckpt_runtime import SceneCkptPred
+    from python.train.viz_contract import renderable_state
+    from python.viz.scene_ribbon import scene_ckpt_ribbon_polyline
+
+    values = np.full((LANE_GT_DIM,), np.nan, dtype=np.float32)
+    for i, x in enumerate((0.0, 0.4, 1.2, 2.0)):
+        if i >= len(LOOKAHEADS_M):
+            break
+        values[i * 3] = np.float32(x)
+    ckpt = "m.ckpt_ep1.npz"
+    pred = SceneCkptPred(lane_gt=values, lane_x=0.4, confidence=0.9, ckpt=ckpt)
+    pred.detect = {
+        "edge": {
+            "src": "model",
+            "head": "edge",
+            "ckpt": ckpt,
+            "confidence": 0.91,
+            "points": [{"side": "left", "x": -1.5, "y": 5.0}],
+            "gt_poly": {"src": "gt", "points": [{"x": 9.0, "y": 5.0}]},
+            "path_world": [{"x": 1.0, "y": 10.0}],
+        },
+        "map_road": {
+            "src": "map",
+            "head": "edge",
+            "ckpt": ckpt,
+            "confidence": 0.99,
+            "points": [{"x": 0.0, "y": 5.0}],
+        },
+    }
+    state = pred.as_state()
+    assert state["confidence"] == 0.9
+    assert state["centers"][0]["y"] == 5.0
+    assert state["centers"][0]["src"] == "model"
+    assert state["centers"][0]["head"] == "lane_gt"
+    assert state["centers"][0]["ckpt"] == ckpt
+    assert state["lane_x"]["src"] == "model"
+    assert state["lane_x"]["head"] == "lane_gt"
+    assert state["lane_x"]["ckpt"] == ckpt
+    assert state["lane_x"]["lane_x"] == 0.4
+    assert "gt_poly" not in state["detect"]["edge"]
+    assert "path_world" not in state["detect"]["edge"]
+    assert "map_road" not in state["detect"]
+    again = renderable_state(state)
+    blob = repr(again)
+    assert "gt_poly" not in blob and "path_world" not in blob and "src': 'map'" not in blob and 'src": "map"' not in blob
+    poly = scene_ckpt_ribbon_polyline(state["centers"], state["confidence"])
+    assert len(poly) >= 2, "tagged centers must still feed the ribbon"
+    print("as_state: lane_x and centers tagged, gt/map/path_world stripped, ribbon still fed OK")
 
 
 def main() -> None:
     check_rejects_foreign_and_low_conf()
+    check_as_state_strips_and_tags()
     print("test_viz_contract: all OK")
 
 

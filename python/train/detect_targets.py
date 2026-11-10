@@ -367,8 +367,14 @@ def object_label(row: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "label_src": LABEL_SRC,
         "train_only": True,
+        "listed": _object_lists_present(row),
         "slots": slots[:OBJ_SLOTS],
     }
+
+
+def _object_lists_present(row: Mapping[str, Any]) -> bool:
+    """True when this frame recorded traffic or static objects, even if empty."""
+    return any(isinstance(row.get(key), list) for key in ("traffic", "static_objects", "cones"))
 
 
 def _brake_value(obj: Mapping[str, Any]) -> float | None:
@@ -500,6 +506,7 @@ def arrays_from_record(rec: Mapping[str, Any]) -> dict[str, np.ndarray]:
     brake = rec.get("brake") if isinstance(rec.get("brake"), Mapping) else {}
     on = _finite(brake.get("on"))
     brake_valid = 1.0 if (_finite(brake.get("valid")) or 0.0) > 0.5 and on is not None else 0.0
+    listed = 1.0 if objects.get("listed") is True or objects.get("listed") == 1 or objects.get("listed") == 1.0 else 0.0
     return {
         "edge": np.asarray(values, dtype=np.float32),
         "edge_valid": np.asarray(valid, dtype=np.float32),
@@ -508,6 +515,7 @@ def arrays_from_record(rec: Mapping[str, Any]) -> dict[str, np.ndarray]:
         "obj_class": cls,
         "brake": np.asarray(0.0 if on is None else on, dtype=np.float32),
         "brake_valid": np.asarray(brake_valid, dtype=np.float32),
+        "obj_listed": np.asarray(listed, dtype=np.float32),
     }
 
 

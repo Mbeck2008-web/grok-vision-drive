@@ -101,27 +101,114 @@ def require_model_drawable(field: Any) -> dict[str, Any]:
     return dict(field)
 
 
+# Nested keys that are never model geometry, even inside a valid head record.
+_NEST_DROP = frozenset(
+    {
+        "gt_poly",
+        "path_ego",
+        "path_world",
+        "road_edges",
+        "road_network",
+    }
+)
+_GEOM_KEYS = frozenset({"x", "y", "z", "side", "yaw", "length", "width", "height", "cls"})
+
+
+def _drop_key(key: str) -> bool:
+    return key in _NEST_DROP or key in FORBIDDEN_SRC
+
+
+def _is_geometry_point(field: Mapping[str, Any]) -> bool:
+    """An x/y sample with no source tag. Not a path or a ground-truth record."""
+    if _source_names(field):
+        return False
+    return bool(set(field) & {"x", "y", "side"}) and set(field) <= _GEOM_KEYS | {"side"}
+
+
+def _clean_drawable(field: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep a model record and drop foreign children, recursively."""
+    out: dict[str, Any] = {}
+    for key, value in field.items():
+        name = str(key)
+        if _drop_key(name):
+            continue
+        cleaned = _clean_child(value)
+        if cleaned is None:
+            continue
+        out[name] = cleaned
+    return out
+
+
+def _clean_child(value: Any) -> Any | None:
+    if isinstance(value, Mapping):
+        if _source_names(value) & FORBIDDEN_SRC:
+            return None
+        if is_model_drawable(value):
+            return _clean_drawable(value)
+        if _is_geometry_point(value):
+            return {str(k): v for k, v in value.items()}
+        nested: dict[str, Any] = {}
+        for key, item in value.items():
+            name = str(key)
+            if _drop_key(name):
+                continue
+            cleaned = _clean_child(item)
+            if cleaned is None:
+                continue
+            if isinstance(item, Mapping) and not is_model_drawable(item) and not _is_geometry_point(item):
+                if not isinstance(cleaned, dict) or not cleaned:
+                    continue
+            nested[name] = cleaned
+        return nested or None
+    if isinstance(value, list):
+        items: list[Any] = []
+        for item in value:
+            if isinstance(item, Mapping):
+                if _source_names(item) & FORBIDDEN_SRC:
+                    continue
+                if is_model_drawable(item):
+                    items.append(_clean_drawable(item))
+                    continue
+                if _is_geometry_point(item):
+                    items.append({str(k): v for k, v in item.items()})
+                    continue
+                continue
+            cleaned = _clean_child(item)
+            if cleaned is not None:
+                items.append(cleaned)
+        return items
+    return value
+
+
 def renderable_state(payload: Any) -> dict[str, Any]:
     """The only dict the visualizer may draw from.
 
     Untagged numbers, ground truth, map roads, AI paths, and low-confidence
-    model records are omitted. An empty result means draw nothing.
+    model records are omitted. A valid parent does not keep a nested
+    ground-truth polyline or ``path_world``. An empty result means draw nothing.
     """
     if not isinstance(payload, Mapping):
         return {}
     kept: dict[str, Any] = {}
     for key, value in payload.items():
+        name = str(key)
+        if _drop_key(name):
+            continue
         if isinstance(value, Mapping):
             if is_model_drawable(value):
-                kept[str(key)] = dict(value)
+                kept[name] = _clean_drawable(value)
                 continue
             nested = renderable_state(value)
             if nested:
-                kept[str(key)] = nested
+                kept[name] = nested
         elif isinstance(value, list):
-            items = [dict(item) for item in value if is_model_drawable(item)]
+            items = [
+                _clean_drawable(item) if isinstance(item, Mapping) else item
+                for item in value
+                if is_model_drawable(item)
+            ]
             if items:
-                kept[str(key)] = items
+                kept[name] = items
     return kept
 
 

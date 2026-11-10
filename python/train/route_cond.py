@@ -21,13 +21,18 @@ def encode_route(cmd: str, next_jct_m: float | None) -> np.ndarray:
     """``(5,)`` float32: one-hot command plus clipped ``next_jct_m / 150``.
 
     Unknown or masked commands become ``follow``. A missing distance is ``1.0``
-    (treated as ``DIST_SCALE`` metres away).
+    (treated as ``DIST_SCALE`` metres away). Masked frames keep the follow
+    one-hot but zero the distance so a U-turn is not trained as a near-junction
+    follow.
     """
-    label = str(cmd or "").strip().lower()
-    if label not in ROUTE_CMDS:
-        label = "follow"
+    raw_cmd = str(cmd or "").strip().lower()
+    masked = raw_cmd == "mask"
+    label = raw_cmd if raw_cmd in ROUTE_CMDS else "follow"
     vec = np.zeros(ROUTE_COND_DIM, dtype=np.float32)
     vec[ROUTE_CMDS.index(label)] = 1.0
+    if masked:
+        vec[4] = 0.0
+        return vec
     if next_jct_m is None:
         dist = 1.0
     else:
@@ -41,7 +46,13 @@ def encode_route(cmd: str, next_jct_m: float | None) -> np.ndarray:
 
 
 def cmd_from_nav(nav: Mapping[str, Any] | None) -> tuple[str, float | None]:
-    """Map a ``route_intent`` / ``nav`` dict onto a training command."""
+    """Map a ``route_intent`` / ``nav`` dict onto a training command.
+
+    Matches ``route_hindsight``: no turn command beyond ``APPROACH_M`` (60 m),
+    and no junction at all beyond ``LOOKAHEAD_M`` (80 m).
+    """
+    from python.sensors.route_intent import APPROACH_M, LOOKAHEAD_M, SNAP_M
+
     if not isinstance(nav, Mapping):
         return "follow", None
     turn = str(nav.get("turn") or "").strip().lower()
@@ -54,6 +65,12 @@ def cmd_from_nav(nav: Mapping[str, Any] | None) -> tuple[str, float | None]:
             metres = None
     except (TypeError, ValueError):
         metres = None
+    # Labeler only "sees" a junction if a future sample within LOOKAHEAD_M
+    # falls inside SNAP_M of the node, so next_jct_m can be up to ~96 m.
+    if metres is None or metres > LOOKAHEAD_M + SNAP_M:
+        return "follow", None
+    if metres > APPROACH_M:
+        return "follow", metres
     return turn, metres
 
 

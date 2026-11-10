@@ -48,9 +48,26 @@ def main(argv: list[str] | None = None) -> int:
                 rows.append(json.loads(line))
     labels = label_sequence(graph, rows)
     out.parent.mkdir(parents=True, exist_ok=True)
+    counts = {name: 0 for name in ("follow", "left", "right", "straight", "mask")}
+    reasons: dict[str, int] = {}
+    junction_frames = 0
     with out.open("w", encoding="utf-8") as dest:
         for row in labels:
+            cmd = str(row.get("cmd") or "follow")
+            if cmd not in counts:
+                cmd = "mask"
+            counts[cmd] += 1
+            if cmd in ("left", "right", "straight"):
+                junction_frames += 1
+            if cmd == "mask":
+                why = str(row.get("reason") or "unknown")
+                reasons[why] = reasons.get(why, 0) + 1
             dest.write(json.dumps(row, sort_keys=True) + "\n")
+    parts = " ".join(f"{name}={counts[name]}" for name in ("follow", "left", "right", "straight", "mask"))
+    line = f"[GVD] route-intent: {parts} junction_frames={junction_frames}"
+    if reasons:
+        line += " mask_reasons: " + " ".join(f"{name}={reasons[name]}" for name in sorted(reasons))
+    print(line)
     return 0
 
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import functools
+import json
+import math
 import os
 import sys
 import time
@@ -46,7 +48,7 @@ from python.sensors.tech import (
     run_probe,
 )
 from python.sensors.extras import ExtraSensors, load_sensors_config, nav_hint_from_bundle, write_sensors_snapshot
-from python.sensors.route_intent import merge_nav_intent
+from python.sensors.route_intent import Graph, intent_from_pose, merge_nav_intent
 from python.viz.foxglove_bridge import FoxgloveBridge
 from python.control.e2e import make_e2e
 from python.control.override import (
@@ -237,6 +239,107 @@ def _ui_request_is_live(prefs: dict, start_unix: float) -> bool:
         return False
 
 
+def _finite_xy(x: Any, y: Any) -> tuple[float, float] | None:
+    try:
+        fx, fy = float(x), float(y)
+    except (TypeError, ValueError):
+        return None
+    if math.isfinite(fx) and math.isfinite(fy):
+        return fx, fy
+    return None
+
+
+def load_route_graph(path: str | None, level: str | None = None) -> Graph | None:
+    """Optional offline graph for #203 ``intent_from_pose``. None if unset or unreadable."""
+    raw = str(path or "").strip()
+    if not raw:
+        return None
+    data = json.loads(Path(raw).read_text(encoding="utf-8"))
+    if isinstance(data, dict) and "levels" in data:
+        name = (level or "").strip() or next(iter(data["levels"]))
+        return Graph.from_fixture(data, name)
+    nodes = {str(k): (float(v[0]), float(v[1])) for k, v in data["nodes"].items()}
+    edges = tuple((str(e["a"]), str(e["b"]), bool(e.get("oneway", False))) for e in data["edges"])
+    return Graph(nodes=nodes, edges=edges)
+
+
+def ego_xy_for_intent(vdata: Any, extras_bundle: Any, nav: dict[str, Any] | None) -> tuple[float, float] | None:
+    """Pose for ``intent_from_pose``: vehicle pose, then GPS metres, then nav hint."""
+    if vdata is not None:
+        pos = getattr(vdata, "pos", None)
+        if isinstance(pos, (list, tuple)) and len(pos) >= 2:
+            xy = _finite_xy(pos[0], pos[1])
+            if xy is not None:
+                return xy
+        xy = _finite_xy(getattr(vdata, "gps_x", None), getattr(vdata, "gps_y", None))
+        if xy is not None:
+            return xy
+    if extras_bundle is not None:
+        gps = getattr(extras_bundle, "gps", None)
+        if gps is not None:
+            xy = _finite_xy(getattr(gps, "x", None), getattr(gps, "y", None))
+            if xy is not None:
+                return xy
+    if isinstance(nav, dict):
+        gps = nav.get("gps") if isinstance(nav.get("gps"), dict) else None
+        if isinstance(gps, dict):
+            xy = _finite_xy(gps.get("x"), gps.get("y"))
+            if xy is not None:
+                return xy
+    return None
+
+
+def goal_from_pin(graph: Graph, nav: dict[str, Any] | None, vdata: Any = None) -> str | None:
+    """Route pin / named goal if it is a graph node. Not a planner target."""
+    candidates: list[Any] = []
+    if isinstance(nav, dict):
+        pin = nav.get("pin") if isinstance(nav.get("pin"), dict) else {}
+        candidates.extend([nav.get("goal"), pin.get("name") if isinstance(pin, dict) else None, nav.get("pin_name")])
+    if vdata is not None:
+        candidates.append(getattr(vdata, "pin_name", None))
+    for raw in candidates:
+        name = str(raw or "").strip()
+        if name and name in graph.nodes:
+            return name
+    return None
+
+
+def heading_rad_for_intent(vdata: Any, ego_fb: Any = None) -> float | None:
+    direc = getattr(vdata, "dir", None) if vdata is not None else None
+    if isinstance(direc, (list, tuple)) and len(direc) >= 2:
+        try:
+            dx, dy = float(direc[0]), float(direc[1])
+        except (TypeError, ValueError):
+            dx, dy = 0.0, 0.0
+        if math.hypot(dx, dy) > 1e-6:
+            return math.atan2(dy, dx)
+    deg = nav_heading_from_sources(vdata, ego_fb)
+    if deg is None:
+        return None
+    try:
+        value = float(deg)
+    except (TypeError, ValueError):
+        return None
+    return math.radians(value) if math.isfinite(value) else None
+
+
+def live_route_intent(
+    graph: Graph | None,
+    vdata: Any,
+    extras_bundle: Any,
+    nav: dict[str, Any] | None,
+    ego_fb: Any = None,
+) -> dict[str, Any] | None:
+    """#203 intent from pose + pin. None when the graph, pose, or pin is missing."""
+    if graph is None:
+        return None
+    xy = ego_xy_for_intent(vdata, extras_bundle, nav)
+    goal = goal_from_pin(graph, nav, vdata)
+    if xy is None or goal is None:
+        return None
+    return intent_from_pose(graph, xy, goal=goal, heading=heading_rad_for_intent(vdata, ego_fb))
+
+
 def _ms_text(value: Any) -> str:
     return "na" if value is None else f"{float(value):.3f}"
 
@@ -420,7 +523,19 @@ def main(clock=None) -> None:
         default=0.0,
         help="Stop the supervisor loop after this many seconds (0 = run until stopped). For captures.",
     )
+    ap.add_argument(
+        "--route-graph",
+        default=os.environ.get("GVD_ROUTE_GRAPH", ""),
+        help="Optional road-graph JSON for GPS route intent (intent_from_pose). "
+        "Empty keeps follow. Also GVD_ROUTE_GRAPH.",
+    )
+    ap.add_argument(
+        "--route-level",
+        default=os.environ.get("GVD_ROUTE_LEVEL", ""),
+        help="Level key when --route-graph has multiple levels (or GVD_ROUTE_LEVEL).",
+    )
     args = ap.parse_args()
+    route_graph = load_route_graph(getattr(args, "route_graph", None), getattr(args, "route_level", None))
     scene_ckpt_path = str(getattr(args, "scene_ckpt", "") or "").strip()
     if bool(getattr(args, "scene_ckpt_drive", False)) and not scene_ckpt_path:
         print("[GVD] --scene-ckpt-drive requires --scene-ckpt <epoch.npz>", flush=True)
@@ -802,6 +917,7 @@ def main(clock=None) -> None:
                 )
         elif args.lane_source == "gt":
             print("[GVD] lane source=gt road-network center at 8 m", flush=True)
+        prev_nav: dict[str, Any] = {}
         while True:
             if run_deadline is not None and time.monotonic() >= run_deadline:
                 print(f"[GVD] --run-seconds {float(args.run_seconds):g} reached; stopping", flush=True)
@@ -906,6 +1022,8 @@ def main(clock=None) -> None:
             extras_bundle.foxglove = fox.note if fox.enabled else "off"
             fox.publish(extras_bundle, frames=getattr(bundle, "frames", None))
             write_sensors_snapshot(extras_bundle)
+            nav_now = prev_nav if isinstance(prev_nav, dict) else {}
+            route_intent_result = live_route_intent(route_graph, vdata, extras_bundle, nav_now, ego_fb)
 
             # The one rule: ego speed is this session's fresh measurement, or None.
             if vehicle is None:
@@ -1108,10 +1226,10 @@ def main(clock=None) -> None:
                 if getattr(scene_lane, "wants_route", False):
                     from python.train.route_cond import runtime_route_vec
 
-                    route_vec = runtime_route_vec(st.get("nav") if isinstance(st.get("nav"), dict) else {}, None)
-                lane_hat, conf = scene_guard.observe(
-                    scene_lane, strip, tick_dt, engaged=engaged, ages=tick_ages, route=route_vec
-                )
+                    route_vec = runtime_route_vec(
+                        st.get("nav") if isinstance(st.get("nav"), dict) else {}, route_intent_result
+                    )
+                lane_hat, conf = scene_guard.observe(scene_lane, strip, tick_dt, engaged=engaged, ages=tick_ages, route=route_vec)
                 scene_hold = scene_guard.hold is not None
                 if scene_hold and not was_hold and engaged:
                     print(f"[GVD] HOLD: scene_input_shape {scene_guard.hold}", flush=True)
@@ -1144,7 +1262,9 @@ def main(clock=None) -> None:
                     if getattr(scene_ckpt, "wants_route", False):
                         from python.train.route_cond import runtime_route_vec
 
-                        route_vec = runtime_route_vec(st.get("nav") if isinstance(st.get("nav"), dict) else {}, None)
+                        route_vec = runtime_route_vec(
+                            st.get("nav") if isinstance(st.get("nav"), dict) else {}, route_intent_result
+                        )
                     ckpt_pred = scene_ckpt.observe(main, tick_dt, route=route_vec)
                 except SceneCkptInputError as exc:
                     print(f"[GVD] scene-ckpt input: {exc}", flush=True)
@@ -1493,7 +1613,10 @@ def main(clock=None) -> None:
                 # Tech attach has no gvd_ego.json; ego_fb stays None until Lua retail echo.
                 heading = nav_heading_from_sources(vdata, ego_fb)
                 st["nav"] = nav_hint_from_bundle(extras_bundle, heading_deg=heading)
-            st["nav"] = merge_nav_intent(st.get("nav") if isinstance(st.get("nav"), dict) else {}, None)
+            st["nav"] = merge_nav_intent(
+                st.get("nav") if isinstance(st.get("nav"), dict) else {}, route_intent_result
+            )
+            prev_nav = st["nav"] if isinstance(st.get("nav"), dict) else {}
             st["sensors"] = extras_bundle.health()
             # Real planner path wins. The 36 m steer preview is only the empty-path stand-in.
             st["path_ego"] = list(pout.path_ego) if pout.path_ego else steer_preview_path_ego(steer, length_m=36.0)

@@ -17,6 +17,11 @@ from typing import Any
 TURNS = ("left", "right", "straight", "none")
 RESULT_KEYS = frozenset({"turn", "next_jct_m"})
 THROUGH_DEG = 20.0
+LOOKAHEAD_M = 80.0
+APPROACH_M = 60.0
+SNAP_M = 16.0
+AMBIGUOUS_LO = 16.0
+AMBIGUOUS_HI = 24.0
 
 
 def result_message(turn: str, next_jct_m: float | None) -> dict[str, Any]:
@@ -42,10 +47,17 @@ def _wrap(rad: float) -> float:
 
 
 def classify_turn(delta_rad: float) -> str:
-    """left / straight / right from a heading change (CCW positive)."""
+    """left / straight / right from a heading change (CCW positive).
+
+    The 16–24° band is ambiguous: training masks it and the model encodes
+    ``none`` as follow. Shared with ``route_hindsight.AMBIGUOUS_LO/HI``.
+    """
     deg = math.degrees(_wrap(delta_rad))
-    if abs(deg) < THROUGH_DEG:
+    ad = abs(deg)
+    if ad < AMBIGUOUS_LO:
         return "straight"
+    if ad < AMBIGUOUS_HI:
+        return "none"
     return "left" if deg > 0.0 else "right"
 
 

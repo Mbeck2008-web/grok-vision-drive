@@ -9,16 +9,18 @@ from __future__ import annotations
 import math
 from typing import Any, Iterable, Mapping
 
-from python.sensors.route_intent import Graph, classify_turn
+from python.sensors.route_intent import (
+    AMBIGUOUS_HI,
+    AMBIGUOUS_LO,
+    APPROACH_M,
+    Graph,
+    LOOKAHEAD_M,
+    SNAP_M,
+    classify_turn,
+)
 
-LOOKAHEAD_M = 80.0
-APPROACH_M = 60.0
 EXIT_M = 15.0
-SNAP_M = 16.0
 NEAR_M = 25.0
-THROUGH_DEG = 20.0
-AMBIGUOUS_LO = 16.0
-AMBIGUOUS_HI = 24.0
 UTURN_DEG = 135.0
 ROUNDABOUT_DEG = 270.0
 CMDS = ("follow", "left", "right", "straight", "mask")

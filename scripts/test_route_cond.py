@@ -29,6 +29,7 @@ def check_encoding_is_not_ctl_cond() -> None:
     assert left.tolist()[:4] == [0.0, 1.0, 0.0, 0.0]
     assert abs(float(left[4]) - 30.0 / 150.0) < 1e-6
     assert mask.tolist()[:4] == [1.0, 0.0, 0.0, 0.0], "mask encodes as follow"
+    assert float(mask[4]) == 0.0, "masked frames must not keep a near-junction distance"
     nav_left = vec_from_nav({"turn": "left", "next_jct_m": 12.0})
     assert nav_left.tolist()[:4] == [0.0, 1.0, 0.0, 0.0]
     none = vec_from_nav({"turn": "none", "next_jct_m": None})
@@ -50,6 +51,107 @@ def check_runtime_uses_route_intent_schema() -> None:
     fallback = runtime_route_vec({}, None)
     assert fallback.tolist()[:4] == [1.0, 0.0, 0.0, 0.0]
     print("  runtime_route_vec maps #203 turn/right to the model slot; missing -> follow")
+
+
+def check_train_runtime_encoding_contract() -> None:
+    """Runtime must emit the same 5-vector the labeler trains on."""
+    from python.sensors.route_intent import AMBIGUOUS_HI, AMBIGUOUS_LO, APPROACH_M, LOOKAHEAD_M
+    from python.collect import route_hindsight as rh
+    from python.train.route_cond import cmd_from_nav, encode_route, runtime_route_vec, vec_from_nav
+
+    assert rh.APPROACH_M == APPROACH_M == 60.0
+    assert rh.LOOKAHEAD_M == LOOKAHEAD_M == 80.0
+    assert rh.AMBIGUOUS_LO == AMBIGUOUS_LO == 16.0
+    assert rh.AMBIGUOUS_HI == AMBIGUOUS_HI == 24.0
+
+    left_near = vec_from_nav({"turn": "left", "next_jct_m": 25.0})
+    assert left_near.tolist()[:4] == [0.0, 1.0, 0.0, 0.0]
+    assert abs(float(left_near[4]) - 25.0 / 150.0) < 1e-6
+
+    # Training never emits a turn one-hot past APPROACH_M (60 m). A 190 m left
+    # would encode as dist 1.267 today; it must become follow like the labeler.
+    cmd, dist = cmd_from_nav({"turn": "left", "next_jct_m": 190.0})
+    assert cmd == "follow", (cmd, dist)
+    far = encode_route(cmd, dist)
+    assert far.tolist()[:4] == [1.0, 0.0, 0.0, 0.0]
+    # Past LOOKAHEAD_M the labeler never saw a junction, so dist is missing (1.0).
+    assert abs(float(far[4]) - 1.0) < 1e-6
+
+    mid = vec_from_nav({"turn": "left", "next_jct_m": 70.0})
+    assert mid.tolist()[:4] == [1.0, 0.0, 0.0, 0.0]
+    assert abs(float(mid[4]) - 70.0 / 150.0) < 1e-6
+
+    assert runtime_route_vec({}, {"turn": "left", "next_jct_m": 190.0}).tolist()[:4] == [
+        1.0, 0.0, 0.0, 0.0
+    ]
+    print("  encoding: turn cmds only <=60 m; >80 m follow+missing; shared thresholds")
+
+
+def check_left_25m_reaches_model_tensor() -> None:
+    """A live #203 left at 25 m must reach the model as left with dist 25/150."""
+    sys.path.insert(0, str(ROOT / "tests"))
+    from synthetic_roads import load_graph
+    from python.sensors.route_intent import Graph, intent_from_pose
+    from python.train.route_cond import runtime_route_vec
+
+    graph = Graph.from_fixture(load_graph(), "synth_a")
+    result = intent_from_pose(graph, (0.0, -25.0), goal="W")
+    assert result["turn"] == "left", result
+    assert result["next_jct_m"] is not None and abs(float(result["next_jct_m"]) - 25.0) < 0.51, result
+    vec = runtime_route_vec({}, result)
+    assert vec.tolist()[:4] == [0.0, 1.0, 0.0, 0.0], vec
+    assert abs(float(vec[4]) - 25.0 / 150.0) < 1e-5, vec
+    wiped = runtime_route_vec({"turn": "left", "next_jct_m": 25.0}, None)
+    assert wiped.tolist()[:4] == [1.0, 0.0, 0.0, 0.0], "None intent still falls back to follow"
+    print("  live left at 25 m encodes as left with dist 25/150")
+
+
+def check_labeler_runtime_vectors_match() -> None:
+    """Same pose sequence: hindsight encode_route == runtime_route_vec(intent_from_pose)."""
+    import math
+
+    sys.path.insert(0, str(ROOT / "tests"))
+    from synthetic_roads import load_graph
+    from python.collect.route_hindsight import label_sequence
+    from python.sensors.route_intent import Graph, intent_from_pose
+    from python.train.route_cond import encode_route, runtime_route_vec
+
+    data = load_graph()
+    graph = Graph.from_fixture(data, "synth_a")
+    # Centerline (not the 1.75 m lane offset track()) so graph remaining
+    # distance matches along-track metres.
+    poses = []
+    for y in range(-200, 1, 1):
+        poses.append((0.0, float(y), math.pi / 2.0))
+    for x in range(-1, -201, -1):
+        poses.append((float(x), 0.0, math.pi))
+    rows = []
+    for i, (x, y, heading) in enumerate(poses):
+        rows.append(
+            {
+                "t": round(i * 0.1, 4),
+                "pos": [float(x), float(y), 0.0],
+                "dir": [math.cos(heading), math.sin(heading), 0.0],
+            }
+        )
+    labels = label_sequence(graph, rows)
+    assert len(labels) == len(poses)
+    mismatches = []
+    compared = 0
+    for row, lab, pose in zip(rows, labels, poses):
+        # Masked hindsight rows are follow+0; runtime missing/none is follow+1.0.
+        if lab["cmd"] == "mask":
+            continue
+        train_vec = encode_route(lab["cmd"], lab["next_jct_m"])
+        result = intent_from_pose(graph, (pose[0], pose[1]), goal="W", heading=pose[2])
+        live_vec = runtime_route_vec({}, result)
+        compared += 1
+        if not np.allclose(train_vec, live_vec, atol=5e-3):
+            mismatches.append((row["t"], lab, result, train_vec.tolist(), live_vec.tolist()))
+    assert compared >= 200, compared
+    assert any(lab["cmd"] == "left" for lab in labels)
+    assert not mismatches, mismatches[:5]
+    print(f"  labeler vs runtime: {compared} identical non-mask vectors on S->T->W")
 
 
 def check_balance_and_sidecar() -> None:
@@ -98,15 +200,43 @@ def check_trainer_flag() -> None:
     print("  trainer: --route-cond default off, help denies ctl-cond, flag is plumbed")
 
 
+def _call_passes_literal_none(tree: ast.AST, func_name: str, arg_index: int = 1) -> bool:
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = None
+        if isinstance(node.func, ast.Name):
+            name = node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            name = node.func.attr
+        if name != func_name:
+            continue
+        if len(node.args) > arg_index and isinstance(node.args[arg_index], ast.Constant):
+            if node.args[arg_index].value is None:
+                return True
+        for kw in node.keywords:
+            if kw.arg in {"intent_result", "result"} and isinstance(kw.value, ast.Constant):
+                if kw.value.value is None:
+                    return True
+    return False
+
+
 def check_run_vision_wires_under_flag() -> None:
     text = (ROOT / "python/run_vision.py").read_text(encoding="utf-8")
     assert "runtime_route_vec" in text or "vec_from_nav" in text
     assert "wants_route" in text
+    assert "intent_from_pose" in text, "run_vision must compute #203 intent from pose + pin"
     tree = ast.parse(text, filename="run_vision.py")
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and (node.module or "").endswith("route_hindsight"):
             raise AssertionError("run_vision must not import the hindsight labeler")
-    print("  run_vision feeds runtime_route_vec only when the model wants_route")
+    assert not _call_passes_literal_none(tree, "runtime_route_vec"), (
+        "runtime_route_vec(..., None) wipes a live turn to follow"
+    )
+    assert not _call_passes_literal_none(tree, "merge_nav_intent"), (
+        "merge_nav_intent(..., None) wipes nav turn before the next tick"
+    )
+    print("  run_vision feeds runtime_route_vec from intent_from_pose; no None wipe")
 
 
 def _torch():
@@ -162,6 +292,9 @@ def check_model_flag_shapes_ckpt_and_flip() -> None:
 def main() -> int:
     check_encoding_is_not_ctl_cond()
     check_runtime_uses_route_intent_schema()
+    check_train_runtime_encoding_contract()
+    check_left_25m_reaches_model_tensor()
+    check_labeler_runtime_vectors_match()
     check_balance_and_sidecar()
     check_trainer_flag()
     check_run_vision_wires_under_flag()

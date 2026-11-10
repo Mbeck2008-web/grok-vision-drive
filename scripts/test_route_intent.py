@@ -188,6 +188,7 @@ def check_isolation() -> None:
     allow = DISPLAY_NAV_ARG_ALLOWLIST | MODEL_ROUTE_INPUT_ALLOWLIST | HARMLESS_NAV_READS
     assert MODEL_ROUTE_INPUT_ALLOWLIST.isdisjoint(CONTROL_CALL_NAMES)
     assert MODEL_ROUTE_INPUT_ALLOWLIST.isdisjoint(DISPLAY_NAV_ARG_ALLOWLIST)
+    assert DISPLAY_NAV_ARG_ALLOWLIST.isdisjoint(CONTROL_CALL_NAMES)
     vision = ROOT / "python" / "run_vision.py"
     tree = ast.parse(vision.read_text(encoding="utf-8"), filename=str(vision))
     for node in ast.walk(tree):

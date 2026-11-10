@@ -6,6 +6,8 @@ Offline. No BeamNG, no GPU, no planner. Graph + future poses only.
 from __future__ import annotations
 
 import ast
+import contextlib
+import io
 import json
 import math
 import sys
@@ -19,17 +21,23 @@ sys.path.insert(0, str(ROOT / "tests"))
 from synthetic_roads import load_graph, track  # noqa: E402
 
 
+def _imported_module_names(tree: ast.AST) -> list[str]:
+    names: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                names.append(node.module)
+            names.extend(alias.name for alias in node.names)
+    return names
+
+
 def _iso_banned(path: Path, banned: tuple[str, ...]) -> None:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    for node in ast.walk(tree):
-        names: list[str] = []
-        if isinstance(node, ast.Import):
-            names = [alias.name for alias in node.names]
-        elif isinstance(node, ast.ImportFrom):
-            root = (node.module or "").split(".", 1)[0]
-            names = [root] + [alias.name.split(".", 1)[0] for alias in node.names]
-        for name in names:
-            assert name not in banned, f"{path.name} imports {name}"
+    for name in _imported_module_names(tree):
+        low = name.lower()
+        assert not any(b in low for b in banned), f"{path.name} imports {name}"
 
 
 def check_isolation() -> None:
@@ -39,6 +47,9 @@ def check_isolation() -> None:
         "python/actuate.py",
         "python/control/actuate.py",
         "python/run_vision.py",
+        "python/train/scene_lane_runtime.py",
+        "python/train/scene_ckpt_runtime.py",
+        "python/train/route_cond.py",
     ):
         path = ROOT / rel
         if not path.exists():
@@ -47,6 +58,26 @@ def check_isolation() -> None:
     src = (ROOT / "python/collect/route_hindsight.py").read_text(encoding="utf-8")
     assert "gt.jsonl" in src or "refuses" in src.lower() or True
     print("  isolation: planner / run_vision do not import the hindsight labeler")
+
+
+def check_iso_catches_dotted_hindsight_imports() -> None:
+    """Mutations that the old first-token matcher missed must fail."""
+    snippets = (
+        "from python.collect.route_hindsight import label_sequence\n",
+        "import python.collect.route_hindsight\n",
+        "from python.collect import route_hindsight\n",
+    )
+    for src in snippets:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "run_vision.py"
+            path.write_text(src, encoding="utf-8")
+            raised = False
+            try:
+                _iso_banned(path, ("route_hindsight", "label_route_intent"))
+            except AssertionError:
+                raised = True
+            assert raised, f"isolation missed: {src!r}"
+    print("  isolation: dotted route_hindsight / label_sequence imports are banned")
 
 
 def _rows_from_poses(poses: list[tuple[float, float, float]], *, dt: float = 0.1) -> list[dict]:
@@ -197,8 +228,13 @@ def check_cli_sidecar() -> None:
         with state.open("w", encoding="utf-8") as fh:
             for row in _rows_from_poses(poses):
                 fh.write(json.dumps(row) + "\n")
-        rc = label_main(["--state", str(state), "--graph", str(graph_path), "--level", "synth_a", "--out", str(out)])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = label_main(["--state", str(state), "--graph", str(graph_path), "--level", "synth_a", "--out", str(out)])
+        hist = buf.getvalue()
         assert rc == 0 and out.is_file()
+        for key in ("follow=", "left=", "right=", "straight=", "mask=", "junction"):
+            assert key in hist, (key, hist)
         lines = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines() if line.strip()]
         assert lines and {"t", "cmd", "next_jct_m", "src"} <= set(lines[0])
         assert any(row["cmd"] == "right" for row in lines)
@@ -211,6 +247,7 @@ def check_cli_sidecar() -> None:
 
 def main() -> int:
     check_isolation()
+    check_iso_catches_dotted_hindsight_imports()
     check_t_junction_right_and_left()
     check_four_way_and_y()
     check_uturn_masked()

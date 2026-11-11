@@ -99,8 +99,10 @@ from python.sensors.frame_slot import (
     LatestFrameSlot,
     bundle_frame_age_s,
     format_latency_line,
+    format_stage_line,
     process_rss_mb,
 )
+from python.viz.present import VizPump
 from python.runtime.frame_gate import (
     DEFAULT_MAX_FRAME_AGE_MS,
     STALE_CAPTION,
@@ -871,16 +873,13 @@ def main(clock=None) -> None:
 
     win = "GVD VISION" if args.viz else None
     viz_screen_active = str(args.viz_screen)
-    viz_note = ""
+    viz_note_box = [""]
+    viz_pump: VizPump | None = None
     if win:
         import cv2
 
-        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(win, STAGE_W + ui.nerd_width, STAGE_H)
-        viz_note = place_opencv_window(win, screen=args.viz_screen, fullscreen=bool(args.viz_fullscreen))
-
         def _on_mouse(event, x, y, flags, param):
-            if event not in (cv2.EVENT_LBUTTONDOWN, cv2.EVENT_MOUSEMOVE):
+            if viz_pump is None or event not in (cv2.EVENT_LBUTTONDOWN, cv2.EVENT_MOUSEMOVE):
                 return
             # Highgui already mapped this point through the resized client
             # into the image last shown. getWindowImageRect is that client
@@ -897,11 +896,75 @@ def main(clock=None) -> None:
                 int(x), int(y), image_wh=(img_w, img_h), window_rect=window_rect,
             )
             if event == cv2.EVENT_MOUSEMOVE:
-                ui.handle_hover(ix, iy, stage_w=STAGE_W)
+                viz_pump.push_event(("hover", ix, iy))
                 return
-            ui.handle_click(ix, iy, stage_w=STAGE_W)
+            viz_pump.push_event(("click", ix, iy))
 
-        cv2.setMouseCallback(win, _on_mouse)
+        def _viz_setup() -> None:
+            cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(win, STAGE_W + ui.nerd_width, STAGE_H)
+            viz_note_box[0] = place_opencv_window(
+                win, screen=args.viz_screen, fullscreen=bool(args.viz_fullscreen)
+            )
+            cv2.setMouseCallback(win, _on_mouse)
+
+        applied_screen = [str(args.viz_screen)]
+
+        def _viz_paint(job: dict) -> int:
+            screen = str(job.get("screen") or "")
+            if screen and screen != applied_screen[0]:
+                applied_screen[0] = screen
+                viz_note_box[0] = place_opencv_window(
+                    win, screen=screen, fullscreen=bool(job.get("fullscreen"))
+                )
+            paint_state = job["state"] if job.get("matched", True) else load_paint_state()
+            stage_frame = render_stage(
+                paint_state,
+                ui=ui,
+                main_frame=job.get("main"),
+                cam_frames=job.get("frames"),
+                dets=job.get("dets"),
+            )
+            cv2.imshow(win, stage_frame)
+            raw_key = cv2.waitKeyEx(1)
+            return -1 if raw_key is None else int(raw_key)
+
+        def _viz_teardown() -> None:
+            cv2.destroyAllWindows()
+
+        try:
+            viz_pump = VizPump(_viz_paint, setup=_viz_setup, teardown=_viz_teardown)
+            viz_pump.start()
+            print("[GVD] viz on a side thread (latest frame); the control loop does not wait for it", flush=True)
+        except Exception as exc:
+            print(f"[GVD] viz thread unavailable ({exc}); painting on the control thread", flush=True)
+            viz_pump = None
+            cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(win, STAGE_W + ui.nerd_width, STAGE_H)
+            viz_note_box[0] = place_opencv_window(
+                win, screen=args.viz_screen, fullscreen=bool(args.viz_fullscreen)
+            )
+
+            def _on_mouse_sync(event, x, y, flags, param):
+                if event not in (cv2.EVENT_LBUTTONDOWN, cv2.EVENT_MOUSEMOVE):
+                    return
+                img_w = STAGE_W + (ui.nerd_width if ui.show_nerd and 0 not in ui.layers else 0)
+                img_h = STAGE_H
+                window_rect = None
+                try:
+                    rect = cv2.getWindowImageRect(win)
+                    window_rect = (int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3]))
+                except Exception:
+                    window_rect = None
+                ix, iy = image_point_from_window_mouse(
+                    int(x), int(y), image_wh=(img_w, img_h), window_rect=window_rect,
+                )
+                if event == cv2.EVENT_MOUSEMOVE:
+                    ui.handle_hover(ix, iy, stage_w=STAGE_W)
+                    return
+                ui.handle_click(ix, iy, stage_w=STAGE_W)
+
+            cv2.setMouseCallback(win, _on_mouse_sync)
 
     session_start = time.time()
     policy_active = args.policy
@@ -1029,8 +1092,57 @@ def main(clock=None) -> None:
             # Capture stays off the control thread. The slot keeps one frame;
             # a slower infer loop drops the ones it did not take. The step
             # clock used by tests stays synchronous so a tick is one grab.
-            capture_pump = CapturePump(capture_slot, backend.grab, idle_s=0.002)
+            # One grab per control period. A 2 ms idle re-took the camera
+            # socket (and the GIL) before inference could run, so loop_hz
+            # fell to a few hertz while unique stayed 1.
+            capture_period = 1.0 / max(float(args.hz), 1.0)
+            capture_pump = CapturePump(
+                capture_slot, backend.grab, idle_s=0.0, period_s=capture_period,
+            )
             capture_pump.start()
+            print(
+                f"[GVD] capture pump period_s={capture_period:.3f} "
+                f"(target {float(args.hz):.0f} Hz; grab does not spin)",
+                flush=True,
+            )
+
+        def _handle_viz_key(key: int) -> bool:
+            if key in (ord("q"), 27):
+                return True
+            if key < 0:
+                return False
+            if ui.handle_key(key):
+                return False
+            if key == ord("v"):
+                ui.toggle_nerd()
+            elif key == ord("?"):
+                ui.toggle_help()
+            elif key == ord("t"):
+                ui.top_down = not ui.top_down
+            elif key == ord("c"):
+                recorder.request("manual", now=time.time())
+                print("[GVD] manual clip requested (key C)")
+            elif key in (ord("0"), ord("1"), ord("2"), ord("3"), ord("4"), ord("5")):
+                ui.set_layer(int(chr(key)))
+            return False
+
+        def _drain_viz_events() -> bool:
+            if viz_pump is None:
+                return False
+            quit_now = False
+            while True:
+                ev = viz_pump.poll_event()
+                if ev is None:
+                    break
+                kind = ev[0]
+                if kind == "key":
+                    quit_now = _handle_viz_key(int(ev[1])) or quit_now
+                elif kind == "hover":
+                    ui.handle_hover(int(ev[1]), int(ev[2]), stage_w=STAGE_W)
+                elif kind == "click":
+                    ui.handle_click(int(ev[1]), int(ev[2]), stage_w=STAGE_W)
+            return quit_now
+
         while True:
             if run_deadline is not None and time.monotonic() >= run_deadline:
                 print(f"[GVD] --run-seconds {float(args.run_seconds):g} reached; stopping", flush=True)
@@ -1044,6 +1156,13 @@ def main(clock=None) -> None:
                 tick_dt = dt_loop
                 loop_hz_ema = ema_hz(loop_hz_ema, 1.0 / dt_loop)
             last_loop_t = loop_t0
+            if _drain_viz_events():
+                break
+            grab_wait_ms = 0.0
+            infer_wall_ms = 0.0
+            ckpt_ms = 0.0
+            actuate_ms = 0.0
+            viz_wait_ms = 0.0
 
             # In-game GVD app requests ride on the existing prefs file (no second bus).
             prefs = _read_ui_prefs()
@@ -1055,9 +1174,10 @@ def main(clock=None) -> None:
                 want_screen = str(prefs.get("viz_screen") or "").strip().lower()
                 if win is not None and want_screen and want_screen != viz_screen_active:
                     viz_screen_active = want_screen
-                    viz_note = place_opencv_window(
-                        win, screen=want_screen, fullscreen=bool(args.viz_fullscreen)
-                    )
+                    if viz_pump is None:
+                        viz_note_box[0] = place_opencv_window(
+                            win, screen=want_screen, fullscreen=bool(args.viz_fullscreen)
+                        )
 
             t_grab = time.perf_counter()
             if capture_pump is not None:
@@ -1073,9 +1193,10 @@ def main(clock=None) -> None:
                     bundle = held.payload
             else:
                 bundle = backend.grab()
+            grab_wait_ms = (time.perf_counter() - t_grab) * 1000.0
             grab_ms = float(getattr(bundle, "grab_ms", 0.0) or 0.0)
             if grab_ms <= 0:
-                grab_ms = (time.perf_counter() - t_grab) * 1000.0
+                grab_ms = grab_wait_ms
             # Take-time age feeds the speed cap. The drive decision is recomputed
             # immediately before gate_drive_command, after AEB has already run
             # on this same bundle.
@@ -1210,6 +1331,7 @@ def main(clock=None) -> None:
             # Loaded detector / lanes / planner / E2E shadow run every tick, engaged or not.
             # The stitch is this grab only: eight cameras, one timestamp.
             rig_view = stitch_frames(bundle_tick_frames(bundle))
+            t_inf = time.perf_counter()
             pout = perc.tick(
                 main,
                 stitch_bgr=rig_view.bgr,
@@ -1218,6 +1340,7 @@ def main(clock=None) -> None:
                 yaw_rate=yaw_rate,
                 dt_s=tick_dt,
             )
+            infer_wall_ms += (time.perf_counter() - t_inf) * 1000.0
             pout = apply_to_perception(ui.debug, pout)
 
             if ui.debug.force_engage and not prev_force:
@@ -1293,6 +1416,7 @@ def main(clock=None) -> None:
                 # The tick above may have held a pre-engage one-side center.
                 # Refit with the seed gate so that value cannot steer.
                 perc.arm_lane_seed()
+                t_inf = time.perf_counter()
                 pout = perc.tick(
                     main,
                     stitch_bgr=rig_view.bgr,
@@ -1301,6 +1425,7 @@ def main(clock=None) -> None:
                     yaw_rate=yaw_rate,
                     dt_s=tick_dt,
                 )
+                infer_wall_ms += (time.perf_counter() - t_inf) * 1000.0
                 pout = apply_to_perception(ui.debug, pout)
             disengage_reason = "none" if ident.matched else "bus_mismatch"
             heartbeat_ok = True
@@ -1419,7 +1544,9 @@ def main(clock=None) -> None:
                         route_vec = runtime_route_vec(
                             st.get("nav") if isinstance(st.get("nav"), dict) else {}, route_intent_result
                         )
+                    t_ckpt = time.perf_counter()
                     ckpt_pred = scene_ckpt.observe(main, tick_dt, route=route_vec)
+                    ckpt_ms = (time.perf_counter() - t_ckpt) * 1000.0
                 except SceneCkptInputError as exc:
                     print(f"[GVD] scene-ckpt input: {exc}", flush=True)
                     ckpt_pred = None
@@ -1751,10 +1878,12 @@ def main(clock=None) -> None:
             # Capture telemetry (read only): would actuate skip vehicle.control this
             # tick because a camera GE call holds the socket? Counted with engage off too.
             would_skip_control = bool(cam_age_log) and camera_ge_socket_busy()
+            t_act = time.perf_counter()
             if engaged and (cmd.reason == "ok" or holding):
                 applied = actuator.apply(cmd)
             else:
                 applied = actuator.stop(seq=cmd_seq, reason=cmd.reason)
+            actuate_ms = (time.perf_counter() - t_act) * 1000.0
             # Reference for the override residual, keyed by seq so the mod's ack can find the
             # command its echo belongs to. Gate holds ride along as brake=1 and the car echoes
             # those back just like a real command, so they have to be in here too.
@@ -1855,7 +1984,7 @@ def main(clock=None) -> None:
             st["rss_mb"] = _rss_mb()
             st["viz_window"] = win is not None
             st["viz_screen"] = viz_screen_active
-            st["viz_note"] = viz_note
+            st["viz_note"] = viz_note_box[0]
             st["debug_gt"] = bool(getattr(args, "debug_gt", False))
             st["detector"] = pout.detector_name
             st["actuator"] = actuator.name
@@ -2094,10 +2223,41 @@ def main(clock=None) -> None:
 
             # Call-site coalesce only. write_state itself still stamps the beat.
             # Mark after the write so the 100 ms cap is on the file, not the check.
+            # Paint is off this thread. The control tick only copies the latest
+            # picture and returns. imshow / waitKey stay on the viz thread.
             stage_frame = None
-            if win is not None:
-                # Reuse this tick's bus check. A second bus_identity() would
-                # move the clock seam the retail tests count.
+            t_viz = time.perf_counter()
+            if viz_pump is not None:
+                import copy
+
+                import numpy as np
+
+                frames = getattr(bundle, "frames", None)
+                frame_snap = None
+                if isinstance(frames, dict):
+                    frame_snap = {
+                        key: (np.array(img, copy=True) if isinstance(img, np.ndarray) else img)
+                        for key, img in frames.items()
+                    }
+                main_snap = np.array(main, copy=True) if isinstance(main, np.ndarray) else main
+                try:
+                    state_snap = copy.deepcopy(st)
+                except Exception:
+                    state_snap = st
+                viz_pump.submit(
+                    {
+                        "state": state_snap,
+                        "main": main_snap,
+                        "frames": frame_snap,
+                        "dets": getattr(pout, "dets", None),
+                        "matched": bool(ident.matched),
+                        "screen": viz_screen_active,
+                        "fullscreen": bool(args.viz_fullscreen),
+                    }
+                )
+                st["viz_ms"] = float(viz_pump.viz_ms)
+            elif win is not None:
+                # Thread setup failed. Paint here so the window still works.
                 paint = st if ident.matched else load_paint_state()
                 stage_frame = render_stage(
                     paint,
@@ -2107,8 +2267,23 @@ def main(clock=None) -> None:
                     dets=getattr(pout, "dets", None),
                 )
                 st["viz_ms"] = float(paint.get("viz_ms") or 0.0)
+            viz_wait_ms = (time.perf_counter() - t_viz) * 1000.0
             age_window.add(frame_age_ms)
             tick_now = clock.perf() if clock is not None else time.perf_counter()
+            print(
+                format_stage_line(
+                    grab_ms=grab_ms,
+                    grab_wait_ms=grab_wait_ms,
+                    infer_ms=infer_wall_ms + ckpt_ms,
+                    actuate_ms=actuate_ms,
+                    viz_ms=float(st.get("viz_ms") or 0.0),
+                    viz_wait_ms=viz_wait_ms,
+                    tick_ms=(tick_now - loop_t0) * 1000.0,
+                    loop_hz=loop_hz_ema,
+                    ckpt_ms=ckpt_ms,
+                ),
+                flush=True,
+            )
             print(
                 format_latency_line(
                     capture_ms=grab_ms,
@@ -2159,7 +2334,7 @@ def main(clock=None) -> None:
                 cmd_reason=str(st.get("cmd_reason") or ""),
             )
 
-            if win is not None and stage_frame is not None:
+            if win is not None and stage_frame is not None and viz_pump is None:
                 import cv2
 
                 cv2.imshow(win, stage_frame)
@@ -2169,23 +2344,8 @@ def main(clock=None) -> None:
                 key = -1 if raw_key is None else int(raw_key)
                 # q and Esc leave the supervisor. close() disconnects only
                 # (quit_on_close=false) and does not kill BeamNG.tech.
-                if key in (ord("q"), 27):
+                if _handle_viz_key(key):
                     break
-                if key < 0:
-                    pass
-                elif ui.handle_key(key):
-                    pass
-                elif key == ord("v"):
-                    ui.toggle_nerd()
-                elif key == ord("?"):
-                    ui.toggle_help()
-                elif key == ord("t"):
-                    ui.top_down = not ui.top_down
-                elif key == ord("c"):
-                    recorder.request("manual", now=time.time())
-                    print("[GVD] manual clip requested (key C)")
-                elif key in (ord("0"), ord("1"), ord("2"), ord("3"), ord("4"), ord("5")):
-                    ui.set_layer(int(chr(key)))
 
             frame_i += 1
             dt = 1.0 / max(args.hz, 1.0)
@@ -2215,12 +2375,14 @@ def main(clock=None) -> None:
                 pass
         if capture_pump is not None:
             capture_pump.stop()
+        if viz_pump is not None:
+            viz_pump.stop()
         backend.close()
         try:
             fox.close()
         except Exception:
             pass
-        if win is not None:
+        if win is not None and viz_pump is None:
             import cv2
 
             cv2.destroyAllWindows()

@@ -131,6 +131,36 @@ def format_latency_line(
     )
 
 
+def format_stage_line(
+    *,
+    grab_ms: float,
+    grab_wait_ms: float,
+    infer_ms: float,
+    actuate_ms: float,
+    viz_ms: float,
+    viz_wait_ms: float,
+    tick_ms: float,
+    loop_hz: float,
+    ckpt_ms: float = 0.0,
+) -> str:
+    """Control-thread stage times, plus the off-thread grab and paint.
+
+    ``grab_ms`` is how long the camera grab itself took. ``grab_wait_ms`` is
+    how long this tick blocked to take that frame. ``infer_ms`` includes the
+    scene-ckpt forward (``ckpt_ms`` is that forward alone). ``viz_ms`` is the
+    paint thread. ``viz_wait_ms`` is how long the control thread spent handing
+    the paint off. ``tick_ms`` is the control thread from the top of the tick
+    through this line, before the rate sleep.
+    """
+    return (
+        f"[GVD] stage grab_ms={float(grab_ms):.2f} grab_wait_ms={float(grab_wait_ms):.2f} "
+        f"infer_ms={float(infer_ms):.2f} ckpt_ms={float(ckpt_ms):.2f} "
+        f"actuate_ms={float(actuate_ms):.2f} viz_ms={float(viz_ms):.2f} "
+        f"viz_wait_ms={float(viz_wait_ms):.2f} tick_ms={float(tick_ms):.2f} "
+        f"loop_hz={float(loop_hz):.2f}"
+    )
+
+
 def rss_mb_from_statm(text: str, page_size: int) -> float:
     """Resident set from a ``/proc/self/statm`` line. The second field is pages."""
     pages = int(str(text).split()[1])
@@ -317,10 +347,15 @@ class CapturePump:
         produce: Callable[[], Any],
         *,
         idle_s: float = 0.002,
+        period_s: float | None = None,
     ) -> None:
         self.slot = slot
         self._produce = produce
         self._idle_s = max(0.0, float(idle_s))
+        # None keeps the old idle-only pace (tests that want a fast pump).
+        # A positive period is the supervisor: one grab per control period,
+        # then the shared camera socket / GIL is free for inference.
+        self._period_s = 0.0 if period_s is None else max(0.0, float(period_s))
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -349,6 +384,8 @@ class CapturePump:
                 self.slot.put(bundle)
             spent = time.perf_counter() - t0
             pause = self._idle_s if spent < self._idle_s else 0.0
+            if self._period_s > 0.0:
+                pause = max(pause, self._period_s - spent)
             if self._stop.wait(pause):
                 return
 

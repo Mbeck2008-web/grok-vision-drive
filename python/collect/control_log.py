@@ -2,7 +2,8 @@
 
 Pure helpers, no BeamNG import. The collector sends ``VE_PROBE`` (vehicle Lua) and
 ``TRAFFIC_CHUNK`` (game-engine Lua) with ``response=True`` and parses the replies
-here. A probe value is ``None`` when the reply lacks it; it is never 0 by default.
+here. The traffic chunk reads every non-player object. A probe value is ``None``
+when the reply lacks it; it is never 0 by default.
 The label recorded under ``*_ai`` is the AI controller's command, and that
 controller uses information the cameras do not see (road geometry ahead, its
 planned path, traffic).
@@ -66,16 +67,26 @@ VE_META_PROBE = (
 )
 
 TRAFFIC_EVERY_S = 0.5
+# Names the spawn script gives the two companions. The probe does not look
+# them up by those names: it walks every non-player object.
 TRAFFIC_NAMES = ("gvd_traffic_0", "gvd_traffic_1")
 TRAFFIC_CHUNK = (
     "local out={};"
-    + "".join(
-        f"pcall(function() local o=scenetree.findObject('{name}');if o then "
-        "local p=o:getPosition();local v=o:getVelocity();local d=o:getDirectionVector();"
-        f"out[#out+1]={{name='{name}',pos={{p.x,p.y,p.z}},vel={{v.x,v.y,v.z}},dir={{d.x,d.y,d.z}}}} end end);"
-        for name in TRAFFIC_NAMES
-    )
-    + "return jsonEncode(out)"
+    "local player=nil;"
+    "pcall(function() player=be:getPlayerVehicle(0) end);"
+    "local n=0;"
+    "pcall(function() n=be:getObjectCount() or 0 end);"
+    "for i=0,n-1 do "
+    "pcall(function() "
+    "local o=be:getObject(i);"
+    "if o and o~=player then "
+    "local name='';"
+    "pcall(function() name=tostring(o:getField('name',0) or '') end);"
+    "if name=='' or name=='nil' then pcall(function() name=tostring(o:getName() or '') end) end;"
+    "local p=o:getPosition();local v=o:getVelocity();local d=o:getDirectionVector();"
+    "out[#out+1]={name=name,pos={p.x,p.y,p.z},vel={v.x,v.y,v.z},dir={d.x,d.y,d.z}} "
+    "end end) end;"
+    "return jsonEncode(out)"
 )
 
 

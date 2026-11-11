@@ -267,7 +267,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--heads",
         default="",
-        help="Comma list of heads that receive loss. Empty trains every head. The export still has every output.",
+        help=(
+            "Comma list of heads that receive loss. Empty trains every head except "
+            "curbs, until every recording's sem_classes.json has a human-confirmed "
+            "curb name. ctl and road_edge only when named. The export still has every output."
+        ),
     )
     parser.add_argument(
         "--augment",
@@ -3867,6 +3871,18 @@ def exact_epochs_refusal(args: argparse.Namespace) -> str | None:
     return None
 
 
+def heads_for_run(text: str | None, roots: Any = None) -> tuple[str, ...]:
+    """Loss heads for a ``--heads`` string and the recordings about to train.
+
+    Empty text leaves ``curbs`` out until every root has a human-confirmed
+    curb name in ``sem_classes.json``. ``road_edge`` is included only when
+    the string names it, and it is never a substitute for painted ``lane_gt``.
+    """
+    from python.train.scene_net import curb_palette_for_training, resolve_train_heads
+
+    return resolve_train_heads(text, curb_palette_for_training(roots))
+
+
 def main(argv: list[str] | None = None) -> None:
     from python.data.data_root import DataDriveError, check_data_path, ensure_cache_dirs, scene_lanes_dir
 
@@ -3934,6 +3950,12 @@ def main(argv: list[str] | None = None) -> None:
     except ValueError as exc:
         print(f"[GVD] scene train: {exc}")
         sys.exit(2)
+    head_names = heads_for_run(args.heads, strip_roots)
+    if not str(args.heads or "").strip() and "curbs" not in head_names:
+        print(
+            "[GVD] curbs omitted from empty --heads until a confirmed curb name is in sem_classes.json",
+            flush=True,
+        )
     if args.build_cache:
         if Path(args.build_cache).exists():
             print(f"[GVD] scene train: --build-cache is create-only; {Path(args.build_cache).name} already exists", flush=True)

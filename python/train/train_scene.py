@@ -824,7 +824,7 @@ def _as_target(labels: dict[str, Any], device: Any) -> dict[str, Any]:
     import torch
 
     out = {}
-    long_keys = {"object_class", "sign_class", "sign_state"}
+    long_keys = {"object_class", "sign_class", "sign_state", "obstacle_mask"}
     for key, value in labels.items():
         dtype = torch.long if key in long_keys else torch.float32
         out[key] = torch.as_tensor(value, device=device, dtype=dtype)
@@ -836,7 +836,7 @@ def _prediction_at(pred: ScenePrediction, index: int) -> ScenePrediction:
 
     extra = {name: getattr(pred, name)[index] for name in CTL_OUTPUT_FIELDS if getattr(pred, name, None) is not None}
     # Training-only aux / road_edge: must travel with the slice or scene_loss skips them.
-    for name in ("aux_depth", "aux_sem_logits", "road_edge"):
+    for name in ("aux_depth", "aux_sem_logits", "road_edge", "obstacle_mask", "obstacle_clear"):
         value = getattr(pred, name, None)
         if value is not None:
             extra[name] = value[index]
@@ -854,6 +854,8 @@ def _loss_terms(net: Any) -> tuple[str, ...]:
         extra.append("road_edge")
     if bool(getattr(net, "aux_sensors", False)):
         extra.extend(("aux_depth", "aux_sem"))
+    if bool(getattr(net, "obstacles", False)):
+        extra.append("obstacle")
     return tuple(LOSS_TERMS) + tuple(extra)
 
 
@@ -1411,6 +1413,7 @@ def _row_labels(
         aux_depth=bool(aux_depth_w),
         aux_sem=bool(aux_sem_w),
         road_edge=("road_edge" in (heads or ())),
+        obstacles=("obstacles" in (heads or ())),
         aux_cache=aux_cache,
     )
 
@@ -2463,6 +2466,7 @@ def train_directory(
     use_cam_age = bool(cam_age)
     use_ctl = bool(train_heads) and "ctl" in train_heads
     use_road_edge = bool(train_heads) and "road_edge" in train_heads
+    use_obstacles = bool(train_heads) and "obstacles" in train_heads
     use_aux_sensors = bool(aux_depth) or bool(aux_sem)
     aux_depth_w = float(aux_depth_weight) if aux_depth else 0.0
     aux_sem_w = float(aux_sem_weight) if aux_sem else 0.0
@@ -2470,6 +2474,8 @@ def train_directory(
         raise SystemExit("sensor aux is wired into the scratch net only (--backbone scratch)")
     if use_road_edge and backbone not in ("", "scratch"):
         raise SystemExit("road_edge is wired into the scratch net only (--backbone scratch)")
+    if use_obstacles and backbone not in ("", "scratch"):
+        raise SystemExit("obstacles is wired into the scratch net only (--backbone scratch)")
     if use_ctl and backbone not in ("", "scratch"):
         raise SystemExit("ctl is wired into the scratch net only (--backbone scratch)")
     if ctl_cond and not use_ctl:
@@ -2806,6 +2812,7 @@ def train_directory(
                     cond_dim=ctl_cond_dim,
                     aux_sensors=use_aux_sensors,
                     road_edge=use_road_edge,
+                    obstacles=use_obstacles,
                     route_cond=bool(route_cond),
                     **dict(model_net_kwargs or {}),
                 ).to(device)
@@ -3079,6 +3086,7 @@ def train_directory(
             **({"ctl_cond_dim": int(ctl_cond_dim)} if ctl_cond_dim else {}),
             **({"ctl_loss": ctl_kind} if ctl_kind != "huber" else {}),
             **({"route_cond": True} if route_cond else {}),
+            **({"obstacles": True} if use_obstacles else {}),
             "heads": list(train_heads or ()),
             "scale": float(input_scale),
             "backbone": str(backbone),

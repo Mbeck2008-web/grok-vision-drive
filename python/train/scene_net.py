@@ -671,6 +671,100 @@ def _index_vector(value: Any, table: tuple[str, ...], n: int, fallback: np.ndarr
     return out
 
 
+# Human-confirmed annotation names that may become curb polylines.
+# Empty until someone copies a name out of a real sem_classes.json.
+# A string that merely looks like a curb ("CURB", "kerb", "guardrail") is not proof.
+CURB_NAME_ALLOWLIST: frozenset[str] = frozenset()
+
+
+def _palette_names(sem_classes: Mapping[str, Any] | None) -> list[str]:
+    """Annotation names from a ``sem_classes.json`` payload, id order, skipping 0."""
+    if not isinstance(sem_classes, Mapping):
+        return []
+    classes = sem_classes.get("classes")
+    if not isinstance(classes, Mapping):
+        return []
+    named: list[tuple[int, str]] = []
+    for key, name in classes.items():
+        try:
+            idx = int(key)
+        except (TypeError, ValueError):
+            continue
+        if idx <= 0 or not isinstance(name, str):
+            continue
+        text = name.strip()
+        if not text or text.lower() == "unknown":
+            continue
+        named.append((idx, text))
+    named.sort()
+    return [name for _idx, name in named]
+
+
+def confirmed_curb_names(
+    sem_classes: Mapping[str, Any] | None,
+    allowlist: frozenset[str] | None = None,
+) -> tuple[str, ...]:
+    """Palette names a human copied onto the curb allowlist.
+
+    The default allowlist is empty. Matching is the exact string from
+    ``sem_classes.json``, not a guess from the letters in the name.
+    """
+    allowed = CURB_NAME_ALLOWLIST if allowlist is None else frozenset(allowlist)
+    if not allowed:
+        return ()
+    return tuple(name for name in _palette_names(sem_classes) if name in allowed)
+
+
+def curb_targets(
+    sem_classes: Mapping[str, Any] | None = None,
+    *,
+    points: Any = None,
+    allowlist: frozenset[str] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """``(curbs [N_CURBS, LANE_POINTS, 2], curb_valid [N_CURBS])``.
+
+    Point labels are written only after palette proof. Without a confirmed
+    name both arrays stay zero, including when ``points`` holds road-edge
+    xs. This function does not read ``road_edge`` or ``lane_gt``.
+    """
+    zeros = np.zeros((N_CURBS, LANE_POINTS, 2), dtype=np.float32)
+    valid = np.zeros((N_CURBS,), dtype=np.float32)
+    if not confirmed_curb_names(sem_classes, allowlist=allowlist) or points is None:
+        return zeros, valid
+    packed, flags = _polys_to_slots(points, N_CURBS)
+    return packed.astype(np.float32), flags.astype(np.float32)
+
+
+def _read_curb_palette(root: Path | str | None) -> dict[str, Any] | None:
+    """``sem_classes.json`` for the curb gate. Missing or invalid → no proof."""
+    if root is None:
+        return None
+    from python.train.sensor_aux import AuxTargetError, read_sem_classes
+
+    try:
+        payload = read_sem_classes(root)
+    except AuxTargetError:
+        return None
+    return dict(payload) if payload else None
+
+
+def curb_palette_for_training(roots: Any) -> Mapping[str, Any] | None:
+    """One palette when every recording has a confirmed curb name, else None.
+
+    One root without that name keeps ``curbs`` off an empty ``--heads``.
+    An all-zero ``curb_valid`` on an unlabeled recording is not "no curb".
+    """
+    if not roots:
+        return None
+    chosen: Mapping[str, Any] | None = None
+    for root in roots:
+        payload = _read_curb_palette(root)
+        if not confirmed_curb_names(payload):
+            return None
+        chosen = payload
+    return chosen
+
+
 def labels_from_tech(tech: Mapping[str, Any] | None) -> dict[str, np.ndarray]:
     """Fixed-shape scene labels from a Tech dict, or zeros when labels are absent."""
     tech = tech or {}
@@ -733,6 +827,12 @@ def labels_for_row(
     values, mask = lane_gt_from_record(tech if isinstance(tech, Mapping) else None)
     labels["lane_gt"] = values
     labels["lane_gt_valid"] = mask
+    # Curbs are a semantic boundary, not a copy of the mapped road edge or of paint.
+    # Until a human-confirmed name is in this recording's palette, curb_valid stays 0.
+    if not confirmed_curb_names(_read_curb_palette(root)):
+        curbs, curb_valid = curb_targets(None)
+        labels["curbs"] = curbs
+        labels["curb_valid"] = curb_valid
     # ctl targets exist only on rows the trainer attached them to (--heads ...,ctl).
     if "ctl" in row and "ctl_valid" in row:
         labels["ctl"] = np.asarray(row["ctl"], dtype=np.float32).reshape(3, CTL_K)
@@ -1148,6 +1248,29 @@ def head_names(heads: tuple[str, ...] | list[str] | None) -> frozenset[str]:
     if not heads:
         return frozenset(HEAD_NAMES)
     return frozenset(parse_heads(",".join(str(name) for name in heads)))
+
+
+def resolve_train_heads(
+    text: str | None,
+    sem_classes: Mapping[str, Any] | None = None,
+    *,
+    allowlist: frozenset[str] | None = None,
+) -> tuple[str, ...]:
+    """Loss heads for a ``--heads`` string.
+
+    ``ctl`` and ``road_edge`` are included only when named. An empty string
+    trains every default head except ``curbs`` until ``sem_classes`` contains
+    a human-confirmed curb name. An all-zero ``curb_valid`` must not be the
+    BCE target for ticks that were never labeled.
+    """
+    from python.train.cam_strip import parse_heads
+
+    names = parse_heads(text)
+    if str(text or "").strip():
+        return names
+    if not confirmed_curb_names(sem_classes, allowlist=allowlist):
+        names = tuple(name for name in names if name != "curbs")
+    return names
 
 
 def _ctl_loss(pred: Any, goal: Any, valid: Any, kind: str = "huber") -> Any:

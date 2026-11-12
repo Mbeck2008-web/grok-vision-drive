@@ -283,13 +283,44 @@ def _gap_stats(starts: list[_Start], reset_s: float) -> str:
     )
 
 
+def _collector_place_sites(src: str) -> dict[str, tuple[int, str]]:
+    """The three collector calls, each named, so one ``persist=False`` fails alone.
+
+    Stall recover and driving start share the same call text. The line number
+    is what distinguishes them, so flipping either one is its own failure.
+    """
+    lines = src.splitlines()
+    found: dict[str, tuple[int, str]] = {}
+    for i, line in enumerate(lines):
+        if "place_excursion_clock(" not in line or line.lstrip().startswith("def "):
+            continue
+        after = "\n".join(lines[i:i + 6])
+        before = "\n".join(lines[max(0, i - 8):i])
+        if "segment_aborts = 0" in after:
+            name = "segment load"
+        elif "weave_stats.end_stretch()" in after:
+            name = "driving start"
+        elif "stall_s" in before:
+            name = "stall recover"
+        else:
+            raise AssertionError(f"line {i + 1} calls place_excursion_clock outside the three reset sites: {line.strip()}")
+        if name in found:
+            raise AssertionError(f"two {name} calls")
+        found[name] = (i + 1, line)
+    missing = {"stall recover", "segment load", "driving start"} - set(found)
+    assert not missing, f"reset site missing: {sorted(missing)}"
+    return found
+
+
 def check_resets_keep_one_clock() -> None:
     import scripts.collect_scene_lanes as collect
 
     src = Path(collect.__file__).read_text(encoding="utf-8")
     assert src.count("clock = new_clock()") == 1, "a later site still builds a new clock"
-    # The def plus the stall-recover, segment-load, and driving-start calls.
-    assert src.count("place_excursion_clock(") == 4, src.count("place_excursion_clock(")
+    for name, (lineno, line) in _collector_place_sites(src).items():
+        assert "persist=gap_persist" in line and "persist=False" not in line, (
+            f"{name} (line {lineno}) passes persist=False while a gap flag is set: {line.strip()}"
+        )
     fresh = ExcursionClock()
     fresh.update(10.0, **_kw())
     replaced = collect.place_excursion_clock(fresh, persist=False, fresh=ExcursionClock)

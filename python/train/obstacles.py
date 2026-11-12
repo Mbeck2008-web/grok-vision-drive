@@ -1,10 +1,12 @@
 """Training-only obstacle mask and clearance.
 
-Runtime and the visualizer do not import this module. A cell is blocked when
-its unprojected point sits inside the drivable corridor and its world Z is
-more than ``OBSTACLE_Z_EPS_M`` above the interpolated ``RoadPoly.z``. That
-difference is in the world frame. Ego z, ego pitch, and a missing height are
-not a road surface.
+Runtime and the visualizer do not import this module. Inside the drivable
+corridor a cell is blocked when its world Z is more than ``clear_eps_m``
+(0.15 m) above the interpolated ``RoadPoly.z``. A point within
+``edge_band_m`` (0.5 m) outside that edge is blocked at ``curb_eps_m``
+(0.08 m). Those three numbers are written on every ``obstacles.jsonl`` row.
+The difference is in the world frame. Ego z, ego pitch, and a missing height
+are not a road surface.
 
 The corridor half-width is half the painted lane width about the painted
 center. When that lane is missing it is ``road_width_m / 2`` about
@@ -25,8 +27,13 @@ import numpy as np
 from python.debug.lane_targets import LOOKAHEADS_M, lane_center_is_valid
 from python.train.sensor_aux import DRIVABLE_CLASS_ALLOWLIST
 
-# Metres of world Z above the interpolated road surface. Not an ego-frame height.
-OBSTACLE_Z_EPS_M = 0.15
+# In-corridor world Z above the interpolated road surface. Not an ego-frame height.
+# Strictly greater than this is blocked. Written on every obstacles.jsonl row.
+CLEAR_EPS_M = 0.15
+OBSTACLE_Z_EPS_M = CLEAR_EPS_M
+# Outside the corridor, within EDGE_BAND_M of the edge: a curb, not a lip.
+CURB_EPS_M = 0.08
+EDGE_BAND_M = 0.5
 GRID_H = 64
 GRID_W = 64
 X_MIN = -16.0
@@ -426,6 +433,9 @@ def _empty(cam: str, t: Any, mask_src: str) -> dict[str, Any]:
         "y_max": Y_MAX,
         "mask": [UNKNOWN] * (GRID_H * GRID_W),
         "mask_src": mask_src,
+        "clear_eps_m": CLEAR_EPS_M,
+        "curb_eps_m": CURB_EPS_M,
+        "edge_band_m": EDGE_BAND_M,
         "clear_m": None,
         "clear_valid": False,
     }
@@ -499,12 +509,16 @@ def label_obstacle_frame(
         if road_z is None or corridor is None:
             return record
         center, half = corridor
-        inside = np.abs(ego_x - center) <= (half + 1e-6)
+        lateral = np.abs(ego_x - center)
+        inside = lateral <= (half + 1e-6)
+        in_band = (lateral > (half + 1e-6)) & (lateral <= (half + EDGE_BAND_M + 1e-6))
         height = world_z - road_z
         known = valid & inside & np.isfinite(height)
         classes = np.zeros(depth.shape, np.uint8)
-        classes[known & (height > OBSTACLE_Z_EPS_M)] = BLOCKED
-        classes[known & (height <= OBSTACLE_Z_EPS_M) & (height >= -OBSTACLE_Z_EPS_M)] = DRIVABLE
+        classes[known & (height > CLEAR_EPS_M)] = BLOCKED
+        classes[known & (height <= CLEAR_EPS_M) & (height >= -CLEAR_EPS_M)] = DRIVABLE
+        band = valid & in_band & np.isfinite(height)
+        classes[band & (height >= CURB_EPS_M)] = BLOCKED
         blocked = classes == BLOCKED
     grid = _bin(ego_x, ego_y, classes, valid)
     clear_m, clear_ok = _clearance(ego_x, ego_y, blocked, lane_gt, lane_gt_valid)

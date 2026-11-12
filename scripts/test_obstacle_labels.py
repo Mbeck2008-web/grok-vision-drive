@@ -215,6 +215,13 @@ def check_pitched_and_raised_ego_uses_world_z() -> None:
     print("  pitched and z-offset ego: blocked is world Z minus RoadPoly.z")
 
 
+def _assert_row_fields(record) -> None:
+    """clear_eps_m, curb_eps_m, and edge_band_m are on every obstacles row."""
+    assert record["clear_eps_m"] == 0.15, record.get("clear_eps_m")
+    assert record["curb_eps_m"] == 0.08, record.get("curb_eps_m")
+    assert record["edge_band_m"] == 0.5, record.get("edge_band_m")
+
+
 def check_epsilon_is_world_clearance() -> None:
     from python.train.obstacles import BLOCKED, DRIVABLE, OBSTACLE_Z_EPS_M, UNKNOWN
 
@@ -489,6 +496,7 @@ def check_writer_and_missing_sidecar() -> None:
         assert saved["grid_h"] == 64 and saved["grid_w"] == 64
         assert saved["x_min"] == -16.0 and saved["x_max"] == 16.0
         assert saved["y_min"] == 0.0 and saved["y_max"] == 40.0
+        _assert_row_fields(saved)
         assert _at(saved, 0.0, 10.0)[0] == DRIVABLE
         assert _at(saved, 0.0, 16.0)[0] == BLOCKED
         assert not (root / "gt.jsonl").exists()
@@ -507,6 +515,54 @@ def check_writer_and_missing_sidecar() -> None:
         plain = labels_for_row({"i": 0, "t": 1.25, "tech": {}})
         assert "obstacle_mask" not in plain
     print("  writer stores obstacles.jsonl and a missing sidecar stays masked")
+
+
+def check_edge_band_and_row_fields() -> None:
+    """0.10 m just outside the edge is blocked. 0.05 m there is not.
+
+    The three epsilon fields are on a full row and on every empty row.
+    """
+    from python.train.obstacles import BLOCKED, DRIVABLE, UNKNOWN
+
+    right, forward, up = _flat_axes()
+    pos = (0.0, 0.0, 0.0)
+    half = 3.5 / 2.0
+    x = half + 0.3
+    y = 12.0
+    assert x < half + 0.5
+
+    def one(z: float):
+        depth = _blank(POSE.height, POSE.width)
+        ego = _to_ego((x, y, z), pos, right, forward, up)
+        _splat(depth, ego)
+        got = _label(depth, lane=_paint(3.5), road=_road(lambda _y: 0.0), pos=pos, forward=forward, up=up)
+        return got, ego
+
+    curb, curb_e = one(0.10)
+    lip, lip_e = one(0.05)
+    assert _at(curb, curb_e[0], curb_e[1])[0] == BLOCKED, curb_e
+    assert _at(lip, lip_e[0], lip_e[1])[0] != BLOCKED, lip_e
+    # The same 0.10 m inside the corridor is the road, not a curb.
+    inside = _blank(POSE.height, POSE.width)
+    in_ego = _to_ego((0.0, y, 0.10), pos, right, forward, up)
+    _splat(inside, in_ego)
+    inner = _label(inside, lane=_paint(3.5), road=_road(lambda _y: 0.0), pos=pos, forward=forward, up=up)
+    assert _at(inner, in_ego[0], in_ego[1])[0] == DRIVABLE, in_ego
+
+    none_depth = _label(None, lane=_paint(), road=_road(lambda _y: 0.0), pos=pos, forward=forward, up=up)
+    zeros = _label(_blank(POSE.height, POSE.width), lane=_paint(), road=_road(lambda _y: 0.0), pos=pos, forward=forward, up=up)
+    no_corridor = _label(
+        inside,
+        lane=(None, None),
+        road=_road(lambda _y: 0.0),
+        pos=pos,
+        forward=forward,
+        up=up,
+    )
+    for record in (curb, lip, inner, none_depth, zeros, no_corridor):
+        _assert_row_fields(record)
+    assert int(np.asarray(none_depth["mask"]).max()) == UNKNOWN
+    print("  edge band: 0.10 m at half+0.3 m blocked, 0.05 m not; eps fields on every row")
 
 
 def check_head_stays_out_of_export() -> None:
@@ -658,6 +714,7 @@ def main() -> None:
     check_pitched_and_raised_ego_uses_world_z()
     check_epsilon_is_world_clearance()
     check_corridor_matches_paint_then_pack_road_edge()
+    check_edge_band_and_row_fields()
     check_wall_pole_empty_and_missing_depth()
     check_missing_geometry_stays_unknown()
     check_clearance_masked_without_near_centers()

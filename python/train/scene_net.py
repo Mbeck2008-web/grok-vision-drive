@@ -809,8 +809,8 @@ def _read_curb_palette(root: Path | str | None) -> dict[str, Any] | None:
 def curb_palette_for_training(roots: Any) -> Mapping[str, Any] | None:
     """One palette when every recording has a confirmed curb name, else None.
 
-    One root without that name keeps ``curbs`` off an empty ``--heads``.
-    An all-zero ``curb_valid`` on an unlabeled recording is not "no curb".
+    An explicit ``--heads curbs`` checks this palette. An empty ``--heads``
+    still omits ``curbs``: a name match does not label a curb.
     """
     if not roots:
         return None
@@ -890,11 +890,11 @@ def labels_for_row(
     labels["lane_gt"] = values
     labels["lane_gt_valid"] = mask
     # Curbs are a semantic boundary, not a copy of the mapped road edge or of paint.
-    # Until a human-confirmed name is in this recording's palette, curb_valid stays 0.
-    if not confirmed_curb_names(_read_curb_palette(root)):
-        curbs, curb_valid = curb_targets(None)
-        labels["curbs"] = curbs
-        labels["curb_valid"] = curb_valid
+    # A palette name on CURB_NAME_ALLOWLIST is not a polyline. Nothing here sets
+    # curb_valid from that class id, so stuffed tech curbs stay off.
+    curbs, curb_valid = curb_targets(None)
+    labels["curbs"] = curbs
+    labels["curb_valid"] = curb_valid
     # ctl targets exist only on rows the trainer attached them to (--heads ...,ctl).
     if "ctl" in row and "ctl_valid" in row:
         labels["ctl"] = np.asarray(row["ctl"], dtype=np.float32).reshape(3, CTL_K)
@@ -1324,8 +1324,9 @@ def resolve_train_heads(
     """Loss heads for a ``--heads`` string.
 
     ``ctl`` and ``road_edge`` are included only when named. An empty string
-    trains every default head except ``curbs`` until ``sem_classes`` contains
-    a human-confirmed curb name. An all-zero ``curb_valid`` must not be the
+    trains every default head except ``curbs``. A palette name on
+    ``CURB_NAME_ALLOWLIST`` does not put ``curbs`` back: no labeler sets
+    ``curb_valid`` from that class id, and an all-zero mask must not be the
     BCE target for ticks that were never labeled.
 
     An explicit ``curbs`` (``--heads curbs`` or ``lane_gt,curbs``) raises
@@ -1336,13 +1337,14 @@ def resolve_train_heads(
 
     names = parse_heads(text)
     explicit = bool(str(text or "").strip())
-    if explicit and "curbs" in names and not confirmed_curb_names(sem_classes, allowlist=allowlist):
+    confirmed = confirmed_curb_names(sem_classes, allowlist=allowlist)
+    if explicit and "curbs" in names and not confirmed:
         raise ValueError(
             "refusing --heads curbs: CURB_NAME_ALLOWLIST has no confirmed name in sem_classes.json"
         )
-    if explicit:
-        return names
-    if not confirmed_curb_names(sem_classes, allowlist=allowlist):
+    # Empty --heads never restores curbs on a name match. There is no labeler
+    # that writes curb_valid from the allowlisted class id.
+    if not explicit:
         names = tuple(name for name in names if name != "curbs")
     return names
 

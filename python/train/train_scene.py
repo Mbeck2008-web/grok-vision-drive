@@ -269,8 +269,10 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help=(
             "Comma list of heads that receive loss. Empty trains every head except "
-            "curbs, until every recording's sem_classes.json has a human-confirmed "
-            "curb name. ctl and road_edge only when named. The export still has every output."
+            "curbs. A sem_classes.json name on CURB_NAME_ALLOWLIST does not turn "
+            "curbs on; no labeler sets curb_valid from that class id. Explicit "
+            "curbs is refused while that allowlist matches nothing. ctl and "
+            "road_edge only when named. The export still has every output."
         ),
     )
     parser.add_argument(
@@ -3874,9 +3876,11 @@ def exact_epochs_refusal(args: argparse.Namespace) -> str | None:
 def heads_for_run(text: str | None, roots: Any = None) -> tuple[str, ...]:
     """Loss heads for a ``--heads`` string and the recordings about to train.
 
-    Empty text leaves ``curbs`` out until every root has a human-confirmed
-    curb name in ``sem_classes.json``. ``road_edge`` is included only when
-    the string names it, and it is never a substitute for painted ``lane_gt``.
+    Empty text leaves ``curbs`` out. A confirmed name in ``sem_classes.json``
+    does not put it back: no labeler sets ``curb_valid`` from that class id.
+    Explicit ``curbs`` raises when ``CURB_NAME_ALLOWLIST`` matches nothing in
+    those recordings. ``road_edge`` is included only when the string names
+    it, and it is never a substitute for painted ``lane_gt``.
     """
     from python.train.scene_net import curb_palette_for_training, resolve_train_heads
 
@@ -3957,7 +3961,7 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(2)
     if not str(args.heads or "").strip() and "curbs" not in head_names:
         print(
-            "[GVD] curbs omitted from empty --heads until a confirmed curb name is in sem_classes.json",
+            "[GVD] curbs omitted from empty --heads; a palette name is not a curb label",
             flush=True,
         )
     if args.build_cache:

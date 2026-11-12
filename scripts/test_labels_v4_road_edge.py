@@ -4,10 +4,10 @@
 * ``road_edge`` is not a painted-lane label. Naming it on ``--heads`` is the
   only way it enters the loss.
 * A class name that merely looks like a curb is not proof. ``curb_valid``
-  stays 0 until that exact name is on the human allowlist and in
-  ``sem_classes.json``.
-* An empty ``--heads`` therefore leaves ``curbs`` out, so the zero mask is
-  not a BCE target for "no curb".
+  stays 0. A name on ``CURB_NAME_ALLOWLIST`` does not write curb points.
+* An empty ``--heads`` leaves ``curbs`` out even when that name is in
+  ``sem_classes.json``, so the zero mask is not a BCE target for "no curb".
+* Explicit ``--heads curbs`` raises while ``CURB_NAME_ALLOWLIST`` matches nothing.
 """
 from __future__ import annotations
 
@@ -152,9 +152,10 @@ def check_road_edge_and_curbs_opt_in() -> None:
     named = resolve_train_heads("lane_gt,road_edge")
     assert named == ("lane_gt", "road_edge")
     assert "curbs" not in named
-    # A confirmed name puts curbs back on an empty --heads. A lookalike does not.
+    # A confirmed name does not put curbs back on an empty --heads. No labeler
+    # sets curb_valid from that class id. A lookalike does not either.
     proven = resolve_train_heads("", _palette("CURB"), allowlist=frozenset({"CURB"}))
-    assert "curbs" in proven and "road_edge" not in proven
+    assert "curbs" not in proven and "road_edge" not in proven
     lookalike = resolve_train_heads("", _palette("CURB"))
     assert "curbs" not in lookalike
     # The production allowlist is empty, so a file that says CURB is still not proof.
@@ -171,6 +172,78 @@ def check_road_edge_and_curbs_opt_in() -> None:
     assert "def heads_for_run(" in trainer
     assert "head_names = heads_for_run(args.heads, strip_roots)" in trainer
     print("road_edge opt-in, empty --heads omits curbs")
+
+
+def check_allowlist_match_without_points_has_no_curb_grad() -> None:
+    """A real palette hit is not a curb label when no class id wrote points."""
+    import json
+    import tempfile
+
+    try:
+        import torch
+    except ImportError:
+        skip_check("allowlist_match_without_points_has_no_curb_grad", "torch missing")
+        return
+    import python.train.scene_net as scene_net
+    from python.train.sensor_aux import read_sem_classes
+    from python.train.scene_net import (
+        SceneNet,
+        confirmed_curb_names,
+        labels_for_row,
+        resolve_train_heads,
+        scene_loss,
+    )
+
+    paint_v, paint_m, edge_v, _edge_m = _paint_and_edge()
+    payload = {
+        "kind": "gvd_sem_classes",
+        "train_only": True,
+        "classes": {"0": "unknown", "1": "CURB"},
+        "colours": {"CURB": [180, 180, 180]},
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "sem_classes.json").write_text(json.dumps(payload), encoding="utf-8")
+        loaded = read_sem_classes(root)
+        assert confirmed_curb_names(loaded, allowlist=frozenset({"CURB"})) == ("CURB",)
+        heads = resolve_train_heads("", loaded, allowlist=frozenset({"CURB"}))
+        assert "curbs" not in heads, heads
+        bare = labels_for_row(
+            {"tech": {"lane_gt": paint_v.tolist(), "lane_gt_valid": paint_m.tolist()}},
+            root=root,
+        )
+        assert float(bare["curb_valid"].sum()) == 0.0
+        old = scene_net.CURB_NAME_ALLOWLIST
+        scene_net.CURB_NAME_ALLOWLIST = frozenset({"CURB"})
+        try:
+            stuffed = labels_for_row(
+                {
+                    "tech": {
+                        "lane_gt": paint_v.tolist(),
+                        "lane_gt_valid": paint_m.tolist(),
+                        "curbs": _edge_polylines(edge_v),
+                    }
+                },
+                root=root,
+            )
+        finally:
+            scene_net.CURB_NAME_ALLOWLIST = old
+        assert float(stuffed["curb_valid"].sum()) == 0.0
+        assert float(np.abs(stuffed["curbs"]).sum()) == 0.0
+        labels = bare
+
+    net = SceneNet(cams=("main",)).train()
+    blank = torch.zeros(1, 3, net.canvas_h, net.canvas_w)
+    target = {key: torch.as_tensor(value) for key, value in labels.items()}
+    for key in ("object_class", "sign_class", "sign_state"):
+        target[key] = target[key].long()
+    net.zero_grad(set_to_none=True)
+    pred, _state = net(blank, 0.1, net.initial_state())
+    scene_loss(pred, target, heads)["total"].backward()
+    for param in (net.curb_head.weight, net.curb_valid_head.weight):
+        grad = param.grad
+        assert grad is None or float(grad.abs().max()) == 0.0, grad
+    print("allowlist match with no curb points leaves curb grad at 0")
 
 
 def check_empty_heads_does_not_bce_curb_valid() -> None:
@@ -216,6 +289,7 @@ def main() -> None:
     check_allowlist_empty_and_curb_valid_zero()
     check_explicit_curbs_without_allowlist_raises()
     check_road_edge_and_curbs_opt_in()
+    check_allowlist_match_without_points_has_no_curb_grad()
     check_empty_heads_does_not_bce_curb_valid()
     print("test_labels_v4_road_edge: OK")
 

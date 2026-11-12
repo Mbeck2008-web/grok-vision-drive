@@ -590,8 +590,8 @@ def main() -> None:
     span_cam = Cam()
     assert abs(span_cam.ahead_m - draw.ahead_m) < 1e-6
     assert abs(span_cam.behind_m - draw.behind_m) < 1e-6
-    # Chase stays just behind the ego. Draw range does not drag the lens back.
-    assert abs(span_cam.eye[0] - 1.6) < 1e-6
+    # Chase stays centered just behind the ego. Draw range does not drag the lens back.
+    assert abs(span_cam.eye[0]) < 1e-6
     assert abs(span_cam.eye[1] - (-16.5)) < 1e-6
     assert abs(span_cam.eye[2] - 5.4) < 1e-6
 

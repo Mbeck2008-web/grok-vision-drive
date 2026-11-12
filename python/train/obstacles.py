@@ -2,7 +2,10 @@
 
 Runtime and the visualizer do not import this module. Inside the drivable
 corridor a cell is blocked when its world Z is more than ``clear_eps_m``
-(0.15 m) above the interpolated ``RoadPoly.z``. A point within
+(0.15 m) above the road surface. The surface is centerline ``RoadPoly.z``
+plus a lateral slope: ``RoadPoly.cross_slope`` when the road has one,
+otherwise a plane fit through in-corridor points already within
+``clear_eps_m`` of the centerline. A point within
 ``edge_band_m`` (0.5 m) outside that edge is blocked at ``curb_eps_m``
 (0.08 m). Those three numbers are written on every ``obstacles.jsonl`` row.
 The difference is in the world frame. Ego z, ego pitch, and a missing height
@@ -317,6 +320,53 @@ def corridor_center_half(
     return center, np.full(y.shape, half)
 
 
+def _cross_slope(road: Any) -> float | None:
+    """Metres of rise per metre of ego-right lateral offset, or None.
+
+    ``RoadPoly`` has no cross-slope field. A recording that measured one may
+    set ``cross_slope`` on the road object. Positive raises the ego-right side.
+    """
+    if road is None:
+        return None
+    return _finite(getattr(road, "cross_slope", None))
+
+
+def _lateral_rise(
+    lateral: np.ndarray,
+    rough: np.ndarray,
+    inside: np.ndarray,
+    valid: np.ndarray,
+    road: Any,
+) -> np.ndarray:
+    """Height of the road surface above centerline Z, in metres.
+
+    ``cross_slope`` wins when the road has one. Otherwise each side is a
+    plane through the centerline, fit to in-corridor points already within
+    ``CLEAR_EPS_M`` of that centerline (a crown is two slopes, a bank is one).
+    """
+    side = np.asarray(lateral, dtype=np.float64)
+    height = np.asarray(rough, dtype=np.float64)
+    slope = _cross_slope(road)
+    if slope is not None:
+        return float(slope) * side
+    rise = np.zeros(side.shape, dtype=np.float64)
+    finite = np.asarray(valid, dtype=bool) & np.isfinite(height) & np.isfinite(side)
+    seed = finite & np.asarray(inside, dtype=bool) & (np.abs(height) <= CLEAR_EPS_M)
+    for sign in (1.0, -1.0):
+        sel = seed & (side * sign >= 0.25)
+        if int(sel.sum()) < 3:
+            continue
+        samples = side[sel]
+        if float(np.max(np.abs(samples))) < 1.0:
+            continue
+        denom = float(np.dot(samples, samples))
+        if denom < 1e-6:
+            continue
+        gain = float(np.dot(samples, height[sel]) / denom)
+        rise = np.where(side * sign >= 0.0, gain * side, rise)
+    return rise
+
+
 def _class_names(sem_classes: Mapping[str, Any] | None) -> dict[int, str]:
     if not isinstance(sem_classes, Mapping):
         return {}
@@ -509,10 +559,11 @@ def label_obstacle_frame(
         if road_z is None or corridor is None:
             return record
         center, half = corridor
-        lateral = np.abs(ego_x - center)
-        inside = lateral <= (half + 1e-6)
-        in_band = (lateral > (half + 1e-6)) & (lateral <= (half + EDGE_BAND_M + 1e-6))
-        height = world_z - road_z
+        lateral = ego_x - center
+        inside = np.abs(lateral) <= (half + 1e-6)
+        in_band = (np.abs(lateral) > (half + 1e-6)) & (np.abs(lateral) <= (half + EDGE_BAND_M + 1e-6))
+        rough = world_z - road_z
+        height = rough - _lateral_rise(lateral, rough, inside, valid & np.isfinite(rough), road)
         known = valid & inside & np.isfinite(height)
         classes = np.zeros(depth.shape, np.uint8)
         classes[known & (height > CLEAR_EPS_M)] = BLOCKED

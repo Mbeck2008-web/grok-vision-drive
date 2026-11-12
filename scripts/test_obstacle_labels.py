@@ -517,6 +517,100 @@ def check_writer_and_missing_sidecar() -> None:
     print("  writer stores obstacles.jsonl and a missing sidecar stays masked")
 
 
+def _visible(x: float, y: float, z: float) -> bool:
+    from python.train.obstacles import view_depth_m
+
+    hit = view_depth_m(POSE, x, y, z, POSE.width, POSE.height)
+    if hit is None:
+        return False
+    u, v, _metres = hit
+    return 0.0 <= u < POSE.width and 0.0 <= v < POSE.height
+
+
+def _surface_points(xs, ys, z_at) -> list[tuple[float, float, float]]:
+    points = []
+    for y in ys:
+        for x in xs:
+            z = float(z_at(float(x)))
+            if _visible(float(x), float(y), z):
+                points.append((float(x), float(y), z))
+    return points
+
+
+def _geom_road(points, road_width: float, *, cross_slope: float | None = None):
+    right, forward, up = _flat_axes()
+    depth = _blank(POSE.height, POSE.width)
+    for point in points:
+        _splat(depth, point)
+    road = _road(lambda _y: 0.0, width=road_width)
+    if cross_slope is not None:
+        road.cross_slope = float(cross_slope)
+    return _label(
+        depth,
+        lane=(None, None),
+        road=road,
+        pos=(0.0, 0.0, 0.0),
+        forward=forward,
+        up=up,
+        road_width_m=float(road_width),
+        road_offset_m=0.0,
+        road_heading_err_rad=0.0,
+    )
+
+
+def check_crown_and_bank_not_blocked() -> None:
+    """A lateral slope is the road, including corridors wider than 5 m.
+
+    Centerline Z marks the high side blocked. The surface is the cross-slope
+    when RoadPoly has one, otherwise a plane fit from the low side of the crown.
+    """
+    from python.train.obstacles import BLOCKED, DRIVABLE
+
+    def assert_surface(points, road_width: float, *, cross_slope: float | None = None) -> None:
+        got = _geom_road(points, road_width, cross_slope=cross_slope)
+        _assert_row_fields(got)
+        mask = np.asarray(got["mask"], dtype=np.int64)
+        assert int((mask == BLOCKED).sum()) == 0, int((mask == BLOCKED).sum())
+        for x, y, _z in points:
+            kind = _at(got, x, y)[0]
+            assert kind == DRIVABLE, (x, y, kind, cross_slope)
+
+    bank_w = 8.0
+    bank = _surface_points(
+        [i * 0.5 for i in range(-8, 9)],
+        (12.0, 16.0),
+        lambda x: 0.06 * x,
+    )
+    assert len(bank) >= 8 and max(abs(p[0]) for p in bank) > 2.5
+    assert_surface(bank, bank_w)
+
+    crown_w = 16.0
+    crown = _surface_points(
+        [i * 0.5 for i in range(-16, 17)],
+        (16.0, 20.0, 24.0),
+        lambda x: -0.02 * abs(x),
+    )
+    assert len(crown) >= 8 and max(abs(p[0]) for p in crown) > 2.5
+    assert_surface(crown, crown_w)
+
+    # 2% cross-slope across a corridor wider than 5 m. The high side is
+    # above 0.15 m of centerline Z and still the road.
+    slope_w = 20.0
+    slope = _surface_points(
+        [i * 0.5 for i in range(0, 19)],
+        (16.0, 20.0, 24.0, 28.0),
+        lambda x: 0.02 * x,
+    )
+    assert len(slope) >= 8 and max(p[0] for p in slope) > 7.5
+    assert_surface(slope, slope_w)
+
+    # No in-corridor seeds: the attribute is the only slope.
+    edge = _surface_points((3.5, 4.0), (12.0, 16.0), lambda x: 0.06 * x)
+    assert edge, edge
+    assert_surface(edge, bank_w, cross_slope=0.06)
+    print("  2% crown and 6% bank: 0 in-corridor blocks on a wide corridor")
+
+
 def check_edge_band_and_row_fields() -> None:
     """0.10 m just outside the edge is blocked. 0.05 m there is not.
 
@@ -715,6 +809,7 @@ def main() -> None:
     check_epsilon_is_world_clearance()
     check_corridor_matches_paint_then_pack_road_edge()
     check_edge_band_and_row_fields()
+    check_crown_and_bank_not_blocked()
     check_wall_pole_empty_and_missing_depth()
     check_missing_geometry_stays_unknown()
     check_clearance_masked_without_near_centers()

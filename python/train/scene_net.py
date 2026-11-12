@@ -1522,10 +1522,13 @@ def _scene_loss_body(
             if goal.dim() == 2:
                 goal = goal.unsqueeze(0)
             if tuple(logits.shape[-2:]) == tuple(goal.shape[-2:]):
-                on = (goal == 1) | (goal == 2)
-                if bool(on.any()):
-                    picked = logits.permute(0, 2, 3, 1).reshape(-1, int(logits.shape[1]))[on.reshape(-1)]
-                    obstacle_term = functional.cross_entropy(picked, goal.reshape(-1)[on.reshape(-1)])
+                # Unknown (class 0) is replaced, not multiplied. where drops its grad.
+                known = (goal == 1) | (goal == 2)
+                flat_logits = logits.permute(0, 2, 3, 1).reshape(-1, int(logits.shape[1]))
+                flat_goal = goal.reshape(-1)
+                per = functional.cross_entropy(flat_logits, flat_goal, reduction="none")
+                masked = torch.where(known.reshape(-1), per, torch.zeros_like(per))
+                obstacle_term = masked.sum() / known.reshape(-1).to(dtype=per.dtype).sum().clamp(min=1.0)
         from python.train.obstacles import CLEARANCE_LOSS_WEIGHT, PROP_CHECK_PASSED
 
         clear_weight = float(CLEARANCE_LOSS_WEIGHT) if PROP_CHECK_PASSED else 0.0

@@ -6,8 +6,9 @@ surface is past ``clear_eps_m`` (0.15 m). The slope is
 ``(edge_z - z_center) / signed half-width`` from ``RoadPoly`` ``left_z`` /
 ``right_z``. When that side has no edge height, a RANSAC fit of paved
 in-corridor points supplies it. If neither exists the point stays unknown.
-``depth_range_pad_m`` is the only range pad; it stays 0 until spec #217
-defines ``pad(r)``. A point within ``edge_band_m`` (0.5 m) outside the
+``depth_range_pad_m`` is an interim 0.10 m until labels_v4 pad(r) is GREEN.
+Blocked is above threshold + pad. Drivable is inside +/-(threshold - pad).
+The band between them is unknown. A point within ``edge_band_m`` (0.5 m) outside the
 corridor is blocked at ``curb_eps_m`` (0.08 m). Those three numbers are
 written on every ``obstacles.jsonl`` row. The difference is in the world
 frame. Ego z, ego pitch, and a missing height are not a road surface.
@@ -457,13 +458,33 @@ def _edge_slopes(
     return left, right
 
 
-def depth_range_pad_m(depth_m: np.ndarray) -> np.ndarray:
-    """Metres added to a height threshold for depth quantization.
+# Interim until labels_v4 pad(r) is GREEN. Above the measured ~0.084 m error.
+INTERIM_DEPTH_RANGE_PAD_M = 0.10
 
-    Spec #217 has not defined ``pad(r)``. This stays 0 so a follow-up is this
-    return. A blocked curb needs ``pad <= 0.02`` m; do not invent a range curve here.
+
+def depth_range_pad_m(depth_m: np.ndarray) -> np.ndarray:
+    """Interim constant until labels_v4 pad(r) is GREEN.
+
+    0.10 m at every range, above the measured ~0.084 m depth-height error.
+    Replace this body when pad(r) is approved.
     """
-    return np.zeros(np.shape(depth_m), dtype=np.float64)
+    return np.full(np.shape(depth_m), INTERIM_DEPTH_RANGE_PAD_M, dtype=np.float64)
+
+
+def apply_height_band(height: np.ndarray, threshold: float, pad: np.ndarray) -> np.ndarray:
+    """BLOCKED above ``threshold + pad``, DRIVABLE inside ``+/-(threshold - pad)``.
+
+    Everything else is UNKNOWN (0). When ``threshold - pad <= 0``, nothing is drivable.
+    """
+    values = np.asarray(height, dtype=np.float64)
+    slack = np.asarray(pad, dtype=np.float64)
+    out = np.zeros(values.shape, np.uint8)
+    finite = np.isfinite(values)
+    hi = float(threshold) + slack
+    lo = float(threshold) - slack
+    out[finite & (values > hi)] = BLOCKED
+    out[finite & (lo > 0) & (values <= lo) & (values >= -lo)] = DRIVABLE
+    return out
 
 
 def _class_names(sem_classes: Mapping[str, Any] | None) -> dict[int, str]:
@@ -678,14 +699,11 @@ def label_obstacle_frame(
         have = valid & np.isfinite(rough) & np.isfinite(slope)
         height = np.where(have, rough - slope * lateral, np.nan)
         pad = depth_range_pad_m(np.asarray(depth, dtype=np.float64) / 100.0)
-        clear_tol = CLEAR_EPS_M + pad
-        curb_tol = CURB_EPS_M + pad
         classes = np.zeros(depth.shape, np.uint8)
         corridor_pts = have & inside
-        classes[corridor_pts & (height > clear_tol)] = BLOCKED
-        classes[corridor_pts & (height <= clear_tol) & (height >= -clear_tol)] = DRIVABLE
+        classes[corridor_pts] = apply_height_band(height, CLEAR_EPS_M, pad)[corridor_pts]
         band = have & in_band
-        classes[band & (height >= curb_tol)] = BLOCKED
+        classes[band] = apply_height_band(height, CURB_EPS_M, pad)[band]
         blocked = classes == BLOCKED
     grid = _bin(ego_x, ego_y, classes, valid)
     clear_m, clear_ok = _clearance(ego_x, ego_y, blocked, lane_gt, lane_gt_valid)

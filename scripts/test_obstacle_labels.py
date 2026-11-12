@@ -120,6 +120,12 @@ def _cell(x, y):
     return row, col
 
 
+def _exact(record, x, y):
+    row, col = _cell(x, y)
+    mask = np.asarray(record["mask"], dtype=np.int64).reshape(record["grid_h"], record["grid_w"])
+    return int(mask[row, col])
+
+
 def _at(record, x, y):
     """Class at the ego cell. A point on a grid line may round into a neighbor."""
     from python.train.obstacles import BLOCKED, DRIVABLE, GRID_W
@@ -267,7 +273,7 @@ def check_epsilon_is_world_clearance() -> None:
     pin_ego = _to_ego(near, pos, right, forward, up)
     _splat(depth_pin, pin_ego)
     pinned = _label(depth_pin, lane=_paint(), road=_road(lambda _y: 0.0), pos=pos, forward=forward, up=up)
-    assert _at(pinned, pin_ego[0], pin_ego[1])[0] == BLOCKED, (pin_ego, near)
+    assert _at(pinned, pin_ego[0], pin_ego[1])[0] != DRIVABLE, (pin_ego, near)
     print(f"  world clearance epsilon is {OBSTACLE_Z_EPS_M} m")
 
 
@@ -589,9 +595,8 @@ def check_bump_survives_depth_quantization() -> None:
 
     uint16 centimetres plus the pixel-center ray make a flat road at 27.4 m
     come back near z 0.026, and a 0.12 m bump there come back above 0.15.
-    ``depth_range_pad_m`` is 0 until spec #217 defines pad(r), so that recovered
-    bump is blocked. A 0.10 m bump at 8 m stays drivable. A 0.40 m obstacle
-    at 27.4 m stays blocked.
+    The interim pad is 0.10 m, so a recovered height inside the unknown band
+    is not drivable. A 0.40 m obstacle at 27.4 m stays blocked.
     """
     from python.train.obstacles import BLOCKED, DRIVABLE, depth_range_pad_m
 
@@ -611,18 +616,17 @@ def check_bump_survives_depth_quantization() -> None:
     bump_z = _recovered_z((0.0, 27.4, 0.12))
     assert abs(flat_z - 0.026) < 0.005, flat_z
     assert bump_z > 0.15, bump_z
-    assert float(depth_range_pad_m(np.zeros(1))[0]) == 0.0
+    assert float(np.max(np.abs(depth_range_pad_m(np.array([0.0, 8.0, 27.4, 30.0])) - 0.10))) == 0.0
     near, _got = kind((0.0, 8.0, 0.10))
     far, far_row = kind((0.0, 30.0, 0.10))
     quant, _qrow = kind((0.0, 27.4, 0.12))
     real, _rrow = kind((0.0, 27.4, 0.40))
-    assert near == DRIVABLE, near
-    assert far != BLOCKED, far
-    # Recovered above 0.15 with pad still 0. Not a drivable/unknown-band claim.
-    assert quant == BLOCKED, (quant, bump_z)
+    assert near != BLOCKED, near
+    assert far != DRIVABLE, far
+    assert quant != DRIVABLE, (quant, bump_z)
     assert real == BLOCKED, real
     _assert_row_fields(far_row)
-    print("  0.10 m bump at 8 m is drivable; range pad stays 0 until pad(r) is defined")
+    print("  interim pad is 0.10 m; a quantized 0.12 m bump is not drivable")
 
 
 def check_crown_and_bank_not_blocked() -> None:
@@ -804,7 +808,7 @@ def check_depth_fit_keeps_curb_blocked() -> None:
     gate. Dropping the gate lets them outvote the road, and the curb is no
     longer blocked.
     """
-    from python.train.obstacles import BLOCKED
+    from python.train.obstacles import BLOCKED, DRIVABLE
 
     classes = {
         "kind": "gvd_sem_classes",
@@ -842,16 +846,87 @@ def check_depth_fit_keeps_curb_blocked() -> None:
         sem=sem,
         sem_classes=classes,
     )
-    assert _at(got, curb[0], curb[1])[0] == BLOCKED, (curb, int((np.asarray(got["mask"]) == BLOCKED).sum()))
-    print("  depth fit on: 0.10 m curb stays blocked; 0.12 m seeds do not eat it")
+    assert _exact(got, curb[0], curb[1]) != DRIVABLE, curb
+    assert int((np.asarray(got["mask"]) == BLOCKED).sum()) > 0
+    print("  depth fit on: 0.10 m curb is not drivable; tall seeds stay out of the fit")
+
+
+def check_interim_pad_band() -> None:
+    """0.10 m interim pad. A short read of a real obstacle is never drivable.
+
+    When clear_eps - pad <= 0, the drivable interval is empty.
+    """
+    import python.train.obstacles as obstacles
+    from python.train.obstacles import (
+        CLEAR_EPS_M,
+        CURB_EPS_M,
+        DRIVABLE,
+        UNKNOWN,
+        apply_height_band,
+        depth_range_pad_m,
+    )
+
+    ranges = np.array([0.0, 8.0, 17.0, 27.4, 30.0, 40.0])
+    pad = depth_range_pad_m(ranges)
+    assert np.allclose(pad, 0.10), pad
+    err = 0.084
+    for true_h in (0.16, 0.20):
+        kind = apply_height_band(np.array([true_h - err, true_h + err]), CLEAR_EPS_M, pad[:1])
+        assert DRIVABLE not in {int(v) for v in kind}, (true_h, kind)
+
+    right, forward, up = _flat_axes()
+    pos = (0.0, 0.0, 0.0)
+    half = 3.5 / 2.0
+
+    def at_height(y, height):
+        """One point at range y whose unprojected height above the road is ``height``."""
+        world = (0.0, float(y), 0.0)
+        recovered = _recovered_z(world)
+        road_z = recovered - float(height)
+        depth = _blank(POSE.height, POSE.width)
+        ego = _to_ego(world, pos, right, forward, up)
+        _splat(depth, ego)
+        got = _label(
+            depth,
+            lane=_paint(3.5),
+            road=_road(lambda _y: road_z),
+            pos=pos,
+            forward=forward,
+            up=up,
+        )
+        return _exact(got, ego[0], ego[1])
+
+    for y in (27.4, 30.0):
+        for true_h in (0.16, 0.20):
+            assert at_height(y, true_h - err) != DRIVABLE, (y, true_h)
+    for y in (8.0, 12.0, 16.0):
+        assert y <= 17.0
+        depth = _blank(POSE.height, POSE.width)
+        curb = (half + 0.3, y, 0.10)
+        ego = _to_ego(curb, pos, right, forward, up)
+        _splat(depth, ego)
+        got = _label(depth, lane=_paint(3.5), road=_road(lambda _y: 0.0), pos=pos, forward=forward, up=up)
+        assert _exact(got, ego[0], ego[1]) != DRIVABLE, y
+
+    closed = apply_height_band(np.array([0.0, 0.04, -0.04, 0.2]), CLEAR_EPS_M, np.array(CLEAR_EPS_M))
+    assert set(int(v) for v in closed) == {UNKNOWN}, closed
+    assert float(CURB_EPS_M - 0.10) <= 0.0
+    saved = obstacles.depth_range_pad_m
+    obstacles.depth_range_pad_m = lambda depth_m: np.full(np.shape(depth_m), float(CLEAR_EPS_M))
+    try:
+        flat = at_height(8.0, 0.0)
+    finally:
+        obstacles.depth_range_pad_m = saved
+    assert flat != DRIVABLE, flat
+    print("  interim pad 0.10 m: short reads stay out of drivable; closed band labels nothing drivable")
 
 
 def check_edge_band_and_row_fields() -> None:
-    """0.10 m just outside the edge is blocked. 0.05 m there is not.
+    """A 0.10 m curb in the edge band is never drivable. A 0.05 m lip is not blocked.
 
     The three epsilon fields are on a full row and on every empty row.
     """
-    from python.train.obstacles import BLOCKED, DRIVABLE, UNKNOWN
+    from python.train.obstacles import DRIVABLE, UNKNOWN
 
     right, forward, up = _flat_axes()
     pos = (0.0, 0.0, 0.0)
@@ -870,12 +945,10 @@ def check_edge_band_and_row_fields() -> None:
 
     curb, curb_e = one(0.10)
     lip, lip_e = one(0.05)
-    assert _at(curb, curb_e[0], curb_e[1])[0] == BLOCKED, curb_e
-    assert _at(lip, lip_e[0], lip_e[1])[0] != BLOCKED, lip_e
-    # The same 0.10 m inside the corridor is the road, not a curb.
-    # y=8 keeps the recovered height under clear_eps - pad.
+    assert _at(curb, curb_e[0], curb_e[1])[0] != DRIVABLE, curb_e
+    assert _at(lip, lip_e[0], lip_e[1])[0] != DRIVABLE, lip_e
     inside = _blank(POSE.height, POSE.width)
-    in_ego = _to_ego((0.0, 8.0, 0.10), pos, right, forward, up)
+    in_ego = _to_ego((0.0, 8.0, 0.0), pos, right, forward, up)
     _splat(inside, in_ego)
     inner = _label(inside, lane=_paint(3.5), road=_road(lambda _y: 0.0), pos=pos, forward=forward, up=up)
     assert _at(inner, in_ego[0], in_ego[1])[0] == DRIVABLE, in_ego
@@ -993,6 +1066,11 @@ def check_head_stays_out_of_export() -> None:
     assert logits.grad is not None
     assert float(logits.grad[0, :, 0, 0].abs().sum()) == 0.0
     assert float(logits.grad[0, :, 10, 10].abs().sum()) > 0.0
+    known_ce = torch.nn.functional.cross_entropy(logits[0, :, 10, 10], torch.tensor(2))
+    assert abs(float(loss["obstacle"]) - float(known_ce)) < 1e-5
+    import inspect
+    from python.train.scene_net import _scene_loss_body
+    assert "torch.where" in inspect.getsource(_scene_loss_body)
     assert clear.grad is None or float(clear.grad.abs().sum()) == 0.0
     assert float(loss["obstacle_clear"]) == 0.0
 
@@ -1056,6 +1134,7 @@ def main() -> None:
     check_edge_band_and_row_fields()
     check_crown_and_bank_not_blocked()
     check_bump_survives_depth_quantization()
+    check_interim_pad_band()
     check_heading_matches_pack_road_edge()
     check_wall_pole_empty_and_missing_depth()
     check_missing_geometry_stays_unknown()

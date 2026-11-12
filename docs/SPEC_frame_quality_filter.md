@@ -201,5 +201,10 @@ is node order, reversed when `flipDirection` is set. The car is placed in the
 rightmost lane on a one-way road, and in a right-hand lane at least 0.75 m
 off the centerline on a two-way road. A `wrong_way` verdict or a
 `twoway_centerline` reason is not spawned: the deck tries a bounded set of
-lanes and stations, then skips that road and logs the rejection. Classifier
-verdicts themselves are unchanged.
+lanes and stations, then skips that road. The skip line keeps `verdict=` and
+`reason=` as separate fields and adds `road_mismatch=<id>` when the classifier
+snapped to a different road. `autoLanes`, and a lane tag that underfills the
+decal, take the lane count from the road width. A pose whose car body
+(0.9 m) would cross the local edge is not used. A level with
+`roadRules.rightHandDrive` true is left-hand traffic and is skipped.
+Classifier verdicts themselves are unchanged.

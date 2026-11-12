@@ -127,6 +127,9 @@ TRAFFIC_MIN_M = 8.0
 LEGAL_FRACTIONS = (0.40, 0.30, 0.50, 0.22, 0.62)
 LEGAL_ATTEMPTS = 8
 LANE_W_M = 3.5
+# Half the etk800 body. A pose whose center is closer than this to the decal
+# edge hangs the car off the road.
+VEHICLE_HALF_M = 0.9
 # Stay this far inside the painted edge so the pose is still on the road.
 EDGE_MARGIN_M = 0.15
 # Past the 0.75 m centerline deadzone, so a later projection does not fall
@@ -421,31 +424,82 @@ def _pose_at(points: list[tuple[float, float, float]], fraction: float = 0.4) ->
     return (x, y, z), _yaw_quat(right[0] - left[0], right[1] - left[1])
 
 
+def _mix_width(left: float | None, right: float | None, mix: float) -> float | None:
+    if left is None and right is None:
+        return None
+    if left is None:
+        return float(right)  # type: ignore[arg-type]
+    if right is None:
+        return float(left)
+    return float(left) + (float(right) - float(left)) * mix
+
+
 def _sample_center(
-    points: list[tuple[float, float, float]], fraction: float
-) -> tuple[tuple[float, float, float], tuple[float, float]] | None:
-    """``(center xyz, node-order tangent)`` at ``fraction`` along ``points``."""
-    segs: list[tuple[tuple[float, float, float], tuple[float, float, float], float]] = []
+    points: list[tuple[float, float, float]],
+    fraction: float,
+    widths: list[float | None] | None = None,
+) -> tuple[tuple[float, float, float], tuple[float, float], float | None] | None:
+    """``(center xyz, node-order tangent, local width)`` at ``fraction`` along ``points``."""
+    paired: list[float | None]
+    if widths is not None and len(widths) == len(points):
+        paired = list(widths)
+    else:
+        paired = [None] * len(points)
+    segs: list[tuple[tuple[float, float, float], tuple[float, float, float], float, float | None, float | None]] = []
     length = 0.0
-    for left, right in zip(points, points[1:]):
+    for (left, left_w), (right, right_w) in zip(zip(points, paired), zip(points[1:], paired[1:])):
         step = math.hypot(right[0] - left[0], right[1] - left[1])
         if step < 1e-3:
             continue
-        segs.append((left, right, step))
+        segs.append((left, right, step, left_w, right_w))
         length += step
     if not segs or length < 1.0:
         return None
     target = min(length * float(fraction), max(0.0, length - 1.0))
     walked = 0.0
-    left, right, step = segs[-1]
-    for left, right, step in segs:
+    left, right, step, left_w, right_w = segs[-1]
+    for left, right, step, left_w, right_w in segs:
         if walked + step >= target:
             break
         walked += step
     mix = 0.0 if step < 1e-6 else min(1.0, max(0.0, (target - walked) / step))
     center = tuple(left[k] + (right[k] - left[k]) * mix for k in range(3))
     norm = step or 1.0
-    return center, ((right[0] - left[0]) / norm, (right[1] - left[1]) / norm)
+    return center, ((right[0] - left[0]) / norm, (right[1] - left[1]) / norm), _mix_width(left_w, right_w, mix)
+
+
+def _centers_and_widths(road: Mapping[str, Any]) -> tuple[list[tuple[float, float, float]], list[float | None]]:
+    """Centerline points and the left/right span at each point. Missing edges are None."""
+    points: list[tuple[float, float, float]] = []
+    widths: list[float | None] = []
+    for edge in road.get("edges") or []:
+        if not isinstance(edge, dict):
+            continue
+        middle = edge.get("middle")
+        if not (isinstance(middle, (list, tuple)) and len(middle) >= 3):
+            continue
+        points.append((float(middle[0]), float(middle[1]), float(middle[2])))
+        left, right = edge.get("left"), edge.get("right")
+        span: float | None = None
+        if (
+            isinstance(left, (list, tuple))
+            and isinstance(right, (list, tuple))
+            and len(left) >= 2
+            and len(right) >= 2
+        ):
+            got = math.hypot(float(right[0]) - float(left[0]), float(right[1]) - float(left[1]))
+            if got >= 0.5:
+                span = got
+        widths.append(span)
+    return points, widths
+
+
+def _median_width(widths: list[float | None]) -> float | None:
+    spans = [float(item) for item in widths if item is not None and float(item) >= 0.5]
+    if not spans:
+        return None
+    spans.sort()
+    return spans[len(spans) // 2]
 
 
 def _width_of_edges(edges: Any) -> float | None:
@@ -495,21 +549,77 @@ def _effective_oneway(road: dict[str, Any]) -> bool:
     return left == 0 and right >= 1
 
 
-def _lane_count(road: dict[str, Any], width: float) -> int:
-    counts = _explicit_lanes(road)
-    if counts is not None and sum(counts) >= 1:
-        return sum(counts)
-    named = int(_num(road.get("lanes")))
-    if named >= 1:
-        return named
+def _derived_lanes(width: float) -> int:
     return max(1, min(8, int(round(float(width) / LANE_W_M))))
 
 
-def _offset_candidates(road: dict[str, Any]) -> list[float]:
-    """Metres to the right of the legal tangent, rightmost lane first."""
+def _auto_lanes(road: dict[str, Any]) -> bool:
+    """BeamNG ignores ``lanesLeft`` / ``lanesRight`` when ``autoLanes`` is set."""
+    if "auto_lanes" in road:
+        return bool(road["auto_lanes"])
+    return _flag(road.get("autoLanes"))
+
+
+def _tagged_lanes(road: dict[str, Any]) -> int:
+    counts = _explicit_lanes(road)
+    if counts is not None and sum(counts) >= 1:
+        return sum(counts)
+    return int(_num(road.get("lanes")))
+
+
+def _lane_count(road: dict[str, Any], width: float) -> int:
+    """Lane count used for the right-hand offset.
+
+    ``autoLanes`` drops the tags. A tag that underfills the decal (fewer lanes
+    than the width holds at ``LANE_W_M``) is replaced by that width count too.
+    Highway/ramp classification keeps the stored tag on ``road["lanes"]``.
+    """
+    derived = _derived_lanes(width)
+    tagged = _tagged_lanes(road)
+    if _auto_lanes(road) or tagged < 1 or tagged < derived:
+        return derived
+    return tagged
+
+
+def body_inside(offset_m: float, local_width: float | None) -> bool:
+    """False when the car body (``VEHICLE_HALF_M``) crosses the local decal edge."""
+    if local_width is None:
+        return True
+    try:
+        half = float(local_width) * 0.5
+    except (TypeError, ValueError):
+        return True
+    if not math.isfinite(half) or half <= 0.0:
+        return True
+    return abs(float(offset_m)) + VEHICLE_HALF_M <= half + 1e-6
+
+
+def _station_width(local: float | None, road: dict[str, Any]) -> float | None:
+    if local is not None:
+        try:
+            value = float(local)
+        except (TypeError, ValueError):
+            value = None
+        else:
+            if math.isfinite(value) and value > 0.0:
+                return value
+    fallback = road.get("width")
+    try:
+        value = float(fallback)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value > 0.0 else None
+
+
+def _offset_candidates(road: dict[str, Any], width: float | None = None) -> list[float]:
+    """Metres to the right of the legal tangent, rightmost lane first.
+
+    ``width`` is the decal width at the station. Lane tags that underfill that
+    width, and ``autoLanes``, are counted from it.
+    """
     from python.train.frame_quality import CENTER_DEADZONE_M
 
-    width = float(road["width"])
+    width = float(road["width"] if width is None else width)
     count = _lane_count(road, width)
     lane_w = width / count
     centers = [-width / 2.0 + (index + 0.5) * lane_w for index in range(count)]
@@ -565,11 +675,43 @@ def format_spawn_line(
     align: Any,
     offset_m: Any,
     verdict: str,
+    reason: str = "",
+    road_mismatch: str = "",
 ) -> str:
-    """One spawn line: road, kind, flipDirection, align, offset_m, verdict."""
-    return (
+    """One spawn line. ``verdict`` and ``reason`` stay separate fields.
+
+    ``road_mismatch`` is the classifier's road id when it is not ``road_id``.
+    """
+    line = (
         f"{prefix} road={road_id} kind={kind} flipDirection={1 if flip else 0} "
-        f"align={_fmt_num(align, '.3f')} offset_m={_fmt_num(offset_m, '.2f')} verdict={verdict}"
+        f"align={_fmt_num(align, '.3f')} offset_m={_fmt_num(offset_m, '.2f')} "
+        f"verdict={verdict or 'na'} reason={reason or 'na'}"
+    )
+    if road_mismatch:
+        line += f" road_mismatch={road_mismatch}"
+    return line
+
+
+def reject_spawn_line(kind: str, road_id: str, flip: bool, last: Mapping[str, Any] | None) -> str:
+    """Skip line: ``verdict=`` and ``reason=`` are separate, plus a road mismatch."""
+    logged = str(road_id)
+    verdict = "rejected"
+    reason = "no_candidate"
+    mismatch = ""
+    align = offset = None
+    if last:
+        if last.get("attempted_id"):
+            logged = str(last["attempted_id"])
+        verdict = str(last.get("verdict") or "rejected")
+        reason = str(last.get("reason") or "na")
+        align = last.get("align")
+        offset = last.get("offset_m")
+        got = str(last.get("road_id") or "")
+        if got and got != logged:
+            mismatch = got
+    return (
+        format_spawn_line("spawn reject", kind, logged, bool(flip), align, offset, verdict, reason, mismatch)
+        + " (skipped)"
     )
 
 
@@ -619,7 +761,7 @@ def seek_legal_pose(
     grid: dict[Any, Any] | None,
     *,
     fractions: tuple[float, ...] = LEGAL_FRACTIONS,
-    attempts: int = LEGAL_ATTEMPTS,
+    attempts: int | None = None,
     z_lift: float = 0.5,
     classify_z: bool = True,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
@@ -630,6 +772,8 @@ def seek_legal_pose(
     """
     from python.train.frame_quality import classify_wrong_way
 
+    if attempts is None:
+        attempts = LEGAL_ATTEMPTS
     points = road.get("pts") or []
     if not road.get("width"):
         pose = _pose_at(points)
@@ -647,17 +791,25 @@ def seek_legal_pose(
             "legacy": True,
         }, None
     flip = bool(road.get("flip"))
-    offsets = _offset_candidates(road)
-    if not offsets or not quality:
-        return None, None
+    road_id = str(road.get("id"))
+    if not quality:
+        return None, {"verdict": "rejected", "reason": "no_roads", "road_id": road_id}
+    if road.get("width") is None:
+        return None, {"verdict": "rejected", "reason": "no_candidate", "road_id": road_id}
     last: dict[str, Any] | None = None
     tried = 0
+    past_edge = False
     for fraction in fractions:
-        sampled = _sample_center(points, fraction)
+        sampled = _sample_center(points, fraction, road.get("widths"))
         if sampled is None:
             continue
-        center, tangent = sampled
+        center, tangent, local = sampled
+        station = _station_width(local, road)
+        offsets = _offset_candidates(road, station)
         for offset in offsets:
+            if not body_inside(offset, station):
+                past_edge = True
+                continue
             if tried >= int(attempts):
                 return None, last
             tried += 1
@@ -666,8 +818,10 @@ def seek_legal_pose(
             got = classify_wrong_way(
                 pos[0], pos[1], yaw, quality, grid, z=pos[2] if classify_z else None
             )
-            last = got
-            if _pose_accepted(got, str(road.get("id"))):
+            last = dict(got)
+            last["attempted_id"] = road_id
+            last["flip"] = flip
+            if _pose_accepted(got, road_id):
                 return {
                     "pos": pos,
                     "rot": rot,
@@ -678,15 +832,29 @@ def seek_legal_pose(
                     "reason": str(got.get("reason") or ""),
                     "legacy": False,
                 }, got
+    if last is None:
+        last = {
+            "verdict": "rejected",
+            "reason": "past_edge" if past_edge else "no_candidate",
+            "road_id": road_id,
+        }
     return None, last
 
 
 def _project_station(
-    points: list[tuple[float, float, float]], x: float, y: float
-) -> tuple[float, tuple[float, float, float], tuple[float, float]] | None:
-    """``(distance, center, node tangent)`` of the closest centerline point."""
-    best: tuple[float, tuple[float, float, float], tuple[float, float]] | None = None
-    for left, right in zip(points, points[1:]):
+    points: list[tuple[float, float, float]],
+    x: float,
+    y: float,
+    widths: list[float | None] | None = None,
+) -> tuple[float, tuple[float, float, float], tuple[float, float], float | None] | None:
+    """``(distance, center, node tangent, local width)`` of the closest centerline point."""
+    paired: list[float | None]
+    if widths is not None and len(widths) == len(points):
+        paired = list(widths)
+    else:
+        paired = [None] * len(points)
+    best: tuple[float, tuple[float, float, float], tuple[float, float], float | None] | None = None
+    for (left, left_w), (right, right_w) in zip(zip(points, paired), zip(points[1:], paired[1:])):
         dx, dy = right[0] - left[0], right[1] - left[1]
         length2 = dx * dx + dy * dy
         if length2 < 1e-6:
@@ -697,8 +865,9 @@ def _project_station(
         dist = math.hypot(x - center[0], y - center[1])
         norm = math.sqrt(length2)
         tangent = (dx / norm, dy / norm)
+        local = _mix_width(left_w, right_w, tee)
         if best is None or dist < best[0]:
-            best = (dist, center, tangent)
+            best = (dist, center, tangent, local)
     return best
 
 
@@ -718,12 +887,12 @@ def legal_pose_near(
     del z
     from python.train.frame_quality import build_road_grid, classify_wrong_way
 
-    ranked: list[tuple[float, dict[str, Any], tuple[float, float, float], tuple[float, float]]] = []
+    ranked: list[tuple[float, dict[str, Any], tuple[float, float, float], tuple[float, float], float | None]] = []
     for road in roads:
-        hit = _project_station(road.get("pts") or [], x, y)
+        hit = _project_station(road.get("pts") or [], x, y, road.get("widths"))
         if hit is None or hit[0] > float(max_dist):
             continue
-        ranked.append((hit[0], road, hit[1], hit[2]))
+        ranked.append((hit[0], road, hit[1], hit[2], hit[3]))
     ranked.sort(key=lambda item: item[0])
     if not ranked:
         return None, None
@@ -742,15 +911,20 @@ def legal_pose_near(
             "legacy": True,
             "road_id": str(nearest[1].get("id")),
         }, None
-    quality = [item for item in (_quality_from_road(road) for _d, road, _c, _t in ranked) if item is not None]
+    quality = [item for item in (_quality_from_road(road) for _d, road, _c, _t, _w in ranked) if item is not None]
     grid = build_road_grid(quality) if quality else {}
     last: dict[str, Any] | None = None
     tried = 0
-    for _dist, road, center, tangent in ranked[:4]:
+    past_edge = False
+    for _dist, road, center, tangent, local in ranked[:4]:
         if not road.get("width"):
             continue
         flip = bool(road.get("flip"))
-        for offset in _offset_candidates(road):
+        station = _station_width(local, road)
+        for offset in _offset_candidates(road, station):
+            if not body_inside(offset, station):
+                past_edge = True
+                continue
             if tried >= LEGAL_ATTEMPTS:
                 return None, last
             tried += 1
@@ -758,7 +932,9 @@ def legal_pose_near(
             got = classify_wrong_way(
                 pos[0], pos[1], math.atan2(heading[1], heading[0]), quality, grid, z=pos[2]
             )
-            last = got
+            last = dict(got)
+            last["attempted_id"] = str(road.get("id"))
+            last["flip"] = flip
             if _pose_accepted(got, str(road.get("id"))):
                 return {
                     "pos": pos,
@@ -771,6 +947,12 @@ def legal_pose_near(
                     "legacy": False,
                     "road_id": str(road.get("id")),
                 }, got
+    if last is None:
+        last = {
+            "verdict": "rejected",
+            "reason": "past_edge" if past_edge else "no_candidate",
+            "road_id": str(nearest[1].get("id")),
+        }
     return None, last
 
 
@@ -785,27 +967,29 @@ def view_from_network_road(road_id: str, road: Any) -> dict[str, Any] | None:
             return None
     except (TypeError, ValueError):
         pass
-    points = _middles(road)
+    points, widths = _centers_and_widths(road)
     if len(points) < 2:
         return None
     counts = _explicit_lanes(road)
     lanes = (sum(counts) if counts is not None else 0) or int(_num(road.get("lanes")))
-    width = road.get("width")
-    try:
-        width_f = float(width) if width is not None else None
-    except (TypeError, ValueError):
-        width_f = None
-    if width_f is None or width_f < 0.5:
-        width_f = _width_of_edges(road.get("edges"))
+    width_f = _median_width(widths)
+    if width_f is None:
+        raw_width = road.get("width")
+        try:
+            width_f = float(raw_width) if raw_width is not None else None
+        except (TypeError, ValueError):
+            width_f = None
     return {
         "id": str(road_id),
         "pts": points,
+        "widths": widths,
         "lanes": lanes,
         "lanes_left": counts[0] if counts is not None else 0,
         "lanes_right": counts[1] if counts is not None else 0,
         "length": _num(road.get("debugRoadLength")) or _polyline_m(points),
         "oneway": _flag(road.get("oneWay", road.get("oneway"))),
         "flip": _flag(road.get("flipDirection", road.get("flip"))),
+        "auto_lanes": _flag(road.get("autoLanes", road.get("auto_lanes"))),
         "width": width_f,
     }
 
@@ -886,7 +1070,7 @@ def load_nav_roads(path: Path | str) -> list[dict[str, Any]]:
     for road_id, road in network.items():
         if not isinstance(road, dict):
             continue
-        points = _middles(road)
+        points, widths = _centers_and_widths(road)
         if len(points) < 2:
             continue
         lanes_left = int(_num(road.get("lanesLeft")))
@@ -901,13 +1085,15 @@ def load_nav_roads(path: Path | str) -> list[dict[str, Any]]:
             {
                 "id": str(road_id),
                 "pts": points,
+                "widths": widths,
                 "lanes": lanes,
                 "lanes_left": lanes_left,
                 "lanes_right": lanes_right,
                 "length": length,
                 "oneway": oneway,
                 "flip": _flag(road.get("flipDirection")),
-                "width": _width_of_edges(road.get("edges")),
+                "auto_lanes": _flag(road.get("autoLanes")),
+                "width": _median_width(widths),
             }
         )
     return roads
@@ -1089,20 +1275,7 @@ class SpawnDeck:
             return found
         if not road.get("width") and not quality:
             return None
-        reason = ""
-        align = offset = None
-        verdict = "rejected"
-        if last:
-            reason = str(last.get("reason") or "")
-            verdict = reason or str(last.get("verdict") or "rejected")
-            align = last.get("align")
-            offset = last.get("offset_m")
-        self._say(
-            format_spawn_line(
-                "spawn reject", kind, str(road.get("id")), bool(road.get("flip")), align, offset, verdict
-            )
-            + " (skipped)"
-        )
+        self._say(reject_spawn_line(kind, str(road.get("id")), bool(road.get("flip")), last))
         return None
 
     def filtering(self) -> bool:
@@ -1141,6 +1314,7 @@ class SpawnDeck:
                     info.get("align"),
                     info.get("offset_m"),
                     str(info.get("verdict") or "ok"),
+                    str(info.get("reason") or ""),
                 )
             )
         return SpawnPick(

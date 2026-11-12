@@ -27,6 +27,28 @@ from python.train.frame_quality import (  # noqa: E402
 FIXTURE = ROOT / "tests" / "fixtures" / "roads" / "west_coast_usa.json.gz"
 
 
+def _local_half(edges: list, x: float, y: float) -> float:
+    """Half the decal width at the closest centerline point."""
+    best: tuple[float, float] | None = None
+    for left, right in zip(edges, edges[1:]):
+        ax, ay = float(left["middle"][0]), float(left["middle"][1])
+        bx, by = float(right["middle"][0]), float(right["middle"][1])
+        dx, dy = bx - ax, by - ay
+        length2 = dx * dx + dy * dy
+        if length2 < 1e-6:
+            continue
+        tee = ((x - ax) * dx + (y - ay) * dy) / length2
+        tee = 0.0 if tee < 0.0 else 1.0 if tee > 1.0 else tee
+        dist = math.hypot(x - (ax + dx * tee), y - (ay + dy * tee))
+        wa = math.hypot(float(left["right"][0]) - float(left["left"][0]), float(left["right"][1]) - float(left["left"][1]))
+        wb = math.hypot(float(right["right"][0]) - float(right["left"][0]), float(right["right"][1]) - float(right["left"][1]))
+        half = 0.5 * (wa + (wb - wa) * tee)
+        if best is None or dist < best[0]:
+            best = (dist, half)
+    assert best is not None
+    return best[1]
+
+
 def _heading(rot: tuple[float, float, float, float]) -> tuple[float, float]:
     _qx, _qy, qz, qw = rot
     yaw = math.atan2(2.0 * qw * qz, 1.0 - 2.0 * qz * qz)
@@ -289,7 +311,124 @@ def check_fixture_deck_has_no_rejected_poses() -> None:
         assert not spawn_pose_rejected(got), (pick.road_id, got)
     assert n >= 800, n
     assert bad == {"wrong_way": 0, "twoway_centerline": 0}, bad
-    print(f"fixture deck picks={n} wrong_way=0 twoway_centerline=0")
+    import gzip
+    import json
+
+    with gzip.open(FIXTURE, "rt", encoding="utf-8") as handle:
+        network = json.load(handle)["road_network"]
+    hangs = 0
+    wide_kept = 0
+    road_679 = None
+    deck2 = SpawnDeck.load(FIXTURE)
+    seen = 0
+    while True:
+        pick = deck2.take()
+        if pick is None:
+            break
+        seen += 1
+        raw = network[str(pick.road_id)]
+        half = _local_half(raw["edges"], pick.pos[0], pick.pos[1])
+        fx, fy = _heading(pick.rot)
+        row = classify_wrong_way(pick.pos[0], pick.pos[1], math.atan2(fy, fx), roads, grid, z=pick.pos[2])
+        offset = float(row.get("offset_m") or 0.0)
+        if offset + 0.9 > half + 1e-6:
+            hangs += 1
+        lanes = int(float(raw.get("lanesLeft") or 0)) + int(float(raw.get("lanesRight") or 0))
+        if str(raw.get("oneWay") or "0").lower() in {"1", "true"} and lanes == 1 and half >= 5.0 and offset > 1.0:
+            wide_kept += 1
+        if str(pick.road_id) == "892679.0":
+            road_679 = offset
+    assert hangs == 0, hangs
+    assert road_679 is not None and road_679 > 2.0, road_679
+    assert wide_kept >= 1
+    assert seen == n
+    skipped = sum(len(pool) for pool in deck2.pools.values()) - n
+    print(
+        f"fixture deck picks={n} skipped={skipped} wrong_way=0 twoway_centerline=0 "
+        f"hangs={hangs} wide_oneway_right={wide_kept} road_892679_offset={road_679:.2f}"
+    )
+
+
+def check_later_station_is_required() -> None:
+    """The first station is stolen by a parallel road. A later station is free.
+
+    ``LEGAL_ATTEMPTS = 1`` never reaches that station, so this road is skipped.
+    """
+    main = _road("later", [(0.0, 0.0), (200.0, 0.0)], half=4.0, lanes_left=1, lanes_right=1, oneway=False, flip=False)
+    thief = _road("thief", [(70.0, -3.0), (100.0, -3.0)], half=1.5, lanes_left=0, lanes_right=1, oneway=True, flip=False)
+    picks = []
+    deck = _deck([main, thief])
+    for _ in range(4):
+        pick = deck.take()
+        if pick is None:
+            break
+        picks.append(pick.road_id)
+    assert "later" in picks, picks
+
+
+def check_wide_oneway_uses_width_not_tag() -> None:
+    """autoLanes ignores a 1-lane tag. A 15 m one-way is not spawned on the centerline."""
+    road = _road(
+        "wide1", [(0.0, 0.0), (80.0, 0.0)], half=7.5, lanes_left=1, lanes_right=0, oneway=True, flip=False
+    )
+    road["auto_lanes"] = True
+    bare = _road(
+        "under", [(0.0, 40.0), (80.0, 40.0)], half=7.5, lanes_left=1, lanes_right=0, oneway=True, flip=False
+    )
+    bare["auto_lanes"] = False
+    deck = _deck([road, bare])
+    got = {}
+    for _ in range(4):
+        pick = deck.take()
+        if pick is None:
+            break
+        got[pick.road_id] = _classify(pick.road_id == "wide1" and road or bare, pick.pos, pick.rot)
+    assert set(got) == {"wide1", "under"}, got
+    for rid, row in got.items():
+        assert row["verdict"] == "ok", (rid, row)
+        assert row["offset_m"] > 2.0, (rid, row)
+        assert row["offset_m"] + 0.9 <= 7.5 + 1e-6, (rid, row)
+    print(f"wide one-way offsets { {k: round(v['offset_m'], 2) for k, v in got.items()} }")
+
+
+def check_reject_line_names_verdict_reason_and_mismatch() -> None:
+    main = _road("covered", [(0.0, 0.0), (100.0, 0.0)], half=4.0, lanes_left=1, lanes_right=1, oneway=False, flip=False)
+    thief = _road("thief", [(-10.0, -2.6), (120.0, -2.6)], half=2.0, lanes_left=0, lanes_right=1, oneway=True, flip=False)
+    log: list[str] = []
+    deck = _deck([main, thief], log=log.append)
+    ids = []
+    for _ in range(4):
+        pick = deck.take()
+        if pick is None:
+            break
+        ids.append(pick.road_id)
+    assert "covered" not in ids, ids
+    lines = [line for line in log if "covered" in line and line.startswith("spawn reject")]
+    assert lines, log
+    line = lines[0]
+    assert "verdict=" in line and "reason=" in line, line
+    verdict = line.split("verdict=", 1)[1].split()[0]
+    reason = line.split("reason=", 1)[1].split()[0]
+    assert verdict != reason, line
+    assert "road_mismatch=thief" in line, line
+    print(f"reject line {line}")
+
+
+def check_right_hand_drive_map_is_skipped() -> None:
+    from python.collect.level_session import skip_right_hand_drive_maps
+
+    infos = {
+        "west_coast_usa": {"roadRules": {"rightHandDrive": False}},
+        "jungle_rock_island": {"roadRules": {"rightHandDrive": True}},
+        "italy": {},
+        "uk": {"roadRules": {"rightHandDrive": "1"}},
+    }
+    kept, skipped = skip_right_hand_drive_maps(
+        ("west_coast_usa", "jungle_rock_island", "italy", "uk"), infos
+    )
+    assert kept == ["west_coast_usa", "italy"], kept
+    assert skipped == ["jungle_rock_island", "uk"], skipped
+    print(f"rightHandDrive skipped {skipped}")
 
 
 def check_spawn_pose_rejected_helper() -> None:
@@ -313,6 +452,10 @@ def main() -> None:
     check_road_spawn_flip_and_right_lane()
     check_snap_near_west_coast_carriageway()
     check_fixture_deck_has_no_rejected_poses()
+    check_later_station_is_required()
+    check_wide_oneway_uses_width_not_tag()
+    check_reject_line_names_verdict_reason_and_mismatch()
+    check_right_hand_drive_map_is_skipped()
     check_spawn_pose_rejected_helper()
     print("legal spawn ok")
 

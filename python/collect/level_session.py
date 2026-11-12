@@ -200,6 +200,64 @@ def installed_levels(bng: Any) -> tuple[set[str] | None, str]:
     return None, "; ".join(notes) if notes else "no get_levels"
 
 
+def right_hand_drive(info: Any) -> bool:
+    """True when ``roadRules.rightHandDrive`` is set.
+
+    BeamNG uses that flag for left-hand traffic: the driver sits on the right.
+    Spawns here are right-hand traffic, so a true flag means skip the map.
+    """
+    if not isinstance(info, dict):
+        return False
+    rules = info.get("roadRules")
+    if not isinstance(rules, dict):
+        rules = info.get("road_rules")
+    if not isinstance(rules, dict):
+        return False
+    raw = rules.get("rightHandDrive", rules.get("right_hand_drive"))
+    if isinstance(raw, bool):
+        return raw
+    return str(raw or "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def level_info_table(bng: Any) -> dict[str, Any]:
+    """Level name to the ``get_levels`` record, when this session can list levels."""
+    payload = _levels_payload(bng)
+    if not isinstance(payload, dict):
+        return {}
+    nested = payload.get("levels") if "levelName" not in payload else None
+    table = nested if isinstance(nested, dict) else payload
+    if not isinstance(table, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key, info in table.items():
+        token = level_token(str(key))
+        if token:
+            out[token] = info if isinstance(info, dict) else {}
+    return out
+
+
+def skip_right_hand_drive_maps(
+    names: tuple[str, ...] | list[str],
+    infos: Any,
+) -> tuple[list[str], list[str]]:
+    """Drop levels whose ``roadRules.rightHandDrive`` is true. Missing rules stay."""
+    kept: list[str] = []
+    skipped: list[str] = []
+    table = infos if isinstance(infos, dict) else {}
+    for name in names:
+        token = level_token(name)
+        if not token:
+            continue
+        info = table.get(token)
+        if info is None:
+            info = table.get(name)
+        if right_hand_drive(info):
+            skipped.append(token)
+        else:
+            kept.append(token)
+    return kept, skipped
+
+
 def select_maps(requested: tuple[str, ...] | list[str], installed: set[str] | None) -> tuple[list[str], list[str]]:
     """Keep requested levels that are installed. ``installed is None`` keeps every name."""
     if installed is None:
@@ -291,19 +349,9 @@ def road_spawn(roads: list[Any]) -> tuple[tuple[float, float, float], tuple[floa
     for view in views[:12]:
         found, last = seek_legal_pose(view, quality, grid, z_lift=0.0, classify_z=False)
         if found is None:
-            reason = "rejected"
-            align = offset = None
-            if last:
-                reason = str(last.get("reason") or last.get("verdict") or "rejected")
-                align = last.get("align")
-                offset = last.get("offset_m")
-            print(
-                format_spawn_line(
-                    "spawn reject", "road", str(view.get("id")), bool(view.get("flip")), align, offset, reason
-                )
-                + " (skipped)",
-                flush=True,
-            )
+            from python.collect.spawn_mix import reject_spawn_line
+
+            print(reject_spawn_line("road", str(view.get("id")), bool(view.get("flip")), last), flush=True)
             continue
         pos = (found["pos"][0], found["pos"][1], SPAWN_Z_M)
         print(
@@ -800,17 +848,10 @@ def snap_to_road(
     found, last = legal_pose_near(views, float(near[0]), float(near[1]), float(near[2]) if len(near) > 2 else None)
     if found is None:
         if last is not None:
+            from python.collect.spawn_mix import reject_spawn_line
+
             print(
-                format_spawn_line(
-                    "spawn reject",
-                    "snap",
-                    str(last.get("road_id") or ""),
-                    bool(last.get("flip")),
-                    last.get("align"),
-                    last.get("offset_m"),
-                    str(last.get("reason") or last.get("verdict") or "rejected"),
-                )
-                + " (skipped)",
+                reject_spawn_line("snap", str(last.get("attempted_id") or last.get("road_id") or ""), bool(last.get("flip")), last),
                 flush=True,
             )
         return None

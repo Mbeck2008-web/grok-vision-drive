@@ -271,7 +271,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Comma list of heads that receive loss. Empty trains every head except "
             "curbs. A sem_classes.json name on CURB_NAME_ALLOWLIST does not turn "
             "curbs on; no labeler sets curb_valid from that class id. Explicit "
-            "curbs is refused while that allowlist matches nothing. ctl and "
+            "curbs is refused until that labeler exists. ctl and "
             "road_edge only when named. The export still has every output."
         ),
     )
@@ -3878,8 +3878,9 @@ def heads_for_run(text: str | None, roots: Any = None) -> tuple[str, ...]:
 
     Empty text leaves ``curbs`` out. A confirmed name in ``sem_classes.json``
     does not put it back: no labeler sets ``curb_valid`` from that class id.
-    Explicit ``curbs`` raises when ``CURB_NAME_ALLOWLIST`` matches nothing in
-    those recordings. ``road_edge`` is included only when the string names
+    Explicit ``curbs`` raises until a labeler sets ``curb_valid`` from a
+    ``CURB_NAME_ALLOWLIST`` class id, including when the name matches.
+    ``road_edge`` is included only when the string names
     it, and it is never a substitute for painted ``lane_gt``.
     """
     from python.train.scene_net import curb_palette_for_training, resolve_train_heads

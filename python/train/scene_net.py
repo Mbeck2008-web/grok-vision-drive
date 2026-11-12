@@ -1330,17 +1330,20 @@ def resolve_train_heads(
     BCE target for ticks that were never labeled.
 
     An explicit ``curbs`` (``--heads curbs`` or ``lane_gt,curbs``) raises
-    ``ValueError`` naming ``CURB_NAME_ALLOWLIST`` when that allowlist matches
-    nothing in ``sem_classes``.
+    ``ValueError`` until a labeler sets ``curb_valid`` from a
+    ``CURB_NAME_ALLOWLIST`` class id. A name match is not that labeler, so
+    the zero mask is not a BCE target for "never a curb".
     """
     from python.train.cam_strip import parse_heads
 
     names = parse_heads(text)
     explicit = bool(str(text or "").strip())
-    confirmed = confirmed_curb_names(sem_classes, allowlist=allowlist)
-    if explicit and "curbs" in names and not confirmed:
+    if explicit and "curbs" in names:
+        confirmed = confirmed_curb_names(sem_classes, allowlist=allowlist)
+        matched = ", ".join(confirmed) if confirmed else "none"
         raise ValueError(
-            "refusing --heads curbs: CURB_NAME_ALLOWLIST has no confirmed name in sem_classes.json"
+            "refusing --heads curbs until a labeler sets curb_valid from a "
+            f"CURB_NAME_ALLOWLIST class id (match: {matched})"
         )
     # Empty --heads never restores curbs on a name match. There is no labeler
     # that writes curb_valid from the allowlisted class id.

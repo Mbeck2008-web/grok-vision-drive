@@ -7,7 +7,8 @@
   stays 0. A name on ``CURB_NAME_ALLOWLIST`` does not write curb points.
 * An empty ``--heads`` leaves ``curbs`` out even when that name is in
   ``sem_classes.json``, so the zero mask is not a BCE target for "no curb".
-* Explicit ``--heads curbs`` raises while ``CURB_NAME_ALLOWLIST`` matches nothing.
+* Explicit ``--heads curbs`` raises until a labeler sets ``curb_valid`` from
+  a ``CURB_NAME_ALLOWLIST`` class id, including when that name matches.
 """
 from __future__ import annotations
 
@@ -145,6 +146,51 @@ def check_explicit_curbs_without_allowlist_raises() -> None:
     # A named list that does not ask for curbs is unchanged.
     assert resolve_train_heads("lane_gt,road_edge") == ("lane_gt", "road_edge")
     print("explicit curbs without CURB_NAME_ALLOWLIST raises")
+
+
+def check_explicit_curbs_with_name_match_raises() -> None:
+    """A matching allowlist name is not a labeler. Explicit curbs still raises."""
+    import json
+    import tempfile
+
+    import python.train.scene_net as scene_net
+    from python.train.sensor_aux import read_sem_classes
+    from python.train.scene_net import confirmed_curb_names, resolve_train_heads
+    from python.train.train_scene import heads_for_run
+
+    allow = frozenset({"CURB"})
+    payload = {
+        "kind": "gvd_sem_classes",
+        "train_only": True,
+        "classes": {"0": "unknown", "1": "CURB"},
+        "colours": {"CURB": [180, 180, 180]},
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "sem_classes.json").write_text(json.dumps(payload), encoding="utf-8")
+        loaded = read_sem_classes(root)
+        assert confirmed_curb_names(loaded, allowlist=allow) == ("CURB",)
+        _expect_curb_labeler(lambda: resolve_train_heads("curbs", loaded, allowlist=allow))
+        _expect_curb_labeler(lambda: resolve_train_heads("lane_gt,curbs", loaded, allowlist=allow))
+        old = scene_net.CURB_NAME_ALLOWLIST
+        scene_net.CURB_NAME_ALLOWLIST = allow
+        try:
+            _expect_curb_labeler(lambda: heads_for_run("curbs", [root]))
+        finally:
+            scene_net.CURB_NAME_ALLOWLIST = old
+    print("explicit curbs raises when the allowlist name matches")
+
+
+def _expect_curb_labeler(fn) -> None:
+    """``fn`` raises until a labeler sets curb_valid from the class id."""
+    try:
+        fn()
+    except ValueError as exc:
+        text = str(exc)
+        assert "CURB_NAME_ALLOWLIST" in text, text
+        assert "curb_valid" in text, text
+        return
+    raise AssertionError("expected ValueError: no labeler sets curb_valid")
 
 
 def check_road_edge_and_curbs_opt_in() -> None:
@@ -369,6 +415,7 @@ def check_empty_heads_does_not_bce_curb_valid() -> None:
 def main() -> None:
     check_allowlist_empty_and_curb_valid_zero()
     check_explicit_curbs_without_allowlist_raises()
+    check_explicit_curbs_with_name_match_raises()
     check_road_edge_and_curbs_opt_in()
     check_main_loss_heads_omit_curbs()
     check_default_onnx_outputs_are_exact()

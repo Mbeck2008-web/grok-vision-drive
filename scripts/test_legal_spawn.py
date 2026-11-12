@@ -309,7 +309,7 @@ def check_fixture_deck_has_no_rejected_poses() -> None:
         if got.get("reason") == "twoway_centerline":
             bad["twoway_centerline"] += 1
         assert not spawn_pose_rejected(got), (pick.road_id, got)
-    assert n >= 800, n
+    assert n == 998, n
     assert bad == {"wrong_way": 0, "twoway_centerline": 0}, bad
     import gzip
     import json
@@ -343,6 +343,7 @@ def check_fixture_deck_has_no_rejected_poses() -> None:
     assert wide_kept >= 1
     assert seen == n
     skipped = sum(len(pool) for pool in deck2.pools.values()) - n
+    assert skipped == 74, skipped
     print(
         f"fixture deck picks={n} skipped={skipped} wrong_way=0 twoway_centerline=0 "
         f"hangs={hangs} wide_oneway_right={wide_kept} road_892679_offset={road_679:.2f}"
@@ -389,6 +390,38 @@ def check_wide_oneway_uses_width_not_tag() -> None:
         assert row["offset_m"] > 2.0, (rid, row)
         assert row["offset_m"] + 0.9 <= 7.5 + 1e-6, (rid, row)
     print(f"wide one-way offsets { {k: round(v['offset_m'], 2) for k, v in got.items()} }")
+
+
+def check_autolanes_overrides_a_tag_that_fits() -> None:
+    """autoLanes wins even when the tag does not underfill the decal.
+
+    Width 7 m is 2 lanes at 3.5 m. The tag says 4, which is not fewer than
+    that, so only the autoLanes clause drops the tag. The rightmost center
+    of 2 lanes is 1.75 m; the tag's fitting lane is 0.875 m.
+    """
+    from python.collect.spawn_mix import LANE_W_M, _lane_count
+
+    road = _road(
+        "fit",
+        [(0.0, 0.0), (80.0, 0.0)],
+        half=3.5,
+        lanes_left=0,
+        lanes_right=4,
+        oneway=True,
+        flip=False,
+    )
+    road["auto_lanes"] = True
+    width = float(road["width"])
+    derived = max(1, min(8, int(round(width / LANE_W_M))))
+    assert road["lanes"] >= derived, (road["lanes"], derived)
+    counted = _lane_count(road, width)
+    assert counted == derived, (counted, derived)
+    pick = _deck([road]).take()
+    assert pick is not None
+    got = _classify(road, pick.pos, pick.rot)
+    assert got["verdict"] == "ok", got
+    assert abs(got["offset_m"] - 1.75) < 0.05, got
+    print(f"autoLanes tag-fits offset={got['offset_m']:.2f} lanes={derived}")
 
 
 def check_reject_line_names_verdict_reason_and_mismatch() -> None:
@@ -454,6 +487,7 @@ def main() -> None:
     check_fixture_deck_has_no_rejected_poses()
     check_later_station_is_required()
     check_wide_oneway_uses_width_not_tag()
+    check_autolanes_overrides_a_tag_that_fits()
     check_reject_line_names_verdict_reason_and_mismatch()
     check_right_hand_drive_map_is_skipped()
     check_spawn_pose_rejected_helper()

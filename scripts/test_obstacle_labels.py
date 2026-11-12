@@ -518,10 +518,19 @@ def check_writer_and_missing_sidecar() -> None:
                 "heading_err_rad": 0.0,
             },
         }
+        row["map"] = "synth"
+        row["road"] = {"road_id": "synth", "edge_z_file": "roads/synth.json.gz"}
         (root / "state.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
-        roads = root / "roads.json"
-        roads.write_text(json.dumps({"roads": [{"id": "synth", "edges": edges}]}), encoding="utf-8")
-        code = cli.main([str(root), "--roads", str(roads), "--pose-width", "120", "--pose-height", "90"])
+        from python.collect.road_dump import write_road_dump
+
+        write_road_dump(
+            root / "roads" / "synth.json.gz",
+            level="synth",
+            spawn=None,
+            spawn_source="",
+            road_network={"synth": {"drivability": 1, "edges": edges}},
+        )
+        code = cli.main([str(root), "--pose-width", "120", "--pose-height", "90"])
         assert code == 0, code
         out = root / "obstacles.jsonl"
         assert out.is_file()
@@ -535,7 +544,7 @@ def check_writer_and_missing_sidecar() -> None:
         assert _at(saved, 0.0, 16.0)[0] == BLOCKED
         assert not (root / "gt.jsonl").exists()
 
-        code = cli.main([str(root), "--roads", str(roads), "--out", "gt.jsonl"])
+        code = cli.main([str(root), "--out", "gt.jsonl"])
         assert code == 2
         assert not (root / "gt.jsonl").exists()
 

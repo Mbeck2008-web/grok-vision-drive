@@ -176,36 +176,61 @@ def persist_painted_decals(root: Path | str, level: str) -> Path | None:
     return dest
 
 
+def _road_dict(row: dict[str, Any]) -> dict[str, Any]:
+    road = row.get("road")
+    if isinstance(road, dict):
+        return road
+    tags = row.get("tags")
+    if isinstance(tags, dict) and isinstance(tags.get("road"), dict):
+        return tags["road"]
+    return {}
+
+
+def _safe_relative(rel: str) -> bool:
+    path = Path(rel)
+    return bool(rel) and not rel.startswith(("/", "\\")) and ".." not in path.parts
+
+
 def road_gt_for_row(root: Path | str, row: dict[str, Any]) -> RoadPoly | None:
-    """The road polyline for one recorded frame, including ``left_z`` / ``right_z`` when the dump has them."""
+    """This frame's road, from ``road.edge_z_file`` or ``roads/<map>.json.gz``.
+
+    A missing road id is no road (the depth fit runs). The id is looked up
+    only in that one file. Another map's dump is not searched, and there is
+    no ``roads[0]`` fallback. ``edge_z_file: null`` (the dump was not written)
+    is no road even when ``map`` is set.
+    """
     base = Path(root)
-    road = row.get("road") if isinstance(row.get("road"), dict) else {}
-    wanted = str(road.get("road_id") or row.get("road_id") or "")
-    candidates: list[Path] = []
-    rel = road.get("edge_z_file")
-    if isinstance(rel, str) and rel and ".." not in Path(rel).parts and not rel.startswith(("/", "\\")):
-        candidates.append(base / rel)
-    level = row.get("map")
-    if isinstance(level, str) and level.strip():
-        candidates.append(base / "roads" / f"{level_file_name(level)}.json.gz")
-    folder = base / "roads"
-    if folder.is_dir():
-        candidates.extend(
-            sorted(path for path in folder.glob("*.json.gz") if not path.name.endswith("_lines.json.gz"))
-        )
-    seen: set[Path] = set()
-    for path in candidates:
-        if path in seen or not path.is_file():
-            continue
-        seen.add(path)
-        polys, _payload = load_road_dump(path)
-        if wanted:
-            for poly in polys:
-                if poly.road_id == wanted:
-                    return poly
-            continue
-        if len(polys) == 1:
-            return polys[0]
+    road = _road_dict(row)
+    raw_id = road.get("road_id", row.get("road_id"))
+    if raw_id is None or not str(raw_id).strip():
+        return None
+    wanted = str(raw_id)
+    if "edge_z_file" in road:
+        rel = road.get("edge_z_file")
+        if not isinstance(rel, str) or not _safe_relative(rel.strip()):
+            return None
+        path = base / rel.strip()
+    else:
+        level = row.get("map")
+        if not isinstance(level, str) or not level.strip():
+            return None
+        path = base / "roads" / f"{level_file_name(level)}.json.gz"
+    if not path.is_file():
+        return None
+    polys, _payload = load_road_dump(path)
+    for poly in polys:
+        if poly.road_id == wanted:
+            return poly
+    return None
+
+
+def recorded_edge_z_file(root: Path | str, relative: str | None) -> str | None:
+    """The relative dump path when that file is on disk, else None."""
+    if not isinstance(relative, str) or not _safe_relative(relative.strip()):
+        return None
+    rel = relative.strip()
+    if (Path(root) / rel).is_file():
+        return rel
     return None
 
 

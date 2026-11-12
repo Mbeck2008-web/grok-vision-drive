@@ -1017,21 +1017,22 @@ def _log_road_heights(level: str, roads: list[Any], logged: set[str]) -> None:
         print(line, flush=True)
 
 
-def _persist_map_gt(out: Path, level: str, bng: Any, roads: list[Any]) -> str:
-    """Write the DecalRoad network (edge z included) and painted decals beside the recording.
+def _persist_map_gt(out: Path, level: str, bng: Any, roads: list[Any]) -> str | None:
+    """Write the DecalRoad network and painted decals. Return the relative dump path, or None.
 
-    Returns the level name used in ``roads/<level>.json.gz``. A miss is logged
-    and the collect continues: the frame still records pose and paint.
+    None means the gzip is not on disk. The frame then stores ``edge_z_file: null``.
     """
-    from python.collect.road_dump import level_file_name, persist_painted_decals, persist_recording_roads
+    from python.collect.road_dump import level_file_name, persist_painted_decals, persist_recording_roads, recorded_edge_z_file
 
     name = level_file_name(level)
+    rel = f"roads/{name}.json.gz"
     try:
         path = persist_recording_roads(out, name, bng, roads)
     except Exception as exc:  # noqa: BLE001 — the collect keeps going
         print(f"collect road edge z {name} not saved: {type(exc).__name__}: {exc}", flush=True)
         path = None
-    if path is None:
+    saved = recorded_edge_z_file(out, rel if path is not None else None)
+    if saved is None:
         print(f"collect road edge z {name} not saved (no road network)", flush=True)
     else:
         from python.collect.road_dump import load_road_dump
@@ -1056,7 +1057,7 @@ def _persist_map_gt(out: Path, level: str, bng: Any, roads: list[Any]) -> str:
         lines = None
     if lines is not None:
         print(f"collect painted decals {name} bytes={lines.stat().st_size} file={lines}", flush=True)
-    return name
+    return saved
 
 
 def road_lanes(roads: list[Any], hit: object) -> int | None:
@@ -1850,7 +1851,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         roads: list[Any] = []
         painted = PaintedLanes([])
         heights_logged: set[str] = set()  # road_heights_line: once per map
-        roads_level = "current"
+        roads_edge_file: str | None = None
         cams: dict[str, Any] = {}
         spawn_pos: tuple[float, float, float] | None = None
         # Bumped on every spawn, respawn, and level load; veh_meta is keyed on it.
@@ -1881,7 +1882,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             spawn_seq += 1
         writer = RawWriteQueue(RawFrameWriter(out, camera_sidecar(cam_cfg)))
         if not map_names:
-            roads_level = _persist_map_gt(out, str(args.reload_level or "") or "current", bng, roads)
+            roads_edge_file = _persist_map_gt(out, str(args.reload_level or "") or "current", bng, roads)
         sem_classes_written = False
         ticks = TickLog(out / TICKS_FILE, 0.1)
         from python.data.strip_writer import STRIP_ORDER
@@ -2605,7 +2606,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     print(f"collect stop {last_error}", flush=True)
                     run.stop("level_load_failed", last_error)
                     return 2
-                roads_level = _persist_map_gt(out, map_name, bng, roads)
+                roads_edge_file = _persist_map_gt(out, map_name, bng, roads)
                 loaded_map = map_name
                 loaded_index = seg_index
                 cut_at_load = schedule_cut
@@ -3287,7 +3288,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             road_now = road_for(roads, hit)
             tags["road"] = control_log.road_tag(hit, lanes_here, road_now)
             if isinstance(tags["road"], dict):
-                tags["road"]["edge_z_file"] = f"roads/{roads_level}.json.gz"
+                from python.collect.road_dump import recorded_edge_z_file
+
+                tags["road"]["edge_z_file"] = recorded_edge_z_file(out, roads_edge_file)
                 for key in ("road_width_m", "road_offset_m", "heading_err_rad"):
                     if tags["road"].get(key) is not None:
                         tags[key] = tags["road"][key]

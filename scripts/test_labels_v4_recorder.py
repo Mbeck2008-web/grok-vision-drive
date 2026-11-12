@@ -167,15 +167,19 @@ def check_brake_lights_come_from_each_vehicle() -> None:
     class _Api:
         def __init__(self) -> None:
             self._all = {"ego": ego, "gvd_traffic_0": lead, "parked_bus": parked}
+            self.kwargs: dict = {}
 
-        def get_current(self):
+        def get_current(self, **kwargs):
+            self.kwargs = dict(kwargs)
             return dict(self._all)
 
         def get_player_vehicle_id(self):
             return {"vid": "ego"}
 
+    api = _Api()
+
     class _Bng:
-        vehicles = _Api()
+        vehicles = api
 
     sensors = types.ModuleType("beamngpy.sensors")
     _install_sensors(sensors)
@@ -205,6 +209,7 @@ def check_brake_lights_come_from_each_vehicle() -> None:
     assert "electrics" in lead.sensors and "electrics" in parked.sensors
     assert lead.polls == 1 and parked.polls == 1
     assert "electrics" not in ego.sensors  # the player attach is the collector's, not this merge
+    assert api.kwargs == {"include_config": False}
     print("brake_lights stay on the vehicle that reported them")
 
 
@@ -229,7 +234,7 @@ def check_electrics_attach_failure_is_masked() -> None:
             self.sensors = _BoomSensors()
 
     class _Api:
-        def get_current(self):
+        def get_current(self, **_kwargs):
             return {"ego": object(), "gvd_traffic_0": _Boom()}
 
         def get_player_vehicle_id(self):
@@ -252,7 +257,7 @@ def check_electrics_attach_failure_is_masked() -> None:
             first = rec.with_brake_lights(cars, _Bng())
             second = rec.with_brake_lights(cars, _Bng())
         class _BadApi:
-            def get_current(self):
+            def get_current(self, **_kwargs):
                 raise RuntimeError("vehicles down")
 
         class _Bad:
@@ -434,7 +439,7 @@ class _Bng:
         self.camera = _Anno()
 
         class _Api:
-            def get_current(_self):
+            def get_current(_self, **_kwargs):
                 return {"ego": ego, "gvd_traffic_0": lead, "parked_bus": parked}
 
             def get_player_vehicle_id(_self):

@@ -74,7 +74,8 @@ def _connected_by_name(bng: Any) -> dict[str, Any]:
     current: dict[str, Any] = {}
     try:
         getter = getattr(api, "get_current", None) if api is not None else None
-        cur = getter() if callable(getter) else None
+        # Names only. include_config would pull each vehicle's jbeam.
+        cur = getter(include_config=False) if callable(getter) else None
         if isinstance(cur, dict):
             current = {str(key): value for key, value in cur.items() if value is not None}
     except Exception:

@@ -1748,7 +1748,14 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         f"stop under 20 GB free",
         flush=True,
     )
-    from python.collect.level_session import installed_levels, is_session_error, select_maps, session_text
+    from python.collect.level_session import (
+        installed_levels,
+        is_session_error,
+        level_info_table,
+        select_maps,
+        session_text,
+        skip_right_hand_drive_maps,
+    )
     from python.debug.remote_status import status_dir as _status_dir
 
     status_root = _status_dir()
@@ -1777,12 +1784,20 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 for name in skipped_levels:
                     print(f"collect skip level {name} (not in this Tech install)", flush=True)
                 map_names = tuple(kept)
-                if not map_names and not args.list_levels:
+            kept_drive, left_hand = skip_right_hand_drive_maps(map_names, level_info_table(bng))
+            for name in left_hand:
+                print(f"collect skip level {name} (roadRules.rightHandDrive)", flush=True)
+                skipped_levels.append(name)
+            map_names = tuple(kept_drive)
+            if not map_names and not args.list_levels:
+                if left_hand:
+                    message = "requested maps are roadRules.rightHandDrive (left-hand traffic)"
+                else:
                     message = "none of the requested maps are in this Tech install"
-                    record_session_failure(status_root, message)
-                    print(f"collect stop {message}", flush=True)
-                    run.stop("no_maps", message)
-                    return 2
+                record_session_failure(status_root, message)
+                print(f"collect stop {message}", flush=True)
+                run.stop("no_maps", message)
+                return 2
         elif args.reload_level:
             print(f"collect reload level={args.reload_level}", flush=True)
         if args.list_levels or args.dump_roads or args.check_maps:

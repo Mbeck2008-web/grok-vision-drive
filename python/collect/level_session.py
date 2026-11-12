@@ -200,6 +200,64 @@ def installed_levels(bng: Any) -> tuple[set[str] | None, str]:
     return None, "; ".join(notes) if notes else "no get_levels"
 
 
+def right_hand_drive(info: Any) -> bool:
+    """True when ``roadRules.rightHandDrive`` is set.
+
+    BeamNG uses that flag for left-hand traffic: the driver sits on the right.
+    Spawns here are right-hand traffic, so a true flag means skip the map.
+    """
+    if not isinstance(info, dict):
+        return False
+    rules = info.get("roadRules")
+    if not isinstance(rules, dict):
+        rules = info.get("road_rules")
+    if not isinstance(rules, dict):
+        return False
+    raw = rules.get("rightHandDrive", rules.get("right_hand_drive"))
+    if isinstance(raw, bool):
+        return raw
+    return str(raw or "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def level_info_table(bng: Any) -> dict[str, Any]:
+    """Level name to the ``get_levels`` record, when this session can list levels."""
+    payload = _levels_payload(bng)
+    if not isinstance(payload, dict):
+        return {}
+    nested = payload.get("levels") if "levelName" not in payload else None
+    table = nested if isinstance(nested, dict) else payload
+    if not isinstance(table, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key, info in table.items():
+        token = level_token(str(key))
+        if token:
+            out[token] = info if isinstance(info, dict) else {}
+    return out
+
+
+def skip_right_hand_drive_maps(
+    names: tuple[str, ...] | list[str],
+    infos: Any,
+) -> tuple[list[str], list[str]]:
+    """Drop levels whose ``roadRules.rightHandDrive`` is true. Missing rules stay."""
+    kept: list[str] = []
+    skipped: list[str] = []
+    table = infos if isinstance(infos, dict) else {}
+    for name in names:
+        token = level_token(name)
+        if not token:
+            continue
+        info = table.get(token)
+        if info is None:
+            info = table.get(name)
+        if right_hand_drive(info):
+            skipped.append(token)
+        else:
+            kept.append(token)
+    return kept, skipped
+
+
 def select_maps(requested: tuple[str, ...] | list[str], installed: set[str] | None) -> tuple[list[str], list[str]]:
     """Keep requested levels that are installed. ``installed is None`` keeps every name."""
     if installed is None:
@@ -266,24 +324,49 @@ def _yaw_quat(dx: float, dy: float) -> tuple[float, float, float, float]:
 
 
 def road_spawn(roads: list[Any]) -> tuple[tuple[float, float, float], tuple[float, float, float, float]] | None:
-    """A point about 40% along the longest centerline, dropped onto the mesh from above."""
-    usable = [road for road in roads if len(getattr(road, "xy", ()) or []) >= 2]
-    if not usable:
+    """A point about 40% along a long centerline, in the legal right-hand lane.
+
+    Dropped from ``SPAWN_Z_M`` so the mesh catch still works. Heading follows
+    node order, reversed when the road says ``flip``. A pose the wrong-way
+    classifier rejects is skipped for the next-longest road.
+    """
+    from python.collect.spawn_mix import (
+        format_spawn_line,
+        index_spawn_roads,
+        seek_legal_pose,
+        view_from_poly,
+    )
+
+    views = []
+    for road in roads:
+        view = view_from_poly(road)
+        if view is not None and len(view.get("pts") or []) >= 2:
+            views.append(view)
+    if not views:
         return None
-    road = max(usable, key=lambda item: _polyline_length(list(item.xy)))
-    pts = [(float(x), float(y)) for x, y in road.xy]
-    target = max(5.0, _polyline_length(pts) * 0.4)
-    walked = 0.0
-    for (ax, ay), (bx, by) in zip(pts, pts[1:]):
-        seg = math.hypot(bx - ax, by - ay)
-        if seg < 1e-6:
+    views.sort(key=lambda view: _polyline_length([(point[0], point[1]) for point in view["pts"]]), reverse=True)
+    quality, grid = index_spawn_roads(views)
+    for view in views[:12]:
+        found, last = seek_legal_pose(view, quality, grid, z_lift=0.0, classify_z=False)
+        if found is None:
+            from python.collect.spawn_mix import reject_spawn_line
+
+            print(reject_spawn_line("road", str(view.get("id")), bool(view.get("flip")), last), flush=True)
             continue
-        if walked + seg >= target or (bx, by) == pts[-1]:
-            mix = 0.0 if seg < 1e-6 else min(1.0, (target - walked) / seg)
-            x = ax + mix * (bx - ax)
-            y = ay + mix * (by - ay)
-            return (x, y, SPAWN_Z_M), _yaw_quat(bx - ax, by - ay)
-        walked += seg
+        pos = (found["pos"][0], found["pos"][1], SPAWN_Z_M)
+        print(
+            format_spawn_line(
+                "spawn legal",
+                "road",
+                str(view.get("id")),
+                bool(found.get("flip")),
+                found.get("align"),
+                found.get("offset_m"),
+                str(found.get("verdict") or "ok"),
+            ),
+            flush=True,
+        )
+        return pos, found["rot"]
     return None
 
 
@@ -749,34 +832,43 @@ def snap_to_road(
     bng: Any,
     near: tuple[float, float, float] | None,
 ) -> tuple[tuple[float, float, float], tuple[float, float, float, float]] | None:
-    """Nearest centerline pose: node z plus half a metre, heading along the road.
+    """Nearest legal right-lane pose: node z plus half a metre.
 
     Points farther than 40 m are ignored so a bad ray does not throw the car
-    across the map at z=250.
+    across the map at z=250. A centerline with no lane width keeps the old
+    node-order heading. A pose the wrong-way classifier rejects is not returned.
     """
-    lines = polylines_xyz(_network_spec(bng))
-    if not lines or near is None:
+    from python.collect.spawn_mix import format_spawn_line, legal_pose_near, views_from_network
+
+    if near is None:
         return None
-    px, py = float(near[0]), float(near[1])
-    best: tuple[float, float, float, float, float, float] | None = None
-    for line in lines:
-        for (ax, ay, az), (bx, by, bz) in zip(line, line[1:]):
-            dx, dy = bx - ax, by - ay
-            length2 = dx * dx + dy * dy
-            if length2 < 1e-6:
-                continue
-            t = ((px - ax) * dx + (py - ay) * dy) / length2
-            t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else t
-            cx = ax + t * dx
-            cy = ay + t * dy
-            cz = az + t * (bz - az)
-            dist = math.hypot(px - cx, py - cy)
-            if best is None or dist < best[0]:
-                best = (dist, cx, cy, cz, dx, dy)
-    if best is None or best[0] > 40.0:
+    views = views_from_network(_network_spec(bng))
+    if not views:
         return None
-    _dist, cx, cy, cz, dx, dy = best
-    return (cx, cy, cz + 0.5), _yaw_quat(dx, dy)
+    found, last = legal_pose_near(views, float(near[0]), float(near[1]), float(near[2]) if len(near) > 2 else None)
+    if found is None:
+        if last is not None:
+            from python.collect.spawn_mix import reject_spawn_line
+
+            print(
+                reject_spawn_line("snap", str(last.get("attempted_id") or last.get("road_id") or ""), bool(last.get("flip")), last),
+                flush=True,
+            )
+        return None
+    if not found.get("legacy"):
+        print(
+            format_spawn_line(
+                "spawn legal",
+                "snap",
+                str(found.get("road_id") or ""),
+                bool(found.get("flip")),
+                found.get("align"),
+                found.get("offset_m"),
+                str(found.get("verdict") or "ok"),
+            ),
+            flush=True,
+        )
+    return found["pos"], found["rot"]
 
 
 def place_vehicle(

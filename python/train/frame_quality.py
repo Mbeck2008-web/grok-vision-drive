@@ -401,6 +401,21 @@ def classify_wrong_way(
     return out
 
 
+def spawn_pose_rejected(result: Mapping[str, Any]) -> bool:
+    """True when a collector must not record this pose.
+
+    ``wrong_way`` is a verdict. ``twoway_centerline`` is the reason on an
+    ``unknown`` verdict (the car is on the road but not in a lane). ``ok``
+    and every other ``unknown`` reason stay usable. This does not change
+    ``classify_wrong_way``.
+    """
+    if not isinstance(result, Mapping):
+        return True
+    if str(result.get("verdict") or "") == "wrong_way":
+        return True
+    return str(result.get("reason") or "") == "twoway_centerline"
+
+
 def classify_row(
     row: Mapping[str, Any],
     roads: list[QualityRoad],

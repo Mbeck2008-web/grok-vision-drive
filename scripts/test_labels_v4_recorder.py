@@ -278,6 +278,70 @@ def check_electrics_attach_failure_is_masked() -> None:
     print("electrics attach failure masks brake_lights and logs once")
 
 
+def check_electrics_poll_failure_is_masked() -> None:
+    """poll_sensors raising stays null, logs once, and does not escape."""
+    import contextlib
+
+    import python.collect.recorder_v4 as rec
+
+    rec._ELECTRICS_LOGGED.clear()
+
+    class _Veh:
+        def __init__(self) -> None:
+            self.name = "gvd_traffic_0"
+            self.sensors = _Sensors()
+
+        def poll_sensors(self) -> None:
+            raise RuntimeError("electrics socket dropped")
+
+    class _Api:
+        def get_current(self, **_kwargs):
+            return {"ego": object(), "gvd_traffic_0": _Veh()}
+
+        def get_player_vehicle_id(self):
+            return {"vid": "ego"}
+
+    class _Bng:
+        vehicles = _Api()
+
+    sensors = types.ModuleType("beamngpy.sensors")
+    _install_sensors(sensors)
+    beamngpy = types.ModuleType("beamngpy")
+    beamngpy.sensors = sensors
+    old = {key: sys.modules.get(key) for key in ("beamngpy", "beamngpy.sensors")}
+    sys.modules["beamngpy"] = beamngpy
+    sys.modules["beamngpy.sensors"] = sensors
+    cars = [{
+        "name": "gvd_traffic_0",
+        "pos": [1.0, 2.0, 0.0],
+        "vel": [0.0, 1.0, 0.0],
+        "dir": [0.0, 1.0, 0.0],
+    }]
+    try:
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                first = rec.with_brake_lights(cars, _Bng())
+                second = rec.with_brake_lights(cars, _Bng())
+        except Exception as exc:  # noqa: BLE001 — the assertion is the contract
+            raise AssertionError(f"poll_sensors failure must not escape: {exc}") from exc
+    finally:
+        for key, value in old.items():
+            if value is None:
+                sys.modules.pop(key, None)
+            else:
+                sys.modules[key] = value
+    assert [row["brake_lights"] for row in first] == [None]
+    assert [row["brake_lights"] for row in second] == [None]
+    assert first[0]["pos"] == [1.0, 2.0, 0.0] and first[0]["name"] == "gvd_traffic_0"
+    hits = [line for line in buf.getvalue().splitlines() if "collect traffic electrics:" in line]
+    assert hits == [
+        "collect traffic electrics: electrics poll failed: RuntimeError: "
+        "electrics socket dropped for gvd_traffic_0; brake_lights null."
+    ], hits
+    print("electrics poll failure masks brake_lights and logs once")
+
+
 def check_iqu45_smoke_is_documented() -> None:
     import scripts.collect_scene_lanes as collect
 
@@ -595,6 +659,7 @@ def main() -> None:
     check_missing_signal_api_is_err_row()
     check_brake_lights_come_from_each_vehicle()
     check_electrics_attach_failure_is_masked()
+    check_electrics_poll_failure_is_masked()
     check_iqu45_smoke_is_documented()
     check_short_collect_writes_recorder_files()
     print("test_labels_v4_recorder: OK")

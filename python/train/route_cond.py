@@ -113,8 +113,18 @@ def _index_sidecar(path: Path) -> dict[str, dict[str, Any]]:
     return out
 
 
-def attach_route_cmds(rows: list[dict[str, Any]]) -> dict[str, int]:
-    """Copy ``intent.jsonl`` onto rows as ``route_cmd`` / ``next_jct_m``."""
+def attach_route_cmds(rows: list[dict[str, Any]], *, missing: str = "follow") -> dict[str, int]:
+    """Copy ``intent.jsonl`` onto rows as ``route_cmd`` / ``next_jct_m``.
+
+    ``missing="follow"`` is the older join: a tick with no sidecar becomes
+    follow. Intersection training passes ``missing="mask"`` so a missing
+    file is not taught as a far-away follow. ``route_supervised`` is 1 only
+    for a present ``left`` / ``right`` / ``straight``. Entry and exit stay
+    on the sidecar; they are not a new embedding input.
+    """
+    fallback = str(missing or "mask").strip().lower()
+    if fallback not in (*ROUTE_CMDS, "mask"):
+        fallback = "mask"
     caches: dict[str, dict[str, dict[str, Any]]] = {}
     counts = {name: 0 for name in (*ROUTE_CMDS, "mask", "missing")}
     for row in rows:
@@ -123,8 +133,9 @@ def attach_route_cmds(rows: list[dict[str, Any]]) -> dict[str, int]:
             caches[root] = _index_sidecar(Path(root) / "intent.jsonl") if root else {}
         rec = caches[root].get(_tkey(row.get("t")))
         if rec is None:
-            row["route_cmd"] = "follow"
+            row["route_cmd"] = fallback
             row["next_jct_m"] = None
+            row["route_supervised"] = 0.0
             counts["missing"] += 1
             continue
         cmd = str(rec.get("cmd") or "follow").strip().lower()
@@ -132,6 +143,7 @@ def attach_route_cmds(rows: list[dict[str, Any]]) -> dict[str, int]:
             cmd = "follow"
         row["route_cmd"] = cmd
         row["next_jct_m"] = rec.get("next_jct_m")
+        row["route_supervised"] = 1.0 if cmd in ("left", "right", "straight") else 0.0
         counts[cmd] += 1
     return counts
 

@@ -203,7 +203,7 @@ def prepare_holdout(
     if route_cond:
         from python.train.route_cond import attach_route_cmds, route_counts_line
 
-        print(route_counts_line(attach_route_cmds(rows)), flush=True)
+        print(route_counts_line(attach_route_cmds(rows, missing="mask")), flush=True)
     from python.train.continual import HOLDOUT_FAST_MPS, holdout_mix
 
     mix = holdout_mix(plan_for_hold)

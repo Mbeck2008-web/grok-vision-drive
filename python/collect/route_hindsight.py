@@ -65,7 +65,14 @@ def _heading_of(row: Mapping[str, Any], pts: list[tuple[float, float]], index: i
     return 0.0
 
 
-def _sidecar(t: Any, cmd: str, next_jct_m: float | None, reason: str | None = None) -> dict[str, Any]:
+def _sidecar(
+    t: Any,
+    cmd: str,
+    next_jct_m: float | None,
+    reason: str | None = None,
+    entry: str | None = None,
+    exit_id: str | None = None,
+) -> dict[str, Any]:
     label = cmd if cmd in CMDS else "mask"
     dist: float | None
     if next_jct_m is None:
@@ -80,8 +87,30 @@ def _sidecar(t: Any, cmd: str, next_jct_m: float | None, reason: str | None = No
     row: dict[str, Any] = {"t": t, "cmd": label, "next_jct_m": dist, "src": "hindsight"}
     if label == "mask" and reason:
         row["reason"] = reason
+    # The driven branch. Omitted when the approach never resolved both arms.
+    if entry is not None and exit_id is not None:
+        row["entry"] = str(entry)
+        row["exit"] = str(exit_id)
     return row
 
+
+
+def branches_are_junction_neighbors(graph: Graph, entry: Any, exit_id: Any) -> bool:
+    """True when both ids are neighbors of one degree >= 3 node.
+
+    A masked U-turn keeps the same id on both sides. That still counts: the
+    id is a neighbor of the junction, and the row stays ``cmd=mask``.
+    """
+    if entry is None or exit_id is None:
+        return False
+    entry_s, exit_s = str(entry), str(exit_id)
+    if entry_s not in graph.nodes or exit_s not in graph.nodes:
+        return False
+    for name in graph.junctions():
+        nbrs = set(_neighbors(graph, name))
+        if entry_s in nbrs and exit_s in nbrs:
+            return True
+    return False
 
 
 def _neighbors(graph: Graph, node: str) -> list[str]:
@@ -220,8 +249,12 @@ def label_sequence(graph: Graph, rows: Iterable[Mapping[str, Any]]) -> list[dict
         if entry is None or exit_n is None:
             out.append(_sidecar(t, "mask", next_dist, "no_future"))
             continue
+
+        def _branched(cmd: str, why: str | None = None) -> dict[str, Any]:
+            return _sidecar(t, cmd, next_dist, why, entry=entry, exit_id=exit_n)
+
         if entry == exit_n:
-            out.append(_sidecar(t, "mask", next_dist, "uturn"))
+            out.append(_branched("mask", "uturn"))
             continue
         ex, ey = graph.nodes[entry]
         ox, oy = graph.nodes[exit_n]
@@ -230,10 +263,10 @@ def label_sequence(graph: Graph, rows: Iterable[Mapping[str, Any]]) -> list[dict
         delta = _wrap(out_h - in_h)
         deg = abs(math.degrees(delta))
         if deg >= UTURN_DEG:
-            out.append(_sidecar(t, "mask", next_dist, "uturn"))
+            out.append(_branched("mask", "uturn"))
             continue
         if AMBIGUOUS_LO <= deg < AMBIGUOUS_HI:
-            out.append(_sidecar(t, "mask", next_dist, "ambiguous"))
+            out.append(_branched("mask", "ambiguous"))
             continue
-        out.append(_sidecar(t, classify_turn(delta), next_dist))
+        out.append(_branched(classify_turn(delta)))
     return out

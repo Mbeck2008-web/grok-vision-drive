@@ -114,7 +114,8 @@ def main() -> None:
     assert (ROOT / ".github" / "workflows" / "tests.yml").is_file()
     workflow = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
     assert "pull_request:" in workflow
-    assert "branches: [main]" in workflow
+    assert "branches:" in workflow and "- main" in workflow
+    assert "cursor/**" in workflow
     assert "run_offline_suite.py" in workflow
     assert "xvfb-run -a python scripts/run_offline_suite.py" in workflow
 

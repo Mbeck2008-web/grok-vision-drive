@@ -2,15 +2,15 @@
 
 Runtime and the visualizer do not import this module. Inside the drivable
 corridor a cell is blocked when its height above the cross-sloped road
-surface is past ``clear_eps_m`` (0.15 m) plus the depth-quantization pad.
-The slope is ``(edge_z - z_center) / signed half-width`` from ``RoadPoly``
-``left_z`` / ``right_z``. When that side has no edge height, a RANSAC fit
-of paved in-corridor points supplies it. If neither exists the point stays
-unknown. The pad band between ``threshold - pad`` and ``threshold + pad``
-is unknown, never drivable. A point within ``edge_band_m`` (0.5 m) outside
-the corridor uses the same rule at ``curb_eps_m`` (0.08 m). Those three
-numbers are written on every ``obstacles.jsonl`` row. The difference is in
-the world frame. Ego z, ego pitch, and a missing height are not a road surface.
+surface is past ``clear_eps_m`` (0.15 m). The slope is
+``(edge_z - z_center) / signed half-width`` from ``RoadPoly`` ``left_z`` /
+``right_z``. When that side has no edge height, a RANSAC fit of paved
+in-corridor points supplies it. If neither exists the point stays unknown.
+``depth_range_pad_m`` is the only range pad; it stays 0 until spec #217
+defines ``pad(r)``. A point within ``edge_band_m`` (0.5 m) outside the
+corridor is blocked at ``curb_eps_m`` (0.08 m). Those three numbers are
+written on every ``obstacles.jsonl`` row. The difference is in the world
+frame. Ego z, ego pitch, and a missing height are not a road surface.
 
 The corridor half-width is half the painted lane width about the painted
 center. When that lane is missing it is ``road_width_m / 2`` about
@@ -457,21 +457,13 @@ def _edge_slopes(
     return left, right
 
 
-def _quant_z_pad(pose: Any, depth_m: np.ndarray) -> np.ndarray:
-    """Extra height slack from uint16 centimetre depth and a half-pixel ray.
+def depth_range_pad_m(depth_m: np.ndarray) -> np.ndarray:
+    """Metres added to a height threshold for depth quantization.
 
-    A flat road at long range does not come back at z 0: the stored depth is
-    whole centimetres and the unprojection uses the pixel-center ray. The pad
-    grows with range so a 0.10 m bump is not labeled blocked by that error.
+    Spec #217 has not defined ``pad(r)``. This stays 0 so a follow-up is this
+    return. A blocked curb needs ``pad <= 0.02`` m; do not invent a range curve here.
     """
-    cm = 0.01
-    metres = np.abs(np.asarray(depth_m, dtype=np.float64))
-    basis = _camera_basis(pose)
-    height = float(getattr(pose, "height", 0) or 0)
-    if basis is None or height < 2.0:
-        return np.full(metres.shape, cm, dtype=np.float64)
-    half_px = (float(basis[3]) / height) * 0.5
-    return cm + metres * math.tan(half_px)
+    return np.zeros(np.shape(depth_m), dtype=np.float64)
 
 
 def _class_names(sem_classes: Mapping[str, Any] | None) -> dict[int, str]:
@@ -685,18 +677,15 @@ def label_obstacle_frame(
         slope = np.where((lateral < 0.0) & np.isfinite(edge_left), edge_left, slope)
         have = valid & np.isfinite(rough) & np.isfinite(slope)
         height = np.where(have, rough - slope * lateral, np.nan)
-        pad = _quant_z_pad(pose, np.asarray(depth, dtype=np.float64) / 100.0)
-        clear_hi = CLEAR_EPS_M + pad
-        clear_lo = CLEAR_EPS_M - pad
-        curb_hi = CURB_EPS_M + pad
-        curb_lo = CURB_EPS_M - pad
+        pad = depth_range_pad_m(np.asarray(depth, dtype=np.float64) / 100.0)
+        clear_tol = CLEAR_EPS_M + pad
+        curb_tol = CURB_EPS_M + pad
         classes = np.zeros(depth.shape, np.uint8)
         corridor_pts = have & inside
-        classes[corridor_pts & (height > clear_hi)] = BLOCKED
-        classes[corridor_pts & (height <= clear_lo) & (height >= -clear_lo)] = DRIVABLE
+        classes[corridor_pts & (height > clear_tol)] = BLOCKED
+        classes[corridor_pts & (height <= clear_tol) & (height >= -clear_tol)] = DRIVABLE
         band = have & in_band
-        classes[band & (height >= curb_hi)] = BLOCKED
-        classes[band & (height <= curb_lo) & (height >= -curb_lo)] = DRIVABLE
+        classes[band & (height >= curb_tol)] = BLOCKED
         blocked = classes == BLOCKED
     grid = _bin(ego_x, ego_y, classes, valid)
     clear_m, clear_ok = _clearance(ego_x, ego_y, blocked, lane_gt, lane_gt_valid)

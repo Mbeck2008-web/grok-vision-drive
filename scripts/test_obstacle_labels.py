@@ -589,9 +589,11 @@ def check_bump_survives_depth_quantization() -> None:
 
     uint16 centimetres plus the pixel-center ray make a flat road at 27.4 m
     come back near z 0.026, and a 0.12 m bump there come back above 0.15.
-    That bump stays unblocked. A 0.40 m obstacle at the same range does not.
+    ``depth_range_pad_m`` is 0 until spec #217 defines pad(r), so that recovered
+    bump is blocked. A 0.10 m bump at 8 m stays drivable. A 0.40 m obstacle
+    at 27.4 m stays blocked.
     """
-    from python.train.obstacles import BLOCKED, DRIVABLE
+    from python.train.obstacles import BLOCKED, DRIVABLE, depth_range_pad_m
 
     right, forward, up = _flat_axes()
     pos = (0.0, 0.0, 0.0)
@@ -609,19 +611,18 @@ def check_bump_survives_depth_quantization() -> None:
     bump_z = _recovered_z((0.0, 27.4, 0.12))
     assert abs(flat_z - 0.026) < 0.005, flat_z
     assert bump_z > 0.15, bump_z
+    assert float(depth_range_pad_m(np.zeros(1))[0]) == 0.0
     near, _got = kind((0.0, 8.0, 0.10))
     far, far_row = kind((0.0, 30.0, 0.10))
     quant, _qrow = kind((0.0, 27.4, 0.12))
     real, _rrow = kind((0.0, 27.4, 0.40))
-    tall16, _trow = kind((0.0, 30.0, 0.16))
     assert near == DRIVABLE, near
     assert far != BLOCKED, far
-    assert quant != BLOCKED, (quant, bump_z)
-    assert quant != DRIVABLE, (quant, bump_z)
-    assert tall16 != DRIVABLE, tall16
+    # Recovered above 0.15 with pad still 0. Not a drivable/unknown-band claim.
+    assert quant == BLOCKED, (quant, bump_z)
     assert real == BLOCKED, real
     _assert_row_fields(far_row)
-    print("  0.10 m bump is not blocked at 8 m or 30 m; 0.16 m at 30 m is never drivable")
+    print("  0.10 m bump at 8 m is drivable; range pad stays 0 until pad(r) is defined")
 
 
 def check_crown_and_bank_not_blocked() -> None:

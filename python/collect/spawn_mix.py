@@ -27,6 +27,12 @@ respawns apart. The type is only logged; no pick is filtered on it.
 collector then keeps the current spawn. ``traffic_slots`` places the
 companion cars along the road (``TRAFFIC_AHEAD_M`` ahead, ``TRAFFIC_BEHIND_M``
 behind), not on the straight spawn tangent.
+
+A road with a measured width is spawned in the legal direction: node order,
+reversed when ``flipDirection`` is set, and shifted into the right-hand lane
+(rightmost lane on a one-way road). ``classify_wrong_way`` has to call the
+pose ``ok`` on that same road. A ``wrong_way`` or ``twoway_centerline`` result
+is not returned; the deck tries a few lanes and stations, then skips the road.
 """
 
 from __future__ import annotations
@@ -39,7 +45,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 CITY = "city"
 HIGHWAY = "highway"
@@ -117,6 +123,15 @@ SOURCES = ("spawn", "recheck")
 TRAFFIC_AHEAD_M = 60.0
 TRAFFIC_BEHIND_M = 40.0
 TRAFFIC_MIN_M = 8.0
+# Legal-lane search. The first fraction is the historical 40% station.
+LEGAL_FRACTIONS = (0.40, 0.30, 0.50, 0.22, 0.62)
+LEGAL_ATTEMPTS = 8
+LANE_W_M = 3.5
+# Stay this far inside the painted edge so the pose is still on the road.
+EDGE_MARGIN_M = 0.15
+# Past the 0.75 m centerline deadzone, so a later projection does not fall
+# back inside it.
+LANE_CLEAR_M = 0.08
 
 
 @dataclass(frozen=True)
@@ -128,6 +143,11 @@ class SpawnPick:
     speed: tuple[float, float]
     # Share of probes ahead with a painted ego lane. None: not measured.
     paint_cov: float | None = None
+    # Set when the pose was checked against the wrong-way classifier.
+    flip: bool | None = None
+    align: float | None = None
+    offset_m: float | None = None
+    verdict: str | None = None
 
 
 def _num(value: Any, default: float = 0.0) -> float:
@@ -140,6 +160,12 @@ def _num(value: Any, default: float = 0.0) -> float:
 def _yaw_quat(dx: float, dy: float) -> tuple[float, float, float, float]:
     half = math.atan2(float(dy), float(dx)) * 0.5
     return (0.0, 0.0, math.sin(half), math.cos(half))
+
+
+def _flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _middles(road: dict[str, Any]) -> list[tuple[float, float, float]]:
@@ -395,6 +421,458 @@ def _pose_at(points: list[tuple[float, float, float]], fraction: float = 0.4) ->
     return (x, y, z), _yaw_quat(right[0] - left[0], right[1] - left[1])
 
 
+def _sample_center(
+    points: list[tuple[float, float, float]], fraction: float
+) -> tuple[tuple[float, float, float], tuple[float, float]] | None:
+    """``(center xyz, node-order tangent)`` at ``fraction`` along ``points``."""
+    segs: list[tuple[tuple[float, float, float], tuple[float, float, float], float]] = []
+    length = 0.0
+    for left, right in zip(points, points[1:]):
+        step = math.hypot(right[0] - left[0], right[1] - left[1])
+        if step < 1e-3:
+            continue
+        segs.append((left, right, step))
+        length += step
+    if not segs or length < 1.0:
+        return None
+    target = min(length * float(fraction), max(0.0, length - 1.0))
+    walked = 0.0
+    left, right, step = segs[-1]
+    for left, right, step in segs:
+        if walked + step >= target:
+            break
+        walked += step
+    mix = 0.0 if step < 1e-6 else min(1.0, max(0.0, (target - walked) / step))
+    center = tuple(left[k] + (right[k] - left[k]) * mix for k in range(3))
+    norm = step or 1.0
+    return center, ((right[0] - left[0]) / norm, (right[1] - left[1]) / norm)
+
+
+def _width_of_edges(edges: Any) -> float | None:
+    spans: list[float] = []
+    if not isinstance(edges, list):
+        return None
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        left, right = edge.get("left"), edge.get("right")
+        if not (
+            isinstance(left, (list, tuple))
+            and isinstance(right, (list, tuple))
+            and len(left) >= 2
+            and len(right) >= 2
+        ):
+            continue
+        span = math.hypot(float(right[0]) - float(left[0]), float(right[1]) - float(left[1]))
+        if span >= 0.5:
+            spans.append(span)
+    if not spans:
+        return None
+    spans.sort()
+    return spans[len(spans) // 2]
+
+
+def _explicit_lanes(road: Mapping[str, Any] | dict[str, Any]) -> tuple[int, int] | None:
+    if isinstance(road, dict):
+        keys = road.keys()
+    else:
+        return None
+    if not any(key in keys for key in ("lanes_left", "lanes_right", "lanesLeft", "lanesRight")):
+        return None
+    left = road["lanes_left"] if "lanes_left" in road else road.get("lanesLeft")
+    right = road["lanes_right"] if "lanes_right" in road else road.get("lanesRight")
+    return int(_num(left)), int(_num(right))
+
+
+def _effective_oneway(road: dict[str, Any]) -> bool:
+    """Same rule as ``classify_wrong_way``: oneWay, or no left lanes and some right lanes."""
+    if bool(road.get("oneway")):
+        return True
+    counts = _explicit_lanes(road)
+    if counts is None:
+        return False
+    left, right = counts
+    return left == 0 and right >= 1
+
+
+def _lane_count(road: dict[str, Any], width: float) -> int:
+    counts = _explicit_lanes(road)
+    if counts is not None and sum(counts) >= 1:
+        return sum(counts)
+    named = int(_num(road.get("lanes")))
+    if named >= 1:
+        return named
+    return max(1, min(8, int(round(float(width) / LANE_W_M))))
+
+
+def _offset_candidates(road: dict[str, Any]) -> list[float]:
+    """Metres to the right of the legal tangent, rightmost lane first."""
+    from python.train.frame_quality import CENTER_DEADZONE_M
+
+    width = float(road["width"])
+    count = _lane_count(road, width)
+    lane_w = width / count
+    centers = [-width / 2.0 + (index + 0.5) * lane_w for index in range(count)]
+    cap = max(0.0, width / 2.0 - EDGE_MARGIN_M)
+    if _effective_oneway(road):
+        raw = [min(max(0.0, center), cap) for center in centers if center >= -1e-6]
+        if not raw:
+            raw = [0.0]
+    else:
+        clear = CENTER_DEADZONE_M + LANE_CLEAR_M
+        raw = [min(center, cap) for center in centers if clear - 1e-9 <= center <= cap + 1e-6]
+        if not raw and cap >= clear:
+            raw = [min(clear, cap)]
+    ordered: list[float] = []
+    for center in sorted(raw, reverse=True):
+        if not ordered or abs(ordered[-1] - center) > 0.05:
+            ordered.append(center)
+    return ordered
+
+
+def _pose_shifted(
+    center: tuple[float, float, float],
+    node_tangent: tuple[float, float],
+    flip: bool,
+    offset_m: float,
+    z_lift: float,
+) -> tuple[tuple[float, float, float], tuple[float, float, float, float], tuple[float, float]]:
+    nx, ny = node_tangent
+    if flip:
+        nx, ny = -nx, -ny
+    rx, ry = ny, -nx
+    pos = (center[0] + rx * offset_m, center[1] + ry * offset_m, center[2] + z_lift)
+    return pos, _yaw_quat(nx, ny), (nx, ny)
+
+
+def _fmt_num(value: Any, spec: str) -> str:
+    if value is None:
+        return "na"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "na"
+    if not math.isfinite(number):
+        return "na"
+    return format(number, spec)
+
+
+def format_spawn_line(
+    prefix: str,
+    kind: str,
+    road_id: str,
+    flip: bool,
+    align: Any,
+    offset_m: Any,
+    verdict: str,
+) -> str:
+    """One spawn line: road, kind, flipDirection, align, offset_m, verdict."""
+    return (
+        f"{prefix} road={road_id} kind={kind} flipDirection={1 if flip else 0} "
+        f"align={_fmt_num(align, '.3f')} offset_m={_fmt_num(offset_m, '.2f')} verdict={verdict}"
+    )
+
+
+def _quality_from_road(road: dict[str, Any]) -> Any:
+    from python.train.frame_quality import QualityRoad
+
+    points = road.get("pts") or []
+    if len(points) < 2:
+        return None
+    try:
+        width = float(road.get("width"))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(width) or width < 0.5:
+        return None
+    counts = _explicit_lanes(road)
+    left = counts[0] if counts is not None else 0
+    right = counts[1] if counts is not None else 0
+    lanes = left + right if left + right >= 1 else int(_num(road.get("lanes")))
+    return QualityRoad(
+        road_id=str(road.get("id")),
+        xy=[(float(point[0]), float(point[1])) for point in points],
+        width_m=width,
+        oneway=bool(road.get("oneway")),
+        lanes_left=left,
+        lanes_right=right,
+        lanes=max(0, lanes),
+        drivability=1.0,
+        flip=bool(road.get("flip")),
+        z=[float(point[2]) for point in points],
+    )
+
+
+def _pose_accepted(got: Mapping[str, Any], road_id: str) -> bool:
+    from python.train.frame_quality import spawn_pose_rejected
+
+    if str(got.get("verdict") or "") != "ok":
+        return False
+    if str(got.get("road_id")) != str(road_id):
+        return False
+    return not spawn_pose_rejected(got)
+
+
+def seek_legal_pose(
+    road: dict[str, Any],
+    quality: list[Any],
+    grid: dict[Any, Any] | None,
+    *,
+    fractions: tuple[float, ...] = LEGAL_FRACTIONS,
+    attempts: int = LEGAL_ATTEMPTS,
+    z_lift: float = 0.5,
+    classify_z: bool = True,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """A legal right-lane pose, or ``(None, last classification)``.
+
+    Roads with no measured width keep the old centerline pose and are not
+    classified (callers that only stored a centerline have nothing to offset).
+    """
+    from python.train.frame_quality import classify_wrong_way
+
+    points = road.get("pts") or []
+    if not road.get("width"):
+        pose = _pose_at(points)
+        if pose is None:
+            return None, None
+        pos, rot = pose
+        return {
+            "pos": pos,
+            "rot": rot,
+            "flip": False,
+            "offset_m": None,
+            "align": None,
+            "verdict": None,
+            "reason": "",
+            "legacy": True,
+        }, None
+    flip = bool(road.get("flip"))
+    offsets = _offset_candidates(road)
+    if not offsets or not quality:
+        return None, None
+    last: dict[str, Any] | None = None
+    tried = 0
+    for fraction in fractions:
+        sampled = _sample_center(points, fraction)
+        if sampled is None:
+            continue
+        center, tangent = sampled
+        for offset in offsets:
+            if tried >= int(attempts):
+                return None, last
+            tried += 1
+            pos, rot, heading = _pose_shifted(center, tangent, flip, offset, z_lift)
+            yaw = math.atan2(heading[1], heading[0])
+            got = classify_wrong_way(
+                pos[0], pos[1], yaw, quality, grid, z=pos[2] if classify_z else None
+            )
+            last = got
+            if _pose_accepted(got, str(road.get("id"))):
+                return {
+                    "pos": pos,
+                    "rot": rot,
+                    "flip": flip,
+                    "offset_m": float(got["offset_m"]),
+                    "align": float(got["align"]),
+                    "verdict": str(got.get("verdict") or "ok"),
+                    "reason": str(got.get("reason") or ""),
+                    "legacy": False,
+                }, got
+    return None, last
+
+
+def _project_station(
+    points: list[tuple[float, float, float]], x: float, y: float
+) -> tuple[float, tuple[float, float, float], tuple[float, float]] | None:
+    """``(distance, center, node tangent)`` of the closest centerline point."""
+    best: tuple[float, tuple[float, float, float], tuple[float, float]] | None = None
+    for left, right in zip(points, points[1:]):
+        dx, dy = right[0] - left[0], right[1] - left[1]
+        length2 = dx * dx + dy * dy
+        if length2 < 1e-6:
+            continue
+        tee = ((x - left[0]) * dx + (y - left[1]) * dy) / length2
+        tee = 0.0 if tee < 0.0 else 1.0 if tee > 1.0 else tee
+        center = tuple(left[k] + (right[k] - left[k]) * tee for k in range(3))
+        dist = math.hypot(x - center[0], y - center[1])
+        norm = math.sqrt(length2)
+        tangent = (dx / norm, dy / norm)
+        if best is None or dist < best[0]:
+            best = (dist, center, tangent)
+    return best
+
+
+def legal_pose_near(
+    roads: list[dict[str, Any]],
+    x: float,
+    y: float,
+    z: float | None = None,
+    *,
+    max_dist: float = 40.0,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Legal right-lane pose on the centerline nearest ``(x, y)``, within ``max_dist``.
+
+    ``z`` is ignored for the search. The returned height is the node height
+    plus half a metre, which is what a recovery snap uses.
+    """
+    del z
+    from python.train.frame_quality import build_road_grid, classify_wrong_way
+
+    ranked: list[tuple[float, dict[str, Any], tuple[float, float, float], tuple[float, float]]] = []
+    for road in roads:
+        hit = _project_station(road.get("pts") or [], x, y)
+        if hit is None or hit[0] > float(max_dist):
+            continue
+        ranked.append((hit[0], road, hit[1], hit[2]))
+    ranked.sort(key=lambda item: item[0])
+    if not ranked:
+        return None, None
+    nearest = ranked[0]
+    if not nearest[1].get("width"):
+        center, tangent = nearest[2], nearest[3]
+        pos = (center[0], center[1], center[2] + 0.5)
+        return {
+            "pos": pos,
+            "rot": _yaw_quat(tangent[0], tangent[1]),
+            "flip": False,
+            "offset_m": None,
+            "align": None,
+            "verdict": None,
+            "reason": "",
+            "legacy": True,
+            "road_id": str(nearest[1].get("id")),
+        }, None
+    quality = [item for item in (_quality_from_road(road) for _d, road, _c, _t in ranked) if item is not None]
+    grid = build_road_grid(quality) if quality else {}
+    last: dict[str, Any] | None = None
+    tried = 0
+    for _dist, road, center, tangent in ranked[:4]:
+        if not road.get("width"):
+            continue
+        flip = bool(road.get("flip"))
+        for offset in _offset_candidates(road):
+            if tried >= LEGAL_ATTEMPTS:
+                return None, last
+            tried += 1
+            pos, rot, heading = _pose_shifted(center, tangent, flip, offset, 0.5)
+            got = classify_wrong_way(
+                pos[0], pos[1], math.atan2(heading[1], heading[0]), quality, grid, z=pos[2]
+            )
+            last = got
+            if _pose_accepted(got, str(road.get("id"))):
+                return {
+                    "pos": pos,
+                    "rot": rot,
+                    "flip": flip,
+                    "offset_m": float(got["offset_m"]),
+                    "align": float(got["align"]),
+                    "verdict": str(got.get("verdict") or "ok"),
+                    "reason": str(got.get("reason") or ""),
+                    "legacy": False,
+                    "road_id": str(road.get("id")),
+                }, got
+    return None, last
+
+
+def view_from_network_road(road_id: str, road: Any) -> dict[str, Any] | None:
+    """One spawn-road dict from a ``get_road_network`` value (dict or edge list)."""
+    if isinstance(road, list):
+        road = {"edges": road}
+    if not isinstance(road, dict):
+        return None
+    try:
+        if float(road.get("drivability", road.get("drivable", 1)) or 0) <= 0.0:
+            return None
+    except (TypeError, ValueError):
+        pass
+    points = _middles(road)
+    if len(points) < 2:
+        return None
+    counts = _explicit_lanes(road)
+    lanes = (sum(counts) if counts is not None else 0) or int(_num(road.get("lanes")))
+    width = road.get("width")
+    try:
+        width_f = float(width) if width is not None else None
+    except (TypeError, ValueError):
+        width_f = None
+    if width_f is None or width_f < 0.5:
+        width_f = _width_of_edges(road.get("edges"))
+    return {
+        "id": str(road_id),
+        "pts": points,
+        "lanes": lanes,
+        "lanes_left": counts[0] if counts is not None else 0,
+        "lanes_right": counts[1] if counts is not None else 0,
+        "length": _num(road.get("debugRoadLength")) or _polyline_m(points),
+        "oneway": _flag(road.get("oneWay", road.get("oneway"))),
+        "flip": _flag(road.get("flipDirection", road.get("flip"))),
+        "width": width_f,
+    }
+
+
+def views_from_network(spec: Any) -> list[dict[str, Any]]:
+    """Spawn roads from a road-network payload, keeping flip and lane counts."""
+    if isinstance(spec, dict) and isinstance(spec.get("roads"), dict):
+        spec = spec["roads"]
+    elif isinstance(spec, dict) and isinstance(spec.get("road_network"), dict):
+        spec = spec["road_network"]
+    if not isinstance(spec, dict):
+        return []
+    views: list[dict[str, Any]] = []
+    for road_id, road in spec.items():
+        view = view_from_network_road(str(road_id), road)
+        if view is not None:
+            views.append(view)
+    return views
+
+
+def index_spawn_roads(views: list[dict[str, Any]]) -> tuple[list[Any], dict[Any, Any]]:
+    """Quality roads for ``classify_wrong_way``, in the same order as ``views``."""
+    from python.train.frame_quality import build_road_grid
+
+    built = [item for item in (_quality_from_road(view) for view in views) if item is not None]
+    return built, (build_road_grid(built) if built else {})
+
+
+def view_from_poly(road: Any) -> dict[str, Any] | None:
+    """A ``RoadPoly`` or any object with ``xy`` (and optional lane fields)."""
+    xy = getattr(road, "xy", None)
+    if not xy or len(xy) < 2:
+        return None
+    heights = getattr(road, "z", None) or []
+    points: list[tuple[float, float, float]] = []
+    for index, pair in enumerate(xy):
+        height = 0.0
+        if heights and index < len(heights) and heights[index] is not None:
+            try:
+                height = float(heights[index])
+            except (TypeError, ValueError):
+                height = 0.0
+        points.append((float(pair[0]), float(pair[1]), height))
+    width = getattr(road, "width_m", None)
+    try:
+        width_f = float(width) if width is not None else None
+    except (TypeError, ValueError):
+        width_f = None
+    has_sides = getattr(road, "lanes_left", None) is not None or getattr(road, "lanes_right", None) is not None
+    left = int(getattr(road, "lanes_left", 0) or 0) if has_sides else 0
+    right = int(getattr(road, "lanes_right", 0) or 0) if has_sides else 0
+    lanes = int(getattr(road, "lanes", 0) or 0)
+    view = {
+        "id": str(getattr(road, "road_id", None) or getattr(road, "id", None) or ""),
+        "pts": points,
+        "lanes": lanes or (left + right),
+        "length": _polyline_m(points),
+        "oneway": bool(getattr(road, "oneway", False)),
+        "flip": bool(getattr(road, "flip", False)),
+        "width": width_f if width_f and width_f >= 0.5 else None,
+    }
+    if has_sides:
+        view["lanes_left"] = left
+        view["lanes_right"] = right
+    return view
+
+
 def load_nav_roads(path: Path | str) -> list[dict[str, Any]]:
     """Drivable navgraph roads with a centerline of at least two points."""
     file = Path(path)
@@ -411,7 +889,9 @@ def load_nav_roads(path: Path | str) -> list[dict[str, Any]]:
         points = _middles(road)
         if len(points) < 2:
             continue
-        lanes = int(_num(road.get("lanesLeft"))) + int(_num(road.get("lanesRight")))
+        lanes_left = int(_num(road.get("lanesLeft")))
+        lanes_right = int(_num(road.get("lanesRight")))
+        lanes = lanes_left + lanes_right
         length = _num(road.get("debugRoadLength"))
         drivability = _num(road.get("drivability"), -1.0)
         if drivability < 0.3 or length < 12.0 or lanes < 1:
@@ -422,8 +902,12 @@ def load_nav_roads(path: Path | str) -> list[dict[str, Any]]:
                 "id": str(road_id),
                 "pts": points,
                 "lanes": lanes,
+                "lanes_left": lanes_left,
+                "lanes_right": lanes_right,
                 "length": length,
                 "oneway": oneway,
+                "flip": _flag(road.get("flipDirection")),
+                "width": _width_of_edges(road.get("edges")),
             }
         )
     return roads
@@ -530,6 +1014,9 @@ class SpawnDeck:
         self.last_type: str | None = None
         self.resume_skipped = 0
         self.exhausted = False
+        self._quality: list[Any] | None = None
+        self._quality_grid: dict[Any, Any] | None = None
+        self._quality_ready = False
         self._by_id: dict[str, dict[str, Any]] = {}
         self._ends: dict[tuple[int, int], list[tuple[str, bool]]] = defaultdict(list)
         for pool_kind, pool in self.pools.items():
@@ -547,7 +1034,76 @@ class SpawnDeck:
         rng: random.Random | None = None,
         **kwargs: Any,
     ) -> SpawnDeck:
-        return cls(classify_roads(load_nav_roads(path)), rng, **kwargs)
+        deck = cls(classify_roads(load_nav_roads(path)), rng, **kwargs)
+        deck._bind_dump(path)
+        return deck
+
+    def _bind_dump(self, path: Path | str) -> None:
+        """Classify poses with the same road dump the offline filter uses."""
+        from python.train.frame_quality import build_road_grid, load_quality_roads
+
+        try:
+            roads = load_quality_roads(path)
+        except Exception:
+            return
+        if not roads:
+            return
+        self._quality = roads
+        self._quality_grid = build_road_grid(roads)
+        self._quality_ready = True
+
+    def _ensure_quality(self) -> tuple[list[Any], dict[Any, Any]]:
+        if not self._quality_ready:
+            built = [item for item in (_quality_from_road(road) for road in self._by_id.values()) if item is not None]
+            from python.train.frame_quality import build_road_grid
+
+            self._quality = built
+            self._quality_grid = build_road_grid(built) if built else {}
+            self._quality_ready = True
+        return self._quality or [], self._quality_grid or {}
+
+    def _legal_for(self, kind: str, road: dict[str, Any]) -> dict[str, Any] | None:
+        from python.train.frame_quality import classify_wrong_way
+
+        quality, grid = self._ensure_quality()
+        found, last = seek_legal_pose(road, quality, grid)
+        if found is not None and found.get("legacy") and quality:
+            pos, rot = found["pos"], found["rot"]
+            _qx, _qy, qz, qw = rot
+            yaw = math.atan2(2.0 * qw * qz, 1.0 - 2.0 * qz * qz)
+            last = classify_wrong_way(pos[0], pos[1], yaw, quality, grid, z=pos[2])
+            if _pose_accepted(last, str(road.get("id"))):
+                found = {
+                    "pos": pos,
+                    "rot": rot,
+                    "flip": bool(road.get("flip")),
+                    "offset_m": float(last["offset_m"]),
+                    "align": float(last["align"]),
+                    "verdict": str(last.get("verdict") or "ok"),
+                    "reason": str(last.get("reason") or ""),
+                    "legacy": False,
+                }
+            else:
+                found = None
+        if found is not None:
+            return found
+        if not road.get("width") and not quality:
+            return None
+        reason = ""
+        align = offset = None
+        verdict = "rejected"
+        if last:
+            reason = str(last.get("reason") or "")
+            verdict = reason or str(last.get("verdict") or "rejected")
+            align = last.get("align")
+            offset = last.get("offset_m")
+        self._say(
+            format_spawn_line(
+                "spawn reject", kind, str(road.get("id")), bool(road.get("flip")), align, offset, verdict
+            )
+            + " (skipped)"
+        )
+        return None
 
     def filtering(self) -> bool:
         return self.painted is not None and bool(self.painted) and self.min_paint_cov > 0.0
@@ -566,15 +1122,39 @@ class SpawnDeck:
         if self.log is not None:
             self.log(text)
 
-    def _pick(self, kind: str, road: dict[str, Any], pose: Any, cov: float | None, wanted: str) -> SpawnPick:
+    def _pick(
+        self, kind: str, road: dict[str, Any], info: dict[str, Any], cov: float | None, wanted: str
+    ) -> SpawnPick:
         self.counts[kind] += 1
         rid = str(road["id"])
         self.road_picks[rid] = self.road_picks.get(rid, 0) + 1
         self.road_kind[rid] = kind
         if kind != wanted:
             self.cross_kind += 1
-        pos, rot = pose
-        return SpawnPick(kind, road["id"], pos, rot, SPEED[kind], cov)
+        if not info.get("legacy"):
+            self._say(
+                format_spawn_line(
+                    "spawn legal",
+                    kind,
+                    rid,
+                    bool(info.get("flip")),
+                    info.get("align"),
+                    info.get("offset_m"),
+                    str(info.get("verdict") or "ok"),
+                )
+            )
+        return SpawnPick(
+            kind,
+            road["id"],
+            info["pos"],
+            info["rot"],
+            SPEED[kind],
+            cov,
+            None if info.get("legacy") else bool(info.get("flip")),
+            None if info.get("legacy") else info.get("align"),
+            None if info.get("legacy") else info.get("offset_m"),
+            None if info.get("legacy") else info.get("verdict"),
+        )
 
     def take(self, source: str = "spawn") -> SpawnPick | None:
         """Next spawn, or None. ``last_ms`` is this call's wall time.
@@ -829,8 +1409,27 @@ class SpawnDeck:
             if along < want - 1e-6:
                 notes.append(f"traffic {where} fallback: farthest valid spot {along:.1f} m along the road (wanted {want:.0f} m)")
             fx, fy = (-tx, -ty) if back else (tx, ty)
+            shift = 0.0 if pick.offset_m is None else float(pick.offset_m)
+            rx, ry = fy, -fx
+            x += rx * shift
+            y += ry * shift
+            if shift and not self._slot_is_legal(x, y, z + 0.5, fx, fy):
+                notes.append(f"traffic {where} skipped: not in a legal lane")
+                continue
             slots.append((where, (x, y, z + 0.5), _yaw_quat(fx, fy), along))
         return slots, notes
+
+    def _slot_is_legal(self, x: float, y: float, z: float, fx: float, fy: float) -> bool:
+        """Companion cars use the ego's lane shift, and are dropped when that is rejected."""
+        from python.train.frame_quality import classify_wrong_way, spawn_pose_rejected
+
+        quality, grid = self._ensure_quality()
+        if not quality:
+            return True
+        got = classify_wrong_way(x, y, math.atan2(fy, fx), quality, grid, z=z)
+        if spawn_pose_rejected(got):
+            return False
+        return str(got.get("verdict") or "") == "ok"
 
     # ------------------------------------------------------------ recheck
     def nearest_road(
@@ -910,25 +1509,25 @@ class SpawnDeck:
             return None
         order = [first] + [kind for kind in self._kinds_by_deficit() if kind != first]
         filtering = self.filtering()
-        tried: list[tuple[float, str, dict[str, Any], Any]] = []
+        tried: list[tuple[float, str, dict[str, Any], dict[str, Any]]] = []
         for kind in order:
             budget = self.max_tries
             for road in [item for item in self.pools[kind] if item["id"] not in self.used]:
-                pose = _pose_at(road["pts"])
                 self.used.add(road["id"])
-                if pose is None:
+                info = self._legal_for(kind, road)
+                if info is None:
                     continue
                 if not filtering:
-                    return self._pick(kind, road, pose, None, first)
+                    return self._pick(kind, road, info, None, first)
                 cov = self.coverage(road)
                 if cov >= self.min_paint_cov:
                     self._say(
                         f"spawn pick {kind} road={road['id']} paint_cov={cov:.2f} "
                         f"(>={self.min_paint_cov:.2f}, skipped {len(tried)})"
                     )
-                    return self._pick(kind, road, pose, cov, first)
+                    return self._pick(kind, road, info, cov, first)
                 self.skipped += 1
-                tried.append((cov, kind, road, pose))
+                tried.append((cov, kind, road, info))
                 self._say(
                     f"spawn skip {kind} road={road['id']} paint_cov={cov:.2f} (<{self.min_paint_cov:.2f})"
                 )
@@ -937,13 +1536,13 @@ class SpawnDeck:
                     break
         if not tried:
             return None
-        cov, kind, road, pose = max(tried, key=lambda item: item[0])
+        cov, kind, road, info = max(tried, key=lambda item: item[0])
         self._say(
             f"spawn fallback {kind} road={road['id']} paint_cov={cov:.2f} "
             f"(no road >= {self.min_paint_cov:.2f} in {len(tried)} tries)"
         )
         self.best_seen += 1
-        return self._pick(kind, road, pose, cov, first)
+        return self._pick(kind, road, info, cov, first)
 
     def _kinds_by_deficit(self) -> list[str]:
         total = sum(self.counts.values()) + 1

@@ -193,3 +193,13 @@ The live A/B recipe uses `--no-resume`.
   centerline and off-network are `unknown` and are not dropped.
 - A lower-half white image exceeds `0.20`; an upper-only clip does not.
 - `apply_frame_quality` with both flags off returns the same rows.
+
+## Collector spawns
+
+Recording spawns use this classifier before a pose is kept. The legal tangent
+is node order, reversed when `flipDirection` is set. The car is placed in the
+rightmost lane on a one-way road, and in a right-hand lane at least 0.75 m
+off the centerline on a two-way road. A `wrong_way` verdict or a
+`twoway_centerline` reason is not spawned: the deck tries a bounded set of
+lanes and stations, then skips that road and logs the rejection. Classifier
+verdicts themselves are unchanged.

@@ -20,6 +20,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from python.collect.signal_labels import label_signs, sidecar_row  # noqa: E402
+from python.collect.static_signs import (  # noqa: E402
+    STATIC_SIGNS_NAME,
+    load_static_catalog,
+    merge_static_into_rows,
+)
 
 
 def _load_signals(path: Path) -> tuple[str, Any]:
@@ -76,6 +81,15 @@ def main(argv: list[str] | None = None) -> int:
             )
             for row in state_rows
         ]
+    catalog_path = root / STATIC_SIGNS_NAME
+    catalog = load_static_catalog(catalog_path)
+    if catalog is not None:
+        labelled = merge_static_into_rows(labelled, state_rows, catalog)
+    elif catalog_path.is_file():
+        print(
+            f"[GVD] stop-sign source: absent on {root.name}: unrecognized {STATIC_SIGNS_NAME}",
+            flush=True,
+        )
     with out.open("w", encoding="utf-8") as dest:
         for row in labelled:
             dest.write(json.dumps(row, sort_keys=True) + "\n")

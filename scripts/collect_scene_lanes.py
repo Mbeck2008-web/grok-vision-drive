@@ -2442,6 +2442,26 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         run.ctl_reads = {"pipelined": ctl_pipelined, "probes": 0, "probe_null": 0, "traffic_reads": 0, "traffic_null": 0}
         ctl_meta_for: int | None = None
         ai_cmd = control_log.ai_cmd_state()
+        static_done: set[str] = set()
+
+        def _capture_static(map_label: str) -> None:
+            """One scenetree read per map. A failure is a marker, not a guessed sign."""
+            label = str(map_label or "").strip() or "loaded"
+            if label in static_done:
+                return
+            static_done.add(label)
+            from python.collect.static_signs import STATIC_SIGNS_NAME, record_static_signs
+
+            try:
+                record_static_signs(bng, label, out / STATIC_SIGNS_NAME)
+            except Exception as exc:  # noqa: BLE001 — keep collecting; the marker is the record
+                print(
+                    f"[GVD] stop-sign source: absent on {label}: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+
+        if not map_names:
+            _capture_static("")
         while done_s < target_s:
             run.beat(done_s)
             if stop_file(out).is_file():
@@ -2533,6 +2553,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     return 2
                 loaded_map = map_name
                 loaded_index = seg_index
+                _capture_static(map_name)
                 cut_at_load = schedule_cut
                 last_ai = None
                 held_tag = None

@@ -13,6 +13,8 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from python.collect.signal_labels import SIGN_CLASSES
+
 STOP_LINE_DIM = 2
 
 
@@ -107,6 +109,8 @@ def attach_sign_labels(rows: list[dict[str, Any]]) -> dict[str, int]:
     """
     caches: dict[str, dict[str, dict[str, Any]] | None] = {}
     counts = {"parsed": 0, "masked": 0, "absent": 0}
+    for name in SIGN_CLASSES:
+        counts[name] = 0
     for row in rows:
         root = str(row.get("source_root") or "")
         if not root:
@@ -125,8 +129,13 @@ def attach_sign_labels(rows: list[dict[str, Any]]) -> dict[str, int]:
             counts["masked"] += 1
             continue
         signs = rec.get("signs")
-        _write_signs(row, list(signs) if isinstance(signs, list) else [])
+        copied = list(signs) if isinstance(signs, list) else []
+        _write_signs(row, copied)
         counts["parsed"] += 1
+        for sign in copied:
+            cls = sign.get("cls") if isinstance(sign, dict) else None
+            if cls in counts:
+                counts[str(cls)] += 1
     return counts
 
 
@@ -165,8 +174,10 @@ def attach_stop_lines(rows: list[dict[str, Any]]) -> dict[str, int]:
 
 
 def sign_counts_line(counts: Mapping[str, int]) -> str:
+    """Row joins, then how many sign objects of each class were copied on."""
     parts = " ".join(f"{name}={int(counts.get(name, 0))}" for name in ("parsed", "masked", "absent"))
-    return f"[GVD] signs: {parts}"
+    classes = " ".join(f"{name}={int(counts.get(name, 0))}" for name in SIGN_CLASSES)
+    return f"[GVD] signs: {parts} {classes}"
 
 
 def stop_counts_line(counts: Mapping[str, int]) -> str:

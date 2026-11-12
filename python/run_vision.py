@@ -454,6 +454,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Sim ground truth JSONL under logs/ (or set GVD_GT_LOG=1). Off in normal play.",
     )
     ap.add_argument(
+        "--drive-log",
+        default="",
+        help="Append one JSONL row per supervisor tick (lane_x, steer, pose, BeamNG applied steer). "
+        "Off unless a path is set. Does not change the command.",
+    )
+    ap.add_argument(
+        "--drive-log-gt",
+        action="store_true",
+        help="With --drive-log, also record the painted-lane center at 8 m "
+        "(the training-label geometry). Logged only: not a steer, pedal, or viz input. "
+        "Visualizer ground truth stays behind --debug-gt.",
+    )
+    ap.add_argument(
         "--debug-gt",
         action="store_true",
         help="DEBUG ONLY, off by default: draw sim/map overlays that use BeamNG ground "
@@ -609,6 +622,10 @@ def main(clock=None) -> None:
     scene_ckpt_path = str(getattr(args, "scene_ckpt", "") or "").strip()
     if bool(getattr(args, "scene_ckpt_drive", False)) and not scene_ckpt_path:
         print("[GVD] --scene-ckpt-drive requires --scene-ckpt <epoch.npz>", flush=True)
+        raise SystemExit(2)
+    drive_log_path = str(getattr(args, "drive_log", "") or "").strip()
+    if bool(getattr(args, "drive_log_gt", False)) and not drive_log_path:
+        print("[GVD] --drive-log-gt requires --drive-log PATH", flush=True)
         raise SystemExit(2)
     if scene_ckpt_path and not bool(getattr(args, "scene_ckpt_drive", False)):
         args.no_engage = True
@@ -930,9 +947,23 @@ def main(clock=None) -> None:
     lane_steer = LaneSteerState()
     launch_guard = LaunchGuard()
     gt_log = None
+    drive_log = None
+    drive_gt = None
     if gt_log_enabled(bool(args.gt_log)) or args.lane_source == "gt":
         gt_log = GroundTruthLogger.open()
         print(f"[GVD] ground truth -> {gt_log.path}", flush=True)
+    if drive_log_path:
+        from python.debug.drive_log import DriveLog, PaintLaneGt
+
+        drive_log = DriveLog(drive_log_path)
+        print(f"[GVD] drive log -> {drive_log.path}", flush=True)
+        if bool(getattr(args, "drive_log_gt", False)):
+            ckpt_origin = None
+            if scene_ckpt is not None:
+                ckpt_origin = str((getattr(scene_ckpt, "meta", None) or {}).get("gvd_gt_origin") or "") or None
+            drive_gt = PaintLaneGt(origin=ckpt_origin)
+            drive_gt.load(bng)
+            print("[GVD] drive-log GT: painted 8 m center, log only", flush=True)
     capture_slot = LatestFrameSlot()
     capture_pump: CapturePump | None = None
     age_window = AgeWindow()
@@ -1032,6 +1063,7 @@ def main(clock=None) -> None:
             capture_pump = CapturePump(capture_slot, backend.grab, idle_s=0.002)
             capture_pump.start()
         while True:
+            steer_law = None
             if run_deadline is not None and time.monotonic() >= run_deadline:
                 print(f"[GVD] --run-seconds {float(args.run_seconds):g} reached; stopping", flush=True)
                 break
@@ -1648,6 +1680,8 @@ def main(clock=None) -> None:
             # Debug gain, invert, and the steer cap still have the last word
             # before the launch cap. A crash after that brakes and disengages.
             cmd = apply_to_command(ui.debug, cmd)
+            # Lane-law output, before launch yaw may replace it. Logged only.
+            steer_law = float(cmd.steer)
             hdg = None
             dmg = None
             pos_xy = None
@@ -2127,6 +2161,61 @@ def main(clock=None) -> None:
                 write_state(st)
                 soft_esc_state_write_mark()
 
+            if drive_log is not None:
+                from python.debug.drive_log import record_drive_tick
+
+                gt_x = None
+                gt_origin = None
+                if drive_gt is not None:
+                    # After the command is applied. The return value is the log row only.
+                    gt_x, gt_origin = drive_gt.sample(
+                        vdata,
+                        bng,
+                        socket_busy=bool(getattr(bundle, "grab_read_blocked", False)),
+                    )
+                model_x = None
+                if ckpt_pred is not None and getattr(ckpt_pred, "lane_x", None) is not None:
+                    model_x = getattr(ckpt_pred, "lane_x", None)
+                elif scene_lane_x is not None:
+                    model_x = scene_lane_x
+                launch_yaw = None
+                if (
+                    launch_guard.active
+                    and launch_guard.heading is not None
+                    and launch_guard.heading0 is not None
+                ):
+                    launch_yaw = float(launch_guard.heading) - float(launch_guard.heading0)
+                gear = getattr(vdata, "gear", None) if vdata is not None else None
+                pose = getattr(vdata, "pos", None) if vdata is not None else None
+                record_drive_tick(
+                    drive_log,
+                    applied,
+                    {
+                        "wall": time.time(),
+                        "frame_id": int(frame_i),
+                        "frame_age_s": frame_age_s_cap,
+                        "lane_x": lane_x,
+                        "lane_y": lane_y,
+                        "steer_cmd": float(applied.steer),
+                        "steer_why": lane_steer.reason,
+                        "throttle": float(applied.throttle),
+                        "brake": float(applied.brake),
+                        "gear": gear,
+                        "speed_mps": ego_v,
+                        "yaw_rad": hdg,
+                        "pos": pose,
+                        "applied_steer": steer_in,
+                        "loop_hz": None if frame_i == 0 else loop_hz_ema,
+                        "camera_hz": None if frame_i == 0 else cam_hz_ema,
+                        "model_lane_x": model_x,
+                        "steer_law": steer_law,
+                        "launch_yaw_rad": launch_yaw,
+                    },
+                    include_gt=drive_gt is not None,
+                    gt_lane_x=gt_x,
+                    gt_origin=gt_origin,
+                )
+
             if gt_log is not None:
                 gt_log.write(
                     bng=bng,
@@ -2215,6 +2304,11 @@ def main(clock=None) -> None:
                 pass
         if capture_pump is not None:
             capture_pump.stop()
+        if drive_log is not None:
+            try:
+                drive_log.close()
+            except Exception:
+                pass
         backend.close()
         try:
             fox.close()

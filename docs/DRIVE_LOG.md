@@ -7,10 +7,10 @@ Opt-in supervisor log for a live scene-ckpt drive. It does not change steering, 
 BeamNG.tech 0.39 is already up (`BeamNG.tech.exe -tcom -console -gfx vk`, port 25252). One process. The Grok Vision Drive mod is enabled. Spawn the car, then from the repo:
 
 ```
-py -3 -m python.run_vision --backend beamngpy --scene-ckpt E:\GVD_data\models\<run>.ckpt_ep11_step<S>.npz --scene-ckpt-drive --hz 10 --drive-log E:\GVD_data\logs\drive.jsonl --drive-log-gt
+py -3 -m python.run_vision --backend beamngpy --scene-ckpt E:\GVD_data\models\<run>.ckpt_ep11_step<S>.npz --scene-ckpt-drive --live-long-side 640 --hz 10 --drive-log E:\GVD_data\logs\drive.jsonl --drive-log-gt
 ```
 
-`<run>.ckpt_ep11_step<S>.npz` is the aux_ds epoch-11 checkpoint (`train_scene` names it `<strips>.run<UTC>.ckpt_ep<N>_step<S>.npz`). `play_gvd_tech.bat` attaches and forwards extra arguments, so the same flags can be passed after the bat's own `--backend beamngpy --viz`.
+`<run>.ckpt_ep11_step<S>.npz` is the aux_ds epoch-11 checkpoint (`train_scene` names it `<strips>.run<UTC>.ckpt_ep<N>_step<S>.npz`). `--live-long-side 640` is the camera long side the scene net was trained on. `--hz 10` is the loop cap: after each tick the supervisor sleeps the rest of `1/10` s (`run_vision` `time.sleep`). It does not force the loop to run at 10 Hz. `loop_hz` and `camera_hz` in the log are the measured EMAs, and both are null on frame 0 before a period exists. `play_gvd_tech.bat` attaches and forwards extra arguments, so the same flags can be passed after the bat's own `--backend beamngpy --viz`.
 
 Engage from the GVD VISION window. `q` quits the supervisor and leaves BeamNG open. Each tick is flushed, so a crash still leaves the rows.
 

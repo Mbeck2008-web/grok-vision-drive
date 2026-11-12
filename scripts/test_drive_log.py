@@ -6,7 +6,10 @@ Plain asserts so ``run_offline_suite.py`` runs it; functions are named
 """
 from __future__ import annotations
 
+import gzip
 import json
+import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -198,6 +201,21 @@ def test_report_scores_model_against_gt_and_flags_opposite_steer() -> None:
         assert report_main([str(path)]) == 0
 
 
+def test_applied_steer_unit_names_the_lock() -> None:
+    """BeamNG's reported steer carries its unit. A null unit fails this test."""
+    from python.control.actuate import DriveCommand
+    from python.debug.drive_log import APPLIED_STEER_UNIT, DriveLog, record_drive_tick
+
+    cmd = DriveCommand(steer=0.0, throttle=0.0, brake=0.0, seq=1, reason="not_engaged")
+    with tempfile.TemporaryDirectory() as tmp:
+        log = DriveLog(Path(tmp) / "drive.jsonl")
+        row = record_drive_tick(log, cmd, {"applied_steer": 0.25, "frame_id": 1}, include_gt=False)
+        log.close()
+    assert row["applied_steer"] == 0.25
+    assert row["applied_steer_unit"] == "steering_input (±1 = ±30 deg road wheel)"
+    assert row["applied_steer_unit"] == APPLIED_STEER_UNIT
+
+
 def test_supervisor_wires_drive_log_without_feeding_viz_or_steer() -> None:
     src = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
     assert "--drive-log" in src
@@ -263,13 +281,169 @@ def test_launch_yaw_can_oppose_positive_lane_x() -> None:
     assert held.throttle == 0.0
 
 
+class _StepClock:
+    """Three supervisor ticks, 0.25 s apart, then stop. ``perf`` is the loop clock."""
+
+    def __init__(self) -> None:
+        self.t = 1000.0
+        self.steps = 0
+
+    def mono(self) -> float:
+        return self.t
+
+    def perf(self) -> float:
+        return self.t
+
+    def wall(self) -> float:
+        return 1_700_000_000.0 + self.t
+
+    def sleep(self, _seconds: float) -> None:
+        self.steps += 1
+        if self.steps >= 3:
+            raise SystemExit(0)
+        self.t += 0.25
+
+
+def _install_stub_pose() -> None:
+    """Stub camera plus a painted-lane pose. The actuator stays the real cmd_json stub."""
+    from python.sensors.cameras import StubBackend
+    from python.sensors.tech import VehicleData
+
+    class _Level:
+        def queue_lua_command(self, _command: str, *args: object, **kwargs: object) -> str:
+            return "gvd_paint_map"
+
+    def poll_vehicle(self: object) -> VehicleData:
+        return VehicleData(
+            connected=True,
+            pos=(0.4, 0.0, 0.0),
+            dir=(0.0, 1.0, 0.0),
+            speed_mps=0.0,
+            steering_input=0.25,
+            gear=2,
+            model="etk800",
+        )
+
+    StubBackend.bng = property(lambda self: _Level())  # type: ignore[method-assign]
+    StubBackend.poll_vehicle = poll_vehicle  # type: ignore[method-assign]
+
+
+def drive_log_supervisor_child() -> int:
+    """One real ``run_vision.main`` loop. ``GVD_DRIVE_LOG_GT=1`` turns the GT flag on."""
+    _install_stub_pose()
+    from python.run_vision import main as run_main
+
+    argv = [
+        "run_vision.py",
+        "--backend",
+        "stub",
+        "--vision-only",
+        "--no-engage",
+        "--encode",
+        "cpu",
+        "--hz",
+        "8",
+        "--drive-log",
+        os.environ["GVD_DRIVE_LOG_PATH"],
+    ]
+    if os.environ.get("GVD_DRIVE_LOG_GT") == "1":
+        argv.append("--drive-log-gt")
+    sys.argv = argv
+    run_main(clock=_StepClock())
+    return 0
+
+
+def _write_paint(data_dir: Path) -> None:
+    roads = data_dir / "roads"
+    roads.mkdir(parents=True, exist_ok=True)
+    decals = [_straight(-1.75), _straight(1.75)]
+    with gzip.open(roads / "gvd_paint_map_lines.json.gz", "wt", encoding="utf-8") as fh:
+        json.dump(decals, fh)
+
+
+def _run_supervisor(log_path: Path, *, include_gt: bool) -> tuple[int, str]:
+    env = dict(os.environ)
+    env["GVD_DRIVE_LOG_CHILD"] = "1"
+    env["GVD_DRIVE_LOG_GT"] = "1" if include_gt else "0"
+    env["GVD_DRIVE_LOG_PATH"] = str(log_path)
+    proc = subprocess.run(
+        [sys.executable, "-u", str(Path(__file__).resolve())],
+        cwd=str(ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return proc.returncode, proc.stdout + proc.stderr
+
+
+def _rows(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def test_live_supervisor_gt_flag_leaves_applied_command() -> None:
+    """The real stub tick applies the same command with ``--drive-log-gt`` on and off.
+
+    Ground truth is on the log row. ``loop_hz`` / ``camera_hz`` are the measured
+    EMA (null on frame 0). A hardcoded 99, a null steer unit, or
+    ``applied.steer = float(gt_x)`` after the paint sample fails this test.
+    """
+    from gvd_test_env import isolated_home
+
+    from python.debug.drive_log import APPLIED_STEER_UNIT
+
+    with isolated_home(prefix="gvd-drive-log-") as home:
+        data = Path(home) / "data"
+        _write_paint(data)
+        os.environ["GVD_DATA_DIR"] = str(data)
+        off_path = Path(home) / "off.jsonl"
+        on_path = Path(home) / "on.jsonl"
+        code_off, text_off = _run_supervisor(off_path, include_gt=False)
+        code_on, text_on = _run_supervisor(on_path, include_gt=True)
+        assert code_off == 0, text_off[-2000:]
+        assert code_on == 0, text_on[-2000:]
+        off = _rows(off_path)
+        on = _rows(on_path)
+        assert len(off) == 3 and len(on) == 3, (len(off), len(on), text_on[-1500:])
+        command = lambda row: (row["steer_cmd"], row["throttle"], row["brake"])
+        assert [command(row) for row in on] == [command(row) for row in off]
+        for row in on:
+            assert row["gt_lane_x"] is not None, row
+            assert abs(float(row["gt_lane_x"]) - (-0.4)) < 0.05, row["gt_lane_x"]
+            assert row["steer_cmd"] != row["gt_lane_x"]
+        for row in off:
+            assert "gt_lane_x" not in row
+        for row in on + off:
+            assert row["applied_steer"] == 0.25
+            assert row["applied_steer_unit"] == APPLIED_STEER_UNIT
+            if row["frame_id"] == 0:
+                assert row["loop_hz"] is None and row["camera_hz"] is None, row
+            else:
+                assert abs(float(row["loop_hz"]) - 4.0) < 1e-6, row
+                assert row["camera_hz"] == 0.0, row
+        state_path = (
+            Path(os.environ["LOCALAPPDATA"])
+            / "BeamNG"
+            / "BeamNG.drive"
+            / "current"
+            / "Documents"
+            / "GVD"
+            / "gvd_state.json"
+        )
+        assert state_path.is_file(), state_path
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        assert "gt_lane_x" not in state
+
+
 def main() -> None:
     test_row_schema_nulls_missing_fields()
     test_drive_log_gt_does_not_change_control()
     test_gt_lane_x_is_the_training_label_at_8m()
     test_missing_paint_is_null_not_a_centered_lane()
     test_report_scores_model_against_gt_and_flags_opposite_steer()
+    test_applied_steer_unit_names_the_lock()
     test_supervisor_wires_drive_log_without_feeding_viz_or_steer()
+    test_live_supervisor_gt_flag_leaves_applied_command()
     test_pursuit_keeps_the_sign_of_lane_x()
     test_rate_limit_leaves_the_opposite_band_in_one_tick()
     test_launch_yaw_can_oppose_positive_lane_x()
@@ -277,4 +451,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    if os.environ.get("GVD_DRIVE_LOG_CHILD") == "1":
+        raise SystemExit(drive_log_supervisor_child())
     main()

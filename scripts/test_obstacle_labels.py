@@ -204,7 +204,7 @@ def check_pitched_and_raised_ego_uses_world_z() -> None:
     road_cls, rr, rc, _gw = _at(got, road_e[0], road_e[1])
     wall_cls, wr, wc, _gw = _at(got, wall_e[0], wall_e[1])
     assert (rr, rc) != (wr, wc), ((rr, rc), (wr, wc))
-    assert road_cls == UNKNOWN, (road_cls, road_e, road_w)
+    assert road_cls == DRIVABLE, (road_cls, road_e, road_w)
     assert wall_cls == BLOCKED, (wall_cls, wall_e, wall_w)
 
     # Level vehicle, origin lifted off the road. Ego z of the wall is negative.
@@ -227,7 +227,7 @@ def check_pitched_and_raised_ego_uses_world_z() -> None:
         forward=flat_f,
         up=flat_u,
     )
-    assert _at(got2, road2_e[0], road2_e[1])[0] == UNKNOWN, road2_e
+    assert _at(got2, road2_e[0], road2_e[1])[0] == DRIVABLE, road2_e
     assert _at(got2, wall2_e[0], wall2_e[1])[0] == BLOCKED, wall2_e
     print("  pitched and z-offset ego: blocked is world Z minus RoadPoly.z")
 
@@ -264,7 +264,8 @@ def check_epsilon_is_world_clearance() -> None:
         egos.append(ego)
     got = _label(depth, lane=_paint(), road=_road(lambda _y: 0.0), pos=pos, forward=forward, up=up)
     assert _at(got, *egos[0][:2])[0] == DRIVABLE, egos[0]
-    assert _at(got, *egos[1][:2])[0] == UNKNOWN, egos[1]
+    # Half of clear_eps is under clear_eps - pad(r) on this camera, so the lane is drivable.
+    assert _at(got, *egos[1][:2])[0] == DRIVABLE, egos[1]
     assert _at(got, *egos[2][:2])[0] == BLOCKED, egos[2]
     # Literal 0.15. A test that only reads the constant still passes at 0.30.
     assert float(OBSTACLE_Z_EPS_M) == 0.15
@@ -349,14 +350,14 @@ def check_wall_pole_empty_and_missing_depth() -> None:
     got = scene(ground + wall)
     assert got["mask_src"] == "geom"
     assert _at(got, 0.0, 15.0)[0] == BLOCKED
-    assert _at(got, 0.0, 10.0)[0] == UNKNOWN
+    assert _at(got, 0.0, 10.0)[0] == DRIVABLE
     assert got["clear_valid"] is True
     assert abs(float(got["clear_m"]) - 15.0) < 0.75, got["clear_m"]
 
     pole = [(0.3 + dx, 12.0, z) for dx in (-0.15, 0.0, 0.15) for z in (0.6, 1.4)]
     got_p = scene(ground + pole)
     assert _at(got_p, 0.3, 12.0)[0] == BLOCKED
-    assert _at(got_p, 0.0, 10.0)[0] == UNKNOWN
+    assert _at(got_p, 0.0, 10.0)[0] == DRIVABLE
     assert got_p["clear_valid"] is True
     assert abs(float(got_p["clear_m"]) - 12.0) < 0.75, got_p["clear_m"]
 
@@ -366,7 +367,7 @@ def check_wall_pole_empty_and_missing_depth() -> None:
     empty = scene(ground)
     mask = np.asarray(empty["mask"], dtype=np.int64)
     assert int((mask == BLOCKED).sum()) == 0, int((mask == BLOCKED).sum())
-    assert _at(empty, 0.0, 10.0)[0] == UNKNOWN
+    assert _at(empty, 0.0, 10.0)[0] == DRIVABLE
     assert empty["clear_valid"] is False
     assert empty["clear_m"] is None
 
@@ -452,7 +453,7 @@ def check_semantic_blocked_needs_palette_proof() -> None:
 
     geom = _label(depth, **kw)
     assert geom["mask_src"] == "geom"
-    assert _at(geom, 0.0, 16.0)[0] == UNKNOWN
+    assert _at(geom, 0.0, 16.0)[0] == DRIVABLE
     assert _at(geom, 0.0, 24.0)[0] == BLOCKED
 
     proved = _label(depth, blocked_names=["WALL"], **kw)
@@ -531,7 +532,7 @@ def check_writer_and_missing_sidecar() -> None:
         assert saved["x_min"] == -16.0 and saved["x_max"] == 16.0
         assert saved["y_min"] == 0.0 and saved["y_max"] == 40.0
         _assert_row_fields(saved)
-        assert _at(saved, 0.0, 10.0)[0] == UNKNOWN
+        assert _at(saved, 0.0, 10.0)[0] == DRIVABLE
         assert _at(saved, 0.0, 16.0)[0] == BLOCKED
         assert not (root / "gt.jsonl").exists()
 
@@ -977,11 +978,14 @@ def check_interim_pad_band() -> None:
     safe = sweep()
     assert all(kind != DRIVABLE for kind in safe), safe
     saved = obstacles.depth_range_pad_m
+    saved_edge = obstacles.edge_range_pad_m
     obstacles.depth_range_pad_m = lambda depth_m: np.zeros(np.shape(depth_m), dtype=np.float64)
+    obstacles.edge_range_pad_m = lambda depth_m, pose=None: np.zeros(np.shape(depth_m), dtype=np.float64)
     try:
         unsafe = sweep()
     finally:
         obstacles.depth_range_pad_m = saved
+        obstacles.edge_range_pad_m = saved_edge
     assert any(kind == DRIVABLE for kind in unsafe), unsafe
     print("  pad 0.25: 0.16 m and 0.20 m faces on main and wide are never drivable; pad 0 is")
 
@@ -1016,7 +1020,7 @@ def check_edge_band_and_row_fields() -> None:
     in_ego = _to_ego((0.0, 8.0, 0.0), pos, right, forward, up)
     _splat(inside, in_ego)
     inner = _label(inside, lane=_paint(3.5), road=_road(lambda _y: 0.0), pos=pos, forward=forward, up=up)
-    assert _at(inner, in_ego[0], in_ego[1])[0] == UNKNOWN, in_ego
+    assert _at(inner, in_ego[0], in_ego[1])[0] == DRIVABLE, in_ego
 
     none_depth = _label(None, lane=_paint(), road=_road(lambda _y: 0.0), pos=pos, forward=forward, up=up)
     zeros = _label(_blank(POSE.height, POSE.width), lane=_paint(), road=_road(lambda _y: 0.0), pos=pos, forward=forward, up=up)
@@ -1190,7 +1194,79 @@ def check_runtime_does_not_import_the_labeler() -> None:
     print(f"  runtime files do not import the obstacle labeler ({len(targets)} files)")
 
 
+class _MainCam:
+    """Real main intrinsics. pad(r) is <= 0.02 m inside 17.34 m on this camera."""
+
+    def __init__(self) -> None:
+        self.cam_id = "main"
+        self.x = 0.0
+        self.y = 1.20
+        self.z = 1.26
+        self.yaw_deg = 0.0
+        self.pitch_deg = -6.0
+        self.fov_v_deg = 34.0
+        self.width = 640
+        self.height = 480
+
+
+def check_edge_z_curb_blocked_lane_drivable() -> None:
+    """A 0.12 m curb is blocked and the lane is drivable when left_z/right_z exist.
+
+    Dropping those heights leaves the depth-fit fallback. Two points cannot
+    fill its 20-inlier window, so the curb is not blocked. That is the mutation.
+    """
+    from python.train.obstacles import BLOCKED, DRIVABLE, _unproject, label_obstacle_frame, view_depth_m
+
+    cam = _MainCam()
+    half = 3.5 / 2.0
+    road = _road(lambda _y: 0.0, width=3.5)
+    assert road.left_z is not None and road.right_z is not None
+    lane_pt = (0.0, 8.0, 0.0)
+    curb_pt = (half + 0.25, 8.0, 0.12)
+    assert 0.10 <= curb_pt[2] <= 0.15
+    assert half < curb_pt[0] <= half + 0.5
+
+    def paint(road_poly):
+        depth = np.zeros((cam.height, cam.width), np.uint16)
+        pixels = []
+        for point in (lane_pt, curb_pt):
+            hit = view_depth_m(cam, point[0], point[1], point[2], cam.width, cam.height)
+            assert hit is not None, point
+            u, v, metres = hit
+            ui, vi = int(round(u)), int(round(v))
+            assert 0 <= ui < cam.width and 0 <= vi < cam.height, (ui, vi, point)
+            depth[vi, ui] = np.uint16(max(1, int(round(float(metres) * 100.0))))
+            pixels.append((vi, ui))
+        values, valid = _paint(3.5)
+        got = label_obstacle_frame(
+            depth,
+            pose=cam,
+            lane_gt=values,
+            lane_gt_valid=valid,
+            road=road_poly,
+            ego_pos=(0.0, 0.0, 0.0),
+            ego_dir=(0.0, 1.0, 0.0),
+            ego_up=(0.0, 0.0, 1.0),
+            cam="main",
+            t=1.0,
+        )
+        ex, ey, _ez, _ok = _unproject(cam, depth)
+        kinds = [_exact(got, float(ex[vi, ui]), float(ey[vi, ui])) for vi, ui in pixels]
+        return kinds
+
+    lane_kind, curb_kind = paint(road)
+    assert lane_kind == DRIVABLE, lane_kind
+    assert curb_kind == BLOCKED, curb_kind
+
+    bare = _road(lambda _y: 0.0, width=3.5, edges=False)
+    assert bare.left_z is None and bare.right_z is None
+    _lane_bare, curb_bare = paint(bare)
+    assert curb_bare != BLOCKED, curb_bare
+    print("  edge z: 0.12 m curb blocked, lane drivable; dropping left_z is not blocked")
+
+
 def main() -> None:
+    check_edge_z_curb_blocked_lane_drivable()
     check_pitched_and_raised_ego_uses_world_z()
     check_epsilon_is_world_clearance()
     check_corridor_matches_paint_then_pack_road_edge()

@@ -81,8 +81,11 @@ TRAFFIC_CHUNK = (
     "local name='';"
     "pcall(function() name=tostring(o:getField('name',0) or '') end);"
     "if name=='' or name=='nil' then pcall(function() name=tostring(o:getName() or '') end) end;"
+    "local model='';"
+    "pcall(function() model=tostring(o.jbeam or '') end);"
+    "if model=='nil' then model='' end;"
     "local p=o:getPosition();local v=o:getVelocity();local d=o:getDirectionVector();"
-    "out[#out+1]={name=name,pos={p.x,p.y,p.z},vel={v.x,v.y,v.z},dir={d.x,d.y,d.z}} "
+    "out[#out+1]={name=name,model=model,pos={p.x,p.y,p.z},vel={v.x,v.y,v.z},dir={d.x,d.y,d.z}} "
     "end end) end;"
     "return jsonEncode(out)"
 )
@@ -181,8 +184,16 @@ def parse_traffic(reply: Any) -> list[dict[str, Any]] | None:
     cars = []
     for car in blob:
         if isinstance(car, dict):
-            cars.append({"name": str(car.get("name") or ""), "pos": _vec(car.get("pos")),
-                         "vel": _vec(car.get("vel")), "dir": _vec(car.get("dir"))})
+            row = {
+                "name": str(car.get("name") or ""),
+                "pos": _vec(car.get("pos")),
+                "vel": _vec(car.get("vel")),
+                "dir": _vec(car.get("dir")),
+            }
+            model = car.get("model")
+            if isinstance(model, str) and model.strip() and model.strip().lower() != "nil":
+                row["model"] = model.strip()
+            cars.append(row)
     return cars
 
 
@@ -208,8 +219,15 @@ def ai_cmd_state(state: Mapping[str, Any] | None = None, command: str | None = N
     return out
 
 
-def road_tag(hit: Any, lanes_here: int | None) -> dict[str, Any] | None:
-    """Road fields the collector already has for this tick. Fields it does not compute are left out."""
+def road_tag(hit: Any, lanes_here: int | None, road: Any = None) -> dict[str, Any] | None:
+    """Road fields the collector already has for this tick. Fields it does not compute are left out.
+
+    ``road_width_m`` is the mapped road, not the painted lane. ``left_z`` /
+    ``right_z`` are not copied here: one value per edge point lives in
+    ``roads/<map>.json.gz``, and repeating that polyline on every tick would
+    push ``state.jsonl`` through the 3.5 GiB file cap. ``edge_z`` is true when
+    this road's dump entry has both sides.
+    """
     if hit is None:
         return None
     out: dict[str, Any] = {}
@@ -220,7 +238,20 @@ def road_tag(hit: Any, lanes_here: int | None) -> dict[str, Any] | None:
     width = _num(getattr(hit, "lane_width_m", None))
     if width is not None:
         out["lane_width_m"] = width
-    return out
+    road_width = _num(getattr(road, "width_m", None)) if road is not None else None
+    if road_width is not None and road_width > 0.0:
+        out["road_width_m"] = road_width
+    offset = _num(getattr(hit, "offset_m", None))
+    if offset is not None:
+        out["road_offset_m"] = offset
+    heading = _num(getattr(hit, "heading_err_rad", None))
+    if heading is not None:
+        out["heading_err_rad"] = heading
+    left = getattr(road, "left_z", None) if road is not None else None
+    right = getattr(road, "right_z", None) if road is not None else None
+    if isinstance(left, list) and isinstance(right, list) and left and right:
+        out["edge_z"] = True
+    return out or None
 
 
 def vehicle_fields(state: Mapping[str, Any] | None) -> dict[str, Any]:

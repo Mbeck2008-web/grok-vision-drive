@@ -48,7 +48,10 @@ fail; that log is the IQU45 proof of whether it works. Follow-up, not
 this collect: connect each traffic vehicle via beamngpy, then attach
 Electrics. Do not copy the ego lamp onto other rows. Also expect
 ``raw/main_depth``, ``raw/main_sem``, ``raw/wide_depth``, ``raw/wide_sem``,
-and ``sem_classes.json``. LiDAR and radar stay off.
+and ``sem_classes.json``. Each map also writes ``roads/<map>.json.gz``
+(DecalRoad left/middle/right xyz, so ``left_z`` / ``right_z`` reload) and,
+when the level zip or the roads cache has them, ``roads/<map>_lines.json.gz``.
+LiDAR and radar stay off.
 
     py -3 scripts\\collect_scene_lanes.py --minutes 1 --no-excursions --traffic 2 --smoke-s 15 --ctl-probe-every 1
 
@@ -1014,6 +1017,48 @@ def _log_road_heights(level: str, roads: list[Any], logged: set[str]) -> None:
         print(line, flush=True)
 
 
+def _persist_map_gt(out: Path, level: str, bng: Any, roads: list[Any]) -> str:
+    """Write the DecalRoad network (edge z included) and painted decals beside the recording.
+
+    Returns the level name used in ``roads/<level>.json.gz``. A miss is logged
+    and the collect continues: the frame still records pose and paint.
+    """
+    from python.collect.road_dump import level_file_name, persist_painted_decals, persist_recording_roads
+
+    name = level_file_name(level)
+    try:
+        path = persist_recording_roads(out, name, bng, roads)
+    except Exception as exc:  # noqa: BLE001 — the collect keeps going
+        print(f"collect road edge z {name} not saved: {type(exc).__name__}: {exc}", flush=True)
+        path = None
+    if path is None:
+        print(f"collect road edge z {name} not saved (no road network)", flush=True)
+    else:
+        from python.collect.road_dump import load_road_dump
+
+        polys, _payload = load_road_dump(path)
+        with_z = sum(1 for poly in polys if poly.left_z and poly.right_z)
+        print(
+            f"collect road edge z {name} roads={len(polys)} with_edge_z={with_z} "
+            f"bytes={path.stat().st_size} file={path}",
+            flush=True,
+        )
+        if polys and with_z == 0:
+            print(
+                f"collect road edge z {name} missing left_z/right_z; "
+                "curbs use the depth-fit fallback",
+                flush=True,
+            )
+    try:
+        lines = persist_painted_decals(out, name)
+    except Exception as exc:  # noqa: BLE001
+        print(f"collect painted decals {name} not saved: {type(exc).__name__}: {exc}", flush=True)
+        lines = None
+    if lines is not None:
+        print(f"collect painted decals {name} bytes={lines.stat().st_size} file={lines}", flush=True)
+    return name
+
+
 def road_lanes(roads: list[Any], hit: object) -> int | None:
     road = road_for(roads, hit)
     if road is None:
@@ -1805,6 +1850,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         roads: list[Any] = []
         painted = PaintedLanes([])
         heights_logged: set[str] = set()  # road_heights_line: once per map
+        roads_level = "current"
         cams: dict[str, Any] = {}
         spawn_pos: tuple[float, float, float] | None = None
         # Bumped on every spawn, respawn, and level load; veh_meta is keyed on it.
@@ -1834,6 +1880,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 spawn_pos = (float(opened.spawn[0]), float(opened.spawn[1]), float(opened.spawn[2]))
             spawn_seq += 1
         writer = RawWriteQueue(RawFrameWriter(out, camera_sidecar(cam_cfg)))
+        if not map_names:
+            roads_level = _persist_map_gt(out, str(args.reload_level or "") or "current", bng, roads)
         sem_classes_written = False
         ticks = TickLog(out / TICKS_FILE, 0.1)
         from python.data.strip_writer import STRIP_ORDER
@@ -2557,6 +2605,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     print(f"collect stop {last_error}", flush=True)
                     run.stop("level_load_failed", last_error)
                     return 2
+                roads_level = _persist_map_gt(out, map_name, bng, roads)
                 loaded_map = map_name
                 loaded_index = seg_index
                 cut_at_load = schedule_cut
@@ -3235,7 +3284,13 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             tags["imu"] = probe["imu"]
             tags["ai_in_src"] = probe["ai_in_src"]
             tags["ai_cmd"] = dict(ai_cmd)
-            tags["road"] = control_log.road_tag(hit, lanes_here)
+            road_now = road_for(roads, hit)
+            tags["road"] = control_log.road_tag(hit, lanes_here, road_now)
+            if isinstance(tags["road"], dict):
+                tags["road"]["edge_z_file"] = f"roads/{roads_level}.json.gz"
+                for key in ("road_width_m", "road_offset_m", "heading_err_rad"):
+                    if tags["road"].get(key) is not None:
+                        tags[key] = tags["road"][key]
             tags["traffic"] = traffic_now
             if ctl_meta_for != spawn_seq:
                 meta = control_log.parse_ve_meta(_ask_vehicle(vehicle, control_log.VE_META_PROBE))

@@ -46,6 +46,21 @@ def _pose(cam: str, width: int | None, height: int | None) -> _Pose | None:
     return None
 
 
+def _recording_roads(root: Path) -> list[RoadPoly]:
+    """Roads the collector wrote beside this recording. ``*_lines`` files are paint, not the network."""
+    folder = root / "roads"
+    if not folder.is_dir():
+        return []
+    from python.collect.road_dump import load_road_dump
+
+    found: list[RoadPoly] = []
+    for path in sorted(folder.glob("*.json.gz")):
+        if path.name.endswith("_lines.json.gz"):
+            continue
+        found.extend(load_road_dump(path)[0])
+    return found
+
+
 def _roads(path: Path) -> list[RoadPoly]:
     if path.name.endswith(".gz"):
         from python.collect.road_dump import load_road_dump
@@ -70,12 +85,45 @@ def _pick_road(roads: list[RoadPoly], row: dict[str, Any]) -> RoadPoly | None:
         return None
     tags = row.get("tags") if isinstance(row.get("tags"), dict) else {}
     road_tag = tags.get("road") if isinstance(tags.get("road"), dict) else {}
+    if not road_tag and isinstance(row.get("road"), dict):
+        road_tag = row["road"]
     wanted = str(road_tag.get("road_id") or row.get("road_id") or "")
     if wanted:
         for poly in roads:
             if poly.road_id == wanted:
                 return poly
     return roads[0]
+
+
+def _field(row: dict[str, Any], tech: dict[str, Any], *keys: str) -> Any:
+    """First present value. Paint lives on ``tech``; road width and offset live on the state row."""
+    road = row.get("road") if isinstance(row.get("road"), dict) else {}
+    for source in (tech, row, road):
+        if not isinstance(source, dict):
+            continue
+        for key in keys:
+            if source.get(key) is not None:
+                return source.get(key)
+    return None
+
+
+def _gt_by_index(root: Path) -> dict[int, dict[str, Any]]:
+    path = root / "gt.jsonl"
+    if not path.is_file():
+        return {}
+    found: dict[int, dict[str, Any]] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        item = json.loads(line)
+        if not isinstance(item, dict) or item.get("i") is None:
+            continue
+        tech = item.get("tech") if isinstance(item.get("tech"), dict) else {}
+        try:
+            found[int(item["i"])] = tech
+        except (TypeError, ValueError):
+            continue
+    return found
 
 
 def _ego(row: dict[str, Any], key: str) -> Any:
@@ -104,6 +152,7 @@ def label_recording(
         classes = read_sem_classes(root)
     proven = proven_blocked_names(classes, blocked_names)
     count = 0
+    gt_by_i = _gt_by_index(root)
     with state.open(encoding="utf-8") as fh, out.open("w", encoding="utf-8") as dest:
         for line_index, line in enumerate(fh):
             line = line.strip()
@@ -113,20 +162,21 @@ def label_recording(
             if not isinstance(row, dict):
                 continue
             index = line_index if row.get("i") is None else int(row["i"])
-            tech = row.get("tech") if isinstance(row.get("tech"), dict) else row
-            values, valid = lane_gt_from_record(tech if isinstance(tech, dict) else None)
+            tech = row.get("tech") if isinstance(row.get("tech"), dict) else gt_by_i.get(index, {})
+            if not isinstance(tech, dict):
+                tech = {}
+            values, valid = lane_gt_from_record(tech or None)
             road = _pick_road(roads, row)
             depth = load_raw_camera(root, f"{cam}_depth", index)
             sem = load_raw_camera(root, f"{cam}_sem", index)
-            record = tech if isinstance(tech, dict) else {}
             labeled = label_obstacle_frame(
                 depth,
                 pose=pose,
                 lane_gt=values,
                 lane_gt_valid=valid,
-                road_width_m=record.get("road_width_m", record.get("width_m")),
-                road_offset_m=record.get("road_offset_m", record.get("offset_m")),
-                road_heading_err_rad=record.get("heading_err_rad", record.get("road_heading_err_rad")),
+                road_width_m=_field(row, tech, "road_width_m", "width_m"),
+                road_offset_m=_field(row, tech, "road_offset_m", "offset_m"),
+                road_heading_err_rad=_field(row, tech, "heading_err_rad", "road_heading_err_rad"),
                 road=road,
                 ego_pos=_ego(row, "pos"),
                 ego_dir=_ego(row, "dir"),
@@ -168,7 +218,7 @@ def main(argv: list[str] | None = None) -> int:
     if pose is None:
         print(f"no camera pose for {args.cam}", flush=True)
         return 2
-    roads = _roads(Path(args.roads)) if args.roads else []
+    roads = _roads(Path(args.roads)) if args.roads else _recording_roads(root)
     names = [part.strip() for part in str(args.blocked_names).split(",") if part.strip()]
     return label_recording(
         root,

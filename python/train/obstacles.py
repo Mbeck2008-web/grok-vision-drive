@@ -9,13 +9,18 @@ define the plane. When that side has no edge height, a 5-row station window
 of paved in-corridor cells supplies the slope. Seeds are within 0.05 m of the
 centerline, residuals above 0.05 m are dropped, and the fit is repeated once.
 Fewer than 20 inlier cells leaves the point unknown.
-``depth_range_pad_m`` is an interim 0.25 m until labels_v4 pad(r) is GREEN.
-pad(r) still omits the 0.05 m fit tolerance, and pad=0 let a 0.16 m face read
-as drivable. Blocked is ``h > threshold + pad``. Drivable is ``h <= threshold - pad``.
-The band between them is unknown. A point within ``edge_band_m`` (0.5 m) outside the
-corridor uses ``curb_eps_m`` (0.08 m) in that same split. Those three numbers are
-written on every ``obstacles.jsonl`` row. The difference is in the world
-frame. Ego z, ego pitch, and a missing height are not a road surface.
+When ``left_z`` / ``right_z`` supply the slope, the pad is labels_v4
+``pad(r)``: ``min(0.25, 0.005 + r * hypot(tan(alpha_h/2), tan(alpha_v/2)))``.
+On main that is at most 0.02 m inside 17.34 m, so a 0.10–0.15 m curb in the
+edge band is blocked and a flat lane is drivable. The depth-fit fallback
+keeps an interim 0.25 m pad (``depth_range_pad_m``). pad=0 let a 0.16 m face
+read as drivable, and two points cannot fill the 20-inlier fit, so dropping
+``left_z`` leaves that curb unknown. Blocked is ``h > threshold + pad``.
+Drivable is ``h <= threshold - pad``. The band between them is unknown. A
+point within ``edge_band_m`` (0.5 m) outside the corridor uses ``curb_eps_m``
+(0.08 m) in that same split. Those three numbers are written on every
+``obstacles.jsonl`` row. The difference is in the world frame. Ego z, ego
+pitch, and a missing height are not a road surface.
 
 The corridor half-width is half the painted lane width about the painted
 center. When that lane is missing it is ``road_width_m / 2`` about
@@ -476,12 +481,38 @@ INTERIM_DEPTH_RANGE_PAD_M = 0.25
 
 
 def depth_range_pad_m(depth_m: np.ndarray) -> np.ndarray:
-    """Interim constant until labels_v4 pad(r) is GREEN.
+    """Interim pad for the depth-fit fallback, when edge heights are missing.
 
     0.25 m at every range. pad=0 let a 0.16 m or 0.20 m face read under 0.15 m
-    and become drivable. Replace this body when pad(r) is approved.
+    and become drivable. The edge-z path uses ``edge_range_pad_m`` instead.
     """
     return np.full(np.shape(depth_m), INTERIM_DEPTH_RANGE_PAD_M, dtype=np.float64)
+
+
+def _pixel_hypot(pose: Any) -> float | None:
+    """``hypot(tan(alpha_h/2), tan(alpha_v/2))`` for one camera. None if the pose is unusable."""
+    width = float(getattr(pose, "width", 0) or 0)
+    height = float(getattr(pose, "height", 0) or 0)
+    fov_v = math.radians(float(getattr(pose, "fov_v_deg", 0) or 0))
+    if width < 2.0 or height < 2.0 or fov_v <= 1e-3 or fov_v >= math.pi - 1e-3:
+        return None
+    fov_h = 2.0 * math.atan(math.tan(fov_v * 0.5) * (width / height))
+    alpha_v = fov_v / height
+    alpha_h = fov_h / width
+    return math.hypot(math.tan(alpha_h * 0.5), math.tan(alpha_v * 0.5))
+
+
+def edge_range_pad_m(depth_m: np.ndarray, pose: Any) -> np.ndarray:
+    """labels_v4 ``pad(r)`` for a point whose slope came from ``left_z`` / ``right_z``.
+
+    ``r`` is the view-Z depth in metres. A pose that cannot name its field of
+    view keeps the interim pad, so a missing camera does not become pad 0.
+    """
+    factor = _pixel_hypot(pose)
+    if factor is None:
+        return depth_range_pad_m(depth_m)
+    span = np.asarray(depth_m, dtype=np.float64)
+    return np.minimum(INTERIM_DEPTH_RANGE_PAD_M, 0.005 + np.maximum(span, 0.0) * float(factor))
 
 
 def apply_height_band(height: np.ndarray, threshold: float, pad: np.ndarray) -> np.ndarray:
@@ -723,7 +754,10 @@ def label_obstacle_frame(
         fit_h = np.where(np.isfinite(fit_slope), rough - fit_slope * lateral, np.nan)
         have = valid & (edge_have | np.isfinite(fit_h))
         height = np.where(edge_have, edge_h, fit_h)
-        pad = depth_range_pad_m(np.asarray(depth, dtype=np.float64) / 100.0)
+        depth_m = np.asarray(depth, dtype=np.float64) / 100.0
+        pad = depth_range_pad_m(depth_m)
+        if bool(edge_have.any()):
+            pad = np.where(edge_have, edge_range_pad_m(depth_m, pose), pad)
         classes = np.zeros(depth.shape, np.uint8)
         corridor_pts = have & inside
         classes[corridor_pts] = apply_height_band(height, CLEAR_EPS_M, pad)[corridor_pts]

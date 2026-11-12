@@ -1653,7 +1653,11 @@ def _optimizer_step(
         return None, 0, carry, end_state
     loss = total / n_loss
     grad_norm = None
-    if scaler is not None:
+    # A step whose every head is masked (missing obstacle sidecar, all-unknown
+    # cells, no lane targets) is a zero with no grad. backward would throw.
+    if not bool(getattr(loss, "requires_grad", False)):
+        grad_norm = 0.0
+    elif scaler is not None:
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
         grad_norm = float(torch.nn.utils.clip_grad_norm_(net.parameters(), float(clip)))
@@ -1848,7 +1852,11 @@ def _optimizer_group(
         return None, 0, end_state, end_state
     loss = total / n_loss
     grad_norm = None
-    if scaler is not None:
+    # A step whose every head is masked (missing obstacle sidecar, all-unknown
+    # cells, no lane targets) is a zero with no grad. backward would throw.
+    if not bool(getattr(loss, "requires_grad", False)):
+        grad_norm = 0.0
+    elif scaler is not None:
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
         grad_norm = float(torch.nn.utils.clip_grad_norm_(net.parameters(), float(clip)))

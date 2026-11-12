@@ -1498,7 +1498,8 @@ def _scene_loss_body(
             aux_sem_term = ce
         total = total + float(aux_sem_weight) * aux_sem_term
     # Obstacle mask is training-only. Unknown cells (0) and a missing sidecar
-    # do not pull. Clearance weight stays 0 until the prop check passes.
+    # do not pull, but the zero stays on the logit graph so backward is safe.
+    # Clearance weight stays 0 until the prop check passes.
     obstacle_term = zero.clone()
     obstacle_clear_term = zero.clone()
     if (
@@ -1506,12 +1507,15 @@ def _scene_loss_body(
         and getattr(pred, "obstacle_mask", None) is not None
         and "obstacle_mask" in target
     ):
+        logits = pred.obstacle_mask.to(device=device)
+        # A missing sidecar or an all-unknown mask has no CE target. 0 * sum
+        # still requires grad, so train_scene can backward this total.
+        obstacle_term = logits.sum() * 0.0
         present = target.get("obstacle_present")
         present_on = True
         if present is not None:
             present_on = float(torch.as_tensor(present, device=device).reshape(-1).max()) >= 0.5
         if present_on:
-            logits = pred.obstacle_mask.to(device=device)
             goal = target["obstacle_mask"].to(device=device, dtype=torch.long)
             if logits.dim() == 3:
                 logits = logits.unsqueeze(0)

@@ -719,14 +719,7 @@ def check_head_stays_out_of_export() -> None:
     assert PROP_CHECK_PASSED is False
     assert float(CLEARANCE_LOSS_WEIGHT) == 0.0
 
-    try:
-        import torch
-    except ImportError:
-        from gvd_test_env import skip_check
-
-        skip_check("obstacle_head", "torch is not installed")
-        print("  head stays out of HEAD_NAMES (torch skipped)")
-        return
+    import torch
 
     from python.train.scene_net import (
         LANE_POINTS,
@@ -752,6 +745,7 @@ def check_head_stays_out_of_export() -> None:
     extra = sum(p.numel() for p in opt.parameters()) - sum(p.numel() for p in plain.parameters())
     cin = int(opt.stem.out_channels)
     assert extra == cin * 3 + 3 + cin + 1, extra
+    assert extra == 516, extra
     opt.eval()
     strip = torch.zeros(1, 3, opt.canvas_h, opt.canvas_w)
     pred, _state = opt.forward_batch(strip, torch.zeros(1), opt.initial_state())
@@ -817,8 +811,20 @@ def check_head_stays_out_of_export() -> None:
     blank.obstacle_mask = logits2
     missed = scene_loss(blank, absent, heads=("obstacles",))
     assert float(missed["obstacle"]) == 0.0
+    assert bool(missed["total"].requires_grad)
     missed["total"].backward()
-    assert logits2.grad is None or float(logits2.grad.abs().sum()) == 0.0
+    assert logits2.grad is not None and float(logits2.grad.abs().sum()) == 0.0
+
+    unknown = dict(target)
+    unknown["obstacle_mask"] = torch.zeros(64, 64, dtype=torch.long)
+    unknown["obstacle_present"] = torch.tensor([1.0])
+    logits3 = torch.zeros(1, 3, 64, 64, requires_grad=True)
+    blank.obstacle_mask = logits3
+    unk = scene_loss(blank, unknown, heads=("obstacles",))
+    assert float(unk["obstacle"]) == 0.0
+    assert bool(unk["total"].requires_grad)
+    unk["total"].backward()
+    assert float(logits3.grad.abs().sum()) == 0.0
 
     opt.train()
     live = opt.forward_batch(torch.rand(1, 3, opt.canvas_h, opt.canvas_w), torch.zeros(1), opt.initial_state())[0]

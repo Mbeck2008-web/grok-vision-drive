@@ -4,11 +4,15 @@
 * Defaults stay on the old 60 s cadence (``CRUISE_S``), and that cadence does
   not consume the run RNG.
 * ``--excursion-gap-min-s`` / ``--excursion-gap-max-s`` draw each cruise
-  uniformly in that range from the seeded RNG. The same seed repeats. A new
-  draw is taken after a weave, a recover, and an abort, and a new clock
-  (spawn / respawn) starts the timer over on the next draw.
-* min > max or min < 0 is rejected.
+  uniformly in that range from ``--excursion-seed`` (default 0). The same
+  seed repeats. A new draw is taken only when the clock returns to cruise.
+* With either gap flag set, segment load, teleport, respawn, and stall
+  recover keep that one clock (elapsed cruise, armed gap, lane-change count).
+  A teleport during a move ends it in cruise. With the flags absent, those
+  points still build a new clock, matching main.
+* min > max, min < 0, and a non-integer seed are rejected.
 * The excursion start log names the gap that just elapsed.
+* Spawn order does not use the gap generator.
 """
 from __future__ import annotations
 
@@ -155,15 +159,18 @@ def check_abort_and_respawn() -> None:
         assert t - cruise_at < HI + 5.0
     assert LO <= armed <= HI
     assert 0.0 <= (t - cruise_at) - armed <= DT + 1e-6
-    # A respawn is a new clock on the same generator: the timer starts over,
-    # and the gap is the next draw, not a repeat of the first.
-    spawned = ExcursionClock(LO, HI, rng)
-    assert spawned.phase == "cruise" and spawned.phase_t == 0.0
+    # Teleport during the move: one new gap, lane-change count kept, not a new clock.
+    kind = clock._kind
+    clock.relocate()
+    assert clock.phase == "cruise" and clock.phase_t == 0.0 and clock._kind == kind
+    assert abs(clock.gap_s - probe.uniform(LO, HI)) < 1e-9
     for _ in range(30):
-        spawned.update(DT, **_kw())
-    assert spawned.phase == "cruise" and spawned.phase_t == 30.0
-    assert abs(spawned.gap_s - probe.uniform(LO, HI)) < 1e-9
-    print(f"abort and respawn: next gaps {armed:.1f}s and {spawned.gap_s:.1f}s, timer restarted")
+        clock.update(DT, **_kw())
+    assert clock.phase == "cruise" and clock.phase_t == 30.0
+    held_gap = float(clock.gap_s)
+    clock.relocate()
+    assert clock.phase == "cruise" and clock.phase_t == 30.0 and clock.gap_s == held_gap and clock._kind == kind
+    print(f"abort and teleport: next gap {armed:.1f}s, relocate keeps {held_gap:.1f}s of cruise")
 
 
 def check_rejects_a_bad_range() -> None:
@@ -191,11 +198,18 @@ def check_rejects_a_bad_range() -> None:
 
     args = collect.build_parser().parse_args([])
     assert args.excursion_gap_min_s == CRUISE_S and args.excursion_gap_max_s == CRUISE_S
-    wide = collect.build_parser().parse_args(["--excursion-gap-min-s", "300", "--excursion-gap-max-s", "600"])
+    assert args.excursion_gap_set is False and args.excursion_seed == 0
+    wide = collect.build_parser().parse_args(
+        ["--excursion-gap-min-s", "300", "--excursion-gap-max-s", "600", "--excursion-seed", "4"]
+    )
     assert wide.excursion_gap_min_s == 300.0 and wide.excursion_gap_max_s == 600.0
+    assert wide.excursion_gap_set is True and wide.excursion_seed == 4
+    explicit = collect.build_parser().parse_args(["--excursion-gap-min-s", "60", "--excursion-gap-max-s", "60"])
+    assert explicit.excursion_gap_set is True
     for argv in (
         ["--excursion-gap-min-s", "-1"],
         ["--excursion-gap-min-s", "10", "--excursion-gap-max-s", "3"],
+        ["--excursion-seed", "nope"],
     ):
         err = io.StringIO()
         try:
@@ -205,14 +219,149 @@ def check_rejects_a_bad_range() -> None:
             assert exc.code == 2, exc.code
         else:
             raise AssertionError(argv)
-        assert "excursion gap" in err.getvalue(), err.getvalue()
+        assert "excursion" in err.getvalue(), err.getvalue()
     bare = collect_argv(AutoOptions(), "collect_scene_lanes.py")
     assert "--excursion-gap-min-s" not in bare and "--excursion-gap-max-s" not in bare
-    opts = AutoOptions(excursion_gap_min_s=LO, excursion_gap_max_s=HI)
+    assert "--excursion-seed" not in bare
+    opts = AutoOptions(excursion_gap_min_s=LO, excursion_gap_max_s=HI, excursion_seed=4)
     argv = collect_argv(opts, "collect_scene_lanes.py")
     assert argv[argv.index("--excursion-gap-min-s") + 1] == "300.0"
     assert argv[argv.index("--excursion-gap-max-s") + 1] == "600.0"
-    print("reject: min < 0 and min > max exit 2; flags default to CRUISE_S and stay off AutoOptions")
+    assert argv[argv.index("--excursion-seed") + 1] == "4"
+    zero = [s.gap for s in _simulate(ExcursionClock(LO, HI, random.Random(0)), 1200.0)]
+    other = [s.gap for s in _simulate(ExcursionClock(LO, HI, random.Random(4)), 1200.0)]
+    assert zero != other
+    print("reject: min < 0, min > max, and a bad seed exit 2; seed 4 differs from seed 0")
+
+
+def _simulate_resets(reset_s: float, seconds: float, seed: int) -> list[_Start]:
+    """The collector's place function, every ``reset_s``, on one clock."""
+    import scripts.collect_scene_lanes as collect
+
+    clock = ExcursionClock(LO, HI, random.Random(seed))
+
+    def rearm():
+        raise AssertionError("reset re-armed the clock from zero")
+
+    t = 0.0
+    prev = clock.phase
+    cruise_at = 0.0
+    starts: list[_Start] = []
+    next_reset = float(reset_s)
+    while t < seconds - 1e-9:
+        if t + 1e-9 >= next_reset:
+            before = clock.phase
+            clock = collect.place_excursion_clock(clock, persist=True, fresh=rearm)
+            if before != "cruise":
+                cruise_at = t
+            prev = clock.phase
+            next_reset += float(reset_s)
+        move = clock.update(DT, **_kw())
+        t += DT
+        if prev != "cruise" and move.phase == "cruise":
+            cruise_at = t
+        if prev == "cruise" and move.phase in ("weave", "lane_change"):
+            starts.append(_Start(t, move.phase, float(clock.gap_s), t - cruise_at))
+        prev = move.phase
+    return starts
+
+
+def _gap_stats(starts: list[_Start], reset_s: float) -> str:
+    lane_changes = sum(1 for s in starts if s.phase == "lane_change")
+    waits = [s.cruise_s for s in starts]
+    mean = sum(waits) / len(waits)
+    in_band = sum(1 for g in waits if LO - 1e-6 <= g <= HI + DT + 1e-6)
+    early = [s for s in starts if s.t <= 3600.0 + 1e-6]
+    assert any(s.phase == "lane_change" for s in early), (reset_s, [(s.t, s.phase) for s in early])
+    assert LO - 1e-6 <= starts[0].t <= HI + DT + 1e-6, starts[0]
+    for prev, start in zip(starts, starts[1:]):
+        space = start.t - prev.t
+        assert LO - 1e-6 <= space <= HI + _dur(prev.phase) + DT + 1e-6, (reset_s, prev, start, space)
+    return (
+        f"8h reset {reset_s:.0f}s: starts={len(starts)} lane_changes={lane_changes} "
+        f"mean_gap={mean:.1f}s in_band={in_band}/{len(waits)}"
+    )
+
+
+def check_resets_keep_one_clock() -> None:
+    import scripts.collect_scene_lanes as collect
+
+    src = Path(collect.__file__).read_text(encoding="utf-8")
+    assert src.count("clock = new_clock()") == 1, "a later site still builds a new clock"
+    # The def plus the stall-recover, segment-load, and driving-start calls.
+    assert src.count("place_excursion_clock(") == 4, src.count("place_excursion_clock(")
+    fresh = ExcursionClock()
+    fresh.update(10.0, **_kw())
+    replaced = collect.place_excursion_clock(fresh, persist=False, fresh=ExcursionClock)
+    assert replaced is not fresh and replaced.phase_t == 0.0 and replaced._kind == 0
+    # A teleport during a weave keeps the object and the lane-change count.
+    def rearm():
+        raise AssertionError("reset re-armed the clock from zero")
+
+    moving = ExcursionClock(LO, HI, random.Random(3))
+    while moving.phase == "cruise":
+        moving.update(DT, **_kw())
+    kind = moving._kind
+    moved = collect.place_excursion_clock(moving, persist=True, fresh=rearm)
+    assert moved is moving and moved.phase == "cruise" and moved.phase_t == 0.0 and moved._kind == kind
+    assert LO <= moved.gap_s <= HI
+    lines = []
+    for reset_s in (720.0, 180.0):
+        starts = _simulate_resets(reset_s, 8.0 * 3600.0, seed=7)
+        lines.append(_gap_stats(starts, reset_s))
+        print(lines[-1])
+    assert lines[0] != lines[1]
+
+
+def check_spawn_order_ignores_the_gap_rng() -> None:
+    import scripts.collect_scene_lanes as collect
+    import python.collect.spawn_mix as spawn_mix
+    import test_collect_spawn_fix as harness
+    from python.collect.level_session import OpenedLevel
+
+    src = Path(collect.__file__).read_text(encoding="utf-8")
+    load_at = src.index("spawn_deck = SpawnDeck.load(")
+    load_call = src[load_at:src.index("\n                )", load_at)]
+    assert "excursion_rng" not in load_call and "rng=" not in load_call, load_call
+    pools = harness._west_pools()
+
+    def enter(bng, level, cfg, cams):
+        del cfg, cams, level
+        return OpenedLevel(
+            vehicle=bng.vehicles.vehicle,
+            roads=[harness.RoadPoly("r", [(0.0, 0.0), (0.0, 80.0)], 7.0)],
+            spawn=(0.4, 12.0, 0.5),
+            cameras={"main": harness._Cam()},
+        )
+
+    def run(extra: list[str]) -> list[str]:
+        seen: dict[str, object] = {}
+
+        def load(cls, path, rng=None, **kw):
+            deck = cls(pools, rng, **kw)
+            seen["rng"] = rng
+            seen["order"] = [road["id"] for kind in deck.pools.values() for road in kind]
+            return deck
+
+        previous = (collect.enter_map, collect.painted_for, spawn_mix.SpawnDeck.load)
+        collect.enter_map = enter  # type: ignore[assignment]
+        collect.painted_for = lambda level: harness._Paint(lambda x, y: True)  # type: ignore[assignment]
+        spawn_mix.SpawnDeck.load = classmethod(load)  # type: ignore[assignment]
+        try:
+            code, text, _out = harness._run_collector(
+                {"speed_at": lambda n: 10.0, "stop_at": 40},
+                ["--maps", "west_coast_usa", "--no-vary-env", "--no-excursions"] + extra,
+            )
+        finally:
+            collect.enter_map, collect.painted_for, spawn_mix.SpawnDeck.load = previous  # type: ignore[assignment]
+        assert code == 0, text[-1500:]
+        assert seen["rng"] is None, seen["rng"]
+        return list(seen["order"])  # type: ignore[arg-type]
+
+    plain = run([])
+    seeded = run(["--excursion-gap-min-s", "300", "--excursion-gap-max-s", "600", "--excursion-seed", "11"])
+    assert plain == seeded and len(plain) > 4, (plain, seeded)
+    print(f"spawn order: {len(plain)} roads match with the gap flags on and off")
 
 
 def check_start_log_names_the_gap() -> None:
@@ -242,6 +391,8 @@ def main() -> None:
     check_range_over_an_hour()
     check_abort_and_respawn()
     check_rejects_a_bad_range()
+    check_resets_keep_one_clock()
+    check_spawn_order_ignores_the_gap_rng()
     check_start_log_names_the_gap()
     print("excursion gap ok")
 

@@ -52,9 +52,10 @@ class AutoOptions:
     smoke_s: float = 60.0
     vary_env: bool = True
     speed_set: bool = False
-    # None leaves the collector default (CRUISE_S). Set both to widen the cruise.
+    # None leaves the collector default (CRUISE_S, and a new clock on every spawn).
     excursion_gap_min_s: float | None = None
     excursion_gap_max_s: float | None = None
+    excursion_seed: int | None = None
 
     def __post_init__(self) -> None:
         # A speed given here (not the defaults) is the user's: pass it on.
@@ -190,6 +191,8 @@ def collect_argv(opts: AutoOptions, script: Path | str, python: str | None = Non
         cmd += ["--excursion-gap-min-s", str(float(opts.excursion_gap_min_s))]
     if opts.excursion_gap_max_s is not None:
         cmd += ["--excursion-gap-max-s", str(float(opts.excursion_gap_max_s))]
+    if opts.excursion_seed is not None:
+        cmd += ["--excursion-seed", str(int(opts.excursion_seed))]
     if opts.maps:
         cmd += ["--maps", str(opts.maps), "--segment-min", str(float(opts.segment_min))]
         if not opts.vary_env:

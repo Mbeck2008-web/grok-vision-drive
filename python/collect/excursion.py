@@ -477,6 +477,16 @@ def unsafe_reason(
     return ""
 
 
+def excursion_seed(value: object) -> int:
+    """Integer seed for the cruise-gap draw. Rejects anything that is not a base-10 integer."""
+    if isinstance(value, bool):
+        raise ValueError(f"excursion seed {value!r} is not an integer")
+    text = str(value).strip()
+    if (text[:1] in "+-" and text[1:].isdigit()) or text.isdigit():
+        return int(text, 10)
+    raise ValueError(f"excursion seed {value!r} is not an integer")
+
+
 def excursion_gap_bounds(min_s: float, max_s: float) -> tuple[float, float]:
     """Cruise seconds ``[min, max]``. ``min < 0`` or ``min > max`` is an error."""
     try:
@@ -499,10 +509,11 @@ class ExcursionClock:
     The cruise before each start is one draw from ``[gap_min_s, gap_max_s]``
     (both default to ``CRUISE_S``). The first draw is on the first cruise
     check. The next draw is when the clock returns to cruise: after a weave,
-    after a recover, and after an abort. A spawn or respawn is a new clock
-    on the same ``rng``, so it takes the next draw and starts the timer over.
-    ``rng`` left unset is ``Random(0)``. Equal bounds do not consume it, so
-    the default 60 s cruise does not depend on the generator.
+    after a recover, and after an abort (``_to_cruise`` only). ``relocate``
+    keeps the elapsed cruise, the armed gap, and ``_kind``; a move in
+    progress ends in cruise, which is that one new draw. ``rng`` left unset
+    is ``Random(0)``. Equal bounds do not consume it, so the default 60 s
+    cruise does not depend on the generator.
     """
 
     def __init__(
@@ -615,6 +626,19 @@ class ExcursionClock:
             self.reason = str(reason or "unsafe")
             self._saw_offset = False
         return self._sample(None)
+
+    def relocate(self) -> None:
+        """Keep this clock across a teleport, respawn, or segment load.
+
+        Cruise elapsed time, the armed gap, and ``_kind`` stay. A weave, lane
+        change, recover, or abort ends in cruise, which draws one new gap in
+        ``_to_cruise``. Already cruising does not draw and does not zero the timer.
+        """
+        if self.phase == "cruise":
+            return
+        if self.phase != "abort":
+            self.force_abort("relocate")
+        self._to_cruise()
 
     def _advance(
         self,

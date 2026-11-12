@@ -86,6 +86,7 @@ def check_schema() -> None:
     assert "getPosition" in cl.TRAFFIC_CHUNK and "getVelocity" in cl.TRAFFIC_CHUNK
     assert "getDirectionVector" in cl.TRAFFIC_CHUNK and "name" in cl.TRAFFIC_CHUNK
     assert "gvd_traffic_0" not in cl.TRAFFIC_CHUNK and "gvd_traffic_1" not in cl.TRAFFIC_CHUNK
+    assert not hasattr(cl, "TRAFFIC_NAMES")
     assert cl.TRAFFIC_EVERY_S == 0.5
     assert "return jsonEncode" in cl.TRAFFIC_CHUNK and "return jsonEncode" in cl.VE_PROBE
     assert "lastInputs" in cl.VE_PROBE and "gx2" in cl.VE_PROBE

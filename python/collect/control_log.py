@@ -67,9 +67,7 @@ VE_META_PROBE = (
 )
 
 TRAFFIC_EVERY_S = 0.5
-# Names the spawn script gives the two companions. The probe does not look
-# them up by those names: it walks every non-player object.
-TRAFFIC_NAMES = ("gvd_traffic_0", "gvd_traffic_1")
+# Walks every non-player object. It does not look companions up by name.
 TRAFFIC_CHUNK = (
     "local out={};"
     "local player=nil;"

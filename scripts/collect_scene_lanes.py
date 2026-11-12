@@ -518,6 +518,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Stop (reason=no_progress, exit 6) after this many segment ends in a row with no recorded row. 0 never stops.",
     )
     parser.add_argument(
+        "--static-signs",
+        action="store_true",
+        help=(
+            "Training-only: read TSStatic stop/yield meshes into static_signs.json. "
+            "Off by default. Every allowlist stem is still an unverified guess, so leave this "
+            "off until a real scenetree dump has been checked."
+        ),
+    )
+    parser.add_argument(
         "--recheck-cov-min",
         type=float,
         default=0.0,
@@ -2483,6 +2492,28 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         run.ctl_reads = {"pipelined": ctl_pipelined, "probes": 0, "probe_null": 0, "traffic_reads": 0, "traffic_null": 0}
         ctl_meta_for: int | None = None
         ai_cmd = control_log.ai_cmd_state()
+        static_done: set[str] = set()
+
+        def _capture_static(map_label: str) -> None:
+            """One scenetree read per map. Off unless ``--static-signs``."""
+            if not args.static_signs:
+                return
+            label = str(map_label or "").strip() or "loaded"
+            if label in static_done:
+                return
+            static_done.add(label)
+            from python.collect.static_signs import STATIC_SIGNS_NAME, record_static_signs
+
+            try:
+                record_static_signs(bng, label, out / STATIC_SIGNS_NAME)
+            except Exception as exc:  # noqa: BLE001 — keep collecting; the marker is the record
+                print(
+                    f"[GVD] stop-sign source: absent on {label}: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+
+        if args.static_signs and not map_names:
+            _capture_static("")
         while done_s < target_s:
             run.beat(done_s)
             if stop_file(out).is_file():
@@ -2574,6 +2605,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     return 2
                 loaded_map = map_name
                 loaded_index = seg_index
+                if args.static_signs:
+                    _capture_static(map_name)
                 cut_at_load = schedule_cut
                 last_ai = None
                 held_tag = None

@@ -271,8 +271,9 @@ def build_parser() -> argparse.ArgumentParser:
             "Comma list of heads that receive loss. Empty trains every head except "
             "curbs. A sem_classes.json name on CURB_NAME_ALLOWLIST does not turn "
             "curbs on; no labeler sets curb_valid from that class id. Explicit "
-            "curbs is refused until that labeler exists. ctl and "
-            "road_edge only when named. The export still has every output."
+            "curbs is refused until that labeler exists. ctl, road_edge, and "
+            "stop_line only when named. stop_line is training-only and is not exported. "
+            "The export still has every default output."
         ),
     )
     parser.add_argument(
@@ -838,7 +839,7 @@ def _prediction_at(pred: ScenePrediction, index: int) -> ScenePrediction:
 
     extra = {name: getattr(pred, name)[index] for name in CTL_OUTPUT_FIELDS if getattr(pred, name, None) is not None}
     # Training-only aux / road_edge: must travel with the slice or scene_loss skips them.
-    for name in ("aux_depth", "aux_sem_logits", "road_edge"):
+    for name in ("aux_depth", "aux_sem_logits", "road_edge", "stop_line"):
         value = getattr(pred, name, None)
         if value is not None:
             extra[name] = value[index]
@@ -854,6 +855,8 @@ def _loss_terms(net: Any) -> tuple[str, ...]:
         extra.append("ctl")
     if bool(getattr(net, "road_edge", False)):
         extra.append("road_edge")
+    if bool(getattr(net, "stop_line", False)):
+        extra.append("stop_line")
     if bool(getattr(net, "aux_sensors", False)):
         extra.extend(("aux_depth", "aux_sem"))
     return tuple(LOSS_TERMS) + tuple(extra)
@@ -1413,6 +1416,7 @@ def _row_labels(
         aux_depth=bool(aux_depth_w),
         aux_sem=bool(aux_sem_w),
         road_edge=("road_edge" in (heads or ())),
+        stop_line=("stop_line" in (heads or ())),
         aux_cache=aux_cache,
     )
 
@@ -2465,6 +2469,7 @@ def train_directory(
     use_cam_age = bool(cam_age)
     use_ctl = bool(train_heads) and "ctl" in train_heads
     use_road_edge = bool(train_heads) and "road_edge" in train_heads
+    use_stop_line = bool(train_heads) and "stop_line" in train_heads
     use_aux_sensors = bool(aux_depth) or bool(aux_sem)
     aux_depth_w = float(aux_depth_weight) if aux_depth else 0.0
     aux_sem_w = float(aux_sem_weight) if aux_sem else 0.0
@@ -2472,6 +2477,8 @@ def train_directory(
         raise SystemExit("sensor aux is wired into the scratch net only (--backbone scratch)")
     if use_road_edge and backbone not in ("", "scratch"):
         raise SystemExit("road_edge is wired into the scratch net only (--backbone scratch)")
+    if use_stop_line and backbone not in ("", "scratch"):
+        raise SystemExit("stop_line is wired into the scratch net only (--backbone scratch)")
     if use_ctl and backbone not in ("", "scratch"):
         raise SystemExit("ctl is wired into the scratch net only (--backbone scratch)")
     if ctl_cond and not use_ctl:
@@ -2711,10 +2718,20 @@ def train_directory(
         train_ids = {i for i, label in plan_labels(startup_plan).items() if label == "train"}
         # b1_constants keeps only loss_mask rows, as the training loss does.
         ctl_b1 = b1_constants([row for row in rows if row.get("i") in train_ids])
+    from python.train.intersection_labels import (
+        attach_sign_labels,
+        attach_stop_lines,
+        sign_counts_line,
+        stop_counts_line,
+    )
+
+    print(sign_counts_line(attach_sign_labels(rows)), flush=True)
+    if use_stop_line:
+        print(stop_counts_line(attach_stop_lines(rows)), flush=True)
     if route_cond:
         from python.train.route_cond import attach_route_cmds, route_counts_line
 
-        print(route_counts_line(attach_route_cmds(rows)), flush=True)
+        print(route_counts_line(attach_route_cmds(rows, missing="mask")), flush=True)
     print(
         f"[GVD] holdout: rows={mix['rows']} slices={mix['slices']} fast={mix['fast']} slow={mix['slow']} "
         f"no_speed={mix['no_speed']} (fast is row speed >= {HOLDOUT_FAST_MPS} m/s)",
@@ -2808,6 +2825,7 @@ def train_directory(
                     cond_dim=ctl_cond_dim,
                     aux_sensors=use_aux_sensors,
                     road_edge=use_road_edge,
+                    stop_line=use_stop_line,
                     route_cond=bool(route_cond),
                     **dict(model_net_kwargs or {}),
                 ).to(device)

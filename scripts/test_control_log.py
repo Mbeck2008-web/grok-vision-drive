@@ -77,8 +77,22 @@ def check_schema() -> None:
     # Traffic: GE reply list, empty Lua table, garbage.
     car = {"name": "gvd_traffic_0", "pos": [1, 2, 3], "vel": [0, 9.5, 0], "dir": [0, 1, 0]}
     assert cl.parse_traffic(json.dumps([car])) == [
-        {"name": "gvd_traffic_0", "pos": [1.0, 2.0, 3.0], "vel": [0.0, 9.5, 0.0], "dir": [0.0, 1.0, 0.0]}
+        {"name": "gvd_traffic_0", "pos": [1.0, 2.0, 3.0], "vel": [0.0, 9.5, 0.0], "dir": [0.0, 1.0, 0.0],
+         "up": None, "box": None}
     ]
+    # Size: the world oriented box when the object reports one; null, never a guessed 4.5 x 1.8 m.
+    boxed = dict(car, up=[0, 0, 1], box={"ctr": [1, 2, 3.7], "half": [0.95, 2.3, 0.75],
+                                          "ax": [[1, 0, 0], [0, 1, 0], [0, 0, 1]]})
+    got = cl.parse_traffic(json.dumps([boxed]))[0]
+    assert got["up"] == [0.0, 0.0, 1.0]
+    assert got["box"] == {"ctr": [1.0, 2.0, 3.7], "half": [0.95, 2.3, 0.75],
+                          "ax": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]}
+    for bad in ({"ctr": [1, 2, 3], "half": [0.9, 2.3]}, {"ctr": [1, 2, 3], "half": [0, 2, 1], "ax": [[1, 0, 0]] * 3},
+                {"ctr": [1, 2, 3], "half": [1, 2, 1], "ax": [[1, 0, 0], [0, 1, 0]]},
+                {"ctr": [1, 2, None], "half": [1, 2, 1], "ax": [[1, 0, 0]] * 3}, "box"):
+        assert cl.parse_traffic(json.dumps([dict(car, box=bad)]))[0]["box"] is None, bad
+    assert "getSpawnWorldOOBB" in cl.TRAFFIC_CHUNK and "getHalfExtents" in cl.TRAFFIC_CHUNK
+    assert "getDirectionVectorUp" in cl.TRAFFIC_CHUNK
     assert cl.parse_traffic("{}") == [] and cl.parse_traffic("[]") == []
     assert cl.parse_traffic(None) is None and cl.parse_traffic("nope") is None
     # Every non-player object, not a hardcoded pair of companion names.

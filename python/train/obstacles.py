@@ -9,18 +9,13 @@ define the plane. When that side has no edge height, a 5-row station window
 of paved in-corridor cells supplies the slope. Seeds are within 0.05 m of the
 centerline, residuals above 0.05 m are dropped, and the fit is repeated once.
 Fewer than 20 inlier cells leaves the point unknown.
-When ``left_z`` / ``right_z`` supply the slope, the pad is labels_v4
-``pad(r)``: ``min(0.25, 0.005 + r * hypot(tan(alpha_h/2), tan(alpha_v/2)))``.
-On main that is at most 0.02 m inside 17.34 m, so a 0.10–0.15 m curb in the
-edge band is blocked and a flat lane is drivable. The depth-fit fallback
-keeps an interim 0.25 m pad (``depth_range_pad_m``). pad=0 let a 0.16 m face
-read as drivable, and two points cannot fill the 20-inlier fit, so dropping
-``left_z`` leaves that curb unknown. Blocked is ``h > threshold + pad``.
-Drivable is ``h <= threshold - pad``. The band between them is unknown. A
-point within ``edge_band_m`` (0.5 m) outside the corridor uses ``curb_eps_m``
-(0.08 m) in that same split. Those three numbers are written on every
-``obstacles.jsonl`` row. The difference is in the world frame. Ego z, ego
-pitch, and a missing height are not a road surface.
+``depth_range_pad_m`` is ``pad(r)`` from the camera pose (the ``cameras.yaml``
+fov and live resolution). The edge-z path uses that pad alone. The depth-fit
+fallback adds ``fit_tol`` (0.13 m) on both sides of the bar. A point within
+``edge_band_m`` (0.5 m) outside the corridor uses ``curb_eps_m`` (0.08 m), and
+only where ``pad(r) <= 0.02`` m. Those three numbers are
+written on every ``obstacles.jsonl`` row. The difference is in the world
+frame. Ego z, ego pitch, and a missing height are not a road surface.
 
 The corridor half-width is half the painted lane width about the painted
 center. When that lane is missing it is ``road_width_m / 2`` about
@@ -53,6 +48,10 @@ FIT_RESIDUAL_M = 0.05
 FIT_MIN_INLIERS = 20
 FIT_SEED_M = 0.05
 WINDOW_ROWS = 5
+# Plane bias of a through-centerline fit at the outer edge-band cell. Spec labels_v4.
+FIT_TOL_M = 0.13
+# Past this pad the edge-band curb is out of scope and the cell stays unknown.
+CURB_PAD_MAX_M = 0.02
 GRID_H = 64
 GRID_W = 64
 X_MIN = -16.0
@@ -476,49 +475,46 @@ def _edge_slopes(
     return left, right
 
 
-# Interim until labels_v4 pad(r) is GREEN. pad(r) still omits the 0.05 m fit tolerance.
-INTERIM_DEPTH_RANGE_PAD_M = 0.25
+def pad_hypot_factor(pose: Any) -> float | None:
+    """``hypot(tan(α_h/2), tan(α_v/2))`` for this pose's fov and pixel size.
 
-
-def depth_range_pad_m(depth_m: np.ndarray) -> np.ndarray:
-    """Interim pad for the depth-fit fallback, when edge heights are missing.
-
-    0.25 m at every range. pad=0 let a 0.16 m or 0.20 m face read under 0.15 m
-    and become drivable. The edge-z path uses ``edge_range_pad_m`` instead.
+    ``α_v = fov_v / H`` and ``α_h = fov_h / W``, with ``fov_h`` from the same
+    vertical fov the camera record stores. The pose is the ``cameras.yaml``
+    intrinsics the frame was shot with.
     """
-    return np.full(np.shape(depth_m), INTERIM_DEPTH_RANGE_PAD_M, dtype=np.float64)
-
-
-def _pixel_hypot(pose: Any) -> float | None:
-    """``hypot(tan(alpha_h/2), tan(alpha_v/2))`` for one camera. None if the pose is unusable."""
+    basis = _camera_basis(pose)
+    if basis is None:
+        return None
+    _forward, _up, _right, fov_v, fov_h = basis
     width = float(getattr(pose, "width", 0) or 0)
     height = float(getattr(pose, "height", 0) or 0)
-    fov_v = math.radians(float(getattr(pose, "fov_v_deg", 0) or 0))
-    if width < 2.0 or height < 2.0 or fov_v <= 1e-3 or fov_v >= math.pi - 1e-3:
+    if width < 2.0 or height < 2.0:
         return None
-    fov_h = 2.0 * math.atan(math.tan(fov_v * 0.5) * (width / height))
-    alpha_v = fov_v / height
     alpha_h = fov_h / width
+    alpha_v = fov_v / height
     return math.hypot(math.tan(alpha_h * 0.5), math.tan(alpha_v * 0.5))
 
 
-def edge_range_pad_m(depth_m: np.ndarray, pose: Any) -> np.ndarray:
-    """labels_v4 ``pad(r)`` for a point whose slope came from ``left_z`` / ``right_z``.
+def depth_range_pad_m(depth_m: np.ndarray, pose: Any) -> np.ndarray:
+    """``pad(r) = min(0.25, 0.005 + r * hypot(tan(α_h/2), tan(α_v/2)))``.
 
-    ``r`` is the view-Z depth in metres. A pose that cannot name its field of
-    view keeps the interim pad, so a missing camera does not become pad 0.
+    ``r`` is view-Z in metres. No fit tolerance here. The depth-fit path adds
+    ``FIT_TOL_M`` at the label. A pose with no fov returns the 0.25 m cap.
     """
-    factor = _pixel_hypot(pose)
+    ranges = np.asarray(depth_m, dtype=np.float64)
+    factor = pad_hypot_factor(pose)
     if factor is None:
-        return depth_range_pad_m(depth_m)
-    span = np.asarray(depth_m, dtype=np.float64)
-    return np.minimum(INTERIM_DEPTH_RANGE_PAD_M, 0.005 + np.maximum(span, 0.0) * float(factor))
+        return np.full(ranges.shape, 0.25, dtype=np.float64)
+    return np.minimum(0.25, 0.005 + ranges * float(factor))
 
 
-def apply_height_band(height: np.ndarray, threshold: float, pad: np.ndarray) -> np.ndarray:
-    """BLOCKED when ``h > threshold + pad``, DRIVABLE when ``h <= threshold - pad``.
+def apply_height_band(
+    height: np.ndarray, threshold: float, pad: np.ndarray, *, blocked_ge: bool = False
+) -> np.ndarray:
+    """BLOCKED above ``threshold + pad``, DRIVABLE at or under ``threshold - pad``.
 
-    The open interval between those cuts is UNKNOWN (0).
+    The open interval is UNKNOWN. A drivable bar at or below 0 labels nothing
+    drivable. ``blocked_ge`` uses ``>=`` for the edge-z curb (``h >= thr + pad``).
     """
     values = np.asarray(height, dtype=np.float64)
     slack = np.asarray(pad, dtype=np.float64)
@@ -526,8 +522,9 @@ def apply_height_band(height: np.ndarray, threshold: float, pad: np.ndarray) -> 
     finite = np.isfinite(values)
     hi = float(threshold) + slack
     lo = float(threshold) - slack
-    out[finite & (values > hi)] = BLOCKED
-    out[finite & (values <= lo)] = DRIVABLE
+    above = values >= hi if blocked_ge else values > hi
+    out[finite & above] = BLOCKED
+    out[finite & (lo > 0) & (values <= lo)] = DRIVABLE
     return out
 
 
@@ -754,15 +751,18 @@ def label_obstacle_frame(
         fit_h = np.where(np.isfinite(fit_slope), rough - fit_slope * lateral, np.nan)
         have = valid & (edge_have | np.isfinite(fit_h))
         height = np.where(edge_have, edge_h, fit_h)
-        depth_m = np.asarray(depth, dtype=np.float64) / 100.0
-        pad = depth_range_pad_m(depth_m)
-        if bool(edge_have.any()):
-            pad = np.where(edge_have, edge_range_pad_m(depth_m, pose), pad)
+        pad = depth_range_pad_m(np.asarray(depth, dtype=np.float64) / 100.0, pose)
+        # Edge-z uses pad(r). The depth-fit fallback adds fit_tol on both sides.
+        slack = np.where(edge_have, pad, pad + FIT_TOL_M)
         classes = np.zeros(depth.shape, np.uint8)
         corridor_pts = have & inside
-        classes[corridor_pts] = apply_height_band(height, CLEAR_EPS_M, pad)[corridor_pts]
-        band = have & in_band
-        classes[band] = apply_height_band(height, CURB_EPS_M, pad)[band]
+        classes[corridor_pts] = apply_height_band(height, CLEAR_EPS_M, slack)[corridor_pts]
+        # Past pad 0.02 m the edge-band curb is out of scope.
+        band = have & in_band & (pad <= CURB_PAD_MAX_M)
+        edge_band = band & edge_have
+        fit_band = band & ~edge_have
+        classes[edge_band] = apply_height_band(height, CURB_EPS_M, pad, blocked_ge=True)[edge_band]
+        classes[fit_band] = apply_height_band(height, CURB_EPS_M, pad + FIT_TOL_M)[fit_band]
         blocked = classes == BLOCKED
     grid = _bin(ego_x, ego_y, classes, valid)
     clear_m, clear_ok = _clearance(ego_x, ego_y, blocked, lane_gt, lane_gt_valid)

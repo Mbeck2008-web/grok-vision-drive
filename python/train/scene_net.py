@@ -58,10 +58,45 @@ N_SIGNS = 8
 SIGN_FEAT = 4
 
 # Columns of objects[16, 8]: x, y, yaw, length, width, speed, partial, unseen_s.
+# Length and width are not labels. A missing size stays 0, and the loss
+# ignores those two columns (object_feature_keep). 4.5 m x 1.8 m was a filler.
 # Columns of signs[8, 4]: x, y, misses, seen fraction.
 OBJECT_CLASSES = ("vehicle", "car", "truck", "bus", "pedestrian", "bike")
+OBJECT_SIZE_COLS = (3, 4)
 SIGN_CLASSES = ("stop_sign", "yield", "traffic_light", "speed_limit")
 LAMP_STATES = ("unknown", "red", "yellow", "green")
+
+
+def object_feature_keep(n: int = OBJECT_FEAT) -> np.ndarray:
+    """1 on supervised object columns. Length and width stay 0."""
+    keep = np.ones((int(n),), dtype=np.float64)
+    for col in OBJECT_SIZE_COLS:
+        if 0 <= int(col) < keep.shape[0]:
+            keep[int(col)] = 0.0
+    return keep
+
+
+def _fold_object_yaw(objects: np.ndarray) -> np.ndarray:
+    """Keep yaw in (-pi, pi] after the float32 cast.
+
+    ``atan2`` returns -pi on one side of the cut; the label uses +pi.
+    ``float32(pi)`` is one ulp above pi, so the cast itself leaves the
+    interval. Both become the greatest float32 that is still <= pi.
+    """
+    if objects.ndim != 2 or objects.shape[0] == 0 or objects.shape[-1] < 3:
+        return objects
+    yaw = objects[:, 2]
+    # Compare in float64. A float32 compare casts pi down to float32(pi),
+    # which hides the ulp the cast just added.
+    yaw64 = yaw.astype(np.float64)
+    cap = np.nextafter(np.float32(math.pi), np.float32(0.0))
+    pos = np.float32(math.pi)
+    neg = np.float32(-math.pi)
+    on_pos = (yaw == pos) & (yaw64 > math.pi)
+    on_neg = (yaw == neg) & (yaw64 <= -math.pi)
+    objects[:, 2] = np.where(on_pos | on_neg, cap, yaw)
+    return objects
+
 
 _CLASS_ALIASES = {
     "stop": "stop_sign",
@@ -541,6 +576,27 @@ def _apply_valid(valid: np.ndarray, given: Any) -> np.ndarray:
     return out
 
 
+def _optional_metric(obj: Mapping[str, Any], *keys: str) -> float | None:
+    """A finite measurement, or None when the key was not stored.
+
+    Missing length/width must not become the 4.5 m x 1.8 m filler. That pair
+    is not a label.
+    """
+    for key in keys:
+        if key not in obj:
+            continue
+        value = obj[key]
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(out):
+            return out
+    return None
+
+
 def _object_matrix(value: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     points = np.zeros((N_OBJECTS, OBJECT_FEAT), dtype=np.float64)
     classes = np.zeros((N_OBJECTS,), dtype=np.int64)
@@ -572,12 +628,14 @@ def _object_matrix(value: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if isinstance(partial, bool):
             partial = 1.0 if partial else 0.0
         speed = obj.get("speed_mps", obj.get("speed", 0.0))
+        length = _optional_metric(obj, "length", "length_m")
+        width = _optional_metric(obj, "width", "width_m")
         points[slot] = (
             float(obj.get("x", 0.0)),
             float(obj.get("y", 0.0)),
             float(obj.get("yaw", obj.get("heading", 0.0))),
-            float(obj.get("length", obj.get("length_m", 4.5))),
-            float(obj.get("width", obj.get("width_m", 1.8))),
+            0.0 if length is None else length,
+            0.0 if width is None else width,
             float(speed or 0.0),
             float(partial or 0.0),
             float(obj.get("unseen_s", 0.0) or 0.0),
@@ -791,7 +849,7 @@ def labels_from_tech(tech: Mapping[str, Any] | None) -> dict[str, np.ndarray]:
         "lane_valid": lane_valid.astype(np.float32),
         "curbs": curbs.astype(np.float32),
         "curb_valid": curb_valid.astype(np.float32),
-        "objects": objects.astype(np.float32),
+        "objects": _fold_object_yaw(objects.astype(np.float32)),
         "object_class": object_class.astype(np.int64),
         "object_valid": object_valid.astype(np.float32),
         "signs": signs.astype(np.float32),
@@ -810,6 +868,7 @@ def labels_for_row(
     road_edge: bool = False,
     obstacles: bool = False,
     aux_cache: Any = None,
+    brake_light_head: bool | None = None,
 ) -> dict[str, np.ndarray]:
     """Scene labels plus the ground-truth lane vector when the row has one.
 
@@ -817,6 +876,9 @@ def labels_for_row(
     geometry is NaN and its mask is clear, so that term does not pull.
     ``road_edge`` is attached as a separate vector (never copied into paint).
     Depth/sem aux load only when ``root`` is set and the matching flag is on.
+    A row with ``traffic`` replaces object slots from that probe (ego frame).
+    ``brake_light_head`` opens the mask only for a finite brake_lights value.
+    A null (failed Electrics attach) stays masked, and the flag adds no ONNX output.
     """
     from pathlib import Path as _Path
 
@@ -862,6 +924,9 @@ def labels_for_row(
             want_road_edge=False,
             aux_cache=aux_cache,
         )
+    from python.train.vehicle_labels import traffic_object_labels
+
+    labels.update(traffic_object_labels(row, brake_light_head=brake_light_head))
     return labels
 
 
@@ -1369,6 +1434,16 @@ def _scene_loss_body(
             curb_points = curb_points + functional.smooth_l1_loss(pred.curbs[curb_on].float(), gt_curbs[curb_on])
 
     if "objects" in wanted:
+        # Size is not supervised. Traffic rows also pass object_feat_keep,
+        # which zeros partial and unseen_s. x, y, yaw, and speed still train.
+        if "object_feat_keep" in target:
+            feature_keep = target["object_feat_keep"].to(device=device, dtype=dtype)
+        else:
+            feature_keep = torch.as_tensor(
+                object_feature_keep(int(pred.objects.shape[-1])),
+                device=device,
+                dtype=dtype,
+            )
         obj_points, classes, obj_valid = _match_continuous(
             functional,
             pred.objects,
@@ -1384,6 +1459,7 @@ def _scene_loss_body(
             state_logits=None,
             gt_state=None,
             lamps=None,
+            feature_keep=feature_keep,
         )
     if "signs" in wanted:
         sign_points, classes, sign_valid, lamps = _match_continuous(
@@ -1581,6 +1657,7 @@ def _match_continuous(
     state_logits: Any,
     gt_state: Any,
     lamps: Any,
+    feature_keep: Any = None,
 ) -> tuple[Any, Any, Any] | tuple[Any, Any, Any, Any]:
     if torch is None:
         raise ImportError("PyTorch is not installed")
@@ -1599,7 +1676,23 @@ def _match_continuous(
         local_g = torch.tensor([g for _p, g in pairs], device=device, dtype=torch.long)
         gt_i = gt_on[local_g]
         target_valid[pred_i] = 1
-        points = points + functional.smooth_l1_loss(pred_cont[pred_i].float(), gt_cont[gt_i].float())
+        pred_f = pred_cont[pred_i].float()
+        gt_f = gt_cont[gt_i].float()
+        if feature_keep is None:
+            points = points + functional.smooth_l1_loss(pred_f, gt_f)
+        else:
+            per = functional.smooth_l1_loss(pred_f, gt_f, reduction="none")
+            keep = feature_keep.to(device=per.device, dtype=per.dtype)
+            if keep.ndim == 1:
+                keep = keep.reshape(1, -1)
+                per = per * keep
+                denom = keep.sum() * per.shape[0]
+            else:
+                # (slot, feature) mask, indexed by the matched ground-truth slot.
+                keep = keep[gt_i]
+                per = per * keep
+                denom = keep.sum()
+            points = points + per.sum() / denom.clamp(min=1.0)
         classes = classes + functional.cross_entropy(pred_class[pred_i].float(), gt_class[gt_i])
         if state_logits is not None and gt_state is not None and lamps is not None:
             lamps = lamps + functional.cross_entropy(state_logits[pred_i].float(), gt_state[gt_i])

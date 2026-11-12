@@ -312,12 +312,12 @@ The settled game view. Soft Esc parked.
 
 ## Training-only depth and semantic ground truth
 
-Optional, off by default. Driving and inference stay vision-only (colour cameras); nothing here feeds the planner or the live net.
+`main` and `wide` record it (`train_gt: true`). The other six cameras stay RGB-only. Driving and inference stay vision-only (colour cameras); nothing here feeds the planner or the live net.
 
-- **Opt-in per camera:** add `train_gt: true` to a camera in `config/cameras.yaml` (intended for `main`). Without the key the camera attaches exactly as before.
-- **Outputs** (next to `raw/main/`, one file per tick):
-  - `raw/main_depth/NNNNNN.png`: uint16 depth in **centimetres**, saturating at 65535 (655.35 m).
-  - `raw/main_sem/NNNNNN.png`: uint8 semantic class id (0 = unknown); `sem_classes.json` maps id to the simulator's annotation class name and colour.
+- **Per camera:** `train_gt: true` in `config/cameras.yaml` renders depth and annotation for that camera only. A camera without the key stays colour.
+- **Outputs** (one file per tick, beside the colour folder):
+  - `raw/<cam>_depth/NNNNNN.png`: uint16 depth in **centimetres**, saturating at 65535 (655.35 m). `main` and `wide`.
+  - `raw/<cam>_sem/NNNNNN.png`: uint8 semantic class id (0 = unknown); `sem_classes.json` maps id to the simulator's annotation class name and colour.
 - **Tagging and isolation:** these entries carry `"train_only": true` in `state.jsonl`. Raw-image listings, per-row camera lists and the frame cache's camera list exclude `*_depth` / `*_sem`, so the driving cameras and training strips are unchanged.
 - **Depth scale is an assumption:** distance is taken as raw depth (0..1) x the camera far plane. This is unverified until a short live smoke run spot-checks a known distance; treat depth values as provisional until then.
 - **Training aux (opt-in):** `--aux-depth` / `--aux-sem` add masked losses from those PNGs onto the main-camera stem features (fixed `12×16` grid). They are never ONNX inputs or default export outputs. Weights (`--aux-depth-weight`, `--aux-sem-weight`) are experimental.

@@ -262,7 +262,14 @@ def check_matches_trainer_val() -> None:
         )
 
 
+def check_route_missing_matches_training() -> None:
+    text = (ROOT / "scripts" / "eval_scene_ckpt.py").read_text(encoding="utf-8")
+    assert 'attach_route_cmds(rows, missing="mask")' in text
+    print("  eval route join uses missing=mask, same as training")
+
+
 def main() -> None:
+    check_route_missing_matches_training()
     check_refuse_missing_and_invalid()
     check_matches_trainer_val()
     print("test_eval_scene_ckpt: all OK")

@@ -1,10 +1,12 @@
 """Train-only stop and yield signs from static level meshes.
 
-The live supervisor never imports this module. A collect run asks the
-BeamNG scenetree once per map, writes ``static_signs.json``, and
-``scripts/export_signal_labels.py`` projects those points into the ego
-frame when it builds ``signs.jsonl``. A failed query is an ``absent``
-marker. It is never filled in with a guessed sign.
+The live supervisor never imports this module. ``--static-signs`` is off
+until a real IQU45 scenetree confirms the stems (every stem is
+``verified=False``). With the flag, collect asks the scenetree once per
+map, writes ``static_signs.json``, and ``scripts/export_signal_labels.py``
+projects those points into the ego frame when it builds ``signs.jsonl``.
+A failed query is an ``absent`` marker. It is never filled in with a
+guessed sign. The default collect and export leave this source unread.
 
 Allowlist status
 ----------------
@@ -25,13 +27,11 @@ Verified, and not used as a mesh stem:
   yield stems that copy it are not.
 
 Unverified stems (every entry below is a guess; none was found in this
-repo, in beamngpy, or in the BeamNG docs):
-
-* shape or object name: ``s_sign_stop``, ``s_sign_yield``,
-  ``stop_sign``, ``stopsign``, ``sign_stop``, ``yield_sign``,
-  ``yieldsign``, ``sign_yield``
-* shape basename only: ``stop``, ``yield`` (so ``stop.dae`` counts and
-  ``stop_light.dae`` does not)
+repo, in beamngpy, or in the BeamNG docs). A match is the shape file's
+basename after the extension and a trailing ``_digits`` suffix, nothing
+else. The object name is ignored, so a tree named ``stop_sign`` is not
+a stop. ``stop.dae``, ``sign_stop_line.dae``, and ``stopsign_prop.dae``
+are not matches: the stem has to be the whole basename.
 """
 from __future__ import annotations
 
@@ -48,18 +48,17 @@ DEDUPE_M = 2.0
 _MATCH_CAP = 4000
 _STEM = re.compile(r"^[a-z0-9_]+$")
 
-# stem, class, verified, how. ``how`` is ``shape-or-name`` or ``shape-basename``.
+# stem, class, verified, how. Match is the shape basename only.
+# Every stem is a guess (verified=False) until an IQU45 scenetree check.
 SHAPE_PATTERNS: tuple[tuple[str, str, bool, str], ...] = (
-    ("s_sign_stop", "stop_sign", False, "shape-or-name"),
-    ("s_sign_yield", "yield", False, "shape-or-name"),
-    ("stop_sign", "stop_sign", False, "shape-or-name"),
-    ("stopsign", "stop_sign", False, "shape-or-name"),
-    ("sign_stop", "stop_sign", False, "shape-or-name"),
-    ("yield_sign", "yield", False, "shape-or-name"),
-    ("yieldsign", "yield", False, "shape-or-name"),
-    ("sign_yield", "yield", False, "shape-or-name"),
-    ("stop", "stop_sign", False, "shape-basename"),
-    ("yield", "yield", False, "shape-basename"),
+    ("s_sign_stop", "stop_sign", False, "shape-basename"),
+    ("s_sign_yield", "yield", False, "shape-basename"),
+    ("stop_sign", "stop_sign", False, "shape-basename"),
+    ("stopsign", "stop_sign", False, "shape-basename"),
+    ("sign_stop", "stop_sign", False, "shape-basename"),
+    ("yield_sign", "yield", False, "shape-basename"),
+    ("yieldsign", "yield", False, "shape-basename"),
+    ("sign_yield", "yield", False, "shape-basename"),
 )
 
 
@@ -88,31 +87,16 @@ def _basename(text: Any) -> str:
     return re.sub(r"_+\d+$", "", base)
 
 
-def _bounded(text: str, stem: str) -> bool:
-    start = 0
-    while True:
-        found = text.find(stem, start)
-        if found < 0:
-            return False
-        before = text[found - 1] if found else ""
-        after_at = found + len(stem)
-        after = text[after_at] if after_at < len(text) else ""
-        if not before.isalnum() and not after.isalnum():
-            return True
-        start = found + 1
-
-
 def classify_shape(shape: Any, name: Any = "") -> str | None:
-    """Map one mesh path or object name onto ``stop_sign`` or ``yield``."""
-    shape_n = _norm(shape)
-    name_n = _norm(name)
-    bases = {_basename(shape), _basename(name)}
-    for stem, cls, _verified, how in SHAPE_PATTERNS:
-        if how == "shape-basename":
-            if _basename(shape) == stem:
-                return cls
-            continue
-        if stem in bases or _bounded(shape_n, stem) or _bounded(name_n, stem):
+    """Map a mesh path onto ``stop_sign`` or ``yield``.
+
+    The object name is ignored. Only an exact shape basename hits, so
+    ``sign_stop_line.dae`` and ``stopsign_prop.dae`` stay unlabeled.
+    """
+    del name
+    base = _basename(shape)
+    for stem, cls, _verified, _how in SHAPE_PATTERNS:
+        if base == stem:
             return cls
     return None
 
@@ -211,12 +195,10 @@ def _lua_set(stems: list[str]) -> str:
 
 
 def lua_chunk() -> str:
-    """GE Lua: return only TSStatic meshes the allowlist names."""
-    long_stems = [stem for stem, _cls, _verified, how in SHAPE_PATTERNS if how == "shape-or-name"]
-    exact_stems = [stem for stem, _cls, _verified, how in SHAPE_PATTERNS if how == "shape-basename"]
+    """GE Lua: return only TSStatic meshes whose shape basename is allowlisted."""
+    stems = [stem for stem, _cls, _verified, _how in SHAPE_PATTERNS]
     return f"""
-local long = {_lua_set(long_stems)}
-local exact = {_lua_set(exact_stems)}
+local stems = {_lua_set(stems)}
 local function norm(s)
   s = tostring(s or ''):lower():gsub('\\\\','/'):gsub('%-','_'):gsub(' ','_')
   return s
@@ -228,32 +210,8 @@ local function basename(s)
   s = s:gsub('_+%d+$','')
   return s
 end
-local function edge(ch)
-  if ch == nil or ch == '' then return true end
-  return ch:match('[a-z0-9]') == nil
-end
-local function bounded(text, stem)
-  local i = 1
-  while true do
-    local s, e = string.find(text, stem, i, true)
-    if not s then return false end
-    local before = s > 1 and text:sub(s - 1, s - 1) or ''
-    local after = text:sub(e + 1, e + 1)
-    if edge(before) and edge(after) then return true end
-    i = s + 1
-  end
-end
-local function hit(shape, name)
-  local shape_n, name_n = norm(shape), norm(name)
-  local bshape = basename(shape)
-  if exact[bshape] then return true end
-  local bname = basename(name)
-  for stem, _ in pairs(long) do
-    if bshape == stem or bname == stem or bounded(shape_n, stem) or bounded(name_n, stem) then
-      return true
-    end
-  end
-  return false
+local function hit(shape)
+  return stems[basename(shape)] == true
 end
 if not scenetree or not scenetree.findClassObjects then
   return jsonEncode({{ok=false, err='scenetree.findClassObjects unavailable'}})
@@ -280,7 +238,7 @@ for _, id in pairs(ids) do
       if o.getName then name = o:getName() or '' else name = o.name or '' end
     end)
     shape, name = tostring(shape or ''), tostring(name or '')
-    if hit(shape, name) then
+    if hit(shape) then
       local p = nil
       pcall(function() p = o:getPosition() end)
       local x = p and tonumber(p.x) or nil
@@ -410,10 +368,6 @@ def record_static_signs(bng: Any, map_name: str, path: Path) -> dict[str, Any]:
     return catalog
 
 
-def _is_signal(row: dict[str, Any]) -> bool:
-    return str(row.get("src") or "traffic_signals") != "scenetree"
-
-
 def _near(a: dict[str, Any], b: dict[str, Any], radius_m: float) -> bool:
     try:
         return math.hypot(float(a["x"]) - float(b["x"]), float(a["y"]) - float(b["y"])) <= float(radius_m)
@@ -426,12 +380,17 @@ def merge_sign_labels(
     static_signs: Any,
     radius_m: float = DEDUPE_M,
 ) -> list[dict[str, Any]]:
-    """Keep signal rows. Drop a scenetree row of the same class within ``radius_m``."""
+    """Keep signal rows. Drop a same-class scenetree twin within ``radius_m``.
+
+    Distance ``== radius_m`` is a twin (the comparison is ``<=``). A second
+    scenetree row of the same class within that radius of an earlier one
+    is dropped too.
+    """
     kept = [dict(row) for row in signal_signs or [] if isinstance(row, dict)]
     for row in static_signs or []:
         if not isinstance(row, dict) or "x" not in row or "y" not in row:
             continue
-        if any(_is_signal(prev) and prev.get("cls") == row.get("cls") and _near(prev, row, radius_m) for prev in kept):
+        if any(prev.get("cls") == row.get("cls") and _near(prev, row, radius_m) for prev in kept):
             continue
         kept.append(dict(row))
     kept.sort(key=lambda row: (float(row.get("y") or 0.0), float(row.get("x") or 0.0), str(row.get("cls") or "")))

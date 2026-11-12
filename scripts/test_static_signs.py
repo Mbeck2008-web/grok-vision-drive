@@ -6,6 +6,7 @@ import ast
 import io
 import json
 import sys
+import tempfile
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -100,6 +101,28 @@ def check_scenetree_fixture_is_ego_frame() -> None:
     print("  scenetree fixture: stop and yield in ego frame; drift, light, and non-TSStatic dropped")
 
 
+def check_shape_basename_rejects_lookalikes() -> None:
+    from python.collect.static_signs import classify_shape, labels_from_scenetree
+
+    assert classify_shape("sign_stop_line.dae") is None
+    assert classify_shape("stopsign_prop.dae") is None
+    assert classify_shape("stop.dae") is None
+    assert classify_shape("tree.dae", "stop_sign") is None
+    assert classify_shape("/art/shapes/objects/s_sign_stop.dae", "tree") == "stop_sign"
+    rows = labels_from_scenetree(
+        [
+            {"class": "TSStatic", "shapeName": "sign_stop_line.dae", "pos": [0.0, 5.0, 0.0]},
+            {"class": "TSStatic", "shapeName": "stopsign_prop.dae", "pos": [0.0, 6.0, 0.0]},
+            {"class": "TSStatic", "shapeName": "stop.dae", "pos": [0.0, 7.0, 0.0]},
+            {"class": "TSStatic", "name": "stop_sign", "shapeName": "tree.dae", "pos": [0.0, 8.0, 0.0]},
+        ],
+        EGO_POS,
+        EGO_DIR,
+    )
+    assert rows == [], rows
+    print("  lookalikes (stop line, prop, bare stop.dae, a tree named stop_sign) are not signs")
+
+
 def check_dedupe_against_signals_api() -> None:
     from python.collect.signal_labels import labels_from_signals
     from python.collect.static_signs import DEDUPE_M, labels_from_scenetree, merge_sign_labels
@@ -132,6 +155,35 @@ def check_dedupe_against_signals_api() -> None:
     lights = [row for row in merged if row["cls"] == "traffic_light"]
     assert len(lights) == 1 and lights[0]["state"] == "red" and lights[0]["src"] == "traffic_signals"
     print("  dedupe: a signals stop within 2 m drops the scenetree twin; a farther stop and a yield stay")
+
+
+def check_dedupe_boundary_is_inclusive() -> None:
+    """Exactly 2.0 m is a twin. A hair past 2.0 m is kept (locks ``<=``)."""
+    from python.collect.static_signs import DEDUPE_M, merge_sign_labels
+
+    signal = [{"cls": "stop_sign", "x": 0.0, "y": 0.0, "state": "unknown", "src": "traffic_signals"}]
+    at_radius = [{"cls": "stop_sign", "x": float(DEDUPE_M), "y": 0.0, "state": "unknown", "src": "scenetree"}]
+    past = [{"cls": "stop_sign", "x": float(DEDUPE_M) + 1e-6, "y": 0.0, "state": "unknown", "src": "scenetree"}]
+    dropped = merge_sign_labels(signal, at_radius)
+    kept = merge_sign_labels(signal, past)
+    assert len(dropped) == 1 and dropped[0]["src"] == "traffic_signals", dropped
+    assert len(kept) == 2 and any(row["src"] == "scenetree" for row in kept), kept
+    print("  dedupe boundary: 2.0 m dropped, 2.0 m + eps kept")
+
+
+def check_scenetree_twins_collapse() -> None:
+    from python.collect.static_signs import DEDUPE_M, merge_sign_labels
+
+    near = {"cls": "stop_sign", "x": 1.0, "y": 10.0, "state": "unknown", "src": "scenetree"}
+    twin = {"cls": "stop_sign", "x": 1.0 + float(DEDUPE_M), "y": 10.0, "state": "unknown", "src": "scenetree"}
+    past = {"cls": "stop_sign", "x": 1.0 + float(DEDUPE_M) + 1e-6, "y": 10.0, "state": "unknown", "src": "scenetree"}
+    other = {"cls": "yield", "x": 1.0, "y": 10.0, "state": "unknown", "src": "scenetree"}
+    merged = merge_sign_labels([], [near, twin, past, other])
+    stops = [row for row in merged if row["cls"] == "stop_sign"]
+    assert len(stops) == 2, merged
+    assert any(abs(float(row["x"]) - (1.0 + float(DEDUPE_M) + 1e-6)) < 1e-9 for row in stops)
+    assert any(row["cls"] == "yield" for row in merged)
+    print("  scenetree twins within 2 m collapse; a different class stays")
 
 
 def check_zero_match_writes_no_signs() -> None:
@@ -276,7 +328,9 @@ def check_export_merges_static_catalog() -> None:
             },
         }
         (root / "static_signs.json").write_text(json.dumps(catalog), encoding="utf-8")
-        code = ex.main([str(root), "--signals", str(root / "signals.jsonl"), "--out", "signs.jsonl"])
+        code = ex.main(
+            [str(root), "--signals", str(root / "signals.jsonl"), "--out", "signs.jsonl", "--static-signs"]
+        )
         assert code == 0, code
         row = json.loads((root / "signs.jsonl").read_text(encoding="utf-8").splitlines()[0])
         by_cls = {sign["cls"]: sign for sign in row["signs"]}
@@ -287,21 +341,89 @@ def check_export_merges_static_catalog() -> None:
     print("  export writes the scenetree stop into signs.jsonl beside the signal light")
 
 
-def check_recorder_is_wired() -> None:
-    text = (ROOT / "scripts" / "collect_scene_lanes.py").read_text(encoding="utf-8")
-    assert "record_static_signs" in text
-    print("  collector calls record_static_signs")
+def check_default_path_skips_scenetree() -> None:
+    """Default collect does not query, and default export writes no scenetree rows."""
+    import collect_scene_lanes as collect
+    import export_signal_labels as ex
+    import scripts.test_collect_tick as tick
+    from python.collect import static_signs as signs
+
+    assert collect.build_parser().parse_args([]).static_signs is False
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        state = {
+            "t": 1.0,
+            "pos": [0.0, 0.0, 0.0],
+            "dir": [0.0, 1.0, 0.0],
+            "tags": {"map": "west_coast_usa"},
+        }
+        (root / "state.jsonl").write_text(json.dumps(state) + "\n", encoding="utf-8")
+        signals = {
+            "t": 1.0,
+            "signals": [{"cls": "traffic_light", "pos": [2.0, 10.0, 0.0], "state": "red"}],
+        }
+        (root / "signals.jsonl").write_text(json.dumps(signals) + "\n", encoding="utf-8")
+        catalog = {
+            "maps": {
+                "west_coast_usa": {
+                    "matches": 1,
+                    "signs": [
+                        {
+                            "cls": "stop_sign",
+                            "pos": [0.0, 20.0, 0.0],
+                            "shapeName": "s_sign_stop.dae",
+                            "name": "corner",
+                        }
+                    ],
+                }
+            }
+        }
+        (root / "static_signs.json").write_text(json.dumps(catalog), encoding="utf-8")
+        code = ex.main([str(root), "--signals", str(root / "signals.jsonl"), "--out", "signs.jsonl"])
+        assert code == 0, code
+        written = (root / "signs.jsonl").read_text(encoding="utf-8")
+        assert "scenetree" not in written, written
+
+    calls: list[int] = []
+    original = signs.record_static_signs
+
+    def _spy(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    signs.record_static_signs = _spy
+    try:
+        with tick.collect_root() as root:
+            out = root / "scene"
+            vehicle = tick._Vehicle(tick.stop_file(out))
+            code = tick._collect(root, out, tick._Bng(vehicle), [])
+            assert code == 0, code
+            assert calls == [], calls
+            assert not (out / "static_signs.json").is_file()
+        calls.clear()
+        with tick.collect_root() as root:
+            out = root / "scene"
+            vehicle = tick._Vehicle(tick.stop_file(out))
+            code = tick._collect(root, out, tick._Bng(vehicle), ["--static-signs"])
+            assert code == 0, code
+            assert calls, "flag on should call record_static_signs"
+    finally:
+        signs.record_static_signs = original
+    print("  default collect and export skip scenetree; --static-signs queries")
 
 
 def main() -> None:
     check_live_path_never_reads_static_signs()
     check_scenetree_fixture_is_ego_frame()
+    check_shape_basename_rejects_lookalikes()
     check_dedupe_against_signals_api()
+    check_dedupe_boundary_is_inclusive()
+    check_scenetree_twins_collapse()
     check_zero_match_writes_no_signs()
     check_enumeration_failure_is_a_marker()
     check_sign_class_counts_show_zero_stops()
     check_export_merges_static_catalog()
-    check_recorder_is_wired()
+    check_default_path_skips_scenetree()
     print("test_static_signs: OK")
 
 

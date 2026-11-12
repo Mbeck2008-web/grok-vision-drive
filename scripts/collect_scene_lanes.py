@@ -495,6 +495,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Stop (reason=no_progress, exit 6) after this many segment ends in a row with no recorded row. 0 never stops.",
     )
     parser.add_argument(
+        "--static-signs",
+        action="store_true",
+        help=(
+            "Training-only: read TSStatic stop/yield meshes into static_signs.json. "
+            "Off by default. Every allowlist stem is still an unverified guess, so leave this "
+            "off until a real scenetree dump has been checked."
+        ),
+    )
+    parser.add_argument(
         "--recheck-cov-min",
         type=float,
         default=0.0,
@@ -2445,7 +2454,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         static_done: set[str] = set()
 
         def _capture_static(map_label: str) -> None:
-            """One scenetree read per map. A failure is a marker, not a guessed sign."""
+            """One scenetree read per map. Off unless ``--static-signs``."""
+            if not args.static_signs:
+                return
             label = str(map_label or "").strip() or "loaded"
             if label in static_done:
                 return
@@ -2460,7 +2471,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     flush=True,
                 )
 
-        if not map_names:
+        if args.static_signs and not map_names:
             _capture_static("")
         while done_s < target_s:
             run.beat(done_s)
@@ -2553,7 +2564,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     return 2
                 loaded_map = map_name
                 loaded_index = seg_index
-                _capture_static(map_name)
+                if args.static_signs:
+                    _capture_static(map_name)
                 cut_at_load = schedule_cut
                 last_ai = None
                 held_tag = None

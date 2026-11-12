@@ -48,6 +48,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Per-tick signals.jsonl, or one JSON dump of get_map_node_signals",
     )
     ap.add_argument("--out", default="signs.jsonl")
+    ap.add_argument(
+        "--static-signs",
+        action="store_true",
+        help=(
+            "Merge static_signs.json into the sidecar. Off by default; the shape "
+            "allowlist is still unverified."
+        ),
+    )
     args = ap.parse_args(argv)
     root = Path(args.root)
     out = root / args.out
@@ -81,15 +89,16 @@ def main(argv: list[str] | None = None) -> int:
             )
             for row in state_rows
         ]
-    catalog_path = root / STATIC_SIGNS_NAME
-    catalog = load_static_catalog(catalog_path)
-    if catalog is not None:
-        labelled = merge_static_into_rows(labelled, state_rows, catalog)
-    elif catalog_path.is_file():
-        print(
-            f"[GVD] stop-sign source: absent on {root.name}: unrecognized {STATIC_SIGNS_NAME}",
-            flush=True,
-        )
+    if args.static_signs:
+        catalog_path = root / STATIC_SIGNS_NAME
+        catalog = load_static_catalog(catalog_path)
+        if catalog is not None:
+            labelled = merge_static_into_rows(labelled, state_rows, catalog)
+        elif catalog_path.is_file():
+            print(
+                f"[GVD] stop-sign source: absent on {root.name}: unrecognized {STATIC_SIGNS_NAME}",
+                flush=True,
+            )
     with out.open("w", encoding="utf-8") as dest:
         for row in labelled:
             dest.write(json.dumps(row, sort_keys=True) + "\n")

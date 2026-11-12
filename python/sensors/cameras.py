@@ -1648,7 +1648,8 @@ class BeamNGPyBackend:
                         rgb_only=rgb_only,
                         update_priority=want_prio,
                         cid=cid,
-                        train_gt=bool(spec.get("train_gt", False)),
+                        # Live is colour only. cameras.yaml train_gt is the collector's.
+                        train_gt=False,
                     )
                     try:
                         cam = Camera(f"gvd_{cid}", bng, vehicle, **kwargs)
@@ -1697,8 +1698,6 @@ class BeamNGPyBackend:
                 self._sensors[cid] = cam
                 if cid != "main":
                     cap_companion_pending(cam)
-                if spec.get("train_gt"):
-                    _attach_sem_palette(cam, bng)
                 self._clip_planes[cid] = (used_near, used_far)
                 self._update_s[cid] = float(used_rate)
                 self._update_priority[cid] = float(used_prio)
@@ -1719,6 +1718,11 @@ class BeamNGPyBackend:
                     for k, v in self._update_s.items()
                 )
                 prios = " ".join(f"{k}={v:g}" for k, v in self._update_priority.items())
+                sent = " ".join(
+                    f"{cid}:depth={'on' if kw.get('is_render_depth') else 'off'},"
+                    f"sem={'on' if kw.get('is_render_annotations') else 'off'}"
+                    for cid, kw in self._sensor_kwargs.items()
+                )
                 print(
                     f"[GVD] beamngpy attached {attached} color Camera(s) from cameras.yaml "
                     f"(near_far_planes far_m {clips}; requested_update_time {rates}; "
@@ -1728,7 +1732,7 @@ class BeamNGPyBackend:
                     f"rear={self._rear_grab_div}; "
                     f"stream_raw offscreen lane_update_s={LANE_CAM_UPDATE_S:g} "
                     f"companion_update_s={COMPANION_OFFSCREEN_UPDATE_S:g}; "
-                    f"GVD->BeamNG vehicle-space convert; depth/semantic OFF)."
+                    f"GVD->BeamNG vehicle-space convert; depth/semantic {sent})."
                 )
             else:
                 print("[GVD] beamngpy: zero Cameras attached; cam_health=missing.")
@@ -1937,6 +1941,8 @@ class BeamNGPyBackend:
         self._sensors[cid] = fresh
         if cid != "main":
             cap_companion_pending(fresh)
+        # Copies the kwargs from open. Live open passes train_gt=False, so
+        # integer_depth is absent and this does not fetch the annotation palette.
         if new_kwargs.get("integer_depth") is False:
             _attach_sem_palette(fresh, self.session.bng)
         self._sensor_kwargs[cid] = new_kwargs

@@ -662,9 +662,19 @@ def check_beamngpy_open_passes_near_far() -> None:
             },
         )
 
+        palette_calls = {"n": 0}
+
+        class _Anno:
+            def get_annotations(self):
+                palette_calls["n"] += 1
+                return {"ROAD": (128, 64, 128)}
+
+        class _Bng:
+            camera = _Anno()
+
         def _connect(explicit=True):
             be.session.vehicle = object()
-            be.session.bng = object()
+            be.session.bng = _Bng()
             return True
 
         be.session.connect = _connect  # type: ignore[method-assign]
@@ -688,7 +698,6 @@ def check_beamngpy_open_passes_near_far() -> None:
         assert "narrow=16" in log
         assert "stream_raw offscreen lane_update_s=0.1 companion_update_s=1" in log
         assert "rear=16" in log
-        assert "depth/semantic OFF" in log
         names = [n for n, _ in captured]
         assert names == [f"gvd_{c}" for c in CAM_IDS], names
         by = {n: kw for n, kw in captured}
@@ -709,9 +718,29 @@ def check_beamngpy_open_passes_near_far() -> None:
             want_rate = LANE_CAM_UPDATE_S if cid in LANE_SENSOR_CAM_IDS else COMPANION_OFFSCREEN_UPDATE_S
             assert by[f"gvd_{cid}"]["requested_update_time"] == want_rate, cid
             assert by[f"gvd_{cid}"]["is_streaming"] is True, cid
-            assert by[f"gvd_{cid}"]["is_render_depth"] is False
             assert by[f"gvd_{cid}"]["resolution"][0] >= 1
-        assert by["gvd_narrow"]["is_render_depth"] is False
+        # Live ignores cameras.yaml train_gt. The log repeats the flags that were sent.
+        sent = []
+        for cid in CAM_IDS:
+            kw = by[f"gvd_{cid}"]
+            assert kw["is_render_depth"] is False, cid
+            assert kw["is_render_annotations"] is False, cid
+            assert "integer_depth" not in kw, cid
+            sent.append(
+                f"{cid}:depth={'on' if kw['is_render_depth'] else 'off'},"
+                f"sem={'on' if kw['is_render_annotations'] else 'off'}"
+            )
+        assert f"depth/semantic {' '.join(sent)}" in log, log
+        assert "depth/semantic OFF" not in log
+        assert palette_calls["n"] == 0
+        assert be._reattach_cam("main", far_m=300.0)
+        assert be._reattach_cam("wide", far_m=300.0)
+        assert palette_calls["n"] == 0
+        for cid in ("main", "wide"):
+            again = be._sensor_kwargs[cid]
+            assert again["is_render_depth"] is False, cid
+            assert again["is_render_annotations"] is False, cid
+            assert "integer_depth" not in again, cid
         assert by["gvd_narrow"]["is_streaming"] is True
         assert by["gvd_narrow"]["resolution"] == (640, 480)
         assert be._clip_planes["narrow"] == (0.05, 800.0)
@@ -746,6 +775,62 @@ def check_beamngpy_open_passes_near_far() -> None:
                 sys.modules.pop(k, None)
             else:
                 sys.modules[k] = v
+
+
+def check_collector_train_gt_stays_on() -> None:
+    """Collection still asks for depth and annotation where cameras.yaml sets train_gt."""
+    import types
+
+    import scripts.collect_scene_lanes as collect
+
+    made: dict[str, dict] = {}
+    palette_calls = {"n": 0}
+
+    class _Cam:
+        def __init__(self, name, bng, vehicle, **kwargs):
+            del bng, vehicle
+            made[name] = kwargs
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
+    class _Anno:
+        def get_annotations(self):
+            palette_calls["n"] += 1
+            return {"ROAD": (128, 64, 128)}
+
+    sensors = types.ModuleType("beamngpy.sensors")
+    sensors.Camera = _Cam
+    beamngpy = types.ModuleType("beamngpy")
+    beamngpy.sensors = sensors
+    old = {k: sys.modules.get(k) for k in ("beamngpy", "beamngpy.sensors")}
+    sys.modules["beamngpy"] = beamngpy
+    sys.modules["beamngpy.sensors"] = sensors
+    try:
+        attached = collect._attach_cameras(
+            types.SimpleNamespace(camera=_Anno()),
+            object(),
+            load_camera_config(),
+        )
+    finally:
+        for k, v in old.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+    assert set(attached) == set(CAM_IDS)
+    for cid in CAM_IDS:
+        kw = made[f"gvd_collect_{cid}"]
+        want = cid in ("main", "wide")
+        assert kw["is_render_depth"] is want, cid
+        assert kw["is_render_annotations"] is want, cid
+        if want:
+            assert kw["integer_depth"] is False, cid
+            assert attached[cid].gvd_sem_palette == {"ROAD": (128, 64, 128)}, cid
+        else:
+            assert "integer_depth" not in kw, cid
+            assert not hasattr(attached[cid], "gvd_sem_palette"), cid
+    assert palette_calls["n"] == 2
+    print("collector train_gt stays on for main and wide")
 
 
 def check_beamngpy_side_grab_half_rate() -> None:
@@ -3112,6 +3197,7 @@ def main() -> None:
     check_poll_mock()
     check_camera_clip_planes()
     check_beamngpy_open_passes_near_far()
+    check_collector_train_gt_stays_on()
     check_beamngpy_side_grab_half_rate()
     check_adhoc_companions_do_not_block_or_pile()
     check_narrow_reattach_and_cam_io_edges()

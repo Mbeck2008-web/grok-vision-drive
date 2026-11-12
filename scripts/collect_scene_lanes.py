@@ -33,6 +33,25 @@ is a smoke collect: if those PNGs do not decode, the process stops.
     py -3 scripts\\collect_scene_lanes.py --check-maps --maps west_coast_usa,italy,east_coast_usa,utah,jungle_rock_island
     py -3 scripts\\collect_scene_lanes.py --minutes 120 --maps west_coast_usa,italy,east_coast_usa,utah,jungle_rock_island --segment-min 12 --smoke-s 60
 
+IQU45 smoke for brake lights and per-tick signals. Tech is already
+running and ``GVD_DATA_DIR`` is the data disk. One minute is the shortest
+schedule; create the STOP file after ``collect smoke ok`` to end early.
+``signals.jsonl`` has one row per ``state.jsonl`` ``t``: the raw
+``get_map_node_signals`` payload, or ``{t, err}`` when the API is missing.
+Non-null ``traffic`` rows (2 Hz) carry ``pos``, ``vel``, ``dir``, ``name``,
+and ``brake_lights`` for every non-player object. ``brake_lights`` is that
+vehicle's Electrics value when the attach worked, otherwise null. A null
+is masked, not lights off. The collector logs the reason once
+(``collect traffic electrics:``). Lua-spawned ``gvd_traffic_*`` cars are
+scenetree objects, not connected beamngpy Vehicles, so the attach may
+fail; that log is the IQU45 proof of whether it works. Follow-up, not
+this collect: connect each traffic vehicle via beamngpy, then attach
+Electrics. Do not copy the ego lamp onto other rows. Also expect
+``raw/main_depth``, ``raw/main_sem``, ``raw/wide_depth``, ``raw/wide_sem``,
+and ``sem_classes.json``. LiDAR and radar stay off.
+
+    py -3 scripts\\collect_scene_lanes.py --minutes 1 --no-excursions --traffic 2 --smoke-s 15 --ctl-probe-every 1
+
 West-coast spawns skip roads whose next 300 m has painted lanes on less than
 ``--min-paint-cov`` of the probes (default 0.5, 0 disables). The weave guard
 (on; ``--no-weave-guard`` turns it off) keeps weaves off unpainted stretches
@@ -68,11 +87,15 @@ Row fields in ``state.jsonl`` written by this collector, besides the frame data:
   on the others). ``*_ai`` is the AI controller's command, and that controller
   uses information the cameras do not see. ``veh`` (electrics whitelist),
   ``ai_cmd`` (the AI commands this collector sent), ``road`` (fields already
-  computed for ``gt``), ``traffic`` (2 Hz, null on other rows), and
+  computed for ``gt``), ``traffic`` (2 Hz, null on other rows; each
+  non-player object has ``pos``, ``vel``, ``dir``, ``name``, and
+  ``brake_lights``, null when Electrics cannot attach), and
   ``veh_meta`` on the first row after each spawn. The probe and the traffic
   read are sent before the sensor poll and answered in the same game frame,
   so they add no round-trip of their own. A failed read is null; it
-  never stops collection. ``--max-file-gib`` stops with exit 7 (``file_cap``).
+  never stops collection. ``signals.jsonl`` is one ``get_map_node_signals``
+  payload per recorded tick, or ``{t, err}``. ``--max-file-gib`` stops with
+  exit 7 (``file_cap``).
 
 ``impacts.jsonl`` beside ``state.jsonl`` has one ``{"kind": "impact", "t",
 "i", "pre_t0", "pre_i0", ...}`` line per impact and one ``{"kind":
@@ -694,6 +717,7 @@ def share_maps(maps: tuple[str, ...], weights: dict[str, float]) -> list[tuple[s
 HARD_SEGMENT_REASONS = ("stationary", "tipped", "damage", "impact")
 IMPACTS_FILE = "impacts.jsonl"
 CUTS_FILE = "cuts.jsonl"
+SIGNALS_FILE = "signals.jsonl"
 # An excursion line is WINDOW_M (60 m) long. With --weave-guard the move ends
 # this far before the line runs out, instead of driving past its end.
 LINE_END_MARGIN_M = 5.0
@@ -2441,6 +2465,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
 
         # Control-input fields (python/collect/control_log.py): probe count, last traffic
         # read, the spawn_seq veh_meta was sent for, and the AI commands sent so far.
+        from python.collect.recorder_v4 import append_signal_tick, with_brake_lights
+
         ctl_ticks = 0
         ctl_traffic_at: float | None = None
         bngpy_version = _beamngpy_version()
@@ -2682,6 +2708,15 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     traffic_now = control_log.parse_traffic(traffic_reply)
                 except Exception:
                     traffic_now = None
+                if traffic_now is not None:
+                    try:
+                        traffic_now = with_brake_lights(traffic_now, bng)
+                    except Exception:
+                        # The helper already masks. This only runs if it raises.
+                        traffic_now = [
+                            {**car, "brake_lights": None} if isinstance(car, dict) else car
+                            for car in traffic_now
+                        ]
             ticks.add("veh_s", time.monotonic() - veh_mark)
             main_stamp = stamps.get("main") if isinstance(stamps, dict) else None
             ticks.note(
@@ -3302,6 +3337,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 impact_respawn_due = impact_respawn_on
             yield_fire = False
             if queued:
+                append_signal_tick(out / SIGNALS_FILE, bng, round(float(now), 6))
                 if "veh_meta" in tags:
                     ctl_meta_for = spawn_seq
                 impact.note_row(now, row_i)

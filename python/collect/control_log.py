@@ -82,7 +82,14 @@ TRAFFIC_CHUNK = (
     "pcall(function() name=tostring(o:getField('name',0) or '') end);"
     "if name=='' or name=='nil' then pcall(function() name=tostring(o:getName() or '') end) end;"
     "local p=o:getPosition();local v=o:getVelocity();local d=o:getDirectionVector();"
-    "out[#out+1]={name=name,pos={p.x,p.y,p.z},vel={v.x,v.y,v.z},dir={d.x,d.y,d.z}} "
+    "local row={name=name,pos={p.x,p.y,p.z},vel={v.x,v.y,v.z},dir={d.x,d.y,d.z}};"
+    # Training-only size for occupancy / vehicle boxes. Each read has its own
+    # pcall, so an object without it keeps its row and the field stays null.
+    "pcall(function() local u=o:getDirectionVectorUp();row.up={u.x,u.y,u.z} end);"
+    "pcall(function() local b=o:getSpawnWorldOOBB();local c=b:getCenter();local h=b:getHalfExtents();"
+    "local a0=b:getAxis(0);local a1=b:getAxis(1);local a2=b:getAxis(2);"
+    "row.box={ctr={c.x,c.y,c.z},half={h.x,h.y,h.z},ax={{a0.x,a0.y,a0.z},{a1.x,a1.y,a1.z},{a2.x,a2.y,a2.z}}} end);"
+    "out[#out+1]=row "
     "end end) end;"
     "return jsonEncode(out)"
 )
@@ -171,6 +178,12 @@ def _vec(value: Any) -> list[float | None] | None:
     return [_num(v) for v in value[:3]]
 
 
+def _full_vec(value: Any) -> list[float] | None:
+    """Three finite numbers or None; never a list holding None."""
+    vec = _vec(value)
+    return None if vec is None or any(x is None for x in vec) else vec  # type: ignore[return-value]
+
+
 def parse_traffic(reply: Any) -> list[dict[str, Any]] | None:
     """Traffic cars found by name. ``[]`` when none exist; ``None`` when the call gave nothing usable."""
     blob = _reply(reply)
@@ -182,8 +195,30 @@ def parse_traffic(reply: Any) -> list[dict[str, Any]] | None:
     for car in blob:
         if isinstance(car, dict):
             cars.append({"name": str(car.get("name") or ""), "pos": _vec(car.get("pos")),
-                         "vel": _vec(car.get("vel")), "dir": _vec(car.get("dir"))})
+                         "vel": _vec(car.get("vel")), "dir": _vec(car.get("dir")),
+                         "up": _full_vec(car.get("up")), "box": _box(car.get("box"))})
     return cars
+
+
+def _box(value: Any) -> dict[str, Any] | None:
+    """World oriented box (``getSpawnWorldOOBB``): centre, half extents, three unit axes.
+
+    Training-only (occupancy fill, vehicle box size). ``None`` when the object
+    did not report one or any part is missing / non-finite; never a guessed size.
+    """
+    if not isinstance(value, dict):
+        return None
+    ctr, half = _vec(value.get("ctr")), _vec(value.get("half"))
+    axes = value.get("ax")
+    if ctr is None or half is None or not isinstance(axes, (list, tuple)) or len(axes) < 3:
+        return None
+    ax = [_vec(a) for a in axes[:3]]
+    flat = ctr + half + [x for a in ax if a is not None for x in a]
+    if any(a is None for a in ax) or any(x is None for x in flat):
+        return None
+    if any(h <= 0.0 for h in half):
+        return None
+    return {"ctr": ctr, "half": half, "ax": ax}
 
 
 _SET = re.compile(r'^\s*ai\.(setMode|setSpeedMode|setSpeed|setLine)\((.*)\)\s*$', re.S)

@@ -127,7 +127,7 @@ Do not copy the ego lamp onto other boxes, and do not threshold red pixels. `OBJ
 
 ## Recorder changes before the next collect
 
-1. Set `train_gt: true` on `main` and `wide` only (`wide` is the urban-intersection camera, `config/cameras.yaml:72-80`). Leave the other six RGB-only so depth and annotation do not render eight ways on the shared 11 GB card.
+1. Set `train_gt: true` on all eight cameras (Michael, 2026-11-11: the long recording must be enough to build a 360° occupancy network later without re-recording). Consumer: the 360° occupancy labeler and net, specced after this recording; until then nothing reads the side/rear GT, and that is accepted. Cost gate: the smoke recording before the long run measures camera Hz and GB/h on IQU45 with all eight; if Hz falls below the run's floor or GB/h does not fit E:, the run goes back to `main` + `wide` only (edit `config/cameras.yaml`), never a silent rate drop. Depth is uint16 centimetres, so `narrow` (far 800 m) saturates at 655.35 m; the labeler treats saturated pixels as far / unknown.
 2. Append one `get_map_node_signals` payload per tick to `signals.jsonl` (`python/collect/signal_labels.py:56-67`). On a missing API, write `{t, err}` and continue. Do not invent lamps.
 3. Extend the traffic read to every non-player object’s `pos`/`vel`/`dir`, still at 2 Hz, names included. Brake lights use the IQU45 gate above: a per-name lookup in the current vehicle map (`python/sensors/tech.py:1389-1395`), then `_connect_vehicle` (`python/sensors/tech.py:1413-1419`), not `_resolve_vehicle` and not the scenetree object (`python/collect/control_log.py:73-75`). PASS stores the polled `brake_lights`, including 0. FAIL stores `null` and sets that loss weight to 0.
 4. Keep LiDAR and radar false.

@@ -3950,7 +3950,11 @@ def main(argv: list[str] | None = None) -> None:
     except ValueError as exc:
         print(f"[GVD] scene train: {exc}")
         sys.exit(2)
-    head_names = heads_for_run(args.heads, strip_roots)
+    try:
+        head_names = heads_for_run(args.heads, strip_roots)
+    except ValueError as exc:
+        print(f"[GVD] scene train: {exc}")
+        sys.exit(2)
     if not str(args.heads or "").strip() and "curbs" not in head_names:
         print(
             "[GVD] curbs omitted from empty --heads until a confirmed curb name is in sem_classes.json",

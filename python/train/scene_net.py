@@ -1327,11 +1327,20 @@ def resolve_train_heads(
     trains every default head except ``curbs`` until ``sem_classes`` contains
     a human-confirmed curb name. An all-zero ``curb_valid`` must not be the
     BCE target for ticks that were never labeled.
+
+    An explicit ``curbs`` (``--heads curbs`` or ``lane_gt,curbs``) raises
+    ``ValueError`` naming ``CURB_NAME_ALLOWLIST`` when that allowlist matches
+    nothing in ``sem_classes``.
     """
     from python.train.cam_strip import parse_heads
 
     names = parse_heads(text)
-    if str(text or "").strip():
+    explicit = bool(str(text or "").strip())
+    if explicit and "curbs" in names and not confirmed_curb_names(sem_classes, allowlist=allowlist):
+        raise ValueError(
+            "refusing --heads curbs: CURB_NAME_ALLOWLIST has no confirmed name in sem_classes.json"
+        )
+    if explicit:
         return names
     if not confirmed_curb_names(sem_classes, allowlist=allowlist):
         names = tuple(name for name in names if name != "curbs")

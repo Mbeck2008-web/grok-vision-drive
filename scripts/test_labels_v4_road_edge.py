@@ -110,6 +110,30 @@ def check_allowlist_empty_and_curb_valid_zero() -> None:
     print("allowlist empty, curb_valid 0, paint unchanged")
 
 
+def _expect_curb_allowlist(fn) -> None:
+    """``fn`` raises ValueError and the message names CURB_NAME_ALLOWLIST."""
+    try:
+        fn()
+    except ValueError as exc:
+        text = str(exc)
+        assert "CURB_NAME_ALLOWLIST" in text, text
+        return
+    raise AssertionError("expected ValueError naming CURB_NAME_ALLOWLIST")
+
+
+def check_explicit_curbs_without_allowlist_raises() -> None:
+    from python.train.scene_net import resolve_train_heads
+    from python.train.train_scene import heads_for_run
+
+    _expect_curb_allowlist(lambda: resolve_train_heads("curbs"))
+    _expect_curb_allowlist(lambda: resolve_train_heads("lane_gt,curbs"))
+    _expect_curb_allowlist(lambda: heads_for_run("curbs"))
+    _expect_curb_allowlist(lambda: heads_for_run("lane_gt,curbs"))
+    # A named list that does not ask for curbs is unchanged.
+    assert resolve_train_heads("lane_gt,road_edge") == ("lane_gt", "road_edge")
+    print("explicit curbs without CURB_NAME_ALLOWLIST raises")
+
+
 def check_road_edge_and_curbs_opt_in() -> None:
     import json
     import tempfile
@@ -183,20 +207,14 @@ def check_empty_heads_does_not_bce_curb_valid() -> None:
     scene_loss(fresh(), target, heads)["total"].backward()
     grad = net.curb_valid_head.weight.grad
     assert grad is None or float(grad.abs().max()) == 0.0, grad
-
-    # The same all-zero mask does BCE-train curb_valid when the head is named.
-    # Empty --heads must not take that path. A second forward, so the first
-    # backward has not already freed the graph.
-    named = scene_loss(fresh(), target, ("curbs",))
-    assert float(named["valid"].detach()) > 0.0
-    named["total"].backward()
-    named_grad = net.curb_valid_head.weight.grad
-    assert named_grad is not None and float(named_grad.abs().max()) > 0.0
+    curb_xy = net.curb_head.weight.grad
+    assert curb_xy is None or float(curb_xy.abs().max()) == 0.0, curb_xy
     print("empty --heads does not BCE-train curb_valid")
 
 
 def main() -> None:
     check_allowlist_empty_and_curb_valid_zero()
+    check_explicit_curbs_without_allowlist_raises()
     check_road_edge_and_curbs_opt_in()
     check_empty_heads_does_not_bce_curb_valid()
     print("test_labels_v4_road_edge: OK")

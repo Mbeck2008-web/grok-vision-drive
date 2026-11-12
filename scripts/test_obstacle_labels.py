@@ -913,6 +913,9 @@ def check_interim_pad_band() -> None:
         got = float(depth_range_pad_m(np.array([dist]), cam)[0])
         assert abs(got - want) < 5e-4, (dist, got, want)
         assert (got <= 0.02) is under, (dist, got)
+    # The 0.25 cap binds at the far end. Uncapped main at 300 m is 0.264 and wide at 120 m is 0.329.
+    assert float(depth_range_pad_m(np.array([300.0]), main)[0]) == 0.25
+    assert float(depth_range_pad_m(np.array([120.0]), wide)[0]) == 0.25
 
     classes = {"kind": "gvd_sem_classes", "train_only": True, "classes": {"0": "unknown", "1": "ROAD"}}
 
@@ -1237,6 +1240,62 @@ def _one_point(cam, x, y, z, *, edges, seeds=False):
     return kind, counts
 
 
+def check_fallback_bump_is_unknown() -> None:
+    """A 0.10 m in-corridor bump on the depth fit at 8 m is unknown by itself.
+
+    Recovered height is about 0.1007 m. That is under ``0.15 - pad(r)`` and
+    over ``0.15 - pad(r) - fit_tol``, so dropping fit_tol from the drivable
+    bar alone labels it drivable. The cell is this bump, not a blocked count.
+    """
+    from python.train.obstacles import UNKNOWN, label_obstacle_frame, view_depth_m, _unproject
+
+    cam = _cam("main")
+    classes = _classes_road()
+    depth = np.zeros((cam.height, cam.width), np.uint16)
+    sem = np.zeros(depth.shape, np.uint8)
+    y = 8.0
+    center = int(math.floor(y / 0.625))
+
+    def splat(x, yy, z, paved):
+        hit = view_depth_m(cam, x, yy, z, cam.width, cam.height)
+        assert hit is not None, (x, yy, z)
+        u, v, metres = hit
+        ui, vi = int(round(u)), int(round(v))
+        assert 0 <= ui < cam.width and 0 <= vi < cam.height, (ui, vi, x, yy)
+        depth[vi, ui] = np.uint16(max(1, int(round(float(metres) * 100.0))))
+        if paved:
+            sem[vi, ui] = 1
+        return vi, ui
+
+    for row in range(center - 2, center + 3):
+        yy = (row + 0.5) * 0.625
+        for x in (0.25, 0.75, 1.25, 1.75):
+            splat(x, yy, 0.0, True)
+    # A 7 m lane leaves this cell inside the corridor and off the seed cells.
+    vi, ui = splat(2.25, y, 0.10, False)
+    values, valid = _paint(7.0)
+    got = label_obstacle_frame(
+        depth,
+        pose=cam,
+        lane_gt=values,
+        lane_gt_valid=valid,
+        road=_road(lambda _y: 0.0, edges=False),
+        ego_pos=(0.0, 0.0, 0.0),
+        ego_dir=(0.0, 1.0, 0.0),
+        ego_up=(0.0, 0.0, 1.0),
+        sem=sem,
+        sem_classes=classes,
+        cam="probe",
+        t=1.0,
+    )
+    ex, ey, ez, _ok = _unproject(cam, depth)
+    kind = _exact(got, float(ex[vi, ui]), float(ey[vi, ui]))
+    recovered = float(ez[vi, ui])
+    assert abs(recovered - 0.1007) < 5e-4, recovered
+    assert kind == UNKNOWN, (kind, recovered)
+    print(f"  fallback 0.10 m bump at 8 m is unknown (recovered {recovered:.4f} m)")
+
+
 def check_path_class_counts() -> None:
     """Edge-z uses pad(r). The depth fit adds fit_tol. Flat road inside 17 m is drivable."""
     from python.train.obstacles import BLOCKED, DRIVABLE, UNKNOWN
@@ -1360,6 +1419,7 @@ def main() -> None:
     check_crown_and_bank_not_blocked()
     check_bump_survives_depth_quantization()
     check_interim_pad_band()
+    check_fallback_bump_is_unknown()
     check_path_class_counts()
     check_fit_levers()
     check_heading_matches_pack_road_edge()

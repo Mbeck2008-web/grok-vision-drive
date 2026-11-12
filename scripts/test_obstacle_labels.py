@@ -249,6 +249,14 @@ def check_epsilon_is_world_clearance() -> None:
     assert _at(got, *egos[0][:2])[0] == UNKNOWN, egos[0]
     assert _at(got, *egos[1][:2])[0] == DRIVABLE, egos[1]
     assert _at(got, *egos[2][:2])[0] == BLOCKED, egos[2]
+    # Literal 0.15. A test that only reads the constant still passes at 0.30.
+    assert float(OBSTACLE_Z_EPS_M) == 0.15
+    near = (0.0, 8.0, 0.20)
+    depth_pin = _blank(POSE.height, POSE.width)
+    pin_ego = _to_ego(near, pos, right, forward, up)
+    _splat(depth_pin, pin_ego)
+    pinned = _label(depth_pin, lane=_paint(), road=_road(lambda _y: 0.0), pos=pos, forward=forward, up=up)
+    assert _at(pinned, pin_ego[0], pin_ego[1])[0] == BLOCKED, (pin_ego, near)
     print(f"  world clearance epsilon is {OBSTACLE_Z_EPS_M} m")
 
 
@@ -657,6 +665,59 @@ def check_crown_and_bank_not_blocked() -> None:
     print("  2% crown and 6% bank: 0 in-corridor blocks on a wide corridor")
 
 
+def check_heading_matches_pack_road_edge() -> None:
+    """Nonzero heading uses the same sin term as pack_road_edge.
+
+    Flipping the sign of sin moves the center to the other side of the car.
+    """
+    from python.debug.lane_targets import LOOKAHEADS_M
+    from python.train.obstacles import BLOCKED, UNKNOWN
+
+    heading = 0.30
+    offset = 0.5
+    width = 6.0
+    y = float(LOOKAHEADS_M[1])
+    values, valid = pack_road_edge(offset_m=offset, heading_err_rad=heading, road_width_m=width)
+    left, right_x = float(values[2]), float(values[3])
+    assert float(valid[2]) > 0.5 and float(valid[3]) > 0.5
+    packed = 0.5 * (left + right_x)
+    expect = -offset + y * math.sin(heading)
+    flipped = -offset - y * math.sin(heading)
+    assert abs(packed - expect) < 1e-4, (packed, expect)
+    assert abs(packed - flipped) > 1.0, (packed, flipped)
+
+    right, forward, up = _flat_axes()
+    pos = (0.0, 0.0, 0.0)
+    road = _road(lambda _y: 0.0, width=width)
+    # y=16 keeps both the true center and the sign-flipped center in the image,
+    # and the flipped center is outside this corridor's edge band.
+    y_img = 16.0
+    center = -offset + y_img * math.sin(heading)
+    other = -offset - y_img * math.sin(heading)
+    half = width * 0.5
+    assert abs(center - other) > half + 0.5
+    inside = (center, y_img, 1.2)
+    outside = (other, y_img, 1.2)
+    assert _visible(*inside) and _visible(*outside), (inside, outside)
+    depth = _blank(POSE.height, POSE.width)
+    _splat(depth, inside)
+    _splat(depth, outside)
+    got = _label(
+        depth,
+        lane=(None, None),
+        road=road,
+        pos=pos,
+        forward=forward,
+        up=up,
+        road_width_m=width,
+        road_offset_m=offset,
+        road_heading_err_rad=heading,
+    )
+    assert _at(got, inside[0], inside[1])[0] == BLOCKED, (center, other)
+    assert _at(got, outside[0], outside[1])[0] == UNKNOWN, (center, other)
+    print("  nonzero heading matches pack_road_edge; a sin sign flip misses the corridor")
+
+
 def check_edge_band_and_row_fields() -> None:
     """0.10 m just outside the edge is blocked. 0.05 m there is not.
 
@@ -863,6 +924,7 @@ def main() -> None:
     check_edge_band_and_row_fields()
     check_crown_and_bank_not_blocked()
     check_bump_survives_depth_quantization()
+    check_heading_matches_pack_road_edge()
     check_wall_pole_empty_and_missing_depth()
     check_missing_geometry_stays_unknown()
     check_clearance_masked_without_near_centers()

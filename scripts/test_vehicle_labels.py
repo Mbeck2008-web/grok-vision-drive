@@ -230,6 +230,65 @@ def check_runtime_stays_camera_only() -> None:
     print(f"  runtime: {len(targets)} files do not import vehicle labels")
 
 
+def check_left_yaw_stays_inside_pi() -> None:
+    """A left-pointing dir is +pi, not -pi, including after the float32 cast."""
+    cap = float(np.nextafter(np.float32(math.pi), np.float32(0.0)))
+    assert cap <= math.pi
+    for ego_h in (math.pi, 1.0):
+        ego_dir = [math.cos(ego_h), math.sin(ego_h), 0.0]
+        # Ego left is -right. right = (sin h, -cos h), so left = (-sin h, cos h).
+        left = [-math.sin(ego_h), math.cos(ego_h), 0.0]
+        row = {
+            "ego": {"pos": [0.0, 0.0, 0.0], "dir": ego_dir},
+            "traffic": [
+                {
+                    "name": "gvd_traffic_0",
+                    "pos": [12.0 * ego_dir[0], 12.0 * ego_dir[1], 0.0],
+                    "vel": [0.0, 0.0, 0.0],
+                    "dir": left,
+                }
+            ],
+        }
+        yaw = float(labels_for_row(row)["objects"][0, 2])
+        # Forcing the branch cut to -pi fails this. float32(pi) is past pi and fails it too.
+        assert -math.pi < yaw <= math.pi, (ego_h, yaw)
+        assert yaw > 0.0, (ego_h, yaw)
+        assert yaw == cap, (ego_h, yaw, cap)
+    print("  yaw cut: left-pointing dir is +pi in (-pi, pi] after float32")
+
+
+def check_brake_only_zero_or_one() -> None:
+    """0 and 1 are lamps. 0.5, 2, -1, and NaN are masked, not a dim light."""
+    def packed(value: object):
+        row = _row(
+            [0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [
+                {
+                    "name": "gvd_traffic_0",
+                    "pos": [0.0, 10.0, 0.0],
+                    "vel": [0.0, 1.0, 0.0],
+                    "dir": [0.0, 1.0, 0.0],
+                    "brake_lights": value,
+                }
+            ],
+        )
+        return labels_for_row(row, brake_light_head=True)
+
+    for bad in (0.5, 2.0, -1.0, float("nan")):
+        got = packed(bad)
+        assert math.isnan(float(got["brake_lights"][0])), (bad, got["brake_lights"][0])
+        assert float(got["brake_lights_valid"][0]) == 0.0, bad
+        assert float(got["object_valid"][0]) == 1.0, bad
+    off = packed(0)
+    on = packed(1)
+    assert float(off["brake_lights"][0]) == 0.0 and float(off["brake_lights_valid"][0]) == 1.0
+    assert float(on["brake_lights"][0]) == 1.0 and float(on["brake_lights_valid"][0]) == 1.0
+    assert float(packed(False)["brake_lights"][0]) == 0.0
+    assert float(packed(True)["brake_lights_valid"][0]) == 1.0
+    print("  brake lights: only exact 0 or 1 is a label")
+
+
 def check_size_default_dropped() -> None:
     from python.train.scene_net import object_feature_keep
 
@@ -297,12 +356,100 @@ def check_size_channels_out_of_loss() -> None:
     print("  size loss: length/width do not change the point loss or its grad")
 
 
+def check_traffic_partial_unseen_grad_is_zero() -> None:
+    """Traffic slots supervise x, y, yaw, speed. partial and unseen_s do not."""
+    try:
+        import torch
+    except ImportError:
+        skip_check("traffic_partial_grad", "torch missing")
+        return
+    from python.train.scene_net import ScenePrediction, scene_loss
+
+    row = _row(
+        [0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [
+            {
+                "name": "gvd_traffic_0",
+                "model": "etk800",
+                "pos": [0.0, 12.0, 0.0],
+                "vel": [0.0, 4.0, 0.0],
+                "dir": [0.0, 1.0, 0.0],
+            }
+        ],
+    )
+    labels = labels_for_row(row)
+    gt = torch.tensor(labels["objects"])
+    pred_t = gt.clone()
+    pred_t[0, 0] = 5.0
+    pred_t[0, 6] = 4.0
+    pred_t[0, 7] = 7.0
+    pred_t.requires_grad_(True)
+    target = {
+        "objects": gt,
+        "object_class": torch.tensor(labels["object_class"]),
+        "object_valid": torch.tensor(labels["object_valid"]),
+        "object_feat_keep": torch.tensor(labels["object_feat_keep"]),
+    }
+    pred = ScenePrediction(
+        lanes=torch.zeros(6, 16, 2),
+        lane_valid=torch.zeros(6),
+        curbs=torch.zeros(2, 16, 2),
+        curb_valid=torch.zeros(2),
+        objects=pred_t,
+        object_class=torch.zeros(16, len(OBJECT_CLASSES)),
+        object_valid=torch.full((16,), 0.5),
+        signs=torch.zeros(8, 4),
+        sign_class=torch.zeros(8, 4),
+        sign_state=torch.zeros(8, 4),
+        sign_valid=torch.zeros(8),
+    )
+    scene_loss(pred, target, ("objects",))["points"].backward()
+    assert pred_t.grad is not None
+    assert torch.count_nonzero(pred_t.grad[:, 6:8]) == 0
+    assert float(pred_t.grad[0, 0].abs()) > 0.0
+    # A hand-built track with no traffic key still trains partial.
+    hand = torch.zeros(16, OBJECT_FEAT)
+    hand[0] = torch.tensor([0.0, 10.0, 1.0, 0.0, 0.0, 3.0, 0.0, 0.0])
+    hand_pred = hand.clone()
+    hand_pred[0, 6] = 2.0
+    hand_pred.requires_grad_(True)
+    hand_tgt = {
+        "objects": hand,
+        "object_class": torch.zeros(16, dtype=torch.long),
+        "object_valid": torch.zeros(16),
+    }
+    hand_tgt["object_valid"][0] = 1.0
+    scene_loss(
+        ScenePrediction(
+            lanes=torch.zeros(6, 16, 2),
+            lane_valid=torch.zeros(6),
+            curbs=torch.zeros(2, 16, 2),
+            curb_valid=torch.zeros(2),
+            objects=hand_pred,
+            object_class=torch.zeros(16, len(OBJECT_CLASSES)),
+            object_valid=torch.full((16,), 0.5),
+            signs=torch.zeros(8, 4),
+            sign_class=torch.zeros(8, 4),
+            sign_state=torch.zeros(8, 4),
+            sign_valid=torch.zeros(8),
+        ),
+        hand_tgt,
+        ("objects",),
+    )["points"].backward()
+    assert float(hand_pred.grad[0, 6].abs()) > 0.0
+    print("  traffic loss: partial and unseen_s gradients are 0")
+
+
 def main() -> None:
     check_heading_wrap()
+    check_left_yaw_stays_inside_pi()
     check_missing_brake_lights_masked()
+    check_brake_only_zero_or_one()
     check_objects_behind_ego()
     check_size_default_dropped()
     check_size_channels_out_of_loss()
+    check_traffic_partial_unseen_grad_is_zero()
     check_runtime_stays_camera_only()
     print("test_vehicle_labels: OK")
 

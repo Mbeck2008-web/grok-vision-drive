@@ -9,8 +9,10 @@ A null traffic sample scores nothing: there is no interpolation, and
 unset. Brake lights are written beside the box. ``brake_lights: null`` is
 what the recorder stores when Electrics cannot attach to a Lua-spawned
 ``gvd_traffic_*`` scenetree object. That null is NaN and its mask stays 0,
-including when the IQU45 flag is on, so it is not "lights off" and it cannot
-enter a loss. A real 0 is the only off. The head stays shut until that poll
+including when the IQU45 flag is on, so it is not "lights off". Only an
+exact 0 or 1 is stored as a lamp. ``scene_loss`` does not read the channel.
+A future brake head must use ``where(mask, x, 0)``, not ``x * mask``,
+because a masked NaN times 0 is still NaN. The flag defaults off
 (``BRAKE_LIGHT_HEAD``).
 """
 from __future__ import annotations
@@ -104,7 +106,11 @@ def _yaw(direction: Any, ego_pos: Any, ego_dir: Any) -> float | None:
     forward = tip[1] - origin[1]
     if math.hypot(right, forward) < 1e-8:
         return None
-    return math.atan2(forward, right)
+    yaw = math.atan2(forward, right)
+    # atan2's negative branch is -pi. +pi is the same heading and stays in (-pi, pi].
+    if yaw <= -math.pi:
+        return math.pi
+    return yaw
 
 
 def _speed(vel: Any) -> float | None:
@@ -119,7 +125,8 @@ def _brake(obj: Mapping[str, Any]) -> tuple[float, bool]:
     """(value, present). Null is masked, not off.
 
     PR1 writes ``brake_lights: null`` when Electrics fails on a scenetree
-    ``gvd_traffic_*``. That is NaN with present False. A finite 0 is off.
+    ``gvd_traffic_*``. That is NaN with present False. Only an exact 0 or 1
+    is a lamp. 0.5, 2, -1, and NaN are not a dim light: NaN, present False.
     """
     sources: list[Mapping[str, Any]] = [obj]
     nested = obj.get("veh")
@@ -138,7 +145,7 @@ def _brake(obj: Mapping[str, Any]) -> tuple[float, bool]:
                 out = float(value)
             except (TypeError, ValueError):
                 return math.nan, False
-            if not math.isfinite(out):
+            if out != 0.0 and out != 1.0:
                 return math.nan, False
             return out, True
     return 0.0, False
@@ -197,9 +204,11 @@ def traffic_object_labels(
 
     No ``traffic`` key leaves the dict empty so painted tracks stay as they
     are. ``traffic: null`` (the off-ticks of the 2 Hz probe) scores nothing.
-    Brake-light values are stored either way. A null field is NaN.
-    ``brake_lights_valid`` is 1 only for a finite field when the head flag
-    is on. Null stays 0, so no brake-light loss can use it.
+    Brake-light values are stored beside the box. ``scene_loss`` does not
+    read them. ``brake_lights_valid`` is 1 only for an exact 0 or 1 when the
+    head flag is on. Null and any other number are NaN with valid 0. A future
+    brake head has to use ``where(mask, x, 0)`` rather than ``x * mask``:
+    a masked NaN times 0 is still NaN.
     """
     row = row or {}
     field = _traffic_field(row)
@@ -218,10 +227,18 @@ def traffic_object_labels(
         if box["_brake_seen"]:
             seen[slot] = 1.0
     open_head = BRAKE_LIGHT_HEAD if brake_light_head is None else bool(brake_light_head)
+    # Spec supervises x, y, yaw, speed only. partial and unseen_s are not labels.
+    feat_keep = np.zeros((N_OBJECTS, OBJECT_FEAT), dtype=np.float32)
+    for slot in range(len(boxes)):
+        feat_keep[slot, 0] = 1.0
+        feat_keep[slot, 1] = 1.0
+        feat_keep[slot, 2] = 1.0
+        feat_keep[slot, 5] = 1.0
     return {
         "objects": packed["objects"],
         "object_class": packed["object_class"],
         "object_valid": packed["object_valid"],
+        "object_feat_keep": feat_keep,
         "brake_lights": lamps,
         "brake_lights_valid": seen if open_head else np.zeros_like(seen),
     }

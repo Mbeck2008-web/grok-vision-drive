@@ -76,6 +76,28 @@ def object_feature_keep(n: int = OBJECT_FEAT) -> np.ndarray:
     return keep
 
 
+def _fold_object_yaw(objects: np.ndarray) -> np.ndarray:
+    """Keep yaw in (-pi, pi] after the float32 cast.
+
+    ``atan2`` returns -pi on one side of the cut; the label uses +pi.
+    ``float32(pi)`` is one ulp above pi, so the cast itself leaves the
+    interval. Both become the greatest float32 that is still <= pi.
+    """
+    if objects.ndim != 2 or objects.shape[0] == 0 or objects.shape[-1] < 3:
+        return objects
+    yaw = objects[:, 2]
+    # Compare in float64. A float32 compare casts pi down to float32(pi),
+    # which hides the ulp the cast just added.
+    yaw64 = yaw.astype(np.float64)
+    cap = np.nextafter(np.float32(math.pi), np.float32(0.0))
+    pos = np.float32(math.pi)
+    neg = np.float32(-math.pi)
+    on_pos = (yaw == pos) & (yaw64 > math.pi)
+    on_neg = (yaw == neg) & (yaw64 <= -math.pi)
+    objects[:, 2] = np.where(on_pos | on_neg, cap, yaw)
+    return objects
+
+
 _CLASS_ALIASES = {
     "stop": "stop_sign",
     "yield_sign": "yield",
@@ -733,7 +755,7 @@ def labels_from_tech(tech: Mapping[str, Any] | None) -> dict[str, np.ndarray]:
         "lane_valid": lane_valid.astype(np.float32),
         "curbs": curbs.astype(np.float32),
         "curb_valid": curb_valid.astype(np.float32),
-        "objects": objects.astype(np.float32),
+        "objects": _fold_object_yaw(objects.astype(np.float32)),
         "object_class": object_class.astype(np.int64),
         "object_valid": object_valid.astype(np.float32),
         "signs": signs.astype(np.float32),
@@ -1282,13 +1304,16 @@ def _scene_loss_body(
             curb_points = curb_points + functional.smooth_l1_loss(pred.curbs[curb_on].float(), gt_curbs[curb_on])
 
     if "objects" in wanted:
-        # Size is not supervised. The keep mask zeros length and width so a
-        # stored 0 (or an old 4.5 x 1.8 filler) cannot pull the object head.
-        size_keep = torch.as_tensor(
-            object_feature_keep(int(pred.objects.shape[-1])),
-            device=device,
-            dtype=dtype,
-        )
+        # Size is not supervised. Traffic rows also pass object_feat_keep,
+        # which zeros partial and unseen_s. x, y, yaw, and speed still train.
+        if "object_feat_keep" in target:
+            feature_keep = target["object_feat_keep"].to(device=device, dtype=dtype)
+        else:
+            feature_keep = torch.as_tensor(
+                object_feature_keep(int(pred.objects.shape[-1])),
+                device=device,
+                dtype=dtype,
+            )
         obj_points, classes, obj_valid = _match_continuous(
             functional,
             pred.objects,
@@ -1304,7 +1329,7 @@ def _scene_loss_body(
             state_logits=None,
             gt_state=None,
             lamps=None,
-            feature_keep=size_keep,
+            feature_keep=feature_keep,
         )
     if "signs" in wanted:
         sign_points, classes, sign_valid, lamps = _match_continuous(
@@ -1480,9 +1505,16 @@ def _match_continuous(
             points = points + functional.smooth_l1_loss(pred_f, gt_f)
         else:
             per = functional.smooth_l1_loss(pred_f, gt_f, reduction="none")
-            keep = feature_keep.to(device=per.device, dtype=per.dtype).reshape(-1)
-            per = per * keep
-            denom = keep.sum() * per.shape[0]
+            keep = feature_keep.to(device=per.device, dtype=per.dtype)
+            if keep.ndim == 1:
+                keep = keep.reshape(1, -1)
+                per = per * keep
+                denom = keep.sum() * per.shape[0]
+            else:
+                # (slot, feature) mask, indexed by the matched ground-truth slot.
+                keep = keep[gt_i]
+                per = per * keep
+                denom = keep.sum()
             points = points + per.sum() / denom.clamp(min=1.0)
         classes = classes + functional.cross_entropy(pred_class[pred_i].float(), gt_class[gt_i])
         if state_logits is not None and gt_state is not None and lamps is not None:

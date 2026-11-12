@@ -866,6 +866,7 @@ def labels_for_row(
     aux_depth: bool = False,
     aux_sem: bool = False,
     road_edge: bool = False,
+    obstacles: bool = False,
     aux_cache: Any = None,
     brake_light_head: bool | None = None,
 ) -> dict[str, np.ndarray]:
@@ -908,6 +909,10 @@ def labels_for_row(
         re_v, re_m = road_edge_from_record(record)
         labels["road_edge"] = re_v
         labels["road_edge_valid"] = re_m
+    if obstacles and root is not None:
+        from python.train.obstacles import obstacle_targets
+
+        labels.update(obstacle_targets(root, index=row.get("i"), t=row.get("t")))
     if root is not None and (aux_depth or aux_sem) and row.get("i") is not None:
         labels = attach_aux_to_labels(
             labels,
@@ -1140,10 +1145,12 @@ class ScenePrediction:
     ctl_steer: Any = None
     ctl_throttle: Any = None
     ctl_brake: Any = None
-    # Training-only aux / road_edge (never default ONNX outputs).
+    # Training-only aux / road_edge / obstacles (never default ONNX outputs).
     aux_depth: Any = None
     aux_sem_logits: Any = None
     road_edge: Any = None
+    obstacle_mask: Any = None
+    obstacle_clear: Any = None
 
     def as_dict(self) -> dict[str, Any]:
         return {name: getattr(self, name) for name in OUTPUT_FIELDS}
@@ -1504,7 +1511,7 @@ def _scene_loss_body(
         ctl_term = zero.clone()
     # A lane-only run (with or without ctl) must not backprop the other heads.
     # Those zeros are fresh tensors, not a slice of the polyline or the match loss.
-    if wanted - {"ctl", "road_edge"} == frozenset({"lane_gt"}):
+    if wanted - {"ctl", "road_edge", "obstacles"} == frozenset({"lane_gt"}):
         points = zero.detach().clone()
         classes = zero.detach().clone()
         lamps = zero.detach().clone()
@@ -1580,6 +1587,51 @@ def _scene_loss_body(
             )
             aux_sem_term = ce
         total = total + float(aux_sem_weight) * aux_sem_term
+    # Obstacle mask is training-only. Unknown cells (0) and a missing sidecar
+    # do not pull, but the zero stays on the logit graph so backward is safe.
+    # Clearance weight stays 0 until the prop check passes.
+    obstacle_term = zero.clone()
+    obstacle_clear_term = zero.clone()
+    if (
+        "obstacles" in wanted
+        and getattr(pred, "obstacle_mask", None) is not None
+        and "obstacle_mask" in target
+    ):
+        logits = pred.obstacle_mask.to(device=device)
+        # A missing sidecar or an all-unknown mask has no CE target. 0 * sum
+        # still requires grad, so train_scene can backward this total.
+        obstacle_term = logits.sum() * 0.0
+        present = target.get("obstacle_present")
+        present_on = True
+        if present is not None:
+            present_on = float(torch.as_tensor(present, device=device).reshape(-1).max()) >= 0.5
+        if present_on:
+            goal = target["obstacle_mask"].to(device=device, dtype=torch.long)
+            if logits.dim() == 3:
+                logits = logits.unsqueeze(0)
+            if goal.dim() == 2:
+                goal = goal.unsqueeze(0)
+            if tuple(logits.shape[-2:]) == tuple(goal.shape[-2:]):
+                # Unknown (class 0) is replaced, not multiplied. where drops its grad.
+                known = (goal == 1) | (goal == 2)
+                flat_logits = logits.permute(0, 2, 3, 1).reshape(-1, int(logits.shape[1]))
+                flat_goal = goal.reshape(-1)
+                per = functional.cross_entropy(flat_logits, flat_goal, reduction="none")
+                masked = torch.where(known.reshape(-1), per, torch.zeros_like(per))
+                obstacle_term = masked.sum() / known.reshape(-1).to(dtype=per.dtype).sum().clamp(min=1.0)
+        from python.train.obstacles import CLEARANCE_LOSS_WEIGHT, PROP_CHECK_PASSED
+
+        clear_weight = float(CLEARANCE_LOSS_WEIGHT) if PROP_CHECK_PASSED else 0.0
+        if clear_weight > 0.0 and getattr(pred, "obstacle_clear", None) is not None and "obstacle_clear" in target:
+            clear_pred = pred.obstacle_clear.to(device=device, dtype=dtype).reshape(-1)
+            clear_goal = target["obstacle_clear"].to(device=device, dtype=dtype).reshape(-1)
+            clear_mask = target.get("obstacle_clear_valid")
+            if clear_mask is not None:
+                on_clear = clear_mask.to(device=device, dtype=dtype).reshape(-1)[: clear_pred.shape[0]] > 0.5
+                if bool(on_clear.any()):
+                    diff = functional.smooth_l1_loss(clear_pred, clear_goal, reduction="none")
+                    obstacle_clear_term = (diff[on_clear]).sum() / on_clear.sum().clamp(min=1).to(dtype)
+        total = total + obstacle_term + clear_weight * obstacle_clear_term
     out = {
         "points": points,
         "class": classes,
@@ -1591,6 +1643,8 @@ def _scene_loss_body(
         "road_edge": road_edge_term,
         "aux_depth": aux_depth_term,
         "aux_sem": aux_sem_term,
+        "obstacle": obstacle_term,
+        "obstacle_clear": obstacle_clear_term,
         "total": total,
         # Unweighted parts of lane_gt, for the val line. Not in LOSS_TERMS.
         "lane_reg": lane_reg,
@@ -1752,6 +1806,7 @@ if torch is not None:
             cond_dim: int = 0,
             aux_sensors: bool = False,
             road_edge: bool = False,
+            obstacles: bool = False,
             route_cond: bool = False,
             *,
             stem_channels: tuple[int, ...] | None = None,
@@ -1805,6 +1860,7 @@ if torch is not None:
 
             self.aux_sensors = bool(aux_sensors)
             self.road_edge = bool(road_edge)
+            self.obstacles = bool(obstacles)
             self.aux_h = int(AUX_H)
             self.aux_w = int(AUX_W)
             self.sem_class_max = int(SEM_CLASS_MAX)
@@ -1818,6 +1874,15 @@ if torch is not None:
                 self.road_edge_head = nn.Linear(hidden, int(ROAD_EDGE_DIM))
                 arch = getattr(self, "pause_arch", checkpoint_arch(self.cams))
                 self.pause_arch = arch + f":road_edge={int(ROAD_EDGE_DIM)}"
+            if self.obstacles:
+                from python.train.obstacles import GRID_H, GRID_W
+
+                cin = int(getattr(self.stem, "out_channels", STEM_CHANNELS[-1]))
+                self.obstacle_mask_head = nn.Conv2d(cin, 3, kernel_size=1, bias=True)
+                self.obstacle_clear_head = nn.Conv2d(cin, 1, kernel_size=1, bias=True)
+                self.obstacle_grid = (int(GRID_H), int(GRID_W))
+                arch = getattr(self, "pause_arch", checkpoint_arch(self.cams))
+                self.pause_arch = arch + f":obstacles={int(GRID_H)}x{int(GRID_W)}"
             # --route-cond: additive nav-command embedding. Off by default so
             # old checkpoints load unchanged. This is not --ctl-cond.
             self.route_cond = bool(route_cond)
@@ -1946,6 +2011,7 @@ if torch is not None:
                 sem = functional.adaptive_avg_pool2d(sem, (self.aux_h, self.aux_w))
                 pred.aux_depth = depth
                 pred.aux_sem_logits = sem
+            _attach_obstacles(self, pred, main_feat)
             end_state = SceneState(h=h_new, tokens=tokens_ring, mask=mask_ring)
             return pred, end_state, end_state
 
@@ -1988,6 +2054,7 @@ if torch is not None:
                 sem = functional.adaptive_avg_pool2d(sem, (self.aux_h, self.aux_w))
                 pred.aux_depth = depth
                 pred.aux_sem_logits = sem
+            _attach_obstacles(self, pred, main_feat)
             return pred, SceneState(h=h_new, tokens=new_tokens, mask=new_mask)
 
         def _encode(self, image: Any) -> Any:
@@ -2011,7 +2078,7 @@ if torch is not None:
                 if sec.wide:
                     narrow = 256 if self.scale >= 0.999 else max(1, int(round(256 * self.scale)))
                     crop = _letterbox_wide(crop, self.canvas_h, narrow)
-                if bool(getattr(self, "aux_sensors", False)) and str(sec.cam_id) == "main":
+                if bool(getattr(self, "aux_sensors", False) or getattr(self, "obstacles", False)) and str(sec.cam_id) == "main":
                     feat_map = self.stem.features(crop)
                     parts.append(self.stem.embed(feat_map))
                     main_feat = feat_map
@@ -2028,6 +2095,17 @@ if torch is not None:
         if not bool(getattr(net, "road_edge", False)):
             return None
         return net.road_edge_head(feat)
+
+    def _attach_obstacles(net: SceneNet, pred: ScenePrediction, main_feat: Any) -> None:
+        """1x1 conv on the main-sector stem. Not an ONNX output."""
+        if not bool(getattr(net, "obstacles", False)) or main_feat is None:
+            return
+        import torch.nn.functional as functional
+
+        grid = getattr(net, "obstacle_grid", (64, 64))
+        logits = net.obstacle_mask_head(main_feat)
+        pred.obstacle_mask = functional.interpolate(logits, size=grid, mode="bilinear", align_corners=False)
+        pred.obstacle_clear = functional.adaptive_avg_pool2d(net.obstacle_clear_head(main_feat), 1).flatten(1)
 
     def _apply_route(net: SceneNet, feat: Any, route: Any) -> Any:
         if not bool(getattr(net, "route_cond", False)):
@@ -2129,7 +2207,7 @@ if torch is not None:
 
     def _prediction_at(pred: ScenePrediction, index: int) -> ScenePrediction:
         extra = {name: getattr(pred, name)[index] for name in CTL_OUTPUT_FIELDS if getattr(pred, name) is not None}
-        for name in ("aux_depth", "aux_sem_logits", "road_edge"):
+        for name in ("aux_depth", "aux_sem_logits", "road_edge", "obstacle_mask", "obstacle_clear"):
             value = getattr(pred, name, None)
             if value is not None:
                 extra[name] = value[index]

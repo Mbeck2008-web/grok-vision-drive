@@ -3,7 +3,11 @@ name: offline tests
 on:
   pull_request:
   push:
-    branches: [main]
+    # pull_request covers PR sync. push covers this branch even when that
+    # event does not register a check. No path filter: every file runs the suite.
+    branches:
+      - main
+      - "cursor/**"
 
 jobs:
   offline:

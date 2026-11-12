@@ -339,6 +339,53 @@ def check_low_space_run() -> None:
     print(f"low-space run: {len(refused)} val rows, every checkpoint refused and logged, training finished OK")
 
 
+def check_old_checkpoint_has_no_obstacle_head() -> None:
+    """A checkpoint written before the obstacle head loads strictly.
+
+    Forcing obstacles=True builds the new convs, and the strict load raises
+    KeyError because those weights are not in the file.
+    """
+    import torch
+
+    from python.train.epoch_ckpt import build_net, load_epoch_ckpt, load_into_net, write_epoch_ckpt
+    from python.train.scene_net import SceneNet
+
+    torch.manual_seed(0)
+    net = SceneNet(cams=("main",))
+    assert net.obstacles is False
+    weights = {key: value.detach().cpu().numpy() for key, value in net.state_dict().items()}
+    assert not any("obstacle" in key for key in weights)
+    meta = {
+        "run": "20261112T000000Z",
+        "epoch": 1,
+        "step": 4,
+        "strips": "old",
+        "cams": ["main"],
+        "scale": 1.0,
+        "backbone": "scratch",
+        "arch": "scratch",
+        "heads": ["lane_gt"],
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "old.run20261112T000000Z.ckpt_ep1_step4.npz"
+        write_epoch_ckpt(path, weights, meta)
+        loaded = load_epoch_ckpt(path)
+        restored = build_net(loaded["meta"], loaded["weights"])
+        assert restored.obstacles is False
+        load_into_net(restored, loaded["weights"])
+        forced_meta = dict(loaded["meta"])
+        forced_meta["obstacles"] = True
+        forced = build_net(forced_meta, loaded["weights"])
+        assert forced.obstacles is True
+        try:
+            load_into_net(forced, loaded["weights"])
+        except KeyError as exc:
+            assert "obstacle" in str(exc), exc
+        else:
+            raise AssertionError("old checkpoint loaded into obstacles=True")
+    print("old checkpoint: strict load works; obstacles=True raises KeyError")
+
+
 def check_cli_flags() -> None:
     from python.train.train_scene import build_parser
 
@@ -358,6 +405,7 @@ def main() -> None:
     check_step_embedded()
     check_low_space()
     check_cli_flags()
+    check_old_checkpoint_has_no_obstacle_head()
     check_round_trip()
     check_round_trip_cam_age()
     check_low_space_run()

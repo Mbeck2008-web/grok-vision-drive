@@ -28,6 +28,10 @@ class RoadPoly:
     # reads it (stacked garage floors share x, y); a segment with a missing
     # end height has no dz, so that one join is judged in plan only.
     z: list[float | None] | None = None
+    # Per-vertex height of the left and right road edges. None when that side
+    # had no height (older dumps included). Not folded into ``z``.
+    left_z: list[float | None] | None = None
+    right_z: list[float | None] | None = None
 
 
 # A heading jump bigger than this in one tick is a different road, not a yaw.
@@ -226,13 +230,17 @@ def parse_road_edges(road_id: str, edges: object) -> RoadPoly | None:
     """Centerline from BeamNG ``get_road_edges`` records.
 
     Each record may carry ``middle`` / ``left`` / ``right`` as xyz. A missing
-    middle is the mean of the two edges. Width is the left-right distance,
-    or the record's ``width`` when the edges are absent.
+    middle point is the mean of the two edge positions. Width is the left-right
+    distance, or the record's ``width`` when the edges are absent. Left and right
+    heights are kept on ``left_z`` / ``right_z``. A missing side stays None.
+    A middle without a height stays missing. The slope uses the raw edge heights.
     """
     if not isinstance(edges, list):
         return None
     xy: list[tuple[float, float]] = []
     zs: list[float | None] = []
+    left_zs: list[float | None] = []
+    right_zs: list[float | None] = []
     widths: list[float] = []
     for edge in edges:
         if not isinstance(edge, dict):
@@ -242,17 +250,16 @@ def parse_road_edges(road_id: str, edges: object) -> RoadPoly | None:
         mid_raw = edge.get("middle") or edge.get("mid") or edge.get("center")
         mid = _xy3(mid_raw)
         mid_z = _z3(mid_raw)
+        lz, rz = _z3(edge.get("left")), _z3(edge.get("right"))
         if mid is None and left is not None and right is not None:
             mid = ((left[0] + right[0]) * 0.5, (left[1] + right[1]) * 0.5)
-            mid_z = None
-        if mid_z is None:
-            # A middle without a height still gets the edges' mean height.
-            lz, rz = _z3(edge.get("left")), _z3(edge.get("right"))
-            mid_z = None if lz is None or rz is None else 0.5 * (lz + rz)
+        # A missing middle height stays missing. The slope uses left_z/right_z.
         if mid is None:
             continue
         xy.append(mid)
         zs.append(mid_z)
+        left_zs.append(lz)
+        right_zs.append(rz)
         got = _edge_width(edge, left, right)
         if got is not None:
             widths.append(got)
@@ -270,7 +277,11 @@ def parse_road_edges(road_id: str, edges: object) -> RoadPoly | None:
         width = LANE_W_M
     # Per point: one record without a height costs that point, not the road.
     z = None if all(value is None for value in zs) else [None if v is None else float(v) for v in zs]
-    return RoadPoly(road_id=str(road_id), xy=xy, width_m=float(width), z=z)
+    left_z = None if all(value is None for value in left_zs) else [None if v is None else float(v) for v in left_zs]
+    right_z = None if all(value is None for value in right_zs) else [None if v is None else float(v) for v in right_zs]
+    return RoadPoly(
+        road_id=str(road_id), xy=xy, width_m=float(width), z=z, left_z=left_z, right_z=right_z
+    )
 
 
 @dataclass(frozen=True)

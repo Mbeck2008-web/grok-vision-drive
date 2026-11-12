@@ -634,6 +634,18 @@ def _assert_short_collect(out: Path, made: dict, bng: _Bng, lead: _Vehicle, park
     assert any("getObjectCount" in cmd for cmd in bng.commands)
     assert "electrics" in lead.sensors and "electrics" in parked.sensors
 
+    from python.collect.road_dump import load_road_dump, road_gt_for_row
+
+    dump = out / "roads" / "current.json.gz"
+    assert dump.is_file(), dump
+    saved_polys, _payload = load_road_dump(dump)
+    assert saved_polys and saved_polys[0].road_id == "r"
+    assert saved_polys[0].left_z is None and saved_polys[0].right_z is None
+    pointed = [row for row in state if isinstance(row.get("road"), dict)]
+    assert pointed and all(row["road"].get("edge_z_file") == "roads/current.json.gz" for row in pointed)
+    assert road_gt_for_row(out, pointed[0]) is not None
+    assert "left_z" not in pointed[0]["road"] and "right_z" not in pointed[0]["road"]
+
     gt_rows = [json.loads(line) for line in (out / "gt.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
     assert len(gt_rows) == len(state)
     for row in gt_rows:

@@ -192,6 +192,9 @@ def with_brake_lights(cars: list[dict[str, Any]] | None, bng: Any) -> list[dict[
                 "pos": car.get("pos"),
                 "vel": car.get("vel"),
                 "dir": car.get("dir"),
+                # Training-only size/attitude from parse_traffic; None stays None.
+                "up": car.get("up"),
+                "box": car.get("box"),
                 "brake_lights": _brake_lights_for(name, handles),
             }
         )

@@ -37,6 +37,8 @@ TRAFFIC = [
     {"name": "gvd_traffic_0", "pos": [1.0, 40.0, 0.5], "vel": [0.0, 8.0, 0.0], "dir": [0.0, 1.0, 0.0]},
     {"name": "parked_bus", "pos": [-3.0, 15.0, 0.5], "vel": [0.0, 0.0, 0.0], "dir": [1.0, 0.0, 0.0]},
 ]
+BOX = {"ctr": [1.0, 40.0, 0.9], "half": [0.95, 2.3, 0.75],
+       "ax": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]}
 # Ego lamp is 1. Traffic lamps differ so a copied ego lamp fails the check.
 BRAKES = {"ego": 1, "gvd_traffic_0": 0, "parked_bus": 1}
 PAINT_KEYS = {
@@ -185,7 +187,10 @@ def check_brake_lights_come_from_each_vehicle() -> None:
     sys.modules["beamngpy"] = beamngpy
     sys.modules["beamngpy.sensors"] = sensors
     try:
-        got = with_brake_lights(TRAFFIC + [
+        from python.collect.control_log import parse_traffic
+        parsed = parse_traffic(json.dumps([dict(TRAFFIC[0], up=[0, 0, 1], box=BOX)]))[0]
+        assert parsed["box"] is not None and parsed["up"] == [0.0, 0.0, 1.0]
+        got = with_brake_lights([parsed, TRAFFIC[1]] + [
             {"name": "loose_cone", "pos": [0.0, 9.0, 0.2], "vel": [0.0, 0.0, 0.0], "dir": [0.0, 1.0, 0.0]},
         ], _Bng())
     finally:
@@ -202,6 +207,10 @@ def check_brake_lights_come_from_each_vehicle() -> None:
     assert by["gvd_traffic_0"]["pos"] == [1.0, 40.0, 0.5]
     assert by["parked_bus"]["vel"] == [0.0, 0.0, 0.0]
     assert by["gvd_traffic_0"]["dir"] == [0.0, 1.0, 0.0]
+    # The parsed box and up survive the brake merge into the stored tag.
+    assert by["gvd_traffic_0"]["box"] == parsed["box"], by["gvd_traffic_0"]
+    assert by["gvd_traffic_0"]["up"] == [0.0, 0.0, 1.0]
+    assert by["parked_bus"]["box"] is None and by["parked_bus"]["up"] is None
     assert "electrics" in lead.sensors and "electrics" in parked.sensors
     assert lead.polls == 1 and parked.polls == 1
     assert "electrics" not in ego.sensors  # the player attach is the collector's, not this merge

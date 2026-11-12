@@ -178,6 +178,12 @@ def _vec(value: Any) -> list[float | None] | None:
     return [_num(v) for v in value[:3]]
 
 
+def _full_vec(value: Any) -> list[float] | None:
+    """Three finite numbers or None; never a list holding None."""
+    vec = _vec(value)
+    return None if vec is None or any(x is None for x in vec) else vec  # type: ignore[return-value]
+
+
 def parse_traffic(reply: Any) -> list[dict[str, Any]] | None:
     """Traffic cars found by name. ``[]`` when none exist; ``None`` when the call gave nothing usable."""
     blob = _reply(reply)
@@ -190,7 +196,7 @@ def parse_traffic(reply: Any) -> list[dict[str, Any]] | None:
         if isinstance(car, dict):
             cars.append({"name": str(car.get("name") or ""), "pos": _vec(car.get("pos")),
                          "vel": _vec(car.get("vel")), "dir": _vec(car.get("dir")),
-                         "up": _vec(car.get("up")), "box": _box(car.get("box"))})
+                         "up": _full_vec(car.get("up")), "box": _box(car.get("box"))})
     return cars
 
 

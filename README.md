@@ -312,7 +312,7 @@ The settled game view. Soft Esc parked.
 
 ## Training-only depth and semantic ground truth
 
-`main` and `wide` record it (`train_gt: true`). The other six cameras stay RGB-only. Driving and inference stay vision-only (colour cameras); nothing here feeds the planner or the live net.
+All eight cameras record it (`train_gt: true`) for later 360° occupancy labels; the smoke recording checks Hz and disk first (see `docs/specs/labels_v4.md`). Driving and inference stay vision-only (colour cameras); nothing here feeds the planner or the live net.
 
 - **Per camera:** `train_gt: true` in `config/cameras.yaml` renders depth and annotation for that camera only. A camera without the key stays colour.
 - **Outputs** (one file per tick, beside the colour folder):

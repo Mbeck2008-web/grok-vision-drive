@@ -230,10 +230,10 @@ def parse_road_edges(road_id: str, edges: object) -> RoadPoly | None:
     """Centerline from BeamNG ``get_road_edges`` records.
 
     Each record may carry ``middle`` / ``left`` / ``right`` as xyz. A missing
-    middle is the mean of the two edges. Width is the left-right distance,
-    or the record's ``width`` when the edges are absent. Left and right
+    middle point is the mean of the two edge positions. Width is the left-right
+    distance, or the record's ``width`` when the edges are absent. Left and right
     heights are kept on ``left_z`` / ``right_z``. A missing side stays None.
-    A middle without a height still uses the edges' mean as centerline ``z``.
+    A middle without a height stays missing. The slope uses the raw edge heights.
     """
     if not isinstance(edges, list):
         return None
@@ -253,9 +253,7 @@ def parse_road_edges(road_id: str, edges: object) -> RoadPoly | None:
         lz, rz = _z3(edge.get("left")), _z3(edge.get("right"))
         if mid is None and left is not None and right is not None:
             mid = ((left[0] + right[0]) * 0.5, (left[1] + right[1]) * 0.5)
-        if mid_z is None:
-            # Centerline height only. The edge heights stay on left_z/right_z.
-            mid_z = None if lz is None or rz is None else 0.5 * (lz + rz)
+        # A missing middle height stays missing. The slope uses left_z/right_z.
         if mid is None:
             continue
         xy.append(mid)

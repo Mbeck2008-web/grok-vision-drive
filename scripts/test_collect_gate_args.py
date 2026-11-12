@@ -203,22 +203,23 @@ def check_heights() -> list[str]:
     edges[2] = _edge(0.0, 8.0, None, with_edges_z=False)
     part = parse_road_edges("b", edges)
     assert part is not None and part.z == [10.0, 11.0, None, 13.0, 14.0], part.z
-    # A middle without a height takes the edges' mean height.
+    # A middle without a height stays missing. The edge heights are not averaged in.
     mid_only = [{"middle": [0.0, 4.0 * k], "left": [-1.75, 4.0 * k, 5.0], "right": [1.75, 4.0 * k, 7.0]}
                 for k in range(3)]
     got = parse_road_edges("c", mid_only)
-    assert got is not None and got.z == [6.0, 6.0, 6.0], got.z
+    assert got is not None and got.z is None, got.z
     assert got.left_z == [5.0, 5.0, 5.0] and got.right_z == [7.0, 7.0, 7.0], (got.left_z, got.right_z)
+    assert abs((7.0 - 5.0) / got.width_m - (2.0 / 3.5)) < 1e-6
     none = parse_road_edges("d", [_edge(0.0, 4.0 * k, None, with_edges_z=False) for k in range(3)])
     assert none is not None and none.z is None
     out.append("heights: one record without z costs one point ([10, 11, None, 13, 14]); "
-               "middle without z uses the edge mean; no z at all -> None")
+               "middle without z stays missing; no z at all -> None")
     cov = height_coverage([full, part, got, none])
-    assert (cov.roads, cov.roads_without, cov.roads_partial, cov.points, cov.points_without) == (4, 1, 1, 16, 4), cov
+    assert (cov.roads, cov.roads_without, cov.roads_partial, cov.points, cov.points_without) == (4, 2, 1, 16, 7), cov
     logged: set[str] = set()
     line = road_heights_line("testmap", [full, part, got, none], logged)
-    assert line == ("collect road heights testmap roads=4 without=1 (25.0%) partial=1 (25.0%) "
-                    "points_without=4/16 (25.0%)"), line
+    assert line == ("collect road heights testmap roads=4 without=2 (50.0%) partial=1 (25.0%) "
+                    "points_without=7/16 (43.8%)"), line
     assert road_heights_line("testmap", [full], logged) is None, "logged twice for one map"
     assert road_heights_line("othermap", [full], logged) is not None
     out.append(f"heights log once per map: {line}")

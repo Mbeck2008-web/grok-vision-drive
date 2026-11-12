@@ -2,14 +2,18 @@
 
 Runtime and the visualizer do not import this module. Inside the drivable
 corridor a cell is blocked when its height above the cross-sloped road
-surface is past ``clear_eps_m`` (0.15 m). The slope is
+surface is past ``clear_eps_m + pad`` (0.15 m plus the range pad). The slope is
 ``(edge_z - z_center) / signed half-width`` from ``RoadPoly`` ``left_z`` /
-``right_z``. When that side has no edge height, a RANSAC fit of paved
-in-corridor points supplies it. If neither exists the point stays unknown.
-``depth_range_pad_m`` is an interim 0.10 m until labels_v4 pad(r) is GREEN.
-Blocked is above threshold + pad. Drivable is inside +/-(threshold - pad).
+``right_z``. A missing center height stays missing; both edge heights still
+define the plane. When that side has no edge height, a 5-row station window
+of paved in-corridor cells supplies the slope. Seeds are within 0.05 m of the
+centerline, residuals above 0.05 m are dropped, and the fit is repeated once.
+Fewer than 20 inlier cells leaves the point unknown.
+``depth_range_pad_m`` is an interim 0.25 m until labels_v4 pad(r) is GREEN.
+pad(r) still omits the 0.05 m fit tolerance, and pad=0 let a 0.16 m face read
+as drivable. Blocked is ``h > threshold + pad``. Drivable is ``h <= threshold - pad``.
 The band between them is unknown. A point within ``edge_band_m`` (0.5 m) outside the
-corridor is blocked at ``curb_eps_m`` (0.08 m). Those three numbers are
+corridor uses ``curb_eps_m`` (0.08 m) in that same split. Those three numbers are
 written on every ``obstacles.jsonl`` row. The difference is in the world
 frame. Ego z, ego pitch, and a missing height are not a road surface.
 
@@ -42,6 +46,8 @@ EDGE_BAND_M = 0.5
 # Fallback slope fit. A curb face (0.08 m) cannot be an inlier.
 FIT_RESIDUAL_M = 0.05
 FIT_MIN_INLIERS = 20
+FIT_SEED_M = 0.05
+WINDOW_ROWS = 5
 GRID_H = 64
 GRID_W = 64
 X_MIN = -16.0
@@ -243,22 +249,22 @@ def road_profile_z(
     """Center, left-edge, and right-edge Z at each query, along the centerline.
 
     A query farther than half the road width plus 2 m is NaN. None when the
-    road has no centerline heights. A side is NaN where that edge has no height.
+    road has no polyline. A channel is NaN where that height is missing, including
+    a centerline that was not filled from the edge mean.
     """
-    if road is None or getattr(road, "z", None) is None:
+    if road is None or not getattr(road, "xy", None) or len(road.xy) < 2:
         return None
+    count = len(road.xy)
+    center_z = road.z if isinstance(getattr(road, "z", None), (list, tuple)) else [None] * count
     xs: list[float] = []
     ys: list[float] = []
-    zs: list[float] = []
+    zs: list[float | None] = []
     lzs: list[float | None] = []
     rzs: list[float | None] = []
-    for index, ((x, y), z) in enumerate(zip(road.xy, road.z)):
-        height = _finite(z)
-        if height is None:
-            continue
+    for index, (x, y) in enumerate(road.xy):
         xs.append(float(x))
         ys.append(float(y))
-        zs.append(height)
+        zs.append(_finite(center_z[index]) if index < len(center_z) else None)
         lzs.append(_side_height(getattr(road, "left_z", None), index))
         rzs.append(_side_height(getattr(road, "right_z", None), index))
     if len(xs) < 2:
@@ -280,7 +286,10 @@ def road_profile_z(
         dist = np.hypot(wx - (ax + t * vx), wy - (ay + t * vy))
         better = dist < best_d
         best_d = np.where(better, dist, best_d)
-        best_z = np.where(better, az + t * (bz - az), best_z)
+        if az is not None and bz is not None:
+            best_z = np.where(better, az + t * (bz - az), best_z)
+        else:
+            best_z = np.where(better, np.nan, best_z)
         lz0, lz1 = lzs[index], lzs[index + 1]
         rz0, rz1 = rzs[index], rzs[index + 1]
         if lz0 is not None and lz1 is not None:
@@ -380,67 +389,71 @@ def _paved_mask(sem: np.ndarray | None, sem_classes: Mapping[str, Any] | None, s
     return mask
 
 
-def _ransac_slope(lateral: np.ndarray, height: np.ndarray) -> float | None:
-    """Slope through the centerline, or None when fewer than 20 inliers agree.
-
-    One hypothesis per sample (``height / lateral``) plus a flat road.
-    Inliers sit within ``FIT_RESIDUAL_M`` (0.05 m), under a curb face.
-    """
-    side = np.asarray(lateral, dtype=np.float64).reshape(-1)
-    values = np.asarray(height, dtype=np.float64).reshape(-1)
-    if int(side.size) < FIT_MIN_INLIERS:
+def _refit_cell_slope(lateral: np.ndarray, height: np.ndarray, rows: np.ndarray) -> float | None:
+    """Slope through the centerline from BEV cells. Drop residual > 0.05 m and refit once."""
+    if int(lateral.size) == 0:
         return None
-    hypotheses = [0.0]
-    usable = np.abs(side) >= 0.25
-    if bool(usable.any()):
-        hypotheses.extend((values[usable] / side[usable]).tolist())
-    best_count = 0
-    best: np.ndarray | None = None
-    for slope in hypotheses:
-        if not math.isfinite(float(slope)):
-            continue
-        inl = np.abs(values - float(slope) * side) <= FIT_RESIDUAL_M
-        count = int(inl.sum())
-        if count > best_count:
-            best_count = count
-            best = inl
-    if best is None or best_count < FIT_MIN_INLIERS:
+    col = np.floor(np.asarray(lateral, dtype=np.float64) / 0.5).astype(np.int64)
+    buckets: dict[tuple[int, int], list[tuple[float, float]]] = {}
+    for lat, hgt, row, cell in zip(lateral, height, rows, col, strict=False):
+        buckets.setdefault((int(row), int(cell)), []).append((float(lat), float(hgt)))
+    if len(buckets) < FIT_MIN_INLIERS:
         return None
-    samples = side[best]
-    denom = float(np.dot(samples, samples))
-    if denom < 1e-6:
+    lat = np.array([float(np.median([item[0] for item in pts])) for pts in buckets.values()])
+    hgt = np.array([float(np.median([item[1] for item in pts])) for pts in buckets.values()])
+    denom = float(np.dot(lat, lat))
+    if denom < 1e-8:
+        return None
+    slope = float(np.dot(lat, hgt) / denom)
+    keep = np.abs(hgt - slope * lat) <= FIT_RESIDUAL_M
+    if int(keep.sum()) < FIT_MIN_INLIERS:
+        return None
+    lat2, hgt2 = lat[keep], hgt[keep]
+    denom2 = float(np.dot(lat2, lat2))
+    if denom2 < 1e-8:
         return 0.0
-    return float(np.dot(samples, values[best]) / denom)
+    return float(np.dot(lat2, hgt2) / denom2)
 
 
 def _fit_side_slopes(
     lateral: np.ndarray,
     rough: np.ndarray,
+    ego_y: np.ndarray,
     inside: np.ndarray,
     in_band: np.ndarray,
     valid: np.ndarray,
     sem: np.ndarray | None,
     sem_classes: Mapping[str, Any] | None,
-) -> tuple[float | None, float | None]:
-    """Per-side fallback slope from paved in-corridor points.
+) -> np.ndarray:
+    """Per-row slope from a 5-row station window of in-corridor cells.
 
-    The 0.5 m edge band and obstacle candidates (``|height| > 0.15`` m above
-    the centerline) are not seeds. A side with fewer than 20 inliers has no slope.
+    Seeds are paved, inside the corridor, outside the edge band, and within
+    0.05 m of the centerline. One row cannot hold 20 cells. The window is five
+    along-track rows. After one refit a side with fewer than 20 inliers is unknown.
     """
-    finite = np.asarray(valid, dtype=bool) & np.isfinite(rough) & np.isfinite(lateral)
+    finite = np.asarray(valid, dtype=bool) & np.isfinite(rough) & np.isfinite(lateral) & np.isfinite(ego_y)
     paved = _paved_mask(sem, sem_classes, np.shape(rough))
-    # In the corridor, not in the edge band, and not an obstacle candidate.
     seed = finite & paved & np.asarray(inside, dtype=bool) & ~np.asarray(in_band, dtype=bool)
-    seed = seed & (np.abs(rough) <= 0.15)
-    left = right = None
-    for sign, slot in ((1.0, "right"), (-1.0, "left")):
-        sel = seed & (lateral * sign >= 0.25)
-        slope = _ransac_slope(lateral[sel], rough[sel]) if int(sel.sum()) else None
-        if slot == "right":
-            right = slope
-        else:
-            left = slope
-    return left, right
+    seed = seed & (np.abs(rough) <= FIT_SEED_M)
+    row_h = (Y_MAX - Y_MIN) / float(GRID_H)
+    row = np.clip(np.floor((ego_y - Y_MIN) / row_h).astype(np.int64), 0, GRID_H - 1)
+    slopes = np.full(lateral.shape, np.nan, dtype=np.float64)
+    for sign in (1.0, -1.0):
+        side = seed & (lateral * sign > 0.0)
+        by_row = np.full(GRID_H, np.nan, dtype=np.float64)
+        for center in range(GRID_H):
+            lo = max(0, center - (WINDOW_ROWS // 2))
+            hi = min(GRID_H - 1, center + (WINDOW_ROWS // 2))
+            sel = side & (row >= lo) & (row <= hi)
+            if not bool(sel.any()):
+                continue
+            fitted = _refit_cell_slope(lateral[sel], rough[sel], row[sel])
+            if fitted is not None:
+                by_row[center] = fitted
+        on_side = lateral * sign >= 0.0
+        mapped = by_row[row]
+        slopes = np.where(on_side & np.isfinite(mapped), mapped, slopes)
+    return slopes
 
 
 def _edge_slopes(
@@ -458,23 +471,23 @@ def _edge_slopes(
     return left, right
 
 
-# Interim until labels_v4 pad(r) is GREEN. Above the measured ~0.084 m error.
-INTERIM_DEPTH_RANGE_PAD_M = 0.10
+# Interim until labels_v4 pad(r) is GREEN. pad(r) still omits the 0.05 m fit tolerance.
+INTERIM_DEPTH_RANGE_PAD_M = 0.25
 
 
 def depth_range_pad_m(depth_m: np.ndarray) -> np.ndarray:
     """Interim constant until labels_v4 pad(r) is GREEN.
 
-    0.10 m at every range, above the measured ~0.084 m depth-height error.
-    Replace this body when pad(r) is approved.
+    0.25 m at every range. pad=0 let a 0.16 m or 0.20 m face read under 0.15 m
+    and become drivable. Replace this body when pad(r) is approved.
     """
     return np.full(np.shape(depth_m), INTERIM_DEPTH_RANGE_PAD_M, dtype=np.float64)
 
 
 def apply_height_band(height: np.ndarray, threshold: float, pad: np.ndarray) -> np.ndarray:
-    """BLOCKED above ``threshold + pad``, DRIVABLE inside ``+/-(threshold - pad)``.
+    """BLOCKED when ``h > threshold + pad``, DRIVABLE when ``h <= threshold - pad``.
 
-    Everything else is UNKNOWN (0). When ``threshold - pad <= 0``, nothing is drivable.
+    The open interval between those cuts is UNKNOWN (0).
     """
     values = np.asarray(height, dtype=np.float64)
     slack = np.asarray(pad, dtype=np.float64)
@@ -483,7 +496,7 @@ def apply_height_band(height: np.ndarray, threshold: float, pad: np.ndarray) -> 
     hi = float(threshold) + slack
     lo = float(threshold) - slack
     out[finite & (values > hi)] = BLOCKED
-    out[finite & (lo > 0) & (values <= lo) & (values >= -lo)] = DRIVABLE
+    out[finite & (values <= lo)] = DRIVABLE
     return out
 
 
@@ -683,21 +696,33 @@ def label_obstacle_frame(
         lateral = ego_x - center
         inside = np.abs(lateral) <= (half + 1e-6)
         in_band = (np.abs(lateral) > (half + 1e-6)) & (np.abs(lateral) <= (half + EDGE_BAND_M + 1e-6))
-        rough = world_z - road_z
         half_width = float(getattr(road, "width_m", 0.0) or 0.0) * 0.5
         edge_left, edge_right = _edge_slopes(road_z, z_left, z_right, half_width)
-        fit_left, fit_right = _fit_side_slopes(
-            lateral, rough, inside, in_band, valid & np.isfinite(rough), sem, sem_classes
+        edge_h = np.full(lateral.shape, np.nan, dtype=np.float64)
+        center_ok = np.isfinite(road_z)
+        edge_h = np.where(
+            center_ok & (lateral >= 0.0) & np.isfinite(edge_right),
+            (world_z - road_z) - edge_right * lateral,
+            edge_h,
         )
-        slope = np.full(lateral.shape, np.nan, dtype=np.float64)
-        if fit_right is not None:
-            slope = np.where(lateral >= 0.0, fit_right, slope)
-        if fit_left is not None:
-            slope = np.where(lateral < 0.0, fit_left, slope)
-        slope = np.where((lateral >= 0.0) & np.isfinite(edge_right), edge_right, slope)
-        slope = np.where((lateral < 0.0) & np.isfinite(edge_left), edge_left, slope)
-        have = valid & np.isfinite(rough) & np.isfinite(slope)
-        height = np.where(have, rough - slope * lateral, np.nan)
+        edge_h = np.where(
+            center_ok & (lateral < 0.0) & np.isfinite(edge_left),
+            (world_z - road_z) - edge_left * lateral,
+            edge_h,
+        )
+        both_edges = (~center_ok) & np.isfinite(z_left) & np.isfinite(z_right) & (half_width > 1e-6)
+        if half_width > 1e-6:
+            span = np.where(both_edges, z_right - z_left, 0.0)
+            edge_plane = z_left + ((lateral + half_width) / (2.0 * half_width)) * span
+            edge_h = np.where(both_edges, world_z - edge_plane, edge_h)
+        edge_have = np.isfinite(edge_h)
+        rough = np.where(center_ok, world_z - road_z, np.nan)
+        fit_slope = _fit_side_slopes(
+            lateral, rough, ego_y, inside, in_band, valid & np.isfinite(rough), sem, sem_classes
+        )
+        fit_h = np.where(np.isfinite(fit_slope), rough - fit_slope * lateral, np.nan)
+        have = valid & (edge_have | np.isfinite(fit_h))
+        height = np.where(edge_have, edge_h, fit_h)
         pad = depth_range_pad_m(np.asarray(depth, dtype=np.float64) / 100.0)
         classes = np.zeros(depth.shape, np.uint8)
         corridor_pts = have & inside

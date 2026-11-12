@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Recorder-only labels v4: main+wide train_gt, per-tick signals, traffic electrics.
+"""Recorder-only labels v4: train_gt on all eight cameras, per-tick signals, traffic electrics.
 
 No trainer and no head. A fake beamngpy stands in for Tech. LiDAR and radar stay off.
 """
@@ -54,18 +54,14 @@ IQU45_SMOKE = (
     "py -3 scripts\\collect_scene_lanes.py --minutes 1 --no-excursions "
     "--traffic 2 --smoke-s 15 --ctl-probe-every 1"
 )
-RGB_ONLY = ("narrow", "pillarL", "pillarR", "repeatL", "repeatR", "rear")
-
-
-def check_train_gt_main_and_wide_only() -> None:
+def check_train_gt_all_eight() -> None:
+    """360 occupancy labels need depth + semantics from every camera."""
     cfg = load_camera_config()
     by_id = {str(cam["id"]): cam for cam in cfg["cameras"]}
     assert set(by_id) == set(CAM_IDS)
-    assert by_id["main"].get("train_gt") is True
-    assert by_id["wide"].get("train_gt") is True
-    for cid in RGB_ONLY:
-        assert not by_id[cid].get("train_gt"), cid
-    print("train_gt true on main and wide only")
+    for cid in CAM_IDS:
+        assert by_id[cid].get("train_gt") is True, cid
+    print("train_gt true on all eight cameras")
 
 
 def check_lidar_and_radar_stay_off() -> None:
@@ -587,26 +583,20 @@ def check_short_collect_writes_recorder_files() -> None:
 
 def _assert_short_collect(out: Path, made: dict, bng: _Bng, lead: _Vehicle, parked: _Vehicle) -> None:
     for cid, kw in made.items():
-        gt = cid in ("gvd_collect_main", "gvd_collect_wide")
-        assert kw["is_render_depth"] is gt, cid
-        assert kw["is_render_annotations"] is gt, cid
+        assert kw["is_render_depth"] is True, cid
+        assert kw["is_render_annotations"] is True, cid
         assert kw["is_render_colours"] is True
     assert set(made) == {f"gvd_collect_{cid}" for cid in CAM_IDS}
 
     raw = out / "raw"
     names = {p.name for p in raw.iterdir() if p.is_dir()}
-    for cid in ("main", "wide"):
-        assert cid in names
-        assert f"{cid}_depth" in names
-        assert f"{cid}_sem" in names
-        assert any((raw / cid).rglob("*.png"))
-        assert any((raw / f"{cid}_depth").rglob("*.png"))
-        assert any((raw / f"{cid}_sem").rglob("*.png"))
-    for cid in RGB_ONLY:
+    for cid in CAM_IDS:
         assert cid in names, cid
-        assert f"{cid}_depth" not in names, cid
-        assert f"{cid}_sem" not in names, cid
+        assert f"{cid}_depth" in names, cid
+        assert f"{cid}_sem" in names, cid
         assert any((raw / cid).rglob("*.png")), cid
+        assert any((raw / f"{cid}_depth").rglob("*.png")), cid
+        assert any((raw / f"{cid}_sem").rglob("*.png")), cid
 
     classes = json.loads((out / "sem_classes.json").read_text(encoding="utf-8"))
     assert classes["kind"] == "gvd_sem_classes" and classes["train_only"] is True
@@ -658,7 +648,7 @@ def _assert_short_collect(out: Path, made: dict, bng: _Bng, lead: _Vehicle, park
 
 
 def main() -> None:
-    check_train_gt_main_and_wide_only()
+    check_train_gt_all_eight()
     check_lidar_and_radar_stay_off()
     check_traffic_chunk_walks_non_player_objects()
     check_missing_signal_api_is_err_row()

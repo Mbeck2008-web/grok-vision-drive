@@ -56,8 +56,15 @@ West-coast spawns skip roads whose next 300 m has painted lanes on less than
 ``--min-paint-cov`` of the probes (default 0.5, 0 disables). The weave guard
 (on; ``--no-weave-guard`` turns it off) keeps weaves off unpainted stretches
 and junctions, and ends an excursion when its 60 m ``ai.setLine`` runs out.
-Excursions start after 60 s of cruise (``CRUISE_S``); every 4th is a lane
-change on a road with two or more lanes.
+Excursions start after a cruise gap (``--excursion-gap-min-s`` and
+``--excursion-gap-max-s``, both default ``CRUISE_S`` = 60 s). Each gap is
+one uniform draw from ``--excursion-seed`` (default 0), taken again only
+when the clock returns to cruise. With either gap flag set, that clock
+is the same object for the whole run: a spawn, respawn, segment load, or
+stall recover keeps the elapsed cruise, the armed gap, and the lane-change
+count. A teleport during a move ends it in cruise (one new draw). With the
+flags absent, each of those points starts a new 60 s clock, as before.
+Every 4th start may be a lane change on a road with two or more lanes.
 
 The ego car is ``--ego-model`` (default ``sbr``, the Hirochi eSBR electric)
 with ``--ego-config`` (default ``EGO_CONFIG_DEFAULT``, a .pc path; empty is the
@@ -345,8 +352,35 @@ def save_progress(path: Path, done_s: float, target_s: float, extra: dict[str, A
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+def place_excursion_clock(clock, *, persist: bool, fresh):
+    """Segment load, teleport, respawn, or stall recover.
+
+    ``persist`` is false when the gap flags are absent: ``fresh()`` is a new
+    clock, which is what main does (cruise timer and lane-change count restart).
+    ``persist`` is true when either gap flag was set: the same clock stays.
+    ``ExcursionClock.relocate`` keeps elapsed cruise, the armed gap, and
+    ``_kind``. A move in progress ends in cruise (one new draw). A cruise
+    is not zeroed.
+    """
+    if not persist:
+        return fresh()
+    clock.relocate()
+    return clock
+
+
+class _ExcursionGapAction(argparse.Action):
+    """Record that the user passed a gap flag. The default value is not a pass."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        namespace.excursion_gap_set = True
+
+
 def build_parser() -> argparse.ArgumentParser:
+    from python.collect.excursion import CRUISE_S, excursion_seed
+
     parser = argparse.ArgumentParser(description="Record AI driving strips with GT lane targets")
+    parser.set_defaults(excursion_gap_set=False)
     parser.add_argument("--minutes", type=float, default=45.0, help="Stop after this much driving. 0 with --until-disk runs to the 20 GB floor.")
     parser.add_argument("--until-disk", action="store_true", help="Ignore the clock. Stop only under 20 GB free.")
     parser.add_argument("--map", default="", help="Level to load. Empty keeps the current level.")
@@ -420,6 +454,33 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--no-excursions", action="store_true", help="Stay centered. Default weaves and lane changes.")
+    parser.add_argument(
+        "--excursion-gap-min-s",
+        type=float,
+        default=CRUISE_S,
+        action=_ExcursionGapAction,
+        help=(
+            "Shortest cruise before a weave or lane change, in seconds. "
+            f"Default {CRUISE_S:g} (CRUISE_S). Each gap is uniform between this and --excursion-gap-max-s. "
+            "Setting either gap flag keeps one clock across spawns; leaving both unset starts a new 60 s clock each time."
+        ),
+    )
+    parser.add_argument(
+        "--excursion-gap-max-s",
+        type=float,
+        default=CRUISE_S,
+        action=_ExcursionGapAction,
+        help=(
+            "Longest cruise before a weave or lane change, in seconds. "
+            f"Default {CRUISE_S:g}. min > max or min < 0 is rejected."
+        ),
+    )
+    parser.add_argument(
+        "--excursion-seed",
+        type=excursion_seed,
+        default=0,
+        help="Integer seed for the cruise-gap draw. Default 0. Another seed is another sequence. Spawn order does not use it.",
+    )
     parser.add_argument("--smoke-s", type=float, default=60.0, help="Collect this many seconds, check PNG decode, then continue. 0 skips the check.")
     parser.add_argument("--no-vary-env", action="store_true", help="Do not change weather or time of day on each segment.")
     parser.add_argument(
@@ -1612,6 +1673,14 @@ def main(argv: list[str] | None = None) -> int:
 def _main(argv: list[str] | None, run: RunStop) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    from python.collect.excursion import excursion_gap_bounds, excursion_seed
+
+    try:
+        gap_lo, gap_hi = excursion_gap_bounds(args.excursion_gap_min_s, args.excursion_gap_max_s)
+        args.excursion_seed = excursion_seed(args.excursion_seed)
+    except ValueError as exc:
+        parser.error(str(exc))
+    args.excursion_gap_min_s, args.excursion_gap_max_s = gap_lo, gap_hi
     from python.collect.level_session import ego_spec, set_ego
 
     try:
@@ -1850,7 +1919,6 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             AI_DEFAULT_AGGRESSION,
             Excursion,
             ExcursionClock,
-            CRUISE_S,
             WEAVE_STATS_NOTES,
             WeaveStats,
             build_sent_line,
@@ -1863,7 +1931,21 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             targets_for,
         )
 
-        clock = ExcursionClock()
+        import random
+
+        # The spawn deck builds its own Random(0). This generator is only for
+        # cruise gaps, so a non-zero --excursion-seed does not reshuffle spawns.
+        gap_persist = bool(args.excursion_gap_set)
+        excursion_rng = random.Random(int(args.excursion_seed))
+
+        def new_clock() -> ExcursionClock:
+            return ExcursionClock(
+                gap_min_s=float(args.excursion_gap_min_s),
+                gap_max_s=float(args.excursion_gap_max_s),
+                rng=excursion_rng,
+            )
+
+        clock = new_clock()
         from python.collect.liveness import (
             ImpactWatch,
             Liveness,
@@ -2130,7 +2212,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     time.sleep(SETTLE_S)
                     recover_lost_s += stall_s + float(SETTLE_S)
                     live.reset()
-                    clock = ExcursionClock()
+                    clock = place_excursion_clock(clock, persist=gap_persist, fresh=new_clock)
                     last_ai = None
                     held_tag = None
                     prev_dir = None
@@ -2562,7 +2644,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 cut_at_load = schedule_cut
                 last_ai = None
                 held_tag = None
-                clock = ExcursionClock()
+                clock = place_excursion_clock(clock, persist=gap_persist, fresh=new_clock)
                 live.reset()
                 segment_aborts = 0
                 cams_ready = False
@@ -2788,7 +2870,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 if driving:
                     segment_open = True
                     live.reset()
-                    clock = ExcursionClock()
+                    clock = place_excursion_clock(clock, persist=gap_persist, fresh=new_clock)
                     # A new segment or a respawn: the next refusal is a new blocked stretch.
                     weave_stats.end_stretch()
                     lane_change_run = None
@@ -2947,7 +3029,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 and not waypoint
                 and driving
                 and clock.phase == "cruise"
-                and clock.phase_t + tick_dt >= CRUISE_S
+                and clock.phase_t + tick_dt >= clock.gap_s
                 and pos is not None
             ):
                 # The gate builds the line the start below would send: the
@@ -3070,7 +3152,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                         f"collect weave {segment_id} {speeds_txt} amp={path_info.get('amp_m', 0.0):.2f}m "
                         f"wave={path_info.get('wave_m', 0.0):.0f}m line={path_info.get('length_m', 0.0):.0f}m "
                         f"lat_acc={path_info.get('lat_acc_mps2', 0.0):.2f} m/s2 "
-                        f"(with road {path_info.get('total_lat_acc_mps2', 0.0):.2f}) shrunk={path_info.get('shrunk', 0)}",
+                        f"(with road {path_info.get('total_lat_acc_mps2', 0.0):.2f}) shrunk={path_info.get('shrunk', 0)} "
+                        f"{clock.gap_log()}",
                         flush=True,
                     )
                 elif path is not None and path_info:
@@ -3078,7 +3161,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                         f"collect {move.phase} {segment_id} {speeds_txt} delta={path_info.get('delta_m', 0.0):.2f}m "
                         f"ramp={path_info.get('ramp_m') or 0.0:.0f}m line={path_info.get('length_m', 0.0):.0f}m "
                         f"lat_acc={path_info.get('lat_acc_mps2', 0.0):.2f} m/s2 "
-                        f"(with road {path_info.get('total_lat_acc_mps2', 0.0):.2f})",
+                        f"(with road {path_info.get('total_lat_acc_mps2', 0.0):.2f}) "
+                        f"{clock.gap_log()}",
                         flush=True,
                     )
                 if path is None or spec is None:
@@ -3135,9 +3219,10 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 if args.weave_guard:
                     sent_line = path if excursions_on and not waypoint and resolved.phase in ACTIVE else None
                     line_left_m = polyline_length(sent_line) if sent_line else None
+                gap_note = f" {clock.gap_log()}" if resolved.phase in ACTIVE else ""
                 print(
                     f"collect ai speed={speed:.0f} m/s route={waypoint or map_name or 'span'} "
-                    f"excursion={resolved.phase}",
+                    f"excursion={resolved.phase}{gap_note}",
                     flush=True,
                 )
             move = resolved

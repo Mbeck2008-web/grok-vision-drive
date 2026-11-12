@@ -102,6 +102,19 @@ def check_allowlist_empty_and_curb_valid_zero() -> None:
     assert np.allclose(labels["lane_gt_valid"], paint_m)
     assert float(labels["curb_valid"].sum()) == 0.0
     assert float(np.abs(labels["curbs"]).sum()) == 0.0
+    # A recording root with a lookalike palette must not turn stuffed curbs on.
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "sem_classes.json").write_text(
+            json.dumps(_palette("CURB", "kerb", "guardrail")), encoding="utf-8",
+        )
+        rooted = labels_for_row(row, root=root, road_edge=True)
+    assert float(rooted["curb_valid"].sum()) == 0.0
+    assert float(np.abs(rooted["curbs"]).sum()) == 0.0
+    assert np.allclose(rooted["lane_gt"], paint_v)
     assert "road_edge" in labels and float(labels["road_edge_valid"].sum()) == float(edge_m.sum())
     # No road-edge x was written into a paint slot.
     paint_slots = np.asarray(labels["lane_gt"], dtype=np.float64).reshape(-1)
@@ -166,12 +179,80 @@ def check_road_edge_and_curbs_opt_in() -> None:
         assert curb_palette_for_training([root, root]) is None
     assert curb_palette_for_training(None) is None
     assert curb_palette_for_training(()) is None
-    # train_scene.main resolves heads through heads_for_run. Importing the
-    # trainer pulls cv2; the source lock does not.
-    trainer = (ROOT / "python" / "train" / "train_scene.py").read_text(encoding="utf-8")
-    assert "def heads_for_run(" in trainer
-    assert "head_names = heads_for_run(args.heads, strip_roots)" in trainer
     print("road_edge opt-in, empty --heads omits curbs")
+
+
+def check_main_loss_heads_omit_curbs() -> None:
+    """The heads tuple main hands to the loss omits curbs on an empty --heads.
+
+    A source grep of ``heads_for_run`` stays green if main then trains with
+    ``parse_heads(args.heads)``. This calls main and reads that tuple.
+    """
+    import tempfile
+
+    import python.train.train_scene as train_scene
+    from python.train.cam_strip import HEAD_NAMES
+
+    seen: dict = {}
+    original = train_scene.train_directory
+
+    def capture(*_args, **kwargs):
+        seen["heads"] = kwargs.get("heads")
+        raise SystemExit(0)
+
+    train_scene.train_directory = capture
+    code = None
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "rec"
+            root.mkdir()
+            try:
+                train_scene.main(
+                    [
+                        "--strips", str(root),
+                        "--cams", "main",
+                        "--heads", "",
+                        "--no-panel",
+                        "--autostart",
+                        "--no-resume",
+                        "--dry-run",
+                        "--workers", "0",
+                        "--epochs", "1",
+                    ]
+                )
+            except SystemExit as exc:
+                code = exc.code
+    finally:
+        train_scene.train_directory = original
+    assert code == 0, code
+    want = tuple(name for name in HEAD_NAMES if name != "curbs")
+    assert seen.get("heads") == want, seen.get("heads")
+    print("train main loss heads omit curbs")
+
+
+def check_default_onnx_outputs_are_exact() -> None:
+    """Default export outputs are OUTPUT_FIELDS plus h, tokens, mask. Nothing else."""
+    try:
+        import onnx
+    except ImportError:
+        skip_check("default_onnx_outputs_are_exact", "onnx missing")
+        return
+    try:
+        import torch  # noqa: F401
+    except ImportError:
+        skip_check("default_onnx_outputs_are_exact", "torch missing")
+        return
+    import tempfile
+
+    from python.train.scene_net import OUTPUT_FIELDS, SceneNet, export_scene_onnx
+
+    net = SceneNet(cams=("main",))
+    with tempfile.TemporaryDirectory() as tmp:
+        path = export_scene_onnx(Path(tmp) / "plain.onnx", net, heads=("lane_gt",))
+        model = onnx.load(str(path))
+    outputs = [item.name for item in model.graph.output]
+    assert outputs == list(OUTPUT_FIELDS) + ["h", "tokens", "mask"], outputs
+    print("default ONNX outputs match OUTPUT_FIELDS + h, tokens, mask")
 
 
 def check_allowlist_match_without_points_has_no_curb_grad() -> None:
@@ -289,6 +370,8 @@ def main() -> None:
     check_allowlist_empty_and_curb_valid_zero()
     check_explicit_curbs_without_allowlist_raises()
     check_road_edge_and_curbs_opt_in()
+    check_main_loss_heads_omit_curbs()
+    check_default_onnx_outputs_are_exact()
     check_allowlist_match_without_points_has_no_curb_grad()
     check_empty_heads_does_not_bce_curb_valid()
     print("test_labels_v4_road_edge: OK")

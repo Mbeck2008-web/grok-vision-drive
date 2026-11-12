@@ -367,6 +367,23 @@ def _lateral_rise(
     return rise
 
 
+def _quant_z_pad(pose: Any, depth_m: np.ndarray) -> np.ndarray:
+    """Extra height slack from uint16 centimetre depth and a half-pixel ray.
+
+    A flat road at long range does not come back at z 0: the stored depth is
+    whole centimetres and the unprojection uses the pixel-center ray. The pad
+    grows with range so a 0.10 m bump is not labeled blocked by that error.
+    """
+    cm = 0.01
+    metres = np.abs(np.asarray(depth_m, dtype=np.float64))
+    basis = _camera_basis(pose)
+    height = float(getattr(pose, "height", 0) or 0)
+    if basis is None or height < 2.0:
+        return np.full(metres.shape, cm, dtype=np.float64)
+    half_px = (float(basis[3]) / height) * 0.5
+    return cm + metres * math.tan(half_px)
+
+
 def _class_names(sem_classes: Mapping[str, Any] | None) -> dict[int, str]:
     if not isinstance(sem_classes, Mapping):
         return {}
@@ -564,10 +581,11 @@ def label_obstacle_frame(
         in_band = (np.abs(lateral) > (half + 1e-6)) & (np.abs(lateral) <= (half + EDGE_BAND_M + 1e-6))
         rough = world_z - road_z
         height = rough - _lateral_rise(lateral, rough, inside, valid & np.isfinite(rough), road)
+        tol = CLEAR_EPS_M + _quant_z_pad(pose, np.asarray(depth, dtype=np.float64) / 100.0)
         known = valid & inside & np.isfinite(height)
         classes = np.zeros(depth.shape, np.uint8)
-        classes[known & (height > CLEAR_EPS_M)] = BLOCKED
-        classes[known & (height <= CLEAR_EPS_M) & (height >= -CLEAR_EPS_M)] = DRIVABLE
+        classes[known & (height > tol)] = BLOCKED
+        classes[known & (height <= tol) & (height >= -tol)] = DRIVABLE
         band = valid & in_band & np.isfinite(height)
         classes[band & (height >= CURB_EPS_M)] = BLOCKED
         blocked = classes == BLOCKED

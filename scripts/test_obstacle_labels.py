@@ -215,6 +215,15 @@ def check_pitched_and_raised_ego_uses_world_z() -> None:
     print("  pitched and z-offset ego: blocked is world Z minus RoadPoly.z")
 
 
+def _recovered_z(ego) -> float:
+    from python.train.obstacles import _unproject
+
+    depth = _blank(POSE.height, POSE.width)
+    vi, ui = _splat(depth, ego)
+    _x, _y, z, _valid = _unproject(POSE, depth)
+    return float(z[vi, ui])
+
+
 def _assert_row_fields(record) -> None:
     """clear_eps_m, curb_eps_m, and edge_band_m are on every obstacles row."""
     assert record["clear_eps_m"] == 0.15, record.get("clear_eps_m")
@@ -558,6 +567,43 @@ def _geom_road(points, road_width: float, *, cross_slope: float | None = None):
     )
 
 
+def check_bump_survives_depth_quantization() -> None:
+    """A 0.10 m bump is not blocked, including at 30 m.
+
+    uint16 centimetres plus the pixel-center ray make a flat road at 27.4 m
+    come back near z 0.026, and a 0.12 m bump there come back above 0.15.
+    That bump stays unblocked. A 0.40 m obstacle at the same range does not.
+    """
+    from python.train.obstacles import BLOCKED, DRIVABLE
+
+    right, forward, up = _flat_axes()
+    pos = (0.0, 0.0, 0.0)
+    road = _road(lambda _y: 0.0)
+    lane = _paint()
+
+    def kind(world):
+        depth = _blank(POSE.height, POSE.width)
+        ego = _to_ego(world, pos, right, forward, up)
+        _splat(depth, ego)
+        got = _label(depth, lane=lane, road=road, pos=pos, forward=forward, up=up)
+        return _at(got, ego[0], ego[1])[0], got
+
+    flat_z = _recovered_z((0.0, 27.4, 0.0))
+    bump_z = _recovered_z((0.0, 27.4, 0.12))
+    assert abs(flat_z - 0.026) < 0.005, flat_z
+    assert bump_z > 0.15, bump_z
+    near, _got = kind((0.0, 8.0, 0.10))
+    far, far_row = kind((0.0, 30.0, 0.10))
+    quant, _qrow = kind((0.0, 27.4, 0.12))
+    real, _rrow = kind((0.0, 27.4, 0.40))
+    assert near == DRIVABLE, near
+    assert far != BLOCKED, far
+    assert quant != BLOCKED, (quant, bump_z)
+    assert real == BLOCKED, real
+    _assert_row_fields(far_row)
+    print("  0.10 m bump is not blocked at 8 m or 30 m; depth error does not flip 0.12 m")
+
+
 def check_crown_and_bank_not_blocked() -> None:
     """A lateral slope is the road, including corridors wider than 5 m.
 
@@ -810,6 +856,7 @@ def main() -> None:
     check_corridor_matches_paint_then_pack_road_edge()
     check_edge_band_and_row_fields()
     check_crown_and_bank_not_blocked()
+    check_bump_survives_depth_quantization()
     check_wall_pole_empty_and_missing_depth()
     check_missing_geometry_stays_unknown()
     check_clearance_masked_without_near_centers()

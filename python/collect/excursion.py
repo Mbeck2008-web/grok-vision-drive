@@ -10,12 +10,15 @@ The phase is a tag on the tick. The pixels stay the raw camera frames.
 from __future__ import annotations
 
 import math
+import random
 from dataclasses import dataclass
 
 from python.debug.gt_geom import CURVATURE_AHEAD_M, RoadPoly, lane_center_offsets, road_ahead_split
 
 PHASES = ("cruise", "weave", "lane_change", "recover", "abort")
 ACTIVE = ("weave", "lane_change", "recover")
+# Cruise before each excursion. A collect run may draw uniformly in a wider
+# range (``--excursion-gap-min-s`` / ``--excursion-gap-max-s``); both default here.
 CRUISE_S = 60.0
 WEAVE_S = 12.0
 LANE_CHANGE_S = 8.0
@@ -474,10 +477,40 @@ def unsafe_reason(
     return ""
 
 
-class ExcursionClock:
-    """Cruise, then weave / lane-change / recover, then cruise again."""
+def excursion_gap_bounds(min_s: float, max_s: float) -> tuple[float, float]:
+    """Cruise seconds ``[min, max]``. ``min < 0`` or ``min > max`` is an error."""
+    try:
+        lo = float(min_s)
+        hi = float(max_s)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"excursion gap min={min_s!r} max={max_s!r} are not numbers") from exc
+    if not math.isfinite(lo) or not math.isfinite(hi):
+        raise ValueError(f"excursion gap min={lo} max={hi} must be finite")
+    if lo < 0.0:
+        raise ValueError(f"excursion gap min={lo} is below 0")
+    if lo > hi:
+        raise ValueError(f"excursion gap min={lo} is above max={hi}")
+    return lo, hi
 
-    def __init__(self) -> None:
+
+class ExcursionClock:
+    """Cruise, then weave / lane-change / recover, then cruise again.
+
+    The cruise before each start is one draw from ``[gap_min_s, gap_max_s]``
+    (both default to ``CRUISE_S``). The first draw is on the first cruise
+    check. The next draw is when the clock returns to cruise: after a weave,
+    after a recover, and after an abort. A spawn or respawn is a new clock
+    on the same ``rng``, so it takes the next draw and starts the timer over.
+    ``rng`` left unset is ``Random(0)``. Equal bounds do not consume it, so
+    the default 60 s cruise does not depend on the generator.
+    """
+
+    def __init__(
+        self,
+        gap_min_s: float | None = None,
+        gap_max_s: float | None = None,
+        rng: random.Random | None = None,
+    ) -> None:
         self.phase = "cruise"
         self.phase_t = 0.0
         self.direction = 1
@@ -485,6 +518,31 @@ class ExcursionClock:
         self.reason = ""
         self._saw_offset = False
         self.speed_mps: float | None = None
+        self.gap_min_s, self.gap_max_s = excursion_gap_bounds(
+            CRUISE_S if gap_min_s is None else gap_min_s,
+            CRUISE_S if gap_max_s is None else gap_max_s,
+        )
+        # Seed 0 when the caller does not pass the run's generator. Equal
+        # bounds never draw, so this does not move a shared generator.
+        self._rng = rng if rng is not None else random.Random(0)
+        self._gap_s: float | None = None
+
+    def _draw_gap(self) -> float:
+        lo, hi = self.gap_min_s, self.gap_max_s
+        if hi <= lo:
+            return lo
+        return float(self._rng.uniform(lo, hi))
+
+    @property
+    def gap_s(self) -> float:
+        """Cruise seconds armed for this gap. The first read draws it."""
+        if self._gap_s is None:
+            self._gap_s = self._draw_gap()
+        return self._gap_s
+
+    def gap_log(self) -> str:
+        """``gap=60.0s`` for the excursion start line. The cruise just waited."""
+        return f"gap={self.gap_s:.1f}s"
 
     def update(
         self,
@@ -568,10 +626,10 @@ class ExcursionClock:
         window_ok: bool = True,
         start_kind: str | None = None,
     ) -> None:
-        if self.phase == "cruise" and self.phase_t >= CRUISE_S and not self.reason:
+        if self.phase == "cruise" and self.phase_t >= self.gap_s and not self.reason:
             if not window_ok:
                 # The timer elapsed on a curve or a junction. Look again shortly.
-                self.phase_t = max(0.0, CRUISE_S - 2.0)
+                self.phase_t = max(0.0, self.gap_s - 2.0)
                 return
             self._start_next(lane_width_m, traffic, n_lanes, chosen=start_kind)
         elif self.phase == "weave" and self.phase_t >= WEAVE_S:
@@ -635,6 +693,8 @@ class ExcursionClock:
         self.phase_t = 0.0
         self.reason = ""
         self._saw_offset = False
+        # A finished weave, recover, or abort. The next start waits a new draw.
+        self._gap_s = self._draw_gap()
 
     def _sample(self, lane_width_m: float | None) -> Excursion:
         if self.phase in ("cruise", "abort"):

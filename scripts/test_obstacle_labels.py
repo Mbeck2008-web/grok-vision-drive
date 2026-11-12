@@ -204,7 +204,7 @@ def check_pitched_and_raised_ego_uses_world_z() -> None:
     road_cls, rr, rc, _gw = _at(got, road_e[0], road_e[1])
     wall_cls, wr, wc, _gw = _at(got, wall_e[0], wall_e[1])
     assert (rr, rc) != (wr, wc), ((rr, rc), (wr, wc))
-    assert road_cls == UNKNOWN, (road_cls, road_e, road_w)
+    assert road_cls == DRIVABLE, (road_cls, road_e, road_w)
     assert wall_cls == BLOCKED, (wall_cls, wall_e, wall_w)
 
     # Level vehicle, origin lifted off the road. Ego z of the wall is negative.
@@ -227,7 +227,7 @@ def check_pitched_and_raised_ego_uses_world_z() -> None:
         forward=flat_f,
         up=flat_u,
     )
-    assert _at(got2, road2_e[0], road2_e[1])[0] == UNKNOWN, road2_e
+    assert _at(got2, road2_e[0], road2_e[1])[0] == DRIVABLE, road2_e
     assert _at(got2, wall2_e[0], wall2_e[1])[0] == BLOCKED, wall2_e
     print("  pitched and z-offset ego: blocked is world Z minus RoadPoly.z")
 
@@ -264,7 +264,7 @@ def check_epsilon_is_world_clearance() -> None:
         egos.append(ego)
     got = _label(depth, lane=_paint(), road=_road(lambda _y: 0.0), pos=pos, forward=forward, up=up)
     assert _at(got, *egos[0][:2])[0] == DRIVABLE, egos[0]
-    assert _at(got, *egos[1][:2])[0] == UNKNOWN, egos[1]
+    assert _at(got, *egos[1][:2])[0] == DRIVABLE, egos[1]
     assert _at(got, *egos[2][:2])[0] == BLOCKED, egos[2]
     # Literal 0.15. A test that only reads the constant still passes at 0.30.
     assert float(OBSTACLE_Z_EPS_M) == 0.15
@@ -349,14 +349,14 @@ def check_wall_pole_empty_and_missing_depth() -> None:
     got = scene(ground + wall)
     assert got["mask_src"] == "geom"
     assert _at(got, 0.0, 15.0)[0] == BLOCKED
-    assert _at(got, 0.0, 10.0)[0] == UNKNOWN
+    assert _at(got, 0.0, 10.0)[0] == DRIVABLE
     assert got["clear_valid"] is True
     assert abs(float(got["clear_m"]) - 15.0) < 0.75, got["clear_m"]
 
     pole = [(0.3 + dx, 12.0, z) for dx in (-0.15, 0.0, 0.15) for z in (0.6, 1.4)]
     got_p = scene(ground + pole)
     assert _at(got_p, 0.3, 12.0)[0] == BLOCKED
-    assert _at(got_p, 0.0, 10.0)[0] == UNKNOWN
+    assert _at(got_p, 0.0, 10.0)[0] == DRIVABLE
     assert got_p["clear_valid"] is True
     assert abs(float(got_p["clear_m"]) - 12.0) < 0.75, got_p["clear_m"]
 
@@ -366,7 +366,7 @@ def check_wall_pole_empty_and_missing_depth() -> None:
     empty = scene(ground)
     mask = np.asarray(empty["mask"], dtype=np.int64)
     assert int((mask == BLOCKED).sum()) == 0, int((mask == BLOCKED).sum())
-    assert _at(empty, 0.0, 10.0)[0] == UNKNOWN
+    assert _at(empty, 0.0, 10.0)[0] == DRIVABLE
     assert empty["clear_valid"] is False
     assert empty["clear_m"] is None
 
@@ -452,7 +452,7 @@ def check_semantic_blocked_needs_palette_proof() -> None:
 
     geom = _label(depth, **kw)
     assert geom["mask_src"] == "geom"
-    assert _at(geom, 0.0, 16.0)[0] == UNKNOWN
+    assert _at(geom, 0.0, 16.0)[0] == DRIVABLE
     assert _at(geom, 0.0, 24.0)[0] == BLOCKED
 
     proved = _label(depth, blocked_names=["WALL"], **kw)
@@ -531,7 +531,7 @@ def check_writer_and_missing_sidecar() -> None:
         assert saved["x_min"] == -16.0 and saved["x_max"] == 16.0
         assert saved["y_min"] == 0.0 and saved["y_max"] == 40.0
         _assert_row_fields(saved)
-        assert _at(saved, 0.0, 10.0)[0] == UNKNOWN
+        assert _at(saved, 0.0, 10.0)[0] == DRIVABLE
         assert _at(saved, 0.0, 16.0)[0] == BLOCKED
         assert not (root / "gt.jsonl").exists()
 
@@ -595,8 +595,8 @@ def check_bump_survives_depth_quantization() -> None:
 
     uint16 centimetres plus the pixel-center ray make a flat road at 27.4 m
     come back near z 0.026, and a 0.12 m bump there come back above 0.15.
-    The interim pad is 0.25 m, so a recovered height inside the unknown band
-    is not drivable. A 0.40 m obstacle at 27.4 m is not drivable.
+    On this pose ``pad(r)`` is the depth term only. A short bump stays under the
+    blocked bar. A far bump is not drivable.
     """
     from python.train.obstacles import BLOCKED, DRIVABLE, depth_range_pad_m
 
@@ -616,7 +616,9 @@ def check_bump_survives_depth_quantization() -> None:
     bump_z = _recovered_z((0.0, 27.4, 0.12))
     assert abs(flat_z - 0.026) < 0.005, flat_z
     assert bump_z > 0.15, bump_z
-    assert float(np.max(np.abs(depth_range_pad_m(np.array([0.0, 8.0, 27.4, 30.0])) - 0.25))) == 0.0
+    pad = depth_range_pad_m(np.array([0.0, 8.0, 27.4, 30.0]), POSE)
+    assert float(pad[-1]) > float(pad[1]) > 0.005
+    assert float(np.max(pad)) <= 0.25
     near, _got = kind((0.0, 8.0, 0.10))
     far, far_row = kind((0.0, 30.0, 0.10))
     quant, _qrow = kind((0.0, 27.4, 0.12))
@@ -626,7 +628,7 @@ def check_bump_survives_depth_quantization() -> None:
     assert quant != DRIVABLE, (quant, bump_z)
     assert real != DRIVABLE, real
     _assert_row_fields(far_row)
-    print("  interim pad is 0.25 m; a quantized 0.12 m bump is not drivable")
+    print("  pad(r): a near 0.10 m bump is not blocked; a far quantized bump is not drivable")
 
 
 def check_crown_and_bank_not_blocked() -> None:
@@ -821,7 +823,7 @@ def check_edge_heights_are_kept() -> None:
 
 
 def check_depth_fit_keeps_curb_blocked() -> None:
-    """A 0.10 m curb is not drivable while that side's depth fit is enabled.
+    """Depth-fit 0.10 m curb stays out of drivable. Edge-z blocks it where pad <= 0.02.
 
     Seeds are paved cells with |h_centerline| <= 0.05 m, in a 5-row window.
     Four cells per row times five rows is the 20-inlier minimum. Taller points
@@ -871,119 +873,111 @@ def check_depth_fit_keeps_curb_blocked() -> None:
     )
     assert _exact(got, curb[0], curb[1]) != DRIVABLE, curb
     assert int((np.asarray(got["mask"]) == BLOCKED).sum()) > 0
-    print("  depth fit on: 0.10 m curb is not drivable; tall seeds stay out of the fit")
+    # Edge-z path, where pad(r) <= 0.02: the same 0.10 m curb is blocked.
+    from python.train.obstacles import BLOCKED as _BLOCKED
+    edge_kind, _counts = _one_point(_cam("main"), 1.75 + 0.3, 8.0, 0.10, edges=True, seeds=False)
+    assert edge_kind == _BLOCKED, edge_kind
+    print("  depth fit: 0.10 m curb is not drivable; edge-z curb at 8 m is blocked")
+
+
+def _cam(kind: str):
+    if kind == "main":
+        return _Cam(x=0.0, y=1.20, z=1.26, yaw_deg=0.0, pitch_deg=-6.0, fov_v_deg=34.0, width=640, height=480)
+    return _Cam(x=-0.03, y=1.20, z=1.24, yaw_deg=0.0, pitch_deg=-8.0, fov_v_deg=88.7, width=640, height=360)
+
+
+class _Cam:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
 
 
 def check_interim_pad_band() -> None:
-    """0.25 m interim pad. A 0.16 m or 0.20 m face is never drivable.
+    """pad(r) on the edge-z path, pad(r)+fit_tol on the depth fit.
 
-    pad=0 lets those faces read under 0.15 m on the wide and main cameras.
+    A 0.16 m or 0.20 m face on the fit path is never drivable at 12/20/27.4/30 m
+    on main and wide. pad=0 on the edge-z path makes one of those faces drivable.
     """
     import python.train.obstacles as obstacles
-    from python.train.obstacles import (
-        CLEAR_EPS_M,
-        CURB_EPS_M,
-        DRIVABLE,
-        UNKNOWN,
-        apply_height_band,
-        depth_range_pad_m,
+    from python.train.obstacles import DRIVABLE, depth_range_pad_m, label_obstacle_frame, view_depth_m, _unproject
+
+    main, wide = _cam("main"), _cam("wide")
+    published = (
+        (main, 17.34, 0.019996, True),
+        (main, 17.35, 0.020004, False),
+        (main, 27.4, 0.0287, False),
+        (main, 30.0, 0.0309, False),
+        (wide, 5.54, 0.019976, True),
+        (wide, 30.0, 0.0861, False),
     )
+    for cam, dist, want, under in published:
+        got = float(depth_range_pad_m(np.array([dist]), cam)[0])
+        assert abs(got - want) < 5e-4, (dist, got, want)
+        assert (got <= 0.02) is under, (dist, got)
 
-    ranges = np.array([0.0, 8.0, 17.0, 27.4, 30.0, 40.0])
-    pad = depth_range_pad_m(ranges)
-    assert np.allclose(pad, 0.25), pad
-    err = 0.084
-    for true_h in (0.16, 0.20):
-        kind = apply_height_band(np.array([true_h - err, true_h + err]), CLEAR_EPS_M, pad[:1])
-        assert DRIVABLE not in {int(v) for v in kind}, (true_h, kind)
+    classes = {"kind": "gvd_sem_classes", "train_only": True, "classes": {"0": "unknown", "1": "ROAD"}}
 
-    right, forward, up = _flat_axes()
-    pos = (0.0, 0.0, 0.0)
-    half = 3.5 / 2.0
-
-    def at_height(y, height):
-        """One point at range y whose unprojected height above the road is ``height``."""
-        world = (0.0, float(y), 0.0)
-        recovered = _recovered_z(world)
-        road_z = recovered - float(height)
-        depth = _blank(POSE.height, POSE.width)
-        ego = _to_ego(world, pos, right, forward, up)
-        _splat(depth, ego)
-        got = _label(
-            depth,
-            lane=_paint(3.5),
-            road=_road(lambda _y: road_z),
-            pos=pos,
-            forward=forward,
-            up=up,
-        )
-        return _exact(got, ego[0], ego[1])
-
-    for y in (27.4, 30.0):
-        for true_h in (0.16, 0.20):
-            assert at_height(y, true_h - err) != DRIVABLE, (y, true_h)
-    for y in (8.0, 12.0, 16.0):
-        assert y <= 17.0
-        depth = _blank(POSE.height, POSE.width)
-        curb = (half + 0.3, y, 0.10)
-        ego = _to_ego(curb, pos, right, forward, up)
-        _splat(depth, ego)
-        got = _label(depth, lane=_paint(3.5), road=_road(lambda _y: 0.0), pos=pos, forward=forward, up=up)
-        assert _exact(got, ego[0], ego[1]) != DRIVABLE, y
-
-    from python.train.obstacles import label_obstacle_frame, view_depth_m, _unproject
-
-    class _Cam:
-        def __init__(self, **kw):
-            self.__dict__.update(kw)
-
-    cams = (
-        _Cam(x=0.0, y=1.20, z=1.26, yaw_deg=0.0, pitch_deg=-6.0, fov_v_deg=34.0, width=640, height=480),
-        _Cam(x=-0.03, y=1.20, z=1.24, yaw_deg=0.0, pitch_deg=-8.0, fov_v_deg=88.7, width=640, height=360),
-    )
-
-    def face(cam, y, height):
-        depth = np.zeros((cam.height, cam.width), np.uint16)
-        hit = view_depth_m(cam, 0.0, float(y), float(height), cam.width, cam.height)
-        assert hit is not None, (cam.width, y, height)
+    def splat(depth, sem, cam, x, y, z, paved):
+        hit = view_depth_m(cam, x, y, z, cam.width, cam.height)
+        assert hit is not None, (x, y, z, cam.width)
         u, v, metres = hit
         ui, vi = int(round(u)), int(round(v))
-        assert 0 <= ui < cam.width and 0 <= vi < cam.height, (ui, vi, y, height)
+        assert 0 <= ui < cam.width and 0 <= vi < cam.height, (ui, vi, x, y, z)
         depth[vi, ui] = np.uint16(max(1, int(round(float(metres) * 100.0))))
-        values, valid = _paint()
+        if paved and sem is not None:
+            sem[vi, ui] = 1
+        return vi, ui
+
+    def label_at(cam, depth, sem, vi, ui, *, edges):
+        values, valid = _paint(3.5)
         got = label_obstacle_frame(
             depth,
             pose=cam,
             lane_gt=values,
             lane_gt_valid=valid,
-            road=_road(lambda _y: 0.0),
+            road=_road(lambda _y: 0.0, edges=edges),
             ego_pos=(0.0, 0.0, 0.0),
             ego_dir=(0.0, 1.0, 0.0),
             ego_up=(0.0, 0.0, 1.0),
+            sem=sem,
+            sem_classes=classes if sem is not None else None,
             cam="probe",
             t=1.0,
         )
         ex, ey, _ez, _ok = _unproject(cam, depth)
         return _exact(got, float(ex[vi, ui]), float(ey[vi, ui]))
 
-    def sweep():
-        found = []
-        for cam in cams:
-            for y in (12.0, 20.0, 27.4, 30.0):
-                for height in (0.16, 0.20):
-                    found.append(face(cam, y, height))
-        return found
+    def fallback_face(cam, y, height):
+        depth = np.zeros((cam.height, cam.width), np.uint16)
+        sem = np.zeros(depth.shape, np.uint8)
+        center = int(math.floor(float(y) / 0.625))
+        for row in range(center - 4, center + 5):
+            yy = (row + 0.5) * 0.625
+            if yy < 2.0:
+                continue
+            for x in (0.25, 0.75, 1.25, 1.60):
+                splat(depth, sem, cam, x, yy, 0.0, True)
+        # Edge-band cell, so a paved seed in the corridor cannot vote the face drivable.
+        vi, ui = splat(depth, sem, cam, 1.75 + 0.3, float(y), float(height), False)
+        return label_at(cam, depth, sem, vi, ui, edges=False)
 
-    safe = sweep()
-    assert all(kind != DRIVABLE for kind in safe), safe
+    def edge_face(cam, y, height):
+        depth = np.zeros((cam.height, cam.width), np.uint16)
+        vi, ui = splat(depth, None, cam, 0.40, float(y), float(height), False)
+        return label_at(cam, depth, None, vi, ui, edges=True)
+
+    for cam in (main, wide):
+        for y in (12.0, 20.0, 27.4, 30.0):
+            for height in (0.16, 0.20):
+                kind = fallback_face(cam, y, height)
+                assert kind != DRIVABLE, (cam.width, y, height, kind)
     saved = obstacles.depth_range_pad_m
-    obstacles.depth_range_pad_m = lambda depth_m: np.zeros(np.shape(depth_m), dtype=np.float64)
+    obstacles.depth_range_pad_m = lambda depth_m, pose=None: np.zeros(np.shape(depth_m), dtype=np.float64)
     try:
-        unsafe = sweep()
+        opened = [edge_face(cam, y, height) for cam in (main, wide) for y in (12.0, 20.0, 27.4, 30.0) for height in (0.16, 0.20)]
     finally:
         obstacles.depth_range_pad_m = saved
-    assert any(kind == DRIVABLE for kind in unsafe), unsafe
-    print("  pad 0.25: 0.16 m and 0.20 m faces on main and wide are never drivable; pad 0 is")
+    assert any(kind == DRIVABLE for kind in opened), opened
+    print("  fit path: 0.16/0.20 m faces never drivable; pad=0 on edge-z is")
 
 
 def check_edge_band_and_row_fields() -> None:
@@ -1016,7 +1010,7 @@ def check_edge_band_and_row_fields() -> None:
     in_ego = _to_ego((0.0, 8.0, 0.0), pos, right, forward, up)
     _splat(inside, in_ego)
     inner = _label(inside, lane=_paint(3.5), road=_road(lambda _y: 0.0), pos=pos, forward=forward, up=up)
-    assert _at(inner, in_ego[0], in_ego[1])[0] == UNKNOWN, in_ego
+    assert _at(inner, in_ego[0], in_ego[1])[0] == DRIVABLE, in_ego
 
     none_depth = _label(None, lane=_paint(), road=_road(lambda _y: 0.0), pos=pos, forward=forward, up=up)
     zeros = _label(_blank(POSE.height, POSE.width), lane=_paint(), road=_road(lambda _y: 0.0), pos=pos, forward=forward, up=up)
@@ -1190,6 +1184,172 @@ def check_runtime_does_not_import_the_labeler() -> None:
     print(f"  runtime files do not import the obstacle labeler ({len(targets)} files)")
 
 
+def _classes_road():
+    return {"kind": "gvd_sem_classes", "train_only": True, "classes": {"0": "unknown", "1": "ROAD"}}
+
+
+def _one_point(cam, x, y, z, *, edges, seeds=False):
+    """Class of one point. ``seeds`` paints a paved station so the depth fit can run."""
+    from python.train.obstacles import label_obstacle_frame, view_depth_m, _unproject
+
+    depth = np.zeros((cam.height, cam.width), np.uint16)
+    sem = np.zeros(depth.shape, np.uint8) if seeds or not edges else None
+
+    def splat(px, py, pz, paved):
+        hit = view_depth_m(cam, px, py, pz, cam.width, cam.height)
+        assert hit is not None, (px, py, pz)
+        u, v, metres = hit
+        ui, vi = int(round(u)), int(round(v))
+        assert 0 <= ui < cam.width and 0 <= vi < cam.height, (ui, vi, px, py, pz)
+        depth[vi, ui] = np.uint16(max(1, int(round(float(metres) * 100.0))))
+        if paved and sem is not None:
+            sem[vi, ui] = 1
+        return vi, ui
+
+    if seeds:
+        center = int(math.floor(float(y) / 0.625))
+        for row in range(center - 4, center + 5):
+            yy = (row + 0.5) * 0.625
+            if yy < 2.0:
+                continue
+            for sx in (0.25, 0.75, 1.25, 1.60):
+                splat(sx, yy, 0.0, True)
+    vi, ui = splat(x, y, z, False)
+    values, valid = _paint(3.5)
+    got = label_obstacle_frame(
+        depth,
+        pose=cam,
+        lane_gt=values,
+        lane_gt_valid=valid,
+        road=_road(lambda _y: 0.0, edges=edges),
+        ego_pos=(0.0, 0.0, 0.0),
+        ego_dir=(0.0, 1.0, 0.0),
+        ego_up=(0.0, 0.0, 1.0),
+        sem=sem,
+        sem_classes=_classes_road() if sem is not None else None,
+        cam="probe",
+        t=1.0,
+    )
+    ex, ey, _ez, _ok = _unproject(cam, depth)
+    kind = _exact(got, float(ex[vi, ui]), float(ey[vi, ui]))
+    mask = np.asarray(got["mask"])
+    counts = {int(k): int(v) for k, v in zip(*np.unique(mask, return_counts=True))}
+    return kind, counts
+
+
+def check_path_class_counts() -> None:
+    """Edge-z uses pad(r). The depth fit adds fit_tol. Flat road inside 17 m is drivable."""
+    from python.train.obstacles import BLOCKED, DRIVABLE, UNKNOWN
+
+    main = _cam("main")
+    half = 3.5 / 2.0
+    names = {UNKNOWN: "unknown", DRIVABLE: "drivable", BLOCKED: "blocked"}
+    rows = []
+
+    def add(path, what, y, z, x, *, edges, seeds):
+        kind, counts = _one_point(main, x, y, z, edges=edges, seeds=seeds)
+        rows.append((path, what, y, names[kind], counts.get(0, 0), counts.get(1, 0), counts.get(2, 0)))
+        return kind
+
+    for y in (8.0, 12.0, 16.0):
+        assert add("edge-z", "flat", y, 0.0, 0.4, edges=True, seeds=False) == DRIVABLE, y
+    assert add("edge-z", "curb 0.10", 8.0, 0.10, half + 0.3, edges=True, seeds=False) == BLOCKED
+    assert add("edge-z", "curb 0.10", 12.0, 0.10, half + 0.3, edges=True, seeds=False) == BLOCKED
+    assert add("edge-z", "curb 0.20", 8.0, 0.20, half + 0.3, edges=True, seeds=False) == BLOCKED
+    assert add("edge-z", "curb 0.35", 8.0, 0.35, half + 0.3, edges=True, seeds=False) == BLOCKED
+    assert add("edge-z", "curb 0.10", 30.0, 0.10, half + 0.3, edges=True, seeds=False) != BLOCKED
+    assert add("fit", "flat", 8.0, 0.0, 0.4, edges=False, seeds=True) == DRIVABLE
+    assert add("fit", "curb 0.10", 8.0, 0.10, half + 0.3, edges=False, seeds=True) == UNKNOWN
+    assert add("fit", "curb 0.20", 8.0, 0.20, half + 0.3, edges=False, seeds=True) == UNKNOWN
+    assert add("fit", "curb 0.35", 8.0, 0.35, half + 0.3, edges=False, seeds=True) == BLOCKED
+    print("  path counts (main): path object y class unk drv blk")
+    for path, what, y, kind, unk, drv, blk in rows:
+        print(f"    {path:7} {what:10} y={y:4.0f} {kind:9} {unk:4} {drv:3} {blk:2}")
+
+
+def check_fit_levers() -> None:
+    """Each fallback lever fails on its own: seed 0.15, whole frame, min inliers 1, no refit."""
+    from python.train.obstacles import (
+        BLOCKED,
+        FIT_MIN_INLIERS,
+        FIT_SEED_M,
+        UNKNOWN,
+        WINDOW_ROWS,
+        _refit_cell_slope,
+        label_obstacle_frame,
+        view_depth_m,
+        _unproject,
+    )
+
+    assert FIT_SEED_M == 0.05 and FIT_MIN_INLIERS == 20 and WINDOW_ROWS == 5
+    lateral = np.array([0.25] * 40 + [1.75] * 4, dtype=np.float64)
+    height = np.array([0.05] * 40 + [0.0] * 4, dtype=np.float64)
+    rows = np.array(list(range(40)) + list(range(4)))
+    refit = _refit_cell_slope(lateral, height, rows)
+    assert refit is not None and abs(refit - 0.20) < 1e-9, refit
+
+    cam = _cam("main")
+    classes = _classes_road()
+
+    def scene(points):
+        depth = np.zeros((cam.height, cam.width), np.uint16)
+        sem = np.zeros(depth.shape, np.uint8)
+        mark = None
+        for x, y, z, paved, query in points:
+            hit = view_depth_m(cam, x, y, z, cam.width, cam.height)
+            assert hit is not None, (x, y, z)
+            u, v, metres = hit
+            ui, vi = int(round(u)), int(round(v))
+            assert 0 <= ui < cam.width and 0 <= vi < cam.height, (ui, vi, x, y, z)
+            depth[vi, ui] = np.uint16(max(1, int(round(float(metres) * 100.0))))
+            if paved:
+                sem[vi, ui] = 1
+            if query:
+                mark = (vi, ui)
+        values, valid = _paint(3.5)
+        got = label_obstacle_frame(
+            depth, pose=cam, lane_gt=values, lane_gt_valid=valid,
+            road=_road(lambda _y: 0.0, edges=False),
+            ego_pos=(0.0, 0.0, 0.0), ego_dir=(0.0, 1.0, 0.0), ego_up=(0.0, 0.0, 1.0),
+            sem=sem, sem_classes=classes, cam="probe", t=1.0,
+        )
+        ex, ey, _ez, _ok = _unproject(cam, depth)
+        vi, ui = mark
+        return _exact(got, float(ex[vi, ui]), float(ey[vi, ui]))
+
+    def seeds_at(rows_y, xs, z):
+        out = []
+        for y in rows_y:
+            for x in xs:
+                out.append((x, y, z, True, False))
+        return out
+
+    y_local = (16 + 0.5) * 0.625
+    local = seeds_at([y_local], (0.25, 0.75, 1.25, 1.60), 0.0)
+    far = []
+    for row in range(40, 49):
+        far.extend(seeds_at([(row + 0.5) * 0.625], (0.25, 0.75, 1.25, 1.60), 0.0))
+    tall = (1.25, y_local + 0.12, 0.55, False, True)
+    # One row cannot reach 20 inliers, so the tall face stays unknown.
+    assert scene(local + [tall]) == UNKNOWN
+    # Far rows are outside the 5-row window. The whole frame would fit them and block the face.
+    assert scene(local + far + [tall]) == UNKNOWN
+
+    y = 8.0
+    center = int(math.floor(y / 0.625))
+    road = []
+    poison = []
+    for row in range(center - 4, center + 5):
+        yy = (row + 0.5) * 0.625
+        for x in (0.25, 0.75, 1.25, 1.60):
+            road.append((x, yy, 0.0, True, False))
+            for dx in (-0.10, 0.10):
+                poison.append((x + dx, yy, 0.12, True, False))
+    marker = (1.60, y + 0.15, 0.45, False, True)
+    assert scene(poison + road + [marker]) == BLOCKED
+    print("  fit levers: seed 0.05, 5-row window, 20 inliers, and the refit each hold")
+
+
 def main() -> None:
     check_pitched_and_raised_ego_uses_world_z()
     check_epsilon_is_world_clearance()
@@ -1200,6 +1360,8 @@ def main() -> None:
     check_crown_and_bank_not_blocked()
     check_bump_survives_depth_quantization()
     check_interim_pad_band()
+    check_path_class_counts()
+    check_fit_levers()
     check_heading_matches_pack_road_edge()
     check_wall_pole_empty_and_missing_depth()
     check_missing_geometry_stays_unknown()

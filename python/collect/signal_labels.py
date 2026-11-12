@@ -190,3 +190,65 @@ def sidecar_row(
     if not recognized_payload(raw):
         return {"err": "unrecognized traffic_signals payload", "t": t}
     return {"t": t, "signs": labels_from_signals(raw, ego_pos, ego_dir)}
+
+
+def _tkey(stamp: Any) -> str:
+    try:
+        return f"{float(stamp):.4f}"
+    except (TypeError, ValueError):
+        return str(stamp)
+
+
+def signal_payload(row: Any) -> tuple[Any, str | None]:
+    """Split one ``signals.jsonl`` object into ``(raw, err)``.
+
+    ``{t, err}`` is a missing API. ``{t, signals: payload}`` (or ``raw``) is a
+    real dump. A row with neither is missing, not an empty network.
+    """
+    if not isinstance(row, dict):
+        return None, "unrecognized traffic_signals payload"
+    err = row.get("err")
+    if err:
+        return None, str(err)
+    if "signals" in row:
+        return row.get("signals"), None
+    if "raw" in row:
+        return row.get("raw"), None
+    extra = {key: value for key, value in row.items() if key != "t"}
+    if not extra:
+        return None, "missing signals"
+    return extra, None
+
+
+def signs_for_state(state_row: Any, signal_row: Any) -> dict[str, Any]:
+    """One ``signs.jsonl`` object. Missing data is an ``err`` row, never a lamp."""
+    t = state_row.get("t") if isinstance(state_row, dict) else None
+    if signal_row is None:
+        return {"err": "missing signals", "t": t}
+    raw, err = signal_payload(signal_row)
+    if err:
+        return {"err": err, "t": t}
+    ego_pos = state_row.get("pos") if isinstance(state_row, dict) else None
+    ego_dir = None
+    if isinstance(state_row, dict):
+        ego_dir = state_row.get("dir") if state_row.get("dir") is not None else state_row.get("direction")
+    if _xy(ego_pos) is None or _xy(ego_dir) is None:
+        return {"err": "missing ego pose", "t": t}
+    return sidecar_row(t=t, raw=raw, err=None, ego_pos=ego_pos, ego_dir=ego_dir)
+
+
+def label_signs(state_rows: Any, signal_rows: Any) -> list[dict[str, Any]]:
+    """Join per-tick ``signals.jsonl`` onto ``state.jsonl`` by ``t``.
+
+    The first signal row for a timestamp wins. A state row with no partner
+    is masked. This does not stamp one dump onto every tick.
+    """
+    index: dict[str, Any] = {}
+    for row in signal_rows or []:
+        if isinstance(row, dict) and "t" in row:
+            index.setdefault(_tkey(row.get("t")), row)
+    out: list[dict[str, Any]] = []
+    for state in state_rows or []:
+        key = _tkey(state.get("t") if isinstance(state, dict) else None)
+        out.append(signs_for_state(state, index.get(key)))
+    return out

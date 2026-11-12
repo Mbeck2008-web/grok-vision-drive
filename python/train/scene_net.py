@@ -715,13 +715,16 @@ def labels_for_row(
     aux_sem: bool = False,
     road_edge: bool = False,
     aux_cache: Any = None,
+    stop_line: bool = False,
 ) -> dict[str, np.ndarray]:
     """Scene labels plus the ground-truth lane vector when the row has one.
 
     Old strips without ``lane_gt`` still train the polyline heads. Invalid
     geometry is NaN and its mask is clear, so that term does not pull.
     ``road_edge`` is attached as a separate vector (never copied into paint).
-    Depth/sem aux load only when ``root`` is set and the matching flag is on.
+    ``stop_line`` is the training-only ``(y_m, valid)`` scalar. It is not
+    written into ``lane_gt``. Depth/sem aux load only when ``root`` is set
+    and the matching flag is on.
     """
     from pathlib import Path as _Path
 
@@ -746,6 +749,12 @@ def labels_for_row(
         re_v, re_m = road_edge_from_record(record)
         labels["road_edge"] = re_v
         labels["road_edge_valid"] = re_m
+    if stop_line:
+        from python.train.intersection_labels import stop_line_arrays
+
+        stop_y, stop_m = stop_line_arrays(row if isinstance(row, Mapping) else None)
+        labels["stop_line"] = stop_y
+        labels["stop_line_valid"] = stop_m
     if root is not None and (aux_depth or aux_sem) and row.get("i") is not None:
         labels = attach_aux_to_labels(
             labels,
@@ -979,6 +988,8 @@ class ScenePrediction:
     aux_depth: Any = None
     aux_sem_logits: Any = None
     road_edge: Any = None
+    # Training-only stop-line scalar (y_m, valid). Not an ONNX output.
+    stop_line: Any = None
 
     def as_dict(self) -> dict[str, Any]:
         return {name: getattr(self, name) for name in OUTPUT_FIELDS}
@@ -1291,7 +1302,7 @@ def _scene_loss_body(
         ctl_term = zero.clone()
     # A lane-only run (with or without ctl) must not backprop the other heads.
     # Those zeros are fresh tensors, not a slice of the polyline or the match loss.
-    if wanted - {"ctl", "road_edge"} == frozenset({"lane_gt"}):
+    if wanted - {"ctl", "road_edge", "stop_line"} == frozenset({"lane_gt"}):
         points = zero.detach().clone()
         classes = zero.detach().clone()
         lamps = zero.detach().clone()
@@ -1311,6 +1322,19 @@ def _scene_loss_body(
             diff = functional.smooth_l1_loss(pred_re, torch.nan_to_num(goal_re, nan=0.0), reduction="none")
             road_edge_term = (diff * mask_re).sum() / mask_re.sum().clamp(min=1.0)
         total = total + float(road_edge_weight) * road_edge_term
+    # stop_line: training-only (y_m, valid). Mask 0 (missing sidecar or a mask
+    # bar) adds nothing. Not an OUTPUT_FIELDS entry.
+    stop_line_term = zero.clone()
+    if (
+        "stop_line" in wanted
+        and getattr(pred, "stop_line", None) is not None
+        and "stop_line" in target
+        and "stop_line_valid" in target
+    ):
+        from python.train.intersection_labels import stop_line_loss
+
+        stop_line_term = stop_line_loss(pred.stop_line, target["stop_line"], target["stop_line_valid"])
+        total = total + stop_line_term
     # Dense aux (depth/sem): weight 0 keeps default totals identical.
     aux_depth_term = zero.clone()
     aux_sem_term = zero.clone()
@@ -1376,6 +1400,7 @@ def _scene_loss_body(
         # Always present; 0 unless the ctl head is on. Not in LOSS_TERMS.
         "ctl": ctl_term,
         "road_edge": road_edge_term,
+        "stop_line": stop_line_term,
         "aux_depth": aux_depth_term,
         "aux_sem": aux_sem_term,
         "total": total,
@@ -1425,7 +1450,13 @@ def _match_continuous(
         points = points + functional.smooth_l1_loss(pred_cont[pred_i].float(), gt_cont[gt_i].float())
         classes = classes + functional.cross_entropy(pred_class[pred_i].float(), gt_class[gt_i])
         if state_logits is not None and gt_state is not None and lamps is not None:
-            lamps = lamps + functional.cross_entropy(state_logits[pred_i].float(), gt_state[gt_i])
+            # LAMP_STATES[0] is unknown. Lamp CE is only red / yellow / green.
+            # The sign stays valid so position loss still runs.
+            known = gt_state[gt_i] > 0
+            if bool(known.any()):
+                lamps = lamps + functional.cross_entropy(
+                    state_logits[pred_i][known].float(), gt_state[gt_i][known]
+                )
     valid = valid + bce(pred_valid, target_valid)
     if lamps is None:
         return points, classes, valid
@@ -1522,6 +1553,7 @@ if torch is not None:
             cond_dim: int = 0,
             aux_sensors: bool = False,
             road_edge: bool = False,
+            stop_line: bool = False,
             route_cond: bool = False,
             *,
             stem_channels: tuple[int, ...] | None = None,
@@ -1588,6 +1620,13 @@ if torch is not None:
                 self.road_edge_head = nn.Linear(hidden, int(ROAD_EDGE_DIM))
                 arch = getattr(self, "pause_arch", checkpoint_arch(self.cams))
                 self.pause_arch = arch + f":road_edge={int(ROAD_EDGE_DIM)}"
+            # Training-only (y_m, valid). Off unless --heads names stop_line.
+            # Not exported: _OnnxScene returns OUTPUT_FIELDS only.
+            self.stop_line = bool(stop_line)
+            if self.stop_line:
+                self.stop_line_head = nn.Linear(hidden, 2)
+                arch = getattr(self, "pause_arch", checkpoint_arch(self.cams))
+                self.pause_arch = arch + ":stop_line=2"
             # --route-cond: additive nav-command embedding. Off by default so
             # old checkpoints load unchanged. This is not --ctl-cond.
             self.route_cond = bool(route_cond)
@@ -1799,6 +1838,13 @@ if torch is not None:
             return None
         return net.road_edge_head(feat)
 
+    def _stop_line_output(net: SceneNet, feat: Any) -> Any:
+        """``(B, 2)`` metres and a valid probability. None when the head is off."""
+        if not bool(getattr(net, "stop_line", False)):
+            return None
+        raw = net.stop_line_head(feat)
+        return torch.cat([raw[..., :1], torch.sigmoid(raw[..., 1:])], dim=-1)
+
     def _apply_route(net: SceneNet, feat: Any, route: Any) -> Any:
         if not bool(getattr(net, "route_cond", False)):
             return feat
@@ -1877,6 +1923,7 @@ if torch is not None:
             sign_valid=torch.sigmoid(net.sign_valid_head(feat)).view(width, N_SIGNS),
             lane_gt=_lane_gt_output(net, feat),
             road_edge=_road_edge_output(net, feat),
+            stop_line=_stop_line_output(net, feat),
             **_ctl_outputs(net, feat, cond),
         )
 
@@ -1899,7 +1946,7 @@ if torch is not None:
 
     def _prediction_at(pred: ScenePrediction, index: int) -> ScenePrediction:
         extra = {name: getattr(pred, name)[index] for name in CTL_OUTPUT_FIELDS if getattr(pred, name) is not None}
-        for name in ("aux_depth", "aux_sem_logits", "road_edge"):
+        for name in ("aux_depth", "aux_sem_logits", "road_edge", "stop_line"):
             value = getattr(pred, name, None)
             if value is not None:
                 extra[name] = value[index]

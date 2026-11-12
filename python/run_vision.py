@@ -102,7 +102,7 @@ from python.sensors.frame_slot import (
     format_stage_line,
     process_rss_mb,
 )
-from python.viz.present import VizPump
+from python.viz.present import VizPump, paint_job_snapshot
 from python.runtime.frame_gate import (
     DEFAULT_MAX_FRAME_AGE_MS,
     STALE_CAPTION,
@@ -456,6 +456,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Sim ground truth JSONL under logs/ (or set GVD_GT_LOG=1). Off in normal play.",
     )
     ap.add_argument(
+        "--drive-log",
+        default="",
+        help="Append one JSONL row per supervisor tick (lane_x, steer, pose, BeamNG applied steer). "
+        "Off unless a path is set. Does not change the command.",
+    )
+    ap.add_argument(
+        "--drive-log-gt",
+        action="store_true",
+        help="With --drive-log, also record the painted-lane center at 8 m "
+        "(the training-label geometry). Logged only: not a steer, pedal, or viz input. "
+        "Visualizer ground truth stays behind --debug-gt.",
+    )
+    ap.add_argument(
         "--debug-gt",
         action="store_true",
         help="DEBUG ONLY, off by default: draw sim/map overlays that use BeamNG ground "
@@ -611,6 +624,10 @@ def main(clock=None) -> None:
     scene_ckpt_path = str(getattr(args, "scene_ckpt", "") or "").strip()
     if bool(getattr(args, "scene_ckpt_drive", False)) and not scene_ckpt_path:
         print("[GVD] --scene-ckpt-drive requires --scene-ckpt <epoch.npz>", flush=True)
+        raise SystemExit(2)
+    drive_log_path = str(getattr(args, "drive_log", "") or "").strip()
+    if bool(getattr(args, "drive_log_gt", False)) and not drive_log_path:
+        print("[GVD] --drive-log-gt requires --drive-log PATH", flush=True)
         raise SystemExit(2)
     if scene_ckpt_path and not bool(getattr(args, "scene_ckpt_drive", False)):
         args.no_engage = True
@@ -993,9 +1010,23 @@ def main(clock=None) -> None:
     lane_steer = LaneSteerState()
     launch_guard = LaunchGuard()
     gt_log = None
+    drive_log = None
+    drive_gt = None
     if gt_log_enabled(bool(args.gt_log)) or args.lane_source == "gt":
         gt_log = GroundTruthLogger.open()
         print(f"[GVD] ground truth -> {gt_log.path}", flush=True)
+    if drive_log_path:
+        from python.debug.drive_log import DriveLog, PaintLaneGt
+
+        drive_log = DriveLog(drive_log_path)
+        print(f"[GVD] drive log -> {drive_log.path}", flush=True)
+        if bool(getattr(args, "drive_log_gt", False)):
+            ckpt_origin = None
+            if scene_ckpt is not None:
+                ckpt_origin = str((getattr(scene_ckpt, "meta", None) or {}).get("gvd_gt_origin") or "") or None
+            drive_gt = PaintLaneGt(origin=ckpt_origin)
+            drive_gt.load(bng)
+            print("[GVD] drive-log GT: painted 8 m center, log only", flush=True)
     capture_slot = LatestFrameSlot()
     capture_pump: CapturePump | None = None
     age_window = AgeWindow()
@@ -1092,17 +1123,17 @@ def main(clock=None) -> None:
             # Capture stays off the control thread. The slot keeps one frame;
             # a slower infer loop drops the ones it did not take. The step
             # clock used by tests stays synchronous so a tick is one grab.
-            # One grab per control period. A 2 ms idle re-took the camera
-            # socket (and the GIL) before inference could run, so loop_hz
-            # fell to a few hertz while unique stayed 1.
-            capture_period = 1.0 / max(float(args.hz), 1.0)
+            # The grab is phased to finish just before the next take. Sleeping
+            # a full control period after each grab left AEB a frame about one
+            # period old.
+            capture_phase = 1.0 / max(float(args.hz), 1.0)
             capture_pump = CapturePump(
-                capture_slot, backend.grab, idle_s=0.0, period_s=capture_period,
+                capture_slot, backend.grab, idle_s=0.002, phase_s=capture_phase,
             )
             capture_pump.start()
             print(
-                f"[GVD] capture pump period_s={capture_period:.3f} "
-                f"(target {float(args.hz):.0f} Hz; grab does not spin)",
+                f"[GVD] capture phase_s={capture_phase:.3f} "
+                f"(grab finishes just before the next take; target {float(args.hz):.0f} Hz)",
                 flush=True,
             )
 
@@ -1144,6 +1175,7 @@ def main(clock=None) -> None:
             return quit_now
 
         while True:
+            steer_law = None
             if run_deadline is not None and time.monotonic() >= run_deadline:
                 print(f"[GVD] --run-seconds {float(args.run_seconds):g} reached; stopping", flush=True)
                 break
@@ -1775,6 +1807,8 @@ def main(clock=None) -> None:
             # Debug gain, invert, and the steer cap still have the last word
             # before the launch cap. A crash after that brakes and disengages.
             cmd = apply_to_command(ui.debug, cmd)
+            # Lane-law output, before launch yaw may replace it. Logged only.
+            steer_law = float(cmd.steer)
             hdg = None
             dmg = None
             pos_xy = None
@@ -1877,8 +1911,9 @@ def main(clock=None) -> None:
                 actuator.note_ack(ego_fb)
             # Capture telemetry (read only): would actuate skip vehicle.control this
             # tick because a camera GE call holds the socket? Counted with engage off too.
-            would_skip_control = bool(cam_age_log) and camera_ge_socket_busy()
+            # The timer starts before this pair so the two lines stay adjacent.
             t_act = time.perf_counter()
+            would_skip_control = bool(cam_age_log) and camera_ge_socket_busy()
             if engaged and (cmd.reason == "ok" or holding):
                 applied = actuator.apply(cmd)
             else:
@@ -2228,33 +2263,18 @@ def main(clock=None) -> None:
             stage_frame = None
             t_viz = time.perf_counter()
             if viz_pump is not None:
-                import copy
-
-                import numpy as np
-
                 frames = getattr(bundle, "frames", None)
-                frame_snap = None
-                if isinstance(frames, dict):
-                    frame_snap = {
-                        key: (np.array(img, copy=True) if isinstance(img, np.ndarray) else img)
-                        for key, img in frames.items()
-                    }
-                main_snap = np.array(main, copy=True) if isinstance(main, np.ndarray) else main
-                try:
-                    state_snap = copy.deepcopy(st)
-                except Exception:
-                    state_snap = st
-                viz_pump.submit(
-                    {
-                        "state": state_snap,
-                        "main": main_snap,
-                        "frames": frame_snap,
-                        "dets": getattr(pout, "dets", None),
-                        "matched": bool(ident.matched),
-                        "screen": viz_screen_active,
-                        "fullscreen": bool(args.viz_fullscreen),
-                    }
+                job = paint_job_snapshot(
+                    state=st,
+                    main=main,
+                    frames=frames if isinstance(frames, dict) else None,
+                    dets=getattr(pout, "dets", None),
+                    matched=bool(ident.matched),
+                    screen=viz_screen_active,
+                    fullscreen=bool(args.viz_fullscreen),
                 )
+                if job is not None:
+                    viz_pump.submit(job)
                 st["viz_ms"] = float(viz_pump.viz_ms)
             elif win is not None:
                 # Thread setup failed. Paint here so the window still works.
@@ -2301,6 +2321,61 @@ def main(clock=None) -> None:
             if state_due:
                 write_state(st)
                 soft_esc_state_write_mark()
+
+            if drive_log is not None:
+                from python.debug.drive_log import record_drive_tick
+
+                gt_x = None
+                gt_origin = None
+                if drive_gt is not None:
+                    # After the command is applied. The return value is the log row only.
+                    gt_x, gt_origin = drive_gt.sample(
+                        vdata,
+                        bng,
+                        socket_busy=bool(getattr(bundle, "grab_read_blocked", False)),
+                    )
+                model_x = None
+                if ckpt_pred is not None and getattr(ckpt_pred, "lane_x", None) is not None:
+                    model_x = getattr(ckpt_pred, "lane_x", None)
+                elif scene_lane_x is not None:
+                    model_x = scene_lane_x
+                launch_yaw = None
+                if (
+                    launch_guard.active
+                    and launch_guard.heading is not None
+                    and launch_guard.heading0 is not None
+                ):
+                    launch_yaw = float(launch_guard.heading) - float(launch_guard.heading0)
+                gear = getattr(vdata, "gear", None) if vdata is not None else None
+                pose = getattr(vdata, "pos", None) if vdata is not None else None
+                record_drive_tick(
+                    drive_log,
+                    applied,
+                    {
+                        "wall": time.time(),
+                        "frame_id": int(frame_i),
+                        "frame_age_s": frame_age_s_cap,
+                        "lane_x": lane_x,
+                        "lane_y": lane_y,
+                        "steer_cmd": float(applied.steer),
+                        "steer_why": lane_steer.reason,
+                        "throttle": float(applied.throttle),
+                        "brake": float(applied.brake),
+                        "gear": gear,
+                        "speed_mps": ego_v,
+                        "yaw_rad": hdg,
+                        "pos": pose,
+                        "applied_steer": steer_in,
+                        "loop_hz": None if frame_i == 0 else loop_hz_ema,
+                        "camera_hz": None if frame_i == 0 else cam_hz_ema,
+                        "model_lane_x": model_x,
+                        "steer_law": steer_law,
+                        "launch_yaw_rad": launch_yaw,
+                    },
+                    include_gt=drive_gt is not None,
+                    gt_lane_x=gt_x,
+                    gt_origin=gt_origin,
+                )
 
             if gt_log is not None:
                 gt_log.write(
@@ -2349,6 +2424,10 @@ def main(clock=None) -> None:
 
             frame_i += 1
             dt = 1.0 / max(args.hz, 1.0)
+            if clock is None and capture_pump is not None:
+                # Next take is one period after this tick started. The pump
+                # grabs so that frame is ready then, not one period early.
+                capture_pump.note_next_take(loop_t0 + dt)
             if clock is not None:
                 # Test step barrier: report this tick done, block until the test releases the next.
                 clock.sleep(max(0.0, dt - (clock.perf() - loop_t0)))
@@ -2371,6 +2450,11 @@ def main(clock=None) -> None:
         if pressure_mon is not None:
             try:
                 pressure_mon.stop()
+            except Exception:
+                pass
+        if drive_log is not None:
+            try:
+                drive_log.close()
             except Exception:
                 pass
         if capture_pump is not None:

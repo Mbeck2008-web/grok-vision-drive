@@ -37,7 +37,7 @@ Real names on main:
 
 ## Not built yet
 
-- Paint labels in the live log. The live GT log's `gt_center_x` / `gt_center_xs` come from the road network (`get_roads` edges), not from paint. Nothing writes the scene-net prediction and the paint label for the same live frame yet.
+- The full shadow-gate row (masks, commit, model hash). `--drive-log` / `--drive-log-gt` (`docs/DRIVE_LOG.md`) writes the model 8 m `lane_x` and, when the GT flag is on, the painted-lane center at 8 m for that same tick. The older `--gt-log` `gt_center_x` is still the road network, not paint. The drive-log GT value is not a control or viz input.
 - A junction mask in the live log.
 - A respawn / reset flag in the GT log rows.
 - A grader for a shadow log.

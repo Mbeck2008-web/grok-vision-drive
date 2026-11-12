@@ -1,20 +1,73 @@
 """Latest-frame viz pump.
 
-Paint (stage draw, imshow, waitKey) runs off the control thread. A newer
-job replaces one the painter has not started. The control thread only
-submits and drains keys, so a slow draw does not delay actuation.
+Paint (stage draw, imshow, waitKey) runs on a side thread. A newer job
+replaces one the painter has not started. ``submit`` returns without waiting
+for the paint to finish.
+
+That does not isolate the GIL. OpenCV ``waitKey`` and a paint that sleeps
+release the GIL, so the control thread (AEB included) keeps running. A paint
+that holds the GIL (a tight Python or NumPy loop) stalls the control thread
+for the whole paint. This pump does not move paint into another process.
 """
 
 from __future__ import annotations
 
+import copy
 import queue
 import threading
 import time
 from typing import Any, Callable
 
 
+def paint_job_snapshot(
+    *,
+    state: dict,
+    main: Any,
+    frames: dict | None,
+    dets: Any,
+    matched: bool,
+    screen: str,
+    fullscreen: bool,
+) -> dict | None:
+    """One tick's paint inputs. ``None`` when state or dets cannot be copied.
+
+    The returned dict does not alias ``state`` or ``dets``. A later tick can
+    replace those live objects without changing this job. There is no fallback
+    that hands the painter the live state.
+    """
+    try:
+        state_snap = copy.deepcopy(state)
+        dets_snap = None if dets is None else copy.deepcopy(dets)
+    except Exception:
+        return None
+    frame_snap = None
+    if isinstance(frames, dict):
+        frame_snap = {}
+        for key, img in frames.items():
+            copy_of = getattr(img, "copy", None)
+            frame_snap[key] = copy_of() if callable(copy_of) else img
+    main_snap = main
+    main_copy = getattr(main, "copy", None)
+    if callable(main_copy):
+        main_snap = main_copy()
+    return {
+        "state": state_snap,
+        "main": main_snap,
+        "frames": frame_snap,
+        "dets": dets_snap,
+        "matched": bool(matched),
+        "screen": str(screen),
+        "fullscreen": bool(fullscreen),
+    }
+
+
 class VizPump:
-    """One painter thread. ``submit`` keeps the latest job and returns."""
+    """One painter thread. ``submit`` keeps the latest job and returns.
+
+    A paint that holds the GIL still stalls the control thread. See the
+    module docstring. ``submit`` only avoids waiting out a paint that
+    releases the GIL.
+    """
 
     def __init__(
         self,

@@ -339,7 +339,18 @@ class LatestFrameSlot:
 
 
 class CapturePump:
-    """Calls ``produce`` off the control thread and publishes into ``slot``."""
+    """Calls ``produce`` off the control thread and publishes into ``slot``.
+
+    ``phase_s`` is the control period. The pump starts the grab so it finishes
+    just before the next ``note_next_take`` deadline. A grab that finishes at
+    the start of the period would sit for almost the whole period, and AEB
+    would see pixels about one period old. The lead is capped under
+    ``phase_s / 3`` so the stamp-at-start age stays inside that bound when the
+    grab itself is shorter than the lead.
+
+    ``period_s`` is the old sleep-after-grab pace. The supervisor does not use
+    it. Passing neither leaves the short ``idle_s`` pump.
+    """
 
     def __init__(
         self,
@@ -348,14 +359,17 @@ class CapturePump:
         *,
         idle_s: float = 0.002,
         period_s: float | None = None,
+        phase_s: float | None = None,
     ) -> None:
         self.slot = slot
         self._produce = produce
         self._idle_s = max(0.0, float(idle_s))
-        # None keeps the old idle-only pace (tests that want a fast pump).
-        # A positive period is the supervisor: one grab per control period,
-        # then the shared camera socket / GIL is free for inference.
         self._period_s = 0.0 if period_s is None else max(0.0, float(period_s))
+        self._phase_s = 0.0 if phase_s is None else max(0.0, float(phase_s))
+        self._grab_s = 0.008
+        self._primed = False
+        self._next_take_at: float | None = None
+        self._sched = threading.Condition()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -368,21 +382,64 @@ class CapturePump:
 
     def stop(self) -> None:
         self._stop.set()
+        with self._sched:
+            self._sched.notify_all()
         thread = self._thread
         if thread is not None:
             thread.join(timeout=2.0)
 
+    def note_next_take(self, when: float) -> None:
+        """The control thread will ``take`` again at this ``perf_counter`` time."""
+        with self._sched:
+            self._next_take_at = float(when)
+            self._sched.notify_all()
+
+    def _lead_s(self) -> float:
+        """How early to start the grab. Kept under a third of the phase."""
+        raw = max(self._grab_s, 0.0) + 0.004
+        cap = self._phase_s / 3.0
+        if cap <= 0.0:
+            return raw
+        return min(raw, max(cap * 0.5, 0.002))
+
+    def _wait_phase(self) -> bool:
+        """Block until the grab window. True means the pump should exit."""
+        while not self._stop.is_set():
+            with self._sched:
+                if self._stop.is_set():
+                    return True
+                target = self._next_take_at
+                if target is None:
+                    if not self._primed:
+                        self._primed = True
+                        return False
+                    self._sched.wait(timeout=0.05)
+                    continue
+                delay = target - self._lead_s() - time.perf_counter()
+                if delay <= 0.0:
+                    if self._next_take_at == target:
+                        self._next_take_at = None
+                    return False
+                self._sched.wait(timeout=min(delay, 0.05))
+        return True
+
     def _run(self) -> None:
         while not self._stop.is_set():
+            if self._phase_s > 0.0:
+                if self._wait_phase():
+                    return
             t0 = time.perf_counter()
             bundle = None
             try:
                 bundle = self._produce()
             except Exception:
                 bundle = None
+            spent = time.perf_counter() - t0
+            self._grab_s = spent if self._grab_s <= 0.0 else (0.5 * self._grab_s + 0.5 * spent)
             if bundle is not None:
                 self.slot.put(bundle)
-            spent = time.perf_counter() - t0
+            if self._phase_s > 0.0:
+                continue
             pause = self._idle_s if spent < self._idle_s else 0.0
             if self._period_s > 0.0:
                 pause = max(pause, self._period_s - spent)

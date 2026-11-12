@@ -844,6 +844,118 @@ def check_stop_bar_anchors_to_visible_ribbon() -> None:
     print(f"stop-bar: mid x={mid:.3f} m width={width:.2f} m (ego half={half:.3f}) OK")
 
 
+def _ego_center_column(img: np.ndarray) -> float:
+    """Screen column through the rendered ego box, ignoring the HUD and the caption."""
+    road = np.array([15, 12, 10], dtype=np.int16)
+    view = img[24:-24]
+    diff = np.abs(view.astype(np.int16) - road).sum(axis=2)
+    ys, xs = np.where(diff > 25)
+    assert ys.size > 200, "ego box should paint on the chase view"
+    height = int(ys.max() - ys.min())
+    width = int(xs.max() - xs.min())
+    assert height < 220 and width < 260, (height, width, "mask should be the car, not the road")
+    return 0.5 * (float(xs.min()) + float(xs.max()))
+
+
+def _ribbon_row_mid(delta: np.ndarray, py: int, *, min_span: int, thresh: int = 12) -> float | None:
+    if py < 0 or py >= delta.shape[0]:
+        return None
+    # The tail fades, so the 30 m row is only a few counts above the road.
+    xs = np.flatnonzero(delta[py].sum(axis=1) > thresh)
+    if xs.size < 2:
+        return None
+    span = int(xs[-1] - xs[0])
+    if span < min_span:
+        return None
+    return 0.5 * (float(xs[0]) + float(xs[-1]))
+
+
+def check_chase_straight_path_on_ego_center() -> None:
+    """A straight detection (lane_x=0 at 8 m) stays on the ego box center column.
+
+    The chase lens sits on the ego centerline. Near and far ribbon points share
+    that column within 2 px. lane_x=+1 m paints to the right, lane_x=-1 m to
+    the left, by the same screen offset.
+    """
+    import cv2
+
+    from python.train.scene_ckpt_runtime import SceneCkptPred
+    from python.viz.stage import Cam, render_stage
+
+    cam = Cam()
+    assert abs(cam.eye[0]) < 1e-9, cam.eye
+    # Look target shares the lens x, so the basis has no yaw.
+    forward = cam._basis[1]
+    assert abs(float(forward[0])) < 1e-6, forward
+
+    def frame(lane_x: float):
+        st = _corridor_state([])
+        st["scene_ckpt"] = SceneCkptPred(
+            lane_gt=_lane_gt([lane_x, lane_x, lane_x, lane_x], 0.92),
+            lane_x=lane_x,
+            confidence=0.92,
+        ).as_state()
+        ui = _stage_ui()
+        ui.top_down = False
+        ui.debug.viz_pip = False
+        ui.debug.viz_lanes = False
+        return render_stage(st, ui=ui)
+
+    ui_blank = _stage_ui()
+    ui_blank.top_down = False
+    ui_blank.debug.viz_pip = False
+    ui_blank.debug.viz_lanes = False
+    ego = render_stage(_corridor_state([]), ui=ui_blank)
+    column = _ego_center_column(ego)
+    optical = ego.shape[1] * 0.5
+    assert abs(column - optical) <= 2.0, (
+        f"ego box column {column:.1f} is off the camera center {optical:.1f}"
+    )
+
+    straight = frame(0.0)
+    delta = cv2.absdiff(straight, ego)
+    # lane_x is the 8 m sample. 30 m is the far published center.
+    for y_m, label in ((8.0, "near"), (30.0, "far")):
+        u, py = cam.project(0.0, y_m, 0.03)
+        assert abs(u - column) <= 2.0, f"{label} point y={y_m} u={u} column={column:.1f}"
+        if label == "far":
+            mid = _ribbon_row_mid(delta, py, min_span=15, thresh=4)
+            assert mid is not None, f"far ribbon missing at row {py}"
+            assert abs(mid - column) <= 2.0, f"far ribbon mid {mid:.1f} column={column:.1f}"
+
+    _, py8 = cam.project(0.0, 8.0, 0.03)
+    _, py_far = cam.project(0.0, 30.0, 0.03)
+    near_mid = None
+    step = -1 if py_far < py8 else 1
+    for py in range(py8, py_far + step, step):
+        near_mid = _ribbon_row_mid(delta, py, min_span=15)
+        if near_mid is not None:
+            break
+    assert near_mid is not None, "straight ribbon should be visible ahead of the car"
+    assert abs(near_mid - column) <= 2.0, f"near ribbon mid {near_mid:.1f} column={column:.1f}"
+
+    def side_at(lane_x: float, y_m: float) -> tuple[float, float]:
+        painted = frame(lane_x)
+        d = cv2.absdiff(painted, ego)
+        u, py = cam.project(lane_x, y_m, 0.03)
+        mid = _ribbon_row_mid(d, py, min_span=15)
+        assert mid is not None, f"lane_x={lane_x} ribbon missing at y={y_m} row={py}"
+        return float(u), float(mid)
+
+    # 20 m is ahead of the box, so both offsets are fully painted.
+    u_r, mid_r = side_at(1.0, 20.0)
+    u_l, mid_l = side_at(-1.0, 20.0)
+    assert u_r > column + 2.0, (u_r, column)
+    assert u_l < column - 2.0, (u_l, column)
+    assert abs((u_r - column) - (column - u_l)) <= 2.0, (u_r, u_l, column)
+    assert mid_r > column + 2.0 and mid_l < column - 2.0, (mid_r, mid_l, column)
+    assert abs((mid_r - column) - (column - mid_l)) <= 2.0, (mid_r, mid_l, column)
+    print(
+        f"chase center: ego column {column:.1f}, "
+        f"+1 m u {u_r - column:.1f}px / -1 m u {column - u_l:.1f}px OK"
+    )
+
+
 def main() -> None:
     check_projection_monotonic()
     check_spline_through_knots()
@@ -855,6 +967,7 @@ def main() -> None:
     check_bench_reports_cpu_ms()
     check_no_dashed_ribbon_center()
     check_straight_ribbon_aligned_with_ego()
+    check_chase_straight_path_on_ego_center()
     check_ribbon_width_matches_ego()
     check_low_conf_dims_ribbon_no_text()
     check_scene_ribbon_is_sole_blue_band()

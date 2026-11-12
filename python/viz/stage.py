@@ -519,7 +519,9 @@ class Cam:
                 self.fade_frac = draw.fade_frac
         if not self.top_down:
             cam = np.array(self.eye, dtype=np.float64)
-            target = np.array([0.0, 16.0, -0.8], dtype=np.float64)
+            # Same x as the lens. A look target off that line yaws the basis,
+            # and a straight path then leans across the car.
+            target = np.array([float(cam[0]), 16.0, -0.8], dtype=np.float64)
             forward = target - cam
             forward = forward / (np.linalg.norm(forward) + 1e-9)
             world_up = np.array([0.0, 0.0, 1.0])
@@ -534,8 +536,9 @@ class Cam:
     def eye(self) -> tuple[float, float, float]:
         if self.top_down:
             return (0.0, -8.0, 40.0)
-        # Chase 3/4, just behind the ego. Draw range is longer; the lens stays here.
-        return (1.6, -16.5, 5.4)
+        # Centered behind the ego. A lateral offset leans a straight path
+        # off the car. Draw range is longer; the lens stays here.
+        return (0.0, -16.5, 5.4)
 
     def project(self, x: float, y: float, z: float = 0.0) -> tuple[int, int]:
         w, h = int(self.width), int(self.height)

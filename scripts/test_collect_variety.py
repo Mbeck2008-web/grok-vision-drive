@@ -641,7 +641,8 @@ def check_level_load_spawns_and_switches() -> None:
     spawn = choose_spawn("italy", roads)
     assert spawn is not None
     (x, y, z), rot = spawn
-    assert abs(x) < 1e-6 and 100.0 < y < 250.0 and z > 20.0
+    # 7 m two-lane road: the right-hand lane center is 1.75 m east of the centerline.
+    assert 1.5 < x < 2.0 and 100.0 < y < 250.0 and z > 20.0
     assert abs(rot[2] - math.sin(math.pi / 4.0)) < 1e-6
 
     missing, skipped = select_maps(("west_coast_usa", "italy", "utah"), {"italy", "jungle_rock_island"})
@@ -694,7 +695,8 @@ def check_level_load_spawns_and_switches() -> None:
         assert opened.vehicle is host.ego
         assert opened.roads and len(opened.cameras) == 8
         assert opened.spawn_source == "known"
-        assert abs(float(opened.spawn[0]) + 717.121) < 0.05
+        # 14 m road, no lane tags: four lanes, rightmost center 5.25 m east of x=-717.121.
+        assert abs(float(opened.spawn[0]) + 711.871) < 0.05
         assert host.scenario.starts == 1
         assert host.scenario.loaded and getattr(host.scenario.loaded[-1], "level", "") == "west_coast_usa"
         started_at = getattr(host.scenario.loaded[0], "pos", None)

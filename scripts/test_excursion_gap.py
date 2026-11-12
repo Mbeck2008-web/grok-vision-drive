@@ -344,6 +344,61 @@ def check_resets_keep_one_clock() -> None:
     assert lines[0] != lines[1]
 
 
+def check_gap_flag_keeps_the_clock_across_respawn() -> None:
+    """A gap flag set means a respawn keeps the same clock and its cruise time.
+
+    Forcing ``gap_persist = False`` builds a new clock here, so phase_t goes back
+    to 0. The call-line check above still requires ``persist=gap_persist``.
+    """
+    import scripts.collect_scene_lanes as collect
+    import python.collect.spawn_mix as spawn_mix
+    import test_collect_spawn_fix as harness
+    from python.collect.level_session import OpenedLevel
+
+    pools = harness._west_pools()
+    real = collect.place_excursion_clock
+    seen: list[tuple[int, str, float, bool, int, float]] = []
+
+    def wrapped(clock, *, persist, fresh):
+        before_id, before_phase, before_t = id(clock), clock.phase, float(clock.phase_t)
+        out = real(clock, persist=persist, fresh=fresh)
+        seen.append((before_id, before_phase, before_t, bool(persist), id(out), float(out.phase_t)))
+        return out
+
+    def enter(bng, level, cfg, cams):
+        del cfg, cams, level
+        return OpenedLevel(
+            vehicle=bng.vehicles.vehicle,
+            roads=[harness.RoadPoly("r", [(0.0, 0.0), (0.0, 80.0)], 7.0)],
+            spawn=(0.4, 12.0, 0.5),
+            cameras={"main": harness._Cam()},
+        )
+
+    previous = (collect.enter_map, collect.painted_for, spawn_mix.SpawnDeck.load, collect.place_excursion_clock)
+    collect.enter_map = enter  # type: ignore[assignment]
+    collect.painted_for = lambda level: harness._Paint(lambda x, y: True)  # type: ignore[assignment]
+    spawn_mix.SpawnDeck.load = classmethod(lambda cls, path, rng=None, **kw: cls(pools, rng, **kw))  # type: ignore[assignment]
+    collect.place_excursion_clock = wrapped  # type: ignore[assignment]
+    try:
+        code, text, _out = harness._run_collector(
+            {"speed_at": lambda n: 10.0, "stop_at": 80},
+            ["--maps", "west_coast_usa", "--no-vary-env", "--respawn-min", "0.05",
+             "--excursion-gap-min-s", "300", "--excursion-gap-max-s", "600"],
+        )
+    finally:
+        collect.enter_map, collect.painted_for, spawn_mix.SpawnDeck.load, collect.place_excursion_clock = previous  # type: ignore[assignment]
+    assert code == 0, text[-1500:]
+    # The first places are the fresh clock. A later respawn must keep the cruise already driven.
+    carried = [row for row in seen if row[2] > 1.0]
+    assert carried, [(row[1], row[2], row[3]) for row in seen]
+    for before_id, phase, before_t, persist, out_id, after_t in carried:
+        assert persist is True and out_id == before_id and phase == "cruise" and after_t == before_t, (
+            f"gap flag set but a reset rebuilt the clock "
+            f"(persist={persist} phase={phase} phase_t {before_t} -> {after_t})"
+        )
+    print(f"respawn kept the clock: {len(carried)} places with cruise already {carried[0][2]:.1f}s")
+
+
 def check_spawn_order_ignores_the_gap_rng() -> None:
     import scripts.collect_scene_lanes as collect
     import python.collect.spawn_mix as spawn_mix
@@ -423,6 +478,7 @@ def main() -> None:
     check_abort_and_respawn()
     check_rejects_a_bad_range()
     check_resets_keep_one_clock()
+    check_gap_flag_keeps_the_clock_across_respawn()
     check_spawn_order_ignores_the_gap_rng()
     check_start_log_names_the_gap()
     print("excursion gap ok")

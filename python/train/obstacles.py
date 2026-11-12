@@ -1,15 +1,16 @@
 """Training-only obstacle mask and clearance.
 
 Runtime and the visualizer do not import this module. Inside the drivable
-corridor a cell is blocked when its world Z is more than ``clear_eps_m``
-(0.15 m) above the road surface. The surface is centerline ``RoadPoly.z``
-plus a lateral slope: ``RoadPoly.cross_slope`` when the road has one,
-otherwise a plane fit through in-corridor points already within
-``clear_eps_m`` of the centerline. A point within
-``edge_band_m`` (0.5 m) outside that edge is blocked at ``curb_eps_m``
-(0.08 m). Those three numbers are written on every ``obstacles.jsonl`` row.
-The difference is in the world frame. Ego z, ego pitch, and a missing height
-are not a road surface.
+corridor a cell is blocked when its height above the cross-sloped road
+surface is past ``clear_eps_m`` (0.15 m) plus the depth-quantization pad.
+The slope is ``(edge_z - z_center) / signed half-width`` from ``RoadPoly``
+``left_z`` / ``right_z``. When that side has no edge height, a RANSAC fit
+of paved in-corridor points supplies it. If neither exists the point stays
+unknown. The pad band between ``threshold - pad`` and ``threshold + pad``
+is unknown, never drivable. A point within ``edge_band_m`` (0.5 m) outside
+the corridor uses the same rule at ``curb_eps_m`` (0.08 m). Those three
+numbers are written on every ``obstacles.jsonl`` row. The difference is in
+the world frame. Ego z, ego pitch, and a missing height are not a road surface.
 
 The corridor half-width is half the painted lane width about the painted
 center. When that lane is missing it is ``road_width_m / 2`` about
@@ -37,6 +38,9 @@ OBSTACLE_Z_EPS_M = CLEAR_EPS_M
 # Outside the corridor, within EDGE_BAND_M of the edge: a curb, not a lip.
 CURB_EPS_M = 0.08
 EDGE_BAND_M = 0.5
+# Fallback slope fit. A curb face (0.08 m) cannot be an inlier.
+FIT_RESIDUAL_M = 0.05
+FIT_MIN_INLIERS = 20
 GRID_H = 64
 GRID_W = 64
 X_MIN = -16.0
@@ -226,29 +230,44 @@ def _world_of(
     return wx, wy, wz
 
 
-def interpolated_road_z(road: Any, world_x: np.ndarray, world_y: np.ndarray) -> np.ndarray | None:
-    """World Z of ``road`` at each query, interpolated along the centerline.
+def _side_height(values: Any, index: int) -> float | None:
+    if not isinstance(values, (list, tuple)) or index >= len(values):
+        return None
+    return _finite(values[index])
 
-    ``RoadPoly.z`` is already world Z. A query farther than half the road
-    width plus 2 m from that centerline is NaN. None when the road has no heights.
+
+def road_profile_z(
+    road: Any, world_x: np.ndarray, world_y: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Center, left-edge, and right-edge Z at each query, along the centerline.
+
+    A query farther than half the road width plus 2 m is NaN. None when the
+    road has no centerline heights. A side is NaN where that edge has no height.
     """
     if road is None or getattr(road, "z", None) is None:
         return None
     xs: list[float] = []
     ys: list[float] = []
     zs: list[float] = []
-    for (x, y), z in zip(road.xy, road.z):
-        if z is None or not math.isfinite(float(z)):
+    lzs: list[float | None] = []
+    rzs: list[float | None] = []
+    for index, ((x, y), z) in enumerate(zip(road.xy, road.z)):
+        height = _finite(z)
+        if height is None:
             continue
         xs.append(float(x))
         ys.append(float(y))
-        zs.append(float(z))
+        zs.append(height)
+        lzs.append(_side_height(getattr(road, "left_z", None), index))
+        rzs.append(_side_height(getattr(road, "right_z", None), index))
     if len(xs) < 2:
         return None
     wx = np.asarray(world_x, dtype=np.float64)
     wy = np.asarray(world_y, dtype=np.float64)
     best_d = np.full(wx.shape, np.inf, dtype=np.float64)
     best_z = np.full(wx.shape, np.nan, dtype=np.float64)
+    best_l = np.full(wx.shape, np.nan, dtype=np.float64)
+    best_r = np.full(wx.shape, np.nan, dtype=np.float64)
     for index in range(len(xs) - 1):
         ax, ay, az = xs[index], ys[index], zs[index]
         bx, by, bz = xs[index + 1], ys[index + 1], zs[index + 1]
@@ -258,12 +277,38 @@ def interpolated_road_z(road: Any, world_x: np.ndarray, world_y: np.ndarray) -> 
             continue
         t = np.clip(((wx - ax) * vx + (wy - ay) * vy) / length2, 0.0, 1.0)
         dist = np.hypot(wx - (ax + t * vx), wy - (ay + t * vy))
-        height = az + t * (bz - az)
         better = dist < best_d
         best_d = np.where(better, dist, best_d)
-        best_z = np.where(better, height, best_z)
+        best_z = np.where(better, az + t * (bz - az), best_z)
+        lz0, lz1 = lzs[index], lzs[index + 1]
+        rz0, rz1 = rzs[index], rzs[index + 1]
+        if lz0 is not None and lz1 is not None:
+            best_l = np.where(better, lz0 + t * (lz1 - lz0), best_l)
+        else:
+            best_l = np.where(better, np.nan, best_l)
+        if rz0 is not None and rz1 is not None:
+            best_r = np.where(better, rz0 + t * (rz1 - rz0), best_r)
+        else:
+            best_r = np.where(better, np.nan, best_r)
     limit = max(float(getattr(road, "width_m", 0.0) or 0.0) * 0.5 + 2.0, 4.0)
-    return np.where(best_d <= limit, best_z, np.nan)
+    near = best_d <= limit
+    return (
+        np.where(near, best_z, np.nan),
+        np.where(near, best_l, np.nan),
+        np.where(near, best_r, np.nan),
+    )
+
+
+def interpolated_road_z(road: Any, world_x: np.ndarray, world_y: np.ndarray) -> np.ndarray | None:
+    """World Z of ``road`` at each query, interpolated along the centerline.
+
+    ``RoadPoly.z`` is already world Z. A query farther than half the road
+    width plus 2 m from that centerline is NaN. None when the road has no heights.
+    """
+    profile = road_profile_z(road, world_x, world_y)
+    if profile is None:
+        return None
+    return profile[0]
 
 
 def _painted_samples(lane_gt: Any, lane_valid: Any) -> list[tuple[float, float, float]]:
@@ -320,51 +365,96 @@ def corridor_center_half(
     return center, np.full(y.shape, half)
 
 
-def _cross_slope(road: Any) -> float | None:
-    """Metres of rise per metre of ego-right lateral offset, or None.
+def _paved_mask(sem: np.ndarray | None, sem_classes: Mapping[str, Any] | None, shape: tuple[int, ...]) -> np.ndarray:
+    """True where the semantic id is a paved allowlist name."""
+    mask = np.zeros(shape, dtype=bool)
+    if sem is None:
+        return mask
+    ids = np.asarray(sem)
+    if ids.shape != shape:
+        return mask
+    for cid, name in _class_names(sem_classes).items():
+        if name in DRIVABLE_CLASS_ALLOWLIST:
+            mask |= ids == cid
+    return mask
 
-    ``RoadPoly`` has no cross-slope field. A recording that measured one may
-    set ``cross_slope`` on the road object. Positive raises the ego-right side.
+
+def _ransac_slope(lateral: np.ndarray, height: np.ndarray) -> float | None:
+    """Slope through the centerline, or None when fewer than 20 inliers agree.
+
+    One hypothesis per sample (``height / lateral``) plus a flat road.
+    Inliers sit within ``FIT_RESIDUAL_M`` (0.05 m), under a curb face.
     """
-    if road is None:
+    side = np.asarray(lateral, dtype=np.float64).reshape(-1)
+    values = np.asarray(height, dtype=np.float64).reshape(-1)
+    if int(side.size) < FIT_MIN_INLIERS:
         return None
-    return _finite(getattr(road, "cross_slope", None))
+    hypotheses = [0.0]
+    usable = np.abs(side) >= 0.25
+    if bool(usable.any()):
+        hypotheses.extend((values[usable] / side[usable]).tolist())
+    best_count = 0
+    best: np.ndarray | None = None
+    for slope in hypotheses:
+        if not math.isfinite(float(slope)):
+            continue
+        inl = np.abs(values - float(slope) * side) <= FIT_RESIDUAL_M
+        count = int(inl.sum())
+        if count > best_count:
+            best_count = count
+            best = inl
+    if best is None or best_count < FIT_MIN_INLIERS:
+        return None
+    samples = side[best]
+    denom = float(np.dot(samples, samples))
+    if denom < 1e-6:
+        return 0.0
+    return float(np.dot(samples, values[best]) / denom)
 
 
-def _lateral_rise(
+def _fit_side_slopes(
     lateral: np.ndarray,
     rough: np.ndarray,
     inside: np.ndarray,
+    in_band: np.ndarray,
     valid: np.ndarray,
-    road: Any,
-) -> np.ndarray:
-    """Height of the road surface above centerline Z, in metres.
+    sem: np.ndarray | None,
+    sem_classes: Mapping[str, Any] | None,
+) -> tuple[float | None, float | None]:
+    """Per-side fallback slope from paved in-corridor points.
 
-    ``cross_slope`` wins when the road has one. Otherwise each side is a
-    plane through the centerline, fit to in-corridor points already within
-    ``CLEAR_EPS_M`` of that centerline (a crown is two slopes, a bank is one).
+    The 0.5 m edge band and obstacle candidates (``|height| > 0.15`` m above
+    the centerline) are not seeds. A side with fewer than 20 inliers has no slope.
     """
-    side = np.asarray(lateral, dtype=np.float64)
-    height = np.asarray(rough, dtype=np.float64)
-    slope = _cross_slope(road)
-    if slope is not None:
-        return float(slope) * side
-    rise = np.zeros(side.shape, dtype=np.float64)
-    finite = np.asarray(valid, dtype=bool) & np.isfinite(height) & np.isfinite(side)
-    seed = finite & np.asarray(inside, dtype=bool) & (np.abs(height) <= CLEAR_EPS_M)
-    for sign in (1.0, -1.0):
-        sel = seed & (side * sign >= 0.25)
-        if int(sel.sum()) < 3:
-            continue
-        samples = side[sel]
-        if float(np.max(np.abs(samples))) < 1.0:
-            continue
-        denom = float(np.dot(samples, samples))
-        if denom < 1e-6:
-            continue
-        gain = float(np.dot(samples, height[sel]) / denom)
-        rise = np.where(side * sign >= 0.0, gain * side, rise)
-    return rise
+    finite = np.asarray(valid, dtype=bool) & np.isfinite(rough) & np.isfinite(lateral)
+    paved = _paved_mask(sem, sem_classes, np.shape(rough))
+    # In the corridor, not in the edge band, and not an obstacle candidate.
+    seed = finite & paved & np.asarray(inside, dtype=bool) & ~np.asarray(in_band, dtype=bool)
+    seed = seed & (np.abs(rough) <= 0.15)
+    left = right = None
+    for sign, slot in ((1.0, "right"), (-1.0, "left")):
+        sel = seed & (lateral * sign >= 0.25)
+        slope = _ransac_slope(lateral[sel], rough[sel]) if int(sel.sum()) else None
+        if slot == "right":
+            right = slope
+        else:
+            left = slope
+    return left, right
+
+
+def _edge_slopes(
+    z_center: np.ndarray, z_left: np.ndarray, z_right: np.ndarray, half_width: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """``(edge_z - z_center) / signed half-width``. Right is the positive side."""
+    left = np.full(np.shape(z_center), np.nan, dtype=np.float64)
+    right = np.full(np.shape(z_center), np.nan, dtype=np.float64)
+    if half_width <= 1e-6:
+        return left, right
+    ok_l = np.isfinite(z_left) & np.isfinite(z_center)
+    ok_r = np.isfinite(z_right) & np.isfinite(z_center)
+    left = np.where(ok_l, (z_left - z_center) / (-half_width), left)
+    right = np.where(ok_r, (z_right - z_center) / half_width, right)
+    return left, right
 
 
 def _quant_z_pad(pose: Any, depth_m: np.ndarray) -> np.ndarray:
@@ -569,25 +659,44 @@ def label_obstacle_frame(
         if pos is None or axes is None:
             return record
         world_x, world_y, world_z = _world_of(ego_x, ego_y, ego_z, pos, axes)
-        road_z = interpolated_road_z(road, world_x, world_y)
+        profile = road_profile_z(road, world_x, world_y)
         corridor = corridor_center_half(
             ego_y, lane_gt, lane_gt_valid, road_width_m, road_offset_m, road_heading_err_rad
         )
-        if road_z is None or corridor is None:
+        if profile is None or corridor is None:
             return record
+        road_z, z_left, z_right = profile
         center, half = corridor
         lateral = ego_x - center
         inside = np.abs(lateral) <= (half + 1e-6)
         in_band = (np.abs(lateral) > (half + 1e-6)) & (np.abs(lateral) <= (half + EDGE_BAND_M + 1e-6))
         rough = world_z - road_z
-        height = rough - _lateral_rise(lateral, rough, inside, valid & np.isfinite(rough), road)
-        tol = CLEAR_EPS_M + _quant_z_pad(pose, np.asarray(depth, dtype=np.float64) / 100.0)
-        known = valid & inside & np.isfinite(height)
+        half_width = float(getattr(road, "width_m", 0.0) or 0.0) * 0.5
+        edge_left, edge_right = _edge_slopes(road_z, z_left, z_right, half_width)
+        fit_left, fit_right = _fit_side_slopes(
+            lateral, rough, inside, in_band, valid & np.isfinite(rough), sem, sem_classes
+        )
+        slope = np.full(lateral.shape, np.nan, dtype=np.float64)
+        if fit_right is not None:
+            slope = np.where(lateral >= 0.0, fit_right, slope)
+        if fit_left is not None:
+            slope = np.where(lateral < 0.0, fit_left, slope)
+        slope = np.where((lateral >= 0.0) & np.isfinite(edge_right), edge_right, slope)
+        slope = np.where((lateral < 0.0) & np.isfinite(edge_left), edge_left, slope)
+        have = valid & np.isfinite(rough) & np.isfinite(slope)
+        height = np.where(have, rough - slope * lateral, np.nan)
+        pad = _quant_z_pad(pose, np.asarray(depth, dtype=np.float64) / 100.0)
+        clear_hi = CLEAR_EPS_M + pad
+        clear_lo = CLEAR_EPS_M - pad
+        curb_hi = CURB_EPS_M + pad
+        curb_lo = CURB_EPS_M - pad
         classes = np.zeros(depth.shape, np.uint8)
-        classes[known & (height > tol)] = BLOCKED
-        classes[known & (height <= tol) & (height >= -tol)] = DRIVABLE
-        band = valid & in_band & np.isfinite(height)
-        classes[band & (height >= CURB_EPS_M)] = BLOCKED
+        corridor_pts = have & inside
+        classes[corridor_pts & (height > clear_hi)] = BLOCKED
+        classes[corridor_pts & (height <= clear_lo) & (height >= -clear_lo)] = DRIVABLE
+        band = have & in_band
+        classes[band & (height >= curb_hi)] = BLOCKED
+        classes[band & (height <= curb_lo) & (height >= -curb_lo)] = DRIVABLE
         blocked = classes == BLOCKED
     grid = _bin(ego_x, ego_y, classes, valid)
     clear_m, clear_ok = _clearance(ego_x, ego_y, blocked, lane_gt, lane_gt_valid)

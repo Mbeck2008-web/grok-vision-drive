@@ -72,14 +72,25 @@ def _paint(width=3.5, offset=0.0, heading=0.0):
     )
 
 
-def _road(z_at, width=8.0):
+def _road(z_at, width=8.0, *, edges=True):
     ys = list(range(-20, 81, 5))
+    z = [float(z_at(float(y))) for y in ys]
     return RoadPoly(
         road_id="synth",
         xy=[(0.0, float(y)) for y in ys],
         width_m=float(width),
-        z=[float(z_at(float(y))) for y in ys],
+        z=z,
+        left_z=list(z) if edges else None,
+        right_z=list(z) if edges else None,
     )
+
+
+def _with_slopes(road, left_slope: float, right_slope: float):
+    """Edge heights for per-side slopes. Positive slope raises the ego-right side."""
+    half = float(road.width_m) * 0.5
+    road.left_z = [None if z is None else float(z) + float(left_slope) * (-half) for z in road.z]
+    road.right_z = [None if z is None else float(z) + float(right_slope) * half for z in road.z]
+    return road
 
 
 def _splat(depth, ego_xyz):
@@ -554,14 +565,12 @@ def _surface_points(xs, ys, z_at) -> list[tuple[float, float, float]]:
     return points
 
 
-def _geom_road(points, road_width: float, *, cross_slope: float | None = None):
+def _geom_road(points, road_width: float, *, left_slope: float = 0.0, right_slope: float = 0.0):
     right, forward, up = _flat_axes()
     depth = _blank(POSE.height, POSE.width)
     for point in points:
         _splat(depth, point)
-    road = _road(lambda _y: 0.0, width=road_width)
-    if cross_slope is not None:
-        road.cross_slope = float(cross_slope)
+    road = _with_slopes(_road(lambda _y: 0.0, width=road_width), left_slope, right_slope)
     return _label(
         depth,
         lane=(None, None),
@@ -604,30 +613,32 @@ def check_bump_survives_depth_quantization() -> None:
     far, far_row = kind((0.0, 30.0, 0.10))
     quant, _qrow = kind((0.0, 27.4, 0.12))
     real, _rrow = kind((0.0, 27.4, 0.40))
+    tall16, _trow = kind((0.0, 30.0, 0.16))
     assert near == DRIVABLE, near
     assert far != BLOCKED, far
     assert quant != BLOCKED, (quant, bump_z)
+    assert quant != DRIVABLE, (quant, bump_z)
+    assert tall16 != DRIVABLE, tall16
     assert real == BLOCKED, real
     _assert_row_fields(far_row)
-    print("  0.10 m bump is not blocked at 8 m or 30 m; depth error does not flip 0.12 m")
+    print("  0.10 m bump is not blocked at 8 m or 30 m; 0.16 m at 30 m is never drivable")
 
 
 def check_crown_and_bank_not_blocked() -> None:
-    """A lateral slope is the road, including corridors wider than 5 m.
+    """A lateral slope from left_z/right_z is the road, including wide corridors.
 
-    Centerline Z marks the high side blocked. The surface is the cross-slope
-    when RoadPoly has one, otherwise a plane fit from the low side of the crown.
+    Centerline Z alone marks the high side blocked. Edge heights supply the slope.
     """
     from python.train.obstacles import BLOCKED, DRIVABLE
 
-    def assert_surface(points, road_width: float, *, cross_slope: float | None = None) -> None:
-        got = _geom_road(points, road_width, cross_slope=cross_slope)
+    def assert_surface(points, road_width: float, *, left_slope: float, right_slope: float) -> None:
+        got = _geom_road(points, road_width, left_slope=left_slope, right_slope=right_slope)
         _assert_row_fields(got)
         mask = np.asarray(got["mask"], dtype=np.int64)
         assert int((mask == BLOCKED).sum()) == 0, int((mask == BLOCKED).sum())
         for x, y, _z in points:
             kind = _at(got, x, y)[0]
-            assert kind == DRIVABLE, (x, y, kind, cross_slope)
+            assert kind != BLOCKED, (x, y, kind, left_slope, right_slope)
 
     bank_w = 8.0
     bank = _surface_points(
@@ -636,7 +647,7 @@ def check_crown_and_bank_not_blocked() -> None:
         lambda x: 0.06 * x,
     )
     assert len(bank) >= 8 and max(abs(p[0]) for p in bank) > 2.5
-    assert_surface(bank, bank_w)
+    assert_surface(bank, bank_w, left_slope=0.06, right_slope=0.06)
 
     crown_w = 16.0
     crown = _surface_points(
@@ -645,7 +656,7 @@ def check_crown_and_bank_not_blocked() -> None:
         lambda x: -0.02 * abs(x),
     )
     assert len(crown) >= 8 and max(abs(p[0]) for p in crown) > 2.5
-    assert_surface(crown, crown_w)
+    assert_surface(crown, crown_w, left_slope=0.02, right_slope=-0.02)
 
     # 2% cross-slope across a corridor wider than 5 m. The high side is
     # above 0.15 m of centerline Z and still the road.
@@ -656,12 +667,27 @@ def check_crown_and_bank_not_blocked() -> None:
         lambda x: 0.02 * x,
     )
     assert len(slope) >= 8 and max(p[0] for p in slope) > 7.5
-    assert_surface(slope, slope_w)
+    assert_surface(slope, slope_w, left_slope=0.02, right_slope=0.02)
 
-    # No in-corridor seeds: the attribute is the only slope.
-    edge = _surface_points((3.5, 4.0), (12.0, 16.0), lambda x: 0.06 * x)
-    assert edge, edge
-    assert_surface(edge, bank_w, cross_slope=0.06)
+    # One high edge point, no edge z and no 20-inlier fit: unknown, not blocked.
+    from python.train.obstacles import UNKNOWN
+
+    lone = _surface_points((3.5,), (12.0,), lambda x: 0.06 * x)
+    assert lone
+    depth = _blank(POSE.height, POSE.width)
+    _splat(depth, lone[0])
+    bare = _label(
+        depth,
+        lane=(None, None),
+        road=_road(lambda _y: 0.0, width=bank_w, edges=False),
+        pos=(0.0, 0.0, 0.0),
+        forward=(0.0, 1.0, 0.0),
+        up=(0.0, 0.0, 1.0),
+        road_width_m=bank_w,
+        road_offset_m=0.0,
+        road_heading_err_rad=0.0,
+    )
+    assert _at(bare, lone[0][0], lone[0][1])[0] == UNKNOWN, lone
     print("  2% crown and 6% bank: 0 in-corridor blocks on a wide corridor")
 
 
@@ -718,6 +744,107 @@ def check_heading_matches_pack_road_edge() -> None:
     print("  nonzero heading matches pack_road_edge; a sin sign flip misses the corridor")
 
 
+def check_edge_heights_are_kept() -> None:
+    """left_z and right_z survive parsing, the loader, and a dump.
+
+    Centerline z may still be the edge mean when the middle has no height.
+    The edge values themselves are not replaced by that mean. A record with
+    no edge height leaves the fields None.
+    """
+    from python.collect.road_dump import load_road_dump, write_road_dump
+    from python.collect.road_loader import polys_from_network
+    from python.debug.gt_geom import parse_road_edges
+
+    kept = [
+        {"middle": [0.0, 4.0 * k, 6.0], "left": [-1.75, 4.0 * k, 5.0], "right": [1.75, 4.0 * k, 7.0]}
+        for k in range(4)
+    ]
+    poly = parse_road_edges("kept", kept)
+    assert poly is not None
+    assert poly.z == [6.0, 6.0, 6.0, 6.0]
+    assert poly.left_z == [5.0, 5.0, 5.0, 5.0]
+    assert poly.right_z == [7.0, 7.0, 7.0, 7.0]
+    bare = [
+        {"middle": [0.0, 4.0 * k], "left": [-1.75, 4.0 * k, 5.0], "right": [1.75, 4.0 * k, 7.0]}
+        for k in range(3)
+    ]
+    got = parse_road_edges("bare", bare)
+    assert got is not None and got.z == [6.0, 6.0, 6.0]
+    assert got.left_z == [5.0, 5.0, 5.0] and got.right_z == [7.0, 7.0, 7.0]
+    loaded = polys_from_network({"bare": {"edges": bare}})
+    assert loaded and loaded[0].left_z == [5.0, 5.0, 5.0] and loaded[0].right_z == [7.0, 7.0, 7.0]
+    missing_edges = [
+        {"middle": [0.0, 0.0, 1.0], "left": [-1.0, 0.0], "right": [1.0, 0.0]},
+        {"middle": [0.0, 10.0, 1.0], "left": [-1.0, 10.0], "right": [1.0, 10.0]},
+    ]
+    missing = parse_road_edges("old", missing_edges)
+    assert missing is not None and missing.left_z is None and missing.right_z is None
+    plain = RoadPoly("old-ctor", [(0.0, 0.0), (0.0, 10.0)], 7.0)
+    assert plain.left_z is None and plain.right_z is None
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "map.json.gz"
+        write_road_dump(
+            path,
+            level="synth",
+            spawn=None,
+            spawn_source="",
+            road_network={"bare": {"edges": bare}},
+        )
+        polys, _payload = load_road_dump(path)
+    assert polys and polys[0].left_z == [5.0, 5.0, 5.0] and polys[0].right_z == [7.0, 7.0, 7.0]
+    print("  left_z/right_z survive parse, loader, and dump; missing edges stay None")
+
+
+def check_depth_fit_keeps_curb_blocked() -> None:
+    """A 0.10 m curb stays blocked while that side's depth fit is enabled.
+
+    In-corridor points at 0.12 m pass ``|height| <= 0.15`` and are not inliers
+    (residual 0.12 m > 0.05 m). Taller in-corridor points are excluded by that
+    gate. Dropping the gate lets them outvote the road, and the curb is no
+    longer blocked.
+    """
+    from python.train.obstacles import BLOCKED
+
+    classes = {
+        "kind": "gvd_sem_classes",
+        "train_only": True,
+        "classes": {"0": "unknown", "1": "ROAD"},
+    }
+    half = 3.5 / 2.0
+    # y=11.6 recovers a 0.10 m face above curb_eps + pad. Road samples sit a
+    # hair under the centerline so quantization does not tilt the fit upward.
+    curb = (half + 0.3, 11.6, 0.10)
+    depth = _blank(POSE.height, POSE.width)
+    sem = np.zeros(depth.shape, np.uint8)
+
+    def paint(point) -> None:
+        sem[_splat(depth, point)] = 1
+
+    for y in (8.0, 8.5, 9.0, 9.5, 10.0, 10.5, 11.0, 11.5, 12.0):
+        for x in (0.6, 0.9, 1.2, 1.5):
+            paint((x, y, -0.02))
+    for y in (9.0, 10.0, 11.0):
+        paint((0.9, y, 0.12))
+    # More tall points than road samples, all on one slope. They are paved and
+    # in the corridor, and above 0.15 m, so only the seed gate keeps them out.
+    for y in (8.2, 8.6, 9.2, 9.6, 10.2, 10.6, 11.2, 11.8, 12.2, 12.6, 13.0, 13.4):
+        for x in (0.55, 0.85, 1.15, 1.45):
+            paint((x, y, 0.55 * x))
+    paint(curb)
+    got = _label(
+        depth,
+        lane=_paint(3.5),
+        road=_road(lambda _y: 0.0, edges=False),
+        pos=(0.0, 0.0, 0.0),
+        forward=(0.0, 1.0, 0.0),
+        up=(0.0, 0.0, 1.0),
+        sem=sem,
+        sem_classes=classes,
+    )
+    assert _at(got, curb[0], curb[1])[0] == BLOCKED, (curb, int((np.asarray(got["mask"]) == BLOCKED).sum()))
+    print("  depth fit on: 0.10 m curb stays blocked; 0.12 m seeds do not eat it")
+
+
 def check_edge_band_and_row_fields() -> None:
     """0.10 m just outside the edge is blocked. 0.05 m there is not.
 
@@ -729,7 +856,8 @@ def check_edge_band_and_row_fields() -> None:
     pos = (0.0, 0.0, 0.0)
     half = 3.5 / 2.0
     x = half + 0.3
-    y = 12.0
+    # y=10 is where a recovered 0.10 m face clears curb_eps + the depth pad.
+    y = 10.0
     assert x < half + 0.5
 
     def one(z: float):
@@ -744,8 +872,9 @@ def check_edge_band_and_row_fields() -> None:
     assert _at(curb, curb_e[0], curb_e[1])[0] == BLOCKED, curb_e
     assert _at(lip, lip_e[0], lip_e[1])[0] != BLOCKED, lip_e
     # The same 0.10 m inside the corridor is the road, not a curb.
+    # y=8 keeps the recovered height under clear_eps - pad.
     inside = _blank(POSE.height, POSE.width)
-    in_ego = _to_ego((0.0, y, 0.10), pos, right, forward, up)
+    in_ego = _to_ego((0.0, 8.0, 0.10), pos, right, forward, up)
     _splat(inside, in_ego)
     inner = _label(inside, lane=_paint(3.5), road=_road(lambda _y: 0.0), pos=pos, forward=forward, up=up)
     assert _at(inner, in_ego[0], in_ego[1])[0] == DRIVABLE, in_ego
@@ -921,6 +1050,8 @@ def main() -> None:
     check_pitched_and_raised_ego_uses_world_z()
     check_epsilon_is_world_clearance()
     check_corridor_matches_paint_then_pack_road_edge()
+    check_edge_heights_are_kept()
+    check_depth_fit_keeps_curb_blocked()
     check_edge_band_and_row_fields()
     check_crown_and_bank_not_blocked()
     check_bump_survives_depth_quantization()

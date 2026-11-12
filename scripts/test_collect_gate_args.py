@@ -208,6 +208,7 @@ def check_heights() -> list[str]:
                 for k in range(3)]
     got = parse_road_edges("c", mid_only)
     assert got is not None and got.z == [6.0, 6.0, 6.0], got.z
+    assert got.left_z == [5.0, 5.0, 5.0] and got.right_z == [7.0, 7.0, 7.0], (got.left_z, got.right_z)
     none = parse_road_edges("d", [_edge(0.0, 4.0 * k, None, with_edges_z=False) for k in range(3)])
     assert none is not None and none.z is None
     out.append("heights: one record without z costs one point ([10, 11, None, 13, 14]); "

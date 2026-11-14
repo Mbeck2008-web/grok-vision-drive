@@ -36,7 +36,6 @@ import json
 import math
 import re
 import sys
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -44,18 +43,23 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from python.debug.gt_geom import parse_road_edges  # noqa: E402
+from python.collect.junction_map import (  # noqa: E402,F401 - the graph code lives there
+    LEAD_M,
+    MERGE_M,
+    Edge,
+    Graph,
+    _drivable,
+    _point_along,
+    graph_from_fixture,
+    graph_from_network,
+    leave_angle,
+    wrap,
+)
 
 THROUGH_DEG = 20.0  # |heading change| below this is "through"
 NEAR_M = 20.0  # a pose this close to a junction node is inside the junction
-LEAD_M = 25.0  # how far along a road its direction at a node is measured
-MERGE_M = 4.0  # road ends this close together are one node
 JUMP_M = 30.0  # a pose step longer than this is a respawn, not driving
 CLASSES = ("left", "through", "right")
-
-
-def wrap(rad: float) -> float:
-    return (rad + math.pi) % (2.0 * math.pi) - math.pi
 
 
 def classify(delta_rad: float) -> str:
@@ -64,148 +68,6 @@ def classify(delta_rad: float) -> str:
     if abs(deg) < THROUGH_DEG:
         return "through"
     return "left" if deg > 0.0 else "right"
-
-
-@dataclass
-class Edge:
-    a: str
-    b: str
-    xy: list[tuple[float, float]]
-    oneway: bool = False
-    name: str = ""
-
-    @property
-    def length(self) -> float:
-        return sum(math.hypot(q[0] - p[0], q[1] - p[1]) for p, q in zip(self.xy, self.xy[1:]))
-
-
-@dataclass
-class Graph:
-    nodes: dict[str, tuple[float, float]] = field(default_factory=dict)
-    edges: list[Edge] = field(default_factory=list)
-
-    def incident(self, node: str) -> list[Edge]:
-        return [e for e in self.edges if e.a == node or e.b == node]
-
-    def junctions(self) -> list[str]:
-        return [n for n in self.nodes if len(self.incident(n)) >= 3]
-
-
-def _point_along(xy: list[tuple[float, float]], dist: float) -> tuple[float, float]:
-    left = dist
-    for p, q in zip(xy, xy[1:]):
-        seg = math.hypot(q[0] - p[0], q[1] - p[1])
-        if seg >= left and seg > 0.0:
-            f = left / seg
-            return (p[0] + (q[0] - p[0]) * f, p[1] + (q[1] - p[1]) * f)
-        left -= seg
-    return xy[-1]
-
-
-def leave_angle(edge: Edge, node: str) -> float:
-    """Direction a car leaving ``node`` along ``edge`` drives in."""
-    xy = edge.xy if edge.a == node else list(reversed(edge.xy))
-    far = _point_along(xy, min(LEAD_M, edge.length))
-    return math.atan2(far[1] - xy[0][1], far[0] - xy[0][0])
-
-
-# ---------------------------------------------------------------- loading
-
-
-def graph_from_fixture(data: dict[str, Any], level: str | None = None) -> Graph:
-    """The hand-built ``junctions_synthetic.json`` format."""
-    levels = data.get("levels") or {}
-    if level is None:
-        level = next(iter(levels))
-    lvl = levels[level]
-    graph = Graph({k: (float(v[0]), float(v[1])) for k, v in lvl["nodes"].items()})
-    for e in lvl["edges"]:
-        graph.edges.append(
-            Edge(e["a"], e["b"], [graph.nodes[e["a"]], graph.nodes[e["b"]]], bool(e.get("oneway")), f"{e['a']}-{e['b']}")
-        )
-    return graph
-
-
-def _drivable(road: Any) -> bool:
-    if not isinstance(road, dict):
-        return True
-    try:
-        return float(road.get("drivability", road.get("drivable", 1))) > 0.0
-    except (TypeError, ValueError):
-        return True
-
-
-def graph_from_network(spec: Any) -> Graph:
-    """A node/edge graph from a raw road network (an offline road dump).
-
-    Road ends within ``MERGE_M`` share a node. A road end that lands on the
-    middle of another road splits that road there, so a side street that
-    ends on a through road makes a T.
-    """
-    if isinstance(spec, dict) and isinstance(spec.get("roads"), dict):
-        spec = spec["roads"]
-    lines: list[tuple[str, list[tuple[float, float]], bool]] = []
-    for road_id, road in (spec or {}).items() if isinstance(spec, dict) else []:
-        if not _drivable(road):
-            continue
-        edges = road.get("edges") or road.get("nodes") if isinstance(road, dict) else road
-        poly = parse_road_edges(str(road_id), edges)
-        if poly is None or len(poly.xy) < 2:
-            continue
-        oneway = bool(isinstance(road, dict) and (road.get("oneWay") or road.get("oneway")))
-        lines.append((str(road_id), [(float(x), float(y)) for x, y in poly.xy], oneway))
-    graph = Graph()
-
-    def node_for(p: tuple[float, float]) -> str:
-        for name, q in graph.nodes.items():
-            if math.hypot(p[0] - q[0], p[1] - q[1]) <= MERGE_M:
-                return name
-        name = f"n{len(graph.nodes)}"
-        graph.nodes[name] = p
-        return name
-
-    ends = [p for _rid, xy, _ow in lines for p in (xy[0], xy[-1])]
-    for p in ends:
-        node_for(p)
-    for rid, xy, oneway in lines:
-        # Split points: other roads' ends that sit on this road's interior.
-        cuts: list[tuple[float, tuple[float, float]]] = []
-        run = 0.0
-        for p, q in zip(xy, xy[1:]):
-            dx, dy = q[0] - p[0], q[1] - p[1]
-            seg2 = dx * dx + dy * dy
-            if seg2 <= 1e-9:
-                continue
-            for e in ends:
-                t = max(0.0, min(1.0, ((e[0] - p[0]) * dx + (e[1] - p[1]) * dy) / seg2))
-                c = (p[0] + dx * t, p[1] + dy * t)
-                if math.hypot(e[0] - c[0], e[1] - c[1]) <= MERGE_M:
-                    cuts.append((run + math.sqrt(seg2) * t, c))
-            run += math.sqrt(seg2)
-        total = run
-        cuts = sorted(c for c in cuts if MERGE_M < c[0] < total - MERGE_M)
-        pieces: list[list[tuple[float, float]]] = []
-        cur = [xy[0]]
-        run = 0.0
-        ci = 0
-        for p, q in zip(xy, xy[1:]):
-            seg = math.hypot(q[0] - p[0], q[1] - p[1])
-            while ci < len(cuts) and cuts[ci][0] <= run + seg:
-                cur.append(cuts[ci][1])
-                pieces.append(cur)
-                cur = [cuts[ci][1]]
-                ci += 1
-            cur.append(q)
-            run += seg
-        pieces.append(cur)
-        for i, piece in enumerate(pieces):
-            if len(piece) < 2:
-                continue
-            a, b = node_for(piece[0]), node_for(piece[-1])
-            if a == b:
-                continue
-            graph.edges.append(Edge(a, b, piece, oneway, rid if len(pieces) == 1 else f"{rid}#{i}"))
-    return graph
 
 
 def load_graph(path: Path, level: str | None = None) -> Graph:

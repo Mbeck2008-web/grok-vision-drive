@@ -6,6 +6,7 @@ time itself:
 
 ``poll_s``    BeamNG camera poll (shared-memory reads)
 ``veh_s``     BeamNG vehicle sensor poll
+``jct_s``     the junction label for the row (``jct.jsonl``)
 ``submit_s``  hand-off to the writer queue (array copies)
 ``sleep_s``   the planned sleep to the 0.1 s period
 ``top_s``     loop top before the poll (respawns, level loads, status)
@@ -34,7 +35,7 @@ from pathlib import Path
 from typing import Any
 
 TICKS_FILE = "ticks.jsonl"
-_PARTS = ("top_s", "poll_s", "veh_s", "submit_s", "sleep_s")
+_PARTS = ("top_s", "poll_s", "veh_s", "jct_s", "submit_s", "sleep_s")
 
 
 def slow_cause(dt: float, parts: dict[str, float], period_s: float) -> str | None:

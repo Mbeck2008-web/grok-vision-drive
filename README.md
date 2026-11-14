@@ -1,6 +1,6 @@
 # Grok Vision Drive (GVD)
 
-Grok Vision Drive is a camera-only drive-assist toy for BeamNG.drive and BeamNG.tech. It reads camera pictures, finds the lane, plans a short path, and is built to steer the car in the game (unproven). It is for entertainment. It is not a controller for a real car, it is not a driver aid, and it is not Tesla FSD. The license is MIT.
+Grok Vision Drive is a camera-only drive-assist toy for BeamNG.drive and BeamNG.tech. It reads camera pictures, finds the lane, plans a short path, and is built to steer the car in the game (unproven). It is for entertainment. It is not a controller for a real car, it is not a driver aid, and it is not Tesla FSD. The license is PolyForm Noncommercial 1.0.0.
 
 This is an **alpha** (`VERSION` 1.7.13). It may break.
 
@@ -550,4 +550,10 @@ GVD uses these outside projects. Each one is its authors' work.
 
 ## License
 
-GVD's license is MIT (`LICENSE`). Detector weight notices are in `models/NOTICE.txt`.
+GVD's license is [PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0) (`LICENSE`; SPDX `PolyForm-Noncommercial-1.0.0`). Detector weight notices are in `models/NOTICE.txt`.
+
+### Commercial use
+
+Commercial or paid use of GVD needs a separate license from Michael Beck. Open a GitHub issue on this repository, or contact him through his [GitHub profile](https://github.com/Mbeck2008-web). Do not email a request through this README.
+
+Versions released before this license change remain under the MIT License that shipped with those commits.

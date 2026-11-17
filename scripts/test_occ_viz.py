@@ -155,6 +155,11 @@ def check_motion() -> None:
         sw = got[sorted(got)[0]]
         # a car heading north, seen after the ego turned left by ego_w * 0.5 s
         assert abs(sw["speed_mps"] - 15.0) < 0.5 and abs(sw["yaw"] - (math.pi / 2 - ego_w * 0.5)) < 0.05, sw
+    gate = OccTracker()
+    for i in range(3):
+        first = gate.update([{"x": 0.0, "y": 20.0, "cls": "vehicle"}], 0.1 * i)
+    jump = gate.update([{"x": 9.0, "y": 34.0, "cls": "vehicle"}], 0.3)  # 16 m away: a new car, not the same one
+    assert jump[0]["id"] != first[0]["id"] and jump[0]["motion"] == "unknown", (first, jump)
     one = OccTracker().update([{"x": 0.0, "y": 10.0, "cls": "vehicle"}], 0.0, ego_speed_mps=10.0)
     assert one[0]["motion"] == "unknown" and "vx" not in one[0]
     print("motion: unknown for frames 1-2; same_way/oncoming/crossing/alongside/parked after 3 (straight and turning ego) OK")
@@ -237,6 +242,8 @@ def check_colors() -> None:
     assert reds and all(g == "edges" and c in ("road_edge", "curb") for g, c in reds), reds
     assert all(ln["color"] == ln["paint"] and ln["color"] in ("white", "yellow") for ln in msg["lanes"])
     assert "red" not in MOTION_COLORS.values() and MOTION_COLORS["parked"] == "orange"
+    one = occ_to_viz({"lanes": [{"pts": [[1.8, 0.0], [1.8, 20.0]], "material": "line_white"}]})["lanes"]
+    assert [ln["paint"] for ln in one] == ["white"], one  # a lone / first white line stays white
     assert all(m["color"] == "white" for g in ("crosswalks", "stop_lines") for m in msg[g])
     print("colors: red only on edges/curbs; lanes white/yellow by paint; parked orange OK")
 

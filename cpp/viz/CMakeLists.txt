@@ -28,29 +28,28 @@ option(GVD_VIZ_TESTS "Build the ctest render tests" ON)
 
 include(FetchContent)
 
-# glm and nlohmann_json: system package first, else a pinned release tarball.
-find_package(glm CONFIG QUIET)
+# glm and nlohmann_json always come from these pinned, SHA-256-checked
+# FetchContent tarballs. System packages are not used, so every builder
+# gets the same headers (the PR / spec promise this).
+FetchContent_Declare(glm
+  URL https://github.com/g-truc/glm/archive/refs/tags/1.0.1.tar.gz
+  URL_HASH SHA256=9f3174561fd26904b23f0db5e560971cbf9b3cbda0b280f04d5c379d03bf234c
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+  SOURCE_SUBDIR gvd_headers_only)  # download only; no add_subdirectory
+FetchContent_MakeAvailable(glm)
 if(NOT TARGET glm::glm)
-  FetchContent_Declare(glm
-    URL https://github.com/g-truc/glm/archive/refs/tags/1.0.1.tar.gz
-    URL_HASH SHA256=9f3174561fd26904b23f0db5e560971cbf9b3cbda0b280f04d5c379d03bf234c
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-    SOURCE_SUBDIR gvd_headers_only)  # download only; no add_subdirectory
-  FetchContent_MakeAvailable(glm)
   add_library(glm_headers INTERFACE)
   target_include_directories(glm_headers SYSTEM INTERFACE ${glm_SOURCE_DIR})
   add_library(glm::glm ALIAS glm_headers)
 endif()
 
-find_package(nlohmann_json 3.10 CONFIG QUIET)
-if(NOT TARGET nlohmann_json::nlohmann_json)
-  FetchContent_Declare(nlohmann_json
-    URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
-    URL_HASH SHA256=d6c65aca6b1ed68e7a182f4757257b107ae403032760ed6ef121c9d55e81757d
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
-  FetchContent_MakeAvailable(nlohmann_json)
-endif()
+FetchContent_Declare(nlohmann_json
+  URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
+  URL_HASH SHA256=d6c65aca6b1ed68e7a182f4757257b107ae403032760ed6ef121c9d55e81757d
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_MakeAvailable(nlohmann_json)
 
+# GLFW: system package 3.3+ if present, otherwise the pinned 3.4 tarball.
 if(GVD_VIZ_GLFW)
   find_package(glfw3 3.3 CONFIG QUIET)
   if(NOT TARGET glfw)

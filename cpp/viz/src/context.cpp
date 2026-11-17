@@ -85,15 +85,17 @@ bool GlContext::init_headless(std::string* err) {
   if (egl_headless(&egl_display_, &egl_context_, err)) return true;
 #endif
 #if GVD_VIZ_HAVE_GLFW
-  glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
-  return init_window(64, 64, "gvd_viz offscreen", false, err);
+  // Do not set hints here: GLFW 3.4 ignores pre-init hints, and glfwInit
+  // resets them. init_window sets GLFW_VISIBLE after a successful init.
+  return init_window(64, 64, "gvd_viz offscreen", false, err, /*visible=*/false);
 #else
   if (err && err->empty()) *err = "no headless backend (build with EGL or GLFW)";
   return false;
 #endif
 }
 
-bool GlContext::init_window(int w, int h, const char* title, bool vsync, std::string* err) {
+bool GlContext::init_window(int w, int h, const char* title, bool vsync, std::string* err,
+                               bool visible) {
 #if GVD_VIZ_HAVE_GLFW
   if (!glfw_inited_) {
     if (!glfwInit()) {
@@ -106,6 +108,8 @@ bool GlContext::init_window(int w, int h, const char* title, bool vsync, std::st
   glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
   glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
   glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
+  // After glfwInit only: 3.4 drops hints set before init, and init resets them.
+  glfwWindowHint(GLFW_VISIBLE, visible ? GLFW_TRUE : GLFW_FALSE);
   win_ = glfwCreateWindow(w, h, title, nullptr, nullptr);
   if (!win_) {
     if (err) *err = "glfwCreateWindow(GL 3.3 core) failed";
@@ -119,7 +123,7 @@ bool GlContext::init_window(int w, int h, const char* title, bool vsync, std::st
   }
   return true;
 #else
-  (void)w; (void)h; (void)title; (void)vsync;
+  (void)w; (void)h; (void)title; (void)vsync; (void)visible;
   if (err) *err = "built without GLFW (no window mode)";
   return false;
 #endif

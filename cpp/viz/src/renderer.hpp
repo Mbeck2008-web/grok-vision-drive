@@ -1,5 +1,6 @@
 // GL 3.3 core renderer for the early-FSD-beta look (docs/specs/viz_cpp.md).
 #pragma once
+#include <cstddef>
 #include <glm/glm.hpp>
 #include <string>
 #include <vector>
@@ -9,12 +10,14 @@
 
 namespace gvd {
 
+// Default = named "chase": pulled back, 40 deg vfov, ego in the lower third,
+// ~3 lanes and a long look-ahead visible at 16:9 (early FSD beta framing).
 struct Lens {
-  glm::vec3 eye{0.f, -21.f, 6.6f};
-  glm::vec3 look{0.f, 14.3f, 0.f};
-  float vfov_deg = 30.f;
+  glm::vec3 eye{0.f, -32.f, 10.f};
+  glm::vec3 look{0.f, 40.f, 0.f};
+  float vfov_deg = 40.f;
 };
-// chase (live default), low, high, top, side, dash (camera-ish, for overlay).
+// chase (live / offline default), low, high, top, side, dash (camera-ish, for overlay).
 bool lens_named(const std::string& name, Lens& out);
 
 enum class Palette { Neon, Parking, Dusk };
@@ -29,6 +32,14 @@ struct RenderOptions {
   bool draw_hud = true;
   const Image* background = nullptr;  // offline overlay: drawn under the scene
 };
+
+// Hard cap on GL render-target + buffer memory (MSAA colour + depth + resolve).
+constexpr size_t kMaxGlBytes = 200ull * 1024ull * 1024ull;
+
+// Estimated bytes for the MSAA colour RB, depth RB, and resolve texture.
+size_t estimate_target_bytes(int w, int h, int msaa);
+// Shrink MSAA first, then resolution, so estimate + extra fits in budget.
+void cap_render_targets(int& w, int& h, int& msaa, size_t extra = 0, size_t budget = kMaxGlBytes);
 
 // Colours the renderer uses (linear 0..1). Exposed for tests.
 glm::vec3 lane_rgb(Paint p);
@@ -52,6 +63,8 @@ class Renderer {
   const FrameStats& stats() const { return stats_; }
   // Bytes of GL memory this renderer allocated (targets + buffers + textures).
   size_t gl_bytes() const;
+  // Internal target size actually allocated (after the 200 MB cap).
+  void target_size(int* w, int* h, int* msaa) const;
 
  private:
   bool ensure_targets(int w, int h, int msaa);

@@ -426,7 +426,7 @@ glm::vec3 track_rgb(const Track& t, int lead_id, Palette pal) {
                                                                             : glm::vec3(1.0f, 0.50f, 0.18f);
   if (is_cls(t, {"pedestrian", "ped", "person"})) return {1.0f, 0.55f, 0.95f};
   if (is_cls(t, {"bicycle", "bike", "cyclist", "motorcycle"})) return {1.0f, 0.90f, 0.15f};
-  if (is_cls(t, {"obstacle", "parked", "debris", "cone"})) return {1.0f, 0.24f, 0.08f};
+  if (is_cls(t, {"obstacle", "parked", "debris", "cone"})) return {1.0f, 0.55f, 0.10f};
   if (is_cls(t, {"truck", "bus", "trailer"})) return {0.95f, 0.25f, 1.0f};
   // A car crossing our path (heading mostly sideways) is yellow, like the
   // cross traffic in the refs; the rest are blue.
@@ -435,7 +435,7 @@ glm::vec3 track_rgb(const Track& t, int lead_id, Palette pal) {
 }
 
 bool lens_named(const std::string& name, Lens& out) {
-  if (name == "chase") { out = Lens{{0.f, -25.f, 7.6f}, {0.f, 26.f, 0.f}, 30.f}; return true; }
+  if (name == "chase") { out = Lens{{0.f, -32.f, 10.f}, {0.f, 40.f, 0.f}, 40.f}; return true; }
   if (name == "low") { out = Lens{{0.f, -10.5f, 3.3f}, {0.f, 18.f, 0.4f}, 40.f}; return true; }
   if (name == "high") { out = Lens{{0.f, -16.f, 22.f}, {0.f, 12.f, 0.f}, 50.f}; return true; }
   if (name == "top") { out = Lens{{0.f, 8.f, 70.f}, {0.f, 8.1f, 0.f}, 45.f}; return true; }
@@ -572,6 +572,44 @@ bool Renderer::init(std::string* err) {
   return true;
 }
 
+
+size_t estimate_target_bytes(int w, int h, int msaa) {
+  int ww = std::max(1, w), hh = std::max(1, h);
+  int s = std::max(1, msaa);
+  size_t px = static_cast<size_t>(ww) * static_cast<size_t>(hh);
+  return px * 4 * static_cast<size_t>(s) + px * 4 * static_cast<size_t>(s) + px * 4;
+}
+
+void cap_render_targets(int& w, int& h, int& msaa, size_t extra, size_t budget) {
+  w = std::clamp(w, 16, 8192);
+  h = std::clamp(h, 16, 8192);
+  msaa = std::clamp(msaa, 0, 8);
+  auto fits = [&](int ww, int hh, int s) {
+    return estimate_target_bytes(ww, hh, std::max(1, s)) + extra <= budget;
+  };
+  if (fits(w, h, msaa)) return;
+  while (msaa > 1 && !fits(w, h, msaa)) --msaa;
+  if (fits(w, h, msaa)) return;
+  msaa = std::min(msaa, 1);
+  const double denom = 4.0 * (2.0 * static_cast<double>(std::max(1, msaa)) + 1.0);
+  if (budget <= extra || denom <= 0.0) {
+    w = 16;
+    h = 16;
+    return;
+  }
+  const double area_budget = static_cast<double>(budget - extra) / denom;
+  const double area = static_cast<double>(w) * static_cast<double>(h);
+  if (area > area_budget && area > 0.0) {
+    const double scale = std::sqrt(area_budget / area);
+    w = std::max(16, static_cast<int>(std::floor(w * scale / 2.0) * 2.0));
+    h = std::max(16, static_cast<int>(std::floor(h * scale / 2.0) * 2.0));
+  }
+  while (!fits(w, h, msaa) && (w > 16 || h > 16)) {
+    w = std::max(16, w - 16);
+    h = std::max(16, h - 16);
+  }
+}
+
 bool Renderer::ensure_targets(int w, int h, int msaa) {
   Impl& I = *p_;
   if (I.fbo_ms && I.tw == w && I.th == h && I.tmsaa == msaa) return true;
@@ -636,6 +674,18 @@ size_t Renderer::gl_bytes() const {
   bytes += static_cast<size_t>(I.bg_w) * I.bg_h * 4;
   bytes += I.buf_bytes;
   return bytes;
+}
+
+void Renderer::target_size(int* w, int* h, int* msaa) const {
+  if (!p_) {
+    if (w) *w = 0;
+    if (h) *h = 0;
+    if (msaa) *msaa = 0;
+    return;
+  }
+  if (w) *w = p_->tw;
+  if (h) *h = p_->th;
+  if (msaa) *msaa = p_->tmsaa;
 }
 
 template <class T>
@@ -717,7 +767,13 @@ bool Renderer::render(const Scene& s, const RenderOptions& o, Image* out, bool b
   if (!p_) return false;
   Impl& I = *p_;
   auto t0 = std::chrono::steady_clock::now();
-  if (!ensure_targets(o.w, o.h, o.msaa)) return false;
+  int w = o.w, h = o.h, msaa = o.msaa;
+  size_t extra = I.buf_bytes;
+  if (o.background && o.background->w > 0 && o.background->h > 0) {
+    extra += static_cast<size_t>(o.background->w) * static_cast<size_t>(o.background->h) * 4;
+  }
+  cap_render_targets(w, h, msaa, extra);
+  if (!ensure_targets(w, h, msaa)) return false;
   upload_background(o.background);
 
   // GPU timer from two frames ago (non-blocking read).
@@ -813,7 +869,7 @@ bool Renderer::render(const Scene& s, const RenderOptions& o, Image* out, bool b
 
   // HUD: speed digits + bar, engaged ring
   if (o.draw_hud) {
-    float W = static_cast<float>(o.w), H = static_cast<float>(o.h);
+    float W = static_cast<float>(w), H = static_cast<float>(h);
     float u = H / 720.f;
     int mph = static_cast<int>(std::lround(std::max(0.f, s.speed_mps) * 2.23694f));
     mph = std::min(mph, 199);
@@ -855,7 +911,7 @@ bool Renderer::render(const Scene& s, const RenderOptions& o, Image* out, bool b
 
   glBeginQuery(GL_TIME_ELAPSED, I.q[qi]);
   glBindFramebuffer(GL_FRAMEBUFFER, I.fbo_ms);
-  glViewport(0, 0, o.w, o.h);
+  glViewport(0, 0, w, h);
   glDisable(GL_CULL_FACE);
   glDepthMask(GL_TRUE);
   glClearDepth(1.0);
@@ -879,14 +935,14 @@ bool Renderer::render(const Scene& s, const RenderOptions& o, Image* out, bool b
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
   }
 
-  const float aspect = static_cast<float>(o.w) / static_cast<float>(o.h);
+  const float aspect = static_cast<float>(w) / static_cast<float>(h);
   const float near_z = 0.3f;
   glm::mat4 view = glm::lookAt(o.lens.eye, o.lens.look, glm::vec3(0, 0, 1));
   if (std::fabs(glm::normalize(o.lens.look - o.lens.eye).z) > 0.99f)
     view = glm::lookAt(o.lens.eye, o.lens.look, glm::vec3(0, 1, 0));
   glm::mat4 proj = glm::perspective(glm::radians(o.lens.vfov_deg), aspect, near_z, 600.f);
   glm::mat4 vp = proj * view;
-  glm::vec2 vpx(static_cast<float>(o.w), static_cast<float>(o.h));
+  glm::vec2 vpx(static_cast<float>(w), static_cast<float>(h));
 
   // ego mesh first: writes depth so lines and glow under/behind it are hidden
   if (o.draw_ego) {
@@ -941,7 +997,7 @@ bool Renderer::render(const Scene& s, const RenderOptions& o, Image* out, bool b
   // resolve MSAA
   glBindFramebuffer(GL_READ_FRAMEBUFFER, I.fbo_ms);
   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, I.fbo_res);
-  glBlitFramebuffer(0, 0, o.w, o.h, 0, 0, o.w, o.h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+  glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
   glEndQuery(GL_TIME_ELAPSED);
   I.q_pending[qi] = true;
   I.q_frame++;
@@ -949,22 +1005,22 @@ bool Renderer::render(const Scene& s, const RenderOptions& o, Image* out, bool b
   if (blit_to_default) {
     glBindFramebuffer(GL_READ_FRAMEBUFFER, I.fbo_res);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-    glBlitFramebuffer(0, 0, o.w, o.h, 0, 0, fb_w > 0 ? fb_w : o.w, fb_h > 0 ? fb_h : o.h, GL_COLOR_BUFFER_BIT,
+    glBlitFramebuffer(0, 0, w, h, 0, 0, fb_w > 0 ? fb_w : w, fb_h > 0 ? fb_h : h, GL_COLOR_BUFFER_BIT,
                       GL_LINEAR);
   }
   if (out) {
-    out->w = o.w;
-    out->h = o.h;
-    out->rgba.resize(static_cast<size_t>(o.w) * o.h * 4);
+    out->w = w;
+    out->h = h;
+    out->rgba.resize(static_cast<size_t>(w) * h * 4);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, I.fbo_res);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadPixels(0, 0, o.w, o.h, GL_RGBA, GL_UNSIGNED_BYTE, out->rgba.data());
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, out->rgba.data());
     // GL is bottom-up; flip to top-down rows.
-    const size_t row = static_cast<size_t>(o.w) * 4;
+    const size_t row = static_cast<size_t>(w) * 4;
     std::vector<uint8_t> tmp(row);
-    for (int y = 0; y < o.h / 2; ++y) {
+    for (int y = 0; y < h / 2; ++y) {
       uint8_t* a = out->rgba.data() + y * row;
-      uint8_t* b = out->rgba.data() + (o.h - 1 - y) * row;
+      uint8_t* b = out->rgba.data() + (h - 1 - y) * row;
       std::copy(a, a + row, tmp.data());
       std::copy(b, b + row, a);
       std::copy(tmp.data(), tmp.data() + row, b);

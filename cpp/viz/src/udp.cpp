@@ -59,6 +59,17 @@ bool UdpReceiver::open(int port, std::string* err) {
 #endif
     return false;
   }
+  sockaddr_in bound{};
+#ifdef _WIN32
+  int blen = sizeof(bound);
+#else
+  socklen_t blen = sizeof(bound);
+#endif
+  if (getsockname(s, reinterpret_cast<sockaddr*>(&bound), &blen) == 0) {
+    port_ = static_cast<int>(ntohs(bound.sin_port));
+  } else {
+    port_ = port;
+  }
   sock_ = static_cast<long long>(s);
   return true;
 }

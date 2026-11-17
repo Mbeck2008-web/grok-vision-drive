@@ -28,7 +28,9 @@ from typing import Any, Iterable
 
 SCHEMA_VERSION = 1
 DEFAULT_PORT = 47800
-# Loopback UDP carries up to 65507 bytes; stay well under it.
+# Loopback UDP payload cap (65507 = 65535 − 8 byte UDP header − 20 byte min IPv4).
+UDP_MAX_PAYLOAD = 65507
+# Stay under the UDP cap; the test pins this against UDP_MAX_PAYLOAD, not just itself.
 MAX_DATAGRAM = 60000
 MAX_TRACKS = 64
 MAX_SIGNS = 16
@@ -39,7 +41,17 @@ MAX_POINTS = 120
 MIN_INTERVAL_S = 1.0 / 60.0
 
 ROOT = Path(__file__).resolve().parents[2]
-_PAINT_KEYS = ("paint", "paint_color", "color", "colour", "material", "line_color")
+# Strict v1 enums (on-wire). Exact strings only; anything else is dropped or
+# replaced with the documented default. See docs/specs/viz_cpp.md.
+PAINT_VALUES = frozenset({"white", "yellow"})
+KIND_VALUES = frozenset({"detected", "predicted"})
+AEB_VALUES = frozenset({"off", "warn", "brake"})
+TRACK_CLS = frozenset({
+    "vehicle", "car", "pedestrian", "ped", "person", "bicycle", "bike", "cyclist",
+    "motorcycle", "truck", "bus", "trailer", "obstacle", "parked", "debris", "cone",
+})
+SIGN_CLS = frozenset({"traffic_light", "stop_sign", "pole"})
+SIGN_STATE = frozenset({"red", "yellow", "green", "unknown"})
 # Top-level message keys. Tests pin this set so a new field is a schema decision.
 MESSAGE_KEYS = frozenset(
     {"v", "type", "seq", "t", "ego", "lead_id", "aeb", "lanes", "edges", "tracks", "signs", "path", "path_conf"}
@@ -80,29 +92,23 @@ def _pts(src: Any, limit: int = MAX_POINTS) -> list[list[float]]:
 
 
 def lane_paint(record: Any) -> str:
-    """``"yellow"`` only when the record carries yellow paint; else ``"white"``.
+    """``"yellow"`` only when ``paint`` is exactly ``"yellow"``; else ``"white"``.
 
-    Live ``lanes_ext`` has no paint field yet, so live lanes are white. Index,
-    side and kind never pick a colour (no purple lanes).
+    Exact key and exact value. Aliases (``paint_color``, ``colour``, ``line_color``,
+    ``color``, ``material``, ``yellow: true``) and substring matches
+    (``"not_yellow"``) are rejected. Live ``lanes_ext`` has no paint field yet,
+    so live lanes are white. Index, side and kind never pick a colour.
     """
     if not isinstance(record, dict):
         return "white"
-    for key in _PAINT_KEYS:
-        raw = record.get(key)
-        if isinstance(raw, str) and "yellow" in raw.lower():
-            return "yellow"
-    if record.get("yellow") is True:
-        return "yellow"
-    return "white"
+    return "yellow" if record.get("paint") == "yellow" else "white"
 
 
 def _int(v: Any) -> int | None:
-    if isinstance(v, bool):
+    """JSON-integer only: reject bools, floats (no truncation) and strings."""
+    if isinstance(v, bool) or not isinstance(v, int):
         return None
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return None
+    return int(v)
 
 
 def _tracks(src: Iterable[Any]) -> list[dict[str, Any]]:
@@ -113,17 +119,30 @@ def _tracks(src: Iterable[Any]) -> list[dict[str, Any]]:
         x, y = _f(tr.get("x")), _f(tr.get("y"))
         if x is None or y is None:
             continue
-        row: dict[str, Any] = {"cls": str(tr.get("class") or tr.get("cls") or "vehicle"), "x": x, "y": y}
+        cls = tr.get("class") if tr.get("class") is not None else tr.get("cls")
+        if cls is None or cls == "":
+            cls = "vehicle"
+        cls = str(cls)
+        if cls not in TRACK_CLS:
+            continue
+        row: dict[str, Any] = {"cls": cls, "x": x, "y": y}
         tid = _int(tr.get("id"))
         if tid is not None:
             row["id"] = tid
         yaw = _f(tr.get("yaw"), 3)
         if yaw is not None:
             row["yaw"] = yaw
-        for src_key, key in (("length", "l"), ("width", "w"), ("height", "h"), ("speed_mps", "v")):
+        # Supervisor-state aliases (length/width/height/speed_mps) map to the
+        # on-wire keys l/w/h/v. The datagram itself only ever has l/w/h/v.
+        for src_key, key in (("l", "l"), ("w", "w"), ("h", "h"), ("v", "v"),
+                             ("length", "l"), ("width", "w"), ("height", "h"), ("speed_mps", "v")):
+            if key in row:
+                continue
             val = _f(tr.get(src_key))
             if val is not None:
                 row[key] = val
+        # Live tracks do not carry a lead flag; lead is indicated by lead_id.
+        # If the state (or occ_to_viz) sets lead=true, pass it through.
         if tr.get("lead") is True:
             row["lead"] = True
         out.append(row)
@@ -138,10 +157,18 @@ def _signs(src: Iterable[Any]) -> list[dict[str, Any]]:
         if not isinstance(s, dict):
             continue
         x, y = _f(s.get("x")), _f(s.get("y"))
-        cls = str(s.get("cls") or s.get("class") or "")
-        if x is None or y is None or not cls:
+        cls = s.get("cls") if s.get("cls") is not None else s.get("class")
+        cls = str(cls) if cls else ""
+        if x is None or y is None or cls not in SIGN_CLS:
             continue
-        out.append({"cls": cls, "x": x, "y": y, "state": str(s.get("state") or "unknown")})
+        raw_state = s.get("state")
+        if raw_state is None or raw_state == "":
+            state = "unknown"
+        else:
+            state = str(raw_state)
+            if state not in SIGN_STATE:
+                continue
+        out.append({"cls": cls, "x": x, "y": y, "state": state})
         if len(out) >= MAX_SIGNS:
             break
     return out
@@ -167,37 +194,57 @@ def build_scene_message(state: dict[str, Any], *, seq: int = 0, t: float | None 
         "seq": int(seq),
         "t": round(float(time.monotonic() if t is None else t), 4),
         "ego": {"engaged": bool(st.get("engaged")), "speed_mps": _f(ego.get("speed_mps")) or 0.0},
-        "aeb": str(pl.get("aeb") or "off"),
         "lanes": [],
         "edges": [],
         "tracks": _tracks(_list(st.get("tracks"))),
         "signs": _signs(_list(st.get("signs"))),
         "path": {"pts": _pts(st.get("path_ego"))},
-        "path_conf": _f(st.get("path_conf")) if _f(st.get("path_conf")) is not None else 1.0,
     }
+    aeb = pl.get("aeb")
+    msg["aeb"] = aeb if aeb in AEB_VALUES else "off"
+    pc = _f(st.get("path_conf"))
+    msg["path_conf"] = 1.0 if pc is None else min(1.0, max(0.0, pc))
     set_v = _f(pl.get("target_v"))
     if set_v is not None:
         msg["ego"]["set_mps"] = set_v
     lead = _int(pl.get("cipv_id"))
     if lead is not None:
         msg["lead_id"] = lead
-    for ln in _list(st.get("lanes_ext"))[:MAX_LANES]:
+    for ln in _list(st.get("lanes_ext")):
+        if len(msg["lanes"]) >= MAX_LANES:
+            break
         pts = _pts(ln)
         if len(pts) < 2:
             continue
-        kind = str(ln.get("kind") or "detected") if isinstance(ln, dict) else "detected"
-        msg["lanes"].append({"pts": pts, "paint": lane_paint(ln), "kind": kind})
-    for ed in _list(st.get("road_edges"))[:MAX_EDGES]:
+        kind = "detected"
+        if isinstance(ln, dict) and ln.get("kind") is not None:
+            raw_kind = str(ln.get("kind"))
+            if raw_kind not in KIND_VALUES:
+                continue
+            kind = raw_kind
+        paint = lane_paint(ln)
+        if isinstance(ln, dict) and ln.get("paint") is not None and ln.get("paint") not in PAINT_VALUES:
+            continue
+        msg["lanes"].append({"pts": pts, "paint": paint, "kind": kind})
+    for ed in _list(st.get("road_edges")):
+        if len(msg["edges"]) >= MAX_EDGES:
+            break
         pts = _pts(ed)
         if len(pts) < 2:
             continue
-        kind = str(ed.get("kind") or "detected") if isinstance(ed, dict) else "detected"
+        kind = "detected"
+        if isinstance(ed, dict) and ed.get("kind") is not None:
+            raw_kind = str(ed.get("kind"))
+            if raw_kind not in KIND_VALUES:
+                continue
+            kind = raw_kind
         msg["edges"].append({"pts": pts, "kind": kind})
     return msg
 
 
 def encode_message(msg: dict[str, Any], max_bytes: int = MAX_DATAGRAM) -> bytes | None:
     """Compact UTF-8 JSON that fits one datagram, thinning points if needed."""
+    max_bytes = min(int(max_bytes), UDP_MAX_PAYLOAD)
     data = json.dumps(msg, separators=(",", ":"), allow_nan=False).encode("utf-8")
     if len(data) <= max_bytes:
         return data
@@ -327,11 +374,27 @@ class CppVizPublisher:
             pass
         self._sock = None
         proc, self._proc = self._proc, None
-        if proc is not None and proc.poll() is None:
+        if proc is None:
+            return
+        if proc.poll() is not None:
+            return  # already exited; poll() reaped it
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
             try:
-                proc.terminate()
+                proc.kill()
             except OSError:
                 pass
+            try:
+                proc.wait(timeout=1.0)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+        except OSError:
+            pass
 
 
 def write_scene_file(path: str | os.PathLike[str], states: Iterable[dict[str, Any]]) -> int:

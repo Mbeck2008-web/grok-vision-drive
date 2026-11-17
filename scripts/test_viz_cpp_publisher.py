@@ -13,7 +13,9 @@
 from __future__ import annotations
 
 import json
+import signal
 import socket
+import subprocess
 import statistics
 import sys
 import time
@@ -121,14 +123,35 @@ def check_perception_only() -> None:
 
 def check_paint() -> None:
     assert cp.lane_paint({"paint": "yellow"}) == "yellow"
-    assert cp.lane_paint({"material": "line_yellow"}) == "yellow"
-    assert cp.lane_paint({"color": "Yellow"}) == "yellow"
-    assert cp.lane_paint({"yellow": True}) == "yellow"
-    for rec in ({}, {"index": -1, "side": "left"}, {"paint": "white"}, {"kind": "predicted", "index": 2}, None):
+    assert cp.lane_paint({"paint": "white"}) == "white"
+    # exact key and exact value only: aliases and substring matches are rejected
+    for rec in (
+        {},
+        {"index": -1, "side": "left"},
+        {"paint": "white"},
+        {"kind": "predicted", "index": 2},
+        None,
+        {"paint": "not_yellow"},
+        {"paint": "Yellow"},
+        {"paint_color": "yellow"},
+        {"colour": "yellow"},
+        {"line_color": "yellow"},
+        {"color": "yellow"},
+        {"material": "line_yellow"},
+        {"yellow": True},
+    ):
         assert cp.lane_paint(rec) == "white", rec
     msg = cp.build_scene_message(rich_state())
     assert [ln["paint"] for ln in msg["lanes"]] == ["yellow", "white", "white", "white"]
-    print("paint: yellow only from a paint field, else white OK")
+    # a lane with an invalid paint value is dropped, not emitted as yellow
+    st = rich_state()
+    st["lanes_ext"] = [
+        {"points": [{"x": 0.0, "y": 0.0}, {"x": 0.0, "y": 10.0}], "paint": "not_yellow"},
+        {"points": [{"x": 1.0, "y": 0.0}, {"x": 1.0, "y": 10.0}], "paint": "yellow"},
+    ]
+    msg2 = cp.build_scene_message(st)
+    assert [ln["paint"] for ln in msg2["lanes"]] == ["yellow"]
+    print("paint: exact paint=yellow only; aliases and substrings rejected OK")
 
 
 def check_nonblocking_no_listener() -> None:
@@ -197,10 +220,17 @@ def check_oversize() -> None:
     assert len(msg["tracks"]) == cp.MAX_TRACKS and len(msg["lanes"]) <= cp.MAX_LANES
     assert all(len(ln["pts"]) <= cp.MAX_POINTS for ln in msg["lanes"])
     data = cp.encode_message(msg)
-    assert data is not None and len(data) <= cp.MAX_DATAGRAM, len(data or b"")
+    assert data is not None
+    # Pin against the UDP payload limit, not MAX_DATAGRAM (a 1e6 mutant would
+    # still pass a comparison to itself).
+    assert cp.MAX_DATAGRAM <= cp.UDP_MAX_PAYLOAD == 65507
+    assert len(data) <= 65507, len(data)
+    assert len(data) <= cp.MAX_DATAGRAM, len(data)
+    # even a caller who asks for more than the UDP limit is clamped
+    assert len(cp.encode_message(msg, max_bytes=10**6) or b"") <= 65507
     tiny = cp.encode_message(msg, max_bytes=9000)
     assert tiny is None or len(tiny) <= 9000
-    print(f"oversize: {len(data)} bytes <= {cp.MAX_DATAGRAM} OK")
+    print(f"oversize: {len(data)} bytes <= {cp.MAX_DATAGRAM} (<= 65507) OK")
 
 
 def check_fail_safe() -> None:
@@ -246,16 +276,123 @@ def check_flag_default_off() -> None:
     print("--viz-cpp: off by default; missing gvd_viz leaves the publisher harmless OK")
 
 
+def check_schema_strict() -> None:
+    # aeb: only off|warn|brake; anything else becomes off (not passed through)
+    for raw, want in (("off", "off"), ("warn", "warn"), ("brake", "brake"),
+                      ("maybe", "off"), ("WARN", "off"), (True, "off"), (1, "off")):
+        st = rich_state()
+        st["planner"]["aeb"] = raw
+        assert cp.build_scene_message(st)["aeb"] == want, (raw, want)
+    # path_conf: default 1.0, clamped to [0, 1]
+    st = rich_state()
+    del st["path_conf"]
+    assert cp.build_scene_message(st)["path_conf"] == 1.0
+    st = rich_state(); st["path_conf"] = 1.8
+    assert cp.build_scene_message(st)["path_conf"] == 1.0
+    st = rich_state(); st["path_conf"] = -0.2
+    assert cp.build_scene_message(st)["path_conf"] == 0.0
+    st = rich_state(); st["path_conf"] = 0.45
+    assert cp.build_scene_message(st)["path_conf"] == 0.45
+    # ids: floats and strings are rejected (no truncation)
+    st = rich_state()
+    st["planner"]["cipv_id"] = 4.9
+    assert "lead_id" not in cp.build_scene_message(st)
+    st["planner"]["cipv_id"] = "4"
+    assert "lead_id" not in cp.build_scene_message(st)
+    st["planner"]["cipv_id"] = 4
+    assert cp.build_scene_message(st)["lead_id"] == 4
+    st = rich_state()
+    st["tracks"] = [{"id": 1.9, "class": "vehicle", "x": 0.0, "y": 8.0}]
+    assert "id" not in cp.build_scene_message(st)["tracks"][0]
+    # kind enum: invalid kind drops the lane / edge
+    st = rich_state()
+    st["lanes_ext"] = [{"points": [{"x": 0.0, "y": 0.0}, {"x": 0.0, "y": 10.0}], "kind": "guessed"}]
+    assert cp.build_scene_message(st)["lanes"] == []
+    st["road_edges"] = [{"points": [{"x": 5.0, "y": 0.0}, {"x": 5.0, "y": 10.0}], "kind": "guessed"}]
+    assert cp.build_scene_message(st)["edges"] == []
+    # unknown track / sign class dropped; invalid sign state dropped
+    st = rich_state()
+    st["tracks"] = [{"id": 1, "class": "spaceship", "x": 0.0, "y": 8.0},
+                    {"id": 2, "class": "vehicle", "x": 1.0, "y": 8.0}]
+    msg = cp.build_scene_message(st)
+    assert [t["id"] for t in msg["tracks"]] == [2]
+    st = rich_state()
+    st["signs"] = [{"cls": "billboard", "x": 0.0, "y": 20.0},
+                   {"cls": "traffic_light", "x": 1.0, "y": 20.0, "state": "purple"}]
+    assert cp.build_scene_message(st)["signs"] == []
+    st["signs"] = [{"cls": "traffic_light", "x": 1.0, "y": 20.0, "state": "red"}]
+    assert cp.build_scene_message(st)["signs"][0]["state"] == "red"
+    # live publisher does not emit track.lead (lead is lead_id from cipv_id)
+    st = rich_state()
+    assert all("lead" not in t for t in cp.build_scene_message(st)["tracks"])
+    st["tracks"][0]["lead"] = True
+    assert cp.build_scene_message(st)["tracks"][0].get("lead") is True
+    # on-wire keys are exact: no class/points/length aliases in the datagram
+    st = rich_state()
+    msg = cp.build_scene_message(st)
+    blob = json.dumps(msg)
+    assert "paint_color" not in blob and "line_color" not in blob and '"points"' not in blob
+    for tr in msg["tracks"]:
+        assert "class" not in tr and "length" not in tr and "width" not in tr
+        assert "height" not in tr and "speed_mps" not in tr and "pts" not in tr
+    for ln in msg["lanes"]:
+        assert "points" not in ln and "pts" in ln
+    # caps on the publisher side
+    st = rich_state(n_tracks=80)
+    assert len(cp.build_scene_message(st)["tracks"]) == cp.MAX_TRACKS == 64
+    print("schema strict: enums, ints, caps, path_conf, no aliases, lead_id-only live OK")
+
+
+def check_close_terminates_and_reaps() -> None:
+    pub = cp.CppVizPublisher(port=9, min_interval_s=0.0)
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    pub._proc = proc
+    t0 = time.monotonic()
+    pub.close()
+    elapsed = time.monotonic() - t0
+    assert pub._proc is None
+    assert proc.poll() is not None, "dummy exe still running after close()"
+    assert elapsed < 1.0, f"close() took {elapsed:.2f}s; terminate should be prompt (kill fallback is 2s)"
+    if sys.platform != "win32":
+        assert proc.returncode == -signal.SIGTERM, proc.returncode
+    print(f"close(): terminated dummy pid, reaped rc={proc.returncode} in {elapsed*1000:.0f} ms OK")
+
+
+def check_sendto_oserror() -> None:
+    pub = cp.CppVizPublisher(port=9, min_interval_s=0.0)
+
+    class BoomSock:
+        def sendto(self, *_a):
+            raise OSError("refused")
+
+        def close(self):
+            pass
+
+    pub._sock = BoomSock()
+    assert pub.publish(rich_state()) is False
+    assert pub.errors == 0 and pub.dropped >= 1, pub.status()
+    pub.close()
+    print("sendto OSError: counted as drop, no raise OK")
+
+
 def main() -> None:
     sys.path.insert(0, str(ROOT / "scripts"))
     check_schema()
     check_perception_only()
     check_paint()
+    check_schema_strict()
     check_nonblocking_no_listener()
     check_receiver_never_reads()
     check_roundtrip_and_rate()
     check_oversize()
     check_fail_safe()
+    check_sendto_oserror()
+    check_close_terminates_and_reaps()
     check_flag_default_off()
     print("test_viz_cpp_publisher: all OK")
 

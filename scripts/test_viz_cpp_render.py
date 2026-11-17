@@ -130,10 +130,52 @@ def check_end_to_end(exe: Path) -> None:
           f"red R={int(red[:, right].sum())} green={int(green.sum())} purple=0, GT not drawn OK")
 
 
+
+def check_stale_and_drain_wired() -> None:
+    main = (SRC / "src" / "main.cpp").read_text(encoding="utf-8")
+    assert "scene_is_stale(last_rx)" in main, "live loop must call scene_is_stale (not stale=false)"
+    assert "bool stale = false" not in main
+    udp = (SRC / "src" / "udp.cpp").read_text(encoding="utf-8")
+    assert "for (int i = 0; i < 1024; ++i)" in udp
+    print("main.cpp/udp.cpp: stale helper and 1024-datagram drain wired OK")
+
+def check_glfw_visible_after_init() -> None:
+    """GLFW 3.4 drops hints set before glfwInit, and init resets them."""
+    src = (SRC / "src" / "context.cpp").read_text(encoding="utf-8")
+    head_start = src.find("bool GlContext::init_headless")
+    win_start = src.find("bool GlContext::init_window")
+    assert 0 <= head_start < win_start, "init_headless / init_window not found"
+    headless = src[head_start:win_start]
+    assert "glfwWindowHint" not in headless, "GLFW hints in init_headless run before glfwInit"
+    win = src[win_start:]
+    init_pos = win.find("glfwInit")
+    vis_pos = win.find("GLFW_VISIBLE")
+    assert init_pos != -1 and vis_pos != -1 and vis_pos > init_pos, (
+        "GLFW_VISIBLE must be set after glfwInit (GLFW 3.4 resets hints at init)"
+    )
+    print("context.cpp: GLFW_VISIBLE is set after glfwInit OK")
+
+
+def check_deps_pinned() -> None:
+    cmake = (SRC / "CMakeLists.txt").read_text(encoding="utf-8")
+    # glm / nlohmann_json are pinned tarballs only (no find_package).
+    assert "find_package(glm" not in cmake
+    assert "find_package(nlohmann_json" not in cmake
+    assert "glm/archive/refs/tags/1.0.1.tar.gz" in cmake
+    assert "json/releases/download/v3.11.3/json.tar.xz" in cmake
+    # GLFW may use a system 3.3+ package, else the pinned 3.4 tarball.
+    assert "find_package(glfw3 3.3" in cmake
+    assert "glfw/releases/download/3.4/glfw-3.4.zip" in cmake
+    print("CMakeLists: glm/json pinned-only; GLFW system-or-3.4 OK")
+
+
 def main() -> None:
+    check_glfw_visible_after_init()
+    check_deps_pinned()
+    check_stale_and_drain_wired()
     b = build_dir()
     if b is None:
-        print("test_viz_cpp_render: skipped (no toolchain)")
+        print("test_viz_cpp_render: skipped build (no toolchain)")
         return
     exe = _find_exe(b)
     assert exe is not None, f"no {EXE_NAME} in {b}"

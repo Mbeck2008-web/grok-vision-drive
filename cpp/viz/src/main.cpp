@@ -164,11 +164,13 @@ int main(int argc, char** argv) {
         last_rx = std::chrono::steady_clock::now();
       }
     }
-    bool stale = std::chrono::steady_clock::now() - last_rx > std::chrono::seconds(1);
-    Scene show = stale ? Scene{} : cur;  // no signal: empty road + ego
+    bool stale = scene_is_stale(last_rx);  // no signal for 1 s: empty road + ego
+    Scene show = stale ? Scene{} : cur;
     int fw = 0, fh = 0;
     ctx.framebuffer_size(&fw, &fh);
     if (fw > 0 && fh > 0) {
+      // The window may be any size; Renderer caps internal targets so
+      // gl_bytes stays under 200 MB, then blits to the framebuffer.
       o.w = fw;
       o.h = fh;
       r.render(show, o, nullptr, true, fw, fh);

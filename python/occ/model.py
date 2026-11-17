@@ -643,7 +643,7 @@ class OccSparseNet(nn.Module):
     def vo_sample(e: Mapping[str, Any], pts: torch.Tensor, contrast: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
         """Grey values of one camera at ego-frame points (N,3) (bilinear) and their in-image validity (N,).
 
-        ``contrast``: validity also requires local texture (max-min of 4 samples at +-1.5 px >= VO_MIN_CONTRAST),
+        ``contrast``: validity also requires local texture along v (max-min of samples at v +-1.5 / +-3 px >= VO_MIN_CONTRAST),
         so flat regions (a uniform car face, sky, blank road) never anchor the match."""
         cam, g = e["cam"], e["gray"]
         pts = pts.to(torch.float32)
@@ -660,7 +660,10 @@ class OccSparseNet(nn.Module):
         if contrast:
             d = 1.5
             nb = []
-            for du, dv in ((d, 0.0), (-d, 0.0), (0.0, d), (0.0, -d)):
+            # vertical neighbours only: forward motion moves ground points mostly along v, so edges of
+            # longitudinal lines / road borders (gradient along u, invariant to forward motion) must not
+            # anchor the match (counterexample V9: they pinned dy at 0)
+            for du, dv in ((0.0, d), (0.0, -d), (0.0, 2 * d), (0.0, -2 * d)):
                 gg = torch.stack([(u + du) / cam.width * 2 - 1, (v + dv) / cam.height * 2 - 1], dim=-1).view(1, -1, 1, 2)
                 nb.append(F.grid_sample(g.to(pts.dtype), gg, mode="bilinear", padding_mode="border", align_corners=False).view(-1))
             nb = torch.stack(nb)
@@ -715,7 +718,12 @@ class OccSparseNet(nn.Module):
             med = float(fin.median())
             contrast = max(0.0, (med - bc) / (med + 1e-6))
             frac = float(ok.float().mean())
-            conf = float(min(1.0, 2.0 * contrast) * min(1.0, frac / 0.25))
+            # local sharpness: the minimum must stand out against +-0.15 m forward (counterexample V9: a flat
+            # basin at small steps gave a wrong answer with conf 1.0 from the global contrast alone)
+            nb = self._vo_cost(ref, ok, e, torch.stack([best + torch.tensor([0.0, 0.15, 0.0]), best - torch.tensor([0.0, 0.15, 0.0])]))
+            nbf = nb[torch.isfinite(nb)]
+            sharp = max(0.0, (float(nbf.min()) - bc) / (float(nbf.min()) + 1e-6)) if nbf.numel() else 0.0
+            conf = float(min(1.0, 2.0 * contrast) * min(1.0, sharp / 0.25) * min(1.0, frac / 0.25))
             sxy = 0.05 / max(contrast, 0.02)
             cov = [sxy ** 2, sxy ** 2, (0.01 / max(contrast, 0.02)) ** 2]
             return best.float(), conf, cov

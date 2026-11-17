@@ -18,7 +18,8 @@ hidden behind corner buildings.
   observed=False with finite prob / class; agreement with ray-cast GT;
 * memory: a leg seen at t0, not predicted at t1 and occluded at t1 persists
   (VO-warped, observed=False); without memory it is gone; a dropped cell a
-  camera sees at t1 is not carried;
+  camera sees at t1 is not carried; a seen cell also replaces this tick's
+  unobserved live guess at the same key (observed cells always win);
 * causality: frames after t perturbed or deleted -> occ_out at <= t byte-identical.
 """
 from __future__ import annotations
@@ -321,6 +322,81 @@ def check_memory_rules() -> None:
           f"VO-warped (2 m forward shift, 90 deg yaw rotation) cell-exact; VO lost -> cleared, nothing resurfaces OK")
 
 
+
+def check_memory_seen_beats_guess() -> None:
+    """A tick-1 in-frustum, unobserved live guess must lose to a seen memory cell.
+
+    OccRuntime path: stub predict + cap + observed_mask + OccMemory. Tick 0
+    observes a drivable cell. Tick 1 emits the same key as a wrong class,
+    still in a camera frustum, but an elevated occluder on the ray makes
+    observed_mask False. The merge rule keeps the earlier observation.
+    Mutant M6 (keep only memory keys that are missing from the live set)
+    lets the live guess win.
+    """
+    from python.perception.occ_geometry import project
+    from python.perception.occ_out import observed_mask, occluders
+
+    cams = [c for c in RCAMS.values() if c.cam_id in ("main", "wide")]
+    cam = next(c for c in cams if c.cam_id == "wide")
+    origin = np.asarray(cam.pos, np.float64)
+    tgt_pt = np.array([2.0, 10.0, GROUND_Z + 0.2])
+    ref_pt = np.array([-4.0, 4.0, GROUND_Z + 0.2])  # off the ray; keeps a ground band
+    tgt = int(G.keys_of(tgt_pt.reshape(1, 3))[0])
+    ref = int(G.keys_of(ref_pt.reshape(1, 3))[0])
+    assert tgt >= 0 and ref >= 0 and tgt != ref
+    _, _, tgt_ok = project(cam, G.centers_of_keys(np.array([tgt])))
+    assert bool(tgt_ok[0]), "target must be in the wide frustum at tick 1"
+
+    # An elevated cell on the camera ray, not the last voxel before the target.
+    gz = int(G.cell_of_key(np.array([ref]))[0, 2])
+    vec = G.centers_of_keys(np.array([tgt]))[0] - origin
+    dist = float(np.linalg.norm(vec))
+    unit = vec / max(dist, 1e-9)
+    cands = []
+    for t in np.arange(0.4, dist - G.voxel_m, G.voxel_m * 0.5):
+        k = int(G.keys_of((origin + unit * t).reshape(1, 3))[0])
+        if k < 0 or k in (tgt, ref):
+            continue
+        if int(G.cell_of_key(np.array([k]))[0, 2]) >= gz + 1:
+            cands.append(k)
+    assert cands, "need an elevated occluder on the ray"
+    k0, c0 = np.array([ref, tgt], np.int64), np.array([1, 1], np.uint8)
+    occl_k = None
+    obs1 = None
+    for k in cands:
+        k1 = np.array([ref, tgt, k], np.int64)
+        c1 = np.array([1, 0, 0], np.uint8)
+        obs1 = observed_mask(G.centers_of_keys(k1), cams, occluders(k1, c1, G), G)
+        if not bool(obs1[k1 == tgt][0]):
+            occl_k, k1, c1 = k, k1, c1
+            break
+    assert occl_k is not None, f"no on-ray occluder hid the target (tried {len(cands)})"
+    assert int((k1 == tgt).sum()) == 1
+
+    vehicle = {"wheelspeed_mps": 0.0, "imu_yaw_rate": 0.0}
+    imgs = [object() for _ in cams]
+    rt = oo.OccRuntime(StubNet([_pred(k0, c0), _pred(k1, c1)], cams),
+                       from_vehicle=True, memory=True, timer=lambda: 0.0)
+    m0 = rt.step(imgs, 0.0, vehicle=vehicle)
+    keys, cls, _p, obs = rt.last_cells
+    assert m0["ego"]["ok"] and bool(obs[keys == tgt][0]) and int(cls[keys == tgt][0]) == 1
+    m1 = rt.step(imgs, 0.1, vehicle=vehicle)
+    keys, cls, _p, obs = rt.last_cells
+    assert m1["ego"]["ok"]
+    assert tgt in keys, "remembered cell must still be in last_cells"
+    assert int(cls[keys == tgt][0]) == 1, (int(cls[keys == tgt][0]), "seen memory should beat the unobserved live guess")
+    assert not bool(obs[keys == tgt][0])
+
+    rt_off = oo.OccRuntime(StubNet([_pred(k0, c0), _pred(k1, c1)], cams),
+                           from_vehicle=True, memory=False, timer=lambda: 0.0)
+    rt_off.step(imgs, 0.0, vehicle=vehicle)
+    rt_off.step(imgs, 0.1, vehicle=vehicle)
+    keys, cls, _p, obs = rt_off.last_cells
+    assert int(cls[keys == tgt][0]) == 0 and not bool(obs[keys == tgt][0])
+    print("memory seen-beats-guess: tick-1 in-frustum unobserved live guess (cls=other) "
+          "replaced by the tick-0 observation (cls=drivable); without memory the guess stands OK")
+
+
 def check_causality() -> None:
     preds = [_pred(k, c) for _, _, _, k, c in CLIP_LABELS]
     full = _runtime(list(preds))
@@ -364,6 +440,7 @@ def main() -> int:
     check_observed()
     check_memory()
     check_memory_rules()
+    check_memory_seen_beats_guess()
     check_causality()
     print("test_occ_unseen: all OK")
     return 0

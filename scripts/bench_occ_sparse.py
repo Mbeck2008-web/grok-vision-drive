@@ -117,6 +117,11 @@ def run(a: argparse.Namespace) -> dict:
     out["cam_res"] = {c.cam_id: [c.width, c.height] for c in cams}
     out["mem_estimate_mb_fp32"] = memory_estimate(cams, config=a.net, max_points=a.max_points)
     out["max_points"], out["max_coarse"] = a.max_points, a.max_coarse  # arithmetic ESTIMATE, not measured
+    # peak_vram_mb is only ever an nvidia-smi reading (IQU45); the arithmetic number stays in vram_est_mb_cpu
+    out["vram_est_mb_cpu"] = float(out["mem_estimate_mb_fp32"]["total_mb"])
+    smi = getattr(a, "nvidia_smi_mb", None)
+    out["peak_vram_mb"] = None if smi is None else float(smi)
+    out["vram_status"] = "UNPROVEN" if smi is None else "MEASURED"
     imgs = [torch.rand(1, 3, c.height, c.width, device=dev) for c in cams]
     pts = torch.rand(1, a.queries, 3, device=dev) * torch.tensor([51.2, 64.0, 6.4], device=dev) + torch.tensor([-25.6, -12.8, -2.0], device=dev)
     out["act_bytes_fp32_queries"] = activation_bytes(net, imgs, pts)
@@ -209,6 +214,8 @@ def main(argv=None) -> int:
     ap.add_argument("--queries", type=int, default=8192)
     ap.add_argument("--max-points", type=int, default=65536, help="per-stage top-k cap in predict")
     ap.add_argument("--max-coarse", type=int, default=2048, help="absolute cap on the top coarse stage")
+    ap.add_argument("--nvidia-smi-mb", type=float, default=None,
+                    help="peak used MB read off nvidia-smi on Desktop-IQU45 with BeamNG live; only this fills peak_vram_mb")
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--fp16", action="store_true", help="fp16 autocast for inference (CUDA only)")
@@ -248,12 +255,14 @@ def summary(res: dict) -> str:
     """One line: FPS and VRAM next to each other (Pascal: fp16 saves memory, not time)."""
     vram = res.get("infer_cuda_max_allocated_mb")
     tr = res.get("train_cuda_max_allocated_mb")
+    pk = "UNPROVEN" if res.get("peak_vram_mb") is None else f"{res['peak_vram_mb']:.0f}(nvidia-smi)"
     return (f"SUMMARY host={res['host']} device={res['device']} net={res.get('net_config')} cams={len(res['cams'])}"
             f"({','.join(res['cams'])}) long={res['long_side']} fp16={res['infer_fp16']} "
             f"infer_ms={res['infer_ms_median']:.1f} fps={res['infer_fps']:.2f} "
             f"infer_vram_mb={'n/a (no CUDA)' if vram is None else f'{vram:.0f}'} "
             f"stages={res['infer_stage_queries']} frustum={res['frustum_fine_cells']} grid={res['grid_cells']} "
-            f"queried/dense={res['infer_queried_ratio']:.3f} mem_est_mb={res['mem_estimate_mb_fp32']['total_mb']:.0f}(estimate)"
+            f"queried/dense={res['infer_queried_ratio']:.3f} vram_est_mb_cpu={res['vram_est_mb_cpu']:.0f}(estimate) "
+            f"peak_vram_mb={'UNPROVEN' if res.get('peak_vram_mb') is None else f'{res[chr(112) + "eak_vram_mb"]:.0f}(nvidia-smi)'}"
             + ("" if "train_compute_ms_median" not in res else
                f" train_vram_mb={'n/a (no CUDA)' if tr is None else f'{tr:.0f}'} train_amp={res['train_amp']}"
                f" train_wait_ms={res['train_wait_ms_median']:.0f} train_compute_ms={res['train_compute_ms_median']:.0f}"))

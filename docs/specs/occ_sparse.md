@@ -395,10 +395,13 @@ py -3 scripts/bench_occ_sparse.py --device cuda --profile 1080ti --iters 20 --wa
 py -3 scripts/bench_occ_sparse.py --device cuda --sweep --iters 20 --warmup 3
 py -3 scripts/bench_occ_sparse.py --device cuda --profile front_cluster --infer-only --iters 20 --warmup 3
 nvidia-smi --query-gpu=memory.used,memory.total --format=csv
+# then record the reading (only this fills peak_vram_mb; the arithmetic number stays vram_est_mb_cpu):
+py -3 scripts/bench_occ_sparse.py --device cuda --profile 1080ti --infer-only --iters 20 --warmup 3 --nvidia-smi-mb <used MB>
 ```
 
 Each run ends with a `SUMMARY` line: `fps=` next to `infer_vram_mb=` (8 cams @640
-for `--profile 1080ti`), `mem_est_mb=` (arithmetic estimate), and for a training
+for `--profile 1080ti`), `vram_est_mb_cpu=` (arithmetic estimate), `peak_vram_mb=UNPROVEN`
+(until `--nvidia-smi-mb` is given; then `MEASURED`), and for a training
 run `train_vram_mb=` (AMP: memory saving only on Pascal). The sweep covers net
 (default/cheap) x cameras (all8/front3/min) x long side (640/480/320) x fp32/fp16.
 Acceptance: inference <= 4096 MB and (VRAM free with BeamNG running - 1 GB);

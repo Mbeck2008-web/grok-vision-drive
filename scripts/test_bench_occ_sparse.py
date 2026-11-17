@@ -32,6 +32,18 @@ def main() -> int:
     assert out["infer_ms_median"] > 0 and 0 < out["infer_queried_ratio"] < 0.25, out
     assert out["shard_bytes_per_sample"] > 0 and out["train_compute_ms_median"] > 0 and out["train_peak_rss_mb"] > 0
     assert "infer_cuda_max_allocated_mb" not in out, "no CUDA number without CUDA"
+    # peak_vram_mb is UNPROVEN until an nvidia-smi reading is passed; the CPU estimate never fills it
+    assert out["peak_vram_mb"] is None and out["vram_status"] == "UNPROVEN", out
+    assert out["vram_est_mb_cpu"] == out["mem_estimate_mb_fp32"]["total_mb"] > 0
+    assert "peak_vram_mb=UNPROVEN" in summ and "vram_est_mb_cpu=" in summ and "(estimate)" in summ, summ
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        bench_occ_sparse.main(["--long-side", "64", "--cams", "main,rear", "--queries", "64", "--iters", "1", "--warmup", "0",
+                               "--infer-only", "--threads", "2", "--nvidia-smi-mb", "3071"])
+    t2 = buf.getvalue()
+    o2 = json.loads(t2[: t2.rindex("SUMMARY")])
+    assert o2["peak_vram_mb"] == 3071.0 and o2["vram_status"] == "MEASURED" and o2["vram_est_mb_cpu"] == out["vram_est_mb_cpu"], o2
+    assert "peak_vram_mb=3071(nvidia-smi)" in t2
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         bench_occ_sparse.main(["--sweep", "--sweep-long", "48", "--queries", "64", "--iters", "1", "--warmup", "0", "--threads", "2"])

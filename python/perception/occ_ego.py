@@ -26,11 +26,12 @@ from __future__ import annotations
 import argparse
 import math
 from dataclasses import dataclass
+from collections.abc import Sequence
 from typing import Any, Mapping
 
 import numpy as np
 
-from python.perception.occ_geometry import DEFAULT_GRID, OccGrid
+from python.perception.occ_geometry import DEFAULT_GRID, OccGrid, project
 
 VEHICLE = 2
 DRIVABLE = 1
@@ -86,16 +87,52 @@ def _bev_keys(xy: np.ndarray, grid: OccGrid) -> np.ndarray:
     return np.where(ok, ix * ny + iy, -1)
 
 
-def _score(prev: np.ndarray, cur_keys: np.ndarray, grid: OccGrid, fwd: float, dyaw: float) -> float:
-    """Share of warped previous cells that hit a current cell. Sparse: sorted key lookup, no raster."""
+def _visible_xy(xy: np.ndarray, cams: Sequence[Any] | None, z: float = 0.6,
+                occl: np.ndarray | None = None, grid: OccGrid | None = None) -> np.ndarray:
+    """Which BEV points the current live cameras can see (at height ``z``).
+
+    Frustum only when no occluders are given; otherwise the same observed
+    test the runtime uses (frustum and no occluder on the ray).
+    """
+    if not cams or len(xy) == 0:
+        return np.ones(len(xy), dtype=bool)
+    pts = np.column_stack([xy, np.full(len(xy), z)])
+    if occl is None or grid is None:
+        vis = np.zeros(len(xy), dtype=bool)
+        for cam in cams:
+            _, _, ok = project(cam, pts)
+            vis |= ok
+        return vis
+    from python.perception.occ_out import observed_mask
+    return observed_mask(pts, cams, occl, grid)
+
+
+def _score(prev: np.ndarray, cur_keys: np.ndarray, grid: OccGrid, fwd: float, dyaw: float,
+           cams: Sequence[Any] | None = None, occl: np.ndarray | None = None) -> float:
+    """Share of warped previous cells that hit a current cell. Sparse: sorted key lookup, no raster.
+
+    When ``cams`` is set, the denominator is only the previous cells that
+    fall in the current observed region after the warp (live cameras, and
+    this tick's occluders when ``occl`` is given), so a side/rear camera
+    going stale does not collapse the score.
+    """
     if len(prev) == 0 or len(cur_keys) == 0:
         return 0.0
-    k = _bev_keys(_warp(prev, fwd, dyaw), grid)
+    warped = _warp(prev, fwd, dyaw)
+    k = _bev_keys(warped, grid)
     pos = np.clip(np.searchsorted(cur_keys, k), 0, len(cur_keys) - 1)
-    return float(((cur_keys[pos] == k) & (k >= 0)).sum()) / float(len(prev))
+    hits = (cur_keys[pos] == k) & (k >= 0)
+    if cams:
+        vis = _visible_xy(warped, cams, occl=occl, grid=grid)
+        n = int(vis.sum())
+        if n < VO_MIN_CELLS:
+            return 0.0
+        return float((hits & vis).sum()) / float(n)
+    return float(hits.sum()) / float(len(prev))
 
 
-def _register(prev: np.ndarray, cur_keys: np.ndarray, grid: OccGrid) -> tuple[float, float, float]:
+def _register(prev: np.ndarray, cur_keys: np.ndarray, grid: OccGrid,
+              cams: Sequence[Any] | None = None, occl: np.ndarray | None = None) -> tuple[float, float, float]:
     """Coarse-to-fine search: (forward m, yaw rad, overlap score)."""
     if len(prev) < VO_MIN_CELLS or len(cur_keys) == 0:
         return 0.0, 0.0, 0.0
@@ -109,7 +146,7 @@ def _register(prev: np.ndarray, cur_keys: np.ndarray, grid: OccGrid) -> tuple[fl
             ys = best[2] + np.arange(-span_y, span_y + 1e-9, step_y)
         for f in fs:
             for yw in ys:
-                sc = _score(prev, cur_keys, grid, float(f), float(yw))
+                sc = _score(prev, cur_keys, grid, float(f), float(yw), cams=cams, occl=occl)
                 if sc > best[0] + 1e-9:
                     best = (sc, float(f), float(yw))
     return best[1], best[2], best[0]
@@ -117,6 +154,7 @@ def _register(prev: np.ndarray, cur_keys: np.ndarray, grid: OccGrid) -> tuple[fl
 
 def occ_odometry(prev_keys, prev_cls, cur_keys, cur_cls, *, grid: OccGrid = DEFAULT_GRID,
                  prev_obs: np.ndarray | None = None, cur_obs: np.ndarray | None = None,
+                 cams: Sequence[Any] | None = None, occl: np.ndarray | None = None,
                  ) -> tuple[float, float, float]:
     """(forward m, yaw rad, overlap score) moving the previous frame onto the current one.
 
@@ -124,7 +162,9 @@ def occ_odometry(prev_keys, prev_cls, cur_keys, cur_cls, *, grid: OccGrid = DEFA
     observed). Unobserved decode_unseen clutter is ignored, so there is no
     residual path: a parked ego with a moving or jittering subset keeps the
     (0, 0) hypothesis the same way full-set registration always did. Forward
-    and yaw come from the same search.
+    and yaw come from the same search. The score's denominator is the
+    previous observed cells that, after the warp, fall in the current
+    observed region (all previous observed cells if ``cams`` is omitted).
     """
     prev = _static_bev(prev_keys, prev_cls, grid, obs=prev_obs)
     cur = _static_bev(cur_keys, cur_cls, grid, obs=cur_obs)
@@ -132,7 +172,7 @@ def occ_odometry(prev_keys, prev_cls, cur_keys, cur_cls, *, grid: OccGrid = DEFA
         return 0.0, 0.0, 0.0
     cur_k = np.unique(_bev_keys(cur, grid))
     cur_k = cur_k[cur_k >= 0]
-    return _register(prev, cur_k, grid)
+    return _register(prev, cur_k, grid, cams=cams, occl=occl)
 
 
 @dataclass
@@ -158,7 +198,8 @@ class EgoMotion:
         return cls(from_vehicle=bool(getattr(a, "ego_from_vehicle", False)), **kw)
 
     def update(self, keys: np.ndarray, cls: np.ndarray, t: float, vehicle: Mapping[str, Any] | None = None,
-               obs: np.ndarray | None = None) -> EgoEstimate:
+               obs: np.ndarray | None = None, cams: Sequence[Any] | None = None,
+               occl: np.ndarray | None = None) -> EgoEstimate:
         if self.from_vehicle:
             sig = {k: vehicle[k] for k in VEHICLE_SIGNAL_KEYS if vehicle is not None and k in vehicle}
             if len(sig) == len(VEHICLE_SIGNAL_KEYS):
@@ -173,7 +214,7 @@ class EgoMotion:
             return self._last
         dt = float(t) - prev[2]
         fwd, dyaw, score = occ_odometry(prev[0], prev[1], keys, cls, grid=self.grid,
-                                        prev_obs=prev[3], cur_obs=obs_a)
+                                        prev_obs=prev[3], cur_obs=obs_a, cams=cams, occl=occl)
         if score < VO_MIN_SCORE:
             self._last = EgoEstimate(self._last.speed_mps, self._last.yaw_rate, self.source, False)
         else:

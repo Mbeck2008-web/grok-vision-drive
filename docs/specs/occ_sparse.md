@@ -254,14 +254,31 @@ constraint; the estimate is held and flagged `motion_ok = False`.
 
 `occ_odometry` votes only on *observed* static cells (`prev_obs` / `cur_obs`;
 default all observed). Unobserved `decode_unseen` clutter cannot vote, so
-there is no residual-VO path. A parked ego with 1-3 voxel smears, whole-wall
-depth jumps, moving objects, or lateral smear keeps `(0, 0)` (`ok=True`);
-slow real motion on observed cells stays within one search step (0.2 m).
-`OccRuntime` computes `observed_mask` before `ego.update` and passes it in.
-Tests: `check_vo_clutter`, `check_vo_parked_flicker`,
-`check_vo_parked_range_flicker`, `check_vo_parked_structured`,
-`check_vo_slow_motion`. The older residual share-gate tests and mutants N3/N4
-no longer apply (the residual mutation sites are gone).
+there is no residual-VO path. The score's denominator is the previous
+observed cells that, after the hypothesis warp, fall in the current
+observed region (this tick's live/fresh cameras, with this tick's
+occluders), so a side or rear camera going stale does not collapse the
+overlap and trigger a hold. If fewer than `VO_MIN_CELLS` of those are
+visible, or the score is below `VO_MIN_SCORE` (0.4), the last estimate is
+held, `ok` is False, and `OccMemory` is cleared (no blind carry).
+`check_ego` requires 11/11 ticks `ok` at the recorder's camera rates, with
+all cameras fresh, and with only the front three fresh. A parked ego with
+1-3 voxel smears, whole-wall depth jumps, moving objects, or lateral smear
+keeps `(0, 0)` (`ok=True`); slow real motion on observed cells stays within
+one search step (0.2 m). `OccRuntime` computes `observed_mask` from this
+tick's live cameras and occluders before `ego.update` and passes the mask,
+those cameras, and the occluders in so the score uses the same observed
+region. Tests: `check_vo_clutter`,
+`check_vo_parked_flicker`, `check_vo_parked_range_flicker`,
+`check_vo_parked_structured`, `check_vo_slow_motion`,
+`check_vo_runtime_obs`. The older residual share-gate tests and mutants
+N3/N4 no longer apply (the residual mutation sites are gone).
+
+Limitation (same as base, not fixed here): *observed* ego-fixed clutter
+still votes. A dense self-occluded sheet is hidden by `observed_mask` and
+does not lock VO, but sparse observed floaters can (e.g. 800 cells at
+z 0.6-3 m: obs-VO 0.00 m at true 1.5 m, `ok=True`, score 0.67). The
+claim is only that unobserved `decode_unseen` clutter cannot vote.
 
 Tests: `test_occ_ego` (VO, observed-only clutter, parked structured probes, slow motion, world-fixed cells with the flag off, non-identity
 warp, drift printout), `test_occ_runtime_imports` (no GT-pose module reachable
@@ -455,8 +472,8 @@ smoke). Metrics: `scripts/eval_occ_unseen.py` (results below).
 
 Later-stage `predict` caps (`_capped_hot`, at production `LEVELS` (4, 2):
 cell 1.6 m and 0.8 m): the ground band follows the ground per xy column,
-the layer with the highest occupancy in that column (ties go to the lowest
-layer). Below and above are relative to that column's ground, so a downhill
+the highest layer whose occupancy is within a small margin of that
+column's maximum (the surface; a below-ground fill that ties or is slightly hotter does not win). Below and above are relative to that column's ground, so a downhill
 or height-offset road stays the band instead of a fixed z=0 slab. At most
 half the cap goes to the band; above-ground structure is filled next, then
 below-ground, each pool spread in xy so a high-p off-road region cannot take

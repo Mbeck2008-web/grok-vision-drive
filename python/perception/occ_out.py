@@ -682,7 +682,7 @@ class OccRuntime:
         occl = occluders(raw.keys, raw.cls, g)
         obs = observed_mask(g.centers_of_keys(np.asarray(raw.keys, np.int64)), live, occl, g) if len(raw.keys) else np.zeros(0, bool)
         # VO on observed cells only, so unobserved decode_unseen clutter cannot vote.
-        est = self.ego.update(raw.keys, raw.cls, t, vehicle, obs=obs)
+        est = self.ego.update(raw.keys, raw.cls, t, vehicle, obs=obs, cams=live, occl=occl)
         dt = None if self._prev_t is None else float(t) - self._prev_t
         if self.memory is not None:
             keys, cls, prob, obs = self.memory.step(raw.keys, raw.cls, raw.prob, obs, ok=bool(est.ok),

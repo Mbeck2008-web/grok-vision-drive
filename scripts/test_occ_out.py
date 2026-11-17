@@ -185,34 +185,93 @@ def check_ego() -> None:
     assert a.ego_from_vehicle is False
     _, msgs = RUN
     assert msgs[0]["ego"]["dt_s"] is None and not msgs[0]["ego"]["ok"]
-    dists, yaws, held = [], [], []
-    for i in range(1, len(TS)):
-        e = msgs[i]["ego"]
-        dist, dyaw, dt = _truth(i)
-        # VO votes only on observed static cells. Ticks where side/rear
-        # cameras are stale and dt is large can drop the observed overlap
-        # below VO_MIN_SCORE even when the best shift is the true motion;
-        # EgoMotion then holds the last estimate and flags ok=False.
-        assert e["source"] == "vo", (i, e)
-        assert abs(e["dt_s"] - dt) < 1e-6, (i, e["dt_s"], dt)
-        dists.append(abs(e["speed_mps"] * dt - dist)); yaws.append(abs(e["yaw_rate_rps"] * dt - dyaw))
-        assert abs(e["speed_mps"] - dist / dt) < max(2.0, 0.3 / dt), (i, e, dist / dt)
-        assert e["yaw_rate_rps"] > 0, (i, e)  # left turn is positive
-        if not e["ok"]:
-            held.append(i)
-    n_ok = (len(TS) - 1) - len(held)
-    assert n_ok >= 8, (n_ok, held)  # most ticks still register; a thin live set may hold
+    def _vo_ok(msgs, tag: str) -> tuple[float, float]:
+        dists, yaws = [], []
+        held = []
+        for i in range(1, len(TS)):
+            e = msgs[i]["ego"]
+            dist, dyaw, dt = _truth(i)
+            assert e["source"] == "vo" and e["ok"], (tag, i, e)
+            assert abs(e["dt_s"] - dt) < 1e-6, (tag, i, e["dt_s"], dt)
+            dists.append(abs(e["speed_mps"] * dt - dist)); yaws.append(abs(e["yaw_rate_rps"] * dt - dyaw))
+            assert abs(e["speed_mps"] - dist / dt) < max(2.0, 0.3 / dt), (tag, i, e, dist / dt)
+            assert e["yaw_rate_rps"] > 0, (tag, i, e)  # left turn is positive
+        assert not held
+        assert max(dists) < 0.3 and max(yaws) < 0.012, (tag, dists, yaws)
+        return max(dists), max(yaws)
+
+    d0, y0 = _vo_ok(msgs, "recorder rates")
+    _, fresh = run(ages_fn=lambda t: {c: 0.0 for c in RATES})
+    d1, y1 = _vo_ok(fresh, "all cams fresh")
+    front = ("main", "wide", "narrow")
+    _, f3 = run(ages_fn=lambda t: {c: (0.0 if c in front else 1.0) for c in RATES})
+    d2, y2 = _vo_ok(f3, "front 3 fresh")
     sp = np.array([m["ego"]["speed_mps"] for m in msgs[1:]]); yr = np.array([m["ego"]["yaw_rate_rps"] for m in msgs[1:]])
-    assert max(dists) < 0.3 and max(yaws) < 0.012, (dists, yaws)
     assert abs(sp.mean() - V) < 1.0 and abs(yr.mean() - W) < 0.03, (sp, yr)
     # with --ego-from-vehicle the car's own signals, tagged vehicle
     _, vm = run(from_vehicle=True, vehicle_fn=lambda t: {"wheelspeed_mps": 11.5 + t, "imu_yaw_rate": 0.09})
     assert all(m["ego"]["source"] == "vehicle" and m["ego"]["ok"] for m in vm)
     assert abs(vm[-1]["ego"]["speed_mps"] - (11.5 + TS[-1])) < 1e-3 and vm[-1]["ego"]["yaw_rate_rps"] == 0.09
     print(f"ego: source vo by default, dt from timestamps {sorted({round(_truth(i)[2], 3) for i in range(1, len(TS))})}; "
-          f"|speed*dt - |(dx,dy)|| max {max(dists):.3f} m, |yaw_rate*dt - dyaw| max {max(yaws):.4f} rad; "
-          f"mean {sp.mean():.2f} m/s (true {V}), {yr.mean():.3f} rad/s (true {W}, left +); "
-          f"ok {n_ok}/{len(TS)-1} (held ticks {held}); vehicle flag -> source vehicle OK")
+          f"recorder/all-fresh/front-3 all 11/11 ok, max |speed*dt-dist| {d0:.3f}/{d1:.3f}/{d2:.3f} m, "
+          f"|yaw_rate*dt-dyaw| {y0:.4f}/{y1:.4f}/{y2:.4f} rad; "
+          f"mean {sp.mean():.2f} m/s (true {V}), {yr.mean():.3f} rad/s (true {W}, left +); vehicle flag -> source vehicle OK")
+
+
+
+def check_vo_runtime_obs() -> None:
+    """OccRuntime VO must use live-camera observed_mask (kills O1 and O3).
+
+    O1 (obs=None): a dense ego-fixed sheet that observed_mask hides must not
+    vote; VO still tracks 1.5 m of real motion. O3 (obs from stale cameras
+    too): ego-fixed clutter only a stale rear camera can see must not vote.
+    """
+    g = DEFAULT_GRID
+    rng = np.random.default_rng(5)
+    posts = np.stack([rng.choice([-1, 1], 300) * rng.uniform(5, 22, 300),
+                      rng.uniform(-10, 50, 300)], 1)
+    sheet = np.c_[np.random.default_rng(9).uniform(-6, 6, 3000),
+                  np.random.default_rng(9).uniform(0, 30, 3000),
+                  np.full(3000, 1.2)]
+    rear = np.c_[np.random.default_rng(11).uniform(-2, 2, 400),
+                 np.random.default_rng(11).uniform(-8, -3, 400),
+                 np.full(400, 1.0)]
+
+    def pred(fwd: float, clutter: np.ndarray | None) -> OccPrediction:
+        p = posts - np.array([0.0, fwd])
+        keys, cls = [], []
+        for z in (0.2, 0.6, 1.0, 1.4):
+            xyz = np.column_stack([p, np.full(len(p), z)])
+            ins = g.inside(xyz)
+            keys.append(g.keys_of(xyz[ins])); cls.append(np.zeros(int(ins.sum()), np.uint8))
+        gx, gy = np.meshgrid(np.arange(-4, 4, 0.4) + 0.2, np.arange(-10, 50, 0.4) + 0.2)
+        road = np.column_stack([gx.ravel(), gy.ravel(), np.full(gx.size, -0.2)])
+        keys.append(g.keys_of(road)); cls.append(np.ones(len(road), np.uint8))
+        if clutter is not None:
+            ins = g.inside(clutter)
+            keys.append(g.keys_of(clutter[ins])); cls.append(np.zeros(int(ins.sum()), np.uint8))
+        k = np.concatenate(keys); c = np.concatenate(cls)
+        ok = k >= 0; k, idx = np.unique(k[ok], return_index=True)
+        n = int(k.size)
+        return OccPrediction(k, np.full(n, 0.9, np.float32), c[ok][idx], 0, n, (0, 0, n))
+
+    ages_fresh = {c: 0.0 for c in RATES}
+    ages_front = {c: (0.0 if c in ("main", "wide", "narrow") else 1.0) for c in RATES}
+    imgs = [NoImage() for _ in CAMS]
+
+    def track(clutter, ages, tag, true_fwd=1.5, dt=0.2):
+        net = StubNet([pred(0.0, clutter), pred(true_fwd, clutter)])
+        rt = oo.OccRuntime(net, from_vehicle=False, memory=False)
+        m0 = rt.step(imgs, 0.0, ages_s=ages)
+        m1 = rt.step(imgs, dt, ages_s=ages)
+        e = m1["ego"]
+        err = abs(e["speed_mps"] * dt - true_fwd)
+        assert e["source"] == "vo" and e["ok"], (tag, e)
+        assert err <= 0.2, (tag, e, err)
+        print(f"runtime VO {tag}: fwd {e['speed_mps']*dt:.2f} m (true {true_fwd}) ok err {err:.3f} OK")
+
+    track(sheet, ages_fresh, "dense unobserved sheet (O1)")
+    track(rear, ages_front, "stale-rear clutter only (O3)")
 
 
 def check_heading() -> None:
@@ -416,6 +475,7 @@ def check_runtime_net() -> None:
 def main() -> int:
     check_panels()
     check_ego()
+    check_vo_runtime_obs()
     check_heading()
     check_boxes2d()
     check_corridor()

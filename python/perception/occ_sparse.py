@@ -392,13 +392,15 @@ if nn is not None:
 def _capped_hot(hot: np.ndarray, p_hot: np.ndarray, cap: int, z_min: float, cell_m: float) -> np.ndarray:
     """Indices of the ``cap`` hot cells to refine.
 
-    The ground band follows the ground per xy column: the layer with the
-    highest occupancy in that column (ties go to the lowest layer). Below
-    and above are relative to that column's ground, so a downhill or
-    height-offset road stays the band instead of a fixed z=0 slab. A
-    thinner or holed ground layer still wins its columns when it is the
-    strongest layer there, even if a below-ground fill has more cells
-    globally. At most half the cap goes to the band. Above-ground
+    The ground band follows the ground per xy column: the highest layer
+    whose occupancy is within a small margin of that column's maximum
+    (the surface, not a below-ground fill that ties or is slightly
+    hotter). Below and above are relative to that column's ground, so a
+    downhill or height-offset road stays the band instead of a fixed z=0
+    slab. A thinner or holed ground layer still wins its columns when it
+    is within the margin of the strongest layer there, even if a
+    below-ground fill has more cells globally. At most half the cap goes
+    to the band. Above-ground
     structure is filled next, then below-ground leftovers, so a hot
     below-ground fill cannot starve posts / buildings that VO and
     occluders need. Unused budget returns to the ground, then to structure.
@@ -412,14 +414,22 @@ def _capped_hot(hot: np.ndarray, p_hot: np.ndarray, cap: int, z_min: float, cell
     cell_m = float(cell_m)
     z_min = float(z_min)
     lvl = np.floor((hot[:, 2] - z_min) / cell_m + 1e-6).astype(np.int64)
-    # Per-column ground: strongest occupied layer in that xy column
-    # (ties downward). Not a global z=0 slab.
+    # Per-column ground: highest layer within BAND_MARGIN of the
+    # column's max occupancy (the surface). A below-ground fill that
+    # ties or is slightly hotter cannot take the band. Not a z=0 slab.
+    BAND_MARGIN = 0.05
     ix = np.floor(hot[:, 0] / cell_m + 1e-6).astype(np.int64)
     iy = np.floor(hot[:, 1] / cell_m + 1e-6).astype(np.int64)
     ix0 = ix - int(ix.min())
     iy0 = iy - int(iy.min())
     col = ix0 * (int(iy0.max()) + 1) + iy0
-    order = np.lexsort((lvl, -p_hot, col))
+    order = np.lexsort((-p_hot, col))
+    _, first = np.unique(col[order], return_index=True)
+    pmax = np.empty(int(col.max()) + 1, dtype=np.float64)
+    pmax[col[order][first]] = p_hot[order][first]
+    near = p_hot >= (pmax[col] - BAND_MARGIN)
+    # candidates first, then highest layer
+    order = np.lexsort((-lvl, ~near, col))
     _, first = np.unique(col[order], return_index=True)
     g_lvl = np.empty(int(col.max()) + 1, dtype=np.int64)
     g_lvl[col[order][first]] = lvl[order][first]

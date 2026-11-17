@@ -366,8 +366,111 @@ def check_capped_hot_follows_ground() -> None:
         # below must be 0. A widened band (N6) would pull the adjacent below
         # layer into the band and spend those slots on below.
         if cap <= 1024 or f == 2:
-            gm = (np.arange(X.size) % 8) == 0  # 12.5% of columns
-            run("holed 12.5% (N6)", 0.2, ground_mask=gm)
+            # 12.5% of columns have ground; structure sits on those same
+            # columns only (enough cells to fill the non-band budget) so a
+            # hole cannot promote a roof to the band. Picked below must be 0.
+            # A widened band (N6b) would pull the adjacent below into the
+            # band and spend those slots on below.
+            # Stride so n_ground < cap//2 but n_ground + in-grid struct >= cap
+            # (at 1.6 m the third struct layer can clip z_max).
+            step = 6 if cap <= 1024 else 8
+            gm = (np.arange(X.size) % step) == 0
+            gz = np.broadcast_to(np.asarray(0.2, dtype=np.float64), X.shape)
+            parts = [(np.stack([X[gm], Y[gm], zc(gz[gm])], 1), 0.95,
+                      np.where(Y[gm] > 20.0, "groundFAR", "groundNEAR")),
+                     (np.stack([X[gm], Y[gm], zc(gz[gm] - cm)], 1), 0.9,
+                      np.full(int(gm.sum()), "below"))]
+            for k in (1, 2, 3):
+                parts.append((np.stack([X[gm], Y[gm], zc(gz[gm] + k * cm)], 1),
+                              0.7, np.full(int(gm.sum()), "struct")))
+            # reuse run() by passing through a temporary ground_mask path:
+            # build via a one-off that uses the same exact-count asserts
+            def run_parts(name, parts):
+                hot = np.concatenate([p[0] for p in parts])
+                ph = np.concatenate([np.full(len(p[0]), p[1]) for p in parts])
+                lab = np.concatenate([p[2] for p in parts])
+                keep = (hot[:, 2] >= G.z_min) & (hot[:, 2] < G.z_max)
+                hot, ph, lab = hot[keep], ph[keep], lab[keep]
+                idx = _capped_hot(hot, ph, cap, G.z_min, cm)
+                picked = lab[idx]
+                n_g = int(np.isin(picked, ("groundFAR", "groundNEAR")).sum())
+                n_st = int((picked == "struct").sum())
+                n_bel = int((picked == "below").sum())
+                n_g_tot = int(np.isin(lab, ("groundFAR", "groundNEAR")).sum())
+                n_st_tot = int((lab == "struct").sum())
+                n_bel_tot = int((lab == "below").sum())
+                n_low = min(n_g_tot, cap // 2) if n_g_tot else 0
+                n_up = min(n_st_tot, cap - n_low)
+                n_dn = min(n_bel_tot, cap - n_low - n_up)
+                leftover = cap - (n_low + n_up + n_dn)
+                n_low = min(n_g_tot, n_low + leftover)
+                leftover = cap - (n_low + n_up + n_dn)
+                n_up = min(n_st_tot, n_up + leftover)
+                leftover = cap - (n_low + n_up + n_dn)
+                n_dn = min(n_bel_tot, n_dn + leftover)
+                kept = dict(zip(*np.unique(picked, return_counts=True)))
+                assert n_g == n_low, (name, f, n_g, n_low, kept)
+                assert n_st == n_up, (name, f, n_st, n_up, kept)
+                assert n_bel == n_dn == 0, (name, f, n_bel, n_dn, kept)
+                assert n_g == n_g_tot, (name, f, "ground dropped", kept)
+                print(f"capped_hot f={f} cell={cm}m cap={cap} {name}: "
+                      f"ground {n_g} struct {n_st} below {n_bel} OK")
+            run_parts("holed (N6)", parts)
+
+
+
+def check_capped_hot_surface_fill() -> None:
+    """A below-ground fill must not steal the band on equal or slightly higher p.
+
+    Production 2x stage, cap 2048: equal p, both saturated at 1.0, fill 0.97
+    vs ground 0.95, and cold/empty ground with a hot fill. Structure stays
+    at the geometric-cap share (1024). Downhill and offset stay in
+    check_capped_hot_follows_ground.
+    """
+    f, cap = 2, 2048
+    cm = G.voxel_m * f
+    nx = int(round((G.x_max - G.x_min) / cm))
+    ny = int(round((G.y_max - G.y_min) / cm))
+    xs = G.x_min + cm * (np.arange(nx) + 0.5)
+    ys = G.y_min + cm * (np.arange(ny) + 0.5)
+    X, Y = np.meshgrid(xs, ys, indexing="ij")
+    X, Y = X.ravel(), Y.ravel()
+    bld = (np.abs(X) > 8) & (np.abs(X) < 14) & (Y > 0) & (Y < 45)
+
+    def zc(z):
+        z = np.asarray(z, dtype=np.float64)
+        return G.z_min + cm * (np.floor((z - G.z_min) / cm) + 0.5)
+
+    def layer(z, mask=None):
+        m = np.ones(X.size, bool) if mask is None else mask
+        return np.stack([X[m], Y[m], np.full(int(m.sum()), zc(z))], 1)
+
+    def run(name, parts, expect_ground=True):
+        hot = np.concatenate([p[0] for p in parts])
+        ph = np.concatenate([np.full(len(p[0]), p[1]) for p in parts])
+        lab = np.concatenate([np.full(len(p[0]), p[2]) for p in parts])
+        keep = (hot[:, 2] >= G.z_min) & (hot[:, 2] < G.z_max)
+        hot, ph, lab = hot[keep], ph[keep], lab[keep]
+        idx = _capped_hot(hot, ph, cap, G.z_min, cm)
+        kept = dict(zip(*np.unique(lab[idx], return_counts=True)))
+        n_st = int((lab[idx] == "struct").sum())
+        n_g = int((lab[idx] == "ground").sum())
+        assert n_st == 1024, (name, n_st, kept)
+        if expect_ground:
+            assert n_g == 1024, (name, n_g, kept)
+        else:
+            assert n_g == 0, (name, n_g, kept)
+        print(f"capped_hot surface {name}: {kept} OK")
+
+    struct = [(layer(0.2 + k * cm, bld), 0.7, "struct") for k in (1, 2, 3)]
+    for pb, pg, name in ((0.95, 0.95, "equal p=0.95"),
+                         (1.0, 1.0, "saturated p=1.0"),
+                         (0.97, 0.95, "fill 0.97 vs ground 0.95")):
+        run(name, [(layer(0.2), pg, "ground"), (layer(0.2 - cm), pb, "below"),
+                   (layer(0.2 - 2 * cm), pb, "below")] + struct)
+    run("cold ground, hot fill p=0.9",
+        [(layer(0.2 - cm), 0.9, "below"), (layer(0.2 - 2 * cm), 0.9, "below")] + struct,
+        expect_ground=False)
 
 
 def check_class_balance() -> None:
@@ -432,6 +535,7 @@ def main() -> int:
     check_capped_hot_spreads()
     check_capped_hot_below_ground()
     check_capped_hot_follows_ground()
+    check_capped_hot_surface_fill()
     check_class_balance()
     check_unoccupied_not_occluded_structure()
     check_queries()

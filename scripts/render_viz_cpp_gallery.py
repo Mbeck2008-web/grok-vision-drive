@@ -152,16 +152,16 @@ def parking():
     """ref3: parking aisle, parked rows, path curving into a bay."""
     tracks, tid = [], 1
     for side, x in ((-1, -7.5), (1, 7.5)):
-        for k, y in enumerate(np.arange(6.0, 50.0, 3.0)):
-            if side == 1 and k == 3:
-                continue  # open bay
+        for k, y in enumerate(np.arange(6.0, 56.0, 3.4)):
+            if (side == 1 and k == 3) or (side == -1 and k in (5, 9)) or (side == 1 and k == 10):
+                continue  # open bays
             tracks.append(car(tid, float(x + side * 0.3 * (k % 2)), float(y), yaw=0.0 + 0.06 * ((k % 3) - 1),
                               cls="parked", length=4.6, width=1.9, height=1.5))
             tid += 1
     tracks.append(car(90, -3.0, 14.0, cls="pedestrian"))
     edges = [{"points": line(lambda y: -11.0, -16, 52, 1.0), "kind": "detected"},
              {"points": line(lambda y: 11.0, -16, 52, 1.0), "kind": "detected"}]
-    bay = 6.0 + 3.0 * 3
+    bay = 6.0 + 3.4 * 3
     path = [{"x": 0.0, "y": float(y)} for y in np.arange(2.0, bay - 4.0, 1.0)]
     for k in range(1, 10):
         t = (math.pi / 2) * k / 9
@@ -216,7 +216,7 @@ SCENES = {
 REF_LENS = {
     "intersection": ("0,-14.3,9", "0,6.3,0", 38.0),
     "multilane": ("0,-16,8", "0,12,0", 34.0),
-    "parking": ("0,-11,9", "0,10,0", 45.0),
+    "parking": ("0,-12,8", "0,6,0", 42.0),
     "dusk": ("0,-22.9,8.6", "0,21.8,0", 45.0),
     "highway_curve": ("0,-16,8", "0,12,0", 34.0),
 }

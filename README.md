@@ -183,6 +183,8 @@ Do not run Automatic Mode while the supervisor is also attaching cameras.
 
 Review capture (`R`) writes `Documents/GVD/review/<UTC stamp>/tick_NNNNNN.json` and one `tick_NNNNNN_<camera>.jpg` per camera. Clips go to `Documents/GVD/clips`.
 
+**C++ visualizer (M1, opt-in).** `--viz-cpp` also sends a perception-only scene message per tick over localhost UDP to `gvd_viz`, a separate C++/OpenGL app with the early-FSD-beta look, and starts it if it has been built under `cpp/viz/build`. Sending never blocks the loop: frames are dropped when the app is slow or missing. Build: `cmake --preset windows-msvc && cmake --build --preset windows-msvc` in `cpp/viz`. Live lanes draw white until perception reports paint colour. Spec: [docs/specs/viz_cpp.md](docs/specs/viz_cpp.md).
+
 ### In-game GVD app
 
 A BeamNG UI app named **GVD** (330x440, bottom left by default).

@@ -162,16 +162,19 @@ def check_vo_clutter() -> None:
     clutter = np.stack([rng.uniform(-24, 24, 3000), rng.uniform(-12, 50, 3000)], 1)
     fwd = 2.5
     def cells(shift):
-        xy = np.concatenate([posts - np.array([0.0, shift]), clutter])
-        # lift to a 3-D key set as elevated 'other' (cls 0)
+        # posts are observed; ego-fixed decode_unseen clutter is not, so it
+        # cannot vote. The residual path is gone.
+        post_xy = posts - np.array([0.0, shift])
+        xy = np.concatenate([post_xy, clutter])
+        obs = np.concatenate([np.ones(len(post_xy), bool), np.zeros(len(clutter), bool)])
         z = 1.2
         pts = np.concatenate([xy, np.full((len(xy), 1), z)], 1)
         keys = G.keys_of(pts)
         ok = keys >= 0
-        return keys[ok], np.zeros(ok.sum(), np.uint8)
-    k0, c0 = cells(0.0)
-    k1, c1 = cells(fwd)
-    est_fwd, dyaw, score = occ_odometry(k0, c0, k1, c1, grid=G)
+        return keys[ok], np.zeros(ok.sum(), np.uint8), obs[ok]
+    k0, c0, o0 = cells(0.0)
+    k1, c1, o1 = cells(fwd)
+    est_fwd, dyaw, score = occ_odometry(k0, c0, k1, c1, grid=G, prev_obs=o0, cur_obs=o1)
     assert abs(est_fwd - fwd) < 0.3, (est_fwd, dyaw, score)
     assert score >= VO_MIN_SCORE, (est_fwd, score)
     print(f"VO clutter: fwd {est_fwd:.3f} m (true {fwd}) score {score:.3f} despite {3000} ego-fixed cells OK")
@@ -254,46 +257,17 @@ def check_vo_parked_range_flicker() -> None:
                   f"|fwd| max {max(abs(x) for x in fwds):.3f} m, score min {min(scores):.2f} OK")
 
 
-def check_vo_residual_share_mid_score() -> None:
-    """Share >= 0.15 with residual score in [0.4, 0.6) must still accept the residual.
 
-    Kills F3 (share path removed; only conf >= 0.6 accepts a residual). A
-    mid-score residual of moving posts, diluted by unmatched noise, must
-    beat an ego-fixed sheet that locks the full set at zero.
+def check_vo_parked_structured() -> None:
+    """Parked-ego structured disturbances must stay at rest with ok=True.
+
+    Ports Skeptic's vo_probe3 / vo_lat probes: 2- and 3-voxel range smear,
+    whole-wall depth jumps, a moving non-vehicle object, and lateral smear.
+    The residual path accepted these as motion; full-set (observed) VO must
+    not. |fwd| < 0.1 and |yaw| < 0.0025, score >= VO_MIN_SCORE, 6 ticks.
     """
-    rng = np.random.default_rng(4)
-    clutter = np.stack([rng.uniform(-24, 24, 800), rng.uniform(-12, 50, 800)], 1)
-    posts = np.stack([rng.uniform(-20, -6, 200), rng.uniform(5, 40, 200)], 1)
-    fwd = 2.5
-
-    def cells(shift, seed):
-        r = np.random.default_rng(seed)
-        noise = np.stack([r.uniform(-24, 24, 100), r.uniform(-12, 50, 100)], 1)
-        xy = np.concatenate([posts - np.array([0.0, shift]), clutter, noise])
-        pts = np.concatenate([xy, np.full((len(xy), 1), 1.2)], 1)
-        k = G.keys_of(pts)
-        k = k[k >= 0]
-        return k, np.zeros(k.size, np.uint8)
-
-    k0, c0 = cells(0.0, 11)
-    k1, c1 = cells(fwd, 12)
-    est_fwd, dyaw, score = occ_odometry(k0, c0, k1, c1, grid=G)
-    assert abs(est_fwd - fwd) < 0.3, (est_fwd, dyaw, score)
-    assert VO_MIN_SCORE <= score < 0.6, (est_fwd, score)
-    print(f"VO residual share mid-score: fwd {est_fwd:.3f} m (true {fwd}) score {score:.3f} in [0.4, 0.6) OK")
-
-
-def check_vo_residual_share_low_score() -> None:
-    """Share >= 0.15 with residual score < 0.4 must keep the full (0, 0), ok=True.
-
-    Kills F4 (min-score check removed; a low-score residual with a large
-    unmatched share would be returned and clear memory). 20% and 25%
-    random parked flicker is such a residual.
-    """
-    rng = np.random.default_rng(1)
-    n_static = 600
     v = float(G.voxel_m)
-    base = (np.floor(np.stack([rng.uniform(-20, 20, n_static), rng.uniform(0, 45, n_static)], 1) / v) + 0.5) * v
+    snap = lambda xy: (np.floor(np.asarray(xy, np.float64) / v) + 0.5) * v
 
     def keys(xy, z=1.2):
         pts = np.concatenate([xy, np.full((len(xy), 1), z)], 1)
@@ -301,21 +275,118 @@ def check_vo_residual_share_low_score() -> None:
         k = np.unique(k[k >= 0])
         return k, np.zeros(k.size, np.uint8)
 
-    for frac in (0.20, 0.25):
-        n = int(round(frac * n_static))
-        fwds, scores = [], []
-        for t in range(5):
-            r = np.random.default_rng(200 + t + n)
-            flick_a = (np.floor(np.stack([r.uniform(-20, 20, n), r.uniform(0, 45, n)], 1) / v) + 0.5) * v
-            flick_b = (np.floor(np.stack([r.uniform(-20, 20, n), r.uniform(0, 45, n)], 1) / v) + 0.5) * v
-            f, y, sc = occ_odometry(*keys(np.concatenate([base, flick_a])),
-                                   *keys(np.concatenate([base, flick_b])), grid=G)
-            fwds.append(f)
-            scores.append(sc)
-            assert abs(f) < 0.1, (frac, t, f, y, sc)
-            assert sc >= VO_MIN_SCORE, (frac, t, f, sc)
-        print(f"VO residual share low-score {n}/{n_static} ({100 * frac:.0f}% random): "
-              f"|fwd| max {max(abs(x) for x in fwds):.3f} m, score min {min(scores):.2f} OK")
+    def run(tag, gen, n=6, seed=7):
+        rng = np.random.default_rng(seed)
+        fwds, yaws, scores = [], [], []
+        for t in range(n):
+            a, b = gen(rng, t)
+            f, y, sc = occ_odometry(*keys(a), *keys(b), grid=G)
+            fwds.append(f); yaws.append(y); scores.append(sc)
+            assert abs(f) < 0.1, (tag, t, f, y, sc)
+            assert abs(y) < 0.0025, (tag, t, f, y, sc)
+            assert sc >= VO_MIN_SCORE, (tag, t, f, sc)
+        print(f"VO parked+{tag}: |fwd| max {max(abs(x) for x in fwds):.3f} m, "
+              f"|yaw| max {max(abs(x) for x in yaws):.4f} rad, score min {min(scores):.2f} OK")
+
+    r0 = np.random.default_rng(1)
+    base = snap(np.stack([r0.uniform(-20, 20, 600), r0.uniform(0, 45, 600)], 1))
+
+    def smear(k, sided, nfl):
+        def g(rng, t):
+            fl = []
+            for _ in range(2):
+                idx = rng.choice(len(base), nfl, replace=False)
+                sg = np.ones(nfl) if sided == 1 else rng.choice([-1.0, 1.0], nfl)
+                fl.append(base[idx] + np.stack([np.zeros(nfl), sg * k * v], 1))
+            return np.concatenate([base, fl[0]]), np.concatenate([base, fl[1]])
+        return g
+
+    for k in (1, 2, 3):
+        for nfl in (30, 100, 200):
+            run(f"one-sided {k}-voxel range smear n={nfl}", smear(k, 1, nfl))
+            run(f"+-{k}-voxel range jitter n={nfl}", smear(k, 2, nfl))
+
+    wall = snap(np.stack([np.linspace(-6, 6, 30).repeat(2), np.tile([20.0, 20.4], 30)], 1))
+    for k in (1, 2, 3):
+        def g(rng, t, k=k):
+            return np.concatenate([base, wall]), np.concatenate([base, wall + [0, k * v]])
+        run(f"whole wall depth jumps {k} voxel(s)", g)
+
+    def gc(rng, t):
+        c = snap(np.stack([rng.uniform(-4, 4, 40), rng.uniform(10, 14, 40)], 1))
+        return np.concatenate([base, c]), base.copy()
+    run("40-cell cluster vanishes", gc)
+
+    obj = snap(np.stack([np.linspace(2, 4, 6).repeat(8), np.tile(np.linspace(5, 7.8, 8), 6)], 1))
+    for vel in (0.6, 1.0, 2.0):
+        def gm(rng, t, vel=vel):
+            return np.concatenate([base, obj + [0, vel * t]]), np.concatenate([base, obj + [0, vel * (t + 1)]])
+        run(f"48-cell other object moving {vel} m/frame", gm)
+
+    def radial(n, r, k=1):
+        idx = r.choice(len(base), n, replace=False)
+        pt = base[idx]
+        d = pt / np.linalg.norm(pt, axis=1, keepdims=True)
+        return snap(pt + d * k * v)
+
+    def lateral(n, r, k=1):
+        idx = r.choice(len(base), n, replace=False)
+        return base[idx] + np.array([k * v * np.sign(r.standard_normal()), 0])
+
+    for name, fn in (("radial 1-voxel smear", radial), ("lateral 1-voxel smear", lateral)):
+        for n in (30, 60, 100, 150):
+            def g(rng, t, n=n, fn=fn):
+                return np.concatenate([base, fn(n, rng)]), np.concatenate([base, fn(n, rng)])
+            run(f"{name} n={n}", g)
+
+
+def check_vo_slow_motion() -> None:
+    """Slow real motion stays within a voxel of truth, with and without clutter.
+
+    Ports Skeptic's vo_slow.py. Clean continuous-world points must match base
+    (quantization, max |err| <= 0.2 m). With 3000 ego-fixed unobserved clutter
+    cells, observed posts still track; no residual path is used.
+    """
+    r = np.random.default_rng(3)
+    world = np.stack([r.uniform(-20, 20, 4000), r.uniform(-5, 50, 4000)], 1)
+    clutter = (np.floor(np.stack([r.uniform(-6, 6, 3000), r.uniform(0, 30, 3000)], 1) / 0.4) + 0.5) * 0.4
+
+    def keys_obs(xy, obs=None, z=1.2):
+        pts = np.concatenate([xy, np.full((len(xy), 1), z)], 1)
+        k = G.keys_of(pts)
+        ok = k >= 0
+        k = k[ok]
+        c = np.zeros(k.size, np.uint8)
+        if obs is None:
+            return k, c, None
+        return k, c, np.asarray(obs, bool)[ok]
+
+    for clut in (False, True):
+        for fwd in (0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.8, 1.5):
+            errs, oks = [], 0
+            for t in range(8):
+                y0 = t * fwd
+                a = world - [0, y0]
+                b = world - [0, y0 + fwd]
+                if clut:
+                    a_xy = np.concatenate([a[:300], clutter])
+                    b_xy = np.concatenate([b[:300], clutter])
+                    oa = np.concatenate([np.ones(300, bool), np.zeros(len(clutter), bool)])
+                    ob = np.concatenate([np.ones(300, bool), np.zeros(len(clutter), bool)])
+                    k0, c0, o0 = keys_obs(a_xy, oa)
+                    k1, c1, o1 = keys_obs(b_xy, ob)
+                    f, yw, sc = occ_odometry(k0, c0, k1, c1, grid=G, prev_obs=o0, cur_obs=o1)
+                else:
+                    k0, c0, _ = keys_obs(a)
+                    k1, c1, _ = keys_obs(b)
+                    f, yw, sc = occ_odometry(k0, c0, k1, c1, grid=G)
+                errs.append(f - fwd)
+                oks += int(sc >= VO_MIN_SCORE)
+            err = np.asarray(errs)
+            assert oks == 8, (clut, fwd, oks, err)
+            assert float(np.max(np.abs(err))) <= 0.2 + 1e-9, (clut, fwd, err)
+            print(f"VO slow {'clutter' if clut else 'clean  '} fwd {fwd:.2f}: "
+                  f"mean err {float(np.mean(err)):+.3f} max|err| {float(np.max(np.abs(err))):.3f} ok {oks}/8 OK")
 
 
 def check_featureless() -> None:
@@ -335,8 +406,8 @@ def main() -> int:
     check_vo_clutter()
     check_vo_parked_flicker()
     check_vo_parked_range_flicker()
-    check_vo_residual_share_mid_score()
-    check_vo_residual_share_low_score()
+    check_vo_parked_structured()
+    check_vo_slow_motion()
     check_world_fixed()
     check_featureless()
     print("test_occ_ego: all OK")

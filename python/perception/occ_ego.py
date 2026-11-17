@@ -37,13 +37,6 @@ DRIVABLE = 1
 VEHICLE_SIGNAL_KEYS = ("wheelspeed_mps", "imu_yaw_rate")
 VO_MIN_CELLS = 12
 VO_MIN_SCORE = 0.4
-# Residual VO: unmatched-at-zero cells are used only when they are a real
-# share of the previous set, or when they themselves register with high
-# confidence (ego-fixed clutter is a small share but a sharp residual peak).
-# An absolute 12-cell floor on the residual (the first version) treated
-# parked-ego flicker as motion.
-VO_RESIDUAL_SHARE = 0.15
-VO_RESIDUAL_CONF = 0.6
 FWD_RANGE_M = (-1.0, 4.0)     # per frame: -10..40 m/s at 10 Hz
 YAW_RANGE = (-0.15, 0.15)     # rad per frame
 
@@ -54,10 +47,13 @@ def add_ego_args(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
     return ap
 
 
-def _static_bev(keys: np.ndarray, cls: np.ndarray, grid: OccGrid) -> np.ndarray:
+def _static_bev(keys: np.ndarray, cls: np.ndarray, grid: OccGrid,
+                obs: np.ndarray | None = None) -> np.ndarray:
     keys = np.asarray(keys, dtype=np.int64)
     cls = np.asarray(cls)
     m = (cls != VEHICLE) & (cls != DRIVABLE)
+    if obs is not None:
+        m = m & np.asarray(obs, dtype=bool)
     if not m.any():
         return np.zeros((0, 2), dtype=np.float64)
     c = grid.cell_of_key(keys[m])
@@ -119,37 +115,24 @@ def _register(prev: np.ndarray, cur_keys: np.ndarray, grid: OccGrid) -> tuple[fl
     return best[1], best[2], best[0]
 
 
-def occ_odometry(prev_keys, prev_cls, cur_keys, cur_cls, *, grid: OccGrid = DEFAULT_GRID) -> tuple[float, float, float]:
-    """(forward m, yaw rad, overlap score) moving the previous frame onto the current one."""
-    prev, cur = _static_bev(prev_keys, prev_cls, grid), _static_bev(cur_keys, cur_cls, grid)
+def occ_odometry(prev_keys, prev_cls, cur_keys, cur_cls, *, grid: OccGrid = DEFAULT_GRID,
+                 prev_obs: np.ndarray | None = None, cur_obs: np.ndarray | None = None,
+                 ) -> tuple[float, float, float]:
+    """(forward m, yaw rad, overlap score) moving the previous frame onto the current one.
+
+    Only *observed* static cells vote (``prev_obs`` / ``cur_obs``; default all
+    observed). Unobserved decode_unseen clutter is ignored, so there is no
+    residual path: a parked ego with a moving or jittering subset keeps the
+    (0, 0) hypothesis the same way full-set registration always did. Forward
+    and yaw come from the same search.
+    """
+    prev = _static_bev(prev_keys, prev_cls, grid, obs=prev_obs)
+    cur = _static_bev(cur_keys, cur_cls, grid, obs=cur_obs)
     if len(prev) < VO_MIN_CELLS or len(cur) < VO_MIN_CELLS:
         return 0.0, 0.0, 0.0
-    cur_keys = np.unique(_bev_keys(cur, grid))
-    cur_keys = cur_keys[cur_keys >= 0]
-    # Score the full set and, if enough cells miss at zero, the residual set.
-    # Ego-fixed decode_unseen clutter scores 0.8+ at (0, 0) on the full set and
-    # would lock speed=0; the residual of the moving posts still registers.
-    # A parked ego with flickering cells must keep the full (0, 0) hit, including
-    # one-voxel boundary smear along the camera ray (a sharp residual peak at
-    # 0.4 m is still not motion). Residual is used only when the unmatched
-    # share is large, or the residual itself scores with high confidence, and
-    # only when its shift exceeds one voxel versus the full hypothesis.
-    full = _register(prev, cur_keys, grid)
-    k0 = _bev_keys(_warp(prev, 0.0, 0.0), grid)
-    pos0 = np.clip(np.searchsorted(cur_keys, k0), 0, len(cur_keys) - 1)
-    hit0 = (cur_keys[pos0] == k0) & (k0 >= 0)
-    residual = prev[~hit0]
-    if len(residual) >= VO_MIN_CELLS:
-        res = _register(residual, cur_keys, grid)
-        share = len(residual) / float(len(prev))
-        if res[2] >= VO_MIN_SCORE and (share >= VO_RESIDUAL_SHARE or res[2] >= VO_RESIDUAL_CONF):
-            # One-voxel residual peaks are boundary flicker along the ray
-            # (a copy of a cell that already matched at the full hypothesis).
-            # Use the residual only when its shift exceeds one voxel.
-            if (abs(res[0] - full[0]) > float(grid.voxel_m) + 1e-9
-                    or abs(res[1] - full[1]) > 1e-9):
-                return res
-    return full
+    cur_k = np.unique(_bev_keys(cur, grid))
+    cur_k = cur_k[cur_k >= 0]
+    return _register(prev, cur_k, grid)
 
 
 @dataclass
@@ -167,14 +150,15 @@ class EgoMotion:
         self.from_vehicle = bool(from_vehicle)
         self.source = "vehicle_signals" if self.from_vehicle else "camera_vo"
         self.grid = grid
-        self._prev: tuple[np.ndarray, np.ndarray, float] | None = None
+        self._prev: tuple[np.ndarray, np.ndarray, float, np.ndarray | None] | None = None
         self._last = EgoEstimate(0.0, 0.0, self.source, False)
 
     @classmethod
     def from_args(cls, a: argparse.Namespace, **kw: Any) -> "EgoMotion":
         return cls(from_vehicle=bool(getattr(a, "ego_from_vehicle", False)), **kw)
 
-    def update(self, keys: np.ndarray, cls: np.ndarray, t: float, vehicle: Mapping[str, Any] | None = None) -> EgoEstimate:
+    def update(self, keys: np.ndarray, cls: np.ndarray, t: float, vehicle: Mapping[str, Any] | None = None,
+               obs: np.ndarray | None = None) -> EgoEstimate:
         if self.from_vehicle:
             sig = {k: vehicle[k] for k in VEHICLE_SIGNAL_KEYS if vehicle is not None and k in vehicle}
             if len(sig) == len(VEHICLE_SIGNAL_KEYS):
@@ -182,12 +166,14 @@ class EgoMotion:
             else:
                 self._last = EgoEstimate(self._last.speed_mps, self._last.yaw_rate, self.source, False)
             return self._last
-        prev, self._prev = self._prev, (np.asarray(keys), np.asarray(cls), float(t))
+        obs_a = None if obs is None else np.asarray(obs, dtype=bool)
+        prev, self._prev = self._prev, (np.asarray(keys), np.asarray(cls), float(t), obs_a)
         if prev is None or float(t) <= prev[2]:
             self._last = EgoEstimate(self._last.speed_mps, self._last.yaw_rate, self.source, False)
             return self._last
         dt = float(t) - prev[2]
-        fwd, dyaw, score = occ_odometry(prev[0], prev[1], keys, cls, grid=self.grid)
+        fwd, dyaw, score = occ_odometry(prev[0], prev[1], keys, cls, grid=self.grid,
+                                        prev_obs=prev[3], cur_obs=obs_a)
         if score < VO_MIN_SCORE:
             self._last = EgoEstimate(self._last.speed_mps, self._last.yaw_rate, self.source, False)
         else:

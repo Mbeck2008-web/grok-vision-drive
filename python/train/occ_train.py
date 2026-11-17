@@ -134,10 +134,12 @@ def sample_queries(
             pick = rng.integers(0, keys.size, size=int(n_occ))
         p = grid.centers_of_keys(keys[pick]) + rng.uniform(-JITTER, JITTER, size=(int(n_occ), 3)) * grid.voxel_m
         pts.append(p); occ.append(np.ones(n_occ)); occ_w.append(np.ones(n_occ)); tcls.append(cls[pick].astype(np.int64))
-    # Free budget stays n_free (no extras): recorded free rays plus unoccupied cell
-    # centres. Stratified upper positives would otherwise teach "everything above
-    # the road is occupied"; decode_unseen then fills a dense ego-fixed volume
-    # and camera-VO locks at zero shift.
+    # Free budget stays n_free (no extras): recorded free rays plus unoccupied
+    # *below-ground* cell centres. Stratified upper positives would otherwise
+    # teach "everything above the road is occupied"; only the recorded free
+    # rays stop that (the unoccupied centres are below-ground only and cannot).
+    # decode_unseen filling a dense ego-fixed volume would also lock camera-VO
+    # at zero shift.
     if n_free:
         n_empty = int(n_free) // 2
         n_ray = int(n_free) - n_empty

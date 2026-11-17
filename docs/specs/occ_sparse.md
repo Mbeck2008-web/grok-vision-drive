@@ -257,9 +257,12 @@ Residual VO: cells that already match at zero shift can be an ego-fixed
 set and the residual (unmatched-at-zero) set. The residual is used only when
 its share of the previous cells is at least `VO_RESIDUAL_SHARE` (0.15) or
 its own overlap is at least `VO_RESIDUAL_CONF` (0.6), and that overlap is
-at least `VO_MIN_SCORE` (0.4, unchanged). A parked ego with a few flickering
-cells therefore keeps the full (0, 0) hypothesis (`ok=True`). Tests:
-`check_vo_clutter`, `check_vo_parked_flicker`.
+at least `VO_MIN_SCORE` (0.4, unchanged), and only when its shift versus
+the full hypothesis exceeds one voxel. A one-voxel boundary smear along the
+camera ray is therefore not treated as motion. A parked ego with uniform or
+one-voxel range flicker keeps the full (0, 0) hypothesis (`ok=True`). Tests:
+`check_vo_clutter`, `check_vo_parked_flicker`, `check_vo_parked_range_flicker`,
+`check_vo_residual_share_mid_score`, `check_vo_residual_share_low_score`.
 
 Tests: `test_occ_ego` (VO, residual clutter, parked+flicker, world-fixed cells with the flag off, non-identity
 warp, drift printout), `test_occ_runtime_imports` (no GT-pose module reachable
@@ -443,24 +446,29 @@ batch 1) = 104.7 MB; batch 4 (training batch) = 416.8 MB, both under the
 
 Tests: `test_occ_unseen` (TRACER traces, labels, unseen decode, observed,
 memory, causality), `test_occ_memory_gap` (hidden-leg proof through
-`OccRuntime`: predict + cap + camera VO + observed + memory; lift retrain,
-loss ablation, zero-warp, memory-off mutants), `test_occ_net` (xy-spread
+`OccRuntime`: predict + cap + vehicle-signal ego + observed + memory; lift retrain,
+loss ablation, zero-warp, memory-off mutants; camera VO is not in this proof), `test_occ_net` (xy-spread
 cap, below-ground-hot cap, class-balanced ground positives, below-ground
 free samples, deterministic overfit/predict), `test_occ_out` (v2 fields, version gate),
 `test_occ_runtime_imports` (safety isolation), `test_eval_occ_unseen` (eval
 smoke). Metrics: `scripts/eval_occ_unseen.py` (results below).
 
-Later-stage `predict` caps (`_capped_hot`): the ground band is the most
-populous z-layer (ties broken toward z closest to 0). At most half the cap
-goes there; above-ground structure is filled next, then below-ground, each
+Later-stage `predict` caps (`_capped_hot`): the ground band is every
+z-layer whose cell centre is at most half a cell from z=0 (geometry, not
+count; a two-layer slope around z=0 stays in the band). At most half the
+cap goes there; above-ground structure is filled next, then below-ground, each
 pool spread in xy so a high-p off-road region cannot take the whole ground
-budget. `sample_queries` class-balances ground positives and spends half of
+budget. A holed or partial ground layer therefore cannot lose the band to a
+more populous below-ground fill. `sample_queries` class-balances ground positives and spends half of
 `n_free` on unoccupied *below-ground* cell centres (never on above-ground
 cells missing from `keys`, which may be occluded structure).
 
 #### Unseen-structure results (SYNTHETIC, `eval_occ_unseen.py`)
 
-Run 2026-11-17 01:55-04:13 CST on the loaded CPU box (load 26-73),
+This table is from a run on 2026-11-17 01:55-04:13 CST, before the residual-VO,
+three-pool cap, and below-ground free-sample commits (`490fc34`..`b5279d2`,
+about 12:00-1:00 PM CST the same day). It has not been re-run at later heads.
+Run was on the loaded CPU box (load 26-73),
 `--steps 300 --train-seeds 10 --eval-seeds 3 --frames 5 --baseline --threads 4`,
 cheap net (45,398 params) at 64 px, 100 train samples; held-out seeds 900-902
 per clip kind; last frame of each clip, mean over the 3 clips. Visible /

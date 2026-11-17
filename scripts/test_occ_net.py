@@ -181,6 +181,7 @@ def check_overfit(tmp: Path) -> None:
     print("overfit: loss fell > 60%, IoU > 0.85 OK")
     # The trained net's sparse predict on the training scene, cell level.
     net = res["net"].eval()
+    net.decode_unseen = False  # camera-only labels here: unseen cells were never supervised (unseen decode: test_occ_unseen)
     imgs = [torch.from_numpy(prep_image(render(full[c.cam_id].scaled(128))[2], c)).unsqueeze(0) for c in cams]
     net.reset_temporal()
     for _ in range(3):  # capped top stage (2048 of the visible coarse cells): let the sweep + hot carry settle

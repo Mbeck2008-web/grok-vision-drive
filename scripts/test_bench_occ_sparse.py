@@ -29,7 +29,10 @@ def main() -> int:
     assert abs(out["infer_fps"] - 1000.0 / out["infer_ms_median"]) < 1e-6
     assert out["device"] == "cpu" and out["cams"] == ["main", "rear"], out
     assert out["params"] > 10_000 and out["act_bytes_fp32_queries"] > 0
-    assert out["infer_ms_median"] > 0 and 0 < out["infer_queried_ratio"] < 0.25, out
+    # every stage is capped: top <= max_coarse, then <= max_points per stage (decode_unseen sweeps the whole top grid)
+    bound = (out["max_coarse"] + 2 * out["max_points"]) / out["grid_cells"]
+    assert out["infer_ms_median"] > 0 and 0 < out["infer_queried_ratio"] <= bound, (out["infer_queried_ratio"], bound)
+    assert sum(out["infer_stage_queries"]) == out["infer_n_coarse"] + out["infer_n_fine"], out["infer_stage_queries"]
     assert out["shard_bytes_per_sample"] > 0 and out["train_compute_ms_median"] > 0 and out["train_peak_rss_mb"] > 0
     assert "infer_cuda_max_allocated_mb" not in out, "no CUDA number without CUDA"
     # peak_vram_mb is UNPROVEN until an nvidia-smi reading is passed; the CPU estimate never fills it

@@ -85,8 +85,8 @@ def _batch(visible_only: bool):
 
     from python.train.occ_train import collate, prep_image
 
-    q = sample_queries(KEYS, CLS, LAB.free, np.random.default_rng(3), vis_keys=VIS, visible_only=visible_only,
-                       n_occ=768, n_free=256, n_coarse=128)
+    kw = {"visible_only": True} if visible_only else {}  # after = the training default (no flag)
+    q = sample_queries(KEYS, CLS, LAB.free, np.random.default_rng(3), vis_keys=VIS, n_occ=768, n_free=256, n_coarse=128, **kw)
     q["images"] = [prep_image(ss.render(c, SCENE)[2], NCAMS[i]) for i, c in enumerate(RCAMS.values())]
     q["recovery"] = False
     return collate([q]), torch
@@ -235,8 +235,25 @@ def check_observed() -> None:
     gt_vis = np.isin(keys, VIS)
     agree = float((obs[ground] == gt_vis[ground]).mean())
     assert agree > 0.8, agree
+    # edge points track GT visibility of the ground cell under the point
+    ep = np.array([p for e in m["edges"] for p in e["pts"]], float).reshape(-1, 2)
+    eo = np.array([b for e in m["edges"] for b in e["observed"]], bool)
+    ec = G.cell_of(np.concatenate([ep, np.zeros((len(ep), 1))], 1))
+    ec[:, 2] = ML.ground_k
+    e_agree = float((eo == np.isin(G.key_of_cell(ec), VIS)).mean())
+    assert eo.size > 20 and e_agree > 0.85, (eo.size, e_agree)
+    # preset "min" (forward cams only): edge points behind the ego are unobserved, ahead observed
+    rt = oo.OccRuntime(StubNet([_pred(k, c) for _, _, _, k, c in CLIP_LABELS[:1]], list(RCAMS.values())),
+                       preset="min", memory=False, timer=lambda: 0.0)
+    m2 = rt.step(_imgs(), 0.0)
+    fp = np.array([p for e in m2["edges"] for p in e["pts"]], float).reshape(-1, 2)
+    fo = np.array([b for e in m2["edges"] for b in e["observed"]], bool)
+    behind, ahead = fp[:, 1] < -3.0, (fp[:, 1] > 8.0) & (fp[:, 1] < 30.0)
+    assert behind.sum() > 5 and not fo[behind].any(), (behind.sum(), fo[behind].sum())
+    assert ahead.sum() > 5 and fo[ahead].mean() > 0.8, fo[ahead].mean()
     print(f"observed: {obs.sum()} observed / {(~obs).sum()} not (finite prob, valid class); ground cells agree with "
-          f"8-camera ray-cast GT visibility {agree:.1%}; every edge point flagged OK")
+          f"8-camera ray-cast GT visibility {agree:.1%}; edge points agree {e_agree:.1%}; preset min: "
+          f"{int(behind.sum())} edge points behind ego all unobserved, ahead {fo[ahead].mean():.0%} observed OK")
 
 
 def check_memory() -> None:
@@ -250,15 +267,44 @@ def check_memory() -> None:
         rt = _runtime(list(preds), memory=mem)
         rt.step(_imgs(), CLIP[0][0])
         m = rt.step(_imgs(), CLIP[1][0])
-        keys, _, _, obs = rt.last_cells  # every stored cell (the message keeps the nearest MAX_CELLS)
+        keys, kcls, _, obs = rt.last_cells  # every stored cell (the message keeps the nearest MAX_CELLS)
+        carried = keys[~np.isin(keys, preds[1].keys) & (kcls == 1)]
+        prec = float(np.isin(carried, ml1.keys[ml1.cls == 1]).mean()) if carried.size else None
+        if mem:
+            prec_mem = prec
         assert m["ego"]["ok"], m["ego"]
         res[mem] = (float(np.isin(hidden, keys).mean()), float(np.isin(shown, keys).mean()),
                     float(obs[np.isin(keys, hidden)].mean()) if np.isin(keys, hidden).any() else None)
     assert res[True][0] > 0.5 and res[False][0] == 0.0, res        # carried vs gone
     assert res[True][2] == 0.0, res                                 # carried cells are not observed
     assert res[True][1] < 0.1, res                                  # a seen-free cell is not carried
+    assert prec_mem is not None and prec_mem > 0.97, prec_mem      # carried cells land on the true road (VO-warped)
     print(f"memory: occluded-at-t1 leg cells present with memory {res[True][0]:.0%} (observed=False), without {res[False][0]:.0%}; "
-          f"visible-and-dropped cells carried {res[True][1]:.0%} OK")
+          f"visible-and-dropped cells carried {res[True][1]:.0%}; carried ground cells on true road {prec_mem:.1%} OK")
+
+
+def check_memory_rules() -> None:
+    from python.perception.occ_outputs import VEHICLE
+    rng = np.random.default_rng(5)
+    keys = np.unique(rng.integers(0, G.dense_cells, 600))
+    cls = np.where(np.arange(keys.size) % 3 == 0, VEHICLE, 1).astype(np.uint8)
+    prob = np.full(keys.size, 0.9, np.float32)
+    obs = np.ones(keys.size, bool)
+    occl = np.zeros(0, np.int64)
+    e = np.zeros(0, np.int64)
+    kw = dict(fwd=0.0, dyaw=0.0, cams=[], occl=occl)
+    mem = oo.OccMemory(G)
+    mem.step(keys, cls, prob, obs, ok=True, dt=None, **kw)
+    assert mem.keys.size and not (mem.cls == VEHICLE).any(), np.unique(mem.cls)   # vehicles are never remembered
+    K, C, _, _ = mem.step(e, e.astype(np.uint8), e.astype(np.float32), e.astype(bool), ok=True, dt=0.1, **kw)
+    assert K.size and not (C == VEHICLE).any(), (K.size, np.unique(C))
+    n_static = K.size
+    mem.step(e, e.astype(np.uint8), e.astype(np.float32), e.astype(bool), ok=False, dt=0.1, **kw)
+    assert mem.keys.size == 0, mem.keys.size                                    # VO lost -> memory cleared
+    K, _, _, _ = mem.step(e, e.astype(np.uint8), e.astype(np.float32), e.astype(bool), ok=True, dt=0.1, **kw)
+    assert K.size == 0, K.size                                                  # nothing resurfaces after VO recovers
+    print(f"memory rules: {int((cls == VEHICLE).sum())} vehicle cells never carried ({n_static} static carried); "
+          f"VO lost -> cleared, nothing resurfaces OK")
 
 
 def check_causality() -> None:
@@ -303,6 +349,7 @@ def main() -> int:
     check_predict_unseen()
     check_observed()
     check_memory()
+    check_memory_rules()
     check_causality()
     print("test_occ_unseen: all OK")
     return 0

@@ -79,7 +79,7 @@ def check_round_trip_and_edge_positions() -> None:
     for e, want_x in zip(sorted(occ_edges, key=lambda e: e["pts"][0][0]), (-3.5, 3.5)):
         xs = np.array([p[0] for p in e["pts"]])
         ys = np.array([p[1] for p in e["pts"]])
-        assert np.abs(xs - want_x).max() <= 0.25, (want_x, xs)
+        assert np.abs(xs - want_x).max() <= 0.05, (want_x, xs)  # band boundary, not cell centres
         assert abs(ys.min() - 0.5) <= 1.0 and abs(ys.max() - 19.5) <= 1.0, (ys.min(), ys.max())
         assert np.all(np.diff(ys) > 0), "edge points ordered forward"
     assert {c["cls"] for c in msg["occ"]} == {"drivable", "vehicle"}
@@ -89,7 +89,7 @@ def check_round_trip_and_edge_positions() -> None:
     assert len({t["id"] for t in msg["tracks"]}) == 5
     assert msg["stop_lines"] == [{"pts": [[-1.8, 18.0], [1.8, 18.0]]}]
     assert len(msg["crosswalks"]) == 1 and msg["signs"][0]["cls"] == "stop_sign"
-    print(f"  round trip: {len(msg['occ'])} occ cells, occ edges at x=+-3.5 (tol 0.25 m), 5 motion states over 4 frames")
+    print(f"  round trip: {len(msg['occ'])} occ cells, occ edges at x=+-3.5 (tol 0.05 m), 5 motion states over 4 frames")
 
 
 def check_motion_needs_history() -> None:
@@ -101,6 +101,9 @@ def check_motion_needs_history() -> None:
     seen = [[t["motion"] for t in occ_to_viz(_pred(f), tracker=tr, t=0.1 * f, ego_speed_mps=10.0)["tracks"]] for f in range(3)]
     assert set(seen[0]) == {"unknown"} and set(seen[1]) == {"unknown"}, seen
     assert "unknown" not in seen[2], seen
+    slow = MotionTracker()  # long ticks: span is met after 2 frames, frame count still gates
+    two = [occ_to_viz(_pred(f, dt=0.25), tracker=slow, t=0.25 * f, ego_speed_mps=10.0) for f in range(2)][-1]
+    assert {t["motion"] for t in two["tracks"]} == {"unknown"}, "2 frames is not a track history"
     print("  motion: unknown until 3 frames over 0.2 s; never from one frame")
 
 

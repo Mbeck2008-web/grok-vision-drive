@@ -32,7 +32,7 @@ extras below. When `python.viz.cpp_publisher` is importable (PR #232), the adapt
 | field | shape | from | GT source in recorder data |
 |---|---|---|---|
 | `occ` (optional) | `{x, y, z, cls}`, cls unknown/drivable/vehicle, at most 800 (about 41 kB) | occ head on queried voxels, sigmoid > 0.5 | labels v4 `raw/<cam>_depth` + `_sem` + traffic (this spec) |
-| `edges[]` src `occ` | `{pts, kind: detected, src: occ}` | outermost drivable cell per 1 m forward bin, left and right, ±0.25 m | same as `occ` (derived) |
+| `edges[]` src `occ` | `{pts, kind: detected, src: occ}` | outermost drivable cell per 1 m forward bin, left and right, ±0.05 m | same as `occ` (derived) |
 | `edges[]` src `curb` | `{pts, kind: detected, src: curb}` | `curbs` head | existing curbs labels |
 | `lanes[].paint` | `white` / `yellow` | `lane_paint` = P(yellow) per lane, white when absent | **labelable, no head yet**: decal materials `line_yellow*` vs `line_white*` (`python/debug/painted_lanes.py`). UNLABELED in the net; live is white. |
 | `stop_lines` (optional) | `{pts: [[-1.8, y], [1.8, y]]}` | `stop_line` = (y_m, valid logit) | `intersection_labels.stop_line_arrays`. The head is training-only, so live has none. |

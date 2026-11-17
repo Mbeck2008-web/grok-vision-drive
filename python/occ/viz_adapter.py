@@ -19,7 +19,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from python.occ.classes import CLASS_NAMES, CLASS_RGB, CLASS_SRC, SRC_EDGE, SRC_MOTION, SRC_VEHICLE, UNLABELED, UNLABELED_OUTPUTS
+from python.occ.classes import CLASS_NAMES, CLASS_RGB, CLASS_SRC, KNOWN_SOURCES, N_CLASSES, RED_POLYLINE_KINDS, SRC_EDGE, SRC_MOTION, SRC_VEHICLE, UNLABELED, UNLABELED_OUTPUTS
 from python.occ.grid import DEFAULT_GRID, VoxelGrid
 
 SCHEMA_VERSION = 1
@@ -33,6 +33,18 @@ MESSAGE_KEYS = frozenset(
     {"v", "type", "seq", "t", "ego", "lead_id", "aeb", "lanes", "edges", "tracks", "signs", "path", "path_conf"}
 )
 MAX_OCC_CELLS = 1500
+# C++ reads seq as long long and ids as int.
+INT64 = (-(2**63), 2**63)
+INT32 = (-(2**31), 2**31)
+MOTION_STATES = ("unknown", "parked", "same_way", "oncoming", "crossing", "alongside")
+
+
+def _int_in(v: Any, rng: tuple[int, int]) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and rng[0] <= v < rng[1]
+
+
+def _src(v: Any) -> str:
+    return v if isinstance(v, str) and v in KNOWN_SOURCES else UNLABELED
 
 
 class VizSchemaError(ValueError):
@@ -60,8 +72,8 @@ def validate_v1(msg: Any) -> list[str]:
         errs.append("type != gvd_scene")
     if not (isinstance(msg.get("v"), int) and not isinstance(msg.get("v"), bool) and msg.get("v") == 1):
         errs.append("v != 1")
-    if not (isinstance(msg.get("seq"), int) and not isinstance(msg.get("seq"), bool)):
-        errs.append("seq not an int")
+    if not _int_in(msg.get("seq"), INT64):
+        errs.append("seq not an int64")
     if not _num(msg.get("t")):
         errs.append("t not a finite number")
     ego = msg.get("ego")
@@ -69,8 +81,8 @@ def validate_v1(msg: Any) -> list[str]:
         errs.append("ego.engaged/speed_mps")
     elif "set_mps" in ego and not _num(ego["set_mps"]):
         errs.append("ego.set_mps")
-    if "lead_id" in msg and not (isinstance(msg["lead_id"], int) and not isinstance(msg["lead_id"], bool)):
-        errs.append("lead_id not an int")
+    if "lead_id" in msg and not _int_in(msg["lead_id"], INT32):
+        errs.append("lead_id not an int32")
     if not isinstance(msg.get("aeb"), str):
         errs.append("aeb not a string")
     if not _num(msg.get("path_conf")):
@@ -94,7 +106,7 @@ def validate_v1(msg: Any) -> list[str]:
         if not isinstance(tr, Mapping) or not _num(tr.get("x")) or not _num(tr.get("y")) or not isinstance(tr.get("cls"), str):
             errs.append(f"tracks[{i}] x/y/cls")
             continue
-        if "id" in tr and not (isinstance(tr["id"], int) and not isinstance(tr["id"], bool)):
+        if "id" in tr and not _int_in(tr["id"], INT32):
             errs.append(f"tracks[{i}].id")
         for k in ("yaw", "l", "w", "h", "v"):
             if k in tr and not _num(tr[k]):
@@ -123,17 +135,23 @@ def _track_row(tr: Mapping[str, Any]) -> dict[str, Any] | None:
     if not (_num(tr.get("x")) and _num(tr.get("y"))):
         return None
     row: dict[str, Any] = {"cls": str(tr.get("cls") or "vehicle"), "x": _r(tr["x"]), "y": _r(tr["y"])}
-    if isinstance(tr.get("id"), int) and not isinstance(tr.get("id"), bool):
+    if _int_in(tr.get("id"), INT32):
         row["id"] = int(tr["id"])
     if _num(tr.get("yaw")):
         row["yaw"] = _r(tr["yaw"], 3)
     for k in ("l", "w", "h", "v"):
         if _num(tr.get(k)):
             row[k] = _r(tr[k])
-    row["motion"] = str(tr.get("motion") or "unknown")
-    row["motion_frames"] = int(tr.get("motion_frames") or 0)
+    frames = tr.get("motion_frames")
+    frames = int(frames) if _int_in(frames, INT32) and frames > 0 else 0
+    motion = tr.get("motion")
+    # A motion state needs a track over >= 2 frames; anything else is unknown.
+    if motion not in MOTION_STATES or frames < 2:
+        motion = "unknown"
+    row["motion"] = motion
+    row["motion_frames"] = frames
     row["motion_src"] = SRC_MOTION
-    row["src"] = str(tr.get("src") or SRC_VEHICLE)
+    row["src"] = _src(tr.get("src", SRC_VEHICLE))
     return row
 
 
@@ -151,7 +169,7 @@ def occ_to_viz(outputs: Mapping[str, Any], *, seq: int = 0, ego: Mapping[str, An
     msg: dict[str, Any] = {
         "v": SCHEMA_VERSION,
         "type": "gvd_scene",
-        "seq": int(seq),
+        "seq": int(seq) % INT64[1],
         "t": round(float(t), 4),
         "ego": {"engaged": bool(eg.get("engaged", False)), "speed_mps": _r(speed)},
         "aeb": "off",
@@ -164,8 +182,9 @@ def occ_to_viz(outputs: Mapping[str, Any], *, seq: int = 0, ego: Mapping[str, An
     }
     for ed in list(outputs.get("edges") or [])[:MAX_EDGES]:
         pts = [[_r(p[0]), _r(p[1])] for p in ed.get("pts", []) if _num(p[0]) and _num(p[1])][:MAX_POINTS]
-        if len(pts) >= 2:
-            msg["edges"].append({"pts": pts, "kind": "predicted", "type": str(ed.get("type", "road_edge")), "src": str(ed.get("src", SRC_EDGE))})
+        ty = ed.get("type", "road_edge")
+        if len(pts) >= 2 and ty in RED_POLYLINE_KINDS:  # v1 edges draw red: only edges and curbs
+            msg["edges"].append({"pts": pts, "kind": "predicted", "type": ty, "src": _src(ed.get("src", SRC_EDGE))})
     for tr in outputs.get("tracks") or []:
         row = _track_row(tr) if isinstance(tr, Mapping) else None
         if row is not None:
@@ -178,6 +197,9 @@ def occ_to_viz(outputs: Mapping[str, Any], *, seq: int = 0, ego: Mapping[str, An
     conf = np.asarray(cells.get("conf", np.ones(cls.shape)), dtype=np.float64).reshape(-1)
     if not (idx.shape[0] == cls.shape[0] == conf.shape[0]):
         raise VizSchemaError("cells idx/cls/conf lengths differ")
+    good = (idx >= 0).all(axis=1) & (idx < np.array(grid.shape)).all(axis=1) & (cls >= 0) & (cls < N_CLASSES)
+    idx, cls = idx[good], cls[good]
+    conf = np.nan_to_num(conf[good], nan=0.0, posinf=1.0, neginf=0.0).clip(0.0, 1.0)
     order = np.argsort(-conf, kind="stable")[:MAX_OCC_CELLS]
     xyz = grid.to_center(idx[order]) if order.size else np.zeros((0, 3))
     occ_cells = [[_r(p[0], 1), _r(p[1], 1), _r(p[2], 1), int(c)] for p, c in zip(xyz.tolist(), cls[order].tolist())]

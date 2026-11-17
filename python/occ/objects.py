@@ -17,7 +17,9 @@ def objects_from_cells(idx: np.ndarray, cls: np.ndarray, conf: np.ndarray | None
     idx = np.asarray(idx, dtype=np.int64).reshape(-1, 3)
     cls = np.asarray(cls).reshape(-1)
     conf = np.ones(cls.shape, dtype=np.float32) if conf is None else np.asarray(conf, dtype=np.float32).reshape(-1)
-    sel = cls == VEHICLE
+    conf = np.nan_to_num(conf, nan=0.0, posinf=1.0, neginf=0.0).clip(0.0, 1.0)
+    inb = (idx >= 0).all(axis=1) & (idx < np.array(grid.shape)).all(axis=1)
+    sel = (cls == VEHICLE) & inb
     veh, vconf = idx[sel], conf[sel]
     if veh.shape[0] == 0:
         return []
@@ -68,7 +70,8 @@ def objects_from_cells(idx: np.ndarray, cls: np.ndarray, conf: np.ndarray | None
                 "yaw": float(yaw),
                 "l": float(a.max() - a.min() + v),
                 "w": float(b.max() - b.min() + v),
-                "h": float((zs.max() + 1) * v + grid.z_min - max(0.0, grid.z_min + zs.min() * v)),
+                # Top of the highest cell minus the lower of ground (0) and the lowest cell.
+                "h": float(max(v, (grid.z_min + (zs.max() + 1) * v) - max(0.0, grid.z_min + zs.min() * v))),
                 "conf": float(np.clip(vconf[ks].mean(), 0.0, 1.0)),
                 "src": SRC_VEHICLE,
             }

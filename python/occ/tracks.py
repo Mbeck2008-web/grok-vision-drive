@@ -31,6 +31,8 @@ SAME_DEG = 35.0
 ALONGSIDE_Y = 6.0
 ALONGSIDE_X = 1.2
 MAX_TRACKS = 64
+# Fastest object the gate allows for a track with no velocity yet (highway oncoming).
+MAX_OBJ_MPS = 45.0
 
 
 def _finite(*vals: Any) -> bool:
@@ -122,10 +124,20 @@ class MotionTracker:
         odom = [self._to_odom(float(d["x"]), float(d["y"])) for d in dets]
         pairs = []
         for ti, tr in enumerate(self.tracks):
-            _, X, Y = tr.hist[-1]
+            tl, X, Y = tr.hist[-1]
+            dt_tr = max(0.0, t - tl)
+            if len(tr.hist) >= 2:
+                # Constant-velocity prediction; the gate stays gate_m around it.
+                ta, xa, ya = tr.hist[-2]
+                span = max(tl - ta, 1e-6)
+                X += (X - xa) / span * dt_tr
+                Y += (Y - ya) / span * dt_tr
+                gate = self.gate_m
+            else:
+                gate = self.gate_m + MAX_OBJ_MPS * dt_tr
             for di, (ox, oy) in enumerate(odom):
                 dist = math.hypot(ox - X, oy - Y)
-                if dist <= self.gate_m and str(dets[di].get("cls", "vehicle")) == tr.cls:
+                if dist <= gate and str(dets[di].get("cls", "vehicle")) == tr.cls:
                     pairs.append((dist, ti, di))
         pairs.sort()
         used_t, used_d = set(), set()

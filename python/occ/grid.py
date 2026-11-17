@@ -47,11 +47,15 @@ class VoxelGrid:
         """Indices (N,3) int32 and an in-bounds mask (N,). Non-finite points are out."""
         pts = np.asarray(xyz, dtype=np.float64).reshape(-1, 3)
         finite = np.isfinite(pts).all(axis=1)
-        safe = np.where(finite[:, None], pts, 0.0)
-        idx = np.floor((safe - self.lo()) / self.voxel).astype(np.int64)
         shape = np.array(self.shape, dtype=np.int64)
-        ok = finite & (idx >= 0).all(axis=1) & (idx < shape).all(axis=1)
-        return np.where(ok[:, None], idx, 0).astype(np.int32), ok
+        safe = np.where(finite[:, None], pts, 0.0)
+        with np.errstate(over="ignore", invalid="ignore"):
+            fidx = np.floor((safe - self.lo()) / self.voxel)
+        # Bounds are checked in float before the cast: a huge finite value must
+        # not wrap to a valid-looking int64 (the cast of inf/1e19 is undefined).
+        ok = finite & np.isfinite(fidx).all(axis=1) & (fidx >= 0).all(axis=1) & (fidx < shape).all(axis=1)
+        idx = np.where(ok[:, None], fidx, 0.0).astype(np.int64)
+        return idx.astype(np.int32), ok
 
     def to_center(self, idx: np.ndarray) -> np.ndarray:
         ii = np.asarray(idx, dtype=np.float64).reshape(-1, 3)

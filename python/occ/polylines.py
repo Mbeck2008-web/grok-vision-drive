@@ -60,6 +60,8 @@ def edges_from_cells(idx: np.ndarray, cls: np.ndarray, *, grid: VoxelGrid = DEFA
     cls = np.asarray(cls).reshape(-1)
     if idx.shape[0] != cls.shape[0]:
         raise ValueError("idx and cls lengths differ")
+    inb = (idx >= 0).all(axis=1) & (idx < np.array(grid.shape)).all(axis=1)
+    idx, cls = idx[inb], cls[inb]
     v = grid.voxel
     ego_ix = (ego_x - grid.x_min) / v - 0.5
     left: list[tuple[int, float]] = []

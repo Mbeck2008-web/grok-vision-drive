@@ -75,6 +75,11 @@ class ShardWriter:
             raise ShardError("max_bytes and max_count must be positive")
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
+        old = sorted(self.out_dir.glob(f"{prefix}-*.tar")) + sorted(self.out_dir.glob(f"{prefix}-*.tar.part"))
+        if old:
+            # A second build must not overwrite part of the first and leave its
+            # extra shards to be read as one set. Nothing is deleted here.
+            raise ShardError(f"{self.out_dir} already has {len(old)} '{prefix}-*' shard file(s); use a new folder or prefix")
         self.prefix = prefix
         self.max_bytes = int(min(max_bytes, SHARD_MAX_BYTES))
         self.max_count = int(max_count)

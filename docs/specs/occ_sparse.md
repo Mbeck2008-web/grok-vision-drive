@@ -21,6 +21,37 @@ without a dense 3D grid and without changing what runs live.
 - Recovery mix: `recovery_weights(rows, target=0.25)` gives sampler weights so
   `excursion.phase == "recover"` rows are 25 % of draws; targets outside 20–30 % raise.
 
+## Viz schema (C++ visualizer, frozen v1 = `docs/specs/viz_cpp.md` at `f3555bf`)
+`python/viz/occ_scene.py` (numpy only; imports no torch, labelers or raw frames). Entry point
+`occ_to_viz(outputs, tracker=, t=, ego_speed_mps=) -> dict`. Its output has every v1 key
+(`v type seq t ego aeb lanes edges tracks signs path path_conf`), and v1 builders ignore the optional
+extras below. When `python.viz.cpp_publisher` is importable (PR #232), the adapter uses its
+`build_scene_message` and only adds fields. Red is the renderer's colour for `edges` only. Lanes are
+`white` or `yellow`, and edges carry no paint.
+
+| field | shape | from | GT source in recorder data |
+|---|---|---|---|
+| `occ` (optional) | `{x, y, z, cls}`, cls unknown/drivable/vehicle, at most 800 (about 41 kB) | occ head on queried voxels, sigmoid > 0.5 | labels v4 `raw/<cam>_depth` + `_sem` + traffic (this spec) |
+| `edges[]` src `occ` | `{pts, kind: detected, src: occ}` | outermost drivable cell per 1 m forward bin, left and right, ±0.25 m | same as `occ` (derived) |
+| `edges[]` src `curb` | `{pts, kind: detected, src: curb}` | `curbs` head | existing curbs labels |
+| `lanes[].paint` | `white` / `yellow` | `lane_paint` = P(yellow) per lane, white when absent | **labelable, no head yet**: decal materials `line_yellow*` vs `line_white*` (`python/debug/painted_lanes.py`). UNLABELED in the net; live is white. |
+| `stop_lines` (optional) | `{pts: [[-1.8, y], [1.8, y]]}` | `stop_line` = (y_m, valid logit) | `intersection_labels.stop_line_arrays`. The head is training-only, so live has none. |
+| `crosswalks` (optional) | `{pts: [[x0, y0], [x1, y1]]}` | `crosswalks` (M, 4) if a head provides it | **UNLABELED**: no crosswalk label source on main. Not claimed. |
+| `tracks[].motion` (optional) | unknown/same_way/oncoming/crossing/alongside/parked | `MotionTracker` over ≥3 frames spanning ≥0.2 s | traffic positions per tick (`vehicle_labels`). Deterministic, not learned |
+
+Motion is never a single-frame guess. Tracks are matched to the previous tick by nearest position
+(≤3 m). Ground velocity is displacement/dt plus ego forward speed. The state comes from that velocity
+heading against +y: under 0.5 m/s is parked, ≤30° is same_way (alongside when |y|<6 and |x|>1.5),
+≥150° is oncoming, and 60–120° is crossing. A track reports `unknown` until it has enough history.
+v1 `yaw` is radians from +x (π/2 = ego heading), the same convention as `vehicle_labels._yaw`.
+
+Tests: `scripts/test_occ_viz.py`. It round-trips the JSON, checks edge positions against tolerances on
+a synthetic road band, checks the five motion states over four frames, checks a single frame stays
+`unknown`, checks red only on edges and curbs, checks the v1 required keys, and checks that unknown
+keys are ignored. Checked locally against the `f3555bf` builder (not in CI, since #232 is not on
+main). Extras were `crosswalks`, `occ` and `stop_lines`, the encoded size was 28.8 kB, and there were
+no problems.
+
 ## Non-goals
 - No runtime / ONNX change: `occ_head` is outside `OUTPUT_FIELDS` and the export, like
   `aux_depth_head` and `stop_line_head`. `run_vision` never imports `occ_sparse`.
@@ -33,10 +64,11 @@ without a dense 3D grid and without changing what runs live.
 - `python/train/occ_sparse.py` (new): labeler, shards, sampler weights, queries, loss, head.
 - `python/train/scene_net.py`: opt-in `occ_sparse=False` kwarg, `occ_feat` on the prediction,
   `:occ_sparse=128` arch suffix. Default net is byte-for-byte the same; plain checkpoints load.
-- `scripts/test_occ_sparse.py` (new), `docs/specs/occ_sparse.md` (new).
+- `python/viz/occ_scene.py` (new): `occ_to_viz` adapter, `MotionTracker`, v1 validator.
+- `scripts/test_occ_sparse.py`, `scripts/test_occ_viz.py`, `docs/specs/occ_sparse.md` (new).
 
 ## Verify
-1. `python scripts/test_occ_sparse.py` -> `test_occ_sparse: OK` (overfit loss falls >10x, acc >0.97).
+1. `python scripts/test_occ_sparse.py` and `python scripts/test_occ_viz.py` -> `test_occ_sparse: OK` (overfit loss falls >10x, acc >0.97).
 2. `PATH=venv xvfb-run -a python scripts/run_offline_suite.py` green.
 3. CI attempt 1 green on the draft PR.
 

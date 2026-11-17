@@ -75,6 +75,19 @@ def check_labels_sparse_8cams() -> None:
     print(f"  8 cams: {len(occ)} occupied + {len(free)} free of {dense} voxels, 360 coverage")
 
 
+def check_free_never_overrides_hit() -> None:
+    """A near wall seen by one cam sits on the far cam's free ray: it stays occupied."""
+    from python.train.occ_sparse import occ_labels_for_tick, unproject_depth, voxel_index
+
+    cams = [_cam("main", 0.0), _cam("wide", 0.0)]
+    planes = {"main": {"depth_cm": _plane(10.0), "sem": None}, "wide": {"depth_cm": _plane(5.0), "sem": None}}
+    lab = occ_labels_for_tick(planes, cams, sem_names={}, row=None, stride=4)
+    near, _ = voxel_index(unproject_depth(_plane(5.0), cams[1], stride=4)[0])
+    assert np.isin(np.unique(near), lab["occ_idx"]).all(), "near hits are occupied"
+    assert not np.intersect1d(lab["occ_idx"], lab["free_idx"]).size, "free ray of the far cam must not clear a hit"
+    print("  overlap: far cam's free ray never clears the near cam's hit")
+
+
 def check_drivable_and_missing_cams() -> None:
     from python.train.occ_sparse import OCC_CLASSES, occ_labels_for_tick
 
@@ -89,7 +102,13 @@ def check_drivable_and_missing_cams() -> None:
                                sem_names={}, row=None, stride=4)
     assert lab2["cams"] == ["main"]
     assert set(lab2["occ_cls"].tolist()) == {OCC_CLASSES.index("unknown")}, "no sem -> unknown"
-    print("  ROAD -> drivable, missing sem -> unknown, missing cam -> skipped")
+    # Same ground seen as ROAD by one cam and unknown by another: unknown wins the voxel.
+    road = {"depth_cm": _plane(2.4), "sem": sem}
+    unk = {"depth_cm": _plane(2.4), "sem": np.zeros((48, 64), np.uint8)}
+    lab3 = occ_labels_for_tick({"main": road, "wide": unk}, [cam, _cam("wide", 0.0, pitch=-30.0)],
+                               sem_names={0: "unknown", 7: "ROAD"}, row=None, stride=4)
+    assert set(lab3["occ_cls"].tolist()) == {OCC_CLASSES.index("unknown")}, "unknown beats drivable"
+    print("  ROAD -> drivable, missing sem -> unknown, missing cam -> skipped, unknown beats drivable")
 
 
 def check_vehicle_voxels() -> None:
@@ -209,6 +228,14 @@ def check_loss_masks_and_overfit() -> None:
     q, t_occ, t_cls, m = build_queries([empty], k=16, seed=0)
     loss = occ_loss(head(torch.zeros(1, 32), q), t_occ, t_cls, m)
     assert float(loss) == 0.0, "no labels -> zero loss, not a fake free sky"
+    # Masked slots never count: garbage targets behind mask 0 leave the loss unchanged.
+    full = {"occ_idx": np.arange(4, dtype=np.int32), "occ_cls": np.ones(4, np.uint8), "free_idx": np.arange(4, 8, dtype=np.int32)}
+    q, t_occ, t_cls, m = build_queries([full], k=16, seed=0)
+    assert float(m.sum()) < m.numel(), "k > labels leaves masked slots"
+    logits = head(torch.randn(1, 32), q).detach()
+    ref = occ_loss(logits, t_occ, t_cls, m)
+    t_bad = torch.where(m > 0.5, t_occ, 1.0 - t_occ)
+    assert torch.allclose(occ_loss(logits, t_bad, t_cls, m), ref), "masked slots leak into the loss"
     rng = np.random.default_rng(1)
     labels = []
     for _ in range(4):
@@ -228,8 +255,11 @@ def check_loss_masks_and_overfit() -> None:
     out = head(feat, q)
     pred_occ = (out[..., 0] > 0).float()
     acc = float(((pred_occ == t_occ).float() * m).sum() / m.sum())
+    hit = (t_occ > 0.5) & (m > 0.5)
+    cls_acc = float((out[..., 1:].argmax(-1)[hit] == t_cls[hit]).float().mean())
     assert float(loss) < 0.1 * first and acc > 0.97, (first, float(loss), acc)
-    print(f"  overfit: loss {first:.3f} -> {float(loss):.4f}, occ acc {acc:.3f}")
+    assert cls_acc > 0.95, f"class head must learn too: {cls_acc}"
+    print(f"  overfit: loss {first:.3f} -> {float(loss):.4f}, occ acc {acc:.3f}, class acc {cls_acc:.3f}")
 
 
 def check_build_reads_shards_not_pngs() -> None:
@@ -283,6 +313,7 @@ def check_live_entry_points_skip_occ() -> None:
 def main() -> int:
     check_unproject_forward_and_side()
     check_labels_sparse_8cams()
+    check_free_never_overrides_hit()
     check_drivable_and_missing_cams()
     check_vehicle_voxels()
     check_shards_roundtrip()

@@ -134,10 +134,11 @@ def ages_at(t: float):
     return {cid: round(t - math.floor(t * hz + 1e-9) / hz, 6) for cid, hz in RATES.items()}
 
 
-def run(*, from_vehicle=False, vehicle_fn=None, preset=None, vram_est=None):
+def run(*, from_vehicle=False, vehicle_fn=None, preset=None, vram_est=None, ages_fn=None):
     rt = oo.OccRuntime(StubNet([frame(t) for t in TS]), from_vehicle=from_vehicle, preset=preset, vram_est_mb_cpu=vram_est)
     imgs = [NoImage() for _ in CAMS]  # raises on any pixel access: everything after the net is image-blind
-    return rt, [rt.step(imgs, t, ages_s=ages_at(t), vehicle=None if vehicle_fn is None else vehicle_fn(t)) for t in TS]
+    ages_fn = ages_fn or ages_at
+    return rt, [rt.step(imgs, t, ages_s=ages_fn(t), vehicle=None if vehicle_fn is None else vehicle_fn(t)) for t in TS]
 
 
 RUN = run()
@@ -243,6 +244,11 @@ def check_boxes2d() -> None:
     assert {c for c, v in m["cams"].items() if v["status"] != "ABSENT"} == {"main", "wide"}, m["cams"]
     assert m["counts"]["frustum"] < last["counts"]["frustum"], (m["counts"], last["counts"])  # active cams only
     assert set(m["boxes2d"]) <= {"main", "wide"} and m["cams"]["rear"] == {"status": "ABSENT", "age_s": None, "weight": 0.0, "res": None}
+    # a STALE camera (main frame 0.6 s old, weight exp(-0.6/0.5) = 0.30) gets no boxes, a fresh one does
+    _, sm = run(ages_fn=lambda t: dict(ages_at(t), main=0.6, wide=0.0))
+    s_last = sm[-1]
+    assert s_last["cams"]["main"]["status"] == "STALE" and 0 < s_last["cams"]["main"]["weight"] < 0.5, s_last["cams"]["main"]
+    assert "main" not in s_last["boxes2d"] and s_last["boxes2d"].get("wide"), sorted(s_last["boxes2d"])
     bad = copy.deepcopy(last); bad["boxes2d"]["rear"] = [dict(last["boxes2d"]["main"][0])]
     bad["cams"]["rear"] = {"status": "STALE", "age_s": 0.9, "weight": 0.1, "res": [640, 400]}
     _raises(bad, "STALE")

@@ -437,6 +437,36 @@ memory, causality), `test_occ_out` (v2 fields, version gate),
 `test_occ_runtime_imports` (safety isolation), `test_eval_occ_unseen` (eval
 smoke). Metrics: `scripts/eval_occ_unseen.py` (results below).
 
+#### Unseen-structure results (SYNTHETIC, `eval_occ_unseen.py`)
+
+Run 2026-11-17 01:55-04:13 CST on the loaded CPU box (load 26-73),
+`--steps 300 --train-seeds 10 --eval-seeds 3 --frames 5 --baseline --threads 4`,
+cheap net (45,398 params) at 64 px, 100 train samples; held-out seeds 900-902
+per clip kind; last frame of each clip, mean over the 3 clips. Visible /
+occluded split by the 8-camera ray-cast mask (metric only). All metrics are
+inside the ego grid window; the share of GT road length beyond the window is
+listed per clip. One seed, tiny model: **these are not evidence that unseen
+decoding works yet.**
+
+| Kind | Model | IoU visible | IoU occluded | edge chamfer vis (m) | edge chamfer occ (m) |
+|---|---|---|---|---|---|
+| intersection | map_unmasked (+memory) | 0.475 | 0.109 | 1.22 | 3.05 |
+| intersection | map_unmasked, no memory | 0.474 | 0.111 | 1.22 | 3.17 |
+| intersection | camera_masked baseline | 0.345 | 0.087 | 1.62 | 3.64 |
+| roundabout | map_unmasked (+memory) | 0.203 | 0.095 | 1.87 | NaN (no occluded edge predicted) |
+| roundabout | map_unmasked, no memory | 0.203 | 0.095 | 1.87 | NaN |
+| roundabout | camera_masked baseline | 0.121 | 0.207 | 2.07 | 2.99 |
+
+GT cells per clip: intersection 2,882 visible / 2,110 occluded; roundabout
+1,885 / 3,312. Road beyond the window: intersection 0.358 / 0.358 / 0.358,
+roundabout 0.318 / 0.294 / 0.327 (seeds 900/901/902).
+Reading: the unmasked model beats the baseline on visible IoU in both kinds
+and on occluded IoU/chamfer at the intersection, but **loses on roundabout
+occluded IoU (0.095 vs 0.207)**. Memory makes no measurable difference here
+(<= 0.002 IoU); its effect is shown only by the unit tests (79% vs 0%
+carry on a controlled clip). VRAM estimate: batch 1 104.7 MB, batch 4
+416.8 MB (CPU arithmetic); runner batch 1 (eval and live), 4 (training).
+
 ## Files
 
 New: `python/perception/occ_geometry.py`, `python/perception/occ_sparse.py`,

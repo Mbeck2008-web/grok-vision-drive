@@ -20,7 +20,7 @@ logits over ``OCC_CLASS_COUNT`` coarse classes (other / drivable / vehicle).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
@@ -45,6 +45,54 @@ COARSE_FACTOR = LEVELS[0]
 COARSE_THRESH = 0.3
 FINE_THRESH = 0.5
 LIVE_LONG_SIDE = 640
+# Net sizes. "cheap" aims at the planner tick on a shared Pascal card (fp16 compute
+# there is ~1/64 of fp32, so AMP buys memory, not speed: run cheap in fp32).
+NET_CONFIGS = {
+    "default": {"channels": ENC_CHANNELS, "feat": FEAT, "hidden": HIDDEN},
+    "cheap": {"channels": (16, 32, 48), "feat": 32, "hidden": 64},
+}
+# Reduced-camera presets. The live supervisor reads all 8 cams but the 8-cam live
+# rate at the planner tick is unproven: main+wide is the minimum.
+CAM_PRESETS = {
+    "min": ("main", "wide"),
+    "front3": ("main", "wide", "narrow"),
+    "all8": ("narrow", "main", "wide", "pillarL", "pillarR", "repeatL", "repeatR", "rear"),
+}
+# Run profiles for the GTX 1080 Ti shared with BeamNG. Compute is fp32: Pascal
+# fp16 math is ~1/64 of fp32, so fp16 is a memory option only, never a speed
+# claim. int8 (TensorRT, DP4A) is the only precision speed-up on this card and is
+# NOT implemented: it would need a calibration set and an accuracy delta vs fp32
+# (both UNMEASURED) and adds TensorRT as a dependency.
+PROFILES = {
+    "1080ti": {"config": "default", "long_side": 640, "cams": "all8", "compute": "fp32"},
+    "1080ti_cheap": {"config": "cheap", "long_side": 480, "cams": "front3", "compute": "fp32"},
+    "1080ti_min": {"config": "cheap", "long_side": 320, "cams": "min", "compute": "fp32"},
+}
+# Per-camera age weight: exp(-age / tau), 0 past max age (or no frame).
+AGE_TAU_S = 0.5
+AGE_MAX_S = 1.5
+
+
+def cam_weights(cam_ids: Sequence[str], *, preset: str | None = None, ages_s: Mapping[str, float] | None = None,
+                tau_s: float = AGE_TAU_S, max_age_s: float = AGE_MAX_S) -> np.ndarray:
+    """Fusion weight per camera (``cam_ids`` order), float32 in [0, 1].
+
+    ``preset`` masks cameras outside ``CAM_PRESETS[preset]`` (weight 0).
+    ``ages_s`` is each camera's own frame age at this tick (now - its frame
+    timestamp): a fresh frame weighs 1, a stale one ``exp(-age/tau)``, one older
+    than ``max_age_s`` or missing from ``ages_s`` weighs 0. A NaN or negative
+    age counts as missing.
+    """
+    w = np.ones((len(cam_ids),), dtype=np.float32)
+    if preset is not None:
+        keep = set(CAM_PRESETS[preset])
+        w *= np.array([c in keep for c in cam_ids], dtype=np.float32)
+    if ages_s is not None:
+        for i, c in enumerate(cam_ids):
+            a = ages_s.get(c)
+            a = float(a) if a is not None else float("nan")
+            w[i] *= 0.0 if not (np.isfinite(a) and 0.0 <= a <= max_age_s) else float(np.exp(-a / tau_s))
+    return w
 
 
 def positional_encoding_dim(freqs: int = PE_FREQS) -> int:
@@ -106,14 +154,22 @@ if nn is not None:
     class SparseOccNet(nn.Module):
         """Camera features sampled at sparse 3-D query points."""
 
-        def __init__(self, cams: Sequence[PinholeCam], *, grid: OccGrid = DEFAULT_GRID, feat: int = FEAT, hidden: int = HIDDEN) -> None:
+        def __init__(self, cams: Sequence[PinholeCam], *, grid: OccGrid = DEFAULT_GRID, feat: int | None = None,
+                     hidden: int | None = None, channels: Sequence[int] | None = None, config: str = "default") -> None:
             super().__init__()
             if not cams:
                 raise ValueError("SparseOccNet needs at least one camera")
+            cfg = NET_CONFIGS[config]
+            feat = int(feat or cfg["feat"])
+            hidden = int(hidden or cfg["hidden"])
+            self.config = config
             self.cam_ids = tuple(c.cam_id for c in cams)
             self.cams = list(cams)
             self.grid = grid
-            self.encoder = CamEncoder(feat=feat)
+            self.channels = tuple(int(c) for c in (channels or cfg["channels"]))
+            self.hidden = hidden
+            self.encoder = CamEncoder(self.channels, feat=feat)
+            self.feat_dim = feat
             rot = np.stack([c.rotation() for c in cams]).astype(np.float32)
             pos = np.stack([np.asarray(c.pos) for c in cams]).astype(np.float32)
             intr = np.array([[c.focal_px, c.width, c.height, c.near_m, c.far_m] for c in cams], dtype=np.float32)
@@ -138,11 +194,17 @@ if nn is not None:
                 out += [torch.sin((2.0 ** i) * np.pi * unit), torch.cos((2.0 ** i) * np.pi * unit)]
             return torch.cat(out, dim=-1)
 
-        def encode(self, images: Sequence[Any]) -> list[Any]:
-            """One feature map per camera, in ``cam_ids`` order. Each image is (B,3,H,W) in [0,1]."""
+        def encode(self, images: Sequence[Any], cam_w: Any = None) -> list[Any]:
+            """One feature map per camera, in ``cam_ids`` order. Each image is (B,3,H,W) in [0,1].
+
+            A ``None`` image, or a camera whose weight in ``cam_w`` is 0, is not
+            encoded (its feature map is ``None`` and it drops out of fusion).
+            """
             if len(images) != len(self.cam_ids):
-                raise ValueError(f"expected {len(self.cam_ids)} camera images, got {len(images)}")
-            return [self.encoder(img) for img in images]
+                raise ValueError(f"expected {len(self.cam_ids)} camera images (None for a missing cam), got {len(images)}")
+            w = None if cam_w is None else np.asarray(cam_w, dtype=np.float32).reshape(-1)
+            return [None if (img is None or (w is not None and w[k] <= 0.0)) else self.encoder(img)
+                    for k, img in enumerate(images)]
 
         def project(self, k: int, pts: Any) -> tuple[Any, Any, Any]:
             """Pixel (u, v) and frustum mask of ego points in camera ``k``."""
@@ -155,12 +217,24 @@ if nn is not None:
             ok = (z > near) & (z < far) & (u >= 0) & (u < w) & (v >= 0) & (v < h)
             return u, v, ok
 
-        def query(self, feats: Sequence[Any], pts: Any) -> dict[str, Any]:
-            """Head outputs at ego points ``pts`` (B,N,3)."""
+        def query(self, feats: Sequence[Any], pts: Any, cam_w: Any = None) -> dict[str, Any]:
+            """Head outputs at ego points ``pts`` (B,N,3).
+
+            Fusion is the ``cam_w``-weighted mean of the features of the cameras
+            that see a point (default weight 1; ``None`` feature map = weight 0).
+            ``seen`` is the summed weight, clipped to 1.
+            """
             bsz, n, _ = pts.shape
-            acc = pts.new_zeros((bsz, n, feats[0].shape[1]))
+            acc = pts.new_zeros((bsz, n, self.feat_dim))
             cnt = pts.new_zeros((bsz, n, 1))
+            if cam_w is not None and not torch.is_tensor(cam_w):
+                cam_w = torch.as_tensor(np.asarray(cam_w, dtype=np.float32))
+            if cam_w is not None:
+                cam_w = cam_w.to(device=pts.device, dtype=pts.dtype)
+                cam_w = cam_w.reshape(1, -1).expand(bsz, -1) if cam_w.dim() == 1 else cam_w
             for k, fm in enumerate(feats):
+                if fm is None:
+                    continue
                 u, v, ok = self.project(k, pts)
                 w, h = self.cam_intr[k, 1], self.cam_intr[k, 2]
                 gx = u / w * 2.0 - 1.0
@@ -169,16 +243,18 @@ if nn is not None:
                 samp = F.grid_sample(fm, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
                 samp = samp.squeeze(2).transpose(1, 2).to(acc.dtype)  # B,N,C
                 m = ok.unsqueeze(-1).to(acc.dtype)
+                if cam_w is not None:
+                    m = m * cam_w[:, k].reshape(bsz, 1, 1)
                 acc = acc + samp * m
                 cnt = cnt + m
-            mean = acc / cnt.clamp(min=1.0)
-            seen = (cnt > 0).to(acc.dtype)
+            mean = acc / cnt.clamp(min=1e-6)
+            seen = cnt.clamp(max=1.0)
             out = self.head(torch.cat([mean, self._pe(pts).to(acc.dtype), seen], dim=-1))
             nl = len(LEVELS)
             return {"occ": out[..., 0], "any": out[..., 1 : 1 + nl], "cls": out[..., 1 + nl :], "seen": seen.squeeze(-1)}
 
-        def forward(self, images: Sequence[Any], pts: Any) -> dict[str, Any]:
-            return self.query(self.encode(images), pts)
+        def forward(self, images: Sequence[Any], pts: Any, cam_w: Any = None) -> dict[str, Any]:
+            return self.query(self.encode(images), pts, cam_w)
 
         @torch.no_grad()
         def predict(
@@ -188,6 +264,7 @@ if nn is not None:
             coarse_thresh: float = COARSE_THRESH,
             fine_thresh: float = FINE_THRESH,
             max_points: int = 65536,
+            cam_w: Any = None,
         ) -> OccPrediction:
             """Coarse-to-fine sparse occupancy for one frame (batch 1).
 
@@ -195,17 +272,28 @@ if nn is not None:
             are kept), so the worst case is bounded too.
             """
             grid = self.grid
-            if getattr(self, "_coarse_pts", None) is None:
+            w = np.array([img is not None for img in images], dtype=np.float32)
+            if cam_w is not None:
+                w = w * np.asarray(cam_w, dtype=np.float32).reshape(-1)
+            active = tuple(bool(x > 0.0) for x in w)
+            cache = self.__dict__.setdefault("_coarse_cache", {})
+            if active not in cache:
                 top = grid.coarse(LEVELS[0])
                 cpts = top.centers_of_keys(np.arange(top.dense_cells))
-                self._coarse_pts = cpts[visible_mask(self.cams, cpts)].astype(np.float32)
+                on = [c for c, a in zip(self.cams, active) if a]
+                cache[active] = (cpts[visible_mask(on, cpts)] if on else cpts[:0]).astype(np.float32)
+            self._coarse_pts = cache[active]
             dev = self.cam_pos.device
-            feats = self.encode(images)
+            feats = self.encode(images, w)
+            cw = torch.from_numpy(w).to(dev)
             pts = self._coarse_pts
+            if pts.shape[0] == 0:
+                empty = np.zeros((0,), dtype=np.int64)
+                return OccPrediction(empty, np.zeros((0,), np.float32), np.zeros((0,), np.uint8), 0, 0)
             n_coarse = 0
             for li, f in enumerate(LEVELS):
                 n_coarse += int(pts.shape[0])
-                p_any = torch.sigmoid(self.query(feats, torch.from_numpy(pts).to(dev).unsqueeze(0))["any"][0, :, li].float()).cpu().numpy()
+                p_any = torch.sigmoid(self.query(feats, torch.from_numpy(pts).to(dev).unsqueeze(0), cw)["any"][0, :, li].float()).cpu().numpy()
                 sel = p_any >= float(coarse_thresh)
                 hot, p_hot = pts[sel], p_any[sel]
                 nxt = LEVELS[li + 1] if li + 1 < len(LEVELS) else 1
@@ -219,7 +307,7 @@ if nn is not None:
             if pts.shape[0] == 0:
                 empty = np.zeros((0,), dtype=np.int64)
                 return OccPrediction(empty, np.zeros((0,), np.float32), np.zeros((0,), np.uint8), n_coarse, 0)
-            out = self.query(feats, torch.from_numpy(pts).to(dev).unsqueeze(0))
+            out = self.query(feats, torch.from_numpy(pts).to(dev).unsqueeze(0), cw)
             p = torch.sigmoid(out["occ"][0].float()).cpu().numpy()
             c = out["cls"][0].float().argmax(-1).cpu().numpy().astype(np.uint8)
             sel = p >= float(fine_thresh)
@@ -233,3 +321,36 @@ def live_cams(cfg: Any, long_side: int = LIVE_LONG_SIDE) -> list[PinholeCam]:
     from python.perception.occ_geometry import rig_cams
 
     return [c.scaled(long_side) for c in rig_cams(cfg)]
+
+
+class CheckpointMismatch(ValueError):
+    """A checkpoint's width/depth does not match the net it is loaded into."""
+
+
+def net_spec(net: Any) -> dict[str, Any]:
+    """The knobs that shape the weights. Any change here forces a retrain."""
+    return {"channels": list(net.channels), "feat": int(net.feat_dim), "hidden": int(net.hidden),
+            "levels": list(LEVELS), "classes": OCC_CLASS_COUNT, "pe_freqs": PE_FREQS}
+
+
+def save_checkpoint(net: Any, path: Any, **meta: Any) -> None:
+    """Weights + ``net_spec``. Cameras, input size and grid are NOT stored as
+    weights (they are non-persistent buffers): those knobs stay loadable."""
+    torch.save({"spec": net_spec(net), "state_dict": net.state_dict(), "meta": dict(meta)}, path)
+
+
+def load_checkpoint(net: Any, path: Any) -> dict[str, Any]:
+    """Strict load into ``net``. Raises ``CheckpointMismatch`` naming the knobs
+    that differ (width / depth / levels / classes / PE), never a partial load."""
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(ck, dict) or "spec" not in ck or "state_dict" not in ck:
+        raise CheckpointMismatch(f"{path}: not an occ_sparse checkpoint (no spec/state_dict)")
+    want, got = net_spec(net), dict(ck["spec"])
+    diff = {k: (got.get(k), want[k]) for k in want if got.get(k) != want[k]}
+    if diff:
+        raise CheckpointMismatch(f"{path}: checkpoint vs net differ in {diff}; width/depth changes need a retrain")
+    try:
+        net.load_state_dict(ck["state_dict"], strict=True)
+    except RuntimeError as e:  # same spec but different tensors: still refuse
+        raise CheckpointMismatch(f"{path}: {e}") from e
+    return dict(ck.get("meta") or {})

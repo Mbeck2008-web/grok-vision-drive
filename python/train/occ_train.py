@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import resource
 import sys
 import time
 from pathlib import Path
@@ -166,9 +165,40 @@ def resolve_amp(mode: str, device: Any) -> bool:
     return bool(amp_enabled(torch.cuda.get_device_capability(device)))
 
 
-def peak_rss_mb() -> float:
+def peak_rss_mb() -> float | None:
+    """Peak RSS of this process in MB (None where it cannot be read)."""
+    try:
+        import resource  # POSIX only
+    except ImportError:
+        try:  # Windows (Desktop-IQU45): psutil if present
+            import psutil
+
+            mi = psutil.Process().memory_info()
+            return float(getattr(mi, "peak_wset", mi.rss)) / 2 ** 20
+        except Exception:
+            return None
     r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return float(r) / (1024.0 if sys.platform != "darwin" else 1024.0 * 1024.0)
+
+
+def train_cam_weights(cam_ids: Sequence[str], batch: int, p_drop: float, rng: Any) -> np.ndarray:
+    """(B, K) fusion weights for training: the live rig will not have every cam fresh.
+
+    main and wide (``CAM_PRESETS["min"]``) are always on at weight 1. Every other
+    camera is dropped (weight 0) with ``p_drop``, else given the age weight of a
+    random age in [0, AGE_MAX_S] (the 1-2 Hz cams are up to a second old).
+    """
+    from python.perception.occ_sparse import AGE_MAX_S, AGE_TAU_S, CAM_PRESETS
+
+    keep = set(CAM_PRESETS["min"])
+    w = np.ones((int(batch), len(cam_ids)), dtype=np.float32)
+    for k, c in enumerate(cam_ids):
+        if c in keep:
+            continue
+        drop = rng.random(int(batch)) < float(p_drop)
+        age = rng.uniform(0.0, AGE_MAX_S, int(batch))
+        w[:, k] = np.where(drop, 0.0, np.exp(-age / AGE_TAU_S)).astype(np.float32)
+    return w
 
 
 def train(
@@ -183,6 +213,7 @@ def train(
     workers: int = 0,
     ratio: float = 0.25,
     seed: int = 0,
+    cam_drop: float = 0.0,
     log: Any = None,
     net: Any = None,
     **q: int,
@@ -208,11 +239,15 @@ def train(
         torch.cuda.reset_peak_memory_stats(dev)
     hist: list[dict[str, float]] = []
     t_prev = time.perf_counter()
+    drop_rng = np.random.default_rng(seed + 1)
     for step, batch in enumerate(dl):
         t_data = time.perf_counter()
         batch = {k: ([t.to(dev, non_blocking=True) for t in v] if k == "images" else v.to(dev)) for k, v in batch.items()}
+        cw = None
+        if cam_drop > 0.0:
+            cw = torch.from_numpy(train_cam_weights(net.cam_ids, int(batch["pts"].shape[0]), cam_drop, drop_rng)).to(dev)
         with torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=use_amp):
-            out = net(batch["images"], batch["pts"])
+            out = net(batch["images"], batch["pts"], cw)
         loss, stats = occ_loss(out, batch)
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
@@ -249,6 +284,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--input-long", type=int, default=640)
     ap.add_argument("--cams", default="", help="comma list; default all 8 rig cams")
+    ap.add_argument("--cam-drop", type=float, default=0.3, help="P(drop) per non-main/wide cam per sample")
+    ap.add_argument("--net", default="default", choices=("default", "cheap"))
     ap.add_argument("--out", type=Path, required=True)
     a = ap.parse_args(argv)
     import torch
@@ -260,10 +297,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         cams = [c for c in cams if c.cam_id in keep]
     a.out.mkdir(parents=True, exist_ok=True)
     with open(a.out / "occ_train.jsonl", "x", encoding="utf-8") as fh:
+        from python.perception.occ_sparse import SparseOccNet
+
         res = train(a.shards, cams, steps=a.steps, batch_size=a.batch, lr=a.lr, amp=a.amp, device=a.device,
-                    workers=a.workers, log=lambda s: (fh.write(s + "\n"), fh.flush()))
-    torch.save({"state_dict": res["net"].state_dict(), "cams": [c.cam_id for c in cams], "input_long": a.input_long},
-               a.out / "occ_sparse.pt")
+                    workers=a.workers, cam_drop=a.cam_drop, net=SparseOccNet(cams, config=a.net), log=lambda s: (fh.write(s + "\n"), fh.flush()))
+    from python.perception.occ_sparse import save_checkpoint
+
+    save_checkpoint(res["net"], a.out / "occ_sparse.pt", cams=[c.cam_id for c in cams], input_long=a.input_long,
+                    net_config=a.net)
     print(json.dumps({k: v for k, v in res.items() if k not in ("history", "net")}))
     return 0
 

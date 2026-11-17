@@ -65,11 +65,11 @@ def check_projection() -> None:
 
 def check_camera_only() -> None:
     sig = inspect.signature(SparseOccNet.forward)
-    assert list(sig.parameters) == ["self", "images", "pts"], list(sig.parameters)
+    assert list(sig.parameters) == ["self", "images", "pts", "cam_w"], list(sig.parameters)
     sig = inspect.signature(SparseOccNet.predict)
     names = [n for n in sig.parameters if n != "self"]
     assert not any(w in n for n in names for w in ("depth", "sem", "box", "label", "gt")), names
-    print("camera-only: forward(images, pts), predict has no GT argument OK")
+    print("camera-only: forward(images, pts, cam_w), predict has no GT argument OK")
 
 
 def check_sparse_predict() -> None:

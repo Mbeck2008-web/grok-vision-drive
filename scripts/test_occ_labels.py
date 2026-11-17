@@ -128,7 +128,9 @@ def check_all_eight() -> None:
         pass
     else:
         raise AssertionError("unknown camera must be refused")
-    print(f"8 cams: {lab.keys.size} cells (main alone {only_main.keys.size}); behind and both sides labelled OK")
+    assert lab.keys.size < 0.05 * G.dense_cells, (lab.keys.size, G.dense_cells)
+    print(f"8 cams: {lab.keys.size} cells (main alone {only_main.keys.size}); behind and both sides labelled; "
+          f"stored {lab.keys.size} of {G.dense_cells} grid cells ({lab.keys.size / G.dense_cells:.4f}) OK")
 
 
 def check_vehicle_rows() -> None:

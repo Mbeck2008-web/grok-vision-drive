@@ -1155,6 +1155,8 @@ class ScenePrediction:
     road_edge: Any = None
     # Training-only stop-line scalar (y_m, valid). Not an ONNX output.
     stop_line: Any = None
+    # Training-only: the head feature the sparse occupancy head queries. Not an ONNX output.
+    occ_feat: Any = None
 
     def as_dict(self) -> dict[str, Any]:
         return {name: getattr(self, name) for name in OUTPUT_FIELDS}
@@ -1789,6 +1791,7 @@ if torch is not None:
             stem_channels: tuple[int, ...] | None = None,
             gru_hidden: int | None = None,
             preset: str = "small",
+            occ_sparse: bool = False,
         ) -> None:
             super().__init__()
             from python.data.cam_hold import CAM_AGE_N
@@ -1857,6 +1860,14 @@ if torch is not None:
                 self.stop_line_head = nn.Linear(hidden, 2)
                 arch = getattr(self, "pause_arch", checkpoint_arch(self.cams))
                 self.pause_arch = arch + ":stop_line=2"
+            # Training-only sparse occupancy queries (python/train/occ_sparse.py). Not exported.
+            self.occ_sparse = bool(occ_sparse)
+            if self.occ_sparse:
+                from python.train.occ_sparse import HEAD_WIDTH, SparseOccHead
+
+                self.occ_head = SparseOccHead(hidden)
+                arch = getattr(self, "pause_arch", checkpoint_arch(self.cams))
+                self.pause_arch = arch + f":occ_sparse={int(HEAD_WIDTH)}"
             # --route-cond: additive nav-command embedding. Off by default so
             # old checkpoints load unchanged. This is not --ctl-cond.
             self.route_cond = bool(route_cond)
@@ -2154,6 +2165,7 @@ if torch is not None:
             lane_gt=_lane_gt_output(net, feat),
             road_edge=_road_edge_output(net, feat),
             stop_line=_stop_line_output(net, feat),
+            occ_feat=feat if bool(getattr(net, "occ_sparse", False)) else None,
             **_ctl_outputs(net, feat, cond),
         )
 
@@ -2176,7 +2188,7 @@ if torch is not None:
 
     def _prediction_at(pred: ScenePrediction, index: int) -> ScenePrediction:
         extra = {name: getattr(pred, name)[index] for name in CTL_OUTPUT_FIELDS if getattr(pred, name) is not None}
-        for name in ("aux_depth", "aux_sem_logits", "road_edge", "stop_line"):
+        for name in ("aux_depth", "aux_sem_logits", "road_edge", "stop_line", "occ_feat"):
             value = getattr(pred, name, None)
             if value is not None:
                 extra[name] = value[index]

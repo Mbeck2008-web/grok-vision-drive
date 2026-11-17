@@ -9,6 +9,7 @@ Torch checks skip when PyTorch is not installed.
 from __future__ import annotations
 
 import io
+import json
 import sys
 import tarfile
 import tempfile
@@ -231,6 +232,54 @@ def check_loss_masks_and_overfit() -> None:
     print(f"  overfit: loss {first:.3f} -> {float(loss):.4f}, occ acc {acc:.3f}")
 
 
+def check_build_reads_shards_not_pngs() -> None:
+    """Recording dir -> shards; the loader then works with raw/ gone (no PNG fallback)."""
+    import shutil
+    import tempfile
+
+    from python.data.raw_frames import RawFrameWriter, write_sem_classes
+    from python.train.occ_sparse import build_occ_shards, read_occ_shards
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "rec"
+        writer = RawFrameWriter(root, [])
+        sem = np.zeros((48, 64), np.uint8)
+        sem[24:, :] = 2  # ROAD below the horizon
+        for i in range(3):
+            writer.write(
+                {"main": np.full((48, 64, 3), 40, np.uint8), "main_depth": _plane(10.0), "main_sem": sem},
+                t=float(i), timestamps={"main": 1.0 + i}, tech={},
+            )
+        write_sem_classes(root, {"CAR": (0, 0, 142), "ROAD": (128, 64, 128), "SKY": (70, 130, 180)})
+        (root / "cameras.json").write_text(json.dumps({"cameras": [_cam("main", 0.0)]}), encoding="utf-8")
+        paths = build_occ_shards(root, Path(tmp) / "shards")
+        assert paths and all(str(p).endswith(".tar") for p in paths), paths
+        shutil.rmtree(root)  # no PNGs left to fall back to
+        got = list(read_occ_shards(paths))
+        assert len(got) == 3, len(got)
+        assert all(len(g["occ_idx"]) > 0 and g["cams"] == ["main"] for g in got), got[0]
+    print("  build: recording -> 3 shard samples, loader reads them with raw/ deleted")
+
+
+def check_live_entry_points_skip_occ() -> None:
+    """Runtime stays camera-only: importing the live entry point never loads the GT labeler."""
+    import os
+    import subprocess
+
+    code = "import sys, python.run_vision; print([m for m in sys.modules if 'occ_sparse' in m])"
+    out = subprocess.run(
+        [sys.executable, "-c", code], cwd=str(ROOT), env=dict(os.environ, PYTHONPATH=str(ROOT)),
+        capture_output=True, text=True, timeout=120,
+    )
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert out.stdout.strip().splitlines()[-1] == "[]", out.stdout
+    for live in ("python/run_vision.py", "python/train/scene_live.py"):
+        path = ROOT / live
+        if path.is_file():
+            assert "occ_sparse" not in path.read_text(encoding="utf-8"), live
+    print("  live: run_vision / scene_live never import occ_sparse")
+
+
 def main() -> int:
     check_unproject_forward_and_side()
     check_labels_sparse_8cams()
@@ -238,6 +287,8 @@ def main() -> int:
     check_vehicle_voxels()
     check_shards_roundtrip()
     check_recovery_mix()
+    check_build_reads_shards_not_pngs()
+    check_live_entry_points_skip_occ()
     check_head_training_only()
     check_loss_masks_and_overfit()
     print("test_occ_sparse: OK")

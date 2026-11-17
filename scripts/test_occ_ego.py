@@ -204,6 +204,120 @@ def check_vo_parked_flicker() -> None:
               f"|fwd| max {max(abs(x) for x in fwds):.3f} m, score min {min(scores):.2f} OK")
 
 
+def check_vo_parked_range_flicker() -> None:
+    """Parked ego plus one-voxel range flicker must stay at rest with ok=True.
+
+    Uniform-random flicker is already covered. Boundary smear sits on the
+    surface, one voxel along the camera ray (forward y), and is not random:
+    a residual path that accepts a sharp 1-voxel peak reports 0.4 m/frame
+    (4 m/s at 10 Hz) with ok=True. One-sided and +-1 jitter at 5, 10, 17
+    and 25% must keep |fwd| < 0.1.
+    """
+    rng = np.random.default_rng(7)
+    n_static = 600
+    v = float(G.voxel_m)
+
+    def snap(xy):
+        return (np.floor(np.asarray(xy, np.float64) / v) + 0.5) * v
+
+    base = snap(np.stack([rng.uniform(-20, 20, n_static), rng.uniform(0, 45, n_static)], 1))
+
+    def keys(xy, z=1.2):
+        pts = np.concatenate([xy, np.full((len(xy), 1), z)], 1)
+        k = G.keys_of(pts)
+        k = np.unique(k[k >= 0])
+        return k, np.zeros(k.size, np.uint8)
+
+    def one_sided(n, r):
+        idx = r.choice(len(base), n, replace=False)
+        return base[idx] + np.array([0.0, v])
+
+    def plus_minus(n, r):
+        idx = r.choice(len(base), n, replace=False)
+        sgn = r.choice([-1.0, 1.0], n)
+        return base[idx] + np.stack([np.zeros(n), sgn * v], 1)
+
+    for name, flick in (("one-sided +1 y", one_sided), ("+-1 y", plus_minus)):
+        for frac in (0.05, 0.10, 0.17, 0.25):
+            n = int(round(frac * n_static))
+            fwds, scores = [], []
+            for t in range(6):
+                r = np.random.default_rng(70 + t + n)
+                a = np.concatenate([base, flick(n, r)])
+                b = np.concatenate([base, flick(n, r)])
+                f, y, sc = occ_odometry(*keys(a), *keys(b), grid=G)
+                fwds.append(f)
+                scores.append(sc)
+                assert abs(f) < 0.1, (name, frac, t, f, y, sc)
+                assert sc >= VO_MIN_SCORE, (name, frac, t, f, sc)
+            print(f"VO parked+{name} {n}/{n_static} ({100 * frac:.0f}%): "
+                  f"|fwd| max {max(abs(x) for x in fwds):.3f} m, score min {min(scores):.2f} OK")
+
+
+def check_vo_residual_share_mid_score() -> None:
+    """Share >= 0.15 with residual score in [0.4, 0.6) must still accept the residual.
+
+    Kills F3 (share path removed; only conf >= 0.6 accepts a residual). A
+    mid-score residual of moving posts, diluted by unmatched noise, must
+    beat an ego-fixed sheet that locks the full set at zero.
+    """
+    rng = np.random.default_rng(4)
+    clutter = np.stack([rng.uniform(-24, 24, 800), rng.uniform(-12, 50, 800)], 1)
+    posts = np.stack([rng.uniform(-20, -6, 200), rng.uniform(5, 40, 200)], 1)
+    fwd = 2.5
+
+    def cells(shift, seed):
+        r = np.random.default_rng(seed)
+        noise = np.stack([r.uniform(-24, 24, 100), r.uniform(-12, 50, 100)], 1)
+        xy = np.concatenate([posts - np.array([0.0, shift]), clutter, noise])
+        pts = np.concatenate([xy, np.full((len(xy), 1), 1.2)], 1)
+        k = G.keys_of(pts)
+        k = k[k >= 0]
+        return k, np.zeros(k.size, np.uint8)
+
+    k0, c0 = cells(0.0, 11)
+    k1, c1 = cells(fwd, 12)
+    est_fwd, dyaw, score = occ_odometry(k0, c0, k1, c1, grid=G)
+    assert abs(est_fwd - fwd) < 0.3, (est_fwd, dyaw, score)
+    assert VO_MIN_SCORE <= score < 0.6, (est_fwd, score)
+    print(f"VO residual share mid-score: fwd {est_fwd:.3f} m (true {fwd}) score {score:.3f} in [0.4, 0.6) OK")
+
+
+def check_vo_residual_share_low_score() -> None:
+    """Share >= 0.15 with residual score < 0.4 must keep the full (0, 0), ok=True.
+
+    Kills F4 (min-score check removed; a low-score residual with a large
+    unmatched share would be returned and clear memory). 20% and 25%
+    random parked flicker is such a residual.
+    """
+    rng = np.random.default_rng(1)
+    n_static = 600
+    v = float(G.voxel_m)
+    base = (np.floor(np.stack([rng.uniform(-20, 20, n_static), rng.uniform(0, 45, n_static)], 1) / v) + 0.5) * v
+
+    def keys(xy, z=1.2):
+        pts = np.concatenate([xy, np.full((len(xy), 1), z)], 1)
+        k = G.keys_of(pts)
+        k = np.unique(k[k >= 0])
+        return k, np.zeros(k.size, np.uint8)
+
+    for frac in (0.20, 0.25):
+        n = int(round(frac * n_static))
+        fwds, scores = [], []
+        for t in range(5):
+            r = np.random.default_rng(200 + t + n)
+            flick_a = (np.floor(np.stack([r.uniform(-20, 20, n), r.uniform(0, 45, n)], 1) / v) + 0.5) * v
+            flick_b = (np.floor(np.stack([r.uniform(-20, 20, n), r.uniform(0, 45, n)], 1) / v) + 0.5) * v
+            f, y, sc = occ_odometry(*keys(np.concatenate([base, flick_a])),
+                                   *keys(np.concatenate([base, flick_b])), grid=G)
+            fwds.append(f)
+            scores.append(sc)
+            assert abs(f) < 0.1, (frac, t, f, y, sc)
+            assert sc >= VO_MIN_SCORE, (frac, t, f, sc)
+        print(f"VO residual share low-score {n}/{n_static} ({100 * frac:.0f}% random): "
+              f"|fwd| max {max(abs(x) for x in fwds):.3f} m, score min {min(scores):.2f} OK")
+
+
 def check_featureless() -> None:
     em = EgoMotion()
     k, c = frame_cells(0)
@@ -220,6 +334,9 @@ def main() -> int:
     check_vo()
     check_vo_clutter()
     check_vo_parked_flicker()
+    check_vo_parked_range_flicker()
+    check_vo_residual_share_mid_score()
+    check_vo_residual_share_low_score()
     check_world_fixed()
     check_featureless()
     print("test_occ_ego: all OK")

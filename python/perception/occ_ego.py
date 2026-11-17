@@ -129,9 +129,11 @@ def occ_odometry(prev_keys, prev_cls, cur_keys, cur_cls, *, grid: OccGrid = DEFA
     # Score the full set and, if enough cells miss at zero, the residual set.
     # Ego-fixed decode_unseen clutter scores 0.8+ at (0, 0) on the full set and
     # would lock speed=0; the residual of the moving posts still registers.
-    # A parked ego with a few flickering cells must keep the full (0, 0) hit:
-    # residual is used only when the unmatched share is large, or the residual
-    # itself scores with high confidence (not a ~0.4 flicker peak).
+    # A parked ego with flickering cells must keep the full (0, 0) hit, including
+    # one-voxel boundary smear along the camera ray (a sharp residual peak at
+    # 0.4 m is still not motion). Residual is used only when the unmatched
+    # share is large, or the residual itself scores with high confidence, and
+    # only when its shift exceeds one voxel versus the full hypothesis.
     full = _register(prev, cur_keys, grid)
     k0 = _bev_keys(_warp(prev, 0.0, 0.0), grid)
     pos0 = np.clip(np.searchsorted(cur_keys, k0), 0, len(cur_keys) - 1)
@@ -141,7 +143,12 @@ def occ_odometry(prev_keys, prev_cls, cur_keys, cur_cls, *, grid: OccGrid = DEFA
         res = _register(residual, cur_keys, grid)
         share = len(residual) / float(len(prev))
         if res[2] >= VO_MIN_SCORE and (share >= VO_RESIDUAL_SHARE or res[2] >= VO_RESIDUAL_CONF):
-            return res
+            # One-voxel residual peaks are boundary flicker along the ray
+            # (a copy of a cell that already matched at the full hypothesis).
+            # Use the residual only when its shift exceeds one voxel.
+            if (abs(res[0] - full[0]) > float(grid.voxel_m) + 1e-9
+                    or abs(res[1] - full[1]) > 1e-9):
+                return res
     return full
 
 

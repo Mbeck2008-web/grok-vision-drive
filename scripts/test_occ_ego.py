@@ -109,6 +109,7 @@ def check_world_fixed() -> None:
     drift = []
     tr = OccTracker()
     reps = []
+    pose_err: list[float] = []
     for i in range(10):
         k, c = frame_cells(i)
         est = em.update(k, c, i * DT, vehicle=None)
@@ -118,6 +119,8 @@ def check_world_fixed() -> None:
             assert abs(est.speed_mps - FWD / DT) < 1.5 and abs(est.yaw_rate - DYAW / DT) < 0.1, (i, est)
             f, y = est.speed_mps * DT, est.yaw_rate * DT
             px += -math.sin(h) * f; py += math.cos(h) * f; h += y
+            tx, ty, _ = pose(i)
+            pose_err.append(math.hypot(px - tx, py - ty))
         bev = _static_bev(k, c, G)
         # back to world with the VO pose
         wx = px + bev[:, 0] * math.cos(h) - bev[:, 1] * math.sin(h)
@@ -142,6 +145,8 @@ def check_world_fixed() -> None:
     print(f"world-fixed: VO pose after 9 frames within {math.hypot(px - tpx, py - tpy):.2f} m / {abs(h - th):.4f} rad, "
           f"static cells on their true world cell (+-1) every frame >= {min(vo_frac):.2f} (no warp: {still_frac[-1]:.2f} by frame 9), "
           f"parked car stays parked OK")
+    print(f"world-fixed: camera-VO (flag off) pose drift per frame, m: {[round(e, 3) for e in pose_err]} "
+          f"over {9 * FWD:.1f} m driven ({pose_err[-1] / (9 * FWD) * 100:.1f}%)")
 
 
 def check_featureless() -> None:

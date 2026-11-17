@@ -23,6 +23,7 @@
 #include "renderer.hpp"
 #include "scene.hpp"
 #include "udp.hpp"
+#include <glm/gtc/matrix_transform.hpp>
 #if GVD_VIZ_HAVE_GLFW
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
@@ -246,18 +247,20 @@ int main() {
   {
     Image parked = shot(must(head("\"tracks\":[{\"id\":1,\"cls\":\"parked\",\"x\":0,\"y\":12,\"yaw\":1.5708}]")), o);
     Counts cp = classify(parked);
-    CHECK(cp.orange > 80, "parked: only %ld orange px", cp.orange);
+    // Uniform box strokes no longer add at vertices, so the orange bucket is
+    // smaller than the old 12-capsule additive draw; colour identity is enough.
+    CHECK(cp.orange > 40, "parked: only %ld orange px", cp.orange);
     CHECK(cp.red == 0, "parked drew %ld red px (red is edges/curbs only)", cp.red);
     Image obst = shot(must(head("\"tracks\":[{\"id\":1,\"cls\":\"obstacle\",\"x\":0,\"y\":12,\"yaw\":1.5708}]")), o);
     Counts co = classify(obst);
-    CHECK(co.orange > 80, "obstacle: only %ld orange px", co.orange);
+    CHECK(co.orange > 40, "obstacle: only %ld orange px", co.orange);
     CHECK(co.red == 0, "obstacle drew %ld red px (red is edges/curbs only)", co.red);
-    // Cone's class prior is 0.4x0.4 m, too small for an 80-px colour bucket;
+    // Cone's class prior is 0.4x0.4 m, too small for the class-colour bucket;
     // give it the same box size as a parked car so this asserts colour, not size.
     Image cone = shot(must(head("\"tracks\":[{\"id\":1,\"cls\":\"cone\",\"x\":0,\"y\":12,\"yaw\":1.5708,\"l\":4.5,\"w\":1.9,\"h\":1.5}]")), o);
     Counts cn = classify(cone);
     CHECK(cn.red == 0, "cone drew %ld red px", cn.red);
-    CHECK(cn.orange > 80, "cone: only %ld orange px", cn.orange);
+    CHECK(cn.orange > 40, "cone: only %ld orange px", cn.orange);
     Image car = shot(must(head("\"tracks\":[{\"id\":1,\"cls\":\"vehicle\",\"x\":0,\"y\":12,\"yaw\":1.5708}]")), o);
     Counts cv = classify(car);
     CHECK(cv.blue > 80, "car: only %ld blue px", cv.blue);
@@ -462,6 +465,63 @@ int main() {
     RenderOptions ro;
     CHECK(ro.lens.eye == d.eye && ro.lens.look == d.look && ro.lens.vfov_deg == 40.f,
           "RenderOptions default lens is not chase");
+  }
+
+
+  // 19. box wireframe: corner brightness is within ~5% of mid-edge (no additive
+  // glow pile-up where 12 capsules would overlap at a vertex).
+  {
+    Scene s = must(head("\"tracks\":[{\"id\":1,\"cls\":\"vehicle\",\"x\":0,\"y\":14,\"yaw\":1.5708}]"));
+    Image im = shot(s, o);
+    const Track& t = s.tracks[0];
+    glm::vec3 d = t.l > 0.f ? glm::vec3(t.l, t.w, t.h) : glm::vec3(4.5f, 1.85f, 1.5f);
+    // same vertex construction as add_box
+    float cy = std::cos(t.yaw), sy = std::sin(t.yaw);
+    glm::vec2 fwd(cy, sy), side(-sy, cy), ctr(t.x, t.y);
+    glm::vec3 v[8];
+    for (int i = 0; i < 8; ++i) {
+      float fl = (i & 1) ? 0.5f : -0.5f, sl = (i & 2) ? 0.5f : -0.5f;
+      glm::vec2 p = ctr + fwd * (fl * d.x) + side * (sl * d.y);
+      v[i] = glm::vec3(p, (i & 4) ? d.z : 0.03f);
+    }
+    const float aspect = float(o.w) / float(o.h);
+    glm::mat4 view = glm::lookAt(o.lens.eye, o.lens.look, glm::vec3(0, 0, 1));
+    glm::mat4 proj = glm::perspective(glm::radians(o.lens.vfov_deg), aspect, 0.3f, 600.f);
+    auto to_img = [&](glm::vec3 w) -> glm::vec2 {
+      glm::vec4 clip = proj * view * glm::vec4(w, 1.f);
+      glm::vec3 ndc = glm::vec3(clip) / clip.w;
+      float sx = (ndc.x * 0.5f + 0.5f) * float(o.w);
+      float sy = (1.f - (ndc.y * 0.5f + 0.5f)) * float(o.h);
+      return {sx, sy};
+    };
+    auto luma_at = [&](int x, int y) -> float {
+      if (x < 0 || y < 0 || x >= im.w || y >= im.h) return 0.f;
+      const uint8_t* p = &im.rgba[(static_cast<size_t>(y) * im.w + x) * 4];
+      return (0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2]) / 255.f;
+    };
+    auto max_win = [&](glm::vec2 px, int rad) -> float {
+      float m = 0.f;
+      int cx = int(std::lround(px.x)), cy = int(std::lround(px.y));
+      for (int dy = -rad; dy <= rad; ++dy)
+        for (int dx = -rad; dx <= rad; ++dx) m = std::max(m, luma_at(cx + dx, cy + dy));
+      return m;
+    };
+    // closer face (smaller y, toward the camera): verts 0,2,4,6
+    const int face[4] = {0, 2, 4, 6};
+    const int edges[4][2] = {{0, 2}, {4, 6}, {0, 4}, {2, 6}};
+    float corner = 0.f, edge = 0.f;
+    for (int i : face) corner = std::max(corner, max_win(to_img(v[i]), 4));
+    for (auto& e : edges) edge = std::max(edge, max_win(to_img(0.5f * (v[e[0]] + v[e[1]])), 4));
+    // also average mid-edges so a single bright sample cannot hide a dark line
+    float edge_sum = 0.f;
+    for (auto& e : edges) edge_sum += max_win(to_img(0.5f * (v[e[0]] + v[e[1]])), 4);
+    float edge_mean = edge_sum / 4.f;
+    float ref = edge_mean > 1e-4f ? edge_mean : edge;
+    float rel = ref > 1e-4f ? std::fabs(corner - ref) / ref : 1.f;
+    std::printf("box stroke: corner luma %.4f mid-edge max %.4f mean %.4f rel %.3f\n",
+                corner, edge, edge_mean, rel);
+    CHECK(ref > 0.05f, "box wireframe too dim to measure (edge luma %.4f)", ref);
+    CHECK(rel <= 0.05f, "corner luma %.4f vs mid-edge %.4f (rel %.3f, want <= 0.05)", corner, ref, rel);
   }
 
   std::printf("%s (%d failures)\n", g_fail ? "FAILED" : "OK", g_fail);

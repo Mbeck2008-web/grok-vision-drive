@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
@@ -59,6 +60,15 @@ struct Capsule {
   glm::vec4 color;  // rgb, core intensity
   glm::vec2 glow;   // halo px, halo gain
 };
+struct BoxStroke {
+  glm::vec3 v[8];
+  glm::vec4 color;
+  glm::vec2 rad;
+  glm::vec2 glow;
+};
+// One stroke per box (min distance to all 12 edges). Set false to draw 12
+// additive capsules instead — corners then glow brighter than mid-edges.
+constexpr bool kBoxUniformStroke = true;
 struct GVert { glm::vec3 pos; glm::vec4 color; glm::vec2 uv; float mode; };
 struct Sprite { glm::vec3 pos; glm::vec2 size_m; float min_px; float type; glm::vec4 color; };
 struct Hud { glm::vec4 rect; glm::vec4 color; glm::vec2 kind; };
@@ -115,6 +125,96 @@ void main(){
   if (max(rgb.r, max(rgb.g, rgb.b)) < 0.004) discard;
   o = vec4(rgb, 0.0);  // additive (premultiplied, alpha 0)
 })";
+
+// One billboard per box; the fragment takes the min distance to all 12 edges
+// so a corner is no brighter than a mid-edge (additive 12-capsule draws stack).
+const char* kBoxVS = R"(#version 330 core
+layout(location=0) in vec2 a_corner;
+layout(location=1) in vec3 a_v0; layout(location=2) in vec3 a_v1;
+layout(location=3) in vec3 a_v2; layout(location=4) in vec3 a_v3;
+layout(location=5) in vec3 a_v4; layout(location=6) in vec3 a_v5;
+layout(location=7) in vec3 a_v6; layout(location=8) in vec3 a_v7;
+layout(location=9) in vec4 a_color; layout(location=10) in vec2 a_rad;
+layout(location=11) in vec2 a_glow;
+uniform mat4 u_view; uniform mat4 u_proj; uniform vec2 u_vp; uniform float u_near;
+out vec2 v_px;
+flat out vec3 v_w0, v_w1, v_w2, v_w3, v_w4, v_w5, v_w6, v_w7;
+flat out vec4 v_color; flat out vec2 v_rad; flat out vec2 v_glow;
+void main(){
+  vec3 w[8] = vec3[](a_v0,a_v1,a_v2,a_v3,a_v4,a_v5,a_v6,a_v7);
+  vec2 mn = vec2(1e9), mx = vec2(-1e9);
+  int vis = 0;
+  float f = u_proj[1][1]*0.5*u_vp.y;
+  float ext = 2.0;
+  for (int i = 0; i < 8; ++i) {
+    vec4 e = u_view*vec4(w[i],1.0);
+    if (e.z > -u_near) continue;
+    vec4 c = u_proj*e;
+    vec2 s = (c.xy/c.w*0.5+0.5)*u_vp;
+    float r = max(a_rad.y, a_rad.x*f/(-e.z));
+    float g = a_glow.x*clamp(r/2.5, 0.4, 1.0);
+    ext = max(ext, r + g + 1.0);
+    mn = min(mn, s); mx = max(mx, s);
+    vis++;
+  }
+  if (vis == 0) { gl_Position = vec4(2.0,2.0,2.0,1.0); return; }
+  mn -= ext; mx += ext;
+  vec2 px = mix(mn, mx, a_corner*0.5+0.5);
+  gl_Position = vec4(px/u_vp*2.0-1.0, 0.0, 1.0);
+  v_px = px;
+  v_w0=a_v0; v_w1=a_v1; v_w2=a_v2; v_w3=a_v3;
+  v_w4=a_v4; v_w5=a_v5; v_w6=a_v6; v_w7=a_v7;
+  v_color = a_color; v_rad = a_rad; v_glow = a_glow;
+})";
+const char* kBoxFS = R"(#version 330 core
+in vec2 v_px;
+flat in vec3 v_w0, v_w1, v_w2, v_w3, v_w4, v_w5, v_w6, v_w7;
+flat in vec4 v_color; flat in vec2 v_rad; flat in vec2 v_glow;
+uniform mat4 u_view; uniform mat4 u_proj; uniform vec2 u_vp; uniform float u_near;
+out vec4 o;
+bool project_edge(vec3 p0, vec3 p1, out vec2 s0, out vec2 s1, out float z0, out float z1, out float r, out float g){
+  vec4 e0 = u_view*vec4(p0,1.0), e1 = u_view*vec4(p1,1.0);
+  if (e0.z > -u_near && e1.z > -u_near) return false;
+  if (e0.z > -u_near) e0 = mix(e0, e1, (-u_near - e0.z)/(e1.z - e0.z));
+  if (e1.z > -u_near) e1 = mix(e1, e0, (-u_near - e1.z)/(e0.z - e1.z));
+  vec4 c0 = u_proj*e0, c1 = u_proj*e1;
+  s0 = (c0.xy/c0.w*0.5+0.5)*u_vp;
+  s1 = (c1.xy/c1.w*0.5+0.5)*u_vp;
+  z0 = c0.z/c0.w; z1 = c1.z/c1.w;
+  float f = u_proj[1][1]*0.5*u_vp.y;
+  float r0 = v_rad.x*f/(-e0.z), r1 = v_rad.x*f/(-e1.z);
+  r = max(v_rad.y, 0.5*(r0+r1));
+  g = v_glow.x*clamp(r/2.5, 0.4, 1.0);
+  return true;
+}
+void main(){
+  vec3 w[8] = vec3[](v_w0,v_w1,v_w2,v_w3,v_w4,v_w5,v_w6,v_w7);
+  const int E[24] = int[](0,1, 1,3, 3,2, 2,0, 4,5, 5,7, 7,6, 6,4, 0,4, 1,5, 2,6, 3,7);
+  float best_d = 1e9, best_r = 1.0, best_gpx = 0.0, best_z = 0.0;
+  bool any = false;
+  for (int i = 0; i < 12; ++i) {
+    vec2 s0, s1; float z0, z1, r, gpx;
+    if (!project_edge(w[E[i*2]], w[E[i*2+1]], s0, s1, z0, z1, r, gpx)) continue;
+    vec2 pa = v_px - s0, ba = s1 - s0;
+    float h = dot(ba,ba) > 1e-6 ? clamp(dot(pa,ba)/dot(ba,ba), 0.0, 1.0) : 0.0;
+    float d = length(pa - ba*h);
+    if (!any || d < best_d) {
+      best_d = d; best_r = r; best_gpx = gpx; best_z = mix(z0, z1, h);
+      any = true;
+    }
+  }
+  if (!any) discard;
+  gl_FragDepth = clamp(best_z*0.5+0.5, 0.0, 1.0);
+  float core = clamp(best_r + 0.5 - best_d, 0.0, 1.0);
+  float out_d = max(best_d - best_r, 0.0);
+  float halo = best_gpx > 0.0 ? v_glow.y*exp(-(out_d*out_d)/(0.35*best_gpx*best_gpx+1e-3)) : 0.0;
+  float hot = core*smoothstep(best_r, 0.0, best_d)*0.22;
+  vec3 c = mix(v_color.rgb, vec3(1.0), hot);
+  vec3 rgb = c*core*v_color.a + v_color.rgb*halo*(1.0-core);
+  if (max(rgb.r, max(rgb.g, rgb.b)) < 0.004) discard;
+  o = vec4(rgb, 0.0);
+})";
+
 
 const char* kGroundVS = R"(#version 330 core
 layout(location=0) in vec3 a_pos; layout(location=1) in vec4 a_color;
@@ -453,10 +553,10 @@ bool palette_named(const std::string& name, Palette& out) {
 
 // ---- renderer -------------------------------------------------------------
 struct Renderer::Impl {
-  GLuint p_caps = 0, p_ground = 0, p_sprite = 0, p_hud = 0, p_mesh = 0, p_bg = 0;
-  GLuint vao_caps = 0, vao_ground = 0, vao_sprite = 0, vao_hud = 0, vao_mesh = 0, vao_bg = 0;
-  GLuint vb_corner = 0, vb_caps = 0, vb_ground = 0, vb_sprite = 0, vb_hud = 0, vb_mesh = 0;
-  size_t cap_caps = 0, cap_ground = 0, cap_sprite = 0, cap_hud = 0;
+  GLuint p_caps = 0, p_boxes = 0, p_ground = 0, p_sprite = 0, p_hud = 0, p_mesh = 0, p_bg = 0;
+  GLuint vao_caps = 0, vao_boxes = 0, vao_ground = 0, vao_sprite = 0, vao_hud = 0, vao_mesh = 0, vao_bg = 0;
+  GLuint vb_corner = 0, vb_caps = 0, vb_boxes = 0, vb_ground = 0, vb_sprite = 0, vb_hud = 0, vb_mesh = 0;
+  size_t cap_caps = 0, cap_boxes = 0, cap_ground = 0, cap_sprite = 0, cap_hud = 0;
   GLsizei mesh_n = 0;
   GLuint fbo_ms = 0, rb_color = 0, rb_depth = 0, fbo_res = 0, tex_res = 0;
   int tw = 0, th = 0, tmsaa = 0;
@@ -468,6 +568,7 @@ struct Renderer::Impl {
   bool q_pending[2] = {false, false};
   size_t buf_bytes = 0;
   std::vector<Capsule> caps;
+  std::vector<BoxStroke> boxes;
   std::vector<GVert> ground;
   std::vector<Sprite> sprites;
   std::vector<Hud> hud;
@@ -489,6 +590,7 @@ bool Renderer::init(std::string* err) {
   p_ = new Impl();
   Impl& I = *p_;
   if (!(I.p_caps = program(kCapsuleVS, kCapsuleFS, err))) return false;
+  if (!(I.p_boxes = program(kBoxVS, kBoxFS, err))) return false;
   if (!(I.p_ground = program(kGroundVS, kGroundFS, err))) return false;
   if (!(I.p_sprite = program(kSpriteVS, kSpriteFS, err))) return false;
   if (!(I.p_hud = program(kHudVS, kHudFS, err))) return false;
@@ -515,6 +617,18 @@ bool Renderer::init(std::string* err) {
   attrib(3, 2, sizeof(Capsule), offsetof(Capsule, rad), true);
   attrib(4, 4, sizeof(Capsule), offsetof(Capsule, color), true);
   attrib(5, 2, sizeof(Capsule), offsetof(Capsule, glow), true);
+
+  glGenVertexArrays(1, &I.vao_boxes);
+  glBindVertexArray(I.vao_boxes);
+  corner_attr();
+  glGenBuffers(1, &I.vb_boxes);
+  glBindBuffer(GL_ARRAY_BUFFER, I.vb_boxes);
+  for (int i = 0; i < 8; ++i) {
+    attrib(1 + i, 3, sizeof(BoxStroke), offsetof(BoxStroke, v) + i * sizeof(glm::vec3), true);
+  }
+  attrib(9, 4, sizeof(BoxStroke), offsetof(BoxStroke, color), true);
+  attrib(10, 2, sizeof(BoxStroke), offsetof(BoxStroke, rad), true);
+  attrib(11, 2, sizeof(BoxStroke), offsetof(BoxStroke, glow), true);
 
   glGenVertexArrays(1, &I.vao_sprite);
   glBindVertexArray(I.vao_sprite);
@@ -702,7 +816,7 @@ static void upload(GLuint vb, const std::vector<T>& v, size_t& cap, size_t& tota
 }
 
 // ---- scene -> instances ---------------------------------------------------
-static void add_box(std::vector<Capsule>& caps, const Track& t, glm::vec3 col) {
+static void add_box(std::vector<Capsule>& caps, std::vector<BoxStroke>& boxes, const Track& t, glm::vec3 col) {
   glm::vec3 d = dims_of(t);
   float c = std::cos(t.yaw), s = std::sin(t.yaw);
   glm::vec2 fwd(c, s), side(-s, c);
@@ -716,7 +830,16 @@ static void add_box(std::vector<Capsule>& caps, const Track& t, glm::vec3 col) {
   const int E[12][2] = {{0, 1}, {1, 3}, {3, 2}, {2, 0}, {4, 5}, {5, 7}, {7, 6}, {6, 4}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
   float g = far_gain(t.y);
   if (g <= 0.f) return;
-  for (auto& e : E) caps.push_back({v[e[0]], v[e[1]], {0.055f, 1.9f}, {col, 1.0f * g}, {10.f, 0.5f * g}});
+  if (kBoxUniformStroke) {
+    BoxStroke b;
+    for (int i = 0; i < 8; ++i) b.v[i] = v[i];
+    b.color = {col, 1.0f * g};
+    b.rad = {0.055f, 1.9f};
+    b.glow = {10.f, 0.5f * g};
+    boxes.push_back(b);
+  } else {
+    for (auto& e : E) caps.push_back({v[e[0]], v[e[1]], {0.055f, 1.9f}, {col, 1.0f * g}, {10.f, 0.5f * g}});
+  }
   // centre dot on the end face toward the ego (the refs' filled disc)
   glm::vec2 f1 = ctr + fwd * (0.5f * d.x), f2 = ctr - fwd * (0.5f * d.x);
   glm::vec2 face = glm::length(f1) < glm::length(f2) ? f1 : f2;
@@ -791,6 +914,7 @@ bool Renderer::render(const Scene& s, const RenderOptions& o, Image* out, bool b
 
   const Palette pal = o.palette;
   I.caps.clear();
+  I.boxes.clear();
   I.ground.clear();
   I.sprites.clear();
   I.hud.clear();
@@ -828,7 +952,7 @@ bool Renderer::render(const Scene& s, const RenderOptions& o, Image* out, bool b
     }
   }
   // boxes
-  for (const auto& t : s.tracks) add_box(I.caps, t, track_rgb(t, s.lead_id, pal));
+  for (const auto& t : s.tracks) add_box(I.caps, I.boxes, t, track_rgb(t, s.lead_id, pal));
 
   // signs
   bool crosswalk_done = false;
@@ -900,11 +1024,12 @@ bool Renderer::render(const Scene& s, const RenderOptions& o, Image* out, bool b
 
   auto t1 = std::chrono::steady_clock::now();
   stats_.cpu_build_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-  stats_.capsules = static_cast<int>(I.caps.size());
+  stats_.capsules = static_cast<int>(I.caps.size() + I.boxes.size());
   stats_.sprites = static_cast<int>(I.sprites.size());
   stats_.ground_verts = static_cast<int>(I.ground.size());
 
   upload(I.vb_caps, I.caps, I.cap_caps, I.buf_bytes);
+  upload(I.vb_boxes, I.boxes, I.cap_boxes, I.buf_bytes);
   upload(I.vb_ground, I.ground, I.cap_ground, I.buf_bytes);
   upload(I.vb_sprite, I.sprites, I.cap_sprite, I.buf_bytes);
   upload(I.vb_hud, I.hud, I.cap_hud, I.buf_bytes);
@@ -967,14 +1092,22 @@ bool Renderer::render(const Scene& s, const RenderOptions& o, Image* out, bool b
     glBindVertexArray(I.vao_ground);
     glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(I.ground.size()));
   }
+  auto cap_uniforms = [&](GLuint prog) {
+    glUseProgram(prog);
+    glUniformMatrix4fv(glGetUniformLocation(prog, "u_view"), 1, GL_FALSE, glm::value_ptr(view));
+    glUniformMatrix4fv(glGetUniformLocation(prog, "u_proj"), 1, GL_FALSE, glm::value_ptr(proj));
+    glUniform2fv(glGetUniformLocation(prog, "u_vp"), 1, glm::value_ptr(vpx));
+    glUniform1f(glGetUniformLocation(prog, "u_near"), near_z + 0.05f);
+  };
   if (!I.caps.empty()) {
-    glUseProgram(I.p_caps);
-    glUniformMatrix4fv(glGetUniformLocation(I.p_caps, "u_view"), 1, GL_FALSE, glm::value_ptr(view));
-    glUniformMatrix4fv(glGetUniformLocation(I.p_caps, "u_proj"), 1, GL_FALSE, glm::value_ptr(proj));
-    glUniform2fv(glGetUniformLocation(I.p_caps, "u_vp"), 1, glm::value_ptr(vpx));
-    glUniform1f(glGetUniformLocation(I.p_caps, "u_near"), near_z + 0.05f);
+    cap_uniforms(I.p_caps);
     glBindVertexArray(I.vao_caps);
     glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, static_cast<GLsizei>(I.caps.size()));
+  }
+  if (!I.boxes.empty()) {
+    cap_uniforms(I.p_boxes);
+    glBindVertexArray(I.vao_boxes);
+    glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, static_cast<GLsizei>(I.boxes.size()));
   }
   if (!I.sprites.empty()) {
     glUseProgram(I.p_sprite);

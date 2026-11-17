@@ -85,7 +85,7 @@ def run(a: argparse.Namespace) -> dict:
 
     from python.data.occ_shards import ShardWriter
     from python.perception.occ_geometry import rig_cams
-    from python.perception.occ_sparse import CAM_PRESETS, PROFILES, SparseOccNet, live_cams
+    from python.perception.occ_sparse import CAM_PRESETS, PROFILES, SparseOccNet, live_cams, memory_estimate, profile_cams
 
     if a.profile:
         pr = PROFILES[a.profile]
@@ -99,7 +99,9 @@ def run(a: argparse.Namespace) -> dict:
     dev = torch.device(a.device)
     cfg = yaml.safe_load((ROOT / "config" / "cameras.yaml").read_text(encoding="utf-8"))
     cams = live_cams(cfg, a.long_side)
-    if a.cam_preset:
+    if a.profile:
+        cams = profile_cams(cfg, a.profile)
+    elif a.cam_preset:
         cams = [c for c in cams if c.cam_id in set(CAM_PRESETS[a.cam_preset])]
     if a.cams:
         cams = [c for c in cams if c.cam_id in set(a.cams.split(","))]
@@ -110,6 +112,8 @@ def run(a: argparse.Namespace) -> dict:
                  "net_config": a.net, "cam_preset": a.cam_preset or None, "profile": a.profile or None}
     net = SparseOccNet(cams, config=a.net).to(dev).eval()
     out["params"] = int(sum(p.numel() for p in net.parameters()))
+    out["cam_res"] = {c.cam_id: [c.width, c.height] for c in cams}
+    out["mem_estimate_mb_fp32"] = memory_estimate(cams, config=a.net)  # arithmetic ESTIMATE, not measured
     imgs = [torch.rand(1, 3, c.height, c.width, device=dev) for c in cams]
     pts = torch.rand(1, a.queries, 3, device=dev) * torch.tensor([51.2, 64.0, 6.4], device=dev) + torch.tensor([-25.6, -12.8, -2.0], device=dev)
     out["act_bytes_fp32_queries"] = activation_bytes(net, imgs, pts)
@@ -236,7 +240,7 @@ def summary(res: dict) -> str:
             f"({','.join(res['cams'])}) long={res['long_side']} fp16={res['infer_fp16']} "
             f"infer_ms={res['infer_ms_median']:.1f} fps={res['infer_fps']:.2f} "
             f"infer_vram_mb={'n/a (no CUDA)' if vram is None else f'{vram:.0f}'} "
-            f"queried/dense={res['infer_queried_ratio']:.3f}"
+            f"queried/dense={res['infer_queried_ratio']:.3f} mem_est_mb={res['mem_estimate_mb_fp32']['total_mb']:.0f}(estimate)"
             + ("" if "train_compute_ms_median" not in res else
                f" train_vram_mb={'n/a (no CUDA)' if tr is None else f'{tr:.0f}'} train_amp={res['train_amp']}"
                f" train_wait_ms={res['train_wait_ms_median']:.0f} train_compute_ms={res['train_compute_ms_median']:.0f}"))

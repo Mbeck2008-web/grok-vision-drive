@@ -199,6 +199,16 @@ def check_checkpoints(tmp: Path) -> None:
     else:
         raise AssertionError("a checkpoint without a spec loaded")
     assert all(p["compute"] == "fp32" for p in PROFILES.values())
+    from python.perception.occ_sparse import memory_estimate, profile_cams
+    for prof, pr in PROFILES.items():
+        pc = profile_cams(CFG, prof)
+        assert sorted(c.cam_id for c in pc) == sorted(CAM_PRESETS[pr["cams"]]), prof
+        est = memory_estimate(pc, config=pr["config"])
+        assert est["params_formula"] == sum(p.numel() for p in SparseOccNet(pc, config=pr["config"]).parameters()), prof
+        k2 = memory_estimate(pc, config=pr["config"], temporal_k=2)
+        assert abs(k2["feature_cache_mb"] - 2 * est["feature_cache_mb"]) < 1e-9
+    fc = {c.cam_id: c.width for c in profile_cams(CFG, "front_cluster")}
+    assert fc == {"main": 800, "wide": 640}, fc
     print(f"checkpoints: loads across {', '.join(loadable)}; refuses {', '.join(retrain)} with no partial load OK")
 
 

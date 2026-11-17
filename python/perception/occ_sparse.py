@@ -67,6 +67,11 @@ PROFILES = {
     "1080ti": {"config": "default", "long_side": 640, "cams": "all8", "compute": "fp32"},
     "1080ti_cheap": {"config": "cheap", "long_side": 480, "cams": "front3", "compute": "fp32"},
     "1080ti_min": {"config": "cheap", "long_side": 320, "cams": "min", "compute": "fp32"},
+    # Michael's front_cluster knob: main+wide only, main at a higher resolution,
+    # against front3 (main+wide+narrow, all at 640). Trade-off measured by
+    # scripts/compare_front_cluster.py.
+    "front_cluster": {"config": "default", "long_side": 640, "main_long_side": 800, "cams": "min", "compute": "fp32"},
+    "front3": {"config": "default", "long_side": 640, "cams": "front3", "compute": "fp32"},
 }
 # Per-camera age weight: exp(-age / tau), 0 past max age (or no frame).
 AGE_TAU_S = 0.5
@@ -314,6 +319,58 @@ if nn is not None:
             keys = grid.keys_of(pts[sel].astype(np.float64))
             order = np.argsort(keys)
             return OccPrediction(keys[order], p[sel][order], c[sel][order], n_coarse, int(pts.shape[0]))
+
+
+def profile_cams(cfg: Any, profile: str, *, scale: float = 1.0) -> list[PinholeCam]:
+    """Cameras of ``PROFILES[profile]`` (preset + input sizes); ``scale`` shrinks every long side."""
+    from python.perception.occ_geometry import rig_cams
+
+    pr = PROFILES[profile]
+    keep = set(CAM_PRESETS[pr["cams"]])
+    out = []
+    for c in rig_cams(cfg):
+        if c.cam_id in keep:
+            ls = pr.get("main_long_side", pr["long_side"]) if c.cam_id == "main" else pr["long_side"]
+            out.append(c.scaled(max(8, int(round(ls * scale)))))
+    return out
+
+
+def memory_estimate(cams: Sequence[PinholeCam], *, config: str = "default", max_points: int = 65536,
+                    bytes_per: int = 4, temporal_k: int = 1) -> dict[str, float]:
+    """ESTIMATE (arithmetic, not measured) of inference memory in MB.
+
+    weights + temporal feature cache (K x cams x C x H/8 x W/8 x bytes; K = 1:
+    the net keeps only this frame's maps, temporal state is the tracker's few
+    floats per track) + encoder peak (largest consecutive stage pair of one
+    camera at a time) + query activations (max_points rows through the head,
+    x3 for the coarse-to-fine copies in flight).
+    """
+    cfg = NET_CONFIGS[config]
+    ch, feat, hid = tuple(cfg["channels"]), int(cfg["feat"]), int(cfg["hidden"])
+    params = 0
+    prev = 3
+    for c in ch:
+        params += prev * c * 9 + c + 2 * c
+        prev = c
+    params += prev * feat * 9 + feat + 2 * feat + feat * feat + feat
+    pe = positional_encoding_dim()
+    params += (feat + pe + 1) * hid + hid + hid * hid + hid + hid * (1 + len(LEVELS) + OCC_CLASS_COUNT) + 1 + len(LEVELS) + OCC_CLASS_COUNT
+    mb = 2.0 ** 20
+    cache = sum(temporal_k * feat * (c.height // 8) * (c.width // 8) * bytes_per for c in cams)
+    stages = []
+    for c in cams:
+        h, w, maps = c.height, c.width, [3]
+        sizes = [3 * h * w]
+        for k in ch:
+            h, w = (h + 1) // 2, (w + 1) // 2
+            sizes.append(k * h * w)
+        sizes.append(feat * h * w)
+        stages.append(max(a + b for a, b in zip(sizes, sizes[1:])) * bytes_per)
+    query = 3 * int(max_points) * (feat + pe + 1 + 2 * hid + 1 + len(LEVELS) + OCC_CLASS_COUNT + 3) * bytes_per
+    out = {"weights_mb": params * 4 / mb, "feature_cache_mb": cache / mb, "encoder_peak_mb": max(stages) / mb,
+           "query_mb": query / mb, "params_formula": float(params), "temporal_k": float(temporal_k)}
+    out["total_mb"] = out["weights_mb"] + out["feature_cache_mb"] + out["encoder_peak_mb"] + out["query_mb"]
+    return out
 
 
 def live_cams(cfg: Any, long_side: int = LIVE_LONG_SIDE) -> list[PinholeCam]:

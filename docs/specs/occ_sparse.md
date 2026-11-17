@@ -46,8 +46,9 @@ come from `scripts/bench_occ_sparse.py` on Desktop-IQU45.
 | Encoder cost 8 cams @640 | 7.28 GMAC, feature maps 8.8 MiB fp32 | `probe_flops.py` |
 | Head cost | 30.5 kMAC/query; 111k queries = 3.4 GMAC | same |
 | Net size | 165,542 params | `bench_occ_sparse.py` |
-| CPU inference 8 cams @640 (untrained, caps hit) | 23.6 s median (load 29; meaningless for the GPU, recorded only) | bench, earlier run |
-| CPU train step b4 8 cams | loader wait 0.52 s vs compute 22.0 s median; peak RSS 1.84 GB | bench, earlier run |
+| CPU inference 8 cams @640 (untrained, caps hit) | 21.3 s median, 4 threads, 23:35:51-23:40:08 CST, load 30-37 (meaningless for the GPU, recorded only) | bench |
+| CPU train step b4 8 cams, workers 0 | loader wait 0.38 s vs compute 22.7 s median; peak RSS 1.85 GB | bench, same run |
+| Shard build (labels from 8 cams) | 3.4 s/sample on the loaded box | bench, same run |
 | Activations at 8192 queries, fp32 (estimate) | 427 MB | bench |
 | Shard vs loose bytes/sample (bench, synthetic) | 233 KB vs 143 KB | bench |
 

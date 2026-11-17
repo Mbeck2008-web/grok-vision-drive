@@ -111,6 +111,17 @@ class VizUI:
     record_browser: Any = None
     # Automatic Mode collector. None until the AUTO tab is used.
     auto: Any = None
+    # Stage look. "legacy" is the ice-ribbon cabin. "early" is the vector chase.
+    # The supervisor sets this from --viz-style. Default stays legacy so existing
+    # cabin tests keep their pixels; the live flag default is early.
+    style: str = "legacy"
+    overlay: bool = False
+    debug_board: bool = False
+    showcase: bool = False
+    showcase_layout: str = "full"
+    showcase_preset: str = "stage"
+    # Debug-board samples only. The drive loop does not read this.
+    kine_trace: list = field(default_factory=list)
 
     def toggle_nerd(self) -> None:
         self.show_nerd = not self.show_nerd
@@ -178,6 +189,10 @@ class VizUI:
 
     def handle_key(self, key: int) -> bool:
         """Consume a GVD VISION key that belongs to the nerd/DRIVE/VIZ tab. True = handled."""
+        if key in (ord("b"), ord("B")):
+            # Debug board. D stays the DRIVE tab.
+            self.debug_board = not self.debug_board
+            return True
         if key in (ord("d"), ord("D")):
             self.show_drive_tab()
             return True
@@ -506,6 +521,10 @@ class Cam:
     fade_frac: float = -1.0
     width: int = STAGE_W
     height: int = STAGE_H
+    # None keeps the legacy chase lens. The vector stage passes its own eye.
+    eye_override: tuple[float, float, float] | None = None
+    look_override: tuple[float, float, float] | None = None
+    fov_deg: float = 42.0
     _basis: tuple | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -521,19 +540,28 @@ class Cam:
             cam = np.array(self.eye, dtype=np.float64)
             # Same x as the lens. A look target off that line yaws the basis,
             # and a straight path then leans across the car.
-            target = np.array([float(cam[0]), 16.0, -0.8], dtype=np.float64)
+            if self.look_override is not None:
+                target = np.array(self.look_override, dtype=np.float64)
+            else:
+                target = np.array([float(cam[0]), 16.0, -0.8], dtype=np.float64)
             forward = target - cam
             forward = forward / (np.linalg.norm(forward) + 1e-9)
             world_up = np.array([0.0, 0.0, 1.0])
             right = np.cross(forward, world_up)
             right = right / (np.linalg.norm(right) + 1e-9)
             up = np.cross(right, forward)
-            fov = math.radians(42.0)
+            fov = math.radians(float(self.fov_deg))
             f = (float(self.height) * 0.5) / math.tan(fov * 0.5)
             self._basis = (cam, forward, right, up, float(f))
 
     @property
     def eye(self) -> tuple[float, float, float]:
+        if self.eye_override is not None:
+            return (
+                float(self.eye_override[0]),
+                float(self.eye_override[1]),
+                float(self.eye_override[2]),
+            )
         if self.top_down:
             return (0.0, -8.0, 40.0)
         # Centered behind the ego. A lateral offset leans a straight path
@@ -1796,6 +1824,68 @@ def _draw_conf_gate_tag(img: np.ndarray, state: dict[str, Any], *, x: int, y: in
     cv2.putText(img, tag, (int(x), int(y)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (80, 180, 220), 1, cv2.LINE_AA)
 
 
+def _stage_mode(ui: VizUI) -> str:
+    """legacy cabin, early vector, camera overlay, debug board, or showcase."""
+    if bool(getattr(ui, "debug_board", False)):
+        return "debug"
+    if bool(getattr(ui, "showcase", False)):
+        return "showcase"
+    style = str(getattr(ui, "style", "legacy") or "legacy").strip().lower()
+    if bool(getattr(ui, "overlay", False)) or style == "early":
+        return "early"
+    return "legacy"
+
+
+def _paint_alt(
+    mode: str,
+    state: dict[str, Any],
+    ui: VizUI,
+    width: int,
+    height: int,
+    main_frame: np.ndarray | None,
+    cam_frames: dict[str, Any] | None,
+) -> np.ndarray:
+    if mode == "debug":
+        from python.viz.debug_board import render_debug_board
+
+        return render_debug_board(
+            state, ui, width=width, height=height, main_frame=main_frame, cam_frames=cam_frames,
+        )
+    if mode == "showcase":
+        from python.viz.showcase import render_showcase
+
+        return render_showcase(
+            state, ui, width=width, height=height, main_frame=main_frame, cam_frames=cam_frames,
+        )
+    from python.viz.early_vector import render_early_stage
+
+    return render_early_stage(
+        state,
+        ui,
+        width=width,
+        height=height,
+        main_frame=main_frame,
+        top_down=bool(ui.top_down),
+        overlay=bool(getattr(ui, "overlay", False)),
+    )
+
+
+_VOID_TEMPLATES: dict[tuple[int, int], np.ndarray] = {}
+
+
+def _void_canvas(h: int, w: int) -> np.ndarray:
+    """VOID-filled frame. Filling with a colour tuple costs ms at 1280x720;
+    copying a cached template is a memcpy. Same pixels as np.full."""
+    key = (int(h), int(w))
+    tpl = _VOID_TEMPLATES.get(key)
+    if tpl is None:
+        if len(_VOID_TEMPLATES) > 8:
+            _VOID_TEMPLATES.clear()
+        tpl = np.full((key[0], key[1], 3), VOID, dtype=np.uint8)
+        _VOID_TEMPLATES[key] = tpl
+    return tpl.copy()
+
+
 def render_stage(
     state: dict[str, Any],
     ui: VizUI | None = None,
@@ -1820,7 +1910,7 @@ def render_stage(
         width=stage_w,
         height=stage_h,
     )
-    img = np.full((stage_h, stage_w, 3), VOID, dtype=np.uint8)
+    img = _void_canvas(stage_h, stage_w)
 
     if is_bus_mismatch(state):
         _draw_mismatch(img, state)
@@ -1868,6 +1958,21 @@ def render_stage(
                 state, h=STAGE_H, w=ui.nerd_width, show_help=ui.show_help, ui=ui, cam_frames=cam_frames,
             )
             return np.concatenate([img, panel], axis=1)
+        return img
+
+    mode = _stage_mode(ui)
+    if mode != "legacy":
+        img = _paint_alt(mode, state, ui, stage_w, stage_h, main_frame, cam_frames)
+        note = scene_note(state)
+        state["viz_ms"] = (time.perf_counter() - t0) * 1000.0
+        state["viz_scene_note"] = note
+        # Showcase frames stay free of the nerd panel. Debug and early keep it.
+        if ui.show_nerd and not clean and mode != "showcase" and img.shape[0] > 0:
+            panel = render_panel(
+                state, h=int(img.shape[0]), w=ui.nerd_width, show_help=ui.show_help, ui=ui, cam_frames=cam_frames,
+            )
+            if panel.shape[0] == img.shape[0]:
+                return np.concatenate([img, panel], axis=1)
         return img
 
     engaged = bool(state.get("engaged"))

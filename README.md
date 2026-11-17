@@ -45,7 +45,19 @@ Windows. You do not need an administrator account. The full agent procedure (Tec
 
 ![GVD VISION at an intersection, offline render](docs/media/gvd_viz_intersection_stage.png)
 
-*Offline render of the GVD VISION stage from the GVD UI code. Not live gameplay.*
+*Offline render of the GVD VISION stage from the GVD UI code. Not live gameplay. This picture is the legacy cabin (`--viz-style legacy`).*
+
+The supervisor default (`--viz-style early`) is a black chase view: dotted lane lines, a dotted path, and wireframe boxes. `--viz-overlay` draws that scene on the main camera with a speed bar. `--viz-style legacy` keeps the ice-ribbon cabin above. Key `b` or `--viz-debug` opens the multi-panel board (off by default). `--viz-showcase` is a clean frame for stills; presets are `square` (1080x1080), `story` (1080x1920), and `wide` (1920x1080).
+
+![Vector stage, intersection, offline](docs/images/viz_early_fsd/intersection.png)
+
+*Offline synthetic vector stage. Not a live capture.*
+
+![Vector overlay on a synthetic dusk frame](docs/images/viz_early_fsd/overlay_dusk.png)
+
+*Offline synthetic camera with the vector overlay and speed bar. Not a live capture.*
+
+`scripts/render_label_video.py <recording_dir> --out clip.mp4` draws training labels on recorded frames. It is not part of the live loop.
 
 #### Stage elements
 
@@ -255,7 +267,7 @@ The game bus lives in the running product's `Documents/GVD` folder (`%LOCALAPPDA
 
 | Command | Key flags (default) | Status |
 | --- | --- | --- |
-| `py -3 python\run_vision.py` (supervisor; the `.bat` launchers add `--viz`) | `--viz` (off), `--backend auto\|beamngpy\|window\|stub` (auto), `--hz` (15), `--policy modular\|e2e\|shadow` (modular, from `config/control.yaml`), `--lane-source hough\|scene\|gt` (hough), `--scene-onnx` (`models/e2e_scene.onnx`), `--detector` (auto), `--e2e-model` (auto), `--viz-screen auto\|1\|2` (auto), `--viz-fullscreen`, `--encode auto\|qsv\|cpu\|nvenc` (auto), `--gt-log` (off), `--foxglove` (off), `--tech-probe`, `--tech-hold`, `--smoke`, `--vision-only`, `--allow-preview-drive` (off), `--allow-synthetic-detect` (off), `--force-engage` (dev only, off), `--no-engage` / `GVD_NO_ENGAGE=1` (hard engage disable, off), `--cam-age-baseline` (cam-age capture baseline: cam-age model / hold off), `--run-seconds` (0 = until stopped) | Unproven |
+| `py -3 python\run_vision.py` (supervisor; the `.bat` launchers add `--viz`) | `--viz` (off), `--backend auto\|beamngpy\|window\|stub` (auto), `--hz` (15), `--policy modular\|e2e\|shadow` (modular, from `config/control.yaml`), `--lane-source hough\|scene\|gt` (hough), `--scene-onnx` (`models/e2e_scene.onnx`), `--detector` (auto), `--e2e-model` (auto), `--viz-screen auto\|1\|2` (auto), `--viz-fullscreen`, `--viz-style early\|legacy` (early), `--viz-overlay` (off), `--viz-debug` (off; key `b`), `--viz-showcase` (off), `--viz-showcase-layout full\|split\|pip` (full), `--viz-preset stage\|square\|story\|wide` (stage), `--encode auto\|qsv\|cpu\|nvenc` (auto), `--gt-log` (off), `--foxglove` (off), `--tech-probe`, `--tech-hold`, `--smoke`, `--vision-only`, `--allow-preview-drive` (off), `--allow-synthetic-detect` (off), `--force-engage` (dev only, off), `--no-engage` / `GVD_NO_ENGAGE=1` (hard engage disable, off), `--cam-age-baseline` (cam-age capture baseline: cam-age model / hold off), `--run-seconds` (0 = until stopped) | Unproven |
 | `py -3 scripts\collect_scene_lanes.py` (collector) | `--minutes` (45), `--until-disk`, `--map`, `--maps`, `--map-weights`, `--segment-min` (12), `--route span\|waypoints\|random` (span), `--waypoints`, `--speed-min` (unset), `--speed-max` (unset; when set, each clamps every spawn type's range: city 8-14, highway 20-30, ramp 10-18 m/s; off the deck 8-17), `--cameras` (all), `--rates`, `--traffic [N]`, `--respawn-min` (0), `--no-impact-respawn` (impact respawn is on by default), `--time-of-day`, `--weather`, `--no-excursions`, `--weave-guard` (on; `--no-weave-guard` turns it off), `--ego-model` (sbr, the Hirochi eSBR electric), `--ego-config` (`vehicles/sbr/electric_800.pc`, the stock eSBR 800), `--no-vary-env`, `--smoke-s` (60), `--out`, `--data-dir`, `--reload-level`, `--check-maps`, `--list-levels`, `--dump-roads`, `--host`, `--port` | Proven live: recording only (`GVD_data\logs\rec3_20261019.txt`, `GVD_data\scene_lanes_rec3\collect.json`) |
 | `py -3 -m python.train.train_scene` (trainer) | see Technical details | Offline smoke only |
 | `py -3 scripts\gvd_status.py` | none | Offline smoke only |

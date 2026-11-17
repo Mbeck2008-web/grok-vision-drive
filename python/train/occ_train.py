@@ -41,6 +41,8 @@ def sample_queries(
     n_free: int = N_FREE,
     n_coarse: int = N_COARSE,
     levels: Sequence[int] = LEVELS,
+    vis_keys: np.ndarray | None = None,
+    visible_only: bool = False,
 ) -> dict[str, np.ndarray]:
     """Fixed-size sparse query set + targets for one labelled tick.
 
@@ -48,6 +50,13 @@ def sample_queries(
     observed cells: holding an occupied fine cell or crossed by a free ray).
     ``any[:, l]`` is 1 when the level-``l`` cell holding the point holds an
     occupied fine cell.
+
+    ``keys``/``cls`` may hold map ground truth for the whole grid (occluded
+    cells included, ``occ_map_labels.merge_targets``): every one is a target.
+    ``vis_keys`` (camera-ray visibility) only tags each query ``vis`` 1/0 for
+    the visible / occluded split. ``visible_only=True`` reproduces the old
+    camera-masked loss (occluded queries weight 0) and exists for the trace
+    test only.
     """
     keys = np.asarray(keys, dtype=np.int64)
     coarse_grids = [grid.coarse(f) for f in levels]
@@ -81,8 +90,12 @@ def sample_queries(
         rep = rng.integers(0, P.shape[0], size=want - P.shape[0])
         P, O, W, C = np.concatenate([P, P[rep]]), np.concatenate([O, O[rep]]), np.concatenate([W, W[rep]]), np.concatenate([C, C[rep]])
     anyt = np.stack([np.isin(cg.keys_of(P), occ_l) for cg, occ_l in zip(coarse_grids, occ_levels)], axis=-1)
+    vis = np.ones(P.shape[0], bool) if vis_keys is None else np.isin(grid.keys_of(P.astype(np.float64)), np.asarray(vis_keys, np.int64))
+    any_w = np.ones(anyt.shape, np.float32)
+    if visible_only:
+        W = np.where(vis, W, 0.0); C = np.where(vis, C, -1); any_w[~vis] = 0.0
     return {"pts": P.astype(np.float32), "occ": O.astype(np.float32), "occ_w": W.astype(np.float32),
-            "any": anyt.astype(np.float32), "cls": C.astype(np.int64)}
+            "any": anyt.astype(np.float32), "any_w": any_w, "cls": C.astype(np.int64), "vis": vis.astype(np.float32)}
 
 
 def prep_image(img_bgr: np.ndarray, cam: PinholeCam) -> np.ndarray:
@@ -112,7 +125,7 @@ class QueryDataset:
         s = self.shards[i]
         self.calls += 1
         rng = np.random.default_rng((self.seed, int(i), self.calls))
-        out = sample_queries(s["keys"], s["cls"], s["free"], rng, grid=self.grid, **self.q)
+        out = sample_queries(s["keys"], s["cls"], s["free"], rng, grid=self.grid, vis_keys=s.get("vis"), **self.q)
         out["images"] = [prep_image(s["images"][c.cam_id], c) for c in self.cams]
         out["recovery"] = bool(s["meta"].get("recovery"))
         return out
@@ -121,7 +134,7 @@ class QueryDataset:
 def collate(batch: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     import torch
 
-    out = {k: torch.from_numpy(np.stack([b[k] for b in batch])) for k in ("pts", "occ", "occ_w", "any", "cls")}
+    out = {k: torch.from_numpy(np.stack([b[k] for b in batch])) for k in ("pts", "occ", "occ_w", "any", "any_w", "cls", "vis")}
     out["images"] = [torch.from_numpy(np.stack([b["images"][k] for b in batch])) for k in range(len(batch[0]["images"]))]
     out["recovery"] = torch.tensor([b["recovery"] for b in batch])
     return out
@@ -134,7 +147,11 @@ def occ_loss(out: Mapping[str, Any], batch: Mapping[str, Any]) -> tuple[Any, dic
     occ = out["occ"].float()
     w = batch["occ_w"]
     l_occ = (F.binary_cross_entropy_with_logits(occ, batch["occ"], reduction="none") * w).sum() / w.sum().clamp(min=1.0)
-    l_any = F.binary_cross_entropy_with_logits(out["any"].float(), batch["any"])
+    aw = batch.get("any_w")
+    if aw is None:
+        l_any = F.binary_cross_entropy_with_logits(out["any"].float(), batch["any"])
+    else:
+        l_any = (F.binary_cross_entropy_with_logits(out["any"].float(), batch["any"], reduction="none") * aw).sum() / aw.sum().clamp(min=1.0)
     cls = batch["cls"]
     if bool((cls >= 0).any()):
         l_cls = F.cross_entropy(out["cls"].float().reshape(-1, out["cls"].shape[-1]), cls.reshape(-1), ignore_index=-1)

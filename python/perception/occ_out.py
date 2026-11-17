@@ -1,4 +1,12 @@
-"""``occ_out`` v1: the occupancy runtime's output contract (camera-only).
+"""``occ_out`` v2: the occupancy runtime's output contract (camera-only).
+
+v2 = v1 plus exactly one field per element type: ``observed`` (bool) per
+occupancy cell (``cells.observed``) and per polyline point
+(``edges[].observed``, ``lanes[].observed``): true when a LIVE camera's ray
+reaches it this tick with no predicted occluder in front; false for cells the
+net decoded without a ray (occluded / out of view) or carried by the VO-warped
+memory. Everything else is v1. The validator is version-gated: a v1 message
+must not carry ``observed``, a v2 message must.
 
 One dict per tick, built by ``OccRuntime.step``. Strict: ``validate_occ_out``
 raises ``OccOutError`` on a missing field, an unknown field (any level), a
@@ -43,7 +51,9 @@ import numpy as np
 
 from python.perception.occ_geometry import DEFAULT_GRID, OccGrid, PinholeCam, project
 
-OCC_OUT_VERSION = 1
+OCC_OUT_VERSION = 2          # v2 = v1 + ``observed`` per cell and per polyline point
+OCC_OUT_VERSIONS = (1, 2)
+MAX_MEMORY = 16384
 CAM_IDS = ("narrow", "main", "wide", "pillarL", "pillarR", "repeatL", "repeatR", "rear")
 OCC_CLASS_NAMES = ("other", "drivable", "vehicle")
 OBJECT_CLASSES = ("vehicle",)
@@ -69,9 +79,14 @@ TOP_KEYS = ("v", "type", "seq", "t", "grid", "counts", "cells", "edges", "lanes"
             "cams", "ego", "timing_ms", "peak_vram_mb", "vram_status", "vram_est_mb_cpu")
 GRID_KEYS = ("voxel_m", "origin", "shape")
 COUNT_KEYS = ("full", "frustum", "queried", "stored", "stage_queries", "cells_out", "objects", "edges")
-CELL_KEYS = ("ijk", "cls", "prob")
-EDGE_KEYS = ("side", "kind", "pts", "conf")
-LANE_KEYS = ("paint", "pts", "conf")
+CELL_KEYS_V1 = ("ijk", "cls", "prob")
+EDGE_KEYS_V1 = ("side", "kind", "pts", "conf")
+LANE_KEYS_V1 = ("paint", "pts", "conf")
+# v2 adds exactly one field per element type: observed (true = a LIVE camera ray reaches it this tick)
+CELL_KEYS = CELL_KEYS_V1 + ("observed",)
+EDGE_KEYS = EDGE_KEYS_V1 + ("observed",)
+LANE_KEYS = LANE_KEYS_V1 + ("observed",)
+KEYS_BY_VERSION = {1: (CELL_KEYS_V1, EDGE_KEYS_V1, LANE_KEYS_V1), 2: (CELL_KEYS, EDGE_KEYS, LANE_KEYS)}
 CORRIDOR_KEYS = ("pts", "conf")
 OBJECT_KEYS = ("id", "cls", "x", "y", "z0", "l", "w", "h", "heading", "heading_src", "motion", "speed_mps", "frames")
 BOX_KEYS = ("id", "cls", "box")
@@ -108,7 +123,7 @@ def field_present(msg: Mapping[str, Any], path: str) -> bool:
 
 
 class OccOutError(ValueError):
-    """``occ_out`` violates the v1 contract."""
+    """``occ_out`` violates the v1/v2 contract."""
 
 
 def _keys(d: Any, want: Sequence[str], where: str) -> None:
@@ -156,6 +171,14 @@ def _list(x: Any, where: str, cap: int, min_len: int = 0) -> list:
     return x
 
 
+def _bools(x: Any, where: str, n: int) -> None:
+    if not isinstance(x, list) or len(x) != n:
+        raise OccOutError(f"{where}: want a list of {n} bools")
+    for i, b in enumerate(x):
+        if not isinstance(b, bool):
+            raise OccOutError(f"{where}[{i}]: not a bool")
+
+
 def _polyline(rec: Mapping[str, Any], where: str, cap: int = MAX_POINTS, closed: bool = False) -> None:
     pts = _list(rec["pts"], f"{where}.pts", cap, 3 if closed else 2)
     for i, p in enumerate(pts):
@@ -191,10 +214,12 @@ def polygon_simple(pts: Sequence[Sequence[float]]) -> bool:
 
 
 def validate_occ_out(msg: Any) -> dict[str, Any]:
-    """Raise ``OccOutError`` unless ``msg`` is a valid occ_out v1. Returns ``msg``."""
+    """Raise ``OccOutError`` unless ``msg`` is a valid occ_out v1 or v2. Returns ``msg``."""
     _keys(msg, TOP_KEYS, "occ_out")
-    if msg["v"] != OCC_OUT_VERSION or msg["type"] != "occ_out":
-        raise OccOutError(f"occ_out: v/type {msg['v']!r}/{msg['type']!r}, want {OCC_OUT_VERSION}/occ_out")
+    if msg["v"] not in OCC_OUT_VERSIONS or isinstance(msg["v"], bool) or msg["type"] != "occ_out":
+        raise OccOutError(f"occ_out: v/type {msg['v']!r}/{msg['type']!r}, want one of {OCC_OUT_VERSIONS}/occ_out")
+    ver = int(msg["v"])
+    cell_keys, edge_keys, lane_keys = KEYS_BY_VERSION[ver]
     _int(msg["seq"], "seq"); _num(msg["t"], "t")
     g = msg["grid"]; _keys(g, GRID_KEYS, "grid")
     _num(g["voxel_m"], "grid.voxel_m", 1e-3)
@@ -215,14 +240,18 @@ def validate_occ_out(msg: Any) -> dict[str, Any]:
         _int(q, f"counts.stage_queries[{i}]")
     if full != int(np.prod(g["shape"])):
         raise OccOutError(f"counts.full {full} != prod(grid.shape)")
-    if not (stored <= queried <= full and frustum <= full):
-        raise OccOutError(f"counts: need stored {stored} <= queried {queried} <= full {full}, frustum {frustum} <= full")
+    # v2: stored = this tick's predicted cells + VO-warped memory cells (<= MAX_MEMORY)
+    mem = MAX_MEMORY if ver >= 2 else 0
+    if not (stored <= min(full, queried + mem) and queried <= full and frustum <= full):
+        raise OccOutError(f"counts: need stored {stored} <= queried {queried} (+ memory {mem}) <= full {full}, frustum {frustum} <= full")
     if sum(sq) != queried:
         raise OccOutError(f"counts.stage_queries sum {sum(sq)} != queried {queried}")
-    cells = msg["cells"]; _keys(cells, CELL_KEYS, "cells")
+    cells = msg["cells"]; _keys(cells, cell_keys, "cells")
     ijk = _list(cells["ijk"], "cells.ijk", MAX_CELLS)
     cls = _list(cells["cls"], "cells.cls", MAX_CELLS)
     prob = _list(cells["prob"], "cells.prob", MAX_CELLS)
+    if ver >= 2:
+        _bools(_list(cells["observed"], "cells.observed", MAX_CELLS), "cells.observed", len(ijk))
     if not (len(ijk) == len(cls) == len(prob) == c["cells_out"]):
         raise OccOutError(f"cells: lengths {len(ijk)}/{len(cls)}/{len(prob)} vs counts.cells_out {c['cells_out']}")
     if c["cells_out"] > stored:
@@ -241,12 +270,16 @@ def validate_occ_out(msg: Any) -> dict[str, Any]:
     if len(edges) != _int(c["edges"], "counts.edges"):
         raise OccOutError("counts.edges != len(edges)")
     for i, e in enumerate(edges):
-        _keys(e, EDGE_KEYS, f"edges[{i}]")
+        _keys(e, edge_keys, f"edges[{i}]")
+        if ver >= 2:
+            _bools(e["observed"], f"edges[{i}].observed", len(e["pts"]) if isinstance(e["pts"], list) else -1)
         _enum(e["side"], EDGE_SIDES, f"edges[{i}].side"); _enum(e["kind"], EDGE_KINDS, f"edges[{i}].kind")
         _list(e["conf"], f"edges[{i}].conf", MAX_POINTS)
         _polyline(e, f"edges[{i}]")
     for i, ln in enumerate(_list(msg["lanes"], "lanes", MAX_LANES)):
-        _keys(ln, LANE_KEYS, f"lanes[{i}]")
+        _keys(ln, lane_keys, f"lanes[{i}]")
+        if ver >= 2:
+            _bools(ln["observed"], f"lanes[{i}].observed", len(ln["pts"]) if isinstance(ln["pts"], list) else -1)
         _enum(ln["paint"], LANE_PAINTS, f"lanes[{i}].paint")
         _list(ln["conf"], f"lanes[{i}].conf", MAX_POINTS)
         _polyline(ln, f"lanes[{i}]")
@@ -463,8 +496,123 @@ def cam_panels(cams: Sequence[PinholeCam], weights: np.ndarray, ages: Mapping[st
     return out
 
 
+def ground_cell(keys: np.ndarray, cls: np.ndarray, grid: OccGrid) -> int | None:
+    """Median z cell of the drivable cells (road surface), None without any."""
+    from python.perception.occ_outputs import DRIVABLE
+
+    m = np.asarray(cls) == DRIVABLE
+    if not m.any():
+        return None
+    return int(np.median(grid.cell_of_key(np.asarray(keys, np.int64)[m])[:, 2]))
+
+
+def occluders(keys: np.ndarray, cls: np.ndarray, grid: OccGrid) -> np.ndarray:
+    """Sorted keys that block a camera ray: predicted non-drivable cells >= 1 voxel above the road surface."""
+    from python.perception.occ_outputs import DRIVABLE
+
+    keys = np.asarray(keys, np.int64)
+    cls = np.asarray(cls)
+    if not keys.size:
+        return keys
+    g = ground_cell(keys, cls, grid)
+    z = grid.cell_of_key(keys)[:, 2]
+    m = (cls != DRIVABLE) & (z >= (g + 1 if g is not None else -1))
+    return np.sort(keys[m])
+
+
+def observed_mask(pts: np.ndarray, cams: Sequence[PinholeCam], occl: np.ndarray, grid: OccGrid,
+                  chunk: int = 1024) -> np.ndarray:
+    """(N,) True where some camera in ``cams`` sees the point with no occluder cell
+    on the ray before it (the last voxel before the point is not tested).
+    Sparse: ray samples are looked up in the sorted occluder keys."""
+    pts = np.asarray(pts, np.float64).reshape(-1, 3)
+    obs = np.zeros(pts.shape[0], bool)
+    v = float(grid.voxel_m)
+    occl = np.asarray(occl, np.int64)
+    for cam in cams:
+        _, _, ok = project(cam, pts)
+        idx = np.flatnonzero(ok & ~obs)
+        if not idx.size:
+            continue
+        o = np.asarray(cam.pos, np.float64)
+        if not occl.size:
+            obs[idx] = True
+            continue
+        for c0 in range(0, idx.size, chunk):
+            ii = idx[c0:c0 + chunk]
+            vec = pts[ii] - o
+            dist = np.linalg.norm(vec, axis=1)
+            unit = vec / np.maximum(dist, 1e-9)[:, None]
+            ts = np.arange(0.0, float(dist.max()), v * 0.5)
+            m = ts[None, :] < (dist[:, None] - v)
+            samp = o + unit[:, None, :] * ts[None, :, None]
+            k = grid.keys_of(samp.reshape(-1, 3)).reshape(m.shape)
+            pos = np.clip(np.searchsorted(occl, k), 0, occl.size - 1)
+            hit = (occl[pos] == k) & (k >= 0) & m
+            obs[ii[~hit.any(axis=1)]] = True
+    return obs
+
+
+class OccMemory:
+    """VO-warped temporal memory of static cells (causal: past ticks only).
+
+    Each tick: last tick's static cells (not vehicles, which move) are warped
+    into the current ego frame with this tick's camera-VO motion, their
+    probability decays by exp(-dt/tau). A warped cell a camera sees now is
+    dropped (the current prediction is the truth there); an unseen one is
+    kept with ``observed = False`` if this tick did not predict it. VO not
+    ok -> memory cleared (no blind carry). Capped at ``MAX_MEMORY`` cells.
+    """
+
+    def __init__(self, grid: OccGrid, *, tau_s: float = 2.0, min_prob: float = 0.35, cap: int = MAX_MEMORY) -> None:
+        self.grid, self.tau_s, self.min_prob, self.cap = grid, float(tau_s), float(min_prob), int(cap)
+        self.keys = np.zeros(0, np.int64); self.cls = np.zeros(0, np.uint8); self.prob = np.zeros(0, np.float32)
+
+    def reset(self) -> None:
+        self.__init__(self.grid, tau_s=self.tau_s, min_prob=self.min_prob, cap=self.cap)
+
+    def step(self, keys, cls, prob, obs, *, ok: bool, fwd: float, dyaw: float, dt: float | None,
+             cams: Sequence[PinholeCam], occl: np.ndarray):
+        """-> merged (keys, cls, prob, observed), sorted by key."""
+        from python.perception.occ_ego import _warp
+        from python.perception.occ_outputs import VEHICLE
+
+        g = self.grid
+        keys = np.asarray(keys, np.int64); cls = np.asarray(cls, np.uint8); prob = np.asarray(prob, np.float32)
+        obs = np.asarray(obs, bool)
+        mk = np.zeros(0, np.int64); mc = np.zeros(0, np.uint8); mp = np.zeros(0, np.float32)
+        if self.keys.size and ok and dt is not None and dt > 0:
+            c = g.centers_of_keys(self.keys)
+            xy = _warp(c[:, :2], float(fwd), float(dyaw))
+            nk = g.keys_of(np.concatenate([xy, c[:, 2:3]], 1))
+            p = self.prob * np.float32(math.exp(-dt / self.tau_s))
+            keep = (nk >= 0) & (p >= self.min_prob) & ~np.isin(nk, keys)
+            mk, mc, mp = nk[keep], self.cls[keep], p[keep]
+            if mk.size:
+                mk, first = np.unique(mk, return_index=True)
+                mc, mp = mc[first], mp[first]
+                seen = observed_mask(g.centers_of_keys(mk), cams, occl, g)
+                mk, mc, mp = mk[~seen], mc[~seen], mp[~seen]
+        K = np.concatenate([keys, mk]); C = np.concatenate([cls, mc]); P = np.concatenate([prob, mp])
+        O = np.concatenate([obs, np.zeros(mk.size, bool)])
+        o = np.argsort(K, kind="stable")
+        K, C, P, O = K[o], C[o], P[o], O[o]
+        st = (C != VEHICLE) & (P >= self.min_prob)
+        if ok or dt is None:  # first tick: nothing to warp yet, start remembering
+            gk = ground_cell(K, C, g)
+            flat = (C == 0) & (g.cell_of_key(K)[:, 2] <= (gk if gk is not None else -1)) if K.size else np.zeros(0, bool)
+            top = np.lexsort((-P[st], flat[st]))[: self.cap]  # plain ground last, then by probability
+            self.keys, self.cls, self.prob = K[st][top], C[st][top], P[st][top]
+        else:  # VO lost: no blind carry
+            self.reset()
+        return K, C, P, O
+
+
 class OccRuntime:
-    """Camera-only tick: images (+ per-camera ages) -> validated ``occ_out`` v1.
+    """Camera-only tick: images (+ per-camera ages) -> validated ``occ_out`` v2.
+
+    Causal: a tick reads only this tick's images and state carried from earlier
+    ticks (VO, tracker, memory); nothing is revised retroactively.
 
     Ego motion is camera VO unless ``from_vehicle`` (``--ego-from-vehicle``).
     Latency comes from in-code ``perf_counter`` timers.
@@ -472,7 +620,7 @@ class OccRuntime:
 
     def __init__(self, net: Any, *, from_vehicle: bool = False, max_points: int = 16384, max_coarse: int = 2048,
                  preset: str | None = None, vram_est_mb_cpu: float | None = None,
-                 frustum_cells: int | None = None) -> None:
+                 frustum_cells: int | None = None, memory: bool = True, timer: Any = None) -> None:
         from python.perception.occ_ego import EgoMotion
         from python.perception.occ_outputs import OccTracker
 
@@ -486,6 +634,8 @@ class OccRuntime:
         self._prev_t: float | None = None
         self._frustum: dict[tuple, int] = {}
         self._frustum_fixed = frustum_cells  # precomputed (e.g. by bench_occ_sparse) for huge grids
+        self.memory = OccMemory(net.grid) if memory else None
+        self._timer = timer or time.perf_counter  # injectable: a fixed clock makes occ_out byte-reproducible
 
     def _frustum_count(self, active: tuple) -> int:
         """Fine cells visible to the active cameras, counted in fixed-size chunks (no grid-sized array)."""
@@ -504,32 +654,60 @@ class OccRuntime:
 
     def step(self, images: Sequence[Any], t: float, *, ages_s: Mapping[str, float] | None = None,
              vehicle: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        from python.perception.occ_ego import runtime_frame
-        from python.perception.occ_sparse import cam_weights
+        from python.perception.occ_outputs import occ_outputs
+        from python.perception.occ_sparse import OccPrediction, cam_weights
 
         ids = self.net.cam_ids
         w = cam_weights(ids, preset=self.preset, ages_s=ages_s) if (ages_s is not None or self.preset) else np.ones(len(ids), np.float32)
         present = [img is not None for img in images]
         w = w * np.asarray(present, dtype=np.float32)
         self._frustum_count(tuple(bool(x > 0) for x in w))  # once per camera set, cached, outside the timers
-        t0 = time.perf_counter()
-        pred = self.net.predict(images, max_points=self.max_points, max_coarse=self.max_coarse, cam_w=w)
-        t1 = time.perf_counter()
-        out = runtime_frame(pred, self.tracker, self.ego, t, vehicle=vehicle)
-        msg = self._build(pred, out, t, w, ages_s, present, (t1 - t0) * 1e3, (time.perf_counter() - t1) * 1e3)
-        msg["timing_ms"]["total"] = _r((time.perf_counter() - t0) * 1e3, 2)
+        clk = self._timer
+        t0 = clk()
+        raw = self.net.predict(images, max_points=self.max_points, max_coarse=self.max_coarse, cam_w=w)
+        t1 = clk()
+        g = self.grid
+        est = self.ego.update(raw.keys, raw.cls, t, vehicle)  # VO on this tick's own cells
+        dt = None if self._prev_t is None else float(t) - self._prev_t
+        live = [c for c, x in zip(self.net.cams, w) if x >= STALE_WEIGHT]
+        occl = occluders(raw.keys, raw.cls, g)
+        obs = observed_mask(g.centers_of_keys(np.asarray(raw.keys, np.int64)), live, occl, g) if len(raw.keys) else np.zeros(0, bool)
+        if self.memory is not None:
+            keys, cls, prob, obs = self.memory.step(raw.keys, raw.cls, raw.prob, obs, ok=bool(est.ok),
+                                                    fwd=est.speed_mps * (dt or 0.0), dyaw=est.yaw_rate * (dt or 0.0),
+                                                    dt=dt, cams=live, occl=occl)
+        else:
+            keys, cls, prob = np.asarray(raw.keys), np.asarray(raw.cls), np.asarray(raw.prob)
+        pred = OccPrediction(keys, prob, cls, raw.n_coarse, raw.n_fine, raw.stage_queries)
+        out = occ_outputs(pred, self.tracker, t, ego_speed_mps=est.speed_mps, ego_yaw_rate=est.yaw_rate, grid=g)
+        out["ego"].update({"source": est.source, "motion_ok": bool(est.ok), "yaw_rate": float(est.yaw_rate)})
+        self._obs_ctx = (obs, live, occl)
+        self.last_cells = (np.asarray(keys, np.int64), np.asarray(cls), np.asarray(prob), np.asarray(obs, bool))  # pre-cap, for eval
+        t2 = clk()
+        msg = self._build(pred, out, t, w, ages_s, present, (t1 - t0) * 1e3, (t2 - t1) * 1e3)
+        msg["timing_ms"]["total"] = _r((clk() - t0) * 1e3, 2)
         return validate_occ_out(msg)
 
     def _build(self, pred, out, t, w, ages, present, ms_pred, ms_out) -> dict[str, Any]:
         g = self.grid
         keys, cls, prob = np.asarray(pred.keys), np.asarray(pred.cls), np.asarray(pred.prob)
         ctr = g.centers_of_keys(keys) if keys.size else np.zeros((0, 3))
-        order = np.argsort(np.hypot(ctr[:, 0], ctr[:, 1]), kind="stable")[:MAX_CELLS] if keys.size else np.zeros(0, int)
+        # cap order: plain ground ("other" at road-surface height: grass / terrain) last, else nearest first
+        gk0 = ground_cell(keys, cls, g)
+        flat = (cls == 0) & (g.cell_of_key(keys)[:, 2] <= (gk0 if gk0 is not None else -1)) if keys.size else np.zeros(0, bool)
+        order = np.lexsort((np.hypot(ctr[:, 0], ctr[:, 1]), flat))[:MAX_CELLS] if keys.size else np.zeros(0, int)
         ijk = g.cell_of_key(keys[order]) if keys.size else np.zeros((0, 3), int)
         edges = [e for e in out["edges"] if len(e["pts"]) >= 2][:MAX_EDGES]
         for e in edges:
             e["pts"] = e["pts"][:MAX_POINTS]
         confs = edge_conf(edges, keys, cls, prob, g)
+        obs, live, occl = self._obs_ctx
+        gk = ground_cell(keys, cls, g)
+        gz = g.z_min + ((gk if gk is not None else 0) + 0.5) * g.voxel_m
+        e_obs = []
+        for e in edges:
+            P = np.asarray(e["pts"], np.float64).reshape(-1, 2)
+            e_obs.append(observed_mask(np.concatenate([P, np.full((len(P), 1), gz)], 1), live, occl, g).tolist())
         objs = []
         for o in out["objects"][:MAX_OBJECTS]:
             moving = o.get("yaw_src") == "track"  # tracker: speed >= PARKED_MPS over >= MIN_FRAMES
@@ -562,8 +740,10 @@ class OccRuntime:
                        "stored": int(keys.size), "stage_queries": [int(x) for x in pred.stage_queries],
                        "cells_out": int(order.size), "objects": len(objs), "edges": len(edges)},
             "cells": {"ijk": ijk.astype(int).tolist(), "cls": cls[order].astype(int).tolist(),
-                      "prob": [_r(p) for p in prob[order].tolist()]},
-            "edges": [{"side": e["side"], "kind": "road_edge", "pts": e["pts"], "conf": c} for e, c in zip(edges, confs)],
+                      "prob": [_r(p) for p in prob[order].tolist()],
+                      "observed": [bool(b) for b in np.asarray(obs, bool)[order].tolist()]},
+            "edges": [{"side": e["side"], "kind": "road_edge", "pts": e["pts"], "conf": c, "observed": [bool(b) for b in ob]}
+                      for e, c, ob in zip(edges, confs, e_obs)],
             "lanes": [],
             "corridor": corridor(edges),
             "objects": objs,
@@ -580,8 +760,22 @@ class OccRuntime:
         return msg
 
 
+VIZ_DELTA = (  # occ_out field -> gvd_scene v1
+    ("cells.ijk/cls", "occ.cells [[ix,iy,iz,cls]] (optional block)"),
+    ("cells.prob, cells.observed", "not in viz v1: dropped"),
+    ("edges[].pts/side", "edges[] class road_edge, color red"),
+    ("edges[].conf, edges[].observed", "not in viz v1: dropped"),
+    ("objects[].heading", "tracks[].yaw = atan2(sin, cos)"),
+    ("objects[].l/w/h/speed_mps/motion", "tracks[].l/w/h/v/motion"),
+    ("corridor, boxes2d, cams, counts, timing_ms, ego.yaw_rate_rps", "not in viz v1: debug-view only"),
+)
+
+
 def occ_out_to_viz_inputs(msg: Mapping[str, Any]) -> dict[str, Any]:
-    """occ_out v1 -> the input dict ``occ_viz.occ_to_viz`` reads (known keys only)."""
+    """occ_out (v1/v2) -> the input dict ``occ_viz.occ_to_viz`` reads (known keys only).
+
+    Mapping / delta to viz v1 (kept here; ``occ_viz.py`` and the C++ viz are
+    GVD's): see ``VIZ_DELTA``."""
     from python.perception.occ_geometry import OccGrid as _G
 
     validate_occ_out(msg)

@@ -75,7 +75,7 @@ def check_camera_only() -> None:
 def check_sparse_predict() -> None:
     cams = [c.scaled(64) for c in rig_cams(CFG)]
     torch.manual_seed(0)
-    net = SparseOccNet(cams).eval()
+    net = SparseOccNet(cams, decode_unseen=False).eval()  # frustum-only top stage: exact visible counts (unseen: test_occ_unseen)
     imgs = [torch.rand(1, 3, c.height, c.width) for c in cams]
     top = G.coarse(LEVELS[0])
     vis = int(visible_mask(cams, top.centers_of_keys(np.arange(top.dense_cells))).sum())

@@ -56,7 +56,17 @@ OCC_GT_MODULES = (
     "python.train.occ_train",
     "python.train.occ_sampler",
     "python.data.occ_shards",
+    "python.train.occ_map_labels",
 )
+# Safety path: actuation, AEB, engage, heartbeat and the live supervisor that
+# hosts them. occ_out is a perception/debug output only: none of these may
+# import any occupancy module (statically or at import time).
+SAFETY_MODULES = tuple(sorted(
+    ["python.run_vision"]
+    + [f"python.control.{p.stem}" for p in (ROOT / "python" / "control").glob("*.py") if p.stem != "__init__"]
+    + [f"python.runtime.{m}" for m in ("conf_gate", "frame_gate", "state_io", "shadow")]
+))
+OCC_PREFIXES = ("python.perception.occ_", "python.train.occ_", "python.data.occ_", "python.viz.occ_")
 # Older training-only depth/sem reader. ``scene_net`` imports it inside a
 # training function (static path exists, pre-existing), so it is held to the
 # runtime check only: importing the live path must not load it.
@@ -315,7 +325,24 @@ def check_flag_and_spy() -> None:
           f"{list(VEHICLE_SIGNAL_KEYS)}; outputs/viz/planner stub never touch a camera array OK")
 
 
+def check_safety_isolation() -> None:
+    seen = reachable(SAFETY_MODULES)
+    bad = sorted(chain(seen, m) for m in seen if m.startswith(OCC_PREFIXES))
+    assert not bad, bad
+    assert "python.control.actuate" in SAFETY_MODULES and len(SAFETY_MODULES) >= 8, SAFETY_MODULES
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="-1")
+    code = CHILD.format(root=str(ROOT), entries=SAFETY_MODULES)
+    res = subprocess.run([sys.executable, "-c", code], cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=240)
+    assert res.returncode == 0, res.stderr[-2000:]
+    loaded = set(json.loads(res.stdout.strip().splitlines()[-1]))
+    hit = sorted(m for m in loaded if m.startswith(OCC_PREFIXES))
+    assert not hit, hit
+    print(f"safety isolation: {len(SAFETY_MODULES)} actuation/AEB/engage/heartbeat modules reach {len(seen)} modules, "
+          f"0 occupancy modules (static AST walk + import-time sys.modules) OK")
+
+
 def main() -> int:
+    check_safety_isolation()
     check_static()
     check_runtime()
     check_gt_pose_trace()

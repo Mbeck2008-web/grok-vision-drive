@@ -134,8 +134,9 @@ def ages_at(t: float):
     return {cid: round(t - math.floor(t * hz + 1e-9) / hz, 6) for cid, hz in RATES.items()}
 
 
-def run(*, from_vehicle=False, vehicle_fn=None, preset=None, vram_est=None, ages_fn=None):
-    rt = oo.OccRuntime(StubNet([frame(t) for t in TS]), from_vehicle=from_vehicle, preset=preset, vram_est_mb_cpu=vram_est)
+def run(*, from_vehicle=False, vehicle_fn=None, preset=None, vram_est=None, ages_fn=None, memory=True):
+    rt = oo.OccRuntime(StubNet([frame(t) for t in TS]), from_vehicle=from_vehicle, preset=preset, vram_est_mb_cpu=vram_est,
+                       memory=memory)
     imgs = [NoImage() for _ in CAMS]  # raises on any pixel access: everything after the net is image-blind
     ages_fn = ages_fn or ages_at
     return rt, [rt.step(imgs, t, ages_s=ages_fn(t), vehicle=None if vehicle_fn is None else vehicle_fn(t)) for t in TS]
@@ -160,7 +161,7 @@ def check_panels() -> None:
     confs = [x for e in last["edges"] for x in e["conf"]]
     assert float(np.median(confs)) == 0.9 and max(confs) <= 0.9, confs  # = the boundary cells' occupancy prob
     c = last["counts"]
-    assert c["stored"] <= c["queried"] <= c["full"] and c["frustum"] < c["full"] and c["cells_out"] <= oo.MAX_CELLS
+    assert c["stored"] <= c["queried"] + oo.MAX_MEMORY and c["queried"] <= c["full"] and c["frustum"] < c["full"] and c["cells_out"] <= oo.MAX_CELLS
     from python.viz import occ_viz
 
     occ_viz.DROPPED.clear()
@@ -311,7 +312,11 @@ def check_reject() -> None:
         (lambda m: m["edges"][0].update(color="red"), "unknown fields"),
         (lambda m: m.pop("corridor"), "missing"),
         (lambda m: m["objects"][0].pop("heading"), "missing"),
-        (lambda m: m.update(v=2), "v/type"),
+        (lambda m: m.update(v=3), "v/type"),
+        (lambda m: m["cells"].pop("observed"), "missing"),               # v2 must
+        (lambda m: m["edges"][0].pop("observed"), "missing"),
+        (lambda m: m["cells"]["observed"].__setitem__(0, 1), "not a bool"),
+        (lambda m: m["edges"][0]["observed"].pop(), "bools"),
         (lambda m: m["ego"].update(speed_mps=float("nan")), "not finite"),
         (lambda m: m["ego"].update(source="gt"), "not in"),
         (lambda m: m["cells"]["prob"].__setitem__(0, 1.5), "outside"),
@@ -324,7 +329,7 @@ def check_reject() -> None:
         (lambda m: m["counts"].update(stored=m["counts"]["full"] + 1), "stored"),
         (lambda m: m["counts"].update(objects=9), "counts.objects"),
         (lambda m: m["edges"][0]["conf"].pop(), "values for"),
-        (lambda m: m.update(lanes=[{"paint": "red", "pts": [[0, 0], [0, 1]], "conf": [1, 1]}]), "not in"),
+        (lambda m: m.update(lanes=[{"paint": "red", "pts": [[0, 0], [0, 1]], "conf": [1, 1], "observed": [True, False]}]), "not in"),
         (lambda m: m["cams"]["rear"].update(status="ABSENT", age_s=0.5), "ABSENT"),
         (lambda m: m.update(peak_vram_mb=812.0), "MEASURED"),
         (lambda m: m.update(vram_status="MEASURED"), "UNPROVEN"),
@@ -335,6 +340,14 @@ def check_reject() -> None:
         m = copy.deepcopy(good)
         mut(m)
         _raises(m, frag)
+    # version gate: v1 = v2 minus observed (no memory cells); v1 carrying observed is rejected
+    v2 = run(memory=False)[1][-1]
+    v1 = copy.deepcopy(v2); v1["v"] = 1; v1["cells"].pop("observed")
+    for e in v1["edges"]:
+        e.pop("observed")
+    oo.validate_occ_out(v1)
+    bad = copy.deepcopy(v2); bad["v"] = 1
+    _raises(bad, "unknown fields")
     print(f"reject: {len(cases)} malformed messages (unknown / missing fields at 6 levels, NaN, ranges, enums, caps, VRAM) raise OK")
 
 
@@ -387,7 +400,7 @@ def check_runtime_net() -> None:
     for i, t in enumerate((0.0, 0.1, 0.2)):
         m = rt.step([torch.rand(1, 3, c.height, c.width) for c in cams], t, ages_s={c.cam_id: 0.0 for c in cams})
     assert m["seq"] == 2 and m["ego"]["source"] == "vo" and m["timing_ms"]["predict"] > 0
-    print(f"runtime: untrained SparseOccNet -> occ_out v1 valid, {m['counts']['stored']} stored, "
+    print(f"runtime: untrained SparseOccNet -> occ_out v2 valid, {m['counts']['stored']} stored, "
           f"{m['timing_ms']['total']:.0f} ms total (CPU, in-code timer) OK")
 
 

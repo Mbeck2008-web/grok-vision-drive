@@ -122,6 +122,8 @@ class ShardWriter:
         members.append((f"{key}.keys.npy", _npy_bytes(np.asarray(labels["keys"], dtype=np.int64))))
         members.append((f"{key}.cls.npy", _npy_bytes(np.asarray(labels["cls"], dtype=np.uint8))))
         members.append((f"{key}.free.npy", _npy_bytes(np.asarray(labels["free"], dtype=np.float16))))
+        if labels.get("vis") is not None:  # optional: camera-ray visibility keys (metric split only)
+            members.append((f"{key}.vis.npy", _npy_bytes(np.asarray(labels["vis"], dtype=np.int64))))
         m = dict(meta)
         m["cams"] = sorted(images)
         members.append((f"{key}.meta.json", json.dumps(m, sort_keys=True).encode("utf-8")))
@@ -249,8 +251,11 @@ class OccShardDataset:
                 raise ValueError(f"undecodable {cam} frame in {self.items[i][1]['key']}")
             images[cam] = img
         load = lambda n: np.load(io.BytesIO(blobs[n]), allow_pickle=False)  # noqa: E731
-        return {"images": images, "keys": load("keys.npy"), "cls": load("cls.npy"),
-                "free": load("free.npy").astype(np.float32), "meta": meta}
+        out = {"images": images, "keys": load("keys.npy"), "cls": load("cls.npy"),
+               "free": load("free.npy").astype(np.float32), "meta": meta}
+        if "vis.npy" in blobs:
+            out["vis"] = load("vis.npy")
+        return out
 
     def close(self) -> None:
         for fh in self._fh.values():

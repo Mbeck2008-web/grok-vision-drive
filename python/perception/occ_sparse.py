@@ -48,8 +48,8 @@ LIVE_LONG_SIDE = 640
 # Net sizes. "cheap" aims at the planner tick on a shared Pascal card (fp16 compute
 # there is ~1/64 of fp32, so AMP buys memory, not speed: run cheap in fp32).
 NET_CONFIGS = {
-    "default": {"channels": ENC_CHANNELS, "feat": FEAT, "hidden": HIDDEN},
-    "cheap": {"channels": (16, 32, 48), "feat": 32, "hidden": 64},
+    "default": {"channels": ENC_CHANNELS, "feat": FEAT, "hidden": HIDDEN, "ctx": True},
+    "cheap": {"channels": (16, 32, 48), "feat": 32, "hidden": 64, "ctx": True},
 }
 # Reduced-camera presets. The live supervisor reads all 8 cams but the 8-cam live
 # rate at the planner tick is unproven: main+wide is the minimum.
@@ -165,7 +165,8 @@ if nn is not None:
         """Camera features sampled at sparse 3-D query points."""
 
         def __init__(self, cams: Sequence[PinholeCam], *, grid: OccGrid = DEFAULT_GRID, feat: int | None = None,
-                     hidden: int | None = None, channels: Sequence[int] | None = None, config: str = "default") -> None:
+                     hidden: int | None = None, channels: Sequence[int] | None = None, config: str = "default",
+                     ctx: bool | None = None, decode_unseen: bool = True) -> None:
             super().__init__()
             if not cams:
                 raise ValueError("SparseOccNet needs at least one camera")
@@ -178,6 +179,13 @@ if nn is not None:
             self.grid = grid
             self.channels = tuple(int(c) for c in (channels or cfg["channels"]))
             self.hidden = hidden
+            # ctx: a per-tick scene vector (cam_w-weighted mean of every camera's
+            # pooled feature map, B x feat) fed to every query, so a query no
+            # camera ray reaches (occluded / out of view) still decodes from the
+            # scene, not from position alone. decode_unseen: predict() also
+            # queries top-stage cells outside every frustum.
+            self.ctx = bool(cfg.get("ctx", True) if ctx is None else ctx)
+            self.decode_unseen = bool(decode_unseen)
             self.encoder = CamEncoder(self.channels, feat=feat)
             self.feat_dim = feat
             rot = np.stack([c.rotation() for c in cams]).astype(np.float32)
@@ -192,7 +200,7 @@ if nn is not None:
             self.register_buffer("box_hi", hi, persistent=False)
             pe = positional_encoding_dim()
             self.head = nn.Sequential(
-                nn.Linear(feat + pe + 1, hidden), nn.ReLU(),
+                nn.Linear(feat + pe + 1 + (feat if self.ctx else 0), hidden), nn.ReLU(),
                 nn.Linear(hidden, hidden), nn.ReLU(),
                 nn.Linear(hidden, 1 + len(LEVELS) + OCC_CLASS_COUNT),
             )
@@ -259,9 +267,24 @@ if nn is not None:
                 cnt = cnt + m
             mean = acc / cnt.clamp(min=1e-6)
             seen = cnt.clamp(max=1.0)
-            out = self.head(torch.cat([mean, self._pe(pts).to(acc.dtype), seen], dim=-1))
+            parts = [mean, self._pe(pts).to(acc.dtype), seen]
+            if self.ctx:
+                parts.append(self.scene_ctx(feats, cam_w, bsz, acc).unsqueeze(1).expand(-1, n, -1))
+            out = self.head(torch.cat(parts, dim=-1))
             nl = len(LEVELS)
             return {"occ": out[..., 0], "any": out[..., 1 : 1 + nl], "cls": out[..., 1 + nl :], "seen": seen.squeeze(-1)}
+
+        def scene_ctx(self, feats: Sequence[Any], cam_w: Any, bsz: int, like: Any) -> Any:
+            """(B, feat): cam_w-weighted mean of the cameras' spatially pooled feature maps."""
+            acc = like.new_zeros((bsz, self.feat_dim))
+            tot = like.new_zeros((bsz, 1))
+            for k, fm in enumerate(feats):
+                if fm is None:
+                    continue
+                w = like.new_ones((bsz, 1)) if cam_w is None else cam_w[:, k].reshape(bsz, 1).to(like.dtype)
+                acc = acc + fm.mean(dim=(2, 3)).to(like.dtype) * w
+                tot = tot + w
+            return acc / tot.clamp(min=1e-6)
 
         def forward(self, images: Sequence[Any], pts: Any, cam_w: Any = None) -> dict[str, Any]:
             return self.query(self.encode(images), pts, cam_w)
@@ -313,7 +336,12 @@ if nn is not None:
             sweep = sweep[~np.isin(sweep, carry)]
             idx = np.concatenate([carry, sweep])[:cap0]
             cpts = top.centers_of_keys(idx)
-            vis = visible_mask(on, cpts) if on else np.zeros((idx.shape[0],), bool)
+            if not on:
+                vis = np.zeros((idx.shape[0],), bool)
+            elif self.decode_unseen:  # occluded / out-of-view cells decode too (from ctx + memory)
+                vis = np.ones((idx.shape[0],), bool)
+            else:
+                vis = visible_mask(on, cpts)
             idx = idx[vis]
             cands = cpts[vis].astype(np.float32)
             self._top_keys = idx
@@ -376,7 +404,7 @@ def profile_cams(cfg: Any, profile: str, *, scale: float = 1.0) -> list[PinholeC
 
 
 def memory_estimate(cams: Sequence[PinholeCam], *, config: str = "default", max_points: int = 65536,
-                    bytes_per: int = 4, temporal_k: int = 1) -> dict[str, float]:
+                    bytes_per: int = 4, temporal_k: int = 1, batch: int = 1) -> dict[str, float]:
     """ESTIMATE (arithmetic, not measured) of inference memory in MB.
 
     weights + temporal feature cache (K x cams x C x H/8 x W/8 x bytes; K = 1:
@@ -394,7 +422,8 @@ def memory_estimate(cams: Sequence[PinholeCam], *, config: str = "default", max_
         prev = c
     params += prev * feat * 9 + feat + 2 * feat + feat * feat + feat
     pe = positional_encoding_dim()
-    params += (feat + pe + 1) * hid + hid + hid * hid + hid + hid * (1 + len(LEVELS) + OCC_CLASS_COUNT) + 1 + len(LEVELS) + OCC_CLASS_COUNT
+    cx = feat if cfg.get("ctx", True) else 0  # scene context vector into every query
+    params += (feat + pe + 1 + cx) * hid + hid + hid * hid + hid + hid * (1 + len(LEVELS) + OCC_CLASS_COUNT) + 1 + len(LEVELS) + OCC_CLASS_COUNT
     mb = 2.0 ** 20
     cache = sum(temporal_k * feat * (c.height // 8) * (c.width // 8) * bytes_per for c in cams)
     stages = []
@@ -406,9 +435,10 @@ def memory_estimate(cams: Sequence[PinholeCam], *, config: str = "default", max_
             sizes.append(k * h * w)
         sizes.append(feat * h * w)
         stages.append(max(a + b for a, b in zip(sizes, sizes[1:])) * bytes_per)
-    query = 3 * int(max_points) * (feat + pe + 1 + 2 * hid + 1 + len(LEVELS) + OCC_CLASS_COUNT + 3) * bytes_per
-    out = {"weights_mb": params * 4 / mb, "feature_cache_mb": cache / mb, "encoder_peak_mb": max(stages) / mb,
-           "query_mb": query / mb, "params_formula": float(params), "temporal_k": float(temporal_k)}
+    query = 3 * int(max_points) * (feat + pe + 1 + cx + 2 * hid + 1 + len(LEVELS) + OCC_CLASS_COUNT + 3) * bytes_per
+    b = max(1, int(batch))  # everything but the weights scales with the batch
+    out = {"weights_mb": params * 4 / mb, "feature_cache_mb": b * cache / mb, "encoder_peak_mb": b * max(stages) / mb,
+           "query_mb": b * query / mb, "batch": float(b), "params_formula": float(params), "temporal_k": float(temporal_k)}
     out["total_mb"] = out["weights_mb"] + out["feature_cache_mb"] + out["encoder_peak_mb"] + out["query_mb"]
     return out
 
@@ -427,7 +457,7 @@ class CheckpointMismatch(ValueError):
 def net_spec(net: Any) -> dict[str, Any]:
     """The knobs that shape the weights. Any change here forces a retrain."""
     return {"channels": list(net.channels), "feat": int(net.feat_dim), "hidden": int(net.hidden),
-            "levels": list(LEVELS), "classes": OCC_CLASS_COUNT, "pe_freqs": PE_FREQS}
+            "levels": list(LEVELS), "classes": OCC_CLASS_COUNT, "pe_freqs": PE_FREQS, "ctx": bool(getattr(net, "ctx", False))}
 
 
 def save_checkpoint(net: Any, path: Any, **meta: Any) -> None:

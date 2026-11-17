@@ -114,7 +114,7 @@ class EgoFeedback:
     # Lua's own counter, one per electrics echo it wrote. None is a mod older than the echo
     # contract (python/control/echo_link.py): that mod cannot tell a repeat from a new sample.
     echo_seq: int | None = None
-    # gvd_main M.MOD_VERSION ("1.7.13"). None: a mod older than the field.
+    # gvd_main M.MOD_VERSION ("1.7.14"). None: a mod older than the field.
     mod_version: str | None = None
 
     @property

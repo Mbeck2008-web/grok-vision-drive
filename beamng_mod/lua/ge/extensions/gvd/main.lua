@@ -10,7 +10,7 @@ local M = {}
 -- Mod / bus protocol version, written to gvd_ego.json as mod_version. Tracks VERSION. The
 -- supervisor refuses engage (lua_echo_outdated) below its MIN_MOD_VERSION
 -- (python/control/echo_link.py). A module field, not a local: the main chunk is at the limit.
-M.MOD_VERSION = '1.7.13'
+M.MOD_VERSION = '1.7.14'
 
 local engaged = false
 local showPath = true

@@ -96,7 +96,7 @@ def check_release_zip() -> None:
             for bad in (".pt", ".safetensors", ".pyc", ".mp4"):
                 assert not any(r.endswith(bad) for r in rels), bad
             onnx_members = [r for r in rels if r.endswith(".onnx")]
-            assert onnx_members == ["models/yolov8n.onnx"], onnx_members
+            assert onnx_members == ["models/yolox_nano.onnx"], onnx_members
             assert "models/NOTICE.txt" in rels
             assert "models/e2e_current.onnx" not in rels
             assert "models/yolov8n.pt" not in rels
@@ -117,7 +117,7 @@ def check_release_zip() -> None:
             assert "docs/media/SOURCE.md" in rels
             assert "AGENTS.md" in rels
             assert "models/.gitkeep" in rels
-            assert "models/yolov8n.onnx" in rels
+            assert "models/yolox_nano.onnx" in rels
             assert not any(r.startswith("scripts/test_") for r in rels)
             # Windows-friendly: .bat files are CRLF inside the zip.
             for r in ("install.bat", "uninstall.bat", "play_gvd.bat"):
@@ -138,9 +138,9 @@ def check_release_zip() -> None:
     # The real checkout must package cleanly too (manifest only; no dist/ write).
     real = rel.collect_files(ROOT)
     assert "install.bat" in real and "python/run_vision.py" in real
-    assert "models/yolov8n.onnx" in real
+    assert "models/yolox_nano.onnx" in real
     assert not any(f.endswith(".pt") for f in real)
-    assert not any(f.endswith(".onnx") and f != "models/yolov8n.onnx" for f in real)
+    assert not any(f.endswith(".onnx") and f != "models/yolox_nano.onnx" for f in real)
     assert "requirements-foxglove.txt" not in real
     assert "config/sensors.yaml" in real
     assert "python/sensors/extras.py" in real
@@ -1681,7 +1681,7 @@ def check_player_docs() -> None:
     assert readme.index("This is an **alpha**") < readme.index("## Quick start")
     assert f"Point bumps (`{major}.{minor}.x`) are fixes and small UI." in readme
     assert f"A main alpha bump (`{major}.x.0`) is features, core, or a UI overhaul." in readme
-    assert "1.7.13-alpha-<sha>" in readme
+    assert f"{version}-alpha-<sha>" in readme
     assert "docs/stitch-360.png" in readme
     assert "docs/soft-esc-highway.jpg" not in readme
     assert "Soft Esc parked" in readme

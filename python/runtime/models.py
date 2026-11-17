@@ -1,12 +1,13 @@
 """Discover and load the nets GVD can actually run.
 
-Shipped: ``models/yolov8n.onnx`` (Ultralytics YOLOv8n detect @640). Other
-``*.onnx`` / ``*.pt`` stay gitignored. This catalog lists:
+Shipped: ``models/yolox_nano.onnx`` (Megvii YOLOX-Nano detect @416, Apache-2.0).
+Other ``*.onnx`` / ``*.pt`` stay gitignored. This catalog lists:
 
-* Detector: YOLOv8 *detect* ONNX or Ultralytics ``.pt`` found under ``models/``
-  (stems ``yolov8n`` / ``s`` / ``m`` / ``l`` / ``x``, plus any other ``yolov8*.onnx|pt``).
-  Optional Apache second row: any ``models/yolox*.onnx`` (``yolox_s.onnx`` →
-  ``yolox-s-onnx``). Missing files are omitted from the MODEL cycle.
+* Detector: any ``models/yolox*.onnx`` (``yolox_nano.onnx`` → ``yolox-nano-onnx``),
+  plus optional YOLOv8 *detect* ONNX or Ultralytics ``.pt`` found under ``models/``
+  (stems ``yolov8n`` / ``s`` / ``m`` / ``l`` / ``x``, plus any other ``yolov8*.onnx|pt``;
+  those Ultralytics files and ``UltraYoloDetector`` are AGPL-3.0 and are not shipped).
+  Missing files are omitted from the MODEL cycle.
   Always-available fallbacks: ``synthetic`` (smoke leads) and ``empty`` (no boxes).
 * E2E: PilotNet-scale ONNX (``e2e*.onnx`` / ``config/control.yaml`` ``e2e.model``) or the
   numpy stub. Named feeds: main / wide 1x3x180x320 + kin 1x2. No trained E2E file is shipped.

@@ -8,7 +8,7 @@ e2e:
   # Live image is the flat 360 strip. main+wide is only the no-stitch fallback.
   cams: [stitch360]
 detector:
-  prefer: yolov8n-onnx
+  prefer: yolox-nano-onnx
   allow_synthetic_default: false
-  # Nerd MODEL tab / --detector: auto | synthetic | empty | yolov8{n,s,m,l,x}-onnx
-  # yolov8n.onnx is shipped; other sizes are optional local files. Lanes stay Hough.
+  # Nerd MODEL tab / --detector: auto | synthetic | empty | yolox-*-onnx | yolov8{n,s,m,l,x}-onnx
+  # yolox_nano.onnx is shipped (Apache-2.0). YOLOv8 and other YOLOX sizes are optional local files (YOLOv8 is AGPL). Lanes stay Hough.

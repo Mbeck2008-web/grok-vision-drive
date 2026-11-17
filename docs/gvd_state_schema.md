@@ -47,7 +47,7 @@ Soft Esc reads the same tick from `gvd_state.json` and the `[GVD] seg` line. Pol
 
 ## M2 fields
 
-| `detector` | string | `empty` / `synthetic` / `yolov8n-onnx` / `yolov8n-ultra` |
+| `detector` | string | `empty` / `synthetic` / `yolox-nano-onnx` / other `yolox-*-onnx` / optional `yolov8n-onnx` / `yolov8n-ultra` |
 | `tracks[]` | list | id, class, x,y,yaw,speed_mps (filtered Δy velocity, signed: negative = closing; consumers use its magnitude),… ego frame |
 | `planner.cipv_id` | int? | lead track id in path tube |
 | `planner.ttc_lead` | float? | seconds; null if ego_speed unknown |
@@ -178,7 +178,7 @@ Live wheel / pedal HUD fields are the same retail Direct Drive echo already writ
 
 A measured `loop_hz` or `camera_hz` under `min_accept_hz` is not an Engage drop and does not replace the plan with a brake hold. A hitch that used to mark the link stale for a split second was the HOLD flash. CAMS blit dropping remains 8 Hz. The narrow-far hitch remains 10 Hz. The command dead-man is still `CMD_STALE_S` 0.35 s.
 
-Perception always runs (loaded detector, lanes, corridor planner, other-vehicle tracks, E2E shadow). Path ribbon / GVD VISION overlays stay up. The VISION ice ribbon is `path_width / 2` meters each side and only as long as the path being painted. Modular, or e2e/shadow held by a veto (including `e2e_stub`), paints `path_ego`. `policy=e2e` with `e2e_backend=onnx` and `veto_reason=none` paints `path_e2e` or a steer integral of that same length. Shadow keeps the modular ribbon and may add a thinner ghost of the other path when the clean cabin (key 0) is off. Actuators only when engaged **and** modular OK. Shadow mode computes both intents; default apply path stays modular. `e2e_stub` (no trained onnx, `e2e_backend=stub`) holds the brake and stays engaged on `--policy e2e`. Shadow does not treat that stub as a disagreement. The command dead-man is unchanged (`CMD_STALE_S` 0.35 s, `CMD_DEAD_S` 1.0 s). The link/ribbon stale window is 1.5 s, not 0.35 s, so one grab hitch does not mark the link stale. Detector default is shipped `models/yolov8n.onnx`. No E2E checkpoint in git (`models/e2e_current.onnx` still gitignored).
+Perception always runs (loaded detector, lanes, corridor planner, other-vehicle tracks, E2E shadow). Path ribbon / GVD VISION overlays stay up. The VISION ice ribbon is `path_width / 2` meters each side and only as long as the path being painted. Modular, or e2e/shadow held by a veto (including `e2e_stub`), paints `path_ego`. `policy=e2e` with `e2e_backend=onnx` and `veto_reason=none` paints `path_e2e` or a steer integral of that same length. Shadow keeps the modular ribbon and may add a thinner ghost of the other path when the clean cabin (key 0) is off. Actuators only when engaged **and** modular OK. Shadow mode computes both intents; default apply path stays modular. `e2e_stub` (no trained onnx, `e2e_backend=stub`) holds the brake and stays engaged on `--policy e2e`. Shadow does not treat that stub as a disagreement. The command dead-man is unchanged (`CMD_STALE_S` 0.35 s, `CMD_DEAD_S` 1.0 s). The link/ribbon stale window is 1.5 s, not 0.35 s, so one grab hitch does not mark the link stale. Detector default is shipped `models/yolox_nano.onnx`. No E2E checkpoint in git (`models/e2e_current.onnx` still gitignored).
 
 
 ## M6 — `gvd_engage.json` contract (retail package)
@@ -274,7 +274,7 @@ Written every tick from the GVD VISION nerd **DRIVE** / **VIZ** tabs (`python/ru
 | `aeb_on` / `aeb_ttc` / `cipv_on` | Rewrite planner AEB/CIPV before `shadow_tick` |
 | `speed_cap` / `cruise_mps` / `corridor_width` / `lane_conf_min` | Speed and veto knobs |
 | `lanes_on` / `detector_on` | Drop lane paint (preview path) or YOLO tracks |
-| `detector_id` / `e2e_id` | Nerd **MODEL** tab. `auto` uses shipped `yolov8n.onnx` when present. `synthetic` / `empty` plus any extra `models/yolov8*.onnx\|pt` or `e2e*.onnx`. Unknown ids are not listed. Lanes are Hough (no net). |
+| `detector_id` / `e2e_id` | Nerd **MODEL** tab. `auto` uses shipped `yolox_nano.onnx` when present. `synthetic` / `empty` plus any extra `models/yolox*.onnx`, optional `models/yolov8*.onnx\|pt`, or `e2e*.onnx`. Unknown ids are not listed. Lanes are Hough (no net). |
 | `viz_*` | OpenCV overlay layers. `viz_occ` occupancy is **from tracks**, not a learned grid. Keys `1–5` map to occ / detector boxes / lane polynomials / camera FOV / planner samples |
 
 `occupancy` in state stays `null` (no occupancy net). The VIZ overlay is drawn in OpenCV only.

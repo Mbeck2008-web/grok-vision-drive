@@ -40,8 +40,8 @@ TH = 2
 ROW_H = 32
 TAB_H = 36
 PAD_X = 16
-# yolov8n-onnx is 133px at FS_BODY; keep pad so shipped ids are not clipped.
-VAL_COL_W = 148
+# yolox-nano-onnx is 164px at FS_BODY; keep pad so shipped ids are not clipped.
+VAL_COL_W = 172
 # DRIVE tab pedal history. Newest sample is the right edge. Path length uses a 40 m full scale.
 PEDAL_TRACE_N = 60
 PEDAL_GRAPH_H = 168
@@ -305,7 +305,7 @@ def render_panel(
     elif tab == "model":
         y = _draw_knob_tab(
             img, opts, model_sel, y + 8, h, w, hits, MODEL_ROWS,
-            intro="YOLOv8 detect / E2E in models/; lanes stay Hough",
+            intro="YOLOX-Nano / E2E in models/; lanes stay Hough",
         )
     elif tab == "cams":
         y = _draw_cams_tab(img, state, y + 8, h, w, hits, cam_frames=cam_frames)

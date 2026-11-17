@@ -9,8 +9,8 @@ venv/
 dist/
 gvd-retail-*.zip
 
-# Weight blobs. Exception: the shipped YOLOv8n detect ONNX (COCO).
-# Optional extras (yolov8s/m, yolox_s.onnx, e2e) stay ignored. Retail zip ships n only.
+# Weight blobs. Exception: the shipped YOLOX-Nano detect ONNX (Apache-2.0).
+# Optional extras (yolov8*, yolox_s.onnx, e2e) stay ignored. Retail zip ships nano only.
 *.onnx
 *.pt
 *.pth
@@ -19,4 +19,4 @@ gvd-retail-*.zip
 models/*.onnx
 models/*.pt
 !models/.gitkeep
-!models/yolov8n.onnx
+!models/yolox_nano.onnx

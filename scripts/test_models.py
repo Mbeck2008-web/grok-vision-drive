@@ -39,17 +39,17 @@ def test_catalog_shipped_n() -> None:
     det_ids = ids_for("detector")
     assert det_ids[0] == "auto"
     assert "synthetic" in det_ids and "empty" in det_ids
-    assert "yolov8n-onnx" in det_ids
-    n = next(c for c in detector_choices() if c.id == "yolov8n-onnx")
+    assert "yolox-nano-onnx" in det_ids
+    n = next(c for c in detector_choices() if c.id == "yolox-nano-onnx")
     assert n.path is not None and n.path.is_file()
+    if (models_mod.MODELS_DIR / "yolov8n.onnx").is_file():
+        assert "yolov8n-onnx" in det_ids
     for stem in ("yolov8s-onnx", "yolov8m-onnx"):
         if stem in det_ids:
             path = next(c.path for c in detector_choices() if c.id == stem)
             assert path is not None and path.is_file()
-    yolox_present = models_mod.MODELS_DIR.is_dir() and any(
-        p.is_file() for p in models_mod.MODELS_DIR.glob("yolox*.onnx")
-    )
-    assert ("yolox-s-onnx" in det_ids) == yolox_present
+    yolox_s_present = models_mod.MODELS_DIR.is_dir() and (models_mod.MODELS_DIR / "yolox_s.onnx").is_file()
+    assert ("yolox-s-onnx" in det_ids) == yolox_s_present
     e2e_ids = ids_for("e2e")
     assert e2e_ids[:2] == ["auto", "stub"]
     assert cycle_id("detector", "auto", +1) in det_ids
@@ -69,8 +69,8 @@ def test_load_fallbacks() -> None:
         pass
     pol = load_e2e("stub")
     assert pol.backend == "stub"
-    det, miss = load_detector("yolov8n-onnx")
-    assert isinstance(det, OnnxYoloDetector) and det.name == "yolov8n-onnx" and miss == []
+    det, miss = load_detector("yolox-nano-onnx")
+    assert isinstance(det, OnnxYoloxDetector) and det.name == "yolox-nano-onnx" and miss == []
     import numpy as np
 
     blank = det.detect(np.zeros((240, 320, 3), dtype=np.uint8))
@@ -108,34 +108,34 @@ def test_yolox_optional(tmp_path: Path) -> None:
     assert abs(float(decoded[0, 0, 2]) - 8.0) < 1e-5
 
     det, _miss = make_detector(allow_synthetic=True)
-    assert isinstance(det, OnnxYoloDetector) and det.name == "yolov8n-onnx"
+    assert isinstance(det, OnnxYoloxDetector) and det.name == "yolox-nano-onnx"
 
-    yolox_path = next(
-        (p for p in sorted(models_mod.MODELS_DIR.glob("yolox*.onnx")) if p.is_file()),
-        None,
-    )
-    if yolox_path is None:
-        print("test_models: skip yolox load (models/yolox*.onnx missing)")
+    # Shipped nano already loaded via make_detector above. Optional larger sizes stay optional.
+    extra = next((p for p in sorted(models_mod.MODELS_DIR.glob("yolox*.onnx")) if p.is_file() and p.name != "yolox_nano.onnx"), None)
+    if extra is None:
+        print("test_models: skip extra yolox load (only shipped yolox_nano.onnx present)")
         return
-    loaded, miss = load_detector("yolox-s-onnx")
-    assert isinstance(loaded, OnnxYoloxDetector) and loaded.name == "yolox-s-onnx" and miss == []
+    from python.runtime.models import yolox_catalog_id
+    loaded, miss = load_detector(yolox_catalog_id(extra))
+    assert isinstance(loaded, OnnxYoloxDetector) and miss == []
     blank = loaded.detect(np.zeros((240, 320, 3), dtype=np.uint8))
     assert isinstance(blank, list)
 
 
-def test_retail_zip_no_yolox() -> None:
+def test_retail_zip_ships_yolox_nano() -> None:
     sys.path.insert(0, str(ROOT / "scripts"))
     import make_release_zip as rel  # noqa: E402
 
-    assert "models/yolov8n.onnx" in rel.SHIPPED_WEIGHTS
-    assert all("yolox" not in w for w in rel.SHIPPED_WEIGHTS)
+    assert rel.SHIPPED_WEIGHTS == frozenset({"models/yolox_nano.onnx"})
     files = rel.collect_files(ROOT)
-    assert "models/yolov8n.onnx" in files
-    assert not any(Path(f).name.startswith("yolox") and f.endswith(".onnx") for f in files)
+    assert "models/yolox_nano.onnx" in files
+    assert not any(f.endswith(".onnx") and f != "models/yolox_nano.onnx" for f in files)
+    assert "models/yolov8n.onnx" not in files
     assert rel._excluded_file("models/yolox_s.onnx")
     assert rel._excluded_file("models/yolox-s.onnx")
     assert rel._excluded_file("models/yolox_m.onnx")
-    assert not rel._excluded_file("models/yolov8n.onnx")
+    assert rel._excluded_file("models/yolov8n.onnx")
+    assert not rel._excluded_file("models/yolox_nano.onnx")
     assert (ROOT / "scripts" / "download_yolox.py").is_file()
     assert not (ROOT / "scripts" / "download_yolox_s.py").is_file()
 
@@ -158,12 +158,12 @@ def test_missing_file_reverts(tmp_path: Path) -> None:
     old = models_mod.MODELS_DIR
     models_mod.MODELS_DIR = tmp_path
     try:
-        fake = tmp_path / "yolov8n.onnx"
+        fake = tmp_path / "yolox_nano.onnx"
         fake.write_bytes(b"not-an-onnx")
-        assert "yolov8n-onnx" in ids_for("detector")
+        assert "yolox-nano-onnx" in ids_for("detector")
         perc = ModularPerception(allow_synthetic=True)
         e2e = load_e2e("stub")
-        opts = DebugOpts(detector_id="yolov8n-onnx", e2e_id="stub")
+        opts = DebugOpts(detector_id="yolox-nano-onnx", e2e_id="stub")
         rt = ModelRuntime(detector_id="synthetic", e2e_id="stub")
         kept = perc.detector.name
         perc, e2e, notes = rt.sync(opts, perc, e2e, allow_synthetic=True)
@@ -196,7 +196,7 @@ def main() -> None:
         test_missing_file_reverts(Path(td))
     with tempfile.TemporaryDirectory() as td:
         test_yolox_optional(Path(td))
-    test_retail_zip_no_yolox()
+    test_retail_zip_ships_yolox_nano()
     test_no_chrome()
     print("test_models: OK")
 

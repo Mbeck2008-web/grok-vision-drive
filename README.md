@@ -2,7 +2,7 @@
 
 Grok Vision Drive is a camera-only drive-assist toy for BeamNG.drive and BeamNG.tech. It reads camera pictures, finds the lane, plans a short path, and is built to steer the car in the game (unproven). It is for entertainment. It is not a controller for a real car, it is not a driver aid, and it is not Tesla FSD. The license is PolyForm Noncommercial 1.0.0.
 
-This is an **alpha** (`VERSION` 1.7.13). It may break.
+This is an **alpha** (`VERSION` 1.7.14). It may break.
 
 ## What is proven
 
@@ -130,7 +130,7 @@ The DRIVE tab also draws a **pedal graph**: throttle against path length, and br
 
 Key `0` hides every layer and shows the clean stage only.
 
-**MODEL tab rows:** `detector` (default `auto`; a YOLOv8 ONNX/pt in `models/`, or synthetic/empty) and `e2e` (default `auto`; an `e2e*.onnx` in `models/`, or the numpy stub). Status: Offline smoke only.
+**MODEL tab rows:** `detector` (default `auto`; the shipped YOLOX-Nano ONNX, or another YOLOX/YOLOv8 file in `models/`, or synthetic/empty) and `e2e` (default `auto`; an `e2e*.onnx` in `models/`, or the numpy stub). Status: Offline smoke only.
 
 #### LIVE tab recording buttons
 
@@ -373,7 +373,7 @@ Caveats:
 
 ## Version
 
-Canonical pin **1.7.13** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Untagged retail zips use `1.7.13-alpha-<sha>`. Point bumps (`1.7.x`) are fixes and small UI. A main alpha bump (`1.x.0`) is features, core, or a UI overhaul. The change history is the git log.
+Canonical pin **1.7.14** (`VERSION`, `python/__init__.py`, BeamNG `app.json`). Untagged retail zips use `1.7.14-alpha-<sha>`. Point bumps (`1.7.x`) are fixes and small UI. A main alpha bump (`1.x.0`) is features, core, or a UI overhaul. The change history is the git log.
 
 ## Technical details
 
@@ -386,7 +386,7 @@ Every number in this section is a code default or a code constant on this branch
 | Cameras | Eight BeamNG.tech cameras (`config/cameras.yaml`): main, narrow and wide on the windshield, pillarL/R aimed 78 degrees off the lane, repeatL/R on the fenders at yaw ±150, rear. `vehicle_overrides` holds per-model mounts (the eSBR's repeaters sit mirror-like, behind the front tyre and outboard of the body). Retail BeamNG.drive captures one window only. | Unproven |
 | Capture | One supervisor tick reads all eight cameras from shared memory. A camera not read this tick is missing; an older frame is not reused. Companions update offscreen; a bright-blue flash frame is not stored. | Offline smoke only |
 | Stitch | 2272x192 canvas: six 256x192 sectors (repeatL, pillarL, main, narrow, pillarR, repeatR), two 340x192 sectors (wide, rear), seven 8 px gaps. No pose warp. A missing camera is an empty sector. Repeater ego-body columns are cleared. | Offline smoke only |
-| Supervisor | `python/run_vision.py`: capture, perception (Hough lanes by default, YOLOv8n detector), path planner, safety vetoes, actuator, viz, clips. | Unproven |
+| Supervisor | `python/run_vision.py`: capture, perception (Hough lanes by default, YOLOX-Nano detector), path planner, safety vetoes, actuator, viz, clips. | Unproven |
 | Scene net | `python/train/scene_net.py`, trained from scratch: a per-sector conv stem (GroupNorm), a 512-wide token, a one-layer GRU (hidden 512) stepped with the real seconds since the previous strip, 15 s of memory, and a short residual skip. | Offline smoke only |
 | Backbones | `--backbone scratch\|imagenet-resnet18\|mobilenetv3` (default `scratch`, merged in PR #87). `scratch` is the GRU scene net above. The two ImageNet choices are a single-frame baseline (`python/train/pretrained_net.py`): a torchvision backbone per frame, no GRU. | Unproven |
 | Heads | Linear heads on the GRU output: lanes (6 x 16 points), lane valid, curbs (2 x 16), curb valid, objects (16 x 8 with class and valid), signs (8 x 4 with class, lamp state and valid), and `lane_gt` (14 values). Optional ctl head (offline only): `--heads lane_gt,ctl` adds steer, throttle and brake targets at 0-5 s horizons for offline evaluation; nothing drives from it. `--ctl-cond` (off by default) also feeds that head the previous row's speed, controls and yaw rate; the live runtime refuses such a model. `--ctl-loss l1` (default `huber`) trains its steer and throttle on L1 instead of smooth-L1. The path planner turns the scene into the path. | Offline smoke only |
@@ -495,7 +495,7 @@ Before the first step the trainer measures free VRAM and shrinks the batch until
 
 - CPU i9-9900K, 32 GB RAM, GPU GTX 1080 Ti (11 GB, Pascal, no tensor cores) shared with BeamNG (`config/hardware.yaml`).
 - Vision inference VRAM cap: 4 GB (`max_inference_vram_gb`). Live input long side 640 px.
-- Small models only: the shipped detector is YOLOv8n (`models/yolov8n.onnx`). No transformers, ViT or BEV nets.
+- Small models only: the shipped detector is YOLOX-Nano (`models/yolox_nano.onnx`, Apache-2.0). No transformers, ViT or BEV nets.
 - Clip encoding prefers Intel Quick Sync on the UHD 630, then CPU x264. NVENC is used only with `--encode nvenc`.
 
 ### Debug tooling
@@ -537,8 +537,8 @@ GVD uses these outside projects. Each one is its authors' work.
 - [PyTorch](https://pytorch.org/). Scene-net training and ONNX export use PyTorch.
 - [ONNX](https://onnx.ai/). The exported scene graph and the detector files are ONNX.
 - [ONNX Runtime](https://onnxruntime.ai/). Play time runs those graphs with ONNX Runtime.
-- [Ultralytics](https://github.com/ultralytics/ultralytics). The shipped YOLOv8n detector is an Ultralytics checkpoint, and the ultra path loads it with their library.
-- [YOLOX](https://github.com/Megvii-BaseDetection/YOLOX). An optional detector path reads a Megvii YOLOX ONNX file.
+- [YOLOX](https://github.com/Megvii-BaseDetection/YOLOX). The shipped detector is Megvii YOLOX-Nano (Apache-2.0).
+- [Ultralytics](https://github.com/ultralytics/ultralytics). Optional. The YOLOv8 ONNX/pt path, `UltraYoloDetector`, and the `ultralytics` package are AGPL-3.0 and are not shipped.
 - [Foxglove SDK](https://github.com/foxglove/foxglove-sdk). An optional live view publishes with the Foxglove SDK.
 - [BetterCam](https://github.com/RootKit-Org/BetterCam). Windows window capture uses BetterCam.
 - [mss](https://github.com/BoboTiG/python-mss). Window capture uses mss when BetterCam is unavailable.
@@ -547,12 +547,14 @@ GVD uses these outside projects. Each one is its authors' work.
 
 ## License
 
-GVD's license is [PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0) (`LICENSE`; SPDX `PolyForm-Noncommercial-1.0.0`). Detector weight notices are in `models/NOTICE.txt`.
+GVD-authored code and models are licensed under [PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0) (`LICENSE`; SPDX `PolyForm-Noncommercial-1.0.0`). Third-party files keep their own licenses; see `models/NOTICE.txt`. This README does not narrow `LICENSE`.
 
 ### Commercial use
 
-Commercial or paid use of GVD needs a separate license from Michael Beck. Open a GitHub issue on this repository, or contact him through his [GitHub profile](https://github.com/Mbeck2008-web). Do not email a request through this README.
+Commercial use of GVD-authored code and models needs a separate license from Michael Beck. Open a GitHub issue on this repository, or contact him through his [GitHub profile](https://github.com/Mbeck2008-web).
 
-**Paid services.** You may not use GVD, or any part of it (code, models, data, or visualizations), in or with a product or service that charges money, including a subscription, a paywall, paid tiers, or a paid API, unless you contact Michael Beck first and get his written permission. A service that is free for anyone to use is fine, even if it asks people to sign up for a free account. This explains what "noncommercial" in `LICENSE` means for GVD. If this note and `LICENSE` ever disagree, `LICENSE` controls.
+**Paid and ad-supported services (a statement from Michael Beck, not a change to `LICENSE`).** This applies only to GVD-authored code and models, not to third-party files (see `models/NOTICE.txt`). A service that is free, with no advertisements, no sponsorship, and no paid product behind it, may use those assets without asking first, even if it requires a free account. A service that charges money (including a subscription, a paywall, paid tiers, or a paid API), runs ads or sponsorships, or is a free front door to a paid product needs Michael Beck's written permission first. This does not narrow `LICENSE`. Organizations that `LICENSE` already permits (for example educational institutions or charities, even when they charge a fee) stay permitted. If this note and `LICENSE` ever disagree, `LICENSE` controls.
 
-Versions released before this license change remain under the MIT License that shipped with those commits.
+The last MIT-licensed commit is [`b098384`](https://github.com/Mbeck2008-web/grok-vision-drive/commit/b098384). Those MIT grants are not revoked. Versions from this release on (`VERSION` 1.7.14) are PolyForm Noncommercial 1.0.0.
+
+The optional `ultralytics` package and `UltraYoloDetector` path are AGPL-3.0 and are not shipped. If you add them yourself, their license applies to that combination.

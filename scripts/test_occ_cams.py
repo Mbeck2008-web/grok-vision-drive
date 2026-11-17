@@ -121,6 +121,9 @@ def check_ages() -> None:
         pert = list(imgs)
         pert[k_part] = 1.0 - imgs[k_part]
         moved = (net(pert, pts, wm)["occ"] - base["occ"]).abs().max().item()
+        w_one = wm.copy(); w_one[k_part] = 1.0
+        reweighted = (net(imgs, pts, w_one)["occ"] - base["occ"]).abs().max().item()
+    assert reweighted > 1e-4, "a partly stale cam must count less than a fresh one in the fused mean"
     assert moved > 1e-4, moved
     pred = net.predict(imgs, cam_w=wm, max_points=4096)
     pred_pert = net.predict([im if k != k_stale else torch.zeros_like(im) for k, im in enumerate(imgs)], cam_w=wm, max_points=4096)

@@ -39,10 +39,13 @@ jobs:
       - name: Lua 5.1 and a display
         run: sudo apt-get update && sudo apt-get install -y lua5.1 xvfb
 
-      - name: C++ viz toolchain (CMake, Ninja, Mesa EGL llvmpipe)
-        run: sudo apt-get install -y cmake ninja-build g++ libegl1 libegl-mesa0 libgl1-mesa-dri
+      - name: C++ viz toolchain (CMake, Ninja, Mesa EGL, X11 for GLFW)
+        # xorg-dev turns GVD_VIZ_GLFW on so the hidden-window attrib test runs.
+        # Offline renders still use EGL surfaceless; ctest is wrapped in xvfb
+        # only so glfwCreateWindow has a display.
+        run: sudo apt-get install -y cmake ninja-build g++ libegl1 libegl-mesa0 libgl1-mesa-dri xorg-dev
 
-      - name: C++ viz build + ctest (headless EGL)
+      - name: C++ viz build + ctest (headless EGL + GLFW under xvfb)
         # docs/specs/viz_cpp.md. glad/stb are vendored; glm + nlohmann_json are
         # pinned FetchContent tarballs. Renders on Mesa llvmpipe (no GPU).
         working-directory: cpp/viz
@@ -50,7 +53,7 @@ jobs:
           cmake --preset linux-release
           cmake --build --preset linux-release --parallel
           ./build/linux-release/gvd_viz --info --offline tests/scenes/basic.jsonl --png build/ci_basic.png
-          ctest --preset linux-release
+          xvfb-run -a ctest --preset linux-release
 
       - name: Python packages
         run: |

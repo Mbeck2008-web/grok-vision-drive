@@ -164,8 +164,7 @@ int main(int argc, char** argv) {
         last_rx = std::chrono::steady_clock::now();
       }
     }
-    bool stale = scene_is_stale(last_rx);  // no signal for 1 s: empty road + ego
-    Scene show = stale ? Scene{} : cur;
+    Scene show = scene_to_show(cur, last_rx);  // no signal for 1 s: empty road + ego
     int fw = 0, fh = 0;
     ctx.framebuffer_size(&fw, &fh);
     if (fw > 0 && fh > 0) {

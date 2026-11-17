@@ -70,6 +70,14 @@ struct Scene {
   float path_conf = 1.0f;
 };
 
+// Live loop: pick the scene to draw. A stale feed (no valid datagram for
+// more than kStaleTimeout) blanks to an empty scene (empty road + ego).
+inline Scene scene_to_show(const Scene& cur,
+                           std::chrono::steady_clock::time_point last_rx,
+                           std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) {
+  return scene_is_stale(last_rx, now) ? Scene{} : cur;
+}
+
 // Parse one JSON scene message. Returns false (and fills err) on bad JSON,
 // a schema version this build does not speak, or a value that fails a
 // strict enum (aeb). Unknown keys are ignored: the parser only reads the

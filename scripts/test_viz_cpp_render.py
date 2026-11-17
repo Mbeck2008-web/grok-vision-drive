@@ -133,7 +133,7 @@ def check_end_to_end(exe: Path) -> None:
 
 def check_stale_and_drain_wired() -> None:
     main = (SRC / "src" / "main.cpp").read_text(encoding="utf-8")
-    assert "scene_is_stale(last_rx)" in main, "live loop must call scene_is_stale (not stale=false)"
+    assert "scene_to_show(cur, last_rx)" in main, "live loop must use scene_to_show(cur, last_rx)"
     assert "bool stale = false" not in main
     udp = (SRC / "src" / "udp.cpp").read_text(encoding="utf-8")
     assert "for (int i = 0; i < 1024; ++i)" in udp
@@ -147,6 +147,7 @@ def check_glfw_visible_after_init() -> None:
     assert 0 <= head_start < win_start, "init_headless / init_window not found"
     headless = src[head_start:win_start]
     assert "glfwWindowHint" not in headless, "GLFW hints in init_headless run before glfwInit"
+    assert "headless_glfw_visible()" in headless, "init_headless must pass visible=headless_glfw_visible()"
     win = src[win_start:]
     init_pos = win.find("glfwInit")
     vis_pos = win.find("GLFW_VISIBLE")

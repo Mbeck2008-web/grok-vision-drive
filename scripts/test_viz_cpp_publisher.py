@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import os
 import signal
 import socket
 import subprocess
@@ -322,7 +323,7 @@ def check_schema_strict() -> None:
     assert cp.build_scene_message(st)["signs"] == []
     st["signs"] = [{"cls": "traffic_light", "x": 1.0, "y": 20.0, "state": "red"}]
     assert cp.build_scene_message(st)["signs"][0]["state"] == "red"
-    # live publisher does not emit track.lead (lead is lead_id from cipv_id)
+    # live publisher does not invent track.lead, but passes it through when set
     st = rich_state()
     assert all("lead" not in t for t in cp.build_scene_message(st)["tracks"])
     st["tracks"][0]["lead"] = True
@@ -337,10 +338,53 @@ def check_schema_strict() -> None:
         assert "height" not in tr and "speed_mps" not in tr and "pts" not in tr
     for ln in msg["lanes"]:
         assert "points" not in ln and "pts" in ln
-    # caps on the publisher side
+    # caps on the publisher side (tracks, signs, edges)
     st = rich_state(n_tracks=80)
     assert len(cp.build_scene_message(st)["tracks"]) == cp.MAX_TRACKS == 64
-    print("schema strict: enums, ints, caps, path_conf, no aliases, lead_id-only live OK")
+    st = rich_state()
+    st["signs"] = [{"cls": "traffic_light", "x": float(i), "y": 20.0, "state": "red"} for i in range(20)]
+    signs = cp.build_scene_message(st)["signs"]
+    assert len(signs) == cp.MAX_SIGNS == 16
+    assert signs[0]["x"] == 0.0 and signs[-1]["x"] == 15.0
+    st = rich_state()
+    st["road_edges"] = [
+        {"points": [{"x": float(i), "y": 0.0}, {"x": float(i), "y": 10.0}]} for i in range(12)
+    ]
+    edges = cp.build_scene_message(st)["edges"]
+    assert len(edges) == cp.MAX_EDGES == 8
+    assert edges[0]["pts"][0][0] == 0.0 and edges[-1]["pts"][0][0] == 7.0
+    print("schema strict: enums, ints, caps, path_conf, no aliases, lead pass-through OK")
+
+
+
+def check_seq_increments_on_attempt() -> None:
+    """seq increments when a send is attempted, including drops; rate-limit skips do not."""
+    pub = cp.CppVizPublisher(port=9, min_interval_s=0.0)
+
+    class DropSock:
+        def __init__(self) -> None:
+            self.n = 0
+            self.payloads: list[bytes] = []
+
+        def sendto(self, data, _addr):
+            self.n += 1
+            if self.n <= 3:
+                raise BlockingIOError
+            self.payloads.append(data)
+
+        def close(self) -> None:
+            pass
+
+    sock = DropSock()
+    pub._sock = sock
+    st = rich_state()
+    for _ in range(3):
+        assert pub.publish(st) is False
+    assert pub.dropped == 3 and pub.sent == 0
+    assert pub.publish(st) is True
+    assert json.loads(sock.payloads[0])["seq"] == 4, json.loads(sock.payloads[0])["seq"]
+    pub.close()
+    print("seq: three drops then a send -> first sent seq is 4 OK")
 
 
 def check_close_terminates_and_reaps() -> None:
@@ -361,6 +405,41 @@ def check_close_terminates_and_reaps() -> None:
     if sys.platform != "win32":
         assert proc.returncode == -signal.SIGTERM, proc.returncode
     print(f"close(): terminated dummy pid, reaped rc={proc.returncode} in {elapsed*1000:.0f} ms OK")
+
+
+
+def check_close_kill_fallback() -> None:
+    """A child that ignores SIGTERM must be kill()ed after the wait timeout."""
+    if sys.platform == "win32":
+        print("close() kill fallback: skipped on Windows (TerminateProcess cannot be ignored)")
+        return
+    pub = cp.CppVizPublisher(port=9, min_interval_s=0.0)
+    ready_r, ready_w = os.pipe()
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import os, signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "os.write(%d, b'x'); time.sleep(60)" % ready_w,
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        pass_fds=(ready_w,),
+    )
+    os.close(ready_w)
+    got = os.read(ready_r, 1)
+    os.close(ready_r)
+    assert got == b"x", got
+    pub._proc = proc
+    t0 = time.monotonic()
+    pub.close()
+    elapsed = time.monotonic() - t0
+    assert pub._proc is None
+    assert proc.poll() is not None, "SIGTERM-immune child still running after close(); kill() fallback missing"
+    assert proc.returncode == -signal.SIGKILL, proc.returncode
+    assert 1.5 <= elapsed < 6.0, f"close() took {elapsed:.2f}s; expected ~2s terminate timeout then kill"
+    print(f"close() kill fallback: SIGTERM ignored, SIGKILL reaped rc={proc.returncode} in {elapsed:.2f}s OK")
 
 
 def check_sendto_oserror() -> None:
@@ -392,7 +471,9 @@ def main() -> None:
     check_oversize()
     check_fail_safe()
     check_sendto_oserror()
+    check_seq_increments_on_attempt()
     check_close_terminates_and_reaps()
+    check_close_kill_fallback()
     check_flag_default_off()
     print("test_viz_cpp_publisher: all OK")
 

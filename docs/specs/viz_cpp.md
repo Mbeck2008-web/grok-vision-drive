@@ -21,7 +21,7 @@ It has to stay light. It shares the GTX 1080 Ti with BeamNG and the vision model
 - No ground truth. The renderer only gets the perception output the supervisor already has. `path_world`, `debug_gt` overlays, `*_gt`/`gt_*` keys and labeler output are never published.
 - No changes to safety, actuation or the recorder. The viz cannot block, slow or crash the control loop.
 - No 3D car models for traffic (boxes only, as in the early beta). No later v9+ customer UI.
-- Live lanes have no paint field yet (`lanes_ext` carries index/kind/points/side/style only), so in a live drive every lane is white, including real yellow centre lines. Yellow shows only when a record carries `paint`/`color`/`material` with "yellow". Detecting paint colour is a separate perception PR.
+- Live lanes have no paint field yet (`lanes_ext` carries index/kind/points/side/style only), so in a live drive every lane is white, including real yellow centre lines. Yellow shows only when a record carries the exact key `paint` with the exact value `"yellow"`. Aliases (`color`, `material`, `paint_color`, `colour`, `line_color`) are ignored and the lane stays white. Detecting paint colour is a separate perception PR.
 
 ## Architecture
 
@@ -37,11 +37,11 @@ gvd_viz --offline scenes.jsonl --png out.png   (headless EGL, tests/gallery)
 ```
 
 - `cpp/viz/`: CMake ≥ 3.20, C++17. glad 2 (GL 3.3 core + EGL 1.5 runtime loader) and stb are vendored in `third_party/`. glm 1.0.1 and nlohmann_json 3.11.3 **always** come from pinned FetchContent tarballs (SHA-256 checked); system packages are not used. GLFW uses a system 3.3+ package if CMake finds one, otherwise the pinned 3.4 tarball. GLFW is on by default on Windows and on Linux when X11 dev headers are present.
-- Headless: EGL surfaceless (Mesa) on Linux, so CI and the box render on llvmpipe with no X server. On Windows, headless uses a hidden GLFW window. `GLFW_VISIBLE` is set **after** `glfwInit` (GLFW 3.4 drops pre-init hints, and `glfwInit` resets them).
+- Headless: EGL surfaceless (Mesa) on Linux, so CI and the box render on llvmpipe with no X server. On Windows, headless uses a hidden GLFW window. `init_headless` passes `visible=headless_glfw_visible()` (always false). `GLFW_VISIBLE` is set **after** `glfwInit` (GLFW 3.4 drops pre-init hints, and `glfwInit` resets them). CI installs `xorg-dev` and runs ctest under xvfb so the hidden-window attrib test runs on the runner.
 - Presets: `linux-release` (Ninja, EGL) and `windows-msvc` (VS 2022 x64, GLFW).
-- Rendering: one instanced "capsule" primitive (screen-space segment SDF with an analytic glow halo, additive) for lane beads, curb dots, path beads and the box centre disc. Each traffic box is one instanced stroke whose fragment shader takes the minimum distance to all 12 edges, so a corner is no brighter than a mid-edge (additive per-edge capsules would stack at vertices). Plus a flat-shaded ego mesh (David_Holiday Tesla Model 3, 26,635 tris, depth-tested first so lines under it hide; Lambertian shading so body corners are not brighter than the panels), ground quads (stop bar, zebra, ego glow), SDF sprites (traffic light, stop sign) and an SDF HUD. 4x MSAA FBO, resolved, then read back (offline) or blitted (live). Internal render-target size and MSAA are capped so allocated GL memory stays under 200 MB (MSAA is reduced first, then resolution). A 4K window is blitted from the capped internal target.
+- Rendering: one instanced "capsule" primitive (screen-space segment SDF with an analytic glow halo, additive) for lane beads, curb dots, path beads and the box centre disc. Each traffic box is one instanced stroke whose vertex shader projects the 8 box corners once; the fragment shader takes the minimum distance to all 12 edges, so a corner is no brighter than a mid-edge (additive per-edge capsules would stack at vertices). Edge thickness is `r = max(1.9 px, 0.055 m * focal / depth)`. Plus a flat-shaded ego mesh (David_Holiday Tesla Model 3, 26,635 tris, SHA-256 `fa1ac2450f36a48356abdf2390346e8c1190ffb986e031dc430124a59e10dae8`, hood T badge removed; depth-tested first so lines under it hide; Lambertian shading so body corners are not brighter than the panels), ground quads (stop bar, zebra, ego glow), SDF sprites (traffic light, stop sign) and an SDF HUD. 4x MSAA FBO, resolved, then read back (offline) or blitted (live). Internal render-target size and MSAA are capped so allocated GL memory stays under 200 MB (MSAA is reduced first through powers of two only — 8→4→2→1 — because drivers round 3→4 and 5–7→8, then resolution). The cap and `gl_bytes()` use a CPU-side byte formula, not a measured GPU VRAM figure; `gl_bytes()` reads back `GL_RENDERBUFFER_SAMPLES` and uses that real count. A 4K 4x request first lands on MSAA 2, about 166 MB by the formula; if the driver then reports more samples than requested (llvmpipe at 4K reports 4), resolution is shrunk so the actual allocation stays under 200 MB, and those fitted targets are reused on later frames with the same requested size. Provenance for the ego source GLB is in `cpp/viz/assets/ATTRIBUTION.txt`.
 - Fail-safe: `--viz-cpp` is off by default. A missing `gvd_viz` prints one note and the publisher keeps sending, which is harmless. `publish` catches everything and only counts errors. The app is started with `Popen` (no wait) and on `close()` is `terminate()`d, waited, and reaped (with a `kill` fallback).
-- Live mode drains the UDP socket every frame and keeps only the newest datagram. If no valid message has arrived for more than 1 second (`scene_is_stale`), the view blanks to an empty road plus ego.
+- Live mode drains the UDP socket every frame and keeps only the newest datagram. If no valid message has arrived for more than 1 second, `scene_to_show(cur, last_rx)` blanks the view to an empty road plus ego.
 
 ## Message schema v1
 
@@ -66,7 +66,7 @@ The on-wire schema is **strict**: exact keys, strict enums, JSON integers only f
 | --- | --- |
 | `v` | Integer, must be `1`. Missing or any other value: message rejected. |
 | `type` | Must be exactly `"gvd_scene"`. |
-| `seq` | JSON integer (publisher: non-negative, monotonic per publisher instance, increments only when a datagram is actually sent). Wrong type is ignored (stays 0). |
+| `seq` | JSON integer (publisher: non-negative, monotonic per publisher instance). The publisher increments `seq` when a send is attempted, including frames later dropped for EAGAIN/OSError or that fail to encode; rate-limited skips do not increment. After three dropped attempts the next successful datagram has `seq == 4`. Wrong type is ignored (stays 0). |
 | `t` | Number of seconds, finite. Live publisher uses `time.monotonic()`, rounded to 4 decimal places. Offline `write_scene_file` uses `frame_index / 30`. Wrong type / non-finite is ignored (stays 0). |
 | `ego.engaged` | Boolean, default `false`. |
 | `ego.speed_mps` | Number, default 0. |
@@ -74,13 +74,13 @@ The on-wire schema is **strict**: exact keys, strict enums, JSON integers only f
 | `lead_id` | JSON integer only (no floats, no strings). Identifies the CIPV. Optional; missing or invalid is `-1` (no lead). |
 | `aeb` | Enum: `"off"` \| `"warn"` \| `"brake"`. Missing defaults to `"off"`. Any other value **rejects the message** (C++) or is emitted as `"off"` (publisher, so it never sends an invalid value). |
 | `path_conf` | Number in `[0, 1]`, **default `1.0`** when missing. Both sides clamp into `[0, 1]`. The renderer further floors the path glow at 0.45 so a very low conf is still visible. |
-| `lanes[].paint` | Enum: `"white"` \| `"yellow"`. Exact key `paint` and exact value only. Missing → `"white"`. Any other value (including `"Yellow"`, `"not_yellow"`, aliases like `paint_color` / `colour` / `line_color` / `color` / `material`, or `yellow: true`) is **rejected** (the lane is dropped; it is not treated as yellow). |
+| `lanes[].paint` | Enum: `"white"` \| `"yellow"`. Exact key `paint` and exact value only. Missing `paint`, or a paint alias on another key (`paint_color` / `colour` / `line_color` / `color` / `material`, or `yellow: true`), is ignored and the lane is **kept as `"white"`** (it is not treated as yellow and is not dropped). An invalid value on the `paint` key itself (including `"Yellow"`, `"not_yellow"`, or a non-string) **drops the lane**. |
 | `lanes[].kind`, `edges[].kind` | Enum: `"detected"` \| `"predicted"`. Missing → `"detected"`. Any other value drops that lane/edge. Non-`"predicted"` is no longer silently treated as detected. |
 | `lanes[].pts`, `edges[].pts`, `path.pts` | Array of `[x, y]` number pairs, key **`pts` only** (not `points`). Non-finite points skipped. |
 | `tracks[].id` | JSON integer only. Floats and strings are rejected (the track is dropped if `id` is present and not an integer; a missing `id` is allowed and stays `-1`). |
 | `tracks[].cls` | Enum: `vehicle`, `car`, `pedestrian`, `ped`, `person`, `bicycle`, `bike`, `cyclist`, `motorcycle`, `truck`, `bus`, `trailer`, `obstacle`, `parked`, `debris`, `cone`. Missing → `"vehicle"`. Any other value drops the track. On-wire key is `cls` only. |
 | `tracks[].l/w/h/v` | Optional numbers (class priors fill in `l/w/h` in the renderer). On-wire keys are `l`, `w`, `h`, `v` only. |
-| `tracks[].lead` | Optional boolean. C++ treats a track as lead if `lead` is true **or** `id == lead_id`. The live publisher does **not** emit `lead` (lead is indicated by `lead_id` from `planner.cipv_id` only). Offline / `occ_to_viz` may set `lead` if they want. |
+| `tracks[].lead` | Optional boolean. C++ treats a track as lead if `lead` is true **or** `id == lead_id`. The live publisher **passes `lead` through** when the supervisor state (or `occ_to_viz`) sets `lead=true`; it does not invent a lead flag from `lead_id`. Lead is also indicated by `lead_id` from `planner.cipv_id`. |
 | `signs[].cls` | Enum: `traffic_light` \| `stop_sign` \| `pole`. Anything else drops the sign. |
 | `signs[].state` | Enum: `red` \| `yellow` \| `green` \| `unknown`. Missing → `"unknown"`. Anything else drops the sign. |
 
@@ -109,13 +109,13 @@ Strict where the first draft was loose. Adapters must:
 6. Send `path_conf` in `[0, 1]` or omit it (default 1.0).
 7. Use on-wire keys `cls`, `l`, `w`, `h`, `v`, `pts` (not `class`, `length`, `points`).
 8. Honour the caps; the C++ parser now truncates the same way the publisher does.
-9. Not rely on `tracks[].lead` being present in a live publisher datagram; set `lead_id` (and optionally `lead` if you want).
+9. Not rely on `tracks[].lead` being present unless the state (or adapter) set it; set `lead_id` (and optionally `lead` if you want). The live publisher will pass `lead` through when it is set.
 10. Not include `path_world` or other GT keys for drawing; they are ignored if present.
 
 ## File touch list
 
 - New: `cpp/viz/**` (CMakeLists, presets, `src/{scene,renderer,context,udp,image_io,main}`, `tests/test_render.cpp`, `tests/run_cli.cmake`, `tests/scenes/basic.jsonl`, vendored `third_party/{glad,stb}`), `python/viz/cpp_publisher.py`, `scripts/test_viz_cpp_publisher.py`, `scripts/test_viz_cpp_render.py`, `scripts/render_viz_cpp_gallery.py`, this spec.
-- Changed: `python/run_vision.py` (flags `--viz-cpp`, `--viz-cpp-port`, `--viz-cpp-exe`, `--viz-cpp-no-launch`; `start_cpp_viz`; one `publish(st)` per tick; `close()` in `finally`), `.github/workflows/tests.yml` (apt cmake/ninja/g++/Mesa EGL, build + ctest step, `GVD_VIZ_BUILD_DIR` for the suite), README.
+- Changed: `python/run_vision.py` (flags `--viz-cpp`, `--viz-cpp-port`, `--viz-cpp-exe`, `--viz-cpp-no-launch`; `start_cpp_viz`; one `publish(st)` per tick; `close()` in `finally`), `.github/workflows/tests.yml` (apt cmake/ninja/g++/Mesa EGL/xorg-dev, build + ctest under xvfb, `GVD_VIZ_BUILD_DIR` for the suite), README.
 
 ## Verify
 

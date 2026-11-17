@@ -31,8 +31,26 @@ LIVE_ENTRY_POINTS = (
     "python.perception.occ_sparse",
     "python.perception.occ_geometry",
     "python.perception.occ_outputs",
+    "python.perception.occ_ego",
     "python.viz.occ_viz",
 )
+# The occupancy runtime proper (net -> ego motion -> tracker -> viz). Besides the
+# GT label modules it must not reach any sim-truth pose source.
+OCC_RUNTIME = (
+    "python.perception.occ_sparse", "python.perception.occ_geometry", "python.perception.occ_outputs",
+    "python.perception.occ_ego", "python.viz.occ_viz",
+)
+# Modules whose job is reading sim truth (pose, road graph, decals, signals).
+# Config readers the live supervisor already loads (raw_frames, sensors.cameras)
+# are not on this list; the spy below proves no pose is read through them.
+GT_POSE_MODULES = (
+    "python.debug.gt_geom", "python.debug.painted_lanes", "python.collect.signal_labels", "python.collect.route_hindsight",
+    "python.collect.static_signs", "python.collect.road_dump", "python.collect.recorder_v4", "python.collect.road_loader",
+)
+# Identifiers that read sim-truth pose / labels; none may appear in the occupancy runtime source.
+GT_POSE_NAMES = frozenset({"read_state_jsonl", "scenetree", "get_scenetree", "get_road_edges", "world_to_ego",
+                           "vehicles_in_ego", "beamngpy", "state_jsonl", "gt_pose"})
+GT_POSE_THIRD_PARTY = ("beamngpy",)
 OCC_GT_MODULES = (
     "python.train.occ_labels",
     "python.train.occ_train",
@@ -134,9 +152,174 @@ def check_static() -> None:
     print(f"static: {len(seen)} modules reachable from the live entry points, no GT module; walk finds occ_labels from occ_train OK")
 
 
+def third_party_of(name: str) -> set[str]:
+    path = module_path(name)
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    out = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            out.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+            out.add(node.module.split(".")[0])
+    return out
+
+
+def names_in(name: str) -> set[str]:
+    tree = ast.parse(module_path(name).read_text(encoding="utf-8"))
+    out = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            out.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            out.add(node.attr)
+        elif isinstance(node, ast.alias):
+            out.add(node.name.split(".")[-1]); out.add(node.name.split(".")[0])
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in GT_POSE_NAMES:
+            out.add(node.value)
+    return out
+
+
+def check_gt_pose_trace() -> None:
+    seen = reachable(OCC_RUNTIME)
+    bad = [chain(seen, m) for m in seen if any(m == g or m.startswith(g + ".") for g in GT_POSE_MODULES)]
+    assert not bad, bad
+    # The occupancy modules themselves never import beamngpy. (The rig geometry is read
+    # through raw_frames.camera_sidecar -> sensors.cameras, the live camera client,
+    # which references beamngpy lazily for frames; the runtime check below proves
+    # importing the occupancy runtime does not load it.)
+    third = sorted({t for m in OCC_RUNTIME for t in third_party_of(m)} & set(GT_POSE_THIRD_PARTY))
+    assert not third, third
+    for m in OCC_RUNTIME:
+        used = names_in(m) & GT_POSE_NAMES
+        assert not used, (m, sorted(used))
+    assert names_in("python.train.occ_labels") & GT_POSE_NAMES, "name scan must see occ_labels' world_to_ego"
+    assert names_in("python.data.occ_shards") & GT_POSE_NAMES, "name scan must see the shard builder's state reader"
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="-1")
+    code = CHILD.format(root=str(ROOT), entries=OCC_RUNTIME)
+    res = subprocess.run([sys.executable, "-c", code + "\nprint(json.dumps(sorted(m for m in sys.modules if m.split('.')[0] in {third!r})))".format(third=GT_POSE_THIRD_PARTY)],
+                         cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=240)
+    assert res.returncode == 0, res.stderr[-2000:]
+    lines = res.stdout.strip().splitlines()
+    loaded, sim = set(json.loads(lines[-2])), json.loads(lines[-1])
+    leaked = sorted(m for m in loaded if any(m == g or m.startswith(g + ".") for g in GT_POSE_MODULES))
+    assert not leaked and not sim, (leaked, sim)
+    print(f"GT pose: {len(seen)} modules reachable from the occupancy runtime, none is a pose/sim-truth source; "
+          f"no pose-reading name in its source; beamngpy not imported OK")
+
+
+class _Spy(dict):
+    """Vehicle/state mapping that records every key read and raises on sim-truth keys."""
+
+    FORBIDDEN = ("pos", "dir", "up", "rotation", "rot", "vel", "velocity", "yaw", "heading", "ego", "pose", "scenetree")
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.read: list[str] = []
+
+    def _touch(self, k):
+        self.read.append(k)
+        if k in self.FORBIDDEN:
+            raise AssertionError(f"runtime read sim-truth key {k!r}")
+
+    def __getitem__(self, k):
+        self._touch(k)
+        return super().__getitem__(k)
+
+    def get(self, k, d=None):
+        self._touch(k)
+        return super().get(k, d)
+
+    def __contains__(self, k):
+        self._touch(k)
+        return super().__contains__(k)
+
+    def keys(self):
+        raise AssertionError("runtime enumerated the vehicle mapping")
+
+    def items(self):
+        raise AssertionError("runtime enumerated the vehicle mapping")
+
+    def __iter__(self):
+        raise AssertionError("runtime enumerated the vehicle mapping")
+
+
+class _NoImage:
+    """Stands in for every camera array downstream of the heads: any access raises."""
+
+    def __getattr__(self, name):
+        raise AssertionError(f"downstream code touched a camera array (.{name})")
+
+    def __getitem__(self, k):
+        raise AssertionError("downstream code indexed a camera array")
+
+    def __array__(self, *a, **k):
+        raise AssertionError("downstream code converted a camera array")
+
+    def __iter__(self):
+        raise AssertionError("downstream code iterated a camera array")
+
+    def __len__(self):
+        raise AssertionError("downstream code sized a camera array")
+
+
+def planner_stub(msg) -> float | None:
+    """Toy planner on the viz message only: nearest track ahead within 2 m of the lane."""
+    ahead = [t["y"] for t in msg["tracks"] if t["y"] > 0 and abs(t["x"]) < 2.0]
+    return min(ahead) if ahead else None
+
+
+def check_flag_and_spy() -> None:
+    import argparse
+
+    import numpy as np
+
+    sys.path.insert(0, str(ROOT))
+    from python.perception.occ_ego import VEHICLE_SIGNAL_KEYS, EgoMotion, add_ego_args, runtime_frame
+    from python.perception.occ_geometry import DEFAULT_GRID as G
+    from python.perception.occ_outputs import OccTracker
+    from python.viz.occ_viz import encode, occ_to_viz
+
+    a = add_ego_args(argparse.ArgumentParser()).parse_args([])
+    assert a.ego_from_vehicle is False
+    assert EgoMotion.from_args(a).source == "camera_vo"
+    on = add_ego_args(argparse.ArgumentParser()).parse_args(["--ego-from-vehicle"])
+    assert EgoMotion.from_args(on).source == "vehicle_signals"
+
+    class Pred:  # what the net hands downstream: cells only; image fields are guards
+        def __init__(self, k, c):
+            self.keys, self.cls = k, c
+            self.images = _NoImage(); self.frames = _NoImage()
+
+    car = np.array([[x, 12.0 + y, z] for x in (-0.6, -0.2, 0.2, 0.6) for y in (0.0, 0.4, 0.8, 1.2, 1.6) for z in (0.2, 0.6)])
+    keys = G.keys_of(car); cls = np.full(keys.shape, 2, np.uint8)
+    truth = {"pos": [1, 2, 3], "dir": [0, 1, 0], "rotation": [0, 0, 0, 1], "vel": [0, 9, 0], "wheelspeed_mps": 9.0,
+             "imu_yaw_rate": 0.01, "scenetree": {}}
+    for flag in (False, True):
+        ego, tr = EgoMotion(from_vehicle=flag), OccTracker()
+        for i in range(4):
+            spy = _Spy(truth)
+            out = runtime_frame(Pred(keys, cls), tr, ego, 0.1 * i, vehicle=spy)
+            out["images"] = _NoImage()  # unknown keys in the outputs are never read either
+            msg = occ_to_viz(out, seq=i)
+            encode(msg)
+            planner_stub(msg)
+            if flag:
+                assert set(spy.read) <= set(VEHICLE_SIGNAL_KEYS) and spy.read, spy.read
+            else:
+                assert spy.read == [], f"default (camera VO) read vehicle keys {spy.read}"
+        assert out["ego"]["source"] == ("vehicle_signals" if flag else "camera_vo")
+        if flag:
+            assert out["ego"]["speed_mps"] == 9.0
+    assert planner_stub(msg) is not None
+    print("ego flag: --ego-from-vehicle defaults OFF (camera VO reads no vehicle key); ON reads only "
+          f"{list(VEHICLE_SIGNAL_KEYS)}; outputs/viz/planner stub never touch a camera array OK")
+
+
 def main() -> int:
     check_static()
     check_runtime()
+    check_gt_pose_trace()
+    check_flag_and_spy()
     print("test_occ_runtime_imports: all OK")
     return 0
 

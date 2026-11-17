@@ -9,7 +9,9 @@ and ignores any other key, as the C++ parser does.
   road's real edges (asymmetric road, all 8 cameras, front and rear);
 * a vehicle cluster sits on the box face the cameras see; a full footprint
   gives the box's centre, size and heading;
-* motion state needs 3 frames (frame 1 and 2 are ``unknown``) and, with
+* motion state needs 3 frames (frame 1 and 2 are ``unknown``): a stationary
+  forward-facing car ahead of a moving ego is parked, plus oncoming and
+  crossing tracks one by one; and, with
   ego-motion compensation (straight and turning), names same_way /
   oncoming / crossing / alongside / parked correctly;
 * the synthetic scene's outputs round-trip into a valid v1 message under
@@ -158,6 +160,29 @@ def check_motion() -> None:
     print("motion: unknown for frames 1-2; same_way/oncoming/crossing/alongside/parked after 3 (straight and turning ego) OK")
 
 
+def check_motion_named() -> None:
+    """Critic cases one by one: each from track displacement over N frames, relative to ego."""
+    # stationary car straight ahead, facing forward (same heading as ego), ego at 10 m/s
+    for ego_v in (10.0, 25.0):
+        reps = _drive([(0.0, 30.0, 0.0, 0.0)], ego_v=ego_v, frames=5)
+        assert [r[0]["motion"] for r in reps[:2]] == ["unknown", "unknown"]
+        last = reps[-1][0]
+        assert last["motion"] == "parked", (ego_v, last)
+        assert last["speed_mps"] < 0.2 and last.get("yaw_src") != "track" and last["yaw"] == 0.0, last
+        # its ego-relative closing speed is the ego speed: a relative-only rule would call it oncoming
+        assert reps[0][0]["y"] - reps[-1][0]["y"] > 0.35 * ego_v
+    # oncoming in the next lane, 12 m/s toward the ego
+    on = _drive([(-3.5, 45.0, 0.0, -12.0)], frames=4)[-1][0]
+    assert on["motion"] == "oncoming" and abs(on["speed_mps"] - 12.0) < 0.3, on
+    # crossing left to right ahead, 8 m/s
+    cr = _drive([(-15.0, 25.0, 8.0, 0.0)], frames=4)[-1][0]
+    assert cr["motion"] == "crossing" and abs(cr["vx"] - 8.0) < 0.3 and abs(cr["vy"]) < 0.3, cr
+    # a track that keeps the same ego-relative position while the ego drives is same_way, not parked
+    sw = _drive([(0.0, 20.0, 0.0, 10.0)], ego_v=10.0, frames=4)[-1][0]
+    assert sw["motion"] == "same_way" and abs(sw["speed_mps"] - 10.0) < 0.3, sw
+    print("motion: stationary forward-facing car -> parked (ego 10 and 25 m/s); oncoming; crossing; pacing car same_way OK")
+
+
 def _outputs():
     pred = _scene_pred()
     tracker = OccTracker()
@@ -238,6 +263,7 @@ def main() -> int:
     check_edges()
     check_objects()
     check_motion()
+    check_motion_named()
     check_message()
     check_colors()
     check_runtime_net()

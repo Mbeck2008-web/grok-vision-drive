@@ -824,7 +824,8 @@ def check_missing_level_and_bng_error_are_status() -> None:
                 sys.stdout = old_out
             assert code == 2, (code, buf.getvalue())
             assert dead.player_calls > 1
-            assert dead.scenario.starts == 1
+            # A first-map load with no vehicle is retried, then stops.
+            assert dead.scenario.starts == collect.LEVEL_LOAD_ATTEMPTS
             assert dead.early_road is False
             status = json.loads((root / "status" / "collect.json").read_text(encoding="utf-8"))
             crash = (root / "status" / "collect_crash.txt").read_text(encoding="utf-8")

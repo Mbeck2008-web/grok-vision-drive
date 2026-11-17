@@ -40,10 +40,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y lua5.1 xvfb
 
       - name: C++ viz toolchain (CMake, Ninja, Mesa EGL, X11 for GLFW)
-        # xorg-dev turns GVD_VIZ_GLFW on so the hidden-window attrib test runs.
-        # Offline renders still use EGL surfaceless; ctest is wrapped in xvfb
-        # only so glfwCreateWindow has a display.
-        run: sudo apt-get install -y cmake ninja-build g++ libegl1 libegl-mesa0 libgl1-mesa-dri xorg-dev
+        # xorg-dev turns GVD_VIZ_GLFW on; libglfw3-dev supplies a system GLFW
+        # so CI does not have to compile the pinned 3.4 tarball (which would
+        # need wayland-scanner). Offline renders still use EGL surfaceless;
+        # ctest is wrapped in xvfb only so glfwCreateWindow has a display.
+        run: sudo apt-get install -y cmake ninja-build g++ libegl1 libegl-mesa0 libgl1-mesa-dri xorg-dev libglfw3-dev
 
       - name: C++ viz build + ctest (headless EGL + GLFW under xvfb)
         # docs/specs/viz_cpp.md. glad/stb are vendored; glm + nlohmann_json are

@@ -27,6 +27,7 @@
 #include "image_io.hpp"
 #include "renderer.hpp"
 #include "scene.hpp"
+#include "dots.hpp"
 #include "udp.hpp"
 #include <nlohmann/json.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -141,7 +142,7 @@ static Counts classify(const Image& im, int y0 = 0, int y1 = -1) {
 }
 
 static std::string head(const std::string& body) {
-  return std::string("{\"v\":1,\"type\":\"gvd_scene\",\"seq\":1,\"t\":0") + (body.empty() ? "" : ",") + body + "}";
+  return std::string("{\"v\":2,\"type\":\"gvd_scene\",\"seq\":1,\"t\":0") + (body.empty() ? "" : ",") + body + "}";
 }
 
 static Scene must(const std::string& js) {
@@ -227,11 +228,12 @@ int main() {
   // 1. schema: wrong version / type / junk are rejected, not drawn.
   {
     Scene s;
-    CHECK(!parse_scene("{\"v\":2,\"type\":\"gvd_scene\"}", s), "v=2 accepted");
-    CHECK(!parse_scene("{\"v\":1,\"type\":\"other\"}", s), "wrong type accepted");
+    CHECK(!parse_scene("{\"v\":1,\"type\":\"gvd_scene\"}", s), "v=1 accepted");
+    CHECK(!parse_scene("{\"v\":99,\"type\":\"gvd_scene\"}", s), "v=99 accepted");
+    CHECK(!parse_scene("{\"v\":2,\"type\":\"other\"}", s), "wrong type accepted");
     CHECK(!parse_scene("{\"type\":\"gvd_scene\"}", s), "missing v accepted");
     CHECK(!parse_scene("not json", s), "junk accepted");
-    CHECK(parse_scene(head(""), s), "minimal v1 rejected");
+    CHECK(parse_scene(head(""), s), "minimal v2 rejected");
   }
 
   // 2. empty scene, no ego/HUD: pure black.
@@ -542,7 +544,7 @@ int main() {
     }
   }
 
-  // 16. strict v1 enums, integer ids, caps, path_conf clamp / default.
+  // 16. strict v2 enums, integer ids, caps, path_conf clamp / default.
   {
     Scene s;
     CHECK(!parse_scene(head("\"aeb\":\"maybe\""), s), "invalid aeb accepted");
@@ -998,8 +1000,8 @@ int main() {
       return m;
     };
     // Seed history at t=0 with an empty scene, then introduce the dot.
-    shot(must("{\"v\":1,\"type\":\"gvd_scene\",\"seq\":1,\"t\":0}"), o);
-    const char* dot = "{\"v\":1,\"type\":\"gvd_scene\",\"seq\":2,\"t\":%.3f,"
+    shot(must("{\"v\":2,\"type\":\"gvd_scene\",\"seq\":1,\"t\":0}"), o);
+    const char* dot = "{\"v\":2,\"type\":\"gvd_scene\",\"seq\":2,\"t\":%.3f,"
                       "\"dots\":[{\"id\":7,\"x\":0,\"y\":22,\"cls\":\"white\",\"prob\":1,\"observed\":true}]}";
     char buf[256];
     std::snprintf(buf, sizeof(buf), dot, 0.04);
@@ -1056,9 +1058,10 @@ int main() {
     std::printf("world lock: ego0 peak (%d,%d) luma %.3f  ego+8 (%d,%d) luma %.3f  expected (%.1f,%.1f)->(%.1f,%.1f)\n",
                 ax, ay, la, bx, by, lb, exp_a.x, exp_a.y, exp_b.x, exp_b.y);
     CHECK(la > 0.15f && lb > 0.15f, "world-fixed dot not visible (%.3f / %.3f)", la, lb);
-    CHECK(std::fabs(float(ax) - exp_a.x) <= 3.f && std::fabs(float(ay) - exp_a.y) <= 3.f,
+    // Measured lock is 1.0 px (not 0.5). Assert that, not a 3 px window.
+    CHECK(std::fabs(float(ax) - exp_a.x) <= 1.f && std::fabs(float(ay) - exp_a.y) <= 1.f,
           "dot at ego 0 is at (%d,%d) want (%.1f,%.1f)", ax, ay, exp_a.x, exp_a.y);
-    CHECK(std::fabs(float(bx) - exp_b.x) <= 3.f && std::fabs(float(by) - exp_b.y) <= 3.f,
+    CHECK(std::fabs(float(bx) - exp_b.x) <= 1.f && std::fabs(float(by) - exp_b.y) <= 1.f,
           "dot after ego move is at (%d,%d) want (%.1f,%.1f)", bx, by, exp_b.x, exp_b.y);
   }
 
@@ -1117,6 +1120,232 @@ int main() {
     Image sized = shot(must(head("\"tracks\":[{\"id\":1,\"cls\":\"vehicle\",\"x\":0,\"y\":14,\"yaw\":1.5708,\"l\":4.5,\"w\":1.85,\"h\":1.5}]")), o);
     CHECK(classify(none).lit == 0, "sizeless track was drawn (%ld lit) using a fixed prior", classify(none).lit);
     CHECK(classify(sized).lit > 40, "sized track is invisible");
+  }
+
+
+  // 29. CPU: fade duration is 200 ms, independent of target alpha (150-250 ms).
+  // These numeric checks kill fade=1000/100/400 ms, no-fade-out, low-prob, and
+  // sqrt(prob) mutants without depending on GPU luma.
+  {
+    auto mk = [](int id, float x, float y, float prob, bool obs = true, int i = -1, int j = -1, int k = -1) {
+      Dot d;
+      d.id = id; d.x = x; d.y = y; d.prob = prob; d.observed = obs;
+      d.i = i; d.j = j; d.k = k;
+      return d;
+    };
+    std::vector<LiveDot> live;
+    double last = -1e9;
+    // first frame snaps
+    step_live_dots(live, {mk(1, 0, 22, 1.f)}, 0.0, last, 0.f, 0.f, false);
+    CHECK(live.size() == 1 && std::fabs(live[0].alpha - 1.f) < 1e-5 && std::fabs(live[0].fade - 1.f) < 1e-5,
+          "first frame did not snap (fade=%.3f alpha=%.3f)", live.empty() ? 0.f : live[0].fade,
+          live.empty() ? 0.f : live[0].alpha);
+
+    // New dot fade-in: empty seed at t=0, introduce at t=0.04 / 0.10 / 0.20.
+    live.clear();
+    last = -1e9;
+    step_live_dots(live, {}, 0.0, last, 0.f, 0.f, false);
+    step_live_dots(live, {mk(7, 0, 22, 1.f)}, 0.04, last, 0.f, 0.f, false);
+    CHECK(live.size() == 1, "fade-in lost the dot");
+    const float a04 = live.empty() ? 0.f : live[0].alpha;
+    const float f04 = live.empty() ? 0.f : live[0].fade;
+    CHECK(std::fabs(f04 - 0.20f) < 0.02f, "t=40 ms fade=%.3f, want 0.20 (200 ms fade)", f04);
+    step_live_dots(live, {mk(7, 0, 22, 1.f)}, 0.10, last, 0.f, 0.f, false);
+    const float f10 = live.empty() ? 0.f : live[0].fade;
+    const float a10 = live.empty() ? 0.f : live[0].alpha;
+    CHECK(std::fabs(f10 - 0.50f) < 0.03f, "t=100 ms fade=%.3f, want 0.50 (kills 100 ms fade)", f10);
+    CHECK(a10 < 0.95f, "t=100 ms already full (alpha=%.3f); fade is too short", a10);
+    step_live_dots(live, {mk(7, 0, 22, 1.f)}, 0.20, last, 0.f, 0.f, false);
+    const float f20 = live.empty() ? 0.f : live[0].fade;
+    const float a20 = live.empty() ? 0.f : live[0].alpha;
+    CHECK(std::fabs(f20 - 1.f) < 0.03f, "t=200 ms fade=%.3f, want 1 (kills 400/1000 ms fade)", f20);
+    CHECK(std::fabs(a20 - 1.f) < 0.03f, "t=200 ms alpha=%.3f, want 1", a20);
+    CHECK(a04 > 0.05f && a20 > a04 * 1.5f, "fade-in did not rise (%.3f then %.3f)", a04, a20);
+
+    // Low-prob: duration still 200 ms, alpha = fade * 0.25 (kills sqrt(prob) and scaled-dt).
+    live.clear();
+    last = -1e9;
+    step_live_dots(live, {}, 0.0, last, 0.f, 0.f, false);
+    step_live_dots(live, {mk(8, 0, 22, 0.25f)}, 0.04, last, 0.f, 0.f, false);
+    const float lp04 = live.empty() ? 0.f : live[0].alpha;
+    const float lf04 = live.empty() ? 0.f : live[0].fade;
+    CHECK(std::fabs(lf04 - 0.20f) < 0.02f, "low-prob fade at 40 ms is %.3f, want 0.20", lf04);
+    CHECK(std::fabs(lp04 - 0.05f) < 0.01f, "low-prob alpha at 40 ms is %.3f, want 0.05 (=0.20*0.25)", lp04);
+    step_live_dots(live, {mk(8, 0, 22, 0.25f)}, 0.20, last, 0.f, 0.f, false);
+    const float lp20 = live.empty() ? 0.f : live[0].alpha;
+    CHECK(std::fabs(lp20 - 0.25f) < 0.02f, "low-prob alpha at 200 ms is %.3f, want 0.25 (not sqrt(0.25)=0.5)", lp20);
+
+    // alpha == prob after snap (kills sqrt(prob) at 1 vs 0.25 -> 1 vs 0.5).
+    live.clear();
+    last = -1e9;
+    step_live_dots(live, {mk(1, -3.5f, 22, 1.f), mk(2, 3.5f, 22, 0.25f)}, 0.0, last, 0.f, 0.f, false);
+    CHECK(live.size() == 2, "snap pair size %zu", live.size());
+    float a_hi = 0, a_lo = 0;
+    for (const auto& L : live) {
+      if (L.id == 1) a_hi = L.alpha;
+      if (L.id == 2) a_lo = L.alpha;
+    }
+    CHECK(std::fabs(a_hi - 1.f) < 1e-5 && std::fabs(a_lo - 0.25f) < 1e-5,
+          "alpha!=prob (hi=%.3f lo=%.3f); sqrt(prob) would be 0.5", a_hi, a_lo);
+
+    // Fade-out: after a fully faded p=1 dot is removed, 40 ms later it is still
+    // visible (~0.80) and is gone by 200 ms (kills no-fade-out and 1000 ms).
+    live.clear();
+    last = -1e9;
+    step_live_dots(live, {mk(9, 0, 22, 1.f)}, 0.0, last, 0.f, 0.f, false);
+    step_live_dots(live, {}, 0.04, last, 0.f, 0.f, false);
+    CHECK(!live.empty() && live[0].alpha > 0.70f && live[0].alpha < 0.90f,
+          "fade-out at 40 ms alpha=%.3f (popped or too slow)", live.empty() ? 0.f : live[0].alpha);
+    step_live_dots(live, {}, 0.20, last, 0.f, 0.f, false);
+    CHECK(live.empty(), "fade-out still alive at 200 ms (n=%zu alpha=%.3f)", live.size(),
+          live.empty() ? 0.f : live[0].alpha);
+
+    // Gaps > 0.5 s and repeated timestamps must not pop.
+    live.clear();
+    last = -1e9;
+    step_live_dots(live, {}, 0.0, last, 0.f, 0.f, false);
+    step_live_dots(live, {mk(3, 0, 22, 1.f)}, 0.04, last, 0.f, 0.f, false);
+    const float before_gap = live[0].alpha;
+    step_live_dots(live, {mk(3, 0, 22, 1.f)}, 0.84, last, 0.f, 0.f, false);  // 0.8 s gap
+    CHECK(!live.empty() && std::fabs(live[0].alpha - before_gap) < 1e-5,
+          "gap>0.5 s popped (%.3f -> %.3f)", before_gap, live.empty() ? 0.f : live[0].alpha);
+    const float mid = live[0].alpha;
+    const double t_rep = last;
+    step_live_dots(live, {mk(3, 0, 22, 1.f)}, t_rep, last, 0.f, 0.f, false);
+    CHECK(std::fabs(live[0].alpha - mid) < 1e-5, "repeated t popped (%.3f -> %.3f)", mid, live[0].alpha);
+
+    std::printf("fade unit: in 40/100/200 ms %.3f/%.3f/%.3f  low-p 40/200 %.3f/%.3f  out-ok\n",
+                a04, a10, a20, lp04, lp20);
+  }
+
+  // 30. Dot identity: reorder mid-fade, with and without ids. Kills index-order matching.
+  {
+    auto mk = [](int id, float x, float y, float prob) {
+      Dot d; d.id = id; d.x = x; d.y = y; d.prob = prob; d.observed = true; return d;
+    };
+    std::vector<LiveDot> live;
+    double last = -1e9;
+    // Stagger appearance so the two ids have different fade values; a same-fade
+    // pair would still pass under index-order matching.
+    step_live_dots(live, {}, 0.0, last, 0.f, 0.f, false);
+    step_live_dots(live, {mk(1, -3.f, 22.f, 1.f)}, 0.04, last, 0.f, 0.f, false);
+    step_live_dots(live, {mk(1, -3.f, 22.f, 1.f), mk(2, 3.f, 22.f, 1.f)}, 0.08, last, 0.f, 0.f, false);
+    step_live_dots(live, {mk(2, 3.f, 22.f, 1.f), mk(1, -3.f, 22.f, 1.f)}, 0.12, last, 0.f, 0.f, false);
+    float f1 = -1, f2 = -1;
+    for (const auto& L : live) {
+      if (L.id == 1) f1 = L.fade;
+      if (L.id == 2) f2 = L.fade;
+    }
+    // id1 has been visible 120 ms (fade 0.60), id2 80 ms (fade 0.40).
+    CHECK(std::fabs(f1 - 0.60f) < 0.03f && std::fabs(f2 - 0.40f) < 0.03f,
+          "reorder-with-id mixed the fades (id1=%.3f want 0.60, id2=%.3f want 0.40)", f1, f2);
+
+    // Without ids: stagger, then swap array order. Identity is by position.
+    live.clear();
+    last = -1e9;
+    auto mk0 = [](float x, float y) {
+      Dot d; d.id = -1; d.x = x; d.y = y; d.prob = 1.f; d.observed = true; return d;
+    };
+    step_live_dots(live, {}, 0.0, last, 0.f, 0.f, false);
+    step_live_dots(live, {mk0(-3.f, 22.f)}, 0.04, last, 0.f, 0.f, false);
+    step_live_dots(live, {mk0(-3.f, 22.f), mk0(3.f, 22.f)}, 0.08, last, 0.f, 0.f, false);
+    step_live_dots(live, {mk0(3.f, 22.f), mk0(-3.f, 22.f)}, 0.12, last, 0.f, 0.f, false);
+    CHECK(live.size() == 2, "reorder-without-id lost a dot (n=%zu)", live.size());
+    float fl = -1, fr = -1;
+    for (const auto& L : live) {
+      if (L.wx < 0) fl = L.fade;
+      else fr = L.fade;
+    }
+    CHECK(std::fabs(fl - 0.60f) < 0.03f && std::fabs(fr - 0.40f) < 0.03f,
+          "reorder-without-id mixed the fades (left=%.3f want 0.60, right=%.3f want 0.40)", fl, fr);
+  }
+
+  // 31. Ego-motion compensation (and ijk) keeps identity at speed, so a 0.75 m
+  // leap does not re-fade. Kills radius-0 matching and uncompensated NN.
+  {
+    auto mk = [](int id, float x, float y) {
+      Dot d; d.id = id; d.x = x; d.y = y; d.prob = 1.f; d.observed = true; return d;
+    };
+    std::vector<LiveDot> live;
+    double last = -1e9;
+    step_live_dots(live, {}, 0.0, last, 0.f, 0.f, false);
+    step_live_dots(live, {mk(-1, 0.f, 20.f)}, 0.04, last, 0.f, 0.f, false);
+    const float fade_mid = live[0].fade;
+    // 20 m/s * 0.04 s = 0.8 m > 0.75 m radius. Without compensation this rematches as new.
+    step_live_dots(live, {mk(-1, 0.f, 19.2f)}, 0.08, last, 20.f, 0.f, false);
+    CHECK(live.size() == 1, "motion match lost the dot");
+    CHECK(std::fabs(live[0].fade - (fade_mid + 0.20f)) < 0.05f,
+          "uncompensated rematch re-faded (fade=%.3f, mid was %.3f)", live[0].fade, fade_mid);
+    CHECK(std::fabs(live[0].wy - 19.2f) < 1e-3, "matched wrong position");
+
+    // ijk match when the point jumps further than the radius, no motion given.
+    live.clear();
+    last = -1e9;
+    Dot a; a.id = -1; a.x = 0; a.y = 10; a.prob = 1; a.observed = true; a.i = 4; a.j = 8; a.k = 1;
+    Dot b = a; b.x = 0; b.y = 12;  // 2 m jump
+    step_live_dots(live, {}, 0.0, last, 0.f, 0.f, false);
+    step_live_dots(live, {a}, 0.04, last, 0.f, 0.f, false);
+    const float fi = live[0].fade;
+    step_live_dots(live, {b}, 0.08, last, 0.f, 0.f, false);
+    CHECK(live.size() == 1 && std::fabs(live[0].fade - (fi + 0.20f)) < 0.05f,
+          "ijk match failed (n=%zu fade=%.3f)", live.size(), live.empty() ? 0.f : live[0].fade);
+  }
+
+  // 32. C++ kMaxDots cap: 1025 dots on the wire keeps 1024.
+  {
+    std::string body = "\"dots\":[";
+    for (int i = 0; i < 1025; ++i) {
+      if (i) body += ',';
+      char buf[160];
+      std::snprintf(buf, sizeof(buf),
+                    "{\"id\":%d,\"x\":%.3f,\"y\":10,\"cls\":\"white\",\"prob\":1,\"observed\":true}",
+                    i, 0.01 * i);
+      body += buf;
+    }
+    body += "]";
+    Scene s = must(head(body));
+    CHECK(s.dots.size() == static_cast<size_t>(kMaxDots),
+          "kMaxDots: parsed %zu, want %d", s.dots.size(), kMaxDots);
+  }
+
+  // 33. Malformed / missing prob or observed is dropped, not drawn at 1.0.
+  {
+    Scene s;
+    CHECK(parse_scene(head("\"dots\":[{\"x\":0,\"y\":10,\"cls\":\"white\",\"observed\":true}]"), s)
+              && s.dots.empty(),
+          "missing prob was accepted (n=%zu)", s.dots.size());
+    CHECK(parse_scene(head("\"dots\":[{\"x\":0,\"y\":10,\"cls\":\"white\",\"prob\":\"high\",\"observed\":true}]"), s)
+              && s.dots.empty(),
+          "string prob was accepted (n=%zu)", s.dots.size());
+    CHECK(parse_scene(head("\"dots\":[{\"x\":0,\"y\":10,\"cls\":\"white\",\"prob\":null,\"observed\":true}]"), s)
+              && s.dots.empty(),
+          "null prob was accepted (n=%zu)", s.dots.size());
+    CHECK(parse_scene(head("\"dots\":[{\"x\":0,\"y\":10,\"cls\":\"white\",\"prob\":0.5}]"), s)
+              && s.dots.empty(),
+          "missing observed was accepted (n=%zu)", s.dots.size());
+    CHECK(parse_scene(head("\"dots\":[{\"x\":0,\"y\":10,\"cls\":\"white\",\"prob\":1.5,\"observed\":true}]"), s)
+              && s.dots.size() == 1 && std::fabs(s.dots[0].prob - 1.f) < 1e-5,
+          "prob 1.5 was not clamped (n=%zu p=%.3f)", s.dots.size(), s.dots.empty() ? 0.f : s.dots[0].prob);
+  }
+
+  // 34. Incomplete pose does not invent fields; tracks stay ego-frame when a
+  // complete pose is present (only dots switch frame).
+  {
+    Scene s = must(head("\"ego\":{\"yaw\":1.5708},\"dots\":[{\"id\":1,\"x\":0,\"y\":28,\"cls\":\"white\",\"prob\":1,\"observed\":true}]"));
+    CHECK(!s.has_ego_pose, "partial pose (yaw only) set has_ego_pose");
+    Scene w = must(head("\"ego\":{\"x\":0,\"y\":8,\"yaw\":1.5708},"
+                        "\"tracks\":[{\"id\":1,\"cls\":\"vehicle\",\"x\":0,\"y\":14,\"yaw\":1.5708,\"l\":4.5,\"w\":1.85,\"h\":1.5}],"
+                        "\"dots\":[{\"id\":1,\"x\":0,\"y\":28,\"cls\":\"white\",\"prob\":1,\"observed\":true}]"));
+    CHECK(w.has_ego_pose && std::fabs(w.ego_y - 8.f) < 1e-3, "complete pose rejected");
+    Image with = shot(w, o);
+    Scene e = w;
+    e.has_ego_pose = false;
+    Image no = shot(e, o);
+    // The track at ego (0,14) must stay lit with the pose present. Previously
+    // world_to_ego moved it to (0,6) or off-screen (0 lit px).
+    CHECK(classify(with).lit > 40, "ego-frame track vanished once a pose was set (%ld lit)", classify(with).lit);
+    (void)no;
+    std::printf("frame: partial pose has_ego=%d  complete+track lit %ld\n", (int)s.has_ego_pose, classify(with).lit);
   }
 
   std::printf("%s (%d failures)\n", g_fail ? "FAILED" : "OK", g_fail);

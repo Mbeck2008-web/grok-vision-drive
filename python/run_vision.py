@@ -1855,6 +1855,8 @@ def main(clock=None) -> None:
             except (TypeError, ValueError):
                 last_infer_ms = None
             st["ego"]["speed_mps"] = ego_v
+            # Live ego x/y/yaw is not wired up yet (UNPROVEN). The C++ viz
+            # therefore keeps dots in the ego frame during a live drive.
             if not engaged and disengage_reason not in ("none", "not_engaged"):
                 last_refusal_reason = disengage_reason  # sticky; not_engaged never overwrites it
             elif engaged and not prev_engaged:

@@ -125,11 +125,18 @@ bool parse_scene(const std::string& text, Scene& out, std::string* err) {
     s.engaged = boolean(*it, "engaged", false);
     s.speed_mps = num(*it, "speed_mps", 0.f);
     s.set_mps = num(*it, "set_mps", -1.f);
-    if (it->contains("x") || it->contains("y") || it->contains("yaw")) {
-      s.has_ego_pose = true;
-      s.ego_x = num(*it, "x", 0.f);
-      s.ego_y = num(*it, "y", 0.f);
-      s.ego_yaw = num(*it, "yaw", 1.5707963f);
+    s.yaw_rate_rps = num(*it, "yaw_rate_rps", 0.f);
+    // All three pose fields must be present and finite; nothing is invented.
+    if (it->contains("x") && it->contains("y") && it->contains("yaw")) {
+      const float px = num(*it, "x", NAN);
+      const float py = num(*it, "y", NAN);
+      const float pyaw = num(*it, "yaw", NAN);
+      if (std::isfinite(px) && std::isfinite(py) && std::isfinite(pyaw)) {
+        s.has_ego_pose = true;
+        s.ego_x = px;
+        s.ego_y = py;
+        s.ego_yaw = pyaw;
+      }
     }
   }
   read_int(j, "lead_id", s.lead_id);
@@ -202,12 +209,27 @@ bool parse_scene(const std::string& text, Scene& out, std::string* err) {
         else if (c == "path") dot.cls = DotCls::Path;
         else continue;
       }
-      float pr = num(d, "prob", 1.f);
+      // Missing or non-numeric / non-finite prob, or missing / non-bool
+      // observed, drops the dot (it is not drawn at full brightness).
+      auto pit = d.find("prob");
+      if (pit == d.end() || !pit->is_number()) continue;
+      const double pr = pit->get<double>();
       if (!std::isfinite(pr)) continue;
-      dot.prob = std::clamp(pr, 0.f, 1.f);
-      if (d.contains("observed")) {
-        if (!d["observed"].is_boolean()) continue;
-        dot.observed = d["observed"].get<bool>();
+      dot.prob = std::clamp(static_cast<float>(pr), 0.f, 1.f);
+      auto oit = d.find("observed");
+      if (oit == d.end() || !oit->is_boolean()) continue;
+      dot.observed = oit->get<bool>();
+      if (d.contains("ijk")) {
+        const auto& ijk = d["ijk"];
+        if (!ijk.is_array() || ijk.size() != 3) continue;
+        int ii = 0, jj = 0, kk = 0;
+        if (!ijk[0].is_number_integer() || !ijk[1].is_number_integer() || !ijk[2].is_number_integer()) continue;
+        ii = ijk[0].get<int>();
+        jj = ijk[1].get<int>();
+        kk = ijk[2].get<int>();
+        dot.i = ii;
+        dot.j = jj;
+        dot.k = kk;
       }
       s.dots.push_back(dot);
     }

@@ -5,7 +5,7 @@
   its ctest pixel tests (white/yellow paint, no purple, red only edges, lead
   green, GT keys ignored, schema version enforced);
 * end to end: the Python publisher's scene file -> ``gvd_viz --offline`` PNG ->
-  pixels checked here, so the two sides of schema v1 agree.
+  pixels checked here, so the two sides of schema v2 agree.
 
 A host with no CMake or no C++ compiler skips visibly (skip_check). CI
 installs both, so CI always runs it. A build or test failure is a failure.

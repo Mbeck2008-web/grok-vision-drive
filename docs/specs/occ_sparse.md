@@ -19,7 +19,8 @@ visualizer (`gvd_scene` v1, `docs/specs/viz_cpp.md` @ f3555bf) through
 - No lane-paint colour, crosswalk or stop-line head in this branch (see
   "Outputs and their labels": UNLABELED / not exported).
 - No recorder change in this branch (recorder findings are listed, not applied).
-- Not wired into `scripts/live_*` yet: nothing on the live path imports it.
+- Not wired into `run_vision` yet: nothing on the live path imports it.
+- No dense fused grid anywhere, not even as a baseline (see "Where sparsity begins").
 
 ## Measurements that drove the design
 
@@ -103,9 +104,143 @@ What the numbers say:
 - **Trainer** `python/train/occ_train.py`: BCE occupancy, BCE coarse-any, CE class on
   occupied queries; AMP fp16 with GradScaler (`--amp fp16` forces it on Pascal).
 
+### Where sparsity begins
+
+Sparse end to end. The only dense tensors are the per-camera **2-D** image
+feature maps (64 ch at 1/8 of the input; 8.8 MiB fp32 for 8 cams at 640). There
+is no BEV plane and no 3-D volume. Fusion happens **at the sparse query points**:
+each 3-D point is projected into every camera and the bilinear features are
+averaged there (`SparseOccNet.query`). `predict` queries the visible 1.6 m
+coarse cells (5,044 of 327,680 for 8 cams), descends only under hot parents, and
+caps each stage. Stored labels are a sorted key vector (8-cam proxy 3.5% of the
+grid, one real camera 1.0%). `test_occ_cams.check_sparsity_begins` hooks every
+head layer and asserts no 3-D batch has more than `max_points` rows (worst case
+all-hot: largest batch 16,384 rows vs 327,680 dense; 37,812 points queried in
+total = 11.5% of dense); `test_occ_labels` prints stored vs grid cells. There is
+no dense baseline in this branch, so no crossover is claimed: a dense head would
+query 327,680 points per frame against 5,044 (all cold) to 37,812 (all hot,
+capped) here.
+
+### Cameras: presets, per-camera age, missing cameras
+
+GVD reports the recorder at 8 cams 10/10/10/2/2/1/1/1 Hz, 9.89 Hz overall, 0
+drops over 2 h (GVD-reported, used as the design input); the live 8-cam rate at
+the planner tick is unproven. So:
+
+- `CAM_PRESETS`: `min` = main+wide (minimum), `front3` = main+wide+narrow,
+  `all8`. One set of weights serves every preset (the encoder is shared).
+- `cam_weights(cam_ids, preset=, ages_s=)`: each camera carries its own frame
+  age (now minus its own timestamp; the live supervisor already has
+  `python.data.cam_hold.ages_vector`). Weight `exp(-age/0.5 s)`, 0 past 1.5 s, 0
+  for a missing/NaN/negative age. Fusion is the weighted mean over the cameras
+  that see a point; a zero-weight or `None` camera is not even encoded.
+- Training draws the same: main+wide always weight 1, each other camera dropped
+  with p = 0.3 or aged uniformly in [0, 1.5 s] (`train_cam_weights`, `--cam-drop`).
+- Tests (`test_occ_cams`): both presets give the same outputs as the same
+  weights built on only those cameras; at t = 0.95 s of the rig pattern main
+  weighs 0.90, pillarL 0.41, rear 0.15; a fully stale camera's pixels change
+  nothing; a partly stale camera counts less than a fresh one.
+
+### Profiles (GTX 1080 Ti shared with BeamNG)
+
+Pascal fp16 math is ~1/64 of fp32: **fp16 saves memory, not time**; no fp16
+speed claim is made. All profiles compute in fp32 (`--fp16` in the bench is a
+memory experiment only). int8 via TensorRT (DP4A) is the only precision speed-up
+on this card; it is **not implemented** (needs a calibration set and an accuracy
+delta vs fp32, both UNMEASURED; would add TensorRT as a dependency).
+
+| Profile | Net | Cameras @ input | Params | Memory ESTIMATE fp32 (MB): weights + feature cache (K=1) + encoder peak + queries = total |
+|---|---|---|---|---|
+| `1080ti` | default (32/64/96, feat 64, hidden 128) | all8 @ 640 | 165,542 | 0.6 + 8.8 + 14.1 + 276.8 = 300.2 |
+| `front3` | default | narrow, main, wide @ 640 | 165,542 | 0.6 + 3.2 + 14.1 + 276.8 = 294.7 |
+| `front_cluster` | default | main @ 800 + wide @ 640 | 165,542 | 0.6 + 2.7 + 22.0 + 276.8 = 302.1 |
+| `1080ti_cheap` | cheap (16/32/48, feat 32, hidden 64) | front3 @ 480 | 43,350 | 0.2 + 0.9 + 4.6 + 156.8 = 162.4 |
+| `1080ti_min` | cheap | main+wide @ 320 | 43,350 | 0.2 + 0.3 + 2.1 + 156.8 = 159.2 |
+
+These are arithmetic (`memory_estimate`), not measurements, and exclude the
+CUDA context and allocator slack. Temporal cache term is
+K x cams x C x H/8 x W/8 x bytes with K = 1: the net is single-frame; temporal
+state is the tracker (<= 64 tracks x 10 positions). A profile only "fits" after
+GVD posts `nvidia-smi` from Desktop-IQU45 with BeamNG running, minus 1 GB. The
+query term dominates and scales with `max_points` (65,536 default), so the
+cheapest memory knob is `max_points`, then the camera count.
+
+Michael's rule: drop input resolution before giving up same-tick camera sync.
+Input resolution is a bench knob (`--long-side`, `--sweep-long 640,480,320`).
+
+#### front_cluster vs front3 (measured, `scripts/compare_front_cluster.py`)
+
+Run 2026-11-17 00:09:31-00:24:08 CST on the loaded CPU box (loadavg 23-35 on 8
+cores; `ps` logged before/after). Same 16 synthetic train clips, same 8 held-out
+clips (one box 10-48 m ahead, |x| <= 4 m), seed 0, 150 steps, batch 4. Trained
+at 1/8 of the profile sizes (the 800/640 ratio kept). One seed, few far cells:
+**the differences are within noise; neither rig is shown better.**
+
+| Rig | Input (trained / full) | Params | Mem ESTIMATE full size | Held-out query IoU | Vehicle recall < 30 m (159 cells) | >= 30 m (86 cells) |
+|---|---|---|---|---|---|---|
+| front_cluster | main 100x75 + wide 80x45 / main 800x600 + wide 640x360 | 165,542 | 302.1 MB | 0.861 | 0.447 | 0.547 |
+| front3 | narrow, main 80x60 + wide 80x45 / 3 cams @640 | 165,542 | 294.7 MB | 0.855 | 0.409 | 0.593 |
+
+Train loss 1.667 -> 0.102 (front_cluster) and 1.667 -> 0.106 (front3). The real
+question (narrow's 800 m far plane vs a sharper main at range) needs recorded
+held-out clips at full size on IQU45; the script is ready for it once
+shards of real clips exist.
+
+### Checkpoints: what stays loadable
+
+`save_checkpoint` stores the weights plus `net_spec` (channels, feat, hidden,
+levels, classes, PE). `load_checkpoint` is strict.
+
+- **Loadable** (no retrain; tested, forward runs): input resolution, camera
+  count/preset/ages (shared encoder; camera poses and intrinsics are
+  non-persistent buffers), grid range and voxel size (queries are continuous
+  points; the head is resolution-agnostic, though the PE normalises by the grid
+  box so a different box shifts the encoding and wants a fine-tune), tracker
+  frames (`MIN_FRAMES`, not weights).
+- **Retrain** (refused with `CheckpointMismatch` naming the knob, nothing
+  loaded): encoder width (channels), depth (number of stages), `feat`,
+  `hidden`, the `cheap` config, levels, class count.
+
+### Ego motion (temporal warp)
+
+Runtime default is **camera-only VO** (`python/perception/occ_ego.py`): the
+static non-drivable, non-vehicle BEV cells of the previous prediction are
+registered onto the current one by a coarse-to-fine search over forward travel
+(-1..4 m/frame) and yaw (+-0.15 rad/frame). `--ego-from-vehicle` (default
+**OFF**, GVD ruling) switches to the car's own wheel speed + IMU yaw rate, read
+only through `VEHICLE_SIGNAL_KEYS = (wheelspeed_mps, imu_yaw_rate)`; the BeamNG
+mapping (`electrics.wheelspeed`, an IMU gyro z) is **for GVD to confirm**.
+BeamNG GT pose, scenetree, `state.jsonl` ego rows: training labels only.
+
+Measured on the synthetic static world (ego 15 m/s, 0.2 rad/s, 10 Hz, flag
+off): per-frame forward error <= 0.10 m, yaw error < 0.0025 rad; pose drift
+0.10, 0.10, 0.20, 0.15, 0.15, 0.20, 0.25, 0.25, 0.30 m over 13.5 m driven
+(2.2%); 99% of static cells land on their true world cell (+-1) every frame vs
+1% with no warp. Limitation: a featureless straight road has no forward
+constraint; the estimate is held and flagged `motion_ok = False`.
+
+Tests: `test_occ_ego` (VO, world-fixed cells with the flag off, non-identity
+warp, drift printout), `test_occ_runtime_imports` (no GT-pose module reachable
+from the occupancy runtime, no pose-reading identifier in its source, beamngpy
+not loaded, flag defaults off, a spy mapping proves the default path reads no
+vehicle key and the flag path only the two signals, and a guard that raises on
+any camera-array access runs through `runtime_frame -> occ_to_viz -> encode ->
+planner stub`).
+
+### Heads vs the AC (deviation)
+
+The net has explicit **occupancy** (+ coarse "any") and **semantic class**
+heads. Road edges and objects are **derived** from occupancy (edges: drivable
+-> other transitions; objects: vehicle clusters) and motion comes from the
+tracker. There is no lane / paint / crosswalk / stop-line head. Reason: the
+per-frame labels for them are not packed in this branch (paint material and
+`stoplines.jsonl` exist offline only), and an untrained head would be a head
+trained on nothing. `lanes` pass through from the existing lane head when the
+caller supplies them; paint colour stays UNLABELED.
+
 ## Outputs and their labels (viz contract)
 
-`occ_outputs.occ_outputs(pred, tracker, t, ...)` -> `occ_viz.occ_to_viz` -> `gvd_scene` v1. Every v1
+`occ_ego.runtime_frame(pred, tracker, ego, t)` (= `EgoMotion` -> `occ_outputs`) -> `occ_viz.occ_to_viz` -> `gvd_scene` v1. Every v1
 required key is always present (`v, type, seq, t, ego, aeb, lanes, edges, tracks,
 signs, path, path_conf`); the C++ parser ignores the optional keys below.
 
@@ -117,7 +252,7 @@ signs, path, path_conf`); the C++ parser ignores the optional keys below.
 | Lane lines + paint | `lanes[]` `{pts, paint, color}` | pass-through of an existing lane head when the caller supplies one; paint is `yellow` only if the record says yellow, else `white` | paint materials `line_white`/`line_yellow`... in `painted_lanes.LANE_LINE_MATERIALS` exist, but no head in this branch predicts colour | **paint colour UNLABELED** (no runtime head) |
 | Crosswalks / stop lines | optional `crosswalks[]`, `stop_lines[]` `{pts, color:"white"}` | adapter accepts them if a caller supplies them | `stoplines.jsonl` (`scripts/label_stoplines.py`) exists offline | **not exported**: no runtime head |
 | Objects | `tracks[]` `{id, cls, x, y, yaw, l, w, h, v, motion, color}` | `objects`: 8-connected BEV clusters of vehicle cells, PCA footprint/heading (`yaw_src: pca`), velocity heading once tracked (`yaw_src: track`) | traffic rows (`tags.traffic`) + vehicle sem cells | derived from occupancy |
-| Motion state | optional `tracks[].motion` = `same_way|oncoming|crossing|alongside|parked|unknown` | `OccTracker`: nearest-neighbour association (3 m gate, 2 misses), ego-motion compensated (speed, yaw rate), least-squares velocity over >= 3 frames; `unknown` before 3 frames | per-tick traffic rows positions over time (offline, for evaluation) | multi-frame tracker, never one frame |
+| Motion state | optional `tracks[].motion` = `same_way|oncoming|crossing|alongside|parked|unknown` | `OccTracker`: nearest-neighbour association (3 m gate, 2 misses), ego-motion compensated (camera VO by default), least-squares velocity over >= 3 frames; `unknown` before 3 frames | per-tick traffic rows positions over time (offline, for evaluation) | multi-frame tracker, never one frame |
 
 Motion rule (`motion_state`, ego frame, world velocity after ego-motion
 compensation; angle 0 = ego heading): speed < 0.7 m/s -> `parked`; angle <= 35 deg
@@ -133,11 +268,11 @@ Crosswalks and stop lines white.
 ## Files
 
 New: `python/perception/occ_geometry.py`, `python/perception/occ_sparse.py`,
-`python/perception/occ_outputs.py`, `python/viz/occ_viz.py`,
+`python/perception/occ_outputs.py`, `python/perception/occ_ego.py`, `python/viz/occ_viz.py`,
 `python/train/occ_labels.py`, `python/train/occ_sampler.py`,
 `python/train/occ_train.py`, `python/data/occ_shards.py`,
-`scripts/bench_occ_sparse.py`, `tests/synthetic_occ.py`, tests
-`scripts/test_occ_{labels,shards,sampler,net,runtime_imports,viz}.py`,
+`scripts/bench_occ_sparse.py`, `scripts/compare_front_cluster.py`, `tests/synthetic_occ.py`, tests
+`scripts/test_occ_{labels,shards,sampler,net,cams,ego,runtime_imports,viz}.py`,
 `scripts/test_bench_occ_sparse.py`, this spec. No existing file is modified (the
 offline suite picks up `scripts/test_*.py` itself).
 
@@ -149,20 +284,28 @@ python scripts/test_occ_labels.py      # geometry, 8 cams, boxes, invalid depth,
 python scripts/test_occ_shards.py      # roundtrip, no loose-PNG fallback, rollover, CLI
 python scripts/test_occ_sampler.py     # 20-30% recovery per batch, enforced
 python scripts/test_occ_net.py         # projection, camera-only, sparse predict, overfit
-python scripts/test_occ_runtime_imports.py  # GT modules not reachable from live entry points
+python scripts/test_occ_cams.py        # presets, per-cam ages, sparsity begins, checkpoints, profiles
+python scripts/test_occ_ego.py         # camera VO, static world stays fixed with the flag off
+python scripts/test_occ_runtime_imports.py  # GT label/pose modules unreachable, flag off, spy, image guard
 python scripts/test_occ_viz.py         # edges vs synthetic road, tracker cases, v1 message, red rule
 ```
 
-Desktop-IQU45 (real VRAM, GTX 1080 Ti; note what else holds the GPU):
+Desktop-IQU45 (real VRAM and FPS, GTX 1080 Ti, BeamNG running; note what else holds the GPU):
 
 ```
-py -3 scripts/bench_occ_sparse.py --device cuda --long-side 640 --fp16 --iters 20 --warmup 3 --samples 16 --steps 20 --batch 4 --amp fp16 --workers 4
+py -3 scripts/bench_occ_sparse.py --device cuda --profile 1080ti --iters 20 --warmup 3 --samples 16 --steps 20 --batch 4 --amp fp16 --workers 4
+py -3 scripts/bench_occ_sparse.py --device cuda --sweep --iters 20 --warmup 3
+py -3 scripts/bench_occ_sparse.py --device cuda --profile front_cluster --infer-only --iters 20 --warmup 3
+nvidia-smi --query-gpu=memory.used,memory.total --format=csv
 ```
 
-`infer_cuda_max_allocated_mb` = fp16 inference peak with all 8 cams at 640 (untrained
-net, caps hit: worst case); `train_cuda_max_allocated_mb` = AMP training peak.
-Acceptance: inference <= 4096 MB, training <= 11264 MB. If `train_wait_ms_median`
-is a large share of `train_compute_ms_median`, raise `--workers`.
+Each run ends with a `SUMMARY` line: `fps=` next to `infer_vram_mb=` (8 cams @640
+for `--profile 1080ti`), `mem_est_mb=` (arithmetic estimate), and for a training
+run `train_vram_mb=` (AMP: memory saving only on Pascal). The sweep covers net
+(default/cheap) x cameras (all8/front3/min) x long side (640/480/320) x fp32/fp16.
+Acceptance: inference <= 4096 MB and (VRAM free with BeamNG running - 1 GB);
+training <= 11264 MB. If `train_wait_ms` is a large share of `train_compute_ms`,
+raise `--workers`.
 
 Real data: `python -m python.data.occ_shards <recording> <nvme>/occ_shards/<name>`
 then `python -m python.train.occ_train <nvme>/occ_shards --out <ckpt> --amp fp16`.
@@ -173,5 +316,10 @@ then `python -m python.train.occ_train <nvme>/occ_shards --out <ckpt> --amp fp16
 - 8-cam labels need `train_gt` on all 8 cams in the recorder (today main + wide
   only: +6.6 GB/h more if all 8 are turned on at rig rates).
 - PCA heading is +-pi ambiguous for a parked car until it moves.
+- Camera VO needs static non-road structure; on a bare straight road it holds
+  the last estimate (flagged). Not yet measured on recorded clips.
+- Rig geometry is read through `raw_frames.camera_sidecar`, which loads the live
+  camera client module (it references beamngpy lazily); the occupancy modules
+  themselves never import beamngpy or a pose source (tested).
 - Untrained `predict` hits the per-stage caps (33.9% of dense queried); a trained
   net queries fewer, the oracle says 10-33%.

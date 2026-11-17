@@ -91,6 +91,8 @@ def run(a: argparse.Namespace) -> dict:
         pr = PROFILES[a.profile]
         a.net, a.long_side, a.cam_preset = pr["config"], pr["long_side"], pr["cams"]
         a.fp16 = a.fp16 and pr["compute"] != "fp32"
+        a.max_points = pr["max_points"]
+        a.max_coarse = pr["max_coarse"]
     from python.train.occ_labels import build_occ_labels
     from python.train.occ_train import train
     from synthetic_occ import SEM_CLASSES, render
@@ -113,7 +115,8 @@ def run(a: argparse.Namespace) -> dict:
     net = SparseOccNet(cams, config=a.net).to(dev).eval()
     out["params"] = int(sum(p.numel() for p in net.parameters()))
     out["cam_res"] = {c.cam_id: [c.width, c.height] for c in cams}
-    out["mem_estimate_mb_fp32"] = memory_estimate(cams, config=a.net)  # arithmetic ESTIMATE, not measured
+    out["mem_estimate_mb_fp32"] = memory_estimate(cams, config=a.net, max_points=a.max_points)
+    out["max_points"], out["max_coarse"] = a.max_points, a.max_coarse  # arithmetic ESTIMATE, not measured
     imgs = [torch.rand(1, 3, c.height, c.width, device=dev) for c in cams]
     pts = torch.rand(1, a.queries, 3, device=dev) * torch.tensor([51.2, 64.0, 6.4], device=dev) + torch.tensor([-25.6, -12.8, -2.0], device=dev)
     out["act_bytes_fp32_queries"] = activation_bytes(net, imgs, pts)
@@ -126,7 +129,7 @@ def run(a: argparse.Namespace) -> dict:
     with torch.no_grad(), torch.autocast(device_type=dev.type, dtype=torch.float16, enabled=use_half):
         for i in range(a.warmup + a.iters):
             t = time.perf_counter()
-            last = net.predict(imgs)
+            last = net.predict(imgs, max_points=a.max_points, max_coarse=a.max_coarse)
             if dev.type == "cuda":
                 torch.cuda.synchronize(dev)
             if i >= a.warmup:
@@ -137,6 +140,12 @@ def run(a: argparse.Namespace) -> dict:
     out["infer_fps"] = 1000.0 / out["infer_ms_median"]
     out["infer_n_coarse"], out["infer_n_fine"] = int(last.n_coarse), int(last.n_fine)
     out["infer_queried_ratio"] = float(last.queried_ratio())
+    out["infer_stage_queries"] = list(last.stage_queries)
+    from python.perception.occ_sparse import visible_mask
+
+    fine = net.grid.centers_of_keys(np.arange(net.grid.dense_cells))
+    out["frustum_fine_cells"] = int(visible_mask(cams, fine).sum())
+    out["grid_cells"] = int(net.grid.dense_cells)
     if dev.type == "cuda":
         out["infer_cuda_max_allocated_mb"] = torch.cuda.max_memory_allocated(dev) / 2 ** 20
     if a.infer_only:
@@ -198,6 +207,8 @@ def main(argv=None) -> int:
     ap.add_argument("--profile", default="", choices=("", "1080ti", "1080ti_cheap", "1080ti_min"),
                     help="sets --net, --long-side, --cam-preset; fp32 compute")
     ap.add_argument("--queries", type=int, default=8192)
+    ap.add_argument("--max-points", type=int, default=65536, help="per-stage top-k cap in predict")
+    ap.add_argument("--max-coarse", type=int, default=2048, help="absolute cap on the top coarse stage")
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--fp16", action="store_true", help="fp16 autocast for inference (CUDA only)")
@@ -225,6 +236,7 @@ def main(argv=None) -> int:
                     b = argparse.Namespace(**vars(a))
                     b.net, b.cam_preset, b.long_side, b.fp16, b.infer_only, b.cams = net, preset, long_side, fp16, True, ""
                     b.profile = ""
+                    b.max_points, b.max_coarse = a.max_points, a.max_coarse
                     res = run(b)
                     rows.append(res)
                     print(summary(res), flush=True)
@@ -240,6 +252,7 @@ def summary(res: dict) -> str:
             f"({','.join(res['cams'])}) long={res['long_side']} fp16={res['infer_fp16']} "
             f"infer_ms={res['infer_ms_median']:.1f} fps={res['infer_fps']:.2f} "
             f"infer_vram_mb={'n/a (no CUDA)' if vram is None else f'{vram:.0f}'} "
+            f"stages={res['infer_stage_queries']} frustum={res['frustum_fine_cells']} grid={res['grid_cells']} "
             f"queried/dense={res['infer_queried_ratio']:.3f} mem_est_mb={res['mem_estimate_mb_fp32']['total_mb']:.0f}(estimate)"
             + ("" if "train_compute_ms_median" not in res else
                f" train_vram_mb={'n/a (no CUDA)' if tr is None else f'{tr:.0f}'} train_amp={res['train_amp']}"

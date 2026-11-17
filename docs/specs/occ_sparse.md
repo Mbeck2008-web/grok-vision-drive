@@ -112,7 +112,7 @@ is no BEV plane and no 3-D volume. Fusion happens **at the sparse query points**
 each 3-D point is projected into every camera and the bilinear features are
 averaged there (`SparseOccNet.query`). `predict` queries the visible 1.6 m
 coarse cells (5,044 of 327,680 for 8 cams), descends only under hot parents, and
-caps each stage. Stored labels are a sorted key vector (8-cam proxy 3.5% of the
+caps each stage (absolute caps below). Stored labels are a sorted key vector (8-cam proxy 3.5% of the
 grid, one real camera 1.0%). `test_occ_cams.check_sparsity_begins` hooks every
 head layer and asserts no 3-D batch has more than `max_points` rows (worst case
 all-hot: largest batch 16,384 rows vs 327,680 dense; 37,812 points queried in
@@ -121,24 +121,38 @@ no dense baseline in this branch, so no crossover is claimed: a dense head would
 query 327,680 points per frame against 5,044 (all cold) to 37,812 (all hot,
 capped) here.
 
-Per-stage counts (`test_occ_cams.check_stage_counts`, 8 cams, `max_points` 16,384,
-grid 327,680 cells; untrained head forced cold / random / all-hot):
+Every stage has an absolute cap (`1080ti` profile: `max_coarse` 2,048 on the top
+stage, `max_points` 16,384 top-k per later stage). The top stage queries last
+frame's hot top cells first (sparse temporal carry, <= half the cap) and then a
+rotating stride subset of the visible coarse cells, so each one is revisited
+within ceil(visible / cap) frames (tested: cap 1,000, 5,044 cells swept in 6
+frames). There is no ray x depth-bin lifting at all: 3-D points are queried, and
+each later stage keeps only the top-k children by probability above the
+threshold.
 
-| Stage | cold | random head | all-hot |
-|---|---|---|---|
-| fusion + query, 4x coarse (1.6 m) | 5,044 (1.54%) | 5,044 (1.54%) | 5,044 (1.54%) |
-| fusion + query, 2x coarse | 0 | 16,384 (5.0%) | 16,384 (5.0%) |
-| fusion + query, fine (0.4 m) | 0 | 16,384 (5.0%) | 16,384 (5.0%) |
-| head output stored (cells) | 0 | 15,324 (4.7%) | 16,384 (5.0%) |
-| temporal memory: VO static BEV keys | 0 | 3,363 | 1,024 |
-| temporal memory: tracker | 0 tracks | 0 tracks | 0 tracks (<= 64 x 10 positions) |
+Per stage at 8 cameras (fine frustum = 322,331 cells visible to some camera at
+the `1080ti` rig; full grid 327,680), `test_occ_cams.check_stage_counts`,
+untrained head forced cold / random / all-hot, first frame:
 
-Plainly: the top level is a sweep of every visible 1.6 m cell (5,044 points,
-1.54% of the fine grid). It is a query list, not a stored volume: the per-point
-features are dropped after the head and only hot cells descend. Temporal memory
-is the tracker's track list and the previous frame's sorted static BEV cell keys
-for VO (no raster: lookup by `np.searchsorted`). No tensor or array the size of
-the grid (3-D or BEV) is allocated at runtime.
+| Stage | cap | cold | random head | all-hot |
+|---|---|---|---|---|
+| fusion + query, 4x coarse (1.6 m) | 2,048 | 1,682 | 1,682 | 1,682 |
+| fusion + query, 2x coarse | 16,384 | 0 | 13,456 | 13,456 |
+| fusion + query, fine (0.4 m) | 16,384 | 0 | 16,384 | 16,384 |
+| head output stored (cells) | <= fine | 0 | 14,567 | 16,384 |
+| temporal memory: VO static BEV keys | <= stored | 0 | 5,244 | 3,072 |
+| temporal memory: carried hot top cells | 1,024 | 0 | <= 1,024 | <= 1,024 |
+| temporal memory: tracker | 64 x 10 | 0 | 0 tracks | 0 tracks |
+
+Every post-backbone tensor is counted with a `TorchDispatchMode` over all aten
+ops after the encoder (1,749 op outputs in that run): largest dimension 16,384
+(the cap), largest numel 2,097,152 (16,384 rows x 128 hidden); no tensor has a
+grid- or frustum-sized dimension. The candidate list of visible top cells is
+built once per camera set (enumerating the 5,120 coarse indices), cached, and is
+an index list, not a feature volume. Temporal memory is the carried hot top-cell
+indices, the previous frame's sorted static BEV keys for VO (no raster:
+`np.searchsorted`), and the tracker's track list. No array the size of the grid
+(3-D or BEV) is allocated at runtime.
 
 ### Cameras: presets, per-camera age, missing cameras
 

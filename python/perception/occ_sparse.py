@@ -60,19 +60,23 @@ CAM_PRESETS = {
 }
 # Run profiles for the GTX 1080 Ti shared with BeamNG. Compute is fp32: Pascal
 # fp16 math is ~1/64 of fp32, so fp16 is a memory option only, never a speed
-# claim. int8 (TensorRT, DP4A) is the only precision speed-up on this card and is
+# claim. ``max_points`` is the per-stage top-k cap on the descent (16,384 = 5% of
+# the grid, 5.1% of the 8-camera fine frustum). int8 (TensorRT, DP4A) is the only precision speed-up on this card and is
 # NOT implemented: it would need a calibration set and an accuracy delta vs fp32
 # (both UNMEASURED) and adds TensorRT as a dependency.
 PROFILES = {
-    "1080ti": {"config": "default", "long_side": 640, "cams": "all8", "compute": "fp32"},
-    "1080ti_cheap": {"config": "cheap", "long_side": 480, "cams": "front3", "compute": "fp32"},
-    "1080ti_min": {"config": "cheap", "long_side": 320, "cams": "min", "compute": "fp32"},
+    "1080ti": {"config": "default", "long_side": 640, "cams": "all8", "compute": "fp32", "max_points": 16384, "max_coarse": 2048},
+    "1080ti_cheap": {"config": "cheap", "long_side": 480, "cams": "front3", "compute": "fp32", "max_points": 16384, "max_coarse": 2048},
+    "1080ti_min": {"config": "cheap", "long_side": 320, "cams": "min", "compute": "fp32", "max_points": 16384, "max_coarse": 2048},
     # Michael's front_cluster knob: main+wide only, main at a higher resolution,
     # against front3 (main+wide+narrow, all at 640). Trade-off measured by
     # scripts/compare_front_cluster.py.
-    "front_cluster": {"config": "default", "long_side": 640, "main_long_side": 800, "cams": "min", "compute": "fp32"},
-    "front3": {"config": "default", "long_side": 640, "cams": "front3", "compute": "fp32"},
+    "front_cluster": {"config": "default", "long_side": 640, "main_long_side": 800, "cams": "min", "compute": "fp32", "max_points": 16384, "max_coarse": 2048},
+    "front3": {"config": "default", "long_side": 640, "cams": "front3", "compute": "fp32", "max_points": 16384, "max_coarse": 2048},
 }
+# Absolute cap on the top (4x coarse) stage. 8 cams see 5,044 of the 5,120 top
+# cells; the cap keeps that stage from scaling with the grid.
+MAX_COARSE = 2048
 # Per-camera age weight: exp(-age / tau), 0 past max age (or no frame).
 AGE_TAU_S = 0.5
 AGE_MAX_S = 1.5
@@ -262,6 +266,11 @@ if nn is not None:
         def forward(self, images: Sequence[Any], pts: Any, cam_w: Any = None) -> dict[str, Any]:
             return self.query(self.encode(images), pts, cam_w)
 
+        def reset_temporal(self) -> None:
+            """Forget the carried hot top cells and the sweep phase (scene cut, teleport, tests)."""
+            self.__dict__.pop("_hot_top", None)
+            self.__dict__.pop("_sweep_phase", None)
+
         @torch.no_grad()
         def predict(
             self,
@@ -270,12 +279,17 @@ if nn is not None:
             coarse_thresh: float = COARSE_THRESH,
             fine_thresh: float = FINE_THRESH,
             max_points: int = 65536,
+            max_coarse: int = MAX_COARSE,
             cam_w: Any = None,
         ) -> OccPrediction:
             """Coarse-to-fine sparse occupancy for one frame (batch 1).
 
-            Each stage queries at most ``max_points`` points (the hottest cells
-            are kept), so the worst case is bounded too.
+            Every stage has an absolute cap. The top (4x) stage queries at most
+            ``max_coarse`` of the visible coarse cells: last frame's hot top
+            cells first (sparse temporal carry, <= half the cap), then a
+            rotating stride subset of the rest, so every visible coarse cell is
+            revisited within ``ceil(visible / cap)`` frames. Each later stage
+            keeps the top-``max_points`` children by probability.
             """
             grid = self.grid
             w = np.array([img is not None for img in images], dtype=np.float32)
@@ -288,7 +302,18 @@ if nn is not None:
                 cpts = top.centers_of_keys(np.arange(top.dense_cells))
                 on = [c for c, a in zip(self.cams, active) if a]
                 cache[active] = (cpts[visible_mask(on, cpts)] if on else cpts[:0]).astype(np.float32)
-            self._coarse_pts = cache[active]
+            cands = cache[active]
+            cap0 = max(1, int(max_coarse))
+            if cands.shape[0] > cap0:
+                carry = self.__dict__.get("_hot_top", {}).get(active, np.zeros((0,), np.int64))[: cap0 // 2]
+                rest = np.setdiff1d(np.arange(cands.shape[0]), carry)
+                stride = int(np.ceil(rest.shape[0] / float(cap0 - carry.shape[0])))
+                phase = self.__dict__.setdefault("_sweep_phase", {}).get(active, 0) % stride
+                self._sweep_phase[active] = phase + 1
+                idx = np.concatenate([carry, rest[phase::stride]])[:cap0]
+            else:
+                idx = np.arange(cands.shape[0])
+            self._coarse_pts = cands[idx]
             dev = self.cam_pos.device
             feats = self.encode(images, w)
             cw = torch.from_numpy(w).to(dev)
@@ -303,6 +328,9 @@ if nn is not None:
                 stages.append(int(pts.shape[0]))
                 p_any = torch.sigmoid(self.query(feats, torch.from_numpy(pts).to(dev).unsqueeze(0), cw)["any"][0, :, li].float()).cpu().numpy()
                 sel = p_any >= float(coarse_thresh)
+                if li == 0:  # remember this frame's hot top cells (indices into the candidate list)
+                    hot_idx = idx[sel][np.argsort(-p_any[sel], kind="stable")]
+                    self.__dict__.setdefault("_hot_top", {})[active] = hot_idx.astype(np.int64)
                 hot, p_hot = pts[sel], p_any[sel]
                 nxt = LEVELS[li + 1] if li + 1 < len(LEVELS) else 1
                 offs = children_offsets(f // nxt, grid.voxel_m * nxt)

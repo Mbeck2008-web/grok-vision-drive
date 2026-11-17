@@ -89,20 +89,42 @@ def check_sparse_predict() -> None:
             net.head[-1].bias[2] = any1
 
     bias(10.0, 10.0)  # every cell hot at both levels: worst case, uncapped
-    hot = net.predict(imgs, max_points=10 ** 9)
+    U = 10 ** 9  # uncapped top stage for the exact-count checks; the capped sweep is checked below
+    hot = net.predict(imgs, max_points=10 ** 9, max_coarse=U)
     assert hot.n_coarse == vis + vis * 8, (hot.n_coarse, vis)
     assert hot.n_fine == vis * 64, (hot.n_fine, vis)
     bias(-10.0, 10.0)  # top level cold: nothing below it is queried
-    cold = net.predict(imgs)
+    cold = net.predict(imgs, max_coarse=U)
     assert cold.n_coarse == vis and cold.n_fine == 0 and cold.keys.size == 0, (cold.n_coarse, cold.n_fine)
     assert cold.queried_ratio() < 0.02, cold.queried_ratio()
     bias(10.0, -10.0)  # middle level cold: no fine query
-    mid = net.predict(imgs)
+    mid = net.predict(imgs, max_coarse=U)
     assert mid.n_fine == 0 and mid.n_coarse == vis + min(vis, 65536 // 8) * 8, (mid.n_coarse, vis)
     bias(10.0, 10.0)
-    capped = net.predict(imgs, max_points=8192)
+    capped = net.predict(imgs, max_points=8192, max_coarse=U)
     assert capped.n_fine <= 8192 and capped.n_coarse <= vis + 8192, (capped.n_coarse, capped.n_fine)
     assert capped.queried_ratio() < 0.1, capped.queried_ratio()
+    # absolute cap on the top stage: <= cap per frame, every visible coarse cell revisited
+    net.reset_temporal()
+    bias(-10.0, -10.0)
+    cap = 1000
+    seen_top: set = set()
+    frames = int(np.ceil(vis / cap)) + 1
+    for _ in range(frames):
+        pr = net.predict(imgs, max_coarse=cap)
+        assert pr.stage_queries[0] <= cap, pr.stage_queries
+        seen_top.update(map(tuple, np.round(net._coarse_pts, 2).tolist()))
+    assert len(seen_top) == vis, (len(seen_top), vis, frames)
+    # hot top cells are carried into the next frame first
+    net.reset_temporal()
+    bias(10.0, -10.0)
+    net.predict(imgs, max_coarse=cap)
+    first = {tuple(p) for p in np.round(net._coarse_pts, 2).tolist()}
+    net.predict(imgs, max_coarse=cap)
+    second = {tuple(p) for p in np.round(net._coarse_pts, 2).tolist()}
+    assert len(first & second) >= cap // 2, len(first & second)
+    net.reset_temporal()
+    print(f"top-stage cap: {cap}/frame, all {vis} visible coarse cells swept in {frames} frames, hot cells carried OK")
     print(f"sparse predict: cold {cold.n_queried} pts ({cold.queried_ratio():.4f} of dense), "
           f"capped {capped.n_queried} ({capped.queried_ratio():.4f}), uncapped all-hot {hot.n_queried} OK")
 
@@ -160,7 +182,9 @@ def check_overfit(tmp: Path) -> None:
     # The trained net's sparse predict on the training scene, cell level.
     net = res["net"].eval()
     imgs = [torch.from_numpy(prep_image(render(full[c.cam_id].scaled(128))[2], c)).unsqueeze(0) for c in cams]
-    pred = net.predict(imgs)
+    net.reset_temporal()
+    for _ in range(3):  # capped top stage (2048 of the visible coarse cells): let the sweep + hot carry settle
+        pred = net.predict(imgs)
     lab = build_occ_labels({c: render(full[c].scaled(128))[:2] for c in ids}, {c: full[c].scaled(128) for c in ids},
                            sem_classes=SEM_CLASSES, stride=1)
     observed = np.union1d(lab.keys, G.keys_of(lab.free.astype(np.float64)))

@@ -78,6 +78,7 @@ def check_presets() -> None:
             assert torch.allclose(a[k], b[k], atol=1e-5) and torch.allclose(c_[k], b[k], atol=1e-5), (preset, k)
         seen = float(b["seen"].mean())
         assert 0.0 < seen < seen_all, (preset, seen, seen_all)
+        sub.reset_temporal(); full.reset_temporal()
         p_sub = sub.predict(sub_imgs, max_points=4096)
         p_full = full.predict(masked_imgs, max_points=4096)
         assert p_full.n_coarse == p_sub.n_coarse and np.array_equal(p_full.keys, p_sub.keys), preset
@@ -127,9 +128,11 @@ def check_ages() -> None:
     assert moved > 1e-4, moved
     calls: list[int] = []
     hk = net.encoder.register_forward_hook(lambda _m, _i, _o: calls.append(1))
+    net.reset_temporal()
     pred = net.predict(imgs, cam_w=wm, max_points=4096)
     hk.remove()
     assert len(calls) == int((wm > 0).sum()) == 7, (len(calls), wm)  # the stale cam is not even encoded
+    net.reset_temporal()
     pred_pert = net.predict([im if k != k_stale else torch.zeros_like(im) for k, im in enumerate(imgs)], cam_w=wm, max_points=4096)
     assert np.array_equal(pred.keys, pred_pert.keys) and pred.n_queried == pred_pert.n_queried
     # training draws the same kind of weights: main+wide always 1, others dropped or aged
@@ -156,9 +159,43 @@ def check_sparsity_begins() -> None:
     for h in hooks:
         h.remove()
     dense = DEFAULT_GRID.dense_cells
-    assert max(rows) <= 16384 + 8 and max(rows) < dense / 10, (max(rows), dense)
+    from python.perception.occ_sparse import visible_mask
+    frustum = int(visible_mask(cams, DEFAULT_GRID.centers_of_keys(np.arange(dense))).sum())
+    # no post-backbone tensor carries the grid or the camera frustum: largest point batch is the top-k cap
+    assert max(rows) <= 16384 + 8 and max(rows) < dense / 10 and max(rows) < frustum / 10, (max(rows), frustum, dense)
     assert all(len(s) == 4 for s in fmaps) and len(fmaps) == 8  # 2-D maps per camera, no 3-D volume
-    print(f"sparsity begins at the query set: largest 3-D query batch {max(rows)} rows vs dense grid {dense}; "
+    # EVERY post-backbone tensor (all aten ops after the encoder, coarse passes included), counted
+    from torch.utils._python_dispatch import TorchDispatchMode
+    from torch.utils._pytree import tree_leaves
+
+    feats = net.encode(imgs)
+    shapes: list[tuple[int, ...]] = []
+
+    class Rec(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            out = func(*args, **(kwargs or {}))
+            shapes.extend(tuple(t.shape) for t in tree_leaves(out) if isinstance(t, torch.Tensor))
+            return out
+
+    enc = net.encode
+    net.encode = lambda images, cam_w=None: [f if (cam_w is None or cam_w[k] > 0) else None for k, f in enumerate(feats)]
+    try:
+        net.reset_temporal()
+        with Rec():
+            capped = net.predict(imgs, max_points=16384, max_coarse=2048)
+    finally:
+        net.encode = enc
+    cap_rows = 16384
+    big_dim = max(max(s_) if s_ else 0 for s_ in shapes)
+    big_numel = max(int(np.prod(s_)) if s_ else 0 for s_ in shapes)
+    assert big_dim <= cap_rows, big_dim
+    assert big_numel <= cap_rows * 256, big_numel  # rows x (feat + PE + seen) at most; never grid- or frustum-sized rows
+    assert capped.stage_queries[0] <= 2048 and all(q <= cap_rows for q in capped.stage_queries), capped.stage_queries
+    print(f"every post-backbone tensor ({len(shapes)} op outputs): largest dim {big_dim} <= cap {cap_rows}, "
+          f"largest numel {big_numel}; per stage active {list(capped.stage_queries)} vs frustum {frustum} vs grid {dense} "
+          f"(top stage capped at 2048 of 5,044 visible coarse cells) OK")
+    print(f"sparsity begins at the query set: largest 3-D query batch {max(rows)} rows vs fine frustum {frustum} "
+          f"vs dense grid {dense}; "
           f"queried {pred.n_queried} ({pred.queried_ratio():.4f} of dense); dense tensors are 8 2-D feature maps only OK")
 
 
@@ -179,6 +216,7 @@ def check_stage_counts() -> None:
             net.head[-1].bias[0], net.head[-1].bias[1], net.head[-1].bias[2] = occ, any0, any1
             if name == "half":  # data-dependent: let the random weights decide
                 torch.manual_seed(3); net.head[-1].reset_parameters()
+        net.reset_temporal()
         pred = net.predict(imgs, max_points=16384)
         tr, ego = OccTracker(), EgoMotion()
         out = runtime_frame(pred, tr, ego, 0.0)
@@ -239,7 +277,7 @@ def check_checkpoints(tmp: Path) -> None:
         pass
     else:
         raise AssertionError("a checkpoint without a spec loaded")
-    assert all(p["compute"] == "fp32" for p in PROFILES.values())
+    assert all(p["compute"] == "fp32" and p["max_points"] <= 0.05 * DEFAULT_GRID.dense_cells for p in PROFILES.values())
     from python.perception.occ_sparse import memory_estimate, profile_cams
     for prof, pr in PROFILES.items():
         pc = profile_cams(CFG, prof)

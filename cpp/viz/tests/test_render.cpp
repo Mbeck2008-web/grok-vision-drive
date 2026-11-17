@@ -160,6 +160,26 @@ static std::string lanes(const char* a, const char* b) {
 }
 
 int main() {
+  // 17. hidden GLFW window: must run *before* the EGL surfaceless context is
+  // current. Creating a GLX context while EGL owns the thread fails on xvfb
+  // with X_GLXMakeCurrent BadAccess and aborts the process.
+  {
+    CHECK(headless_glfw_visible() == false, "init_headless must pass visible=false");
+#if GVD_VIZ_HAVE_GLFW
+    GlContext hidden;
+    std::string e;
+    if (hidden.init_window(64, 64, "gvd_viz hint test", false, &e, /*visible=*/false)) {
+      CHECK(hidden.window() != nullptr, "hidden window is null");
+      CHECK(glfwGetWindowAttrib(hidden.window(), GLFW_VISIBLE) == GLFW_FALSE,
+            "hidden window is visible (GLFW_VISIBLE hint lost)");
+    } else {
+      std::printf("SKIP glfw hidden-window attrib (no display?): %s\n", e.c_str());
+    }
+#else
+    std::printf("SKIP glfw hidden-window attrib (built without GLFW)\n");
+#endif
+  }
+
   GlContext ctx;
   std::string err;
   if (!ctx.init_headless(&err)) {
@@ -609,24 +629,7 @@ int main() {
           "boolean paint was kept as white");
   }
 
-  // 17. hidden GLFW window: the headless path must pass visible=false, and
-  // GLFW_VISIBLE is false when requested (hint set after init).
-  {
-    CHECK(headless_glfw_visible() == false, "init_headless must pass visible=false");
-#if GVD_VIZ_HAVE_GLFW
-    GlContext hidden;
-    std::string e;
-    if (hidden.init_window(64, 64, "gvd_viz hint test", false, &e, /*visible=*/false)) {
-      CHECK(hidden.window() != nullptr, "hidden window is null");
-      CHECK(glfwGetWindowAttrib(hidden.window(), GLFW_VISIBLE) == GLFW_FALSE,
-            "hidden window is visible (GLFW_VISIBLE hint lost)");
-    } else {
-      std::printf("SKIP glfw hidden-window attrib (no display?): %s\n", e.c_str());
-    }
-#else
-    std::printf("SKIP glfw hidden-window attrib (built without GLFW)\n");
-#endif
-  }
+  // 17. hidden GLFW window test runs before init_headless (see main).
 
   // 18. default Lens is the named chase: pulled back, 40 deg vfov.
   {

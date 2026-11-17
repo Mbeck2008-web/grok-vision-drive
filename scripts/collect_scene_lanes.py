@@ -3519,8 +3519,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     flush=True,
                 )
                 damage_warned = True
-            if not queued:
+            if due and not queued:
                 # A tick that is not written puts its phases back.
+                # An empty due list is not a drop: no cameras were due.
                 cam_sched.undo()
                 print(
                     f"collect drop writer queue full cams={sorted(due)} "

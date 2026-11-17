@@ -454,7 +454,19 @@ def _collect(root: Path, out: Path, bng: "_Bng", extra: list[str]) -> int:
         del session, veh, cfg
         return {"main": _Cam()}
 
-    collect.time.sleep = lambda _seconds: None
+    # Advance the collector clock by the requested sleep so 10 Hz cameras
+    # stay due each tick. A no-op sleep left only the first row with
+    # cameras, and later ticks were correctly skipped as empty.
+    _mono = [collect.time.monotonic()]
+
+    def _sleep(seconds: object) -> None:
+        _mono[0] += max(0.0, float(seconds or 0.0))
+
+    def _monotonic() -> float:
+        return _mono[0]
+
+    collect.time.sleep = _sleep
+    collect.time.monotonic = _monotonic
     import python.debug.gt_logger as gt_logger
     import python.sensors.tech as tech
 

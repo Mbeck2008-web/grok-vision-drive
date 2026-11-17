@@ -128,4 +128,19 @@ if(GVD_VIZ_TESTS)
             -DSCENE=${CMAKE_CURRENT_SOURCE_DIR}/tests/scenes/basic.jsonl
             -DOUT=${CMAKE_CURRENT_BINARY_DIR}/cli_offline.png
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_cli.cmake)
+  # GLFW-only init_headless (no EGL): this is the Windows fallback path.
+  # The main render test uses EGL on Linux, so it never reaches this branch.
+  # Compiled as a separate exe without GVD_VIZ_HAVE_EGL. SKIP (77) if
+  # glfwCreateWindow fails (no display); ctest reports Skipped vs Passed.
+  if(GVD_VIZ_GLFW)
+    add_executable(gvd_viz_test_glfw_headless tests/test_glfw_headless.cpp src/context.cpp)
+    target_include_directories(gvd_viz_test_glfw_headless PRIVATE src third_party/glad/include)
+    target_link_libraries(gvd_viz_test_glfw_headless PRIVATE gvd_glad glfw)
+    target_compile_definitions(gvd_viz_test_glfw_headless PRIVATE GVD_VIZ_HAVE_GLFW=1)
+    if(WIN32)
+      target_compile_definitions(gvd_viz_test_glfw_headless PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+    endif()
+    add_test(NAME gvd_viz_glfw_headless COMMAND gvd_viz_test_glfw_headless)
+    set_tests_properties(gvd_viz_glfw_headless PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
 endif()

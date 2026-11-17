@@ -33,6 +33,7 @@
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 #endif
+#include <glad/gl.h>
 
 using namespace gvd;
 
@@ -172,6 +173,8 @@ int main() {
       CHECK(hidden.window() != nullptr, "hidden window is null");
       CHECK(glfwGetWindowAttrib(hidden.window(), GLFW_VISIBLE) == GLFW_FALSE,
             "hidden window is visible (GLFW_VISIBLE hint lost)");
+      if (hidden.window() && glfwGetWindowAttrib(hidden.window(), GLFW_VISIBLE) == GLFW_FALSE)
+        std::printf("PASS glfw hidden-window attrib (init_window visible=false)\n");
     } else {
       std::printf("SKIP glfw hidden-window attrib (no display?): %s\n", e.c_str());
     }
@@ -483,6 +486,14 @@ int main() {
       cap_render_targets(ww, hh, s);
       CHECK(ww == 5120 && hh == 1440 && s == 2, "5120x1440 4x should land on 2, got %dx%d msaa=%d", ww, hh, s);
     }
+    // F4: 8→4 step must not skip to 2. 2560x1440 8x is ~250.7 MB (over
+    // the cap) and 4x is ~132.7 MB (fits), so the first step must land on 4.
+    {
+      int ww = 2560, hh = 1440, s = 8;
+      cap_render_targets(ww, hh, s);
+      CHECK(ww == 2560 && hh == 1440 && s == 4,
+            "2560x1440 8x must land on msaa 4, got %dx%d msaa=%d", ww, hh, s);
+    }
     // K9: render() must pass the background's bytes into the cap. A 80 MB
     // background makes 2560x1440 4x miss the budget, so MSAA or size must drop.
     {
@@ -521,6 +532,72 @@ int main() {
     } else {
       CHECK(static_cast<long long>(tw) * th < 3840ll * 2160ll,
             "driver rounded MSAA to %d but 4K resolution was not reduced (%dx%d)", ts, tw, th);
+    }
+    // F2: target_size()'s ts comes from the same GL_RENDERBUFFER_SAMPLES
+    // readback it is meant to check. Query the still-bound renderbuffer
+    // (ensure_targets last binds the depth RB) so a "tmsaa = requested"
+    // mutant cannot hide a driver round-up.
+    {
+      GLint rb = 0, gl_s = -1;
+      glGetIntegerv(GL_RENDERBUFFER_BINDING, &rb);
+      if (rb != 0) {
+        glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_SAMPLES, &gl_s);
+        if (gl_s < 1) gl_s = 1;
+        CHECK(ts == gl_s, "target_size msaa=%d but GL_RENDERBUFFER_SAMPLES=%d (F2?)", ts, gl_s);
+        std::printf("4K readback: target_size msaa=%d GL_RENDERBUFFER_SAMPLES=%d %dx%d gl_bytes=%zu\n",
+                    ts, gl_s, tw, th, r.gl_bytes());
+      } else {
+        // Binding was cleared: on llvmpipe a 4K request still allocates 4
+        // samples (~265 MB at full 4K) even when 2 was asked. gl_bytes must
+        // use that real count, and the resolution must shrink to fit.
+        const std::string rname = ctx.renderer_string();
+        std::printf("4K readback: no RB bound; renderer=%s ts=%d %dx%d gl_bytes=%zu\n",
+                    rname.c_str(), ts, tw, th, r.gl_bytes());
+        if (rname.find("llvmpipe") != std::string::npos) {
+          CHECK(ts == 4, "llvmpipe 4K tmsaa should be the real 4, got %d (F2 uses requested?)", ts);
+          CHECK(static_cast<long long>(tw) * th < 3840ll * 2160ll,
+                "llvmpipe 4K was not shrunk (%dx%d msaa=%d)", tw, th, ts);
+          const size_t est4 = estimate_target_bytes(tw, th, 4);
+          CHECK(r.gl_bytes() >= est4, "llvmpipe gl_bytes %zu < 4-sample estimate %zu", r.gl_bytes(), est4);
+        }
+      }
+    }
+    // F5: reuse guard must count the background extra on the same
+    // renderer. 2560x1440 4x with no bg fits and stays 4x (~132.7 MB);
+    // the same request plus an 84 MB background would be 216.6 MB if
+    // the targets were reused, which is over the 200 MiB cap.
+    {
+      Renderer r2;
+      std::string e2;
+      CHECK(r2.init(&e2), "F5 renderer init failed: %s", e2.c_str());
+      RenderOptions no_bg;
+      no_bg.w = 2560;
+      no_bg.h = 1440;
+      no_bg.msaa = 4;
+      no_bg.draw_ego = false;
+      no_bg.draw_hud = false;
+      CHECK(r2.render(must(head("")), no_bg, nullptr), "F5 first render (no bg) failed");
+      int aw = 0, ah = 0, as_ = 0;
+      r2.target_size(&aw, &ah, &as_);
+      CHECK(aw == 2560 && ah == 1440 && as_ == 4,
+            "F5 setup: 2560x1440 4x no-bg should keep 4x, got %dx%d msaa=%d", aw, ah, as_);
+      CHECK(r2.gl_bytes() <= kMaxGlBytes, "F5 no-bg gl_bytes %zu over cap", r2.gl_bytes());
+      Image bg;
+      bg.w = 4096;
+      bg.h = 5120;  // 4096*5120*4 = 83,886,080 bytes
+      bg.rgba.assign(static_cast<size_t>(bg.w) * bg.h * 4, static_cast<uint8_t>(0));
+      RenderOptions with_bg = no_bg;
+      with_bg.background = &bg;
+      CHECK(r2.render(must(head("")), with_bg, nullptr), "F5 second render (with bg) failed");
+      CHECK(r2.gl_bytes() <= kMaxGlBytes, "F5 reuse ignored bg extra: gl_bytes %zu > 200 MiB", r2.gl_bytes());
+      int bw = 0, bh = 0, bs = 0;
+      r2.target_size(&bw, &bh, &bs);
+      const size_t bg_bytes = static_cast<size_t>(bg.w) * bg.h * 4;
+      CHECK(estimate_target_bytes(bw, bh, bs) + bg_bytes <= kMaxGlBytes,
+            "F5 allocated %dx%d msaa=%d plus bg still over cap", bw, bh, bs);
+      CHECK(bs < 4 || bw < 2560 || bh < 1440,
+            "F5 84 MB bg did not tighten reused 2560x1440 4x (got %dx%d msaa=%d)", bw, bh, bs);
+      std::printf("F5 reuse+bg: %dx%d msaa=%d gl_bytes=%zu\n", bw, bh, bs, r2.gl_bytes());
     }
   }
 
@@ -670,7 +747,9 @@ int main() {
     close_o.lens.vfov_deg = 40.f;
     close_o.draw_ego = false;
     close_o.draw_hud = false;
-    Scene cs = must(head("\"tracks\":[{\"id\":1,\"cls\":\"vehicle\",\"x\":0,\"y\":3,\"yaw\":1.5708,\"l\":4.5,\"w\":1.85,\"h\":1.5}]"));
+    // Closer than y=3 so the mid-edge world term is well above the 1.9 px
+    // floor (at y=3, expect was ~4.06 px — zero margin vs half >= 4).
+    Scene cs = must(head("\"tracks\":[{\"id\":1,\"cls\":\"vehicle\",\"x\":0,\"y\":0,\"yaw\":1.5708,\"l\":4.5,\"w\":1.85,\"h\":1.5}]"));
     Image cim = shot(cs, close_o);
     const Track& ct = cs.tracks[0];
     glm::vec3 cd = ct.l > 0.f ? glm::vec3(ct.l, ct.w, ct.h) : glm::vec3(4.5f, 1.85f, 1.5f);
@@ -703,13 +782,17 @@ int main() {
     for (int s = 0; s <= 20; ++s) {
       if (luma(m.x + nrm.x * s, m.y + nrm.y * s) >= 0.5f * peak) half = s;
     }
-    // Width is ~2*half. Floor-only is ~2*1.9 px plus a little AA; require
-    // clearly more than that (world term at ~4 m depth is ~7 px half-width).
-    CHECK(half >= 4, "close-up half-width %d px looks like the 1.9 px floor only (N2)", half);
     glm::vec4 emid = view * glm::vec4(mid, 1.f);
     float focal = proj[1][1] * 0.5f * float(close_o.h);
     float expect = box_edge_pixel_radius(kBoxEdgeWorldM, kBoxEdgeFloorPx, focal, emid.z);
-    CHECK(expect > kBoxEdgeFloorPx + 2.f, "test setup is floor-limited (expect %f px)", expect);
+    // Width is ~2*half. Floor-only is ~1.9 px plus a little AA (~2-3 px
+    // half-width). The close-up mid-edge is sized so the world term sits
+    // several pixels above that floor; require half to track expect with
+    // margin, not a tight half>=4 against a 4 px expect.
+    CHECK(expect > kBoxEdgeFloorPx + 3.f, "test setup is floor-limited (expect %f px)", expect);
+    CHECK(half >= 5, "close-up half-width %d px looks like the 1.9 px floor only (N2); expect r=%.2f", half, expect);
+    CHECK(static_cast<float>(half) + 2.f >= expect,
+          "close-up half-width %d px is well below expect r=%.2f", half, expect);
     std::printf("box thickness: close half-width %d px (expect r=%.2f, floor=%.1f)\n", half, expect, kBoxEdgeFloorPx);
   }
 

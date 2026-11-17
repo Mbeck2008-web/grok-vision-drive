@@ -12,11 +12,14 @@ installs both, so CI always runs it. A build or test failure is a failure.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -157,6 +160,325 @@ def check_glfw_visible_after_init() -> None:
     print("context.cpp: GLFW_VISIBLE is set after glfwInit OK")
 
 
+
+def _free_port() -> int:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _start_xvfb():
+    """Return (display, proc) or (None, None) if Xvfb cannot be started."""
+    xvfb = shutil.which("Xvfb")
+    if xvfb is None:
+        return None, None
+    for n in range(20, 80):
+        disp = f":{n}"
+        lock = Path(f"/tmp/.X{n}-lock")
+        if lock.exists():
+            continue
+        proc = subprocess.Popen(
+            [xvfb, disp, "-screen", "0", "1280x720x24", "-nolisten", "tcp"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(0.3)
+        if proc.poll() is None:
+            return disp, proc
+        proc.wait(timeout=2)
+    return None, None
+
+
+def _x11_find_and_grab(display: str, title: str, timeout_s: float = 8.0):
+    """Return (w, h, rgb_bytes) for the first window whose title contains `title`."""
+    import ctypes
+    import ctypes.util
+
+    lib = ctypes.util.find_library("X11")
+    if not lib:
+        raise RuntimeError("libX11 not found")
+    x11 = ctypes.CDLL(lib)
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XDefaultRootWindow.restype = ctypes.c_ulong
+    x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+    x11.XDefaultScreen.restype = ctypes.c_int
+    x11.XDefaultScreen.argtypes = [ctypes.c_void_p]
+    x11.XGetGeometry.restype = ctypes.c_int
+    x11.XFetchName.restype = ctypes.c_int
+    x11.XFree.argtypes = [ctypes.c_void_p]
+    x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    x11.XMapWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    x11.XGetWindowAttributes.restype = ctypes.c_int
+
+    class XImage(ctypes.Structure):
+        _fields_ = [
+            ("width", ctypes.c_int),
+            ("height", ctypes.c_int),
+            ("xoffset", ctypes.c_int),
+            ("format", ctypes.c_int),
+            ("data", ctypes.c_void_p),
+            ("byte_order", ctypes.c_int),
+            ("bitmap_unit", ctypes.c_int),
+            ("bitmap_bit_order", ctypes.c_int),
+            ("bitmap_pad", ctypes.c_int),
+            ("depth", ctypes.c_int),
+            ("bytes_per_line", ctypes.c_int),
+            ("bits_per_pixel", ctypes.c_int),
+            ("red_mask", ctypes.c_ulong),
+            ("green_mask", ctypes.c_ulong),
+            ("blue_mask", ctypes.c_ulong),
+        ]
+
+    x11.XGetImage.restype = ctypes.POINTER(XImage)
+
+    class XWindowAttributes(ctypes.Structure):
+        _fields_ = [
+            ("x", ctypes.c_int), ("y", ctypes.c_int),
+            ("width", ctypes.c_int), ("height", ctypes.c_int),
+            ("border_width", ctypes.c_int), ("depth", ctypes.c_int),
+            ("visual", ctypes.c_void_p), ("root", ctypes.c_ulong),
+            ("class", ctypes.c_int), ("bit_gravity", ctypes.c_int),
+            ("win_gravity", ctypes.c_int), ("backing_store", ctypes.c_int),
+            ("backing_planes", ctypes.c_ulong), ("backing_pixel", ctypes.c_ulong),
+            ("save_under", ctypes.c_int), ("colormap", ctypes.c_ulong),
+            ("map_installed", ctypes.c_int), ("map_state", ctypes.c_int),
+            ("all_event_masks", ctypes.c_long), ("your_event_mask", ctypes.c_long),
+            ("do_not_propagate_mask", ctypes.c_long), ("override_redirect", ctypes.c_int),
+            ("screen", ctypes.c_void_p),
+        ]
+
+    class XTextProperty(ctypes.Structure):
+        _fields_ = [
+            ("value", ctypes.c_void_p),
+            ("encoding", ctypes.c_ulong),
+            ("format", ctypes.c_int),
+            ("nitems", ctypes.c_ulong),
+        ]
+
+    class WindowList(ctypes.Structure):
+        pass
+
+    dpy = x11.XOpenDisplay(display.encode() if display else None)
+    if not dpy:
+        raise RuntimeError(f"XOpenDisplay({display}) failed")
+
+    root = x11.XDefaultRootWindow(dpy)
+
+    def window_title(win):
+        name = ctypes.c_void_p()
+        if x11.XFetchName(dpy, ctypes.c_ulong(win), ctypes.byref(name)) and name.value:
+            title_s = ctypes.cast(name, ctypes.c_char_p).value
+            x11.XFree(name)
+            return (title_s or b"").decode("utf-8", "replace")
+        # _NET_WM_NAME (UTF-8)
+        net = x11.XInternAtom(dpy, b"_NET_WM_NAME", 0)
+        actual_type = ctypes.c_ulong()
+        actual_fmt = ctypes.c_int()
+        nitems = ctypes.c_ulong()
+        bytes_after = ctypes.c_ulong()
+        prop = ctypes.c_void_p()
+        if x11.XGetWindowProperty(
+            dpy, ctypes.c_ulong(win), net, 0, 1024, 0,
+            0,  # AnyPropertyType
+            ctypes.byref(actual_type), ctypes.byref(actual_fmt),
+            ctypes.byref(nitems), ctypes.byref(bytes_after), ctypes.byref(prop),
+        ) == 0 and prop.value:
+            raw = ctypes.cast(prop, ctypes.c_char_p).value
+            x11.XFree(prop)
+            return (raw or b"").decode("utf-8", "replace")
+        return ""
+
+    def children_of(win):
+        root_ret = ctypes.c_ulong()
+        parent = ctypes.c_ulong()
+        kids = ctypes.POINTER(ctypes.c_ulong)()
+        nkids = ctypes.c_uint()
+        if not x11.XQueryTree(dpy, ctypes.c_ulong(win), ctypes.byref(root_ret),
+                              ctypes.byref(parent), ctypes.byref(kids), ctypes.byref(nkids)):
+            return []
+        out = [kids[i] for i in range(nkids.value)]
+        if kids:
+            x11.XFree(kids)
+        return out
+
+    def walk(win, acc):
+        acc.append(win)
+        for c in children_of(win):
+            walk(c, acc)
+
+    deadline = time.time() + timeout_s
+    found = None
+    while time.time() < deadline and found is None:
+        wins = []
+        walk(root, wins)
+        for w in wins:
+            t = window_title(w)
+            if title in t:
+                found = w
+                break
+        if found is None:
+            time.sleep(0.15)
+
+    if found is None:
+        x11.XCloseDisplay(dpy)
+        raise RuntimeError(f"no window titled {title!r} on {display}")
+
+    attrs = XWindowAttributes()
+    if not x11.XGetWindowAttributes(dpy, ctypes.c_ulong(found), ctypes.byref(attrs)):
+        x11.XCloseDisplay(dpy)
+        raise RuntimeError("XGetWindowAttributes failed")
+    # IsUnmapped = 0; wait until viewable (2)
+    wait = time.time() + 3.0
+    while attrs.map_state != 2 and time.time() < wait:
+        time.sleep(0.1)
+        x11.XGetWindowAttributes(dpy, ctypes.c_ulong(found), ctypes.byref(attrs))
+    w, h = attrs.width, attrs.height
+    if w < 16 or h < 16:
+        x11.XCloseDisplay(dpy)
+        raise RuntimeError(f"window too small: {w}x{h}")
+
+    ZPixmap = 2
+    AllPlanes = ctypes.c_ulong(~0)
+    img_p = x11.XGetImage(dpy, ctypes.c_ulong(found), 0, 0, w, h, AllPlanes, ZPixmap)
+    if not img_p:
+        x11.XCloseDisplay(dpy)
+        raise RuntimeError("XGetImage failed")
+    img = img_p.contents
+    bpp = max(1, img.bits_per_pixel // 8)
+    raw = ctypes.string_at(img.data, img.bytes_per_line * h)
+    rgb = bytearray(w * h * 3)
+    rmask, gmask, bmask = img.red_mask, img.green_mask, img.blue_mask
+
+    def shift_of(mask):
+        if not mask:
+            return 0
+        s = 0
+        m = mask
+        while m & 1 == 0:
+            m >>= 1
+            s += 1
+        return s
+
+    rs, gs, bs_ = shift_of(rmask), shift_of(gmask), shift_of(bmask)
+
+    for y in range(h):
+        row = y * img.bytes_per_line
+        for x in range(w):
+            off = row + x * bpp
+            pix = int.from_bytes(raw[off:off + min(4, bpp)].ljust(4, b"\x00"), "little")
+            i = (y * w + x) * 3
+            rgb[i] = (pix & rmask) >> rs
+            rgb[i + 1] = (pix & gmask) >> gs
+            rgb[i + 2] = (pix & bmask) >> bs_
+    x11.XDestroyImage(img_p)
+    x11.XCloseDisplay(dpy)
+    return w, h, bytes(rgb)
+
+
+def _yellow_count(w: int, h: int, rgb: bytes) -> int:
+    n = 0
+    for i in range(0, w * h * 3, 3):
+        r, g, b = rgb[i], rgb[i + 1], rgb[i + 2]
+        mx = max(r, g, b)
+        if mx <= 110:
+            continue
+        if r > 170 and g > 120 and b < 0.55 * g and (r - g) < 110:
+            n += 1
+    return n
+
+
+def _send_scene(port: int, body: dict) -> None:
+    payload = json.dumps(body, separators=(",", ":")).encode()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.sendto(payload, ("127.0.0.1", port))
+    finally:
+        sock.close()
+
+
+def check_live_uses_scene_to_show(exe: Path) -> None:
+    """Behavioral check of main.cpp:167. After 1 s with no UDP, the live
+    window must blank tracks/lanes (scene_to_show). `Scene show = cur`
+    would keep the last yellow lanes on screen.
+    Skips visibly if this build has no GLFW or there is no display.
+    """
+    display = os.environ.get("DISPLAY")
+    xvfb_proc = None
+    if not display:
+        display, xvfb_proc = _start_xvfb()
+        if display is None:
+            print("SKIP live scene_to_show wiring (no DISPLAY / Xvfb)")
+            return
+        os.environ["DISPLAY"] = display
+    port = _free_port()
+    env = os.environ.copy()
+    env["DISPLAY"] = display
+    proc = subprocess.Popen(
+        [str(exe), "--listen", str(port), "--size", "640x360", "--no-hud", "--no-ego"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        text=True,
+    )
+    try:
+        # Fail fast if the binary was built without GLFW / cannot make a window.
+        time.sleep(0.4)
+        if proc.poll() is not None:
+            err = (proc.stderr.read() if proc.stderr else "") or ""
+            out = (proc.stdout.read() if proc.stdout else "") or ""
+            msg = (err + out).strip()
+            print(f"SKIP live scene_to_show wiring (gvd_viz exited {proc.returncode}): {msg}")
+            return
+        scene = {
+            "v": 1, "type": "gvd_scene", "seq": 1, "t": 0,
+            "lanes": [
+                {"pts": [[-1.8, -12], [-1.8, 90]], "paint": "yellow"},
+                {"pts": [[1.8, -12], [1.8, 90]], "paint": "yellow"},
+            ],
+        }
+        # Give the window a moment to map, then send a distinctive scene.
+        time.sleep(0.6)
+        for _ in range(5):
+            _send_scene(port, scene)
+            time.sleep(0.05)
+        time.sleep(0.4)
+        w1, h1, rgb1 = _x11_find_and_grab(display, "GVD VIZ", timeout_s=8.0)
+        yellow_fresh = _yellow_count(w1, h1, rgb1)
+        # Wait past kStaleTimeout (1 s) with no further datagrams.
+        time.sleep(1.4)
+        w2, h2, rgb2 = _x11_find_and_grab(display, "GVD VIZ", timeout_s=4.0)
+        yellow_stale = _yellow_count(w2, h2, rgb2)
+        assert yellow_fresh > 100, (
+            f"live window did not show yellow lanes while fresh "
+            f"(yellow={yellow_fresh} {w1}x{h1})"
+        )
+        assert yellow_stale < 20, (
+            f"live window still shows yellow after 1 s silence "
+            f"(fresh={yellow_fresh} stale={yellow_stale}); main.cpp must use scene_to_show"
+        )
+        print(
+            f"live scene_to_show wiring: fresh yellow={yellow_fresh} "
+            f"stale yellow={yellow_stale} ({w2}x{h2}) OK"
+        )
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+        if xvfb_proc is not None and xvfb_proc.poll() is None:
+            xvfb_proc.terminate()
+            try:
+                xvfb_proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                xvfb_proc.kill()
+
+
 def check_deps_pinned() -> None:
     cmake = (SRC / "CMakeLists.txt").read_text(encoding="utf-8")
     # glm / nlohmann_json are pinned tarballs only (no find_package).
@@ -171,9 +493,7 @@ def check_deps_pinned() -> None:
 
 
 def main() -> None:
-    check_glfw_visible_after_init()
     check_deps_pinned()
-    check_stale_and_drain_wired()
     b = build_dir()
     if b is None:
         print("test_viz_cpp_render: skipped build (no toolchain)")
@@ -182,6 +502,11 @@ def main() -> None:
     assert exe is not None, f"no {EXE_NAME} in {b}"
     check_ctest(b)
     check_end_to_end(exe)
+    # Behavioral wiring checks first so a mutant is killed by observed
+    # behaviour, not only by a source grep.
+    check_live_uses_scene_to_show(exe)
+    check_glfw_visible_after_init()
+    check_stale_and_drain_wired()
     print("test_viz_cpp_render: all OK")
 
 

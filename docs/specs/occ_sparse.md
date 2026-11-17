@@ -252,7 +252,16 @@ off): per-frame forward error <= 0.10 m, yaw error < 0.0025 rad; pose drift
 1% with no warp. Limitation: a featureless straight road has no forward
 constraint; the estimate is held and flagged `motion_ok = False`.
 
-Tests: `test_occ_ego` (VO, world-fixed cells with the flag off, non-identity
+Residual VO: cells that already match at zero shift can be an ego-fixed
+`decode_unseen` sheet that would lock `fwd=0`. The search scores the full
+set and the residual (unmatched-at-zero) set. The residual is used only when
+its share of the previous cells is at least `VO_RESIDUAL_SHARE` (0.15) or
+its own overlap is at least `VO_RESIDUAL_CONF` (0.6), and that overlap is
+at least `VO_MIN_SCORE` (0.4, unchanged). A parked ego with a few flickering
+cells therefore keeps the full (0, 0) hypothesis (`ok=True`). Tests:
+`check_vo_clutter`, `check_vo_parked_flicker`.
+
+Tests: `test_occ_ego` (VO, residual clutter, parked+flicker, world-fixed cells with the flag off, non-identity
 warp, drift printout), `test_occ_runtime_imports` (no GT-pose module reachable
 from the occupancy runtime, no pose-reading identifier in its source, beamngpy
 not loaded, flag defaults off, a spy mapping proves the default path reads no
@@ -433,9 +442,21 @@ batch 1) = 104.7 MB; batch 4 (training batch) = 416.8 MB, both under the
 `peak_vram_mb` stays UNPROVEN until IQU45 nvidia-smi.
 
 Tests: `test_occ_unseen` (TRACER traces, labels, unseen decode, observed,
-memory, causality), `test_occ_out` (v2 fields, version gate),
+memory, causality), `test_occ_memory_gap` (hidden-leg proof through
+`OccRuntime`: predict + cap + camera VO + observed + memory; lift retrain,
+loss ablation, zero-warp, memory-off mutants), `test_occ_net` (xy-spread
+cap, below-ground-hot cap, class-balanced ground positives, below-ground
+free samples, deterministic overfit/predict), `test_occ_out` (v2 fields, version gate),
 `test_occ_runtime_imports` (safety isolation), `test_eval_occ_unseen` (eval
 smoke). Metrics: `scripts/eval_occ_unseen.py` (results below).
+
+Later-stage `predict` caps (`_capped_hot`): the ground band is the most
+populous z-layer (ties broken toward z closest to 0). At most half the cap
+goes there; above-ground structure is filled next, then below-ground, each
+pool spread in xy so a high-p off-road region cannot take the whole ground
+budget. `sample_queries` class-balances ground positives and spends half of
+`n_free` on unoccupied *below-ground* cell centres (never on above-ground
+cells missing from `keys`, which may be occluded structure).
 
 #### Unseen-structure results (SYNTHETIC, `eval_occ_unseen.py`)
 
@@ -462,10 +483,31 @@ GT cells per clip: intersection 2,882 visible / 2,110 occluded; roundabout
 roundabout 0.318 / 0.294 / 0.327 (seeds 900/901/902).
 Reading: the unmasked model beats the baseline on visible IoU in both kinds
 and on occluded IoU/chamfer at the intersection, but **loses on roundabout
-occluded IoU (0.095 vs 0.207)**. Memory makes no measurable difference here
-(<= 0.002 IoU); its effect is shown only by the unit tests (79% vs 0%
-carry on a controlled clip). VRAM estimate: batch 1 104.7 MB, batch 4
+occluded IoU (0.095 vs 0.207)**. On this synthetic eval, adding memory
+changes occluded IoU by <= 0.002 — it is not a proof that memory works,
+and it is not a proof that it does not. The memory contract is tested by
+`test_occ_unseen` (unit carry 79% vs 0% on a controlled clip) and by
+`test_occ_memory_gap` (OccRuntime hidden-leg Youden J, held-out starts,
+mutants must fail the gate). VRAM estimate: batch 1 104.7 MB, batch 4
 416.8 MB (CPU arithmetic); runner batch 1 (eval and live), 4 (training).
+
+#### Grid window (eval radius)
+
+The occupancy metric and the hidden-leg proof are inside `DEFAULT_GRID`
+(0.4 m voxels). Anything outside this window is reported as a share of GT
+road length, not as occupancy error.
+
+| axis | min (m) | max (m) | cells | half-extent / radius from ego (m) |
+| --- | ---: | ---: | ---: | ---: |
+| x | -25.6 | 25.6 | 128 | 25.6 |
+| y | -12.8 | 51.2 | 160 | 12.8 behind / 51.2 ahead |
+| z | -2.0 | 4.4 | 16 | 2.0 below / 4.4 above |
+
+Eval (synthetic, CPU; same flags as the table above):
+
+```
+PATH=<venv>/bin:$PATH python scripts/eval_occ_unseen.py --steps 300 --train-seeds 10 --eval-seeds 3 --frames 5 --baseline --threads 4
+```
 
 ## Files
 
@@ -474,9 +516,9 @@ New: `python/perception/occ_geometry.py`, `python/perception/occ_sparse.py`,
 `python/train/occ_labels.py`, `python/train/occ_sampler.py`,
 `python/train/occ_train.py`, `python/data/occ_shards.py`,
 `scripts/bench_occ_sparse.py`, `scripts/compare_front_cluster.py`, `tests/synthetic_occ.py`, tests
-`scripts/test_occ_{labels,shards,sampler,net,cams,ego,runtime_imports,viz,out,unseen}.py`, `scripts/test_eval_occ_unseen.py`,
-`scripts/test_bench_occ_sparse.py`, this spec. No existing file is modified (the
-offline suite picks up `scripts/test_*.py` itself).
+`scripts/test_occ_{labels,shards,sampler,net,cams,ego,runtime_imports,viz,out,unseen,memory_gap}.py`, `scripts/test_eval_occ_unseen.py`,
+`scripts/test_bench_occ_sparse.py`, this spec. The offline suite picks up
+`scripts/test_*.py` itself.
 
 ## Verify
 
@@ -486,11 +528,14 @@ python scripts/test_occ_labels.py      # geometry, 8 cams, boxes, invalid depth,
 python scripts/test_occ_out.py         # occ_out v1: 4-panel fields, ego dt/units/source, heading, 2-D boxes, corridor, rejects, VRAM fields, flat size
 python scripts/test_occ_shards.py      # roundtrip, no loose-PNG fallback, rollover, CLI
 python scripts/test_occ_sampler.py     # 20-30% recovery per batch, enforced
-python scripts/test_occ_net.py         # projection, camera-only, sparse predict, overfit
+python scripts/test_occ_net.py         # projection, camera-only, sparse predict, overfit, cap, class balance, free samples
 python scripts/test_occ_cams.py        # presets, per-cam ages, sparsity begins, checkpoints, profiles
-python scripts/test_occ_ego.py         # camera VO, static world stays fixed with the flag off
+python scripts/test_occ_ego.py         # camera VO, residual clutter, parked+flicker, static world stays fixed with the flag off
 python scripts/test_occ_runtime_imports.py  # GT label/pose modules unreachable, flag off, spy, image guard
 python scripts/test_occ_viz.py         # edges vs synthetic road, tracker cases, v1 message, red rule
+python scripts/test_occ_unseen.py      # unmasked occluded loss, unseen decode, memory rules, causality
+python scripts/test_occ_memory_gap.py  # OccRuntime hidden-leg proof + mutants (CPU, ~few minutes)
+python scripts/eval_occ_unseen.py --steps 300 --train-seeds 10 --eval-seeds 3 --frames 5 --baseline --threads 4
 ```
 
 Desktop-IQU45 (real VRAM and FPS, GTX 1080 Ti, BeamNG running; note what else holds the GPU):

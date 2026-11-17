@@ -219,7 +219,7 @@ def main() -> None:
     nerd.show_model_tab()
     model_frame = render_stage(st, ui=nerd)
     assert model_frame.shape == drive_frame.shape
-    assert _text_size("yolov8n-onnx", FS_BODY, TH)[0] <= VAL_COL_W - 4, "MODEL value column must fit shipped id"
+    assert _text_size("yolox-nano-onnx", FS_BODY, TH)[0] <= VAL_COL_W - 4, "MODEL value column must fit shipped id"
     nerd.show_viz_tab()
     nerd.debug.viz_dense = True
     nerd.debug.apply_dense()

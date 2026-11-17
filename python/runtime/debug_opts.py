@@ -216,7 +216,7 @@ MODEL_ROWS: tuple[dict[str, Any], ...] = (
         "label": "detector",
         "attr": "detector_id",
         "role": "detector",
-        "hint": "YOLOv8 detect ONNX/pt, or synthetic/empty",
+        "hint": "shipped YOLOX-Nano ONNX, or another YOLOX/YOLOv8 file in models/, or synthetic/empty",
     },
     {
         "id": "e2e_id",

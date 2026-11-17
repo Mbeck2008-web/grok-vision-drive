@@ -1,4 +1,10 @@
-"""Object detect on cam_main — YOLOv8n ONNX if present, else synthetic/empty."""
+"""Object detect on cam_main — shipped YOLOX-Nano ONNX if present, else synthetic/empty.
+
+Detection quality and GPU VRAM are UNPROVEN. Published COCO val mAP 0.5:0.95 is
+25.8 at 416 for YOLOX-Nano vs 37.3 at 640 for YOLOv8n. Live detections feed
+tracks, CIPV and AEB. Compare models once labeled images exist:
+``scripts/eval_detect.py``.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +16,9 @@ from typing import Any
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_ONNX = ROOT / "models" / "yolov8n.onnx"
+DEFAULT_ONNX = ROOT / "models" / "yolox_nano.onnx"
+OPTIONAL_YOLOV8N_ONNX = ROOT / "models" / "yolov8n.onnx"
+OPTIONAL_YOLOV8N_PT = ROOT / "models" / "yolov8n.pt"
 COCO_VEHICLE = {2, 3, 5, 7}  # car, motorcycle, bus, truck
 COCO_PERSON = {0}
 COCO_BIKE = {1}
@@ -162,7 +170,7 @@ def _session_from_onnx(ort, onnx_path: Path):
 class OnnxYoloDetector(Detector):
     name = "yolov8n-onnx"
 
-    def __init__(self, onnx_path: Path = DEFAULT_ONNX, conf: float = 0.35, nms_thr: float = 0.45) -> None:
+    def __init__(self, onnx_path: Path, conf: float = 0.35, nms_thr: float = 0.45) -> None:
         import onnxruntime as ort  # type: ignore
 
         self.path = Path(onnx_path)
@@ -297,18 +305,19 @@ def _nms_xyxy(boxes: np.ndarray, scores: np.ndarray, thr: float) -> list[int]:
 
 
 class OnnxYoloxDetector(Detector):
-    """Optional Apache YOLOX-s ONNX. Same Detection / COCO map as OnnxYoloDetector.
+    """Apache YOLOX ONNX (shipped nano, optional other sizes). Same Detection / COCO map as OnnxYoloDetector.
 
-    Official Megvii 0.1.1rc0 ``yolox_s.onnx`` (Apache-2.0): one output
-    ``[1, 8400, 85]`` with decode_in_inference=False. Channels = raw
-    (cx, cy, log-w, log-h) + objectness + 80 COCO. Input ``[1, 3, 640, 640]``
-    BGR float32 0–255, letterbox pad 114. Score = objectness * class, then
-    cxcywh→xyxy / letterbox ratio. If N does not match the 8/16/32 grid, treat
-    the first four channels as already-decoded pixel cxcywh (later official
-    ``--decode_in_inference`` exports).
+    Official Megvii 0.1.1rc0 exports (Apache-2.0): one output ``[1, N, 85]``
+    with decode_in_inference=False. Channels = raw (cx, cy, log-w, log-h) +
+    objectness + 80 COCO. ``yolox_nano.onnx`` is 416x416 (N=3549);
+    ``yolox_s.onnx`` is 640x640 (N=8400). Input BGR float32 0–255, letterbox
+    pad 114. Score = objectness * class, then cxcywh→xyxy / letterbox ratio.
+    If N does not match the 8/16/32 grid, treat the first four channels as
+    already-decoded pixel cxcywh (later official ``--decode_in_inference``
+    exports).
     """
 
-    name = "yolox-s-onnx"
+    name = "yolox-nano-onnx"
 
     def __init__(self, onnx_path: Path, conf: float = 0.35, nms_thr: float = 0.45) -> None:
         import onnxruntime as ort  # type: ignore
@@ -415,17 +424,25 @@ class UltraYoloDetector(Detector):
 
 
 def make_detector(*, allow_synthetic: bool = True) -> tuple[Detector, list[str]]:
-    """Return detector + missing keys. Prefer ONNX; Ultralytics pt optional; else synthetic/empty."""
+    """Return detector + missing keys. Prefer shipped YOLOX-Nano; optional AGPL YOLOv8 last; else synthetic/empty.
+
+    Nano quality and GPU VRAM are UNPROVEN; detections feed tracks, CIPV and AEB.
+    """
     missing: list[str] = []
     if DEFAULT_ONNX.is_file():
         try:
-            return OnnxYoloDetector(DEFAULT_ONNX), missing
+            return OnnxYoloxDetector(DEFAULT_ONNX), missing
         except Exception as e:
             missing.append(f"onnx_load:{e}")
-    pt = ROOT / "models" / "yolov8n.pt"
-    if pt.is_file():
+    # Optional local AGPL extras (not shipped). ultralytics / UltraYoloDetector are AGPL-3.0.
+    if OPTIONAL_YOLOV8N_ONNX.is_file():
         try:
-            return UltraYoloDetector(pt), missing
+            return OnnxYoloDetector(OPTIONAL_YOLOV8N_ONNX), missing
+        except Exception as e:
+            missing.append(f"onnx_load:{e}")
+    if OPTIONAL_YOLOV8N_PT.is_file():
+        try:
+            return UltraYoloDetector(OPTIONAL_YOLOV8N_PT), missing
         except Exception as e:
             missing.append(f"ultra_load:{e}")
     missing.append("yolo_weights")

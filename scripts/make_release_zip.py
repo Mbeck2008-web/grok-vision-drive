@@ -11,7 +11,7 @@ Ships the **retail** slice a player double-clicks:
 
 Never ships: data/clips/, extra weights (*.pt, e2e ONNX, random blobs),
 .git, __pycache__, venvs, scripts/ (tests + this tool), dist/.
-Does ship: models/yolov8n.onnx (YOLOv8n detect, AGPL Ultralytics).
+Does ship: models/yolox_nano.onnx (YOLOX-Nano detect, Apache-2.0).
 
 Honesty: retail = 1-cam window capture only. 8-cam rig needs BeamNG.tech + BeamNGpy.
 No Tesla / FSD chrome. Not real-vehicle control.
@@ -31,7 +31,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 # Canonical product pin (also VERSION, python/__init__.py, BeamNG app.json).
-VERSION = "1.7.13"
+VERSION = "1.7.14"
 RELEASE_CHANNEL = "alpha"
 RELEASE_LABEL = f"{VERSION}-{RELEASE_CHANNEL}"
 
@@ -53,7 +53,8 @@ INCLUDE_GLOBS = (
     "docs/media/*.png",
     "models/.gitkeep",
     "models/NOTICE.txt",
-    "models/yolov8n.onnx",
+    "models/LICENSE-YOLOX.txt",
+    "models/yolox_nano.onnx",
 )
 # Directories copied recursively (subject to EXCLUDE_* below).
 INCLUDE_DIRS = ("beamng_mod", "python", "config")
@@ -75,7 +76,8 @@ MUST_HAVE = (
     "config/cameras.yaml",
     "config/hardware.yaml",
     "VERSION.txt",
-    "models/yolov8n.onnx",
+    "models/yolox_nano.onnx",
+    "models/LICENSE-YOLOX.txt",
     "docs/media/gvd_cabin_synthetic.png",
     "docs/media/gvd_ingame_ui_synthetic.png",
     "docs/media/gvd_ingame_ui_drive_synthetic.png",
@@ -122,8 +124,8 @@ EXCLUDE_FILE_GLOBS = (
     "data/clips/*",
 )
 
-# Detect ONNX that must ship so retail auto-detector is YOLOv8n, not empty.
-SHIPPED_WEIGHTS = frozenset({"models/yolov8n.onnx"})
+# Detect ONNX that must ship so retail auto-detector is YOLOX-Nano, not empty.
+SHIPPED_WEIGHTS = frozenset({"models/yolox_nano.onnx"})
 # Never allowed in the built archive (belt-and-suspenders verification).
 FORBIDDEN_ARCHIVE_GLOBS = (
     "*.onnx",
@@ -305,7 +307,7 @@ def verify(zip_path: Path, *, flat: bool, version: str) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Build the GVD retail release zip (YOLOv8n ONNX in, other weights/clips/.git out).")
+    ap = argparse.ArgumentParser(description="Build the GVD retail release zip (YOLOX-Nano ONNX in, other weights/clips/.git out).")
     ap.add_argument("--version", default=None, help=f"Version label (default: exact git tag, else {RELEASE_LABEL}-<sha>)")
     ap.add_argument("--out", default=None, help="Output path (default: dist/gvd-retail-<version>.zip)")
     ap.add_argument("--flat", action="store_true", help="No top-level gvd-retail-<version>/ folder inside the zip")

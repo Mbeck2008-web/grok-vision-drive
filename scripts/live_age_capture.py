@@ -21,7 +21,7 @@ PASS / FAIL:
 * duration: each log spans >= 55 s of ticks.
 * compute: on every tick of both logs the detector, the planner (lanes,
   CIPV, AEB) and the scene net ran (``detect_ms``, ``plan_ms``, ``scene_ms``
-  present and > 0, ``aeb`` present), and the detector is yolov8n. Engage
+  present and > 0, ``aeb`` present), and the detector is the shipped YOLOX-Nano (or optional YOLOv8n). Engage
   gates actuation only.
 * ages: per side camera, live median within 1 tick (1/15 s) and p95 within
   2 ticks of the training ages on the recording the model would train on.
@@ -371,7 +371,7 @@ def grade(
     missing = {name: len(compute_gaps(log["ticks"])) for name, log in (("on", on), ("baseline", base))}
     no_main = {name: sum(1 for t in log["ticks"] if t["main_luma"] is None) for name, log in (("on", on), ("baseline", base))}
     detectors = {name: str((log.get("providers") or {}).get("detector", "")) for name, log in (("on", on), ("baseline", base))}
-    yolo = all(d.startswith("yolov8n") for d in detectors.values())
+    yolo = all(d.startswith("yolox-nano") or d.startswith("yolov8n") for d in detectors.values())
     bars["compute"] = {
         "pass": bool(on["ticks"]) and bool(base["ticks"]) and not any(missing.values()) and yolo,
         "detail": f"ticks without detect/plan/scene timers or aeb: {missing}; ticks without a main frame {no_main}; "

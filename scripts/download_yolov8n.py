@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Download a YOLOv8 detect checkpoint and export ONNX @640 into models/.
 
-``models/yolov8n.onnx`` is shipped in git. Use this for s/m/l/x extras (gitignored).
+Optional and AGPL-3.0 (Ultralytics). Not shipped; the default detector is Apache-2.0
+YOLOX-Nano. Use this only if you want a local YOLOv8 extra (gitignored).
 
   PYTHONPATH=. python scripts/download_yolov8n.py --size n
   PYTHONPATH=. python scripts/download_yolov8n.py --size s

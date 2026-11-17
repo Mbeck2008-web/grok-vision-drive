@@ -3,5 +3,7 @@
 onnxruntime>=1.16
 # GPU EP on Windows/Pascal (optional):
 # onnxruntime-gpu>=1.16
+# Optional AGPL-3.0: only if you use UltraYoloDetector or scripts/download_yolov8n.py.
+# Not needed for the shipped YOLOX-Nano detector. Not in the retail zip.
 ultralytics>=8.0
 # torch comes with ultralytics; prefer cu118/cu121 Pascal wheels on the Pascal / 1080 Ti machine

@@ -1,6 +1,10 @@
-YOLOv8n detect weights in this folder are Ultralytics COCO checkpoints, not GVD-trained.
+Detector weights in this folder are third-party COCO checkpoints, not GVD-trained. They keep their own licenses. GVD-authored code and models are PolyForm-Noncommercial-1.0.0. This notice does not add restrictions to third-party licenses.
 
-- models/yolov8n.onnx  -- shipped. Ultralytics YOLOv8n detect @640, ONNX. License: AGPL-3.0 (Ultralytics). The rest of GVD stays MIT.
-- models/yolox_s.onnx  -- optional, gitignored, not in the retail zip. Megvii YOLOX-s detect @640, official ONNX (0.1.1rc0). License: Apache-2.0 (Megvii-BaseDetection/YOLOX, Copyright (c) 2021-2022 Megvii Inc.). Download: PYTHONPATH=. python scripts/download_yolox.py. Other models/yolox*.onnx stay optional extras.
-- models/*.pt and other *.onnx stay gitignored. Optional local extras: python scripts/download_yolov8n.py --size s
+- models/yolox_nano.onnx  -- shipped. Megvii YOLOX-Nano detect @416, official ONNX (0.1.1rc0). License: Apache-2.0 (Megvii-BaseDetection/YOLOX, Copyright (c) 2021-2022 Megvii Inc.). Full licence text: models/LICENSE-YOLOX.txt. Re-download: PYTHONPATH=. python scripts/download_yolox.py
+- models/yolox_s.onnx and other models/yolox*.onnx  -- optional, gitignored, not in the retail zip. Megvii YOLOX detect, official ONNX (0.1.1rc0). License: Apache-2.0 (Megvii-BaseDetection/YOLOX, Copyright (c) 2021-2022 Megvii Inc.). Download: PYTHONPATH=. python scripts/download_yolox.py --size s
+- models/yolov8*.onnx and models/yolov8*.pt  -- optional, not shipped. Ultralytics YOLOv8 detect. License: AGPL-3.0 (Ultralytics). The optional ultralytics package and python/perception/detect.py UltraYoloDetector path are AGPL-3.0. Download/export: PYTHONPATH=. python scripts/download_yolov8n.py --size n
+- models/*.pt and other *.onnx stay gitignored.
 - No e2e_current.onnx: the E2E policy is still the in-repo numpy stub until you train and export one.
+
+Other third-party assets (not in this folder) also keep their own licenses and are not under PolyForm Noncommercial 1.0.0:
+- cpp/viz/assets/  -- CC BY 4.0. See ATTRIBUTION.txt in that folder when it is present. CC BY 4.0 does not allow extra restrictions, so the README paid-services note does not apply to those assets.

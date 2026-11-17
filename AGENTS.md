@@ -2,7 +2,7 @@
 
 Paste this file into an agent when someone asks to install or run Grok Vision Drive. Work in the repo. Verify each step before the next one. Ask before any download larger than a few GB (the CUDA wheel is one of those). Do not skip `--check-maps`.
 
-Grok Vision Drive (GVD) is an MIT **camera-only** toy for **BeamNG.tech**. Entertainment only. Never control a physical car. Not Tesla. No Tesla logos. No vendor autopilot product names. Never write into the Steam or Tech **game** folder. Do not call `BeamNGpy.close()`.
+Grok Vision Drive (GVD) is a PolyForm-Noncommercial-1.0.0 **camera-only** toy for **BeamNG.tech**. Entertainment only. Never control a physical car. Not Tesla. No Tesla logos. No vendor autopilot product names. Never write into the Steam or Tech **game** folder. Do not call `BeamNGpy.close()`.
 
 ## 1. See the machine
 

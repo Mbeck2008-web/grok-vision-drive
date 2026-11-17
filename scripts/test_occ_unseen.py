@@ -299,12 +299,26 @@ def check_memory_rules() -> None:
     K, C, _, _ = mem.step(e, e.astype(np.uint8), e.astype(np.float32), e.astype(bool), ok=True, dt=0.1, **kw)
     assert K.size and not (C == VEHICLE).any(), (K.size, np.unique(C))
     n_static = K.size
+    # carried cells move with the ego: 2 m forward (+y), no yaw -> every remembered cell shifts 2 m back
+    before = G.centers_of_keys(mem.keys)
+    exp = G.keys_of(before - np.array([0.0, 2.0, 0.0]))
+    exp = np.unique(exp[exp >= 0])
+    K, _, _, _ = mem.step(e, e.astype(np.uint8), e.astype(np.float32), e.astype(bool), ok=True, dt=0.1,
+                          fwd=2.0, dyaw=0.0, cams=[], occl=occl)
+    assert exp.size > 100 and np.array_equal(np.sort(K), exp), (exp.size, K.size, np.isin(K, exp).mean())
+    # yaw: 90 deg left turn -> (x, y) maps to (y, -x)
+    before = G.centers_of_keys(mem.keys)
+    exp = G.keys_of(np.stack([before[:, 1], -before[:, 0], before[:, 2]], 1))
+    exp = np.unique(exp[exp >= 0])
+    K, _, _, _ = mem.step(e, e.astype(np.uint8), e.astype(np.float32), e.astype(bool), ok=True, dt=0.1,
+                          fwd=0.0, dyaw=np.pi / 2, cams=[], occl=occl)
+    assert exp.size > 10 and np.array_equal(np.sort(K), exp), (exp.size, K.size, np.isin(K, exp).mean())
     mem.step(e, e.astype(np.uint8), e.astype(np.float32), e.astype(bool), ok=False, dt=0.1, **kw)
     assert mem.keys.size == 0, mem.keys.size                                    # VO lost -> memory cleared
     K, _, _, _ = mem.step(e, e.astype(np.uint8), e.astype(np.float32), e.astype(bool), ok=True, dt=0.1, **kw)
     assert K.size == 0, K.size                                                  # nothing resurfaces after VO recovers
     print(f"memory rules: {int((cls == VEHICLE).sum())} vehicle cells never carried ({n_static} static carried); "
-          f"VO lost -> cleared, nothing resurfaces OK")
+          f"VO-warped (2 m forward shift, 90 deg yaw rotation) cell-exact; VO lost -> cleared, nothing resurfaces OK")
 
 
 def check_causality() -> None:

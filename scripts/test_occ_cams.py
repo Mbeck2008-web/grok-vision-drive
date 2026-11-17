@@ -12,6 +12,9 @@
 * sparsity begins at the query set: the only dense tensors are the 2-D
   per-camera feature maps; no 3-D activation in ``predict`` has as many rows as
   the dense grid (hooked and counted);
+* grid growth: 1x / 8x / 64x finer grids, all-hot head: per-stage queries
+  stay at the caps and the CPU index arrays (candidate keys, centres, sweep,
+  carry, children) and numpy peak (tracemalloc) stay flat;
 * checkpoints: input size, camera count/preset and the grid box are loadable
   knobs (same weights, forward works); a width or depth change fails with
   ``CheckpointMismatch`` naming the knob, never a partial load.
@@ -234,6 +237,37 @@ def check_stage_counts() -> None:
     print("stage counts: every stage a sparse set, none allocates the grid OK")
 
 
+def check_grid_growth() -> None:
+    """CPU index arrays and per-stage queries do not grow with the grid (all-hot head)."""
+    import tracemalloc
+
+    cams = _cams()
+    imgs = [torch.rand(1, 3, c.height, c.width) for c in cams]
+    g0 = DEFAULT_GRID
+    rows = []
+    for name, f in (("1x", 1.0), ("8x", 2.0), ("64x", 4.0)):
+        grid = OccGrid(g0.x_min, g0.x_max, g0.y_min, g0.y_max, g0.z_min, g0.z_max, g0.voxel_m / f)
+        torch.manual_seed(0)
+        net = SparseOccNet(cams, grid=grid).eval()
+        with torch.no_grad():
+            net.head[-1].weight.zero_(); net.head[-1].bias.zero_(); net.head[-1].bias[0:3] = 10.0
+        net.predict(imgs, max_points=16384, max_coarse=2048)  # warm the carry
+        tracemalloc.start()
+        pred = net.predict(imgs, max_points=16384, max_coarse=2048)
+        peak = tracemalloc.get_traced_memory()[1]
+        tracemalloc.stop()
+        assert pred.stage_queries[0] <= 2048 and max(pred.stage_queries) <= 16384 + 64, (name, pred.stage_queries)
+        rows.append((name, grid.dense_cells, pred.stage_queries, pred.keys.size, net._index_bytes, peak))
+    ib = [r[4] for r in rows]; pk = [r[5] for r in rows]
+    assert rows[2][1] >= 60 * rows[0][1], rows
+    assert max(ib) <= 2048 * 48 + 2 * (16384 + 64) * 12 and max(ib) <= 1.1 * min(ib), ib
+    assert max(pk) <= 2.0 * min(pk), pk
+    for name, dense, st, kept, b, peak in rows:
+        print(f"grid growth [{name}] dense {dense}: stages {list(st)} stored {kept}; CPU index arrays {b} B; "
+              f"numpy peak in predict {peak / 1e6:.2f} MB")
+    print("grid growth: 64x the cells, same per-stage caps and flat CPU index arrays OK")
+
+
 def check_checkpoints(tmp: Path) -> None:
     cams = _cams(64)
     torch.manual_seed(0)
@@ -297,6 +331,7 @@ def main() -> int:
     check_ages()
     check_sparsity_begins()
     check_stage_counts()
+    check_grid_growth()
     with tempfile.TemporaryDirectory() as d:
         check_checkpoints(Path(d))
     print("test_occ_cams: all OK")

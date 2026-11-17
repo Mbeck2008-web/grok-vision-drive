@@ -19,8 +19,12 @@ for p in (str(ROOT), str(ROOT / "tests")):
     if p not in sys.path:
         sys.path.insert(0, p)
 
+import dataclasses  # noqa: E402
+
 import numpy as np  # noqa: E402
 import yaml  # noqa: E402
+
+from python.train import occ_labels  # noqa: E402
 
 from python.perception.occ_geometry import DEFAULT_GRID, backproject, project, rig_cams  # noqa: E402
 from python.train.occ_labels import (  # noqa: E402
@@ -92,12 +96,20 @@ def check_box_and_sparse() -> None:
 def check_invalid_depth() -> None:
     d, s, _ = render(CAMS["main"], box=False)
     zero = np.zeros_like(d)
-    lab = build_occ_labels({"main": (zero, s)}, CAMS, sem_classes=SEM_CLASSES)
+    keep_clear = occ_labels.EGO_CLEAR
+    occ_labels.EGO_CLEAR = (-1.0, 0.0, 0.0, -99.0)  # off: the camera origin is inside the ego box
+    try:
+        lab = build_occ_labels({"main": (zero, s)}, CAMS, sem_classes=SEM_CLASSES)
+    finally:
+        occ_labels.EGO_CLEAR = keep_clear
     assert lab.keys.size == 0 and lab.free.shape[0] == 0, (lab.keys.size, lab.free.shape)
-    sky = np.full_like(d, int(CAMS["main"].far_m * 100))
-    lab = build_occ_labels({"main": (sky, s)}, CAMS, sem_classes=SEM_CLASSES)
+    # a 30 m far plane keeps the far-plane points inside the grid: they still must not be cells
+    near_cams = dict(CAMS, main=dataclasses.replace(CAMS["main"], far_m=30.0))
+    sky = np.full_like(d, 3000)
+    lab = build_occ_labels({"main": (sky, s)}, near_cams, sem_classes=SEM_CLASSES)
     assert lab.keys.size == 0, lab.keys.size
     assert lab.free.shape[0] > 100, lab.free.shape
+    assert np.all(np.linalg.norm(lab.free - np.asarray(CAMS["main"].pos), axis=1) < 30.0 * 1.2)
     print("depth 0 -> no label; far-plane depth -> free ray, no cell OK")
 
 
@@ -146,7 +158,13 @@ def check_vehicle_rows() -> None:
 def check_class_lut() -> None:
     lut = class_lut({"classes": {"0": "unknown", "1": "ASPHALT", "2": "CAR", "3": "STREET", "4": "TRUCK", "5": "car"}})
     assert lut[1] == OCC_DRIVABLE and lut[2] == OCC_VEHICLE and lut[4] == OCC_VEHICLE
-    assert lut[3] == OCC_OTHER and lut[5] == OCC_OTHER and lut[0] == OCC_OTHER
+    # STREET is 62% of the pixels of the real main frame (sensor-aux fixture 037126):
+    # without it a real recording has no drivable cell and no road edge label.
+    assert lut[3] == OCC_DRIVABLE, "STREET must be drivable"
+    assert lut[5] == OCC_OTHER and lut[0] == OCC_OTHER
+    lut = class_lut({"classes": {"1": "SIDEWALK", "2": "street", "3": "DRIVING_INSTRUCTIONS"}})
+    # road paint (arrows, lines) lies on the road surface: drivable, else it fakes an edge mid-lane
+    assert lut[1] == OCC_OTHER and lut[2] == OCC_OTHER and lut[3] == OCC_DRIVABLE
     print("class allowlists: exact names only OK")
 
 

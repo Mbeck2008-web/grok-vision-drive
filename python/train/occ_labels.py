@@ -12,8 +12,11 @@ rays in front of each hit. No dense grid is allocated.
 
 Rules (``docs/specs/labels_v4.md``):
 * depth 0 is invalid; depth at the far plane is sky / no hit (free ray, no cell).
-* coarse class names come from fixed allowlists only. Drivable reuses
-  ``sensor_aux.DRIVABLE_CLASS_ALLOWLIST`` unchanged.
+* coarse class names come from fixed allowlists only. Drivable is
+  ``sensor_aux.DRIVABLE_CLASS_ALLOWLIST`` plus ``STREET`` and
+  ``DRIVING_INSTRUCTIONS`` (palette proof: the real main frame of fixture
+  037126 is 62% ``STREET``, 0.2% road paint; with the sensor_aux list alone
+  it has zero drivable cells). ``sensor_aux`` itself is unchanged.
 * a traffic row without a recorded size never invents a box. It only relabels
   depth-observed cells near its centre as vehicle. A row with an explicit
   ``length``/``width``/``height`` fills that box.
@@ -35,6 +38,8 @@ OCC_OTHER, OCC_DRIVABLE, OCC_VEHICLE = 0, 1, 2
 # Annotation names seen in a real recording's sem_classes.json
 # (sgt_2h_20261105: CAR, TRUCK, TRUCK_TRAILERS). Exact names only.
 VEHICLE_CLASS_ALLOWLIST = frozenset({"CAR", "TRUCK", "TRUCK_TRAILERS"})
+# Same recording: STREET is the road surface, DRIVING_INSTRUCTIONS the paint on it.
+OCC_DRIVABLE_ALLOWLIST = DRIVABLE_CLASS_ALLOWLIST | frozenset({"STREET", "DRIVING_INSTRUCTIONS"})
 # Pixel stride for back-projection (each camera). Stride 2 keeps 68% of the
 # stride-1 cells at 11% of the time on a real frame (spec, measurements).
 PIXEL_STRIDE = 2
@@ -72,7 +77,7 @@ def class_lut(sem_classes: Mapping[str, Any] | None) -> np.ndarray:
             continue
         if not 0 < i < 256:
             continue
-        if name in DRIVABLE_CLASS_ALLOWLIST:
+        if name in OCC_DRIVABLE_ALLOWLIST:
             lut[i] = OCC_DRIVABLE
         elif name in VEHICLE_CLASS_ALLOWLIST:
             lut[i] = OCC_VEHICLE

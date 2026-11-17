@@ -547,13 +547,13 @@ GVD uses these outside projects. Each one is its authors' work.
 
 ## License
 
-GVD-authored code and models are licensed under [PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0) (`LICENSE`; SPDX `PolyForm-Noncommercial-1.0.0`). Third-party files keep their own licenses; see `models/NOTICE.txt`. This README does not narrow `LICENSE`.
+GVD-authored code and models are licensed under [PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0) (`LICENSE`; SPDX `PolyForm-Noncommercial-1.0.0`). Third-party files and assets keep their own licenses; see `models/NOTICE.txt`. Assets in `cpp/viz/assets/` are CC BY 4.0 (see `ATTRIBUTION.txt` in that folder when it is present). This README does not narrow `LICENSE`.
 
 ### Commercial use
 
 Commercial use of GVD-authored code and models needs a separate license from Michael Beck. Open a GitHub issue on this repository, or contact him through his [GitHub profile](https://github.com/Mbeck2008-web).
 
-**Paid and ad-supported services (a statement from Michael Beck, not a change to `LICENSE`).** This applies only to GVD-authored code and models, not to third-party files (see `models/NOTICE.txt`). A service that is free, with no advertisements, no sponsorship, and no paid product behind it, may use those assets without asking first, even if it requires a free account. A service that charges money (including a subscription, a paywall, paid tiers, or a paid API), runs ads or sponsorships, or is a free front door to a paid product needs Michael Beck's written permission first. This does not narrow `LICENSE`. Organizations that `LICENSE` already permits (for example educational institutions or charities, even when they charge a fee) stay permitted. If this note and `LICENSE` ever disagree, `LICENSE` controls.
+**Paid and ad-supported services (a statement from Michael Beck, not a change to `LICENSE`).** This applies only to GVD-authored code and models, not to third-party files or assets (see `models/NOTICE.txt`), including `cpp/viz/assets/` (CC BY 4.0). CC BY 4.0 does not allow extra restrictions, so this note does not apply to those third-party assets. A service that is free, with no advertisements, no sponsorship, and no paid product behind it, may use GVD-authored code and models without asking first, even if it requires a free account. A service that charges money (including a subscription, a paywall, paid tiers, or a paid API), runs ads or sponsorships, or is a free front door to a paid product needs Michael Beck's written permission first. This does not narrow `LICENSE`. Organizations that `LICENSE` already permits (for example educational institutions or charities, even when they charge a fee) stay permitted. If this note and `LICENSE` ever disagree, `LICENSE` controls.
 
 The last MIT-licensed commit is [`b098384`](https://github.com/Mbeck2008-web/grok-vision-drive/commit/b098384). Those MIT grants are not revoked. Versions from this release on (`VERSION` 1.7.14) are PolyForm Noncommercial 1.0.0.
 

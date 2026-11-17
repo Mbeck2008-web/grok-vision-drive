@@ -1,5 +1,10 @@
 Required Notice: Copyright (c) 2026 Michael Beck (https://github.com/Mbeck2008-web)
 
+This license covers GVD-authored code and models only. Third-party files and
+assets keep their own licenses and are not subject to this license. See
+models/NOTICE.txt. Files in cpp/viz/assets/ are licensed under CC BY 4.0
+(see ATTRIBUTION.txt in that folder when it is present).
+
 # PolyForm Noncommercial License 1.0.0
 
 <https://polyformproject.org/licenses/noncommercial/1.0.0>

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -134,8 +135,16 @@ def test_folder_and_runtime_fence() -> None:
         assert pairs[1][1] == {}
         painted = [render_label_frame(f, lab) for f, lab in pairs]
         out = root / "clip.mp4"
-        assert encode_mp4(painted, out, fps=10.0)
-        assert out.stat().st_size > 100
+        if shutil.which("ffmpeg") is None:
+            # CI has no ffmpeg: the encoder must say so (False), not fake a file.
+            assert encode_mp4(painted, out, fps=10.0) is False
+            assert not out.exists()
+            from gvd_test_env import skip_check
+
+            skip_check("label_mp4_encode", "ffmpeg not installed")
+        else:
+            assert encode_mp4(painted, out, fps=10.0)
+            assert out.stat().st_size > 100
     print("recording folder, short labels, runtime fence OK")
 
 

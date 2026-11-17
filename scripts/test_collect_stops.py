@@ -93,19 +93,24 @@ def check_schedule_wrap() -> None:
     print(f"schedule wrap ok: {len(wraps)} wraps, run kept going")
 
 
-def check_level_load_failed() -> None:
-    import python.collect.spawn_mix as spawn_mix
+def _stub_enter(calls, fail_from: int = 2, fail_error: str = "level load timed out"):
     from python.collect.level_session import OpenedLevel
     from python.debug.gt_geom import RoadPoly
 
-    calls = {"n": 0}
-
     def enter(bng, level, cfg, cams):
+        del cfg, cams
         calls["n"] += 1
-        if calls["n"] >= 2:
-            return OpenedLevel(vehicle=None, roads=[], spawn=None, cameras={}, error="level load timed out")
+        calls.setdefault("levels", []).append(level)
+        if calls["n"] >= fail_from:
+            return OpenedLevel(vehicle=None, roads=[], spawn=None, cameras={}, error=fail_error)
         return OpenedLevel(vehicle=bng.vehicles.vehicle, roads=[RoadPoly("r", [(0.0, 0.0), (0.0, 80.0)], 7.0)],
                            spawn=(0.4, 12.0, 0.5), cameras={"main": sf._Cam()})
+
+    return enter
+
+
+def _with_west_deck(enter, fn):
+    import python.collect.spawn_mix as spawn_mix
 
     previous = (collect.enter_map, collect.painted_for, spawn_mix.SpawnDeck.load)
     collect.enter_map = enter
@@ -113,11 +118,92 @@ def check_level_load_failed() -> None:
     pools = sf._west_pools()
     spawn_mix.SpawnDeck.load = classmethod(lambda cls, path, rng=None, **kw: cls(pools, rng, **kw))
     try:
-        code, text, out = sf._run_collector({"speed_at": lambda n: 10.0, "stop_at": 99999},
-                                            ["--maps", "west_coast_usa", "--no-vary-env", "--no-excursions",
-                                             "--segment-min", "1", "--minutes", "3"])
+        return fn()
     finally:
         collect.enter_map, collect.painted_for, spawn_mix.SpawnDeck.load = previous
+
+
+def check_needs_level_reload() -> None:
+    """A new chunk on the same map must not reload. A first load or a new map must."""
+    assert collect.needs_level_reload("", "west_coast_usa") is True
+    assert collect.needs_level_reload("west_coast_usa", "west_coast_usa") is False
+    assert collect.needs_level_reload("west_coast_usa", "italy") is True
+    assert collect.needs_level_reload("", "") is False
+    # Mutation: treating every segment change as a reload (the old or==index test).
+    assert collect.needs_level_reload("west_coast_usa", "west_coast_usa") is not collect.segment_changed(
+        "west_coast_usa", 0, "west_coast_usa", 1
+    )
+    print("needs_level_reload ok")
+
+
+def check_same_map_segment_respawns_not_reloads() -> None:
+    """A second west-coast chunk must respawn, not call enter_map. A stub that
+    would time out on the second reload must not kill the run."""
+    calls = {"n": 0}
+    code, text, out = _with_west_deck(
+        _stub_enter(calls, fail_from=2),
+        lambda: sf._run_collector(
+            {"speed_at": lambda n: 10.0, "stop_at": 99999},
+            ["--maps", "west_coast_usa", "--no-vary-env", "--no-excursions",
+             "--segment-min", "1", "--minutes", "3"],
+        ),
+    )
+    assert calls["n"] == 1, (calls, text[-3000:])
+    assert "reason=level_load_failed" not in text, text[-3000:]
+    assert "collect segment west_coast_usa#1" in text, text[-3000:]
+    assert "same map" in text.lower() or "respawn without reload" in text, text[-3000:]
+    status = json.loads((out / "collect.json").read_text(encoding="utf-8"))
+    assert status.get("stop_reason") != "level_load_failed", status
+    assert code == 0, (code, text[-2000:])
+    print(f"same-map segment respawn ok: enter_map={calls['n']} reason={status.get('stop_reason')}")
+
+
+def check_level_load_retries_then_respawns() -> None:
+    """A failed reload of a new map is retried, then the run respawns instead of stopping."""
+    calls = {"n": 0}
+
+    def enter(bng, level, cfg, cams):
+        del cfg, cams
+        calls["n"] += 1
+        calls.setdefault("levels", []).append(level)
+        from python.collect.level_session import OpenedLevel
+        from python.debug.gt_geom import RoadPoly
+        roads = [RoadPoly("r", [(0.0, 0.0), (0.0, 80.0)], 7.0)]
+        if level == "italy":
+            return OpenedLevel(vehicle=None, roads=[], spawn=None, cameras={}, error="TimeoutError: timed out")
+        return OpenedLevel(vehicle=bng.vehicles.vehicle, roads=roads,
+                           spawn=(0.4, 12.0, 0.5), cameras={"main": sf._Cam()})
+
+    code, text, out = _with_west_deck(
+        enter,
+        lambda: sf._run_collector(
+            {"speed_at": lambda n: 10.0, "stop_at": 99999},
+            ["--maps", "west_coast_usa,italy", "--no-vary-env", "--no-excursions",
+             "--segment-min", "1", "--minutes", "3"],
+        ),
+    )
+    italy_tries = calls.get("levels", []).count("italy")
+    assert italy_tries >= collect.LEVEL_LOAD_ATTEMPTS, (calls, text[-3000:])
+    assert "collect level load retry" in text, text[-3000:]
+    assert "reason=level_load_failed" not in text, text[-3000:]
+    status = json.loads((out / "collect.json").read_text(encoding="utf-8"))
+    assert status.get("stop_reason") != "level_load_failed", status
+    assert code == 0, (code, text[-2000:])
+    print(f"level load retry/respawn ok: italy_tries={italy_tries} reason={status.get('stop_reason')}")
+
+
+def check_level_load_failed() -> None:
+    """The first map load still stops the run when every attempt fails (no session to keep)."""
+    calls = {"n": 0}
+    code, text, out = _with_west_deck(
+        _stub_enter(calls, fail_from=1),
+        lambda: sf._run_collector(
+            {"speed_at": lambda n: 10.0, "stop_at": 99999},
+            ["--maps", "west_coast_usa", "--no-vary-env", "--no-excursions",
+             "--segment-min", "1", "--minutes", "3"],
+        ),
+    )
+    assert calls["n"] == collect.LEVEL_LOAD_ATTEMPTS, calls
     _check_stop(code, text, out, "level_load_failed", 2)
     print("level_load_failed ok")
 
@@ -429,6 +515,9 @@ def main() -> None:
     check_requested_and_target()
     check_rec3_segment_end_keeps_running()
     check_schedule_wrap()
+    check_needs_level_reload()
+    check_same_map_segment_respawns_not_reloads()
+    check_level_load_retries_then_respawns()
     check_level_load_failed()
     check_camera_outage()
     check_disk_low()

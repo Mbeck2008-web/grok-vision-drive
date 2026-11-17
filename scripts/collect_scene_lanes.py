@@ -948,12 +948,28 @@ def segment_boundary(
 
 
 def segment_changed(loaded_map: str, loaded_index: int, map_name: str, seg_index: int) -> bool:
-    """True when this piece needs a fresh level load.
+    """True when this piece is a new segment.
 
     Two west-coast chunks are different segments even though the level name
     matches. An empty name is the single-level collect and does not reload.
+    Same-map chunks still change segments, but they must respawn rather than
+    reload (see ``needs_level_reload``).
     """
     return bool(map_name) and (map_name != loaded_map or seg_index != loaded_index)
+
+
+# How many times enter_map is tried for a new map before a respawn fallback.
+LEVEL_LOAD_ATTEMPTS = 3
+
+
+def needs_level_reload(loaded_map: str, map_name: str) -> bool:
+    """True when this segment is a different map, or the first named map.
+
+    A new chunk on the same map must not call ``enter_map``: that reloads the
+    level, and a second load can time out and kill the run (IQU45 30 min
+    bughunt, ``west_coast_usa#2``, ``level_load_failed`` / ``TimeoutError``).
+    """
+    return bool(map_name) and map_name != loaded_map
 
 
 def continue_after_segment_end(
@@ -2030,6 +2046,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         impact_respawns: dict[str, int] = {"impacts": 0, "deck": 0, "recover": 0, "abort_same_tick": 0}
         loaded_map = ""
         loaded_index = -1
+        skipped_maps: set[str] = set()
         speed_span = [speeds]
         # Effective speed range per segment (collect.json speed_ranges) and the
         # weave / lane change / recover counters (collect.json weave_stats).
@@ -2650,6 +2667,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     )
             else:
                 segment_defer.clear()
+            if map_name in skipped_maps:
+                # A failed reload already retried this map; stay on the live session.
+                map_name, seg_index = loaded_map, loaded_index
             segment_id = f"{map_name}#{seg_index}" if map_name else "current#0"
             run.segment = segment_id
             if not map_names and segment_id not in speed_ranges:
@@ -2673,18 +2693,53 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                         respawn_released_for = spawn_mark
             if segment_changed(loaded_map, loaded_index, map_name, seg_index):
                 print(f"collect segment {segment_id}", flush=True)
-                opened = enter_map(bng, map_name, cam_cfg, cams)
-                vehicle, roads, cams, err = opened.vehicle, opened.roads, opened.cameras, opened.error
-                painted = painted_for(map_name)
-                _log_road_heights(map_name, roads, heights_logged)
-                if err or vehicle is None or not roads or not cams:
-                    last_error = err or "no vehicle after load"
-                    _save_progress(done_s, done_s if target_s == float("inf") else target_s)
-                    _publish(None, speed, waypoint)
-                    _write_collect_crash(status_root, last_error, {})
-                    print(f"collect stop {last_error}", flush=True)
-                    run.stop("level_load_failed", last_error)
-                    return 2
+                opened = None
+                reloaded = False
+                if needs_level_reload(loaded_map, map_name) and map_name not in skipped_maps:
+                    prev_vehicle, prev_roads, prev_cams = vehicle, roads, cams
+                    last_load_error = ""
+                    for attempt in range(1, LEVEL_LOAD_ATTEMPTS + 1):
+                        opened = enter_map(bng, map_name, cam_cfg, cams)
+                        vehicle, roads, cams, err = opened.vehicle, opened.roads, opened.cameras, opened.error
+                        painted = painted_for(map_name)
+                        _log_road_heights(map_name, roads, heights_logged)
+                        if not (err or vehicle is None or not roads or not cams):
+                            reloaded = True
+                            break
+                        last_load_error = err or "no vehicle after load"
+                        if attempt < LEVEL_LOAD_ATTEMPTS:
+                            print(
+                                f"collect level load retry {attempt}/{LEVEL_LOAD_ATTEMPTS} "
+                                f"{map_name}: {last_load_error}",
+                                flush=True,
+                            )
+                    if not reloaded:
+                        vehicle, roads, cams = prev_vehicle, prev_roads, prev_cams
+                        if vehicle is not None:
+                            try:
+                                cams = _attach_cameras(bng, vehicle, cam_cfg) or cams
+                            except Exception:
+                                pass
+                        if vehicle is None or not roads or not cams:
+                            last_error = last_load_error
+                            _save_progress(done_s, done_s if target_s == float("inf") else target_s)
+                            _publish(None, speed, waypoint)
+                            _write_collect_crash(status_root, last_error, {})
+                            print(f"collect stop {last_error}", flush=True)
+                            run.stop("level_load_failed", last_error)
+                            return 2
+                        print(
+                            f"collect level load failed {map_name}; respawn on "
+                            f"{loaded_map or 'current'} instead of stopping: {last_load_error}",
+                            flush=True,
+                        )
+                        skipped_maps.add(map_name)
+                        map_name, seg_index = loaded_map, loaded_index
+                        segment_id = f"{map_name}#{seg_index}" if map_name else "current#0"
+                        run.segment = segment_id
+                        painted = painted_for(map_name) if map_name else painted
+                elif not needs_level_reload(loaded_map, map_name):
+                    print(f"collect segment {segment_id} same map; respawn without reload", flush=True)
                 loaded_map = map_name
                 loaded_index = seg_index
                 if args.static_signs:
@@ -2695,14 +2750,15 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 clock = place_excursion_clock(clock, persist=gap_persist, fresh=new_clock)
                 live.reset()
                 segment_aborts = 0
-                cams_ready = False
+                if reloaded:
+                    cams_ready = False
                 segment_open = False
                 follow = RoadFollow()
                 lane_track.reset()
                 label_hit = None
                 gate_note = ""
                 warmup_since = None
-                if opened.spawn is not None:
+                if opened is not None and opened.spawn is not None:
                     spawn_pos = (float(opened.spawn[0]), float(opened.spawn[1]), float(opened.spawn[2]))
                 spawn_seq += 1
                 prev_dir = None

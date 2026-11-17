@@ -98,7 +98,11 @@ def check_vo() -> None:
 
 
 def check_world_fixed() -> None:
-    em = EgoMotion()
+    import argparse
+
+    from python.perception.occ_ego import add_ego_args
+
+    em = EgoMotion.from_args(add_ego_args(argparse.ArgumentParser()).parse_args([]))  # the default: flag OFF
     assert em.source == "camera_vo" and not em.from_vehicle
     px, py, h = 0.0, 0.0, 0.0
     posts_w = None
@@ -109,7 +113,9 @@ def check_world_fixed() -> None:
         k, c = frame_cells(i)
         est = em.update(k, c, i * DT, vehicle=None)
         if i > 0:
-            assert est.ok, i
+            # flag off (default) still warps: camera-VO motion, non-identity and right
+            assert est.ok and est.source == "camera_vo", (i, est)
+            assert abs(est.speed_mps - FWD / DT) < 1.5 and abs(est.yaw_rate - DYAW / DT) < 0.1, (i, est)
             f, y = est.speed_mps * DT, est.yaw_rate * DT
             px += -math.sin(h) * f; py += math.cos(h) * f; h += y
         bev = _static_bev(k, c, G)

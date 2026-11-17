@@ -121,6 +121,25 @@ no dense baseline in this branch, so no crossover is claimed: a dense head would
 query 327,680 points per frame against 5,044 (all cold) to 37,812 (all hot,
 capped) here.
 
+Per-stage counts (`test_occ_cams.check_stage_counts`, 8 cams, `max_points` 16,384,
+grid 327,680 cells; untrained head forced cold / random / all-hot):
+
+| Stage | cold | random head | all-hot |
+|---|---|---|---|
+| fusion + query, 4x coarse (1.6 m) | 5,044 (1.54%) | 5,044 (1.54%) | 5,044 (1.54%) |
+| fusion + query, 2x coarse | 0 | 16,384 (5.0%) | 16,384 (5.0%) |
+| fusion + query, fine (0.4 m) | 0 | 16,384 (5.0%) | 16,384 (5.0%) |
+| head output stored (cells) | 0 | 15,324 (4.7%) | 16,384 (5.0%) |
+| temporal memory: VO static BEV keys | 0 | 3,363 | 1,024 |
+| temporal memory: tracker | 0 tracks | 0 tracks | 0 tracks (<= 64 x 10 positions) |
+
+Plainly: the top level is a sweep of every visible 1.6 m cell (5,044 points,
+1.54% of the fine grid). It is a query list, not a stored volume: the per-point
+features are dropped after the head and only hot cells descend. Temporal memory
+is the tracker's track list and the previous frame's sorted static BEV cell keys
+for VO (no raster: lookup by `np.searchsorted`). No tensor or array the size of
+the grid (3-D or BEV) is allocated at runtime.
+
 ### Cameras: presets, per-camera age, missing cameras
 
 GVD reports the recorder at 8 cams 10/10/10/2/2/1/1/1 Hz, 9.89 Hz overall, 0

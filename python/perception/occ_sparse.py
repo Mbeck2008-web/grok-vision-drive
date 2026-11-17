@@ -128,6 +128,7 @@ class OccPrediction:
     cls: np.ndarray        # their coarse class
     n_coarse: int          # coarse points queried
     n_fine: int            # fine points queried
+    stage_queries: tuple = ()  # points queried per stage: (4x coarse, 2x coarse, fine)
 
     @property
     def n_queried(self) -> int:
@@ -292,12 +293,14 @@ if nn is not None:
             feats = self.encode(images, w)
             cw = torch.from_numpy(w).to(dev)
             pts = self._coarse_pts
+            stages: list[int] = []
             if pts.shape[0] == 0:
                 empty = np.zeros((0,), dtype=np.int64)
                 return OccPrediction(empty, np.zeros((0,), np.float32), np.zeros((0,), np.uint8), 0, 0)
             n_coarse = 0
             for li, f in enumerate(LEVELS):
                 n_coarse += int(pts.shape[0])
+                stages.append(int(pts.shape[0]))
                 p_any = torch.sigmoid(self.query(feats, torch.from_numpy(pts).to(dev).unsqueeze(0), cw)["any"][0, :, li].float()).cpu().numpy()
                 sel = p_any >= float(coarse_thresh)
                 hot, p_hot = pts[sel], p_any[sel]
@@ -311,14 +314,16 @@ if nn is not None:
                     break
             if pts.shape[0] == 0:
                 empty = np.zeros((0,), dtype=np.int64)
-                return OccPrediction(empty, np.zeros((0,), np.float32), np.zeros((0,), np.uint8), n_coarse, 0)
+                return OccPrediction(empty, np.zeros((0,), np.float32), np.zeros((0,), np.uint8), n_coarse, 0,
+                                    tuple(stages + [0] * (len(LEVELS) + 1 - len(stages))))
             out = self.query(feats, torch.from_numpy(pts).to(dev).unsqueeze(0), cw)
             p = torch.sigmoid(out["occ"][0].float()).cpu().numpy()
             c = out["cls"][0].float().argmax(-1).cpu().numpy().astype(np.uint8)
             sel = p >= float(fine_thresh)
             keys = grid.keys_of(pts[sel].astype(np.float64))
             order = np.argsort(keys)
-            return OccPrediction(keys[order], p[sel][order], c[sel][order], n_coarse, int(pts.shape[0]))
+            return OccPrediction(keys[order], p[sel][order], c[sel][order], n_coarse, int(pts.shape[0]),
+                                 tuple(stages) + (int(pts.shape[0]),))
 
 
 def profile_cams(cfg: Any, profile: str, *, scale: float = 1.0) -> list[PinholeCam]:

@@ -162,6 +162,40 @@ def check_sparsity_begins() -> None:
           f"queried {pred.n_queried} ({pred.queried_ratio():.4f} of dense); dense tensors are 8 2-D feature maps only OK")
 
 
+def check_stage_counts() -> None:
+    """Every runtime stage is a sparse set: counts vs the 327,680-cell grid."""
+    from python.perception.occ_ego import EgoMotion, _static_bev, runtime_frame
+    from python.perception.occ_outputs import OccTracker
+
+    cams = _cams()
+    torch.manual_seed(0)
+    net = SparseOccNet(cams).eval()
+    dense = DEFAULT_GRID.dense_cells
+    imgs = [torch.rand(1, 3, c.height, c.width) for c in cams]
+    rows = []
+    for name, any0, any1, occ in (("cold", -10.0, -10.0, -10.0), ("half", 0.0, 0.0, 0.0), ("all-hot", 10.0, 10.0, 10.0)):
+        with torch.no_grad():
+            net.head[-1].weight.zero_(); net.head[-1].bias.zero_()
+            net.head[-1].bias[0], net.head[-1].bias[1], net.head[-1].bias[2] = occ, any0, any1
+            if name == "half":  # data-dependent: let the random weights decide
+                torch.manual_seed(3); net.head[-1].reset_parameters()
+        pred = net.predict(imgs, max_points=16384)
+        tr, ego = OccTracker(), EgoMotion()
+        out = runtime_frame(pred, tr, ego, 0.0)
+        out = runtime_frame(pred, tr, ego, 0.1)
+        vo = len(_static_bev(pred.keys, pred.cls, DEFAULT_GRID))
+        mem = sum(len(t.hist) for t in tr.tracks)
+        assert len(pred.stage_queries) == 3 and sum(pred.stage_queries) == pred.n_queried
+        assert max(pred.stage_queries) <= 16384 + 64 and pred.keys.size <= pred.stage_queries[-1]
+        assert pred.stage_queries[0] < 0.02 * dense and vo <= pred.keys.size and mem <= 64 * 10
+        rows.append((name, pred.stage_queries, pred.keys.size, vo, len(tr.tracks), mem))
+    for name, st, kept, vo, ntr, mem in rows:
+        print(f"stages [{name}] of {dense} grid cells: fusion/query 4x={st[0]} ({st[0] / dense:.4f}) 2x={st[1]} "
+              f"({st[1] / dense:.4f}) fine={st[2]} ({st[2] / dense:.4f}); head output stored {kept} ({kept / dense:.4f}); "
+              f"temporal memory: VO {vo} static BEV keys, tracker {ntr} tracks / {mem} positions")
+    print("stage counts: every stage a sparse set, none allocates the grid OK")
+
+
 def check_checkpoints(tmp: Path) -> None:
     cams = _cams(64)
     torch.manual_seed(0)
@@ -224,6 +258,7 @@ def main() -> int:
     check_presets()
     check_ages()
     check_sparsity_begins()
+    check_stage_counts()
     with tempfile.TemporaryDirectory() as d:
         check_checkpoints(Path(d))
     print("test_occ_cams: all OK")

@@ -1,7 +1,7 @@
 """Ego motion for the occupancy tracker, deploy-valid sources only.
 
 Default (``camera_vo``): camera-only odometry from the net's own sparse
-occupancy. The static (non-vehicle) BEV cells of the previous frame are
+occupancy (sparse: sorted BEV cell keys, no raster or dense grid). The static (non-vehicle) BEV cells of the previous frame are
 registered onto the current frame by a coarse-to-fine search over forward
 travel and yaw; the best overlap gives ``(speed_mps, yaw_rate)``. Nothing but
 the predicted cells is read.
@@ -65,13 +65,20 @@ def _warp(xy: np.ndarray, fwd: float, dyaw: float) -> np.ndarray:
     return np.stack([c * x + s * y, -s * x + c * y], axis=1)
 
 
-def _score(prev: np.ndarray, ras: np.ndarray, grid: OccGrid, fwd: float, dyaw: float) -> float:
+def _bev_keys(xy: np.ndarray, grid: OccGrid) -> np.ndarray:
     v = float(grid.voxel_m)
-    w = _warp(prev, fwd, dyaw)
-    ix = np.floor((w[:, 0] - grid.x_min) / v).astype(np.int64)
-    iy = np.floor((w[:, 1] - grid.y_min) / v).astype(np.int64)
-    ok = (ix >= 0) & (ix < ras.shape[0]) & (iy >= 0) & (iy < ras.shape[1])
-    return float(ras[ix[ok], iy[ok]].sum()) / float(len(prev))
+    nx, ny, _ = grid.shape
+    ix = np.floor((xy[:, 0] - grid.x_min) / v).astype(np.int64)
+    iy = np.floor((xy[:, 1] - grid.y_min) / v).astype(np.int64)
+    ok = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)
+    return np.where(ok, ix * ny + iy, -1)
+
+
+def _score(prev: np.ndarray, cur_keys: np.ndarray, grid: OccGrid, fwd: float, dyaw: float) -> float:
+    """Share of warped previous cells that hit a current cell. Sparse: sorted key lookup, no raster."""
+    k = _bev_keys(_warp(prev, fwd, dyaw), grid)
+    pos = np.clip(np.searchsorted(cur_keys, k), 0, len(cur_keys) - 1)
+    return float(((cur_keys[pos] == k) & (k >= 0)).sum()) / float(len(prev))
 
 
 def occ_odometry(prev_keys, prev_cls, cur_keys, cur_cls, *, grid: OccGrid = DEFAULT_GRID) -> tuple[float, float, float]:
@@ -79,11 +86,8 @@ def occ_odometry(prev_keys, prev_cls, cur_keys, cur_cls, *, grid: OccGrid = DEFA
     prev, cur = _static_bev(prev_keys, prev_cls, grid), _static_bev(cur_keys, cur_cls, grid)
     if len(prev) < VO_MIN_CELLS or len(cur) < VO_MIN_CELLS:
         return 0.0, 0.0, 0.0
-    v = float(grid.voxel_m)
-    nx, ny, _ = grid.shape
-    ras = np.zeros((nx, ny), dtype=bool)
-    ci = np.floor((cur - np.array([grid.x_min, grid.y_min])) / v).astype(np.int64)
-    ras[np.clip(ci[:, 0], 0, nx - 1), np.clip(ci[:, 1], 0, ny - 1)] = True
+    cur_keys = np.unique(_bev_keys(cur, grid))
+    cur_keys = cur_keys[cur_keys >= 0]
     best = (-1.0, 0.0, 0.0)
     for step_f, step_y, span_f, span_y in ((0.2, 0.01, None, None), (0.05, 0.0025, 0.3, 0.015)):
         if span_f is None:
@@ -94,7 +98,7 @@ def occ_odometry(prev_keys, prev_cls, cur_keys, cur_cls, *, grid: OccGrid = DEFA
             ys = best[2] + np.arange(-span_y, span_y + 1e-9, step_y)
         for f in fs:
             for yw in ys:
-                sc = _score(prev, ras, grid, float(f), float(yw))
+                sc = _score(prev, cur_keys, grid, float(f), float(yw))
                 if sc > best[0] + 1e-9:
                     best = (sc, float(f), float(yw))
     return best[1], best[2], best[0]

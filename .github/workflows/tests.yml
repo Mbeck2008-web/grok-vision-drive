@@ -39,6 +39,19 @@ jobs:
       - name: Lua 5.1 and a display
         run: sudo apt-get update && sudo apt-get install -y lua5.1 xvfb
 
+      - name: C++ viz toolchain (CMake, Ninja, Mesa EGL llvmpipe)
+        run: sudo apt-get install -y cmake ninja-build g++ libegl1 libegl-mesa0 libgl1-mesa-dri
+
+      - name: C++ viz build + ctest (headless EGL)
+        # docs/specs/viz_cpp.md. glad/stb are vendored; glm + nlohmann_json are
+        # pinned FetchContent tarballs. Renders on Mesa llvmpipe (no GPU).
+        working-directory: cpp/viz
+        run: |
+          cmake --preset linux-release
+          cmake --build --preset linux-release --parallel
+          ./build/linux-release/gvd_viz --info --offline tests/scenes/basic.jsonl --png build/ci_basic.png
+          ctest --preset linux-release
+
       - name: Python packages
         run: |
           python -m pip install --upgrade pip
@@ -62,4 +75,6 @@ jobs:
       - name: Offline suite
         # opencv's Qt build only ships the xcb plugin. A headless runner aborts
         # in cv2.namedWindow (the train panel). xvfb is a display, not offscreen Qt.
+        env:
+          GVD_VIZ_BUILD_DIR: ${{ github.workspace }}/cpp/viz/build/linux-release
         run: xvfb-run -a python scripts/run_offline_suite.py

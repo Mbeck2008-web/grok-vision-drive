@@ -1870,6 +1870,22 @@ def _paint_alt(
     )
 
 
+_VOID_TEMPLATES: dict[tuple[int, int], np.ndarray] = {}
+
+
+def _void_canvas(h: int, w: int) -> np.ndarray:
+    """VOID-filled frame. Filling with a colour tuple costs ms at 1280x720;
+    copying a cached template is a memcpy. Same pixels as np.full."""
+    key = (int(h), int(w))
+    tpl = _VOID_TEMPLATES.get(key)
+    if tpl is None:
+        if len(_VOID_TEMPLATES) > 8:
+            _VOID_TEMPLATES.clear()
+        tpl = np.full((key[0], key[1], 3), VOID, dtype=np.uint8)
+        _VOID_TEMPLATES[key] = tpl
+    return tpl.copy()
+
+
 def render_stage(
     state: dict[str, Any],
     ui: VizUI | None = None,
@@ -1894,7 +1910,7 @@ def render_stage(
         width=stage_w,
         height=stage_h,
     )
-    img = np.full((stage_h, stage_w, 3), VOID, dtype=np.uint8)
+    img = _void_canvas(stage_h, stage_w)
 
     if is_bus_mismatch(state):
         _draw_mismatch(img, state)

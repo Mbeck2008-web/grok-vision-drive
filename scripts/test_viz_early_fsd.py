@@ -160,7 +160,9 @@ def test_colors() -> None:
     frame = _render(_base(), _ui())
     cam = make_early_cam(1280, 720)
     assert _is_white(_pix(frame, *cam.project(-3.2, 8.0, GROUND_Z)))
-    assert _is_purple(_pix(frame, *cam.project(-6.2, 8.0, GROUND_Z))), "outer lane is purple"
+    # Michael's paint rule: an outer lane with no paint tag is white, never purple.
+    outer = _pix(frame, *cam.project(-6.2, 8.0, GROUND_Z))
+    assert _is_white(outer) and not _is_purple(outer), outer
     assert _is_red(_pix(frame, *cam.project(-8.8, 8.0, GROUND_Z))), "curb is red"
     assert _is_blue(_pix(frame, *cam.project(2.8, 8.0, GROUND_Z))), "path is blue"
     assert int(_pix(frame, *cam.project(2.8, 9.0, GROUND_Z)).max()) < 30, "path dots have gaps"
@@ -270,6 +272,128 @@ def test_overlay_and_ground_lock() -> None:
     print("overlay camera, speed bar, ground lock OK")
 
 
+def test_lane_paint_colors() -> None:
+    """White paint white, yellow paint yellow, red only for edges, no purple."""
+    from python.viz import early_vector as ev
+
+    white, yellow = ev.LANE_WHITE, ev.LANE_YELLOW
+    assert not hasattr(ev, "LANE_PURPLE"), "no purple lane colour exists"
+    for rec in (
+        {"index": 2, "kind": "predicted"},
+        {"index": -3, "role": "merge"},
+        {"index": 1, "role": "exit"},
+        {"paint": "white"},
+        {"material": "line_dashed_long"},
+        {},
+    ):
+        assert ev.lane_bgr(rec) == white, rec
+    for rec in (
+        {"paint": "yellow"},
+        {"paint_color": "Yellow"},
+        {"color": "yellow"},
+        {"material": "line_dashed_short_yellow"},
+        {"material": "line_yellowblack", "index": 3, "kind": "predicted"},
+    ):
+        assert ev.lane_bgr(rec) == yellow, rec
+    assert ev.lane_bgr({"paint": "yellow"}) != ev.EDGE_RED
+    assert ev.lane_bgr({}) != ev.EDGE_RED
+
+    # Rendered: a yellow-paint lane is yellow; the other lanes white.
+    st = _base()
+    st["tracks"] = []
+    st["signs"] = []
+    st["lanes_ext"] = [
+        dict(_lane(-3.2, -1), paint="yellow"),
+        _lane(1.8, 1),
+        _lane(-6.2, -2, kind="predicted"),
+    ]
+    frame = _render(st, _ui())
+    cam = ev.make_early_cam(1280, 720)
+    assert _is_yellow(_pix(frame, *cam.project(-3.2, 8.0, ev.GROUND_Z))), "yellow paint"
+    assert _is_white(_pix(frame, *cam.project(1.8, 8.0, ev.GROUND_Z))), "white paint"
+    assert _is_white(_pix(frame, *cam.project(-6.2, 8.0, ev.GROUND_Z))), "predicted lane white"
+    assert _is_red(_pix(frame, *cam.project(-8.8, 8.0, ev.GROUND_Z))), "edge stays red"
+
+    # Top-down has no ego (no tail lamps): lanes alone give no red, no purple.
+    st["road_edges"] = []
+    st["path_ego"] = []
+    st["lanes_ext"].append(_lane(5.0, 3, kind="predicted"))
+    td = _render(st, _ui(top_down=True), w=640, h=480).astype(np.int16)
+    b, g, r = td[..., 0], td[..., 1], td[..., 2]
+    purple = (b > 120) & (r > 120) & (g < 90)
+    red = (r > 150) & (r > g + 60) & (r > b + 60)
+    assert int(purple.sum()) == 0, int(purple.sum())
+    assert int(red.sum()) == 0, int(red.sum())
+    print("lane paint colours: white / yellow / red edges, no purple OK")
+
+
+def test_dashes_not_dots() -> None:
+    """Lane paint is a short dash along the line, so it reaches past a dot radius."""
+    from python.viz.early_vector import DASH_M, DOT_RADIUS_PX_MAX, GROUND_Z, LANE_STEP_M, make_early_cam
+
+    cross = {
+        "points": [{"x": float(x), "y": 10.0} for x in range(-8, 9, 2)],
+        "kind": "detected",
+        "index": 3,
+    }
+    st = {"lanes_ext": [cross], "path_ego": [], "tracks": [], "road_edges": [], "signs": []}
+    frame = _render(st, _ui())
+    cam = make_early_cam(1280, 720)
+    u0, v0 = cam.project(-8.0, 10.0, GROUND_Z)
+    assert _is_white(_pix(frame, u0, v0)), _pix(frame, u0, v0)
+    u1, v1 = cam.project(-8.0 + 0.25, 10.0, GROUND_Z)
+    assert u1 - u0 > DOT_RADIUS_PX_MAX + 1, (u0, u1)
+    assert _is_white(_pix(frame, u1, v1)), "dash runs along the line past a dot radius"
+    gap_x = -8.0 + (DASH_M + LANE_STEP_M) * 0.5
+    ug, vg = cam.project(gap_x, 10.0, GROUND_Z)
+    assert int(_pix(frame, ug, vg).max()) < 40, "dashes keep a gap"
+    print("lane dashes, not dots OK")
+
+
+def test_chase_lens_and_ego_model() -> None:
+    """High chase lens (horizon in the top quarter, small ego low) and a shaded car."""
+    from python.viz.early_vector import EGO_TAIL, make_early_cam
+
+    w, h = 1280, 720
+    cam = make_early_cam(w, h)
+    _u, v_far = cam.project(0.0, 150.0, 0.0)
+    assert v_far < 0.25 * h, v_far
+    _u, v_ego = cam.project(0.0, 0.0, 0.0)
+    assert 0.62 * h < v_ego < 0.8 * h, v_ego
+    ul, _ = cam.project(-0.92, 0.0, 0.5)
+    ur, _ = cam.project(0.92, 0.0, 0.5)
+    assert 0.06 * w < ur - ul < 0.12 * w, ur - ul
+
+    frame = _render({}, _ui())
+    roof = _pix(frame, *cam.project(0.0, 0.2, 1.41))
+    assert int(roof.max()) < 90, ("glass roof is dark", roof)
+    deck = _pix(frame, *cam.project(0.0, -1.9, 0.94))
+    assert int(deck.min()) > 180, ("trunk deck is white", deck)
+    for sx in (-0.6, 0.6):
+        lamp = _pix(frame, *cam.project(sx, -2.36, 0.62))
+        assert tuple(int(c) for c in lamp) == EGO_TAIL, ("tail lamp", lamp)
+    print("chase lens, ego car model OK")
+
+
+def test_crosswalk_zebra() -> None:
+    from python.viz.early_vector import (
+        GROUND_Z, STOP_LINE_M, ZEBRA_BAR_M, ZEBRA_DEPTH_M, ZEBRA_GAP_M, ZEBRA_OFFSET_M, make_early_cam,
+    )
+
+    y = 20.0
+    st = {"signs": [{"cls": "stop_sign", "x": -6.0, "y": y}], "tracks": [], "path_ego": [], "lanes_ext": []}
+    frame = _render(st, _ui())
+    cam = make_early_cam(1280, 720)
+    bar = _pix(frame, *cam.project(0.0, y + STOP_LINE_M * 0.5, GROUND_Z))
+    assert _is_white(bar), ("stop bar", bar)
+    zy = y + STOP_LINE_M + ZEBRA_OFFSET_M + ZEBRA_DEPTH_M * 0.5
+    stripe = _pix(frame, *cam.project(-4.2 + ZEBRA_BAR_M * 0.5, zy, GROUND_Z))
+    assert int(stripe.min()) > 120 and int(stripe.max()) - int(stripe.min()) < 20, ("zebra stripe", stripe)
+    gap = _pix(frame, *cam.project(-4.2 + ZEBRA_BAR_M + ZEBRA_GAP_M * 0.5, zy, GROUND_Z))
+    assert int(gap.max()) < 40, ("zebra gap", gap)
+    print("stop bar and zebra crosswalk OK")
+
+
 def test_parser_and_time() -> None:
     from python.run_vision import build_parser
 
@@ -301,6 +425,10 @@ def main() -> None:
     test_curve_follows_polyline()
     test_zero_and_legacy_and_gt()
     test_overlay_and_ground_lock()
+    test_lane_paint_colors()
+    test_dashes_not_dots()
+    test_chase_lens_and_ego_model()
+    test_crosswalk_zebra()
     test_parser_and_time()
     print("test_viz_early_fsd: OK")
 

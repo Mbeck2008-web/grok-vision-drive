@@ -31,24 +31,38 @@ from python.viz.stage import (
 
 # World spacing. Screen gaps shrink because the chase lens compresses distance.
 GROUND_Z = 0.05
-LANE_STEP_M = 2.0
+# Lane paint draws as short dashes (DASH_M long, gap to the next start is
+# LANE_STEP_M); far away a dash shrinks to a dot, like the early beta.
+LANE_STEP_M = 1.6
+DASH_M = 0.55
+DASH_WIDTH_M = 0.16
+DASH_PX_MAX = 5
+DASH_PX_LEN_MAX = 14
 PATH_STEP_M = 2.0
-EDGE_STEP_M = 1.6
+EDGE_STEP_M = 0.8
 DOT_RADIUS_M = 0.15
 DOT_RADIUS_PX_MAX = 6
-DRAW_FAR_M = 90.0
+DRAW_FAR_M = 150.0
+THIN_FROM_M = 40.0
 CENTER_Z_FRAC = 0.55
 LIGHT_Z = 4.8
 SIGN_Z = 2.6
-EARLY_EYE = (0.0, -8.4, 3.15)
-EARLY_LOOK = (0.0, 22.0, 0.15)
-EARLY_FOV = 46.0
-EGO_GLOW_RADII = (150, 96, 54)
+# High chase lens looking down about 17 deg: the horizon sits near the top
+# fifth, the ego is small in the lower third, like the early-beta refs.
+EARLY_EYE = (0.0, -21.0, 6.6)
+EARLY_LOOK = (0.0, 14.3, 0.0)
+EARLY_FOV = 30.0
+# Ground halo around the ego (world meters) and the headlight wash ahead.
+EGO_HALO_M = (1.9, 2.9)
+EGO_HALO_GAIN = 0.55
+EGO_WASH_GAIN = 0.35
 
 BG = (0, 0, 0)
+# Lane colour is the real paint: white paint white, yellow paint yellow.
+# Red is only road edges and curbs. No purple lane colour.
 LANE_WHITE = (245, 245, 245)
+LANE_YELLOW = (30, 210, 255)
 EDGE_RED = (40, 40, 255)
-LANE_PURPLE = (220, 40, 210)
 PATH_BGR = (255, 190, 70)
 LEAD_BGR = (70, 255, 80)
 CAR_BGR = (255, 100, 40)
@@ -107,8 +121,19 @@ def make_early_cam(
         height=int(height),
         eye_override=EARLY_EYE,
         look_override=EARLY_LOOK,
-        fov_deg=EARLY_FOV,
+        fov_deg=early_fov_deg(int(width), int(height)),
     )
+
+
+def early_fov_deg(width: int, height: int) -> float:
+    """Vertical FOV. 16:9 and wider use EARLY_FOV. A square or portrait frame
+    widens it so the side lanes stay in view (about 0.6 of the 16:9 width)."""
+    if width <= 0 or height <= 0:
+        return EARLY_FOV
+    tan_v = math.tan(math.radians(EARLY_FOV) * 0.5)
+    tan_h_min = tan_v * (16.0 / 9.0) * 0.6
+    need = tan_h_min * float(height) / float(width)
+    return math.degrees(2.0 * math.atan(max(tan_v, need)))
 
 
 def walk_dots(pts: Any, step_m: float) -> list[tuple[float, float]]:
@@ -183,16 +208,25 @@ def role_bgr(tr: dict[str, Any], cipv_id: int | None) -> tuple[int, int, int]:
     return OTHER_BGR
 
 
+_PAINT_KEYS = ("paint", "paint_color", "color", "colour", "material", "line_color")
+
+
 def lane_bgr(record: dict[str, Any]) -> tuple[int, int, int]:
-    """Ego pair stays white. Merge, exit, predicted, and outer lanes are purple."""
-    kind = str(record.get("kind") or "")
-    role = str(record.get("role") or "through")
-    try:
-        idx = abs(int(record.get("index") if record.get("index") is not None else 1))
-    except (TypeError, ValueError):
-        idx = 1
-    if kind == "predicted" or role in ("merge", "exit") or idx >= 2:
-        return LANE_PURPLE
+    """Real paint colour. Yellow paint (a centre line) is yellow, else white.
+
+    The paint comes from the lane record when a label or the fit carries it
+    (``paint`` / ``color`` / ``material`` such as ``line_yellow``). Lane index,
+    kind and role never change the colour, so nothing is purple. Red stays
+    for road edges and curbs (``EDGE_RED``), never a lane line.
+    """
+    if not isinstance(record, dict):
+        return LANE_WHITE
+    for key in _PAINT_KEYS:
+        raw = record.get(key)
+        if isinstance(raw, str) and "yellow" in raw.lower():
+            return LANE_YELLOW
+    if record.get("yellow") is True:
+        return LANE_YELLOW
     return LANE_WHITE
 
 
@@ -243,7 +277,7 @@ def _dot(img: np.ndarray, project: Project, x: float, y: float, z: float,
     else:
         rad = int(round(math.hypot(p1[0] - p0[0], p1[1] - p0[1])))
     rad = max(2, min(DOT_RADIUS_PX_MAX, rad))
-    cv2.circle(img, p0, rad, color, -1, cv2.LINE_8)
+    cv2.circle(img, p0, rad, color, -1, cv2.LINE_AA)
 
 
 def draw_dotted(
@@ -256,10 +290,87 @@ def draw_dotted(
     z: float = GROUND_Z,
     radius_m: float = DOT_RADIUS_M,
 ) -> None:
+    last: tuple[float, float] | None = None
     for x, y in walk_dots(pts, step_m):
         if y > DRAW_FAR_M:
             continue
+        # Past THIN_FROM_M the lens packs dots together; thin them with depth.
+        if last is not None and y > THIN_FROM_M:
+            if math.hypot(x - last[0], y - last[1]) < step_m * (y / THIN_FROM_M) - 1e-6:
+                continue
+        last = (x, y)
         _dot(img, project, x, y, z, color, radius_m)
+
+
+def walk_dashes(pts: Any, step_m: float) -> list[tuple[float, float, float, float]]:
+    """Dash starts spaced by arc length, each with the unit heading there."""
+    seq: list[tuple[float, float]] = []
+    for p in pts or []:
+        if isinstance(p, dict):
+            seq.append((float(p.get("x") or 0.0), float(p.get("y") or 0.0)))
+        else:
+            try:
+                seq.append((float(p[0]), float(p[1])))
+            except (TypeError, IndexError, ValueError):
+                continue
+    if len(seq) < 2:
+        return [(seq[0][0], seq[0][1], 0.0, 1.0)] if seq else []
+    step = float(step_m) if float(step_m) > 1e-3 else 1.0
+    out: list[tuple[float, float, float, float]] = []
+    remain = 0.0
+    for (ax, ay), (bx, by) in zip(seq, seq[1:]):
+        dx, dy = bx - ax, by - ay
+        seg = math.hypot(dx, dy)
+        if seg < 1e-8:
+            continue
+        ux, uy = dx / seg, dy / seg
+        travelled = remain
+        while travelled <= seg + 1e-8:
+            out.append((ax + ux * travelled, ay + uy * travelled, ux, uy))
+            travelled += step
+        remain = travelled - seg
+    return out
+
+
+def draw_dashed(
+    img: np.ndarray,
+    pts: Any,
+    project: Project,
+    color: tuple[int, int, int],
+    step_m: float = LANE_STEP_M,
+    *,
+    dash_m: float = DASH_M,
+    width_m: float = DASH_WIDTH_M,
+    z: float = GROUND_Z,
+) -> None:
+    """Lane paint as short dashes along the line. Far dashes become dots."""
+    h, w = img.shape[:2]
+    last: tuple[float, float] | None = None
+    for x, y, ux, uy in walk_dashes(pts, step_m):
+        if y > DRAW_FAR_M:
+            continue
+        if last is not None and y > THIN_FROM_M:
+            if math.hypot(x - last[0], y - last[1]) < step_m * (y / THIN_FROM_M) - 1e-6:
+                continue
+        last = (x, y)
+        a = project(x, y, z)
+        if a is None or not (-8 <= a[0] < w + 8 and -8 <= a[1] < h + 8):
+            continue
+        b = project(x + ux * dash_m, y + uy * dash_m, z)
+        side = project(x + uy * width_m, y - ux * width_m, z)
+        if b is None:
+            b = a
+        th = 2
+        if side is not None:
+            th = int(round(math.hypot(side[0] - a[0], side[1] - a[1])))
+        th = max(2, min(DASH_PX_MAX, th))
+        # Near the lens a dash would stretch into a bar; keep it a short tick.
+        du, dv = b[0] - a[0], b[1] - a[1]
+        dl = math.hypot(du, dv)
+        cap = DASH_PX_LEN_MAX
+        if dl > cap:
+            b = (a[0] + int(du * cap / dl), a[1] + int(dv * cap / dl))
+        cv2.line(img, a, b, color, th, cv2.LINE_AA)
 
 
 def _box_corners(x: float, y: float, yaw: float, length: float, width: float) -> list[tuple[float, float]]:
@@ -294,7 +405,13 @@ def draw_wire_box(
             return
         bot.append(b)
         top.append(t)
-    dim = tuple(max(0, c // 3) for c in color)
+    # Neon tube: a wide dim halo, a mid band, then a bright core. Line width
+    # follows distance so near boxes read thick like the refs.
+    span = max(abs(top[0][1] - bot[0][1]), abs(top[2][1] - bot[2][1]))
+    core = 2 if span < 36 else (3 if span < 110 else 4)
+    halo = tuple(max(0, c // 5) for c in color)
+    mid = tuple(max(0, (c * 5) // 9) for c in color)
+    hot = tuple(min(255, c + (255 - c) // 4) for c in color)
     edges = []
     for i in range(4):
         j = (i + 1) % 4
@@ -302,13 +419,20 @@ def draw_wire_box(
         edges.append((top[i], top[j]))
         edges.append((bot[i], top[i]))
     for a, b in edges:
-        cv2.line(img, a, b, dim, 2, cv2.LINE_8)
+        cv2.line(img, a, b, halo, core + 5, cv2.LINE_8)
     for a, b in edges:
-        cv2.line(img, a, b, color, 1, cv2.LINE_8)
+        cv2.line(img, a, b, mid, core + 2, cv2.LINE_AA)
+    for a, b in edges:
+        cv2.line(img, a, b, color, core, cv2.LINE_AA)
+    if core >= 3:
+        for a, b in edges:
+            cv2.line(img, a, b, hot, 1, cv2.LINE_AA)
     if center:
         c = project(x, y, height * CENTER_Z_FRAC)
         if c is not None:
-            cv2.circle(img, c, 3, color, -1, cv2.LINE_8)
+            rad = max(3, min(14, int(span * 0.11)))
+            cv2.circle(img, c, rad + 2, mid, -1, cv2.LINE_AA)
+            cv2.circle(img, c, rad, color, -1, cv2.LINE_AA)
 
 
 def _yaw_of(tr: dict[str, Any]) -> float:
@@ -342,6 +466,15 @@ def draw_tracks(
         draw_wire_box(img, project, x, y, _yaw_of(tr), length, width, height, color)
 
 
+def _meters_px(project: Project, anchor: tuple[int, int], x: float, y: float, z: float,
+               meters: float, lo: int, hi: int) -> int:
+    """Pixel size of ``meters`` across at that point, clamped."""
+    side = project(x + meters, y, z)
+    if side is None:
+        return lo
+    return max(lo, min(hi, int(abs(side[0] - anchor[0]))))
+
+
 def draw_light_icon(img: np.ndarray, anchor: tuple[int, int], state: str, scale: int) -> None:
     w = max(10, int(scale))
     h = int(w * 2.5)
@@ -372,48 +505,174 @@ def draw_stop_icon(img: np.ndarray, anchor: tuple[int, int], scale: int) -> None
     cv2.polylines(img, [poly], True, (240, 240, 240), 1, cv2.LINE_8)
 
 
+ZEBRA_BAR_M = 0.5
+ZEBRA_GAP_M = 0.6
+ZEBRA_DEPTH_M = 3.0
+ZEBRA_OFFSET_M = 1.2
+STOP_LINE_M = 0.45
+ZEBRA_BGR = (185, 185, 185)
+STOP_BGR = (245, 245, 245)
+
+
+def _ground_quad(project: Project, pts: list[tuple[float, float]]) -> np.ndarray | None:
+    pix = []
+    for x, y in pts:
+        got = project(x, y, GROUND_Z)
+        if got is None:
+            return None
+        pix.append(got)
+    return np.array(pix, dtype=np.int32)
+
+
 def draw_crosswalk(img: np.ndarray, project: Project, y: float, half_w: float = 4.2) -> None:
-    """Two transverse dotted bars. A stop or a light is enough to place them."""
-    for yy in (y, y + 2.4):
-        xs = np.arange(-half_w, half_w + 0.01, 0.75)
-        for x in xs:
-            _dot(img, project, float(x), float(yy), GROUND_Z, LANE_WHITE, 0.12)
+    """Solid white stop bar at ``y``, then a zebra crosswalk just past it.
+
+    Zebra bars run along the road (ZEBRA_BAR_M wide, ZEBRA_GAP_M apart) and
+    are filled grey with a white rim, so they read as paint, not as lanes.
+    """
+    bar = _ground_quad(project, [(-half_w, y), (half_w, y), (half_w, y + STOP_LINE_M), (-half_w, y + STOP_LINE_M)])
+    if bar is not None:
+        cv2.fillPoly(img, [bar], STOP_BGR, cv2.LINE_AA)
+    y0 = y + STOP_LINE_M + ZEBRA_OFFSET_M
+    y1 = y0 + ZEBRA_DEPTH_M
+    x = -half_w
+    rim = (205, 205, 205)
+    while x + ZEBRA_BAR_M <= half_w + 1e-6:
+        quad = _ground_quad(project, [(x, y0), (x + ZEBRA_BAR_M, y0), (x + ZEBRA_BAR_M, y1), (x, y1)])
+        if quad is not None:
+            cv2.fillPoly(img, [quad], ZEBRA_BGR, cv2.LINE_AA)
+            cv2.polylines(img, [quad], True, rim, 1, cv2.LINE_AA)
+        x += ZEBRA_BAR_M + ZEBRA_GAP_M
 
 
-def _sedan_faces() -> list[tuple[list[tuple[float, float, float]], tuple[int, int, int]]]:
-    w = EGO_WIDTH_M * 0.5
-    body = (198, 200, 204)
-    roof = (226, 228, 232)
-    glass = (42, 40, 38)
-    side = (168, 170, 176)
-    lamp = (50, 50, 230)
-    faces: list[tuple[list[tuple[float, float, float]], tuple[int, int, int]]] = []
+# Low-poly ego: cross-sections from the rear bumper to the nose, lofted into
+# quads and shaded by one light. Each row: y, body half-width, sill z,
+# belt z, roof half-width, roof z, is_cabin (side and top panels are glass).
+EGO_SECTIONS: tuple[tuple[float, float, float, float, float, float, bool], ...] = (
+    (-2.34, 0.82, 0.36, 0.66, 0.66, 0.74, False),
+    (-2.24, 0.90, 0.32, 0.84, 0.74, 0.90, False),
+    (-1.80, 0.93, 0.30, 0.88, 0.72, 0.95, False),
+    (-1.35, 0.94, 0.30, 0.90, 0.64, 1.00, True),
+    (-0.25, 0.94, 0.30, 0.92, 0.58, 1.40, True),
+    (0.80, 0.94, 0.30, 0.92, 0.58, 1.42, True),
+    (1.35, 0.94, 0.30, 0.88, 0.70, 0.98, True),
+    (2.05, 0.90, 0.32, 0.76, 0.72, 0.82, False),
+    (2.36, 0.74, 0.36, 0.58, 0.56, 0.64, False),
+)
+EGO_BODY = (222, 224, 228)
+EGO_GLASS = (46, 42, 40)
+EGO_TAIL = (40, 30, 225)
+EGO_SHADOW = (14, 14, 16)
+_LIGHT = (-0.30, 0.40, 0.87)
+_GLASS_SEGS = (2, 3, 4)
 
-    def q(pts: list[tuple[float, float, float]], col: tuple[int, int, int]) -> None:
-        faces.append((pts, col))
 
-    q([(-w, -2.15, 0.28), (w, -2.15, 0.28), (w, -2.15, 0.86), (-w, -2.15, 0.86)], body)
-    q([(-w * 0.96, -2.05, 0.86), (w * 0.96, -2.05, 0.86), (w * 0.9, -0.55, 0.95), (-w * 0.9, -0.55, 0.95)], body)
-    q([(-w * 0.78, -0.50, 0.98), (w * 0.78, -0.50, 0.98), (w * 0.70, -0.15, 1.36), (-w * 0.70, -0.15, 1.36)], glass)
-    q([(-w * 0.72, -0.12, 1.38), (w * 0.72, -0.12, 1.38), (w * 0.68, 0.85, 1.34), (-w * 0.68, 0.85, 1.34)], roof)
-    q([(-w * 0.72, 0.90, 1.30), (w * 0.72, 0.90, 1.30), (w * 0.86, 1.55, 0.92), (-w * 0.86, 1.55, 0.92)], glass)
-    q([(-w * 0.90, 1.50, 0.88), (w * 0.90, 1.50, 0.88), (w * 0.92, 2.20, 0.70), (-w * 0.92, 2.20, 0.70)], body)
-    q([(-w, -2.15, 0.28), (-w, 2.20, 0.32), (-w, 2.20, 0.78), (-w, -2.15, 0.86)], side)
-    q([(w, -2.15, 0.28), (w, 2.20, 0.32), (w, 2.20, 0.78), (w, -2.15, 0.86)], body)
-    q([(-w * 0.72, -2.16, 0.52), (-w * 0.28, -2.16, 0.52), (-w * 0.28, -2.16, 0.72), (-w * 0.72, -2.16, 0.72)], lamp)
-    q([(w * 0.28, -2.16, 0.52), (w * 0.72, -2.16, 0.52), (w * 0.72, -2.16, 0.72), (w * 0.28, -2.16, 0.72)], lamp)
+def _ego_ring(sec: tuple[float, float, float, float, float, float, bool]) -> list[tuple[float, float, float]]:
+    """Cross-section: sill, rounded flank, shoulder, roof, then mirrored."""
+    y, hw, z0, zb, rw, zr, _cab = sec
+    zm = z0 + (zb - z0) * 0.55
+    left = [(-hw * 0.93, y, z0), (-hw, y, zm), (-hw * 0.95, y, zb), (-rw, y, zr)]
+    right = [(-x, yy, z) for x, yy, z in reversed(left)]
+    return left + right
+
+
+def _ego_faces() -> list[tuple[list[tuple[float, float, float]], tuple[int, int, int], bool]]:
+    """(points, base colour, is_glass). Outward winding is fixed at shading."""
+    faces: list[tuple[list[tuple[float, float, float]], tuple[int, int, int], bool]] = []
+    for a, b in zip(EGO_SECTIONS, EGO_SECTIONS[1:]):
+        ra, rb = _ego_ring(a), _ego_ring(b)
+        cabin = a[6] and b[6]
+        for k in range(len(ra) - 1):
+            quad = [ra[k], ra[k + 1], rb[k + 1], rb[k]]
+            glass = cabin and k in _GLASS_SEGS
+            faces.append((quad, EGO_GLASS if glass else EGO_BODY, glass))
+    faces.append((_ego_ring(EGO_SECTIONS[0]), EGO_BODY, False))
+    faces.append((_ego_ring(EGO_SECTIONS[-1]), EGO_BODY, False))
+    # Tail lamps wrap the rear corners, just under the deck lip.
+    y0 = EGO_SECTIONS[0][0] - 0.02
+    for sgn in (-1.0, 1.0):
+        faces.append(([
+            (sgn * 0.40, y0, 0.56), (sgn * 0.80, y0, 0.54),
+            (sgn * 0.80, y0, 0.68), (sgn * 0.40, y0, 0.71),
+        ], EGO_TAIL, False))
+    faces.append(([(-0.70, y0, 0.37), (0.70, y0, 0.37), (0.72, y0, 0.46), (-0.72, y0, 0.46)], (40, 40, 44), False))
     return faces
 
 
-def draw_ego(img: np.ndarray, cam: Cam, project: Project) -> None:
-    u, v = project(0.0, 0.25, 0.02) or cam.project(0.0, 0.25, 0.02)
-    scale = float(img.shape[0]) / 800.0
-    cols = ((22, 22, 26), (48, 50, 56), (96, 100, 108))
-    for rad, col in zip(EGO_GLOW_RADII, cols):
-        cv2.circle(img, (u, v), max(4, int(rad * scale)), col, -1, cv2.LINE_8)
-    faces = _sedan_faces()
-    faces.sort(key=lambda item: -sum(p[1] for p in item[0]) / len(item[0]))
-    for pts, col in faces:
+def _shade(pts: list[tuple[float, float, float]], base: tuple[int, int, int], glass: bool,
+           eye: tuple[float, float, float]) -> tuple[tuple[int, int, int], bool]:
+    """Lambert + a little specular. Returns colour and whether it faces the eye.
+
+    Tail lamps are emissive: they keep their colour whatever the light.
+    """
+    p0, p1, p2 = np.array(pts[0]), np.array(pts[1]), np.array(pts[2])
+    n = np.cross(p1 - p0, p2 - p0)
+    if float(np.linalg.norm(n)) < 1e-9 and len(pts) > 3:
+        n = np.cross(p2 - p0, np.array(pts[3]) - p0)
+    n = n / (np.linalg.norm(n) + 1e-9)
+    cen = np.mean(np.array(pts), axis=0)
+    if float(np.dot(n, cen - np.array((0.0, 0.0, 0.6)))) < 0.0:
+        n = -n
+    to_eye = np.array(eye) - cen
+    to_eye = to_eye / (np.linalg.norm(to_eye) + 1e-9)
+    facing = float(np.dot(n, to_eye)) > -0.05
+    if base == EGO_TAIL:
+        return base, facing
+    light = np.array(_LIGHT) / np.linalg.norm(_LIGHT)
+    lam = max(0.0, float(np.dot(n, light)))
+    half = light + to_eye
+    half = half / (np.linalg.norm(half) + 1e-9)
+    spec = max(0.0, float(np.dot(n, half))) ** (24 if glass else 10)
+    amb = 0.62 if not glass else 0.8
+    k = amb + (1.0 - amb) * lam
+    add = (110.0 if glass else 45.0) * spec
+    col = tuple(int(max(0, min(255, c * k + add))) for c in base)
+    return col, facing  # type: ignore[return-value]
+
+
+_EGO_CACHE: dict[tuple, tuple[list[tuple[np.ndarray, tuple[int, int, int]]], np.ndarray | None, tuple[int, int]]] = {}
+
+
+def _cam_key(cam: Cam, w: int, h: int) -> tuple:
+    return (w, h, tuple(cam.eye), tuple(cam.look_override or ()), float(cam.fov_deg))
+
+
+def _ego_glow_patch(cam: Cam, project: Project, w: int, h: int) -> tuple[np.ndarray | None, tuple[int, int]]:
+    """Soft white halo on the ground plus a headlight wash ahead, pre-blurred."""
+    mask = np.zeros((h, w), dtype=np.float32)
+    ax, ay = EGO_HALO_M
+    ring = []
+    for k in range(40):
+        t = 2.0 * math.pi * k / 40.0
+        ring.append(project(ax * math.cos(t), 0.3 + ay * math.sin(t), 0.0))
+    if all(p is not None for p in ring):
+        cv2.fillPoly(mask, [np.array(ring, dtype=np.int32)], EGO_HALO_GAIN, cv2.LINE_AA)
+    wash = [project(-1.0, 2.3, 0.0), project(1.0, 2.3, 0.0), project(2.6, 11.0, 0.0), project(-2.6, 11.0, 0.0)]
+    if all(p is not None for p in wash):
+        tmp = np.zeros_like(mask)
+        cv2.fillPoly(tmp, [np.array(wash, dtype=np.int32)], EGO_WASH_GAIN, cv2.LINE_AA)
+        mask = np.maximum(mask, tmp)
+    k = max(9, int(h * 0.06) | 1)
+    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=k * 0.5)
+    ys, xs = np.nonzero(mask > 0.004)
+    if ys.size == 0:
+        return None, (0, 0)
+    y0, y1, x0, x1 = int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1
+    patch = np.clip(mask[y0:y1, x0:x1] * 255.0, 0, 255).astype(np.uint8)
+    return cv2.merge([patch, patch, patch]), (x0, y0)
+
+
+def _ego_cached(cam: Cam, project: Project, w: int, h: int):
+    key = _cam_key(cam, w, h)
+    hit = _EGO_CACHE.get(key)
+    if hit is not None:
+        return hit
+    eye = tuple(float(v) for v in cam.eye)
+    polys: list[tuple[float, np.ndarray, tuple[int, int, int]]] = []
+    for pts, base, glass in _ego_faces():
+        col, facing = _shade(pts, base, glass, eye)
+        if not facing:
+            continue
         pix = []
         for x, y, z in pts:
             got = project(x, y, z)
@@ -421,10 +680,42 @@ def draw_ego(img: np.ndarray, cam: Cam, project: Project) -> None:
                 pix = []
                 break
             pix.append(got)
-        if len(pix) >= 3:
-            cv2.fillPoly(img, [np.array(pix, dtype=np.int32)], col, cv2.LINE_8)
-    for wx, wy in ((-0.78, -1.45), (0.78, -1.45), (-0.78, 1.35), (0.78, 1.35)):
-        _dot(img, project, wx, wy, 0.32, (24, 24, 26), 0.28)
+        if len(pix) < 3:
+            continue
+        cen = np.mean(np.array(pts), axis=0)
+        dist = float(np.linalg.norm(cen - np.array(eye)))
+        polys.append((dist, np.array(pix, dtype=np.int32), col))
+    polys.sort(key=lambda item: -item[0])
+    shadow = [project(x, y, 0.0) for x, y in ((-0.86, -1.40), (0.86, -1.40), (0.86, 2.20), (-0.86, 2.20))]
+    if all(p is not None for p in shadow):
+        polys.insert(0, (1e9, np.array(shadow, dtype=np.int32), EGO_SHADOW))
+    glow, origin = _ego_glow_patch(cam, project, w, h)
+    out = ([(poly, col) for _d, poly, col in polys], glow, origin)
+    if len(_EGO_CACHE) > 16:
+        _EGO_CACHE.clear()
+    _EGO_CACHE[key] = out
+    return out
+
+
+def draw_ego_glow(img: np.ndarray, cam: Cam, project: Project) -> None:
+    h, w = img.shape[:2]
+    _polys, glow, (x0, y0) = _ego_cached(cam, project, w, h)
+    if glow is None:
+        return
+    gh, gw = glow.shape[:2]
+    x1, y1 = min(w, x0 + gw), min(h, y0 + gh)
+    if x1 <= x0 or y1 <= y0:
+        return
+    roi = img[y0:y1, x0:x1]
+    cv2.add(roi, glow[: y1 - y0, : x1 - x0], dst=roi)
+
+
+def draw_ego(img: np.ndarray, cam: Cam, project: Project) -> None:
+    """Shaded white low-poly car. The glow is drawn before the scene."""
+    h, w = img.shape[:2]
+    polys, _glow, _o = _ego_cached(cam, project, w, h)
+    for poly, col in polys:
+        cv2.fillPoly(img, [poly], col, cv2.LINE_AA)
 
 
 def draw_ego_sprite(img: np.ndarray, cx: int, cy: int) -> None:
@@ -469,13 +760,28 @@ def _set_mps(state: dict[str, Any]) -> float | None:
         return None
 
 
+HUD_FONT = cv2.FONT_HERSHEY_DUPLEX
+
+
 def draw_hud(img: np.ndarray, state: dict[str, Any]) -> None:
+    """Big speed number, unit under it, drive word: the early-beta corner.
+
+    Sizes follow the short side so a 1080p showcase still reads at 720p scale.
+    """
+    hh, ww = img.shape[:2]
+    k = max(1.0, min(hh, ww) / 720.0)
     spd = _speed_mps(state)
-    text = "-- m/s" if spd is None else f"{spd:0.1f} m/s"
-    cv2.putText(img, text, (14, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.55, HUD, 1, cv2.LINE_AA)
+    num = "--" if spd is None else f"{spd:0.1f}"
+    x0 = int(18 * k)
+    y_num = int(50 * k)
+    cv2.putText(img, num, (x0, y_num), HUD_FONT, 1.25 * k, HUD, max(2, int(2 * k)), cv2.LINE_AA)
+    (tw, _th), _b = cv2.getTextSize(num, HUD_FONT, 1.25 * k, max(2, int(2 * k)))
+    cv2.putText(img, "m/s", (x0 + tw + int(6 * k), y_num), HUD_FONT, 0.5 * k, HUD_DIM, 1, cv2.LINE_AA)
     word, col = cabin_drive_word(state)
-    cv2.putText(img, word, (14, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv2.LINE_AA)
-    cv2.putText(img, "GVD", (78, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.4, HUD_DIM, 1, cv2.LINE_AA)
+    y_word = int(76 * k)
+    cv2.putText(img, word, (x0 + 2, y_word), HUD_FONT, 0.5 * k, col, 1, cv2.LINE_AA)
+    (wl, _wh), _b = cv2.getTextSize(word, HUD_FONT, 0.5 * k, 1)
+    cv2.putText(img, "GVD", (x0 + wl + int(14 * k), y_word), HUD_FONT, 0.45 * k, HUD_DIM, 1, cv2.LINE_AA)
 
 
 def draw_speed_bar(img: np.ndarray, state: dict[str, Any]) -> None:
@@ -489,20 +795,40 @@ def draw_speed_bar(img: np.ndarray, state: dict[str, Any]) -> None:
     cv2.rectangle(img, (16, y0 + 16), (296, h - 12), (60, 60, 64), 1, cv2.LINE_8)
     if x1 > 18:
         cv2.rectangle(img, (16, y0 + 16), (x1, h - 12), PATH_BGR, -1, cv2.LINE_8)
-    cv2.putText(img, f"{spd:0.1f} m/s", (312, y0 + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, HUD, 1, cv2.LINE_AA)
+    cv2.putText(img, f"{spd:0.1f} m/s", (312, y0 + 28), HUD_FONT, 0.6, HUD, 1, cv2.LINE_AA)
     set_v = _set_mps(state)
     if set_v is not None:
         cv2.putText(
             img, f"set {set_v:0.1f}", (460, y0 + 28),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, HUD_DIM, 1, cv2.LINE_AA,
+            HUD_FONT, 0.5, HUD_DIM, 1, cv2.LINE_AA,
         )
     word, col = cabin_drive_word(state)
-    cv2.putText(img, word, (w - 120, y0 + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 1, cv2.LINE_AA)
+    cv2.putText(img, word, (w - 120, y0 + 28), HUD_FONT, 0.55, col, 1, cv2.LINE_AA)
 
 
 def _chase_project(cam: Cam) -> Project:
+    """Same numbers as ``cam.project`` without a numpy call per point."""
+    if cam.top_down or getattr(cam, "_basis", None) is None:
+        def project_td(x: float, y: float, z: float) -> tuple[int, int] | None:
+            return cam.project(x, y, z)
+
+        return project_td
+    eye, fwd, right, up, f = cam._basis  # type: ignore[misc]
+    ex, ey, ez = (float(v) for v in eye)
+    fx, fy, fz = (float(v) for v in fwd)
+    rx, ry, rz = (float(v) for v in right)
+    ux, uy, uz = (float(v) for v in up)
+    hw, hh = int(cam.width) * 0.5, int(cam.height) * 0.5
+    ff = float(f)
+
     def project(x: float, y: float, z: float) -> tuple[int, int] | None:
-        return cam.project(x, y, z)
+        dx, dy, dz = x - ex, y - ey, z - ez
+        cz = dx * fx + dy * fy + dz * fz
+        if cz < 0.6:
+            cz = 0.6
+        cx = dx * rx + dy * ry + dz * rz
+        cy = dx * ux + dy * uy + dz * uz
+        return int(hw + ff * cx / cz), int(hh - ff * cy / cz)
 
     return project
 
@@ -555,13 +881,14 @@ def paint_vector_scene(
     if draw_lanes:
         records = drawn_lane_records(state, None, cam)
         for ln in records:
-            pts = _clip_poly_y(ln.get("points") or [], y_lo, y_hi)
-            col = LANE_WHITE if overlay else lane_bgr(ln)
-            draw_dotted(img, pts, project, col, LANE_STEP_M)
+            # drawn_lane_records already clipped to the cam span; the far
+            # cut (DRAW_FAR_M) happens per dash.
+            pts = ln.get("points") or []
+            draw_dashed(img, pts, project, lane_bgr(ln), LANE_STEP_M)
         curb = OVERLAY_CURB if overlay else EDGE_RED
         for edge in list(state.get("road_edges") or state.get("edges") or []):
             pts = _clip_poly_y(_poly_points(edge), y_lo, y_hi)
-            draw_dotted(img, pts, project, curb, EDGE_STEP_M, radius_m=0.12)
+            draw_dotted(img, pts, project, curb, EDGE_STEP_M, radius_m=0.13)
     if draw_path:
         poly, gain = _path_points(state)
         if len(poly) >= 2:
@@ -578,11 +905,11 @@ def paint_vector_scene(
             if cls == "traffic_light":
                 anchor = project(x, y, LIGHT_Z)
                 if anchor is not None:
-                    draw_light_icon(img, anchor, str(s.get("state") or ""), 12)
+                    draw_light_icon(img, anchor, str(s.get("state") or ""), _meters_px(project, anchor, x, y, LIGHT_Z, 0.8, 11, 28))
             elif cls == "stop_sign":
                 anchor = project(x, y, SIGN_Z)
                 if anchor is not None:
-                    draw_stop_icon(img, anchor, 9)
+                    draw_stop_icon(img, anchor, _meters_px(project, anchor, x, y, SIGN_Z, 0.45, 8, 22))
                 if not placed:
                     draw_crosswalk(img, project, y)
                     placed = True
@@ -650,6 +977,8 @@ def render_early_stage(
     else:
         img = np.zeros((int(height), int(width), 3), dtype=np.uint8)
         project = _chase_project(cam)
+        if not top_down:
+            draw_ego_glow(img, cam, project)
     paint_vector_scene(
         img, state, project,
         cipv_id=cipv_id_of(state),

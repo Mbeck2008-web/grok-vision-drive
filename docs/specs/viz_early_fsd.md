@@ -4,6 +4,15 @@
 
 The live GVD VISION stage defaults to a black chase view: dotted lanes, a dotted path from the planner or scene ribbon, wireframe boxes, signal icons, and a small speed readout. An optional overlay draws the same elements on the main camera and adds a speed bar. The previous ice-ribbon cabin stays available.
 
+## Look
+
+- High chase lens (eye 21 m behind, 6.6 m up, 30 deg vertical FOV, looking about 17 deg down): horizon in the top quarter, a small ego in the lower third. Square and portrait frames widen the FOV so the side lanes stay in view.
+- Lane colour is the real paint: white paint white, yellow paint (a centre line) yellow, read from the lane record's `paint` / `paint_color` / `color` / `material` (e.g. `line_yellow`). Lane index, kind and role never change the colour; there is no purple lane colour. Red is only road edges and curbs.
+- Lane paint draws as short dashes (0.55 m every 1.6 m, capped on screen); far away they shrink to dots. Curbs are dense red dots. The path is blue dots.
+- Boxes are neon tubes (dim halo, mid band, bright core, width by distance) with a filled centre dot.
+- A stop sign places a solid white stop bar and a grey zebra crosswalk past it.
+- The ego is a shaded low-poly white car (dark glass greenhouse, emissive tail lamps, soft shadow) over a soft ground halo and headlight wash. The car and halo are cached per lens.
+
 ## Non-goals
 
 - No change to actuation, heartbeat, AEB, engage, collection, training, or the Lua mod.

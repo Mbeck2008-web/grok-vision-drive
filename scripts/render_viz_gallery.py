@@ -31,50 +31,83 @@ def _pts(fn, y0, y1, step=2.0):
     return out
 
 
-def intersection():
-    def bend(x0):
-        return lambda y: x0 + 4.2 * math.sin(y / 18.0)
+def _curb_corner(x_side, y_turn, radius, far_x):
+    """Curb running up the road, rounding into the cross street."""
+    sgn = 1.0 if x_side > 0 else -1.0
+    pts = [{"x": x_side, "y": round(y, 2)} for y in np.arange(-16.0, y_turn, 1.0)]
+    for k in range(1, 9):
+        t = (math.pi / 2) * k / 8
+        pts.append({"x": x_side + sgn * radius * (1 - math.cos(t)), "y": y_turn + radius * math.sin(t)})
+    end = pts[-1]
+    for x in np.arange(end["x"] + sgn, far_x, sgn * 1.0):
+        pts.append({"x": float(x), "y": end["y"]})
+    return pts
 
+
+def _curb_back(x_side, y_turn, radius, far_x):
+    """Far-side curb: from the cross street back onto the road ahead."""
+    sgn = 1.0 if x_side > 0 else -1.0
+    pts = [{"x": float(x), "y": y_turn} for x in np.arange(far_x, x_side + sgn * radius, -sgn * 1.0)]
+    for k in range(0, 9):
+        t = (math.pi / 2) * (1 - k / 8)
+        pts.append({"x": x_side + sgn * radius * (1 - math.cos(t)), "y": y_turn + radius * math.sin(t)})
+    end = pts[-1]
+    pts += [{"x": x_side, "y": float(y)} for y in np.arange(end["y"] + 1.0, 110.0, 1.0)]
+    return pts
+
+
+def intersection():
+    """Four-lane approach to a signalised cross street, like the ref1 frame."""
     lanes = []
-    for x, idx in ((-1.7, -1), (1.7, 1), (-5.2, -2), (5.2, 2)):
+    for x, idx, paint in ((-5.4, -2, "yellow"), (-1.8, -1, "white"), (1.8, 1, "white"), (5.4, 2, "white")):
+        for y0, y1 in ((-16, 21), (40, 110)):
+            lanes.append({
+                "points": _pts(lambda y, x=x: x, y0, y1),
+                "kind": "detected",
+                "index": idx,
+                "side": "left" if x < 0 else "right",
+                # Real paint: the far-left line is the yellow centre line.
+                "paint": paint,
+            })
+    # Cross street lanes, left to right across the view.
+    for y, paint in ((28.5, "white"), (31.5, "yellow"), (34.5, "white")):
         lanes.append({
-            "points": _pts(bend(x), 2, 70),
-            "kind": "detected" if abs(idx) == 1 else "predicted",
-            "index": idx,
-            "side": "left" if x < 0 else "right",
+            "points": [{"x": float(x), "y": y} for x in np.arange(-60.0, 61.0, 2.0)],
+            "kind": "detected",
+            "index": 3,
+            "side": "right",
+            "paint": paint,
         })
-    # Cross street.
-    lanes.append({
-        "points": [{"x": x, "y": 28.0 + 0.15 * abs(x)} for x in np.linspace(-14, 14, 16)],
-        "kind": "detected",
-        "index": 3,
-        "side": "right",
-    })
     edges = [
-        {"points": _pts(bend(-8.6), 2, 70), "kind": "detected", "side": "left"},
-        {"points": _pts(bend(8.6), 2, 70), "kind": "detected", "side": "right"},
+        {"points": _curb_corner(-9.0, 19.0, 6.0, -60.0), "kind": "detected", "side": "left"},
+        {"points": _curb_corner(9.0, 19.0, 6.0, 60.0), "kind": "detected", "side": "right"},
+        {"points": _curb_back(-9.0, 38.0, 4.0, -60.0), "kind": "detected", "side": "left"},
+        {"points": _curb_back(9.0, 38.0, 4.0, 60.0), "kind": "detected", "side": "right"},
     ]
     tracks = [
-        {"id": 1, "class": "vehicle", "x": 0.2, "y": 16, "yaw": 1.57},
-        {"id": 2, "class": "vehicle", "x": 4.6, "y": 18, "yaw": 1.7},
-        {"id": 3, "class": "vehicle", "x": -4.4, "y": 14, "yaw": 1.45},
-        {"id": 4, "class": "truck", "x": -7.2, "y": 22, "yaw": 1.2},
-        {"id": 5, "class": "pedestrian", "x": 6.4, "y": 12, "yaw": 3.0},
-        {"id": 6, "class": "bike", "x": 7.5, "y": 20, "yaw": 1.57},
-        {"id": 7, "class": "vehicle", "x": 3.8, "y": 30, "yaw": 0.4},
+        {"id": 1, "class": "vehicle", "x": 0.0, "y": 11, "yaw": 1.57},
+        {"id": 2, "class": "vehicle", "x": 3.6, "y": 6, "yaw": 1.57},
+        {"id": 3, "class": "vehicle", "x": 3.6, "y": 13, "yaw": 1.57},
+        {"id": 4, "class": "vehicle", "x": 3.7, "y": 20, "yaw": 1.57},
+        {"id": 5, "class": "vehicle", "x": -3.6, "y": 15, "yaw": 1.57},
+        {"id": 6, "class": "truck", "x": -18.0, "y": 30.0, "yaw": 0.0},
+        {"id": 7, "class": "vehicle", "x": 14.0, "y": 33.0, "yaw": math.pi},
+        {"id": 8, "class": "pedestrian", "x": -10.5, "y": 23.0, "yaw": 0.0},
+        {"id": 9, "class": "bike", "x": -7.6, "y": 12.0, "yaw": 1.57},
+        {"id": 10, "class": "vehicle", "x": -1.8, "y": 46.0, "yaw": -1.57},
     ]
     signs = [
-        {"cls": "traffic_light", "x": -2.2, "y": 32, "state": "red"},
-        {"cls": "traffic_light", "x": 2.4, "y": 33, "state": "green"},
-        {"cls": "traffic_light", "x": 6.0, "y": 31, "state": "red"},
-        {"cls": "stop_sign", "x": -6.5, "y": 26},
+        {"cls": "traffic_light", "x": -1.8, "y": 40, "state": "red"},
+        {"cls": "traffic_light", "x": 1.8, "y": 40, "state": "red"},
+        {"cls": "traffic_light", "x": 9.5, "y": 39, "state": "red"},
+        {"cls": "stop_sign", "x": -9.6, "y": 21.5},
     ]
-    path = _pts(lambda y: 0.15 * y * math.sin(y / 14.0), 2, 48, 1.5)
+    path = _pts(lambda y: 0.0, 2, 20, 1.5)
     return {
         "engaged": True,
         "path_conf": 0.9,
-        "ego": {"speed_mps": 8.5},
-        "planner": {"cipv_id": 1, "aeb": "off", "target_v": 9.0},
+        "ego": {"speed_mps": 6.5},
+        "planner": {"cipv_id": 1, "aeb": "off", "target_v": 6.0},
         "cmd_reason": "cmd_json_applied",
         "cmd_applied": True,
         "lua_applying": True,
@@ -88,25 +121,30 @@ def intersection():
 
 def multilane():
     lanes = []
-    for x, idx in ((-5.4, -2), (-1.8, -1), (1.8, 1), (5.4, 2)):
+    for x, idx in ((-9.0, -3), (-5.4, -2), (-1.8, -1), (1.8, 1), (5.4, 2), (9.0, 3)):
         lanes.append({
-            "points": _pts(lambda y, x=x: x + 0.4 * math.sin(y / 22.0), 2, 80),
+            "points": _pts(lambda y, x=x: x + 0.4 * math.sin(y / 22.0), -16, 140),
             "kind": "detected",
             "index": idx,
             "side": "left" if x < 0 else "right",
+            "paint": "line_yellow" if idx == -3 else "line_white",
         })
     edges = [
-        {"points": _pts(lambda y: -9.0, 2, 80), "kind": "detected"},
-        {"points": _pts(lambda y: 9.0, 2, 80), "kind": "detected"},
+        {"points": _pts(lambda y: -10.2, -16, 140), "kind": "detected"},
+        {"points": _pts(lambda y: 12.6, -16, 140), "kind": "detected"},
     ]
     tracks = [
         {"id": 1, "class": "vehicle", "x": 0.1, "y": 14, "yaw": 1.57},
         {"id": 2, "class": "vehicle", "x": 3.6, "y": 12, "yaw": 1.57},
         {"id": 3, "class": "vehicle", "x": -3.6, "y": 18, "yaw": 1.57},
         {"id": 4, "class": "vehicle", "x": 3.7, "y": 26, "yaw": 1.57},
-        {"id": 5, "class": "truck", "x": -7.2, "y": 20, "yaw": 1.57},
+        {"id": 5, "class": "truck", "x": -7.2, "y": 22, "yaw": 1.57},
         {"id": 6, "class": "vehicle", "x": 7.2, "y": 24, "yaw": 1.57},
-        {"id": 7, "class": "pedestrian", "x": 8.4, "y": 10, "yaw": 0.2},
+        {"id": 7, "class": "pedestrian", "x": 11.2, "y": 10, "yaw": 0.2},
+        {"id": 8, "class": "vehicle", "x": 7.2, "y": 7, "yaw": 1.57},
+        {"id": 9, "class": "vehicle", "x": 0.2, "y": 34, "yaw": 1.57},
+        {"id": 10, "class": "vehicle", "x": -3.7, "y": 40, "yaw": 1.57},
+        {"id": 11, "class": "bike", "x": -11.5, "y": 30, "yaw": 1.57},
     ]
     signs = [
         {"cls": "traffic_light", "x": -3.0, "y": 48, "state": "green"},
@@ -130,37 +168,43 @@ def multilane():
 
 
 def parking():
+    """Parking aisle: parked rows both sides, path curving into a bay (ref3)."""
     tracks = []
     tid = 1
-    for row, y in enumerate((8, 13, 18, 23)):
-        for col, x in enumerate((-7.5, -4.2, -1.0, 2.4, 5.6)):
-            if row == 1 and col == 2:
-                continue
-            cls = "obstacle" if (row + col) % 3 else "truck"
-            if row == 0 and col == 4:
-                cls = "pedestrian"
+    for side, x in ((-1, -6.6), (1, 6.6)):
+        for k, y in enumerate(np.arange(3.0, 44.0, 2.8)):
+            if side == 1 and k == 5:
+                continue  # the open bay the path turns into
             tracks.append({
                 "id": tid,
-                "class": cls,
-                "x": x,
-                "y": y,
-                "yaw": 0.15 if col % 2 == 0 else math.pi - 0.1,
+                "class": "obstacle",
+                "x": float(x + side * 0.3 * (k % 2)),
+                "y": float(y),
+                "yaw": 0.08 * ((k % 3) - 1),
+                "length": 4.6,
+                "width": 1.9,
+                "height": 1.5,
             })
             tid += 1
-    tracks.append({"id": 99, "class": "vehicle", "x": 0.2, "y": 16, "yaw": 1.57})
+    tracks.append({"id": 90, "class": "pedestrian", "x": -3.2, "y": 22.0, "yaw": 0.0})
+    tracks.append({"id": 99, "class": "vehicle", "x": -0.4, "y": 30.0, "yaw": 1.57})
     edges = []
-    for x in (-9.5, 8.5):
-        edges.append({"points": _pts(lambda y, x=x: x, 2, 40), "kind": "detected"})
-    edges.append({"points": [{"x": x, "y": 6.0} for x in np.linspace(-9, 8, 14)], "kind": "detected"})
+    for x in (-9.4, 9.4):
+        edges.append({"points": _pts(lambda y, x=x: x, -16, 46, 1.0), "kind": "detected"})
+    bay_y = 3.0 + 2.8 * 5
+    path = [{"x": 0.0, "y": float(y)} for y in np.arange(2.0, bay_y - 4.0, 1.2)]
+    for k in range(1, 9):
+        t = (math.pi / 2) * k / 8
+        path.append({"x": 4.0 * (1 - math.cos(t)), "y": bay_y - 4.0 + 4.0 * math.sin(t)})
+    path.append({"x": 6.0, "y": bay_y})
     return {
         "engaged": False,
         "path_conf": 0.7,
         "ego": {"speed_mps": 3.2},
         "planner": {"cipv_id": 99, "target_v": 4.0, "aeb": "off"},
-        "path_ego": _pts(lambda y: 1.8 * math.sin((y - 4) / 6.0), 3, 28, 1.2),
+        "path_ego": path,
         "lanes_ext": [
-            {"points": _pts(lambda y: -1.6, 4, 30), "kind": "detected", "index": -1},
-            {"points": _pts(lambda y: 1.6, 4, 30), "kind": "detected", "index": 1},
+            {"points": _pts(lambda y: -3.0, -16, 44), "kind": "detected", "index": -1, "paint": "white"},
         ],
         "road_edges": edges,
         "tracks": tracks,
@@ -201,6 +245,38 @@ def main() -> None:
     path = dest / "overlay_dusk.png"
     cv2.imwrite(str(path), frame)
     print(path, frame.shape)
+    board_dest = ROOT / "docs" / "images" / "viz_debug"
+    board_dest.mkdir(parents=True, exist_ok=True)
+    frame = debug_board_sample()
+    path = board_dest / "board.png"
+    cv2.imwrite(str(path), frame)
+    print(path, frame.shape)
+
+
+def debug_board_sample():
+    """Debug board after 60 synthetic ticks so the graphs have a trace."""
+    from python.viz.stage import render_stage
+
+    ui = _ui()
+    ui.debug_board = True
+    main = np.zeros((240, 320, 3), dtype=np.uint8)
+    main[:] = (60, 50, 45)
+    main[:110] = (70, 60, 90)
+    st = multilane()
+    st["flags"] = {"WET_ROAD": 0.8, "RAINING": 0.1}
+    st["calib"] = {"pitch": 0.1, "yaw": 1.2, "roll": 0.0}
+    frame = None
+    for i in range(60):
+        st["ego"] = {
+            "speed_mps": 14.0 + 3.0 * math.sin(i / 12.0),
+            "yaw_rate": 0.05 * math.sin(i / 9.0),
+            "steer": 0.2 * math.sin(i / 9.0),
+            "throttle": 0.3 + 0.2 * math.sin(i / 7.0),
+            "brake": max(0.0, -0.3 * math.sin(i / 7.0)),
+        }
+        st["t"] = i / 12.0
+        frame = render_stage(st, ui=ui, width=1280, height=720, main_frame=main, cam_frames={"main": main})
+    return frame
 
 
 if __name__ == "__main__":

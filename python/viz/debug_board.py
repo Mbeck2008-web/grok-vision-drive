@@ -234,19 +234,33 @@ def _draw_ids(img: np.ndarray, state: dict[str, Any]) -> None:
             cv2.putText(img, label, (u + 4, v - 4), cv2.FONT_HERSHEY_PLAIN, 1.0, (240, 240, 240), 1, cv2.LINE_8)
 
 
+GRAPH_GRID = (30, 30, 34)
+GRAPH_FONT = cv2.FONT_HERSHEY_DUPLEX
+
+
 def _graph(rect: tuple[int, int, int, int], title: str, series: list[list[float]], colors: list[tuple[int, int, int]]) -> np.ndarray:
+    """Scope-style strip: faint grid, soft fill under the first trace, AA lines,
+    latest value of each trace on the right in its own colour."""
     x0, y0, x1, y1 = rect
     w, h = max(1, x1 - x0), max(1, y1 - y0)
     img = np.zeros((h, w, 3), dtype=np.uint8)
-    cv2.rectangle(img, (0, 0), (w - 1, h - 1), (40, 40, 40), 1, cv2.LINE_8)
-    _label(img, title, 6, 14)
+    img[:] = (10, 10, 12)
+    cv2.rectangle(img, (0, 0), (w - 1, h - 1), (48, 48, 52), 1, cv2.LINE_8)
+    cv2.putText(img, title, (6, 15), GRAPH_FONT, 0.42, (220, 220, 220), 1, cv2.LINE_AA)
     if h < 8 or w < 8:
         return img
-    plot = img[18:h - 4, 4:w - 4]
+    plot = img[20:h - 4, 4:w - 4]
     ph, pw = plot.shape[:2]
     if ph < 2 or pw < 2:
         return img
-    for values, color in zip(series, colors):
+    for k in range(1, 4):
+        yy = int(ph * k / 4)
+        cv2.line(plot, (0, yy), (pw - 1, yy), GRAPH_GRID, 1, cv2.LINE_8)
+    for k in range(1, 8):
+        xx = int(pw * k / 8)
+        cv2.line(plot, (xx, 0), (xx, ph - 1), GRAPH_GRID, 1, cv2.LINE_8)
+    readouts: list[tuple[str, tuple[int, int, int]]] = []
+    for idx, (values, color) in enumerate(zip(series, colors)):
         if len(values) < 1:
             continue
         lo = min(values)
@@ -261,7 +275,19 @@ def _graph(rect: tuple[int, int, int, int], title: str, series: list[list[float]
         if len(pts) == 1:
             cv2.circle(plot, pts[0], 2, color, -1, cv2.LINE_8)
         else:
-            cv2.polylines(plot, [np.array(pts, dtype=np.int32)], False, color, 1, cv2.LINE_8)
+            if idx == 0:
+                area = np.array(pts + [(pts[-1][0], ph - 1), (pts[0][0], ph - 1)], dtype=np.int32)
+                fill = tuple(max(0, c // 6) for c in color)
+                cv2.fillPoly(plot, [area], fill, cv2.LINE_8)
+            cv2.polylines(plot, [np.array(pts, dtype=np.int32)], False, color, 2, cv2.LINE_AA)
+            cv2.circle(plot, pts[-1], 3, color, -1, cv2.LINE_AA)
+        readouts.append((f"{values[-1]:+.2f}", color))
+    xr = w - 8
+    for text, color in reversed(readouts):
+        (tw, _th), _b = cv2.getTextSize(text, GRAPH_FONT, 0.42, 1)
+        xr -= tw
+        cv2.putText(img, text, (xr, 15), GRAPH_FONT, 0.42, color, 1, cv2.LINE_AA)
+        xr -= 10
     return img
 
 

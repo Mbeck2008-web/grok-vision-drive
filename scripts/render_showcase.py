@@ -26,10 +26,12 @@ def _scene(t: float) -> dict:
         lanes.append({
             "points": [
                 {"x": x + 0.6 * math.sin(y / 18.0 + t), "y": float(y)}
-                for y in range(2, 64, 2)
+                for y in range(-16, 90, 2)
             ],
             "kind": "detected" if abs(idx) == 1 else "predicted",
             "index": idx,
+            # Real paint colour: the far-left line is the yellow centre line.
+            "paint": "yellow" if idx == -2 else "white",
         })
     return {
         "engaged": True,
@@ -42,8 +44,8 @@ def _scene(t: float) -> dict:
         "path_ego": path,
         "lanes_ext": lanes,
         "road_edges": [
-            {"points": [{"x": -8.5, "y": float(y)} for y in range(2, 64, 2)], "kind": "detected"},
-            {"points": [{"x": 8.5, "y": float(y)} for y in range(2, 64, 2)], "kind": "detected"},
+            {"points": [{"x": -8.5, "y": float(y)} for y in range(-16, 90, 2)], "kind": "detected"},
+            {"points": [{"x": 8.5, "y": float(y)} for y in range(-16, 90, 2)], "kind": "detected"},
         ],
         "tracks": [
             {"id": 1, "class": "vehicle", "x": 0.2 * math.sin(t * 3), "y": y_lead, "yaw": 1.57},

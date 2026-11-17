@@ -47,8 +47,10 @@ def paint_mark(img: np.ndarray, *, card: bool = False) -> None:
     h, w = img.shape[:2]
     cv2.putText(img, "GVD", (w - 72, h - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (230, 230, 230), 1, cv2.LINE_AA)
     if card:
-        cv2.rectangle(img, (0, 0), (w, 46), (0, 0, 0), -1, cv2.LINE_8)
-        cv2.putText(img, "GVD VISION", (16, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (235, 235, 235), 1, cv2.LINE_AA)
+        # Title card top-right so the speed HUD (top-left) stays readable.
+        text = "GVD VISION"
+        (tw, _th), _b = cv2.getTextSize(text, cv2.FONT_HERSHEY_DUPLEX, 0.8, 1)
+        cv2.putText(img, text, (w - tw - 18, 34), cv2.FONT_HERSHEY_DUPLEX, 0.8, (235, 235, 235), 1, cv2.LINE_AA)
 
 
 def render_showcase(

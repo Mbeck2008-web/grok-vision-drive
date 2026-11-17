@@ -362,14 +362,89 @@ rad/s (true 0.1). Corridor vertices within 0.20 m of the true road edge, 64
 verts, conf 0.98. Message 71 kB; 30k stored cells on the default grid and on a
 64x finer grid both cap at 4096 cells out (88 kB vs 84 kB, cap 200 kB).
 
+## Unseen road structure (occluded / out-of-view), `occ_out` v2
+
+Goal: predict road structure no camera ray reaches this tick (cross legs
+behind corner buildings, the back of a roundabout, corners hidden by cars).
+
+**Labels** (`python/train/occ_map_labels.py`, training only): the ground layer
+of the WHOLE grid is labelled from map GT, not masked to camera-visible
+pixels: `drivable` = cell centre within width/2 of a road centerline, `other`
+elsewhere. Map source: the recorder road dump (`roads/<map>.json.gz` ->
+`road_dump.load_road_dump` -> `RoadPoly` centerline/width/z) + the tick's ego
+pose row, both sim truth (training labels only; `occ_map_labels` is on the
+GT-module list of `test_occ_runtime_imports`). `merge_targets` = camera hits +
+map ground layer (map wins on the ground layer; a vehicle cell stays vehicle).
+Road outlines (centerline +-width/2, junction mouths removed) are the
+edge-chamfer GT. `visible_keys` ray-casts the 8 cameras' depth (pixel stride
+2-4) and keeps every cell a ray crosses up to its hit; it is used **only** to
+split metrics visible / occluded, never to mask the loss. Lanes: no map lane
+label is packed (paint UNLABELED), so no lane target and no lane chamfer.
+
+**Loss**: every map cell is a target (`occ_w = 1`, class set) whether a ray
+reached it or not. `sample_queries(..., visible_only=True)` reproduces the old
+camera-masked loss and exists for the trace test only.
+
+**Model**: (1) `ctx`: each query also gets a per-tick scene vector (cam_w
+weighted mean of the cameras' pooled feature maps, B x feat), so a query no
+ray reaches decodes from the scene, not from its position alone; (2)
+`decode_unseen` (default on): the top coarse stage sweeps the whole top grid,
+not only frustum cells, same `max_coarse` cap. Both change the head input
+width (checkpoint `spec.ctx`), i.e. retrain. (3) **Temporal memory**
+(`occ_out.OccMemory`, causal): last tick's static cells (vehicles excluded)
+warped into the current frame by the camera-VO motion, prob x exp(-dt/2 s),
+dropped when a camera sees the cell now (current prediction wins) or prob <
+0.35, cleared when VO is not ok; capped at 16,384 cells (plain ground last).
+
+**occ_out v2**: v1 + exactly one field per element type, `observed: bool` per
+cell (`cells.observed`) and per polyline point (`edges[].observed`,
+`lanes[].observed`): true when a LIVE camera's ray reaches the point with no
+predicted occluder (non-drivable cell >= 1 voxel above the road surface) in
+front. Memory-carried and unseen-decoded cells are `observed = false` and
+still carry finite `prob` / valid `cls`. Validator is version-gated (v1 may
+not carry `observed`, v2 must; unknown keys still raise). v2 also allows
+`stored <= queried + 16,384` (memory cells). Cell cap order: plain ground
+(class other at road height) last, then nearest first. occ -> viz v1 mapping
+is `occ_out.VIZ_DELTA` (`observed`, `prob`, `conf` are not in viz v1 and are
+dropped there); `python/viz/occ_viz.py` and the C++ viz are not changed by
+this part.
+
+**Window**: unseen proposals are the occupancy grid itself (x +-25.6 m,
+y -12.8..51.2 m, ego frame); occluded metrics are inside it; the eval reports
+per clip the share of GT centerline length within 80 m that lies beyond it.
+
+**Causality**: `OccRuntime.step(t)` reads only tick t's images and state from
+earlier ticks (VO, tracker, memory); nothing is smoothed backwards or revised.
+`test_occ_unseen.check_causality`: frames after t perturbed (junk cells /
+grey images) or deleted -> every occ_out at <= t byte-identical (timer
+injected so `timing_ms` is reproducible), stub net and a real SparseOccNet.
+
+**Safety isolation**: `test_occ_runtime_imports.check_safety_isolation`: the
+12 actuation / AEB / engage / heartbeat modules (`python.run_vision`,
+`python.control.*`, `python.runtime.{conf_gate,frame_gate,state_io,shadow}`)
+reach 0 occupancy modules, by static AST walk and by import-time
+`sys.modules`. occ_out feeds the debug view / C++ viz only.
+
+**VRAM (CPU-box arithmetic estimate, `vram_est_mb_cpu`)**: `memory_estimate`
+takes `batch`; at the `1080ti` profile (8 cams @640, default net, ctx on,
+max_points 16,384): batch 1 (live and the offline runner `OccRuntime`, which is
+batch 1) = 104.7 MB; batch 4 (training batch) = 416.8 MB, both under the
+4,096 MB cap. Memory module = 16,384 x 13 B on the CPU (no VRAM).
+`peak_vram_mb` stays UNPROVEN until IQU45 nvidia-smi.
+
+Tests: `test_occ_unseen` (TRACER traces, labels, unseen decode, observed,
+memory, causality), `test_occ_out` (v2 fields, version gate),
+`test_occ_runtime_imports` (safety isolation), `test_eval_occ_unseen` (eval
+smoke). Metrics: `scripts/eval_occ_unseen.py` (results below).
+
 ## Files
 
 New: `python/perception/occ_geometry.py`, `python/perception/occ_sparse.py`,
-`python/perception/occ_outputs.py`, `python/perception/occ_ego.py`, `python/perception/occ_out.py`, `python/viz/occ_viz.py`,
+`python/perception/occ_outputs.py`, `python/perception/occ_ego.py`, `python/perception/occ_out.py`, `python/viz/occ_viz.py`, `python/train/occ_map_labels.py`, `tests/synthetic_scenes.py`, `scripts/eval_occ_unseen.py`,
 `python/train/occ_labels.py`, `python/train/occ_sampler.py`,
 `python/train/occ_train.py`, `python/data/occ_shards.py`,
 `scripts/bench_occ_sparse.py`, `scripts/compare_front_cluster.py`, `tests/synthetic_occ.py`, tests
-`scripts/test_occ_{labels,shards,sampler,net,cams,ego,runtime_imports,viz,out}.py`,
+`scripts/test_occ_{labels,shards,sampler,net,cams,ego,runtime_imports,viz,out,unseen}.py`, `scripts/test_eval_occ_unseen.py`,
 `scripts/test_bench_occ_sparse.py`, this spec. No existing file is modified (the
 offline suite picks up `scripts/test_*.py` itself).
 

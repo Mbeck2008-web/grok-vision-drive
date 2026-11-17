@@ -209,6 +209,29 @@ def check_ranged_weighted_stays_in_bounds() -> None:
     print("ranged weighted: 30-min and 120-min clips in [5, 10] except a short last")
 
 
+def check_ranged_weighted_uses_per_clip_seed() -> None:
+    """Weighted clip lengths come from clip_rng(seed, index), not a frozen seed 0 stream."""
+    weights = {"west_coast_usa": 0.6}
+    lo, hi = 5.0, 10.0
+    total = 30.0 * 60.0
+
+    def pieces(seed: int) -> list[tuple[str, int, float]]:
+        return _walk(ClipSchedule(MAPS6, SEGMENT_S, weights, total, minute_range=(lo, hi), seed=seed), total)
+
+    seed0 = pieces(0)
+    again0 = pieces(0)
+    seed11 = pieces(11)
+    assert seed0 == again0, (seed0, again0)
+    assert seed11 != seed0, (seed11, seed0)
+    # A second distinct seed must also differ, so one lucky collision cannot hide a frozen stream.
+    seed3 = pieces(3)
+    assert seed3 != seed0 and seed3 != seed11, (seed3, seed0, seed11)
+    print(
+        f"ranged weighted seed: seed 0 repeats ({len(seed0)} clips); "
+        f"seeds 0/3/11 each differ"
+    )
+
+
 def check_resolve_traffic_range_and_tags() -> None:
     rng = clip_rng(0, 0)
     want = draw_traffic_count(clip_rng(0, 0), 4, 12)
@@ -366,7 +389,9 @@ def check_main_logs_draws_on_fake_beamng() -> None:
     """_main with --traffic-range / --segment-min-range / --seed writes collect.json and state.jsonl."""
     from test_collect_spawn_fix import _Paint, _run_collector, _run_west_coast, _west_pools
 
-    seed, lo_m, hi_m, lo_t, hi_t = 7, 1.0, 2.0, 4, 8
+    # Seed 11: first and second traffic draws differ, and seed 0 traffic differs too,
+    # so a shared-stream or seed-ignored draw cannot pass by coincidence.
+    seed, lo_m, hi_m, lo_t, hi_t = 11, 1.0, 2.0, 4, 8
     code, text, out = _run_west_coast(
         _Paint(lambda x, y: True),
         _west_pools(),
@@ -392,9 +417,8 @@ def check_main_logs_draws_on_fake_beamng() -> None:
     for i, rec in enumerate(draws):
         assert rec["seed"] == seed
         assert rec["clip_seed"] == clip_seed_tag(seed, i)
-        rng = clip_rng(seed, i)
-        want_min = draw_segment_minutes(rng, lo_m, hi_m)
-        want_tr = draw_traffic_count(rng, lo_t, hi_t)
+        want_min = draw_segment_minutes(clip_rng(seed, i), lo_m, hi_m)
+        want_tr = draw_traffic_count(clip_rng(seed, i), lo_t, hi_t)
         assert abs(float(rec["segment_min"]) - round(want_min, 4)) < 1e-9, rec
         assert int(rec["traffic_requested"]) == want_tr, rec
         assert "traffic_count" in rec
@@ -436,6 +460,7 @@ def main() -> None:
     check_defaults_off_match_old_schedule()
     check_ranged_schedule_draws_per_clip()
     check_ranged_weighted_stays_in_bounds()
+    check_ranged_weighted_uses_per_clip_seed()
     check_resolve_traffic_range_and_tags()
     check_parser_defaults_and_flags()
     check_no_circular_import()

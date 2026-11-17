@@ -23,6 +23,7 @@ from scripts.traffic_stress import (  # noqa: E402
     STOP_HZ_MIN,
     STOP_RSS_MAX_MB,
     STOP_VRAM_HEADROOM_GB,
+    PeakHoldSampler,
     check_stress_out,
     live_collect_cmd,
     live_measure_factory,
@@ -208,6 +209,41 @@ def check_max_safe_uses_placed_count() -> None:
     print("placed count: max_safe_count uses placed 4, not requested 8")
 
 
+def check_peak_hold_keeps_max_and_missing() -> None:
+    """Hold samples keep the peak VRAM/RSS; a hold with no VRAM reading is missing."""
+    import scripts.traffic_stress as ts
+
+    real_vram, real_rss = ts._nvidia_vram, ts.sample_rss
+    vram = iter([(6.0, 11.0), (8.5, 11.0), (7.0, 11.0), (None, None)])
+    rss = iter([(100.0, 200.0), (90.0, 400.0), (120.0, 300.0), (80.0, 250.0)])
+    ts._nvidia_vram = lambda: next(vram, (None, None))
+    ts.sample_rss = lambda: next(rss, (None, None))
+    try:
+        sampler = PeakHoldSampler(interval_s=0.01)
+        sampler.sample_once()
+        sampler.sample_once()
+        sampler.sample_once()
+        # stop() takes one more sample (the trailing missing VRAM / lower RSS).
+        peaks = sampler.stop()
+        assert peaks["vram_used_gb"] == 8.5, peaks
+        assert peaks["vram_total_gb"] == 11.0
+        assert peaks["vram_missing"] is False
+        assert peaks["beamng_rss_mb"] == 120.0
+        assert peaks["supervisor_rss_mb"] == 400.0
+        assert peaks["vram_samples"] >= 4
+        ts._nvidia_vram = lambda: (None, None)
+        ts.sample_rss = lambda: (None, None)
+        empty = PeakHoldSampler()
+        empty.sample_once()
+        empty.sample_once()
+        missing = empty.stop()
+        assert missing["vram_missing"] is True
+        assert missing["vram_used_gb"] is None
+    finally:
+        ts._nvidia_vram, ts.sample_rss = real_vram, real_rss
+    print("peak hold: max VRAM 8.5 / RSS 400 kept; all-missing is vram_missing")
+
+
 def check_live_child_passes_requested_count() -> None:
     cmd = live_collect_cmd(12, maps="west_coast_usa", minutes=1.0, step_dir=Path("/tmp/n12"))
     assert "--traffic" in cmd
@@ -269,6 +305,7 @@ def main() -> None:
     check_max_safe_when_all_pass_or_first_fails()
     check_max_safe_uses_placed_count()
     check_does_not_kill_existing_beamng()
+    check_peak_hold_keeps_max_and_missing()
     check_live_child_passes_requested_count()
     check_leaves_cars_documented()
     import tempfile

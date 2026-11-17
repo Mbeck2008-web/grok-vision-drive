@@ -13,8 +13,8 @@ GROUND_Z = 0.2          # mid-cell of the default 0.4 m grid (z cell 5)
 BOX_LO = (-1.0, 10.0, 0.2)
 BOX_HI = (1.0, 14.4, 1.8)
 SEM_CLASSES = {"kind": "gvd_sem_classes", "train_only": True,
-               "classes": {"0": "unknown", "1": "ASPHALT", "2": "CAR", "3": "SKY"}}
-SEM_GROUND, SEM_BOX, SEM_SKY = 1, 2, 3
+               "classes": {"0": "unknown", "1": "ASPHALT", "2": "CAR", "3": "SKY", "4": "GRASS"}}
+SEM_GROUND, SEM_BOX, SEM_SKY, SEM_GRASS = 1, 2, 3, 4
 
 
 def _box_hit(o: np.ndarray, d: np.ndarray, lo, hi) -> np.ndarray:
@@ -30,8 +30,11 @@ def _box_hit(o: np.ndarray, d: np.ndarray, lo, hi) -> np.ndarray:
     return np.where(hit, np.maximum(tmin, 0.0), np.inf)
 
 
-def render(cam: PinholeCam, *, box: bool = True, box_lo=BOX_LO, box_hi=BOX_HI):
-    """(depth_cm uint16, sem uint8, bgr uint8) for ``cam``. Sky is the far plane."""
+def render(cam: PinholeCam, *, box: bool = True, box_lo=BOX_LO, box_hi=BOX_HI, road=None):
+    """(depth_cm uint16, sem uint8, bgr uint8) for ``cam``. Sky is the far plane.
+
+    ``road=(x_left, x_right)``: ground outside that strip is GRASS, inside ASPHALT.
+    """
     vs, us = np.mgrid[0 : cam.height, 0 : cam.width]
     d = pixel_rays(cam, us.reshape(-1), vs.reshape(-1))
     o = np.asarray(cam.pos, dtype=np.float64)
@@ -45,10 +48,14 @@ def render(cam: PinholeCam, *, box: bool = True, box_lo=BOX_LO, box_hi=BOX_HI):
     depth = np.where(sky, cam.far_m, t)
     cm = np.clip(np.rint(depth * 100.0), 0, 65535).astype(np.uint16)
     p = o + d * np.where(sky, 0.0, t)[:, None]
+    if road is not None:
+        off = (sem == SEM_GROUND) & ((p[:, 0] < road[0]) | (p[:, 0] > road[1]))
+        sem = np.where(off, SEM_GRASS, sem)
     bgr = np.zeros((d.shape[0], 3), dtype=np.uint8)
     checker = ((np.floor(p[:, 0]) + np.floor(p[:, 1])) % 2).astype(np.uint8)
     bgr[sem == SEM_GROUND] = np.stack([60 + 80 * checker, 60 + 80 * checker, 60 + 80 * checker], -1)[sem == SEM_GROUND]
     bgr[sem == SEM_BOX] = (30, 30, 220)
     bgr[sem == SEM_SKY] = (230, 180, 120)
+    bgr[sem == SEM_GRASS] = (40, 140, 40)
     shape = (cam.height, cam.width)
     return cm.reshape(shape), sem.astype(np.uint8).reshape(shape), bgr.reshape(shape + (3,))

@@ -30,6 +30,8 @@ LIVE_ENTRY_POINTS = (
     "python.runtime.models",
     "python.perception.occ_sparse",
     "python.perception.occ_geometry",
+    "python.perception.occ_outputs",
+    "python.viz.occ_viz",
 )
 OCC_GT_MODULES = (
     "python.train.occ_labels",

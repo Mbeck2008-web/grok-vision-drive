@@ -296,24 +296,29 @@ if nn is not None:
             if cam_w is not None:
                 w = w * np.asarray(cam_w, dtype=np.float32).reshape(-1)
             active = tuple(bool(x > 0.0) for x in w)
-            cache = self.__dict__.setdefault("_coarse_cache", {})
-            if active not in cache:
-                top = grid.coarse(LEVELS[0])
-                cpts = top.centers_of_keys(np.arange(top.dense_cells))
-                on = [c for c, a in zip(self.cams, active) if a]
-                cache[active] = (cpts[visible_mask(on, cpts)] if on else cpts[:0]).astype(np.float32)
-            cands = cache[active]
+            on = [c for c, a in zip(self.cams, active) if a]
+            top = grid.coarse(LEVELS[0])
             cap0 = max(1, int(max_coarse))
-            if cands.shape[0] > cap0:
-                carry = self.__dict__.get("_hot_top", {}).get(active, np.zeros((0,), np.int64))[: cap0 // 2]
-                rest = np.setdiff1d(np.arange(cands.shape[0]), carry)
-                stride = int(np.ceil(rest.shape[0] / float(cap0 - carry.shape[0])))
-                phase = self.__dict__.setdefault("_sweep_phase", {}).get(active, 0) % stride
-                self._sweep_phase[active] = phase + 1
-                idx = np.concatenate([carry, rest[phase::stride]])[:cap0]
-            else:
-                idx = np.arange(cands.shape[0])
-            self._coarse_pts = cands[idx]
+            # Top-stage candidates are generated arithmetically (never by enumerating the
+            # grid): last frame's hot top keys first (<= half the cap), then the keys
+            # phase, phase+stride, ... over the top index space, visible ones kept.
+            # Every array here is <= cap0 long whatever the grid size.
+            carry = self.__dict__.get("_hot_top", {}).get(active, np.zeros((0,), np.int64))[: cap0 // 2]
+            n_top = int(top.dense_cells)
+            budget = cap0 - int(carry.shape[0])
+            stride = max(1, int(np.ceil(n_top / float(max(1, budget)))))
+            phase = self.__dict__.setdefault("_sweep_phase", {}).get(active, 0) % stride
+            self._sweep_phase[active] = phase + 1
+            sweep = np.arange(phase, n_top, stride, dtype=np.int64)[:budget]
+            sweep = sweep[~np.isin(sweep, carry)]
+            idx = np.concatenate([carry, sweep])[:cap0]
+            cpts = top.centers_of_keys(idx)
+            vis = visible_mask(on, cpts) if on else np.zeros((idx.shape[0],), bool)
+            idx = idx[vis]
+            cands = cpts[vis].astype(np.float32)
+            self._top_keys = idx
+            self._index_bytes = int(idx.nbytes + cpts.nbytes + sweep.nbytes + carry.nbytes)
+            self._coarse_pts = cands
             dev = self.cam_pos.device
             feats = self.encode(images, w)
             cw = torch.from_numpy(w).to(dev)
@@ -321,7 +326,8 @@ if nn is not None:
             stages: list[int] = []
             if pts.shape[0] == 0:
                 empty = np.zeros((0,), dtype=np.int64)
-                return OccPrediction(empty, np.zeros((0,), np.float32), np.zeros((0,), np.uint8), 0, 0)
+                return OccPrediction(empty, np.zeros((0,), np.float32), np.zeros((0,), np.uint8), 0, 0,
+                                     (0,) * (len(LEVELS) + 1))
             n_coarse = 0
             for li, f in enumerate(LEVELS):
                 n_coarse += int(pts.shape[0])
@@ -338,6 +344,7 @@ if nn is not None:
                 if hot.shape[0] > cap:
                     hot = hot[np.argsort(-p_hot)[:cap]]
                 pts = (hot[:, None, :] + offs[None, :, :]).reshape(-1, 3).astype(np.float32)
+                self._index_bytes = max(self._index_bytes, int(pts.nbytes + hot.nbytes))
                 if pts.shape[0] == 0:
                     break
             if pts.shape[0] == 0:

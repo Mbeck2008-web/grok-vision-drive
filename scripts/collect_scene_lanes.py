@@ -32,6 +32,17 @@ is a smoke collect: if those PNGs do not decode, the process stops.
     py -3 scripts\\collect_scene_lanes.py --check-maps --list-levels
     py -3 scripts\\collect_scene_lanes.py --check-maps --maps west_coast_usa,italy,east_coast_usa,utah,jungle_rock_island
     py -3 scripts\\collect_scene_lanes.py --minutes 120 --maps west_coast_usa,italy,east_coast_usa,utah,jungle_rock_island --segment-min 12 --smoke-s 60
+    py -3 scripts\\collect_scene_lanes.py --minutes 120 --maps west_coast_usa,italy,east_coast_usa,utah,jungle_rock_island --segment-min-range 5 10 --traffic-range 4 12 --seed 0 --smoke-s 60
+
+``--segment-min-range LO HI`` and ``--traffic-range LO HI`` are off unless
+passed. LO for the minute range must be at least 1. When set, each clip
+draws a uniform length in ``[LO, HI]`` minutes and (on west_coast_usa only)
+a uniform AI car count in ``[LO, HI]`` from ``--seed``. The per-clip seed
+is ``"{seed}:{index}"``. ``collect.json`` ``clip_draws`` and the
+``traffic_count`` state tag record the number of cars actually placed, not
+the requested draw. ``--traffic-range`` is rejected when ``west_coast_usa``
+is not in ``--maps``. Defaults off leave the old ``--segment-min`` /
+``--traffic`` behaviour unchanged.
 
 IQU45 smoke for brake lights and per-tick signals. Tech is already
 running and ``GVD_DATA_DIR`` is the data disk. One minute is the shortest
@@ -215,6 +226,13 @@ if str(ROOT) not in sys.path:
 
 from python.data.raw_frames import controls_from_state
 from python.collect.spawn_mix import clamp_speed_range, traffic_count
+from python.collect.clip_draw import (  # noqa: F401 — re-exported for existing tests
+    segment_at,
+    segment_boundary,
+    segment_piece,
+    share_maps,
+    weighted_pieces,
+)
 from python.collect import control_log
 from python.collect.boundary import BoundaryDefer, CarryOver, boundary_wait_reason
 from python.collect.level_session import EGO_CONFIG_DEFAULT, EGO_MODEL_DEFAULT
@@ -404,6 +422,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Companion AI cars ahead and behind. West coast defaults to 2. 0 disables them.",
     )
     parser.add_argument(
+        "--traffic-range",
+        nargs=2,
+        type=int,
+        default=None,
+        metavar=("LO", "HI"),
+        help=(
+            "Each west_coast_usa segment draws a uniform integer AI car count in [LO, HI] "
+            "from --seed (HI at most 32). Logged as the number of cars actually placed, "
+            "not the draw, if the road walk had to drop stacked slots. Requires "
+            "west_coast_usa in --maps (the only map with a spawn deck). Off unless passed. "
+            "Do not combine with --traffic."
+        ),
+    )
+    parser.add_argument(
         "--respawn-min",
         type=float,
         default=0.0,
@@ -444,6 +476,27 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=12.0,
         help="Minutes per segment. Weighted time is split into chunks of this length.",
+    )
+    parser.add_argument(
+        "--segment-min-range",
+        nargs=2,
+        type=float,
+        default=None,
+        metavar=("LO", "HI"),
+        help=(
+            "Each segment draws a uniform length in [LO, HI] minutes from --seed. "
+            "LO must be at least 1. Off unless passed. Overrides --segment-min for "
+            "chunk length. Same 60 s floor as --segment-min."
+        ),
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help=(
+            "RNG seed for --segment-min-range and --traffic-range. "
+            "Ignored when both ranges are off. Default 0."
+        ),
     )
     parser.add_argument(
         "--map-weights",
@@ -750,28 +803,6 @@ def parse_map_weights(text: str) -> dict[str, float]:
     return weights
 
 
-def share_maps(maps: tuple[str, ...], weights: dict[str, float]) -> list[tuple[str, float]]:
-    """Time fraction for each map, in ``maps`` order, summing to 1.
-
-    A listed weight is that map's share. Maps without a weight split whatever
-    is left. Weights that already sum past 1, with nothing left to split, are
-    scaled down.
-    """
-    explicit = {name: float(weights[name]) for name in maps if name in weights}
-    missing = [name for name in maps if name not in weights]
-    used = sum(explicit.values())
-    if missing:
-        left = max(0.0, 1.0 - used)
-        each = left / len(missing)
-        shares = [(name, explicit.get(name, each)) for name in maps]
-        total = sum(share for _name, share in shares)
-        if total > 0.0 and abs(total - 1.0) > 1e-6:
-            shares = [(name, share / total) for name, share in shares]
-        return shares
-    scale = used if used > 0.0 else 1.0
-    return [(name, explicit.get(name, 0.0) / scale) for name in maps]
-
-
 # A second stall, tip, or damage hit ends the segment. The remainder of
 # that segment is reassigned, not lost. The same reason on three maps, or
 # real stall and settle seconds past this much of the plan, end the run.
@@ -816,137 +847,6 @@ def segment_fail_action(
     return "continue"
 
 
-def weighted_pieces(
-    maps: tuple[str, ...],
-    segment_s: float,
-    weights: dict[str, float],
-    total_s: float | None,
-) -> list[tuple[str, float]]:
-    """Chunks of at most ``segment_s`` that sum to each map's share.
-
-    The heaviest map alternates with the others, so a 60% west-coast share
-    is several short visits rather than one block at the front. A map whose
-    share is already shorter than ``segment_s`` is a single chunk.
-    """
-    shares = share_maps(maps, weights)
-    if total_s is not None and math.isfinite(float(total_s)) and float(total_s) > 0.0:
-        cycle = float(total_s)
-    else:
-        positive = [share for _name, share in shares if share > 1e-9]
-        small = min(positive) if positive else 1.0
-        cycle = max(1.0, float(segment_s)) / small
-    span = max(1.0, float(segment_s))
-    budgets = [(name, max(0.0, share) * cycle) for name, share in shares]
-    budgets = [(name, dur) for name, dur in budgets if dur > 0.05]
-    if not budgets:
-        return [(maps[0], span)]
-
-    def _chunks(name: str, budget: float) -> list[tuple[str, float]]:
-        pieces: list[tuple[str, float]] = []
-        left = float(budget)
-        while left > 0.05 and len(pieces) < 10000:
-            take = min(span, left)
-            if left - take <= 0.05:
-                take = left
-            pieces.append((name, take))
-            left -= take
-        return pieces
-
-    heavy_at = max(range(len(budgets)), key=lambda i: (budgets[i][1], -i))
-    heavy = _chunks(budgets[heavy_at][0], budgets[heavy_at][1])
-    others: list[tuple[str, float]] = []
-    for index, (name, dur) in enumerate(budgets):
-        if index == heavy_at:
-            continue
-        others.extend(_chunks(name, dur))
-    pieces: list[tuple[str, float]] = []
-    heavy_i = 0
-    other_i = 0
-    while heavy_i < len(heavy) or other_i < len(others):
-        if heavy_i < len(heavy):
-            pieces.append(heavy[heavy_i])
-            heavy_i += 1
-        if other_i < len(others):
-            pieces.append(others[other_i])
-            other_i += 1
-    return pieces
-
-
-def segment_at(
-    elapsed_s: float,
-    maps: tuple[str, ...],
-    segment_s: float,
-    weights: dict[str, float] | None = None,
-    total_s: float | None = None,
-) -> tuple[str, int]:
-    """Map name and segment index. Empty maps stay on the loaded level.
-
-    Without weights, each map gets ``segment_s`` and the list repeats.
-    With weights, ``weighted_pieces`` rotates those chunks across the plan.
-    The index keeps climbing when the cycle repeats.
-    """
-    if not maps:
-        return "", 0
-    elapsed = max(0.0, float(elapsed_s))
-    if not weights:
-        span = max(1.0, float(segment_s))
-        index = int(elapsed // span)
-        return maps[index % len(maps)], index
-    pieces = weighted_pieces(maps, segment_s, weights, total_s)
-    cycle_len = sum(dur for _name, dur in pieces) or 1.0
-    which = int(elapsed // cycle_len)
-    pos = elapsed - which * cycle_len
-    acc = 0.0
-    for i, (name, dur) in enumerate(pieces):
-        acc += dur
-        if pos < acc or i == len(pieces) - 1:
-            return name, which * len(pieces) + i
-    return pieces[-1][0], which * len(pieces) + len(pieces) - 1
-
-
-def segment_piece(
-    index: int,
-    maps: tuple[str, ...],
-    segment_s: float,
-    weights: dict[str, float] | None = None,
-    total_s: float | None = None,
-) -> tuple[str, int]:
-    """Map name of segment ``index`` (the inverse of ``segment_at``'s index)."""
-    if not maps:
-        return "", 0
-    i = max(0, int(index))
-    if not weights:
-        return maps[i % len(maps)], i
-    pieces = weighted_pieces(maps, segment_s, weights, total_s)
-    return pieces[i % len(pieces)][0], i
-
-
-def segment_boundary(
-    elapsed_s: float,
-    maps: tuple[str, ...],
-    segment_s: float,
-    weights: dict[str, float] | None = None,
-    total_s: float | None = None,
-) -> float | None:
-    """Schedule time where the current segment index changes. None with no maps."""
-    if not maps:
-        return None
-    elapsed = max(0.0, float(elapsed_s))
-    if not weights:
-        span = max(1.0, float(segment_s))
-        return (int(elapsed // span) + 1) * span
-    pieces = weighted_pieces(maps, segment_s, weights, total_s)
-    cycle_len = sum(dur for _name, dur in pieces) or 1.0
-    which = int(elapsed // cycle_len)
-    pos = elapsed - which * cycle_len
-    acc = 0.0
-    for _name, dur in pieces:
-        acc += dur
-        if pos < acc:
-            return which * cycle_len + acc
-    return (which + 1) * cycle_len
-
-
 def segment_changed(loaded_map: str, loaded_index: int, map_name: str, seg_index: int) -> bool:
     """True when this piece needs a fresh level load.
 
@@ -967,6 +867,7 @@ def continue_after_segment_end(
     segment_s: float,
     weights: dict[str, float] | None,
     total_s: float,
+    boundary_at=None,
 ) -> tuple[str, float, float]:
     """``(action, new_cut_s, skipped_s)`` after a segment's second hard abort.
 
@@ -981,7 +882,10 @@ def continue_after_segment_end(
     planned = None
     if math.isfinite(float(total_s)) and float(total_s) > 0.0:
         planned = float(total_s)
-    boundary = segment_boundary(done_s + cut_s, maps, segment_s, weights, planned)
+    if boundary_at is not None:
+        boundary = boundary_at(done_s + cut_s)
+    else:
+        boundary = segment_boundary(done_s + cut_s, maps, segment_s, weights, planned)
     if boundary is None:
         return "stop", cut_s, 0.0
     skipped = max(0.0, float(boundary) - (float(done_s) + float(cut_s)))
@@ -1690,6 +1594,12 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
     except ValueError as exc:
         parser.error(str(exc))
     args.excursion_gap_min_s, args.excursion_gap_max_s = gap_lo, gap_hi
+    from python.collect.clip_draw import validate_clip_flags
+
+    try:
+        clip_minute_range, clip_traffic_range, clip_seed = validate_clip_flags(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     from python.collect.level_session import ego_spec, set_ego
 
     try:
@@ -2030,6 +1940,27 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         impact_respawns: dict[str, int] = {"impacts": 0, "deck": 0, "recover": 0, "abort_same_tick": 0}
         loaded_map = ""
         loaded_index = -1
+        from python.collect.clip_draw import (
+            ClipSchedule,
+            clip_rng,
+            clip_row_tags,
+            clip_seed_tag,
+            resolve_traffic,
+        )
+
+        schedule = ClipSchedule(
+            map_names,
+            segment_s,
+            map_weights or None,
+            None if target_s == float("inf") else target_s,
+            minute_range=clip_minute_range,
+            seed=int(clip_seed),
+        )
+        clip_draws: list[dict[str, Any]] = []
+        clip_seen: str | None = None
+        segment_clip_min: float | None = None
+        segment_traffic: int | None = None
+        segment_traffic_placed: int | None = None
         speed_span = [speeds]
         # Effective speed range per segment (collect.json speed_ranges) and the
         # weave / lane change / recover counters (collect.json weave_stats).
@@ -2156,6 +2087,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     segment_s,
                     map_weights or None,
                     target_s,
+                    boundary_at=schedule.boundary,
                 )
                 print(f"collect segment end {segment_id} {reason}", flush=True)
                 if action == "exit":
@@ -2278,11 +2210,22 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 rows.append(entry)
             return speeds_for(lo, hi)
 
+        def _record_placed_traffic(placed_n: int) -> None:
+            """Write the cars actually spawned onto the open clip_draws row."""
+            nonlocal segment_traffic_placed
+            segment_traffic_placed = int(placed_n)
+            if clip_draws and clip_draws[-1].get("segment") == segment_id and clip_traffic_range is not None:
+                clip_draws[-1]["traffic_count"] = int(placed_n)
+                if segment_traffic is not None:
+                    clip_draws[-1]["traffic_requested"] = int(segment_traffic)
+
         def _apply_spawn(force: bool, source: str = "spawn") -> None:
             """Teleport west coast to the next unused stratified spawn."""
             nonlocal spawn_deck, spawn_kind, spawn_mark, spawn_pos, spawn_seq, last_ai, segment_open, speed, spawn_cov
-            nonlocal spawn_road, recheck_mark
+            nonlocal spawn_road, recheck_mark, segment_traffic_placed
             if map_name != "west_coast_usa" or vehicle is None:
+                if clip_traffic_range is not None:
+                    _record_placed_traffic(0)
                 return
             if not force and (respawn_s <= 0.0 or done_s - spawn_mark < respawn_s):
                 return
@@ -2385,8 +2328,12 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             last_ai = None
             live.reset()
             segment_open = False
-            count = traffic_count(args.traffic, map_name)
+            if clip_traffic_range is not None and segment_traffic is not None:
+                count = int(segment_traffic)
+            else:
+                count = traffic_count(args.traffic, map_name)
             ge = getattr(bng, "queue_lua_command", None)
+            placed_n = 0
             if count and callable(ge):
                 slots, notes = spawn_deck.traffic_slots(
                     picked, count, float(args.traffic_ahead_m), float(args.traffic_behind_m)
@@ -2394,17 +2341,22 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 for note in notes:
                     print(f"collect {note}", flush=True)
                 placed = " ".join(f"{where}={along:.1f}m" for where, _p, _r, along in slots) or "none"
+                placed_n = len(slots)
                 print(
                     f"collect traffic {segment_id} placed {placed} "
-                    f"(want ahead={float(args.traffic_ahead_m):.0f}m behind={float(args.traffic_behind_m):.0f}m along the road)",
+                    f"(requested={count} placed={placed_n} "
+                    f"want ahead={float(args.traffic_ahead_m):.0f}m behind={float(args.traffic_behind_m):.0f}m along the road)",
                     flush=True,
                 )
                 for command in traffic_lua(picked, len(slots), slots):
                     ge(command)
+            if clip_traffic_range is not None:
+                _record_placed_traffic(placed_n)
             print(
                 f"collect spawn {segment_id} {picked.kind} "
                 f"({picked.pos[0]:.1f},{picked.pos[1]:.1f},{picked.pos[2]:.1f}) "
-                f"speed={picked.speed[0]:.0f}-{picked.speed[1]:.0f} traffic={count} "
+                f"speed={picked.speed[0]:.0f}-{picked.speed[1]:.0f} traffic={placed_n if clip_traffic_range is not None else count} "
+                f"requested={count} "
                 f"paint_cov={'na' if picked.paint_cov is None else format(picked.paint_cov, '.2f')} "
                 f"select_ms={spawn_deck.last_ms:.0f}",
                 flush=True,
@@ -2515,6 +2467,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             extra["ai_aggression"] = {"abort": ABORT_AGGRESSION, "reset_to": AI_DEFAULT_AGGRESSION, "reset_on": "cruise"}
             # Lane-change rows carry the peak heading reached so far (older recordings: the full-ramp peak).
             extra["lane_change_tag"] = "peak_so_far"
+            if clip_draws:
+                extra["clip_draws"] = list(clip_draws)
+                extra["clip_seed"] = int(clip_seed)
             extra["notes"] = {
                 "weave_stats": dict(WEAVE_STATS_NOTES),
                 "lane_change_tag": "peak_so_far: a lane-change row's target_heading_rad is the peak heading the sent "
@@ -2613,13 +2568,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             cut_at_load += repaid
             speed = speed_at(elapsed, tuple(speed_span[0]))
             waypoint = waypoint_at(elapsed, names)
-            map_name, seg_index = segment_at(
-                elapsed + schedule_cut,
-                map_names,
-                segment_s,
-                map_weights or None,
-                None if target_s == float("inf") else target_s,
-            )
+            map_name, seg_index = schedule.at(elapsed + schedule_cut)
             # A clock-driven chunk switch (no abort or yield cut since the load)
             # waits for cruise and the end of the settle window, at most 30 s.
             if (
@@ -2638,20 +2587,54 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     settled = segment_carry.add(segment_defer.waited_s, done_s, target_s)
                     schedule_cut += settled - segment_defer.waited_s
                     cut_at_load += settled
-                    map_name, seg_index = segment_at(
-                        elapsed + schedule_cut, map_names, segment_s, map_weights or None,
-                        None if target_s == float("inf") else target_s,
-                    )
+                    map_name, seg_index = schedule.at(elapsed + schedule_cut)
                 if was_held and seg_index > loaded_index + 1:
                     # The hold outlasted a short chunk: load the next chunk, not the one after it.
-                    map_name, seg_index = segment_piece(
-                        loaded_index + 1, map_names, segment_s, map_weights or None,
-                        None if target_s == float("inf") else target_s,
-                    )
+                    map_name, seg_index = schedule.piece(loaded_index + 1)
             else:
                 segment_defer.clear()
-            segment_id = f"{map_name}#{seg_index}" if map_name else "current#0"
+            if map_name:
+                segment_id = f"{map_name}#{seg_index}"
+            elif clip_minute_range is not None:
+                segment_id = f"current#{seg_index}"
+            else:
+                segment_id = "current#0"
             run.segment = segment_id
+            if segment_id != clip_seen:
+                clip_seen = segment_id
+                if clip_minute_range is not None:
+                    segment_clip_min = float(schedule.duration_min(seg_index))
+                else:
+                    segment_clip_min = None
+                if clip_traffic_range is not None:
+                    segment_traffic = resolve_traffic(
+                        args.traffic,
+                        map_name,
+                        clip_traffic_range,
+                        clip_rng(int(clip_seed), int(seg_index)),
+                    )
+                    segment_traffic_placed = None
+                else:
+                    segment_traffic = None
+                    segment_traffic_placed = None
+                if clip_minute_range is not None or clip_traffic_range is not None:
+                    rec: dict[str, Any] = {
+                        "segment": segment_id,
+                        "seed": int(clip_seed),
+                        "clip_seed": clip_seed_tag(int(clip_seed), int(seg_index)),
+                    }
+                    if segment_clip_min is not None:
+                        rec["segment_min"] = round(float(segment_clip_min), 4)
+                    if clip_traffic_range is not None:
+                        rec["traffic_requested"] = int(segment_traffic)
+                    clip_draws.append(rec)
+                    print(
+                        f"collect clip {segment_id}"
+                        + (f" min={segment_clip_min:.2f}" if segment_clip_min is not None else "")
+                        + (f" clip_seed={clip_seed_tag(int(clip_seed), int(seg_index))}" )
+                        + (f" traffic_requested={segment_traffic}" if clip_traffic_range is not None else ""),
+                        flush=True,
+                    )
             if not map_names and segment_id not in speed_ranges:
                 # A single-level run has no segment load: record its range once here.
                 speed_span[0] = _speed_range("level", (8.0, 17.0), "flag" if flags_set else "default")
@@ -3350,6 +3333,10 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 "map": map_name or None,
                 "excursion": move.as_tag(),
             }
+            tags.update(clip_row_tags(
+                segment_clip_min if clip_minute_range is not None else None,
+                segment_traffic_placed if clip_traffic_range is not None else None,
+            ))
             if spawn_kind:
                 tags["spawn_type"] = spawn_kind
                 tags["spawn_paint_cov"] = None if spawn_cov is None else round(float(spawn_cov), 3)
@@ -3477,13 +3464,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 road_here = None if hit is None else (str(getattr(hit, "road_id", "") or "") or None)
                 kind_was, road_was = spawn_kind or None, spawn_road
                 can_respawn = map_name == "west_coast_usa" and vehicle is not None and spawn_deck is not None
-                boundary = None if can_respawn else segment_boundary(
-                    done_s + schedule_cut,
-                    map_names,
-                    segment_s,
-                    map_weights or None,
-                    None if target_s == float("inf") else target_s,
-                )
+                boundary = None if can_respawn else schedule.boundary(done_s + schedule_cut)
                 plan, new_cut = low_yield_plan(can_respawn, boundary, done_s, schedule_cut)
                 if plan == "respawn":
                     mark = spawn_mark

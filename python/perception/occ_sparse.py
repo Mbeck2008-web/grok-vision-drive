@@ -390,16 +390,47 @@ if nn is not None:
 
 
 def _capped_hot(hot: np.ndarray, p_hot: np.ndarray, cap: int, z_min: float, cell_m: float) -> np.ndarray:
-    """Indices of the ``cap`` hot cells to refine: top-k by probability, with at most half the cap
-    for the most populous height layer (the ground: with whole-grid map labels it alone exceeds
-    the cap and would starve every structure above it - VO and occluders need those). Any share
-    the other layers do not use goes back to the ground layer."""
+    """Indices of the ``cap`` hot cells to refine.
+
+    At most half the cap goes to the most populous height layer (the ground:
+    with whole-grid map labels it alone exceeds the cap and would starve every
+    structure above it — VO and occluders need those). Any share the other
+    layers do not use goes back to the ground layer.
+
+    Within a height band, slots are spread in xy rather than a global top-k by
+    probability. Off-road ground and solid buildings are slightly easier
+    occupied cells than the road; a global top-k would never refine the road,
+    and camera-VO / memory then have no structure to track.
+    """
     lvl = np.floor((hot[:, 2] - z_min) / cell_m + 1e-6).astype(np.int64)
     band = lvl == int(np.bincount(lvl - lvl.min()).argmax() + lvl.min())
-    order = np.argsort(-p_hot, kind="stable")
-    up, low = order[~band[order]], order[band[order]]
-    up = up[: max(cap - min(low.size, cap // 2), 0)]
-    return np.concatenate([up, low[: cap - up.size]])
+
+    def _spread(idxs: np.ndarray, budget: int) -> np.ndarray:
+        if idxs.size <= budget:
+            return idxs
+        xy = hot[idxs, :2]
+        lo = xy.min(0)
+        span = np.maximum(xy.max(0) - lo, 1e-6)
+        nx = max(1, int(np.ceil(np.sqrt(budget))))
+        ny = max(1, int(np.ceil(budget / nx)))
+        bx = np.minimum(((xy[:, 0] - lo[0]) / span[0] * nx).astype(np.int64), nx - 1)
+        by = np.minimum(((xy[:, 1] - lo[1]) / span[1] * ny).astype(np.int64), ny - 1)
+        bin_id = bx * ny + by
+        order = np.argsort(-p_hot[idxs], kind="stable")
+        _, first = np.unique(bin_id[order], return_index=True)
+        winners = order[first]
+        if winners.size >= budget:
+            return idxs[winners[np.argsort(-p_hot[idxs[winners]], kind="stable")[:budget]]]
+        taken = np.zeros(idxs.size, dtype=bool)
+        taken[winners] = True
+        fill = order[~taken[order]][: budget - winners.size]
+        return idxs[np.concatenate([winners, fill])]
+
+    up = np.flatnonzero(~band)
+    low = np.flatnonzero(band)
+    n_up = max(cap - min(low.size, cap // 2), 0)
+    up = _spread(up, n_up)
+    return np.concatenate([up, _spread(low, cap - up.size)])
 
 
 def profile_cams(cfg: Any, profile: str, *, scale: float = 1.0) -> list[PinholeCam]:

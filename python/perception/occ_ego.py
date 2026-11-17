@@ -97,6 +97,16 @@ def occ_odometry(prev_keys, prev_cls, cur_keys, cur_cls, *, grid: OccGrid = DEFA
         return 0.0, 0.0, 0.0
     cur_keys = np.unique(_bev_keys(cur, grid))
     cur_keys = cur_keys[cur_keys >= 0]
+    # Cells that already match at zero shift are ego-fixed clutter (a dense
+    # decode_unseen prior, or a parked-ego hold). They score 0.8+ at (0, 0)
+    # and swamp a smaller set of moving posts/buildings. If enough cells do
+    # not match at rest, register those only; otherwise keep the full set so
+    # a truly stationary ego still scores high at zero.
+    k0 = _bev_keys(_warp(prev, 0.0, 0.0), grid)
+    pos0 = np.clip(np.searchsorted(cur_keys, k0), 0, len(cur_keys) - 1)
+    hit0 = (cur_keys[pos0] == k0) & (k0 >= 0)
+    if int((~hit0).sum()) >= VO_MIN_CELLS:
+        prev = prev[~hit0]
     best = (-1.0, 0.0, 0.0)
     for step_f, step_y, span_f, span_y in ((0.2, 0.01, None, None), (0.05, 0.0025, 0.3, 0.015)):
         if span_f is None:

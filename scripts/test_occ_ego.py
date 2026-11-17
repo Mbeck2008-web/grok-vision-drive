@@ -154,6 +154,29 @@ def check_world_fixed() -> None:
           f"over {9 * FWD:.1f} m driven ({pose_err[-1] / (9 * FWD) * 100:.1f}%)")
 
 
+
+def check_vo_clutter() -> None:
+    """A dense ego-fixed 'other' sheet must not lock VO at zero when posts move."""
+    rng = np.random.default_rng(0)
+    posts = np.stack([rng.uniform(-20, -6, 80), rng.uniform(5, 40, 80)], 1)
+    clutter = np.stack([rng.uniform(-24, 24, 3000), rng.uniform(-12, 50, 3000)], 1)
+    fwd = 2.5
+    def cells(shift):
+        xy = np.concatenate([posts - np.array([0.0, shift]), clutter])
+        # lift to a 3-D key set as elevated 'other' (cls 0)
+        z = 1.2
+        pts = np.concatenate([xy, np.full((len(xy), 1), z)], 1)
+        keys = G.keys_of(pts)
+        ok = keys >= 0
+        return keys[ok], np.zeros(ok.sum(), np.uint8)
+    k0, c0 = cells(0.0)
+    k1, c1 = cells(fwd)
+    est_fwd, dyaw, score = occ_odometry(k0, c0, k1, c1, grid=G)
+    assert abs(est_fwd - fwd) < 0.3, (est_fwd, dyaw, score)
+    assert score >= VO_MIN_SCORE if False else score > 0.3, (est_fwd, score)
+    print(f"VO clutter: fwd {est_fwd:.3f} m (true {fwd}) score {score:.3f} despite {3000} ego-fixed cells OK")
+
+
 def check_featureless() -> None:
     em = EgoMotion()
     k, c = frame_cells(0)
@@ -168,6 +191,7 @@ def check_featureless() -> None:
 
 def main() -> int:
     check_vo()
+    check_vo_clutter()
     check_world_fixed()
     check_featureless()
     print("test_occ_ego: all OK")

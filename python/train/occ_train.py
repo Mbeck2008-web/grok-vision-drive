@@ -30,6 +30,43 @@ N_COARSE = 512
 JITTER = 0.45
 
 
+
+
+def _class_balance(idxs: np.ndarray, cls: np.ndarray, rng: np.random.Generator, n: int) -> np.ndarray:
+    """Sample ``n`` of ``idxs``, splitting evenly across the classes they carry.
+
+    Whole-grid map labels make off-road ground ('other') the majority; without
+    this, a smaller side road is almost never a positive and the class head
+    calls it 'other'.
+    """
+    if n <= 0 or idxs.size == 0:
+        return np.zeros((0,), np.int64)
+    labs, inv = np.unique(np.asarray(cls)[idxs], return_inverse=True)
+    if labs.size == 1:
+        return idxs[rng.integers(0, idxs.size, size=n)]
+    per = np.full(labs.size, n // labs.size)
+    per[: n - int(per.sum())] += 1
+    out = []
+    for i, k in enumerate(per):
+        pool = idxs[inv == i]
+        out.append(pool[rng.integers(0, pool.size, size=int(k))])
+    return np.concatenate(out)
+
+
+def _unoccupied_points(keys: np.ndarray, grid: OccGrid, rng: np.random.Generator, n: int) -> np.ndarray:
+    """Centres of ``n`` cells that are not in the occupied key set (may be empty)."""
+    if n <= 0:
+        return np.zeros((0, 3), np.float64)
+    occ = np.asarray(keys, np.int64)
+    # draw with a small rejection buffer; the grid is sparse so this almost always fills
+    cand = rng.integers(0, grid.dense_cells, size=max(int(n) * 4, int(n)))
+    if occ.size:
+        cand = cand[~np.isin(cand, occ)]
+    if cand.size < n:
+        return grid.centers_of_keys(cand) if cand.size else np.zeros((0, 3), np.float64)
+    return grid.centers_of_keys(cand[:n])
+
+
 def sample_queries(
     keys: np.ndarray,
     cls: np.ndarray,
@@ -73,22 +110,31 @@ def sample_queries(
         if lo_i.size and up_i.size:
             n_up = int(n_occ) // 2
             pick = np.concatenate([up_i[rng.integers(0, up_i.size, size=n_up)],
-                                   lo_i[rng.integers(0, lo_i.size, size=int(n_occ) - n_up)]])
+                                   _class_balance(lo_i, cls, rng, int(n_occ) - n_up)])
         else:
             pick = rng.integers(0, keys.size, size=int(n_occ))
-        # below the ground layer nothing is occupied (no camera ray gets there, so without these
-        # negatives a decoder asked about the whole grid fills it): free points under ground cells
-        gz = int(z[layer][0]) if lo_i.size else 0
-        if lo_i.size and gz > 0 and n_free:
-            nb = max(1, int(n_free) // 4)
-            col = grid.centers_of_keys(keys[lo_i[rng.integers(0, lo_i.size, size=nb)]])
-            col[:, 2] = grid.z_min + rng.uniform(0.0, gz * grid.voxel_m - 0.5 * grid.voxel_m, size=nb)
-            pts.append(col); occ.append(np.zeros(nb)); occ_w.append(np.ones(nb)); tcls.append(np.full(nb, -1))
         p = grid.centers_of_keys(keys[pick]) + rng.uniform(-JITTER, JITTER, size=(int(n_occ), 3)) * grid.voxel_m
         pts.append(p); occ.append(np.ones(n_occ)); occ_w.append(np.ones(n_occ)); tcls.append(cls[pick].astype(np.int64))
-    if free.shape[0] and n_free:
-        pick = rng.integers(0, free.shape[0], size=int(n_free))
-        pts.append(free[pick].astype(np.float64)); occ.append(np.zeros(n_free)); occ_w.append(np.ones(n_free)); tcls.append(np.full(n_free, -1))
+    # Free budget stays n_free (no extras): recorded free rays plus unoccupied cell
+    # centres. Stratified upper positives would otherwise teach "everything above
+    # the road is occupied"; decode_unseen then fills a dense ego-fixed volume
+    # and camera-VO locks at zero shift.
+    if n_free:
+        n_empty = int(n_free) // 2
+        n_ray = int(n_free) - n_empty
+        empty_pts = _unoccupied_points(keys, grid, rng, n_empty)
+        if empty_pts.shape[0]:
+            n_e = empty_pts.shape[0]
+            pts.append(empty_pts); occ.append(np.zeros(n_e)); occ_w.append(np.ones(n_e)); tcls.append(np.full(n_e, -1))
+            n_ray = int(n_free) - n_e
+        if free.shape[0] and n_ray:
+            pick = rng.integers(0, free.shape[0], size=int(n_ray))
+            pts.append(free[pick].astype(np.float64)); occ.append(np.zeros(n_ray)); occ_w.append(np.ones(n_ray)); tcls.append(np.full(n_ray, -1))
+        elif n_ray and empty_pts.shape[0]:
+            # no recorded rays: top up from more unoccupied cells so the budget is filled
+            extra = _unoccupied_points(keys, grid, rng, n_ray)
+            if extra.shape[0]:
+                pts.append(extra); occ.append(np.zeros(len(extra))); occ_w.append(np.ones(len(extra))); tcls.append(np.full(len(extra), -1))
     centers = grid.centers_of_keys(keys) if keys.size else np.zeros((0, 3))
     occ_levels = [np.unique(cg.keys_of(centers)) for cg in coarse_grids]
     per = [int(n_coarse) // len(levels)] * len(levels)

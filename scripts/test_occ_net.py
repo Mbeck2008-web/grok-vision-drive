@@ -33,7 +33,7 @@ import yaml  # noqa: E402
 
 from python.data.occ_shards import ShardWriter  # noqa: E402
 from python.perception.occ_geometry import DEFAULT_GRID, project, rig_cams  # noqa: E402
-from python.perception.occ_sparse import LEVELS, SparseOccNet, visible_mask  # noqa: E402
+from python.perception.occ_sparse import LEVELS, SparseOccNet, _capped_hot, visible_mask  # noqa: E402
 from python.train.occ_labels import build_occ_labels  # noqa: E402
 from python.train.occ_train import prep_image, sample_queries, train  # noqa: E402
 from synthetic_occ import SEM_CLASSES, render  # noqa: E402
@@ -200,11 +200,44 @@ def check_overfit(tmp: Path) -> None:
     print("predict: observed-cell IoU > 0.6 from sparse queries (< 25% of dense) OK")
 
 
+
+def check_capped_hot_spreads() -> None:
+    """Later-stage caps must not spend the whole budget on the highest-p region.
+
+    Off-road ground / buildings are slightly easier occupied cells than the
+    road; a global top-k by probability then never refines the road.
+    """
+    # one height band, two xy regions: a large high-p field and a smaller lower-p "road"
+    n_hi, n_lo = 2000, 200
+    hi = np.stack([np.full(n_hi, -10.0), np.linspace(-20.0, 40.0, n_hi), np.full(n_hi, 0.2)], 1)
+    lo = np.stack([np.full(n_lo, 10.0), np.linspace(-20.0, 40.0, n_lo), np.full(n_lo, 0.2)], 1)
+    hot = np.concatenate([hi, lo])
+    p = np.concatenate([np.full(n_hi, 0.90), np.full(n_lo, 0.80)])
+    cap = 256
+    idx = _capped_hot(hot, p, cap, z_min=-2.0, cell_m=0.4)
+    assert idx.size == cap, idx.size
+    picked = hot[idx]
+    n_road = int((picked[:, 0] > 0).sum())
+    n_field = int((picked[:, 0] < 0).sum())
+    assert n_field > 0 and n_road > 0, (n_field, n_road)
+    assert n_road >= 16, n_road  # a fair xy share, not a couple of leftovers
+    # height split is kept: a thinner upper band still gets slots when the ground is huge
+    ground = np.stack([np.linspace(-20.0, 20.0, 4000), np.zeros(4000), np.full(4000, 0.2)], 1)
+    posts = np.stack([np.linspace(-5.0, 5.0, 80), np.full(80, 15.0), np.full(80, 3.0)], 1)
+    hot2 = np.concatenate([ground, posts])
+    p2 = np.concatenate([np.full(4000, 0.95), np.full(80, 0.70)])
+    idx2 = _capped_hot(hot2, p2, 256, z_min=-2.0, cell_m=0.4)
+    n_up = int((hot2[idx2, 2] > 1.0).sum())
+    assert n_up > 0, n_up
+    print(f"capped_hot: cap={cap} field/road {n_field}/{n_road}; ground+posts upper kept {n_up} OK")
+
+
 def main() -> int:
     torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
     check_projection()
     check_camera_only()
     check_sparse_predict()
+    check_capped_hot_spreads()
     check_queries()
     with tempfile.TemporaryDirectory() as d:
         check_overfit(Path(d))

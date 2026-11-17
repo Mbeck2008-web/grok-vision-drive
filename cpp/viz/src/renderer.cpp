@@ -149,6 +149,9 @@ void main(){
 
 // One billboard per box; the fragment takes the min distance to all 12 edges
 // so a corner is no brighter than a mid-edge (additive 12-capsule draws stack).
+// The vertex shader projects the 8 box corners once; the fragment shader
+// uses those projected endpoints (and only reprojects an endpoint that was
+// clipped to the near plane) instead of doing 24 view/proj multiplies per pixel.
 const char* kBoxVS = R"(#version 330 core
 layout(location=0) in vec2 a_corner;
 layout(location=1) in vec3 a_v0; layout(location=2) in vec3 a_v1;
@@ -159,7 +162,8 @@ layout(location=9) in vec4 a_color; layout(location=10) in vec2 a_rad;
 layout(location=11) in vec2 a_glow;
 uniform mat4 u_view; uniform mat4 u_proj; uniform vec2 u_vp; uniform float u_near;
 out vec2 v_px;
-flat out vec3 v_w0, v_w1, v_w2, v_w3, v_w4, v_w5, v_w6, v_w7;
+flat out vec4 v_eye[8];
+flat out vec4 v_clip[8];
 flat out vec4 v_color; flat out vec2 v_rad; flat out vec2 v_glow;
 void main(){
   vec3 w[8] = vec3[](a_v0,a_v1,a_v2,a_v3,a_v4,a_v5,a_v6,a_v7);
@@ -169,8 +173,10 @@ void main(){
   float ext = 2.0;
   for (int i = 0; i < 8; ++i) {
     vec4 e = u_view*vec4(w[i],1.0);
-    if (e.z > -u_near) continue;
     vec4 c = u_proj*e;
+    v_eye[i] = e;
+    v_clip[i] = c;
+    if (e.z > -u_near) continue;
     vec2 s = (c.xy/c.w*0.5+0.5)*u_vp;
     float r = max(a_rad.y, a_rad.x*f/(-e.z));
     float g = a_glow.x*clamp(r/2.5, 0.4, 1.0);
@@ -183,22 +189,21 @@ void main(){
   vec2 px = mix(mn, mx, a_corner*0.5+0.5);
   gl_Position = vec4(px/u_vp*2.0-1.0, 0.0, 1.0);
   v_px = px;
-  v_w0=a_v0; v_w1=a_v1; v_w2=a_v2; v_w3=a_v3;
-  v_w4=a_v4; v_w5=a_v5; v_w6=a_v6; v_w7=a_v7;
   v_color = a_color; v_rad = a_rad; v_glow = a_glow;
 })";
 const char* kBoxFS = R"(#version 330 core
 in vec2 v_px;
-flat in vec3 v_w0, v_w1, v_w2, v_w3, v_w4, v_w5, v_w6, v_w7;
+flat in vec4 v_eye[8];
+flat in vec4 v_clip[8];
 flat in vec4 v_color; flat in vec2 v_rad; flat in vec2 v_glow;
-uniform mat4 u_view; uniform mat4 u_proj; uniform vec2 u_vp; uniform float u_near;
+uniform mat4 u_proj; uniform vec2 u_vp; uniform float u_near;
 out vec4 o;
-bool project_edge(vec3 p0, vec3 p1, out vec2 s0, out vec2 s1, out float z0, out float z1, out float r, out float g){
-  vec4 e0 = u_view*vec4(p0,1.0), e1 = u_view*vec4(p1,1.0);
+bool project_edge(int i0, int i1, out vec2 s0, out vec2 s1, out float z0, out float z1, out float r, out float g){
+  vec4 e0 = v_eye[i0], e1 = v_eye[i1];
   if (e0.z > -u_near && e1.z > -u_near) return false;
-  if (e0.z > -u_near) e0 = mix(e0, e1, (-u_near - e0.z)/(e1.z - e0.z));
-  if (e1.z > -u_near) e1 = mix(e1, e0, (-u_near - e1.z)/(e0.z - e1.z));
-  vec4 c0 = u_proj*e0, c1 = u_proj*e1;
+  vec4 c0 = v_clip[i0], c1 = v_clip[i1];
+  if (e0.z > -u_near) { e0 = mix(e0, e1, (-u_near - e0.z)/(e1.z - e0.z)); c0 = u_proj*e0; }
+  if (e1.z > -u_near) { e1 = mix(e1, e0, (-u_near - e1.z)/(e0.z - e1.z)); c1 = u_proj*e1; }
   s0 = (c0.xy/c0.w*0.5+0.5)*u_vp;
   s1 = (c1.xy/c1.w*0.5+0.5)*u_vp;
   z0 = c0.z/c0.w; z1 = c1.z/c1.w;
@@ -209,13 +214,12 @@ bool project_edge(vec3 p0, vec3 p1, out vec2 s0, out vec2 s1, out float z0, out 
   return true;
 }
 void main(){
-  vec3 w[8] = vec3[](v_w0,v_w1,v_w2,v_w3,v_w4,v_w5,v_w6,v_w7);
   const int E[24] = int[](0,1, 1,3, 3,2, 2,0, 4,5, 5,7, 7,6, 6,4, 0,4, 1,5, 2,6, 3,7);
   float best_d = 1e9, best_r = 1.0, best_gpx = 0.0, best_z = 0.0;
   bool any = false;
   for (int i = 0; i < 12; ++i) {
     vec2 s0, s1; float z0, z1, r, gpx;
-    if (!project_edge(w[E[i*2]], w[E[i*2+1]], s0, s1, z0, z1, r, gpx)) continue;
+    if (!project_edge(E[i*2], E[i*2+1], s0, s1, z0, z1, r, gpx)) continue;
     vec2 pa = v_px - s0, ba = s1 - s0;
     float h = dot(ba,ba) > 1e-6 ? clamp(dot(pa,ba)/dot(ba,ba), 0.0, 1.0) : 0.0;
     float d = length(pa - ba*h);
@@ -788,6 +792,10 @@ struct Renderer::Impl {
   double last_dot_t = -1e9;
   GLuint fbo_ms = 0, rb_color = 0, rb_depth = 0, fbo_res = 0, tex_res = 0;
   int tw = 0, th = 0, tmsaa = 0;
+  // Last *requested* size/msaa/extra that produced the current targets, so a
+  // driver that rounds samples up (and forces a one-time shrink) does not
+  // rebuild FBOs every frame.
+  int src_w = 0, src_h = 0, src_msaa = -1;
   GLuint tex_bg = 0;
   const Image* bg_src = nullptr;
   int bg_w = 0, bg_h = 0;
@@ -942,6 +950,20 @@ bool Renderer::init(std::string* err) {
 }
 
 
+int msaa_step_down(int msaa) {
+  if (msaa > 4) return 4;
+  if (msaa > 2) return 2;
+  if (msaa > 1) return 1;
+  return msaa;
+}
+
+int msaa_request_pow2(int msaa) {
+  if (msaa <= 1) return msaa;
+  if (msaa <= 2) return 2;
+  if (msaa <= 4) return 4;
+  return 8;
+}
+
 size_t estimate_target_bytes(int w, int h, int msaa) {
   int ww = std::max(1, w), hh = std::max(1, h);
   int s = std::max(1, msaa);
@@ -949,17 +971,12 @@ size_t estimate_target_bytes(int w, int h, int msaa) {
   return px * 4 * static_cast<size_t>(s) + px * 4 * static_cast<size_t>(s) + px * 4;
 }
 
-void cap_render_targets(int& w, int& h, int& msaa, size_t extra, size_t budget) {
-  w = std::clamp(w, 16, 8192);
-  h = std::clamp(h, 16, 8192);
-  msaa = std::clamp(msaa, 0, 8);
-  auto fits = [&](int ww, int hh, int s) {
-    return estimate_target_bytes(ww, hh, std::max(1, s)) + extra <= budget;
+// Shrink resolution only (MSAA held fixed) so the CPU-side estimate fits.
+static void shrink_res_to_fit(int& w, int& h, int msaa, size_t extra, size_t budget) {
+  auto fits = [&](int ww, int hh) {
+    return estimate_target_bytes(ww, hh, std::max(1, msaa)) + extra <= budget;
   };
-  if (fits(w, h, msaa)) return;
-  while (msaa > 1 && !fits(w, h, msaa)) --msaa;
-  if (fits(w, h, msaa)) return;
-  msaa = std::min(msaa, 1);
+  if (fits(w, h)) return;
   const double denom = 4.0 * (2.0 * static_cast<double>(std::max(1, msaa)) + 1.0);
   if (budget <= extra || denom <= 0.0) {
     w = 16;
@@ -973,10 +990,28 @@ void cap_render_targets(int& w, int& h, int& msaa, size_t extra, size_t budget) 
     w = std::max(16, static_cast<int>(std::floor(w * scale / 2.0) * 2.0));
     h = std::max(16, static_cast<int>(std::floor(h * scale / 2.0) * 2.0));
   }
-  while (!fits(w, h, msaa) && (w > 16 || h > 16)) {
+  while (!fits(w, h) && (w > 16 || h > 16)) {
     w = std::max(16, w - 16);
     h = std::max(16, h - 16);
   }
+}
+
+void cap_render_targets(int& w, int& h, int& msaa, size_t extra, size_t budget) {
+  w = std::clamp(w, 16, 8192);
+  h = std::clamp(h, 16, 8192);
+  msaa = std::clamp(msaa, 0, 8);
+  // Never request 3, 5, 6, 7: drivers round those up (3→4, 5–7→8) and the
+  // estimate would under-count. Promote to the power of two the driver would
+  // use, then step down 8→4→2→1 until the estimate fits.
+  msaa = msaa_request_pow2(msaa);
+  auto fits = [&](int ww, int hh, int s) {
+    return estimate_target_bytes(ww, hh, std::max(1, s)) + extra <= budget;
+  };
+  if (fits(w, h, msaa)) return;
+  while (msaa > 1 && !fits(w, h, msaa)) msaa = msaa_step_down(msaa);
+  if (fits(w, h, msaa)) return;
+  msaa = std::min(msaa, 1);
+  shrink_res_to_fit(w, h, msaa, extra, budget);
 }
 
 bool Renderer::ensure_targets(int w, int h, int msaa) {
@@ -991,10 +1026,12 @@ bool Renderer::ensure_targets(int w, int h, int msaa) {
   }
   GLint max_s = 0;
   glGetIntegerv(GL_MAX_SAMPLES, &max_s);
-  int s = std::max(0, std::min(msaa, static_cast<int>(max_s)));
+  int s = msaa_request_pow2(std::max(0, std::min(msaa, static_cast<int>(max_s))));
   glGenRenderbuffers(1, &I.rb_color);
   glBindRenderbuffer(GL_RENDERBUFFER, I.rb_color);
   glRenderbufferStorageMultisample(GL_RENDERBUFFER, s, GL_RGBA8, w, h);
+  GLint got = s;
+  glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_SAMPLES, &got);
   glGenRenderbuffers(1, &I.rb_depth);
   glBindRenderbuffer(GL_RENDERBUFFER, I.rb_depth);
   glRenderbufferStorageMultisample(GL_RENDERBUFFER, s, GL_DEPTH_COMPONENT24, w, h);
@@ -1013,13 +1050,22 @@ bool Renderer::ensure_targets(int w, int h, int msaa) {
   ok = ok && glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
   I.tw = w;
   I.th = h;
-  I.tmsaa = s;
+  // Use the real sample count, not the requested one, so gl_bytes() cannot
+  // under-count a driver that rounded up.
+  I.tmsaa = static_cast<int>(got);
   return ok;
 }
 
 void Renderer::upload_background(const Image* bg) {
   Impl& I = *p_;
-  if (!bg || bg->w <= 0) return;
+  if (!bg || bg->w <= 0) {
+    if (I.tex_bg) glDeleteTextures(1, &I.tex_bg);
+    I.tex_bg = 0;
+    I.bg_src = nullptr;
+    I.bg_w = 0;
+    I.bg_h = 0;
+    return;
+  }
   if (I.bg_src == bg && I.bg_w == bg->w && I.bg_h == bg->h) return;
   if (!I.tex_bg) glGenTextures(1, &I.tex_bg);
   glBindTexture(GL_TEXTURE_2D, I.tex_bg);
@@ -1098,11 +1144,11 @@ static void add_box(std::vector<Capsule>& caps, std::vector<BoxStroke>& boxes, c
     BoxStroke b;
     for (int i = 0; i < 8; ++i) b.v[i] = v[i];
     b.color = {col, 1.0f * g};
-    b.rad = {0.055f, 1.9f};
+    b.rad = {kBoxEdgeWorldM, kBoxEdgeFloorPx};
     b.glow = {10.f, 0.5f * g};
     boxes.push_back(b);
   } else {
-    for (auto& e : E) caps.push_back({v[e[0]], v[e[1]], {0.055f, 1.9f}, {col, 1.0f * g}, {10.f, 0.5f * g}});
+    for (auto& e : E) caps.push_back({v[e[0]], v[e[1]], {kBoxEdgeWorldM, kBoxEdgeFloorPx}, {col, 1.0f * g}, {10.f, 0.5f * g}});
   }
   // centre dot on the end face toward the ego (the refs' filled disc)
   glm::vec2 f1 = ctr + fwd * (0.5f * d.x), f2 = ctr - fwd * (0.5f * d.x);
@@ -1159,8 +1205,27 @@ bool Renderer::render(const Scene& s, const RenderOptions& o, Image* out, bool b
   if (o.background && o.background->w > 0 && o.background->h > 0) {
     extra += static_cast<size_t>(o.background->w) * static_cast<size_t>(o.background->h) * 4;
   }
-  cap_render_targets(w, h, msaa, extra);
-  if (!ensure_targets(w, h, msaa)) return false;
+  bool reuse = I.fbo_ms && I.src_w == o.w && I.src_h == o.h && I.src_msaa == o.msaa &&
+               estimate_target_bytes(I.tw, I.th, I.tmsaa) + extra <= kMaxGlBytes;
+  if (!reuse) {
+    cap_render_targets(w, h, msaa, extra);
+    int requested_msaa = msaa;
+    if (!ensure_targets(w, h, msaa)) return false;
+    int tw = 0, th = 0, ts = 0;
+    target_size(&tw, &th, &ts);
+    // Retry only when the driver rounded samples up past what we budgeted.
+    // A cap_render_targets(..., 0) mutant must not be papered over here: if
+    // the driver honours the requested count, the first cap is the budget.
+    if (ts > requested_msaa) {
+      shrink_res_to_fit(w, h, ts, extra, kMaxGlBytes);
+      // Ask for the driver's sample count at the shrunken size so tmsaa
+      // matches the request and gl_bytes stays on the real allocation.
+      if (!ensure_targets(w, h, ts)) return false;
+    }
+    I.src_w = o.w;
+    I.src_h = o.h;
+    I.src_msaa = o.msaa;
+  }
   upload_background(o.background);
 
   // GPU timer from two frames ago (non-blocking read).

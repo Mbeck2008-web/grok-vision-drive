@@ -6,10 +6,20 @@ Author: https://sketchfab.com/David_Holiday
 This folder's tesla_model3_ego.glb is that model, prepared for the GVD C++
 visualizer (gvd_viz) as the ego car.
 
-Source file used: model3_car_only.glb, an extract of the car meshes only
-(body, glass, wheels, calipers, a small interior) from a public CC BY 4.0
-copy of the listing. The slideshow scene file model3_scene.glb was not used
-(it also contains non-car props that this project does not redistribute).
+The public copy used to prepare this file came from GitHub
+wass08/r3f-3d-slideshow @ 4672444 (commit 4672444b40fcdf9830985b4d7fad90bb01c7993d),
+path public/models/model3_scene.glb
+(https://github.com/wass08/r3f-3d-slideshow). That repo's README credits
+the same David_Holiday Sketchfab model as CC BY 4.0.
+  SHA-256 (model3_scene.glb): 98ecdd9299e871e72852fad4327754689644d45620e4f2ba8bc014ee708f5502
+  Size: 295,892 bytes (Draco-compressed GLB).
+
+model3_scene.glb is a slideshow scene, not a standalone car (it also has
+non-car props this project does not redistribute). A car-only extract
+(model3_car_only.glb: body, glass, wheels, calipers, a small interior) was
+the direct source for tesla_model3_ego.glb. That extract has 26,942 triangles;
+Sketchfab lists 27,012 for the standalone model, a 70-triangle gap that was
+not further reconciled.
 
 Changes made (CC BY 4.0 requires that adaptations be indicated):
   - The embossed Tesla "T" badge on the hood was removed (307 triangles).

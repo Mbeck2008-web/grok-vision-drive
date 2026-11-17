@@ -1,7 +1,9 @@
 // ctest: render fixed scenes headless and check pixels / schema handling.
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cctype>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -45,6 +47,67 @@ static int g_fail = 0;
       std::printf("\n");                                  \
     }                                                     \
   } while (0)
+
+
+// Compact SHA-256 (public-domain style) for pinning the ego GLB bytes.
+static uint32_t rotr32(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+static void sha256(const unsigned char* data, size_t len, unsigned char out[32]) {
+  static const uint32_t K[64] = {
+      0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+      0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+      0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+      0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+      0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+      0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+      0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+      0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
+  uint32_t h[8] = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+  auto process = [&](const unsigned char* blk) {
+    uint32_t w[64];
+    for (int i = 0; i < 16; ++i)
+      w[i] = (uint32_t)blk[i*4]<<24 | (uint32_t)blk[i*4+1]<<16 | (uint32_t)blk[i*4+2]<<8 | blk[i*4+3];
+    for (int i = 16; i < 64; ++i) {
+      uint32_t s0 = rotr32(w[i-15],7) ^ rotr32(w[i-15],18) ^ (w[i-15]>>3);
+      uint32_t s1 = rotr32(w[i-2],17) ^ rotr32(w[i-2],19) ^ (w[i-2]>>10);
+      w[i] = w[i-16] + s0 + w[i-7] + s1;
+    }
+    uint32_t a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
+    for (int i = 0; i < 64; ++i) {
+      uint32_t S1 = rotr32(e,6) ^ rotr32(e,11) ^ rotr32(e,25);
+      uint32_t ch = (e & f) ^ ((~e) & g);
+      uint32_t t1 = hh + S1 + ch + K[i] + w[i];
+      uint32_t S0 = rotr32(a,2) ^ rotr32(a,13) ^ rotr32(a,22);
+      uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+      uint32_t t2 = S0 + maj;
+      hh=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+    }
+    h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d; h[4]+=e; h[5]+=f; h[6]+=g; h[7]+=hh;
+  };
+  unsigned char blk[64];
+  size_t n = len, off = 0;
+  while (n >= 64) { process(data + off); off += 64; n -= 64; }
+  memcpy(blk, data + off, n);
+  blk[n] = 0x80;
+  if (n + 1 > 56) { memset(blk + n + 1, 0, 63 - n); process(blk); memset(blk, 0, 56); }
+  else memset(blk + n + 1, 0, 55 - n);
+  uint64_t bits = (uint64_t)len * 8;
+  for (int i = 0; i < 8; ++i) blk[63 - i] = (unsigned char)(bits >> (8 * i));
+  process(blk);
+  for (int i = 0; i < 8; ++i) {
+    out[i*4] = (unsigned char)(h[i] >> 24);
+    out[i*4+1] = (unsigned char)(h[i] >> 16);
+    out[i*4+2] = (unsigned char)(h[i] >> 8);
+    out[i*4+3] = (unsigned char)h[i];
+  }
+}
+static std::string sha256_hex(const unsigned char* data, size_t len) {
+  unsigned char d[32];
+  sha256(data, len, d);
+  static const char* kHex = "0123456789abcdef";
+  std::string s(64, '0');
+  for (int i = 0; i < 32; ++i) { s[i*2] = kHex[d[i] >> 4]; s[i*2+1] = kHex[d[i] & 0xf]; }
+  return s;
+}
 
 struct Counts { long white = 0, yellow = 0, purple = 0, red = 0, green = 0, blue = 0, lit = 0,
                 orange = 0, pink = 0, magenta = 0; };
@@ -114,6 +177,26 @@ static std::string lanes(const char* a, const char* b) {
 }
 
 int main() {
+  // 17. hidden GLFW window: must run *before* the EGL surfaceless context is
+  // current. Creating a GLX context while EGL owns the thread fails on xvfb
+  // with X_GLXMakeCurrent BadAccess and aborts the process.
+  {
+    CHECK(headless_glfw_visible() == false, "init_headless must pass visible=false");
+#if GVD_VIZ_HAVE_GLFW
+    GlContext hidden;
+    std::string e;
+    if (hidden.init_window(64, 64, "gvd_viz hint test", false, &e, /*visible=*/false)) {
+      CHECK(hidden.window() != nullptr, "hidden window is null");
+      CHECK(glfwGetWindowAttrib(hidden.window(), GLFW_VISIBLE) == GLFW_FALSE,
+            "hidden window is visible (GLFW_VISIBLE hint lost)");
+    } else {
+      std::printf("SKIP glfw hidden-window attrib (no display?): %s\n", e.c_str());
+    }
+#else
+    std::printf("SKIP glfw hidden-window attrib (built without GLFW)\n");
+#endif
+  }
+
   GlContext ctx;
   std::string err;
   if (!ctx.init_headless(&err)) {
@@ -361,9 +444,21 @@ int main() {
     CHECK(scene_is_stale(t0, t0 + std::chrono::milliseconds(1001)), "1001 ms is still fresh");
     CHECK(scene_is_stale(t0, t0 + std::chrono::seconds(2)), "2 s is still fresh");
     CHECK(!scene_is_stale(t0, t0 + std::chrono::milliseconds(999)), "999 ms is stale");
+    Scene cur;
+    cur.speed_mps = 13.4f;
+    cur.seq = 7;
+    cur.engaged = true;
+    Scene fresh = scene_to_show(cur, t0, t0 + std::chrono::milliseconds(999));
+    CHECK(fresh.seq == 7 && std::fabs(fresh.speed_mps - 13.4f) < 1e-5f && fresh.engaged,
+          "fresh scene_to_show dropped the live scene (seq=%lld speed=%f)", fresh.seq, fresh.speed_mps);
+    Scene blank = scene_to_show(cur, t0, t0 + std::chrono::milliseconds(1001));
+    CHECK(blank.seq == 0 && blank.speed_mps == 0.f && !blank.engaged && blank.tracks.empty(),
+          "stale scene_to_show did not blank (seq=%lld speed=%f)", blank.seq, blank.speed_mps);
   }
 
   // 15. internal targets stay under the 200 MB VRAM cap, including a 4K 4x request.
+  // Figures from estimate_target_bytes / gl_bytes are a CPU-side formula, not a
+  // measured GPU VRAM figure. MSAA steps through powers of two only (8→4→2→1).
   {
     int w = 3840, h = 2160, msaa = 4;
     size_t uncapped = estimate_target_bytes(w, h, msaa);
@@ -372,7 +467,7 @@ int main() {
     size_t capped = estimate_target_bytes(w, h, msaa);
     CHECK(capped <= kMaxGlBytes, "capped 4K estimate %zu over budget", capped);
     CHECK(w == 3840 && h == 2160, "4K resolution was reduced before MSAA (%dx%d msaa=%d)", w, h, msaa);
-    CHECK(msaa >= 1 && msaa < 4, "4K 4x MSAA was not reduced (msaa=%d)", msaa);
+    CHECK(msaa == 2, "4K 4x must land exactly on MSAA 2, got msaa=%d", msaa);
     // smaller sizes at 4x already fit
     for (auto wh : {std::pair<int,int>{1280,720}, {1920,1080}, {2560,1440}}) {
       int ww = wh.first, hh = wh.second, s = 4;
@@ -380,15 +475,71 @@ int main() {
       CHECK(ww == wh.first && hh == wh.second && s == 4, "unexpected cap at %dx%d msaa=%d", ww, hh, s);
       CHECK(estimate_target_bytes(ww, hh, s) <= kMaxGlBytes, "estimate over cap at %dx%d", ww, hh);
     }
+    // background / extra term must tighten the cap (K9). 2560x1440 4x fits
+    // alone (~132.7 MB) but not with an 80 MB extra; it must step to 2.
+    {
+      int ww = 2560, hh = 1440, s = 4;
+      cap_render_targets(ww, hh, s, /*extra=*/0);
+      CHECK(ww == 2560 && hh == 1440 && s == 4, "2560x1440 4x should fit with no extra");
+      ww = 2560; hh = 1440; s = 4;
+      const size_t extra = 80ull * 1024ull * 1024ull;
+      cap_render_targets(ww, hh, s, extra);
+      CHECK(estimate_target_bytes(ww, hh, s) + extra <= kMaxGlBytes,
+            "extra term left estimate over budget (%dx%d msaa=%d)", ww, hh, s);
+      CHECK(s == 2 && ww == 2560 && hh == 1440,
+            "80 MB extra should step 2560x1440 4x to msaa 2, got %dx%d msaa=%d", ww, hh, s);
+    }
+    // Non-power-of-two requests must not stick at 3/5/6/7 (driver would
+    // round those up). 5120x1440 at 3 would appear to fit, but 4 would not.
+    {
+      int ww = 5120, hh = 1440, s = 3;
+      cap_render_targets(ww, hh, s);
+      CHECK(s == 2 || s == 1 || s == 4 || s == 8, "non-pow2 sample count survived, msaa=%d", s);
+      CHECK(s != 3, "msaa 3 request landed on 3 (driver would round up to 4, over budget)");
+      CHECK(estimate_target_bytes(ww, hh, s) <= kMaxGlBytes, "5120x1440 msaa=%d over budget", s);
+      ww = 5120; hh = 1440; s = 4;
+      cap_render_targets(ww, hh, s);
+      CHECK(ww == 5120 && hh == 1440 && s == 2, "5120x1440 4x should land on 2, got %dx%d msaa=%d", ww, hh, s);
+    }
+    // K9: render() must pass the background's bytes into the cap. A 80 MB
+    // background makes 2560x1440 4x miss the budget, so MSAA or size must drop.
+    {
+      Image bg;
+      bg.w = 4096;
+      bg.h = 5120;  // 4096*5120*4 = 83,886,080 bytes
+      bg.rgba.assign(static_cast<size_t>(bg.w) * bg.h * 4, static_cast<uint8_t>(0));
+      RenderOptions with_bg;
+      with_bg.w = 2560;
+      with_bg.h = 1440;
+      with_bg.msaa = 4;
+      with_bg.background = &bg;
+      CHECK(r.render(must(head("")), with_bg, nullptr), "render with large background failed");
+      int bw = 0, bh = 0, bs = 0;
+      r.target_size(&bw, &bh, &bs);
+      const size_t bg_bytes = static_cast<size_t>(bg.w) * bg.h * 4;
+      CHECK(estimate_target_bytes(bw, bh, bs) + bg_bytes <= kMaxGlBytes,
+            "background extra ignored: allocated %dx%d msaa=%d", bw, bh, bs);
+      CHECK(bs < 4 || bw < 2560 || bh < 1440,
+            "80 MB background did not tighten 2560x1440 4x (got %dx%d msaa=%d)", bw, bh, bs);
+    }
     RenderOptions big = o;
     big.w = 3840;
     big.h = 2160;
     big.msaa = 4;
     CHECK(r.render(must(head("")), big, nullptr), "capped 4K render failed");
-    CHECK(r.gl_bytes() < kMaxGlBytes, "gl_bytes %zu over 200 MB after 4K request", r.gl_bytes());
+    CHECK(r.gl_bytes() <= kMaxGlBytes, "gl_bytes %zu over 200 MB after 4K request", r.gl_bytes());
     int tw = 0, th = 0, ts = 0;
     r.target_size(&tw, &th, &ts);
     CHECK(estimate_target_bytes(tw, th, ts) <= kMaxGlBytes, "allocated %dx%d msaa=%d over cap", tw, th, ts);
+    // cap_render_targets itself lands on 4K MSAA 2 (tested above). The
+    // allocated target uses the real GL_RENDERBUFFER_SAMPLES count; if the
+    // driver rounded up past 2, resolution must shrink so the estimate fits.
+    if (ts <= 2) {
+      CHECK(tw == 3840 && th == 2160, "driver honored msaa %d but 4K was reduced to %dx%d", ts, tw, th);
+    } else {
+      CHECK(static_cast<long long>(tw) * th < 3840ll * 2160ll,
+            "driver rounded MSAA to %d but 4K resolution was not reduced (%dx%d)", ts, tw, th);
+    }
   }
 
   // 16. strict v1 enums, integer ids, caps, path_conf clamp / default.
@@ -452,24 +603,51 @@ int main() {
     CHECK(parse_scene(head(long_path), s) && s.path.size() == 120 && s.path.front().y == 0.f && s.path.back().y == 199.f,
           "point cap: size=%zu first=%f last=%f", s.path.size(), s.path.empty() ? -1.f : s.path.front().y,
           s.path.empty() ? -1.f : s.path.back().y);
+    // K10: C++ edge cap
+    std::string edges = "\"edges\":[";
+    for (int i = 0; i < 12; ++i) {
+      char buf[96];
+      std::snprintf(buf, sizeof(buf), "%s{\"pts\":[[%d,-12],[%d,90]]}", i ? "," : "", i, i);
+      edges += buf;
+    }
+    edges += "]";
+    CHECK(parse_scene(head(edges), s) && s.edges.size() == 8, "edge cap: got %zu", s.edges.size());
+    CHECK(!s.edges.empty() && s.edges.front().pts[0].x == 0.f && s.edges.back().pts[0].x == 7.f,
+          "edge cap dropped the wrong end");
+    // K11: C++ sign cap
+    std::string signs = "\"signs\":[";
+    for (int i = 0; i < 20; ++i) {
+      char buf[96];
+      std::snprintf(buf, sizeof(buf), "%s{\"cls\":\"traffic_light\",\"x\":%d,\"y\":30}", i ? "," : "", i);
+      signs += buf;
+    }
+    signs += "]";
+    CHECK(parse_scene(head(signs), s) && s.signs.size() == 16, "sign cap: got %zu", s.signs.size());
+    CHECK(!s.signs.empty() && s.signs.front().x == 0.f && s.signs.back().x == 15.f, "sign cap dropped the wrong end");
+    // K14: invalid edge kind is dropped, not accepted as detected
+    CHECK(parse_scene(head("\"edges\":[{\"pts\":[[5,-12],[5,90]],\"kind\":\"guessed\"}]"), s) && s.edges.empty(),
+          "invalid edge kind accepted");
+    CHECK(parse_scene(head("\"edges\":[{\"pts\":[[5,-12],[5,90]],\"kind\":1}]"), s) && s.edges.empty(),
+          "non-string edge kind accepted");
+    // K15: integer ids that do not fit in int are rejected
+    CHECK(parse_scene(head("\"tracks\":[{\"id\":2147483648,\"cls\":\"vehicle\",\"x\":0,\"y\":12}]"), s) && s.tracks.empty(),
+          "out-of-range track id accepted");
+    CHECK(parse_scene(head("\"lead_id\":2147483648"), s) && s.lead_id == -1,
+          "out-of-range lead_id accepted, got %d", s.lead_id);
+    CHECK(parse_scene(head("\"tracks\":[{\"id\":-2147483649,\"cls\":\"vehicle\",\"x\":0,\"y\":12}]"), s) && s.tracks.empty(),
+          "under-range track id accepted");
+    // K17: missing sign state is unknown, not red
+    CHECK(parse_scene(head("\"signs\":[{\"cls\":\"traffic_light\",\"x\":0,\"y\":30}]"), s)
+              && s.signs.size() == 1 && s.signs[0].state == "unknown",
+          "missing sign state: got %s", s.signs.empty() ? "(none)" : s.signs[0].state.c_str());
+    // K18: a non-string paint value drops the lane (it is not kept as white)
+    CHECK(parse_scene(head("\"lanes\":[{\"pts\":[[0,-12],[0,90]],\"paint\":1}]"), s) && s.lanes.empty(),
+          "non-string paint was kept as white");
+    CHECK(parse_scene(head("\"lanes\":[{\"pts\":[[0,-12],[0,90]],\"paint\":true}]"), s) && s.lanes.empty(),
+          "boolean paint was kept as white");
   }
 
-  // 17. hidden GLFW window: GLFW_VISIBLE is false when requested (hint set after init).
-  {
-#if GVD_VIZ_HAVE_GLFW
-    GlContext hidden;
-    std::string e;
-    if (hidden.init_window(64, 64, "gvd_viz hint test", false, &e, /*visible=*/false)) {
-      CHECK(hidden.window() != nullptr, "hidden window is null");
-      CHECK(glfwGetWindowAttrib(hidden.window(), GLFW_VISIBLE) == GLFW_FALSE,
-            "hidden window is visible (GLFW_VISIBLE hint lost)");
-    } else {
-      std::printf("SKIP glfw hidden-window attrib (no display?): %s\n", e.c_str());
-    }
-#else
-    std::printf("SKIP glfw hidden-window attrib (built without GLFW)\n");
-#endif
-  }
+  // 17. hidden GLFW window test runs before init_headless (see main).
 
   // 18. default Lens is the named chase: pulled back, 40 deg vfov.
   {
@@ -486,6 +664,71 @@ int main() {
     RenderOptions ro;
     CHECK(ro.lens.eye == d.eye && ro.lens.look == d.look && ro.lens.vfov_deg == 40.f,
           "RenderOptions default lens is not chase");
+  }
+
+  // 18b. box edge thickness: max(0.055 m * focal / depth, 1.9 px). Kills N2
+  // (floor only, no distance scaling).
+  {
+    CHECK(kBoxEdgeWorldM == 0.055f && kBoxEdgeFloorPx == 1.9f,
+          "thickness constants changed (world=%f floor=%f)", kBoxEdgeWorldM, kBoxEdgeFloorPx);
+    const float f = 500.f;
+    // Close: world term wins. Floor-only would stay at 1.9.
+    float close = box_edge_pixel_radius(kBoxEdgeWorldM, kBoxEdgeFloorPx, f, -4.f);
+    float world_close = kBoxEdgeWorldM * f / 4.f;  // 6.875 px
+    CHECK(std::fabs(close - world_close) < 1e-4f, "close radius %f, want %f (world term)", close, world_close);
+    CHECK(close > kBoxEdgeFloorPx + 2.f, "close radius %f did not exceed the 1.9 px floor (N2?)", close);
+    // Far: the floor wins.
+    float far = box_edge_pixel_radius(kBoxEdgeWorldM, kBoxEdgeFloorPx, f, -200.f);
+    CHECK(std::fabs(far - kBoxEdgeFloorPx) < 1e-5f, "far radius %f, want the 1.9 px floor", far);
+    // Render a close box and measure mid-edge half-max width; it must be
+    // clearly thicker than a floor-only 1.9 px stroke.
+    RenderOptions close_o = o;
+    close_o.lens.eye = glm::vec3(0.f, -1.5f, 1.2f);
+    close_o.lens.look = glm::vec3(0.f, 6.f, 0.6f);
+    close_o.lens.vfov_deg = 40.f;
+    close_o.draw_ego = false;
+    close_o.draw_hud = false;
+    Scene cs = must(head("\"tracks\":[{\"id\":1,\"cls\":\"vehicle\",\"x\":0,\"y\":3,\"yaw\":1.5708,\"l\":4.5,\"w\":1.85,\"h\":1.5}]"));
+    Image cim = shot(cs, close_o);
+    const Track& ct = cs.tracks[0];
+    glm::vec3 cd = ct.l > 0.f ? glm::vec3(ct.l, ct.w, ct.h) : glm::vec3(4.5f, 1.85f, 1.5f);
+    float cy = std::cos(ct.yaw), sy = std::sin(ct.yaw);
+    glm::vec2 fwd(cy, sy), side(-sy, cy), ctr(ct.x, ct.y);
+    glm::vec3 v0 = glm::vec3(ctr + fwd * (0.5f * cd.x) + side * (-0.5f * cd.y), cd.z);
+    glm::vec3 v1 = glm::vec3(ctr + fwd * (0.5f * cd.x) + side * (0.5f * cd.y), cd.z);
+    glm::vec3 mid = 0.5f * (v0 + v1);
+    const float aspect = float(close_o.w) / float(close_o.h);
+    glm::mat4 view = glm::lookAt(close_o.lens.eye, close_o.lens.look, glm::vec3(0, 0, 1));
+    glm::mat4 proj = glm::perspective(glm::radians(close_o.lens.vfov_deg), aspect, 0.3f, 600.f);
+    auto to_img = [&](glm::vec3 w) -> glm::vec2 {
+      glm::vec4 clip = proj * view * glm::vec4(w, 1.f);
+      glm::vec3 ndc = glm::vec3(clip) / clip.w;
+      return {(ndc.x * 0.5f + 0.5f) * float(close_o.w), (1.f - (ndc.y * 0.5f + 0.5f)) * float(close_o.h)};
+    };
+    glm::vec2 a = to_img(v0), b = to_img(v1), m = to_img(mid);
+    glm::vec2 dir = glm::normalize(b - a);
+    glm::vec2 nrm(-dir.y, dir.x);
+    auto luma = [&](float x, float y) -> float {
+      int ix = (int)std::round(x), iy = (int)std::round(y);
+      if (ix < 0 || iy < 0 || ix >= cim.w || iy >= cim.h) return 0.f;
+      const uint8_t* p = &cim.rgba[(static_cast<size_t>(iy) * cim.w + ix) * 4];
+      return (0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2]) / 255.f;
+    };
+    float peak = 0.f;
+    for (int s = -20; s <= 20; ++s) peak = std::max(peak, luma(m.x + nrm.x * s, m.y + nrm.y * s));
+    CHECK(peak > 0.15f, "close-up box edge not found (peak luma %f)", peak);
+    int half = 0;
+    for (int s = 0; s <= 20; ++s) {
+      if (luma(m.x + nrm.x * s, m.y + nrm.y * s) >= 0.5f * peak) half = s;
+    }
+    // Width is ~2*half. Floor-only is ~2*1.9 px plus a little AA; require
+    // clearly more than that (world term at ~4 m depth is ~7 px half-width).
+    CHECK(half >= 4, "close-up half-width %d px looks like the 1.9 px floor only (N2)", half);
+    glm::vec4 emid = view * glm::vec4(mid, 1.f);
+    float focal = proj[1][1] * 0.5f * float(close_o.h);
+    float expect = box_edge_pixel_radius(kBoxEdgeWorldM, kBoxEdgeFloorPx, focal, emid.z);
+    CHECK(expect > kBoxEdgeFloorPx + 2.f, "test setup is floor-limited (expect %f px)", expect);
+    std::printf("box thickness: close half-width %d px (expect r=%.2f, floor=%.1f)\n", half, expect, kBoxEdgeFloorPx);
   }
 
 
@@ -546,7 +789,9 @@ int main() {
   }
 
 
-  // 20. ego GLB (David_Holiday Tesla Model 3) loads, under 30k tris, no badge node.
+  // 20. ego GLB (David_Holiday Tesla Model 3) loads, under 30k tris, SHA pinned,
+  // and no hood-T badge triangles (node names alone are not enough: the
+  // shipped file is one merged node).
   {
     CHECK(r.ego_from_glb(), "ego mesh did not load from tesla_model3_ego.glb (path '%s')",
           r.ego_glb_path().c_str());
@@ -565,11 +810,17 @@ int main() {
       f.seekg(0);
       f.read(buf.data(), static_cast<std::streamsize>(buf.size()));
       CHECK(buf.size() > 20 && u32(buf, 0) == 0x46546C67u, "ego asset is not a GLB");
-      size_t off = 12, json_off = 0, json_n = 0;
+      // Pin the exact bytes the prepare script reproduces (fa1ac245…).
+      const char* kEgoSha =
+          "fa1ac2450f36a48356abdf2390346e8c1190ffb986e031dc430124a59e10dae8";
+      std::string got_sha = sha256_hex(reinterpret_cast<const unsigned char*>(buf.data()), buf.size());
+      CHECK(got_sha == kEgoSha, "ego GLB sha256 %s, want %s", got_sha.c_str(), kEgoSha);
+      size_t off = 12, json_off = 0, json_n = 0, bin_off = 0, bin_n = 0;
       while (off + 8 <= buf.size()) {
         uint32_t clen = u32(buf, off), typ = u32(buf, off + 4);
         if (off + 8 + clen > buf.size()) break;
         if (typ == 0x4E4F534Au) { json_off = off + 8; json_n = clen; }
+        if (typ == 0x004E4942u) { bin_off = off + 8; bin_n = clen; }
         off += 8 + clen;
       }
       CHECK(json_n > 0, "ego GLB has no JSON chunk");
@@ -595,7 +846,63 @@ int main() {
       }
       CHECK(nodes >= 1, "ego GLB has no nodes");
       CHECK(named, "ego GLB missing Tesla_Model_3 node");
-      std::printf("ego GLB nodes=%d (no badge)\n", nodes);
+      // Hood-T box from prepare_ego_glb.py, converted to the ego frame
+      // with the same ymin/zmid that script uses on the kept verts:
+      //   |x| < 0.045, y in (2.014792, 2.104792), z in (0.664687, 0.729687),
+      //   area < 5e-4. A badge-restored mesh (26,942 tris) has 307 hits here.
+      const float kBx = 0.045f, kBy0 = 2.014792f, kBy1 = 2.104792f, kBz0 = 0.664687f, kBz1 = 0.729687f, kArea = 5.0e-4f;
+      int badge_tris = 0, ntris = 0;
+      if (bin_n > 0 && gltf.contains("meshes") && !gltf["meshes"].empty() &&
+          gltf["meshes"][0].contains("primitives") && !gltf["meshes"][0]["primitives"].empty()) {
+        const auto& prim = gltf["meshes"][0]["primitives"][0];
+        auto acc_of = [&](int ai) -> const nlohmann::json& { return gltf["accessors"].at(ai); };
+        auto read_f32_vec3 = [&](int ai, std::vector<glm::vec3>& out) {
+          const auto& acc = acc_of(ai);
+          const auto& view = gltf["bufferViews"].at(acc.at("bufferView").get<int>());
+          size_t o = bin_off + view.value("byteOffset", 0) + acc.value("byteOffset", 0);
+          int count = acc.at("count").get<int>();
+          out.resize(static_cast<size_t>(count));
+          if (o + static_cast<size_t>(count) * 12 > buf.size()) { out.clear(); return; }
+          std::memcpy(out.data(), buf.data() + o, static_cast<size_t>(count) * 12);
+        };
+        auto read_idx = [&](int ai, std::vector<uint32_t>& out) {
+          const auto& acc = acc_of(ai);
+          const auto& view = gltf["bufferViews"].at(acc.at("bufferView").get<int>());
+          size_t o = bin_off + view.value("byteOffset", 0) + acc.value("byteOffset", 0);
+          int count = acc.at("count").get<int>();
+          int ctype = acc.at("componentType").get<int>();
+          out.resize(static_cast<size_t>(count));
+          if (ctype == 5125) {  // uint32
+            if (o + static_cast<size_t>(count) * 4 > buf.size()) { out.clear(); return; }
+            std::memcpy(out.data(), buf.data() + o, static_cast<size_t>(count) * 4);
+          } else if (ctype == 5123) {  // uint16
+            if (o + static_cast<size_t>(count) * 2 > buf.size()) { out.clear(); return; }
+            for (int i = 0; i < count; ++i) {
+              uint16_t v; std::memcpy(&v, buf.data() + o + static_cast<size_t>(i) * 2, 2); out[i] = v;
+            }
+          } else {
+            out.clear();
+          }
+        };
+        std::vector<glm::vec3> pos;
+        std::vector<uint32_t> idx;
+        read_f32_vec3(prim["attributes"].at("POSITION").get<int>(), pos);
+        if (prim.contains("indices")) read_idx(prim.at("indices").get<int>(), idx);
+        CHECK(!pos.empty() && idx.size() >= 3 && idx.size() % 3 == 0,
+              "ego GLB mesh unreadable (verts=%zu idx=%zu)", pos.size(), idx.size());
+        ntris = static_cast<int>(idx.size() / 3);
+        for (size_t i = 0; i + 2 < idx.size(); i += 3) {
+          if (idx[i] >= pos.size() || idx[i+1] >= pos.size() || idx[i+2] >= pos.size()) continue;
+          glm::vec3 p0 = pos[idx[i]], p1 = pos[idx[i+1]], p2 = pos[idx[i+2]];
+          glm::vec3 c = (p0 + p1 + p2) / 3.f;
+          glm::vec3 cr = glm::cross(p1 - p0, p2 - p0);
+          float area = 0.5f * glm::length(cr);
+          if (std::fabs(c.x) < kBx && c.y > kBy0 && c.y < kBy1 && c.z > kBz0 && c.z < kBz1 && area < kArea)
+            ++badge_tris;
+        }
+      }
+      CHECK(badge_tris == 0, "hood-T badge still present: %d tris in the badge box (%d total)", badge_tris, ntris);
+      std::printf("ego GLB nodes=%d (no badge) sha256=%s badge_tris=%d\n", nodes, got_sha.c_str(), badge_tris);
     }
   }
 

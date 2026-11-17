@@ -87,7 +87,7 @@ bool GlContext::init_headless(std::string* err) {
 #if GVD_VIZ_HAVE_GLFW
   // Do not set hints here: GLFW 3.4 ignores pre-init hints, and glfwInit
   // resets them. init_window sets GLFW_VISIBLE after a successful init.
-  return init_window(64, 64, "gvd_viz offscreen", false, err, /*visible=*/false);
+  return init_window(64, 64, "gvd_viz offscreen", false, err, /*visible=*/headless_glfw_visible());
 #else
   if (err && err->empty()) *err = "no headless backend (build with EGL or GLFW)";
   return false;

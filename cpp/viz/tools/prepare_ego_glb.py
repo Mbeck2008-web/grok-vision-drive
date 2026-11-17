@@ -15,9 +15,6 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[3]
-# Default source lives next to the UI refs, not in the repo.
-DEFAULT_SRC = Path("/workspace/gvd-ui/tesla-models/tesla-model-3-david-holiday/model3_car_only.glb")
 OUT = Path(__file__).resolve().parents[1] / "assets" / "tesla_model3_ego.glb"
 
 
@@ -145,7 +142,8 @@ def main() -> None:
     import argparse
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--src", type=Path, default=DEFAULT_SRC)
+    ap.add_argument("--src", type=Path, required=True,
+                    help="car-only source GLB (no default; pass the extracted model3_car_only.glb)")
     ap.add_argument("--out", type=Path, default=OUT)
     args = ap.parse_args()
     gltf, blob = parse_glb(args.src)

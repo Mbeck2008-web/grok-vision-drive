@@ -6,6 +6,12 @@ struct GLFWwindow;
 
 namespace gvd {
 
+// Visibility for a GLFW window used as the headless/offscreen fallback.
+// Must stay false: a visible first-run window was the original Windows bug.
+// init_headless passes this to init_window after glfwInit (GLFW 3.4 drops
+// pre-init hints, and glfwInit resets them).
+inline bool headless_glfw_visible() { return false; }
+
 class GlContext {
  public:
   ~GlContext();

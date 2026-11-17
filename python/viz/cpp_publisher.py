@@ -578,6 +578,8 @@ class CppVizPublisher:
             mono = time.monotonic() if now is None else float(now)
             if mono - self._last_send < self.min_interval_s:
                 return False
+            # Increment on every send attempt, including frames later dropped
+            # (EAGAIN / OSError / too-big). Rate-limited skips do not increment.
             self._seq += 1
             data = encode_message(build_scene_message(state, seq=self._seq, t=mono))
             if data is None:

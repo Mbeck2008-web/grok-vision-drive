@@ -20,7 +20,7 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 
 from python.occ.camera import CameraModel
-from python.occ.classes import BLOCKED, CURB, ROAD, UNKNOWN, VEHICLE
+from python.occ.classes import BLOCKED, CURB, LANE_WHITE, LANE_YELLOW, PAINT_CLASSES, ROAD, STOP_LINE, UNKNOWN, VEHICLE
 from python.occ.grid import DEFAULT_GRID, VoxelGrid
 
 DEPTH_CM_INVALID = (0, 65535)
@@ -31,7 +31,9 @@ FREE_MARGIN_M = 0.75      # a voxel this far in front of the depth hit is free
 # Conservative core car box (smaller than any companion) and the outer ignore box.
 BOX_CORE = (3.6, 1.6, 1.3)
 BOX_OUTER = (5.2, 2.2, 1.9)
-PRIORITY = {UNKNOWN: 0, ROAD: 1, CURB: 2, BLOCKED: 3, VEHICLE: 4}
+PRIORITY = {UNKNOWN: 0, ROAD: 1, LANE_WHITE: 2, LANE_YELLOW: 2, STOP_LINE: 2, CURB: 3, BLOCKED: 4, VEHICLE: 5}
+STATIC_CLASSES = frozenset({ROAD, CURB, BLOCKED}) | PAINT_CLASSES
+PAINT_VIS_MARGIN_M = 1.0
 
 
 @dataclass
@@ -120,8 +122,57 @@ def boxes_from_row(row: Mapping[str, Any]) -> list[dict[str, float]]:
         b = world_to_ego((px + dx, py + dy), ego.get("pos"), ego.get("dir"))
         if a is None or b is None:
             continue
-        out.append({"x": a[0], "y": a[1], "yaw": math.atan2(b[1] - a[1], b[0] - a[0])})
+        box = {"x": a[0], "y": a[1], "yaw": math.atan2(b[1] - a[1], b[0] - a[0])}
+        vel = item.get("vel")
+        try:
+            vx, vy = float(vel[0]), float(vel[1])
+        except (TypeError, ValueError, IndexError, KeyError):
+            vx = vy = math.nan
+        o = world_to_ego((0.0, 0.0), (0.0, 0.0), ego.get("dir"))
+        e = world_to_ego((vx, vy), (0.0, 0.0), ego.get("dir")) if math.isfinite(vx) and math.isfinite(vy) else None
+        if o is not None and e is not None:
+            box["vx"], box["vy"] = e[0] - o[0], e[1] - o[1]  # ground velocity in ego axes
+        out.append(box)
     return out
+
+
+def paint_segments_from_decals(decals: Iterable[Mapping[str, Any]], pos: Any, direction: Any, *, reach_m: float = 90.0) -> list[dict[str, Any]]:
+    """Ego-frame lane-paint segments ``{x0, y0, x1, y1, yellow}`` from DecalRoads (painted_lanes materials)."""
+    from python.debug.painted_lanes import _catmull_rom, is_paint
+
+    try:
+        px, py = float(pos[0]), float(pos[1])
+        fx, fy = float(direction[0]), float(direction[1])
+    except (TypeError, ValueError, IndexError):
+        return []
+    n = math.hypot(fx, fy)
+    if not (math.isfinite(px) and math.isfinite(py)) or not math.isfinite(n) or n < 1e-6:
+        return []
+    fx, fy = fx / n, fy / n
+    rx, ry = fy, -fx
+    out = []
+    for d in decals:
+        mat = str(d.get("material") or "")
+        nodes = d.get("nodes")
+        if not is_paint(mat) or not nodes or len(nodes) < 2:
+            continue
+        p = np.asarray(_catmull_rom(nodes), dtype=np.float64)[:, :2] - (px, py)
+        ex, ey = p @ (rx, ry), p @ (fx, fy)
+        yellow = "yellow" in mat.lower()
+        for k in range(len(ex) - 1):
+            if min(math.hypot(ex[k], ey[k]), math.hypot(ex[k + 1], ey[k + 1])) > reach_m:
+                continue
+            out.append({"x0": float(ex[k]), "y0": float(ey[k]), "x1": float(ex[k + 1]), "y1": float(ey[k + 1]), "yellow": yellow})
+    return out
+
+
+def _seg_points(x0: float, y0: float, x1: float, y1: float, step: float) -> np.ndarray:
+    if not all(math.isfinite(v) for v in (x0, y0, x1, y1)):
+        return np.zeros((0, 2))
+    q = math.hypot(x1 - x0, y1 - y0) / step  # length or length/step can overflow to inf for huge finite endpoints (fuzz F1)
+    n = (int(min(10000, max(1, math.ceil(q)))) if math.isfinite(q) else 10000) + 1
+    t = np.linspace(0.0, 1.0, n)
+    return np.stack([x0 + (x1 - x0) * t, y0 + (y1 - y0) * t], axis=1)
 
 
 def voxel_labels(
@@ -129,6 +180,8 @@ def voxel_labels(
     sem_classes: Mapping[str, Any] | None = None,
     boxes: Iterable[Mapping[str, float]] = (),
     *,
+    paint: Iterable[Mapping[str, Any]] = (),
+    stop_bars: Iterable[Mapping[str, Any]] = (),
     grid: VoxelGrid = DEFAULT_GRID,
     ground_z: float = 0.0,
     max_free: int = 4096,
@@ -138,8 +191,11 @@ def voxel_labels(
 
     Returns ``occ_idx`` (N,3) int32 unique, ``occ_cls`` (N,) int8,
     ``free_idx`` (M,3) int32 unique and disjoint from ``occ_idx`` and from
-    every box's outer band, ``ignore_idx`` (K,3) int32 (box band).
+    every box's outer band, ``ignore_idx`` (K,3) int32 (box band),
+    ``occ_flow`` (N,2) float32 ground velocity in ego axes (box ``vx/vy`` for
+    VEHICLE, 0 for static classes, NaN = unlabeled).
     """
+    boxes = list(boxes)
     rids = road_ids(sem_classes)
     pts_all: list[np.ndarray] = []
     cls_all: list[np.ndarray] = []
@@ -176,6 +232,45 @@ def voxel_labels(
             if (ix - 1, iy) in road_bev or (ix + 1, iy) in road_bev:
                 cls[k] = CURB
 
+    # Painted lanes / stop bars: ground cells along each stroke that a camera sees.
+    iz_g = int(math.floor((ground_z + 0.01 - grid.z_min) / grid.voxel))
+    pxy: list[np.ndarray] = []
+    pcls: list[np.ndarray] = []
+    for seg in paint:
+        try:
+            pts2 = _seg_points(float(seg["x0"]), float(seg["y0"]), float(seg["x1"]), float(seg["y1"]), grid.voxel / 2)
+        except (KeyError, TypeError, ValueError):
+            continue
+        pxy.append(pts2)
+        pcls.append(np.full(len(pts2), LANE_YELLOW if seg.get("yellow") is True else LANE_WHITE, np.int8))
+    for bar in stop_bars:
+        if bar.get("valid") is not True:
+            continue
+        try:
+            pts2 = _seg_points(float(bar["x0"]), float(bar["y_m"]), float(bar["x1"]), float(bar["y_m"]), grid.voxel / 2)
+        except (KeyError, TypeError, ValueError):
+            continue
+        pxy.append(pts2)
+        pcls.append(np.full(len(pts2), STOP_LINE, np.int8))
+    if pxy and 0 <= iz_g < nz and frames:
+        p2 = np.concatenate(pxy)
+        p3 = np.concatenate([p2, np.full((len(p2), 1), ground_z)], axis=1)
+        seen = np.zeros(len(p3), dtype=bool)
+        for fr in frames:
+            d = depth_to_m(fr.depth)
+            uv, z, ok = fr.cam.project(p3)
+            u = np.clip(np.nan_to_num(uv[:, 0], nan=0.0, posinf=0.0, neginf=0.0).astype(np.int64), 0, fr.cam.width - 1)
+            v = np.clip(np.nan_to_num(uv[:, 1], nan=0.0, posinf=0.0, neginf=0.0).astype(np.int64), 0, fr.cam.height - 1)
+            hit = d[v, u]
+            seen |= ok & np.isfinite(hit) & (hit >= z - PAINT_VIS_MARGIN_M)
+        pi, pin = grid.to_index(p3)
+        keep_p = pin & seen
+        if keep_p.any():
+            pi = pi[keep_p]
+            pi[:, 2] = iz_g
+            idx = np.concatenate([idx, pi])
+            cls = np.concatenate([cls, np.concatenate(pcls)[keep_p]])
+
     # Per-voxel class: highest priority among its points.
     flat = grid.flat(idx)
     pri = np.vectorize(PRIORITY.get, otypes=[np.int64])(cls) if cls.size else np.zeros(0, dtype=np.int64)
@@ -186,17 +281,31 @@ def voxel_labels(
     occ = {int(f): int(c) for f, c in zip(flat_s[keep], cls_s[keep])}
 
     ignore: set[int] = set()
+    vflow: dict[int, tuple[float, float]] = {}
     for box in boxes:
         core = grid.flat(_box_voxels(grid, box, BOX_CORE))
         outer = grid.flat(_box_voxels(grid, box, BOX_OUTER))
+        try:
+            bv = (float(box.get("vx", math.nan)), float(box.get("vy", math.nan)))
+        except (TypeError, ValueError):
+            bv = (math.nan, math.nan)
+        if not all(math.isfinite(v) and abs(v) < 100.0 for v in bv):
+            bv = (math.nan, math.nan)
         for f in core.tolist():
             occ[int(f)] = VEHICLE
+            vflow[int(f)] = bv
         ignore.update(int(f) for f in outer.tolist())
     ignore -= set(occ)
     # A non-vehicle depth hit inside the outer band is still kept as occupied.
 
     occ_flat = np.array(sorted(occ), dtype=np.int64)
     occ_cls = np.array([occ[int(f)] for f in occ_flat], dtype=np.int8)
+    occ_flow = np.full((len(occ_flat), 2), np.nan, dtype=np.float32)
+    for k, (f, c) in enumerate(zip(occ_flat.tolist(), occ_cls.tolist())):
+        if c == VEHICLE:
+            occ_flow[k] = vflow.get(int(f), (math.nan, math.nan))
+        elif c in STATIC_CLASSES:
+            occ_flow[k] = 0.0
 
     # Free space: random voxels seen in front of a valid depth hit.
     rng = np.random.default_rng(seed)
@@ -224,6 +333,34 @@ def voxel_labels(
     return {
         "occ_idx": grid.unflat(occ_flat),
         "occ_cls": occ_cls,
+        "occ_flow": occ_flow,
+        "boxes": np.array([[float(b.get("x", np.nan)), float(b.get("y", np.nan)), float(b.get("yaw", np.nan)),
+                            float(b.get("vx", np.nan)), float(b.get("vy", np.nan))] for b in boxes], dtype=np.float32).reshape(-1, 5),
         "free_idx": grid.unflat(free_flat),
         "ignore_idx": grid.unflat(ign_flat),
     }
+
+
+def vo_target(prev_row: Mapping[str, Any] | None, row: Mapping[str, Any]) -> np.ndarray:
+    """Training label for the VO head: ego motion (dx, dy, dyaw) from the previous tick's pose,
+    in the previous ego frame. GT pose is used here (training) only. NaN when unknown."""
+    nan = np.full(3, np.nan, np.float32)
+    if not isinstance(prev_row, Mapping):
+        return nan
+
+    def pose(r: Mapping[str, Any]):
+        e = r.get("ego") if isinstance(r.get("ego"), Mapping) else r
+        try:
+            return float(e["pos"][0]), float(e["pos"][1]), math.atan2(float(e["dir"][1]), float(e["dir"][0]))
+        except (KeyError, TypeError, ValueError, IndexError):
+            return None
+
+    a, b = pose(prev_row), pose(row)
+    if a is None or b is None or not all(math.isfinite(v) for v in (*a, *b)):
+        return nan
+    th = a[2]
+    fx, fy = math.cos(th), math.sin(th)
+    rx, ry = fy, -fx
+    dxw, dyw = b[0] - a[0], b[1] - a[1]
+    dyaw = (b[2] - a[2] + math.pi) % (2 * math.pi) - math.pi
+    return np.array([dxw * rx + dyw * ry, dxw * fx + dyw * fy, dyaw], np.float32)

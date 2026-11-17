@@ -1,0 +1,6 @@
+# Dev / test-only tools. Never imported by runtime, collection or training code.
+# hypothesis: property tests in scripts/test_occ_sparse_*.py (without it those
+#   checks are reported as visible skips, not silently passed).
+# mutmut: mutation testing of python/occ (config in setup.cfg [mutmut]); local only, not run in CI.
+hypothesis==6.170.15
+mutmut==3.8.1

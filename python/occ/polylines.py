@@ -13,7 +13,7 @@ from typing import Any
 
 import numpy as np
 
-from python.occ.classes import CURB, ROAD, SRC_CURB_LINE, SRC_EDGE
+from python.occ.classes import CURB, LANE_WHITE, LANE_YELLOW, PAINT_CLASSES, ROAD, SRC_CURB_LINE, SRC_EDGE, SRC_LANE_LINE, SRC_STOP_LINE, STOP_LINE
 from python.occ.grid import DEFAULT_GRID, VoxelGrid
 
 MIN_ROWS = 3
@@ -66,7 +66,7 @@ def edges_from_cells(idx: np.ndarray, cls: np.ndarray, *, grid: VoxelGrid = DEFA
     ego_ix = (ego_x - grid.x_min) / v - 0.5
     left: list[tuple[int, float]] = []
     right: list[tuple[int, float]] = []
-    road = idx[cls == ROAD]
+    road = idx[(cls == ROAD) | np.isin(cls, list(PAINT_CLASSES))]  # paint lies on the road surface
     for iy in np.unique(road[:, 1]) if road.size else []:
         runs = _runs(road[road[:, 1] == iy][:, 0])
         a, b = min(runs, key=lambda r: 0.0 if r[0] <= ego_ix <= r[1] else min(abs(r[0] - ego_ix), abs(r[1] - ego_ix)))
@@ -85,3 +85,86 @@ def edges_from_cells(idx: np.ndarray, cls: np.ndarray, *, grid: VoxelGrid = DEFA
             out.append({"pts": pts, "kind": "predicted", "type": "curb", "src": SRC_CURB_LINE})
     out.sort(key=lambda e: -len(e["pts"]))
     return out[:MAX_EDGES]
+
+
+MAX_LANES = 16
+LANE_JOIN_M = 0.75
+
+
+def lanes_from_cells(idx: np.ndarray, cls: np.ndarray, *, grid: VoxelGrid = DEFAULT_GRID) -> list[dict[str, Any]]:
+    """Lane-line polylines from LANE_WHITE / LANE_YELLOW cells.
+
+    Per forward row, each run of paint cells gives one point at its centre.
+    Points are chained row to row to the nearest open line within
+    ``LANE_JOIN_M``; lines shorter than ``MIN_ROWS`` are dropped. Paint is the
+    majority colour of the line's cells (yellow only when most are yellow).
+    """
+    idx = np.asarray(idx, dtype=np.int64).reshape(-1, 3)
+    cls = np.asarray(cls).reshape(-1)
+    if idx.shape[0] != cls.shape[0]:
+        raise ValueError("idx and cls lengths differ")
+    inb = (idx >= 0).all(axis=1) & (idx < np.array(grid.shape)).all(axis=1)
+    sel = inb & ((cls == LANE_WHITE) | (cls == LANE_YELLOW))
+    p, c = idx[sel], cls[sel]
+    v = grid.voxel
+    open_lines: list[dict[str, Any]] = []
+    done: list[dict[str, Any]] = []
+    for iy in (np.unique(p[:, 1]) if p.size else []):
+        row = p[:, 1] == iy
+        pts_here = []
+        for a, b in _runs(p[row][:, 0]):
+            in_run = row & (p[:, 0] >= a) & (p[:, 0] <= b)
+            pts_here.append((grid.x_min + (a + b + 1) / 2 * v, int((c[in_run] == LANE_YELLOW).sum()), int(in_run.sum())))
+        used = set()
+        for ln in open_lines:
+            if iy - ln["rows"][-1][0] > MAX_ROW_GAP:
+                continue
+            best = None
+            for k, (x, _, _) in enumerate(pts_here):
+                if k in used or abs(x - ln["rows"][-1][1]) > LANE_JOIN_M:
+                    continue
+                if best is None or abs(x - ln["rows"][-1][1]) < abs(pts_here[best][0] - ln["rows"][-1][1]):
+                    best = k
+            if best is not None:
+                used.add(best)
+                x, ny, n = pts_here[best]
+                ln["rows"].append((int(iy), x))
+                ln["yellow"] += ny
+                ln["n"] += n
+        still = []
+        for ln in open_lines:
+            (still if iy - ln["rows"][-1][0] <= MAX_ROW_GAP else done).append(ln)
+        open_lines = still
+        for k, (x, ny, n) in enumerate(pts_here):
+            if k not in used:
+                open_lines.append({"rows": [(int(iy), x)], "yellow": ny, "n": n})
+    out = []
+    for ln in done + open_lines:
+        for pts in _chain(ln["rows"], grid):
+            out.append({"pts": pts, "paint": "yellow" if ln["yellow"] * 2 > ln["n"] else "white", "kind": "predicted", "src": SRC_LANE_LINE})
+    out.sort(key=lambda e: -len(e["pts"]))
+    return out[:MAX_LANES]
+
+
+def stop_lines_from_cells(idx: np.ndarray, cls: np.ndarray, *, grid: VoxelGrid = DEFAULT_GRID) -> list[dict[str, Any]]:
+    """Stop bars ``{x0, x1, y, src}`` from STOP_LINE cells: one bar per run of >= 3 cells in a row."""
+    idx = np.asarray(idx, dtype=np.int64).reshape(-1, 3)
+    cls = np.asarray(cls).reshape(-1)
+    inb = (idx >= 0).all(axis=1) & (idx < np.array(grid.shape)).all(axis=1)
+    p = idx[inb & (cls == STOP_LINE)]
+    v = grid.voxel
+    out = []
+    for iy in (np.unique(p[:, 1]) if p.size else []):
+        for a, b in _runs(p[p[:, 1] == iy][:, 0]):
+            if b - a + 1 >= MIN_ROWS:
+                out.append({"x0": round(grid.x_min + a * v, 2), "x1": round(grid.x_min + (b + 1) * v, 2),
+                            "y": round(grid.y_min + (iy + 0.5) * v, 2), "src": SRC_STOP_LINE})
+    # merge bars in adjacent rows (a 0.5 m bar can span two rows)
+    merged: list[dict[str, Any]] = []
+    for bar in sorted(out, key=lambda r: (r["y"], r["x0"])):
+        if merged and abs(bar["y"] - merged[-1]["y"]) <= v + 1e-6 and bar["x0"] <= merged[-1]["x1"] and bar["x1"] >= merged[-1]["x0"]:
+            m = merged[-1]
+            m["x0"], m["x1"], m["y"] = min(m["x0"], bar["x0"]), max(m["x1"], bar["x1"]), round((m["y"] + bar["y"]) / 2, 2)
+            continue
+        merged.append(bar)
+    return merged[:16]

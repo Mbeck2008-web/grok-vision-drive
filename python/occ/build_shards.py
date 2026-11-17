@@ -18,7 +18,7 @@ import numpy as np
 
 from python.occ.camera import CameraModel, cameras_from_config
 from python.occ.grid import DEFAULT_GRID, VoxelGrid
-from python.occ.labels import CamFrame, boxes_from_row, voxel_labels
+from python.occ.labels import depth_to_m, CamFrame, boxes_from_row, vo_target, voxel_labels
 from python.occ.shards import ShardWriter, is_recovery_row
 
 
@@ -36,20 +36,24 @@ def build_from_rows(
 ) -> dict[str, Any]:
     kw = {"max_bytes": max_bytes} if max_bytes else {}
     stats = {"written": 0, "skipped_no_depth": 0, "skipped_no_rgb": 0, "recover": 0}
+    prev_row = None
     with ShardWriter(out_dir, prefix, **kw) as w:
         for row in rows:
             try:
                 i = int(row.get("i"))
             except (TypeError, ValueError):
                 continue
-            rgb = {}
+            rgb, cam_t = {}, {}
+            stamps = row.get("cam_t") if isinstance(row.get("cam_t"), Mapping) else {}
             for cam in rgb_cams:
                 img = read(cam, i)
                 if img is None or img.ndim != 3 or img.shape[2] < 3:
-                    break
+                    continue  # a camera that did not render this tick is missing, not filled in
                 rgb[cam] = np.ascontiguousarray(img[..., 2::-1])  # BGR(A) -> RGB
-            if len(rgb) != len(rgb_cams):
+                cam_t[cam] = stamps.get(cam, row.get("t"))
+            if not rgb:
                 stats["skipped_no_rgb"] += 1
+                prev_row = row
                 continue
             frames = []
             for cid, cam in gt_cams.items():
@@ -60,10 +64,16 @@ def build_from_rows(
                 frames.append(CamFrame(cam.scaled(d.shape[1], d.shape[0]), d, s))
             if not frames:
                 stats["skipped_no_depth"] += 1
+                prev_row = row
                 continue
             lab = voxel_labels(frames, sem_classes, boxes_from_row(row), grid=grid, seed=i)
+            lab["vo_t"] = vo_target(prev_row, row)
+            for f in frames:  # depth-bin head targets (training only), 1/4 res float16 metres; NaN = invalid
+                dm = depth_to_m(f.depth)
+                lab[f"depth_{f.cam.cam_id}"] = np.where(np.isfinite(dm), dm, np.nan)[::4, ::4].astype(np.float16)
+            prev_row = row
             rec = is_recovery_row(row)
-            meta = {"i": i, "t": row.get("t"), "recover": rec, "cams": list(rgb_cams), "label_cams": [f.cam.cam_id for f in frames]}
+            meta = {"i": i, "t": row.get("t"), "recover": rec, "cams": sorted(rgb), "cam_t": cam_t, "label_cams": [f.cam.cam_id for f in frames]}
             w.write(f"s{i:08d}", meta=meta, rgb=rgb, arrays=lab)
             stats["written"] += 1
             stats["recover"] += int(rec)
@@ -79,7 +89,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--rec", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--cams", default="main")
+    ap.add_argument("--cams", default="narrow,main,wide,pillarL,pillarR,repeatL,repeatR,rear")
     ap.add_argument("--gt-cams", default="main,wide")
     a = ap.parse_args(argv)
     root = Path(a.rec)

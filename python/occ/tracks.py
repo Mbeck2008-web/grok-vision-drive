@@ -3,8 +3,8 @@
 Detections arrive in the ego frame each tick (x right, y forward, metres).
 Ego speed and yaw rate (runtime kinematics, not ground truth) move them into
 an odometry frame, where a track's displacement over its last frames gives
-its ground velocity. A track seen in one frame only is ``unknown``: there is
-no single-frame motion guess.
+its ground velocity. A track seen in fewer than 3 frames, or over less than 0.2 s,
+is ``unknown``: there is no single-frame motion guess.
 
 States: ``parked`` (ground speed < 0.5 m/s over >= MIN_SPAN_S),
 ``same_way`` / ``alongside`` (heading within 35 deg of ego; alongside when
@@ -26,7 +26,8 @@ from python.occ.classes import SRC_MOTION
 
 MOTION_STATES = ("unknown", "parked", "same_way", "oncoming", "crossing", "alongside")
 PARKED_MPS = 0.5
-MIN_SPAN_S = 0.15
+MIN_SPAN_S = 0.2
+MIN_FRAMES = 3
 SAME_DEG = 35.0
 ALONGSIDE_Y = 6.0
 ALONGSIDE_X = 1.2
@@ -49,6 +50,7 @@ class _Track:
     hist: list[tuple[float, float, float]] = field(default_factory=list)  # (t, X, Y) odom
     det: dict[str, Any] = field(default_factory=dict)
     misses: int = 0
+    vel: tuple[float, float] | None = None
 
 
 class MotionTracker:
@@ -83,7 +85,7 @@ class MotionTracker:
     def _motion(self, tr: _Track) -> tuple[str, float | None, int]:
         h = tr.hist[-self.window :]
         n = len(h)
-        if n < 2:
+        if n < MIN_FRAMES:
             return "unknown", None, n
         t0, x0, y0 = h[0]
         t1, x1, y1 = h[-1]
@@ -92,6 +94,7 @@ class MotionTracker:
             return "unknown", None, n
         vx, vy = (x1 - x0) / span, (y1 - y0) / span
         speed = math.hypot(vx, vy)
+        tr.vel = self._to_ego_vec(vx, vy)  # ego-frame ground velocity (m/s), x right / y forward
         if speed < PARKED_MPS:
             return "parked", speed, n
         ex, ey = self._to_ego_vec(vx, vy)
@@ -106,8 +109,28 @@ class MotionTracker:
             return "oncoming", speed, n
         return "crossing", speed, n
 
-    def update(self, t: float, detections: Sequence[Mapping[str, Any]], *, speed_mps: float, yaw_rate: float = 0.0) -> list[dict[str, Any]]:
-        if not _finite(t, speed_mps, yaw_rate):
+    def update(
+        self,
+        t: float,
+        detections: Sequence[Mapping[str, Any]],
+        *,
+        speed_mps: float | None = None,
+        yaw_rate: float = 0.0,
+        motion: Sequence[float] | None = None,
+    ) -> list[dict[str, Any]]:
+        """``motion`` = (dx, dy, dyaw) since the last tick in the previous ego frame
+        (the same estimate the temporal warp used: VO by default). Without it,
+        ``speed_mps`` / ``yaw_rate`` are integrated (``--ego-from-vehicle``)."""
+        use_motion = motion is not None
+        if use_motion:
+            try:
+                mdx, mdy, mdyaw = (float(v) for v in motion)  # type: ignore[union-attr]
+            except (TypeError, ValueError):
+                mdx = mdy = mdyaw = math.nan
+            ok = _finite(t, mdx, mdy, mdyaw)
+        else:
+            ok = speed_mps is not None and _finite(t, speed_mps, yaw_rate)
+        if not ok:
             self.reset()
             return self._emit_unknown(detections)
         t = float(t)
@@ -115,6 +138,11 @@ class MotionTracker:
             dt = t - self.t
             if dt <= 0.0 or dt > self.max_gap_s:
                 self.reset()
+            elif use_motion:
+                c, s = math.cos(self.th), math.sin(self.th)
+                self.px += mdx * s + mdy * c
+                self.py += -mdx * c + mdy * s
+                self.th += mdyaw
             else:
                 self.th += float(yaw_rate) * dt
                 self.px += float(speed_mps) * dt * math.cos(self.th)
@@ -173,6 +201,9 @@ class MotionTracker:
             row.update({"id": tr.tid, "cls": tr.cls, "motion": state, "motion_frames": n, "motion_src": SRC_MOTION})
             if speed is not None:
                 row["v"] = speed
+                vel = getattr(tr, "vel", None)
+                if vel is not None and all(math.isfinite(c) for c in vel):
+                    row["vx"], row["vy"] = float(vel[0]), float(vel[1])
             out.append(row)
         return out
 

@@ -33,14 +33,33 @@ def ground_depth(cam: CameraModel, ground_z: float = 0.0, box: dict | None = Non
     return np.where(np.isfinite(s) & (s < 300), s, np.nan)
 
 
-def scene(cam: CameraModel, *, road_half_w: float = 3.5, box: dict | None = None) -> dict[str, Any]:
-    """RGB uint8, depth float32 metres, sem uint8, and the box (ego frame) for one frame."""
-    box = box if box is not None else {"x": 0.0, "y0": 15.0, "w": 1.8, "h": 1.4, "l": 4.0}
+# World-frame paint: a solid yellow centre line and a dashed white lane line (3 m dash, 9 m period),
+# so a forward-moving camera sees longitudinal texture (VO needs it).
+PAINT = [{"x0": -1.75, "y0": -20.0, "x1": -1.75, "y1": 120.0, "yellow": True}] + [
+    {"x0": 1.75, "y0": float(y), "x1": 1.75, "y1": float(y) + 3.0, "yellow": False} for y in range(-18, 120, 9)]
+STOP_BARS = [{"y_m": 30.0, "x0": -1.75, "x1": 1.75, "valid": True, "src": "stop_line"}]
+PAINT_HALF_W = 0.2
+
+
+def scene(cam: CameraModel, *, road_half_w: float = 3.5, box: dict | None = None, paint: bool = True, ego_y: float = 0.0,
+          texture: bool = True) -> dict[str, Any]:
+    """RGB uint8, depth float32 metres, sem uint8, the box, paint strokes and stop bars for one camera.
+
+    ``ego_y``: how far the ego has driven forward (+y) through this static world;
+    the box and the stop bar move back by that much in the ego frame.
+    ``texture``: a faint world-fixed asphalt pattern (real asphalt is never
+    uniform); RGB only, labels are unaffected.
+    """
+    box = dict(box) if box is not None else {"x": 0.0, "y0": 15.0, "w": 1.8, "h": 1.4, "l": 4.0}
+    box["y0"] = box["y0"] - ego_y
+    bars = [{**b, "y_m": b["y_m"] - ego_y} for b in STOP_BARS]
+    strokes = [{**p, "y0": p["y0"] - ego_y, "y1": p["y1"] - ego_y} for p in PAINT]
     d = ground_depth(cam, box=box)
     g = ground_depth(cam)
     on_box = np.isfinite(d) & ~(np.isfinite(g) & np.isclose(d, g, rtol=1e-6))
     ego, valid = cam.backproject(np.nan_to_num(d, nan=0.0))
     x = ego[:, 0].reshape(d.shape)
+    y = ego[:, 1].reshape(d.shape)
     on_road = np.isfinite(d) & ~on_box & (np.abs(x) <= road_half_w)
     sem = np.zeros(d.shape, np.uint8)
     sem[np.isfinite(d)] = 2
@@ -50,6 +69,20 @@ def scene(cam: CameraModel, *, road_half_w: float = 3.5, box: dict | None = None
     rgb[...] = (110, 160, 230)          # sky
     rgb[sem == 2] = (60, 130, 50)       # grass
     rgb[sem == 1] = (70, 70, 75)        # asphalt
+    if texture:  # world-anchored low-contrast asphalt texture (static in the world, moves with ego_y in the image)
+        yw = y + ego_y
+        tex = (np.sin(2.3 * x + 1.7 * yw) + np.sin(-0.9 * x + 2.9 * yw + 1.0) + np.sin(0.5 * x + 4.1 * yw + 2.0)
+               + np.sin(5.3 * x - 1.1 * yw + 0.5))
+        t8 = np.clip(70.0 + 4.0 * tex, 0, 255).astype(np.uint8)
+        rgb[sem == 1] = np.stack([t8, t8, np.clip(t8.astype(np.int16) + 5, 0, 255).astype(np.uint8)], -1)[sem == 1]
+    if paint:
+        for seg in strokes:
+            m = on_road & (np.abs(x - seg["x0"]) <= PAINT_HALF_W) & (y >= seg["y0"]) & (y <= seg["y1"])
+            rgb[m] = (230, 190, 30) if seg["yellow"] else (235, 235, 235)
+        for bar in bars:
+            m = on_road & (np.abs(y - bar["y_m"]) <= 0.3) & (x >= bar["x0"]) & (x <= bar["x1"])
+            rgb[m] = (240, 240, 240)
     rgb[sem == 3] = (200, 40, 40)       # car
-    car = {"x": box["x"], "y": box["y0"] + box.get("l", 4.0) / 2, "yaw": np.pi / 2}
-    return {"rgb": rgb, "depth": d.astype(np.float32), "sem": sem, "box": car}
+    car = {"x": box["x"], "y": box["y0"] + box.get("l", 4.0) / 2, "yaw": np.pi / 2, "vx": 0.0, "vy": 0.0}
+    return {"rgb": rgb, "depth": d.astype(np.float32), "sem": sem, "box": car,
+            "paint": strokes if paint else [], "stop_bars": bars if paint else []}

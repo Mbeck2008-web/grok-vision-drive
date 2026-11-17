@@ -116,7 +116,11 @@ if HAVE_HYP:
             frames.append(CamFrame(cam, d, sem))
         return frames
 
-    box_st = st.fixed_dictionaries({"x": st.one_of(finite, anyfloat), "y": st.one_of(finite, anyfloat), "yaw": st.one_of(st.floats(-7, 7), anyfloat)})
+    box_st = st.fixed_dictionaries({"x": st.one_of(finite, anyfloat), "y": st.one_of(finite, anyfloat), "yaw": st.one_of(st.floats(-7, 7), anyfloat)},
+                                   optional={"vx": st.one_of(st.floats(-40, 40), anyfloat), "vy": st.one_of(st.floats(-40, 40), anyfloat)})
+    paint_st = st.fixed_dictionaries({"x0": st.one_of(st.floats(-30, 30), anyfloat), "y0": st.one_of(st.floats(-20, 90), anyfloat),
+                                      "x1": st.one_of(st.floats(-30, 30), anyfloat), "y1": st.one_of(st.floats(-20, 90), anyfloat), "yellow": st.booleans()})
+    bar_st = st.fixed_dictionaries({"y_m": st.one_of(st.floats(-5, 80), anyfloat), "x0": st.floats(-10, 10), "x1": st.floats(-10, 10), "valid": st.booleans()})
 
 
 # ---------------------------------------------------------------- I1 grid
@@ -166,10 +170,10 @@ if HAVE_HYP:
         assert abs(z[0] - d) < 1e-9 * max(1.0, d) + 1e-9
 
     # ------------------------------------------------------------ I3/I4 labels
-    @given(cam_frames(), st.lists(box_st, max_size=4), st.integers(0, 50))
-    def test_labels_invariants(frames, boxes, max_free):
-        lab = voxel_labels(frames, SEM, boxes, max_free=max_free, seed=1)
-        _check_labels(lab, frames, boxes, max_free)
+    @given(cam_frames(), st.lists(box_st, max_size=4), st.integers(0, 50), st.lists(paint_st, max_size=4), st.lists(bar_st, max_size=3))
+    def test_labels_invariants(frames, boxes, max_free, paint, bars):
+        lab = voxel_labels(frames, SEM, boxes, max_free=max_free, seed=1, paint=paint, stop_bars=bars)
+        _check_labels(lab, frames, boxes, max_free, paint, bars)
 
     @given(st.one_of(hnp.arrays(np.uint16, st.tuples(st.integers(0, 6), st.integers(0, 6))), hnp.arrays(np.float32, st.tuples(st.integers(0, 6), st.integers(0, 6)), elements=st.floats(width=32))))
     def test_depth_to_m(arr):
@@ -180,7 +184,7 @@ if HAVE_HYP:
             assert np.isnan(m[(arr == 0) | (arr == 65535)]).all()
 
 
-def _check_labels(lab, frames, boxes, max_free):
+def _check_labels(lab, frames, boxes, max_free, paint=(), bars=()):
     occ, cls, free, ign = lab["occ_idx"], lab["occ_cls"], lab["free_idx"], lab["ignore_idx"]
     for a in (occ, free, ign):
         assert a.dtype == np.int32 and a.ndim == 2 and a.shape[1] == 3
@@ -194,6 +198,21 @@ def _check_labels(lab, frames, boxes, max_free):
         assert not (cls == C.ROAD).any() and not (cls == C.CURB).any()
     if not boxes:
         assert not (cls == C.VEHICLE).any()
+    if not paint:
+        assert not ((cls == C.LANE_WHITE) | (cls == C.LANE_YELLOW)).any()
+    if not any(b.get("valid") is True for b in bars):
+        assert not (cls == C.STOP_LINE).any()
+    if not any(p.get("yellow") for p in paint):
+        assert not (cls == C.LANE_YELLOW).any()
+    flow = lab["occ_flow"]
+    assert flow.shape == (occ.shape[0], 2) and flow.dtype == np.float32
+    assert not np.isinf(flow).any()
+    static = np.isin(cls, [C.ROAD, C.CURB, C.BLOCKED, C.LANE_WHITE, C.LANE_YELLOW, C.STOP_LINE])
+    assert (flow[static] == 0).all()
+    assert np.isnan(flow[cls == C.UNKNOWN]).all()
+    fin = np.isfinite(flow[cls == C.VEHICLE]).all(axis=1)
+    assert (np.abs(flow[cls == C.VEHICLE][fin]) < 100).all()
+    assert lab["boxes"].shape == (len(boxes), 5)
 
 
 def test_labels_edge_cases():
@@ -214,6 +233,29 @@ def test_labels_edge_cases():
         pass
     else:
         raise AssertionError("wrong-shape depth must raise")
+
+
+def test_labels_paint_and_stop_line():
+    """Synthetic paint: white at x=+1.75, yellow at x=-1.75, stop bar at y=30 -> cells within one voxel."""
+    from python.occ.synthetic import scene
+
+    cam = MAIN.scaled(320, 240)
+    sc = scene(cam, box={"x": -6.0, "y0": 15.0, "w": 1.8, "h": 1.4, "l": 4.0})  # car off to the side
+    lab = voxel_labels([CamFrame(cam, sc["depth"], sc["sem"])], SEM, [sc["box"]], paint=sc["paint"], stop_bars=sc["stop_bars"])
+    xyz = G.to_center(lab["occ_idx"])
+    cls = lab["occ_cls"]
+    for k, x0 in ((C.LANE_WHITE, 1.75), (C.LANE_YELLOW, -1.75)):
+        sel = xyz[cls == k]
+        assert len(sel) > 20 and (np.abs(sel[:, 0] - x0) <= G.voxel).all() and (np.abs(sel[:, 2]) <= G.voxel).all(), k
+    stop = xyz[cls == C.STOP_LINE]
+    assert len(stop) >= 3 and (np.abs(stop[:, 1] - 30.0) <= G.voxel).all()
+    # paint the camera cannot see (behind the car, y < 0) is not labelled
+    assert (xyz[np.isin(cls, [C.LANE_WHITE, C.LANE_YELLOW]), 1] > 0).all()
+    # a car in the lane hides the stop bar behind it: occluded paint is not labelled
+    sc2 = scene(cam)
+    lab2 = voxel_labels([CamFrame(cam, sc2["depth"], sc2["sem"])], SEM, [sc2["box"]], paint=sc2["paint"], stop_bars=sc2["stop_bars"])
+    occl = G.to_center(lab2["occ_idx"][lab2["occ_cls"] == C.STOP_LINE])
+    assert (np.abs(occl[:, 0]) > 0.9).all() if len(occl) else True
 
 
 def test_labels_synthetic_scene():
@@ -404,7 +446,7 @@ def _check_frame(rows, fresh):
     for r in rows:
         assert r["motion"] in MOTION_STATES and r["motion_src"] == C.SRC_MOTION
         if r["motion"] != "unknown":
-            assert r["motion_frames"] >= 2
+            assert r["motion_frames"] >= 3
         if fresh:
             assert r["motion"] == "unknown"
 
@@ -412,6 +454,22 @@ def _check_frame(rows, fresh):
 if HAVE_HYP:
     det_st = st.fixed_dictionaries({"x": st.one_of(st.floats(-30, 30), anyfloat), "y": st.one_of(st.floats(-10, 80), anyfloat), "cls": st.sampled_from(["vehicle", "pedestrian"])})
     frame_st = st.tuples(st.one_of(st.floats(-0.3, 1.0), anyfloat), st.lists(det_st, max_size=80), st.one_of(st.floats(0, 40), anyfloat), st.one_of(st.floats(-1, 1), anyfloat))
+
+    @given(st.lists(st.tuples(st.one_of(st.floats(-0.3, 1.0), anyfloat, st.just(0.0)), st.lists(det_st, max_size=80),
+                              st.tuples(st.one_of(st.floats(-8, 8), anyfloat), st.one_of(st.floats(-8, 8), anyfloat), st.one_of(st.floats(-4, 4), anyfloat))), min_size=1, max_size=25))
+    def test_tracker_fuzz_motion_input(frames):
+        """VO-fed tracker: clock jumps, zero dt, duplicate stamps, NaN / huge motion estimates."""
+        tr = MotionTracker()
+        t = 0.0
+        for dt, dets, mot in frames:
+            t_prev, resets = tr.t, tr.resets
+            t = t + dt if math.isfinite(dt) else dt
+            rows = tr.update(t, dets, motion=mot)
+            _check_frame(rows, t_prev is None or tr.resets > resets)
+            for r in rows:
+                assert all(math.isfinite(float(r[k])) for k in ("x", "y"))
+                assert "v" not in r or math.isfinite(r["v"])
+            t = t if math.isfinite(t) else 0.0
 
     @given(st.lists(frame_st, min_size=1, max_size=25))
     def test_tracker_fuzz(frames):
@@ -450,9 +508,52 @@ if HAVE_HYP:
                 assert rows[0]["motion"] == "unknown"
             if rows:
                 last = rows[0]
-        assert last is not None and last["motion_frames"] >= 2
+        assert last is not None and last["motion_frames"] >= 3
         rel = (heading - th) if heading is not None else 0.0
         rel = math.degrees((rel + math.pi) % (2 * math.pi) - math.pi)
+        if kind == "parked":
+            assert last["motion"] == "parked", last
+        elif abs(rel) < 30:
+            assert last["motion"] in ("same_way", "alongside"), (last, rel)
+        elif abs(rel) > 150:
+            assert last["motion"] == "oncoming", (last, rel)
+        elif 60 < abs(rel) < 120:
+            assert last["motion"] == "crossing", (last, rel)
+
+
+if HAVE_HYP:
+
+    @given(st.floats(0, 30), st.floats(-0.3, 0.3), st.floats(-12, 12), st.floats(8, 50), st.sampled_from(["parked", "same", "oncoming", "crossing"]),
+           st.floats(4, 30), st.lists(st.tuples(st.floats(-0.01, 0.01), st.floats(-0.01, 0.01), st.floats(-0.001, 0.001)), min_size=8, max_size=8))
+    def test_tracker_physics_vo_noise(ego_v, ego_w, ox, oy, kind, obj_v, noise):
+        """Tracker fed per-tick ego motion estimates (VO) with bounded noise: the state still matches truth."""
+        dt = 0.1
+        tr = MotionTracker()
+        ex, ey, th = 0.0, 0.0, math.pi / 2
+        heading = {"parked": None, "same": math.pi / 2, "oncoming": -math.pi / 2, "crossing": 0.0}[kind]
+        wx, wy = ox, oy
+        last = None
+        from python.occ.model import ego_motion
+
+        for k in range(8):
+            mot = (0.0, 0.0, 0.0)
+            if k:
+                dx, dy, dyaw = ego_motion(ego_v, ego_w, dt)
+                c, s = math.cos(th), math.sin(th)
+                ex += dx * s + dy * c
+                ey += -dx * c + dy * s
+                th += dyaw
+                mot = (dx + noise[k][0], dy + noise[k][1], dyaw + noise[k][2])
+                if heading is not None:
+                    wx += obj_v * dt * math.cos(heading)
+                    wy += obj_v * dt * math.sin(heading)
+            ddx, ddy = wx - ex, wy - ey
+            x = ddx * math.sin(th) - ddy * math.cos(th)
+            y = ddx * math.cos(th) + ddy * math.sin(th)
+            rows = tr.update(k * dt, [{"x": x, "y": y, "cls": "vehicle"}], motion=mot)
+            last = rows[0] if rows else last
+        assert last is not None and last["motion_frames"] >= 3
+        rel = 0.0 if heading is None else math.degrees((heading - th + math.pi) % (2 * math.pi) - math.pi)
         if kind == "parked":
             assert last["motion"] == "parked", last
         elif abs(rel) < 30:
@@ -468,9 +569,10 @@ def test_tracker_edge_cases():
     assert tr.update(0.0, [], speed_mps=10) == []
     car = [{"x": 0.0, "y": 20.0, "cls": "vehicle"}]
     assert tr.update(0.1, car, speed_mps=0.0)[0]["motion"] == "unknown"   # first sighting
-    assert tr.update(0.15, car, speed_mps=0.0)[0]["motion"] == "unknown"  # span < MIN_SPAN_S
-    assert tr.update(0.3, car, speed_mps=0.0)[0]["motion"] == "parked"
-    assert tr.update(0.3, car, speed_mps=0.0)[0]["motion"] == "unknown"   # repeated stamp resets
+    assert tr.update(0.15, car, speed_mps=0.0)[0]["motion"] == "unknown"  # 2 frames
+    assert tr.update(0.25, car, speed_mps=0.0)[0]["motion"] == "unknown"  # 3 frames but span 0.15 s < 0.2 s
+    assert tr.update(0.35, car, speed_mps=0.0)[0]["motion"] == "parked"  # 4 frames over 0.25 s
+    assert tr.update(0.35, car, speed_mps=0.0)[0]["motion"] == "unknown"  # repeated stamp resets
     assert tr.update(0.1, car, speed_mps=0.0)[0]["motion"] == "unknown"   # clock went back
     tr.update(0.2, car, speed_mps=0.0)
     assert tr.update(5.0, car, speed_mps=0.0)[0]["motion"] == "unknown"   # dropped frames / jump
@@ -525,8 +627,15 @@ if HAVE_HYP:
     @given(st.one_of(st.lists(st.tuples(st.integers(-5, 170), st.integers(-5, 170), st.integers(-3, 10), st.integers(-1, 6)), max_size=400),
                      st.lists(st.tuples(st.integers(-6, 3), st.integers(-5, 170), st.integers(-3, 10), st.sampled_from([C.ROAD, C.CURB])), min_size=0, max_size=400)))
     def test_edges_random_cells(cells):
+        from python.occ.polylines import lanes_from_cells, stop_lines_from_cells
+
         a = np.array(cells, dtype=np.int64).reshape(-1, 4)
         _check_edges(edges_from_cells(a[:, :3], a[:, 3]))
+        for ln in lanes_from_cells(a[:, :3], a[:, 3]):
+            assert ln["paint"] in ("white", "yellow") and len(ln["pts"]) >= MIN_ROWS
+            assert all(G.x_min <= x <= G.x_max and G.y_min <= y <= G.y_max for x, y in ln["pts"])
+        for bar in stop_lines_from_cells(a[:, :3], a[:, 3]):
+            assert G.x_min <= bar["x0"] < bar["x1"] <= G.x_max
 
     @st.composite
     def clustered_cells(draw):
@@ -558,6 +667,34 @@ if HAVE_HYP:
             assert o["src"] == C.SRC_VEHICLE
 
 
+def test_lane_and_stop_polylines():
+    """Lane polylines from paint cells sit within one voxel of the true lines, with the right paint."""
+    from python.occ.polylines import lanes_from_cells, stop_lines_from_cells
+
+    iz = int((0.0 - G.z_min) / G.voxel)
+    rows = np.arange(int((0 - G.y_min) / G.voxel), int((40 - G.y_min) / G.voxel))
+    cells, cls = [], []
+    for x0, k in ((1.75, C.LANE_WHITE), (-1.75, C.LANE_YELLOW)):
+        ix = int((x0 - G.x_min) / G.voxel)
+        cells += [[ix, r, iz] for r in rows]
+        cls += [k] * len(rows)
+    sy = int((30.0 - G.y_min) / G.voxel)
+    for ix in range(int((-1.75 - G.x_min) / G.voxel), int((1.75 - G.x_min) / G.voxel)):
+        cells.append([ix, sy, iz])
+        cls.append(C.STOP_LINE)
+    idx, cls = np.array(cells), np.array(cls)
+    lanes = lanes_from_cells(idx, cls)
+    assert len(lanes) == 2
+    for ln in lanes:
+        xs = np.array([p[0] for p in ln["pts"]])
+        want = 1.75 if ln["paint"] == "white" else -1.75
+        assert np.abs(xs - want).max() <= G.voxel, (ln["paint"], xs[:5])
+        assert ln["src"] == C.SRC_LANE_LINE
+    assert sorted(ln["paint"] for ln in lanes) == ["white", "yellow"]
+    bars = stop_lines_from_cells(idx, cls)
+    assert len(bars) == 1 and abs(bars[0]["y"] - 30.0) <= G.voxel and bars[0]["x0"] <= -1.5 and bars[0]["x1"] >= 1.5
+
+
 def test_curb_line():
     idx, cls = _road_cells(7.0, 0.0)
     iz = int((0.0 - G.z_min) / G.voxel)
@@ -579,11 +716,11 @@ def _check_viz(msg):
     rt = json.loads(data)
     assert rt == msg and not validate_v1(rt) and not validate_v1(strip_to_v1(rt))
     assert set(strip_to_v1(rt)) <= MESSAGE_KEYS
-    assert msg["lanes"] == []  # no paint label source: no invented lanes
+    assert msg["lanes"] == []  # the committed v1 adapter (GVD-owned, unchanged here) draws no lanes; lanes/stop lines are in occ_out v2
     assert -(2**63) <= msg["seq"] < 2**63
     for tr in msg["tracks"]:
         assert tr["src"] in C.KNOWN_SOURCES and tr["motion"] in MOTION_STATES and tr["motion_src"] == C.SRC_MOTION
-        assert tr["motion"] == "unknown" or tr["motion_frames"] >= 2
+        assert tr["motion"] == "unknown" or tr["motion_frames"] >= 2  # committed v1 adapter rule (GVD-owned); occ_out v2 enforces >= 3
         assert "id" not in tr or -(2**31) <= tr["id"] < 2**31
     for ed in msg["edges"]:
         assert ed["src"] in C.KNOWN_SOURCES and ed["type"] in C.RED_POLYLINE_KINDS
@@ -610,12 +747,15 @@ if HAVE_HYP:
         st.lists(track_st, max_size=90),
         st.lists(st.tuples(st.lists(st.tuples(anyfloat, anyfloat), max_size=150), st.one_of(st.sampled_from(["road_edge", "curb", "lane", "stop_line"]), st.text(max_size=5)), st.one_of(st.sampled_from(sorted(C.KNOWN_SOURCES)), st.text(max_size=5))), max_size=12),
         st.floats(0, 60), st.booleans(),
+        st.lists(st.tuples(st.lists(st.tuples(anyfloat, anyfloat), max_size=150), st.one_of(st.sampled_from(["white", "yellow", "red", "purple"]), st.text(max_size=4)), st.one_of(st.sampled_from(sorted(C.KNOWN_SOURCES)), st.text(max_size=4))), max_size=20),
+        st.lists(st.fixed_dictionaries({"x0": anyfloat, "x1": anyfloat, "y": anyfloat, "src": st.text(max_size=4)}), max_size=20),
     )
-    def test_occ_to_viz(t, seq, cells, tracks, edges, speed, engaged):
+    def test_occ_to_viz(t, seq, cells, tracks, edges, speed, engaged, lanes, bars):
         a = np.array([c[:4] for c in cells], dtype=np.int64).reshape(-1, 4)
         conf = np.array([c[4] for c in cells], dtype=np.float32)
         outputs = {"t": t, "cells": {"idx": a[:, :3], "cls": a[:, 3], "conf": conf}, "tracks": tracks,
-                   "edges": [{"pts": [list(p) for p in e], "type": ty, "src": sr} for e, ty, sr in edges]}
+                   "edges": [{"pts": [list(p) for p in e], "type": ty, "src": sr} for e, ty, sr in edges],
+                   "lanes": [{"pts": [list(p) for p in e], "paint": pa, "src": sr} for e, pa, sr in lanes], "stop_lines": bars}
         _check_viz(occ_to_viz(outputs, seq=seq, ego={"speed_mps": speed, "engaged": engaged}))
 
 
@@ -735,17 +875,25 @@ def test_reg_r10_objects_height_bounds_conf():
     assert objects_from_cells(np.array([[-1, 0, 0], [-1, 1, 0]]), np.array([3, 3])) == []
 
 
+
+def test_reg_r11_paint_huge_finite_endpoint():
+    """Fuzz F1 (fuzz profile, before fix: OverflowError in labels._seg_points): a paint stroke with a huge
+    but finite endpoint overflowed length/step to inf."""
+    lab = voxel_labels([], None, [], paint=[{"x0": 0.0, "y0": 0.0, "x1": 0.0, "y1": 4.49423283715579e+307, "yellow": False}], max_free=0)
+    assert lab["occ_idx"].shape[1] == 3
+
+
 REGRESSION_TESTS = [n for n in list(globals()) if n.startswith("test_reg_r")]
 
 
 PROPERTY_TESTS = [
     "test_grid_index", "test_fine_in_coarse", "test_camera_roundtrip", "test_labels_invariants", "test_depth_to_m",
-    "test_sampler_mix", "test_sampler_pure_raises", "test_shard_roundtrip", "test_tracker_fuzz", "test_tracker_physics",
+    "test_sampler_mix", "test_sampler_pure_raises", "test_shard_roundtrip", "test_tracker_fuzz", "test_tracker_fuzz_motion_input", "test_tracker_physics", "test_tracker_physics_vo_noise",
     "test_edges_straight_road", "test_edges_random_cells", "test_objects_from_cells", "test_occ_to_viz",
 ]
 PLAIN_TESTS = [
-    "test_labels_edge_cases", "test_labels_synthetic_scene", "test_sampler_edge_cases", "test_shard_no_stale_mix", "test_shard_edge_cases",
-    "test_tracker_edge_cases", "test_curb_line", "test_viz_edge_cases", "test_v1_constants_match_f3555bf",
+    "test_labels_edge_cases", "test_labels_synthetic_scene", "test_labels_paint_and_stop_line", "test_sampler_edge_cases", "test_shard_no_stale_mix", "test_shard_edge_cases",
+    "test_tracker_edge_cases", "test_curb_line", "test_lane_and_stop_polylines", "test_viz_edge_cases", "test_v1_constants_match_f3555bf",
 ]
 
 

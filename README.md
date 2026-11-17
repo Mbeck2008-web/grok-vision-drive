@@ -183,6 +183,8 @@ Do not run Automatic Mode while the supervisor is also attaching cameras.
 
 Review capture (`R`) writes `Documents/GVD/review/<UTC stamp>/tick_NNNNNN.json` and one `tick_NNNNNN_<camera>.jpg` per camera. Clips go to `Documents/GVD/clips`.
 
+**C++ visualizer (M1, opt-in).** `--viz-cpp` also sends a perception-only scene message per tick over localhost UDP to `gvd_viz`, a separate C++/OpenGL app with the early-FSD-beta look, and starts it if it has been built under `cpp/viz/build`. Sending never blocks the loop: frames are dropped when the app is slow or missing. Build: `cmake --preset windows-msvc && cmake --build --preset windows-msvc` in `cpp/viz`. Live lanes draw white until perception reports paint colour. Spec: [docs/specs/viz_cpp.md](docs/specs/viz_cpp.md).
+
 ### In-game GVD app
 
 A BeamNG UI app named **GVD** (330x440, bottom left by default).
@@ -547,7 +549,8 @@ GVD uses these outside projects. Each one is its authors' work.
 - [mss](https://github.com/BoboTiG/python-mss). Window capture uses mss when BetterCam is unavailable.
 - [pywin32](https://github.com/mhammond/pywin32). Windows matches the BeamNG window title with pywin32.
 - [FFmpeg](https://ffmpeg.org/). Review clips are encoded with FFmpeg when it is on PATH.
+- "Tesla Model 3" by David_Holiday, [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/), https://sketchfab.com/3d-models/tesla-model-3-123c10f376ec4f18b93c73afc382808b — ego mesh in the C++ visualizer (`cpp/viz/assets/`, hood T badge removed).
 
 ## License
 
-GVD's license is MIT (`LICENSE`). Detector weight notices are in `models/NOTICE.txt`.
+GVD's license is MIT (`LICENSE`). Detector weight notices are in `models/NOTICE.txt`. The C++ visualizer ego mesh is CC BY 4.0; see `cpp/viz/assets/ATTRIBUTION.txt`.

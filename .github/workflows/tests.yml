@@ -9,6 +9,8 @@ jobs:
   offline:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      GVD_REQUIRE_LIVE: "1"
     steps:
       - name: Put /tmp on disk
         # ubuntu-26.04 mounts /tmp as a RAM tmpfs (about 7.8 GB). The suite writes
@@ -39,6 +41,24 @@ jobs:
       - name: Lua 5.1 and a display
         run: sudo apt-get update && sudo apt-get install -y lua5.1 xvfb
 
+      - name: C++ viz toolchain (CMake, Ninja, Mesa EGL, X11 for GLFW)
+        # xorg-dev turns GVD_VIZ_GLFW on; libglfw3-dev supplies a system GLFW
+        # so CI does not have to compile the pinned 3.4 tarball (which would
+        # need wayland-scanner). Offline renders still use EGL surfaceless;
+        # ctest is wrapped in xvfb only so glfwCreateWindow has a display.
+        run: sudo apt-get install -y cmake ninja-build g++ libegl1 libegl-mesa0 libgl1-mesa-dri xorg-dev libglfw3-dev
+
+      - name: C++ viz build + ctest (headless EGL + GLFW under xvfb)
+        # docs/specs/viz_cpp.md. glad/stb are vendored; glm + nlohmann_json are
+        # pinned FetchContent tarballs. Renders on Mesa llvmpipe (no GPU).
+        working-directory: cpp/viz
+        run: |
+          cmake --preset linux-release
+          cmake --build --preset linux-release --parallel
+          ./build/linux-release/gvd_viz --info --offline tests/scenes/basic.jsonl --png build/ci_basic.png
+          echo "GVD_REQUIRE_LIVE=${GVD_REQUIRE_LIVE}"
+          xvfb-run -a ctest --preset linux-release
+
       - name: Python packages
         run: |
           python -m pip install --upgrade pip
@@ -62,4 +82,9 @@ jobs:
       - name: Offline suite
         # opencv's Qt build only ships the xcb plugin. A headless runner aborts
         # in cv2.namedWindow (the train panel). xvfb is a display, not offscreen Qt.
-        run: xvfb-run -a python scripts/run_offline_suite.py
+        env:
+          GVD_VIZ_BUILD_DIR: ${{ github.workspace }}/cpp/viz/build/linux-release
+          GVD_REQUIRE_LIVE: "1"
+        run: |
+          echo "GVD_REQUIRE_LIVE=${GVD_REQUIRE_LIVE}"
+          xvfb-run -a python scripts/run_offline_suite.py

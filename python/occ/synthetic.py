@@ -42,7 +42,7 @@ PAINT_HALF_W = 0.2
 
 
 def scene(cam: CameraModel, *, road_half_w: float = 3.5, box: dict | None = None, paint: bool = True, ego_y: float = 0.0,
-          texture: bool = True) -> dict[str, Any]:
+          texture: bool = True, leg: dict | None = None, with_box: bool = True) -> dict[str, Any]:
     """RGB uint8, depth float32 metres, sem uint8, the box, paint strokes and stop bars for one camera.
 
     ``ego_y``: how far the ego has driven forward (+y) through this static world;
@@ -54,13 +54,16 @@ def scene(cam: CameraModel, *, road_half_w: float = 3.5, box: dict | None = None
     box["y0"] = box["y0"] - ego_y
     bars = [{**b, "y_m": b["y_m"] - ego_y} for b in STOP_BARS]
     strokes = [{**p, "y0": p["y0"] - ego_y, "y1": p["y1"] - ego_y} for p in PAINT]
-    d = ground_depth(cam, box=box)
+    d = ground_depth(cam, box=box if with_box else None)
     g = ground_depth(cam)
     on_box = np.isfinite(d) & ~(np.isfinite(g) & np.isclose(d, g, rtol=1e-6))
     ego, valid = cam.backproject(np.nan_to_num(d, nan=0.0))
     x = ego[:, 0].reshape(d.shape)
     y = ego[:, 1].reshape(d.shape)
     on_road = np.isfinite(d) & ~on_box & (np.abs(x) <= road_half_w)
+    if leg is not None:
+        yw0 = y + ego_y
+        on_road |= np.isfinite(d) & ~on_box & (x >= leg["x0"]) & (x <= leg["x1"]) & (yw0 >= leg["y0"]) & (yw0 <= leg["y1"])
     sem = np.zeros(d.shape, np.uint8)
     sem[np.isfinite(d)] = 2
     sem[on_road] = 1
@@ -83,6 +86,6 @@ def scene(cam: CameraModel, *, road_half_w: float = 3.5, box: dict | None = None
             m = on_road & (np.abs(y - bar["y_m"]) <= 0.3) & (x >= bar["x0"]) & (x <= bar["x1"])
             rgb[m] = (240, 240, 240)
     rgb[sem == 3] = (200, 40, 40)       # car
-    car = {"x": box["x"], "y": box["y0"] + box.get("l", 4.0) / 2, "yaw": np.pi / 2, "vx": 0.0, "vy": 0.0}
+    car = {"x": box["x"], "y": box["y0"] + box.get("l", 4.0) / 2, "yaw": np.pi / 2, "vx": 0.0, "vy": 0.0} if with_box else None
     return {"rgb": rgb, "depth": d.astype(np.float32), "sem": sem, "box": car,
             "paint": strokes if paint else [], "stop_bars": bars if paint else []}

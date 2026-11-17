@@ -376,10 +376,43 @@ def detector_runtime(detector: Any) -> str:
     return name
 
 
+def start_cpp_viz(args: argparse.Namespace) -> Any:
+    """``--viz-cpp``: a CppVizPublisher (and gvd_viz if built), else None.
+
+    Fail-safe: any error here leaves the C++ viz off and the supervisor running.
+    """
+    if not bool(getattr(args, "viz_cpp", False)):
+        return None
+    try:
+        from python.viz.cpp_publisher import CppVizPublisher
+
+        pub = CppVizPublisher(port=int(getattr(args, "viz_cpp_port", 47800) or 47800))
+        import atexit
+
+        atexit.register(pub.close)  # also stops gvd_viz if setup fails before the loop's finally
+        if not bool(getattr(args, "viz_cpp_no_launch", False)):
+            pub.launch(str(getattr(args, "viz_cpp_exe", "") or "") or None)
+        print(f"[GVD] {pub.note or 'viz-cpp: publishing to udp://127.0.0.1:%d' % pub.addr[1]}", flush=True)
+        return pub
+    except Exception as exc:  # noqa: BLE001 - the viz must never stop the supervisor
+        print(f"[GVD] viz-cpp: off ({exc!r})", flush=True)
+        return None
+
+
 def build_parser() -> argparse.ArgumentParser:
     """CLI for ``python.run_vision``. Default ``--no-conf-gate`` is off."""
     ap = argparse.ArgumentParser(description="GVD supervisor + M2/M3/M4/M5")
     ap.add_argument("--viz", action="store_true")
+    ap.add_argument(
+        "--viz-cpp",
+        action="store_true",
+        help="Also publish perception-only scene messages to the C++ visualizer (gvd_viz) over "
+        "localhost UDP, and start it if built. Off by default. Never blocks the loop; frames drop "
+        "when the renderer is slow or absent (docs/specs/viz_cpp.md).",
+    )
+    ap.add_argument("--viz-cpp-port", type=int, default=47800, help="UDP port for --viz-cpp (127.0.0.1 only)")
+    ap.add_argument("--viz-cpp-exe", default="", help="gvd_viz path for --viz-cpp (default: cpp/viz/build)")
+    ap.add_argument("--viz-cpp-no-launch", action="store_true", help="--viz-cpp: publish only, do not start gvd_viz")
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--hz", type=float, default=15.0)
     ap.add_argument("--backend", default="auto", choices=["auto", "beamngpy", "window", "stub"])
@@ -886,6 +919,7 @@ def main(clock=None) -> None:
     extras = ExtraSensors(sensors_cfg)
     fox = FoxgloveBridge(sensors_cfg)
 
+    cpp_viz = start_cpp_viz(args)
     win = "GVD VISION" if args.viz else None
     viz_screen_active = str(args.viz_screen)
     viz_note = ""
@@ -2141,6 +2175,8 @@ def main(clock=None) -> None:
                     dets=getattr(pout, "dets", None),
                 )
                 st["viz_ms"] = float(paint.get("viz_ms") or 0.0)
+            if cpp_viz is not None:
+                cpp_viz.publish(st)  # non-blocking UDP; never raises
             age_window.add(frame_age_ms)
             tick_now = clock.perf() if clock is not None else time.perf_counter()
             print(
@@ -2314,6 +2350,8 @@ def main(clock=None) -> None:
             fox.close()
         except Exception:
             pass
+        if cpp_viz is not None:
+            cpp_viz.close()
         if win is not None:
             import cv2
 

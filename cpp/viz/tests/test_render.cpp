@@ -6,6 +6,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -88,12 +89,28 @@ static Scene must(const std::string& js) {
   return s;
 }
 
-static const char* kStraight = "\"lanes\":[{\"pts\":[[-1.8,-12],[-1.8,90]],\"paint\":\"%s\"},{\"pts\":[[1.8,-12],[1.8,90]],\"paint\":\"%s\"}]";
+// Independent dots along a segment. The viz must not invent extra samples.
+static std::string dots_seg(float x0, float y0, float x1, float y1, const char* cls, float step,
+                            int id0, float prob = 1.f, bool observed = true) {
+  std::ostringstream o;
+  const float dx = x1 - x0, dy = y1 - y0;
+  const float len = std::sqrt(dx * dx + dy * dy);
+  const int n = std::max(1, static_cast<int>(std::lround(len / step)));
+  for (int i = 0; i <= n; ++i) {
+    const float t = (n == 0) ? 0.f : static_cast<float>(i) / static_cast<float>(n);
+    if (i) o << ',';
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "{\"id\":%d,\"x\":%.3f,\"y\":%.3f,\"cls\":\"%s\",\"prob\":%.3f,\"observed\":%s}",
+                  id0 + i, x0 + t * dx, y0 + t * dy, cls, prob, observed ? "true" : "false");
+    o << buf;
+  }
+  return o.str();
+}
 
 static std::string lanes(const char* a, const char* b) {
-  char buf[512];
-  std::snprintf(buf, sizeof(buf), kStraight, a, b);
-  return buf;
+  return std::string("\"dots\":[") + dots_seg(-1.8f, -12.f, -1.8f, 90.f, a, 1.2f, 1) + "," +
+         dots_seg(1.8f, -12.f, 1.8f, 90.f, b, 1.2f, 200) + "]";
 }
 
 int main() {
@@ -158,14 +175,15 @@ int main() {
     CHECK(c.yellow > 150, "yellow paint: only %ld yellow px", c.yellow);
     CHECK(c.white > 100, "white line beside yellow: only %ld white px", c.white);
     CHECK(c.purple == 0, "purple px %ld", c.purple);
-    Image im2 = shot(must(head("\"lanes\":[{\"pts\":[[0,-12],[0,90]]}]")), o);
+    Image im2 = shot(must(head(std::string("\"dots\":[") + dots_seg(0.f, -12.f, 0.f, 90.f, "white", 1.2f, 1) + "]")), o);
     Counts c2 = classify(im2);
     CHECK(c2.yellow == 0 && c2.white > 80, "no paint field: yellow=%ld white=%ld", c2.yellow, c2.white);
   }
 
   // 5. road edges are red, and only edges are red.
   {
-    Image im = shot(must(head("\"edges\":[{\"pts\":[[-6,-12],[-6,90]]},{\"pts\":[[6,-12],[6,90]]}]")), o);
+    Image im = shot(must(head(std::string("\"dots\":[") + dots_seg(-6.f, -12.f, -6.f, 90.f, "curb", 0.8f, 1) + "," +
+                                  dots_seg(6.f, -12.f, 6.f, 90.f, "curb", 0.8f, 300) + "]")), o);
     Counts c = classify(im);
     CHECK(c.red > 150, "edges: only %ld red px", c.red);
     CHECK(c.yellow == 0 && c.purple == 0 && c.green == 0, "edges drew y=%ld p=%ld g=%ld", c.yellow, c.purple,
@@ -174,20 +192,20 @@ int main() {
 
   // 6. lead box green; another car blue and not green.
   {
-    Image im = shot(must(head("\"lead_id\":1,\"tracks\":[{\"id\":1,\"cls\":\"vehicle\",\"x\":0,\"y\":14,\"yaw\":1.5708}]")), o);
+    Image im = shot(must(head("\"lead_id\":1,\"tracks\":[{\"id\":1,\"cls\":\"vehicle\",\"x\":0,\"y\":14,\"yaw\":1.5708,\"l\":4.5,\"w\":1.85,\"h\":1.5}]")), o);
     Counts c = classify(im);
     CHECK(c.green > 80, "lead box: only %ld green px", c.green);
-    Image im2 = shot(must(head("\"lead_id\":7,\"tracks\":[{\"id\":1,\"cls\":\"vehicle\",\"x\":0,\"y\":14,\"yaw\":1.5708}]")), o);
+    Image im2 = shot(must(head("\"lead_id\":7,\"tracks\":[{\"id\":1,\"cls\":\"vehicle\",\"x\":0,\"y\":14,\"yaw\":1.5708,\"l\":4.5,\"w\":1.85,\"h\":1.5}]")), o);
     Counts c2 = classify(im2);
     CHECK(c2.blue > 80, "other car: only %ld blue px", c2.blue);
     CHECK(c2.green == 0, "non-lead car drew %ld green px", c2.green);
-    Image im3 = shot(must(head("\"tracks\":[{\"id\":1,\"cls\":\"vehicle\",\"x\":0,\"y\":14,\"yaw\":1.5708,\"lead\":true}]")), o);
+    Image im3 = shot(must(head("\"tracks\":[{\"id\":1,\"cls\":\"vehicle\",\"x\":0,\"y\":14,\"yaw\":1.5708,\"l\":4.5,\"w\":1.85,\"h\":1.5,\"lead\":true}]")), o);
     CHECK(classify(im3).green > 80, "track lead flag ignored");
   }
 
   // 7. GT / unknown keys never change a pixel.
   {
-    std::string base = lanes("white", "white") + ",\"tracks\":[{\"id\":3,\"cls\":\"truck\",\"x\":3.6,\"y\":20,\"yaw\":1.57}]";
+    std::string base = lanes("white", "white") + ",\"tracks\":[{\"id\":3,\"cls\":\"truck\",\"x\":3.6,\"y\":20,\"yaw\":1.57,\"l\":7.6,\"w\":2.5,\"h\":3.0}]";
     std::string gt = base +
                      ",\"path_world\":{\"pts\":[[1,0],[1,40]]},\"debug_gt\":true,\"gt_lanes\":[{\"pts\":[[0,0],[0,40]],\"paint\":\"yellow\"}],"
                      "\"lanes_gt\":[{\"pts\":[[3,0],[3,40]]}],\"vehicles_gt\":[{\"x\":0,\"y\":10}]";
@@ -211,7 +229,7 @@ int main() {
 
   // 9. path is blue beads.
   {
-    Image im = shot(must(head("\"path\":{\"pts\":[[0,2],[0,40]]}")), o);
+    Image im = shot(must(head(std::string("\"dots\":[") + dots_seg(0.f, 2.f, 0.f, 40.f, "path", 2.0f, 1) + "]")), o);
     Counts c = classify(im);
     CHECK(c.blue > 60, "path: only %ld blue px", c.blue);
     CHECK(c.green == 0 && c.red == 0, "path drew g=%ld r=%ld", c.green, c.red);
@@ -231,7 +249,7 @@ int main() {
   // 11. a full scene renders at two sizes back to back with no GL error.
   {
     std::string full = lanes("yellow", "white") +
-                       ",\"edges\":[{\"pts\":[[-6,-12],[-6,90]]}],\"tracks\":[{\"id\":1,\"x\":0,\"y\":12}],"
+                       ",\"edges\":[{\"pts\":[[-6,-12],[-6,90]]}],\"tracks\":[{\"id\":1,\"x\":0,\"y\":12,\"l\":4.5,\"w\":1.85,\"h\":1.5}],"
                        "\"signs\":[{\"cls\":\"traffic_light\",\"x\":2,\"y\":40,\"state\":\"green\"}],\"path\":{\"pts\":[[0,2],[0,30]]}";
     Scene s = must(head(full));
     RenderOptions big = o;
@@ -248,13 +266,13 @@ int main() {
 
   // 12. per-class box colours (red is edges/curbs only).
   {
-    Image parked = shot(must(head("\"tracks\":[{\"id\":1,\"cls\":\"parked\",\"x\":0,\"y\":12,\"yaw\":1.5708}]")), o);
+    Image parked = shot(must(head("\"tracks\":[{\"id\":1,\"cls\":\"parked\",\"x\":0,\"y\":12,\"yaw\":1.5708,\"l\":4.5,\"w\":1.9,\"h\":1.5}]")), o);
     Counts cp = classify(parked);
     // Uniform box strokes no longer add at vertices, so the orange bucket is
     // smaller than the old 12-capsule additive draw; colour identity is enough.
     CHECK(cp.orange > 40, "parked: only %ld orange px", cp.orange);
     CHECK(cp.red == 0, "parked drew %ld red px (red is edges/curbs only)", cp.red);
-    Image obst = shot(must(head("\"tracks\":[{\"id\":1,\"cls\":\"obstacle\",\"x\":0,\"y\":12,\"yaw\":1.5708}]")), o);
+    Image obst = shot(must(head("\"tracks\":[{\"id\":1,\"cls\":\"obstacle\",\"x\":0,\"y\":12,\"yaw\":1.5708,\"l\":4.4,\"w\":1.9,\"h\":1.6}]")), o);
     Counts co = classify(obst);
     CHECK(co.orange > 40, "obstacle: only %ld orange px", co.orange);
     CHECK(co.red == 0, "obstacle drew %ld red px (red is edges/curbs only)", co.red);
@@ -264,21 +282,21 @@ int main() {
     Counts cn = classify(cone);
     CHECK(cn.red == 0, "cone drew %ld red px", cn.red);
     CHECK(cn.orange > 40, "cone: only %ld orange px", cn.orange);
-    Image car = shot(must(head("\"tracks\":[{\"id\":1,\"cls\":\"vehicle\",\"x\":0,\"y\":12,\"yaw\":1.5708}]")), o);
+    Image car = shot(must(head("\"tracks\":[{\"id\":1,\"cls\":\"vehicle\",\"x\":0,\"y\":12,\"yaw\":1.5708,\"l\":4.5,\"w\":1.85,\"h\":1.5}]")), o);
     Counts cv = classify(car);
     CHECK(cv.blue > 80, "car: only %ld blue px", cv.blue);
     CHECK(cv.red == 0, "car drew %ld red px", cv.red);
-    Image ped = shot(must(head("\"tracks\":[{\"id\":1,\"cls\":\"pedestrian\",\"x\":0,\"y\":12,\"yaw\":1.5708}]")), o);
+    Image ped = shot(must(head("\"tracks\":[{\"id\":1,\"cls\":\"pedestrian\",\"x\":0,\"y\":12,\"yaw\":1.5708,\"l\":0.7,\"w\":0.7,\"h\":1.7}]")), o);
     CHECK(classify(ped).pink > 80, "ped: only %ld pink px", classify(ped).pink);
-    Image bike = shot(must(head("\"tracks\":[{\"id\":1,\"cls\":\"bike\",\"x\":0,\"y\":12,\"yaw\":1.5708}]")), o);
+    Image bike = shot(must(head("\"tracks\":[{\"id\":1,\"cls\":\"bike\",\"x\":0,\"y\":12,\"yaw\":1.5708,\"l\":1.8,\"w\":0.6,\"h\":1.5}]")), o);
     Counts cb = classify(bike);
     CHECK(cb.yellow > 80, "bike: only %ld yellow px", cb.yellow);
     CHECK(cb.green == 0, "bike drew %ld green px", cb.green);
-    Image cross = shot(must(head("\"tracks\":[{\"id\":1,\"cls\":\"vehicle\",\"x\":0,\"y\":12,\"yaw\":0}]")), o);
+    Image cross = shot(must(head("\"tracks\":[{\"id\":1,\"cls\":\"vehicle\",\"x\":0,\"y\":12,\"yaw\":0,\"l\":4.5,\"w\":1.85,\"h\":1.5}]")), o);
     Counts cc = classify(cross);
     CHECK(cc.yellow > 80, "cross traffic: only %ld yellow px", cc.yellow);
     CHECK(cc.green == 0, "cross traffic drew %ld green (lead) px", cc.green);
-    Image truck = shot(must(head("\"tracks\":[{\"id\":1,\"cls\":\"truck\",\"x\":0,\"y\":12,\"yaw\":1.5708}]")), o);
+    Image truck = shot(must(head("\"tracks\":[{\"id\":1,\"cls\":\"truck\",\"x\":0,\"y\":12,\"yaw\":1.5708,\"l\":7.6,\"w\":2.5,\"h\":3.0}]")), o);
     Counts ct = classify(truck);
     CHECK(ct.magenta > 80, "truck: only %ld magenta px", ct.magenta);
     // Linear RGB of parked/obstacle must not fall in the red bucket (g >= 0.45 r).
@@ -474,7 +492,7 @@ int main() {
   // 19. box wireframe: corner brightness is within ~5% of mid-edge (no additive
   // glow pile-up where 12 capsules would overlap at a vertex).
   {
-    Scene s = must(head("\"tracks\":[{\"id\":1,\"cls\":\"vehicle\",\"x\":0,\"y\":14,\"yaw\":1.5708}]"));
+    Scene s = must(head("\"tracks\":[{\"id\":1,\"cls\":\"vehicle\",\"x\":0,\"y\":14,\"yaw\":1.5708,\"l\":4.5,\"w\":1.85,\"h\":1.5}]"));
     Image im = shot(s, o);
     const Track& t = s.tracks[0];
     glm::vec3 d = t.l > 0.f ? glm::vec3(t.l, t.w, t.h) : glm::vec3(4.5f, 1.85f, 1.5f);
@@ -579,6 +597,219 @@ int main() {
       CHECK(named, "ego GLB missing Tesla_Model_3 node");
       std::printf("ego GLB nodes=%d (no badge)\n", nodes);
     }
+  }
+
+
+  // 21. dropping one independent dot from the input removes only that dot.
+  {
+    auto to_img = [&](float x, float y) -> glm::vec2 {
+      const float aspect = float(o.w) / float(o.h);
+      glm::mat4 view = glm::lookAt(o.lens.eye, o.lens.look, glm::vec3(0, 0, 1));
+      glm::mat4 proj = glm::perspective(glm::radians(o.lens.vfov_deg), aspect, 0.3f, 600.f);
+      glm::vec4 clip = proj * view * glm::vec4(x, y, 0.04f, 1.f);
+      glm::vec3 ndc = glm::vec3(clip) / clip.w;
+      return {(ndc.x * 0.5f + 0.5f) * float(o.w), (1.f - (ndc.y * 0.5f + 0.5f)) * float(o.h)};
+    };
+    auto win_luma = [&](const Image& im, glm::vec2 px, int rad) -> float {
+      float m = 0.f;
+      int cx = int(std::lround(px.x)), cy = int(std::lround(px.y));
+      for (int dy = -rad; dy <= rad; ++dy)
+        for (int dx = -rad; dx <= rad; ++dx) {
+          int x = cx + dx, y = cy + dy;
+          if (x < 0 || y < 0 || x >= im.w || y >= im.h) continue;
+          const uint8_t* p = &im.rgba[(static_cast<size_t>(y) * im.w + x) * 4];
+          m = std::max(m, (0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2]) / 255.f);
+        }
+      return m;
+    };
+    const char* both =
+        "\"dots\":[{\"id\":1,\"x\":-3.5,\"y\":22,\"cls\":\"white\",\"prob\":1,\"observed\":true},"
+        "{\"id\":2,\"x\":3.5,\"y\":22,\"cls\":\"white\",\"prob\":1,\"observed\":true}]";
+    const char* one =
+        "\"dots\":[{\"id\":1,\"x\":-3.5,\"y\":22,\"cls\":\"white\",\"prob\":1,\"observed\":true}]";
+    Image a = shot(must(head(both)), o);
+    Image b = shot(must(head(one)), o);
+    glm::vec2 p1 = to_img(-3.5f, 22.f), p2 = to_img(3.5f, 22.f);
+    CHECK(win_luma(a, p1, 6) > 0.15f && win_luma(a, p2, 6) > 0.15f, "both dots should be lit");
+    CHECK(win_luma(b, p1, 6) > 0.15f, "kept dot disappeared");
+    CHECK(win_luma(b, p2, 6) < 0.05f, "dropped dot is still lit (luma %.3f)", win_luma(b, p2, 6));
+    std::printf("drop one dot: kept %.3f dropped %.3f (was %.3f)\n", win_luma(b, p1, 6), win_luma(b, p2, 6),
+                win_luma(a, p2, 6));
+  }
+
+  // 22. per-dot alpha follows that dot's prob.
+  {
+    auto to_img = [&](float x, float y) -> glm::vec2 {
+      const float aspect = float(o.w) / float(o.h);
+      glm::mat4 view = glm::lookAt(o.lens.eye, o.lens.look, glm::vec3(0, 0, 1));
+      glm::mat4 proj = glm::perspective(glm::radians(o.lens.vfov_deg), aspect, 0.3f, 600.f);
+      glm::vec4 clip = proj * view * glm::vec4(x, y, 0.04f, 1.f);
+      glm::vec3 ndc = glm::vec3(clip) / clip.w;
+      return {(ndc.x * 0.5f + 0.5f) * float(o.w), (1.f - (ndc.y * 0.5f + 0.5f)) * float(o.h)};
+    };
+    auto win_luma = [&](const Image& im, glm::vec2 px, int rad) -> float {
+      float m = 0.f;
+      int cx = int(std::lround(px.x)), cy = int(std::lround(px.y));
+      for (int dy = -rad; dy <= rad; ++dy)
+        for (int dx = -rad; dx <= rad; ++dx) {
+          int x = cx + dx, y = cy + dy;
+          if (x < 0 || y < 0 || x >= im.w || y >= im.h) continue;
+          const uint8_t* p = &im.rgba[(static_cast<size_t>(y) * im.w + x) * 4];
+          m = std::max(m, (0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2]) / 255.f);
+        }
+      return m;
+    };
+    Image im = shot(must(head("\"dots\":[{\"id\":1,\"x\":-3.5,\"y\":22,\"cls\":\"white\",\"prob\":1.0,\"observed\":true},"
+                              "{\"id\":2,\"x\":3.5,\"y\":22,\"cls\":\"white\",\"prob\":0.25,\"observed\":true}]")),
+                    o);
+    float hi = win_luma(im, to_img(-3.5f, 22.f), 6);
+    float lo = win_luma(im, to_img(3.5f, 22.f), 6);
+    std::printf("alpha follows prob: p=1 luma %.3f  p=0.25 luma %.3f\n", hi, lo);
+    CHECK(hi > 0.20f, "prob=1 dot too dim (%.3f)", hi);
+    CHECK(lo > 0.02f, "prob=0.25 dot invisible (%.3f)", lo);
+    CHECK(hi > lo * 1.6f, "prob=1 (%.3f) should be clearly brighter than prob=0.25 (%.3f)", hi, lo);
+  }
+
+  // 23. a new dot fades in over N frames rather than popping on.
+  {
+    auto win_luma = [&](const Image& im, int rad) -> float {
+      const float aspect = float(o.w) / float(o.h);
+      glm::mat4 view = glm::lookAt(o.lens.eye, o.lens.look, glm::vec3(0, 0, 1));
+      glm::mat4 proj = glm::perspective(glm::radians(o.lens.vfov_deg), aspect, 0.3f, 600.f);
+      glm::vec4 clip = proj * view * glm::vec4(0.f, 22.f, 0.04f, 1.f);
+      glm::vec3 ndc = glm::vec3(clip) / clip.w;
+      int cx = int(std::lround((ndc.x * 0.5f + 0.5f) * float(o.w)));
+      int cy = int(std::lround((1.f - (ndc.y * 0.5f + 0.5f)) * float(o.h)));
+      float m = 0.f;
+      for (int dy = -rad; dy <= rad; ++dy)
+        for (int dx = -rad; dx <= rad; ++dx) {
+          int x = cx + dx, y = cy + dy;
+          if (x < 0 || y < 0 || x >= im.w || y >= im.h) continue;
+          const uint8_t* p = &im.rgba[(static_cast<size_t>(y) * im.w + x) * 4];
+          m = std::max(m, (0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2]) / 255.f);
+        }
+      return m;
+    };
+    // Seed history at t=0 with an empty scene, then introduce the dot.
+    shot(must("{\"v\":1,\"type\":\"gvd_scene\",\"seq\":1,\"t\":0}"), o);
+    const char* dot = "{\"v\":1,\"type\":\"gvd_scene\",\"seq\":2,\"t\":%.3f,"
+                      "\"dots\":[{\"id\":7,\"x\":0,\"y\":22,\"cls\":\"white\",\"prob\":1,\"observed\":true}]}";
+    char buf[256];
+    std::snprintf(buf, sizeof(buf), dot, 0.04);
+    float l1 = win_luma(shot(must(buf), o), 6);
+    std::snprintf(buf, sizeof(buf), dot, 0.08);
+    float l2 = win_luma(shot(must(buf), o), 6);
+    std::snprintf(buf, sizeof(buf), dot, 0.12);
+    float l3 = win_luma(shot(must(buf), o), 6);
+    std::snprintf(buf, sizeof(buf), dot, 0.28);
+    float lN = win_luma(shot(must(buf), o), 6);
+    std::printf("fade in: t=0.04 %.3f  0.08 %.3f  0.12 %.3f  0.28 %.3f\n", l1, l2, l3, lN);
+    CHECK(l1 > 0.01f, "first fade frame is black (%.3f)", l1);
+    CHECK(lN > l1 * 1.4f, "dot popped instead of fading (%.3f then %.3f)", l1, lN);
+    CHECK(l2 >= l1 * 0.9f && l3 >= l2 * 0.9f, "fade is not increasing (%.3f %.3f %.3f)", l1, l2, l3);
+  }
+
+  // 24. a world-fixed dot shifts on screen by the right amount when ego moves.
+  {
+    auto to_img = [&](float x, float y) -> glm::vec2 {
+      const float aspect = float(o.w) / float(o.h);
+      glm::mat4 view = glm::lookAt(o.lens.eye, o.lens.look, glm::vec3(0, 0, 1));
+      glm::mat4 proj = glm::perspective(glm::radians(o.lens.vfov_deg), aspect, 0.3f, 600.f);
+      glm::vec4 clip = proj * view * glm::vec4(x, y, 0.04f, 1.f);
+      glm::vec3 ndc = glm::vec3(clip) / clip.w;
+      return {(ndc.x * 0.5f + 0.5f) * float(o.w), (1.f - (ndc.y * 0.5f + 0.5f)) * float(o.h)};
+    };
+    auto peak = [&](const Image& im, glm::vec2 guess, int rad, int* ox, int* oy) -> float {
+      int cx = int(std::lround(guess.x)), cy = int(std::lround(guess.y));
+      float m = 0.f;
+      int bx = cx, by = cy;
+      for (int dy = -rad; dy <= rad; ++dy)
+        for (int dx = -rad; dx <= rad; ++dx) {
+          int x = cx + dx, y = cy + dy;
+          if (x < 0 || y < 0 || x >= im.w || y >= im.h) continue;
+          const uint8_t* p = &im.rgba[(static_cast<size_t>(y) * im.w + x) * 4];
+          float L = (0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2]) / 255.f;
+          if (L > m) { m = L; bx = x; by = y; }
+        }
+      if (ox) *ox = bx;
+      if (oy) *oy = by;
+      return m;
+    };
+    // World yaw π/2 = facing +Y. Dot at world (0, 28). Ego at y=0 then y=8.
+    Image a = shot(must(head("\"ego\":{\"x\":0,\"y\":0,\"yaw\":1.5708},"
+                             "\"dots\":[{\"id\":1,\"x\":0,\"y\":28,\"cls\":\"white\",\"prob\":1,\"observed\":true}]")),
+                   o);
+    Image b = shot(must(head("\"ego\":{\"x\":0,\"y\":8,\"yaw\":1.5708},"
+                             "\"dots\":[{\"id\":1,\"x\":0,\"y\":28,\"cls\":\"white\",\"prob\":1,\"observed\":true}]")),
+                   o);
+    glm::vec2 exp_a = to_img(0.f, 28.f), exp_b = to_img(0.f, 20.f);
+    int ax, ay, bx, by;
+    float la = peak(a, exp_a, 8, &ax, &ay);
+    float lb = peak(b, exp_b, 8, &bx, &by);
+    std::printf("world lock: ego0 peak (%d,%d) luma %.3f  ego+8 (%d,%d) luma %.3f  expected (%.1f,%.1f)->(%.1f,%.1f)\n",
+                ax, ay, la, bx, by, lb, exp_a.x, exp_a.y, exp_b.x, exp_b.y);
+    CHECK(la > 0.15f && lb > 0.15f, "world-fixed dot not visible (%.3f / %.3f)", la, lb);
+    CHECK(std::fabs(float(ax) - exp_a.x) <= 3.f && std::fabs(float(ay) - exp_a.y) <= 3.f,
+          "dot at ego 0 is at (%d,%d) want (%.1f,%.1f)", ax, ay, exp_a.x, exp_a.y);
+    CHECK(std::fabs(float(bx) - exp_b.x) <= 3.f && std::fabs(float(by) - exp_b.y) <= 3.f,
+          "dot after ego move is at (%d,%d) want (%.1f,%.1f)", bx, by, exp_b.x, exp_b.y);
+  }
+
+  // 25. different object size and yaw from the model output render differently.
+  {
+    Image mid = shot(must(head("\"tracks\":[{\"id\":1,\"cls\":\"vehicle\",\"x\":0,\"y\":14,\"yaw\":1.5708,\"l\":4.5,\"w\":1.85,\"h\":1.5}]")), o);
+    Image big = shot(must(head("\"tracks\":[{\"id\":1,\"cls\":\"vehicle\",\"x\":0,\"y\":14,\"yaw\":1.5708,\"l\":9.0,\"w\":2.5,\"h\":3.0}]")), o);
+    Image yaw = shot(must(head("\"tracks\":[{\"id\":1,\"cls\":\"vehicle\",\"x\":0,\"y\":14,\"yaw\":0.0,\"l\":4.5,\"w\":1.85,\"h\":1.5}]")), o);
+    CHECK(mid.rgba != big.rgba, "same pixels for 4.5 m and 9 m boxes");
+    CHECK(mid.rgba != yaw.rgba, "same pixels for yaw=pi/2 and yaw=0");
+    Counts cm = classify(mid), cb = classify(big);
+    CHECK(cb.lit > cm.lit + 40, "larger box is not bigger on screen (%ld vs %ld lit)", cb.lit, cm.lit);
+    std::printf("size/yaw: mid lit %ld  big lit %ld  yaw0 lit %ld\n", cm.lit, cb.lit, classify(yaw).lit);
+  }
+
+  // 26. a 2-vertex lane is two dots, not a resampled bead chain.
+  {
+    Image im = shot(must(head("\"lanes\":[{\"pts\":[[-1.8,-12],[-1.8,90]],\"paint\":\"white\"}]")), o);
+    Counts c = classify(im);
+    std::printf("no resample: 2-vertex lane white=%ld lit=%ld\n", c.white, c.lit);
+    CHECK(c.lit > 5 && c.lit < 80, "2-vertex lane should be two beads, got %ld white / %ld lit px", c.white, c.lit);
+    CHECK(c.yellow == 0 && c.purple == 0, "2-vertex lane drew y=%ld p=%ld", c.yellow, c.purple);
+  }
+
+  // 27. inferred (observed=false) dots are dimmer than observed ones.
+  {
+    auto win_luma = [&](const Image& im, float x, float y) -> float {
+      const float aspect = float(o.w) / float(o.h);
+      glm::mat4 view = glm::lookAt(o.lens.eye, o.lens.look, glm::vec3(0, 0, 1));
+      glm::mat4 proj = glm::perspective(glm::radians(o.lens.vfov_deg), aspect, 0.3f, 600.f);
+      glm::vec4 clip = proj * view * glm::vec4(x, y, 0.04f, 1.f);
+      glm::vec3 ndc = glm::vec3(clip) / clip.w;
+      int cx = int(std::lround((ndc.x * 0.5f + 0.5f) * float(o.w)));
+      int cy = int(std::lround((1.f - (ndc.y * 0.5f + 0.5f)) * float(o.h)));
+      float m = 0.f;
+      for (int dy = -6; dy <= 6; ++dy)
+        for (int dx = -6; dx <= 6; ++dx) {
+          int ix = cx + dx, iy = cy + dy;
+          if (ix < 0 || iy < 0 || ix >= im.w || iy >= im.h) continue;
+          const uint8_t* p = &im.rgba[(static_cast<size_t>(iy) * im.w + ix) * 4];
+          m = std::max(m, (0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2]) / 255.f);
+        }
+      return m;
+    };
+    Image im = shot(must(head("\"dots\":[{\"id\":1,\"x\":-3.5,\"y\":22,\"cls\":\"white\",\"prob\":1,\"observed\":true},"
+                              "{\"id\":2,\"x\":3.5,\"y\":22,\"cls\":\"white\",\"prob\":1,\"observed\":false}]")),
+                    o);
+    float ho = win_luma(im, -3.5f, 22.f), hi = win_luma(im, 3.5f, 22.f);
+    std::printf("inferred dimmer: observed %.3f  inferred %.3f\n", ho, hi);
+    CHECK(ho > hi * 1.4f, "inferred (%.3f) is not dimmer than observed (%.3f)", hi, ho);
+  }
+
+  // 28. a track with no model size is not drawn (no invented class prior).
+  {
+    Image none = shot(must(head("\"tracks\":[{\"id\":1,\"cls\":\"vehicle\",\"x\":0,\"y\":14,\"yaw\":1.5708}]")), o);
+    Image sized = shot(must(head("\"tracks\":[{\"id\":1,\"cls\":\"vehicle\",\"x\":0,\"y\":14,\"yaw\":1.5708,\"l\":4.5,\"w\":1.85,\"h\":1.5}]")), o);
+    CHECK(classify(none).lit == 0, "sizeless track was drawn (%ld lit) using a fixed prior", classify(none).lit);
+    CHECK(classify(sized).lit > 40, "sized track is invisible");
   }
 
   std::printf("%s (%d failures)\n", g_fail ? "FAILED" : "OK", g_fail);

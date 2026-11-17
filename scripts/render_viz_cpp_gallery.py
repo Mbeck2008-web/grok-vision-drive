@@ -42,28 +42,39 @@ def xline(y, x0, x1, step=2.0):
 def corner(x_side, y_turn, radius, far_x, y_from=-16.0):
     """Curb up the road, rounding into a cross street."""
     s = 1.0 if x_side > 0 else -1.0
-    pts = [{"x": x_side, "y": float(y)} for y in np.arange(y_from, y_turn, 1.0)]
+    pts = [{"x": x_side, "y": float(y)} for y in np.arange(y_from, y_turn, 0.5)]
     for k in range(1, 10):
         t = (math.pi / 2) * k / 9
         pts.append({"x": x_side + s * radius * (1 - math.cos(t)), "y": y_turn + radius * math.sin(t)})
     end = pts[-1]
-    pts += [{"x": float(x), "y": end["y"]} for x in np.arange(end["x"] + s, far_x, s)]
+    pts += [{"x": float(x), "y": end["y"]} for x in np.arange(end["x"] + s * 0.5, far_x, s * 0.5)]
     return pts
 
 
 def corner_back(x_side, y_turn, radius, far_x, y_to=120.0):
     """Far-side curb: from the cross street back up the road ahead."""
     s = 1.0 if x_side > 0 else -1.0
-    pts = [{"x": float(x), "y": y_turn} for x in np.arange(far_x, x_side + s * radius, -s)]
+    pts = [{"x": float(x), "y": y_turn} for x in np.arange(far_x, x_side + s * radius, -s * 0.5)]
     for k in range(0, 10):
         t = (math.pi / 2) * (1 - k / 9)
         pts.append({"x": x_side + s * radius * (1 - math.cos(t)), "y": y_turn + radius * (1 - math.sin(t))})
-    pts += [{"x": x_side, "y": float(y)} for y in np.arange(pts[-1]["y"] + 1.0, y_to, 1.0)]
+    pts += [{"x": x_side, "y": float(y)} for y in np.arange(pts[-1]["y"] + 0.5, y_to, 0.5)]
     return pts
 
 
+_CLS_SIZE = {
+    "vehicle": (4.5, 1.85, 1.5), "car": (4.5, 1.85, 1.5), "parked": (4.5, 1.9, 1.5),
+    "truck": (7.6, 2.5, 3.0), "bus": (10.5, 2.6, 3.2), "trailer": (12.0, 2.5, 3.4),
+    "bike": (1.8, 0.6, 1.5), "bicycle": (1.8, 0.6, 1.5), "cyclist": (1.8, 0.6, 1.6),
+    "motorcycle": (2.1, 0.7, 1.4), "pedestrian": (0.7, 0.7, 1.7), "ped": (0.7, 0.7, 1.7),
+    "person": (0.7, 0.7, 1.7), "obstacle": (4.4, 1.9, 1.6), "debris": (1.2, 0.8, 0.6),
+    "cone": (0.4, 0.4, 0.75),
+}
+
+
 def car(i, x, y, yaw=1.5708, cls="vehicle", **kw):
-    d = {"id": i, "class": cls, "x": x, "y": y, "yaw": yaw}
+    l, w, h = _CLS_SIZE.get(cls, (4.5, 1.85, 1.5))
+    d = {"id": i, "class": cls, "x": x, "y": y, "yaw": yaw, "length": l, "width": w, "height": h}
     d.update(kw)
     return d
 
@@ -95,10 +106,10 @@ def intersection():
     for y, paint in ((29.0, "white"), (32.0, "white"), (35.0, "white")):
         lanes.append(lane(xline(y, -70, 70), paint))
     edges = [
-        {"points": corner(-9.0, 20.0, 6.0, -70.0), "kind": "detected"},
-        {"points": corner(9.0, 20.0, 6.0, 70.0), "kind": "detected"},
-        {"points": corner_back(-9.0, 40.0, 5.0, -70.0), "kind": "detected"},
-        {"points": corner_back(9.0, 40.0, 5.0, 70.0), "kind": "detected"},
+        {"points": corner(-9.0, 20.0, 6.0, -70.0), "kind": "detected", "cls": "curb"},
+        {"points": corner(9.0, 20.0, 6.0, 70.0), "kind": "detected", "cls": "curb"},
+        {"points": corner_back(-9.0, 40.0, 5.0, -70.0), "kind": "detected", "cls": "curb"},
+        {"points": corner_back(9.0, 40.0, 5.0, 70.0), "kind": "detected", "cls": "curb"},
     ]
     tracks = [
         car(1, 0.0, 11.0),
@@ -126,8 +137,8 @@ def multilane():
     for y in (44.0, 47.0, 50.0):
         lanes.append(lane(xline(y, -60, 60), "white"))
     edges = [
-        {"points": corner(-15.0, 32.0, 7.0, -70.0), "kind": "detected"},
-        {"points": corner(12.6, 34.0, 7.0, 70.0), "kind": "detected"},
+        {"points": corner(-15.0, 32.0, 7.0, -70.0), "kind": "detected", "cls": "curb"},
+        {"points": corner(12.6, 34.0, 7.0, 70.0), "kind": "detected", "cls": "curb"},
     ]
     tracks = [
         car(1, 0.0, 10.0, height=1.7),
@@ -159,8 +170,8 @@ def parking():
                               cls="parked", length=4.6, width=1.9, height=1.5))
             tid += 1
     tracks.append(car(90, -3.0, 14.0, cls="pedestrian"))
-    edges = [{"points": line(lambda y: -11.0, -16, 52, 1.0), "kind": "detected"},
-             {"points": line(lambda y: 11.0, -16, 52, 1.0), "kind": "detected"}]
+    edges = [{"points": line(lambda y: -11.0, -16, 52, 0.5), "kind": "detected", "cls": "curb"},
+             {"points": line(lambda y: 11.0, -16, 52, 0.5), "kind": "detected", "cls": "curb"}]
     bay = 6.0 + 3.4 * 3
     path = [{"x": 0.0, "y": float(y)} for y in np.arange(2.0, bay - 4.0, 1.0)]
     for k in range(1, 10):
@@ -176,9 +187,9 @@ def dusk():
     lanes = [lane(line(lambda y: -0.2 - 0.004 * y * y, -10, 40, 1.5), "yellow"),
              lane(line(lambda y: 3.2 + 0.002 * y * y, -10, 40, 1.5), "white"),
              lane(xline(30.0, -40.0, -6.0, 1.5), "white")]
-    edges = [{"points": corner(-6.5, 22.0, 6.0, -45.0, -10.0), "kind": "detected"},
-             {"points": corner(7.5, 24.0, 6.0, 45.0, -10.0), "kind": "detected"},
-             {"points": xline(42.0, -45.0, 45.0, 1.0), "kind": "detected"}]
+    edges = [{"points": corner(-6.5, 22.0, 6.0, -45.0, -10.0), "kind": "detected", "cls": "curb"},
+             {"points": corner(7.5, 24.0, 6.0, 45.0, -10.0), "kind": "detected", "cls": "curb"},
+             {"points": xline(42.0, -45.0, 45.0, 0.5), "kind": "detected", "cls": "curb"}]
     tracks = [car(1, -14.0, 34.0, yaw=0.0), car(2, 9.0, 36.0, yaw=math.pi), car(3, 15.0, 37.0, yaw=math.pi),
               car(4, 21.0, 37.5, yaw=math.pi), car(5, -2.5, 46.0, cls="pedestrian"),
               car(6, 9.0, 8.0, yaw=0.2, cls="parked", length=4.8, width=2.0, height=1.6)]
@@ -193,8 +204,8 @@ def highway_curve():
         return lambda y, x=x: x + 0.5 * k * y * y
     lanes = [lane(line(off(-5.4), -16, 150, 2.0), "yellow"), lane(line(off(-1.8), -16, 150, 2.0)),
              lane(line(off(1.8), -16, 150, 2.0)), lane(line(off(5.4), -16, 150, 2.0))]
-    edges = [{"points": line(off(-7.0), -16, 150, 1.0), "kind": "detected"},
-             {"points": line(off(7.2), -16, 150, 1.0), "kind": "detected"}]
+    edges = [{"points": line(off(-7.0), -16, 150, 0.5), "kind": "detected", "cls": "curb"},
+             {"points": line(off(7.2), -16, 150, 0.5), "kind": "detected", "cls": "curb"}]
     def yaw_at(y):
         return math.atan2(1.0, k * y)
     tracks = [car(1, off(0.0)(26.0), 26.0, yaw=yaw_at(26.0)), car(2, off(3.6)(12.0), 12.0, yaw=yaw_at(12.0)),

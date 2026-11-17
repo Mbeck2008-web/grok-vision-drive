@@ -125,6 +125,12 @@ bool parse_scene(const std::string& text, Scene& out, std::string* err) {
     s.engaged = boolean(*it, "engaged", false);
     s.speed_mps = num(*it, "speed_mps", 0.f);
     s.set_mps = num(*it, "set_mps", -1.f);
+    if (it->contains("x") || it->contains("y") || it->contains("yaw")) {
+      s.has_ego_pose = true;
+      s.ego_x = num(*it, "x", 0.f);
+      s.ego_y = num(*it, "y", 0.f);
+      s.ego_yaw = num(*it, "yaw", 1.5707963f);
+    }
   }
   read_int(j, "lead_id", s.lead_id);
   if (auto it = j.find("aeb"); it != j.end()) {
@@ -173,6 +179,37 @@ bool parse_scene(const std::string& text, Scene& out, std::string* err) {
       edge.pts = pts_of(e);
       if (!read_kind(e, edge.predicted)) continue;
       if (edge.pts.size() >= 2) s.edges.push_back(std::move(edge));
+    }
+  }
+
+  if (auto it = j.find("dots"); it != j.end() && it->is_array()) {
+    for (const auto& d : *it) {
+      if (s.dots.size() >= static_cast<size_t>(kMaxDots)) break;
+      if (!d.is_object()) continue;
+      Dot dot;
+      if (d.contains("id") && !read_int(d, "id", dot.id)) continue;
+      dot.x = num(d, "x", NAN);
+      dot.y = num(d, "y", NAN);
+      if (!std::isfinite(dot.x) || !std::isfinite(dot.y)) continue;
+      auto cit = d.find("cls");
+      if (cit != d.end()) {
+        if (!cit->is_string()) continue;
+        const std::string c = cit->get<std::string>();
+        if (c == "white" || c == "lane") dot.cls = DotCls::White;
+        else if (c == "yellow") dot.cls = DotCls::Yellow;
+        else if (c == "curb") dot.cls = DotCls::Curb;
+        else if (c == "edge" || c == "road_edge") dot.cls = DotCls::Edge;
+        else if (c == "path") dot.cls = DotCls::Path;
+        else continue;
+      }
+      float pr = num(d, "prob", 1.f);
+      if (!std::isfinite(pr)) continue;
+      dot.prob = std::clamp(pr, 0.f, 1.f);
+      if (d.contains("observed")) {
+        if (!d["observed"].is_boolean()) continue;
+        dot.observed = d["observed"].get<bool>();
+      }
+      s.dots.push_back(dot);
     }
   }
   if (auto it = j.find("tracks"); it != j.end() && it->is_array()) {

@@ -27,7 +27,7 @@ if str(ROOT) not in sys.path:
 
 from python.viz import cpp_publisher as cp  # noqa: E402
 
-READ_TOP = {"engaged", "ego", "planner", "path_ego", "path_conf", "lanes_ext", "road_edges", "tracks", "signs"}
+READ_TOP = {"engaged", "ego", "planner", "path_ego", "path_conf", "lanes_ext", "road_edges", "tracks", "signs", "dots", "occ_out"}
 GT_KEYS = {
     "path_world": [{"x": 100.0, "y": 200.0}, {"x": 101.0, "y": 240.0}],
     "debug_gt": True,
@@ -87,6 +87,49 @@ def rich_state(n_tracks: int = 6, n_pts: int = 40) -> dict:
         "signs": [{"cls": "traffic_light", "x": 0.0, "y": 45.0, "state": "red", "conf": 0.8}],
         "loop_hz": 15.0,
     }
+
+
+
+def check_dots() -> None:
+    # explicit dots are forwarded 1:1; a missing vertex is not invented
+    st = {
+        "engaged": False,
+        "ego": {"speed_mps": 1.0},
+        "dots": [
+            {"id": 1, "x": 0.0, "y": 10.0, "cls": "white", "prob": 0.8, "observed": True},
+            {"id": 2, "x": 1.0, "y": 10.0, "cls": "curb", "prob": 0.4, "observed": False},
+        ],
+        "lanes_ext": [{"points": [{"x": 9.0, "y": 0.0}, {"x": 9.0, "y": 40.0}], "paint": "yellow"}],
+    }
+    msg = cp.build_scene_message(st, seq=1, t=0.0)
+    assert len(msg["dots"]) == 2, msg["dots"]
+    assert msg["dots"][0]["id"] == 1 and msg["dots"][0]["prob"] == 0.8
+    assert msg["dots"][1]["cls"] == "curb" and msg["dots"][1]["observed"] is False
+    # polyline vertices become dots when no dots/occ_out given, no mid-segment samples
+    st2 = {"lanes_ext": [{"points": [{"x": -1.8, "y": 0.0}, {"x": -1.8, "y": 10.0}], "paint": "white"}]}
+    d2 = cp.build_scene_message(st2, seq=1, t=0.0)["dots"]
+    assert len(d2) == 2 and all(abs(d["x"] + 1.8) < 1e-6 for d in d2), d2
+    assert {round(d["y"], 1) for d in d2} == {0.0, 10.0}
+    # occ_out cells (paint classes only) and lane vertices
+    st3 = {"occ_out": {
+        "occ": {"xyz": [[0.0, 5.0, 0.0], [1.0, 5.0, 0.0], [2.0, 5.0, 0.0]],
+                "cls": [5, 1, 2], "prob": [0.9, 0.8, 0.7], "observed": [True, True, False]},
+        "lanes": {"type": ["yellow_solid"], "pts": [[[-1.8, 0.0], [-1.8, 4.0]]],
+                  "conf": [[0.6, 0.5]], "observed": [[True, False]]},
+    }}
+    d3 = cp.build_scene_message(st3, seq=1, t=0.0)["dots"]
+    cls = {(round(d["x"], 1), d["cls"], d["observed"]) for d in d3}
+    assert (0.0, "white", True) in cls  # cell cls 5
+    assert (2.0, "curb", False) in cls  # cell cls 2
+    assert (1.0, "edge", True) not in cls and not any(d["x"] == 1.0 and d["cls"] == "white" for d in d3)
+    assert (-1.8, "yellow", True) in cls and any(d["x"] == -1.8 and d["y"] == 4.0 and d["observed"] is False for d in d3)
+    # over-cap: drop lowest-prob / farthest, never interpolate
+    many = [{"id": i, "x": float(i), "y": 80.0, "cls": "white", "prob": 0.1 if i else 1.0, "observed": True}
+            for i in range(cp.MAX_DOTS + 50)]
+    d4 = cp.build_scene_message({"dots": many}, seq=1, t=0.0)["dots"]
+    assert len(d4) == cp.MAX_DOTS
+    assert any(d.get("id") == 0 and d["prob"] == 1.0 for d in d4)
+    print(f"dots: explicit {len(msg['dots'])}, vertices {len(d2)}, occ_out {len(d3)}, cap {len(d4)} OK")
 
 
 def check_schema() -> None:
@@ -382,6 +425,7 @@ def check_sendto_oserror() -> None:
 
 def main() -> None:
     sys.path.insert(0, str(ROOT / "scripts"))
+    check_dots()
     check_schema()
     check_perception_only()
     check_paint()

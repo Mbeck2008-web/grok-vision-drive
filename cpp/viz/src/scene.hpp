@@ -14,6 +14,7 @@ constexpr int kMaxSigns = 16;
 constexpr int kMaxLanes = 16;
 constexpr int kMaxEdges = 8;
 constexpr int kMaxPoints = 120;
+constexpr int kMaxDots = 1024;
 
 // Live mode: no valid datagram for this long blanks the scene (empty road + ego).
 constexpr std::chrono::seconds kStaleTimeout{1};
@@ -53,6 +54,17 @@ struct Sign {
   std::string state; // red | yellow | green | unknown
 };
 
+// One world-fixed bead from model / occ_out point output. Not a polyline sample.
+enum class DotCls { White, Yellow, Curb, Edge, Path };
+
+struct Dot {
+  int id = -1;
+  float x = 0, y = 0;  // world metres if Scene::has_ego_pose, else ego frame
+  DotCls cls = DotCls::White;
+  float prob = 1.f;    // [0,1] — per-dot alpha
+  bool observed = true;
+};
+
 struct Scene {
   int v = kSchemaVersion;
   long long seq = 0;
@@ -60,10 +72,16 @@ struct Scene {
   bool engaged = false;
   float speed_mps = 0;
   float set_mps = -1;  // <0 = none
+  // Optional world pose of the ego. When set, dots/tracks/signs/path are in
+  // the world frame and the renderer transforms them so the ego stays
+  // screen-locked and world-fixed dots stream past.
+  bool has_ego_pose = false;
+  float ego_x = 0, ego_y = 0, ego_yaw = 1.5707963f;
   int lead_id = -1;
   std::string aeb = "off";
   std::vector<Lane> lanes;
   std::vector<Edge> edges;
+  std::vector<Dot> dots;
   std::vector<Track> tracks;
   std::vector<Sign> signs;
   std::vector<P2> path;

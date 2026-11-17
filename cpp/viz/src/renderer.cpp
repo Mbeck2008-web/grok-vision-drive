@@ -43,11 +43,26 @@ const Prior kPriors[] = {
     {"car", 4.5f, 1.85f, 1.5f},
 };
 
+// Mutation flags. Tests flip these (one at a time) to prove the new behaviour.
+constexpr bool kResamplePolylines = false;   // true: walk() beads along lanes/edges/path
+constexpr bool kDotAlphaFollowsProb = true;  // false: every dot is fully opaque
+constexpr bool kDotFade = true;              // false: appear/disappear instantly
+constexpr bool kFixedBoxSize = false;        // true: class-prior box size, ignore l/w/h
+constexpr float kDotFadeSec = 0.20f;         // 200 ms fade in/out
+constexpr float kDotMatchRadius = 0.75f;     // NN match when id is missing / new
+constexpr float kInferredScale = 0.45f;      // observed=false dimming
+
 glm::vec3 dims_of(const Track& t) {
-  glm::vec3 d(4.5f, 1.85f, 1.5f);
+  glm::vec3 prior(4.5f, 1.85f, 1.5f);
   for (const auto& p : kPriors) {
-    if (t.cls == p.cls) { d = {p.l, p.w, p.h}; break; }
+    if (t.cls == p.cls) { prior = {p.l, p.w, p.h}; break; }
   }
+  if (!kFixedBoxSize) {
+    // Size comes from the model's per-object output only.
+    if (t.l > 0.2f && t.w > 0.2f && t.h > 0.2f) return {t.l, t.w, t.h};
+    return {0.f, 0.f, 0.f};
+  }
+  glm::vec3 d = prior;
   if (t.l > 0.2f) d.x = t.l;
   if (t.w > 0.2f) d.y = t.w;
   if (t.h > 0.2f) d.z = t.h;
@@ -512,6 +527,49 @@ float far_gain(float y) {
 
 }  // namespace
 
+
+P2 world_to_ego(float wx, float wy, const Scene& s) {
+  if (!s.has_ego_pose) return {wx, wy};
+  const float dx = wx - s.ego_x, dy = wy - s.ego_y;
+  const float c = std::cos(s.ego_yaw), si = std::sin(s.ego_yaw);
+  return {dx * si - dy * c, dx * c + dy * si};
+}
+
+float yaw_to_ego(float yaw, const Scene& s) {
+  if (!s.has_ego_pose) return yaw;
+  return yaw - s.ego_yaw + 1.5707963f;
+}
+
+glm::vec3 dot_rgb(DotCls c, Palette pal) {
+  if (c == DotCls::Yellow) return lane_rgb(Paint::Yellow);
+  if (c == DotCls::Curb || c == DotCls::Edge) return edge_rgb(pal);
+  if (c == DotCls::Path) return {0.20f, 0.45f, 1.0f};
+  return lane_rgb(Paint::White);
+}
+
+void emit_dot_capsule(std::vector<Capsule>& caps, const P2& e, DotCls cls, float alpha, Palette pal) {
+  float g = far_gain(e.y) * std::clamp(alpha, 0.f, 1.f);
+  if (g <= 0.004f) return;
+  glm::vec3 col = dot_rgb(cls, pal);
+  if (cls == DotCls::Curb || cls == DotCls::Edge) {
+    // Curbs are brighter and a touch bigger than lane paint.
+    float rad = cls == DotCls::Curb ? 0.16f : kEdgeRad;
+    glm::vec3 p(e.x, e.y, 0.05f);
+    caps.push_back({p, p, {rad, 1.4f}, {col, 1.15f * g}, {5.f, 0.60f * g}});
+  } else if (cls == DotCls::Path) {
+    glm::vec3 p(e.x, e.y, 0.06f);
+    caps.push_back({p, p, {kPathRad, 1.6f}, {col, g}, {7.f, 0.6f * g}});
+  } else {
+    glm::vec3 p(e.x, e.y, 0.04f);
+    caps.push_back({p, p, {kLaneRad, 1.1f}, {col, g}, {5.f, 0.45f * g}});
+  }
+}
+
+// Vertices of a polyline become independent dots. No mid-segment samples.
+void vertices_as_dots(std::vector<Dot>& dst, const std::vector<P2>& pts, DotCls cls, float prob, bool observed) {
+  for (const auto& p : pts) dst.push_back({-1, p.x, p.y, cls, prob, observed});
+}
+
 // ---- public colour rules -------------------------------------------------
 glm::vec3 lane_rgb(Paint p) {
   // Real paint: yellow paint is yellow, everything else white. No purple.
@@ -720,6 +778,14 @@ struct Renderer::Impl {
   bool ego_from_glb = false;
   int ego_tris = 0;
   std::string ego_glb_path;
+  struct LiveDot {
+    int id = -1;
+    float wx = 0, wy = 0;
+    DotCls cls = DotCls::White;
+    float target = 0, alpha = 0;
+  };
+  std::vector<LiveDot> live_dots;
+  double last_dot_t = -1e9;
   GLuint fbo_ms = 0, rb_color = 0, rb_depth = 0, fbo_res = 0, tex_res = 0;
   int tw = 0, th = 0, tmsaa = 0;
   GLuint tex_bg = 0;
@@ -1015,6 +1081,7 @@ static void upload(GLuint vb, const std::vector<T>& v, size_t& cap, size_t& tota
 // ---- scene -> instances ---------------------------------------------------
 static void add_box(std::vector<Capsule>& caps, std::vector<BoxStroke>& boxes, const Track& t, glm::vec3 col) {
   glm::vec3 d = dims_of(t);
+  if (d.x <= 0.2f || d.y <= 0.2f || d.z <= 0.2f) return;
   float c = std::cos(t.yaw), s = std::sin(t.yaw);
   glm::vec2 fwd(c, s), side(-s, c);
   glm::vec2 ctr(t.x, t.y);
@@ -1116,44 +1183,149 @@ bool Renderer::render(const Scene& s, const RenderOptions& o, Image* out, bool b
   I.sprites.clear();
   I.hud.clear();
 
-  // lanes: dashes near, beads far (perspective shrinks the dash)
-  for (const auto& l : s.lanes) {
-    glm::vec3 col = lane_rgb(l.paint);
-    float k = l.predicted ? 0.45f : 1.0f;
-    for (const auto& w : walk(l.pts, kLaneStep, 0.4f)) {
-      float g = far_gain(w.p.y) * k;
-      if (g <= 0.f) continue;
-      glm::vec3 a(w.p - w.t * kLaneHalf, 0.04f), b(w.p + w.t * kLaneHalf, 0.04f);
-      I.caps.push_back({a, b, {kLaneRad, 1.1f}, {col, g}, {5.f, 0.45f * g}});
+  // Independent world-fixed dots from occ_out / the message. Do not resample
+  // polylines unless the mutation flag is on.
+  std::vector<Dot> incoming = s.dots;
+  if (incoming.empty()) {
+    for (const auto& l : s.lanes)
+      vertices_as_dots(incoming, l.pts, l.paint == Paint::Yellow ? DotCls::Yellow : DotCls::White,
+                       l.predicted ? 0.45f : 1.0f, !l.predicted);
+    for (const auto& e : s.edges)
+      vertices_as_dots(incoming, e.pts, DotCls::Edge, e.predicted ? 0.6f : 1.0f, !e.predicted);
+    if (!s.path.empty())
+      vertices_as_dots(incoming, s.path, DotCls::Path, std::clamp(s.path_conf, 0.45f, 1.0f), true);
+  }
+
+  const double now = s.t;
+  double dt = now - I.last_dot_t;
+  // Snap on first frame, time rewind, a still (dt ~ 0, e.g. gallery / ctest
+  // fixtures that all use t=0), or a long gap. Fade only between consecutive
+  // ticks with 0 < dt <= 0.5 s.
+  const bool snap = !kDotFade || dt <= 1e-6 || dt > 0.5 || I.last_dot_t < -1e8;
+  if (dt < 0.0 || dt > 0.5) dt = 0.0;
+  I.last_dot_t = now;
+  const float fade_step = (kDotFadeSec > 1e-4f) ? static_cast<float>(dt / kDotFadeSec) : 1.f;
+
+  std::vector<char> used(incoming.size(), 0);
+  std::vector<Impl::LiveDot> next;
+  next.reserve(incoming.size() + I.live_dots.size());
+
+  auto target_of = [](const Dot& d) -> float {
+    float a = kDotAlphaFollowsProb ? std::clamp(d.prob, 0.f, 1.f) : 1.f;
+    if (!d.observed) a *= kInferredScale;
+    return a;
+  };
+
+  // Match previous live dots by stable id, else nearest neighbour in world space.
+  for (auto& live : I.live_dots) {
+    int best = -1;
+    float best_d = kDotMatchRadius;
+    for (size_t i = 0; i < incoming.size(); ++i) {
+      if (used[i]) continue;
+      const Dot& d = incoming[i];
+      if (live.id >= 0 && d.id == live.id) {
+        best = static_cast<int>(i);
+        best_d = 0.f;
+        break;
+      }
+      if (live.id >= 0 && d.id >= 0 && d.id != live.id) continue;
+      const float dx = d.x - live.wx, dy = d.y - live.wy;
+      const float dist = std::sqrt(dx * dx + dy * dy);
+      if (dist < best_d) {
+        best_d = dist;
+        best = static_cast<int>(i);
+      }
+    }
+    if (best >= 0) {
+      const Dot& d = incoming[static_cast<size_t>(best)];
+      used[static_cast<size_t>(best)] = 1;
+      live.id = d.id;
+      live.wx = d.x;
+      live.wy = d.y;
+      live.cls = d.cls;
+      live.target = target_of(d);
+      if (snap) live.alpha = live.target;
+      else if (live.alpha < live.target) live.alpha = std::min(live.target, live.alpha + fade_step);
+      else live.alpha = std::max(live.target, live.alpha - fade_step);
+      next.push_back(live);
+    } else {
+      // fade out
+      if (snap) continue;
+      live.target = 0.f;
+      live.alpha = std::max(0.f, live.alpha - fade_step);
+      if (live.alpha > 0.004f) next.push_back(live);
     }
   }
-  // road edges / curbs: red dots
-  glm::vec3 ecol = edge_rgb(pal);
-  for (const auto& e : s.edges) {
-    float k = e.predicted ? 0.6f : 1.0f;
-    for (const auto& w : walk(e.pts, kEdgeStep, 0.2f)) {
-      float g = far_gain(w.p.y) * k;
-      if (g <= 0.f) continue;
-      glm::vec3 p(w.p, 0.05f);
-      I.caps.push_back({p, p, {kEdgeRad, 1.3f}, {ecol, g}, {5.f, 0.55f * g}});
+  for (size_t i = 0; i < incoming.size(); ++i) {
+    if (used[i]) continue;
+    const Dot& d = incoming[i];
+    Impl::LiveDot live;
+    live.id = d.id;
+    live.wx = d.x;
+    live.wy = d.y;
+    live.cls = d.cls;
+    live.target = target_of(d);
+    live.alpha = snap ? live.target : 0.f;
+    if (!snap && kDotFade) {
+      live.alpha = std::min(live.target, fade_step);
+    }
+    if (live.alpha > 0.004f || live.target > 0.004f) next.push_back(live);
+  }
+  I.live_dots.swap(next);
+  for (const auto& live : I.live_dots) {
+    P2 e = world_to_ego(live.wx, live.wy, s);
+    emit_dot_capsule(I.caps, e, live.cls, live.alpha, pal);
+  }
+
+  if (kResamplePolylines) {
+    for (const auto& l : s.lanes) {
+      glm::vec3 col = lane_rgb(l.paint);
+      float k = l.predicted ? 0.45f : 1.0f;
+      for (const auto& wlk : walk(l.pts, kLaneStep, 0.4f)) {
+        float g = far_gain(wlk.p.y) * k;
+        if (g <= 0.f) continue;
+        glm::vec3 a(wlk.p - wlk.t * kLaneHalf, 0.04f), b(wlk.p + wlk.t * kLaneHalf, 0.04f);
+        I.caps.push_back({a, b, {kLaneRad, 1.1f}, {col, g}, {5.f, 0.45f * g}});
+      }
+    }
+    glm::vec3 ecol = edge_rgb(pal);
+    for (const auto& e : s.edges) {
+      float k = e.predicted ? 0.6f : 1.0f;
+      for (const auto& wlk : walk(e.pts, kEdgeStep, 0.2f)) {
+        float g = far_gain(wlk.p.y) * k;
+        if (g <= 0.f) continue;
+        glm::vec3 p(wlk.p, 0.05f);
+        I.caps.push_back({p, p, {kEdgeRad, 1.3f}, {ecol, g}, {5.f, 0.55f * g}});
+      }
+    }
+    if (s.path.size() >= 2) {
+      float gain = std::clamp(s.path_conf, 0.45f, 1.0f);
+      glm::vec3 pcol(0.20f, 0.45f, 1.0f);
+      for (const auto& wlk : walk(s.path, kPathStep, 2.0f)) {
+        float g = far_gain(wlk.p.y) * gain;
+        glm::vec3 p(wlk.p, 0.06f);
+        I.caps.push_back({p, p, {kPathRad, 1.6f}, {pcol, g}, {7.f, 0.6f * g}});
+      }
     }
   }
-  // planned path: blue beads
-  if (s.path.size() >= 2) {
-    float gain = std::clamp(s.path_conf, 0.45f, 1.0f);
-    glm::vec3 pcol(0.20f, 0.45f, 1.0f);
-    for (const auto& w : walk(s.path, kPathStep, 2.0f)) {
-      float g = far_gain(w.p.y) * gain;
-      glm::vec3 p(w.p, 0.06f);
-      I.caps.push_back({p, p, {kPathRad, 1.6f}, {pcol, g}, {7.f, 0.6f * g}});
-    }
+
+  // boxes (position / yaw / size from the model; optional world pose)
+  for (const auto& t0 : s.tracks) {
+    Track t = t0;
+    P2 e = world_to_ego(t.x, t.y, s);
+    t.x = e.x;
+    t.y = e.y;
+    t.yaw = yaw_to_ego(t.yaw, s);
+    add_box(I.caps, I.boxes, t, track_rgb(t, s.lead_id, pal));
   }
-  // boxes
-  for (const auto& t : s.tracks) add_box(I.caps, I.boxes, t, track_rgb(t, s.lead_id, pal));
 
   // signs
   bool crosswalk_done = false;
-  for (const auto& g : s.signs) {
+  for (const auto& g0 : s.signs) {
+    Sign g = g0;
+    P2 ge = world_to_ego(g.x, g.y, s);
+    g.x = ge.x;
+    g.y = ge.y;
     if (g.cls == "traffic_light") {
       glm::vec4 col(0.0f);  // a = lit lamp index+1 (1 red top, 2 yellow, 3 green); 0 = none
       if (g.state == "red") col = {1.0f, 0.12f, 0.10f, 1.f};

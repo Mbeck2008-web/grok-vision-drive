@@ -182,12 +182,44 @@ def check_empty_submit_does_not_create_a_row() -> None:
     print("empty submit creates no hollow row")
 
 
+def check_empty_submit_does_not_enqueue() -> None:
+    """Empty ticks must not occupy a queue slot or count as enqueued.
+
+    ``write_encoded([])`` and a failed empty encode already refuse a
+    hollow row, so a test that only checks state.jsonl cannot kill a
+    mutant that drops the early return in ``submit()`` and still
+    enqueues the empty tick (later marked failed, no PNG).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        queue = RawWriteQueue(RawFrameWriter(root, []), max_depth=4)
+        try:
+            assert queue.submit({}, **_payload(0)) is True
+            assert queue.submit(None, **_payload(1)) is True
+            assert queue.submit({"main": None}, **_payload(2)) is True
+            assert queue.submit({"main": np.zeros((0, 0, 3), dtype=np.uint8)}, **_payload(3)) is True
+            stats = queue.stats()
+            assert int(stats["enqueued"]) == 0, stats
+            assert int(stats["queue_depth"]) == 0, stats
+            assert int(stats["written"]) == 0, stats
+            assert int(stats["failed"]) == 0, stats
+            assert int(stats["dropped_frames"]) == 0, stats
+            assert queue.wait_empty(1.0)
+        finally:
+            queue.close()
+        state = root / "state.jsonl"
+        assert (not state.exists()) or state.read_text(encoding="utf-8") == ""
+        assert not list(root.joinpath("raw").rglob("*.png"))
+    print("empty submit does not enqueue")
+
+
 def main() -> None:
     check_tick_does_not_wait_for_disk()
     check_full_queue_drops_and_stays_fast()
     check_queue_writes_controls_off_thread()
     check_failed_write_is_not_counted_written()
     check_empty_submit_does_not_create_a_row()
+    check_empty_submit_does_not_enqueue()
     print("raw queue ok")
 
 

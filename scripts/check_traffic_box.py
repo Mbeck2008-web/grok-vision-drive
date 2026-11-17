@@ -474,9 +474,11 @@ def format_report(summary: Mapping[str, Any], source: str) -> str:
             f"FAIL: status AXES-UNPROVEN.{who} "
             f"No {NAME_PREFIX}* car had yaw span >= {MIN_YAW_SPAN_DEG:g}° "
             "on a proven segment's moving boxed samples. Do not start the "
-            "long run. Do not claim those axes are live. Keep only half "
-            "and build ctr/ax from pos/dir/up, or switch to a live OOBB "
-            "call, then re-smoke."
+            "long run. Do not claim those axes are live. Re-smoke on a "
+            f"route where a {NAME_PREFIX}* car turns >= {MIN_YAW_SPAN_DEG:g}° "
+            "while boxed and more than 10 m from spawn. If the box is "
+            "still unproven after that, keep only half and build ctr/ax "
+            "from pos/dir/up, or switch to a live OOBB call, then re-smoke."
         )
     elif summary["stuck"]:
         names = ", ".join(summary["stuck"])

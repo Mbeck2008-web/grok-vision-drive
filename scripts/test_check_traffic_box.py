@@ -198,6 +198,14 @@ def _dist_from(a: tuple[float, float, float], b: tuple[float, float, float]) -> 
     return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2) ** 0.5
 
 
+def _assert_mixed_axes_caveat(text: str) -> None:
+    """Y10: mixed PASS must name the straight car, not the turning companion."""
+    assert "Axes are UNPROVEN for gvd_traffic_0" in text
+    assert "Long run may proceed on this evidence; axes are unproven for gvd_traffic_0" in text
+    assert "UNPROVEN for gvd_traffic_axes" not in text
+    assert "unproven for gvd_traffic_axes" not in text
+
+
 def check_live_box_passes() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -226,8 +234,10 @@ def check_live_box_passes() -> None:
         assert stats["max_ctr_pos_m"] is not None
         assert abs(stats["max_ctr_pos_m"] - expected) < 1e-9, stats
         assert stats["moved_m"] > ctb.MOVE_M
-        assert "box.ctr follows pos" not in ctb.format_report(summary, "synthetic")
-        assert "IQU45 smoke check" in ctb.format_report(summary, "synthetic")
+        text = ctb.format_report(summary, "synthetic")
+        assert "box.ctr follows pos" not in text
+        assert "IQU45 smoke check" in text
+        _assert_mixed_axes_caveat(text)
     print("live box passes")
 
 
@@ -336,6 +346,7 @@ def check_two_spawn_live_box_passes() -> None:
         summary = ctb.summarize(ctb.load_state(root / "state.jsonl"))
         stats = summary["cars"]["gvd_traffic_0"]
         assert summary["ok"] and stats["proven_live"] and stats["n_spawns"] == 2
+        _assert_mixed_axes_caveat(ctb.format_report(summary, "synthetic"))
     print("two-spawn live box passes")
 
 
@@ -420,6 +431,7 @@ def check_ignores_non_companion_and_accepts_state_file() -> None:
         summary = ctb.summarize(ctb.load_state(state))
         assert "parked_bus" not in summary["cars"]
         assert summary["ok"]
+        _assert_mixed_axes_caveat(ctb.format_report(summary, "synthetic"))
     print("non-companion ignored; state.jsonl path ok")
 
 
@@ -624,6 +636,7 @@ def check_ctr_within_axis_slack_passes() -> None:
         assert stats["n_moving_boxed"] >= ctb.MIN_MOVING_BOXED
         assert stats["max_ctr_pos_m"] is not None
         assert abs(stats["max_ctr_pos_m"] - off) < 1e-9
+        _assert_mixed_axes_caveat(ctb.format_report(summary, "synthetic"))
     print("ctr within per-axis slack passes")
 
 
@@ -665,6 +678,7 @@ def check_exactly_6_moving_boxed_passes() -> None:
         assert summary["ok"] and summary["status"] == "LIVE", summary
         assert stats["n_moving_boxed"] == ctb.MIN_MOVING_BOXED
         assert stats["proven_live"]
+        _assert_mixed_axes_caveat(ctb.format_report(summary, "synthetic"))
     print("exactly 6 moving boxed passes")
 
 
@@ -702,6 +716,7 @@ def check_proven_segment_plus_short_tail_passes() -> None:
         stats = summary["cars"]["gvd_traffic_0"]
         assert summary["ok"] and summary["status"] == "LIVE", summary
         assert stats["n_spawns"] == 2 and stats["proven_live"]
+        _assert_mixed_axes_caveat(ctb.format_report(summary, "synthetic"))
         by_name, _, _ = ctb.split_segments(loaded)
         segs = [ctb._segment_stats(s) for s in by_name["gvd_traffic_0"]]
         assert len(segs) == 2
@@ -747,6 +762,8 @@ def check_straight_only_axes_unproven() -> None:
     assert "status AXES-UNPROVEN" in text
     assert "Do not claim those axes are live" in text
     assert "Do not start the long run" in text
+    assert "Re-smoke on a route where a gvd_traffic_* car turns >= 30° while boxed and more than 10 m from spawn" in text
+    assert text.index("Re-smoke on a route") < text.index("keep only half")
     assert "PASS:" not in text
     assert "Long run may proceed" not in text
     print("straight-only axes UNPROVEN exits 3")
@@ -890,6 +907,46 @@ def check_flipped_crosswise_box_is_axes_stuck() -> None:
     print("flipped crosswise box is AXES-STUCK")
 
 
+def check_turn_29_5_deg_axes_unproven() -> None:
+    """A 29.5° heading change must exit 3 (G9: threshold 30→29 would pass)."""
+    rc, summary, text = _run_ticks(
+        _ticks_from_poses(_straight_then_turn_poses(turn_deg=29.5))
+    )
+    stats = summary["cars"]["gvd_traffic_0"]
+    span = stats["yaw_span_deg"]
+    assert 29.0 < span < 30.0, span
+    assert rc == 3 and not summary["ok"] and summary["status"] == "AXES-UNPROVEN", summary
+    assert stats["proven_live"] and not stats["axes_yaw_proven"]
+    assert "AXES-UNPROVEN" in text
+    print("29.5° turn is axes UNPROVEN")
+
+
+def check_exact_30_deg_span_is_proven() -> None:
+    """Exactly 30.0° on a proven segment counts as axes proven (Y3: >= → >)."""
+    seg = {
+        "ticks": 14,
+        "moved_m": 65.0,
+        "box_nonnull": 1.0,
+        "max_ctr_pos_m": 0.7,
+        "ctr_span_m": 65.0,
+        "n_box": 14,
+        "n_moving_boxed": 11,
+        "moving": True,
+        "spawn_stuck": False,
+        "axes_stuck": False,
+        "unproven": False,
+        "yaw_span_deg": 30.0,
+        "proven_live": True,
+    }
+    merged = ctb._merge_stats([seg])
+    assert merged["yaw_span_deg"] == 30.0
+    assert repr(merged["yaw_span_deg"]) == "30.0"
+    assert merged["axes_yaw_proven"] is True
+    just_under = dict(seg, yaw_span_deg=29.5)
+    assert ctb._merge_stats([just_under])["axes_yaw_proven"] is False
+    print("exact 30.0° span is axes proven")
+
+
 def check_turning_car_axes_proven() -> None:
     """A live box on a >=30° turn must report axes proven."""
     poses: list[tuple[tuple[float, float, float], float]] = []
@@ -1026,6 +1083,8 @@ def main() -> None:
     check_unboxed_turn_does_not_prove_axes()
     check_flipped_axes_live_turning_passes()
     check_flipped_crosswise_box_is_axes_stuck()
+    check_turn_29_5_deg_axes_unproven()
+    check_exact_30_deg_span_is_proven()
     check_turning_car_axes_proven()
     check_unusable_half_on_moving_sample_is_spawn_stuck()
     check_predicates_locked()

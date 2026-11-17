@@ -20,3 +20,7 @@ models/*.onnx
 models/*.pt
 !models/.gitkeep
 !models/yolov8n.onnx
+
+# property-test / mutation-test working dirs
+.hypothesis/
+mutants/

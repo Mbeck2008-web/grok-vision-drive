@@ -35,7 +35,7 @@ from python.data.occ_shards import ShardWriter  # noqa: E402
 from python.perception.occ_geometry import DEFAULT_GRID, project, rig_cams  # noqa: E402
 from python.perception.occ_sparse import LEVELS, SparseOccNet, _capped_hot, visible_mask  # noqa: E402
 from python.train.occ_labels import build_occ_labels  # noqa: E402
-from python.train.occ_train import prep_image, sample_queries, train  # noqa: E402
+from python.train.occ_train import _class_balance, _unoccupied_points, prep_image, sample_queries, train  # noqa: E402
 from synthetic_occ import SEM_CLASSES, render  # noqa: E402
 
 CFG = yaml.safe_load((ROOT / "config" / "cameras.yaml").read_text(encoding="utf-8"))
@@ -184,7 +184,11 @@ def check_overfit(tmp: Path) -> None:
     net.decode_unseen = False  # camera-only labels here: unseen cells were never supervised (unseen decode: test_occ_unseen)
     imgs = [torch.from_numpy(prep_image(render(full[c.cam_id].scaled(128))[2], c)).unsqueeze(0) for c in cams]
     net.reset_temporal()
-    for _ in range(3):  # capped top stage (2048 of the visible coarse cells): let the sweep + hot carry settle
+    # Capped top stage (2048 of the visible coarse cells). check_sparse_predict
+    # needs 7 frames to sweep all 5044 visible coarse cells; 3 frames left the
+    # observed-cell IoU platform-dependent (0.515 / 14,022 queries on CI vs
+    # 0.722 / 20,517 locally). Run a full sweep, still under the 0.25 dense cap.
+    for _ in range(8):
         pred = net.predict(imgs)
     lab = build_occ_labels({c: render(full[c].scaled(128))[:2] for c in ids}, {c: full[c].scaled(128) for c in ids},
                            sem_classes=SEM_CLASSES, stride=1)
@@ -232,12 +236,100 @@ def check_capped_hot_spreads() -> None:
     print(f"capped_hot: cap={cap} field/road {n_field}/{n_road}; ground+posts upper kept {n_up} OK")
 
 
+def check_capped_hot_below_ground() -> None:
+    """Skeptic probe: a hot below-ground fill must not starve above-ground structure."""
+    f = 2
+    cm = G.voxel_m * f
+    xs = G.x_min + cm * (np.arange(64) + 0.5)
+    ys = G.y_min + cm * (np.arange(80) + 0.5)
+    X, Y = np.meshgrid(xs, ys, indexing="ij")
+    X, Y = X.ravel(), Y.ravel()
+    gz = G.z_min + cm * 2.5  # ground layer index 2 at the 2x stage
+
+    def layer(z, mask=None):
+        m = np.ones_like(X, bool) if mask is None else mask
+        return np.stack([X[m], Y[m], np.full(int(m.sum()), z)], 1)
+
+    bld = ((np.abs(X) > 8) & (np.abs(X) < 14) & (Y > 0) & (Y < 45)) | ((X > -4) & (X < 4) & (Y > 35) & (Y < 40))
+    rng = np.random.default_rng(0)
+    for p_bg, p_st in ((0.9, 0.7), (0.6, 0.7), (0.0, 0.7)):
+        parts = [(layer(gz), 0.95, "ground")]
+        if p_bg > 0:
+            parts += [(layer(G.z_min + cm * 0.5), p_bg, "below"), (layer(G.z_min + cm * 1.5), p_bg, "below")]
+        parts += [(layer(gz + cm * k, bld), p_st, "struct") for k in (1, 2, 3, 4)]
+        hot = np.concatenate([p[0] for p in parts])
+        ph = np.concatenate([np.full(len(p[0]), p[1]) + rng.normal(0, 0.01, len(p[0])) for p in parts])
+        lab = np.concatenate([[p[2]] * len(p[0]) for p in parts])
+        idx = _capped_hot(hot, ph, 2048, G.z_min, cm)
+        n_struct = int((lab[idx] == "struct").sum())
+        assert idx.size <= 2048, idx.size
+        assert n_struct > 0, (p_bg, n_struct, dict(zip(*np.unique(lab[idx], return_counts=True))))
+        print(f"capped_hot below-ground p={p_bg}: structure kept {n_struct} / cap 2048 OK")
+
+
+def check_class_balance() -> None:
+    """_class_balance splits evenly across classes; a 99:1 pool must not stay 99:1."""
+    rng = np.random.default_rng(0)
+    cls = np.concatenate([np.zeros(990, np.int64), np.ones(10, np.int64)])
+    idxs = np.arange(cls.size)
+    # 20 independent draws of 100: balanced should land near 50/50; off (uniform) ~1
+    minority = []
+    for i in range(20):
+        pick = _class_balance(idxs, cls, np.random.default_rng(i), 100)
+        minority.append(int((cls[pick] == 1).sum()))
+    assert min(minority) >= 30, minority  # 50/50 with 10 available, resampled
+    # single-class pool still returns n indices (and must not ZeroDivisionError)
+    one = _class_balance(np.arange(8), np.zeros(8, np.int64), rng, 5)
+    assert one.size == 5
+    print(f"class_balance: minority counts in 20 draws of 100 from 99:1 {min(minority)}-{max(minority)} OK")
+
+
+def check_unoccupied_not_occluded_structure() -> None:
+    """Free unoccupied samples must not sit in occluded above-ground structure (not in keys)."""
+    rng = np.random.default_rng(0)
+    # occupied: a full ground layer at z cell 5 (~0.2 m) plus a few visible upper posts
+    nx, ny, nz = G.shape
+    gz = 5
+    ix, iy = np.meshgrid(np.arange(nx), np.arange(ny), indexing="ij")
+    ground = G.key_of_cell(np.stack([ix.ravel(), iy.ravel(), np.full(ix.size, gz)], 1))
+    posts = G.keys_of(np.stack([np.linspace(-5, 5, 20), np.full(20, 15.0), np.full(20, 3.0)], 1))
+    posts = posts[posts >= 0]
+    keys = np.unique(np.concatenate([ground, posts]))
+    cls = np.zeros(keys.size, np.uint8)
+    # planted occluded structure above ground, NOT in keys
+    hidden = G.keys_of(np.stack([np.linspace(8, 12, 40), np.full(40, 20.0), np.full(40, 2.5)], 1))
+    hidden = hidden[(hidden >= 0) & (~np.isin(hidden, keys))]
+    assert hidden.size >= 10, hidden.size
+    free = np.zeros((0, 3), np.float64)
+    q = sample_queries(keys, cls, free, rng, n_occ=50, n_free=80, n_coarse=0)
+    free_m = (q["occ"] == 0) & (q["occ_w"] == 1)
+    free_pts = q["pts"][free_m].astype(np.float64)
+    free_k = G.keys_of(free_pts)
+    assert not np.isin(free_k, hidden).any(), int(np.isin(free_k, hidden).sum())
+    # and we actually sampled below-ground unoccupied centres (kills n_empty=0)
+    zc = G.cell_of(free_pts)[:, 2] if free_pts.size else np.zeros(0, np.int64)
+    n_below = int((zc < gz).sum()) if free_pts.size else 0
+    assert n_below >= 20, n_below
+    # none of the free samples are above the ground layer
+    assert not (zc > gz).any(), int((zc > gz).sum())
+    print(f"unoccupied free: {n_below} below-ground, 0 in planted occluded structure, 0 above ground OK")
+
+
 def main() -> int:
-    torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
+    # pin to 1: CI runners and this box disagree on thread count, and the
+    # overfit predict IoU was 0.515 / 14,022 queries on CI vs 0.722 / 20,517 here.
+    torch.set_num_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
     check_projection()
     check_camera_only()
     check_sparse_predict()
     check_capped_hot_spreads()
+    check_capped_hot_below_ground()
+    check_class_balance()
+    check_unoccupied_not_occluded_structure()
     check_queries()
     with tempfile.TemporaryDirectory() as d:
         check_overfit(Path(d))

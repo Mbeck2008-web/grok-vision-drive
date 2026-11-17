@@ -123,6 +123,8 @@ SOURCES = ("spawn", "recheck")
 TRAFFIC_AHEAD_M = 60.0
 TRAFFIC_BEHIND_M = 40.0
 TRAFFIC_MIN_M = 8.0
+# Extra cars past the first ahead/behind pair, along the road, metres.
+TRAFFIC_SPACING_M = 25.0
 # Legal-lane search. The first fraction is the historical 40% station.
 LEGAL_FRACTIONS = (0.40, 0.30, 0.50, 0.22, 0.62)
 LEGAL_ATTEMPTS = 8
@@ -1554,18 +1556,30 @@ class SpawnDeck:
         ahead_m: float = TRAFFIC_AHEAD_M,
         behind_m: float = TRAFFIC_BEHIND_M,
     ) -> tuple[list[tuple[str, tuple[float, float, float], tuple[float, float, float, float], float]], list[str]]:
-        """Companion-car poses along the road: slot 0 ``ahead_m`` ahead, slot 1 ``behind_m`` behind.
+        """Companion-car poses along the road.
 
-        Returns ``([(where, pos, rot, along_m)], notes)``. A slot the walk
-        cannot reach uses the farthest point reached (a note says so); under
-        TRAFFIC_MIN_M, or with no road, the slot is dropped (also noted).
-        Both cars face the direction of travel.
+        Slot 0 is ``ahead_m`` ahead, slot 1 is ``behind_m`` behind (same as
+        before). Further cars alternate ahead and behind at ``TRAFFIC_SPACING_M``
+        steps past those distances. Returns ``([(where, pos, rot, along_m)],
+        notes)``. A slot the walk cannot reach uses the farthest point
+        reached (a note says so); under TRAFFIC_MIN_M, or with no road, the
+        slot is dropped (also noted). Cars face the direction of travel.
         """
         road = self._by_id.get(str(pick.road_id))
         _qx, _qy, qz, qw = pick.rot
         yaw = math.atan2(2.0 * qw * qz, 1.0 - 2.0 * qz * qz)
         hx, hy = math.cos(yaw), math.sin(yaw)
-        wants = [("ahead", float(ahead_m), False), ("behind", float(behind_m), True)][: max(0, int(count))]
+        wants: list[tuple[str, float, bool]] = []
+        for slot in range(max(0, int(count))):
+            k = slot // 2
+            if slot % 2 == 0:
+                where = "ahead" if k == 0 else f"ahead_{k + 1}"
+                dist = float(ahead_m) + k * TRAFFIC_SPACING_M
+                wants.append((where, dist, False))
+            else:
+                where = "behind" if k == 0 else f"behind_{k + 1}"
+                dist = float(behind_m) + k * TRAFFIC_SPACING_M
+                wants.append((where, dist, True))
         slots: list[tuple[str, tuple[float, float, float], tuple[float, float, float, float], float]] = []
         notes: list[str] = []
         for where, want, back in wants:
@@ -1747,9 +1761,9 @@ def traffic_lua(pick: SpawnPick, count: int, slots: list[Any] | None = None) -> 
     """GE Lua that replaces the companion cars ahead of and behind the ego.
 
     ``slots`` (from ``SpawnDeck.traffic_slots``) gives each car's pose along
-    the road; without it the cars go 28 m ahead and 22 m behind on the
-    spawn tangent. The player vehicle is not deleted and is not switched into
-    traffic mode.
+    the road; without it the first two cars go 28 m ahead and 22 m behind
+    on the spawn tangent, and further cars step by ``TRAFFIC_SPACING_M``.
+    The player vehicle is not deleted and is not switched into traffic mode.
     """
     if count <= 0:
         return []
@@ -1761,7 +1775,6 @@ def traffic_lua(pick: SpawnPick, count: int, slots: list[Any] | None = None) -> 
     # BeamNG yaw-from-dir used atan2(dy, dx), so the road tangent is that heading.
     dx = math.cos(yaw)
     dy = math.sin(yaw)
-    offsets = (28.0, -22.0)
     lines = [
         "local player = be:getPlayerVehicle(0)",
         "for i = be:getObjectCount() - 1, 0, -1 do",
@@ -1779,8 +1792,12 @@ def traffic_lua(pick: SpawnPick, count: int, slots: list[Any] | None = None) -> 
     if slots is not None:
         poses = [(tuple(item[1]), tuple(item[2])) for item in slots][: int(count)]
     else:
-        for slot in range(min(int(count), len(offsets))):
-            dist = offsets[slot]
+        for slot in range(max(0, int(count))):
+            k = slot // 2
+            if slot % 2 == 0:
+                dist = 28.0 + k * TRAFFIC_SPACING_M
+            else:
+                dist = -(22.0 + k * TRAFFIC_SPACING_M)
             poses.append(((x0 + dx * dist, y0 + dy * dist, z0), tuple(pick.rot)))
     for slot, ((x, y, z), (qx, qy, qz, qw)) in enumerate(poses):
         name = f"gvd_traffic_{slot}"

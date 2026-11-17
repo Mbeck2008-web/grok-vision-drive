@@ -434,6 +434,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument("--viz-fullscreen", action="store_true", help="Fullscreen GVD VISION on chosen monitor")
     ap.add_argument(
+        "--viz-style",
+        default="early",
+        choices=("legacy", "early"),
+        help="Stage look. early (default): black field, dotted lanes, wire boxes. "
+        "legacy: the ice-ribbon cabin.",
+    )
+    ap.add_argument(
+        "--viz-overlay",
+        action="store_true",
+        help="Draw the vector scene on the main camera and add a speed bar.",
+    )
+    ap.add_argument(
+        "--viz-debug",
+        action="store_true",
+        help="Open the multi-panel debug board. Off by default. Key b toggles it.",
+    )
+    ap.add_argument(
+        "--viz-showcase",
+        action="store_true",
+        help="Clean full-frame vector stage for a share-ready view. No nerd panel.",
+    )
+    ap.add_argument(
+        "--viz-showcase-layout",
+        default="full",
+        choices=("full", "split", "pip"),
+        help="Showcase layout: full vector, camera|vector split, or vector with a camera inset.",
+    )
+    ap.add_argument(
+        "--viz-preset",
+        default="stage",
+        choices=("stage", "square", "story", "wide"),
+        help="Showcase size. stage is 1280x800. square 1080x1080, story 1080x1920, wide 1920x1080.",
+    )
+    ap.add_argument(
         "--tech-probe",
         action="store_true",
         help="Connect to BeamNG.tech, poll vehicle electrics/pose/damage, exit. No fake cameras.",
@@ -797,6 +831,12 @@ def main(clock=None) -> None:
     perc = ModularPerception(allow_synthetic=args.allow_synthetic_detect, clock=clock)
     e2e_policy = make_e2e()
     ui = VizUI()
+    ui.style = str(getattr(args, "viz_style", "early") or "early")
+    ui.overlay = bool(getattr(args, "viz_overlay", False))
+    ui.debug_board = bool(getattr(args, "viz_debug", False))
+    ui.showcase = bool(getattr(args, "viz_showcase", False))
+    ui.showcase_layout = str(getattr(args, "viz_showcase_layout", "full") or "full")
+    ui.showcase_preset = str(getattr(args, "viz_preset", "stage") or "stage")
     ui.record_browser = _ask_strip_folder
     ui.debug.detector_id = str(args.detector or "auto")
     ui.debug.e2e_id = str(args.e2e_model or "auto")
@@ -2133,12 +2173,19 @@ def main(clock=None) -> None:
                 # Reuse this tick's bus check. A second bus_identity() would
                 # move the clock seam the retail tests count.
                 paint = st if ident.matched else load_paint_state()
+                stage_w, stage_h = STAGE_W, STAGE_H
+                if ui.showcase:
+                    from python.viz.showcase import preset_size
+
+                    stage_w, stage_h = preset_size(ui.showcase_preset)
                 stage_frame = render_stage(
                     paint,
                     ui=ui,
                     main_frame=main,
                     cam_frames=getattr(bundle, "frames", None),
                     dets=getattr(pout, "dets", None),
+                    width=stage_w,
+                    height=stage_h,
                 )
                 st["viz_ms"] = float(paint.get("viz_ms") or 0.0)
             age_window.add(frame_age_ms)

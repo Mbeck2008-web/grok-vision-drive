@@ -24,9 +24,10 @@ displacement from that segment's first ``pos`` is greater than ``MOVE_M``):
   all passing both tests, and no violating sample in any segment. A later
   short segment does not undo a proven one.
 * Axes are reported live only if the yaw span across the proven segment's
-  moving boxed samples is at least ``MIN_YAW_SPAN_DEG``. A shorter span
-  is printed as axes UNPROVEN; the recording may still PASS and the long
-  run may proceed, but the report must not claim those axes are live.
+  moving boxed samples is at least ``MIN_YAW_SPAN_DEG``. LIVE / exit 0
+  requires at least one such car. If every live car has a shorter span,
+  the script prints status ``AXES-UNPROVEN`` and exits 3; do not start
+  the long run, and do not claim those axes are live.
 
 If the box is spawn-stuck or axes stay at spawn: keep only ``half`` and
 build ``ctr`` / ``ax`` from live ``pos`` / ``dir`` / ``up``, or switch the
@@ -374,6 +375,9 @@ def summarize(rows: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     elif not proven:
         status = "UNPROVEN"
         ok = False
+    elif not any(cars[n]["axes_yaw_proven"] for n in proven):
+        status = "AXES-UNPROVEN"
+        ok = False
     else:
         status = "LIVE"
         ok = True
@@ -459,6 +463,21 @@ def format_report(summary: Mapping[str, Any], source: str) -> str:
             "decides this; do not assume it from the Lua name. "
             f"{proceed}"
         )
+    elif summary["status"] == "AXES-UNPROVEN":
+        names = ", ".join(
+            name
+            for name, st in cars.items()
+            if st["proven_live"] and not st["axes_yaw_proven"]
+        )
+        who = f" ({names})" if names else ""
+        lines.append(
+            f"FAIL: status AXES-UNPROVEN.{who} "
+            f"No {NAME_PREFIX}* car had yaw span >= {MIN_YAW_SPAN_DEG:g}° "
+            "on a proven segment's moving boxed samples. Do not start the "
+            "long run. Do not claim those axes are live. Keep only half "
+            "and build ctr/ax from pos/dir/up, or switch to a live OOBB "
+            "call, then re-smoke."
+        )
     elif summary["stuck"]:
         names = ", ".join(summary["stuck"])
         lines.append(
@@ -507,7 +526,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     summary = summarize(rows)
     print(format_report(summary, str(state)))
-    return 0 if summary["ok"] else 1
+    if summary["ok"]:
+        return 0
+    return 3 if summary["status"] == "AXES-UNPROVEN" else 1
 
 
 if __name__ == "__main__":

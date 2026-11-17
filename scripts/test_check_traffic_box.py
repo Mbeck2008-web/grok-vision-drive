@@ -94,6 +94,110 @@ def _path(
     return [(start[0], start[1] + i * step, start[2]) for i in range(n)]
 
 
+def _turning_companion(i: int, name: str = "gvd_traffic_axes") -> dict:
+    """Live boxed sample i of a car that turns 30° after 20 m.
+
+    Within nine samples this yields >= MIN_MOVING_BOXED moving boxed
+    points whose yaw span is 30°, so a straight-only companion can
+    still let a LIVE test exit 0 under the axes-proven gate.
+    """
+    start = (200.0, 0.0, 0.5)
+    step = 5.0
+    turn_from = 4
+    x, y, z = start
+    for k in range(i):
+        yw = 0.0 if k < turn_from else math.radians(30.0)
+        x += step * math.sin(yw)
+        y += step * math.cos(yw)
+    yaw = 0.0 if i < turn_from else math.radians(30.0)
+    pos = (x, y, z)
+    direction, up, ax = _orient(yaw)
+    return _car(name, pos, _box(_live_ctr(pos), ax=ax), direction=direction, up=up)
+
+
+def _add_axes_companion(ticks: list) -> list:
+    present = 0
+    out = []
+    for cars in ticks:
+        if cars is None:
+            out.append(None)
+            continue
+        out.append(list(cars) + [_turning_companion(present)])
+        present += 1
+    return out
+
+
+def _add_axes_companion_rows(rows: list[dict]) -> list[dict]:
+    present = 0
+    out = []
+    for row in rows:
+        r = dict(row)
+        traffic = r.get("traffic")
+        if isinstance(traffic, list):
+            r["traffic"] = list(traffic) + [_turning_companion(present)]
+            present += 1
+        out.append(r)
+    return out
+
+
+def _straight_then_turn_poses(
+    straight_m: float = 40.0,
+    step: float = 5.0,
+    turn_deg: float = 30.0,
+    turn_n: int = 8,
+    start: tuple[float, float, float] = (0.0, 0.0, 0.5),
+) -> list[tuple[tuple[float, float, float], float]]:
+    poses: list[tuple[tuple[float, float, float], float]] = []
+    x, y, z = start
+    yaw = 0.0
+    dist = 0.0
+    while dist <= straight_m + 1e-9:
+        poses.append(((x, y, z), yaw))
+        x += step * math.sin(yaw)
+        y += step * math.cos(yaw)
+        dist += step
+    yaw = math.radians(turn_deg)
+    for _ in range(turn_n):
+        x += step * math.sin(yaw)
+        y += step * math.cos(yaw)
+        poses.append(((x, y, z), yaw))
+    return poses
+
+
+def _ticks_from_poses(
+    poses: list[tuple[tuple[float, float, float], float]],
+    *,
+    name: str = "gvd_traffic_0",
+    flip_ax: bool = False,
+    half: list | None = None,
+    boxed: bool | list[bool] | None = None,
+) -> list:
+    ticks = []
+    for i, (pos, yaw) in enumerate(poses):
+        direction, up, ax = _orient(yaw)
+        if flip_ax:
+            ax = [[-c for c in a] for a in ax]
+        has_box = True if boxed is None else (boxed if isinstance(boxed, bool) else boxed[i])
+        box = _box(_live_ctr(pos), ax=ax, half=half) if has_box else None
+        ticks.append([_car(name, pos, box, direction=direction, up=up)])
+    return ticks
+
+
+def _run_ticks(ticks: list, extras: list | None = None) -> tuple[int, dict, str]:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _write(root, ticks, extras)
+        rc = ctb.main([str(root)])
+        summary = ctb.summarize(ctb.load_state(root / "state.jsonl"))
+        text = ctb.format_report(summary, "synthetic")
+        return rc, summary, text
+
+
+
+def _dist_from(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
+    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2) ** 0.5
+
+
 def check_live_box_passes() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -111,7 +215,7 @@ def check_live_box_passes() -> None:
                 ticks.append(None)
                 continue
             ticks.append([_car("gvd_traffic_0", pos, _box(_live_ctr(pos)))])
-        _write(root, ticks)
+        _write(root, _add_axes_companion(ticks))
         assert ctb.main([str(root)]) == 0
         summary = ctb.summarize(ctb.load_state(ctb.resolve_state(root)))
         stats = summary["cars"]["gvd_traffic_0"]
@@ -227,7 +331,7 @@ def check_two_spawn_live_box_passes() -> None:
                     row["veh_meta"] = {"model": "etk800"}
                 rows.append(row)
                 i += 1
-        _write_rows(root, rows)
+        _write_rows(root, _add_axes_companion_rows(rows))
         assert ctb.main([str(root)]) == 0
         summary = ctb.summarize(ctb.load_state(root / "state.jsonl"))
         stats = summary["cars"]["gvd_traffic_0"]
@@ -311,7 +415,7 @@ def check_ignores_non_companion_and_accepts_state_file() -> None:
                 _car("gvd_traffic_0", pos, _box(_live_ctr(pos))),
                 _car("parked_bus", (0.0, 0.0, 0.5), _box((0.0, 0.0, 0.8))),
             ])
-        state = _write(root, ticks)
+        state = _write(root, _add_axes_companion(ticks))
         assert ctb.main([str(state)]) == 0
         summary = ctb.summarize(ctb.load_state(state))
         assert "parked_bus" not in summary["cars"]
@@ -511,7 +615,7 @@ def check_ctr_within_axis_slack_passes() -> None:
         for pos in _path():
             ctr = (pos[0] + off, pos[1], pos[2])
             ticks.append([_car("gvd_traffic_0", pos, _box(ctr))])
-        _write(root, ticks)
+        _write(root, _add_axes_companion(ticks))
         assert ctb.main([str(root)]) == 0
         summary = ctb.summarize(ctb.load_state(root / "state.jsonl"))
         stats = summary["cars"]["gvd_traffic_0"]
@@ -554,7 +658,7 @@ def check_exactly_6_moving_boxed_passes() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         ticks = [[_car("gvd_traffic_0", pos, _box(_live_ctr(pos)))] for pos in poses]
-        _write(root, ticks)
+        _write(root, _add_axes_companion(ticks))
         assert ctb.main([str(root)]) == 0
         summary = ctb.summarize(ctb.load_state(root / "state.jsonl"))
         stats = summary["cars"]["gvd_traffic_0"]
@@ -591,7 +695,7 @@ def check_proven_segment_plus_short_tail_passes() -> None:
         i += 1
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        _write_rows(root, rows)
+        _write_rows(root, _add_axes_companion_rows(rows))
         assert ctb.main([str(root)]) == 0
         loaded = ctb.load_state(root / "state.jsonl")
         summary = ctb.summarize(loaded)
@@ -631,26 +735,159 @@ def check_ctr_1_3m_above_car_fails() -> None:
 
 
 def check_straight_only_axes_unproven() -> None:
-    """A straight-only live box must PASS with axes UNPROVEN (yaw span < 30°)."""
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
-        ticks = [[_car("gvd_traffic_0", pos, _box(_live_ctr(pos)))] for pos in _path()]
-        _write(root, ticks)
-        assert ctb.main([str(root)]) == 0
-        summary = ctb.summarize(ctb.load_state(root / "state.jsonl"))
-        stats = summary["cars"]["gvd_traffic_0"]
-        assert summary["ok"] and summary["status"] == "LIVE", summary
+    """A7: one straight live car must exit 3 with status AXES-UNPROVEN."""
+    ticks = [[_car("gvd_traffic_0", pos, _box(_live_ctr(pos)))] for pos in _path()]
+    rc, summary, text = _run_ticks(ticks)
+    stats = summary["cars"]["gvd_traffic_0"]
+    assert rc == 3 and not summary["ok"] and summary["status"] == "AXES-UNPROVEN", summary
+    assert stats["proven_live"] and not stats["axes_yaw_proven"]
+    assert stats["yaw_span_deg"] < ctb.MIN_YAW_SPAN_DEG
+    assert "yaw_span_deg=" in text
+    assert "LIVE, axes UNPROVEN" in text
+    assert "status AXES-UNPROVEN" in text
+    assert "Do not claim those axes are live" in text
+    assert "Do not start the long run" in text
+    assert "PASS:" not in text
+    assert "Long run may proceed" not in text
+    print("straight-only axes UNPROVEN exits 3")
+
+
+def check_two_straight_cars_axes_unproven() -> None:
+    """C10: two straight live cars must exit 3 with status AXES-UNPROVEN."""
+    ticks = []
+    for pos0, pos1 in zip(_path(), _path(start=(20.0, 0.0, 0.5))):
+        ticks.append([
+            _car("gvd_traffic_0", pos0, _box(_live_ctr(pos0))),
+            _car("gvd_traffic_1", pos1, _box(_live_ctr(pos1))),
+        ])
+    rc, summary, text = _run_ticks(ticks)
+    assert rc == 3 and not summary["ok"] and summary["status"] == "AXES-UNPROVEN", summary
+    for name in ("gvd_traffic_0", "gvd_traffic_1"):
+        stats = summary["cars"][name]
         assert stats["proven_live"] and not stats["axes_yaw_proven"]
         assert stats["yaw_span_deg"] < ctb.MIN_YAW_SPAN_DEG
-        text = ctb.format_report(summary, "synthetic")
-        assert "yaw_span_deg=" in text
-        assert "LIVE, axes UNPROVEN" in text
-        assert "Axes are UNPROVEN" in text
-        assert "do not claim axes are live" in text
-        assert "Long run may proceed on this evidence; axes are unproven for gvd_traffic_0" in text
-        assert "do not claim axes are live" in text
-        assert "yaw span >= " not in text
-    print("straight-only axes UNPROVEN")
+    assert "status AXES-UNPROVEN" in text
+    assert "Do not start the long run" in text
+    assert "PASS:" not in text
+    print("two straight cars axes UNPROVEN exits 3")
+
+
+def check_turn_only_inside_first_10m_axes_unproven() -> None:
+    """Y12: a heading change only inside the first MOVE_M must not prove axes."""
+    poses: list[tuple[tuple[float, float, float], float]] = []
+    x, y, z = 0.0, 0.0, 0.5
+    yaws = [0.0] + [math.radians(40.0)] * (LIVE_N - 1)
+    for yaw in yaws:
+        poses.append(((x, y, z), yaw))
+        x += 5.0 * math.sin(yaw)
+        y += 5.0 * math.cos(yaw)
+    # The first 40° sample is still inside MOVE_M; first moving sample is at 40°.
+    first_turn = poses[1][0]
+    assert _dist_from(poses[0][0], first_turn) < ctb.MOVE_M
+    rc, summary, text = _run_ticks(_ticks_from_poses(poses))
+    stats = summary["cars"]["gvd_traffic_0"]
+    assert rc == 3 and summary["status"] == "AXES-UNPROVEN", summary
+    assert stats["proven_live"] and not stats["axes_yaw_proven"]
+    assert stats["yaw_span_deg"] < ctb.MIN_YAW_SPAN_DEG
+    assert "AXES-UNPROVEN" in text
+    print("turn only inside first 10 m is axes UNPROVEN")
+
+
+def check_short_turning_tail_does_not_prove_axes() -> None:
+    """Y7: yaw span on a non-proven respawn tail must not prove axes."""
+    rows: list[dict] = []
+    i = 0
+    for pos in _path():
+        rows.append({
+            "i": i,
+            "t": i * 0.5,
+            "traffic": [_car("gvd_traffic_0", pos, _box(_live_ctr(pos)))],
+        })
+        i += 1
+    # Short tail: 8 samples, 5 moving boxed, headings 0° then 35°.
+    # n_moving_boxed < MIN_MOVING_BOXED, but yaw span of those samples is 35°.
+    start = (0.0, 20.0, 0.5)
+    step = 5.0
+    turn_from = 5
+    x, y, z = start
+    for k in range(8):
+        yaw = 0.0 if k < turn_from else math.radians(35.0)
+        pos = (x, y, z)
+        direction, up, ax = _orient(yaw)
+        row = {
+            "i": i,
+            "t": i * 0.5,
+            "traffic": [_car(
+                "gvd_traffic_0", pos, _box(_live_ctr(pos), ax=ax),
+                direction=direction, up=up,
+            )],
+        }
+        if k == 0:
+            row["veh_meta"] = {"model": "etk800"}
+        rows.append(row)
+        yw = 0.0 if k < turn_from else math.radians(35.0)
+        x += step * math.sin(yw)
+        y += step * math.cos(yw)
+        i += 1
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _write_rows(root, rows)
+        rc = ctb.main([str(root)])
+        loaded = ctb.load_state(root / "state.jsonl")
+        summary = ctb.summarize(loaded)
+        stats = summary["cars"]["gvd_traffic_0"]
+        by_name, _, _ = ctb.split_segments(loaded)
+        segs = [ctb._segment_stats(s) for s in by_name["gvd_traffic_0"]]
+        assert len(segs) == 2
+        assert segs[0]["proven_live"] and segs[0]["yaw_span_deg"] < ctb.MIN_YAW_SPAN_DEG
+        assert not segs[1]["proven_live"]
+        assert segs[1]["n_moving_boxed"] < ctb.MIN_MOVING_BOXED
+        assert segs[1]["yaw_span_deg"] >= ctb.MIN_YAW_SPAN_DEG
+        assert rc == 3 and summary["status"] == "AXES-UNPROVEN", summary
+        assert stats["proven_live"] and not stats["axes_yaw_proven"]
+    print("short turning tail does not prove axes")
+
+
+def check_unboxed_turn_does_not_prove_axes() -> None:
+    """Y11: yaw from unboxed moving samples must not prove axes."""
+    poses = _straight_then_turn_poses(turn_deg=40.0)
+    boxed = [yaw == 0.0 for (_pos, yaw) in poses]
+    assert any(boxed) and not all(boxed)
+    assert all(boxed[i] for i, (_p, yaw) in enumerate(poses) if yaw == 0.0)
+    assert not any(boxed[i] for i, (_p, yaw) in enumerate(poses) if yaw != 0.0)
+    rc, summary, text = _run_ticks(_ticks_from_poses(poses, boxed=boxed))
+    stats = summary["cars"]["gvd_traffic_0"]
+    assert rc == 3 and summary["status"] == "AXES-UNPROVEN", summary
+    assert stats["proven_live"] and not stats["axes_yaw_proven"]
+    assert stats["yaw_span_deg"] < ctb.MIN_YAW_SPAN_DEG
+    assert "AXES-UNPROVEN" in text
+    print("unboxed turn does not prove axes")
+
+
+def check_flipped_axes_live_turning_passes() -> None:
+    """A5/A5b: a live turning box with axes opposite dir/up is still LIVE."""
+    poses = _straight_then_turn_poses(turn_deg=40.0)
+    rc, summary, text = _run_ticks(_ticks_from_poses(poses, flip_ax=True))
+    stats = summary["cars"]["gvd_traffic_0"]
+    assert rc == 0 and summary["ok"] and summary["status"] == "LIVE", summary
+    assert stats["proven_live"] and stats["axes_yaw_proven"]
+    assert stats["yaw_span_deg"] >= ctb.MIN_YAW_SPAN_DEG
+    assert "AXES-STUCK" not in text
+    print("flipped live turning box is LIVE")
+
+
+def check_flipped_crosswise_box_is_axes_stuck() -> None:
+    """A5c: flipped axes with the long half across the car are AXES-STUCK."""
+    poses = _straight_then_turn_poses(turn_deg=40.0)
+    across = [HALF[1], HALF[0], HALF[2]]
+    rc, summary, text = _run_ticks(
+        _ticks_from_poses(poses, flip_ax=True, half=across)
+    )
+    stats = summary["cars"]["gvd_traffic_0"]
+    assert rc == 1 and not summary["ok"] and summary["status"] == "AXES-STUCK", summary
+    assert stats["axes_stuck"] and not stats["spawn_stuck"]
+    assert "AXES-STUCK" in text
+    print("flipped crosswise box is AXES-STUCK")
 
 
 def check_turning_car_axes_proven() -> None:
@@ -735,6 +972,8 @@ def check_predicates_locked() -> None:
     assert "MIN_YAW_SPAN_DEG = 30.0" in src
     assert 's["yaw_span_deg"] >= MIN_YAW_SPAN_DEG' in src
     assert "LIVE, axes UNPROVEN" in src
+    assert 'status = "AXES-UNPROVEN"' in src
+    assert 'return 3 if summary["status"] == "AXES-UNPROVEN" else 1' in src
     assert "if paired is None:\n        return True" in src
     assert '_dist(pos, last_pos[name]) > JUMP_M' in src
     assert 'if "veh_meta" in row:' in src
@@ -781,6 +1020,12 @@ def main() -> None:
     check_proven_segment_plus_short_tail_passes()
     check_ctr_1_3m_above_car_fails()
     check_straight_only_axes_unproven()
+    check_two_straight_cars_axes_unproven()
+    check_turn_only_inside_first_10m_axes_unproven()
+    check_short_turning_tail_does_not_prove_axes()
+    check_unboxed_turn_does_not_prove_axes()
+    check_flipped_axes_live_turning_passes()
+    check_flipped_crosswise_box_is_axes_stuck()
     check_turning_car_axes_proven()
     check_unusable_half_on_moving_sample_is_spawn_stuck()
     check_predicates_locked()

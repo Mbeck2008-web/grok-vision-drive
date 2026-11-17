@@ -15,7 +15,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import check_traffic_box as ctb  # noqa: E402
 
 
-HALF = [2.2, 1.0, 0.7]
+# half[i] pairs with AX[i] = [right, dir, up]: width, length, height.
+HALF = [1.0, 2.2, 0.7]
 AX = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
 # A small, stable origin-to-centre offset (live box, not spawn).
 CTR_OFFSET = (0.3, -0.4, 0.5)
@@ -23,8 +24,16 @@ CTR_OFFSET = (0.3, -0.4, 0.5)
 LIVE_N = 14
 
 
-def _box(ctr: tuple[float, float, float], ax: list | None = None) -> dict:
-    return {"ctr": [ctr[0], ctr[1], ctr[2]], "half": list(HALF), "ax": [list(a) for a in (ax or AX)]}
+def _box(
+    ctr: tuple[float, float, float],
+    ax: list | None = None,
+    half: list | None = None,
+) -> dict:
+    return {
+        "ctr": [ctr[0], ctr[1], ctr[2]],
+        "half": list(half if half is not None else HALF),
+        "ax": [list(a) for a in (ax or AX)],
+    }
 
 
 def _live_ctr(pos: tuple[float, float, float]) -> tuple[float, float, float]:
@@ -136,7 +145,7 @@ def check_spawn_stuck_flagged() -> None:
         text = ctb.format_report(summary, "synthetic")
         assert "SPAWN-STUCK" in text and "Do not start the long run" in text
         assert "Keep only half" in text
-        assert "|box.ctr - pos|" in text
+        assert "|(pos-ctr)·ax_i|" in text
     print("spawn-stuck ctr flagged")
 
 
@@ -412,15 +421,202 @@ def check_turning_car_axes() -> None:
     print("turning-car axes: live passes, frozen fails")
 
 
+
+def check_rolled_box_up_misaligned_fails() -> None:
+    """Car stays level; box rolled 30° about dir must exit 1 (locks the up check)."""
+    roll = math.radians(30.0)
+    c, s = math.cos(roll), math.sin(roll)
+    # Right-handed roll about +Y (dir): right and up tilt, dir stays +Y.
+    ax = [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]]
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        ticks = [
+            [_car("gvd_traffic_0", pos, _box(_live_ctr(pos), ax=ax))]
+            for pos in _path()
+        ]
+        _write(root, ticks)
+        assert ctb.main([str(root)]) == 1
+        summary = ctb.summarize(ctb.load_state(root / "state.jsonl"))
+        stats = summary["cars"]["gvd_traffic_0"]
+        assert summary["status"] == "AXES-STUCK" and not summary["ok"], summary
+        assert stats["axes_stuck"] and not stats["spawn_stuck"]
+        assert stats["n_moving_boxed"] >= ctb.MIN_MOVING_BOXED
+    print("rolled 30° box (level car) fails")
+
+
+def check_frozen_axes_after_exact_90deg_turn_fails() -> None:
+    """Frozen axes after an exact 90° turn must not pass as LIVE."""
+    poses: list[tuple[tuple[float, float, float], float]] = []
+    y = 0.0
+    while y <= 40.0 + 1e-9:
+        poses.append(((0.0, y, 0.5), 0.0))
+        y += 5.0
+    # Turn exactly 90° to +X; identity axes then have ax0 along the new dir.
+    x, y = 0.0, 40.0
+    yaw = math.pi / 2.0
+    for _ in range(8):
+        x += 5.0 * math.sin(yaw)
+        y += 5.0 * math.cos(yaw)
+        poses.append(((x, y, 0.5), yaw))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        ticks = []
+        for pos, yaw in poses:
+            direction, up, _ = _orient(yaw)
+            ticks.append([_car(
+                "gvd_traffic_0", pos, _box(_live_ctr(pos), ax=AX),
+                direction=direction, up=up,
+            )])
+        _write(root, ticks)
+        assert ctb.main([str(root)]) == 1
+        summary = ctb.summarize(ctb.load_state(root / "state.jsonl"))
+        stats = summary["cars"]["gvd_traffic_0"]
+        assert summary["status"] == "AXES-STUCK" and not summary["ok"], summary
+        assert stats["axes_stuck"] and not stats["spawn_stuck"]
+        assert stats["n_moving_boxed"] >= ctb.MIN_MOVING_BOXED
+    print("frozen axes after exact 90° turn fail")
+
+
+def check_box_length_across_car_fails() -> None:
+    """A box whose long half lies across the car (not along dir) must exit 1."""
+    # Swap width/length: ax0 (right) carries 2.2 m, dir only 1.0 m.
+    across = [HALF[1], HALF[0], HALF[2]]
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        ticks = [
+            [_car("gvd_traffic_0", pos, _box(_live_ctr(pos), half=across))]
+            for pos in _path()
+        ]
+        _write(root, ticks)
+        assert ctb.main([str(root)]) == 1
+        summary = ctb.summarize(ctb.load_state(root / "state.jsonl"))
+        stats = summary["cars"]["gvd_traffic_0"]
+        assert summary["status"] == "AXES-STUCK" and not summary["ok"], summary
+        assert stats["axes_stuck"] and not stats["spawn_stuck"]
+        assert stats["n_moving_boxed"] >= ctb.MIN_MOVING_BOXED
+    print("box length across the car fails")
+
+
+def check_ctr_within_axis_slack_passes() -> None:
+    """An offset in (half_i, half_i+slack] along one axis is still LIVE."""
+    # Lateral (right / ax0): half_0=1.0, so 1.5 m is on the inclusive slack edge.
+    off = HALF[0] + ctb.CTR_POS_SLACK_M
+    assert HALF[0] < off <= HALF[0] + ctb.CTR_POS_SLACK_M
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        ticks = []
+        for pos in _path():
+            ctr = (pos[0] + off, pos[1], pos[2])
+            ticks.append([_car("gvd_traffic_0", pos, _box(ctr))])
+        _write(root, ticks)
+        assert ctb.main([str(root)]) == 0
+        summary = ctb.summarize(ctb.load_state(root / "state.jsonl"))
+        stats = summary["cars"]["gvd_traffic_0"]
+        assert summary["ok"] and summary["status"] == "LIVE", summary
+        assert stats["proven_live"] and not stats["spawn_stuck"]
+        assert stats["n_moving_boxed"] >= ctb.MIN_MOVING_BOXED
+        assert stats["max_ctr_pos_m"] is not None
+        assert abs(stats["max_ctr_pos_m"] - off) < 1e-9
+    print("ctr within per-axis slack passes")
+
+
+def check_ctr_2m_lateral_fails() -> None:
+    """A 2 m lateral offset is outside half_right+slack and must be SPAWN-STUCK."""
+    off = 2.0
+    assert off > HALF[0] + ctb.CTR_POS_SLACK_M
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        ticks = []
+        for pos in _path():
+            ctr = (pos[0] + off, pos[1], pos[2])
+            ticks.append([_car("gvd_traffic_0", pos, _box(ctr))])
+        _write(root, ticks)
+        assert ctb.main([str(root)]) == 1
+        summary = ctb.summarize(ctb.load_state(root / "state.jsonl"))
+        stats = summary["cars"]["gvd_traffic_0"]
+        assert summary["status"] == "SPAWN-STUCK" and not summary["ok"], summary
+        assert stats["spawn_stuck"] and not stats["axes_stuck"]
+        assert stats["n_moving_boxed"] >= ctb.MIN_MOVING_BOXED
+        assert stats["max_ctr_pos_m"] is not None
+        assert abs(stats["max_ctr_pos_m"] - off) < 1e-9
+    print("2 m lateral ctr offset fails")
+
+
+def check_exactly_6_moving_boxed_passes() -> None:
+    """Exactly MIN_MOVING_BOXED moving boxed samples is enough for LIVE."""
+    # 0,5,...,40 m: six samples with displacement > MOVE_M (10 m).
+    poses = _path(n=9, step=5.0)
+    moving = [p for p in poses if (p[1] - poses[0][1]) > ctb.MOVE_M]
+    assert len(moving) == ctb.MIN_MOVING_BOXED
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        ticks = [[_car("gvd_traffic_0", pos, _box(_live_ctr(pos)))] for pos in poses]
+        _write(root, ticks)
+        assert ctb.main([str(root)]) == 0
+        summary = ctb.summarize(ctb.load_state(root / "state.jsonl"))
+        stats = summary["cars"]["gvd_traffic_0"]
+        assert summary["ok"] and summary["status"] == "LIVE", summary
+        assert stats["n_moving_boxed"] == ctb.MIN_MOVING_BOXED
+        assert stats["proven_live"]
+    print("exactly 6 moving boxed passes")
+
+
+def check_proven_segment_plus_short_tail_passes() -> None:
+    """A proven segment plus a later short respawn tail must still be LIVE."""
+    rows: list[dict] = []
+    i = 0
+    for pos in _path():
+        rows.append({
+            "i": i,
+            "t": i * 0.5,
+            "traffic": [_car("gvd_traffic_0", pos, _box(_live_ctr(pos)))],
+        })
+        i += 1
+    # Respawn under JUMP_M (20 m gap) with a short tail that never reaches
+    # MIN_MOVING_BOXED. No violating sample; this is a typical smoke-run tail.
+    tail_start = (0.0, 20.0, 0.5)
+    for k in range(4):
+        pos = (tail_start[0], tail_start[1] + k * 4.0, tail_start[2])
+        row = {
+            "i": i,
+            "t": i * 0.5,
+            "traffic": [_car("gvd_traffic_0", pos, _box(_live_ctr(pos)))],
+        }
+        if k == 0:
+            row["veh_meta"] = {"model": "etk800"}
+        rows.append(row)
+        i += 1
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _write_rows(root, rows)
+        assert ctb.main([str(root)]) == 0
+        loaded = ctb.load_state(root / "state.jsonl")
+        summary = ctb.summarize(loaded)
+        stats = summary["cars"]["gvd_traffic_0"]
+        assert summary["ok"] and summary["status"] == "LIVE", summary
+        assert stats["n_spawns"] == 2 and stats["proven_live"]
+        by_name, _, _ = ctb.split_segments(loaded)
+        segs = [ctb._segment_stats(s) for s in by_name["gvd_traffic_0"]]
+        assert len(segs) == 2
+        assert segs[0]["proven_live"]
+        assert not segs[1]["proven_live"]
+        assert not segs[1]["spawn_stuck"] and not segs[1]["axes_stuck"]
+        assert segs[1]["n_moving_boxed"] < ctb.MIN_MOVING_BOXED
+    print("proven segment plus short tail passes")
+
+
 def check_predicates_locked() -> None:
     """Mutations of the |ctr-pos| limit, axis check, or spawn split must fail tests."""
     src = (ROOT / "scripts" / "check_traffic_box.py").read_text(encoding="utf-8")
     assert "SPAWN_STUCK_M" not in src
     assert "box.ctr follows pos" not in src
-    assert "ctr_pos > limit" in src
-    assert "return norm + CTR_POS_SLACK_M" in src
+    assert "abs(_dot(delta, ax)) > half[i] + CTR_POS_SLACK_M" in src
+    assert "if ctr_exceeds_half(box, pos, ctr):" in src
     assert "abs(_dot(a, dir_u)) >= AXIS_DOT_MIN" in src
     assert "abs(_dot(a, up_u)) >= AXIS_DOT_MIN" in src
+    assert "return has_dir and has_up" in src
+    assert "longest horizontal" in src
     assert '_dist(pos, last_pos[name]) > JUMP_M' in src
     assert 'if "veh_meta" in row:' in src
     assert "n_moving_boxed >= MIN_MOVING_BOXED" in src
@@ -457,6 +653,13 @@ def main() -> None:
     check_missing_and_empty()
     check_pos_jump_and_veh_meta_split()
     check_turning_car_axes()
+    check_rolled_box_up_misaligned_fails()
+    check_frozen_axes_after_exact_90deg_turn_fails()
+    check_box_length_across_car_fails()
+    check_ctr_within_axis_slack_passes()
+    check_ctr_2m_lateral_fails()
+    check_exactly_6_moving_boxed_passes()
+    check_proven_segment_plus_short_tail_passes()
     check_predicates_locked()
     print("check_traffic_box ok")
 

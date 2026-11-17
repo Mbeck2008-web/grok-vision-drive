@@ -15,11 +15,14 @@ split on a ``veh_meta`` row (a new ego spawn) or a ``pos`` jump of more than
 A spawn segment is scored on its moving boxed samples (box present and
 displacement from that segment's first ``pos`` is greater than ``MOVE_M``):
 
-* ``|box.ctr - pos|`` must be <= ``|half|`` (Euclidean) + ``CTR_POS_SLACK_M``.
+* ``|(pos - box.ctr) · ax_i|`` must be <= ``half_i`` + ``CTR_POS_SLACK_M``
+  on every axis (an oriented box, not a sphere of radius ``|half|``).
 * One box axis must have ``|dot|`` >= ``AXIS_DOT_MIN`` with ``dir``, and
-  one with ``up``.
+  one with ``up``. The dir-aligned axis must carry the longest horizontal
+  half, and the up-aligned axis the vertical half.
 * LIVE requires at least ``MIN_MOVING_BOXED`` such samples in a segment,
-  all passing both tests, and no violating sample in any segment.
+  all passing both tests, and no violating sample in any segment. A later
+  short segment does not undo a proven one.
 
 If the box is spawn-stuck or axes stay at spawn: keep only ``half`` and
 build ``ctr`` / ``ax`` from live ``pos`` / ``dir`` / ``up``, or switch the
@@ -47,7 +50,7 @@ MOVE_M = 10.0
 JUMP_M = 50.0
 # LIVE needs at least this many moving boxed samples in one spawn segment.
 MIN_MOVING_BOXED = 6
-# |ctr - pos| limit on a moving boxed sample: |half| + this slack (metres).
+# Per-axis | (pos-ctr)·ax_i | limit: half_i + this slack (metres).
 CTR_POS_SLACK_M = 0.5
 # On a moving boxed sample, one axis must align with dir and one with up.
 AXIS_DOT_MIN = 0.98
@@ -82,38 +85,93 @@ def _unit(value: Any) -> tuple[float, float, float] | None:
     return (vec[0] / norm, vec[1] / norm, vec[2] / norm)
 
 
-def _half_norm(box: Mapping[str, Any] | None) -> float | None:
+def _half_axes(
+    box: Mapping[str, Any] | None,
+) -> tuple[tuple[float, float, float], list[tuple[float, float, float]]] | None:
+    """Paired ``half`` and unit ``ax``, or None if either is unusable."""
     if not isinstance(box, Mapping):
         return None
     half = _vec3(box.get("half"))
+    axes = box.get("ax")
     if half is None or any(h <= 0.0 for h in half):
         return None
-    return math.sqrt(half[0] ** 2 + half[1] ** 2 + half[2] ** 2)
-
-
-def ctr_pos_limit(box: Mapping[str, Any] | None) -> float | None:
-    """Max allowed ``|box.ctr - pos|`` on a moving boxed sample."""
-    norm = _half_norm(box)
-    if norm is None:
+    if not isinstance(axes, (list, tuple)) or len(axes) < 3:
         return None
-    return norm + CTR_POS_SLACK_M
+    units: list[tuple[float, float, float]] = []
+    for a in axes[:3]:
+        u = _unit(a)
+        if u is None:
+            return None
+        units.append(u)
+    return half, units
+
+
+def ctr_exceeds_half(
+    box: Mapping[str, Any] | None,
+    pos: tuple[float, float, float],
+    ctr: tuple[float, float, float],
+) -> bool:
+    """True when any ``|(pos-ctr)·ax_i|`` exceeds ``half_i`` + slack, or half/ax is unusable."""
+    paired = _half_axes(box)
+    if paired is None:
+        return True
+    half, units = paired
+    delta = (pos[0] - ctr[0], pos[1] - ctr[1], pos[2] - ctr[2])
+    for i, ax in enumerate(units):
+        if abs(_dot(delta, ax)) > half[i] + CTR_POS_SLACK_M:
+            return True
+    return False
+
+
+def _axes_match_extents(
+    units: list[tuple[float, float, float]],
+    half: tuple[float, float, float],
+    dir_u: tuple[float, float, float],
+    up_u: tuple[float, float, float],
+) -> bool:
+    """Dir-aligned axis carries the longest horizontal half; up-aligned the vertical half.
+
+    Missing dir/up axes are left to ``has_dir`` / ``has_up`` so a dropped
+    up check still fails a rolled-but-dir-aligned box.
+    """
+    # Argument order is (ref, axis) so these lines do not duplicate the
+    # has_dir / has_up strings that mutation tests patch.
+    dir_idxs = [i for i, a in enumerate(units) if abs(_dot(dir_u, a)) >= AXIS_DOT_MIN]
+    up_idxs = [i for i, a in enumerate(units) if abs(_dot(up_u, a)) >= AXIS_DOT_MIN]
+    if dir_idxs and up_idxs and set(dir_idxs) & set(up_idxs):
+        return False
+    if dir_idxs:
+        i = dir_idxs[0]
+        horiz = [j for j in range(3) if j not in up_idxs]
+        if i not in horiz:
+            return False
+        if half[i] + 1e-12 < max(half[j] for j in horiz):
+            return False
+    if up_idxs:
+        # The up-aligned axis carries the remaining (vertical) half: it is
+        # not a horizontal axis, and no other axis is also aligned with up.
+        if len(up_idxs) != 1:
+            return False
+        if up_idxs[0] in dir_idxs:
+            return False
+    return True
 
 
 def axes_aligned(box: Mapping[str, Any] | None, direction: Any, up: Any) -> bool:
-    """True when one axis matches ``dir`` and one matches ``up`` (|dot| threshold)."""
+    """True when dir/up each match one axis and those axes carry the matching halves."""
     if not isinstance(box, Mapping):
-        return False
-    axes = box.get("ax")
-    if not isinstance(axes, (list, tuple)) or len(axes) < 3:
         return False
     dir_u, up_u = _unit(direction), _unit(up)
     if dir_u is None or up_u is None:
         return False
-    units = [_unit(a) for a in axes[:3]]
-    if any(a is None for a in units):
+    paired = _half_axes(box)
+    if paired is None:
         return False
+    half, units = paired
     has_dir = any(abs(_dot(a, dir_u)) >= AXIS_DOT_MIN for a in units)
     has_up = any(abs(_dot(a, up_u)) >= AXIS_DOT_MIN for a in units)
+    if not _axes_match_extents(units, half, dir_u, up_u):
+        return False
     return has_dir and has_up
 
 
@@ -212,8 +270,7 @@ def _segment_stats(samples: list[dict[str, Any]]) -> dict[str, Any]:
         if _dist(pos, first_pos) <= MOVE_M:
             continue
         n_moving_boxed += 1
-        limit = ctr_pos_limit(box)
-        if limit is None or ctr_pos > limit:
+        if ctr_exceeds_half(box, pos, ctr):
             spawn_stuck = True
         if not axes_aligned(box, sample.get("dir"), sample.get("up")):
             axes_stuck = True
@@ -346,16 +403,17 @@ def format_report(summary: Mapping[str, Any], source: str) -> str:
         lines.append(
             f"PASS: {n} {NAME_PREFIX}* car(s) met the live-box bar on the "
             "IQU45 smoke check "
-            f"(|ctr-pos| <= |half|+{CTR_POS_SLACK_M:g} m on "
+            f"(|(pos-ctr)·ax_i| <= half_i+{CTR_POS_SLACK_M:g} m on "
             f">= {MIN_MOVING_BOXED} moving boxed samples in a spawn segment, "
-            f"axes |dot|>= {AXIS_DOT_MIN:g} with dir and up; samples split "
+            f"dir axis has the longest horizontal half, up axis the vertical "
+            f"half, axes |dot|>= {AXIS_DOT_MIN:g} with dir and up; samples split "
             "on veh_meta or a pos jump). The smoke run decides this; do not "
             "assume it from the Lua name. Long run may proceed on this evidence."
         )
     elif summary["stuck"]:
         names = ", ".join(summary["stuck"])
         lines.append(
-            f"FAIL: {names} |box.ctr - pos| exceeded |half|+{CTR_POS_SLACK_M:g} m "
+            f"FAIL: {names} |(pos-ctr)·ax_i| exceeded half_i+{CTR_POS_SLACK_M:g} m "
             "on a moving boxed sample. Do not start the long run. Keep only "
             "half and build ctr/ax from pos/dir/up, or switch to a live OOBB "
             "call, then re-smoke."
@@ -364,7 +422,9 @@ def format_report(summary: Mapping[str, Any], source: str) -> str:
         names = ", ".join(summary["axes"])
         lines.append(
             f"FAIL: {names} box axes were not aligned with dir/up "
-            f"(|dot| < {AXIS_DOT_MIN:g}) on a moving boxed sample. Do not "
+            f"(|dot| < {AXIS_DOT_MIN:g}), or the dir/up axes did not carry "
+            "the longest horizontal / vertical half, on a moving boxed "
+            "sample. Do not "
             "start the long run. Keep only half and build ctr/ax from "
             "pos/dir/up, or switch to a live OOBB call, then re-smoke."
         )

@@ -55,6 +55,7 @@ cameras:
     far_m: 800
     requested_update_time: -1
     update_priority: 0.5
+    train_gt: true  # training-only depth + semantic ids (raw/narrow_depth, raw/narrow_sem); 360 occupancy labels
   - id: main
     role: primary_forward
     note: "toy analogue of the primary forward windshield cam; alias cam_main"
@@ -81,7 +82,7 @@ cameras:
     far_m: 300
     requested_update_time: -1
     update_priority: 0.5
-    train_gt: true  # urban-intersection camera; the other six stay RGB-only
+    train_gt: true  # training-only depth + semantic ids (raw/wide_depth, raw/wide_sem)
   - id: pillarL
     role: forward_side_left
     note: "toy analogue of a left B-pillar cam aimed across the corner, not down the lane"
@@ -94,6 +95,7 @@ cameras:
     far_m: 100
     requested_update_time: -1
     update_priority: 0.5
+    train_gt: true  # training-only depth + semantic ids (raw/pillarL_depth, raw/pillarL_sem); 360 occupancy labels
   - id: pillarR
     role: forward_side_right
     note: "toy analogue of a right B-pillar cam aimed across the corner, not down the lane"
@@ -106,6 +108,7 @@ cameras:
     far_m: 100
     requested_update_time: -1
     update_priority: 0.5
+    train_gt: true  # training-only depth + semantic ids (raw/pillarR_depth, raw/pillarR_sem); 360 occupancy labels
   - id: repeatL
     role: rear_side_left
     note: "toy analogue of a left fender repeater aimed back along the adjacent lane; the ego body is only at the frame edge"
@@ -118,6 +121,7 @@ cameras:
     far_m: 100
     requested_update_time: -1
     update_priority: 1.0
+    train_gt: true  # training-only depth + semantic ids (raw/repeatL_depth, raw/repeatL_sem); 360 occupancy labels
   - id: repeatR
     role: rear_side_right
     note: "toy analogue of a right fender repeater aimed back along the adjacent lane; the ego body is only at the frame edge"
@@ -130,6 +134,7 @@ cameras:
     far_m: 100
     requested_update_time: -1
     update_priority: 1.0
+    train_gt: true  # training-only depth + semantic ids (raw/repeatR_depth, raw/repeatR_sem); 360 occupancy labels
   - id: rear
     role: rear_traffic
     note: "toy analogue of a rear license-plate cam"
@@ -142,6 +147,7 @@ cameras:
     far_m: 100
     requested_update_time: -1
     update_priority: 1.0
+    train_gt: true  # training-only depth + semantic ids (raw/rear_depth, raw/rear_sem); 360 occupancy labels
 # Per-ego-model mounts (python/sensors/rig_overrides.py). Keys here replace the
 # camera's keys above for that model only; a model without an entry (the
 # etk800 the rig was calibrated on) gets the cameras above unchanged.

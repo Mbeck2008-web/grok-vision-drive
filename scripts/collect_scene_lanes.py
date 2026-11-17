@@ -47,8 +47,8 @@ scenetree objects, not connected beamngpy Vehicles, so the attach may
 fail; that log is the IQU45 proof of whether it works. Follow-up, not
 this collect: connect each traffic vehicle via beamngpy, then attach
 Electrics. Do not copy the ego lamp onto other rows. Also expect
-``raw/main_depth``, ``raw/main_sem``, ``raw/wide_depth``, ``raw/wide_sem``,
-and ``sem_classes.json``. LiDAR and radar stay off.
+``raw/<cam>_depth`` and ``raw/<cam>_sem`` for all eight cameras (360°
+occupancy labels), and ``sem_classes.json``. LiDAR and radar stay off.
 
     py -3 scripts\\collect_scene_lanes.py --minutes 1 --no-excursions --traffic 2 --smoke-s 15 --ctl-probe-every 1
 
@@ -95,8 +95,9 @@ Row fields in ``state.jsonl`` written by this collector, besides the frame data:
   uses information the cameras do not see. ``veh`` (electrics whitelist),
   ``ai_cmd`` (the AI commands this collector sent), ``road`` (fields already
   computed for ``gt``), ``traffic`` (2 Hz, null on other rows; each
-  non-player object has ``pos``, ``vel``, ``dir``, ``name``, and
-  ``brake_lights``, null when Electrics cannot attach), and
+  non-player object has ``pos``, ``vel``, ``dir``, ``up``, ``box``,
+  ``name``, and ``brake_lights``; ``up``/``box`` are null when not
+  reported, ``brake_lights`` is null when Electrics cannot attach), and
   ``veh_meta`` on the first row after each spawn. The probe and the traffic
   read are sent before the sensor poll and answered in the same game frame,
   so they add no round-trip of their own. A failed read is null; it

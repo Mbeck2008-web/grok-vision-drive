@@ -392,20 +392,33 @@ if nn is not None:
 def _capped_hot(hot: np.ndarray, p_hot: np.ndarray, cap: int, z_min: float, cell_m: float) -> np.ndarray:
     """Indices of the ``cap`` hot cells to refine.
 
-    At most half the cap goes to the most populous height layer (the ground:
-    with whole-grid map labels it alone exceeds the cap and would starve every
-    structure above it — VO and occluders need those). Any share the other
-    layers do not use goes back to the ground layer.
+    The ground band is the most populous z-layer (ties broken toward z closest
+    to 0, not the lowest layer). At most half the cap goes to that band.
+    Above-ground structure is filled next, then below-ground leftovers, so a
+    hot below-ground fill cannot starve posts / buildings that VO and
+    occluders need. Unused budget returns to the ground, then to structure.
 
-    Within a height band, slots are spread in xy rather than a global top-k by
-    probability. Off-road ground and solid buildings are slightly easier
-    occupied cells than the road; a global top-k would never refine the road,
-    and camera-VO / memory then have no structure to track.
+    Within each of those three pools, slots are spread in xy rather than a
+    global top-k by probability, so a high-p off-road region cannot take the
+    whole ground budget from a side road.
     """
+    if hot.size == 0 or cap <= 0:
+        return np.zeros((0,), np.int64)
     lvl = np.floor((hot[:, 2] - z_min) / cell_m + 1e-6).astype(np.int64)
-    band = lvl == int(np.bincount(lvl - lvl.min()).argmax() + lvl.min())
+    # most populous layer; ties -> z closest to 0 (a full below-ground layer
+    # must not beat a same-size ground layer)
+    shifted = lvl - int(lvl.min())
+    counts = np.bincount(shifted)
+    winners = np.flatnonzero(counts == counts.max())
+    z_of = (winners + int(lvl.min()) + 0.5) * float(cell_m) + float(z_min)
+    ground_lvl = int(winners[np.argmin(np.abs(z_of))] + int(lvl.min()))
+    band = lvl == ground_lvl
+    below = lvl < ground_lvl
+    above = lvl > ground_lvl
 
     def _spread(idxs: np.ndarray, budget: int) -> np.ndarray:
+        if budget <= 0 or idxs.size == 0:
+            return np.zeros((0,), dtype=idxs.dtype)
         if idxs.size <= budget:
             return idxs
         xy = hot[idxs, :2]
@@ -426,11 +439,21 @@ def _capped_hot(hot: np.ndarray, p_hot: np.ndarray, cap: int, z_min: float, cell
         fill = order[~taken[order]][: budget - winners.size]
         return idxs[np.concatenate([winners, fill])]
 
-    up = np.flatnonzero(~band)
     low = np.flatnonzero(band)
-    n_up = max(cap - min(low.size, cap // 2), 0)
-    up = _spread(up, n_up)
-    return np.concatenate([up, _spread(low, cap - up.size)])
+    up = np.flatnonzero(above)
+    dn = np.flatnonzero(below)
+    n_low = min(low.size, cap // 2) if low.size else 0
+    n_up = min(up.size, cap - n_low)
+    n_dn = min(dn.size, cap - n_low - n_up)
+    leftover = cap - (n_low + n_up + n_dn)
+    n_low = min(low.size, n_low + leftover)
+    leftover = cap - (n_low + n_up + n_dn)
+    n_up = min(up.size, n_up + leftover)
+    leftover = cap - (n_low + n_up + n_dn)
+    n_dn = min(dn.size, n_dn + leftover)
+    parts = [_spread(up, n_up), _spread(low, n_low), _spread(dn, n_dn)]
+    parts = [p for p in parts if p.size]
+    return np.concatenate(parts) if parts else np.zeros((0,), np.int64)
 
 
 def profile_cams(cfg: Any, profile: str, *, scale: float = 1.0) -> list[PinholeCam]:

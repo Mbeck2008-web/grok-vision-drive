@@ -65,7 +65,25 @@ def sample_queries(
     occ_w: list[np.ndarray] = []
     tcls: list[np.ndarray] = []
     if keys.size and n_occ:
-        pick = rng.integers(0, keys.size, size=int(n_occ))
+        # stratified positives: whole-grid map labels make the ground layer ~97% of the cells; half
+        # the positives come from everything above it so structure (VO, occluders) is learned too
+        z = grid.cell_of_key(keys)[:, 2]
+        layer = z == np.bincount(z - z.min()).argmax() + z.min()
+        lo_i, up_i = np.flatnonzero(layer), np.flatnonzero(~layer)
+        if lo_i.size and up_i.size:
+            n_up = int(n_occ) // 2
+            pick = np.concatenate([up_i[rng.integers(0, up_i.size, size=n_up)],
+                                   lo_i[rng.integers(0, lo_i.size, size=int(n_occ) - n_up)]])
+        else:
+            pick = rng.integers(0, keys.size, size=int(n_occ))
+        # below the ground layer nothing is occupied (no camera ray gets there, so without these
+        # negatives a decoder asked about the whole grid fills it): free points under ground cells
+        gz = int(z[layer][0]) if lo_i.size else 0
+        if lo_i.size and gz > 0 and n_free:
+            nb = max(1, int(n_free) // 4)
+            col = grid.centers_of_keys(keys[lo_i[rng.integers(0, lo_i.size, size=nb)]])
+            col[:, 2] = grid.z_min + rng.uniform(0.0, gz * grid.voxel_m - 0.5 * grid.voxel_m, size=nb)
+            pts.append(col); occ.append(np.zeros(nb)); occ_w.append(np.ones(nb)); tcls.append(np.full(nb, -1))
         p = grid.centers_of_keys(keys[pick]) + rng.uniform(-JITTER, JITTER, size=(int(n_occ), 3)) * grid.voxel_m
         pts.append(p); occ.append(np.ones(n_occ)); occ_w.append(np.ones(n_occ)); tcls.append(cls[pick].astype(np.int64))
     if free.shape[0] and n_free:

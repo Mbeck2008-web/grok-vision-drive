@@ -559,14 +559,19 @@ class OccMemory:
     Each tick: last tick's static cells (not vehicles, which move) are warped
     into the current ego frame with this tick's camera-VO motion, their
     probability decays by exp(-dt/tau). A warped cell a camera sees now is
-    dropped (the current prediction is the truth there); an unseen one is
-    kept with ``observed = False`` if this tick did not predict it. VO not
-    ok -> memory cleared (no blind carry). Capped at ``MAX_MEMORY`` cells.
+    dropped (the current prediction is the truth there). Each remembered cell
+    carries ``seen``: a live camera observed it at some earlier tick. An
+    unseen-now warped cell is kept with ``observed = False`` where this tick
+    predicted nothing, and a ``seen`` one also REPLACES this tick's
+    unobserved guess at that key (an earlier observation beats a decoded
+    guess; this tick's observed cells always win). VO not ok -> memory
+    cleared (no blind carry). Capped at ``MAX_MEMORY`` cells.
     """
 
     def __init__(self, grid: OccGrid, *, tau_s: float = 2.0, min_prob: float = 0.35, cap: int = MAX_MEMORY) -> None:
         self.grid, self.tau_s, self.min_prob, self.cap = grid, float(tau_s), float(min_prob), int(cap)
         self.keys = np.zeros(0, np.int64); self.cls = np.zeros(0, np.uint8); self.prob = np.zeros(0, np.float32)
+        self.seen = np.zeros(0, bool)
 
     def reset(self) -> None:
         self.__init__(self.grid, tau_s=self.tau_s, min_prob=self.min_prob, cap=self.cap)
@@ -580,29 +585,35 @@ class OccMemory:
         g = self.grid
         keys = np.asarray(keys, np.int64); cls = np.asarray(cls, np.uint8); prob = np.asarray(prob, np.float32)
         obs = np.asarray(obs, bool)
-        mk = np.zeros(0, np.int64); mc = np.zeros(0, np.uint8); mp = np.zeros(0, np.float32)
+        mk = np.zeros(0, np.int64); mc = np.zeros(0, np.uint8); mp = np.zeros(0, np.float32); ms = np.zeros(0, bool)
         if self.keys.size and ok and dt is not None and dt > 0:
             c = g.centers_of_keys(self.keys)
             xy = _warp(c[:, :2], float(fwd), float(dyaw))
             nk = g.keys_of(np.concatenate([xy, c[:, 2:3]], 1))
             p = self.prob * np.float32(math.exp(-dt / self.tau_s))
-            keep = (nk >= 0) & (p >= self.min_prob) & ~np.isin(nk, keys)
-            mk, mc, mp = nk[keep], self.cls[keep], p[keep]
+            # a seen cell may replace this tick's UNOBSERVED guess; an observed prediction always wins
+            keep = (nk >= 0) & (p >= self.min_prob) & (~np.isin(nk, keys) | (self.seen & np.isin(nk, keys[~obs])))
+            mk, mc, mp, ms = nk[keep], self.cls[keep], p[keep], self.seen[keep]
             if mk.size:
+                o = np.lexsort((~ms, mk))  # per key: a seen copy first
+                mk, mc, mp, ms = mk[o], mc[o], mp[o], ms[o]
                 mk, first = np.unique(mk, return_index=True)
-                mc, mp = mc[first], mp[first]
-                seen = observed_mask(g.centers_of_keys(mk), cams, occl, g)
-                mk, mc, mp = mk[~seen], mc[~seen], mp[~seen]
+                mc, mp, ms = mc[first], mp[first], ms[first]
+                live = observed_mask(g.centers_of_keys(mk), cams, occl, g)
+                mk, mc, mp, ms = mk[~live], mc[~live], mp[~live], ms[~live]
+        rep = np.isin(keys, mk)  # current unobserved guesses replaced by a seen memory cell
+        keys, cls, prob, obs = keys[~rep], cls[~rep], prob[~rep], obs[~rep]
         K = np.concatenate([keys, mk]); C = np.concatenate([cls, mc]); P = np.concatenate([prob, mp])
         O = np.concatenate([obs, np.zeros(mk.size, bool)])
+        S = np.concatenate([obs, ms])
         o = np.argsort(K, kind="stable")
-        K, C, P, O = K[o], C[o], P[o], O[o]
+        K, C, P, O, S = K[o], C[o], P[o], O[o], S[o]
         st = (C != VEHICLE) & (P >= self.min_prob)
         if ok or dt is None:  # first tick: nothing to warp yet, start remembering
             gk = ground_cell(K, C, g)
             flat = (C == 0) & (g.cell_of_key(K)[:, 2] <= (gk if gk is not None else -1)) if K.size else np.zeros(0, bool)
-            top = np.lexsort((-P[st], flat[st]))[: self.cap]  # plain ground last, then by probability
-            self.keys, self.cls, self.prob = K[st][top], C[st][top], P[st][top]
+            top = np.lexsort((-P[st], ~S[st], flat[st]))[: self.cap]  # plain ground last, then seen first, then by probability
+            self.keys, self.cls, self.prob, self.seen = K[st][top], C[st][top], P[st][top], S[st][top]
         else:  # VO lost: no blind carry
             self.reset()
         return K, C, P, O

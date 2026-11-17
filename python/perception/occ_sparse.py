@@ -370,7 +370,7 @@ if nn is not None:
                 offs = children_offsets(f // nxt, grid.voxel_m * nxt)
                 cap = max(1, int(max_points) // offs.shape[0])
                 if hot.shape[0] > cap:
-                    hot = hot[np.argsort(-p_hot)[:cap]]
+                    hot = hot[_capped_hot(hot, p_hot, cap, float(grid.z_min), grid.voxel_m * f)]
                 pts = (hot[:, None, :] + offs[None, :, :]).reshape(-1, 3).astype(np.float32)
                 self._index_bytes = max(self._index_bytes, int(pts.nbytes + hot.nbytes))
                 if pts.shape[0] == 0:
@@ -387,6 +387,19 @@ if nn is not None:
             order = np.argsort(keys)
             return OccPrediction(keys[order], p[sel][order], c[sel][order], n_coarse, int(pts.shape[0]),
                                  tuple(stages) + (int(pts.shape[0]),))
+
+
+def _capped_hot(hot: np.ndarray, p_hot: np.ndarray, cap: int, z_min: float, cell_m: float) -> np.ndarray:
+    """Indices of the ``cap`` hot cells to refine: top-k by probability, with at most half the cap
+    for the most populous height layer (the ground: with whole-grid map labels it alone exceeds
+    the cap and would starve every structure above it - VO and occluders need those). Any share
+    the other layers do not use goes back to the ground layer."""
+    lvl = np.floor((hot[:, 2] - z_min) / cell_m + 1e-6).astype(np.int64)
+    band = lvl == int(np.bincount(lvl - lvl.min()).argmax() + lvl.min())
+    order = np.argsort(-p_hot, kind="stable")
+    up, low = order[~band[order]], order[band[order]]
+    up = up[: max(cap - min(low.size, cap // 2), 0)]
+    return np.concatenate([up, low[: cap - up.size]])
 
 
 def profile_cams(cfg: Any, profile: str, *, scale: float = 1.0) -> list[PinholeCam]:

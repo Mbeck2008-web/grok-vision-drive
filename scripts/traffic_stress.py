@@ -3,17 +3,24 @@
 
 For each count (default 0, 4, 8, 12, 16, 24, 32) the live mode holds
 about 60 s and writes achieved recorder Hz, frame-drop fraction, tick
-time p50/p95, nvidia-smi VRAM, and BeamNG / supervisor RSS. Escalation
-stops when Hz drops under 9, drops exceed 1%, or VRAM headroom is under
-1 GB. A JSON and Markdown table go under --out.
+time p50/p95, peak nvidia-smi VRAM sampled during the hold, and BeamNG /
+supervisor RSS. Escalation stops when Hz drops under 9, drops exceed 1%,
+VRAM headroom is under 1 GB, a VRAM reading is missing, or supervisor RSS
+is over 12 GB. Rows and max_safe_count use the number of cars actually
+placed, not the requested step. A JSON and Markdown table go under --out
+(required; refused on C:/D: and refused if it is the current directory).
 
-This script attaches to a BeamNG.tech already running on --host/--port.
-It never launches or closes BeamNG. Do not run it from CI; use --stub
-for the offline tests, and run live on the dev PC (Desktop-IQU45).
+Live mode requires ``--live``. This script attaches to a BeamNG.tech
+already running on --host/--port. It never launches or closes BeamNG.
+Each live step's collector child replaces ``gvd_traffic_*`` at spawn, but
+the cars from the last completed step are left in the running session —
+this script does not despawn them and does not close the game. Do not run
+it from CI; use --stub for the offline tests, and run live on the dev PC
+(Desktop-IQU45).
 
 Example (dev PC, after BeamNG.tech is up and the usual collect attach works):
 
-    py -3 scripts\\traffic_stress.py --hold-s 60 --maps west_coast_usa --out E:\\GVD_data\\traffic_stress
+    py -3 scripts\\traffic_stress.py --live --hold-s 60 --maps west_coast_usa --out E:\\GVD_data\\traffic_stress
 """
 from __future__ import annotations
 
@@ -34,6 +41,7 @@ DEFAULT_COUNTS = (0, 4, 8, 12, 16, 24, 32)
 STOP_HZ_MIN = 9.0
 STOP_DROP_MAX = 0.01
 STOP_VRAM_HEADROOM_GB = 1.0
+STOP_RSS_MAX_MB = 12.0 * 1024.0  # 12 GB supervisor RSS
 DEFAULT_VRAM_TOTAL_GB = 11.0  # GTX 1080 Ti, when nvidia-smi has no total
 
 
@@ -55,19 +63,26 @@ def should_stop(
     *,
     hz: float,
     drop_frac: float,
-    vram_used_gb: float,
-    vram_total_gb: float,
+    vram_used_gb: float | None,
+    vram_total_gb: float | None,
     hz_min: float = STOP_HZ_MIN,
     drop_max: float = STOP_DROP_MAX,
     headroom_gb: float = STOP_VRAM_HEADROOM_GB,
+    vram_missing: bool = False,
+    supervisor_rss_mb: float | None = None,
+    rss_max_mb: float = STOP_RSS_MAX_MB,
 ) -> str | None:
     """Why to stop escalating, or ``None`` if this step is still healthy."""
     if float(hz) < float(hz_min):
         return "hz"
     if float(drop_frac) > float(drop_max):
         return "drops"
+    if vram_missing or vram_used_gb is None or vram_total_gb is None:
+        return "vram"
     if float(vram_total_gb) - float(vram_used_gb) < float(headroom_gb):
         return "vram"
+    if supervisor_rss_mb is not None and float(supervisor_rss_mb) > float(rss_max_mb):
+        return "rss"
     return None
 
 
@@ -87,17 +102,38 @@ def _tick_percentiles(sample: MappingLike) -> tuple[float | None, float | None]:
 
 
 
+def _placed_count(count: int, sample: MappingLike) -> int:
+    """Cars actually placed; falls back to the requested step count."""
+    if sample.get("placed_count") is not None:
+        return int(sample["placed_count"])
+    if sample.get("traffic_count") is not None and "placed_count" in sample:
+        return int(sample["traffic_count"])
+    return int(count)
+
+
+def _vram_missing(sample: MappingLike) -> bool:
+    if sample.get("vram_missing"):
+        return True
+    return sample.get("vram_used_gb") is None
+
+
 def _row_from_sample(count: int, hold_s: float, sample: MappingLike) -> dict[str, Any]:
     p50, p95 = _tick_percentiles(sample)
+    missing = _vram_missing(sample)
+    used = None if missing else float(sample.get("vram_used_gb") or 0.0)
+    total = None if missing else float(sample.get("vram_total_gb") or DEFAULT_VRAM_TOTAL_GB)
+    placed = _placed_count(count, sample)
     return {
-        "traffic_count": int(count),
+        "traffic_requested": int(count),
+        "traffic_count": int(placed),
         "hold_s": float(hold_s),
         "hz": float(sample.get("hz") or 0.0),
         "drop_frac": float(sample.get("drop_frac") or 0.0),
         "tick_p50_s": p50,
         "tick_p95_s": p95,
-        "vram_used_gb": float(sample.get("vram_used_gb") or 0.0),
-        "vram_total_gb": float(sample.get("vram_total_gb") or DEFAULT_VRAM_TOTAL_GB),
+        "vram_used_gb": used,
+        "vram_total_gb": total if total is not None else DEFAULT_VRAM_TOTAL_GB,
+        "vram_missing": missing,
         "beamng_rss_mb": sample.get("beamng_rss_mb"),
         "supervisor_rss_mb": sample.get("supervisor_rss_mb"),
         "stop": None,
@@ -121,11 +157,13 @@ def run_plan(
         reason = should_stop(
             hz=float(row["hz"]),
             drop_frac=float(row["drop_frac"]),
-            vram_used_gb=float(row["vram_used_gb"]),
-            vram_total_gb=float(row["vram_total_gb"]),
+            vram_used_gb=None if row.get("vram_missing") else row.get("vram_used_gb"),
+            vram_total_gb=None if row.get("vram_missing") else row.get("vram_total_gb"),
             hz_min=hz_min,
             drop_max=drop_max,
             headroom_gb=headroom_gb,
+            vram_missing=bool(row.get("vram_missing")),
+            supervisor_rss_mb=None if row.get("supervisor_rss_mb") is None else float(row["supervisor_rss_mb"]),
         )
         row["stop"] = reason
         rows.append(row)
@@ -151,6 +189,7 @@ def write_report(rows: Sequence[MappingLike], json_path: Path, md_path: Path) ->
     json_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     cols = (
+        "traffic_requested",
         "traffic_count",
         "hz",
         "drop_frac",
@@ -188,16 +227,16 @@ def write_report(rows: Sequence[MappingLike], json_path: Path, md_path: Path) ->
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _nvidia_vram() -> tuple[float, float]:
-    """``(used_gb, total_gb)``. Total falls back to 11 GB. Zeros if smi is missing."""
-    used = 0.0
-    total = DEFAULT_VRAM_TOTAL_GB
+def _nvidia_vram() -> tuple[float | None, float | None]:
+    """``(used_gb, total_gb)``. Both ``None`` when the used reading is missing."""
+    used: float | None
     try:
         from python.runtime.hw_probe import gpu_vram_used_gb
 
         used = float(gpu_vram_used_gb(force=True))
     except Exception:
-        used = 0.0
+        used = None
+    total: float | None = None
     try:
         import subprocess
 
@@ -212,8 +251,67 @@ def _nvidia_vram() -> tuple[float, float]:
         if tot > 0:
             total = tot
     except Exception:
-        pass
-    return used, total
+        total = None
+    if used is None:
+        return None, None
+    return used, (DEFAULT_VRAM_TOTAL_GB if total is None else total)
+
+
+class PeakHoldSampler:
+    """Sample VRAM and RSS during a live hold and keep the peaks."""
+
+    def __init__(self, interval_s: float = 1.0) -> None:
+        self.interval_s = float(interval_s)
+        self.peak_used_gb: float | None = None
+        self.total_gb: float | None = None
+        self.peak_supervisor_rss_mb: float | None = None
+        self.beamng_rss_mb: float | None = None
+        self.samples = 0
+        self._stop = None
+        self._thread = None
+
+    def sample_once(self) -> None:
+        used, total = _nvidia_vram()
+        beam, supervisor = sample_rss()
+        self.samples += 1
+        if used is not None:
+            self.peak_used_gb = used if self.peak_used_gb is None else max(self.peak_used_gb, used)
+            self.total_gb = total
+        if supervisor is not None:
+            self.peak_supervisor_rss_mb = (
+                supervisor if self.peak_supervisor_rss_mb is None else max(self.peak_supervisor_rss_mb, supervisor)
+            )
+        if beam is not None:
+            self.beamng_rss_mb = beam if self.beamng_rss_mb is None else max(self.beamng_rss_mb, beam)
+
+    def start(self) -> None:
+        import threading
+
+        self._stop = threading.Event()
+
+        def _loop() -> None:
+            self.sample_once()
+            while self._stop is not None and not self._stop.wait(self.interval_s):
+                self.sample_once()
+
+        self._thread = threading.Thread(target=_loop, name="traffic-stress-peak", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> dict[str, Any]:
+        if self._stop is not None:
+            self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=3.0)
+        self.sample_once()
+        missing = self.peak_used_gb is None
+        return {
+            "vram_used_gb": self.peak_used_gb,
+            "vram_total_gb": self.total_gb,
+            "vram_missing": missing,
+            "beamng_rss_mb": self.beamng_rss_mb,
+            "supervisor_rss_mb": self.peak_supervisor_rss_mb,
+            "vram_samples": self.samples,
+        }
 
 
 def _process_rss_mb(match: Callable[[str], bool]) -> float | None:
@@ -260,6 +358,30 @@ def _parse_counts(text: str) -> tuple[int, ...]:
     return tuple(int(p) for p in parts)
 
 
+def check_stress_out(path: Path | str | None) -> Path:
+    """Require an explicit --out, not C:/D: and not the current directory."""
+    if path is None or str(path).strip() == "":
+        raise ValueError("--out is required and must not default to the current directory")
+    resolved = Path(path).expanduser()
+    try:
+        comparable = resolved.resolve()
+    except OSError:
+        comparable = resolved
+    try:
+        cwd = Path.cwd().resolve()
+    except OSError:
+        cwd = Path.cwd()
+    if comparable == cwd:
+        raise ValueError("--out must not be the current directory")
+    from python.data.data_root import DataDriveError, refuse_system_drive
+
+    try:
+        refuse_system_drive(resolved)
+    except DataDriveError as exc:
+        raise ValueError(str(exc)) from exc
+    return resolved
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Step AI traffic counts and record collector load (does not launch or close BeamNG)."
@@ -277,7 +399,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--out",
         type=Path,
         default=None,
-        help="Folder for traffic_stress.json and traffic_stress.md.",
+        help="Required folder for traffic_stress.json and traffic_stress.md. Refused on C:/D: and if it is the cwd.",
+    )
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Attach to an already-running BeamNG.tech session. Required for live mode (do not omit in favor of a cwd default).",
     )
     parser.add_argument("--hz-min", type=float, default=STOP_HZ_MIN)
     parser.add_argument("--drop-max", type=float, default=STOP_DROP_MAX)
@@ -322,8 +449,46 @@ def _default_stub_fixtures() -> dict[int, dict[str, Any]]:
             vram_total_gb=11.0,
             beamng_rss_mb=3500.0 + 10.0 * n,
             supervisor_rss_mb=800.0,
+            placed_count=n,
         )
     return rows
+
+
+def live_collect_cmd(
+    count: int,
+    *,
+    maps: str,
+    minutes: float,
+    step_dir: Path,
+    host: str | None = None,
+    port: int | None = None,
+    data_dir: str = "",
+) -> list[str]:
+    """Collector argv for one live step. ``--traffic`` is the requested count."""
+    cmd = [
+        sys.executable,
+        str(ROOT / "scripts" / "collect_scene_lanes.py"),
+        "--minutes",
+        f"{minutes:g}",
+        "--maps",
+        str(maps),
+        "--segment-min",
+        f"{minutes:g}",
+        "--traffic",
+        str(int(count)),
+        "--smoke-s",
+        "0",
+        "--no-excursions",
+        "--out",
+        str(step_dir),
+    ]
+    if host:
+        cmd += ["--host", str(host)]
+    if port is not None:
+        cmd += ["--port", str(port)]
+    if data_dir:
+        cmd += ["--data-dir", str(data_dir)]
+    return cmd
 
 
 def live_measure_factory(args: argparse.Namespace) -> Callable[[int], dict[str, Any]]:
@@ -332,11 +497,12 @@ def live_measure_factory(args: argparse.Namespace) -> Callable[[int], dict[str, 
     The child is ``scripts/collect_scene_lanes.py``. It attaches to the
     already-running Tech session and does not launch or close it. Each
     step uses a fresh --out subfolder so previous frames are not deleted.
+    VRAM and RSS are sampled during the hold; the peaks are kept. Cars
+    from the last step stay in the running session (not despawned).
     """
     import subprocess
     import time
 
-    collect = ROOT / "scripts" / "collect_scene_lanes.py"
     out_root = Path(args.out)
     hold_s = max(60.0, float(args.hold_s))  # collector floors --minutes at 1
     minutes = hold_s / 60.0
@@ -344,42 +510,52 @@ def live_measure_factory(args: argparse.Namespace) -> Callable[[int], dict[str, 
     def measure(count: int) -> dict[str, Any]:
         step_dir = out_root / f"n{int(count):02d}"
         step_dir.mkdir(parents=True, exist_ok=True)
-        cmd = [
-            sys.executable,
-            str(collect),
-            "--minutes",
-            f"{minutes:g}",
-            "--maps",
-            str(args.maps),
-            "--segment-min",
-            f"{minutes:g}",
-            "--traffic",
-            str(int(count)),
-            "--smoke-s",
-            "0",
-            "--no-excursions",
-            "--out",
-            str(step_dir),
-        ]
-        if args.host:
-            cmd += ["--host", str(args.host)]
-        if args.port is not None:
-            cmd += ["--port", str(args.port)]
-        if args.data_dir:
-            cmd += ["--data-dir", str(args.data_dir)]
+        cmd = live_collect_cmd(
+            int(count),
+            maps=str(args.maps),
+            minutes=minutes,
+            step_dir=step_dir,
+            host=args.host,
+            port=args.port,
+            data_dir=str(args.data_dir or ""),
+        )
         print(f"traffic_stress step traffic={count} cmd={' '.join(cmd)}", flush=True)
+        sampler = PeakHoldSampler()
+        sampler.start()
         t0 = time.monotonic()
         proc = subprocess.run(cmd, cwd=str(ROOT))
         held = max(1e-3, time.monotonic() - t0)
+        peaks = sampler.stop()
         if proc.returncode not in (0, 6, 7):
             # 6 is no_progress, 7 is file_cap; still parse whatever was written.
             print(f"traffic_stress collector exit {proc.returncode} at traffic={count}", flush=True)
-        return _metrics_from_step(step_dir, held)
+        return _metrics_from_step(step_dir, held, peaks=peaks)
 
     return measure
 
 
-def _metrics_from_step(step_dir: Path, held_s: float) -> dict[str, Any]:
+def _placed_from_step(step_dir: Path, state_rows: Sequence[MappingLike] | None = None) -> int | None:
+    """Placed traffic count from collect.json clip_draws, else state.jsonl tags."""
+    collect = Path(step_dir) / "collect.json"
+    if collect.is_file():
+        try:
+            data = json.loads(collect.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        draws = data.get("clip_draws") or []
+        counts = [int(d["traffic_count"]) for d in draws if d.get("traffic_count") is not None]
+        if counts:
+            return counts[-1]
+    if state_rows:
+        tagged = [int(r["traffic_count"]) for r in state_rows if r.get("traffic_count") is not None]
+        if tagged:
+            return tagged[-1]
+    return None
+
+
+def _metrics_from_step(
+    step_dir: Path, held_s: float, peaks: MappingLike | None = None
+) -> dict[str, Any]:
     """Hz, drops, and tick percentiles from a collector output folder."""
     from python.collect.tick_log import TICKS_FILE
     from python.data.strip_writer import read_state_jsonl
@@ -403,9 +579,18 @@ def _metrics_from_step(step_dir: Path, held_s: float) -> dict[str, Any]:
         span = float(rows[-1]["t"]) - float(rows[0]["t"])
         if span > 0.5:
             hz = (frames - 1) / span
-    used, total = _nvidia_vram()
-    beam, supervisor = sample_rss()
+    if peaks is None:
+        used, total = _nvidia_vram()
+        beam, supervisor = sample_rss()
+        missing = used is None
+    else:
+        used = peaks.get("vram_used_gb")
+        total = peaks.get("vram_total_gb")
+        beam = peaks.get("beamng_rss_mb")
+        supervisor = peaks.get("supervisor_rss_mb")
+        missing = bool(peaks.get("vram_missing")) or used is None
     p50, p95 = (percentile(dts, 50), percentile(dts, 95)) if dts else (None, None)
+    placed = _placed_from_step(step_dir, rows)
     return {
         "hz": hz,
         "drop_frac": drop_frac,
@@ -413,8 +598,10 @@ def _metrics_from_step(step_dir: Path, held_s: float) -> dict[str, Any]:
         "tick_p95_s": p95,
         "vram_used_gb": used,
         "vram_total_gb": total,
+        "vram_missing": missing,
         "beamng_rss_mb": beam,
         "supervisor_rss_mb": supervisor,
+        "placed_count": placed,
         "frames": frames,
         "dropped": dropped,
     }
@@ -431,10 +618,17 @@ def main(argv: list[str] | None = None) -> int:
     if not counts or any(n < 0 for n in counts):
         parser.error("counts must be a comma list of integers >= 0")
         return 2
-    out = args.out
-    if out is None:
-        out = Path.cwd() / "traffic_stress"
-    args.out = Path(out)
+    if bool(args.stub) == bool(getattr(args, "live", False)):
+        parser.error("pass exactly one of --stub or --live")
+        return 2
+    if args.out is None:
+        parser.error("--out is required and must not default to the current directory")
+        return 2
+    try:
+        args.out = check_stress_out(args.out)
+    except ValueError as exc:
+        parser.error(str(exc))
+        return 2
     args.out.mkdir(parents=True, exist_ok=True)
     if args.stub:
         if args.stub_metrics is not None:

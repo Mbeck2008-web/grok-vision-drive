@@ -4,8 +4,9 @@
 Pure Python: no BeamNG, no nvidia-smi, no live attach.
 
 The planner steps a count list, records Hz / drops / tick percentiles /
-VRAM / RSS, writes a JSON and Markdown table, and stops escalating when
-Hz < 9, drops > 1%, or VRAM headroom < 1 GB.
+peak VRAM / RSS, writes a JSON and Markdown table, and stops escalating
+when Hz < 9, drops > 1%, VRAM headroom < 1 GB, a VRAM reading is missing,
+or supervisor RSS is over 12 GB. Rows use the placed count.
 """
 from __future__ import annotations
 
@@ -20,7 +21,10 @@ from scripts.traffic_stress import (  # noqa: E402
     DEFAULT_COUNTS,
     STOP_DROP_MAX,
     STOP_HZ_MIN,
+    STOP_RSS_MAX_MB,
     STOP_VRAM_HEADROOM_GB,
+    check_stress_out,
+    live_collect_cmd,
     live_measure_factory,
     main as stress_main,
     percentile,
@@ -37,8 +41,17 @@ def check_stop_rules() -> None:
     assert should_stop(hz=10.0, drop_frac=0.01, vram_used_gb=6.0, vram_total_gb=11.0) is None
     assert should_stop(hz=10.0, drop_frac=0.0, vram_used_gb=10.1, vram_total_gb=11.0) == "vram"
     assert should_stop(hz=10.0, drop_frac=0.0, vram_used_gb=10.0, vram_total_gb=11.0) is None
+    assert should_stop(hz=10.0, drop_frac=0.0, vram_used_gb=None, vram_total_gb=11.0, vram_missing=True) == "vram"
+    assert should_stop(hz=10.0, drop_frac=0.0, vram_used_gb=None, vram_total_gb=None) == "vram"
+    assert should_stop(
+        hz=10.0, drop_frac=0.0, vram_used_gb=6.0, vram_total_gb=11.0, supervisor_rss_mb=12.0 * 1024.0 + 1
+    ) == "rss"
+    assert should_stop(
+        hz=10.0, drop_frac=0.0, vram_used_gb=6.0, vram_total_gb=11.0, supervisor_rss_mb=12.0 * 1024.0
+    ) is None
     assert STOP_HZ_MIN == 9.0 and STOP_DROP_MAX == 0.01 and STOP_VRAM_HEADROOM_GB == 1.0
-    print("stop rules: hz < 9, drops > 1%, headroom < 1 GB")
+    assert STOP_RSS_MAX_MB == 12.0 * 1024.0
+    print("stop rules: hz < 9, drops > 1%, headroom < 1 GB, missing VRAM, RSS > 12 GB")
 
 
 def check_percentiles() -> None:
@@ -157,17 +170,114 @@ def check_does_not_kill_existing_beamng() -> None:
     print("no-kill: stress script never launches or closes BeamNG")
 
 
+def check_max_safe_uses_placed_count() -> None:
+    def measure(count: int) -> dict:
+        # Requested 8 only places 4; 12 is unhealthy. max_safe must be 4, not 8.
+        if count <= 8:
+            return dict(
+                hz=12.0,
+                drop_frac=0.0,
+                tick_s=(0.08, 0.10),
+                vram_used_gb=6.0,
+                vram_total_gb=11.0,
+                supervisor_rss_mb=800.0,
+                placed_count=4 if count == 8 else count,
+            )
+        return dict(
+            hz=8.0,
+            drop_frac=0.0,
+            tick_s=(0.2, 0.4),
+            vram_used_gb=8.0,
+            vram_total_gb=11.0,
+            supervisor_rss_mb=800.0,
+            placed_count=count,
+        )
+
+    rows = run_plan((0, 4, 8, 12), measure, hold_s=60.0)
+    assert [row["traffic_requested"] for row in rows] == [0, 4, 8, 12]
+    assert [row["traffic_count"] for row in rows] == [0, 4, 4, 12]
+    assert rows[-1]["stop"] == "hz"
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="gvd-stress-placed-") as raw:
+        out = Path(raw)
+        write_report(rows, out / "traffic_stress.json", out / "traffic_stress.md")
+        payload = json.loads((out / "traffic_stress.json").read_text(encoding="utf-8"))
+        assert payload["max_safe_count"] == 4
+        assert payload["stopped_at"] == 12
+    print("placed count: max_safe_count uses placed 4, not requested 8")
+
+
+def check_live_child_passes_requested_count() -> None:
+    cmd = live_collect_cmd(12, maps="west_coast_usa", minutes=1.0, step_dir=Path("/tmp/n12"))
+    assert "--traffic" in cmd
+    assert cmd[cmd.index("--traffic") + 1] == "12"
+    src = __import__("inspect").getsource(live_collect_cmd)
+    assert "str(int(count))" in src
+    print("live child: --traffic is the requested step count")
+
+
+def check_out_and_live_flags(tmp: Path) -> None:
+    import io
+    from contextlib import redirect_stderr, redirect_stdout
+
+    def _run(argv):
+        err, out = io.StringIO(), io.StringIO()
+        try:
+            with redirect_stderr(err), redirect_stdout(out):
+                code = stress_main(argv)
+        except SystemExit as exc:
+            return exc.code, err.getvalue() + out.getvalue()
+        return code, err.getvalue() + out.getvalue()
+
+    code, text = _run(["--stub", "--counts", "0"])
+    assert code == 2, (code, text)
+    assert "--out" in text
+    code, text = _run(["--out", str(tmp / "x")])
+    assert code == 2, (code, text)
+    assert "--live" in text or "--stub" in text
+    try:
+        check_stress_out(Path.cwd())
+    except ValueError as exc:
+        assert "current directory" in str(exc)
+    else:
+        raise AssertionError("cwd --out must be refused")
+    try:
+        check_stress_out(Path("C:/GVD_data/traffic_stress"))
+    except ValueError as exc:
+        assert "C:" in str(exc) or "refusing" in str(exc)
+    else:
+        raise AssertionError("C: --out must be refused")
+    ok = check_stress_out(tmp / "stress")
+    assert ok.name == "stress"
+    print("out/live flags: --out required, cwd and C: refused, --live required for live")
+
+
+def check_leaves_cars_documented() -> None:
+    import inspect
+    import scripts.traffic_stress as ts
+
+    src = inspect.getsource(ts)
+    assert "left in the running session" in src or "are left" in src.lower()
+    assert "does not despawn" in src or "not despawned" in src
+    print("cleanup: leftover stress-run cars are documented")
+
+
 def main() -> None:
     check_stop_rules()
     check_percentiles()
     check_max_safe_when_all_pass_or_first_fails()
+    check_max_safe_uses_placed_count()
     check_does_not_kill_existing_beamng()
+    check_live_child_passes_requested_count()
+    check_leaves_cars_documented()
     import tempfile
 
     with tempfile.TemporaryDirectory(prefix="gvd-traffic-stress-") as raw:
         root = Path(raw)
         check_stub_plan_stops_and_writes(root / "plan")
         check_stub_cli_prints_max_safe(root / "cli")
+        check_out_and_live_flags(root / "flags")
     print("traffic stress ok")
 
 

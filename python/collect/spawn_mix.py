@@ -1562,8 +1562,10 @@ class SpawnDeck:
         before). Further cars alternate ahead and behind at ``TRAFFIC_SPACING_M``
         steps past those distances. Returns ``([(where, pos, rot, along_m)],
         notes)``. A slot the walk cannot reach uses the farthest point
-        reached (a note says so); under TRAFFIC_MIN_M, or with no road, the
-        slot is dropped (also noted). Cars face the direction of travel.
+        reached (a note says so) unless that pose is within TRAFFIC_MIN_M of a
+        car already placed, in which case the slot is dropped so extras do
+        not stack. Under TRAFFIC_MIN_M, or with no road, the slot is dropped
+        (also noted). Cars face the direction of travel.
         """
         road = self._by_id.get(str(pick.road_id))
         _qx, _qy, qz, qw = pick.rot
@@ -1603,6 +1605,13 @@ class SpawnDeck:
             y += ry * shift
             if shift and not self._slot_is_legal(x, y, z + 0.5, fx, fy):
                 notes.append(f"traffic {where} skipped: not in a legal lane")
+                continue
+            # A short road walk would otherwise stack extra slots on the same
+            # farthest pose. Drop the new car rather than spawn a duplicate.
+            if any(math.dist((x, y), (px, py)) < TRAFFIC_MIN_M for _w, (px, py, _pz), _r, _a in slots):
+                notes.append(
+                    f"traffic {where} skipped: within {TRAFFIC_MIN_M:.0f} m of a car already placed"
+                )
                 continue
             slots.append((where, (x, y, z + 0.5), _yaw_quat(fx, fy), along))
         return slots, notes

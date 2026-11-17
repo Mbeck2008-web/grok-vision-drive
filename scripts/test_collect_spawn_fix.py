@@ -1117,7 +1117,7 @@ def check_impact_traffic_run() -> None:
     code, text, out = _run_west_coast(paint, _west_pools(), [], 300, speed_at=crash)
     assert code == 0, text[-2500:]
     placed = [x for x in text.splitlines() if x.startswith("collect traffic west_coast_usa#")]
-    assert placed and "placed ahead=60.0m behind=40.0m (want ahead=60m behind=40m along the road)" in placed[0], placed
+    assert placed and "placed ahead=60.0m behind=40.0m (requested=2 placed=2 want ahead=60m behind=40m along the road)" in placed[0], placed
     line = [x for x in text.splitlines() if x.startswith("collect impact west_coast_usa#") and " decel=" in x]
     assert len(line) == 1 and line[0].endswith("decel=98.0 m/s2 v=10.0->0.2 excursion=cruise"), line
     assert "traffic=" not in line[0] and "state unavailable" not in text

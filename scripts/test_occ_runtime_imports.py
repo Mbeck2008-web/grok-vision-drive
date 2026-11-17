@@ -38,7 +38,7 @@ LIVE_ENTRY_POINTS = (
 # GT label modules it must not reach any sim-truth pose source.
 OCC_RUNTIME = (
     "python.perception.occ_sparse", "python.perception.occ_geometry", "python.perception.occ_outputs",
-    "python.perception.occ_ego", "python.viz.occ_viz",
+    "python.perception.occ_ego", "python.perception.occ_out", "python.viz.occ_viz",
 )
 # Modules whose job is reading sim truth (pose, road graph, decals, signals).
 # Config readers the live supervisor already loads (raw_frames, sensors.cameras)

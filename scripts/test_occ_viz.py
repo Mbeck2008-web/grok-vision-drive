@@ -218,8 +218,16 @@ def check_message() -> None:
     key = DEFAULT_GRID.key_of_cell(np.array([ix, iy, iz]))
     assert key in set(out["cells"]["keys"].tolist())
     # GT / unknown input keys are not read
+    from python.viz import occ_viz
+
+    occ_viz.DROPPED.clear()
+    assert occ_to_viz(out, seq=7) == msg and not occ_viz.DROPPED, dict(occ_viz.DROPPED)
     noisy = dict(out, gt_boxes=[{"x": 1, "y": 2}], depth=np.zeros((4, 4)), tracks_gt=[1], foo="bar")
+    noisy["ego"] = dict(out["ego"], gt_pose=[0, 0, 0])
     assert occ_to_viz(noisy, seq=7) == msg
+    occ_to_viz(noisy, seq=8)
+    assert dict(occ_viz.DROPPED) == {"gt_boxes": 2, "depth": 2, "tracks_gt": 2, "foo": 2, "ego.gt_pose": 2}, dict(occ_viz.DROPPED)
+    assert not any(k in json.dumps(msg) for k in ("gt_boxes", "tracks_gt", "gt_pose", "foo"))
     # the validator ignores unknown message keys; v1 alone still validates
     validate_v1(dict(msg, future_field={"a": 1}))
     validate_v1({k: msg[k] for k in V1_KEYS})
@@ -228,7 +236,7 @@ def check_message() -> None:
     small = json.loads(big)
     validate_v1(small)
     assert len(big) <= 20000 and len(small["occ"]["cells"]) < len(occ["cells"]) and small["edges"] == back["edges"]
-    print(f"message: v1 valid, {len(data)} bytes, {len(occ['cells'])} occ cells, GT/unknown inputs ignored OK")
+    print(f"message: v1 valid, {len(data)} bytes, {len(occ['cells'])} occ cells, GT/unknown inputs dropped + counted OK")
 
 
 def check_colors() -> None:

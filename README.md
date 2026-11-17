@@ -553,4 +553,6 @@ GVD's license is [PolyForm Noncommercial 1.0.0](https://polyformproject.org/lice
 
 Commercial or paid use of GVD needs a separate license from Michael Beck. Open a GitHub issue on this repository, or contact him through his [GitHub profile](https://github.com/Mbeck2008-web). Do not email a request through this README.
 
+**Paid services.** You may not use GVD, or any part of it (code, models, data, or visualizations), in or with a product or service that charges money, including a subscription, a paywall, paid tiers, or a paid API, unless you contact Michael Beck first and get his written permission. A service that is free for anyone to use is fine, even if it asks people to sign up for a free account. This explains what "noncommercial" in `LICENSE` means for GVD. If this note and `LICENSE` ever disagree, `LICENSE` controls.
+
 Versions released before this license change remain under the MIT License that shipped with those commits.

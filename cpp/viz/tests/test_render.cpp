@@ -1,8 +1,10 @@
 // ctest: render fixed scenes headless and check pixels / schema handling.
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <string>
 #include <utility>
@@ -23,6 +25,7 @@
 #include "renderer.hpp"
 #include "scene.hpp"
 #include "udp.hpp"
+#include <nlohmann/json.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #if GVD_VIZ_HAVE_GLFW
 #define GLFW_INCLUDE_NONE
@@ -522,6 +525,60 @@ int main() {
                 corner, edge, edge_mean, rel);
     CHECK(ref > 0.05f, "box wireframe too dim to measure (edge luma %.4f)", ref);
     CHECK(rel <= 0.05f, "corner luma %.4f vs mid-edge %.4f (rel %.3f, want <= 0.05)", corner, ref, rel);
+  }
+
+
+  // 20. ego GLB (David_Holiday Tesla Model 3) loads, under 30k tris, no badge node.
+  {
+    CHECK(r.ego_from_glb(), "ego mesh did not load from tesla_model3_ego.glb (path '%s')",
+          r.ego_glb_path().c_str());
+    CHECK(r.ego_triangle_count() > 10000, "ego GLB too small (%d tris)", r.ego_triangle_count());
+    CHECK(r.ego_triangle_count() < 30000, "ego GLB too heavy (%d tris, want < 30k)", r.ego_triangle_count());
+    std::printf("ego GLB: %s  tris=%d\n", r.ego_glb_path().c_str(), r.ego_triangle_count());
+    const std::string& path = r.ego_glb_path();
+    std::ifstream f(path, std::ios::binary);
+    CHECK(f.good(), "cannot open ego GLB %s", path.c_str());
+    if (f) {
+      auto u32 = [](const std::vector<char>& b, size_t o) {
+        uint32_t v; std::memcpy(&v, b.data() + o, 4); return v;
+      };
+      f.seekg(0, std::ios::end);
+      std::vector<char> buf(static_cast<size_t>(f.tellg()));
+      f.seekg(0);
+      f.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+      CHECK(buf.size() > 20 && u32(buf, 0) == 0x46546C67u, "ego asset is not a GLB");
+      size_t off = 12, json_off = 0, json_n = 0;
+      while (off + 8 <= buf.size()) {
+        uint32_t clen = u32(buf, off), typ = u32(buf, off + 4);
+        if (off + 8 + clen > buf.size()) break;
+        if (typ == 0x4E4F534Au) { json_off = off + 8; json_n = clen; }
+        off += 8 + clen;
+      }
+      CHECK(json_n > 0, "ego GLB has no JSON chunk");
+      nlohmann::json gltf = nlohmann::json::parse(buf.data() + json_off, buf.data() + json_off + json_n, nullptr, false);
+      CHECK(!gltf.is_discarded(), "ego GLB JSON parse failed");
+      auto lower = [](std::string s) {
+        for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return s;
+      };
+      const char* kBadge[] = {"badge", "logo", "emblem", "wordmark", "hood_t", "tesla_t", "t_badge"};
+      int nodes = 0;
+      bool named = false;
+      if (gltf.contains("nodes")) {
+        for (const auto& n : gltf["nodes"]) {
+          ++nodes;
+          std::string name = n.value("name", "");
+          if (name == "Tesla_Model_3") named = true;
+          std::string ln = lower(name);
+          for (const char* k : kBadge) {
+            CHECK(ln.find(k) == std::string::npos, "badge node present: %s", name.c_str());
+          }
+        }
+      }
+      CHECK(nodes >= 1, "ego GLB has no nodes");
+      CHECK(named, "ego GLB missing Tesla_Model_3 node");
+      std::printf("ego GLB nodes=%d (no badge)\n", nodes);
+    }
   }
 
   std::printf("%s (%d failures)\n", g_fail ? "FAILED" : "OK", g_fail);

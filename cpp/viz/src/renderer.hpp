@@ -65,6 +65,11 @@ class Renderer {
   size_t gl_bytes() const;
   // Internal target size actually allocated (after the 200 MB cap).
   void target_size(int* w, int* h, int* msaa) const;
+  // Ego mesh: the David_Holiday Tesla Model 3 GLB when it loaded, else the
+  // procedural fallback. triangle count is the number of GL triangles.
+  bool ego_from_glb() const;
+  int ego_triangle_count() const;
+  const std::string& ego_glb_path() const;
 
  private:
   bool ensure_targets(int w, int h, int msaa);

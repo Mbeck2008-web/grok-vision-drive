@@ -1,4 +1,5 @@
 #include "renderer.hpp"
+#include "gvd_viz_asset_dir.hpp"
 
 #include <glad/gl.h>
 
@@ -6,9 +7,14 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <cstdio>
+#include <cstdlib>
+#include <fstream>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
+#include <nlohmann/json.hpp>
 
 namespace gvd {
 namespace {
@@ -315,18 +321,16 @@ void main(){
 const char* kMeshVS = R"(#version 330 core
 layout(location=0) in vec3 a_pos; layout(location=1) in vec3 a_nrm;
 layout(location=2) in vec3 a_col; layout(location=3) in float a_emi;
-uniform mat4 u_vp_m; out vec3 v_n; out vec3 v_col; out float v_emi; out vec3 v_w;
-void main(){ gl_Position = u_vp_m*vec4(a_pos,1.0); v_n=a_nrm; v_col=a_col; v_emi=a_emi; v_w=a_pos; })";
+uniform mat4 u_vp_m; out vec3 v_n; out vec3 v_col; out float v_emi;
+void main(){ gl_Position = u_vp_m*vec4(a_pos,1.0); v_n=a_nrm; v_col=a_col; v_emi=a_emi; })";
 const char* kMeshFS = R"(#version 330 core
-in vec3 v_n; in vec3 v_col; in float v_emi; in vec3 v_w; uniform vec3 u_eye; uniform vec3 u_tint; out vec4 o;
+in vec3 v_n; in vec3 v_col; in float v_emi; uniform vec3 u_tint; out vec4 o;
 void main(){
+  // Lambertian, high ambient: body corners must not glow brighter than panels.
   vec3 n = normalize(v_n); vec3 l = normalize(vec3(-0.35,-0.45,0.82));
-  vec3 vdir = normalize(u_eye - v_w);
   float lam = max(dot(n,l),0.0);
-  float spec = pow(max(dot(n, normalize(l+vdir)),0.0), 24.0);
-  float rim = pow(1.0 - max(dot(n, vdir), 0.0), 3.0);
   vec3 base = v_col*u_tint;
-  vec3 c = base*(0.30 + 0.75*lam) + vec3(0.35)*spec + vec3(0.18)*rim;
+  vec3 c = base*(0.62 + 0.38*lam);
   c = mix(c, v_col, v_emi);
   o = vec4(c, 1.0);
 })";
@@ -551,13 +555,171 @@ bool palette_named(const std::string& name, Palette& out) {
   return false;
 }
 
+
+// ---- ego GLB (David_Holiday Tesla Model 3) --------------------------------
+const char* kEgoGlbName = "tesla_model3_ego.glb";
+
+std::string find_asset(const char* name) {
+  std::vector<std::string> cands;
+  if (const char* env = std::getenv("GVD_VIZ_ASSETS")) {
+    cands.push_back(std::string(env) + "/" + name);
+  }
+#ifdef GVD_VIZ_ASSET_DIR
+  cands.push_back(std::string(GVD_VIZ_ASSET_DIR) + "/" + name);
+#endif
+  cands.push_back(std::string("assets/") + name);
+  cands.push_back(std::string("cpp/viz/assets/") + name);
+  for (const auto& p : cands) {
+    std::ifstream f(p, std::ios::binary);
+    if (f.good()) return p;
+  }
+  return {};
+}
+
+bool read_whole(const std::string& path, std::vector<uint8_t>& out) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return false;
+  f.seekg(0, std::ios::end);
+  auto n = f.tellg();
+  if (n <= 0) return false;
+  out.resize(static_cast<size_t>(n));
+  f.seekg(0);
+  f.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(out.size()));
+  return static_cast<bool>(f);
+}
+
+template <typename T>
+bool glb_accessor(const nlohmann::json& gltf, const uint8_t* bin, size_t bin_n, int acc_i, int ncomp, int ctype,
+                  std::vector<T>& out, std::string* err) {
+  if (acc_i < 0 || acc_i >= static_cast<int>(gltf["accessors"].size())) {
+    if (err) *err = "glb accessor out of range";
+    return false;
+  }
+  const auto& acc = gltf["accessors"][acc_i];
+  if (!acc.contains("bufferView")) {
+    if (err) *err = "glb accessor missing bufferView";
+    return false;
+  }
+  const auto& view = gltf["bufferViews"][acc["bufferView"].get<int>()];
+  size_t off = view.value("byteOffset", 0) + acc.value("byteOffset", 0);
+  int count = acc["count"].get<int>();
+  if (acc["componentType"].get<int>() != ctype) {
+    if (err) *err = "glb accessor component type mismatch";
+    return false;
+  }
+  size_t nbytes = static_cast<size_t>(count) * ncomp * sizeof(T);
+  if (off + nbytes > bin_n) {
+    if (err) *err = "glb accessor overflows BIN";
+    return false;
+  }
+  out.resize(static_cast<size_t>(count) * ncomp);
+  std::memcpy(out.data(), bin + off, nbytes);
+  return true;
+}
+
+bool load_ego_glb(const std::string& path, std::vector<MVert>& verts, std::vector<uint32_t>& indices, std::string* err) {
+  std::vector<uint8_t> file;
+  if (!read_whole(path, file) || file.size() < 20) {
+    if (err) *err = "cannot read " + path;
+    return false;
+  }
+  auto u32 = [&](size_t o) -> uint32_t {
+    uint32_t v;
+    std::memcpy(&v, file.data() + o, 4);
+    return v;
+  };
+  if (u32(0) != 0x46546C67u || u32(4) != 2) {
+    if (err) *err = "not a glTF 2 GLB: " + path;
+    return false;
+  }
+  size_t off = 12, json_off = 0, json_n = 0, bin_off = 0, bin_n = 0;
+  while (off + 8 <= file.size()) {
+    uint32_t clen = u32(off), typ = u32(off + 4);
+    if (off + 8 + clen > file.size()) break;
+    if (typ == 0x4E4F534Au) {  // JSON
+      json_off = off + 8;
+      json_n = clen;
+    } else if (typ == 0x004E4942u) {  // BIN\0
+      bin_off = off + 8;
+      bin_n = clen;
+    }
+    off += 8 + clen;
+  }
+  if (!json_n) {
+    if (err) *err = "glb has no JSON chunk";
+    return false;
+  }
+  nlohmann::json gltf = nlohmann::json::parse(file.data() + json_off, file.data() + json_off + json_n, nullptr, false);
+  if (gltf.is_discarded() || !gltf.contains("meshes") || gltf["meshes"].empty()) {
+    if (err) *err = "glb JSON has no mesh";
+    return false;
+  }
+  const auto& prim = gltf["meshes"][0]["primitives"][0];
+  const auto& attrs = prim["attributes"];
+  if (!attrs.contains("POSITION") || !prim.contains("indices")) {
+    if (err) *err = "glb mesh missing POSITION or indices";
+    return false;
+  }
+  const uint8_t* bin = file.data() + bin_off;
+  std::vector<float> pos, nrm, col;
+  std::vector<uint32_t> idx;
+  if (!glb_accessor(gltf, bin, bin_n, attrs["POSITION"].get<int>(), 3, 5126, pos, err)) return false;
+  if (attrs.contains("NORMAL")) {
+    if (!glb_accessor(gltf, bin, bin_n, attrs["NORMAL"].get<int>(), 3, 5126, nrm, err)) return false;
+  }
+  int ccomp = 0;
+  if (attrs.contains("COLOR_0")) {
+    const auto& cacc = gltf["accessors"][attrs["COLOR_0"].get<int>()];
+    std::string typ = cacc.value("type", "VEC4");
+    ccomp = typ == "VEC3" ? 3 : 4;
+    if (!glb_accessor(gltf, bin, bin_n, attrs["COLOR_0"].get<int>(), ccomp, 5126, col, err)) return false;
+  }
+  const auto& iacc = gltf["accessors"][prim["indices"].get<int>()];
+  int ictype = iacc["componentType"].get<int>();
+  if (ictype == 5125) {
+    if (!glb_accessor(gltf, bin, bin_n, prim["indices"].get<int>(), 1, 5125, idx, err)) return false;
+  } else if (ictype == 5123) {
+    std::vector<uint16_t> idx16;
+    if (!glb_accessor(gltf, bin, bin_n, prim["indices"].get<int>(), 1, 5123, idx16, err)) return false;
+    idx.assign(idx16.begin(), idx16.end());
+  } else {
+    if (err) *err = "glb index type not uint16/uint32";
+    return false;
+  }
+  size_t nvert = pos.size() / 3;
+  if (nvert == 0 || idx.empty() || idx.size() % 3 != 0) {
+    if (err) *err = "glb mesh empty or not triangles";
+    return false;
+  }
+  if (nrm.size() != pos.size()) nrm.assign(pos.size(), 0.f);
+  verts.resize(nvert);
+  for (size_t i = 0; i < nvert; ++i) {
+    glm::vec3 p(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]);
+    glm::vec3 n(nrm[i * 3], nrm[i * 3 + 1], nrm[i * 3 + 2]);
+    glm::vec3 c(0.92f, 0.93f, 0.95f);
+    float emi = 0.f;
+    if (!col.empty()) {
+      size_t k = i * static_cast<size_t>(ccomp);
+      c = glm::vec3(col[k], col[k + 1], col[k + 2]);
+      if (ccomp >= 4) emi = col[k + 3];
+    }
+    verts[i] = {p, n, c, emi};
+  }
+  indices = std::move(idx);
+  return true;
+}
+
 // ---- renderer -------------------------------------------------------------
 struct Renderer::Impl {
   GLuint p_caps = 0, p_boxes = 0, p_ground = 0, p_sprite = 0, p_hud = 0, p_mesh = 0, p_bg = 0;
   GLuint vao_caps = 0, vao_boxes = 0, vao_ground = 0, vao_sprite = 0, vao_hud = 0, vao_mesh = 0, vao_bg = 0;
-  GLuint vb_corner = 0, vb_caps = 0, vb_boxes = 0, vb_ground = 0, vb_sprite = 0, vb_hud = 0, vb_mesh = 0;
+  GLuint vb_corner = 0, vb_caps = 0, vb_boxes = 0, vb_ground = 0, vb_sprite = 0, vb_hud = 0, vb_mesh = 0, ib_mesh = 0;
   size_t cap_caps = 0, cap_boxes = 0, cap_ground = 0, cap_sprite = 0, cap_hud = 0;
   GLsizei mesh_n = 0;
+  bool mesh_indexed = false;
+  bool ego_from_glb = false;
+  int ego_tris = 0;
+  std::string ego_glb_path;
   GLuint fbo_ms = 0, rb_color = 0, rb_depth = 0, fbo_res = 0, tex_res = 0;
   int tw = 0, th = 0, tmsaa = 0;
   GLuint tex_bg = 0;
@@ -663,7 +825,28 @@ bool Renderer::init(std::string* err) {
   attrib(2, 2, sizeof(GVert), offsetof(GVert, uv), false);
   attrib(3, 1, sizeof(GVert), offsetof(GVert, mode), false);
 
-  std::vector<MVert> ego = build_ego();
+  std::vector<MVert> ego;
+  std::vector<uint32_t> ego_idx;
+  std::string glb_path = find_asset(kEgoGlbName);
+  std::string glb_err;
+  if (!glb_path.empty() && load_ego_glb(glb_path, ego, ego_idx, &glb_err) && !ego_idx.empty()) {
+    I.ego_from_glb = true;
+    I.ego_glb_path = glb_path;
+    I.ego_tris = static_cast<int>(ego_idx.size() / 3);
+    I.mesh_indexed = true;
+    I.mesh_n = static_cast<GLsizei>(ego_idx.size());
+  } else {
+    ego = build_ego();
+    I.ego_from_glb = false;
+    I.ego_glb_path.clear();
+    I.ego_tris = static_cast<int>(ego.size() / 3);
+    I.mesh_indexed = false;
+    I.mesh_n = static_cast<GLsizei>(ego.size());
+    if (!glb_path.empty() && glb_err.size()) {
+      std::fprintf(stderr, "gvd_viz: ego GLB load failed (%s): %s; using procedural fallback\n",
+                   glb_path.c_str(), glb_err.c_str());
+    }
+  }
   glGenVertexArrays(1, &I.vao_mesh);
   glBindVertexArray(I.vao_mesh);
   glGenBuffers(1, &I.vb_mesh);
@@ -674,7 +857,13 @@ bool Renderer::init(std::string* err) {
   attrib(1, 3, sizeof(MVert), offsetof(MVert, nrm), false);
   attrib(2, 3, sizeof(MVert), offsetof(MVert, col), false);
   attrib(3, 1, sizeof(MVert), offsetof(MVert, emissive), false);
-  I.mesh_n = static_cast<GLsizei>(ego.size());
+  if (I.mesh_indexed) {
+    glGenBuffers(1, &I.ib_mesh);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, I.ib_mesh);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(ego_idx.size() * sizeof(uint32_t)), ego_idx.data(),
+                 GL_STATIC_DRAW);
+    I.buf_bytes += ego_idx.size() * sizeof(uint32_t);
+  }
   glBindVertexArray(0);
 
   glGenQueries(2, I.q);
@@ -801,6 +990,14 @@ void Renderer::target_size(int* w, int* h, int* msaa) const {
   if (h) *h = p_->th;
   if (msaa) *msaa = p_->tmsaa;
 }
+
+bool Renderer::ego_from_glb() const { return p_ && p_->ego_from_glb; }
+int Renderer::ego_triangle_count() const { return p_ ? p_->ego_tris : 0; }
+const std::string& Renderer::ego_glb_path() const {
+  static const std::string kEmpty;
+  return p_ ? p_->ego_glb_path : kEmpty;
+}
+
 
 template <class T>
 static void upload(GLuint vb, const std::vector<T>& v, size_t& cap, size_t& total) {
@@ -1079,7 +1276,8 @@ bool Renderer::render(const Scene& s, const RenderOptions& o, Image* out, bool b
     glm::vec3 tint = pal == Palette::Parking ? glm::vec3(0.25f, 0.55f, 1.0f) : glm::vec3(1.0f);
     glUniform3fv(glGetUniformLocation(I.p_mesh, "u_tint"), 1, glm::value_ptr(tint));
     glBindVertexArray(I.vao_mesh);
-    glDrawArrays(GL_TRIANGLES, 0, I.mesh_n);
+    if (I.mesh_indexed) glDrawElements(GL_TRIANGLES, I.mesh_n, GL_UNSIGNED_INT, nullptr);
+    else glDrawArrays(GL_TRIANGLES, 0, I.mesh_n);
   }
   glEnable(GL_DEPTH_TEST);
   glDepthMask(GL_FALSE);

@@ -1,0 +1,24 @@
+"Tesla Model 3" by David_Holiday, licensed under CC BY 4.0
+(https://creativecommons.org/licenses/by/4.0/).
+Source: https://sketchfab.com/3d-models/tesla-model-3-123c10f376ec4f18b93c73afc382808b
+Author: https://sketchfab.com/David_Holiday
+
+This folder's tesla_model3_ego.glb is that model, prepared for the GVD C++
+visualizer (gvd_viz) as the ego car.
+
+Source file used: model3_car_only.glb, an extract of the car meshes only
+(body, glass, wheels, calipers, a small interior) from a public CC BY 4.0
+copy of the listing. The slideshow scene file model3_scene.glb was not used
+(it also contains non-car props that this project does not redistribute).
+
+Changes made (CC BY 4.0 requires that adaptations be indicated):
+  - The embossed Tesla "T" badge on the hood was removed (307 triangles).
+  - Axes were converted to the visualizer ego frame (X right, Y forward,
+    Z up), length-centered, with the wheels on the ground. The car is
+    4.354 m long.
+  - Vertex colours were assigned (body, glass, wheels, lamps) for the
+    flat-shaded mesh shader; the original placeholder textures were dropped.
+  - No decimation or retopology. Triangle count after the badge removal:
+    26,635 (under 30,000).
+
+Tesla is a trademark; the CC BY 4.0 license does not grant trademark rights.

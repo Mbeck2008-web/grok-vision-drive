@@ -85,6 +85,12 @@ add_library(gvd_viz_core STATIC
 target_include_directories(gvd_viz_core PUBLIC src third_party/stb)
 target_link_libraries(gvd_viz_core PUBLIC gvd_glad glm::glm nlohmann_json::nlohmann_json)
 target_compile_definitions(gvd_viz_core PUBLIC GLM_FORCE_RADIANS GLM_ENABLE_EXPERIMENTAL)
+# Ego GLB (David_Holiday Tesla Model 3). Generated so the path is a proper
+# C string on every generator, including Windows.
+file(TO_CMAKE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/assets" _gvd_viz_assets)
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/gvd_viz_asset_dir.hpp"
+     "#pragma once\n#define GVD_VIZ_ASSET_DIR \"${_gvd_viz_assets}\"\n")
+target_include_directories(gvd_viz_core PUBLIC "${CMAKE_CURRENT_BINARY_DIR}")
 if(GVD_VIZ_EGL)
   target_compile_definitions(gvd_viz_core PUBLIC GVD_VIZ_HAVE_EGL=1)
 endif()
@@ -104,6 +110,10 @@ endif()
 
 add_executable(gvd_viz src/main.cpp)
 target_link_libraries(gvd_viz PRIVATE gvd_viz_core)
+add_custom_command(TARGET gvd_viz POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_directory
+          ${CMAKE_CURRENT_SOURCE_DIR}/assets
+          $<TARGET_FILE_DIR:gvd_viz>/assets)
 
 if(GVD_VIZ_TESTS)
   enable_testing()

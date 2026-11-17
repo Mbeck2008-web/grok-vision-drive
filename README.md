@@ -549,7 +549,8 @@ GVD uses these outside projects. Each one is its authors' work.
 - [mss](https://github.com/BoboTiG/python-mss). Window capture uses mss when BetterCam is unavailable.
 - [pywin32](https://github.com/mhammond/pywin32). Windows matches the BeamNG window title with pywin32.
 - [FFmpeg](https://ffmpeg.org/). Review clips are encoded with FFmpeg when it is on PATH.
+- "Tesla Model 3" by David_Holiday, [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/), https://sketchfab.com/3d-models/tesla-model-3-123c10f376ec4f18b93c73afc382808b — ego mesh in the C++ visualizer (`cpp/viz/assets/`, hood T badge removed).
 
 ## License
 
-GVD's license is MIT (`LICENSE`). Detector weight notices are in `models/NOTICE.txt`.
+GVD's license is MIT (`LICENSE`). Detector weight notices are in `models/NOTICE.txt`. The C++ visualizer ego mesh is CC BY 4.0; see `cpp/viz/assets/ATTRIBUTION.txt`.

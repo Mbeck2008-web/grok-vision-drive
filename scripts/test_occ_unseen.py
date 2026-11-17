@@ -397,6 +397,73 @@ def check_memory_seen_beats_guess() -> None:
           "replaced by the tick-0 observation (cls=drivable); without memory the guess stands OK")
 
 
+def check_memory_unseen_does_not_beat_guess() -> None:
+    """An unseen memory cell must not replace this tick's unobserved live guess.
+
+    Negative twin of check_memory_seen_beats_guess. Tick 0 emits a drivable
+    cell that is already unobserved (same on-ray occluder), so it enters
+    memory with seen=False. Tick 1 emits the same key as a wrong-class
+    unobserved guess. The live guess must stand. Mutant F8 (drop self.seen
+    from the keep clause) lets the unseen memory win.
+    """
+    from python.perception.occ_geometry import project
+    from python.perception.occ_out import observed_mask, occluders
+
+    cams = [c for c in RCAMS.values() if c.cam_id in ("main", "wide")]
+    cam = next(c for c in cams if c.cam_id == "wide")
+    origin = np.asarray(cam.pos, np.float64)
+    tgt_pt = np.array([2.0, 10.0, GROUND_Z + 0.2])
+    ref_pt = np.array([-4.0, 4.0, GROUND_Z + 0.2])
+    tgt = int(G.keys_of(tgt_pt.reshape(1, 3))[0])
+    ref = int(G.keys_of(ref_pt.reshape(1, 3))[0])
+    assert tgt >= 0 and ref >= 0 and tgt != ref
+    _, _, tgt_ok = project(cam, G.centers_of_keys(np.array([tgt])))
+    assert bool(tgt_ok[0])
+
+    gz = int(G.cell_of_key(np.array([ref]))[0, 2])
+    vec = G.centers_of_keys(np.array([tgt]))[0] - origin
+    dist = float(np.linalg.norm(vec))
+    unit = vec / max(dist, 1e-9)
+    cands = []
+    for t in np.arange(0.4, dist - G.voxel_m, G.voxel_m * 0.5):
+        k = int(G.keys_of((origin + unit * t).reshape(1, 3))[0])
+        if k < 0 or k in (tgt, ref):
+            continue
+        if int(G.cell_of_key(np.array([k]))[0, 2]) >= gz + 1:
+            cands.append(k)
+    assert cands, "need an elevated occluder on the ray"
+    occl_k = None
+    for k in cands:
+        kk = np.array([ref, tgt, k], np.int64)
+        cc = np.array([1, 1, 0], np.uint8)
+        obs0 = observed_mask(G.centers_of_keys(kk), cams, occluders(kk, cc, G), G)
+        if not bool(obs0[kk == tgt][0]):
+            occl_k = k
+            break
+    assert occl_k is not None, f"no on-ray occluder hid the target (tried {len(cands)})"
+    k0 = np.array([ref, tgt, occl_k], np.int64)
+    c0 = np.array([1, 1, 0], np.uint8)  # target is a guess, never observed
+    k1 = k0
+    c1 = np.array([1, 0, 0], np.uint8)  # live unobserved guess, other class
+
+    vehicle = {"wheelspeed_mps": 0.0, "imu_yaw_rate": 0.0}
+    imgs = [object() for _ in cams]
+    rt = oo.OccRuntime(StubNet([_pred(k0, c0), _pred(k1, c1)], cams),
+                       from_vehicle=True, memory=True, timer=lambda: 0.0)
+    m0 = rt.step(imgs, 0.0, vehicle=vehicle)
+    keys, cls, _p, obs = rt.last_cells
+    assert m0["ego"]["ok"] and tgt in keys
+    assert not bool(obs[keys == tgt][0]) and int(cls[keys == tgt][0]) == 1
+    m1 = rt.step(imgs, 0.1, vehicle=vehicle)
+    keys, cls, _p, obs = rt.last_cells
+    assert m1["ego"]["ok"] and tgt in keys
+    assert int(cls[keys == tgt][0]) == 0, (int(cls[keys == tgt][0]),
+                                           "unseen memory must not beat the unobserved live guess")
+    assert not bool(obs[keys == tgt][0])
+    print("memory unseen-does-not-beat-guess: never-observed memory (cls=drivable) "
+          "does not replace the tick-1 unobserved live guess (cls=other) OK")
+
+
 def check_causality() -> None:
     preds = [_pred(k, c) for _, _, _, k, c in CLIP_LABELS]
     full = _runtime(list(preds))
@@ -441,6 +508,7 @@ def main() -> int:
     check_memory()
     check_memory_rules()
     check_memory_seen_beats_guess()
+    check_memory_unseen_does_not_beat_guess()
     check_causality()
     print("test_occ_unseen: all OK")
     return 0

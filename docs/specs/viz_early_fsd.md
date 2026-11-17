@@ -63,3 +63,7 @@ Panels, left to right: a perspective grid with the vector scene, up to three cam
 `--viz-showcase` with `--viz-showcase-layout full|split|pip` and `--viz-preset square|story|wide` (1080x1080, 1080x1920, 1920x1080). The frame is the vector stage plus a GVD mark. Split puts the camera on the left. Pip insets it. The nerd panel is not attached. `lerp_state` is for the offline clip only.
 
 `python/viz/showcase.py`, `scripts/render_showcase.py`, `scripts/test_viz_showcase.py`, `docs/images/viz_showcase/`.
+
+## Screenshot gallery
+
+`python scripts/render_viz_gallery.py` writes the four stills above, the debug board, and `docs/images/viz_early_fsd/gallery/` (`--gallery` writes only the gallery). Scenes: intersection (lights, stop bar, zebra), highway_curve, multilane, parking, merge_ramp, t_junction. Each one is rendered at 1280x720 with three lenses (`chase` is the live default, `low` is a closer and lower chase, `high` looks down from high up) and as a ~2.15:1 `*_wide.png` (1548x720, chase), which is the framing of the early-beta stills. `overlay_dusk.png` / `overlay_dusk_wide.png` are the camera overlay on a synthetic dusk frame. Lenses live in `early_vector.EARLY_LENSES`. The supervisor always uses `chase`. All scenes are synthetic states, not captures.

@@ -490,6 +490,29 @@ def test_crosswalk_zebra() -> None:
     print("stop bar and zebra crosswalk OK")
 
 
+def test_gallery_lenses() -> None:
+    """Offline lenses change the view; the live default stays the chase lens."""
+    from python.viz.early_vector import EARLY_LENSES, make_early_cam, render_early_stage
+
+    st = _base()
+    ui = _ui()
+    default = render_early_stage(st, ui, width=640, height=360)
+    chase = render_early_stage(st, ui, width=640, height=360, lens="chase")
+    bogus = render_early_stage(st, ui, width=640, height=360, lens="nope")
+    assert np.array_equal(default, chase) and np.array_equal(default, bogus)
+    ego = {}
+    for name in ("chase", "low", "high"):
+        assert name in EARLY_LENSES
+        frame = render_early_stage(st, ui, width=640, height=360, lens=name)
+        if name != "chase":
+            assert not np.array_equal(frame, chase), name
+        ego[name] = make_early_cam(640, 360, lens=name).project(0.0, 0.0, 0.0)[1]
+    # High looks further down (horizon off the top); low sits nearer the road.
+    hor = {n: make_early_cam(640, 360, lens=n).project(0.0, 150.0, 0.0)[1] for n in ("chase", "low", "high")}
+    assert hor["high"] < hor["chase"] < hor["low"], hor
+    print("gallery lenses: chase default, low / high differ OK")
+
+
 def test_parser_and_time() -> None:
     from python.run_vision import build_parser
 
@@ -538,6 +561,7 @@ def main() -> None:
     test_dashes_not_dots()
     test_chase_lens_and_ego_model()
     test_crosswalk_zebra()
+    test_gallery_lenses()
     test_parser_and_time()
     print("test_viz_early_fsd: OK")
 

@@ -95,12 +95,23 @@ _PRIORS: dict[str, tuple[float, float, float]] = {
 Project = Callable[[float, float, float], tuple[int, int] | None]
 
 
+# Named chase lenses: (eye, look, vertical FOV at 16:9). "chase" is the live
+# default; the others are for offline galleries and showcase angles.
+EARLY_LENSES: dict[str, tuple[tuple[float, float, float], tuple[float, float, float], float]] = {
+    "chase": (EARLY_EYE, EARLY_LOOK, EARLY_FOV),
+    "low": ((0.0, -10.5, 3.3), (0.0, 18.0, 0.4), 40.0),
+    "high": ((0.0, -16.0, 22.0), (0.0, 12.0, 0.0), 50.0),
+}
+
+
 def make_early_cam(
     width: int,
     height: int,
     top_down: bool = False,
     state: dict[str, Any] | None = None,
+    lens: str = "chase",
 ) -> Cam:
+    """Vector-stage camera. Unknown lens names fall back to the live chase."""
     draw = resolve_draw_range(state or {})
     if top_down:
         return Cam(
@@ -112,6 +123,7 @@ def make_early_cam(
             width=int(width),
             height=int(height),
         )
+    eye, look, fov = EARLY_LENSES.get(str(lens or "chase"), EARLY_LENSES["chase"])
     return Cam(
         top_down=False,
         ahead_m=draw.ahead_m,
@@ -119,18 +131,18 @@ def make_early_cam(
         fade_frac=draw.fade_frac,
         width=int(width),
         height=int(height),
-        eye_override=EARLY_EYE,
-        look_override=EARLY_LOOK,
-        fov_deg=early_fov_deg(int(width), int(height)),
+        eye_override=eye,
+        look_override=look,
+        fov_deg=early_fov_deg(int(width), int(height), fov),
     )
 
 
-def early_fov_deg(width: int, height: int) -> float:
+def early_fov_deg(width: int, height: int, base_deg: float = EARLY_FOV) -> float:
     """Vertical FOV. 16:9 and wider use EARLY_FOV. A square or portrait frame
     widens it so the side lanes stay in view (about 0.6 of the 16:9 width)."""
     if width <= 0 or height <= 0:
-        return EARLY_FOV
-    tan_v = math.tan(math.radians(EARLY_FOV) * 0.5)
+        return float(base_deg)
+    tan_v = math.tan(math.radians(float(base_deg)) * 0.5)
     tan_h_min = tan_v * (16.0 / 9.0) * 0.6
     need = tan_h_min * float(height) / float(width)
     return math.degrees(2.0 * math.atan(max(tan_v, need)))
@@ -952,6 +964,7 @@ def render_early_stage(
     overlay: bool = False,
     grid: bool = False,
     hud: bool = True,
+    lens: str = "chase",
 ) -> np.ndarray:
     """One vector frame. An empty state is the ego on black."""
     state = state if isinstance(state, dict) else {}
@@ -960,7 +973,7 @@ def render_early_stage(
     draw_path = True if dbg is None else bool(getattr(dbg, "viz_path", True))
     draw_boxes = True if dbg is None else bool(getattr(dbg, "viz_ghosts", True))
     draw_signs = True if dbg is None else bool(getattr(dbg, "viz_signs", True))
-    cam = make_early_cam(width, height, top_down=top_down, state=state)
+    cam = make_early_cam(width, height, top_down=top_down, state=state, lens=lens)
     want_overlay = bool(overlay) and not top_down
     have_frame = (
         want_overlay

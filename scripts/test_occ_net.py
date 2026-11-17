@@ -284,33 +284,90 @@ def check_capped_hot_below_ground() -> None:
             assert n_struct > 0, (gfrac, p_bg, n_struct, kept)
             print(f"capped_hot ground {gfrac:.2f} + 1 below p={p_bg}: structure kept {n_struct} {kept} OK")
 
-    # A ground surface that spans two fine layers (a slope / quantization
-    # split around z=0) must also leave structure its slots.
-    cmf = G.voxel_m  # fine stage, 0.4 m
-    xs_f = G.x_min + cmf * (np.arange(64) + 0.5)
-    ys_f = G.y_min + cmf * (np.arange(80) + 0.5)
-    Xf, Yf = np.meshgrid(xs_f, ys_f, indexing="ij")
-    Xf, Yf = Xf.ravel(), Yf.ravel()
-    bld_f = ((np.abs(Xf) > 8) & (np.abs(Xf) < 14) & (Yf > 0) & (Yf < 45)) | ((Xf > -4) & (Xf < 4) & (Yf > 35) & (Yf < 40))
 
-    def layer_f(z, mask=None, X=Xf, Y=Yf):
-        m = np.ones_like(X, bool) if mask is None else mask
-        return np.stack([X[m], Y[m], np.full(int(m.sum()), z)], 1)
 
-    # Split the ground xy between z=-0.2 and z=+0.2 (two layers nearest z=0).
-    slope = Xf >= 0
-    parts = [(layer_f(-0.2, ~slope), 0.95, "ground"),
-             (layer_f(0.2, slope), 0.95, "ground"),
-             (layer_f(G.z_min + cmf * 0.5), 0.9, "below")]
-    parts += [(layer_f(1.0 + cmf * k, bld_f), 0.7, "struct") for k in (0, 1, 2, 3)]
-    hot = np.concatenate([p[0] for p in parts])
-    ph = np.concatenate([np.full(len(p[0]), p[1]) + rng.normal(0, 0.01, len(p[0])) for p in parts])
-    lab = np.concatenate([[p[2]] * len(p[0]) for p in parts])
-    idx = _capped_hot(hot, ph, 2048, G.z_min, cmf)
-    n_struct = int((lab[idx] == "struct").sum())
-    kept = dict(zip(*np.unique(lab[idx], return_counts=True)))
-    assert n_struct > 0, (n_struct, kept)
-    print(f"capped_hot 2-layer sloped ground: structure kept {n_struct} {kept} OK")
+def check_capped_hot_follows_ground() -> None:
+    """Ground band follows the local ground per xy column at production LEVELS.
+
+    Production only caps at LEVELS (4, 2): cell 1.6 m and 0.8 m. OccRuntime
+    max_points=16384 with 8 children gives cap=2048 at both stages. A 3%
+    downhill and a -0.7 m ground offset must keep the (far) road; a below
+    layer adjacent to ground must not take band slots (exact band counts).
+    """
+    for f, cap in ((4, 2048), (4, 512), (2, 2048)):
+        cm = G.voxel_m * f
+        nx = int(round((G.x_max - G.x_min) / cm))
+        ny = int(round((G.y_max - G.y_min) / cm))
+        xs = G.x_min + cm * (np.arange(nx) + 0.5)
+        ys = G.y_min + cm * (np.arange(ny) + 0.5)
+        X, Y = np.meshgrid(xs, ys, indexing="ij")
+        X, Y = X.ravel(), Y.ravel()
+        bld = ((np.abs(X) > 8) & (np.abs(X) < 14) & (Y > 0) & (Y < 45)) | (
+            (X > -4) & (X < 4) & (Y > 35) & (Y < 40))
+
+        def zc(z):
+            z = np.asarray(z, dtype=np.float64)
+            return G.z_min + cm * (np.floor((z - G.z_min) / cm) + 0.5)
+
+        def run(name: str, gz, ground_mask=None) -> None:
+            gz = np.broadcast_to(np.asarray(gz, dtype=np.float64), X.shape)
+            gm = np.ones(X.size, bool) if ground_mask is None else ground_mask
+            parts = [(np.stack([X[gm], Y[gm], zc(gz[gm])], 1), 0.95,
+                      np.where(Y[gm] > 20.0, "groundFAR", "groundNEAR"))]
+            # Adjacent below-ground layer only under ground columns, so a
+            # hole cannot promote below to the band. Those below cells
+            # must not take band slots (N6).
+            parts.append((np.stack([X[gm], Y[gm], zc(gz[gm] - cm)], 1), 0.9,
+                          np.full(int(gm.sum()), "below")))
+            for k in (1, 2, 3):
+                parts.append((np.stack([X[bld], Y[bld], zc(gz[bld] + k * cm)], 1),
+                              0.7, np.full(int(bld.sum()), "struct")))
+            hot = np.concatenate([p[0] for p in parts])
+            # Fixed p, no noise: a 0.05 gap must be enough for the column
+            # max to pick ground over the adjacent below layer (N6).
+            ph = np.concatenate([np.full(len(p[0]), p[1]) for p in parts])
+            lab = np.concatenate([p[2] for p in parts])
+            keep = (hot[:, 2] >= G.z_min) & (hot[:, 2] < G.z_max)
+            hot, ph, lab = hot[keep], ph[keep], lab[keep]
+            idx = _capped_hot(hot, ph, cap, G.z_min, cm)
+            assert idx.size <= cap, (name, f, idx.size)
+            picked = lab[idx]
+            n_g = int(np.isin(picked, ("groundFAR", "groundNEAR")).sum())
+            n_far = int((picked == "groundFAR").sum())
+            n_st = int((picked == "struct").sum())
+            n_bel = int((picked == "below").sum())
+            n_g_tot = int(np.isin(lab, ("groundFAR", "groundNEAR")).sum())
+            n_st_tot = int((lab == "struct").sum())
+            n_bel_tot = int((lab == "below").sum())
+            # Exact pool sizes: band is cap//2, all ground; structure next;
+            # adjacent below only gets leftover. Unused budget returns to ground.
+            n_low = min(n_g_tot, cap // 2) if n_g_tot else 0
+            n_up = min(n_st_tot, cap - n_low)
+            n_dn = min(n_bel_tot, cap - n_low - n_up)
+            leftover = cap - (n_low + n_up + n_dn)
+            n_low = min(n_g_tot, n_low + leftover)
+            leftover = cap - (n_low + n_up + n_dn)
+            n_up = min(n_st_tot, n_up + leftover)
+            leftover = cap - (n_low + n_up + n_dn)
+            n_dn = min(n_bel_tot, n_dn + leftover)
+            kept = dict(zip(*np.unique(picked, return_counts=True)))
+            assert n_g == n_low, (name, f, n_g, n_low, kept)
+            assert n_st == n_up, (name, f, n_st, n_up, kept)
+            assert n_bel == n_dn, (name, f, n_bel, n_dn, kept)
+            assert n_far > 0, (name, f, "far road starved", kept)
+            assert n_st > 0, (name, f, "structure starved", kept)
+            print(f"capped_hot f={f} cell={cm}m cap={cap} {name}: "
+                  f"ground {n_g} (far {n_far}) struct {n_st} below {n_bel} OK")
+
+        run("flat z=0.2", 0.2)
+        run("offset z=-0.7", 0.2 - 0.7)
+        run("3% downhill", 0.2 - 0.03 * np.maximum(Y, 0.0))
+        # Holed ground, n_ground < cap//2, structure fills the rest: picked
+        # below must be 0. A widened band (N6) would pull the adjacent below
+        # layer into the band and spend those slots on below.
+        if cap <= 1024 or f == 2:
+            gm = (np.arange(X.size) % 8) == 0  # 12.5% of columns
+            run("holed 12.5% (N6)", 0.2, ground_mask=gm)
 
 
 def check_class_balance() -> None:
@@ -374,6 +431,7 @@ def main() -> int:
     check_sparse_predict()
     check_capped_hot_spreads()
     check_capped_hot_below_ground()
+    check_capped_hot_follows_ground()
     check_class_balance()
     check_unoccupied_not_occluded_structure()
     check_queries()

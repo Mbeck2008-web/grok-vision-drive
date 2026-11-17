@@ -392,13 +392,15 @@ if nn is not None:
 def _capped_hot(hot: np.ndarray, p_hot: np.ndarray, cap: int, z_min: float, cell_m: float) -> np.ndarray:
     """Indices of the ``cap`` hot cells to refine.
 
-    The ground band is every z-layer whose cell centre is at most half a
-    cell from z=0 (geometry, not count). That is the road surface, including
-    a two-layer slope / quantization split around z=0. A thinner or holed
-    ground layer therefore stays the ground band even when a below-ground
-    fill has more cells. At most half the cap goes to that band.
-    Above-ground structure is filled next, then below-ground leftovers, so a
-    hot below-ground fill cannot starve posts / buildings that VO and
+    The ground band follows the ground per xy column: the layer with the
+    highest occupancy in that column (ties go to the lowest layer). Below
+    and above are relative to that column's ground, so a downhill or
+    height-offset road stays the band instead of a fixed z=0 slab. A
+    thinner or holed ground layer still wins its columns when it is the
+    strongest layer there, even if a below-ground fill has more cells
+    globally. At most half the cap goes to the band. Above-ground
+    structure is filled next, then below-ground leftovers, so a hot
+    below-ground fill cannot starve posts / buildings that VO and
     occluders need. Unused budget returns to the ground, then to structure.
 
     Within each of those three pools, slots are spread in xy rather than a
@@ -407,14 +409,24 @@ def _capped_hot(hot: np.ndarray, p_hot: np.ndarray, cap: int, z_min: float, cell
     """
     if hot.size == 0 or cap <= 0:
         return np.zeros((0,), np.int64)
+    cell_m = float(cell_m)
+    z_min = float(z_min)
     lvl = np.floor((hot[:, 2] - z_min) / cell_m + 1e-6).astype(np.int64)
-    # Geometric ground: layers whose centre is within half a cell of z=0.
-    # Count does not pick the band; a full below-ground slab cannot win it.
-    z_center = (lvl + 0.5) * float(cell_m) + float(z_min)
-    half = 0.5 * float(cell_m) + 1e-6
-    band = np.abs(z_center) <= half
-    below = z_center < -half
-    above = z_center > half
+    # Per-column ground: strongest occupied layer in that xy column
+    # (ties downward). Not a global z=0 slab.
+    ix = np.floor(hot[:, 0] / cell_m + 1e-6).astype(np.int64)
+    iy = np.floor(hot[:, 1] / cell_m + 1e-6).astype(np.int64)
+    ix0 = ix - int(ix.min())
+    iy0 = iy - int(iy.min())
+    col = ix0 * (int(iy0.max()) + 1) + iy0
+    order = np.lexsort((lvl, -p_hot, col))
+    _, first = np.unique(col[order], return_index=True)
+    g_lvl = np.empty(int(col.max()) + 1, dtype=np.int64)
+    g_lvl[col[order][first]] = lvl[order][first]
+    gl = g_lvl[col]
+    band = lvl == gl
+    below = lvl < gl
+    above = lvl > gl
 
     def _spread(idxs: np.ndarray, budget: int) -> np.ndarray:
         if budget <= 0 or idxs.size == 0:

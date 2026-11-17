@@ -252,19 +252,18 @@ off): per-frame forward error <= 0.10 m, yaw error < 0.0025 rad; pose drift
 1% with no warp. Limitation: a featureless straight road has no forward
 constraint; the estimate is held and flagged `motion_ok = False`.
 
-Residual VO: cells that already match at zero shift can be an ego-fixed
-`decode_unseen` sheet that would lock `fwd=0`. The search scores the full
-set and the residual (unmatched-at-zero) set. The residual is used only when
-its share of the previous cells is at least `VO_RESIDUAL_SHARE` (0.15) or
-its own overlap is at least `VO_RESIDUAL_CONF` (0.6), and that overlap is
-at least `VO_MIN_SCORE` (0.4, unchanged), and only when its shift versus
-the full hypothesis exceeds one voxel. A one-voxel boundary smear along the
-camera ray is therefore not treated as motion. A parked ego with uniform or
-one-voxel range flicker keeps the full (0, 0) hypothesis (`ok=True`). Tests:
-`check_vo_clutter`, `check_vo_parked_flicker`, `check_vo_parked_range_flicker`,
-`check_vo_residual_share_mid_score`, `check_vo_residual_share_low_score`.
+`occ_odometry` votes only on *observed* static cells (`prev_obs` / `cur_obs`;
+default all observed). Unobserved `decode_unseen` clutter cannot vote, so
+there is no residual-VO path. A parked ego with 1-3 voxel smears, whole-wall
+depth jumps, moving objects, or lateral smear keeps `(0, 0)` (`ok=True`);
+slow real motion on observed cells stays within one search step (0.2 m).
+`OccRuntime` computes `observed_mask` before `ego.update` and passes it in.
+Tests: `check_vo_clutter`, `check_vo_parked_flicker`,
+`check_vo_parked_range_flicker`, `check_vo_parked_structured`,
+`check_vo_slow_motion`. The older residual share-gate tests and mutants N3/N4
+no longer apply (the residual mutation sites are gone).
 
-Tests: `test_occ_ego` (VO, residual clutter, parked+flicker, world-fixed cells with the flag off, non-identity
+Tests: `test_occ_ego` (VO, observed-only clutter, parked structured probes, slow motion, world-fixed cells with the flag off, non-identity
 warp, drift printout), `test_occ_runtime_imports` (no GT-pose module reachable
 from the occupancy runtime, no pose-reading identifier in its source, beamngpy
 not loaded, flag defaults off, a spy mapping proves the default path reads no
@@ -448,18 +447,21 @@ Tests: `test_occ_unseen` (TRACER traces, labels, unseen decode, observed,
 memory, causality), `test_occ_memory_gap` (hidden-leg proof through
 `OccRuntime`: predict + cap + vehicle-signal ego + observed + memory; lift retrain,
 loss ablation, zero-warp, memory-off mutants; camera VO is not in this proof), `test_occ_net` (xy-spread
-cap, below-ground-hot cap, class-balanced ground positives, below-ground
+cap, below-ground-hot cap, per-column ground band at 0.8/1.6 m including
+3% downhill, -0.7 m offset, flat, and exact band contents, class-balanced ground positives, below-ground
 free samples, deterministic overfit/predict), `test_occ_out` (v2 fields, version gate),
 `test_occ_runtime_imports` (safety isolation), `test_eval_occ_unseen` (eval
 smoke). Metrics: `scripts/eval_occ_unseen.py` (results below).
 
-Later-stage `predict` caps (`_capped_hot`): the ground band is every
-z-layer whose cell centre is at most half a cell from z=0 (geometry, not
-count; a two-layer slope around z=0 stays in the band). At most half the
-cap goes there; above-ground structure is filled next, then below-ground, each
-pool spread in xy so a high-p off-road region cannot take the whole ground
-budget. A holed or partial ground layer therefore cannot lose the band to a
-more populous below-ground fill. `sample_queries` class-balances ground positives and spends half of
+Later-stage `predict` caps (`_capped_hot`, at production `LEVELS` (4, 2):
+cell 1.6 m and 0.8 m): the ground band follows the ground per xy column,
+the layer with the highest occupancy in that column (ties go to the lowest
+layer). Below and above are relative to that column's ground, so a downhill
+or height-offset road stays the band instead of a fixed z=0 slab. At most
+half the cap goes to the band; above-ground structure is filled next, then
+below-ground, each pool spread in xy so a high-p off-road region cannot take
+the whole ground budget. A holed or partial ground layer therefore cannot
+lose its own columns to a more populous below-ground fill. `sample_queries` class-balances ground positives and spends half of
 `n_free` on unoccupied *below-ground* cell centres (never on above-ground
 cells missing from `keys`, which may be occluded structure).
 
@@ -538,7 +540,7 @@ python scripts/test_occ_shards.py      # roundtrip, no loose-PNG fallback, rollo
 python scripts/test_occ_sampler.py     # 20-30% recovery per batch, enforced
 python scripts/test_occ_net.py         # projection, camera-only, sparse predict, overfit, cap, class balance, free samples
 python scripts/test_occ_cams.py        # presets, per-cam ages, sparsity begins, checkpoints, profiles
-python scripts/test_occ_ego.py         # camera VO, residual clutter, parked+flicker, static world stays fixed with the flag off
+python scripts/test_occ_ego.py         # camera VO, observed-only clutter, parked structured probes, slow motion, static world stays fixed with the flag off
 python scripts/test_occ_runtime_imports.py  # GT label/pose modules unreachable, flag off, spy, image guard
 python scripts/test_occ_viz.py         # edges vs synthetic road, tracker cases, v1 message, red rule
 python scripts/test_occ_unseen.py      # unmasked occluded loss, unseen decode, memory rules, causality

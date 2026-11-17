@@ -196,18 +196,14 @@ class OccShardDataset:
 
 
 def forward_with_memory(net: Any, batch: dict[str, Any]) -> dict[str, Any]:
-    """Training forward: past frames go through the SAME backbone under no_grad (cached at runtime)."""
-    import torch
-
+    """Training forward: past frames go through the SAME backbone (``occ.encode_memory``: newest past
+    frame with grad, older ones under no_grad; the runtime cache is plain no_grad ``encode``)."""
     past = batch["past_images"]
-    b, k = past.shape[:2]
-    with torch.no_grad():
-        mf = net.encode(past.reshape((b * k,) + tuple(past.shape[2:])))
-    mf = mf.reshape((b, k) + tuple(mf.shape[1:]))
+    mf = occ.encode_memory(net, past)
     feat = net.encode(batch["images"])
     out = net.decode(feat, batch["queries"], mf, batch["mem_xf"], batch["mem_valid"])
     # camera-only VO head, supervised by the recorded pose delta (training label only, never a runtime input)
-    out["vo"] = net.vo(feat, mf[:, 0])
+    out["vo"] = net.vo(net.vo_encode(batch["images"]), net.vo_encode(past[:, 0]))
     out["vo_target"] = occ.delta_from_xf(batch["mem_xf"][:, 0])
     out["vo_valid"] = batch["mem_valid"][:, 0]
     return out

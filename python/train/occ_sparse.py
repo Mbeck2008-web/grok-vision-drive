@@ -46,6 +46,12 @@ MAX_MEM_LEN = 8
 REF_CAMS = 8.0  # "seen" feature scale; fixed so cam count is a loadable knob
 CAM_AGE_TAU_S = 0.3   # a camera frame 0.3 s old counts 1/e; GVD's rig refreshes some cams at 1-2 Hz
 CAM_MAX_AGE_S = 1.0   # older than this: masked out of fusion
+# Visual odometry: its own tiny encoder on a fixed-size downsample of each camera (cached per frame
+# like the backbone maps), a local correlation volume (+-VO_RADIUS cells) between now and the newest
+# past frame, soft-argmax flow per cell, and an MLP from the flow field to (dx, dy, dyaw).
+VO_HW = (24, 32)      # correlation grid (rows, cols); the image is resampled to 2x this, then stride 2
+VO_RADIUS = 4         # +-4 cells = +-8 px of a 64-px-wide view (about +-0.12 x horizontal FOV per tick)
+VO_CH = 16
 
 
 @dataclass(frozen=True)
@@ -233,12 +239,21 @@ def _build_net_class():
                 raise ValueError(f"mem_len {self.mem_len} > {MAX_MEM_LEN}")
             # camera-only visual odometry: ego motion between the newest past frame and now, from the
             # same cached backbone maps. Predicted per camera in that camera's axes, rotated to ego.
-            self.vo_conv = nn.Sequential(
-                nn.Conv2d(2 * width, width, 3, 1, 1), nn.ReLU(inplace=True),
-                nn.Conv2d(width, width, 3, 2, 1), nn.ReLU(inplace=True),
-                nn.AdaptiveAvgPool2d((3, 4)),
+            # (v1 regressed the delta from concatenated stride-8 backbone maps; it never beat "predict the
+            # mean" on G24: per-tick dyaw err 0.019 rad = the prior. Motion is a displacement, so measure it.)
+            self.vo_enc = nn.Sequential(
+                nn.Conv2d(3, VO_CH, 3, 1, 1), nn.ReLU(inplace=True),
+                nn.Conv2d(VO_CH, VO_CH, 3, 2, 1), nn.ReLU(inplace=True),
+                nn.Conv2d(VO_CH, VO_CH, 1),
+                nn.InstanceNorm2d(VO_CH, affine=False),
             )
-            self.vo_fc = nn.Sequential(nn.Linear(width * 12, hidden), nn.ReLU(inplace=True), nn.Linear(hidden, 3))
+            self.vo_temp = nn.Parameter(torch.tensor(math.log(10.0)))
+            self.vo_fc = nn.Sequential(nn.Linear(3 * VO_HW[0] * VO_HW[1], hidden), nn.ReLU(inplace=True),
+                                       nn.Linear(hidden, 3))
+            d = np.arange(-VO_RADIUS, VO_RADIUS + 1, dtype=np.float32)
+            dy_, dx_ = np.meshgrid(d, d, indexing="ij")
+            self.register_buffer("vo_disp", torch.from_numpy(np.stack([dx_.ravel(), dy_.ravel()], 1)),
+                                 persistent=False)
             self.mlp = nn.Sequential(
                 nn.Linear(d_in, hidden), nn.ReLU(inplace=True),
                 nn.Linear(hidden, hidden), nn.ReLU(inplace=True),
@@ -295,12 +310,27 @@ def _build_net_class():
             return self.decode(self.encode(images), queries, mem_feat, mem_xf, mem_valid, cam_valid, cam_age,
                                mem_age)
 
-        def vo(self, feat, past, cam_valid=None, cam_age=None):
+        def vo_encode(self, images):
+            """(B,N,3,H,W) -> (B,N,VO_CH,*VO_HW) per-camera VO maps (cached with the frame at runtime)."""
+            b, n, _, h, w = images.shape
+            x = F.interpolate(images.reshape(b * n, 3, h, w), size=(2 * VO_HW[0], 2 * VO_HW[1]), mode="bilinear",
+                              align_corners=False, antialias=(h > 2 * VO_HW[0] or w > 2 * VO_HW[1]))
+            f = self.vo_enc(x)
+            return f.reshape(b, n, f.shape[1], f.shape[2], f.shape[3])
+
+        def vo(self, cur, past, cam_valid=None, cam_age=None):
             """(B,3) = (dx right, dy forward, dyaw ccw rad): the current ego in the past ego's frame.
-            Camera-only: inputs are this tick's and the newest cached backbone maps."""
-            b, n, c, fh, fw = feat.shape
-            z = self.vo_conv(torch.cat([feat, past], 2).reshape(b * n, 2 * c, fh, fw)).reshape(b * n, -1)
-            o = self.vo_fc(z).reshape(b, n, 3)
+            Camera-only: inputs are this tick's and the newest cached ``vo_encode`` maps."""
+            b, n, c, fh, fw = cur.shape
+            r = VO_RADIUS
+            a = cur.reshape(b * n, c, fh, fw)
+            pp = F.pad(past.reshape(b * n, c, fh, fw), (r, r, r, r))
+            cost = torch.stack([(a * pp[:, :, r + int(dy):r + int(dy) + fh, r + int(dx):r + int(dx) + fw]).mean(1)
+                                for dx, dy in self.vo_disp.tolist()], 1) * torch.exp(self.vo_temp)
+            prob = torch.softmax(cost, 1)
+            flow = torch.einsum("bkhw,kc->bchw", prob, self.vo_disp.to(prob.dtype))
+            conf = prob.max(1, keepdim=True).values
+            o = self.vo_fc(torch.cat([flow, conf], 1).flatten(1)).reshape(b, n, 3)
             ax_r = F.normalize(self.cam_rot[:, 0, :2], dim=-1)
             ax_f = F.normalize(self.cam_rot[:, 2, :2], dim=-1)
             t = o[..., 0:1] * ax_r[None] + o[..., 1:2] * ax_f[None]
@@ -399,6 +429,75 @@ def nearest_coarse_queries(grid: OccGrid, max_coarse: int = DEFAULT_MAX_COARSE) 
     return cidx[np.argsort(d, kind="stable")[:cap]]
 
 
+def coarse_window_radius(grid: OccGrid, max_coarse: int = DEFAULT_MAX_COARSE) -> dict[str, float]:
+    """Radius (m, xy from ego) of the fixed ego-relative coarse window that ``nearest_coarse_queries``
+    proposes: ``full_m`` = every coarse cell centre closer than this is asked; ``max_m`` = the farthest
+    centre asked. Depends only on the grid and the cap, never on images, map or labels."""
+    cidx = nearest_coarse_queries(grid, max_coarse)
+    d = np.hypot(*grid.coarse_centers(cidx)[:, :2].T)
+    cdims = np.array(grid.coarse_dims, np.int64)
+    if len(cidx) >= int(np.prod(cdims)):
+        return {"full_m": float("inf"), "max_m": float(d.max()), "n": int(len(cidx))}
+    # nearest centre NOT asked: enumerate one ring beyond the asked set's bbox (O(window), not O(grid))
+    lo = np.maximum(cidx[:, :2].min(0) - 1, 0)
+    hi = np.minimum(cidx[:, :2].max(0) + 2, cdims[:2])
+    ix, iy, iz = np.meshgrid(np.arange(lo[0], hi[0]), np.arange(lo[1], hi[1]), np.arange(cdims[2]), indexing="ij")
+    ring = np.stack([ix.ravel(), iy.ravel(), iz.ravel()], 1)
+    asked = set(map(tuple, cidx.tolist()))
+    out = np.array([tuple(r) not in asked for r in ring.tolist()])
+    dn = np.hypot(*grid.coarse_centers(ring[out])[:, :2].T) if out.any() else np.array([np.inf])
+    return {"full_m": float(dn.min()), "max_m": float(d.max()), "n": int(len(cidx))}
+
+
+def observed_cells(xyz: np.ndarray, grid: OccGrid, cam_pos: np.ndarray, cam_rot: np.ndarray, tan_hv: np.ndarray,
+                   cam_on: Sequence[bool], *, chunk: int = 1024) -> np.ndarray:
+    """``observed`` per active cell, from the model's own output only (no GT ray cast, no map).
+
+    A cell is observed when, for at least one live (unmasked, fresh) camera this tick, it projects
+    inside that camera's frustum AND no other active cell sits on the ray from the camera to the
+    cell's nearest point (its face toward the camera, so a flat road surface does not occlude
+    itself at grazing angles). The ray is sampled every voxel/3. Masking a camera only removes
+    one term of the OR, so with the active set fixed it can only flip True -> False.
+    Memory-carried cells (outside every live frustum, or behind another active cell) are False.
+    """
+    xyz = np.asarray(xyz, np.float64).reshape(-1, 3)
+    obs = np.zeros(len(xyz), bool)
+    if len(xyz) == 0:
+        return obs
+    idx, _ = grid.to_index(xyz)
+    lin = grid.linear(idx)
+    act = np.unique(lin)
+    half = 0.5 * grid.voxel_m
+    step = grid.voxel_m / 3.0
+    dims = np.array(grid.dims)
+    for n in range(len(cam_pos)):
+        if not bool(cam_on[n]):
+            continue
+        pos = np.asarray(cam_pos[n], np.float64)
+        c = (xyz - pos) @ np.asarray(cam_rot[n], np.float64).T
+        z = c[:, 2]
+        zs = np.maximum(z, 1e-3)
+        vis = (z > 0.1) & (np.abs(c[:, 0] / (zs * tan_hv[n][0])) <= 1) & (np.abs(c[:, 1] / (zs * tan_hv[n][1])) <= 1)
+        cand = np.nonzero(vis & ~obs)[0]
+        for s0 in range(0, len(cand), chunk):
+            ci = cand[s0:s0 + chunk]
+            tgt = np.clip(pos, xyz[ci] - half + 1e-3, xyz[ci] + half - 1e-3)  # nearest point of the cell box
+            ray = pos - tgt
+            dist = np.linalg.norm(ray, axis=1)
+            u = ray / np.maximum(dist, 1e-9)[:, None]
+            ks = np.arange(1, int(np.ceil(dist.max() / step)) + 1)
+            samp = tgt[:, None, :] + u[:, None, :] * (ks[None, :, None] * step)  # from the cell toward the cam
+            ok = (ks[None, :] * step) < dist[:, None]
+            sidx = np.floor((samp - grid.lo) / grid.voxel_m).astype(np.int64)
+            ok &= np.all((sidx >= 0) & (sidx < dims), axis=2)
+            sl = grid.linear(sidx.reshape(-1, 3)).reshape(sidx.shape[:2])
+            ok &= sl != lin[ci][:, None]
+            pos_ = np.clip(np.searchsorted(act, sl), 0, len(act) - 1)
+            hit = ok & (act[pos_] == sl)
+            obs[ci] = ~hit.any(1)
+    return obs
+
+
 def coarse_children(grid: OccGrid, cidx: np.ndarray) -> np.ndarray:
     fx, fy, fz = grid.coarse
     off = np.stack(np.meshgrid(np.arange(fx), np.arange(fy), np.arange(fz), indexing="ij"), -1).reshape(-1, 3)
@@ -453,7 +552,8 @@ class FeatureMemory:
     def __init__(self, mem_len: int = 2) -> None:
         self.mem_len = int(mem_len)
         self.odom: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)  # VO-integrated ego pose
-        self.frames: list[tuple[Any, tuple[float, float, float, float] | None, Any]] = []
+        # (backbone maps, ego pose, per-cam capture times, VO maps)
+        self.frames: list[tuple[Any, tuple[float, float, float, float] | None, Any, Any]] = []
 
     def tensors(self, ego_pose: Sequence[float] | None, like: Any, now: float | None = None):
         torch = _torch()
@@ -463,7 +563,7 @@ class FeatureMemory:
         xf = like.new_zeros((b, k_mem, 2, 3))
         valid = like.new_zeros((b, k_mem, n))
         age = like.new_zeros((b, k_mem, n))
-        for k, (f, pose, cam_t) in enumerate(reversed(self.frames[-self.mem_len:])):  # k=0 newest past
+        for k, (f, pose, cam_t, _vo) in enumerate(reversed(self.frames[-self.mem_len:])):  # k=0 newest past
             if pose is None or ego_pose is None or tuple(f.shape) != tuple(like.shape):
                 continue
             feat[:, k] = f
@@ -473,10 +573,46 @@ class FeatureMemory:
                 age[:, k] = torch.as_tensor(float(now) - np.asarray(cam_t, np.float64), dtype=like.dtype)
         return feat, xf, valid, age
 
-    def push(self, feat: Any, ego_pose: Sequence[float] | None, cam_t: Sequence[float] | None = None) -> None:
+    def push(self, feat: Any, ego_pose: Sequence[float] | None, cam_t: Sequence[float] | None = None,
+             vo_feat: Any = None) -> None:
         pose = None if ego_pose is None else tuple(map(float, ego_pose))
-        self.frames = (self.frames + [(feat.detach(), pose, None if cam_t is None else np.asarray(cam_t))])
+        self.frames = (self.frames + [(feat.detach(), pose, None if cam_t is None else np.asarray(cam_t),
+                                       None if vo_feat is None else vo_feat.detach())])
         self.frames = self.frames[-self.mem_len:] if self.mem_len > 0 else []
+
+
+def encode_memory(net: Any, past: Any, *, grad_newest: bool = True) -> Any:
+    """Training-time encode of K past frames (B,K,N,3,H,W) -> (B,K,N,C,h,w) through the SAME backbone.
+
+    The newest past frame keeps its graph (truncated BPTT of one step) so the loss can shape the
+    features the temporal branch reads; older frames run under no_grad. Encoding every past frame
+    under no_grad (v1) left the memory branch with no gradient into the backbone: with the current
+    view fixed the shared backbone collapsed (past-map contrast 0.30 -> 0.04 in 25 steps) and G22's
+    memory-vs-no-memory gap vanished. At runtime the cache is still plain no_grad ``encode`` output."""
+    torch = _torch()
+    b, k = past.shape[:2]
+    flat = lambda x: x.reshape((b * x.shape[1],) + tuple(x.shape[2:]))  # noqa: E731
+    n_grad = 1 if (grad_newest and torch.is_grad_enabled()) else 0
+    parts = []
+    if n_grad:
+        f0 = net.encode(flat(past[:, :1]))
+        parts.append(f0.reshape((b, 1) + tuple(f0.shape[1:])))
+    if k > n_grad:
+        with torch.no_grad():
+            f1 = net.encode(flat(past[:, n_grad:]))
+        parts.append(f1.reshape((b, k - n_grad) + tuple(f1.shape[1:])))
+    return parts[0] if len(parts) == 1 else torch.cat(parts, 1)
+
+
+def live_cams(net: Any, cam_valid: Sequence[float] | None, cam_t: Sequence[float] | None,
+              now: float | None) -> np.ndarray:
+    """Per camera: does it feed this tick's fusion (same rule as cam_weight: valid and not older than
+    CAM_MAX_AGE_S)? Used for ``observed``."""
+    n = len(net.cam_ids)
+    on = np.ones(n, bool) if cam_valid is None else np.asarray(cam_valid, np.float64).reshape(n) > 0
+    if cam_t is not None and now is not None:
+        on &= (float(now) - np.asarray(cam_t, np.float64).reshape(n)) <= CAM_MAX_AGE_S
+    return on
 
 
 def infer_sparse(net: Any, images: Any, *, tau: float = 0.5, max_fine: int = DEFAULT_MAX_FINE,
@@ -523,15 +659,18 @@ def infer_sparse(net: Any, images: Any, *, tau: float = 0.5, max_fine: int = DEF
         if memory is not None:
             if ego_pose is not None and not ego_from_vehicle:
                 raise ValueError("ego_pose given but ego_from_vehicle is off: runtime ego motion is camera-only (VO)")
-            if ego_pose is None:  # default: camera-only visual odometry from cached features
-                if memory.frames and tuple(memory.frames[-1][0].shape) == tuple(feat.shape):
-                    ego_delta = net.vo(feat, memory.frames[-1][0], cv, ca)[0].tolist()
+            vof = None
+            if ego_pose is None:  # default: camera-only visual odometry from cached VO maps
+                vof = net.vo_encode(images)
+                last = memory.frames[-1][3] if memory.frames else None
+                if last is not None and tuple(last.shape) == tuple(vof.shape):
+                    ego_delta = net.vo(vof, last, cv, ca)[0].tolist()
                     memory.odom = pose_step(memory.odom, ego_delta)
                 ego_pose = memory.odom
             t = lap("vo", t)
             mf, mx, mv, ma = memory.tensors(ego_pose, feat, now)
             mem = (mf, mx, mv, cv, ca, ma if (cam_t is not None and now is not None) else None)
-            memory.push(feat, ego_pose, cam_t)
+            memory.push(feat, ego_pose, cam_t, vof)
             t = lap("memory", t)
         else:
             mem = (None, None, None, cv, ca, None)
@@ -551,7 +690,8 @@ def infer_sparse(net: Any, images: Any, *, tau: float = 0.5, max_fine: int = DEF
         if len(keep) == 0:
             z = torch.zeros((0, 3), dtype=torch.long)
             return {"idx": z, "prob": torch.zeros(0), "sem": torch.zeros((0, len(OCC_CLASSES))),
-                    "flow": torch.zeros((0, 2)), "box": torch.zeros((0, 6)), **base}
+                    "flow": torch.zeros((0, 2)), "box": torch.zeros((0, 6)), "observed": torch.zeros(0, dtype=torch.bool),
+                    **base}
         fidx = coarse_children(grid, cidx[keep])
         fq = np.concatenate([grid.centers(fidx), np.zeros((len(fidx), 1))], 1)
         hid = net.hidden(feat, torch.tensor(fq, dtype=torch.float32, device=dev)[None], *mem)
@@ -564,8 +704,13 @@ def infer_sparse(net: Any, images: Any, *, tau: float = 0.5, max_fine: int = DEF
         fp = torch.sigmoid(out["occ"]).cpu()
         sel = fp > tau
         base["evaluated"] = evaluated
+        on = live_cams(net, cam_valid, cam_t, now)
+        obs = observed_cells(grid.centers(fidx[sel.numpy()]), grid, net.cam_pos.cpu().numpy(),
+                             net.cam_rot.cpu().numpy(), net.tan_hv.cpu().numpy(), on)
+        t = lap("observed", t)
         return {"idx": torch.from_numpy(fidx)[sel], "prob": fp[sel], "sem": out["sem"].cpu()[sel],
-                "flow": out["flow"].cpu()[sel], "box": out["box"].cpu()[sel], **base}
+                "flow": out["flow"].cpu()[sel], "box": out["box"].cpu()[sel],
+                "observed": torch.from_numpy(obs), **base}
 
 
 def export_onnx(net: Any, path: Path | str, *, n_queries: int = 1024, image_hw: tuple[int, int] = (480, 640)) -> Path:
@@ -605,7 +750,8 @@ def export_onnx(net: Any, path: Path | str, *, n_queries: int = 1024, image_hw: 
 
 
 def memory_budget(net: Any, *, n_cams: int = 8, hw: tuple[int, int] = (480, 640), n_queries: int | None = None,
-                  batch: int = 2, train_queries: int = 12288) -> dict[str, Any]:
+                  batch: int = 2, train_queries: int = 12288, infer_batch: int = 1,
+                  max_coarse: int = DEFAULT_MAX_COARSE, max_fine: int = DEFAULT_MAX_FINE) -> dict[str, Any]:
     """Upper-bound memory from a real CPU forward with hooks (an estimate, not a GPU reading).
 
     infer_bytes = params + inputs + the sum of every module output in one
@@ -616,7 +762,7 @@ def memory_budget(net: Any, *, n_cams: int = 8, hw: tuple[int, int] = (480, 640)
     torch = _torch()
     grid = net.grid
     if n_queries is None:
-        n_queries = min(int(np.prod(grid.coarse_dims)), DEFAULT_MAX_COARSE) + DEFAULT_MAX_FINE
+        n_queries = min(int(np.prod(grid.coarse_dims)), int(max_coarse)) + int(max_fine)
     sizes: list[int] = []
 
     def hook(_m, _i, out):
@@ -636,6 +782,15 @@ def memory_budget(net: Any, *, n_cams: int = 8, hw: tuple[int, int] = (480, 640)
             mem = (torch.zeros((1, k) + tuple(f.shape[1:])), torch.zeros(1, k, 2, 3), torch.ones(1, k, n))
             mem_bytes = mem[0].numel() * 4
             sizes.clear()
+            net.encode(img)
+            act_bb = sum(sizes)  # backbone activations of one frame set (newest past frame trains with grad)
+            sizes.clear()
+            vf = net.vo_encode(img)
+            net.vo(vf, vf)
+            # correlation volume + softmax are not module outputs: add them by hand
+            act_vo = sum(sizes) + 2 * n * net.vo_disp.shape[0] * vf.shape[-2] * vf.shape[-1] * 4
+            vo_cache = vf.numel() * 4
+            sizes.clear()
             net(img, torch.zeros(1, n_queries, 3), *mem)  # memory valid: temporal branch counted
             act_infer = sum(sizes)
             sizes.clear()
@@ -648,15 +803,23 @@ def memory_budget(net: Any, *, n_cams: int = 8, hw: tuple[int, int] = (480, 640)
     scale = float(n_cams) / float(n)
     in_bytes = n_cams * 3 * hw[0] * hw[1] * 4
     mem_b = int(mem_bytes * scale)  # cached past features (no grad, also in training)
-    infer = params + in_bytes + mem_b + int(act_infer * scale) + n_queries * 4 * 4
-    past_in = in_bytes * max(1, net.mem_len)  # past frames' images, encoded under no_grad
-    train32 = params * 4 + int(act_train * scale) * 2 * batch + (in_bytes + past_in + mem_b) * batch
-    train16 = params * 4 + params // 2 + int(act_train * scale) * batch + (in_bytes + past_in) * batch // 2 \
+    vo_b = int(vo_cache * scale)
+    ib = max(1, int(infer_batch))
+    infer = params + ib * (in_bytes + mem_b + vo_b + int((act_infer + act_vo) * scale) + n_queries * 4 * 4)
+    past_in = in_bytes * max(1, net.mem_len)  # past frames' images (newest with grad, older under no_grad)
+    # training graph: current forward + the newest past frame's backbone (encode_memory) + VO on 2 frames
+    act_t = int((act_train + act_bb + 2 * act_vo) * scale)
+    train32 = params * 4 + act_t * 2 * batch + (in_bytes + past_in + mem_b) * batch
+    train16 = params * 4 + params // 2 + act_t * batch + (in_bytes + past_in) * batch // 2 \
         + mem_b * batch
     return {
         "params": params // 4,
         "infer_bytes": int(infer),
         "mem_cache_bytes": int(mem_b),  # K x cams x C x h x w x 4 B of cached past backbone maps
+        "vo_cache_bytes": int(vo_b),
+        "infer_batch": ib,
+        "max_coarse": int(max_coarse),
+        "max_fine": int(max_fine),
         "train_fp32_bytes": int(train32),
         "train_fp16_bytes": int(train16),
         "batch": batch,

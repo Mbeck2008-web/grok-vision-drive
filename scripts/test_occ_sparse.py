@@ -424,8 +424,7 @@ def test_temporal() -> None:
         cases = [(0, 5.0), (1, 0.0)]  # (past frame, forward flow m/s)
         for _ in range(250):
             for shade, v in cases:
-                with torch.no_grad():
-                    mf = m.encode(past[shade])[:, None]
+                mf = occ.encode_memory(m, past[shade][:, None])  # the training path (train_occ.forward_with_memory)
                 kw = (mf, eye, torch.ones(1, 1)) if use_mem else ()
                 out = m(cur, qq, *kw)["flow"]
                 loss = ((out - torch.tensor([0.0, v])) ** 2).mean()
@@ -660,7 +659,7 @@ def test_vo() -> None:
         a = torch.from_numpy(np.stack([b[0] for b in batch]))[:, None]
         c = torch.from_numpy(np.stack([b[1] for b in batch]))[:, None]
         tgt = torch.tensor([b[2] for b in batch], dtype=torch.float32)
-        loss = torch.nn.functional.smooth_l1_loss(net.vo(net.encode(c), net.encode(a)) * scale, tgt * scale)
+        loss = torch.nn.functional.smooth_l1_loss(net.vo(net.vo_encode(c), net.vo_encode(a)) * scale, tgt * scale)
         opt.zero_grad()
         loss.backward()
         opt.step()

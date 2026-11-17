@@ -100,14 +100,24 @@ def _connected_by_name(bng: Any) -> dict[str, Any]:
 
 
 def _try_attach(veh: Any) -> str | None:
-    """``None`` when Electrics is attached. Otherwise a short reason."""
+    """``None`` when Electrics is attached. Otherwise a short reason.
+
+    Do not use ``"electrics" in sensors``. beamngpy's Sensors implements
+    ``__getitem__`` but not ``__contains__``, so membership iterates
+    ``sensors[0]`` and raises ``KeyError: 0`` (IQU45 30 min bughunt,
+    ``gvd_traffic_0``), and attach never runs.
+    """
     sensors = getattr(veh, "sensors", None)
     attach = getattr(sensors, "attach", None) if sensors is not None else None
     if not callable(attach):
         return "no sensors.attach"
     try:
-        if "electrics" in sensors:
-            return None
+        sensors["electrics"]
+        return None
+    except (KeyError, TypeError):
+        # KeyError: not attached. TypeError: not a mapping; still try attach.
+        # (Do not use ``in``: that raises KeyError: 0 on beamngpy Sensors.)
+        pass
     except Exception as exc:  # noqa: BLE001
         return f"electrics lookup failed: {type(exc).__name__}: {exc}"
     try:

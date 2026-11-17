@@ -2379,7 +2379,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 _save_progress(done_s, done_s if target_s == float("inf") else target_s)
                 return
             from python.collect.level_session import place_vehicle
-            from python.collect.spawn_mix import traffic_lua
+            from python.collect.spawn_mix import queue_companion_traffic
 
             shift = place_vehicle(bng, vehicle, picked.pos, picked.rot)
             if shift:
@@ -2404,7 +2404,8 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             segment_open = False
             count = traffic_count(args.traffic, map_name)
             ge = getattr(bng, "queue_lua_command", None)
-            if count and callable(ge):
+            slots, notes = [], []
+            if count and spawn_deck is not None:
                 slots, notes = spawn_deck.traffic_slots(
                     picked, count, float(args.traffic_ahead_m), float(args.traffic_behind_m)
                 )
@@ -2416,8 +2417,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     f"(want ahead={float(args.traffic_ahead_m):.0f}m behind={float(args.traffic_behind_m):.0f}m along the road)",
                     flush=True,
                 )
-                for command in traffic_lua(picked, len(slots), slots):
-                    ge(command)
+            queue_companion_traffic(ge, picked, count, slots)
             print(
                 f"collect spawn {segment_id} {picked.kind} "
                 f"({picked.pos[0]:.1f},{picked.pos[1]:.1f},{picked.pos[2]:.1f}) "
@@ -3440,7 +3440,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             row_i = None if row_base is None else int(row_base) + int(getattr(writer, "enqueued", 0) or 0)
             q_before = writer.stats()
             submit_mark = time.monotonic()
-            queued = writer.submit(
+            queued = False
+            if due:
+                queued = writer.submit(
                 due,
                 t=now,
                 timestamps=due_stamps,
@@ -3478,6 +3480,12 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 tags=tags,
             )
             ticks.add("submit_s", time.monotonic() - submit_mark)
+            write_err = (writer.stats() or {}).get("error")
+            if write_err:
+                _save_progress(done_s, done_s if target_s == float("inf") else target_s)
+                print(f"collect stop writer_failed {write_err}", flush=True)
+                run.stop("writer_failed", str(write_err))
+                return 2
             ticks.note(
                 row=bool(queued),
                 cams=len(due),

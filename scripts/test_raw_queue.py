@@ -2,6 +2,7 @@
 """Capture tick time stays flat when the disk writer is slow."""
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import threading
@@ -131,10 +132,62 @@ def check_queue_writes_controls_off_thread() -> None:
         assert "lane_gt" in gt
 
 
+
+def check_failed_write_is_not_counted_written() -> None:
+    """A write error must not increment written or kill later ticks."""
+    image = np.zeros((8, 8, 3), dtype=np.uint8)
+    class _Boom:
+        def __init__(self) -> None:
+            self.calls = 0
+        def write_encoded(self, payload, **kwargs: object) -> None:
+            self.calls += 1
+            if self.calls == 1:
+                raise OSError("disk full")
+    boom = _Boom()
+    queue = RawWriteQueue(boom, max_depth=8)
+    try:
+        assert queue.submit({"main": image}, **_payload(0))
+        assert queue.submit({"main": image}, **_payload(1))
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            stats = queue.stats()
+            if stats["written"] + int(stats.get("failed") or 0) >= 2 and stats.get("error"):
+                break
+            time.sleep(0.01)
+        stats = queue.stats()
+        assert stats["written"] == 1, stats
+        assert int(stats.get("failed") or 0) == 1, stats
+        assert stats.get("error") and "disk full" in str(stats["error"])
+        assert boom.calls == 2
+    finally:
+        queue.close()
+    print("failed write is not counted as written")
+
+
+def check_empty_submit_does_not_create_a_row() -> None:
+    """Empty camera dicts must not become gt rows with no PNGs."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        queue = RawWriteQueue(RawFrameWriter(root, []), max_depth=4)
+        try:
+            assert queue.submit({}, **_payload(0)) is True
+            assert queue.submit({"main": np.zeros((4, 4, 3), dtype=np.uint8)}, **_payload(1))
+            assert queue.wait_empty(2.0)
+        finally:
+            queue.close()
+        state = list((root / "state.jsonl").read_text(encoding="utf-8").splitlines())
+        assert len(state) == 1
+        assert json.loads(state[0])["i"] == 0
+        assert list(root.joinpath("raw").rglob("*.png"))
+    print("empty submit creates no hollow row")
+
+
 def main() -> None:
     check_tick_does_not_wait_for_disk()
     check_full_queue_drops_and_stays_fast()
     check_queue_writes_controls_off_thread()
+    check_failed_write_is_not_counted_written()
+    check_empty_submit_does_not_create_a_row()
     print("raw queue ok")
 
 

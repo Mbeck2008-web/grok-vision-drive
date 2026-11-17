@@ -38,6 +38,8 @@ class RawWriteQueue:
         self.dropped = 0
         self.enqueued = 0
         self.written = 0
+        self.failed = 0
+        self.error: str | None = None
         self._peak = 0
         self._queued = 0
         self._encoding = 0
@@ -78,6 +80,8 @@ class RawWriteQueue:
                 arr = np.ascontiguousarray(image)
                 copied[str(cam_id)] = arr
                 nbytes += int(arr.nbytes)
+        if not copied:
+            return True
         with self._lock:
             if self._inflight() >= self.max_depth or self._bytes + nbytes > self.max_bytes:
                 self.dropped += 1
@@ -102,6 +106,8 @@ class RawWriteQueue:
                 "dropped_frames": int(self.dropped),
                 "enqueued": int(self.enqueued),
                 "written": int(self.written),
+                "failed": int(self.failed),
+                "error": self.error,
                 "bytes_written": int(getattr(self.writer, "stored_bytes", 0) or 0),
                 "encode_s_last": round(float(self._encode_s_last), 4),
                 "commit_s_last": round(float(self._commit_s_last), 4),
@@ -113,7 +119,7 @@ class RawWriteQueue:
         deadline = time.monotonic() + max(0.0, float(timeout_s))
         while True:
             with self._lock:
-                idle = self._inflight() == 0 and int(self.written) >= int(self.enqueued)
+                idle = self._inflight() == 0 and int(self.written) + int(self.failed) >= int(self.enqueued)
             if idle:
                 return True
             if time.monotonic() >= deadline:
@@ -127,6 +133,12 @@ class RawWriteQueue:
         for thread in self._threads:
             thread.join(timeout=max(0.1, float(deadline)))
         self._commit.join(timeout=max(0.1, float(deadline)))
+        closer = getattr(self.writer, "close", None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception:
+                pass
 
     def _encode(self) -> None:
         while True:
@@ -146,7 +158,11 @@ class RawWriteQueue:
                     payload: Any = encode_cameras(frames) if self._encoded else frames
                 except Exception as exc:
                     print(f"collect encode failed: {type(exc).__name__}: {exc}", flush=True)
-                    payload = [] if self._encoded else {}
+                    payload = None
+                else:
+                    if self._encoded and not payload:
+                        print("collect encode failed: no camera bytes", flush=True)
+                        payload = None
                 spent = time.monotonic() - began
                 with self._cv:
                     self._encode_s_last = spent
@@ -169,20 +185,29 @@ class RawWriteQueue:
                 self._committing += 1
                 self._next += 1
             began = time.monotonic()
+            ok = False
+            err: str | None = None
             try:
-                try:
-                    if self._encoded:
-                        self.writer.write_encoded(payload, **kwargs)
-                    else:
-                        self.writer.write(payload, **kwargs)
-                except Exception as exc:
-                    print(f"collect write failed: {exc}", flush=True)
-                    raise
-            finally:
-                spent = time.monotonic() - began
-                with self._lock:
-                    self._commit_s_last = spent
-                    self._commit_s_max = max(self._commit_s_max, spent)
-                    self._committing -= 1
-                    self._bytes = max(0, self._bytes - nbytes)
+                if payload is None:
+                    err = "encode failed: no camera bytes"
+                elif self._encoded:
+                    self.writer.write_encoded(payload, **kwargs)
+                    ok = True
+                else:
+                    self.writer.write(payload, **kwargs)
+                    ok = True
+            except Exception as exc:
+                err = f"{type(exc).__name__}: {exc}"
+                print(f"collect write failed: {exc}", flush=True)
+            spent = time.monotonic() - began
+            with self._lock:
+                self._commit_s_last = spent
+                self._commit_s_max = max(self._commit_s_max, spent)
+                self._committing -= 1
+                self._bytes = max(0, self._bytes - nbytes)
+                if ok:
                     self.written += 1
+                else:
+                    self.failed += 1
+                    if err and not self.error:
+                        self.error = err

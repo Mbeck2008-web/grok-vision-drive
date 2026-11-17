@@ -475,23 +475,43 @@ def _write_bytes(path: Path, payload: bytes) -> None:
     write_atomic(path, payload)
 
 
-def _append_line(path: Path, line: Mapping[str, Any]) -> None:
-    blob = (json.dumps(line, separators=(",", ":")) + "\n").encode("utf-8")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(
-        str(path),
-        os.O_CREAT | os.O_APPEND | os.O_WRONLY | os_binary(),
-        0o644,
-    )
-    try:
+class _JsonlAppender:
+    """One append handle, opened once and kept for the run."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self._fd: int | None = None
+
+    def append(self, line: Mapping[str, Any]) -> None:
+        blob = (json.dumps(line, separators=(",", ":")) + "\n").encode("utf-8")
+        if self._fd is None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._fd = os.open(
+                str(self.path),
+                os.O_CREAT | os.O_APPEND | os.O_WRONLY | os_binary(),
+                0o644,
+            )
         view = memoryview(blob)
         while view:
-            wrote = os.write(fd, view)
+            wrote = os.write(self._fd, view)
             if wrote <= 0:
-                raise OSError(f"raw state write made no progress: {path}")
+                raise OSError(f"raw state write made no progress: {self.path}")
             view = view[wrote:]
+
+    def close(self) -> None:
+        fd = self._fd
+        self._fd = None
+        if fd is not None:
+            os.close(fd)
+
+
+def _append_line(path: Path, line: Mapping[str, Any]) -> None:
+    """One-shot helper for tests and callers that do not keep a handle."""
+    log = _JsonlAppender(Path(path))
+    try:
+        log.append(line)
     finally:
-        os.close(fd)
+        log.close()
 
 
 def encode_cameras(
@@ -710,6 +730,8 @@ class RawFrameWriter:
             write_raw_layout(self.root, self.per_dir)
         self.state_path = self.root / "state.jsonl"
         self.gt_path = self.root / "gt.jsonl"
+        self._state_log = _JsonlAppender(self.state_path)
+        self._gt_log = _JsonlAppender(self.gt_path)
         self.cameras = list(cameras or [])
         self._by_id = {str(cam["id"]): cam for cam in self.cameras if cam.get("id")}
         self._prev_t: float | None = None
@@ -776,12 +798,16 @@ class RawFrameWriter:
         tech: Mapping[str, Any] | None = None,
         driver: str | None = None,
         tags: Mapping[str, Any] | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         """Write already-encoded camera bytes and one state line.
 
         Callers that encode on several threads still commit here one tick
         at a time, in capture order, so ``dt_s`` stays the capture gap.
+        An empty payload adds no row and returns None, so a failed encode
+        cannot open a hollow gt index with no PNG files.
         """
+        if not encoded:
+            return None
         idx = self._n
         t_store = round(float(t), 6)
         dt_s = None if self._prev_t is None else round(t_store - self._prev_t, 6)
@@ -852,15 +878,23 @@ class RawFrameWriter:
         }
         for key, value in dict(tags or {}).items():
             line[str(key)] = _jsonable(value)
-        _append_line(self.state_path, line)
+        self._state_log.append(line)
         if tech is not None:
-            _append_line(
-                self.gt_path,
-                {"i": idx, "t": t_store, "tech": _jsonable(dict(tech))},
-            )
+            self._gt_log.append({"i": idx, "t": t_store, "tech": _jsonable(dict(tech))})
         self._n = idx + 1
         self._prev_t = t_store
         return line
+
+
+    def close(self) -> None:
+        self._state_log.close()
+        self._gt_log.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def _jsonable(value: Any) -> Any:

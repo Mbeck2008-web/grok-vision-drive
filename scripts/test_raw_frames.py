@@ -240,12 +240,115 @@ def check_raw_count_is_one_camera() -> None:
     print("raw count is per camera")
 
 
+
+def check_state_jsonl_stays_open_across_rows() -> None:
+    """state.jsonl and gt.jsonl stay open for the run.
+
+    The 30 min bughunt recorded commit_s of 28.8 s. Reopening those files
+    every tick can stall the commit thread when a reader holds them
+    (Windows sharing). A reader thread must not block the writer, and
+    os.open is used once per log, not once per row.
+    """
+    import os
+    import threading
+    import time
+
+    from python.data.raw_frames import RawFrameWriter
+    from python.debug.lane_targets import tech_from_hit
+
+    image = np.zeros((8, 8, 3), dtype=np.uint8)
+    image[:, :, 1] = 9
+    opens: list[str] = []
+    real_open = os.open
+
+    def counting_open(path, flags, *rest, **kwargs):
+        opens.append(str(path))
+        return real_open(path, flags, *rest, **kwargs)
+
+    os.open = counting_open  # type: ignore[method-assign]
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            writer = RawFrameWriter(root, [])
+            try:
+                for i in range(6):
+                    writer.write(
+                        {"main": image},
+                        t=float(i),
+                        tech=tech_from_hit(0.1, 0.0, 3.5, False),
+                    )
+                # A reader holds the file the way a status poller does.
+                hold = threading.Event()
+                started = threading.Event()
+
+                def _read() -> None:
+                    with (root / "state.jsonl").open("r", encoding="utf-8") as handle:
+                        started.set()
+                        handle.read()
+                        hold.wait(1.0)
+
+                t = threading.Thread(target=_read, daemon=True)
+                t.start()
+                assert started.wait(1.0)
+                t0 = time.perf_counter()
+                writer.write(
+                    {"main": image},
+                    t=6.0,
+                    tech=tech_from_hit(0.1, 0.0, 3.5, False),
+                )
+                spent = time.perf_counter() - t0
+                hold.set()
+                t.join(1.0)
+            finally:
+                writer.close()
+            state_opens = [p for p in opens if p.endswith("state.jsonl")]
+            gt_opens = [p for p in opens if p.endswith("gt.jsonl")]
+            assert len(state_opens) == 1, state_opens
+            assert len(gt_opens) == 1, gt_opens
+            assert spent < 0.2, spent
+            lines = (root / "state.jsonl").read_text(encoding="utf-8").splitlines()
+            assert len(lines) == 7, len(lines)
+            assert len((root / "gt.jsonl").read_text(encoding="utf-8").splitlines()) == 7
+    finally:
+        os.open = real_open  # type: ignore[method-assign]
+    print("state.jsonl stays open across rows")
+
+
+def check_empty_encoded_tick_does_not_add_a_row() -> None:
+    """A tick with no camera bytes must not open a hollow state/gt index.
+
+    The 30 min bughunt had 106 gt rows in 0..12018 whose main/wide PNGs
+    were missing, with dropped_frames=0.
+    """
+    from python.data.raw_frames import RawFrameWriter
+    from python.debug.lane_targets import tech_from_hit
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        writer = RawFrameWriter(root, [])
+        try:
+            line = writer.write_encoded([], t=1.0, tech=tech_from_hit(0.1, 0.0, 3.5, False))
+            assert line is None
+            image = np.zeros((4, 4, 3), dtype=np.uint8)
+            writer.write({"main": image}, t=1.0, tech=tech_from_hit(0.1, 0.0, 3.5, False))
+        finally:
+            writer.close()
+        state = (root / "state.jsonl").read_text(encoding="utf-8").splitlines()
+        assert len(state) == 1
+        assert json.loads(state[0])["i"] == 0
+        pngs = list((root / "raw").rglob("*.png"))
+        assert len(pngs) == 1
+    print("empty encoded tick adds no hollow row")
+
+
 def main() -> None:
     check_disk_ceiling()
     check_rates_and_controls()
     check_pixels_roundtrip_and_load_time_stitch()
     check_validator_reads_raw_and_names_time_holes()
     check_raw_count_is_one_camera()
+    check_state_jsonl_stays_open_across_rows()
+    check_empty_encoded_tick_does_not_add_a_row()
     print("raw frames ok")
 
 

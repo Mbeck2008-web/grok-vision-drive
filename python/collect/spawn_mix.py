@@ -1751,8 +1751,8 @@ def traffic_lua(pick: SpawnPick, count: int, slots: list[Any] | None = None) -> 
     spawn tangent. The player vehicle is not deleted and is not switched into
     traffic mode.
     """
-    if count <= 0:
-        return []
+    # count<=0 or empty slots still emit the delete loop. A respawn that
+    # finds no new poses must not leave leftover gvd_traffic_* cars behind.
     dx = 0.0
     dy = 1.0
     # The yaw quaternion is (0, 0, sin(yaw/2), cos(yaw/2)). Recover the heading.
@@ -1798,4 +1798,21 @@ def traffic_lua(pick: SpawnPick, count: int, slots: list[Any] | None = None) -> 
         lines.append(f"  veh:queueLuaCommand('ai.setSpeed({speed:.1f})')")
         lines.append("end")
     return [" ".join(lines)]
+
+
+
+def queue_companion_traffic(ge: Any, pick: SpawnPick, count: int, slots: list[Any] | None) -> int:
+    """Send replace-traffic Lua. Always deletes old ``gvd_traffic_*`` cars first.
+
+    ``slots`` is the list from ``traffic_slots`` (possibly empty). An empty
+    list still deletes leftovers and does not invent tangent poses. ``None``
+    keeps the default ahead/behind offsets when count > 0.
+    """
+    if not callable(ge):
+        return 0
+    sent = 0
+    for command in traffic_lua(pick, int(count or 0), slots):
+        ge(command)
+        sent += 1
+    return sent
 

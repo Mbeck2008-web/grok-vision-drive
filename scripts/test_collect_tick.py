@@ -32,9 +32,16 @@ PROBE_REPLY = {
     "g2": {"x": 0.9, "y": 0.0, "z": 9.8},
     "w": {"yaw": 0.02, "pitch": 0.0, "roll": 0.0},
 }
-TRAFFIC_CAR = {"name": "gvd_traffic_0", "pos": [0.4, 40.0, 0.5], "vel": [0.0, 9.0, 0.0], "dir": [0.0, 1.0, 0.0]}
+# One car the sim reports up/box for, one it reports neither: both must reach the row
+# through the brake-light merge (up/box are training-only occupancy inputs).
+TRAFFIC_BOX = {"ctr": [0.4, 40.0, 0.9], "half": [0.95, 2.3, 0.75],
+               "ax": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]}
+TRAFFIC_CAR = {"name": "gvd_traffic_0", "pos": [0.4, 40.0, 0.5], "vel": [0.0, 9.0, 0.0], "dir": [0.0, 1.0, 0.0],
+               "up": [0.0, 0.0, 1.0], "box": TRAFFIC_BOX}
+TRAFFIC_BARE = {"name": "gvd_traffic_1", "pos": [-3.1, 25.0, 0.5], "vel": [0.0, 8.0, 0.0], "dir": [0.0, 1.0, 0.0]}
 # The fake session does not connect the scenetree car, so Electrics stays masked.
-TRAFFIC_ROW = {**TRAFFIC_CAR, "brake_lights": None}
+TRAFFIC_ROWS = [{**TRAFFIC_CAR, "brake_lights": None},
+                {**TRAFFIC_BARE, "up": None, "box": None, "brake_lights": None}]
 # Old row keys, in their order before the control fields: these stay byte-identical.
 OLD_EGO = ["speed_mps", "yaw_rate", "damage", "pos", "dir", "up", "x", "y"]
 OLD_CAPTURE = ["t", "dt_s", "steer", "throttle", "brake", "speed_mps", "yaw_rate", "pos", "dir", "driver", "gt"]
@@ -114,7 +121,7 @@ class _Bng:
     def queue_lua_command(self, command: str, *args: object) -> object:
         if "getObjectCount" in command and args and args[0]:
             self.traffic_calls += 1
-            return json.dumps([TRAFFIC_CAR])
+            return json.dumps([TRAFFIC_CAR, TRAFFIC_BARE])
         return None
 
 
@@ -268,7 +275,7 @@ def _wire_run(every: int, fail: bool, version: object) -> dict:
     if fail:  # a failed probe or traffic read is null, never 0, and the row is still written
         assert all(r["traffic"] is None for r in rows), [r["traffic"] for r in rows]
     else:
-        assert rows[0]["traffic"] == [TRAFFIC_ROW]
+        assert rows[0]["traffic"] == TRAFFIC_ROWS
     assert all(r["traffic"] is None for r in rows[1:])
     assert rows[0]["veh_meta"] == {"model": "etk800", "steer_lock_deg": 450.0, "wheelbase_m": 2.91}
     kinds = [[_kind(d) for d in frame] for frame in game.frames]
@@ -380,7 +387,7 @@ def check_one_tick() -> None:
         assert pngs, sorted(p.name for p in out.rglob("*") if p.is_file())
         print(f"state steer={wheel.get('steer')} png={pngs[0].name}")
         _check_control_row(row, line, probed=True)
-        assert row["traffic"] == [TRAFFIC_ROW], row["traffic"]
+        assert row["traffic"] == TRAFFIC_ROWS, row["traffic"]
         assert row["veh_meta"] == {"model": "etk800", "steer_lock_deg": 450.0, "wheelbase_m": 2.91}, row["veh_meta"]
         print(f"control row ok steer_ai={wheel['steer_ai']} deg={wheel['steer_angle_deg']} traffic=1")
 
@@ -432,7 +439,7 @@ def check_probe_every_2_and_traffic_rate() -> None:
         for k, (row, line) in enumerate(zip(rows, lines)):
             _check_control_row(row, line, probed=k % 2 == 0)
         # The fake ticks are ms apart: traffic on the first row only (2 Hz).
-        assert rows[0]["traffic"] == [TRAFFIC_ROW] and all(r["traffic"] is None for r in rows[1:]), [
+        assert rows[0]["traffic"] == TRAFFIC_ROWS and all(r["traffic"] is None for r in rows[1:]), [
             r["traffic"] for r in rows
         ]
         assert bng.traffic_calls == 1 and vehicle.probes == (len(rows) + 1) // 2, (bng.traffic_calls, vehicle.probes)

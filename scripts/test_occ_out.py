@@ -156,6 +156,8 @@ def check_panels() -> None:
     st = {c: v["status"] for c, v in last["cams"].items()}
     assert st["main"] == "LIVE" and all(v in oo.CAM_STATUS for v in st.values()), st
     assert [m["seq"] for m in msgs] == list(range(len(TS))) and [m["t"] for m in msgs] == TS
+    confs = [x for e in last["edges"] for x in e["conf"]]
+    assert float(np.median(confs)) == 0.9 and max(confs) <= 0.9, confs  # = the boundary cells' occupancy prob
     c = last["counts"]
     assert c["stored"] <= c["queried"] <= c["full"] and c["frustum"] < c["full"] and c["cells_out"] <= oo.MAX_CELLS
     from python.viz import occ_viz
@@ -239,6 +241,7 @@ def check_boxes2d() -> None:
     _, mm = run(preset="min")
     m = mm[-1]
     assert {c for c, v in m["cams"].items() if v["status"] != "ABSENT"} == {"main", "wide"}, m["cams"]
+    assert m["counts"]["frustum"] < last["counts"]["frustum"], (m["counts"], last["counts"])  # active cams only
     assert set(m["boxes2d"]) <= {"main", "wide"} and m["cams"]["rear"] == {"status": "ABSENT", "age_s": None, "weight": 0.0, "res": None}
     bad = copy.deepcopy(last); bad["boxes2d"]["rear"] = [dict(last["boxes2d"]["main"][0])]
     bad["cams"]["rear"] = {"status": "STALE", "age_s": 0.9, "weight": 0.1, "res": [640, 400]}

@@ -30,8 +30,6 @@ N_COARSE = 512
 JITTER = 0.45
 
 
-
-
 def _class_balance(idxs: np.ndarray, cls: np.ndarray, rng: np.random.Generator, n: int) -> np.ndarray:
     """Sample ``n`` of ``idxs``, splitting evenly across the classes they carry.
 
@@ -54,14 +52,35 @@ def _class_balance(idxs: np.ndarray, cls: np.ndarray, rng: np.random.Generator, 
 
 
 def _unoccupied_points(keys: np.ndarray, grid: OccGrid, rng: np.random.Generator, n: int) -> np.ndarray:
-    """Centres of ``n`` cells that are not in the occupied key set (may be empty)."""
+    """Centres of ``n`` unoccupied cells *below the ground layer*.
+
+    Above-ground cells missing from ``keys`` may be occluded structure (the
+    upper layers only carry camera-hit labels). Labelling those as free would
+    teach "unseen structure = empty". Below the ground band nothing is
+    occupied, so those cells are safe negatives.
+    """
     if n <= 0:
         return np.zeros((0, 3), np.float64)
     occ = np.asarray(keys, np.int64)
-    # draw with a small rejection buffer; the grid is sparse so this almost always fills
-    cand = rng.integers(0, grid.dense_cells, size=max(int(n) * 4, int(n)))
+    if occ.size:
+        z = grid.cell_of_key(occ)[:, 2]
+        gz = int(np.bincount(z - int(z.min())).argmax() + int(z.min()))
+    else:
+        gz = int(np.floor((0.0 - grid.z_min) / float(grid.voxel_m)))
+    gz = max(0, gz)
+    if gz <= 0:
+        return np.zeros((0, 3), np.float64)
+    nx, ny, _ = grid.shape
+    n_draw = max(int(n) * 4, int(n))
+    cell = np.stack([
+        rng.integers(0, nx, size=n_draw),
+        rng.integers(0, ny, size=n_draw),
+        rng.integers(0, gz, size=n_draw),
+    ], axis=1)
+    cand = grid.key_of_cell(cell)
     if occ.size:
         cand = cand[~np.isin(cand, occ)]
+    cand = cand[cand >= 0]
     if cand.size < n:
         return grid.centers_of_keys(cand) if cand.size else np.zeros((0, 3), np.float64)
     return grid.centers_of_keys(cand[:n])

@@ -22,7 +22,9 @@ Reads only the keys named in ``occ_to_viz``. Ground-truth keys in the input
 """
 from __future__ import annotations
 
+import collections
 import json
+import logging
 import math
 from typing import Any, Mapping
 
@@ -48,6 +50,21 @@ MOTION_COLORS = {
     "unknown": "blue",
 }
 MARK_COLOR = "white"         # crosswalks and stop lines
+INPUT_KEYS = frozenset(("t", "ego", "cells", "grid", "edges", "curbs", "objects", "lanes", "crosswalks",
+                        "stop_lines", "path", "path_conf", "lead_id"))
+EGO_INPUT_KEYS = frozenset(("speed_mps", "engaged", "set_mps", "source", "motion_ok", "yaw_rate"))
+DROPPED = collections.Counter()  # unknown input keys dropped by occ_to_viz, "<key>" / "ego.<key>"
+_log = logging.getLogger(__name__)
+
+
+def _drop_unknown(o: Mapping[str, Any], ego: Mapping[str, Any]) -> list[str]:
+    """Count (and warn once per key) every input key occ_to_viz does not read."""
+    bad = [str(k) for k in o if k not in INPUT_KEYS] + [f"ego.{k}" for k in ego if k not in EGO_INPUT_KEYS]
+    for k in bad:
+        if DROPPED[k] == 0:
+            _log.warning("occ_to_viz: dropping unknown input key %r (counted in occ_viz.DROPPED)", k)
+        DROPPED[k] += 1
+    return bad
 
 
 def _f(v: Any, nd: int = 2) -> float | None:
@@ -113,10 +130,12 @@ def occ_to_viz(outputs: Mapping[str, Any], *, seq: int = 0) -> dict[str, Any]:
 
     Reads: ``t``, ``ego.{speed_mps,engaged,set_mps}``, ``cells``, ``grid``,
     ``edges``, ``curbs``, ``objects``, ``lanes``, ``crosswalks``,
-    ``stop_lines``, ``path``, ``path_conf``, ``lead_id``. Nothing else.
+    ``stop_lines``, ``path``, ``path_conf``, ``lead_id``. Nothing else: any
+    other input key is dropped, counted in ``DROPPED`` and logged once.
     """
     o = outputs if isinstance(outputs, Mapping) else {}
     ego = o.get("ego") if isinstance(o.get("ego"), Mapping) else {}
+    _drop_unknown(o, ego)
     msg: dict[str, Any] = {
         "v": SCHEMA_VERSION, "type": "gvd_scene", "seq": int(seq), "t": _f(o.get("t"), 4) or 0.0,
         "ego": {"engaged": bool(ego.get("engaged")), "speed_mps": _f(ego.get("speed_mps")) or 0.0},

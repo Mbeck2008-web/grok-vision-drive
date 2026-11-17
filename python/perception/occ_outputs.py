@@ -158,7 +158,8 @@ def objects(keys: np.ndarray, cls: np.ndarray, *, grid: OccGrid = DEFAULT_GRID) 
         zs = grid.z_min + (c3[inside, 2] + 0.5) * v
         out.append({"cls": "vehicle", "x": float(ctr[0]), "y": float(ctr[1]), "yaw": float(yaw), "yaw_src": "pca",
                     "length": float(proj_l.max() - proj_l.min() + v), "width": float(proj_w.max() - proj_w.min() + v),
-                    "height": float(zs.max() - zs.min() + v), "cells": int(comp.size)})
+                    "height": float(zs.max() - zs.min() + v), "z0": float(zs.min() - v / 2.0),
+                    "cells": int(comp.size)})
     return out
 
 

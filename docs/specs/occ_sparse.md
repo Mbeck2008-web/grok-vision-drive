@@ -298,14 +298,78 @@ yellow, **red only on `edges[]` (road edges and curbs)**. Tracks: same_way green
 oncoming yellow, crossing purple, alongside blue, parked orange, unknown blue.
 Crosswalks and stop lines white.
 
+## `occ_out` v1 (runtime output contract, `python/perception/occ_out.py`)
+
+`OccRuntime.step(images, t, ages_s=..., vehicle=None)` runs net -> camera VO ->
+tracker -> outputs and returns one **validated** `occ_out` dict per tick.
+`validate_occ_out` **raises** `OccOutError` on any unknown field at any level
+(new fields => `v` bump), a missing field, NaN/inf, wrong type/shape, a
+probability or confidence outside [0, 1], an unknown class / paint / motion /
+camera status / ego source, `stored <= queried <= full` broken, a count that
+disagrees with its array, a non-unit heading, or any array over its cap. Only
+`occ_viz.occ_to_viz` (viz v1 side) tolerates extra input keys, and it **drops
+and counts** them (`occ_viz.DROPPED`, one log warning per key) instead of
+passing them through. `occ_out_to_viz_inputs(msg)` feeds `occ_to_viz` with zero
+dropped keys.
+
+| Field | Content | Cap | Debug panel |
+|---|---|---|---|
+| `v, type, seq, t` | 1, `"occ_out"`, tick counter, frame time (s) | - | graphs (x axis) |
+| `grid` | `voxel_m`, `origin[3]`, `shape[3]` | - | 3-D grid |
+| `counts` | `full` (grid cells), `frustum` (fine cells seen by the active cams, counted once per camera set in 64k chunks, cached), `queried`, `stored`, `stage_queries` (4x, 2x, fine), `cells_out`, `objects`, `edges` | - | HUD |
+| `cells` | `ijk[[i,j,k]]`, `cls` (0 other, 1 drivable, 2 vehicle), `prob`; nearest-first | 4096 | 3-D grid |
+| `edges[]` | `side` left/right, `kind` road_edge (curb UNLABELED, never emitted), `pts[[x,y]]`, `conf[]` per point = occupancy prob of the drivable boundary cell | 8 x 120 pts | 3-D grid red dots, top-down |
+| `lanes[]` | `paint` white/yellow, `pts`, `conf` - **always empty**: paint UNLABELED, no runtime head | 16 x 120 | 3-D grid lane-dot chains (none drawn) |
+| `corridor` | `pts` drivable polygon, ego frame, implicitly closed (first vertex not repeated), non-self-intersecting (validator checks), `conf` | 64 verts | top-down |
+| `objects[]` | `id` (track id), `cls` vehicle, `x, y, z0, l, w, h`, `heading [cos, sin]`, `heading_src` box/velocity, `motion`, `speed_mps`, `frames` | 64 | top-down numbered arrows |
+| `boxes2d{cam}[]` | `id`, `cls`, `box [u0,v0,u1,v1]` px | 32 / cam | camera panels |
+| `cams{8}` | `status` LIVE/STALE/ABSENT, `age_s`, `weight` (fusion weight), `res [w,h]`; ABSENT = not in preset / no frame / no age, with `age_s = res = None`, `weight = 0` (never zeros-as-data) | 8 | camera panels |
+| `ego` | `speed_mps`, `yaw_rate_rps` (left/CCW +), `source` vo/vehicle, `ok`, `dt_s` | - | HUD, speed + yaw-rate graphs |
+| `timing_ms` | `predict`, `outputs`, `total` from in-code `perf_counter` | - | HUD |
+| `peak_vram_mb`, `vram_status` | `None` / `"UNPROVEN"` until GVD posts nvidia-smi from IQU45; a number is only valid with `vram_status = "MEASURED"` | - | - |
+| `vram_est_mb_cpu` | arithmetic CPU-box estimate (labelled), separate field, never copied into `peak_vram_mb` | - | - |
+
+`PANEL_FIELDS` maps each of the 4 panels of `debug_view_multipanel.png` to the
+fields above; `test_occ_out.check_panels` asserts every path resolves. The
+renderer itself is the C++ viz (PR #232); this round scores the contract.
+
+Decisions the Skeptic asked to state:
+
+- **Ego speed / yaw rate**: `source = "vo"` (camera VO) unless
+  `--ego-from-vehicle` (`"vehicle"`, wheel speed + IMU yaw rate). Rates are
+  per-frame VO motion divided by `dt` from the frame timestamps (no fixed
+  0.1 s). VO now ignores static cells at road-surface height (>= 1 voxel above
+  the median drivable z): flat grass/pavement is identical at every
+  along-track shift and pulled the forward estimate short (measured 0.35 m on a
+  0.6-1.2 m frame before; 0.25 m worst after; `test_occ_ego` forward error 0.10 m worst before and after).
+- **Heading** is one field, `heading = [cos, sin]`: the box (PCA) axis
+  (`heading_src = "box"`, +-pi ambiguous) while the track is stationary or
+  younger than 3 frames, the track velocity direction once speed >= 0.7 m/s
+  (`"velocity"`). No separate `yaw`.
+- **Per-camera 2-D boxes** are **projections** of the 3-D object boxes (8
+  corners, points in front of the near plane), clipped to the image, same id
+  and class as the 3-D object, only for LIVE cameras. No separate 2-D head, so
+  no extra VRAM.
+- **Corridor**: rows where both road edges exist, resampled to <= 32 rows; up
+  the left edge, back down the right. `conf` = edge support over the shared
+  span x share of rows with left < right - 0.4 m. Below 0.5, one side only, or
+  < 1 m shared: `pts = []` (no default polygon).
+
+Measured (`test_occ_out`, CPU box, synthetic world, ego 12 m/s turning left
+0.1 rad/s at irregular dt 0.05-0.2 s): |speed*dt - |(dx,dy)|| <= 0.25 m per
+frame, |yaw_rate*dt - dyaw| <= 0.005 rad; mean 11.52 m/s (true 12.0), 0.115
+rad/s (true 0.1). Corridor vertices within 0.20 m of the true road edge, 64
+verts, conf 0.98. Message 71 kB; 30k stored cells on the default grid and on a
+64x finer grid both cap at 4096 cells out (88 kB vs 84 kB, cap 200 kB).
+
 ## Files
 
 New: `python/perception/occ_geometry.py`, `python/perception/occ_sparse.py`,
-`python/perception/occ_outputs.py`, `python/perception/occ_ego.py`, `python/viz/occ_viz.py`,
+`python/perception/occ_outputs.py`, `python/perception/occ_ego.py`, `python/perception/occ_out.py`, `python/viz/occ_viz.py`,
 `python/train/occ_labels.py`, `python/train/occ_sampler.py`,
 `python/train/occ_train.py`, `python/data/occ_shards.py`,
 `scripts/bench_occ_sparse.py`, `scripts/compare_front_cluster.py`, `tests/synthetic_occ.py`, tests
-`scripts/test_occ_{labels,shards,sampler,net,cams,ego,runtime_imports,viz}.py`,
+`scripts/test_occ_{labels,shards,sampler,net,cams,ego,runtime_imports,viz,out}.py`,
 `scripts/test_bench_occ_sparse.py`, this spec. No existing file is modified (the
 offline suite picks up `scripts/test_*.py` itself).
 
@@ -314,6 +378,7 @@ offline suite picks up `scripts/test_*.py` itself).
 ```
 PATH=<venv>/bin:$PATH xvfb-run -a python scripts/run_offline_suite.py
 python scripts/test_occ_labels.py      # geometry, 8 cams, boxes, invalid depth, class names
+python scripts/test_occ_out.py         # occ_out v1: 4-panel fields, ego dt/units/source, heading, 2-D boxes, corridor, rejects, VRAM fields, flat size
 python scripts/test_occ_shards.py      # roundtrip, no loose-PNG fallback, rollover, CLI
 python scripts/test_occ_sampler.py     # 20-30% recovery per batch, enforced
 python scripts/test_occ_net.py         # projection, camera-only, sparse predict, overfit

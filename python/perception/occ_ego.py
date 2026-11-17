@@ -54,6 +54,15 @@ def _static_bev(keys: np.ndarray, cls: np.ndarray, grid: OccGrid) -> np.ndarray:
     if not m.any():
         return np.zeros((0, 2), dtype=np.float64)
     c = grid.cell_of_key(keys[m])
+    road = cls == DRIVABLE
+    if road.any():
+        # flat ground beside the road (grass, pavement) is the same at every
+        # along-track shift and swamps the score: keep cells >= 1 voxel above
+        # the road surface (median z cell of this frame's drivable cells)
+        ground = int(np.median(grid.cell_of_key(keys[road])[:, 2]))
+        c = c[c[:, 2] >= ground + 1]
+        if not len(c):
+            return np.zeros((0, 2), dtype=np.float64)
     xy = np.unique(c[:, :2], axis=0)
     return (xy + 0.5) * float(grid.voxel_m) + np.array([grid.x_min, grid.y_min])
 

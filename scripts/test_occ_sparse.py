@@ -200,7 +200,7 @@ def check_head_training_only() -> None:
     assert any(k.startswith("occ_head") for k in headed.state_dict())
     assert ":occ_sparse=" in (headed.pause_arch or "")
     missing, unexpected = headed.load_state_dict(plain.state_dict(), strict=False)
-    assert not unexpected and all(k.startswith("occ_head") for k in missing)
+    assert not unexpected and all(k.startswith(("occ_head", "occ_core")) for k in missing)
     strip = torch.zeros(1, 3, int(headed.canvas_h), int(headed.canvas_w))
     pred, _ = headed.forward(strip, 0.1, headed.initial_state())
     assert pred.occ_feat is not None and list(pred.as_dict()) == list(OUTPUT_FIELDS)
@@ -208,8 +208,9 @@ def check_head_training_only() -> None:
     base, _ = plain.forward(strip, 0.1, plain.initial_state())
     assert getattr(base, "occ_feat", None) is None
     q = torch.randint(0, 1000, (1, 64))
-    logits = headed.occ_head(pred.occ_feat.reshape(1, -1), q)
-    assert tuple(logits.shape) == (1, 64, 1 + 3)
+    sset, _ = headed.occ_core.step(pred.occ_maps.unsqueeze(0), 0.1)
+    logits = headed.occ_head(pred.occ_feat.reshape(1, -1), q, sset)
+    assert tuple(logits.shape) == (1, 64, 1 + 3 + 2)
     n = sum(p.numel() for p in headed.occ_head.parameters())
     assert n < 100_000, n
     print(f"  occ head opt-in ({n} params), plain ckpt loads, ONNX fields unchanged")
@@ -256,7 +257,7 @@ def check_loss_masks_and_overfit() -> None:
     pred_occ = (out[..., 0] > 0).float()
     acc = float(((pred_occ == t_occ).float() * m).sum() / m.sum())
     hit = (t_occ > 0.5) & (m > 0.5)
-    cls_acc = float((out[..., 1:].argmax(-1)[hit] == t_cls[hit]).float().mean())
+    cls_acc = float((out[..., 1:4].argmax(-1)[hit] == t_cls[hit]).float().mean())
     assert float(loss) < 0.1 * first and acc > 0.97, (first, float(loss), acc)
     assert cls_acc > 0.95, f"class head must learn too: {cls_acc}"
     print(f"  overfit: loss {first:.3f} -> {float(loss):.4f}, occ acc {acc:.3f}, class acc {cls_acc:.3f}")
@@ -310,6 +311,52 @@ def check_live_entry_points_skip_occ() -> None:
     print("  live: run_vision / scene_live never import occ_sparse")
 
 
+def check_occluded_road_kept_in_loss() -> None:
+    """Map-GT road behind an occluder is a target (drivable, visible=0) and its loss is never masked."""
+    from python.train.occ_sparse import OCC_CLASSES, build_queries, occ_labels_full, split_metrics, voxel_centers
+
+    cams = [_cam("main", 0)]
+    planes = {"main": {"depth_cm": _plane(8.0), "sem": np.zeros((48, 64), np.uint8)}}  # wall of hits at 8 m
+    ys = np.linspace(-4.0, 38.0, 22)
+    road = (np.c_[np.full(22, -3.0), ys], np.c_[np.full(22, 3.0), ys])
+    lab = occ_labels_full(planes, cams, sem_names={0: "unknown"}, row=None, roads_ego=[road], stride=4)
+    drv = OCC_CLASSES.index("drivable")
+    is_drv = lab["occ_cls"] == drv
+    c = voxel_centers(lab["occ_idx"])
+    vis = lab["occ_visible"].astype(bool)
+    assert len(lab["occ_visible"]) == len(lab["occ_idx"]) and len(lab["free_visible"]) == len(lab["free_idx"])
+    behind = is_drv & (c[:, 1] > 12.0)
+    assert behind.sum() > 100, "map road behind the wall is a drivable target over the whole region"
+    assert not vis[behind].any(), "road behind the 8 m wall is occluded"
+    rear = is_drv & (c[:, 1] < -1.0)
+    assert rear.any() and not vis[rear].any(), "outside every FOV -> occluded, still a target"
+    seen = is_drv & vis
+    assert seen.any() and (c[seen, 1] < 1.2 + 8.0 + 0.5).all(), "visible road only in front of the wall, inside the FOV"
+    assert not np.intersect1d(lab["occ_idx"], lab["free_idx"]).size
+    m = split_metrics(lab["occ_idx"][is_drv], np.full(int(is_drv.sum()), drv), lab)
+    assert m == {"iou": 1.0, "recall_visible": 1.0, "recall_occluded": 1.0}, m
+    m0 = split_metrics(lab["occ_idx"][seen], np.full(int(seen.sum()), drv), lab)
+    assert m0["recall_visible"] == 1.0 and m0["recall_occluded"] == 0.0, m0
+    torch = _torch()
+    if torch is None:
+        skip_check("occ_occluded_loss", "PyTorch is not installed")
+        return
+    from python.train.occ_sparse import occ_loss
+
+    k = 2 * len(lab["occ_idx"]) + 2 * len(lab["free_idx"])
+    q, t_occ, t_cls, msk = build_queries([lab], k=k, seed=0)
+    occl = set(lab["occ_idx"][behind].tolist())
+    slot = [i for i, v in enumerate(q[0].tolist()) if v in occl and msk[0, i] > 0]
+    assert len(slot) == int(behind.sum()), "every occluded road cell is queried"
+    assert all(t_occ[0, i] == 1.0 and t_cls[0, i] == drv for i in slot)
+    logits = torch.zeros(1, k, 1 + len(OCC_CLASSES) + 2, requires_grad=True)
+    occ_loss(logits, t_occ, t_cls, msk).backward()
+    g = logits.grad[0, slot, 0]
+    assert (g.abs() > 0).all(), "occluded GT must carry loss gradient (not visibility-masked)"
+    print(f"  occluded road: {int(behind.sum())} cells behind the wall + {int(rear.sum())} outside FOV are drivable "
+          f"targets (visible=0) with loss grad; {int(seen.sum())} visible; metrics {m0}")
+
+
 def main() -> int:
     check_unproject_forward_and_side()
     check_labels_sparse_8cams()
@@ -322,6 +369,7 @@ def main() -> int:
     check_live_entry_points_skip_occ()
     check_head_training_only()
     check_loss_masks_and_overfit()
+    check_occluded_road_kept_in_loss()
     print("test_occ_sparse: OK")
     return 0
 

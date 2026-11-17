@@ -39,6 +39,7 @@ FREE_FRACTIONS = (0.25, 0.5, 0.75)
 VEHICLE_Z_M = (0.0, 1.5)
 PE_FREQS = 6
 HEAD_WIDTH = 128
+FLOW_DIM = 2
 # FAT32 holds 4 GB per file; the cache keeps chunks under 3.5 GB (AGENTS.md).
 SHARD_MAX_BYTES = 3_500_000_000
 RECOVERY_SHARE = (0.20, 0.30)
@@ -87,17 +88,40 @@ def voxel_centers(flat: np.ndarray) -> np.ndarray:
     return np.asarray(GRID_MIN) + (ijk + 0.5) * VOXEL_M
 
 
-def _vehicle_points(row: Mapping[str, Any] | None) -> np.ndarray:
+def _vehicle_points(row: Mapping[str, Any] | None) -> tuple[np.ndarray, np.ndarray]:
+    """Vehicle column points ``(N, 3)`` and their ego-frame ground velocity ``(N, 2)`` m/s.
+
+    Same traffic rows and ego transform as ``vehicle_labels``. Velocity is the
+    recorded world ``vel`` turned into ego axes; under 0.3 m/s, or no ``vel``, is 0.
+    """
+    empty = (np.zeros((0, 3)), np.zeros((0, 2)))
     if not isinstance(row, Mapping):
-        return np.zeros((0, 3))
-    from python.train.vehicle_labels import _boxes, _traffic_field
+        return empty
+    from python.collect.signal_labels import world_to_ego
+    from python.train.vehicle_labels import _ego_pose, _pair, _traffic_field, _yaw
 
     field = _traffic_field(row)
     if not isinstance(field, list):
-        return np.zeros((0, 3))
+        return empty
+    ego_pos, ego_dir = _ego_pose(row)
     zs = np.arange(VEHICLE_Z_M[0] + VOXEL_M / 2.0, VEHICLE_Z_M[1], VOXEL_M)
-    pts = [(b["x"], b["y"], z) for b in _boxes(row, field) for z in zs]
-    return np.asarray(pts, dtype=np.float64).reshape(-1, 3)
+    pts: list[tuple[float, float, float]] = []
+    flows: list[tuple[float, float]] = []
+    for item in field:
+        if not isinstance(item, Mapping):
+            continue
+        pos = _pair(item.get("pos"))
+        xy = world_to_ego(pos, ego_pos, ego_dir) if pos is not None else None
+        if xy is None:
+            continue
+        vel = _pair(item.get("vel"))
+        speed = math.hypot(*vel) if vel is not None else 0.0
+        ang = _yaw(item.get("vel"), ego_pos, ego_dir) if speed >= 0.3 else None
+        v = (speed * math.cos(ang), speed * math.sin(ang)) if ang is not None else (0.0, 0.0)
+        for z in zs:
+            pts.append((float(xy[0]), float(xy[1]), float(z)))
+            flows.append(v)
+    return np.asarray(pts, np.float64).reshape(-1, 3), np.asarray(flows, np.float64).reshape(-1, 2)
 
 
 def occ_labels_for_tick(
@@ -143,11 +167,14 @@ def occ_labels_for_tick(
         for frac in FREE_FRACTIONS:
             fflat, _ = voxel_index(origin + (pts - origin) * float(frac))
             free_parts.append(fflat)
-    vpts = _vehicle_points(row)
+    vpts, vflow = _vehicle_points(row)
+    veh_flow: dict[int, tuple[float, float]] = {}
     if len(vpts):
-        vflat, _ = voxel_index(vpts)
+        vflat, vin = voxel_index(vpts)
         occ_parts.append(vflat)
         cls_parts.append(np.full(len(vflat), veh, np.uint8))
+        for cell, f in zip(vflat.tolist(), vflow[vin].tolist()):
+            veh_flow.setdefault(int(cell), (float(f[0]), float(f[1])))
     occ = np.concatenate(occ_parts) if occ_parts else np.zeros(0, np.int32)
     cls = np.concatenate(cls_parts) if cls_parts else np.zeros(0, np.uint8)
     # Per voxel: vehicle beats unknown beats drivable. One stray unknown hit
@@ -161,7 +188,18 @@ def occ_labels_for_tick(
     cls_u = cls_sorted[first].astype(np.uint8)
     free = np.concatenate(free_parts) if free_parts else np.zeros(0, np.int32)
     free_u = np.setdiff1d(np.unique(free), occ_u).astype(np.int32)
-    return {"occ_idx": occ_u, "occ_cls": cls_u, "free_idx": free_u, "cams": sorted(used)}
+    # Flow GT: vehicle cells take their car's velocity; drivable is static ground (0).
+    # Unknown cells (buildings, poles, but also people or props) have no velocity label.
+    flow = np.zeros((len(occ_u), FLOW_DIM), np.float16)
+    flow_ok = np.zeros(len(occ_u), np.uint8)
+    for i, (cell, k) in enumerate(zip(occ_u.tolist(), cls_u.tolist())):
+        if k == veh:
+            flow[i] = veh_flow.get(int(cell), (0.0, 0.0))
+            flow_ok[i] = 1
+        elif k == drv:
+            flow_ok[i] = 1
+    return {"occ_idx": occ_u, "occ_cls": cls_u, "free_idx": free_u, "occ_flow": flow, "flow_valid": flow_ok,
+            "cams": sorted(used)}
 
 
 def is_recovery_row(row: Mapping[str, Any] | None) -> bool:
@@ -187,6 +225,7 @@ def recovery_weights(rows: Sequence[Mapping[str, Any]], *, target: float = 0.25)
 
 
 _ARRAYS = ("occ_idx", "occ_cls", "free_idx")
+_OPTIONAL_ARRAYS = ("occ_flow", "flow_valid")  # flow GT; older shards have none
 
 
 def _npy(arr: np.ndarray) -> bytes:
@@ -226,6 +265,7 @@ class OccShardWriter:
         if "." in key or "/" in key:
             raise ValueError(f"shard key must not contain '.' or '/': {key!r}")
         members = [(f"{key}.{name}.npy", _npy(sample[name])) for name in _ARRAYS]
+        members += [(f"{key}.{name}.npy", _npy(sample[name])) for name in _OPTIONAL_ARRAYS if name in sample]
         meta = {"recover": bool(sample.get("recover", False)), "cams": list(sample.get("cams") or [])}
         members.append((f"{key}.json", json.dumps(meta).encode("utf-8")))
         size = sum(512 + ((len(b) + 511) // 512) * 512 for _, b in members)
@@ -302,8 +342,14 @@ def build_occ_shards(root: Path | str, out_dir: Path | str, *, stride: int = 8, 
         return list(writer.paths)
 
 
-def build_queries(labels: Sequence[Mapping[str, Any]], *, k: int = 4096, seed: int = 0) -> tuple[Any, Any, Any, Any]:
-    """``(B, k)`` voxel ids, occ target, class target, mask. Half occupied, rest free; short rows are masked."""
+def build_queries(
+    labels: Sequence[Mapping[str, Any]], *, k: int = 4096, seed: int = 0, with_flow: bool = False
+) -> tuple[Any, ...]:
+    """``(B, k)`` voxel ids, occ target, class target, mask. Half occupied, rest free; short rows are masked.
+
+    ``with_flow`` adds ``(B, k, 2)`` flow target and ``(B, k)`` flow mask (1 only
+    on occupied queries whose label row has ``flow_valid``).
+    """
     import torch
 
     rng = np.random.default_rng(int(seed))
@@ -312,6 +358,8 @@ def build_queries(labels: Sequence[Mapping[str, Any]], *, k: int = 4096, seed: i
     t_occ = np.zeros((b, k), np.float32)
     t_cls = np.zeros((b, k), np.int64)
     m = np.zeros((b, k), np.float32)
+    t_flow = np.zeros((b, k, FLOW_DIM), np.float32)
+    f_m = np.zeros((b, k), np.float32)
     for i, lab in enumerate(labels):
         occ = np.asarray(lab["occ_idx"], np.int64)
         cls = np.asarray(lab["occ_cls"], np.int64)
@@ -325,13 +373,18 @@ def build_queries(labels: Sequence[Mapping[str, Any]], *, k: int = 4096, seed: i
         t_occ[i, :n_occ] = 1.0
         t_cls[i, :n_occ] = cls[pick_o]
         m[i, :n] = 1.0
-    return tuple(torch.as_tensor(a) for a in (q, t_occ, t_cls, m))  # type: ignore[return-value]
+        if with_flow and lab.get("occ_flow") is not None and lab.get("flow_valid") is not None:
+            t_flow[i, :n_occ] = np.asarray(lab["occ_flow"], np.float32).reshape(-1, FLOW_DIM)[pick_o]
+            f_m[i, :n_occ] = np.asarray(lab["flow_valid"], np.float32).reshape(-1)[pick_o]
+    out = (q, t_occ, t_cls, m, t_flow, f_m) if with_flow else (q, t_occ, t_cls, m)
+    return tuple(torch.as_tensor(a) for a in out)
 
 
-def occ_loss(logits: Any, t_occ: Any, t_cls: Any, mask: Any) -> Any:
-    """Masked BCE on occupancy plus CE on the class of occupied queries. Zero with no labels."""
+def occ_loss(logits: Any, t_occ: Any, t_cls: Any, mask: Any, t_flow: Any = None, flow_mask: Any = None) -> Any:
+    """Masked BCE on occupancy, CE on the class of occupied queries, smooth-L1 on flow where ``flow_mask``. Zero with no labels."""
     import torch.nn.functional as functional
 
+    n_cls = len(OCC_CLASSES)
     occ_logit = logits[..., 0]
     m = mask.to(occ_logit.dtype)
     denom = m.sum()
@@ -341,7 +394,12 @@ def occ_loss(logits: Any, t_occ: Any, t_cls: Any, mask: Any) -> Any:
     loss = (bce * m).sum() / denom
     hit = (t_occ > 0.5) & (m > 0.5)
     if bool(hit.any()):
-        loss = loss + functional.cross_entropy(logits[..., 1:][hit].float(), t_cls[hit])
+        loss = loss + functional.cross_entropy(logits[..., 1 : 1 + n_cls][hit].float(), t_cls[hit])
+    if t_flow is not None and flow_mask is not None:
+        fm = (flow_mask > 0.5) & hit
+        if bool(fm.any()):
+            flow = logits[..., 1 + n_cls : 1 + n_cls + FLOW_DIM]
+            loss = loss + functional.smooth_l1_loss(flow[fm].float(), t_flow[fm].float())
     return loss
 
 
@@ -350,19 +408,22 @@ try:
     from torch import nn
 
     class SparseOccHead(nn.Module):
-        """Implicit occupancy at queried voxels: MLP(scene feature, Fourier(voxel centre)).
+        """Implicit occupancy at queried voxels: MLP(scene feature, sparse-set feature near the voxel, Fourier(centre)).
 
         Cost is O(queries), never O(grid). Output per query: 1 occupancy
-        logit + one logit per ``OCC_CLASSES`` entry.
+        logit, one logit per ``OCC_CLASSES`` entry, then ``FLOW_DIM`` ego-frame
+        ground velocity (vx, vy) m/s. ``vox`` is an ``occ_sparse3d.SparseSet``; with
+        ``vox_ch=0`` the head reads the scene feature only (old checkpoints).
         """
 
-        def __init__(self, feat_dim: int, width: int = HEAD_WIDTH) -> None:
+        def __init__(self, feat_dim: int, width: int = HEAD_WIDTH, vox_ch: int = 0) -> None:
             super().__init__()
             pe_dim = 3 + 3 * 2 * PE_FREQS
+            self.vox_ch = int(vox_ch)
             self.mlp = nn.Sequential(
-                nn.Linear(int(feat_dim) + pe_dim, width), nn.ReLU(),
+                nn.Linear(int(feat_dim) + self.vox_ch + pe_dim, width), nn.ReLU(),
                 nn.Linear(width, width), nn.ReLU(),
-                nn.Linear(width, 1 + len(OCC_CLASSES)),
+                nn.Linear(width, 1 + len(OCC_CLASSES) + FLOW_DIM),
             )
             lo = torch.tensor(GRID_MIN)
             hi = torch.tensor(GRID_MAX)
@@ -370,24 +431,143 @@ try:
             self.register_buffer("grid_span", hi - lo, persistent=False)
             self.register_buffer("freqs", (2.0 ** torch.arange(PE_FREQS)) * math.pi, persistent=False)
 
-        def encode(self, q: Any) -> Any:
+        def centers(self, q: Any) -> Any:
             q = q.long()
             sz = GRID_SHAPE[1] * GRID_SHAPE[2]
             ix = torch.div(q, sz, rounding_mode="floor")
             iy = torch.div(q % sz, GRID_SHAPE[2], rounding_mode="floor")
             iz = q % GRID_SHAPE[2]
             ijk = torch.stack([ix, iy, iz], dim=-1).to(self.grid_lo.dtype)
-            xyz = self.grid_lo + (ijk + 0.5) * VOXEL_M
-            unit = (xyz - self.grid_lo) / self.grid_span * 2.0 - 1.0
+            return self.grid_lo + (ijk + 0.5) * VOXEL_M
+
+        def encode(self, q: Any) -> Any:
+            unit = (self.centers(q) - self.grid_lo) / self.grid_span * 2.0 - 1.0
             ang = unit.unsqueeze(-1) * self.freqs
             return torch.cat([unit, torch.sin(ang).flatten(-2), torch.cos(ang).flatten(-2)], dim=-1)
 
-        def forward(self, feat: Any, q: Any) -> Any:
+        def forward(self, feat: Any, q: Any, vox: Any = None) -> Any:
             pe = self.encode(q).to(feat.dtype)
-            f = feat.unsqueeze(1).expand(-1, q.shape[1], -1)
-            return self.mlp(torch.cat([f, pe], dim=-1))
+            parts = [feat.unsqueeze(1).expand(-1, q.shape[1], -1)]
+            if self.vox_ch:
+                if vox is None:
+                    raise ValueError("this occ head reads the fused sparse voxel set; pass vox")
+                from python.train.occ_sparse3d import gather
+
+                parts.append(gather(vox, q.long()).to(feat.dtype))
+            elif vox is not None:
+                raise ValueError("this occ head has no voxel-set input; vox was given")
+            return self.mlp(torch.cat([*parts, pe], dim=-1))
 
 except ImportError:  # pragma: no cover - torch-free hosts
     class SparseOccHead:  # type: ignore[no-redef]
         def __init__(self, *_a: Any, **_k: Any) -> None:
             raise RuntimeError("PyTorch is required for the occupancy head")
+
+
+# --- Full-region (map GT) targets + visibility, for occluded road structure --------------------------
+# Training labels only. Targets cover the whole query region, not just what a camera saw; the
+# ray-cast ``visible`` mask is for *scoring* visible vs occluded, never for masking the loss.
+GROUND_Z_M = 0.25  # centre of the ground layer (z in [0, 0.5) m) used for map drivable cells
+
+
+def _in_tri(p: np.ndarray, a: np.ndarray, b: np.ndarray, c: np.ndarray) -> np.ndarray:
+    def s(p1: Any, p2: Any, p3: Any) -> np.ndarray:
+        return (p1[..., 0] - p3[0]) * (p2[1] - p3[1]) - (p2[0] - p3[0]) * (p1[..., 1] - p3[1])
+
+    d1, d2, d3 = s(p, a, b), s(p, b, c), s(p, c, a)
+    neg = (d1 < 0) | (d2 < 0) | (d3 < 0)
+    pos = (d1 > 0) | (d2 > 0) | (d3 > 0)
+    return ~(neg & pos)
+
+
+def map_drivable_cells(roads_ego: Sequence[tuple[Any, Any]]) -> np.ndarray:
+    """Ground-layer voxel ids covered by map road polygons (ego frame ``(left (P,2), right (P,2))`` edges)."""
+    iz = int((GROUND_Z_M - GRID_MIN[2]) / VOXEL_M)
+    ix, iy = np.meshgrid(np.arange(GRID_SHAPE[0]), np.arange(GRID_SHAPE[1]), indexing="ij")
+    ctr = np.stack([GRID_MIN[0] + (ix + 0.5) * VOXEL_M, GRID_MIN[1] + (iy + 0.5) * VOXEL_M], -1).reshape(-1, 2)
+    hit = np.zeros(len(ctr), bool)
+    for left, right in roads_ego:
+        lft, rgt = np.asarray(left, np.float64), np.asarray(right, np.float64)
+        for i in range(min(len(lft), len(rgt)) - 1):
+            a, b, c, d = lft[i], rgt[i], rgt[i + 1], lft[i + 1]
+            lo, hi = np.minimum.reduce([a, b, c, d]), np.maximum.reduce([a, b, c, d])
+            box = ((ctr >= lo) & (ctr <= hi)).all(1) & ~hit
+            if box.any():
+                p = ctr[box]
+                hit[np.flatnonzero(box)] = _in_tri(p, a, b, c) | _in_tri(p, a, c, d)
+    flat = np.ravel_multi_index((ix.reshape(-1)[hit], iy.reshape(-1)[hit], np.full(int(hit.sum()), iz)), GRID_SHAPE)
+    return np.sort(flat).astype(np.int32)
+
+
+def visibility_mask(cell_ids: Any, cams: Sequence[Mapping[str, Any]], blockers: Any, *, step_m: float = 0.25) -> np.ndarray:
+    """``True`` where some camera sees the voxel centre: inside its FOV and the ray from the camera
+    reaches the voxel before any ``blockers`` voxel (first-hit occlusion; the target voxel itself and
+    ground-level drivable cells are not blockers). Scoring only."""
+    ids = np.asarray(cell_ids, np.int64).reshape(-1)
+    block = np.unique(np.asarray(blockers, np.int64).reshape(-1))
+    tgt = voxel_centers(ids)
+    vis = np.zeros(len(ids), bool)
+    for cam in cams:
+        right, up, fwd = _basis(float(cam.get("yaw_deg") or 0.0), float(cam.get("pitch_deg") or 0.0))
+        pos = np.asarray(cam.get("pos_m") or [0.0, 0.0, 0.0], np.float64)
+        w, h = (cam.get("resolution") or [64, 48])[:2]
+        fy = (h / 2.0) / math.tan(math.radians(float(cam.get("fov_v") or 70.0)) / 2.0)
+        d = tgt - pos
+        z = d @ fwd
+        with np.errstate(divide="ignore", invalid="ignore"):
+            inside = (z > 0.1) & (np.abs((d @ right) / z * fy) < w / 2.0) & (np.abs((d @ up) / z * fy) < h / 2.0)
+        for i in np.flatnonzero(inside & ~vis):
+            n = max(int(np.linalg.norm(d[i]) / step_m), 1)
+            pts = pos + d[i] * (np.arange(1, n) / n)[:, None]
+            flat, ok = voxel_index(pts)
+            path = flat[(flat != ids[i])]
+            if not np.isin(path, block).any():
+                vis[i] = True
+    return vis
+
+
+def occ_labels_full(
+    planes: Mapping[str, Mapping[str, Any]],
+    cams: Sequence[Mapping[str, Any]],
+    *,
+    sem_names: Mapping[int, str],
+    row: Mapping[str, Any] | None,
+    roads_ego: Sequence[tuple[Any, Any]] = (),
+    stride: int = 8,
+) -> dict[str, Any]:
+    """Ray labels + map drivable over the whole region. Adds ``occ_visible`` / ``free_visible`` (uint8).
+
+    Map road cells a ray did not reach (occluded behind a car, round a corner) become drivable
+    targets; ray hits keep precedence (vehicle > unknown > drivable)."""
+    lab = occ_labels_for_tick(planes, cams, sem_names=sem_names, row=row, stride=stride)
+    drv = OCC_CLASSES.index("drivable")
+    extra = np.setdiff1d(map_drivable_cells(roads_ego), lab["occ_idx"]).astype(np.int32)
+    occ = np.concatenate([lab["occ_idx"], extra]).astype(np.int32)
+    order = np.argsort(occ, kind="stable")
+    lab["occ_idx"] = occ[order]
+    lab["occ_cls"] = np.concatenate([lab["occ_cls"], np.full(len(extra), drv, np.uint8)])[order]
+    lab["occ_flow"] = np.concatenate([lab["occ_flow"], np.zeros((len(extra), FLOW_DIM), np.float16)])[order]
+    lab["flow_valid"] = np.concatenate([lab["flow_valid"], np.ones(len(extra), np.uint8)])[order]
+    lab["free_idx"] = np.setdiff1d(lab["free_idx"], extra).astype(np.int32)
+    blockers = lab["occ_idx"][lab["occ_cls"] != drv]
+    lab["occ_visible"] = visibility_mask(lab["occ_idx"], cams, blockers).astype(np.uint8)
+    lab["free_visible"] = visibility_mask(lab["free_idx"], cams, blockers).astype(np.uint8)
+    return lab
+
+
+def split_metrics(pred_ids: Any, pred_cls: Any, lab: Mapping[str, Any], cls: str = "drivable") -> dict[str, float | None]:
+    """One class: overall IoU, plus recall split by ``occ_visible`` (visible vs occluded GT cells).
+
+    Split *IoU* would need a visibility for every false positive too; recall per split is what the
+    GT mask supports exactly, so that is what is reported. None when a split is empty."""
+    k = OCC_CLASSES.index(cls)
+    sel = np.asarray(lab["occ_cls"]) == k
+    gt = np.asarray(lab["occ_idx"])[sel]
+    vis = np.asarray(lab["occ_visible"], bool)[sel]
+    pr = np.unique(np.asarray(pred_ids)[np.asarray(pred_cls) == k])
+    union = np.union1d(gt, pr)
+    out: dict[str, float | None] = {"iou": float(len(np.intersect1d(gt, pr)) / len(union)) if len(union) else None}
+    for name, m in (("recall_visible", vis), ("recall_occluded", ~vis)):
+        g = gt[m]
+        out[name] = float(np.isin(g, pr).mean()) if len(g) else None
+    return out

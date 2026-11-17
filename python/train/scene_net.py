@@ -1157,6 +1157,8 @@ class ScenePrediction:
     stop_line: Any = None
     # Training-only: the head feature the sparse occupancy head queries. Not an ONNX output.
     occ_feat: Any = None
+    # Training-only: every camera's stem map ``(B, n_cams, C, H', W')`` for ``occ_sparse3d``. Not an ONNX output.
+    occ_maps: Any = None
 
     def as_dict(self) -> dict[str, Any]:
         return {name: getattr(self, name) for name in OUTPUT_FIELDS}
@@ -1865,9 +1867,16 @@ if torch is not None:
             if self.occ_sparse:
                 from python.train.occ_sparse import HEAD_WIDTH, SparseOccHead
 
-                self.occ_head = SparseOccHead(hidden)
+                from python.train.occ_sparse3d import FEAT_C, KEEP, SparseOcc3D
+
+                narrow = 256 if self.scale >= 0.999 else max(1, int(round(256 * self.scale)))
+                with torch.no_grad():
+                    probe = self.stem.features(torch.zeros(1, 3, int(self.canvas_h), narrow))
+                # All cameras -> one sparse ego-frame voxel set (no dense BEV/volume), ego-aligned memory.
+                self.occ_core = SparseOcc3D(int(probe.shape[1]), self.cams, int(probe.shape[2]), int(probe.shape[3]))
+                self.occ_head = SparseOccHead(hidden, vox_ch=FEAT_C + 1)
                 arch = getattr(self, "pause_arch", checkpoint_arch(self.cams))
-                self.pause_arch = arch + f":occ_sparse={int(HEAD_WIDTH)}"
+                self.pause_arch = arch + f":occ_sparse={int(HEAD_WIDTH)}:vox={FEAT_C}x{KEEP}"
             # --route-cond: additive nav-command embedding. Off by default so
             # old checkpoints load unchanged. This is not --ctl-cond.
             self.route_cond = bool(route_cond)
@@ -1954,7 +1963,7 @@ if torch is not None:
             ages_col = _window_ages(self, ages, image, batch, ticks)
             route = _window_route(self, route, image, batch, ticks)
             state = _state_on(state, image[:batch] if batch > 0 else image)
-            token, main_feat = self._encode(image)
+            token, main_feat, occ_maps = self._encode_maps(image)
             token = token.reshape(batch, ticks, 1, token.shape[-1]).squeeze(2)
             if self.cam_age:
                 token = torch.cat([token, ages_col], dim=-1)
@@ -1987,6 +1996,8 @@ if torch is not None:
             feat = torch.stack(feats, dim=1).reshape(batch * ticks, -1)
             feat = _apply_route(self, feat, route)
             pred = _heads_batch(self, feat, cond)
+            if occ_maps is not None:
+                pred.occ_maps = occ_maps
             if bool(getattr(self, "aux_sensors", False)) and main_feat is not None:
                 import torch.nn.functional as functional
 
@@ -2005,7 +2016,7 @@ if torch is not None:
             cond = _cond_rows(self, cond, image)
             route = _route_rows(self, route, image)
             state = _state_on(state, image)
-            token, main_feat = self._encode(image)
+            token, main_feat, occ_maps = self._encode_maps(image)
             if self.cam_age:
                 token = torch.cat([token, _ages_column(ages, image)], dim=-1)
             elif ages is not None:
@@ -2029,6 +2040,8 @@ if torch is not None:
             feat = gru_out[:, 0, :] + residual
             feat = _apply_route(self, feat, route)
             pred = _heads_batch(self, feat, cond)
+            if occ_maps is not None:
+                pred.occ_maps = occ_maps
             if bool(getattr(self, "aux_sensors", False)) and main_feat is not None:
                 import torch.nn.functional as functional
 
@@ -2041,6 +2054,11 @@ if torch is not None:
             return pred, SceneState(h=h_new, tokens=new_tokens, mask=new_mask)
 
         def _encode(self, image: Any) -> Any:
+            """``(token, main_feat)``: the encoder contract other callers unpack."""
+            token, main_feat, _maps = self._encode_maps(image)
+            return token, main_feat
+
+        def _encode_maps(self, image: Any) -> Any:
             """``_token``, under ``torch.utils.checkpoint`` when ``grad_ckpt`` is on and gradients flow.
 
             The stem is Conv/GroupNorm/ReLU/Linear (no BatchNorm, no dropout), so
@@ -2053,9 +2071,11 @@ if torch is not None:
                 return checkpoint(self._token, image, use_reentrant=False)
             return self._token(image)
 
-        def _token(self, image: Any) -> tuple[Any, Any]:
+        def _token(self, image: Any) -> tuple[Any, Any, Any]:
             parts = []
             main_feat = None
+            # occ_sparse: keep every camera's stem map for the fused BEV (same compute, no second stem pass).
+            maps: list[Any] | None = [] if bool(getattr(self, "occ_sparse", False)) else None
             for sec in self.sectors:
                 crop = image[:, :, :, sec.x0 : sec.x1]
                 if sec.wide:
@@ -2065,9 +2085,17 @@ if torch is not None:
                     feat_map = self.stem.features(crop)
                     parts.append(self.stem.embed(feat_map))
                     main_feat = feat_map
+                elif maps is not None:
+                    feat_map = self.stem.features(crop)
+                    parts.append(self.stem.embed(feat_map))
+                    maps.append(feat_map)
+                    continue
                 else:
                     parts.append(self.stem(crop))
-            return torch.cat(parts, dim=-1).unsqueeze(1), main_feat
+                if maps is not None:
+                    maps.append(feat_map)
+            occ_maps = torch.stack(maps, dim=1) if maps is not None else None
+            return torch.cat(parts, dim=-1).unsqueeze(1), main_feat, occ_maps
 
     def _lane_gt_output(net: SceneNet, feat: Any) -> Any:
         raw = net.lane_gt_head(feat)
@@ -2188,7 +2216,7 @@ if torch is not None:
 
     def _prediction_at(pred: ScenePrediction, index: int) -> ScenePrediction:
         extra = {name: getattr(pred, name)[index] for name in CTL_OUTPUT_FIELDS if getattr(pred, name) is not None}
-        for name in ("aux_depth", "aux_sem_logits", "road_edge", "stop_line", "occ_feat"):
+        for name in ("aux_depth", "aux_sem_logits", "road_edge", "stop_line", "occ_feat", "occ_maps"):
             value = getattr(pred, name, None)
             if value is not None:
                 extra[name] = value[index]

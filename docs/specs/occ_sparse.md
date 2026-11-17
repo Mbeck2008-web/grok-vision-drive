@@ -79,3 +79,25 @@ no problems.
 - The brief asks for AMP fp16 on Pascal. AGENTS.md says Pascal (6.1) stays FP32. This head
   adds ~88k params and no activations beyond `(B, k, 128)`, so FP32 is the default here.
 - VRAM was not measured on the 1080 Ti (no GPU on the build box). Numbers here are CPU only.
+
+## Fully sparse core (`python/train/occ_sparse3d.py`), AI-Day layout
+
+The 8 cams go through one shared SceneNet backbone. The per-cam stem maps (12x16 at the 192 px strip) feed `SparseOcc3D`. The existing heads (lanes/paint/edges, objects) read the SceneNet token. The new occ + flow head reads only the sparse voxel set and never touches images (see `check_viz_never_touches_images`).
+
+1. **Lift.** A per-pixel conv outputs 32-ch features plus a 12-bin depth softmax (2–46 m). Every (cam, row, col, depth) ray sample maps to a fixed voxel id taken from `cameras.yaml` poses. The ids are precomputed into an ACTIVE voxel set (2,555 of 57,344 for 8 cams).
+2. **Fuse.** `index_add` writes the samples into the active set only, weighted by depth probability. A cam older than `stale_s` (0.5 s, from `cam_hold` ages) gets weight 0.
+3. **Prune.** An MLP over (feature, xyz) and a score head keep the top `keep` voxels in a `SparseSet(ids, feat, score)`.
+4. **Memory.** The last tick's ids are warped by an exact coordinate transform: p_new = R(-dyaw)·(x-dx, y-dy). The ego frame is x right, y FORWARD, z up, and yaw + is left. Ids are gated, merged by id, and pruned again. Cells that leave the grid are dropped.
+5. **Read.** The head gathers a 3x3x3 neighbourhood per query by sorted-id `searchsorted`. It returns C+1 values, the last being the hit fraction.
+
+Sparsity starts at the lift. No dense BEV or 3D tensor exists between the backbone and the heads. The largest buffer is bounded by the ray samples (8·12·16·12), not by the grid. `check_grid_growth_flat` grows the range x2 and the resolution x2 (full grid x64), and the stored feature count stays flat at keep·C.
+
+## Odometry
+
+Runtime is camera-only. By default, ego motion is a VO MLP over pooled sparse-set statistics (cur, prev) that outputs (dx, dy, dyaw). `--ego-from-vehicle` (default off, `occ_core.ego_from_vehicle`) allows wheel speed and IMU yaw instead, with dx = 0. BeamNG GT pose is never a runtime input (`check_runtime_has_no_gt_pose`). With the flag off, passing ego raises. Real VO drift is UNPROVEN until VO is trained on recorded pose deltas.
+
+## Profiles (`python/train/occ_profiles.py`)
+
+There is one architecture, with knobs for preset, scale, cams, frames, stale_s, precision and keep. res, frames, stale_s, precision and keep can change without breaking weight loading. preset and cams force a retrain, and `load_into` raises `ProfileMismatch` for them. Strip scale is capped at 1, so main's resolution can't go above the recorded 192 px strip without a recorder change.
+
+Memory numbers come from a CPU estimate (params + 4x the largest activation), not a GPU measurement. On-GPU VRAM/fps on IQU45 is UNPROVEN, and the budget is BeamNG free memory minus 1 GB. fp16 on Pascal saves memory only. int8/TensorRT needs calibration plus an accuracy delta, so it is UNPROVEN.

@@ -53,6 +53,7 @@ INCLUDE_GLOBS = (
     "docs/media/*.png",
     "models/.gitkeep",
     "models/NOTICE.txt",
+    "models/LICENSE-YOLOX.txt",
     "models/yolox_nano.onnx",
 )
 # Directories copied recursively (subject to EXCLUDE_* below).
@@ -76,6 +77,7 @@ MUST_HAVE = (
     "config/hardware.yaml",
     "VERSION.txt",
     "models/yolox_nano.onnx",
+    "models/LICENSE-YOLOX.txt",
     "docs/media/gvd_cabin_synthetic.png",
     "docs/media/gvd_ingame_ui_synthetic.png",
     "docs/media/gvd_ingame_ui_drive_synthetic.png",

@@ -11,4 +11,7 @@ detector:
   prefer: yolox-nano-onnx
   allow_synthetic_default: false
   # Nerd MODEL tab / --detector: auto | synthetic | empty | yolox-*-onnx | yolov8{n,s,m,l,x}-onnx
-  # yolox_nano.onnx is shipped (Apache-2.0). YOLOv8 and other YOLOX sizes are optional local files (YOLOv8 is AGPL). Lanes stay Hough.
+  # yolox_nano.onnx is shipped (Apache-2.0). Detection quality and GPU VRAM are UNPROVEN.
+  # Published COCO val mAP 0.5:0.95: YOLOX-Nano 25.8 at 416 vs YOLOv8n 37.3 at 640. This detector feeds tracks, CIPV and AEB.
+  # Compare once labeled images exist: python scripts/eval_detect.py (YOLOX-Tiny / YOLOv8n weights are optional and not shipped).
+  # YOLOv8 and other YOLOX sizes are optional local files (YOLOv8 is AGPL). Lanes stay Hough.

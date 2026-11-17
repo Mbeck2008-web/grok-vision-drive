@@ -98,6 +98,10 @@ def check_release_zip() -> None:
             onnx_members = [r for r in rels if r.endswith(".onnx")]
             assert onnx_members == ["models/yolox_nano.onnx"], onnx_members
             assert "models/NOTICE.txt" in rels
+            assert "models/LICENSE-YOLOX.txt" in rels
+            license_body = zf.read("gvd-retail-test/models/LICENSE-YOLOX.txt").decode("utf-8")
+            assert "Apache License" in license_body
+            assert "Copyright (c) 2021-2022 Megvii Inc." in license_body
             assert "models/e2e_current.onnx" not in rels
             assert "models/yolov8n.pt" not in rels
             assert not any(r.startswith((".git/", "data/", "dist/", "scripts/")) for r in rels)
@@ -139,6 +143,7 @@ def check_release_zip() -> None:
     real = rel.collect_files(ROOT)
     assert "install.bat" in real and "python/run_vision.py" in real
     assert "models/yolox_nano.onnx" in real
+    assert "models/LICENSE-YOLOX.txt" in real
     assert not any(f.endswith(".pt") for f in real)
     assert not any(f.endswith(".onnx") and f != "models/yolox_nano.onnx" for f in real)
     assert "requirements-foxglove.txt" not in real

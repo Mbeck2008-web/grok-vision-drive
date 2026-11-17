@@ -1,4 +1,10 @@
-"""Object detect on cam_main — shipped YOLOX-Nano ONNX if present, else synthetic/empty."""
+"""Object detect on cam_main — shipped YOLOX-Nano ONNX if present, else synthetic/empty.
+
+Detection quality and GPU VRAM are UNPROVEN. Published COCO val mAP 0.5:0.95 is
+25.8 at 416 for YOLOX-Nano vs 37.3 at 640 for YOLOv8n. Live detections feed
+tracks, CIPV and AEB. Compare models once labeled images exist:
+``scripts/eval_detect.py``.
+"""
 
 from __future__ import annotations
 
@@ -418,7 +424,10 @@ class UltraYoloDetector(Detector):
 
 
 def make_detector(*, allow_synthetic: bool = True) -> tuple[Detector, list[str]]:
-    """Return detector + missing keys. Prefer shipped YOLOX-Nano; optional AGPL YOLOv8 last; else synthetic/empty."""
+    """Return detector + missing keys. Prefer shipped YOLOX-Nano; optional AGPL YOLOv8 last; else synthetic/empty.
+
+    Nano quality and GPU VRAM are UNPROVEN; detections feed tracks, CIPV and AEB.
+    """
     missing: list[str] = []
     if DEFAULT_ONNX.is_file():
         try:

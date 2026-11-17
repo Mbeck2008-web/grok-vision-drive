@@ -136,11 +136,77 @@ def test_retail_zip_ships_yolox_nano() -> None:
     assert rel._excluded_file("models/yolox_m.onnx")
     assert rel._excluded_file("models/yolov8n.onnx")
     assert not rel._excluded_file("models/yolox_nano.onnx")
+    assert "models/LICENSE-YOLOX.txt" in rel.INCLUDE_GLOBS
+    assert "models/LICENSE-YOLOX.txt" in rel.MUST_HAVE
+    assert "models/LICENSE-YOLOX.txt" in files
+    license_txt = ROOT / "models" / "LICENSE-YOLOX.txt"
+    assert license_txt.is_file()
+    body = license_txt.read_text(encoding="utf-8")
+    assert "Apache License" in body
+    assert "Copyright (c) 2021-2022 Megvii Inc." in body
     assert (ROOT / "scripts" / "download_yolox.py").is_file()
     assert not (ROOT / "scripts" / "download_yolox_s.py").is_file()
 
 
+def test_yolox_decode_416_positive() -> None:
+    """Synthetic raw head at 416 (N=3549) must decode a vehicle and a pedestrian."""
+    import numpy as np
+
+    in_h = in_w = 416
+    n = (in_h // 8) * (in_w // 8) + (in_h // 16) * (in_w // 16) + (in_h // 32) * (in_w // 32)
+    assert n == 3549
+    raw = np.zeros((1, n, 85), dtype=np.float32)
+    decoded = _yolox_decode_raw(raw, in_h, in_w)
+    assert decoded.shape == (1, 3549, 85)
+    # First stride-8 cell at (0,0): cx,cy = 0; w,h = exp(0)*8 = 8.
+    assert abs(float(decoded[0, 0, 0])) < 1e-5
+    assert abs(float(decoded[0, 0, 2]) - 8.0) < 1e-5
+
+    # Vehicle (COCO 2) at stride-8 grid (20, 15): cx=160, cy=120, 8x8 box.
+    veh_i = 15 * (in_w // 8) + 20
+    raw[0, veh_i, 0:4] = 0.0
+    raw[0, veh_i, 4] = 1.0
+    raw[0, veh_i, 5 + 2] = 1.0
+    # Pedestrian (COCO 0) at stride-16 grid (10, 8): cx=160, cy=128, 16x16 box.
+    ped_i = (in_h // 8) * (in_w // 8) + 8 * (in_w // 16) + 10
+    raw[0, ped_i, 0:4] = 0.0
+    raw[0, ped_i, 4] = 1.0
+    raw[0, ped_i, 5 + 0] = 1.0
+
+    class _Fake:
+        in_h = 416
+        in_w = 416
+        conf = 0.35
+        nms_thr = 0.45
+        _decode_outputs = OnnxYoloxDetector._decode_outputs
+
+    xyxy, cls_ids, confs = _Fake()._decode_outputs([raw], ratio=1.0)
+    assert xyxy.shape[0] == 2
+    got = {int(c): (tuple(float(v) for v in box), float(s)) for box, c, s in zip(xyxy, cls_ids, confs)}
+    assert 2 in got and 0 in got
+    veh_box, veh_s = got[2]
+    ped_box, ped_s = got[0]
+    assert abs(veh_s - 1.0) < 1e-5 and abs(ped_s - 1.0) < 1e-5
+    exp_veh = (156.0, 116.0, 164.0, 124.0)
+    exp_ped = (152.0, 120.0, 168.0, 136.0)
+    assert all(abs(a - b) < 1e-4 for a, b in zip(veh_box, exp_veh)), veh_box
+    assert all(abs(a - b) < 1e-4 for a, b in zip(ped_box, exp_ped)), ped_box
+
+
+def test_shipped_yolox_nano_sha256() -> None:
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import download_yolox as dl  # noqa: E402
+
+    path = ROOT / "models" / "yolox_nano.onnx"
+    assert path.is_file()
+    digest = dl._sha256(path)
+    assert digest == dl.MODELS_BY_SIZE["nano"]["sha256"]
+    # The pin itself must stay the official Megvii 0.1.1rc0 digest.
+    assert digest == "c789161ed43c8269fcd4e67c67eeeb4e80c622da2eb296a20bc6007bd18a0b7d"
+
+
 def test_hot_swap() -> None:
+
     perc = ModularPerception(allow_synthetic=True)
     e2e = load_e2e("stub")
     opts = DebugOpts(detector_id="empty", e2e_id="stub")
@@ -191,6 +257,8 @@ def test_no_chrome() -> None:
 def main() -> None:
     test_catalog_shipped_n()
     test_load_fallbacks()
+    test_yolox_decode_416_positive()
+    test_shipped_yolox_nano_sha256()
     test_hot_swap()
     with tempfile.TemporaryDirectory() as td:
         test_missing_file_reverts(Path(td))

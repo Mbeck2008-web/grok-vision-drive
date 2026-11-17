@@ -37,6 +37,13 @@ DRIVABLE = 1
 VEHICLE_SIGNAL_KEYS = ("wheelspeed_mps", "imu_yaw_rate")
 VO_MIN_CELLS = 12
 VO_MIN_SCORE = 0.4
+# Residual VO: unmatched-at-zero cells are used only when they are a real
+# share of the previous set, or when they themselves register with high
+# confidence (ego-fixed clutter is a small share but a sharp residual peak).
+# An absolute 12-cell floor on the residual (the first version) treated
+# parked-ego flicker as motion.
+VO_RESIDUAL_SHARE = 0.15
+VO_RESIDUAL_CONF = 0.6
 FWD_RANGE_M = (-1.0, 4.0)     # per frame: -10..40 m/s at 10 Hz
 YAW_RANGE = (-0.15, 0.15)     # rad per frame
 
@@ -85,28 +92,17 @@ def _bev_keys(xy: np.ndarray, grid: OccGrid) -> np.ndarray:
 
 def _score(prev: np.ndarray, cur_keys: np.ndarray, grid: OccGrid, fwd: float, dyaw: float) -> float:
     """Share of warped previous cells that hit a current cell. Sparse: sorted key lookup, no raster."""
+    if len(prev) == 0 or len(cur_keys) == 0:
+        return 0.0
     k = _bev_keys(_warp(prev, fwd, dyaw), grid)
     pos = np.clip(np.searchsorted(cur_keys, k), 0, len(cur_keys) - 1)
     return float(((cur_keys[pos] == k) & (k >= 0)).sum()) / float(len(prev))
 
 
-def occ_odometry(prev_keys, prev_cls, cur_keys, cur_cls, *, grid: OccGrid = DEFAULT_GRID) -> tuple[float, float, float]:
-    """(forward m, yaw rad, overlap score) moving the previous frame onto the current one."""
-    prev, cur = _static_bev(prev_keys, prev_cls, grid), _static_bev(cur_keys, cur_cls, grid)
-    if len(prev) < VO_MIN_CELLS or len(cur) < VO_MIN_CELLS:
+def _register(prev: np.ndarray, cur_keys: np.ndarray, grid: OccGrid) -> tuple[float, float, float]:
+    """Coarse-to-fine search: (forward m, yaw rad, overlap score)."""
+    if len(prev) < VO_MIN_CELLS or len(cur_keys) == 0:
         return 0.0, 0.0, 0.0
-    cur_keys = np.unique(_bev_keys(cur, grid))
-    cur_keys = cur_keys[cur_keys >= 0]
-    # Cells that already match at zero shift are ego-fixed clutter (a dense
-    # decode_unseen prior, or a parked-ego hold). They score 0.8+ at (0, 0)
-    # and swamp a smaller set of moving posts/buildings. If enough cells do
-    # not match at rest, register those only; otherwise keep the full set so
-    # a truly stationary ego still scores high at zero.
-    k0 = _bev_keys(_warp(prev, 0.0, 0.0), grid)
-    pos0 = np.clip(np.searchsorted(cur_keys, k0), 0, len(cur_keys) - 1)
-    hit0 = (cur_keys[pos0] == k0) & (k0 >= 0)
-    if int((~hit0).sum()) >= VO_MIN_CELLS:
-        prev = prev[~hit0]
     best = (-1.0, 0.0, 0.0)
     for step_f, step_y, span_f, span_y in ((0.2, 0.01, None, None), (0.05, 0.0025, 0.3, 0.015)):
         if span_f is None:
@@ -121,6 +117,32 @@ def occ_odometry(prev_keys, prev_cls, cur_keys, cur_cls, *, grid: OccGrid = DEFA
                 if sc > best[0] + 1e-9:
                     best = (sc, float(f), float(yw))
     return best[1], best[2], best[0]
+
+
+def occ_odometry(prev_keys, prev_cls, cur_keys, cur_cls, *, grid: OccGrid = DEFAULT_GRID) -> tuple[float, float, float]:
+    """(forward m, yaw rad, overlap score) moving the previous frame onto the current one."""
+    prev, cur = _static_bev(prev_keys, prev_cls, grid), _static_bev(cur_keys, cur_cls, grid)
+    if len(prev) < VO_MIN_CELLS or len(cur) < VO_MIN_CELLS:
+        return 0.0, 0.0, 0.0
+    cur_keys = np.unique(_bev_keys(cur, grid))
+    cur_keys = cur_keys[cur_keys >= 0]
+    # Score the full set and, if enough cells miss at zero, the residual set.
+    # Ego-fixed decode_unseen clutter scores 0.8+ at (0, 0) on the full set and
+    # would lock speed=0; the residual of the moving posts still registers.
+    # A parked ego with a few flickering cells must keep the full (0, 0) hit:
+    # residual is used only when the unmatched share is large, or the residual
+    # itself scores with high confidence (not a ~0.4 flicker peak).
+    full = _register(prev, cur_keys, grid)
+    k0 = _bev_keys(_warp(prev, 0.0, 0.0), grid)
+    pos0 = np.clip(np.searchsorted(cur_keys, k0), 0, len(cur_keys) - 1)
+    hit0 = (cur_keys[pos0] == k0) & (k0 >= 0)
+    residual = prev[~hit0]
+    if len(residual) >= VO_MIN_CELLS:
+        res = _register(residual, cur_keys, grid)
+        share = len(residual) / float(len(prev))
+        if res[2] >= VO_MIN_SCORE and (share >= VO_RESIDUAL_SHARE or res[2] >= VO_RESIDUAL_CONF):
+            return res
+    return full
 
 
 @dataclass

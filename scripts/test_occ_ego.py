@@ -25,7 +25,7 @@ sys.path.insert(0, str(ROOT))
 
 import numpy as np  # noqa: E402
 
-from python.perception.occ_ego import EgoMotion, _static_bev, _warp, occ_odometry  # noqa: E402
+from python.perception.occ_ego import EgoMotion, VO_MIN_SCORE, _static_bev, _warp, occ_odometry  # noqa: E402
 from python.perception.occ_geometry import DEFAULT_GRID  # noqa: E402
 from python.perception.occ_outputs import OccTracker, objects  # noqa: E402
 
@@ -173,8 +173,35 @@ def check_vo_clutter() -> None:
     k1, c1 = cells(fwd)
     est_fwd, dyaw, score = occ_odometry(k0, c0, k1, c1, grid=G)
     assert abs(est_fwd - fwd) < 0.3, (est_fwd, dyaw, score)
-    assert score >= VO_MIN_SCORE if False else score > 0.3, (est_fwd, score)
+    assert score >= VO_MIN_SCORE, (est_fwd, score)
     print(f"VO clutter: fwd {est_fwd:.3f} m (true {fwd}) score {score:.3f} despite {3000} ego-fixed cells OK")
+
+
+def check_vo_parked_flicker() -> None:
+    """A parked ego plus >= 2% flickering cells must stay at rest with ok=True."""
+    rng = np.random.default_rng(1)
+    n_static = 600
+    base = np.stack([rng.uniform(-20, 20, n_static), rng.uniform(0, 45, n_static)], 1)
+
+    def keys(xy, z=1.2):
+        pts = np.concatenate([xy, np.full((len(xy), 1), z)], 1)
+        k = G.keys_of(pts)
+        k = k[k >= 0]
+        return k, np.zeros(k.size, np.uint8)
+
+    for nfl in (12, 30, 60):  # 2%, 5%, 10%
+        # one pair is enough for the odometry check; run a few ticks
+        fwds, scores = [], []
+        for t in range(5):
+            a = np.concatenate([base, np.stack([rng.uniform(-20, 20, nfl), rng.uniform(0, 45, nfl)], 1)])
+            b = np.concatenate([base, np.stack([rng.uniform(-20, 20, nfl), rng.uniform(0, 45, nfl)], 1)])
+            f, y, sc = occ_odometry(*keys(a), *keys(b), grid=G)
+            fwds.append(f)
+            scores.append(sc)
+            assert abs(f) < 0.1, (nfl, t, f, y, sc)
+            assert sc >= VO_MIN_SCORE, (nfl, t, f, sc)  # ok=True
+        print(f"VO parked+flicker {nfl}/{n_static} ({100 * nfl / n_static:.0f}%): "
+              f"|fwd| max {max(abs(x) for x in fwds):.3f} m, score min {min(scores):.2f} OK")
 
 
 def check_featureless() -> None:
@@ -192,6 +219,7 @@ def check_featureless() -> None:
 def main() -> int:
     check_vo()
     check_vo_clutter()
+    check_vo_parked_flicker()
     check_world_fixed()
     check_featureless()
     print("test_occ_ego: all OK")

@@ -27,7 +27,7 @@ or CPU ESTIMATES; real-data, GPU memory and GPU latency are UNPROVEN.
 
 | claim | evidence / cost | test that would falsify it |
 |---|---|---|
-| A learned VO head is unnecessary for v1; direct sparse photometric VO is enough | two learned heads failed on synthetic clips; direct VO drift 0.079 m / 10 m, no params, 384 samples | real clips: integrated VO drift over 100 m > 5% with conf >= 0.3 |
+| A learned VO head is unnecessary for v1; direct sparse photometric VO is enough | two learned heads failed on synthetic clips; direct VO drift 0.045 m / 10 m, no params, 384 samples | real clips: integrated VO drift over 100 m > 5% with conf >= 0.3 |
 | Nothing dense needs to cross ticks | cache = sparse cells + 384 grey samples (0.072 MB) | an ablation that caches the 1/8 map and beats sparse memory on occluded IoU on GVD's split |
 | Lanes as polylines from semantic cells beat a lane head at this size | no lane labels beyond paint strokes; zero extra params | a lane head of <= 50k params with higher polyline F1 on held-out real clips |
 | The occluded metric is dominated by layout priors on straight roads | prior 0.934 vs model 0.005 on synthetic | held-out intersections/roundabouts where the prior falls below the memory model |

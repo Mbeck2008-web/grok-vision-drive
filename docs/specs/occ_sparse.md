@@ -68,7 +68,7 @@ occ_out at t byte-identical). No bidirectional memory, smoothing or retroactive 
 first fresh of main/wide/narrow/...; grey values with local texture (range >= 4/255 over
 +-1.5 px) are cached. Next tick, candidate motions move the points with the same
 `warp_cells` the memory uses; trimmed (best 80%) photometric cost, 37-step forward search
-then three 3x3x3 refinements. Confidence from cost contrast; below 0.3 the last accepted
+then three 3x3x3 refinements. Confidence = global cost contrast x local sharpness (+-0.15 m); below 0.3 the last accepted
 step is reused (flagged `vo_fallback`, conf halved). Flat-ground assumption; no learned
 parameters. Wheel/IMU replace it only with `--ego-from-vehicle` (default off). GT pose and
 scenetree are training labels only (import-graph + pose-spy tests).
@@ -76,7 +76,7 @@ scenetree are training labels only (import-graph + pose-spy tests).
 * **Deviation from the earlier plan:** two learned VO heads were tried first and failed
   on the synthetic clips (recorded below); the direct VO replaced them.
 * Measured (N6, SYNTHETIC held-out clip, flag off, no GT, 8-12 m/s, 10 ticks): **VO drift
-  0.079 m over 10.00 m travel** (0.8%); baselines: zero odometry 10.00 m, constant training
+  0.045 m over 10.00 m travel** (0.5%; max 0.056 m); baselines: zero odometry 10.00 m, constant training
   mean 2.50 m. The true-pose run (warp math) is kept separately (exact).
 * Limitation: the synthetic world only moves forward; lateral/yaw VO is exercised only by
   fuzz (finite, bounded), not by an accuracy test.
@@ -183,7 +183,10 @@ majority-class baseline (disclosed: a loosened bar on a test added in this branc
 F1 (fuzz profile, 1500 examples) `labels._seg_points` OverflowError on a paint stroke with a
 huge finite endpoint -> fixed, regression R11; F2 (fuzz) a branch test asserted motion >= 3
 frames on the committed v1 viz adapter, which allows 2 -> test restored to the adapter's
-rule (viz is GVD-owned; occ_out v2 enforces >= 3).
+rule (viz is GVD-owned; occ_out v2 enforces >= 3);
+V9 (hypothesis, script mode) direct VO on the wide camera alone at 96 px, 0.25 m step: answer
+0.0 m with conf 1.0 (flat cost basin; longitudinal line edges pinned dy at 0) -> texture gate
+along v only + local-sharpness term in the confidence (now 0.24 < 0.3 on that case).
 
 Properties (hypothesis, ci profile 60 / net 12 examples; fuzz profile 1500 / 80): grid index,
 fine-in-coarse, camera round trip, label invariants, depth_to_m, sampler 20-30% recoveries,

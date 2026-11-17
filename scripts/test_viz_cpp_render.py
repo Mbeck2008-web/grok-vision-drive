@@ -72,12 +72,42 @@ def build_dir() -> Path | None:
     return b
 
 
+def require_live() -> bool:
+    """CI sets GVD_REQUIRE_LIVE=1 so a skipped live/GLFW check is a failure."""
+    v = (os.environ.get("GVD_REQUIRE_LIVE") or "").strip().lower()
+    return v not in ("", "0", "false", "no", "off")
+
+
+def _glfw_headless_built(b: Path) -> bool:
+    name = "gvd_viz_test_glfw_headless.exe" if sys.platform == "win32" else "gvd_viz_test_glfw_headless"
+    return any((b / sub / name).is_file() for sub in ("", "Release", "Debug"))
+
+
+def _no_glfw_build_error(msg: str) -> bool:
+    text = (msg or "").lower()
+    return "built without glfw" in text or "no window mode" in text
+
+
 def check_ctest(b: Path) -> None:
     ctest = shutil.which("ctest") or str(Path(shutil.which("cmake") or "ctest").with_name("ctest"))
     r = subprocess.run([ctest, "--test-dir", str(b), "-C", "Release", "--output-on-failure"],
                        capture_output=True, text=True)
     print(r.stdout[-3000:])
-    assert r.returncode == 0, r.stderr[-2000:]
+    print(f"check_ctest: GVD_REQUIRE_LIVE={os.environ.get('GVD_REQUIRE_LIVE')!r} "
+          f"DISPLAY={os.environ.get('DISPLAY')!r}")
+    assert r.returncode == 0, (r.stderr or r.stdout)[-2000:]
+    # A GLFW-fallback init_headless failure used to return 77 (ctest Skipped,
+    # exit 0). If we have a display and a GLFW test binary, that skip is a fail.
+    glfw_built = _glfw_headless_built(b)
+    display = os.environ.get("DISPLAY")
+    if glfw_built and (require_live() or display):
+        skipped = [ln for ln in r.stdout.splitlines()
+                   if "gvd_viz_glfw_headless" in ln and "Skipped" in ln]
+        assert not skipped, (
+            "gvd_viz_glfw_headless was skipped while GLFW is built and "
+            f"DISPLAY={display!r} GVD_REQUIRE_LIVE={os.environ.get('GVD_REQUIRE_LIVE')!r}: "
+            + " | ".join(skipped)
+        )
     print("ctest: gvd_viz render tests OK")
 
 
@@ -253,14 +283,17 @@ def check_live_uses_scene_to_show(exe: Path) -> None:
     """Behavioral check of main.cpp:167. After 1 s with no UDP, the live
     window must blank tracks/lanes (scene_to_show). `Scene show = cur`
     would keep the last yellow lanes on screen.
-    Screenshots the Xvfb display with mss. Skips visibly if this
-    build has no GLFW or there is no display.
+    Screenshots the Xvfb display with mss. Skips only when this build
+    truly has no GLFW, or there is no display. GVD_REQUIRE_LIVE=1 (CI)
+    turns those SKIPs into failures.
     """
     display = os.environ.get("DISPLAY")
     xvfb_proc = None
     if not display:
         display, xvfb_proc = _start_xvfb()
         if display is None:
+            if require_live():
+                raise AssertionError("GVD_REQUIRE_LIVE=1 but no DISPLAY / Xvfb")
             print("SKIP live scene_to_show wiring (no DISPLAY / Xvfb)")
             return
         os.environ["DISPLAY"] = display
@@ -275,14 +308,23 @@ def check_live_uses_scene_to_show(exe: Path) -> None:
         text=True,
     )
     try:
-        # Fail fast if the binary was built without GLFW / cannot make a window.
+        # Fail fast. Only SKIP a no-GLFW *build*; any other early exit
+        # (including a forced rx.open failure, exit 9) is a failure.
+        # GVD_REQUIRE_LIVE=1 also fails the no-GLFW skip.
         time.sleep(0.4)
         if proc.poll() is not None:
             err = (proc.stderr.read() if proc.stderr else "") or ""
             out = (proc.stdout.read() if proc.stdout else "") or ""
             msg = (err + out).strip()
-            print(f"SKIP live scene_to_show wiring (gvd_viz exited {proc.returncode}): {msg}")
-            return
+            no_glfw = _no_glfw_build_error(msg)
+            if no_glfw and not require_live():
+                print(f"SKIP live scene_to_show wiring (no GLFW build, "
+                      f"exited {proc.returncode}): {msg}")
+                return
+            raise AssertionError(
+                f"gvd_viz --listen exited {proc.returncode}: {msg}"
+                + ("; GVD_REQUIRE_LIVE=1, missing GLFW is a failure" if no_glfw else "")
+            )
         scene = {
             "v": 1, "type": "gvd_scene", "seq": 1, "t": 0,
             "lanes": [
@@ -343,6 +385,8 @@ def check_deps_pinned() -> None:
 
 
 def main() -> None:
+    print(f"GVD_REQUIRE_LIVE={os.environ.get('GVD_REQUIRE_LIVE') or ''} "
+          f"(live/GLFW skips are {'FAIL' if require_live() else 'allowed'})")
     check_deps_pinned()
     b = build_dir()
     if b is None:

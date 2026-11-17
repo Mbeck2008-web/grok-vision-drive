@@ -132,6 +132,8 @@ if(GVD_VIZ_TESTS)
   # The main render test uses EGL on Linux, so it never reaches this branch.
   # Compiled as a separate exe without GVD_VIZ_HAVE_EGL. SKIP (77) if
   # glfwCreateWindow fails (no display); ctest reports Skipped vs Passed.
+  # Under GVD_REQUIRE_LIVE=1 the test returns 1 instead of 77 so a
+  # failed GLFW fallback cannot hide as Skipped (CI sets this).
   if(GVD_VIZ_GLFW)
     add_executable(gvd_viz_test_glfw_headless tests/test_glfw_headless.cpp src/context.cpp)
     target_include_directories(gvd_viz_test_glfw_headless PRIVATE src third_party/glad/include)

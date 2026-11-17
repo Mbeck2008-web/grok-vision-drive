@@ -9,6 +9,8 @@ jobs:
   offline:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      GVD_REQUIRE_LIVE: "1"
     steps:
       - name: Put /tmp on disk
         # ubuntu-26.04 mounts /tmp as a RAM tmpfs (about 7.8 GB). The suite writes
@@ -54,6 +56,7 @@ jobs:
           cmake --preset linux-release
           cmake --build --preset linux-release --parallel
           ./build/linux-release/gvd_viz --info --offline tests/scenes/basic.jsonl --png build/ci_basic.png
+          echo "GVD_REQUIRE_LIVE=${GVD_REQUIRE_LIVE}"
           xvfb-run -a ctest --preset linux-release
 
       - name: Python packages
@@ -81,4 +84,7 @@ jobs:
         # in cv2.namedWindow (the train panel). xvfb is a display, not offscreen Qt.
         env:
           GVD_VIZ_BUILD_DIR: ${{ github.workspace }}/cpp/viz/build/linux-release
-        run: xvfb-run -a python scripts/run_offline_suite.py
+          GVD_REQUIRE_LIVE: "1"
+        run: |
+          echo "GVD_REQUIRE_LIVE=${GVD_REQUIRE_LIVE}"
+          xvfb-run -a python scripts/run_offline_suite.py

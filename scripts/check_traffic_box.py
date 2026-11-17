@@ -18,11 +18,15 @@ displacement from that segment's first ``pos`` is greater than ``MOVE_M``):
 * ``|(pos - box.ctr) · ax_i|`` must be <= ``half_i`` + ``CTR_POS_SLACK_M``
   on every axis (an oriented box, not a sphere of radius ``|half|``).
 * One box axis must have ``|dot|`` >= ``AXIS_DOT_MIN`` with ``dir``, and
-  one with ``up``. The dir-aligned axis must carry the longest horizontal
-  half, and the up-aligned axis the vertical half.
+  one with ``up``. The dir-aligned axis must carry the longest half among
+  axes not aligned with ``up``.
 * LIVE requires at least ``MIN_MOVING_BOXED`` such samples in a segment,
   all passing both tests, and no violating sample in any segment. A later
   short segment does not undo a proven one.
+* Axes are reported live only if the yaw span across the proven segment's
+  moving boxed samples is at least ``MIN_YAW_SPAN_DEG``. A shorter span
+  is printed as axes UNPROVEN; the recording may still PASS and the long
+  run may proceed, but the report must not claim those axes are live.
 
 If the box is spawn-stuck or axes stay at spawn: keep only ``half`` and
 build ``ctr`` / ``ax`` from live ``pos`` / ``dir`` / ``up``, or switch the
@@ -54,6 +58,9 @@ MIN_MOVING_BOXED = 6
 CTR_POS_SLACK_M = 0.5
 # On a moving boxed sample, one axis must align with dir and one with up.
 AXIS_DOT_MIN = 0.98
+# Axes are live only if the proven segment's moving boxed samples span
+# at least this much heading change (degrees, circular).
+MIN_YAW_SPAN_DEG = 30.0
 NAME_PREFIX = "gvd_traffic_"
 
 
@@ -123,42 +130,40 @@ def ctr_exceeds_half(
     return False
 
 
+def _yaw_span_deg(yaws: list[float]) -> float:
+    """Smallest circular span, in degrees, covering the heading samples."""
+    if len(yaws) < 2:
+        return 0.0
+    xs = sorted(y % (2.0 * math.pi) for y in yaws)
+    gaps = [xs[i + 1] - xs[i] for i in range(len(xs) - 1)]
+    gaps.append(xs[0] + 2.0 * math.pi - xs[-1])
+    return math.degrees(2.0 * math.pi - max(gaps))
+
+
 def _axes_match_extents(
     units: list[tuple[float, float, float]],
     half: tuple[float, float, float],
     dir_u: tuple[float, float, float],
     up_u: tuple[float, float, float],
 ) -> bool:
-    """Dir-aligned axis carries the longest horizontal half; up-aligned the vertical half.
+    """Dir-aligned axis carries the longest half among axes not aligned with up.
 
     Missing dir/up axes are left to ``has_dir`` / ``has_up`` so a dropped
     up check still fails a rolled-but-dir-aligned box.
     """
-    # Argument order is (ref, axis) so these lines do not duplicate the
-    # has_dir / has_up strings that mutation tests patch.
     dir_idxs = [i for i, a in enumerate(units) if abs(_dot(dir_u, a)) >= AXIS_DOT_MIN]
     up_idxs = [i for i, a in enumerate(units) if abs(_dot(up_u, a)) >= AXIS_DOT_MIN]
-    if dir_idxs and up_idxs and set(dir_idxs) & set(up_idxs):
+    if not dir_idxs:
+        return True
+    i = dir_idxs[0]
+    horiz = [j for j in range(3) if j not in up_idxs]
+    if horiz and half[i] + 1e-12 < max(half[j] for j in horiz):
         return False
-    if dir_idxs:
-        i = dir_idxs[0]
-        horiz = [j for j in range(3) if j not in up_idxs]
-        if i not in horiz:
-            return False
-        if half[i] + 1e-12 < max(half[j] for j in horiz):
-            return False
-    if up_idxs:
-        # The up-aligned axis carries the remaining (vertical) half: it is
-        # not a horizontal axis, and no other axis is also aligned with up.
-        if len(up_idxs) != 1:
-            return False
-        if up_idxs[0] in dir_idxs:
-            return False
     return True
 
 
 def axes_aligned(box: Mapping[str, Any] | None, direction: Any, up: Any) -> bool:
-    """True when dir/up each match one axis and those axes carry the matching halves."""
+    """True when dir/up each match one axis and the dir-aligned axis has the longest non-up half."""
     if not isinstance(box, Mapping):
         return False
     dir_u, up_u = _unit(direction), _unit(up)
@@ -249,6 +254,7 @@ def _segment_stats(samples: list[dict[str, Any]]) -> dict[str, Any]:
     n_moving_boxed = 0
     spawn_stuck = False
     axes_stuck = False
+    yaws: list[float] = []
     for sample in samples:
         pos = _vec3(sample.get("pos"))
         if pos is None:
@@ -274,7 +280,11 @@ def _segment_stats(samples: list[dict[str, Any]]) -> dict[str, Any]:
             spawn_stuck = True
         if not axes_aligned(box, sample.get("dir"), sample.get("up")):
             axes_stuck = True
+        dir_u = _unit(sample.get("dir"))
+        if dir_u is not None:
+            yaws.append(math.atan2(dir_u[0], dir_u[1]))
     n = len(samples)
+    yaw_span_deg = _yaw_span_deg(yaws)
     moving = first_pos is not None and pos_span > MOVE_M
     unproven = moving and n_moving_boxed < MIN_MOVING_BOXED and not spawn_stuck and not axes_stuck
     # A moving stretch with no boxed samples at all is unproven (not stuck).
@@ -292,6 +302,7 @@ def _segment_stats(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "spawn_stuck": spawn_stuck,
         "axes_stuck": axes_stuck,
         "unproven": unproven,
+        "yaw_span_deg": yaw_span_deg,
         "proven_live": (
             moving
             and n_moving_boxed >= MIN_MOVING_BOXED
@@ -313,6 +324,15 @@ def _merge_stats(segments: list[dict[str, Any]]) -> dict[str, Any]:
     axes_stuck = any(s["axes_stuck"] for s in segments)
     proven_live = any(s["proven_live"] for s in segments)
     unproven = (not spawn_stuck) and (not axes_stuck) and (not proven_live)
+    proven_spans = [s["yaw_span_deg"] for s in segments if s["proven_live"]]
+    yaw_span_deg = (
+        max(proven_spans)
+        if proven_spans
+        else max((s["yaw_span_deg"] for s in segments), default=0.0)
+    )
+    axes_yaw_proven = any(
+        s["proven_live"] and s["yaw_span_deg"] >= MIN_YAW_SPAN_DEG for s in segments
+    )
     return {
         "ticks": n,
         "moved_m": moved,
@@ -326,6 +346,10 @@ def _merge_stats(segments: list[dict[str, Any]]) -> dict[str, Any]:
         "spawn_stuck": spawn_stuck,
         "axes_stuck": axes_stuck,
         "unproven": unproven,
+        "yaw_span_deg": yaw_span_deg,
+        "axes_yaw_proven": (
+            proven_live and not spawn_stuck and not axes_stuck and axes_yaw_proven
+        ),
         "proven_live": proven_live and not spawn_stuck and not axes_stuck,
     }
 
@@ -373,7 +397,9 @@ def _tag(stats: Mapping[str, Any]) -> str:
     if stats["axes_stuck"]:
         return "AXES-STUCK"
     if stats["proven_live"]:
-        return "LIVE"
+        if stats.get("axes_yaw_proven"):
+            return "LIVE"
+        return "LIVE, axes UNPROVEN"
     if stats["moving"]:
         return "UNPROVEN"
     return "PARKED"
@@ -392,23 +418,46 @@ def format_report(summary: Mapping[str, Any], source: str) -> str:
         ctr_span = stats["ctr_span_m"]
         max_s = "none" if max_cp is None else f"{max_cp:.3f}"
         span_s = "none" if ctr_span is None else f"{ctr_span:.3f}"
+        yaw_s = f"{stats['yaw_span_deg']:.1f}"
         lines.append(
             f"  {name}  ticks={stats['ticks']}  spawns={stats['n_spawns']}  "
             f"moved_m={stats['moved_m']:.3f}  box_nonnull={stats['box_nonnull']:.3f}  "
             f"moving_boxed={stats['n_moving_boxed']}  max_|ctr-pos|_m={max_s}  "
-            f"ctr_span_m={span_s}  {_tag(stats)}"
+            f"ctr_span_m={span_s}  yaw_span_deg={yaw_s}  {_tag(stats)}"
         )
     if summary["ok"]:
         n = len(summary["proven"])
+        axes_unproven = [
+            name
+            for name, st in cars.items()
+            if st["proven_live"] and not st["axes_yaw_proven"]
+        ]
+        if axes_unproven:
+            names = ", ".join(axes_unproven)
+            axes_note = (
+                f"Axes are UNPROVEN for {names} (yaw span under "
+                f"{MIN_YAW_SPAN_DEG:g}° over the proven segment's moving "
+                "boxed samples); do not claim axes are live. "
+            )
+            proceed = (
+                "Long run may proceed on this evidence; "
+                f"axes are unproven for {names}."
+            )
+        else:
+            axes_note = (
+                f"yaw span >= {MIN_YAW_SPAN_DEG:g}° on a proven segment; "
+            )
+            proceed = "Long run may proceed on this evidence."
         lines.append(
             f"PASS: {n} {NAME_PREFIX}* car(s) met the live-box bar on the "
             "IQU45 smoke check "
             f"(|(pos-ctr)·ax_i| <= half_i+{CTR_POS_SLACK_M:g} m on "
             f">= {MIN_MOVING_BOXED} moving boxed samples in a spawn segment, "
-            f"dir axis has the longest horizontal half, up axis the vertical "
-            f"half, axes |dot|>= {AXIS_DOT_MIN:g} with dir and up; samples split "
-            "on veh_meta or a pos jump). The smoke run decides this; do not "
-            "assume it from the Lua name. Long run may proceed on this evidence."
+            "dir axis has the longest half among axes not aligned with up, "
+            f"axes |dot|>= {AXIS_DOT_MIN:g} with dir and up; {axes_note}"
+            "samples split on veh_meta or a pos jump). The smoke run "
+            "decides this; do not assume it from the Lua name. "
+            f"{proceed}"
         )
     elif summary["stuck"]:
         names = ", ".join(summary["stuck"])
@@ -422,9 +471,9 @@ def format_report(summary: Mapping[str, Any], source: str) -> str:
         names = ", ".join(summary["axes"])
         lines.append(
             f"FAIL: {names} box axes were not aligned with dir/up "
-            f"(|dot| < {AXIS_DOT_MIN:g}), or the dir/up axes did not carry "
-            "the longest horizontal / vertical half, on a moving boxed "
-            "sample. Do not "
+            f"(|dot| < {AXIS_DOT_MIN:g}), or the dir-aligned axis did not "
+            "carry the longest half among axes not aligned with up, on a "
+            "moving boxed sample. Do not "
             "start the long run. Keep only half and build ctr/ax from "
             "pos/dir/up, or switch to a live OOBB call, then re-smoke."
         )

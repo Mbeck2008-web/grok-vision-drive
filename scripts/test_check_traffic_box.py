@@ -411,6 +411,8 @@ def check_turning_car_axes() -> None:
     live = _run(True)
     assert live["_rc"] == 0 and live["status"] == "LIVE", live
     assert live["cars"]["gvd_traffic_0"]["proven_live"]
+    assert live["cars"]["gvd_traffic_0"]["axes_yaw_proven"]
+    assert live["cars"]["gvd_traffic_0"]["yaw_span_deg"] >= ctb.MIN_YAW_SPAN_DEG
 
     frozen = _run(False)
     assert frozen["_rc"] == 1 and frozen["status"] == "AXES-STUCK", frozen
@@ -606,6 +608,115 @@ def check_proven_segment_plus_short_tail_passes() -> None:
     print("proven segment plus short tail passes")
 
 
+def check_ctr_1_3m_above_car_fails() -> None:
+    """A box centre ~1.3 m above the car must be SPAWN-STUCK (locks the vertical axis)."""
+    off = 1.3
+    assert off > HALF[2] + ctb.CTR_POS_SLACK_M
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        ticks = []
+        for pos in _path():
+            ctr = (pos[0], pos[1], pos[2] + off)
+            ticks.append([_car("gvd_traffic_0", pos, _box(ctr))])
+        _write(root, ticks)
+        assert ctb.main([str(root)]) == 1
+        summary = ctb.summarize(ctb.load_state(root / "state.jsonl"))
+        stats = summary["cars"]["gvd_traffic_0"]
+        assert summary["status"] == "SPAWN-STUCK" and not summary["ok"], summary
+        assert stats["spawn_stuck"]
+        assert stats["n_moving_boxed"] >= ctb.MIN_MOVING_BOXED
+        assert stats["max_ctr_pos_m"] is not None
+        assert abs(stats["max_ctr_pos_m"] - off) < 1e-9
+    print("1.3 m above-car ctr fails")
+
+
+def check_straight_only_axes_unproven() -> None:
+    """A straight-only live box must PASS with axes UNPROVEN (yaw span < 30°)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        ticks = [[_car("gvd_traffic_0", pos, _box(_live_ctr(pos)))] for pos in _path()]
+        _write(root, ticks)
+        assert ctb.main([str(root)]) == 0
+        summary = ctb.summarize(ctb.load_state(root / "state.jsonl"))
+        stats = summary["cars"]["gvd_traffic_0"]
+        assert summary["ok"] and summary["status"] == "LIVE", summary
+        assert stats["proven_live"] and not stats["axes_yaw_proven"]
+        assert stats["yaw_span_deg"] < ctb.MIN_YAW_SPAN_DEG
+        text = ctb.format_report(summary, "synthetic")
+        assert "yaw_span_deg=" in text
+        assert "LIVE, axes UNPROVEN" in text
+        assert "Axes are UNPROVEN" in text
+        assert "do not claim axes are live" in text
+        assert "Long run may proceed on this evidence; axes are unproven for gvd_traffic_0" in text
+        assert "do not claim axes are live" in text
+        assert "yaw span >= " not in text
+    print("straight-only axes UNPROVEN")
+
+
+def check_turning_car_axes_proven() -> None:
+    """A live box on a >=30° turn must report axes proven."""
+    poses: list[tuple[tuple[float, float, float], float]] = []
+    y = 0.0
+    while y <= 40.0 + 1e-9:
+        poses.append(((0.0, y, 0.5), 0.0))
+        y += 5.0
+    yaw = math.radians(30.0)
+    x, y = 0.0, 40.0
+    for _ in range(8):
+        x += 5.0 * math.sin(yaw)
+        y += 5.0 * math.cos(yaw)
+        poses.append(((x, y, 0.5), yaw))
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        ticks = []
+        for pos, yaw in poses:
+            direction, up, ax = _orient(yaw)
+            ticks.append([_car(
+                "gvd_traffic_0", pos, _box(_live_ctr(pos), ax=ax),
+                direction=direction, up=up,
+            )])
+        _write(root, ticks)
+        assert ctb.main([str(root)]) == 0
+        summary = ctb.summarize(ctb.load_state(root / "state.jsonl"))
+        stats = summary["cars"]["gvd_traffic_0"]
+        assert summary["ok"] and summary["status"] == "LIVE", summary
+        assert stats["proven_live"] and stats["axes_yaw_proven"]
+        assert stats["yaw_span_deg"] >= ctb.MIN_YAW_SPAN_DEG
+        text = ctb.format_report(summary, "synthetic")
+        assert "LIVE, axes UNPROVEN" not in text
+        assert "Axes are UNPROVEN" not in text
+        assert "axes are unproven" not in text
+        assert "Long run may proceed on this evidence." in text
+        assert f"yaw span >= {ctb.MIN_YAW_SPAN_DEG:g}°" in text
+        assert "yaw_span_deg=" in text
+    print("turning car (>=30°) axes proven")
+
+
+def check_unusable_half_on_moving_sample_is_spawn_stuck() -> None:
+    """Unusable half on a moving boxed sample must be SPAWN-STUCK (not AXES-STUCK)."""
+    poses = _path()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        ticks = []
+        for pos in poses:
+            if (pos[1] - poses[0][1]) > ctb.MOVE_M:
+                box = _box(_live_ctr(pos), half=[None, HALF[1], HALF[2]])  # type: ignore[list-item]
+            else:
+                box = _box(_live_ctr(pos))
+            ticks.append([_car("gvd_traffic_0", pos, box)])
+        _write(root, ticks)
+        assert ctb.main([str(root)]) == 1
+        summary = ctb.summarize(ctb.load_state(root / "state.jsonl"))
+        stats = summary["cars"]["gvd_traffic_0"]
+        assert summary["status"] == "SPAWN-STUCK" and not summary["ok"], summary
+        assert stats["spawn_stuck"]
+        assert stats["n_moving_boxed"] >= ctb.MIN_MOVING_BOXED
+        assert "AXES-STUCK" not in summary["status"]
+        text = ctb.format_report(summary, "synthetic")
+        assert "SPAWN-STUCK" in text
+    print("unusable half on moving sample is SPAWN-STUCK")
+
+
 def check_predicates_locked() -> None:
     """Mutations of the |ctr-pos| limit, axis check, or spawn split must fail tests."""
     src = (ROOT / "scripts" / "check_traffic_box.py").read_text(encoding="utf-8")
@@ -616,7 +727,15 @@ def check_predicates_locked() -> None:
     assert "abs(_dot(a, dir_u)) >= AXIS_DOT_MIN" in src
     assert "abs(_dot(a, up_u)) >= AXIS_DOT_MIN" in src
     assert "return has_dir and has_up" in src
-    assert "longest horizontal" in src
+    assert "longest half among axes not aligned with up" in src
+    assert "up-aligned axis the vertical half" not in src
+    assert "Argument order is (ref, axis)" not in src
+    assert "for i, ax in enumerate(units):" in src
+    assert "for i, ax in enumerate(units[:2]):" not in src
+    assert "MIN_YAW_SPAN_DEG = 30.0" in src
+    assert 's["yaw_span_deg"] >= MIN_YAW_SPAN_DEG' in src
+    assert "LIVE, axes UNPROVEN" in src
+    assert "if paired is None:\n        return True" in src
     assert '_dist(pos, last_pos[name]) > JUMP_M' in src
     assert 'if "veh_meta" in row:' in src
     assert "n_moving_boxed >= MIN_MOVING_BOXED" in src
@@ -660,6 +779,10 @@ def main() -> None:
     check_ctr_2m_lateral_fails()
     check_exactly_6_moving_boxed_passes()
     check_proven_segment_plus_short_tail_passes()
+    check_ctr_1_3m_above_car_fails()
+    check_straight_only_axes_unproven()
+    check_turning_car_axes_proven()
+    check_unusable_half_on_moving_sample_is_spawn_stuck()
     check_predicates_locked()
     print("check_traffic_box ok")
 

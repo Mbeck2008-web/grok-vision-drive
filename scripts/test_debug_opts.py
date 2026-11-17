@@ -423,10 +423,16 @@ def main() -> None:
         tw = _text_size(label, FS_TAB)[0]
         tab_x += tw + 26
         assert tw + 18 < NERD_WIDTH - 16, label
-    assert tab_x <= NERD_WIDTH + 8, tab_x
+    # OpenCV Hershey getTextSize is not stable across 4.x vs 5.0 (unpinned
+    # opencv-python>=4.8). Local 5.0.0 measures tab_x=561; CI 4.x has landed
+    # on 575, which missed NERD_WIDTH+8=568. The same 575 failure already
+    # showed up on an unrelated occupancy PR (actions run 44155534635) and
+    # then passed on a later run. Keep enough slack for that variance; still
+    # fail if a new tab is added without widening the panel.
+    assert tab_x <= NERD_WIDTH + 24, tab_x
     assert FS_BODY >= 0.65, "nerd body type must stay large enough to read on a second screen"
     assert NERD_WIDTH >= 520
-    print("test_debug_opts: OK")
+    print(f"test_debug_opts: OK (tab_x={tab_x} cv2={__import__('cv2').__version__})")
 
 
 if __name__ == "__main__":

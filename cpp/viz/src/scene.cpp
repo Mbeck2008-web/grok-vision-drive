@@ -125,6 +125,19 @@ bool parse_scene(const std::string& text, Scene& out, std::string* err) {
     s.engaged = boolean(*it, "engaged", false);
     s.speed_mps = num(*it, "speed_mps", 0.f);
     s.set_mps = num(*it, "set_mps", -1.f);
+    s.yaw_rate_rps = num(*it, "yaw_rate_rps", 0.f);
+    // All three pose fields must be present and finite; nothing is invented.
+    if (it->contains("x") && it->contains("y") && it->contains("yaw")) {
+      const float px = num(*it, "x", NAN);
+      const float py = num(*it, "y", NAN);
+      const float pyaw = num(*it, "yaw", NAN);
+      if (std::isfinite(px) && std::isfinite(py) && std::isfinite(pyaw)) {
+        s.has_ego_pose = true;
+        s.ego_x = px;
+        s.ego_y = py;
+        s.ego_yaw = pyaw;
+      }
+    }
   }
   read_int(j, "lead_id", s.lead_id);
   if (auto it = j.find("aeb"); it != j.end()) {
@@ -173,6 +186,52 @@ bool parse_scene(const std::string& text, Scene& out, std::string* err) {
       edge.pts = pts_of(e);
       if (!read_kind(e, edge.predicted)) continue;
       if (edge.pts.size() >= 2) s.edges.push_back(std::move(edge));
+    }
+  }
+
+  if (auto it = j.find("dots"); it != j.end() && it->is_array()) {
+    for (const auto& d : *it) {
+      if (s.dots.size() >= static_cast<size_t>(kMaxDots)) break;
+      if (!d.is_object()) continue;
+      Dot dot;
+      if (d.contains("id") && !read_int(d, "id", dot.id)) continue;
+      dot.x = num(d, "x", NAN);
+      dot.y = num(d, "y", NAN);
+      if (!std::isfinite(dot.x) || !std::isfinite(dot.y)) continue;
+      auto cit = d.find("cls");
+      if (cit != d.end()) {
+        if (!cit->is_string()) continue;
+        const std::string c = cit->get<std::string>();
+        if (c == "white" || c == "lane") dot.cls = DotCls::White;
+        else if (c == "yellow") dot.cls = DotCls::Yellow;
+        else if (c == "curb") dot.cls = DotCls::Curb;
+        else if (c == "edge" || c == "road_edge") dot.cls = DotCls::Edge;
+        else if (c == "path") dot.cls = DotCls::Path;
+        else continue;
+      }
+      // Missing or non-numeric / non-finite prob, or missing / non-bool
+      // observed, drops the dot (it is not drawn at full brightness).
+      auto pit = d.find("prob");
+      if (pit == d.end() || !pit->is_number()) continue;
+      const double pr = pit->get<double>();
+      if (!std::isfinite(pr)) continue;
+      dot.prob = std::clamp(static_cast<float>(pr), 0.f, 1.f);
+      auto oit = d.find("observed");
+      if (oit == d.end() || !oit->is_boolean()) continue;
+      dot.observed = oit->get<bool>();
+      if (d.contains("ijk")) {
+        const auto& ijk = d["ijk"];
+        if (!ijk.is_array() || ijk.size() != 3) continue;
+        int ii = 0, jj = 0, kk = 0;
+        if (!ijk[0].is_number_integer() || !ijk[1].is_number_integer() || !ijk[2].is_number_integer()) continue;
+        ii = ijk[0].get<int>();
+        jj = ijk[1].get<int>();
+        kk = ijk[2].get<int>();
+        dot.i = ii;
+        dot.j = jj;
+        dot.k = kk;
+      }
+      s.dots.push_back(dot);
     }
   }
   if (auto it = j.find("tracks"); it != j.end() && it->is_array()) {

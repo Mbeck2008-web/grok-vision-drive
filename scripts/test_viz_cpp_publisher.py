@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """C++ viz publisher (python/viz/cpp_publisher.py, docs/specs/viz_cpp.md).
 
-* schema v1: only the pinned top-level keys, JSON, one datagram;
+* schema v2: only the pinned top-level keys, JSON, one datagram;
 * perception only: the builder reads a fixed whitelist of state keys, and
   GT keys (path_world, debug_gt, *_gt, gt_*) never change the message;
 * paint: yellow only when the record carries yellow paint, else white;
@@ -28,7 +28,7 @@ if str(ROOT) not in sys.path:
 
 from python.viz import cpp_publisher as cp  # noqa: E402
 
-READ_TOP = {"engaged", "ego", "planner", "path_ego", "path_conf", "lanes_ext", "road_edges", "tracks", "signs"}
+READ_TOP = {"engaged", "ego", "planner", "path_ego", "path_conf", "lanes_ext", "road_edges", "tracks", "signs", "dots", "occ_out"}
 GT_KEYS = {
     "path_world": [{"x": 100.0, "y": 200.0}, {"x": 101.0, "y": 240.0}],
     "debug_gt": True,
@@ -90,12 +90,65 @@ def rich_state(n_tracks: int = 6, n_pts: int = 40) -> dict:
     }
 
 
+
+def check_dots() -> None:
+    # explicit dots are forwarded 1:1; a missing vertex is not invented
+    st = {
+        "engaged": False,
+        "ego": {"speed_mps": 1.0},
+        "dots": [
+            {"id": 1, "x": 0.0, "y": 10.0, "cls": "white", "prob": 0.8, "observed": True},
+            {"id": 2, "x": 1.0, "y": 10.0, "cls": "curb", "prob": 0.4, "observed": False},
+        ],
+        "lanes_ext": [{"points": [{"x": 9.0, "y": 0.0}, {"x": 9.0, "y": 40.0}], "paint": "yellow"}],
+    }
+    msg = cp.build_scene_message(st, seq=1, t=0.0)
+    assert len(msg["dots"]) == 2, msg["dots"]
+    assert msg["dots"][0]["id"] == 1 and msg["dots"][0]["prob"] == 0.8
+    assert msg["dots"][1]["cls"] == "curb" and msg["dots"][1]["observed"] is False
+    # polyline vertices become dots when no dots/occ_out given, no mid-segment samples
+    st2 = {"lanes_ext": [{"points": [{"x": -1.8, "y": 0.0}, {"x": -1.8, "y": 10.0}], "paint": "white"}]}
+    d2 = cp.build_scene_message(st2, seq=1, t=0.0)["dots"]
+    assert len(d2) == 2 and all(abs(d["x"] + 1.8) < 1e-6 for d in d2), d2
+    assert {round(d["y"], 1) for d in d2} == {0.0, 10.0}
+    # occ_out v2: edges[] are red, lanes[] carry paint. Cells are not paint.
+    from python.viz.occ_out_v2_contract import make_occ_out_v2
+    st3 = {"occ_out": make_occ_out_v2(
+        cells={"ijk": [[64, 40, 4], [70, 40, 4]], "cls": [1, 2], "prob": [0.9, 0.8], "observed": [True, False]},
+        edges=[{"side": "left", "kind": "curb", "pts": [[-7.0, 0.0], [-7.0, 10.0]],
+                "conf": [0.9, 0.8], "observed": [True, False]},
+               {"side": "right", "kind": "road_edge", "pts": [[7.0, 0.0], [7.0, 10.0]],
+                "conf": [0.7, 0.6], "observed": [True, True]}],
+        lanes=[{"paint": "yellow", "pts": [[-1.8, 0.0], [-1.8, 4.0]],
+                "conf": [0.6, 0.5], "observed": [True, False]}],
+    )}
+    d3 = cp.build_scene_message(st3, seq=1, t=0.0)["dots"]
+    cls = {(round(d["x"], 1), d["cls"], d["observed"]) for d in d3}
+    assert (-7.0, "curb", True) in cls and (-7.0, "curb", False) in cls, d3
+    assert (7.0, "edge", True) in cls
+    assert (-1.8, "yellow", True) in cls and any(d["x"] == -1.8 and d["y"] == 4.0 and d["observed"] is False for d in d3)
+    # occupancy cells (cls 1=drivable, 2=vehicle) must not become beads
+    assert not any(d["cls"] in {"white", "yellow"} and abs(d["x"] - 0.0) < 1e-6 for d in d3)
+    # invented schema / wrong version yields no dots
+    assert cp.build_scene_message({"occ_out": {"v": 99, "type": "occ_out", "edges": []}}, seq=1, t=0.0)["dots"] == []
+    assert cp.build_scene_message({"occ_out": {"v": 1, "type": "occ_out"}}, seq=1, t=0.0)["dots"] == []
+    fake = {"occ": {"xyz": [[0.0, 5.0], [2.0, 5.0]], "cls": [5, 2], "prob": [0.9, 0.7], "observed": [True, False]}}
+    assert cp.build_scene_message({"occ_out": fake}, seq=1, t=0.0)["dots"] == []
+    # over-cap: drop lowest-prob / farthest, never interpolate
+    many = [{"id": i, "x": float(i), "y": 80.0, "cls": "white", "prob": 0.1 if i else 1.0, "observed": True}
+            for i in range(cp.MAX_DOTS + 50)]
+    d4 = cp.build_scene_message({"dots": many}, seq=1, t=0.0)["dots"]
+    assert len(d4) == cp.MAX_DOTS
+    assert any(d.get("id") == 0 and d["prob"] == 1.0 for d in d4)
+    print(f"dots: explicit {len(msg['dots'])}, vertices {len(d2)}, occ_out {len(d3)}, cap {len(d4)} OK")
+
+
 def check_schema() -> None:
     msg = cp.build_scene_message(rich_state(), seq=7, t=1.5)
     assert set(msg) <= cp.MESSAGE_KEYS, set(msg) - cp.MESSAGE_KEYS
     for key in ("v", "type", "seq", "t", "ego", "lanes", "edges", "tracks", "signs", "path"):
         assert key in msg, key
-    assert msg["v"] == cp.SCHEMA_VERSION == 1 and msg["type"] == "gvd_scene" and msg["seq"] == 7
+    assert msg["v"] == cp.SCHEMA_VERSION == 2 and msg["type"] == "gvd_scene" and msg["seq"] == 7
     assert msg["lead_id"] == 1 and msg["ego"]["set_mps"] == 15.0 and msg["ego"]["engaged"] is True
     assert len(msg["lanes"]) == 4 and len(msg["tracks"]) == 6 and len(msg["signs"]) == 1
     assert msg["edges"][0]["kind"] == "predicted"
@@ -105,7 +158,7 @@ def check_schema() -> None:
     data = cp.encode_message(msg)
     assert data is not None and len(data) <= cp.MAX_DATAGRAM
     assert json.loads(data) == json.loads(json.dumps(msg))
-    print(f"schema v1: keys {sorted(msg)} , {len(data)} bytes OK")
+    print(f"schema v2: keys {sorted(msg)} , {len(data)} bytes OK")
 
 
 def check_perception_only() -> None:
@@ -459,8 +512,148 @@ def check_sendto_oserror() -> None:
     print("sendto OSError: counted as drop, no raise OK")
 
 
+
+def check_occ_out_contract_freeze() -> None:
+    """Frozen field set matches b939818, and the live module when available."""
+    import ast
+    import os
+    from python.viz.occ_out_v2_contract import (
+        CAM_IDS, CELL_KEYS, EDGE_KEYS, EGO_KEYS, GRID_KEYS, LANE_KEYS, LANE_PAINTS,
+        OCC_CLASS_NAMES, OCC_OUT_CONTRACT_SHA, OCC_OUT_VERSION, TOP_KEYS,
+        frozen_field_set, make_occ_out_v2,
+    )
+    frozen = frozen_field_set()
+    assert OCC_OUT_VERSION == 2 and OCC_OUT_CONTRACT_SHA == "b939818"
+    assert frozen["CELL_KEYS"] == ("ijk", "cls", "prob", "observed")
+    assert frozen["EDGE_KEYS"] == ("side", "kind", "pts", "conf", "observed")
+    assert frozen["LANE_KEYS"] == ("paint", "pts", "conf", "observed")
+    assert frozen["OCC_CLASS_NAMES"] == ("other", "drivable", "vehicle")
+    assert frozen["LANE_PAINTS"] == ("white", "yellow")
+    assert frozen["GRID_KEYS"] == ("voxel_m", "origin", "shape")
+    assert "observed" in CELL_KEYS and "paint" in LANE_KEYS and "v" in TOP_KEYS and "narrow" in CAM_IDS
+    msg = make_occ_out_v2(
+        edges=[{"side": "left", "kind": "curb", "pts": [[-7.0, 0.0], [-7.0, 4.0]],
+                "conf": [1.0, 1.0], "observed": [True, True]}],
+    )
+    assert set(msg) == set(TOP_KEYS) and msg["v"] == 2 and set(msg["grid"]) == set(GRID_KEYS)
+    assert set(msg["ego"]) == set(EGO_KEYS)
+    # Optional: compare against the real contract file (read-only). Do not import
+    # it — it pulls occ_geometry / numpy and lives in another worktree.
+    candidates = []
+    env = os.environ.get("GVD_OCC_OUT_CONTRACT")
+    if env:
+        candidates.append(Path(env))
+    candidates.append(Path("/workspace/swarm/swarm-2/grok-vision-drive/python/perception/occ_out.py"))
+    compared = False
+    for path in candidates:
+        if not path.is_file():
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        ns: dict = {}
+        want = set(frozen)
+        keep = want | {n + "_V1" for n in want} | {"CELL_KEYS_V1", "EDGE_KEYS_V1", "LANE_KEYS_V1"}
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                name = node.targets[0].id
+                if name not in keep and not name.endswith("_KEYS") and name not in want:
+                    if name not in ("OCC_CLASS_NAMES", "LANE_PAINTS", "EDGE_KINDS", "CAM_IDS"):
+                        continue
+                try:
+                    ns[name] = eval(compile(ast.Expression(node.value), str(path), "eval"), {"__builtins__": {}}, ns)
+                except Exception:
+                    continue
+        got = {k: tuple(ns[k]) for k in want if k in ns}
+        assert got == frozen, (path, {k: (got.get(k), frozen[k]) for k in sorted(want) if got.get(k) != frozen[k]})
+        compared = True
+        print(f"occ_out v2 freeze matches {path} OK")
+        break
+    if not compared:
+        print("occ_out v2 freeze: live module not present, constants self-checked OK")
+
+
+def check_occ_out_adapter_strict() -> None:
+    from python.viz.occ_out_v2_contract import make_occ_out_v2
+    # string "false" is not a bool — that point is dropped
+    msg = make_occ_out_v2(edges=[{
+        "side": "left", "kind": "curb",
+        "pts": [[0.0, 1.0], [0.0, 2.0], [0.0, 3.0]],
+        "conf": [0.9, 0.8, 0.7],
+        "observed": [True, "false", False],
+    }])
+    dots = cp.collect_dots({"occ_out": msg})
+    assert len(dots) == 2 and all(isinstance(d["observed"], bool) for d in dots), dots
+    assert {round(d["y"], 1) for d in dots} == {1.0, 3.0}
+    # missing conf / observed drops the point, not full brightness
+    msg2 = make_occ_out_v2(lanes=[{
+        "paint": "white", "pts": [[1.0, 0.0], [1.0, 2.0], [1.0, 4.0]],
+        "conf": [0.5],  # only first point
+        "observed": [True, True, True],
+    }])
+    d2 = cp.collect_dots({"occ_out": msg2})
+    assert len(d2) == 1 and d2[0]["y"] == 0.0 and d2[0]["prob"] == 0.5, d2
+    # numpy-safe: arrays for pts/conf/observed, and bool_ scalars
+    np = None
+    try:
+        import numpy as np
+    except ImportError:
+        print("occ_out adapter: numpy not installed, array path skipped")
+        return
+    msg3 = make_occ_out_v2(edges=[{
+        "side": "right", "kind": "road_edge",
+        "pts": np.asarray([[3.0, 0.0], [3.0, 5.0]], dtype=float),
+        "conf": np.asarray([0.4, 0.3], dtype=float),
+        "observed": np.asarray([True, False]),
+    }])
+    d3 = cp.collect_dots({"occ_out": msg3})
+    assert len(d3) == 2 and d3[0]["cls"] == "edge" and d3[1]["observed"] is False, d3
+    # a numpy bool must not take the bool("false") path
+    assert cp._as_bool(np.bool_(False)) is False and cp._as_bool("false") is None
+    print(f"occ_out adapter strict: dropped-invalid {len(dots)} / {len(d2)}, numpy {len(d3)} OK")
+
+
+def check_prob_clamp_and_drop() -> None:
+    # Out-of-range numeric probs are clamped (mutant: drop the clamp line).
+    hi = cp.build_scene_message({"dots": [{"x": 0.0, "y": 1.0, "cls": "white", "prob": 1.5, "observed": True}]}, seq=1, t=0)["dots"]
+    lo = cp.build_scene_message({"dots": [{"x": 0.0, "y": 1.0, "cls": "white", "prob": -0.2, "observed": True}]}, seq=1, t=0)["dots"]
+    assert len(hi) == 1 and hi[0]["prob"] == 1.0, hi
+    assert len(lo) == 1 and lo[0]["prob"] == 0.0, lo
+    # Missing or invalid prob / observed is dropped, not drawn at 1.0 / True.
+    missing_p = cp.build_scene_message({"dots": [{"x": 0.0, "y": 1.0, "cls": "white", "observed": True}]}, seq=1, t=0)["dots"]
+    missing_o = cp.build_scene_message({"dots": [{"x": 0.0, "y": 1.0, "cls": "white", "prob": 0.5}]}, seq=1, t=0)["dots"]
+    bad_p = cp.build_scene_message({"dots": [{"x": 0.0, "y": 1.0, "cls": "white", "prob": "high", "observed": True}]}, seq=1, t=0)["dots"]
+    bad_o = cp.build_scene_message({"dots": [{"x": 0.0, "y": 1.0, "cls": "white", "prob": 0.5, "observed": "false"}]}, seq=1, t=0)["dots"]
+    assert missing_p == [] and missing_o == [] and bad_p == [] and bad_o == []
+    print("prob clamp + drop missing/invalid OK")
+
+
+def check_pose_not_invented() -> None:
+    # Partial pose must not invent the rest; dots stay in ego frame.
+    msg = cp.build_scene_message({
+        "ego": {"speed_mps": 5.0, "yaw": 0.3},
+        "dots": [{"x": 1.0, "y": 2.0, "cls": "white", "prob": 1.0, "observed": True}],
+    }, seq=1, t=0)
+    assert "x" not in msg["ego"] and "y" not in msg["ego"] and "yaw" not in msg["ego"], msg["ego"]
+    assert msg["dots"][0]["x"] == 1.0 and msg["dots"][0]["y"] == 2.0
+    # Complete pose converts ego-frame dots onto the wire in world frame.
+    # yaw=π/2 (facing +Y): ego (0, 28) + pose (0, 8) -> world (0, 36).
+    posed = cp.build_scene_message({
+        "ego": {"speed_mps": 5.0, "x": 0.0, "y": 8.0, "yaw": 1.5707963},
+        "dots": [{"x": 0.0, "y": 28.0, "cls": "white", "prob": 1.0, "observed": True}],
+        "tracks": [{"id": 1, "cls": "vehicle", "x": 0.0, "y": 14.0, "l": 4.5, "w": 1.85, "h": 1.5}],
+    }, seq=1, t=0)
+    assert posed["ego"]["x"] == 0.0 and posed["ego"]["y"] == 8.0
+    assert abs(posed["dots"][0]["x"] - 0.0) < 1e-6 and abs(posed["dots"][0]["y"] - 36.0) < 1e-6, posed["dots"]
+    # tracks stay in ego frame on the wire
+    assert posed["tracks"][0]["x"] == 0.0 and posed["tracks"][0]["y"] == 14.0
+    print("pose: no invention, dots world-converted, tracks ego OK")
+
 def main() -> None:
     sys.path.insert(0, str(ROOT / "scripts"))
+    check_dots()
+    check_occ_out_contract_freeze()
+    check_occ_out_adapter_strict()
+    check_prob_clamp_and_drop()
+    check_pose_not_invented()
     check_schema()
     check_perception_only()
     check_paint()

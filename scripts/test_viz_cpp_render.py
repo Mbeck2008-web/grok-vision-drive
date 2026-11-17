@@ -5,7 +5,7 @@
   its ctest pixel tests (white/yellow paint, no purple, red only edges, lead
   green, GT keys ignored, schema version enforced);
 * end to end: the Python publisher's scene file -> ``gvd_viz --offline`` PNG ->
-  pixels checked here, so the two sides of schema v1 agree.
+  pixels checked here, so the two sides of schema v2 agree.
 
 A host with no CMake or no C++ compiler skips visibly (skip_check). CI
 installs both, so CI always runs it. A build or test failure is a failure.
@@ -91,8 +91,8 @@ def check_end_to_end(exe: Path) -> None:
     state = {
         "engaged": True, "ego": {"speed_mps": 10.0}, "planner": {"cipv_id": 4},
         "lanes_ext": lanes,
-        "road_edges": [{"points": [{"x": 5.5, "y": -10.0}, {"x": 5.5, "y": 80.0}], "kind": "predicted"}],
-        "tracks": [{"id": 4, "class": "vehicle", "x": 0.0, "y": 15.0, "yaw": 1.5708}],
+        "road_edges": [{"points": [{"x": 5.5, "y": float(y)} for y in range(-10, 80, 1)], "kind": "predicted", "cls": "curb"}],
+        "tracks": [{"id": 4, "class": "vehicle", "x": 0.0, "y": 15.0, "yaw": 1.5708, "length": 4.5, "width": 1.85, "height": 1.5}],
         # GT that must not be drawn: a yellow line at x=0 and a world path.
         "gt_lanes": [{"points": [{"x": 0.0, "y": 0.0}, {"x": 0.0, "y": 60.0}], "paint": "yellow"}],
         "path_world": [{"x": 0.5, "y": 0.0}, {"x": 0.5, "y": 50.0}],

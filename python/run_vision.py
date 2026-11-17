@@ -376,6 +376,37 @@ def detector_runtime(detector: Any) -> str:
     return name
 
 
+def apply_viz_args(ui: Any, args: Any) -> Any:
+    """Copy the --viz-* flags onto the VizUI. Missing attrs keep the live defaults."""
+    ui.style = str(getattr(args, "viz_style", "early") or "early")
+    ui.overlay = bool(getattr(args, "viz_overlay", False))
+    ui.debug_board = bool(getattr(args, "viz_debug", False))
+    ui.showcase = bool(getattr(args, "viz_showcase", False))
+    ui.showcase_layout = str(getattr(args, "viz_showcase_layout", "full") or "full")
+    ui.showcase_preset = str(getattr(args, "viz_preset", "stage") or "stage")
+    return ui
+
+
+def viz_stage_size(ui: Any) -> tuple[int, int]:
+    """Stage canvas (w, h). Showcase uses its preset; everything else the stage size."""
+    if bool(getattr(ui, "showcase", False)):
+        from python.viz.showcase import preset_size
+
+        return preset_size(getattr(ui, "showcase_preset", "stage"))
+    return STAGE_W, STAGE_H
+
+
+_VIZ_FAILS = {"n": 0}
+
+
+def _viz_render_failed(exc: BaseException) -> None:
+    """Log a stage render failure: the first one, then every 100th."""
+    _VIZ_FAILS["n"] += 1
+    n = _VIZ_FAILS["n"]
+    if n == 1 or n % 100 == 0:
+        print(f"[GVD] viz render failed ({n}x): {type(exc).__name__}: {exc}", flush=True)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """CLI for ``python.run_vision``. Default ``--no-conf-gate`` is off."""
     ap = argparse.ArgumentParser(description="GVD supervisor + M2/M3/M4/M5")
@@ -831,12 +862,7 @@ def main(clock=None) -> None:
     perc = ModularPerception(allow_synthetic=args.allow_synthetic_detect, clock=clock)
     e2e_policy = make_e2e()
     ui = VizUI()
-    ui.style = str(getattr(args, "viz_style", "early") or "early")
-    ui.overlay = bool(getattr(args, "viz_overlay", False))
-    ui.debug_board = bool(getattr(args, "viz_debug", False))
-    ui.showcase = bool(getattr(args, "viz_showcase", False))
-    ui.showcase_layout = str(getattr(args, "viz_showcase_layout", "full") or "full")
-    ui.showcase_preset = str(getattr(args, "viz_preset", "stage") or "stage")
+    apply_viz_args(ui, args)
     ui.record_browser = _ask_strip_folder
     ui.debug.detector_id = str(args.detector or "auto")
     ui.debug.e2e_id = str(args.e2e_model or "auto")
@@ -2173,21 +2199,23 @@ def main(clock=None) -> None:
                 # Reuse this tick's bus check. A second bus_identity() would
                 # move the clock seam the retail tests count.
                 paint = st if ident.matched else load_paint_state()
-                stage_w, stage_h = STAGE_W, STAGE_H
-                if ui.showcase:
-                    from python.viz.showcase import preset_size
-
-                    stage_w, stage_h = preset_size(ui.showcase_preset)
-                stage_frame = render_stage(
-                    paint,
-                    ui=ui,
-                    main_frame=main,
-                    cam_frames=getattr(bundle, "frames", None),
-                    dets=getattr(pout, "dets", None),
-                    width=stage_w,
-                    height=stage_h,
-                )
-                st["viz_ms"] = float(paint.get("viz_ms") or 0.0)
+                stage_w, stage_h = viz_stage_size(ui)
+                # Viz only: a drawer bug must not stop the drive loop. The frame
+                # is skipped (no imshow) and the error is logged, rate-limited.
+                try:
+                    stage_frame = render_stage(
+                        paint,
+                        ui=ui,
+                        main_frame=main,
+                        cam_frames=getattr(bundle, "frames", None),
+                        dets=getattr(pout, "dets", None),
+                        width=stage_w,
+                        height=stage_h,
+                    )
+                    st["viz_ms"] = float(paint.get("viz_ms") or 0.0)
+                except Exception as exc:  # noqa: BLE001 - viz must not break the loop
+                    stage_frame = None
+                    _viz_render_failed(exc)
             age_window.add(frame_age_ms)
             tick_now = clock.perf() if clock is not None else time.perf_counter()
             print(

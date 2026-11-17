@@ -14,6 +14,13 @@ Desktop-IQU45 (GTX 1080 Ti; real VRAM at ~640 px fp16 inference and the AMP
 training peak; run with BeamNG idle or note what else holds the GPU):
 
     py -3 scripts/bench_occ_sparse.py --device cuda --long-side 640 --fp16 --iters 20 --warmup 3 --samples 16 --steps 20 --batch 4 --amp fp16 --workers 4
+    py -3 scripts/bench_occ_sparse.py --device cuda --sweep --iters 20 --warmup 3
+
+The sweep is inference only: net (default/cheap) x cameras (all8 / front3 =
+main+wide+narrow / min = main+wide) x input long side (640/480/320) x
+fp32/fp16, one ``SUMMARY`` line each with FPS next to VRAM. Pascal fp16 math is
+~1/64 of fp32: expect fp16 to save memory, not time. Michael's rule: drop the
+input resolution before giving up same-tick sync of the cameras.
 
 ``infer_cuda_max_allocated_mb`` is the fp16 inference peak (untrained net,
 so the coarse-to-fine caps are hit: the worst case), ``train_cuda_max_allocated_mb``
@@ -78,7 +85,12 @@ def run(a: argparse.Namespace) -> dict:
 
     from python.data.occ_shards import ShardWriter
     from python.perception.occ_geometry import rig_cams
-    from python.perception.occ_sparse import SparseOccNet, live_cams
+    from python.perception.occ_sparse import CAM_PRESETS, PROFILES, SparseOccNet, live_cams
+
+    if a.profile:
+        pr = PROFILES[a.profile]
+        a.net, a.long_side, a.cam_preset = pr["config"], pr["long_side"], pr["cams"]
+        a.fp16 = a.fp16 and pr["compute"] != "fp32"
     from python.train.occ_labels import build_occ_labels
     from python.train.occ_train import train
     from synthetic_occ import SEM_CLASSES, render
@@ -87,13 +99,16 @@ def run(a: argparse.Namespace) -> dict:
     dev = torch.device(a.device)
     cfg = yaml.safe_load((ROOT / "config" / "cameras.yaml").read_text(encoding="utf-8"))
     cams = live_cams(cfg, a.long_side)
+    if a.cam_preset:
+        cams = [c for c in cams if c.cam_id in set(CAM_PRESETS[a.cam_preset])]
     if a.cams:
         cams = [c for c in cams if c.cam_id in set(a.cams.split(","))]
     out: dict = {"started_at": time.strftime("%Y-%m-%d %H:%M:%S %z"), "loadavg": _loadavg(),
                  "host": platform.node(), "cpu": _cpu_name(), "device": str(dev),
                  "cuda_name": torch.cuda.get_device_name(dev) if dev.type == "cuda" else None,
-                 "torch": torch.__version__, "long_side": a.long_side, "cams": [c.cam_id for c in cams]}
-    net = SparseOccNet(cams).to(dev).eval()
+                 "torch": torch.__version__, "long_side": a.long_side, "cams": [c.cam_id for c in cams],
+                 "net_config": a.net, "cam_preset": a.cam_preset or None, "profile": a.profile or None}
+    net = SparseOccNet(cams, config=a.net).to(dev).eval()
     out["params"] = int(sum(p.numel() for p in net.parameters()))
     imgs = [torch.rand(1, 3, c.height, c.width, device=dev) for c in cams]
     pts = torch.rand(1, a.queries, 3, device=dev) * torch.tensor([51.2, 64.0, 6.4], device=dev) + torch.tensor([-25.6, -12.8, -2.0], device=dev)
@@ -115,10 +130,14 @@ def run(a: argparse.Namespace) -> dict:
     out["infer_fp16"] = bool(use_half)
     out["infer_ms_median"] = float(np.median(times))
     out["infer_ms_p90"] = float(np.percentile(times, 90))
+    out["infer_fps"] = 1000.0 / out["infer_ms_median"]
     out["infer_n_coarse"], out["infer_n_fine"] = int(last.n_coarse), int(last.n_fine)
     out["infer_queried_ratio"] = float(last.queried_ratio())
     if dev.type == "cuda":
         out["infer_cuda_max_allocated_mb"] = torch.cuda.max_memory_allocated(dev) / 2 ** 20
+    if a.infer_only:
+        out["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S %z")
+        return out
     # Short training run on synthetic shards.
     full = {c.cam_id: c for c in rig_cams(cfg)}
     with tempfile.TemporaryDirectory() as d:
@@ -144,7 +163,8 @@ def run(a: argparse.Namespace) -> dict:
         out["loose_png_bytes_per_sample_rgb_depth_sem"] = loose_bytes / a.samples
         if dev.type == "cuda":
             torch.cuda.reset_peak_memory_stats(dev)
-        res = train(sh, cams, steps=a.steps, batch_size=a.batch, device=a.device, amp=a.amp, workers=a.workers)
+        res = train(sh, cams, steps=a.steps, batch_size=a.batch, device=a.device, amp=a.amp, workers=a.workers,
+                    net=SparseOccNet(cams, config=a.net), cam_drop=0.3)
         h = res["history"][2:] or res["history"]
         out.update({
             "train_batch": a.batch, "train_amp": res["amp"], "train_steps": a.steps, "workers": a.workers,
@@ -168,6 +188,11 @@ def main(argv=None) -> int:
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--long-side", type=int, default=640)
     ap.add_argument("--cams", default="")
+    ap.add_argument("--cam-preset", default="", choices=("", "min", "front3", "all8"),
+                    help="min = main+wide, front3 = main+wide+narrow")
+    ap.add_argument("--net", default="default", choices=("default", "cheap"))
+    ap.add_argument("--profile", default="", choices=("", "1080ti", "1080ti_cheap", "1080ti_min"),
+                    help="sets --net, --long-side, --cam-preset; fp32 compute")
     ap.add_argument("--queries", type=int, default=8192)
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--warmup", type=int, default=1)
@@ -178,9 +203,43 @@ def main(argv=None) -> int:
     ap.add_argument("--amp", default="auto", choices=("auto", "fp16", "off"))
     ap.add_argument("--workers", type=int, default=0)
     ap.add_argument("--threads", type=int, default=max(1, min(8, os.cpu_count() or 1)))
+    ap.add_argument("--infer-only", action="store_true")
+    ap.add_argument("--sweep", action="store_true",
+                    help="inference only over net x cam preset x long side x fp16/fp32; one line each")
+    ap.add_argument("--sweep-long", default="640,480,320", help="input long sides for --sweep")
     a = ap.parse_args(argv)
-    print(json.dumps(run(a), indent=1))
+    if not a.sweep:
+        res = run(a)
+        print(json.dumps(res, indent=1))
+        print(summary(res))
+        return 0
+    rows = []
+    for net in ("default", "cheap"):
+        for preset in ("all8", "front3", "min"):
+            for long_side in [int(x) for x in a.sweep_long.split(",") if x]:
+                for fp16 in ((False, True) if a.device.startswith("cuda") else (False,)):
+                    b = argparse.Namespace(**vars(a))
+                    b.net, b.cam_preset, b.long_side, b.fp16, b.infer_only, b.cams = net, preset, long_side, fp16, True, ""
+                    b.profile = ""
+                    res = run(b)
+                    rows.append(res)
+                    print(summary(res), flush=True)
+    print(json.dumps(rows))
     return 0
+
+
+def summary(res: dict) -> str:
+    """One line: FPS and VRAM next to each other (Pascal: fp16 saves memory, not time)."""
+    vram = res.get("infer_cuda_max_allocated_mb")
+    tr = res.get("train_cuda_max_allocated_mb")
+    return (f"SUMMARY host={res['host']} device={res['device']} net={res.get('net_config')} cams={len(res['cams'])}"
+            f"({','.join(res['cams'])}) long={res['long_side']} fp16={res['infer_fp16']} "
+            f"infer_ms={res['infer_ms_median']:.1f} fps={res['infer_fps']:.2f} "
+            f"infer_vram_mb={'n/a (no CUDA)' if vram is None else f'{vram:.0f}'} "
+            f"queried/dense={res['infer_queried_ratio']:.3f}"
+            + ("" if "train_compute_ms_median" not in res else
+               f" train_vram_mb={'n/a (no CUDA)' if tr is None else f'{tr:.0f}'} train_amp={res['train_amp']}"
+               f" train_wait_ms={res['train_wait_ms_median']:.0f} train_compute_ms={res['train_compute_ms_median']:.0f}"))
 
 
 if __name__ == "__main__":

@@ -68,6 +68,11 @@ def frame_cells(i: int):
             xyz = np.concatenate([e, np.full((len(e), 1), z)], 1)
             ins = G.inside(xyz)
             keys.append(G.keys_of(xyz[ins])); cls.append(np.full(int(ins.sum()), c, np.uint8))
+    # a lead car pacing the ego 15 m ahead: fixed in the ego frame, it must not drag VO to zero motion
+    lead = np.array([[x, y] for x in np.arange(-0.8, 0.81, 0.2) for y in np.arange(15.0, 19.41, 0.2)])
+    for z in (0.2, 0.6, 1.0, 1.4):
+        xyz = np.concatenate([lead, np.full((len(lead), 1), z)], 1)
+        keys.append(G.keys_of(xyz)); cls.append(np.full(len(xyz), 2, np.uint8))
     k = np.concatenate(keys); c = np.concatenate(cls)
     k, idx = np.unique(k, return_index=True)
     return k, c[idx]
@@ -140,11 +145,11 @@ def check_world_fixed() -> None:
     vo_frac = [a for a, _ in drift]
     still_frac = [b for _, b in drift]
     assert min(vo_frac) > 0.9 and still_frac[-1] < 0.5, drift
-    cars = [r for r in reps[-1] if r["frames"] >= 5]
-    assert len(cars) == 1 and cars[0]["motion"] == "parked", reps[-1]
+    cars = sorted((r for r in reps[-1] if r["frames"] >= 5), key=lambda r: r["y"])
+    assert [r["motion"] for r in cars] == ["same_way", "parked"], reps[-1]
     print(f"world-fixed: VO pose after 9 frames within {math.hypot(px - tpx, py - tpy):.2f} m / {abs(h - th):.4f} rad, "
           f"static cells on their true world cell (+-1) every frame >= {min(vo_frac):.2f} (no warp: {still_frac[-1]:.2f} by frame 9), "
-          f"parked car stays parked OK")
+          f"parked car stays parked, pacing lead car same_way OK")
     print(f"world-fixed: camera-VO (flag off) pose drift per frame, m: {[round(e, 3) for e in pose_err]} "
           f"over {9 * FWD:.1f} m driven ({pose_err[-1] / (9 * FWD) * 100:.1f}%)")
 

@@ -125,7 +125,11 @@ def check_ages() -> None:
         reweighted = (net(imgs, pts, w_one)["occ"] - base["occ"]).abs().max().item()
     assert reweighted > 1e-4, "a partly stale cam must count less than a fresh one in the fused mean"
     assert moved > 1e-4, moved
+    calls: list[int] = []
+    hk = net.encoder.register_forward_hook(lambda _m, _i, _o: calls.append(1))
     pred = net.predict(imgs, cam_w=wm, max_points=4096)
+    hk.remove()
+    assert len(calls) == int((wm > 0).sum()) == 7, (len(calls), wm)  # the stale cam is not even encoded
     pred_pert = net.predict([im if k != k_stale else torch.zeros_like(im) for k, im in enumerate(imgs)], cam_w=wm, max_points=4096)
     assert np.array_equal(pred.keys, pred_pert.keys) and pred.n_queried == pred_pert.n_queried
     # training draws the same kind of weights: main+wide always 1, others dropped or aged

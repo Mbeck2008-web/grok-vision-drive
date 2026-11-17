@@ -319,3 +319,29 @@ def recording_to_shards(
                     "recovery": is_recovery(row), "label_cams": list(lab.cams)}
             w.write(f"{root.name.replace('.', '_')}_{int(row.get('i') or 0):08d}", imgs, lab.as_arrays(), meta)
     return w.paths
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """``python -m python.data.occ_shards <recording> <out_dir>``: offline shard build."""
+    import argparse
+
+    import yaml
+
+    ap = argparse.ArgumentParser(description="recording (loose frames + depth/sem) -> occupancy tar shards")
+    ap.add_argument("recording", type=Path)
+    ap.add_argument("out_dir", type=Path)
+    ap.add_argument("--cameras", type=Path, default=Path(__file__).resolve().parents[2] / "config" / "cameras.yaml")
+    ap.add_argument("--rgb-cams", default="", help="comma list; default all 8 rig cams")
+    ap.add_argument("--max-mb", type=int, default=SHARD_MAX_BYTES // 2 ** 20)
+    ap.add_argument("--limit", type=int, default=None)
+    a = ap.parse_args(argv)
+    cfg = yaml.safe_load(a.cameras.read_text(encoding="utf-8"))
+    rgb = [c for c in a.rgb_cams.split(",") if c] or None
+    paths = recording_to_shards(a.recording, a.out_dir, cfg, rgb_cams=rgb, max_bytes=a.max_mb * 2 ** 20, limit=a.limit)
+    n = sum(len(_scan_index(p)) for p in paths) if paths else 0
+    print(json.dumps({"shards": [str(p) for p in paths], "samples": n}))
+    return 0 if paths else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

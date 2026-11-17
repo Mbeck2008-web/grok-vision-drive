@@ -157,7 +157,12 @@ def check_recording(tmp: Path) -> None:
     assert sorted(s["images"]) == sorted(cams) and sorted(s["meta"]["label_cams"]) == sorted(cams)
     assert s["keys"].size > 50 and s["free"].shape[0] > 50
     ds.close()
-    print(f"recording -> shards: 4 ticks x 8 cams, {s['keys'].size} cells, recovery flag kept OK")
+    (tmp / "cams.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    assert occ_shards.main([str(rec), str(tmp / "rec8_cli"), "--cameras", str(tmp / "cams.yaml"), "--limit", "2"]) == 0
+    cli = OccShardDataset(tmp / "rec8_cli")
+    assert len(cli) == 2 and np.array_equal(cli[0]["keys"], s["keys"])
+    cli.close()
+    print(f"recording -> shards: 4 ticks x 8 cams, {s['keys'].size} cells, recovery flag kept, CLI same labels OK")
 
 
 def main() -> int:

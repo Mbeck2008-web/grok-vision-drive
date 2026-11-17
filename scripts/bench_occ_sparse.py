@@ -9,6 +9,15 @@ wait vs compute per step and peak RSS, and shard bytes per sample vs the
 loose-PNG layout. Synthetic scene frames only (``tests/synthetic_occ.py``).
 
     python scripts/bench_occ_sparse.py --device cuda --long-side 640 --batch 4
+
+Desktop-IQU45 (GTX 1080 Ti; real VRAM at ~640 px fp16 inference and the AMP
+training peak; run with BeamNG idle or note what else holds the GPU):
+
+    py -3 scripts/bench_occ_sparse.py --device cuda --long-side 640 --fp16 --iters 20 --warmup 3 --samples 16 --steps 20 --batch 4 --amp fp16 --workers 4
+
+``infer_cuda_max_allocated_mb`` is the fp16 inference peak (untrained net,
+so the coarse-to-fine caps are hit: the worst case), ``train_cuda_max_allocated_mb``
+the AMP training peak. Repeat with ``--amp off`` for the fp32 (Pascal default) peak.
 """
 from __future__ import annotations
 
@@ -35,6 +44,13 @@ def _cpu_name() -> str:
     except OSError:
         pass
     return platform.processor() or platform.machine()
+
+
+def _loadavg() -> list[float] | None:
+    try:
+        return [round(x, 2) for x in os.getloadavg()]
+    except (AttributeError, OSError):  # Windows
+        return None
 
 
 def activation_bytes(net, imgs, pts) -> int:
@@ -73,7 +89,8 @@ def run(a: argparse.Namespace) -> dict:
     cams = live_cams(cfg, a.long_side)
     if a.cams:
         cams = [c for c in cams if c.cam_id in set(a.cams.split(","))]
-    out: dict = {"host": platform.node(), "cpu": _cpu_name(), "device": str(dev),
+    out: dict = {"started_at": time.strftime("%Y-%m-%d %H:%M:%S %z"), "loadavg": _loadavg(),
+                 "host": platform.node(), "cpu": _cpu_name(), "device": str(dev),
                  "cuda_name": torch.cuda.get_device_name(dev) if dev.type == "cuda" else None,
                  "torch": torch.__version__, "long_side": a.long_side, "cams": [c.cam_id for c in cams]}
     net = SparseOccNet(cams).to(dev).eval()
@@ -138,6 +155,11 @@ def run(a: argparse.Namespace) -> dict:
         })
         if "cuda_max_allocated_mb" in res:
             out["train_cuda_max_allocated_mb"] = res["cuda_max_allocated_mb"]
+    out["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S %z")
+    out["loadavg_end"] = _loadavg()
+    if dev.type == "cuda":
+        free, total = torch.cuda.mem_get_info(dev)
+        out["cuda_mem_free_total_mb_end"] = [free / 2 ** 20, total / 2 ** 20]
     return out
 
 

@@ -312,7 +312,7 @@ The settled game view. Soft Esc parked.
 
 ## Training-only depth and semantic ground truth
 
-All eight cameras record it (`train_gt: true`) for later 360° occupancy labels; the smoke recording checks Hz and disk first, and `py -3 scripts/check_traffic_box.py <recording_dir>` must pass before the long run (see `docs/specs/labels_v4.md`). Driving and inference stay vision-only (colour cameras); nothing here feeds the planner or the live net.
+All eight cameras record it (`train_gt: true`) for later 360° occupancy labels; the smoke recording checks Hz and disk first, and `py -3 scripts/check_traffic_box.py <recording_dir>` must pass before the long run — that script decides whether the traffic box is live on the IQU45 smoke recording (see `docs/specs/labels_v4.md`). Driving and inference stay vision-only (colour cameras); nothing here feeds the planner or the live net.
 
 - **Per camera:** `train_gt: true` in `config/cameras.yaml` renders depth and annotation for that camera only. A camera without the key stays colour.
 - **Outputs** (one file per tick, beside the colour folder):

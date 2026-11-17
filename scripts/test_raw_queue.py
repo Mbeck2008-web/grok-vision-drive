@@ -213,6 +213,25 @@ def check_empty_submit_does_not_enqueue() -> None:
     print("empty submit does not enqueue")
 
 
+
+def check_queue_close_closes_writer() -> None:
+    """RawWriteQueue.close must close the writer, which closes the gt log."""
+    image = np.zeros((8, 8, 3), dtype=np.uint8)
+    image[0, 0] = (1, 2, 3)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        writer = RawFrameWriter(root, [{"id": "main"}])
+        queue = RawWriteQueue(writer, max_depth=4)
+        try:
+            assert queue.submit({"main": image}, **_payload(0)) is True
+            assert queue.wait_empty(2.0)
+        finally:
+            queue.close()
+        assert writer._state_log._fd is None
+        assert writer._gt_log._fd is None
+    print("queue close closes the writer")
+
+
 def main() -> None:
     check_tick_does_not_wait_for_disk()
     check_full_queue_drops_and_stays_fast()
@@ -220,6 +239,7 @@ def main() -> None:
     check_failed_write_is_not_counted_written()
     check_empty_submit_does_not_create_a_row()
     check_empty_submit_does_not_enqueue()
+    check_queue_close_closes_writer()
     print("raw queue ok")
 
 

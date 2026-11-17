@@ -152,18 +152,45 @@ def check_same_map_segment_respawns_not_reloads() -> None:
     assert "reason=level_load_failed" not in text, text[-3000:]
     assert "collect segment west_coast_usa#1" in text, text[-3000:]
     assert "same map" in text.lower() or "respawn without reload" in text, text[-3000:]
+    # The #1 boundary must actually call _apply_spawn(True), not only log the segment.
+    spawn_lines = [ln for ln in text.splitlines() if ln.startswith("collect spawn west_coast_usa#")]
+    assert any(ln.startswith("collect spawn west_coast_usa#0") for ln in spawn_lines), text[-3000:]
+    assert any(ln.startswith("collect spawn west_coast_usa#1") for ln in spawn_lines), spawn_lines
+    poses = [ln.split(" (", 1)[-1].split(")", 1)[0] for ln in spawn_lines]
+    assert len(set(poses)) >= 2, (poses, spawn_lines)
     status = json.loads((out / "collect.json").read_text(encoding="utf-8"))
     assert status.get("stop_reason") != "level_load_failed", status
     assert code == 0, (code, text[-2000:])
-    print(f"same-map segment respawn ok: enter_map={calls['n']} reason={status.get('stop_reason')}")
+    print(f"same-map segment respawn ok: enter_map={calls['n']} spawns={len(spawn_lines)} reason={status.get('stop_reason')}")
 
 
-def check_level_load_retries_then_respawns() -> None:
-    """A failed reload of a new map is retried, then the run respawns instead of stopping."""
-    calls = {"n": 0}
+def check_level_load_retries_then_stops() -> None:
+    """A failed reload of a new map is retried, then the run stops.
+
+    ``enter_map`` drops the live cameras before ``begin_level``. A fallback
+    that restores those already-dropped cams (or remaps later chunks onto
+    the old map) must not keep the run going. After the retries the stop
+    is ``level_load_failed``, exit 2, recorded in collect.json.
+    """
+    calls = {"n": 0, "dropped": []}
+
+    class _DropCam(sf._Cam):
+        def __init__(self) -> None:
+            self.removed = False
+
+        def remove(self) -> None:
+            self.removed = True
+            calls["dropped"].append(self)
+
+        def poll(self):
+            if self.removed:
+                raise RuntimeError("dropped camera")
+            return super().poll()
 
     def enter(bng, level, cfg, cams):
-        del cfg, cams
+        del cfg
+        # Model the real enter_map: cameras are dropped before the load.
+        collect.drop_cameras(cams)
         calls["n"] += 1
         calls.setdefault("levels", []).append(level)
         from python.collect.level_session import OpenedLevel
@@ -172,7 +199,7 @@ def check_level_load_retries_then_respawns() -> None:
         if level == "italy":
             return OpenedLevel(vehicle=None, roads=[], spawn=None, cameras={}, error="TimeoutError: timed out")
         return OpenedLevel(vehicle=bng.vehicles.vehicle, roads=roads,
-                           spawn=(0.4, 12.0, 0.5), cameras={"main": sf._Cam()})
+                           spawn=(0.4, 12.0, 0.5), cameras={"main": _DropCam()})
 
     code, text, out = _with_west_deck(
         enter,
@@ -185,11 +212,11 @@ def check_level_load_retries_then_respawns() -> None:
     italy_tries = calls.get("levels", []).count("italy")
     assert italy_tries >= collect.LEVEL_LOAD_ATTEMPTS, (calls, text[-3000:])
     assert "collect level load retry" in text, text[-3000:]
-    assert "reason=level_load_failed" not in text, text[-3000:]
-    status = json.loads((out / "collect.json").read_text(encoding="utf-8"))
-    assert status.get("stop_reason") != "level_load_failed", status
-    assert code == 0, (code, text[-2000:])
-    print(f"level load retry/respawn ok: italy_tries={italy_tries} reason={status.get('stop_reason')}")
+    assert "respawn on" not in text, text[-3000:]
+    assert calls["dropped"], "italy enter_map must drop the west-coast cameras"
+    assert all(cam.removed for cam in calls["dropped"])
+    _check_stop(code, text, out, "level_load_failed", 2)
+    print(f"level load retry/stop ok: italy_tries={italy_tries} dropped={len(calls['dropped'])}")
 
 
 def check_level_load_failed() -> None:
@@ -510,6 +537,70 @@ def check_vehicle_width() -> None:
     print("vehicle_width: unknown model without bbox stops with code 2; --no-excursions runs")
 
 
+
+def check_writer_failed_stops_collector() -> None:
+    """A writer error stops the run with writer_failed, exit 2, and no further submits."""
+    import python.data.raw_queue as raw_queue
+
+    boxes: list = []
+    base = raw_queue.RawWriteQueue
+
+    class _FailAfterFirst(base):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.submit_n = 0
+            boxes.append(self)
+
+        def submit(self, frames, **kwargs):
+            self.submit_n += 1
+            ok = super().submit(frames, **kwargs)
+            if self.submit_n >= 1 and dict(frames or {}):
+                self.error = "OSError: disk full"
+            return ok
+
+    raw_queue.RawWriteQueue = _FailAfterFirst
+    try:
+        code, text, out = sf._run_collector(
+            {"speed_at": lambda n: 10.0, "stop_at": 99999},
+            ["--no-excursions", "--smoke-s", "0"],
+        )
+    finally:
+        raw_queue.RawWriteQueue = base
+    _check_stop(code, text, out, "writer_failed", 2)
+    assert boxes and boxes[0].submit_n == 1, (boxes[0].submit_n if boxes else None, text[-2000:])
+    assert "collect stop writer_failed" in text, text[-2000:]
+    print(f"writer_failed collector stop ok: submits={boxes[0].submit_n}")
+
+
+def check_empty_traffic_slots_still_queued_from_collector() -> None:
+    """The collector call site must send delete Lua even when traffic_slots is empty."""
+    import python.collect.spawn_mix as spawn_mix
+
+    calls: list[tuple] = []
+    real = spawn_mix.queue_companion_traffic
+
+    def wrapped(ge, pick, count, slots):
+        calls.append((int(count or 0), list(slots or [])))
+        return real(ge, pick, count, slots)
+
+    spawn_mix.queue_companion_traffic = wrapped
+    try:
+        code, text, out = _with_west_deck(
+            _stub_enter({"n": 0}, fail_from=99),
+            lambda: sf._run_collector(
+                {"speed_at": lambda n: 10.0, "stop_at": 200},
+                ["--maps", "west_coast_usa", "--no-vary-env", "--no-excursions",
+                 "--traffic", "0", "--segment-min", "1", "--minutes", "1"],
+            ),
+        )
+    finally:
+        spawn_mix.queue_companion_traffic = real
+    assert code == 0, (code, text[-2000:])
+    empty = [c for c in calls if c[1] == []]
+    assert empty and empty[0][0] == 0, (calls, text[-2000:])
+    print(f"collector queue_companion_traffic on empty slots ok: calls={len(calls)}")
+
+
 def main() -> None:
     check_heartbeat_interval()
     check_requested_and_target()
@@ -517,8 +608,10 @@ def main() -> None:
     check_schedule_wrap()
     check_needs_level_reload()
     check_same_map_segment_respawns_not_reloads()
-    check_level_load_retries_then_respawns()
+    check_level_load_retries_then_stops()
     check_level_load_failed()
+    check_writer_failed_stops_collector()
+    check_empty_traffic_slots_still_queued_from_collector()
     check_camera_outage()
     check_disk_low()
     check_smoke_failed()

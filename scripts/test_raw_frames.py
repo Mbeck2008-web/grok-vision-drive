@@ -341,6 +341,24 @@ def check_empty_encoded_tick_does_not_add_a_row() -> None:
     print("empty encoded tick adds no hollow row")
 
 
+
+def check_writer_close_closes_gt_log() -> None:
+    """RawFrameWriter.close must close the gt jsonl handle, not only state."""
+    image = np.zeros((8, 8, 3), dtype=np.uint8)
+    image[0, 0] = (1, 2, 3)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        writer = RawFrameWriter(root, [{"id": "main"}])
+        from python.debug.lane_targets import tech_from_hit
+        assert writer.write({"main": image}, t=1.0, tech=tech_from_hit(0.1, 0.0, 3.5, False)) is not None
+        assert writer._gt_log._fd is not None
+        assert writer._state_log._fd is not None
+        writer.close()
+        assert writer._state_log._fd is None
+        assert writer._gt_log._fd is None
+    print("writer close closes the gt log")
+
+
 def main() -> None:
     check_disk_ceiling()
     check_rates_and_controls()
@@ -349,6 +367,7 @@ def main() -> None:
     check_raw_count_is_one_camera()
     check_state_jsonl_stays_open_across_rows()
     check_empty_encoded_tick_does_not_add_a_row()
+    check_writer_close_closes_gt_log()
     print("raw frames ok")
 
 

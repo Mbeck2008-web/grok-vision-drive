@@ -804,7 +804,11 @@ def _run_supervisor(
         # Hold SIGKILL until write_state has seen the echo. Killing mid-tick left
         # cmd_applied=False / cmd_json_pending for check_run_vision_e2e.
         # Override runs must not stop on cmd_applied: that flips true before the dwell.
-        grace = 1.5 if expect_disengage and latched is None else (0.5 if ack and expect_disengage is None else 0.0)
+        # 0.5 s was not enough on a loaded CI runner: SIGKILL mid-tick left
+        # cmd_applied=False for check_run_vision_e2e under veto:low_lane_conf
+        # (the early-exit used to require cmd_reason == cmd_json_applied, which
+        # a veto stop never is).
+        grace = 1.5 if expect_disengage and latched is None else (1.5 if ack and expect_disengage is None else 0.0)
         until = time.monotonic() + grace
         while time.monotonic() < until:
             if proc.poll() is not None:
@@ -817,7 +821,7 @@ def _run_supervisor(
             if expect_disengage is None and ack:
                 try:
                     st = read_state() or {}
-                    if st.get("cmd_applied") is True and st.get("cmd_reason") == "cmd_json_applied":
+                    if st.get("cmd_applied") is True:
                         break
                 except Exception:
                     pass

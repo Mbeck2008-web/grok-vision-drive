@@ -266,6 +266,52 @@ def check_capped_hot_below_ground() -> None:
         assert n_struct > 0, (p_bg, n_struct, dict(zip(*np.unique(lab[idx], return_counts=True))))
         print(f"capped_hot below-ground p={p_bg}: structure kept {n_struct} / cap 2048 OK")
 
+    # Ground coverage 0.8 / 0.95 plus one full below-ground layer must not
+    # flip the ground band to the more populous below layer (count-based
+    # picker). Structure must keep its slots.
+    for gfrac in (0.80, 0.95):
+        for p_bg in (0.6, 0.9):
+            gm = rng.random(X.size) < gfrac
+            parts = [(layer(gz, gm), 0.95, "ground"),
+                     (layer(G.z_min + cm * 0.5), p_bg, "below")]
+            parts += [(layer(gz + cm * k, bld), 0.7, "struct") for k in (1, 2, 3, 4)]
+            hot = np.concatenate([p[0] for p in parts])
+            ph = np.concatenate([np.full(len(p[0]), p[1]) + rng.normal(0, 0.01, len(p[0])) for p in parts])
+            lab = np.concatenate([[p[2]] * len(p[0]) for p in parts])
+            idx = _capped_hot(hot, ph, 2048, G.z_min, cm)
+            n_struct = int((lab[idx] == "struct").sum())
+            kept = dict(zip(*np.unique(lab[idx], return_counts=True)))
+            assert n_struct > 0, (gfrac, p_bg, n_struct, kept)
+            print(f"capped_hot ground {gfrac:.2f} + 1 below p={p_bg}: structure kept {n_struct} {kept} OK")
+
+    # A ground surface that spans two fine layers (a slope / quantization
+    # split around z=0) must also leave structure its slots.
+    cmf = G.voxel_m  # fine stage, 0.4 m
+    xs_f = G.x_min + cmf * (np.arange(64) + 0.5)
+    ys_f = G.y_min + cmf * (np.arange(80) + 0.5)
+    Xf, Yf = np.meshgrid(xs_f, ys_f, indexing="ij")
+    Xf, Yf = Xf.ravel(), Yf.ravel()
+    bld_f = ((np.abs(Xf) > 8) & (np.abs(Xf) < 14) & (Yf > 0) & (Yf < 45)) | ((Xf > -4) & (Xf < 4) & (Yf > 35) & (Yf < 40))
+
+    def layer_f(z, mask=None, X=Xf, Y=Yf):
+        m = np.ones_like(X, bool) if mask is None else mask
+        return np.stack([X[m], Y[m], np.full(int(m.sum()), z)], 1)
+
+    # Split the ground xy between z=-0.2 and z=+0.2 (two layers nearest z=0).
+    slope = Xf >= 0
+    parts = [(layer_f(-0.2, ~slope), 0.95, "ground"),
+             (layer_f(0.2, slope), 0.95, "ground"),
+             (layer_f(G.z_min + cmf * 0.5), 0.9, "below")]
+    parts += [(layer_f(1.0 + cmf * k, bld_f), 0.7, "struct") for k in (0, 1, 2, 3)]
+    hot = np.concatenate([p[0] for p in parts])
+    ph = np.concatenate([np.full(len(p[0]), p[1]) + rng.normal(0, 0.01, len(p[0])) for p in parts])
+    lab = np.concatenate([[p[2]] * len(p[0]) for p in parts])
+    idx = _capped_hot(hot, ph, 2048, G.z_min, cmf)
+    n_struct = int((lab[idx] == "struct").sum())
+    kept = dict(zip(*np.unique(lab[idx], return_counts=True)))
+    assert n_struct > 0, (n_struct, kept)
+    print(f"capped_hot 2-layer sloped ground: structure kept {n_struct} {kept} OK")
+
 
 def check_class_balance() -> None:
     """_class_balance splits evenly across classes; a 99:1 pool must not stay 99:1."""

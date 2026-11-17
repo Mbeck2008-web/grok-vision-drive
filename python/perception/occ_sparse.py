@@ -392,8 +392,11 @@ if nn is not None:
 def _capped_hot(hot: np.ndarray, p_hot: np.ndarray, cap: int, z_min: float, cell_m: float) -> np.ndarray:
     """Indices of the ``cap`` hot cells to refine.
 
-    The ground band is the most populous z-layer (ties broken toward z closest
-    to 0, not the lowest layer). At most half the cap goes to that band.
+    The ground band is every z-layer whose cell centre is at most half a
+    cell from z=0 (geometry, not count). That is the road surface, including
+    a two-layer slope / quantization split around z=0. A thinner or holed
+    ground layer therefore stays the ground band even when a below-ground
+    fill has more cells. At most half the cap goes to that band.
     Above-ground structure is filled next, then below-ground leftovers, so a
     hot below-ground fill cannot starve posts / buildings that VO and
     occluders need. Unused budget returns to the ground, then to structure.
@@ -405,16 +408,13 @@ def _capped_hot(hot: np.ndarray, p_hot: np.ndarray, cap: int, z_min: float, cell
     if hot.size == 0 or cap <= 0:
         return np.zeros((0,), np.int64)
     lvl = np.floor((hot[:, 2] - z_min) / cell_m + 1e-6).astype(np.int64)
-    # most populous layer; ties -> z closest to 0 (a full below-ground layer
-    # must not beat a same-size ground layer)
-    shifted = lvl - int(lvl.min())
-    counts = np.bincount(shifted)
-    winners = np.flatnonzero(counts == counts.max())
-    z_of = (winners + int(lvl.min()) + 0.5) * float(cell_m) + float(z_min)
-    ground_lvl = int(winners[np.argmin(np.abs(z_of))] + int(lvl.min()))
-    band = lvl == ground_lvl
-    below = lvl < ground_lvl
-    above = lvl > ground_lvl
+    # Geometric ground: layers whose centre is within half a cell of z=0.
+    # Count does not pick the band; a full below-ground slab cannot win it.
+    z_center = (lvl + 0.5) * float(cell_m) + float(z_min)
+    half = 0.5 * float(cell_m) + 1e-6
+    band = np.abs(z_center) <= half
+    below = z_center < -half
+    above = z_center > half
 
     def _spread(idxs: np.ndarray, budget: int) -> np.ndarray:
         if budget <= 0 or idxs.size == 0:

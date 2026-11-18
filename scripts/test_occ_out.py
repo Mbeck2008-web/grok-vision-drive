@@ -40,7 +40,7 @@ import numpy as np  # noqa: E402
 import yaml  # noqa: E402
 
 from python.perception import occ_out as oo  # noqa: E402
-from python.perception.occ_ego import add_ego_args  # noqa: E402
+from python.perception.occ_ego import EgoMotion, add_ego_args  # noqa: E402
 from python.perception.occ_geometry import DEFAULT_GRID, OccGrid, rig_cams  # noqa: E402
 from python.perception.occ_sparse import OccPrediction  # noqa: E402
 
@@ -224,7 +224,9 @@ def check_vo_runtime_obs() -> None:
 
     O1 (obs=None): a dense ego-fixed sheet that observed_mask hides must not
     vote; VO still tracks 1.5 m of real motion. O3 (obs from stale cameras
-    too): ego-fixed clutter only a stale rear camera can see must not vote.
+    too): after the live-camera score denom, rear-only clutter no longer
+    poisons the overlap, so this also asserts the mask passed into
+    ego.update does not mark those cells observed.
     """
     g = DEFAULT_GRID
     rng = np.random.default_rng(5)
@@ -259,19 +261,43 @@ def check_vo_runtime_obs() -> None:
     ages_front = {c: (0.0 if c in ("main", "wide", "narrow") else 1.0) for c in RATES}
     imgs = [NoImage() for _ in CAMS]
 
-    def track(clutter, ages, tag, true_fwd=1.5, dt=0.2):
-        net = StubNet([pred(0.0, clutter), pred(true_fwd, clutter)])
-        rt = oo.OccRuntime(net, from_vehicle=False, memory=False)
-        m0 = rt.step(imgs, 0.0, ages_s=ages)
-        m1 = rt.step(imgs, dt, ages_s=ages)
+    def track(clutter, ages, tag, true_fwd=1.5, dt=0.2, rear_unobs=False):
+        rec = []
+        orig = EgoMotion.update
+
+        def spy(self, keys, cls, t, vehicle=None, obs=None, cams=None, occl=None):
+            rec.append((None if obs is None else np.asarray(obs, bool).copy(),
+                        np.asarray(keys).copy(), float(t)))
+            return orig(self, keys, cls, t, vehicle, obs=obs, cams=cams, occl=occl)
+
+        EgoMotion.update = spy
+        try:
+            net = StubNet([pred(0.0, clutter), pred(true_fwd, clutter)])
+            rt = oo.OccRuntime(net, from_vehicle=False, memory=False)
+            rt.step(imgs, 0.0, ages_s=ages)
+            m1 = rt.step(imgs, dt, ages_s=ages)
+        finally:
+            EgoMotion.update = orig
         e = m1["ego"]
         err = abs(e["speed_mps"] * dt - true_fwd)
         assert e["source"] == "vo" and e["ok"], (tag, e)
         assert err <= 0.2, (tag, e, err)
+        assert rec and all(obs is not None for obs, _, _ in rec), (tag, "obs=None passed to ego.update")
+        if rear_unobs:
+            found = marked = 0
+            for obs, keys, _t in rec:
+                xyz = g.centers_of_keys(keys) if len(keys) else np.zeros((0, 3))
+                box = ((xyz[:, 0] >= -2.5) & (xyz[:, 0] <= 2.5) &
+                       (xyz[:, 1] >= -8.5) & (xyz[:, 1] <= -2.5) &
+                       (np.abs(xyz[:, 2] - 1.0) < 0.4))
+                found += int(box.sum())
+                marked += int((box & obs).sum())
+            assert found >= 10, (tag, "no rear clutter in keys passed to VO", found)
+            assert marked == 0, (tag, "stale-rear clutter marked observed in obs passed to VO", marked, found)
         print(f"runtime VO {tag}: fwd {e['speed_mps']*dt:.2f} m (true {true_fwd}) ok err {err:.3f} OK")
 
     track(sheet, ages_fresh, "dense unobserved sheet (O1)")
-    track(rear, ages_front, "stale-rear clutter only (O3)")
+    track(rear, ages_front, "stale-rear clutter only (O3)", rear_unobs=True)
 
 
 def check_heading() -> None:

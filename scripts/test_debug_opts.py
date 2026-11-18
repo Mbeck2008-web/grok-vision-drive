@@ -415,15 +415,27 @@ def main() -> None:
     assert viz_row_at(0)["id"] == "viz_dense"
     assert model_row_at(0)["id"] == "detector_id"
     from python.runtime.debug_opts import NERD_TAB_IDS
-    from python.viz.nerd import FS_TAB, _text_size
+    from python.viz.nerd import FS_TAB, _text_size, tab_layout
 
     assert NERD_TAB_IDS == ("live", "drive", "viz", "model", "cams", "auto", "keys")
-    tab_x = 12
-    for label in ("LIVE", "DRIVE", "VIZ", "MODEL", "CAMS", "AUTO", "KEYS"):
+    # Measure the real layout with the same Hershey font the drawer uses.
+    # A single-row sum of glyph widths is not portable: OpenCV getTextSize
+    # can differ by ~2 px/label across builds, and the drawer already wraps
+    # when a tab would pass the right edge. Every rect must stay inside the
+    # panel; do not widen a one-row tolerance.
+    layout = tab_layout(NERD_WIDTH)
+    assert [tid for tid, _lbl, _rect in layout] == list(NERD_TAB_IDS)
+    for tid, label, (x0, y0, x1, y1) in layout:
         tw = _text_size(label, FS_TAB)[0]
-        tab_x += tw + 26
-        assert tw + 18 < NERD_WIDTH - 16, label
-    assert tab_x <= NERD_WIDTH + 8, tab_x
+        assert tw + 18 < NERD_WIDTH - 16, (tid, tw)
+        assert 0 <= x0 < x1 <= NERD_WIDTH, (tid, x0, x1, NERD_WIDTH)
+        assert y1 - y0 == 36  # TAB_H
+        assert x1 - x0 == tw + 18
+    # A narrower panel must wrap rather than overflow.
+    narrow = tab_layout(max(120, NERD_WIDTH // 2))
+    assert [tid for tid, _lbl, _rect in narrow] == list(NERD_TAB_IDS)
+    assert max(rect[3] for _t, _l, rect in narrow) > max(rect[3] for _t, _l, rect in layout)
+    assert all(rect[2] <= NERD_WIDTH // 2 for _t, _l, rect in narrow)
     assert FS_BODY >= 0.65, "nerd body type must stay large enough to read on a second screen"
     assert NERD_WIDTH >= 520
     print("test_debug_opts: OK")

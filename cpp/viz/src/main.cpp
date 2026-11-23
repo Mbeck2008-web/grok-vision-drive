@@ -31,7 +31,7 @@ static bool parse3(const char* s, glm::vec3& v) {
 
 static int usage() {
   std::fprintf(stderr,
-               "usage: gvd_viz (--offline FILE [--png OUT] [--frame N] [--bench N] | --listen PORT)\n"
+               "usage: gvd_viz (--offline FILE [--png OUT] [--png-seq PREFIX] [--frame N] [--bench N] | --listen PORT)\n"
                "  [--size WxH] [--lens chase|low|high|top|side|dash] [--eye x,y,z --look x,y,z --fov DEG]\n"
                "  [--palette neon|parking|dusk] [--background IMG] [--no-ego] [--no-hud] [--msaa N] [--info]\n");
   return 2;
@@ -44,7 +44,7 @@ static double median(std::vector<double> v) {
 }
 
 int main(int argc, char** argv) {
-  std::string offline, png, listen_port, bg_path;
+  std::string offline, png, png_seq, listen_port, bg_path;
   int frame = 0, bench = 0;
   bool info = false;
   RenderOptions o;
@@ -54,6 +54,7 @@ int main(int argc, char** argv) {
     const char* v = nullptr;
     if (a == "--offline" && (v = next())) offline = v;
     else if (a == "--png" && (v = next())) png = v;
+    else if (a == "--png-seq" && (v = next())) png_seq = v;
     else if (a == "--frame" && (v = next())) frame = std::atoi(v);
     else if (a == "--bench" && (v = next())) bench = std::atoi(v);
     else if (a == "--listen" && (v = next())) listen_port = v;
@@ -139,6 +140,21 @@ int main(int argc, char** argv) {
       if (!write_png(png, img)) {
         std::fprintf(stderr, "gvd_viz: cannot write %s\n", png.c_str());
         return 8;
+      }
+    }
+    if (!png_seq.empty()) {
+      for (size_t i = 0; i < scenes.size(); ++i) {
+        Image img;
+        if (!r.render(scenes[i], o, &img)) {
+          std::fprintf(stderr, "gvd_viz: render failed at frame %zu\n", i);
+          return 7;
+        }
+        char path[1024];
+        std::snprintf(path, sizeof(path), "%s_%04zu.png", png_seq.c_str(), i);
+        if (!write_png(path, img)) {
+          std::fprintf(stderr, "gvd_viz: cannot write %s\n", path);
+          return 8;
+        }
       }
     }
     return 0;

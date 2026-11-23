@@ -7,7 +7,7 @@ Status: **M1** (this PR). Replaces the Python/OpenCV early-vector stage of PR #2
 A separate C++ / OpenGL 3.3 core app that draws what GVD's perception sees in the look of the earliest Tesla FSD beta. The primary reference is Michael's screenshots in `gvd-viz-refs/fsd-early-beta/ref1-4`, not #231:
 
 - black background
-- lane lines as glowing beads/short dashes in the real paint colour: white, and yellow only where the lane record says the paint is yellow. No purple and no colour by index.
+- lane, curb and road-edge dots as independent world-fixed beads (one per model point), not samples along a polyline. Paint colour is real paint: white is white, yellow is yellow, bright red only for curbs and road edges. No purple and no colour by index. Curb dots are denser and brighter than lane paint. Per-dot alpha follows `prob`; inferred (`observed=false`) dots are dimmer. Dots stay fixed in the world and stream past a screen-locked ego.
 - red dotted road edges and curbs (red means edges/curbs and nothing else)
 - neon wireframe 3D boxes with a centre dot and glow: blue cars, green lead (CIPV), yellow cross traffic and bikes, magenta trucks, orange parked/obstacles, pink pedestrians
 - traffic-light icons with the lit lamp glowing, stop sign plus stop bar and zebra crosswalk
@@ -32,7 +32,7 @@ run_vision.py tick ──st──> CppVizPublisher.publish(st)          (Python,
                                 │
                                 ▼
 gvd_viz --listen 47800  (separate process, GLFW window, vsync)
-   drain socket each frame, keep newest valid v1 message, render
+   drain socket each frame, keep newest valid v2 message, render
 gvd_viz --offline scenes.jsonl --png out.png   (headless EGL, tests/gallery)
 ```
 
@@ -43,18 +43,19 @@ gvd_viz --offline scenes.jsonl --png out.png   (headless EGL, tests/gallery)
 - Fail-safe: `--viz-cpp` is off by default. A missing `gvd_viz` prints one note and the publisher keeps sending, which is harmless. `publish` catches everything and only counts errors. The app is started with `Popen` (no wait) and on `close()` is `terminate()`d, waited, and reaped (with a `kill` fallback).
 - Live mode drains the UDP socket every frame and keeps only the newest datagram. If no valid message has arrived for more than 1 second, `scene_to_show(cur, last_rx)` blanks the view to an empty road plus ego.
 
-## Message schema v1
+## Message schema v2
 
 One JSON object per datagram / per line (offline file), ≤ 60 000 bytes (hard UDP payload limit 65 507). Points are thinned to fit. Ego frame: x right, y forward, metres. `yaw` is radians from +x (π/2 = same heading as ego).
 
 The on-wire schema is **strict**: exact keys, strict enums, JSON integers only for ids. Unknown keys are ignored (so a stray GT field can never be drawn). Invalid enums on a lane, edge, track or sign drop that element, not the whole message, except `aeb` (an invalid `aeb` rejects the message). Caps are enforced on **both** the Python publisher and the C++ parser.
 
 ```json
-{"v":1,"type":"gvd_scene","seq":12,"t":1234.5678,
- "ego":{"engaged":true,"speed_mps":13.4,"set_mps":15.0},
+{"v":2,"type":"gvd_scene","seq":12,"t":1234.5678,
+ "ego":{"engaged":true,"speed_mps":13.4,"set_mps":15.0,"x":0.0,"y":0.0,"yaw":1.5708},
  "lead_id":4,"aeb":"off","path_conf":0.9,
  "lanes":[{"pts":[[-1.8,-10],[-1.8,80]],"paint":"yellow|white","kind":"detected|predicted"}],
  "edges":[{"pts":[[5.5,-10],[5.5,80]],"kind":"predicted"}],
+ "dots":[{"id":1,"x":-1.8,"y":10.0,"cls":"yellow|white|curb|edge|path","prob":0.9,"observed":true}],
  "tracks":[{"id":4,"cls":"vehicle","x":0,"y":15,"yaw":1.57,"l":4.5,"w":1.85,"h":1.5,"v":10,"lead":true}],
  "signs":[{"cls":"traffic_light|stop_sign|pole","x":0,"y":45,"state":"red|yellow|green|unknown"}],
  "path":{"pts":[[0,2],[0,30]]}}
@@ -64,13 +65,16 @@ The on-wire schema is **strict**: exact keys, strict enums, JSON integers only f
 
 | Field | Rules |
 | --- | --- |
-| `v` | Integer, must be `1`. Missing or any other value: message rejected. |
+| `v` | Integer, must be `2`. Missing or any other value (including `1`): message rejected. |
 | `type` | Must be exactly `"gvd_scene"`. |
 | `seq` | JSON integer (publisher: non-negative, monotonic per publisher instance). The publisher increments `seq` when a send is attempted, including frames later dropped for EAGAIN/OSError or that fail to encode; rate-limited skips do not increment. After three dropped attempts the next successful datagram has `seq == 4`. Wrong type is ignored (stays 0). |
 | `t` | Number of seconds, finite. Live publisher uses `time.monotonic()`, rounded to 4 decimal places. Offline `write_scene_file` uses `frame_index / 30`. Wrong type / non-finite is ignored (stays 0). |
 | `ego.engaged` | Boolean, default `false`. |
 | `ego.speed_mps` | Number, default 0. |
 | `ego.set_mps` | Number, optional; omitted when the planner has no target. `< 0` means none. |
+| `ego.yaw_rate_rps` | Optional number (rad/s, CCW positive). Used to ego-motion-compensate ego-frame dots between ticks when no world pose is present. Missing defaults to 0. |
+| `ego.x`, `ego.y`, `ego.yaw` | Optional world pose of the ego (metres, radians from +x). **All three must be present and finite** or the pose is ignored — missing fields are not invented (no default yaw π/2, no default x/y = 0). When the pose is set, **only `dots` are in the world frame** and are transformed so the ego stays screen-locked; tracks, signs, lanes and path stay in the ego frame. When omitted, dots are already in the ego frame. Live `run_vision.py` does not yet set ego x/y/yaw (**UNPROVEN**); world-lock is for offline / synthetic poses until that is wired. |
+| `dots[]` | Independent beads from the model's point output. Each is one point: `id` (optional JSON integer), `x`, `y`, `cls` (`white` \| `yellow` \| `curb` \| `edge` \| `path`), `prob` in `[0,1]` (required; per-dot alpha, out-of-range values are clamped), `observed` (required boolean; inferred dots are drawn dimmer), optional `ijk` (`[i,j,k]` cell index). A missing, non-numeric, or non-finite `prob`, or a missing / non-boolean `observed`, **drops the dot** (it is not drawn at full brightness). The renderer **does not resample polylines** into extra beads. If `dots` is omitted or empty, each vertex of `lanes` / `edges` / `path` becomes one dot (still no mid-segment samples). Cap **1024**. If a datagram would exceed 60 kB, farthest / lowest-`prob` dots are dropped — mid-segment samples are never invented. Dots fade in and out over **200 ms** (pinned to 150–250 ms); fade progress is 0..1 and `alpha = fade * target`, so duration does not scale with `prob`. First frame snaps to the target alpha. A gap over 0.5 s or a repeated timestamp holds the current fade (no pop). Identity: stable `id`, else cell `ijk`, else nearest neighbour within 0.75 m after ego-motion compensation (or in world frame when a pose is set). World-lock of a posed dot is within **1.0 px** of the projected position. |
 | `lead_id` | JSON integer only (no floats, no strings). Identifies the CIPV. Optional; missing or invalid is `-1` (no lead). |
 | `aeb` | Enum: `"off"` \| `"warn"` \| `"brake"`. Missing defaults to `"off"`. Any other value **rejects the message** (C++) or is emitted as `"off"` (publisher, so it never sends an invalid value). |
 | `path_conf` | Number in `[0, 1]`, **default `1.0`** when missing. Both sides clamp into `[0, 1]`. The renderer further floors the path glow at 0.45 so a very low conf is still visible. |
@@ -79,23 +83,23 @@ The on-wire schema is **strict**: exact keys, strict enums, JSON integers only f
 | `lanes[].pts`, `edges[].pts`, `path.pts` | Array of `[x, y]` number pairs, key **`pts` only** (not `points`). Non-finite points skipped. |
 | `tracks[].id` | JSON integer only. Floats and strings are rejected (the track is dropped if `id` is present and not an integer; a missing `id` is allowed and stays `-1`). |
 | `tracks[].cls` | Enum: `vehicle`, `car`, `pedestrian`, `ped`, `person`, `bicycle`, `bike`, `cyclist`, `motorcycle`, `truck`, `bus`, `trailer`, `obstacle`, `parked`, `debris`, `cone`. Missing → `"vehicle"`. Any other value drops the track. On-wire key is `cls` only. |
-| `tracks[].l/w/h/v` | Optional numbers (class priors fill in `l/w/h` in the renderer). On-wire keys are `l`, `w`, `h`, `v` only. |
+| `tracks[].l/w/h/v` | Optional numbers. Box size, yaw and position come from this per-object output only — the renderer does **not** invent a class-prior size when `l/w/h` are missing or ≤ 0.2 m (the track is skipped). On-wire keys are `l`, `w`, `h`, `v` only. |
 | `tracks[].lead` | Optional boolean. C++ treats a track as lead if `lead` is true **or** `id == lead_id`. The live publisher **passes `lead` through** when the supervisor state (or `occ_to_viz`) sets `lead=true`; it does not invent a lead flag from `lead_id`. Lead is also indicated by `lead_id` from `planner.cipv_id`. |
 | `signs[].cls` | Enum: `traffic_light` \| `stop_sign` \| `pole`. Anything else drops the sign. |
 | `signs[].state` | Enum: `red` \| `yellow` \| `green` \| `unknown`. Missing → `"unknown"`. Anything else drops the sign. |
 
-Caps (extra elements / points dropped, both sides): **64** tracks, **16** signs, **16** lanes, **8** edges, **120** points per polyline.
+Caps (extra elements / points dropped, both sides): **64** tracks, **16** signs, **16** lanes, **8** edges, **120** points per polyline, **1024** dots.
 
 ### Supervisor-state input (publisher only, not on the wire)
 
-The publisher still reads supervisor state keys: `engaged`, `ego.speed_mps`, `planner.{target_v,cipv_id,aeb}`, `path_ego`, `path_conf`, `lanes_ext`, `road_edges`, `tracks`, `signs`. Ground truth (`path_world`, `debug_gt`, `*_gt` / `gt_*`) is never read.
+The publisher still reads supervisor state keys: `engaged`, `ego.{speed_mps,x,y,yaw,yaw_rate,yaw_rate_rps}`, `planner.{target_v,cipv_id,aeb}`, `path_ego`, `path_conf`, `lanes_ext`, `road_edges`, `tracks`, `signs`, `dots`, `occ_out`. Preference for beads: explicit `dots`, then a canonical **occ_out v2** message, then the vertices of `lanes_ext` / `road_edges` / `path_ego`. The occ_out adapter requires `v==2` and `type=="occ_out"` (anything else, including v=1 or v=99, yields no occ dots). Red curb / road-edge beads come only from `edges[]` (`kind` `curb` or `road_edge`); paint colour comes only from `lanes[].paint` (`white` or `yellow`). Occupancy `cells` (class `other` / `drivable` / `vehicle`) are not paint and are not drawn as beads. A missing or invalid per-point `conf`/`prob` or `observed` drops that point. This PR depends on the occupancy swarm winner's occ_out v2 contract (`python/perception/occ_out.py` on `gvd/occ-sparse-s2`, SHA `b939818`); the field set is frozen in `python/viz/occ_out_v2_contract.py`. It never interpolates a polyline into mid-segment beads. Ground truth (`path_world`, `debug_gt`, `*_gt` / `gt_*`) is never read.
 
 These **input** aliases are mapped onto the strict on-wire keys and then discarded. They must not appear in the datagram:
 
 - track `class` → `cls`; `length`/`width`/`height`/`speed_mps` → `l`/`w`/`h`/`v`
 - lane / edge / path `points` or `pts`, list or `{points|pts: ...}` dict → on-wire `{pts: [[x,y], ...]}`
 
-`occ_to_viz` (and any other adapter writing schema v1) should emit the **on-wire** keys and enums above, not the supervisor aliases.
+`occ_to_viz` (and any other adapter writing schema v2) should emit the **on-wire** keys and enums above, not the supervisor aliases.
 
 ### Contract changes in this revision (for `occ_to_viz`)
 

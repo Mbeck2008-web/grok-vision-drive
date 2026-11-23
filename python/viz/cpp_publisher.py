@@ -11,7 +11,7 @@ once per tick. It never blocks and never raises:
 * a missing ``gvd_viz`` executable is reported once and the publisher keeps
   sending (harmless) so a renderer started later still gets frames.
 
-Schema v1 (``{"v": 1, "type": "gvd_scene", ...}``) is mirrored by
+Schema v2 (``{"v": 2, "type": "gvd_scene", ...}``) is mirrored by
 ``cpp/viz/src/scene.cpp``. Bump ``SCHEMA_VERSION`` on any breaking change.
 """
 from __future__ import annotations
@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_PORT = 47800
 # Loopback UDP payload cap (65507 = 65535 − 8 byte UDP header − 20 byte min IPv4).
 UDP_MAX_PAYLOAD = 65507
@@ -37,10 +37,13 @@ MAX_SIGNS = 16
 MAX_LANES = 16
 MAX_EDGES = 8
 MAX_POINTS = 120
+MAX_DOTS = 1024
 # Supervisor ticks are ~15-30 Hz; never send faster than the renderer's 60 fps.
 MIN_INTERVAL_S = 1.0 / 60.0
 
 ROOT = Path(__file__).resolve().parents[2]
+
+from python.viz.occ_out_v2_contract import LANE_PAINTS, OCC_OUT_VERSION  # noqa: E402
 # Strict v1 enums (on-wire). Exact strings only; anything else is dropped or
 # replaced with the documented default. See docs/specs/viz_cpp.md.
 PAINT_VALUES = frozenset({"white", "yellow"})
@@ -54,8 +57,18 @@ SIGN_CLS = frozenset({"traffic_light", "stop_sign", "pole"})
 SIGN_STATE = frozenset({"red", "yellow", "green", "unknown"})
 # Top-level message keys. Tests pin this set so a new field is a schema decision.
 MESSAGE_KEYS = frozenset(
-    {"v", "type", "seq", "t", "ego", "lead_id", "aeb", "lanes", "edges", "tracks", "signs", "path", "path_conf"}
+    {"v", "type", "seq", "t", "ego", "lead_id", "aeb", "lanes", "edges", "dots", "tracks", "signs", "path", "path_conf"}
 )
+DOT_CLS = frozenset({"white", "yellow", "curb", "edge", "path"})
+# Aliases accepted on the state side only; the wire always uses DOT_CLS.
+DOT_CLS_ALIASES = {
+    "white": "white", "lane": "white", "white_solid": "white", "white_dashed": "white",
+    "stop_line": "white",
+    "yellow": "yellow", "yellow_solid": "yellow", "yellow_dashed": "yellow",
+    "curb": "curb",
+    "edge": "edge", "road_edge": "edge",
+    "path": "path",
+}
 
 
 def _f(v: Any, nd: int = 2) -> float | None:
@@ -178,24 +191,338 @@ def _list(v: Any) -> list[Any]:
     return list(v) if isinstance(v, (list, tuple)) else []
 
 
+
+def _seq(v: Any) -> list[Any]:
+    if v is None:
+        return []
+    if isinstance(v, (list, tuple)):
+        return list(v)
+    tolist = getattr(v, "tolist", None)
+    if callable(tolist):
+        try:
+            return list(tolist())
+        except (TypeError, ValueError):
+            return []
+    return []
+
+
+def _as_bool(v: Any) -> bool | None:
+    """Accept a real bool (or a numpy bool scalar). Strings and 0/1 are invalid."""
+    if type(v) is bool:
+        return v
+    item = getattr(v, "item", None)
+    if callable(item):
+        try:
+            x = item()
+        except (TypeError, ValueError):
+            return None
+        if type(x) is bool:
+            return x
+    return None
+
+
+def _as_int(v: Any) -> int | None:
+    """JSON / numpy integer, not bool, not truncated float."""
+    if type(v) is bool:
+        return None
+    if type(v) is int:
+        return v
+    item = getattr(v, "item", None)
+    if callable(item):
+        try:
+            x = item()
+        except (TypeError, ValueError):
+            return None
+        if type(x) is int:
+            return x
+        if type(x) is bool:
+            return None
+    return None
+
+
+def _ijk(raw: Any) -> list[int] | None:
+    seq = _seq(raw)
+    if len(seq) < 3:
+        return None
+    out = [_as_int(seq[0]), _as_int(seq[1]), _as_int(seq[2])]
+    if any(x is None for x in out):
+        return None
+    return [int(out[0]), int(out[1]), int(out[2])]  # type: ignore[arg-type]
+
+
+def _occ_v2(occ: Any) -> bool:
+    if not isinstance(occ, dict):
+        return False
+    v = _as_int(occ.get("v"))
+    typ = occ.get("type")
+    return v == OCC_OUT_VERSION and typ == "occ_out"
+
+
+def _dot_cls(raw: Any) -> str | None:
+    """Map a paint / edge label to an on-wire DotCls. Integer occ class ids
+    (other/drivable/vehicle) are not paint and return None."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return None
+    key = str(raw).strip().lower()
+    return DOT_CLS_ALIASES.get(key)
+
+
+def _one_dot(rec: Any, *, default_cls: str = "white", default_prob: float | None = None,
+             default_obs: bool | None = None, default_id: int | None = None) -> dict[str, Any] | None:
+    if not isinstance(rec, dict):
+        return None
+    x, y = _f(rec.get("x")), _f(rec.get("y"))
+    if x is None or y is None:
+        return None
+    cls = _dot_cls(rec.get("cls") if rec.get("cls") is not None else rec.get("class")) or default_cls
+    if cls not in DOT_CLS:
+        return None
+    if "prob" in rec:
+        pr = _f(rec.get("prob"), 3)
+    elif "conf" in rec:
+        pr = _f(rec.get("conf"), 3)
+    else:
+        pr = None
+    if pr is None:
+        if default_prob is None:
+            return None
+        pr = default_prob
+    pr = min(1.0, max(0.0, pr))
+    if "observed" in rec:
+        observed = _as_bool(rec.get("observed"))
+        if observed is None:
+            return None
+    elif default_obs is None:
+        return None
+    else:
+        observed = default_obs
+    row: dict[str, Any] = {"x": x, "y": y, "cls": cls, "prob": pr, "observed": observed}
+    tid = _int(rec.get("id"))
+    if tid is None:
+        tid = default_id
+    if tid is not None:
+        row["id"] = tid
+    ijk = _ijk(rec.get("ijk"))
+    if ijk is not None:
+        row["ijk"] = ijk
+    return row
+
+
+def _dots_from_list(src: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for rec in _list(src):
+        d = _one_dot(rec)
+        if d is not None:
+            out.append(d)
+        if len(out) >= MAX_DOTS:
+            break
+    return out
+
+
+def _dots_from_vertices(pts: list[list[float]], cls: str, prob: float, observed: bool,
+                        id0: int | None = None) -> list[dict[str, Any]]:
+    """One dot per vertex. Never interpolates mid-segment samples."""
+    out: list[dict[str, Any]] = []
+    for i, p in enumerate(pts):
+        if len(p) < 2:
+            continue
+        row: dict[str, Any] = {"x": p[0], "y": p[1], "cls": cls, "prob": float(prob), "observed": bool(observed)}
+        if id0 is not None:
+            row["id"] = id0 + i
+        out.append(row)
+    return out
+
+
+def _dots_from_occ_out(occ: Any) -> list[dict[str, Any]]:
+    """Dots from a canonical occ_out v2 message.
+
+    Red curb / road-edge beads come only from ``edges[]``. Paint colour comes
+    only from ``lanes[].paint``. ``v`` must be 2; anything else is rejected.
+    Occupancy cells (cls in other/drivable/vehicle) are not paint and are not
+    drawn as beads. A missing or invalid per-point ``conf``/``prob`` or
+    ``observed`` drops that point instead of drawing it at full brightness.
+    """
+    if not _occ_v2(occ):
+        return []
+    out: list[dict[str, Any]] = []
+
+    def _pt_xy(p: Any) -> tuple[float, float] | None:
+        if isinstance(p, dict):
+            x, y = _f(p.get("x")), _f(p.get("y"))
+        elif isinstance(p, (list, tuple)) and len(p) >= 2:
+            x, y = _f(p[0]), _f(p[1])
+        else:
+            return None
+        if x is None or y is None:
+            return None
+        return x, y
+
+    def _push(x: float, y: float, cls: str, pr: float, obs: bool, ijk=None) -> bool:
+        rec: dict[str, Any] = {"x": x, "y": y, "cls": cls, "prob": min(1.0, max(0.0, pr)), "observed": obs}
+        if ijk is not None:
+            rec["ijk"] = ijk
+        out.append(rec)
+        return len(out) >= MAX_DOTS
+
+    for e in _seq(occ.get("edges")):
+        if not isinstance(e, dict):
+            continue
+        kind = e.get("kind")
+        if kind == "curb":
+            cls = "curb"
+        elif kind == "road_edge":
+            cls = "edge"
+        else:
+            continue
+        pts = _seq(e.get("pts"))
+        confs = _seq(e.get("conf"))
+        obs = _seq(e.get("observed"))
+        for j, p in enumerate(pts):
+            xy = _pt_xy(p)
+            if xy is None:
+                continue
+            if j >= len(confs):
+                continue
+            pr = _f(confs[j], 3)
+            if pr is None:
+                continue
+            if j >= len(obs):
+                continue
+            ob = _as_bool(obs[j])
+            if ob is None:
+                continue
+            if _push(xy[0], xy[1], cls, pr, ob):
+                return out
+
+    for ln in _seq(occ.get("lanes")):
+        if not isinstance(ln, dict):
+            continue
+        paint = ln.get("paint")
+        if paint not in LANE_PAINTS:
+            continue
+        pts = _seq(ln.get("pts"))
+        confs = _seq(ln.get("conf"))
+        obs = _seq(ln.get("observed"))
+        for j, p in enumerate(pts):
+            xy = _pt_xy(p)
+            if xy is None:
+                continue
+            if j >= len(confs):
+                continue
+            pr = _f(confs[j], 3)
+            if pr is None:
+                continue
+            if j >= len(obs):
+                continue
+            ob = _as_bool(obs[j])
+            if ob is None:
+                continue
+            if _push(xy[0], xy[1], str(paint), pr, ob):
+                return out
+    return out
+
+
+def _thin_dots(dots: list[dict[str, Any]], limit: int, origin: tuple[float, float] = (0.0, 0.0)) -> list[dict[str, Any]]:
+    """Drop farthest / lowest-prob dots. Never invent mid-segment samples."""
+    if len(dots) <= limit:
+        return dots
+    ox, oy = origin
+
+    def key(d: dict[str, Any]) -> tuple[float, float]:
+        dx, dy = float(d["x"]) - ox, float(d["y"]) - oy
+        return (-float(d.get("prob", 1.0)), dx * dx + dy * dy)
+
+    ranked = sorted(dots, key=key)
+    return ranked[:limit]
+
+
+def _dots_to_world(dots: list[dict[str, Any]], ex: float, ey: float, yaw: float) -> list[dict[str, Any]]:
+    """Supervisor / occ_out points are ego-frame; the wire uses world when a pose is set."""
+    c, s = math.cos(yaw), math.sin(yaw)
+    out = []
+    for d in dots:
+        x, y = float(d["x"]), float(d["y"])
+        dx = x * s + y * c
+        dy = -x * c + y * s
+        rec = dict(d)
+        rec["x"], rec["y"] = round(ex + dx, 2), round(ey + dy, 2)
+        out.append(rec)
+    return out
+
+
+def collect_dots(st: dict[str, Any]) -> list[dict[str, Any]]:
+
+    """Independent dots from state. Preference: dots, then occ_out, then vertices."""
+    if st.get("dots") is not None:
+        return _thin_dots(_dots_from_list(st.get("dots")), MAX_DOTS)
+    if st.get("occ_out") is not None:
+        return _thin_dots(_dots_from_occ_out(st.get("occ_out")), MAX_DOTS)
+    out: list[dict[str, Any]] = []
+    for ln in _list(st.get("lanes_ext")):
+        paint = lane_paint(ln)
+        kind = "detected"
+        if isinstance(ln, dict) and ln.get("kind") is not None:
+            raw = str(ln.get("kind"))
+            if raw not in KIND_VALUES:
+                continue
+            kind = raw
+        pts = _pts(ln)
+        out.extend(_dots_from_vertices(pts, paint, 0.45 if kind == "predicted" else 1.0, kind != "predicted"))
+    for ed in _list(st.get("road_edges")):
+        kind = "detected"
+        if isinstance(ed, dict) and ed.get("kind") is not None:
+            raw = str(ed.get("kind"))
+            if raw not in KIND_VALUES:
+                continue
+            kind = raw
+        cls = "curb" if (isinstance(ed, dict) and str(ed.get("cls") or ed.get("class") or "").lower() in {"curb"}) else "edge"
+        pts = _pts(ed)
+        out.extend(_dots_from_vertices(pts, cls, 0.6 if kind == "predicted" else 1.0, kind != "predicted"))
+    path_pts = _pts(st.get("path_ego"))
+    pc = _f(st.get("path_conf"))
+    conf = 1.0 if pc is None else min(1.0, max(0.0, pc))
+    if path_pts:
+        out.extend(_dots_from_vertices(path_pts, "path", conf, True))
+    return _thin_dots(out, MAX_DOTS)
+
+
 def build_scene_message(state: dict[str, Any], *, seq: int = 0, t: float | None = None) -> dict[str, Any]:
     """Scene message from the supervisor state. Perception fields only.
 
-    Reads: ``engaged``, ``ego.speed_mps``, ``planner.{target_v,cipv_id,aeb}``,
+    Reads: ``engaged``, ``ego.{speed_mps,x,y,yaw,yaw_rate,yaw_rate_rps}``, ``planner.{target_v,cipv_id,aeb}``,
     ``path_ego``, ``path_conf``, ``lanes_ext``, ``road_edges``, ``tracks``,
-    ``signs``. Nothing else.
+    ``signs``, ``dots``, ``occ_out``. Nothing else. Each lane / curb / edge
+    vertex is forwarded as an independent dot; the publisher never resamples
+    a polyline into mid-segment beads.
     """
     st = state if isinstance(state, dict) else {}
     ego = st.get("ego") if isinstance(st.get("ego"), dict) else {}
     pl = st.get("planner") if isinstance(st.get("planner"), dict) else {}
+    ego_msg: dict[str, Any] = {"engaged": bool(st.get("engaged")), "speed_mps": _f(ego.get("speed_mps")) or 0.0}
+    # yaw_rate is optional; used to ego-motion-compensate dots when there is no world pose.
+    yr = _f(ego.get("yaw_rate_rps") if ego.get("yaw_rate_rps") is not None else ego.get("yaw_rate"), 4)
+    if yr is not None:
+        ego_msg["yaw_rate_rps"] = yr
+    # Live ego x/y/yaw is not wired up yet (UNPROVEN). Only emit a pose when
+    # all three fields are present and finite — nothing is invented.
+    ex, ey, eyaw = _f(ego.get("x"), 3), _f(ego.get("y"), 3), _f(ego.get("yaw"), 4)
+    have_pose = ex is not None and ey is not None and eyaw is not None
+    if have_pose:
+        ego_msg["x"], ego_msg["y"], ego_msg["yaw"] = ex, ey, eyaw
+    dots = collect_dots(st)
+    if have_pose:
+        dots = _dots_to_world(dots, float(ex), float(ey), float(eyaw))
     msg: dict[str, Any] = {
         "v": SCHEMA_VERSION,
         "type": "gvd_scene",
         "seq": int(seq),
         "t": round(float(time.monotonic() if t is None else t), 4),
-        "ego": {"engaged": bool(st.get("engaged")), "speed_mps": _f(ego.get("speed_mps")) or 0.0},
+        "ego": ego_msg,
         "lanes": [],
         "edges": [],
+        "dots": dots,
         "tracks": _tracks(_list(st.get("tracks"))),
         "signs": _signs(_list(st.get("signs"))),
         "path": {"pts": _pts(st.get("path_ego"))},
@@ -249,7 +576,13 @@ def encode_message(msg: dict[str, Any], max_bytes: int = MAX_DATAGRAM) -> bytes 
     if len(data) <= max_bytes:
         return data
     thin = json.loads(data)
-    for _ in range(6):
+    ox = float(((thin.get("ego") or {}).get("x")) or 0.0)
+    oy = float(((thin.get("ego") or {}).get("y")) or 0.0)
+    for _ in range(8):
+        dots = thin.get("dots") or []
+        if len(dots) > 8:
+            # drop farthest / lowest-prob; never invent mid-segment samples
+            thin["dots"] = _thin_dots(dots, max(8, len(dots) // 2), (ox, oy))
         for group in ("lanes", "edges"):
             for rec in thin.get(group) or []:
                 pts = rec.get("pts") or []

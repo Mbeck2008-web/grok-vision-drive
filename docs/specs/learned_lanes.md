@@ -48,6 +48,6 @@ Heartbeat / AEB / engage are untouched: lanes feed the planner exactly where Hou
 - The paint gate is a pixel heuristic. A bright band narrower than `PAINT_MAX_WIDTH_PX` (24 px)
   looks like paint and counts; a worn or very hazy stripe it misses gives no lanes (a stop).
   It is frame-level: with real paint present, a Hough curb line is not removed.
-- The row-continuity check assumes a camera-like aspect (stripe moves <= ~4 px per row).
+- The row-continuity check assumes a camera-like aspect (thin (≤6 px) stripes: ≤2 px/row; "~4 px/row" only holds at 12 px).
 - All 87 real BeamNG fixture frames in `tests/fixtures` pass the gate; that is not a
   held-out accuracy result.

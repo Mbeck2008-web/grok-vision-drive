@@ -1,18 +1,18 @@
 # lane_select.py mutants: every eccf5c4 survivor, classified
 
 - r3 (eccf5c4): 907 mutants, 741 killed, 164 survived, 2 segfault.
-- r4 (this branch, new checks in scripts/test_learned_lanes_props.py): {'killed': 862, 'survived': 43, 'segfault': 2}.
-  mutmut 3.8.1, CPU, `mut-lanes/` (paths: python/perception/lane_select.py; tests: tests_lanes/ pytest wrapper over the props script). Log: mutmut_run4.log, results: mutmut_results_r4.txt.
+- r4 (this branch as of a7da30a, new checks in scripts/test_learned_lanes_props.py): {'killed': 862, 'survived': 43, 'segfault': 2}. mutmut 3.8.1, CPU.
 - The 2 segfaults (paint_evidence_px 133 `mask = None`, 144 `connectedComponentsWithStats(None)`) crash cv2 and the test process; the mutant cannot pass. Not survivors.
-- Of the 164 r3 survivors: killed 121, equivalent 43, unclassified 0.
-- "KILLED by" names the check written to kill that mutant (by design; mutmut stops at the first failing test and does not record which). All 121 are reported killed by mutmut r4.
-- Equivalents cross-checked empirically where they are pure functions of an image (equiv_crosscheck.py / .log).
+- Of the 164 r3 survivors: killed 122, equivalent 42, unclassified 0.
+  x_paint_evidence_px__mutmut_5 was in the r4 survivor set and is now KILLED by check_paint_gate_input_forms (zero-width/height frames).
+- "KILLED by" names the check written to kill that mutant (by design; mutmut stops at the first failing test and does not record which). 121 were reported killed by mutmut r4; pe5 is killed by the later input-forms asserts.
+- Equivalents were cross-checked empirically where they are pure functions of an image.
 - No tolerance, threshold or invariant was changed. lane_select.py changed only in docstrings/comments.
 
 | mutant | function | mutation | verdict |
 |---|---|---|---|
 | x_paint_evidence_px__mutmut_2 | paint_evidence_px | `return 1` | KILLED by check_paint_gate_input_forms (None -> 0) |
-| x_paint_evidence_px__mutmut_5 | paint_evidence_px | `if arr.ndim != 3 or arr.shape[2] < 3 or arr.shape[0] < 4 and arr.shape[1] < 4:` | EQUIVALENT: height < 4 is caught by the ROI check (rows < 4 -> 0); width < 5 gives ridge <= 0 (needs x-tau and x+tau in frame, tau >= 2) -> 0 |
+| x_paint_evidence_px__mutmut_5 | paint_evidence_px | `if arr.ndim != 3 or arr.shape[2] < 3 or arr.shape[0] < 4 and arr.shape[1] < 4:` | KILLED by check_paint_gate_input_forms (shapes (100,0,3), (0,100,3), (0,0,3) return 0; mutant raises cv2.error) |
 | x_paint_evidence_px__mutmut_6 | paint_evidence_px | `if arr.ndim != 3 or arr.shape[2] < 3 and arr.shape[0] < 4 or arr.shape[1] < 4:` | KILLED by check_paint_gate_input_forms (2-channel frame -> 0; mutant raises in cvtColor) |
 | x_paint_evidence_px__mutmut_13 | paint_evidence_px | `if arr.ndim != 3 or arr.shape[2] < 3 or arr.shape[1] < 4 or arr.shape[1] < 4:` | EQUIVALENT: height check dropped: h < 4 always leaves < 4 ROI rows -> same 0 |
 | x_paint_evidence_px__mutmut_14 | paint_evidence_px | `if arr.ndim != 3 or arr.shape[2] < 3 or arr.shape[0] <= 4 or arr.shape[1] < 4:` | EQUIVALENT: h == 4 leaves 3 ROI rows -> ROI check returns 0 anyway |

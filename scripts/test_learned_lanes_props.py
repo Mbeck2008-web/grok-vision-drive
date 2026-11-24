@@ -444,11 +444,9 @@ def check_flag_off_pipeline_pin_real_frames() -> None:
 #
 # Each check below pins a documented rule of paint_evidence_px / forward_image
 # at its exact boundary, on both sides. They were written to kill surviving
-# mutants (evidence/mutant_table.md), but each one is a behaviour the I1 gate
+# mutants (docs/specs/learned_lanes_mutants.md), but each one is a behaviour the I1 gate
 # depends on: a rule that can move by one unit without a test failing is not a
 # rule.
-
-ROI_TOP_100 = int(ls.PAINT_ROI_TOP * 100)  # 35 on a 100-row frame
 
 
 def stripe_frame(color, bg, *, h=100, w=160, x0=70, width=6, r0=45, r1=85, shift=0, dtype=np.uint8) -> np.ndarray:
@@ -507,6 +505,11 @@ def check_paint_gate_stripe_shape_rules() -> None:
         # 4 px wide, 2 px sideways per row: a side lane in perspective.
         slanted = stripe_frame(color, bg, width=4, shift=2, x0=40)
         assert paint_both(slanted) > 0, color
+    # 6 px stripe: measured limit is 2 px/row (s <= (W_ridge+8)/5 = 2.8), 0 at 3.
+    # 240x640 so the stripe stays in-frame at 3 px/row over rows 100..229.
+    six = dict(h=240, w=640, x0=100, width=6, r0=100, r1=230)
+    assert paint_both(stripe_frame(WHITE, GRAY, shift=2, **six)) >= ls.PAINT_MIN_PX
+    assert paint_both(stripe_frame(WHITE, GRAY, shift=3, **six)) == 0
     # Component bounding box: (W + 8) wide after the join, R - 4 rows tall.
     # W=4, R=12 -> 12 x 8 box: exactly PAINT_MIN_RUN_PX long, counts.
     assert ls.PAINT_MIN_RUN_PX == 12
@@ -551,6 +554,11 @@ def check_paint_gate_input_forms() -> None:
     """No frame / degenerate shapes give 0; BGRA = BGR; float input is clipped to
     0..255 like a camera (overexposed paint still counts, negative is black)."""
     assert ls.paint_evidence_px(None) == 0
+    # Zero width/height: original returns 0 (kills x_paint_evidence_px__mutmut_5,
+    # which rewrites the <4 guard with `and` and then raises cv2.error in cvtColor).
+    assert ls.paint_evidence_px(np.zeros((100, 0, 3), np.uint8)) == 0
+    assert ls.paint_evidence_px(np.zeros((0, 100, 3), np.uint8)) == 0
+    assert ls.paint_evidence_px(np.zeros((0, 0, 3), np.uint8)) == 0
     ref = stripe_frame(WHITE, GRAY)
     n = ls.paint_evidence_px(ref)
     assert n > 0

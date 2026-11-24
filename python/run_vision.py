@@ -59,6 +59,11 @@ from python.control.override import (
 from python.control.echo_link import MIN_MOD_VERSION, STATUS_OUTDATED, EchoGate, SessionEcho, outdated_message
 from python.data.record import ClipRecorder, choose_encoder
 from python.perception.pipeline import ModularPerception
+from python.perception.lane_select import (
+    build_lane_selector,
+    lane_strip_for,
+    log_lane_head_change,
+)
 from python.perception.stitch360 import stitch_frames
 from python.perception.road_model import lanes_ext_for_live, road_edges
 from python.viz.debug_draw import cabin_drive_word
@@ -397,13 +402,6 @@ def start_cpp_viz(args: argparse.Namespace) -> Any:
     except Exception as exc:  # noqa: BLE001 - the viz must never stop the supervisor
         print(f"[GVD] viz-cpp: off ({exc!r})", flush=True)
         return None
-
-
-from python.perception.lane_select import (  # noqa: E402  (--learned-lanes wiring)
-    build_lane_selector,
-    lane_strip_for,
-    log_lane_head_change,
-)
 
 
 def build_parser() -> argparse.ArgumentParser:

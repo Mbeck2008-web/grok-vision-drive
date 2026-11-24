@@ -45,6 +45,9 @@ viz:
   behind_min_m: 20
   behind_max_m: 80
   fade_frac: 0.28         # furniture/lanes fade in the last 28% of AHEAD range
+  main_view: reality      # reality (GVD 2.0 main view) | classic (old stage view, disabled below)
+  classic_view_enabled: false  # true (or --enable-classic-view) to allow main_view/--view classic
+  cpp_viz_enabled: false       # true (or --enable-viz-cpp) to allow --viz-cpp to open gvd_viz
 cameras:
   - id: narrow
     role: long_range_forward

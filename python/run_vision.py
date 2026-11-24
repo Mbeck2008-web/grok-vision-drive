@@ -413,6 +413,10 @@ def start_cpp_viz(args: argparse.Namespace, cameras: dict[str, Any] | None = Non
     if not bool(getattr(args, "viz_cpp", False)):
         return None
     if not cpp_viz_unlocked(args, cameras):
+        print(
+            "[GVD] viz-cpp: disabled (pass --enable-viz-cpp or viz.cpp_viz_enabled: true)",
+            flush=True,
+        )
         return None
     try:
         from python.viz.cpp_publisher import CppVizPublisher

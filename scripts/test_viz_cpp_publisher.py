@@ -476,6 +476,17 @@ def check_viz_cpp_gate() -> None:
     alone = ap.parse_args(["--viz-cpp", "--viz-cpp-exe", "/nonexistent/gvd_viz", "--viz-cpp-port", "47999"])
     assert alone.viz_cpp is True and alone.enable_viz_cpp is False
     assert start_cpp_viz(alone) is None, "--viz-cpp alone must not open the C++ early-FSD-beta viewer"
+    import io
+    from contextlib import redirect_stdout
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        assert start_cpp_viz(alone) is None
+    note = buf.getvalue()
+    disabled = "[GVD] viz-cpp: disabled (pass --enable-viz-cpp or viz.cpp_viz_enabled: true)"
+    assert disabled in note, note
+    assert note.count("disabled") >= 1
+    assert "fsd" not in note.lower(), note
 
     # Opt-in CLI + --viz-cpp opens the publisher (missing exe stays fail-safe).
     on = ap.parse_args([
@@ -502,6 +513,8 @@ def check_viz_cpp_gate() -> None:
     assert start_cpp_viz(args, cameras={}) is None
     # Garbage config is a safe off, never a raise.
     assert start_cpp_viz(args, cameras={"viz": "nope"}) is None
+    assert start_cpp_viz(args, cameras=[1]) is None
+    assert start_cpp_viz(args, cameras="x") is None
     assert start_cpp_viz(args, cameras=None) is None  # shipped yaml is disabled
 
     # No env-var path.

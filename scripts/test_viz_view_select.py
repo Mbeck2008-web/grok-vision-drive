@@ -171,6 +171,68 @@ def check_draw_vision_frame_live_path() -> None:
     assert ui.handle_click(cx, cy, stage_w=STAGE_W) is True
 
 
+def check_draw_vision_frame_forwards_cam_frames() -> None:
+    """Classic cams tab keeps its tiles; cam_frames=None in the helper must fail."""
+    import types
+
+    import numpy as np
+
+    from python.run_vision import draw_vision_frame
+    from python.viz.stage import STAGE_W, VizUI, render_stage
+    from python.viz.view_select import resolve_view
+
+    choice = resolve_view({"viz": {"main_view": "classic", "classic_view_enabled": True}})
+    main = np.full((180, 320, 3), 50, np.uint8)
+    cam_frames = {"main": np.full((48, 64, 3), (15, 15, 180), np.uint8)}
+    bundle = types.SimpleNamespace(frames=cam_frames)
+    pout = types.SimpleNamespace(dets=None)
+    paint = {"engaged": False}
+
+    def _cams_ui() -> VizUI:
+        ui = VizUI()
+        ui.nerd_tab = "cams"
+        ui.show_nerd = True
+        ui.show_help = False
+        return ui
+
+    got = draw_vision_frame(choice, paint, _cams_ui(), main, bundle, pout)
+    classic = render_stage(paint, ui=_cams_ui(), main_frame=main, cam_frames=cam_frames, dets=None)
+    assert np.array_equal(got[:, :STAGE_W], classic[:, :STAGE_W]), (
+        "draw_vision_frame must match render_stage when the classic cams tab is on"
+    )
+    dropped = render_stage(paint, ui=_cams_ui(), main_frame=main, cam_frames=None, dets=None)
+    assert not np.array_equal(got[:, :STAGE_W], dropped[:, :STAGE_W]), (
+        "classic cams tab must keep its tiles; draw_vision_frame must forward cam_frames"
+    )
+
+
+def check_draw_vision_frame_loop_call_args() -> None:
+    """The live loop must call draw_vision_frame(view_choice, paint, ui, main, bundle, pout)."""
+    import ast
+
+    src = (ROOT / "python" / "run_vision.py").read_text(encoding="utf-8")
+    found: list[list[str]] = []
+    for node in ast.walk(ast.parse(src)):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name) or target.id != "stage_frame":
+            continue
+        call = node.value
+        if not isinstance(call, ast.Call):
+            continue
+        func = call.func
+        if not isinstance(func, ast.Name) or func.id != "draw_vision_frame":
+            continue
+        names: list[str] = []
+        for arg in call.args:
+            assert isinstance(arg, ast.Name), ast.dump(arg)
+            names.append(arg.id)
+        assert call.keywords == [], "live loop must pass positional args only"
+        found.append(names)
+    assert found == [["view_choice", "paint", "ui", "main", "bundle", "pout"]], found
+
+
 def check_docs_view_flags() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "The left part is the stage (the 3D view of what GVD sees)" not in readme
@@ -371,6 +433,8 @@ def main() -> None:
     check_conf_gate_tag_on_default_path()
     check_classic_passthrough_forwards_all()
     check_draw_vision_frame_live_path()
+    check_draw_vision_frame_forwards_cam_frames()
+    check_draw_vision_frame_loop_call_args()
     check_docs_view_flags()
 
     print("test_viz_view_select: ok")

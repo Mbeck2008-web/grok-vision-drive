@@ -464,6 +464,9 @@ def check_viz_cpp_gate() -> None:
     """--viz-cpp alone must not open gvd_viz; the explicit opt-in must."""
     import os
 
+    import io
+    from contextlib import redirect_stderr, redirect_stdout
+
     from python.run_vision import build_parser, start_cpp_viz
 
     ap = build_parser()
@@ -471,16 +474,17 @@ def check_viz_cpp_gate() -> None:
     bare = ap.parse_args([])
     assert getattr(bare, "enable_viz_cpp", None) is False
     assert bare.viz_cpp is False
-    assert start_cpp_viz(bare) is None
+    bare_buf = io.StringIO()
+    with redirect_stdout(bare_buf), redirect_stderr(bare_buf):
+        assert start_cpp_viz(bare) is None
+    assert "viz-cpp: disabled" not in bare_buf.getvalue(), bare_buf.getvalue()
 
     alone = ap.parse_args(["--viz-cpp", "--viz-cpp-exe", "/nonexistent/gvd_viz", "--viz-cpp-port", "47999"])
     assert alone.viz_cpp is True and alone.enable_viz_cpp is False
     assert start_cpp_viz(alone) is None, "--viz-cpp alone must not open the C++ early-FSD-beta viewer"
-    import io
-    from contextlib import redirect_stdout
 
     buf = io.StringIO()
-    with redirect_stdout(buf):
+    with redirect_stdout(buf), redirect_stderr(buf):
         assert start_cpp_viz(alone) is None
     note = buf.getvalue()
     disabled = "[GVD] viz-cpp: disabled (pass --enable-viz-cpp or viz.cpp_viz_enabled: true)"
@@ -494,8 +498,11 @@ def check_viz_cpp_gate() -> None:
         "--viz-cpp-exe", "/nonexistent/gvd_viz", "--viz-cpp-port", "47999",
     ])
     assert on.viz_cpp is True and on.enable_viz_cpp is True
-    pub = start_cpp_viz(on)
+    on_buf = io.StringIO()
+    with redirect_stdout(on_buf), redirect_stderr(on_buf):
+        pub = start_cpp_viz(on)
     assert pub is not None and pub.addr == ("127.0.0.1", 47999)
+    assert "viz-cpp: disabled" not in on_buf.getvalue(), on_buf.getvalue()
     pub.close()
 
     # Enable flag alone does not open it.

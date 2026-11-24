@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT))
 from python.collect.spawn_mix import (  # noqa: E402
     SPEED,
     SpawnDeck,
+    queue_companion_traffic,
     traffic_count,
     traffic_lua,
 )
@@ -50,8 +51,38 @@ def check_mix_and_traffic() -> None:
     )
 
 
+
+
+def check_empty_slots_still_delete_traffic() -> None:
+    """A respawn that finds no new slots must still delete leftover gvd_traffic_* cars.
+
+    The 30 min bughunt left companion cars at the previous spawn (km away)
+    because the collector called traffic_lua(pick, len(slots), slots) and
+    skipped the Lua entirely when slots was empty.
+    """
+    deck = SpawnDeck.load(FIXTURE)
+    picked = deck.take()
+    assert picked is not None
+    none = traffic_lua(picked, 0, [])
+    assert none, "count=0 must still emit the delete script"
+    script0 = " ".join(none)
+    assert "gvd_traffic" in script0 and "v:delete()" in script0
+    assert "spawnNewVehicle" not in script0
+    script2 = " ".join(traffic_lua(picked, 2, []))
+    assert "v:delete()" in script2 and "spawnNewVehicle" not in script2
+    sent: list[str] = []
+    n = queue_companion_traffic(sent.append, picked, 2, [])
+    assert n == 1 and sent and "v:delete()" in sent[0]
+    assert "spawnNewVehicle" not in sent[0]
+    placed: list[str] = []
+    n = queue_companion_traffic(placed.append, picked, 2, None)
+    assert n == 1 and "spawnNewVehicle" in placed[0] and "gvd_traffic_0" in placed[0]
+    assert queue_companion_traffic(None, picked, 2, []) == 0
+    print("empty traffic slots still delete leftover cars")
+
 def main() -> None:
     check_mix_and_traffic()
+    check_empty_slots_still_delete_traffic()
     print("spawn mix ok")
 
 

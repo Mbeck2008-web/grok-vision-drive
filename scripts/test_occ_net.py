@@ -637,6 +637,193 @@ def check_capped_hot_grade_and_onelayer() -> None:
 
 
 
+
+def check_capped_hot_p_margin_and_robust_env() -> None:
+    """p-margin ground-at-envelope and a robust 12 m envelope (Skeptic pr237v7).
+
+    has_env_layer must not require an exact p match: a one-layer car at
+    p 0.901-0.949 on a road at 0.90 must stay in the above-ground pool
+    (6cdfb8d put the band on 640/640 car columns at 0.8 m and 160/160
+    at 1.6 m). Existing f=2 / f=4 floors plus the cold-ground wall must
+    still hold with p noise at sigma 0.01 and 0.02 (6cdfb8d cold-ground
+    wall 124 and 1; v6 held 1022 at sigma 0.01). The 12 m envelope must
+    not follow one low outlier seed (6cdfb8d: 1004/5120 columns at
+    level 0 on the sigma 0.01 two-fill scene) or jump a layer when
+    sparse cars are more than BAND_MARGIN hotter than the road
+    (6cdfb8d: 4480/4480 road columns at 0.8 m, 1120/1120 at 1.6 m).
+    """
+    def car_scene(cell, nx, ny, proad, pcar, every):
+        ix, iy = [a.ravel() for a in np.meshgrid(np.arange(nx), np.arange(ny), indexing="ij")]
+        ground_lvl = 4
+        car = (ix % every == 0)
+        col = np.concatenate([ix * 1000 + iy, (ix * 1000 + iy)[car]])
+        lvl = np.concatenate([np.full(ix.size, ground_lvl), np.full(int(car.sum()), ground_lvl + 1)])
+        p = np.concatenate([np.full(ix.size, proad), np.full(int(car.sum()), pcar)]).astype(np.float32)
+        xy = (np.concatenate([ix, ix[car]]), np.concatenate([iy, iy[car]]))
+        band = _column_ground_lvl(col, lvl, p, xy[0], xy[1], cell)
+        u = np.unique(col)
+        r = band[u]
+        n_car = int(car.sum())
+        n_road = int((~car).sum())
+        at_car = int((r[car] == ground_lvl + 1).sum())
+        road_wrong = int((r[~car] != ground_lvl).sum())
+        return at_car, n_car, road_wrong, n_road
+
+    # --- Major 1: cars slightly hotter than the road must not take the band ---
+    for cell, nx, ny, n_car_exp, n_road_exp in ((0.8, 64, 80, 640, 4480), (1.6, 32, 40, 160, 1120)):
+        for d in (0.001, 0.010, 0.030, 0.049):
+            at_car, n_car, road_wrong, n_road = car_scene(cell, nx, ny, 0.90, 0.90 + d, 9)
+            assert n_car == n_car_exp and n_road == n_road_exp, (cell, d, n_car, n_road)
+            assert at_car == 0, (
+                f"car p={0.90+d:.3f} took the band at {cell} m",
+                at_car, n_car, road_wrong, n_road,
+            )
+            assert road_wrong == 0, (cell, d, road_wrong, n_road)
+            print(f"p-margin car {cell} m road 0.90 car {0.90+d:.3f}: "
+                  f"band@car {at_car}/{n_car}, road wrong {road_wrong}/{n_road} OK")
+
+    # --- Major 2: sparse cars hotter than the road by more than 0.05 ---
+    for cell, nx, ny, n_car_exp, n_road_exp in ((0.8, 64, 80, 640, 4480), (1.6, 32, 40, 160, 1120)):
+        for pcar in (0.95, 0.96):
+            at_car, n_car, road_wrong, n_road = car_scene(cell, nx, ny, 0.90, pcar, 9)
+            assert n_car == n_car_exp and n_road == n_road_exp, (cell, pcar, n_car, n_road)
+            assert road_wrong == 0, (
+                f"hot cars p={pcar} moved the road band at {cell} m",
+                road_wrong, n_road, at_car, n_car,
+            )
+            assert at_car == 0, (
+                f"hot cars p={pcar} took the band at {cell} m",
+                at_car, n_car,
+            )
+            print(f"robust-env hot car {cell} m road 0.90 car {pcar:.2f}: "
+                  f"band@car {at_car}/{n_car}, road wrong {road_wrong}/{n_road} OK")
+
+    # --- Major 2: one low outlier must not drag ~1000 columns (cold_dbg 1004/5120) ---
+    f, cm = 2, G.voxel_m * 2
+    xs = G.x_min + cm * (np.arange(int(51.2 / cm)) + 0.5)
+    ys = G.y_min + cm * (np.arange(int(64 / cm)) + 0.5)
+    X, Y = [a.ravel() for a in np.meshgrid(xs, ys, indexing="ij")]
+    zc = lambda z: G.z_min + cm * (np.floor((z - G.z_min) / cm) + 0.5)
+    ALL = np.ones_like(X, bool)
+    bld = (np.abs(X) > 8) & (np.abs(X) < 14) & (Y > 0) & (Y < 45)
+
+    def layers_two_fill():
+        def L(z, m):
+            return np.stack([X[m], Y[m], np.full(int(m.sum()), zc(z))], 1)
+        parts = [(L(0.2 - cm, ALL), 0.9), (L(0.2 - 2 * cm, ALL), 0.9)]
+        parts += [(L(0.2 + k * cm, bld), 0.7) for k in (1, 2, 3)]
+        hot = np.concatenate([p[0] for p in parts])
+        return hot, parts
+
+    hot, parts = layers_two_fill()
+    rng = np.random.default_rng(1)
+    ph = np.clip(
+        np.concatenate([np.full(len(p[0]), p[1]) for p in parts])
+        + rng.normal(0, 0.01, len(hot)),
+        0, 1,
+    ).astype(np.float32)
+    lvl = np.floor((hot[:, 2] - G.z_min) / cm + 1e-6).astype(np.int64)
+    ix = np.floor(hot[:, 0] / cm + 1e-6).astype(np.int64)
+    iy = np.floor(hot[:, 1] / cm + 1e-6).astype(np.int64)
+    ix0, iy0 = ix - int(ix.min()), iy - int(iy.min())
+    col = ix0 * (int(iy0.max()) + 1) + iy0
+    gl = _column_ground_lvl(col, lvl, ph, ix0, iy0, cm)[col]
+    # first fill layer is one cell per column (5120 columns)
+    t = gl[: X.size]
+    n0 = int((t == 0).sum())
+    assert t.size == 5120, t.size
+    assert n0 == 0, ("low outlier dragged columns to level 0", n0, t.size)
+    print(f"robust-env two-fill sigma 0.01: {n0}/{t.size} columns at level 0 OK")
+
+    # --- Major 1: p noise on the f=2 / f=4 floors; cold-ground wall near v6 ---
+    def run_parts(name, parts, cap, cm, min_counts, max_below=0, sig=0.0, seed=1):
+        rng = np.random.default_rng(seed)
+        hot = np.concatenate([p[0] for p in parts])
+        ph = np.concatenate([np.full(len(p[0]), p[1]) for p in parts]).astype(np.float64)
+        if sig > 0:
+            ph = np.clip(ph + rng.normal(0, sig, len(ph)), 0, 1)
+        ph = ph.astype(np.float32)
+        lab = np.concatenate([np.full(len(p[0]), p[2]) for p in parts])
+        keep = (hot[:, 2] >= G.z_min) & (hot[:, 2] < G.z_max)
+        hot, ph, lab = hot[keep], ph[keep], lab[keep]
+        idx = _capped_hot(hot, ph, cap, G.z_min, cm)
+        kept = {str(k): int(v) for k, v in zip(*np.unique(lab[idx], return_counts=True))}
+        for k, nmin in min_counts.items():
+            assert int(kept.get(k, 0)) >= nmin, (name, k, kept, nmin)
+        n_bel = int(kept.get("below", 0))
+        assert n_bel <= max_below, (name, n_bel, max_below, kept)
+        print(f"capped_hot {name}: {kept} OK")
+        return kept
+
+    def grid_xy(cm):
+        xs = G.x_min + cm * (np.arange(int(51.2 / cm)) + 0.5)
+        ys = G.y_min + cm * (np.arange(int(64 / cm)) + 0.5)
+        return [a.ravel() for a in np.meshgrid(xs, ys, indexing="ij")]
+
+    def zc_cm(z, cm):
+        return G.z_min + cm * (np.floor((z - G.z_min) / cm) + 0.5)
+
+    def lay(X, Y, zfun, m, cm):
+        z = zfun(X[m], Y[m])
+        return np.stack([X[m], Y[m], zc_cm(z, cm)], 1)
+
+    # Cars/rails keep the noise-free floors even with p noise. Uphill
+    # kink counts move under noise (pinned to the measured values at
+    # seed 1; the noise-free floors above are unchanged). Cold-ground
+    # wall must stay at the cap share (1024 / 256), near v6's 1022,
+    # not 6cdfb8d's 124 / 1.
+    for f, cap, want in (
+        (2, 2048, {"car": 150, "rail": 64, "cold_wall": 1024,
+                    0.01: {"up10_wall": 397, "up15_wall": 615, "up10_below": 208, "up15_below": 159},
+                    0.02: {"up10_wall": 471, "up15_wall": 619, "up10_below": 214, "up15_below": 172}}),
+        (4, 512, {"car": 40, "rail": 32, "cold_wall": 256,
+                   0.01: {"up10_wall": 94, "up15_wall": 73, "up10_below": 44, "up15_below": 85},
+                   0.02: {"up10_wall": 106, "up15_wall": 97, "up10_below": 41, "up15_below": 66}}),
+    ):
+        cm = G.voxel_m * f
+        X, Y = grid_xy(cm)
+        ALL = np.ones_like(X, bool)
+        road = np.abs(X) < 4
+        bld = (np.abs(X) > 8) & (np.abs(X) < 14) & (Y > 0) & (Y < 45)
+        rail = np.abs(np.abs(X) - 5) < cm * 0.6
+        cars = road & (np.floor(Y / 6) % 2 == 0) & (Y > 5)
+        flat = lambda x, y: np.full(x.shape, 0.2)
+        for sig in (0.01, 0.02):
+            tag = f"f={f} sig={sig}"
+            run_parts(
+                f"{tag} 1-layer cars 1.0",
+                [(lay(X, Y, flat, ALL, cm), 1.0, "ground")]
+                + [(lay(X, Y, lambda x, y, k=k: 0.2 + k * cm + 0 * x, bld, cm), 1.0, "wall") for k in (1, 2, 3)]
+                + [(lay(X, Y, lambda x, y: 0.2 + cm + 0 * x, cars, cm), 1.0, "car")],
+                cap, cm, {"car": want["car"]}, sig=sig,
+            )
+            run_parts(
+                f"{tag} 1-layer guardrails 1.0",
+                [(lay(X, Y, flat, ALL, cm), 1.0, "ground"),
+                 (lay(X, Y, lambda x, y: 0.2 - cm + 0 * x, ALL, cm), 1.0, "below")]
+                + [(lay(X, Y, lambda x, y, k=k: 0.2 + k * cm + 0 * x, bld, cm), 1.0, "wall") for k in (1, 2, 3)]
+                + [(lay(X, Y, lambda x, y: 0.2 + cm + 0 * x, rail, cm), 1.0, "rail")],
+                cap, cm, {"rail": want["rail"]}, sig=sig,
+            )
+            uw = want[sig]
+            for g, wkey, bkey in ((0.10, "up10_wall", "up10_below"), (0.15, "up15_wall", "up15_below")):
+                gz = lambda x, y, g=g: 0.2 + g * np.maximum(y, 0)
+                run_parts(
+                    f"{tag} uphill {g * 100:+.0f}%",
+                    [(lay(X, Y, gz, ALL, cm), 0.95, "ground"),
+                     (lay(X, Y, lambda x, y, g=g: gz(x, y) - cm, ALL, cm), 0.9, "below")]
+                    + [(lay(X, Y, lambda x, y, k=k, g=g: gz(x, y) + k * cm, bld, cm), 0.95, "wall") for k in (1, 2, 3)],
+                    cap, cm, {"wall": uw[wkey]}, max_below=uw[bkey], sig=sig,
+                )
+            # cold-ground wall must stay near the v6 level (~1022 of 1024 at f=2)
+            run_parts(
+                f"{tag} cold ground wall",
+                [(lay(X, Y, lambda x, y: 0.2 - cm + 0 * x, ALL, cm), 0.9, "below"),
+                 (lay(X, Y, lambda x, y: 0.2 - 2 * cm + 0 * x, ALL, cm), 0.9, "below")]
+                + [(lay(X, Y, lambda x, y, k=k: 0.2 + k * cm + 0 * x, bld, cm), 0.7, "wall") for k in (1, 2, 3)],
+                cap, cm, {"wall": want["cold_wall"]}, max_below=cap, sig=sig,
+            )
+
 def check_class_balance() -> None:
     """_class_balance splits evenly across classes; a 99:1 pool must not stay 99:1."""
     rng = np.random.default_rng(0)
@@ -702,6 +889,7 @@ def main() -> int:
     check_capped_hot_surface_fill()
     check_capped_hot_structure_surface()
     check_capped_hot_grade_and_onelayer()
+    check_capped_hot_p_margin_and_robust_env()
     check_class_balance()
     check_unoccupied_not_occluded_structure()
     check_queries()

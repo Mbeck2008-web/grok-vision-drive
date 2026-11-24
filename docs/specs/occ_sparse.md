@@ -478,12 +478,20 @@ Later-stage `predict` caps (`_capped_hot`, at production `LEVELS` (4, 2):
 cell 1.6 m and 0.8 m): the ground band is chosen from the bottom of each
 xy column, not the top. The seed is the highest near-max layer (within a
 small margin of the column max) in a three-layer window starting at the
-lowest near-max layer — the surface of a fill+ground stack. Strong-p
-seeds vote on a 12 m lower envelope; inliers up to a 15% grade over that
-radius fit a local ground plane, which is the band. Far ground on a hill
-stays the band. A one-layer car or guardrail that sits on real ground,
+lowest near-max layer — the surface of a fill+ground stack. Seeds with p at least an absolute
+threshold vote on a robust 12 m lower envelope (a 5x5 median of tile
+seeds, then the min of seeds not a full layer below that median — not
+a raw window min, and not relative to the 12 m p max). Inliers up to a
+15% grade over that radius fit a local ground plane, which is the band.
+Far ground on a hill stays the band. A one-layer car or guardrail that
+sits on real ground — including when its p is slightly above the road —
 and a wall or roof (or a building with no ground under it), stay in the
-above-ground pool. A below-ground fill that ties or is slightly hotter
+above-ground pool. A column has real ground at the envelope when a cell
+there is within a p margin just under the near-max margin, so a 0.05-weaker
+below-ground fill is not treated as the band when the envelope lags a
+grade. ``test_occ_net`` also pins p-noise at sigma 0.01 / 0.02 on the
+f=2 / f=4 floors (cold-ground wall stays at the cap share) and the
+hot-car / low-outlier fixtures. A below-ground fill that ties or is slightly hotter
 does not win. Limit: where flat road turns into a +10% / +15% uphill inside
 the 12 m window, the plane fit lags the kink and some below-ground fill
 still reaches the cap (0.8 m: walls 924 / 662, below 128 / 140 of 2048;

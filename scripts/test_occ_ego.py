@@ -25,8 +25,14 @@ sys.path.insert(0, str(ROOT))
 
 import numpy as np  # noqa: E402
 
-from python.perception.occ_ego import EgoMotion, VO_MIN_SCORE, _static_bev, _warp, occ_odometry  # noqa: E402
-from python.perception.occ_geometry import DEFAULT_GRID  # noqa: E402
+from python.perception.occ_ego import (  # noqa: E402
+    EgoMotion, VO_MIN_CELLS, VO_MIN_SCORE, _static_bev, _warp, occ_odometry,
+)
+from python.perception.occ_geometry import DEFAULT_GRID, PinholeCam  # noqa: E402
+try:
+    from python.perception.occ_geometry import observed_mask  # noqa: E402
+except ImportError:
+    from python.perception.occ_out import observed_mask  # noqa: E402
 from python.perception.occ_outputs import OccTracker, objects  # noqa: E402
 
 G = DEFAULT_GRID
@@ -401,6 +407,165 @@ def check_featureless() -> None:
     print("featureless frame: estimate held, ok=False OK")
 
 
+
+def _xy_keys(xy, z=1.0):
+    pts = np.column_stack([np.asarray(xy, np.float64), np.full(len(xy), z)])
+    k = G.keys_of(pts)
+    ok = k >= 0
+    k, idx = np.unique(k[ok], return_index=True)
+    return k, np.zeros(k.size, np.uint8)
+
+
+def _fwd_cam() -> PinholeCam:
+    return PinholeCam(
+        "main", (0.0, 1.20, 1.26),
+        (1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, 1.0, 0.0),
+        640, 400, 50.0, 0.3, 80.0,
+    )
+
+
+def check_vo_score_gate() -> None:
+    """Pin VO_MIN_SCORE from both sides (kills H1 0.43 and H2 0.3).
+
+    A true-motion tick whose best overlap is in [0.40, 0.43) must be
+    ok; a wrong or ambiguous tick in [0.3, 0.4) must hold.
+    """
+    # 100 unique static cells in a 10x10 grid ahead of the ego.
+    xs, ys = np.meshgrid(np.linspace(-8, 8, 10), np.linspace(8, 24, 10), indexing="ij")
+    base = np.column_stack([xs.ravel(), ys.ravel()])
+    assert len(base) == 100
+    k0, c0 = _xy_keys(base)
+
+    def run(n_hit: int) -> tuple[object, float]:
+        hit = base[:n_hit]
+        miss = base[n_hit:] + np.array([0.0, 25.0])  # far ahead, unique match
+        k1, c1 = _xy_keys(np.concatenate([hit, miss]))
+        em = EgoMotion()
+        em.update(k0, c0, 0.0)
+        est = em.update(k1, c1, 0.1)
+        _fwd, _yw, sc = occ_odometry(k0, c0, k1, c1, grid=G)
+        return est, sc
+
+    est_hi, sc_hi = run(40)
+    assert 0.40 <= sc_hi < 0.43, sc_hi
+    assert est_hi.ok, (est_hi, sc_hi, "score in [0.40, 0.43) must be ok (H1)")
+    est_lo, sc_lo = run(35)
+    assert 0.30 <= sc_lo < 0.40, sc_lo
+    assert not est_lo.ok, (est_lo, sc_lo, "score in [0.3, 0.4) must hold (H2)")
+    print(f"VO score gate: true-motion {sc_hi:.3f} ok={est_hi.ok}; "
+          f"ambiguous {sc_lo:.3f} ok={est_lo.ok} OK")
+
+
+def check_vo_min_cells_visible() -> None:
+    """A visible region of 1-11 cells must hold, even if they all match (D4)."""
+    cam = _fwd_cam()
+    # 8 posts in the front frustum, 80 more behind the camera (out of view).
+    front = np.column_stack([np.linspace(-2, 2, 8), np.full(8, 12.0)])
+    rear = np.column_stack([np.linspace(-10, 10, 80), np.full(80, -6.0)])
+    xy = np.concatenate([front, rear])
+    k, c = _xy_keys(xy, z=1.0)
+    # Occupied cells at z=1.0 also act as occluders (none in front of the 8).
+    em = EgoMotion()
+    em.update(k, c, 0.0, cams=[cam], occl=k)
+    est = em.update(k, c, 0.1, cams=[cam], occl=k)
+    _fwd, _yw, sc = occ_odometry(k, c, k, c, grid=G, cams=[cam], occl=k)
+    assert sc == 0.0 and not est.ok, (sc, est, "1-11 visible cells must hold (D4)")
+    # And the un-gated overlap on those 8 cells would have been perfect.
+    from python.perception.occ_ego import _score, _bev_keys, _static_bev
+    prev = _static_bev(k, c, G)
+    cur_k = np.unique(_bev_keys(prev, G))
+    cur_k = cur_k[cur_k >= 0]
+    ungated = _score(prev, cur_k, G, 0.0, 0.0)
+    assert ungated == 1.0, ungated
+    print(f"VO min-cells: 8 visible cells score={sc} ok={est.ok} "
+          f"(ungated overlap {ungated:.2f}) OK")
+
+
+def check_vo_visibility_z() -> None:
+    """Visibility height is 0.6 m, not the ground (kills D5 z=0.0)."""
+    cam = _fwd_cam()
+    # Posts behind a low wall: a ray to z=0.0 hits the wall, a ray to z=0.6
+    # goes over it. Enough posts that 0.6 is ok and 0.0 drops under 12 cells.
+    wall_xy = np.column_stack([np.linspace(-3, 3, 16), np.full(16, 18.0)])
+    wall = G.keys_of(np.column_stack([wall_xy, np.full(16, 0.2)]))
+    wall = np.unique(wall[wall >= 0])
+    posts_xy = np.column_stack([np.linspace(-2.5, 2.5, 20), np.full(20, 20.0)])
+    posts, pcls = _xy_keys(posts_xy, z=0.6)
+    # Also a handful of posts with a clear line of sight (no wall), not enough
+    # alone to pass VO_MIN_CELLS. The wall is occluder-only: it must not
+    # join the VO cell set, or those cells stay visible at z=0.0 too.
+    clear_xy = np.column_stack([np.linspace(8, 10, 5), np.full(5, 12.0)])
+    clear, ccls = _xy_keys(clear_xy, z=0.6)
+    k = np.unique(np.concatenate([posts, clear]))
+    c = np.zeros(k.size, np.uint8)
+    pts06 = np.column_stack([np.concatenate([posts_xy, clear_xy]),
+                             np.full(25, 0.6)])
+    pts00 = np.column_stack([np.concatenate([posts_xy, clear_xy]),
+                             np.full(25, 0.0)])
+    n06 = int(observed_mask(pts06, [cam], wall, G).sum())
+    n00 = int(observed_mask(pts00, [cam], wall, G).sum())
+    assert n06 >= VO_MIN_CELLS > n00, (n06, n00, VO_MIN_CELLS)
+    em = EgoMotion()
+    em.update(k, c, 0.0, cams=[cam], occl=wall)
+    est = em.update(k, c, 0.1, cams=[cam], occl=wall)
+    assert est.ok, (est, n06, n00, "default z=0.6 must see the posts over the wall (D5)")
+    print(f"VO vis z: observed at 0.6 m={n06}, at 0.0 m={n00}; default ok={est.ok} OK")
+
+
+def check_vo_observed_region_cost() -> None:
+    """The current observed region is computed once per tick, not per hypothesis."""
+    import time
+    import python.perception.occ_ego as ego_mod
+    import python.perception.occ_geometry as geom
+
+    posts, _car, _road = world()
+    # Two frames 1.5 m apart, with occluders = the static keys.
+    def cells(i):
+        p = pose(i)
+        e = to_ego(posts, p)
+        keys = []
+        for z in (0.2, 0.6, 1.0, 1.4, 1.8):
+            xyz = np.column_stack([e, np.full(len(e), z)])
+            ins = G.inside(xyz)
+            keys.append(G.keys_of(xyz[ins]))
+        k = np.concatenate(keys)
+        k = np.unique(k[k >= 0])
+        return k, np.zeros(k.size, np.uint8)
+
+    k0, c0 = cells(0)
+    k1, c1 = cells(1)
+    cam = _fwd_cam()
+    occl = k1
+
+    calls = {"n": 0}
+    orig = ego_mod._observed_bev_keys
+
+    def wrap(*a, **k):
+        calls["n"] += 1
+        return orig(*a, **k)
+
+    ego_mod._observed_bev_keys = wrap
+    try:
+        t0 = time.perf_counter()
+        occ_odometry(k0, c0, k1, c1, grid=G, cams=[cam], occl=occl)
+        ms_cams = (time.perf_counter() - t0) * 1e3
+    finally:
+        ego_mod._observed_bev_keys = orig
+    assert calls["n"] == 1, (calls["n"], "observed region must be built once per tick")
+    t0 = time.perf_counter()
+    times = []
+    for _ in range(3):
+        t1 = time.perf_counter()
+        occ_odometry(k0, c0, k1, c1, grid=G)
+        times.append((time.perf_counter() - t1) * 1e3)
+    ms_nocams = float(np.median(times))
+    # Generous wall-clock bound: the old per-hypothesis path was ~80x
+    # (~1.9 s vs ~24 ms). Stay within 15x of the no-cams path, and under 200 ms.
+    assert ms_cams <= max(200.0, 15.0 * ms_nocams), (ms_cams, ms_nocams)
+    print(f"VO cost: observed-region builds={calls['n']}, "
+          f"with cams {ms_cams:.0f} ms, no cams {ms_nocams:.0f} ms OK")
+
+
 def main() -> int:
     check_vo()
     check_vo_clutter()
@@ -410,6 +575,10 @@ def main() -> int:
     check_vo_slow_motion()
     check_world_fixed()
     check_featureless()
+    check_vo_score_gate()
+    check_vo_min_cells_visible()
+    check_vo_visibility_z()
+    check_vo_observed_region_cost()
     print("test_occ_ego: all OK")
     return 0
 

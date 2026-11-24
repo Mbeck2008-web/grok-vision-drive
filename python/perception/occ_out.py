@@ -49,7 +49,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from python.perception.occ_geometry import DEFAULT_GRID, OccGrid, PinholeCam, project
+from python.perception.occ_geometry import DEFAULT_GRID, OccGrid, PinholeCam, observed_mask, project
 
 OCC_OUT_VERSION = 2          # v2 = v1 + ``observed`` per cell and per polyline point
 OCC_OUT_VERSIONS = (1, 2)
@@ -518,39 +518,6 @@ def occluders(keys: np.ndarray, cls: np.ndarray, grid: OccGrid) -> np.ndarray:
     z = grid.cell_of_key(keys)[:, 2]
     m = (cls != DRIVABLE) & (z >= (g + 1 if g is not None else -1))
     return np.sort(keys[m])
-
-
-def observed_mask(pts: np.ndarray, cams: Sequence[PinholeCam], occl: np.ndarray, grid: OccGrid,
-                  chunk: int = 1024) -> np.ndarray:
-    """(N,) True where some camera in ``cams`` sees the point with no occluder cell
-    on the ray before it (the last voxel before the point is not tested).
-    Sparse: ray samples are looked up in the sorted occluder keys."""
-    pts = np.asarray(pts, np.float64).reshape(-1, 3)
-    obs = np.zeros(pts.shape[0], bool)
-    v = float(grid.voxel_m)
-    occl = np.asarray(occl, np.int64)
-    for cam in cams:
-        _, _, ok = project(cam, pts)
-        idx = np.flatnonzero(ok & ~obs)
-        if not idx.size:
-            continue
-        o = np.asarray(cam.pos, np.float64)
-        if not occl.size:
-            obs[idx] = True
-            continue
-        for c0 in range(0, idx.size, chunk):
-            ii = idx[c0:c0 + chunk]
-            vec = pts[ii] - o
-            dist = np.linalg.norm(vec, axis=1)
-            unit = vec / np.maximum(dist, 1e-9)[:, None]
-            ts = np.arange(0.0, float(dist.max()), v * 0.5)
-            m = ts[None, :] < (dist[:, None] - v)
-            samp = o + unit[:, None, :] * ts[None, :, None]
-            k = grid.keys_of(samp.reshape(-1, 3)).reshape(m.shape)
-            pos = np.clip(np.searchsorted(occl, k), 0, occl.size - 1)
-            hit = (occl[pos] == k) & (k >= 0) & m
-            obs[ii[~hit.any(axis=1)]] = True
-    return obs
 
 
 class OccMemory:

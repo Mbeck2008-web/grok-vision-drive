@@ -199,3 +199,70 @@ def backproject(
     if radial:
         d = d / np.linalg.norm(rays, axis=-1)
     return np.asarray(cam.pos, dtype=np.float64) + rays * d[:, None]
+
+
+def observed_mask(pts: np.ndarray, cams: Sequence[PinholeCam], occl: np.ndarray, grid: OccGrid,
+                  chunk: int = 1024) -> np.ndarray:
+    """(N,) True where some camera in ``cams`` sees the point with no occluder cell
+    on the ray before it (the last voxel before the point is not tested).
+
+    Same samples as a per-ray ``arange(0, dist, voxel/2)`` lookup in the
+    occluder set; implemented with a dense occupancy volume and blocked
+    steps so one tick is one pass, not a scan per sample.
+    """
+    pts = np.asarray(pts, np.float64).reshape(-1, 3)
+    obs = np.zeros(pts.shape[0], bool)
+    v = float(grid.voxel_m)
+    occl = np.asarray(occl, np.int64)
+    occl = occl[occl >= 0]
+    nx, ny, nz = grid.shape
+    occ3d = None
+    if occl.size:
+        c = grid.cell_of_key(occl)
+        inb = ((c[:, 0] >= 0) & (c[:, 0] < nx) & (c[:, 1] >= 0) & (c[:, 1] < ny) &
+               (c[:, 2] >= 0) & (c[:, 2] < nz))
+        if inb.any():
+            occ3d = np.zeros((nx, ny, nz), dtype=bool)
+            cc = c[inb]
+            occ3d[cc[:, 0], cc[:, 1], cc[:, 2]] = True
+    lo = np.array([grid.x_min, grid.y_min, grid.z_min], dtype=np.float64)
+    inv = 1.0 / v
+    _ = chunk  # kept for call-site compatibility
+    BS = 32
+    for cam in cams:
+        _, _, ok = project(cam, pts)
+        idx = np.flatnonzero(ok & ~obs)
+        if not idx.size:
+            continue
+        o = np.asarray(cam.pos, np.float64)
+        if occ3d is None:
+            obs[idx] = True
+            continue
+        vec = pts[idx] - o
+        dist = np.linalg.norm(vec, axis=1)
+        unit = vec / np.maximum(dist, 1e-9)[:, None]
+        span = dist - v
+        dmax = float(dist.max()) if dist.size else 0.0
+        ts_all = np.arange(0.0, dmax, v * 0.5) if dmax > 0 else np.zeros(0)
+        blocked = np.zeros(idx.size, bool)
+        ox, oy, oz = o
+        for k0 in range(0, ts_all.size, BS):
+            ts = ts_all[k0:k0 + BS]
+            active = (~blocked) & (span > ts[0])
+            if not active.any():
+                break
+            x = ox + unit[active, 0:1] * ts
+            y = oy + unit[active, 1:2] * ts
+            z = oz + unit[active, 2:3] * ts
+            t_ok = ts[None, :] < span[active, None]
+            ix = np.floor((x - lo[0]) * inv).astype(np.int64)
+            iy = np.floor((y - lo[1]) * inv).astype(np.int64)
+            iz = np.floor((z - lo[2]) * inv).astype(np.int64)
+            inb = ((ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny) & (iz >= 0) & (iz < nz) & t_ok)
+            hit = np.zeros(t_ok.shape, dtype=bool)
+            if inb.any():
+                hit[inb] = occ3d[ix[inb], iy[inb], iz[inb]]
+            blocked[active] |= hit.any(axis=1)
+        obs[idx[~blocked]] = True
+    return obs
+

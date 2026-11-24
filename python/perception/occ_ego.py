@@ -31,7 +31,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from python.perception.occ_geometry import DEFAULT_GRID, OccGrid, project
+from python.perception.occ_geometry import DEFAULT_GRID, OccGrid, observed_mask, project
 
 VEHICLE = 2
 DRIVABLE = 1
@@ -87,7 +87,61 @@ def _bev_keys(xy: np.ndarray, grid: OccGrid) -> np.ndarray:
     return np.where(ok, ix * ny + iy, -1)
 
 
-def _visible_xy(xy: np.ndarray, cams: Sequence[Any] | None, z: float = 0.6,
+def _observed_bev_keys(grid: OccGrid, cams: Sequence[Any], occl: np.ndarray | None,
+                       z: float = 0.6, prev_xy: np.ndarray | None = None) -> np.ndarray:
+    """Sorted BEV keys of the current observed region at height ``z``.
+
+    Built once per tick (live-camera frustum, and no occluder on the
+    ray when ``occl`` is given). Each VO hypothesis is then a sorted-key
+    lookup, the same cost as the hit test. When ``prev_xy`` is given,
+    only the BEV cells a search hypothesis can land on are tested
+    (coarse-search warps, dilated for the fine stage).
+    """
+    nx, ny, _ = grid.shape
+    v = float(grid.voxel_m)
+    if prev_xy is not None and len(prev_xy):
+        fs = np.arange(FWD_RANGE_M[0], FWD_RANGE_M[1] + 1e-9, 0.2)
+        ys = np.arange(YAW_RANGE[0], YAW_RANGE[1] + 1e-9, 0.01)
+        # Vectorized warps of every previous cell at every coarse (fwd, yaw).
+        c = np.cos(ys)[None, :, None]
+        s = np.sin(ys)[None, :, None]
+        x = prev_xy[None, None, :, 0]
+        y = prev_xy[None, None, :, 1] - fs[:, None, None]
+        warped = np.stack([c * x + s * y, -s * x + c * y], axis=-1).reshape(-1, 2)
+        k = np.unique(_bev_keys(warped, grid))
+        k = k[k >= 0]
+        # Fine stage is +-0.3 m / +-0.015 rad; dilate two cells.
+        if k.size:
+            iy_d, ix_d = np.meshgrid(np.arange(-2, 3), np.arange(-2, 3), indexing="xy")
+            ix = k // ny
+            iy = k % ny
+            ix = (ix[:, None] + ix_d.ravel()[None, :]).ravel()
+            iy = (iy[:, None] + iy_d.ravel()[None, :]).ravel()
+            ok = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)
+            k = np.unique((ix[ok] * ny + iy[ok]).astype(np.int64))
+        ix = k // ny
+        iy = k % ny
+        pts = np.column_stack([
+            grid.x_min + (ix + 0.5) * v,
+            grid.y_min + (iy + 0.5) * v,
+            np.full(k.size, z),
+        ])
+    else:
+        ix, iy = np.meshgrid(np.arange(nx), np.arange(ny), indexing="ij")
+        k = (ix.ravel() * ny + iy.ravel()).astype(np.int64)
+        pts = np.column_stack([
+            grid.x_min + (ix.ravel() + 0.5) * v,
+            grid.y_min + (iy.ravel() + 0.5) * v,
+            np.full(ix.size, z),
+        ])
+        ix, iy = ix.ravel(), iy.ravel()
+    occl_k = np.zeros(0, np.int64) if occl is None else np.asarray(occl, np.int64)
+    vis = observed_mask(pts, cams, occl_k, grid)
+    return np.sort(k[vis])
+
+
+
+def _visible_xy(xy: np.ndarray, cams: Sequence[Any] | None, z=0.6,
                 occl: np.ndarray | None = None, grid: OccGrid | None = None) -> np.ndarray:
     """Which BEV points the current live cameras can see (at height ``z``).
 
@@ -103,18 +157,17 @@ def _visible_xy(xy: np.ndarray, cams: Sequence[Any] | None, z: float = 0.6,
             _, _, ok = project(cam, pts)
             vis |= ok
         return vis
-    from python.perception.occ_out import observed_mask
     return observed_mask(pts, cams, occl, grid)
 
 
 def _score(prev: np.ndarray, cur_keys: np.ndarray, grid: OccGrid, fwd: float, dyaw: float,
-           cams: Sequence[Any] | None = None, occl: np.ndarray | None = None) -> float:
+           obs_keys: np.ndarray | None = None) -> float:
     """Share of warped previous cells that hit a current cell. Sparse: sorted key lookup, no raster.
 
-    When ``cams`` is set, the denominator is only the previous cells that
+    When ``obs_keys`` is set, the denominator is only the previous cells that
     fall in the current observed region after the warp (live cameras, and
-    this tick's occluders when ``occl`` is given), so a side/rear camera
-    going stale does not collapse the score.
+    this tick's occluders when they were used to build ``obs_keys``), so a
+    side/rear camera going stale does not collapse the score.
     """
     if len(prev) == 0 or len(cur_keys) == 0:
         return 0.0
@@ -122,8 +175,11 @@ def _score(prev: np.ndarray, cur_keys: np.ndarray, grid: OccGrid, fwd: float, dy
     k = _bev_keys(warped, grid)
     pos = np.clip(np.searchsorted(cur_keys, k), 0, len(cur_keys) - 1)
     hits = (cur_keys[pos] == k) & (k >= 0)
-    if cams:
-        vis = _visible_xy(warped, cams, occl=occl, grid=grid)
+    if obs_keys is not None:
+        if len(obs_keys) == 0:
+            return 0.0
+        p = np.clip(np.searchsorted(obs_keys, k), 0, len(obs_keys) - 1)
+        vis = (obs_keys[p] == k) & (k >= 0)
         n = int(vis.sum())
         if n < VO_MIN_CELLS:
             return 0.0
@@ -136,6 +192,7 @@ def _register(prev: np.ndarray, cur_keys: np.ndarray, grid: OccGrid,
     """Coarse-to-fine search: (forward m, yaw rad, overlap score)."""
     if len(prev) < VO_MIN_CELLS or len(cur_keys) == 0:
         return 0.0, 0.0, 0.0
+    obs_keys = _observed_bev_keys(grid, cams, occl, prev_xy=prev) if cams else None
     best = (-1.0, 0.0, 0.0)
     for step_f, step_y, span_f, span_y in ((0.2, 0.01, None, None), (0.05, 0.0025, 0.3, 0.015)):
         if span_f is None:
@@ -146,7 +203,7 @@ def _register(prev: np.ndarray, cur_keys: np.ndarray, grid: OccGrid,
             ys = best[2] + np.arange(-span_y, span_y + 1e-9, step_y)
         for f in fs:
             for yw in ys:
-                sc = _score(prev, cur_keys, grid, float(f), float(yw), cams=cams, occl=occl)
+                sc = _score(prev, cur_keys, grid, float(f), float(yw), obs_keys=obs_keys)
                 if sc > best[0] + 1e-9:
                     best = (sc, float(f), float(yw))
     return best[1], best[2], best[0]

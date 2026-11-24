@@ -399,6 +399,13 @@ def start_cpp_viz(args: argparse.Namespace) -> Any:
         return None
 
 
+from python.perception.lane_select import (  # noqa: E402  (--learned-lanes wiring)
+    build_lane_selector,
+    lane_strip_for,
+    log_lane_head_change,
+)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """CLI for ``python.run_vision``. Default ``--no-conf-gate`` is off."""
     ap = argparse.ArgumentParser(description="GVD supervisor + M2/M3/M4/M5")
@@ -513,6 +520,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="hough keeps the pixel lane finder. scene reads lane_x from models/e2e_scene.onnx "
         "and stops when that confidence is low. gt feeds the road-network center at 8 m "
         "as lane_x (GVD_LANE_SOURCE=gt). A missing road hit stops.",
+    )
+    ap.add_argument(
+        "--learned-lanes",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="With --lane-source hough: feed the planner the SceneNet lane head (lanes/lane_valid, "
+        "painted lanes only; curbs kept apart) and use Hough only as a reported fallback "
+        "(missing/refused model, low confidence, non-finite output). A paint gate vetoes lines "
+        "on frames with no painted stripe. Default OFF (env GVD_LEARNED_LANES=1): no trained "
+        "lane weights or held-out eval vs Hough exist yet (scripts/eval_learned_lanes.py).",
     )
     ap.add_argument(
         "--scene-onnx",
@@ -828,6 +845,7 @@ def main(clock=None) -> None:
 
     exit_if_tech_connect_failed(backend, backend_name)
     perc = ModularPerception(allow_synthetic=args.allow_synthetic_detect, clock=clock)
+    perc.lane_selector = build_lane_selector(args)
     e2e_policy = make_e2e()
     ui = VizUI()
     ui.record_browser = _ask_strip_folder
@@ -1013,6 +1031,7 @@ def main(clock=None) -> None:
         # poll_vehicle handing back last-good (coalesced) ego: counted every tick;
         # engaged past one tick it takes the existing heartbeat_stale stop.
         stale_ego = StaleEgo()
+        lane_head_seen = None
         prev_main_frame = None
         would_skip_control = False
         compose_ms = 0.0
@@ -1283,8 +1302,10 @@ def main(clock=None) -> None:
                 steer_deg=steer,
                 yaw_rate=yaw_rate,
                 dt_s=tick_dt,
+                lane_strip=lane_strip_for(perc, bundle),
             )
             pout = apply_to_perception(ui.debug, pout)
+            lane_head_seen = log_lane_head_change(lane_head_seen, getattr(pout, "lane_head", None))
 
             if ui.debug.force_engage and not prev_force:
                 print("[GVD] DEBUG force engage ON (sim toy; not Alt+G)", flush=True)
@@ -1366,6 +1387,7 @@ def main(clock=None) -> None:
                     steer_deg=steer,
                     yaw_rate=yaw_rate,
                     dt_s=tick_dt,
+                    lane_strip=lane_strip_for(perc, bundle),
                 )
                 pout = apply_to_perception(ui.debug, pout)
             disengage_reason = "none" if ident.matched else "bus_mismatch"
@@ -1962,6 +1984,7 @@ def main(clock=None) -> None:
                 "why": lane_steer.reason,
                 "source": getattr(pout, "lane_source", "none"),
             }
+            st["lane_head"] = dict(getattr(pout, "lane_head", None) or {})
             st["ego_source"] = ego_source
             st["cmd_ack_seq"] = int(ego_fb.applied_seq) if ego_fb is not None else -1
             st["lua_applying"] = bool(ego_fb.applying and ego_fb.fresh) if ego_fb is not None else False

@@ -161,26 +161,52 @@ class CameraSchedule:
             self._undo.pop(cid, None)
 
 
-def capture_plan(cfg: Mapping[str, Any] | None, ratio: float = PNG_RATIO_MAX) -> list[dict[str, Any]]:
-    """Per-camera bytes and GB/h at ``CAMERA_HZ`` and a PNG/raw ratio."""
+def capture_plan(
+    cfg: Mapping[str, Any] | None, ratio: float = PNG_RATIO_MAX, *, gt: bool = False
+) -> list[dict[str, Any]]:
+    """Per-plane bytes and GB/h: colour at ``CAMERA_HZ`` and a PNG/raw ratio.
+
+    ``gt=False`` is the colour-only plan (the 8 RGB cameras). With ``gt=True``
+    (what the collector reports as its disk ceiling) every ``train_gt`` camera
+    also writes a ``<cam>_depth`` (uint16) and a
+    ``<cam>_sem`` (uint8) plane at its colour rate. Their PNG ratio is not
+    measured, so they count at raw size (``png_ratio`` 1.0) as the ceiling.
+    An enabled ``chase_camera`` (``--chase-cam``) adds its colour and GT
+    planes at ``chase_hz``. The GT gate can only thin GT below this.
+    """
+    cfg = dict(cfg or {})
+    chase_spec = cfg.get("chase_camera")
+    chase_on = isinstance(chase_spec, dict) and bool(chase_spec.get("enabled"))
     rows = []
-    for cam in camera_sidecar(cfg):
-        cid = str(cam["id"])
-        width, height = cam["resolution"]
-        raw = int(width) * int(height) * 3
-        hz = float(CAMERA_HZ.get(cid, 0.0))
+
+    def _row(cid: str, width: int, height: int, channels: int, bytes_per: int, hz: float, png_ratio: float) -> None:
+        raw = int(width) * int(height) * int(channels) * int(bytes_per)
         rows.append(
             {
                 "id": cid,
                 "width": int(width),
                 "height": int(height),
-                "channels": 3,
+                "channels": int(channels),
+                "bytes_per_channel": int(bytes_per),
                 "hz": hz,
+                "png_ratio": float(png_ratio),
                 "uncompressed_bytes": raw,
                 "uncompressed_gb_per_hour": gb_per_hour(raw, hz),
-                "png_gb_per_hour": gb_per_hour(raw, hz) * float(ratio),
+                "png_gb_per_hour": gb_per_hour(raw, hz) * float(png_ratio),
             }
         )
+
+    for cam in camera_sidecar(cfg, chase=gt and chase_on):
+        cid = str(cam["id"])
+        width, height = cam["resolution"]
+        if cam.get("recording_only"):
+            hz = float((chase_spec or {}).get("chase_hz") or 2.0)
+        else:
+            hz = float(CAMERA_HZ.get(cid, 0.0))
+        _row(cid, width, height, 3, 1, hz, float(ratio))
+        if gt and cam.get("train_gt"):
+            _row(f"{cid}_depth", width, height, 1, 2, hz, 1.0)
+            _row(f"{cid}_sem", width, height, 1, 1, hz, 1.0)
     return rows
 
 
@@ -694,6 +720,17 @@ class TrainGtGate:
         self.ema_s: float | None = None
         self.stride = 1
         self._seen: dict[str, int] = {}
+
+    def reset(self) -> None:
+        """Forget the tick history (respawn, level load, camera warm-up).
+
+        The interval across a load or teleport is not loop lag. Without a
+        reset that one long ``dt`` lifts the EMA over ``behind_ratio`` and GT
+        drops to every other frame for seconds after every spawn.
+        """
+        self.ema_s = None
+        self.stride = 1
+        self._seen.clear()
 
     def select(self, dt_s: float | None, bases: Any) -> set[str]:
         if dt_s is not None and float(dt_s) > 0.0:

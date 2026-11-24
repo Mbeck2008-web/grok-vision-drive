@@ -98,7 +98,8 @@ def check_collector_argv() -> None:
 
 def _fake_recording(out: Path, *, rows: int = 40, speed: float = 10.0, yaw_rate: float = 0.0,
                     jpg: bool = False, drop_depth: str | None = None, damage: float = 0.0,
-                    traffic_n: int = 2, luma: int = 120, spawn_type: str = "city") -> None:
+                    traffic_n: int = 2, luma: int = 120, spawn_type: str = "city",
+                    traffic_at=None, speed_at=None, impact_at=()) -> None:
     import cv2
 
     from python.data.raw_frames import RawFrameWriter, camera_sidecar
@@ -120,11 +121,19 @@ def _fake_recording(out: Path, *, rows: int = 40, speed: float = 10.0, yaw_rate:
                 stamps[f"{cid}_depth"] = stamps[cid]
                 stamps[f"{cid}_sem"] = stamps[cid]
         traffic = [{"name": f"gvd_traffic_{k}", "pos": [3.0 * k, 20.0, 0.0], "dir": [0, 1, 0]} for k in range(traffic_n)]
+        if traffic_at is not None:
+            traffic = traffic_at(i)
+        elif i % 5:
+            traffic = None
+        v = speed if speed_at is None else float(speed_at(i))
+        tags = {"traffic": traffic, "spawn_type": spawn_type, "veh": {"wheelspeed": v}}
+        if i in impact_at:
+            tags["impact"] = {"kind": "contact", "speed_mps": v}
         w.write(
             frames, t=1000.0 + i * 0.1, timestamps=stamps,
-            ego={"speed_mps": speed, "yaw_rate": yaw_rate, "pos": [0.0, i * 1.0, 0.0], "dir": [0, 1, 0], "damage": damage},
+            ego={"speed_mps": v, "yaw_rate": yaw_rate, "pos": [0.0, i * 1.0, 0.0], "dir": [0, 1, 0], "damage": damage},
             tech={"lane_gt_valid": [1.0, 1.0, 0.0]},
-            tags={"traffic": traffic if i % 5 == 0 else None, "spawn_type": spawn_type, "veh": {"wheelspeed": speed}},
+            tags=tags,
         )
     if jpg:
         cv2.imwrite(str(out / "raw" / "main" / "000" / "000999.jpg"), np.zeros((8, 8, 3), np.uint8))
@@ -161,6 +170,112 @@ def check_quality_check_marks_not_deletes() -> None:
         q = quality_check(d, p, exit_code=4)
         assert q["quality"] == "pretrain_only" and any("exit" in r for r in q["reasons"]), q
     print("quality check: bad clips are marked pretrain_only, never deleted")
+
+
+def check_quality_check_failed_clip_paths() -> None:
+    """Signal-killed exit, the 50% span floor, undecodable frames and impact each mark a clip."""
+    from python.collect.clip_mode import plan_clip, quality_check
+    from scripts.gvd_test_env import collect_root
+
+    p = plan_clip(0, seed=1, maps=MAPS, max_traffic=2, edge_cases=("rain",), min_s=4.0, max_s=4.0)
+    assert p.duration_s == 4.0
+
+    def reasons(d: Path, code: int = 0) -> list[str]:
+        q = quality_check(d, p, exit_code=code)
+        assert (q["quality"] == "pretrain_only") == bool(q["reasons"]), q
+        return q["reasons"]
+
+    with collect_root() as root:
+        d = root / "ok"
+        _fake_recording(d)
+        assert reasons(d) == []
+        # A collector killed by a signal exits negative (subprocess: -9, -15). Not clean.
+        for code in (-9, -15):
+            got = reasons(d, code)
+            assert got == [f"collector exit {code}"], got
+        # Span floor is half the planned length: 1.5 s of a 4 s clip fails, 2.0 s passes.
+        d = root / "span15"
+        _fake_recording(d, rows=16)
+        got = reasons(d)
+        assert got == ["recorded 1.5 s of a 4 s clip"], got
+        d = root / "span20"
+        _fake_recording(d, rows=21)
+        assert reasons(d) == [], reasons(d)
+        # A PNG that does not decode (first or last of a camera folder) marks the clip.
+        for sub in ("main", "rear_depth"):
+            d = root / f"bad_{sub}"
+            _fake_recording(d)
+            folder = sorted(p_ for p_ in (d / "raw" / sub).iterdir() if p_.is_dir())[-1]
+            (folder / "999999.png").write_bytes(b"not a png")
+            got = reasons(d)
+            assert len(got) == 1 and got[0].startswith("undecodable frames") and sub in got[0], got
+        # An impact row with zero damage still marks the clip.
+        d = root / "impact"
+        _fake_recording(d, impact_at={20})
+        got = reasons(d)
+        assert got == ["ego damaged or impact logged"], got
+    print("failed-clip QC: signal kill, half-span floor, undecodable frame, impact")
+
+
+def check_edge_case_false_positives() -> None:
+    """A False observation must not read as True: each case here is a plain clip."""
+    from python.collect.clip_mode import plan_clip, quality_check
+    from scripts.gvd_test_env import collect_root
+
+    def plan(case: str, traffic: int = 2):
+        return plan_clip(0, seed=1, maps=("west_coast_usa",), max_traffic=traffic, edge_cases=(case,), min_s=4.0, max_s=4.0)
+
+    def car(name: str, x: float, y: float) -> dict:
+        return {"name": name, "pos": [x, y, 0.0], "dir": [0, 1, 0]}
+
+    with collect_root() as root:
+        # cut_in: a lead car in the ego lane and a car that stays in the next lane.
+        d = root / "lead"
+        _fake_recording(d, traffic_at=lambda i: [car("gvd_traffic_0", 0.0, i + 20.0), car("gvd_traffic_1", 3.5, i + 12.0)])
+        q = quality_check(d, plan("cut_in"), exit_code=0)
+        assert q["edge_case_observed"] is False and q["quality"] == "pretrain_only", q
+        # A real cut-in: next lane, then into the ego lane 1.5 s later.
+        d = root / "cut"
+        _fake_recording(d, traffic_at=lambda i: [car("gvd_traffic_1", 3.5 if i < 15 else 0.3, i + 15.0)])
+        assert quality_check(d, plan("cut_in"), exit_code=0)["edge_case_observed"] is True
+        # A lead car on a 25 m-radius bend shows a 3 m offset at 20 m; when the road
+        # straightens it is back at 0. That is the road, not a cut-in.
+        d = root / "bend"
+        _fake_recording(d, yaw_rate=0.4, traffic_at=lambda i: [car("gvd_traffic_0", 3.0 if i < 10 else 0.0, i + 20.0)])
+        assert quality_check(d, plan("cut_in"), exit_code=0)["edge_case_observed"] is False
+        # Seen out once, then in the ego lane 10 s later: too old to be one manoeuvre.
+        d = root / "stale"
+        _fake_recording(d, rows=120, traffic_at=lambda i: (
+            [car("gvd_traffic_1", 3.5, i + 15.0)] if i == 0 else [car("gvd_traffic_1", 0.2, i + 15.0)] if i >= 100 else []
+        ))
+        assert quality_check(d, plan("cut_in"), exit_code=0)["edge_case_observed"] is False
+        # sharp_curve: a tight ratio at walking speed (3 m/s < 5 m/s) is not a sharp curve.
+        d = root / "slow_turn"
+        _fake_recording(d, speed=3.0, yaw_rate=0.4)
+        q = quality_check(d, plan("sharp_curve"), exit_code=0)
+        assert q["edge_case_observed"] is False, q
+        # heavy_traffic counts only our companions (gvd_traffic_*), not other cars.
+        d = root / "parked"
+        _fake_recording(d, traffic_at=lambda i: [car(f"gvd_traffic_{k}", 3.0 * k, 30.0) for k in range(2)]
+                        + [car(f"parked_{k}", -6.0, 10.0 * k) for k in range(6)])
+        q = quality_check(d, plan("heavy_traffic", 8), exit_code=0)
+        assert q["traffic_placed"] == 2 and q["edge_case_observed"] is False, q
+        # need = ceil(0.75 * 6) = 5: four placed of six is not heavy.
+        p6 = plan("heavy_traffic", 6)
+        assert p6.traffic == 6
+        d = root / "four_of_six"
+        _fake_recording(d, traffic_n=4)
+        q = quality_check(d, p6, exit_code=0)
+        assert q["traffic_placed"] == 4 and q["edge_case_observed"] is False, q
+        d = root / "five_of_six"
+        _fake_recording(d, traffic_n=5)
+        assert quality_check(d, p6, exit_code=0)["edge_case_observed"] is True
+        # Moving check is the median speed: 1.5 s at 10 m/s then parked is a parked clip.
+        d = root / "burst"
+        _fake_recording(d, speed_at=lambda i: 10.0 if i < 15 else 0.5)
+        q = quality_check(d, plan("rain"), exit_code=0)
+        assert q["median_speed_mps"] == 0.5 and any("median speed" in r for r in q["reasons"]), q
+    print("edge-case QC: lead car, bend, stale sighting, slow turn, parked cars, ceil share, median speed")
 
 
 def check_edge_case_observation() -> None:
@@ -215,6 +330,30 @@ def check_session_never_overwrites() -> None:
     print("sessions and clips always get a new folder")
 
 
+def check_tags_never_overwritten() -> None:
+    from python.collect.clip_mode import plan_clip, write_tags
+    from scripts.gvd_test_env import collect_root
+
+    p = plan_clip(0, seed=1, maps=MAPS, max_traffic=2)
+    with collect_root() as root:
+        clip = root / "clip"
+        clip.mkdir()
+        path = write_tags(clip, p, {"quality": "train", "reasons": []})
+        first = path.read_bytes()
+        try:
+            write_tags(clip, p, {"quality": "pretrain_only", "reasons": ["again"]})
+        except FileExistsError:
+            pass
+        else:
+            raise AssertionError("clip_tags.json was replaced")
+        assert path.read_bytes() == first
+        assert json.loads(first)["gfx"] == "vk"
+        other = root / "other"
+        other.mkdir()
+        assert json.loads(write_tags(other, p, {}, gfx="dx11").read_text(encoding="utf-8"))["gfx"] == "dx11"
+    print("clip_tags.json is created once and never replaced; gfx is recorded as requested")
+
+
 def check_run_clips_with_fake_collector() -> None:
     from python.collect.clip_mode import run_clips
     from scripts.gvd_test_env import collect_root
@@ -262,6 +401,8 @@ def check_cli() -> None:
     args = cli.parse_args(["--out", "/tmp/x", "--clips", "5", "--maps", "west_coast_usa,italy"])
     assert args.min_s == 30.0 and args.max_s == 60.0 and args.clips == 5
     assert args.maps == ("west_coast_usa", "italy")
+    assert args.gfx == "vk"  # Michael's rule: Vulkan unless asked otherwise
+    assert cli.parse_args(["--out", "/tmp/x", "--gfx", "dx11"]).gfx == "dx11"
     cmd = cli.collector_command(["--map", "italy"], python="py")
     assert cmd[0] == "py" and cmd[1].endswith("collect_scene_lanes.py") and cmd[2:] == ["--map", "italy"]
     print("collect_clips CLI: 30-60 s bounds, one collector process per clip")
@@ -272,8 +413,11 @@ def main() -> None:
     check_plans_are_seeded_and_bounded()
     check_collector_argv()
     check_quality_check_marks_not_deletes()
+    check_quality_check_failed_clip_paths()
     check_edge_case_observation()
+    check_edge_case_false_positives()
     check_session_never_overwrites()
+    check_tags_never_overwritten()
     check_run_clips_with_fake_collector()
     check_cli()
     print("test_clip_mode: OK")

@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 from python.collect.auto_mode import hour_to_beamng_tod
+from python.sensors.tech import TECH_GFX
 
 EDGE_CASES: tuple[str, ...] = (
     "sharp_curve",
@@ -54,7 +55,10 @@ DECK_ONLY = ("merge", "cut_in", "heavy_traffic")
 # clip's own quality check reads the semantic planes for dirt).
 DIRT_MAPS: tuple[str, ...] = ("utah", "jungle_rock_island", "italy", "east_coast_usa", "small_island")
 EGO_MODEL = "sbr"
-GFX = "vk"
+# Requested renderer, recorded in the tags and manifest (--gfx, default Vulkan).
+# The collector launches BeamNG.tech with -gfx TECH_GFX; an already-running
+# BeamNG keeps the renderer it was started with.
+GFX = TECH_GFX
 MIN_CLIP_S = 30.0
 MAX_CLIP_S = 60.0
 SPAWN_KIND = {"merge": "ramp", "cut_in": "highway", "heavy_traffic": "highway", "sharp_curve": "city", "junction": "city"}
@@ -71,6 +75,8 @@ DIRT_CLASSES = ("MUD", "SAND", "ROCK", "GRAVEL", "DIRT")
 CUT_IN_FROM_M = 2.5          # lateral offset before
 CUT_IN_TO_M = 1.0            # lateral offset after, ahead within CUT_IN_AHEAD_MAX_M
 CUT_IN_AHEAD_MAX_M = 30.0
+CUT_IN_WINDOW_S = 6.0        # the "out" sighting must be this recent when the car is in lane
+CUT_IN_BEND_MAX_M = 0.75     # road bend at the car's range (k * ahead^2 / 2) above this: row not read
 HEAVY_PLACED_SHARE = 0.75
 
 
@@ -218,7 +224,7 @@ def new_session_dir(root: Path | str, stamp: str | None = None) -> Path:
 
 
 def new_clip_dir(session: Path | str, plan: ClipPlan) -> Path:
-    """``clip_<NNN>_<edge>_<map>`` (``_b``, ``_c``... when taken). Always a new, empty folder."""
+    """``clip_<NNN>_<edge>_<map>`` (``_r1``, ``_r2``... when taken). Always a new, empty folder."""
     base = f"clip_{int(plan.index):03d}_{plan.edge_case}_{plan.map}"
     for n in range(0, 10000):
         cand = Path(session) / (base if n == 0 else f"{base}_r{n}")
@@ -322,7 +328,12 @@ def _observe(plan: ClipPlan, clip: Path, rows: list[dict[str, Any]], gt: list[di
             best = max(best, float(np.isin(low, ids).mean()))
         return best >= DIRT_MIN_SHARE, f"dirt_road: dirt share of the lower third {best:.2f} (need >= {DIRT_MIN_SHARE})"
     if case == "cut_in":
-        seen = {}
+        # A car seen >= CUT_IN_FROM_M out, then within CUT_IN_TO_M of the ego
+        # line, both ahead, within CUT_IN_WINDOW_S. A plain lead car is never
+        # "out". Rows where the road bends enough to fake that offset at the
+        # car's range (a lead car on a curve) are not read, and an old "out"
+        # sighting expires, so tailing a car long after it merged is not one.
+        seen: dict[str, tuple[float | None]] = {}
         for row in rows:
             ego = row.get("ego") or {}
             pos, d = ego.get("pos"), ego.get("dir")
@@ -330,6 +341,12 @@ def _observe(plan: ClipPlan, clip: Path, rows: list[dict[str, Any]], gt: list[di
                 continue
             norm = math.hypot(d[0], d[1]) or 1.0
             fx, fy = d[0] / norm, d[1] / norm
+            t = _num(row.get("t"))
+            yr, sp = _num(ego.get("yaw_rate")), _num(ego.get("speed_mps"))
+            bend_k = abs(yr) / sp if yr is not None and sp is not None and sp > 0.5 else 0.0
+            for name, (t_out,) in list(seen.items()):
+                if t is not None and t_out is not None and t - t_out > CUT_IN_WINDOW_S:
+                    del seen[name]
             for car in row.get("traffic") or []:
                 cp = car.get("pos") if isinstance(car, dict) else None
                 if not (isinstance(cp, list) and len(cp) >= 2):
@@ -338,9 +355,11 @@ def _observe(plan: ClipPlan, clip: Path, rows: list[dict[str, Any]], gt: list[di
                 ahead = dx * fx + dy * fy
                 lat = abs(-dx * fy + dy * fx)
                 name = str(car.get("name"))
+                if 0.5 * bend_k * ahead * ahead > CUT_IN_BEND_MAX_M:
+                    continue
                 if 0.0 < ahead < CUT_IN_AHEAD_MAX_M:
                     if lat >= CUT_IN_FROM_M:
-                        seen[name] = True
+                        seen[name] = (t,)
                     elif lat <= CUT_IN_TO_M and seen.get(name):
                         return True, f"cut_in: {name} moved into the ego lane {ahead:.0f} m ahead"
         return False, "cut_in: no car crossed into the ego lane ahead"
@@ -413,7 +432,9 @@ def quality_check(clip: Path | str, plan: ClipPlan, *, exit_code: int) -> dict[s
     }
 
 
-def write_tags(clip: Path | str, plan: ClipPlan, qc: Mapping[str, Any], extra: Mapping[str, Any] | None = None) -> Path:
+def write_tags(
+    clip: Path | str, plan: ClipPlan, qc: Mapping[str, Any], extra: Mapping[str, Any] | None = None, *, gfx: str = GFX
+) -> Path:
     """``clip_tags.json`` beside the recording (created once; an existing file is never replaced)."""
     path = Path(clip) / "clip_tags.json"
     payload = {
@@ -430,7 +451,7 @@ def write_tags(clip: Path | str, plan: ClipPlan, qc: Mapping[str, Any], extra: M
         "spawn_seed": plan.spawn_seed,
         "spawn_kind": plan.spawn_kind,
         "ego_model": plan.ego_model,
-        "gfx": GFX,
+        "gfx": gfx,
         "lossless": True,
         "quality": qc.get("quality"),
         "reasons": list(qc.get("reasons") or []),
@@ -459,6 +480,7 @@ def run_clips(
     chase: bool = False,
     extra: Iterable[str] = (),
     log: Callable[[str], None] = print,
+    gfx: str = GFX,
 ) -> Path:
     """Record ``clips`` clips into a new session folder. ``runner(argv)`` runs the collector."""
     maps = tuple(maps)
@@ -480,7 +502,7 @@ def run_clips(
             "max_s": float(max_s),
             "chase_cam": bool(chase),
             "ego_model": EGO_MODEL,
-            "gfx": GFX,
+            "gfx": gfx,
             "results": results,
         }, indent=2) + "\n", encoding="utf-8")
         tmp.replace(manifest)
@@ -499,7 +521,7 @@ def run_clips(
             log(f"clip {clip.name}: collector raised {type(exc).__name__}: {exc}")
             code = 99
         qc = quality_check(clip, plan, exit_code=code)
-        write_tags(clip, plan, qc, {"collector_exit": code, "argv": argv, "started_wall": started})
+        write_tags(clip, plan, qc, {"collector_exit": code, "argv": argv, "started_wall": started}, gfx=gfx)
         log(f"clip {clip.name}: {qc['quality']} {'; '.join(qc['reasons']) or 'ok'}")
         results.append({"dir": clip.name, "edge_case": plan.edge_case, "map": plan.map,
                         "quality": qc["quality"], "exit": code})

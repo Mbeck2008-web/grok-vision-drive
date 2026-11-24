@@ -1846,7 +1846,9 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         # Recording-only: attached by _attach_cameras, written to raw/chase*, never in CAM_IDS.
         cam_cfg["chase_camera"] = {**chase_spec, "enabled": True}
         cam_rates["chase"] = float(chase_spec.get("chase_hz") or 2.0)
-    plan = capture_plan(cam_cfg, PNG_RATIO_MAX)
+    # Disk ceiling: colour, every train_gt depth/sem plane (raw size; PNG ratio
+    # unmeasured) and the chase camera when --chase-cam is on.
+    plan = capture_plan(cam_cfg, PNG_RATIO_MAX, gt=True)
     totals = plan_totals(plan)
     ceiling_gb = float(totals["png_gb_per_hour"])
     print(
@@ -2115,6 +2117,12 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
         # loop runs behind the 10 Hz plan; colour frames are never thinned.
         gt_gate = TrainGtGate(1.0 / COLLECT_HZ)
         gt_prev_mono: list[float | None] = [None]
+
+        def _reset_gt_gate() -> None:
+            # A level load, teleport or camera warm-up is a gap, not loop lag: the
+            # first interval after it must not halve GT (TrainGtGate.reset).
+            gt_gate.reset()
+            gt_prev_mono[0] = None
         prev_dir: list[float] | None = None
         prev_dir_t: float | None = None
         last_error = ""
@@ -2302,6 +2310,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                     segment_open = False
                     spawn_pos = moved
                     spawn_seq += 1
+                    _reset_gt_gate()
                     mark_recover = True
                     impact.reset()
                     yield_guard.reset()
@@ -2434,6 +2443,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
             recheck_mark = done_s
             spawn_pos = picked.pos
             spawn_seq += 1
+            _reset_gt_gate()
             lane_track.reset()
             impact.reset()
             yield_guard.reset()
@@ -2788,6 +2798,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 prev_dir = None
                 prev_dir_t = None
                 cam_sched.reset()
+                _reset_gt_gate()
                 impact.reset()
                 yield_guard.reset()
                 settle.start(done_s)
@@ -2938,6 +2949,7 @@ def _main(argv: list[str] | None, run: RunStop) -> int:
                 if attached_frames_ready(cams, frames):
                     cams_ready = True
                     warmup_since = None
+                    _reset_gt_gate()
                     print(f"collect cameras live {sorted(cams)}", flush=True)
                 else:
                     if warmup_since is None:

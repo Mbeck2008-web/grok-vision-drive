@@ -87,6 +87,46 @@ def check_gt_gate_halves_when_behind() -> None:
     print("GT gate: full rate on time, every other frame when behind, recovers")
 
 
+def check_gt_gate_thresholds_pinned() -> None:
+    """behind 1.2x, recover 1.05x, EMA alpha 0.2: each number is a boundary here."""
+    from python.data.raw_frames import TrainGtGate
+
+    def settled(dt: float, n: int = 60, gate=None):
+        gate = gate or TrainGtGate(period_s=0.1)
+        for _ in range(n):
+            gate.select(dt, ["main"])
+        return gate
+
+    # behind_ratio 1.2: a steady 1.3x tick thins, a steady 1.15x tick does not.
+    assert settled(0.13).stride == 2
+    assert settled(0.115).stride == 1
+    # recover_ratio 1.05: once thinned, a 1.1x tick keeps thinning (hysteresis);
+    # under 1.05x it recovers.
+    assert settled(0.11, gate=settled(0.13)).stride == 2
+    assert settled(0.10, gate=settled(0.13)).stride == 1
+    # alpha 0.2: one 1.8x tick after an on-time run moves the EMA 20% of the way
+    # (0.116 s, under 1.2x), so one hiccup does not halve GT.
+    gate = settled(0.1)
+    gate.select(0.18, ["main"])
+    assert abs(gate.ema_s - 0.116) < 1e-9 and gate.stride == 1, (gate.ema_s, gate.stride)
+    print("GT gate: 1.2x behind, 1.05x recover, alpha 0.2 pinned at their boundaries")
+
+
+def check_gt_gate_reset() -> None:
+    """A load/teleport gap is not lag: reset() drops the EMA, stride and counters."""
+    from python.data.raw_frames import TrainGtGate
+
+    gate = TrainGtGate(period_s=0.1)
+    for _ in range(5):
+        gate.select(0.1, ["main"])
+    gate.select(20.0, ["main"])  # a 20 s level load seen as one tick
+    assert gate.stride == 2
+    gate.reset()
+    assert gate.stride == 1 and gate.ema_s is None
+    assert all(gate.select(0.1, ["main"]) == {"main"} for _ in range(30))
+    print("GT gate reset: full rate straight after a gap")
+
+
 # --------------------------------------------------------------- item 2
 
 PED = re.compile(r"pedestrian|\bperson\b", re.I)
@@ -115,6 +155,31 @@ def check_no_pedestrian_labels_or_classes() -> None:
                     hits.append(f"{path.relative_to(ROOT)}:{n}: {line.strip()}")
     assert not hits, "pedestrian label/class still present:\n" + "\n".join(hits)
     print("no pedestrian label, class, or COCO person mapping in perception/train/collect/data/config")
+
+
+def check_person_dropped_by_decision() -> None:
+    """Pins Michael's call (2026-11-23 23:19 CST): BeamNG spawns no people, so the
+    live detector drops COCO person on purpose and the labels have no such class.
+    This is a decision, not a safety proof: if people ever appear in the sim, this
+    test is the line to revisit (labels_v4.md, "Recorder v2: no pedestrians")."""
+    import test_yolo_nms as nms
+    from python.perception.detect import COCO_VEHICLE, coco_class_name
+    from python.train.scene_net import OBJECT_CLASSES, labels_from_tech
+
+    assert coco_class_name(0) is None and 0 not in COCO_VEHICLE
+    # The live ONNX decode: a lone, confident COCO person row gives no detection.
+    assert nms._detect([(320, 320, 60, 160, nms.PERSON, 0.95)]) == []
+    # Training labels: a "pedestrian" object never becomes a slot.
+    assert "pedestrian" not in OBJECT_CLASSES  # gvd-allow-pedestrian-word
+    labels = labels_from_tech({"objects": [
+        {"cls": "pedestrian", "x": 0.0, "y": 8.0},  # gvd-allow-pedestrian-word
+        {"cls": "car", "x": 1.0, "y": 20.0},
+    ]})
+    assert int(labels["object_valid"].sum()) == 1, labels["object_valid"]
+    assert int(labels["object_class"][0]) == OBJECT_CLASSES.index("car")
+    spec = (ROOT / "docs" / "specs" / "labels_v4.md").read_text(encoding="utf-8")
+    assert "no pedestrians in the game" in spec.lower() and "not proven safe" in spec.lower(), "spec line missing"
+    print("COCO person dropped live and in labels, by Michael's decision (spec line present)")
 
 
 def check_old_checkpoint_class_count_is_refused() -> None:
@@ -177,7 +242,51 @@ def check_old_checkpoint_refused_by_loaders() -> None:
     print("epoch checkpoint loader refuses a pre-v2 class head")
 
 
+def check_pause_checkpoint_class_head_refused() -> None:
+    """train_scene._apply_checkpoint names the class-count error before any copy."""
+    try:
+        import torch  # noqa: F401
+    except Exception:
+        from gvd_test_env import skip_check
+
+        skip_check("check_pause_checkpoint_class_head_refused", "torch not importable")
+        return
+    from python.train.scene_net import ObjectClassCountError, SceneNet
+    from python.train.train_scene import _apply_checkpoint, stamp_pause
+
+    net = SceneNet(cams=("main",)).cpu()
+    weights = {k: v.detach().numpy().copy() for k, v in net.state_dict().items()}
+    w = weights["object_class_head.weight"]
+    weights["object_class_head.weight"] = np.zeros((96, w.shape[1]), dtype=w.dtype)
+    weights["object_class_head.bias"] = np.zeros((96,), dtype=w.dtype)
+    fields = stamp_pause({"weights": weights}, net.cams, getattr(net, "pause_arch", None))
+    before = {k: v.detach().clone() for k, v in net.state_dict().items()}
+    try:
+        _apply_checkpoint(net, None, None, fields, "cpu")
+    except ObjectClassCountError as exc:
+        assert "pause checkpoint" in str(exc) and "pedestrian" in str(exc), str(exc)
+    else:
+        raise AssertionError("pause checkpoint with 96 class outputs loaded")
+    after = net.state_dict()
+    assert all(torch.equal(before[k], after[k]) for k in before), "weights changed before the refusal"
+    print("pause checkpoint loader refuses a pre-v2 class head by name, nothing copied")
+
+
 # --------------------------------------------------------------- item 3 / 4
+
+def check_rgb_span_edges() -> None:
+    from python.data.raw_frames import _rgb_span_ms
+
+    assert _rgb_span_ms({}) is None
+    assert _rgb_span_ms({"main": {"t": 10.0}}) is None  # one camera: no spread to report
+    assert _rgb_span_ms({"main": {"t": 10.0}, "main_depth": {"t": 10.5}}) is None  # GT is not a colour camera
+    cams = {
+        "main": {"t": 10.000}, "wide": {"t": 10.004},
+        "main_depth": {"t": 9.0}, "wide_sem": {"t": 11.0}, "chase": {"t": 12.0}, "chase_depth": {"t": 8.0},
+        "rear": {"t": None}, "narrow": "bad",
+    }
+    assert _rgb_span_ms(cams) == 4.0, _rgb_span_ms(cams)
+    print("cam_span_ms: None under two colour cams; GT planes and chase left out")
 
 def check_intrinsics_from_fov() -> None:
     from python.data.raw_frames import camera_intrinsics
@@ -362,6 +471,33 @@ def check_traffic_slots_beyond_two() -> None:
     print(f"traffic_slots places {len(slots)} cars for count 6, none stacked")
 
 
+def check_traffic_slot_order_beyond_two() -> None:
+    """Slots 3+ alternate ahead/behind: ahead2 then behind2, each one stagger further out."""
+    import random
+
+    from python.collect.spawn_mix import TRAFFIC_AHEAD_M, TRAFFIC_BEHIND_M, TRAFFIC_STAGGER_M, SpawnDeck
+
+    deck = SpawnDeck.load(ROOT / "tests" / "fixtures" / "roads" / "west_coast_usa.json.gz", random.Random(3))
+    for _ in range(20):
+        pick = deck.take()
+        assert pick is not None
+        slots, _notes = deck.traffic_slots(pick, 4)
+        if len(slots) == 4:
+            break
+    else:
+        raise AssertionError("no pick placed all four slots")
+    assert [s[0] for s in slots] == ["ahead", "behind", "ahead2", "behind2"], [s[0] for s in slots]
+    want = [TRAFFIC_AHEAD_M, TRAFFIC_BEHIND_M, TRAFFIC_AHEAD_M + TRAFFIC_STAGGER_M, TRAFFIC_BEHIND_M + TRAFFIC_STAGGER_M]
+    assert [round(s[3], 3) for s in slots] == [round(w, 3) for w in want], [s[3] for s in slots]
+    _qx, _qy, qz, qw = pick.rot
+    yaw = math.atan2(2.0 * qw * qz, 1.0 - 2.0 * qz * qz)
+    hx, hy = math.cos(yaw), math.sin(yaw)
+    for where, pos, _rot, _along in slots:
+        ahead = (pos[0] - pick.pos[0]) * hx + (pos[1] - pick.pos[1]) * hy
+        assert (ahead > 0) == where.startswith("ahead"), (where, ahead)
+    print("traffic slots 3+: ahead2 in front, behind2 behind, one stagger out")
+
+
 def check_spawn_deck_seed_and_kind() -> None:
     import random
 
@@ -455,6 +591,29 @@ def check_z_to_ray_conversion() -> None:
     fit = fit_ground_plane(np.where(mask, synth, 0.0) * 100.0, mask, k, "planar_z")
     assert abs(fit["height_m"] - 1.26) < 1e-3 and abs(fit["pitch_deg"] - 6.0) < 0.05, fit
     print("z-to-ray conversion and synthetic ground fit OK")
+
+
+def check_depth_verdict_ratio() -> None:
+    """VERDICT_RATIO 3: a reading only wins when its rms is 3x flatter; 2x is unclear."""
+    import python.data.depth_check as dc
+
+    real_fit, real_mask = dc.fit_ground_plane, dc.ground_mask
+    rms: dict[str, float] = {}
+    dc.ground_mask = lambda depth, sem, classes: np.ones((2, 2), bool)  # type: ignore[assignment]
+    dc.fit_ground_plane = lambda depth, mask, intr, kind: {"rms_m": rms[kind]}  # type: ignore[assignment]
+    try:
+        def verdict(z: float, ray: float) -> str:
+            rms.update(planar_z=z, ray=ray)
+            return dc.depth_kind_verdict(None, None, {}, {})["verdict"]
+
+        assert dc.VERDICT_RATIO == 3.0
+        assert verdict(0.01, 0.02) == "unclear"
+        assert verdict(0.01, 0.0301) == "planar_z"
+        assert verdict(0.02, 0.01) == "unclear"
+        assert verdict(0.0301, 0.01) == "ray"
+    finally:
+        dc.fit_ground_plane, dc.ground_mask = real_fit, real_mask
+    print("depth verdict needs a 3x rms margin; 2x is unclear")
 
 
 def check_depth_check_script_on_fixture() -> None:
@@ -624,13 +783,99 @@ def check_short_collect_behind_halves_gt() -> None:
     print("behind the 10 Hz plan: colour every tick, depth/sem every other frame")
 
 
+def check_respawn_keeps_full_gt_and_cli_reaches_collector() -> None:
+    """Fake west-coast run with a 20 s teleport on every respawn.
+
+    * GT is not thinned after a spawn: the gap is not loop lag (gate reset).
+    * --spawn-seed and --spawn-kind reach SpawnDeck.load; every spawn is that kind.
+    * --chase-cam records at chase_hz (2 Hz), not the 10 Hz loop rate.
+    * The disk ceiling counts the depth/sem planes and the chase camera.
+    """
+    import random
+
+    import python.collect.level_session as level_session
+    import python.collect.spawn_mix as spawn_mix
+    import scripts.collect_scene_lanes as collect
+    from python.data.raw_frames import capture_plan, plan_totals
+    from python.debug.gt_geom import RoadPoly
+
+    real_begin, real_place, real_load = level_session.begin_level, level_session.place_vehicle, spawn_mix.SpawnDeck.load
+    loads: list[dict] = []
+    places: list[int] = []
+
+    def begin(bng, level):
+        del level
+        return level_session.OpenedLevel(
+            vehicle=bng.ego, roads=[RoadPoly("r", [(0.0, 0.0), (0.0, 80.0)], 7.0)], spawn=(0.0, 10.0, 0.5),
+        )
+
+    def place(*args, **kwargs):
+        places.append(1)
+        collect.time.sleep(20.0)  # a teleport + physics settle, as a 20 s gap on the loop clock
+        return real_place(*args, **kwargs)
+
+    def load(cls, path, rng=None, **kwargs):
+        loads.append({"rng_state": None if rng is None else rng.getstate(), "only_kind": kwargs.get("only_kind")})
+        return real_load.__func__(cls, path, rng, **kwargs)
+
+    level_session.begin_level = begin
+    level_session.place_vehicle = place
+    spawn_mix.SpawnDeck.load = classmethod(load)  # type: ignore[assignment]
+    try:
+        code, text, out, _made, root_cm = _run_fake_collect(
+            ["--maps", "west_coast_usa", "--respawn-min", "0.1", "--no-vary-env", "--min-paint-cov", "0",
+             "--spawn-seed", "7", "--spawn-kind", "highway", "--chase-cam"],
+            stop_at=200,
+        )
+    finally:
+        level_session.begin_level, level_session.place_vehicle = real_begin, real_place
+        spawn_mix.SpawnDeck.load = real_load  # type: ignore[assignment]
+    try:
+        assert code == 0, text[-2000:]
+        assert len(places) >= 3, (len(places), text[-1500:])
+        # --spawn-seed / --spawn-kind plumbing
+        assert len(loads) == 1, loads
+        assert loads[0]["only_kind"] == "highway", loads
+        assert loads[0]["rng_state"] == random.Random(7).getstate(), "spawn deck did not get Random(--spawn-seed)"
+        state = _rows(out)
+        kinds = {r.get("spawn_type") for r in state}
+        assert kinds == {"highway"}, kinds
+        # GT right after every spawn: full rate, never stride 2
+        mains = [r for r in state if "main" in r["cams"]]
+        assert len(mains) >= 150, len(mains)
+        thinned = [r["i"] for r in mains if "main_depth" not in r["cams"] or r.get("gt_stride") != 1]
+        assert not thinned, f"GT thinned after a spawn at rows {thinned[:12]}"
+        # chase at 2 Hz: about one row in five of the 10 Hz loop
+        chase = sum(1 for r in state if "chase" in r["cams"])
+        assert 0.1 * len(mains) <= chase <= 0.3 * len(mains), (chase, len(mains))
+        # disk ceiling: colour + 8x depth/sem + chase (with its GT)
+        cfg = load_camera_config()
+        cfg["chase_camera"] = {**cfg["chase_camera"], "enabled": True}
+        full = plan_totals(capture_plan(cfg, gt=True))["png_gb_per_hour"]
+        colour = plan_totals(capture_plan(load_camera_config()))["png_gb_per_hour"]
+        status = json.loads((out.parent / "status" / "collect.json").read_text(encoding="utf-8"))
+        assert abs(float(status["raw_png_gb_per_hour"]) - full) < 1e-6, (status["raw_png_gb_per_hour"], full)
+        assert full > colour * 2.0, (full, colour)
+        for line in ("collect cam main_depth ", "collect cam rear_sem ", "collect cam chase ", "collect cam chase_depth "):
+            assert line in text, line
+    finally:
+        root_cm.__exit__(None, None, None)
+    print(f"respawn: {len(places)} teleports, GT full rate after each; spawn seed/kind reach the deck; "
+          f"chase {chase}/{len(mains)} rows; ceiling {full:.1f} GB/h incl. GT + chase")
+
+
 def main() -> None:
     check_train_gt_on_all_eight()
     check_live_attach_forces_gt_off()
     check_gt_gate_halves_when_behind()
+    check_gt_gate_thresholds_pinned()
+    check_gt_gate_reset()
     check_no_pedestrian_labels_or_classes()
+    check_person_dropped_by_decision()
     check_old_checkpoint_class_count_is_refused()
     check_old_checkpoint_refused_by_loaders()
+    check_pause_checkpoint_class_head_refused()
+    check_rgb_span_edges()
     check_intrinsics_from_fov()
     check_sidecar_has_k_and_sbr_mounts()
     check_writer_stamps_and_train_only_pose()
@@ -638,13 +883,16 @@ def main() -> None:
     check_traffic_chunk_runs_in_lua()
     check_brake_merge_keeps_actor_fields()
     check_traffic_slots_beyond_two()
+    check_traffic_slot_order_beyond_two()
     check_spawn_deck_seed_and_kind()
     check_chase_cam_is_recording_only()
     check_depth_is_planar_z_on_real_frame()
     check_z_to_ray_conversion()
+    check_depth_verdict_ratio()
     check_depth_check_script_on_fixture()
     check_short_collect_v2()
     check_short_collect_behind_halves_gt()
+    check_respawn_keeps_full_gt_and_cli_reaches_collector()
     print("test_recorder_v2: OK")
 
 

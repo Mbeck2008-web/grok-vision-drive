@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from python.collect.clip_mode import EDGE_CASES, MAX_CLIP_S, MIN_CLIP_S, run_clips  # noqa: E402
+from python.collect.clip_mode import EDGE_CASES, GFX, MAX_CLIP_S, MIN_CLIP_S, run_clips  # noqa: E402
 
 COLLECTOR = ROOT / "scripts" / "collect_scene_lanes.py"
 DEFAULT_MAPS = "west_coast_usa,italy,east_coast_usa,utah,jungle_rock_island"
@@ -48,6 +48,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-s", type=float, default=MAX_CLIP_S, help="Longest clip, seconds (<= 60).")
     parser.add_argument("--edge-cases", default="", help=f"Comma-separated subset of {','.join(EDGE_CASES)}.")
     parser.add_argument("--chase-cam", action="store_true", help="Also record the recording-only chase camera.")
+    parser.add_argument(
+        "--gfx", default=GFX,
+        help=f"Renderer recorded in clip_tags.json and session.json (default {GFX}, Vulkan). The collector "
+             f"launches BeamNG.tech with -gfx {GFX}; an already-running BeamNG keeps its own renderer.",
+    )
     parser.add_argument("--python", default=sys.executable, help="Python that runs the collector.")
     args, extra = parser.parse_known_args(argv)
     if extra and extra[0] == "--":
@@ -92,6 +97,7 @@ def main(argv: list[str] | None = None) -> int:
         edge_cases=args.edge_cases,
         chase=args.chase_cam,
         extra=args.extra,
+        gfx=args.gfx,
     )
     print(f"session {session}")
     return 0

@@ -7,6 +7,7 @@ CPU only. The memory figure is a CPU-derived estimate, not a GPU measurement.
 # gvd-ci: requires torch
 from __future__ import annotations
 
+import ast
 import io
 import math
 import os
@@ -1541,12 +1542,18 @@ def check_wide_low_barrier_hides_ground() -> None:
         lo, hi = (-6.0, 10.0, 0.0), (6.0, 10.3, height)
         for cams in (["main"], cams8):
             out, geoms = _scene_run(cams, [(lo, hi)])
-            free_ok = out["logits"][0, bl.CH_FREE] != -bl.FORCE_LOGIT
+            lg = out["logits"][0]
+            free_ok = lg[bl.CH_FREE] != -bl.FORCE_LOGIT
+            seen = lg[bl.CH_UNKNOWN] != bl.FORCE_LOGIT
             hid = _barrier_hidden(geoms, lo, hi)
             assert len(hid) >= 1, (height, cams, len(hid))
             nf = sum(bool(free_ok[r, c]) for r, c in hid)
-            assert nf == 0, (
-                f"barrier {height} m cams={len(cams)}: hidden {len(hid)} free-eligible {nf}"
+            ns = sum(bool(seen[r, c]) for r, c in hid)
+            nth = sum(float(out["through_mass"][0, 0, r, c]) > 0 for r, c in hid)
+            ncl = sum(float(out["clear_mass"][0, 0, r, c]) > 0 for r, c in hid)
+            assert nf == 0 and ns == 0 and nth == 0 and ncl == 0, (
+                f"barrier {height} m cams={len(cams)}: hidden {len(hid)} "
+                f"free-eligible {nf} seen {ns} through {nth} clear {ncl}"
             )
 
 
@@ -1660,12 +1667,73 @@ def check_ground_band_pinned_and_plumbed() -> None:
     out, _ = _scene_run(["main"], [CAR_BOX], head=head)
     free_ok = out["logits"][0, bl.CH_FREE] != -bl.FORCE_LOGIT
     assert sum(bool(free_ok[r, c]) for r, c in _footprint(*CAR_BOX)) > 0
+    # 2.0 m band raises occ_m to 1.8 m, so a 0.6 m wall is not a raised occluder:
+    # hidden cells past the 1.5 m sightline margin must open. Pinning occ_m at
+    # RAISED_OCC_M (0.3 m) leaves those far cells shut.
+    lo, hi = (-6.0, 10.0, 0.0), (6.0, 10.3, 0.6)
+    out_w, geoms_w = _scene_run(["main"], [(lo, hi)], head=head)
+    free_w = out_w["logits"][0, bl.CH_FREE] != -bl.FORCE_LOGIT
+    far = [
+        (r, c)
+        for r, c in _barrier_hidden(geoms_w, lo, hi)
+        if (32.0 - 0.5 * (r + 0.5)) > hi[1] + bl.SIGHTLINE_MARGIN_M
+    ]
+    assert len(far) >= 1, len(far)
+    n_far = sum(bool(free_w[r, c]) for r, c in far)
+    assert n_far > 0, f"band=2.0 m 0.6 m wall: {len(far)} far hidden, {n_far} free-eligible"
     # boundary: a point exactly band above the ground is outside (z - ground < band), like the BEV z band
     z = torch.tensor([0.25, 0.5 - 1e-6, 0.5, 0.5 + 1e-6, 3.0]) + 1.0
     g = torch.full_like(z, 1.0)
     assert bl.near_ground(z, g, 0.5).tolist() == [True, True, False, False, False]
     assert bl.near_ground(z, g, 2.0).tolist() == [True, True, True, True, False]
     print("ground_band_pinned_and_plumbed")
+
+
+def _assign_names(tree: ast.AST, name: str) -> list[ast.AST]:
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and node.targets[0].id == name:
+            out.append(node.value)
+    return out
+
+
+def check_v6_gate_factors_pinned() -> None:
+    """occ_m tracks the configured band; centre and edge clear/through multiply by crossed and visible.
+
+    S09 pins occ_m at RAISED_OCC_M. S10/S11 drop crossed*visible on through_w/clear_w
+    (bev_lss.py around the band_w splat). S12/S13 drop only crossed; on the 0.6-1.0 m
+    barrier scenes that factor is observationally redundant with visible (at 0.6 m
+    two_scale_ground marks no raised cells so crossed is 1; at >=0.8 m the wall
+    extinguishes through/clear in the umbra). The assignment pin still requires it.
+    """
+    tree = ast.parse(Path(bl.__file__).read_text(), filename=bl.__file__)
+    occ = _assign_names(tree, "occ_m")
+    assert len(occ) == 1, len(occ)
+    assert ast.unparse(occ[0]).replace(" ", "") == "self.ground_band_m-(GROUND_BAND_M-RAISED_OCC_M)", ast.unparse(occ[0])
+    for name in ("clear_w", "through_w"):
+        vals = _assign_names(tree, name)
+        assert len(vals) == 1, (name, len(vals))
+        used = {n.id for n in ast.walk(vals[0]) if isinstance(n, ast.Name)}
+        assert {"crossed", "visible"} <= used, (name, used)
+    vis_e = _assign_names(tree, "vis_e")
+    assert vis_e, "vis_e assignment missing"
+    # first assignment is the stacked edge occ/clear/through weights
+    stacked = vis_e[0]
+    elts = None
+    for node in ast.walk(stacked):
+        if isinstance(node, ast.Call):
+            fn = node.func
+            if isinstance(fn, ast.Attribute) and fn.attr == "stack" and node.args:
+                arg0 = node.args[0]
+                if isinstance(arg0, ast.List) and len(arg0.elts) == 3:
+                    elts = arg0.elts
+                    break
+    assert elts is not None, ast.unparse(stacked)
+    for i, elt in enumerate(elts[1:]):  # clear, through (not occ)
+        used = {n.id for n in ast.walk(elt) if isinstance(n, ast.Name)}
+        assert {"crossed_e", "visible_e"} <= used, (i, used)
+    print("v6_gate_factors_pinned")
+
 
 def main() -> None:
     check_intrinsics_from_fov()
@@ -1688,6 +1756,7 @@ def main() -> None:
     check_empty_road_on_grade_and_pitch()
     check_ray_surface_and_ground_height()
     check_ground_band_pinned_and_plumbed()
+    check_v6_gate_factors_pinned()
     check_sky_rays_never_free()
     check_low_occluder_hides_ground()
     check_wide_low_barrier_hides_ground()

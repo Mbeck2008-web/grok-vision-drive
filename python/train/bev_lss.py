@@ -17,14 +17,18 @@ G4  Per-camera intrinsics K and cam-to-ego extrinsics are explicit inputs.
     The recordings carry no K, so ``camera_intrinsics`` derives a pinhole
     from ``fov_v`` and the letterboxed 192x256 crop (square pixels, centred
     principal point, no distortion; UNVERIFIED against a recorded K).
-G5  Unknown is the default. A cell no valid ray reaches is ``unknown``
-    (logit forced high) and never ``observed_free`` (logit forced low).
-    ``observed_free`` is allowed only where a minimum share of the cell's
-    depth mass passed through it (``pass_mass / (hit_mass + pass_mass)
-    >= PASS_FRAC_TAU``). Softmax residual mass is not enough: cells that
-    only lie behind a confident depth hit (prior cumulative probability
-    already ``OCCLUDE_HIT_TAU``) have free forced low and ``unknown``
-    plus ``occluded`` forced high. This is structural, not a loss weight.
+G5  Unknown is the default, decided per ray by depth transmittance.
+    For a ray (valid camera and pixel) the probability that it reached
+    depth bin i is ``T_i = sum_{j >= i} p_j`` and that it passed through
+    bin i is ``S_i = sum_{j > i} p_j``. A cell is seen only if some valid
+    ray reached it (``T_i >= REACH_TAU``); otherwise ``unknown`` is forced
+    high and ``observed_free`` forced low. ``observed_free`` is allowed only
+    where some valid ray passed through the cell (``S_i >= FREE_PASS_TAU``)
+    and the cell is seen. A cell valid rays landed in but none reached is
+    behind a wall: ``occluded`` is forced high as well. Cells no valid ray
+    landed in are unknown, not occluded. A partial wall (p < 1) or a second
+    depth guess beyond it does not open the cells in between unless the
+    ray more likely than not got there. This is structural, not a loss weight.
 G6  The output is differentiable with respect to the stem taps and the
     depth head.
 G7  No NaN or Inf, including a batch where no camera is valid.
@@ -80,14 +84,13 @@ CH_UNKNOWN = BEV_CHANNELS.index("unknown")
 CH_OCCLUDED = BEV_CHANNELS.index("occluded")
 # Finite, so a forced logit never produces NaN in a loss.
 FORCE_LOGIT = 30.0
-# Free is allowed only when this share of a cell's depth mass passed through
-# it: pass_mass / (hit_mass + pass_mass) >= PASS_FRAC_TAU. A raw `passed > 0`
-# test cannot tell "seen through" from softmax residual behind a wall.
-PASS_FRAC_TAU = 0.5
-# A ray has a confident hit once cumulative depth probability reaches this.
-# Bins past that hit are occluded. 0.95 is below the weakest wall case the
-# tests pin (p_hit = 0.987 at softmax margin 8).
-OCCLUDE_HIT_TAU = 0.95
+# Visibility cutoffs on per-ray transmittance (G5). Both are the majority
+# decision: a ray counts as having reached (passed through) a bin only when
+# the depth head says that is more likely than not. Not tuned to a fixture:
+# any wall the head is more than half sure of hides what is behind it, and
+# a wall it is less than half sure of does not.
+REACH_TAU = 0.5  # seen: T_i = sum_{j >= i} p_j >= REACH_TAU
+FREE_PASS_TAU = 0.5  # may be free: S_i = sum_{j > i} p_j >= FREE_PASS_TAU
 
 # Categorical depth (audit item 9: 40 log bins, 1-48 m).
 DEPTH_BINS = 40
@@ -297,10 +300,21 @@ def depth_survival(prob: Any, dim: int = 1) -> Any:
     return (prob.flip(dim).cumsum(dim).flip(dim) - prob).clamp(min=0.0)
 
 
-def depth_already_hit(prob: Any, tau: float = OCCLUDE_HIT_TAU, dim: int = 2) -> Any:
-    """True at bins already behind a confident hit: prior cumulative mass >= ``tau``."""
-    prior = prob.cumsum(dim) - prob
-    return prior >= tau
+def depth_transmittance(prob: Any, dim: int = 1) -> Any:
+    """Probability the ray reached each bin along ``dim``: sum_{j >= i} p_j (1 - mass before the bin)."""
+    return prob.flip(dim).cumsum(dim).flip(dim)
+
+
+def visibility_gates(reach: Any, passed: Any, reach_tau: float = REACH_TAU, free_pass_tau: float = FREE_PASS_TAU) -> tuple[Any, Any]:
+    """Per ray and bin: (reached, passed through) as 0/1 in ``reach``'s dtype. Both cutoffs are inclusive."""
+    return (reach >= reach_tau).to(reach.dtype), (passed >= free_pass_tau).to(reach.dtype)
+
+
+def _check_tau(name: str, value: float) -> float:
+    value = float(value)
+    if not (0.0 < value <= 1.0):
+        raise ValueError(f"{name} must be in (0, 1], got {value}")
+    return value
 
 
 def bev_flat_index(points: Any) -> tuple[Any, Any]:
@@ -392,14 +406,14 @@ class BevLssHead(nn.Module):
     def __init__(
         self,
         depth_bins: int = DEPTH_BINS,
-        pass_frac_tau: float = PASS_FRAC_TAU,
-        occlude_hit_tau: float = OCCLUDE_HIT_TAU,
+        reach_tau: float = REACH_TAU,
+        free_pass_tau: float = FREE_PASS_TAU,
     ) -> None:
         super().__init__()
         self.spatial = SpatialPath(depth_bins=depth_bins)
         self.encoder = BevEncoder(CTX_CH + 2)
-        self.pass_frac_tau = float(pass_frac_tau)
-        self.occlude_hit_tau = float(occlude_hit_tau)
+        self.reach_tau = _check_tau("reach_tau", reach_tau)
+        self.free_pass_tau = _check_tau("free_pass_tau", free_pass_tau)
         self.register_buffer("depths", torch.from_numpy(depth_bin_centers(depth_bins)), persistent=False)
 
     @staticmethod
@@ -425,7 +439,10 @@ class BevLssHead(nn.Module):
 
         ``cam_valid`` (B x N, 1 = use this camera) and ``pixel_valid``
         (N x h x w letterbox mask) are optional. Returns ``logits`` (B x 14 x 128 x 128),
-        ``hit_mass``, ``pass_mass`` (B x 1 x 128 x 128) and ``depth_prob``.
+        ``hit_mass``, ``pass_mass``, ``clear_mass`` (sum of T over valid rays that reached the
+        cell), ``through_mass`` (sum of S over valid rays that passed through it),
+        ``occluded_mass`` (sum of 1 - T over valid rays that landed there but did not reach it),
+        all B x 1 x 128 x 128, and ``depth_prob``.
         """
         b, n = f8.shape[:2]
         flat = lambda t: t.reshape(b * n, *t.shape[2:])  # noqa: E731
@@ -441,10 +458,11 @@ class BevLssHead(nn.Module):
         beyond = depth_survival(prob, dim=2)
         prob_w = prob * weight
         beyond_w = beyond * weight
-        blocked = depth_already_hit(prob, self.occlude_hit_tau, dim=2).to(dtype=prob.dtype)
-        unblocked = 1.0 - blocked
-        occ_w = blocked * weight
-        clear_w = (prob_w + beyond_w) * unblocked
+        reach = depth_transmittance(prob, dim=2)
+        reached, through = visibility_gates(reach, beyond, self.reach_tau, self.free_pass_tau)
+        clear_w = reach * reached * weight
+        through_w = beyond * through * weight
+        occ_w = (1.0 - reach) * (1.0 - reached) * weight
         ctx = ctx.view(b, n, 1, CTX_CH, h, w)
         lifted = prob_w.unsqueeze(3) * ctx  # B N D C h w
         pts = frustum_ego_points(K, T, self.depths.to(K.dtype), (h, w), FEAT_STRIDE, time_offset_s, ego_speed_mps)
@@ -456,63 +474,52 @@ class BevLssHead(nn.Module):
                 beyond_w.unsqueeze(-1),
                 occ_w.unsqueeze(-1),
                 clear_w.unsqueeze(-1),
+                through_w.unsqueeze(-1),
             ],
             dim=-1,
-        ).reshape(b, n * d * h * w, CTX_CH + 4)
+        ).reshape(b, n * d * h * w, CTX_CH + 5)
         bev = splat(values, idx.reshape(b, -1), ok.reshape(b, -1))
         feat = bev[:, :CTX_CH]
         hit = bev[:, CTX_CH : CTX_CH + 1]
         passed = bev[:, CTX_CH + 1 : CTX_CH + 2]
         occ = bev[:, CTX_CH + 2 : CTX_CH + 3]
         clear = bev[:, CTX_CH + 3 : CTX_CH + 4]
+        thru = bev[:, CTX_CH + 4 : CTX_CH + 5]
         logits = self.encoder(torch.cat([feat, torch.log1p(hit), torch.log1p(passed)], dim=1))
-        logits = apply_visibility(
-            logits, hit, passed, occluded_mass=occ, clear_mass=clear, pass_frac_tau=self.pass_frac_tau
-        )
+        logits = apply_visibility(logits, clear, thru, occluded_mass=occ)
         return {
             "logits": logits,
             "hit_mass": hit,
             "pass_mass": passed,
             "occluded_mass": occ,
             "clear_mass": clear,
+            "through_mass": thru,
             "depth_prob": prob,
             "bev_feat": feat,
         }
 
-def apply_visibility(
-    logits: Any,
-    hit: Any,
-    passed: Any,
-    occluded_mass: Any = None,
-    clear_mass: Any = None,
-    pass_frac_tau: float = PASS_FRAC_TAU,
-) -> Any:
-    """G5: unobserved -> unknown, never free; free only where pass share >= ``pass_frac_tau``.
+def apply_visibility(logits: Any, clear_mass: Any, through_mass: Any, occluded_mass: Any = None) -> Any:
+    """G5 on per-cell transmittance masses (see ``BevLssHead.forward``).
 
-    Cells with ``occluded_mass > 0`` and no unblocked (``clear_mass``) observation
-    are behind a confident hit: free is forced low, unknown and occluded high.
+    Seen = some valid ray reached the cell (``clear_mass > 0``); unseen cells
+    have unknown forced high and free forced low. Free is allowed only where
+    the cell is seen and some valid ray passed through it (``through_mass > 0``).
+    Cells with ``occluded_mass > 0`` that no ray reached have occluded forced high.
     """
-    total = hit + passed
-    pass_frac = passed / (total + 1e-12)
-    free_ok = (total > 0) & (pass_frac >= pass_frac_tau)
-    seen = total > 0
+    seen = clear_mass > 0
+    free_ok = seen & (through_mass > 0)
     behind = None
     if occluded_mass is not None:
-        behind = occluded_mass > 0
-        if clear_mass is not None:
-            behind = behind & (clear_mass <= 0)
-            seen = clear_mass > 0
-        else:
-            seen = seen & ~behind
-        free_ok = free_ok & ~behind
-    free = torch.where(free_ok, logits[:, CH_FREE : CH_FREE + 1], torch.full_like(hit, -FORCE_LOGIT))
-    unknown = torch.where(seen, logits[:, CH_UNKNOWN : CH_UNKNOWN + 1], torch.full_like(hit, FORCE_LOGIT))
+        behind = (occluded_mass > 0) & ~seen
+    force = torch.full_like(clear_mass, FORCE_LOGIT)
+    free = torch.where(free_ok, logits[:, CH_FREE : CH_FREE + 1], -force)
+    unknown = torch.where(seen, logits[:, CH_UNKNOWN : CH_UNKNOWN + 1], force)
     if behind is None:
         return torch.cat(
             [logits[:, :CH_FREE], free, logits[:, CH_FREE + 1 : CH_UNKNOWN], unknown, logits[:, CH_UNKNOWN + 1 :]],
             dim=1,
         )
-    occ = torch.where(behind, torch.full_like(hit, FORCE_LOGIT), logits[:, CH_OCCLUDED : CH_OCCLUDED + 1])
+    occ = torch.where(behind, force, logits[:, CH_OCCLUDED : CH_OCCLUDED + 1])
     return torch.cat(
         [
             logits[:, :CH_FREE],
@@ -539,6 +546,6 @@ def build_bev_head(cfg: Mapping[str, Any] | None = None) -> Any:
         return None
     return BevLssHead(
         depth_bins=int(section.get("depth_bins", DEPTH_BINS)),
-        pass_frac_tau=float(section.get("pass_frac_tau", PASS_FRAC_TAU)),
-        occlude_hit_tau=float(section.get("occlude_hit_tau", OCCLUDE_HIT_TAU)),
+        reach_tau=float(section.get("reach_tau", REACH_TAU)),
+        free_pass_tau=float(section.get("free_pass_tau", FREE_PASS_TAU)),
     )

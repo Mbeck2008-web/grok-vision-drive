@@ -324,123 +324,299 @@ def check_visibility_by_construction() -> None:
     rig = _rig()
     with torch.no_grad():
         out = head(*_taps(), rig["K"], rig["T"], pixel_valid=rig["pixel_valid"])
-    logits, hit, passed = out["logits"][0], out["hit_mass"][0, 0], out["pass_mass"][0, 0]
-    clear = out["clear_mass"][0, 0]
-    seen = clear > 0  # unblocked observation; residual mass behind a hit is not "seen"
-    assert 0.2 < float(seen.float().mean()) < 1.0  # some cells seen, some not (near-ego blind ring, gaps)
+    logits = out["logits"][0]
+    clear, through = out["clear_mass"][0, 0], out["through_mass"][0, 0]
+    seen = clear > 0  # a valid ray reached the cell (transmittance >= REACH_TAU)
+    # untrained head: depth near uniform over the log bins, so a ray more likely than not reaches only
+    # about its median depth (~7 m). Near cells are seen, 15 m is not (G5: unknown, never free).
+    assert 0.0 < float(seen.float().mean()) < 1.0, float(seen.float().mean())
+    assert bool(seen[64 - 8, 64]) and not bool(seen[64 - 30, 64])
     assert torch.all(logits[bl.CH_UNKNOWN][~seen] == bl.FORCE_LOGIT)
     assert torch.all(logits[bl.CH_FREE][~seen] == -bl.FORCE_LOGIT)
-    assert torch.all(logits[bl.CH_FREE][passed <= 0] == -bl.FORCE_LOGIT)
-    frac = passed / (hit + passed + 1e-12)
-    assert torch.all(logits[bl.CH_FREE][frac < bl.PASS_FRAC_TAU] == -bl.FORCE_LOGIT)
+    assert torch.all(logits[bl.CH_FREE][through <= 0] == -bl.FORCE_LOGIT)
     assert torch.all(logits[bl.CH_UNKNOWN][seen].abs() < bl.FORCE_LOGIT)  # learned where seen
-    assert bool(seen[64 - 30, 64])  # 15 m ahead is seen
+    assert torch.all(logits[bl.CH_FREE][(through > 0) & seen].abs() < bl.FORCE_LOGIT)
+    # a head sure of a far surface (bin 35, p 0.987) on all 8 cameras sees most of the grid, 15 m ahead included
+    head.spatial = _FixedDepth(_peaked(35, 0.987))
+    with torch.no_grad():
+        far = head(*_taps(), rig["K"], rig["T"], pixel_valid=rig["pixel_valid"])
+    seen_far = far["clear_mass"][0, 0] > 0
+    assert 0.2 < float(seen_far.float().mean()) < 1.0, float(seen_far.float().mean())
+    assert bool(seen_far[64 - 30, 64])  # 15 m ahead is seen
+    assert torch.all(far["logits"][0, bl.CH_UNKNOWN][~seen_far] == bl.FORCE_LOGIT)
+    assert torch.all(far["logits"][0, bl.CH_UNKNOWN][seen_far].abs() < bl.FORCE_LOGIT)
     # apply_visibility in isolation: other channels untouched
     raw = torch.randn(1, 14, 4, 4)
-    h = torch.zeros(1, 1, 4, 4)
-    p = torch.zeros(1, 1, 4, 4)
-    h[..., 0, 0] = 1.0
-    p[..., 1, 1] = 1.0
-    got = bl.apply_visibility(raw, h, p)
+    c = torch.zeros(1, 1, 4, 4)
+    t = torch.zeros(1, 1, 4, 4)
+    c[..., 0, 0] = 1.0  # reached, nothing passed through (the hit cell)
+    c[..., 1, 1] = 1.0
+    t[..., 1, 1] = 0.7  # reached and passed through
+    got = bl.apply_visibility(raw, c, t)
     keep = [i for i in range(14) if i not in (bl.CH_FREE, bl.CH_UNKNOWN)]
     assert torch.equal(got[:, keep], raw[:, keep])
     assert got[0, bl.CH_UNKNOWN, 0, 0] == raw[0, bl.CH_UNKNOWN, 0, 0] and got[0, bl.CH_UNKNOWN, 1, 1] == raw[0, bl.CH_UNKNOWN, 1, 1]
     assert got[0, bl.CH_UNKNOWN, 2, 2] == bl.FORCE_LOGIT
-    assert got[0, bl.CH_FREE, 0, 0] == -bl.FORCE_LOGIT  # hit only, nothing passed: not free
+    assert got[0, bl.CH_FREE, 0, 0] == -bl.FORCE_LOGIT  # reached, nothing passed: not free
     assert got[0, bl.CH_FREE, 1, 1] == raw[0, bl.CH_FREE, 1, 1]
+    # through without reach (possible when FREE_PASS_TAU < REACH_TAU) is still not free
+    t2 = torch.zeros(1, 1, 4, 4)
+    t2[..., 2, 2] = 0.4
+    got2 = bl.apply_visibility(raw, c, t2)
+    assert got2[0, bl.CH_FREE, 2, 2] == -bl.FORCE_LOGIT and got2[0, bl.CH_UNKNOWN, 2, 2] == bl.FORCE_LOGIT
     print("visibility_by_construction")
 
 
+def check_visibility_taus_pinned() -> None:
+    """Both visibility cutoffs are the majority decision (0.5): no cutoff is tuned to a wall fixture."""
+    assert bl.REACH_TAU == 0.5, bl.REACH_TAU
+    assert bl.FREE_PASS_TAU == 0.5, bl.FREE_PASS_TAU
+    head = bl.BevLssHead()
+    assert head.reach_tau == 0.5 and head.free_pass_tau == 0.5
+    for bad in (0.0, -0.1, 1.5, float("nan")):
+        _raises(ValueError, lambda: bl.BevLssHead(reach_tau=bad), match="reach_tau")
+        _raises(ValueError, lambda: bl.BevLssHead(free_pass_tau=bad), match="free_pass_tau")
+    bl.BevLssHead(reach_tau=1.0, free_pass_tau=1.0)  # 1.0 is a legal (strictest) cutoff
+    print("visibility_taus_pinned")
 
-def check_pass_fraction_gate() -> None:
-    """observed_free is allowed only when pass / (hit + pass) >= PASS_FRAC_TAU (default 0.5)."""
-    raw = torch.randn(1, 14, 2, 2)
-    h = torch.zeros(1, 1, 2, 2)
-    p = torch.zeros(1, 1, 2, 2)
-    # below 0.5: hit=0.9, pass=0.1 (frac=0.1), still > 0 so a `passed > 0` gate would allow free
-    h[..., 0, 0] = 0.9
-    p[..., 0, 0] = 0.1
-    # above 0.5: hit=0.4, pass=0.6 (frac=0.6)
-    h[..., 0, 1] = 0.4
-    p[..., 0, 1] = 0.6
-    got = bl.apply_visibility(raw, h, p)
-    assert got[0, bl.CH_FREE, 0, 0] == -bl.FORCE_LOGIT, "sub-threshold pass share must force free low"
-    assert got[0, bl.CH_FREE, 0, 1] == raw[0, bl.CH_FREE, 0, 1], "at-or-above-threshold pass share may be free"
-    assert bl.PASS_FRAC_TAU == 0.5, bl.PASS_FRAC_TAU
-    print("pass_fraction_gate")
+
+def check_transmittance_boundary() -> None:
+    """Transmittance exactly equal to the cutoff counts (>=, not >), for reach and for pass-through."""
+    tau_r, tau_f = bl.REACH_TAU, bl.FREE_PASS_TAU
+    p = torch.tensor([0.5, 0.5, 0.0, 0.0]).view(1, 1, 4, 1, 1)  # exact in float32
+    reach = bl.depth_transmittance(p, dim=2).view(-1)
+    assert torch.equal(reach, torch.tensor([1.0, 0.5, 0.0, 0.0])), reach
+    assert torch.equal(bl.depth_survival(p, dim=2).view(-1), torch.tensor([0.5, 0.0, 0.0, 0.0]))
+    # cell 0: reached exactly at tau and passed exactly at tau; cell 1: just below both; cell 2: reached, pass just below
+    reach_v = torch.tensor([tau_r, tau_r * (1 - 1e-6), tau_r]).view(1, 1, 3, 1, 1)
+    pass_v = torch.tensor([tau_f, tau_f * (1 - 1e-6), tau_f * (1 - 1e-6)]).view(1, 1, 3, 1, 1)
+    reached, through = bl.visibility_gates(reach_v, pass_v, tau_r, tau_f)
+    assert reached.view(-1).tolist() == [1.0, 0.0, 1.0], reached.view(-1)
+    assert through.view(-1).tolist() == [1.0, 0.0, 0.0], through.view(-1)
+    print("transmittance_boundary")
+
+
+class _FixedDepth(torch.nn.Module):
+    """Spatial stand-in: depth distribution ``p`` at every pixel (or a list, one per camera), unit context."""
+
+    def __init__(self, p) -> None:
+        super().__init__()
+        self.ps = list(p) if isinstance(p, (list, tuple)) else [p]
+
+    def forward(self, f4, f8, f16, cam):
+        n, _, h, w = f8.shape
+        per = [p.view(-1, 1, 1).expand(-1, h, w) for p in self.ps]
+        return torch.stack([per[i % len(per)] for i in range(n)]).contiguous(), torch.ones(n, bl.CTX_CH, h, w)
+
+
+def _peaked(k: int, p_hit: float) -> torch.Tensor:
+    """p_hit at bin k, the rest spread evenly over the other bins (softmax with one raised logit)."""
+    m = math.log((bl.DEPTH_BINS - 1) * p_hit / (1.0 - p_hit))
+    lg = torch.zeros(bl.DEPTH_BINS)
+    lg[k] = m
+    return lg.softmax(0)
+
+
+def _bimodal(kw: int, p_wall: float, kf: int, eps: float = 1e-6) -> torch.Tensor:
+    p = torch.full((bl.DEPTH_BINS,), eps)
+    p[kw] = p_wall
+    p[kf] = 1.0 - p_wall
+    return p / p.sum()
+
+
+def _cells(rig: dict, head, lo: int, hi: int) -> torch.Tensor:
+    """Bool 128x128: cells some valid pixel's bins lo..hi-1 land in."""
+    pts = bl.frustum_ego_points(rig["K"], rig["T"], head.depths, (24, 32))[0, 0]
+    idx, ok = bl.bev_flat_index(pts)
+    ok = ok & rig["pixel_valid"][0].bool()[None]
+    m = torch.zeros(128 * 128, dtype=torch.bool)
+    m[idx[lo:hi][ok[lo:hi]]] = True
+    return m.view(128, 128)
+
+
+def _run_fixed(cam: str, p: torch.Tensor, head=None) -> tuple[dict, dict, torch.nn.Module]:
+    rig = bl.rig_tensors(bl.rig_geometry([cam], _cfg(), model=BASE_RIG_MODEL))
+    head = (head or bl.BevLssHead()).eval()
+    head.spatial = _FixedDepth(p)
+    taps = (torch.zeros(1, 1, 64, 48, 64), torch.zeros(1, 1, 128, 24, 32), torch.zeros(1, 1, 128, 12, 16))
+    with torch.no_grad():
+        out = head(*taps, rig["K"], rig["T"], pixel_valid=rig["pixel_valid"])
+    return out, rig, head
+
+
+def _forced(lg: torch.Tensor, region: torch.Tensor) -> tuple[int, int, int]:
+    """(free forced low, unknown forced high, occluded forced high) counts inside ``region``."""
+    return (
+        int((region & (lg[bl.CH_FREE] == -bl.FORCE_LOGIT)).sum()),
+        int((region & (lg[bl.CH_UNKNOWN] == bl.FORCE_LOGIT)).sum()),
+        int((region & (lg[bl.CH_OCCLUDED] == bl.FORCE_LOGIT)).sum()),
+    )
 
 
 def check_wall_behind_is_unknown_not_free() -> None:
-    """G5: a confident wall makes every cell behind it unknown (and occluded), never free.
+    """G5: every cell only reached behind a wall the head is >= 50% sure of is unknown + occluded, never free.
 
-    Wall at bin 12 (3.4 m) of the main camera, softmax margins 8, 15 and 25
-    (p_hit 0.987, ~1, 1). All 776 cells only reached beyond the wall must have
-    free forced low and unknown (and occluded) forced high.
+    Walls on main (bins 12 and 24), pillarL (bin 16) and rear (bin 20), with the rest of the depth
+    mass spread evenly (p_hit 0.6, 0.8, 0.94, 0.987, 0.999999). Cells in front of the wall stay learned.
     """
-    class Peaked(torch.nn.Module):
-        def __init__(self, k, m):
-            super().__init__()
-            self.k, self.m = k, m
-
-        def forward(self, f4, f8, f16, cam):
-            n, _, h, w = f8.shape
-            lg = torch.zeros(n, bl.DEPTH_BINS, h, w)
-            lg[:, self.k] = self.m
-            return lg.softmax(1), torch.ones(n, bl.CTX_CH, h, w)
-
-    cfg = _cfg()
-    geoms = bl.rig_geometry(["main"], cfg, model=BASE_RIG_MODEL)
-    rig = bl.rig_tensors(geoms)
-    head = bl.BevLssHead().eval()
-    k = 12
-    centre = float(head.depths[k])
-    assert 3.3 < centre < 3.5, centre  # 3.4 m ahead
-    ch_occ = bl.BEV_CHANNELS.index("occluded")
-    f4 = torch.randn(1, 1, 64, 48, 64)
-    f8 = torch.randn(1, 1, 128, 24, 32)
-    f16 = torch.randn(1, 1, 128, 12, 16)
-    behind_n = None
-    for m in (8.0, 15.0, 25.0):
-        head.spatial = Peaked(k, m)
-        with torch.no_grad():
-            out = head(f4, f8, f16, rig["K"], rig["T"], pixel_valid=rig["pixel_valid"])
-        lg = out["logits"][0]
-        pts = bl.frustum_ego_points(rig["K"], rig["T"], head.depths, (24, 32))[0, 0]
-        idx, ok = bl.bev_flat_index(pts)
-        behind = torch.zeros(128 * 128, dtype=torch.bool)
-        front = torch.zeros(128 * 128, dtype=torch.bool)
-        in_front = torch.zeros(128 * 128, dtype=torch.bool)
-        behind[idx[k + 1 :][ok[k + 1 :]]] = True
-        front[idx[: k + 1][ok[: k + 1]]] = True
-        in_front[idx[:k][ok[:k]]] = True
-        behind = (behind & ~front).view(128, 128)
-        in_front = (in_front & ~behind.view(-1)).view(128, 128)
-        n_behind = int(behind.sum())
-        if behind_n is None:
-            behind_n = n_behind
-        assert n_behind == 776, n_behind
-        p_hit = float(torch.softmax(torch.tensor([m] + [0.0] * (bl.DEPTH_BINS - 1)), 0)[0])
-        free_open = behind & (lg[bl.CH_FREE] != -bl.FORCE_LOGIT)
-        unk_learned = behind & (lg[bl.CH_UNKNOWN] != bl.FORCE_LOGIT)
-        occ_open = behind & (lg[ch_occ] != bl.FORCE_LOGIT)
-        assert int(free_open.sum()) == 0, (
-            f"margin {m}: p_hit={p_hit:.8f} free NOT forced low={int(free_open.sum())} of {n_behind}"
-        )
-        assert int(unk_learned.sum()) == 0, (
-            f"margin {m}: p_hit={p_hit:.8f} unknown NOT forced high={int(unk_learned.sum())} of {n_behind}"
-        )
-        assert int(occ_open.sum()) == 0, (
-            f"margin {m}: p_hit={p_hit:.8f} occluded NOT forced high={int(occ_open.sum())} of {n_behind}"
-        )
-        # rays that have not yet hit the wall stay learned, not forced unknown / not-free
-        assert int(in_front.sum()) > 0
-        assert torch.all(lg[bl.CH_UNKNOWN][in_front].abs() < bl.FORCE_LOGIT), m
-        assert not torch.all(lg[bl.CH_FREE][in_front] == -bl.FORCE_LOGIT), m
-    assert 0.0 < bl.OCCLUDE_HIT_TAU <= 0.987, bl.OCCLUDE_HIT_TAU
-    src = Path(bl.__file__).read_text(encoding="utf-8")
-    assert "PASS_FRAC_TAU" in src and "OCCLUDE_HIT_TAU" in src
-    assert "pass_mass / (hit_mass + pass_mass)" in src or "pass_mass/(hit_mass+pass_mass)" in src
+    expect_behind = {("main", 12): 776}
+    for cam, k in (("main", 12), ("main", 24), ("pillarL", 16), ("rear", 20)):
+        for p_hit in (0.6, 0.8, 0.94, 0.987, 0.999999):
+            out, rig, head = _run_fixed(cam, _peaked(k, p_hit))
+            lg = out["logits"][0]
+            front = _cells(rig, head, 0, k + 1)
+            behind = _cells(rig, head, k + 1, bl.DEPTH_BINS) & ~front
+            in_front = _cells(rig, head, 0, k) & ~behind
+            n = int(behind.sum())
+            assert n > 0, (cam, k)
+            if (cam, k) in expect_behind:
+                assert n == expect_behind[(cam, k)], (cam, k, n)
+            got = _forced(lg, behind)
+            assert got == (n, n, n), f"{cam} bin {k} p_hit {p_hit}: forced (free, unknown, occluded) {got} of {n}"
+            assert int(in_front.sum()) > 0
+            assert torch.all(lg[bl.CH_UNKNOWN][in_front].abs() < bl.FORCE_LOGIT), (cam, k, p_hit)
+            assert torch.all(lg[bl.CH_OCCLUDED][in_front].abs() < bl.FORCE_LOGIT), (cam, k, p_hit)
+            assert not torch.all(lg[bl.CH_FREE][in_front] == -bl.FORCE_LOGIT), (cam, k, p_hit)
     print("wall_behind_is_unknown_not_free")
+
+
+def check_bimodal_depth_occludes_between_modes() -> None:
+    """Two-guess depth: wall p at 3.4 m (bin 12), 1 - p at bin 30. Between the modes the ray got through
+    with probability 1 - p only, so for p > 0.5 those cells are unknown + occluded, never free; for
+    p < 0.5 they are seen and may be free; p == 0.5 is seen and may be free (>=). main, pillarL, rear.
+    """
+    kw, kf = 12, 30
+    for cam in ("main", "pillarL", "rear"):
+        for p_wall in (0.6, 0.8, 0.94):
+            out, rig, head = _run_fixed(cam, _bimodal(kw, p_wall, kf))
+            lg = out["logits"][0]
+            mid = _cells(rig, head, kw + 1, kf) & ~_cells(rig, head, 0, kw + 1)
+            n = int(mid.sum())
+            assert n > 0, cam
+            got = _forced(lg, mid)
+            assert got == (n, n, n), f"{cam} p_wall {p_wall}: forced (free, unknown, occluded) {got} of {n}"
+        for p_wall, eps in ((0.4, 1e-6), (0.5, 0.0)):
+            out, rig, head = _run_fixed(cam, _bimodal(kw, p_wall, kf, eps))
+            lg = out["logits"][0]
+            mid = _cells(rig, head, kw + 1, kf) & ~_cells(rig, head, 0, kw + 1)
+            n = int(mid.sum())
+            got = _forced(lg, mid)
+            assert got == (0, 0, 0), f"{cam} p_wall {p_wall}: see-through cells forced {got} of {n}"
+    print("bimodal_depth_occludes_between_modes")
+
+
+def check_visibility_masses_values() -> None:
+    """clear / through / occluded masses on one pixel equal a hand sum over its bins."""
+    K, T = _simple_cam(pos=(0.0, 0.0, 1.0), fx=100.0)
+    p = torch.zeros(bl.DEPTH_BINS)
+    p[5], p[15], p[25] = 0.25, 0.375, 0.375  # exact in float32
+    head = bl.BevLssHead()
+    head.spatial = _FixedDepth(p)
+    only = torch.zeros(1, 24, 32)
+    only[0, 12, 16] = 1.0
+    with torch.no_grad():
+        out = head(*(t[:, :1] for t in _taps()), K, T, pixel_valid=only)
+    pts = bl.frustum_ego_points(K, T, head.depths, (24, 32))[0, 0, :, 12, 16]
+    _idx, ok = bl.bev_flat_index(pts)
+    clear = through = occ = 0.0
+    for i in range(bl.DEPTH_BINS):
+        if not bool(ok[i]):
+            continue
+        reach = float(p[i:].sum())
+        passed = float(p[i + 1 :].sum())
+        clear += reach if reach >= 0.5 else 0.0
+        through += passed if passed >= 0.5 else 0.0
+        occ += (1.0 - reach) if reach < 0.5 else 0.0
+    assert clear > 0 and through > 0 and occ > 0
+    assert abs(float(out["clear_mass"].sum()) - clear) < 1e-5, (float(out["clear_mass"].sum()), clear)
+    assert abs(float(out["through_mass"].sum()) - through) < 1e-5, (float(out["through_mass"].sum()), through)
+    assert abs(float(out["occluded_mass"].sum()) - occ) < 1e-5, (float(out["occluded_mass"].sum()), occ)
+    print("visibility_masses_values")
+
+
+def check_occlusion_branches() -> None:
+    """Occluded is forced only where valid rays landed and none reached: not where another ray saw the
+    cell, not from an invalid camera, not where no ray landed at all."""
+    raw = torch.randn(1, 14, 1, 3)
+    clear = torch.tensor([0.0, 0.7, 0.0]).view(1, 1, 1, 3)
+    through = torch.zeros(1, 1, 1, 3)
+    occ = torch.tensor([0.4, 0.4, 0.0]).view(1, 1, 1, 3)  # cell 0 behind, cell 1 behind for one ray but seen by another, cell 2 no ray
+    got = bl.apply_visibility(raw, clear, through, occluded_mass=occ)
+    assert got[0, bl.CH_OCCLUDED, 0, 0] == bl.FORCE_LOGIT
+    assert got[0, bl.CH_OCCLUDED, 0, 1] == raw[0, bl.CH_OCCLUDED, 0, 1], "seen by another ray: occluded stays learned"
+    assert got[0, bl.CH_UNKNOWN, 0, 1] == raw[0, bl.CH_UNKNOWN, 0, 1]
+    assert got[0, bl.CH_OCCLUDED, 0, 2] == raw[0, bl.CH_OCCLUDED, 0, 2], "no ray landed: occluded stays learned"
+    assert got[0, bl.CH_UNKNOWN, 0, 2] == bl.FORCE_LOGIT
+    # head level: cells outside every frustum keep a learned occluded logit
+    out, rig, head = _run_fixed("main", _peaked(12, 0.94))
+    lg = out["logits"][0]
+    landed = _cells(rig, head, 0, bl.DEPTH_BINS)
+    assert int((~landed).sum()) > 0
+    assert torch.all(lg[bl.CH_OCCLUDED][~landed].abs() < bl.FORCE_LOGIT)
+    # head level: main has a 94% wall at 3.4 m; the forward "wide" camera is sure of a far surface (bin 35)
+    # and reaches some of the cells behind main's wall. Those cells are seen, not occluded.
+    rig2 = bl.rig_tensors(bl.rig_geometry(["main", "wide"], _cfg(), model=BASE_RIG_MODEL))
+    head2 = bl.BevLssHead().eval()
+    head2.spatial = _FixedDepth([_peaked(12, 0.94), _peaked(35, 0.987)])
+    taps2 = (torch.zeros(1, 2, 64, 48, 64), torch.zeros(1, 2, 128, 24, 32), torch.zeros(1, 2, 128, 12, 16))
+    with torch.no_grad():
+        both = head2(*taps2, rig2["K"], rig2["T"], pixel_valid=rig2["pixel_valid"])
+        # wide invalid: identical masses and forcing to main alone
+        only_main = head2(*taps2, rig2["K"], rig2["T"], cam_valid=torch.tensor([[1.0, 0.0]]), pixel_valid=rig2["pixel_valid"])
+    for name in ("clear_mass", "through_mass", "occluded_mass", "hit_mass", "pass_mass"):
+        assert torch.equal(only_main[name], out[name]), name
+    for ch in (bl.CH_FREE, bl.CH_UNKNOWN, bl.CH_OCCLUDED):
+        assert torch.equal(only_main["logits"][0, ch] == bl.FORCE_LOGIT, lg[ch] == bl.FORCE_LOGIT), ch
+        assert torch.equal(only_main["logits"][0, ch] == -bl.FORCE_LOGIT, lg[ch] == -bl.FORCE_LOGIT), ch
+    lgb = both["logits"][0]
+    shared = (out["occluded_mass"][0, 0] > 0) & (out["clear_mass"][0, 0] <= 0) & (both["clear_mass"][0, 0] > 0)
+    assert int(shared.sum()) > 0, "fixture: some main-occluded cells must be reached by wide"
+    assert torch.all(lgb[bl.CH_OCCLUDED][shared].abs() < bl.FORCE_LOGIT)
+    assert torch.all(lgb[bl.CH_UNKNOWN][shared].abs() < bl.FORCE_LOGIT)
+    print("occlusion_branches")
+
+
+def check_visibility_taus_plumbed() -> None:
+    """Non-default cutoffs reach the head through build_bev_head and change the forcing."""
+    kw, kf = 12, 30
+    cfg_head = bl.build_bev_head({"bev_lss": {"enabled": True, "reach_tau": 0.3, "free_pass_tau": 0.7}})
+    assert cfg_head.reach_tau == 0.3 and cfg_head.free_pass_tau == 0.7
+    # p_wall 0.6: between the modes reach = pass = 0.4. Default 0.5 forces; reach_tau 0.3 lets it be seen,
+    # but free_pass_tau 0.7 still forbids free.
+    out_d, rig, head_d = _run_fixed("main", _bimodal(kw, 0.6, kf))
+    mid = _cells(rig, head_d, kw + 1, kf) & ~_cells(rig, head_d, 0, kw + 1)
+    n = int(mid.sum())
+    assert _forced(out_d["logits"][0], mid) == (n, n, n)
+    out_c, _, _ = _run_fixed("main", _bimodal(kw, 0.6, kf), head=cfg_head)
+    assert _forced(out_c["logits"][0], mid) == (n, 0, 0), _forced(out_c["logits"][0], mid)
+    # p_wall 0.4: pass between modes 0.6. Default: free allowed; free_pass_tau 0.7: free forced low, still seen.
+    out_d, _, _ = _run_fixed("main", _bimodal(kw, 0.4, kf))
+    assert _forced(out_d["logits"][0], mid) == (0, 0, 0)
+    strict = bl.build_bev_head({"bev_lss": {"enabled": True, "free_pass_tau": 0.7}})
+    assert strict.reach_tau == bl.REACH_TAU and strict.free_pass_tau == 0.7
+    out_s, _, _ = _run_fixed("main", _bimodal(kw, 0.4, kf), head=strict)
+    assert _forced(out_s["logits"][0], mid) == (n, 0, 0), _forced(out_s["logits"][0], mid)
+    # reach_tau alone: 0.7 makes the 0.4-wall's between cells (reach 0.6) unseen and occluded
+    tight = bl.build_bev_head({"bev_lss": {"enabled": True, "reach_tau": 0.7}})
+    assert tight.reach_tau == 0.7 and tight.free_pass_tau == bl.FREE_PASS_TAU
+    out_t, _, _ = _run_fixed("main", _bimodal(kw, 0.4, kf), head=tight)
+    assert _forced(out_t["logits"][0], mid) == (n, n, n), _forced(out_t["logits"][0], mid)
+    print("visibility_taus_plumbed")
+
+
+def check_depth_transmittance_reference() -> None:
+    torch.manual_seed(3)
+    prob = torch.rand(2, 3, 7, 4, 5).softmax(dim=2)
+    got = bl.depth_transmittance(prob, dim=2)
+    ref = torch.zeros_like(prob)
+    for i in range(7):
+        ref[:, :, i] = prob[:, :, i:].sum(dim=2)
+    assert torch.allclose(got, ref, atol=1e-6)
+    assert torch.allclose(got[:, :, 0], torch.ones_like(got[:, :, 0]), atol=1e-6)
+    assert torch.allclose(got, bl.depth_survival(prob, dim=2) + prob, atol=1e-6)
+    flat = torch.tensor([[0.5, 0.3, 0.2]])  # default dim=1 (N x D)
+    assert torch.allclose(bl.depth_transmittance(flat), torch.tensor([[1.0, 0.5, 0.2]]))
+    print("depth_transmittance_reference")
 
 
 def check_pass_mass_is_survival() -> None:
@@ -767,26 +943,6 @@ def check_flat_index_edges() -> None:
     assert idx[0].item() == 0 and idx[1].item() == 128 * 128 - 1
     print("flat_index_edges")
 
-
-
-def check_depth_already_hit_boundary() -> None:
-    """A bin whose prior cumulative mass is exactly OCCLUDE_HIT_TAU is already occluded."""
-    tau = bl.OCCLUDE_HIT_TAU
-    d = 4
-    p = torch.zeros(1, 1, d, 1, 1)
-    p[0, 0, 0] = tau
-    p[0, 0, 1] = 1.0 - tau
-    blocked = bl.depth_already_hit(p, tau, dim=2)
-    assert not bool(blocked[0, 0, 0]), "hit bin itself is not yet behind"
-    assert bool(blocked[0, 0, 1]), "prior == tau must count as a confident hit (>=, not >)"
-    assert bool(blocked[0, 0, 2]) and bool(blocked[0, 0, 3])
-    q = torch.zeros(1, 1, d, 1, 1)
-    just = min(tau - 1e-6, tau * 0.999)
-    q[0, 0, 0] = just
-    q[0, 0, 1] = 1.0 - just
-    below = bl.depth_already_hit(q, tau, dim=2)
-    assert not bool(below[0, 0, 0]) and not bool(below[0, 0, 1]), (float(just), tau)
-    print("depth_already_hit_boundary")
 
 
 def check_depth_survival_reference() -> None:
@@ -1132,8 +1288,13 @@ def main() -> None:
     check_ego_compensation_optional()
     check_shapes_every_stage()
     check_visibility_by_construction()
-    check_pass_fraction_gate()
+    check_visibility_taus_pinned()
+    check_transmittance_boundary()
     check_wall_behind_is_unknown_not_free()
+    check_bimodal_depth_occludes_between_modes()
+    check_visibility_masses_values()
+    check_occlusion_branches()
+    check_visibility_taus_plumbed()
     check_pass_mass_is_survival()
     check_zero_valid_cameras_no_nan()
     check_gradients_reach_stem_and_depth()
@@ -1146,7 +1307,7 @@ def main() -> None:
     check_geometry_helper_edges()
     check_flat_index_edges()
     check_depth_survival_reference()
-    check_depth_already_hit_boundary()
+    check_depth_transmittance_reference()
     check_lift_and_head_compensation()
     check_camera_features_values()
     check_architecture_pinned()

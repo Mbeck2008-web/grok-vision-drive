@@ -67,6 +67,8 @@ jobs:
           # Same torch / torchvision / scipy versions as the dev PC, without the +cu126 suffix.
           python -m pip install torch==2.14.1 torchvision==0.29.1 --index-url https://download.pytorch.org/whl/cpu
           python -m pip install scipy==1.18.1
+          # Dev-only: property/fuzz tests (scripts/test_learned_lanes_props.py). Not a runtime dep.
+          python -m pip install -r requirements-dev.txt
 
       - name: Disk guard (22 GB free on /tmp)
         run: |

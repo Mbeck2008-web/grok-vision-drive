@@ -399,6 +399,214 @@ def check_eval_harness() -> None:
     )
 
 
+def check_hough_output_sanitized() -> None:
+    """I4 on the fallback path: a broken Hough result never leaks NaN, far points or conf > 1."""
+    good = [{"x": -1.75, "y": float(y), "z": 0.0} for y in range(0, 40, 4)]
+    edge = [{"x": ls.LAT_MAX_M, "y": ls.Y_MIN_M}, {"x": -ls.LAT_MAX_M, "y": ls.Y_MAX_M}]
+    bad = [
+        [{"x": float("nan"), "y": 5.0}], [{"x": 0.0, "y": float("inf")}], [{"y": 3.0}], [{"x": 1.0}],
+        [{"x": ls.LAT_MAX_M + 1e-6, "y": 5.0}], [{"x": -ls.LAT_MAX_M - 1e-6, "y": 5.0}],
+        [{"x": 0.0, "y": ls.Y_MIN_M - 1e-6}], [{"x": 0.0, "y": ls.Y_MAX_M + 1e-6}], [],
+    ]
+    for conf, curv, want_conf, want_curv in (
+        (0.95, 0.01, 0.95, 0.01), (7.0, 9.0, 1.0, ls.CURVATURE_MAX), (-3.0, -9.0, 0.0, -ls.CURVATURE_MAX),
+        (float("nan"), float("nan"), 0.0, 0.0), (float("inf"), float("-inf"), 0.0, 0.0),
+    ):
+        res = ls.sanitize_result(LaneResult(conf=conf, lanes_bev=[good, edge, *bad], curvature=curv))
+        assert res.lanes_bev == [good, edge], res.lanes_bev
+        assert res.conf == want_conf and res.curvature == want_curv, (conf, curv, res)
+    only_bad = ls.sanitize_result(LaneResult(conf=0.9, lanes_bev=bad, curvature=0.0))
+    assert only_bad.lanes_bev == [] and only_bad.conf == 0.0, only_bad
+    sel = ls.LearnedLaneSelector(
+        None, runtime_factory=lambda _p: None,
+        hough=lambda m, s: LaneResult(conf=float("nan"), lanes_bev=[good, *bad], curvature=float("inf")),
+    )
+    out = sel.select(painted_frame(), strip=STRIP)
+    assert out.result.lanes_bev == [good] and out.result.conf == 0.0 and out.result.curvature == 0.0, out.result
+    print("broken Hough output is sanitized (NaN / far / missing keys dropped, conf and curvature clamped) OK")
+
+
+def check_parse_boundaries() -> None:
+    """Exact edges of the parse rules (each one a mutant before this check)."""
+    at = head_outputs(lane_xs=(-ls.LAT_MAX_M, ls.LAT_MAX_M), lane_p=ls.LANE_VALID_MIN, curb_xs=(ls.LAT_MAX_M,), curb_p=1.0)
+    at["lanes"][0, 0, 1] = ls.Y_MIN_M
+    at["lanes"][1, -1, 1] = ls.Y_MAX_M
+    at["lane_valid"][2] = 1.0
+    at["lanes"][2] = lane_poly(0.0)
+    parsed = ls.parse_learned_lanes(at, 1.0)
+    assert parsed.reason == "" and len(parsed.result.lanes_bev) == 3 and parsed.conf == 1.0, parsed
+    assert len(parsed.curbs_bev) == 1
+    capped = ls.parse_learned_lanes(head_outputs(lane_p=0.9), 3.0)
+    assert abs(capped.conf - 0.9) < 1e-6 and capped.result.conf == capped.conf, capped
+    low = ls.parse_learned_lanes(head_outputs(lane_p=0.45))
+    assert low.reason == ls.REASON_LOW_CONF and low.conf == 0.0 and low.result is None, low
+    lowh = ls.parse_learned_lanes(head_outputs(lane_p=0.8), 0.3)
+    assert lowh.reason == ls.REASON_LOW_CONF and abs(lowh.conf - 0.3) < 1e-9, lowh
+    out_sel = selector_with(head_conf=0.3).select(painted_frame(), strip=STRIP)
+    assert abs(out_sel.telemetry()["learned_conf"] - 0.3) < 1e-9, out_sel.telemetry()
+    for mutate, reason in (
+        (lambda o: o.__setitem__("lanes", o["lanes"][:5]), ls.REASON_BAD_SHAPE),
+        (lambda o: o.__setitem__("lane_valid", o["lane_valid"][:5]), ls.REASON_BAD_SHAPE),
+        (lambda o: o.__setitem__("curbs", o["curbs"][:1]), ls.REASON_BAD_SHAPE),
+        (lambda o: o.__setitem__("curb_valid", o["curb_valid"][:1]), ls.REASON_BAD_SHAPE),
+        (lambda o: o.__setitem__("lanes", "not a tensor"), ls.REASON_BAD_SHAPE),
+        (lambda o: o["curb_valid"].__setitem__(0, -0.01), ls.REASON_OUT_OF_RANGE),
+        (lambda o: o["curb_valid"].__setitem__(1, 1.01), ls.REASON_OUT_OF_RANGE),
+        (lambda o: o["lane_valid"].__setitem__(5, -0.01), ls.REASON_OUT_OF_RANGE),
+        (lambda o: o["curbs"].__setitem__((0, 4, 1), ls.Y_MAX_M + 1), ls.REASON_OUT_OF_RANGE),
+        (lambda o: o["lanes"].__setitem__((1, 4, 1), ls.Y_MIN_M - 1), ls.REASON_OUT_OF_RANGE),
+    ):
+        outs = head_outputs(curb_xs=(-3.0, 3.0))
+        outs = {k: np.array(v, dtype=np.float32) for k, v in outs.items()}
+        mutate(outs)
+        got = ls.parse_learned_lanes(outs)
+        assert got.result is None and got.reason == reason, (reason, got)
+    assert ls.parse_learned_lanes(head_outputs(), "x").reason == ls.REASON_BAD_SHAPE
+    assert ls.parse_learned_lanes(head_outputs(), float("nan")).reason == ls.REASON_NONFINITE
+    # A slot below LANE_VALID_MIN is out of range only when it is kept.
+    far = head_outputs(lane_xs=(-1.75, 1.75, 1e6), lane_p=0.9)
+    far["lane_valid"][2] = 0.49
+    assert ls.parse_learned_lanes(far).reason == "" and len(ls.parse_learned_lanes(far).result.lanes_bev) == 2
+    print("parse boundaries: valid floor, conf cap, bounds, per-head shape and range reasons OK")
+
+
+def check_selector_plumbing() -> None:
+    """dt, strip and stitch reach the right callee; reason strings name the error."""
+    seen = {}
+
+    class Rec(FakeRuntime):
+        def observe(self, strip, dt_s):
+            seen["strip"], seen["dt"] = strip, dt_s
+            return super().observe(strip, dt_s)
+
+    rt = Rec()
+    selector_with(rt).select(painted_frame(), strip=STRIP, dt_s=0.125)
+    assert seen["strip"] is STRIP and seen["dt"] == 0.125, seen
+    calls = []
+
+    def hough(m, s):
+        calls.append((m is not None, s is not None))
+        return LaneResult(conf=0.0, lanes_bev=[], curvature=0.0)
+
+    from python.perception.stitch360 import GAP_PX, SECTOR_H, SECTOR_W, STITCH_ORDER, forward_lane_view
+
+    n = len(STITCH_ORDER)
+    stitch = np.zeros((SECTOR_H, n * SECTOR_W + (n - 1) * GAP_PX, 3), dtype=np.uint8)
+    band = forward_lane_view(stitch)
+    band[:] = painted(band.shape[0], band.shape[1], **PAINTED)
+    i0 = STITCH_ORDER.index("wide") * (SECTOR_W + GAP_PX)
+    stitch[:, i0:i0 + band.shape[1]] = band
+    fwd = ls.forward_image(None, stitch)
+    assert fwd.shape == band.shape and np.array_equal(fwd, band), fwd.shape
+    assert ls.forward_image(painted_frame(), None).shape == painted_frame().shape
+    assert ls.forward_image(None, painted_frame()).shape == painted_frame().shape
+    assert ls.forward_image(None, None) is None
+    assert ls.forward_image(np.zeros((4, 4), np.uint8)) is None
+    assert ls.forward_image(np.zeros((1, 4, 3), np.uint8)) is None
+    assert ls.forward_image(np.zeros((4, 4, 4), np.uint8)).shape == (4, 4, 3)
+    f32 = ls.forward_image(np.full((4, 4, 3), 300.0, np.float32))
+    assert f32.dtype == np.uint8 and int(f32.max()) == 255
+    blank_main = np.zeros((240, 320, 3), np.uint8)
+    sel = ls.LearnedLaneSelector(None, runtime_factory=lambda _p: None, hough=hough)
+    out = sel.select(blank_main, stitch, strip=None)
+    assert calls[-1] == (True, True), calls
+    assert out.paint_px >= ls.PAINT_MIN_PX, "paint evidence must come from the stitch band, not main"
+    assert ls.paint_evidence_px(painted_frame().astype(np.float32)) == ls.paint_evidence_px(painted_frame())
+    sky_only = painted_frame()
+    sky_only[int(ls.PAINT_ROI_TOP * sky_only.shape[0]):] = 70
+    assert ls.paint_evidence_px(sky_only) == 0, "paint above the ROI does not count"
+    err = selector_with(raise_on_observe=RuntimeError("ort")).select(painted_frame(), strip=STRIP)
+    assert err.fallback_reason == "runtime_error: RuntimeError", err.fallback_reason
+    from python.train.scene_lane_runtime import SceneInputShapeError
+
+    dis = selector_with(raise_on_observe=SceneInputShapeError("x")).select(painted_frame(), strip=STRIP)
+    assert dis.fallback_reason == "learned_disabled: SceneInputShapeError", dis.fallback_reason
+
+    class KeyErr(FakeRuntime):
+        def output(self, name):
+            raise KeyError(name)
+
+    ke = selector_with(KeyErr()).select(painted_frame(), strip=STRIP)
+    assert ke.fallback_reason == "runtime_error: KeyError", ke.fallback_reason
+    assert selector_with(untrained=("curb_valid",)).select(painted_frame(), strip=STRIP).fallback_reason == "lanes_untrained: curb_valid"
+    # Paint exactly at the floor passes; one under is gated.
+    real = ls.paint_evidence_px
+    try:
+        ls.paint_evidence_px = lambda _img: ls.PAINT_MIN_PX
+        at = selector_with().select(painted_frame(), strip=STRIP)
+        ls.paint_evidence_px = lambda _img: ls.PAINT_MIN_PX - 1
+        under = selector_with().select(painted_frame(), strip=STRIP)
+    finally:
+        ls.paint_evidence_px = real
+    assert not at.paint_gated and at.result.lanes_bev and at.telemetry()["paint_px"] == ls.PAINT_MIN_PX
+    assert under.paint_gated and not under.result.lanes_bev
+    tel = selector_with().select(painted_frame(), strip=STRIP).telemetry()
+    assert tel == {
+        "mode": "learned", "source": "learned", "fallback": False, "reason": "none", "learned_conf": 0.9,
+        "paint_px": ls.paint_evidence_px(painted_frame()), "paint_gated": False, "curbs_n": 0,
+    }, tel
+    assert "model ready (fake.onnx)" in selector_with().describe()
+    assert "model_missing" in missing_selector().describe() and "Hough fallback" in missing_selector().describe()
+    print("selector plumbing: dt / strip / stitch band, error names, paint floor, telemetry OK")
+
+
+def check_curvature() -> None:
+    ys = np.linspace(2.0, 40.0, ls.LANE_POINTS)
+    bend = np.stack([-1.75 + 0.01 * ys ** 2, ys], -1)
+    straight = np.stack([np.full_like(ys, 1.75), ys], -1)
+    assert abs(ls._curvature([bend]) - 0.02) < 1e-9
+    assert abs(ls._curvature([bend, straight]) - 0.01) < 1e-9
+    assert ls._curvature([np.stack([np.full_like(ys, 1.0), np.full_like(ys, 5.0)], -1)]) == 0.0
+    assert ls._curvature([np.stack([-1.75 + 1.0 * ys ** 2, ys], -1)]) == ls.CURVATURE_MAX
+    assert ls._curvature([np.stack([-1.75 - 1.0 * ys ** 2, ys], -1)]) == -ls.CURVATURE_MAX
+    assert ls._curvature([]) == 0.0
+    print("learned curvature: quadratic fit, clipped, flat polylines skipped OK")
+
+
+def check_env_and_load_details() -> None:
+    for raw, want in (("1", True), ("true", True), (" TRUE ", True), ("yes", True), ("On", True),
+                      ("0", False), ("false", False), ("off", False), ("  ", False), ("2", False)):
+        assert ls.learned_lanes_enabled(None, env={"GVD_LEARNED_LANES": raw}) is want, raw
+    saved = os.environ.get("GVD_LEARNED_LANES")
+    try:
+        os.environ["GVD_LEARNED_LANES"] = "1"
+        assert ls.learned_lanes_enabled(None) is True
+        os.environ.pop("GVD_LEARNED_LANES")
+        assert ls.learned_lanes_enabled(None) is False
+    finally:
+        if saved is not None:
+            os.environ["GVD_LEARNED_LANES"] = saved
+    got = []
+    ls.LearnedLaneSelector("/models/x.onnx", runtime_factory=lambda p: got.append(p) or FakeRuntime())
+    assert got == ["/models/x.onnx"], got
+    bare = ls.LearnedLaneSelector(None, runtime_factory=lambda _p: object())
+    assert bare.runtime is None and bare.load_reason == "model_refused: not ready", bare.load_reason
+    blank = ls.LearnedLaneSelector(None, runtime_factory=lambda _p: SimpleNamespace(ready=False, reason=""))
+    assert blank.load_reason == "model_refused: not ready", blank.load_reason
+    ok = selector_with()
+    assert ok.load_reason == "" and ok.disabled_reason == "" and ok.ready
+
+    def boom(_p):
+        raise ValueError("bad graph")
+
+    assert ls.LearnedLaneSelector(None, runtime_factory=boom).load_reason == "model_refused: ValueError: bad graph"
+    # Paint above PAINT_ROI_TOP never counts; the same stripe below it does.
+    top = np.full((240, 320, 3), 70, np.uint8)
+    rows = int(ls.PAINT_ROI_TOP * 240) - 2
+    top[:rows, 150:154] = 235
+    low = np.full((240, 320, 3), 70, np.uint8)
+    low[240 - rows:, 150:154] = 235
+    assert ls.paint_evidence_px(top) == 0 and ls.paint_evidence_px(low) >= ls.PAINT_MIN_PX, (
+        ls.paint_evidence_px(top), ls.paint_evidence_px(low))
+    bgra = np.concatenate([painted_frame(), np.full((240, 320, 1), 255, np.uint8)], axis=2)
+    assert ls.paint_evidence_px(bgra) == ls.paint_evidence_px(painted_frame())
+    yel = np.full((240, 320, 3), 70, np.uint8)
+    yel[100:, 150:154] = (40, 190, 230)
+    assert ls.paint_evidence_px(yel) >= ls.PAINT_MIN_PX
+    assert ls.paint_evidence_px(yel.astype(np.float32)) == ls.paint_evidence_px(yel)
+    print("env parsing, factory path, load reasons, paint ROI / BGRA / yellow / float OK")
+
+
 # ---------------------------------------------------------------- properties
 
 
@@ -559,6 +767,11 @@ def main() -> None:
     check_fallback_other_reasons()
     check_dropped_frames_and_sizes()
     check_learned_drives_on_paint()
+    check_hough_output_sanitized()
+    check_parse_boundaries()
+    check_selector_plumbing()
+    check_curvature()
+    check_env_and_load_details()
     check_hallucinating_head_gated()
     check_pipeline_wiring()
     check_eval_harness()

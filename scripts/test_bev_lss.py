@@ -530,11 +530,208 @@ def check_default_off() -> None:
     assert bl.build_bev_head({"bev_lss": {"enabled": False}}) is None
     head = bl.build_bev_head({"bev_lss": {"enabled": True}})
     assert isinstance(head, bl.BevLssHead) and head.depths.numel() == bl.DEPTH_BINS
+    small = bl.build_bev_head({"bev_lss": {"enabled": True, "depth_bins": 20}})
+    assert small.depths.numel() == 20 and small.spatial.depth.out_channels == 20
+    assert bl.rig_tensors(bl.rig_geometry(["main"], _cfg()))["K"].shape == (1, 1, 3, 3)  # default batch 1
     import python.train.scene_net as sn
 
     assert "bev_lss" not in Path(sn.__file__).read_text(encoding="utf-8")
     assert not any(n.startswith("bev") for n, _ in sn.SceneNet().named_modules() if n)
     print("default_off")
+
+
+# ---------------------------------------------------------------- mutation-guided edge checks
+def _raises(exc, fn, *args, match: str = "") -> None:
+    try:
+        fn(*args)
+    except exc as err:
+        assert match in str(err), (match, str(err))
+        return
+    raise AssertionError(f"{fn.__name__}{args} did not raise {exc.__name__}")
+
+
+def check_geometry_helper_edges() -> None:
+    assert bl.content_rect(640, 480) == (256, 192, 0, 0)
+    assert bl.content_rect(1000, 100) == (256, 26, 0, 83)  # very wide: letterbox rows
+    assert bl.content_rect(100, 1000) == (19, 192, 118, 0)  # very tall: pillarbox columns
+    assert all(isinstance(v, int) for v in bl.content_rect(1000, 100) + bl.content_rect(100, 1000))
+    assert bl.content_rect(640, 480, 128, 96) == (128, 96, 0, 0)
+    assert bl.content_rect(100000, 1) == (256, 1, 0, 95)  # degenerate sizes clamp to one pixel, not two
+    assert bl.content_rect(1, 100000) == (1, 192, 127, 0)
+    K = bl.camera_intrinsics(90.0, 640, 360)  # 256x144 at row 24, tan(45) = 1
+    assert np.allclose(K, [[72.0, 0.0, 128.0], [0.0, 72.0, 96.0], [0.0, 0.0, 1.0]], atol=1e-4), K
+    Ks = bl.camera_intrinsics(90.0, 640, 480, 128, 96)  # crop size is honoured
+    assert np.allclose(Ks, [[48.0, 0.0, 64.0], [0.0, 48.0, 48.0], [0.0, 0.0, 1.0]], atol=1e-4), Ks
+    assert bl.camera_intrinsics(0.5, 640, 480)[0, 0] > 10000  # tiny but legal fov
+    _raises(ValueError, bl.camera_intrinsics, 0.0, 640, 480, match="fov_v")
+    assert bl.depth_bin_centers(1, 1.0, 4.0).tolist() == [2.5]  # one bin is legal
+    _raises(ValueError, bl.depth_bin_centers, 0, 1.0, 4.0, match="bad depth bins")
+    _raises(ValueError, bl.depth_bin_centers, 4, 0.0, 4.0, match="bad depth bins")
+    cfg = _cfg()
+    junk = {"cameras": ["not a camera", {"no_id": 1}] + list(cfg["cameras"])}
+    geoms = {g.cam_id: g for g in bl.rig_geometry(["main", "pillarL"], junk)}
+    assert geoms["pillarL"].yaw_deg == -78.0 and geoms["main"].yaw_deg == 0.0
+    _raises(KeyError, bl.rig_geometry, ["nope"], cfg, match="nope")
+    # letterbox mask boundaries: centres are 4 + 8k, so x0 = 60 and x0 + nw = 124 sit on a centre
+    g = bl.CamGeom("t", np.eye(3, dtype=np.float32), np.eye(4, dtype=np.float32), (64, 48, 60, 44), 0.0)
+    m = bl.pixel_valid_mask([g])[0]
+    assert m.dtype == np.float32
+    cols = np.flatnonzero(m.any(axis=0)).tolist()
+    rows = np.flatnonzero(m.any(axis=1)).tolist()
+    assert cols == list(range(7, 15)), cols  # u = 60 .. 116 kept, 124 dropped
+    assert rows == list(range(5, 11)), rows  # v = 44 .. 84 kept, 92 dropped
+    assert m.sum() == len(cols) * len(rows)
+
+    class _FakeStem(torch.nn.Module):
+        conv = torch.nn.Sequential(torch.nn.Conv2d(3, 4, 3, 2, 1), torch.nn.ReLU())
+
+    _raises(RuntimeError, bl.stem_taps, _FakeStem(), torch.zeros(1, 3, 16, 16), match="need 4")
+    print("geometry_helper_edges")
+
+
+def check_flat_index_edges() -> None:
+    half = bl.BEV_HALF_M
+    pts = torch.tensor([
+        [-half, half - 0.01, 0.0],  # row 0, col 0: kept
+        [half - 0.01, -half + 0.01, 0.0],  # row 127, col 127: kept
+        [half, 0.0, 0.0],  # col 128: dropped
+        [-half - 0.01, 0.0, 0.0],  # col -1: dropped
+        [0.0, half + 0.01, 0.0],  # row -1: dropped
+        [0.0, -half, 0.0],  # row 128: dropped
+    ])
+    idx, ok = bl.bev_flat_index(pts)
+    assert ok.tolist() == [True, True, False, False, False, False], ok
+    assert idx[0].item() == 0 and idx[1].item() == 128 * 128 - 1
+    print("flat_index_edges")
+
+
+def check_depth_survival_reference() -> None:
+    torch.manual_seed(3)
+    prob = torch.rand(2, 3, 7, 4, 5).softmax(dim=2)
+    got = bl.depth_survival(prob, dim=2)
+    ref = torch.zeros_like(prob)
+    for i in range(7):
+        ref[:, :, i] = prob[:, :, i + 1 :].sum(dim=2)
+    assert torch.allclose(got, ref, atol=1e-6)
+    assert torch.all(got >= 0) and torch.all(got[:, :, -1] == 0)
+    flat = torch.tensor([[0.5, 0.3, 0.2]])  # default dim=1 (N x D)
+    assert torch.allclose(bl.depth_survival(flat), torch.tensor([[0.5, 0.2, 0.0]]))
+    print("depth_survival_reference")
+
+
+class _ConstSpatial(torch.nn.Module):
+    """Stub spatial path: one-hot depth in ``bin_index``, context = ``value`` on every channel."""
+
+    def __init__(self, bin_index: int, value: float) -> None:
+        super().__init__()
+        self.bin_index, self.value = bin_index, value
+
+    def forward(self, f4, f8, f16, cam_feat):
+        n, _c, h, w = f8.shape
+        prob = torch.zeros(n, bl.DEPTH_BINS, h, w, dtype=f8.dtype)
+        prob[:, self.bin_index] = 1.0
+        ctx = torch.full((n, bl.CTX_CH, h, w), self.value, dtype=f8.dtype)
+        ctx[:, 1] = -self.value
+        return prob, ctx
+
+
+def check_lift_and_head_compensation() -> None:
+    K, T = _simple_cam(pos=(0.0, 0.0, 1.0), fx=100.0)
+    head = bl.BevLssHead()
+    k = int(torch.argmin((head.depths - 10.0).abs()))
+    head.spatial = _ConstSpatial(k, 2.0)
+    only = torch.zeros(1, 24, 32)
+    only[0, 12, 16] = 1.0
+    f4, f8, f16 = (t[:, :1] for t in _taps())
+    out = head(f4, f8, f16, K, T, pixel_valid=only)
+    hit = out["hit_mass"][0, 0]
+    feat = out["bev_feat"][0]
+    assert tuple(out["bev_feat"].shape) == (1, bl.CTX_CH, 128, 128)
+    assert torch.allclose(feat[0], 2.0 * hit) and torch.allclose(feat[1], -2.0 * hit)  # lift = depth x context
+    row, col = (int(v) for v in torch.nonzero(hit)[0])
+    moved = head(f4, f8, f16, K, T, pixel_valid=only, time_offset_s=torch.tensor([[0.05]]),
+                 ego_speed_mps=torch.tensor([20.0]))["hit_mass"][0, 0]
+    assert torch.nonzero(moved).tolist() == [[row - 2, col]], (row, col, torch.nonzero(moved).tolist())
+    # per-batch pixel mask (B x N x h x w): batch 1 masks the only pixel
+    taps2 = tuple(torch.cat([t, t]) for t in (f4, f8, f16))
+    pv = torch.stack([only, torch.zeros_like(only)])
+    out2 = head(*taps2, K.expand(2, -1, -1, -1), T.expand(2, -1, -1, -1), pixel_valid=pv)
+    assert float(out2["hit_mass"][0].sum()) == 1.0 and float(out2["hit_mass"][1].sum()) == 0.0
+    # float64 end to end (K, T, taps and weights in double): no silent float32 casts
+    headd = bl.BevLssHead().double()
+    outd = headd(*(t.double() for t in (f4, f8, f16)), K.double(), T.double())
+    assert outd["logits"].dtype == torch.float64 and outd["hit_mass"].dtype == torch.float64
+    ptsd = bl.ego_compensate(torch.zeros(1, 1, 2, 3, dtype=torch.float64), torch.tensor([[0.1]]), torch.tensor([3.0]))
+    assert ptsd.dtype == torch.float64
+    print("lift_and_head_compensation")
+
+
+def check_camera_features_values() -> None:
+    rig = _rig()
+    feat = bl.BevLssHead.camera_features(rig["K"], rig["T"])[0]
+    cfg = {c["id"]: c for c in _cfg()["cameras"]}
+    for i, cid in enumerate(_cam_ids()):
+        yaw = math.radians(cfg[cid]["yaw_deg"])
+        fx = bl.camera_intrinsics(cfg[cid]["fov_v"], *cfg[cid]["live_res"])[0, 0]
+        want = torch.tensor([fx / bl.FX_REF_PX, math.sin(yaw), math.cos(yaw), cfg[cid]["pos_m"][2]])
+        assert torch.allclose(feat[i], want, atol=1e-4), (cid, feat[i], want)
+    print("camera_features_values")
+
+
+def check_architecture_pinned() -> None:
+    """The design claims in the docstrings: dilated s16 context (2, 4), a stride-2 BEV U-Net, DW-sep blocks
+    with no conv bias before GroupNorm and a ReLU at the end, and a depth buffer kept out of checkpoints."""
+    head = bl.BevLssHead()
+    dil = [blk.block[0].dilation[0] for blk in head.spatial.ctx16]
+    assert dil == [2, 4], dil
+    down = head.encoder.down
+    assert down[0][0].stride == (2, 2) and [blk.block[0].dilation[0] for blk in down[1:]] == [1, 2]
+    blk = bl._dws(8, 16)
+    assert blk[0].dilation == (1, 1) and blk[0].stride == (1, 1) and blk[0].groups == 8
+    assert isinstance(blk[-1], torch.nn.ReLU) and len(blk) == 5
+    assert bl._Res(8).block[0].dilation == (1, 1)
+    for m in head.modules():
+        if isinstance(m, torch.nn.Sequential):
+            for a, b in zip(m, list(m)[1:]):
+                if isinstance(a, torch.nn.Conv2d) and isinstance(b, torch.nn.GroupNorm):
+                    assert a.bias is None
+    assert isinstance(head.encoder.inp[-1], torch.nn.ReLU)
+    assert "depths" not in head.state_dict() and "depths" in dict(head.named_buffers())
+    print("architecture_pinned")
+
+
+def check_forward_reference() -> None:
+    """SpatialPath, BevEncoder and _Res against an explicit composition of their own submodules."""
+    import torch.nn.functional as F
+
+    torch.manual_seed(4)
+    sp = bl.SpatialPath().eval()
+    with torch.no_grad():
+        sp.film.weight.normal_(0, 0.5)
+        sp.film.bias.normal_(0, 0.5)
+        f4, f8, f16 = torch.randn(2, 64, 48, 64), torch.randn(2, 128, 24, 32), torch.randn(2, 128, 12, 16)
+        cam = torch.randn(2, bl.CAM_FEAT)
+        prob, ctx = sp(f4, f8, f16, cam)
+        p16 = sp.lat16(sp.ctx16[1](sp.ctx16[0](f16)))
+        p8 = sp.lat8(f8) + p16.repeat_interleave(2, dim=2).repeat_interleave(2, dim=3)
+        pooled = sp.lat4(f4)
+        pooled = 0.25 * (pooled[..., 0::2, 0::2] + pooled[..., 1::2, 0::2] + pooled[..., 0::2, 1::2] + pooled[..., 1::2, 1::2])
+        p8 = p8 + pooled
+        gb = sp.film(cam)
+        gamma, beta = gb[:, : bl.FPN_CH, None, None], gb[:, bl.FPN_CH :, None, None]
+        p8 = sp.fuse8(p8 * (1.0 + gamma) + beta)
+        assert torch.allclose(prob, sp.depth(p8).softmax(dim=1), atol=1e-5)
+        assert torch.allclose(ctx, sp.ctx(p8), atol=1e-5)
+        enc = bl.BevEncoder(6).eval()
+        x = torch.randn(1, 6, 32, 32)
+        a = enc.inp(x)
+        b = F.interpolate(enc.down(a), size=(32, 32), mode="bilinear", align_corners=False)
+        assert torch.allclose(enc(x), enc.head(enc.up(torch.cat([a, b], dim=1))), atol=1e-5)
+        res = bl._Res(8).eval()
+        y = torch.randn(1, 8, 6, 6)
+        assert torch.allclose(res(y), y + res.block(y), atol=1e-6)
+        assert not torch.allclose(res(y), y)  # the block contributes
+    print("forward_reference")
 
 
 def main() -> None:
@@ -556,6 +753,13 @@ def main() -> None:
     check_activation_memory_estimate()
     check_onnx_export_parity()
     check_default_off()
+    check_geometry_helper_edges()
+    check_flat_index_edges()
+    check_depth_survival_reference()
+    check_lift_and_head_compensation()
+    check_camera_features_values()
+    check_architecture_pinned()
+    check_forward_reference()
     print("test_bev_lss: OK")
 
 

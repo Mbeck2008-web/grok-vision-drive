@@ -462,6 +462,51 @@ def check_cli() -> None:
     print("collect_clips CLI: 30-60 s bounds, one collector process per clip")
 
 
+def check_cut_in_bend_speed_floor() -> None:
+    """A cut-in at 0.3 m/s is still a cut-in: yaw is not curvature below 0.5 m/s."""
+    from python.collect.clip_mode import plan_clip, quality_check
+    from scripts.gvd_test_env import collect_root
+
+    plan = plan_clip(0, seed=1, maps=("west_coast_usa",), max_traffic=2, edge_cases=("cut_in",), min_s=4.0, max_s=4.0)
+
+    def car(name: str, x: float, y: float) -> dict:
+        return {"name": name, "pos": [x, y, 0.0], "dir": [0, 1, 0]}
+
+    with collect_root() as root:
+        d = root / "crawl"
+        # yaw 0.4 at 0.3 m/s would be a 0.75 1/m bend if the 0.5 m/s floor were dropped,
+        # and 0.5 * k * ahead^2 would hide this cut-in.
+        _fake_recording(
+            d, speed=0.3, yaw_rate=0.4,
+            traffic_at=lambda i: [car("gvd_traffic_1", 3.5 if i < 15 else 0.3, i + 15.0)],
+        )
+        q = quality_check(d, plan, exit_code=0)
+        assert q["edge_case_observed"] is True, q
+    print("cut-in: yaw at 0.3 m/s is not treated as a road bend")
+
+
+def check_session_gfx_follows_flag() -> None:
+    """session.json gfx is the --gfx / run_clips gfx argument, not the TECH_GFX default."""
+    from python.collect.clip_mode import run_clips
+    from scripts.gvd_test_env import collect_root
+
+    def runner(argv: list[str]) -> int:
+        out = Path(argv[argv.index("--out") + 1])
+        _fake_recording(out, rows=50)
+        return 0
+
+    with collect_root() as root:
+        session = run_clips(
+            root, clips=1, seed=5, maps=MAPS, max_traffic=4, runner=runner,
+            min_s=4.0, max_s=5.0, gfx="dx11",
+        )
+        manifest = json.loads((session / "session.json").read_text(encoding="utf-8"))
+        assert manifest["gfx"] == "dx11", manifest
+        tags = json.loads((next(p for p in session.iterdir() if p.is_dir()) / "clip_tags.json").read_text(encoding="utf-8"))
+        assert tags["gfx"] == "dx11", tags
+    print("session.json gfx follows the run_clips gfx argument")
+
+
 def main() -> None:
     check_edge_case_list()
     check_plans_are_seeded_and_bounded()
@@ -476,6 +521,8 @@ def main() -> None:
     check_tags_never_overwritten()
     check_run_clips_with_fake_collector()
     check_cli()
+    check_cut_in_bend_speed_floor()
+    check_session_gfx_follows_flag()
     print("test_clip_mode: OK")
 
 

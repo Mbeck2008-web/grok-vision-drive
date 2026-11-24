@@ -455,6 +455,42 @@ def check_profile_script_runs() -> None:
     print("profile_collect_tick: per-stage and per-camera times logged (stub, not a live Hz claim)")
 
 
+def check_target_exit_flush_failure_is_not_train() -> None:
+    """A --clip-s run that reaches its target still exits nonzero if the final flush fails.
+
+    The stop-file path is already covered. This is the path every clip ends on.
+    A zero exit would let clip QC mark the recording train.
+    """
+    import python.data.raw_frames as raw_frames
+    import test_recorder_v2 as rv2
+    from python.collect.clip_mode import plan_clip, quality_check
+
+    real_close = raw_frames.RawFrameWriter.close
+
+    def bad_close(self):
+        real_close(self)
+        raise OSError("final fsync failed")
+
+    raw_frames.RawFrameWriter.close = bad_close
+    try:
+        code, text, out, _made, root_cm = rv2._run_fake_collect(
+            ["--clip-s", "1", "--no-vary-env"],
+            stop_at=10**6,
+        )
+    finally:
+        raw_frames.RawFrameWriter.close = real_close
+    try:
+        assert code == 2, (code, text[-1500:])
+        assert "collect stop writer_failed flush on exit" in text and "final fsync failed" in text, text[-1500:]
+        plan = plan_clip(0, seed=1, maps=("west_coast_usa",), max_traffic=2, min_s=1.0, max_s=1.0)
+        qc = quality_check(out, plan, exit_code=code)
+        assert qc["quality"] != "train", qc
+        assert any("exit 2" in r for r in qc["reasons"]), qc
+    finally:
+        root_cm.__exit__(None, None, None)
+    print("target exit: a flush failure is writer_failed exit 2 and the clip is not train")
+
+
 def main() -> None:
     check_shared_memory_default_and_socket_fallback()
     check_parallel_fetch_same_tick_and_identical()
@@ -464,6 +500,7 @@ def main() -> None:
     check_background_writer_bounded_and_never_blocks()
     check_background_writer_errors_are_loud_and_exit_flushes()
     check_collector_fails_loudly_when_exit_flush_fails()
+    check_target_exit_flush_failure_is_not_train()
     check_profile_script_runs()
     print("test_collect_perf: OK")
 

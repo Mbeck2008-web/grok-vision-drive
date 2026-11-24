@@ -961,6 +961,173 @@ def check_clip_argv_spawns_traffic_full_gt_and_length() -> None:
           f"full-rate GT on {len(mains)} rows at 5 Hz")
 
 
+def check_capture_plan_chase_uses_chase_hz() -> None:
+    """The disk ceiling counts the chase plane at chase_hz, not CAMERA_HZ (10)."""
+    from python.data.raw_frames import CAMERA_HZ, capture_plan
+
+    cfg = dict(load_camera_config())
+    spec = dict(cfg.get("chase_camera") or {})
+    spec["enabled"] = True
+    for rate in (2.0, 3.0):
+        cfg["chase_camera"] = {**spec, "chase_hz": rate}
+        rows = [row for row in capture_plan(cfg, gt=True) if str(row["id"]) == "chase"
+                or str(row["id"]).startswith("chase_")]
+        assert rows, rate
+        assert all(abs(float(row["hz"]) - rate) < 1e-12 for row in rows), (rate, rows)
+    assert float(CAMERA_HZ.get("chase", 10.0)) != 2.0
+    print("capture_plan: chase colour/depth/sem use chase_hz (2 and 3), not CAMERA_HZ")
+
+
+def check_clip_s_overrides_until_disk() -> None:
+    """--clip-s turns off --until-disk (collect_clips can pass both via --)."""
+    code, text, out, _made, root_cm = _run_fake_collect(
+        ["--clip-s", "1", "--until-disk", "--no-vary-env"],
+        stop_at=10**6,
+    )
+    try:
+        assert code == 0, text[-2000:]
+        status = json.loads((out.parent / "status" / "collect.json").read_text(encoding="utf-8"))
+        assert status.get("until_disk") is False, status
+        # And the run actually stopped on the clip length, not an infinite disk wait.
+        assert status.get("target_s") == 1.0, status
+    finally:
+        root_cm.__exit__(None, None, None)
+    print("clip-s: --until-disk is forced off and target_s is the clip length")
+
+
+def check_gt_gate_reset_on_recover_and_segment_load() -> None:
+    """GT stays full-rate after a recover teleport and a same-map segment load.
+
+    These are the two reset sites the west-coast deck-spawn check does not hit:
+    a first stationary recover (no spawn deck) and the next same-level segment
+    load. A 2.5 s settle (recover) or a 2.5 s gap at cam_sched.reset (load)
+    would look like loop lag if the gate were not reset.
+
+    Rows are only written once the car is driving, so the ego moves for 2 s
+    to open the segment, then parks (ramped, so the stop is not scored as an
+    impact) to fire the 10 s stall abort. After the same-map load the
+    segment is closed, so the ego drives again.
+    """
+    import python.collect.level_session as level_session
+    import python.data.raw_frames as raw_frames
+    import scripts.collect_scene_lanes as collect
+    import test_labels_v4_recorder as v4
+    from python.debug.gt_geom import RoadPoly
+
+    real_begin = level_session.begin_level
+    real_snap = level_session.snap_to_road
+    real_place = level_session.place_vehicle
+    real_poll = v4._Vehicle.poll_sensors
+    real_reset = raw_frames.CameraSchedule.reset
+    drive = {"on": True, "since": None, "resets": 0, "speed": 10.0, "t": None}
+
+    def begin(bng, level):
+        del level
+        return level_session.OpenedLevel(
+            vehicle=bng.ego, roads=[RoadPoly("r", [(0.0, 0.0), (0.0, 80.0)], 7.0)], spawn=(0.0, 10.0, 0.5),
+        )
+
+    def snap(_bng, near):
+        # Recover sets segment_open False; start moving again so the
+        # post-reset rows are written before the second stall ends the segment.
+        drive["on"] = True
+        drive["since"] = None  # 2 s window starts on the first poll after settle
+        pos = near if near is not None else (0.0, 10.0, 0.5)
+        return (float(pos[0]), float(pos[1]), float(pos[2])), (0.0, 0.0, 0.0, 1.0)
+
+    def place(*_a, **_k):
+        return ""
+
+    def _ego_speed() -> float:
+        # Ramp at 8 m/s^2 so a park is not scored as an impact (15 m/s^2).
+        now = collect.time.monotonic()
+        last = drive["t"]
+        drive["t"] = now
+        target = 10.0
+        if drive["on"]:
+            if drive["since"] is None:
+                drive["since"] = now
+            if now - drive["since"] >= 2.0 and drive["resets"] < 3:
+                drive["on"] = False
+                target = 0.0
+        else:
+            target = 0.0
+        speed = drive["speed"]
+        dt = 0.0 if last is None else max(0.0, now - last)
+        step = 8.0 * dt
+        if speed < target:
+            speed = min(target, speed + step)
+        elif speed > target:
+            speed = max(target, speed - step)
+        drive["speed"] = speed
+        return speed
+
+    def poll(self):
+        real_poll(self)
+        if self.name != "ego":
+            return
+        speed = _ego_speed()
+        self.state["vel"] = [0.0, speed, 0.0]
+        self.state.setdefault("electrics", {})["wheelspeed"] = speed
+        el = self.sensors.get("electrics")
+        if el is not None:
+            el.data["wheelspeed"] = speed
+
+    def reset(self, *args, **kwargs):
+        drive["resets"] += 1
+        # 1 = CameraSchedule.__init__, 2 = first segment load, 3 = same-map load.
+        if drive["resets"] >= 3:
+            collect.time.sleep(2.5)
+            drive["on"] = True
+            drive["since"] = None
+        return real_reset(self, *args, **kwargs)
+
+    level_session.begin_level = begin
+    level_session.snap_to_road = snap
+    level_session.place_vehicle = place
+    v4._Vehicle.poll_sensors = poll
+    raw_frames.CameraSchedule.reset = reset
+    try:
+        code, text, out, _made, root_cm = _run_fake_collect(
+            ["--maps", "italy", "--stall-respawn-s", "0", "--no-vary-env",
+             "--min-paint-cov", "0", "--no-impact-respawn"],
+            stop_at=400,
+        )
+    finally:
+        level_session.begin_level = real_begin
+        level_session.snap_to_road = real_snap
+        level_session.place_vehicle = real_place
+        v4._Vehicle.poll_sensors = real_poll
+        raw_frames.CameraSchedule.reset = real_reset
+    try:
+        assert code == 0, text[-2000:]
+        assert "collect abort impact" not in text, text[-2000:]
+        assert "collect recover" in text, text[-2000:]
+        assert "same map; respawn without reload" in text, text[-2000:]
+        state = _rows(out)
+        rec_at = next((i for i, row in enumerate(state) if row.get("recover")), None)
+        assert rec_at is not None, "no recover-tagged row"
+        segs = [row.get("segment") for row in state]
+        first = next((s for s in segs if s), None)
+        later = next((i for i, s in enumerate(segs) if s and s != first), None)
+        assert later is not None, (segs[:5], segs[-5:], text[-1500:])
+        # The two reset sites must land on different written windows.
+        assert later >= rec_at + 8, (rec_at, later, segs[rec_at], segs[later])
+
+        def _thinned(rows):
+            mains = [r for r in rows if "main" in (r.get("cams") or {})]
+            return [r["i"] for r in mains if "main_depth" not in r["cams"] or r.get("gt_stride") != 1], len(mains)
+
+        after_rec, n_rec = _thinned(state[rec_at:rec_at + 40])
+        after_load, n_load = _thinned(state[later:later + 40])
+        assert n_rec >= 8, n_rec
+        assert not after_rec, f"GT thinned after recover at rows {after_rec[:12]}"
+        assert n_load >= 8, n_load
+        assert not after_load, f"GT thinned after same-map segment load at rows {after_load[:12]}"
+    finally:
+        root_cm.__exit__(None, None, None)
+    print(f"recover + same-map load: GT full rate after recover row {rec_at} and load row {later}")
+
 def main() -> None:
     check_train_gt_on_all_eight()
     check_live_attach_forces_gt_off()
@@ -992,6 +1159,9 @@ def main() -> None:
     check_respawn_keeps_full_gt_and_cli_reaches_collector()
     check_gt_gate_off_keeps_full_rate()
     check_clip_argv_spawns_traffic_full_gt_and_length()
+    check_capture_plan_chase_uses_chase_hz()
+    check_clip_s_overrides_until_disk()
+    check_gt_gate_reset_on_recover_and_segment_load()
     print("test_recorder_v2: OK")
 
 
